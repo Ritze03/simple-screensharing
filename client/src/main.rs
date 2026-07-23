@@ -1,12 +1,16 @@
 //! Simple Screensharing — Rust/egui desktop client.
 //!
-//! This is scaffolding only: a minimal window that compiles and runs.
-//! Capture, networking, and protocol logic land in follow-up work once
-//! the protocol spec is finalized.
+//! QUIC networking (`net.rs`), wire protocol (`protocol.rs`), fragmentation
+//! (`fragment.rs`), saved rooms (`rooms.rs`), and the join/roster UI
+//! (`ui.rs`) are implemented. Capture and decode/render are still follow-up
+//! work — see their module doc-comments.
 
+mod audio;
 mod capture;
 mod decode;
+mod fragment;
 mod net;
+mod preview;
 mod protocol;
 mod rooms;
 mod ui;
@@ -35,18 +39,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Simple Screensharing",
         native_options,
-        Box::new(|_cc| Ok(Box::new(App::default()))),
+        Box::new(|_cc| Ok(Box::new(ui::App::default()))),
     )
-}
-
-#[derive(Default)]
-struct App;
-
-impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Simple Screensharing");
-            ui.label("Simple Screensharing — under construction");
-        });
-    }
 }
