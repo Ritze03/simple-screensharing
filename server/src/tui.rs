@@ -1,0 +1,1 @@
+//! Ratatui admin status interface.
