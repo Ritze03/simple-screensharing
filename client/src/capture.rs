@@ -5,11 +5,23 @@
 //! # Pipeline
 //!
 //! ```text
-//! pipewiresrc fd=<fd> path=<node_id> ! videoconvert ! video/x-raw,format=I420
-//!   ! x264enc tune=zerolatency bitrate=<kbps> key-int-max=<gop> speed-preset=ultrafast
-//!   ! video/x-h264,stream-format=byte-stream,alignment=au
-//!   ! appsink name=sink
+//! pipewiresrc fd=<fd> path=<node_id> ! videoconvert ! tee name=t
+//!   t. ! queue ! video/x-raw,format=I420
+//!      ! x264enc tune=zerolatency bitrate=<kbps> key-int-max=<gop> speed-preset=ultrafast
+//!      ! video/x-h264,stream-format=byte-stream,alignment=au
+//!      ! appsink name=sink
+//!   t. ! queue leaky=downstream max-size-buffers=1 ! videorate ! video/x-raw,framerate=1/1
+//!      ! videoconvert ! video/x-raw,format=RGB
+//!      ! appsink name=preview_sink
 //! ```
+//!
+//! The `tee` feeds a second, low-rate branch whose RGB8 samples back
+//! [`preview::spawn_preview_task`] (see [`start_sharing`]) — the
+//! already-implemented periodic thumbnail/preview sender in `preview.rs`,
+//! which itself has zero GStreamer dependency and only samples the latest
+//! frame off whatever [`preview::FrameStream`] it's handed every 30s, so
+//! capping the tee branch to ~1fps here is purely a CPU-saving measure, not
+//! something the preview task requires.
 //!
 //! Two [`EncoderBackend`]s implement the encoder stage: software `x264enc`
 //! (above) and, preferred when actually usable, VAAPI's `vah264enc` (format
@@ -62,9 +74,12 @@ use futures_util::StreamExt;
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
+use gstreamer_video as gst_video;
+use gstreamer_video::prelude::*;
 
 use crate::fragment::fragment_frame;
 use crate::net::{encrypt_frame, ScreenshareClient};
+use crate::preview::{self, FrameStream, PreviewHandle, RawFrame};
 use crate::protocol::StreamKind;
 
 /// Element name of the VAAPI H.264 encoder in the installed GStreamer
@@ -313,15 +328,21 @@ async fn open_portal_capture() -> Result<PortalCapture> {
 // GStreamer pipeline construction
 // ---------------------------------------------------------------------
 
+/// Preview branch is capped to this framerate off the tee (see this
+/// module's doc comment) — [`preview::spawn_preview_task`] only ever samples
+/// the latest frame every 30s, so anything above "occasionally" here is
+/// wasted `videoconvert`/appsink work.
+const PREVIEW_BRANCH_FRAMERATE: u32 = 1;
+
 /// Builds and links (but does not start) the capture/encode pipeline
-/// described in this module's doc comment, returning the pipeline and its
-/// `appsink` element.
+/// described in this module's doc comment, returning the pipeline, its
+/// encoded-output `appsink`, and the preview branch's raw-RGB `appsink`.
 fn build_pipeline(
     pipewire_fd: std::os::fd::RawFd,
     node_id: u32,
     bitrate_kbps: u32,
     backend: EncoderBackend,
-) -> Result<(gst::Pipeline, gst_app::AppSink)> {
+) -> Result<(gst::Pipeline, gst_app::AppSink, gst_app::AppSink)> {
     let gop_frames = GOP_SECONDS * CAPTURE_FRAMERATE;
     let encoder = backend.launch_fragment(bitrate_kbps, gop_frames);
     let raw_format = backend.raw_format();
@@ -329,10 +350,18 @@ fn build_pipeline(
     let description = format!(
         "pipewiresrc fd={pipewire_fd} path={node_id} do-timestamp=true \
          ! videoconvert \
-         ! video/x-raw,format={raw_format} \
-         ! {encoder} \
-         ! video/x-h264,stream-format=byte-stream,alignment=au \
-         ! appsink name=sink emit-signals=false sync=false max-buffers=4 drop=true"
+         ! tee name=t \
+         t. ! queue \
+            ! video/x-raw,format={raw_format} \
+            ! {encoder} \
+            ! video/x-h264,stream-format=byte-stream,alignment=au \
+            ! appsink name=sink emit-signals=false sync=false max-buffers=4 drop=true \
+         t. ! queue leaky=downstream max-size-buffers=1 \
+            ! videorate \
+            ! video/x-raw,framerate={PREVIEW_BRANCH_FRAMERATE}/1 \
+            ! videoconvert \
+            ! video/x-raw,format=RGB \
+            ! appsink name=preview_sink emit-signals=false sync=false max-buffers=1 drop=true"
     );
 
     let element = gst::parse::launch(&description)
@@ -347,7 +376,13 @@ fn build_pipeline(
         .downcast::<gst_app::AppSink>()
         .map_err(|_| anyhow!("'sink' element is not an AppSink"))?;
 
-    Ok((pipeline, sink))
+    let preview_sink = pipeline
+        .by_name("preview_sink")
+        .ok_or_else(|| anyhow!("pipeline has no element named 'preview_sink'"))?
+        .downcast::<gst_app::AppSink>()
+        .map_err(|_| anyhow!("'preview_sink' element is not an AppSink"))?;
+
+    Ok((pipeline, sink, preview_sink))
 }
 
 /// Builds `backend`'s capture pipeline and drives it to `Playing`, waiting
@@ -363,8 +398,8 @@ fn start_pipeline(
     node_id: u32,
     bitrate_kbps: u32,
     backend: EncoderBackend,
-) -> Result<(gst::Pipeline, gst_app::AppSink)> {
-    let (pipeline, appsink) = build_pipeline(pipewire_fd, node_id, bitrate_kbps, backend)?;
+) -> Result<(gst::Pipeline, gst_app::AppSink, gst_app::AppSink)> {
+    let (pipeline, appsink, preview_sink) = build_pipeline(pipewire_fd, node_id, bitrate_kbps, backend)?;
 
     if let Err(e) = pipeline.set_state(gst::State::Playing) {
         let _ = pipeline.set_state(gst::State::Null);
@@ -382,7 +417,7 @@ fn start_pipeline(
         return Err(anyhow!("capture pipeline ({backend:?}) failed to reach PLAYING: {e:?}"));
     }
 
-    Ok((pipeline, appsink))
+    Ok((pipeline, appsink, preview_sink))
 }
 
 // ---------------------------------------------------------------------
@@ -398,6 +433,7 @@ pub struct CaptureHandle {
     pipeline: gst::Pipeline,
     portal_session: Session<Screencast>,
     pump_task: tokio::task::JoinHandle<()>,
+    preview_handle: PreviewHandle,
 }
 
 /// Starts sharing this machine's screen on `stream_id`: runs the portal
@@ -428,7 +464,8 @@ pub async fn start_sharing(client: &ScreenshareClient, stream_id: u8, bitrate_kb
     // pipeline didn't happen to catch — so a flaky/partial VAAPI setup
     // never fails the whole capture when software encode would have worked.
     let preferred_backend = detect_encoder_backend();
-    let (pipeline, appsink) = match start_pipeline(fd, portal.node_id, bitrate_kbps, preferred_backend) {
+    let (pipeline, appsink, preview_sink) = match start_pipeline(fd, portal.node_id, bitrate_kbps, preferred_backend)
+    {
         Ok(started) => started,
         Err(e) if preferred_backend == EncoderBackend::Vaapi => {
             tracing::warn!("VAAPI capture pipeline failed to start ({e:#}); falling back to software encoder");
@@ -456,12 +493,75 @@ pub async fn start_sharing(client: &ScreenshareClient, stream_id: u8, bitrate_kb
         .await
         .context("failed to announce video stream to the relay")?;
 
+    // Now that the pipeline is confirmed Playing and the stream has been
+    // announced, wire up the (already-implemented, capture-agnostic)
+    // periodic preview/thumbnail sender to the tee's low-rate RGB branch.
+    let preview_frames: FrameStream = preview_frame_stream(preview_sink);
+    let preview_handle = preview::spawn_preview_task(client.clone(), stream_id, preview_frames);
+
     Ok(CaptureHandle {
         stream_id,
         client: client.clone(),
         pipeline,
         portal_session: portal.session,
         pump_task,
+        preview_handle,
+    })
+}
+
+/// Bridges `preview_sink`'s raw-RGB samples (the tee's low-rate branch, see
+/// this module's doc comment) into a [`FrameStream`] for
+/// [`preview::spawn_preview_task`], extracting width/height from the
+/// negotiated caps and stride-correcting the pixel data into a tightly
+/// packed `width * height * 3`-byte buffer — the same [`gst_video::VideoFrameRef`]-based
+/// pattern `decode.rs`'s `pull_color_image` uses on the receiving side for
+/// the equivalent stride issue. Malformed samples are dropped (logged, not
+/// propagated) rather than ending the stream.
+fn preview_frame_stream(preview_sink: gst_app::AppSink) -> FrameStream {
+    Box::pin(preview_sink.stream().filter_map(|sample| async move {
+        match sample_to_raw_frame(&sample) {
+            Ok(frame) => Some(frame),
+            Err(e) => {
+                tracing::warn!("dropping malformed preview capture frame: {e:#}");
+                None
+            }
+        }
+    }))
+}
+
+fn sample_to_raw_frame(sample: &gst::Sample) -> Result<RawFrame> {
+    let buffer = sample.buffer().ok_or_else(|| anyhow!("preview sample had no buffer"))?;
+    let caps = sample.caps().ok_or_else(|| anyhow!("preview sample had no caps"))?;
+    let info = gst_video::VideoInfo::from_caps(caps).context("failed to parse preview capture caps")?;
+
+    let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info)
+        .map_err(|_| anyhow!("failed to map preview capture buffer readable"))?;
+
+    let width = frame.width() as usize;
+    let height = frame.height() as usize;
+    let stride = frame.plane_stride()[0] as usize;
+    let plane = frame
+        .plane_data(0)
+        .map_err(|_| anyhow!("preview capture frame had no plane 0 data"))?;
+
+    // Tightly pack RGB rows for `preview::RawFrame`, stripping any stride
+    // padding GStreamer added past `width * 3` (see decode.rs's
+    // `pull_color_image` for the equivalent handling on the receive side).
+    let row_bytes = width * 3;
+    let mut packed = Vec::with_capacity(row_bytes * height);
+    for row in 0..height {
+        let start = row * stride;
+        let end = start + row_bytes;
+        let Some(row_slice) = plane.get(start..end) else {
+            anyhow::bail!("preview capture frame plane shorter than expected (stride/height mismatch)");
+        };
+        packed.extend_from_slice(row_slice);
+    }
+
+    Ok(RawFrame {
+        width: width as u32,
+        height: height as u32,
+        rgb: packed,
     })
 }
 
@@ -491,6 +591,8 @@ impl CaptureHandle {
         if let Err(e) = self.pump_task.await {
             tracing::warn!("capture send task did not shut down cleanly: {e}");
         }
+
+        self.preview_handle.stop().await;
 
         if let Err(e) = self.portal_session.close().await {
             tracing::warn!("error closing screencast portal session: {e}");
@@ -686,6 +788,82 @@ mod tests {
         assert!(
             run_backend_and_expect_encoded_buffer(EncoderBackend::Software),
             "expected at least one encoded H.264 access unit from the software encoder test pipeline"
+        );
+    }
+
+    /// Sanity-checks the tee's second (preview) branch this module's doc
+    /// comment describes: `... ! videoconvert ! tee name=t !` with a
+    /// `t. ! queue ... ! videorate ! video/x-raw,framerate=1/1 !
+    /// videoconvert ! video/x-raw,format=RGB ! appsink` branch alongside the
+    /// main encoder branch — the same structure [`build_pipeline`] produces,
+    /// with `videotestsrc` standing in for `pipewiresrc fd=… path=…` per
+    /// [`run_backend_and_expect_encoded_buffer`]'s doc comment. Asserts the
+    /// preview branch's `appsink` yields a sample that, once stride-corrected
+    /// via [`sample_to_raw_frame`] exactly like the real pipeline does, is a
+    /// tightly-packed `width * height * 3`-byte RGB8 frame of the source's
+    /// negotiated dimensions — i.e. a frame [`preview::spawn_preview_task`]
+    /// could actually consume.
+    #[test]
+    fn pipeline_tee_branch_produces_rgb_preview_frames() {
+        if gst::init().is_err() {
+            eprintln!("skipping: gstreamer not available in this environment");
+            return;
+        }
+
+        let backend = EncoderBackend::Software;
+        let encoder = backend.launch_fragment(DEFAULT_BITRATE_KBPS, GOP_SECONDS * CAPTURE_FRAMERATE);
+        let raw_format = backend.raw_format();
+        let description = format!(
+            "videotestsrc num-buffers=40 \
+             ! video/x-raw,width=640,height=480 \
+             ! videoconvert \
+             ! tee name=t \
+             t. ! queue \
+                ! video/x-raw,format={raw_format} \
+                ! {encoder} \
+                ! video/x-h264,stream-format=byte-stream,alignment=au \
+                ! appsink name=sink emit-signals=false sync=false \
+             t. ! queue leaky=downstream max-size-buffers=1 \
+                ! videorate \
+                ! video/x-raw,framerate={PREVIEW_BRANCH_FRAMERATE}/1 \
+                ! videoconvert \
+                ! video/x-raw,format=RGB \
+                ! appsink name=preview_sink emit-signals=false sync=false max-buffers=1 drop=true"
+        );
+
+        let element = gst::parse::launch(&description).expect("tee pipeline should parse and link");
+        let pipeline = element.downcast::<gst::Pipeline>().expect("top-level element should be a Pipeline");
+        let preview_sink = pipeline
+            .by_name("preview_sink")
+            .expect("preview_sink element should exist")
+            .downcast::<gst_app::AppSink>()
+            .expect("preview_sink should be an AppSink");
+
+        pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+
+        let mut raw_frame = None;
+        let bus = pipeline.bus().unwrap();
+        for msg in bus.iter_timed(gst::ClockTime::from_seconds(10)) {
+            match msg.view() {
+                gst::MessageView::Eos(_) => break,
+                gst::MessageView::Error(e) => panic!("pipeline error: {} ({:?})", e.error(), e.debug()),
+                _ => {}
+            }
+            if let Some(sample) = preview_sink.try_pull_sample(gst::ClockTime::from_mseconds(50)) {
+                raw_frame = Some(sample_to_raw_frame(&sample).expect("preview sample should convert to a RawFrame"));
+                break;
+            }
+        }
+
+        pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+
+        let frame = raw_frame.expect("expected at least one RGB preview frame from the tee branch");
+        assert_eq!(frame.width, 640);
+        assert_eq!(frame.height, 480);
+        assert_eq!(
+            frame.rgb.len(),
+            640 * 480 * 3,
+            "preview frame RGB buffer should be tightly packed with no stride padding"
         );
     }
 

@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::audio::{self, AudioCaptureHandle, AudioSource};
 use crate::capture::{self, CaptureHandle};
-use crate::decode::StreamDecoder;
+use crate::decode::{self, PreviewCache, StreamDecoder};
 use crate::net::{ClientEvent, PresenceSnapshotState, ScreenshareClient};
 use crate::protocol::{ConnId, Member, PresenceEvent, StreamId, StreamInfo, StreamKind};
 use crate::rooms::RoomStore;
@@ -107,6 +107,16 @@ struct Connected {
     watch_error: Option<String>,
     /// Which watched stream the central video panel currently displays.
     selected_watch: Option<(ConnId, StreamId)>,
+
+    /// Latest decoded preview still per active stream, regardless of
+    /// whether it's being watched — previews arrive for every active
+    /// stream (spec design), so the "Streams" list row for any of them can
+    /// show a thumbnail once one has arrived.
+    preview_cache: PreviewCache,
+    /// Lazily created/updated texture per stream for the "Streams" list
+    /// thumbnail, keyed the same way as `preview_cache`/`watches`. Mirrors
+    /// `WatchEntry::texture`'s create-once/`set`-in-place pattern.
+    preview_textures: HashMap<(ConnId, StreamId), egui::TextureHandle>,
 }
 
 pub struct App {
@@ -407,6 +417,8 @@ impl App {
                     watches: HashMap::new(),
                     watch_error: None,
                     selected_watch: None,
+                    preview_cache: PreviewCache::new(),
+                    preview_textures: HashMap::new(),
                 });
             }
             Ok(Err(e)) => {
@@ -421,7 +433,7 @@ impl App {
         }
     }
 
-    fn drain_events(&mut self) {
+    fn drain_events(&mut self, ctx: &egui::Context) {
         let Some(connected) = &mut self.connected else { return };
         while let Ok(event) = connected.event_rx.try_recv() {
             match event {
@@ -444,6 +456,8 @@ impl App {
                         m.stream_count = m.stream_count.saturating_sub(1);
                     }
                     connected.streams.retain(|s| !(s.owner == conn_id && s.stream_id == stream_id));
+                    connected.preview_cache.remove(conn_id, stream_id);
+                    connected.preview_textures.remove(&(conn_id, stream_id));
                 }
                 ClientEvent::SubscriberCount { .. } | ClientEvent::KeyframeRequest { .. } => {
                     // Relevant once this client can be a sender (capture.rs, later).
@@ -453,9 +467,32 @@ impl App {
                         entry.decoder.feed(&frame);
                     }
                 }
-                ClientEvent::Preview(_) => {
-                    // No preview UI in this pass; only the full decode path is wired up.
-                }
+                ClientEvent::Preview(preview) => match decode::decode_preview(&preview) {
+                    Ok(image) => {
+                        let key = (preview.conn_id, preview.stream_id);
+                        // Upload/update the roster thumbnail texture right
+                        // away, mirroring `WatchEntry`'s
+                        // create-once-then-`set`-in-place pattern (see
+                        // `update_watch_textures`) rather than reuploading
+                        // an unchanged image every repaint.
+                        match connected.preview_textures.get_mut(&key) {
+                            Some(tex) => tex.set(image.clone(), egui::TextureOptions::LINEAR),
+                            None => {
+                                let name = format!("preview-{:016x}-{}", preview.conn_id, preview.stream_id);
+                                let tex = ctx.load_texture(name, image.clone(), egui::TextureOptions::LINEAR);
+                                connected.preview_textures.insert(key, tex);
+                            }
+                        }
+                        connected.preview_cache.update(preview.conn_id, preview.stream_id, image);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "failed to decode preview for stream {} on conn {:016x}: {e:#}",
+                            preview.stream_id,
+                            preview.conn_id
+                        );
+                    }
+                },
                 ClientEvent::ControlClosed(reason) => {
                     self.status = Status::Error(format!("disconnected: {reason}"));
                     self.connected = None;
@@ -712,14 +749,38 @@ impl App {
                     .map(|m| m.display_name.as_str())
                     .unwrap_or("unknown");
                 ui.horizontal(|ui| {
-                    ui.label(format!("{owner_name} — {} ({}x{})", info.label, info.width, info.height));
-                    let button_label = if watching { "Stop Watching" } else { "Watch" };
-                    if ui.small_button(button_label).clicked() {
-                        to_toggle = Some(key);
+                    // Thumbnail (or a placeholder box until the first
+                    // preview for this stream arrives) — previews arrive
+                    // for every active stream regardless of whether we're
+                    // watching it, so this shows up independent of the
+                    // Watch/Stop Watching toggle below.
+                    const THUMB_WIDTH: f32 = 120.0;
+                    const THUMB_HEIGHT: f32 = THUMB_WIDTH * 9.0 / 16.0;
+                    match connected.preview_textures.get(&key) {
+                        Some(tex) => {
+                            let tex_size = tex.size_vec2();
+                            let scale = if tex_size.x > 0.0 { THUMB_WIDTH / tex_size.x } else { 1.0 };
+                            ui.image((tex.id(), tex_size * scale));
+                        }
+                        None => {
+                            let (rect, _) =
+                                ui.allocate_exact_size(egui::vec2(THUMB_WIDTH, THUMB_HEIGHT), egui::Sense::hover());
+                            ui.painter().rect_filled(rect, 4.0, egui::Color32::from_gray(60));
+                        }
                     }
-                    if connected.selected_watch == Some(key) {
-                        ui.colored_label(egui::Color32::from_rgb(80, 200, 120), "(viewing)");
-                    }
+
+                    ui.vertical(|ui| {
+                        ui.label(format!("{owner_name} — {} ({}x{})", info.label, info.width, info.height));
+                        ui.horizontal(|ui| {
+                            let button_label = if watching { "Stop Watching" } else { "Watch" };
+                            if ui.small_button(button_label).clicked() {
+                                to_toggle = Some(key);
+                            }
+                            if connected.selected_watch == Some(key) {
+                                ui.colored_label(egui::Color32::from_rgb(80, 200, 120), "(viewing)");
+                            }
+                        });
+                    });
                 });
             }
             if let Some((owner, stream_id)) = to_toggle {
@@ -757,7 +818,7 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_connect_result();
-        self.drain_events();
+        self.drain_events(ctx);
         if let Some(connected) = &mut self.connected {
             connected.poll_share_states();
             connected.poll_audio_sources();
