@@ -12,6 +12,8 @@
 //! returns.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::{mpsc, oneshot};
 
@@ -59,9 +61,39 @@ struct ActiveShare {
 
 /// One stream currently being watched: its decoder, plus the texture handle
 /// (created lazily on the first decoded frame, then updated in place).
+///
+/// The decoder is behind an `Arc<Mutex<_>>` rather than owned outright
+/// because, once popped out (see `popout`), it needs to be polled from
+/// inside a `show_viewport_deferred` closure — those closures are `Fn`
+/// (callable repeatedly, possibly from the egui backend's own bookkeeping)
+/// rather than `FnMut`, so any state they mutate has to live behind shared
+/// interior mutability rather than being captured by unique reference. The
+/// same `Arc` is cloned into the popout closure while this struct keeps its
+/// own handle, so `drain_events`' `feed()` calls keep working unchanged
+/// regardless of popped-out state.
 struct WatchEntry {
-    decoder: StreamDecoder,
+    decoder: Arc<Mutex<StreamDecoder>>,
     texture: Option<egui::TextureHandle>,
+    /// `Some` while this stream is displayed in its own native window
+    /// instead of the central panel.
+    popout: Option<PopoutState>,
+}
+
+/// State for a `WatchEntry` currently rendered in its own
+/// `show_viewport_deferred` window rather than the central panel.
+struct PopoutState {
+    /// The popout window's own texture, decoupled from `WatchEntry::texture`
+    /// so the inline central panel and the popout window can each hold the
+    /// most recent frame decoded at their own repaint cadence without
+    /// stepping on each other. Wrapped for the same `Fn`-closure reason as
+    /// `WatchEntry::decoder`.
+    texture: Arc<Mutex<Option<egui::TextureHandle>>>,
+    /// Set from inside the popout's `viewport_ui_cb` when it observes
+    /// `ViewportInfo::close_requested()` (OS close button, Alt+F4, etc.).
+    /// Polled once per main-thread frame in `show_popouts` so the entry can
+    /// be un-popped-out (returned to the central panel) instead of just
+    /// leaking into a window that no longer repaints.
+    close_requested: Arc<AtomicBool>,
 }
 
 enum Status {
@@ -341,7 +373,10 @@ impl Connected {
         } else {
             match StreamDecoder::new(stream_id) {
                 Ok(decoder) => {
-                    self.watches.insert(key, WatchEntry { decoder, texture: None });
+                    self.watches.insert(
+                        key,
+                        WatchEntry { decoder: Arc::new(Mutex::new(decoder)), texture: None, popout: None },
+                    );
                     self.selected_watch = Some(key);
                     self.watch_error = None;
 
@@ -361,15 +396,148 @@ impl Connected {
 
     /// Upload any freshly decoded frames to their stream's texture. Call
     /// once per repaint; cheap no-op when nothing new has decoded.
+    ///
+    /// Skips popped-out entries: once a stream is popped out, its own
+    /// viewport closure (`show_popouts`) is the sole `latest_frame()`
+    /// poller for that stream, so the main-thread pass here doesn't steal
+    /// frames out from under it.
     fn update_watch_textures(&mut self, ctx: &egui::Context) {
         for ((owner, stream_id), entry) in self.watches.iter_mut() {
-            if let Some(image) = entry.decoder.latest_frame() {
+            if entry.popout.is_some() {
+                continue;
+            }
+            let image = entry.decoder.lock().unwrap().latest_frame();
+            if let Some(image) = image {
                 match &mut entry.texture {
                     Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
                     None => {
                         let name = format!("stream-{owner:016x}-{stream_id}");
                         entry.texture = Some(ctx.load_texture(name, image, egui::TextureOptions::LINEAR));
                     }
+                }
+            }
+        }
+    }
+
+    /// "Pop out" clicked for `(owner, stream_id)`: mark that `WatchEntry` as
+    /// popped-out so the central panel stops rendering it and `show_popouts`
+    /// starts giving it its own native window instead.
+    fn pop_out(&mut self, owner: ConnId, stream_id: StreamId) {
+        let key = (owner, stream_id);
+        if self.selected_watch == Some(key) {
+            // Free the central panel to show something else immediately —
+            // otherwise it'd sit on "(popped out)" with nothing to fall
+            // back to for a lone watched stream.
+            self.selected_watch = self.watches.keys().find(|k| **k != key).copied();
+        }
+        if let Some(entry) = self.watches.get_mut(&key) {
+            entry.popout = Some(PopoutState {
+                texture: Arc::new(Mutex::new(None)),
+                close_requested: Arc::new(AtomicBool::new(false)),
+            });
+        }
+    }
+
+    /// For every currently popped-out `WatchEntry`, (re)declare its deferred
+    /// viewport — `show_viewport_deferred` must be called every frame a
+    /// viewport should keep existing, per egui's viewport API. Call once per
+    /// repaint, alongside `update_watch_textures`.
+    fn show_popouts(&mut self, ctx: &egui::Context) {
+        for ((owner, stream_id), entry) in self.watches.iter() {
+            let Some(popout) = &entry.popout else { continue };
+            let owner = *owner;
+            let stream_id = *stream_id;
+            let viewport_id = egui::ViewportId::from_hash_of((owner, stream_id));
+            let decoder = entry.decoder.clone();
+            let texture = popout.texture.clone();
+            let close_requested = popout.close_requested.clone();
+            let title = format!("Stream {stream_id} — {owner:016x}");
+
+            ctx.show_viewport_deferred(
+                viewport_id,
+                egui::ViewportBuilder::default().with_decorations(false).with_title(title),
+                move |ctx, _class| {
+                    // Poll this stream's decoder on the popout's own
+                    // repaint cadence rather than the root viewport's —
+                    // `show_viewport_deferred`'s closure is driven
+                    // independently once the viewport is a real native
+                    // window, which is exactly what lets a high-refresh-rate
+                    // popped-out stream repaint faster than a slower main
+                    // window.
+                    let mut got_new_frame = false;
+                    if let Some(image) = decoder.lock().unwrap().latest_frame() {
+                        let mut tex_guard = texture.lock().unwrap();
+                        match &mut *tex_guard {
+                            Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
+                            None => {
+                                let name = format!("popout-{owner:016x}-{stream_id}");
+                                *tex_guard = Some(ctx.load_texture(name, image, egui::TextureOptions::LINEAR));
+                            }
+                        }
+                        got_new_frame = true;
+                    }
+
+                    egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
+                        let tex_guard = texture.lock().unwrap();
+                        match &*tex_guard {
+                            Some(tex) => {
+                                let available = ui.available_size();
+                                let tex_size = tex.size_vec2();
+                                let scale = if tex_size.x > 0.0 && tex_size.y > 0.0 {
+                                    (available.x / tex_size.x).min(available.y / tex_size.y)
+                                } else {
+                                    1.0
+                                };
+                                let display_size = tex_size * scale.max(0.01);
+                                ui.centered_and_justified(|ui| ui.image((tex.id(), display_size)));
+                            }
+                            None => {
+                                ui.centered_and_justified(|ui| ui.label("Waiting for first decoded frame…"));
+                            }
+                        }
+                    });
+
+                    if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+                        let is_fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_fullscreen));
+                    }
+
+                    if ctx.input(|i| i.viewport().close_requested()) {
+                        close_requested.store(true, Ordering::Relaxed);
+                    }
+
+                    // Only this viewport, not the whole app, needs to
+                    // repaint again for the frame we just drew.
+                    if got_new_frame {
+                        ctx.request_repaint();
+                    }
+                },
+            );
+        }
+
+        // Re-embed any popouts whose native window the user closed, instead
+        // of leaving them marked popped-out with nothing left repainting
+        // them.
+        let mut to_unpop: Vec<(ConnId, StreamId)> = Vec::new();
+        for (key, entry) in self.watches.iter() {
+            if let Some(popout) = &entry.popout {
+                if popout.close_requested.load(Ordering::Relaxed) {
+                    to_unpop.push(*key);
+                }
+            }
+        }
+        for key in to_unpop {
+            if let Some(entry) = self.watches.get_mut(&key) {
+                if let Some(popout) = entry.popout.take() {
+                    // Hand the popout's last frame over as the inline
+                    // texture so returning to the central panel doesn't
+                    // flash blank until the next decoded frame.
+                    if let Some(tex) = popout.texture.lock().unwrap().take() {
+                        entry.texture = Some(tex);
+                    }
+                }
+                if self.selected_watch.is_none() {
+                    self.selected_watch = Some(key);
                 }
             }
         }
@@ -464,7 +632,7 @@ impl App {
                 }
                 ClientEvent::MediaFrame(frame) => {
                     if let Some(entry) = connected.watches.get_mut(&(frame.conn_id, frame.stream_id)) {
-                        entry.decoder.feed(&frame);
+                        entry.decoder.lock().unwrap().feed(&frame);
                     }
                 }
                 ClientEvent::Preview(preview) => match decode::decode_preview(&preview) {
@@ -735,6 +903,7 @@ impl App {
             ui.label("(none active)");
         } else {
             let mut to_toggle: Option<(ConnId, StreamId)> = None;
+            let mut to_pop_out: Option<(ConnId, StreamId)> = None;
             for info in &connected.streams {
                 if info.kind != StreamKind::Video {
                     // decode.rs only handles video in this pass.
@@ -769,6 +938,8 @@ impl App {
                         }
                     }
 
+                    let popped_out = connected.watches.get(&key).is_some_and(|e| e.popout.is_some());
+
                     ui.vertical(|ui| {
                         ui.label(format!("{owner_name} — {} ({}x{})", info.label, info.width, info.height));
                         ui.horizontal(|ui| {
@@ -776,7 +947,19 @@ impl App {
                             if ui.small_button(button_label).clicked() {
                                 to_toggle = Some(key);
                             }
-                            if connected.selected_watch == Some(key) {
+                            if watching {
+                                // Pop out into its own native window (or,
+                                // once popped out, this just reports state —
+                                // closing that window is how it comes back).
+                                ui.add_enabled_ui(!popped_out, |ui| {
+                                    if ui.small_button("Pop out").clicked() {
+                                        to_pop_out = Some(key);
+                                    }
+                                });
+                            }
+                            if popped_out {
+                                ui.colored_label(egui::Color32::LIGHT_BLUE, "(popped out)");
+                            } else if connected.selected_watch == Some(key) {
                                 ui.colored_label(egui::Color32::from_rgb(80, 200, 120), "(viewing)");
                             }
                         });
@@ -786,12 +969,18 @@ impl App {
             if let Some((owner, stream_id)) = to_toggle {
                 connected.toggle_watch(owner, stream_id);
             }
+            if let Some((owner, stream_id)) = to_pop_out {
+                connected.pop_out(owner, stream_id);
+            }
         }
 
         ui.add_space(12.0);
         ui.separator();
         ui.label("Video");
         match connected.selected_watch.and_then(|key| connected.watches.get(&key)) {
+            Some(entry) if entry.popout.is_some() => {
+                ui.label("(popped out — see its separate window; close that window to bring it back here)");
+            }
             Some(entry) => match &entry.texture {
                 Some(tex) => {
                     let available = ui.available_size();
@@ -823,6 +1012,7 @@ impl eframe::App for App {
             connected.poll_share_states();
             connected.poll_audio_sources();
             connected.update_watch_textures(ctx);
+            connected.show_popouts(ctx);
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
