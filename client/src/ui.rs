@@ -159,6 +159,11 @@ pub struct App {
     connected: Option<Connected>,
     room_store: RoomStore,
     room_store_error: Option<String>,
+    /// Current UI language ("en" or "de"), mirrored into `rust_i18n`'s
+    /// global locale on startup and on every toggle. Kept here too (rather
+    /// than re-reading `rust_i18n::locale()` each frame) so the language
+    /// `ComboBox` has a plain `&mut String` to bind to.
+    language: String,
 }
 
 impl Default for App {
@@ -167,6 +172,8 @@ impl Default for App {
             Ok(store) => (store, None),
             Err(e) => (RoomStore::default(), Some(e.to_string())),
         };
+        let language = crate::rooms::AppSettings::load().language;
+        rust_i18n::set_locale(&language);
         Self {
             join_string: String::new(),
             display_name: whoami_fallback(),
@@ -175,7 +182,18 @@ impl Default for App {
             connected: None,
             room_store,
             room_store_error,
+            language,
         }
+    }
+}
+
+/// Persist the current language choice, logging (not panicking) on failure —
+/// losing the language preference across restarts is a minor inconvenience,
+/// not worth surfacing as a UI error.
+fn save_language(language: &str) {
+    let settings = crate::rooms::AppSettings { language: language.to_string() };
+    if let Err(e) = settings.save() {
+        tracing::warn!("failed to save language preference: {e:#}");
     }
 }
 
@@ -184,7 +202,7 @@ impl Default for App {
 fn whoami_fallback() -> String {
     std::env::var("USER")
         .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "friend".to_string())
+        .unwrap_or_else(|_| t!("common.default_display_name").to_string())
 }
 
 impl Connected {
@@ -204,7 +222,7 @@ impl Connected {
             stream_id,
             ActiveShare {
                 kind: StreamKind::Video,
-                label: "Screen share".to_string(),
+                label: t!("share.video_label").to_string(),
                 status: ShareStatus::Starting(rx),
             },
         );
@@ -288,7 +306,7 @@ impl Connected {
                     }
                     Err(oneshot::error::TryRecvError::Empty) => {}
                     Err(oneshot::error::TryRecvError::Closed) => {
-                        self.share_error = Some("share-start task ended unexpectedly".to_string());
+                        self.share_error = Some(t!("errors.share_start_task_ended").to_string());
                         to_remove.push(*stream_id);
                     }
                 },
@@ -300,7 +318,7 @@ impl Connected {
                     }
                     Err(oneshot::error::TryRecvError::Empty) => {}
                     Err(oneshot::error::TryRecvError::Closed) => {
-                        self.share_error = Some("share-stop task ended unexpectedly".to_string());
+                        self.share_error = Some(t!("errors.share_stop_task_ended").to_string());
                         to_remove.push(*stream_id);
                     }
                 },
@@ -347,7 +365,7 @@ impl Connected {
             }
             Err(oneshot::error::TryRecvError::Empty) => {}
             Err(oneshot::error::TryRecvError::Closed) => {
-                self.audio_sources_error = Some("audio source listing task ended unexpectedly".to_string());
+                self.audio_sources_error = Some(t!("errors.audio_sources_task_ended").to_string());
                 self.audio_sources_rx = None;
             }
         }
@@ -451,7 +469,7 @@ impl Connected {
             let decoder = entry.decoder.clone();
             let texture = popout.texture.clone();
             let close_requested = popout.close_requested.clone();
-            let title = format!("Stream {stream_id} — {owner:016x}");
+            let title = t!("popout.title", stream_id = stream_id, owner = format!("{owner:016x}")).to_string();
 
             ctx.show_viewport_deferred(
                 viewport_id,
@@ -492,7 +510,7 @@ impl Connected {
                                 ui.centered_and_justified(|ui| ui.image((tex.id(), display_size)));
                             }
                             None => {
-                                ui.centered_and_justified(|ui| ui.label("Waiting for first decoded frame…"));
+                                ui.centered_and_justified(|ui| ui.label(t!("video.waiting_frame").to_string()));
                             }
                         }
                     });
@@ -595,7 +613,7 @@ impl App {
             }
             Err(oneshot::error::TryRecvError::Empty) => {}
             Err(oneshot::error::TryRecvError::Closed) => {
-                self.status = Status::Error("connection task ended unexpectedly".to_string());
+                self.status = Status::Error(t!("errors.connect_task_ended").to_string());
                 self.connect_rx = None;
             }
         }
@@ -662,7 +680,7 @@ impl App {
                     }
                 },
                 ClientEvent::ControlClosed(reason) => {
-                    self.status = Status::Error(format!("disconnected: {reason}"));
+                    self.status = Status::Error(t!("errors.disconnected", reason = reason).to_string());
                     self.connected = None;
                     return;
                 }
@@ -670,21 +688,48 @@ impl App {
         }
     }
 
+    /// Small "English"/"Deutsch" language switcher. Language names are
+    /// deliberately left untranslated (a language selector conventionally
+    /// shows each option in its own language, e.g. "Deutsch" rather than
+    /// "German" while in English mode) so a user can always find their way
+    /// back regardless of the current locale.
+    fn ui_language_toggle(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label(t!("settings.language_label").to_string());
+            let mut changed = false;
+            if ui.selectable_label(self.language == "en", "English").clicked() && self.language != "en" {
+                self.language = "en".to_string();
+                changed = true;
+            }
+            if ui.selectable_label(self.language == "de", "Deutsch").clicked() && self.language != "de" {
+                self.language = "de".to_string();
+                changed = true;
+            }
+            if changed {
+                rust_i18n::set_locale(&self.language);
+                save_language(&self.language);
+            }
+        });
+    }
+
     fn ui_join_screen(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Simple Screensharing");
+        self.ui_language_toggle(ui);
+        ui.add_space(4.0);
+
+        ui.heading(t!("app.title").to_string());
         ui.add_space(8.0);
 
-        ui.label("Display name");
+        ui.label(t!("join.display_name_label").to_string());
         ui.text_edit_singleline(&mut self.display_name);
         ui.add_space(4.0);
 
-        ui.label("Join link (server|room-id|key)");
+        ui.label(t!("join.link_label").to_string());
         ui.text_edit_singleline(&mut self.join_string);
         ui.add_space(8.0);
 
         let connecting = matches!(self.status, Status::Connecting);
         ui.add_enabled_ui(!connecting && !self.join_string.trim().is_empty(), |ui| {
-            if ui.button("Join").clicked() {
+            if ui.button(t!("join.button").to_string()).clicked() {
                 self.start_connect();
             }
         });
@@ -694,32 +739,32 @@ impl App {
             Status::Connecting => {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label("Connecting…");
+                    ui.label(t!("join.connecting").to_string());
                 });
             }
             Status::Error(e) => {
-                ui.colored_label(egui::Color32::RED, format!("Error: {e}"));
+                ui.colored_label(egui::Color32::RED, t!("join.error", error = e).to_string());
             }
         }
 
         ui.add_space(12.0);
         ui.separator();
-        ui.label("Saved lounges");
+        ui.label(t!("join.saved_lounges").to_string());
         if let Some(err) = &self.room_store_error {
-            ui.colored_label(egui::Color32::RED, format!("Could not load saved rooms: {err}"));
+            ui.colored_label(egui::Color32::RED, t!("join.load_error", error = err).to_string());
         }
         if self.room_store.rooms.is_empty() {
-            ui.label("(none yet)");
+            ui.label(t!("join.no_saved_rooms").to_string());
         } else {
             let mut to_join: Option<String> = None;
             let mut to_remove: Option<String> = None;
             for room in &self.room_store.rooms {
                 ui.horizontal(|ui| {
                     ui.label(&room.name);
-                    if ui.small_button("Join").clicked() {
+                    if ui.small_button(t!("join.button").to_string()).clicked() {
                         to_join = Some(room.join_string.clone());
                     }
-                    if ui.small_button("Remove").clicked() {
+                    if ui.small_button(t!("rooms.remove_button").to_string()).clicked() {
                         to_remove = Some(room.name.clone());
                     }
                 });
@@ -740,19 +785,19 @@ impl App {
     fn ui_connected_screen(&mut self, ui: &mut egui::Ui) {
         let Some(connected) = &mut self.connected else { return };
 
-        ui.heading("Simple Screensharing");
-        ui.label(format!(
-            "Connected as {} (conn_id {:016x})",
-            self.display_name,
-            connected.client.conn_id()
-        ));
+        ui.heading(t!("app.title").to_string());
+        ui.label(t!(
+            "connected.status",
+            name = self.display_name,
+            conn_id = format!("{:016x}", connected.client.conn_id())
+        ).to_string());
         ui.add_space(8.0);
 
         ui.horizontal(|ui| {
-            ui.label("Save this room as:");
+            ui.label(t!("rooms.save_label").to_string());
             ui.text_edit_singleline(&mut connected.save_name);
             let can_save = !connected.save_name.trim().is_empty();
-            if ui.add_enabled(can_save, egui::Button::new("Save")).clicked() {
+            if ui.add_enabled(can_save, egui::Button::new(t!("rooms.save_button").to_string())).clicked() {
                 self.room_store.upsert(connected.save_name.clone(), self.join_string.clone());
                 if let Err(e) = self.room_store.save() {
                     self.room_store_error = Some(e.to_string());
@@ -762,12 +807,12 @@ impl App {
             }
         });
         if connected.saved {
-            ui.colored_label(egui::Color32::GREEN, "Saved.");
+            ui.colored_label(egui::Color32::GREEN, t!("rooms.saved_confirmation").to_string());
         }
 
         ui.add_space(12.0);
         ui.separator();
-        ui.label(format!("Members ({})", connected.members.len()));
+        ui.label(t!("members.header", count = connected.members.len()).to_string());
         egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
             // Show all members, not just streamers (spec §8/§4.2: a lurker
             // with stream_count == 0 still appears in the roster).
@@ -775,12 +820,8 @@ impl App {
                 ui.horizontal(|ui| {
                     if member.stream_count > 0 {
                         ui.colored_label(egui::Color32::from_rgb(80, 200, 120), "\u{25cf}");
-                        ui.label(format!(
-                            "{} ({} stream{})",
-                            member.display_name,
-                            member.stream_count,
-                            if member.stream_count == 1 { "" } else { "s" }
-                        ));
+                        let key = if member.stream_count == 1 { "members.stream_singular" } else { "members.stream_plural" };
+                        ui.label(t!(key, name = member.display_name, count = member.stream_count).to_string());
                     } else {
                         ui.colored_label(egui::Color32::GRAY, "\u{25cb}");
                         ui.label(&member.display_name);
@@ -791,9 +832,9 @@ impl App {
 
         ui.add_space(12.0);
         ui.separator();
-        ui.label("Share video");
+        ui.label(t!("share.video_header").to_string());
         ui.horizontal(|ui| {
-            ui.label("Bitrate (kbps):");
+            ui.label(t!("share.bitrate_label").to_string());
             ui.add(egui::Slider::new(&mut connected.bitrate_kbps, MIN_BITRATE_KBPS..=MAX_BITRATE_KBPS));
         });
         ui.horizontal(|ui| {
@@ -801,7 +842,7 @@ impl App {
             // active starts *another* one (a second stream_id), re-prompting
             // the OS portal picker so the user can pick a different
             // monitor/window.
-            if ui.button("Share Screen").clicked() {
+            if ui.button(t!("share.screen_button").to_string()).clicked() {
                 connected.start_video_share();
             }
             let starting_video = connected
@@ -810,19 +851,19 @@ impl App {
                 .any(|s| s.kind == StreamKind::Video && matches!(s.status, ShareStatus::Starting(_)));
             if starting_video {
                 ui.spinner();
-                ui.label("Waiting for screen-share permission…");
+                ui.label(t!("share.waiting_permission").to_string());
             }
         });
 
         ui.add_space(12.0);
         ui.separator();
-        ui.label("Share audio");
+        ui.label(t!("share.audio_header").to_string());
         ui.horizontal(|ui| {
             if !connected.audio_sources_requested {
                 connected.audio_sources_requested = true;
                 connected.refresh_audio_sources();
             }
-            if ui.button("Refresh").clicked() {
+            if ui.button(t!("share.refresh_button").to_string()).clicked() {
                 connected.refresh_audio_sources();
             }
             if connected.audio_sources_rx.is_some() {
@@ -830,12 +871,13 @@ impl App {
             }
         });
         ui.horizontal(|ui| {
+            let placeholder = t!("share.select_source_placeholder").to_string();
             let selected_text = connected
                 .selected_audio_source
                 .as_ref()
                 .map(|s| s.name.as_str())
-                .unwrap_or("(select a source)");
-            egui::ComboBox::from_label("Source")
+                .unwrap_or(placeholder.as_str());
+            egui::ComboBox::from_label(t!("share.source_label").to_string())
                 .selected_text(selected_text)
                 .show_ui(ui, |ui| {
                     for source in &connected.audio_sources {
@@ -846,22 +888,22 @@ impl App {
                     }
                 });
             let can_share_audio = connected.selected_audio_source.is_some();
-            if ui.add_enabled(can_share_audio, egui::Button::new("Share Audio")).clicked() {
+            if ui.add_enabled(can_share_audio, egui::Button::new(t!("share.audio_button").to_string())).clicked() {
                 connected.start_audio_share();
             }
         });
         if connected.audio_sources.is_empty() && connected.audio_sources_rx.is_none() {
-            ui.label("(no audio sources found — click Refresh once something is playing)");
+            ui.label(t!("share.no_audio_sources").to_string());
         }
         if let Some(err) = &connected.audio_sources_error {
-            ui.colored_label(egui::Color32::RED, format!("Audio source list error: {err}"));
+            ui.colored_label(egui::Color32::RED, t!("share.audio_sources_error", error = err).to_string());
         }
 
         ui.add_space(12.0);
         ui.separator();
-        ui.label("Active shares");
+        ui.label(t!("share.active_header").to_string());
         if connected.active_shares.is_empty() {
-            ui.label("(none)");
+            ui.label(t!("share.none").to_string());
         } else {
             let mut stream_ids: Vec<StreamId> = connected.active_shares.keys().copied().collect();
             stream_ids.sort_unstable();
@@ -869,17 +911,30 @@ impl App {
             for stream_id in stream_ids {
                 let share = &connected.active_shares[&stream_id];
                 let kind_label = match share.kind {
-                    StreamKind::Video => "Video",
-                    StreamKind::Audio => "Audio",
+                    StreamKind::Video => t!("share.kind_video").to_string(),
+                    StreamKind::Audio => t!("share.kind_audio").to_string(),
                 };
                 let (state_label, stoppable) = match &share.status {
-                    ShareStatus::Starting(_) => ("Starting…", false),
-                    ShareStatus::Active(_) => ("Active", true),
-                    ShareStatus::Stopping(_) => ("Stopping…", false),
+                    ShareStatus::Starting(_) => (t!("share.state_starting").to_string(), false),
+                    ShareStatus::Active(_) => (t!("share.state_active").to_string(), true),
+                    ShareStatus::Stopping(_) => (t!("share.state_stopping").to_string(), false),
                 };
                 ui.horizontal(|ui| {
-                    ui.label(format!("[{stream_id}] {kind_label}: {} — {state_label}", share.label));
-                    let stop_label = if share.kind == StreamKind::Audio { "Stop Sharing Audio" } else { "Stop Sharing" };
+                    ui.label(
+                        t!(
+                            "share.active_line",
+                            stream_id = stream_id,
+                            kind = kind_label,
+                            label = share.label.clone(),
+                            state = state_label
+                        )
+                        .to_string(),
+                    );
+                    let stop_label = if share.kind == StreamKind::Audio {
+                        t!("share.stop_audio_button").to_string()
+                    } else {
+                        t!("share.stop_button").to_string()
+                    };
                     if ui.add_enabled(stoppable, egui::Button::new(stop_label)).clicked() {
                         to_stop.push(stream_id);
                     }
@@ -890,20 +945,21 @@ impl App {
             }
         }
         if let Some(err) = &connected.share_error {
-            ui.colored_label(egui::Color32::RED, format!("Share error: {err}"));
+            ui.colored_label(egui::Color32::RED, t!("share.error", error = err).to_string());
         }
 
         ui.add_space(12.0);
         ui.separator();
-        ui.label("Streams");
+        ui.label(t!("streams.header").to_string());
         if let Some(err) = &connected.watch_error {
-            ui.colored_label(egui::Color32::RED, format!("Watch error: {err}"));
+            ui.colored_label(egui::Color32::RED, t!("streams.watch_error", error = err).to_string());
         }
         if connected.streams.is_empty() {
-            ui.label("(none active)");
+            ui.label(t!("streams.none_active").to_string());
         } else {
             let mut to_toggle: Option<(ConnId, StreamId)> = None;
             let mut to_pop_out: Option<(ConnId, StreamId)> = None;
+            let unknown_owner = t!("streams.unknown_owner").to_string();
             for info in &connected.streams {
                 if info.kind != StreamKind::Video {
                     // decode.rs only handles video in this pass.
@@ -916,7 +972,7 @@ impl App {
                     .iter()
                     .find(|m| m.conn_id == info.owner)
                     .map(|m| m.display_name.as_str())
-                    .unwrap_or("unknown");
+                    .unwrap_or(unknown_owner.as_str());
                 ui.horizontal(|ui| {
                     // Thumbnail (or a placeholder box until the first
                     // preview for this stream arrives) — previews arrive
@@ -941,9 +997,22 @@ impl App {
                     let popped_out = connected.watches.get(&key).is_some_and(|e| e.popout.is_some());
 
                     ui.vertical(|ui| {
-                        ui.label(format!("{owner_name} — {} ({}x{})", info.label, info.width, info.height));
+                        ui.label(
+                            t!(
+                                "streams.line",
+                                owner = owner_name,
+                                label = info.label.clone(),
+                                width = info.width,
+                                height = info.height
+                            )
+                            .to_string(),
+                        );
                         ui.horizontal(|ui| {
-                            let button_label = if watching { "Stop Watching" } else { "Watch" };
+                            let button_label = if watching {
+                                t!("streams.stop_watching_button").to_string()
+                            } else {
+                                t!("streams.watch_button").to_string()
+                            };
                             if ui.small_button(button_label).clicked() {
                                 to_toggle = Some(key);
                             }
@@ -952,15 +1021,15 @@ impl App {
                                 // once popped out, this just reports state —
                                 // closing that window is how it comes back).
                                 ui.add_enabled_ui(!popped_out, |ui| {
-                                    if ui.small_button("Pop out").clicked() {
+                                    if ui.small_button(t!("streams.pop_out_button").to_string()).clicked() {
                                         to_pop_out = Some(key);
                                     }
                                 });
                             }
                             if popped_out {
-                                ui.colored_label(egui::Color32::LIGHT_BLUE, "(popped out)");
+                                ui.colored_label(egui::Color32::LIGHT_BLUE, t!("streams.popped_out").to_string());
                             } else if connected.selected_watch == Some(key) {
-                                ui.colored_label(egui::Color32::from_rgb(80, 200, 120), "(viewing)");
+                                ui.colored_label(egui::Color32::from_rgb(80, 200, 120), t!("streams.viewing").to_string());
                             }
                         });
                     });
@@ -976,10 +1045,10 @@ impl App {
 
         ui.add_space(12.0);
         ui.separator();
-        ui.label("Video");
+        ui.label(t!("video.header").to_string());
         match connected.selected_watch.and_then(|key| connected.watches.get(&key)) {
             Some(entry) if entry.popout.is_some() => {
-                ui.label("(popped out — see its separate window; close that window to bring it back here)");
+                ui.label(t!("video.popped_out_note").to_string());
             }
             Some(entry) => match &entry.texture {
                 Some(tex) => {
@@ -994,11 +1063,11 @@ impl App {
                     ui.image((tex.id(), display_size));
                 }
                 None => {
-                    ui.label("Waiting for first decoded frame…");
+                    ui.label(t!("video.waiting_frame").to_string());
                 }
             },
             None => {
-                ui.label("(not watching any stream)");
+                ui.label(t!("video.not_watching").to_string());
             }
         }
     }

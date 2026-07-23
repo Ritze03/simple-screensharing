@@ -5,6 +5,11 @@
 //! (`ui.rs`) are implemented. Capture and decode/render are still follow-up
 //! work — see their module doc-comments.
 
+#[macro_use]
+extern crate rust_i18n;
+
+i18n!("locales", fallback = "en");
+
 mod audio;
 mod capture;
 mod decode;
