@@ -24,6 +24,14 @@ env:
   GST_ARCH: "x86_64"
   # Fixed install location for both MSIs (kept short/simple to avoid any
   # path-length or space issues with MSVC/pkg-config tooling).
+  #
+  # NOTE: the GStreamer MSI's INSTALLDIR property is the *parent* dir — the
+  # installer appends its own "1.0\msvc_x86_64" (version\arch) subpath onto
+  # whatever INSTALLDIR you give it. So INSTALLDIR must be set to
+  # GST_INSTALL_PARENT ("C:\gstreamer"), and the files actually end up at
+  # GST_ROOT ("C:\gstreamer\1.0\msvc_x86_64"), which is what every other
+  # step (PATH, PKG_CONFIG_PATH, packaging) needs to reference.
+  GST_INSTALL_PARENT: "C:\\gstreamer"
   GST_ROOT: "C:\\gstreamer\\1.0\\msvc_x86_64"
 
 jobs:
@@ -92,7 +100,7 @@ jobs:
               "/i", "`"$msiPath`"",
               "/qn",
               "ADDLOCAL=ALL",
-              "INSTALLDIR=`"$env:GST_ROOT`"",
+              "INSTALLDIR=`"$env:GST_INSTALL_PARENT`"",
               "/l*v", "`"$logPath`""
             )
             $proc = Start-Process -FilePath msiexec.exe -ArgumentList $msiArgs -Wait -PassThru -NoNewWindow
@@ -105,26 +113,11 @@ jobs:
           Install-GstMsi "$dir\gstreamer-runtime.msi" "$env:RUNNER_TEMP\gst-runtime-install.log"
           Install-GstMsi "$dir\gstreamer-devel.msi" "$env:RUNNER_TEMP\gst-devel-install.log"
 
-      # TEMPORARY debug step: dump what actually landed on disk so we can
-      # see why pkg-config can't find the .pc files. Remove once resolved.
-      - name: DEBUG list GStreamer install tree
-        shell: pwsh
-        run: |
-          Write-Host "--- Test-Path GST_ROOT ---"
-          Test-Path $env:GST_ROOT
-          Write-Host "--- C:\gstreamer tree (2 levels) ---"
-          Get-ChildItem -Path "C:\gstreamer" -Recurse -Depth 3 -ErrorAction SilentlyContinue | Select-Object FullName
-          Write-Host "--- Any gstreamer-1.0.pc anywhere on C: ---"
-          Get-ChildItem -Path "C:\" -Recurse -Filter "gstreamer-1.0.pc" -ErrorAction SilentlyContinue | Select-Object FullName
-          Write-Host "--- Program Files search ---"
-          Get-ChildItem -Path "C:\Program Files" -Directory -Filter "*streamer*" -ErrorAction SilentlyContinue
-          Get-ChildItem -Path "C:\Program Files (x86)" -Directory -Filter "*streamer*" -ErrorAction SilentlyContinue
-
-      # Always upload the msiexec logs so a failed (or successful-but-wrong)
-      # install's diagnostics are actually inspectable instead of just
-      # "cargo build had a linker error".
-      - name: Upload GStreamer install logs
-        if: always()
+      # Upload the msiexec logs whenever the install step (or anything
+      # after it) fails, so a failed run's diagnostics are actually
+      # inspectable instead of just "cargo build had a linker error".
+      - name: Upload GStreamer install logs (on failure)
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: gstreamer-install-logs
