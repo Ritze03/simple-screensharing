@@ -1,0 +1,212 @@
+name: Windows build
+
+# Why this workflow exists: the project owner develops on Linux and has no
+# way to test a Windows build locally. This builds the desktop client
+# natively on a windows-latest GitHub-hosted runner so a Windows-using friend
+# can download the resulting .exe (+ its GStreamer runtime DLLs) from the
+# workflow run and smoke-test it.
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  # Lets the project owner trigger a fresh build on demand from the Actions
+  # tab whenever they want a new build to hand off, without needing a push.
+  workflow_dispatch: {}
+
+env:
+  # Pinned GStreamer release used for both the build-time dev libs and the
+  # runtime DLLs shipped in the artifact. Keep this on an *even* minor
+  # version (1.26.x, 1.24.x, ...) — GStreamer's odd/dev releases (1.27.x,
+  # 1.29.x, ...) switched to a single all-in-one .exe installer instead of
+  # the classic separate runtime + devel .msi pair this workflow relies on.
+  GST_VERSION: "1.26.9"
+  GST_ARCH: "x86_64"
+  # Fixed install location for both MSIs (kept short/simple to avoid any
+  # path-length or space issues with MSVC/pkg-config tooling).
+  GST_ROOT: "C:\\gstreamer\\1.0\\msvc_x86_64"
+
+jobs:
+  windows-build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # windows-latest ships Rust via rustup already, but we pin/verify the
+      # toolchain and explicitly add the MSVC target rather than relying on
+      # whatever happens to be preinstalled.
+      - name: Install Rust (stable, x86_64-pc-windows-msvc)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-msvc-gst${{ env.GST_VERSION }}
+
+      # --- GStreamer -----------------------------------------------------
+      # gstreamer/gstreamer-app/gstreamer-video are thin wrappers around
+      # *-sys crates whose build.rs shells out to pkg-config to locate
+      # GStreamer's headers/libs, so `cargo build` cannot succeed without a
+      # GStreamer *development* install present, and the resulting .exe
+      # needs the GStreamer *runtime* DLLs beside it to actually launch.
+      #
+      # GStreamer doesn't publish an official Chocolatey package, so — per
+      # gstreamer-rs's own README (Windows installation section) and
+      # mirroring how its CI locates GStreamer — we download the two
+      # official MSVC installers directly from gstreamer.freedesktop.org
+      # and run them unattended via msiexec.
+      - name: Cache downloaded GStreamer installers
+        id: gst-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\gst-installers
+          key: gst-installers-${{ env.GST_VERSION }}-${{ env.GST_ARCH }}
+
+      - name: Download GStreamer MSVC installers
+        if: steps.gst-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dir = "$env:RUNNER_TEMP\gst-installers"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $base = "https://gstreamer.freedesktop.org/data/pkg/windows/$env:GST_VERSION/msvc"
+          Invoke-WebRequest -Uri "$base/gstreamer-1.0-msvc-$env:GST_ARCH-$env:GST_VERSION.msi" -OutFile "$dir\gstreamer-runtime.msi"
+          Invoke-WebRequest -Uri "$base/gstreamer-1.0-devel-msvc-$env:GST_ARCH-$env:GST_VERSION.msi" -OutFile "$dir\gstreamer-devel.msi"
+
+      - name: Install GStreamer runtime + devel (silent)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dir = "$env:RUNNER_TEMP\gst-installers"
+
+          function Install-GstMsi($msiPath, $logPath) {
+            # ADDLOCAL=ALL installs every optional MSI feature — all plugin
+            # sets on the runtime installer, and (on the devel installer)
+            # the pkgconfig .pc files + bundled pkg-config.exe that
+            # gstreamer-rs's build scripts need. /qn is fully unattended.
+            $msiArgs = @(
+              "/i", "`"$msiPath`"",
+              "/qn",
+              "ADDLOCAL=ALL",
+              "INSTALLDIR=`"$env:GST_ROOT`"",
+              "/l*v", "`"$logPath`""
+            )
+            $proc = Start-Process -FilePath msiexec.exe -ArgumentList $msiArgs -Wait -PassThru -NoNewWindow
+            if ($proc.ExitCode -ne 0) {
+              Write-Host "::error::msiexec failed for $msiPath with exit code $($proc.ExitCode). See uploaded log for details."
+              exit 1
+            }
+          }
+
+          Install-GstMsi "$dir\gstreamer-runtime.msi" "$env:RUNNER_TEMP\gst-runtime-install.log"
+          Install-GstMsi "$dir\gstreamer-devel.msi" "$env:RUNNER_TEMP\gst-devel-install.log"
+
+      # Upload the msiexec logs whenever the install step (or anything
+      # after it) fails, so a failed run's diagnostics are actually
+      # inspectable instead of just "cargo build had a linker error".
+      - name: Upload GStreamer install logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gstreamer-install-logs
+          path: ${{ runner.temp }}\gst-*-install.log
+          if-no-files-found: ignore
+
+      - name: Configure environment for GStreamer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          # GSTREAMER_1_0_ROOT_MSVC_X86_64 is the variable gstreamer-rs's own
+          # CI/tooling and various build helpers look for.
+          Add-Content -Path $env:GITHUB_ENV -Value "GSTREAMER_1_0_ROOT_MSVC_X86_64=$env:GST_ROOT"
+          # Prepend GStreamer's bin dir to PATH: it holds both the runtime
+          # DLLs (needed at build-time too, e.g. for build-script probes)
+          # and GStreamer's own bundled pkg-config.exe, which per
+          # gstreamer-rs's README must be found *before* any other
+          # pkg-config on PATH.
+          Add-Content -Path $env:GITHUB_PATH -Value "$env:GST_ROOT\bin"
+          # Whichever pkg-config.exe ends up being used needs to be told
+          # where the GStreamer .pc files live.
+          Add-Content -Path $env:GITHUB_ENV -Value "PKG_CONFIG_PATH=$env:GST_ROOT\lib\pkgconfig"
+
+      - name: Install fallback pkg-config (belt-and-suspenders)
+        shell: pwsh
+        run: |
+          # GStreamer's devel MSI is documented to bundle its own
+          # pkg-config.exe, but in case that particular feature wasn't
+          # where expected, make sure *some* working pkg-config is on
+          # PATH too. Because GStreamer's own bin dir was prepended above,
+          # GStreamer's copy (if present) is still found first.
+          choco install pkgconfiglite -y --no-progress
+
+      - name: Sanity-check pkg-config can see GStreamer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Get-Command pkg-config
+          pkg-config --modversion gstreamer-1.0
+          pkg-config --modversion gstreamer-app-1.0
+          pkg-config --modversion gstreamer-video-1.0
+
+      - name: cargo build --release
+        shell: pwsh
+        run: cargo build --release --target x86_64-pc-windows-msvc --locked
+
+      # --- Package the artifact ------------------------------------------
+      # Ship the .exe alongside GStreamer's runtime DLLs and plugins so the
+      # friend doesn't need to install GStreamer themselves. Bundling the
+      # whole GStreamer bin/plugin set (rather than hand-picking a minimal
+      # DLL subset) is deliberately conservative: this app depends on
+      # gstreamer-app/-video on top of core, and hand-tracing the exact
+      # transitive DLL closure is brittle for a one-off smoke-test build.
+      - name: Stage build output for the artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dist = "dist"
+          New-Item -ItemType Directory -Force -Path "$dist\bin" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$dist\lib\gstreamer-1.0" | Out-Null
+
+          Copy-Item "target\x86_64-pc-windows-msvc\release\simple-screensharing-client.exe" "$dist\bin\"
+          Copy-Item "$env:GST_ROOT\bin\*.dll" "$dist\bin\"
+
+          # Plugins (encoders/decoders/etc.), looked up by GStreamer
+          # relative to the DLLs at ..\lib\gstreamer-1.0 — which is exactly
+          # the bin\ + lib\ layout staged here.
+          Copy-Item "$env:GST_ROOT\lib\gstreamer-1.0\*" "$dist\lib\gstreamer-1.0\" -Recurse
+
+          # Fallback launcher in case relative-path plugin discovery
+          # doesn't kick in on the friend's machine: sets GST_PLUGIN_PATH
+          # explicitly before starting the exe.
+          Set-Content -Encoding ascii -Path "$dist\run.bat" -Value @'
+          @echo off
+          set GST_PLUGIN_PATH=%~dp0lib\gstreamer-1.0
+          set PATH=%~dp0bin;%PATH%
+          start "" "%~dp0bin\simple-screensharing-client.exe"
+          '@
+
+          Set-Content -Encoding ascii -Path "$dist\README.txt" -Value @'
+          Simple Screensharing Client - Windows smoke-test build
+          ========================================================
+
+          Double-click run.bat to launch it. That also works if GStreamer's
+          automatic plugin discovery doesn't find lib\gstreamer-1.0 on its
+          own. Running bin\simple-screensharing-client.exe directly should
+          work too in most cases.
+
+          This is an unsigned CI build intended for smoke-testing only -
+          Windows SmartScreen may warn about it being from an unknown
+          publisher.
+          '@
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: simple-screensharing-client-windows-${{ env.GST_ARCH }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
