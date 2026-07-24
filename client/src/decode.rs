@@ -72,14 +72,57 @@
 //!
 //! # Audio
 //!
-// TODO(audio): out of scope for this pass. `ClientEvent::MediaFrame` for a
-// `StreamKind::Audio` stream carries raw Opus packets via the exact same
-// path (reassembled + decrypted in net.rs); a parallel `AudioDecoder`
-// (`appsrc ! opusdec ! audioconvert ! audioresample ! <sink>`, or decoded
-// PCM handed back for `ui.rs`/a future audio-out module to play) is future
-// work and is not implemented here.
+//! `ClientEvent::MediaFrame` for a `StreamKind::Audio` stream carries raw
+//! Opus packets via the exact same path as video (reassembled + decrypted
+//! in `net.rs`; see [`AudioDecoder`] below). Unlike H.264, an Opus packet
+//! never depends on any other packet (`audio.rs`'s sender always marks
+//! `keyframe: true` for exactly this reason — see its comment at
+//! `send_encoded_sample`), so there is no keyframe-gating on the decode
+//! side either: every packet for the subscribed `stream_id` is pushed into
+//! the pipeline as it arrives. Decoded PCM is handed straight to an audio
+//! sink (`autoaudiosink` in production) rather than back to `ui.rs` as
+//! samples to render — there is nothing for the UI to draw each frame, only
+//! a volume knob to expose (see [`AudioDecoder::set_volume`]).
+//!
+//! ## Pipeline
+//!
+//! ```text
+//! appsrc ! opusdec ! audioconvert ! audioresample ! volume name=vol ! autoaudiosink
+//! ```
+//!
+//! `appsrc` is configured with fixed caps `audio/x-opus,
+//! channel-mapping-family=(int)0` and deliberately *no* `channels`/`rate`
+//! fields: `gst-inspect-1.0 opusdec`'s sink pad template accepts
+//! `audio/x-opus, channel-mapping-family: 0` with `channels`/`rate`
+//! unconstrained for exactly the mono/stereo case `opusenc` on the sender
+//! side produces (verified live: `audiotestsrc` encoded through `opusenc`
+//! at both 1 and 2 channels decodes correctly through `opusdec` fed nothing
+//! but those bare caps — libopus recovers the channel count from each
+//! packet's TOC byte). This matters because the wire protocol carries no
+//! separate "audio format" side-channel (`StreamInfo` only has `width`/
+//! `height`, meaningful for video only), so the decoder can't know the
+//! sender's channel count up front any other way.
+//!
+//! `volume` (GStreamer's `volume` element) sits just before the sink so
+//! [`AudioDecoder::set_volume`] can adjust playback level live without
+//! rebuilding the pipeline; its `volume` property is already a 0.0-2.0
+//! linear scale (`gst-inspect-1.0 volume`: "Double. Range: 0 - 10 Default:
+//! 1"), so the UI's 0-200% slider maps onto it by dividing by 100.0 with no
+//! further conversion.
+//!
+//! ## Threading
+//!
+//! Same model as [`StreamDecoder`]: one dedicated `std::thread` per
+//! `AudioDecoder` owns the pipeline for its whole lifetime, fed over a
+//! `std::sync::mpsc` channel by `feed()`/`set_volume()`, with the bus
+//! drained for error/warning logging between messages and a clean
+//! `Shutdown` message + `join()` on `Drop`. There is no `latest_frame()`
+//! equivalent: decoded PCM goes straight through `volume` to the sink
+//! inside GStreamer's own pipeline threads, with nothing for `ui.rs` to
+//! poll or render per frame.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -379,6 +422,220 @@ fn pull_color_image(sink: &AppSink) -> Result<Option<egui::ColorImage>> {
     }
 
     Ok(Some(egui::ColorImage::from_rgba_unmultiplied([width, height], &packed)))
+}
+
+// ---------------------------------------------------------------------
+// Audio decode + playback
+// ---------------------------------------------------------------------
+
+/// Message sent from `feed()`/`set_volume()`/`Drop` to the audio
+/// pipeline-owning thread. Parallel to video's `PipelineMsg`, plus
+/// `SetVolume` since audio has a live-adjustable playback parameter video
+/// doesn't.
+enum AudioPipelineMsg {
+    Packet { pts_us: u64, data: Vec<u8> },
+    SetVolume(f64),
+    Shutdown,
+}
+
+/// Decodes and plays one subscribed audio stream's incoming Opus packets.
+/// See the module docs "Audio" section for the pipeline shape and
+/// threading rationale. Unlike [`StreamDecoder`], there is nothing to poll
+/// each frame — decoded PCM goes straight to the sink — so the only
+/// runtime knob exposed is [`AudioDecoder::set_volume`].
+pub struct AudioDecoder {
+    stream_id: StreamId,
+    tx: std_mpsc::Sender<AudioPipelineMsg>,
+    /// Set once the pipeline reaches `Playing` and cleared just before it's
+    /// torn down; a cheap way for a caller to notice a pipeline that failed
+    /// to start (e.g. `opusdec`/`autoaudiosink` missing) without needing a
+    /// result channel. Not essential to correctness — `feed`/`set_volume`
+    /// degrade gracefully (log + drop) regardless — but cheap enough to be
+    /// worth exposing.
+    alive: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl AudioDecoder {
+    /// Build and start a playback pipeline dedicated to `stream_id`, using
+    /// the real system audio sink. Calls `gstreamer::init()` (idempotent).
+    pub fn new(stream_id: StreamId) -> Result<Self> {
+        Self::new_with_sink(stream_id, "autoaudiosink", true)
+    }
+
+    /// Like `new`, but with the sink element factory name and its `sync`
+    /// property overridable — used by this module's own tests to swap in a
+    /// `fakesink` (so `cargo test` doesn't need a real audio output device)
+    /// with `sync=false` (so a synthetic test clip drains at full speed
+    /// instead of pacing itself against the wall clock the way real
+    /// playback correctly should).
+    fn new_with_sink(stream_id: StreamId, sink_factory: &str, sink_sync: bool) -> Result<Self> {
+        gstreamer::init().context("failed to initialize GStreamer")?;
+
+        let (tx, rx) = std_mpsc::channel::<AudioPipelineMsg>();
+        let alive = Arc::new(AtomicBool::new(false));
+
+        let pipeline_alive = alive.clone();
+        let sink_factory = sink_factory.to_string();
+        let thread = thread::Builder::new()
+            .name(format!("audio-decode-stream-{stream_id}"))
+            .spawn(move || {
+                if let Err(e) = run_audio_pipeline(rx, &sink_factory, sink_sync, pipeline_alive) {
+                    tracing::error!("audio decode pipeline for stream {stream_id} exited with error: {e:#}");
+                }
+            })
+            .context("failed to spawn audio decode pipeline thread")?;
+
+        Ok(Self { stream_id, tx, alive, thread: Some(thread) })
+    }
+
+    pub fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+
+    /// Whether the pipeline thread is currently in `Playing`. `false` both
+    /// before startup completes and after the pipeline has exited/errored.
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
+    }
+
+    /// Feed one already-reassembled-and-decrypted Opus packet (i.e. a
+    /// `ClientEvent::MediaFrame` payload from `net.rs` for a
+    /// `StreamKind::Audio` stream). Packets for a different `stream_id` are
+    /// ignored defensively, mirroring `StreamDecoder::feed`. Never blocks.
+    pub fn feed(&mut self, frame: &DecryptedMediaFrame) {
+        if frame.stream_id != self.stream_id {
+            return;
+        }
+        let msg = AudioPipelineMsg::Packet { pts_us: frame.pts, data: frame.payload.clone() };
+        if self.tx.send(msg).is_err() {
+            tracing::warn!(
+                "audio decode pipeline thread for stream {} is gone; dropping packet",
+                self.stream_id
+            );
+        }
+    }
+
+    /// Set playback volume as a 0.0-2.0 linear factor (matching the
+    /// project's 0-200% requirement 1:1 — see the module docs "Audio"
+    /// section for why no further conversion is needed). Values outside
+    /// that range are clamped rather than rejected, since a UI slider
+    /// bounded to 0..=200% can never actually produce one, but a defensive
+    /// clamp costs nothing. Never blocks.
+    pub fn set_volume(&mut self, volume: f64) {
+        let clamped = volume.clamp(0.0, 2.0);
+        if self.tx.send(AudioPipelineMsg::SetVolume(clamped)).is_err() {
+            tracing::warn!(
+                "audio decode pipeline thread for stream {} is gone; dropping volume change",
+                self.stream_id
+            );
+        }
+    }
+}
+
+impl Drop for AudioDecoder {
+    fn drop(&mut self) {
+        let _ = self.tx.send(AudioPipelineMsg::Shutdown);
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Builds the audio pipeline, drives it to `Playing`, and pumps `rx` until
+/// `Shutdown` (or the channel disconnects because every `AudioDecoder`
+/// handle was dropped) — see module docs "Audio"/"Threading".
+fn run_audio_pipeline(
+    rx: std_mpsc::Receiver<AudioPipelineMsg>,
+    sink_factory: &str,
+    sink_sync: bool,
+    alive: Arc<AtomicBool>,
+) -> Result<()> {
+    let pipeline = Pipeline::new();
+
+    let src = ElementFactory::make("appsrc")
+        .name("src")
+        .build()
+        .context("appsrc element unavailable")?;
+    let decoder = ElementFactory::make("opusdec")
+        .build()
+        .context("opusdec element unavailable (is gst-plugins-base installed?)")?;
+    let convert = ElementFactory::make("audioconvert")
+        .build()
+        .context("audioconvert element unavailable")?;
+    let resample = ElementFactory::make("audioresample")
+        .build()
+        .context("audioresample element unavailable")?;
+    let volume = ElementFactory::make("volume")
+        .name("vol")
+        .build()
+        .context("volume element unavailable")?;
+    let sink = ElementFactory::make(sink_factory)
+        .build()
+        .with_context(|| format!("{sink_factory} element unavailable"))?;
+    sink.set_property("sync", sink_sync);
+
+    pipeline
+        .add_many([&src, &decoder, &convert, &resample, &volume, &sink])
+        .context("failed to add elements to pipeline")?;
+    Element::link_many([&src, &decoder, &convert, &resample, &volume, &sink]).context("failed to link decode chain")?;
+
+    let appsrc = src
+        .dynamic_cast::<AppSrc>()
+        .map_err(|_| anyhow!("appsrc element was not an AppSrc"))?;
+    // No `channels`/`rate` fields — see module docs "Audio" section for why
+    // `opusdec` doesn't need them for the mono/stereo case (`family: 0`)
+    // this project's `opusenc` sender always produces.
+    appsrc.set_caps(Some(&Caps::builder("audio/x-opus").field("channel-mapping-family", 0i32).build()));
+    appsrc.set_is_live(true);
+    appsrc.set_format(gstreamer::Format::Time);
+
+    let bus = pipeline.bus().ok_or_else(|| anyhow!("pipeline has no bus"))?;
+
+    pipeline
+        .set_state(State::Playing)
+        .context("failed to start audio decode pipeline")?;
+    alive.store(true, Ordering::Relaxed);
+
+    let volume_element = volume;
+    let result = pump_audio_loop(&rx, &appsrc, &volume_element, &bus);
+
+    alive.store(false, Ordering::Relaxed);
+    let _ = appsrc.end_of_stream();
+    let _ = pipeline.set_state(State::Null);
+    result
+}
+
+/// Feed loop: pushes Opus packets into `appsrc`, applies volume changes to
+/// the `volume` element, and drains the bus for error/warning logging in
+/// between, until told to shut down. Mirrors video's `pump_loop`.
+fn pump_audio_loop(rx: &std_mpsc::Receiver<AudioPipelineMsg>, appsrc: &AppSrc, volume: &Element, bus: &Bus) -> Result<()> {
+    loop {
+        while let Some(msg) = bus.pop() {
+            log_bus_message(&msg);
+        }
+
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(AudioPipelineMsg::Packet { pts_us, data }) => {
+                let mut buffer = Buffer::from_slice(data);
+                if let Some(buffer_mut) = buffer.get_mut() {
+                    buffer_mut.set_pts(ClockTime::from_useconds(pts_us));
+                }
+                // Same "glitch and continue" policy as video: a bad packet
+                // downstream of a dropped fragment is logged and skipped,
+                // never fatal.
+                if let Err(e) = appsrc.push_buffer(buffer) {
+                    tracing::warn!("appsrc dropped an audio packet: {e:?}");
+                }
+            }
+            Ok(AudioPipelineMsg::SetVolume(v)) => {
+                volume.set_property("volume", v);
+            }
+            Ok(AudioPipelineMsg::Shutdown) => return Ok(()),
+            Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -741,5 +998,120 @@ mod tests {
 
         let _ = pipeline.set_state(State::Null);
         access_units
+    }
+
+    /// End-to-end correctness check of [`AudioDecoder`], mirroring the
+    /// video test above: generate a real Opus stream with `audiotestsrc !
+    /// audioconvert ! audioresample ! opusenc`, feed each encoded packet
+    /// through `AudioDecoder::feed` exactly as `ui.rs` does for an incoming
+    /// `ClientEvent::MediaFrame`, and confirm the pipeline accepts every
+    /// packet without an `Err` from `appsrc.push_buffer` and without the
+    /// pipeline reporting itself dead (`is_alive()` false) partway through —
+    /// i.e. a genuine round trip through the real `opusenc`/`opusdec`
+    /// codecs, not just a construction smoke test. Routes to `fakesink`
+    /// (with `sync=false`) instead of the real `autoaudiosink` used in
+    /// production, per this task's instructions, so the test doesn't depend
+    /// on this environment having a real audio output device and doesn't
+    /// spend 2 seconds of wall-clock time pacing itself against fake PTS
+    /// values. Also exercises `set_volume` at both ends of its documented
+    /// 0.0-2.0 range plus an out-of-range value, confirming the clamp holds
+    /// and nothing panics.
+    #[test]
+    fn decodes_synthetic_opus_stream_without_erroring() {
+        gstreamer::init().expect("gstreamer init");
+
+        const NUM_BUFFERS: i32 = 30;
+
+        let packets = encode_test_opus_clip(NUM_BUFFERS);
+        assert!(!packets.is_empty(), "encoder produced no Opus packets");
+
+        let mut decoder =
+            AudioDecoder::new_with_sink(9, "fakesink", false).expect("failed to build AudioDecoder");
+
+        // Give the pipeline thread a moment to reach Playing before hammering
+        // it with packets.
+        let start_deadline = Instant::now() + Duration::from_secs(5);
+        while !decoder.is_alive() && Instant::now() < start_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(decoder.is_alive(), "audio decode pipeline never reached Playing");
+
+        decoder.set_volume(0.0);
+        decoder.set_volume(2.0);
+        decoder.set_volume(1.0);
+        decoder.set_volume(5.0); // out of range: must clamp, not panic.
+
+        for (i, packet) in packets.iter().enumerate() {
+            let frame = DecryptedMediaFrame {
+                conn_id: 1,
+                stream_id: 9,
+                pts: (i as u64) * 20_000,
+                keyframe: true,
+                payload: packet.clone(),
+            };
+            decoder.feed(&frame);
+        }
+
+        // A frame for a different stream_id must be a silent no-op, never a
+        // panic or a push into this decoder's pipeline.
+        decoder.feed(&DecryptedMediaFrame { conn_id: 1, stream_id: 200, pts: 0, keyframe: true, payload: vec![1, 2, 3] });
+
+        // Let the pipeline thread drain the channel and push everything
+        // through opusdec, then confirm it's still alive (no bus error tore
+        // it down) before dropping it. `Drop` itself (shutdown + join) is
+        // exercised implicitly at the end of this test/function scope.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(decoder.is_alive(), "audio decode pipeline died while decoding a valid Opus stream");
+    }
+
+    /// Encodes `num_buffers` frames of `audiotestsrc` to Opus packets using a
+    /// throwaway GStreamer pipeline, and returns each packet's bytes. Used
+    /// only by the test above to build a fixture without needing a
+    /// checked-in binary file — same rationale as `encode_test_clip` above,
+    /// for audio instead of video.
+    fn encode_test_opus_clip(num_buffers: i32) -> Vec<Vec<u8>> {
+        use gstreamer_app::AppSink as TestAppSink;
+
+        let pipeline = Pipeline::new();
+        let src = ElementFactory::make("audiotestsrc")
+            .property("num-buffers", num_buffers)
+            .build()
+            .expect("audiotestsrc unavailable");
+        let convert = ElementFactory::make("audioconvert").build().expect("audioconvert unavailable");
+        let resample = ElementFactory::make("audioresample").build().expect("audioresample unavailable");
+        let enc = ElementFactory::make("opusenc").build().expect("opusenc unavailable");
+        let sink = ElementFactory::make("appsink").build().expect("appsink unavailable");
+
+        pipeline.add_many([&src, &convert, &resample, &enc, &sink]).unwrap();
+        Element::link_many([&src, &convert, &resample, &enc, &sink]).unwrap();
+
+        let appsink = sink.dynamic_cast::<TestAppSink>().unwrap();
+        appsink.set_property("sync", false);
+
+        pipeline.set_state(State::Playing).expect("failed to start encode pipeline");
+
+        let mut packets = Vec::new();
+        let bus = pipeline.bus().unwrap();
+        loop {
+            if let Some(sample) = appsink.try_pull_sample(ClockTime::from_mseconds(200)) {
+                if let Some(buffer) = sample.buffer() {
+                    if let Ok(map) = buffer.map_readable() {
+                        packets.push(map.as_slice().to_vec());
+                    }
+                }
+            } else {
+                if let Some(msg) = bus.timed_pop(ClockTime::from_mseconds(0)) {
+                    if matches!(msg.view(), MessageView::Eos(_)) {
+                        break;
+                    }
+                }
+                if packets.len() as i32 >= num_buffers || appsink.is_eos() {
+                    break;
+                }
+            }
+        }
+
+        let _ = pipeline.set_state(State::Null);
+        packets
     }
 }

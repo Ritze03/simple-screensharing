@@ -19,7 +19,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::audio::{self, AudioCaptureHandle, AudioSource};
 use crate::capture::{self, CaptureHandle};
-use crate::decode::{self, PreviewCache, StreamDecoder};
+use crate::decode::{self, AudioDecoder, PreviewCache, StreamDecoder};
 use crate::net::{ClientEvent, PresenceSnapshotState, ScreenshareClient};
 use crate::protocol::{ConnId, Member, PresenceEvent, StreamId, StreamInfo, StreamKind};
 use crate::rooms::RoomStore;
@@ -77,6 +77,26 @@ struct WatchEntry {
     /// `Some` while this stream is displayed in its own native window
     /// instead of the central panel.
     popout: Option<PopoutState>,
+    /// The stream_id of the same sender's audio stream, if one was active
+    /// when this video watch started (see `Connected::toggle_watch`'s
+    /// auto-subscribe-audio behavior) and got auto-subscribed alongside it.
+    /// Looked up in `Connected::audio_watches` to render the volume slider
+    /// next to the video panel and to tear the audio watch down together
+    /// with this one. `None` if the sender had no audio stream announced at
+    /// watch time.
+    audio_stream_id: Option<StreamId>,
+}
+
+/// One audio stream currently being decoded/played, whether auto-subscribed
+/// alongside a video `WatchEntry` (see `WatchEntry::audio_stream_id`) or
+/// started standalone via a "Listen" click on an audio-only stream (no
+/// video from the same sender). Keyed the same way as `watches`, in
+/// `Connected::audio_watches`.
+struct AudioWatch {
+    decoder: AudioDecoder,
+    /// 0-200, the value bound to this stream's volume slider. Applied to
+    /// `decoder` (as `volume_percent / 100.0`) whenever the slider changes.
+    volume_percent: u32,
 }
 
 /// State for a `WatchEntry` currently rendered in its own
@@ -139,6 +159,14 @@ struct Connected {
     watch_error: Option<String>,
     /// Which watched stream the central video panel currently displays.
     selected_watch: Option<(ConnId, StreamId)>,
+
+    /// Audio streams we're currently subscribed to and playing, keyed by
+    /// (owner conn_id, audio stream_id) — the audio stream's own id, not the
+    /// paired video's. Populated both by watching a video stream whose
+    /// sender also has an active audio stream (auto-subscribe, see
+    /// `toggle_watch`) and by clicking "Listen" on an audio-only stream (see
+    /// `toggle_listen`).
+    audio_watches: HashMap<(ConnId, StreamId), AudioWatch>,
 
     /// Latest decoded preview still per active stream, regardless of
     /// whether it's being watched — previews arrive for every active
@@ -404,14 +432,83 @@ impl Connected {
         }
     }
 
+    /// The `stream_id` of `owner`'s currently-announced audio stream, if
+    /// any — used by `toggle_watch` to auto-subscribe audio alongside video
+    /// from the same sender. `announced-streams` state (`self.streams`) is
+    /// exactly the `StreamInfo`/`ANNOUNCE_STREAM` state described in this
+    /// task's instructions, already tracked here from
+    /// `PresenceSnapshot`/`PresenceDelta`.
+    fn sibling_audio_stream(&self, owner: ConnId) -> Option<StreamId> {
+        self.streams.iter().find(|s| s.owner == owner && s.kind == StreamKind::Audio).map(|s| s.stream_id)
+    }
+
+    /// Whether `owner` currently has an announced video stream — used to
+    /// decide whether an audio stream gets its own "Listen" row in the
+    /// Streams list (only audio-only senders do; a sender with video has
+    /// their audio auto-subscribed via `toggle_watch` instead).
+    fn owner_has_video(&self, owner: ConnId) -> bool {
+        self.streams.iter().any(|s| s.owner == owner && s.kind == StreamKind::Video)
+    }
+
+    /// Start decoding/playing `(owner, stream_id)`'s audio if not already
+    /// doing so, and subscribe to it. Shared by `toggle_watch`'s
+    /// auto-subscribe-audio-alongside-video path and `toggle_listen`'s
+    /// standalone audio-only path — both just need "make sure this audio
+    /// stream is playing", so a click on "Listen" for a stream already
+    /// auto-subscribed via its video watch (or vice versa) is a safe no-op
+    /// rather than a second decoder.
+    fn start_audio_watch(&mut self, owner: ConnId, stream_id: StreamId) {
+        let key = (owner, stream_id);
+        if self.audio_watches.contains_key(&key) {
+            return;
+        }
+        match AudioDecoder::new(stream_id) {
+            Ok(decoder) => {
+                self.audio_watches.insert(key, AudioWatch { decoder, volume_percent: 100 });
+                self.watch_error = None;
+
+                let client = self.client.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = client.subscribe(owner, stream_id).await {
+                        tracing::warn!("subscribe (audio) ({owner:016x}, {stream_id}) failed: {e:#}");
+                    }
+                });
+            }
+            Err(e) => {
+                self.watch_error = Some(format!("{e:#}"));
+            }
+        }
+    }
+
+    /// Tear down `(owner, stream_id)`'s audio watch, if one is active, and
+    /// unsubscribe. Dropping the removed `AudioWatch` drops its
+    /// `AudioDecoder`, which synchronously shuts down its pipeline thread
+    /// (see `AudioDecoder`'s `Drop` impl).
+    fn teardown_audio_watch(&mut self, owner: ConnId, stream_id: StreamId) {
+        if self.audio_watches.remove(&(owner, stream_id)).is_some() {
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                if let Err(e) = client.unsubscribe(owner, stream_id).await {
+                    tracing::warn!("unsubscribe (audio) ({owner:016x}, {stream_id}) failed: {e:#}");
+                }
+            });
+        }
+    }
+
     /// "Watch"/"Stop Watching" clicked for `(owner, stream_id)`. Subscribing
     /// and unsubscribing are async (control-plane round trip) so they're
     /// fired onto the runtime and not awaited here; the decoder itself is
     /// created/dropped synchronously since that's cheap (spawns/joins a
     /// local decode thread, no network wait).
+    ///
+    /// If `owner` also has an active audio stream, it's auto-subscribed and
+    /// played alongside the video (see `start_audio_watch`) — matching the
+    /// natural expectation that "watching someone's screen" includes
+    /// hearing their audio, without a separate manual step — and torn down
+    /// together with the video watch when watching stops.
     fn toggle_watch(&mut self, owner: ConnId, stream_id: StreamId) {
         let key = (owner, stream_id);
-        if self.watches.remove(&key).is_some() {
+        if let Some(entry) = self.watches.remove(&key) {
             if self.selected_watch == Some(key) {
                 self.selected_watch = self.watches.keys().next().copied();
             }
@@ -421,12 +518,21 @@ impl Connected {
                     tracing::warn!("unsubscribe({owner:016x}, {stream_id}) failed: {e:#}");
                 }
             });
+            if let Some(audio_stream_id) = entry.audio_stream_id {
+                self.teardown_audio_watch(owner, audio_stream_id);
+            }
         } else {
             match StreamDecoder::new(stream_id) {
                 Ok(decoder) => {
+                    let audio_stream_id = self.sibling_audio_stream(owner);
                     self.watches.insert(
                         key,
-                        WatchEntry { decoder: Arc::new(Mutex::new(decoder)), texture: None, popout: None },
+                        WatchEntry {
+                            decoder: Arc::new(Mutex::new(decoder)),
+                            texture: None,
+                            popout: None,
+                            audio_stream_id,
+                        },
                     );
                     self.selected_watch = Some(key);
                     self.watch_error = None;
@@ -437,11 +543,27 @@ impl Connected {
                             tracing::warn!("subscribe({owner:016x}, {stream_id}) failed: {e:#}");
                         }
                     });
+
+                    if let Some(audio_stream_id) = audio_stream_id {
+                        self.start_audio_watch(owner, audio_stream_id);
+                    }
                 }
                 Err(e) => {
                     self.watch_error = Some(format!("{e:#}"));
                 }
             }
+        }
+    }
+
+    /// "Listen"/"Stop Listening" clicked for an audio-only stream (a sender
+    /// with no video announced — see `owner_has_video`). Just toggles that
+    /// stream's `AudioWatch` via the same start/teardown helpers
+    /// `toggle_watch` uses for its auto-subscribed audio.
+    fn toggle_listen(&mut self, owner: ConnId, stream_id: StreamId) {
+        if self.audio_watches.contains_key(&(owner, stream_id)) {
+            self.teardown_audio_watch(owner, stream_id);
+        } else {
+            self.start_audio_watch(owner, stream_id);
         }
     }
 
@@ -636,6 +758,7 @@ impl App {
                     watches: HashMap::new(),
                     watch_error: None,
                     selected_watch: None,
+                    audio_watches: HashMap::new(),
                     preview_cache: PreviewCache::new(),
                     preview_textures: HashMap::new(),
                 });
@@ -702,8 +825,18 @@ impl App {
                     }
                 }
                 ClientEvent::MediaFrame(frame) => {
-                    if let Some(entry) = connected.watches.get_mut(&(frame.conn_id, frame.stream_id)) {
+                    let key = (frame.conn_id, frame.stream_id);
+                    if let Some(entry) = connected.watches.get_mut(&key) {
                         entry.decoder.lock().unwrap().feed(&frame);
+                    }
+                    // A given (conn_id, stream_id) only ever matches one of
+                    // `watches` (video) or `audio_watches` (audio) — each
+                    // owner allocates a distinct stream_id per share
+                    // regardless of kind — so both are checked
+                    // unconditionally rather than needing to know the
+                    // frame's `StreamKind` up front.
+                    if let Some(audio_watch) = connected.audio_watches.get_mut(&key) {
+                        audio_watch.decoder.feed(&frame);
                     }
                 }
                 ClientEvent::Preview(preview) => match decode::decode_preview(&preview) {
@@ -1015,20 +1148,67 @@ impl App {
         } else {
             let mut to_toggle: Option<(ConnId, StreamId)> = None;
             let mut to_pop_out: Option<(ConnId, StreamId)> = None;
+            let mut to_toggle_listen: Option<(ConnId, StreamId)> = None;
             let unknown_owner = t!("streams.unknown_owner").to_string();
             for info in &connected.streams {
-                if info.kind != StreamKind::Video {
-                    // decode.rs only handles video in this pass.
-                    continue;
-                }
                 let key = (info.owner, info.stream_id);
-                let watching = connected.watches.contains_key(&key);
                 let owner_name = connected
                     .members
                     .iter()
                     .find(|m| m.conn_id == info.owner)
                     .map(|m| m.display_name.as_str())
                     .unwrap_or(unknown_owner.as_str());
+
+                if info.kind == StreamKind::Audio {
+                    // A sender with video gets their audio auto-subscribed
+                    // via the video row's Watch button (see
+                    // `Connected::toggle_watch`) — only an audio-only sender
+                    // (no video announced) gets its own "Listen" row here.
+                    if connected.owner_has_video(info.owner) {
+                        continue;
+                    }
+                    let listening = connected.audio_watches.contains_key(&key);
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                t!(
+                                    "streams.audio_line",
+                                    owner = owner_name,
+                                    label = info.label.clone()
+                                )
+                                .to_string(),
+                            );
+                            ui.horizontal(|ui| {
+                                let button_label = if listening {
+                                    t!("streams.stop_listening_button").to_string()
+                                } else {
+                                    t!("streams.listen_button").to_string()
+                                };
+                                if ui.small_button(button_label).clicked() {
+                                    to_toggle_listen = Some(key);
+                                }
+                                if listening {
+                                    ui.colored_label(
+                                        egui::Color32::from_rgb(80, 200, 120),
+                                        t!("streams.listening").to_string(),
+                                    );
+                                }
+                            });
+                            if let Some(audio_watch) = connected.audio_watches.get_mut(&key) {
+                                ui.horizontal(|ui| {
+                                    ui.label(t!("audio.volume_label").to_string());
+                                    let slider = egui::Slider::new(&mut audio_watch.volume_percent, 0..=200).suffix("%");
+                                    if ui.add(slider).changed() {
+                                        audio_watch.decoder.set_volume(audio_watch.volume_percent as f64 / 100.0);
+                                    }
+                                });
+                            }
+                        });
+                    });
+                    continue;
+                }
+
+                let watching = connected.watches.contains_key(&key);
                 ui.horizontal(|ui| {
                     // Thumbnail (or a placeholder box until the first
                     // preview for this stream arrives) — previews arrive
@@ -1097,11 +1277,36 @@ impl App {
             if let Some((owner, stream_id)) = to_pop_out {
                 connected.pop_out(owner, stream_id);
             }
+            if let Some((owner, stream_id)) = to_toggle_listen {
+                connected.toggle_listen(owner, stream_id);
+            }
         }
 
         ui.add_space(12.0);
         ui.separator();
         ui.label(t!("video.header").to_string());
+
+        // If the currently displayed video watch also auto-subscribed the
+        // same sender's audio (see `Connected::toggle_watch`), show its
+        // volume slider here, right above the video panel — "somewhere
+        // sensible in the watched-stream UI", per this task's brief.
+        let linked_audio_key: Option<(ConnId, StreamId)> = connected
+            .selected_watch
+            .and_then(|key| connected.watches.get(&key))
+            .and_then(|entry| entry.audio_stream_id)
+            .map(|audio_stream_id| (connected.selected_watch.expect("checked above").0, audio_stream_id));
+        if let Some(audio_key) = linked_audio_key {
+            if let Some(audio_watch) = connected.audio_watches.get_mut(&audio_key) {
+                ui.horizontal(|ui| {
+                    ui.label(t!("audio.volume_label").to_string());
+                    let slider = egui::Slider::new(&mut audio_watch.volume_percent, 0..=200).suffix("%");
+                    if ui.add(slider).changed() {
+                        audio_watch.decoder.set_volume(audio_watch.volume_percent as f64 / 100.0);
+                    }
+                });
+            }
+        }
+
         match connected.selected_watch.and_then(|key| connected.watches.get(&key)) {
             Some(entry) if entry.popout.is_some() => {
                 ui.label(t!("video.popped_out_note").to_string());
