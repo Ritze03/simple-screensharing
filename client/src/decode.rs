@@ -408,8 +408,21 @@ fn pull_color_image(sink: &AppSink) -> Result<Option<egui::ColorImage>> {
         .plane_data(0)
         .map_err(|_| anyhow!("decoded frame had no plane 0 data"))?;
 
-    // Tightly pack RGBA rows for egui::ColorImage, stripping any stride
-    // padding GStreamer added past `width * 4`.
+    let packed = pack_rgba_rows(plane, width, height, stride)?;
+
+    Ok(Some(egui::ColorImage::from_rgba_unmultiplied([width, height], &packed)))
+}
+
+/// Tightly packs `height` RGBA rows of `width * 4` bytes each out of `plane`,
+/// which is laid out with `stride` bytes between the start of consecutive
+/// rows (`stride >= width * 4`; any bytes past `width * 4` on a given row
+/// are alignment padding GStreamer added and must be skipped rather than
+/// copied — copying them, or worse, assuming `stride == width * 4` and
+/// reading straight through the padding into the next row's data, is what
+/// produces the sheared/banded frames this function exists to prevent. See
+/// `pack_rgba_rows_skips_stride_padding_instead_of_shearing_rows` below for
+/// a synthetic, GStreamer-independent proof.
+fn pack_rgba_rows(plane: &[u8], width: usize, height: usize, stride: usize) -> Result<Vec<u8>> {
     let row_bytes = width * 4;
     let mut packed = Vec::with_capacity(row_bytes * height);
     for row in 0..height {
@@ -420,8 +433,7 @@ fn pull_color_image(sink: &AppSink) -> Result<Option<egui::ColorImage>> {
         };
         packed.extend_from_slice(row_slice);
     }
-
-    Ok(Some(egui::ColorImage::from_rgba_unmultiplied([width, height], &packed)))
+    Ok(packed)
 }
 
 // ---------------------------------------------------------------------
@@ -867,8 +879,21 @@ mod tests {
     fn decodes_synthetic_h264_stream_to_rgba_frames() {
         gstreamer::init().expect("gstreamer init");
 
-        const WIDTH: i32 = 160;
-        const HEIGHT: i32 = 120;
+        // Deliberately awkward dimensions rather than a suspiciously-round
+        // number like 320x240: 322 * 4 = 1288 bytes/row, which is NOT a
+        // multiple of typical SIMD row-alignment boundaries (16 or 32
+        // bytes) that `videoconvert`/`avdec_h264` commonly pad rows to.
+        // 322 also happens to divide evenly into the SMPTE pattern's 7
+        // vertical color bars (46px each), which keeps the sample columns
+        // below well clear of any bar boundary. A round width like 160
+        // risks the row already landing on an alignment boundary by
+        // accident, silently hiding a stride bug — which is exactly why the
+        // previous version of this test (160x120, and only asserting
+        // `image.size`) would not have caught one: it never inspected
+        // pixel content at all, so a sheared/banded frame of the right
+        // dimensions passed just as well as a correct one.
+        const WIDTH: i32 = 322;
+        const HEIGHT: i32 = 242;
         const NUM_BUFFERS: i32 = 20;
 
         // Encode a short synthetic clip in-process (no filesystem fixture
@@ -881,8 +906,7 @@ mod tests {
 
         let mut decoder = StreamDecoder::new(7).expect("failed to build StreamDecoder");
 
-        let mut decoded_any = false;
-        let mut last_size: Option<[usize; 2]> = None;
+        let mut last_image: Option<egui::ColorImage> = None;
         let deadline = Instant::now() + Duration::from_secs(15);
 
         for (i, au) in access_units.iter().enumerate() {
@@ -898,25 +922,170 @@ mod tests {
             // Give the pipeline thread a chance to decode as we go, rather
             // than only polling once at the end.
             if let Some(image) = decoder.latest_frame() {
-                decoded_any = true;
-                last_size = Some(image.size);
+                last_image = Some(image);
             }
         }
 
-        // Drain until either a frame shows up or we time out.
-        while !decoded_any && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
+        // Drain until either a frame shows up or we time out. Keep polling
+        // past the first hit so `last_image` ends up holding a frame from
+        // well into the clip, not just whatever showed up first.
+        while Instant::now() < deadline {
             if let Some(image) = decoder.latest_frame() {
-                decoded_any = true;
-                last_size = Some(image.size);
+                last_image = Some(image);
+            }
+            if last_image.is_some() && Instant::now() + Duration::from_millis(300) > deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let image = last_image.expect("no decoded RGBA frame was produced within the deadline");
+        assert_eq!(
+            image.size,
+            [WIDTH as usize, HEIGHT as usize],
+            "decoded frame dimensions did not match the encoded test clip"
+        );
+
+        assert_smpte_bars_are_coherent(&image, WIDTH as usize, HEIGHT as usize);
+    }
+
+    /// Asserts `image` looks like real SMPTE 100% color bars rather than
+    /// banded/sheared garbage, without hardcoding exact bar RGB values
+    /// (which drift slightly across GStreamer versions and lossy H.264
+    /// quantization). Two independent checks, each targeting the reported
+    /// bug shape directly:
+    ///
+    /// 1. **Vertical consistency**: the SMPTE top region is 7 solid
+    ///    vertical stripes — same color from row to row. Sampling the same
+    ///    x column near the top and deep near the bottom of that region
+    ///    should yield nearly the same color. A stride bug's error is
+    ///    `row * (stride - row_bytes)` bytes and grows with row, so a
+    ///    shallow row can look almost right while a deep row is reading
+    ///    from completely unrelated bytes — this is exactly what would
+    ///    catch it.
+    /// 2. **Horizontal diversity**: across the 7 bar centers, colors must
+    ///    actually differ from each other. This rules out the false-pass
+    ///    where a stride bug produces uniformly-wrong-but-internally-
+    ///    consistent flat gray bands (matching the user's screenshot
+    ///    description) that would otherwise sail through check 1.
+    fn assert_smpte_bars_are_coherent(image: &egui::ColorImage, width: usize, height: usize) {
+        let top_region_height = height * 2 / 3;
+        let margin = 6usize;
+        let shallow_row = margin;
+        let deep_row = top_region_height - margin;
+        assert!(deep_row > shallow_row + 20, "test dimensions too small to separate sample rows");
+
+        let bar_width = width / 7;
+        let bar_x = |i: usize| i * bar_width + bar_width / 2;
+
+        let pixel = |x: usize, y: usize| image[(x, y)];
+
+        let mut shallow_colors = Vec::with_capacity(7);
+        let mut deep_colors = Vec::with_capacity(7);
+        for i in 0..7 {
+            let x = bar_x(i);
+            shallow_colors.push(pixel(x, shallow_row));
+            deep_colors.push(pixel(x, deep_row));
+        }
+
+        // Check 1: vertical consistency per bar.
+        for i in 0..7 {
+            let a = shallow_colors[i];
+            let b = deep_colors[i];
+            let diff = channel_diff(a, b);
+            assert!(
+                diff <= 60,
+                "bar {i} is not vertically consistent (shallow row {shallow_row} = {a:?}, \
+                 deep row {deep_row} = {b:?}, diff {diff}) — looks like a sheared/stride-corrupted \
+                 frame, not solid color bars"
+            );
+        }
+
+        // Check 2: horizontal diversity, evaluated on the deep row (the
+        // one most exposed to cumulative stride error) so a uniformly-wrong
+        // flat-gray-bands result can't sneak past check 1.
+        let mut distinct_pairs = 0;
+        for i in 0..deep_colors.len() {
+            for j in (i + 1)..deep_colors.len() {
+                if channel_diff(deep_colors[i], deep_colors[j]) > 50 {
+                    distinct_pairs += 1;
+                }
+            }
+        }
+        assert!(
+            distinct_pairs >= 10,
+            "deep-row bar colors aren't diverse enough to be real color bars \
+             ({distinct_pairs} sufficiently-distinct pairs out of 21; colors: {deep_colors:?}) — \
+             looks like flat banded garbage, not SMPTE bars"
+        );
+    }
+
+    /// Max-channel (R/G/B) absolute difference between two pixels, ignoring
+    /// alpha (which the RGBA video path always sets to opaque).
+    fn channel_diff(a: egui::Color32, b: egui::Color32) -> i32 {
+        (a.r() as i32 - b.r() as i32)
+            .abs()
+            .max((a.g() as i32 - b.g() as i32).abs())
+            .max((a.b() as i32 - b.b() as i32).abs())
+    }
+
+    /// Fast, deterministic, GStreamer-independent proof that
+    /// `pack_rgba_rows` correctly skips stride padding rather than
+    /// shearing the image, whether or not the local GStreamer install
+    /// happens to pad RGBA rows for a given width (RGBA rows are always a
+    /// multiple of 4 bytes, so the common `round-up-to-4` stride policy
+    /// never pads them — real padding only shows up with certain
+    /// decoder/converter backends, e.g. GPU/hardware paths that align to
+    /// 16/32/64+ byte boundaries regardless of format. This test builds
+    /// that scenario by hand instead of hoping the CI machine's software
+    /// decoder happens to produce it.)
+    #[test]
+    fn pack_rgba_rows_skips_stride_padding_instead_of_shearing_rows() {
+        const WIDTH: usize = 3;
+        const HEIGHT: usize = 4;
+        const ROW_BYTES: usize = WIDTH * 4;
+        const PADDING: usize = 12; // stride = row_bytes + 12, e.g. 32-byte SIMD alignment
+        const STRIDE: usize = ROW_BYTES + PADDING;
+
+        // Each row's real pixel bytes are filled with a distinct, easily
+        // recognizable value (row index repeated); the padding bytes past
+        // `ROW_BYTES` are filled with a sentinel (0xEE) that must never
+        // appear in the packed output.
+        let mut plane = vec![0xEEu8; STRIDE * HEIGHT];
+        for row in 0..HEIGHT {
+            let start = row * STRIDE;
+            for b in &mut plane[start..start + ROW_BYTES] {
+                *b = row as u8;
             }
         }
 
-        assert!(decoded_any, "no decoded RGBA frame was produced within the deadline");
+        let packed = pack_rgba_rows(&plane, WIDTH, HEIGHT, STRIDE).expect("packing should succeed");
+
+        let mut expected = Vec::with_capacity(ROW_BYTES * HEIGHT);
+        for row in 0..HEIGHT {
+            expected.extend(std::iter::repeat(row as u8).take(ROW_BYTES));
+        }
         assert_eq!(
-            last_size,
-            Some([WIDTH as usize, HEIGHT as usize]),
-            "decoded frame dimensions did not match the encoded test clip"
+            packed, expected,
+            "stride-aware packing produced the wrong bytes: expected each row's real pixels \
+             tightly packed with no padding, got something else (rows shifted/sheared or padding leaked in)"
+        );
+        assert!(
+            !packed.contains(&0xEE),
+            "padding sentinel byte leaked into the packed output — stride was not skipped correctly"
+        );
+
+        // The naive bug this guards against: treating the buffer as if
+        // `stride == row_bytes` (i.e. `plane[..ROW_BYTES * HEIGHT]`) reads
+        // straight through the padding into the next row, shearing the
+        // image. Confirm that naive slice does NOT equal the correct
+        // output — proving this test actually discriminates the bug from
+        // the fix, not just checking dimensions.
+        let naive = &plane[..ROW_BYTES * HEIGHT];
+        assert_ne!(
+            naive, expected.as_slice(),
+            "test fixture is degenerate: the naive (stride-ignoring) extraction accidentally \
+             matches the correct one, so this test wouldn't actually catch the bug"
         );
     }
 
@@ -931,6 +1100,12 @@ mod tests {
         let pipeline = Pipeline::new();
         let src = ElementFactory::make("videotestsrc")
             .property("num-buffers", num_buffers)
+            // SMPTE 100% color bars: sharp, well-known vertical stripe
+            // boundaries that a stride/shear bug visibly disrupts. This is
+            // also `videotestsrc`'s default pattern, but set explicitly so
+            // the pixel-content assertions in the test above don't
+            // silently depend on that default never changing.
+            .property_from_str("pattern", "smpte")
             .build()
             .expect("videotestsrc unavailable");
         let capsfilter = ElementFactory::make("capsfilter")
