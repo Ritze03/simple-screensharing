@@ -75,7 +75,7 @@
 
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 #[cfg(unix)]
@@ -291,6 +291,17 @@ enum CaptureSource {
     Portal(PortalCapture),
     #[cfg(windows)]
     Windows,
+    /// TEST-ONLY seam: bypasses the interactive portal/pipewiresrc (Linux)
+    /// or `d3d11screencapturesrc` (Windows) acquisition entirely, launching
+    /// [`build_pipeline`] directly from a caller-supplied `gst-launch`-syntax
+    /// source fragment (e.g. `"videotestsrc is-live=true pattern=smpte"`)
+    /// instead. Exists solely so an automated integration test can drive
+    /// this module's real tee→encode→appsink→encrypt→fragment→send pipeline
+    /// end to end without a human clicking the Wayland portal consent
+    /// dialog. Never constructed outside `#[cfg(test)]` code — see
+    /// [`start_sharing_from_test_source`].
+    #[cfg(test)]
+    TestSource(String),
 }
 
 impl CaptureSource {
@@ -321,6 +332,8 @@ impl CaptureSource {
                 // handled via `vah264enc` on Linux.
                 "d3d11screencapturesrc monitor-index=0 do-timestamp=true".to_string()
             }
+            #[cfg(test)]
+            CaptureSource::TestSource(fragment) => fragment.clone(),
         }
     }
 }
@@ -578,6 +591,49 @@ pub async fn start_sharing(client: &ScreenshareClient, stream_id: u8, bitrate_kb
     ensure_gstreamer_initialized()?;
 
     let capture_source = acquire_capture_source().await?;
+    start_sharing_with_source(client, stream_id, bitrate_kbps, capture_source).await
+}
+
+/// TEST-ONLY seam (see [`CaptureSource::TestSource`]): starts the exact same
+/// tee→encode→appsink→encrypt→fragment→send pipeline [`start_sharing`] uses
+/// internally, sourced from a caller-supplied raw `gst-launch`-syntax source
+/// fragment (e.g. `"videotestsrc is-live=true pattern=smpte ! \
+/// video/x-raw,width=320,height=240,framerate=15/1"`) instead of the
+/// interactive portal/pipewiresrc (or Windows `d3d11screencapturesrc`) flow.
+///
+/// Exists solely so an automated integration test can drive this module's
+/// real capture → encrypt → fragment → send path end to end without a human
+/// clicking the interactive Wayland portal consent dialog (which cannot be
+/// automated). `#[cfg(test)]`-gated: this function does not exist at all in
+/// a non-test build, so it changes nothing about [`start_sharing`]'s
+/// production API or behavior.
+#[cfg(test)]
+pub async fn start_sharing_from_test_source(
+    client: &ScreenshareClient,
+    stream_id: u8,
+    bitrate_kbps: u32,
+    source_fragment: &str,
+) -> Result<CaptureHandle> {
+    ensure_gstreamer_initialized()?;
+    start_sharing_with_source(
+        client,
+        stream_id,
+        bitrate_kbps,
+        CaptureSource::TestSource(source_fragment.to_string()),
+    )
+    .await
+}
+
+/// Shared body of [`start_sharing`] / [`start_sharing_from_test_source`]:
+/// everything from "a [`CaptureSource`] has been acquired" onward (building
+/// and starting the encode pipeline, announcing the stream, wiring up the
+/// send pump and preview task).
+async fn start_sharing_with_source(
+    client: &ScreenshareClient,
+    stream_id: u8,
+    bitrate_kbps: u32,
+    capture_source: CaptureSource,
+) -> Result<CaptureHandle> {
     let source_fragment = capture_source.launch_fragment();
 
     // Prefer hardware (VAAPI) encode when it's actually usable on this
@@ -707,11 +763,33 @@ impl CaptureHandle {
     /// already stopped either way), and waits for the background send task
     /// to finish draining.
     pub async fn stop(mut self) -> Result<()> {
-        // Stopping the pipeline (Null) unblocks the appsink's stream (EOS/
-        // None) and the pump task exits on its own; no separate cancel
-        // signal needed.
-        if let Err(e) = self.pipeline.set_state(gst::State::Null) {
-            tracing::warn!("error stopping capture pipeline: {e}");
+        // Ask the pipeline to end gracefully by sending it a real EOS event
+        // *before* forcing it to `Null`, and wait for the pump task to
+        // notice.
+        //
+        // This isn't just tidiness: `gstreamer_app::AppSinkStream` (what
+        // `pump_loop` awaits via `appsink_stream.next()`) only ever yields
+        // its terminal `None` once the appsink's `is_eos()` flag is actually
+        // set, which only happens once a real EOS event has flowed all the
+        // way through the pipeline into it (see that type's `poll_next`).
+        // Jumping straight to `set_state(Null)` (as this used to do) never
+        // sends that event — it just tears the elements down — so the
+        // appsink's stream would sit `Pending` forever and `pump_task` would
+        // never complete, hanging this whole function indefinitely. This
+        // was caught by the end-to-end integration test
+        // (`end_to_end_test.rs`) actually awaiting a real `stop()` on a live
+        // pipeline for the first time; no prior test exercised this path.
+        // `Pipeline::send_event` on a downstream/serialized event like EOS
+        // delegates to the bin's source element(s), so it originates
+        // upstream of the `tee` exactly like a natural end-of-stream would.
+        //
+        // The `timeout` is a backstop, not the expected path: a healthy
+        // pipeline should drain and reach EOS in well under a second, but
+        // this guarantees `stop()` itself can never hang the caller forever
+        // if a source somehow never honors EOS (e.g. an unresponsive
+        // hardware capture device).
+        if !self.pipeline.send_event(gst::event::Eos::new()) {
+            tracing::warn!("capture pipeline did not accept the EOS event; forcing a hard stop");
         }
 
         // `&mut` rather than moving `self.pump_task` out: `CaptureHandle`
@@ -719,8 +797,16 @@ impl CaptureHandle {
         // fields out of `self` by value — `JoinHandle` is `Unpin`, so
         // awaiting through `&mut` works identically. Same fix already
         // applied to `AudioCaptureHandle::stop`.
-        if let Err(e) = (&mut self.pump_task).await {
-            tracing::warn!("capture send task did not shut down cleanly: {e}");
+        match tokio::time::timeout(Duration::from_secs(5), &mut self.pump_task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("capture send task did not shut down cleanly: {e}"),
+            Err(_) => tracing::warn!(
+                "capture send task did not observe EOS within 5s; forcing pipeline to Null anyway"
+            ),
+        }
+
+        if let Err(e) = self.pipeline.set_state(gst::State::Null) {
+            tracing::warn!("error stopping capture pipeline: {e}");
         }
 
         // `.take()` rather than moving `self.preview_handle` out directly,
@@ -738,13 +824,21 @@ impl CaptureHandle {
             // Borrow rather than move `self.capture_source` — also required
             // now that `CaptureHandle: Drop`, though `Session::close` takes
             // `&self` anyway, so a borrow is all this needs regardless.
-            // `CaptureSource` has exactly one variant on this platform (see
-            // its `#[cfg(unix)]`/`#[cfg(windows)]` split), so this
-            // destructure is irrefutable — a plain `let` avoids the
-            // "useless if let" lint an `if let` would trigger here.
-            let CaptureSource::Portal(portal) = &self.capture_source;
-            if let Err(e) = portal.session.close().await {
-                tracing::warn!("error closing screencast portal session: {e}");
+            // `CaptureSource` has exactly one variant on this platform in a
+            // non-test build (see its `#[cfg(unix)]`/`#[cfg(windows)]`
+            // split); a `match` (rather than the irrefutable `let` this used
+            // to be) is what lets the `#[cfg(test)]`-only `TestSource`
+            // variant coexist here without an exhaustiveness error in test
+            // builds — it's a no-op for that variant, since a test source
+            // never opened a portal session to close.
+            match &self.capture_source {
+                CaptureSource::Portal(portal) => {
+                    if let Err(e) = portal.session.close().await {
+                        tracing::warn!("error closing screencast portal session: {e}");
+                    }
+                }
+                #[cfg(test)]
+                CaptureSource::TestSource(_) => {}
             }
         }
 

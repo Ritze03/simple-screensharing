@@ -13,6 +13,8 @@ i18n!("locales", fallback = "en");
 mod audio;
 mod capture;
 mod decode;
+#[cfg(test)]
+mod end_to_end_test;
 mod fragment;
 mod net;
 mod preview;
