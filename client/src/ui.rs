@@ -32,6 +32,20 @@ const DEFAULT_BITRATE_KBPS: u32 = 8000;
 const MIN_BITRATE_KBPS: u32 = 1000;
 const MAX_BITRATE_KBPS: u32 = 40000;
 
+/// Default capture framerate, preselected on the framerate dropdown —
+/// mirrors `capture::DEFAULT_FRAMERATE` (kept as a local constant, like
+/// `DEFAULT_BITRATE_KBPS` above, rather than importing it, for consistency
+/// with the existing bitrate constants' pattern in this module). Deliberately
+/// conservative: see `capture::DEFAULT_FRAMERATE`'s doc comment for why 30
+/// (matching this pipeline's framerate before it became configurable) beats
+/// defaulting straight to the 240Hz ceiling.
+const DEFAULT_FRAMERATE: u32 = 30;
+/// Common refresh rates offered on the framerate dropdown, up to the
+/// project's 240Hz desktop-client ceiling (`capture::MAX_FRAMERATE`) — more
+/// natural as discrete choices than a continuous slider, since these are the
+/// values that actually correspond to real monitor refresh rates.
+const FRAMERATE_OPTIONS: [u32; 7] = [30, 60, 90, 120, 144, 165, 240];
+
 /// Either kind of running outbound share this client can hold onto.
 enum ShareHandle {
     Video(CaptureHandle),
@@ -142,6 +156,10 @@ struct Connected {
     next_stream_id: StreamId,
     /// Bitrate (kbps) to use for the *next* video share started.
     bitrate_kbps: u32,
+    /// Capture framerate cap (fps) to use for the *next* video share
+    /// started — see `capture::build_pipeline`'s `videorate` cap and
+    /// `key-int-max` scaling.
+    framerate: u32,
 
     /// Audio sources discovered by the last `list_audio_sources()` call.
     audio_sources: Vec<AudioSource>,
@@ -245,6 +263,7 @@ impl Connected {
 
         let client = self.client.clone();
         let bitrate_kbps = self.bitrate_kbps;
+        let framerate = self.framerate;
         let (tx, rx) = oneshot::channel();
         self.active_shares.insert(
             stream_id,
@@ -257,7 +276,7 @@ impl Connected {
         self.share_error = None;
 
         tokio::spawn(async move {
-            let result = capture::start_sharing(&client, stream_id, bitrate_kbps)
+            let result = capture::start_sharing(&client, stream_id, bitrate_kbps, framerate)
                 .await
                 .map(ShareHandle::Video)
                 .map_err(|e| format!("{e:#}"));
@@ -750,6 +769,7 @@ impl App {
                     share_error: None,
                     next_stream_id: 0,
                     bitrate_kbps: DEFAULT_BITRATE_KBPS,
+                    framerate: DEFAULT_FRAMERATE,
                     audio_sources: Vec::new(),
                     audio_sources_error: None,
                     audio_sources_requested: false,
@@ -1027,6 +1047,16 @@ impl App {
             ui.add(egui::Slider::new(&mut connected.bitrate_kbps, MIN_BITRATE_KBPS..=MAX_BITRATE_KBPS));
         });
         ui.horizontal(|ui| {
+            ui.label(t!("share.framerate_label").to_string());
+            egui::ComboBox::from_id_salt("framerate_combo")
+                .selected_text(format!("{} fps", connected.framerate))
+                .show_ui(ui, |ui| {
+                    for &fps in &FRAMERATE_OPTIONS {
+                        ui.selectable_value(&mut connected.framerate, fps, format!("{fps} fps"));
+                    }
+                });
+        });
+        ui.horizontal(|ui| {
             // Always enabled: clicking again while a video share is already
             // active starts *another* one (a second stream_id), re-prompting
             // the OS portal picker so the user can pick a different
@@ -1126,6 +1156,14 @@ impl App {
                     };
                     if ui.add_enabled(stoppable, egui::Button::new(stop_label)).clicked() {
                         to_stop.push(stream_id);
+                    }
+                    // Sharer-side live encode rate: the encoder branch's
+                    // actual output framerate (see `CaptureHandle::encoder_fps`),
+                    // confirming the configured framerate is really being
+                    // hit rather than just selected in the UI. Video shares
+                    // only — audio has no comparable per-frame rate.
+                    if let ShareStatus::Active(ShareHandle::Video(handle)) = &share.status {
+                        ui.label(t!("share.fps_label", fps = handle.encoder_fps()).to_string());
                     }
                 });
             }
@@ -1285,6 +1323,22 @@ impl App {
         ui.add_space(12.0);
         ui.separator();
         ui.label(t!("video.header").to_string());
+
+        // Viewer-side live FPS: how often the currently displayed watch's
+        // decoder actually yields a *new* frame (see
+        // `StreamDecoder::current_fps`), not just the UI's own repaint rate —
+        // the most directly useful FPS readout, since it tells you whether
+        // playback of what's on screen right now is actually smooth. Reads
+        // through the same `Arc<Mutex<StreamDecoder>>` `update_watch_textures`/
+        // the popout closure poll `latest_frame()` through, so this reflects
+        // real decode activity regardless of whether the stream is currently
+        // shown inline or popped out into its own window.
+        if let Some(key) = connected.selected_watch {
+            if let Some(entry) = connected.watches.get(&key) {
+                let fps = entry.decoder.lock().unwrap().current_fps();
+                ui.label(t!("video.fps_label", fps = format!("{fps:.1}")).to_string());
+            }
+        }
 
         // If the currently displayed video watch also auto-subscribed the
         // same sender's audio (see `Connected::toggle_watch`), show its

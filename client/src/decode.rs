@@ -121,12 +121,12 @@
 //! inside GStreamer's own pipeline threads, with nothing for `ui.rs` to
 //! poll or render per frame.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use gstreamer::prelude::*;
@@ -148,6 +148,56 @@ enum PipelineMsg {
     Shutdown,
 }
 
+/// Sliding-window size for [`StreamDecoder::current_fps`] — wide enough to
+/// smooth over normal frame-to-frame jitter but narrow enough to react
+/// quickly to a real change (e.g. playback stalling, or the sender's
+/// configured framerate changing).
+const DECODE_FPS_WINDOW: Duration = Duration::from_secs(2);
+
+/// Tracks how often [`StreamDecoder::latest_frame`] actually yields a *new*
+/// decoded frame (not just how often it's polled — `ui.rs` polls once per
+/// repaint regardless of whether anything new has decoded, which would
+/// otherwise just measure the UI's own repaint rate instead of real decode
+/// throughput) over a rolling [`DECODE_FPS_WINDOW`], for display as a live
+/// "is playback actually smooth" indicator.
+struct FpsCounter {
+    timestamps: VecDeque<Instant>,
+}
+
+impl FpsCounter {
+    fn new() -> Self {
+        Self { timestamps: VecDeque::new() }
+    }
+
+    /// Record one newly-yielded frame.
+    fn record(&mut self) {
+        let now = Instant::now();
+        self.timestamps.push_back(now);
+        self.prune(now);
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while let Some(&oldest) = self.timestamps.front() {
+            if now.duration_since(oldest) > DECODE_FPS_WINDOW {
+                self.timestamps.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Current rate: frames recorded within the last [`DECODE_FPS_WINDOW`],
+    /// divided by the window length. Pruning also happens here (not just on
+    /// `record`) so the rate correctly decays toward 0 if playback stalls
+    /// and nothing new is recorded for a while, rather than sitting frozen
+    /// at its last computed value.
+    fn fps(&mut self) -> f64 {
+        let now = Instant::now();
+        self.prune(now);
+        self.timestamps.len() as f64 / DECODE_FPS_WINDOW.as_secs_f64()
+    }
+}
+
 /// Decodes one subscribed video stream's incoming H.264 access units into
 /// `egui::ColorImage` frames. See the module docs for the pipeline shape and
 /// threading rationale.
@@ -161,6 +211,8 @@ pub struct StreamDecoder {
     /// to the spec's 2-second GOP) would just be decode-error log spam.
     seen_keyframe: bool,
     thread: Option<thread::JoinHandle<()>>,
+    /// Live viewer-side FPS tracker — see [`FpsCounter`]/[`Self::current_fps`].
+    fps_counter: FpsCounter,
 }
 
 impl StreamDecoder {
@@ -189,6 +241,7 @@ impl StreamDecoder {
             latest_frame,
             seen_keyframe: false,
             thread: Some(thread),
+            fps_counter: FpsCounter::new(),
         })
     }
 
@@ -232,8 +285,26 @@ impl StreamDecoder {
     /// `None` if nothing new has been decoded since the last call. Intended
     /// to be called once per `ui.rs` repaint and, when `Some`, uploaded via
     /// an `egui::TextureHandle::set`.
+    ///
+    /// Every `Some` return is recorded by [`Self::current_fps`]'s counter —
+    /// this is what makes `current_fps` measure real decode throughput
+    /// rather than `ui.rs`'s repaint rate: a slow/stalled decoder still gets
+    /// polled every repaint, but only actually *yields* a new frame at the
+    /// real decode rate.
     pub fn latest_frame(&mut self) -> Option<egui::ColorImage> {
-        self.latest_frame.lock().unwrap().take()
+        let frame = self.latest_frame.lock().unwrap().take();
+        if frame.is_some() {
+            self.fps_counter.record();
+        }
+        frame
+    }
+
+    /// Live viewer-side FPS: how many *new* frames [`Self::latest_frame`]
+    /// actually yielded over the last [`DECODE_FPS_WINDOW`] — i.e. real
+    /// playback smoothness, not just how often the UI happens to poll.
+    /// Intended for `ui.rs` to show next to the watched video panel.
+    pub fn current_fps(&mut self) -> f64 {
+        self.fps_counter.fps()
     }
 }
 

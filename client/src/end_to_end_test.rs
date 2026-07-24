@@ -266,9 +266,15 @@ async fn real_capture_encrypt_fragment_relay_decode_round_trip() {
     );
 
     eprintln!("[e2e] starting real capture pipeline on client A (videotestsrc, real encode/encrypt/fragment/send)");
-    let capture_handle = capture::start_sharing_from_test_source(&client_a, VIDEO_STREAM_ID, 2000, &source_fragment)
-        .await
-        .expect("start_sharing_from_test_source failed");
+    let capture_handle = capture::start_sharing_from_test_source(
+        &client_a,
+        VIDEO_STREAM_ID,
+        2000,
+        capture::DEFAULT_FRAMERATE,
+        &source_fragment,
+    )
+    .await
+    .expect("start_sharing_from_test_source failed");
 
     let owner_conn_id = client_a.conn_id();
 
@@ -428,9 +434,15 @@ async fn resubscribe_after_pause_resumes_encoder_and_frames_flow() {
     );
 
     eprintln!("[e2e-resub] starting real capture pipeline on client A");
-    let capture_handle = capture::start_sharing_from_test_source(&client_a, VIDEO_STREAM_ID, 2000, &source_fragment)
-        .await
-        .expect("start_sharing_from_test_source failed");
+    let capture_handle = capture::start_sharing_from_test_source(
+        &client_a,
+        VIDEO_STREAM_ID,
+        2000,
+        capture::DEFAULT_FRAMERATE,
+        &source_fragment,
+    )
+    .await
+    .expect("start_sharing_from_test_source failed");
 
     let owner_conn_id = client_a.conn_id();
     let start = std::time::Instant::now();
@@ -712,9 +724,15 @@ async fn repeated_pause_resume_cycles_keep_resuming() {
          ! video/x-raw,width={WIDTH},height={HEIGHT},framerate=15/1"
     );
 
-    let capture_handle = capture::start_sharing_from_test_source(&client_a, VIDEO_STREAM_ID, 2000, &source_fragment)
-        .await
-        .expect("start_sharing_from_test_source failed");
+    let capture_handle = capture::start_sharing_from_test_source(
+        &client_a,
+        VIDEO_STREAM_ID,
+        2000,
+        capture::DEFAULT_FRAMERATE,
+        &source_fragment,
+    )
+    .await
+    .expect("start_sharing_from_test_source failed");
 
     let owner_conn_id = client_a.conn_id();
     let start = std::time::Instant::now();

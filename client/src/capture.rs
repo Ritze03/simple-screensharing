@@ -81,6 +81,9 @@
 
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -267,11 +270,32 @@ fn probe_vaapi_encoder() -> bool {
     probe_ok
 }
 
-/// Fixed capture framerate for this pass. A future task may make this
-/// (and bitrate, resolution, encoder backend) user-configurable; the
-/// plumbing here already accepts `bitrate_kbps` per the task that scoped
-/// this module.
-const CAPTURE_FRAMERATE: u32 = 30;
+/// Default encoder-branch framerate cap, preselected in `ui.rs`'s framerate
+/// dropdown. Deliberately conservative (matches this pipeline's previous
+/// hardcoded `CAPTURE_FRAMERATE` value) rather than jumping straight to the
+/// spec's 240Hz ceiling ([`MAX_FRAMERATE`]): a higher framerate multiplies
+/// both the encoder's CPU cost and (per this module's doc comment on
+/// `build_pipeline`'s `videorate` cap) how finely the same configured
+/// bitrate gets sliced, so a cautious default — especially so soon after the
+/// bitrate-starvation bug this same knob was originally added to fix (see
+/// this module's doc comment) — is safer than maximizing it by default.
+/// Users who want up to 240fps (desktop-only per the original design; the
+/// browser client can stay lower) can select it explicitly.
+pub const DEFAULT_FRAMERATE: u32 = 30;
+
+/// Hard ceiling on the user-selectable capture framerate, per the original
+/// project design's "desktop clients support up to 240Hz streaming"
+/// requirement — the browser client isn't held to this, but this is the
+/// native desktop client. [`build_pipeline`] clamps whatever `framerate` it's
+/// given into `MIN_FRAMERATE..=MAX_FRAMERATE` as a defensive belt-and-
+/// suspenders measure (`ui.rs`'s dropdown already only offers values in
+/// range), so a bad/malicious caller can never hand this a `framerate` of 0
+/// (which would make `key-int-max` 0, i.e. "never insert a keyframe past the
+/// first") or something absurdly large.
+pub const MAX_FRAMERATE: u32 = 240;
+
+/// See [`MAX_FRAMERATE`].
+pub const MIN_FRAMERATE: u32 = 1;
 
 /// Per protocol-spec's fixed 2-second GOP interval (§9: "the next scheduled
 /// 2 s keyframe").
@@ -473,9 +497,15 @@ const ENCODER_VALVE_NAME: &str = "encoder_valve";
 fn build_pipeline(
     source_fragment: &str,
     bitrate_kbps: u32,
+    framerate: u32,
     backend: EncoderBackend,
 ) -> Result<(gst::Pipeline, gst_app::AppSink, gst_app::AppSink, gst::Element)> {
-    let gop_frames = GOP_SECONDS * CAPTURE_FRAMERATE;
+    // Defensive clamp — see [`MAX_FRAMERATE`]'s doc comment. `ui.rs`'s
+    // dropdown only ever offers values already inside this range, so this
+    // is a backstop against a 0/absurd value reaching `key-int-max`, not the
+    // primary validation.
+    let framerate = framerate.clamp(MIN_FRAMERATE, MAX_FRAMERATE);
+    let gop_frames = GOP_SECONDS * framerate;
     let encoder = backend.launch_fragment(bitrate_kbps, gop_frames);
     let raw_format = backend.raw_format();
 
@@ -496,31 +526,34 @@ fn build_pipeline(
     // buffers exactly as before — that's the whole point of the valve — but
     // lets EOS (and caps/segment, though those don't change mid-stream here)
     // through regardless of `drop`.
-    // `videorate ! video/x-raw,...,framerate={CAPTURE_FRAMERATE}/1` on the
-    // encoder branch (mirroring the preview branch's own `videorate` a few
-    // lines down) is load-bearing, not cosmetic: `<platform source>` (portal
+    // `videorate ! video/x-raw,...,framerate={framerate}/1` on the encoder
+    // branch (mirroring the preview branch's own `videorate` a few lines
+    // down) is load-bearing, not cosmetic: `<platform source>` (portal
     // `pipewiresrc`/Windows `d3d11screencapturesrc`) delivers frames at
     // whatever variable, content-driven rate the compositor/OS pushes them —
     // observed live ranging from ~1fps on an idle desktop up to the
     // monitor's full refresh rate (100+ fps) under continuous motion, with
-    // nothing upstream constraining it to `CAPTURE_FRAMERATE`. Every encoder
-    // property that assumes a nominal 30fps (`key-int-max={gop_frames}` for
-    // the spec's 2s GOP, and — critically — `bitrate={bitrate_kbps}` itself,
-    // since both `x264enc` and `vah264enc` allocate their per-frame bit
-    // budget by dividing the target bitrate across the negotiated caps'
-    // framerate) silently breaks without this: fed at, say, 100fps instead
-    // of the assumed 30, the encoder divides the same kbit/s budget across
-    // >3x as many frames, so each frame gets a fraction of its intended
-    // allocation. Live-measured without this cap: every delta frame landed
-    // at exactly the same ~222 bytes regardless of real on-screen motion
-    // (mouse movement, window content changes) or the configured bitrate
-    // (8000 kbps) — the classic signature of a starved rate controller
-    // dividing a fixed budget across far more frames than intended, not an
-    // actual per-frame bitrate/unit bug (`gst-inspect-1.0` confirms both
-    // backends' `bitrate` properties are already correctly in kbit/s). This
-    // also fixes the GOP interval: `key-int-max={gop_frames}` assumes
-    // `CAPTURE_FRAMERATE`, which was previously only true by accident
-    // whenever the source happened to deliver exactly that rate.
+    // nothing upstream constraining it to the user's chosen `framerate`.
+    // Every encoder property that assumes a nominal fps
+    // (`key-int-max={gop_frames}` for the spec's 2s GOP, and — critically —
+    // `bitrate={bitrate_kbps}` itself, since both `x264enc` and `vah264enc`
+    // allocate their per-frame bit budget by dividing the target bitrate
+    // across the negotiated caps' framerate) silently breaks without this:
+    // fed at, say, 100fps instead of the configured 30, the encoder divides
+    // the same kbit/s budget across >3x as many frames, so each frame gets a
+    // fraction of its intended allocation. Live-measured without this cap:
+    // every delta frame landed at exactly the same ~222 bytes regardless of
+    // real on-screen motion (mouse movement, window content changes) or the
+    // configured bitrate (8000 kbps) — the classic signature of a starved
+    // rate controller dividing a fixed budget across far more frames than
+    // intended, not an actual per-frame bitrate/unit bug (`gst-inspect-1.0`
+    // confirms both backends' `bitrate` properties are already correctly in
+    // kbit/s). This also fixes the GOP interval: `key-int-max={gop_frames}`
+    // assumes the same `framerate` value passed in here (scaled by
+    // `GOP_SECONDS`, so the ~2-second keyframe interval holds regardless of
+    // which framerate the user picks), which was previously only true by
+    // accident whenever the source happened to deliver exactly the
+    // hardcoded 30fps.
     let description = format!(
         "{source_fragment} \
          ! videoconvert \
@@ -528,7 +561,7 @@ fn build_pipeline(
          t. ! queue \
             ! valve name={ENCODER_VALVE_NAME} drop=false drop-mode=forward-sticky-events \
             ! videorate \
-            ! video/x-raw,format={raw_format},framerate={CAPTURE_FRAMERATE}/1 \
+            ! video/x-raw,format={raw_format},framerate={framerate}/1 \
             ! {encoder} \
             ! video/x-h264,stream-format=byte-stream,alignment=au \
             ! appsink name=sink emit-signals=false sync=false max-buffers=4 drop=true \
@@ -576,9 +609,11 @@ fn build_pipeline(
 fn start_pipeline(
     source_fragment: &str,
     bitrate_kbps: u32,
+    framerate: u32,
     backend: EncoderBackend,
 ) -> Result<(gst::Pipeline, gst_app::AppSink, gst_app::AppSink, gst::Element)> {
-    let (pipeline, appsink, preview_sink, encoder_valve) = build_pipeline(source_fragment, bitrate_kbps, backend)?;
+    let (pipeline, appsink, preview_sink, encoder_valve) =
+        build_pipeline(source_fragment, bitrate_kbps, framerate, backend)?;
 
     if let Err(e) = pipeline.set_state(gst::State::Playing) {
         let _ = pipeline.set_state(gst::State::Null);
@@ -632,6 +667,15 @@ pub struct CaptureHandle {
     // `control_rx.recv()` observe channel closure and stop selecting on it —
     // no explicit shutdown signal needed.
     control_tx: mpsc::UnboundedSender<CaptureControlEvent>,
+    // Sharer-side live FPS readout: the encoder branch's real output rate,
+    // updated by `pump_loop` (see [`ENCODER_FPS_WINDOW`]) every time an
+    // encoded access unit reaches the appsink, and read back here via
+    // [`CaptureHandle::encoder_fps`] — lets `ui.rs` show "is the configured
+    // framerate actually being hit", not just "what was selected". An
+    // `Arc<AtomicU32>` rather than a channel: this is a plain last-value
+    // gauge, not an event stream, so a lock-free shared cell is simpler than
+    // threading another channel through.
+    encoder_fps: Arc<AtomicU32>,
 }
 
 impl Drop for CaptureHandle {
@@ -667,18 +711,26 @@ impl Drop for CaptureHandle {
 /// room members see the stream appear.
 ///
 /// `bitrate_kbps` is plumbed straight into the encoder (see
-/// [`DEFAULT_BITRATE_KBPS`] for a reasonable default); a bitrate-selection UI
-/// is a later task.
+/// [`DEFAULT_BITRATE_KBPS`] for a reasonable default). `framerate` caps the
+/// encoder branch's output rate (see [`build_pipeline`]'s doc comment) and
+/// scales the GOP/keyframe interval to match — see [`DEFAULT_FRAMERATE`]/
+/// [`MAX_FRAMERATE`] for the selectable range; `ui.rs`'s framerate dropdown
+/// is the UI for choosing it.
 ///
 /// Returns `Err` — never panics — if the capture source is unavailable (on
 /// Linux: the portal is unreachable, or the user denies/cancels the
 /// screencast permission dialog), or the GStreamer pipeline fails to
 /// construct/start.
-pub async fn start_sharing(client: &ScreenshareClient, stream_id: u8, bitrate_kbps: u32) -> Result<CaptureHandle> {
+pub async fn start_sharing(
+    client: &ScreenshareClient,
+    stream_id: u8,
+    bitrate_kbps: u32,
+    framerate: u32,
+) -> Result<CaptureHandle> {
     ensure_gstreamer_initialized()?;
 
     let capture_source = acquire_capture_source().await?;
-    start_sharing_with_source(client, stream_id, bitrate_kbps, capture_source).await
+    start_sharing_with_source(client, stream_id, bitrate_kbps, framerate, capture_source).await
 }
 
 /// TEST-ONLY seam (see [`CaptureSource::TestSource`]): starts the exact same
@@ -699,6 +751,7 @@ pub async fn start_sharing_from_test_source(
     client: &ScreenshareClient,
     stream_id: u8,
     bitrate_kbps: u32,
+    framerate: u32,
     source_fragment: &str,
 ) -> Result<CaptureHandle> {
     ensure_gstreamer_initialized()?;
@@ -706,6 +759,7 @@ pub async fn start_sharing_from_test_source(
         client,
         stream_id,
         bitrate_kbps,
+        framerate,
         CaptureSource::TestSource(source_fragment.to_string()),
     )
     .await
@@ -719,6 +773,7 @@ async fn start_sharing_with_source(
     client: &ScreenshareClient,
     stream_id: u8,
     bitrate_kbps: u32,
+    framerate: u32,
     capture_source: CaptureSource,
 ) -> Result<CaptureHandle> {
     let source_fragment = capture_source.launch_fragment();
@@ -734,11 +789,11 @@ async fn start_sharing_with_source(
     // Software there (see its doc comment), so the Vaapi arm never matches.
     let preferred_backend = detect_encoder_backend();
     let (pipeline, appsink, preview_sink, encoder_valve) =
-        match start_pipeline(&source_fragment, bitrate_kbps, preferred_backend) {
+        match start_pipeline(&source_fragment, bitrate_kbps, framerate, preferred_backend) {
             Ok(started) => started,
             Err(e) if preferred_backend == EncoderBackend::Vaapi => {
                 tracing::warn!("VAAPI capture pipeline failed to start ({e:#}); falling back to software encoder");
-                start_pipeline(&source_fragment, bitrate_kbps, EncoderBackend::Software)
+                start_pipeline(&source_fragment, bitrate_kbps, framerate, EncoderBackend::Software)
                     .context("software fallback capture pipeline also failed to start")?
             }
             Err(e) => return Err(e),
@@ -769,8 +824,10 @@ async fn start_sharing_with_source(
     let bus_stream = bus.stream();
 
     let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let encoder_fps = Arc::new(AtomicU32::new(0));
 
     let pump_client = client.clone();
+    let pump_encoder_fps = encoder_fps.clone();
     let pump_task = tokio::spawn(pump_loop(
         pump_client,
         stream_id,
@@ -779,6 +836,7 @@ async fn start_sharing_with_source(
         control_rx,
         encoder_valve,
         encoder_sink_pad,
+        pump_encoder_fps,
     ));
 
     client
@@ -800,6 +858,7 @@ async fn start_sharing_with_source(
         pump_task,
         preview_handle: Some(preview_handle),
         control_tx,
+        encoder_fps,
     })
 }
 
@@ -984,6 +1043,20 @@ impl CaptureHandle {
     pub fn notify_keyframe_request(&self) {
         let _ = self.control_tx.send(CaptureControlEvent::KeyframeRequest);
     }
+
+    /// Live sharer-side encode rate: the encoder branch's actual output
+    /// framerate over the last [`ENCODER_FPS_WINDOW`], updated by
+    /// [`pump_loop`] every time an encoded access unit reaches the appsink.
+    /// `0` until enough samples have arrived to compute a rate (e.g. right
+    /// after starting, or while the encoder is paused at 0 subscribers — see
+    /// [`CaptureControlEvent::SubscriberCount`]). Intended for `ui.rs` to
+    /// show next to the configured framerate, confirming the pipeline is
+    /// really hitting the selected rate rather than silently capping at some
+    /// other value — exactly the class of bug this area of the code has hit
+    /// twice before (see this module's doc comment on the `videorate` cap).
+    pub fn encoder_fps(&self) -> u32 {
+        self.encoder_fps.load(Ordering::Relaxed)
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1048,6 +1121,35 @@ fn set_valve_drop(encoder_valve: &gst::Element, drop: bool, stream_id: u8) {
     }
 }
 
+/// Sliding-window size for [`CaptureHandle::encoder_fps`]'s live rate —
+/// wide enough to smooth over natural per-frame jitter (encode time,
+/// scheduler noise) but narrow enough that the displayed number reacts
+/// quickly to a real change (e.g. the encoder pausing at 0 subscribers, or
+/// content going idle/busy).
+const ENCODER_FPS_WINDOW: Duration = Duration::from_secs(2);
+
+/// Records that one encoded access unit just reached the appsink (called
+/// from [`pump_loop`]'s `appsink_stream` arm) and recomputes
+/// [`CaptureHandle::encoder_fps`]'s published rate from the count of
+/// timestamps still inside [`ENCODER_FPS_WINDOW`]. `times` is `pump_loop`'s
+/// own local sliding window — plain `VecDeque` push-back/pop-front, no lock
+/// needed since only `pump_loop`'s single task ever touches it; `fps` is the
+/// `Arc<AtomicU32>` shared out to [`CaptureHandle::encoder_fps`] for
+/// lock-free reads from `ui.rs`.
+fn record_encoder_frame(times: &mut VecDeque<Instant>, fps: &AtomicU32) {
+    let now = Instant::now();
+    times.push_back(now);
+    while let Some(&oldest) = times.front() {
+        if now.duration_since(oldest) > ENCODER_FPS_WINDOW {
+            times.pop_front();
+        } else {
+            break;
+        }
+    }
+    let rate = times.len() as f64 / ENCODER_FPS_WINDOW.as_secs_f64();
+    fps.store(rate.round() as u32, Ordering::Relaxed);
+}
+
 /// Drains encoded access units from `appsink` and pipeline error/EOS
 /// messages from `bus` concurrently, for as long as either stream keeps
 /// producing, while also reacting to [`CaptureControlEvent`]s on
@@ -1066,10 +1168,15 @@ async fn pump_loop(
     mut control_rx: mpsc::UnboundedReceiver<CaptureControlEvent>,
     encoder_valve: gst::Element,
     encoder_sink_pad: gst::Pad,
+    encoder_fps: Arc<AtomicU32>,
 ) {
     let start = Instant::now();
     let mut appsink_done = false;
     let mut bus_done = false;
+    // Sliding window of the `Instant`s each encoded access unit reached the
+    // appsink, used to compute [`CaptureHandle::encoder_fps`]'s live rate —
+    // see [`ENCODER_FPS_WINDOW`].
+    let mut encoded_frame_times: VecDeque<Instant> = VecDeque::new();
     // Once `control_tx` (on `CaptureHandle`) drops, `control_rx.recv()`
     // resolves to `None` immediately on every poll — this flag stops that
     // from turning into a busy-spin on this `select!` arm for however much
@@ -1092,6 +1199,7 @@ async fn pump_loop(
             sample = appsink_stream.next(), if !appsink_done => {
                 match sample {
                     Some(sample) => {
+                        record_encoder_frame(&mut encoded_frame_times, &encoder_fps);
                         if let Err(e) = send_encoded_sample(&client, stream_id, &sample, start) {
                             tracing::warn!("dropping encoded frame for stream {stream_id}: {e:#}");
                         }
@@ -1112,6 +1220,15 @@ async fn pump_loop(
                             tracing::info!("stream {stream_id} has 0 subscribers; pausing encoder to save CPU/bandwidth");
                             set_valve_drop(&encoder_valve, true, stream_id);
                             paused = true;
+                            // No more encoded frames will arrive while
+                            // paused, so `record_encoder_frame`'s window
+                            // won't naturally decay on its own (it only
+                            // recomputes on a new frame) — reset the
+                            // published rate to 0 immediately rather than
+                            // leaving `encoder_fps()` stuck reporting its
+                            // last pre-pause value.
+                            encoded_frame_times.clear();
+                            encoder_fps.store(0, Ordering::Relaxed);
                         }
                     }
                     Some(CaptureControlEvent::SubscriberCount(_)) => {
@@ -1226,7 +1343,7 @@ mod tests {
     /// permission grant this test environment can't provide), runs it, and
     /// returns whether at least one encoded H.264 access unit came out.
     fn run_backend_and_expect_encoded_buffer(backend: EncoderBackend) -> bool {
-        let encoder = backend.launch_fragment(DEFAULT_BITRATE_KBPS, GOP_SECONDS * CAPTURE_FRAMERATE);
+        let encoder = backend.launch_fragment(DEFAULT_BITRATE_KBPS, GOP_SECONDS * DEFAULT_FRAMERATE);
         let raw_format = backend.raw_format();
         let description = format!(
             "videotestsrc num-buffers=10 \
@@ -1420,7 +1537,7 @@ mod tests {
         }
 
         let backend = EncoderBackend::Software;
-        let encoder = backend.launch_fragment(DEFAULT_BITRATE_KBPS, GOP_SECONDS * CAPTURE_FRAMERATE);
+        let encoder = backend.launch_fragment(DEFAULT_BITRATE_KBPS, GOP_SECONDS * DEFAULT_FRAMERATE);
         let raw_format = backend.raw_format();
         let description = format!(
             "videotestsrc num-buffers=40 \
@@ -1473,6 +1590,92 @@ mod tests {
             frame.rgb.len(),
             640 * 480 * 3,
             "preview frame RGB buffer should be tightly packed with no stride padding"
+        );
+    }
+
+    /// Real, measured proof that [`build_pipeline`]'s `framerate` parameter
+    /// actually reaches the encoder branch's output rate — not just that the
+    /// pipeline parses/links (that alone would not have caught either of the
+    /// two prior bugs in this exact area: the original bitrate-starvation
+    /// bug where the `videorate` cap was simply missing, and the general
+    /// "looks configured in the UI but isn't actually applied" bug shape
+    /// this task's own instructions call out). Feeds a fixed, fast 60fps
+    /// `videotestsrc` (well above every `framerate` under test, so the
+    /// `videorate` cap — not the source — is what's actually limiting
+    /// output) through two different `build_pipeline` `framerate` values,
+    /// measures how many encoded access units actually arrive at the appsink
+    /// over a real wall-clock window, and asserts the measured rate tracks
+    /// the configured one — and that the two configured rates produce
+    /// visibly different measured rates, ruling out "always outputs
+    /// whatever the source happens to deliver, ignoring the parameter"
+    /// silently passing this test by coincidence.
+    #[test]
+    fn build_pipeline_framerate_parameter_actually_caps_encoder_output_rate() {
+        if gst::init().is_err() {
+            eprintln!("skipping: gstreamer not available in this environment");
+            return;
+        }
+
+        // Small resolution and software encoder keep this fast/deterministic
+        // on any machine (no VAAPI dependency), while `is-live=true` and a
+        // fixed 60/1 source framerate (comfortably above every configured
+        // rate under test) makes the `videorate` cap on the encoder branch —
+        // not the source's own delivery rate — the thing actually being
+        // measured, mirroring how a real portal/pipewiresrc source can
+        // deliver well above the configured cap under motion.
+        let source = "videotestsrc is-live=true pattern=smpte \
+             ! video/x-raw,width=64,height=64,framerate=60/1";
+
+        fn measure_output_fps(source: &str, configured_fps: u32) -> f64 {
+            let (pipeline, sink, _preview_sink, _valve) =
+                build_pipeline(source, DEFAULT_BITRATE_KBPS, configured_fps, EncoderBackend::Software)
+                    .expect("pipeline should construct");
+            pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+
+            let measure_window = Duration::from_secs(2);
+            let deadline = Instant::now() + measure_window;
+            let mut count = 0u32;
+            while Instant::now() < deadline {
+                if sink.try_pull_sample(gst::ClockTime::from_mseconds(100)).is_some() {
+                    count += 1;
+                }
+            }
+
+            pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+            count as f64 / measure_window.as_secs_f64()
+        }
+
+        let low_configured = 10u32;
+        let high_configured = 25u32;
+        let low_measured = measure_output_fps(source, low_configured);
+        let high_measured = measure_output_fps(source, high_configured);
+
+        eprintln!(
+            "measured encoder output rate: configured {low_configured}fps -> {low_measured:.1}fps measured; \
+             configured {high_configured}fps -> {high_measured:.1}fps measured"
+        );
+
+        // Generous tolerance (±40%) — this is real wall-clock GStreamer
+        // timing on a shared CI/dev machine, not a deterministic simulation —
+        // but tight enough that "ignoring the parameter and just passing
+        // through whatever the 60fps source delivers" (which would measure
+        // close to 60fps at both settings) or "always emitting at some other
+        // fixed rate regardless of the parameter" both fail it.
+        assert!(
+            (low_measured - low_configured as f64).abs() < low_configured as f64 * 0.4,
+            "configured {low_configured}fps produced a measured rate of {low_measured:.1}fps, \
+             too far off to say the framerate parameter is actually being applied"
+        );
+        assert!(
+            (high_measured - high_configured as f64).abs() < high_configured as f64 * 0.4,
+            "configured {high_configured}fps produced a measured rate of {high_measured:.1}fps, \
+             too far off to say the framerate parameter is actually being applied"
+        );
+        assert!(
+            high_measured > low_measured * 1.3,
+            "changing the configured framerate from {low_configured} to {high_configured} did not \
+             meaningfully change the measured output rate ({low_measured:.1}fps vs {high_measured:.1}fps) — \
+             looks like the parameter isn't actually reaching the pipeline, just like the bug this test guards against"
         );
     }
 
