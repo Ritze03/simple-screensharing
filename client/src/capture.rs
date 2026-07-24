@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! <platform source> ! videoconvert ! tee name=t
-//!   t. ! queue ! video/x-raw,format=I420
+//!   t. ! queue ! valve name=encoder_valve drop=false ! video/x-raw,format=I420
 //!      ! x264enc tune=zerolatency bitrate=<kbps> key-int-max=<gop> speed-preset=ultrafast
 //!      ! video/x-h264,stream-format=byte-stream,alignment=au
 //!      ! appsink name=sink
@@ -15,6 +15,12 @@
 //!      ! videoconvert ! video/x-raw,format=RGB
 //!      ! appsink name=preview_sink
 //! ```
+//!
+//! The `valve` gates only the encoder branch: `pump_loop` toggles its
+//! `drop` property in response to `ClientEvent::SubscriberCount` (pausing
+//! at 0 subscribers, resuming — with a forced keyframe — on the next
+//! subscriber) without touching the preview `tee` branch or the pipeline's
+//! `Playing` state. See [`CaptureControlEvent`]/[`force_keyframe`].
 //!
 //! `<platform source>` is [`CaptureSource::launch_fragment`]:
 //! `pipewiresrc fd=<fd> path=<node_id> do-timestamp=true` on Linux/Unix
@@ -88,6 +94,7 @@ use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use gstreamer_video::prelude::*;
+use tokio::sync::mpsc;
 
 use crate::fragment::fragment_frame;
 use crate::net::{encrypt_frame, ScreenshareClient};
@@ -434,16 +441,26 @@ async fn open_portal_capture() -> Result<PortalCapture> {
 /// wasted `videoconvert`/appsink work.
 const PREVIEW_BRANCH_FRAMERATE: u32 = 1;
 
+/// Name of the `valve` element gating the encoder branch (between the
+/// tee's `queue` and the raw-format capsfilter feeding the encoder) — see
+/// [`build_pipeline`]. Toggled via its `drop` property by [`pump_loop`] in
+/// response to `ClientEvent::SubscriberCount { count: 0, .. }`/`> 0`, so a
+/// stream can stop encoding (and burning CPU/bandwidth) while it has no
+/// subscribers without touching the preview tee branch or the pipeline's
+/// `Playing` state.
+const ENCODER_VALVE_NAME: &str = "encoder_valve";
+
 /// Builds and links (but does not start) the capture/encode pipeline
 /// described in this module's doc comment, returning the pipeline, its
-/// encoded-output `appsink`, and the preview branch's raw-RGB `appsink`.
+/// encoded-output `appsink`, the preview branch's raw-RGB `appsink`, and the
+/// encoder branch's gating `valve` (see [`ENCODER_VALVE_NAME`]).
 /// `source_fragment` is [`CaptureSource::launch_fragment`]'s output — the
 /// only platform-specific piece of the description below.
 fn build_pipeline(
     source_fragment: &str,
     bitrate_kbps: u32,
     backend: EncoderBackend,
-) -> Result<(gst::Pipeline, gst_app::AppSink, gst_app::AppSink)> {
+) -> Result<(gst::Pipeline, gst_app::AppSink, gst_app::AppSink, gst::Element)> {
     let gop_frames = GOP_SECONDS * CAPTURE_FRAMERATE;
     let encoder = backend.launch_fragment(bitrate_kbps, gop_frames);
     let raw_format = backend.raw_format();
@@ -453,6 +470,7 @@ fn build_pipeline(
          ! videoconvert \
          ! tee name=t \
          t. ! queue \
+            ! valve name={ENCODER_VALVE_NAME} drop=false \
             ! video/x-raw,format={raw_format} \
             ! {encoder} \
             ! video/x-h264,stream-format=byte-stream,alignment=au \
@@ -483,7 +501,11 @@ fn build_pipeline(
         .downcast::<gst_app::AppSink>()
         .map_err(|_| anyhow!("'preview_sink' element is not an AppSink"))?;
 
-    Ok((pipeline, sink, preview_sink))
+    let encoder_valve = pipeline
+        .by_name(ENCODER_VALVE_NAME)
+        .ok_or_else(|| anyhow!("pipeline has no element named '{ENCODER_VALVE_NAME}'"))?;
+
+    Ok((pipeline, sink, preview_sink, encoder_valve))
 }
 
 /// Builds `backend`'s capture pipeline and drives it to `Playing`, waiting
@@ -498,8 +520,8 @@ fn start_pipeline(
     source_fragment: &str,
     bitrate_kbps: u32,
     backend: EncoderBackend,
-) -> Result<(gst::Pipeline, gst_app::AppSink, gst_app::AppSink)> {
-    let (pipeline, appsink, preview_sink) = build_pipeline(source_fragment, bitrate_kbps, backend)?;
+) -> Result<(gst::Pipeline, gst_app::AppSink, gst_app::AppSink, gst::Element)> {
+    let (pipeline, appsink, preview_sink, encoder_valve) = build_pipeline(source_fragment, bitrate_kbps, backend)?;
 
     if let Err(e) = pipeline.set_state(gst::State::Playing) {
         let _ = pipeline.set_state(gst::State::Null);
@@ -517,7 +539,7 @@ fn start_pipeline(
         return Err(anyhow!("capture pipeline ({backend:?}) failed to reach PLAYING: {e:?}"));
     }
 
-    Ok((pipeline, appsink, preview_sink))
+    Ok((pipeline, appsink, preview_sink, encoder_valve))
 }
 
 // ---------------------------------------------------------------------
@@ -545,6 +567,14 @@ pub struct CaptureHandle {
     // normally (bare-drop backstop path) is fine, per `PreviewHandle`'s own
     // doc comment (dropping `stop_tx` promptly stops its background task).
     preview_handle: Option<PreviewHandle>,
+    // The other end of `pump_loop`'s `control_rx` (see [`CaptureControlEvent`]).
+    // The caller (`ui.rs`'s main event loop) forwards `ClientEvent::SubscriberCount`/
+    // `ClientEvent::KeyframeRequest` for this `stream_id` here via
+    // [`CaptureHandle::notify_subscriber_count`]/[`CaptureHandle::notify_keyframe_request`].
+    // Dropped by `stop`/`Drop` along with the rest of `self`, which makes
+    // `control_rx.recv()` observe channel closure and stop selecting on it —
+    // no explicit shutdown signal needed.
+    control_tx: mpsc::UnboundedSender<CaptureControlEvent>,
 }
 
 impl Drop for CaptureHandle {
@@ -646,15 +676,16 @@ async fn start_sharing_with_source(
     // this branch is inert: detect_encoder_backend() always resolves to
     // Software there (see its doc comment), so the Vaapi arm never matches.
     let preferred_backend = detect_encoder_backend();
-    let (pipeline, appsink, preview_sink) = match start_pipeline(&source_fragment, bitrate_kbps, preferred_backend) {
-        Ok(started) => started,
-        Err(e) if preferred_backend == EncoderBackend::Vaapi => {
-            tracing::warn!("VAAPI capture pipeline failed to start ({e:#}); falling back to software encoder");
-            start_pipeline(&source_fragment, bitrate_kbps, EncoderBackend::Software)
-                .context("software fallback capture pipeline also failed to start")?
-        }
-        Err(e) => return Err(e),
-    };
+    let (pipeline, appsink, preview_sink, encoder_valve) =
+        match start_pipeline(&source_fragment, bitrate_kbps, preferred_backend) {
+            Ok(started) => started,
+            Err(e) if preferred_backend == EncoderBackend::Vaapi => {
+                tracing::warn!("VAAPI capture pipeline failed to start ({e:#}); falling back to software encoder");
+                start_pipeline(&source_fragment, bitrate_kbps, EncoderBackend::Software)
+                    .context("software fallback capture pipeline also failed to start")?
+            }
+            Err(e) => return Err(e),
+        };
 
     // Width/height for AnnounceStream: read off the negotiated sink caps
     // now that the pipeline is playing, falling back to 0x0 (unknown) if
@@ -662,12 +693,36 @@ async fn start_sharing_with_source(
     // cosmetic field.
     let (width, height) = negotiated_size(&appsink).unwrap_or((0, 0));
 
+    // The pad `force_keyframe` pushes its `UpstreamForceKeyUnitEvent` from:
+    // specifically the encoded-output appsink's sink pad, not e.g.
+    // `pipeline.send_event()`, because this pipeline has *two* leaf sink
+    // elements (this one and `preview_sink`) — `Pipeline::send_event`'s
+    // "pick a random sink element" behavior for upstream events could just
+    // as easily pick the preview branch, which doesn't reach the encoder at
+    // all. Pushing from this specific pad guarantees the event travels
+    // upstream through exactly the encoder branch (arriving at the
+    // encoder's src pad, where `GstVideoEncoder`'s base class — which both
+    // `x264enc` and `vah264enc` derive from — intercepts it).
+    let encoder_sink_pad = appsink
+        .static_pad("sink")
+        .ok_or_else(|| anyhow!("encoded-output appsink has no sink pad"))?;
+
     let stream = appsink.stream();
     let bus = pipeline.bus().ok_or_else(|| anyhow!("pipeline has no bus"))?;
     let bus_stream = bus.stream();
 
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+
     let pump_client = client.clone();
-    let pump_task = tokio::spawn(pump_loop(pump_client, stream_id, stream, bus_stream));
+    let pump_task = tokio::spawn(pump_loop(
+        pump_client,
+        stream_id,
+        stream,
+        bus_stream,
+        control_rx,
+        encoder_valve,
+        encoder_sink_pad,
+    ));
 
     client
         .announce_stream(stream_id, StreamKind::Video, "Screen", width, height)
@@ -687,6 +742,7 @@ async fn start_sharing_with_source(
         capture_source,
         pump_task,
         preview_handle: Some(preview_handle),
+        control_tx,
     })
 }
 
@@ -848,25 +904,105 @@ impl CaptureHandle {
 
         Ok(())
     }
+
+    /// Forwards a `ClientEvent::SubscriberCount { stream_id, count }` for
+    /// this handle's `stream_id` to [`pump_loop`], which pauses (`count ==
+    /// 0`) or resumes (`count > 0`, forcing a keyframe so the next frame any
+    /// new subscriber gets is decodable) the encoder branch. The caller
+    /// (`ui.rs`'s event loop) is responsible for matching the incoming
+    /// `stream_id` against the right `CaptureHandle` before calling this —
+    /// this method itself doesn't check it.
+    ///
+    /// A no-op (silently dropped) if `pump_loop` has already exited (e.g.
+    /// `stop()` is in flight) — there is nothing useful left to pause/resume.
+    pub fn notify_subscriber_count(&self, count: u32) {
+        let _ = self.control_tx.send(CaptureControlEvent::SubscriberCount(count));
+    }
+
+    /// Forwards a `ClientEvent::KeyframeRequest { stream_id }` for this
+    /// handle's `stream_id` to [`pump_loop`], which forces the encoder to
+    /// produce a keyframe on its next output frame (see
+    /// [`force_keyframe`]). Same caller-matches-`stream_id` contract and
+    /// already-stopped no-op behavior as [`CaptureHandle::notify_subscriber_count`].
+    pub fn notify_keyframe_request(&self) {
+        let _ = self.control_tx.send(CaptureControlEvent::KeyframeRequest);
+    }
 }
 
 // ---------------------------------------------------------------------
 // Encode → encrypt → fragment → send pump
 // ---------------------------------------------------------------------
 
+/// Control-plane events that affect an active share's encoder, forwarded
+/// from the relay's `RelayToClient::SubscriberCount`/`RelayToClient::KeyframeRequest`
+/// (surfaced to this client as `net::ClientEvent::SubscriberCount`/
+/// `net::ClientEvent::KeyframeRequest`) via [`CaptureHandle::notify_subscriber_count`]/
+/// [`CaptureHandle::notify_keyframe_request`]. See [`pump_loop`] for how
+/// each variant is handled.
+enum CaptureControlEvent {
+    /// New subscriber count for this stream. `0` pauses the encoder branch
+    /// (via [`ENCODER_VALVE_NAME`]'s `drop` property) to save CPU/bandwidth
+    /// while nobody is watching; a transition from `0` to non-zero resumes
+    /// it and forces a keyframe (see [`force_keyframe`]) so the newly
+    /// (re)subscribed viewer's decoder has something to start from.
+    SubscriberCount(u32),
+    /// A new subscriber joined (relay-debounced). Forces a keyframe — and,
+    /// if the encoder branch happened to be paused, resumes it too (a
+    /// `KeyframeRequest` implies at least one subscriber exists, regardless
+    /// of whether its paired `SubscriberCount` update has arrived yet).
+    KeyframeRequest,
+}
+
+/// Sends a `gst_video::UpstreamForceKeyUnitEvent` into the pipeline from
+/// `encoder_sink_pad` (the encoded-output appsink's sink pad — see
+/// [`start_sharing_with_source`]'s doc comment on why that specific pad,
+/// not `pipeline.send_event()`). Pushing an upstream event on a sink pad
+/// delivers it to the peer pad (the encoder's src pad), which is exactly
+/// where `GstVideoEncoder` — the base class both `x264enc` and `vah264enc`
+/// build on — listens for force-key-unit requests: the very next buffer the
+/// encoder outputs will not carry the `DELTA_UNIT` flag.
+fn force_keyframe(encoder_sink_pad: &gst::Pad) {
+    let event = gst_video::UpstreamForceKeyUnitEvent::builder().all_headers(true).build();
+    if !encoder_sink_pad.push_event(event) {
+        tracing::warn!("force-keyframe event was not accepted by the capture pipeline");
+    }
+}
+
 /// Drains encoded access units from `appsink` and pipeline error/EOS
 /// messages from `bus` concurrently, for as long as either stream keeps
-/// producing. Exits when both streams end (normal teardown, see
-/// [`CaptureHandle::stop`]) or the bus reports a pipeline error.
+/// producing, while also reacting to [`CaptureControlEvent`]s on
+/// `control_rx` (pausing/resuming `encoder_valve` and forcing keyframes via
+/// `encoder_sink_pad` — see [`force_keyframe`]). Exits its GStreamer-facing
+/// half when both the appsink and bus streams end (normal teardown, see
+/// [`CaptureHandle::stop`]) or the bus reports a pipeline error;
+/// `control_rx` naturally stops contributing new work once `CaptureHandle`
+/// (and its `control_tx`) drops, so it doesn't gate the loop's exit the same
+/// way the other two do.
 async fn pump_loop(
     client: ScreenshareClient,
     stream_id: u8,
     mut appsink_stream: gst_app::app_sink::AppSinkStream,
     mut bus_stream: gst::bus::BusStream,
+    mut control_rx: mpsc::UnboundedReceiver<CaptureControlEvent>,
+    encoder_valve: gst::Element,
+    encoder_sink_pad: gst::Pad,
 ) {
     let start = Instant::now();
     let mut appsink_done = false;
     let mut bus_done = false;
+    // Once `control_tx` (on `CaptureHandle`) drops, `control_rx.recv()`
+    // resolves to `None` immediately on every poll — this flag stops that
+    // from turning into a busy-spin on this `select!` arm for however much
+    // longer the loop keeps running on the other two streams (normally
+    // zero, since `stop()` always awaits `pump_task` to completion before
+    // `self`/`control_tx` drop; only the bare-drop `Drop` backstop path,
+    // which doesn't join `pump_task`, could otherwise hit this).
+    let mut control_done = false;
+    // Mirrors the valve's actual `drop` property so a `SubscriberCount`
+    // transition from one non-zero count to another (e.g. 2 -> 1) doesn't
+    // spuriously re-force a keyframe — only an actual 0 -> non-zero (or an
+    // explicit `KeyframeRequest`) does.
+    let mut paused = false;
 
     loop {
         if appsink_done && bus_done {
@@ -887,6 +1023,42 @@ async fn pump_loop(
                 match msg {
                     Some(msg) => handle_bus_message(&msg, &mut bus_done),
                     None => bus_done = true,
+                }
+            }
+            ctrl = control_rx.recv(), if !control_done => {
+                match ctrl {
+                    Some(CaptureControlEvent::SubscriberCount(0)) => {
+                        if !paused {
+                            tracing::info!("stream {stream_id} has 0 subscribers; pausing encoder to save CPU/bandwidth");
+                            encoder_valve.set_property("drop", true);
+                            paused = true;
+                        }
+                    }
+                    Some(CaptureControlEvent::SubscriberCount(_)) => {
+                        if paused {
+                            tracing::info!("stream {stream_id} has a subscriber again; resuming encoder");
+                            encoder_valve.set_property("drop", false);
+                            paused = false;
+                            // Resuming after a pause means the first frame
+                            // back out of the encoder must be a keyframe —
+                            // nothing decodable was produced while paused.
+                            force_keyframe(&encoder_sink_pad);
+                        }
+                    }
+                    Some(CaptureControlEvent::KeyframeRequest) => {
+                        if paused {
+                            // A subscribe implies at least one subscriber
+                            // exists even if the paired `SubscriberCount`
+                            // update hasn't arrived yet — don't leave the
+                            // encoder paused (and the new subscriber with
+                            // nothing to decode) waiting on message order.
+                            tracing::info!("stream {stream_id} got a keyframe request while paused; resuming encoder");
+                            encoder_valve.set_property("drop", false);
+                            paused = false;
+                        }
+                        force_keyframe(&encoder_sink_pad);
+                    }
+                    None => control_done = true,
                 }
             }
         }
@@ -1032,6 +1204,119 @@ mod tests {
         assert!(
             run_backend_and_expect_encoded_buffer(EncoderBackend::Software),
             "expected at least one encoded H.264 access unit from the software encoder test pipeline"
+        );
+    }
+
+    /// Exercises the two mechanisms `pump_loop` relies on for
+    /// pause-at-zero-subscribers/keyframe-on-new-subscriber (see this
+    /// module's doc comment and [`CaptureControlEvent`]) directly against a
+    /// real GStreamer pipeline shaped like the encoder branch [`build_pipeline`]
+    /// produces (`valve name=v drop=false ! ... ! x264enc ! ... ! appsink`),
+    /// with `videotestsrc` standing in for the real capture source per
+    /// [`run_backend_and_expect_encoded_buffer`]'s doc comment:
+    ///
+    /// 1. With a large `key-int-max` (so only the very first frame is
+    ///    naturally a keyframe), confirms encoded output actually contains
+    ///    both a keyframe and a later `DELTA_UNIT` (non-keyframe) buffer —
+    ///    establishing the delta-frame baseline the rest of the test
+    ///    depends on.
+    /// 2. Sets the valve's `drop` property to `true` and confirms no further
+    ///    encoded buffers reach the appsink while it's closed.
+    /// 3. Re-opens the valve, pushes a real
+    ///    [`gst_video::UpstreamForceKeyUnitEvent`] on the appsink's sink pad
+    ///    (exactly what [`force_keyframe`] does), and confirms the next
+    ///    buffer that comes out does *not* carry `DELTA_UNIT` — i.e. is a
+    ///    real keyframe, not just whatever the encoder would have produced
+    ///    next regardless.
+    #[test]
+    fn encoder_valve_gates_output_and_force_key_unit_event_forces_a_keyframe() {
+        if gst::init().is_err() {
+            eprintln!("skipping: gstreamer not available in this environment");
+            return;
+        }
+
+        let backend = EncoderBackend::Software;
+        // A huge GOP so nothing but the very first frame is a keyframe
+        // within this test's short run, isolating the force-key-unit
+        // event's effect from x264enc's own periodic keyframing.
+        let encoder = backend.launch_fragment(DEFAULT_BITRATE_KBPS, 10_000);
+        let raw_format = backend.raw_format();
+        let description = format!(
+            "videotestsrc is-live=true \
+             ! videoconvert \
+             ! valve name=v drop=false \
+             ! video/x-raw,format={raw_format} \
+             ! {encoder} \
+             ! video/x-h264,stream-format=byte-stream,alignment=au \
+             ! appsink name=sink emit-signals=false sync=false max-buffers=4 drop=true"
+        );
+
+        let element = gst::parse::launch(&description).expect("pipeline should parse and link");
+        let pipeline = element.downcast::<gst::Pipeline>().expect("top-level element should be a Pipeline");
+        let valve = pipeline.by_name("v").expect("valve element should exist");
+        let sink = pipeline
+            .by_name("sink")
+            .expect("sink element should exist")
+            .downcast::<gst_app::AppSink>()
+            .expect("sink should be an AppSink");
+        let sink_pad = sink.static_pad("sink").expect("appsink should have a sink pad");
+
+        pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+
+        // (1) Baseline: the first buffer is a keyframe, a later one is a
+        // plain delta frame (proving the huge key-int-max is actually
+        // suppressing automatic re-keyframing, so step 3 below is a real
+        // test of the force-key-unit event and not a fluke of timing).
+        let mut got_keyframe = false;
+        let mut got_delta = false;
+        for _ in 0..100 {
+            if got_keyframe && got_delta {
+                break;
+            }
+            if let Some(sample) = sink.try_pull_sample(gst::ClockTime::from_mseconds(200)) {
+                let buffer = sample.buffer().expect("sample should have a buffer");
+                if buffer.flags().contains(gst::BufferFlags::DELTA_UNIT) {
+                    got_delta = true;
+                } else {
+                    got_keyframe = true;
+                }
+            }
+        }
+        assert!(got_keyframe, "expected the first encoded buffer to be a keyframe");
+        assert!(got_delta, "expected a later buffer to be a non-keyframe delta frame with a large key-int-max");
+
+        // (2) Closing the valve should stop new encoded buffers from
+        // reaching the appsink. Drain anything already in flight first, then
+        // confirm nothing further shows up.
+        valve.set_property("drop", true);
+        while sink.try_pull_sample(gst::ClockTime::from_mseconds(50)).is_some() {}
+        assert!(
+            sink.try_pull_sample(gst::ClockTime::from_mseconds(700)).is_none(),
+            "closing the valve should stop new encoded buffers from reaching the appsink"
+        );
+
+        // (3) Re-opening the valve and forcing a keyframe (the same
+        // `UpstreamForceKeyUnitEvent`-on-the-appsink's-sink-pad mechanism
+        // `force_keyframe` uses) must make the very next buffer a keyframe.
+        valve.set_property("drop", false);
+        let event = gst_video::UpstreamForceKeyUnitEvent::builder().all_headers(true).build();
+        assert!(sink_pad.push_event(event), "force-keyframe event should be accepted by the pipeline");
+
+        let mut resumed_keyframe = None;
+        for _ in 0..100 {
+            if let Some(sample) = sink.try_pull_sample(gst::ClockTime::from_mseconds(200)) {
+                let buffer = sample.buffer().expect("sample should have a buffer");
+                resumed_keyframe = Some(!buffer.flags().contains(gst::BufferFlags::DELTA_UNIT));
+                break;
+            }
+        }
+
+        pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+
+        assert_eq!(
+            resumed_keyframe,
+            Some(true),
+            "the first encoded buffer after resuming + a forced keyframe request should not carry DELTA_UNIT"
         );
     }
 

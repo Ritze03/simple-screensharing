@@ -678,8 +678,28 @@ impl App {
                     connected.preview_cache.remove(conn_id, stream_id);
                     connected.preview_textures.remove(&(conn_id, stream_id));
                 }
-                ClientEvent::SubscriberCount { .. } | ClientEvent::KeyframeRequest { .. } => {
-                    // Relevant once this client can be a sender (capture.rs, later).
+                // Only meaningful for a stream we're actively *sending*
+                // (relay spec §9: both are sent only to the connection that
+                // owns `stream_id`) — forward to that stream's live
+                // `CaptureHandle` so `capture.rs`'s pump loop can
+                // pause/resume the encoder and force keyframes. A miss (no
+                // `active_shares` entry, not `Active` yet, or an audio
+                // share) is a normal, silent no-op: audio has no encoder to
+                // pause, and a `Starting`/`Stopping`/absent share has
+                // nothing listening yet.
+                ClientEvent::SubscriberCount { stream_id, count } => {
+                    if let Some(ActiveShare { status: ShareStatus::Active(ShareHandle::Video(handle)), .. }) =
+                        connected.active_shares.get(&stream_id)
+                    {
+                        handle.notify_subscriber_count(count);
+                    }
+                }
+                ClientEvent::KeyframeRequest { stream_id } => {
+                    if let Some(ActiveShare { status: ShareStatus::Active(ShareHandle::Video(handle)), .. }) =
+                        connected.active_shares.get(&stream_id)
+                    {
+                        handle.notify_keyframe_request();
+                    }
                 }
                 ClientEvent::MediaFrame(frame) => {
                     if let Some(entry) = connected.watches.get_mut(&(frame.conn_id, frame.stream_id)) {
