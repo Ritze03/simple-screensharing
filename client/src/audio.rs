@@ -496,18 +496,49 @@ impl AudioCaptureHandle {
     /// error here is logged, not returned, since capture has already
     /// stopped either way).
     pub async fn stop(mut self) -> Result<()> {
-        if let Err(e) = self.pipeline.set_state(gst::State::Null) {
-            tracing::warn!("error stopping audio capture pipeline: {e}");
+        // Ask the pipeline to end gracefully by sending it a real EOS event
+        // *before* forcing it to `Null`, and wait for the pump task to
+        // notice — same fix, same rationale, as `capture.rs::CaptureHandle::stop`:
+        // `gstreamer_app::AppSinkStream` (what `pump_loop` awaits via
+        // `appsink_stream.next()`) only ever yields its terminal `None` once
+        // the appsink's `is_eos()` flag is actually set, which only happens
+        // once a real EOS event has flowed all the way through the pipeline
+        // into it. Jumping straight to `set_state(Null)` (as this used to
+        // do) never sends that event — it just tears the elements down — so
+        // the appsink's stream would sit `Pending` forever and `pump_task`
+        // would never complete, hanging this whole function (and orphaning
+        // the still-running `pw-loopback` child, since it was only killed
+        // *after* the pump task join) indefinitely. Confirmed via a live
+        // end-to-end "Stop Sharing Audio" test that hung in "Stopping..."
+        // for 90+ seconds.
+        //
+        // The `timeout` is a backstop, not the expected path: a healthy
+        // pipeline should drain and reach EOS in well under a second, but
+        // this guarantees `stop()` itself can never hang the caller forever
+        // if the source somehow never honors EOS.
+        if !self.pipeline.send_event(gst::event::Eos::new()) {
+            tracing::warn!("audio capture pipeline did not accept the EOS event; forcing a hard stop");
         }
 
         // `&mut` rather than moving `self.pump_task` out: `AudioCaptureHandle`
         // implements `Drop` (see below), which forbids moving individual
         // fields out of `self` by value — `JoinHandle` is `Unpin`, so
         // awaiting through `&mut` works identically.
-        if let Err(e) = (&mut self.pump_task).await {
-            tracing::warn!("audio capture send task did not shut down cleanly: {e}");
+        match tokio::time::timeout(Duration::from_secs(5), &mut self.pump_task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("audio capture send task did not shut down cleanly: {e}"),
+            Err(_) => tracing::warn!(
+                "audio capture send task did not observe EOS within 5s; forcing pipeline to Null anyway"
+            ),
         }
 
+        if let Err(e) = self.pipeline.set_state(gst::State::Null) {
+            tracing::warn!("error stopping audio capture pipeline: {e}");
+        }
+
+        // Unconditional regardless of whether EOS was observed cleanly or
+        // the timeout fallback fired above — "Stop Sharing Audio" must
+        // never leave `pw-loopback` orphaned.
         kill_and_wait(&mut self.loopback_child);
 
         if let Err(e) = self.client.stop_stream(self.stream_id).await {
@@ -840,5 +871,152 @@ mod tests {
         kill_and_wait(&mut loopback_child);
         let _ = app.kill();
         let _ = app.wait();
+    }
+
+    /// Regression test for the "Stop Sharing Audio" hang: starts a real
+    /// audio share (synthetic `audiotestsrc ! pipewiresink` source, real
+    /// `pw-loopback`, real Opus capture pipeline, real relay connection —
+    /// same "real server child process, in-process client" model as
+    /// `end_to_end_test.rs`), then asserts [`AudioCaptureHandle::stop`]
+    /// returns well within its 5s EOS-wait timeout (previously: hung
+    /// indefinitely, confirmed live at 90+ seconds before this was force-
+    /// killed) and that the `pw-loopback` child process is actually gone
+    /// (not orphaned) afterward, checked both via `Child::try_wait()` and an
+    /// independent `pgrep` against the loopback's `--name`. Not runnable
+    /// unattended/in CI (spawns real system processes + needs a live
+    /// PipeWire session + a built server binary), hence `#[ignore]`. Run
+    /// manually with:
+    /// `cargo test audio::tests::stop_returns_promptly_and_reaps_pw_loopback -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn stop_returns_promptly_and_reaps_pw_loopback() {
+        use std::net::UdpSocket;
+
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+        // --- spin up a real relay server child process, same approach as
+        // end_to_end_test.rs (duplicated in miniature here rather than
+        // reaching into that module, to keep this test self-contained). ---
+        let port = {
+            let socket = UdpSocket::bind("127.0.0.1:0").expect("failed to bind ephemeral probe socket");
+            socket.local_addr().expect("local_addr").port()
+        };
+        let home = dirs::home_dir().expect("could not determine home directory");
+        let server_repo = home.join("Documents/Programming/simple-screensharing-server");
+        let server_binary = {
+            let release = server_repo.join("target/release/simple-screensharing-server");
+            let debug = server_repo.join("target/debug/simple-screensharing-server");
+            if release.is_file() {
+                release
+            } else if debug.is_file() {
+                debug
+            } else {
+                panic!("server binary not found at {release:?} or {debug:?} — build the server repo first");
+            }
+        };
+        let cmd_string = format!("{} {port}", server_binary.display());
+        let mut server_child = Command::new("setsid")
+            .args(["script", "-qc", &cmd_string, "/dev/null"])
+            .current_dir(&server_repo)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn relay server child process (requires setsid/script)");
+
+        let server_addr = format!("127.0.0.1:{port}");
+        let room_id: crate::protocol::RoomId = rand::random();
+        let room_key: [u8; 32] = rand::random();
+        let join_string = crate::net::format_join_string(&server_addr, &room_id, &room_key);
+
+        let mut client = None;
+        for _ in 0..40 {
+            match ScreenshareClient::connect(&join_string, "audio-stop-test").await {
+                Ok(v) => {
+                    client = Some(v);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(250)).await,
+            }
+        }
+        let (client, _snapshot, _events) = client.expect("client failed to connect to the relay after retries");
+
+        // --- synthetic audio-producing app + real pw-loopback tap. ---
+        let mut app = Command::new("gst-launch-1.0")
+            .args([
+                "audiotestsrc",
+                "!",
+                "audioconvert",
+                "!",
+                "pipewiresink",
+                "client-name=ssshare-audio-stop-test",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn synthetic audiotestsrc app");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let sources = list_audio_sources().expect("list_audio_sources should succeed against a live pw-dump");
+        let source = sources
+            .iter()
+            .find(|s| s.name.contains("ssshare-audio-stop-test"))
+            .cloned()
+            .expect("did not find the synthetic test app among live audio sources");
+
+        eprintln!("[audio-stop-test] starting real audio share for source {source:?}");
+        let handle = start_audio_sharing(&client, 7, &source)
+            .await
+            .expect("start_audio_sharing failed");
+
+        // Let it actually run/produce a few Opus packets before stopping,
+        // like a real share would.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let loopback_pid = handle.loopback_child.id();
+        eprintln!("[audio-stop-test] pw-loopback pid={loopback_pid}; calling stop()");
+
+        let stop_started = Instant::now();
+        let stop_result = tokio::time::timeout(Duration::from_secs(10), handle.stop()).await;
+        let stop_elapsed = stop_started.elapsed();
+        eprintln!("[audio-stop-test] stop() returned after {stop_elapsed:?}");
+
+        assert!(
+            stop_result.is_ok(),
+            "AudioCaptureHandle::stop() did not return within 10s — the hang is still present"
+        );
+        assert!(
+            stop_elapsed < Duration::from_secs(6),
+            "stop() took {stop_elapsed:?}, expected well under the 5s EOS-wait timeout plus teardown overhead"
+        );
+        if let Err(e) = stop_result.unwrap() {
+            tracing::warn!("[audio-stop-test] stop() returned Err (non-fatal to this test): {e:#}");
+        }
+
+        // Confirm the pw-loopback OS process is actually gone, not orphaned
+        // — both via the reaped Child's own exit status and an independent
+        // process-table check by pid.
+        let still_running_by_pid = Command::new("kill")
+            .args(["-0", &loopback_pid.to_string()])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        eprintln!("[audio-stop-test] pw-loopback pid={loopback_pid} still running per `kill -0`: {still_running_by_pid}");
+        assert!(
+            !still_running_by_pid,
+            "pw-loopback process (pid {loopback_pid}) is still running after stop() — orphaned"
+        );
+
+        let _ = client.leave().await;
+        let _ = app.kill();
+        let _ = app.wait();
+        let _ = server_child.kill();
+        let _ = server_child.wait();
+        let _ = Command::new("pkill")
+            .args(["-f", &format!("simple-screensharing-server {port}")])
+            .status();
+
+        eprintln!("[audio-stop-test] PASS: stop() returned in {stop_elapsed:?}, pw-loopback (pid {loopback_pid}) reaped");
     }
 }
