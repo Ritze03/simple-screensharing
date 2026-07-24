@@ -496,13 +496,39 @@ fn build_pipeline(
     // buffers exactly as before — that's the whole point of the valve — but
     // lets EOS (and caps/segment, though those don't change mid-stream here)
     // through regardless of `drop`.
+    // `videorate ! video/x-raw,...,framerate={CAPTURE_FRAMERATE}/1` on the
+    // encoder branch (mirroring the preview branch's own `videorate` a few
+    // lines down) is load-bearing, not cosmetic: `<platform source>` (portal
+    // `pipewiresrc`/Windows `d3d11screencapturesrc`) delivers frames at
+    // whatever variable, content-driven rate the compositor/OS pushes them —
+    // observed live ranging from ~1fps on an idle desktop up to the
+    // monitor's full refresh rate (100+ fps) under continuous motion, with
+    // nothing upstream constraining it to `CAPTURE_FRAMERATE`. Every encoder
+    // property that assumes a nominal 30fps (`key-int-max={gop_frames}` for
+    // the spec's 2s GOP, and — critically — `bitrate={bitrate_kbps}` itself,
+    // since both `x264enc` and `vah264enc` allocate their per-frame bit
+    // budget by dividing the target bitrate across the negotiated caps'
+    // framerate) silently breaks without this: fed at, say, 100fps instead
+    // of the assumed 30, the encoder divides the same kbit/s budget across
+    // >3x as many frames, so each frame gets a fraction of its intended
+    // allocation. Live-measured without this cap: every delta frame landed
+    // at exactly the same ~222 bytes regardless of real on-screen motion
+    // (mouse movement, window content changes) or the configured bitrate
+    // (8000 kbps) — the classic signature of a starved rate controller
+    // dividing a fixed budget across far more frames than intended, not an
+    // actual per-frame bitrate/unit bug (`gst-inspect-1.0` confirms both
+    // backends' `bitrate` properties are already correctly in kbit/s). This
+    // also fixes the GOP interval: `key-int-max={gop_frames}` assumes
+    // `CAPTURE_FRAMERATE`, which was previously only true by accident
+    // whenever the source happened to deliver exactly that rate.
     let description = format!(
         "{source_fragment} \
          ! videoconvert \
          ! tee name=t \
          t. ! queue \
             ! valve name={ENCODER_VALVE_NAME} drop=false drop-mode=forward-sticky-events \
-            ! video/x-raw,format={raw_format} \
+            ! videorate \
+            ! video/x-raw,format={raw_format},framerate={CAPTURE_FRAMERATE}/1 \
             ! {encoder} \
             ! video/x-h264,stream-format=byte-stream,alignment=au \
             ! appsink name=sink emit-signals=false sync=false max-buffers=4 drop=true \
