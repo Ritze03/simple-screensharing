@@ -1,11 +1,12 @@
-//! Wayland screen capture (xdg-desktop-portal `ScreenCast` + PipeWire) →
-//! H.264 encode (GStreamer) → AEAD-encrypt → fragment → send, over the QUIC
-//! media-datagram plane wired up in `net.rs`.
+//! Screen capture (Linux: xdg-desktop-portal `ScreenCast` + PipeWire;
+//! Windows: GStreamer's `d3d11screencapturesrc`) → H.264 encode (GStreamer) →
+//! AEAD-encrypt → fragment → send, over the QUIC media-datagram plane wired
+//! up in `net.rs`.
 //!
 //! # Pipeline
 //!
 //! ```text
-//! pipewiresrc fd=<fd> path=<node_id> ! videoconvert ! tee name=t
+//! <platform source> ! videoconvert ! tee name=t
 //!   t. ! queue ! video/x-raw,format=I420
 //!      ! x264enc tune=zerolatency bitrate=<kbps> key-int-max=<gop> speed-preset=ultrafast
 //!      ! video/x-h264,stream-format=byte-stream,alignment=au
@@ -14,6 +15,14 @@
 //!      ! videoconvert ! video/x-raw,format=RGB
 //!      ! appsink name=preview_sink
 //! ```
+//!
+//! `<platform source>` is [`CaptureSource::launch_fragment`]:
+//! `pipewiresrc fd=<fd> path=<node_id> do-timestamp=true` on Linux/Unix
+//! (behind `#[cfg(unix)]`, fed by the portal flow below), or
+//! `d3d11screencapturesrc monitor-index=0 do-timestamp=true` on Windows
+//! (behind `#[cfg(windows)]`, no portal/consent flow needed — see
+//! [`acquire_capture_source`]). Everything downstream of that first element
+//! is identical on both platforms.
 //!
 //! The `tee` feeds a second, low-rate branch whose RGB8 samples back
 //! [`preview::spawn_preview_task`] (see [`start_sharing`]) — the
@@ -64,11 +73,14 @@
 //! one) that announces a second `StreamKind::Audio` stream on its own
 //! `stream_id`, reusing the same encrypt/fragment/send path below.
 
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
+#[cfg(unix)]
 use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
+#[cfg(unix)]
 use ashpd::desktop::{PersistMode, Session};
 use futures_util::StreamExt;
 use gstreamer as gst;
@@ -154,6 +166,14 @@ impl EncoderBackend {
 /// The probe result is cached for the process's lifetime (VAAPI device
 /// availability doesn't change at runtime) so repeated [`start_sharing`]
 /// calls don't pay the probe-pipeline cost every time.
+///
+/// On Windows this naturally always resolves to [`EncoderBackend::Software`]:
+/// [`probe_vaapi_encoder`]'s `vah264enc` element simply isn't installed
+/// there, so the same "construct the element, fail gracefully" probe below
+/// does the right thing with no `#[cfg]` needed. Windows hardware encode via
+/// Media Foundation's `mfvideoenc` (the natural Windows analogue of VAAPI
+/// here) is a deliberate fast-follow, not an oversight — same staging as
+/// VAAPI itself was after software-only worked first on Linux.
 fn detect_encoder_backend() -> EncoderBackend {
     use std::sync::OnceLock;
     static VAAPI_AVAILABLE: OnceLock<bool> = OnceLock::new();
@@ -252,11 +272,77 @@ fn ensure_gstreamer_initialized() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------
-// Portal (ashpd) — request a screencast session and its PipeWire remote
+// Capture source acquisition — platform-specific. Linux/Unix goes through
+// the xdg-desktop-portal `ScreenCast` + PipeWire flow (consent dialog
+// required); Windows captures directly via GStreamer's
+// `d3d11screencapturesrc` (no portal/consent system to go through for a
+// native desktop app on Windows). Both converge on [`CaptureSource`], whose
+// [`CaptureSource::launch_fragment`] is the only thing [`build_pipeline`]
+// needs to know about — see this module's doc comment for the full
+// pipeline shape both platforms share downstream of that first element.
 // ---------------------------------------------------------------------
+
+/// Everything needed to know how raw video enters the capture pipeline on
+/// this platform, plus any resources whose lifetime must span the capture
+/// (Linux: the portal session + PipeWire remote fd; Windows: nothing extra —
+/// `d3d11screencapturesrc` needs no persistent handle of its own here).
+enum CaptureSource {
+    #[cfg(unix)]
+    Portal(PortalCapture),
+    #[cfg(windows)]
+    Windows,
+}
+
+impl CaptureSource {
+    /// The `gst-launch`-syntax fragment for this platform's capture source
+    /// element (see this module's doc comment) — the only piece of
+    /// [`build_pipeline`]'s description that differs by platform.
+    fn launch_fragment(&self) -> String {
+        match self {
+            #[cfg(unix)]
+            CaptureSource::Portal(portal) => {
+                format!(
+                    "pipewiresrc fd={} path={} do-timestamp=true",
+                    portal._pipewire_fd.as_raw_fd(),
+                    portal.node_id
+                )
+            }
+            #[cfg(windows)]
+            CaptureSource::Windows => {
+                // monitor-index=0: single primary-monitor capture, matching
+                // the Linux path's current "capture this monitor" scope. A
+                // full monitor-picker UI (mirroring a fuller portal source
+                // picker) is a future enhancement, not required for this
+                // pass. `d3d11screencapturesrc` is part of gst-plugins-bad's
+                // D3D11 plugin — GStreamer's own wrapper around DXGI Desktop
+                // Duplication, keeping this project's "use GStreamer
+                // elements, not hand-rolled platform FFI" principle
+                // consistent with how VAAPI hardware encode was already
+                // handled via `vah264enc` on Linux.
+                "d3d11screencapturesrc monitor-index=0 do-timestamp=true".to_string()
+            }
+        }
+    }
+}
+
+/// Acquires this platform's [`CaptureSource`]. On Linux/Unix this runs the
+/// interactive portal permission flow (see [`open_portal_capture`]); on
+/// Windows there's no portal/consent dialog system for a native desktop app
+/// to go through, so this captures directly with no user interaction beyond
+/// whatever the app's own UI already asked for.
+#[cfg(unix)]
+async fn acquire_capture_source() -> Result<CaptureSource> {
+    Ok(CaptureSource::Portal(open_portal_capture().await?))
+}
+
+#[cfg(windows)]
+async fn acquire_capture_source() -> Result<CaptureSource> {
+    Ok(CaptureSource::Windows)
+}
 
 /// Everything obtained from the xdg-desktop-portal `ScreenCast` interface
 /// needed to build the capture pipeline.
+#[cfg(unix)]
 struct PortalCapture {
     node_id: u32,
     /// Kept alive for the lifetime of the capture: `pipewiresrc` dups the fd
@@ -275,6 +361,7 @@ struct PortalCapture {
 ///
 /// Returns a clear `Err` (never panics) if the portal is unavailable or the
 /// user denies/cancels the permission dialog.
+#[cfg(unix)]
 async fn open_portal_capture() -> Result<PortalCapture> {
     let proxy = Screencast::new()
         .await
@@ -337,9 +424,10 @@ const PREVIEW_BRANCH_FRAMERATE: u32 = 1;
 /// Builds and links (but does not start) the capture/encode pipeline
 /// described in this module's doc comment, returning the pipeline, its
 /// encoded-output `appsink`, and the preview branch's raw-RGB `appsink`.
+/// `source_fragment` is [`CaptureSource::launch_fragment`]'s output — the
+/// only platform-specific piece of the description below.
 fn build_pipeline(
-    pipewire_fd: std::os::fd::RawFd,
-    node_id: u32,
+    source_fragment: &str,
     bitrate_kbps: u32,
     backend: EncoderBackend,
 ) -> Result<(gst::Pipeline, gst_app::AppSink, gst_app::AppSink)> {
@@ -348,7 +436,7 @@ fn build_pipeline(
     let raw_format = backend.raw_format();
 
     let description = format!(
-        "pipewiresrc fd={pipewire_fd} path={node_id} do-timestamp=true \
+        "{source_fragment} \
          ! videoconvert \
          ! tee name=t \
          t. ! queue \
@@ -394,12 +482,11 @@ fn build_pipeline(
 /// down to `Null` before returning `Err`, so a failed attempt never leaks a
 /// half-started pipeline into the fallback attempt.
 fn start_pipeline(
-    pipewire_fd: std::os::fd::RawFd,
-    node_id: u32,
+    source_fragment: &str,
     bitrate_kbps: u32,
     backend: EncoderBackend,
 ) -> Result<(gst::Pipeline, gst_app::AppSink, gst_app::AppSink)> {
-    let (pipeline, appsink, preview_sink) = build_pipeline(pipewire_fd, node_id, bitrate_kbps, backend)?;
+    let (pipeline, appsink, preview_sink) = build_pipeline(source_fragment, bitrate_kbps, backend)?;
 
     if let Err(e) = pipeline.set_state(gst::State::Playing) {
         let _ = pipeline.set_state(gst::State::Null);
@@ -431,45 +518,48 @@ pub struct CaptureHandle {
     stream_id: u8,
     client: ScreenshareClient,
     pipeline: gst::Pipeline,
-    portal_session: Session<Screencast>,
+    capture_source: CaptureSource,
     pump_task: tokio::task::JoinHandle<()>,
     preview_handle: PreviewHandle,
 }
 
-/// Starts sharing this machine's screen on `stream_id`: runs the portal
-/// permission flow, builds and starts the capture/encode pipeline, and (once
-/// the first encoded frame has actually gone out, i.e. capture is really
-/// flowing — not just "pipeline exists") calls
-/// [`ScreenshareClient::announce_stream`] so other room members see the
-/// stream appear.
+/// Starts sharing this machine's screen on `stream_id`: acquires this
+/// platform's capture source (Linux: runs the portal permission flow;
+/// Windows: no consent flow needed, see [`acquire_capture_source`]), builds
+/// and starts the capture/encode pipeline, and (once the first encoded frame
+/// has actually gone out, i.e. capture is really flowing — not just
+/// "pipeline exists") calls [`ScreenshareClient::announce_stream`] so other
+/// room members see the stream appear.
 ///
 /// `bitrate_kbps` is plumbed straight into the encoder (see
 /// [`DEFAULT_BITRATE_KBPS`] for a reasonable default); a bitrate-selection UI
 /// is a later task.
 ///
-/// Returns `Err` — never panics — if the portal is unavailable, the user
-/// denies/cancels the screencast permission dialog, or the GStreamer
-/// pipeline fails to construct/start.
+/// Returns `Err` — never panics — if the capture source is unavailable (on
+/// Linux: the portal is unreachable, or the user denies/cancels the
+/// screencast permission dialog), or the GStreamer pipeline fails to
+/// construct/start.
 pub async fn start_sharing(client: &ScreenshareClient, stream_id: u8, bitrate_kbps: u32) -> Result<CaptureHandle> {
     ensure_gstreamer_initialized()?;
 
-    let portal = open_portal_capture().await?;
-    let fd = portal._pipewire_fd.as_raw_fd();
+    let capture_source = acquire_capture_source().await?;
+    let source_fragment = capture_source.launch_fragment();
 
     // Prefer hardware (VAAPI) encode when it's actually usable on this
     // machine, per detect_encoder_backend's probe; fall back to software.
     // Beyond that up-front probe, also fall back if the *real* pipeline
-    // (with the real portal fd/node_id) fails to construct or reach
-    // PLAYING — belt-and-suspenders against VAAPI issues the cheap probe
-    // pipeline didn't happen to catch — so a flaky/partial VAAPI setup
-    // never fails the whole capture when software encode would have worked.
+    // (with the real capture source) fails to construct or reach PLAYING —
+    // belt-and-suspenders against VAAPI issues the cheap probe pipeline
+    // didn't happen to catch — so a flaky/partial VAAPI setup never fails
+    // the whole capture when software encode would have worked. On Windows
+    // this branch is inert: detect_encoder_backend() always resolves to
+    // Software there (see its doc comment), so the Vaapi arm never matches.
     let preferred_backend = detect_encoder_backend();
-    let (pipeline, appsink, preview_sink) = match start_pipeline(fd, portal.node_id, bitrate_kbps, preferred_backend)
-    {
+    let (pipeline, appsink, preview_sink) = match start_pipeline(&source_fragment, bitrate_kbps, preferred_backend) {
         Ok(started) => started,
         Err(e) if preferred_backend == EncoderBackend::Vaapi => {
             tracing::warn!("VAAPI capture pipeline failed to start ({e:#}); falling back to software encoder");
-            start_pipeline(fd, portal.node_id, bitrate_kbps, EncoderBackend::Software)
+            start_pipeline(&source_fragment, bitrate_kbps, EncoderBackend::Software)
                 .context("software fallback capture pipeline also failed to start")?
         }
         Err(e) => return Err(e),
@@ -503,7 +593,7 @@ pub async fn start_sharing(client: &ScreenshareClient, stream_id: u8, bitrate_kb
         stream_id,
         client: client.clone(),
         pipeline,
-        portal_session: portal.session,
+        capture_source,
         pump_task,
         preview_handle,
     })
@@ -576,7 +666,8 @@ fn negotiated_size(appsink: &gst_app::AppSink) -> Option<(u16, u16)> {
 
 impl CaptureHandle {
     /// Tears the capture down cleanly: stops the GStreamer pipeline, closes
-    /// the portal session, tells the relay this stream is gone (best-effort
+    /// the portal session (Linux only — Windows has no session to close, see
+    /// [`CaptureSource`]), tells the relay this stream is gone (best-effort
     /// — a network error here is logged, not returned, since the pipeline is
     /// already stopped either way), and waits for the background send task
     /// to finish draining.
@@ -594,8 +685,16 @@ impl CaptureHandle {
 
         self.preview_handle.stop().await;
 
-        if let Err(e) = self.portal_session.close().await {
-            tracing::warn!("error closing screencast portal session: {e}");
+        #[cfg(unix)]
+        {
+            // `CaptureSource` has exactly one variant on this platform (see
+            // its `#[cfg(unix)]`/`#[cfg(windows)]` split), so this
+            // destructure is irrefutable — a plain `let` avoids the
+            // "useless if let" lint an `if let` would trigger here.
+            let CaptureSource::Portal(portal) = self.capture_source;
+            if let Err(e) = portal.session.close().await {
+                tracing::warn!("error closing screencast portal session: {e}");
+            }
         }
 
         if let Err(e) = self.client.stop_stream(self.stream_id).await {
@@ -915,6 +1014,7 @@ mod tests {
     /// and click "Share" in the dialog that appears; a `node_id` printed to
     /// stderr means the whole portal handshake (session creation, source
     /// selection, start, PipeWire remote fd) worked.
+    #[cfg(unix)]
     #[tokio::test]
     #[ignore]
     async fn live_portal_probe() {
