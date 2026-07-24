@@ -488,6 +488,17 @@ const PREVIEW_BRANCH_FRAMERATE: u32 = 1;
 /// `Playing` state.
 const ENCODER_VALVE_NAME: &str = "encoder_valve";
 
+/// `max-size-buffers` for the encoder branch's `queue leaky=downstream`
+/// right after the tee (see [`build_pipeline`]'s doc comment on that queue
+/// for the full "why" — briefly: without a small bounded/leaky config here,
+/// a real capture source's incoming raw-frame rate spiking under motion can
+/// outpace the encoder and this queue's own defaults, blocking the whole
+/// pipeline solid rather than dropping raw frames). A couple of frames'
+/// worth of slack (unlike the preview branch's `max-size-buffers=1`, which
+/// only ever needs the single newest frame) smooths brief scheduling jitter
+/// without ever letting a real backlog accumulate.
+const ENCODER_QUEUE_MAX_BUFFERS: u32 = 2;
+
 /// Builds and links (but does not start) the capture/encode pipeline
 /// described in this module's doc comment, returning the pipeline, its
 /// encoded-output `appsink`, the preview branch's raw-RGB `appsink`, and the
@@ -526,6 +537,34 @@ fn build_pipeline(
     // buffers exactly as before — that's the whole point of the valve — but
     // lets EOS (and caps/segment, though those don't change mid-stream here)
     // through regardless of `drop`.
+    // `queue leaky=downstream max-size-buffers={ENCODER_QUEUE_MAX_BUFFERS}`
+    // right after the tee is load-bearing, not cosmetic, and fixes a
+    // distinct bug from the `videorate` cap below: a plain `queue` (as this
+    // was before) defaults to `leaky=no` with `max-size-bytes=10485760`
+    // (10MB) — at even 1080p NV12 (~3.1MB/raw frame) that default byte cap
+    // holds only ~3 raw frames (at 4K NV12, ~12.4MB/frame, a *single*
+    // buffered frame already exceeds it), so the instant the downstream
+    // chain (`videorate`+`{encoder}`, sharing this one streaming thread)
+    // falls even slightly behind the raw capture rate — which spikes well
+    // above the configured `framerate` under real sustained motion, per the
+    // `videorate` doc comment below — this queue fills within a fraction of
+    // a second and, being non-leaky, *blocks* rather than drops. That block
+    // propagates upstream through the tee to `videoconvert` and the real
+    // capture source itself: on a real portal `pipewiresrc` (push-driven by
+    // the compositor against a small fixed PipeWire buffer pool, unlike a
+    // self-paced `videotestsrc`), a permanently blocked downstream means our
+    // side stops returning buffers to the pool, which stalls the
+    // compositor's own frame delivery once that pool is exhausted — a real
+    // freeze, not graceful degradation. This is exactly the live-reported
+    // "works for a few seconds under light motion, then freezes solid under
+    // sustained heavy motion" symptom, and matches this project's own
+    // established real-time policy everywhere else in this same pipeline
+    // (the preview branch's own `queue leaky=downstream max-size-buffers=1`
+    // a few lines down; both appsinks' `drop=true`): prefer dropping a raw
+    // frame over blocking. `max-size-buffers={ENCODER_QUEUE_MAX_BUFFERS}`
+    // (rather than the preview branch's 1) keeps a little slack to smooth
+    // over brief scheduling jitter without blocking, while still being far
+    // below the default's multi-second worst case.
     // `videorate ! video/x-raw,...,framerate={framerate}/1` on the encoder
     // branch (mirroring the preview branch's own `videorate` a few lines
     // down) is load-bearing, not cosmetic: `<platform source>` (portal
@@ -558,7 +597,7 @@ fn build_pipeline(
         "{source_fragment} \
          ! videoconvert \
          ! tee name=t \
-         t. ! queue \
+         t. ! queue leaky=downstream max-size-buffers={ENCODER_QUEUE_MAX_BUFFERS} \
             ! valve name={ENCODER_VALVE_NAME} drop=false drop-mode=forward-sticky-events \
             ! videorate \
             ! video/x-raw,format={raw_format},framerate={framerate}/1 \
