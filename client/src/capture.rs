@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! <platform source> ! videoconvert ! tee name=t
-//!   t. ! queue ! valve name=encoder_valve drop=false ! video/x-raw,format=I420
+//!   t. ! queue ! valve name=encoder_valve drop=false drop-mode=forward-sticky-events ! video/x-raw,format=I420
 //!      ! x264enc tune=zerolatency bitrate=<kbps> key-int-max=<gop> speed-preset=ultrafast
 //!      ! video/x-h264,stream-format=byte-stream,alignment=au
 //!      ! appsink name=sink
@@ -182,6 +182,20 @@ impl EncoderBackend {
 /// here) is a deliberate fast-follow, not an oversight — same staging as
 /// VAAPI itself was after software-only worked first on Linux.
 fn detect_encoder_backend() -> EncoderBackend {
+    // TEST-ONLY escape hatch: lets `end_to_end_test.rs` force the software
+    // backend even on a machine where VAAPI is actually available, so the
+    // live repro can be run against both backends. Never consulted outside
+    // `#[cfg(test)]` builds, so this changes nothing about production
+    // behavior.
+    #[cfg(test)]
+    if let Ok(forced) = std::env::var("E2E_FORCE_BACKEND") {
+        return if forced == "software" {
+            EncoderBackend::Software
+        } else {
+            EncoderBackend::Vaapi
+        };
+    }
+
     use std::sync::OnceLock;
     static VAAPI_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
@@ -465,12 +479,29 @@ fn build_pipeline(
     let encoder = backend.launch_fragment(bitrate_kbps, gop_frames);
     let raw_format = backend.raw_format();
 
+    // `drop-mode=forward-sticky-events` (rather than the element's default
+    // `drop-all`) is load-bearing, not cosmetic: GstValve's default mode
+    // drops *events*, not just buffers, while `drop=true` — and per
+    // `gst/gstevent.h`, `GST_EVENT_EOS` carries the `STICKY` flag, so a
+    // closed valve under the default mode silently swallows EOS too.
+    // `CaptureHandle::stop()` sends a real EOS event to drain the pipeline
+    // cleanly (see its doc comment), and `pump_loop`'s `appsink_stream` only
+    // ever yields its terminal `None` once that EOS actually reaches the
+    // appsink — so stopping a stream while its encoder happens to be paused
+    // (0 subscribers) would hang `stop()` for its full 5s timeout,
+    // discovered live via this module's own multi-cycle integration test
+    // (`end_to_end_test::repeated_pause_resume_cycles_keep_resuming`, which
+    // left the encoder paused at the end of its last cycle before tearing
+    // down). `forward-sticky-events` still drops ordinary (non-sticky)
+    // buffers exactly as before — that's the whole point of the valve — but
+    // lets EOS (and caps/segment, though those don't change mid-stream here)
+    // through regardless of `drop`.
     let description = format!(
         "{source_fragment} \
          ! videoconvert \
          ! tee name=t \
          t. ! queue \
-            ! valve name={ENCODER_VALVE_NAME} drop=false \
+            ! valve name={ENCODER_VALVE_NAME} drop=false drop-mode=forward-sticky-events \
             ! video/x-raw,format={raw_format} \
             ! {encoder} \
             ! video/x-h264,stream-format=byte-stream,alignment=au \
@@ -968,6 +999,29 @@ fn force_keyframe(encoder_sink_pad: &gst::Pad) {
     }
 }
 
+/// Sets [`ENCODER_VALVE_NAME`]'s `drop` property and immediately reads it
+/// back, warning loudly if it didn't actually take — a `GObject` property
+/// write is normally infallible/synchronous for a simple boolean like this,
+/// so a mismatch here would mean something is very wrong (e.g. the element
+/// handle outlived/detached from its pipeline), not a transient timing
+/// issue. This exists purely as a diagnostic backstop for exactly the class
+/// of bug this function's callers were written to guard against — pausing
+/// or resuming silently *appearing* to work (the call site runs, the log
+/// fires) while the valve's real state diverges from `pump_loop`'s `paused`
+/// bool — so if that ever happens again, it shows up as a loud warning
+/// instead of a silent 35-second-bandwidth-flatline mystery.
+fn set_valve_drop(encoder_valve: &gst::Element, drop: bool, stream_id: u8) {
+    encoder_valve.set_property("drop", drop);
+    let actual: bool = encoder_valve.property("drop");
+    if actual != drop {
+        tracing::warn!(
+            "stream {stream_id}: encoder_valve's 'drop' property is {actual} right after setting it to {drop} — \
+             the valve did not actually change state; the encoder branch is now out of sync with pump_loop's \
+             paused/resumed bookkeeping"
+        );
+    }
+}
+
 /// Drains encoded access units from `appsink` and pipeline error/EOS
 /// messages from `bus` concurrently, for as long as either stream keeps
 /// producing, while also reacting to [`CaptureControlEvent`]s on
@@ -1030,14 +1084,14 @@ async fn pump_loop(
                     Some(CaptureControlEvent::SubscriberCount(0)) => {
                         if !paused {
                             tracing::info!("stream {stream_id} has 0 subscribers; pausing encoder to save CPU/bandwidth");
-                            encoder_valve.set_property("drop", true);
+                            set_valve_drop(&encoder_valve, true, stream_id);
                             paused = true;
                         }
                     }
                     Some(CaptureControlEvent::SubscriberCount(_)) => {
                         if paused {
                             tracing::info!("stream {stream_id} has a subscriber again; resuming encoder");
-                            encoder_valve.set_property("drop", false);
+                            set_valve_drop(&encoder_valve, false, stream_id);
                             paused = false;
                             // Resuming after a pause means the first frame
                             // back out of the encoder must be a keyframe —
@@ -1053,7 +1107,7 @@ async fn pump_loop(
                             // encoder paused (and the new subscriber with
                             // nothing to decode) waiting on message order.
                             tracing::info!("stream {stream_id} got a keyframe request while paused; resuming encoder");
-                            encoder_valve.set_property("drop", false);
+                            set_valve_drop(&encoder_valve, false, stream_id);
                             paused = false;
                         }
                         force_keyframe(&encoder_sink_pad);

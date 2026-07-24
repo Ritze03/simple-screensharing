@@ -387,3 +387,459 @@ async fn real_capture_encrypt_fragment_relay_decode_round_trip() {
         variance
     );
 }
+
+/// Reproduces (and proves the fix for) the "resubscribe after the encoder
+/// paused never resumes" bug: client B watches, stops watching (subscriber
+/// count -> 0, encoder pauses via `encoder_valve`), then watches again
+/// (fresh subscribe, subscriber count -> 1 again). This drives client A's
+/// real `ClientEvent::SubscriberCount`/`ClientEvent::KeyframeRequest`
+/// handling exactly the way `ui.rs`'s event loop does (see its
+/// `ClientEvent::SubscriberCount`/`ClientEvent::KeyframeRequest` arms) —
+/// unlike the round-trip test above, this one actually reads and forwards
+/// client A's event channel, since that forwarding is exactly the wiring
+/// under test.
+#[tokio::test]
+#[ignore = "spawns a real relay server child process and real GStreamer capture/decode \
+            pipelines; run explicitly with `cargo test end_to_end_test:: -- --ignored --nocapture`"]
+async fn resubscribe_after_pause_resumes_encoder_and_frames_flow() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    let port = pick_free_udp_port().expect("failed to pick a free UDP port for the test relay");
+    eprintln!("[e2e-resub] starting relay server on 127.0.0.1:{port}");
+    let _server = spawn_relay_server(port).expect("failed to spawn relay server child process");
+
+    let server_addr = format!("127.0.0.1:{port}");
+    let room_id: RoomId = rand::random();
+    let room_key: [u8; 32] = rand::random();
+    let join_string = crate::net::format_join_string(&server_addr, &room_id, &room_key);
+
+    eprintln!("[e2e-resub] connecting client A (sharer)");
+    let (client_a, _snapshot_a, mut events_a) = connect_with_retry(&join_string, "sharer")
+        .await
+        .expect("client A failed to connect to the relay after retries");
+    eprintln!("[e2e-resub] connecting client B (viewer)");
+    let (client_b, _snapshot_b, mut events_b) = connect_with_retry(&join_string, "viewer")
+        .await
+        .expect("client B failed to connect to the relay after retries");
+
+    let source_fragment = format!(
+        "videotestsrc is-live=true pattern=smpte \
+         ! video/x-raw,width={WIDTH},height={HEIGHT},framerate=15/1"
+    );
+
+    eprintln!("[e2e-resub] starting real capture pipeline on client A");
+    let capture_handle = capture::start_sharing_from_test_source(&client_a, VIDEO_STREAM_ID, 2000, &source_fragment)
+        .await
+        .expect("start_sharing_from_test_source failed");
+
+    let owner_conn_id = client_a.conn_id();
+    let start = std::time::Instant::now();
+
+    eprintln!("[e2e-resub] waiting for client B to see StreamStarted presence delta");
+    let saw_stream_started = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match events_b.recv().await {
+                Some(ClientEvent::PresenceDelta(PresenceEvent::StreamStarted(info)))
+                    if info.owner == owner_conn_id && info.stream_id == VIDEO_STREAM_ID =>
+                {
+                    return true;
+                }
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+    })
+    .await;
+    assert_eq!(
+        saw_stream_started,
+        Ok(true),
+        "client B never observed client A's StreamStarted presence delta over the real relay"
+    );
+
+    // Forwards every SubscriberCount/KeyframeRequest client A receives to
+    // `capture_handle`, exactly like `ui.rs`'s event loop
+    // (`ClientEvent::SubscriberCount`/`ClientEvent::KeyframeRequest` arms) —
+    // this is the real wiring under test, so the test must exercise it for
+    // real rather than calling `notify_*` directly.
+    async fn forward_one_control_event(
+        events_a: &mut tokio::sync::mpsc::UnboundedReceiver<ClientEvent>,
+        capture_handle: &capture::CaptureHandle,
+        start: std::time::Instant,
+    ) -> bool {
+        match events_a.recv().await {
+            Some(ClientEvent::SubscriberCount { stream_id, count }) if stream_id == VIDEO_STREAM_ID => {
+                eprintln!("[e2e-resub] t={:?} client A got SubscriberCount({count})", start.elapsed());
+                capture_handle.notify_subscriber_count(count);
+                true
+            }
+            Some(ClientEvent::KeyframeRequest { stream_id }) if stream_id == VIDEO_STREAM_ID => {
+                eprintln!("[e2e-resub] t={:?} client A got KeyframeRequest", start.elapsed());
+                capture_handle.notify_keyframe_request();
+                true
+            }
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    async fn drain_media_frames_ignored(events_b: &mut tokio::sync::mpsc::UnboundedReceiver<ClientEvent>) {
+        // Best-effort background drain so `events_b`'s unbounded channel
+        // doesn't grow unbounded while B is unsubscribed and we're not
+        // otherwise reading it (mirrors `ui.rs` always draining its event
+        // channel every frame regardless of what's currently displayed).
+        while events_b.recv().await.is_some() {}
+    }
+
+    eprintln!("[e2e-resub] phase 1: client B subscribing (first time)");
+    client_b
+        .subscribe(owner_conn_id, VIDEO_STREAM_ID)
+        .await
+        .expect("client B: first subscribe() failed");
+
+    let mut decoder = StreamDecoder::new(VIDEO_STREAM_ID).expect("failed to build StreamDecoder");
+    let mut initial_frames: u64 = 0;
+    let mut first_decoded_at: Option<std::time::Duration> = None;
+
+    let phase1 = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            tokio::select! {
+                ok = forward_one_control_event(&mut events_a, &capture_handle, start) => {
+                    if !ok { break; }
+                }
+                event = events_b.recv() => {
+                    match event {
+                        Some(ClientEvent::MediaFrame(frame))
+                            if frame.conn_id == owner_conn_id && frame.stream_id == VIDEO_STREAM_ID =>
+                        {
+                            initial_frames += 1;
+                            decoder.feed(&frame);
+                        }
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+            }
+            if decoder.latest_frame().is_some() {
+                first_decoded_at.get_or_insert(start.elapsed());
+                if initial_frames >= 5 {
+                    break;
+                }
+            }
+        }
+    })
+    .await;
+    eprintln!(
+        "[e2e-resub] phase 1 done: {initial_frames} media frames, first decoded frame at {:?}",
+        first_decoded_at
+    );
+    assert!(phase1.is_ok(), "phase 1 (initial subscribe) timed out waiting for frames");
+    assert!(first_decoded_at.is_some(), "phase 1 never decoded a single frame");
+
+    eprintln!("[e2e-resub] phase 2: client B unsubscribing (subscriber count should drop to 0, encoder pauses)");
+    client_b
+        .unsubscribe(owner_conn_id, VIDEO_STREAM_ID)
+        .await
+        .expect("client B: unsubscribe() failed");
+
+    // Give the relay time to notify A and the pump loop time to act on it,
+    // then confirm the pause was actually observed (not just "should have
+    // happened") by forwarding the real SubscriberCount(0) event.
+    let saw_pause = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events_a.recv().await {
+                Some(ClientEvent::SubscriberCount { stream_id, count: 0 }) if stream_id == VIDEO_STREAM_ID => {
+                    eprintln!("[e2e-resub] t={:?} client A got SubscriberCount(0)", start.elapsed());
+                    capture_handle.notify_subscriber_count(0);
+                    return true;
+                }
+                Some(ClientEvent::SubscriberCount { stream_id, count }) if stream_id == VIDEO_STREAM_ID => {
+                    eprintln!("[e2e-resub] t={:?} client A got unexpected SubscriberCount({count}) while waiting for 0", start.elapsed());
+                    capture_handle.notify_subscriber_count(count);
+                }
+                Some(_) => {}
+                None => return false,
+            }
+        }
+    })
+    .await;
+    assert_eq!(saw_pause, Ok(true), "client A never observed SubscriberCount(0) after client B unsubscribed");
+
+    // Drop B's decoder — a real re-watch builds a brand new one (see
+    // `ui.rs`'s `toggle_watch`), and the fresh decoder's `seen_keyframe`
+    // gate is exactly what makes this repro sensitive to the resume bug (no
+    // keyframe ever arriving => stuck on "waiting for first decoded frame"
+    // forever, matching the reported symptom).
+    drop(decoder);
+
+    // Simulate a real gap between stopping and re-watching (the reported
+    // bug manifested well after resubscribe, not immediately). Matches the
+    // reported live-test timescale (paused ~35s+) rather than a token 2s
+    // gap, in case the bug is time-dependent (e.g. an encoder/driver state
+    // issue that only shows up after a longer idle period).
+    let pause_secs: u64 = std::env::var("E2E_PAUSE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+    eprintln!("[e2e-resub] pausing for {pause_secs}s before resubscribe");
+    tokio::time::sleep(Duration::from_secs(pause_secs)).await;
+
+    eprintln!("[e2e-resub] phase 3: client B re-subscribing (should resume encoder + get a fresh keyframe promptly)");
+    let resubscribe_at = start.elapsed();
+    client_b
+        .subscribe(owner_conn_id, VIDEO_STREAM_ID)
+        .await
+        .expect("client B: second subscribe() failed");
+
+    let mut decoder2 = StreamDecoder::new(VIDEO_STREAM_ID).expect("failed to build second StreamDecoder");
+    let mut resumed_frames: u64 = 0;
+    let mut first_resumed_decode_at: Option<std::time::Duration> = None;
+    let mut resumed_images: Vec<egui::ColorImage> = Vec::new();
+
+    let phase3 = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            tokio::select! {
+                ok = forward_one_control_event(&mut events_a, &capture_handle, start) => {
+                    if !ok { break; }
+                }
+                event = events_b.recv() => {
+                    match event {
+                        Some(ClientEvent::MediaFrame(frame))
+                            if frame.conn_id == owner_conn_id && frame.stream_id == VIDEO_STREAM_ID =>
+                        {
+                            resumed_frames += 1;
+                            decoder2.feed(&frame);
+                        }
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+            }
+            if let Some(img) = decoder2.latest_frame() {
+                first_resumed_decode_at.get_or_insert(start.elapsed());
+                resumed_images.push(img);
+                if resumed_images.len() >= 3 {
+                    break;
+                }
+            }
+        }
+    })
+    .await;
+
+    eprintln!(
+        "[e2e-resub] phase 3 done: {resumed_frames} media frames received after resubscribe (t={:?}), \
+         first decoded frame at {:?} (resubscribed at t={:?})",
+        start.elapsed(),
+        first_resumed_decode_at,
+        resubscribe_at
+    );
+
+    // Teardown before asserting, so a failing assertion still leaves things
+    // cleanly stopped.
+    if let Err(e) = capture_handle.stop().await {
+        tracing::warn!("[e2e-resub] capture_handle.stop() reported an error (non-fatal to the test): {e:#}");
+    }
+    let _ = client_a.leave().await;
+    let _ = client_b.leave().await;
+    let _ = tokio::time::timeout(Duration::from_millis(200), drain_media_frames_ignored(&mut events_b)).await;
+
+    assert!(
+        phase3.is_ok(),
+        "TIMED OUT waiting for frames to resume after resubscribe (got {resumed_frames} media frames, \
+         {} decoded) — this reproduces the reported hang",
+        resumed_images.len()
+    );
+    assert!(
+        resumed_frames > 0,
+        "client B never received a single media frame after resubscribing — encoder never resumed"
+    );
+    assert!(
+        !resumed_images.is_empty(),
+        "client B received media frames after resubscribing but never decoded one \
+         (consistent with the encoder never producing a fresh keyframe, so the new \
+         decoder's seen_keyframe gate never opens — 'Waiting for first decoded frame' forever)"
+    );
+
+    let resume_latency = first_resumed_decode_at.unwrap() - resubscribe_at;
+    eprintln!("[e2e-resub] resume latency (resubscribe -> first decoded frame): {resume_latency:?}");
+    assert!(
+        resume_latency < Duration::from_secs(5),
+        "resume took implausibly long ({resume_latency:?}) — matches the reported \
+         'never actually resumes' symptom"
+    );
+
+    for (i, img) in resumed_images.iter().enumerate() {
+        let variance = color_variance(img);
+        eprintln!("[e2e-resub] resumed frame {i} color variance: {variance:.1}");
+        assert!(
+            variance > 100.0,
+            "resumed decoded frame {i} looks flat/corrupt (luma variance {variance:.1}) — \
+             matches the reported flat-grey-frame symptom"
+        );
+    }
+
+    eprintln!("[e2e-resub] PASS: encoder resumed and frames flowed within {resume_latency:?} of resubscribe");
+}
+
+/// Same real server/client/pipeline setup as
+/// [`resubscribe_after_pause_resumes_encoder_and_frames_flow`], but drives
+/// *several* pause/resume cycles back to back (a real long-lived sharing
+/// session would see many subscribe/unsubscribe transitions, not just one) —
+/// checking whether a bug only surfaces on the second or later resume (e.g.
+/// state left over from the first cycle: a stale `paused` flag, a debounced
+/// keyframe request, an encoder-internal GOP/timestamp assumption that only
+/// breaks after having already been forced once).
+#[tokio::test]
+#[ignore = "spawns a real relay server child process and real GStreamer capture/decode \
+            pipelines; run explicitly with `cargo test end_to_end_test:: -- --ignored --nocapture`"]
+async fn repeated_pause_resume_cycles_keep_resuming() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    let port = pick_free_udp_port().expect("failed to pick a free UDP port for the test relay");
+    eprintln!("[e2e-cycles] starting relay server on 127.0.0.1:{port}");
+    let _server = spawn_relay_server(port).expect("failed to spawn relay server child process");
+
+    let server_addr = format!("127.0.0.1:{port}");
+    let room_id: RoomId = rand::random();
+    let room_key: [u8; 32] = rand::random();
+    let join_string = crate::net::format_join_string(&server_addr, &room_id, &room_key);
+
+    let (client_a, _snapshot_a, mut events_a) = connect_with_retry(&join_string, "sharer")
+        .await
+        .expect("client A failed to connect to the relay after retries");
+    let (client_b, _snapshot_b, mut events_b) = connect_with_retry(&join_string, "viewer")
+        .await
+        .expect("client B failed to connect to the relay after retries");
+
+    let source_fragment = format!(
+        "videotestsrc is-live=true pattern=smpte \
+         ! video/x-raw,width={WIDTH},height={HEIGHT},framerate=15/1"
+    );
+
+    let capture_handle = capture::start_sharing_from_test_source(&client_a, VIDEO_STREAM_ID, 2000, &source_fragment)
+        .await
+        .expect("start_sharing_from_test_source failed");
+
+    let owner_conn_id = client_a.conn_id();
+    let start = std::time::Instant::now();
+
+    let saw_stream_started = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match events_b.recv().await {
+                Some(ClientEvent::PresenceDelta(PresenceEvent::StreamStarted(info)))
+                    if info.owner == owner_conn_id && info.stream_id == VIDEO_STREAM_ID =>
+                {
+                    return true;
+                }
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+    })
+    .await;
+    assert_eq!(saw_stream_started, Ok(true), "client B never observed StreamStarted");
+
+    async fn forward_one_control_event(
+        events_a: &mut tokio::sync::mpsc::UnboundedReceiver<ClientEvent>,
+        capture_handle: &capture::CaptureHandle,
+        start: std::time::Instant,
+        tag: &str,
+    ) -> bool {
+        match events_a.recv().await {
+            Some(ClientEvent::SubscriberCount { stream_id, count }) if stream_id == VIDEO_STREAM_ID => {
+                eprintln!("[e2e-cycles][{tag}] t={:?} client A got SubscriberCount({count})", start.elapsed());
+                capture_handle.notify_subscriber_count(count);
+                true
+            }
+            Some(ClientEvent::KeyframeRequest { stream_id }) if stream_id == VIDEO_STREAM_ID => {
+                eprintln!("[e2e-cycles][{tag}] t={:?} client A got KeyframeRequest", start.elapsed());
+                capture_handle.notify_keyframe_request();
+                true
+            }
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    const CYCLES: u32 = 5;
+    for cycle in 1..=CYCLES {
+        let tag = format!("cycle{cycle}");
+        eprintln!("[e2e-cycles][{tag}] subscribing");
+        client_b
+            .subscribe(owner_conn_id, VIDEO_STREAM_ID)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] subscribe failed: {e:#}"));
+
+        let mut decoder = StreamDecoder::new(VIDEO_STREAM_ID).expect("failed to build StreamDecoder");
+        let mut media_frames: u64 = 0;
+        let mut decoded_at: Option<std::time::Duration> = None;
+        let resubscribed_at = start.elapsed();
+
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                tokio::select! {
+                    ok = forward_one_control_event(&mut events_a, &capture_handle, start, &tag) => {
+                        if !ok { break; }
+                    }
+                    event = events_b.recv() => {
+                        match event {
+                            Some(ClientEvent::MediaFrame(frame))
+                                if frame.conn_id == owner_conn_id && frame.stream_id == VIDEO_STREAM_ID =>
+                            {
+                                media_frames += 1;
+                                decoder.feed(&frame);
+                            }
+                            Some(_) => {}
+                            None => break,
+                        }
+                    }
+                }
+                if decoder.latest_frame().is_some() {
+                    decoded_at.get_or_insert(start.elapsed());
+                    if media_frames >= 3 {
+                        break;
+                    }
+                }
+            }
+        })
+        .await;
+
+        eprintln!(
+            "[e2e-cycles][{tag}] done: {media_frames} media frames, first decode at {decoded_at:?} \
+             (resubscribed at {resubscribed_at:?})"
+        );
+        assert!(result.is_ok(), "[{tag}] TIMED OUT waiting for frames after subscribe (got {media_frames})");
+        assert!(decoded_at.is_some(), "[{tag}] never decoded a frame after subscribe");
+
+        eprintln!("[e2e-cycles][{tag}] unsubscribing");
+        client_b
+            .unsubscribe(owner_conn_id, VIDEO_STREAM_ID)
+            .await
+            .unwrap_or_else(|e| panic!("[{tag}] unsubscribe failed: {e:#}"));
+
+        let saw_pause = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match events_a.recv().await {
+                    Some(ClientEvent::SubscriberCount { stream_id, count: 0 }) if stream_id == VIDEO_STREAM_ID => {
+                        capture_handle.notify_subscriber_count(0);
+                        return true;
+                    }
+                    Some(ClientEvent::SubscriberCount { stream_id, count }) if stream_id == VIDEO_STREAM_ID => {
+                        capture_handle.notify_subscriber_count(count);
+                    }
+                    Some(_) => {}
+                    None => return false,
+                }
+            }
+        })
+        .await;
+        assert_eq!(saw_pause, Ok(true), "[{tag}] never observed SubscriberCount(0) after unsubscribe");
+
+        drop(decoder);
+        tokio::time::sleep(Duration::from_millis(800)).await;
+    }
+
+    if let Err(e) = capture_handle.stop().await {
+        tracing::warn!("[e2e-cycles] capture_handle.stop() reported an error (non-fatal): {e:#}");
+    }
+    let _ = client_a.leave().await;
+    let _ = client_b.leave().await;
+
+    eprintln!("[e2e-cycles] PASS: all {CYCLES} pause/resume cycles resumed successfully");
+}
