@@ -293,6 +293,39 @@ impl Connected {
         });
     }
 
+    /// Abrupt teardown (relay/control connection lost, or the app quitting
+    /// while sharing): fire off `.stop()` for every currently `Active` share
+    /// so the portal session gets closed and the relay gets a stop-stream
+    /// notification, instead of just letting the handles drop synchronously
+    /// when `Connected`/`App` goes away right after this call.
+    ///
+    /// Mirrors `stop_share`'s spawn pattern exactly, but for every active
+    /// share at once and without waiting to see the result — the caller is
+    /// about to discard this `Connected` (or the whole app is exiting)
+    /// regardless of whether the stop finishes, so there is nothing
+    /// meaningful left to poll it into. `Starting`/`Stopping` shares are
+    /// left alone: a `Starting` share has no handle yet to stop, and a
+    /// `Stopping` one is already being torn down.
+    fn stop_all_shares_fire_and_forget(&mut self) {
+        for share in self.active_shares.values_mut() {
+            if !matches!(share.status, ShareStatus::Active(_)) {
+                continue;
+            }
+            let (tx, rx) = oneshot::channel();
+            let ShareStatus::Active(handle) = std::mem::replace(&mut share.status, ShareStatus::Stopping(rx)) else {
+                unreachable!("just matched Active above");
+            };
+            tokio::spawn(async move {
+                let result = match handle {
+                    ShareHandle::Video(h) => h.stop().await,
+                    ShareHandle::Audio(h) => h.stop().await,
+                }
+                .map_err(|e| format!("{e:#}"));
+                let _ = tx.send(result);
+            });
+        }
+    }
+
     /// Poll every in-flight share start/stop, if any. Call once per frame.
     fn poll_share_states(&mut self) {
         let mut to_remove = Vec::new();
@@ -681,6 +714,9 @@ impl App {
                 },
                 ClientEvent::ControlClosed(reason) => {
                     self.status = Status::Error(t!("errors.disconnected", reason = reason).to_string());
+                    if let Some(connected) = &mut self.connected {
+                        connected.stop_all_shares_fire_and_forget();
+                    }
                     self.connected = None;
                     return;
                 }
@@ -1096,6 +1132,26 @@ impl eframe::App for App {
         // has no input to react to yet.
         if matches!(self.status, Status::Connecting) || self.connected.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Called once on shutdown (window closed, app quit) — covers the same
+    /// "abrupt teardown while sharing" gap as `ClientEvent::ControlClosed`,
+    /// just triggered by the user closing the app instead of the connection
+    /// dying underneath them.
+    ///
+    /// `eframe::App::on_exit` is a synchronous callback with no way to block
+    /// on (or even poll) async work before eframe tears the window down, so
+    /// this can't `.await` `.stop()` to completion the way the voluntary
+    /// `stop_share` path does. Best effort: spawn `.stop()` for every active
+    /// share onto the ambient tokio runtime (mirroring `ControlClosed`'s
+    /// `stop_all_shares_fire_and_forget`) so graceful teardown (portal
+    /// session close, relay stop-stream notification) at least gets
+    /// *attempted*, rather than relying solely on the handles' `Drop` impls
+    /// once this process starts exiting.
+    fn on_exit(&mut self) {
+        if let Some(connected) = &mut self.connected {
+            connected.stop_all_shares_fire_and_forget();
         }
     }
 }

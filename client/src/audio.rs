@@ -359,8 +359,11 @@ fn build_pipeline(loopback_output_node_id: u32) -> Result<(gst::Pipeline, gst_ap
 // ---------------------------------------------------------------------
 
 /// A running per-application audio share started by [`start_audio_sharing`].
-/// Drop alone does *not* tear this down cleanly (GStreamer/process cleanup
-/// is async) — call [`AudioCaptureHandle::stop`].
+/// Prefer calling [`AudioCaptureHandle::stop`] for graceful teardown (it
+/// also drains the pump task and notifies the relay); if the handle is
+/// dropped without it, `Drop` still synchronously stops the pipeline and
+/// kills the `pw-loopback` process as a backstop, so no process/tap is
+/// leaked — it just skips the graceful drain/notify steps.
 pub struct AudioCaptureHandle {
     stream_id: u8,
     client: ScreenshareClient,
@@ -462,6 +465,27 @@ pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, sour
     })
 }
 
+impl Drop for AudioCaptureHandle {
+    /// Synchronous backstop for the case where [`AudioCaptureHandle::stop`]
+    /// was never called (a panic, an app crash, or a caller that just drops
+    /// the handle instead of awaiting graceful teardown — confirmed to
+    /// happen on the UI's abrupt-disconnect path). Without this, the
+    /// `pw-loopback` child process (whose own `Drop` impl, per
+    /// `std::process::Child`, does *not* kill the OS process) is orphaned
+    /// and keeps tapping audio indefinitely.
+    ///
+    /// This is a backstop, not a replacement for `stop()`'s graceful
+    /// teardown (which also drains the pump task and notifies the relay) —
+    /// when `stop()` *did* run, `self` is already fully torn down by the
+    /// time this runs, so setting an already-`Null` pipeline to `Null` again
+    /// and killing an already-exited child are both harmless no-ops.
+    fn drop(&mut self) {
+        let _ = self.pipeline.set_state(gst::State::Null);
+        let _ = self.loopback_child.kill();
+        let _ = self.loopback_child.wait(); // reap, avoid a zombie
+    }
+}
+
 impl AudioCaptureHandle {
     /// Tears the audio share down cleanly: stops the GStreamer pipeline,
     /// waits for the background send task to finish draining, kills the
@@ -476,7 +500,11 @@ impl AudioCaptureHandle {
             tracing::warn!("error stopping audio capture pipeline: {e}");
         }
 
-        if let Err(e) = self.pump_task.await {
+        // `&mut` rather than moving `self.pump_task` out: `AudioCaptureHandle`
+        // implements `Drop` (see below), which forbids moving individual
+        // fields out of `self` by value — `JoinHandle` is `Unpin`, so
+        // awaiting through `&mut` works identically.
+        if let Err(e) = (&mut self.pump_task).await {
             tracing::warn!("audio capture send task did not shut down cleanly: {e}");
         }
 

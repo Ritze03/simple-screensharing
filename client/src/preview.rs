@@ -132,8 +132,11 @@ fn downscale_and_encode_jpeg(frame: &RawFrame) -> Result<Vec<u8>> {
 // ---------------------------------------------------------------------
 
 /// A running preview-sender task started by [`spawn_preview_task`]. Call
-/// [`PreviewHandle::stop`] to shut it down; dropping it without calling
-/// `stop` leaves the background task running until the process exits.
+/// [`PreviewHandle::stop`] for a clean, awaited shutdown; simply dropping
+/// the handle is also fine — dropping `stop_tx` closes the channel, so the
+/// background task's `stop_rx` in `preview_loop`'s `select!` resolves
+/// immediately and the task exits promptly on its own (just without being
+/// awaited here).
 pub struct PreviewHandle {
     stop_tx: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
