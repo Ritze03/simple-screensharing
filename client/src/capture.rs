@@ -511,16 +511,51 @@ fn start_pipeline(
 // Public API
 // ---------------------------------------------------------------------
 
-/// A running screen-share capture started by [`start_sharing`]. Drop alone
-/// does *not* tear this down cleanly (GStreamer/portal cleanup is async) —
-/// call [`CaptureHandle::stop`].
+/// A running screen-share capture started by [`start_sharing`]. Prefer
+/// calling [`CaptureHandle::stop`] for graceful teardown (it also drains the
+/// pump/preview tasks, closes the portal session, and notifies the relay);
+/// if the handle is dropped without it, `Drop` still synchronously stops the
+/// GStreamer pipeline as a backstop, so no element thread is left running —
+/// it just skips the async portal-session-close step (see `Drop`'s doc
+/// comment), and it just skips the graceful drain/notify steps.
 pub struct CaptureHandle {
     stream_id: u8,
     client: ScreenshareClient,
     pipeline: gst::Pipeline,
     capture_source: CaptureSource,
     pump_task: tokio::task::JoinHandle<()>,
-    preview_handle: PreviewHandle,
+    // `Option` (rather than a bare `PreviewHandle`) solely so `stop` can
+    // `.take()` it out of `&mut self` to call `PreviewHandle::stop(self)`,
+    // which consumes by value — required now that `CaptureHandle: Drop`
+    // forbids moving fields out of `self` by value anywhere, not just in
+    // `drop` itself. Always `Some` until `stop` runs; letting a `Some` drop
+    // normally (bare-drop backstop path) is fine, per `PreviewHandle`'s own
+    // doc comment (dropping `stop_tx` promptly stops its background task).
+    preview_handle: Option<PreviewHandle>,
+}
+
+impl Drop for CaptureHandle {
+    /// Synchronous backstop for when [`CaptureHandle::stop`] was never
+    /// called (a panic, an app crash, or a caller that just drops the handle
+    /// instead of awaiting graceful teardown). Without this, the GStreamer
+    /// pipeline is left `Playing` — its element threads (`pipewiresrc`/
+    /// `d3d11screencapturesrc`, `x264enc`/`vah264enc`, …) keep running
+    /// indefinitely.
+    ///
+    /// This is a backstop, not a replacement for `stop()`'s graceful
+    /// teardown: closing the ashpd portal session is an async D-Bus call and
+    /// can't run in this synchronous `drop`, so on the Linux/portal path the
+    /// OS recording indicator can stay lit until the OS itself notices this
+    /// process's PipeWire fd close (or until `stop()` actually runs). This
+    /// only guarantees the GStreamer pipeline itself stops.
+    ///
+    /// When `stop()` *did* run first, `self` is already fully torn down by
+    /// the time this runs, so setting an already-`Null` pipeline to `Null`
+    /// again is a harmless no-op (same established pattern as
+    /// `AudioCaptureHandle`'s `Drop`).
+    fn drop(&mut self) {
+        let _ = self.pipeline.set_state(gst::State::Null);
+    }
 }
 
 /// Starts sharing this machine's screen on `stream_id`: acquires this
@@ -595,7 +630,7 @@ pub async fn start_sharing(client: &ScreenshareClient, stream_id: u8, bitrate_kb
         pipeline,
         capture_source,
         pump_task,
-        preview_handle,
+        preview_handle: Some(preview_handle),
     })
 }
 
@@ -671,7 +706,7 @@ impl CaptureHandle {
     /// — a network error here is logged, not returned, since the pipeline is
     /// already stopped either way), and waits for the background send task
     /// to finish draining.
-    pub async fn stop(self) -> Result<()> {
+    pub async fn stop(mut self) -> Result<()> {
         // Stopping the pipeline (Null) unblocks the appsink's stream (EOS/
         // None) and the pump task exits on its own; no separate cancel
         // signal needed.
@@ -679,19 +714,35 @@ impl CaptureHandle {
             tracing::warn!("error stopping capture pipeline: {e}");
         }
 
-        if let Err(e) = self.pump_task.await {
+        // `&mut` rather than moving `self.pump_task` out: `CaptureHandle`
+        // implements `Drop` (see above), which forbids moving individual
+        // fields out of `self` by value — `JoinHandle` is `Unpin`, so
+        // awaiting through `&mut` works identically. Same fix already
+        // applied to `AudioCaptureHandle::stop`.
+        if let Err(e) = (&mut self.pump_task).await {
             tracing::warn!("capture send task did not shut down cleanly: {e}");
         }
 
-        self.preview_handle.stop().await;
+        // `.take()` rather than moving `self.preview_handle` out directly,
+        // for the same reason as `pump_task` above: `PreviewHandle::stop`
+        // consumes `self` by value, so it can't be called through a
+        // reference. `preview_handle` is always `Some` here (only `stop`
+        // itself ever takes it, and `stop` consumes `self`), so the `Some`
+        // arm is the only one that actually runs.
+        if let Some(preview_handle) = self.preview_handle.take() {
+            preview_handle.stop().await;
+        }
 
         #[cfg(unix)]
         {
+            // Borrow rather than move `self.capture_source` — also required
+            // now that `CaptureHandle: Drop`, though `Session::close` takes
+            // `&self` anyway, so a borrow is all this needs regardless.
             // `CaptureSource` has exactly one variant on this platform (see
             // its `#[cfg(unix)]`/`#[cfg(windows)]` split), so this
             // destructure is irrefutable — a plain `let` avoids the
             // "useless if let" lint an `if let` would trigger here.
-            let CaptureSource::Portal(portal) = self.capture_source;
+            let CaptureSource::Portal(portal) = &self.capture_source;
             if let Err(e) = portal.session.close().await {
                 tracing::warn!("error closing screencast portal session: {e}");
             }
@@ -1005,6 +1056,56 @@ mod tests {
 
         let backend = detect_encoder_backend();
         eprintln!("detect_encoder_backend() -> {backend:?}");
+    }
+
+    /// Verifies the exact backstop `impl Drop for CaptureHandle` performs —
+    /// `set_state(Null)` on a still-`Playing` pipeline — actually stops it,
+    /// for the case a `CaptureHandle` is dropped bare (crash/panic/a
+    /// disconnect path that never awaits `.stop()`). Constructing a full
+    /// `CaptureHandle` here isn't practical (it needs a live
+    /// `ScreenshareClient`/portal session), so this instead wraps a
+    /// `videotestsrc`-based pipeline (per this module's other tests) in a
+    /// minimal struct whose `Drop` impl is structurally identical to
+    /// `CaptureHandle`'s, and checks — via a cloned `gst::Pipeline` handle
+    /// (cheap: it's a ref-counted GObject wrapper, so cloning doesn't clone
+    /// the underlying element graph) kept alive past the wrapper's scope —
+    /// that the pipeline is `Null` after the wrapper drops without any
+    /// explicit teardown call.
+    #[test]
+    fn drop_backstop_stops_a_playing_pipeline() {
+        if gst::init().is_err() {
+            eprintln!("skipping: gstreamer not available in this environment");
+            return;
+        }
+
+        struct DropOnlyPipeline(gst::Pipeline);
+        impl Drop for DropOnlyPipeline {
+            fn drop(&mut self) {
+                let _ = self.0.set_state(gst::State::Null);
+            }
+        }
+
+        let element = gst::parse::launch("videotestsrc is-live=true ! fakesink").expect("pipeline should parse and link");
+        let pipeline = element.downcast::<gst::Pipeline>().expect("top-level element should be a Pipeline");
+
+        pipeline.set_state(gst::State::Playing).expect("pipeline should start reaching PLAYING");
+        let (state_result, _current, _pending) = pipeline.state(gst::ClockTime::from_seconds(5));
+        state_result.expect("pipeline should settle into PLAYING before the drop-backstop check");
+
+        let pipeline_for_check = pipeline.clone();
+        {
+            let _wrapper = DropOnlyPipeline(pipeline);
+            // `_wrapper` drops here with no `.stop()`-equivalent call ever
+            // made — mirrors a bare-dropped `CaptureHandle`.
+        }
+
+        let (state_result, current, _pending) = pipeline_for_check.state(gst::ClockTime::from_seconds(5));
+        state_result.expect("pipeline should have settled after Drop's set_state(Null) backstop");
+        assert_eq!(
+            current,
+            gst::State::Null,
+            "bare-dropping the handle should leave the pipeline Null, not still Playing"
+        );
     }
 
     /// Exercises the real xdg-desktop-portal `ScreenCast` flow end to end,
