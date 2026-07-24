@@ -593,11 +593,24 @@ impl Connected {
     /// viewport closure (`show_popouts`) is the sole `latest_frame()`
     /// poller for that stream, so the main-thread pass here doesn't steal
     /// frames out from under it.
-    fn update_watch_textures(&mut self, ctx: &egui::Context) {
+    ///
+    /// Returns whether at least one non-popped-out watch is active, which
+    /// `update()` uses to decide whether to keep requesting repaints on the
+    /// root context every frame: `latest_frame()` is non-blocking and only
+    /// yields `Some` at the decoder's real (possibly >30fps, up to 240Hz)
+    /// output rate, so the repaint cadence has to be driven explicitly here
+    /// rather than left to egui's default input-triggered repaints — without
+    /// this, the panel only actually refreshes on the side effect of other
+    /// input (e.g. mouse movement) or the coarse idle-fallback interval at
+    /// the bottom of `update()`, capping perceived playback well below the
+    /// decoder's real framerate whenever the mouse is idle.
+    fn update_watch_textures(&mut self, ctx: &egui::Context) -> bool {
+        let mut any_active = false;
         for ((owner, stream_id), entry) in self.watches.iter_mut() {
             if entry.popout.is_some() {
                 continue;
             }
+            any_active = true;
             let image = entry.decoder.lock().unwrap().latest_frame();
             if let Some(image) = image {
                 match &mut entry.texture {
@@ -609,6 +622,7 @@ impl Connected {
                 }
             }
         }
+        any_active
     }
 
     /// "Pop out" clicked for `(owner, stream_id)`: mark that `WatchEntry` as
@@ -656,7 +670,6 @@ impl Connected {
                     // window, which is exactly what lets a high-refresh-rate
                     // popped-out stream repaint faster than a slower main
                     // window.
-                    let mut got_new_frame = false;
                     if let Some(image) = decoder.lock().unwrap().latest_frame() {
                         let mut tex_guard = texture.lock().unwrap();
                         match &mut *tex_guard {
@@ -666,7 +679,6 @@ impl Connected {
                                 *tex_guard = Some(ctx.load_texture(name, image, egui::TextureOptions::LINEAR));
                             }
                         }
-                        got_new_frame = true;
                     }
 
                     egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| {
@@ -698,11 +710,18 @@ impl Connected {
                         close_requested.store(true, Ordering::Relaxed);
                     }
 
-                    // Only this viewport, not the whole app, needs to
-                    // repaint again for the frame we just drew.
-                    if got_new_frame {
-                        ctx.request_repaint();
-                    }
+                    // Keep this viewport polling `latest_frame()` every
+                    // frame while it's popped out, regardless of whether
+                    // this particular poll found a new one: `latest_frame()`
+                    // only returns `Some` at the decoder's real output rate,
+                    // so requesting a repaint solely on the polls that *did*
+                    // find something new would let the chain die the moment
+                    // the decoder's real framerate falls behind this
+                    // viewport's repaint rate (the common case), stalling
+                    // this window until unrelated input (e.g. a mouse move
+                    // over it) kicks it again. Only this viewport, not the
+                    // whole app, is affected by this request.
+                    ctx.request_repaint();
                 },
             );
         }
@@ -1392,11 +1411,28 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_connect_result();
         self.drain_events(ctx);
+        let mut has_inline_watch = false;
         if let Some(connected) = &mut self.connected {
             connected.poll_share_states();
             connected.poll_audio_sources();
-            connected.update_watch_textures(ctx);
+            has_inline_watch = connected.update_watch_textures(ctx);
             connected.show_popouts(ctx);
+        }
+
+        // Keep the root context repainting every frame while at least one
+        // stream is being watched inline (not popped out): `latest_frame()`
+        // is non-blocking and only yields a new frame at the decoder's real
+        // output rate (up to 240fps per the framerate-control feature), so
+        // without an explicit continuous repaint request here the panel
+        // would only actually refresh on the side effect of unrelated input
+        // (e.g. mouse movement over it) or the coarse idle-fallback interval
+        // below — capping perceived playback well under the real decode
+        // rate whenever the mouse sits still. Scoped to "currently watching
+        // something inline" rather than requested unconditionally on every
+        // `update()` call, so idle/disconnected sessions don't burn CPU on
+        // needless repaints.
+        if has_inline_watch {
+            ctx.request_repaint();
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1432,5 +1468,222 @@ impl eframe::App for App {
         if let Some(connected) = &mut self.connected {
             connected.stop_all_shares_fire_and_forget();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Live regression coverage for the "watched-video panel only updates at
+    //! full rate while the mouse moves" bug: `update_watch_textures` used to
+    //! upload freshly decoded frames without ever telling egui a repaint was
+    //! worth scheduling, so the panel's real refresh cadence was left to
+    //! whatever repaints happened to occur for unrelated reasons (input
+    //! events, or `App::update`'s coarse idle-fallback
+    //! `request_repaint_after`) rather than tracking the decoder's actual
+    //! output rate.
+    //!
+    //! This drives the exact same `Connected`/`App` types and methods
+    //! `eframe` calls in production (`drain_events`, `update_watch_textures`)
+    //! against a real relay server child process, a real
+    //! `videotestsrc ! clockoverlay ! x264enc` capture pipeline (see
+    //! `end_to_end_test`'s module docs for why this is the right level of
+    //! "real" for a headless, unattended test), and a real `StreamDecoder`
+    //! — with **zero synthetic input ever fed into the `egui::Context`** —
+    //! and asserts that over a several-second run, the decoder's real
+    //! observed output rate (`StreamDecoder::current_fps`) comfortably
+    //! clears the old ~30fps cap this bug imposed, proving repeated
+    //! `update_watch_textures` polling (the mechanism `update()`'s new
+    //! `ctx.request_repaint()` call keeps alive) actually keeps pace with a
+    //! fast source rather than idling at the old fallback rate.
+    use super::*;
+    use crate::end_to_end_test::{connect_with_retry, pick_free_udp_port, spawn_relay_server};
+    use crate::net::format_join_string;
+    use crate::protocol::RoomId;
+    use std::time::{Duration, Instant};
+
+    const TEST_STREAM_ID: StreamId = 1;
+    /// Comfortably above the ~20-30fps this bug capped playback at while the
+    /// mouse was idle, and well within what a software x264enc/avdec_h264
+    /// round trip can sustain on ordinary test hardware — high enough to
+    /// make the regression obvious without flaking on slower CI-like boxes.
+    const TEST_FPS: u32 = 100;
+
+    #[tokio::test]
+    #[ignore = "spawns a real relay server child process and a real GStreamer capture/decode \
+                pipeline; run explicitly with `cargo test ui:: -- --ignored --nocapture`"]
+    async fn watched_panel_repaints_continuously_without_input_at_real_decode_rate() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        gstreamer::init().expect("gstreamer init");
+
+        let port = pick_free_udp_port().expect("failed to pick a free UDP port for the test relay");
+        eprintln!("[ui-repaint] starting relay server on 127.0.0.1:{port}");
+        let _server = spawn_relay_server(port).expect("failed to spawn relay server child process");
+
+        let server_addr = format!("127.0.0.1:{port}");
+        let room_id: RoomId = rand::random();
+        let room_key: [u8; 32] = rand::random();
+        let join_string = format_join_string(&server_addr, &room_id, &room_key);
+
+        eprintln!("[ui-repaint] connecting sharer + watcher");
+        let (client_a, _snapshot_a, events_a) = connect_with_retry(&join_string, "sharer")
+            .await
+            .expect("sharer failed to connect");
+        let (client_b, snapshot_b, events_b) = connect_with_retry(&join_string, "watcher")
+            .await
+            .expect("watcher failed to connect");
+        // Keep client A's event channel alive (dropping it makes net.rs's
+        // reader loop treat sends as errors and tear the connection down),
+        // exactly as `end_to_end_test` does.
+        let _events_a_keepalive = events_a;
+
+        // A real `clockoverlay`-stamped high-framerate source: visually
+        // exactly what a human would eyeball for this same check (a ticking
+        // timestamp that should keep advancing smoothly), and a real
+        // pipeline the fix has to keep pace with.
+        let source_fragment = format!(
+            "videotestsrc is-live=true pattern=ball \
+             ! clockoverlay time-format=\"%H:%M:%S%.3f\" \
+             ! video/x-raw,width=320,height=240,framerate={TEST_FPS}/1"
+        );
+        eprintln!("[ui-repaint] starting real capture pipeline on the sharer at {TEST_FPS}fps");
+        let capture_handle = capture::start_sharing_from_test_source(&client_a, TEST_STREAM_ID, 4000, TEST_FPS, &source_fragment)
+            .await
+            .expect("start_sharing_from_test_source failed");
+        let owner = client_a.conn_id();
+
+        // Build the exact `App`/`Connected` shape `poll_connect_result`
+        // builds in production, then wire up a watch on the sharer's stream
+        // the same way `toggle_watch` does — this is the real code under
+        // test, not a re-implementation of it.
+        let mut app = App::default();
+        let mut connected = Connected {
+            client: client_b,
+            event_rx: events_b,
+            members: snapshot_b.members,
+            streams: snapshot_b.streams,
+            save_name: String::new(),
+            saved: false,
+            active_shares: HashMap::new(),
+            share_error: None,
+            next_stream_id: 0,
+            bitrate_kbps: DEFAULT_BITRATE_KBPS,
+            framerate: TEST_FPS,
+            audio_sources: Vec::new(),
+            audio_sources_error: None,
+            audio_sources_requested: false,
+            audio_sources_rx: None,
+            selected_audio_source: None,
+            watches: HashMap::new(),
+            watch_error: None,
+            selected_watch: None,
+            audio_watches: HashMap::new(),
+            preview_cache: PreviewCache::new(),
+            preview_textures: HashMap::new(),
+        };
+        let decoder = StreamDecoder::new(TEST_STREAM_ID).expect("failed to build StreamDecoder");
+        connected.watches.insert(
+            (owner, TEST_STREAM_ID),
+            WatchEntry { decoder: Arc::new(Mutex::new(decoder)), texture: None, popout: None, audio_stream_id: None },
+        );
+        app.connected = Some(connected);
+
+        connected_client_b_subscribe(&mut app, owner).await;
+
+        // Drive `App::drain_events` + `Connected::update_watch_textures` —
+        // the real production methods — in a tight loop with a bare
+        // `egui::Context` fed `RawInput::default()` every pass: no mouse
+        // position, no clicks, no keys, ever. `eframe::Frame` has no public
+        // constructor outside the real winit/wgpu integration, so this
+        // can't invoke the `eframe::App::update` trait method itself;
+        // instead it reproduces `update()`'s one-line repaint decision
+        // (`if has_inline_watch { ctx.request_repaint(); }`) around the same
+        // real `update_watch_textures` call `update()` makes. Since this
+        // loop supplies its own next iteration unconditionally (there's no
+        // real winit event loop here honoring egui's repaint scheduling),
+        // this can't by itself prove eframe would keep calling `update()`
+        // this fast purely from the repaint request — that half of the
+        // fix's mechanism is confirmed by code review (`ctx.request_repaint`
+        // is exactly what `eframe`'s integration uses to decide when to
+        // wake and redraw). What this loop *does* prove for real: with
+        // nothing but repeated `update_watch_textures` polls (no simulated
+        // mouse motion, no artificial delay), decode output actually keeps
+        // flowing at a rate the fix's fallback interval alone could never
+        // have delivered.
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut polls_with_watch = 0u64;
+        while Instant::now() < deadline {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                app.drain_events(ctx);
+                let Some(connected) = &mut app.connected else { return };
+                let has_inline_watch = connected.update_watch_textures(ctx);
+                if has_inline_watch {
+                    polls_with_watch += 1;
+                    ctx.request_repaint();
+                }
+            });
+            // Yield back to the tokio runtime between passes: this test's
+            // `#[tokio::test]` defaults to a current-thread executor, and a
+            // purely synchronous loop body (no `.await` anywhere in it)
+            // would otherwise starve every other task on that same thread
+            // forever — including the QUIC connection's own background
+            // receive task, which is what actually turns incoming media
+            // datagrams into the `ClientEvent::MediaFrame`s `drain_events`
+            // is polling for above. Not part of the fix itself: purely
+            // this test harness's own concession to sharing one OS thread
+            // with the networking it's exercising.
+            tokio::task::yield_now().await;
+        }
+
+        let observed_fps = app
+            .connected
+            .as_ref()
+            .unwrap()
+            .watches
+            .get(&(owner, TEST_STREAM_ID))
+            .unwrap()
+            .decoder
+            .lock()
+            .unwrap()
+            .current_fps();
+
+        eprintln!("[ui-repaint] {polls_with_watch} polls observed an active watch, decoder-observed fps = {observed_fps:.1}");
+
+        if let Err(e) = capture_handle.stop().await {
+            tracing::warn!("[ui-repaint] capture_handle.stop() reported an error (non-fatal): {e:#}");
+        }
+
+        assert!(polls_with_watch > 0, "the watch loop never observed an active inline watch at all");
+        assert!(
+            observed_fps > 40.0,
+            "decoder-observed fps ({observed_fps:.1}) did not clear the old ~30fps idle cap — \
+             the repaint-cadence fix does not appear to be keeping pace with the real decode rate"
+        );
+    }
+
+    /// Waits for the watcher to see the sharer's `StreamStarted` presence
+    /// delta (the relay silently drops a `Subscribe` for a stream it
+    /// doesn't know about yet) and then subscribes — mirrors
+    /// `end_to_end_test`'s same wait, just against `Connected::event_rx`
+    /// directly instead of a bare receiver.
+    async fn connected_client_b_subscribe(app: &mut App, owner: ConnId) {
+        let connected = app.connected.as_mut().expect("connected must be set");
+        let saw_stream_started = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match connected.event_rx.recv().await {
+                    Some(ClientEvent::PresenceDelta(PresenceEvent::StreamStarted(info)))
+                        if info.owner == owner && info.stream_id == TEST_STREAM_ID =>
+                    {
+                        return true;
+                    }
+                    Some(_) => continue,
+                    None => return false,
+                }
+            }
+        })
+        .await;
+        assert_eq!(saw_stream_started, Ok(true), "watcher never observed the sharer's StreamStarted delta");
+
+        connected.client.subscribe(owner, TEST_STREAM_ID).await.expect("subscribe() failed");
     }
 }

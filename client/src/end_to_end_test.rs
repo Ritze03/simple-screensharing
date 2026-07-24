@@ -102,7 +102,7 @@ use crate::protocol::{PresenceEvent, RoomId};
 /// script -qc ...` wrapper around it — see module docs). Killed on drop —
 /// success, assertion failure, or panic — so a failing test run never
 /// leaves an orphaned server listening on the test port.
-struct ServerGuard {
+pub(crate) struct ServerGuard {
     child: Child,
     port: u16,
 }
@@ -129,7 +129,7 @@ impl Drop for ServerGuard {
 /// this is the same pragmatic "ask the OS for a free port, then reuse the
 /// number" pattern used to pick ephemeral ports for external processes in
 /// general.
-fn pick_free_udp_port() -> Result<u16> {
+pub(crate) fn pick_free_udp_port() -> Result<u16> {
     let socket = UdpSocket::bind("127.0.0.1:0").context("failed to bind ephemeral probe socket")?;
     Ok(socket.local_addr()?.port())
 }
@@ -158,7 +158,7 @@ fn server_binary_path() -> Result<PathBuf> {
 /// Spawns the real relay server binary as a child process listening on
 /// `port`. See this module's doc comment ("Why the server is launched via
 /// `setsid script -qc ...`") for why this isn't a plain `Command::spawn`.
-fn spawn_relay_server(port: u16) -> Result<ServerGuard> {
+pub(crate) fn spawn_relay_server(port: u16) -> Result<ServerGuard> {
     let binary = server_binary_path()?;
     // The server writes its `logs/` directory relative to its current
     // working directory (see its `main.rs`'s `LOG_DIR`). Without an
@@ -190,7 +190,7 @@ fn spawn_relay_server(port: u16) -> Result<ServerGuard> {
 /// freshly spawned server process time to finish self-signed cert
 /// generation and bind its QUIC endpoint before the first real connection
 /// attempt lands.
-async fn connect_with_retry(
+pub(crate) async fn connect_with_retry(
     join_string: &str,
     display_name: &str,
 ) -> Result<(
