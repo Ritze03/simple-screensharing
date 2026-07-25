@@ -7,7 +7,8 @@
 //!
 //! ```text
 //! <platform source> ! videoconvert ! tee name=t
-//!   t. ! queue ! valve name=encoder_valve drop=false drop-mode=forward-sticky-events ! video/x-raw,format=I420
+//!   t. ! queue ! valve name=encoder_valve drop=false drop-mode=forward-sticky-events
+//!      ! videorate drop-only=false max-duplication-time=0 ! video/x-raw,format=I420,framerate=<fps>/1
 //!      ! x264enc tune=zerolatency bitrate=<kbps> key-int-max=<gop> speed-preset=ultrafast
 //!      ! video/x-h264,stream-format=byte-stream,alignment=au
 //!      ! appsink name=sink
@@ -23,12 +24,19 @@
 //! `Playing` state. See [`CaptureControlEvent`]/[`force_keyframe`].
 //!
 //! `<platform source>` is [`CaptureSource::launch_fragment`]:
-//! `pipewiresrc fd=<fd> path=<node_id> do-timestamp=true` on Linux/Unix
-//! (behind `#[cfg(unix)]`, fed by the portal flow below), or
+//! `pipewiresrc fd=<fd> path=<node_id> do-timestamp=true keepalive-time=<ms>`
+//! on Linux/Unix (behind `#[cfg(unix)]`, fed by the portal flow below), or
 //! `d3d11screencapturesrc monitor-index=0 do-timestamp=true` on Windows
 //! (behind `#[cfg(windows)]`, no portal/consent flow needed — see
 //! [`acquire_capture_source`]). Everything downstream of that first element
-//! is identical on both platforms.
+//! is identical on both platforms. `keepalive-time` (Linux only — see
+//! [`CaptureSource::launch_fragment`]'s doc comment) is what keeps frames
+//! flowing at a constant, selected rate even while the desktop is
+//! completely static: a portal `ScreenCast` PipeWire stream otherwise only
+//! pushes a buffer when the compositor reports screen damage, which — left
+//! unfixed — starves both the encoder branch's `videorate` cap (nothing to
+//! duplicate from) and the encoder's rate control (no frames to converge
+//! quality back down on after a motion burst).
 //!
 //! The `tee` feeds a second, low-rate branch whose RGB8 samples back
 //! [`preview::spawn_preview_task`] (see [`start_sharing`]) — the
@@ -353,12 +361,60 @@ impl CaptureSource {
     /// The `gst-launch`-syntax fragment for this platform's capture source
     /// element (see this module's doc comment) — the only piece of
     /// [`build_pipeline`]'s description that differs by platform.
-    fn launch_fragment(&self) -> String {
+    ///
+    /// `framerate` is the user-selected target rate ([`build_pipeline`]'s own
+    /// `framerate` parameter) — needed here (not just by the `videorate`
+    /// stage further downstream) because of `keepalive-time` below: this is
+    /// the only place in the pipeline that can plug the *upstream* half of
+    /// the "static screen ⇒ frames stop entirely" bug (see
+    /// [`build_pipeline`]'s doc comment for the downstream half).
+    fn launch_fragment(&self, framerate: u32) -> String {
         match self {
             #[cfg(unix)]
             CaptureSource::Portal(portal) => {
+                // `keepalive-time=<ms>` is load-bearing, not cosmetic: a
+                // portal `ScreenCast` PipeWire stream is damage-driven by the
+                // compositor (Mutter/KWin/wlroots backends) — it only pushes
+                // a new buffer when something visually changed on screen, as
+                // a bandwidth/CPU-saving optimization at the compositor
+                // level. When the desktop is static, `pipewiresrc` pushes
+                // *nothing at all*, and the `videorate` cap further
+                // downstream (see [`build_pipeline`]) cannot invent frames
+                // out of nothing — it only fills gaps *between* buffers it
+                // actually receives, by duplicating on receipt of the next
+                // one. With no next buffer ever arriving, capture output
+                // (and therefore the stream sent to the viewer) simply stops
+                // until the screen changes again, at which point everything
+                // that piled up since the last real frame gets flushed
+                // through in a burst — this is the reported "sender fps
+                // looks constant but the viewer's fluctuates, and right
+                // after a change the image is frozen and artifacted" bug:
+                // the encoder's rate control was still converging from the
+                // last burst of motion when frame production stopped dead,
+                // so the blockiest frame from that burst is what stays on
+                // screen indefinitely.
+                //
+                // `pipewiresrc`'s `keepalive-time` (ms, 0 = disabled per
+                // `gst-inspect-1.0 pipewiresrc`) makes the element itself
+                // periodically resend its last buffer even when the
+                // compositor delivers nothing new, so there is always a
+                // fresh buffer for `videorate` to work with at (at least) the
+                // selected framerate — turning "zero frames during an idle
+                // gap of arbitrary length" into "the last frame duplicated on
+                // a steady clock", which is exactly the "fully static
+                // framerate, always the selected one" behavor asked for.
+                // Set from the *selected* `framerate` (floor of the frame
+                // interval in ms, so this fires at least as often as the
+                // target rate — `videorate`'s own `framerate={framerate}/1`
+                // caps below normalize the exact rate regardless) rather
+                // than a fixed constant, so raising/lowering the selected
+                // framerate keeps this in lockstep. Never 0 for any
+                // in-range `framerate` (`MIN_FRAMERATE..=MAX_FRAMERATE` is
+                // `1..=240`, and `1000 / 240 == 4`), so this can never
+                // accidentally disable the keepalive.
+                let keepalive_ms = (1000 / framerate.clamp(MIN_FRAMERATE, MAX_FRAMERATE)).max(1);
                 format!(
-                    "pipewiresrc fd={} path={} do-timestamp=true",
+                    "pipewiresrc fd={} path={} do-timestamp=true keepalive-time={keepalive_ms}",
                     portal._pipewire_fd.as_raw_fd(),
                     portal.node_id
                 )
@@ -375,10 +431,26 @@ impl CaptureSource {
                 // elements, not hand-rolled platform FFI" principle
                 // consistent with how VAAPI hardware encode was already
                 // handled via `vah264enc` on Linux.
+                //
+                // No `keepalive-time`-equivalent property was applied here:
+                // unlike `pipewiresrc` (see the Linux arm above),
+                // `d3d11screencapturesrc` has no such property to
+                // `gst-inspect-1.0` on this (Linux) dev machine, since the
+                // plugin isn't installed here — verifying/fixing the same
+                // idle-gap behavior on Windows, if DXGI Desktop Duplication's
+                // `AcquireNextFrame` exhibits it too, needs a Windows
+                // environment and is out of this pass's scope. The
+                // downstream `videorate` fix (see [`build_pipeline`]) still
+                // applies here regardless, so Windows is no worse off than
+                // before.
+                let _ = framerate;
                 "d3d11screencapturesrc monitor-index=0 do-timestamp=true".to_string()
             }
             #[cfg(test)]
-            CaptureSource::TestSource(fragment) => fragment.clone(),
+            CaptureSource::TestSource(fragment) => {
+                let _ = framerate;
+                fragment.clone()
+            }
         }
     }
 }
@@ -593,13 +665,34 @@ fn build_pipeline(
     // which framerate the user picks), which was previously only true by
     // accident whenever the source happened to deliver exactly the
     // hardcoded 30fps.
+    //
+    // `drop-only=false max-duplication-time=0` on that same `videorate` are
+    // spelled out explicitly (rather than left at their already-matching
+    // defaults — see `gst-inspect-1.0 videorate`) because they're the other
+    // load-bearing half of "fully static framerate, always the selected
+    // one": `drop-only=false` is what lets `videorate` duplicate the last
+    // frame to *fill up to* `framerate`, not just drop excess frames down to
+    // it; `max-duplication-time=0` disables the cap on how large a gap it
+    // will still fill with duplicates (a non-zero value would make it give
+    // up filling — and just pass frames through unfilled — once the gap
+    // since the last real buffer exceeds that duration, reintroducing the
+    // exact fluctuating-rate/stuck-frame bug this exists to fix). Both
+    // properties only get a real workout because `keepalive-time` on the
+    // Linux source fragment (see [`CaptureSource::launch_fragment`]) ensures
+    // there's always a fresh buffer for `videorate` to duplicate from, even
+    // when the desktop is fully static and the compositor pushes nothing —
+    // without that upstream fix, `videorate` still can't invent frames out
+    // of a total silence with no next buffer to trigger on. `PacingState` in
+    // `decode.rs` (viewer-side display pacing) then reproduces this constant
+    // cadence faithfully — it was already correct; the irregular cadence it
+    // was faithfully displaying originated entirely here.
     let description = format!(
         "{source_fragment} \
          ! videoconvert \
          ! tee name=t \
          t. ! queue leaky=downstream max-size-buffers={ENCODER_QUEUE_MAX_BUFFERS} \
             ! valve name={ENCODER_VALVE_NAME} drop=false drop-mode=forward-sticky-events \
-            ! videorate \
+            ! videorate drop-only=false max-duplication-time=0 \
             ! video/x-raw,format={raw_format},framerate={framerate}/1 \
             ! {encoder} \
             ! video/x-h264,stream-format=byte-stream,alignment=au \
@@ -815,7 +908,7 @@ async fn start_sharing_with_source(
     framerate: u32,
     capture_source: CaptureSource,
 ) -> Result<CaptureHandle> {
-    let source_fragment = capture_source.launch_fragment();
+    let source_fragment = capture_source.launch_fragment(framerate);
 
     // Prefer hardware (VAAPI) encode when it's actually usable on this
     // machine, per detect_encoder_backend's probe; fall back to software.
