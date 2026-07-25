@@ -72,8 +72,8 @@
 //! # Running this test
 //!
 //! Requires: the server repo built at
-//! `~/Documents/Programming/simple-screensharing-server` (release or debug
-//! profile), a working GStreamer install (same requirement every other
+//! `~/GitHubProjects/simple-screensharing/master/simple-screensharing-server`
+//! (release or debug profile), a working GStreamer install (same requirement every other
 //! `capture.rs`/`decode.rs` test already has), and the `script`/`setsid`
 //! utilities (`util-linux`; present on essentially every Linux desktop).
 //! Not runnable in a typical unattended CI container without those, and
@@ -140,7 +140,7 @@ pub(crate) fn pick_free_udp_port() -> Result<u16> {
 /// falls back to debug.
 fn server_binary_path() -> Result<PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("could not determine home directory"))?;
-    let repo = home.join("Documents/Programming/simple-screensharing-server");
+    let repo = home.join("GitHubProjects/simple-screensharing/master/simple-screensharing-server");
     let release = repo.join("target/release/simple-screensharing-server");
     let debug = repo.join("target/debug/simple-screensharing-server");
     if release.is_file() {

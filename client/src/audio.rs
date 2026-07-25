@@ -271,14 +271,50 @@ fn spawn_loopback(loopback_name: &str) -> Result<Child> {
         .context("failed to spawn pw-loopback (is PipeWire's pw-loopback tool installed?)")
 }
 
-/// Polls `pw-dump` until `loopback_name`'s two stream nodes show up (they
-/// take a moment to register after the process starts) or `timeout` elapses.
-async fn wait_for_loopback_nodes(loopback_name: &str, timeout: Duration) -> Result<LoopbackNodes> {
+/// The readiness predicate the poll loop in [`wait_for_loopback_ready`]
+/// checks against every `pw-dump` snapshot: `loopback_name`'s two stream
+/// nodes must exist AND its input node's input ports must already be
+/// enumerated. Split out into its own function so it's unit-testable
+/// against fixture JSON without a live PipeWire session (see the
+/// `#[cfg(test)]` module below) — the live-server test at the bottom of
+/// this module exercises the real polling/timing behavior end to end.
+///
+/// Why the input node's ports specifically: those are exactly the ports
+/// [`link_source_into_loopback`] needs to `pw-link` into, and PipeWire
+/// announces a node global and its port globals as separate registry
+/// events — a freshly spawned `pw-loopback`'s ports can lag its node by a
+/// beat (format-negotiation round trip). Checking only the node (as this
+/// used to) let `start_audio_sharing` race ahead into linking before the
+/// ports existed, intermittently failing right after a freshly-spawned
+/// loopback.
+fn loopback_readiness(objects: &[PwObject], loopback_name: &str) -> Option<LoopbackNodes> {
+    let nodes = find_loopback_nodes(objects, loopback_name)?;
+    let input_ports = node_port_ids(objects, nodes.input_node_id as u64, "input");
+    if input_ports.is_empty() {
+        return None;
+    }
+    Some(nodes)
+}
+
+/// Polls `pw-dump` until `loopback_name`'s two stream nodes AND its input
+/// node's input ports are both visible in the same snapshot (see
+/// [`loopback_readiness`] for why both are needed), or `timeout` elapses.
+/// Combines what used to be two separate steps — a node-only poll here,
+/// followed by an unconditional one-shot port lookup in
+/// `link_source_into_loopback` that `bail!`ed immediately if the ports
+/// weren't there yet — into one poll, so a loopback whose node has
+/// registered but whose ports haven't yet no longer fails the share
+/// outright; it just keeps polling like the node-existence case always did.
+///
+/// Returns the snapshot the readiness check last succeeded against
+/// alongside the resolved node ids, so the caller can link straight from it
+/// without an extra `pw-dump` round trip.
+async fn wait_for_loopback_ready(loopback_name: &str, timeout: Duration) -> Result<(Vec<PwObject>, LoopbackNodes)> {
     let deadline = Instant::now() + timeout;
     loop {
         let objects = run_pw_dump()?;
-        if let Some(nodes) = find_loopback_nodes(&objects, loopback_name) {
-            return Ok(nodes);
+        if let Some(nodes) = loopback_readiness(&objects, loopback_name) {
+            return Ok((objects, nodes));
         }
         if Instant::now() >= deadline {
             bail!("timed out waiting for pw-loopback '{loopback_name}' to appear in the PipeWire graph");
@@ -292,10 +328,16 @@ async fn wait_for_loopback_nodes(loopback_name: &str, timeout: Duration) -> Resu
 /// up to however many pairs exist on the shorter side. Non-destructive: this
 /// only adds a link, it never touches the source's existing routing (spec'd
 /// approach — verified live, see module docs).
-fn link_source_into_loopback(source_node_id: u32, loopback_input_node_id: u32) -> Result<()> {
-    let objects = run_pw_dump()?;
-    let source_ports = node_port_ids(&objects, source_node_id as u64, "output");
-    let sink_ports = node_port_ids(&objects, loopback_input_node_id as u64, "input");
+///
+/// `objects` is a `pw-dump` snapshot already known (via
+/// [`wait_for_loopback_ready`]) to contain `loopback_input_node_id`'s input
+/// ports — passed in rather than re-fetched, since that readiness wait
+/// already paid for the freshest snapshot that matters. The `sink_ports`
+/// empty check below is accordingly a defensive no-op in the normal path,
+/// not the primary readiness gate anymore (see [`loopback_readiness`]).
+fn link_source_into_loopback(objects: &[PwObject], source_node_id: u32, loopback_input_node_id: u32) -> Result<()> {
+    let source_ports = node_port_ids(objects, source_node_id as u64, "output");
+    let sink_ports = node_port_ids(objects, loopback_input_node_id as u64, "input");
 
     if source_ports.is_empty() {
         bail!("audio source node {source_node_id} has no output ports to link (it may have stopped producing audio)");
@@ -393,7 +435,7 @@ pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, sour
 
     let mut loopback_child = spawn_loopback(&loopback_name)?;
 
-    let loopback = match wait_for_loopback_nodes(&loopback_name, Duration::from_secs(5)).await {
+    let (objects, loopback) = match wait_for_loopback_ready(&loopback_name, Duration::from_secs(5)).await {
         Ok(v) => v,
         Err(e) => {
             kill_and_wait(&mut loopback_child);
@@ -401,7 +443,7 @@ pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, sour
         }
     };
 
-    if let Err(e) = link_source_into_loopback(source.id, loopback.input_node_id) {
+    if let Err(e) = link_source_into_loopback(&objects, source.id, loopback.input_node_id) {
         kill_and_wait(&mut loopback_child);
         return Err(e);
     }
@@ -761,6 +803,52 @@ mod tests {
         assert!(node_port_ids(&objects, 999, "output").is_empty());
     }
 
+    /// Regression test for the "loopback node registered but its ports
+    /// haven't yet" race [`loopback_readiness`]/[`wait_for_loopback_ready`]
+    /// exist to handle: a snapshot with the loopback's node globals present
+    /// but no port globals yet must read as not-ready, exactly like a
+    /// snapshot where the node itself is entirely absent — both are cases
+    /// the poll loop should keep retrying on rather than treat as done (or,
+    /// for the old one-shot port lookup this replaced, fail outright on).
+    #[test]
+    fn loopback_readiness_requires_both_node_and_ports() {
+        let ready = fixture_objects();
+        assert!(
+            loopback_readiness(&ready, "ssshare-loopback-3-abc123").is_some(),
+            "fixture has both loopback nodes and the input node's ports — should be ready"
+        );
+
+        // Both loopback nodes are present, but neither has any ports yet —
+        // the exact shape of a `pw-dump` snapshot caught mid-race, per the
+        // module docs' root-cause note (node and port globals are separate
+        // registry events).
+        let node_only_json = r#"[
+            {
+                "id": 500,
+                "type": "PipeWire:Interface:Node",
+                "info": {
+                    "props": { "media.class": "Stream/Input/Audio", "node.name": "input.ssshare-loopback-9-xyz" }
+                }
+            },
+            {
+                "id": 501,
+                "type": "PipeWire:Interface:Node",
+                "info": {
+                    "props": { "media.class": "Stream/Output/Audio", "node.name": "output.ssshare-loopback-9-xyz" }
+                }
+            }
+        ]"#;
+        let node_only: Vec<PwObject> = serde_json::from_str(node_only_json).expect("fixture JSON should parse");
+        assert!(
+            loopback_readiness(&node_only, "ssshare-loopback-9-xyz").is_none(),
+            "nodes exist but have no ports yet — must not be considered ready"
+        );
+
+        // Neither node exists at all (e.g. pw-loopback hasn't started
+        // registering anything yet) — also not ready.
+        assert!(loopback_readiness(&ready, "no-such-loopback").is_none());
+    }
+
     #[test]
     fn find_loopback_nodes_matches_output_and_input_prefixed_names() {
         let objects = fixture_objects();
@@ -857,12 +945,12 @@ mod tests {
 
         let loopback_name = "ssshare-loopback-live-test";
         let mut loopback_child = spawn_loopback(loopback_name).expect("failed to spawn pw-loopback");
-        let nodes = wait_for_loopback_nodes(loopback_name, Duration::from_secs(5))
+        let (objects, nodes) = wait_for_loopback_ready(loopback_name, Duration::from_secs(5))
             .await
-            .expect("loopback nodes should appear");
+            .expect("loopback nodes and ports should appear");
 
         if let Some(source) = source {
-            link_source_into_loopback(source.id, nodes.input_node_id).expect("linking should succeed");
+            link_source_into_loopback(&objects, source.id, nodes.input_node_id).expect("linking should succeed");
             eprintln!("linked live source id={} name={:?} into loopback input node {}", source.id, source.name, nodes.input_node_id);
         } else {
             eprintln!("did not find the synthetic test app by name; listed sources: {sources:?} — link step skipped");
@@ -902,7 +990,7 @@ mod tests {
             socket.local_addr().expect("local_addr").port()
         };
         let home = dirs::home_dir().expect("could not determine home directory");
-        let server_repo = home.join("Documents/Programming/simple-screensharing-server");
+        let server_repo = home.join("GitHubProjects/simple-screensharing/master/simple-screensharing-server");
         let server_binary = {
             let release = server_repo.join("target/release/simple-screensharing-server");
             let debug = server_repo.join("target/debug/simple-screensharing-server");
