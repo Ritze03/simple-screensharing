@@ -15,6 +15,9 @@
 //!   t. ! queue leaky=downstream max-size-buffers=1 ! videorate ! video/x-raw,framerate=1/1
 //!      ! videoconvert ! video/x-raw,format=RGB
 //!      ! appsink name=preview_sink
+//!   t. ! queue leaky=downstream max-size-buffers=1 ! videorate ! video/x-raw,framerate=12/1
+//!      ! videoconvert ! video/x-raw,format=RGB
+//!      ! appsink name=self_preview_sink
 //! ```
 //!
 //! The `valve` gates only the encoder branch: `pump_loop` toggles its
@@ -45,6 +48,26 @@
 //! frame off whatever [`preview::FrameStream`] it's handed every 30s, so
 //! capping the tee branch to ~1fps here is purely a CPU-saving measure, not
 //! something the preview task requires.
+//!
+//! A *third* tee branch (`self_preview_sink`, [`SELF_PREVIEW_BRANCH_FRAMERATE`])
+//! feeds the sender-side self-preview shown in `ui.rs`'s share panel — a
+//! small live view of what's actually being captured, so the person sharing
+//! can confirm what viewers see without waiting on the (much slower, JPEG-
+//! encoded) 30s thumbnail. It is deliberately its own branch rather than a
+//! second consumer of `preview_sink`'s samples.
+//!
+//! Why: `preview_sink` is capped to ~1fps purely because
+//! [`preview::spawn_preview_task`] only ever samples the latest frame every
+//! 30s — bumping that branch's own `videorate` cap to feed a smooth live
+//! preview would also mean paying for `videoconvert`/appsink work at that
+//! higher rate on every frame the JPEG-thumbnail path *doesn't* need, and
+//! would couple the two features' cadences together for no reason. A
+//! dedicated branch keeps the JPEG-thumbnail path's 1fps and the live
+//! self-preview's [`SELF_PREVIEW_BRANCH_FRAMERATE`] fully independent —
+//! changing one's rate can never accidentally affect the other — at the cost
+//! of one extra `queue`/`videorate`/`videoconvert`/`appsink` chain off the
+//! tee, which is cheap next to the encoder branch. See
+//! `superdoc/features/self-preview.md`.
 //!
 //! Two [`EncoderBackend`]s implement the encoder stage: software `x264enc`
 //! (above) and, preferred when actually usable, VAAPI's `vah264enc` (format
@@ -91,7 +114,7 @@
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -551,6 +574,22 @@ async fn open_portal_capture() -> Result<PortalCapture> {
 /// wasted `videoconvert`/appsink work.
 const PREVIEW_BRANCH_FRAMERATE: u32 = 1;
 
+/// Self-preview branch's framerate cap off the tee (see this module's doc
+/// comment and `superdoc/features/self-preview.md`). Chosen to look smooth
+/// enough for a small "is this really what I'm sharing" live view without
+/// paying anywhere near the encoder branch's CPU/`videoconvert` cost: a
+/// self-preview thumbnail doesn't need to track the full capture framerate
+/// (up to [`MAX_FRAMERATE`]'s 240) to be useful, and this is comfortably
+/// above the ~10-15fps a small preview panel needs to read as live rather
+/// than a slideshow.
+const SELF_PREVIEW_BRANCH_FRAMERATE: u32 = 12;
+
+/// Element name of the tee's third branch — the live sender-side
+/// self-preview appsink (see this module's doc comment and
+/// [`SELF_PREVIEW_BRANCH_FRAMERATE`]), distinct from `preview_sink`'s
+/// existing JPEG-thumbnail branch.
+const SELF_PREVIEW_SINK_NAME: &str = "self_preview_sink";
+
 /// Name of the `valve` element gating the encoder branch (between the
 /// tee's `queue` and the raw-format capsfilter feeding the encoder) — see
 /// [`build_pipeline`]. Toggled via its `drop` property by [`pump_loop`] in
@@ -573,8 +612,9 @@ const ENCODER_QUEUE_MAX_BUFFERS: u32 = 2;
 
 /// Builds and links (but does not start) the capture/encode pipeline
 /// described in this module's doc comment, returning the pipeline, its
-/// encoded-output `appsink`, the preview branch's raw-RGB `appsink`, and the
-/// encoder branch's gating `valve` (see [`ENCODER_VALVE_NAME`]).
+/// encoded-output `appsink`, the preview branch's raw-RGB `appsink`, the
+/// self-preview branch's raw-RGB `appsink` (see [`SELF_PREVIEW_SINK_NAME`]),
+/// and the encoder branch's gating `valve` (see [`ENCODER_VALVE_NAME`]).
 /// `source_fragment` is [`CaptureSource::launch_fragment`]'s output — the
 /// only platform-specific piece of the description below.
 fn build_pipeline(
@@ -582,7 +622,7 @@ fn build_pipeline(
     bitrate_kbps: u32,
     framerate: u32,
     backend: EncoderBackend,
-) -> Result<(gst::Pipeline, gst_app::AppSink, gst_app::AppSink, gst::Element)> {
+) -> Result<(gst::Pipeline, gst_app::AppSink, gst_app::AppSink, gst_app::AppSink, gst::Element)> {
     // Defensive clamp — see [`MAX_FRAMERATE`]'s doc comment. `ui.rs`'s
     // dropdown only ever offers values already inside this range, so this
     // is a backstop against a 0/absurd value reaching `key-int-max`, not the
@@ -702,7 +742,13 @@ fn build_pipeline(
             ! video/x-raw,framerate={PREVIEW_BRANCH_FRAMERATE}/1 \
             ! videoconvert \
             ! video/x-raw,format=RGB \
-            ! appsink name=preview_sink emit-signals=false sync=false max-buffers=1 drop=true"
+            ! appsink name=preview_sink emit-signals=false sync=false max-buffers=1 drop=true \
+         t. ! queue leaky=downstream max-size-buffers=1 \
+            ! videorate \
+            ! video/x-raw,framerate={SELF_PREVIEW_BRANCH_FRAMERATE}/1 \
+            ! videoconvert \
+            ! video/x-raw,format=RGB \
+            ! appsink name={SELF_PREVIEW_SINK_NAME} emit-signals=false sync=false max-buffers=1 drop=true"
     );
 
     let element = gst::parse::launch(&description)
@@ -723,11 +769,17 @@ fn build_pipeline(
         .downcast::<gst_app::AppSink>()
         .map_err(|_| anyhow!("'preview_sink' element is not an AppSink"))?;
 
+    let self_preview_sink = pipeline
+        .by_name(SELF_PREVIEW_SINK_NAME)
+        .ok_or_else(|| anyhow!("pipeline has no element named '{SELF_PREVIEW_SINK_NAME}'"))?
+        .downcast::<gst_app::AppSink>()
+        .map_err(|_| anyhow!("'{SELF_PREVIEW_SINK_NAME}' element is not an AppSink"))?;
+
     let encoder_valve = pipeline
         .by_name(ENCODER_VALVE_NAME)
         .ok_or_else(|| anyhow!("pipeline has no element named '{ENCODER_VALVE_NAME}'"))?;
 
-    Ok((pipeline, sink, preview_sink, encoder_valve))
+    Ok((pipeline, sink, preview_sink, self_preview_sink, encoder_valve))
 }
 
 /// Builds `backend`'s capture pipeline and drives it to `Playing`, waiting
@@ -743,8 +795,8 @@ fn start_pipeline(
     bitrate_kbps: u32,
     framerate: u32,
     backend: EncoderBackend,
-) -> Result<(gst::Pipeline, gst_app::AppSink, gst_app::AppSink, gst::Element)> {
-    let (pipeline, appsink, preview_sink, encoder_valve) =
+) -> Result<(gst::Pipeline, gst_app::AppSink, gst_app::AppSink, gst_app::AppSink, gst::Element)> {
+    let (pipeline, appsink, preview_sink, self_preview_sink, encoder_valve) =
         build_pipeline(source_fragment, bitrate_kbps, framerate, backend)?;
 
     if let Err(e) = pipeline.set_state(gst::State::Playing) {
@@ -763,7 +815,7 @@ fn start_pipeline(
         return Err(anyhow!("capture pipeline ({backend:?}) failed to reach PLAYING: {e:?}"));
     }
 
-    Ok((pipeline, appsink, preview_sink, encoder_valve))
+    Ok((pipeline, appsink, preview_sink, self_preview_sink, encoder_valve))
 }
 
 // ---------------------------------------------------------------------
@@ -808,6 +860,13 @@ pub struct CaptureHandle {
     // gauge, not an event stream, so a lock-free shared cell is simpler than
     // threading another channel through.
     encoder_fps: Arc<AtomicU32>,
+    // Latest frame off the self-preview tee branch (see
+    // [`SELF_PREVIEW_BRANCH_FRAMERATE`]), written by [`pump_loop`] and read
+    // back (and cleared) via [`CaptureHandle::self_preview_frame`] — the same
+    // "last-value slot behind a `Mutex`" shape `decode.rs`'s
+    // `StreamDecoder::latest_frame` uses for the equivalent viewer-side
+    // texture-upload pattern in `ui.rs`.
+    self_preview_frame: Arc<Mutex<Option<egui::ColorImage>>>,
 }
 
 impl Drop for CaptureHandle {
@@ -920,7 +979,7 @@ async fn start_sharing_with_source(
     // this branch is inert: detect_encoder_backend() always resolves to
     // Software there (see its doc comment), so the Vaapi arm never matches.
     let preferred_backend = detect_encoder_backend();
-    let (pipeline, appsink, preview_sink, encoder_valve) =
+    let (pipeline, appsink, preview_sink, self_preview_sink, encoder_valve) =
         match start_pipeline(&source_fragment, bitrate_kbps, framerate, preferred_backend) {
             Ok(started) => started,
             Err(e) if preferred_backend == EncoderBackend::Vaapi => {
@@ -954,12 +1013,24 @@ async fn start_sharing_with_source(
     let stream = appsink.stream();
     let bus = pipeline.bus().ok_or_else(|| anyhow!("pipeline has no bus"))?;
     let bus_stream = bus.stream();
+    // Bridged into `pump_loop` alongside the encoder-output/bus streams below
+    // (see this module's doc comment's "Why" note on the dedicated third tee
+    // branch) rather than via a separate spawned task — reusing the exact
+    // same `gst_app::AppSink::stream()` bridging `pump_loop` already does for
+    // the encoded-output appsink keeps this handle's lifecycle (one
+    // `pump_task`, joined by `CaptureHandle::stop`) unchanged.
+    let self_preview_stream = self_preview_sink.stream();
 
     let (control_tx, control_rx) = mpsc::unbounded_channel();
     let encoder_fps = Arc::new(AtomicU32::new(0));
+    let self_preview_frame: Arc<Mutex<Option<egui::ColorImage>>> = Arc::new(Mutex::new(None));
 
     let pump_client = client.clone();
     let pump_encoder_fps = encoder_fps.clone();
+    let self_preview_bridge = SelfPreviewBridge {
+        stream: self_preview_stream,
+        frame: self_preview_frame.clone(),
+    };
     let pump_task = tokio::spawn(pump_loop(
         pump_client,
         stream_id,
@@ -969,6 +1040,7 @@ async fn start_sharing_with_source(
         encoder_valve,
         encoder_sink_pad,
         pump_encoder_fps,
+        self_preview_bridge,
     ));
 
     client
@@ -991,6 +1063,7 @@ async fn start_sharing_with_source(
         preview_handle: Some(preview_handle),
         control_tx,
         encoder_fps,
+        self_preview_frame,
     })
 }
 
@@ -1048,6 +1121,47 @@ fn sample_to_raw_frame(sample: &gst::Sample) -> Result<RawFrame> {
         height: height as u32,
         rgb: packed,
     })
+}
+
+/// Converts one `self_preview_sink` RGB8 sample (see this module's doc
+/// comment) into an `egui::ColorImage`, for [`CaptureHandle::self_preview_frame`]
+/// to hand `ui.rs`. Stride-corrects via [`gst_video::VideoFrameRef`] exactly
+/// like [`sample_to_raw_frame`] does for the JPEG-thumbnail branch, then
+/// widens tightly-packed RGB rows to RGBA (alpha opaque) since
+/// `egui::ColorImage::from_rgba_unmultiplied` — the same constructor
+/// `decode.rs`'s `pull_color_image` uses for the viewer-side decoded frame —
+/// expects 4 bytes/pixel, while this branch's negotiated caps are RGB8 (3
+/// bytes/pixel, cheaper for `videoconvert` to produce off the tee than
+/// negotiating RGBA all the way through).
+fn sample_to_color_image(sample: &gst::Sample) -> Result<egui::ColorImage> {
+    let buffer = sample.buffer().ok_or_else(|| anyhow!("self-preview sample had no buffer"))?;
+    let caps = sample.caps().ok_or_else(|| anyhow!("self-preview sample had no caps"))?;
+    let info = gst_video::VideoInfo::from_caps(caps).context("failed to parse self-preview capture caps")?;
+
+    let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info)
+        .map_err(|_| anyhow!("failed to map self-preview capture buffer readable"))?;
+
+    let width = frame.width() as usize;
+    let height = frame.height() as usize;
+    let stride = frame.plane_stride()[0] as usize;
+    let plane = frame
+        .plane_data(0)
+        .map_err(|_| anyhow!("self-preview capture frame had no plane 0 data"))?;
+
+    let row_bytes = width * 3;
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for row in 0..height {
+        let start = row * stride;
+        let end = start + row_bytes;
+        let Some(row_slice) = plane.get(start..end) else {
+            anyhow::bail!("self-preview capture frame plane shorter than expected (stride/height mismatch)");
+        };
+        for pixel in row_slice.chunks_exact(3) {
+            rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 0xFF]);
+        }
+    }
+
+    Ok(egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba))
 }
 
 fn negotiated_size(appsink: &gst_app::AppSink) -> Option<(u16, u16)> {
@@ -1189,11 +1303,32 @@ impl CaptureHandle {
     pub fn encoder_fps(&self) -> u32 {
         self.encoder_fps.load(Ordering::Relaxed)
     }
+
+    /// Non-blocking poll for the most recently captured self-preview frame
+    /// (see [`SELF_PREVIEW_BRANCH_FRAMERATE`] and
+    /// `superdoc/features/self-preview.md`) — `None` if nothing new has
+    /// arrived since the last call. Mirrors `decode.rs`'s
+    /// `StreamDecoder::latest_frame`'s take-and-clear shape: intended for
+    /// `ui.rs` to call once per repaint and, when `Some`, upload via
+    /// `egui::TextureHandle::set`/`ctx.load_texture`.
+    pub fn self_preview_frame(&self) -> Option<egui::ColorImage> {
+        self.self_preview_frame.lock().unwrap().take()
+    }
 }
 
 // ---------------------------------------------------------------------
 // Encode → encrypt → fragment → send pump
 // ---------------------------------------------------------------------
+
+/// The self-preview branch's appsink stream plus the frame slot it feeds
+/// (see [`SELF_PREVIEW_BRANCH_FRAMERATE`]), bundled into a single
+/// [`pump_loop`] parameter rather than two — the pieces are always
+/// constructed and consumed together, and this keeps `pump_loop`'s argument
+/// count from growing by two instead of one.
+struct SelfPreviewBridge {
+    stream: gst_app::app_sink::AppSinkStream,
+    frame: Arc<Mutex<Option<egui::ColorImage>>>,
+}
 
 /// Control-plane events that affect an active share's encoder, forwarded
 /// from the relay's `RelayToClient::SubscriberCount`/`RelayToClient::KeyframeRequest`
@@ -1286,12 +1421,15 @@ fn record_encoder_frame(times: &mut VecDeque<Instant>, fps: &AtomicU32) {
 /// messages from `bus` concurrently, for as long as either stream keeps
 /// producing, while also reacting to [`CaptureControlEvent`]s on
 /// `control_rx` (pausing/resuming `encoder_valve` and forcing keyframes via
-/// `encoder_sink_pad` — see [`force_keyframe`]). Exits its GStreamer-facing
-/// half when both the appsink and bus streams end (normal teardown, see
-/// [`CaptureHandle::stop`]) or the bus reports a pipeline error;
-/// `control_rx` naturally stops contributing new work once `CaptureHandle`
-/// (and its `control_tx`) drops, so it doesn't gate the loop's exit the same
-/// way the other two do.
+/// `encoder_sink_pad` — see [`force_keyframe`]) and bridging
+/// `self_preview`'s raw-RGB samples into its frame slot (see
+/// [`sample_to_color_image`], [`SelfPreviewBridge`], and
+/// [`CaptureHandle::self_preview_frame`]). Exits its GStreamer-facing half
+/// when the appsink, bus, and self-preview streams have all ended (normal
+/// teardown, see [`CaptureHandle::stop`]) or the bus reports a pipeline
+/// error; `control_rx` naturally stops contributing new work once
+/// `CaptureHandle` (and its `control_tx`) drops, so it doesn't gate the
+/// loop's exit the same way the other three do.
 async fn pump_loop(
     client: ScreenshareClient,
     stream_id: u8,
@@ -1301,10 +1439,15 @@ async fn pump_loop(
     encoder_valve: gst::Element,
     encoder_sink_pad: gst::Pad,
     encoder_fps: Arc<AtomicU32>,
+    mut self_preview: SelfPreviewBridge,
 ) {
     let start = Instant::now();
     let mut appsink_done = false;
     let mut bus_done = false;
+    // Gates loop exit alongside `appsink_done`/`bus_done` (see the doc
+    // comment above) so a self-preview branch that never reaches EOS for any
+    // reason can't hang `pump_loop` — mirrors those two flags' shape exactly.
+    let mut self_preview_done = false;
     // Sliding window of the `Instant`s each encoded access unit reached the
     // appsink, used to compute [`CaptureHandle::encoder_fps`]'s live rate —
     // see [`ENCODER_FPS_WINDOW`].
@@ -1324,7 +1467,7 @@ async fn pump_loop(
     let mut paused = false;
 
     loop {
-        if appsink_done && bus_done {
+        if appsink_done && bus_done && self_preview_done {
             return;
         }
         tokio::select! {
@@ -1343,6 +1486,15 @@ async fn pump_loop(
                 match msg {
                     Some(msg) => handle_bus_message(&msg, &mut bus_done),
                     None => bus_done = true,
+                }
+            }
+            sample = self_preview.stream.next(), if !self_preview_done => {
+                match sample {
+                    Some(sample) => match sample_to_color_image(&sample) {
+                        Ok(image) => *self_preview.frame.lock().unwrap() = Some(image),
+                        Err(e) => tracing::warn!("dropping malformed self-preview frame for stream {stream_id}: {e:#}"),
+                    },
+                    None => self_preview_done = true,
                 }
             }
             ctrl = control_rx.recv(), if !control_done => {
@@ -1759,7 +1911,7 @@ mod tests {
              ! video/x-raw,width=64,height=64,framerate=60/1";
 
         fn measure_output_fps(source: &str, configured_fps: u32) -> f64 {
-            let (pipeline, sink, _preview_sink, _valve) =
+            let (pipeline, sink, _preview_sink, _self_preview_sink, _valve) =
                 build_pipeline(source, DEFAULT_BITRATE_KBPS, configured_fps, EncoderBackend::Software)
                     .expect("pipeline should construct");
             pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");

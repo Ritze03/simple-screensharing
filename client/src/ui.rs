@@ -205,6 +205,15 @@ struct Connected {
     /// thumbnail, keyed the same way as `preview_cache`/`watches`. Mirrors
     /// `WatchEntry::texture`'s create-once/`set`-in-place pattern.
     preview_textures: HashMap<(ConnId, StreamId), egui::TextureHandle>,
+
+    /// Live self-preview texture per active outbound video share, keyed by
+    /// its own `stream_id` (see `active_shares`) — sender-side only, so this
+    /// is *this* connection's own captured video, not another member's
+    /// stream. Populated by `update_self_preview_textures` from
+    /// `CaptureHandle::self_preview_frame`, mirroring `preview_textures`'
+    /// create-once/`set`-in-place pattern. See
+    /// `superdoc/features/self-preview.md`.
+    self_preview_textures: HashMap<StreamId, egui::TextureHandle>,
 }
 
 pub struct App {
@@ -666,6 +675,39 @@ impl Connected {
         any_active
     }
 
+    /// Upload any freshly captured self-preview frames (see
+    /// `capture::CaptureHandle::self_preview_frame` and
+    /// `superdoc/features/self-preview.md`) to each active outbound video
+    /// share's own texture. Call once per repaint alongside
+    /// `update_watch_textures`; cheap no-op when nothing new has arrived.
+    ///
+    /// Unlike `update_watch_textures`, this doesn't need to drive the repaint
+    /// cadence itself: the self-preview branch is capped to a fixed, modest
+    /// rate (`capture::SELF_PREVIEW_BRANCH_FRAMERATE`), well within what
+    /// `update()`'s existing idle-fallback repaint interval already keeps up
+    /// with, so no extra `ctx.request_repaint()` is needed for this alone.
+    fn update_self_preview_textures(&mut self, ctx: &egui::Context) {
+        for (stream_id, share) in self.active_shares.iter() {
+            let ShareStatus::Active(ShareHandle::Video(handle)) = &share.status else {
+                continue;
+            };
+            let Some(image) = handle.self_preview_frame() else {
+                continue;
+            };
+            match self.self_preview_textures.get_mut(stream_id) {
+                Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
+                None => {
+                    let name = format!("self-preview-{stream_id}");
+                    self.self_preview_textures.insert(*stream_id, ctx.load_texture(name, image, egui::TextureOptions::LINEAR));
+                }
+            }
+        }
+        // Drop textures for shares that no longer exist (stopped/replaced),
+        // so this map doesn't grow unboundedly over a long session's worth
+        // of start/stop cycles.
+        self.self_preview_textures.retain(|stream_id, _| self.active_shares.contains_key(stream_id));
+    }
+
     /// "Pop out" clicked for `(owner, stream_id)`: mark that `WatchEntry` as
     /// popped-out so the central panel stops rendering it and `show_popouts`
     /// starts giving it its own native window instead.
@@ -841,6 +883,7 @@ impl App {
                     audio_watches: HashMap::new(),
                     preview_cache: PreviewCache::new(),
                     preview_textures: HashMap::new(),
+                    self_preview_textures: HashMap::new(),
                 });
             }
             Ok(Err(e)) => {
@@ -1275,6 +1318,29 @@ impl App {
                             ui.label(egui::RichText::new(t!("share.fps_label", fps = handle.encoder_fps()).to_string()).color(theme::TEXT_DIM));
                         }
                     });
+                    // Sender-side self-preview: a small live view of this
+                    // machine's own captured video, so the person sharing can
+                    // confirm what viewers actually see. Video shares only,
+                    // and only once actually `Active` (a `CaptureHandle` — and
+                    // therefore a self-preview frame source — only exists at
+                    // that point). See `superdoc/features/self-preview.md`.
+                    if share.kind == StreamKind::Video && matches!(share.status, ShareStatus::Active(_)) {
+                        const SELF_PREVIEW_WIDTH: f32 = 160.0;
+                        const SELF_PREVIEW_HEIGHT: f32 = SELF_PREVIEW_WIDTH * 9.0 / 16.0;
+                        theme::section_label(ui, t!("share.self_preview_label").as_ref());
+                        match connected.self_preview_textures.get(&stream_id) {
+                            Some(tex) => {
+                                let tex_size = tex.size_vec2();
+                                let scale = if tex_size.x > 0.0 { SELF_PREVIEW_WIDTH / tex_size.x } else { 1.0 };
+                                ui.image((tex.id(), tex_size * scale));
+                            }
+                            None => {
+                                let (rect, _) = ui
+                                    .allocate_exact_size(egui::vec2(SELF_PREVIEW_WIDTH, SELF_PREVIEW_HEIGHT), egui::Sense::hover());
+                                ui.painter().rect_filled(rect, 4.0, theme::FIELD);
+                            }
+                        }
+                    }
                 }
                 for stream_id in to_stop {
                     connected.stop_share(stream_id);
@@ -1504,6 +1570,7 @@ impl eframe::App for App {
             connected.poll_share_states();
             connected.poll_audio_sources();
             has_inline_watch = connected.update_watch_textures(ctx);
+            connected.update_self_preview_textures(ctx);
             connected.show_popouts(ctx);
         }
 
@@ -1684,6 +1751,7 @@ mod tests {
             audio_watches: HashMap::new(),
             preview_cache: PreviewCache::new(),
             preview_textures: HashMap::new(),
+            self_preview_textures: HashMap::new(),
         };
         let decoder = StreamDecoder::new(TEST_STREAM_ID).expect("failed to build StreamDecoder");
         connected.watches.insert(
