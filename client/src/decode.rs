@@ -42,6 +42,34 @@
 //! `feed()` returns quickly instead of synchronously running the whole
 //! decode chain on the caller's thread.
 //!
+//! # Pacing and frame-skipping
+//!
+//! Decoded frames are not displayed the instant they finish decoding: they
+//! are paced against the sender's capture-time PTS (`pts_us`, threaded
+//! through end-to-end from `capture.rs`) by [`PacingState`], owned by
+//! `appsink`'s `new_sample` callback. Pacing alone bounds *latency*
+//! (falling too far behind re-bases instead of accumulating an
+//! ever-growing delay) but says nothing about *throughput*: if a sender is
+//! capturing/encoding at a higher framerate than this viewer's decode
+//! pipeline can sustain (e.g. a 240fps sender against a decoder that only
+//! keeps up with 120fps), re-basing alone still displays every decoded
+//! frame — just each one a little later than it should be — which reads as
+//! the picture slowly drifting out of sync with real elapsed time rather
+//! than as a stall.
+//!
+//! `Why:` `PacingState` tracks a running *pts budget* — how much sender
+//! pts-time has accumulated toward "earning" the next display slot — and
+//! skips (tells `new_sample` to drop the frame, never writing it into the
+//! display sink) whenever a frame hasn't earned enough budget yet. This is
+//! the standard accumulator/DDA technique for down-converting a frame rate:
+//! it settles into skipping almost exactly the fraction the sustained rate
+//! mismatch demands (e.g. ~50% for a 240fps sender against a 120fps-capable
+//! viewer), not 0% (every frame displayed late, forever drifting) or ~100%
+//! (skip-storm with no recovery). See [`PacingState`]'s own doc comment for
+//! the full rationale, including why a *consecutive-badly-behind-events*
+//! counter (an earlier version of this mechanism) does not work for a
+//! gradual per-frame differential.
+//!
 //! # Threading
 //!
 //! Each `StreamDecoder` owns one background `std::thread` (plain
@@ -267,14 +295,24 @@ const DECODE_FPS_WINDOW: Duration = Duration::from_secs(2);
 /// between the two threads.
 const VIDEO_INGEST_CHANNEL_CAPACITY: usize = 8;
 
-/// How far behind wall-clock a video frame's paced target may fall before
-/// [`PacingState::next_delay`] gives up trying to catch up and instead
-/// re-bases pacing on the current frame. Bounds the worst-case latency a
-/// stall/backlog can add, and self-heals a PTS discontinuity (e.g. a
-/// stream restart or a keyframe arriving right after resubscribing, where
-/// the new PTS origin has no relation to the old one) instead of
-/// accumulating drift forever.
-const PACING_MAX_BEHIND: Duration = Duration::from_millis(300);
+/// How large a *single* decode-to-decode wall-clock gap (`dt_wall` between
+/// two consecutive calls to [`PacingState::decide`]) has to be before it's
+/// treated as a genuinely pathological stall — a system suspend/resume, the
+/// process stopped under a debugger, a stream restart — rather than
+/// ordinary (even fairly bad) decode/display backlog. Chosen generously
+/// large — larger than any realistic single decode hiccup, and in the same
+/// ballpark as the H.264 stream's own worst-case 2-second GOP length
+/// mentioned above — specifically so it never fires during the sustained
+/// but *gradual* rate mismatch [`PacingState::decide`]'s pts-budget
+/// mechanism is designed to handle on its own (see that doc comment):
+/// crossing this gate hard-resets the pacer (budget zeroed, frame displayed
+/// immediately) instead of letting the budget mechanism spend potentially
+/// many frames' worth of skips draining a multi-second gap. Also the
+/// self-heal path for a PTS discontinuity (a keyframe arriving right after
+/// resubscribing, where the new PTS origin has no relation to the old one)
+/// on the rare occasion that particular discontinuity happens to coincide
+/// with a large wall-clock gap too.
+const PACING_HARD_STALL_GAP: Duration = Duration::from_secs(2);
 
 /// Tracks how often [`StreamDecoder::latest_frame`] actually yields a *new*
 /// decoded frame (not just how often it's polled — `ui.rs` polls once per
@@ -338,55 +376,144 @@ impl FpsCounter {
 ///
 /// # Why a bounded catch-up window instead of always honoring `pts_us`
 ///
-/// Always sleeping until `target` would let the decoder fall permanently
-/// behind after any stall (e.g. a slow decode, or a burst of frames after
-/// a channel drop), and would misbehave completely across a PTS
-/// discontinuity (a stream restart, or the first keyframe after
-/// resubscribing, where the new stream's PTS origin has nothing to do with
-/// the old one — e.g. a much smaller `pts_us` than the previous frame's).
-/// [`Self::next_delay`] handles both the same way: once the target falls
-/// more than [`PACING_MAX_BEHIND`] behind wall-clock, it gives up catching
-/// up and re-bases pacing on the current frame instead, bounding the
-/// worst-case added latency and self-healing rather than accumulating
-/// drift.
+/// Always sleeping until the sender's pts-time says to would let the
+/// decoder fall permanently behind after any stall (e.g. a slow decode, or
+/// a burst of frames after a channel drop), and would misbehave completely
+/// across a PTS discontinuity (a stream restart, or the first keyframe
+/// after resubscribing, where the new stream's PTS origin has nothing to do
+/// with the old one — e.g. a much smaller `pts_us` than the previous
+/// frame's). [`Self::decide`] handles both the same way: a single
+/// decode-to-decode wall-clock gap larger than [`PACING_HARD_STALL_GAP`]
+/// gives up catching up and hard-resets pacing on the current frame
+/// instead, bounding the worst-case added latency and self-healing rather
+/// than accumulating drift forever.
+///
+/// # Why a hard reset alone isn't enough, and frames get skipped too
+///
+/// A hard reset only fires on a huge single-step gap. It says nothing about
+/// *sustained* throughput: if the sender's output rate durably exceeds what
+/// this viewer can decode and display (e.g. a 240fps sender against a
+/// decoder that can only sustain 120fps), no single step is ever more than
+/// a fraction of a millisecond "worse" than the last — the lag only
+/// *accumulates*, a little at a time, forever. A per-step or
+/// consecutive-event threshold cannot see that: measured one step at a
+/// time the lag never crosses any fixed bar, so a design built purely
+/// around "is this one step bad enough" never engages (this was a real bug
+/// in an earlier version of this mechanism — see git history / the
+/// implementation notes doc). [`Self::decide`] instead runs a small
+/// accumulator, `pts_budget`: every call adds this frame's own `dt_pts`
+/// (how far the sender's clock advanced since the last frame) to the
+/// budget, and every *displayed* frame spends `dt_wall` (how much real
+/// time actually elapsed) out of it. A frame is displayed only if the
+/// budget can afford that real-time cost; otherwise it's skipped and the
+/// budget is left untouched (carried into the next frame's accounting
+/// rather than being wiped to zero). This is the standard accumulator/DDA
+/// technique used for frame-rate down-conversion, and it has the right
+/// asymptotic behavior for free: sustained `dt_wall > dt_pts` by some
+/// constant factor converges to skipping almost exactly `1 - dt_pts/dt_wall`
+/// of frames (e.g. 240fps sender vs. 120fps-sustained viewer -> ~50%
+/// skipped), not 0% (drifting forever) and not ~100% (skip-storm with no
+/// way back) — and it recovers on its own, within a frame or two, the
+/// moment `dt_wall` returns to matching `dt_pts` (viewer catches up, or the
+/// sender's rate drops), because nothing about it depends on how long the
+/// mismatch has been going on, only on the current step's own numbers.
 struct PacingState {
-    /// `(pts_us, local_instant)` of the frame pacing is currently based on
-    /// — `None` until the first frame is seen.
-    base: Option<(u64, Instant)>,
+    /// `(pts_us, local_instant)` of the most recent frame `decide` was
+    /// given — *any* decision, not just displayed ones — used to compute
+    /// the next call's `dt_pts`/`dt_wall`. `None` until the first frame is
+    /// seen.
+    last: Option<(u64, Instant)>,
+    /// Running pts-time budget: how much of the sender's clock has advanced
+    /// since the budget was last spent (by displaying a frame) or zeroed
+    /// (by a [`PACING_HARD_STALL_GAP`] hard reset). See [`Self::decide`]'s
+    /// doc comment ("Why a hard reset alone isn't enough...") for the full
+    /// accounting rule. Never negative (there's no such thing as a Duration
+    /// below zero) — an "ahead of schedule" step still adds to it before
+    /// immediately spending `dt_wall` back out, same as any other display.
+    pts_budget: Duration,
+}
+
+/// What [`PacingState::decide`] wants the caller to do with the next
+/// decoded frame.
+#[derive(Debug, PartialEq, Eq)]
+enum PacingDecision {
+    /// Display the frame. `Some(duration)` means sleep that long first;
+    /// `None` means display it immediately (already on pace, or already
+    /// past due).
+    Display(Option<Duration>),
+    /// Not enough accumulated pts-budget to justify displaying this frame
+    /// right now: drop it instead. The caller just must not write it to the
+    /// display sink; `pts_budget` already accounts for the frame internally
+    /// (see [`PacingState::decide`]), the caller has nothing further to do.
+    Skip,
 }
 
 impl PacingState {
     fn new() -> Self {
-        Self { base: None }
+        Self { last: None, pts_budget: Duration::ZERO }
     }
 
     /// Given the next decoded frame's `pts_us` and the current time `now`,
-    /// decide how long to sleep before displaying it (`None` means display
-    /// immediately). Pure/deterministic given its inputs — kept free of any
-    /// GStreamer or thread-sleeping so it's unit-testable on its own; see
+    /// decide what to do with it — see [`PacingDecision`]. Pure/
+    /// deterministic given its inputs — kept free of any GStreamer or
+    /// thread-sleeping so it's unit-testable on its own; see
     /// `tests::pacing_*` below.
-    fn next_delay(&mut self, pts_us: u64, now: Instant) -> Option<Duration> {
-        let Some((base_pts, base_instant)) = self.base else {
+    fn decide(&mut self, pts_us: u64, now: Instant) -> PacingDecision {
+        let Some((last_pts, last_instant)) = self.last else {
             // First frame ever: nothing to pace against yet, display now
-            // and start the baseline here.
-            self.base = Some((pts_us, now));
-            return None;
+            // and start tracking from here.
+            self.last = Some((pts_us, now));
+            self.pts_budget = Duration::ZERO;
+            return PacingDecision::Display(None);
         };
 
-        let target = base_instant + Duration::from_micros(pts_us.saturating_sub(base_pts));
-        if target > now {
-            return Some(target - now);
+        // How far the sender's clock and the wall clock each advanced since
+        // the last frame `decide` saw. `saturating_sub`/`saturating_duration_since`
+        // rather than plain subtraction: a PTS discontinuity (stream
+        // restart) can make `pts_us` smaller than `last_pts`, and this must
+        // not panic — it just yields `dt_pts == 0` for that one frame,
+        // which is exactly the right answer ("the sender's clock didn't
+        // meaningfully advance towards this new origin").
+        let dt_pts = Duration::from_micros(pts_us.saturating_sub(last_pts));
+        let dt_wall = now.saturating_duration_since(last_instant);
+        self.last = Some((pts_us, now));
+
+        if dt_wall > PACING_HARD_STALL_GAP {
+            // A genuinely pathological single-step gap (system suspend,
+            // debugger pause, stream restart) — don't make the viewer sit
+            // through however many frames it'd take the budget accounting
+            // below to drain a multi-second backlog; just start fresh and
+            // show this frame right away, like a stall that self-heals
+            // instantly rather than one that's merely being paid down.
+            self.pts_budget = Duration::ZERO;
+            return PacingDecision::Display(None);
         }
 
-        // Already at or past target. If we're only slightly behind (normal
-        // jitter/scheduling slop), just display immediately without
-        // touching the baseline. If we're badly behind — a real stall, or
-        // a PTS discontinuity that makes `target` land far in the past —
-        // re-base on this frame instead of letting the gap accumulate.
-        if now.duration_since(target) > PACING_MAX_BEHIND {
-            self.base = Some((pts_us, now));
+        self.pts_budget += dt_pts;
+
+        if dt_wall < dt_pts {
+            // Ahead of schedule: decode finished before the sender's clock
+            // caught up to this frame's pts. Spend only the real time that
+            // actually elapsed and sleep out the rest, same as the
+            // pre-existing behavior.
+            self.pts_budget = self.pts_budget.saturating_sub(dt_wall);
+            return PacingDecision::Display(Some(dt_pts - dt_wall));
         }
-        None
+
+        if self.pts_budget >= dt_wall {
+            // On pace, or behind but with enough banked pts-time to afford
+            // showing this frame right now: spend it and display.
+            self.pts_budget -= dt_wall;
+            PacingDecision::Display(None)
+        } else {
+            // Not enough budget yet to afford this frame's real-time cost —
+            // skip it. `pts_budget` is left as-is (not reset to zero): the
+            // next frame's `dt_pts` adds to the same running total, so a
+            // sustained mismatch naturally settles into skipping the right
+            // proportion instead of oscillating between "reset, catch up
+            // fully" and "give up entirely".
+            PacingDecision::Skip
+        }
     }
 }
 
@@ -615,11 +742,26 @@ fn run_pipeline(rx: std_mpsc::Receiver<PipelineMsg>, latest_frame: LatestFrameSl
             .new_sample(move |sink| {
                 match pull_color_image(sink) {
                     Ok(Some((image, Some(pts_us)))) => {
-                        let delay = pacing.lock().unwrap().next_delay(pts_us, Instant::now());
-                        if let Some(delay) = delay {
-                            std::thread::sleep(delay);
+                        match pacing.lock().unwrap().decide(pts_us, Instant::now()) {
+                            PacingDecision::Display(Some(delay)) => {
+                                std::thread::sleep(delay);
+                                *sink_frame_slot.lock().unwrap() = Some(image);
+                            }
+                            PacingDecision::Display(None) => {
+                                *sink_frame_slot.lock().unwrap() = Some(image);
+                            }
+                            PacingDecision::Skip => {
+                                // Not enough accumulated pts-budget to
+                                // afford this frame's real-time cost (see
+                                // `PacingState::decide`) — decode throughput
+                                // sustainably below the sender's output
+                                // rate: drop this frame — do not write it
+                                // into the sink slot — rather than display
+                                // every decoded frame at a rate the viewer
+                                // can't sustain, which is what caused the
+                                // slow drift this mechanism replaced.
+                            }
                         }
-                        *sink_frame_slot.lock().unwrap() = Some(image);
                     }
                     Ok(Some((image, None))) => {
                         // No PTS on the decoded buffer (shouldn't normally
@@ -830,7 +972,7 @@ struct PendingAudioPacket {
 ///
 /// Deliberately a plain data enum with no GStreamer types in it, so the
 /// buffer's whole decision-making is unit-testable without a pipeline —
-/// the same trick the video pacing fix used to make [`PacingState::next_delay`]
+/// the same trick the video pacing fix used to make [`PacingState::decide`]
 /// testable. [`apply_audio_actions`] is the (trivial, untested) glue that
 /// turns these into actual GStreamer calls.
 #[derive(Debug, PartialEq, Eq)]
@@ -869,10 +1011,13 @@ enum AudioAction {
 ///
 /// The added latency, stated plainly, is **0 ms in the steady state and at
 /// most 40 ms during a loss/reorder event**, after which it returns to 0
-/// on the next in-sequence packet. For comparison, the video path's
-/// [`PACING_MAX_BEHIND`] tolerates up to 300 ms before re-basing; audio is
-/// held to a much tighter bound because lip-sync drift and audio latency
-/// are far more noticeable than a late video frame.
+/// on the next in-sequence packet. For comparison, the video path only
+/// hard-resets on a pathological single-step gap of
+/// [`PACING_HARD_STALL_GAP`] (2 seconds) — smaller, sustained lag is instead
+/// absorbed by [`PacingState`]'s pts-budget skip mechanism, trading
+/// framerate for latency; audio has no equivalent "skip" path and is held
+/// to a much tighter bound because lip-sync drift and audio latency are far
+/// more noticeable than a late (or dropped) video frame.
 ///
 /// # Bounds
 ///
@@ -1785,13 +1930,15 @@ mod tests {
     use std::time::Instant;
 
     /// First frame is always displayed immediately (no delay), and it
-    /// establishes the baseline that later frames are paced against.
+    /// establishes the `last` reference point later frames are paced
+    /// against.
     #[test]
     fn pacing_first_frame_has_no_delay() {
         let mut pacing = PacingState::new();
         let now = Instant::now();
-        assert_eq!(pacing.next_delay(1_000_000, now), None);
-        assert_eq!(pacing.base, Some((1_000_000, now)));
+        assert_eq!(pacing.decide(1_000_000, now), PacingDecision::Display(None));
+        assert_eq!(pacing.last, Some((1_000_000, now)));
+        assert_eq!(pacing.pts_budget, Duration::ZERO);
     }
 
     /// A frame whose PTS is ahead of elapsed wall-clock time (decode kept
@@ -1801,68 +1948,211 @@ mod tests {
     fn pacing_sleeps_for_frames_ahead_of_schedule() {
         let mut pacing = PacingState::new();
         let start = Instant::now();
-        assert_eq!(pacing.next_delay(0, start), None);
+        assert_eq!(pacing.decide(0, start), PacingDecision::Display(None));
 
         // Second frame is 33ms later by PTS, but only 5ms of wall-clock
         // time actually elapsed decoding it: should wait out the other 28ms.
         let now = start + Duration::from_millis(5);
-        let delay = pacing.next_delay(33_000, now).expect("frame ahead of schedule should be delayed");
-        assert_eq!(delay, Duration::from_millis(28));
-        // Delaying doesn't itself move the baseline — only a big fall-behind does.
-        assert_eq!(pacing.base, Some((0, start)));
+        assert_eq!(pacing.decide(33_000, now), PacingDecision::Display(Some(Duration::from_millis(28))));
+        assert_eq!(pacing.last, Some((33_000, now)));
     }
 
-    /// A frame whose target has already passed, but only by a small amount
-    /// (normal jitter), is displayed immediately without resetting the
-    /// baseline — this is the "on schedule or trivially behind" case.
+    /// While the viewer keeps up exactly (each frame's `dt_wall` matches
+    /// its `dt_pts`), the pts-budget never builds up a backlog and nothing
+    /// is ever skipped — this is the ordinary, common-case behavior the
+    /// skip mechanism must never disturb.
     #[test]
-    fn pacing_displays_immediately_when_slightly_behind() {
+    fn pacing_never_skips_when_perfectly_on_pace() {
         let mut pacing = PacingState::new();
         let start = Instant::now();
-        assert_eq!(pacing.next_delay(0, start), None);
+        assert_eq!(pacing.decide(0, start), PacingDecision::Display(None));
 
-        // PTS says this frame should have shown 10ms ago; well within the
-        // 300ms clamp, so no reset.
-        let now = start + Duration::from_millis(10);
-        assert_eq!(pacing.next_delay(0, now), None);
-        assert_eq!(pacing.base, Some((0, start)), "small jitter must not re-base pacing");
+        let mut now = start;
+        for i in 1..200u64 {
+            now += Duration::from_micros(16_667);
+            assert_eq!(
+                pacing.decide(i * 16_667, now),
+                PacingDecision::Display(None),
+                "frame {i}: matched rate must never skip or need to sleep"
+            );
+        }
+        assert_eq!(pacing.pts_budget, Duration::ZERO, "budget must not accumulate when perfectly on pace");
     }
 
-    /// Falling behind by more than `PACING_MAX_BEHIND` (a real stall, not
-    /// just jitter) must give up catching up and re-base on the current
-    /// frame instead of letting the gap accumulate.
+    /// An isolated moderate stall (a single decode-to-decode gap well behind
+    /// the sender's output, but nowhere near `PACING_HARD_STALL_GAP`) costs
+    /// at most one skipped frame's worth of catch-up, then playback returns
+    /// immediately to normal display — it must not turn into sustained
+    /// skipping. This replaces the old design's "an isolated badly-behind
+    /// frame must still display" test: under the pts-budget mechanism, a
+    /// single ~450ms deficit *is* worth skipping exactly one frame to pay
+    /// down (rather than silently letting the viewer sit 450ms further
+    /// behind, which the old re-base-and-still-display behavior did) — see
+    /// the module docs' "Why a hard reset alone isn't enough" section for
+    /// why that's the intended trade rather than a regression.
     #[test]
-    fn pacing_rebases_after_falling_far_behind() {
+    fn pacing_skips_isolated_moderate_stall_then_recovers() {
         let mut pacing = PacingState::new();
         let start = Instant::now();
-        assert_eq!(pacing.next_delay(0, start), None);
+        assert_eq!(pacing.decide(0, start), PacingDecision::Display(None));
 
-        // Decode stalled for 500ms (> PACING_MAX_BEHIND) while PTS only
-        // advanced 50ms: this frame's target is nearly 450ms in the past.
+        // Decode stalled for 500ms (well under PACING_HARD_STALL_GAP) while
+        // PTS only advanced 50ms: budget (50ms) can't afford the 500ms real
+        // cost, so this one frame is skipped.
         let now = start + Duration::from_millis(500);
-        assert_eq!(pacing.next_delay(50_000, now), None, "badly-behind frame must display immediately");
-        assert_eq!(pacing.base, Some((50_000, now)), "baseline must re-base to the current frame");
+        assert_eq!(pacing.decide(50_000, now), PacingDecision::Skip, "a 450ms deficit costs exactly one skip");
+
+        // Normal spacing resumes (60fps-ish, dt_pts == dt_wall): every
+        // subsequent frame must display — the single skip already paid the
+        // whole deficit down, nothing carries forward indefinitely.
+        let mut now = now;
+        let mut pts = 50_000u64;
+        for i in 0..30u64 {
+            now += Duration::from_micros(16_667);
+            pts += 16_667;
+            assert_eq!(
+                pacing.decide(pts, now),
+                PacingDecision::Display(None),
+                "frame {i} after the stall: must have fully recovered, not still paying it down"
+            );
+        }
+    }
+
+    /// A single decode-to-decode gap larger than `PACING_HARD_STALL_GAP`
+    /// (system suspend/resume, debugger pause, ...) must hard-reset the
+    /// pacer and display the frame immediately — not spend potentially
+    /// hundreds of skipped frames draining a multi-second backlog through
+    /// the ordinary pts-budget mechanism.
+    #[test]
+    fn pacing_hard_resets_after_pathological_stall_gap() {
+        let mut pacing = PacingState::new();
+        let start = Instant::now();
+        assert_eq!(pacing.decide(0, start), PacingDecision::Display(None));
+
+        let now = start + PACING_HARD_STALL_GAP + Duration::from_secs(1);
+        assert_eq!(
+            pacing.decide(16_667, now),
+            PacingDecision::Display(None),
+            "a multi-second gap must hard-reset and display immediately, not skip"
+        );
+        assert_eq!(pacing.pts_budget, Duration::ZERO, "hard reset must zero the budget");
+        assert_eq!(pacing.last, Some((16_667, now)));
     }
 
     /// A PTS discontinuity (stream restart / first keyframe after
     /// resubscribing) can make the new `pts_us` smaller than the previous
-    /// baseline's — `saturating_sub` must not panic, and once enough real
-    /// time has passed for the resulting (clamped-to-zero) target to fall
-    /// more than `PACING_MAX_BEHIND` in the past, it must trigger the same
-    /// re-base as a stall rather than being treated as merely "ahead".
+    /// frame's — `saturating_sub` must not panic — and must self-heal
+    /// (at most a single skip while the budget catches up) rather than
+    /// stalling forever or panicking.
     #[test]
-    fn pacing_rebases_on_pts_discontinuity() {
+    fn pacing_recovers_from_pts_discontinuity_without_panicking() {
         let mut pacing = PacingState::new();
         let start = Instant::now();
-        assert_eq!(pacing.next_delay(5_000_000, start), None);
+        assert_eq!(pacing.decide(5_000_000, start), PacingDecision::Display(None));
 
-        // New stream's PTS restarts near zero, far below the old baseline
-        // (saturating_sub clamps the elapsed-since-base to 0, so `target`
-        // collapses to `start`); `now` is far enough past `start` that
-        // `target` is more than PACING_MAX_BEHIND in the past.
-        let now = start + PACING_MAX_BEHIND + Duration::from_millis(50);
-        assert_eq!(pacing.next_delay(1_000, now), None);
-        assert_eq!(pacing.base, Some((1_000, now)), "discontinuity must re-base rather than panic or stall forever");
+        // New stream's PTS restarts near zero, far below the previous
+        // frame's (`saturating_sub` clamps `dt_pts` to 0 rather than
+        // panicking); a plausible resubscribe gap of 350ms elapses too.
+        let now = start + Duration::from_millis(350);
+        assert_eq!(
+            pacing.decide(1_000, now),
+            PacingDecision::Skip,
+            "zero pts progress can't afford a 350ms real-time cost"
+        );
+
+        // Normal spacing resumes immediately after.
+        let now2 = now + Duration::from_micros(16_667);
+        assert_eq!(
+            pacing.decide(1_000 + 16_667, now2),
+            PacingDecision::Display(None),
+            "must recover on the very next frame, not stall forever"
+        );
+    }
+
+    /// The scenario this whole redesign targets, using QC's exact numbers:
+    /// a 240fps sender (`dt_pts` ~= 4167us) against a viewer whose
+    /// decode/display loop only actually manages to cycle every ~8333us
+    /// (120fps-equivalent throughput). The old consecutive-rebase design
+    /// produced `skipped == 0` over 2000 such frames (the bug this test
+    /// guards against); the pts-budget accumulator must instead converge to
+    /// skipping close to the theoretical `1 - dt_pts/dt_wall == 50%`.
+    ///
+    /// The exact steady-state ratio is not asserted as an exact percentage
+    /// (a slightly different accumulator design could land at, say, 49% or
+    /// 51% and still be correct) — instead a generous-but-meaningful band
+    /// around 50% is asserted, wide enough to tolerate implementation
+    /// variance but tight enough that 0% or ~100% (both real bugs this test
+    /// must catch) fail it.
+    #[test]
+    fn pacing_settles_near_theoretical_skip_ratio_for_240fps_over_120fps_viewer() {
+        let mut pacing = PacingState::new();
+        let start = Instant::now();
+        assert_eq!(pacing.decide(0, start), PacingDecision::Display(None));
+
+        const DT_PTS: Duration = Duration::from_micros(4_167);
+        const DT_WALL: Duration = Duration::from_micros(8_333);
+        const NUM_FRAMES: u64 = 2000;
+
+        let mut now = start;
+        let mut pts = 0u64;
+        let mut skipped = 0u64;
+        let mut displayed = 0u64;
+        for _ in 0..NUM_FRAMES {
+            now += DT_WALL;
+            pts += DT_PTS.as_micros() as u64;
+            match pacing.decide(pts, now) {
+                PacingDecision::Skip => skipped += 1,
+                PacingDecision::Display(_) => displayed += 1,
+            }
+        }
+
+        assert_eq!(skipped + displayed, NUM_FRAMES);
+        let skip_fraction = skipped as f64 / NUM_FRAMES as f64;
+        assert!(
+            (0.40..=0.60).contains(&skip_fraction),
+            "expected a skip fraction near the theoretical 1 - 4167/8333 ~= 50% \
+             (proportional to the 2x rate mismatch), got {:.1}% ({skipped}/{NUM_FRAMES}) \
+             -- 0% means the trigger never engages (the original bug), ~100% means it \
+             skips everything with no recovery (the secondary bug)",
+            skip_fraction * 100.0
+        );
+    }
+
+    /// Same idea as the 240/120 test above but with a different, non-2x
+    /// ratio (300fps sender vs. a 100fps-sustained viewer, a 3x mismatch,
+    /// theoretical skip fraction `1 - 3333/10000 ~= 66.7%`) — checked so the
+    /// proportionality isn't an artifact tuned to the specific 2x case.
+    #[test]
+    fn pacing_settles_near_theoretical_skip_ratio_for_300fps_over_100fps_viewer() {
+        let mut pacing = PacingState::new();
+        let start = Instant::now();
+        assert_eq!(pacing.decide(0, start), PacingDecision::Display(None));
+
+        const DT_PTS: Duration = Duration::from_micros(3_333);
+        const DT_WALL: Duration = Duration::from_micros(10_000);
+        const NUM_FRAMES: u64 = 3000;
+
+        let mut now = start;
+        let mut pts = 0u64;
+        let mut skipped = 0u64;
+        let mut displayed = 0u64;
+        for _ in 0..NUM_FRAMES {
+            now += DT_WALL;
+            pts += DT_PTS.as_micros() as u64;
+            match pacing.decide(pts, now) {
+                PacingDecision::Skip => skipped += 1,
+                PacingDecision::Display(_) => displayed += 1,
+            }
+        }
+
+        assert_eq!(skipped + displayed, NUM_FRAMES);
+        let skip_fraction = skipped as f64 / NUM_FRAMES as f64;
+        assert!(
+            (0.55..=0.78).contains(&skip_fraction),
+            "expected a skip fraction near the theoretical 1 - 3333/10000 ~= 66.7%, \
+             got {:.1}% ({skipped}/{NUM_FRAMES})",
+            skip_fraction * 100.0
+        );
     }
 
     /// End-to-end correctness check of the *decode* half of this module,
