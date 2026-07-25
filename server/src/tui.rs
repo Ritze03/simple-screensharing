@@ -94,7 +94,7 @@ fn take_snapshot(registry: &Registry) -> Snapshot {
                 stream_id: s.stream_id,
                 label: s.label.clone(),
                 subscriber_count: s.subscribers.len(),
-                bytes_received: s.bytes_received.load(Ordering::Relaxed),
+                bytes_received: s.route.bytes_received.load(Ordering::Relaxed),
             })
             .collect();
         let log_tail = guard

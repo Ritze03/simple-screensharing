@@ -1,19 +1,68 @@
 //! Room / connection / stream state tracking (spec §10).
 //!
-//! Concurrency design: the whole registry (`HashMap<RoomId, RoomState>`) is
-//! guarded by a single `tokio::sync::RwLock`. Rooms are looked up/mutated on
-//! every control message and every media datagram/preview stream, so reads
-//! vastly outnumber writes for *finding* a room, but almost every operation
-//! inside a room also mutates something (subscriber sets, presence, caches).
-//! A single `Mutex` around the whole map would serialize unrelated rooms
-//! against each other for no reason; per-room locking would be the "more
-//! correct" design but adds real complexity for a friends-scale (<=8
-//! members/room, few rooms concurrently) hobby server. We split the
-//! difference: an outer `RwLock` for registry membership (room
-//! creation/deletion, which is rare) plus each `RoomState` wrapped in its
-//! own `tokio::sync::Mutex` for the mutations that happen on every message.
-//! This means a hot path only ever contends with other connections in the
-//! *same* room, while adding/removing whole rooms is cheap and rare.
+//! # Concurrency design
+//!
+//! Two tiers, split by how often they are touched.
+//!
+//! **Control plane — `RwLock` registry + per-room `tokio::sync::Mutex`.**
+//! The registry (`HashMap<RoomId, RoomState>`) is guarded by a
+//! `tokio::sync::RwLock`: room creation/deletion is rare, lookups are not,
+//! and a `Mutex` there would serialize unrelated rooms against each other
+//! for no reason. Inside a room, everything that mutates shared room state
+//! — presence, stream announcements, subscriber sets, the preview cache,
+//! the admin log — happens under that room's own `tokio::sync::Mutex`.
+//! Those operations are per *user action* (join, announce, subscribe,
+//! leave), i.e. a handful per minute, so a single room-wide mutex is the
+//! simplest thing that is obviously correct at friends scale (<=8
+//! members/room).
+//!
+//! **Media data plane — lock-free [`StreamRoute`] snapshots, off the room
+//! mutex entirely.** Media forwarding is *not* per user action: it runs
+//! once per **fragment**. A frame is AEAD-encrypted once and then split
+//! into ~1200-byte datagrams (spec §6.1/§6.3), so a single 60 fps sharer
+//! emits hundreds of fragments per second, and a keyframe/IDR alone can be
+//! hundreds of fragments. Each fragment previously re-acquired the
+//! room-wide async mutex and held it across the whole per-subscriber
+//! fan-out.
+//!
+//! **Why this changed:** that made lock-acquisition *volume* the
+//! bottleneck. One sharer at a high capture framerate could saturate its
+//! room's mutex, and because the lock is room-wide, it delayed every other
+//! member's control messages *and* every other sharer's media forwarding —
+//! the observed "one high-refresh-rate sharer slows down everyone else in
+//! the room" symptom. The fan-out work itself was never the problem
+//! (`quinn::Connection::send_datagram` is non-blocking); the serialization
+//! point was.
+//!
+//! So the fan-out target list for each stream is now published as an
+//! immutable snapshot in [`StreamRoute`], read without ever touching the
+//! room mutex. [`StreamState::subscribers`] remains the **authority**; the
+//! route is a derived cache, republished by [`RoomState::refresh_route`]
+//! while the room mutex is still held, on every mutation of a subscriber
+//! set. Reader/writer split:
+//!
+//! - **Readers** (per fragment, hot): clone the current `Arc<[RouteTarget]>`
+//!   and release immediately.
+//! - **Writers** (Subscribe/Unsubscribe/StopStream/leave, rare): rebuild
+//!   the whole `Vec` and swap it in, under the room mutex.
+//!
+//! **Lock ordering (why this cannot deadlock):** a route's `RwLock` is a
+//! strict *leaf*. Writers acquire it only while already holding the room
+//! mutex, readers acquire it while holding nothing at all, and no code
+//! path ever takes the room mutex (or awaits) while holding a route lock.
+//! With no cycle possible, the only ordering rule to preserve is: never
+//! reach for the room mutex from inside `StreamRoute`.
+//!
+//! **Why `std::sync::RwLock<Arc<[..]>>` and not `arc-swap` or
+//! `tokio::sync::RwLock`:** the critical section is a single `Arc` clone —
+//! it contains no `.await` and cannot block, so an async lock would buy
+//! nothing and cost a scheduler round-trip. `arc-swap` would make the read
+//! side genuinely lock-free rather than one uncontended atomic, but at a
+//! few hundred reads/sec against writers measured in per-minute user
+//! actions, that difference is unmeasurable here and not worth a new
+//! dependency for a hobby-scale server. If a future profile ever shows
+//! this read as hot, `ArcSwap<Vec<RouteTarget>>` is a drop-in replacement
+//! for the two methods on `StreamRoute`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -22,6 +71,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 use quinn::Connection;
 use tokio::sync::{Mutex, RwLock, mpsc};
+
+/// `std`'s blocking `RwLock`, used *only* for the media-route snapshot
+/// swap. Aliased to keep it visually distinct from the async
+/// `tokio::sync::RwLock` that guards the registry — mixing the two up
+/// would be a real bug, holding a blocking lock across an `.await`.
+use std::sync::RwLock as SyncRwLock;
 
 use crate::protocol::{ConnId, RelayToClient, RoomId, StreamId, StreamKind};
 
@@ -102,6 +157,83 @@ pub struct ConnState {
     pub stream_count: u8,
 }
 
+/// One resolved fan-out destination for a stream's media datagrams: the
+/// subscriber's id (for logging) plus a clone of its `quinn::Connection`
+/// handle (cheap — internally an `Arc`).
+#[derive(Clone)]
+pub struct RouteTarget {
+    pub conn_id: ConnId,
+    pub connection: Connection,
+}
+
+/// The media data plane for one stream: an immutable snapshot of the
+/// current fan-out targets plus the stream's rx byte counter.
+///
+/// Shared as `Arc<StreamRoute>` between the room (which republishes the
+/// snapshot under the room mutex) and the owning connection's media
+/// forwarder task (which reads it per fragment, holding no room lock).
+/// See the module docs for why the hot path may not touch the room mutex.
+pub struct StreamRoute {
+    /// Current fan-out targets, replaced wholesale (copy-on-write) by
+    /// [`StreamRoute::publish`]. Derived from
+    /// [`StreamState::subscribers`], which stays authoritative.
+    targets: SyncRwLock<Arc<[RouteTarget]>>,
+    /// Bytes of *incoming* media datagrams accepted for this stream
+    /// (source bitrate, before subscriber fan-out). Sampled by the TUI
+    /// once/sec for the Room Detail per-stream bandwidth readout.
+    ///
+    /// Counted by the forwarder, not by the receiving actor, so it
+    /// excludes fragments shed by a saturated media queue — i.e. it
+    /// reads as *forwarded* source bitrate. Under overload it therefore
+    /// undercounts what the sender actually put on the wire; the
+    /// process-wide `Registry::bandwidth.rx` counter is the one that
+    /// still sees every arriving byte. That difference is deliberate:
+    /// the per-stream readout is meant to reflect what the relay is
+    /// really moving.
+    pub bytes_received: AtomicU64,
+}
+
+impl StreamRoute {
+    pub fn new() -> Self {
+        Self {
+            targets: SyncRwLock::new(Arc::from(Vec::new())),
+            bytes_received: AtomicU64::new(0),
+        }
+    }
+
+    /// Take a cheap handle on the current target set. Hot path: called
+    /// once per media fragment. The lock is held only for the `Arc`
+    /// clone, never across an `.await`.
+    pub fn targets(&self) -> Arc<[RouteTarget]> {
+        self.targets
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone()
+    }
+
+    /// Publish a new target set, replacing the previous snapshot.
+    /// Callers must hold the room mutex so this stays consistent with
+    /// the authoritative `subscribers` set.
+    ///
+    /// A fragment already past its `targets()` read may still be
+    /// delivered to a target removed by this call. That is unavoidable
+    /// (and harmless): even the old room-mutex design could not recall a
+    /// datagram already handed to quinn, and a stale send just returns
+    /// `Err` on a closed connection, which the forwarder ignores.
+    pub fn publish(&self, targets: Vec<RouteTarget>) {
+        *self
+            .targets
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = Arc::from(targets);
+    }
+}
+
+impl Default for StreamRoute {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub struct StreamState {
     pub owner: ConnId,
     pub stream_id: StreamId,
@@ -109,11 +241,14 @@ pub struct StreamState {
     pub label: String,
     pub width: u16,
     pub height: u16,
+    /// Authoritative subscriber set. **Every** mutation of this set must
+    /// be followed by [`RoomState::refresh_route`] for this stream while
+    /// the room mutex is still held, or the data plane will keep using a
+    /// stale fan-out snapshot.
     pub subscribers: HashSet<ConnId>,
-    /// Total bytes of *incoming* media datagrams received for this
-    /// stream (source bitrate, before subscriber fan-out). Sampled by
-    /// the TUI once/sec for the Room Detail per-stream bandwidth readout.
-    pub bytes_received: AtomicU64,
+    /// Data-plane handle for this stream (fan-out snapshot + rx counter),
+    /// shared with the owner's media forwarder task.
+    pub route: Arc<StreamRoute>,
     /// Opaque cached ciphertext of the most recent preview blob for this
     /// stream (§7.2), including the 15-byte cleartext header — replayed
     /// verbatim to newcomers and never decrypted.
@@ -153,6 +288,34 @@ impl RoomState {
             }
             let _ = conn.control_tx.send(msg.clone());
         }
+    }
+
+    /// Recompute and publish the media fan-out snapshot for one stream
+    /// from its authoritative `subscribers` set.
+    ///
+    /// Call this — still holding the room mutex — after *any* mutation of
+    /// that set (Subscribe, Unsubscribe, a member leaving). Resolving
+    /// `ConnId -> Connection` here, under the lock, is what lets the
+    /// forwarding path skip the room mutex entirely. Subscribers with no
+    /// live `ConnState` are skipped, matching the old inline
+    /// `connections.get(sub)` lookup.
+    ///
+    /// No-op for an unknown stream (already stopped/removed) — the caller
+    /// that removed it is responsible for having emptied its route.
+    pub fn refresh_route(&self, key: (ConnId, StreamId)) {
+        let Some(stream) = self.streams.get(&key) else {
+            return;
+        };
+        let targets: Vec<RouteTarget> = stream
+            .subscribers
+            .iter()
+            .filter_map(|sub| self.connections.get(sub))
+            .map(|c| RouteTarget {
+                conn_id: c.conn_id,
+                connection: c.connection.clone(),
+            })
+            .collect();
+        stream.route.publish(targets);
     }
 
     /// Send a `RelayToClient` message to exactly one connection, if it's
