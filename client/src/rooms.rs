@@ -77,19 +77,80 @@ impl RoomStore {
     }
 }
 
-/// Minimal app-wide settings, currently just the UI language. Kept in its
-/// own small TOML file alongside `rooms.toml` rather than folded into
-/// `RoomStore` — a language preference isn't a saved room, and this keeps
-/// each file's schema focused.
+/// Which `wgpu::PresentMode` the eframe/wgpu render surface is configured
+/// with. See `superdoc/features/presentation-modes.md` for the full
+/// rationale, including the runtime-vs-restart constraint this settings
+/// value has to work around.
+///
+/// Its own small enum rather than storing `wgpu::PresentMode` directly:
+/// keeps this module's persisted TOML schema stable even across a future
+/// `wgpu` upgrade that renames/reorders its variants, and avoids needing
+/// `wgpu`'s `serde` feature for three values.
+///
+/// Limited to the three modes documented as available everywhere
+/// (`AutoVsync`/`Immediate`/`Mailbox`) rather than exposing every
+/// `wgpu::PresentMode` variant — `Immediate`/`Mailbox` already fall back to
+/// `Fifo` at surface-configure time on a backend that doesn't support them
+/// (see `to_wgpu`), so there's no reason to also offer `Fifo`/`FifoRelaxed`/
+/// `AutoNoVsync` as separate user-facing choices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PresentationMode {
+    /// Vsync-locked to the display refresh rate, no tearing — today's
+    /// implicit behavior (egui-wgpu's own default), kept as the default here
+    /// too so a user who never touches the setting sees no change.
+    #[default]
+    AutoVsync,
+    /// No vsync ceiling: submits frames as soon as they're ready, may tear.
+    Immediate,
+    /// No vsync ceiling, no tearing: swaps into a single-slot buffer instead
+    /// of waiting for the next vblank rather than queuing several frames.
+    Mailbox,
+}
+
+impl PresentationMode {
+    pub const ALL: [PresentationMode; 3] = [Self::AutoVsync, Self::Immediate, Self::Mailbox];
+
+    /// Human-readable label for the presentation-mode dropdown.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::AutoVsync => "Vsync (default)",
+            Self::Immediate => "Immediate (no vsync)",
+            Self::Mailbox => "Mailbox (no vsync, no tearing)",
+        }
+    }
+
+    /// The actual `wgpu::PresentMode` to configure the render surface with.
+    /// `Immediate`/`Mailbox` aren't guaranteed on every backend, but `wgpu`
+    /// itself falls back to `Fifo` at `Surface::configure()` time for a mode
+    /// missing from `SurfaceCapabilities::present_modes`, so no fallback
+    /// logic is needed on this side.
+    pub fn to_wgpu(self) -> wgpu::PresentMode {
+        match self {
+            Self::AutoVsync => wgpu::PresentMode::AutoVsync,
+            Self::Immediate => wgpu::PresentMode::Immediate,
+            Self::Mailbox => wgpu::PresentMode::Mailbox,
+        }
+    }
+}
+
+/// Minimal app-wide settings: UI language and the render presentation mode.
+/// Kept in its own small TOML file alongside `rooms.toml` rather than folded
+/// into `RoomStore` — neither is a saved room, and this keeps each file's
+/// schema focused.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     #[serde(default = "AppSettings::default_language")]
     pub language: String,
+    /// Read once at startup and passed into `NativeOptions.wgpu_options` in
+    /// `main.rs` — changing it takes effect on the next launch, not live.
+    /// See `superdoc/features/presentation-modes.md`.
+    #[serde(default)]
+    pub presentation_mode: PresentationMode,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
-        Self { language: Self::default_language() }
+        Self { language: Self::default_language(), presentation_mode: PresentationMode::default() }
     }
 }
 
@@ -157,11 +218,37 @@ mod tests {
         assert_eq!(AppSettings::default().language, "en");
     }
 
+    /// Load-bearing for "no change for users who never touch the setting":
+    /// the default presentation mode must match egui-wgpu's own default.
+    #[test]
+    fn app_settings_defaults_to_vsync() {
+        assert_eq!(AppSettings::default().presentation_mode, PresentationMode::AutoVsync);
+    }
+
     #[test]
     fn app_settings_toml_round_trip() {
-        let settings = AppSettings { language: "de".to_string() };
+        let settings =
+            AppSettings { language: "de".to_string(), presentation_mode: PresentationMode::Mailbox };
         let toml_str = toml::to_string_pretty(&settings).unwrap();
         let parsed: AppSettings = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.language, "de");
+        assert_eq!(parsed.presentation_mode, PresentationMode::Mailbox);
+    }
+
+    /// A settings file written before this field existed (just `language =
+    /// "..."`) must still parse, defaulting the new field rather than
+    /// failing to load — the same missing-field tolerance `#[serde(default)]`
+    /// already gives `language` itself.
+    #[test]
+    fn app_settings_missing_presentation_mode_defaults() {
+        let parsed: AppSettings = toml::from_str("language = \"de\"\n").unwrap();
+        assert_eq!(parsed.presentation_mode, PresentationMode::AutoVsync);
+    }
+
+    #[test]
+    fn presentation_mode_to_wgpu_maps_expected_variants() {
+        assert_eq!(PresentationMode::AutoVsync.to_wgpu(), wgpu::PresentMode::AutoVsync);
+        assert_eq!(PresentationMode::Immediate.to_wgpu(), wgpu::PresentMode::Immediate);
+        assert_eq!(PresentationMode::Mailbox.to_wgpu(), wgpu::PresentMode::Mailbox);
     }
 }
