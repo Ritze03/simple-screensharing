@@ -47,6 +47,7 @@ share.stop_button: "Stop Sharing"
 share.stop_audio_button: "Stop Sharing Audio"
 share.error: "Share error: %{error}"
 share.fps_label: "%{fps} fps"
+share.self_preview_label: "Your preview"
 
 streams.header: "Streams"
 streams.watch_error: "Watch error: %{error}"

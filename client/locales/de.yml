@@ -47,6 +47,7 @@ share.stop_button: "Freigabe beenden"
 share.stop_audio_button: "Audiofreigabe beenden"
 share.error: "Fehler bei der Freigabe: %{error}"
 share.fps_label: "%{fps} fps"
+share.self_preview_label: "Ihre Vorschau"
 
 streams.header: "Streams"
 streams.watch_error: "Fehler beim Ansehen: %{error}"
