@@ -22,7 +22,8 @@ use crate::capture::{self, CaptureHandle};
 use crate::decode::{self, AudioDecoder, PreviewCache, StreamDecoder};
 use crate::net::{ClientEvent, PresenceSnapshotState, ScreenshareClient};
 use crate::protocol::{ConnId, Member, PresenceEvent, StreamId, StreamInfo, StreamKind};
-use crate::rooms::RoomStore;
+use crate::rooms::{AppSettings, PresentationMode, RoomStore};
+use crate::theme;
 
 type ConnectResult = Result<(ScreenshareClient, PresenceSnapshotState, mpsc::UnboundedReceiver<ClientEvent>), String>;
 
@@ -31,6 +32,15 @@ const DEFAULT_BITRATE_KBPS: u32 = 8000;
 /// Slider bounds, matching the project's 40 Mbit/s ceiling.
 const MIN_BITRATE_KBPS: u32 = 1000;
 const MAX_BITRATE_KBPS: u32 = 40000;
+
+/// Idle-fallback repaint cadence while connecting/connected but nothing
+/// needs a faster one (see `eframe::App::update`'s use of this constant).
+const IDLE_REPAINT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+/// Repaint cadence used instead of `IDLE_REPAINT_INTERVAL` — and instead of
+/// a watched stream's full-rate `ctx.request_repaint()` — whenever the
+/// window has lost OS focus, regardless of the selected `PresentationMode`.
+/// See `superdoc/features/presentation-modes.md`'s "Why" note on this.
+const UNFOCUSED_REPAINT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Default capture framerate, preselected on the framerate dropdown —
 /// mirrors `capture::DEFAULT_FRAMERATE` (kept as a local constant, like
@@ -210,6 +220,17 @@ pub struct App {
     /// than re-reading `rust_i18n::locale()` each frame) so the language
     /// `ComboBox` has a plain `&mut String` to bind to.
     language: String,
+    /// Current `presentation_mode` selection, bound to the presentation-mode
+    /// dropdown and persisted immediately on change. Only takes effect on
+    /// the *next* launch (`main.rs` reads it once at startup and passes it
+    /// into `NativeOptions.wgpu_options`) — see
+    /// `superdoc/features/presentation-modes.md`.
+    presentation_mode: PresentationMode,
+    /// The presentation mode that was actually active when this window was
+    /// created (i.e. what was persisted at launch, before any in-session
+    /// change). Compared against `presentation_mode` to show a "restart to
+    /// apply" hint only once the two diverge.
+    launch_presentation_mode: PresentationMode,
 }
 
 impl Default for App {
@@ -218,8 +239,8 @@ impl Default for App {
             Ok(store) => (store, None),
             Err(e) => (RoomStore::default(), Some(e.to_string())),
         };
-        let language = crate::rooms::AppSettings::load().language;
-        rust_i18n::set_locale(&language);
+        let settings = AppSettings::load();
+        rust_i18n::set_locale(&settings.language);
         Self {
             join_string: String::new(),
             display_name: whoami_fallback(),
@@ -228,18 +249,38 @@ impl Default for App {
             connected: None,
             room_store,
             room_store_error,
-            language,
+            language: settings.language,
+            presentation_mode: settings.presentation_mode,
+            launch_presentation_mode: settings.presentation_mode,
         }
     }
 }
 
 /// Persist the current language choice, logging (not panicking) on failure —
-/// losing the language preference across restarts is a minor inconvenience,
+/// losing a settings preference across restarts is a minor inconvenience,
 /// not worth surfacing as a UI error.
+///
+/// Loads the existing settings file first rather than constructing a fresh
+/// `AppSettings` from just `language`: `AppSettings` now also carries
+/// `presentation_mode`, and building a literal with only `language` set
+/// would silently reset that field to its default every time the language
+/// toggle is touched.
 fn save_language(language: &str) {
-    let settings = crate::rooms::AppSettings { language: language.to_string() };
+    let mut settings = AppSettings::load();
+    settings.language = language.to_string();
     if let Err(e) = settings.save() {
         tracing::warn!("failed to save language preference: {e:#}");
+    }
+}
+
+/// Persist the current presentation-mode choice. Mirrors `save_language`'s
+/// load-modify-save shape for the same reason: don't clobber the sibling
+/// setting.
+fn save_presentation_mode(mode: PresentationMode) {
+    let mut settings = AppSettings::load();
+    settings.presentation_mode = mode;
+    if let Err(e) = settings.save() {
+        tracing::warn!("failed to save presentation mode preference: {e:#}");
     }
 }
 
@@ -731,10 +772,10 @@ impl Connected {
         // them.
         let mut to_unpop: Vec<(ConnId, StreamId)> = Vec::new();
         for (key, entry) in self.watches.iter() {
-            if let Some(popout) = &entry.popout {
-                if popout.close_requested.load(Ordering::Relaxed) {
-                    to_unpop.push(*key);
-                }
+            if let Some(popout) = &entry.popout
+                && popout.close_requested.load(Ordering::Relaxed)
+            {
+                to_unpop.push(*key);
             }
         }
         for key in to_unpop {
@@ -916,494 +957,541 @@ impl App {
         }
     }
 
-    /// Small "English"/"Deutsch" language switcher. Language names are
+    /// Global settings card: the "English"/"Deutsch" language switcher and
+    /// the render presentation-mode dropdown. Language names are
     /// deliberately left untranslated (a language selector conventionally
     /// shows each option in its own language, e.g. "Deutsch" rather than
     /// "German" while in English mode) so a user can always find their way
     /// back regardless of the current locale.
-    fn ui_language_toggle(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(t!("settings.language_label").to_string());
-            let mut changed = false;
-            if ui.selectable_label(self.language == "en", "English").clicked() && self.language != "en" {
-                self.language = "en".to_string();
-                changed = true;
-            }
-            if ui.selectable_label(self.language == "de", "Deutsch").clicked() && self.language != "de" {
-                self.language = "de".to_string();
-                changed = true;
-            }
-            if changed {
-                rust_i18n::set_locale(&self.language);
-                save_language(&self.language);
-            }
+    ///
+    /// Both settings are global (not per-stream/per-room), which is why
+    /// this card lives on the join screen rather than anywhere inside a
+    /// connected session.
+    fn ui_settings_card(&mut self, ui: &mut egui::Ui) {
+        theme::card(ui, t!("settings.header").as_ref(), |ui| {
+            theme::setting_row(ui, t!("settings.language_label").as_ref(), |ui| {
+                let mut changed = false;
+                if ui.selectable_label(self.language == "en", "English").clicked() && self.language != "en" {
+                    self.language = "en".to_string();
+                    changed = true;
+                }
+                if ui.selectable_label(self.language == "de", "Deutsch").clicked() && self.language != "de" {
+                    self.language = "de".to_string();
+                    changed = true;
+                }
+                if changed {
+                    rust_i18n::set_locale(&self.language);
+                    save_language(&self.language);
+                }
+            });
+
+            theme::setting_row(ui, t!("settings.presentation_mode_label").as_ref(), |ui| {
+                let mut changed = false;
+                egui::ComboBox::from_id_salt("presentation_mode_combo")
+                    .selected_text(self.presentation_mode.label())
+                    .show_ui(ui, |ui| {
+                        for mode in PresentationMode::ALL {
+                            if ui.selectable_value(&mut self.presentation_mode, mode, mode.label()).changed() {
+                                changed = true;
+                            }
+                        }
+                    });
+                if changed {
+                    save_presentation_mode(self.presentation_mode);
+                }
+                // Runtime present-mode swap isn't available with this pinned
+                // eframe/egui-wgpu (see superdoc/features/presentation-modes.md):
+                // the surface is only ever configured once, at window
+                // creation. Surface this as an inline hint rather than
+                // silently doing nothing until the next launch.
+                if self.presentation_mode != self.launch_presentation_mode {
+                    ui.label(egui::RichText::new(t!("settings.presentation_mode_restart_hint").to_string()).color(theme::TEXT_FAINT).italics());
+                }
+            });
         });
     }
 
     fn ui_join_screen(&mut self, ui: &mut egui::Ui) {
-        self.ui_language_toggle(ui);
-        ui.add_space(4.0);
+        egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
+            ui.set_max_width(theme::PANEL_MAX_WIDTH);
+            ui.spacing_mut().item_spacing.y = 0.0;
 
-        ui.heading(t!("app.title").to_string());
-        ui.add_space(8.0);
+            ui.heading(egui::RichText::new(t!("app.title").to_string()).color(theme::TEXT));
+            ui.add_space(theme::SPACING);
 
-        ui.label(t!("join.display_name_label").to_string());
-        ui.text_edit_singleline(&mut self.display_name);
-        ui.add_space(4.0);
+            self.ui_settings_card(ui);
 
-        ui.label(t!("join.link_label").to_string());
-        ui.text_edit_singleline(&mut self.join_string);
-        ui.add_space(8.0);
-
-        let connecting = matches!(self.status, Status::Connecting);
-        ui.add_enabled_ui(!connecting && !self.join_string.trim().is_empty(), |ui| {
-            if ui.button(t!("join.button").to_string()).clicked() {
-                self.start_connect();
-            }
-        });
-
-        match &self.status {
-            Status::Idle => {}
-            Status::Connecting => {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(t!("join.connecting").to_string());
+            theme::card(ui, t!("join.button").as_ref(), |ui| {
+                theme::setting_row(ui, t!("join.display_name_label").as_ref(), |ui| {
+                    ui.text_edit_singleline(&mut self.display_name);
                 });
-            }
-            Status::Error(e) => {
-                ui.colored_label(egui::Color32::RED, t!("join.error", error = e).to_string());
-            }
-        }
+                theme::setting_row(ui, t!("join.link_label").as_ref(), |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.join_string).desired_width(ui.available_width()));
+                });
 
-        ui.add_space(12.0);
-        ui.separator();
-        ui.label(t!("join.saved_lounges").to_string());
-        if let Some(err) = &self.room_store_error {
-            ui.colored_label(egui::Color32::RED, t!("join.load_error", error = err).to_string());
-        }
-        if self.room_store.rooms.is_empty() {
-            ui.label(t!("join.no_saved_rooms").to_string());
-        } else {
-            let mut to_join: Option<String> = None;
-            let mut to_remove: Option<String> = None;
-            for room in &self.room_store.rooms {
-                ui.horizontal(|ui| {
-                    ui.label(&room.name);
-                    if ui.small_button(t!("join.button").to_string()).clicked() {
-                        to_join = Some(room.join_string.clone());
-                    }
-                    if ui.small_button(t!("rooms.remove_button").to_string()).clicked() {
-                        to_remove = Some(room.name.clone());
+                let connecting = matches!(self.status, Status::Connecting);
+                ui.add_enabled_ui(!connecting && !self.join_string.trim().is_empty(), |ui| {
+                    if ui.add(theme::primary_button(t!("join.button").to_string())).clicked() {
+                        self.start_connect();
                     }
                 });
-            }
-            if let Some(join_string) = to_join {
-                self.join_string = join_string;
-                self.start_connect();
-            }
-            if let Some(name) = to_remove {
-                self.room_store.remove(&name);
-                if let Err(e) = self.room_store.save() {
-                    self.room_store_error = Some(e.to_string());
+
+                match &self.status {
+                    Status::Idle => {}
+                    Status::Connecting => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(t!("join.connecting").to_string());
+                        });
+                    }
+                    Status::Error(e) => {
+                        ui.colored_label(theme::DANGER, t!("join.error", error = e).to_string());
+                    }
                 }
-            }
-        }
+            });
+
+            theme::card(ui, t!("join.saved_lounges").as_ref(), |ui| {
+                if let Some(err) = &self.room_store_error {
+                    ui.colored_label(theme::DANGER, t!("join.load_error", error = err).to_string());
+                }
+                if self.room_store.rooms.is_empty() {
+                    ui.label(egui::RichText::new(t!("join.no_saved_rooms").to_string()).color(theme::TEXT_FAINT));
+                } else {
+                    let mut to_join: Option<String> = None;
+                    let mut to_remove: Option<String> = None;
+                    for room in &self.room_store.rooms {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(&room.name).color(theme::TEXT));
+                            if ui.add(theme::secondary_button(t!("join.button").to_string())).clicked() {
+                                to_join = Some(room.join_string.clone());
+                            }
+                            if ui.add(theme::danger_button(t!("rooms.remove_button").to_string())).clicked() {
+                                to_remove = Some(room.name.clone());
+                            }
+                        });
+                    }
+                    if let Some(join_string) = to_join {
+                        self.join_string = join_string;
+                        self.start_connect();
+                    }
+                    if let Some(name) = to_remove {
+                        self.room_store.remove(&name);
+                        if let Err(e) = self.room_store.save() {
+                            self.room_store_error = Some(e.to_string());
+                        }
+                    }
+                }
+            });
+        });
     }
 
     fn ui_connected_screen(&mut self, ui: &mut egui::Ui) {
         let Some(connected) = &mut self.connected else { return };
 
-        ui.heading(t!("app.title").to_string());
-        ui.label(t!(
-            "connected.status",
-            name = self.display_name,
-            conn_id = format!("{:016x}", connected.client.conn_id())
-        ).to_string());
-        ui.add_space(8.0);
+        ui.heading(egui::RichText::new(t!("app.title").to_string()).color(theme::TEXT));
+        ui.label(
+            egui::RichText::new(
+                t!(
+                    "connected.status",
+                    name = self.display_name,
+                    conn_id = format!("{:016x}", connected.client.conn_id())
+                )
+                .to_string(),
+            )
+            .color(theme::TEXT_DIM),
+        );
+        ui.add_space(theme::SPACING);
 
+        // A single control row, not its own card: one field plus one button
+        // doesn't need card ceremony (see STYLING-GUIDE.md's card guidance —
+        // cards are for *grouping* related controls).
         ui.horizontal(|ui| {
-            ui.label(t!("rooms.save_label").to_string());
+            ui.label(egui::RichText::new(t!("rooms.save_label").to_string()).color(theme::TEXT));
             ui.text_edit_singleline(&mut connected.save_name);
             let can_save = !connected.save_name.trim().is_empty();
-            if ui.add_enabled(can_save, egui::Button::new(t!("rooms.save_button").to_string())).clicked() {
-                self.room_store.upsert(connected.save_name.clone(), self.join_string.clone());
-                if let Err(e) = self.room_store.save() {
-                    self.room_store_error = Some(e.to_string());
-                } else {
-                    connected.saved = true;
+            ui.add_enabled_ui(can_save, |ui| {
+                if ui.add(theme::secondary_button(t!("rooms.save_button").to_string())).clicked() {
+                    self.room_store.upsert(connected.save_name.clone(), self.join_string.clone());
+                    if let Err(e) = self.room_store.save() {
+                        self.room_store_error = Some(e.to_string());
+                    } else {
+                        connected.saved = true;
+                    }
                 }
-            }
+            });
         });
         if connected.saved {
-            ui.colored_label(egui::Color32::GREEN, t!("rooms.saved_confirmation").to_string());
+            ui.colored_label(theme::SUCCESS, t!("rooms.saved_confirmation").to_string());
         }
+        ui.add_space(theme::SPACING);
 
-        ui.add_space(12.0);
-        ui.separator();
-        ui.label(t!("members.header", count = connected.members.len()).to_string());
-        egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
-            // Show all members, not just streamers (spec §8/§4.2: a lurker
-            // with stream_count == 0 still appears in the roster).
-            for member in &connected.members {
-                ui.horizontal(|ui| {
-                    if member.stream_count > 0 {
-                        ui.colored_label(egui::Color32::from_rgb(80, 200, 120), "\u{25cf}");
-                        let key = if member.stream_count == 1 { "members.stream_singular" } else { "members.stream_plural" };
-                        ui.label(t!(key, name = member.display_name, count = member.stream_count).to_string());
-                    } else {
-                        ui.colored_label(egui::Color32::GRAY, "\u{25cb}");
-                        ui.label(&member.display_name);
-                    }
-                });
-            }
-        });
-
-        ui.add_space(12.0);
-        ui.separator();
-        ui.label(t!("share.video_header").to_string());
-        ui.horizontal(|ui| {
-            ui.label(t!("share.bitrate_label").to_string());
-            ui.add(egui::Slider::new(&mut connected.bitrate_kbps, MIN_BITRATE_KBPS..=MAX_BITRATE_KBPS));
-        });
-        ui.horizontal(|ui| {
-            ui.label(t!("share.framerate_label").to_string());
-            egui::ComboBox::from_id_salt("framerate_combo")
-                .selected_text(format!("{} fps", connected.framerate))
-                .show_ui(ui, |ui| {
-                    for &fps in &FRAMERATE_OPTIONS {
-                        ui.selectable_value(&mut connected.framerate, fps, format!("{fps} fps"));
-                    }
-                });
-        });
-        ui.horizontal(|ui| {
-            // Always enabled: clicking again while a video share is already
-            // active starts *another* one (a second stream_id), re-prompting
-            // the OS portal picker so the user can pick a different
-            // monitor/window.
-            if ui.button(t!("share.screen_button").to_string()).clicked() {
-                connected.start_video_share();
-            }
-            let starting_video = connected
-                .active_shares
-                .values()
-                .any(|s| s.kind == StreamKind::Video && matches!(s.status, ShareStatus::Starting(_)));
-            if starting_video {
-                ui.spinner();
-                ui.label(t!("share.waiting_permission").to_string());
-            }
-        });
-
-        ui.add_space(12.0);
-        ui.separator();
-        ui.label(t!("share.audio_header").to_string());
-        ui.horizontal(|ui| {
-            if !connected.audio_sources_requested {
-                connected.audio_sources_requested = true;
-                connected.refresh_audio_sources();
-            }
-            if ui.button(t!("share.refresh_button").to_string()).clicked() {
-                connected.refresh_audio_sources();
-            }
-            if connected.audio_sources_rx.is_some() {
-                ui.spinner();
-            }
-        });
-        ui.horizontal(|ui| {
-            let placeholder = t!("share.select_source_placeholder").to_string();
-            let selected_text = connected
-                .selected_audio_source
-                .as_ref()
-                .map(|s| s.name.as_str())
-                .unwrap_or(placeholder.as_str());
-            egui::ComboBox::from_label(t!("share.source_label").to_string())
-                .selected_text(selected_text)
-                .show_ui(ui, |ui| {
-                    for source in &connected.audio_sources {
-                        let selected = connected.selected_audio_source.as_ref() == Some(source);
-                        if ui.selectable_label(selected, &source.name).clicked() {
-                            connected.selected_audio_source = Some(source.clone());
-                        }
-                    }
-                });
-            let can_share_audio = connected.selected_audio_source.is_some();
-            if ui.add_enabled(can_share_audio, egui::Button::new(t!("share.audio_button").to_string())).clicked() {
-                connected.start_audio_share();
-            }
-        });
-        if connected.audio_sources.is_empty() && connected.audio_sources_rx.is_none() {
-            ui.label(t!("share.no_audio_sources").to_string());
-        }
-        if let Some(err) = &connected.audio_sources_error {
-            ui.colored_label(egui::Color32::RED, t!("share.audio_sources_error", error = err).to_string());
-        }
-
-        ui.add_space(12.0);
-        ui.separator();
-        ui.label(t!("share.active_header").to_string());
-        if connected.active_shares.is_empty() {
-            ui.label(t!("share.none").to_string());
-        } else {
-            let mut stream_ids: Vec<StreamId> = connected.active_shares.keys().copied().collect();
-            stream_ids.sort_unstable();
-            let mut to_stop = Vec::new();
-            for stream_id in stream_ids {
-                let share = &connected.active_shares[&stream_id];
-                let kind_label = match share.kind {
-                    StreamKind::Video => t!("share.kind_video").to_string(),
-                    StreamKind::Audio => t!("share.kind_audio").to_string(),
-                };
-                let (state_label, stoppable) = match &share.status {
-                    ShareStatus::Starting(_) => (t!("share.state_starting").to_string(), false),
-                    ShareStatus::Active(_) => (t!("share.state_active").to_string(), true),
-                    ShareStatus::Stopping(_) => (t!("share.state_stopping").to_string(), false),
-                };
-                ui.horizontal(|ui| {
-                    ui.label(
-                        t!(
-                            "share.active_line",
-                            stream_id = stream_id,
-                            kind = kind_label,
-                            label = share.label.clone(),
-                            state = state_label
-                        )
-                        .to_string(),
-                    );
-                    let stop_label = if share.kind == StreamKind::Audio {
-                        t!("share.stop_audio_button").to_string()
-                    } else {
-                        t!("share.stop_button").to_string()
-                    };
-                    if ui.add_enabled(stoppable, egui::Button::new(stop_label)).clicked() {
-                        to_stop.push(stream_id);
-                    }
-                    // Sharer-side live encode rate: the encoder branch's
-                    // actual output framerate (see `CaptureHandle::encoder_fps`),
-                    // confirming the configured framerate is really being
-                    // hit rather than just selected in the UI. Video shares
-                    // only — audio has no comparable per-frame rate.
-                    if let ShareStatus::Active(ShareHandle::Video(handle)) = &share.status {
-                        ui.label(t!("share.fps_label", fps = handle.encoder_fps()).to_string());
-                    }
-                });
-            }
-            for stream_id in to_stop {
-                connected.stop_share(stream_id);
-            }
-        }
-        if let Some(err) = &connected.share_error {
-            ui.colored_label(egui::Color32::RED, t!("share.error", error = err).to_string());
-        }
-
-        ui.add_space(12.0);
-        ui.separator();
-        ui.label(t!("streams.header").to_string());
-        if let Some(err) = &connected.watch_error {
-            ui.colored_label(egui::Color32::RED, t!("streams.watch_error", error = err).to_string());
-        }
-        if connected.streams.is_empty() {
-            ui.label(t!("streams.none_active").to_string());
-        } else {
-            let mut to_toggle: Option<(ConnId, StreamId)> = None;
-            let mut to_pop_out: Option<(ConnId, StreamId)> = None;
-            let mut to_toggle_listen: Option<(ConnId, StreamId)> = None;
-            let unknown_owner = t!("streams.unknown_owner").to_string();
-            for info in &connected.streams {
-                let key = (info.owner, info.stream_id);
-                let owner_name = connected
-                    .members
-                    .iter()
-                    .find(|m| m.conn_id == info.owner)
-                    .map(|m| m.display_name.as_str())
-                    .unwrap_or(unknown_owner.as_str());
-
-                if info.kind == StreamKind::Audio {
-                    // A sender with video gets their audio auto-subscribed
-                    // via the video row's Watch button (see
-                    // `Connected::toggle_watch`) — only an audio-only sender
-                    // (no video announced) gets its own "Listen" row here.
-                    if connected.owner_has_video(info.owner) {
-                        continue;
-                    }
-                    let listening = connected.audio_watches.contains_key(&key);
+        theme::card(ui, t!("members.header", count = connected.members.len()).as_ref(), |ui| {
+            egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+                // Show all members, not just streamers (spec §8/§4.2: a
+                // lurker with stream_count == 0 still appears in the
+                // roster).
+                for member in &connected.members {
                     ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
+                        if member.stream_count > 0 {
+                            ui.colored_label(theme::SUCCESS, "\u{25cf}");
+                            let key = if member.stream_count == 1 { "members.stream_singular" } else { "members.stream_plural" };
                             ui.label(
+                                egui::RichText::new(t!(key, name = member.display_name, count = member.stream_count).to_string())
+                                    .color(theme::TEXT),
+                            );
+                        } else {
+                            ui.colored_label(theme::TEXT_FAINT, "\u{25cb}");
+                            ui.label(egui::RichText::new(&member.display_name).color(theme::TEXT_DIM));
+                        }
+                    });
+                }
+            });
+        });
+
+        theme::card(ui, t!("share.video_header").as_ref(), |ui| {
+            theme::slider_row(ui, t!("share.bitrate_label").as_ref(), &mut connected.bitrate_kbps, MIN_BITRATE_KBPS..=MAX_BITRATE_KBPS, 50.0, " kbps");
+            theme::setting_row(ui, t!("share.framerate_label").as_ref(), |ui| {
+                egui::ComboBox::from_id_salt("framerate_combo")
+                    .selected_text(format!("{} fps", connected.framerate))
+                    .show_ui(ui, |ui| {
+                        for &fps in &FRAMERATE_OPTIONS {
+                            ui.selectable_value(&mut connected.framerate, fps, format!("{fps} fps"));
+                        }
+                    });
+            });
+            ui.horizontal(|ui| {
+                // Always enabled: clicking again while a video share is
+                // already active starts *another* one (a second stream_id),
+                // re-prompting the OS portal picker so the user can pick a
+                // different monitor/window.
+                if ui.add(theme::primary_button(t!("share.screen_button").to_string())).clicked() {
+                    connected.start_video_share();
+                }
+                let starting_video = connected
+                    .active_shares
+                    .values()
+                    .any(|s| s.kind == StreamKind::Video && matches!(s.status, ShareStatus::Starting(_)));
+                if starting_video {
+                    ui.spinner();
+                    ui.label(egui::RichText::new(t!("share.waiting_permission").to_string()).color(theme::TEXT_DIM));
+                }
+            });
+        });
+
+        theme::card(ui, t!("share.audio_header").as_ref(), |ui| {
+            ui.horizontal(|ui| {
+                if !connected.audio_sources_requested {
+                    connected.audio_sources_requested = true;
+                    connected.refresh_audio_sources();
+                }
+                if ui.add(theme::secondary_button(t!("share.refresh_button").to_string())).clicked() {
+                    connected.refresh_audio_sources();
+                }
+                if connected.audio_sources_rx.is_some() {
+                    ui.spinner();
+                }
+            });
+            ui.horizontal(|ui| {
+                let placeholder = t!("share.select_source_placeholder").to_string();
+                let selected_text = connected
+                    .selected_audio_source
+                    .as_ref()
+                    .map(|s| s.name.as_str())
+                    .unwrap_or(placeholder.as_str());
+                egui::ComboBox::from_label(t!("share.source_label").to_string())
+                    .selected_text(selected_text)
+                    .show_ui(ui, |ui| {
+                        for source in &connected.audio_sources {
+                            let selected = connected.selected_audio_source.as_ref() == Some(source);
+                            if ui.selectable_label(selected, &source.name).clicked() {
+                                connected.selected_audio_source = Some(source.clone());
+                            }
+                        }
+                    });
+                let can_share_audio = connected.selected_audio_source.is_some();
+                ui.add_enabled_ui(can_share_audio, |ui| {
+                    if ui.add(theme::primary_button(t!("share.audio_button").to_string())).clicked() {
+                        connected.start_audio_share();
+                    }
+                });
+            });
+            if connected.audio_sources.is_empty() && connected.audio_sources_rx.is_none() {
+                ui.label(egui::RichText::new(t!("share.no_audio_sources").to_string()).color(theme::TEXT_FAINT));
+            }
+            if let Some(err) = &connected.audio_sources_error {
+                ui.colored_label(theme::DANGER, t!("share.audio_sources_error", error = err).to_string());
+            }
+        });
+
+        theme::card(ui, t!("share.active_header").as_ref(), |ui| {
+            if connected.active_shares.is_empty() {
+                ui.label(egui::RichText::new(t!("share.none").to_string()).color(theme::TEXT_FAINT));
+            } else {
+                let mut stream_ids: Vec<StreamId> = connected.active_shares.keys().copied().collect();
+                stream_ids.sort_unstable();
+                let mut to_stop = Vec::new();
+                for stream_id in stream_ids {
+                    let share = &connected.active_shares[&stream_id];
+                    let kind_label = match share.kind {
+                        StreamKind::Video => t!("share.kind_video").to_string(),
+                        StreamKind::Audio => t!("share.kind_audio").to_string(),
+                    };
+                    let (state_label, stoppable) = match &share.status {
+                        ShareStatus::Starting(_) => (t!("share.state_starting").to_string(), false),
+                        ShareStatus::Active(_) => (t!("share.state_active").to_string(), true),
+                        ShareStatus::Stopping(_) => (t!("share.state_stopping").to_string(), false),
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(
                                 t!(
-                                    "streams.audio_line",
-                                    owner = owner_name,
-                                    label = info.label.clone()
+                                    "share.active_line",
+                                    stream_id = stream_id,
+                                    kind = kind_label,
+                                    label = share.label.clone(),
+                                    state = state_label
                                 )
                                 .to_string(),
-                            );
-                            ui.horizontal(|ui| {
-                                let button_label = if listening {
-                                    t!("streams.stop_listening_button").to_string()
-                                } else {
-                                    t!("streams.listen_button").to_string()
-                                };
-                                if ui.small_button(button_label).clicked() {
-                                    to_toggle_listen = Some(key);
-                                }
-                                if listening {
-                                    ui.colored_label(
-                                        egui::Color32::from_rgb(80, 200, 120),
-                                        t!("streams.listening").to_string(),
-                                    );
+                            )
+                            .color(theme::TEXT),
+                        );
+                        let stop_label = if share.kind == StreamKind::Audio {
+                            t!("share.stop_audio_button").to_string()
+                        } else {
+                            t!("share.stop_button").to_string()
+                        };
+                        ui.add_enabled_ui(stoppable, |ui| {
+                            if ui.add(theme::danger_button(stop_label)).clicked() {
+                                to_stop.push(stream_id);
+                            }
+                        });
+                        // Sharer-side live encode rate: the encoder
+                        // branch's actual output framerate (see
+                        // `CaptureHandle::encoder_fps`), confirming the
+                        // configured framerate is really being hit rather
+                        // than just selected in the UI. Video shares
+                        // only — audio has no comparable per-frame rate.
+                        if let ShareStatus::Active(ShareHandle::Video(handle)) = &share.status {
+                            ui.label(egui::RichText::new(t!("share.fps_label", fps = handle.encoder_fps()).to_string()).color(theme::TEXT_DIM));
+                        }
+                    });
+                }
+                for stream_id in to_stop {
+                    connected.stop_share(stream_id);
+                }
+            }
+            if let Some(err) = &connected.share_error {
+                ui.colored_label(theme::DANGER, t!("share.error", error = err).to_string());
+            }
+        });
+
+        theme::card(ui, t!("streams.header").as_ref(), |ui| {
+            if let Some(err) = &connected.watch_error {
+                ui.colored_label(theme::DANGER, t!("streams.watch_error", error = err).to_string());
+            }
+            if connected.streams.is_empty() {
+                ui.label(egui::RichText::new(t!("streams.none_active").to_string()).color(theme::TEXT_FAINT));
+            } else {
+                let mut to_toggle: Option<(ConnId, StreamId)> = None;
+                let mut to_pop_out: Option<(ConnId, StreamId)> = None;
+                let mut to_toggle_listen: Option<(ConnId, StreamId)> = None;
+                let unknown_owner = t!("streams.unknown_owner").to_string();
+                for info in &connected.streams {
+                    let key = (info.owner, info.stream_id);
+                    let owner_name = connected
+                        .members
+                        .iter()
+                        .find(|m| m.conn_id == info.owner)
+                        .map(|m| m.display_name.as_str())
+                        .unwrap_or(unknown_owner.as_str());
+
+                    if info.kind == StreamKind::Audio {
+                        // A sender with video gets their audio
+                        // auto-subscribed via the video row's Watch button
+                        // (see `Connected::toggle_watch`) — only an
+                        // audio-only sender (no video announced) gets its
+                        // own "Listen" row here.
+                        if connected.owner_has_video(info.owner) {
+                            continue;
+                        }
+                        let listening = connected.audio_watches.contains_key(&key);
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(
+                                    egui::RichText::new(
+                                        t!(
+                                            "streams.audio_line",
+                                            owner = owner_name,
+                                            label = info.label.clone()
+                                        )
+                                        .to_string(),
+                                    )
+                                    .color(theme::TEXT),
+                                );
+                                ui.horizontal(|ui| {
+                                    let button_label = if listening {
+                                        t!("streams.stop_listening_button").to_string()
+                                    } else {
+                                        t!("streams.listen_button").to_string()
+                                    };
+                                    if ui.small_button(button_label).clicked() {
+                                        to_toggle_listen = Some(key);
+                                    }
+                                    if listening {
+                                        ui.colored_label(theme::SUCCESS, t!("streams.listening").to_string());
+                                    }
+                                });
+                                if let Some(audio_watch) = connected.audio_watches.get_mut(&key)
+                                    && theme::slider_row(ui, t!("audio.volume_label").as_ref(), &mut audio_watch.volume_percent, 0..=200, 1.0, "%")
+                                {
+                                    audio_watch.decoder.set_volume(audio_watch.volume_percent as f64 / 100.0);
                                 }
                             });
-                            if let Some(audio_watch) = connected.audio_watches.get_mut(&key) {
-                                ui.horizontal(|ui| {
-                                    ui.label(t!("audio.volume_label").to_string());
-                                    let slider = egui::Slider::new(&mut audio_watch.volume_percent, 0..=200).suffix("%");
-                                    if ui.add(slider).changed() {
-                                        audio_watch.decoder.set_volume(audio_watch.volume_percent as f64 / 100.0);
-                                    }
-                                });
-                            }
                         });
-                    });
-                    continue;
-                }
-
-                let watching = connected.watches.contains_key(&key);
-                ui.horizontal(|ui| {
-                    // Thumbnail (or a placeholder box until the first
-                    // preview for this stream arrives) — previews arrive
-                    // for every active stream regardless of whether we're
-                    // watching it, so this shows up independent of the
-                    // Watch/Stop Watching toggle below.
-                    const THUMB_WIDTH: f32 = 120.0;
-                    const THUMB_HEIGHT: f32 = THUMB_WIDTH * 9.0 / 16.0;
-                    match connected.preview_textures.get(&key) {
-                        Some(tex) => {
-                            let tex_size = tex.size_vec2();
-                            let scale = if tex_size.x > 0.0 { THUMB_WIDTH / tex_size.x } else { 1.0 };
-                            ui.image((tex.id(), tex_size * scale));
-                        }
-                        None => {
-                            let (rect, _) =
-                                ui.allocate_exact_size(egui::vec2(THUMB_WIDTH, THUMB_HEIGHT), egui::Sense::hover());
-                            ui.painter().rect_filled(rect, 4.0, egui::Color32::from_gray(60));
-                        }
+                        continue;
                     }
 
-                    let popped_out = connected.watches.get(&key).is_some_and(|e| e.popout.is_some());
+                    let watching = connected.watches.contains_key(&key);
+                    ui.horizontal(|ui| {
+                        // Thumbnail (or a placeholder box until the first
+                        // preview for this stream arrives) — previews
+                        // arrive for every active stream regardless of
+                        // whether we're watching it, so this shows up
+                        // independent of the Watch/Stop Watching toggle
+                        // below.
+                        const THUMB_WIDTH: f32 = 120.0;
+                        const THUMB_HEIGHT: f32 = THUMB_WIDTH * 9.0 / 16.0;
+                        match connected.preview_textures.get(&key) {
+                            Some(tex) => {
+                                let tex_size = tex.size_vec2();
+                                let scale = if tex_size.x > 0.0 { THUMB_WIDTH / tex_size.x } else { 1.0 };
+                                ui.image((tex.id(), tex_size * scale));
+                            }
+                            None => {
+                                let (rect, _) =
+                                    ui.allocate_exact_size(egui::vec2(THUMB_WIDTH, THUMB_HEIGHT), egui::Sense::hover());
+                                ui.painter().rect_filled(rect, 4.0, theme::FIELD);
+                            }
+                        }
 
-                    ui.vertical(|ui| {
-                        ui.label(
-                            t!(
-                                "streams.line",
-                                owner = owner_name,
-                                label = info.label.clone(),
-                                width = info.width,
-                                height = info.height
-                            )
-                            .to_string(),
-                        );
-                        ui.horizontal(|ui| {
-                            let button_label = if watching {
-                                t!("streams.stop_watching_button").to_string()
-                            } else {
-                                t!("streams.watch_button").to_string()
-                            };
-                            if ui.small_button(button_label).clicked() {
-                                to_toggle = Some(key);
-                            }
-                            if watching {
-                                // Pop out into its own native window (or,
-                                // once popped out, this just reports state —
-                                // closing that window is how it comes back).
-                                ui.add_enabled_ui(!popped_out, |ui| {
-                                    if ui.small_button(t!("streams.pop_out_button").to_string()).clicked() {
-                                        to_pop_out = Some(key);
-                                    }
-                                });
-                            }
-                            if popped_out {
-                                ui.colored_label(egui::Color32::LIGHT_BLUE, t!("streams.popped_out").to_string());
-                            } else if connected.selected_watch == Some(key) {
-                                ui.colored_label(egui::Color32::from_rgb(80, 200, 120), t!("streams.viewing").to_string());
-                            }
+                        let popped_out = connected.watches.get(&key).is_some_and(|e| e.popout.is_some());
+
+                        ui.vertical(|ui| {
+                            ui.label(
+                                egui::RichText::new(
+                                    t!(
+                                        "streams.line",
+                                        owner = owner_name,
+                                        label = info.label.clone(),
+                                        width = info.width,
+                                        height = info.height
+                                    )
+                                    .to_string(),
+                                )
+                                .color(theme::TEXT),
+                            );
+                            ui.horizontal(|ui| {
+                                let button_label = if watching {
+                                    t!("streams.stop_watching_button").to_string()
+                                } else {
+                                    t!("streams.watch_button").to_string()
+                                };
+                                if ui.small_button(button_label).clicked() {
+                                    to_toggle = Some(key);
+                                }
+                                if watching {
+                                    // Pop out into its own native window
+                                    // (or, once popped out, this just
+                                    // reports state — closing that window
+                                    // is how it comes back).
+                                    ui.add_enabled_ui(!popped_out, |ui| {
+                                        if ui.small_button(t!("streams.pop_out_button").to_string()).clicked() {
+                                            to_pop_out = Some(key);
+                                        }
+                                    });
+                                }
+                                if popped_out {
+                                    ui.colored_label(theme::ACCENT, t!("streams.popped_out").to_string());
+                                } else if connected.selected_watch == Some(key) {
+                                    ui.colored_label(theme::SUCCESS, t!("streams.viewing").to_string());
+                                }
+                            });
                         });
                     });
-                });
+                }
+                if let Some((owner, stream_id)) = to_toggle {
+                    connected.toggle_watch(owner, stream_id);
+                }
+                if let Some((owner, stream_id)) = to_pop_out {
+                    connected.pop_out(owner, stream_id);
+                }
+                if let Some((owner, stream_id)) = to_toggle_listen {
+                    connected.toggle_listen(owner, stream_id);
+                }
             }
-            if let Some((owner, stream_id)) = to_toggle {
-                connected.toggle_watch(owner, stream_id);
-            }
-            if let Some((owner, stream_id)) = to_pop_out {
-                connected.pop_out(owner, stream_id);
-            }
-            if let Some((owner, stream_id)) = to_toggle_listen {
-                connected.toggle_listen(owner, stream_id);
-            }
-        }
+        });
 
-        ui.add_space(12.0);
-        ui.separator();
-        ui.label(t!("video.header").to_string());
-
-        // Viewer-side live FPS: how often the currently displayed watch's
-        // decoder actually yields a *new* frame (see
-        // `StreamDecoder::current_fps`), not just the UI's own repaint rate —
-        // the most directly useful FPS readout, since it tells you whether
-        // playback of what's on screen right now is actually smooth. Reads
-        // through the same `Arc<Mutex<StreamDecoder>>` `update_watch_textures`/
-        // the popout closure poll `latest_frame()` through, so this reflects
-        // real decode activity regardless of whether the stream is currently
-        // shown inline or popped out into its own window.
-        if let Some(key) = connected.selected_watch {
-            if let Some(entry) = connected.watches.get(&key) {
+        theme::card(ui, t!("video.header").as_ref(), |ui| {
+            // Viewer-side live FPS: how often the currently displayed
+            // watch's decoder actually yields a *new* frame (see
+            // `StreamDecoder::current_fps`), not just the UI's own repaint
+            // rate — the most directly useful FPS readout, since it tells
+            // you whether playback of what's on screen right now is
+            // actually smooth. Reads through the same
+            // `Arc<Mutex<StreamDecoder>>` `update_watch_textures`/the
+            // popout closure poll `latest_frame()` through, so this
+            // reflects real decode activity regardless of whether the
+            // stream is currently shown inline or popped out into its own
+            // window.
+            if let Some(key) = connected.selected_watch
+                && let Some(entry) = connected.watches.get(&key)
+            {
                 let fps = entry.decoder.lock().unwrap().current_fps();
-                ui.label(t!("video.fps_label", fps = format!("{fps:.1}")).to_string());
+                ui.label(egui::RichText::new(t!("video.fps_label", fps = format!("{fps:.1}")).to_string()).color(theme::TEXT_DIM));
             }
-        }
 
-        // If the currently displayed video watch also auto-subscribed the
-        // same sender's audio (see `Connected::toggle_watch`), show its
-        // volume slider here, right above the video panel — "somewhere
-        // sensible in the watched-stream UI", per this task's brief.
-        let linked_audio_key: Option<(ConnId, StreamId)> = connected
-            .selected_watch
-            .and_then(|key| connected.watches.get(&key))
-            .and_then(|entry| entry.audio_stream_id)
-            .map(|audio_stream_id| (connected.selected_watch.expect("checked above").0, audio_stream_id));
-        if let Some(audio_key) = linked_audio_key {
-            if let Some(audio_watch) = connected.audio_watches.get_mut(&audio_key) {
-                ui.horizontal(|ui| {
-                    ui.label(t!("audio.volume_label").to_string());
-                    let slider = egui::Slider::new(&mut audio_watch.volume_percent, 0..=200).suffix("%");
-                    if ui.add(slider).changed() {
-                        audio_watch.decoder.set_volume(audio_watch.volume_percent as f64 / 100.0);
+            // If the currently displayed video watch also auto-subscribed
+            // the same sender's audio (see `Connected::toggle_watch`), show
+            // its volume slider here, right above the video panel —
+            // "somewhere sensible in the watched-stream UI", per this
+            // task's brief.
+            let linked_audio_key: Option<(ConnId, StreamId)> = connected
+                .selected_watch
+                .and_then(|key| connected.watches.get(&key))
+                .and_then(|entry| entry.audio_stream_id)
+                .map(|audio_stream_id| (connected.selected_watch.expect("checked above").0, audio_stream_id));
+            if let Some(audio_key) = linked_audio_key
+                && let Some(audio_watch) = connected.audio_watches.get_mut(&audio_key)
+                && theme::slider_row(ui, t!("audio.volume_label").as_ref(), &mut audio_watch.volume_percent, 0..=200, 1.0, "%")
+            {
+                audio_watch.decoder.set_volume(audio_watch.volume_percent as f64 / 100.0);
+            }
+
+            match connected.selected_watch.and_then(|key| connected.watches.get(&key)) {
+                Some(entry) if entry.popout.is_some() => {
+                    ui.label(egui::RichText::new(t!("video.popped_out_note").to_string()).color(theme::TEXT_DIM));
+                }
+                Some(entry) => match &entry.texture {
+                    Some(tex) => {
+                        let available = ui.available_size();
+                        let tex_size = tex.size_vec2();
+                        let scale = if tex_size.x > 0.0 && tex_size.y > 0.0 {
+                            (available.x / tex_size.x).min(available.y.max(60.0) / tex_size.y).min(1.0)
+                        } else {
+                            1.0
+                        };
+                        let display_size = tex_size * scale.max(0.01);
+                        ui.image((tex.id(), display_size));
                     }
-                });
-            }
-        }
-
-        match connected.selected_watch.and_then(|key| connected.watches.get(&key)) {
-            Some(entry) if entry.popout.is_some() => {
-                ui.label(t!("video.popped_out_note").to_string());
-            }
-            Some(entry) => match &entry.texture {
-                Some(tex) => {
-                    let available = ui.available_size();
-                    let tex_size = tex.size_vec2();
-                    let scale = if tex_size.x > 0.0 && tex_size.y > 0.0 {
-                        (available.x / tex_size.x).min(available.y.max(60.0) / tex_size.y).min(1.0)
-                    } else {
-                        1.0
-                    };
-                    let display_size = tex_size * scale.max(0.01);
-                    ui.image((tex.id(), display_size));
-                }
+                    None => {
+                        ui.label(egui::RichText::new(t!("video.waiting_frame").to_string()).color(theme::TEXT_DIM));
+                    }
+                },
                 None => {
-                    ui.label(t!("video.waiting_frame").to_string());
+                    ui.label(egui::RichText::new(t!("video.not_watching").to_string()).color(theme::TEXT_FAINT));
                 }
-            },
-            None => {
-                ui.label(t!("video.not_watching").to_string());
             }
-        }
+        });
     }
 }
 
@@ -1419,19 +1507,33 @@ impl eframe::App for App {
             connected.show_popouts(ctx);
         }
 
+        // Whether the OS reports this window as focused right now. `None`
+        // (backend doesn't report focus) is treated as focused, so a
+        // platform that can't answer this question keeps today's behavior
+        // rather than silently throttling forever.
+        let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+
         // Keep the root context repainting every frame while at least one
-        // stream is being watched inline (not popped out): `latest_frame()`
-        // is non-blocking and only yields a new frame at the decoder's real
-        // output rate (up to 240fps per the framerate-control feature), so
-        // without an explicit continuous repaint request here the panel
-        // would only actually refresh on the side effect of unrelated input
-        // (e.g. mouse movement over it) or the coarse idle-fallback interval
-        // below — capping perceived playback well under the real decode
-        // rate whenever the mouse sits still. Scoped to "currently watching
-        // something inline" rather than requested unconditionally on every
-        // `update()` call, so idle/disconnected sessions don't burn CPU on
-        // needless repaints.
-        if has_inline_watch {
+        // stream is being watched inline (not popped out) *and* the window
+        // is focused: `latest_frame()` is non-blocking and only yields a new
+        // frame at the decoder's real output rate (up to 240fps per the
+        // framerate-control feature, and no longer vsync-capped once a
+        // faster `PresentationMode` is selected — see
+        // `superdoc/features/presentation-modes.md`), so without an explicit
+        // continuous repaint request here the panel would only actually
+        // refresh on the side effect of unrelated input (e.g. mouse movement
+        // over it) or the coarse idle-fallback interval below — capping
+        // perceived playback well under the real decode rate whenever the
+        // mouse sits still. Scoped to "currently watching something inline"
+        // rather than requested unconditionally on every `update()` call, so
+        // idle/disconnected sessions don't burn CPU on needless repaints.
+        //
+        // The focus check is what keeps an uncapped `PresentationMode` from
+        // burning full GPU/CPU while the window sits in the background: it
+        // only relaxes the *ceiling* wgpu imposes on render rate, so
+        // something still has to stop asking for repaints when there's no
+        // point rendering them, and that's this check, not the present mode.
+        if has_inline_watch && focused {
             ctx.request_repaint();
         }
 
@@ -1444,9 +1546,12 @@ impl eframe::App for App {
         });
 
         // Keep polling the connect future / event channel even though egui
-        // has no input to react to yet.
+        // has no input to react to yet. Falls back to a much coarser
+        // interval while unfocused (also covers the has_inline_watch case
+        // above when the window is backgrounded) — see `focused` above.
         if matches!(self.status, Status::Connecting) || self.connected.is_some() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            let interval = if focused { IDLE_REPAINT_INTERVAL } else { UNFOCUSED_REPAINT_INTERVAL };
+            ctx.request_repaint_after(interval);
         }
     }
 

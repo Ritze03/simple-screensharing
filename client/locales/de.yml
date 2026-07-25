@@ -12,7 +12,7 @@ join.load_error: "Gespeicherte Räume konnten nicht geladen werden: %{error}"
 join.no_saved_rooms: "(noch keine)"
 
 rooms.remove_button: "Entfernen"
-rooms.save_label: "Diesen Raum speichern als:"
+rooms.save_label: "Diesen Raum speichern als"
 rooms.save_button: "Speichern"
 rooms.saved_confirmation: "Gespeichert."
 
@@ -24,8 +24,8 @@ members.stream_plural: "%{name} (%{count} Streams)"
 
 share.video_header: "Bildschirm teilen"
 share.video_label: "Bildschirmfreigabe"
-share.bitrate_label: "Bitrate (kbps):"
-share.framerate_label: "Bildrate:"
+share.bitrate_label: "Bitrate (kbps)"
+share.framerate_label: "Bildrate"
 share.screen_button: "Bildschirm teilen"
 share.waiting_permission: "Warte auf Freigabe zum Teilen des Bildschirms…"
 share.audio_header: "Audio teilen"
@@ -75,7 +75,10 @@ popout.title: "Stream %{stream_id} — %{owner}"
 
 common.default_display_name: "Freund"
 
+settings.header: "Einstellungen"
 settings.language_label: "Sprache"
+settings.presentation_mode_label: "Darstellungsmodus"
+settings.presentation_mode_restart_hint: "Neustart zum Anwenden"
 
 errors.share_start_task_ended: "Die Aufgabe zum Starten der Freigabe wurde unerwartet beendet"
 errors.share_stop_task_ended: "Die Aufgabe zum Beenden der Freigabe wurde unerwartet beendet"

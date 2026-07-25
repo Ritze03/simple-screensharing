@@ -12,7 +12,7 @@ join.load_error: "Could not load saved rooms: %{error}"
 join.no_saved_rooms: "(none yet)"
 
 rooms.remove_button: "Remove"
-rooms.save_label: "Save this room as:"
+rooms.save_label: "Save this room as"
 rooms.save_button: "Save"
 rooms.saved_confirmation: "Saved."
 
@@ -24,8 +24,8 @@ members.stream_plural: "%{name} (%{count} streams)"
 
 share.video_header: "Share video"
 share.video_label: "Screen share"
-share.bitrate_label: "Bitrate (kbps):"
-share.framerate_label: "Framerate:"
+share.bitrate_label: "Bitrate (kbps)"
+share.framerate_label: "Framerate"
 share.screen_button: "Share Screen"
 share.waiting_permission: "Waiting for screen-share permission…"
 share.audio_header: "Share audio"
@@ -75,7 +75,10 @@ popout.title: "Stream %{stream_id} — %{owner}"
 
 common.default_display_name: "friend"
 
+settings.header: "Settings"
 settings.language_label: "Language"
+settings.presentation_mode_label: "Presentation mode"
+settings.presentation_mode_restart_hint: "Restart to apply"
 
 errors.share_start_task_ended: "share-start task ended unexpectedly"
 errors.share_stop_task_ended: "share-stop task ended unexpectedly"

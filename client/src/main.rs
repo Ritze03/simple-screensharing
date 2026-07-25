@@ -2,7 +2,8 @@
 //!
 //! QUIC networking (`net.rs`), wire protocol (`protocol.rs`), fragmentation
 //! (`fragment.rs`), capture (`capture.rs`/`audio.rs`), decode (`decode.rs`),
-//! saved rooms (`rooms.rs`) and the egui UI (`ui.rs`) make up the app.
+//! saved rooms (`rooms.rs`), the shared egui theme (`theme.rs`), and the
+//! egui UI (`ui.rs`) make up the app.
 //!
 //! # Front-ends
 //!
@@ -29,6 +30,7 @@ mod net;
 mod preview;
 mod protocol;
 mod rooms;
+mod theme;
 mod tui;
 mod ui;
 
@@ -121,11 +123,21 @@ fn main() -> anyhow::Result<()> {
 
     tracing_subscriber::fmt::init();
 
+    // Presentation mode is only settable here, at surface-creation time: the
+    // pinned eframe/egui-wgpu (0.33.3) doesn't expose the render surface for
+    // reconfiguration once the window exists, so a change made in the
+    // settings UI (`ui.rs`'s presentation-mode dropdown) is picked up on the
+    // *next* launch, not live. See `superdoc/features/presentation-modes.md`.
+    let presentation_mode = rooms::AppSettings::load().presentation_mode;
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([800.0, 600.0])
             .with_title("Simple Screensharing"),
         renderer: eframe::Renderer::Wgpu,
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            present_mode: presentation_mode.to_wgpu(),
+            ..Default::default()
+        },
         ..Default::default()
     };
 
