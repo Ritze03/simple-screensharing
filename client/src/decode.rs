@@ -78,11 +78,94 @@
 //! never depends on any other packet (`audio.rs`'s sender always marks
 //! `keyframe: true` for exactly this reason — see its comment at
 //! `send_encoded_sample`), so there is no keyframe-gating on the decode
-//! side either: every packet for the subscribed `stream_id` is pushed into
-//! the pipeline as it arrives. Decoded PCM is handed straight to an audio
-//! sink (`autoaudiosink` in production) rather than back to `ui.rs` as
-//! samples to render — there is nothing for the UI to draw each frame, only
-//! a volume knob to expose (see [`AudioDecoder::set_volume`]).
+//! side. Decoded PCM is handed straight to an audio sink (`autoaudiosink`
+//! in production) rather than back to `ui.rs` as samples to render — there
+//! is nothing for the UI to draw each frame, only a volume knob to expose
+//! (see [`AudioDecoder::set_volume`]).
+//!
+//! Packets are *not* pushed into the pipeline in raw arrival order,
+//! though: they go through [`AudioJitterBuffer`] first, which restores
+//! `pts`-order and tells `opusdec` about genuinely-missing packets so it
+//! can conceal them. See "Reordering and packet-loss concealment" below.
+//!
+//! ## Reordering and packet-loss concealment
+//!
+//! Media travels over QUIC *datagrams* (spec §6), which are unreliable and
+//! unordered, and `fragment.rs`'s `Reassembler` deliberately emits a frame
+//! the moment its last fragment lands — so when fragments race, frames can
+//! and do complete out of `frame_id` order. For video that barely matters
+//! (`avdec_h264` tolerates it and the GOP re-syncs), but for audio it is
+//! audible immediately: a backwards timestamp makes the audio sink drop or
+//! resync, and a *missing* packet leaves a hole that nothing fills.
+//!
+//! Two separate defects were in play here, and both had to be fixed:
+//!
+//! 1. **Nothing reordered.** `AudioDecoder::feed` pushed every packet
+//!    straight into `appsrc` as it arrived.
+//! 2. **`opusdec`'s PLC was off and unreachable.** `gst-inspect-1.0
+//!    opusdec` shows `plc` defaults to **`false`**, so even a correctly
+//!    signalled gap would have been ignored — and nothing signalled one
+//!    anyway. A dropped packet simply vanished from the decoded PCM.
+//!
+//! Measured on this machine (GStreamer 1.28.5) by feeding 33 real Opus
+//! packets through `appsrc ! opusdec ! audioconvert ! appsink` three ways —
+//! this is what `gap_event_makes_opusdec_conceal_a_missing_packet` below
+//! asserts:
+//!
+//! | case | decoded bytes | `opusdec` `stats` |
+//! | --- | --- | --- |
+//! | all 33 packets | 126720 | `plc-num-samples=0` |
+//! | one packet dropped, nothing signalled | 122880 | `plc-num-samples=0` |
+//! | one packet dropped, `GAP` event sent | 126720 | `plc-num-samples=960`, `plc-duration=20ms` |
+//!
+//! i.e. an unsignalled loss silently deletes exactly one 20 ms frame of
+//! PCM (3840 bytes = 960 samples × 2ch × 2 bytes) — that deletion *is* the
+//! reported stutter — whereas a signalled one is filled in by libopus's
+//! own concealment.
+//!
+//! **Why a `GstEvent::Gap` and not a `GAP`-flagged `gst::Buffer`:** the
+//! concealment hook lives in the `GstAudioDecoder` base class, which runs
+//! PLC (by calling the subclass's `handle_frame(NULL)`, which is exactly
+//! `opusdec`'s `opus_decode(NULL)` path) when it receives a `GST_EVENT_GAP`
+//! *and* `plc` is enabled. A `GAP`-flagged buffer is not that hook — it
+//! would just be an empty payload for `opusdec` to fail to parse. `GAP` is
+//! a serialized event, and `appsrc` queues serialized events in its own
+//! internal queue alongside buffers (GStreamer ≥ 1.14), so
+//! `appsrc.send_event(gap)` stays correctly interleaved with the
+//! surrounding `push_buffer` calls rather than jumping the queue — the
+//! measurement above confirms it (the concealed frame lands in the right
+//! slot, and the output's total length and end timestamp both match the
+//! loss-free case).
+//!
+//! **Why `pts` and not `frame_id` as the sequence number:** the wire
+//! `frame_id` is the connection's *nonce counter*
+//! (`net::NonceSequence::next_nonce`, passed straight through as
+//! `frame_id` by `audio.rs::send_encoded_sample`), and that counter is
+//! shared by every stream on the connection — video, audio, and previews
+//! all draw from it. So consecutive audio packets have *non*-consecutive
+//! `frame_id`s whenever anything else is also being sent, which makes
+//! `frame_id` useless for telling a real gap apart from "video sent three
+//! frames in between". `pts` has none of that problem: it comes from
+//! `opusenc`'s own output buffers, so it is per-stream, monotonic, and
+//! advances by exactly one Opus frame duration per packet. It gives
+//! ordering *and* gap detection from one field `DecryptedMediaFrame`
+//! already carries — which is why no `net.rs` change was needed here.
+//!
+//! The jitter buffer's own sizing/latency rationale lives on
+//! [`AudioJitterBuffer`], next to the constants it uses.
+//!
+//! ## Sender PTS vs. the receiver's playout clock
+//!
+//! A third defect lived in the same place and had to be fixed with the
+//! other two: the sender's `pts` was being pushed at the sink *as if* it
+//! were on the receiver's clock. It isn't — it is the sender's own
+//! capture-pipeline running time, so the offset between the two is "how
+//! long the sharer had been sending audio before this viewer subscribed".
+//! With the sink on `sync=true`, that offset is a playout delay: a viewer
+//! joining 30 s in got **no audio at all** (measured — see
+//! [`AudioTimeline`] for the numbers). [`AudioTimeline`] re-bases every
+//! timestamp onto this pipeline's running time before it reaches `appsrc`,
+//! preserving the sender's *intervals* while replacing its origin.
 //!
 //! ## Pipeline
 //!
@@ -120,8 +203,28 @@
 //! equivalent: decoded PCM goes straight through `volume` to the sink
 //! inside GStreamer's own pipeline threads, with nothing for `ui.rs` to
 //! poll or render per frame.
+//!
+//! The [`AudioJitterBuffer`] and [`AudioTimeline`] are owned *exclusively*
+//! by that pipeline thread, inside `pump_audio_loop` — neither is shared,
+//! so they need no lock at all and no `Arc`/`Mutex` was added anywhere.
+//! Two reasons the jitter buffer lives there rather than in
+//! `AudioDecoder::feed`:
+//!
+//! - It needs a **clock tick** independent of packet arrivals. The whole
+//!   point of the buffer is to notice that a packet *didn't* arrive, and
+//!   `feed()` is by definition not called when that happens. The pipeline
+//!   thread already loops on `rx.recv_timeout(..)`, so it has a natural
+//!   timer; `feed()` has none.
+//! - It keeps `feed()` exactly as non-blocking and as cheap as it was, on
+//!   whatever thread `ui.rs` happens to call it from.
+//!
+//! Note this is a *different* threading situation from the video pacing
+//! fix, which runs inside `appsink`'s `new_sample` callback on GStreamer's
+//! own streaming thread and is therefore wrapped in a `Mutex` to satisfy
+//! that callback's `Fn`/`Sync` bound. Nothing here ever runs on a
+//! GStreamer streaming thread, and nothing here ever sleeps.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
@@ -153,6 +256,25 @@ enum PipelineMsg {
 /// quickly to a real change (e.g. playback stalling, or the sender's
 /// configured framerate changing).
 const DECODE_FPS_WINDOW: Duration = Duration::from_secs(2);
+
+/// Capacity of the video decode pipeline's pre-decode ingest channel (see
+/// [`StreamDecoder::new`]/[`StreamDecoder::feed`]). Small on purpose: this
+/// channel exists only to hand access units from `feed()`'s caller thread
+/// to the pipeline thread without blocking the caller, not to buffer a
+/// backlog — a slow decoder should show a slightly stale live frame (via
+/// the existing appsink drop policy), not an ever-growing queue of stale
+/// input. A handful of frames is enough to absorb normal scheduling jitter
+/// between the two threads.
+const VIDEO_INGEST_CHANNEL_CAPACITY: usize = 8;
+
+/// How far behind wall-clock a video frame's paced target may fall before
+/// [`PacingState::next_delay`] gives up trying to catch up and instead
+/// re-bases pacing on the current frame. Bounds the worst-case latency a
+/// stall/backlog can add, and self-heals a PTS discontinuity (e.g. a
+/// stream restart or a keyframe arriving right after resubscribing, where
+/// the new PTS origin has no relation to the old one) instead of
+/// accumulating drift forever.
+const PACING_MAX_BEHIND: Duration = Duration::from_millis(300);
 
 /// Tracks how often [`StreamDecoder::latest_frame`] actually yields a *new*
 /// decoded frame (not just how often it's polled — `ui.rs` polls once per
@@ -198,12 +320,82 @@ impl FpsCounter {
     }
 }
 
+/// Paces decoded video frames against their capture-time PTS instead of
+/// displaying each one the instant it finishes decoding.
+///
+/// # Why pacing lives here instead of `sync=true` on the appsink
+///
+/// `pts_us` (threaded through decrypt -> [`PipelineMsg::AccessUnit`] ->
+/// stamped onto the `appsrc` buffer in `pump_loop`) is the *sender's* own
+/// running time — `start.elapsed()` since that capture session began (see
+/// `capture.rs`/`audio.rs`) — not wall-clock/epoch time, and has no defined
+/// relationship to this pipeline's own running-time clock. Flipping the
+/// appsink to `sync=true` would make GStreamer pace against its own
+/// running-time axis instead, which is a different clock with no known
+/// offset from the sender's — so pacing has to be done by hand here,
+/// relative to the first frame this decoder instance sees, rather than
+/// trusting GStreamer's sync machinery.
+///
+/// # Why a bounded catch-up window instead of always honoring `pts_us`
+///
+/// Always sleeping until `target` would let the decoder fall permanently
+/// behind after any stall (e.g. a slow decode, or a burst of frames after
+/// a channel drop), and would misbehave completely across a PTS
+/// discontinuity (a stream restart, or the first keyframe after
+/// resubscribing, where the new stream's PTS origin has nothing to do with
+/// the old one — e.g. a much smaller `pts_us` than the previous frame's).
+/// [`Self::next_delay`] handles both the same way: once the target falls
+/// more than [`PACING_MAX_BEHIND`] behind wall-clock, it gives up catching
+/// up and re-bases pacing on the current frame instead, bounding the
+/// worst-case added latency and self-healing rather than accumulating
+/// drift.
+struct PacingState {
+    /// `(pts_us, local_instant)` of the frame pacing is currently based on
+    /// — `None` until the first frame is seen.
+    base: Option<(u64, Instant)>,
+}
+
+impl PacingState {
+    fn new() -> Self {
+        Self { base: None }
+    }
+
+    /// Given the next decoded frame's `pts_us` and the current time `now`,
+    /// decide how long to sleep before displaying it (`None` means display
+    /// immediately). Pure/deterministic given its inputs — kept free of any
+    /// GStreamer or thread-sleeping so it's unit-testable on its own; see
+    /// `tests::pacing_*` below.
+    fn next_delay(&mut self, pts_us: u64, now: Instant) -> Option<Duration> {
+        let Some((base_pts, base_instant)) = self.base else {
+            // First frame ever: nothing to pace against yet, display now
+            // and start the baseline here.
+            self.base = Some((pts_us, now));
+            return None;
+        };
+
+        let target = base_instant + Duration::from_micros(pts_us.saturating_sub(base_pts));
+        if target > now {
+            return Some(target - now);
+        }
+
+        // Already at or past target. If we're only slightly behind (normal
+        // jitter/scheduling slop), just display immediately without
+        // touching the baseline. If we're badly behind — a real stall, or
+        // a PTS discontinuity that makes `target` land far in the past —
+        // re-base on this frame instead of letting the gap accumulate.
+        if now.duration_since(target) > PACING_MAX_BEHIND {
+            self.base = Some((pts_us, now));
+        }
+        None
+    }
+}
+
 /// Decodes one subscribed video stream's incoming H.264 access units into
 /// `egui::ColorImage` frames. See the module docs for the pipeline shape and
 /// threading rationale.
 pub struct StreamDecoder {
     stream_id: StreamId,
-    tx: std_mpsc::Sender<PipelineMsg>,
+    tx: std_mpsc::SyncSender<PipelineMsg>,
     latest_frame: LatestFrameSlot,
     /// An H.264 decoder can't produce anything from a mid-GOP delta frame
     /// alone, so frames are dropped until the first keyframe is seen —
@@ -223,7 +415,16 @@ impl StreamDecoder {
         gstreamer::init().context("failed to initialize GStreamer")?;
 
         let latest_frame: LatestFrameSlot = Arc::new(Mutex::new(None));
-        let (tx, rx) = std_mpsc::channel::<PipelineMsg>();
+        // Bounded, not `std_mpsc::channel()`'s unbounded queue: this is the
+        // pre-decode ingest path, and the module's own stated policy is
+        // "drop and continue" everywhere else (the appsink downstream is
+        // already `max-buffers=1`/`drop=true`). An unbounded channel here
+        // would let a sustained high framerate that outpaces decode
+        // throughput grow latency/memory without bound instead. Bounded to
+        // a small `VIDEO_INGEST_CHANNEL_CAPACITY` and fed via `try_send` in
+        // `feed()` (drop-newest-on-full — see that method's doc comment for
+        // why that policy over drop-oldest).
+        let (tx, rx) = std_mpsc::sync_channel::<PipelineMsg>(VIDEO_INGEST_CHANNEL_CAPACITY);
 
         let pipeline_frame_slot = latest_frame.clone();
         let thread = thread::Builder::new()
@@ -253,8 +454,18 @@ impl StreamDecoder {
     /// `ClientEvent::MediaFrame` payload from `net.rs`). Frames for a
     /// different `stream_id` are ignored defensively (callers are expected
     /// to filter before calling, but a misrouted frame here must never
-    /// panic). Never blocks: this only pushes onto an unbounded channel
-    /// that the pipeline thread drains.
+    /// panic). Never blocks: this pushes onto a small bounded channel
+    /// ([`VIDEO_INGEST_CHANNEL_CAPACITY`]) via `try_send` that the pipeline
+    /// thread drains, and if the pipeline is falling behind and the channel
+    /// is momentarily full, the new access unit is dropped rather than
+    /// queued or blocking the caller — drop-newest, not drop-oldest,
+    /// because `std::sync::mpsc::SyncSender` has no way to reach in and
+    /// evict an already-sent item from the receiver side (that side is
+    /// owned by the pipeline thread), so drop-newest is what the channel
+    /// type actually gives us with no extra synchronization; it's no worse
+    /// than drop-oldest here since either policy just bounds the backlog,
+    /// and the receiver drains in order so the dropped access unit was the
+    /// most recent one anyway.
     pub fn feed(&mut self, frame: &DecryptedMediaFrame) {
         if frame.stream_id != self.stream_id {
             return;
@@ -269,15 +480,28 @@ impl StreamDecoder {
             pts_us: frame.pts,
             data: frame.payload.clone(),
         };
-        if self.tx.send(msg).is_err() {
-            // The pipeline thread only stops after a `Shutdown` sent from
-            // `Drop`, so this means it exited/panicked already (e.g. a
-            // GStreamer element failed to build). Log and keep going —
-            // one dead decoder shouldn't take the whole UI down.
-            tracing::warn!(
-                "decode pipeline thread for stream {} is gone; dropping frame",
-                self.stream_id
-            );
+        match self.tx.try_send(msg) {
+            Ok(()) => {}
+            Err(std_mpsc::TrySendError::Full(_)) => {
+                // Decode can't keep up with the incoming rate right now;
+                // drop this access unit rather than growing an unbounded
+                // backlog. Matches the "drop and continue" policy the
+                // appsink already applies downstream of decode.
+                tracing::debug!(
+                    "decode ingest channel for stream {} is full; dropping access unit (decoder falling behind)",
+                    self.stream_id
+                );
+            }
+            Err(std_mpsc::TrySendError::Disconnected(_)) => {
+                // The pipeline thread only stops after a `Shutdown` sent
+                // from `Drop`, so this means it exited/panicked already
+                // (e.g. a GStreamer element failed to build). Log and keep
+                // going — one dead decoder shouldn't take the whole UI down.
+                tracing::warn!(
+                    "decode pipeline thread for stream {} is gone; dropping frame",
+                    self.stream_id
+                );
+            }
         }
     }
 
@@ -377,11 +601,31 @@ fn run_pipeline(rx: std_mpsc::Receiver<PipelineMsg>, latest_frame: LatestFrameSl
     appsink.set_property("drop", true);
 
     let sink_frame_slot = latest_frame;
+    // `Mutex`, not a plain field, because `new_sample` below is `Fn`, not
+    // `FnMut` (GStreamer may in principle re-invoke it concurrently, and
+    // the closure trait bound requires `Sync`) — same pattern already used
+    // for `sink_frame_slot` just above. This callback runs on GStreamer's
+    // own streaming thread downstream of the `queue` element (see module
+    // docs "Threading"), never on an async runtime thread, so blocking it
+    // with `std::thread::sleep` below for pacing is correct and matches
+    // how a GStreamer `sync=true` sink element would behave internally.
+    let pacing = Mutex::new(PacingState::new());
     appsink.set_callbacks(
         AppSinkCallbacks::builder()
             .new_sample(move |sink| {
                 match pull_color_image(sink) {
-                    Ok(Some(image)) => {
+                    Ok(Some((image, Some(pts_us)))) => {
+                        let delay = pacing.lock().unwrap().next_delay(pts_us, Instant::now());
+                        if let Some(delay) = delay {
+                            std::thread::sleep(delay);
+                        }
+                        *sink_frame_slot.lock().unwrap() = Some(image);
+                    }
+                    Ok(Some((image, None))) => {
+                        // No PTS on the decoded buffer (shouldn't normally
+                        // happen since `pump_loop` always stamps one, but
+                        // never worth failing the whole stream over) —
+                        // display immediately rather than pace blindly.
                         *sink_frame_slot.lock().unwrap() = Some(image);
                     }
                     Ok(None) => {}
@@ -459,13 +703,19 @@ fn log_bus_message(msg: &Message) {
 /// Pull the newest available sample off `sink` and convert it to an
 /// `egui::ColorImage`, respecting the negotiated row stride (RGBA rows can
 /// be padded past `width * 4` bytes depending on the decoder/converter, so
-/// this must not assume a tightly packed buffer).
-fn pull_color_image(sink: &AppSink) -> Result<Option<egui::ColorImage>> {
+/// this must not assume a tightly packed buffer). Also returns the
+/// decoded buffer's PTS (in microseconds), if it has one, for
+/// [`PacingState`] to schedule display against — this is the same
+/// capture-time `pts_us` `pump_loop` stamped onto the pre-decode buffer;
+/// GStreamer propagates it downstream through `h264parse`/`avdec_h264`/
+/// `videoconvert` unless something along the chain drops it.
+fn pull_color_image(sink: &AppSink) -> Result<Option<(egui::ColorImage, Option<u64>)>> {
     let sample = match sink.try_pull_sample(ClockTime::from_mseconds(0)) {
         Some(s) => s,
         None => return Ok(None),
     };
     let buffer = sample.buffer().ok_or_else(|| anyhow!("sample had no buffer"))?;
+    let pts_us = buffer.pts().map(|pts| pts.useconds());
     let caps = sample.caps().ok_or_else(|| anyhow!("sample had no caps"))?;
     let info = VideoInfo::from_caps(caps).context("failed to parse negotiated video caps")?;
 
@@ -481,7 +731,10 @@ fn pull_color_image(sink: &AppSink) -> Result<Option<egui::ColorImage>> {
 
     let packed = pack_rgba_rows(plane, width, height, stride)?;
 
-    Ok(Some(egui::ColorImage::from_rgba_unmultiplied([width, height], &packed)))
+    Ok(Some((
+        egui::ColorImage::from_rgba_unmultiplied([width, height], &packed),
+        pts_us,
+    )))
 }
 
 /// Tightly packs `height` RGBA rows of `width * 4` bytes each out of `plane`,
@@ -519,6 +772,333 @@ enum AudioPipelineMsg {
     Packet { pts_us: u64, data: Vec<u8> },
     SetVolume(f64),
     Shutdown,
+}
+
+/// Longest an out-of-sequence packet is held waiting for a missing
+/// predecessor before [`AudioJitterBuffer`] gives up on it and conceals
+/// the hole instead. Two Opus frames at this project's 20 ms frame size —
+/// deliberately at the *low* end of a normal reorder window, see
+/// [`AudioJitterBuffer`]'s "added latency" note for why holding longer is
+/// actively counterproductive here.
+const AUDIO_JITTER_MAX_HOLD: Duration = Duration::from_millis(40);
+
+/// Hard ceiling on how many packets [`AudioJitterBuffer`] will hold at
+/// once. Once exceeded, the head is released immediately regardless of its
+/// hold deadline. This is the buffer's absolute bound: it can never hold
+/// more than this many packets nor delay one by more than
+/// [`AUDIO_JITTER_MAX_HOLD`], so a sustained gap degrades into a glitch
+/// rather than into unbounded latency or memory.
+const AUDIO_JITTER_MAX_DEPTH: usize = 8;
+
+/// Most consecutive missing slots that will be signalled to `opusdec` for
+/// concealment before the buffer just accepts the discontinuity and moves
+/// on. 100 ms at 20 ms frames — Opus PLC degrades to near-silence well
+/// before that anyway, so concealing further is pure busywork; the
+/// remaining hole is simply left in the timeline for the sink to handle.
+const AUDIO_MAX_CONCEAL_SLOTS: u64 = 5;
+
+/// Assumed Opus frame duration until a real one has been observed. This is
+/// what `audio.rs`'s sender actually produces: it builds `opusenc` with no
+/// `frame-size` override, and `gst-inspect-1.0 opusenc` reports that
+/// property's default as `20` (ms).
+const AUDIO_DEFAULT_FRAME_DURATION_US: u64 = 20_000;
+
+/// How many recent PTS deltas [`AudioJitterBuffer`] keeps to infer the
+/// sender's Opus frame duration from. Bounded (rather than an all-time
+/// minimum) so one anomalous small delta can't poison gap detection
+/// forever — it ages out after this many packets.
+const AUDIO_FRAME_DURATION_WINDOW: usize = 16;
+
+/// A backwards PTS jump larger than this is read as the sender having
+/// restarted its capture session (a new `audio.rs` `start` origin), not as
+/// reordering, and resets the buffer. Same self-healing philosophy as
+/// [`PacingState`]'s re-base on the video side.
+const AUDIO_PTS_DISCONTINUITY_US: u64 = 1_000_000;
+
+/// One Opus packet waiting its turn in [`AudioJitterBuffer`].
+struct PendingAudioPacket {
+    data: Vec<u8>,
+    /// When this packet entered the buffer — the reference point for its
+    /// [`AUDIO_JITTER_MAX_HOLD`] deadline. Deliberately per-packet rather
+    /// than a single buffer-wide deadline, so a packet that arrives while
+    /// an older hole is already being waited out gets its own full (and
+    /// no longer than its own) share of patience.
+    arrived: Instant,
+}
+
+/// What [`AudioJitterBuffer`] wants pushed into `appsrc` next.
+///
+/// Deliberately a plain data enum with no GStreamer types in it, so the
+/// buffer's whole decision-making is unit-testable without a pipeline —
+/// the same trick the video pacing fix used to make [`PacingState::next_delay`]
+/// testable. [`apply_audio_actions`] is the (trivial, untested) glue that
+/// turns these into actual GStreamer calls.
+#[derive(Debug, PartialEq, Eq)]
+enum AudioAction {
+    /// Push this Opus packet into `appsrc`, stamped with `pts_us`.
+    Push { pts_us: u64, data: Vec<u8> },
+    /// Send a `GAP` event for a packet that never arrived, so `opusdec`
+    /// (built with `plc=true`) runs Opus packet-loss concealment for that
+    /// slot instead of leaving a hole. See the module docs' "Reordering
+    /// and packet-loss concealment" section for the measurement proving
+    /// this is what actually triggers PLC.
+    Conceal { pts_us: u64, duration_us: u64 },
+}
+
+/// Re-orders incoming Opus packets by `pts` and turns genuine losses into
+/// explicit concealment requests.
+///
+/// # Why it holds packets only when it has to
+///
+/// A packet that is the immediate successor of the last released one is
+/// released *immediately* — the buffer adds **zero latency** to a healthy,
+/// in-order stream. Latency is spent only when something is actually wrong
+/// (a missing or out-of-order packet), and even then it is bounded by
+/// [`AUDIO_JITTER_MAX_HOLD`] (40 ms) and [`AUDIO_JITTER_MAX_DEPTH`].
+///
+/// This is not the usual "always pre-roll N frames" jitter buffer, and the
+/// difference is deliberate. A classic pre-roll buys the sink extra *lead
+/// time* by delaying the whole timeline. This buffer cannot do that: it
+/// forwards each packet's original `pts` untouched, so delaying a push
+/// does not move the packet's playout slot — it only brings the push
+/// *closer to* (or past) a deadline that stays put. A fixed pre-roll here
+/// would therefore make late packets later, not safer. Holding is worth it
+/// only when it can actually change the outcome, i.e. when the alternative
+/// is pushing packets out of order or with an unannounced hole. Hence:
+/// hold on disorder, never on principle.
+///
+/// The added latency, stated plainly, is **0 ms in the steady state and at
+/// most 40 ms during a loss/reorder event**, after which it returns to 0
+/// on the next in-sequence packet. For comparison, the video path's
+/// [`PACING_MAX_BEHIND`] tolerates up to 300 ms before re-basing; audio is
+/// held to a much tighter bound because lip-sync drift and audio latency
+/// are far more noticeable than a late video frame.
+///
+/// # Bounds
+///
+/// Every input is bounded: at most [`AUDIO_JITTER_MAX_DEPTH`] packets held
+/// (the head is force-released past that, see [`Self::drain`]), at most
+/// [`AUDIO_JITTER_MAX_HOLD`] of delay per packet, at most
+/// [`AUDIO_MAX_CONCEAL_SLOTS`] concealment events per hole, and at most
+/// [`AUDIO_FRAME_DURATION_WINDOW`] remembered deltas. Nothing here grows
+/// with stream length or with how badly the network is behaving.
+struct AudioJitterBuffer {
+    /// Held packets keyed by `pts_us`. `BTreeMap` (not a ring/`VecDeque`)
+    /// because the whole job is "release in PTS order regardless of
+    /// arrival order", and that is exactly what iterating a `BTreeMap`
+    /// from the front gives, with de-duplication by key for free. Bounded
+    /// by [`AUDIO_JITTER_MAX_DEPTH`], so its `O(log n)` is over n ≤ 8.
+    pending: BTreeMap<u64, PendingAudioPacket>,
+    /// `pts_us` of the last packet handed to `appsrc`; `None` before the
+    /// first one (and again after a discontinuity reset).
+    last_released_pts: Option<u64>,
+    /// Sliding window of recent *contiguous* release-to-release PTS
+    /// deltas. The minimum of these is the inferred Opus frame duration —
+    /// see [`Self::frame_duration_us`].
+    recent_deltas: VecDeque<u64>,
+}
+
+impl AudioJitterBuffer {
+    fn new() -> Self {
+        Self {
+            pending: BTreeMap::new(),
+            last_released_pts: None,
+            recent_deltas: VecDeque::new(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// The sender's Opus frame duration, inferred as the smallest delta
+    /// seen between consecutive released packets in the recent past.
+    ///
+    /// Inferred rather than hardcoded to [`AUDIO_DEFAULT_FRAME_DURATION_US`]
+    /// because the whole gap-detection scheme is "how many frame-sized
+    /// slots fit in this hole", which silently produces nonsense if the
+    /// assumed slot size is wrong — and `opusenc`'s `frame-size` is a
+    /// property `audio.rs` could plausibly start setting one day (2.5, 5,
+    /// 10, 20, 40 or 60 ms are all legal). Taking the *minimum* is what
+    /// makes this work at all under loss: a hole inflates a delta to a
+    /// multiple of the frame duration, never to less than it, so lossy
+    /// deltas can only ever be ignored by a `min`, not mistaken for the
+    /// truth.
+    fn frame_duration_us(&self) -> u64 {
+        self.recent_deltas
+            .iter()
+            .copied()
+            .min()
+            .unwrap_or(AUDIO_DEFAULT_FRAME_DURATION_US)
+    }
+
+    fn record_delta(&mut self, delta_us: u64) {
+        // Clamp to the range of legal Opus frame sizes (2.5 ms .. 60 ms):
+        // a delta outside it is measurement noise or a discontinuity, and
+        // letting it into the window would skew every later gap count.
+        let delta = delta_us.clamp(2_500, 60_000);
+        self.recent_deltas.push_back(delta);
+        while self.recent_deltas.len() > AUDIO_FRAME_DURATION_WINDOW {
+            self.recent_deltas.pop_front();
+        }
+    }
+
+    /// Forget the current timeline (used on a PTS discontinuity). The
+    /// learned frame duration is deliberately *kept*: it is a property of
+    /// the sender's encoder configuration, not of the timeline, so a
+    /// capture restart is no reason to re-enter the bootstrap window
+    /// during which gaps go undetected.
+    fn reset_timeline(&mut self) {
+        self.pending.clear();
+        self.last_released_pts = None;
+    }
+
+    /// Accept one decrypted Opus packet and return everything that became
+    /// releasable as a result. Deterministic given `(pts_us, data, now)`
+    /// and the buffer's state — no clock reads, no GStreamer, no sleeping.
+    fn insert(&mut self, pts_us: u64, data: Vec<u8>, now: Instant) -> Vec<AudioAction> {
+        if let Some(last) = self.last_released_pts {
+            if pts_us.saturating_add(AUDIO_PTS_DISCONTINUITY_US) < last {
+                // Far enough backwards that no amount of reordering
+                // explains it: the sender restarted its capture session
+                // and its PTS origin moved. Anything still held belongs to
+                // the dead timeline.
+                tracing::debug!(
+                    "audio PTS discontinuity ({pts_us} << {last}); resetting jitter buffer to the new timeline"
+                );
+                self.reset_timeline();
+            }
+        }
+
+        if let Some(last) = self.last_released_pts {
+            if pts_us <= last {
+                // Its slot is already gone downstream; pushing it now would
+                // hand `opusdec` a backwards timestamp, which is worse than
+                // the loss it was meant to repair. (Also covers exact
+                // duplicates of the last released packet.)
+                tracing::debug!("dropping audio packet pts={pts_us} that arrived after its slot ({last}) shipped");
+                return self.drain(now);
+            }
+        }
+
+        if self.pending.contains_key(&pts_us) {
+            tracing::debug!("dropping duplicate audio packet pts={pts_us}");
+            return self.drain(now);
+        }
+
+        self.pending.insert(pts_us, PendingAudioPacket { data, arrived: now });
+        self.drain(now)
+    }
+
+    /// Time-driven counterpart to [`Self::insert`]: releases anything whose
+    /// hold deadline has expired. Must be called periodically, because a
+    /// hole in the stream means no `insert` is coming to drive it.
+    fn tick(&mut self, now: Instant) -> Vec<AudioAction> {
+        self.drain(now)
+    }
+
+    /// Release everything still held, in PTS order, without waiting or
+    /// concealing — used on a clean shutdown so the tail of the stream
+    /// isn't swallowed. No concealment because there is no point running
+    /// PLC for audio that is about to be followed by EOS.
+    fn flush(&mut self) -> Vec<AudioAction> {
+        let mut out = Vec::with_capacity(self.pending.len());
+        while let Some((pts_us, packet)) = self.pending.pop_first() {
+            self.last_released_pts = Some(pts_us);
+            out.push(AudioAction::Push { pts_us, data: packet.data });
+        }
+        out
+    }
+
+    /// The actual release policy. Repeatedly considers the lowest-PTS held
+    /// packet and either releases it, conceals ahead of it, or stops and
+    /// waits for its missing predecessor.
+    fn drain(&mut self, now: Instant) -> Vec<AudioAction> {
+        let mut out = Vec::new();
+
+        loop {
+            let Some((&pts, packet)) = self.pending.first_key_value() else {
+                break;
+            };
+
+            let Some(last) = self.last_released_pts else {
+                // First packet of a timeline: nothing to order it against
+                // and nothing it could be a gap after. Release at once —
+                // waiting here would be pure startup latency.
+                self.release(pts, &mut out);
+                continue;
+            };
+
+            let frame = self.frame_duration_us();
+            // `pts > last` is guaranteed: `insert` drops anything at or
+            // below `last_released_pts` before it can be queued.
+            let delta = pts - last;
+
+            // Treat the packet as contiguous if it lands within one and a
+            // half frame durations of the last release — half a frame of
+            // slack absorbs any non-exact timestamping without ever
+            // reaching the next real slot.
+            if delta <= frame + frame / 2 {
+                self.record_delta(delta);
+                self.release(pts, &mut out);
+                continue;
+            }
+
+            // At least one slot looks missing. Wait a moment in case it is
+            // merely late (UDP reordering), but not past this packet's own
+            // hold deadline, and never past the depth cap.
+            let overdue = now.saturating_duration_since(packet.arrived) >= AUDIO_JITTER_MAX_HOLD;
+            let over_depth = self.pending.len() > AUDIO_JITTER_MAX_DEPTH;
+            if !overdue && !over_depth {
+                break;
+            }
+
+            // Bootstrap: with no delta observed yet, `frame` is still only
+            // [`AUDIO_DEFAULT_FRAME_DURATION_US`], a guess — and this
+            // branch is precisely the case where the guess disagrees with
+            // reality. Converting a guess into a slot count would be
+            // circular (a legitimate 40 ms-frame stream would look like an
+            // unbroken run of 20 ms losses, and, because concealed deltas
+            // are never recorded, it would never learn otherwise). So the
+            // first delta of a timeline is *defined* to be the frame
+            // duration and is never concealed. The cost is one hold
+            // (≤ 40 ms) at stream start, and only when the very first
+            // delta isn't the assumed 20 ms; note the packet was still
+            // held first, so a merely-reordered second packet is repaired
+            // normally rather than mislearned.
+            if self.recent_deltas.is_empty() {
+                self.record_delta(delta);
+                self.release(pts, &mut out);
+                continue;
+            }
+
+            // Give up on the missing packet(s) and tell `opusdec`, so the
+            // hole is filled with concealment rather than with nothing.
+            let missing = (delta / frame).saturating_sub(1).min(AUDIO_MAX_CONCEAL_SLOTS);
+            for slot in 0..missing {
+                out.push(AudioAction::Conceal {
+                    pts_us: last + (slot + 1) * frame,
+                    duration_us: frame,
+                });
+            }
+            // Deliberately *not* `record_delta(delta)`: this delta is
+            // inflated by the hole, so feeding it to the frame-duration
+            // estimator would only ever make the estimate worse.
+            self.release(pts, &mut out);
+        }
+
+        out
+    }
+
+    /// Move the packet at `pts` out of `pending` and onto the action list.
+    fn release(&mut self, pts: u64, out: &mut Vec<AudioAction>) {
+        let packet = self
+            .pending
+            .remove(&pts)
+            .expect("release is only ever called for a pts just observed in `pending`");
+        self.last_released_pts = Some(pts);
+        out.push(AudioAction::Push { pts_us: pts, data: packet.data });
+    }
 }
 
 /// Decodes and plays one subscribed audio stream's incoming Opus packets.
@@ -586,6 +1166,40 @@ impl AudioDecoder {
     /// `ClientEvent::MediaFrame` payload from `net.rs` for a
     /// `StreamKind::Audio` stream). Packets for a different `stream_id` are
     /// ignored defensively, mirroring `StreamDecoder::feed`. Never blocks.
+    ///
+    /// Packets may arrive here in any order and with holes; this method
+    /// does not care. Ordering and loss handling happen once, downstream,
+    /// in the pipeline thread's [`AudioJitterBuffer`] — see the module
+    /// docs' "Reordering and packet-loss concealment" section.
+    ///
+    /// # Why this channel stays unbounded, unlike video's
+    ///
+    /// [`StreamDecoder::feed`] pushes onto a small `sync_channel` and drops
+    /// on overflow; this one uses a plain unbounded `channel`. That
+    /// asymmetry is deliberate on both counts:
+    ///
+    /// - **It is not the buffer that needed bounding.** The bug this path
+    ///   had was a *missing* buffer (no reordering, no concealment), and
+    ///   the one added — [`AudioJitterBuffer`] — is hard-capped at
+    ///   [`AUDIO_JITTER_MAX_DEPTH`] packets and [`AUDIO_JITTER_MAX_HOLD`]
+    ///   of delay. No unbounded buffer was introduced here.
+    /// - **The volumes are not comparable.** Video queues whole H.264
+    ///   access units (tens of KB, 30-60/s); audio queues Opus packets at
+    ///   ~50/s of ~100 bytes each, so even a pathological multi-second
+    ///   stall on the pipeline thread costs single-digit KB. Bounding that
+    ///   buys nothing.
+    /// - **Bounding it would risk a hang.** A `SyncSender` blocks when
+    ///   full, and `Drop` *must* get its `Shutdown` through or the pipeline
+    ///   thread never exits and `join()` never returns. This module's
+    ///   `set_volume` is documented as non-blocking too. Trading a
+    ///   few-KB memory bound for a new way to wedge the UI thread is a bad
+    ///   deal — and this repo has already had to fix that exact shape of
+    ///   hang twice (`AudioCaptureHandle::stop()`, `CaptureHandle::stop()`).
+    ///
+    /// If the pipeline thread ever does fall behind, the packets still
+    /// arrive in order and simply get pushed late; the jitter buffer
+    /// releases them contiguously without concealing anything, because a
+    /// backlog is a latency problem, not a loss problem.
     pub fn feed(&mut self, frame: &DecryptedMediaFrame) {
         if frame.stream_id != self.stream_id {
             return;
@@ -625,6 +1239,31 @@ impl Drop for AudioDecoder {
     }
 }
 
+/// Builds the `opusdec` element with packet-loss concealment enabled.
+///
+/// Split out from [`run_audio_pipeline`] purely so the `plc` setting is
+/// reachable from a test (everything else in that function is owned by a
+/// background thread the moment it starts) — see
+/// `production_opus_decoder_has_plc_enabled`. It is worth pinning down:
+/// PLC is OFF by default in `opusdec` (verified: `gst-inspect-1.0 opusdec`
+/// → "plc ... Boolean. Default: false"), so without this line every `GAP`
+/// event [`AudioJitterBuffer`] emits would be silently ignored and every
+/// lost packet would stay an audible hole — i.e. the concealment half of
+/// this module's fix would be dead code, and nothing else would fail
+/// loudly enough to notice.
+///
+/// `use-inband-fec` is deliberately left off: it needs the *sender* to
+/// encode redundancy, and `audio.rs` builds `opusenc` with its default
+/// `inband-fec=false`, so there would be no FEC data to recover from. This
+/// is concealment, not recovery.
+fn make_opus_decoder() -> Result<Element> {
+    let decoder = ElementFactory::make("opusdec")
+        .build()
+        .context("opusdec element unavailable (is gst-plugins-base installed?)")?;
+    decoder.set_property("plc", true);
+    Ok(decoder)
+}
+
 /// Builds the audio pipeline, drives it to `Playing`, and pumps `rx` until
 /// `Shutdown` (or the channel disconnects because every `AudioDecoder`
 /// handle was dropped) — see module docs "Audio"/"Threading".
@@ -640,9 +1279,7 @@ fn run_audio_pipeline(
         .name("src")
         .build()
         .context("appsrc element unavailable")?;
-    let decoder = ElementFactory::make("opusdec")
-        .build()
-        .context("opusdec element unavailable (is gst-plugins-base installed?)")?;
+    let decoder = make_opus_decoder()?;
     let convert = ElementFactory::make("audioconvert")
         .build()
         .context("audioconvert element unavailable")?;
@@ -689,20 +1326,221 @@ fn run_audio_pipeline(
     result
 }
 
-/// Feed loop: pushes Opus packets into `appsrc`, applies volume changes to
-/// the `volume` element, and drains the bus for error/warning logging in
-/// between, until told to shut down. Mirrors video's `pump_loop`.
+/// Poll interval while [`AudioJitterBuffer`] is holding something. Has to
+/// be well under [`AUDIO_JITTER_MAX_HOLD`] so a hold deadline fires close
+/// to on time rather than up to a whole idle-poll late — the tick *is* the
+/// buffer's clock.
+const AUDIO_HELD_POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// Poll interval while the buffer is empty. Unchanged from the loop's
+/// original timeout: with nothing held there is no deadline to miss, and
+/// this only paces how often the GStreamer bus gets drained.
+const AUDIO_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Feed loop: runs incoming Opus packets through [`AudioJitterBuffer`] and
+/// pushes what it releases into `appsrc`, applies volume changes to the
+/// `volume` element, and drains the bus for error/warning logging in
+/// between, until told to shut down. Mirrors video's `pump_loop`, plus the
+/// jitter buffer (which video does not need — see the module docs).
 fn pump_audio_loop(rx: &std_mpsc::Receiver<AudioPipelineMsg>, appsrc: &AppSrc, volume: &Element, bus: &Bus) -> Result<()> {
+    // Both owned outright by this thread — see the module docs' audio
+    // "Threading" note for why they need no lock.
+    let mut jitter = AudioJitterBuffer::new();
+    let mut timeline = AudioTimeline::new();
+
     loop {
         while let Some(msg) = bus.pop() {
             log_bus_message(&msg);
         }
 
-        match rx.recv_timeout(Duration::from_millis(50)) {
+        let timeout = if jitter.is_empty() {
+            AUDIO_IDLE_POLL_INTERVAL
+        } else {
+            AUDIO_HELD_POLL_INTERVAL
+        };
+
+        match rx.recv_timeout(timeout) {
             Ok(AudioPipelineMsg::Packet { pts_us, data }) => {
+                let actions = jitter.insert(pts_us, data, Instant::now());
+                apply_audio_actions(appsrc, &mut timeline, actions);
+            }
+            Ok(AudioPipelineMsg::SetVolume(v)) => {
+                volume.set_property("volume", v);
+            }
+            Ok(AudioPipelineMsg::Shutdown) => {
+                apply_audio_actions(appsrc, &mut timeline, jitter.flush());
+                return Ok(());
+            }
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                // The buffer's clock tick: this is what lets a hole in the
+                // stream be noticed at all, since no packet arrives to
+                // drive `insert`.
+                let actions = jitter.tick(Instant::now());
+                apply_audio_actions(appsrc, &mut timeline, actions);
+            }
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                apply_audio_actions(appsrc, &mut timeline, jitter.flush());
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// How far *ahead* of this pipeline's current running time the first
+/// packet of a timeline is scheduled by [`AudioTimeline`], and therefore
+/// the steady-state playout latency the receiver adds on purpose.
+///
+/// Has to comfortably exceed [`AUDIO_JITTER_MAX_HOLD`] (40 ms): a packet
+/// the jitter buffer held while waiting for a missing predecessor reaches
+/// the sink that much later in wall-clock terms than its in-order
+/// siblings, and anything that reaches a `sync=true` sink *after* its
+/// scheduled playout time is dropped rather than played. The rest is
+/// headroom for network jitter that the very first packet happened not to
+/// suffer. 100 ms is inaudible as latency in a screensharing call and
+/// leaves 60 ms of that headroom.
+const AUDIO_TARGET_LEAD_US: i64 = 100_000;
+
+/// How late a mapped packet may be (i.e. how far its scheduled playout
+/// time may have slipped into the past) before [`AudioTimeline`] gives up
+/// on the current mapping and re-bases. Generous compared to
+/// [`AUDIO_TARGET_LEAD_US`] because a re-base is itself a discontinuity
+/// the sink has to resynchronize over: better to let the sink drop a
+/// couple of individually-late packets than to re-base on every jitter
+/// spike.
+const AUDIO_MAX_LATE_US: i64 = 200_000;
+
+/// How far *beyond* [`AUDIO_TARGET_LEAD_US`] a mapped packet may drift
+/// into the future before [`AudioTimeline`] re-bases. Catches the sender
+/// restarting its capture session (PTS origin moves forwards) and the slow
+/// accumulation from a sender clock that runs faster than this receiver's.
+const AUDIO_MAX_EARLY_US: i64 = AUDIO_TARGET_LEAD_US + 1_000_000;
+
+/// Maps the *sender's* capture-time PTS onto *this* pipeline's running
+/// time, which is the clock the audio sink actually schedules against.
+///
+/// # Why this is needed at all
+///
+/// `pts_us` is the sender's own running time — how long its capture
+/// pipeline had been running when the packet was encoded (see
+/// `audio.rs::send_encoded_sample`). The receiver's audio sink runs with
+/// `sync=true`, so it plays each buffer when *this* pipeline's running
+/// time (0 at the moment [`run_audio_pipeline`] hits `Playing`, i.e. at
+/// subscribe) reaches that buffer's PTS. The two clocks have no defined
+/// relationship whatsoever: the offset between them is exactly "how long
+/// the sender had been sharing audio before this viewer subscribed".
+///
+/// Pushing the sender's raw PTS therefore schedules the first packet that
+/// many seconds into the receiver's future. Measured on this machine
+/// (GStreamer 1.28.5) with `appsrc ! opusdec ! audioconvert !
+/// audioresample ! volume ! <sink sync=true>`, feeding 61 real Opus
+/// packets in real time:
+///
+/// | first PTS | buffers that reached the sink | buffers rendered |
+/// | --- | --- | --- |
+/// | at the pipeline's running time | 61 / 61 | 61 |
+/// | 30 s ahead of it | 1 / 61 (`fakesink`), 6 / 61 (`autoaudiosink`) | 0 |
+///
+/// i.e. a viewer who joins 30 s after the sharer started gets **no audio
+/// at all**, and the sink's blocked streaming thread back-pressures the
+/// whole chain so packets pile up inside `appsrc` instead. This is the
+/// same footgun [`PacingState`] documents on the video side, where it was
+/// avoided by leaving the appsink at `sync=false` and pacing by hand; the
+/// audio path cannot do that (there is no manual "display" step — the sink
+/// *is* the clock), so it re-bases the timestamps instead.
+///
+/// # How
+///
+/// The first packet of a timeline is scheduled at `now +
+/// `[`AUDIO_TARGET_LEAD_US`], and every later packet keeps its exact
+/// spacing relative to it by carrying the same offset. So the sender's
+/// intervals — the only part of its timeline that means anything here —
+/// are preserved, while the origin becomes one this pipeline can act on.
+/// The offset is recomputed only when the mapping has clearly stopped
+/// describing reality ([`AUDIO_MAX_LATE_US`] / [`AUDIO_MAX_EARLY_US`]),
+/// which covers a sender capture restart and long-run clock drift alike —
+/// the same self-healing-on-discontinuity approach as [`PacingState`].
+struct AudioTimeline {
+    /// Added to a sender PTS to get a receiver running-time PTS. Signed:
+    /// a sender that started before this viewer subscribed needs a
+    /// negative offset. `None` until the first packet establishes it.
+    offset_us: Option<i64>,
+}
+
+impl AudioTimeline {
+    fn new() -> Self {
+        Self { offset_us: None }
+    }
+
+    /// Map one packet's PTS, (re-)establishing the offset if there isn't a
+    /// usable one. Pure/deterministic given its inputs — no clock reads, no
+    /// GStreamer — so it's unit-testable on its own; see
+    /// `tests::timeline_*`.
+    fn map_push(&mut self, sender_pts_us: u64, running_now_us: u64) -> u64 {
+        if let Some(offset) = self.offset_us {
+            let target = sender_pts_us as i64 + offset;
+            let lead = target - running_now_us as i64;
+            if (-AUDIO_MAX_LATE_US..=AUDIO_MAX_EARLY_US).contains(&lead) {
+                return target.max(0) as u64;
+            }
+            tracing::debug!(
+                "re-basing audio timeline: sender pts={sender_pts_us} mapped to {lead} us from now, \
+                 outside [{}, {}]",
+                -AUDIO_MAX_LATE_US,
+                AUDIO_MAX_EARLY_US
+            );
+        }
+
+        let target = running_now_us as i64 + AUDIO_TARGET_LEAD_US;
+        self.offset_us = Some(target - sender_pts_us as i64);
+        target as u64
+    }
+
+    /// Map a concealment slot's PTS. Never re-bases: a `GAP` sits *between*
+    /// two real packets and has to stay on whatever timeline they are on,
+    /// and it carries no new information about how well that timeline is
+    /// tracking. `None` before any packet has established an offset (which
+    /// [`AudioJitterBuffer`] never actually produces — it only conceals
+    /// after a release — but is not worth guessing at if it ever did).
+    fn map_gap(&self, sender_pts_us: u64) -> Option<u64> {
+        let offset = self.offset_us?;
+        Some((sender_pts_us as i64 + offset).max(0) as u64)
+    }
+}
+
+/// This pipeline's current running time in microseconds — the axis a
+/// `sync=true` sink schedules playout on, and what [`AudioTimeline`] maps
+/// sender PTS onto. `0` if the pipeline has no clock/base time yet (it
+/// does by the time `Playing` is set, but a missing clock must not panic).
+fn running_time_us(element: &AppSrc) -> u64 {
+    element.current_running_time().map(|t| t.useconds()).unwrap_or(0)
+}
+
+/// Turns [`AudioJitterBuffer`]'s decisions into actual GStreamer calls,
+/// re-basing each timestamp from the sender's timeline onto this
+/// pipeline's via `timeline` (see [`AudioTimeline`] for why that is not
+/// optional). Kept as thin as possible so essentially all of the logic
+/// stays in the pipeline-free, unit-tested [`AudioJitterBuffer`] and
+/// [`AudioTimeline`].
+fn apply_audio_actions(appsrc: &AppSrc, timeline: &mut AudioTimeline, actions: Vec<AudioAction>) {
+    if actions.is_empty() {
+        return;
+    }
+    // One clock read per batch: a batch is emitted in a single pass with
+    // no waiting in between, so reading it per action would only add noise
+    // to timestamps that are meant to keep their exact relative spacing.
+    let now_us = running_time_us(appsrc);
+
+    for action in actions {
+        match action {
+            AudioAction::Push { pts_us, data } => {
+                let mapped_pts_us = timeline.map_push(pts_us, now_us);
                 let mut buffer = Buffer::from_slice(data);
                 if let Some(buffer_mut) = buffer.get_mut() {
-                    buffer_mut.set_pts(ClockTime::from_useconds(pts_us));
+                    buffer_mut.set_pts(ClockTime::from_useconds(mapped_pts_us));
+                    // Deliberately no `set_duration`: libopus derives each
+                    // packet's real duration from its TOC byte, and
+                    // stamping a *guessed* duration that disagrees with it
+                    // would be worse than stamping none.
                 }
                 // Same "glitch and continue" policy as video: a bad packet
                 // downstream of a dropped fragment is logged and skipped,
@@ -711,12 +1549,22 @@ fn pump_audio_loop(rx: &std_mpsc::Receiver<AudioPipelineMsg>, appsrc: &AppSrc, v
                     tracing::warn!("appsrc dropped an audio packet: {e:?}");
                 }
             }
-            Ok(AudioPipelineMsg::SetVolume(v)) => {
-                volume.set_property("volume", v);
+            AudioAction::Conceal { pts_us, duration_us } => {
+                let Some(mapped_pts_us) = timeline.map_gap(pts_us) else {
+                    tracing::debug!("skipping GAP at pts={pts_us}: no audio timeline established yet");
+                    continue;
+                };
+                let gap = gstreamer::event::Gap::builder(ClockTime::from_useconds(mapped_pts_us))
+                    .duration(ClockTime::from_useconds(duration_us))
+                    .build();
+                // `Gap` is a serialized event, so `appsrc` queues it in
+                // its own internal queue alongside buffers instead of
+                // letting it overtake them — which is what keeps the
+                // concealed frame in its correct slot.
+                if !appsrc.send_event(gap) {
+                    tracing::debug!("appsrc refused a GAP event at pts={pts_us}; loss will not be concealed");
+                }
             }
-            Ok(AudioPipelineMsg::Shutdown) => return Ok(()),
-            Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std_mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
     }
 }
@@ -935,6 +1783,87 @@ mod preview_tests {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    /// First frame is always displayed immediately (no delay), and it
+    /// establishes the baseline that later frames are paced against.
+    #[test]
+    fn pacing_first_frame_has_no_delay() {
+        let mut pacing = PacingState::new();
+        let now = Instant::now();
+        assert_eq!(pacing.next_delay(1_000_000, now), None);
+        assert_eq!(pacing.base, Some((1_000_000, now)));
+    }
+
+    /// A frame whose PTS is ahead of elapsed wall-clock time (decode kept
+    /// up and finished early) should be paced: delayed by exactly the
+    /// remaining gap, not displayed immediately.
+    #[test]
+    fn pacing_sleeps_for_frames_ahead_of_schedule() {
+        let mut pacing = PacingState::new();
+        let start = Instant::now();
+        assert_eq!(pacing.next_delay(0, start), None);
+
+        // Second frame is 33ms later by PTS, but only 5ms of wall-clock
+        // time actually elapsed decoding it: should wait out the other 28ms.
+        let now = start + Duration::from_millis(5);
+        let delay = pacing.next_delay(33_000, now).expect("frame ahead of schedule should be delayed");
+        assert_eq!(delay, Duration::from_millis(28));
+        // Delaying doesn't itself move the baseline — only a big fall-behind does.
+        assert_eq!(pacing.base, Some((0, start)));
+    }
+
+    /// A frame whose target has already passed, but only by a small amount
+    /// (normal jitter), is displayed immediately without resetting the
+    /// baseline — this is the "on schedule or trivially behind" case.
+    #[test]
+    fn pacing_displays_immediately_when_slightly_behind() {
+        let mut pacing = PacingState::new();
+        let start = Instant::now();
+        assert_eq!(pacing.next_delay(0, start), None);
+
+        // PTS says this frame should have shown 10ms ago; well within the
+        // 300ms clamp, so no reset.
+        let now = start + Duration::from_millis(10);
+        assert_eq!(pacing.next_delay(0, now), None);
+        assert_eq!(pacing.base, Some((0, start)), "small jitter must not re-base pacing");
+    }
+
+    /// Falling behind by more than `PACING_MAX_BEHIND` (a real stall, not
+    /// just jitter) must give up catching up and re-base on the current
+    /// frame instead of letting the gap accumulate.
+    #[test]
+    fn pacing_rebases_after_falling_far_behind() {
+        let mut pacing = PacingState::new();
+        let start = Instant::now();
+        assert_eq!(pacing.next_delay(0, start), None);
+
+        // Decode stalled for 500ms (> PACING_MAX_BEHIND) while PTS only
+        // advanced 50ms: this frame's target is nearly 450ms in the past.
+        let now = start + Duration::from_millis(500);
+        assert_eq!(pacing.next_delay(50_000, now), None, "badly-behind frame must display immediately");
+        assert_eq!(pacing.base, Some((50_000, now)), "baseline must re-base to the current frame");
+    }
+
+    /// A PTS discontinuity (stream restart / first keyframe after
+    /// resubscribing) can make the new `pts_us` smaller than the previous
+    /// baseline's — `saturating_sub` must not panic, and once enough real
+    /// time has passed for the resulting (clamped-to-zero) target to fall
+    /// more than `PACING_MAX_BEHIND` in the past, it must trigger the same
+    /// re-base as a stall rather than being treated as merely "ahead".
+    #[test]
+    fn pacing_rebases_on_pts_discontinuity() {
+        let mut pacing = PacingState::new();
+        let start = Instant::now();
+        assert_eq!(pacing.next_delay(5_000_000, start), None);
+
+        // New stream's PTS restarts near zero, far below the old baseline
+        // (saturating_sub clamps the elapsed-since-base to 0, so `target`
+        // collapses to `start`); `now` is far enough past `start` that
+        // `target` is more than PACING_MAX_BEHIND in the past.
+        let now = start + PACING_MAX_BEHIND + Duration::from_millis(50);
+        assert_eq!(pacing.next_delay(1_000, now), None);
+        assert_eq!(pacing.base, Some((1_000, now)), "discontinuity must re-base rather than panic or stall forever");
+    }
 
     /// End-to-end correctness check of the *decode* half of this module,
     /// bypassing the network/crypto layer entirely (out of scope here —
@@ -1359,5 +2288,725 @@ mod tests {
 
         let _ = pipeline.set_state(State::Null);
         packets
+    }
+
+    // -----------------------------------------------------------------
+    // AudioJitterBuffer — pure reordering / gap-detection logic
+    //
+    // These are the audio counterpart of the `pacing_*` tests above: the
+    // whole decision-making is a plain struct over `(pts, data, Instant)`
+    // with no GStreamer and no sleeping in it, so every case below is
+    // deterministic and runs instantly. The one thing they can't prove —
+    // that a `GAP` event actually makes `opusdec` conceal — is covered
+    // separately by `gap_event_makes_opusdec_conceal_a_missing_packet`.
+    // -----------------------------------------------------------------
+
+    /// Distinguishable stand-in payload; the buffer never looks inside it.
+    fn opus_stub(tag: u8) -> Vec<u8> {
+        vec![tag; 4]
+    }
+
+    fn pushed(actions: &[AudioAction]) -> Vec<u64> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                AudioAction::Push { pts_us, .. } => Some(*pts_us),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn concealed(actions: &[AudioAction]) -> Vec<u64> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                AudioAction::Conceal { pts_us, .. } => Some(*pts_us),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Feeds `pts` values in order at the same instant and returns every
+    /// action produced, so tests can set a buffer up to a known state.
+    fn feed_in_order(buffer: &mut AudioJitterBuffer, ptss: &[u64], now: Instant) -> Vec<AudioAction> {
+        let mut out = Vec::new();
+        for (i, &pts) in ptss.iter().enumerate() {
+            out.extend(buffer.insert(pts, opus_stub(i as u8), now));
+        }
+        out
+    }
+
+    /// The steady state, and the single most important property of this
+    /// design: a healthy in-order stream is released packet-for-packet with
+    /// **no delay and no concealment**. The buffer must not be a pre-roll —
+    /// see [`AudioJitterBuffer`]'s doc comment for why holding packets on
+    /// principle would make late audio later, not safer.
+    #[test]
+    fn jitter_releases_an_in_order_stream_with_zero_delay() {
+        let mut buffer = AudioJitterBuffer::new();
+        let now = Instant::now();
+
+        for i in 0..10u64 {
+            let actions = buffer.insert(i * 20_000, opus_stub(i as u8), now);
+            assert_eq!(
+                pushed(&actions),
+                vec![i * 20_000],
+                "each in-order packet must be released by the very insert that delivered it"
+            );
+            assert!(concealed(&actions).is_empty(), "a lossless stream must never trigger concealment");
+        }
+        assert!(buffer.is_empty(), "nothing should still be held after an in-order stream");
+    }
+
+    /// Two packets that raced over UDP and landed swapped must come back
+    /// out in PTS order, with no concealment — this is a reordering event,
+    /// not a loss, and telling `opusdec` a packet was lost when it wasn't
+    /// would replace good audio with PLC.
+    #[test]
+    fn jitter_reorders_a_swapped_pair_without_concealing() {
+        let mut buffer = AudioJitterBuffer::new();
+        let t0 = Instant::now();
+
+        assert_eq!(pushed(&buffer.insert(0, opus_stub(0), t0)), vec![0]);
+
+        // 40_000 overtakes 20_000: it must be held, not pushed.
+        let held = buffer.insert(40_000, opus_stub(2), t0);
+        assert!(held.is_empty(), "an out-of-sequence packet must be held, not pushed immediately");
+        assert!(!buffer.is_empty());
+
+        // The straggler shows up 5ms later, well inside the hold window.
+        let actions = buffer.insert(20_000, opus_stub(1), t0 + Duration::from_millis(5));
+        assert_eq!(pushed(&actions), vec![20_000, 40_000], "both packets must be released in PTS order");
+        assert!(
+            concealed(&actions).is_empty(),
+            "a packet that merely arrived late must not be reported to opusdec as lost"
+        );
+        assert!(buffer.is_empty());
+    }
+
+    /// A genuinely lost packet: after the hold window expires with no
+    /// straggler, the buffer must emit a `Conceal` for the missing slot
+    /// *before* releasing the packet that follows it, so `opusdec` runs PLC
+    /// in the right place instead of leaving a hole.
+    #[test]
+    fn jitter_conceals_a_lost_packet_once_the_hold_expires() {
+        let mut buffer = AudioJitterBuffer::new();
+        let t0 = Instant::now();
+
+        // Two good packets first, so the 20ms frame duration is learned.
+        feed_in_order(&mut buffer, &[0, 20_000], t0);
+
+        // 40_000 is lost; 60_000 arrives.
+        let held = buffer.insert(60_000, opus_stub(3), t0);
+        assert!(held.is_empty(), "must wait before declaring a loss — it could just be reordering");
+
+        // Still nothing just before the deadline.
+        let early = buffer.tick(t0 + AUDIO_JITTER_MAX_HOLD - Duration::from_millis(1));
+        assert!(early.is_empty(), "must not give up on the missing packet before the hold expires");
+
+        let actions = buffer.tick(t0 + AUDIO_JITTER_MAX_HOLD);
+        assert_eq!(
+            actions,
+            vec![
+                AudioAction::Conceal { pts_us: 40_000, duration_us: 20_000 },
+                AudioAction::Push { pts_us: 60_000, data: opus_stub(3) },
+            ],
+            "the gap must be announced at the missing packet's own slot, ahead of the next real packet"
+        );
+        assert!(buffer.is_empty());
+    }
+
+    /// The depth cap is the buffer's hard ceiling: once more than
+    /// [`AUDIO_JITTER_MAX_DEPTH`] packets are held, the head is released
+    /// immediately even though its hold window hasn't expired. Without this
+    /// a sustained one-way hole would let the buffer (and latency) grow.
+    #[test]
+    fn jitter_depth_cap_forces_release_before_the_hold_expires() {
+        let mut buffer = AudioJitterBuffer::new();
+        let t0 = Instant::now();
+        feed_in_order(&mut buffer, &[0, 20_000], t0);
+
+        // 40_000 is lost. Everything after it arrives at the *same instant*,
+        // so no hold deadline can ever expire — only the depth cap can
+        // break the deadlock.
+        let mut released_at = None;
+        for i in 0..(AUDIO_JITTER_MAX_DEPTH + 1) {
+            let pts = 60_000 + (i as u64) * 20_000;
+            let actions = buffer.insert(pts, opus_stub(9), t0);
+            if !actions.is_empty() {
+                released_at = Some((i, actions));
+                break;
+            }
+            assert!(
+                buffer.pending.len() <= AUDIO_JITTER_MAX_DEPTH,
+                "buffer exceeded its own depth cap while still holding everything"
+            );
+        }
+
+        let (i, actions) = released_at.expect("the depth cap must eventually force a release");
+        assert_eq!(
+            i, AUDIO_JITTER_MAX_DEPTH,
+            "release should happen exactly when the cap is exceeded, not earlier or later"
+        );
+        assert_eq!(concealed(&actions), vec![40_000], "the lost slot must still be concealed on a forced release");
+        assert!(buffer.is_empty(), "a forced release must drain the whole backlog, not just one packet");
+    }
+
+    /// A packet whose slot has already been shipped downstream must be
+    /// dropped, not pushed. Pushing it would hand `opusdec` a backwards
+    /// timestamp, which is a worse defect than the loss it would repair.
+    #[test]
+    fn jitter_drops_a_packet_that_arrives_after_its_slot_shipped() {
+        let mut buffer = AudioJitterBuffer::new();
+        let t0 = Instant::now();
+        feed_in_order(&mut buffer, &[0, 20_000, 40_000], t0);
+
+        let late = buffer.insert(20_000, opus_stub(1), t0 + Duration::from_millis(100));
+        assert!(late.is_empty(), "a packet later than the last released one must never be pushed");
+        assert_eq!(buffer.last_released_pts, Some(40_000), "a late packet must not rewind the timeline");
+        assert!(buffer.is_empty());
+    }
+
+    /// Duplicate delivery (QUIC datagrams can be duplicated by middleboxes,
+    /// and a retransmitted fragment can complete the same frame twice) must
+    /// not produce two pushes of the same slot.
+    #[test]
+    fn jitter_drops_duplicate_packets() {
+        let mut buffer = AudioJitterBuffer::new();
+        let t0 = Instant::now();
+        feed_in_order(&mut buffer, &[0, 20_000], t0);
+
+        // Duplicate of a packet still held (it's out of sequence, so it
+        // stays in `pending` rather than being released immediately).
+        assert!(buffer.insert(80_000, opus_stub(4), t0).is_empty());
+        assert!(buffer.insert(80_000, opus_stub(4), t0).is_empty());
+        assert_eq!(buffer.pending.len(), 1, "a duplicate must not occupy a second slot in the buffer");
+
+        let actions = buffer.tick(t0 + AUDIO_JITTER_MAX_HOLD);
+        assert_eq!(pushed(&actions), vec![80_000], "the duplicated packet must be pushed exactly once");
+    }
+
+    /// A sender restarting its capture session restarts its PTS origin near
+    /// zero (`audio.rs` timestamps against a fresh `Instant`). Without a
+    /// reset every subsequent packet would look "late" forever and audio
+    /// would go permanently silent. Same self-healing intent as
+    /// [`PacingState`]'s re-base on the video side.
+    #[test]
+    fn jitter_resets_on_a_backwards_pts_discontinuity() {
+        let mut buffer = AudioJitterBuffer::new();
+        let t0 = Instant::now();
+        feed_in_order(&mut buffer, &[10_000_000, 10_020_000, 10_040_000], t0);
+        assert_eq!(buffer.last_released_pts, Some(10_040_000));
+
+        // New session: PTS restarts near zero.
+        let actions = buffer.insert(0, opus_stub(0), t0 + Duration::from_millis(500));
+        assert_eq!(pushed(&actions), vec![0], "the first packet of the new timeline must play, not be discarded");
+        assert!(
+            concealed(&actions).is_empty(),
+            "a restart is a discontinuity, not a 500-second hole to conceal"
+        );
+
+        // And the new timeline continues normally, with the frame duration
+        // learned from the old one carried over (no second bootstrap).
+        let actions = buffer.insert(20_000, opus_stub(1), t0 + Duration::from_millis(520));
+        assert_eq!(pushed(&actions), vec![20_000]);
+        assert!(concealed(&actions).is_empty());
+    }
+
+    /// The frame duration is inferred, not hardcoded: a sender configured
+    /// with `opusenc frame-size=40` must not have every one of its packets
+    /// read as a 20ms loss. Costs one bootstrap hold at stream start, then
+    /// gap detection works on the real 40ms grid.
+    #[test]
+    fn jitter_learns_a_frame_duration_other_than_the_20ms_default() {
+        let mut buffer = AudioJitterBuffer::new();
+        let t0 = Instant::now();
+
+        assert_eq!(pushed(&buffer.insert(0, opus_stub(0), t0)), vec![0]);
+
+        // 40ms delta doesn't match the assumed 20ms grid, so it's held
+        // first (it could be a reorder) and then accepted as the real frame
+        // duration — never concealed, since nothing has been learned yet.
+        assert!(buffer.insert(40_000, opus_stub(1), t0).is_empty());
+        let actions = buffer.tick(t0 + AUDIO_JITTER_MAX_HOLD);
+        assert_eq!(pushed(&actions), vec![40_000]);
+        assert!(
+            concealed(&actions).is_empty(),
+            "the first delta of a stream defines the frame duration; it must not be mistaken for a loss"
+        );
+        assert_eq!(buffer.frame_duration_us(), 40_000, "the 40ms frame duration should now be learned");
+
+        // On the learned grid, a further 40ms step is contiguous...
+        let t1 = t0 + AUDIO_JITTER_MAX_HOLD;
+        let actions = buffer.insert(80_000, opus_stub(2), t1);
+        assert_eq!(pushed(&actions), vec![80_000]);
+        assert!(concealed(&actions).is_empty());
+
+        // ...and an 80ms step is exactly one missing 40ms slot, not two
+        // missing 20ms ones.
+        assert!(buffer.insert(160_000, opus_stub(4), t1).is_empty());
+        let actions = buffer.tick(t1 + AUDIO_JITTER_MAX_HOLD);
+        assert_eq!(
+            actions,
+            vec![
+                AudioAction::Conceal { pts_us: 120_000, duration_us: 40_000 },
+                AudioAction::Push { pts_us: 160_000, data: opus_stub(4) },
+            ]
+        );
+    }
+
+    /// A long outage must not turn into an unbounded burst of concealment
+    /// events. Beyond [`AUDIO_MAX_CONCEAL_SLOTS`] the buffer accepts the
+    /// discontinuity and moves on — Opus PLC has decayed to near-silence
+    /// long before that anyway.
+    #[test]
+    fn jitter_caps_concealment_for_a_long_outage() {
+        let mut buffer = AudioJitterBuffer::new();
+        let t0 = Instant::now();
+        feed_in_order(&mut buffer, &[0, 20_000], t0);
+
+        // ~2 seconds of audio missing.
+        assert!(buffer.insert(2_020_000, opus_stub(7), t0).is_empty());
+        let actions = buffer.tick(t0 + AUDIO_JITTER_MAX_HOLD);
+
+        let conceals = concealed(&actions);
+        assert_eq!(
+            conceals.len() as u64,
+            AUDIO_MAX_CONCEAL_SLOTS,
+            "concealment must be capped, not proportional to the outage length"
+        );
+        assert_eq!(conceals, vec![40_000, 60_000, 80_000, 100_000, 120_000]);
+        assert_eq!(pushed(&actions), vec![2_020_000], "playback must resume at the first packet that did arrive");
+    }
+
+    /// Shutdown must not swallow whatever was still held: `flush` releases
+    /// everything in PTS order (and, deliberately, without concealing —
+    /// there is no point running PLC for audio immediately followed by EOS).
+    #[test]
+    fn jitter_flush_releases_everything_still_held_in_order() {
+        let mut buffer = AudioJitterBuffer::new();
+        let t0 = Instant::now();
+        feed_in_order(&mut buffer, &[0, 20_000], t0);
+
+        assert!(buffer.insert(100_000, opus_stub(5), t0).is_empty());
+        assert!(buffer.insert(80_000, opus_stub(4), t0).is_empty());
+
+        let actions = buffer.flush();
+        assert_eq!(pushed(&actions), vec![80_000, 100_000]);
+        assert!(concealed(&actions).is_empty());
+        assert!(buffer.is_empty());
+    }
+
+    /// The measurement quoted in this module's "Reordering and packet-loss
+    /// concealment" docs, as an executable assertion — and the one part of
+    /// the fix the pure tests above cannot reach, since it depends entirely
+    /// on GStreamer/libopus behavior rather than on this module's logic.
+    ///
+    /// Runs three variants of `appsrc ! opusdec ! audioconvert ! appsink`
+    /// over the same real Opus clip and compares them:
+    ///
+    /// 1. **all packets** — the reference output length.
+    /// 2. **one packet dropped, nothing signalled** — what this module used
+    ///    to do. Must come out *short* by exactly one frame of PCM, and
+    ///    with `opusdec` never having concealed anything. This is the
+    ///    reported stutter, reproduced.
+    /// 3. **one packet dropped, `GAP` event sent** (with `plc=true`, as
+    ///    `run_audio_pipeline` now builds it) — must match the reference
+    ///    length again, with `opusdec`'s own `stats` confirming PLC ran.
+    ///
+    /// Asserting (2) as well as (3) is what makes this a discriminating
+    /// test rather than a smoke test: it proves the fix changes the outcome,
+    /// instead of merely proving the fixed pipeline doesn't crash.
+    #[test]
+    fn gap_event_makes_opusdec_conceal_a_missing_packet() {
+        gstreamer::init().expect("gstreamer init");
+
+        const SKIP: usize = 10;
+        let packets = encode_test_opus_clip(30);
+        assert!(packets.len() > SKIP + 2, "need a clip long enough to punch a hole in the middle");
+
+        let baseline = run_opus_loss_case(&packets, None, false);
+        let unsignalled = run_opus_loss_case(&packets, Some(SKIP), false);
+        let signalled = run_opus_loss_case(&packets, Some(SKIP), true);
+
+        assert!(baseline.decoded_bytes > 0, "reference decode produced no PCM at all");
+        assert_eq!(baseline.plc_samples, 0, "a lossless stream must not invoke PLC");
+
+        // (2) The bug: a silent hole in the decoded PCM.
+        assert!(
+            unsignalled.decoded_bytes < baseline.decoded_bytes,
+            "an unsignalled dropped packet should leave a hole in the decoded PCM \
+             (baseline {} bytes, with hole {} bytes) — if these are equal this test \
+             can no longer tell the bug from the fix",
+            baseline.decoded_bytes,
+            unsignalled.decoded_bytes
+        );
+        assert_eq!(
+            unsignalled.plc_samples, 0,
+            "without a GAP event opusdec has no way to know a packet was lost, so it must not have concealed"
+        );
+
+        // (3) The fix: the hole is filled by real Opus PLC.
+        assert_eq!(
+            signalled.decoded_bytes, baseline.decoded_bytes,
+            "with a GAP event the decoded PCM should be back to full length"
+        );
+        assert!(
+            signalled.plc_samples > 0,
+            "opusdec reported no concealed samples, so the GAP event never reached its PLC path"
+        );
+        assert_eq!(
+            signalled.num_gap, 1,
+            "opusdec should have seen exactly the one GAP event that was sent"
+        );
+        // The concealed run must be a whole frame, in the right place: same
+        // end timestamp as the reference means the GAP was serialized into
+        // its correct slot rather than overtaking the buffers around it.
+        assert_eq!(
+            signalled.end_pts_us, baseline.end_pts_us,
+            "concealment landed in the wrong slot: output timeline doesn't match the lossless one"
+        );
+    }
+
+    /// The production decoder must have PLC on, or every `GAP` event the
+    /// jitter buffer emits is silently discarded and half this module's fix
+    /// does nothing. Cheap to assert, and the failure mode it guards
+    /// against is completely silent otherwise (no error, no log, just the
+    /// original stutter back again).
+    #[test]
+    fn production_opus_decoder_has_plc_enabled() {
+        gstreamer::init().expect("gstreamer init");
+        let decoder = make_opus_decoder().expect("opusdec unavailable");
+        assert!(
+            decoder.property::<bool>("plc"),
+            "opusdec's `plc` defaults to false; run_audio_pipeline must turn it on \
+             or GAP events are ignored and lost packets stay audible holes"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // `AudioTimeline` — sender PTS -> receiver running time
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn timeline_schedules_the_first_packet_a_lead_ahead_of_now() {
+        let mut t = AudioTimeline::new();
+        // Sender has been capturing for 30 s; receiver pipeline started
+        // 5 ms ago. Without re-basing this packet would be scheduled ~30 s
+        // into the receiver's future and never play.
+        assert_eq!(t.map_push(30_000_000, 5_000), 5_000 + AUDIO_TARGET_LEAD_US as u64);
+    }
+
+    #[test]
+    fn timeline_preserves_sender_intervals_after_the_first_packet() {
+        let mut t = AudioTimeline::new();
+        let first = t.map_push(30_000_000, 0);
+        // Later packets keep their exact spacing regardless of when the
+        // pipeline thread got round to them.
+        assert_eq!(t.map_push(30_020_000, 3_000), first + 20_000);
+        assert_eq!(t.map_push(30_040_000, 25_000), first + 40_000);
+        assert_eq!(t.map_push(30_060_000, 44_000), first + 60_000);
+    }
+
+    #[test]
+    fn timeline_holds_its_offset_through_normal_jitter() {
+        let mut t = AudioTimeline::new();
+        let first = t.map_push(1_000_000, 0);
+        // A packet the jitter buffer held for its full window arrives late
+        // in wall-clock terms but is still ahead of its playout slot, so
+        // the mapping must not be disturbed.
+        let held = t.map_push(1_020_000, AUDIO_JITTER_MAX_HOLD.as_micros() as u64);
+        assert_eq!(held, first + 20_000);
+    }
+
+    #[test]
+    fn timeline_rebases_when_the_sender_restarts_its_capture_session() {
+        let mut t = AudioTimeline::new();
+        t.map_push(30_000_000, 0);
+        // Sender restarted: PTS origin drops back to ~0, which under the
+        // old offset would map ~30 s into the past.
+        let after = t.map_push(0, 500_000);
+        assert_eq!(after, 500_000 + AUDIO_TARGET_LEAD_US as u64);
+        // ...and the new offset is the one that sticks.
+        assert_eq!(t.map_push(20_000, 520_000), after + 20_000);
+    }
+
+    #[test]
+    fn timeline_rebases_when_it_drifts_too_far_into_the_future() {
+        let mut t = AudioTimeline::new();
+        t.map_push(0, 0);
+        // Receiver clock ran far behind the sender's (or the pipeline
+        // thread stalled): the mapping now schedules absurdly far ahead.
+        let after = t.map_push(5_000_000, 1_000_000);
+        assert_eq!(after, 1_000_000 + AUDIO_TARGET_LEAD_US as u64);
+    }
+
+    #[test]
+    fn timeline_maps_gaps_onto_the_same_offset_without_rebasing() {
+        let mut t = AudioTimeline::new();
+        let first = t.map_push(30_000_000, 0);
+        assert_eq!(t.map_gap(30_020_000), Some(first + 20_000));
+        // A GAP must never move the timeline, however stale it looks.
+        assert_eq!(t.map_gap(99_000_000), Some(first + 69_000_000));
+        assert_eq!(t.map_push(30_040_000, 25_000), first + 40_000);
+    }
+
+    #[test]
+    fn timeline_has_no_gap_mapping_before_the_first_packet() {
+        let t = AudioTimeline::new();
+        assert_eq!(t.map_gap(1_000), None);
+    }
+
+    /// The bug [`AudioTimeline`] exists for, end to end through a real
+    /// `sync=true` sink: a stream whose PTS starts well ahead of the
+    /// receiver pipeline's running time (i.e. any viewer who subscribes a
+    /// while after the sharer started) plays *nothing* if its timestamps
+    /// are pushed as-is, and plays normally once they're re-based.
+    ///
+    /// Discriminating on purpose, in the same style as
+    /// `gap_event_makes_opusdec_conceal_a_missing_packet`: it asserts the
+    /// broken case is broken as well as the fixed case working, so it
+    /// can't quietly degrade into a smoke test. Note the third case —
+    /// PTS starting near zero — passes either way, which is exactly why
+    /// the bug survived the existing tests.
+    #[test]
+    fn sync_true_sink_stalls_on_raw_sender_pts_and_plays_on_rebased_pts() {
+        gstreamer::init().expect("gstreamer init");
+
+        let packets = encode_test_opus_clip(20);
+        assert!(packets.len() > 10, "need a reasonably long clip");
+
+        const SENDER_UPTIME_US: u64 = 30_000_000;
+
+        let raw_late_joiner = run_audio_sync_case(&packets, SENDER_UPTIME_US, false);
+        let rebased_late_joiner = run_audio_sync_case(&packets, SENDER_UPTIME_US, true);
+        let raw_instant_joiner = run_audio_sync_case(&packets, 0, false);
+
+        assert_eq!(
+            raw_late_joiner, 0,
+            "expected a sync=true sink to play nothing when handed PTS {} us ahead of its own \
+             running time — if this now plays, the bug this test guards is gone and the test \
+             can no longer tell the fix from the break",
+            SENDER_UPTIME_US
+        );
+        assert!(
+            rebased_late_joiner > 0,
+            "re-basing onto the pipeline's running time must make a late-joining viewer's audio play"
+        );
+        assert!(
+            raw_instant_joiner > 0,
+            "sanity: PTS that already starts near the pipeline's running time plays either way \
+             (this is why the bug was invisible to the other audio tests)"
+        );
+    }
+
+    /// Pushes `packets` through `appsrc ! opusdec ! audioconvert !
+    /// audioresample ! volume ! appsink(sync=true)` — the production audio
+    /// chain with an observable sink — stamping PTS from `first_pts_us`
+    /// onwards, optionally re-based through [`AudioTimeline`] exactly the
+    /// way [`apply_audio_actions`] does it. Returns how many decoded
+    /// buffers actually made it out of the sink within a bounded wait.
+    fn run_audio_sync_case(packets: &[Vec<u8>], first_pts_us: u64, rebase: bool) -> usize {
+        const FRAME_US: u64 = 20_000;
+
+        let pipeline = Pipeline::new();
+        let src = ElementFactory::make("appsrc").build().expect("appsrc unavailable");
+        let decoder = make_opus_decoder().expect("opusdec unavailable");
+        let convert = ElementFactory::make("audioconvert").build().expect("audioconvert unavailable");
+        let resample = ElementFactory::make("audioresample").build().expect("audioresample unavailable");
+        let volume = ElementFactory::make("volume").build().expect("volume unavailable");
+        let sink = ElementFactory::make("appsink").build().expect("appsink unavailable");
+        // The whole point: schedule playout against the pipeline clock,
+        // like the real `autoaudiosink` does.
+        sink.set_property("sync", true);
+
+        pipeline.add_many([&src, &decoder, &convert, &resample, &volume, &sink]).unwrap();
+        Element::link_many([&src, &decoder, &convert, &resample, &volume, &sink]).unwrap();
+
+        let appsrc = src.dynamic_cast::<AppSrc>().unwrap();
+        appsrc.set_caps(Some(&Caps::builder("audio/x-opus").field("channel-mapping-family", 0i32).build()));
+        appsrc.set_is_live(true);
+        appsrc.set_format(gstreamer::Format::Time);
+        let appsink = sink.dynamic_cast::<AppSink>().unwrap();
+
+        pipeline.set_state(State::Playing).expect("failed to start audio sync-case pipeline");
+
+        let mut timeline = AudioTimeline::new();
+        for (i, packet) in packets.iter().enumerate() {
+            let sender_pts_us = first_pts_us + (i as u64) * FRAME_US;
+            let pts_us = if rebase {
+                timeline.map_push(sender_pts_us, running_time_us(&appsrc))
+            } else {
+                sender_pts_us
+            };
+            let mut buffer = Buffer::from_slice(packet.clone());
+            if let Some(buffer_mut) = buffer.get_mut() {
+                buffer_mut.set_pts(ClockTime::from_useconds(pts_us));
+            }
+            appsrc.push_buffer(buffer).expect("appsrc rejected a valid Opus packet");
+            // Packets really do arrive spread out over wall-clock time;
+            // dumping the clip in instantly would let the whole thing sit
+            // in `appsrc`'s queue and prove nothing about the sink.
+            std::thread::sleep(Duration::from_micros(FRAME_US));
+        }
+
+        // Long enough for every packet that is *going* to be played to
+        // have been: the clip is `packets.len()` * 20 ms long and was fed
+        // in real time, so only the deliberate lead is still outstanding.
+        let mut played = 0usize;
+        while appsink
+            .try_pull_sample(ClockTime::from_mseconds(300))
+            .is_some()
+        {
+            played += 1;
+        }
+
+        let _ = pipeline.set_state(State::Null);
+        played
+    }
+
+    struct OpusLossOutcome {
+        decoded_bytes: usize,
+        plc_samples: u64,
+        num_gap: u64,
+        end_pts_us: Option<u64>,
+    }
+
+    /// Decodes `packets` through a throwaway `appsrc ! opusdec !
+    /// audioconvert ! appsink` pipeline, optionally omitting the packet at
+    /// `skip` and optionally announcing that omission with a `GAP` event —
+    /// exactly the two things [`apply_audio_actions`] does for real.
+    /// Reports how much PCM came out and what `opusdec`'s own `stats`
+    /// property says it did.
+    fn run_opus_loss_case(packets: &[Vec<u8>], skip: Option<usize>, send_gap: bool) -> OpusLossOutcome {
+        const FRAME_US: u64 = 20_000;
+
+        let pipeline = Pipeline::new();
+        let src = ElementFactory::make("appsrc").build().expect("appsrc unavailable");
+        let decoder = ElementFactory::make("opusdec").build().expect("opusdec unavailable");
+        decoder.set_property("plc", true);
+        let convert = ElementFactory::make("audioconvert").build().expect("audioconvert unavailable");
+        let sink = ElementFactory::make("appsink").build().expect("appsink unavailable");
+        sink.set_property("sync", false);
+
+        pipeline.add_many([&src, &decoder, &convert, &sink]).unwrap();
+        Element::link_many([&src, &decoder, &convert, &sink]).unwrap();
+
+        let appsrc = src.dynamic_cast::<AppSrc>().unwrap();
+        appsrc.set_caps(Some(&Caps::builder("audio/x-opus").field("channel-mapping-family", 0i32).build()));
+        appsrc.set_format(gstreamer::Format::Time);
+        let appsink = sink.dynamic_cast::<AppSink>().unwrap();
+
+        pipeline.set_state(State::Playing).expect("failed to start opus loss-case pipeline");
+
+        for (i, packet) in packets.iter().enumerate() {
+            let pts_us = (i as u64) * FRAME_US;
+            if Some(i) == skip {
+                if send_gap {
+                    let gap = gstreamer::event::Gap::builder(ClockTime::from_useconds(pts_us))
+                        .duration(ClockTime::from_useconds(FRAME_US))
+                        .build();
+                    assert!(appsrc.send_event(gap), "appsrc refused the GAP event");
+                }
+                continue;
+            }
+            let mut buffer = Buffer::from_slice(packet.clone());
+            if let Some(buffer_mut) = buffer.get_mut() {
+                buffer_mut.set_pts(ClockTime::from_useconds(pts_us));
+            }
+            appsrc.push_buffer(buffer).expect("appsrc rejected a valid Opus packet");
+        }
+        appsrc.end_of_stream().expect("failed to signal EOS");
+
+        let mut decoded_bytes = 0usize;
+        let mut end_pts_us = None;
+        loop {
+            match appsink.try_pull_sample(ClockTime::from_mseconds(300)) {
+                Some(sample) => {
+                    if let Some(buffer) = sample.buffer() {
+                        if let Ok(map) = buffer.map_readable() {
+                            decoded_bytes += map.len();
+                        }
+                        if let (Some(pts), Some(dur)) = (buffer.pts(), buffer.duration()) {
+                            end_pts_us = Some(pts.useconds() + dur.useconds());
+                        }
+                    }
+                }
+                None => break,
+            }
+        }
+
+        let stats = decoder.property::<gstreamer::Structure>("stats");
+        let plc_samples = stats.get::<u64>("plc-num-samples").unwrap_or(0);
+        let num_gap = stats.get::<u64>("num-gap").unwrap_or(0);
+
+        let _ = pipeline.set_state(State::Null);
+
+        OpusLossOutcome { decoded_bytes, plc_samples, num_gap, end_pts_us }
+    }
+
+    /// Integration check that the whole [`AudioDecoder`] survives the exact
+    /// network conditions this fix exists for — packets delivered out of
+    /// order and with holes — rather than only the tidy in-order feed the
+    /// test above it uses. Complements the pure `jitter_*` tests: those
+    /// prove the decisions are right, this proves the real pipeline
+    /// (`opusdec plc=true`, real `GAP` events, real reordered pushes)
+    /// accepts them without erroring out.
+    #[test]
+    fn audio_decoder_survives_reordered_and_lossy_delivery() {
+        gstreamer::init().expect("gstreamer init");
+
+        let packets = encode_test_opus_clip(40);
+        assert!(packets.len() > 12, "need a reasonably long clip");
+
+        let mut decoder = AudioDecoder::new_with_sink(11, "fakesink", false).expect("failed to build AudioDecoder");
+        let start_deadline = Instant::now() + Duration::from_secs(5);
+        while !decoder.is_alive() && Instant::now() < start_deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(decoder.is_alive(), "audio decode pipeline never reached Playing");
+
+        // Deliver with: every 5th packet dropped outright (loss), and every
+        // 3rd/4th pair swapped (reordering).
+        let mut order: Vec<usize> = Vec::new();
+        let mut i = 0;
+        while i < packets.len() {
+            if i % 5 == 4 {
+                i += 1; // lost
+                continue;
+            }
+            if i % 3 == 0 && i + 1 < packets.len() {
+                order.push(i + 1);
+                order.push(i);
+                i += 2;
+            } else {
+                order.push(i);
+                i += 1;
+            }
+        }
+
+        for &i in &order {
+            decoder.feed(&DecryptedMediaFrame {
+                conn_id: 1,
+                stream_id: 11,
+                // PTS follows the packet's true position, not its arrival
+                // position — that's the whole point.
+                pts: (i as u64) * 20_000,
+                keyframe: true,
+                payload: packets[i].clone(),
+            });
+            // Real packets arrive spread out in time, and the jitter
+            // buffer's hold windows are wall-clock; feeding the whole clip
+            // in a single instant would exercise only the depth cap.
+            std::thread::sleep(Duration::from_millis(2));
+        }
+
+        // Long enough for every outstanding hold window to expire and be
+        // pumped through.
+        std::thread::sleep(AUDIO_JITTER_MAX_HOLD + Duration::from_millis(500));
+        assert!(
+            decoder.is_alive(),
+            "audio decode pipeline died on out-of-order/lossy delivery — exactly the case it was fixed for"
+        );
     }
 }
