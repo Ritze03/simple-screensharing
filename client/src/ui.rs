@@ -287,7 +287,23 @@ struct RoomSession {
 
     /// Streams we're currently subscribed to and decoding in this room, keyed
     /// by (owner conn_id, stream_id).
-    watches: HashMap<(ConnId, StreamId), WatchEntry>,
+    ///
+    /// `Why` `Arc<Mutex<_>>` around the whole map (not just per-entry, though
+    /// `WatchEntry::decoder` is separately `Arc<Mutex<_>>` too, for the
+    /// popout-closure reason documented there): the dedicated per-connection
+    /// media-ingestion task spawned by `insert_room` (see
+    /// `spawn_media_ingestion_task`) needs to look decoders up by
+    /// `(ConnId, StreamId)` the instant a `MediaFrame` event arrives, from a
+    /// different task than whatever's currently running `App::update()` —
+    /// this is what lets media delivery bypass `App::update()`'s throttled
+    /// repaint cadence entirely (see that function's doc comment for the
+    /// backlog bug this fixes). Sharing the *actual* map, rather than a
+    /// separate shadow registry the UI methods below would also have to keep
+    /// in sync, means a stream started/stopped via `toggle_watch` is visible
+    /// to the ingestion task the instant the same lock that guards every
+    /// other access here is released — nothing to duplicate, nothing that can
+    /// drift out of sync.
+    watches: Arc<Mutex<HashMap<(ConnId, StreamId), WatchEntry>>>,
     watch_error: Option<String>,
     /// Which watched stream of this room's the central video panel displays.
     selected_watch: Option<(ConnId, StreamId)>,
@@ -298,7 +314,10 @@ struct RoomSession {
     /// sender also has an active audio stream (auto-subscribe, see
     /// `toggle_watch`) and by clicking "Listen" on an audio-only stream (see
     /// `toggle_listen`).
-    audio_watches: HashMap<(ConnId, StreamId), AudioWatch>,
+    ///
+    /// Shared with the media-ingestion task the same way and for the same
+    /// reason as `watches` above.
+    audio_watches: Arc<Mutex<HashMap<(ConnId, StreamId), AudioWatch>>>,
 
     /// Latest decoded preview still per active stream in this room,
     /// regardless of whether it's being watched — previews arrive for every
@@ -484,6 +503,158 @@ fn capture_feeding(
     captures
         .values()
         .find(|capture| capture.destinations.values().any(|d| d.room == room && d.stream_id == stream_id))
+}
+
+/// Always-on per-connection task that reads `raw_events` — the exact
+/// `mpsc::UnboundedReceiver<ClientEvent>` `ScreenshareClient::connect`
+/// returns — as fast as events arrive, independent of `App::update()`'s
+/// repaint-driven cadence, and forwards everything except `MediaFrame` on to
+/// `forward_tx` (what `RoomSession::event_rx` actually is) for `drain_events`
+/// to keep handling exactly as before, at its normal throttled pace.
+///
+/// # Why this exists (the "fast-forward catch-up" bug)
+///
+/// `Why:` before this task existed, every `ClientEvent` — including
+/// `MediaFrame` — sat in that same unbounded channel until `App::update()`
+/// next ran and `drain_events` drained it with `try_recv()`. While the window
+/// is unfocused, `update()` only runs every `UNFOCUSED_REPAINT_INTERVAL`
+/// (500ms), so a sustained stream of incoming `MediaFrame`s piled up
+/// unconsumed in the channel for up to 500ms at a stretch — not stale in
+/// decode, not stale in `PacingState`'s budget math, just sitting
+/// undelivered. The moment `update()` next ran, the whole backlog drained in
+/// one tight `while let Ok(event) = ... try_recv()` burst, handing
+/// `StreamDecoder`/`AudioDecoder` a rapid-fire sequence of now-stale access
+/// units with almost no wall-clock time between `feed()` calls.
+/// `PacingState::decide` — correctly, given what it was fed — read that as
+/// "decode finished early" for every one of them and paced each out with a
+/// real-time sleep: a literal real-time replay of however much history had
+/// piled up, the "fast-forward catch-up" the user reported (see
+/// `superdoc/brainstorm/ui-redesign-multiroom-streaming.md`,
+/// "Performance/Rendering" round 2, and `decode.rs`'s `PacingState::epoch`
+/// doc comment for the *other*, already-merged half of this fix — a
+/// defensive wall-clock staleness backstop inside the pacing math itself,
+/// which only ever mitigates a burst after the fact; it cannot stop one from
+/// forming).
+///
+/// This task is the fix for the actual backlog: it calls `.recv().await` in
+/// a plain loop, which the tokio scheduler wakes the instant a new event is
+/// queued — not on any repaint-driven cadence — so a `MediaFrame` is fed to
+/// its decoder within a scheduler tick of arriving, whether the window is
+/// focused, unfocused, minimized, or the UI thread is busy laying out a
+/// frame. Nothing at this layer ever has 500ms (or even one repaint
+/// interval's worth) of frames to burst-deliver, so `PacingState` never sees
+/// the bursty-delivery signature that caused it to fast-forward.
+///
+/// # Design choice: intercept-and-forward, not a `net.rs`-side split
+///
+/// Two shapes were considered for *where* `MediaFrame` peels off from
+/// everything else `ClientEvent` carries (membership changes, stream
+/// announce/stop, subscriber counts — none of it latency-sensitive, all of
+/// it fine staying on `drain_events`'s throttled cadence):
+///
+/// 1. Split inside `net.rs` itself, before a `MediaFrame` ever reaches the
+///    UI-facing channel — e.g. datagram_reader_loop looks up a decoder
+///    registry directly and calls `feed()` inline, never constructing a
+///    `ClientEvent::MediaFrame` for it at all.
+/// 2. Keep `net.rs` and `ClientEvent` exactly as they are — one channel out
+///    of `ScreenshareClient::connect` — and put a dedicated always-on drain
+///    task between that channel and the UI, forwarding everything that isn't
+///    a `MediaFrame`.
+///
+/// This function is option 2. `net.rs` has no notion of a decoder registry
+/// today (by design — see its module docs' "Public API shape": it hands back
+/// a plain event channel and stays ignorant of what the caller does with
+/// `MediaFrame`s), and `net.rs`'s tests/API are shared by both front-ends
+/// (`ui.rs` and `tui.rs`), each of which will eventually want a *different*
+/// registry shape (`tui.rs` has its own, much simpler single-stream model).
+/// Reaching into `net.rs` to add a `ui.rs`-specific registry would either
+/// leak `ui.rs` types into `net.rs` or force a generic registry trait for a
+/// single caller — real complexity for no behavioral difference, since
+/// `mpsc::UnboundedReceiver::recv().await` already wakes immediately on
+/// arrival with nothing throttling it between `net.rs` and here. Option 2
+/// gets the identical latency characteristics (nothing sits in a channel
+/// waiting on `App::update()`) with a change confined entirely to `ui.rs`.
+///
+/// # Why the registry is `Arc<Mutex<HashMap<...>>>`, not a channel back to the UI thread
+///
+/// Sending "please feed this decoder" messages back to the UI thread would
+/// just recreate the same kind of queue this fix removes, one level higher.
+/// The decoders themselves already tolerate being driven from any thread —
+/// `StreamDecoder::feed`/`AudioDecoder::feed` are non-blocking, cheap, and
+/// exist precisely so an arbitrary caller can hand off an access unit without
+/// synchronizing with whatever else that decoder is doing — so the simplest
+/// correct shape is to give this task direct read access to the same
+/// `watches`/`audio_watches` maps `RoomSession`'s own methods
+/// (`toggle_watch`, `toggle_listen`, ...) already mutate, behind the
+/// `std::sync::Mutex` those fields are now typed with. Lock hold times here
+/// are a single hash lookup plus (for video) cloning an `Arc` — the same
+/// order of magnitude as the UI thread's own per-repaint texture-upload pass
+/// over the same map, so contention between this task and `App::update()` is
+/// not a real concern.
+async fn spawn_media_ingestion_task(
+    mut raw_events: mpsc::UnboundedReceiver<ClientEvent>,
+    forward_tx: mpsc::UnboundedSender<ClientEvent>,
+    watches: Arc<Mutex<HashMap<(ConnId, StreamId), WatchEntry>>>,
+    audio_watches: Arc<Mutex<HashMap<(ConnId, StreamId), AudioWatch>>>,
+) {
+    loop {
+        // `Why` racing `raw_events.recv()` against `forward_tx.closed()`,
+        // rather than only detecting a dropped `RoomSession` via a failed
+        // `forward_tx.send()` below: this task now owns `raw_events` (see
+        // this function's doc comment), so — unlike before this fix, when
+        // `RoomSession` held that receiver directly — dropping the
+        // `RoomSession` (`disconnect_room`) no longer has any *direct*
+        // effect on this loop. Relying solely on a future failed
+        // `forward_tx.send()` to notice would leave this task (and every
+        // decoder/GStreamer pipeline it keeps feeding, and the
+        // `datagram_reader_loop`/etc. background tasks in `net.rs`, which
+        // only exit when *their* send into `raw_events` fails) running
+        // indefinitely after the user leaves a room, for as long as the
+        // remote side keeps sending `MediaFrame`s and nothing else — the
+        // common case for an active share — since every one of those frames
+        // is consumed here without ever reaching the `other` arm below.
+        // `forward_tx.closed()` resolves the instant `RoomSession::event_rx`
+        // (`forward_rx`) is dropped, independent of whether any event is in
+        // flight, so this task — and transitively, once `raw_events` itself
+        // drops with it, the `net.rs` background tasks — tears down
+        // immediately on disconnect, matching the old teardown promptness.
+        let event = tokio::select! {
+            event = raw_events.recv() => event,
+            _ = forward_tx.closed() => return,
+        };
+        let Some(event) = event else { return };
+        match event {
+            ClientEvent::MediaFrame(frame) => {
+                let key = (frame.conn_id, frame.stream_id);
+                // A given (conn_id, stream_id) only ever matches one of
+                // `watches` (video) or `audio_watches` (audio) — each owner
+                // allocates a distinct stream_id per share regardless of
+                // kind — so both are checked unconditionally rather than
+                // needing to know the frame's `StreamKind` up front. Mirrors
+                // the lookup `drain_events` used to do directly.
+                if let Some(entry) = watches.lock().unwrap().get(&key) {
+                    entry.decoder.lock().unwrap().feed(&frame);
+                }
+                if let Some(audio_watch) = audio_watches.lock().unwrap().get_mut(&key) {
+                    audio_watch.decoder.feed(&frame);
+                }
+            }
+            other => {
+                // Everything else is not latency-sensitive (membership
+                // changes, stream announce/stop, subscriber counts) and
+                // belongs on `drain_events`'s normal throttled cadence — see
+                // this function's doc comment. A send failure here means the
+                // room's `RoomSession` (and its `forward_rx`) has already
+                // been dropped (room left / app shutting down), so this task
+                // has nothing left to do. In practice the `forward_tx.closed()`
+                // branch above should always win that race first, but this
+                // stays as a belt-and-suspenders backstop.
+                if forward_tx.send(other).is_err() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 /// Capture-side operations: everything that owns or drives a local GStreamer
@@ -797,12 +968,12 @@ impl RoomSession {
     /// rather than a second decoder.
     fn start_audio_watch(&mut self, owner: ConnId, stream_id: StreamId) {
         let key = (owner, stream_id);
-        if self.audio_watches.contains_key(&key) {
+        if self.audio_watches.lock().unwrap().contains_key(&key) {
             return;
         }
         match AudioDecoder::new(stream_id) {
             Ok(decoder) => {
-                self.audio_watches.insert(key, AudioWatch { decoder, volume_percent: 100 });
+                self.audio_watches.lock().unwrap().insert(key, AudioWatch { decoder, volume_percent: 100 });
                 self.watch_error = None;
 
                 let client = self.client.clone();
@@ -823,7 +994,7 @@ impl RoomSession {
     /// `AudioDecoder`, which synchronously shuts down its pipeline thread
     /// (see `AudioDecoder`'s `Drop` impl).
     fn teardown_audio_watch(&mut self, owner: ConnId, stream_id: StreamId) {
-        if self.audio_watches.remove(&(owner, stream_id)).is_some() {
+        if self.audio_watches.lock().unwrap().remove(&(owner, stream_id)).is_some() {
             let client = self.client.clone();
             tokio::spawn(async move {
                 if let Err(e) = client.unsubscribe(owner, stream_id).await {
@@ -846,9 +1017,10 @@ impl RoomSession {
     /// together with the video watch when watching stops.
     fn toggle_watch(&mut self, owner: ConnId, stream_id: StreamId) {
         let key = (owner, stream_id);
-        if let Some(entry) = self.watches.remove(&key) {
+        let removed = self.watches.lock().unwrap().remove(&key);
+        if let Some(entry) = removed {
             if self.selected_watch == Some(key) {
-                self.selected_watch = self.watches.keys().next().copied();
+                self.selected_watch = self.watches.lock().unwrap().keys().next().copied();
             }
             let client = self.client.clone();
             tokio::spawn(async move {
@@ -863,7 +1035,7 @@ impl RoomSession {
             match StreamDecoder::new(stream_id) {
                 Ok(decoder) => {
                     let audio_stream_id = self.sibling_audio_stream(owner);
-                    self.watches.insert(
+                    self.watches.lock().unwrap().insert(
                         key,
                         WatchEntry {
                             decoder: Arc::new(Mutex::new(decoder)),
@@ -898,7 +1070,7 @@ impl RoomSession {
     /// stream's `AudioWatch` via the same start/teardown helpers
     /// `toggle_watch` uses for its auto-subscribed audio.
     fn toggle_listen(&mut self, owner: ConnId, stream_id: StreamId) {
-        if self.audio_watches.contains_key(&(owner, stream_id)) {
+        if self.audio_watches.lock().unwrap().contains_key(&(owner, stream_id)) {
             self.teardown_audio_watch(owner, stream_id);
         } else {
             self.start_audio_watch(owner, stream_id);
@@ -925,7 +1097,8 @@ impl RoomSession {
     /// decoder's real framerate whenever the mouse is idle.
     fn update_watch_textures(&mut self, ctx: &egui::Context) -> bool {
         let mut any_active = false;
-        for ((owner, stream_id), entry) in self.watches.iter_mut() {
+        let mut watches = self.watches.lock().unwrap();
+        for ((owner, stream_id), entry) in watches.iter_mut() {
             if entry.popout.is_some() {
                 continue;
             }
@@ -953,9 +1126,9 @@ impl RoomSession {
             // Free the central panel to show something else immediately —
             // otherwise it'd sit on "(popped out)" with nothing to fall
             // back to for a lone watched stream.
-            self.selected_watch = self.watches.keys().find(|k| **k != key).copied();
+            self.selected_watch = self.watches.lock().unwrap().keys().find(|k| **k != key).copied();
         }
-        if let Some(entry) = self.watches.get_mut(&key) {
+        if let Some(entry) = self.watches.lock().unwrap().get_mut(&key) {
             entry.popout = Some(PopoutState {
                 texture: Arc::new(Mutex::new(None)),
                 close_requested: Arc::new(AtomicBool::new(false)),
@@ -973,7 +1146,13 @@ impl RoomSession {
     /// connection, so two rooms could otherwise hash to the same
     /// `ViewportId` and fight over one OS window.
     fn show_popouts(&mut self, ctx: &egui::Context, handle: RoomHandle) {
-        for ((owner, stream_id), entry) in self.watches.iter() {
+        // Locked only for the duration of this loop, which just clones out
+        // `Arc`s to move into each viewport closure — released before
+        // `ctx.show_viewport_deferred` runs (that closure never needs this
+        // lock, since it captured its own `decoder`/`texture` handles) and
+        // well before the second loop below re-locks for the unpop pass.
+        let watches = self.watches.lock().unwrap();
+        for ((owner, stream_id), entry) in watches.iter() {
             let Some(popout) = &entry.popout else { continue };
             let owner = *owner;
             let stream_id = *stream_id;
@@ -1054,15 +1233,16 @@ impl RoomSession {
         // of leaving them marked popped-out with nothing left repainting
         // them.
         let mut to_unpop: Vec<(ConnId, StreamId)> = Vec::new();
-        for (key, entry) in self.watches.iter() {
+        for (key, entry) in watches.iter() {
             if let Some(popout) = &entry.popout
                 && popout.close_requested.load(Ordering::Relaxed)
             {
                 to_unpop.push(*key);
             }
         }
+        drop(watches);
         for key in to_unpop {
-            if let Some(entry) = self.watches.get_mut(&key) {
+            if let Some(entry) = self.watches.lock().unwrap().get_mut(&key) {
                 if let Some(popout) = entry.popout.take() {
                     // Hand the popout's last frame over as the inline
                     // texture so returning to the central panel doesn't
@@ -1105,6 +1285,11 @@ impl App {
     /// Insert a freshly connected room and return its handle. The one place
     /// a `RoomSession` is born — used by `poll_connect_result` and, in tests,
     /// to stand a session up directly.
+    ///
+    /// This is also where the always-on media-ingestion task is spawned (see
+    /// [`spawn_media_ingestion_task`]) — every `RoomSession` is created here,
+    /// so this is the one choke point that guarantees no room's `event_rx`
+    /// ever bypasses it.
     fn insert_room(
         &mut self,
         client: ScreenshareClient,
@@ -1113,21 +1298,40 @@ impl App {
     ) -> RoomHandle {
         let handle = RoomHandle(self.next_room_handle);
         self.next_room_handle = self.next_room_handle.wrapping_add(1);
+
+        let watches: Arc<Mutex<HashMap<(ConnId, StreamId), WatchEntry>>> = Arc::new(Mutex::new(HashMap::new()));
+        let audio_watches: Arc<Mutex<HashMap<(ConnId, StreamId), AudioWatch>>> = Arc::new(Mutex::new(HashMap::new()));
+
+        // `event_rx` is `ScreenshareClient::connect`'s raw, unbounded,
+        // straight-off-the-network channel. It is handed to the ingestion
+        // task, not stored on `RoomSession` directly — see
+        // `spawn_media_ingestion_task`'s doc comment for why. `forward_rx`
+        // (what `RoomSession::event_rx` actually becomes) only ever receives
+        // what that task didn't intercept, at the same throttled cadence
+        // `drain_events` always drained at.
+        let (forward_tx, forward_rx) = mpsc::unbounded_channel();
+        tokio::spawn(spawn_media_ingestion_task(
+            event_rx,
+            forward_tx,
+            watches.clone(),
+            audio_watches.clone(),
+        ));
+
         self.rooms.insert(
             handle,
             RoomSession {
                 client,
-                event_rx,
+                event_rx: forward_rx,
                 members: snapshot.members,
                 streams: snapshot.streams,
                 save_name: String::new(),
                 saved: false,
                 destinations: Vec::new(),
                 next_stream_id: 0,
-                watches: HashMap::new(),
+                watches,
                 watch_error: None,
                 selected_watch: None,
-                audio_watches: HashMap::new(),
+                audio_watches,
                 preview_cache: PreviewCache::new(),
                 preview_textures: HashMap::new(),
             },
@@ -1268,20 +1472,25 @@ impl App {
                             h.notify_keyframe_request();
                         }
                     }
-                    ClientEvent::MediaFrame(frame) => {
-                        let key = (frame.conn_id, frame.stream_id);
-                        if let Some(entry) = room.watches.get_mut(&key) {
-                            entry.decoder.lock().unwrap().feed(&frame);
-                        }
-                        // A given (conn_id, stream_id) only ever matches one
-                        // of `watches` (video) or `audio_watches` (audio) —
-                        // each owner allocates a distinct stream_id per share
-                        // regardless of kind — so both are checked
-                        // unconditionally rather than needing to know the
-                        // frame's `StreamKind` up front.
-                        if let Some(audio_watch) = room.audio_watches.get_mut(&key) {
-                            audio_watch.decoder.feed(&frame);
-                        }
+                    ClientEvent::MediaFrame(_) => {
+                        // `Why:` this arm is unreachable at runtime by
+                        // construction, not dead code the compiler could
+                        // prove unreachable itself. `RoomSession::event_rx`
+                        // is never the raw channel `ScreenshareClient::connect`
+                        // returns — `insert_room` always routes that raw
+                        // channel through `spawn_media_ingestion_task` first,
+                        // and that task intercepts every `MediaFrame` and
+                        // feeds `watches`/`audio_watches` directly, in real
+                        // time, without ever forwarding it here. This keeps
+                        // media delivery fully decoupled from this function's
+                        // (and `App::update()`'s) throttled repaint cadence,
+                        // closing the "fast-forward catch-up" backlog bug —
+                        // see `spawn_media_ingestion_task`'s doc comment for
+                        // the full root-cause writeup. Kept as an explicit
+                        // no-op arm (rather than folded into a wildcard, or
+                        // `unreachable!()`) purely so this `match` stays
+                        // exhaustive against `ClientEvent` and self-documents
+                        // where the frames actually went.
                     }
                     ClientEvent::Preview(preview) => match decode::decode_preview(&preview) {
                         Ok(image) => {
@@ -1738,7 +1947,7 @@ impl App {
                         if room.owner_has_video(info.owner) {
                             continue;
                         }
-                        let listening = room.audio_watches.contains_key(&key);
+                        let listening = room.audio_watches.lock().unwrap().contains_key(&key);
                         ui.horizontal(|ui| {
                             ui.vertical(|ui| {
                                 ui.label(
@@ -1765,7 +1974,8 @@ impl App {
                                         ui.colored_label(theme::SUCCESS, t!("streams.listening").to_string());
                                     }
                                 });
-                                if let Some(audio_watch) = room.audio_watches.get_mut(&key)
+                                let mut audio_watches = room.audio_watches.lock().unwrap();
+                                if let Some(audio_watch) = audio_watches.get_mut(&key)
                                     && theme::slider_row(ui, t!("audio.volume_label").as_ref(), &mut audio_watch.volume_percent, 0..=200, 1.0, "%")
                                 {
                                     audio_watch.decoder.set_volume(audio_watch.volume_percent as f64 / 100.0);
@@ -1775,7 +1985,7 @@ impl App {
                         continue;
                     }
 
-                    let watching = room.watches.contains_key(&key);
+                    let watching = room.watches.lock().unwrap().contains_key(&key);
                     ui.horizontal(|ui| {
                         // Thumbnail (or a placeholder box until the first
                         // preview for this stream arrives) — previews
@@ -1798,7 +2008,7 @@ impl App {
                             }
                         }
 
-                        let popped_out = room.watches.get(&key).is_some_and(|e| e.popout.is_some());
+                        let popped_out = room.watches.lock().unwrap().get(&key).is_some_and(|e| e.popout.is_some());
 
                         ui.vertical(|ui| {
                             ui.label(
@@ -1867,11 +2077,12 @@ impl App {
             // reflects real decode activity regardless of whether the
             // stream is currently shown inline or popped out into its own
             // window.
-            if let Some(key) = room.selected_watch
-                && let Some(entry) = room.watches.get(&key)
-            {
-                let fps = entry.decoder.lock().unwrap().current_fps();
-                ui.label(egui::RichText::new(t!("video.fps_label", fps = format!("{fps:.1}")).to_string()).color(theme::TEXT_DIM));
+            if let Some(key) = room.selected_watch {
+                let watches = room.watches.lock().unwrap();
+                if let Some(entry) = watches.get(&key) {
+                    let fps = entry.decoder.lock().unwrap().current_fps();
+                    ui.label(egui::RichText::new(t!("video.fps_label", fps = format!("{fps:.1}")).to_string()).color(theme::TEXT_DIM));
+                }
             }
 
             // If the currently displayed video watch also auto-subscribed
@@ -1879,19 +2090,21 @@ impl App {
             // its volume slider here, right above the video panel —
             // "somewhere sensible in the watched-stream UI", per this
             // task's brief.
-            let linked_audio_key: Option<(ConnId, StreamId)> = room
-                .selected_watch
-                .and_then(|key| room.watches.get(&key))
-                .and_then(|entry| entry.audio_stream_id)
-                .map(|audio_stream_id| (room.selected_watch.expect("checked above").0, audio_stream_id));
-            if let Some(audio_key) = linked_audio_key
-                && let Some(audio_watch) = room.audio_watches.get_mut(&audio_key)
-                && theme::slider_row(ui, t!("audio.volume_label").as_ref(), &mut audio_watch.volume_percent, 0..=200, 1.0, "%")
-            {
-                audio_watch.decoder.set_volume(audio_watch.volume_percent as f64 / 100.0);
+            let linked_audio_key: Option<(ConnId, StreamId)> = room.selected_watch.and_then(|key| {
+                let audio_stream_id = room.watches.lock().unwrap().get(&key)?.audio_stream_id?;
+                Some((key.0, audio_stream_id))
+            });
+            if let Some(audio_key) = linked_audio_key {
+                let mut audio_watches = room.audio_watches.lock().unwrap();
+                if let Some(audio_watch) = audio_watches.get_mut(&audio_key)
+                    && theme::slider_row(ui, t!("audio.volume_label").as_ref(), &mut audio_watch.volume_percent, 0..=200, 1.0, "%")
+                {
+                    audio_watch.decoder.set_volume(audio_watch.volume_percent as f64 / 100.0);
+                }
             }
 
-            match room.selected_watch.and_then(|key| room.watches.get(&key)) {
+            let watches = room.watches.lock().unwrap();
+            match room.selected_watch.and_then(|key| watches.get(&key)) {
                 Some(entry) if entry.popout.is_some() => {
                     ui.label(egui::RichText::new(t!("video.popped_out_note").to_string()).color(theme::TEXT_DIM));
                 }
@@ -2137,6 +2350,13 @@ mod tests {
     //! `update_watch_textures` polling (the mechanism `update()`'s new
     //! `ctx.request_repaint()` call keeps alive) actually keeps pace with a
     //! fast source rather than idling at the old fallback rate.
+    //!
+    //! [`media_ingestion_keeps_feeding_the_decoder_while_drain_events_is_starved`]
+    //! below is the sibling regression test for the *other* fps bug fixed in
+    //! the same stage — "fast-forward catch-up" — using the same real
+    //! relay/capture/decoder infrastructure; see that test's own doc comment
+    //! for why it starves `drain_events` specifically rather than the whole
+    //! `App::update()` call.
     use super::*;
     use crate::end_to_end_test::{connect_with_retry, pick_free_udp_port, spawn_relay_server};
     use crate::net::format_join_string;
@@ -2201,7 +2421,7 @@ mod tests {
         let room_handle = app.insert_room(client_b, snapshot_b, events_b);
         app.active_room = Some(room_handle);
         let decoder = StreamDecoder::new(TEST_STREAM_ID).expect("failed to build StreamDecoder");
-        app.rooms[&room_handle].watches.insert(
+        app.rooms[&room_handle].watches.lock().unwrap().insert(
             (owner, TEST_STREAM_ID),
             WatchEntry { decoder: Arc::new(Mutex::new(decoder)), texture: None, popout: None, audio_stream_id: None },
         );
@@ -2246,16 +2466,22 @@ mod tests {
             // purely synchronous loop body (no `.await` anywhere in it)
             // would otherwise starve every other task on that same thread
             // forever — including the QUIC connection's own background
-            // receive task, which is what actually turns incoming media
-            // datagrams into the `ClientEvent::MediaFrame`s `drain_events`
-            // is polling for above. Not part of the fix itself: purely
-            // this test harness's own concession to sharing one OS thread
-            // with the networking it's exercising.
+            // receive task and, since `insert_room` above, the dedicated
+            // `spawn_media_ingestion_task` for this room, which is what
+            // actually turns incoming media datagrams into `feed()` calls on
+            // this stream's `StreamDecoder` now (see that function's doc
+            // comment) — `drain_events` above no longer sees `MediaFrame`
+            // events at all, only presence/subscriber-count traffic. Not
+            // part of the fix itself: purely this test harness's own
+            // concession to sharing one OS thread with the networking (and
+            // now ingestion task) it's exercising.
             tokio::task::yield_now().await;
         }
 
         let observed_fps = app.rooms[&room_handle]
             .watches
+            .lock()
+            .unwrap()
             .get(&(owner, TEST_STREAM_ID))
             .unwrap()
             .decoder
@@ -2274,6 +2500,157 @@ mod tests {
             observed_fps > 40.0,
             "decoder-observed fps ({observed_fps:.1}) did not clear the old ~30fps idle cap — \
              the repaint-cadence fix does not appear to be keeping pace with the real decode rate"
+        );
+    }
+
+    /// Regression test for the "fast-forward catch-up" bug (see
+    /// `superdoc/brainstorm/ui-redesign-multiroom-streaming.md`,
+    /// "Performance/Rendering" round 2, and `spawn_media_ingestion_task`'s
+    /// doc comment for the full root-cause writeup).
+    ///
+    /// # What this isolates, and why
+    ///
+    /// Before this stage's fix, `ClientEvent::MediaFrame` -> `feed()` only
+    /// ever happened *inside* `drain_events`, so `drain_events`'s own call
+    /// frequency was, byte for byte, the decoder's *input* rate ceiling —
+    /// and in production `drain_events` only runs as often as `App::update()`
+    /// does, which drops to one call every `UNFOCUSED_REPAINT_INTERVAL`
+    /// (500ms) whenever the OS reports the window unfocused. Reproducing
+    /// that exact OS-focus-driven throttle end-to-end would need a real
+    /// winit event loop and a real window manager to unfocus it — not
+    /// practical in a headless test (the sibling
+    /// `watched_panel_repaints_continuously_without_input_at_real_decode_rate`
+    /// test's own doc comment notes the same limit for the *other* half of
+    /// `App::update()`'s scheduling). What *is* directly testable, and is
+    /// exactly the mechanism this stage's fix changed, is the dependency
+    /// itself: does new media reach a decoder's `feed()` at all without
+    /// `drain_events` running? So this test drives that dependency to its
+    /// most extreme case — `drain_events` is **never called even once**
+    /// during the timed portion of the run — while a separate, tight loop
+    /// keeps polling `update_watch_textures` (decoded *output*) the whole
+    /// time, exactly the way `App::update()` always does both together in
+    /// production. Splitting them apart like this only requires trusting
+    /// that a real production `App::update()` call always invokes
+    /// `drain_events` and `update_watch_textures` in the same pass (true by
+    /// inspection of `eframe::App::update` above) — this test just proves
+    /// the ingestion side no longer needs that pass to happen at all, let
+    /// alone at a full-focus rate.
+    ///
+    /// Before the fix, this would starve `StreamDecoder::feed()` completely
+    /// for the whole run (nothing else ever called it), so `current_fps()`
+    /// would sit at ~0 the entire time. After the fix,
+    /// `insert_room`'s `spawn_media_ingestion_task` feeds the decoder
+    /// straight off the raw connection channel regardless, so `current_fps()`
+    /// tracks the real sender rate even with `drain_events` fully starved —
+    /// proving media delivery no longer depends on it.
+    #[tokio::test]
+    #[ignore = "spawns a real relay server child process and a real GStreamer capture/decode \
+                pipeline; run explicitly with `cargo test ui:: -- --ignored --nocapture`"]
+    async fn media_ingestion_keeps_feeding_the_decoder_while_drain_events_is_starved() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        gstreamer::init().expect("gstreamer init");
+
+        let port = pick_free_udp_port().expect("failed to pick a free UDP port for the test relay");
+        eprintln!("[ingestion] starting relay server on 127.0.0.1:{port}");
+        let _server = spawn_relay_server(port).expect("failed to spawn relay server child process");
+
+        let server_addr = format!("127.0.0.1:{port}");
+        let room_id: RoomId = rand::random();
+        let room_key: [u8; 32] = rand::random();
+        let join_string = format_join_string(&server_addr, &room_id, &room_key);
+
+        eprintln!("[ingestion] connecting sharer + watcher");
+        let (client_a, _snapshot_a, events_a) = connect_with_retry(&join_string, "sharer")
+            .await
+            .expect("sharer failed to connect");
+        let (client_b, snapshot_b, events_b) = connect_with_retry(&join_string, "watcher")
+            .await
+            .expect("watcher failed to connect");
+        let _events_a_keepalive = events_a;
+
+        let source_fragment = format!(
+            "videotestsrc is-live=true pattern=ball \
+             ! clockoverlay time-format=\"%H:%M:%S%.3f\" \
+             ! video/x-raw,width=320,height=240,framerate={TEST_FPS}/1"
+        );
+        eprintln!("[ingestion] starting real capture pipeline on the sharer at {TEST_FPS}fps");
+        let capture_handle = capture::start_sharing_from_test_source(&client_a, TEST_STREAM_ID, 4000, TEST_FPS, &source_fragment)
+            .await
+            .expect("start_sharing_from_test_source failed");
+        let owner = client_a.conn_id();
+
+        // `insert_room` is where `spawn_media_ingestion_task` actually gets
+        // spawned in production — using it here (not a hand-rolled
+        // `RoomSession`) means this test exercises the real wiring, not a
+        // re-implementation of it.
+        let mut app = App { framerate: TEST_FPS, ..App::default() };
+        let room_handle = app.insert_room(client_b, snapshot_b, events_b);
+        app.active_room = Some(room_handle);
+        let decoder = StreamDecoder::new(TEST_STREAM_ID).expect("failed to build StreamDecoder");
+        app.rooms[&room_handle].watches.lock().unwrap().insert(
+            (owner, TEST_STREAM_ID),
+            WatchEntry { decoder: Arc::new(Mutex::new(decoder)), texture: None, popout: None, audio_stream_id: None },
+        );
+
+        // The one and only `drain_events` call in this whole test — needed
+        // to observe the `StreamStarted` presence delta before subscribing
+        // (the relay silently drops a `Subscribe` for an unknown stream).
+        // Everything from here to the fps check runs with `drain_events`
+        // never called again.
+        room_client_b_subscribe(&mut app, room_handle, owner).await;
+
+        eprintln!(
+            "[ingestion] drain_events will not be called again for the rest of this test \
+             (simulating it being starved by App::update()'s unfocused-window throttle)"
+        );
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut polls_with_watch = 0u64;
+        while Instant::now() < deadline {
+            let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                // Deliberately *not* calling `app.drain_events(ctx)` here —
+                // see this test's doc comment. Only decoded-output polling
+                // happens in this loop.
+                let Some(room) = app.rooms.get_mut(&room_handle) else { return };
+                let has_inline_watch = room.update_watch_textures(ctx);
+                if has_inline_watch {
+                    polls_with_watch += 1;
+                    ctx.request_repaint();
+                }
+            });
+            // Same rationale as the sibling test: yield to the tokio
+            // runtime so the connection's background receive task *and* the
+            // per-room media-ingestion task this fix added both keep
+            // running on this test's single-threaded executor.
+            tokio::task::yield_now().await;
+        }
+
+        let observed_fps = app.rooms[&room_handle]
+            .watches
+            .lock()
+            .unwrap()
+            .get(&(owner, TEST_STREAM_ID))
+            .unwrap()
+            .decoder
+            .lock()
+            .unwrap()
+            .current_fps();
+
+        eprintln!(
+            "[ingestion] {polls_with_watch} polls observed an active watch (drain_events called 0 times \
+             during this loop), decoder-observed fps = {observed_fps:.1}"
+        );
+
+        if let Err(e) = capture_handle.stop().await {
+            tracing::warn!("[ingestion] capture_handle.stop() reported an error (non-fatal): {e:#}");
+        }
+
+        assert!(polls_with_watch > 0, "the watch loop never observed an active inline watch at all");
+        assert!(
+            observed_fps > 40.0,
+            "decoder-observed fps ({observed_fps:.1}) stayed near zero with drain_events starved — \
+             media delivery still appears to depend on drain_events being called, i.e. the \
+             'fast-forward catch-up' backlog bug is not actually fixed"
         );
     }
 
