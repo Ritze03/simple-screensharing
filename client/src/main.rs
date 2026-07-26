@@ -26,6 +26,7 @@ mod net;
 mod preview;
 mod protocol;
 mod rooms;
+mod session;
 mod theme;
 mod ui;
 
