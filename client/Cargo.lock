@@ -5083,11 +5083,15 @@ dependencies = [
 name = "simple-screensharing-client-tauri"
 version = "0.1.0"
 dependencies = [
+ "egui",
+ "rust-i18n",
  "serde",
  "serde_json",
  "simple-screensharing-client",
  "tauri",
  "tauri-build",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
