@@ -156,10 +156,19 @@ const RECONNECT_PULSE_PERIOD: f64 = 1.2;
 // the Geist Mono Nerd Font icon fallback its styling guide calls for — see
 // STYLING-GUIDE.md's "Fonts" status note. Anything from a richer icon set
 // would render as tofu today.
+//
+// `Why` the carets are U+23F5/U+23F7 (`⏵`/`⏷`, Miscellaneous Technical) rather
+// than the Geometric Shapes triangles they obviously "should" be: being in
+// Geometric Shapes is *not* sufficient — egui's bundled fonts only cover the
+// subset its own widgets draw from. Verified by rendering each candidate in the
+// real GUI and screenshotting: U+25B6 `▶` and U+25A0 `■` render, but
+// U+25B8 `▸`, U+25BE `▾`, U+25BC, U+25BD, U+25BF, U+25B3 and U+25B4 all come out
+// as tofu boxes. U+23F5/U+23F7 render, are a matched pair at caret size, and
+// stay visually distinct from `ICON_WATCH`.
 const ICON_WATCH: &str = "\u{25b6}"; // ▶
 const ICON_STOP: &str = "\u{25a0}"; // ■
-const ICON_CARET_COLLAPSED: &str = "\u{25b8}"; // ▸
-const ICON_CARET_EXPANDED: &str = "\u{25be}"; // ▾
+const ICON_CARET_COLLAPSED: &str = "\u{23f5}"; // ⏵
+const ICON_CARET_EXPANDED: &str = "\u{23f7}"; // ⏷
 const ICON_CLOSE: &str = "\u{1f5d9}"; // 🗙
 const ICON_AUDIO: &str = "\u{1f50a}"; // 🔊
 
