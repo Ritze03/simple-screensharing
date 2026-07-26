@@ -15,8 +15,27 @@ mod state;
 use state::Managed;
 
 fn main() {
+    // `Managed::new()` builds `session::AppState::default()`, which eagerly
+    // binds the client's local QUIC/UDP socket (`net::build_client_endpoint`).
+    // That bind requires an entered Tokio reactor (quinn's `runtime-tokio`
+    // feature looks it up at bind time) — but a plain `.manage(Managed::new())`
+    // here runs synchronously during `Builder::default()`, before Tauri has
+    // entered any runtime context (same class of problem `driver.rs` hit with
+    // a raw `tokio::spawn` in `.setup()`; see that module's doc comment).
+    // Left as-is, every `join_room` call failed with "no async runtime found"
+    // because the endpoint had already failed to bind at construction and
+    // `start_connect` just replayed that stored error.
+    //
+    // `tauri::async_runtime::block_on` lazily creates (or reuses) Tauri's one
+    // shared Tokio runtime and *enters* it for the duration of the future,
+    // which is exactly the reactor context `build_client_endpoint` needs —
+    // and it's available even this early, before `.setup()`/`.run()`, unlike
+    // a raw `tokio::Runtime::enter()` guard we'd have to build and hold
+    // ourselves. Constructing `Managed` inside it fixes the bind without
+    // touching `session.rs` or making the endpoint lazily-initialized.
+    let managed = tauri::async_runtime::block_on(async { Managed::new() });
     tauri::Builder::default()
-        .manage(Managed::new())
+        .manage(managed)
         .setup(|app| {
             driver::spawn(app.handle().clone());
             Ok(())
