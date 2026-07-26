@@ -35,78 +35,58 @@
 //! `mpsc::UnboundedReceiver<ClientEvent>` that `ScreenshareClient::connect`
 //! returns.
 //!
-//! # Session data model (rooms, captures, destinations)
+//! # Session state lives in `session.rs`
 //!
-//! [`App`] owns three collections that together describe "what this client is
-//! doing right now". None of it is persisted — every launch starts empty
-//! (only `rooms.rs`'s `RoomStore`/`AppSettings` survive a restart):
+//! Every logic-carrying type this module renders (`RoomHandle`,
+//! `CaptureSourceId`, `DestinationId`, `Destination`, `LocalCapture`,
+//! `WatchEntry`, `AudioWatch`, `PopoutState`, `Status`, `RoomSession`,
+//! `PendingConnect`, `PendingRole`, `DestEdit`, `BandwidthController`, and the
+//! whole [`session::AppState`] data model — rooms, captures, destinations,
+//! fan-out/transfer, and Absolute-Maximum bandwidth allocation) lives in
+//! `session.rs` — see that module's docs for the full "Session data model"
+//! writeup, including why captures (not rooms) own destinations, and why
+//! fan-out/transfer are make-before-break.
 //!
-//! - `rooms: IndexMap<RoomHandle, RoomSession>` — one entry per joined room.
-//!   A room *is* one QUIC connection: the protocol welds a `ScreenshareClient`
-//!   to exactly one room, so N rooms means N connections (all riding the one
-//!   shared `quinn::Endpoint` in `App::endpoint`). Everything genuinely
-//!   room-scoped — roster, announced streams, watches, audio watches, preview
-//!   cache/textures, the `stream_id` allocator — lives here, which is what
-//!   keeps two rooms from colliding on a shared key space.
-//! - `captures: IndexMap<CaptureSourceId, LocalCapture>` — one entry per local
-//!   GStreamer capture pipeline (a screen share, or an audio source). **All**
-//!   capture/pipeline state lives here, not under a room.
-//! - each `LocalCapture` owns `destinations: IndexMap<DestinationId, Destination>`
-//!   — one entry per room this capture is being sent into.
+//! [`App`] below is a thin egui-facing wrapper around [`session::AppState`]
+//! plus the handful of fields that are genuinely just view state and never
+//! touched by anything in `session.rs`: [`NavTab`] selection, which rooms are
+//! expanded, the "+ Add Room" card's own fields, the leave-confirm dialog,
+//! and whether the theme has been installed on this `egui::Context` yet.
 //!
-//! `Why:` (captures are `App`-owned, and own their destinations rather than
-//! the other way round) one capture is eventually meant to feed several rooms
-//! at once — one real screen grab, N independently encoded and independently
-//! encrypted outgoing streams, because encryption keys and nonce spaces are
-//! room-bound and can never be shared across rooms. If a room owned its
-//! captures, leaving that room would tear down a pipeline other rooms are
-//! still using. With captures owned by `App` and destinations owned by the
-//! capture, leaving a room only removes that room's destinations; the capture
-//! survives as long as any destination remains. `RoomSession` keeps only a
-//! `Vec<DestinationId>` back-reference so a room can still answer "what am I
-//! sending here?" in its own order.
+//! Business-logic methods on `AppState`/`RoomSession` are called as
+//! `self.state.method(...)` / `room.method(...)` from the rendering code
+//! below. A few (`start_connect`, `disconnect_room`, `request_leave_room`,
+//! `poll_connect_result`) get a thin same-named wrapper here instead of a
+//! bare pass-through, because their `AppState` counterpart used to also touch
+//! a UI-only field (the "+ Add Room" card's state, `expanded_rooms`,
+//! `leave_confirm`) — see [`session::ConnectOutcome`] for how a connect
+//! result gets back to this layer without that UI-only state needing to live
+//! on `AppState`.
 //!
-//! **Fan-out is live**: a capture can feed several rooms at once, each
-//! destination backed by its own dynamic `capture::branch` encode branch with
-//! its own encoder, bitrate, `stream_id`, room key and `DestinationState`.
-//! `add_destination` (fan-out), `transfer_destination` (make-before-break
-//! transfer between rooms) and `apply_destination_edit` (settings edits routed
-//! through `capture::destination::classify_change`) are the operations; the
-//! Stream Control tab is their UI. See `superdoc/features/stream-control.md`.
-//!
-//! The **sidebar** is genuinely multi-room: ROOMS lists every joined room at
-//! once and STREAMS lists this client's outgoing destinations across *all* of
-//! them. The Stream Control tab's destination list and its bandwidth
-//! allocation are cross-room too. `active_room` is now only a *view* pointer
-//! for the View tab and for the room-scoped cards (members, rename, audio) at
-//! the bottom of Stream Control; retiring it entirely belongs to the stage
-//! that adds the one global tile grid across every room. Nothing in the data
-//! model depends on it.
+//! The three rendering-only methods that still need `egui::Context`/textures/
+//! viewports (`RoomSession::update_watch_textures`, `RoomSession::pop_out`,
+//! `RoomSession::show_popouts`) get a second, egui-dependent `impl RoomSession`
+//! block below, alongside `App::update_self_preview_textures` — everything
+//! else on those types is in `session.rs`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
-use indexmap::IndexMap;
-use tokio::sync::{mpsc, oneshot};
-
-use crate::audio::{self, AudioCaptureHandle, AudioSource};
-use crate::bandwidth::{self, AllocInput, Allocation, DestId, DestSpec};
-use crate::capture::{self, CaptureHandle, DestKey};
-use crate::decode::{self, AudioDecoder, PreviewCache, StreamDecoder};
-use crate::net::{ClientEvent, PresenceSnapshotState, ScreenshareClient};
-use crate::protocol::{ConnId, Member, PresenceEvent, StreamId, StreamInfo, StreamKind};
-use crate::rooms::{AppSettings, BandwidthMode, PresentationMode, RoomStore};
+use crate::capture::{self, DestKey};
+use crate::protocol::{ConnId, StreamId, StreamInfo, StreamKind};
+use crate::rooms::{BandwidthMode, PresentationMode};
+use crate::session::{
+    self, room_label, AppState, CaptureSourceId, ConnectOutcome, Destination, DestinationId, LocalCapture, PendingRole,
+    PopoutState, RoomHandle, RoomSession, ShareHandle, ShareStatus, Status, MAX_BITRATE_KBPS,
+};
 use crate::theme;
 
-type ConnectResult = Result<(ScreenshareClient, PresenceSnapshotState, mpsc::UnboundedReceiver<ClientEvent>), String>;
-
-/// A reasonable default encode bitrate, preselected on the bitrate slider.
-const DEFAULT_BITRATE_KBPS: u32 = 8000;
-/// Slider bounds, matching the project's 40 Mbit/s ceiling.
+/// Slider bounds, matching the project's 40 Mbit/s ceiling. The ceiling
+/// (`session::MAX_BITRATE_KBPS`) is imported from `session.rs` since
+/// `AppState::allocation_input` needs the same number as the per-destination
+/// bandwidth ceiling; the floor is purely a UI slider bound.
 const MIN_BITRATE_KBPS: u32 = 1000;
-const MAX_BITRATE_KBPS: u32 = 40000;
 
 /// Idle-fallback repaint cadence while connecting/connected but nothing
 /// needs a faster one (see `eframe::App::update`'s use of this constant).
@@ -117,14 +97,6 @@ const IDLE_REPAINT_INTERVAL: std::time::Duration = std::time::Duration::from_mil
 /// See `superdoc/features/presentation-modes.md`'s "Why" note on this.
 const UNFOCUSED_REPAINT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Default capture framerate, preselected on the framerate dropdown —
-/// mirrors `capture::DEFAULT_FRAMERATE` (kept as a local constant, like
-/// `DEFAULT_BITRATE_KBPS` above, rather than importing it, for consistency
-/// with the existing bitrate constants' pattern in this module). Deliberately
-/// conservative: see `capture::DEFAULT_FRAMERATE`'s doc comment for why 30
-/// (matching this pipeline's framerate before it became configurable) beats
-/// defaulting straight to the 240Hz ceiling.
-const DEFAULT_FRAMERATE: u32 = 30;
 /// Common refresh rates offered on the framerate dropdown, up to the
 /// project's 240Hz desktop-client ceiling (`capture::MAX_FRAMERATE`) — more
 /// natural as discrete choices than a continuous slider, since these are the
@@ -143,141 +115,6 @@ const FRAMERATE_OPTIONS: [u32; 7] = [30, 60, 90, 120, 144, 165, 240];
 const RESOLUTION_SCALES: [(u32, &str); 4] = [(100, "100%"), (75, "75%"), (50, "50%"), (33, "33%")];
 
 // ---------------------------------------------------------------------
-// Bandwidth: Absolute-Maximum mode's allocator wiring
-// ---------------------------------------------------------------------
-
-/// How often the Absolute-Maximum allocation is recomputed at most.
-///
-/// `Why` a rate limit at all (and why ~1s): `allocate` is pure and cheap, but
-/// *applying* its result is a property write into a live encoder's rate
-/// controller, and both `x264enc` and `vah264enc` need time to converge on a
-/// new target. Recomputing on every repaint (up to 240/s) would hand the rate
-/// controller a new target faster than it can settle on the last one, which
-/// shows up as visible quality oscillation rather than a smooth adjustment.
-/// The allocation's inputs also change in bursts — joining a room, starting a
-/// fan-out destination, a transfer's make-before-break overlap where the old
-/// and new destination briefly both exist — so a fixed ~1s cadence collapses
-/// each burst into a single re-apply instead of a storm of them. One second
-/// is the plan doc's own figure and is comfortably below any human-noticeable
-/// delay in a bandwidth adjustment.
-const ALLOC_RECOMPUTE_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Hysteresis: the minimum change worth writing into a live encoder.
-///
-/// `Why both a relative and an absolute term, combined with OR:` at a high
-/// bitrate (say 8000 kbit/s) 5% is 400 kbit/s, and waiting for a swing that
-/// large before reacting would leave real headroom unused; at a low bitrate
-/// (say 400 kbit/s) an absolute 100 kbit/s threshold is a *quarter* of the
-/// stream and would make the destination unresponsive to allocation changes
-/// entirely. Triggering on whichever bound is hit first ("differs by more
-/// than 5% **or** more than 100 kbit/s", exactly as the plan doc words it)
-/// keeps the threshold proportionate at both ends while still filtering the
-/// ±1 kbit/s churn that largest-remainder rounding produces when an unrelated
-/// destination's weight changes slightly.
-const ALLOC_HYSTERESIS_PERCENT: u32 = 5;
-/// See [`ALLOC_HYSTERESIS_PERCENT`].
-const ALLOC_HYSTERESIS_KBPS: u32 = 100;
-
-/// Whether a newly allocated bitrate is different enough from what this
-/// destination's encoder was last actually told to be worth another live
-/// property write. A destination that has never been written to always is.
-fn needs_reapply(current: Option<u32>, target: u32) -> bool {
-    let Some(current) = current else { return true };
-    let delta = current.abs_diff(target);
-    // `u64` for the percentage comparison: both sides are bounded by the
-    // 40 Mbit/s ceiling in practice, but `current` comes from a hand-editable
-    // settings file by way of the allocator, and `delta * 100` on a
-    // near-`u32::MAX` value would wrap — turning "this changed enormously"
-    // into "not worth writing".
-    delta > ALLOC_HYSTERESIS_KBPS || delta as u64 * 100 > current as u64 * ALLOC_HYSTERESIS_PERCENT as u64
-}
-
-/// What one [`BandwidthController::tick`] decided.
-struct BandwidthTick {
-    /// The encoder writes to actually perform — already filtered by
-    /// hysteresis, so an empty vec means "nothing changed enough to be worth
-    /// touching the encoders".
-    writes: Vec<(DestinationId, u32)>,
-    /// The full allocation this tick produced, kept so the UI can show each
-    /// destination's share and the overshoot warning.
-    allocation: Allocation,
-}
-
-/// Drives `bandwidth::allocate` for Absolute-Maximum mode: rate-limits how
-/// often it recomputes, remembers what each destination's encoder was last
-/// told, and suppresses writes that don't clear the hysteresis threshold.
-///
-/// Deliberately owns no `App` state and calls no clock of its own (`now` is
-/// passed in), for the same reason `bandwidth::allocate` is a pure function
-/// and `decode.rs`'s `PacingState` takes an explicit `Instant`: the whole
-/// point of this layer is the timing behaviour, so the timing behaviour has
-/// to be testable without sleeping.
-struct BandwidthController {
-    last_recompute: Option<Instant>,
-    /// Last value actually written to each destination's encoder.
-    applied: HashMap<DestinationId, u32>,
-    /// Most recent allocation, for the UI.
-    last_allocation: Option<Allocation>,
-}
-
-impl BandwidthController {
-    fn new() -> Self {
-        Self { last_recompute: None, applied: HashMap::new(), last_allocation: None }
-    }
-
-    /// Recompute and decide the writes, or `None` if the rate limit says it's
-    /// too soon. Recording the writes as applied is the caller's job
-    /// ([`BandwidthController::note_applied`]) — so a write that couldn't be
-    /// delivered (destination already gone) doesn't get remembered as if it
-    /// had been.
-    fn tick(&mut self, now: Instant, input: &AllocInput) -> Option<BandwidthTick> {
-        if let Some(last) = self.last_recompute
-            && now.duration_since(last) < ALLOC_RECOMPUTE_INTERVAL
-        {
-            return None;
-        }
-        self.last_recompute = Some(now);
-
-        let allocation = bandwidth::allocate(input);
-        let writes: Vec<(DestinationId, u32)> = allocation
-            .per_destination
-            .iter()
-            .map(|(id, kbps)| (DestinationId(id.0), *kbps))
-            .filter(|(id, kbps)| needs_reapply(self.applied.get(id).copied(), *kbps))
-            .collect();
-        self.last_allocation = Some(allocation.clone());
-        Some(BandwidthTick { writes, allocation })
-    }
-
-    fn note_applied(&mut self, id: DestinationId, kbps: u32) {
-        self.applied.insert(id, kbps);
-    }
-
-    fn applied_kbps(&self, id: DestinationId) -> Option<u32> {
-        self.applied.get(&id).copied()
-    }
-
-    fn forget(&mut self, id: DestinationId) {
-        self.applied.remove(&id);
-    }
-
-    /// Leaving Absolute-Maximum mode: nothing the allocator wrote is
-    /// authoritative any more (Per-Stream mode re-applies each destination's
-    /// own manual rate), so drop the memory of it. Deliberately does **not**
-    /// touch any stored per-destination or total setting — only this
-    /// controller's own bookkeeping.
-    fn reset(&mut self) {
-        self.last_recompute = None;
-        self.applied.clear();
-        self.last_allocation = None;
-    }
-
-    fn allocation(&self) -> Option<&Allocation> {
-        self.last_allocation.as_ref()
-    }
-}
-
-// ---------------------------------------------------------------------
 // App-shell layout constants
 // ---------------------------------------------------------------------
 
@@ -290,10 +127,10 @@ const SIDEBAR_WIDTH: f32 = 268.0;
 /// the sidebar.
 ///
 /// `Why` a cap rather than pinning STREAMS to the bottom and letting it grow:
-/// multi-destination fan-out (a later stage) makes STREAMS' length a function
-/// of how many rooms each capture feeds, so an uncapped section could take
-/// over the whole rail. ROOMS is the sidebar's primary navigation and keeps
-/// the greedy middle; STREAMS gets a bounded footer and its own scroll.
+/// multi-destination fan-out makes STREAMS' length a function of how many
+/// rooms each capture feeds, so an uncapped section could take over the
+/// whole rail. ROOMS is the sidebar's primary navigation and keeps the
+/// greedy middle; STREAMS gets a bounded footer and its own scroll.
 const STREAMS_MAX_HEIGHT: f32 = 176.0;
 /// Period of the reconnecting dot's opacity pulse, in seconds.
 const RECONNECT_PULSE_PERIOD: f64 = 1.2;
@@ -360,409 +197,16 @@ impl Default for NavTab {
     }
 }
 
-// ---------------------------------------------------------------------
-// Session ids
-// ---------------------------------------------------------------------
-//
-// `Why:` (opaque `u32` newtypes with a monotonic per-`App` counter, not
-// indices into the maps and not the protocol's own ids) three properties are
-// wanted at once. **Not indices**: `IndexMap` shifts indices on removal, so an
-// id held across a removal would silently start addressing a *different*
-// room/capture. Allocating from a counter that never rewinds within a session
-// means a stale id can only ever miss, never alias. **Not protocol ids**: a
-// `StreamId` is one byte and is only unique within one connection — exactly
-// the collision the multi-room refactor exists to remove — and a `ConnId` is
-// assigned by the relay, so neither can key local state that spans rooms.
-// **Distinct types rather than a shared `Id(u32)`**: passing a
-// `CaptureSourceId` where a `RoomHandle` belongs is then a compile error, and
-// these get passed through a lot of plumbing. `u32` (not `u64`) because these
-// count user actions — joins, screen shares — in one process lifetime.
-
-/// Identifies one joined room (one QUIC connection) for this session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct RoomHandle(u32);
-
-/// Identifies one local capture pipeline (one screen grab, or one audio
-/// source) for this session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct CaptureSourceId(u32);
-
-/// Identifies one outgoing stream: one capture, encoded and encrypted for one
-/// room.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct DestinationId(u32);
-
-/// Either kind of running outbound share this client can hold onto.
-enum ShareHandle {
-    Video(CaptureHandle),
-    Audio(AudioCaptureHandle),
-}
-
-/// Per-share state machine. Starting/stopping are async
-/// (`capture::start_sharing`/`audio::start_audio_sharing`, and each handle's
-/// `.stop()`), so each transition is spawned and its result delivered back
-/// via a oneshot, mirroring `Status`/`connect_rx` above.
-enum ShareStatus {
-    Starting(oneshot::Receiver<Result<ShareHandle, String>>),
-    Active(ShareHandle),
-    Stopping(oneshot::Receiver<Result<(), String>>),
-}
-
-/// One room this capture is being sent into: the room, plus the `stream_id`
-/// announced on *that* room's connection.
-///
-/// `Why:` (no back-pointer to the owning capture, no copy of its own
-/// `DestinationId`) a `Destination` is only ever reachable by walking
-/// `App::captures` → `LocalCapture::destinations`, so both the owning
-/// `CaptureSourceId` and this destination's own `DestinationId` are already
-/// in hand at every use site. Storing them here would be a second copy to
-/// keep in sync, with nothing to gain.
-struct Destination {
-    room: RoomHandle,
-    /// This destination's `stream_id` on `room`'s connection — allocated from
-    /// that `RoomSession`'s own `next_stream_id`, so the same capture fanned
-    /// out to two rooms can (and generally will) carry a different
-    /// `stream_id` in each.
-    stream_id: StreamId,
-    /// This destination's own encode settings. Genuinely per-destination: two
-    /// rooms fed by the same capture can run different resolutions, framerates
-    /// and bitrates, each served by its own tee branch's
-    /// `videoscale`/`videorate`/encoder chain (`capture::branch::add_branch`).
-    /// Set at creation from the app-level defaults; a later UI stage exposes
-    /// per-destination editing on top of `capture::destination::classify_change`.
-    params: capture::destination::VideoParams,
-    /// Shared handle onto this destination's live lifecycle state — the
-    /// `DestinationState` machine, its monotonic wire-PTS clock, and the stall
-    /// protocol's cached IDR. See `capture::destination::DestinationRuntime`.
-    ///
-    /// `None` only while the capture is still `ShareStatus::Starting` (the
-    /// runtime is created inside `capture::start_sharing`, so it doesn't exist
-    /// until the handle comes back), while a fanned-out/transferred
-    /// destination's branch is still being built (`pending`), and for audio
-    /// destinations, which have no video lifecycle. `poll_capture_states` /
-    /// `poll_pending_destinations` attach it the moment the handle lands;
-    /// `Destination::state` reports `Starting` until then, which is exactly
-    /// what a not-yet-started destination is.
-    runtime: Option<capture::destination::SharedDestination>,
-    /// Set while this destination is being brought up (or, for the *source*
-    /// side of a transfer, torn down) so the UI can say which of the two it
-    /// is instead of silently swapping rows. See [`PendingRole`].
-    pending: Option<PendingRole>,
-    /// The settings currently being edited in this destination's row, applied
-    /// (through `capture::destination::classify_change`) when "Apply" is
-    /// clicked. Separate from `params` so a half-typed edit never becomes the
-    /// live configuration, and so the row can show "changed / not applied".
-    edit: DestEdit,
-    /// Set while an "Apply" is in flight, resolving to `Ok(())` once the
-    /// branch swap completes — see `capture::CaptureHandle::change_destination`.
-    apply_rx: Option<oneshot::Receiver<Result<(), String>>>,
-}
-
-/// Audio destinations carry the video params struct inertly — there is no
-/// per-destination audio geometry to describe, and their `runtime` stays
-/// `None` because the video `DestinationState`/stall machinery has no audio
-/// counterpart (audio's own always-on-mixer design makes toggling invisible
-/// by construction; see the plan doc).
-const AUDIO_DESTINATION_PARAMS: capture::destination::VideoParams = capture::destination::VideoParams {
-    width: 0,
-    height: 0,
-    framerate: 0,
-    bitrate_kbps: 0,
-    backend: capture::EncoderBackend::Software,
-};
-
-/// A destination's in-progress lifecycle beyond what `DestinationState`
-/// covers — those states describe a *live* destination's encode branch; these
-/// describe one that isn't (yet, or any more) a normal destination at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PendingRole {
-    /// A second (third, …) destination off an existing capture is being
-    /// brought up — the fan-out case.
-    FanOut,
-    /// Make-before-break transfer: this is the *new* destination in the
-    /// target room, still proving itself. The old one keeps streaming until
-    /// this succeeds.
-    TransferTarget(RoomHandle),
-    /// Make-before-break transfer: this is the *old* destination, still live
-    /// and still authoritative, waiting for its replacement to confirm.
-    TransferSource(RoomHandle),
-}
-
-/// The editable half of a destination row: the user's in-progress choices,
-/// kept as UI-friendly values (a downscale percentage rather than a pixel
-/// size) and resolved against the live source caps at apply time.
-struct DestEdit {
-    /// One of [`RESOLUTION_SCALES`]' percentages.
-    scale_percent: u32,
-    framerate: u32,
-    /// The Per-Stream-Maximum manual rate for this destination.
-    ///
-    /// `Why` this survives Absolute-Maximum mode untouched: the two modes'
-    /// numbers are independent (see `rooms::AppSettings`' `Why:` note).
-    /// While Absolute mode is on, the allocator writes live bitrates straight
-    /// into the encoders without ever touching this field, so switching back
-    /// to Per-Stream restores exactly what the user had set here.
-    bitrate_kbps: u32,
-}
-
-impl Destination {
-    /// This destination's current lifecycle state — `Starting` before the
-    /// capture handle exists (see `runtime`), otherwise whatever the pump task
-    /// has most recently recorded.
-    fn state(&self) -> capture::destination::DestinationState {
-        match &self.runtime {
-            Some(runtime) => runtime.lock().unwrap().state(),
-            None => capture::destination::DestinationState::Starting,
-        }
-    }
-
-    /// The parameters actually in force: the live runtime's if this
-    /// destination has one (the pipeline's real negotiated size, the
-    /// framerate/bitrate its branch is really running at), otherwise the
-    /// requested ones.
-    fn live_params(&self) -> capture::destination::VideoParams {
-        match &self.runtime {
-            Some(runtime) => runtime.lock().unwrap().params(),
-            None => self.params,
-        }
-    }
-
-    /// A fresh edit buffer matching this destination's current settings — the
-    /// state a row shows before the user changes anything.
-    fn edit_from(params: capture::destination::VideoParams) -> DestEdit {
-        DestEdit { scale_percent: 100, framerate: params.framerate, bitrate_kbps: params.bitrate_kbps }
-    }
-
-    /// Resolve this row's edit buffer into concrete `VideoParams` against what
-    /// the capture source is producing. Never upscales — the scale is applied
-    /// to the source size, and `capture::destination::clamp_to_source` is the
-    /// backstop for anything that still overshoots.
-    fn edited_params(&self, source: capture::destination::SourceCaps) -> capture::destination::VideoParams {
-        let (width, height) = if source.width == 0 || source.height == 0 {
-            (0, 0)
-        } else {
-            (
-                (source.width * self.edit.scale_percent / 100).max(2) & !1,
-                (source.height * self.edit.scale_percent / 100).max(2) & !1,
-            )
-        };
-        capture::destination::VideoParams {
-            width,
-            height,
-            framerate: self.edit.framerate,
-            bitrate_kbps: self.edit.bitrate_kbps,
-            backend: self.live_params().backend,
-        }
-    }
-}
-
-/// One local capture pipeline (video or audio) and every room it feeds.
-/// Several can run at once — e.g. two monitors, or a screen share plus an
-/// audio share. Owned by `App::captures`, never by a room: see this module's
-/// "Session data model" docs for why.
-struct LocalCapture {
-    kind: StreamKind,
-    /// Human-readable label for this capture's row: "Screen share" for video,
-    /// the source's name for audio.
-    label: String,
-    status: ShareStatus,
-    /// Rooms this capture is being sent into. Exactly one entry for now (see
-    /// the module docs); the map — rather than a single field — is what later
-    /// fan-out work grows into without re-keying anything.
-    destinations: IndexMap<DestinationId, Destination>,
-    /// Live self-preview texture for this capture (video only), created
-    /// lazily on the first captured frame then updated in place. Populated by
-    /// `App::update_self_preview_textures` from
-    /// `CaptureHandle::self_preview_frame`. See
-    /// `superdoc/features/self-preview.md`.
-    ///
-    /// `Why:` (one texture on the capture, rather than a `HashMap<StreamId, _>`
-    /// on the room) a self-preview shows what *this machine is capturing*,
-    /// which is a property of the capture and identical for every room it's
-    /// sent to. Keying it by `stream_id` — as this did while there was only
-    /// ever one connection — collides the moment two rooms exist, since
-    /// `stream_id` is only unique within one connection.
-    self_preview_texture: Option<egui::TextureHandle>,
-}
-
-/// One stream currently being watched: its decoder, plus the texture handle
-/// (created lazily on the first decoded frame, then updated in place).
-///
-/// The decoder is behind an `Arc<Mutex<_>>` rather than owned outright
-/// because, once popped out (see `popout`), it needs to be polled from
-/// inside a `show_viewport_deferred` closure — those closures are `Fn`
-/// (callable repeatedly, possibly from the egui backend's own bookkeeping)
-/// rather than `FnMut`, so any state they mutate has to live behind shared
-/// interior mutability rather than being captured by unique reference. The
-/// same `Arc` is cloned into the popout closure while this struct keeps its
-/// own handle, so `drain_events`' `feed()` calls keep working unchanged
-/// regardless of popped-out state.
-struct WatchEntry {
-    decoder: Arc<Mutex<StreamDecoder>>,
-    texture: Option<egui::TextureHandle>,
-    /// `Some` while this stream is displayed in its own native window
-    /// instead of the central panel.
-    popout: Option<PopoutState>,
-    /// The stream_id of the same sender's audio stream, if one was active
-    /// when this video watch started (see `RoomSession::toggle_watch`'s
-    /// auto-subscribe-audio behavior) and got auto-subscribed alongside it.
-    /// Looked up in `RoomSession::audio_watches` to render the volume slider
-    /// next to the video panel and to tear the audio watch down together
-    /// with this one. `None` if the sender had no audio stream announced at
-    /// watch time.
-    audio_stream_id: Option<StreamId>,
-}
-
-/// One audio stream currently being decoded/played, whether auto-subscribed
-/// alongside a video `WatchEntry` (see `WatchEntry::audio_stream_id`) or
-/// started standalone via a "Listen" click on an audio-only stream (no
-/// video from the same sender). Keyed the same way as `watches`, in
-/// `RoomSession::audio_watches`.
-struct AudioWatch {
-    decoder: AudioDecoder,
-    /// 0-200, the value bound to this stream's volume slider. Applied to
-    /// `decoder` (as `volume_percent / 100.0`) whenever the slider changes.
-    volume_percent: u32,
-}
-
-/// State for a `WatchEntry` currently rendered in its own
-/// `show_viewport_deferred` window rather than the central panel.
-struct PopoutState {
-    /// The popout window's own texture, decoupled from `WatchEntry::texture`
-    /// so the inline central panel and the popout window can each hold the
-    /// most recent frame decoded at their own repaint cadence without
-    /// stepping on each other. Wrapped for the same `Fn`-closure reason as
-    /// `WatchEntry::decoder`.
-    texture: Arc<Mutex<Option<egui::TextureHandle>>>,
-    /// Set from inside the popout's `viewport_ui_cb` when it observes
-    /// `ViewportInfo::close_requested()` (OS close button, Alt+F4, etc.).
-    /// Polled once per main-thread frame in `show_popouts` so the entry can
-    /// be un-popped-out (returned to the central panel) instead of just
-    /// leaking into a window that no longer repaints.
-    close_requested: Arc<AtomicBool>,
-}
-
-enum Status {
-    Idle,
-    Connecting,
-    Error(String),
-}
-
-/// One joined room: its QUIC connection and everything genuinely scoped to
-/// that room. Replaces the old singleton `Connected`.
-///
-/// Every collection in here is room-scoped *by construction* — living inside
-/// the `RoomSession` is what makes `(ConnId, StreamId)` keys unambiguous
-/// again, since a `StreamId` is only unique within one connection and a
-/// second room would otherwise reuse the same small integers for entirely
-/// different streams.
-struct RoomSession {
-    client: ScreenshareClient,
-    event_rx: mpsc::UnboundedReceiver<ClientEvent>,
-    members: Vec<Member>,
-    streams: Vec<StreamInfo>,
-    /// The `server|room-id|key` string this session was connected with.
-    ///
-    /// `Why` it lives on the session (it used to be a single `App::join_string`
-    /// bound to the join form's text field): the sidebar renders `room_store ⟕
-    /// rooms`, and the join string is the only key a `SavedRoom` and a live
-    /// session both carry (see `RoomStore::name_for`). A single `App`-level
-    /// field could only ever describe the *most recently used* join string,
-    /// which stops meaning anything the moment two rooms are joined.
-    join_string: String,
-    /// Rename field for this room's `RoomStore` entry, bound to the Stream
-    /// Control tab's "save this room as" row.
-    save_name: String,
-    /// Set once the user has saved/renamed this room from that row, so the
-    /// confirmation shows exactly once per edit.
-    saved: bool,
-
-    /// What this client is currently sending *into this room*, in the order
-    /// the user started them. Back-references only: the `Destination`s
-    /// themselves are owned by their `LocalCapture` in `App::captures` (see
-    /// the module docs), because a capture outlives any single room it feeds.
-    destinations: Vec<DestinationId>,
-    /// Single per-room counter for allocating our own `stream_id`s on *this*
-    /// connection, shared across video and audio (protocol nonce-domain
-    /// separation is per stream_id, not per media kind). Per room rather than
-    /// global: `stream_id` is scoped to a connection, so every room starts
-    /// from 0 independently and two rooms handing out the same number is
-    /// correct, not a collision.
-    next_stream_id: StreamId,
-
-    /// Streams we're currently subscribed to and decoding in this room, keyed
-    /// by (owner conn_id, stream_id).
-    ///
-    /// `Why` `Arc<Mutex<_>>` around the whole map (not just per-entry, though
-    /// `WatchEntry::decoder` is separately `Arc<Mutex<_>>` too, for the
-    /// popout-closure reason documented there): the dedicated per-connection
-    /// media-ingestion task spawned by `insert_room` (see
-    /// `spawn_media_ingestion_task`) needs to look decoders up by
-    /// `(ConnId, StreamId)` the instant a `MediaFrame` event arrives, from a
-    /// different task than whatever's currently running `App::update()` —
-    /// this is what lets media delivery bypass `App::update()`'s throttled
-    /// repaint cadence entirely (see that function's doc comment for the
-    /// backlog bug this fixes). Sharing the *actual* map, rather than a
-    /// separate shadow registry the UI methods below would also have to keep
-    /// in sync, means a stream started/stopped via `toggle_watch` is visible
-    /// to the ingestion task the instant the same lock that guards every
-    /// other access here is released — nothing to duplicate, nothing that can
-    /// drift out of sync.
-    watches: Arc<Mutex<HashMap<(ConnId, StreamId), WatchEntry>>>,
-    watch_error: Option<String>,
-    /// Which watched stream of this room's the central video panel displays.
-    selected_watch: Option<(ConnId, StreamId)>,
-
-    /// Audio streams we're currently subscribed to and playing, keyed by
-    /// (owner conn_id, audio stream_id) — the audio stream's own id, not the
-    /// paired video's. Populated both by watching a video stream whose
-    /// sender also has an active audio stream (auto-subscribe, see
-    /// `toggle_watch`) and by clicking "Listen" on an audio-only stream (see
-    /// `toggle_listen`).
-    ///
-    /// Shared with the media-ingestion task the same way and for the same
-    /// reason as `watches` above.
-    audio_watches: Arc<Mutex<HashMap<(ConnId, StreamId), AudioWatch>>>,
-
-    /// Latest decoded preview still per active stream in this room,
-    /// regardless of whether it's being watched — previews arrive for every
-    /// active stream (spec design), so the "Streams" list row for any of them
-    /// can show a thumbnail once one has arrived.
-    preview_cache: PreviewCache,
-    /// Lazily created/updated texture per stream for the "Streams" list
-    /// thumbnail, keyed the same way as `preview_cache`/`watches`. Mirrors
-    /// `WatchEntry::texture`'s create-once/`set`-in-place pattern.
-    preview_textures: HashMap<(ConnId, StreamId), egui::TextureHandle>,
-}
-
-/// A connect attempt in flight, tagged with what it was for so its result can
-/// be routed back to the row (or the "+ Add Room" card) that started it.
-///
-/// `Why` a struct instead of the bare `oneshot::Receiver` this used to be:
-/// with an always-on ROOMS list there is no longer one join form owning the
-/// only connect in the app. A saved row's `[Reconnect]` and the Add Room
-/// card's `[Join]` both land here, and the sidebar has to know *which room row*
-/// is the one currently showing the amber reconnecting dot — which needs the
-/// join string, since a not-yet-connected room has no `RoomHandle`.
-struct PendingConnect {
-    rx: oneshot::Receiver<ConnectResult>,
-    /// The room being connected to. Also what the reconnecting-dot lookup
-    /// matches a `SavedRoom` row against.
-    join_string: String,
-    /// Whether this attempt came from the inline "+ Add Room" card, so a
-    /// failure can be reported inside that card (which stays open) rather than
-    /// as a detached error under the ROOMS list.
-    from_add_card: bool,
-}
-
+/// The egui-facing app shell: a thin wrapper around [`session::AppState`]
+/// (every room/capture/destination, fan-out/transfer, and bandwidth
+/// allocation — see that module's docs) plus the handful of fields that are
+/// genuinely just view state and never touched by anything in `session.rs`.
 pub struct App {
-    display_name: String,
-    status: Status,
-    pending_connect: Option<PendingConnect>,
+    state: AppState,
 
     /// Which nav pill is selected — i.e. what `ui_content` renders. Real,
-    /// frame-persistent state on `App`, deliberately *not* derived from
-    /// whether anything is joined/watching: a view selection the app silently
+    /// frame-persistent state, deliberately *not* derived from whether
+    /// anything is joined/watching: a view selection the app silently
     /// overrode would make the rail's accent fill lie about where you are.
     nav_tab: NavTab,
     /// Whether the inline "+ Add Room" mini-card is expanded under the ROOMS
@@ -778,114 +222,17 @@ pub struct App {
     /// the point of the sidebar is seeing every room at a glance.
     expanded_rooms: HashSet<RoomHandle>,
     /// Room awaiting leave confirmation, if the confirm dialog is up. See
-    /// `leave_needs_confirm`.
+    /// `request_leave_room`.
     leave_confirm: Option<RoomHandle>,
     /// Whether `theme::install` has run for this context yet. Once per
     /// process, not once per frame: it rewrites the whole `Visuals` struct.
     theme_installed: bool,
-
-    /// The one local QUIC endpoint every room connection rides (see
-    /// `net.rs`'s "One endpoint, N connections"). Built once here, at `App`
-    /// construction, rather than per `connect()` call. `Err` carries the bind
-    /// failure so the join screen can report it instead of the app panicking
-    /// at startup over a socket it couldn't open.
-    endpoint: Result<quinn::Endpoint, String>,
-
-    /// Every room currently joined, in join order. See the module docs.
-    rooms: IndexMap<RoomHandle, RoomSession>,
-    /// Every local capture pipeline currently running, in start order, with
-    /// its destinations. See the module docs.
-    captures: IndexMap<CaptureSourceId, LocalCapture>,
-    /// Which room the (still single-room) Stream Control and View tabs drive.
-    ///
-    /// `Why:` the sidebar is multi-room, but the two content tabs' *contents*
-    /// are a later stage (multi-destination fan-out; one global tile grid), so
-    /// until then they need one designated room to render. Deliberately a
-    /// view-level pointer that nothing in the data model depends on — deleting
-    /// it is all that's needed once both tabs can show every room at once.
-    /// Kept in sync by `poll_connect_result` (set on join), a click on a room
-    /// row (re-pointed), and `disconnect_room` (re-pointed on leave).
-    active_room: Option<RoomHandle>,
-
-    /// Monotonic id allocators — never rewind, never reuse (see the "Session
-    /// ids" note above).
-    next_room_handle: u32,
-    next_capture_id: u32,
-    next_destination_id: u32,
-
-    /// Last error from starting/stopping a capture. `App`-level, not
-    /// per-room: a capture is not owned by a room.
-    share_error: Option<String>,
-    /// Bitrate (kbps) to use for the *next* video capture started.
-    bitrate_kbps: u32,
-    /// Capture framerate cap (fps) to use for the *next* video capture
-    /// started — this becomes the capture's shared source rate (see
-    /// `capture::build_pipeline`'s pre-tee `videorate` cap).
-    framerate: u32,
-    /// Which room the "Start a stream" card will start the next capture in.
-    /// `None` until a room is joined; re-pointed by the picker.
-    new_stream_room: Option<RoomHandle>,
-
-    /// Absolute-Maximum vs. Per-Stream-Maximum (persisted preference).
-    bandwidth_mode: BandwidthMode,
-    /// Absolute-Maximum mode's single per-client total, kbit/s (persisted).
-    absolute_total_kbps: u32,
-    /// Absolute-Maximum mode's guaranteed per-destination floor (persisted).
-    destination_floor_kbps: u32,
-    /// Rate limiting, hysteresis and last-allocation bookkeeping for
-    /// Absolute-Maximum mode. Never persisted: it describes this session's
-    /// live encoders.
-    bandwidth: BandwidthController,
-
-    /// Destinations whose encode branch is still being built (fan-out and
-    /// transfer targets), polled once per frame by
-    /// `poll_pending_destinations`.
-    pending_destinations: Vec<PendingDestination>,
-
-    /// Audio sources discovered by the last `list_audio_sources()` call.
-    /// `App`-level: this is what the *machine* can capture, which has nothing
-    /// to do with which rooms are joined.
-    audio_sources: Vec<AudioSource>,
-    audio_sources_error: Option<String>,
-    /// Set once we've kicked off the first automatic listing, so we don't
-    /// re-trigger it every frame.
-    audio_sources_requested: bool,
-    /// In-flight `list_audio_sources()` call, if any.
-    audio_sources_rx: Option<oneshot::Receiver<Result<Vec<AudioSource>, String>>>,
-    selected_audio_source: Option<AudioSource>,
-
-    room_store: RoomStore,
-    room_store_error: Option<String>,
-    /// Current UI language ("en" or "de"), mirrored into `rust_i18n`'s
-    /// global locale on startup and on every toggle. Kept here too (rather
-    /// than re-reading `rust_i18n::locale()` each frame) so the language
-    /// `ComboBox` has a plain `&mut String` to bind to.
-    language: String,
-    /// Current `presentation_mode` selection, bound to the presentation-mode
-    /// dropdown and persisted immediately on change. Only takes effect on
-    /// the *next* launch (`main.rs` reads it once at startup and passes it
-    /// into `NativeOptions.wgpu_options`) — see
-    /// `superdoc/features/presentation-modes.md`.
-    presentation_mode: PresentationMode,
-    /// The presentation mode that was actually active when this window was
-    /// created (i.e. what was persisted at launch, before any in-session
-    /// change). Compared against `presentation_mode` to show a "restart to
-    /// apply" hint only once the two diverge.
-    launch_presentation_mode: PresentationMode,
 }
 
 impl Default for App {
     fn default() -> Self {
-        let (room_store, room_store_error) = match RoomStore::load() {
-            Ok(store) => (store, None),
-            Err(e) => (RoomStore::default(), Some(e.to_string())),
-        };
-        let settings = AppSettings::load();
-        rust_i18n::set_locale(&settings.language);
         Self {
-            display_name: whoami_fallback(),
-            status: Status::Idle,
-            pending_connect: None,
+            state: AppState::default(),
             nav_tab: NavTab::default(),
             add_room_open: false,
             add_room_join_string: String::new(),
@@ -893,1016 +240,22 @@ impl Default for App {
             expanded_rooms: HashSet::new(),
             leave_confirm: None,
             theme_installed: false,
-            endpoint: crate::net::build_client_endpoint().map_err(|e| format!("{e:#}")),
-            rooms: IndexMap::new(),
-            captures: IndexMap::new(),
-            active_room: None,
-            next_room_handle: 0,
-            next_capture_id: 0,
-            next_destination_id: 0,
-            share_error: None,
-            bitrate_kbps: DEFAULT_BITRATE_KBPS,
-            framerate: DEFAULT_FRAMERATE,
-            new_stream_room: None,
-            bandwidth_mode: settings.bandwidth_mode,
-            absolute_total_kbps: settings.absolute_total_kbps,
-            destination_floor_kbps: settings.destination_floor_kbps,
-            bandwidth: BandwidthController::new(),
-            pending_destinations: Vec::new(),
-            audio_sources: Vec::new(),
-            audio_sources_error: None,
-            audio_sources_requested: false,
-            audio_sources_rx: None,
-            selected_audio_source: None,
-            room_store,
-            room_store_error,
-            language: settings.language,
-            presentation_mode: settings.presentation_mode,
-            launch_presentation_mode: settings.presentation_mode,
         }
     }
 }
 
-/// Persist the current language choice, logging (not panicking) on failure —
-/// losing a settings preference across restarts is a minor inconvenience,
-/// not worth surfacing as a UI error.
-///
-/// Loads the existing settings file first rather than constructing a fresh
-/// `AppSettings` from just `language`: `AppSettings` now also carries
-/// `presentation_mode`, and building a literal with only `language` set
-/// would silently reset that field to its default every time the language
-/// toggle is touched.
-fn save_language(language: &str) {
-    let mut settings = AppSettings::load();
-    settings.language = language.to_string();
-    if let Err(e) = settings.save() {
-        tracing::warn!("failed to save language preference: {e:#}");
-    }
-}
-
-/// Persist the current presentation-mode choice. Mirrors `save_language`'s
-/// load-modify-save shape for the same reason: don't clobber the sibling
-/// setting.
-fn save_presentation_mode(mode: PresentationMode) {
-    let mut settings = AppSettings::load();
-    settings.presentation_mode = mode;
-    if let Err(e) = settings.save() {
-        tracing::warn!("failed to save presentation mode preference: {e:#}");
-    }
-}
-
-/// Persist the bandwidth preferences. Same load-modify-save shape as
-/// `save_language`/`save_presentation_mode`, for the same reason: writing a
-/// freshly-constructed `AppSettings` would reset every sibling field.
-///
-/// `Why` all three bandwidth fields are written together rather than one
-/// per edit: they're one coherent preference set, and — crucially — writing
-/// them together is what guarantees that changing the *mode* re-saves the
-/// other mode's number unchanged instead of dropping it. See
-/// `rooms::AppSettings`' `Why:` note on keeping both modes' values
-/// independent.
-fn save_bandwidth_settings(mode: BandwidthMode, absolute_total_kbps: u32, destination_floor_kbps: u32) {
-    let mut settings = AppSettings::load();
-    settings.bandwidth_mode = mode;
-    settings.absolute_total_kbps = absolute_total_kbps;
-    settings.destination_floor_kbps = destination_floor_kbps;
-    if let Err(e) = settings.save() {
-        tracing::warn!("failed to save bandwidth preferences: {e:#}");
-    }
-}
-
-/// A destination whose encode branch is being built on an already-running
-/// capture — the fan-out and transfer paths (`capture::CaptureHandle::
-/// spawn_add_destination`). Polled by `App::poll_pending_destinations`.
-struct PendingDestination {
-    capture_id: CaptureSourceId,
-    destination_id: DestinationId,
-    room: RoomHandle,
-    role: PendingRole,
-    rx: oneshot::Receiver<Result<capture::DestinationHandle, String>>,
-}
-
-/// A small local fallback so the display-name field isn't empty by default.
-/// Not a real identity system — just a nicer starting point than "".
-fn whoami_fallback() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| t!("common.default_display_name").to_string())
-}
-
-/// Resolve a `RoomSession::destinations` back-reference to the capture that
-/// owns it. `None` if the capture is already gone (a stale back-reference is
-/// harmless — ids are never reused, so a miss can only ever be a miss).
-fn find_destination(
-    captures: &IndexMap<CaptureSourceId, LocalCapture>,
-    id: DestinationId,
-) -> Option<(CaptureSourceId, &LocalCapture, &Destination)> {
-    captures
-        .iter()
-        .find_map(|(capture_id, capture)| capture.destinations.get(&id).map(|dest| (*capture_id, capture, dest)))
-}
-
-/// The capture currently feeding `stream_id` into `room`, if any. This is the
-/// multi-room-correct inverse of the old `active_shares[stream_id]` lookup:
-/// `stream_id` alone is ambiguous once more than one connection exists, so
-/// the room the event arrived on has to be part of the key.
-/// Returns the destination's own id alongside the capture, because everything
-/// a relay event drives (pause/resume, force keyframe) is now per
-/// *destination* — one capture can be feeding several rooms, each with its own
-/// encode branch and its own subscriber count.
-fn capture_feeding(
-    captures: &IndexMap<CaptureSourceId, LocalCapture>,
-    room: RoomHandle,
-    stream_id: StreamId,
-) -> Option<(&LocalCapture, DestinationId)> {
-    captures.values().find_map(|capture| {
-        capture
-            .destinations
-            .iter()
-            .find(|(_, d)| d.room == room && d.stream_id == stream_id)
-            .map(|(destination_id, _)| (capture, *destination_id))
-    })
-}
-
-/// Always-on per-connection task that reads `raw_events` — the exact
-/// `mpsc::UnboundedReceiver<ClientEvent>` `ScreenshareClient::connect`
-/// returns — as fast as events arrive, independent of `App::update()`'s
-/// repaint-driven cadence, and forwards everything except `MediaFrame` on to
-/// `forward_tx` (what `RoomSession::event_rx` actually is) for `drain_events`
-/// to keep handling exactly as before, at its normal throttled pace.
-///
-/// # Why this exists (the "fast-forward catch-up" bug)
-///
-/// `Why:` before this task existed, every `ClientEvent` — including
-/// `MediaFrame` — sat in that same unbounded channel until `App::update()`
-/// next ran and `drain_events` drained it with `try_recv()`. While the window
-/// is unfocused, `update()` only runs every `UNFOCUSED_REPAINT_INTERVAL`
-/// (500ms), so a sustained stream of incoming `MediaFrame`s piled up
-/// unconsumed in the channel for up to 500ms at a stretch — not stale in
-/// decode, not stale in `PacingState`'s budget math, just sitting
-/// undelivered. The moment `update()` next ran, the whole backlog drained in
-/// one tight `while let Ok(event) = ... try_recv()` burst, handing
-/// `StreamDecoder`/`AudioDecoder` a rapid-fire sequence of now-stale access
-/// units with almost no wall-clock time between `feed()` calls.
-/// `PacingState::decide` — correctly, given what it was fed — read that as
-/// "decode finished early" for every one of them and paced each out with a
-/// real-time sleep: a literal real-time replay of however much history had
-/// piled up, the "fast-forward catch-up" the user reported (see
-/// `superdoc/brainstorm/ui-redesign-multiroom-streaming.md`,
-/// "Performance/Rendering" round 2, and `decode.rs`'s `PacingState::epoch`
-/// doc comment for the *other*, already-merged half of this fix — a
-/// defensive wall-clock staleness backstop inside the pacing math itself,
-/// which only ever mitigates a burst after the fact; it cannot stop one from
-/// forming).
-///
-/// This task is the fix for the actual backlog: it calls `.recv().await` in
-/// a plain loop, which the tokio scheduler wakes the instant a new event is
-/// queued — not on any repaint-driven cadence — so a `MediaFrame` is fed to
-/// its decoder within a scheduler tick of arriving, whether the window is
-/// focused, unfocused, minimized, or the UI thread is busy laying out a
-/// frame. Nothing at this layer ever has 500ms (or even one repaint
-/// interval's worth) of frames to burst-deliver, so `PacingState` never sees
-/// the bursty-delivery signature that caused it to fast-forward.
-///
-/// # Design choice: intercept-and-forward, not a `net.rs`-side split
-///
-/// Two shapes were considered for *where* `MediaFrame` peels off from
-/// everything else `ClientEvent` carries (membership changes, stream
-/// announce/stop, subscriber counts — none of it latency-sensitive, all of
-/// it fine staying on `drain_events`'s throttled cadence):
-///
-/// 1. Split inside `net.rs` itself, before a `MediaFrame` ever reaches the
-///    UI-facing channel — e.g. datagram_reader_loop looks up a decoder
-///    registry directly and calls `feed()` inline, never constructing a
-///    `ClientEvent::MediaFrame` for it at all.
-/// 2. Keep `net.rs` and `ClientEvent` exactly as they are — one channel out
-///    of `ScreenshareClient::connect` — and put a dedicated always-on drain
-///    task between that channel and the UI, forwarding everything that isn't
-///    a `MediaFrame`.
-///
-/// This function is option 2. `net.rs` has no notion of a decoder registry
-/// today (by design — see its module docs' "Public API shape": it hands back
-/// a plain event channel and stays ignorant of what the caller does with
-/// `MediaFrame`s). Reaching into `net.rs` to add a `ui.rs`-specific registry
-/// would either leak `ui.rs` types into `net.rs` or force a generic registry
-/// trait for a single caller — real complexity for no behavioral difference, since
-/// `mpsc::UnboundedReceiver::recv().await` already wakes immediately on
-/// arrival with nothing throttling it between `net.rs` and here. Option 2
-/// gets the identical latency characteristics (nothing sits in a channel
-/// waiting on `App::update()`) with a change confined entirely to `ui.rs`.
-///
-/// # Why the registry is `Arc<Mutex<HashMap<...>>>`, not a channel back to the UI thread
-///
-/// Sending "please feed this decoder" messages back to the UI thread would
-/// just recreate the same kind of queue this fix removes, one level higher.
-/// The decoders themselves already tolerate being driven from any thread —
-/// `StreamDecoder::feed`/`AudioDecoder::feed` are non-blocking, cheap, and
-/// exist precisely so an arbitrary caller can hand off an access unit without
-/// synchronizing with whatever else that decoder is doing — so the simplest
-/// correct shape is to give this task direct read access to the same
-/// `watches`/`audio_watches` maps `RoomSession`'s own methods
-/// (`toggle_watch`, `toggle_listen`, ...) already mutate, behind the
-/// `std::sync::Mutex` those fields are now typed with. Lock hold times here
-/// are a single hash lookup plus (for video) cloning an `Arc` — the same
-/// order of magnitude as the UI thread's own per-repaint texture-upload pass
-/// over the same map, so contention between this task and `App::update()` is
-/// not a real concern.
-async fn spawn_media_ingestion_task(
-    mut raw_events: mpsc::UnboundedReceiver<ClientEvent>,
-    forward_tx: mpsc::UnboundedSender<ClientEvent>,
-    watches: Arc<Mutex<HashMap<(ConnId, StreamId), WatchEntry>>>,
-    audio_watches: Arc<Mutex<HashMap<(ConnId, StreamId), AudioWatch>>>,
-) {
-    loop {
-        // `Why` racing `raw_events.recv()` against `forward_tx.closed()`,
-        // rather than only detecting a dropped `RoomSession` via a failed
-        // `forward_tx.send()` below: this task now owns `raw_events` (see
-        // this function's doc comment), so — unlike before this fix, when
-        // `RoomSession` held that receiver directly — dropping the
-        // `RoomSession` (`disconnect_room`) no longer has any *direct*
-        // effect on this loop. Relying solely on a future failed
-        // `forward_tx.send()` to notice would leave this task (and every
-        // decoder/GStreamer pipeline it keeps feeding, and the
-        // `datagram_reader_loop`/etc. background tasks in `net.rs`, which
-        // only exit when *their* send into `raw_events` fails) running
-        // indefinitely after the user leaves a room, for as long as the
-        // remote side keeps sending `MediaFrame`s and nothing else — the
-        // common case for an active share — since every one of those frames
-        // is consumed here without ever reaching the `other` arm below.
-        // `forward_tx.closed()` resolves the instant `RoomSession::event_rx`
-        // (`forward_rx`) is dropped, independent of whether any event is in
-        // flight, so this task — and transitively, once `raw_events` itself
-        // drops with it, the `net.rs` background tasks — tears down
-        // immediately on disconnect, matching the old teardown promptness.
-        let event = tokio::select! {
-            event = raw_events.recv() => event,
-            _ = forward_tx.closed() => return,
-        };
-        let Some(event) = event else { return };
-        match event {
-            ClientEvent::MediaFrame(frame) => {
-                let key = (frame.conn_id, frame.stream_id);
-                // A given (conn_id, stream_id) only ever matches one of
-                // `watches` (video) or `audio_watches` (audio) — each owner
-                // allocates a distinct stream_id per share regardless of
-                // kind — so both are checked unconditionally rather than
-                // needing to know the frame's `StreamKind` up front. Mirrors
-                // the lookup `drain_events` used to do directly.
-                if let Some(entry) = watches.lock().unwrap().get(&key) {
-                    entry.decoder.lock().unwrap().feed(&frame);
-                }
-                if let Some(audio_watch) = audio_watches.lock().unwrap().get_mut(&key) {
-                    audio_watch.decoder.feed(&frame);
-                }
-            }
-            other => {
-                // Everything else is not latency-sensitive (membership
-                // changes, stream announce/stop, subscriber counts) and
-                // belongs on `drain_events`'s normal throttled cadence — see
-                // this function's doc comment. A send failure here means the
-                // room's `RoomSession` (and its `forward_rx`) has already
-                // been dropped (room left / app shutting down), so this task
-                // has nothing left to do. In practice the `forward_tx.closed()`
-                // branch above should always win that race first, but this
-                // stays as a belt-and-suspenders backstop.
-                if forward_tx.send(other).is_err() {
-                    return;
-                }
-            }
-        }
-    }
-}
-
-/// Capture-side operations: everything that owns or drives a local GStreamer
-/// pipeline. Deliberately on `App`, not on `RoomSession` — see the module
-/// docs' "Session data model".
 impl App {
-    fn alloc_capture_id(&mut self) -> CaptureSourceId {
-        let id = CaptureSourceId(self.next_capture_id);
-        self.next_capture_id = self.next_capture_id.wrapping_add(1);
-        id
-    }
-
-    fn alloc_destination_id(&mut self) -> DestinationId {
-        let id = DestinationId(self.next_destination_id);
-        self.next_destination_id = self.next_destination_id.wrapping_add(1);
-        id
-    }
-
-    /// "Start streaming" clicked: allocate a capture + its first destination
-    /// into `room_handle` (with a fresh `stream_id` drawn from *that room's*
-    /// counter) and spawn `capture::start_sharing` onto the ambient tokio
-    /// runtime. Can be called again while other captures (video or audio) are
-    /// already running — each call prompts the OS portal picker again, so a
-    /// second click lets the user pick a different monitor/window.
-    ///
-    /// To send the *same* capture into another room, use
-    /// `add_destination` instead — that's fan-out (one screen grab, a second
-    /// independently encoded and encrypted stream), not a second capture.
-    fn start_video_share(&mut self, room_handle: RoomHandle) {
-        let capture_id = self.alloc_capture_id();
-        let destination_id = self.alloc_destination_id();
-
-        let Some(room) = self.rooms.get_mut(&room_handle) else { return };
-        let stream_id = room.next_stream_id;
-        room.next_stream_id = room.next_stream_id.wrapping_add(1);
-        room.destinations.push(destination_id);
-        let client = room.client.clone();
-
-        let bitrate_kbps = self.bitrate_kbps;
-        let framerate = self.framerate;
-        let params = capture::destination::VideoParams {
-            // Width/height 0 = "whatever the source is": this destination
-            // doesn't downscale, and the source's real size isn't known until
-            // the pipeline has negotiated caps.
-            // `capture::destination::clamp_to_source` treats 0 as "no
-            // constraint" for exactly this case, and
-            // `capture::start_sharing` fills the real size in on the runtime
-            // once it knows it.
-            width: 0,
-            height: 0,
-            framerate,
-            bitrate_kbps,
-            backend: capture::EncoderBackend::default(),
-        };
-        let (tx, rx) = oneshot::channel();
-        self.captures.insert(
-            capture_id,
-            LocalCapture {
-                kind: StreamKind::Video,
-                label: t!("share.video_label").to_string(),
-                status: ShareStatus::Starting(rx),
-                destinations: IndexMap::from([(
-                    destination_id,
-                    Destination {
-                        room: room_handle,
-                        stream_id,
-                        params,
-                        runtime: None,
-                        pending: None,
-                        edit: Destination::edit_from(params),
-                        apply_rx: None,
-                    },
-                )]),
-                self_preview_texture: None,
-            },
-        );
-        self.share_error = None;
-
-        tokio::spawn(async move {
-            let result = capture::start_sharing(&client, stream_id, DestKey(destination_id.0), bitrate_kbps, framerate)
-                .await
-                .map(ShareHandle::Video)
-                .map_err(|e| format!("{e:#}"));
-            let _ = tx.send(result);
-        });
-    }
-
-    /// **Fan-out**: send an already-running capture into one more room, as a
-    /// second fully independent encoded+encrypted stream off the same screen
-    /// grab. `role` distinguishes plain fan-out from the make-before-break
-    /// half of a transfer (see `transfer_destination`).
-    ///
-    /// `Why this is not "free replication":` the raw frames are shared (one
-    /// capture, one `tee`), but everything downstream of that tee is not —
-    /// each destination gets its own encoder, its own bitrate, and its own
-    /// AEAD keys/nonce space, because a room key can never be reused across
-    /// rooms. Two rooms therefore cost roughly two streams' bandwidth, which
-    /// the Stream Control tab states outright rather than leaving the user to
-    /// discover on their uplink.
-    fn add_destination(&mut self, capture_id: CaptureSourceId, room_handle: RoomHandle, role: PendingRole) {
-        let destination_id = self.alloc_destination_id();
-
-        let Some(capture) = self.captures.get(&capture_id) else { return };
-        if capture.kind != StreamKind::Video {
-            return;
-        }
-        // Params for the new destination: copy whichever destination this
-        // capture already has (its resolution/framerate are already valid for
-        // this source), so fanning out doesn't silently reconfigure anything.
-        let params = capture
-            .destinations
-            .values()
-            .next()
-            .map(|d| d.live_params())
-            .unwrap_or(capture::destination::VideoParams {
-                width: 0,
-                height: 0,
-                framerate: self.framerate,
-                bitrate_kbps: self.bitrate_kbps,
-                backend: capture::EncoderBackend::default(),
-            });
-
-        let Some(room) = self.rooms.get_mut(&room_handle) else { return };
-        let stream_id = room.next_stream_id;
-        room.next_stream_id = room.next_stream_id.wrapping_add(1);
-        room.destinations.push(destination_id);
-        let client = room.client.clone();
-
-        // From here on, bail out through `abandon` rather than a bare
-        // `return`: the room already holds a `destinations` back-reference to
-        // an id that would otherwise never get a `Destination` — a dangling
-        // entry that makes the room look like it is streaming something it
-        // isn't (and blocks a silent leave, since `leave_needs_confirm` counts
-        // exactly that list).
-        let abandon = |app: &mut Self, error: Option<String>| {
-            if let Some(room) = app.rooms.get_mut(&room_handle) {
-                room.destinations.retain(|d| *d != destination_id);
-            }
-            app.share_error = error;
-        };
-
-        let running = self
-            .captures
-            .get(&capture_id)
-            .is_some_and(|c| matches!(c.status, ShareStatus::Active(ShareHandle::Video(_))));
-        if !running {
-            // Only a running capture has a tee to hang another branch off.
-            abandon(self, Some(t!("stream_control.capture_not_running").to_string()));
-            return;
-        }
-
-        let Some(capture) = self.captures.get_mut(&capture_id) else {
-            abandon(self, Some(t!("stream_control.capture_not_running").to_string()));
-            return;
-        };
-        let ShareStatus::Active(ShareHandle::Video(handle)) = &capture.status else {
-            unreachable!("just checked the capture is an active video capture");
-        };
-        let rx = handle.spawn_add_destination(&client, stream_id, DestKey(destination_id.0), params);
-
-        capture.destinations.insert(
-            destination_id,
-            Destination {
-                room: room_handle,
-                stream_id,
-                params,
-                runtime: None,
-                pending: Some(role),
-                edit: Destination::edit_from(params),
-                apply_rx: None,
-            },
-        );
-        self.pending_destinations.push(PendingDestination {
-            capture_id,
-            destination_id,
-            room: room_handle,
-            role,
-            rx,
-        });
-        self.share_error = None;
-    }
-
-    /// **Transfer**: move one outgoing stream to a different room,
-    /// make-before-break — add a destination in the target room off the *same*
-    /// capture, wait for it to actually go live, and only then stop the old
-    /// one.
-    ///
-    /// `Why make-before-break rather than re-pointing the existing stream:` a
-    /// destination's encryption keys and nonce space are room-bound (see
-    /// `net.rs`), so "the same stream, now in another room" is not
-    /// expressible — the bytes have to be re-encrypted under the target
-    /// room's key on a stream announced in that room. Building the new
-    /// destination first means the user's audience in the *old* room keeps
-    /// seeing frames until the new room is genuinely ready, and a failure
-    /// leaves them exactly where they were rather than off the air.
-    ///
-    /// `Why this reuses the branch add/remove primitives and never touches
-    /// the capture source:` nothing about the screen grab changes — the same
-    /// `tee` feeds both destinations during the overlap. Routing a transfer
-    /// through the source-restart path would stall *every* destination of
-    /// that capture (plan doc's tier 3) to accomplish something that costs
-    /// one extra branch for a second.
-    fn transfer_destination(&mut self, destination_id: DestinationId, target_room: RoomHandle) {
-        let Some((capture_id, _, dest)) = find_destination(&self.captures, destination_id) else { return };
-        if dest.room == target_room || dest.pending.is_some() {
-            return;
-        }
-        let source_room = dest.room;
-        // Mark the old destination first: from here until the new one
-        // confirms, the UI shows both rows as a transfer in flight rather
-        // than as two unrelated streams.
-        if let Some(capture) = self.captures.get_mut(&capture_id)
-            && let Some(dest) = capture.destinations.get_mut(&destination_id)
-        {
-            dest.pending = Some(PendingRole::TransferSource(target_room));
-        }
-        self.add_destination(capture_id, target_room, PendingRole::TransferTarget(source_room));
-
-        // If the add never even got started (no live capture, unknown room),
-        // don't leave the old destination stuck looking like it's mid-transfer.
-        if !self.pending_destinations.iter().any(|p| p.capture_id == capture_id && p.room == target_room)
-            && let Some(capture) = self.captures.get_mut(&capture_id)
-            && let Some(dest) = capture.destinations.get_mut(&destination_id)
-        {
-            dest.pending = None;
-        }
-    }
-
-    /// Poll every in-flight fan-out/transfer destination. Call once per frame.
-    fn poll_pending_destinations(&mut self) {
-        let mut still_pending = Vec::new();
-        for mut pending in std::mem::take(&mut self.pending_destinations) {
-            match pending.rx.try_recv() {
-                Ok(Ok(handle)) => {
-                    let runtime = handle.runtime();
-                    if let Some(capture) = self.captures.get_mut(&pending.capture_id) {
-                        if let ShareStatus::Active(ShareHandle::Video(capture_handle)) = &mut capture.status {
-                            capture_handle.register_destination(handle);
-                        }
-                        if let Some(dest) = capture.destinations.get_mut(&pending.destination_id) {
-                            dest.runtime = Some(runtime);
-                            dest.pending = None;
-                        }
-                    }
-                    // The new destination is live: this is the "break" half of
-                    // make-before-break, and the only place the old
-                    // destination is ever torn down.
-                    if let PendingRole::TransferTarget(source_room) = pending.role {
-                        let old = self
-                            .captures
-                            .get(&pending.capture_id)
-                            .and_then(|capture| {
-                                capture
-                                    .destinations
-                                    .iter()
-                                    .find(|(id, d)| {
-                                        d.room == source_room
-                                            && **id != pending.destination_id
-                                            && matches!(d.pending, Some(PendingRole::TransferSource(_)))
-                                    })
-                                    .map(|(id, _)| *id)
-                            });
-                        if let Some(old) = old {
-                            self.stop_destination(old);
-                        }
-                    }
-                }
-                Ok(Err(e)) => {
-                    self.share_error = Some(e);
-                    self.forget_destination(pending.capture_id, pending.destination_id);
-                    self.clear_transfer_marker(pending.capture_id, pending.role);
-                }
-                Err(oneshot::error::TryRecvError::Empty) => {
-                    still_pending.push(pending);
-                }
-                Err(oneshot::error::TryRecvError::Closed) => {
-                    self.share_error = Some(t!("errors.share_start_task_ended").to_string());
-                    self.forget_destination(pending.capture_id, pending.destination_id);
-                    self.clear_transfer_marker(pending.capture_id, pending.role);
-                }
-            }
-        }
-        self.pending_destinations = still_pending;
-    }
-
-    /// A transfer's target failed to come up: un-mark the source destination,
-    /// which is still live and still authoritative, so it stops claiming to be
-    /// mid-transfer.
-    fn clear_transfer_marker(&mut self, capture_id: CaptureSourceId, role: PendingRole) {
-        let PendingRole::TransferTarget(source_room) = role else { return };
-        let Some(capture) = self.captures.get_mut(&capture_id) else { return };
-        for dest in capture.destinations.values_mut() {
-            if dest.room == source_room && matches!(dest.pending, Some(PendingRole::TransferSource(_))) {
-                dest.pending = None;
-            }
-        }
-    }
-
-    /// Drop one destination from the local model (no pipeline work): used when
-    /// bringing it up failed, so there is nothing to tear down.
-    fn forget_destination(&mut self, capture_id: CaptureSourceId, destination_id: DestinationId) {
-        if let Some(capture) = self.captures.get_mut(&capture_id) {
-            capture.destinations.shift_remove(&destination_id);
-        }
-        for room in self.rooms.values_mut() {
-            room.destinations.retain(|d| *d != destination_id);
-        }
-        self.bandwidth.forget(destination_id);
-    }
-
-    /// Stop sending into *one* room, leaving the capture (and every other room
-    /// it feeds) running. If it was the capture's last destination, the whole
-    /// capture is stopped instead — a capture with nowhere to send is just a
-    /// screen grab burning CPU.
-    fn stop_destination(&mut self, destination_id: DestinationId) {
-        let Some((capture_id, capture, _)) = find_destination(&self.captures, destination_id) else { return };
-        if capture.destinations.len() <= 1 {
-            self.stop_share(capture_id);
-            return;
-        }
-        if let Some(capture) = self.captures.get_mut(&capture_id)
-            && let ShareStatus::Active(ShareHandle::Video(handle)) = &mut capture.status
-        {
-            // Fire-and-forget: the destination is already gone from the
-            // handle's registry, and the teardown (branch drain + `StopStream`)
-            // has no result the UI can act on beyond a log line.
-            let rx = handle.spawn_remove_destination(DestKey(destination_id.0));
-            tokio::spawn(async move {
-                if let Ok(Err(e)) = rx.await {
-                    tracing::warn!("removing a destination did not finish cleanly: {e}");
-                }
-            });
-        }
-        self.forget_destination(capture_id, destination_id);
-    }
-
-    /// "Apply" clicked on a destination row: hand the edited settings to
-    /// `capture::CaptureHandle::change_destination`, which classifies them
-    /// (`capture::destination::classify_change`) into a live bitrate write, a
-    /// branch swap, or a shared-source restart plus swap — this side never
-    /// decides which.
-    fn apply_destination_edit(&mut self, destination_id: DestinationId) {
-        let Some((capture_id, _, _)) = find_destination(&self.captures, destination_id) else { return };
-        let Some(capture) = self.captures.get_mut(&capture_id) else { return };
-        let ShareStatus::Active(ShareHandle::Video(handle)) = &capture.status else { return };
-        let source = handle.source_caps();
-        let Some(dest) = capture.destinations.get(&destination_id) else { return };
-        let requested = dest.edited_params(source);
-
-        match handle.change_destination(DestKey(destination_id.0), requested) {
-            Ok(change) => {
-                let applied = change.applied;
-                if let Some(dest) = capture.destinations.get_mut(&destination_id) {
-                    dest.params = applied;
-                    dest.apply_rx = change.done;
-                }
-                // A source restart changes what *every* destination of this
-                // capture is fed from, so the capture's own framerate notion
-                // moves with it.
-                if change.tier == capture::destination::ChangeTier::SourceRestart {
-                    self.framerate = applied.framerate;
-                }
-            }
-            Err(e) => self.share_error = Some(format!("{e:#}")),
-        }
-    }
-
-    /// Poll every in-flight "Apply" (branch swap). Call once per frame.
-    fn poll_destination_edits(&mut self) {
-        let mut error = None;
-        let mut settled: Vec<CaptureSourceId> = Vec::new();
-        for (capture_id, capture) in self.captures.iter_mut() {
-            for dest in capture.destinations.values_mut() {
-                let Some(rx) = &mut dest.apply_rx else { continue };
-                match rx.try_recv() {
-                    Ok(Ok(())) => {
-                        dest.apply_rx = None;
-                        settled.push(*capture_id);
-                    }
-                    Ok(Err(e)) => {
-                        error = Some(e);
-                        dest.apply_rx = None;
-                        settled.push(*capture_id);
-                    }
-                    Err(oneshot::error::TryRecvError::Empty) => {}
-                    Err(oneshot::error::TryRecvError::Closed) => {
-                        dest.apply_rx = None;
-                        settled.push(*capture_id);
-                    }
-                }
-            }
-        }
-        for capture_id in settled {
-            self.retune_source_framerate(capture_id);
-        }
-        if let Some(e) = error {
-            self.share_error = Some(e);
-        }
-    }
-
-    /// Bring a capture's shared source rate back in line with what its
-    /// destinations actually need: `max(fps)` across them
-    /// (`capture::destination::required_source_framerate`).
-    ///
-    /// `Why` this runs *after* a change settles rather than as part of it:
-    /// raising the source is a precondition for a branch that wants a higher
-    /// rate, so `change_destination` does that itself before swapping;
-    /// *lowering* it is only safe once every branch has actually been re-capped
-    /// below the new rate, or the still-old branch would briefly be asking for
-    /// frames the source no longer produces. Running it here also means a
-    /// destination being removed (fan-out shrinking, a transfer completing)
-    /// naturally lets the capture drop back down instead of running hot at a
-    /// rate nothing needs any more.
-    fn retune_source_framerate(&mut self, capture_id: CaptureSourceId) {
-        let Some(capture) = self.captures.get(&capture_id) else { return };
-        let ShareStatus::Active(ShareHandle::Video(handle)) = &capture.status else { return };
-        let required = capture::destination::required_source_framerate(
-            capture.destinations.values().filter(|d| d.runtime.is_some()).map(|d| d.live_params().framerate),
-        );
-        handle.set_source_framerate(required);
-    }
-
-    // -----------------------------------------------------------------
-    // Bandwidth
-    // -----------------------------------------------------------------
-
-    /// Every video destination that is currently live enough to be worth
-    /// budgeting for, as `bandwidth::DestSpec`s — **across every room and
-    /// every capture**, which is what makes Absolute-Maximum mode a per-client
-    /// aggregate rather than a per-room one (plan doc, round-2 Q6).
-    ///
-    /// Destinations whose branch doesn't exist yet (still starting, or a
-    /// fan-out/transfer target still proving itself) are left out: they have
-    /// no encoder to write to, and including them would shrink everyone else's
-    /// share for a stream that may never come up.
-    fn allocation_input(&self) -> AllocInput {
-        let mut destinations = Vec::new();
-        for capture in self.captures.values() {
-            if capture.kind != StreamKind::Video || !matches!(capture.status, ShareStatus::Active(_)) {
-                continue;
-            }
-            for (destination_id, dest) in &capture.destinations {
-                if dest.runtime.is_none() {
-                    continue;
-                }
-                let params = dest.live_params();
-                destinations.push(DestSpec {
-                    id: DestId(destination_id.0),
-                    // A destination that hasn't negotiated a size yet would
-                    // weigh 0 and get nothing but its floor; fall back to the
-                    // capture's source size so its weight is still
-                    // proportionate to what it will encode.
-                    width: params.width.max(1),
-                    height: params.height.max(1),
-                    fps: params.framerate.max(1),
-                    floor_kbps: self.destination_floor_kbps,
-                    // The project's own per-stream ceiling: no single
-                    // destination is ever worth more than the 40 Mbit/s
-                    // maximum the per-stream slider tops out at, no matter how
-                    // much total budget is free.
-                    ceiling_kbps: Some(MAX_BITRATE_KBPS),
-                });
-            }
-        }
-        AllocInput {
-            total_kbps: self.absolute_total_kbps,
-            // Audio is still its own capture with its own (Opus, constant,
-            // small) rate rather than an attachment on a video destination —
-            // the always-on-mixer rework is a later stage — so there is no
-            // idle-audio baseline to reserve off the top yet. Left explicit at
-            // 0 rather than omitted so the day that lands has an obvious
-            // place to go.
-            audio_reserved_kbps: 0,
-            destinations,
-        }
-    }
-
-    /// Absolute-Maximum mode's live wiring: recompute the allocation (at most
-    /// once per `ALLOC_RECOMPUTE_INTERVAL`) and write each destination's new
-    /// share into its encoder, skipping anything that doesn't clear the
-    /// hysteresis threshold. Call once per frame; a cheap no-op in Per-Stream
-    /// mode.
-    fn apply_bandwidth_allocation(&mut self) {
-        if self.bandwidth_mode != BandwidthMode::Absolute {
-            return;
-        }
-        let input = self.allocation_input();
-        if input.destinations.is_empty() {
-            return;
-        }
-        let Some(tick) = self.bandwidth.tick(Instant::now(), &input) else { return };
-        for (destination_id, kbps) in tick.writes {
-            let Some((capture_id, _, _)) = find_destination(&self.captures, destination_id) else { continue };
-            let Some(capture) = self.captures.get(&capture_id) else { continue };
-            let ShareStatus::Active(ShareHandle::Video(handle)) = &capture.status else { continue };
-            handle.set_destination_bitrate(DestKey(destination_id.0), kbps);
-            self.bandwidth.note_applied(destination_id, kbps);
-        }
-    }
-
-    /// Switch bandwidth mode, persisting the choice.
-    ///
-    /// Leaving Absolute mode re-applies every destination's own manual
-    /// (Per-Stream) rate, which the allocator never touched — see
-    /// `DestEdit::bitrate_kbps`'s `Why:` note. Neither mode's stored numbers
-    /// are modified by the switch itself.
-    fn set_bandwidth_mode(&mut self, mode: BandwidthMode) {
-        if self.bandwidth_mode == mode {
-            return;
-        }
-        self.bandwidth_mode = mode;
-        save_bandwidth_settings(mode, self.absolute_total_kbps, self.destination_floor_kbps);
-        if mode == BandwidthMode::PerStream {
-            self.bandwidth.reset();
-            self.reapply_manual_bitrates();
-        }
-    }
-
-    /// Push every destination's manual Per-Stream rate back into its live
-    /// encoder — what "Per-Stream Maximum is in charge again" means in
-    /// practice.
-    fn reapply_manual_bitrates(&mut self) {
-        for capture in self.captures.values() {
-            let ShareStatus::Active(ShareHandle::Video(handle)) = &capture.status else { continue };
-            for (destination_id, dest) in &capture.destinations {
-                if dest.runtime.is_none() {
-                    continue;
-                }
-                handle.set_destination_bitrate(DestKey(destination_id.0), dest.edit.bitrate_kbps);
-            }
-        }
-    }
-
-    /// "Share Audio" clicked: same shape as `start_video_share`, for the
-    /// currently selected source. No-op if no source is selected (the button
-    /// is disabled in that case).
-    fn start_audio_share(&mut self, room_handle: RoomHandle) {
-        let Some(source) = self.selected_audio_source.clone() else {
-            return;
-        };
-        let capture_id = self.alloc_capture_id();
-        let destination_id = self.alloc_destination_id();
-
-        let Some(room) = self.rooms.get_mut(&room_handle) else { return };
-        let stream_id = room.next_stream_id;
-        room.next_stream_id = room.next_stream_id.wrapping_add(1);
-        room.destinations.push(destination_id);
-        let client = room.client.clone();
-
-        let (tx, rx) = oneshot::channel();
-        self.captures.insert(
-            capture_id,
-            LocalCapture {
-                kind: StreamKind::Audio,
-                label: source.name.clone(),
-                status: ShareStatus::Starting(rx),
-                destinations: IndexMap::from([(
-                    destination_id,
-                    Destination {
-                        room: room_handle,
-                        stream_id,
-                        // Audio destinations carry the video params struct
-                        // inertly — there is no per-destination audio geometry
-                        // to describe, and `runtime` stays `None` because the
-                        // video `DestinationState`/stall machinery has no audio
-                        // counterpart (audio's own always-on-mixer design makes
-                        // toggling invisible by construction; see the plan doc).
-                        params: AUDIO_DESTINATION_PARAMS,
-                        runtime: None,
-                        pending: None,
-                        edit: Destination::edit_from(AUDIO_DESTINATION_PARAMS),
-                        apply_rx: None,
-                    },
-                )]),
-                self_preview_texture: None,
-            },
-        );
-        self.share_error = None;
-
-        tokio::spawn(async move {
-            let result = audio::start_audio_sharing(&client, stream_id, &source)
-                .await
-                .map(ShareHandle::Audio)
-                .map_err(|e| format!("{e:#}"));
-            let _ = tx.send(result);
-        });
-    }
-
-    /// "Stop"/"Stop Sharing Audio" clicked for `capture_id`: hand the
-    /// underlying handle off to a spawned task that tears it down
-    /// (`.stop()` is async on both `CaptureHandle` and `AudioCaptureHandle`).
-    /// The `LocalCapture` stays in the map, in `Stopping`, so the UI can show
-    /// that state; `poll_capture_states` reaps it once the stop lands.
-    fn stop_share(&mut self, capture_id: CaptureSourceId) {
-        let Some(capture) = self.captures.get_mut(&capture_id) else {
-            return;
-        };
-        if !matches!(capture.status, ShareStatus::Active(_)) {
-            return;
-        }
-        let (tx, rx) = oneshot::channel();
-        let ShareStatus::Active(handle) = std::mem::replace(&mut capture.status, ShareStatus::Stopping(rx)) else {
-            unreachable!("just matched Active above");
-        };
-
-        tokio::spawn(async move {
-            let result = match handle {
-                ShareHandle::Video(h) => h.stop().await,
-                ShareHandle::Audio(h) => h.stop().await,
-            }
-            .map_err(|e| format!("{e:#}"));
-            let _ = tx.send(result);
-        });
-    }
-
-    /// Abrupt teardown (relay/control connection lost, or the app quitting
-    /// while sharing): drop `capture_id` and fire off `.stop()` for it if it
-    /// was running, so the portal session gets closed and the relay gets a
-    /// stop-stream notification, instead of just letting the handle drop
-    /// synchronously when `App` goes away right after this call.
-    ///
-    /// Mirrors `stop_share`'s spawn pattern, but without waiting to see the
-    /// result — the caller is discarding this capture (or the whole app is
-    /// exiting) regardless of whether the stop finishes, so there is nothing
-    /// meaningful left to poll it into. `Starting`/`Stopping` captures are
-    /// left to their in-flight task: a `Starting` one has no handle yet to
-    /// stop, and a `Stopping` one is already being torn down.
-    fn drop_capture_fire_and_forget(&mut self, capture_id: CaptureSourceId) {
-        let Some(capture) = self.captures.shift_remove(&capture_id) else { return };
-        self.forget_destinations_of(&capture);
-        let ShareStatus::Active(handle) = capture.status else { return };
-        tokio::spawn(async move {
-            if let Err(e) = match handle {
-                ShareHandle::Video(h) => h.stop().await,
-                ShareHandle::Audio(h) => h.stop().await,
-            } {
-                tracing::warn!("stopping a capture during teardown failed: {e:#}");
-            }
-        });
-    }
-
-    /// Same, for every running capture at once (app exit).
-    fn stop_all_captures_fire_and_forget(&mut self) {
-        for capture_id in self.captures.keys().copied().collect::<Vec<_>>() {
-            self.drop_capture_fire_and_forget(capture_id);
-        }
-    }
-
-    /// Drop `capture`'s destinations out of the back-reference lists of every
-    /// room they pointed into. Call whenever a `LocalCapture` leaves
-    /// `self.captures`, so no room is left advertising an outgoing stream
-    /// that no longer exists.
-    fn forget_destinations_of(&mut self, capture: &LocalCapture) {
-        for (destination_id, dest) in capture.destinations.iter() {
-            if let Some(room) = self.rooms.get_mut(&dest.room) {
-                room.destinations.retain(|d| d != destination_id);
-            }
-            // Drop the allocator's memory of what this destination's encoder
-            // was last set to, so a stopped stream stops counting as
-            // "already at the right bitrate". Ids never rewind, so a stale
-            // entry could never alias a *new* destination — this is
-            // housekeeping, not a correctness fix.
-            self.bandwidth.forget(*destination_id);
-        }
-    }
-
-    /// Poll every in-flight capture start/stop, if any. Call once per frame.
-    fn poll_capture_states(&mut self) {
-        let mut to_remove = Vec::new();
-        for (capture_id, capture) in self.captures.iter_mut() {
-            match &mut capture.status {
-                ShareStatus::Starting(rx) => match rx.try_recv() {
-                    Ok(Ok(handle)) => {
-                        // Attach each destination's own lifecycle runtime, so
-                        // `Destination::state` starts reporting the real state
-                        // machine (`Starting` until its branch's first IDR,
-                        // then `Live`) instead of its not-yet-started
-                        // placeholder. Per destination, not one shared runtime:
-                        // each has its own encode branch and therefore its own
-                        // state, PTS clock and cached IDR.
-                        if let ShareHandle::Video(video) = &handle {
-                            for (destination_id, dest) in capture.destinations.iter_mut() {
-                                dest.runtime = video.destination_runtime(DestKey(destination_id.0));
-                                if let Some(runtime) = &dest.runtime {
-                                    // The capture filled in the size it really
-                                    // negotiated; adopt it so the row's edit
-                                    // buffer and geometry aren't stuck on the
-                                    // "0 = whatever the source is" placeholder.
-                                    dest.params = runtime.lock().unwrap().params();
-                                }
-                            }
-                        }
-                        capture.status = ShareStatus::Active(handle);
-                    }
-                    Ok(Err(e)) => {
-                        self.share_error = Some(e);
-                        to_remove.push(*capture_id);
-                    }
-                    Err(oneshot::error::TryRecvError::Empty) => {}
-                    Err(oneshot::error::TryRecvError::Closed) => {
-                        self.share_error = Some(t!("errors.share_start_task_ended").to_string());
-                        to_remove.push(*capture_id);
-                    }
-                },
-                ShareStatus::Stopping(rx) => match rx.try_recv() {
-                    Ok(Ok(())) => to_remove.push(*capture_id),
-                    Ok(Err(e)) => {
-                        self.share_error = Some(e);
-                        to_remove.push(*capture_id);
-                    }
-                    Err(oneshot::error::TryRecvError::Empty) => {}
-                    Err(oneshot::error::TryRecvError::Closed) => {
-                        self.share_error = Some(t!("errors.share_stop_task_ended").to_string());
-                        to_remove.push(*capture_id);
-                    }
-                },
-                ShareStatus::Active(_) => {}
-            }
-        }
-        for capture_id in to_remove {
-            if let Some(capture) = self.captures.shift_remove(&capture_id) {
-                self.forget_destinations_of(&capture);
-            }
-        }
-    }
-
     /// Upload any freshly captured self-preview frames (see
     /// `capture::CaptureHandle::self_preview_frame` and
     /// `superdoc/features/self-preview.md`) to each running video capture's
     /// own texture. Call once per repaint alongside
     /// `RoomSession::update_watch_textures`; cheap no-op when nothing new has
     /// arrived.
+    ///
+    /// Stays here rather than on `AppState` even though it only touches
+    /// `self.state.captures`: it needs `egui::Context` to create/update
+    /// textures, and `session.rs`'s business-logic methods deliberately don't
+    /// grow new egui dependencies — see that module's docs.
     ///
     /// Unlike `update_watch_textures`, this doesn't need to drive the repaint
     /// cadence itself: the self-preview branch is capped to a fixed, modest
@@ -1913,7 +266,7 @@ impl App {
     /// No map cleanup pass any more: the texture lives on the `LocalCapture`,
     /// so it dies exactly when the capture does.
     fn update_self_preview_textures(&mut self, ctx: &egui::Context) {
-        for (capture_id, capture) in self.captures.iter_mut() {
+        for (capture_id, capture) in self.state.captures.iter_mut() {
             let ShareStatus::Active(ShareHandle::Video(handle)) = &capture.status else {
                 continue;
             };
@@ -1929,189 +282,15 @@ impl App {
             }
         }
     }
-
-    /// Kick off (or re-kick-off) an `audio::list_audio_sources()` call on
-    /// the ambient tokio runtime. That function shells out to `pw-dump`
-    /// synchronously, so it's run via `spawn_blocking` rather than directly
-    /// in the async task, matching the non-blocking intent of the rest of
-    /// this module's spawn pattern.
-    fn refresh_audio_sources(&mut self) {
-        let (tx, rx) = oneshot::channel();
-        self.audio_sources_rx = Some(rx);
-        self.audio_sources_error = None;
-
-        tokio::spawn(async move {
-            let result = match tokio::task::spawn_blocking(audio::list_audio_sources).await {
-                Ok(Ok(sources)) => Ok(sources),
-                Ok(Err(e)) => Err(format!("{e:#}")),
-                Err(e) => Err(format!("audio source listing task panicked: {e}")),
-            };
-            let _ = tx.send(result);
-        });
-    }
-
-    /// Poll the in-flight `list_audio_sources()` call, if any. Call once per
-    /// frame.
-    fn poll_audio_sources(&mut self) {
-        let Some(rx) = &mut self.audio_sources_rx else { return };
-        match rx.try_recv() {
-            Ok(Ok(sources)) => {
-                self.audio_sources = sources;
-                self.audio_sources_rx = None;
-            }
-            Ok(Err(e)) => {
-                self.audio_sources_error = Some(e);
-                self.audio_sources_rx = None;
-            }
-            Err(oneshot::error::TryRecvError::Empty) => {}
-            Err(oneshot::error::TryRecvError::Closed) => {
-                self.audio_sources_error = Some(t!("errors.audio_sources_task_ended").to_string());
-                self.audio_sources_rx = None;
-            }
-        }
-    }
 }
 
-/// Room-scoped operations: presence, watching, and the room's own view state.
-/// Everything in here was already correctly room-scoped as `Connected`; the
-/// only change is that there can now be several of them.
+/// Room-scoped *rendering* operations. The room-scoped business logic
+/// (`toggle_watch`, `toggle_listen`, `start_audio_watch`,
+/// `teardown_audio_watch`, `sibling_audio_stream`, `owner_has_video`) lives in
+/// `session.rs`'s `impl RoomSession` block — this is a second, egui-dependent
+/// `impl RoomSession` block for the parts that genuinely need
+/// `egui::Context`/textures/viewports.
 impl RoomSession {
-    /// The `stream_id` of `owner`'s currently-announced audio stream, if
-    /// any — used by `toggle_watch` to auto-subscribe audio alongside video
-    /// from the same sender. `announced-streams` state (`self.streams`) is
-    /// exactly the `StreamInfo`/`ANNOUNCE_STREAM` state described in this
-    /// task's instructions, already tracked here from
-    /// `PresenceSnapshot`/`PresenceDelta`.
-    fn sibling_audio_stream(&self, owner: ConnId) -> Option<StreamId> {
-        self.streams.iter().find(|s| s.owner == owner && s.kind == StreamKind::Audio).map(|s| s.stream_id)
-    }
-
-    /// Whether `owner` currently has an announced video stream — used to
-    /// decide whether an audio stream gets its own "Listen" row in the
-    /// Streams list (only audio-only senders do; a sender with video has
-    /// their audio auto-subscribed via `toggle_watch` instead).
-    fn owner_has_video(&self, owner: ConnId) -> bool {
-        self.streams.iter().any(|s| s.owner == owner && s.kind == StreamKind::Video)
-    }
-
-    /// Start decoding/playing `(owner, stream_id)`'s audio if not already
-    /// doing so, and subscribe to it. Shared by `toggle_watch`'s
-    /// auto-subscribe-audio-alongside-video path and `toggle_listen`'s
-    /// standalone audio-only path — both just need "make sure this audio
-    /// stream is playing", so a click on "Listen" for a stream already
-    /// auto-subscribed via its video watch (or vice versa) is a safe no-op
-    /// rather than a second decoder.
-    fn start_audio_watch(&mut self, owner: ConnId, stream_id: StreamId) {
-        let key = (owner, stream_id);
-        if self.audio_watches.lock().unwrap().contains_key(&key) {
-            return;
-        }
-        match AudioDecoder::new(stream_id) {
-            Ok(decoder) => {
-                self.audio_watches.lock().unwrap().insert(key, AudioWatch { decoder, volume_percent: 100 });
-                self.watch_error = None;
-
-                let client = self.client.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = client.subscribe(owner, stream_id).await {
-                        tracing::warn!("subscribe (audio) ({owner:016x}, {stream_id}) failed: {e:#}");
-                    }
-                });
-            }
-            Err(e) => {
-                self.watch_error = Some(format!("{e:#}"));
-            }
-        }
-    }
-
-    /// Tear down `(owner, stream_id)`'s audio watch, if one is active, and
-    /// unsubscribe. Dropping the removed `AudioWatch` drops its
-    /// `AudioDecoder`, which synchronously shuts down its pipeline thread
-    /// (see `AudioDecoder`'s `Drop` impl).
-    fn teardown_audio_watch(&mut self, owner: ConnId, stream_id: StreamId) {
-        if self.audio_watches.lock().unwrap().remove(&(owner, stream_id)).is_some() {
-            let client = self.client.clone();
-            tokio::spawn(async move {
-                if let Err(e) = client.unsubscribe(owner, stream_id).await {
-                    tracing::warn!("unsubscribe (audio) ({owner:016x}, {stream_id}) failed: {e:#}");
-                }
-            });
-        }
-    }
-
-    /// "Watch"/"Stop Watching" clicked for `(owner, stream_id)`. Subscribing
-    /// and unsubscribing are async (control-plane round trip) so they're
-    /// fired onto the runtime and not awaited here; the decoder itself is
-    /// created/dropped synchronously since that's cheap (spawns/joins a
-    /// local decode thread, no network wait).
-    ///
-    /// If `owner` also has an active audio stream, it's auto-subscribed and
-    /// played alongside the video (see `start_audio_watch`) — matching the
-    /// natural expectation that "watching someone's screen" includes
-    /// hearing their audio, without a separate manual step — and torn down
-    /// together with the video watch when watching stops.
-    fn toggle_watch(&mut self, owner: ConnId, stream_id: StreamId) {
-        let key = (owner, stream_id);
-        let removed = self.watches.lock().unwrap().remove(&key);
-        if let Some(entry) = removed {
-            if self.selected_watch == Some(key) {
-                self.selected_watch = self.watches.lock().unwrap().keys().next().copied();
-            }
-            let client = self.client.clone();
-            tokio::spawn(async move {
-                if let Err(e) = client.unsubscribe(owner, stream_id).await {
-                    tracing::warn!("unsubscribe({owner:016x}, {stream_id}) failed: {e:#}");
-                }
-            });
-            if let Some(audio_stream_id) = entry.audio_stream_id {
-                self.teardown_audio_watch(owner, audio_stream_id);
-            }
-        } else {
-            match StreamDecoder::new(stream_id) {
-                Ok(decoder) => {
-                    let audio_stream_id = self.sibling_audio_stream(owner);
-                    self.watches.lock().unwrap().insert(
-                        key,
-                        WatchEntry {
-                            decoder: Arc::new(Mutex::new(decoder)),
-                            texture: None,
-                            popout: None,
-                            audio_stream_id,
-                        },
-                    );
-                    self.selected_watch = Some(key);
-                    self.watch_error = None;
-
-                    let client = self.client.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = client.subscribe(owner, stream_id).await {
-                            tracing::warn!("subscribe({owner:016x}, {stream_id}) failed: {e:#}");
-                        }
-                    });
-
-                    if let Some(audio_stream_id) = audio_stream_id {
-                        self.start_audio_watch(owner, audio_stream_id);
-                    }
-                }
-                Err(e) => {
-                    self.watch_error = Some(format!("{e:#}"));
-                }
-            }
-        }
-    }
-
-    /// "Listen"/"Stop Listening" clicked for an audio-only stream (a sender
-    /// with no video announced — see `owner_has_video`). Just toggles that
-    /// stream's `AudioWatch` via the same start/teardown helpers
-    /// `toggle_watch` uses for its auto-subscribed audio.
-    fn toggle_listen(&mut self, owner: ConnId, stream_id: StreamId) {
-        if self.audio_watches.lock().unwrap().contains_key(&(owner, stream_id)) {
-            self.teardown_audio_watch(owner, stream_id);
-        } else {
-            self.start_audio_watch(owner, stream_id);
-        }
-    }
-
     /// Upload any freshly decoded frames to their stream's texture. Call
     /// once per repaint; cheap no-op when nothing new has decoded.
     ///
@@ -2297,6 +476,21 @@ impl RoomSession {
 /// One deferred sidebar interaction. Collected while the ROOMS list renders
 /// (which holds shared borrows of `rooms`/`room_store`/`expanded_rooms`) and
 /// applied by `App::apply_room_action` afterwards.
+enum RoomAction {
+    /// Point the content tabs at this room.
+    Select(RoomHandle),
+    /// Expand/collapse this room's per-stream rows.
+    ToggleExpand(RoomHandle),
+    /// Leave — possibly via the confirm dialog, see `leave_needs_confirm`.
+    Leave(RoomHandle),
+    /// Connect to a saved-but-disconnected room's join string.
+    Reconnect(String),
+    /// Forget a saved room, by its `RoomStore` name.
+    Forget(String),
+    Watch(RoomHandle, ConnId, StreamId),
+    Listen(RoomHandle, ConnId, StreamId),
+}
+
 /// One Stream Control action, recorded while the tab is rendering (and
 /// holding `&self` borrows of `captures`/`rooms`) and applied by
 /// `apply_stream_action` afterwards — the same deferral `RoomAction` uses for
@@ -2316,21 +510,6 @@ enum StreamAction {
     EditFramerate(DestinationId, u32),
     EditBitrate(DestinationId, u32),
     RenameRoom(String, String, RoomHandle),
-}
-
-enum RoomAction {
-    /// Point the content tabs at this room.
-    Select(RoomHandle),
-    /// Expand/collapse this room's per-stream rows.
-    ToggleExpand(RoomHandle),
-    /// Leave — possibly via the confirm dialog, see `leave_needs_confirm`.
-    Leave(RoomHandle),
-    /// Connect to a saved-but-disconnected room's join string.
-    Reconnect(String),
-    /// Forget a saved room, by its `RoomStore` name.
-    Forget(String),
-    Watch(RoomHandle, ConnId, StreamId),
-    Listen(RoomHandle, ConnId, StreamId),
 }
 
 /// How many *other* people are streaming into this room right now — the
@@ -2384,366 +563,77 @@ fn destination_geometry(dest: &Destination) -> String {
     t!("streams.geometry", width = params.width, height = params.height, fps = params.framerate).to_string()
 }
 
-/// The label a room row shows: its saved name if it has one, otherwise a
-/// stable short id derived from the join string's room-id field.
-///
-/// `Why` an id-derived fallback rather than showing the raw join string: the
-/// join string contains the room *key*, i.e. the secret that grants access.
-/// A sidebar is exactly the sort of thing that ends up in a screenshot or a
-/// screen share, so it must never render one.
-fn room_label(room_store: &RoomStore, join_string: &str) -> String {
-    if let Some(name) = room_store.name_for(join_string) {
-        return name.to_string();
-    }
-    t!("rooms.unnamed", id = room_id_prefix(join_string)).to_string()
-}
-
-/// First 4 bytes of the room id, hex — short enough to read in a sidebar row,
-/// long enough to tell two rooms apart. Falls back to a placeholder for a
-/// join string that doesn't parse (which can't have connected, so this is only
-/// ever reachable for a corrupt `rooms.toml` entry).
-fn room_id_prefix(join_string: &str) -> String {
-    match crate::net::parse_join_string(join_string) {
-        Ok(parsed) => parsed.room_id.iter().take(4).map(|b| format!("{b:02x}")).collect(),
-        Err(_) => t!("rooms.unknown_id").to_string(),
-    }
-}
+// `room_label`/`room_id_prefix` live in `session.rs` (used by
+// `AppState::insert_room`/`poll_connect_result`, not just rendering) —
+// imported above as `session::room_label`.
 
 impl App {
     /// Kick off a connect to `join_string`. `from_add_card` routes a failure
     /// back into the inline "+ Add Room" card instead of the ROOMS list's own
-    /// error line.
+    /// error line (see `AppState::start_connect`).
     fn start_connect(&mut self, join_string: String, from_add_card: bool) {
-        let endpoint = match &self.endpoint {
-            Ok(endpoint) => endpoint.clone(),
-            Err(e) => {
-                self.status = Status::Error(e.clone());
-                if from_add_card {
-                    self.add_room_error = Some(e.clone());
-                }
-                return;
-            }
-        };
-        let display_name = self.display_name.clone();
-        let (tx, rx) = oneshot::channel();
-        self.pending_connect = Some(PendingConnect { rx, join_string: join_string.clone(), from_add_card });
-        self.status = Status::Connecting;
         self.add_room_error = None;
-
-        tokio::spawn(async move {
-            let result = ScreenshareClient::connect(&endpoint, &join_string, &display_name)
-                .await
-                .map_err(|e| format!("{e:#}"));
-            let _ = tx.send(result);
-        });
+        if let Err(e) = self.state.start_connect(join_string, from_add_card)
+            && from_add_card
+        {
+            self.add_room_error = Some(e);
+        }
     }
 
     /// Whether `join_string` is the room a connect is currently in flight for
     /// — what puts a saved row into the amber "reconnecting" state.
     fn is_reconnecting(&self, join_string: &str) -> bool {
-        self.pending_connect.as_ref().is_some_and(|p| p.join_string == join_string)
+        self.state.is_reconnecting(join_string)
     }
 
-    /// Insert a freshly connected room and return its handle. The one place
-    /// a `RoomSession` is born — used by `poll_connect_result` and, in tests,
-    /// to stand a session up directly.
-    ///
-    /// This is also where the always-on media-ingestion task is spawned (see
-    /// [`spawn_media_ingestion_task`]) — every `RoomSession` is created here,
-    /// so this is the one choke point that guarantees no room's `event_rx`
-    /// ever bypasses it.
-    fn insert_room(
-        &mut self,
-        client: ScreenshareClient,
-        snapshot: PresenceSnapshotState,
-        event_rx: mpsc::UnboundedReceiver<ClientEvent>,
-        join_string: String,
-    ) -> RoomHandle {
-        let handle = RoomHandle(self.next_room_handle);
-        self.next_room_handle = self.next_room_handle.wrapping_add(1);
+    // `insert_room` has no wrapper here — `poll_connect_result` and tests both
+    // call `self.state.insert_room` / `app.state.insert_room` directly (see
+    // `session::AppState::insert_room`).
 
-        let watches: Arc<Mutex<HashMap<(ConnId, StreamId), WatchEntry>>> = Arc::new(Mutex::new(HashMap::new()));
-        let audio_watches: Arc<Mutex<HashMap<(ConnId, StreamId), AudioWatch>>> = Arc::new(Mutex::new(HashMap::new()));
-
-        // `event_rx` is `ScreenshareClient::connect`'s raw, unbounded,
-        // straight-off-the-network channel. It is handed to the ingestion
-        // task, not stored on `RoomSession` directly — see
-        // `spawn_media_ingestion_task`'s doc comment for why. `forward_rx`
-        // (what `RoomSession::event_rx` actually becomes) only ever receives
-        // what that task didn't intercept, at the same throttled cadence
-        // `drain_events` always drained at.
-        let (forward_tx, forward_rx) = mpsc::unbounded_channel();
-        tokio::spawn(spawn_media_ingestion_task(
-            event_rx,
-            forward_tx,
-            watches.clone(),
-            audio_watches.clone(),
-        ));
-
-        self.rooms.insert(
-            handle,
-            RoomSession {
-                client,
-                event_rx: forward_rx,
-                members: snapshot.members,
-                streams: snapshot.streams,
-                save_name: room_label(&self.room_store, &join_string),
-                join_string,
-                saved: false,
-                destinations: Vec::new(),
-                next_stream_id: 0,
-                watches,
-                watch_error: None,
-                selected_watch: None,
-                audio_watches,
-                preview_cache: PreviewCache::new(),
-                preview_textures: HashMap::new(),
-            },
-        );
-        handle
-    }
-
-    /// Tear one room down: stop sending into it, drop the session — which
-    /// drops its decoders — and re-point `active_room` at whatever is left.
-    ///
-    /// `Why` this removes *destinations* and only drops a capture once it has
-    /// none left, rather than dropping every capture that fed this room: with
-    /// fan-out, one capture can be feeding three rooms, and leaving one of
-    /// them must not tear down a pipeline the other two are still using. That
-    /// is the exact failure `App`-owned (rather than room-owned) captures
-    /// exist to prevent — see the module docs' "Session data model".
+    /// Tear one room down. See `AppState::disconnect_room`; this wrapper also
+    /// clears the two UI-only fields (`expanded_rooms`, `leave_confirm`) that
+    /// used to be reset inline there.
     fn disconnect_room(&mut self, handle: RoomHandle) {
-        let Some(room) = self.rooms.shift_remove(&handle) else { return };
-        for destination_id in room.destinations {
-            let Some((capture_id, capture, _)) = find_destination(&self.captures, destination_id) else {
-                continue;
-            };
-            if capture.destinations.len() <= 1 {
-                // Last room this capture was feeding: nothing left to send
-                // anywhere, so stop the screen grab too.
-                self.drop_capture_fire_and_forget(capture_id);
-            } else {
-                self.stop_destination(destination_id);
-            }
-        }
-        if self.active_room == Some(handle) {
-            self.active_room = self.rooms.keys().next().copied();
-        }
+        self.state.disconnect_room(handle);
         // Purely view state, but ids never rewind, so a stale entry would
         // linger for the process's lifetime rather than ever being reused.
         self.expanded_rooms.remove(&handle);
         if self.leave_confirm == Some(handle) {
             self.leave_confirm = None;
         }
-        // Back on the join screen with nothing joined: reset the two pieces
-        // of `App`-level capture state that used to die with the singleton
-        // `Connected`, so a rejoin looks exactly like a first join (a fresh
-        // audio-source listing, no stale error banner) rather than inheriting
-        // the previous session's leftovers. Deliberately *only* when the last
-        // room goes: with several rooms joined, one leaving must not disturb
-        // what the others are showing.
-        if self.rooms.is_empty() {
-            self.audio_sources_requested = false;
-            self.share_error = None;
-        }
-    }
-
-    /// Whether leaving `handle` should raise a confirm dialog first.
-    ///
-    /// `Why` both conditions and not just watching: the plan's final verify
-    /// pass resolved that leaving a room you're *streaming to* gets the same
-    /// treatment as leaving one you're watching — "you're killing an outgoing
-    /// broadcast, not just navigating". A plain leave with neither is
-    /// immediate: there is nothing to lose and a confirm would just be a
-    /// speed bump on the most common case.
-    ///
-    /// Watching counts whether the tile is inline or popped out into its own
-    /// OS window — `watches` holds both (`WatchEntry::popout` only says
-    /// *where* it renders), and a popped-out window vanishing unannounced is
-    /// if anything the more startling of the two.
-    fn leave_needs_confirm(&self, handle: RoomHandle) -> bool {
-        let Some(room) = self.rooms.get(&handle) else { return false };
-        !room.destinations.is_empty()
-            || !room.watches.lock().unwrap().is_empty()
-            || !room.audio_watches.lock().unwrap().is_empty()
     }
 
     /// "Leave" clicked on a joined room row: tear it down now, or raise the
-    /// confirm dialog first if there's active work in it.
+    /// confirm dialog first if there's active work in it (see
+    /// `AppState::request_leave_room`).
     fn request_leave_room(&mut self, handle: RoomHandle) {
-        if self.leave_needs_confirm(handle) {
+        if !self.state.request_leave_room(handle) {
             self.leave_confirm = Some(handle);
-        } else {
-            self.disconnect_room(handle);
         }
     }
 
+    /// Poll the in-flight connect attempt and react to whatever just resolved
+    /// (see `AppState::poll_connect_result`): a success closes the "+ Add
+    /// Room" card, a failure from that card reports inline in it.
     fn poll_connect_result(&mut self) {
-        let Some(pending) = &mut self.pending_connect else { return };
-        let result = match pending.rx.try_recv() {
-            Ok(result) => result,
-            Err(oneshot::error::TryRecvError::Empty) => return,
-            Err(oneshot::error::TryRecvError::Closed) => Err(t!("errors.connect_task_ended").to_string()),
-        };
-        let Some(pending) = self.pending_connect.take() else { return };
-
-        match result {
-            Ok((client, snapshot, event_rx)) => {
-                self.status = Status::Idle;
-                let handle = self.insert_room(client, snapshot, event_rx, pending.join_string.clone());
-                // A successful join *is* the save: `RoomStore` is this app's
-                // only persistent "rooms I care about" state, and the plan's
-                // Add Room flow deliberately has no separate staging step —
-                // "on success the room appears live in the list, on failure
-                // nothing is saved". Saved under an id-derived name, which the
-                // Stream Control tab's rename row can replace; a room already
-                // saved keeps whatever name it has.
-                if self.room_store.name_for(&pending.join_string).is_none() {
-                    let name = room_label(&self.room_store, &pending.join_string);
-                    self.room_store.upsert(name, pending.join_string.clone());
-                    if let Err(e) = self.room_store.save() {
-                        self.room_store_error = Some(e.to_string());
-                    }
-                }
-                // Newly joined room becomes what the content tabs drive, and
-                // the Add Room card has served its purpose.
-                self.active_room = Some(handle);
+        match self.state.poll_connect_result() {
+            ConnectOutcome::None => {}
+            ConnectOutcome::Joined(_) => {
                 self.add_room_open = false;
                 self.add_room_join_string.clear();
                 self.add_room_error = None;
             }
-            Err(e) => {
-                if pending.from_add_card {
-                    // Keep the card open with the error inline, so the typed
-                    // link is still there to fix rather than retype.
-                    self.add_room_error = Some(e.clone());
+            ConnectOutcome::Failed { error, from_add_card } => {
+                if from_add_card {
+                    self.add_room_error = Some(error);
                 }
-                self.status = Status::Error(e);
             }
         }
     }
 
-    /// Drain every joined room's event channel, not just one. Each room owns
-    /// its own connection and therefore its own channel; nothing here is
-    /// shared between rooms except `captures`, which is why `rooms` and
-    /// `captures` are borrowed as separate fields rather than through `self`.
-    ///
-    /// Rooms whose control connection closed are collected and torn down
-    /// after the loop, since removing from `rooms` mid-iteration isn't
-    /// allowed.
+    /// Drain every joined room's event channel. See `AppState::drain_events`.
     fn drain_events(&mut self, ctx: &egui::Context) {
-        let mut closed: Vec<(RoomHandle, String)> = Vec::new();
-        let App { rooms, captures, .. } = self;
-
-        for (handle, room) in rooms.iter_mut() {
-            let handle = *handle;
-            while let Ok(event) = room.event_rx.try_recv() {
-                match event {
-                    ClientEvent::PresenceDelta(PresenceEvent::MemberJoined(member)) => {
-                        room.members.retain(|m| m.conn_id != member.conn_id);
-                        room.members.push(member);
-                    }
-                    ClientEvent::PresenceDelta(PresenceEvent::MemberLeft { conn_id }) => {
-                        room.members.retain(|m| m.conn_id != conn_id);
-                    }
-                    ClientEvent::PresenceDelta(PresenceEvent::StreamStarted(info)) => {
-                        if let Some(m) = room.members.iter_mut().find(|m| m.conn_id == info.owner) {
-                            m.stream_count = m.stream_count.saturating_add(1);
-                        }
-                        room.streams.retain(|s| !(s.owner == info.owner && s.stream_id == info.stream_id));
-                        room.streams.push(info);
-                    }
-                    ClientEvent::PresenceDelta(PresenceEvent::StreamStopped { conn_id, stream_id }) => {
-                        if let Some(m) = room.members.iter_mut().find(|m| m.conn_id == conn_id) {
-                            m.stream_count = m.stream_count.saturating_sub(1);
-                        }
-                        room.streams.retain(|s| !(s.owner == conn_id && s.stream_id == stream_id));
-                        room.preview_cache.remove(conn_id, stream_id);
-                        room.preview_textures.remove(&(conn_id, stream_id));
-                    }
-                    // Only meaningful for a stream we're actively *sending*
-                    // (relay spec §9: both are sent only to the connection
-                    // that owns `stream_id`) — forward to that stream's live
-                    // `CaptureHandle` so `capture.rs`'s pump loop can
-                    // pause/resume the encoder and force keyframes. Looked up
-                    // by `(room, stream_id)`, never `stream_id` alone: the
-                    // same small integer means a different stream in every
-                    // room. A miss (no such destination, not `Active` yet, or
-                    // an audio capture) is a normal, silent no-op: audio has
-                    // no encoder to pause, and a `Starting`/`Stopping`/absent
-                    // capture has nothing listening yet.
-                    ClientEvent::SubscriberCount { stream_id, count } => {
-                        if let Some((LocalCapture { status: ShareStatus::Active(ShareHandle::Video(h)), .. }, dest)) =
-                            capture_feeding(captures, handle, stream_id)
-                        {
-                            h.notify_subscriber_count(DestKey(dest.0), count);
-                        }
-                    }
-                    ClientEvent::KeyframeRequest { stream_id } => {
-                        if let Some((LocalCapture { status: ShareStatus::Active(ShareHandle::Video(h)), .. }, dest)) =
-                            capture_feeding(captures, handle, stream_id)
-                        {
-                            h.notify_keyframe_request(DestKey(dest.0));
-                        }
-                    }
-                    ClientEvent::MediaFrame(_) => {
-                        // `Why:` this arm is unreachable at runtime by
-                        // construction, not dead code the compiler could
-                        // prove unreachable itself. `RoomSession::event_rx`
-                        // is never the raw channel `ScreenshareClient::connect`
-                        // returns — `insert_room` always routes that raw
-                        // channel through `spawn_media_ingestion_task` first,
-                        // and that task intercepts every `MediaFrame` and
-                        // feeds `watches`/`audio_watches` directly, in real
-                        // time, without ever forwarding it here. This keeps
-                        // media delivery fully decoupled from this function's
-                        // (and `App::update()`'s) throttled repaint cadence,
-                        // closing the "fast-forward catch-up" backlog bug —
-                        // see `spawn_media_ingestion_task`'s doc comment for
-                        // the full root-cause writeup. Kept as an explicit
-                        // no-op arm (rather than folded into a wildcard, or
-                        // `unreachable!()`) purely so this `match` stays
-                        // exhaustive against `ClientEvent` and self-documents
-                        // where the frames actually went.
-                    }
-                    ClientEvent::Preview(preview) => match decode::decode_preview(&preview) {
-                        Ok(image) => {
-                            let key = (preview.conn_id, preview.stream_id);
-                            // Upload/update the roster thumbnail texture right
-                            // away, mirroring `WatchEntry`'s
-                            // create-once-then-`set`-in-place pattern (see
-                            // `update_watch_textures`) rather than reuploading
-                            // an unchanged image every repaint.
-                            match room.preview_textures.get_mut(&key) {
-                                Some(tex) => tex.set(image.clone(), egui::TextureOptions::LINEAR),
-                                None => {
-                                    let name = format!("preview-{:016x}-{}", preview.conn_id, preview.stream_id);
-                                    let tex = ctx.load_texture(name, image.clone(), egui::TextureOptions::LINEAR);
-                                    room.preview_textures.insert(key, tex);
-                                }
-                            }
-                            room.preview_cache.update(preview.conn_id, preview.stream_id, image);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "failed to decode preview for stream {} on conn {:016x}: {e:#}",
-                                preview.stream_id,
-                                preview.conn_id
-                            );
-                        }
-                    },
-                    ClientEvent::ControlClosed(reason) => {
-                        closed.push((handle, reason));
-                        break;
-                    }
-                }
-            }
-        }
-
-        for (handle, reason) in closed {
-            self.status = Status::Error(t!("errors.disconnected", reason = reason).to_string());
-            self.disconnect_room(handle);
-        }
+        self.state.drain_events(ctx);
     }
 
     /// Global settings: the "English"/"Deutsch" language switcher and the
@@ -2759,40 +649,40 @@ impl App {
         theme::card(ui, t!("settings.header").as_ref(), |ui| {
             theme::setting_row(ui, t!("settings.language_label").as_ref(), |ui| {
                 let mut changed = false;
-                if ui.selectable_label(self.language == "en", "English").clicked() && self.language != "en" {
-                    self.language = "en".to_string();
+                if ui.selectable_label(self.state.language == "en", "English").clicked() && self.state.language != "en" {
+                    self.state.language = "en".to_string();
                     changed = true;
                 }
-                if ui.selectable_label(self.language == "de", "Deutsch").clicked() && self.language != "de" {
-                    self.language = "de".to_string();
+                if ui.selectable_label(self.state.language == "de", "Deutsch").clicked() && self.state.language != "de" {
+                    self.state.language = "de".to_string();
                     changed = true;
                 }
                 if changed {
-                    rust_i18n::set_locale(&self.language);
-                    save_language(&self.language);
+                    rust_i18n::set_locale(&self.state.language);
+                    session::save_language(&self.state.language);
                 }
             });
 
             theme::setting_row(ui, t!("settings.presentation_mode_label").as_ref(), |ui| {
                 let mut changed = false;
                 egui::ComboBox::from_id_salt("presentation_mode_combo")
-                    .selected_text(self.presentation_mode.label())
+                    .selected_text(self.state.presentation_mode.label())
                     .show_ui(ui, |ui| {
                         for mode in PresentationMode::ALL {
-                            if ui.selectable_value(&mut self.presentation_mode, mode, mode.label()).changed() {
+                            if ui.selectable_value(&mut self.state.presentation_mode, mode, mode.label()).changed() {
                                 changed = true;
                             }
                         }
                     });
                 if changed {
-                    save_presentation_mode(self.presentation_mode);
+                    session::save_presentation_mode(self.state.presentation_mode);
                 }
                 // Runtime present-mode swap isn't available with this pinned
                 // eframe/egui-wgpu (see superdoc/features/presentation-modes.md):
                 // the surface is only ever configured once, at window
                 // creation. Surface this as an inline hint rather than
                 // silently doing nothing until the next launch.
-                if self.presentation_mode != self.launch_presentation_mode {
+                if self.state.presentation_mode != self.state.launch_presentation_mode {
                     ui.label(egui::RichText::new(t!("settings.presentation_mode_restart_hint").to_string()).color(theme::TEXT_FAINT).italics());
                 }
             });
@@ -2879,13 +769,13 @@ impl App {
     fn ui_rooms_section(&mut self, ui: &mut egui::Ui) {
         theme::section_label(ui, t!("rooms.section").as_ref());
 
-        if let Some(err) = &self.room_store_error {
+        if let Some(err) = &self.state.room_store_error {
             ui.colored_label(theme::DANGER, t!("join.load_error", error = err).to_string());
         }
         // A connect failure that didn't come from the Add Room card (i.e. a
         // `[Reconnect]`, or a dropped connection) has no card to live in, so
         // it reports here, above the list it concerns.
-        if let Status::Error(e) = &self.status
+        if let Status::Error(e) = &self.state.status
             && !self.add_room_open
         {
             ui.colored_label(theme::DANGER, t!("join.error", error = e).to_string());
@@ -2896,22 +786,23 @@ impl App {
             .id_salt("rooms_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for saved in &self.room_store.rooms {
+                for saved in &self.state.room_store.rooms {
                     let handle = self
+                        .state
                         .rooms
                         .iter()
                         .find(|(_, room)| room.join_string == saved.join_string)
                         .map(|(handle, _)| *handle);
                     self.ui_room_row(ui, &saved.name, &saved.join_string, handle, &mut actions);
                 }
-                for (handle, room) in &self.rooms {
-                    if self.room_store.name_for(&room.join_string).is_some() {
+                for (handle, room) in &self.state.rooms {
+                    if self.state.room_store.name_for(&room.join_string).is_some() {
                         continue;
                     }
-                    let name = room_label(&self.room_store, &room.join_string);
+                    let name = room_label(&self.state.room_store, &room.join_string);
                     self.ui_room_row(ui, &name, &room.join_string, Some(*handle), &mut actions);
                 }
-                if self.room_store.rooms.is_empty() && self.rooms.is_empty() {
+                if self.state.room_store.rooms.is_empty() && self.state.rooms.is_empty() {
                     ui.label(egui::RichText::new(t!("rooms.none_yet").to_string()).color(theme::TEXT_FAINT).small());
                 }
             });
@@ -2937,7 +828,7 @@ impl App {
         handle: Option<RoomHandle>,
         actions: &mut Vec<RoomAction>,
     ) {
-        let selected = handle.is_some() && self.active_room == handle;
+        let selected = handle.is_some() && self.state.active_room == handle;
         let expanded = handle.is_some_and(|h| self.expanded_rooms.contains(&h));
         let reconnecting = handle.is_none() && self.is_reconnecting(join_string);
 
@@ -2980,7 +871,7 @@ impl App {
                                 {
                                     actions.push(RoomAction::Leave(h));
                                 }
-                                let room = &self.rooms[&h];
+                                let room = &self.state.rooms[&h];
                                 ui.label(
                                     egui::RichText::new(
                                         t!("rooms.active_users", count = active_user_count(room)).to_string(),
@@ -3036,7 +927,7 @@ impl App {
             return;
         }
         let Some(handle) = handle else { return };
-        let Some(room) = self.rooms.get(&handle) else { return };
+        let Some(room) = self.state.rooms.get(&handle) else { return };
         let me = room.client.conn_id();
         let unknown_owner = t!("streams.unknown_owner").to_string();
         for info in &room.streams {
@@ -3112,11 +1003,11 @@ impl App {
         if self.add_room_open {
             theme::card(ui, t!("rooms.add_header").as_ref(), |ui| {
                 ui.label(egui::RichText::new(t!("join.display_name_label").to_string()).small().color(theme::TEXT_DIM));
-                ui.add(egui::TextEdit::singleline(&mut self.display_name).desired_width(ui.available_width()));
+                ui.add(egui::TextEdit::singleline(&mut self.state.display_name).desired_width(ui.available_width()));
                 ui.label(egui::RichText::new(t!("join.link_label").to_string()).small().color(theme::TEXT_DIM));
                 ui.add(egui::TextEdit::singleline(&mut self.add_room_join_string).desired_width(ui.available_width()));
 
-                let connecting = matches!(self.status, Status::Connecting);
+                let connecting = matches!(self.state.status, Status::Connecting);
                 ui.horizontal(|ui| {
                     ui.add_enabled_ui(!connecting && !self.add_room_join_string.trim().is_empty(), |ui| {
                         if ui.add(theme::primary_button(t!("join.button").to_string())).clicked() {
@@ -3160,7 +1051,7 @@ impl App {
     fn ui_streams_section(&mut self, ui: &mut egui::Ui) {
         theme::section_label(ui, t!("streams_section.header").as_ref());
 
-        if self.captures.is_empty() {
+        if self.state.captures.is_empty() {
             // The common case on every launch: nothing is persisted across
             // sessions, so an inviting empty state is the *normal* state here,
             // not an edge case.
@@ -3183,10 +1074,10 @@ impl App {
             .id_salt("streams_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for (capture_id, capture) in &self.captures {
+                for (capture_id, capture) in &self.state.captures {
                     for dest in capture.destinations.values() {
-                        let room_name = match self.rooms.get(&dest.room) {
-                            Some(room) => room_label(&self.room_store, &room.join_string),
+                        let room_name = match self.state.rooms.get(&dest.room) {
+                            Some(room) => room_label(&self.state.room_store, &room.join_string),
                             None => t!("streams_section.unknown_room").to_string(),
                         };
                         ui.horizontal(|ui| {
@@ -3243,7 +1134,7 @@ impl App {
             });
 
         for capture_id in to_stop {
-            self.stop_share(capture_id);
+            self.state.stop_share(capture_id);
         }
     }
 
@@ -3251,7 +1142,7 @@ impl App {
     /// gone. See `ui_room_row`.
     fn apply_room_action(&mut self, action: RoomAction) {
         match action {
-            RoomAction::Select(handle) => self.active_room = Some(handle),
+            RoomAction::Select(handle) => self.state.active_room = Some(handle),
             RoomAction::ToggleExpand(handle) => {
                 if !self.expanded_rooms.remove(&handle) {
                     self.expanded_rooms.insert(handle);
@@ -3260,24 +1151,24 @@ impl App {
             RoomAction::Leave(handle) => self.request_leave_room(handle),
             RoomAction::Reconnect(join_string) => self.start_connect(join_string, false),
             RoomAction::Forget(name) => {
-                self.room_store.remove(&name);
-                if let Err(e) = self.room_store.save() {
-                    self.room_store_error = Some(e.to_string());
+                self.state.room_store.remove(&name);
+                if let Err(e) = self.state.room_store.save() {
+                    self.state.room_store_error = Some(e.to_string());
                 }
             }
             RoomAction::Watch(handle, owner, stream_id) => {
-                if let Some(room) = self.rooms.get_mut(&handle) {
+                if let Some(room) = self.state.rooms.get_mut(&handle) {
                     room.toggle_watch(owner, stream_id);
                     // Watching from a room's row is also a statement about
                     // which room you're looking at — otherwise the View tab
                     // would keep showing a different room's stream and the
                     // click would look like it did nothing.
-                    self.active_room = Some(handle);
+                    self.state.active_room = Some(handle);
                     self.nav_tab = NavTab::View;
                 }
             }
             RoomAction::Listen(handle, owner, stream_id) => {
-                if let Some(room) = self.rooms.get_mut(&handle) {
+                if let Some(room) = self.state.rooms.get_mut(&handle) {
                     room.toggle_listen(owner, stream_id);
                 }
             }
@@ -3288,11 +1179,11 @@ impl App {
     /// `leave_needs_confirm` for when this is raised at all.
     fn ui_leave_confirm(&mut self, ctx: &egui::Context) {
         let Some(handle) = self.leave_confirm else { return };
-        let Some(room) = self.rooms.get(&handle) else {
+        let Some(room) = self.state.rooms.get(&handle) else {
             self.leave_confirm = None;
             return;
         };
-        let name = room_label(&self.room_store, &room.join_string);
+        let name = room_label(&self.state.room_store, &room.join_string);
         let watching = room.watches.lock().unwrap().len() + room.audio_watches.lock().unwrap().len();
         let sending = room.destinations.len();
 
@@ -3370,14 +1261,14 @@ impl App {
     /// are live and applied afterwards (same pattern as `RoomAction` for the
     /// sidebar).
     fn ui_stream_control_tab(&mut self, ui: &mut egui::Ui) {
-        if self.rooms.is_empty() {
+        if self.state.rooms.is_empty() {
             Self::ui_empty_state(ui, t!("stream_control.empty").as_ref());
             return;
         }
         // Default the "start a stream" room picker to whichever room is
         // selected, so the common case is one click.
-        if self.new_stream_room.is_none_or(|handle| !self.rooms.contains_key(&handle)) {
-            self.new_stream_room = self.active_room.or_else(|| self.rooms.keys().next().copied());
+        if self.state.new_stream_room.is_none_or(|handle| !self.state.rooms.contains_key(&handle)) {
+            self.state.new_stream_room = self.state.active_room.or_else(|| self.state.rooms.keys().next().copied());
         }
 
         let mut actions: Vec<StreamAction> = Vec::new();
@@ -3400,7 +1291,7 @@ impl App {
     /// The bandwidth card: the mode toggle, each mode's own settings, the
     /// fan-out multiplication note, and the overshoot warning.
     fn ui_bandwidth_card(&mut self, ui: &mut egui::Ui) {
-        let mut mode = self.bandwidth_mode;
+        let mut mode = self.state.bandwidth_mode;
         let mut totals_changed = false;
 
         theme::card(ui, t!("bandwidth.header").as_ref(), |ui| {
@@ -3426,12 +1317,12 @@ impl App {
                 }
             });
 
-            match self.bandwidth_mode {
+            match self.state.bandwidth_mode {
                 BandwidthMode::Absolute => {
                     totals_changed |= theme::slider_row(
                         ui,
                         t!("bandwidth.total_label").as_ref(),
-                        &mut self.absolute_total_kbps,
+                        &mut self.state.absolute_total_kbps,
                         MIN_BITRATE_KBPS..=MAX_BITRATE_KBPS,
                         50.0,
                         " kbps",
@@ -3439,7 +1330,7 @@ impl App {
                     totals_changed |= theme::slider_row(
                         ui,
                         t!("bandwidth.floor_label").as_ref(),
-                        &mut self.destination_floor_kbps,
+                        &mut self.state.destination_floor_kbps,
                         100..=MIN_BITRATE_KBPS * 4,
                         10.0,
                         " kbps",
@@ -3475,7 +1366,7 @@ impl App {
             // floors add up to. Never silently exceeded and never starved
             // below floor (plan doc, round-1 Q8) — so the only honest thing
             // left is to say so.
-            if let Some(allocation) = self.bandwidth.allocation()
+            if let Some(allocation) = self.state.bandwidth.allocation()
                 && allocation.overshoot_kbps > 0
             {
                 ui.add_space(theme::SPACING * 0.5);
@@ -3484,7 +1375,7 @@ impl App {
                     &t!(
                         "bandwidth.overshoot_warning",
                         over = allocation.overshoot_kbps,
-                        total = self.absolute_total_kbps,
+                        total = self.state.absolute_total_kbps,
                         assigned = allocation.assigned_total_kbps
                     ),
                 );
@@ -3492,17 +1383,22 @@ impl App {
         });
 
         if totals_changed {
-            save_bandwidth_settings(self.bandwidth_mode, self.absolute_total_kbps, self.destination_floor_kbps);
+            session::save_bandwidth_settings(
+                self.state.bandwidth_mode,
+                self.state.absolute_total_kbps,
+                self.state.destination_floor_kbps,
+            );
         }
-        if mode != self.bandwidth_mode {
-            self.set_bandwidth_mode(mode);
+        if mode != self.state.bandwidth_mode {
+            self.state.set_bandwidth_mode(mode);
         }
     }
 
     /// How many destinations are actually encoding right now — the fan-out
     /// bandwidth multiplier.
     fn live_destination_count(&self) -> usize {
-        self.captures
+        self.state
+            .captures
             .values()
             .filter(|c| c.kind == StreamKind::Video && matches!(c.status, ShareStatus::Active(_)))
             .map(|c| c.destinations.values().filter(|d| d.runtime.is_some()).count())
@@ -3515,48 +1411,50 @@ impl App {
         theme::card(ui, t!("stream_control.start_header").as_ref(), |ui| {
             theme::setting_row(ui, t!("stream_control.room_label").as_ref(), |ui| {
                 let selected = self
+                    .state
                     .new_stream_room
-                    .and_then(|handle| self.rooms.get(&handle))
-                    .map(|room| room_label(&self.room_store, &room.join_string))
+                    .and_then(|handle| self.state.rooms.get(&handle))
+                    .map(|room| room_label(&self.state.room_store, &room.join_string))
                     .unwrap_or_else(|| t!("stream_control.pick_room").to_string());
                 egui::ComboBox::from_id_salt("start_stream_room").selected_text(selected).show_ui(ui, |ui| {
-                    for (handle, room) in &self.rooms {
-                        let label = room_label(&self.room_store, &room.join_string);
-                        ui.selectable_value(&mut self.new_stream_room, Some(*handle), label);
+                    for (handle, room) in &self.state.rooms {
+                        let label = room_label(&self.state.room_store, &room.join_string);
+                        ui.selectable_value(&mut self.state.new_stream_room, Some(*handle), label);
                     }
                 });
             });
             theme::setting_row(ui, t!("share.framerate_label").as_ref(), |ui| {
                 egui::ComboBox::from_id_salt("start_stream_framerate")
-                    .selected_text(format!("{} fps", self.framerate))
+                    .selected_text(format!("{} fps", self.state.framerate))
                     .show_ui(ui, |ui| {
                         for &fps in &FRAMERATE_OPTIONS {
-                            ui.selectable_value(&mut self.framerate, fps, format!("{fps} fps"));
+                            ui.selectable_value(&mut self.state.framerate, fps, format!("{fps} fps"));
                         }
                     });
             });
             // The starting bitrate only means anything in Per-Stream mode; in
             // Absolute mode the allocator overwrites it within a second of the
             // stream going live, so offering the slider would be a lie.
-            if self.bandwidth_mode == BandwidthMode::PerStream {
+            if self.state.bandwidth_mode == BandwidthMode::PerStream {
                 theme::slider_row(
                     ui,
                     t!("share.bitrate_label").as_ref(),
-                    &mut self.bitrate_kbps,
+                    &mut self.state.bitrate_kbps,
                     MIN_BITRATE_KBPS..=MAX_BITRATE_KBPS,
                     50.0,
                     " kbps",
                 );
             }
             ui.horizontal(|ui| {
-                ui.add_enabled_ui(self.new_stream_room.is_some(), |ui| {
+                ui.add_enabled_ui(self.state.new_stream_room.is_some(), |ui| {
                     if ui.add(theme::primary_button(t!("share.screen_button").to_string())).clicked()
-                        && let Some(room) = self.new_stream_room
+                        && let Some(room) = self.state.new_stream_room
                     {
                         actions.push(StreamAction::StartCapture(room));
                     }
                 });
                 let starting_video = self
+                    .state
                     .captures
                     .values()
                     .any(|c| c.kind == StreamKind::Video && matches!(c.status, ShareStatus::Starting(_)));
@@ -3565,7 +1463,7 @@ impl App {
                     ui.label(egui::RichText::new(t!("share.waiting_permission").to_string()).color(theme::TEXT_DIM));
                 }
             });
-            if let Some(err) = self.share_error.as_ref() {
+            if let Some(err) = self.state.share_error.as_ref() {
                 ui.colored_label(theme::DANGER, t!("share.error", error = err).to_string());
             }
         });
@@ -3581,11 +1479,11 @@ impl App {
     /// selection (the same reasoning as the sidebar's STREAMS section).
     fn ui_destinations_card(&mut self, ui: &mut egui::Ui, actions: &mut Vec<StreamAction>) {
         theme::card(ui, t!("share.active_header").as_ref(), |ui| {
-            if self.captures.is_empty() {
+            if self.state.captures.is_empty() {
                 ui.label(egui::RichText::new(t!("share.none").to_string()).color(theme::TEXT_FAINT));
                 return;
             }
-            for (capture_id, capture) in &self.captures {
+            for (capture_id, capture) in &self.state.captures {
                 for (destination_id, dest) in &capture.destinations {
                     self.ui_destination_row(ui, *capture_id, capture, *destination_id, dest, actions);
                     ui.add_space(theme::SPACING);
@@ -3606,8 +1504,8 @@ impl App {
         dest: &Destination,
         actions: &mut Vec<StreamAction>,
     ) {
-        let room_name = match self.rooms.get(&dest.room) {
-            Some(room) => room_label(&self.room_store, &room.join_string),
+        let room_name = match self.state.rooms.get(&dest.room) {
+            Some(room) => room_label(&self.state.room_store, &room.join_string),
             None => t!("streams_section.unknown_room").to_string(),
         };
         let video = capture.kind == StreamKind::Video;
@@ -3649,8 +1547,8 @@ impl App {
         // In Absolute mode that is the allocator's most recent write, which is
         // the number worth showing — the manual slider below is not in force.
         if video && active {
-            let live_kbps = match self.bandwidth_mode {
-                BandwidthMode::Absolute => self.bandwidth.applied_kbps(destination_id),
+            let live_kbps = match self.state.bandwidth_mode {
+                BandwidthMode::Absolute => self.state.bandwidth.applied_kbps(destination_id),
                 BandwidthMode::PerStream => Some(dest.live_params().bitrate_kbps),
             };
             if let Some(kbps) = live_kbps {
@@ -3708,7 +1606,7 @@ impl App {
             }
         });
 
-        if self.bandwidth_mode == BandwidthMode::PerStream {
+        if self.state.bandwidth_mode == BandwidthMode::PerStream {
             let mut bitrate = dest.edit.bitrate_kbps;
             if theme::slider_row(
                 ui,
@@ -3745,16 +1643,18 @@ impl App {
             // transfer it would additionally be self-defeating (the "old"
             // destination is in a room the capture would still be feeding).
             let others: Vec<(RoomHandle, String)> = self
+                .state
                 .rooms
                 .iter()
                 .filter(|(handle, _)| **handle != dest.room)
                 .filter(|(handle, _)| {
                     !self
+                        .state
                         .captures
                         .get(&capture_id)
                         .is_some_and(|c| c.destinations.values().any(|d| d.room == **handle))
                 })
-                .map(|(handle, room)| (*handle, room_label(&self.room_store, &room.join_string)))
+                .map(|(handle, room)| (*handle, room_label(&self.state.room_store, &room.join_string)))
                 .collect();
             let can_move = !others.is_empty() && dest.pending.is_none();
             ui.add_enabled_ui(can_move, |ui| {
@@ -3847,8 +1747,8 @@ impl App {
     }
 
     fn room_name(&self, handle: RoomHandle) -> String {
-        match self.rooms.get(&handle) {
-            Some(room) => room_label(&self.room_store, &room.join_string),
+        match self.state.rooms.get(&handle) {
+            Some(room) => room_label(&self.state.room_store, &room.join_string),
             None => t!("streams_section.unknown_room").to_string(),
         }
     }
@@ -3857,9 +1757,17 @@ impl App {
     /// sharing (still a per-capture concept of its own — see the plan doc's
     /// audio-attachment stage).
     fn ui_room_card(&mut self, ui: &mut egui::Ui, actions: &mut Vec<StreamAction>) {
-        let Some(room_handle) = self.active_room else { return };
-        let App { rooms, room_store, audio_sources, audio_sources_error, audio_sources_requested, audio_sources_rx, selected_audio_source, .. } =
-            self;
+        let Some(room_handle) = self.state.active_room else { return };
+        let AppState {
+            rooms,
+            room_store,
+            audio_sources,
+            audio_sources_error,
+            audio_sources_requested,
+            audio_sources_rx,
+            selected_audio_source,
+            ..
+        } = &mut self.state;
         let Some(room) = rooms.get_mut(&room_handle) else { return };
 
         theme::card(ui, t!("members.header", count = room.members.len()).as_ref(), |ui| {
@@ -3958,55 +1866,28 @@ impl App {
     /// are gone (same shape as `apply_room_action`).
     fn apply_stream_action(&mut self, action: StreamAction) {
         match action {
-            StreamAction::StartCapture(room) => self.start_video_share(room),
-            StreamAction::StartAudio(room) => self.start_audio_share(room),
-            StreamAction::RefreshAudio => self.refresh_audio_sources(),
-            StreamAction::StopDestination(destination_id) => self.stop_destination(destination_id),
-            StreamAction::Transfer(destination_id, room) => self.transfer_destination(destination_id, room),
-            StreamAction::FanOut(capture_id, room) => self.add_destination(capture_id, room, PendingRole::FanOut),
-            StreamAction::ApplyEdit(destination_id) => self.apply_destination_edit(destination_id),
+            StreamAction::StartCapture(room) => self.state.start_video_share(room),
+            StreamAction::StartAudio(room) => self.state.start_audio_share(room),
+            StreamAction::RefreshAudio => self.state.refresh_audio_sources(),
+            StreamAction::StopDestination(destination_id) => self.state.stop_destination(destination_id),
+            StreamAction::Transfer(destination_id, room) => self.state.transfer_destination(destination_id, room),
+            StreamAction::FanOut(capture_id, room) => self.state.add_destination(capture_id, room, PendingRole::FanOut),
+            StreamAction::ApplyEdit(destination_id) => self.state.apply_destination_edit(destination_id),
             StreamAction::EditScale(destination_id, scale) => {
-                self.with_destination(destination_id, |dest| dest.edit.scale_percent = scale);
+                self.state.with_destination(destination_id, |dest| dest.edit.scale_percent = scale);
             }
             StreamAction::EditFramerate(destination_id, framerate) => {
-                self.with_destination(destination_id, |dest| dest.edit.framerate = framerate);
+                self.state.with_destination(destination_id, |dest| dest.edit.framerate = framerate);
             }
             StreamAction::EditBitrate(destination_id, bitrate) => {
-                self.with_destination(destination_id, |dest| dest.edit.bitrate_kbps = bitrate);
+                self.state.with_destination(destination_id, |dest| dest.edit.bitrate_kbps = bitrate);
             }
             StreamAction::RenameRoom(join_string, name, room_handle) => {
-                self.rename_saved_room(&join_string, name);
-                if let Some(room) = self.rooms.get_mut(&room_handle) {
+                self.state.rename_saved_room(&join_string, name);
+                if let Some(room) = self.state.rooms.get_mut(&room_handle) {
                     room.saved = true;
                 }
             }
-        }
-    }
-
-    fn with_destination(&mut self, destination_id: DestinationId, f: impl FnOnce(&mut Destination)) {
-        for capture in self.captures.values_mut() {
-            if let Some(dest) = capture.destinations.get_mut(&destination_id) {
-                f(dest);
-                return;
-            }
-        }
-    }
-
-    /// Rename the `RoomStore` entry for `join_string` to `new_name`.
-    ///
-    /// `Why` remove-then-upsert rather than a plain `upsert`: `RoomStore` is
-    /// keyed by *name*, so upserting under a new name would leave the old
-    /// entry behind and the sidebar would show the same room twice — once
-    /// connected, once as a stale saved row.
-    fn rename_saved_room(&mut self, join_string: &str, new_name: String) {
-        if let Some(old) = self.room_store.name_for(join_string).map(str::to_string)
-            && old != new_name
-        {
-            self.room_store.remove(&old);
-        }
-        self.room_store.upsert(new_name, join_string.to_string());
-        if let Err(e) = self.room_store.save() {
-            self.room_store_error = Some(e.to_string());
         }
     }
 
@@ -4026,11 +1907,11 @@ impl App {
     /// `RoomSession::show_popouts` give it a real OS viewport. Only the
     /// *button* moved.
     fn ui_view_tab(&mut self, ui: &mut egui::Ui) {
-        let Some(room_handle) = self.active_room else {
+        let Some(room_handle) = self.state.active_room else {
             Self::ui_empty_state(ui, t!("view.empty").as_ref());
             return;
         };
-        let Some(room) = self.rooms.get_mut(&room_handle) else { return };
+        let Some(room) = self.state.rooms.get_mut(&room_handle) else { return };
 
         let mut to_toggle: Option<(ConnId, StreamId)> = None;
         let mut to_pop_out: Option<(ConnId, StreamId)> = None;
@@ -4261,23 +2142,23 @@ impl eframe::App for App {
         }
         self.poll_connect_result();
         self.drain_events(ctx);
-        self.poll_capture_states();
-        self.poll_pending_destinations();
-        self.poll_destination_edits();
-        self.poll_audio_sources();
+        self.state.poll_capture_states();
+        self.state.poll_pending_destinations();
+        self.state.poll_destination_edits();
+        self.state.poll_audio_sources();
         self.update_self_preview_textures(ctx);
         // Absolute-Maximum mode's live wiring. Called every frame but
         // internally rate-limited to one recompute per second and hysteresis-
         // filtered per destination, so this is a cheap no-op on the vast
-        // majority of frames — see `BandwidthController`.
-        self.apply_bandwidth_allocation();
+        // majority of frames — see `session::BandwidthController`.
+        self.state.apply_bandwidth_allocation();
 
         // Every room's watches are polled and repainted, not just the one the
         // UI happens to be showing: a `StreamDecoder` that stops being fed
         // (or stops being drained) stalls, and a room being off-screen is a
         // view decision, not a reason to starve its decoders.
         let mut has_inline_watch = false;
-        for (handle, room) in self.rooms.iter_mut() {
+        for (handle, room) in self.state.rooms.iter_mut() {
             has_inline_watch |= room.update_watch_textures(ctx);
             room.show_popouts(ctx, *handle);
         }
@@ -4339,7 +2220,7 @@ impl eframe::App for App {
         // has no input to react to yet. Falls back to a much coarser
         // interval while unfocused (also covers the has_inline_watch case
         // above when the window is backgrounded) — see `focused` above.
-        if matches!(self.status, Status::Connecting) || !self.rooms.is_empty() {
+        if matches!(self.state.status, Status::Connecting) || !self.state.rooms.is_empty() {
             let interval = if focused { IDLE_REPAINT_INTERVAL } else { UNFOCUSED_REPAINT_INTERVAL };
             ctx.request_repaint_after(interval);
         }
@@ -4360,14 +2241,17 @@ impl eframe::App for App {
     /// *attempted*, rather than relying solely on the handles' `Drop` impls
     /// once this process starts exiting.
     fn on_exit(&mut self) {
-        self.stop_all_captures_fire_and_forget();
+        self.state.stop_all_captures_fire_and_forget();
     }
 }
 
 #[cfg(test)]
 mod session_model_tests {
     //! Pure (no I/O, no GStreamer, no network) coverage for the session
-    //! model's cross-room lookups.
+    //! model's cross-room lookups, plus a couple of view-layer-adjacent
+    //! formatting/default checks (`NavTab::default`, `remote_stream_geometry`,
+    //! `destination_geometry`) that stayed with the rendering code they serve
+    //! rather than moving into `session.rs`.
     //!
     //! The whole point of the rooms/captures/destinations split is that a
     //! protocol `StreamId` is only unique *within one connection*: two rooms
@@ -4376,6 +2260,9 @@ mod session_model_tests {
     //! one entry where two were needed. These tests pin the replacement
     //! behaviour with that collision deliberately constructed.
     use super::*;
+    use crate::session::{capture_feeding, find_destination, DestEdit, DEFAULT_BITRATE_KBPS, DEFAULT_FRAMERATE};
+    use indexmap::IndexMap;
+    use tokio::sync::oneshot;
 
     /// A `LocalCapture` with the given destinations and a never-resolving
     /// `Starting` status — enough for the lookup functions, which never touch
@@ -4519,14 +2406,14 @@ mod session_model_tests {
         let key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
         let join_string = format!("relay.example:4433|{room_id}|{key}");
 
-        let store = RoomStore::default();
+        let store = crate::rooms::RoomStore::default();
         let label = room_label(&store, &join_string);
         assert!(label.contains("00112233"), "expected the room-id prefix in {label:?}");
         assert!(!label.contains(key), "the room key must never reach a rendered label");
         assert!(!label.contains("relay.example"), "the label is an identifier, not a connection string");
 
         // A saved room wins over the fallback.
-        let mut store = RoomStore::default();
+        let mut store = crate::rooms::RoomStore::default();
         store.upsert("movie night".to_string(), join_string.clone());
         assert_eq!(room_label(&store, &join_string), "movie night");
     }
@@ -4566,16 +2453,16 @@ mod session_model_tests {
 
     #[tokio::test]
     async fn session_ids_are_monotonic_and_allocated_from_separate_spaces() {
-        // `App::default()` binds a real UDP socket for the shared endpoint,
-        // so this needs a runtime entered — hence `#[tokio::test]`.
-        let mut app = App::default();
-        assert_eq!(app.alloc_capture_id(), CaptureSourceId(0));
-        assert_eq!(app.alloc_capture_id(), CaptureSourceId(1));
+        // `AppState::default()` binds a real UDP socket for the shared
+        // endpoint, so this needs a runtime entered — hence `#[tokio::test]`.
+        let mut state = AppState::default();
+        assert_eq!(state.alloc_capture_id(), CaptureSourceId(0));
+        assert_eq!(state.alloc_capture_id(), CaptureSourceId(1));
         // Allocating a destination id must not disturb the capture counter,
         // and vice versa — they are separate spaces on purpose.
-        assert_eq!(app.alloc_destination_id(), DestinationId(0));
-        assert_eq!(app.alloc_capture_id(), CaptureSourceId(2));
-        assert_eq!(app.alloc_destination_id(), DestinationId(1));
+        assert_eq!(state.alloc_destination_id(), DestinationId(0));
+        assert_eq!(state.alloc_capture_id(), CaptureSourceId(2));
+        assert_eq!(state.alloc_destination_id(), DestinationId(1));
     }
 }
 
@@ -4594,7 +2481,13 @@ mod bandwidth_wiring_tests {
     //! setting_one_branchs_bitrate_writes_through_to_that_encoder_only`.
     //! Splitting it this way keeps the timing assertions deterministic (the
     //! controller takes an injected `Instant`, so nothing sleeps).
-    use super::*;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    use crate::bandwidth::{AllocInput, DestId, DestSpec};
+    use crate::session::{needs_reapply, BandwidthController, ALLOC_RECOMPUTE_INTERVAL};
+
+    use super::{DestinationId, MAX_BITRATE_KBPS};
 
     fn spec(id: u32, width: u32, height: u32, fps: u32) -> DestSpec {
         DestSpec { id: DestId(id), width, height, fps, floor_kbps: 500, ceiling_kbps: Some(MAX_BITRATE_KBPS) }
@@ -4605,8 +2498,8 @@ mod bandwidth_wiring_tests {
     }
 
     /// A stand-in for "what each destination's encoder is currently set to",
-    /// updated exactly the way `App::apply_bandwidth_allocation` updates the
-    /// real ones.
+    /// updated exactly the way `AppState::apply_bandwidth_allocation` updates
+    /// the real ones.
     #[derive(Default)]
     struct FakeEncoders {
         bitrates: HashMap<DestinationId, u32>,
@@ -4637,7 +2530,7 @@ mod bandwidth_wiring_tests {
         let input = input(20_000, vec![spec(1, 1920, 1080, 60), spec(2, 1280, 720, 30)]);
         encoders.apply(&mut controller, now, &input);
 
-        let expected = bandwidth::allocate(&input);
+        let expected = crate::bandwidth::allocate(&input);
         for (id, kbps) in &expected.per_destination {
             assert_eq!(
                 encoders.bitrates.get(&DestinationId(id.0)),
@@ -4829,9 +2722,12 @@ mod tests {
     //! for why it starves `drain_events` specifically rather than the whole
     //! `App::update()` call.
     use super::*;
+    use crate::decode::StreamDecoder;
     use crate::end_to_end_test::{connect_with_retry, pick_free_udp_port, spawn_relay_server};
-    use crate::net::format_join_string;
-    use crate::protocol::RoomId;
+    use crate::net::{format_join_string, ClientEvent};
+    use crate::protocol::{PresenceEvent, RoomId};
+    use crate::session::WatchEntry;
+    use indexmap::IndexMap;
     use std::time::{Duration, Instant};
 
     const TEST_STREAM_ID: StreamId = 1;
@@ -4884,15 +2780,16 @@ mod tests {
             .expect("start_sharing_from_test_source failed");
         let owner = client_a.conn_id();
 
-        // Stand the room up through the exact same `App::insert_room` call
-        // `poll_connect_result` uses in production, then wire up a watch on
-        // the sharer's stream the same way `toggle_watch` does — this is the
-        // real code under test, not a re-implementation of it.
-        let mut app = App { framerate: TEST_FPS, ..App::default() };
-        let room_handle = app.insert_room(client_b, snapshot_b, events_b, join_string.clone());
-        app.active_room = Some(room_handle);
+        // Stand the room up through the exact same `AppState::insert_room`
+        // call `poll_connect_result` uses in production, then wire up a watch
+        // on the sharer's stream the same way `toggle_watch` does — this is
+        // the real code under test, not a re-implementation of it.
+        let mut app = App::default();
+        app.state.framerate = TEST_FPS;
+        let room_handle = app.state.insert_room(client_b, snapshot_b, events_b, join_string.clone());
+        app.state.active_room = Some(room_handle);
         let decoder = StreamDecoder::new(TEST_STREAM_ID).expect("failed to build StreamDecoder");
-        app.rooms[&room_handle].watches.lock().unwrap().insert(
+        app.state.rooms[&room_handle].watches.lock().unwrap().insert(
             (owner, TEST_STREAM_ID),
             WatchEntry { decoder: Arc::new(Mutex::new(decoder)), texture: None, popout: None, audio_stream_id: None },
         );
@@ -4936,7 +2833,7 @@ mod tests {
                     NavTab::View => NavTab::Settings,
                     NavTab::Settings => NavTab::StreamControl,
                 };
-                let Some(room) = app.rooms.get_mut(&room_handle) else { return };
+                let Some(room) = app.state.rooms.get_mut(&room_handle) else { return };
                 let has_inline_watch = room.update_watch_textures(ctx);
                 if has_inline_watch {
                     polls_with_watch += 1;
@@ -4960,7 +2857,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        let observed_fps = app.rooms[&room_handle]
+        let observed_fps = app.state.rooms[&room_handle]
             .watches
             .lock()
             .unwrap()
@@ -4987,14 +2884,14 @@ mod tests {
         // The watch survived hundreds of tab switches, still subscribed and
         // still decoding — the nav really is a pure view-switcher.
         assert!(
-            app.rooms[&room_handle].watches.lock().unwrap().contains_key(&(owner, TEST_STREAM_ID)),
+            app.state.rooms[&room_handle].watches.lock().unwrap().contains_key(&(owner, TEST_STREAM_ID)),
             "the watch was torn down at some point during nav-tab switching"
         );
     }
 
     /// Regression test for the "fast-forward catch-up" bug (see
     /// `superdoc/brainstorm/ui-redesign-multiroom-streaming.md`,
-    /// "Performance/Rendering" round 2, and `spawn_media_ingestion_task`'s
+    /// "Performance/Rendering" round 2, and `session::spawn_media_ingestion_task`'s
     /// doc comment for the full root-cause writeup).
     ///
     /// # What this isolates, and why
@@ -5072,11 +2969,12 @@ mod tests {
         // spawned in production — using it here (not a hand-rolled
         // `RoomSession`) means this test exercises the real wiring, not a
         // re-implementation of it.
-        let mut app = App { framerate: TEST_FPS, ..App::default() };
-        let room_handle = app.insert_room(client_b, snapshot_b, events_b, join_string.clone());
-        app.active_room = Some(room_handle);
+        let mut app = App::default();
+        app.state.framerate = TEST_FPS;
+        let room_handle = app.state.insert_room(client_b, snapshot_b, events_b, join_string.clone());
+        app.state.active_room = Some(room_handle);
         let decoder = StreamDecoder::new(TEST_STREAM_ID).expect("failed to build StreamDecoder");
-        app.rooms[&room_handle].watches.lock().unwrap().insert(
+        app.state.rooms[&room_handle].watches.lock().unwrap().insert(
             (owner, TEST_STREAM_ID),
             WatchEntry { decoder: Arc::new(Mutex::new(decoder)), texture: None, popout: None, audio_stream_id: None },
         );
@@ -5100,7 +2998,7 @@ mod tests {
                 // Deliberately *not* calling `app.drain_events(ctx)` here —
                 // see this test's doc comment. Only decoded-output polling
                 // happens in this loop.
-                let Some(room) = app.rooms.get_mut(&room_handle) else { return };
+                let Some(room) = app.state.rooms.get_mut(&room_handle) else { return };
                 let has_inline_watch = room.update_watch_textures(ctx);
                 if has_inline_watch {
                     polls_with_watch += 1;
@@ -5114,7 +3012,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        let observed_fps = app.rooms[&room_handle]
+        let observed_fps = app.state.rooms[&room_handle]
             .watches
             .lock()
             .unwrap()
@@ -5201,7 +3099,7 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| panic!("{name} failed to connect: {e:#}"));
             clients.push(client.clone());
-            handles.push(app.insert_room(client, snapshot, events, join_string));
+            handles.push(app.state.insert_room(client, snapshot, events, join_string));
         }
         let (room_a, room_b, room_c) = (handles[0], handles[1], handles[2]);
 
@@ -5210,11 +3108,11 @@ mod tests {
         // `start_video_share` would go through the interactive portal, which
         // no unattended test can drive — hence the same `TestSource` seam
         // `end_to_end_test` uses.)
-        let capture_id = app.alloc_capture_id();
-        let destination_a = app.alloc_destination_id();
+        let capture_id = app.state.alloc_capture_id();
+        let destination_a = app.state.alloc_destination_id();
         assert_eq!(destination_a, DestinationId(0), "the test source's DestKey(0) must match the first destination id");
         let stream_id = {
-            let room = app.rooms.get_mut(&room_a).expect("room A");
+            let room = app.state.rooms.get_mut(&room_a).expect("room A");
             let stream_id = room.next_stream_id;
             room.next_stream_id += 1;
             room.destinations.push(destination_a);
@@ -5227,7 +3125,7 @@ mod tests {
             .expect("start_sharing_from_test_source failed");
         let runtime = capture_handle.destination_runtime(DestKey(destination_a.0));
         let params = runtime.as_ref().expect("the first destination must exist").lock().unwrap().params();
-        app.captures.insert(
+        app.state.captures.insert(
             capture_id,
             LocalCapture {
                 kind: StreamKind::Video,
@@ -5251,11 +3149,11 @@ mod tests {
 
         // --- Fan-out: the same capture into room B as a second stream. ---
         eprintln!("[stream-control] fanning out into room B");
-        app.add_destination(capture_id, room_b, PendingRole::FanOut);
-        wait_for(&mut app, Duration::from_secs(20), |app| app.pending_destinations.is_empty()).await;
-        assert!(app.share_error.is_none(), "fan-out reported an error: {:?}", app.share_error);
+        app.state.add_destination(capture_id, room_b, PendingRole::FanOut);
+        wait_for(&mut app, Duration::from_secs(20), |app| app.state.pending_destinations.is_empty()).await;
+        assert!(app.state.share_error.is_none(), "fan-out reported an error: {:?}", app.state.share_error);
         {
-            let capture = app.captures.get(&capture_id).expect("capture must still exist");
+            let capture = app.state.captures.get(&capture_id).expect("capture must still exist");
             assert_eq!(capture.destinations.len(), 2, "fan-out must add a second destination to the same capture");
             let rooms: HashSet<RoomHandle> = capture.destinations.values().map(|d| d.room).collect();
             assert_eq!(rooms, HashSet::from([room_a, room_b]), "the two destinations must be in different rooms");
@@ -5267,7 +3165,7 @@ mod tests {
         // encode branch producing IDRs, which is what makes fan-out two real
         // encoded streams rather than one stream claimed twice.
         wait_for(&mut app, Duration::from_secs(20), |app| {
-            app.captures[&capture_id]
+            app.state.captures[&capture_id]
                 .destinations
                 .values()
                 .all(|d| d.state() == capture::destination::DestinationState::Live)
@@ -5276,44 +3174,44 @@ mod tests {
 
         // --- Absolute-Maximum bandwidth over both destinations. ---
         eprintln!("[stream-control] switching to Absolute Maximum");
-        app.absolute_total_kbps = 6_000;
-        app.destination_floor_kbps = 500;
-        app.set_bandwidth_mode(BandwidthMode::Absolute);
-        app.apply_bandwidth_allocation();
-        let applied: Vec<u32> = app.captures[&capture_id]
+        app.state.absolute_total_kbps = 6_000;
+        app.state.destination_floor_kbps = 500;
+        app.state.set_bandwidth_mode(BandwidthMode::Absolute);
+        app.state.apply_bandwidth_allocation();
+        let applied: Vec<u32> = app.state.captures[&capture_id]
             .destinations
             .keys()
-            .map(|id| app.bandwidth.applied_kbps(*id).unwrap_or_else(|| panic!("{id:?} got no allocation")))
+            .map(|id| app.state.bandwidth.applied_kbps(*id).unwrap_or_else(|| panic!("{id:?} got no allocation")))
             .collect();
         assert_eq!(applied.iter().sum::<u32>(), 6_000, "the whole per-client budget should be assigned: {applied:?}");
-        let allocation = app.bandwidth.allocation().expect("an allocation must have been recorded");
+        let allocation = app.state.bandwidth.allocation().expect("an allocation must have been recorded");
         assert_eq!(allocation.overshoot_kbps, 0, "6000 kbps comfortably covers two 500 kbps floors");
 
         // A second immediate call must be rate-limited away entirely.
-        let before = app.bandwidth.applied_kbps(destination_a);
-        app.absolute_total_kbps = 40_000;
-        app.apply_bandwidth_allocation();
+        let before = app.state.bandwidth.applied_kbps(destination_a);
+        app.state.absolute_total_kbps = 40_000;
+        app.state.apply_bandwidth_allocation();
         assert_eq!(
-            app.bandwidth.applied_kbps(destination_a),
+            app.state.bandwidth.applied_kbps(destination_a),
             before,
             "a recompute inside the rate-limit window must not reach the encoders"
         );
 
         // --- Transfer room B's destination to room C, make-before-break. ---
         eprintln!("[stream-control] transferring room B's destination to room C");
-        let destination_b = *app.captures[&capture_id]
+        let destination_b = *app.state.captures[&capture_id]
             .destinations
             .iter()
             .find(|(_, d)| d.room == room_b)
             .map(|(id, _)| id)
             .expect("room B destination");
-        app.transfer_destination(destination_b, room_c);
+        app.state.transfer_destination(destination_b, room_c);
         // While it's in flight the *old* destination is still there and still
         // marked as the transfer's source — that is the "make" half being
         // visible rather than a silent swap.
         assert!(
             matches!(
-                app.captures[&capture_id].destinations[&destination_b].pending,
+                app.state.captures[&capture_id].destinations[&destination_b].pending,
                 Some(PendingRole::TransferSource(room)) if room == room_c
             ),
             "the source destination should be marked mid-transfer"
@@ -5323,10 +3221,10 @@ mod tests {
         // runtime yet).
         render_stream_control(&mut app);
 
-        wait_for(&mut app, Duration::from_secs(20), |app| app.pending_destinations.is_empty()).await;
-        assert!(app.share_error.is_none(), "transfer reported an error: {:?}", app.share_error);
+        wait_for(&mut app, Duration::from_secs(20), |app| app.state.pending_destinations.is_empty()).await;
+        assert!(app.state.share_error.is_none(), "transfer reported an error: {:?}", app.state.share_error);
         {
-            let capture = app.captures.get(&capture_id).expect("capture must survive a transfer");
+            let capture = app.state.captures.get(&capture_id).expect("capture must survive a transfer");
             let rooms: HashSet<RoomHandle> = capture.destinations.values().map(|d| d.room).collect();
             assert_eq!(
                 rooms,
@@ -5342,18 +3240,18 @@ mod tests {
         // Room A's destination — the one nobody touched — must have kept
         // streaming across both the fan-out and the transfer.
         assert_eq!(
-            app.captures[&capture_id].destinations[&destination_a].state(),
+            app.state.captures[&capture_id].destinations[&destination_a].state(),
             capture::destination::DestinationState::Live,
             "an unrelated destination of the same capture must be untouched by fan-out/transfer"
         );
 
         // --- The tab's real layout code, over the settled state. ---
         render_stream_control(&mut app);
-        app.set_bandwidth_mode(BandwidthMode::PerStream);
+        app.state.set_bandwidth_mode(BandwidthMode::PerStream);
         render_stream_control(&mut app);
 
         eprintln!("[stream-control] tearing down");
-        app.stop_all_captures_fire_and_forget();
+        app.state.stop_all_captures_fire_and_forget();
         tokio::time::sleep(Duration::from_secs(1)).await;
         let _ = std::fs::remove_dir_all(&config_home);
     }
@@ -5365,9 +3263,9 @@ mod tests {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             app.drain_events(&ctx);
-            app.poll_capture_states();
-            app.poll_pending_destinations();
-            app.poll_destination_edits();
+            app.state.poll_capture_states();
+            app.state.poll_pending_destinations();
+            app.state.poll_destination_edits();
             if done(app) {
                 return;
             }
@@ -5394,7 +3292,7 @@ mod tests {
     /// `end_to_end_test`'s same wait, just against `RoomSession::event_rx`
     /// directly instead of a bare receiver.
     async fn room_client_b_subscribe(app: &mut App, room_handle: RoomHandle, owner: ConnId) {
-        let connected = app.rooms.get_mut(&room_handle).expect("room must be present");
+        let connected = app.state.rooms.get_mut(&room_handle).expect("room must be present");
         let saw_stream_started = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 match connected.event_rx.recv().await {
