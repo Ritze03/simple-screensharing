@@ -149,10 +149,37 @@ impl PresentationMode {
     }
 }
 
-/// Minimal app-wide settings: UI language and the render presentation mode.
-/// Kept in its own small TOML file alongside `rooms.toml` rather than folded
-/// into `RoomStore` — neither is a saved room, and this keeps each file's
-/// schema focused.
+/// How the Stream Control tab decides each outgoing destination's bitrate.
+/// The two modes the plan doc names (`superdoc/brainstorm/
+/// ui-redesign-multiroom-streaming.md`, round-2 Q6).
+///
+/// `Why` these are two modes rather than one number with a checkbox: they
+/// answer different questions. "Per-Stream Maximum" answers *how good should
+/// this one stream be* (the user sets each destination's rate by hand, and
+/// starting another stream doesn't change any existing one). "Absolute
+/// Maximum" answers *how much of my uplink may this app ever use in total*
+/// — one per-client aggregate across every destination in every room, so
+/// starting another stream anywhere shrinks every other destination's share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum BandwidthMode {
+    /// The user sets a bitrate per destination; nothing is shared or
+    /// re-divided. Default: it is the behaviour that surprises nobody, and
+    /// it's what a user who never opens the bandwidth card gets.
+    #[default]
+    PerStream,
+    /// The user sets one total; `bandwidth::allocate` divides it across every
+    /// active destination by `width*height*fps` weight.
+    Absolute,
+}
+
+/// Minimal app-wide settings: UI language, the render presentation mode, and
+/// the Stream Control bandwidth preferences. Kept in its own small TOML file
+/// alongside `rooms.toml` rather than folded into `RoomStore` — none of it is
+/// a saved room, and this keeps each file's schema focused.
+///
+/// Preferences only, never session state: no active stream, watch, room
+/// connection or per-destination manual bitrate is persisted (plan doc,
+/// round-1 Q9 — every launch starts fresh).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppSettings {
     #[serde(default = "AppSettings::default_language")]
@@ -162,17 +189,58 @@ pub struct AppSettings {
     /// See `superdoc/features/presentation-modes.md`.
     #[serde(default)]
     pub presentation_mode: PresentationMode,
+    /// Which bandwidth mode the Stream Control tab is in.
+    #[serde(default)]
+    pub bandwidth_mode: BandwidthMode,
+    /// Absolute-Maximum mode's single per-client total, in kbit/s.
+    ///
+    /// `Why` this is stored independently of any per-destination rate, and
+    /// why both survive a mode switch: the two modes' numbers mean different
+    /// things (a total vs. one stream's rate), so folding them into one field
+    /// would silently destroy whichever the user isn't currently looking at.
+    /// Toggling modes back and forth must be lossless.
+    #[serde(default = "AppSettings::default_absolute_total_kbps")]
+    pub absolute_total_kbps: u32,
+    /// Absolute-Maximum mode's guaranteed floor *per destination*, in kbit/s
+    /// (plan doc, round-2 Q7: "full guaranteed floor per destination").
+    /// Feeds `bandwidth::DestSpec::floor_kbps`; when the floors don't all fit
+    /// the total, `allocate` overshoots and reports it rather than starving
+    /// anyone (round-1 Q8).
+    #[serde(default = "AppSettings::default_destination_floor_kbps")]
+    pub destination_floor_kbps: u32,
 }
 
 impl Default for AppSettings {
     fn default() -> Self {
-        Self { language: Self::default_language(), presentation_mode: PresentationMode::default() }
+        Self {
+            language: Self::default_language(),
+            presentation_mode: PresentationMode::default(),
+            bandwidth_mode: BandwidthMode::default(),
+            absolute_total_kbps: Self::default_absolute_total_kbps(),
+            destination_floor_kbps: Self::default_destination_floor_kbps(),
+        }
     }
 }
 
 impl AppSettings {
     fn default_language() -> String {
         "en".to_string()
+    }
+
+    /// 20 Mbit/s: comfortably above a single good 1080p stream's ~8 Mbit/s
+    /// default (so switching to Absolute mode with one stream running doesn't
+    /// immediately throttle it) and comfortably below the project's 40 Mbit/s
+    /// per-stream ceiling, so the mode has visible room to divide.
+    fn default_absolute_total_kbps() -> u32 {
+        20_000
+    }
+
+    /// 500 kbit/s: low enough that a handful of destinations can all be
+    /// guaranteed their floor out of a modest total without overshooting, high
+    /// enough that a destination clamped to it is still watchable rather than
+    /// a slideshow.
+    fn default_destination_floor_kbps() -> u32 {
+        500
     }
 
     /// `$XDG_CONFIG_HOME/simple-screensharing/settings.toml` (or the
@@ -255,12 +323,45 @@ mod tests {
 
     #[test]
     fn app_settings_toml_round_trip() {
-        let settings =
-            AppSettings { language: "de".to_string(), presentation_mode: PresentationMode::Mailbox };
+        let settings = AppSettings {
+            language: "de".to_string(),
+            presentation_mode: PresentationMode::Mailbox,
+            bandwidth_mode: BandwidthMode::Absolute,
+            absolute_total_kbps: 12_345,
+            destination_floor_kbps: 750,
+        };
         let toml_str = toml::to_string_pretty(&settings).unwrap();
         let parsed: AppSettings = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.language, "de");
         assert_eq!(parsed.presentation_mode, PresentationMode::Mailbox);
+        assert_eq!(parsed.bandwidth_mode, BandwidthMode::Absolute);
+        assert_eq!(parsed.absolute_total_kbps, 12_345);
+        assert_eq!(parsed.destination_floor_kbps, 750);
+    }
+
+    /// Both modes' numbers are independent fields, so a settings file written
+    /// while in one mode still carries the other's value — switching modes can
+    /// never destroy what the other mode was configured with.
+    #[test]
+    fn both_bandwidth_modes_values_survive_a_round_trip_together() {
+        let settings = AppSettings {
+            bandwidth_mode: BandwidthMode::PerStream,
+            absolute_total_kbps: 33_000,
+            ..AppSettings::default()
+        };
+        let parsed: AppSettings = toml::from_str(&toml::to_string_pretty(&settings).unwrap()).unwrap();
+        assert_eq!(parsed.bandwidth_mode, BandwidthMode::PerStream);
+        assert_eq!(parsed.absolute_total_kbps, 33_000, "the Absolute total must survive being saved in Per-Stream mode");
+    }
+
+    /// A settings file written before the bandwidth fields existed must still
+    /// parse, defaulting them rather than failing to load.
+    #[test]
+    fn app_settings_missing_bandwidth_fields_default() {
+        let parsed: AppSettings = toml::from_str("language = \"en\"\n").unwrap();
+        assert_eq!(parsed.bandwidth_mode, BandwidthMode::PerStream);
+        assert_eq!(parsed.absolute_total_kbps, AppSettings::default_absolute_total_kbps());
+        assert_eq!(parsed.destination_floor_kbps, AppSettings::default_destination_floor_kbps());
     }
 
     /// A settings file written before this field existed (just `language =
