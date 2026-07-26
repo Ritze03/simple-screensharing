@@ -205,7 +205,13 @@ input {
   color: var(--text-faint);
 }
 
-.room-reconnect-btn {
+/* `.btn`'s own `padding` (below) has the same specificity as this rule's and
+   is declared later in this file, so without the extra `.btn` qualifier here
+   it would win the cascade and silently restore the 6px vertical padding
+   `.room-reconnect-btn` is trying to shrink to 2px — leaving only 8px of
+   content box for an 11px line inside the explicit 22px height, which read
+   as the button's text not being vertically centered. */
+.btn.room-reconnect-btn {
   padding: 2px 10px;
   height: 22px;
   font-size: 11px;
@@ -450,6 +456,9 @@ input {
  * ----------------------------------------------------------------- */
 
 .btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border-radius: var(--rounding);
   border: 1px solid transparent;
   padding: 6px 14px;
