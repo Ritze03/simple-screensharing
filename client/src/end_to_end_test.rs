@@ -498,12 +498,12 @@ async fn resubscribe_after_pause_resumes_encoder_and_frames_flow() {
         match events_a.recv().await {
             Some(ClientEvent::SubscriberCount { stream_id, count }) if stream_id == VIDEO_STREAM_ID => {
                 eprintln!("[e2e-resub] t={:?} client A got SubscriberCount({count})", start.elapsed());
-                capture_handle.notify_subscriber_count(count);
+                capture_handle.notify_subscriber_count(capture::DestKey(0), count);
                 true
             }
             Some(ClientEvent::KeyframeRequest { stream_id }) if stream_id == VIDEO_STREAM_ID => {
                 eprintln!("[e2e-resub] t={:?} client A got KeyframeRequest", start.elapsed());
-                capture_handle.notify_keyframe_request();
+                capture_handle.notify_keyframe_request(capture::DestKey(0));
                 true
             }
             Some(_) => true,
@@ -578,12 +578,12 @@ async fn resubscribe_after_pause_resumes_encoder_and_frames_flow() {
             match events_a.recv().await {
                 Some(ClientEvent::SubscriberCount { stream_id, count: 0 }) if stream_id == VIDEO_STREAM_ID => {
                     eprintln!("[e2e-resub] t={:?} client A got SubscriberCount(0)", start.elapsed());
-                    capture_handle.notify_subscriber_count(0);
+                    capture_handle.notify_subscriber_count(capture::DestKey(0), 0);
                     return true;
                 }
                 Some(ClientEvent::SubscriberCount { stream_id, count }) if stream_id == VIDEO_STREAM_ID => {
                     eprintln!("[e2e-resub] t={:?} client A got unexpected SubscriberCount({count}) while waiting for 0", start.elapsed());
-                    capture_handle.notify_subscriber_count(count);
+                    capture_handle.notify_subscriber_count(capture::DestKey(0), count);
                 }
                 Some(_) => {}
                 None => return false,
@@ -779,12 +779,12 @@ async fn repeated_pause_resume_cycles_keep_resuming() {
         match events_a.recv().await {
             Some(ClientEvent::SubscriberCount { stream_id, count }) if stream_id == VIDEO_STREAM_ID => {
                 eprintln!("[e2e-cycles][{tag}] t={:?} client A got SubscriberCount({count})", start.elapsed());
-                capture_handle.notify_subscriber_count(count);
+                capture_handle.notify_subscriber_count(capture::DestKey(0), count);
                 true
             }
             Some(ClientEvent::KeyframeRequest { stream_id }) if stream_id == VIDEO_STREAM_ID => {
                 eprintln!("[e2e-cycles][{tag}] t={:?} client A got KeyframeRequest", start.elapsed());
-                capture_handle.notify_keyframe_request();
+                capture_handle.notify_keyframe_request(capture::DestKey(0));
                 true
             }
             Some(_) => true,
@@ -852,11 +852,11 @@ async fn repeated_pause_resume_cycles_keep_resuming() {
             loop {
                 match events_a.recv().await {
                     Some(ClientEvent::SubscriberCount { stream_id, count: 0 }) if stream_id == VIDEO_STREAM_ID => {
-                        capture_handle.notify_subscriber_count(0);
+                        capture_handle.notify_subscriber_count(capture::DestKey(0), 0);
                         return true;
                     }
                     Some(ClientEvent::SubscriberCount { stream_id, count }) if stream_id == VIDEO_STREAM_ID => {
-                        capture_handle.notify_subscriber_count(count);
+                        capture_handle.notify_subscriber_count(capture::DestKey(0), count);
                     }
                     Some(_) => {}
                     None => return false,

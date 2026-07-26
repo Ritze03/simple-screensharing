@@ -6,25 +6,47 @@
 //! # Pipeline
 //!
 //! ```text
-//! <platform source> ! videoconvert ! tee name=t
-//!   t. ! queue ! valve name=encoder_valve drop=false drop-mode=forward-sticky-events
-//!      ! videorate drop-only=false max-duplication-time=0 ! video/x-raw,format=I420,framerate=<fps>/1
-//!      ! x264enc tune=zerolatency bitrate=<kbps> key-int-max=<gop> speed-preset=ultrafast
-//!      ! video/x-h264,stream-format=byte-stream,alignment=au
-//!      ! appsink name=sink
+//! <platform source> ! videoconvert
+//!   ! videorate drop-only=false max-duplication-time=0
+//!   ! capsfilter name=source_caps caps=video/x-raw,framerate=<shared fps>/1
+//!   ! tee name=t
 //!   t. ! queue leaky=downstream max-size-buffers=1 ! videorate ! video/x-raw,framerate=1/1
 //!      ! videoconvert ! video/x-raw,format=RGB
 //!      ! appsink name=preview_sink
 //!   t. ! queue leaky=downstream max-size-buffers=1 ! videorate ! video/x-raw,framerate=12/1
 //!      ! videoconvert ! video/x-raw,format=RGB
 //!      ! appsink name=self_preview_sink
+//!   (+ one dynamically added branch per destination — see below)
 //! ```
 //!
-//! The `valve` gates only the encoder branch: `pump_loop` toggles its
-//! `drop` property in response to `ClientEvent::SubscriberCount` (pausing
-//! at 0 subscribers, resuming — with a forced keyframe — on the next
-//! subscriber) without touching the preview `tee` branch or the pipeline's
-//! `Playing` state. See [`CaptureControlEvent`]/[`force_keyframe`].
+//! Those two branches are the pipeline's only *fixed* ones. **There is no
+//! fixed encoder branch**: every outgoing destination — including the first
+//! — is a dynamic branch added to the same `tee` at runtime by
+//! [`branch::add_branch`]:
+//!
+//! ```text
+//!   t. ! queue leaky=downstream ! valve drop-mode=forward-sticky-events
+//!      ! videoconvert ! videoscale ! videorate
+//!      ! video/x-raw,format=<backend's>,width=..,height=..,framerate=<this destination's>/1
+//!      ! <x264enc|vah264enc> bitrate=<this destination's> key-int-max=<gop>
+//!      ! video/x-h264,stream-format=byte-stream,alignment=au
+//!      ! appsink
+//! ```
+//!
+//! so one capture feeds N rooms as N independently encoded and independently
+//! encrypted streams (a room key can never be shared across rooms), each with
+//! its own [`DestinationHandle`], its own [`destination_pump`] task, and its
+//! own pause `valve` — subscriber counts are per stream, so a destination
+//! nobody is watching pauses its own encoder (see [`DestCmd`]) without
+//! touching any sibling destination of the same capture. See
+//! `superdoc/features/stream-control.md`.
+//!
+//! `source_caps` is the *shared* rate every branch downstream of the tee is
+//! fed at; a branch can down-convert from it freely but nothing can conjure
+//! frames the source never produced, which is exactly why raising a
+//! destination above it is the plan doc's tier-3 change
+//! ([`CaptureHandle::set_source_framerate`]) while going below it is a cheap
+//! tier-2 branch swap.
 //!
 //! `<platform source>` is [`CaptureSource::launch_fragment`]:
 //! `pipewiresrc fd=<fd> path=<node_id> do-timestamp=true keepalive-time=<ms>`
@@ -134,14 +156,14 @@
 //! GStreamer types and no clock of its own, so all of it is unit-testable
 //! against injected `Instant`s.
 //!
-//! The two halves are joined by [`branch::swap_to_new_branch`] (tier 2),
-//! [`branch::stall_all`] and [`branch::rebuild_after_source_restart`]
-//! (tier 3). [`start_sharing`] already creates one
-//! [`destination::DestinationRuntime`] and [`pump_loop`] drives it for real
-//! (wire PTS, IDR caching, first-IDR `Starting` → `Live`, the stall
-//! keepalive); what a later stage still owns is replacing this pipeline's
-//! single *fixed* encoder branch with one dynamic branch per destination, so
-//! one [`CaptureHandle`] carries N of them.
+//! The two halves are joined by [`branch::swap_to_new_branch`] (tier 2) and
+//! [`branch::stall_all`] + [`CaptureHandle::set_source_framerate`] (tier 3),
+//! and every user-driven settings change is routed through
+//! [`CaptureHandle::change_destination`], which classifies it rather than
+//! letting a call site assume a tier. Each destination owns a
+//! [`destination::DestinationRuntime`] that its [`destination_pump`] drives
+//! for real: wire PTS, IDR caching, first-IDR `Starting` → `Live`, and the
+//! stall keepalive.
 //!
 //! See `superdoc/architecture/overview.md`'s "Per-destination lifecycle"
 //! section for the full model.
@@ -626,160 +648,128 @@ const SELF_PREVIEW_BRANCH_FRAMERATE: u32 = 12;
 /// existing JPEG-thumbnail branch.
 const SELF_PREVIEW_SINK_NAME: &str = "self_preview_sink";
 
-/// Name of the `valve` element gating the encoder branch (between the
-/// tee's `queue` and the raw-format capsfilter feeding the encoder) — see
-/// [`build_pipeline`]. Toggled via its `drop` property by [`pump_loop`] in
-/// response to `ClientEvent::SubscriberCount { count: 0, .. }`/`> 0`, so a
-/// stream can stop encoding (and burning CPU/bandwidth) while it has no
-/// subscribers without touching the preview tee branch or the pipeline's
-/// `Playing` state.
-const ENCODER_VALVE_NAME: &str = "encoder_valve";
-
-/// `max-size-buffers` for the encoder branch's `queue leaky=downstream`
-/// right after the tee (see [`build_pipeline`]'s doc comment on that queue
-/// for the full "why" — briefly: without a small bounded/leaky config here,
-/// a real capture source's incoming raw-frame rate spiking under motion can
-/// outpace the encoder and this queue's own defaults, blocking the whole
+/// `max-size-buffers` for each encode branch's `queue leaky=downstream`
+/// right after the tee (see [`branch::add_branch`]'s doc comment for the
+/// full "why" — briefly: without a small bounded/leaky config there, a real
+/// capture source's incoming raw-frame rate spiking under motion can
+/// outpace the encoder and the queue's own defaults, blocking the whole
 /// pipeline solid rather than dropping raw frames). A couple of frames'
 /// worth of slack (unlike the preview branch's `max-size-buffers=1`, which
 /// only ever needs the single newest frame) smooths brief scheduling jitter
 /// without ever letting a real backlog accumulate.
 const ENCODER_QUEUE_MAX_BUFFERS: u32 = 2;
 
-/// Builds and links (but does not start) the capture/encode pipeline
-/// described in this module's doc comment, returning the pipeline, its
-/// encoded-output `appsink`, the preview branch's raw-RGB `appsink`, the
-/// self-preview branch's raw-RGB `appsink` (see [`SELF_PREVIEW_SINK_NAME`]),
-/// and the encoder branch's gating `valve` (see [`ENCODER_VALVE_NAME`]).
+/// Element name of the `tee` every branch — fixed (preview/self-preview) and
+/// dynamic (one per destination, see [`branch`]) — hangs off.
+const TEE_NAME: &str = "t";
+
+/// Element name of the capsfilter that fixes the *shared source rate* every
+/// branch downstream of the tee sees (see [`build_pipeline`]). Named because
+/// it is rewritten live by [`CaptureHandle::set_source_framerate`] — the
+/// plan doc's tier-3 change.
+const SOURCE_CAPS_NAME: &str = "source_caps";
+
+/// Everything [`build_pipeline`] hands back: the pipeline itself plus the
+/// three elements a running capture keeps talking to.
+struct CapturePipeline {
+    pipeline: gst::Pipeline,
+    /// Where every encode branch is added ([`branch::add_branch`]).
+    tee: gst::Element,
+    /// See [`SOURCE_CAPS_NAME`].
+    source_caps: gst::Element,
+    /// ~1fps RGB branch feeding [`preview::spawn_preview_task`].
+    preview_sink: gst_app::AppSink,
+    /// [`SELF_PREVIEW_BRANCH_FRAMERATE`] RGB branch feeding the sender-side
+    /// self-preview (see [`CaptureHandle::self_preview_frame`]).
+    self_preview_sink: gst_app::AppSink,
+}
+
+/// Builds and links (but does not start) the capture pipeline described in
+/// this module's doc comment: source → `videoconvert` → shared-rate
+/// capsfilter → `tee`, plus the two *fixed* preview branches. It builds **no
+/// encoder at all** — every encoder in this pipeline belongs to a
+/// destination and is added dynamically by [`branch::add_branch`].
+///
+/// `Why no fixed encoder branch:` a capture can feed N rooms, each with its
+/// own resolution/framerate/bitrate/encoder-backend, its own room key, and
+/// its own `stream_id`. A statically-built branch could only ever serve one
+/// of them, so a second, structurally different code path would be needed
+/// for every other destination — and every operation the plan doc defines
+/// (per-destination settings changes, transfer, fan-out, per-branch VAAPI
+/// fallback) would then have to be implemented twice, with the fixed branch's
+/// version unable to use the branch-swap primitive at all (you cannot swap
+/// out an element `gst::parse::launch` welded into the pipeline). With every
+/// destination dynamic, there is exactly one path, and the *first*
+/// destination is not special in any way.
+///
 /// `source_fragment` is [`CaptureSource::launch_fragment`]'s output — the
 /// only platform-specific piece of the description below.
-fn build_pipeline(
-    source_fragment: &str,
-    bitrate_kbps: u32,
-    framerate: u32,
-    backend: EncoderBackend,
-) -> Result<(gst::Pipeline, gst_app::AppSink, gst_app::AppSink, gst_app::AppSink, gst::Element)> {
+fn build_pipeline(source_fragment: &str, framerate: u32) -> Result<CapturePipeline> {
     // Defensive clamp — see [`MAX_FRAMERATE`]'s doc comment. `ui.rs`'s
     // dropdown only ever offers values already inside this range, so this
-    // is a backstop against a 0/absurd value reaching `key-int-max`, not the
+    // is a backstop against a 0/absurd value reaching the caps, not the
     // primary validation.
     let framerate = framerate.clamp(MIN_FRAMERATE, MAX_FRAMERATE);
-    let gop_frames = GOP_SECONDS * framerate;
-    let encoder = backend.launch_fragment(bitrate_kbps, gop_frames);
-    let raw_format = backend.raw_format();
 
-    // `drop-mode=forward-sticky-events` (rather than the element's default
-    // `drop-all`) is load-bearing, not cosmetic: GstValve's default mode
-    // drops *events*, not just buffers, while `drop=true` — and per
-    // `gst/gstevent.h`, `GST_EVENT_EOS` carries the `STICKY` flag, so a
-    // closed valve under the default mode silently swallows EOS too.
-    // `CaptureHandle::stop()` sends a real EOS event to drain the pipeline
-    // cleanly (see its doc comment), and `pump_loop`'s `appsink_stream` only
-    // ever yields its terminal `None` once that EOS actually reaches the
-    // appsink — so stopping a stream while its encoder happens to be paused
-    // (0 subscribers) would hang `stop()` for its full 5s timeout,
-    // discovered live via this module's own multi-cycle integration test
-    // (`end_to_end_test::repeated_pause_resume_cycles_keep_resuming`, which
-    // left the encoder paused at the end of its last cycle before tearing
-    // down). `forward-sticky-events` still drops ordinary (non-sticky)
-    // buffers exactly as before — that's the whole point of the valve — but
-    // lets EOS (and caps/segment, though those don't change mid-stream here)
-    // through regardless of `drop`.
-    // `queue leaky=downstream max-size-buffers={ENCODER_QUEUE_MAX_BUFFERS}`
-    // right after the tee is load-bearing, not cosmetic, and fixes a
-    // distinct bug from the `videorate` cap below: a plain `queue` (as this
-    // was before) defaults to `leaky=no` with `max-size-bytes=10485760`
-    // (10MB) — at even 1080p NV12 (~3.1MB/raw frame) that default byte cap
-    // holds only ~3 raw frames (at 4K NV12, ~12.4MB/frame, a *single*
-    // buffered frame already exceeds it), so the instant the downstream
-    // chain (`videorate`+`{encoder}`, sharing this one streaming thread)
-    // falls even slightly behind the raw capture rate — which spikes well
-    // above the configured `framerate` under real sustained motion, per the
-    // `videorate` doc comment below — this queue fills within a fraction of
-    // a second and, being non-leaky, *blocks* rather than drops. That block
-    // propagates upstream through the tee to `videoconvert` and the real
-    // capture source itself: on a real portal `pipewiresrc` (push-driven by
-    // the compositor against a small fixed PipeWire buffer pool, unlike a
-    // self-paced `videotestsrc`), a permanently blocked downstream means our
-    // side stops returning buffers to the pool, which stalls the
-    // compositor's own frame delivery once that pool is exhausted — a real
-    // freeze, not graceful degradation. This is exactly the live-reported
-    // "works for a few seconds under light motion, then freezes solid under
-    // sustained heavy motion" symptom, and matches this project's own
-    // established real-time policy everywhere else in this same pipeline
-    // (the preview branch's own `queue leaky=downstream max-size-buffers=1`
-    // a few lines down; both appsinks' `drop=true`): prefer dropping a raw
-    // frame over blocking. `max-size-buffers={ENCODER_QUEUE_MAX_BUFFERS}`
-    // (rather than the preview branch's 1) keeps a little slack to smooth
-    // over brief scheduling jitter without blocking, while still being far
-    // below the default's multi-second worst case.
-    // `videorate ! video/x-raw,...,framerate={framerate}/1` on the encoder
-    // branch (mirroring the preview branch's own `videorate` a few lines
-    // down) is load-bearing, not cosmetic: `<platform source>` (portal
-    // `pipewiresrc`/Windows `d3d11screencapturesrc`) delivers frames at
-    // whatever variable, content-driven rate the compositor/OS pushes them —
-    // observed live ranging from ~1fps on an idle desktop up to the
-    // monitor's full refresh rate (100+ fps) under continuous motion, with
-    // nothing upstream constraining it to the user's chosen `framerate`.
-    // Every encoder property that assumes a nominal fps
-    // (`key-int-max={gop_frames}` for the spec's 2s GOP, and — critically —
-    // `bitrate={bitrate_kbps}` itself, since both `x264enc` and `vah264enc`
-    // allocate their per-frame bit budget by dividing the target bitrate
-    // across the negotiated caps' framerate) silently breaks without this:
-    // fed at, say, 100fps instead of the configured 30, the encoder divides
-    // the same kbit/s budget across >3x as many frames, so each frame gets a
-    // fraction of its intended allocation. Live-measured without this cap:
-    // every delta frame landed at exactly the same ~222 bytes regardless of
-    // real on-screen motion (mouse movement, window content changes) or the
-    // configured bitrate (8000 kbps) — the classic signature of a starved
-    // rate controller dividing a fixed budget across far more frames than
-    // intended, not an actual per-frame bitrate/unit bug (`gst-inspect-1.0`
-    // confirms both backends' `bitrate` properties are already correctly in
-    // kbit/s). This also fixes the GOP interval: `key-int-max={gop_frames}`
-    // assumes the same `framerate` value passed in here (scaled by
-    // `GOP_SECONDS`, so the ~2-second keyframe interval holds regardless of
-    // which framerate the user picks), which was previously only true by
-    // accident whenever the source happened to deliver exactly the
-    // hardcoded 30fps.
+    // `videorate drop-only=false max-duplication-time=0 !
+    // video/x-raw,framerate={framerate}/1` *before* the tee is load-bearing,
+    // not cosmetic — it is the shared source rate every branch downstream
+    // sees, and it is where the "fully static framerate, always the selected
+    // one" guarantee is enforced for the whole capture at once.
     //
-    // `drop-only=false max-duplication-time=0` on that same `videorate` are
-    // spelled out explicitly (rather than left at their already-matching
-    // defaults — see `gst-inspect-1.0 videorate`) because they're the other
-    // load-bearing half of "fully static framerate, always the selected
-    // one": `drop-only=false` is what lets `videorate` duplicate the last
-    // frame to *fill up to* `framerate`, not just drop excess frames down to
-    // it; `max-duplication-time=0` disables the cap on how large a gap it
-    // will still fill with duplicates (a non-zero value would make it give
-    // up filling — and just pass frames through unfilled — once the gap
-    // since the last real buffer exceeds that duration, reintroducing the
-    // exact fluctuating-rate/stuck-frame bug this exists to fix). Both
-    // properties only get a real workout because `keepalive-time` on the
+    // `<platform source>` (portal `pipewiresrc` / Windows
+    // `d3d11screencapturesrc`) delivers frames at whatever variable,
+    // content-driven rate the compositor/OS pushes them — observed live
+    // ranging from ~1fps on an idle desktop up to the monitor's full refresh
+    // rate (100+ fps) under continuous motion, with nothing upstream
+    // constraining it. Every encoder property that assumes a nominal fps
+    // (`key-int-max` for the spec's 2s GOP, and — critically — `bitrate`
+    // itself, since both `x264enc` and `vah264enc` allocate their per-frame
+    // bit budget by dividing the target bitrate across the negotiated caps'
+    // framerate) silently breaks without a cap: fed at, say, 100fps instead
+    // of the configured 30, the encoder divides the same kbit/s budget
+    // across >3x as many frames, so each frame gets a fraction of its
+    // intended allocation. Live-measured without this cap: every delta frame
+    // landed at exactly the same ~222 bytes regardless of real on-screen
+    // motion or the configured bitrate — the classic signature of a starved
+    // rate controller.
+    //
+    // `drop-only=false` is what lets `videorate` *duplicate* the last frame
+    // to fill up to `framerate` rather than only dropping excess frames down
+    // to it; `max-duplication-time=0` disables the cap on how large a gap it
+    // will still fill (a non-zero value would make it give up filling once
+    // the gap since the last real buffer exceeded that duration,
+    // reintroducing the fluctuating-rate/stuck-frame bug this exists to
+    // fix). Both only get a real workout because `keepalive-time` on the
     // Linux source fragment (see [`CaptureSource::launch_fragment`]) ensures
-    // there's always a fresh buffer for `videorate` to duplicate from, even
-    // when the desktop is fully static and the compositor pushes nothing —
-    // without that upstream fix, `videorate` still can't invent frames out
-    // of a total silence with no next buffer to trigger on. `PacingState` in
-    // `decode.rs` (viewer-side display pacing) then reproduces this constant
-    // cadence faithfully — it was already correct; the irregular cadence it
-    // was faithfully displaying originated entirely here.
+    // there is always a fresh buffer to duplicate from even when the desktop
+    // is fully static and the compositor pushes nothing.
+    //
+    // `Why the cap is shared (pre-tee) rather than per-branch:` a
+    // destination's own branch has its own `videorate` too
+    // ([`branch::add_branch`]) and can freely down-convert from this rate,
+    // but nothing downstream of the tee can conjure frames the source never
+    // produced. So this value *is* the capture's [`destination::SourceCaps`]
+    // framerate, and it is exactly why raising a destination above it is the
+    // plan doc's tier-3 [`destination::ChangeTier::SourceRestart`] (handled
+    // by [`CaptureHandle::set_source_framerate`], which rewrites this
+    // capsfilter live) while going below it is a cheap tier-2 branch swap.
+    // A separate `capsfilter` element (rather than caps inline in the
+    // `videorate ! ...` link) is what makes that live rewrite possible: the
+    // filter's `caps` property is settable on a `Playing` pipeline.
     let description = format!(
         "{source_fragment} \
          ! videoconvert \
-         ! tee name=t \
-         t. ! queue leaky=downstream max-size-buffers={ENCODER_QUEUE_MAX_BUFFERS} \
-            ! valve name={ENCODER_VALVE_NAME} drop=false drop-mode=forward-sticky-events \
-            ! videorate drop-only=false max-duplication-time=0 \
-            ! video/x-raw,format={raw_format},framerate={framerate}/1 \
-            ! {encoder} \
-            ! video/x-h264,stream-format=byte-stream,alignment=au \
-            ! appsink name=sink emit-signals=false sync=false max-buffers=4 drop=true \
-         t. ! queue leaky=downstream max-size-buffers=1 \
+         ! videorate drop-only=false max-duplication-time=0 \
+         ! capsfilter name={SOURCE_CAPS_NAME} caps=video/x-raw,framerate={framerate}/1 \
+         ! tee name={TEE_NAME} \
+         {TEE_NAME}. ! queue leaky=downstream max-size-buffers=1 \
             ! videorate \
             ! video/x-raw,framerate={PREVIEW_BRANCH_FRAMERATE}/1 \
             ! videoconvert \
             ! video/x-raw,format=RGB \
             ! appsink name=preview_sink emit-signals=false sync=false max-buffers=1 drop=true \
-         t. ! queue leaky=downstream max-size-buffers=1 \
+         {TEE_NAME}. ! queue leaky=downstream max-size-buffers=1 \
             ! videorate \
             ! video/x-raw,framerate={SELF_PREVIEW_BRANCH_FRAMERATE}/1 \
             ! videoconvert \
@@ -793,12 +783,6 @@ fn build_pipeline(
         .downcast::<gst::Pipeline>()
         .map_err(|_| anyhow!("gst::parse::launch did not return a top-level Pipeline"))?;
 
-    let sink = pipeline
-        .by_name("sink")
-        .ok_or_else(|| anyhow!("pipeline has no element named 'sink'"))?
-        .downcast::<gst_app::AppSink>()
-        .map_err(|_| anyhow!("'sink' element is not an AppSink"))?;
-
     let preview_sink = pipeline
         .by_name("preview_sink")
         .ok_or_else(|| anyhow!("pipeline has no element named 'preview_sink'"))?
@@ -811,33 +795,46 @@ fn build_pipeline(
         .downcast::<gst_app::AppSink>()
         .map_err(|_| anyhow!("'{SELF_PREVIEW_SINK_NAME}' element is not an AppSink"))?;
 
-    let encoder_valve = pipeline
-        .by_name(ENCODER_VALVE_NAME)
-        .ok_or_else(|| anyhow!("pipeline has no element named '{ENCODER_VALVE_NAME}'"))?;
+    let tee = pipeline
+        .by_name(TEE_NAME)
+        .ok_or_else(|| anyhow!("pipeline has no element named '{TEE_NAME}'"))?;
 
-    Ok((pipeline, sink, preview_sink, self_preview_sink, encoder_valve))
+    let source_caps = pipeline
+        .by_name(SOURCE_CAPS_NAME)
+        .ok_or_else(|| anyhow!("pipeline has no element named '{SOURCE_CAPS_NAME}'"))?;
+
+    Ok(CapturePipeline { pipeline, tee, source_caps, preview_sink, self_preview_sink })
 }
 
-/// Builds `backend`'s capture pipeline and drives it to `Playing`, waiting
-/// for the state change to actually settle (success or error) before
-/// returning — used by [`start_sharing`] both for the preferred backend and,
-/// on failure, the software fallback retry.
+/// The `video/x-raw,framerate=N/1` caps [`SOURCE_CAPS_NAME`]'s capsfilter
+/// carries. Its own function because [`build_pipeline`] writes it once at
+/// construction (as a launch-syntax string) and
+/// [`CaptureHandle::set_source_framerate`] rewrites it live (as a real
+/// [`gst::Caps`]), and the two must never drift apart.
+fn source_framerate_caps(framerate: u32) -> gst::Caps {
+    gst::Caps::builder("video/x-raw")
+        .field("framerate", gst::Fraction::new(framerate.clamp(MIN_FRAMERATE, MAX_FRAMERATE) as i32, 1))
+        .build()
+}
+
+/// Builds the capture pipeline and drives it to `Playing`, waiting for the
+/// state change to actually settle (success or error) before returning.
 ///
 /// On any failure (construction or state-change), tears the pipeline back
 /// down to `Null` before returning `Err`, so a failed attempt never leaks a
-/// half-started pipeline into the fallback attempt.
-fn start_pipeline(
-    source_fragment: &str,
-    bitrate_kbps: u32,
-    framerate: u32,
-    backend: EncoderBackend,
-) -> Result<(gst::Pipeline, gst_app::AppSink, gst_app::AppSink, gst_app::AppSink, gst::Element)> {
-    let (pipeline, appsink, preview_sink, self_preview_sink, encoder_valve) =
-        build_pipeline(source_fragment, bitrate_kbps, framerate, backend)?;
+/// half-started pipeline.
+///
+/// No encoder-backend fallback here any more, unlike the version that built
+/// a fixed encoder branch: this pipeline contains no encoder at all, so
+/// there is nothing VAAPI-specific that can fail at this stage. That
+/// fallback now lives per destination, where it belongs — see
+/// [`branch::add_branch_with_fallback`]/[`branch::add_branch_live`].
+fn start_pipeline(source_fragment: &str, framerate: u32) -> Result<CapturePipeline> {
+    let built = build_pipeline(source_fragment, framerate)?;
 
-    if let Err(e) = pipeline.set_state(gst::State::Playing) {
-        let _ = pipeline.set_state(gst::State::Null);
-        return Err(anyhow!("failed to start capture pipeline ({backend:?}): {e}"));
+    if let Err(e) = built.pipeline.set_state(gst::State::Playing) {
+        let _ = built.pipeline.set_state(gst::State::Null);
+        return Err(anyhow!("failed to start capture pipeline: {e}"));
     }
 
     // Wait for the pipeline to actually get moving (or fail) before telling
@@ -845,13 +842,13 @@ fn start_pipeline(
     // immediately errors out would be a confusing "stream with no frames"
     // for other members. `state()` blocks until the async state change
     // settles (success or error) or the timeout elapses.
-    let (state_result, _current, _pending) = pipeline.state(gst::ClockTime::from_seconds(5));
+    let (state_result, _current, _pending) = built.pipeline.state(gst::ClockTime::from_seconds(5));
     if let Err(e) = state_result {
-        let _ = pipeline.set_state(gst::State::Null);
-        return Err(anyhow!("capture pipeline ({backend:?}) failed to reach PLAYING: {e:?}"));
+        let _ = built.pipeline.set_state(gst::State::Null);
+        return Err(anyhow!("capture pipeline failed to reach PLAYING: {e:?}"));
     }
 
-    Ok((pipeline, appsink, preview_sink, self_preview_sink, encoder_valve))
+    Ok(built)
 }
 
 // ---------------------------------------------------------------------
@@ -865,12 +862,114 @@ fn start_pipeline(
 /// GStreamer pipeline as a backstop, so no element thread is left running —
 /// it just skips the async portal-session-close step (see `Drop`'s doc
 /// comment), and it just skips the graceful drain/notify steps.
-pub struct CaptureHandle {
+/// Caller-chosen identity for one destination of a capture, opaque to this
+/// module. `ui.rs` passes its own `DestinationId` through here so every
+/// lookup on a [`CaptureHandle`] is unambiguous.
+///
+/// `Why not the `stream_id`:` a `stream_id` is only unique *within one
+/// connection*, and the whole point of fan-out is that one capture feeds
+/// several rooms — two of its destinations can legitimately carry the same
+/// `stream_id` in different rooms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DestKey(pub u32);
+
+/// One outgoing destination of a running capture: its own encode branch, its
+/// own [`destination::DestinationRuntime`], and its own pump task
+/// ([`destination_pump`]) encrypting and sending into *its* room.
+///
+/// Everything here is per destination, not per capture: the room's
+/// `ScreenshareClient` (its key, nonce space and connection), the
+/// `stream_id`, the encoder and its bitrate, the pause valve, the live
+/// encode-rate gauge, and the lifecycle state machine. That is what makes
+/// "one capture, N independently encoded and encrypted streams" literal
+/// rather than aspirational.
+pub struct DestinationHandle {
+    key: DestKey,
     stream_id: u8,
-    client: ScreenshareClient,
+    /// Which room this destination sends into, purely so a caller can
+    /// correlate it back without a second lookup.
+    cmd_tx: mpsc::UnboundedSender<DestCmd>,
+    runtime: destination::SharedDestination,
+    encoder_fps: Arc<AtomicU32>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl DestinationHandle {
+    /// Shared handle onto this destination's lifecycle state — see
+    /// [`destination::DestinationRuntime`]. `ui.rs` clones this into its own
+    /// `Destination` so the UI can read the state machine every repaint
+    /// without going through the capture handle.
+    pub fn runtime(&self) -> destination::SharedDestination {
+        self.runtime.clone()
+    }
+
+    pub fn params(&self) -> destination::VideoParams {
+        self.runtime.lock().unwrap().params()
+    }
+
+    /// This destination's live encode rate — see [`ENCODER_FPS_WINDOW`].
+    pub fn encoder_fps(&self) -> u32 {
+        self.encoder_fps.load(Ordering::Relaxed)
+    }
+
+    /// Tier-1 change ([`destination::ChangeTier::Bitrate`]): a live encoder
+    /// property write, fire-and-forget. This is the call the Absolute-Maximum
+    /// bandwidth allocator drives (at most once a second, and only past the
+    /// hysteresis threshold — see `ui.rs`'s `BandwidthController`).
+    pub fn set_bitrate(&self, bitrate_kbps: u32) {
+        let _ = self.cmd_tx.send(DestCmd::SetBitrate(bitrate_kbps));
+    }
+
+    /// Graceful teardown of just this destination: drain and remove its
+    /// encode branch off the still-live tee, then tell its room the stream
+    /// stopped. Every *other* destination of the same capture is mechanically
+    /// untouched (its own `queue` isolates it — see [`branch::remove_branch`]).
+    async fn stop(self) -> Result<()> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if self.cmd_tx.send(DestCmd::Stop { reply: reply_tx }).is_err() {
+            // Pump already gone; nothing left to drain.
+            return Ok(());
+        }
+        let result = match tokio::time::timeout(DESTINATION_STOP_TIMEOUT, reply_rx).await {
+            Ok(Ok(result)) => result.map_err(|e| anyhow!("{e}")),
+            Ok(Err(_)) => Ok(()),
+            Err(_) => Err(anyhow!("destination pump did not finish stopping within {DESTINATION_STOP_TIMEOUT:?}")),
+        };
+        // The pump returns right after replying; joining it is what
+        // guarantees no task is still holding a branch when the pipeline goes
+        // `Null` underneath it.
+        let _ = tokio::time::timeout(DESTINATION_STOP_TIMEOUT, self.task).await;
+        result
+    }
+}
+
+/// How long [`DestinationHandle::stop`] waits for a destination's pump to
+/// drain its branch. Comfortably above [`branch::remove_branch`]'s own 5s
+/// internal drain bound, so this only ever fires if that one already gave up.
+const DESTINATION_STOP_TIMEOUT: Duration = Duration::from_secs(7);
+
+/// A running screen-share capture started by [`start_sharing`]: one real
+/// screen grab, one GStreamer pipeline, and N [`DestinationHandle`]s hanging
+/// off its `tee` — one per room this capture is being sent into.
+///
+/// Prefer calling [`CaptureHandle::stop`] for graceful teardown (it drains
+/// every destination's branch, notifies each room, closes the portal session,
+/// and joins the background tasks); if the handle is dropped without it,
+/// `Drop` still synchronously stops the GStreamer pipeline as a backstop, so
+/// no element thread is left running — it just skips the async
+/// portal-session-close and per-room `StopStream` steps (see `Drop`'s doc
+/// comment).
+pub struct CaptureHandle {
     pipeline: gst::Pipeline,
+    /// Where every destination's encode branch is added/removed.
+    tee: gst::Element,
+    /// The shared-source-rate capsfilter — see [`SOURCE_CAPS_NAME`] and
+    /// [`CaptureHandle::set_source_framerate`].
+    source_caps: gst::Element,
     capture_source: CaptureSource,
-    pump_task: tokio::task::JoinHandle<()>,
+    /// Bus + self-preview pump (see [`capture_loop`]). Per capture, not per
+    /// destination: neither of those two things is destination-scoped.
+    capture_task: tokio::task::JoinHandle<()>,
     // `Option` (rather than a bare `PreviewHandle`) solely so `stop` can
     // `.take()` it out of `&mut self` to call `PreviewHandle::stop(self)`,
     // which consumes by value — required now that `CaptureHandle: Drop`
@@ -879,44 +978,21 @@ pub struct CaptureHandle {
     // normally (bare-drop backstop path) is fine, per `PreviewHandle`'s own
     // doc comment (dropping `stop_tx` promptly stops its background task).
     preview_handle: Option<PreviewHandle>,
-    // The other end of `pump_loop`'s `control_rx` (see [`CaptureControlEvent`]).
-    // The caller (`ui.rs`'s main event loop) forwards `ClientEvent::SubscriberCount`/
-    // `ClientEvent::KeyframeRequest` for this `stream_id` here via
-    // [`CaptureHandle::notify_subscriber_count`]/[`CaptureHandle::notify_keyframe_request`].
-    // Dropped by `stop`/`Drop` along with the rest of `self`, which makes
-    // `control_rx.recv()` observe channel closure and stop selecting on it —
-    // no explicit shutdown signal needed.
-    control_tx: mpsc::UnboundedSender<CaptureControlEvent>,
-    // Sharer-side live FPS readout: the encoder branch's real output rate,
-    // updated by `pump_loop` (see [`ENCODER_FPS_WINDOW`]) every time an
-    // encoded access unit reaches the appsink, and read back here via
-    // [`CaptureHandle::encoder_fps`] — lets `ui.rs` show "is the configured
-    // framerate actually being hit", not just "what was selected". An
-    // `Arc<AtomicU32>` rather than a channel: this is a plain last-value
-    // gauge, not an event stream, so a lock-free shared cell is simpler than
-    // threading another channel through.
-    encoder_fps: Arc<AtomicU32>,
     // Latest frame off the self-preview tee branch (see
-    // [`SELF_PREVIEW_BRANCH_FRAMERATE`]), written by [`pump_loop`] and read
+    // [`SELF_PREVIEW_BRANCH_FRAMERATE`]), written by [`capture_loop`] and read
     // back (and cleared) via [`CaptureHandle::self_preview_frame`] — the same
     // "last-value slot behind a `Mutex`" shape `decode.rs`'s
     // `StreamDecoder::latest_frame` uses for the equivalent viewer-side
     // texture-upload pattern in `ui.rs`.
     self_preview_frame: Arc<Mutex<Option<egui::ColorImage>>>,
-    // This capture's destination lifecycle state — the `DestinationState`
-    // machine, the monotonic wire-PTS clock, and the stall protocol's cached
-    // IDR (see [`destination::DestinationRuntime`]). Shared with `pump_loop`,
-    // which writes it as frames flow, and read by `ui.rs` to render the
-    // destination's state.
-    //
-    // One runtime per handle, because this stage's `start_sharing` pipeline
-    // still has exactly one fixed encoder branch and therefore exactly one
-    // destination. Fan-out (N branch-backed destinations off one capture)
-    // holds one of these per destination and drives them with
-    // [`branch::swap_to_new_branch`]/[`branch::stall_all`]/
-    // [`branch::rebuild_after_source_restart`]; nothing about this type
-    // changes when that lands.
-    destination: destination::SharedDestination,
+    /// What the shared source is currently producing. The framerate half is
+    /// authoritative (this module sets it); the size half is negotiated by
+    /// GStreamer and cached here on first successful read.
+    source_state: Mutex<destination::SourceCaps>,
+    /// One entry per room this capture feeds, in the order they were added.
+    /// A `Vec` rather than a map: N is the number of rooms a user is
+    /// simultaneously broadcasting into — a handful at most.
+    destinations: Vec<DestinationHandle>,
 }
 
 impl Drop for CaptureHandle {
@@ -924,15 +1000,16 @@ impl Drop for CaptureHandle {
     /// called (a panic, an app crash, or a caller that just drops the handle
     /// instead of awaiting graceful teardown). Without this, the GStreamer
     /// pipeline is left `Playing` — its element threads (`pipewiresrc`/
-    /// `d3d11screencapturesrc`, `x264enc`/`vah264enc`, …) keep running
-    /// indefinitely.
+    /// `d3d11screencapturesrc`, every destination's `x264enc`/`vah264enc`, …)
+    /// keep running indefinitely.
     ///
     /// This is a backstop, not a replacement for `stop()`'s graceful
     /// teardown: closing the ashpd portal session is an async D-Bus call and
     /// can't run in this synchronous `drop`, so on the Linux/portal path the
     /// OS recording indicator can stay lit until the OS itself notices this
-    /// process's PipeWire fd close (or until `stop()` actually runs). This
-    /// only guarantees the GStreamer pipeline itself stops.
+    /// process's PipeWire fd close (or until `stop()` actually runs). Nor
+    /// does it send any room a `StopStream`. This only guarantees the
+    /// GStreamer pipeline itself stops.
     ///
     /// When `stop()` *did* run first, `self` is already fully torn down by
     /// the time this runs, so setting an already-`Null` pipeline to `Null`
@@ -943,41 +1020,47 @@ impl Drop for CaptureHandle {
     }
 }
 
-/// Starts sharing this machine's screen on `stream_id`: acquires this
+/// Starts sharing this machine's screen into one room: acquires this
 /// platform's capture source (Linux: runs the portal permission flow;
 /// Windows: no consent flow needed, see [`acquire_capture_source`]), builds
-/// and starts the capture/encode pipeline, and (once the first encoded frame
-/// has actually gone out, i.e. capture is really flowing — not just
-/// "pipeline exists") calls [`ScreenshareClient::announce_stream`] so other
-/// room members see the stream appear.
+/// and starts the capture pipeline, adds this capture's **first destination**
+/// as a dynamic encode branch, and — once that branch has actually produced
+/// its first IDR, i.e. capture is really flowing, not just "pipeline exists"
+/// — calls [`ScreenshareClient::announce_stream`] so other room members see
+/// the stream appear.
 ///
-/// `bitrate_kbps` is plumbed straight into the encoder (see
-/// [`DEFAULT_BITRATE_KBPS`] for a reasonable default). `framerate` caps the
-/// encoder branch's output rate (see [`build_pipeline`]'s doc comment) and
-/// scales the GOP/keyframe interval to match — see [`DEFAULT_FRAMERATE`]/
-/// [`MAX_FRAMERATE`] for the selectable range; `ui.rs`'s framerate dropdown
-/// is the UI for choosing it.
+/// More rooms are added later with [`CaptureHandle::spawn_add_destination`];
+/// nothing about this first one is structurally special (see
+/// [`build_pipeline`]'s "Why no fixed encoder branch").
+///
+/// `key` is the caller's own identity for that first destination (see
+/// [`DestKey`]). `bitrate_kbps` is plumbed straight into its encoder (see
+/// [`DEFAULT_BITRATE_KBPS`]). `framerate` sets the *shared* source rate every
+/// branch downstream of the tee sees (see [`build_pipeline`]) and scales each
+/// branch's GOP/keyframe interval to match — see [`DEFAULT_FRAMERATE`]/
+/// [`MAX_FRAMERATE`] for the selectable range.
 ///
 /// Returns `Err` — never panics — if the capture source is unavailable (on
 /// Linux: the portal is unreachable, or the user denies/cancels the
-/// screencast permission dialog), or the GStreamer pipeline fails to
-/// construct/start.
+/// screencast permission dialog), or the GStreamer pipeline/first encode
+/// branch fails to construct, start, or produce an IDR.
 pub async fn start_sharing(
     client: &ScreenshareClient,
     stream_id: u8,
+    key: DestKey,
     bitrate_kbps: u32,
     framerate: u32,
 ) -> Result<CaptureHandle> {
     ensure_gstreamer_initialized()?;
 
     let capture_source = acquire_capture_source().await?;
-    start_sharing_with_source(client, stream_id, bitrate_kbps, framerate, capture_source).await
+    start_sharing_with_source(client, stream_id, key, bitrate_kbps, framerate, capture_source).await
 }
 
 /// TEST-ONLY seam (see [`CaptureSource::TestSource`]): starts the exact same
-/// tee→encode→appsink→encrypt→fragment→send pipeline [`start_sharing`] uses
-/// internally, sourced from a caller-supplied raw `gst-launch`-syntax source
-/// fragment (e.g. `"videotestsrc is-live=true pattern=smpte ! \
+/// tee→branch→encode→appsink→encrypt→fragment→send pipeline [`start_sharing`]
+/// uses internally, sourced from a caller-supplied raw `gst-launch`-syntax
+/// source fragment (e.g. `"videotestsrc is-live=true pattern=smpte ! \
 /// video/x-raw,width=320,height=240,framerate=15/1"`) instead of the
 /// interactive portal/pipewiresrc (or Windows `d3d11screencapturesrc`) flow.
 ///
@@ -999,6 +1082,7 @@ pub async fn start_sharing_from_test_source(
     start_sharing_with_source(
         client,
         stream_id,
+        DestKey(0),
         bitrate_kbps,
         framerate,
         CaptureSource::TestSource(source_fragment.to_string()),
@@ -1008,121 +1092,48 @@ pub async fn start_sharing_from_test_source(
 
 /// Shared body of [`start_sharing`] / [`start_sharing_from_test_source`]:
 /// everything from "a [`CaptureSource`] has been acquired" onward (building
-/// and starting the encode pipeline, announcing the stream, wiring up the
-/// send pump and preview task).
+/// and starting the pipeline, adding the first destination's encode branch,
+/// announcing the stream, wiring up the preview task and the capture-level
+/// bus/self-preview pump).
 async fn start_sharing_with_source(
     client: &ScreenshareClient,
     stream_id: u8,
+    key: DestKey,
     bitrate_kbps: u32,
     framerate: u32,
     capture_source: CaptureSource,
 ) -> Result<CaptureHandle> {
     let source_fragment = capture_source.launch_fragment(framerate);
+    let CapturePipeline { pipeline, tee, source_caps, preview_sink, self_preview_sink } =
+        start_pipeline(&source_fragment, framerate)?;
 
-    // Prefer hardware (VAAPI) encode when it's actually usable on this
-    // machine, per detect_encoder_backend's probe; fall back to software.
-    // Beyond that up-front probe, also fall back if the *real* pipeline
-    // (with the real capture source) fails to construct or reach PLAYING —
-    // belt-and-suspenders against VAAPI issues the cheap probe pipeline
-    // didn't happen to catch — so a flaky/partial VAAPI setup never fails
-    // the whole capture when software encode would have worked. On Windows
-    // this branch is inert: detect_encoder_backend() always resolves to
-    // Software there (see its doc comment), so the Vaapi arm never matches.
-    let preferred_backend = detect_encoder_backend();
-    let (pipeline, appsink, preview_sink, self_preview_sink, encoder_valve) =
-        match start_pipeline(&source_fragment, bitrate_kbps, framerate, preferred_backend) {
-            Ok(started) => started,
-            Err(e) if preferred_backend == EncoderBackend::Vaapi => {
-                tracing::warn!("VAAPI capture pipeline failed to start ({e:#}); falling back to software encoder");
-                start_pipeline(&source_fragment, bitrate_kbps, framerate, EncoderBackend::Software)
-                    .context("software fallback capture pipeline also failed to start")?
-            }
-            Err(e) => return Err(e),
-        };
+    // Size for AnnounceStream and for the never-upscale clamp
+    // ([`destination::clamp_to_source`]): read off the tee's negotiated sink
+    // caps now that the pipeline is playing, falling back to 0x0 ("unknown /
+    // no constraint") if caps haven't landed yet rather than failing the
+    // whole call over a cosmetic field.
+    let (width, height) = negotiated_size(&tee).unwrap_or((0, 0));
+    let source = destination::SourceCaps { width: width as u32, height: height as u32, framerate };
 
-    // Width/height for AnnounceStream: read off the negotiated sink caps
-    // now that the pipeline is playing, falling back to 0x0 (unknown) if
-    // caps haven't landed yet rather than failing the whole call over a
-    // cosmetic field.
-    let (width, height) = negotiated_size(&appsink).unwrap_or((0, 0));
-
-    // The pad `force_keyframe` pushes its `UpstreamForceKeyUnitEvent` from:
-    // specifically the encoded-output appsink's sink pad, not e.g.
-    // `pipeline.send_event()`, because this pipeline has *two* leaf sink
-    // elements (this one and `preview_sink`) — `Pipeline::send_event`'s
-    // "pick a random sink element" behavior for upstream events could just
-    // as easily pick the preview branch, which doesn't reach the encoder at
-    // all. Pushing from this specific pad guarantees the event travels
-    // upstream through exactly the encoder branch (arriving at the
-    // encoder's src pad, where `GstVideoEncoder`'s base class — which both
-    // `x264enc` and `vah264enc` derive from — intercepts it).
-    let encoder_sink_pad = appsink
-        .static_pad("sink")
-        .ok_or_else(|| anyhow!("encoded-output appsink has no sink pad"))?;
-
-    let stream = appsink.stream();
-    let bus = pipeline.bus().ok_or_else(|| anyhow!("pipeline has no bus"))?;
-    let bus_stream = bus.stream();
-    // Bridged into `pump_loop` alongside the encoder-output/bus streams below
-    // (see this module's doc comment's "Why" note on the dedicated third tee
-    // branch) rather than via a separate spawned task — reusing the exact
-    // same `gst_app::AppSink::stream()` bridging `pump_loop` already does for
-    // the encoded-output appsink keeps this handle's lifecycle (one
-    // `pump_task`, joined by `CaptureHandle::stop`) unchanged.
-    let self_preview_stream = self_preview_sink.stream();
-
-    let (control_tx, control_rx) = mpsc::unbounded_channel();
-    let encoder_fps = Arc::new(AtomicU32::new(0));
-    let self_preview_frame: Arc<Mutex<Option<egui::ColorImage>>> = Arc::new(Mutex::new(None));
-
-    // This destination's lifecycle state. `pts_epoch` is anchored here — once,
-    // now — and never moves again for as long as this destination exists; the
-    // `on_pipeline_start` call right after re-anchors only the *offset* onto
-    // the pipeline that was just started. See
-    // [`destination::DestinationRuntime`]'s doc comment for why that split is
-    // what makes a later capture restart look like low framerate rather than a
-    // glitch.
-    let destination_runtime = destination::DestinationRuntime::shared(
-        Instant::now(),
-        destination::VideoParams {
-            width: width as u32,
-            height: height as u32,
-            framerate,
-            bitrate_kbps,
-            backend: preferred_backend,
-        },
-    );
-    {
-        let running_time_us = pipeline.current_running_time().map(|t| t.useconds()).unwrap_or(0);
-        destination_runtime
-            .lock()
-            .unwrap()
-            .on_pipeline_start(running_time_us, Instant::now());
-    }
-
-    let pump_client = client.clone();
-    let pump_encoder_fps = encoder_fps.clone();
-    let self_preview_bridge = SelfPreviewBridge {
-        stream: self_preview_stream,
-        frame: self_preview_frame.clone(),
+    let params = destination::VideoParams {
+        width: source.width,
+        height: source.height,
+        framerate,
+        bitrate_kbps,
+        // Preferred backend for the *branch*; `branch::add_branch_live`
+        // silently falls back to software per branch if this machine's VAAPI
+        // can't actually run another concurrent encode session.
+        backend: detect_encoder_backend(),
     };
-    let pump_task = tokio::spawn(pump_loop(
-        pump_client,
-        stream_id,
-        stream,
-        bus_stream,
-        control_rx,
-        encoder_valve,
-        encoder_sink_pad,
-        pump_encoder_fps,
-        self_preview_bridge,
-        destination_runtime.clone(),
-    ));
 
-    client
-        .announce_stream(stream_id, StreamKind::Video, "Screen", width, height)
-        .await
-        .context("failed to announce video stream to the relay")?;
+    let destination = spawn_destination(&pipeline, &tee, client, stream_id, key, params).await?;
+
+    let self_preview_frame: Arc<Mutex<Option<egui::ColorImage>>> = Arc::new(Mutex::new(None));
+    let bus = pipeline.bus().ok_or_else(|| anyhow!("pipeline has no bus"))?;
+    let capture_task = tokio::spawn(capture_loop(
+        bus.stream(),
+        SelfPreviewBridge { stream: self_preview_sink.stream(), frame: self_preview_frame.clone() },
+    ));
 
     // Now that the pipeline is confirmed Playing and the stream has been
     // announced, wire up the (already-implemented, capture-agnostic)
@@ -1131,17 +1142,103 @@ async fn start_sharing_with_source(
     let preview_handle = preview::spawn_preview_task(client.clone(), stream_id, preview_frames);
 
     Ok(CaptureHandle {
-        stream_id,
-        client: client.clone(),
         pipeline,
+        tee,
+        source_caps,
         capture_source,
-        pump_task,
+        capture_task,
         preview_handle: Some(preview_handle),
-        control_tx,
-        encoder_fps,
         self_preview_frame,
-        destination: destination_runtime,
+        source_state: Mutex::new(source),
+        destinations: vec![destination],
     })
+}
+
+/// Builds one destination end to end: a dynamic encode branch on `tee`
+/// (waiting for its first IDR, with per-branch VAAPI→software fallback), a
+/// fresh [`destination::DestinationRuntime`], a [`destination_pump`] task
+/// encrypting and sending into `client`'s room, and the room's
+/// `AnnounceStream`.
+///
+/// `Why announce here, after the first IDR, and not before:` announcing a
+/// stream whose encoder then turns out not to work would show every other
+/// member a stream that never produces a frame. `branch::add_branch_live`
+/// only returns once this branch has proven itself, so this is the earliest
+/// honest moment to announce — and the same moment the destination's own
+/// state machine goes `Starting` → `Live`.
+async fn spawn_destination(
+    pipeline: &gst::Pipeline,
+    tee: &gst::Element,
+    client: &ScreenshareClient,
+    stream_id: u8,
+    key: DestKey,
+    params: destination::VideoParams,
+) -> Result<DestinationHandle> {
+    // The destination's wire clock is anchored *before* its branch exists, so
+    // `on_pipeline_start` below only ever re-anchors the offset onto a
+    // pipeline this destination's epoch already predates. See
+    // [`destination::DestinationRuntime`]'s doc comment for why that split is
+    // what makes a later source restart look like low framerate rather than a
+    // glitch.
+    let runtime = destination::DestinationRuntime::shared(Instant::now(), params);
+    {
+        let running_time_us = pipeline.current_running_time().map(|t| t.useconds()).unwrap_or(0);
+        runtime.lock().unwrap().on_pipeline_start(running_time_us, Instant::now());
+    }
+
+    let (encode_branch, first_idr) =
+        branch::add_branch_live(pipeline, tee, branch::BranchId(key.0), params.to_encode_settings())
+            .await
+            .with_context(|| format!("failed to bring up the encode branch for stream {stream_id}"))?;
+
+    // Feed the branch's proving IDR through the normal accounting so it is
+    // cached for the stall protocol and drives `Starting` → `Live` exactly
+    // once, in one place — and, critically, so it actually reaches the
+    // viewer: `wait_for_first_idr` consumed it off the appsink, so nothing
+    // else will ever see it.
+    if let Some(buffer) = first_idr.buffer()
+        && let Ok(map) = buffer.map_readable()
+    {
+        {
+            let payload = map.as_slice();
+            let buffer_pts_us = buffer.pts().map(|t| t.useconds()).unwrap_or(0);
+            let (wire_pts_us, stalled) = {
+                let mut runtime = runtime.lock().unwrap();
+                runtime.note_encoded_frame(true, payload, Instant::now());
+                (runtime.wire_pts_from_buffer(buffer_pts_us), runtime.is_stalled())
+            };
+            if let Err(e) = send_media_payload(client, stream_id, payload, wire_pts_us, true, stalled) {
+                tracing::warn!("stream {stream_id}: could not send the branch's first IDR: {e:#}");
+            }
+        }
+    }
+
+    if let Err(e) = client
+        .announce_stream(stream_id, StreamKind::Video, "Screen", params.width as u16, params.height as u16)
+        .await
+    {
+        // Nothing is announced, so nothing may keep encoding: remove the
+        // branch rather than leaking it onto the tee — the same
+        // built-then-abandoned cleanup contract every failure path in
+        // [`branch::add_branch_live`] follows.
+        let _ = branch::remove_branch(pipeline, tee, encode_branch).await;
+        return Err(e).context("failed to announce video stream to the relay");
+    }
+
+    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+    let encoder_fps = Arc::new(AtomicU32::new(0));
+    let task = tokio::spawn(destination_pump(
+        client.clone(),
+        stream_id,
+        pipeline.clone(),
+        tee.clone(),
+        encode_branch,
+        runtime.clone(),
+        encoder_fps.clone(),
+        cmd_rx,
+    ));
+
+    Ok(DestinationHandle { key, stream_id, cmd_tx, runtime, encoder_fps, task })
 }
 
 /// Bridges `preview_sink`'s raw-RGB samples (the tee's low-rate branch, see
@@ -1241,8 +1338,11 @@ fn sample_to_color_image(sample: &gst::Sample) -> Result<egui::ColorImage> {
     Ok(egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba))
 }
 
-fn negotiated_size(appsink: &gst_app::AppSink) -> Option<(u16, u16)> {
-    let pad = appsink.static_pad("sink")?;
+/// Negotiated frame size on `element`'s sink pad. Used against the `tee` to
+/// learn what the shared capture source is actually producing (the size half
+/// of [`destination::SourceCaps`]) — `None` while caps haven't landed yet.
+fn negotiated_size(element: &gst::Element) -> Option<(u16, u16)> {
+    let pad = element.static_pad("sink")?;
     let caps = pad.current_caps()?;
     let s = caps.structure(0)?;
     let width: i32 = s.get("width").ok()?;
@@ -1250,33 +1350,57 @@ fn negotiated_size(appsink: &gst_app::AppSink) -> Option<(u16, u16)> {
     Some((width.clamp(0, u16::MAX as i32) as u16, height.clamp(0, u16::MAX as i32) as u16))
 }
 
+/// What [`CaptureHandle::change_destination`] decided to do with a requested
+/// settings change, so the caller can reflect it (an "applying…" spinner for
+/// a swap, nothing at all for a bitrate write) without re-deriving the
+/// classification itself.
+pub struct ChangeRequest {
+    /// Which tier [`destination::classify_change`] put this change in.
+    pub tier: destination::ChangeTier,
+    /// The parameters that were actually requested, after
+    /// [`destination::clamp_to_source`]'s never-upscale clamp — which may
+    /// differ from what the caller asked for.
+    pub applied: destination::VideoParams,
+    /// Resolves when a tier-2/tier-3 branch swap finishes. `None` for tiers
+    /// that complete synchronously (`Unchanged`, `Bitrate`).
+    pub done: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+}
+
 impl CaptureHandle {
-    /// Tears the capture down cleanly: stops the GStreamer pipeline, closes
-    /// the portal session (Linux only — Windows has no session to close, see
-    /// [`CaptureSource`]), tells the relay this stream is gone (best-effort
-    /// — a network error here is logged, not returned, since the pipeline is
-    /// already stopped either way), and waits for the background send task
-    /// to finish draining.
+    /// Tears the capture down cleanly: stops every destination (draining its
+    /// encode branch and telling its room the stream is gone), stops the
+    /// GStreamer pipeline, closes the portal session (Linux only — Windows
+    /// has no session to close, see [`CaptureSource`]), and waits for the
+    /// background tasks to finish draining.
     pub async fn stop(mut self) -> Result<()> {
+        // Destinations first: each one drains and removes its own branch off
+        // the still-live tee and sends its room a `StopStream`. Doing this
+        // before the pipeline's EOS keeps every removal on the well-tested
+        // live-pipeline path (`branch::remove_branch`) rather than racing a
+        // pipeline that is already tearing down.
+        for destination in std::mem::take(&mut self.destinations) {
+            let stream_id = destination.stream_id;
+            if let Err(e) = destination.stop().await {
+                tracing::warn!("stopping destination (stream {stream_id}) did not finish cleanly: {e:#}");
+            }
+        }
+
         // Ask the pipeline to end gracefully by sending it a real EOS event
-        // *before* forcing it to `Null`, and wait for the pump task to
+        // *before* forcing it to `Null`, and wait for the capture task to
         // notice.
         //
         // This isn't just tidiness: `gstreamer_app::AppSinkStream` (what
-        // `pump_loop` awaits via `appsink_stream.next()`) only ever yields
-        // its terminal `None` once the appsink's `is_eos()` flag is actually
-        // set, which only happens once a real EOS event has flowed all the
-        // way through the pipeline into it (see that type's `poll_next`).
-        // Jumping straight to `set_state(Null)` (as this used to do) never
-        // sends that event — it just tears the elements down — so the
-        // appsink's stream would sit `Pending` forever and `pump_task` would
-        // never complete, hanging this whole function indefinitely. This
-        // was caught by the end-to-end integration test
-        // (`end_to_end_test.rs`) actually awaiting a real `stop()` on a live
-        // pipeline for the first time; no prior test exercised this path.
-        // `Pipeline::send_event` on a downstream/serialized event like EOS
-        // delegates to the bin's source element(s), so it originates
-        // upstream of the `tee` exactly like a natural end-of-stream would.
+        // [`capture_loop`] awaits) only ever yields its terminal `None` once
+        // the appsink's `is_eos()` flag is actually set, which only happens
+        // once a real EOS event has flowed all the way through the pipeline
+        // into it (see that type's `poll_next`). Jumping straight to
+        // `set_state(Null)` never sends that event — it just tears the
+        // elements down — so the appsink's stream would sit `Pending` forever
+        // and the capture task would never complete, hanging this whole
+        // function indefinitely. `Pipeline::send_event` on a
+        // downstream/serialized event like EOS delegates to the bin's source
+        // element(s), so it originates upstream of the `tee` exactly like a
+        // natural end-of-stream would.
         //
         // The `timeout` is a backstop, not the expected path: a healthy
         // pipeline should drain and reach EOS in well under a second, but
@@ -1287,17 +1411,14 @@ impl CaptureHandle {
             tracing::warn!("capture pipeline did not accept the EOS event; forcing a hard stop");
         }
 
-        // `&mut` rather than moving `self.pump_task` out: `CaptureHandle`
+        // `&mut` rather than moving `self.capture_task` out: `CaptureHandle`
         // implements `Drop` (see above), which forbids moving individual
         // fields out of `self` by value — `JoinHandle` is `Unpin`, so
-        // awaiting through `&mut` works identically. Same fix already
-        // applied to `AudioCaptureHandle::stop`.
-        match tokio::time::timeout(Duration::from_secs(5), &mut self.pump_task).await {
+        // awaiting through `&mut` works identically.
+        match tokio::time::timeout(Duration::from_secs(5), &mut self.capture_task).await {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!("capture send task did not shut down cleanly: {e}"),
-            Err(_) => tracing::warn!(
-                "capture send task did not observe EOS within 5s; forcing pipeline to Null anyway"
-            ),
+            Ok(Err(e)) => tracing::warn!("capture task did not shut down cleanly: {e}"),
+            Err(_) => tracing::warn!("capture task did not observe EOS within 5s; forcing pipeline to Null anyway"),
         }
 
         if let Err(e) = self.pipeline.set_state(gst::State::Null) {
@@ -1305,11 +1426,9 @@ impl CaptureHandle {
         }
 
         // `.take()` rather than moving `self.preview_handle` out directly,
-        // for the same reason as `pump_task` above: `PreviewHandle::stop`
+        // for the same reason as `capture_task` above: `PreviewHandle::stop`
         // consumes `self` by value, so it can't be called through a
-        // reference. `preview_handle` is always `Some` here (only `stop`
-        // itself ever takes it, and `stop` consumes `self`), so the `Some`
-        // arm is the only one that actually runs.
+        // reference.
         if let Some(preview_handle) = self.preview_handle.take() {
             preview_handle.stop().await;
         }
@@ -1321,11 +1440,9 @@ impl CaptureHandle {
             // `&self` anyway, so a borrow is all this needs regardless.
             // `CaptureSource` has exactly one variant on this platform in a
             // non-test build (see its `#[cfg(unix)]`/`#[cfg(windows)]`
-            // split); a `match` (rather than the irrefutable `let` this used
-            // to be) is what lets the `#[cfg(test)]`-only `TestSource`
-            // variant coexist here without an exhaustiveness error in test
-            // builds — it's a no-op for that variant, since a test source
-            // never opened a portal session to close.
+            // split); a `match` is what lets the `#[cfg(test)]`-only
+            // `TestSource` variant coexist here without an exhaustiveness
+            // error in test builds.
             match &self.capture_source {
                 CaptureSource::Portal(portal) => {
                     if let Err(e) = portal.session.close().await {
@@ -1337,94 +1454,285 @@ impl CaptureHandle {
             }
         }
 
-        if let Err(e) = self.client.stop_stream(self.stream_id).await {
-            tracing::warn!("error notifying relay that stream {} stopped: {e:#}", self.stream_id);
-        }
-
         Ok(())
     }
 
-    /// Forwards a `ClientEvent::SubscriberCount { stream_id, count }` for
-    /// this handle's `stream_id` to [`pump_loop`], which pauses (`count ==
-    /// 0`) or resumes (`count > 0`, forcing a keyframe so the next frame any
-    /// new subscriber gets is decodable) the encoder branch. The caller
-    /// (`ui.rs`'s event loop) is responsible for matching the incoming
-    /// `stream_id` against the right `CaptureHandle` before calling this —
-    /// this method itself doesn't check it.
+    // -----------------------------------------------------------------
+    // Destinations
+    // -----------------------------------------------------------------
+
+    fn destination(&self, key: DestKey) -> Option<&DestinationHandle> {
+        self.destinations.iter().find(|d| d.key == key)
+    }
+
+    pub fn destination_runtime(&self, key: DestKey) -> Option<destination::SharedDestination> {
+        self.destination(key).map(|d| d.runtime())
+    }
+
+    /// This destination's live encode rate — see [`ENCODER_FPS_WINDOW`]. `0`
+    /// for an unknown key or a paused encoder.
+    pub fn encoder_fps(&self, key: DestKey) -> u32 {
+        self.destination(key).map(|d| d.encoder_fps()).unwrap_or(0)
+    }
+
+    /// Fan-out / transfer: start sending this *same capture* into another
+    /// room as a second, fully independent encoded+encrypted stream.
     ///
-    /// A no-op (silently dropped) if `pump_loop` has already exited (e.g.
-    /// `stop()` is in flight) — there is nothing useful left to pause/resume.
-    pub fn notify_subscriber_count(&self, count: u32) {
-        let _ = self.control_tx.send(CaptureControlEvent::SubscriberCount(count));
+    /// Returns immediately with a receiver for the result: building a branch
+    /// and waiting for its first IDR is async, but `ui.rs` drives everything
+    /// from a synchronous `update()` and owns this handle by value, so it
+    /// cannot `.await` a `&self` method. Everything the work needs
+    /// (`gst::Pipeline`/`gst::Element` are `Send + Sync` refcounted handles,
+    /// `ScreenshareClient` is cloneable) is cloned into the spawned task; the
+    /// caller polls the receiver each frame and hands the resulting
+    /// [`DestinationHandle`] back via [`CaptureHandle::register_destination`].
+    ///
+    /// `Why the caller registers it rather than this method:` the spawned
+    /// task cannot touch `self` (it outlives the borrow), and a shared
+    /// `Mutex<Vec<DestinationHandle>>` would buy nothing — the UI already has
+    /// `&mut` access at exactly the moment it polls the result.
+    pub fn spawn_add_destination(
+        &self,
+        client: &ScreenshareClient,
+        stream_id: u8,
+        key: DestKey,
+        params: destination::VideoParams,
+    ) -> tokio::sync::oneshot::Receiver<Result<DestinationHandle, String>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let pipeline = self.pipeline.clone();
+        let tee = self.tee.clone();
+        let client = client.clone();
+        let params = destination::clamp_to_source(params, self.source_caps());
+        tokio::spawn(async move {
+            let result = spawn_destination(&pipeline, &tee, &client, stream_id, key, params)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+        });
+        rx
     }
 
-    /// Forwards a `ClientEvent::KeyframeRequest { stream_id }` for this
-    /// handle's `stream_id` to [`pump_loop`], which forces the encoder to
-    /// produce a keyframe on its next output frame (see
-    /// [`force_keyframe`]). Same caller-matches-`stream_id` contract and
-    /// already-stopped no-op behavior as [`CaptureHandle::notify_subscriber_count`].
-    pub fn notify_keyframe_request(&self) {
-        let _ = self.control_tx.send(CaptureControlEvent::KeyframeRequest);
+    /// Adopt a destination built by [`CaptureHandle::spawn_add_destination`].
+    pub fn register_destination(&mut self, destination: DestinationHandle) {
+        self.destinations.push(destination);
     }
 
-    /// Live sharer-side encode rate: the encoder branch's actual output
-    /// framerate over the last [`ENCODER_FPS_WINDOW`], updated by
-    /// [`pump_loop`] every time an encoded access unit reaches the appsink.
-    /// `0` until enough samples have arrived to compute a rate (e.g. right
-    /// after starting, or while the encoder is paused at 0 subscribers — see
-    /// [`CaptureControlEvent::SubscriberCount`]). Intended for `ui.rs` to
-    /// show next to the configured framerate, confirming the pipeline is
-    /// really hitting the selected rate rather than silently capping at some
-    /// other value — exactly the class of bug this area of the code has hit
-    /// twice before (see this module's doc comment on the `videorate` cap).
-    pub fn encoder_fps(&self) -> u32 {
-        self.encoder_fps.load(Ordering::Relaxed)
+    /// Stop sending into one room, leaving every other destination of this
+    /// capture running. Same async-from-a-sync-caller shape as
+    /// [`CaptureHandle::spawn_add_destination`]: the destination is removed
+    /// from this handle immediately and torn down in a spawned task.
+    ///
+    /// A no-op (immediately `Ok`) for an unknown key.
+    pub fn spawn_remove_destination(&mut self, key: DestKey) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let Some(index) = self.destinations.iter().position(|d| d.key == key) else {
+            let _ = tx.send(Ok(()));
+            return rx;
+        };
+        let destination = self.destinations.remove(index);
+        tokio::spawn(async move {
+            let _ = tx.send(destination.stop().await.map_err(|e| format!("{e:#}")));
+        });
+        rx
+    }
+
+    /// Forward a `ClientEvent::SubscriberCount { stream_id, count }` to the
+    /// destination that owns `key`, which pauses (`count == 0`) or resumes
+    /// (`count > 0`, forcing a keyframe so the next frame any new subscriber
+    /// gets is decodable) *that destination's* encoder branch. Every other
+    /// destination of this capture is unaffected — subscriber counts are per
+    /// stream, and so is the valve that acts on them.
+    ///
+    /// A no-op if the key is unknown or its pump has already exited.
+    pub fn notify_subscriber_count(&self, key: DestKey, count: u32) {
+        if let Some(destination) = self.destination(key) {
+            let _ = destination.cmd_tx.send(DestCmd::SubscriberCount(count));
+        }
+    }
+
+    /// Forward a `ClientEvent::KeyframeRequest { stream_id }` to the
+    /// destination that owns `key` — same per-destination scoping and
+    /// already-stopped no-op behavior as
+    /// [`CaptureHandle::notify_subscriber_count`].
+    pub fn notify_keyframe_request(&self, key: DestKey) {
+        if let Some(destination) = self.destination(key) {
+            let _ = destination.cmd_tx.send(DestCmd::KeyframeRequest);
+        }
+    }
+
+    /// Tier-1 change, direct: write one destination's encoder bitrate live.
+    /// This is the allocator's write path (see `ui.rs`'s
+    /// `BandwidthController`); a *user-driven* settings edit should go
+    /// through [`CaptureHandle::change_destination`] instead, so it gets
+    /// classified rather than assumed to be tier 1.
+    pub fn set_destination_bitrate(&self, key: DestKey, bitrate_kbps: u32) {
+        if let Some(destination) = self.destination(key) {
+            destination.set_bitrate(bitrate_kbps);
+        }
+    }
+
+    /// Apply a requested settings change to one destination, routed through
+    /// [`destination::classify_change`] — the single entry point for *every*
+    /// user-driven edit.
+    ///
+    /// `Why everything goes through the classifier:` the three tiers differ
+    /// by orders of magnitude in cost and in what the viewer sees (a property
+    /// write nobody notices / a make-before-break branch swap nobody notices
+    /// / a shared source restart that stalls **every** destination on this
+    /// capture at once). Deciding at a call site — "this is just a bitrate,
+    /// I'll write it directly" — is exactly how a change silently takes the
+    /// wrong tier, so the classification is not skippable here.
+    pub fn change_destination(&self, key: DestKey, requested: destination::VideoParams) -> Result<ChangeRequest> {
+        let source = self.source_caps();
+        let target = destination::clamp_to_source(requested, source);
+        let destination = self
+            .destination(key)
+            .ok_or_else(|| anyhow!("no such destination on this capture: {key:?}"))?;
+        let current = destination.params();
+        let tier = destination::classify_change(source, current, target);
+
+        let done = match tier {
+            destination::ChangeTier::Unchanged => None,
+            destination::ChangeTier::Bitrate => {
+                destination.set_bitrate(target.bitrate_kbps);
+                None
+            }
+            destination::ChangeTier::BranchSwap => Some(self.request_swap(destination, target)),
+            destination::ChangeTier::SourceRestart => {
+                // Tier 3 first (the shared source has to be producing at the
+                // new rate before this destination's branch can be capped to
+                // it), then the tier-2 swap that actually re-caps the branch.
+                self.set_source_framerate(target.framerate);
+                Some(self.request_swap(destination, target))
+            }
+        };
+
+        Ok(ChangeRequest { tier, applied: target, done })
+    }
+
+    fn request_swap(
+        &self,
+        destination: &DestinationHandle,
+        params: destination::VideoParams,
+    ) -> tokio::sync::oneshot::Receiver<Result<(), String>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if destination.cmd_tx.send(DestCmd::ApplyParams { params, reply: tx }).is_err() {
+            // The pump is gone (the destination is being torn down); the
+            // receiver resolves to a `RecvError` the caller already handles.
+        }
+        rx
+    }
+
+    // -----------------------------------------------------------------
+    // The shared capture source
+    // -----------------------------------------------------------------
+
+    /// What the shared source is producing right now — the input to
+    /// [`destination::classify_change`] and [`destination::clamp_to_source`].
+    ///
+    /// The size half is filled in lazily: a capture whose caps hadn't landed
+    /// when it started reports `0x0` ("no constraint") until they do, at
+    /// which point the real size is cached here for good.
+    pub fn source_caps(&self) -> destination::SourceCaps {
+        let mut state = self.source_state.lock().unwrap();
+        if (state.width == 0 || state.height == 0)
+            && let Some((width, height)) = negotiated_size(&self.tee)
+        {
+            state.width = width as u32;
+            state.height = height as u32;
+        }
+        *state
+    }
+
+    /// Tier-3 ([`destination::ChangeTier::SourceRestart`]): change the rate
+    /// the **shared** capture source runs at, which every destination on this
+    /// capture is fed from.
+    ///
+    /// `Why a live capsfilter rewrite rather than tearing the pipeline down
+    /// and rebuilding it:` the plan doc's tier-3 is defined by its *effect*
+    /// — the shared source changes, so every co-located destination is
+    /// affected at once and the stall protocol has to cover the gap — not by
+    /// any particular GStreamer mechanic. Rewriting the one capsfilter that
+    /// fixes the source rate ([`SOURCE_CAPS_NAME`]) achieves that effect
+    /// while keeping the portal session, the PipeWire fd, every destination's
+    /// branch, and the preview branches all alive, which a rebuild would each
+    /// have to re-acquire and re-add (and, on Linux, could re-prompt the user
+    /// for consent). The renegotiation this triggers is confined to
+    /// `videorate`'s output framerate — no format or size change — and the
+    /// destinations are stalled across it anyway, so a hitch reads to the
+    /// viewer as the brief low-framerate dip the protocol is designed to make
+    /// it look like.
+    ///
+    /// Raising the rate stalls every destination for the duration (nothing
+    /// downstream can conjure frames the source isn't producing yet);
+    /// *lowering* it deliberately doesn't — the source keeps producing
+    /// throughout, just less often, which is not an outage.
+    pub fn set_source_framerate(&self, framerate: u32) {
+        let framerate = framerate.clamp(MIN_FRAMERATE, MAX_FRAMERATE);
+        let previous = {
+            let mut state = self.source_state.lock().unwrap();
+            let previous = state.framerate;
+            if previous == framerate {
+                return;
+            }
+            state.framerate = framerate;
+            previous
+        };
+
+        let raising = framerate > previous;
+        if raising {
+            self.begin_stall(destination::StallReason::SourceChanged);
+        }
+
+        self.source_caps.set_property("caps", source_framerate_caps(framerate));
+
+        if raising {
+            self.note_source_restarted();
+            // Nothing ends a stall except a real IDR arriving (by design —
+            // see `note_encoded_frame`), so ask every branch for one now
+            // rather than leaving the viewer on the cached-IDR keepalive
+            // until the next scheduled 2s GOP boundary.
+            for destination in &self.destinations {
+                let _ = destination.cmd_tx.send(DestCmd::KeyframeRequest);
+            }
+        }
     }
 
     /// Non-blocking poll for the most recently captured self-preview frame
     /// (see [`SELF_PREVIEW_BRANCH_FRAMERATE`] and
     /// `superdoc/features/self-preview.md`) — `None` if nothing new has
     /// arrived since the last call. Mirrors `decode.rs`'s
-    /// `StreamDecoder::latest_frame`'s take-and-clear shape: intended for
-    /// `ui.rs` to call once per repaint and, when `Some`, upload via
-    /// `egui::TextureHandle::set`/`ctx.load_texture`.
+    /// `StreamDecoder::latest_frame`'s take-and-clear shape.
     pub fn self_preview_frame(&self) -> Option<egui::ColorImage> {
         self.self_preview_frame.lock().unwrap().take()
     }
 
-    /// Shared handle onto this capture's destination lifecycle state — see
-    /// [`destination::DestinationRuntime`]. `ui.rs` clones this into its own
-    /// `Destination` so the UI can read the state machine without going
-    /// through the handle on every repaint.
-    pub fn destination(&self) -> destination::SharedDestination {
-        self.destination.clone()
-    }
-
-    /// Snapshot of this capture's destination state. `Starting` until the
-    /// first IDR actually reaches the wire, then `Live`.
-    pub fn destination_state(&self) -> destination::DestinationState {
-        self.destination.lock().unwrap().state()
-    }
-
-    /// Tier-3 entry point: the shared capture source is going down, so this
-    /// destination stalls — no `StopStream`, no teardown, just the cached-IDR
-    /// keepalive at ~2fps until the source is back (see
-    /// [`send_stall_keepalive`]). Callers must pair this with
-    /// [`CaptureHandle::note_source_restarted`] once the capture is producing
-    /// again; nothing clears a stall on its own except a real frame arriving.
+    /// Tier-3 entry point, first half: the shared capture source is going
+    /// down or changing, so **every** destination fed by it stalls at the same
+    /// instant — no `StopStream`, no teardown, just the cached-IDR keepalive
+    /// at ~2fps until frames are flowing again (see [`send_stall_keepalive`]).
+    /// Callers must pair this with [`CaptureHandle::note_source_restarted`];
+    /// nothing clears a stall on its own except a real IDR arriving.
     pub fn begin_stall(&self, reason: destination::StallReason) {
-        self.destination.lock().unwrap().begin_stall(reason, Instant::now());
+        let runtimes: Vec<destination::SharedDestination> =
+            self.destinations.iter().map(|d| d.runtime.clone()).collect();
+        branch::stall_all(&runtimes, reason);
     }
 
-    /// The capture source is back: re-anchor the wire clock onto the restarted
-    /// pipeline's running time so PTS stays monotonic across the gap (see
+    /// Tier-3, second half: the source is producing again — re-anchor every
+    /// destination's wire clock onto the pipeline's current running time so
+    /// PTS stays monotonic across the gap (see
     /// [`destination::DestinationRuntime::on_pipeline_start`]). The stall
-    /// itself ends when the next real IDR is sent, not here — "the pipeline
-    /// restarted" and "the viewer has something decodable again" are different
-    /// events and only the second one should clear the placeholder.
+    /// itself ends when each destination's next real IDR is sent, not here —
+    /// "the source is back" and "the viewer has something decodable again"
+    /// are different events and only the second one should clear the
+    /// placeholder.
     pub fn note_source_restarted(&self) {
         let running_time_us = self.pipeline.current_running_time().map(|t| t.useconds()).unwrap_or(0);
-        self.destination.lock().unwrap().on_pipeline_start(running_time_us, Instant::now());
+        let now = Instant::now();
+        for destination in &self.destinations {
+            destination.runtime.lock().unwrap().on_pipeline_start(running_time_us, now);
+        }
     }
 }
 
@@ -1440,26 +1748,6 @@ impl CaptureHandle {
 struct SelfPreviewBridge {
     stream: gst_app::app_sink::AppSinkStream,
     frame: Arc<Mutex<Option<egui::ColorImage>>>,
-}
-
-/// Control-plane events that affect an active share's encoder, forwarded
-/// from the relay's `RelayToClient::SubscriberCount`/`RelayToClient::KeyframeRequest`
-/// (surfaced to this client as `net::ClientEvent::SubscriberCount`/
-/// `net::ClientEvent::KeyframeRequest`) via [`CaptureHandle::notify_subscriber_count`]/
-/// [`CaptureHandle::notify_keyframe_request`]. See [`pump_loop`] for how
-/// each variant is handled.
-enum CaptureControlEvent {
-    /// New subscriber count for this stream. `0` pauses the encoder branch
-    /// (via [`ENCODER_VALVE_NAME`]'s `drop` property) to save CPU/bandwidth
-    /// while nobody is watching; a transition from `0` to non-zero resumes
-    /// it and forces a keyframe (see [`force_keyframe`]) so the newly
-    /// (re)subscribed viewer's decoder has something to start from.
-    SubscriberCount(u32),
-    /// A new subscriber joined (relay-debounced). Forces a keyframe — and,
-    /// if the encoder branch happened to be paused, resumes it too (a
-    /// `KeyframeRequest` implies at least one subscriber exists, regardless
-    /// of whether its paired `SubscriberCount` update has arrived yet).
-    KeyframeRequest,
 }
 
 /// Sends a `gst_video::UpstreamForceKeyUnitEvent` into the pipeline from
@@ -1529,83 +1817,59 @@ fn record_encoder_frame(times: &mut VecDeque<Instant>, fps: &AtomicU32) {
     fps.store(rate.round() as u32, Ordering::Relaxed);
 }
 
-/// Drains encoded access units from `appsink` and pipeline error/EOS
-/// messages from `bus` concurrently, for as long as either stream keeps
-/// producing, while also reacting to [`CaptureControlEvent`]s on
-/// `control_rx` (pausing/resuming `encoder_valve` and forcing keyframes via
-/// `encoder_sink_pad` — see [`force_keyframe`]) and bridging
-/// `self_preview`'s raw-RGB samples into its frame slot (see
-/// [`sample_to_color_image`], [`SelfPreviewBridge`], and
-/// [`CaptureHandle::self_preview_frame`]). Exits its GStreamer-facing half
-/// when the appsink, bus, and self-preview streams have all ended (normal
-/// teardown, see [`CaptureHandle::stop`]) or the bus reports a pipeline
-/// error; `control_rx` naturally stops contributing new work once
-/// `CaptureHandle` (and its `control_tx`) drops, so it doesn't gate the
-/// loop's exit the same way the other three do.
-async fn pump_loop(
-    client: ScreenshareClient,
-    stream_id: u8,
-    mut appsink_stream: gst_app::app_sink::AppSinkStream,
-    mut bus_stream: gst::bus::BusStream,
-    mut control_rx: mpsc::UnboundedReceiver<CaptureControlEvent>,
-    encoder_valve: gst::Element,
-    encoder_sink_pad: gst::Pad,
-    encoder_fps: Arc<AtomicU32>,
-    mut self_preview: SelfPreviewBridge,
-    runtime: destination::SharedDestination,
-) {
-    let start = Instant::now();
-    // The stall protocol's clock. Ticks unconditionally (a `select!` arm
-    // can't be conditionally scheduled without re-creating the interval), but
-    // `send_stall_keepalive` is a cheap early-return whenever the destination
-    // isn't stalled, and the loop's own exit check runs before the `select!`
-    // — so this costs one wakeup every `STALL_RESEND_INTERVAL` and can never
-    // hold the loop open past teardown.
-    let mut stall_ticker = tokio::time::interval(destination::STALL_RESEND_INTERVAL);
-    stall_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut appsink_done = false;
+/// Everything one destination's [`destination_pump`] can be asked to do.
+///
+/// `Why a command channel rather than shared state the UI writes directly:`
+/// a destination's encode branch is owned by exactly one task, and every
+/// interesting operation on it (pause, force a keyframe, swap it for a
+/// differently-configured one, drain and remove it) either mutates it or
+/// consumes it. Routing all of them through one mailbox is what makes
+/// "exactly one owner, no locks around GStreamer objects" true, and it is
+/// what lets a swap be `await`ed inside the pump without the UI thread ever
+/// blocking.
+enum DestCmd {
+    /// New subscriber count for this destination's stream. `0` pauses its
+    /// encoder branch (via the branch's own `valve`) to save CPU/bandwidth
+    /// while nobody is watching *this* stream; a transition from `0` to
+    /// non-zero resumes it and forces a keyframe (see [`force_keyframe`]) so
+    /// the newly (re)subscribed viewer's decoder has something to start from.
+    SubscriberCount(u32),
+    /// A new subscriber joined (relay-debounced). Forces a keyframe — and,
+    /// if this branch happened to be paused, resumes it too (a
+    /// `KeyframeRequest` implies at least one subscriber exists, regardless
+    /// of whether its paired `SubscriberCount` update has arrived yet).
+    KeyframeRequest,
+    /// Tier 1 ([`destination::ChangeTier::Bitrate`]): live encoder property
+    /// write, no lifecycle consequence at all.
+    SetBitrate(u32),
+    /// Tier 2 ([`destination::ChangeTier::BranchSwap`]): replace this
+    /// destination's branch with one built for `params`, make-before-break.
+    ApplyParams { params: destination::VideoParams, reply: tokio::sync::oneshot::Sender<Result<(), String>> },
+    /// Drain and remove this destination's branch, tell its room the stream
+    /// stopped, and exit.
+    Stop { reply: tokio::sync::oneshot::Sender<Result<(), String>> },
+}
+
+/// Per-**capture** background loop: watches the pipeline bus for error/EOS
+/// and bridges the self-preview branch's raw-RGB samples into their frame
+/// slot (see [`sample_to_color_image`], [`SelfPreviewBridge`], and
+/// [`CaptureHandle::self_preview_frame`]).
+///
+/// Deliberately holds nothing destination-scoped: with fan-out there are N
+/// destinations per capture but still exactly one bus and one self-preview
+/// branch, so this loop exists once per capture and every send/encode
+/// concern lives in [`destination_pump`] instead.
+async fn capture_loop(mut bus_stream: gst::bus::BusStream, mut self_preview: SelfPreviewBridge) {
     let mut bus_done = false;
-    // Gates loop exit alongside `appsink_done`/`bus_done` (see the doc
-    // comment above) so a self-preview branch that never reaches EOS for any
-    // reason can't hang `pump_loop` — mirrors those two flags' shape exactly.
+    // Gates loop exit alongside `bus_done` so a self-preview branch that
+    // never reaches EOS for any reason can't hang `CaptureHandle::stop`.
     let mut self_preview_done = false;
-    // Sliding window of the `Instant`s each encoded access unit reached the
-    // appsink, used to compute [`CaptureHandle::encoder_fps`]'s live rate —
-    // see [`ENCODER_FPS_WINDOW`].
-    let mut encoded_frame_times: VecDeque<Instant> = VecDeque::new();
-    // Once `control_tx` (on `CaptureHandle`) drops, `control_rx.recv()`
-    // resolves to `None` immediately on every poll — this flag stops that
-    // from turning into a busy-spin on this `select!` arm for however much
-    // longer the loop keeps running on the other two streams (normally
-    // zero, since `stop()` always awaits `pump_task` to completion before
-    // `self`/`control_tx` drop; only the bare-drop `Drop` backstop path,
-    // which doesn't join `pump_task`, could otherwise hit this).
-    let mut control_done = false;
-    // Mirrors the valve's actual `drop` property so a `SubscriberCount`
-    // transition from one non-zero count to another (e.g. 2 -> 1) doesn't
-    // spuriously re-force a keyframe — only an actual 0 -> non-zero (or an
-    // explicit `KeyframeRequest`) does.
-    let mut paused = false;
 
     loop {
-        if appsink_done && bus_done && self_preview_done {
+        if bus_done && self_preview_done {
             return;
         }
         tokio::select! {
-            sample = appsink_stream.next(), if !appsink_done => {
-                match sample {
-                    Some(sample) => {
-                        record_encoder_frame(&mut encoded_frame_times, &encoder_fps);
-                        if let Err(e) = send_encoded_sample(&client, stream_id, &sample, start, &runtime) {
-                            tracing::warn!("dropping encoded frame for stream {stream_id}: {e:#}");
-                        }
-                    }
-                    None => appsink_done = true,
-                }
-            }
-            _ = stall_ticker.tick() => {
-                send_stall_keepalive(&client, stream_id, &runtime);
-            }
             msg = bus_stream.next(), if !bus_done => {
                 match msg {
                     Some(msg) => handle_bus_message(&msg, &mut bus_done),
@@ -1616,54 +1880,198 @@ async fn pump_loop(
                 match sample {
                     Some(sample) => match sample_to_color_image(&sample) {
                         Ok(image) => *self_preview.frame.lock().unwrap() = Some(image),
-                        Err(e) => tracing::warn!("dropping malformed self-preview frame for stream {stream_id}: {e:#}"),
+                        Err(e) => tracing::warn!("dropping malformed self-preview frame: {e:#}"),
                     },
                     None => self_preview_done = true,
                 }
             }
-            ctrl = control_rx.recv(), if !control_done => {
-                match ctrl {
-                    Some(CaptureControlEvent::SubscriberCount(0)) => {
-                        if !paused {
-                            tracing::info!("stream {stream_id} has 0 subscribers; pausing encoder to save CPU/bandwidth");
-                            set_valve_drop(&encoder_valve, true, stream_id);
+        }
+    }
+}
+
+/// Per-**destination** loop: drains encoded access units off *this
+/// destination's* encode branch, encrypts/fragments/sends them into *this
+/// destination's* room, keeps the stall protocol's cached-IDR keepalive
+/// going, and services the [`DestCmd`]s above (including branch swaps, which
+/// it owns because it owns the branch).
+///
+/// One of these per room a capture feeds. Two destinations of the same
+/// capture share nothing but the raw frames coming off the `tee`: separate
+/// encoders, separate bitrates, separate room keys and nonce sequences,
+/// separate `stream_id`s, separate lifecycle state. That is the whole
+/// "confirmed intentional bandwidth multiplication" model from the plan doc,
+/// made literal.
+#[allow(clippy::too_many_arguments)]
+async fn destination_pump(
+    client: ScreenshareClient,
+    stream_id: u8,
+    pipeline: gst::Pipeline,
+    tee: gst::Element,
+    branch: branch::EncodeBranch,
+    runtime: destination::SharedDestination,
+    encoder_fps: Arc<AtomicU32>,
+    mut cmd_rx: mpsc::UnboundedReceiver<DestCmd>,
+) {
+    let start = Instant::now();
+    // The stall protocol's clock. Ticks unconditionally (a `select!` arm
+    // can't be conditionally scheduled without re-creating the interval), but
+    // `send_stall_keepalive` is a cheap early-return whenever the destination
+    // isn't stalled — so this costs one wakeup every `STALL_RESEND_INTERVAL`.
+    let mut stall_ticker = tokio::time::interval(destination::STALL_RESEND_INTERVAL);
+    stall_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Sliding window of the `Instant`s each encoded access unit reached the
+    // appsink, used to compute this destination's live encode rate — see
+    // [`ENCODER_FPS_WINDOW`].
+    let mut encoded_frame_times: VecDeque<Instant> = VecDeque::new();
+    // Mirrors this branch's valve so a `SubscriberCount` transition from one
+    // non-zero count to another (e.g. 2 -> 1) doesn't spuriously re-force a
+    // keyframe — only an actual 0 -> non-zero (or an explicit
+    // `KeyframeRequest`) does.
+    let mut paused = false;
+    // `Option` purely so a swap can take the branch by value (that ownership
+    // transfer *is* the appsink-reader handoff — see `branch::EncodeBranch`'s
+    // doc comment) and put its replacement back. Never `None` across a
+    // `select!` poll except inside the swap arm itself.
+    let mut branch = Some(branch);
+    // Set once this branch's appsink has yielded its terminal `None`, so the
+    // sample arm stops being scheduled instead of spinning on a stream that
+    // will only ever return `None` again.
+    let mut branch_ended = false;
+    // Distinct `BranchId`s per swap, purely for greppable element names.
+    let mut next_branch_id: u32 = 1;
+
+    loop {
+        tokio::select! {
+            sample = async { branch.as_mut().expect("guarded by branch.is_some()").next_sample().await },
+                if branch.is_some() && !branch_ended =>
+            {
+                match sample {
+                    Some(sample) => {
+                        record_encoder_frame(&mut encoded_frame_times, &encoder_fps);
+                        if let Err(e) = send_encoded_sample(&client, stream_id, &sample, start, &runtime) {
+                            tracing::warn!("dropping encoded frame for stream {stream_id}: {e:#}");
+                        }
+                    }
+                    None => branch_ended = true,
+                }
+            }
+            _ = stall_ticker.tick() => {
+                send_stall_keepalive(&client, stream_id, &runtime);
+            }
+            cmd = cmd_rx.recv() => {
+                match cmd {
+                    // Every sender is gone: the `CaptureHandle` was dropped
+                    // without `stop()` (the bare-drop backstop path), so the
+                    // pipeline is being torn down under us. Nothing useful is
+                    // left to drain.
+                    None => return,
+                    Some(DestCmd::SubscriberCount(0)) => {
+                        if !paused && let Some(branch) = branch.as_ref() {
+                            tracing::info!("stream {stream_id} has 0 subscribers; pausing its encoder to save CPU/bandwidth");
+                            branch.set_paused(true, stream_id);
                             paused = true;
                             // No more encoded frames will arrive while
                             // paused, so `record_encoder_frame`'s window
-                            // won't naturally decay on its own (it only
-                            // recomputes on a new frame) — reset the
+                            // won't naturally decay on its own — reset the
                             // published rate to 0 immediately rather than
-                            // leaving `encoder_fps()` stuck reporting its
-                            // last pre-pause value.
+                            // leaving it stuck reporting its last pre-pause
+                            // value.
                             encoded_frame_times.clear();
                             encoder_fps.store(0, Ordering::Relaxed);
                         }
                     }
-                    Some(CaptureControlEvent::SubscriberCount(_)) => {
-                        if paused {
-                            tracing::info!("stream {stream_id} has a subscriber again; resuming encoder");
-                            set_valve_drop(&encoder_valve, false, stream_id);
+                    Some(DestCmd::SubscriberCount(_)) => {
+                        if paused && let Some(branch) = branch.as_ref() {
+                            tracing::info!("stream {stream_id} has a subscriber again; resuming its encoder");
+                            branch.set_paused(false, stream_id);
                             paused = false;
                             // Resuming after a pause means the first frame
                             // back out of the encoder must be a keyframe —
                             // nothing decodable was produced while paused.
-                            force_keyframe(&encoder_sink_pad);
+                            if let Some(pad) = branch.keyframe_pad() {
+                                force_keyframe(&pad);
+                            }
                         }
                     }
-                    Some(CaptureControlEvent::KeyframeRequest) => {
-                        if paused {
-                            // A subscribe implies at least one subscriber
-                            // exists even if the paired `SubscriberCount`
-                            // update hasn't arrived yet — don't leave the
-                            // encoder paused (and the new subscriber with
-                            // nothing to decode) waiting on message order.
-                            tracing::info!("stream {stream_id} got a keyframe request while paused; resuming encoder");
-                            set_valve_drop(&encoder_valve, false, stream_id);
-                            paused = false;
+                    Some(DestCmd::KeyframeRequest) => {
+                        if let Some(branch) = branch.as_ref() {
+                            if paused {
+                                // A subscribe implies at least one subscriber
+                                // exists even if the paired `SubscriberCount`
+                                // update hasn't arrived yet — don't leave the
+                                // encoder paused (and the new subscriber with
+                                // nothing to decode) waiting on message order.
+                                tracing::info!("stream {stream_id} got a keyframe request while paused; resuming its encoder");
+                                branch.set_paused(false, stream_id);
+                                paused = false;
+                            }
+                            if let Some(pad) = branch.keyframe_pad() {
+                                force_keyframe(&pad);
+                            }
                         }
-                        force_keyframe(&encoder_sink_pad);
                     }
-                    None => control_done = true,
+                    Some(DestCmd::SetBitrate(bitrate_kbps)) => {
+                        if let Some(branch) = branch.as_ref() {
+                            branch.set_bitrate_kbps(bitrate_kbps);
+                            runtime.lock().unwrap().set_bitrate(bitrate_kbps);
+                        }
+                    }
+                    Some(DestCmd::ApplyParams { params, reply }) => {
+                        let Some(old) = branch.take() else {
+                            let _ = reply.send(Err("destination has no live encode branch".to_string()));
+                            continue;
+                        };
+                        let id = branch::BranchId(next_branch_id);
+                        next_branch_id = next_branch_id.wrapping_add(1);
+                        // `Why the whole swap is awaited here, inside the
+                        // pump's own loop:` the branch must be owned by
+                        // exactly one place, and this is it. The cost is that
+                        // this destination's already-encoded samples aren't
+                        // drained while the replacement branch is coming up
+                        // (its appsink is `drop=true`, so they're discarded,
+                        // not queued) — normally a few hundred milliseconds,
+                        // bounded by `branch::FIRST_IDR_TIMEOUT`. The
+                        // destination reports `Rebuilding` throughout, which
+                        // is exactly what that state is for. Every *other*
+                        // destination on this capture keeps sending
+                        // untouched, since each has its own pump.
+                        match branch::swap_to_new_branch(&pipeline, &tee, &runtime, old, id, params).await {
+                            branch::SwapOutcome::Swapped(new_branch) => {
+                                // The new branch's own first IDR was consumed
+                                // by the swap's readiness check, so ask for
+                                // another one rather than leaving the viewer
+                                // decoding deltas against a GOP it never got.
+                                if let Some(pad) = new_branch.keyframe_pad() {
+                                    force_keyframe(&pad);
+                                }
+                                if paused {
+                                    // A replacement branch is born open; carry
+                                    // the destination's paused state across.
+                                    new_branch.set_paused(true, stream_id);
+                                }
+                                branch = Some(new_branch);
+                                branch_ended = false;
+                                let _ = reply.send(Ok(()));
+                            }
+                            branch::SwapOutcome::KeptOld(old, e) => {
+                                branch = Some(old);
+                                let _ = reply.send(Err(format!("{e:#}")));
+                            }
+                        }
+                    }
+                    Some(DestCmd::Stop { reply }) => {
+                        let mut result = Ok(());
+                        if let Some(branch) = branch.take()
+                            && let Err(e) = branch::remove_branch(&pipeline, &tee, branch).await
+                        {
+                            result = Err(format!("{e:#}"));
+                        }
+                        if let Err(e) = client.stop_stream(stream_id).await {
+                            tracing::warn!("error notifying relay that stream {stream_id} stopped: {e:#}");
+                        }
+                        let _ = reply.send(result);
+                        return;
+                    }
                 }
             }
         }
@@ -2236,8 +2644,22 @@ pub mod destination {
         }
 
         /// Tier-2: a branch swap is starting. Invisible to the viewer.
+        ///
+        /// `Why` this refuses to start from `Stalled` as well as from
+        /// `Failed`: `Rebuilding` asserts "the old branch is still
+        /// authoritative and still sending", and [`Self::abandon_rebuild`]
+        /// resolves back to `Live` on that assumption. While the shared
+        /// capture source is down that assumption is false — nothing is being
+        /// produced at all — so overwriting a `Stalled` with `Rebuilding`
+        /// would (a) silence the stall protocol's cached-IDR keepalive (which
+        /// only runs while `is_stalled()`), and (b) let a failed swap report
+        /// `Live` while the source is still gone, i.e. hide a real outage
+        /// behind a healthy-looking state. A swap requested during an outage
+        /// is simply not startable; the caller keeps its old branch and can
+        /// retry once the source is back (`note_encoded_frame`'s first real
+        /// IDR returns the destination to `Live`).
         pub fn begin_rebuild(&mut self, now: Instant) {
-            if matches!(self.state, DestinationState::Failed(_)) {
+            if matches!(self.state, DestinationState::Failed(_)) || self.state.is_stalled() {
                 return;
             }
             self.state = DestinationState::Rebuilding { since: now };
@@ -2373,6 +2795,36 @@ pub mod destination {
             runtime.note_encoded_frame(true, b"idr", now);
             runtime.begin_rebuild(now + Duration::from_millis(10));
             runtime.abandon_rebuild();
+            assert_eq!(runtime.state(), DestinationState::Live);
+        }
+
+        /// A rebuild is not startable from `Stalled`, and a failed one
+        /// therefore cannot resolve a real outage away.
+        ///
+        /// Without the guard, `begin_rebuild` overwrote `Stalled` with
+        /// `Rebuilding` and `abandon_rebuild` then resolved that to `Live` —
+        /// so a branch swap attempted while the shared capture source was
+        /// down would report a healthy, live destination while nothing was
+        /// being produced at all, and would silence the cached-IDR keepalive
+        /// (which only runs while `is_stalled()`) for as long as the "rebuild"
+        /// lasted.
+        #[test]
+        fn a_rebuild_cannot_be_started_from_stalled_and_cannot_resolve_the_stall() {
+            let now = t0();
+            let mut runtime = DestinationRuntime::new(now, params(30));
+            runtime.note_encoded_frame(true, b"idr", now);
+            runtime.begin_stall(StallReason::SourceChanged, now + Duration::from_millis(10));
+
+            runtime.begin_rebuild(now + Duration::from_millis(20));
+            assert!(runtime.is_stalled(), "a stalled destination must not enter Rebuilding");
+
+            runtime.abandon_rebuild();
+            assert!(runtime.is_stalled(), "abandoning must not turn a real outage into Live");
+            runtime.finish_rebuild();
+            assert!(runtime.is_stalled(), "finishing a rebuild that never started must not clear the stall either");
+
+            // The one thing that does clear it: a real frame.
+            runtime.note_encoded_frame(true, b"idr2", now + Duration::from_millis(30));
             assert_eq!(runtime.state(), DestinationState::Live);
         }
 
@@ -2745,11 +3197,52 @@ pub mod branch {
         pub appsink: gst_app::AppSink,
         bin: gst::Bin,
         tee_pad: gst::Pad,
+        /// This branch's own encoder element, kept so its `bitrate` property
+        /// can be written live — the plan doc's tier-1 change (see
+        /// [`super::destination::ChangeTier::Bitrate`]) and what the
+        /// Absolute-Maximum bandwidth allocator drives once per second.
+        encoder: gst::Element,
+        /// This branch's own `valve`, gating everything downstream of the
+        /// tee's `queue`. Per-branch rather than one shared valve on the
+        /// capture: subscriber counts are per *stream*, so one destination
+        /// dropping to zero subscribers must pause only its own encoder, not
+        /// every destination fed by the same capture.
+        valve: gst::Element,
         /// See the type's doc comment — created at most once per branch.
         stream: Option<gst_app::app_sink::AppSinkStream>,
     }
 
     impl EncodeBranch {
+        /// Tier-1 change: write this branch's encoder bitrate live. Both
+        /// `x264enc` and `vah264enc` take `bitrate` in kbit/s and accept the
+        /// write while `Playing` (see [`super::EncoderBackend::launch_fragment`]).
+        pub fn set_bitrate_kbps(&self, bitrate_kbps: u32) {
+            self.encoder.set_property("bitrate", bitrate_kbps);
+        }
+
+        /// Current value of the encoder's `bitrate` property, read back off
+        /// the live element — the ground truth a bitrate write is checked
+        /// against (used by this module's tests, and useful for diagnosing a
+        /// write that silently didn't take).
+        pub fn bitrate_kbps(&self) -> u32 {
+            self.encoder.property::<u32>("bitrate")
+        }
+
+        /// Pause (`true`) or resume (`false`) this branch's encoder by
+        /// dropping raw buffers at its `valve`, before they ever reach the
+        /// encoder. See [`super::set_valve_drop`] for the read-back
+        /// diagnostic this delegates to.
+        pub fn set_paused(&self, paused: bool, stream_id: u8) {
+            super::set_valve_drop(&self.valve, paused, stream_id);
+        }
+
+        /// The pad to push an upstream force-key-unit event from for *this*
+        /// branch (see [`super::force_keyframe`]): its appsink's sink pad, so
+        /// the event travels upstream through exactly this branch's encoder
+        /// and no other branch's.
+        pub fn keyframe_pad(&self) -> Option<gst::Pad> {
+            self.appsink.static_pad("sink")
+        }
         /// This branch's single `AppSinkStream`, created on first use. See the
         /// type's doc comment for why there must never be a second one.
         fn sample_stream(&mut self) -> &mut gst_app::app_sink::AppSinkStream {
@@ -2882,19 +3375,40 @@ pub mod branch {
         let gop_frames = GOP_SECONDS * framerate;
         let encoder = settings.backend.launch_fragment(settings.bitrate_kbps, gop_frames);
         let raw_format = settings.backend.raw_format();
-        let width = settings.width;
-        let height = settings.height;
+        // `Why` a size-less capsfilter when either axis is 0: 0 is this
+        // codebase's "whatever the source is producing" sentinel (see
+        // [`super::destination::clamp_to_source`], which treats it as "nothing
+        // to clamp against"), and `width=0` in a capsfilter is not that — it's
+        // an impossible constraint that fails negotiation outright. Leaving
+        // both fields out entirely is what actually expresses "don't
+        // downscale", letting `videoscale` pass the source resolution through.
+        let scale_caps = if settings.width == 0 || settings.height == 0 {
+            String::new()
+        } else {
+            format!(",width={},height={}", settings.width, settings.height)
+        };
 
         let appsink_name = format!("branch_appsink_{index}");
         let bin_name = format!("branch_{index}");
+        let encoder_name = format!("branch_encoder_{index}");
+        let valve_name = format!("branch_valve_{index}");
 
+        // `valve ... drop-mode=forward-sticky-events` right after the queue,
+        // for exactly the reasons the pipeline's original fixed encoder branch
+        // used one (see [`super::ENCODER_VALVE_NAME`]'s and
+        // [`super::build_pipeline`]'s doc comments): pausing a destination
+        // with no subscribers must stop the *encoder* burning CPU without
+        // touching the shared tee or the pipeline state, and the mode must
+        // forward sticky events so [`remove_branch`]'s injected EOS still
+        // drains through a paused branch instead of hanging its 5s timeout.
         let description = format!(
             "queue leaky=downstream max-size-buffers={ENCODER_QUEUE_MAX_BUFFERS} \
+             ! valve name={valve_name} drop=false drop-mode=forward-sticky-events \
              ! videoconvert \
              ! videoscale \
              ! videorate drop-only=false max-duplication-time=0 \
-             ! video/x-raw,format={raw_format},width={width},height={height},framerate={framerate}/1 \
-             ! {encoder} \
+             ! video/x-raw,format={raw_format}{scale_caps},framerate={framerate}/1 \
+             ! {encoder} name={encoder_name} \
              ! video/x-h264,stream-format=byte-stream,alignment=au \
              ! appsink name={appsink_name} emit-signals=false sync=false max-buffers=4 drop=true"
         );
@@ -2911,6 +3425,13 @@ pub mod branch {
             .ok_or_else(|| anyhow!("branch bin has no element named '{appsink_name}'"))?
             .downcast::<gst_app::AppSink>()
             .map_err(|_| anyhow!("'{appsink_name}' element is not an AppSink"))?;
+
+        let encoder_element = bin
+            .by_name(&encoder_name)
+            .ok_or_else(|| anyhow!("branch bin has no element named '{encoder_name}'"))?;
+        let valve = bin
+            .by_name(&valve_name)
+            .ok_or_else(|| anyhow!("branch bin has no element named '{valve_name}'"))?;
 
         let branch_sink_pad = bin.static_pad("sink").ok_or_else(|| {
             anyhow!("branch bin has no ghost sink pad (the queue's sink pad should have been auto-ghosted)")
@@ -2941,7 +3462,7 @@ pub mod branch {
             return Err(anyhow!("failed to link tee's new request pad to the encode branch: {e:?}"));
         }
 
-        Ok(EncodeBranch { id, appsink, bin, tee_pad, stream: None })
+        Ok(EncodeBranch { id, appsink, bin, tee_pad, encoder: encoder_element, valve, stream: None })
     }
 
     /// [`add_branch`] with the same per-branch VAAPI→software fallback
@@ -3018,8 +3539,26 @@ pub mod branch {
                     EncodeSettings { backend: EncoderBackend::Software, ..settings },
                 )
                 .context("software fallback encode branch failed to build")?;
-                let sample = fallback.wait_for_first_idr(FIRST_IDR_TIMEOUT).await?;
-                Ok((fallback, sample))
+                // Same cleanup contract as the two sibling failure paths: a
+                // branch that was built and linked but is being abandoned
+                // must be removed, never left orphaned on the tee.
+                //
+                // `Why:` without this, a fallback branch that also fails to
+                // produce an IDR stays linked to a live `tee`, `Playing`,
+                // encoding into an appsink nobody reads — forever, since the
+                // caller never receives it and therefore can never remove it.
+                // Every future `remove_branch`/`swap` on that capture leaves
+                // it behind too, so a handful of failed adds silently pile up
+                // parallel encoders on one capture. Mirrors the `let _ =
+                // remove_branch(...)` in the VAAPI-dud arm above and the
+                // generic `Err(e)` arm below.
+                match fallback.wait_for_first_idr(FIRST_IDR_TIMEOUT).await {
+                    Ok(sample) => Ok((fallback, sample)),
+                    Err(e) => {
+                        let _ = remove_branch(pipeline, tee, fallback).await;
+                        Err(e).context("software fallback encode branch produced no IDR either")
+                    }
+                }
             }
             Err(e) => {
                 let _ = remove_branch(pipeline, tee, branch).await;
@@ -3075,7 +3614,7 @@ pub mod branch {
         // value is what makes this safe by construction: the production reader
         // cannot still be holding it.
         let _ = branch.sample_stream();
-        let EncodeBranch { id: _, appsink: _, bin, tee_pad, stream } = branch;
+        let EncodeBranch { id: _, appsink: _, bin, tee_pad, encoder: _, valve: _, stream } = branch;
         let mut appsink_stream = stream.expect("sample_stream() populated it immediately above");
 
         let branch_sink_pad = bin
@@ -3349,7 +3888,7 @@ pub mod branch {
     }
 
     #[cfg(test)]
-    mod tests {
+    pub(super) mod tests {
         use super::*;
 
         /// Builds a minimal `videotestsrc ! videoconvert ! tee name=t`
@@ -3393,6 +3932,50 @@ pub mod branch {
                 bitrate_kbps: 500,
                 backend: EncoderBackend::Software,
             }
+        }
+
+        /// Taps the tee with a plain `queue ! appsink` — **no `videorate`** —
+        /// and measures how many raw frames actually come off it per second.
+        ///
+        /// `Why not measure at an encode branch's appsink:` every encode
+        /// branch has its own `videorate drop-only=false`, which *duplicates*
+        /// frames up to its configured rate. A branch therefore reports its
+        /// own rate no matter what the source is doing, which is exactly the
+        /// point of per-destination framerates — and exactly why it cannot be
+        /// used to observe the shared source rate. This tap has nothing
+        /// between the tee and the sink, so what it counts is what the tee is
+        /// really carrying.
+        pub(in crate::capture) fn tap_tee_rate(pipeline: &gst::Pipeline, tee: &gst::Element, window: Duration) -> f64 {
+            let bin = gst::parse::bin_from_description(
+                "queue leaky=downstream max-size-buffers=2 ! appsink name=tap emit-signals=false sync=false max-buffers=8 drop=true",
+                true,
+            )
+            .expect("tap bin should parse");
+            let appsink = bin
+                .by_name("tap")
+                .expect("tap appsink should exist")
+                .downcast::<gst_app::AppSink>()
+                .expect("tap should be an AppSink");
+            let tee_pad = tee.request_pad_simple("src_%u").expect("tee should give a pad");
+            pipeline.add(&bin).expect("tap bin should add");
+            bin.sync_state_with_parent().expect("tap bin should sync state");
+            tee_pad.link(&bin.static_pad("sink").expect("ghost pad")).expect("tap should link");
+
+            // Discard whatever was queued while linking, then count.
+            while appsink.try_pull_sample(gst::ClockTime::ZERO).is_some() {}
+            let deadline = Instant::now() + window;
+            let mut count = 0u32;
+            while Instant::now() < deadline {
+                if appsink.try_pull_sample(gst::ClockTime::from_mseconds(50)).is_some() {
+                    count += 1;
+                }
+            }
+
+            let _ = tee_pad.unlink(&bin.static_pad("sink").expect("ghost pad"));
+            let _ = pipeline.remove(&bin);
+            let _ = bin.set_state(gst::State::Null);
+            tee.release_request_pad(&tee_pad);
+            count as f64 / window.as_secs_f64()
         }
 
         /// Polls `appsink` for up to `timeout` and reports whether at least
@@ -3869,10 +4452,17 @@ pub mod branch {
 
             let (branch, runtime) = start_live_destination(&pipeline, &tee, BranchId(1), small_params()).await;
 
-            // A width of 0 cannot negotiate, so the replacement branch fails
-            // to build — a stand-in for any real "these settings don't work on
-            // this machine" failure.
-            let impossible = VideoParams { width: 0, height: 0, ..small_params() };
+            // 1x1 is a size `x264enc` accepts in its caps template but cannot
+            // actually initialise an encoder for (verified: it fails in
+            // `gst_x264_enc_init_encoder`, so the branch never prerolls), so
+            // the replacement branch fails to come up — a stand-in for any
+            // real "these settings don't work on this machine" failure.
+            //
+            // Not `width: 0`: that is this codebase's "whatever the source is"
+            // sentinel, which `branch::add_branch` deliberately turns into a
+            // *size-less* capsfilter (see its `Why:` note) and therefore
+            // negotiates perfectly well.
+            let impossible = VideoParams { width: 1, height: 1, ..small_params() };
             let outcome = swap_to_new_branch(&pipeline, &tee, &runtime, branch, BranchId(2), impossible).await;
 
             let old = match outcome {
@@ -4159,6 +4749,161 @@ pub mod branch {
                     .expect("cleanup should succeed");
             }
             pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+        }
+
+        /// The bandwidth allocator's actual write path: a tier-1 bitrate
+        /// change must land on the *live* encoder element of the branch it
+        /// targets, and on no other branch's.
+        ///
+        /// `Why this is worth a real-GStreamer test rather than trusting the
+        /// property write:` "the UI shows a number that never reaches the
+        /// pipeline" is a bug shape this module has already been bitten by
+        /// twice (see `build_pipeline_framerate_parameter_actually_caps_
+        /// encoder_output_rate`'s doc comment), and Absolute-Maximum mode
+        /// rests entirely on these writes landing. Reading the property back
+        /// off the element proves the write reached the encoder that is
+        /// actually encoding, not a detached handle.
+        #[tokio::test]
+        async fn setting_one_branchs_bitrate_writes_through_to_that_encoder_only() {
+            if gst::init().is_err() {
+                eprintln!("skipping: gstreamer not available in this environment");
+                return;
+            }
+
+            let (pipeline, tee) = build_test_pipeline();
+            pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+            let (state_result, ..) = pipeline.state(gst::ClockTime::from_seconds(5));
+            state_result.expect("pipeline should settle into PLAYING");
+
+            let first = add_branch(&pipeline, &tee, BranchId(1), EncodeSettings { bitrate_kbps: 500, ..small_settings() })
+                .expect("add_branch should succeed");
+            let second =
+                add_branch(&pipeline, &tee, BranchId(2), EncodeSettings { bitrate_kbps: 900, ..small_settings() })
+                    .expect("add_branch should succeed");
+
+            // Each branch starts at the rate it was *built* with — proof the
+            // per-destination bitrate isn't shared state.
+            assert_eq!(first.bitrate_kbps(), 500);
+            assert_eq!(second.bitrate_kbps(), 900);
+            assert!(wait_for_sample(&first.appsink, Duration::from_secs(5)), "first branch produced nothing");
+
+            // A live write while both branches are encoding.
+            first.set_bitrate_kbps(2_500);
+            assert_eq!(first.bitrate_kbps(), 2_500, "the bitrate write did not reach the live encoder");
+            assert_eq!(second.bitrate_kbps(), 900, "one destination's bitrate write must not touch another's encoder");
+
+            // …and the branch keeps producing across it (a property write is
+            // not supposed to disturb the stream at all — that is exactly why
+            // it is its own tier).
+            assert!(
+                wait_for_sample(&first.appsink, Duration::from_secs(5)),
+                "the branch stopped producing after a live bitrate write"
+            );
+
+            for branch in [first, second] {
+                tokio::time::timeout(Duration::from_secs(10), remove_branch(&pipeline, &tee, branch))
+                    .await
+                    .expect("cleanup should not hang")
+                    .expect("cleanup should succeed");
+            }
+            pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+        }
+
+        /// Per-destination pause: closing one branch's own valve stops that
+        /// branch's encoder without touching a sibling branch on the same tee.
+        /// Subscriber counts are per stream, so the pause has to be per branch
+        /// — a shared valve would take every fanned-out destination down with
+        /// the one nobody happens to be watching.
+        #[tokio::test]
+        async fn pausing_one_branch_does_not_pause_its_sibling() {
+            if gst::init().is_err() {
+                eprintln!("skipping: gstreamer not available in this environment");
+                return;
+            }
+
+            let (pipeline, tee) = build_test_pipeline();
+            pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+            let (state_result, ..) = pipeline.state(gst::ClockTime::from_seconds(5));
+            state_result.expect("pipeline should settle into PLAYING");
+
+            let paused_branch = add_branch(&pipeline, &tee, BranchId(1), small_settings()).expect("add_branch");
+            let live_branch = add_branch(&pipeline, &tee, BranchId(2), small_settings()).expect("add_branch");
+
+            assert!(wait_for_sample(&paused_branch.appsink, Duration::from_secs(5)), "branch 1 produced nothing");
+            assert!(wait_for_sample(&live_branch.appsink, Duration::from_secs(5)), "branch 2 produced nothing");
+
+            paused_branch.set_paused(true, 0);
+            // Drain whatever was already encoded and in flight before the
+            // valve closed, then confirm nothing new arrives.
+            while paused_branch.appsink.try_pull_sample(gst::ClockTime::from_mseconds(50)).is_some() {}
+            assert!(
+                !wait_for_sample(&paused_branch.appsink, Duration::from_millis(700)),
+                "a paused branch must stop producing encoded output"
+            );
+            assert!(
+                wait_for_sample(&live_branch.appsink, Duration::from_secs(5)),
+                "pausing one destination must not pause another destination of the same capture"
+            );
+
+            paused_branch.set_paused(false, 0);
+            assert!(
+                wait_for_sample(&paused_branch.appsink, Duration::from_secs(5)),
+                "a resumed branch must start producing again"
+            );
+
+            for branch in [paused_branch, live_branch] {
+                tokio::time::timeout(Duration::from_secs(10), remove_branch(&pipeline, &tee, branch))
+                    .await
+                    .expect("cleanup should not hang")
+                    .expect("cleanup should succeed");
+            }
+            pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+        }
+
+        /// The shared source rate is a live, rewritable capsfilter (tier 3):
+        /// raising it must actually change what the tee — and therefore every
+        /// branch capped at or above the new rate — is fed, on a pipeline that
+        /// never leaves `Playing`.
+        #[test]
+        fn rewriting_the_source_caps_changes_the_shared_rate_live() {
+            if gst::init().is_err() {
+                eprintln!("skipping: gstreamer not available in this environment");
+                return;
+            }
+
+            let built = super::super::build_pipeline(
+                "videotestsrc is-live=true pattern=smpte ! video/x-raw,width=64,height=64,framerate=60/1",
+                5,
+            )
+            .expect("pipeline should construct");
+            built.pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+            let (state_result, ..) = built.pipeline.state(gst::ClockTime::from_seconds(5));
+            state_result.expect("pipeline should settle into PLAYING");
+
+            // A real destination branch runs across the whole rewrite, so this
+            // also proves the renegotiation doesn't kill an existing branch.
+            let branch = add_branch(&built.pipeline, &built.tee, BranchId(1), small_settings())
+                .expect("add_branch should succeed");
+            assert!(wait_for_sample(&branch.appsink, Duration::from_secs(5)), "branch produced nothing to begin with");
+
+            let window = Duration::from_millis(1500);
+            let slow = tap_tee_rate(&built.pipeline, &built.tee, window);
+            built.source_caps.set_property("caps", super::super::source_framerate_caps(30));
+            // Give the renegotiation a moment before measuring.
+            std::thread::sleep(Duration::from_millis(300));
+            let fast = tap_tee_rate(&built.pipeline, &built.tee, window);
+
+            eprintln!("shared source rate: 5fps -> {slow:.1}fps measured; 30fps -> {fast:.1}fps measured");
+            assert!(
+                fast > slow * 2.0,
+                "rewriting the source capsfilter did not change the live rate ({slow:.1}fps vs {fast:.1}fps)"
+            );
+            assert!(
+                wait_for_sample(&branch.appsink, Duration::from_secs(5)),
+                "a destination branch must survive a live source-rate change (it is stalled across it, not torn down)"
+            );
+
+            built.pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
         }
     }
 }
@@ -4460,22 +5205,36 @@ mod tests {
              ! video/x-raw,width=64,height=64,framerate=60/1";
 
         fn measure_output_fps(source: &str, configured_fps: u32) -> f64 {
-            let (pipeline, sink, _preview_sink, _self_preview_sink, _valve) =
-                build_pipeline(source, DEFAULT_BITRATE_KBPS, configured_fps, EncoderBackend::Software)
-                    .expect("pipeline should construct");
-            pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+            let built = build_pipeline(source, configured_fps).expect("pipeline should construct");
+            built.pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+            let (state_result, ..) = built.pipeline.state(gst::ClockTime::from_seconds(5));
+            state_result.expect("pipeline should settle into PLAYING");
 
-            let measure_window = Duration::from_secs(2);
-            let deadline = Instant::now() + measure_window;
-            let mut count = 0u32;
-            while Instant::now() < deadline {
-                if sink.try_pull_sample(gst::ClockTime::from_mseconds(100)).is_some() {
-                    count += 1;
-                }
-            }
+            // A real encode branch runs throughout, so this measures the rate
+            // the tee carries *while* a destination is encoding off it, not an
+            // idle pipeline's.
+            let branch = branch::add_branch(
+                &built.pipeline,
+                &built.tee,
+                branch::BranchId(0),
+                branch::EncodeSettings {
+                    width: 0,
+                    height: 0,
+                    framerate: configured_fps,
+                    bitrate_kbps: DEFAULT_BITRATE_KBPS,
+                    backend: EncoderBackend::Software,
+                },
+            )
+            .expect("encode branch should build on the live pipeline");
 
-            pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
-            count as f64 / measure_window.as_secs_f64()
+            // Measured off a `videorate`-free tap on the tee — an encode
+            // branch's own `videorate` would duplicate frames back up to its
+            // configured rate and report that instead. See `tap_tee_rate`.
+            let measured = branch::tests::tap_tee_rate(&built.pipeline, &built.tee, Duration::from_secs(2));
+
+            drop(branch);
+            built.pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+            measured
         }
 
         let low_configured = 10u32;

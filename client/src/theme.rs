@@ -260,6 +260,28 @@ pub fn media_frame(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
         });
 }
 
+/// An inline amber banner for a condition the user should know about but
+/// which isn't an error: a tinted, `WARNING`-stroked block with the message
+/// inside it.
+///
+/// *Why its own primitive rather than a `colored_label`:* the plan doc
+/// specifies the bandwidth-overshoot notice as a *banner* — something with
+/// enough visual weight to be noticed above a section, not a line of amber
+/// text lost among controls — and it's the first of a family (a stalled
+/// destination, a degraded encoder fallback) that must all look the same.
+/// `tint(WARNING, …)` for the fill keeps it legible on `PANEL_RAISED` without
+/// introducing another colour token.
+pub fn warning_banner(ui: &mut Ui, message: &str) {
+    egui::Frame::new()
+        .fill(tint(WARNING, 28))
+        .stroke(Stroke::new(1.0, WARNING))
+        .corner_radius(CornerRadius::same(ROUNDING_SM))
+        .inner_margin(SPACING)
+        .show(ui, |ui| {
+            ui.label(RichText::new(message).color(WARNING).strong());
+        });
+}
+
 // ---------------------------------------------------------------------------
 // Control rows
 // ---------------------------------------------------------------------------
