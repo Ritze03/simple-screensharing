@@ -1,7 +1,27 @@
+[workspace]
+members = [".", "src-tauri"]
+# `resolver = "2"` is edition-2024's default anyway, but spelling it out here
+# avoids any ambiguity now that this manifest is also a workspace root.
+resolver = "2"
+
 [package]
 name = "simple-screensharing-client"
 version = "0.1.0"
 edition = "2024"
+
+# Explicit lib + bin targets: this crate now serves two consumers — the
+# existing egui/eframe binary below (unchanged) and, as a `[lib]`, the new
+# `src-tauri/` Tauri app (see src/lib.rs). Cargo infers both targets fine
+# without this section (src/lib.rs + src/main.rs coexist by default), but
+# spelling them out makes the two-target shape explicit for anyone reading
+# this manifest.
+[lib]
+name = "simple_screensharing_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "simple-screensharing-client"
+path = "src/main.rs"
 
 [dependencies]
 aes-gcm = "0.11.0"

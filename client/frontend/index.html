@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Simple Screensharing (placeholder)</title>
+  </head>
+  <body>
+    <!--
+      PLACEHOLDER: this file exists only so the Tauri scaffold in
+      `src-tauri/` has something to point at and can prove its IPC bridge
+      works end to end (see the `ping`/`pong` invoke below). The real
+      frontend is being built out separately — this file is expected to be
+      replaced wholesale, not extended.
+    -->
+    <p id="status">invoking ping...</p>
+    <script>
+      window.__TAURI__.core.invoke("ping").then((response) => {
+        document.getElementById("status").textContent = "ping -> " + response;
+        console.log("ping -> " + response);
+      });
+    </script>
+  </body>
+</html>
