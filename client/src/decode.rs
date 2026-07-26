@@ -70,6 +70,32 @@
 //! counter (an earlier version of this mechanism) does not work for a
 //! gradual per-frame differential.
 //!
+//! `PacingState` also carries a second, independent defense: an absolute,
+//! wall-clock-anchored staleness backstop (`epoch`/[`PACING_STALENESS_THRESHOLD`]).
+//! The pts-budget mechanism above only ever compares *consecutive* frames,
+//! which is exactly right for a gradual, sustained rate mismatch but blind
+//! to a *bursty* one: if something upstream of `feed`/`decide` (e.g. an
+//! unbounded or throttled event-delivery channel between the network layer
+//! and this module's caller) lets a batch of frames back up and then
+//! delivers the whole backlog at once, `pts_budget`'s consecutive-frame
+//! view sees each backlogged frame as "decode finished early" and paces it
+//! out with a real-time sleep — a literal real-time replay of stale
+//! history, the "fast-forward catch-up" symptom this backstop exists to
+//! prevent (see `superdoc/brainstorm/ui-redesign-multiroom-streaming.md`,
+//! "Performance/Rendering" round 2, and the "fps bug fixes" bullet in that
+//! doc's Final Plan section). The two mechanisms are complementary, not
+//! redundant: `pts_budget` handles *sustained* mismatch, the staleness
+//! backstop handles *bursty* delivery; see [`PacingState::epoch`]'s own doc
+//! comment for the full design (in particular why it re-anchors only on
+//! the first frame and a hard reset, and why the check is scoped to just
+//! the "ahead of schedule" branch of [`PacingState::decide`]).
+//!
+//! This backstop only covers the pacing math itself. It does not fix the
+//! upstream cause of a delivery burst — decoupling `MediaFrame` ingestion
+//! from the UI's repaint cadence, so a backlog never has a chance to form
+//! in the first place — which is a separate, `ui.rs`-side fix tracked in
+//! the same plan doc entry.
+//!
 //! # Threading
 //!
 //! Each `StreamDecoder` owns one background `std::thread` (plain
@@ -314,6 +340,32 @@ const VIDEO_INGEST_CHANNEL_CAPACITY: usize = 8;
 /// with a large wall-clock gap too.
 const PACING_HARD_STALL_GAP: Duration = Duration::from_secs(2);
 
+/// How far past a frame's *absolute*, wall-clock-scheduled display time
+/// (see [`PacingState::epoch`]) `now` is allowed to be before
+/// [`PacingState::decide`] rejects the frame outright, in addition to (not
+/// instead of) the relative `pts_budget` accounting above — see
+/// [`PacingState::epoch`]'s doc comment for the "fast-forward catch-up" bug
+/// this defends against and why the check is scoped to only the
+/// "ahead of schedule" branch of `decide`.
+///
+/// `Why` 250ms: the middle of the ~200-300ms starting range the planning
+/// doc suggested (`superdoc/brainstorm/ui-redesign-multiroom-streaming.md`,
+/// "Performance/Rendering" round 2 / "fps bug fixes" in the Final Plan).
+/// Verified empirically against this file's own tests rather than trusted
+/// blindly: neither `pacing_settles_near_theoretical_skip_ratio_for_*`
+/// sustained-mismatch test ever enters the branch this threshold gates at
+/// all (their `dt_wall` is always *larger* than `dt_pts` — that is
+/// definitionally what "the viewer's decode can't keep up" means for a
+/// steady-rate sender, so they never look "ahead of schedule"), so this
+/// value has zero effect on them regardless of how tight or loose it is.
+/// `pacing_sleeps_for_frames_ahead_of_schedule` (an isolated, ordinary
+/// early-decode) only ever has tens of milliseconds of slack, comfortably
+/// under 250ms. What the value does need to do is reliably trip on a
+/// genuine multi-hundred-millisecond-to-multi-second backlog draining in a
+/// tight loop — see `pacing_staleness_backstop_*` below, using the plan
+/// doc's own repro shape (~600ms of silence, then a burst).
+const PACING_STALENESS_THRESHOLD: Duration = Duration::from_millis(250);
+
 /// Tracks how often [`StreamDecoder::latest_frame`] actually yields a *new*
 /// decoded frame (not just how often it's polled — `ui.rs` polls once per
 /// repaint regardless of whether anything new has decoded, which would
@@ -431,6 +483,68 @@ struct PacingState {
     /// below zero) — an "ahead of schedule" step still adds to it before
     /// immediately spending `dt_wall` back out, same as any other display.
     pts_budget: Duration,
+    /// Fixed `(pts_us, local_instant)` reference point [`Self::decide`]
+    /// measures a frame's *absolute* wall-clock staleness against -- a
+    /// defensive backstop layered on top of (not instead of) the relative
+    /// `pts_budget` accounting above. `None` until the first frame is
+    /// seen; re-anchored to `(pts_us, now)` of the current frame on the
+    /// first-frame bootstrap and on a [`PACING_HARD_STALL_GAP`] hard reset
+    /// (a genuine pathological stall should re-anchor, not carry a stale
+    /// epoch forward) -- never on an ordinary call in between. It is
+    /// deliberately *not* a rolling "last frame" reference: rolling it
+    /// forward every call would just re-derive `dt_wall`/`dt_pts`, which
+    /// the relative mechanism above already computes and which is exactly
+    /// what fails to catch the bug this exists for (see below).
+    ///
+    /// `Why:` this is the fix for the "fast-forward catch-up" bug (see
+    /// `superdoc/brainstorm/ui-redesign-multiroom-streaming.md`,
+    /// "Performance/Rendering" round 2). Root cause: something upstream of
+    /// `decide` (an unbounded/throttled event channel, a paused UI thread,
+    /// ...) lets a batch of frames pile up undelivered, then hands them to
+    /// `decide` all at once in a tight loop -- many calls in a row with
+    /// almost no real wall-clock time between them (`dt_wall` tiny) but
+    /// normal PTS spacing (`dt_pts` normal), i.e. exactly the signature of
+    /// the "ahead of schedule" branch in [`Self::decide`]. The *relative*
+    /// `pts_budget` mechanism cannot tell that apart from "decode finished
+    /// early" -- its whole model is built from consecutive-frame deltas, so
+    /// it happily paces every backlogged frame out with a real-time sleep,
+    /// faithfully re-displaying however many hundred milliseconds (or
+    /// seconds) of history piled up, one frame at a time, in real time.
+    /// An absolute check fixes this because it compares each frame against
+    /// a *fixed* real-world point instead of only the previous frame: a
+    /// frame whose own PTS says it belongs far in the past relative to
+    /// *right now* gets rejected outright by [`PACING_STALENESS_THRESHOLD`],
+    /// no matter how small `dt_wall`/`dt_pts` made it look moment-to-moment.
+    ///
+    /// `Why` the check only applies within the "ahead of schedule" branch
+    /// (see [`Self::decide`]) rather than at the top of every call,
+    /// unconditionally: that branch is the *only* one that can ever return
+    /// a real-time sleep in the first place (the other branches either
+    /// already skip, or display immediately with no delay), so it's the
+    /// only place the "replay history in real time" failure mode can
+    /// originate from -- and scoping it there means this backstop cannot
+    /// interfere with the ordinary relative-budget skip/display decisions
+    /// at all. That matters because a truly unconditional check (applied
+    /// on every call, gating on nothing) was tried first and does not
+    /// survive this file's own tests: under a genuine *sustained* rate
+    /// mismatch (`pacing_settles_near_theoretical_skip_ratio_for_*` below),
+    /// `now` and `pts_us` both advance every call, but `now` advances
+    /// *faster* than `pts_us` by construction (`dt_wall > dt_pts` always --
+    /// that is definitionally what "the viewer can't keep up" means), so
+    /// absolute staleness relative to a fixed epoch grows without bound
+    /// over the run even though the frame-to-frame behavior is exactly the
+    /// intended, correct downsampling -- an unconditional check would cross
+    /// any threshold small enough to also catch a real burst within the
+    /// first few dozen frames and then, having nothing that ever shrinks
+    /// the gap back down under a matched-rate (not faster-than-real-time)
+    /// recovery, latch into rejecting every subsequent frame forever.
+    /// Scoping to the "ahead of schedule" branch sidesteps this entirely:
+    /// that branch is never entered at all when `dt_wall >= dt_pts`
+    /// (proven false in both sustained-mismatch tests, and in the ordinary
+    /// on-pace/isolated-stall-recovery tests, which recover at a matched
+    /// rather than faster-than-real-time pace), so this backstop has zero
+    /// effect on any of them regardless of threshold.
+    epoch: Option<(u64, Instant)>,
 }
 
 /// What [`PacingState::decide`] wants the caller to do with the next
@@ -450,7 +564,7 @@ enum PacingDecision {
 
 impl PacingState {
     fn new() -> Self {
-        Self { last: None, pts_budget: Duration::ZERO }
+        Self { last: None, pts_budget: Duration::ZERO, epoch: None }
     }
 
     /// Given the next decoded frame's `pts_us` and the current time `now`,
@@ -461,9 +575,11 @@ impl PacingState {
     fn decide(&mut self, pts_us: u64, now: Instant) -> PacingDecision {
         let Some((last_pts, last_instant)) = self.last else {
             // First frame ever: nothing to pace against yet, display now
-            // and start tracking from here.
+            // and start tracking from here. Also anchors `epoch` — see
+            // that field's doc comment.
             self.last = Some((pts_us, now));
             self.pts_budget = Duration::ZERO;
+            self.epoch = Some((pts_us, now));
             return PacingDecision::Display(None);
         };
 
@@ -485,20 +601,47 @@ impl PacingState {
             // below to drain a multi-second backlog; just start fresh and
             // show this frame right away, like a stall that self-heals
             // instantly rather than one that's merely being paid down.
+            // Also re-anchors `epoch`: a genuine pathological stall should
+            // re-anchor, not carry a stale epoch forward into whatever
+            // comes next (see that field's doc comment).
             self.pts_budget = Duration::ZERO;
+            self.epoch = Some((pts_us, now));
             return PacingDecision::Display(None);
         }
 
-        self.pts_budget += dt_pts;
-
         if dt_wall < dt_pts {
-            // Ahead of schedule: decode finished before the sender's clock
-            // caught up to this frame's pts. Spend only the real time that
-            // actually elapsed and sleep out the rest, same as the
-            // pre-existing behavior.
+            // Ahead of schedule, per the *relative* dt_wall/dt_pts
+            // comparison alone: decode finished before the sender's clock
+            // caught up to this frame's pts. Before trusting that and
+            // pacing this frame out with a real-time sleep, check it
+            // against the *absolute* wall-clock backstop — see `epoch`'s
+            // doc comment for why this specific branch is the one that
+            // needs it (it's the only branch that can ever return a sleep
+            // at all) and why the check sits here, before
+            // `self.pts_budget += dt_pts` below, rather than after: a
+            // frame this backstop rejects must not contribute its `dt_pts`
+            // to the budget either, or a whole rejected backlog's worth of
+            // banked budget would just trigger a *second*, budget-driven
+            // catch-up burst the moment staleness next drops back under
+            // threshold — precisely the failure mode this backstop exists
+            // to prevent, just deferred by a few frames instead of
+            // avoided.
+            let (epoch_pts, epoch_wall) =
+                self.epoch.expect("epoch is set by the first-frame and hard-reset branches above");
+            let expected_wall = epoch_wall + Duration::from_micros(pts_us.saturating_sub(epoch_pts));
+            if now.saturating_duration_since(expected_wall) > PACING_STALENESS_THRESHOLD {
+                return PacingDecision::Skip;
+            }
+
+            // Ahead of schedule, and not stale enough to reject outright:
+            // spend only the real time that actually elapsed and sleep out
+            // the rest, same as the pre-existing behavior.
+            self.pts_budget += dt_pts;
             self.pts_budget = self.pts_budget.saturating_sub(dt_wall);
             return PacingDecision::Display(Some(dt_pts - dt_wall));
         }
+
+        self.pts_budget += dt_pts;
 
         if self.pts_budget >= dt_wall {
             // On pace, or behind but with enough banked pts-time to afford
@@ -2153,6 +2296,132 @@ mod tests {
              got {:.1}% ({skipped}/{NUM_FRAMES})",
             skip_fraction * 100.0
         );
+    }
+
+    /// The exact "fast-forward catch-up" repro shape from the plan doc:
+    /// `decide` simply isn't called for a real stretch of wall-clock time
+    /// (modeling an upstream stall -- an unbounded/throttled event
+    /// channel, a UI thread parked behind a focus-gated repaint, ...),
+    /// then the whole backlog that piled up arrives at `decide` in a tight
+    /// loop -- many calls back to back with essentially zero elapsed
+    /// wall-clock time between them, each with normal PTS spacing. Without
+    /// the staleness backstop, every one of these lands in the "ahead of
+    /// schedule" branch (`dt_wall` ~= 0 < `dt_pts`) and gets paced out
+    /// with a real-time sleep -- a literal real-time replay of the whole
+    /// backlog. With the backstop, the frames that are still far in the
+    /// past relative to *right now* (most of the backlog) must be skipped
+    /// outright instead.
+    #[test]
+    fn pacing_staleness_backstop_skips_stale_backlog_after_delivery_gap() {
+        let mut pacing = PacingState::new();
+        let start = Instant::now();
+        assert_eq!(pacing.decide(0, start), PacingDecision::Display(None));
+
+        const FRAME_INTERVAL_US: u64 = 33_333; // ~30fps
+        const GAP: Duration = Duration::from_millis(600);
+        const BACKLOG_FRAMES: u64 = 20;
+
+        // The whole backlog "arrives" at the same instant: real wall-clock
+        // time did not advance between these decide() calls, only PTS did
+        // -- exactly what draining a backed-up channel in a tight loop
+        // looks like.
+        let burst_now = start + GAP;
+
+        let mut skipped = 0u64;
+        let mut displayed = 0u64;
+        let mut total_sleep = Duration::ZERO;
+        for i in 1..=BACKLOG_FRAMES {
+            let pts = i * FRAME_INTERVAL_US;
+            match pacing.decide(pts, burst_now) {
+                PacingDecision::Skip => skipped += 1,
+                PacingDecision::Display(delay) => {
+                    displayed += 1;
+                    total_sleep += delay.unwrap_or(Duration::ZERO);
+                }
+            }
+        }
+        assert_eq!(skipped + displayed, BACKLOG_FRAMES);
+
+        assert!(
+            skipped >= 8,
+            "most of a 600ms backlog delivered in a tight loop must be rejected as stale, got only \
+             {skipped}/{BACKLOG_FRAMES} skipped"
+        );
+        assert!(
+            displayed > 0,
+            "the tail of the backlog, once close enough to real time, must still display -- the \
+             backstop must not turn into a permanent stall"
+        );
+        // The bug this backstop exists to prevent is exactly "every
+        // backlogged frame gets displayed, paced out with a real-time
+        // sleep": unmitigated, this loop would accumulate close to
+        // BACKLOG_FRAMES * FRAME_INTERVAL (~667ms) of total sleep across
+        // the burst. Assert it stays well below that.
+        assert!(
+            total_sleep < Duration::from_millis(500),
+            "backlog must not be paced through with real-time sleeps like the fast-forward-catch-up \
+             bug did -- total accumulated sleep across the whole burst was {total_sleep:?}"
+        );
+
+        // A concrete, non-fuzzy check that the backstop -- not just the
+        // ordinary pts_budget skip on the very first post-gap frame -- is
+        // what's rejecting the backlog: the second backlog frame lands
+        // squarely in the "ahead of schedule" branch (dt_wall ~= 0 <<
+        // dt_pts) purely by the relative dt_wall/dt_pts comparison, and is
+        // still deep in the stale part of the backlog (~567ms of absolute
+        // staleness), so it must be skipped.
+        let mut pacing2 = PacingState::new();
+        assert_eq!(pacing2.decide(0, start), PacingDecision::Display(None));
+        assert_eq!(pacing2.decide(FRAME_INTERVAL_US, burst_now), PacingDecision::Skip);
+        assert_eq!(
+            pacing2.decide(2 * FRAME_INTERVAL_US, burst_now),
+            PacingDecision::Skip,
+            "a frame in the 'ahead of schedule' branch that is still hundreds of ms stale in \
+             absolute wall-clock terms must be rejected by the backstop"
+        );
+    }
+
+    /// Companion to the burst test above: once the backlog has actually
+    /// drained down to something close to real time, ordinary matched-rate
+    /// playback resumes normally -- the backstop must not leave the pacer
+    /// permanently stuck skipping, and it must not interfere at all once
+    /// frames are arriving at a genuine (non-bursty) real-time cadence.
+    #[test]
+    fn pacing_staleness_backstop_recovers_to_normal_playback_after_backlog_drains() {
+        let mut pacing = PacingState::new();
+        let start = Instant::now();
+        assert_eq!(pacing.decide(0, start), PacingDecision::Display(None));
+
+        const FRAME_INTERVAL_US: u64 = 33_333;
+        const GAP: Duration = Duration::from_millis(600);
+        const BACKLOG_FRAMES: u64 = 20;
+
+        let burst_now = start + GAP;
+        for i in 1..=BACKLOG_FRAMES {
+            pacing.decide(i * FRAME_INTERVAL_US, burst_now);
+        }
+
+        // Playback now resumes at a genuine, matched real-time cadence
+        // (not another burst): each subsequent frame's `dt_wall` actually
+        // elapses in step with its `dt_pts`, exactly like ordinary
+        // steady-state playback elsewhere in this file's tests. The
+        // backstop only ever gates the "ahead of schedule" branch
+        // (`dt_wall < dt_pts`), which matched-rate playback never enters
+        // (`dt_wall == dt_pts` every step, never strictly less) -- so
+        // every one of these frames must display, regardless of how the
+        // preceding burst left `pts_budget` or `epoch`.
+        let mut now = burst_now;
+        let mut pts = BACKLOG_FRAMES * FRAME_INTERVAL_US;
+        for i in 0..30u64 {
+            now += Duration::from_micros(FRAME_INTERVAL_US);
+            pts += FRAME_INTERVAL_US;
+            assert_eq!(
+                pacing.decide(pts, now),
+                PacingDecision::Display(None),
+                "frame {i} after the backlog drained: matched-rate playback must have fully \
+                 recovered, not still be affected by the earlier burst"
+            );
+        }
     }
 
     /// End-to-end correctness check of the *decode* half of this module,
