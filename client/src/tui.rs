@@ -242,6 +242,14 @@ struct App {
     saved_cursor: usize,
     room_store: RoomStore,
     connecting: Option<oneshot::Receiver<ConnectResult>>,
+    /// The one shared QUIC endpoint every `connect()` from this front-end
+    /// rides (see `net.rs`'s "One endpoint, N connections"). `Err` carries
+    /// the bind failure so the join screen can report it instead of this
+    /// mode panicking at startup over a socket it can't open. This mode is
+    /// single-room by design, but it holds the endpoint the same way `ui.rs`
+    /// does so there is exactly one place in the process that binds a socket
+    /// per front-end.
+    endpoint: Result<quinn::Endpoint, String>,
 
     // --- connected ---
     room: Option<Room>,
@@ -272,6 +280,7 @@ impl App {
             saved_cursor: 0,
             room_store,
             connecting: None,
+            endpoint: crate::net::build_client_endpoint().map_err(|e| format!("{e:#}")),
             room: None,
             status: "Not connected".to_string(),
             error: store_error,
@@ -404,6 +413,13 @@ impl App {
             self.error = Some("No join link to connect with".to_string());
             return;
         }
+        let endpoint = match &self.endpoint {
+            Ok(endpoint) => endpoint.clone(),
+            Err(e) => {
+                self.error = Some(format!("No local QUIC endpoint: {e}"));
+                return;
+            }
+        };
         self.join_string = join_string.trim().to_string();
         let join_string = self.join_string.clone();
         let display_name = self.display_name.clone();
@@ -413,7 +429,7 @@ impl App {
         self.status = "Connecting...".to_string();
 
         tokio::spawn(async move {
-            let result = ScreenshareClient::connect(&join_string, &display_name)
+            let result = ScreenshareClient::connect(&endpoint, &join_string, &display_name)
                 .await
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);

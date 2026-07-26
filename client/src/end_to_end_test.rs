@@ -72,7 +72,7 @@
 //! # Running this test
 //!
 //! Requires: the server repo built at
-//! `~/GitHubProjects/simple-screensharing/master/simple-screensharing-server`
+//! `~/GitHubProjects/simple-screensharing/simple-screensharing-server`
 //! (release or debug profile), a working GStreamer install (same requirement every other
 //! `capture.rs`/`decode.rs` test already has), and the `script`/`setsid`
 //! utilities (`util-linux`; present on essentially every Linux desktop).
@@ -138,21 +138,33 @@ pub(crate) fn pick_free_udp_port() -> Result<u16> {
 /// repos are fixed to live in (see this task's own instructions / the
 /// client repo's README). Prefers a release build (faster to run) but
 /// falls back to debug.
-fn server_binary_path() -> Result<PathBuf> {
+/// Candidate sibling-checkout roots for the relay server repo, in preference
+/// order. Two, not one: the workspace originally nested each repo under a
+/// `master/` directory and no longer does. Probing both keeps this harness
+/// working on either layout instead of failing with a path that simply isn't
+/// there any more.
+pub(crate) fn server_repo_candidates() -> Result<Vec<PathBuf>> {
     let home = dirs::home_dir().ok_or_else(|| anyhow!("could not determine home directory"))?;
-    let repo = home.join("GitHubProjects/simple-screensharing/master/simple-screensharing-server");
-    let release = repo.join("target/release/simple-screensharing-server");
-    let debug = repo.join("target/debug/simple-screensharing-server");
-    if release.is_file() {
-        Ok(release)
-    } else if debug.is_file() {
-        Ok(debug)
-    } else {
-        Err(anyhow!(
-            "server binary not found at {release:?} or {debug:?} — build the server repo first \
-             (`cd {repo:?} && cargo build --release`)"
-        ))
+    Ok(vec![
+        home.join("GitHubProjects/simple-screensharing/simple-screensharing-server"),
+        home.join("GitHubProjects/simple-screensharing/master/simple-screensharing-server"),
+    ])
+}
+
+fn server_binary_path() -> Result<PathBuf> {
+    let candidates = server_repo_candidates()?;
+    for repo in &candidates {
+        for profile in ["release", "debug"] {
+            let binary = repo.join(format!("target/{profile}/simple-screensharing-server"));
+            if binary.is_file() {
+                return Ok(binary);
+            }
+        }
     }
+    Err(anyhow!(
+        "server binary not found under any of {candidates:?} (target/release or target/debug) — \
+         build the server repo first (`cargo build --release` in it)"
+    ))
 }
 
 /// Spawns the real relay server binary as a child process listening on
@@ -190,6 +202,10 @@ pub(crate) fn spawn_relay_server(port: u16) -> Result<ServerGuard> {
 /// freshly spawned server process time to finish self-signed cert
 /// generation and bind its QUIC endpoint before the first real connection
 /// attempt lands.
+///
+/// Builds its own [`crate::net::build_client_endpoint`] and reuses it across
+/// every retry, mirroring what the real front-ends do with their one
+/// `App`-owned endpoint (see `net.rs`'s "One endpoint, N connections").
 pub(crate) async fn connect_with_retry(
     join_string: &str,
     display_name: &str,
@@ -198,9 +214,10 @@ pub(crate) async fn connect_with_retry(
     crate::net::PresenceSnapshotState,
     tokio::sync::mpsc::UnboundedReceiver<ClientEvent>,
 )> {
+    let endpoint = crate::net::build_client_endpoint()?;
     let mut last_err = None;
     for _ in 0..40 {
-        match ScreenshareClient::connect(join_string, display_name).await {
+        match ScreenshareClient::connect(&endpoint, join_string, display_name).await {
             Ok(v) => return Ok(v),
             Err(e) => {
                 last_err = Some(e);

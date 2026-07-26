@@ -989,19 +989,15 @@ mod tests {
             let socket = UdpSocket::bind("127.0.0.1:0").expect("failed to bind ephemeral probe socket");
             socket.local_addr().expect("local_addr").port()
         };
-        let home = dirs::home_dir().expect("could not determine home directory");
-        let server_repo = home.join("GitHubProjects/simple-screensharing/master/simple-screensharing-server");
-        let server_binary = {
-            let release = server_repo.join("target/release/simple-screensharing-server");
-            let debug = server_repo.join("target/debug/simple-screensharing-server");
-            if release.is_file() {
-                release
-            } else if debug.is_file() {
-                debug
-            } else {
-                panic!("server binary not found at {release:?} or {debug:?} — build the server repo first");
-            }
-        };
+        // Same two candidate layouts `end_to_end_test` probes (see
+        // `server_repo_candidates`) — the workspace dropped its old `master/`
+        // nesting level, so a single hardcoded path no longer resolves.
+        let candidates = crate::end_to_end_test::server_repo_candidates().expect("could not determine home directory");
+        let (server_repo, server_binary) = candidates
+            .iter()
+            .flat_map(|repo| ["release", "debug"].map(|p| (repo.clone(), repo.join(format!("target/{p}/simple-screensharing-server")))))
+            .find(|(_, binary)| binary.is_file())
+            .unwrap_or_else(|| panic!("server binary not found under any of {candidates:?} — build the server repo first"));
         let cmd_string = format!("{} {port}", server_binary.display());
         let mut server_child = Command::new("setsid")
             .args(["script", "-qc", &cmd_string, "/dev/null"])
@@ -1017,9 +1013,10 @@ mod tests {
         let room_key: [u8; 32] = rand::random();
         let join_string = crate::net::format_join_string(&server_addr, &room_id, &room_key);
 
+        let endpoint = crate::net::build_client_endpoint().expect("failed to build a client QUIC endpoint");
         let mut client = None;
         for _ in 0..40 {
-            match ScreenshareClient::connect(&join_string, "audio-stop-test").await {
+            match ScreenshareClient::connect(&endpoint, &join_string, "audio-stop-test").await {
                 Ok(v) => {
                     client = Some(v);
                     break;
