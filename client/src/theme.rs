@@ -113,6 +113,24 @@ pub const VALUE_W: f32 = 64.0;
 /// Height of a nav-rail pill (`nav_button`) — deliberately much taller than
 /// a form button's default `interact_size.y`, see that function's docs.
 pub const NAV_BUTTON_HEIGHT: f32 = 38.0;
+/// Explicit height for the three `styled_button` variants (`primary_button`,
+/// `secondary_button`, `danger_button`).
+///
+/// *Why this exists:* left to egui's own default, a `Button`'s height is
+/// `ui.spacing().interact_size.y` (18px) — barely taller than one line of
+/// text with only `button_padding.y` (1px) of slack on each side. Two
+/// problems follow: (1) `corner_radius(ROUNDING)` (14) then exceeds half that
+/// height, so egui clamps the requested corner radius down to fit, and the
+/// button never reaches the full pill shape `ROUNDING` was chosen for; (2)
+/// with almost no vertical slack between the text's own line height and the
+/// button's, a sub-pixel rounding difference between the two reads as
+/// visibly off-center text (see the "Reconnect" button in a saved-but-
+/// disconnected ROOMS row) instead of vanishing into unnoticeable padding.
+/// Setting an explicit height comfortably above both the text's line height
+/// and `2 * ROUNDING` (so the pill's rounded ends are never clamped) gives
+/// `AtomLayout`'s own centering real room to work with, the same way
+/// `nav_button`'s explicit `NAV_BUTTON_HEIGHT` already does.
+pub const FORM_BUTTON_HEIGHT: f32 = 30.0;
 /// Diameter of a `status_dot`. Small enough to read as an indicator rather
 /// than a bullet, large enough to still read at a glance in a dense list.
 pub const DOT_SIZE: f32 = 9.0;
@@ -352,7 +370,8 @@ fn styled_button(text: &str, fill: Color32, text_color: Color32, border: Option<
     if strong {
         rich = rich.strong();
     }
-    let mut button = egui::Button::new(rich).fill(fill).corner_radius(CornerRadius::same(ROUNDING));
+    let mut button =
+        egui::Button::new(rich).fill(fill).corner_radius(CornerRadius::same(ROUNDING)).min_size(Vec2::new(0.0, FORM_BUTTON_HEIGHT));
     if let Some(border) = border {
         button = button.stroke(Stroke::new(1.0, border));
     }
