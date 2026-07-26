@@ -1,5 +1,29 @@
-//! egui UI: room join screen, presence roster, screen sharing, and stream
-//! watching.
+//! egui UI: the always-on app shell (left sidebar + right content area),
+//! presence roster, screen sharing, and stream watching.
+//!
+//! # App shell (sidebar + nav tabs)
+//!
+//! There is no join *screen* any more — no one-time gate the app passes
+//! through once and never shows again. The window is permanently split into a
+//! left sidebar (`ui_sidebar`) and a right content area (`ui_content`), and
+//! joining a room is just one affordance inside the sidebar's ROOMS section
+//! rather than a mode the whole app is in. See
+//! `superdoc/ui/APP-SHELL.md` for the layout, its `Why:` notes, and which
+//! parts are deliberately minimal mount points for later stages.
+//!
+//! - **Sidebar**, top to bottom: wordmark / nav rail (three
+//!   [`NavTab`] pills) / ROOMS (scrollable, greedy, with "+ Add Room" pinned
+//!   to its bottom) / STREAMS (capped height, own scroll).
+//! - **Content area** renders whichever [`NavTab`] is selected.
+//!
+//! **The nav is a pure view-switcher.** Nothing in `set_nav_tab` or in any
+//! `ui_*_tab` function starts or stops a capture, a subscription, or a
+//! decoder; every one of those transitions is an explicit user action
+//! (`toggle_watch`, `start_video_share`, …) reachable from the sidebar, which
+//! is rendered on every tab. `eframe::App::update` likewise polls *every*
+//! room's watches and re-declares *every* popout viewport before the tab is
+//! even consulted, so a stream keeps decoding, playing and repainting while
+//! its tab isn't showing.
 //!
 //! eframe's `update()` closure is synchronous and can't `.await`, so every
 //! async call (connecting, starting/stopping capture, subscribing) is
@@ -49,11 +73,17 @@
 //! branch rather than one branch per destination; the ids and ownership are
 //! already in their final shape so nothing has to be re-keyed when it lands.
 //! Each `Destination` does already carry its own `VideoParams` and a live
-//! `DestinationState` (see `Destination::state`). The visible UI is likewise
-//! still single-room: `active_room` names the one `RoomSession` the
-//! join/roster/share/watch screens drive.
+//! `DestinationState` (see `Destination::state`).
+//!
+//! The **sidebar** is genuinely multi-room: ROOMS lists every joined room at
+//! once and STREAMS lists this client's outgoing destinations across *all* of
+//! them. The **content area** is not yet: `active_room` names the one
+//! `RoomSession` the Stream Control and View tabs drive, re-pointed by
+//! clicking a room row. Retiring it belongs to the stages that add
+//! multi-destination fan-out (Stream Control) and the one global tile grid
+//! across every room (View); nothing in the data model depends on it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -98,6 +128,80 @@ const DEFAULT_FRAMERATE: u32 = 30;
 /// natural as discrete choices than a continuous slider, since these are the
 /// values that actually correspond to real monitor refresh rates.
 const FRAMERATE_OPTIONS: [u32; 7] = [30, 60, 90, 120, 144, 165, 240];
+
+// ---------------------------------------------------------------------
+// App-shell layout constants
+// ---------------------------------------------------------------------
+
+/// Fixed width of the always-on left sidebar. Not resizable: every element in
+/// it (nav pills, room rows, stream rows) is designed against one measure, and
+/// a draggable splitter is user-facing complexity with nothing behind it.
+const SIDEBAR_WIDTH: f32 = 268.0;
+/// Ceiling on the STREAMS section's height, so a long list of outgoing
+/// destinations scrolls inside its own well instead of squeezing ROOMS out of
+/// the sidebar.
+///
+/// `Why` a cap rather than pinning STREAMS to the bottom and letting it grow:
+/// multi-destination fan-out (a later stage) makes STREAMS' length a function
+/// of how many rooms each capture feeds, so an uncapped section could take
+/// over the whole rail. ROOMS is the sidebar's primary navigation and keeps
+/// the greedy middle; STREAMS gets a bounded footer and its own scroll.
+const STREAMS_MAX_HEIGHT: f32 = 176.0;
+/// Period of the reconnecting dot's opacity pulse, in seconds.
+const RECONNECT_PULSE_PERIOD: f64 = 1.2;
+
+// Icon glyphs. Deliberately drawn from Latin-1 / Geometric Shapes / the
+// emoji-icon-font subset egui's own widgets rely on (`🗙` is what
+// `egui::Window`'s close button uses), because this project has not installed
+// the Geist Mono Nerd Font icon fallback its styling guide calls for — see
+// STYLING-GUIDE.md's "Fonts" status note. Anything from a richer icon set
+// would render as tofu today.
+const ICON_WATCH: &str = "\u{25b6}"; // ▶
+const ICON_STOP: &str = "\u{25a0}"; // ■
+const ICON_CARET_COLLAPSED: &str = "\u{25b8}"; // ▸
+const ICON_CARET_EXPANDED: &str = "\u{25be}"; // ▾
+const ICON_CLOSE: &str = "\u{1f5d9}"; // 🗙
+const ICON_AUDIO: &str = "\u{1f50a}"; // 🔊
+
+/// Which pill of the sidebar's nav rail is selected — i.e. what the right-hand
+/// content area renders.
+///
+/// Purely a *view* selection: see this module's docs on why switching tabs
+/// cannot start or stop any share or watch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NavTab {
+    StreamControl,
+    View,
+    Settings,
+}
+
+impl NavTab {
+    const ALL: [NavTab; 3] = [Self::StreamControl, Self::View, Self::Settings];
+
+    fn label(self) -> String {
+        match self {
+            Self::StreamControl => t!("nav.stream_control").to_string(),
+            Self::View => t!("nav.view").to_string(),
+            Self::Settings => t!("nav.settings").to_string(),
+        }
+    }
+}
+
+impl Default for NavTab {
+    /// `Why` Stream Control and not View or Settings on a zero-room first
+    /// launch: with nothing joined, all three tabs are empty, so the default
+    /// should be whichever empty state best answers "what do I do now?".
+    /// Sharing your screen is what this app is *for* — Stream Control's empty
+    /// state points straight at the sidebar's "+ Add Room" and is the same
+    /// place the STREAMS section's "+ Start a Stream" button lands you, so
+    /// first launch and first share both converge on one screen. View's empty
+    /// state ("nobody's on screen") reads as a dead end on a fresh launch, and
+    /// opening into Settings suggests configuration is a prerequisite, which
+    /// it isn't.
+    fn default() -> Self {
+        Self::StreamControl
+    }
+}
 
 // ---------------------------------------------------------------------
 // Session ids
@@ -300,8 +404,20 @@ struct RoomSession {
     event_rx: mpsc::UnboundedReceiver<ClientEvent>,
     members: Vec<Member>,
     streams: Vec<StreamInfo>,
+    /// The `server|room-id|key` string this session was connected with.
+    ///
+    /// `Why` it lives on the session (it used to be a single `App::join_string`
+    /// bound to the join form's text field): the sidebar renders `room_store ⟕
+    /// rooms`, and the join string is the only key a `SavedRoom` and a live
+    /// session both carry (see `RoomStore::name_for`). A single `App`-level
+    /// field could only ever describe the *most recently used* join string,
+    /// which stops meaning anything the moment two rooms are joined.
+    join_string: String,
+    /// Rename field for this room's `RoomStore` entry, bound to the Stream
+    /// Control tab's "save this room as" row.
     save_name: String,
-    /// Set once the user has saved this room, so we don't offer to re-save.
+    /// Set once the user has saved/renamed this room from that row, so the
+    /// confirmation shows exactly once per edit.
     saved: bool,
 
     /// What this client is currently sending *into this room*, in the order
@@ -362,11 +478,54 @@ struct RoomSession {
     preview_textures: HashMap<(ConnId, StreamId), egui::TextureHandle>,
 }
 
-pub struct App {
+/// A connect attempt in flight, tagged with what it was for so its result can
+/// be routed back to the row (or the "+ Add Room" card) that started it.
+///
+/// `Why` a struct instead of the bare `oneshot::Receiver` this used to be:
+/// with an always-on ROOMS list there is no longer one join form owning the
+/// only connect in the app. A saved row's `[Reconnect]` and the Add Room
+/// card's `[Join]` both land here, and the sidebar has to know *which room row*
+/// is the one currently showing the amber reconnecting dot — which needs the
+/// join string, since a not-yet-connected room has no `RoomHandle`.
+struct PendingConnect {
+    rx: oneshot::Receiver<ConnectResult>,
+    /// The room being connected to. Also what the reconnecting-dot lookup
+    /// matches a `SavedRoom` row against.
     join_string: String,
+    /// Whether this attempt came from the inline "+ Add Room" card, so a
+    /// failure can be reported inside that card (which stays open) rather than
+    /// as a detached error under the ROOMS list.
+    from_add_card: bool,
+}
+
+pub struct App {
     display_name: String,
     status: Status,
-    connect_rx: Option<oneshot::Receiver<ConnectResult>>,
+    pending_connect: Option<PendingConnect>,
+
+    /// Which nav pill is selected — i.e. what `ui_content` renders. Real,
+    /// frame-persistent state on `App`, deliberately *not* derived from
+    /// whether anything is joined/watching: a view selection the app silently
+    /// overrode would make the rail's accent fill lie about where you are.
+    nav_tab: NavTab,
+    /// Whether the inline "+ Add Room" mini-card is expanded under the ROOMS
+    /// section. Inline, not a modal (per the plan doc): joining is the most
+    /// routine thing this app does and shouldn't blank the rest of the UI.
+    add_room_open: bool,
+    /// The join link typed into that card.
+    add_room_join_string: String,
+    /// Last failure from that card's Join, shown inline inside it.
+    add_room_error: Option<String>,
+    /// Rooms whose row is expanded to show their per-user stream rows.
+    /// A set (not a single `Option`) so several rooms can be open at once —
+    /// the point of the sidebar is seeing every room at a glance.
+    expanded_rooms: HashSet<RoomHandle>,
+    /// Room awaiting leave confirmation, if the confirm dialog is up. See
+    /// `leave_needs_confirm`.
+    leave_confirm: Option<RoomHandle>,
+    /// Whether `theme::install` has run for this context yet. Once per
+    /// process, not once per frame: it rewrites the whole `Visuals` struct.
+    theme_installed: bool,
 
     /// The one local QUIC endpoint every room connection rides (see
     /// `net.rs`'s "One endpoint, N connections"). Built once here, at `App`
@@ -380,14 +539,15 @@ pub struct App {
     /// Every local capture pipeline currently running, in start order, with
     /// its destinations. See the module docs.
     captures: IndexMap<CaptureSourceId, LocalCapture>,
-    /// Which room the (still single-room) connected screen drives.
+    /// Which room the (still single-room) Stream Control and View tabs drive.
     ///
-    /// `Why:` the multi-room *sidebar* is a later stage; until it exists the
-    /// screens need one designated room to render, and this is deliberately a
-    /// view-level pointer rather than anything the data model depends on —
-    /// deleting it is all that's needed once the UI can show every room at
-    /// once. Kept in sync by `poll_connect_result` (set on join) and
-    /// `disconnect_room` (re-pointed on leave).
+    /// `Why:` the sidebar is multi-room, but the two content tabs' *contents*
+    /// are a later stage (multi-destination fan-out; one global tile grid), so
+    /// until then they need one designated room to render. Deliberately a
+    /// view-level pointer that nothing in the data model depends on — deleting
+    /// it is all that's needed once both tabs can show every room at once.
+    /// Kept in sync by `poll_connect_result` (set on join), a click on a room
+    /// row (re-pointed), and `disconnect_room` (re-pointed on leave).
     active_room: Option<RoomHandle>,
 
     /// Monotonic id allocators — never rewind, never reuse (see the "Session
@@ -447,10 +607,16 @@ impl Default for App {
         let settings = AppSettings::load();
         rust_i18n::set_locale(&settings.language);
         Self {
-            join_string: String::new(),
             display_name: whoami_fallback(),
             status: Status::Idle,
-            connect_rx: None,
+            pending_connect: None,
+            nav_tab: NavTab::default(),
+            add_room_open: false,
+            add_room_join_string: String::new(),
+            add_room_error: None,
+            expanded_rooms: HashSet::new(),
+            leave_confirm: None,
+            theme_installed: false,
             endpoint: crate::net::build_client_endpoint().map_err(|e| format!("{e:#}")),
             rooms: IndexMap::new(),
             captures: IndexMap::new(),
@@ -1340,20 +1506,120 @@ impl RoomSession {
     }
 }
 
+/// One deferred sidebar interaction. Collected while the ROOMS list renders
+/// (which holds shared borrows of `rooms`/`room_store`/`expanded_rooms`) and
+/// applied by `App::apply_room_action` afterwards.
+enum RoomAction {
+    /// Point the content tabs at this room.
+    Select(RoomHandle),
+    /// Expand/collapse this room's per-stream rows.
+    ToggleExpand(RoomHandle),
+    /// Leave — possibly via the confirm dialog, see `leave_needs_confirm`.
+    Leave(RoomHandle),
+    /// Connect to a saved-but-disconnected room's join string.
+    Reconnect(String),
+    /// Forget a saved room, by its `RoomStore` name.
+    Forget(String),
+    Watch(RoomHandle, ConnId, StreamId),
+    Listen(RoomHandle, ConnId, StreamId),
+}
+
+/// How many *other* people are streaming into this room right now — the
+/// "N Active Users" in a joined room's collapsed row.
+///
+/// Distinct owners, not stream count: someone sharing two monitors is one
+/// active user. Our own streams are excluded — "who else is on" is the
+/// question the row answers.
+fn active_user_count(room: &RoomSession) -> usize {
+    let me = room.client.conn_id();
+    room.streams
+        .iter()
+        .filter(|s| s.owner != me)
+        .map(|s| s.owner)
+        .collect::<HashSet<_>>()
+        .len()
+}
+
+/// `WxH@FPS` for a *remote* stream, as announced by its sender.
+///
+/// `Why` the framerate is always `—`: `StreamInfo`/`AnnounceStream` carry
+/// width and height but no `fps` field, and a subscriber genuinely cannot
+/// derive one before subscribing and decoding. Adding that protocol field is
+/// tracked in the plan doc's gap list and has to be coordinated with the relay
+/// and the browser viewer; rendering the em-dash placeholder keeps this row
+/// honest in the meantime rather than inventing a number or omitting the
+/// column (which would make the sidebar's alignment change the day the field
+/// lands).
+fn remote_stream_geometry(info: &StreamInfo) -> String {
+    if info.width == 0 || info.height == 0 {
+        return t!("streams.geometry_unknown").to_string();
+    }
+    t!("streams.geometry", width = info.width, height = info.height, fps = "\u{2014}").to_string()
+}
+
+/// `WxH@FPS` for one of *our* outgoing destinations.
+///
+/// Prefers the live `DestinationRuntime`'s params over the `Destination`'s
+/// own: the runtime's width/height are the pipeline's real negotiated caps
+/// (read off the encoder appsink in `capture::start_sharing`), whereas the
+/// destination's are the *requested* ones, which are `0` for "whatever the
+/// source is" — the only value this stage ever sets.
+fn destination_geometry(dest: &Destination) -> String {
+    let params = match &dest.runtime {
+        Some(runtime) => runtime.lock().unwrap().params(),
+        None => dest.params,
+    };
+    if params.width == 0 || params.height == 0 {
+        return t!("streams.geometry_unknown").to_string();
+    }
+    t!("streams.geometry", width = params.width, height = params.height, fps = params.framerate).to_string()
+}
+
+/// The label a room row shows: its saved name if it has one, otherwise a
+/// stable short id derived from the join string's room-id field.
+///
+/// `Why` an id-derived fallback rather than showing the raw join string: the
+/// join string contains the room *key*, i.e. the secret that grants access.
+/// A sidebar is exactly the sort of thing that ends up in a screenshot or a
+/// screen share, so it must never render one.
+fn room_label(room_store: &RoomStore, join_string: &str) -> String {
+    if let Some(name) = room_store.name_for(join_string) {
+        return name.to_string();
+    }
+    t!("rooms.unnamed", id = room_id_prefix(join_string)).to_string()
+}
+
+/// First 4 bytes of the room id, hex — short enough to read in a sidebar row,
+/// long enough to tell two rooms apart. Falls back to a placeholder for a
+/// join string that doesn't parse (which can't have connected, so this is only
+/// ever reachable for a corrupt `rooms.toml` entry).
+fn room_id_prefix(join_string: &str) -> String {
+    match crate::net::parse_join_string(join_string) {
+        Ok(parsed) => parsed.room_id.iter().take(4).map(|b| format!("{b:02x}")).collect(),
+        Err(_) => t!("rooms.unknown_id").to_string(),
+    }
+}
+
 impl App {
-    fn start_connect(&mut self) {
+    /// Kick off a connect to `join_string`. `from_add_card` routes a failure
+    /// back into the inline "+ Add Room" card instead of the ROOMS list's own
+    /// error line.
+    fn start_connect(&mut self, join_string: String, from_add_card: bool) {
         let endpoint = match &self.endpoint {
             Ok(endpoint) => endpoint.clone(),
             Err(e) => {
                 self.status = Status::Error(e.clone());
+                if from_add_card {
+                    self.add_room_error = Some(e.clone());
+                }
                 return;
             }
         };
-        let join_string = self.join_string.clone();
         let display_name = self.display_name.clone();
         let (tx, rx) = oneshot::channel();
-        self.connect_rx = Some(rx);
+        self.pending_connect = Some(PendingConnect { rx, join_string: join_string.clone(), from_add_card });
         self.status = Status::Connecting;
+        self.add_room_error = None;
 
         tokio::spawn(async move {
             let result = ScreenshareClient::connect(&endpoint, &join_string, &display_name)
@@ -1361,6 +1627,12 @@ impl App {
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
         });
+    }
+
+    /// Whether `join_string` is the room a connect is currently in flight for
+    /// — what puts a saved row into the amber "reconnecting" state.
+    fn is_reconnecting(&self, join_string: &str) -> bool {
+        self.pending_connect.as_ref().is_some_and(|p| p.join_string == join_string)
     }
 
     /// Insert a freshly connected room and return its handle. The one place
@@ -1376,6 +1648,7 @@ impl App {
         client: ScreenshareClient,
         snapshot: PresenceSnapshotState,
         event_rx: mpsc::UnboundedReceiver<ClientEvent>,
+        join_string: String,
     ) -> RoomHandle {
         let handle = RoomHandle(self.next_room_handle);
         self.next_room_handle = self.next_room_handle.wrapping_add(1);
@@ -1405,7 +1678,8 @@ impl App {
                 event_rx: forward_rx,
                 members: snapshot.members,
                 streams: snapshot.streams,
-                save_name: String::new(),
+                save_name: room_label(&self.room_store, &join_string),
+                join_string,
                 saved: false,
                 destinations: Vec::new(),
                 next_stream_id: 0,
@@ -1453,6 +1727,12 @@ impl App {
         if self.active_room == Some(handle) {
             self.active_room = self.rooms.keys().next().copied();
         }
+        // Purely view state, but ids never rewind, so a stale entry would
+        // linger for the process's lifetime rather than ever being reused.
+        self.expanded_rooms.remove(&handle);
+        if self.leave_confirm == Some(handle) {
+            self.leave_confirm = None;
+        }
         // Back on the join screen with nothing joined: reset the two pieces
         // of `App`-level capture state that used to die with the singleton
         // `Connected`, so a rejoin looks exactly like a first join (a fresh
@@ -1466,26 +1746,77 @@ impl App {
         }
     }
 
+    /// Whether leaving `handle` should raise a confirm dialog first.
+    ///
+    /// `Why` both conditions and not just watching: the plan's final verify
+    /// pass resolved that leaving a room you're *streaming to* gets the same
+    /// treatment as leaving one you're watching — "you're killing an outgoing
+    /// broadcast, not just navigating". A plain leave with neither is
+    /// immediate: there is nothing to lose and a confirm would just be a
+    /// speed bump on the most common case.
+    ///
+    /// Watching counts whether the tile is inline or popped out into its own
+    /// OS window — `watches` holds both (`WatchEntry::popout` only says
+    /// *where* it renders), and a popped-out window vanishing unannounced is
+    /// if anything the more startling of the two.
+    fn leave_needs_confirm(&self, handle: RoomHandle) -> bool {
+        let Some(room) = self.rooms.get(&handle) else { return false };
+        !room.destinations.is_empty()
+            || !room.watches.lock().unwrap().is_empty()
+            || !room.audio_watches.lock().unwrap().is_empty()
+    }
+
+    /// "Leave" clicked on a joined room row: tear it down now, or raise the
+    /// confirm dialog first if there's active work in it.
+    fn request_leave_room(&mut self, handle: RoomHandle) {
+        if self.leave_needs_confirm(handle) {
+            self.leave_confirm = Some(handle);
+        } else {
+            self.disconnect_room(handle);
+        }
+    }
+
     fn poll_connect_result(&mut self) {
-        let Some(rx) = &mut self.connect_rx else { return };
-        match rx.try_recv() {
-            Ok(Ok((client, snapshot, event_rx))) => {
+        let Some(pending) = &mut self.pending_connect else { return };
+        let result = match pending.rx.try_recv() {
+            Ok(result) => result,
+            Err(oneshot::error::TryRecvError::Empty) => return,
+            Err(oneshot::error::TryRecvError::Closed) => Err(t!("errors.connect_task_ended").to_string()),
+        };
+        let Some(pending) = self.pending_connect.take() else { return };
+
+        match result {
+            Ok((client, snapshot, event_rx)) => {
                 self.status = Status::Idle;
-                self.connect_rx = None;
-                let handle = self.insert_room(client, snapshot, event_rx);
-                // Single-room UI for now: the newest join is what the
-                // connected screen shows. The multi-room sidebar replaces
-                // this with an explicit selection.
+                let handle = self.insert_room(client, snapshot, event_rx, pending.join_string.clone());
+                // A successful join *is* the save: `RoomStore` is this app's
+                // only persistent "rooms I care about" state, and the plan's
+                // Add Room flow deliberately has no separate staging step —
+                // "on success the room appears live in the list, on failure
+                // nothing is saved". Saved under an id-derived name, which the
+                // Stream Control tab's rename row can replace; a room already
+                // saved keeps whatever name it has.
+                if self.room_store.name_for(&pending.join_string).is_none() {
+                    let name = room_label(&self.room_store, &pending.join_string);
+                    self.room_store.upsert(name, pending.join_string.clone());
+                    if let Err(e) = self.room_store.save() {
+                        self.room_store_error = Some(e.to_string());
+                    }
+                }
+                // Newly joined room becomes what the content tabs drive, and
+                // the Add Room card has served its purpose.
                 self.active_room = Some(handle);
+                self.add_room_open = false;
+                self.add_room_join_string.clear();
+                self.add_room_error = None;
             }
-            Ok(Err(e)) => {
+            Err(e) => {
+                if pending.from_add_card {
+                    // Keep the card open with the error inline, so the typed
+                    // link is still there to fix rather than retype.
+                    self.add_room_error = Some(e.clone());
+                }
                 self.status = Status::Error(e);
-                self.connect_rx = None;
-            }
-            Err(oneshot::error::TryRecvError::Empty) => {}
-            Err(oneshot::error::TryRecvError::Closed) => {
-                self.status = Status::Error(t!("errors.connect_task_ended").to_string());
-                self.connect_rx = None;
             }
         }
     }
@@ -1613,16 +1944,15 @@ impl App {
         }
     }
 
-    /// Global settings card: the "English"/"Deutsch" language switcher and
-    /// the render presentation-mode dropdown. Language names are
-    /// deliberately left untranslated (a language selector conventionally
-    /// shows each option in its own language, e.g. "Deutsch" rather than
-    /// "German" while in English mode) so a user can always find their way
-    /// back regardless of the current locale.
+    /// Global settings: the "English"/"Deutsch" language switcher and the
+    /// render presentation-mode dropdown. Language names are deliberately
+    /// left untranslated (a language selector conventionally shows each
+    /// option in its own language, e.g. "Deutsch" rather than "German" while
+    /// in English mode) so a user can always find their way back regardless
+    /// of the current locale.
     ///
-    /// Both settings are global (not per-stream/per-room), which is why
-    /// this card lives on the join screen rather than anywhere inside a
-    /// connected session.
+    /// Both settings are global (not per-stream/per-room), which is why this
+    /// card lives on the Settings nav tab rather than anywhere room-scoped.
     fn ui_settings_card(&mut self, ui: &mut egui::Ui) {
         theme::card(ui, t!("settings.header").as_ref(), |ui| {
             theme::setting_row(ui, t!("settings.language_label").as_ref(), |ui| {
@@ -1667,107 +1997,606 @@ impl App {
         });
     }
 
-    fn ui_join_screen(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().auto_shrink([false, true]).show(ui, |ui| {
-            ui.set_max_width(theme::PANEL_MAX_WIDTH);
-            ui.spacing_mut().item_spacing.y = 0.0;
+    // -----------------------------------------------------------------
+    // App shell — sidebar
+    // -----------------------------------------------------------------
 
-            ui.heading(egui::RichText::new(t!("app.title").to_string()).color(theme::TEXT));
-            ui.add_space(theme::SPACING);
-
-            self.ui_settings_card(ui);
-
-            theme::card(ui, t!("join.button").as_ref(), |ui| {
-                theme::setting_row(ui, t!("join.display_name_label").as_ref(), |ui| {
-                    ui.text_edit_singleline(&mut self.display_name);
-                });
-                theme::setting_row(ui, t!("join.link_label").as_ref(), |ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.join_string).desired_width(ui.available_width()));
-                });
-
-                let connecting = matches!(self.status, Status::Connecting);
-                ui.add_enabled_ui(!connecting && !self.join_string.trim().is_empty(), |ui| {
-                    if ui.add(theme::primary_button(t!("join.button").to_string())).clicked() {
-                        self.start_connect();
-                    }
-                });
-
-                match &self.status {
-                    Status::Idle => {}
-                    Status::Connecting => {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.label(t!("join.connecting").to_string());
-                        });
-                    }
-                    Status::Error(e) => {
-                        ui.colored_label(theme::DANGER, t!("join.error", error = e).to_string());
-                    }
-                }
+    /// The always-on left sidebar: wordmark / nav rail / ROOMS / STREAMS.
+    ///
+    /// `Why` nested egui panels rather than one vertical layout with
+    /// hand-computed spacers: the plan's layout is "ROOMS consumes the greedy
+    /// middle; STREAMS is capped and never squeezes it out". `TopBottomPanel`
+    /// expresses exactly that — the head sizes to its content, the STREAMS
+    /// footer to its content up to `STREAMS_MAX_HEIGHT`, and whatever is left
+    /// goes to the central region. Spacers would have to re-derive the same
+    /// split from `available_height()` every frame, and would get it wrong the
+    /// moment either section's content changed height.
+    fn ui_sidebar(&mut self, ui: &mut egui::Ui) {
+        egui::TopBottomPanel::top("sidebar_head")
+            .frame(egui::Frame::NONE)
+            .show_separator_line(false)
+            .show_inside(ui, |ui| {
+                ui.add_space(theme::SPACING);
+                ui.label(egui::RichText::new(t!("app.title").to_string()).heading().strong().color(theme::TEXT));
+                ui.add_space(theme::SPACING * 2.0);
+                self.ui_nav(ui);
+                ui.add_space(theme::SPACING);
             });
 
-            theme::card(ui, t!("join.saved_lounges").as_ref(), |ui| {
-                if let Some(err) = &self.room_store_error {
-                    ui.colored_label(theme::DANGER, t!("join.load_error", error = err).to_string());
-                }
-                if self.room_store.rooms.is_empty() {
-                    ui.label(egui::RichText::new(t!("join.no_saved_rooms").to_string()).color(theme::TEXT_FAINT));
-                } else {
-                    let mut to_join: Option<String> = None;
-                    let mut to_remove: Option<String> = None;
-                    for room in &self.room_store.rooms {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(&room.name).color(theme::TEXT));
-                            if ui.add(theme::secondary_button(t!("join.button").to_string())).clicked() {
-                                to_join = Some(room.join_string.clone());
-                            }
-                            if ui.add(theme::danger_button(t!("rooms.remove_button").to_string())).clicked() {
-                                to_remove = Some(room.name.clone());
-                            }
-                        });
-                    }
-                    if let Some(join_string) = to_join {
-                        self.join_string = join_string;
-                        self.start_connect();
-                    }
-                    if let Some(name) = to_remove {
-                        self.room_store.remove(&name);
-                        if let Err(e) = self.room_store.save() {
-                            self.room_store_error = Some(e.to_string());
-                        }
-                    }
-                }
+        egui::TopBottomPanel::bottom("sidebar_streams")
+            .frame(egui::Frame::NONE)
+            .show_separator_line(false)
+            .max_height(STREAMS_MAX_HEIGHT)
+            .show_inside(ui, |ui| {
+                ui.add_space(theme::SPACING);
+                self.ui_streams_section(ui);
+            });
+
+        egui::CentralPanel::default().frame(egui::Frame::NONE).show_inside(ui, |ui| {
+            // "+ Add Room" (and its inline card) is pinned to the *bottom of
+            // the ROOMS section*, not the bottom of the sidebar — STREAMS
+            // lives below it — so it's a bottom panel nested inside the rooms
+            // region rather than a sibling of it.
+            egui::TopBottomPanel::bottom("sidebar_add_room")
+                .frame(egui::Frame::NONE)
+                .show_separator_line(false)
+                .show_inside(ui, |ui| {
+                    self.ui_add_room(ui);
+                });
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show_inside(ui, |ui| {
+                self.ui_rooms_section(ui);
             });
         });
     }
 
-    /// The connected screen, rendered for `active_room`.
+    /// The three-pill nav rail. Sets `nav_tab` and nothing else — see this
+    /// module's docs on the nav being a pure view-switcher.
+    fn ui_nav(&mut self, ui: &mut egui::Ui) {
+        for tab in NavTab::ALL {
+            let active = self.nav_tab == tab;
+            let response =
+                ui.add_sized([ui.available_width(), theme::NAV_BUTTON_HEIGHT], theme::nav_button(tab.label(), active));
+            if response.clicked() {
+                self.nav_tab = tab;
+            }
+            ui.add_space(theme::SPACING * 0.5);
+        }
+    }
+
+    /// The ROOMS section: every saved room, with the ones that have a live
+    /// `RoomSession` rendered as connected.
+    ///
+    /// `Why` iterate `room_store` and look the session up (rather than the
+    /// reverse): the plan unifies "rooms" and the old saved "lounges" into one
+    /// list, i.e. a left join `room_store ⟕ rooms`. Driving the loop from the
+    /// persistent side is what makes a disconnected saved room a *row* (with
+    /// `[Reconnect]`) instead of something that vanishes when its connection
+    /// drops. A live room with no store entry can't normally exist — a
+    /// successful join saves it — but is rendered afterwards anyway rather
+    /// than being silently invisible.
+    fn ui_rooms_section(&mut self, ui: &mut egui::Ui) {
+        theme::section_label(ui, t!("rooms.section").as_ref());
+
+        if let Some(err) = &self.room_store_error {
+            ui.colored_label(theme::DANGER, t!("join.load_error", error = err).to_string());
+        }
+        // A connect failure that didn't come from the Add Room card (i.e. a
+        // `[Reconnect]`, or a dropped connection) has no card to live in, so
+        // it reports here, above the list it concerns.
+        if let Status::Error(e) = &self.status
+            && !self.add_room_open
+        {
+            ui.colored_label(theme::DANGER, t!("join.error", error = e).to_string());
+        }
+
+        let mut actions: Vec<RoomAction> = Vec::new();
+        egui::ScrollArea::vertical()
+            .id_salt("rooms_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for saved in &self.room_store.rooms {
+                    let handle = self
+                        .rooms
+                        .iter()
+                        .find(|(_, room)| room.join_string == saved.join_string)
+                        .map(|(handle, _)| *handle);
+                    self.ui_room_row(ui, &saved.name, &saved.join_string, handle, &mut actions);
+                }
+                for (handle, room) in &self.rooms {
+                    if self.room_store.name_for(&room.join_string).is_some() {
+                        continue;
+                    }
+                    let name = room_label(&self.room_store, &room.join_string);
+                    self.ui_room_row(ui, &name, &room.join_string, Some(*handle), &mut actions);
+                }
+                if self.room_store.rooms.is_empty() && self.rooms.is_empty() {
+                    ui.label(egui::RichText::new(t!("rooms.none_yet").to_string()).color(theme::TEXT_FAINT).small());
+                }
+            });
+
+        for action in actions {
+            self.apply_room_action(action);
+        }
+    }
+
+    /// One ROOMS row, in whichever of the three states applies: joined (green
+    /// dot, expandable), reconnecting (amber pulsing dot), or saved-but-
+    /// disconnected (hollow dot, `[Reconnect]`).
+    ///
+    /// Takes `&self` and collects into `actions` rather than acting directly:
+    /// every affordance here mutates something (`rooms`, `room_store`,
+    /// `expanded_rooms`) that this function is simultaneously reading to
+    /// render the list.
+    fn ui_room_row(
+        &self,
+        ui: &mut egui::Ui,
+        name: &str,
+        join_string: &str,
+        handle: Option<RoomHandle>,
+        actions: &mut Vec<RoomAction>,
+    ) {
+        let selected = handle.is_some() && self.active_room == handle;
+        let expanded = handle.is_some_and(|h| self.expanded_rooms.contains(&h));
+        let reconnecting = handle.is_none() && self.is_reconnecting(join_string);
+
+        let fill = if selected { theme::tint(theme::ACCENT, 40) } else { egui::Color32::TRANSPARENT };
+        egui::Frame::new()
+            .fill(fill)
+            .corner_radius(egui::CornerRadius::same(theme::ROUNDING_SM))
+            .inner_margin(4)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    match (handle, reconnecting) {
+                        (Some(_), _) => theme::status_dot(ui, theme::SUCCESS, true),
+                        // A simple sine pulse on the dot's alpha, per the
+                        // plan's "don't over-build this" note. Driven off
+                        // egui's own frame clock; `update()` already keeps
+                        // repainting while a connect is in flight, so this
+                        // needs no repaint request of its own.
+                        (None, true) => {
+                            let phase = (ui.input(|i| i.time) / RECONNECT_PULSE_PERIOD * std::f64::consts::TAU).sin();
+                            let alpha = (140.0 + 115.0 * phase) as u8;
+                            theme::status_dot(ui, theme::tint(theme::WARNING, alpha), true);
+                        }
+                        (None, false) => theme::status_dot(ui, theme::TEXT_FAINT, false),
+                    }
+
+                    if let Some(h) = handle {
+                        let glyph = if expanded { ICON_CARET_EXPANDED } else { ICON_CARET_COLLAPSED };
+                        if ui.add(theme::icon_button(glyph)).clicked() {
+                            actions.push(RoomAction::ToggleExpand(h));
+                        }
+                    }
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        match handle {
+                            Some(h) => {
+                                if ui
+                                    .add(theme::icon_button(ICON_CLOSE))
+                                    .on_hover_text(t!("rooms.leave_tooltip").to_string())
+                                    .clicked()
+                                {
+                                    actions.push(RoomAction::Leave(h));
+                                }
+                                let room = &self.rooms[&h];
+                                ui.label(
+                                    egui::RichText::new(
+                                        t!("rooms.active_users", count = active_user_count(room)).to_string(),
+                                    )
+                                    .small()
+                                    .color(theme::TEXT_DIM),
+                                );
+                            }
+                            None => {
+                                if ui
+                                    .add(theme::icon_button(ICON_CLOSE))
+                                    .on_hover_text(t!("rooms.forget_tooltip").to_string())
+                                    .clicked()
+                                {
+                                    actions.push(RoomAction::Forget(name.to_string()));
+                                }
+                                ui.add_enabled_ui(!reconnecting, |ui| {
+                                    if ui.add(theme::secondary_button(t!("rooms.reconnect_button").to_string())).clicked() {
+                                        actions.push(RoomAction::Reconnect(join_string.to_string()));
+                                    }
+                                });
+                                if !reconnecting {
+                                    ui.label(
+                                        egui::RichText::new(t!("rooms.not_connected").to_string())
+                                            .small()
+                                            .color(theme::TEXT_FAINT),
+                                    );
+                                }
+                            }
+                        }
+
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            let label = egui::Label::new(
+                                egui::RichText::new(name).strong().color(if handle.is_some() {
+                                    theme::TEXT
+                                } else {
+                                    theme::TEXT_DIM
+                                }),
+                            )
+                            .truncate()
+                            .sense(egui::Sense::click());
+                            if ui.add(label).clicked()
+                                && let Some(h) = handle
+                            {
+                                actions.push(RoomAction::Select(h));
+                            }
+                        });
+                    });
+                });
+            });
+
+        if !expanded {
+            return;
+        }
+        let Some(handle) = handle else { return };
+        let Some(room) = self.rooms.get(&handle) else { return };
+        let me = room.client.conn_id();
+        let unknown_owner = t!("streams.unknown_owner").to_string();
+        for info in &room.streams {
+            if info.owner == me {
+                continue;
+            }
+            // A sender who also has video gets their audio auto-subscribed by
+            // the video row's action (see `RoomSession::toggle_watch`), so
+            // only an audio-only sender gets a row of their own.
+            if info.kind == StreamKind::Audio && room.owner_has_video(info.owner) {
+                continue;
+            }
+            let owner_name = room
+                .members
+                .iter()
+                .find(|m| m.conn_id == info.owner)
+                .map(|m| m.display_name.as_str())
+                .unwrap_or(unknown_owner.as_str());
+            let key = (info.owner, info.stream_id);
+            let active = if info.kind == StreamKind::Audio {
+                room.audio_watches.lock().unwrap().contains_key(&key)
+            } else {
+                room.watches.lock().unwrap().contains_key(&key)
+            };
+
+            ui.horizontal(|ui| {
+                ui.add_space(theme::SPACING * 2.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let glyph = if active { ICON_STOP } else { ICON_WATCH };
+                    let tooltip = match (info.kind, active) {
+                        (StreamKind::Audio, false) => t!("streams.listen_button"),
+                        (StreamKind::Audio, true) => t!("streams.stop_listening_button"),
+                        (_, false) => t!("streams.watch_button"),
+                        (_, true) => t!("streams.stop_watching_button"),
+                    };
+                    if ui.add(theme::icon_button(glyph)).on_hover_text(tooltip.to_string()).clicked() {
+                        actions.push(match info.kind {
+                            StreamKind::Audio => RoomAction::Listen(handle, key.0, key.1),
+                            _ => RoomAction::Watch(handle, key.0, key.1),
+                        });
+                    }
+                    ui.label(
+                        egui::RichText::new(remote_stream_geometry(info))
+                            .small()
+                            .color(theme::TEXT_FAINT),
+                    );
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(owner_name)
+                                    .small()
+                                    .color(if active { theme::SUCCESS } else { theme::TEXT_DIM }),
+                            )
+                            .truncate(),
+                        );
+                    });
+                });
+            });
+        }
+    }
+
+    /// The "+ Add Room" button pinned to the bottom of the ROOMS section, and
+    /// the inline mini-card it expands into.
+    ///
+    /// `Why` inline and not a modal: joining is the most routine action in the
+    /// app, and a modal would blank out the very list the new room is about to
+    /// appear in. There is deliberately no staging step either — Join connects
+    /// immediately, and success *is* the save (see `poll_connect_result`),
+    /// because `RoomStore` already is this app's persistent "rooms I care
+    /// about" state and a second "saved but never joined" concept would be a
+    /// third thing to reconcile with the two that already exist.
+    fn ui_add_room(&mut self, ui: &mut egui::Ui) {
+        if self.add_room_open {
+            theme::card(ui, t!("rooms.add_header").as_ref(), |ui| {
+                ui.label(egui::RichText::new(t!("join.display_name_label").to_string()).small().color(theme::TEXT_DIM));
+                ui.add(egui::TextEdit::singleline(&mut self.display_name).desired_width(ui.available_width()));
+                ui.label(egui::RichText::new(t!("join.link_label").to_string()).small().color(theme::TEXT_DIM));
+                ui.add(egui::TextEdit::singleline(&mut self.add_room_join_string).desired_width(ui.available_width()));
+
+                let connecting = matches!(self.status, Status::Connecting);
+                ui.horizontal(|ui| {
+                    ui.add_enabled_ui(!connecting && !self.add_room_join_string.trim().is_empty(), |ui| {
+                        if ui.add(theme::primary_button(t!("join.button").to_string())).clicked() {
+                            let join_string = self.add_room_join_string.trim().to_string();
+                            self.start_connect(join_string, true);
+                        }
+                    });
+                    if ui.add(theme::secondary_button(t!("common.cancel").to_string())).clicked() {
+                        self.add_room_open = false;
+                        self.add_room_error = None;
+                    }
+                    if connecting {
+                        ui.spinner();
+                    }
+                });
+                if let Some(err) = &self.add_room_error {
+                    ui.colored_label(theme::DANGER, t!("join.error", error = err).to_string());
+                }
+            });
+        }
+
+        if ui
+            .add_sized(
+                [ui.available_width(), ui.spacing().interact_size.y],
+                theme::secondary_button(t!("rooms.add_button").to_string()),
+            )
+            .clicked()
+        {
+            self.add_room_open = !self.add_room_open;
+            self.add_room_error = None;
+        }
+    }
+
+    /// The STREAMS section: this client's own outgoing destinations across
+    /// *every* room, not just the one the content tabs happen to be showing.
+    ///
+    /// `Why` cross-room: a destination is "a thing I am broadcasting right
+    /// now", and the whole point of the multi-room model is that several can
+    /// be live in different rooms at once. Scoping this list to `active_room`
+    /// would hide outgoing streams the user is still paying bandwidth for.
+    fn ui_streams_section(&mut self, ui: &mut egui::Ui) {
+        theme::section_label(ui, t!("streams_section.header").as_ref());
+
+        if self.captures.is_empty() {
+            // The common case on every launch: nothing is persisted across
+            // sessions, so an inviting empty state is the *normal* state here,
+            // not an edge case.
+            ui.label(egui::RichText::new(t!("streams_section.empty").to_string()).color(theme::TEXT_FAINT).small());
+            ui.add_space(theme::SPACING * 0.5);
+            if ui
+                .add_sized(
+                    [ui.available_width(), ui.spacing().interact_size.y],
+                    theme::primary_button(t!("streams_section.start_button").to_string()),
+                )
+                .clicked()
+            {
+                self.nav_tab = NavTab::StreamControl;
+            }
+            return;
+        }
+
+        let mut to_stop: Vec<CaptureSourceId> = Vec::new();
+        egui::ScrollArea::vertical()
+            .id_salt("streams_scroll")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for (capture_id, capture) in &self.captures {
+                    for dest in capture.destinations.values() {
+                        let room_name = match self.rooms.get(&dest.room) {
+                            Some(room) => room_label(&self.room_store, &room.join_string),
+                            None => t!("streams_section.unknown_room").to_string(),
+                        };
+                        ui.horizontal(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let stoppable = matches!(capture.status, ShareStatus::Active(_));
+                                ui.add_enabled_ui(stoppable, |ui| {
+                                    if ui
+                                        .add(theme::icon_button(ICON_CLOSE))
+                                        .on_hover_text(t!("share.stop_button").to_string())
+                                        .clicked()
+                                    {
+                                        to_stop.push(*capture_id);
+                                    }
+                                });
+                                // Audio is still its own capture at this
+                                // stage, so the speaker icon marks an
+                                // audio *row*. Once audio becomes an optional
+                                // attachment on a video `Destination` (a later
+                                // stage, see the plan doc), it moves onto that
+                                // video row instead and this row disappears.
+                                if capture.kind == StreamKind::Audio {
+                                    ui.label(egui::RichText::new(ICON_AUDIO).small().color(theme::TEXT_DIM));
+                                }
+                                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                                    let detail = if capture.kind == StreamKind::Audio {
+                                        capture.label.clone()
+                                    } else {
+                                        destination_geometry(dest)
+                                    };
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(t!(
+                                                "streams_section.line",
+                                                room = room_name,
+                                                detail = detail
+                                            ).to_string())
+                                            .small()
+                                            .color(theme::TEXT),
+                                        )
+                                        .truncate(),
+                                    );
+                                });
+                            });
+                        });
+                        if !matches!(capture.status, ShareStatus::Active(_)) {
+                            let state = match capture.status {
+                                ShareStatus::Starting(_) => t!("share.state_starting"),
+                                _ => t!("share.state_stopping"),
+                            };
+                            ui.label(egui::RichText::new(state.to_string()).small().color(theme::TEXT_FAINT));
+                        }
+                    }
+                }
+            });
+
+        for capture_id in to_stop {
+            self.stop_share(capture_id);
+        }
+    }
+
+    /// Apply one deferred sidebar action, now that the render borrows are
+    /// gone. See `ui_room_row`.
+    fn apply_room_action(&mut self, action: RoomAction) {
+        match action {
+            RoomAction::Select(handle) => self.active_room = Some(handle),
+            RoomAction::ToggleExpand(handle) => {
+                if !self.expanded_rooms.remove(&handle) {
+                    self.expanded_rooms.insert(handle);
+                }
+            }
+            RoomAction::Leave(handle) => self.request_leave_room(handle),
+            RoomAction::Reconnect(join_string) => self.start_connect(join_string, false),
+            RoomAction::Forget(name) => {
+                self.room_store.remove(&name);
+                if let Err(e) = self.room_store.save() {
+                    self.room_store_error = Some(e.to_string());
+                }
+            }
+            RoomAction::Watch(handle, owner, stream_id) => {
+                if let Some(room) = self.rooms.get_mut(&handle) {
+                    room.toggle_watch(owner, stream_id);
+                    // Watching from a room's row is also a statement about
+                    // which room you're looking at — otherwise the View tab
+                    // would keep showing a different room's stream and the
+                    // click would look like it did nothing.
+                    self.active_room = Some(handle);
+                    self.nav_tab = NavTab::View;
+                }
+            }
+            RoomAction::Listen(handle, owner, stream_id) => {
+                if let Some(room) = self.rooms.get_mut(&handle) {
+                    room.toggle_listen(owner, stream_id);
+                }
+            }
+        }
+    }
+
+    /// Confirm dialog for leaving a room with active work in it. See
+    /// `leave_needs_confirm` for when this is raised at all.
+    fn ui_leave_confirm(&mut self, ctx: &egui::Context) {
+        let Some(handle) = self.leave_confirm else { return };
+        let Some(room) = self.rooms.get(&handle) else {
+            self.leave_confirm = None;
+            return;
+        };
+        let name = room_label(&self.room_store, &room.join_string);
+        let watching = room.watches.lock().unwrap().len() + room.audio_watches.lock().unwrap().len();
+        let sending = room.destinations.len();
+
+        let mut confirmed = false;
+        let mut cancelled = false;
+        let response = egui::Modal::new(egui::Id::new("leave_room_confirm")).show(ctx, |ui| {
+            ui.set_max_width(theme::PANEL_MAX_WIDTH);
+            theme::section_label(ui, t!("rooms.leave_confirm_title").as_ref());
+            ui.add_space(theme::SPACING);
+            ui.label(egui::RichText::new(t!("rooms.leave_confirm_body", room = name).to_string()).color(theme::TEXT));
+            if sending > 0 {
+                ui.label(
+                    egui::RichText::new(t!("rooms.leave_confirm_sending", count = sending).to_string())
+                        .color(theme::WARNING),
+                );
+            }
+            if watching > 0 {
+                ui.label(
+                    egui::RichText::new(t!("rooms.leave_confirm_watching", count = watching).to_string())
+                        .color(theme::WARNING),
+                );
+            }
+            ui.add_space(theme::SPACING);
+            ui.horizontal(|ui| {
+                if ui.add(theme::danger_button(t!("rooms.leave_confirm_button").to_string())).clicked() {
+                    confirmed = true;
+                }
+                if ui.add(theme::secondary_button(t!("common.cancel").to_string())).clicked() {
+                    cancelled = true;
+                }
+            });
+        });
+
+        if confirmed {
+            self.leave_confirm = None;
+            self.disconnect_room(handle);
+        } else if cancelled || response.should_close() {
+            self.leave_confirm = None;
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // App shell — content area
+    // -----------------------------------------------------------------
+
+    /// Render whichever nav tab is selected. Nothing here (or in the tab
+    /// functions it dispatches to) starts or stops a share, a subscription or
+    /// a decoder as a side effect of *which* tab is showing — see this
+    /// module's docs.
+    fn ui_content(&mut self, ui: &mut egui::Ui) {
+        match self.nav_tab {
+            NavTab::StreamControl => self.ui_stream_control_tab(ui),
+            NavTab::View => self.ui_view_tab(ui),
+            NavTab::Settings => self.ui_settings_tab(ui),
+        }
+    }
+
+    /// A centered "there's nothing here yet, here's what to do" message —
+    /// shared by every tab's empty state so they read as one family.
+    fn ui_empty_state(ui: &mut egui::Ui, message: &str) {
+        ui.centered_and_justified(|ui| {
+            ui.label(egui::RichText::new(message).color(theme::TEXT_FAINT));
+        });
+    }
+
+    fn ui_settings_tab(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.set_max_width(theme::PANEL_MAX_WIDTH);
+            ui.spacing_mut().item_spacing.y = 0.0;
+            self.ui_settings_card(ui);
+        });
+    }
+
+    /// Stream Control: the sharing controls for `active_room`.
+    ///
+    /// **Deliberately minimal at this stage.** This tab is the mount point for
+    /// the multi-destination fan-out UI, the Absolute-Maximum /
+    /// Per-Stream-Maximum bandwidth-mode toggle (and `bandwidth::allocate`'s
+    /// wiring), live transfer between rooms, and the overshoot warning banner
+    /// — none of which are built here. What it holds today is exactly the
+    /// controls the old connected screen had, relocated and restyled: one
+    /// bitrate/framerate setting pair applied to the *next* capture started,
+    /// share screen / share audio, and the list of what's already running.
     ///
     /// `self` is destructured up front rather than accessed field-by-field:
-    /// the screen mixes room-scoped state (`rooms[active_room]`) with
-    /// `App`-scoped capture state (`captures`, `share_error`, the audio-source
-    /// list), and taking them as independent bindings is what lets both be
-    /// live at once. The capture-side *actions* still can't run here — they
-    /// need `&mut self` whole — so they're recorded and applied after the
-    /// borrow ends, the same collect-then-apply idiom the stream list already
-    /// used for its watch toggles.
-    fn ui_connected_screen(&mut self, ui: &mut egui::Ui) {
-        let Some(room_handle) = self.active_room else { return };
+    /// the tab mixes room-scoped state (`rooms[active_room]`) with `App`-scoped
+    /// capture state (`captures`, `share_error`, the audio-source list), and
+    /// taking them as independent bindings is what lets both be live at once.
+    /// The capture-side *actions* still need `&mut self` whole, so they're
+    /// recorded and applied after the borrow ends.
+    fn ui_stream_control_tab(&mut self, ui: &mut egui::Ui) {
+        let Some(room_handle) = self.active_room else {
+            Self::ui_empty_state(ui, t!("stream_control.empty").as_ref());
+            return;
+        };
 
         let mut start_video = false;
         let mut start_audio = false;
         let mut refresh_audio = false;
         let mut to_stop: Vec<CaptureSourceId> = Vec::new();
+        let mut rename: Option<(String, String)> = None;
 
-        // Borrows of these fields end at their last use below (NLL), which is
-        // what lets the deferred `&mut self` actions run at the bottom.
         let App {
             rooms,
             captures,
-            join_string,
-            display_name,
             room_store,
-            room_store_error,
             share_error,
             bitrate_kbps,
             framerate,
@@ -1780,438 +2609,233 @@ impl App {
         } = self;
         let Some(room) = rooms.get_mut(&room_handle) else { return };
 
-        ui.heading(egui::RichText::new(t!("app.title").to_string()).color(theme::TEXT));
-        ui.label(
-            egui::RichText::new(
-                t!(
-                    "connected.status",
-                    name = display_name.clone(),
-                    conn_id = format!("{:016x}", room.client.conn_id())
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.set_max_width(theme::PANEL_MAX_WIDTH);
+            ui.spacing_mut().item_spacing.y = 0.0;
+
+            ui.label(
+                egui::RichText::new(room_label(room_store, &room.join_string))
+                    .heading()
+                    .color(theme::TEXT),
+            );
+            ui.label(
+                egui::RichText::new(
+                    t!("connected.status", conn_id = format!("{:016x}", room.client.conn_id())).to_string(),
                 )
-                .to_string(),
-            )
-            .color(theme::TEXT_DIM),
-        );
-        ui.add_space(theme::SPACING);
+                .small()
+                .color(theme::TEXT_DIM),
+            );
+            ui.add_space(theme::SPACING);
 
-        // A single control row, not its own card: one field plus one button
-        // doesn't need card ceremony (see STYLING-GUIDE.md's card guidance —
-        // cards are for *grouping* related controls).
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(t!("rooms.save_label").to_string()).color(theme::TEXT));
-            ui.text_edit_singleline(&mut room.save_name);
-            let can_save = !room.save_name.trim().is_empty();
-            ui.add_enabled_ui(can_save, |ui| {
-                if ui.add(theme::secondary_button(t!("rooms.save_button").to_string())).clicked() {
-                    room_store.upsert(room.save_name.clone(), join_string.clone());
-                    if let Err(e) = room_store.save() {
-                        *room_store_error = Some(e.to_string());
-                    } else {
-                        room.saved = true;
-                    }
-                }
-            });
-        });
-        if room.saved {
-            ui.colored_label(theme::SUCCESS, t!("rooms.saved_confirmation").to_string());
-        }
-        ui.add_space(theme::SPACING);
-
-        theme::card(ui, t!("members.header", count = room.members.len()).as_ref(), |ui| {
-            egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
-                // Show all members, not just streamers (spec §8/§4.2: a
-                // lurker with stream_count == 0 still appears in the
-                // roster).
-                for member in &room.members {
-                    ui.horizontal(|ui| {
-                        if member.stream_count > 0 {
-                            ui.colored_label(theme::SUCCESS, "\u{25cf}");
-                            let key = if member.stream_count == 1 { "members.stream_singular" } else { "members.stream_plural" };
-                            ui.label(
-                                egui::RichText::new(t!(key, name = member.display_name, count = member.stream_count).to_string())
-                                    .color(theme::TEXT),
-                            );
-                        } else {
-                            ui.colored_label(theme::TEXT_FAINT, "\u{25cb}");
-                            ui.label(egui::RichText::new(&member.display_name).color(theme::TEXT_DIM));
-                        }
-                    });
-                }
-            });
-        });
-
-        theme::card(ui, t!("share.video_header").as_ref(), |ui| {
-            theme::slider_row(ui, t!("share.bitrate_label").as_ref(), bitrate_kbps, MIN_BITRATE_KBPS..=MAX_BITRATE_KBPS, 50.0, " kbps");
-            theme::setting_row(ui, t!("share.framerate_label").as_ref(), |ui| {
-                egui::ComboBox::from_id_salt("framerate_combo")
-                    .selected_text(format!("{} fps", *framerate))
-                    .show_ui(ui, |ui| {
-                        for &fps in &FRAMERATE_OPTIONS {
-                            ui.selectable_value(framerate, fps, format!("{fps} fps"));
-                        }
-                    });
-            });
+            // Rename this room's saved entry. A single field plus one button
+            // doesn't need card ceremony (STYLING-GUIDE.md: cards are for
+            // *grouping* related controls).
             ui.horizontal(|ui| {
-                // Always enabled: clicking again while a video share is
-                // already active starts *another* capture (its own
-                // destination and stream_id), re-prompting the OS portal
-                // picker so the user can pick a different monitor/window.
-                if ui.add(theme::primary_button(t!("share.screen_button").to_string())).clicked() {
-                    start_video = true;
-                }
-                let starting_video = captures
-                    .values()
-                    .any(|c| c.kind == StreamKind::Video && matches!(c.status, ShareStatus::Starting(_)));
-                if starting_video {
-                    ui.spinner();
-                    ui.label(egui::RichText::new(t!("share.waiting_permission").to_string()).color(theme::TEXT_DIM));
-                }
-            });
-        });
-
-        theme::card(ui, t!("share.audio_header").as_ref(), |ui| {
-            ui.horizontal(|ui| {
-                if !*audio_sources_requested {
-                    *audio_sources_requested = true;
-                    refresh_audio = true;
-                }
-                if ui.add(theme::secondary_button(t!("share.refresh_button").to_string())).clicked() {
-                    refresh_audio = true;
-                }
-                if audio_sources_rx.is_some() {
-                    ui.spinner();
-                }
-            });
-            ui.horizontal(|ui| {
-                let placeholder = t!("share.select_source_placeholder").to_string();
-                let selected_text = selected_audio_source
-                    .as_ref()
-                    .map(|s| s.name.as_str())
-                    .unwrap_or(placeholder.as_str());
-                egui::ComboBox::from_label(t!("share.source_label").to_string())
-                    .selected_text(selected_text)
-                    .show_ui(ui, |ui| {
-                        for source in audio_sources.iter() {
-                            let selected = selected_audio_source.as_ref() == Some(source);
-                            if ui.selectable_label(selected, &source.name).clicked() {
-                                *selected_audio_source = Some(source.clone());
-                            }
-                        }
-                    });
-                let can_share_audio = selected_audio_source.is_some();
-                ui.add_enabled_ui(can_share_audio, |ui| {
-                    if ui.add(theme::primary_button(t!("share.audio_button").to_string())).clicked() {
-                        start_audio = true;
+                ui.label(egui::RichText::new(t!("rooms.save_label").to_string()).color(theme::TEXT));
+                ui.text_edit_singleline(&mut room.save_name);
+                let new_name = room.save_name.trim().to_string();
+                ui.add_enabled_ui(!new_name.is_empty(), |ui| {
+                    if ui.add(theme::secondary_button(t!("rooms.save_button").to_string())).clicked() {
+                        rename = Some((room.join_string.clone(), new_name.clone()));
                     }
                 });
             });
-            if audio_sources.is_empty() && audio_sources_rx.is_none() {
-                ui.label(egui::RichText::new(t!("share.no_audio_sources").to_string()).color(theme::TEXT_FAINT));
+            if room.saved {
+                ui.colored_label(theme::SUCCESS, t!("rooms.saved_confirmation").to_string());
             }
-            if let Some(err) = audio_sources_error.as_ref() {
-                ui.colored_label(theme::DANGER, t!("share.audio_sources_error", error = err).to_string());
-            }
-        });
+            ui.add_space(theme::SPACING);
 
-        // What this client is sending *into this room*, walked through the
-        // room's own `destinations` back-references. That ordering (the order
-        // the user started them) replaces the old sort-by-stream_id: with
-        // several rooms, `stream_id` is no longer a session-wide ordering at
-        // all, just a per-connection label.
-        theme::card(ui, t!("share.active_header").as_ref(), |ui| {
-            if room.destinations.is_empty() {
-                ui.label(egui::RichText::new(t!("share.none").to_string()).color(theme::TEXT_FAINT));
-            } else {
-                for destination_id in room.destinations.iter() {
-                    let Some((capture_id, capture, dest)) = find_destination(captures, *destination_id) else {
-                        continue;
-                    };
-                    let kind_label = match capture.kind {
-                        StreamKind::Video => t!("share.kind_video").to_string(),
-                        StreamKind::Audio => t!("share.kind_audio").to_string(),
-                    };
-                    let (state_label, stoppable) = match &capture.status {
-                        ShareStatus::Starting(_) => (t!("share.state_starting").to_string(), false),
-                        ShareStatus::Active(_) => (t!("share.state_active").to_string(), true),
-                        ShareStatus::Stopping(_) => (t!("share.state_stopping").to_string(), false),
-                    };
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(
-                                t!(
-                                    "share.active_line",
-                                    stream_id = dest.stream_id,
-                                    kind = kind_label,
-                                    label = capture.label.clone(),
-                                    state = state_label
-                                )
-                                .to_string(),
-                            )
-                            .color(theme::TEXT),
-                        );
-                        let stop_label = if capture.kind == StreamKind::Audio {
-                            t!("share.stop_audio_button").to_string()
-                        } else {
-                            t!("share.stop_button").to_string()
-                        };
-                        ui.add_enabled_ui(stoppable, |ui| {
-                            if ui.add(theme::danger_button(stop_label)).clicked() {
-                                to_stop.push(capture_id);
+            theme::card(ui, t!("members.header", count = room.members.len()).as_ref(), |ui| {
+                egui::ScrollArea::vertical().id_salt("members_scroll").max_height(120.0).show(ui, |ui| {
+                    // Show all members, not just streamers (spec §8/§4.2: a
+                    // lurker with stream_count == 0 still appears in the
+                    // roster).
+                    for member in &room.members {
+                        ui.horizontal(|ui| {
+                            if member.stream_count > 0 {
+                                theme::status_dot(ui, theme::SUCCESS, true);
+                                let key = if member.stream_count == 1 { "members.stream_singular" } else { "members.stream_plural" };
+                                ui.label(
+                                    egui::RichText::new(t!(key, name = member.display_name, count = member.stream_count).to_string())
+                                        .color(theme::TEXT),
+                                );
+                            } else {
+                                theme::status_dot(ui, theme::TEXT_FAINT, false);
+                                ui.label(egui::RichText::new(&member.display_name).color(theme::TEXT_DIM));
                             }
                         });
-                        // Sharer-side live encode rate: the encoder
-                        // branch's actual output framerate (see
-                        // `CaptureHandle::encoder_fps`), confirming the
-                        // configured framerate is really being hit rather
-                        // than just selected in the UI. Video shares
-                        // only — audio has no comparable per-frame rate.
-                        if let ShareStatus::Active(ShareHandle::Video(handle)) = &capture.status {
-                            ui.label(egui::RichText::new(t!("share.fps_label", fps = handle.encoder_fps()).to_string()).color(theme::TEXT_DIM));
+                    }
+                });
+            });
+
+            theme::card(ui, t!("share.video_header").as_ref(), |ui| {
+                theme::slider_row(ui, t!("share.bitrate_label").as_ref(), bitrate_kbps, MIN_BITRATE_KBPS..=MAX_BITRATE_KBPS, 50.0, " kbps");
+                theme::setting_row(ui, t!("share.framerate_label").as_ref(), |ui| {
+                    egui::ComboBox::from_id_salt("framerate_combo")
+                        .selected_text(format!("{} fps", *framerate))
+                        .show_ui(ui, |ui| {
+                            for &fps in &FRAMERATE_OPTIONS {
+                                ui.selectable_value(framerate, fps, format!("{fps} fps"));
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    // Always enabled: clicking again while a video share is
+                    // already active starts *another* capture (its own
+                    // destination and stream_id), re-prompting the OS portal
+                    // picker so the user can pick a different monitor/window.
+                    if ui.add(theme::primary_button(t!("share.screen_button").to_string())).clicked() {
+                        start_video = true;
+                    }
+                    let starting_video = captures
+                        .values()
+                        .any(|c| c.kind == StreamKind::Video && matches!(c.status, ShareStatus::Starting(_)));
+                    if starting_video {
+                        ui.spinner();
+                        ui.label(egui::RichText::new(t!("share.waiting_permission").to_string()).color(theme::TEXT_DIM));
+                    }
+                });
+            });
+
+            theme::card(ui, t!("share.audio_header").as_ref(), |ui| {
+                ui.horizontal(|ui| {
+                    if !*audio_sources_requested {
+                        *audio_sources_requested = true;
+                        refresh_audio = true;
+                    }
+                    if ui.add(theme::secondary_button(t!("share.refresh_button").to_string())).clicked() {
+                        refresh_audio = true;
+                    }
+                    if audio_sources_rx.is_some() {
+                        ui.spinner();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let placeholder = t!("share.select_source_placeholder").to_string();
+                    let selected_text = selected_audio_source
+                        .as_ref()
+                        .map(|s| s.name.as_str())
+                        .unwrap_or(placeholder.as_str());
+                    egui::ComboBox::from_label(t!("share.source_label").to_string())
+                        .selected_text(selected_text)
+                        .show_ui(ui, |ui| {
+                            for source in audio_sources.iter() {
+                                let selected = selected_audio_source.as_ref() == Some(source);
+                                if ui.selectable_label(selected, &source.name).clicked() {
+                                    *selected_audio_source = Some(source.clone());
+                                }
+                            }
+                        });
+                    let can_share_audio = selected_audio_source.is_some();
+                    ui.add_enabled_ui(can_share_audio, |ui| {
+                        if ui.add(theme::primary_button(t!("share.audio_button").to_string())).clicked() {
+                            start_audio = true;
                         }
                     });
-                    // Sender-side self-preview: a small live view of this
-                    // machine's own captured video, so the person sharing can
-                    // confirm what viewers actually see. Video shares only,
-                    // and only once actually `Active` (a `CaptureHandle` — and
-                    // therefore a self-preview frame source — only exists at
-                    // that point). See `superdoc/features/self-preview.md`.
-                    if capture.kind == StreamKind::Video && matches!(capture.status, ShareStatus::Active(_)) {
-                        const SELF_PREVIEW_WIDTH: f32 = 160.0;
-                        const SELF_PREVIEW_HEIGHT: f32 = SELF_PREVIEW_WIDTH * 9.0 / 16.0;
-                        theme::section_label(ui, t!("share.self_preview_label").as_ref());
-                        match &capture.self_preview_texture {
-                            Some(tex) => {
-                                let tex_size = tex.size_vec2();
-                                let scale = if tex_size.x > 0.0 { SELF_PREVIEW_WIDTH / tex_size.x } else { 1.0 };
-                                ui.image((tex.id(), tex_size * scale));
-                            }
-                            None => {
-                                let (rect, _) = ui
-                                    .allocate_exact_size(egui::vec2(SELF_PREVIEW_WIDTH, SELF_PREVIEW_HEIGHT), egui::Sense::hover());
-                                ui.painter().rect_filled(rect, 4.0, theme::FIELD);
-                            }
-                        }
-                    }
+                });
+                if audio_sources.is_empty() && audio_sources_rx.is_none() {
+                    ui.label(egui::RichText::new(t!("share.no_audio_sources").to_string()).color(theme::TEXT_FAINT));
                 }
-            }
-            if let Some(err) = share_error.as_ref() {
-                ui.colored_label(theme::DANGER, t!("share.error", error = err).to_string());
-            }
-        });
+                if let Some(err) = audio_sources_error.as_ref() {
+                    ui.colored_label(theme::DANGER, t!("share.audio_sources_error", error = err).to_string());
+                }
+            });
 
-        theme::card(ui, t!("streams.header").as_ref(), |ui| {
-            if let Some(err) = &room.watch_error {
-                ui.colored_label(theme::DANGER, t!("streams.watch_error", error = err).to_string());
-            }
-            if room.streams.is_empty() {
-                ui.label(egui::RichText::new(t!("streams.none_active").to_string()).color(theme::TEXT_FAINT));
-            } else {
-                let mut to_toggle: Option<(ConnId, StreamId)> = None;
-                let mut to_pop_out: Option<(ConnId, StreamId)> = None;
-                let mut to_toggle_listen: Option<(ConnId, StreamId)> = None;
-                let unknown_owner = t!("streams.unknown_owner").to_string();
-                for info in &room.streams {
-                    let key = (info.owner, info.stream_id);
-                    let owner_name = room
-                        .members
-                        .iter()
-                        .find(|m| m.conn_id == info.owner)
-                        .map(|m| m.display_name.as_str())
-                        .unwrap_or(unknown_owner.as_str());
-
-                    if info.kind == StreamKind::Audio {
-                        // A sender with video gets their audio
-                        // auto-subscribed via the video row's Watch button
-                        // (see `RoomSession::toggle_watch`) — only an
-                        // audio-only sender (no video announced) gets its
-                        // own "Listen" row here.
-                        if room.owner_has_video(info.owner) {
+            // What this client is sending *into this room*, walked through the
+            // room's own `destinations` back-references. That ordering (the
+            // order the user started them) replaces the old sort-by-stream_id:
+            // with several rooms, `stream_id` is no longer a session-wide
+            // ordering at all, just a per-connection label.
+            theme::card(ui, t!("share.active_header").as_ref(), |ui| {
+                if room.destinations.is_empty() {
+                    ui.label(egui::RichText::new(t!("share.none").to_string()).color(theme::TEXT_FAINT));
+                } else {
+                    for destination_id in room.destinations.iter() {
+                        let Some((capture_id, capture, dest)) = find_destination(captures, *destination_id) else {
                             continue;
-                        }
-                        let listening = room.audio_watches.lock().unwrap().contains_key(&key);
+                        };
+                        let kind_label = match capture.kind {
+                            StreamKind::Video => t!("share.kind_video").to_string(),
+                            StreamKind::Audio => t!("share.kind_audio").to_string(),
+                        };
+                        let (state_label, stoppable) = match &capture.status {
+                            ShareStatus::Starting(_) => (t!("share.state_starting").to_string(), false),
+                            ShareStatus::Active(_) => (t!("share.state_active").to_string(), true),
+                            ShareStatus::Stopping(_) => (t!("share.state_stopping").to_string(), false),
+                        };
                         ui.horizontal(|ui| {
-                            ui.vertical(|ui| {
-                                ui.label(
-                                    egui::RichText::new(
-                                        t!(
-                                            "streams.audio_line",
-                                            owner = owner_name,
-                                            label = info.label.clone()
-                                        )
-                                        .to_string(),
-                                    )
-                                    .color(theme::TEXT),
-                                );
-                                ui.horizontal(|ui| {
-                                    let button_label = if listening {
-                                        t!("streams.stop_listening_button").to_string()
-                                    } else {
-                                        t!("streams.listen_button").to_string()
-                                    };
-                                    if ui.small_button(button_label).clicked() {
-                                        to_toggle_listen = Some(key);
-                                    }
-                                    if listening {
-                                        ui.colored_label(theme::SUCCESS, t!("streams.listening").to_string());
-                                    }
-                                });
-                                let mut audio_watches = room.audio_watches.lock().unwrap();
-                                if let Some(audio_watch) = audio_watches.get_mut(&key)
-                                    && theme::slider_row(ui, t!("audio.volume_label").as_ref(), &mut audio_watch.volume_percent, 0..=200, 1.0, "%")
-                                {
-                                    audio_watch.decoder.set_volume(audio_watch.volume_percent as f64 / 100.0);
-                                }
-                            });
-                        });
-                        continue;
-                    }
-
-                    let watching = room.watches.lock().unwrap().contains_key(&key);
-                    ui.horizontal(|ui| {
-                        // Thumbnail (or a placeholder box until the first
-                        // preview for this stream arrives) — previews
-                        // arrive for every active stream regardless of
-                        // whether we're watching it, so this shows up
-                        // independent of the Watch/Stop Watching toggle
-                        // below.
-                        const THUMB_WIDTH: f32 = 120.0;
-                        const THUMB_HEIGHT: f32 = THUMB_WIDTH * 9.0 / 16.0;
-                        match room.preview_textures.get(&key) {
-                            Some(tex) => {
-                                let tex_size = tex.size_vec2();
-                                let scale = if tex_size.x > 0.0 { THUMB_WIDTH / tex_size.x } else { 1.0 };
-                                ui.image((tex.id(), tex_size * scale));
-                            }
-                            None => {
-                                let (rect, _) =
-                                    ui.allocate_exact_size(egui::vec2(THUMB_WIDTH, THUMB_HEIGHT), egui::Sense::hover());
-                                ui.painter().rect_filled(rect, 4.0, theme::FIELD);
-                            }
-                        }
-
-                        let popped_out = room.watches.lock().unwrap().get(&key).is_some_and(|e| e.popout.is_some());
-
-                        ui.vertical(|ui| {
                             ui.label(
                                 egui::RichText::new(
                                     t!(
-                                        "streams.line",
-                                        owner = owner_name,
-                                        label = info.label.clone(),
-                                        width = info.width,
-                                        height = info.height
+                                        "share.active_line",
+                                        stream_id = dest.stream_id,
+                                        kind = kind_label,
+                                        label = capture.label.clone(),
+                                        state = state_label
                                     )
                                     .to_string(),
                                 )
                                 .color(theme::TEXT),
                             );
-                            ui.horizontal(|ui| {
-                                let button_label = if watching {
-                                    t!("streams.stop_watching_button").to_string()
-                                } else {
-                                    t!("streams.watch_button").to_string()
-                                };
-                                if ui.small_button(button_label).clicked() {
-                                    to_toggle = Some(key);
-                                }
-                                if watching {
-                                    // Pop out into its own native window
-                                    // (or, once popped out, this just
-                                    // reports state — closing that window
-                                    // is how it comes back).
-                                    ui.add_enabled_ui(!popped_out, |ui| {
-                                        if ui.small_button(t!("streams.pop_out_button").to_string()).clicked() {
-                                            to_pop_out = Some(key);
-                                        }
-                                    });
-                                }
-                                if popped_out {
-                                    ui.colored_label(theme::ACCENT, t!("streams.popped_out").to_string());
-                                } else if room.selected_watch == Some(key) {
-                                    ui.colored_label(theme::SUCCESS, t!("streams.viewing").to_string());
+                            let stop_label = if capture.kind == StreamKind::Audio {
+                                t!("share.stop_audio_button").to_string()
+                            } else {
+                                t!("share.stop_button").to_string()
+                            };
+                            ui.add_enabled_ui(stoppable, |ui| {
+                                if ui.add(theme::danger_button(stop_label)).clicked() {
+                                    to_stop.push(capture_id);
                                 }
                             });
+                            // Sharer-side live encode rate: the encoder
+                            // branch's actual output framerate (see
+                            // `CaptureHandle::encoder_fps`), confirming the
+                            // configured framerate is really being hit rather
+                            // than just selected in the UI. Video shares
+                            // only — audio has no comparable per-frame rate.
+                            if let ShareStatus::Active(ShareHandle::Video(handle)) = &capture.status {
+                                ui.label(egui::RichText::new(t!("share.fps_label", fps = handle.encoder_fps()).to_string()).color(theme::TEXT_DIM));
+                            }
                         });
-                    });
+                        // Sender-side self-preview: a small live view of this
+                        // machine's own captured video, so the person sharing
+                        // can confirm what viewers actually see. Video shares
+                        // only, and only once actually `Active` (a
+                        // `CaptureHandle` — and therefore a self-preview frame
+                        // source — only exists at that point). See
+                        // `superdoc/features/self-preview.md`.
+                        if capture.kind == StreamKind::Video && matches!(capture.status, ShareStatus::Active(_)) {
+                            const SELF_PREVIEW_WIDTH: f32 = 160.0;
+                            const SELF_PREVIEW_HEIGHT: f32 = SELF_PREVIEW_WIDTH * 9.0 / 16.0;
+                            theme::section_label(ui, t!("share.self_preview_label").as_ref());
+                            match &capture.self_preview_texture {
+                                Some(tex) => {
+                                    let tex_size = tex.size_vec2();
+                                    let scale = if tex_size.x > 0.0 { SELF_PREVIEW_WIDTH / tex_size.x } else { 1.0 };
+                                    ui.image((tex.id(), tex_size * scale));
+                                }
+                                None => {
+                                    let (rect, _) = ui
+                                        .allocate_exact_size(egui::vec2(SELF_PREVIEW_WIDTH, SELF_PREVIEW_HEIGHT), egui::Sense::hover());
+                                    ui.painter().rect_filled(rect, theme::ROUNDING_SM, theme::FIELD);
+                                }
+                            }
+                        }
+                    }
                 }
-                if let Some((owner, stream_id)) = to_toggle {
-                    room.toggle_watch(owner, stream_id);
+                if let Some(err) = share_error.as_ref() {
+                    ui.colored_label(theme::DANGER, t!("share.error", error = err).to_string());
                 }
-                if let Some((owner, stream_id)) = to_pop_out {
-                    room.pop_out(owner, stream_id);
-                }
-                if let Some((owner, stream_id)) = to_toggle_listen {
-                    room.toggle_listen(owner, stream_id);
-                }
-            }
-        });
-
-        theme::card(ui, t!("video.header").as_ref(), |ui| {
-            // Viewer-side live FPS: how often the currently displayed
-            // watch's decoder actually yields a *new* frame (see
-            // `StreamDecoder::current_fps`), not just the UI's own repaint
-            // rate — the most directly useful FPS readout, since it tells
-            // you whether playback of what's on screen right now is
-            // actually smooth. Reads through the same
-            // `Arc<Mutex<StreamDecoder>>` `update_watch_textures`/the
-            // popout closure poll `latest_frame()` through, so this
-            // reflects real decode activity regardless of whether the
-            // stream is currently shown inline or popped out into its own
-            // window.
-            if let Some(key) = room.selected_watch {
-                let watches = room.watches.lock().unwrap();
-                if let Some(entry) = watches.get(&key) {
-                    let fps = entry.decoder.lock().unwrap().current_fps();
-                    ui.label(egui::RichText::new(t!("video.fps_label", fps = format!("{fps:.1}")).to_string()).color(theme::TEXT_DIM));
-                }
-            }
-
-            // If the currently displayed video watch also auto-subscribed
-            // the same sender's audio (see `RoomSession::toggle_watch`), show
-            // its volume slider here, right above the video panel —
-            // "somewhere sensible in the watched-stream UI", per this
-            // task's brief.
-            let linked_audio_key: Option<(ConnId, StreamId)> = room.selected_watch.and_then(|key| {
-                let audio_stream_id = room.watches.lock().unwrap().get(&key)?.audio_stream_id?;
-                Some((key.0, audio_stream_id))
             });
-            if let Some(audio_key) = linked_audio_key {
-                let mut audio_watches = room.audio_watches.lock().unwrap();
-                if let Some(audio_watch) = audio_watches.get_mut(&audio_key)
-                    && theme::slider_row(ui, t!("audio.volume_label").as_ref(), &mut audio_watch.volume_percent, 0..=200, 1.0, "%")
-                {
-                    audio_watch.decoder.set_volume(audio_watch.volume_percent as f64 / 100.0);
-                }
-            }
-
-            let watches = room.watches.lock().unwrap();
-            match room.selected_watch.and_then(|key| watches.get(&key)) {
-                Some(entry) if entry.popout.is_some() => {
-                    ui.label(egui::RichText::new(t!("video.popped_out_note").to_string()).color(theme::TEXT_DIM));
-                }
-                Some(entry) => match &entry.texture {
-                    Some(tex) => {
-                        let available = ui.available_size();
-                        let tex_size = tex.size_vec2();
-                        let scale = if tex_size.x > 0.0 && tex_size.y > 0.0 {
-                            (available.x / tex_size.x).min(available.y.max(60.0) / tex_size.y).min(1.0)
-                        } else {
-                            1.0
-                        };
-                        let display_size = tex_size * scale.max(0.01);
-                        ui.image((tex.id(), display_size));
-                    }
-                    None => {
-                        ui.label(egui::RichText::new(t!("video.waiting_frame").to_string()).color(theme::TEXT_DIM));
-                    }
-                },
-                None => {
-                    ui.label(egui::RichText::new(t!("video.not_watching").to_string()).color(theme::TEXT_FAINT));
-                }
-            }
         });
 
-        // Capture-side actions, applied now that the room borrow is gone.
+        // Deferred actions, applied now that the field borrows are gone.
+        if let Some((join_string, new_name)) = rename {
+            self.rename_saved_room(&join_string, new_name);
+            if let Some(room) = self.rooms.get_mut(&room_handle) {
+                room.saved = true;
+            }
+        }
         if refresh_audio {
             self.refresh_audio_sources();
         }
@@ -2225,10 +2849,274 @@ impl App {
             self.stop_share(capture_id);
         }
     }
+
+    /// Rename the `RoomStore` entry for `join_string` to `new_name`.
+    ///
+    /// `Why` remove-then-upsert rather than a plain `upsert`: `RoomStore` is
+    /// keyed by *name*, so upserting under a new name would leave the old
+    /// entry behind and the sidebar would show the same room twice — once
+    /// connected, once as a stale saved row.
+    fn rename_saved_room(&mut self, join_string: &str, new_name: String) {
+        if let Some(old) = self.room_store.name_for(join_string).map(str::to_string)
+            && old != new_name
+        {
+            self.room_store.remove(&old);
+        }
+        self.room_store.upsert(new_name, join_string.to_string());
+        if let Err(e) = self.room_store.save() {
+            self.room_store_error = Some(e.to_string());
+        }
+    }
+
+    /// View: the watched-stream pane for `active_room`.
+    ///
+    /// **Deliberately minimal at this stage.** This tab is the mount point for
+    /// the one global auto-tiled grid across every room, the capture-restart
+    /// placeholder tiers, per-tile hover overlays and live audio-toggle
+    /// affordances — none of which are built here. What it holds today is the
+    /// existing single-selected-watch display, relocated and restyled onto
+    /// `theme::media_frame` (chrome-free, per the plan: a video surface must
+    /// never read as a settings card), plus the same stream picker the old
+    /// connected screen's Streams card was, moved to the bottom of this tab
+    /// where the previews it renders are actually useful.
+    ///
+    /// Pop-out is unchanged: it still marks the entry and lets
+    /// `RoomSession::show_popouts` give it a real OS viewport. Only the
+    /// *button* moved.
+    fn ui_view_tab(&mut self, ui: &mut egui::Ui) {
+        let Some(room_handle) = self.active_room else {
+            Self::ui_empty_state(ui, t!("view.empty").as_ref());
+            return;
+        };
+        let Some(room) = self.rooms.get_mut(&room_handle) else { return };
+
+        let mut to_toggle: Option<(ConnId, StreamId)> = None;
+        let mut to_pop_out: Option<(ConnId, StreamId)> = None;
+        let mut to_toggle_listen: Option<(ConnId, StreamId)> = None;
+
+        // The stream picker, pinned below the video. Rendered first so it
+        // reserves its height before the media surface claims "the rest".
+        egui::TopBottomPanel::bottom("view_stream_picker")
+            .frame(egui::Frame::NONE)
+            .show_separator_line(false)
+            .max_height(160.0)
+            .show_inside(ui, |ui| {
+                theme::section_label(ui, t!("streams.header").as_ref());
+                if let Some(err) = &room.watch_error {
+                    ui.colored_label(theme::DANGER, t!("streams.watch_error", error = err).to_string());
+                }
+                let me = room.client.conn_id();
+                let visible: Vec<&StreamInfo> = room
+                    .streams
+                    .iter()
+                    .filter(|s| s.owner != me)
+                    .filter(|s| !(s.kind == StreamKind::Audio && room.owner_has_video(s.owner)))
+                    .collect();
+                if visible.is_empty() {
+                    ui.label(egui::RichText::new(t!("streams.none_active").to_string()).color(theme::TEXT_FAINT));
+                    return;
+                }
+                let unknown_owner = t!("streams.unknown_owner").to_string();
+                egui::ScrollArea::horizontal().id_salt("view_picker_scroll").show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        for info in visible {
+                            let key = (info.owner, info.stream_id);
+                            let owner_name = room
+                                .members
+                                .iter()
+                                .find(|m| m.conn_id == info.owner)
+                                .map(|m| m.display_name.as_str())
+                                .unwrap_or(unknown_owner.as_str());
+                            ui.vertical(|ui| {
+                                const THUMB_WIDTH: f32 = 120.0;
+                                const THUMB_HEIGHT: f32 = THUMB_WIDTH * 9.0 / 16.0;
+                                match room.preview_textures.get(&key) {
+                                    Some(tex) => {
+                                        let tex_size = tex.size_vec2();
+                                        let scale = if tex_size.x > 0.0 { THUMB_WIDTH / tex_size.x } else { 1.0 };
+                                        ui.image((tex.id(), tex_size * scale));
+                                    }
+                                    None => {
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(THUMB_WIDTH, THUMB_HEIGHT),
+                                            egui::Sense::hover(),
+                                        );
+                                        ui.painter().rect_filled(rect, theme::ROUNDING_SM, theme::PANEL_SUNKEN);
+                                    }
+                                }
+                                ui.add(
+                                    egui::Label::new(egui::RichText::new(owner_name).small().color(theme::TEXT))
+                                        .truncate(),
+                                );
+                                if info.kind == StreamKind::Audio {
+                                    let listening = room.audio_watches.lock().unwrap().contains_key(&key);
+                                    let label = if listening {
+                                        t!("streams.stop_listening_button")
+                                    } else {
+                                        t!("streams.listen_button")
+                                    };
+                                    if ui.add(theme::secondary_button(label.to_string())).clicked() {
+                                        to_toggle_listen = Some(key);
+                                    }
+                                    return;
+                                }
+                                let watching = room.watches.lock().unwrap().contains_key(&key);
+                                let popped_out =
+                                    room.watches.lock().unwrap().get(&key).is_some_and(|e| e.popout.is_some());
+                                ui.horizontal(|ui| {
+                                    let label = if watching {
+                                        t!("streams.stop_watching_button")
+                                    } else {
+                                        t!("streams.watch_button")
+                                    };
+                                    if ui.add(theme::secondary_button(label.to_string())).clicked() {
+                                        to_toggle = Some(key);
+                                    }
+                                    if watching {
+                                        ui.add_enabled_ui(!popped_out, |ui| {
+                                            if ui.add(theme::secondary_button(t!("streams.pop_out_button").to_string())).clicked() {
+                                                to_pop_out = Some(key);
+                                            }
+                                        });
+                                    }
+                                });
+                                if popped_out {
+                                    ui.colored_label(theme::ACCENT, t!("streams.popped_out").to_string());
+                                }
+                            });
+                        }
+                    });
+                });
+            });
+
+        egui::CentralPanel::default().frame(egui::Frame::NONE).show_inside(ui, |ui| {
+            // Which watch the pane shows. `selected_watch` is set by watching
+            // something; the chips let you get back to an earlier one without
+            // stopping and restarting it. Not the tiled grid — that's a later
+            // stage; this is just a selector over the same single surface.
+            let keys: Vec<(ConnId, StreamId)> = room.watches.lock().unwrap().keys().copied().collect();
+            if keys.len() > 1 {
+                ui.horizontal_wrapped(|ui| {
+                    for key in &keys {
+                        let owner_name = room
+                            .members
+                            .iter()
+                            .find(|m| m.conn_id == key.0)
+                            .map(|m| m.display_name.clone())
+                            .unwrap_or_else(|| t!("streams.unknown_owner").to_string());
+                        if ui.selectable_label(room.selected_watch == Some(*key), owner_name).clicked() {
+                            room.selected_watch = Some(*key);
+                        }
+                    }
+                });
+            }
+
+            ui.horizontal(|ui| {
+                // Viewer-side live FPS: how often the currently displayed
+                // watch's decoder actually yields a *new* frame (see
+                // `StreamDecoder::current_fps`), not just the UI's own repaint
+                // rate — the most directly useful FPS readout, since it tells
+                // you whether playback of what's on screen right now is
+                // actually smooth. Reads through the same
+                // `Arc<Mutex<StreamDecoder>>` `update_watch_textures`/the
+                // popout closure poll `latest_frame()` through, so this
+                // reflects real decode activity regardless of whether the
+                // stream is currently shown inline or popped out.
+                if let Some(key) = room.selected_watch {
+                    let watches = room.watches.lock().unwrap();
+                    if let Some(entry) = watches.get(&key) {
+                        let fps = entry.decoder.lock().unwrap().current_fps();
+                        ui.label(
+                            egui::RichText::new(t!("video.fps_label", fps = format!("{fps:.1}")).to_string())
+                                .small()
+                                .color(theme::TEXT_DIM),
+                        );
+                    }
+                }
+            });
+
+            // If the currently displayed video watch also auto-subscribed the
+            // same sender's audio (see `RoomSession::toggle_watch`), show its
+            // volume slider right above the video surface.
+            let linked_audio_key: Option<(ConnId, StreamId)> = room.selected_watch.and_then(|key| {
+                let audio_stream_id = room.watches.lock().unwrap().get(&key)?.audio_stream_id?;
+                Some((key.0, audio_stream_id))
+            });
+            let standalone_audio_keys: Vec<(ConnId, StreamId)> = room
+                .audio_watches
+                .lock()
+                .unwrap()
+                .keys()
+                .copied()
+                .filter(|k| Some(*k) != linked_audio_key)
+                .collect();
+            for audio_key in linked_audio_key.into_iter().chain(standalone_audio_keys) {
+                let mut audio_watches = room.audio_watches.lock().unwrap();
+                if let Some(audio_watch) = audio_watches.get_mut(&audio_key)
+                    && theme::slider_row(ui, t!("audio.volume_label").as_ref(), &mut audio_watch.volume_percent, 0..=200, 1.0, "%")
+                {
+                    audio_watch.decoder.set_volume(audio_watch.volume_percent as f64 / 100.0);
+                }
+            }
+
+            // Chrome-free media surface: no card border, no title, letterboxed
+            // against `PANEL_SUNKEN`. See `theme::media_frame`.
+            theme::media_frame(ui, |ui| {
+                let available = ui.available_size();
+                ui.allocate_ui_with_layout(
+                    available,
+                    egui::Layout::centered_and_justified(egui::Direction::TopDown),
+                    |ui| {
+                        let watches = room.watches.lock().unwrap();
+                        match room.selected_watch.and_then(|key| watches.get(&key)) {
+                            Some(entry) if entry.popout.is_some() => {
+                                ui.label(egui::RichText::new(t!("video.popped_out_note").to_string()).color(theme::TEXT_DIM));
+                            }
+                            Some(entry) => match &entry.texture {
+                                Some(tex) => {
+                                    let tex_size = tex.size_vec2();
+                                    let scale = if tex_size.x > 0.0 && tex_size.y > 0.0 {
+                                        (available.x / tex_size.x).min(available.y / tex_size.y)
+                                    } else {
+                                        1.0
+                                    };
+                                    let display_size = tex_size * scale.max(0.01);
+                                    ui.add(
+                                        egui::Image::new((tex.id(), display_size))
+                                            .corner_radius(theme::ROUNDING),
+                                    );
+                                }
+                                None => {
+                                    ui.label(egui::RichText::new(t!("video.waiting_frame").to_string()).color(theme::TEXT_DIM));
+                                }
+                            },
+                            None => {
+                                ui.label(egui::RichText::new(t!("view.empty").to_string()).color(theme::TEXT_FAINT));
+                            }
+                        }
+                    },
+                );
+            });
+        });
+
+        if let Some((owner, stream_id)) = to_toggle {
+            room.toggle_watch(owner, stream_id);
+        }
+        if let Some((owner, stream_id)) = to_pop_out {
+            room.pop_out(owner, stream_id);
+        }
+        if let Some((owner, stream_id)) = to_toggle_listen {
+            room.toggle_listen(owner, stream_id);
+        }
+    }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.theme_installed {
+            theme::install(ctx);
+            self.theme_installed = true;
+        }
         self.poll_connect_result();
         self.drain_events(ctx);
         self.poll_capture_states();
@@ -2275,13 +3163,28 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if self.active_room.is_some() {
-                self.ui_connected_screen(ui);
-            } else {
-                self.ui_join_screen(ui);
-            }
-        });
+        // The always-on shell. Both panels render on every frame regardless of
+        // what's joined or watched — there is no join-gate mode any more.
+        egui::SidePanel::left("sidebar")
+            .resizable(false)
+            .exact_width(SIDEBAR_WIDTH)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::PANEL_SUNKEN)
+                    .inner_margin(theme::SPACING),
+            )
+            .show(ctx, |ui| self.ui_sidebar(ui));
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::PANEL_BASE)
+                    .inner_margin(theme::SPACING),
+            )
+            .show(ctx, |ui| self.ui_content(ui));
+
+        // Drawn last so it floats above both panels.
+        self.ui_leave_confirm(ctx);
 
         // Keep polling the connect future / event channel even though egui
         // has no input to react to yet. Falls back to a much coarser
@@ -2440,6 +3343,71 @@ mod session_model_tests {
         assert!(find_destination(&captures, DestinationId(999)).is_none());
     }
 
+    /// The zero-room first-launch default. Pinned because it's a real
+    /// product decision (see `NavTab::default`'s `Why`), not an arbitrary
+    /// first-variant fallthrough.
+    #[test]
+    fn first_launch_opens_on_stream_control() {
+        assert_eq!(NavTab::default(), NavTab::StreamControl);
+    }
+
+    /// A room row must never render the join string itself — it carries the
+    /// room *key*, and a sidebar is exactly the kind of thing that ends up in
+    /// a screenshot or a screen share.
+    #[test]
+    fn room_label_falls_back_to_an_id_prefix_and_never_leaks_the_key() {
+        let room_id = "00112233445566778899aabbccddeeff";
+        // A real, parseable 32-byte base64url key — `room_label` falls back to
+        // a bare placeholder for a join string that doesn't parse, which would
+        // pass the "no key in the label" assertion for the wrong reason.
+        let key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8";
+        let join_string = format!("relay.example:4433|{room_id}|{key}");
+
+        let store = RoomStore::default();
+        let label = room_label(&store, &join_string);
+        assert!(label.contains("00112233"), "expected the room-id prefix in {label:?}");
+        assert!(!label.contains(key), "the room key must never reach a rendered label");
+        assert!(!label.contains("relay.example"), "the label is an identifier, not a connection string");
+
+        // A saved room wins over the fallback.
+        let mut store = RoomStore::default();
+        store.upsert("movie night".to_string(), join_string.clone());
+        assert_eq!(room_label(&store, &join_string), "movie night");
+    }
+
+    /// Remote streams have no announced framerate (`StreamInfo` carries none),
+    /// so the sidebar renders the placeholder rather than inventing a number —
+    /// and degrades to a bare placeholder when even the size is unknown,
+    /// instead of printing `0x0`.
+    #[test]
+    fn remote_stream_geometry_renders_an_em_dash_for_the_missing_framerate() {
+        let info = StreamInfo {
+            owner: 1,
+            stream_id: 0,
+            kind: StreamKind::Video,
+            label: "Screen".to_string(),
+            width: 1920,
+            height: 1080,
+        };
+        assert_eq!(remote_stream_geometry(&info), "1920x1080@\u{2014}");
+        assert_eq!(remote_stream_geometry(&StreamInfo { width: 0, height: 0, ..info }), "\u{2014}");
+    }
+
+    /// Our *own* destinations do know their real geometry — but only once the
+    /// capture handle has landed and its runtime is attached, because the
+    /// requested params are `0` ("whatever the source is") until then.
+    #[test]
+    fn destination_geometry_prefers_the_live_runtime_over_the_requested_params() {
+        let mut dest = destination(RoomHandle(0), 0);
+        assert_eq!(destination_geometry(&dest), "\u{2014}", "no runtime yet, and 0x0 was requested");
+
+        dest.runtime = Some(capture::destination::DestinationRuntime::shared(
+            std::time::Instant::now(),
+            capture::destination::VideoParams { width: 2560, height: 1440, framerate: 60, ..dest.params },
+        ));
+        assert_eq!(destination_geometry(&dest), "2560x1440@60");
+    }
+
     #[tokio::test]
     async fn session_ids_are_monotonic_and_allocated_from_separate_spaces() {
         // `App::default()` binds a real UDP socket for the shared endpoint,
@@ -2547,7 +3515,7 @@ mod tests {
         // the sharer's stream the same way `toggle_watch` does — this is the
         // real code under test, not a re-implementation of it.
         let mut app = App { framerate: TEST_FPS, ..App::default() };
-        let room_handle = app.insert_room(client_b, snapshot_b, events_b);
+        let room_handle = app.insert_room(client_b, snapshot_b, events_b, join_string.clone());
         app.active_room = Some(room_handle);
         let decoder = StreamDecoder::new(TEST_STREAM_ID).expect("failed to build StreamDecoder");
         app.rooms[&room_handle].watches.lock().unwrap().insert(
@@ -2583,6 +3551,17 @@ mod tests {
         while Instant::now() < deadline {
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
                 app.drain_events(ctx);
+                // Also the regression test for the app shell's hard rule that
+                // **the nav is a pure view-switcher**: flip to a different tab
+                // on every single pass, so for most of this run the View tab
+                // (the only one that renders this watch) is *not* the selected
+                // one. If switching tabs stopped, unsubscribed, or dropped a
+                // watch, the fps assertion below would collapse to ~0.
+                app.nav_tab = match app.nav_tab {
+                    NavTab::StreamControl => NavTab::View,
+                    NavTab::View => NavTab::Settings,
+                    NavTab::Settings => NavTab::StreamControl,
+                };
                 let Some(room) = app.rooms.get_mut(&room_handle) else { return };
                 let has_inline_watch = room.update_watch_textures(ctx);
                 if has_inline_watch {
@@ -2628,7 +3607,14 @@ mod tests {
         assert!(
             observed_fps > 40.0,
             "decoder-observed fps ({observed_fps:.1}) did not clear the old ~30fps idle cap — \
-             the repaint-cadence fix does not appear to be keeping pace with the real decode rate"
+             either the repaint-cadence fix is not keeping pace with the real decode rate, or \
+             switching nav tabs (which this loop does every pass) is interfering with an active watch"
+        );
+        // The watch survived hundreds of tab switches, still subscribed and
+        // still decoding — the nav really is a pure view-switcher.
+        assert!(
+            app.rooms[&room_handle].watches.lock().unwrap().contains_key(&(owner, TEST_STREAM_ID)),
+            "the watch was torn down at some point during nav-tab switching"
         );
     }
 
@@ -2713,7 +3699,7 @@ mod tests {
         // `RoomSession`) means this test exercises the real wiring, not a
         // re-implementation of it.
         let mut app = App { framerate: TEST_FPS, ..App::default() };
-        let room_handle = app.insert_room(client_b, snapshot_b, events_b);
+        let room_handle = app.insert_room(client_b, snapshot_b, events_b, join_string.clone());
         app.active_room = Some(room_handle);
         let decoder = StreamDecoder::new(TEST_STREAM_ID).expect("failed to build StreamDecoder");
         app.rooms[&room_handle].watches.lock().unwrap().insert(
