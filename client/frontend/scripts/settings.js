@@ -1,49 +1,52 @@
 // settings.js — Settings tab content: language toggle + presentation-mode
 // dropdown. Per APP-SHELL.md, this tab needed the least new work — it's the
-// pre-existing settings content, relocated onto the new `.card` primitive;
-// no settings added, removed, or redesigned.
+// pre-existing settings content, relocated onto the new `.card` primitive.
 //
-// Mock-data-first, same `if (window.__TAURI__) {...} else {...}` pattern as
-// the other two tabs' scripts: a real `invoke(...)` stub (not implemented —
-// a later worker fills it in) on one branch, a local-state mutation on the
-// other, so this renders and is interactive in a plain browser.
+// Mock/real fallback pattern (see `superdoc/ui/FRONTEND-SHELL.md`): a real
+// `invoke(...)` call on one branch, a local-state mutation on the other.
+// Mock data field names/values mirror `dto::SettingsDto` — snake_case
+// `presentation_mode`, and its real enum keys (`auto_vsync`/`immediate`/
+// `mailbox`, from `dto::presentation_mode_key`) rather than this file's
+// earlier guess (`vsync`/`reactive`/`continuous`, which don't exist on the
+// backend).
 
 (function () {
   "use strict";
 
   const { el, card, pillSwitch } = window.Components;
 
-  const MOCK_SETTINGS = { language: "en", presentationMode: "vsync" };
+  const MOCK_SETTINGS = { language: "en", presentation_mode: "auto_vsync" };
 
   const PRESENTATION_MODES = [
-    { value: "vsync", label: "Vsync (default)" },
-    { value: "reactive", label: "Reactive" },
-    { value: "continuous", label: "Continuous" },
+    { value: "auto_vsync", label: "Auto Vsync (default)" },
+    { value: "immediate", label: "Immediate" },
+    { value: "mailbox", label: "Mailbox" },
   ];
 
   let state = Object.assign({}, MOCK_SETTINGS);
 
   async function fetchSettings() {
     if (window.__TAURI__) {
-      return await window.__TAURI__.core.invoke("get_settings"); // TODO: not implemented yet — backend worker's scope.
+      const settings = await window.__TAURI__.core.invoke("get_settings");
+      return { language: settings.language, presentation_mode: settings.presentation_mode };
     }
     return Object.assign({}, MOCK_SETTINGS);
   }
 
-  async function setLanguage(lang) {
+  async function setLanguage(language) {
     if (window.__TAURI__) {
-      await window.__TAURI__.core.invoke("set_language", { lang }); // TODO: not implemented yet.
+      await window.__TAURI__.core.invoke("set_language", { language });
     } else {
-      state.language = lang;
+      state.language = language;
     }
     render();
   }
 
   async function setPresentationMode(mode) {
     if (window.__TAURI__) {
-      await window.__TAURI__.core.invoke("set_presentation_mode", { mode }); // TODO: not implemented yet.
+      await window.__TAURI__.core.invoke("set_presentation_mode", { mode });
     } else {
-      state.presentationMode = mode;
+      state.presentation_mode = mode;
     }
     render();
   }
@@ -70,7 +73,7 @@
     presentationRow.appendChild(el("span", { className: "settings-row-label", text: "Presentation mode" }));
     const select = el("select", { className: "settings-select" });
     PRESENTATION_MODES.forEach((m) => select.appendChild(el("option", { text: m.label, attrs: { value: m.value } })));
-    select.value = state.presentationMode;
+    select.value = state.presentation_mode;
     select.addEventListener("change", () => setPresentationMode(select.value));
     presentationRow.appendChild(select);
 

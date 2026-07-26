@@ -1,74 +1,80 @@
 // shell.js — app shell behavior: nav tab switching, ROOMS/STREAMS rendering,
 // room-row expand/collapse, "+ Add Room" inline card, leave-confirm modal.
 //
-// Scope note: this is the FRONTEND SHELL only (see
-// superdoc/ui/APP-SHELL.md, stage 1). Stream Control / View / Settings tab
-// *content* is other workers' scope — the panels below are placeholders
-// that just prove nav-switching works. Nothing here calls a real Tauri
-// command yet; every backend touchpoint is mocked with an in-memory array
-// and flagged with a `// TODO: replace with invoke(...)` comment so it's
-// obvious what the next integration pass needs to wire up.
+// Scope note: this is the FRONTEND SHELL (see superdoc/ui/APP-SHELL.md, stage
+// 1) plus its Tauri wiring. Every backend touchpoint below is a small
+// `async function` that checks `window.__TAURI__` and calls the real
+// `#[tauri::command]` on one branch, falling back to mutating an in-memory
+// mock array on the other — see `superdoc/ui/FRONTEND-SHELL.md`'s "mock/real
+// fallback pattern". The mock branch's data shapes deliberately mirror the
+// real DTOs field-for-field (snake_case `join_string`/`room_handle`/
+// `active_stream_count`/…, matching `dto::SavedRoomRow`) so `renderRoomRow`/
+// `renderStreamRow` work identically fed either source.
 //
 // Per APP-SHELL.md's hard rule ("the nav is a pure view-switcher"): this
 // script only ever toggles which tab panel is visible. It never starts or
-// stops a share/watch/subscription as a side effect of switching tabs —
-// there is no real backend state here yet to accidentally touch, but the
-// structure (a single `setActiveTab` that only flips `hidden`/classes) is
-// deliberately shaped so a later worker wiring real data can't easily
-// violate that rule by accident.
+// stops a share/watch/subscription as a side effect of switching tabs.
+//
+// This module also owns the one place every Tauri event listener is
+// registered (`wireEvents`, called once from `init`) — `room-connected`,
+// `room-connect-failed`, `room-disconnected`, `presence-updated`,
+// `destination-state-changed`, `bandwidth-overshoot` — since the sidebar's
+// ROOMS/STREAMS sections are the shell's own state and the other tabs
+// (`stream-control.js`/`view.js`) expose a small `refresh()` this module
+// calls into rather than duplicating six `listen()` calls per file.
 
 (function () {
   "use strict";
 
   const { renderNavButton, renderRoomRow, renderStreamRow, renderEmptyState, secondaryButton, primaryButton, el } = window.Components;
 
-  // ---------------------------------------------------------------------
-  // Mock data — TODO: replace with invoke('list_saved_rooms') /
-  // invoke('list_active_streams') once the Tauri command surface exists.
-  // Shapes here are the frontend's best guess at the eventual command
-  // response shape; adjust once the real backend worker lands its schema.
-  // ---------------------------------------------------------------------
-
   const NAV_TABS = ["Stream Control", "View", "Settings"];
 
-  // TODO: replace with invoke('list_saved_rooms') — a left join of the
-  // persistent RoomStore with any live RoomSession, per APP-SHELL.md's
-  // "ROOMS section" note.
+  // ---------------------------------------------------------------------
+  // Mock data — shapes match the real DTOs (`dto::SavedRoomRow` /
+  // `dto::DestinationRow`) field-for-field, per FRONTEND-SHELL.md's mock/real
+  // parity rule, plus a frontend-only `members` array on room objects (no
+  // single DTO inlines room + roster + live watch state — that's a client-side
+  // join of `room_detail`'s `members`/`streams`/`watched`, done in
+  // `loadRoomMembers` below for the real branch).
+  // ---------------------------------------------------------------------
+
   let mockRooms = [
     {
-      id: "r1",
+      join_string: "server|11111111|movie-night-key",
       name: "Movie Night",
       state: "joined",
-      activeCount: 1,
-      members: [{ name: "Ana", resolution: "1920x1080", fps: null, watching: false }],
+      room_handle: 1,
+      active_stream_count: 1,
+      members: [{ conn_id: 1, display_name: "Ana", owner: 1, stream_id: 0, resolution: "1920x1080", fps: null, watching: false }],
     },
     {
-      id: "r2",
+      join_string: "server|22222222|gaming-night-key",
       name: "Gaming Night",
       state: "joined",
-      activeCount: 0,
+      room_handle: 2,
+      active_stream_count: 0,
       members: [],
     },
     {
-      id: "r3",
+      join_string: "server|33333333|old-room-key",
       name: "Old Room",
       state: "disconnected",
-      activeCount: 0,
+      room_handle: null,
+      active_stream_count: 0,
       members: [],
     },
     {
-      id: "r4",
+      join_string: "server|44444444|study-group-key",
       name: "Study Group",
       state: "reconnecting",
-      activeCount: 0,
+      room_handle: null,
+      active_stream_count: 0,
       members: [],
     },
   ];
 
-  // TODO: replace with invoke('list_active_streams') — this client's own
-  // outgoing destinations across every room (APP-SHELL.md's "STREAMS"
-  // section: cross-room, not scoped to the active tab/room).
-  let mockStreams = [{ roomLabel: "Movie Night", resolution: "1920x1080", fps: 30, isAudio: false }];
+  let mockStreams = [{ destination_id: 1, capture_id: 1, room_handle: 1, kind: "video", room_label: "Movie Night", width: 1920, height: 1080, framerate: 30 }];
 
   // ---------------------------------------------------------------------
   // UI state (frontend-only; not persisted, matches the "no cross-session
@@ -77,10 +83,58 @@
 
   const state = {
     activeTab: "Stream Control",
-    expandedRoomIds: new Set(["r1"]), // Movie Night starts expanded, matching the reference shot.
+    expandedRoomIds: new Set([mockRooms[0].join_string]), // Movie Night starts expanded, matching the reference shot.
     addRoomOpen: false,
     pendingLeaveRoomId: null,
   };
+
+  // ---------------------------------------------------------------------
+  // Data touchpoints
+  // ---------------------------------------------------------------------
+
+  async function fetchRooms() {
+    if (window.__TAURI__) {
+      return await window.__TAURI__.core.invoke("list_saved_rooms");
+    }
+    return mockRooms;
+  }
+
+  async function fetchStreams() {
+    if (window.__TAURI__) {
+      const rows = await window.__TAURI__.core.invoke("list_active_streams");
+      rows.forEach((row) => (row.room_label = roomLabelFor(row.room_handle)));
+      return rows;
+    }
+    return mockStreams;
+  }
+
+  function roomLabelFor(roomHandle) {
+    const room = mockRooms.find((r) => r.room_handle === roomHandle);
+    return room ? room.name : String(roomHandle);
+  }
+
+  /** Populates one room's `members` from `room_detail` — the real DTO
+   * doesn't inline a roster onto `list_saved_rooms`, so this is a lazy,
+   * per-room fetch on expand (mirrors `stream-control.js`'s room-scoped
+   * members card, which does the same join). */
+  async function loadRoomMembers(room) {
+    if (!window.__TAURI__ || room.state !== "joined" || room.room_handle == null) return;
+    const detail = await window.__TAURI__.core.invoke("room_detail", { roomHandle: room.room_handle });
+    if (!detail) return;
+    const watchedOwners = new Set(detail.watched.map((k) => `${k.owner}:${k.stream_id}`));
+    room.members = detail.members.map((m) => {
+      const videoStream = detail.streams.find((s) => s.owner === m.conn_id && s.kind === "Video");
+      return {
+        conn_id: m.conn_id,
+        display_name: m.display_name,
+        owner: m.conn_id,
+        stream_id: videoStream ? videoStream.stream_id : 0,
+        resolution: videoStream ? `${videoStream.width}x${videoStream.height}` : null,
+        fps: null,
+        watching: videoStream ? watchedOwners.has(`${videoStream.owner}:${videoStream.stream_id}`) : false,
+      };
+    });
+  }
 
   // ---------------------------------------------------------------------
   // Nav
@@ -118,24 +172,39 @@
     mockRooms.forEach((room) => {
       list.appendChild(
         renderRoomRow(room, {
-          expanded: state.expandedRoomIds.has(room.id),
-          onToggleExpand: (id) => {
-            if (state.expandedRoomIds.has(id)) state.expandedRoomIds.delete(id);
-            else state.expandedRoomIds.add(id);
+          expanded: state.expandedRoomIds.has(room.join_string),
+          onToggleExpand: async (joinString) => {
+            if (state.expandedRoomIds.has(joinString)) {
+              state.expandedRoomIds.delete(joinString);
+            } else {
+              state.expandedRoomIds.add(joinString);
+              const r = mockRooms.find((x) => x.join_string === joinString);
+              if (r) await loadRoomMembers(r);
+            }
             renderRooms();
           },
-          onReconnect: (id) => {
-            // TODO: replace with invoke('reconnect_room', { id }).
-            const r = mockRooms.find((x) => x.id === id);
+          onReconnect: async (joinString) => {
+            if (window.__TAURI__) {
+              await window.__TAURI__.core.invoke("join_room", { joinString, displayName: "" });
+              await refreshRooms();
+              return;
+            }
+            const r = mockRooms.find((x) => x.join_string === joinString);
             if (r) r.state = "reconnecting";
             renderRooms();
           },
-          onLeave: (id) => openLeaveConfirm(id),
-          onWatch: (roomId, memberName) => {
-            // TODO: replace with invoke('toggle_watch', { roomId, memberName }).
-            const r = mockRooms.find((x) => x.id === roomId);
-            const m = r && r.members.find((mm) => mm.name === memberName);
-            if (m) m.watching = !m.watching;
+          onLeave: (joinString) => openLeaveConfirm(joinString),
+          onWatch: async (joinString, member) => {
+            const room = mockRooms.find((x) => x.join_string === joinString);
+            if (!room) return;
+            if (window.__TAURI__) {
+              await window.__TAURI__.core.invoke("toggle_watch", { roomHandle: room.room_handle, owner: member.owner, streamId: member.stream_id });
+              await loadRoomMembers(room);
+              if (window.ViewTab) window.ViewTab.refresh();
+            } else {
+              const m = room.members.find((mm) => mm.conn_id === member.conn_id);
+              if (m) m.watching = !m.watching;
+            }
             renderRooms();
           },
         })
@@ -143,27 +212,72 @@
     });
   }
 
-  function openLeaveConfirm(roomId) {
-    const room = mockRooms.find((r) => r.id === roomId);
+  function openLeaveConfirm(joinString) {
+    const room = mockRooms.find((r) => r.join_string === joinString);
     if (!room) return;
 
     // Per APP-SHELL.md: leaving raises a confirm dialog iff the room has an
     // outgoing destination or a live watch; a leave with neither is
-    // immediate. Mock approximation: joined rooms with activeCount > 0, or
-    // any watched member, require confirmation.
-    const hasStake = room.activeCount > 0 || (room.members || []).some((m) => m.watching);
+    // immediate. Mock approximation for the no-Tauri path: joined rooms with
+    // active_stream_count > 0, or any watched member, require confirmation.
+    // The real path asks the backend directly via `leave_needs_confirm`,
+    // which is the source of truth (see `commands.rs`'s doc comment on that
+    // command: exposed as its own query precisely so the frontend can decide
+    // whether to show a dialog *before* calling `leave_room`).
+    if (window.__TAURI__) {
+      if (room.state !== "joined" || room.room_handle == null) {
+        leaveRoom(joinString);
+        return;
+      }
+      window.__TAURI__.core.invoke("leave_needs_confirm", { roomHandle: room.room_handle }).then((needsConfirm) => {
+        if (needsConfirm) {
+          state.pendingLeaveRoomId = joinString;
+          renderLeaveModal();
+        } else {
+          leaveRoom(joinString);
+        }
+      });
+      return;
+    }
+
+    const hasStake = room.active_stream_count > 0 || (room.members || []).some((m) => m.watching);
     if (room.state === "joined" && hasStake) {
-      state.pendingLeaveRoomId = roomId;
+      state.pendingLeaveRoomId = joinString;
       renderLeaveModal();
     } else {
-      leaveRoom(roomId);
+      leaveRoom(joinString);
     }
   }
 
-  function leaveRoom(roomId) {
-    // TODO: replace with invoke('leave_room', { roomId }) /
-    // invoke('forget_room', { roomId }) depending on room.state.
-    mockRooms = mockRooms.filter((r) => r.id !== roomId);
+  /** Leave with no confirm needed (`leave_needs_confirm` already said `false`,
+   * or there's no Tauri backend at all). */
+  async function leaveRoom(joinString) {
+    const room = mockRooms.find((r) => r.join_string === joinString);
+    if (window.__TAURI__ && room && room.room_handle != null) {
+      // `leave_room` returns `false` if a confirm was actually needed and it
+      // did *not* tear the room down. Every call site here only reaches
+      // `leaveRoom` after `leave_needs_confirm` already said `false` (or for
+      // a not-yet-joined row, where there's nothing to lose), so that return
+      // value is not acted on — the modal's own "Leave" button calls
+      // `forceLeaveRoom` (`force_leave_room`) instead, unconditionally.
+      await window.__TAURI__.core.invoke("leave_room", { roomHandle: room.room_handle });
+      await refreshRooms();
+      return;
+    }
+    mockRooms = mockRooms.filter((r) => r.join_string !== joinString);
+    renderRooms();
+  }
+
+  /** Leave after the confirm modal was shown and the user confirmed —
+   * unconditional teardown via `force_leave_room`. */
+  async function forceLeaveRoom(joinString) {
+    const room = mockRooms.find((r) => r.join_string === joinString);
+    if (window.__TAURI__ && room && room.room_handle != null) {
+      await window.__TAURI__.core.invoke("force_leave_room", { roomHandle: room.room_handle });
+      await refreshRooms();
+      return;
+    }
+    mockRooms = mockRooms.filter((r) => r.join_string !== joinString);
     renderRooms();
   }
 
@@ -174,7 +288,7 @@
       overlay.hidden = true;
       return;
     }
-    const room = mockRooms.find((r) => r.id === state.pendingLeaveRoomId);
+    const room = mockRooms.find((r) => r.join_string === state.pendingLeaveRoomId);
     if (!room) {
       overlay.hidden = true;
       return;
@@ -198,10 +312,11 @@
       el("button", {
         className: "btn btn-danger",
         text: "Leave",
-        onClick: () => {
-          leaveRoom(state.pendingLeaveRoomId);
+        onClick: async () => {
+          const joinString = state.pendingLeaveRoomId;
           state.pendingLeaveRoomId = null;
           renderLeaveModal();
+          await forceLeaveRoom(joinString);
         },
       })
     );
@@ -238,24 +353,46 @@
     const linkInput = el("input", { className: "field-input", attrs: { type: "text", placeholder: "" } });
     card.appendChild(linkInput);
 
+    const errorText = el("div", { className: "add-room-error", text: "" });
+    errorText.hidden = true;
+    card.appendChild(errorText);
+
     const actions = el("div", { className: "add-room-actions" });
     actions.appendChild(
-      primaryButton("Join", () => {
-        // TODO: replace with invoke('join_room', { displayName, joinLink }).
-        // On success: upsert into RoomStore, appears live in the list (per
-        // APP-SHELL.md — "no staging step, and why success saves").
-        if (linkInput.value.trim()) {
-          mockRooms.push({
-            id: "r" + Date.now(),
-            name: nameInput.value.trim() || "Room " + Math.random().toString(16).slice(2, 6),
-            state: "joined",
-            activeCount: 0,
-            members: [],
-          });
-          state.addRoomOpen = false;
-          renderRooms();
-          renderAddRoomCard();
+      primaryButton("Join", async () => {
+        const joinString = linkInput.value.trim();
+        if (!joinString) return;
+
+        if (window.__TAURI__) {
+          errorText.hidden = true;
+          try {
+            await window.__TAURI__.core.invoke("join_room", { joinString, displayName: nameInput.value.trim() });
+            // On success: `join_room` upserts into RoomStore and the room
+            // appears live via the `room-connected` event (no staging step,
+            // per APP-SHELL.md — "success saves"). `refreshRooms` here is a
+            // belt-and-braces immediate paint in case the event hasn't
+            // landed yet by the time this await resolves.
+            state.addRoomOpen = false;
+            await refreshRooms();
+            renderAddRoomCard();
+          } catch (e) {
+            errorText.textContent = String(e);
+            errorText.hidden = false;
+          }
+          return;
         }
+
+        mockRooms.push({
+          join_string: joinString,
+          name: nameInput.value.trim() || "Room " + Math.random().toString(16).slice(2, 6),
+          state: "joined",
+          room_handle: Math.floor(Math.random() * 100000),
+          active_stream_count: 0,
+          members: [],
+        });
+        state.addRoomOpen = false;
+        renderRooms();
+        renderAddRoomCard();
       })
     );
     actions.appendChild(
@@ -287,12 +424,74 @@
 
   // Dev-only affordance so both the populated and empty STREAMS states are
   // reachable for visual review without editing mock data by hand. Not a
-  // real feature — remove once real invoke() data drives this section.
+  // real feature — only wired in the mock (no-Tauri) path.
   function wireStreamsDemoToggle() {
     const toggle = document.getElementById("streams-demo-toggle");
+    if (window.__TAURI__) {
+      toggle.hidden = true;
+      return;
+    }
     toggle.addEventListener("click", () => {
-      mockStreams = mockStreams.length === 0 ? [{ roomLabel: "Movie Night", resolution: "1920x1080", fps: 30, isAudio: false }] : [];
+      mockStreams = mockStreams.length === 0 ? [{ destination_id: 1, capture_id: 1, room_handle: 1, kind: "video", room_label: "Movie Night", width: 1920, height: 1080, framerate: 30 }] : [];
       renderStreams();
+    });
+  }
+
+  // ---------------------------------------------------------------------
+  // Refresh — re-fetch + re-render ROOMS/STREAMS. Exposed on `window.Shell`
+  // so the event listeners below (and other tabs, e.g. after starting a
+  // share) can trigger a sidebar repaint without duplicating the fetch call.
+  // ---------------------------------------------------------------------
+
+  async function refreshRooms() {
+    mockRooms = await fetchRooms();
+    renderRooms();
+  }
+
+  async function refreshStreams() {
+    mockStreams = await fetchStreams();
+    renderStreams();
+  }
+
+  async function refreshAll() {
+    await refreshRooms();
+    await refreshStreams();
+  }
+
+  // ---------------------------------------------------------------------
+  // Event listeners — set up once, only when a real Tauri backend is
+  // present (see FRONTEND-SHELL.md's mock/real fallback pattern: these
+  // simply don't exist in a plain-browser Playwright run). Every one of
+  // `driver.rs`'s 6 events is handled here; the ones that affect other tabs'
+  // own rendered state are forwarded through the small `window.StreamControl`
+  // surface those scripts expose, rather than this file reaching into their
+  // internals directly.
+  // ---------------------------------------------------------------------
+
+  function wireEvents() {
+    if (!window.__TAURI__) return;
+    const { listen } = window.__TAURI__.event;
+
+    listen("room-connected", () => refreshAll());
+    listen("room-disconnected", () => refreshAll());
+    listen("room-connect-failed", (event) => {
+      console.error("room-connect-failed", event.payload);
+      refreshRooms();
+    });
+    listen("presence-updated", () => {
+      // Payload is a `RoomDetail` for the room whose roster/streams changed —
+      // cheapest correct response is a full ROOMS refetch (picks up the new
+      // `active_stream_count` too) rather than trying to patch just one row.
+      refreshRooms();
+      if (window.StreamControl) window.StreamControl.refresh();
+      if (window.ViewTab) window.ViewTab.refresh();
+    });
+    listen("destination-state-changed", () => {
+      refreshStreams();
+      if (window.StreamControl) window.StreamControl.refresh();
+    });
+    listen("bandwidth-overshoot", (event) => {
+      if (window.StreamControl) window.StreamControl.setOvershoot(event.payload.overshootKbps);
     });
   }
 
@@ -300,12 +499,13 @@
   // Init
   // ---------------------------------------------------------------------
 
-  function init() {
+  async function init() {
     renderNav();
-    renderRooms();
+    await refreshRooms();
     renderAddRoomCard();
-    renderStreams();
+    await refreshStreams();
     wireStreamsDemoToggle();
+    wireEvents();
 
     document.getElementById("add-room-btn").addEventListener("click", () => {
       state.addRoomOpen = true;
@@ -316,6 +516,8 @@
       panel.hidden = panel.dataset.tab !== state.activeTab;
     });
   }
+
+  window.Shell = { refreshRooms, refreshStreams, refreshAll };
 
   document.addEventListener("DOMContentLoaded", init);
 })();
