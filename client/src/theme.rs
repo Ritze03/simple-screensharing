@@ -18,10 +18,37 @@ use egui::{Color32, CornerRadius, RichText, Stroke, Ui, Vec2, Widget};
 /// selection tint, and (deliberately) non-destructive informational
 /// highlights like the "popped out" stream tag: it's the same "this is the
 /// thing to notice" role in every case, just applied to different content.
-pub const ACCENT: Color32 = Color32::from_rgb(0x5B, 0x8B, 0xF0);
-/// Main panel / window background.
-pub const PANEL: Color32 = Color32::from_rgb(0x1E, 0x1F, 0x22);
-/// Hairline borders and dividers.
+///
+/// *Why this value (2026-07-26 redesign pass):* the original `0x5B8BF0` read
+/// as flat and low-saturation for the Discord/Slack-style look this app is
+/// moving toward (see `superdoc/brainstorm/ui-redesign-multiroom-streaming.md`'s
+/// UX/Design-lens critique). `0x4C6EF5` sits in the same saturated
+/// blue-violet neighborhood as reference points like Discord's blurple
+/// without copying that exact brand color — same character, this app's own
+/// hue.
+pub const ACCENT: Color32 = Color32::from_rgb(0x4C, 0x6E, 0xF5);
+/// Base-tier panel / window background — the middle of three elevation
+/// tiers (`PANEL_SUNKEN` < `PANEL_BASE` < `PANEL_RAISED`), used for the
+/// general app/window background level. See "Elevation tiers" below.
+pub const PANEL_BASE: Color32 = Color32::from_rgb(0x1E, 0x1F, 0x22);
+/// Recessed-tier surface — sits visually *below* `PANEL_BASE`: sidebar
+/// recesses, scroll wells, and the letterboxed background behind a
+/// chrome-free video tile (see `media_frame`). See "Elevation tiers" below.
+pub const PANEL_SUNKEN: Color32 = Color32::from_rgb(0x17, 0x18, 0x1B);
+/// Raised-tier surface — sits visually *above* `PANEL_BASE`: cards and
+/// other content that should read as floating above the base background.
+/// `card()` fills with this tier. See "Elevation tiers" below.
+pub const PANEL_RAISED: Color32 = Color32::from_rgb(0x27, 0x28, 0x2D);
+/// Deprecated alias for `PANEL_BASE`, kept only so any external reference
+/// written against the pre-elevation single-tier palette keeps compiling.
+/// Prefer `PANEL_BASE` (or `PANEL_SUNKEN`/`PANEL_RAISED`) in new code — see
+/// "Elevation tiers" below for which tier to reach for.
+#[deprecated(note = "use PANEL_BASE, PANEL_SUNKEN, or PANEL_RAISED instead")]
+pub const PANEL: Color32 = PANEL_BASE;
+/// Hairline borders and dividers. Still useful alongside the elevation
+/// tiers above (e.g. a hairline between two same-tier surfaces), but no
+/// longer the *only* depth cue — most surface-to-surface contrast should
+/// come from picking a different `PANEL_*` tier first.
 pub const BORDER: Color32 = Color32::from_rgb(0x3A, 0x3B, 0x40);
 /// Primary text.
 pub const TEXT: Color32 = Color32::from_rgb(0xE8, 0xE9, 0xEC);
@@ -50,13 +77,35 @@ pub const DANGER: Color32 = Color32::from_rgb(0xE0, 0x5A, 0x5A);
 /// "reference by role" rule intact — see this file's note added to
 /// STYLING-GUIDE.md itself.
 pub const SUCCESS: Color32 = Color32::from_rgb(0x50, 0xC8, 0x78);
+/// Caution/attention amber — distinct from both `DANGER` (red) and
+/// `SUCCESS` (green): overshoot/approaching-a-limit states that are worth
+/// noticing but aren't failures. First consumer: the bandwidth-overshoot
+/// warning banner (`superdoc/brainstorm/ui-redesign-multiroom-streaming.md`),
+/// added here ahead of that banner landing so the token exists when it's
+/// needed. Follows the same "one named `pub const`, reference by role"
+/// pattern `DANGER`/`SUCCESS` already use — no separate derived
+/// background/border constants, since neither of those has any either
+/// (call sites route through `tint()` as needed).
+pub const WARNING: Color32 = Color32::from_rgb(0xE8, 0xA3, 0x3D);
 
 /// Standard gap between stacked cards / side-by-side columns, and each
 /// card's own inner margin — one number, used everywhere, per
 /// STYLING-GUIDE.md's "Consistent spacing".
 pub const SPACING: f32 = 7.0;
-/// Standard corner rounding for cards and buttons.
-pub const ROUNDING: u8 = 8;
+/// Standard corner rounding for cards, buttons, and media tiles — the
+/// larger of two rounding tiers.
+///
+/// *Why 14, not 8:* the original `8` read as too subtle for the
+/// Discord/Slack-style "chunky" feel this app is moving toward (see
+/// `superdoc/brainstorm/ui-redesign-multiroom-streaming.md`'s UX/Design-lens
+/// critique, which called for 12-16px). Landed in the middle of that range.
+pub const ROUNDING: u8 = 14;
+/// Smaller rounding tier for compact, dense elements — sidebar list rows,
+/// pills — where the full `ROUNDING` would look oversized relative to the
+/// element's own height. Matches the previous single-tier `ROUNDING` value,
+/// so anything already tuned against the old `8` (e.g. compact row mockups)
+/// stays visually consistent.
+pub const ROUNDING_SM: u8 = 8;
 /// Fixed width reserved for a control row's trailing value spinner/preview
 /// (see STYLING-GUIDE.md's "Reserved value-width"), sized to the widest
 /// value this app's rows ever show (e.g. `"40000 kbps"`, `"240 fps"`).
@@ -99,9 +148,16 @@ pub fn section_label(ui: &mut Ui, text: &str) {
 /// own trailing gap (`SPACING`), so callers stacking cards should zero the
 /// container's own item spacing rather than also `add_space`-ing between
 /// them (see STYLING-GUIDE.md's "Watch out for doubled gaps").
+///
+/// Fills with `PANEL_RAISED` (not the old flat `PANEL`) so a card reads as
+/// sitting a tier *above* the base app background — see "Elevation tiers"
+/// on the `PANEL_*` tokens above. This is the card/form/settings treatment;
+/// for a video tile or other live-media surface, use `media_frame` instead
+/// — never wrap media in `card()`, the plan explicitly calls for chrome-free
+/// media (no border, no title, edge-to-edge).
 pub fn card(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui)) {
     egui::Frame::new()
-        .fill(PANEL)
+        .fill(PANEL_RAISED)
         .stroke(Stroke::new(1.0, BORDER))
         .corner_radius(CornerRadius::same(ROUNDING))
         .inner_margin(SPACING)
@@ -111,6 +167,37 @@ pub fn card(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui)) {
             add_contents(ui);
         });
     ui.add_space(SPACING);
+}
+
+/// Chrome-free frame for a video tile or other live-media surface: no
+/// border/stroke, no title, no inner margin — media renders edge-to-edge
+/// inside the tile, unlike `card()`'s bordered-panel-with-title treatment.
+///
+/// *Why this exists:* the UI redesign plan
+/// (`superdoc/brainstorm/ui-redesign-multiroom-streaming.md`) calls for
+/// video tiles to "drop card chrome entirely" — a bordered, titled `card()`
+/// wrapper around a video texture would read as a settings widget, not a
+/// piece of media. `media_frame` is the obvious, correct primitive for that
+/// surface so future tiled-viewing-pane code doesn't reach for `card()` by
+/// habit and accidentally chrome-wrap a video tile.
+///
+/// Fills with `PANEL_SUNKEN` as a letterbox/backdrop color, visible behind
+/// the media wherever its aspect ratio doesn't fill the tile (e.g.
+/// pillarboxing a portrait capture), and keeps `ROUNDING` for the tile's
+/// own corner shape — a Discord/Slack-style tiled grid still wants rounded
+/// tile corners, just no border/title framing them. Note: `Frame` does not
+/// itself clip children to the rounded rect, so a caller drawing a texture
+/// that must not show square corners under the rounding should also round
+/// the image draw (e.g. `egui::Image::corner_radius(…)`), not rely on this
+/// frame alone.
+pub fn media_frame(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
+    egui::Frame::new()
+        .fill(PANEL_SUNKEN)
+        .corner_radius(CornerRadius::same(ROUNDING))
+        .inner_margin(0)
+        .show(ui, |ui| {
+            add_contents(ui);
+        });
 }
 
 // ---------------------------------------------------------------------------
