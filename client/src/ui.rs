@@ -184,7 +184,12 @@ const ALLOC_HYSTERESIS_KBPS: u32 = 100;
 fn needs_reapply(current: Option<u32>, target: u32) -> bool {
     let Some(current) = current else { return true };
     let delta = current.abs_diff(target);
-    delta > ALLOC_HYSTERESIS_KBPS || delta * 100 > current * ALLOC_HYSTERESIS_PERCENT
+    // `u64` for the percentage comparison: both sides are bounded by the
+    // 40 Mbit/s ceiling in practice, but `current` comes from a hand-editable
+    // settings file by way of the allocator, and `delta * 100` on a
+    // near-`u32::MAX` value would wrap — turning "this changed enormously"
+    // into "not worth writing".
+    delta > ALLOC_HYSTERESIS_KBPS || delta as u64 * 100 > current as u64 * ALLOC_HYSTERESIS_PERCENT as u64
 }
 
 /// What one [`BandwidthController::tick`] decided.
@@ -1294,11 +1299,35 @@ impl App {
         room.destinations.push(destination_id);
         let client = room.client.clone();
 
-        let Some(capture) = self.captures.get_mut(&capture_id) else { return };
-        let ShareStatus::Active(ShareHandle::Video(handle)) = &capture.status else {
+        // From here on, bail out through `abandon` rather than a bare
+        // `return`: the room already holds a `destinations` back-reference to
+        // an id that would otherwise never get a `Destination` — a dangling
+        // entry that makes the room look like it is streaming something it
+        // isn't (and blocks a silent leave, since `leave_needs_confirm` counts
+        // exactly that list).
+        let abandon = |app: &mut Self, error: Option<String>| {
+            if let Some(room) = app.rooms.get_mut(&room_handle) {
+                room.destinations.retain(|d| *d != destination_id);
+            }
+            app.share_error = error;
+        };
+
+        let running = self
+            .captures
+            .get(&capture_id)
+            .is_some_and(|c| matches!(c.status, ShareStatus::Active(ShareHandle::Video(_))));
+        if !running {
             // Only a running capture has a tee to hang another branch off.
-            self.share_error = Some(t!("stream_control.capture_not_running").to_string());
+            abandon(self, Some(t!("stream_control.capture_not_running").to_string()));
             return;
+        }
+
+        let Some(capture) = self.captures.get_mut(&capture_id) else {
+            abandon(self, Some(t!("stream_control.capture_not_running").to_string()));
+            return;
+        };
+        let ShareStatus::Active(ShareHandle::Video(handle)) = &capture.status else {
+            unreachable!("just checked the capture is an active video capture");
         };
         let rx = handle.spawn_add_destination(&client, stream_id, DestKey(destination_id.0), params);
 
@@ -3708,10 +3737,23 @@ impl App {
             // Transfer and fan-out: both are "this same capture, in another
             // room", so both are a room picker. They differ only in whether
             // the current room is left behind.
+            //
+            // `Why both pickers exclude rooms this capture already feeds:` the
+            // result would be two independent streams of one screen in one
+            // room — which nobody means by either action, and which doubles
+            // that room's incoming bandwidth for a duplicate picture. For
+            // transfer it would additionally be self-defeating (the "old"
+            // destination is in a room the capture would still be feeding).
             let others: Vec<(RoomHandle, String)> = self
                 .rooms
                 .iter()
                 .filter(|(handle, _)| **handle != dest.room)
+                .filter(|(handle, _)| {
+                    !self
+                        .captures
+                        .get(&capture_id)
+                        .is_some_and(|c| c.destinations.values().any(|d| d.room == **handle))
+                })
                 .map(|(handle, room)| (*handle, room_label(&self.room_store, &room.join_string)))
                 .collect();
             let can_move = !others.is_empty() && dest.pending.is_none();
@@ -3734,18 +3776,9 @@ impl App {
                                 .color(theme::TEXT_FAINT),
                         );
                         for (handle, label) in &others {
-                            // Fanning out into a room this capture already
-                            // feeds would be a second stream of the same
-                            // picture in one room — never what anyone means.
-                            let already = self
-                                .captures
-                                .get(&capture_id)
-                                .is_some_and(|c| c.destinations.values().any(|d| d.room == *handle));
-                            ui.add_enabled_ui(!already, |ui| {
-                                if ui.button(label.clone()).clicked() {
-                                    actions.push(StreamAction::FanOut(capture_id, *handle));
-                                }
-                            });
+                            if ui.button(label.clone()).clicked() {
+                                actions.push(StreamAction::FanOut(capture_id, *handle));
+                            }
                         }
                     });
             });

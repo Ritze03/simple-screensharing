@@ -600,12 +600,19 @@ async fn resubscribe_after_pause_resumes_encoder_and_frames_flow() {
     // forever, matching the reported symptom).
     drop(decoder);
 
-    // Simulate a real gap between stopping and re-watching (the reported
-    // bug manifested well after resubscribe, not immediately). Matches the
-    // reported live-test timescale (paused ~35s+) rather than a token 2s
-    // gap, in case the bug is time-dependent (e.g. an encoder/driver state
-    // issue that only shows up after a longer idle period).
-    let pause_secs: u64 = std::env::var("E2E_PAUSE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+    // Simulate a real gap between stopping and re-watching, at the reported
+    // live-test timescale (~35s) rather than a token 2s gap.
+    //
+    // `Why the length is load-bearing, not padding:` this test ran green at
+    // 2s for the whole life of the bug it is named after. The failure is
+    // *proportional to the pause* — the branch's `videorate` replayed the
+    // gap as duplicated stale frames (see `capture.rs`'s
+    // `BRANCH_MAX_DUPLICATION_TIME_NS`), so a 2s pause cost 2s of replay,
+    // which is indistinguishable from a healthy resume. At 35s the same
+    // mechanism produced ~1000 stale frames and the viewer never caught up.
+    // Shortening this back to "keep the suite quick" would silently retire
+    // the only end-to-end coverage of that bug.
+    let pause_secs: u64 = std::env::var("E2E_PAUSE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(35);
     eprintln!("[e2e-resub] pausing for {pause_secs}s before resubscribe");
     tokio::time::sleep(Duration::from_secs(pause_secs)).await;
 
@@ -877,4 +884,119 @@ async fn repeated_pause_resume_cycles_keep_resuming() {
     let _ = client_b.leave().await;
 
     eprintln!("[e2e-cycles] PASS: all {CYCLES} pause/resume cycles resumed successfully");
+}
+
+/// **The real production share path, against a real portal and a real relay.**
+///
+/// Everything above this uses `start_sharing_from_test_source`. This one calls
+/// the actual `capture::start_sharing` a "Start a Stream" click calls: real
+/// xdg-desktop-portal session, real `pipewiresrc`, real announce, real
+/// per-destination pump, real relay. It then walks the three things this
+/// stage's bug reports were about — the first destination coming up at all,
+/// a *second* dynamic branch being added to the live tee (fan-out), and a
+/// destination resuming after a long subscriber-less pause.
+///
+/// `Why `flavor = "multi_thread"`:` this is the one test in this file driving
+/// a *full-screen* capture, and its per-capture background work (self-preview
+/// RGB conversion at 12fps on 1920x1080 buffers, preview JPEG encoding) is
+/// heavy enough to starve `#[tokio::test]`'s default current-thread runtime —
+/// the test's own timers stop firing and it hangs. The real app runs on a
+/// multi-thread runtime (`main.rs`'s `tokio::runtime::Runtime::new()`), so
+/// this is also the faithful configuration, not just the working one.
+///
+/// `#[ignore]`d: needs a real desktop session with a portal backend.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens a real xdg-desktop-portal screencast session and spawns a real relay server"]
+async fn real_portal_share_fans_out_and_resumes() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    let port = pick_free_udp_port().expect("port");
+    let _server = spawn_relay_server(port).expect("relay");
+    let server_addr = format!("127.0.0.1:{port}");
+    let room_a: RoomId = rand::random();
+    let key_a: [u8; 32] = rand::random();
+    let join_a = crate::net::format_join_string(&server_addr, &room_a, &key_a);
+    let room_b: RoomId = rand::random();
+    let key_b: [u8; 32] = rand::random();
+    let join_b = crate::net::format_join_string(&server_addr, &room_b, &key_b);
+
+    let (sharer_a, _s, mut events_a) = connect_with_retry(&join_a, "sharer").await.expect("sharer joins room A");
+    let (sharer_b, _s, _e) = connect_with_retry(&join_b, "sharer").await.expect("sharer joins room B");
+    let (viewer, _s, mut events_v) = connect_with_retry(&join_a, "viewer").await.expect("viewer joins room A");
+
+    eprintln!("[real] calling capture::start_sharing (real portal)");
+    let mut handle = match capture::start_sharing(&sharer_a, 1, capture::DestKey(0), 4_000, 30).await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("skipping: no portal screencast session available here ({e:#})");
+            return;
+        }
+    };
+    eprintln!("[real] share started");
+
+    // 1. The first destination must actually encode, sustained — not just
+    //    survive `start_sharing` and then go silent (the shape the
+    //    RECONFIGURE bug produced downstream).
+    let mut best = 0;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        best = best.max(handle.encoder_fps(capture::DestKey(0)));
+    }
+    eprintln!("[real] destination 0 encoder fps: {best}");
+    assert!(best > 0, "the first destination of a real portal share never encoded a frame");
+
+    // 2. Fan out into a second room: a *second* dynamic branch on the live
+    //    tee, which is exactly the operation that used to kill the source.
+    let params = handle
+        .destination_runtime(capture::DestKey(0))
+        .expect("destination 0 runtime")
+        .lock()
+        .unwrap()
+        .params();
+    let rx = handle.spawn_add_destination(&sharer_b, 1, capture::DestKey(1), params);
+    let second = tokio::time::timeout(Duration::from_secs(30), rx)
+        .await
+        .expect("fan-out should not hang")
+        .expect("fan-out channel")
+        .expect("fan-out should succeed");
+    handle.register_destination(second);
+
+    let mut best_a = 0;
+    let mut best_b = 0;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        best_a = best_a.max(handle.encoder_fps(capture::DestKey(0)));
+        best_b = best_b.max(handle.encoder_fps(capture::DestKey(1)));
+    }
+    eprintln!("[real] after fan-out: dest0={best_a} fps, dest1={best_b} fps");
+    assert!(best_a > 0, "adding a second destination killed the first one's frames");
+    assert!(best_b > 0, "the fanned-out destination never encoded a frame");
+
+    // 3. Pause destination 0 for a long time, then resume it: it must come
+    //    back at the live edge rather than replaying the pause.
+    handle.notify_subscriber_count(capture::DestKey(0), 0);
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    handle.notify_subscriber_count(capture::DestKey(0), 1);
+    let resumed_at = std::time::Instant::now();
+    let mut resumed = 0;
+    while resumed_at.elapsed() < Duration::from_secs(10) {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        resumed = handle.encoder_fps(capture::DestKey(0));
+        if resumed > 0 {
+            break;
+        }
+    }
+    eprintln!("[real] resumed after a 20s pause in {:?} at {resumed} fps", resumed_at.elapsed());
+    assert!(resumed > 0, "a destination paused for 20s never resumed encoding");
+    assert!(
+        resumed_at.elapsed() < Duration::from_secs(5),
+        "resuming took {:?} — the pause is being replayed rather than skipped",
+        resumed_at.elapsed()
+    );
+
+    handle.stop().await.expect("the share should stop cleanly");
+    drop(viewer);
+    let _ = events_a.try_recv();
+    let _ = events_v.try_recv();
 }

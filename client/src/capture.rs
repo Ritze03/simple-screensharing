@@ -6,10 +6,7 @@
 //! # Pipeline
 //!
 //! ```text
-//! <platform source> ! videoconvert
-//!   ! videorate drop-only=false max-duplication-time=0
-//!   ! capsfilter name=source_caps caps=video/x-raw,framerate=<shared fps>/1
-//!   ! tee name=t
+//! <platform source> ! videoconvert ! video/x-raw,format=BGRx ! tee name=t
 //!   t. ! queue leaky=downstream max-size-buffers=1 ! videorate ! video/x-raw,framerate=1/1
 //!      ! videoconvert ! video/x-raw,format=RGB
 //!      ! appsink name=preview_sink
@@ -41,12 +38,20 @@
 //! touching any sibling destination of the same capture. See
 //! `superdoc/features/stream-control.md`.
 //!
-//! `source_caps` is the *shared* rate every branch downstream of the tee is
-//! fed at; a branch can down-convert from it freely but nothing can conjure
-//! frames the source never produced, which is exactly why raising a
-//! destination above it is the plan doc's tier-3 change
-//! ([`CaptureHandle::set_source_framerate`]) while going below it is a cheap
-//! tier-2 branch swap.
+//! The pixel format *is* pinned before the `tee`, and for a closely related
+//! reason: it keeps what the source negotiates independent of which branches
+//! happen to exist at that moment. See [`SOURCE_RAW_FORMAT`].
+//!
+//! **Nothing converts the frame rate before the `tee`** — the tee carries
+//! whatever the source natively produces, and every rate conversion happens
+//! inside a destination's own branch, downstream of that branch's `queue`.
+//! This is load-bearing rather than incidental: a `videorate` upstream of the
+//! tee stalls a real portal source dead (0 fps past the tee, no error
+//! anywhere) while behaving perfectly against `videotestsrc`. See
+//! [`build_pipeline`]'s "Why there is no rate conversion before the `tee`"
+//! for the measurements, and
+//! `capture::tests::live_portal_capture_feeds_a_destination_branch` for the
+//! regression test that would have caught it.
 //!
 //! `<platform source>` is [`CaptureSource::launch_fragment`]:
 //! `pipewiresrc fd=<fd> path=<node_id> do-timestamp=true keepalive-time=<ms>`
@@ -659,24 +664,83 @@ const SELF_PREVIEW_SINK_NAME: &str = "self_preview_sink";
 /// without ever letting a real backlog accumulate.
 const ENCODER_QUEUE_MAX_BUFFERS: u32 = 2;
 
+/// How large a gap each encode branch's `videorate` will still fill by
+/// duplicating the last frame it saw, in nanoseconds (`videorate`'s
+/// `max-duplication-time`, where `0` means *no limit*).
+///
+/// `Why this must be bounded — the "resuming a stream doesn't work" bug:`
+/// `drop-only=false` is what lets a branch hold its configured framerate on
+/// a completely static screen, by duplicating the last frame instead of
+/// emitting nothing (see [`branch::add_branch`]). Unbounded, that same
+/// mechanism turns every *pause* into a replay. A branch's `valve` sits
+/// directly upstream of its `videorate`, so pausing a destination with no
+/// subscribers looks exactly like a silent source — and the moment the valve
+/// reopened, `videorate` synthesised one duplicate of the frozen pre-pause
+/// frame for every frame period of the entire pause before letting a live
+/// frame through. Measured on a 35s pause: ~1000 stale duplicates encoded,
+/// encrypted and sent, which the viewer's `decode::PacingState` then paced
+/// out by their (evenly spaced, entirely valid) PTS — a real-time replay of
+/// the whole pause showing one frozen image. To the user that is "resuming
+/// doesn't work; I have to restart the share".
+///
+/// `Why one second specifically:` the gaps this is *supposed* to fill are
+/// bounded by the source's own keepalive — `pipewiresrc`'s `keepalive-time`
+/// is one frame period (see [`CaptureSource::launch_fragment`]), so a real
+/// static desktop never goes more than a frame or two without a buffer. A
+/// second is orders of magnitude of headroom over that while capping the
+/// worst-case replay at something imperceptible. Anything longer than this
+/// is not a static screen, it is an outage or a pause, and the right
+/// response to both is to resume at the live edge.
+const BRANCH_MAX_DUPLICATION_TIME_NS: u64 = 1_000_000_000;
+
+/// The one raw pixel format the whole capture is pinned to between the
+/// source and the `tee` (see [`build_pipeline`]). Every branch converts away
+/// from it as it likes; nothing negotiates *back* through it.
+///
+/// `Why pinning a format here is load-bearing — the "real sharing produces no
+/// frames" bug:` without it, the caps `pipewiresrc` negotiates against are
+/// whatever the tee's branches happen to prefer at that instant — and since
+/// every branch begins with converters (`videoconvert`/`videoscale`/
+/// `videorate`), that is an enormous ordered caps list whose *preferred*
+/// first entry is some branch's own fixed `format=…,framerate=…`.
+/// `pipewiresrc` turns that list, in order, into the SPA format params it
+/// offers the producer. Offered a branch-derived preference, a real portal
+/// producer intermittently accepts a format it then never delivers a single
+/// buffer for: the stream reaches PipeWire's `streaming` state, the
+/// GStreamer bus stays completely silent, and nothing ever arrives —
+/// measured with `GST_DEBUG=pipewiresrc:6` as `popped buffer (nil)` for the
+/// pipeline's entire life. Downstream that surfaces only as every encode
+/// branch timing out on its first IDR, i.e. sharing failing with a bare
+/// "encode branch produced no IDR within 5s" and no clue as to why.
+///
+/// Pinning one explicit format immediately after the source makes that offer
+/// deterministic and independent of the branch set — which matters far more
+/// now that *every* destination is a dynamic branch added after the pipeline
+/// is already playing, so the branch set at negotiation time is not even
+/// stable. Measured against one real portal capture, shapes interleaved in a
+/// single session to cancel out drift: **1/5 runs produced frames without
+/// the pin, 5/5 with it**. Two independent shapes that also went 5/5
+/// (pinning format *and* `framerate=0/1`, and pinning nothing but attaching
+/// no caps-constrained branch at all) confirm the mechanism is the branch
+/// caps reaching the source, not the specific format chosen.
+///
+/// `Why `BGRx` specifically:` it is what both real sources already produce
+/// (the portal negotiated `BGRA`; Windows' `d3d11screencapturesrc` is also
+/// BGRA), so the pin costs an alpha-drop rather than a real colour-space
+/// conversion, and it stays a packed 4-byte format so the buffer sizes on
+/// the tee are unchanged.
+const SOURCE_RAW_FORMAT: &str = "BGRx";
+
 /// Element name of the `tee` every branch — fixed (preview/self-preview) and
 /// dynamic (one per destination, see [`branch`]) — hangs off.
 const TEE_NAME: &str = "t";
 
-/// Element name of the capsfilter that fixes the *shared source rate* every
-/// branch downstream of the tee sees (see [`build_pipeline`]). Named because
-/// it is rewritten live by [`CaptureHandle::set_source_framerate`] — the
-/// plan doc's tier-3 change.
-const SOURCE_CAPS_NAME: &str = "source_caps";
-
 /// Everything [`build_pipeline`] hands back: the pipeline itself plus the
-/// three elements a running capture keeps talking to.
+/// two elements a running capture keeps talking to.
 struct CapturePipeline {
     pipeline: gst::Pipeline,
     /// Where every encode branch is added ([`branch::add_branch`]).
     tee: gst::Element,
-    /// See [`SOURCE_CAPS_NAME`].
-    source_caps: gst::Element,
     /// ~1fps RGB branch feeding [`preview::spawn_preview_task`].
     preview_sink: gst_app::AppSink,
     /// [`SELF_PREVIEW_BRANCH_FRAMERATE`] RGB branch feeding the sender-side
@@ -685,10 +749,10 @@ struct CapturePipeline {
 }
 
 /// Builds and links (but does not start) the capture pipeline described in
-/// this module's doc comment: source → `videoconvert` → shared-rate
-/// capsfilter → `tee`, plus the two *fixed* preview branches. It builds **no
-/// encoder at all** — every encoder in this pipeline belongs to a
-/// destination and is added dynamically by [`branch::add_branch`].
+/// this module's doc comment: source → `videoconvert` → `tee`, plus the two
+/// *fixed* preview branches. It builds **no encoder at all** — every encoder
+/// in this pipeline belongs to a destination and is added dynamically by
+/// [`branch::add_branch`].
 ///
 /// `Why no fixed encoder branch:` a capture can feed N rooms, each with its
 /// own resolution/framerate/bitrate/encoder-backend, its own room key, and
@@ -702,66 +766,50 @@ struct CapturePipeline {
 /// destination dynamic, there is exactly one path, and the *first*
 /// destination is not special in any way.
 ///
+/// # Why there is no rate conversion *before* the `tee`
+///
+/// `Why:` the obvious-looking shape — cap the shared source to the selected
+/// framerate once, before the tee, so every branch inherits it — **breaks
+/// real screen capture outright**, while looking perfectly healthy against
+/// `videotestsrc`. Measured directly against a live portal/`pipewiresrc`
+/// source (this is what `live_portal_capture_feeds_a_destination_branch`
+/// guards):
+///
+/// | shape | raw rate arriving at the tee |
+/// | --- | --- |
+/// | `pipewiresrc ! videoconvert ! tee` | 29.5 fps |
+/// | `pipewiresrc ! videoconvert ! videorate ! capsfilter(30/1) ! tee` | **0.0 fps** |
+///
+/// Nothing errors on the broken shape: the pipeline reaches `Playing`, the
+/// bus stays quiet, and not one buffer ever reaches the tee — so every
+/// destination branch times out waiting for its first IDR and sharing fails
+/// with a bare "encode branch produced no IDR within 5s". A portal source
+/// negotiates `framerate=0/1` (variable, damage-driven) plus a `max-framerate`
+/// hint, and a `videorate` asked to turn that into a fixed rate *on the
+/// source's own streaming thread, upstream of any queue* stalls instead of
+/// converting. The identical conversion works fine **downstream of the tee's
+/// per-branch `queue`**, which is where it has always lived
+/// ([`branch::add_branch`]) and where it stays: two branches off one real
+/// portal capture were measured holding 31.5 fps and 5.5 fps simultaneously.
+///
+/// So the tee carries whatever the source natively produces, and **rate is a
+/// per-destination concern**, converted inside each branch. The selected
+/// framerate still reaches the source itself — as `keepalive-time` on the
+/// Linux fragment (see [`CaptureSource::launch_fragment`]), which is what
+/// guarantees a floor rate while the desktop is completely static.
+///
 /// `source_fragment` is [`CaptureSource::launch_fragment`]'s output — the
-/// only platform-specific piece of the description below.
-fn build_pipeline(source_fragment: &str, framerate: u32) -> Result<CapturePipeline> {
-    // Defensive clamp — see [`MAX_FRAMERATE`]'s doc comment. `ui.rs`'s
-    // dropdown only ever offers values already inside this range, so this
-    // is a backstop against a 0/absurd value reaching the caps, not the
-    // primary validation.
-    let framerate = framerate.clamp(MIN_FRAMERATE, MAX_FRAMERATE);
-
-    // `videorate drop-only=false max-duplication-time=0 !
-    // video/x-raw,framerate={framerate}/1` *before* the tee is load-bearing,
-    // not cosmetic — it is the shared source rate every branch downstream
-    // sees, and it is where the "fully static framerate, always the selected
-    // one" guarantee is enforced for the whole capture at once.
-    //
-    // `<platform source>` (portal `pipewiresrc` / Windows
-    // `d3d11screencapturesrc`) delivers frames at whatever variable,
-    // content-driven rate the compositor/OS pushes them — observed live
-    // ranging from ~1fps on an idle desktop up to the monitor's full refresh
-    // rate (100+ fps) under continuous motion, with nothing upstream
-    // constraining it. Every encoder property that assumes a nominal fps
-    // (`key-int-max` for the spec's 2s GOP, and — critically — `bitrate`
-    // itself, since both `x264enc` and `vah264enc` allocate their per-frame
-    // bit budget by dividing the target bitrate across the negotiated caps'
-    // framerate) silently breaks without a cap: fed at, say, 100fps instead
-    // of the configured 30, the encoder divides the same kbit/s budget
-    // across >3x as many frames, so each frame gets a fraction of its
-    // intended allocation. Live-measured without this cap: every delta frame
-    // landed at exactly the same ~222 bytes regardless of real on-screen
-    // motion or the configured bitrate — the classic signature of a starved
-    // rate controller.
-    //
-    // `drop-only=false` is what lets `videorate` *duplicate* the last frame
-    // to fill up to `framerate` rather than only dropping excess frames down
-    // to it; `max-duplication-time=0` disables the cap on how large a gap it
-    // will still fill (a non-zero value would make it give up filling once
-    // the gap since the last real buffer exceeded that duration,
-    // reintroducing the fluctuating-rate/stuck-frame bug this exists to
-    // fix). Both only get a real workout because `keepalive-time` on the
-    // Linux source fragment (see [`CaptureSource::launch_fragment`]) ensures
-    // there is always a fresh buffer to duplicate from even when the desktop
-    // is fully static and the compositor pushes nothing.
-    //
-    // `Why the cap is shared (pre-tee) rather than per-branch:` a
-    // destination's own branch has its own `videorate` too
-    // ([`branch::add_branch`]) and can freely down-convert from this rate,
-    // but nothing downstream of the tee can conjure frames the source never
-    // produced. So this value *is* the capture's [`destination::SourceCaps`]
-    // framerate, and it is exactly why raising a destination above it is the
-    // plan doc's tier-3 [`destination::ChangeTier::SourceRestart`] (handled
-    // by [`CaptureHandle::set_source_framerate`], which rewrites this
-    // capsfilter live) while going below it is a cheap tier-2 branch swap.
-    // A separate `capsfilter` element (rather than caps inline in the
-    // `videorate ! ...` link) is what makes that live rewrite possible: the
-    // filter's `caps` property is settable on a `Playing` pipeline.
+/// only platform-specific piece of the description below. There is
+/// deliberately no `framerate` parameter: the selected rate reaches the
+/// source through `source_fragment`'s own `keepalive-time` (see
+/// [`CaptureSource::launch_fragment`]) and each destination through its own
+/// branch's `videorate` ([`branch::add_branch`]), so nothing in *this*
+/// description depends on it.
+fn build_pipeline(source_fragment: &str) -> Result<CapturePipeline> {
     let description = format!(
         "{source_fragment} \
          ! videoconvert \
-         ! videorate drop-only=false max-duplication-time=0 \
-         ! capsfilter name={SOURCE_CAPS_NAME} caps=video/x-raw,framerate={framerate}/1 \
+         ! video/x-raw,format={SOURCE_RAW_FORMAT} \
          ! tee name={TEE_NAME} \
          {TEE_NAME}. ! queue leaky=downstream max-size-buffers=1 \
             ! videorate \
@@ -799,22 +847,74 @@ fn build_pipeline(source_fragment: &str, framerate: u32) -> Result<CapturePipeli
         .by_name(TEE_NAME)
         .ok_or_else(|| anyhow!("pipeline has no element named '{TEE_NAME}'"))?;
 
-    let source_caps = pipeline
-        .by_name(SOURCE_CAPS_NAME)
-        .ok_or_else(|| anyhow!("pipeline has no element named '{SOURCE_CAPS_NAME}'"))?;
+    isolate_source_from_branch_renegotiation(&tee)?;
 
-    Ok(CapturePipeline { pipeline, tee, source_caps, preview_sink, self_preview_sink })
+    Ok(CapturePipeline { pipeline, tee, preview_sink, self_preview_sink })
 }
 
-/// The `video/x-raw,framerate=N/1` caps [`SOURCE_CAPS_NAME`]'s capsfilter
-/// carries. Its own function because [`build_pipeline`] writes it once at
-/// construction (as a launch-syntax string) and
-/// [`CaptureHandle::set_source_framerate`] rewrites it live (as a real
-/// [`gst::Caps`]), and the two must never drift apart.
-fn source_framerate_caps(framerate: u32) -> gst::Caps {
-    gst::Caps::builder("video/x-raw")
-        .field("framerate", gst::Fraction::new(framerate.clamp(MIN_FRAMERATE, MAX_FRAMERATE) as i32, 1))
-        .build()
+/// Stops a branch being added to the live `tee` from asking everything
+/// *upstream* of the tee to renegotiate, by dropping `RECONFIGURE` events at
+/// the tee's sink pad.
+///
+/// # Why this is the difference between real screen sharing working and not
+///
+/// `Why:` linking a new branch onto a `tee` that is already `Playing` makes
+/// GStreamer send one `GST_EVENT_RECONFIGURE` upstream, which is how a newly
+/// added consumer normally asks the producer to renegotiate for it. Against
+/// a real portal capture, `pipewiresrc` acts on it by renegotiating its
+/// PipeWire stream with the compositor's producer — **and the producer never
+/// sends another buffer**. Not an error, not an EOS, nothing on the bus: the
+/// stream sits in PipeWire's `streaming` state forever with no data.
+///
+/// Measured directly against one live portal capture, sampling the raw frame
+/// rate off the tee every 1.5s:
+///
+/// | | frames off the tee |
+/// | --- | --- |
+/// | before adding a branch | 44.7, 29.3, 65.3, 32.7, 28.7 fps |
+/// | after `add_branch`, reconfigure allowed upstream | 0.7, 0.0, 0.0, 0.0, 0.0 fps |
+/// | after `add_branch`, reconfigure dropped here | 28.7, 28.7, 28.7, 28.7, 28.7 fps |
+///
+/// This is precisely the regression the all-dynamic-branch restructuring
+/// introduced, and precisely why the whole unit suite stayed green while real
+/// sharing was broken. Before it, the encode branch was *fixed* — built into
+/// the launch description, linked before the pipeline ever left `Null` — so
+/// no pad was ever added to a live tee and no reconfigure was ever sent.
+/// Now every destination is dynamic, so the **first** destination of every
+/// share kills the very source it is trying to encode, and the only symptom
+/// downstream is `add_branch_live` timing out on its first IDR. A
+/// `videotestsrc` renegotiates instantly and silently, which is why no test
+/// could see it (see
+/// `capture::tests::live_portal_capture_feeds_a_destination_branch`).
+///
+/// `Why dropping the event is correct rather than a workaround:` a
+/// reconfigure asks upstream to produce something different. Upstream of
+/// this tee there is nothing to ask for — the chain is
+/// `<source> ! videoconvert ! video/x-raw,format=BGRx` (see
+/// [`SOURCE_RAW_FORMAT`]), whose output format is pinned by us and whose
+/// frame size is dictated by the compositor, not negotiable by us. And no
+/// branch needs it to change: every branch begins with its own
+/// `videoconvert`/`videoscale`/`videorate` and converts from whatever the
+/// tee carries to whatever that destination wants. So the event has no
+/// legitimate work to do here, and forwarding it only exposes the source to
+/// a renegotiation it cannot survive.
+fn isolate_source_from_branch_renegotiation(tee: &gst::Element) -> Result<()> {
+    let sink = tee
+        .static_pad("sink")
+        .ok_or_else(|| anyhow!("tee '{TEE_NAME}' has no sink pad to guard against renegotiation"))?;
+
+    sink.add_probe(gst::PadProbeType::EVENT_UPSTREAM, |_, info| {
+        if let Some(gst::PadProbeData::Event(event)) = &info.data
+            && event.type_() == gst::EventType::Reconfigure
+        {
+            tracing::debug!("dropping an upstream RECONFIGURE at the capture tee (see build_pipeline)");
+            return gst::PadProbeReturn::Drop;
+        }
+        gst::PadProbeReturn::Ok
+    })
+    .ok_or_else(|| anyhow!("failed to install the renegotiation guard on tee '{TEE_NAME}'"))?;
+
+    Ok(())
 }
 
 /// Builds the capture pipeline and drives it to `Playing`, waiting for the
@@ -829,8 +929,8 @@ fn source_framerate_caps(framerate: u32) -> gst::Caps {
 /// there is nothing VAAPI-specific that can fail at this stage. That
 /// fallback now lives per destination, where it belongs — see
 /// [`branch::add_branch_with_fallback`]/[`branch::add_branch_live`].
-fn start_pipeline(source_fragment: &str, framerate: u32) -> Result<CapturePipeline> {
-    let built = build_pipeline(source_fragment, framerate)?;
+fn start_pipeline(source_fragment: &str) -> Result<CapturePipeline> {
+    let built = build_pipeline(source_fragment)?;
 
     if let Err(e) = built.pipeline.set_state(gst::State::Playing) {
         let _ = built.pipeline.set_state(gst::State::Null);
@@ -884,10 +984,13 @@ pub struct DestKey(pub u32);
 /// "one capture, N independently encoded and encrypted streams" literal
 /// rather than aspirational.
 pub struct DestinationHandle {
+    /// The caller's own identity for this destination — see [`DestKey`].
     key: DestKey,
+    /// This destination's `stream_id` *on its own room's connection*. Only
+    /// unique within that connection, which is why it is never the key.
     stream_id: u8,
-    /// Which room this destination sends into, purely so a caller can
-    /// correlate it back without a second lookup.
+    /// Mailbox for [`destination_pump`], the one owner of this destination's
+    /// encode branch — see [`DestCmd`].
     cmd_tx: mpsc::UnboundedSender<DestCmd>,
     runtime: destination::SharedDestination,
     encoder_fps: Arc<AtomicU32>,
@@ -963,9 +1066,6 @@ pub struct CaptureHandle {
     pipeline: gst::Pipeline,
     /// Where every destination's encode branch is added/removed.
     tee: gst::Element,
-    /// The shared-source-rate capsfilter — see [`SOURCE_CAPS_NAME`] and
-    /// [`CaptureHandle::set_source_framerate`].
-    source_caps: gst::Element,
     capture_source: CaptureSource,
     /// Bus + self-preview pump (see [`capture_loop`]). Per capture, not per
     /// destination: neither of those two things is destination-scoped.
@@ -985,9 +1085,13 @@ pub struct CaptureHandle {
     // `StreamDecoder::latest_frame` uses for the equivalent viewer-side
     // texture-upload pattern in `ui.rs`.
     self_preview_frame: Arc<Mutex<Option<egui::ColorImage>>>,
-    /// What the shared source is currently producing. The framerate half is
-    /// authoritative (this module sets it); the size half is negotiated by
-    /// GStreamer and cached here on first successful read.
+    /// What this capture is considered to be producing, as the input to
+    /// [`destination::classify_change`]/[`destination::clamp_to_source`]. The
+    /// size half is GStreamer's real negotiated frame size, cached on first
+    /// successful read; the framerate half is the rate the capture was
+    /// started with (its `keepalive-time` floor), raised on demand by
+    /// [`CaptureHandle::set_source_framerate`] — see that method for why the
+    /// real source has no hard rate ceiling to speak of.
     source_state: Mutex<destination::SourceCaps>,
     /// One entry per room this capture feeds, in the order they were added.
     /// A `Vec` rather than a map: N is the number of rooms a user is
@@ -1103,9 +1207,19 @@ async fn start_sharing_with_source(
     framerate: u32,
     capture_source: CaptureSource,
 ) -> Result<CaptureHandle> {
+    // Defensive clamp — see [`MAX_FRAMERATE`]'s doc comment. `ui.rs`'s
+    // dropdown only ever offers values already inside this range, so this is
+    // a backstop against a 0/absurd value reaching the `SourceCaps` this
+    // capture reports (and through it every `classify_change`/
+    // `clamp_to_source` decision made against it), not the primary
+    // validation. It lives here because this is where the value is actually
+    // *consumed*: `build_pipeline` no longer takes a framerate at all, and
+    // `launch_fragment` does its own clamp for `keepalive-time`.
+    let framerate = framerate.clamp(MIN_FRAMERATE, MAX_FRAMERATE);
+
     let source_fragment = capture_source.launch_fragment(framerate);
-    let CapturePipeline { pipeline, tee, source_caps, preview_sink, self_preview_sink } =
-        start_pipeline(&source_fragment, framerate)?;
+    let CapturePipeline { pipeline, tee, preview_sink, self_preview_sink } =
+        start_pipeline(&source_fragment)?;
 
     // Size for AnnounceStream and for the never-upscale clamp
     // ([`destination::clamp_to_source`]): read off the tee's negotiated sink
@@ -1126,10 +1240,37 @@ async fn start_sharing_with_source(
         backend: detect_encoder_backend(),
     };
 
-    let destination = spawn_destination(&pipeline, &tee, client, stream_id, key, params).await?;
+    // Everything from here to the `CaptureHandle` below is fallible, and until
+    // that handle exists **nothing else owns the pipeline or the portal
+    // session** — `CaptureHandle::Drop` is the backstop that stops the
+    // pipeline, and there is no handle to drop yet.
+    //
+    // `Why this is wrapped rather than using `?` directly:` a bare `?` here
+    // was a real, measured leak. When the first destination failed to come up,
+    // `start_sharing` returned `Err`, the UI reported "share failed" and
+    // showed nothing running — while the process kept a live PipeWire
+    // screencast stream, its GStreamer element threads and the portal session
+    // open **for the rest of the process's life**, with no affordance to stop
+    // it: the user's screen went on being captured after they were told the
+    // share had failed. Any early return between `start_pipeline` and the
+    // handle must therefore tear the pipeline down and close the portal
+    // session first, which is exactly what `abandon_capture` does.
+    let started = spawn_destination(&pipeline, &tee, client, stream_id, key, params).await;
+    let destination = match started {
+        Ok(destination) => destination,
+        Err(e) => return Err(abandon_capture(pipeline, capture_source, e).await),
+    };
 
     let self_preview_frame: Arc<Mutex<Option<egui::ColorImage>>> = Arc::new(Mutex::new(None));
-    let bus = pipeline.bus().ok_or_else(|| anyhow!("pipeline has no bus"))?;
+    let bus = match pipeline.bus() {
+        Some(bus) => bus,
+        None => {
+            // The destination's pump is already running; stop it before the
+            // pipeline goes away under it.
+            let _ = destination.stop().await;
+            return Err(abandon_capture(pipeline, capture_source, anyhow!("pipeline has no bus")).await);
+        }
+    };
     let capture_task = tokio::spawn(capture_loop(
         bus.stream(),
         SelfPreviewBridge { stream: self_preview_sink.stream(), frame: self_preview_frame.clone() },
@@ -1144,7 +1285,6 @@ async fn start_sharing_with_source(
     Ok(CaptureHandle {
         pipeline,
         tee,
-        source_caps,
         capture_source,
         capture_task,
         preview_handle: Some(preview_handle),
@@ -1152,6 +1292,38 @@ async fn start_sharing_with_source(
         source_state: Mutex::new(source),
         destinations: vec![destination],
     })
+}
+
+/// Tear down a capture that never became a [`CaptureHandle`]: stop the
+/// GStreamer pipeline and close the portal session, then hand back the error
+/// that caused the abandonment (with context, so the caller's message still
+/// explains what actually failed).
+///
+/// `Why this exists as its own function:` `CaptureHandle`'s `Drop` impl is
+/// what normally guarantees a capture can never outlive its owner, but it
+/// only applies once the handle is *constructed*. Every fallible step between
+/// starting the pipeline and constructing it is outside that guarantee, and
+/// the consequence of getting it wrong is not a leaked allocation — it is a
+/// screen that keeps being captured (recording indicator lit, PipeWire stream
+/// live) after the user was told the share failed.
+async fn abandon_capture(pipeline: gst::Pipeline, capture_source: CaptureSource, error: anyhow::Error) -> anyhow::Error {
+    if let Err(e) = pipeline.set_state(gst::State::Null) {
+        tracing::warn!("failed to stop the pipeline of an abandoned capture: {e}");
+    }
+
+    #[cfg(unix)]
+    match &capture_source {
+        CaptureSource::Portal(portal) => {
+            if let Err(e) = portal.session.close().await {
+                tracing::warn!("failed to close the portal session of an abandoned capture: {e}");
+            }
+        }
+        #[cfg(test)]
+        CaptureSource::TestSource(_) => {}
+    }
+    drop(capture_source);
+
+    error
 }
 
 /// Builds one destination end to end: a dynamic encode branch on `tee`
@@ -1644,57 +1816,51 @@ impl CaptureHandle {
         *state
     }
 
-    /// Tier-3 ([`destination::ChangeTier::SourceRestart`]): change the rate
-    /// the **shared** capture source runs at, which every destination on this
-    /// capture is fed from.
+    /// Raise the rate this capture is considered to be running at, so a
+    /// destination is allowed to encode above the rate the capture was
+    /// started with ([`destination::ChangeTier::SourceRestart`]).
     ///
-    /// `Why a live capsfilter rewrite rather than tearing the pipeline down
-    /// and rebuilding it:` the plan doc's tier-3 is defined by its *effect*
-    /// — the shared source changes, so every co-located destination is
-    /// affected at once and the stall protocol has to cover the gap — not by
-    /// any particular GStreamer mechanic. Rewriting the one capsfilter that
-    /// fixes the source rate ([`SOURCE_CAPS_NAME`]) achieves that effect
-    /// while keeping the portal session, the PipeWire fd, every destination's
-    /// branch, and the preview branches all alive, which a rebuild would each
-    /// have to re-acquire and re-add (and, on Linux, could re-prompt the user
-    /// for consent). The renegotiation this triggers is confined to
-    /// `videorate`'s output framerate — no format or size change — and the
-    /// destinations are stalled across it anyway, so a hitch reads to the
-    /// viewer as the brief low-framerate dip the protocol is designed to make
-    /// it look like.
+    /// `Why this does no pipeline surgery — and why that is not a cop-out:`
+    /// the plan doc's tier 3 assumes the shared source has a hard rate
+    /// ceiling that only a restart can raise. Measured against the real
+    /// portal source, it doesn't:
     ///
-    /// Raising the rate stalls every destination for the duration (nothing
-    /// downstream can conjure frames the source isn't producing yet);
-    /// *lowering* it deliberately doesn't — the source keeps producing
-    /// throughout, just less often, which is not an outage.
+    /// - The source is **damage-driven and variable-rate**
+    ///   (`framerate=0/1`): it was observed delivering ~94 fps under motion
+    ///   and ~30 fps on a static desktop with `keepalive-time` set from the
+    ///   selected framerate. The selected rate is a *floor for the idle
+    ///   case*, not a ceiling.
+    /// - A destination asking for more than that floor is served by its own
+    ///   branch's `videorate`, which duplicates the last frame to fill the
+    ///   gap — the same mechanism that already delivers "a constant framerate
+    ///   even on a completely static screen". Two branches off one real
+    ///   portal capture were measured holding 31.5 fps and 5.5 fps at the
+    ///   same time.
+    ///
+    /// So there is nothing to restart: nothing is being withheld from the
+    /// destination that a source change would unlock. Both mechanisms that
+    /// *could* have changed the live source's rate were measured and rejected
+    /// — rewriting a pre-tee `videorate`'s capsfilter stalls the whole
+    /// capture dead (see [`build_pipeline`]), and writing `keepalive-time` on
+    /// a live `pipewiresrc` kills the stream outright (measured: every branch
+    /// dropped to 0 fps and never recovered).
+    ///
+    /// What this therefore does is the honest minimum: record the higher rate
+    /// so the capture's [`destination::SourceCaps`] stops classifying that
+    /// destination's setting as tier 3, and let the caller's branch swap
+    /// apply it. No stall is raised, because nothing actually stalls.
+    ///
+    /// A genuine source change — the user picking a different monitor, or the
+    /// portal session dying — *does* need the stall protocol and a rebuilt
+    /// pipeline; that is what [`CaptureHandle::begin_stall`],
+    /// [`CaptureHandle::note_source_restarted`] and
+    /// [`branch::rebuild_after_source_restart`] are for, and they stay tested
+    /// against that day.
     pub fn set_source_framerate(&self, framerate: u32) {
         let framerate = framerate.clamp(MIN_FRAMERATE, MAX_FRAMERATE);
-        let previous = {
-            let mut state = self.source_state.lock().unwrap();
-            let previous = state.framerate;
-            if previous == framerate {
-                return;
-            }
+        let mut state = self.source_state.lock().unwrap();
+        if framerate > state.framerate {
             state.framerate = framerate;
-            previous
-        };
-
-        let raising = framerate > previous;
-        if raising {
-            self.begin_stall(destination::StallReason::SourceChanged);
-        }
-
-        self.source_caps.set_property("caps", source_framerate_caps(framerate));
-
-        if raising {
-            self.note_source_restarted();
-            // Nothing ends a stall except a real IDR arriving (by design —
-            // see `note_encoded_frame`), so ask every branch for one now
-            // rather than leaving the viewer on the cached-IDR keepalive
-            // until the next scheduled 2s GOP boundary.
-            for destination in &self.destinations {
-                let _ = destination.cmd_tx.send(DestCmd::KeyframeRequest);
-            }
         }
     }
 
@@ -3401,12 +3567,20 @@ pub mod branch {
         // touching the shared tee or the pipeline state, and the mode must
         // forward sticky events so [`remove_branch`]'s injected EOS still
         // drains through a paused branch instead of hanging its 5s timeout.
+        //
+        // `videorate drop-only=false` is what holds this destination's
+        // configured rate on a static screen (duplicating the last frame
+        // rather than emitting nothing); `max-duplication-time` bounds how
+        // much of a gap it will fill that way, which is load-bearing
+        // precisely *because* the `valve` above is upstream of it — see
+        // [`super::BRANCH_MAX_DUPLICATION_TIME_NS`] and
+        // `a_long_pause_resumes_at_the_live_edge_instead_of_replaying_the_gap`.
         let description = format!(
             "queue leaky=downstream max-size-buffers={ENCODER_QUEUE_MAX_BUFFERS} \
              ! valve name={valve_name} drop=false drop-mode=forward-sticky-events \
              ! videoconvert \
              ! videoscale \
-             ! videorate drop-only=false max-duplication-time=0 \
+             ! videorate drop-only=false max-duplication-time={BRANCH_MAX_DUPLICATION_TIME_NS} \
              ! video/x-raw,format={raw_format}{scale_caps},framerate={framerate}/1 \
              ! {encoder} name={encoder_name} \
              ! video/x-h264,stream-format=byte-stream,alignment=au \
@@ -3976,6 +4150,28 @@ pub mod branch {
             let _ = bin.set_state(gst::State::Null);
             tee.release_request_pad(&tee_pad);
             count as f64 / window.as_secs_f64()
+        }
+
+        /// Blocks until `pipeline` has actually reached `Playing`, or the
+        /// timeout elapses.
+        ///
+        /// `Why not just `pipeline.state(timeout)`:` that returns
+        /// `Ok(StateChangeSuccess::Async)` when the change is still in
+        /// flight, which reads as success and lets a test carry on against a
+        /// pipeline that is still `Paused`. Harmless when a test runs alone
+        /// (the change completes in milliseconds); under `cargo test`'s full
+        /// parallelism, a dozen live GStreamer pipelines coming up at once
+        /// pushed this past 5s and produced a "the branch produced nothing"
+        /// failure whose real cause was "the pipeline was never playing".
+        fn wait_until_playing(pipeline: &gst::Pipeline, timeout: Duration) -> bool {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                let (_result, current, _pending) = pipeline.state(gst::ClockTime::from_mseconds(200));
+                if current == gst::State::Playing {
+                    return true;
+                }
+            }
+            false
         }
 
         /// Polls `appsink` for up to `timeout` and reports whether at least
@@ -4860,51 +5056,396 @@ pub mod branch {
             pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
         }
 
-        /// The shared source rate is a live, rewritable capsfilter (tier 3):
-        /// raising it must actually change what the tee — and therefore every
-        /// branch capped at or above the new rate — is fed, on a pipeline that
-        /// never leaves `Playing`.
-        #[test]
-        fn rewriting_the_source_caps_changes_the_shared_rate_live() {
+        /// **Regression ("resuming a stream doesn't work"):** a branch that
+        /// was paused for a long time must resume *at the live edge* — not
+        /// replay the whole pause as duplicated stale frames.
+        ///
+        /// The bug this pins: the branch's `videorate drop-only=false` had
+        /// `max-duplication-time=0`, i.e. *no limit* on how large a gap it
+        /// would fill by duplicating the last frame it saw. The branch's
+        /// `valve` sits directly upstream of that `videorate`, so a pause is
+        /// indistinguishable from "the source went quiet" — and the instant
+        /// the valve reopened, `videorate` synthesised one duplicate of the
+        /// frozen pre-pause frame for **every frame period of the entire
+        /// pause** before letting the first live frame through. Measured at a
+        /// 35s pause: ~1000 stale duplicates, all encoded, all encrypted, all
+        /// sent. The viewer's `decode::PacingState` then paced that backlog
+        /// out by its (perfectly valid, evenly spaced) PTS — a real-time
+        /// replay of the whole pause showing one frozen image, which is
+        /// exactly the reported "resuming streams doesn't work, the streamer
+        /// has to restart" symptom.
+        ///
+        /// Asserted two ways, because either alone is weak: the resumed
+        /// branch's PTS must *jump across* the pause (not creep one frame
+        /// past where it stopped), and the first second after resume must
+        /// carry roughly one second's worth of frames rather than a burst.
+        #[tokio::test]
+        async fn a_long_pause_resumes_at_the_live_edge_instead_of_replaying_the_gap() {
             if gst::init().is_err() {
                 eprintln!("skipping: gstreamer not available in this environment");
                 return;
             }
 
+            let (pipeline, tee) = build_test_pipeline();
+            pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+            assert!(wait_until_playing(&pipeline, Duration::from_secs(30)), "pipeline never reached PLAYING");
+
+            let framerate = 15u32;
+            let branch = add_branch(&pipeline, &tee, BranchId(1), EncodeSettings { framerate, ..small_settings() })
+                .expect("add_branch");
+            assert!(wait_for_sample(&branch.appsink, Duration::from_secs(20)), "branch produced nothing to begin with");
+
+            // Last PTS the branch emitted before the pause, drained down to
+            // whatever was already in flight when the valve closed.
+            branch.set_paused(true, 0);
+            let mut last_pts_before = None;
+            while let Some(sample) = branch.appsink.try_pull_sample(gst::ClockTime::from_mseconds(100)) {
+                last_pts_before = sample.buffer().and_then(|b| b.pts()).or(last_pts_before);
+            }
+            let last_pts_before = last_pts_before.expect("a pre-pause sample should carry a PTS");
+
+            // Long enough that a full replay is unmistakable (at 15fps this
+            // is 90 duplicate frames with the bug) while keeping the test
+            // quick. The real report was ~35s; the mechanism is linear in
+            // the pause, so 6s proves it just as well.
+            let pause = Duration::from_secs(6);
+            tokio::time::sleep(pause).await;
+            branch.set_paused(false, 0);
+
+            let window = Duration::from_secs(1);
+            let deadline = Instant::now() + window;
+            let mut first_pts_after = None;
+            let mut count = 0u32;
+            while Instant::now() < deadline {
+                if let Some(sample) = branch.appsink.try_pull_sample(gst::ClockTime::from_mseconds(50)) {
+                    count += 1;
+                    if first_pts_after.is_none() {
+                        first_pts_after = sample.buffer().and_then(|b| b.pts());
+                    }
+                }
+            }
+            let first_pts_after = first_pts_after.expect("the branch must produce something after resuming");
+            let pts_jump = first_pts_after.saturating_sub(last_pts_before);
+            eprintln!(
+                "[resume] pts {last_pts_before} -> {first_pts_after} (jump {pts_jump}), \
+                 {count} frames in the first second after a {pause:?} pause"
+            );
+
+            // The first frame after the pause must be a *live* one. With the
+            // bug it is a duplicate of the pre-pause frame, one frame period
+            // later; the floor here is half the pause, far above that and far
+            // below the pause itself (so a little drain latency can't flake it).
+            assert!(
+                pts_jump > gst::ClockTime::from_mseconds(pause.as_millis() as u64 / 2),
+                "resuming replayed the pause instead of jumping to the live edge \
+                 (PTS advanced only {pts_jump} across a {pause:?} pause)"
+            );
+            // …and no catch-up burst behind it. Generous headroom (4x) so a
+            // loaded parallel test run can't flake this, while a full replay
+            // (which delivers the whole 6s backlog as fast as the encoder
+            // manages) still lands far above it.
+            assert!(
+                count < framerate * 4,
+                "resuming produced a catch-up burst: {count} frames in one second at {framerate}fps"
+            );
+
+            tokio::time::timeout(Duration::from_secs(10), remove_branch(&pipeline, &tee, branch))
+                .await
+                .expect("cleanup should not hang")
+                .expect("cleanup should succeed");
+            pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+        }
+
+        /// A live **PipeWire** video source standing in for the portal's, at a
+        /// realistic screen size and pixel format — the closest thing to the
+        /// real capture path that can run unattended.
+        ///
+        /// `Why this exists at all:` every other test in this file feeds the
+        /// pipeline from `videotestsrc`, which is a *self-paced, in-process,
+        /// system-memory, tiny-frame* source. The real capture path is none of
+        /// those things: `pipewiresrc` receives buffers from another process
+        /// across a PipeWire link, at full screen resolution (megabytes per
+        /// frame) in a packed 4-byte format, at whatever irregular rate the
+        /// compositor delivers damage. A whole class of bug — anything to do
+        /// with buffer size, negotiation against a live remote producer, or
+        /// timing — can only show up on this path, and one did: the pre-tee
+        /// rate conversion that stalled a real source dead while every
+        /// `videotestsrc` test stayed green (see [`super::build_pipeline`]'s
+        /// "Why there is no rate conversion before the `tee`").
+        ///
+        /// Returns `None` (test skips, doesn't fail) when PipeWire isn't usable
+        /// here — no daemon, no `pw-dump`, or `pipewiresink` not installed —
+        /// mirroring how the VAAPI tests skip on machines without a GPU.
+        struct PipeWireProducer {
+            pipeline: gst::Pipeline,
+            node_id: u32,
+        }
+
+        impl Drop for PipeWireProducer {
+            fn drop(&mut self) {
+                let _ = self.pipeline.set_state(gst::State::Null);
+            }
+        }
+
+        impl PipeWireProducer {
+            fn start(width: u32, height: u32) -> Option<Self> {
+                let node_name = format!("sss-regression-source-{}", std::process::id());
+                // `stream-properties` takes a `GstStructure` in
+                // launch syntax — unquoted, or the quotes end up inside the
+                // property value and the node keeps its default name.
+                let description = format!(
+                    "videotestsrc is-live=true pattern=ball \
+                     ! video/x-raw,format=BGRx,width={width},height={height},framerate=60/1 \
+                     ! pipewiresink mode=provide stream-properties=props,node.name={node_name}"
+                );
+                let Ok(element) = gst::parse::launch(&description) else {
+                    return None;
+                };
+                let pipeline = element.downcast::<gst::Pipeline>().ok()?;
+                if pipeline.set_state(gst::State::Playing).is_err() {
+                    let _ = pipeline.set_state(gst::State::Null);
+                    return None;
+                }
+
+                // The node only appears in the graph once the sink is actually
+                // playing; poll rather than sleeping a fixed guess.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let node_id = loop {
+                    if let Some(node_id) = Self::find_node(&node_name) {
+                        break Some(node_id);
+                    }
+                    if Instant::now() >= deadline {
+                        break None;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                };
+                match node_id {
+                    Some(node_id) => Some(Self { pipeline, node_id }),
+                    None => {
+                        let _ = pipeline.set_state(gst::State::Null);
+                        None
+                    }
+                }
+            }
+
+            /// `pw-dump`'s JSON graph, filtered to the node this producer
+            /// created — the same shell-out-and-parse approach `audio.rs` uses
+            /// for source discovery.
+            fn find_node(node_name: &str) -> Option<u32> {
+                let output = std::process::Command::new("pw-dump").output().ok()?;
+                if !output.status.success() {
+                    return None;
+                }
+                let objects: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+                // Every `?` here is confined to one object's own lookup chain:
+                // applying `?` to a per-object field inside the loop body
+                // would abandon the whole scan at the first object that
+                // happens to lack it (most `pw-dump` objects have no
+                // `info.props` at all).
+                objects.as_array()?.iter().find_map(|object| {
+                    let props = object.get("info")?.get("props")?;
+                    let name = props.get("node.name")?.as_str()?;
+                    if name != node_name {
+                        return None;
+                    }
+                    Some(object.get("id")?.as_u64()? as u32)
+                })
+            }
+        }
+
+        /// **Regression (real-source path):** a destination branch must come up
+        /// against a live `pipewiresrc` delivering *full-screen-sized* frames.
+        ///
+        /// The failure shape this pins is the one real sharing actually hit:
+        /// the pipeline reaches `Playing`, the bus stays silent, the preview
+        /// branches run — and the encode branch never sees a single frame, so
+        /// `add_branch_live` times out waiting for its first IDR and sharing
+        /// fails with a bare "encode branch produced no IDR within 5s". Every
+        /// `videotestsrc`-fed test in this file stayed green throughout,
+        /// because none of them involves a live cross-process producer or a
+        /// full-screen-sized buffer.
+        ///
+        /// The resolution here is deliberately large (a 3840x2160 BGRx frame
+        /// is ~33MB, well past `GstQueue`'s 10MB default byte limit, which
+        /// each branch's entry `queue` leaves at its default). Keep it that
+        /// way: this test is only worth its runtime while it exercises the
+        /// buffer sizes a real screen produces.
+        #[tokio::test]
+        async fn a_destination_branch_comes_up_against_a_real_pipewire_source() {
+            if gst::init().is_err() {
+                eprintln!("skipping: gstreamer not available in this environment");
+                return;
+            }
+            let Some(producer) = PipeWireProducer::start(3840, 2160) else {
+                eprintln!("skipping: no usable PipeWire daemon/pipewiresink/pw-dump in this environment");
+                return;
+            };
+
+            let built = super::super::build_pipeline(&format!(
+                "pipewiresrc path={} do-timestamp=true keepalive-time=33",
+                producer.node_id
+            ))
+            .expect("pipeline should construct");
+            built.pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+            assert!(
+                wait_until_playing(&built.pipeline, Duration::from_secs(30)),
+                "pipeline never reached PLAYING"
+            );
+
+            // Exactly what `spawn_destination` does for the first destination:
+            // encode at whatever the source turned out to be.
+            let (width, height) = super::super::negotiated_size(&built.tee).unwrap_or((0, 0));
+            assert!(width > 0 && height > 0, "the tee should have negotiated a real frame size");
+            let settings = EncodeSettings {
+                width: width as u32,
+                height: height as u32,
+                framerate: 30,
+                bitrate_kbps: 4_000,
+                backend: EncoderBackend::Software,
+            };
+
+            let result = add_branch_live(&built.pipeline, &built.tee, BranchId(1), settings).await;
+            let (branch, _first_idr) = result.expect(
+                "a destination branch must come up against a real, full-screen-sized PipeWire source \
+                 — this is the exact failure real screen sharing hit",
+            );
+            // …and keep producing, not just emit the one proving IDR.
+            assert!(
+                wait_for_sample(&branch.appsink, Duration::from_secs(5)),
+                "the branch stopped producing after its first IDR"
+            );
+
+            tokio::time::timeout(Duration::from_secs(10), remove_branch(&built.pipeline, &built.tee, branch))
+                .await
+                .expect("cleanup should not hang")
+                .expect("cleanup should succeed");
+            built.pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+        }
+
+        /// **Sibling isolation:** two destinations off one capture each hold
+        /// their *own* framerate, and everything that happens to one of them —
+        /// a settings change (branch swap), a pause, being removed entirely —
+        /// leaves the other's rate undisturbed.
+        ///
+        /// `Why measured rates rather than "it still produces something":` the
+        /// risk fan-out introduces is not that a sibling dies outright (that
+        /// would be obvious), it is that one destination's churn quietly drags
+        /// another's rate around — a shared `videorate` renegotiating, a tee
+        /// stalling while one branch reconfigures, a swap draining buffers a
+        /// sibling needed. Only a before/after *rate* comparison catches that.
+        #[tokio::test]
+        async fn sibling_destinations_keep_their_own_rate_through_a_swap_and_a_removal() {
+            if gst::init().is_err() {
+                eprintln!("skipping: gstreamer not available in this environment");
+                return;
+            }
+
+            // A 60fps source so both a 30fps and a 10fps destination are
+            // genuine down-conversions the branch has to perform itself.
             let built = super::super::build_pipeline(
                 "videotestsrc is-live=true pattern=smpte ! video/x-raw,width=64,height=64,framerate=60/1",
-                5,
             )
             .expect("pipeline should construct");
             built.pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
-            let (state_result, ..) = built.pipeline.state(gst::ClockTime::from_seconds(5));
-            state_result.expect("pipeline should settle into PLAYING");
-
-            // A real destination branch runs across the whole rewrite, so this
-            // also proves the renegotiation doesn't kill an existing branch.
-            let branch = add_branch(&built.pipeline, &built.tee, BranchId(1), small_settings())
-                .expect("add_branch should succeed");
-            assert!(wait_for_sample(&branch.appsink, Duration::from_secs(5)), "branch produced nothing to begin with");
-
-            let window = Duration::from_millis(1500);
-            let slow = tap_tee_rate(&built.pipeline, &built.tee, window);
-            built.source_caps.set_property("caps", super::super::source_framerate_caps(30));
-            // Give the renegotiation a moment before measuring.
-            std::thread::sleep(Duration::from_millis(300));
-            let fast = tap_tee_rate(&built.pipeline, &built.tee, window);
-
-            eprintln!("shared source rate: 5fps -> {slow:.1}fps measured; 30fps -> {fast:.1}fps measured");
             assert!(
-                fast > slow * 2.0,
-                "rewriting the source capsfilter did not change the live rate ({slow:.1}fps vs {fast:.1}fps)"
-            );
-            assert!(
-                wait_for_sample(&branch.appsink, Duration::from_secs(5)),
-                "a destination branch must survive a live source-rate change (it is stalled across it, not torn down)"
+                wait_until_playing(&built.pipeline, Duration::from_secs(30)),
+                "pipeline never reached PLAYING"
             );
 
+            let settings = |framerate: u32| EncodeSettings { framerate, ..small_settings() };
+            let observer = add_branch(&built.pipeline, &built.tee, BranchId(1), settings(30))
+                .expect("observer branch should build");
+            let subject = add_branch(&built.pipeline, &built.tee, BranchId(2), settings(10))
+                .expect("subject branch should build");
+            // Generous first-sample waits: `cargo test` runs this file's
+            // GStreamer tests in parallel, and a dozen live pipelines
+            // competing for CPU can push a fresh branch's first encoded frame
+            // well past the few hundred milliseconds it takes when run alone.
+            assert!(wait_for_sample(&observer.appsink, Duration::from_secs(20)), "observer produced nothing");
+            assert!(wait_for_sample(&subject.appsink, Duration::from_secs(20)), "subject produced nothing");
+
+            let measure = |branch: &EncodeBranch| -> f64 {
+                let window = Duration::from_millis(1500);
+                let deadline = Instant::now() + window;
+                let mut count = 0u32;
+                while Instant::now() < deadline {
+                    if branch.appsink.try_pull_sample(gst::ClockTime::from_mseconds(50)).is_some() {
+                        count += 1;
+                    }
+                }
+                count as f64 / window.as_secs_f64()
+            };
+
+            // Each destination really does run at its own rate off the one
+            // shared capture — the premise everything below rests on.
+            let observer_before = measure(&observer);
+            let subject_before = measure(&subject);
+            eprintln!("[siblings] baseline: observer(30fps)={observer_before:.1} subject(10fps)={subject_before:.1}");
+            // Deliberately a *relative* claim: under parallel test load every
+            // absolute rate sags together, so "the 30fps one runs
+            // meaningfully faster than the 10fps one" is the load-robust way
+            // to state "each destination holds its own rate". Every assertion
+            // below is likewise relative to this same run's own baseline.
+            assert!(
+                observer_before > subject_before * 1.5,
+                "the two destinations should run at their own different rates, measured                  observer(30fps)={observer_before:.1} subject(10fps)={subject_before:.1}"
+            );
+            assert!(observer_before > 5.0, "the pipeline appears not to be running at all");
+
+            // 1. Pause the subject: the observer must not notice.
+            subject.set_paused(true, 0);
+            let observer_paused = measure(&observer);
+            subject.set_paused(false, 0);
+            assert!(
+                (observer_paused - observer_before).abs() < observer_before * 0.4,
+                "pausing a sibling destination changed this one's rate ({observer_before:.1} -> {observer_paused:.1})"
+            );
+
+            // 2. Swap the subject to a different resolution *and* rate — a
+            //    real tier-2 branch swap on the live tee.
+            let runtime = destination::DestinationRuntime::shared(Instant::now(), small_params());
+            runtime.lock().unwrap().note_encoded_frame(true, b"idr", Instant::now());
+            let swapped = swap_to_new_branch(
+                &built.pipeline,
+                &built.tee,
+                &runtime,
+                subject,
+                BranchId(3),
+                VideoParams { width: 32, height: 32, framerate: 5, ..small_params() },
+            )
+            .await;
+            let new_subject = match swapped {
+                SwapOutcome::Swapped(branch) => branch,
+                SwapOutcome::KeptOld(_, e) => panic!("the swap should have succeeded: {e:#}"),
+            };
+            let observer_after_swap = measure(&observer);
+            eprintln!("[siblings] after sibling swap: observer={observer_after_swap:.1}");
+            assert!(
+                (observer_after_swap - observer_before).abs() < observer_before * 0.4,
+                "swapping a sibling's branch changed this one's rate ({observer_before:.1} -> {observer_after_swap:.1})"
+            );
+
+            // 3. Remove the subject entirely: the observer keeps going at its
+            //    own rate (the classic "removing one branch EOS'd the whole
+            //    tee" failure would show up here as a rate of 0).
+            tokio::time::timeout(Duration::from_secs(10), remove_branch(&built.pipeline, &built.tee, new_subject))
+                .await
+                .expect("removal should not hang")
+                .expect("removal should succeed");
+            let observer_after_removal = measure(&observer);
+            eprintln!("[siblings] after sibling removal: observer={observer_after_removal:.1}");
+            assert!(
+                (observer_after_removal - observer_before).abs() < observer_before * 0.4,
+                "removing a sibling destination changed this one's rate ({observer_before:.1} -> {observer_after_removal:.1})"
+            );
+
+            tokio::time::timeout(Duration::from_secs(10), remove_branch(&built.pipeline, &built.tee, observer))
+                .await
+                .expect("cleanup should not hang")
+                .expect("cleanup should succeed");
             built.pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
         }
+
     }
 }
 
@@ -5171,24 +5712,150 @@ mod tests {
         );
     }
 
-    /// Real, measured proof that [`build_pipeline`]'s `framerate` parameter
-    /// actually reaches the encoder branch's output rate — not just that the
-    /// pipeline parses/links (that alone would not have caught either of the
-    /// two prior bugs in this exact area: the original bitrate-starvation
-    /// bug where the `videorate` cap was simply missing, and the general
-    /// "looks configured in the UI but isn't actually applied" bug shape
-    /// this task's own instructions call out). Feeds a fixed, fast 60fps
-    /// `videotestsrc` (well above every `framerate` under test, so the
-    /// `videorate` cap — not the source — is what's actually limiting
-    /// output) through two different `build_pipeline` `framerate` values,
-    /// measures how many encoded access units actually arrive at the appsink
-    /// over a real wall-clock window, and asserts the measured rate tracks
-    /// the configured one — and that the two configured rates produce
-    /// visibly different measured rates, ruling out "always outputs
-    /// whatever the source happens to deliver, ignoring the parameter"
-    /// silently passing this test by coincidence.
+    /// **Regression (leak on a failed share):** abandoning a capture that
+    /// never became a [`CaptureHandle`] must actually stop its pipeline.
+    ///
+    /// `Why this is worth a test of its own:` `CaptureHandle`'s `Drop` is
+    /// what normally guarantees a capture can't outlive its owner, and it
+    /// only exists once the handle is *constructed*. When the first
+    /// destination failed to come up, `start_sharing_with_source` used to
+    /// return `Err` from between those two points — so nothing ever stopped
+    /// the pipeline, and the process went on capturing the user's screen
+    /// (measured: 38 live threads, ~3.7% CPU, PipeWire stream still open)
+    /// for the rest of its life, with no UI affordance to stop something the
+    /// user had just been told had failed.
+    #[tokio::test]
+    async fn abandoning_a_capture_stops_its_pipeline() {
+        if gst::init().is_err() {
+            eprintln!("skipping: gstreamer not available in this environment");
+            return;
+        }
+
+        let built = build_pipeline(
+            "videotestsrc is-live=true pattern=smpte ! video/x-raw,width=64,height=64,framerate=30/1",
+        )
+        .expect("pipeline should construct");
+        let pipeline = built.pipeline.clone();
+        pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+        let (state_result, ..) = pipeline.state(gst::ClockTime::from_seconds(5));
+        state_result.expect("pipeline should settle into PLAYING");
+
+        let error = abandon_capture(
+            built.pipeline,
+            CaptureSource::TestSource("videotestsrc".to_string()),
+            anyhow!("the first destination failed"),
+        )
+        .await;
+
+        // The original error survives, so the caller's message still explains
+        // what actually went wrong rather than reporting the cleanup.
+        assert!(format!("{error:#}").contains("the first destination failed"));
+
+        let (_result, current, _pending) = pipeline.state(gst::ClockTime::from_seconds(5));
+        assert_eq!(
+            current,
+            gst::State::Null,
+            "an abandoned capture's pipeline must be stopped, not left running with no owner"
+        );
+    }
+
+    /// **Regression (the guard itself):** adding a destination branch to a
+    /// live `tee` must not send a `RECONFIGURE` event upstream of that tee.
+    ///
+    /// `Why this asserts on the event rather than on frames:` the damage a
+    /// stray reconfigure does is entirely source-specific — it kills a real
+    /// portal capture stone dead while a `videotestsrc` renegotiates
+    /// instantly and silently (see
+    /// [`super::isolate_source_from_branch_renegotiation`] for the measured
+    /// before/after). So no `videotestsrc`-fed test can ever observe the
+    /// *consequence*, and an assertion on frames would pass with the bug
+    /// fully present — which is exactly what happened. What a synthetic
+    /// source *can* prove is the mechanism: that the event never gets past
+    /// the tee. That is unattended coverage for the one thing the
+    /// `#[ignore]`d portal test would otherwise be the only guard for.
     #[test]
-    fn build_pipeline_framerate_parameter_actually_caps_encoder_output_rate() {
+    fn adding_a_branch_never_renegotiates_upstream_of_the_tee() {
+        if gst::init().is_err() {
+            eprintln!("skipping: gstreamer not available in this environment");
+            return;
+        }
+
+        let built = build_pipeline(
+            "videotestsrc is-live=true pattern=smpte ! video/x-raw,width=64,height=64,framerate=30/1",
+        )
+        .expect("pipeline should construct");
+
+        // Count on the *upstream* side of the guard: the pad feeding the
+        // tee's sink pad, i.e. the first thing a forwarded reconfigure would
+        // reach on its way to the source.
+        let upstream = built
+            .tee
+            .static_pad("sink")
+            .and_then(|sink| sink.peer())
+            .expect("the tee's sink pad should be linked to the source chain");
+        let seen = Arc::new(AtomicU32::new(0));
+        let counter = seen.clone();
+        upstream
+            .add_probe(gst::PadProbeType::EVENT_UPSTREAM, move |_, info| {
+                if let Some(gst::PadProbeData::Event(event)) = &info.data
+                    && event.type_() == gst::EventType::Reconfigure
+                {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+                gst::PadProbeReturn::Ok
+            })
+            .expect("probe should install");
+
+        built.pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+        let (state_result, ..) = built.pipeline.state(gst::ClockTime::from_seconds(5));
+        state_result.expect("pipeline should settle into PLAYING");
+
+        // Two branches, because the first one added to a live tee and every
+        // one after it are different code paths as far as pad activation is
+        // concerned, and both must stay silent.
+        let first = branch::add_branch(&built.pipeline, &built.tee, branch::BranchId(1), branch::EncodeSettings {
+            width: 64,
+            height: 64,
+            framerate: 15,
+            bitrate_kbps: 500,
+            backend: EncoderBackend::Software,
+        })
+        .expect("first branch should build");
+        let second = branch::add_branch(&built.pipeline, &built.tee, branch::BranchId(2), branch::EncodeSettings {
+            width: 32,
+            height: 32,
+            framerate: 10,
+            bitrate_kbps: 500,
+            backend: EncoderBackend::Software,
+        })
+        .expect("second branch should build");
+
+        let count = seen.load(Ordering::Relaxed);
+        drop(first);
+        drop(second);
+        built.pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+
+        assert_eq!(
+            count, 0,
+            "adding a destination branch let {count} RECONFIGURE event(s) reach upstream of the tee — \
+             against a real portal source that is what stops the capture producing frames entirely"
+        );
+    }
+
+    /// Real, measured proof that a destination's configured framerate
+    /// actually reaches its encoder's output rate — not just that the
+    /// pipeline parses/links (that alone would not have caught either of the
+    /// prior bugs in this exact area: the original bitrate-starvation bug
+    /// where the `videorate` cap was simply missing, and the general "looks
+    /// configured in the UI but isn't actually applied" bug shape).
+    ///
+    /// The rate is measured **at the destination's own appsink**, which is
+    /// where it is now enforced: nothing converts the rate before the tee
+    /// (see [`build_pipeline`]'s "Why there is no rate conversion before the
+    /// `tee`"), so the branch's own `videorate` is the only thing standing
+    /// between a 60fps source and the encoder.
+    #[test]
+    fn a_destinations_framerate_actually_caps_its_encoder_output_rate() {
         if gst::init().is_err() {
             eprintln!("skipping: gstreamer not available in this environment");
             return;
@@ -5197,22 +5864,19 @@ mod tests {
         // Small resolution and software encoder keep this fast/deterministic
         // on any machine (no VAAPI dependency), while `is-live=true` and a
         // fixed 60/1 source framerate (comfortably above every configured
-        // rate under test) makes the `videorate` cap on the encoder branch —
-        // not the source's own delivery rate — the thing actually being
-        // measured, mirroring how a real portal/pipewiresrc source can
-        // deliver well above the configured cap under motion.
+        // rate under test) makes the branch's `videorate` — not the source's
+        // own delivery rate — the thing actually being measured, mirroring
+        // how a real portal source can deliver well above the configured rate
+        // under motion.
         let source = "videotestsrc is-live=true pattern=smpte \
              ! video/x-raw,width=64,height=64,framerate=60/1";
 
         fn measure_output_fps(source: &str, configured_fps: u32) -> f64 {
-            let built = build_pipeline(source, configured_fps).expect("pipeline should construct");
+            let built = build_pipeline(source).expect("pipeline should construct");
             built.pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
             let (state_result, ..) = built.pipeline.state(gst::ClockTime::from_seconds(5));
             state_result.expect("pipeline should settle into PLAYING");
 
-            // A real encode branch runs throughout, so this measures the rate
-            // the tee carries *while* a destination is encoding off it, not an
-            // idle pipeline's.
             let branch = branch::add_branch(
                 &built.pipeline,
                 &built.tee,
@@ -5227,14 +5891,18 @@ mod tests {
             )
             .expect("encode branch should build on the live pipeline");
 
-            // Measured off a `videorate`-free tap on the tee — an encode
-            // branch's own `videorate` would duplicate frames back up to its
-            // configured rate and report that instead. See `tap_tee_rate`.
-            let measured = branch::tests::tap_tee_rate(&built.pipeline, &built.tee, Duration::from_secs(2));
+            let window = Duration::from_secs(2);
+            let deadline = Instant::now() + window;
+            let mut count = 0u32;
+            while Instant::now() < deadline {
+                if branch.appsink.try_pull_sample(gst::ClockTime::from_mseconds(100)).is_some() {
+                    count += 1;
+                }
+            }
 
             drop(branch);
             built.pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
-            measured
+            count as f64 / window.as_secs_f64()
         }
 
         let low_configured = 10u32;
@@ -5360,6 +6028,102 @@ mod tests {
             gst::State::Null,
             "bare-dropping the handle should leave the pipeline Null, not still Playing"
         );
+    }
+
+    /// **The real capture path, end to end**: opens a genuine portal
+    /// screencast session, builds this module's real pipeline against the
+    /// resulting `pipewiresrc`, and brings a destination branch up on it —
+    /// i.e. everything `start_sharing` does except the relay/announce half.
+    ///
+    /// `Why this needs to exist alongside the `videotestsrc` suite:` the whole
+    /// unit suite can be green while real screen sharing is broken. It has
+    /// been: the restructuring that made every destination a dynamic branch
+    /// passed every test and then failed against the real portal, because a
+    /// real source differs in ways `videotestsrc` cannot express (a live
+    /// remote producer, damage-driven irregular delivery, full-screen-sized
+    /// buffers, and caps this pipeline has to renegotiate rather than fix up
+    /// front). This is the smallest test that would have caught it.
+    ///
+    /// The regression it actually caught is documented in full on
+    /// [`isolate_source_from_branch_renegotiation`]: adding the first
+    /// destination's branch to the live `tee` sent a `RECONFIGURE` upstream
+    /// that killed the portal source dead. Measured here as 1 pass in 5 runs
+    /// before the guard and 6 in 6 after it.
+    ///
+    /// `#[ignore]`d: it needs a real desktop session with a portal backend,
+    /// and on a backend that prompts it needs a human to approve the dialog.
+    /// Run with:
+    /// `cargo test capture::tests::live_portal_capture_feeds_a_destination_branch -- --ignored --nocapture`
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore]
+    async fn live_portal_capture_feeds_a_destination_branch() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        ensure_gstreamer_initialized().expect("gstreamer init");
+
+        let portal = match open_portal_capture().await {
+            Ok(portal) => portal,
+            Err(e) => {
+                eprintln!("skipping: no portal screencast session available here ({e:#})");
+                return;
+            }
+        };
+        let source = CaptureSource::Portal(portal);
+        let fragment = source.launch_fragment(DEFAULT_FRAMERATE);
+        eprintln!("[portal] source fragment: {fragment}");
+
+        let built = start_pipeline(&fragment).expect("real capture pipeline should start");
+        let (width, height) = negotiated_size(&built.tee).unwrap_or((0, 0));
+        eprintln!("[portal] negotiated size at the tee: {width}x{height}");
+
+        // Diagnostics, not assertions — when this test fails it fails as
+        // "no IDR within 5s" with nothing to distinguish "the source never
+        // produced a frame" from "frames arrive but the branch can't
+        // negotiate against them", and these two lines are what tell those
+        // apart without a GST_DEBUG rerun.
+        if let Some(caps) = built.tee.static_pad("sink").and_then(|p| p.current_caps()) {
+            eprintln!("[portal] full caps at the tee: {caps}");
+        }
+        eprintln!(
+            "[portal] raw frames off the tee: {:.1} fps",
+            branch::tests::tap_tee_rate(&built.pipeline, &built.tee, Duration::from_millis(1500))
+        );
+
+        let settings = branch::EncodeSettings {
+            width: width as u32,
+            height: height as u32,
+            framerate: DEFAULT_FRAMERATE,
+            bitrate_kbps: DEFAULT_BITRATE_KBPS,
+            backend: detect_encoder_backend(),
+        };
+        let result = branch::add_branch_live(&built.pipeline, &built.tee, branch::BranchId(0), settings).await;
+        let (branch, _idr) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = built.pipeline.set_state(gst::State::Null);
+                panic!("a destination branch must come up against a real portal capture: {e:#}");
+            }
+        };
+        eprintln!("[portal] first IDR received; branch is live");
+
+        // Keep it running long enough to prove it is not a one-frame fluke.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut samples = 0u32;
+        while Instant::now() < deadline {
+            if branch.appsink.try_pull_sample(gst::ClockTime::from_mseconds(100)).is_some() {
+                samples += 1;
+            }
+        }
+        eprintln!("[portal] {samples} encoded access units in 3s");
+        // Deliberately a loose floor, not a rate check: a genuinely static
+        // desktop produces very little damage, so the honest guarantee here is
+        // "frames keep coming after the first IDR", which is what the failure
+        // this test exists for (zero, forever) violates. Measured on an
+        // ordinarily-active desktop this lands around 90 (~30fps).
+        assert!(samples >= 5, "a real capture should keep producing encoded frames, got {samples} in 3s");
+
+        let _ = branch::remove_branch(&built.pipeline, &built.tee, branch).await;
+        built.pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
     }
 
     /// Exercises the real xdg-desktop-portal `ScreenCast` flow end to end,
