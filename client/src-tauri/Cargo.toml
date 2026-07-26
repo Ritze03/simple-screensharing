@@ -12,8 +12,18 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tokio = { version = "1", features = ["rt", "time", "macros"] }
+rust-i18n = "4.2.1"
+
+# `AppState::drain_events` needs an `&egui::Context` — see `state.rs`'s doc
+# comment for why an unshown one is created here rather than modifying
+# `session.rs`'s signature.
+egui = "0.33.3"
 
 # Reuse the existing backend crate's `[lib]` target as-is (networking,
 # capture, decode, encryption, bandwidth allocation) — no logic changes,
 # see ../src/lib.rs for what it exports.
 simple-screensharing-client = { path = ".." }
+
+[dev-dependencies]
+tempfile = "3"
