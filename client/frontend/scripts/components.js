@@ -127,7 +127,11 @@
   // -------------------------------------------------------------------
 
   /**
-   * @param {object} room - { id, name, state: 'joined'|'disconnected'|'reconnecting', activeCount, members: [{name, resolution, fps, watching}] }
+   * @param {object} room - a `SavedRoomRow` DTO shape { name, join_string, state:
+   *   'joined'|'disconnected'|'reconnecting', room_handle, active_stream_count },
+   *   plus a frontend-only `members` array (fetched separately via `room_detail` —
+   *   no single DTO inlines both): [{conn_id, display_name, owner, stream_id,
+   *   resolution, fps, watching}].
    * @param {object} handlers - { expanded, onToggleExpand, onReconnect, onLeave, onWatch }
    */
   function renderRoomRow(room, handlers) {
@@ -141,7 +145,7 @@
       head.appendChild(
         el("button", {
           className: "room-caret",
-          onClick: () => handlers.onToggleExpand && handlers.onToggleExpand(room.id),
+          onClick: () => handlers.onToggleExpand && handlers.onToggleExpand(room.join_string),
           attrs: { "aria-label": expanded ? "Collapse" : "Expand" },
         }, [icon(expanded ? "expand_more" : "chevron_right")])
       );
@@ -162,15 +166,15 @@
     // documented deviation from the mock, not a missed detail.
     const trailing = el("div", { className: "room-row-trailing" });
     if (room.state === "joined") {
-      trailing.appendChild(el("span", { className: "room-meta", text: room.activeCount + " active" }));
-      trailing.appendChild(iconButton("close", () => handlers.onLeave && handlers.onLeave(room.id), { title: "Leave room" }));
+      trailing.appendChild(el("span", { className: "room-meta", text: room.active_stream_count + " active" }));
+      trailing.appendChild(iconButton("close", () => handlers.onLeave && handlers.onLeave(room.join_string), { title: "Leave room" }));
     } else if (room.state === "reconnecting") {
       // Per APP-SHELL.md's row-state table, "Reconnecting" has no body text
       // at all (—) — the pulsing dot alone carries the state.
       trailing.appendChild(secondaryButton("Reconnect", () => {}, { disabled: true, className: "room-reconnect-btn" }));
     } else {
-      trailing.appendChild(secondaryButton("Reconnect", () => handlers.onReconnect && handlers.onReconnect(room.id), { className: "room-reconnect-btn" }));
-      trailing.appendChild(iconButton("close", () => handlers.onLeave && handlers.onLeave(room.id), { title: "Forget room" }));
+      trailing.appendChild(secondaryButton("Reconnect", () => handlers.onReconnect && handlers.onReconnect(room.join_string), { className: "room-reconnect-btn" }));
+      trailing.appendChild(iconButton("close", () => handlers.onLeave && handlers.onLeave(room.join_string), { title: "Forget room" }));
     }
     head.appendChild(trailing);
     row.appendChild(head);
@@ -183,7 +187,7 @@
       const memberList = el("div", { className: "room-members" });
       (room.members || []).forEach((m) => {
         const memberRow = el("div", { className: "room-member-row" });
-        memberRow.appendChild(el("span", { className: "room-member-name", text: m.name }));
+        memberRow.appendChild(el("span", { className: "room-member-name", text: m.display_name }));
         memberRow.appendChild(
           el("span", {
             className: "room-member-caps",
@@ -191,7 +195,7 @@
           })
         );
         memberRow.appendChild(
-          iconButton(m.watching ? "visibility" : "play_arrow", () => handlers.onWatch && handlers.onWatch(room.id, m.name), {
+          iconButton(m.watching ? "visibility" : "play_arrow", () => handlers.onWatch && handlers.onWatch(room.join_string, m), {
             title: m.watching ? "Watching" : "Watch",
             className: m.watching ? "watch-active" : "",
           })
@@ -211,14 +215,19 @@
   // Stream row — the sidebar STREAMS section's per-destination row.
   // -------------------------------------------------------------------
 
-  /** @param {object} stream - { roomLabel, resolution, fps, isAudio } */
+  /**
+   * @param {object} stream - a `DestinationRow` DTO shape { kind: 'video'|'audio',
+   *   width, height, framerate }, plus a frontend-only `room_label` (looked up from
+   *   the room's `SavedRoomRow.name` by `room_handle` — `DestinationRow` itself only
+   *   carries the numeric handle, not a display name).
+   */
   function renderStreamRow(stream) {
     const row = el("div", { className: "stream-row" });
-    if (stream.isAudio) row.appendChild(icon("volume_up", "stream-audio-glyph"));
+    if (stream.kind === "audio") row.appendChild(icon("volume_up", "stream-audio-glyph"));
     row.appendChild(
       el("span", {
         className: "stream-label",
-        text: `${stream.roomLabel}: ${stream.resolution}@${stream.fps}`,
+        text: `${stream.room_label}: ${stream.width}x${stream.height}@${stream.framerate}`,
       })
     );
     return row;
@@ -299,14 +308,17 @@
   /**
    * Bandwidth-mode-specific convenience wrapper over `pillSwitch`, per
    * stream-control.md's "Absolute Maximum" / "Per-Stream Maximum" naming.
-   * @param {'absolute'|'per-stream'} mode
-   * @param {(mode: 'absolute'|'per-stream') => void} onChange
+   * Values match `dto::bandwidth_mode_str`'s wire strings exactly
+   * ("absolute" / "per_stream", underscore — not the "per-stream" hyphen
+   * this file used before it was wired to the real DTO).
+   * @param {'absolute'|'per_stream'} mode
+   * @param {(mode: 'absolute'|'per_stream') => void} onChange
    */
   function bandwidthModeToggle(mode, onChange) {
     return pillSwitch(
       [
         { value: "absolute", label: "Absolute Maximum" },
-        { value: "per-stream", label: "Per-Stream Maximum" },
+        { value: "per_stream", label: "Per-Stream Maximum" },
       ],
       mode,
       onChange
@@ -323,12 +335,16 @@
   // -------------------------------------------------------------------
 
   /**
-   * @param {object} dest - { id, roomId, roomLabel, state: 'starting'|'live'|'rebuilding'|'stalled'|'failed',
-   *   resolution, fps, bitrateKbps, isAudio, pendingRoleText, computedShareKbps }
-   * @param {object} handlers - { onEditApply(id, {bitrateKbps}), onTransfer(id, roomId),
-   *   onFanout(id, roomId), onStop(id) }
+   * @param {object} dest - a `DestinationRow` DTO shape { destination_id, capture_id,
+   *   room_handle, kind: 'video'|'audio', state: 'starting'|'live'|'rebuilding'|
+   *   'stalled'|'failed', width, height, framerate, bitrate_kbps, pending }, plus
+   *   frontend-only `room_label` (looked up by `room_handle`), `pendingRoleText`
+   *   (derived from `pending`) and `computedShareKbps` (Absolute-mode allocator
+   *   display, not part of any DTO).
+   * @param {object} handlers - { onEditApply(destinationId, {bitrateKbps}), onTransfer(destinationId, roomHandle),
+   *   onFanout(captureId, roomHandle), onStop(destinationId) }
    * @param {object} [opts] - { roomOptions: [{id,name}], perStreamBitrateEditable: bool,
-   *   roomsAlreadyFedByCapture: string[] }
+   *   roomsAlreadyFedByCapture: number[] }
    */
   function destinationCard(dest, handlers, opts) {
     handlers = handlers || {};
@@ -345,8 +361,8 @@
 
     const head = el("div", { className: "dest-card-head" });
     head.appendChild(statusDot(dest.state));
-    if (dest.isAudio) head.appendChild(icon("volume_up", "stream-audio-glyph"));
-    head.appendChild(el("span", { className: "dest-room-label", text: dest.roomLabel }));
+    if (dest.kind === "audio") head.appendChild(icon("volume_up", "stream-audio-glyph"));
+    head.appendChild(el("span", { className: "dest-room-label", text: dest.room_label }));
     head.appendChild(
       el("span", {
         className: "dest-state-badge dest-state-badge-" + dest.state,
@@ -359,7 +375,7 @@
       wrap.appendChild(el("div", { className: "dest-pending-role", text: dest.pendingRoleText }));
     }
 
-    wrap.appendChild(el("div", { className: "dest-meta", text: `${dest.resolution} @ ${dest.fps}fps` }));
+    wrap.appendChild(el("div", { className: "dest-meta", text: `${dest.width}x${dest.height} @ ${dest.framerate}fps` }));
 
     // Inline bitrate edit — only meaningful in Per-Stream mode (Absolute
     // mode's allocator owns the live bitrate; showing a manual field there
@@ -371,14 +387,14 @@
       editRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Bitrate (kbps)" }));
       const slider = el("input", {
         className: "dest-bitrate-slider",
-        attrs: { type: "range", min: "200", max: "40000", step: "100", value: String(dest.bitrateKbps) },
+        attrs: { type: "range", min: "200", max: "40000", step: "100", value: String(dest.bitrate_kbps) },
       });
-      const value = el("span", { className: "dest-bitrate-value", text: dest.bitrateKbps + " kbps" });
+      const value = el("span", { className: "dest-bitrate-value", text: dest.bitrate_kbps + " kbps" });
       slider.addEventListener("input", () => {
         value.textContent = slider.value + " kbps";
       });
       slider.addEventListener("change", () => {
-        handlers.onEditApply && handlers.onEditApply(dest.id, { bitrateKbps: Number(slider.value) });
+        handlers.onEditApply && handlers.onEditApply(dest.destination_id, { bitrateKbps: Number(slider.value) });
       });
       editRow.appendChild(slider);
       editRow.appendChild(value);
@@ -389,13 +405,13 @@
 
     const actions = el("div", { className: "dest-actions" });
 
-    const roomOptions = (opts.roomOptions || []).filter((r) => r.id !== dest.roomId);
+    const roomOptions = (opts.roomOptions || []).filter((r) => r.id !== dest.room_handle);
     if (roomOptions.length > 0) {
       const transferSelect = el("select", { className: "dest-room-select" });
       roomOptions.forEach((r) => transferSelect.appendChild(el("option", { text: r.name, attrs: { value: r.id } })));
       actions.appendChild(transferSelect);
       actions.appendChild(
-        secondaryButton("Transfer", () => handlers.onTransfer && handlers.onTransfer(dest.id, transferSelect.value), {
+        secondaryButton("Transfer", () => handlers.onTransfer && handlers.onTransfer(dest.destination_id, Number(transferSelect.value)), {
           className: "dest-action-btn",
         })
       );
@@ -406,14 +422,14 @@
         fanoutOptions.forEach((r) => fanoutSelect.appendChild(el("option", { text: r.name, attrs: { value: r.id } })));
         actions.appendChild(fanoutSelect);
         actions.appendChild(
-          secondaryButton("Also send to…", () => handlers.onFanout && handlers.onFanout(dest.id, fanoutSelect.value), {
+          secondaryButton("Also send to…", () => handlers.onFanout && handlers.onFanout(dest.capture_id, Number(fanoutSelect.value)), {
             className: "dest-action-btn",
           })
         );
       }
     }
 
-    actions.appendChild(dangerButton("Stop", () => handlers.onStop && handlers.onStop(dest.id), { className: "dest-action-btn" }));
+    actions.appendChild(dangerButton("Stop", () => handlers.onStop && handlers.onStop(dest.destination_id), { className: "dest-action-btn" }));
     wrap.appendChild(actions);
 
     return wrap;
