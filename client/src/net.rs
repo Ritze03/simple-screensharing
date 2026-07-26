@@ -48,9 +48,9 @@
 //! multiplexes them on a single UDP socket with a single I/O driver task.
 //! Building one per connection (which is what this module used to do) burned
 //! a socket + driver task per room and made every room's connection
-//! independently configurable by accident. The caller (`ui.rs`'s `App`,
-//! `tui.rs`'s `App`) builds exactly one at construction and hands it to every
-//! `connect()` call, which is what makes multi-room joins cheap.
+//! independently configurable by accident. The caller (`ui.rs`'s `App`)
+//! builds exactly one at construction and hands it to every `connect()`
+//! call, which is what makes multi-room joins cheap.
 //!
 //! `capture.rs` (sending) will use `ScreenshareClient::connection()` +
 //! `nonce_sequence()` + `room_key()` together with `encrypt_frame` and
