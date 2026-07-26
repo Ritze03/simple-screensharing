@@ -81,7 +81,17 @@ pub fn spawn(app_handle: AppHandle) {
 
 fn tick(app_handle: &AppHandle, last: &mut Snapshot) {
     let managed = app_handle.state::<Managed>();
-    let mut state = managed.state.lock().unwrap();
+    // `Why:` recover the inner value on a poisoned lock instead of
+    // propagating the poison with `.unwrap()`. This loop runs forever on its
+    // own background task (see `spawn` above) — if some *other* lock holder
+    // ever panics while holding `managed.state` (any of the `#[tauri::command]`
+    // handlers in `commands.rs`, all of which also lock it), the mutex is left
+    // poisoned but `AppState`'s data is still perfectly readable; there is no
+    // invariant here that a caller-side panic could have left half-applied.
+    // Propagating the poison would just kill this polling loop too — every
+    // room's presence/event draining, capture-state polling, etc. — turning
+    // one unrelated panic into two failures instead of one.
+    let mut state = managed.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
     // 1. Connect attempts.
     match state.poll_connect_result() {
