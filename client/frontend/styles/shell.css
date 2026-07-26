@@ -282,6 +282,110 @@ input {
   }
 }
 
+/* Destination states (Stream Control's Active Shares) — same `.status-dot`
+   base, different fills/animations. `starting`/`rebuilding` share the
+   room-row's pulse animation (both are "something is happening, wait");
+   `stalled` reuses the hollow-ring treatment `disconnected` already
+   established. */
+.status-dot-live {
+  background: var(--success);
+}
+
+.status-dot-starting {
+  background: var(--accent);
+  animation: pulse-dot 1.4s ease-in-out infinite;
+}
+
+.status-dot-rebuilding {
+  background: var(--warning);
+  animation: pulse-dot 1.4s ease-in-out infinite;
+}
+
+.status-dot-stalled {
+  background: transparent;
+  border: 1.5px solid var(--warning);
+  width: calc(var(--dot-size) - 3px);
+  height: calc(var(--dot-size) - 3px);
+}
+
+.status-dot-failed {
+  background: var(--danger);
+}
+
+/* -------------------------------------------------------------------
+ * Card — generic equal-width section container, shared by Stream Control /
+ * View / Settings tab content. See components.js's `card()` doc comment for
+ * why this replaced `.tab-placeholder-card`'s content-sized/max-width shape.
+ * ----------------------------------------------------------------- */
+
+.card {
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--rounding);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+
+.card-label {
+  margin: 0 0 2px;
+}
+
+/* -------------------------------------------------------------------
+ * Warning banner — mirrors `theme::warning_banner` (bandwidth overshoot).
+ * ----------------------------------------------------------------- */
+
+.warning-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: rgba(232, 163, 61, 0.12);
+  border: 1px solid var(--warning);
+  border-radius: var(--rounding-sm);
+  padding: 8px 12px;
+  color: var(--warning);
+  font-size: 12px;
+}
+
+.warning-banner-icon {
+  font-size: 18px;
+  flex: 0 0 auto;
+}
+
+/* -------------------------------------------------------------------
+ * Mode toggle / pill switch — bandwidth mode, settings language switcher.
+ * ----------------------------------------------------------------- */
+
+.mode-toggle {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.mode-toggle-btn {
+  border: 1px solid var(--btn-border);
+  background: transparent;
+  color: var(--text-dim);
+  border-radius: var(--rounding-sm);
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.mode-toggle-btn:hover {
+  background: var(--wash-hover-1);
+  color: var(--text);
+}
+
+.mode-toggle-btn-active,
+.mode-toggle-btn-active:hover {
+  background: var(--pill-accent-bg);
+  border-color: var(--accent);
+  color: var(--text);
+}
+
 /* -------------------------------------------------------------------
  * "+ Add Room"
  * ----------------------------------------------------------------- */

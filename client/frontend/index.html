@@ -7,6 +7,9 @@
   <link rel="stylesheet" href="styles/tokens.css" />
   <link rel="stylesheet" href="styles/fonts.css" />
   <link rel="stylesheet" href="styles/shell.css" />
+  <link rel="stylesheet" href="styles/stream-control.css" />
+  <link rel="stylesheet" href="styles/view.css" />
+  <link rel="stylesheet" href="styles/settings.css" />
 </head>
 <body>
   <div class="app">
@@ -41,27 +44,17 @@
     <main class="content">
       <section class="tab-panel" data-tab="Stream Control">
         <h2>Stream Control</h2>
-        <div class="tab-placeholder-card">
-          Stream Control tab content goes here — bandwidth mode, start-a-stream picker,
-          and active-shares list (see <code>superdoc/features/stream-control.md</code>).
-          This is a placeholder proving the shell's nav-switching mechanism; another
-          worker builds the real feature set here.
-        </div>
+        <div id="stream-control-root"></div>
       </section>
 
       <section class="tab-panel" data-tab="View" hidden>
         <h2>View</h2>
-        <div class="view-empty-state">
-          Nobody's on screen right now — pick someone from a room in the sidebar and click Watch.
-        </div>
+        <div id="view-root"></div>
       </section>
 
       <section class="tab-panel" data-tab="Settings" hidden>
         <h2>Settings</h2>
-        <div class="tab-placeholder-card">
-          Settings tab content goes here — language toggle, presentation-mode dropdown.
-          Placeholder only; real content is another worker's scope.
-        </div>
+        <div id="settings-root"></div>
       </section>
     </main>
   </div>
@@ -70,5 +63,8 @@
 
   <script src="scripts/components.js"></script>
   <script src="scripts/shell.js"></script>
+  <script src="scripts/stream-control.js"></script>
+  <script src="scripts/view.js"></script>
+  <script src="scripts/settings.js"></script>
 </body>
 </html>

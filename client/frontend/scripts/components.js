@@ -234,6 +234,191 @@
     return wrap;
   }
 
+  // -------------------------------------------------------------------
+  // Card — a generic, equal-width section container. Added for the Stream
+  // Control / View / Settings tab content: `.tab-placeholder-card` (shell.css)
+  // was a one-off for the nav-switcher proof and capped itself at
+  // `--panel-max-width`, which is exactly the "content-sized card" shape the
+  // Stream Control redesign is fixing. `.card` has no width opinion of its
+  // own — the caller's grid/flex container decides equal-width sizing (see
+  // `stream-control.css`'s `.sc-grid`), so a card never reverts to shrinking
+  // to fit its content.
+  // -------------------------------------------------------------------
+
+  /**
+   * @param {string|null} label - section-label heading text, or null/'' for no heading.
+   * @param {Element[]} children
+   * @param {object} [opts] - { className }
+   */
+  function card(label, children, opts) {
+    opts = opts || {};
+    const c = el("div", { className: "card" + (opts.className ? " " + opts.className : "") });
+    if (label) c.appendChild(el("div", { className: "section-label card-label", text: label }));
+    (children || []).forEach((ch) => ch && c.appendChild(ch));
+    return c;
+  }
+
+  // -------------------------------------------------------------------
+  // Warning banner — mirrors `theme::warning_banner` (stream-control.md's
+  // bandwidth-overshoot banner: WARNING-stroked, tinted background).
+  // -------------------------------------------------------------------
+
+  function warningBanner(text) {
+    return el("div", { className: "warning-banner" }, [
+      icon("warning", "warning-banner-icon"),
+      el("span", { className: "warning-banner-text", text }),
+    ]);
+  }
+
+  // -------------------------------------------------------------------
+  // Two-option pill switch — mirrors `theme.rs`'s use of a `selectable_label`
+  // pair for exclusive two-choice pickers (the bandwidth mode toggle, the
+  // Settings tab's language switcher). One shared implementation so both
+  // call sites don't drift into near-copies of each other.
+  // -------------------------------------------------------------------
+
+  /**
+   * @param {{value: string, label: string}[]} options
+   * @param {string} value - currently selected option's `value`
+   * @param {(value: string) => void} onChange
+   */
+  function pillSwitch(options, value, onChange) {
+    const wrap = el("div", { className: "mode-toggle" });
+    options.forEach((opt) => {
+      wrap.appendChild(
+        el("button", {
+          className: "mode-toggle-btn" + (opt.value === value ? " mode-toggle-btn-active" : ""),
+          text: opt.label,
+          onClick: () => onChange(opt.value),
+        })
+      );
+    });
+    return wrap;
+  }
+
+  /**
+   * Bandwidth-mode-specific convenience wrapper over `pillSwitch`, per
+   * stream-control.md's "Absolute Maximum" / "Per-Stream Maximum" naming.
+   * @param {'absolute'|'per-stream'} mode
+   * @param {(mode: 'absolute'|'per-stream') => void} onChange
+   */
+  function bandwidthModeToggle(mode, onChange) {
+    return pillSwitch(
+      [
+        { value: "absolute", label: "Absolute Maximum" },
+        { value: "per-stream", label: "Per-Stream Maximum" },
+      ],
+      mode,
+      onChange
+    );
+  }
+
+  // -------------------------------------------------------------------
+  // Destination card — the Stream Control tab's Active Shares entry. One of
+  // these per outgoing destination, across every room (cross-room, per
+  // APP-SHELL.md's STREAMS-section rationale). Deliberately dumb: it renders
+  // whatever fields/state the caller hands it and calls back through
+  // `handlers` for every action, so a later worker swapping mock state for
+  // real `invoke()` results only needs to change the caller, not this markup.
+  // -------------------------------------------------------------------
+
+  /**
+   * @param {object} dest - { id, roomId, roomLabel, state: 'starting'|'live'|'rebuilding'|'stalled'|'failed',
+   *   resolution, fps, bitrateKbps, isAudio, pendingRoleText, computedShareKbps }
+   * @param {object} handlers - { onEditApply(id, {bitrateKbps}), onTransfer(id, roomId),
+   *   onFanout(id, roomId), onStop(id) }
+   * @param {object} [opts] - { roomOptions: [{id,name}], perStreamBitrateEditable: bool,
+   *   roomsAlreadyFedByCapture: string[] }
+   */
+  function destinationCard(dest, handlers, opts) {
+    handlers = handlers || {};
+    opts = opts || {};
+    const STATE_LABEL = {
+      starting: "Starting",
+      live: "Live",
+      rebuilding: "Applying…",
+      stalled: "Waiting for capture…",
+      failed: "Failed",
+    };
+
+    const wrap = el("div", { className: "dest-card dest-card-" + dest.state });
+
+    const head = el("div", { className: "dest-card-head" });
+    head.appendChild(statusDot(dest.state));
+    if (dest.isAudio) head.appendChild(icon("volume_up", "stream-audio-glyph"));
+    head.appendChild(el("span", { className: "dest-room-label", text: dest.roomLabel }));
+    head.appendChild(
+      el("span", {
+        className: "dest-state-badge dest-state-badge-" + dest.state,
+        text: STATE_LABEL[dest.state] || dest.state,
+      })
+    );
+    wrap.appendChild(head);
+
+    if (dest.pendingRoleText) {
+      wrap.appendChild(el("div", { className: "dest-pending-role", text: dest.pendingRoleText }));
+    }
+
+    wrap.appendChild(el("div", { className: "dest-meta", text: `${dest.resolution} @ ${dest.fps}fps` }));
+
+    // Inline bitrate edit — only meaningful in Per-Stream mode (Absolute
+    // mode's allocator owns the live bitrate; showing a manual field there
+    // would be a control whose input is silently overwritten, per
+    // stream-control.md's "Absolute mode ... allocator writes live bitrates
+    // straight into the encoders without ever touching the manual values").
+    if (opts.perStreamBitrateEditable) {
+      const editRow = el("div", { className: "dest-edit-row" });
+      editRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Bitrate (kbps)" }));
+      const slider = el("input", {
+        className: "dest-bitrate-slider",
+        attrs: { type: "range", min: "200", max: "40000", step: "100", value: String(dest.bitrateKbps) },
+      });
+      const value = el("span", { className: "dest-bitrate-value", text: dest.bitrateKbps + " kbps" });
+      slider.addEventListener("input", () => {
+        value.textContent = slider.value + " kbps";
+      });
+      slider.addEventListener("change", () => {
+        handlers.onEditApply && handlers.onEditApply(dest.id, { bitrateKbps: Number(slider.value) });
+      });
+      editRow.appendChild(slider);
+      editRow.appendChild(value);
+      wrap.appendChild(editRow);
+    } else if (dest.computedShareKbps !== undefined) {
+      wrap.appendChild(el("div", { className: "dest-computed-share", text: `Allocated: ${dest.computedShareKbps} kbps` }));
+    }
+
+    const actions = el("div", { className: "dest-actions" });
+
+    const roomOptions = (opts.roomOptions || []).filter((r) => r.id !== dest.roomId);
+    if (roomOptions.length > 0) {
+      const transferSelect = el("select", { className: "dest-room-select" });
+      roomOptions.forEach((r) => transferSelect.appendChild(el("option", { text: r.name, attrs: { value: r.id } })));
+      actions.appendChild(transferSelect);
+      actions.appendChild(
+        secondaryButton("Transfer", () => handlers.onTransfer && handlers.onTransfer(dest.id, transferSelect.value), {
+          className: "dest-action-btn",
+        })
+      );
+
+      const fanoutOptions = roomOptions.filter((r) => !(opts.roomsAlreadyFedByCapture || []).includes(r.id));
+      if (fanoutOptions.length > 0) {
+        const fanoutSelect = el("select", { className: "dest-room-select" });
+        fanoutOptions.forEach((r) => fanoutSelect.appendChild(el("option", { text: r.name, attrs: { value: r.id } })));
+        actions.appendChild(fanoutSelect);
+        actions.appendChild(
+          secondaryButton("Also send to…", () => handlers.onFanout && handlers.onFanout(dest.id, fanoutSelect.value), {
+            className: "dest-action-btn",
+          })
+        );
+      }
+    }
+
+    actions.appendChild(dangerButton("Stop", () => handlers.onStop && handlers.onStop(dest.id), { className: "dest-action-btn" }));
+    wrap.appendChild(actions);
+
+    return wrap;
+  }
+
   window.Components = {
     el,
     icon,
@@ -246,5 +431,10 @@
     renderRoomRow,
     renderStreamRow,
     renderEmptyState,
+    card,
+    warningBanner,
+    pillSwitch,
+    bandwidthModeToggle,
+    destinationCard,
   };
 })();

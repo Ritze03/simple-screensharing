@@ -1,0 +1,343 @@
+/*
+ * stream-control.css — Stream Control tab layout.
+ *
+ * Redesign goal (superdoc/features/stream-control.md, superdoc/ui/APP-SHELL.md,
+ * and the design-critique this port is fixing): the OLD egui tab stacked
+ * content-sized cards in an order that buried ACTIVE SHARES — the single most
+ * important thing on the screen — as a tiny stub below two big forms. This
+ * file's `.sc-grid` is a single equal-width column (every `.card` inside it
+ * is exactly the content area's width, never sized to its own content), and
+ * `stream-control.js` orders Active Shares right after a *compact* bandwidth
+ * summary strip, not after it.
+ */
+
+.sc-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 720px;
+}
+
+/* -------------------------------------------------------------------
+ * Bandwidth — compact strip, not a big form up front. Mode toggle + the
+ * current numbers on one row; the mode-specific inputs sit on the row below,
+ * still compact (no full-width sliders-as-forms).
+ * ----------------------------------------------------------------- */
+
+.sc-bandwidth-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.sc-bandwidth-summary {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.sc-bandwidth-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.sc-bandwidth-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sc-bandwidth-field input[type="range"] {
+  width: 160px;
+}
+
+.sc-bandwidth-field-value {
+  color: var(--text);
+  font-weight: 600;
+  min-width: var(--value-w);
+  display: inline-block;
+}
+
+.sc-fanout-note {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+/* -------------------------------------------------------------------
+ * Active shares — the prominent grid. Equal-width tiles via auto-fit, so 1
+ * destination reads as one full-width card and 3-4 read as a tidy grid,
+ * never a single tiny stub.
+ * ----------------------------------------------------------------- */
+
+.sc-active-shares-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 10px;
+}
+
+.dest-card {
+  background: var(--panel-sunken);
+  border: 1px solid var(--border-light);
+  border-radius: var(--rounding-sm);
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.dest-card-stalled {
+  border-color: var(--warning);
+}
+
+.dest-card-failed {
+  border-color: var(--danger);
+}
+
+.dest-card-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.dest-room-label {
+  flex: 1 1 auto;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dest-state-badge {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 2px 6px;
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.dest-state-badge-live {
+  background: var(--pill-success-bg-dim);
+  color: var(--success);
+}
+
+.dest-state-badge-starting {
+  background: var(--pill-accent-bg);
+  color: var(--text);
+}
+
+.dest-state-badge-rebuilding {
+  background: rgba(232, 163, 61, 0.18);
+  color: var(--warning);
+}
+
+.dest-state-badge-stalled {
+  background: rgba(232, 163, 61, 0.1);
+  color: var(--warning);
+}
+
+.dest-state-badge-failed {
+  background: rgba(224, 90, 90, 0.15);
+  color: var(--danger);
+}
+
+.dest-pending-role {
+  font-size: 11px;
+  font-style: italic;
+  color: var(--accent);
+}
+
+.dest-meta {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.dest-computed-share {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.dest-edit-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+}
+
+.dest-edit-label {
+  margin: 0;
+  white-space: nowrap;
+}
+
+.dest-bitrate-slider {
+  flex: 1 1 auto;
+  min-width: 60px;
+}
+
+.dest-bitrate-value {
+  color: var(--text);
+  font-weight: 600;
+  white-space: nowrap;
+  min-width: 60px;
+  text-align: right;
+}
+
+.dest-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+.dest-action-btn {
+  padding: 3px 8px;
+  height: auto;
+  font-size: 11px;
+}
+
+.dest-room-select {
+  background: var(--field);
+  border: 1px solid var(--border);
+  border-radius: var(--rounding-sm);
+  color: var(--text);
+  font-size: 11px;
+  padding: 3px 4px;
+  max-width: 110px;
+}
+
+/* -------------------------------------------------------------------
+ * Start a stream — a compact inline form, not a wide vertical stack.
+ * ----------------------------------------------------------------- */
+
+.sc-start-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 10px 16px;
+}
+
+.sc-start-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.sc-start-field select,
+.sc-start-field input {
+  background: var(--field);
+  border: 1px solid var(--border);
+  border-radius: var(--rounding-sm);
+  color: var(--text);
+  padding: 5px 8px;
+  outline: none;
+}
+
+.sc-start-field select:focus,
+.sc-start-field input:focus {
+  border-color: var(--accent);
+}
+
+.sc-start-error {
+  color: var(--danger);
+  font-size: 12px;
+  flex-basis: 100%;
+}
+
+.sc-start-progress {
+  color: var(--text-faint);
+  font-size: 12px;
+  flex-basis: 100%;
+}
+
+/* -------------------------------------------------------------------
+ * Room-scoped content — Members/rename + Share audio, kept visually
+ * separate from the cross-room Active Shares list via a two-column row of
+ * their own equal-width cards.
+ * ----------------------------------------------------------------- */
+
+.sc-room-scoped-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.sc-room-scoped-header select {
+  background: var(--field);
+  border: 1px solid var(--border);
+  border-radius: var(--rounding-sm);
+  color: var(--text);
+  padding: 4px 8px;
+}
+
+.sc-room-scoped-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+@media (max-width: 620px) {
+  .sc-room-scoped-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+.sc-member-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.sc-member-row-conn {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.sc-rename-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.sc-rename-row input {
+  flex: 1 1 auto;
+  background: var(--field);
+  border: 1px solid var(--border);
+  border-radius: var(--rounding-sm);
+  color: var(--text);
+  padding: 5px 8px;
+  outline: none;
+}
+
+.sc-saved-hint {
+  color: var(--success);
+  font-size: 11px;
+}
+
+.sc-share-audio-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.sc-share-audio-row select {
+  background: var(--field);
+  border: 1px solid var(--border);
+  border-radius: var(--rounding-sm);
+  color: var(--text);
+  padding: 5px 8px;
+  flex: 1 1 140px;
+}

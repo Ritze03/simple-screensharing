@@ -1,0 +1,37 @@
+/*
+ * settings.css — Settings tab. Smallest of the three: one card, two rows,
+ * per APP-SHELL.md ("the pre-existing settings card ... relocated and
+ * restyled. No settings were added, removed or redesigned").
+ */
+
+.settings-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 480px;
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.settings-row-label {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.settings-select {
+  background: var(--field);
+  border: 1px solid var(--border);
+  border-radius: var(--rounding-sm);
+  color: var(--text);
+  padding: 5px 8px;
+}
+
+.settings-hint {
+  font-size: 11px;
+  color: var(--text-faint);
+}
