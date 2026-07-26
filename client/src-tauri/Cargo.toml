@@ -27,3 +27,8 @@ simple-screensharing-client = { path = ".." }
 
 [dev-dependencies]
 tempfile = "3"
+# `tauri::test::mock_builder`/`mock_context` — lets
+# `commands::tests::join_room_outside_a_tokio_runtime_does_not_panic` invoke
+# the real `#[tauri::command]` wrapper (needs a real `tauri::State`, which
+# can't be constructed by hand) instead of only its `_impl` helper.
+tauri = { version = "2", features = ["test"] }

@@ -37,9 +37,31 @@ pub fn join_room_impl(state: &mut AppState, join_string: String, display_name: S
     state.start_connect(join_string, true)
 }
 
+// `Why:` `join_room` is a plain (non-`async`) `#[tauri::command]`. Tauri's
+// command macro only enters its managed Tokio runtime for `async fn`
+// commands (it wraps their execution in `tauri::async_runtime::spawn` before
+// polling them); a `fn` command is instead called straight from whatever
+// thread delivered the IPC message — on Linux that's the webkit2gtk
+// `register_uri_scheme` callback, a C FFI boundary a panic cannot unwind
+// across (fatal process abort, not a recoverable error). `join_room_impl`
+// eventually calls `session::AppState::start_connect`, which does a raw
+// `tokio::spawn` — this is the exact same "no reactor running" class
+// `main.rs`'s `Managed::new()` fix and `driver.rs`'s own `spawn()` doc
+// comment already document, just a third call site. `session.rs` stays
+// untouched (it's shared with the egui frontend, which enters its own Tokio
+// runtime directly and has no `tauri` dependency at all) — instead,
+// `tauri::async_runtime::block_on` enters Tauri's one shared runtime for the
+// duration of this synchronous call, same as `main.rs`'s fix. `block_on`
+// here does not block on any real I/O: `start_connect` only needs the
+// reactor to *issue* `tokio::spawn`, not to await the spawned task's
+// completion (that's `poll_connect_result`'s job, run by `driver.rs`'s
+// already-runtime-entered tick loop), so this returns effectively
+// immediately. The same defect, reached the same way, exists in every other
+// mutating command below that (transitively) spawns — each carries a short
+// pointer back to this note rather than repeating it.
 #[tauri::command]
 pub fn join_room(managed: State<'_, Managed>, join_string: String, display_name: String) -> Result<(), String> {
-    join_room_impl(&mut managed.state.lock().unwrap(), join_string, display_name)
+    tauri::async_runtime::block_on(async { join_room_impl(&mut managed.state.lock().unwrap(), join_string, display_name) })
 }
 
 /// Whether `leave_room` should be preceded by a confirm dialog — exposed as
@@ -53,16 +75,20 @@ pub fn leave_needs_confirm(managed: State<'_, Managed>, room_handle: u32) -> boo
 /// "Leave" clicked without anything to lose: tears the room down immediately
 /// and returns whether it actually did (`false` means the frontend should
 /// have called `leave_needs_confirm` first and shown its own dialog instead).
+// See `join_room`'s `Why:` note above — `request_leave_room` transitively
+// calls `disconnect_room`, which can spawn (`drop_capture_fire_and_forget`/
+// `stop_destination`), so this needs the same `block_on` treatment.
 #[tauri::command]
 pub fn leave_room(managed: State<'_, Managed>, room_handle: u32) -> bool {
-    managed.state.lock().unwrap().request_leave_room(RoomHandle(room_handle))
+    tauri::async_runtime::block_on(async { managed.state.lock().unwrap().request_leave_room(RoomHandle(room_handle)) })
 }
 
 /// Leave after the user confirmed the dialog `leave_needs_confirm` said was
 /// needed — unconditional teardown.
+// See `join_room`'s `Why:` note above — `disconnect_room` can spawn.
 #[tauri::command]
 pub fn force_leave_room(managed: State<'_, Managed>, room_handle: u32) {
-    managed.state.lock().unwrap().disconnect_room(RoomHandle(room_handle));
+    tauri::async_runtime::block_on(async { managed.state.lock().unwrap().disconnect_room(RoomHandle(room_handle)) });
 }
 
 #[tauri::command]
@@ -119,19 +145,22 @@ pub fn set_presentation_mode(managed: State<'_, Managed>, mode: String) -> Resul
 // Stream Control
 // ---------------------------------------------------------------------
 
+// See `join_room`'s `Why:` note above — `start_video_share` spawns.
 #[tauri::command]
 pub fn start_video_share(managed: State<'_, Managed>, room_handle: u32) {
-    managed.state.lock().unwrap().start_video_share(RoomHandle(room_handle));
+    tauri::async_runtime::block_on(async { managed.state.lock().unwrap().start_video_share(RoomHandle(room_handle)) });
 }
 
+// See `join_room`'s `Why:` note above — `start_audio_share` spawns.
 #[tauri::command]
 pub fn start_audio_share(managed: State<'_, Managed>, room_handle: u32) {
-    managed.state.lock().unwrap().start_audio_share(RoomHandle(room_handle));
+    tauri::async_runtime::block_on(async { managed.state.lock().unwrap().start_audio_share(RoomHandle(room_handle)) });
 }
 
+// See `join_room`'s `Why:` note above — `stop_share` spawns.
 #[tauri::command]
 pub fn stop_share(managed: State<'_, Managed>, capture_id: u32) {
-    managed.state.lock().unwrap().stop_share(CaptureSourceId(capture_id));
+    tauri::async_runtime::block_on(async { managed.state.lock().unwrap().stop_share(CaptureSourceId(capture_id)) });
 }
 
 /// Lists currently-producing-audio applications. Deliberately bypasses
@@ -172,16 +201,24 @@ pub fn list_active_streams(managed: State<'_, Managed>) -> Vec<DestinationRow> {
 
 /// "Also send to…" picked on a destination row: fan out an already-running
 /// capture into one more room (see `superdoc/features/stream-control.md`).
+// See `join_room`'s `Why:` note above — `add_destination` spawns
+// (`CaptureHandle::spawn_add_destination`).
 #[tauri::command]
 pub fn start_destination(managed: State<'_, Managed>, capture_id: u32, room_handle: u32) {
-    managed.state.lock().unwrap().add_destination(CaptureSourceId(capture_id), RoomHandle(room_handle), PendingRole::FanOut);
+    tauri::async_runtime::block_on(async {
+        managed.state.lock().unwrap().add_destination(CaptureSourceId(capture_id), RoomHandle(room_handle), PendingRole::FanOut)
+    });
 }
 
 /// "Transfer to…" picked on a destination row: make-before-break move to
 /// another room.
+// See `join_room`'s `Why:` note above — `transfer_destination` calls
+// `add_destination`, which spawns.
 #[tauri::command]
 pub fn transfer_destination(managed: State<'_, Managed>, destination_id: u32, target_room: u32) {
-    managed.state.lock().unwrap().transfer_destination(DestinationId(destination_id), RoomHandle(target_room));
+    tauri::async_runtime::block_on(async {
+        managed.state.lock().unwrap().transfer_destination(DestinationId(destination_id), RoomHandle(target_room))
+    });
 }
 
 /// "Apply" clicked on a destination row's settings edit.
@@ -203,9 +240,10 @@ pub fn edit_destination(
     state.apply_destination_edit(destination_id);
 }
 
+// See `join_room`'s `Why:` note above — `stop_destination` spawns.
 #[tauri::command]
 pub fn stop_destination(managed: State<'_, Managed>, destination_id: u32) {
-    managed.state.lock().unwrap().stop_destination(DestinationId(destination_id));
+    tauri::async_runtime::block_on(async { managed.state.lock().unwrap().stop_destination(DestinationId(destination_id)) });
 }
 
 #[tauri::command]
@@ -241,18 +279,25 @@ pub fn set_bandwidth_floor(managed: State<'_, Managed>, floor_kbps: u32) {
 // View
 // ---------------------------------------------------------------------
 
+// See `join_room`'s `Why:` note above — `RoomSession::toggle_watch` spawns
+// (subscribe/unsubscribe control messages).
 #[tauri::command]
 pub fn toggle_watch(managed: State<'_, Managed>, room_handle: u32, owner: u64, stream_id: u8) {
-    if let Some(room) = managed.state.lock().unwrap().rooms.get_mut(&RoomHandle(room_handle)) {
-        room.toggle_watch(owner, stream_id);
-    }
+    tauri::async_runtime::block_on(async {
+        if let Some(room) = managed.state.lock().unwrap().rooms.get_mut(&RoomHandle(room_handle)) {
+            room.toggle_watch(owner, stream_id);
+        }
+    });
 }
 
+// See `join_room`'s `Why:` note above — `RoomSession::toggle_listen` spawns.
 #[tauri::command]
 pub fn toggle_listen(managed: State<'_, Managed>, room_handle: u32, owner: u64, stream_id: u8) {
-    if let Some(room) = managed.state.lock().unwrap().rooms.get_mut(&RoomHandle(room_handle)) {
-        room.toggle_listen(owner, stream_id);
-    }
+    tauri::async_runtime::block_on(async {
+        if let Some(room) = managed.state.lock().unwrap().rooms.get_mut(&RoomHandle(room_handle)) {
+            room.toggle_listen(owner, stream_id);
+        }
+    });
 }
 
 #[tauri::command]
@@ -335,5 +380,42 @@ mod tests {
     fn leave_needs_confirm_is_false_with_no_live_room() {
         let state = AppState::default();
         assert!(!state.leave_needs_confirm(RoomHandle(0)));
+    }
+
+    /// Reproduces the real-app crash at `session.rs`'s `start_connect`: a
+    /// plain (non-`async`) `#[tauri::command]` like `join_room` is invoked by
+    /// Tauri directly on whatever thread delivered the IPC message — on
+    /// Linux that's the webkit2gtk `register_uri_scheme` callback — with no
+    /// Tokio reactor entered (only `async fn` commands get dispatched via
+    /// `tauri::async_runtime::spawn`, which enters one). This calls the real
+    /// `#[tauri::command] join_room` wrapper (not just `join_room_impl`,
+    /// which only exercises `AppState` and would miss a bug that's actually
+    /// in the wrapper), via a `tauri::test` mock app so a real `State<'_,
+    /// Managed>` exists to pass it — `State`'s field is private, so it can't
+    /// be built by hand. This is a plain `#[test]` (no `#[tokio::test]`)
+    /// precisely to recreate that "no runtime entered" caller context.
+    #[test]
+    fn join_room_outside_a_tokio_runtime_does_not_panic() {
+        let _guard = isolated_config_home();
+        // `Managed::new()` itself needs a reactor too (see `main.rs`'s own
+        // `Why:` note) — build it inside a throwaway runtime, same as
+        // `main.rs` does with Tauri's real one, then drop that runtime
+        // before calling `join_room` so the command wrapper is the only
+        // thing left responsible for entering one.
+        let rt = tokio::runtime::Runtime::new().expect("build throwaway runtime");
+        let managed = rt.block_on(async { Managed::new() });
+        drop(rt);
+
+        let app = tauri::test::mock_builder()
+            .manage(managed)
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("build mock tauri app");
+
+        // Pre-fix, `start_connect`'s raw `tokio::spawn` panics here with
+        // "there is no reactor running, must be called from the context of
+        // a Tokio 1.x runtime" — fatal in the real app because it happens
+        // inside a non-unwindable FFI callback.
+        let result = join_room(app.state::<Managed>(), "not-a-valid-join-string".to_string(), String::new());
+        assert!(result.is_ok(), "join_room should not fail outside a Tokio runtime context: {result:?}");
     }
 }
