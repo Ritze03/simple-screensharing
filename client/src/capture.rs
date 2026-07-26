@@ -109,6 +109,23 @@
 //! It'll likely live in a sibling module (or a second capture graph in this
 //! one) that announces a second `StreamKind::Audio` stream on its own
 //! `stream_id`, reusing the same encrypt/fragment/send path below.
+//!
+//! # Dynamic tee branches ([`branch`])
+//!
+//! Everything above describes the pipeline's three *fixed* tee branches,
+//! built once by [`build_pipeline`] and never changed for the life of the
+//! pipeline. The [`branch`] submodule is the mechanism for a fourth kind:
+//! branches added and removed at runtime, on a live `Playing` pipeline,
+//! without disturbing the fixed branches or each other — the GStreamer
+//! mechanics behind multi-destination fan-out (one capture, several
+//! independently-encoded outgoing streams), per-destination live settings
+//! changes, and stream transfer, per
+//! `superdoc/brainstorm/ui-redesign-multiroom-streaming.md`'s "branch-swap"
+//! design. Not yet wired into [`start_sharing`]/[`CaptureHandle`] — this pass
+//! only builds and stress-tests the primitive itself ([`branch::add_branch`]/
+//! [`branch::remove_branch`]/[`branch::swap_branch`]); a later stage owns
+//! exposing the tee from [`CaptureHandle`] and building real
+//! `Destination`/`DestinationState` integration on top.
 
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -1612,6 +1629,753 @@ fn send_encoded_sample(client: &ScreenshareClient, stream_id: u8, sample: &gst::
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------
+// Dynamic tee branches (multi-destination fan-out)
+// ---------------------------------------------------------------------
+
+/// Dynamically adds/removes/swaps encode branches on a live capture
+/// pipeline's shared `tee` at runtime — see this module's doc comment's
+/// "Dynamic tee branches" section for how this fits the multi-room plan.
+///
+/// This module is deliberately narrow: it knows how to attach/detach a
+/// self-contained encode chain to an already-built [`gst::Pipeline`]'s `tee`
+/// element, and nothing about *why* a branch is being added/removed/swapped
+/// or which room/`Destination` it belongs to — that's app-level state a
+/// later stage owns. It intentionally does not depend on `ui.rs`:
+/// [`BranchId`] is this module's own opaque identifier, not `ui.rs`'s
+/// `DestinationId` — a caller wiring this up against real destinations
+/// passes whatever `u32` it likes (e.g. a `DestinationId`'s inner value).
+pub mod branch {
+    use super::*;
+
+    /// Opaque per-branch identifier, meaningful only to this module's caller
+    /// (see this module's doc comment) — used purely to give each branch's
+    /// GStreamer elements distinct, greppable names (`GST_DEBUG` dumps,
+    /// `pipeline.by_name(...)` while debugging), never looked up or
+    /// interpreted by this module itself.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub struct BranchId(pub u32);
+
+    /// What one dynamically-added encode branch should produce — independent
+    /// of every other branch on the same tee, since each branch gets its own
+    /// `queue`/`videoconvert`/`videoscale`/`videorate`/encoder/`appsink`
+    /// chain (see [`add_branch`]).
+    #[derive(Debug, Clone, Copy)]
+    pub struct EncodeSettings {
+        pub width: u32,
+        pub height: u32,
+        pub framerate: u32,
+        pub bitrate_kbps: u32,
+        pub backend: EncoderBackend,
+    }
+
+    /// A live encode branch built by [`add_branch`]: a `gst::Bin` already
+    /// added to its pipeline and linked to a tee request pad, plus
+    /// everything [`remove_branch`] needs to tear it back down. `appsink` is
+    /// public — this is the caller's read side for the branch's encoded
+    /// H.264 output (pull samples off it the same way [`super::pump_loop`]
+    /// does for the pipeline's original fixed encoder branch, e.g. via
+    /// `appsink.stream()`/`try_pull_sample`).
+    pub struct EncodeBranch {
+        pub id: BranchId,
+        pub appsink: gst_app::AppSink,
+        bin: gst::Bin,
+        tee_pad: gst::Pad,
+    }
+
+    /// Process-wide counter for generating element/bin names that are
+    /// distinct across every branch this process ever creates, regardless of
+    /// [`BranchId`] (which a caller could reuse or which could collide
+    /// across independent captures/pipelines).
+    ///
+    /// `Why:` `GstBin::by_name` searches recursively into child bins, so two
+    /// branches sharing the literal name `"sink"` for their `appsink` (the
+    /// same name the pipeline's *fixed* encoder branch already uses — see
+    /// [`build_pipeline`]) would make `pipeline.by_name("sink")` ambiguous
+    /// the moment more than one branch coexists on the same pipeline. A
+    /// monotonic, never-reused counter rules that out entirely, at the cost
+    /// of names that don't reveal which `BranchId`/destination they belong
+    /// to on their own — acceptable since this module never looks elements
+    /// up by name itself; it keeps direct `gst::Bin`/`gst::Pad`/`AppSink`
+    /// handles instead (see [`EncodeBranch`]).
+    static NEXT_BRANCH_INDEX: AtomicU32 = AtomicU32::new(0);
+
+    fn next_branch_index() -> u32 {
+        NEXT_BRANCH_INDEX.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Requests a new pad from `tee` and builds+links a fresh, independent
+    /// encode branch onto it: `queue leaky=downstream max-size-buffers=2 !
+    /// videoconvert ! videoscale ! videorate ! capsfilter(format,w,h,fps) !
+    /// <encoder> ! capsfilter(h264) ! appsink`, added to `pipeline` and
+    /// sync'd to its current state *before* being linked to the tee — so a
+    /// branch added to an already-`Playing` pipeline starts flowing
+    /// immediately instead of sitting `Null` while the tee tries to push
+    /// buffers into it. On any failure after the tee pad has been requested
+    /// and/or the bin added, this rolls back what it already did (removes
+    /// the bin, nulls it, releases the tee pad) rather than leaking a
+    /// half-wired branch into the pipeline.
+    ///
+    /// `id` is purely for naming (see [`BranchId`]'s doc comment); it plays
+    /// no other role here.
+    ///
+    /// # Why `leaky=downstream max-size-buffers=2` is not optional
+    ///
+    /// `Why:` this is the exact fix that resolved this pipeline's own
+    /// "freezes solid under sustained motion" bug on the *original* fixed
+    /// encoder branch (see [`ENCODER_QUEUE_MAX_BUFFERS`]'s doc comment and
+    /// [`build_pipeline`]'s doc comment for the full incident writeup): a
+    /// plain `queue` defaults to non-leaky with a 10MB byte cap, which a real
+    /// capture source's variable, motion-driven raw-frame rate can fill in a
+    /// fraction of a second — once full, a non-leaky queue *blocks* rather
+    /// than drops, and that block propagates upstream through the shared
+    /// `tee` to the capture source itself, stalling every other branch on
+    /// the same tee too, not just this one. Every dynamically-added branch
+    /// shares that same upstream `tee` and capture source, so it is exactly
+    /// as exposed to that failure mode as the original branch was — using
+    /// the identical `leaky=downstream`/bounded-buffers discipline here is
+    /// what keeps one slow or misbehaving destination's branch from ever
+    /// being able to stall every other destination sharing this capture.
+    /// This is non-negotiable for any *new* branch this module (or a future
+    /// caller) ever builds.
+    ///
+    /// # Why a `videoconvert` here, beyond the plan doc's literal chain
+    ///
+    /// The pipeline's single `tee` carries one negotiated raw-video format
+    /// shared by every branch already on it (whichever branch's requested
+    /// caps "win" the negotiation through the shared `videoconvert` upstream
+    /// of the tee — see this module's parent doc comment). A
+    /// dynamically-added branch's [`EncodeSettings::backend`] can differ
+    /// from whatever format is already flowing through the tee (e.g. a
+    /// per-destination VAAPI-vs-software choice, expected in a later stage
+    /// per the plan doc) — without its own `videoconvert`, a branch
+    /// requesting a format the tee isn't already carrying would simply fail
+    /// to negotiate. The existing preview/self-preview branches already
+    /// establish this exact pattern for the same reason (they need RGB, not
+    /// whatever the tee happens to carry) — this branch follows it too,
+    /// rather than assuming its [`EncodeSettings::backend`] always happens
+    /// to match whichever branch won the tee's format negotiation first.
+    pub fn add_branch(
+        pipeline: &gst::Pipeline,
+        tee: &gst::Element,
+        id: BranchId,
+        settings: EncodeSettings,
+    ) -> Result<EncodeBranch> {
+        let index = next_branch_index();
+        // Defensive clamp, mirroring `build_pipeline`'s own — see
+        // `MAX_FRAMERATE`'s doc comment for why this can never be skipped.
+        let framerate = settings.framerate.clamp(MIN_FRAMERATE, MAX_FRAMERATE);
+        let gop_frames = GOP_SECONDS * framerate;
+        let encoder = settings.backend.launch_fragment(settings.bitrate_kbps, gop_frames);
+        let raw_format = settings.backend.raw_format();
+        let width = settings.width;
+        let height = settings.height;
+
+        let appsink_name = format!("branch_appsink_{index}");
+        let bin_name = format!("branch_{index}");
+
+        let description = format!(
+            "queue leaky=downstream max-size-buffers={ENCODER_QUEUE_MAX_BUFFERS} \
+             ! videoconvert \
+             ! videoscale \
+             ! videorate drop-only=false max-duplication-time=0 \
+             ! video/x-raw,format={raw_format},width={width},height={height},framerate={framerate}/1 \
+             ! {encoder} \
+             ! video/x-h264,stream-format=byte-stream,alignment=au \
+             ! appsink name={appsink_name} emit-signals=false sync=false max-buffers=4 drop=true"
+        );
+
+        // `ghost_unlinked_pads=true` auto-creates a ghost pad on the bin for
+        // the one pad left unconnected inside it (the `queue`'s sink pad),
+        // named after its target — `"sink"` — exactly what we need to link
+        // the tee's new request pad into below.
+        let bin = gst::parse::bin_from_description_with_name(&description, true, &bin_name)
+            .with_context(|| format!("failed to construct encode branch bin: {description}"))?;
+
+        let appsink = bin
+            .by_name(&appsink_name)
+            .ok_or_else(|| anyhow!("branch bin has no element named '{appsink_name}'"))?
+            .downcast::<gst_app::AppSink>()
+            .map_err(|_| anyhow!("'{appsink_name}' element is not an AppSink"))?;
+
+        let branch_sink_pad = bin.static_pad("sink").ok_or_else(|| {
+            anyhow!("branch bin has no ghost sink pad (the queue's sink pad should have been auto-ghosted)")
+        })?;
+
+        let tee_pad = tee
+            .request_pad_simple("src_%u")
+            .ok_or_else(|| anyhow!("tee refused to provide a new request pad (src_%u)"))?;
+
+        if let Err(e) = pipeline.add(&bin) {
+            tee.release_request_pad(&tee_pad);
+            return Err(anyhow!("failed to add encode branch bin to the pipeline: {e}"));
+        }
+
+        if let Err(e) = bin.sync_state_with_parent() {
+            // Roll back rather than leaving a half-wired bin (added to the
+            // pipeline, not Playing, tee pad requested but unlinked) behind.
+            let _ = pipeline.remove(&bin);
+            let _ = bin.set_state(gst::State::Null);
+            tee.release_request_pad(&tee_pad);
+            return Err(anyhow!("encode branch bin failed to sync state with its parent pipeline: {e}"));
+        }
+
+        if let Err(e) = tee_pad.link(&branch_sink_pad) {
+            let _ = pipeline.remove(&bin);
+            let _ = bin.set_state(gst::State::Null);
+            tee.release_request_pad(&tee_pad);
+            return Err(anyhow!("failed to link tee's new request pad to the encode branch: {e:?}"));
+        }
+
+        Ok(EncodeBranch { id, appsink, bin, tee_pad })
+    }
+
+    /// Safely removes `branch` from `pipeline`'s `tee`: blocks the tee's src
+    /// pad feeding this branch, injects a real EOS event directly into the
+    /// branch (bypassing the tee, which stays untouched and keeps serving
+    /// every other branch), waits for that EOS to actually drain all the way
+    /// through the branch to its `appsink` (bounded by a timeout so a
+    /// misbehaving branch can never hang the caller forever), then unlinks,
+    /// removes, nulls, and releases the tee's request pad — in that order,
+    /// matching GStreamer's own documented idiom for dynamically removing a
+    /// tee branch from a live pipeline.
+    ///
+    /// # Why draining to the appsink matters as much as the leaky queue does
+    ///
+    /// `Why:` skipping straight to `pipeline.remove()` + `set_state(Null)`
+    /// (as if this were the original whole-pipeline teardown) is exactly the
+    /// class of bug this project has already been bitten by once, in a
+    /// different spot: [`CaptureHandle::stop`]'s doc comment records that
+    /// jumping straight to `Null` on a pipeline never sends EOS, so anything
+    /// downstream still expecting to see it can hang. Here the risk is
+    /// narrower in blast radius (only this one branch, not the whole
+    /// pipeline) but identical in kind: an encoder (`x264enc`/`vah264enc`)
+    /// holds internal lookahead/reorder state that must be flushed on EOS to
+    /// emit its last few encoded frames cleanly, and — more importantly —
+    /// tearing the branch's elements down via `Null` while a buffer could
+    /// still be in flight to it races the tee: if we unlink/release the tee
+    /// pad while a buffer is mid-delivery, that pad could hand a buffer to
+    /// now-`Null` elements. Blocking the tee's src pad first (so no further
+    /// buffer for this branch can possibly arrive), only then injecting EOS,
+    /// and only then waiting to actually observe the appsink go EOS before
+    /// touching pipeline structure at all, is what makes branch removal safe
+    /// to do repeatedly, live, next to other branches that must keep running
+    /// untouched — reintroducing this exact "torn down without draining"
+    /// shortcut here would resurrect the sustained-motion-freeze class of
+    /// bug in a new spot, just as surely as skipping the leaky queue would.
+    /// See this module's stress test
+    /// (`repeated_add_remove_cycles_do_not_stall_the_pipeline`) for the
+    /// guarantee this buys: dozens of add/remove cycles against a live
+    /// pipeline with no stall and no leaked elements.
+    pub async fn remove_branch(pipeline: &gst::Pipeline, tee: &gst::Element, branch: EncodeBranch) -> Result<()> {
+        let EncodeBranch { id: _, appsink, bin, tee_pad } = branch;
+
+        let branch_sink_pad = bin
+            .static_pad("sink")
+            .ok_or_else(|| anyhow!("encode branch bin unexpectedly lost its ghost sink pad"))?;
+
+        // Block the tee's src pad feeding this branch, then — from inside
+        // that block, so no further buffer for this branch can possibly be
+        // in flight past this point — inject a real EOS event directly into
+        // the branch's own entry pad, and `Drop` the buffer/event that
+        // triggered the block instead of letting it continue.
+        //
+        // `Why Drop, not Remove`: returning `Remove` here (tried first) lets
+        // the item that triggered the block continue flowing to the branch
+        // right after — but our synthetic EOS, injected synchronously inside
+        // this same callback, has *already* been fully processed by the
+        // branch's entry element by the time that happens (`send_event` on a
+        // sink pad runs its event function inline). The formerly-blocked
+        // buffer then arrives at an element that has already seen EOS, which
+        // makes it return `GST_FLOW_EOS` (`gst_pad_chain_data_unchecked`
+        // refuses a buffer on a pad that has already seen EOS). That flow
+        // return then propagates *upstream*, and that is where the real
+        // damage happens: `tee` hands it back out of its chain function, and
+        // the capture source — `basesrc`, i.e. the real screen-capture
+        // source in production and `videotestsrc` in this module's tests —
+        // treats a `FLOW_EOS` from its push as "the stream is over", stops
+        // producing, and pushes a genuine EOS *event* downstream. That event
+        // lands as a sticky event on the **tee's sink pad**, and the tee
+        // forwards its sticky events onto every src pad it has, plus every
+        // src pad requested from it afterwards.
+        //
+        // So the blast radius is not "this one branch" and not "the next
+        // branch to be added": it is the entire capture. Every fixed branch
+        // (the real encoder, the preview, the self-preview) dies with it,
+        // and every future `request_pad_simple` hands back a pad that is
+        // already EOS-flagged, silently black-holing that branch's data with
+        // no error ever posted to the bus. Measured directly, not inferred:
+        // with `Remove`, the tee's *sink* pad reads `EOS_FLAG=true` /
+        // `sticky_eos=true` immediately after the first removal, which can
+        // only mean the EOS came down from upstream.
+        //
+        // `Drop` avoids all of it at the root: the triggering item never
+        // reaches the branch, so nothing is ever pushed into an already-EOS'd
+        // branch entry, no `FLOW_EOS` is ever returned upstream, and the
+        // source keeps running. `Drop` is also what keeps the *other*
+        // branches flowing while this one drains: a `tee` pushes to all of
+        // its src pads sequentially from a single streaming thread, so
+        // genuinely *blocking* this pad (returning `Ok` from a BLOCK probe)
+        // would stall the tee — and therefore every sibling branch — for as
+        // long as the drain below takes. `Drop` returns immediately and only
+        // starves this one doomed pad. See
+        // `removing_a_dynamic_branch_leaves_the_fixed_branches_producing`
+        // for the regression guard; it asserts on the tee sink pad's EOS
+        // flag precisely because that is the signal that flips first.
+        //
+        // We don't remove the probe afterward: it keeps dropping (and
+        // re-sending EOS on) everything aimed at this pad until the pad is
+        // unlinked and released moments later, which is harmless — EOS into
+        // an already-EOS'd branch is a no-op.
+        let probe_sink_pad = branch_sink_pad.clone();
+        tee_pad.add_probe(gst::PadProbeType::BLOCK_DOWNSTREAM, move |_pad, _info| {
+            if !probe_sink_pad.send_event(gst::event::Eos::new()) {
+                tracing::warn!("encode branch removal: EOS was not accepted by the branch's entry pad");
+            }
+            gst::PadProbeReturn::Drop
+        });
+
+        // Wait for that EOS to actually reach the branch's appsink — not
+        // just "we sent it" — by draining `appsink`'s sample stream until it
+        // ends (mirrors `CaptureHandle::stop`'s use of the same
+        // `AppSinkStream` "yields `None` only once real EOS arrives"
+        // contract). Bounded so a branch that somehow never drains (a stuck
+        // encoder, a GStreamer bug) fails loudly via a log line instead of
+        // hanging every future `remove_branch` caller forever; pipeline
+        // structure gets torn down regardless of whether this actually
+        // observed EOS, matching `CaptureHandle::stop`'s established
+        // "best-effort wait, then force it anyway" shape.
+        let mut appsink_stream = appsink.stream();
+        let drained = tokio::time::timeout(Duration::from_secs(5), async {
+            while appsink_stream.next().await.is_some() {}
+        })
+        .await
+        .is_ok();
+        if !drained {
+            tracing::warn!("encode branch did not drain to EOS within 5s; removing it anyway");
+        }
+
+        let _ = tee_pad.unlink(&branch_sink_pad);
+
+        if let Err(e) = pipeline.remove(&bin) {
+            tracing::warn!("failed to remove encode branch bin from the pipeline: {e}");
+        }
+        if let Err(e) = bin.set_state(gst::State::Null) {
+            tracing::warn!("failed to stop encode branch bin: {e}");
+        }
+        tee.release_request_pad(&tee_pad);
+
+        Ok(())
+    }
+
+    /// Make-before-break: builds and links a brand-new branch for
+    /// `new_settings` via [`add_branch`], returning it already producing
+    /// output alongside `old`'s still-live branch — this function never
+    /// touches `old`; it isn't even a parameter. This is the plan doc's
+    /// "branch-swap" mechanism (see this module's parent doc comment): the
+    /// caller keeps reading `old`'s `appsink` as authoritative until the
+    /// newly-returned branch emits its first IDR, then atomically flips
+    /// which appsink it reads from and calls [`remove_branch`] on `old` —
+    /// that Rust-side "wait for IDR, then flip" bookkeeping is app-level
+    /// state this module doesn't own (see this module's parent doc
+    /// comment), so it isn't implemented here.
+    ///
+    /// Exists as its own named function (rather than every swap call site
+    /// just calling [`add_branch`] directly) purely to name the intent at
+    /// the call site — a swap and a fresh additional destination are the
+    /// same GStreamer mechanics today, but documenting them as distinct
+    /// callers keeps the door open for the two to diverge later (e.g. a
+    /// swap wanting to carry over the old branch's bitrate/rate-control
+    /// history for a smoother ramp-up) without every call site needing to be
+    /// re-audited to tell which kind of `add_branch` call it originally was.
+    pub fn swap_branch(
+        pipeline: &gst::Pipeline,
+        tee: &gst::Element,
+        id: BranchId,
+        new_settings: EncodeSettings,
+    ) -> Result<EncodeBranch> {
+        add_branch(pipeline, tee, id, new_settings)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Builds a minimal `videotestsrc ! videoconvert ! tee name=t`
+        /// pipeline for these tests to add/remove/swap branches against —
+        /// the same "swap `videotestsrc` in for the real capture source"
+        /// pattern this file's other tests already use (see
+        /// `run_backend_and_expect_encoded_buffer`'s doc comment in the
+        /// parent `tests` module), just without the fixed encode/preview
+        /// branches [`super::build_pipeline`] also adds, since these tests
+        /// only care about *dynamic* branches on the tee.
+        ///
+        /// `Why:` includes one permanent `t. ! fakesink` branch even though
+        /// no test here reads from it: matches production, where the real
+        /// pipeline's `tee` always has its three fixed branches already
+        /// linked (see [`super::build_pipeline`]) before any dynamic branch
+        /// is ever added. A `tee` with *zero* linked src pads makes a live
+        /// source's every push return `NOT_LINKED`, which `basesrc` treats
+        /// as a fatal streaming error (posts an `Error` on the bus and stops
+        /// pushing) rather than something to route around — with no fixed
+        /// branch here, the source would error out before the first
+        /// dynamically-added branch's own probe/link ever got a chance to
+        /// run, an artifact of this synthetic test pipeline that a real
+        /// capture pipeline can never hit.
+        fn build_test_pipeline() -> (gst::Pipeline, gst::Element) {
+            let description = "videotestsrc is-live=true pattern=smpte \
+                 ! video/x-raw,width=64,height=64,framerate=30/1 \
+                 ! videoconvert \
+                 ! tee name=t \
+                 t. ! queue leaky=downstream max-size-buffers=1 ! fakesink";
+            let element = gst::parse::launch(description).expect("test pipeline should parse and link");
+            let pipeline = element.downcast::<gst::Pipeline>().expect("top-level element should be a Pipeline");
+            let tee = pipeline.by_name("t").expect("tee element should exist");
+            (pipeline, tee)
+        }
+
+        fn small_settings() -> EncodeSettings {
+            EncodeSettings {
+                width: 64,
+                height: 64,
+                framerate: 15,
+                bitrate_kbps: 500,
+                backend: EncoderBackend::Software,
+            }
+        }
+
+        /// Polls `appsink` for up to `timeout` and reports whether at least
+        /// one sample arrived — the same bounded polling shape this file's
+        /// other tests use (e.g. `run_backend_and_expect_encoded_buffer`),
+        /// just factored out since every test below needs it at least once.
+        fn wait_for_sample(appsink: &gst_app::AppSink, timeout: Duration) -> bool {
+            let deadline = Instant::now() + timeout;
+            while Instant::now() < deadline {
+                if appsink.try_pull_sample(gst::ClockTime::from_mseconds(50)).is_some() {
+                    return true;
+                }
+            }
+            false
+        }
+
+        /// [`add_branch`] on an already-`Playing` pipeline must actually
+        /// produce encoded H.264 output — the basic "the mechanics work at
+        /// all" proof every other test here builds on.
+        #[test]
+        fn add_branch_on_playing_pipeline_produces_encoded_output() {
+            if gst::init().is_err() {
+                eprintln!("skipping: gstreamer not available in this environment");
+                return;
+            }
+
+            let (pipeline, tee) = build_test_pipeline();
+            pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+            let (state_result, ..) = pipeline.state(gst::ClockTime::from_seconds(5));
+            state_result.expect("pipeline should settle into PLAYING");
+
+            let branch =
+                add_branch(&pipeline, &tee, BranchId(1), small_settings()).expect("add_branch should succeed");
+            assert_eq!(branch.id, BranchId(1), "returned branch should carry the id it was created with");
+
+            assert!(
+                wait_for_sample(&branch.appsink, Duration::from_secs(5)),
+                "a branch added to a live pipeline should produce at least one encoded sample within 5s"
+            );
+
+            pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+        }
+
+        /// The core "other destinations aren't affected" guarantee the whole
+        /// design depends on: removing one branch must not disturb a sibling
+        /// branch on the same tee, which must keep producing output
+        /// afterward exactly as if nothing happened.
+        #[tokio::test]
+        async fn removing_one_branch_leaves_the_other_branch_producing_output() {
+            if gst::init().is_err() {
+                eprintln!("skipping: gstreamer not available in this environment");
+                return;
+            }
+
+            let (pipeline, tee) = build_test_pipeline();
+            pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+            let (state_result, ..) = pipeline.state(gst::ClockTime::from_seconds(5));
+            state_result.expect("pipeline should settle into PLAYING");
+
+            let branch_a =
+                add_branch(&pipeline, &tee, BranchId(1), small_settings()).expect("add_branch(a) should succeed");
+            let branch_b =
+                add_branch(&pipeline, &tee, BranchId(2), small_settings()).expect("add_branch(b) should succeed");
+
+            assert!(
+                wait_for_sample(&branch_a.appsink, Duration::from_secs(5)),
+                "branch a should produce output before being removed"
+            );
+            assert!(
+                wait_for_sample(&branch_b.appsink, Duration::from_secs(5)),
+                "branch b should produce output before branch a is removed"
+            );
+
+            tokio::time::timeout(Duration::from_secs(10), remove_branch(&pipeline, &tee, branch_a))
+                .await
+                .expect("remove_branch(a) should not hang")
+                .expect("remove_branch(a) should succeed");
+
+            let (state_result, current, _pending) = pipeline.state(gst::ClockTime::from_seconds(5));
+            state_result.expect("pipeline should remain in a valid state after removing branch a");
+            assert_eq!(current, gst::State::Playing, "pipeline should still be Playing after removing branch a");
+
+            assert!(
+                wait_for_sample(&branch_b.appsink, Duration::from_secs(5)),
+                "branch b must keep producing output after branch a was removed — other destinations must not be affected"
+            );
+
+            pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+        }
+
+        /// Builds a test pipeline whose tee carries *fixed* branches shaped
+        /// like the real [`super::build_pipeline`]'s — an encoder branch and
+        /// an RGB preview branch, each ending in its own readable `appsink`
+        /// — so a test can assert that dynamic add/remove leaves the
+        /// **pre-existing** branches producing, not merely that one dynamic
+        /// branch doesn't disturb another dynamic branch.
+        ///
+        /// `Why:` this is deliberately a second, heavier fixture rather than
+        /// an extension of [`build_test_pipeline`]: the failure mode it
+        /// exists to catch (see
+        /// `removing_a_dynamic_branch_leaves_the_fixed_branches_producing`)
+        /// is *upstream* EOS propagation, which is invisible to a fixture
+        /// whose only fixed branch is an unread `fakesink` — nothing asserts
+        /// a `fakesink` is still being fed, so the source could have shut
+        /// down completely and every dynamic-vs-dynamic test would still
+        /// pass.
+        fn build_fixed_branch_test_pipeline() -> (gst::Pipeline, gst::Element, gst_app::AppSink, gst_app::AppSink) {
+            let encoder = EncoderBackend::Software.launch_fragment(500, 30);
+            let raw_format = EncoderBackend::Software.raw_format();
+            let description = format!(
+                "videotestsrc is-live=true pattern=smpte \
+                 ! video/x-raw,width=64,height=64,framerate=30/1 \
+                 ! videoconvert \
+                 ! tee name=t \
+                 t. ! queue leaky=downstream max-size-buffers={ENCODER_QUEUE_MAX_BUFFERS} \
+                    ! videorate drop-only=false max-duplication-time=0 \
+                    ! video/x-raw,format={raw_format},framerate=15/1 \
+                    ! {encoder} \
+                    ! video/x-h264,stream-format=byte-stream,alignment=au \
+                    ! appsink name=fixed_encoder_sink emit-signals=false sync=false max-buffers=4 drop=true \
+                 t. ! queue leaky=downstream max-size-buffers=1 \
+                    ! videorate \
+                    ! video/x-raw,framerate=5/1 \
+                    ! videoconvert \
+                    ! video/x-raw,format=RGB \
+                    ! appsink name=fixed_preview_sink emit-signals=false sync=false max-buffers=1 drop=true"
+            );
+            let element = gst::parse::launch(&description).expect("fixed-branch test pipeline should parse and link");
+            let pipeline = element.downcast::<gst::Pipeline>().expect("top-level element should be a Pipeline");
+            let tee = pipeline.by_name("t").expect("tee element should exist");
+            let encoder_sink = pipeline
+                .by_name("fixed_encoder_sink")
+                .expect("fixed encoder sink should exist")
+                .downcast::<gst_app::AppSink>()
+                .expect("fixed_encoder_sink should be an AppSink");
+            let preview_sink = pipeline
+                .by_name("fixed_preview_sink")
+                .expect("fixed preview sink should exist")
+                .downcast::<gst_app::AppSink>()
+                .expect("fixed_preview_sink should be an AppSink");
+            (pipeline, tee, encoder_sink, preview_sink)
+        }
+
+        /// Adding and removing *dynamic* branches must leave the pipeline's
+        /// pre-existing **fixed** branches — the real encoder branch and the
+        /// RGB preview branch that exist before any dynamic branch is ever
+        /// added (see [`super::build_pipeline`]) — producing output exactly
+        /// as before.
+        ///
+        /// `Why:` this is the regression guard for the specific, silent
+        /// failure mode that the `Drop`-not-`Remove` pad-probe return exists
+        /// to prevent (see [`remove_branch`]'s probe comment). Letting the
+        /// blocked buffer through to an already-EOS'd branch makes that
+        /// branch return `GST_FLOW_EOS`, which propagates *upstream* — the
+        /// `videotestsrc`/real capture source treats it as end-of-stream and
+        /// pushes a real EOS event down through the shared tee, killing
+        /// **every** branch on it and poisoning every future request pad via
+        /// sticky-event forwarding. That blast radius is the whole capture,
+        /// not just dynamic branches, so it has to be asserted against the
+        /// fixed branches specifically: the dynamic-vs-dynamic tests above
+        /// cannot see it, because they tear down and rebuild their dynamic
+        /// branches on every cycle anyway.
+        ///
+        /// `Why:` the load-bearing assertion here is the tee **sink pad**'s
+        /// EOS-flag check, not the "did a sample arrive" checks. Verified by
+        /// flipping the probe back to `PadProbeReturn::Remove`: the sample
+        /// assertions still pass on the first cycle, because each fixed
+        /// `appsink` is holding already-buffered samples (`max-buffers=4
+        /// drop=true`) that keep arriving for a moment after the source has
+        /// actually died — starvation only becomes observable once that
+        /// backlog drains. The EOS flag on the tee's sink pad flips
+        /// *immediately* and unambiguously, so it catches the regression on
+        /// the very first cycle instead of depending on buffer-drain timing.
+        /// Don't drop it in favour of the sample checks alone.
+        #[tokio::test]
+        async fn removing_a_dynamic_branch_leaves_the_fixed_branches_producing() {
+            if gst::init().is_err() {
+                eprintln!("skipping: gstreamer not available in this environment");
+                return;
+            }
+
+            let (pipeline, tee, fixed_encoder_sink, fixed_preview_sink) = build_fixed_branch_test_pipeline();
+            pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+            let (state_result, ..) = pipeline.state(gst::ClockTime::from_seconds(5));
+            state_result.expect("pipeline should settle into PLAYING");
+
+            assert!(
+                wait_for_sample(&fixed_encoder_sink, Duration::from_secs(5)),
+                "fixed encoder branch should produce output before any dynamic branch exists"
+            );
+            assert!(
+                wait_for_sample(&fixed_preview_sink, Duration::from_secs(5)),
+                "fixed preview branch should produce output before any dynamic branch exists"
+            );
+
+            // Several cycles, since the poisoning this guards against only
+            // becomes visible after the first remove.
+            for cycle in 0..5u32 {
+                let branch = add_branch(&pipeline, &tee, BranchId(cycle), small_settings())
+                    .unwrap_or_else(|e| panic!("cycle {cycle}: add_branch failed: {e:#}"));
+                assert!(
+                    wait_for_sample(&branch.appsink, Duration::from_secs(5)),
+                    "cycle {cycle}: dynamic branch produced no output"
+                );
+
+                tokio::time::timeout(Duration::from_secs(10), remove_branch(&pipeline, &tee, branch))
+                    .await
+                    .unwrap_or_else(|_| panic!("cycle {cycle}: remove_branch hung past its timeout"))
+                    .unwrap_or_else(|e| panic!("cycle {cycle}: remove_branch failed: {e:#}"));
+
+                assert!(
+                    wait_for_sample(&fixed_encoder_sink, Duration::from_secs(5)),
+                    "cycle {cycle}: fixed encoder branch stopped producing after a dynamic branch was removed"
+                );
+                assert!(
+                    wait_for_sample(&fixed_preview_sink, Duration::from_secs(5)),
+                    "cycle {cycle}: fixed preview branch stopped producing after a dynamic branch was removed"
+                );
+
+                let tee_sink = tee.static_pad("sink").expect("tee should have a sink pad");
+                assert!(
+                    !tee_sink.pad_flags().contains(gst::PadFlags::EOS),
+                    "cycle {cycle}: the tee's sink pad went EOS — branch removal leaked EOS upstream into the shared \
+                     capture source, which kills every branch on this tee"
+                );
+            }
+
+            pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+        }
+
+        /// The highest-risk piece of this whole mechanism per the
+        /// architecture agent's own assessment: repeated add/remove cycles
+        /// against a live pipeline must never stall it and must never leak
+        /// elements. ~50 cycles, each bounded by its own timeout so a real
+        /// hang fails this test loudly instead of wedging CI.
+        #[tokio::test]
+        async fn repeated_add_remove_cycles_do_not_stall_the_pipeline() {
+            if gst::init().is_err() {
+                eprintln!("skipping: gstreamer not available in this environment");
+                return;
+            }
+
+            let (pipeline, tee) = build_test_pipeline();
+            pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+            let (state_result, ..) = pipeline.state(gst::ClockTime::from_seconds(5));
+            state_result.expect("pipeline should settle into PLAYING");
+
+            let baseline_children = pipeline.children().len();
+
+            for cycle in 0..50u32 {
+                // `add_branch` is synchronous (no waiting on any GStreamer
+                // event) — it either finishes near-instantly or errors, so
+                // unlike `remove_branch` below it needs no timeout wrapper
+                // of its own to guard against a hang.
+                let branch = add_branch(&pipeline, &tee, BranchId(cycle), small_settings())
+                    .unwrap_or_else(|e| panic!("cycle {cycle}: add_branch failed: {e:#}"));
+                assert_eq!(branch.id, BranchId(cycle), "cycle {cycle}: returned branch should carry the id it was created with");
+
+                assert!(
+                    wait_for_sample(&branch.appsink, Duration::from_secs(5)),
+                    "cycle {cycle}: branch produced no output"
+                );
+
+                tokio::time::timeout(Duration::from_secs(10), remove_branch(&pipeline, &tee, branch))
+                    .await
+                    .unwrap_or_else(|_| panic!("cycle {cycle}: remove_branch hung past its timeout"))
+                    .unwrap_or_else(|e| panic!("cycle {cycle}: remove_branch failed: {e:#}"));
+
+                let (state_result, current, _pending) = pipeline.state(gst::ClockTime::from_seconds(5));
+                state_result.unwrap_or_else(|e| panic!("cycle {cycle}: pipeline state query failed: {e:?}"));
+                assert_eq!(current, gst::State::Playing, "cycle {cycle}: pipeline dropped out of Playing");
+
+                assert_eq!(
+                    pipeline.children().len(),
+                    baseline_children,
+                    "cycle {cycle}: pipeline element count did not return to baseline after removal — a leaked branch"
+                );
+            }
+
+            pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+        }
+
+        /// [`swap_branch`]'s make-before-break contract: right after it
+        /// returns, both the new branch and the still-not-yet-removed old
+        /// branch must be live and producing output simultaneously — the
+        /// caller (a later stage) is what eventually calls [`remove_branch`]
+        /// on the old one, never `swap_branch` itself.
+        #[tokio::test]
+        async fn swap_branch_keeps_old_branch_alive_while_new_branch_produces_output() {
+            if gst::init().is_err() {
+                eprintln!("skipping: gstreamer not available in this environment");
+                return;
+            }
+
+            let (pipeline, tee) = build_test_pipeline();
+            pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+            let (state_result, ..) = pipeline.state(gst::ClockTime::from_seconds(5));
+            state_result.expect("pipeline should settle into PLAYING");
+
+            let old = add_branch(&pipeline, &tee, BranchId(1), small_settings()).expect("add_branch should succeed");
+            assert!(
+                wait_for_sample(&old.appsink, Duration::from_secs(5)),
+                "old branch should produce output before the swap"
+            );
+
+            let new_settings = EncodeSettings { bitrate_kbps: 900, ..small_settings() };
+            let new = swap_branch(&pipeline, &tee, BranchId(2), new_settings).expect("swap_branch should succeed");
+
+            // Both branches must coexist and produce output right away —
+            // make-before-break means the old branch is never disturbed by
+            // the swap call itself.
+            assert!(
+                wait_for_sample(&new.appsink, Duration::from_secs(5)),
+                "new branch should produce output immediately after swap_branch returns"
+            );
+            assert!(
+                wait_for_sample(&old.appsink, Duration::from_secs(5)),
+                "old branch should still be producing output after the swap — swap_branch must not touch it"
+            );
+
+            tokio::time::timeout(Duration::from_secs(10), remove_branch(&pipeline, &tee, old))
+                .await
+                .expect("remove_branch(old) should not hang")
+                .expect("remove_branch(old) should succeed");
+            tokio::time::timeout(Duration::from_secs(10), remove_branch(&pipeline, &tee, new))
+                .await
+                .expect("remove_branch(new) should not hang")
+                .expect("remove_branch(new) should succeed");
+
+            pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+        }
+    }
 }
 
 #[cfg(test)]
