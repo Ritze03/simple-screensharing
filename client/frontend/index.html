@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Simple Screensharing</title>
+  <link rel="stylesheet" href="styles/tokens.css" />
+  <link rel="stylesheet" href="styles/fonts.css" />
+  <link rel="stylesheet" href="styles/shell.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <h1>Simple Screensharing</h1>
+      </div>
+
+      <nav class="nav" id="nav" aria-label="Primary"></nav>
+
+      <section class="rooms-section" aria-label="Rooms">
+        <h2 class="section-label">Rooms</h2>
+        <div class="rooms-list" id="rooms-list"></div>
+      </section>
+
+      <div class="add-room-wrap">
+        <button class="btn btn-secondary" id="add-room-btn" style="width: 100%">+ Add Room</button>
+        <div class="add-room-card" id="add-room-card" hidden></div>
+      </div>
+
+      <section class="streams-section" aria-label="Streams">
+        <h2 class="section-label">Streams</h2>
+        <div class="streams-list" id="streams-list"></div>
+        <!-- Dev-only: lets the empty/populated STREAMS states both be
+             reviewed without hand-editing mock data. Not a real feature. -->
+        <button class="streams-demo-toggle" id="streams-demo-toggle" type="button">
+          dev: toggle streams demo state
+        </button>
+      </section>
+    </aside>
+
+    <main class="content">
+      <section class="tab-panel" data-tab="Stream Control">
+        <h2>Stream Control</h2>
+        <div class="tab-placeholder-card">
+          Stream Control tab content goes here — bandwidth mode, start-a-stream picker,
+          and active-shares list (see <code>superdoc/features/stream-control.md</code>).
+          This is a placeholder proving the shell's nav-switching mechanism; another
+          worker builds the real feature set here.
+        </div>
+      </section>
+
+      <section class="tab-panel" data-tab="View" hidden>
+        <h2>View</h2>
+        <div class="view-empty-state">
+          Nobody's on screen right now — pick someone from a room in the sidebar and click Watch.
+        </div>
+      </section>
+
+      <section class="tab-panel" data-tab="Settings" hidden>
+        <h2>Settings</h2>
+        <div class="tab-placeholder-card">
+          Settings tab content goes here — language toggle, presentation-mode dropdown.
+          Placeholder only; real content is another worker's scope.
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="modal-overlay" id="modal-overlay" hidden></div>
+
+  <script src="scripts/components.js"></script>
+  <script src="scripts/shell.js"></script>
+</body>
+</html>

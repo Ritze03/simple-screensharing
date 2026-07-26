@@ -1,0 +1,124 @@
+/*
+ * tokens.css — shared design-token source of truth for the Tauri frontend.
+ *
+ * This file is a 1:1 CSS translation of `src/theme.rs` (the egui desktop
+ * client's central theme module), plus a handful of new sidebar-specific
+ * elevation/wash tokens taken from the design handoff (see
+ * `superdoc/ui/APP-SHELL.md` and the handoff screenshots under
+ * `project/shots/*.png`, cross-referenced by exact hex against `theme.rs`).
+ *
+ * Every other frontend/ file (shell.css today; Stream Control / View /
+ * Settings styles later) should reference these custom properties by role
+ * (`var(--accent)`, `var(--rounding)`, ...) rather than hard-coding a hex or
+ * pixel value at the call site — exactly the discipline theme.rs enforces on
+ * the Rust/egui side. If a design change is needed, it should be a one-file
+ * edit here, not a grep-and-replace across every screen.
+ *
+ * Do not duplicate this file per-screen. Other workers building Stream
+ * Control / View / Settings tab content should `<link>` this same file.
+ */
+
+:root {
+  /* -------------------------------------------------------------------
+   * Color tokens — ported 1:1 from theme.rs (see that file for the
+   * design-rationale comments behind each choice; kept short here).
+   * ----------------------------------------------------------------- */
+
+  /* Brand accent — nav active pill, primary buttons, selection tint. */
+  --accent: #4c6ef5;
+
+  /* Elevation tiers (dark -> light): sunken < base < raised. */
+  --panel-sunken: #17181b;
+  --panel-base: #1e1f22;
+  --panel-raised: #27282d;
+
+  /* Hairline borders / dividers. */
+  --border: #3a3b40;
+
+  /* Text */
+  --text: #e8e9ec;
+  --text-dim: #a8aab2;
+  --text-faint: #6e7078;
+
+  /* Inputs / code-block backgrounds. */
+  --field: #28292d;
+
+  /* Secondary button. */
+  --btn: #2c2d32;
+  --btn-border: #44454c;
+
+  /* Text drawn on top of an accent-filled primary surface. */
+  --primary-text: #0b0c10;
+
+  /* Severity colors. */
+  --danger: #e05a5a;
+  --success: #50c878;
+  --warning: #e8a33d;
+
+  /* -------------------------------------------------------------------
+   * New tokens from the design handoff — not yet in theme.rs, scoped to
+   * the sidebar rail specifically (a deeper recess than `--panel-sunken`,
+   * plus a family of hover/active row washes). Confirmed by a prior scout
+   * to not collide with any existing theme.rs value.
+   * ----------------------------------------------------------------- */
+
+  /* Sidebar rail's own sunken background (deeper than --panel-sunken). */
+  --sidebar-rail: #101114;
+
+  /* Additional elevation surfaces seen in the handoff shots. */
+  --elevation-1b: #1b1c1f;
+  --elevation-16: #16171a;
+  --elevation-19: #191a1e;
+  --elevation-14: #141518;
+
+  /* Hover / active row wash tints, for list rows (room rows, stream rows,
+     nav items) that need a subtler lift than a full panel tier swap. */
+  --wash-hover-1: #24252a;
+  --wash-hover-2: #26272c;
+  --wash-active-1: #2a2b30;
+  --wash-active-2: #1f2024;
+
+  /* Lighter border variant, used where --border reads too heavy against a
+     raised surface (e.g. the joined-room row's card border). */
+  --border-light: #34353b;
+
+  /* Status pill backgrounds (tinted fills for badges/pills, not raw
+     severity text). */
+  --pill-success-bg: #3f6a4f;
+  --pill-success-bg-dim: #2f4a3a;
+  --pill-accent-bg: #2b3ea8;
+  --pill-accent-bg-light: #5c7bf7;
+  --pill-accent-bg-lighter: #8ea3f9;
+
+  /* -------------------------------------------------------------------
+   * Spacing / sizing / rounding — ported from theme.rs's constants.
+   * ----------------------------------------------------------------- */
+
+  --spacing: 7px;
+  --rounding: 14px;
+  --rounding-sm: 8px;
+  --value-w: 64px;
+  --nav-button-height: 38px;
+  --dot-size: 9px;
+  --panel-max-width: 520px;
+
+  /* Frontend-only layout constants (no theme.rs equivalent — these are
+     shell-level, not a widget token). */
+  --sidebar-width: 288px;
+  --streams-max-height: 220px;
+  --rooms-row-radius: var(--rounding-sm);
+
+  /* -------------------------------------------------------------------
+   * Fonts.
+   *
+   * Geist Mono + Material Symbols Outlined are vendored locally (see
+   * frontend/fonts/) rather than pulled from the Google Fonts CDN, so the
+   * shell renders correctly offline and under a CSP-locked Tauri webview.
+   * Only the Regular (400) weight is vendored; bold text falls back to the
+   * browser's synthetic bold (see fonts.css for the full rationale). Falls
+   * back to a system monospace stack if the font fails to load for any
+   * reason.
+   * ----------------------------------------------------------------- */
+  --font-mono: "Geist Mono", ui-monospace, "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  --font-icons: "Material Symbols Outlined";
+}

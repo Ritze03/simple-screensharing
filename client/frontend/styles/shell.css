@@ -1,0 +1,591 @@
+/*
+ * shell.css — sidebar/nav/rooms/streams layout + the placeholder content
+ * area. Everything here references tokens.css custom properties by role;
+ * no raw hex/px values for anything tokens.css already names.
+ */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--panel-base);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+input {
+  font-family: inherit;
+  font-size: inherit;
+}
+
+.app {
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* -------------------------------------------------------------------
+ * Sidebar
+ * ----------------------------------------------------------------- */
+
+.sidebar {
+  width: var(--sidebar-width);
+  flex: 0 0 var(--sidebar-width);
+  background: var(--sidebar-rail);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.sidebar-header {
+  padding: 18px 16px 10px;
+}
+
+.sidebar-header h1 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.nav {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing);
+  padding: 0 12px 12px;
+}
+
+.nav-btn {
+  height: var(--nav-button-height);
+  width: 100%;
+  border: none;
+  border-radius: var(--rounding);
+  background: transparent;
+  color: var(--text-dim);
+  font-weight: 700;
+  cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+.nav-btn:hover {
+  background: var(--wash-hover-1);
+  color: var(--text);
+}
+
+.nav-btn-active,
+.nav-btn-active:hover {
+  background: var(--accent);
+  color: var(--primary-text);
+}
+
+/* -------------------------------------------------------------------
+ * ROOMS — the greedy, scrollable middle section.
+ * ----------------------------------------------------------------- */
+
+.rooms-section {
+  flex: 1 1 auto;
+  min-height: 60px;
+  display: flex;
+  flex-direction: column;
+  padding: 4px 12px 0;
+  overflow: hidden;
+}
+
+.section-label {
+  margin: 8px 4px 6px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.rooms-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-bottom: 8px;
+}
+
+.rooms-empty-hint {
+  margin: 0 4px;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+.room-row {
+  border-radius: var(--rooms-row-radius);
+  padding: 6px 4px;
+}
+
+.room-row-joined {
+  background: var(--wash-active-2);
+}
+
+.room-row:hover {
+  background: var(--wash-hover-2);
+}
+
+.room-row-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+}
+
+.room-caret {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--rounding-sm);
+}
+
+.room-caret:hover {
+  background: var(--wash-hover-1);
+}
+
+.room-caret .material-symbols-outlined {
+  font-size: 18px;
+}
+
+.room-caret-spacer {
+  cursor: default;
+}
+
+.room-name {
+  flex: 1 1 auto;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.room-row-disconnected .room-name {
+  color: var(--text-dim);
+}
+
+.room-row-trailing {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.room-meta {
+  font-size: 11px;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+.room-sub-meta {
+  padding: 0 4px 2px 26px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.room-reconnect-btn {
+  padding: 2px 10px;
+  height: 22px;
+  font-size: 11px;
+}
+
+.room-members {
+  padding: 2px 4px 4px 26px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.room-member-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.room-member-name {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.room-member-caps {
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+
+.room-members-empty {
+  font-size: 11px;
+  color: var(--text-faint);
+  padding: 2px 0;
+}
+
+/* -------------------------------------------------------------------
+ * Status dot — three states.
+ * ----------------------------------------------------------------- */
+
+.status-dot {
+  flex: 0 0 auto;
+  width: var(--dot-size);
+  height: var(--dot-size);
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.status-dot-joined {
+  background: var(--success);
+}
+
+.status-dot-disconnected {
+  background: transparent;
+  border: 1.5px solid var(--text-faint);
+  width: calc(var(--dot-size) - 3px);
+  height: calc(var(--dot-size) - 3px);
+}
+
+.status-dot-reconnecting {
+  background: var(--warning);
+  animation: pulse-dot 1.4s ease-in-out infinite;
+}
+
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.25;
+  }
+}
+
+/* -------------------------------------------------------------------
+ * "+ Add Room"
+ * ----------------------------------------------------------------- */
+
+.add-room-wrap {
+  flex: 0 0 auto;
+  padding: 8px 12px;
+}
+
+.add-room-card {
+  background: var(--elevation-1b);
+  border: 1px solid var(--border-light);
+  border-radius: var(--rounding);
+  padding: var(--spacing);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* `.add-room-card`'s own `display: flex` above has the same specificity as
+   the UA stylesheet's `[hidden] { display: none }` and loads later, so it
+   silently wins and the `hidden` attribute stops hiding the card. Every
+   class here that sets its own `display` on a toggle-shown element needs
+   this same override — see also `.tab-panel` (relies on default block, no
+   override needed) and `.modal-overlay` (already has its own `[hidden]`
+   rule). */
+.add-room-card[hidden] {
+  display: none;
+}
+
+.add-room-label {
+  margin: 0 0 2px;
+}
+
+.field-label {
+  font-size: 11px;
+  color: var(--text-dim);
+  margin-top: 4px;
+}
+
+.field-input {
+  background: var(--field);
+  border: 1px solid var(--border);
+  border-radius: var(--rounding-sm);
+  color: var(--text);
+  padding: 6px 8px;
+  outline: none;
+}
+
+.field-input:focus {
+  border-color: var(--accent);
+}
+
+.add-room-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+/* -------------------------------------------------------------------
+ * Buttons (shared primitives, used across sidebar + tab content).
+ * ----------------------------------------------------------------- */
+
+.btn {
+  border-radius: var(--rounding);
+  border: 1px solid transparent;
+  padding: 6px 14px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.btn:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: var(--primary-text);
+  font-weight: 700;
+}
+
+.btn-primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+.btn-secondary {
+  background: var(--btn);
+  color: var(--text);
+  border-color: var(--btn-border);
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background: var(--wash-hover-1);
+}
+
+.btn-danger {
+  background: transparent;
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: rgba(224, 90, 90, 0.12);
+}
+
+.btn-icon {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  border-radius: var(--rounding-sm);
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.btn-icon:hover {
+  background: var(--wash-hover-1);
+  color: var(--text);
+}
+
+.btn-icon .material-symbols-outlined {
+  font-size: 18px;
+}
+
+.btn-icon.watch-active {
+  color: var(--accent);
+}
+
+/* -------------------------------------------------------------------
+ * STREAMS — capped, independently-scrolling.
+ * ----------------------------------------------------------------- */
+
+.streams-section {
+  flex: 0 0 auto;
+  padding: 4px 12px 14px;
+  border-top: 1px solid var(--border);
+}
+
+.streams-list {
+  max-height: var(--streams-max-height);
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.stream-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px;
+  font-size: 12px;
+  color: var(--text-dim);
+  border-radius: var(--rounding-sm);
+}
+
+.stream-row:hover {
+  background: var(--wash-hover-1);
+}
+
+.stream-audio-glyph {
+  font-size: 15px;
+  color: var(--text-faint);
+}
+
+.empty-state {
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.empty-state-message {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+.empty-state-action {
+  width: 100%;
+}
+
+.streams-demo-toggle {
+  margin-top: 8px;
+  width: 100%;
+  background: transparent;
+  border: 1px dashed var(--border-light);
+  color: var(--text-faint);
+  border-radius: var(--rounding-sm);
+  padding: 3px 6px;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.streams-demo-toggle:hover {
+  color: var(--text-dim);
+  border-color: var(--text-faint);
+}
+
+/* -------------------------------------------------------------------
+ * Content area — per-tab placeholders (real content is other workers'
+ * scope; this just proves the switcher works).
+ * ----------------------------------------------------------------- */
+
+.content {
+  flex: 1 1 auto;
+  overflow: auto;
+  padding: 24px;
+}
+
+.tab-panel h2 {
+  margin-top: 0;
+  color: var(--text);
+}
+
+.tab-placeholder-card {
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--rounding);
+  padding: 16px;
+  max-width: var(--panel-max-width);
+  color: var(--text-dim);
+}
+
+.view-empty-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 60vh;
+  color: var(--text-faint);
+  font-size: 14px;
+}
+
+/* -------------------------------------------------------------------
+ * Leave-confirm modal.
+ * ----------------------------------------------------------------- */
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal-overlay[hidden] {
+  display: none;
+}
+
+.modal {
+  background: var(--elevation-19);
+  border: 1px solid var(--border-light);
+  border-radius: var(--rounding);
+  padding: 16px;
+  width: 320px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+
+.modal-title {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 8px;
+}
+
+.modal-heading {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+
+.modal-body {
+  font-size: 12px;
+  color: var(--warning);
+  margin-bottom: 14px;
+}
+
+.modal-actions {
+  display: flex;
+  gap: 8px;
+}
+
+/* -------------------------------------------------------------------
+ * Scrollbars — thin, matches the dark rail rather than the OS default.
+ * ----------------------------------------------------------------- */
+
+.rooms-list::-webkit-scrollbar,
+.streams-list::-webkit-scrollbar,
+.content::-webkit-scrollbar {
+  width: 8px;
+}
+
+.rooms-list::-webkit-scrollbar-thumb,
+.streams-list::-webkit-scrollbar-thumb,
+.content::-webkit-scrollbar-thumb {
+  background: var(--border-light);
+  border-radius: var(--rounding-sm);
+}
