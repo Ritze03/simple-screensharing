@@ -121,4 +121,19 @@
    * ----------------------------------------------------------------- */
   --font-mono: "Geist Mono", ui-monospace, "JetBrains Mono", "Cascadia Code", Consolas, monospace;
   --font-icons: "Material Symbols Outlined";
+
+  /* This app is always-dark (no light theme), but native form controls
+   * (<select>, <input type="number">'s spinner buttons, <input
+   * type="range">'s track/thumb) fall back to the OS's light chrome for
+   * whatever parts of themselves the engine paints natively, regardless of
+   * the explicit `background`/`color` every select/number input already
+   * sets per-component (see stream-control.css). This has been reported
+   * from the compiled desktop app (Tauri's Linux webview, WebKitGTK) —
+   * plain Chromium (used for local dev) doesn't show it, which is why it's
+   * easy to miss in-browser. `color-scheme: dark` is the standard fix: it
+   * tells the engine which palette to paint its own native chrome in,
+   * without having to `appearance: none` and hand-roll a replacement
+   * dropdown/spinner (see frontend/styles/stream-control.css and
+   * shell.css's `.field-input` for the explicit colors this complements). */
+  color-scheme: dark;
 }
