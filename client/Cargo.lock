@@ -4352,6 +4352,7 @@ dependencies = [
  "gstreamer-app",
  "gstreamer-video",
  "image",
+ "indexmap",
  "postcard",
  "quinn",
  "rand 0.10.2",

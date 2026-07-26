@@ -10,11 +10,49 @@
 //! Incoming presence/media events are drained the same way from the
 //! `mpsc::UnboundedReceiver<ClientEvent>` that `ScreenshareClient::connect`
 //! returns.
+//!
+//! # Session data model (rooms, captures, destinations)
+//!
+//! [`App`] owns three collections that together describe "what this client is
+//! doing right now". None of it is persisted — every launch starts empty
+//! (only `rooms.rs`'s `RoomStore`/`AppSettings` survive a restart):
+//!
+//! - `rooms: IndexMap<RoomHandle, RoomSession>` — one entry per joined room.
+//!   A room *is* one QUIC connection: the protocol welds a `ScreenshareClient`
+//!   to exactly one room, so N rooms means N connections (all riding the one
+//!   shared `quinn::Endpoint` in `App::endpoint`). Everything genuinely
+//!   room-scoped — roster, announced streams, watches, audio watches, preview
+//!   cache/textures, the `stream_id` allocator — lives here, which is what
+//!   keeps two rooms from colliding on a shared key space.
+//! - `captures: IndexMap<CaptureSourceId, LocalCapture>` — one entry per local
+//!   GStreamer capture pipeline (a screen share, or an audio source). **All**
+//!   capture/pipeline state lives here, not under a room.
+//! - each `LocalCapture` owns `destinations: IndexMap<DestinationId, Destination>`
+//!   — one entry per room this capture is being sent into.
+//!
+//! `Why:` (captures are `App`-owned, and own their destinations rather than
+//! the other way round) one capture is eventually meant to feed several rooms
+//! at once — one real screen grab, N independently encoded and independently
+//! encrypted outgoing streams, because encryption keys and nonce spaces are
+//! room-bound and can never be shared across rooms. If a room owned its
+//! captures, leaving that room would tear down a pipeline other rooms are
+//! still using. With captures owned by `App` and destinations owned by the
+//! capture, leaving a room only removes that room's destinations; the capture
+//! survives as long as any destination remains. `RoomSession` keeps only a
+//! `Vec<DestinationId>` back-reference so a room can still answer "what am I
+//! sending here?" in its own order.
+//!
+//! **This stage ships exactly one destination per capture** — the fan-out
+//! machinery (dynamic GStreamer tee branches) is later work; the ids and
+//! ownership are already in their final shape so nothing has to be re-keyed
+//! when it lands. The visible UI is likewise still single-room: `active_room`
+//! names the one `RoomSession` the join/roster/share/watch screens drive.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use indexmap::IndexMap;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::audio::{self, AudioCaptureHandle, AudioSource};
@@ -56,6 +94,38 @@ const DEFAULT_FRAMERATE: u32 = 30;
 /// values that actually correspond to real monitor refresh rates.
 const FRAMERATE_OPTIONS: [u32; 7] = [30, 60, 90, 120, 144, 165, 240];
 
+// ---------------------------------------------------------------------
+// Session ids
+// ---------------------------------------------------------------------
+//
+// `Why:` (opaque `u32` newtypes with a monotonic per-`App` counter, not
+// indices into the maps and not the protocol's own ids) three properties are
+// wanted at once. **Not indices**: `IndexMap` shifts indices on removal, so an
+// id held across a removal would silently start addressing a *different*
+// room/capture. Allocating from a counter that never rewinds within a session
+// means a stale id can only ever miss, never alias. **Not protocol ids**: a
+// `StreamId` is one byte and is only unique within one connection — exactly
+// the collision the multi-room refactor exists to remove — and a `ConnId` is
+// assigned by the relay, so neither can key local state that spans rooms.
+// **Distinct types rather than a shared `Id(u32)`**: passing a
+// `CaptureSourceId` where a `RoomHandle` belongs is then a compile error, and
+// these get passed through a lot of plumbing. `u32` (not `u64`) because these
+// count user actions — joins, screen shares — in one process lifetime.
+
+/// Identifies one joined room (one QUIC connection) for this session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RoomHandle(u32);
+
+/// Identifies one local capture pipeline (one screen grab, or one audio
+/// source) for this session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CaptureSourceId(u32);
+
+/// Identifies one outgoing stream: one capture, encoded and encrypted for one
+/// room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DestinationId(u32);
+
 /// Either kind of running outbound share this client can hold onto.
 enum ShareHandle {
     Video(CaptureHandle),
@@ -72,15 +142,54 @@ enum ShareStatus {
     Stopping(oneshot::Receiver<Result<(), String>>),
 }
 
-/// One outbound share this connection owns (video or audio), keyed by its
-/// `stream_id` in `Connected::active_shares`. Multiple can be active at
-/// once — e.g. two monitors, or a video share plus an audio share.
-struct ActiveShare {
+/// One room this capture is being sent into: the room, plus the `stream_id`
+/// announced on *that* room's connection.
+///
+/// `Why:` (no back-pointer to the owning capture, no copy of its own
+/// `DestinationId`) a `Destination` is only ever reachable by walking
+/// `App::captures` → `LocalCapture::destinations`, so both the owning
+/// `CaptureSourceId` and this destination's own `DestinationId` are already
+/// in hand at every use site. Storing them here would be a second copy to
+/// keep in sync, with nothing to gain. Later stages grow this struct with the
+/// genuinely per-destination things (resolution/fps/bitrate, `DestinationState`,
+/// the wire-PTS epoch) — that's what makes it a struct today rather than a
+/// bare `(RoomHandle, StreamId)` tuple.
+struct Destination {
+    room: RoomHandle,
+    /// This destination's `stream_id` on `room`'s connection — allocated from
+    /// that `RoomSession`'s own `next_stream_id`, so the same capture fanned
+    /// out to two rooms can (and generally will) carry a different
+    /// `stream_id` in each.
+    stream_id: StreamId,
+}
+
+/// One local capture pipeline (video or audio) and every room it feeds.
+/// Several can run at once — e.g. two monitors, or a screen share plus an
+/// audio share. Owned by `App::captures`, never by a room: see this module's
+/// "Session data model" docs for why.
+struct LocalCapture {
     kind: StreamKind,
-    /// Human-readable label for this share's row: "Screen share" for video,
+    /// Human-readable label for this capture's row: "Screen share" for video,
     /// the source's name for audio.
     label: String,
     status: ShareStatus,
+    /// Rooms this capture is being sent into. Exactly one entry for now (see
+    /// the module docs); the map — rather than a single field — is what later
+    /// fan-out work grows into without re-keying anything.
+    destinations: IndexMap<DestinationId, Destination>,
+    /// Live self-preview texture for this capture (video only), created
+    /// lazily on the first captured frame then updated in place. Populated by
+    /// `App::update_self_preview_textures` from
+    /// `CaptureHandle::self_preview_frame`. See
+    /// `superdoc/features/self-preview.md`.
+    ///
+    /// `Why:` (one texture on the capture, rather than a `HashMap<StreamId, _>`
+    /// on the room) a self-preview shows what *this machine is capturing*,
+    /// which is a property of the capture and identical for every room it's
+    /// sent to. Keying it by `stream_id` — as this did while there was only
+    /// ever one connection — collides the moment two rooms exist, since
+    /// `stream_id` is only unique within one connection.
+    self_preview_texture: Option<egui::TextureHandle>,
 }
 
 /// One stream currently being watched: its decoder, plus the texture handle
@@ -102,9 +211,9 @@ struct WatchEntry {
     /// instead of the central panel.
     popout: Option<PopoutState>,
     /// The stream_id of the same sender's audio stream, if one was active
-    /// when this video watch started (see `Connected::toggle_watch`'s
+    /// when this video watch started (see `RoomSession::toggle_watch`'s
     /// auto-subscribe-audio behavior) and got auto-subscribed alongside it.
-    /// Looked up in `Connected::audio_watches` to render the volume slider
+    /// Looked up in `RoomSession::audio_watches` to render the volume slider
     /// next to the video panel and to tear the audio watch down together
     /// with this one. `None` if the sender had no audio stream announced at
     /// watch time.
@@ -115,7 +224,7 @@ struct WatchEntry {
 /// alongside a video `WatchEntry` (see `WatchEntry::audio_stream_id`) or
 /// started standalone via a "Listen" click on an audio-only stream (no
 /// video from the same sender). Keyed the same way as `watches`, in
-/// `Connected::audio_watches`.
+/// `RoomSession::audio_watches`.
 struct AudioWatch {
     decoder: AudioDecoder,
     /// 0-200, the value bound to this stream's volume slider. Applied to
@@ -146,8 +255,15 @@ enum Status {
     Error(String),
 }
 
-/// State once `connect()` has succeeded.
-struct Connected {
+/// One joined room: its QUIC connection and everything genuinely scoped to
+/// that room. Replaces the old singleton `Connected`.
+///
+/// Every collection in here is room-scoped *by construction* — living inside
+/// the `RoomSession` is what makes `(ConnId, StreamId)` keys unambiguous
+/// again, since a `StreamId` is only unique within one connection and a
+/// second room would otherwise reuse the same small integers for entirely
+/// different streams.
+struct RoomSession {
     client: ScreenshareClient,
     event_rx: mpsc::UnboundedReceiver<ClientEvent>,
     members: Vec<Member>,
@@ -156,36 +272,24 @@ struct Connected {
     /// Set once the user has saved this room, so we don't offer to re-save.
     saved: bool,
 
-    /// This connection's own outbound shares (video and/or audio), keyed by
-    /// stream_id. Several can be active concurrently.
-    active_shares: HashMap<StreamId, ActiveShare>,
-    share_error: Option<String>,
-    /// Single per-connection counter for allocating our own `stream_id`s,
-    /// shared across video and audio shares (protocol nonce-domain
-    /// separation is per stream_id, not per media kind).
+    /// What this client is currently sending *into this room*, in the order
+    /// the user started them. Back-references only: the `Destination`s
+    /// themselves are owned by their `LocalCapture` in `App::captures` (see
+    /// the module docs), because a capture outlives any single room it feeds.
+    destinations: Vec<DestinationId>,
+    /// Single per-room counter for allocating our own `stream_id`s on *this*
+    /// connection, shared across video and audio (protocol nonce-domain
+    /// separation is per stream_id, not per media kind). Per room rather than
+    /// global: `stream_id` is scoped to a connection, so every room starts
+    /// from 0 independently and two rooms handing out the same number is
+    /// correct, not a collision.
     next_stream_id: StreamId,
-    /// Bitrate (kbps) to use for the *next* video share started.
-    bitrate_kbps: u32,
-    /// Capture framerate cap (fps) to use for the *next* video share
-    /// started — see `capture::build_pipeline`'s `videorate` cap and
-    /// `key-int-max` scaling.
-    framerate: u32,
 
-    /// Audio sources discovered by the last `list_audio_sources()` call.
-    audio_sources: Vec<AudioSource>,
-    audio_sources_error: Option<String>,
-    /// Set once we've kicked off the first automatic listing, so we don't
-    /// re-trigger it every frame.
-    audio_sources_requested: bool,
-    /// In-flight `list_audio_sources()` call, if any.
-    audio_sources_rx: Option<oneshot::Receiver<Result<Vec<AudioSource>, String>>>,
-    selected_audio_source: Option<AudioSource>,
-
-    /// Streams we're currently subscribed to and decoding, keyed by
-    /// (owner conn_id, stream_id).
+    /// Streams we're currently subscribed to and decoding in this room, keyed
+    /// by (owner conn_id, stream_id).
     watches: HashMap<(ConnId, StreamId), WatchEntry>,
     watch_error: Option<String>,
-    /// Which watched stream the central video panel currently displays.
+    /// Which watched stream of this room's the central video panel displays.
     selected_watch: Option<(ConnId, StreamId)>,
 
     /// Audio streams we're currently subscribed to and playing, keyed by
@@ -196,24 +300,15 @@ struct Connected {
     /// `toggle_listen`).
     audio_watches: HashMap<(ConnId, StreamId), AudioWatch>,
 
-    /// Latest decoded preview still per active stream, regardless of
-    /// whether it's being watched — previews arrive for every active
-    /// stream (spec design), so the "Streams" list row for any of them can
-    /// show a thumbnail once one has arrived.
+    /// Latest decoded preview still per active stream in this room,
+    /// regardless of whether it's being watched — previews arrive for every
+    /// active stream (spec design), so the "Streams" list row for any of them
+    /// can show a thumbnail once one has arrived.
     preview_cache: PreviewCache,
     /// Lazily created/updated texture per stream for the "Streams" list
     /// thumbnail, keyed the same way as `preview_cache`/`watches`. Mirrors
     /// `WatchEntry::texture`'s create-once/`set`-in-place pattern.
     preview_textures: HashMap<(ConnId, StreamId), egui::TextureHandle>,
-
-    /// Live self-preview texture per active outbound video share, keyed by
-    /// its own `stream_id` (see `active_shares`) — sender-side only, so this
-    /// is *this* connection's own captured video, not another member's
-    /// stream. Populated by `update_self_preview_textures` from
-    /// `CaptureHandle::self_preview_frame`, mirroring `preview_textures`'
-    /// create-once/`set`-in-place pattern. See
-    /// `superdoc/features/self-preview.md`.
-    self_preview_textures: HashMap<StreamId, egui::TextureHandle>,
 }
 
 pub struct App {
@@ -221,7 +316,57 @@ pub struct App {
     display_name: String,
     status: Status,
     connect_rx: Option<oneshot::Receiver<ConnectResult>>,
-    connected: Option<Connected>,
+
+    /// The one local QUIC endpoint every room connection rides (see
+    /// `net.rs`'s "One endpoint, N connections"). Built once here, at `App`
+    /// construction, rather than per `connect()` call. `Err` carries the bind
+    /// failure so the join screen can report it instead of the app panicking
+    /// at startup over a socket it couldn't open.
+    endpoint: Result<quinn::Endpoint, String>,
+
+    /// Every room currently joined, in join order. See the module docs.
+    rooms: IndexMap<RoomHandle, RoomSession>,
+    /// Every local capture pipeline currently running, in start order, with
+    /// its destinations. See the module docs.
+    captures: IndexMap<CaptureSourceId, LocalCapture>,
+    /// Which room the (still single-room) connected screen drives.
+    ///
+    /// `Why:` the multi-room *sidebar* is a later stage; until it exists the
+    /// screens need one designated room to render, and this is deliberately a
+    /// view-level pointer rather than anything the data model depends on —
+    /// deleting it is all that's needed once the UI can show every room at
+    /// once. Kept in sync by `poll_connect_result` (set on join) and
+    /// `disconnect_room` (re-pointed on leave).
+    active_room: Option<RoomHandle>,
+
+    /// Monotonic id allocators — never rewind, never reuse (see the "Session
+    /// ids" note above).
+    next_room_handle: u32,
+    next_capture_id: u32,
+    next_destination_id: u32,
+
+    /// Last error from starting/stopping a capture. `App`-level, not
+    /// per-room: a capture is not owned by a room.
+    share_error: Option<String>,
+    /// Bitrate (kbps) to use for the *next* video capture started.
+    bitrate_kbps: u32,
+    /// Capture framerate cap (fps) to use for the *next* video capture
+    /// started — see `capture::build_pipeline`'s `videorate` cap and
+    /// `key-int-max` scaling.
+    framerate: u32,
+
+    /// Audio sources discovered by the last `list_audio_sources()` call.
+    /// `App`-level: this is what the *machine* can capture, which has nothing
+    /// to do with which rooms are joined.
+    audio_sources: Vec<AudioSource>,
+    audio_sources_error: Option<String>,
+    /// Set once we've kicked off the first automatic listing, so we don't
+    /// re-trigger it every frame.
+    audio_sources_requested: bool,
+    /// In-flight `list_audio_sources()` call, if any.
+    audio_sources_rx: Option<oneshot::Receiver<Result<Vec<AudioSource>, String>>>,
+    selected_audio_source: Option<AudioSource>,
+
     room_store: RoomStore,
     room_store_error: Option<String>,
     /// Current UI language ("en" or "de"), mirrored into `rust_i18n`'s
@@ -255,7 +400,21 @@ impl Default for App {
             display_name: whoami_fallback(),
             status: Status::Idle,
             connect_rx: None,
-            connected: None,
+            endpoint: crate::net::build_client_endpoint().map_err(|e| format!("{e:#}")),
+            rooms: IndexMap::new(),
+            captures: IndexMap::new(),
+            active_room: None,
+            next_room_handle: 0,
+            next_capture_id: 0,
+            next_destination_id: 0,
+            share_error: None,
+            bitrate_kbps: DEFAULT_BITRATE_KBPS,
+            framerate: DEFAULT_FRAMERATE,
+            audio_sources: Vec::new(),
+            audio_sources_error: None,
+            audio_sources_requested: false,
+            audio_sources_rx: None,
+            selected_audio_source: None,
             room_store,
             room_store_error,
             language: settings.language,
@@ -301,26 +460,75 @@ fn whoami_fallback() -> String {
         .unwrap_or_else(|_| t!("common.default_display_name").to_string())
 }
 
-impl Connected {
-    /// "Share Screen" clicked: allocate a fresh stream id and spawn
-    /// `capture::start_sharing` onto the ambient tokio runtime. Can be
-    /// called again while other shares (video or audio) are already active —
-    /// each call prompts the OS portal picker again, so a second click lets
-    /// the user pick a different monitor/window.
-    fn start_video_share(&mut self) {
-        let stream_id = self.next_stream_id;
-        self.next_stream_id = self.next_stream_id.wrapping_add(1);
+/// Resolve a `RoomSession::destinations` back-reference to the capture that
+/// owns it. `None` if the capture is already gone (a stale back-reference is
+/// harmless — ids are never reused, so a miss can only ever be a miss).
+fn find_destination(
+    captures: &IndexMap<CaptureSourceId, LocalCapture>,
+    id: DestinationId,
+) -> Option<(CaptureSourceId, &LocalCapture, &Destination)> {
+    captures
+        .iter()
+        .find_map(|(capture_id, capture)| capture.destinations.get(&id).map(|dest| (*capture_id, capture, dest)))
+}
 
-        let client = self.client.clone();
+/// The capture currently feeding `stream_id` into `room`, if any. This is the
+/// multi-room-correct inverse of the old `active_shares[stream_id]` lookup:
+/// `stream_id` alone is ambiguous once more than one connection exists, so
+/// the room the event arrived on has to be part of the key.
+fn capture_feeding(
+    captures: &IndexMap<CaptureSourceId, LocalCapture>,
+    room: RoomHandle,
+    stream_id: StreamId,
+) -> Option<&LocalCapture> {
+    captures
+        .values()
+        .find(|capture| capture.destinations.values().any(|d| d.room == room && d.stream_id == stream_id))
+}
+
+/// Capture-side operations: everything that owns or drives a local GStreamer
+/// pipeline. Deliberately on `App`, not on `RoomSession` — see the module
+/// docs' "Session data model".
+impl App {
+    fn alloc_capture_id(&mut self) -> CaptureSourceId {
+        let id = CaptureSourceId(self.next_capture_id);
+        self.next_capture_id = self.next_capture_id.wrapping_add(1);
+        id
+    }
+
+    fn alloc_destination_id(&mut self) -> DestinationId {
+        let id = DestinationId(self.next_destination_id);
+        self.next_destination_id = self.next_destination_id.wrapping_add(1);
+        id
+    }
+
+    /// "Share Screen" clicked: allocate a capture + one destination into
+    /// `room_handle` (with a fresh `stream_id` drawn from *that room's*
+    /// counter) and spawn `capture::start_sharing` onto the ambient tokio
+    /// runtime. Can be called again while other captures (video or audio) are
+    /// already running — each call prompts the OS portal picker again, so a
+    /// second click lets the user pick a different monitor/window.
+    fn start_video_share(&mut self, room_handle: RoomHandle) {
+        let capture_id = self.alloc_capture_id();
+        let destination_id = self.alloc_destination_id();
+
+        let Some(room) = self.rooms.get_mut(&room_handle) else { return };
+        let stream_id = room.next_stream_id;
+        room.next_stream_id = room.next_stream_id.wrapping_add(1);
+        room.destinations.push(destination_id);
+        let client = room.client.clone();
+
         let bitrate_kbps = self.bitrate_kbps;
         let framerate = self.framerate;
         let (tx, rx) = oneshot::channel();
-        self.active_shares.insert(
-            stream_id,
-            ActiveShare {
+        self.captures.insert(
+            capture_id,
+            LocalCapture {
                 kind: StreamKind::Video,
                 label: t!("share.video_label").to_string(),
                 status: ShareStatus::Starting(rx),
+                destinations: IndexMap::from([(destination_id, Destination { room: room_handle, stream_id })]),
+                self_preview_texture: None,
             },
         );
         self.share_error = None;
@@ -334,24 +542,31 @@ impl Connected {
         });
     }
 
-    /// "Share Audio" clicked: allocate a fresh stream id and spawn
-    /// `audio::start_audio_sharing` for the currently selected source.
-    /// No-op if no source is selected (the button is disabled in that case).
-    fn start_audio_share(&mut self) {
+    /// "Share Audio" clicked: same shape as `start_video_share`, for the
+    /// currently selected source. No-op if no source is selected (the button
+    /// is disabled in that case).
+    fn start_audio_share(&mut self, room_handle: RoomHandle) {
         let Some(source) = self.selected_audio_source.clone() else {
             return;
         };
-        let stream_id = self.next_stream_id;
-        self.next_stream_id = self.next_stream_id.wrapping_add(1);
+        let capture_id = self.alloc_capture_id();
+        let destination_id = self.alloc_destination_id();
 
-        let client = self.client.clone();
+        let Some(room) = self.rooms.get_mut(&room_handle) else { return };
+        let stream_id = room.next_stream_id;
+        room.next_stream_id = room.next_stream_id.wrapping_add(1);
+        room.destinations.push(destination_id);
+        let client = room.client.clone();
+
         let (tx, rx) = oneshot::channel();
-        self.active_shares.insert(
-            stream_id,
-            ActiveShare {
+        self.captures.insert(
+            capture_id,
+            LocalCapture {
                 kind: StreamKind::Audio,
                 label: source.name.clone(),
                 status: ShareStatus::Starting(rx),
+                destinations: IndexMap::from([(destination_id, Destination { room: room_handle, stream_id })]),
+                self_preview_texture: None,
             },
         );
         self.share_error = None;
@@ -365,18 +580,20 @@ impl Connected {
         });
     }
 
-    /// "Stop"/"Stop Sharing Audio" clicked for `stream_id`: hand the
+    /// "Stop"/"Stop Sharing Audio" clicked for `capture_id`: hand the
     /// underlying handle off to a spawned task that tears it down
     /// (`.stop()` is async on both `CaptureHandle` and `AudioCaptureHandle`).
-    fn stop_share(&mut self, stream_id: StreamId) {
-        let Some(share) = self.active_shares.get_mut(&stream_id) else {
+    /// The `LocalCapture` stays in the map, in `Stopping`, so the UI can show
+    /// that state; `poll_capture_states` reaps it once the stop lands.
+    fn stop_share(&mut self, capture_id: CaptureSourceId) {
+        let Some(capture) = self.captures.get_mut(&capture_id) else {
             return;
         };
-        if !matches!(share.status, ShareStatus::Active(_)) {
+        if !matches!(capture.status, ShareStatus::Active(_)) {
             return;
         }
         let (tx, rx) = oneshot::channel();
-        let ShareStatus::Active(handle) = std::mem::replace(&mut share.status, ShareStatus::Stopping(rx)) else {
+        let ShareStatus::Active(handle) = std::mem::replace(&mut capture.status, ShareStatus::Stopping(rx)) else {
             unreachable!("just matched Active above");
         };
 
@@ -391,72 +608,119 @@ impl Connected {
     }
 
     /// Abrupt teardown (relay/control connection lost, or the app quitting
-    /// while sharing): fire off `.stop()` for every currently `Active` share
-    /// so the portal session gets closed and the relay gets a stop-stream
-    /// notification, instead of just letting the handles drop synchronously
-    /// when `Connected`/`App` goes away right after this call.
+    /// while sharing): drop `capture_id` and fire off `.stop()` for it if it
+    /// was running, so the portal session gets closed and the relay gets a
+    /// stop-stream notification, instead of just letting the handle drop
+    /// synchronously when `App` goes away right after this call.
     ///
-    /// Mirrors `stop_share`'s spawn pattern exactly, but for every active
-    /// share at once and without waiting to see the result — the caller is
-    /// about to discard this `Connected` (or the whole app is exiting)
-    /// regardless of whether the stop finishes, so there is nothing
-    /// meaningful left to poll it into. `Starting`/`Stopping` shares are
-    /// left alone: a `Starting` share has no handle yet to stop, and a
-    /// `Stopping` one is already being torn down.
-    fn stop_all_shares_fire_and_forget(&mut self) {
-        for share in self.active_shares.values_mut() {
-            if !matches!(share.status, ShareStatus::Active(_)) {
-                continue;
+    /// Mirrors `stop_share`'s spawn pattern, but without waiting to see the
+    /// result — the caller is discarding this capture (or the whole app is
+    /// exiting) regardless of whether the stop finishes, so there is nothing
+    /// meaningful left to poll it into. `Starting`/`Stopping` captures are
+    /// left to their in-flight task: a `Starting` one has no handle yet to
+    /// stop, and a `Stopping` one is already being torn down.
+    fn drop_capture_fire_and_forget(&mut self, capture_id: CaptureSourceId) {
+        let Some(capture) = self.captures.shift_remove(&capture_id) else { return };
+        self.forget_destinations_of(&capture);
+        let ShareStatus::Active(handle) = capture.status else { return };
+        tokio::spawn(async move {
+            if let Err(e) = match handle {
+                ShareHandle::Video(h) => h.stop().await,
+                ShareHandle::Audio(h) => h.stop().await,
+            } {
+                tracing::warn!("stopping a capture during teardown failed: {e:#}");
             }
-            let (tx, rx) = oneshot::channel();
-            let ShareStatus::Active(handle) = std::mem::replace(&mut share.status, ShareStatus::Stopping(rx)) else {
-                unreachable!("just matched Active above");
-            };
-            tokio::spawn(async move {
-                let result = match handle {
-                    ShareHandle::Video(h) => h.stop().await,
-                    ShareHandle::Audio(h) => h.stop().await,
-                }
-                .map_err(|e| format!("{e:#}"));
-                let _ = tx.send(result);
-            });
+        });
+    }
+
+    /// Same, for every running capture at once (app exit).
+    fn stop_all_captures_fire_and_forget(&mut self) {
+        for capture_id in self.captures.keys().copied().collect::<Vec<_>>() {
+            self.drop_capture_fire_and_forget(capture_id);
         }
     }
 
-    /// Poll every in-flight share start/stop, if any. Call once per frame.
-    fn poll_share_states(&mut self) {
+    /// Drop `capture`'s destinations out of the back-reference lists of every
+    /// room they pointed into. Call whenever a `LocalCapture` leaves
+    /// `self.captures`, so no room is left advertising an outgoing stream
+    /// that no longer exists.
+    fn forget_destinations_of(&mut self, capture: &LocalCapture) {
+        for (destination_id, dest) in capture.destinations.iter() {
+            if let Some(room) = self.rooms.get_mut(&dest.room) {
+                room.destinations.retain(|d| d != destination_id);
+            }
+        }
+    }
+
+    /// Poll every in-flight capture start/stop, if any. Call once per frame.
+    fn poll_capture_states(&mut self) {
         let mut to_remove = Vec::new();
-        for (stream_id, share) in self.active_shares.iter_mut() {
-            match &mut share.status {
+        for (capture_id, capture) in self.captures.iter_mut() {
+            match &mut capture.status {
                 ShareStatus::Starting(rx) => match rx.try_recv() {
-                    Ok(Ok(handle)) => share.status = ShareStatus::Active(handle),
+                    Ok(Ok(handle)) => capture.status = ShareStatus::Active(handle),
                     Ok(Err(e)) => {
                         self.share_error = Some(e);
-                        to_remove.push(*stream_id);
+                        to_remove.push(*capture_id);
                     }
                     Err(oneshot::error::TryRecvError::Empty) => {}
                     Err(oneshot::error::TryRecvError::Closed) => {
                         self.share_error = Some(t!("errors.share_start_task_ended").to_string());
-                        to_remove.push(*stream_id);
+                        to_remove.push(*capture_id);
                     }
                 },
                 ShareStatus::Stopping(rx) => match rx.try_recv() {
-                    Ok(Ok(())) => to_remove.push(*stream_id),
+                    Ok(Ok(())) => to_remove.push(*capture_id),
                     Ok(Err(e)) => {
                         self.share_error = Some(e);
-                        to_remove.push(*stream_id);
+                        to_remove.push(*capture_id);
                     }
                     Err(oneshot::error::TryRecvError::Empty) => {}
                     Err(oneshot::error::TryRecvError::Closed) => {
                         self.share_error = Some(t!("errors.share_stop_task_ended").to_string());
-                        to_remove.push(*stream_id);
+                        to_remove.push(*capture_id);
                     }
                 },
                 ShareStatus::Active(_) => {}
             }
         }
-        for stream_id in to_remove {
-            self.active_shares.remove(&stream_id);
+        for capture_id in to_remove {
+            if let Some(capture) = self.captures.shift_remove(&capture_id) {
+                self.forget_destinations_of(&capture);
+            }
+        }
+    }
+
+    /// Upload any freshly captured self-preview frames (see
+    /// `capture::CaptureHandle::self_preview_frame` and
+    /// `superdoc/features/self-preview.md`) to each running video capture's
+    /// own texture. Call once per repaint alongside
+    /// `RoomSession::update_watch_textures`; cheap no-op when nothing new has
+    /// arrived.
+    ///
+    /// Unlike `update_watch_textures`, this doesn't need to drive the repaint
+    /// cadence itself: the self-preview branch is capped to a fixed, modest
+    /// rate (`capture::SELF_PREVIEW_BRANCH_FRAMERATE`), well within what
+    /// `update()`'s existing idle-fallback repaint interval already keeps up
+    /// with, so no extra `ctx.request_repaint()` is needed for this alone.
+    ///
+    /// No map cleanup pass any more: the texture lives on the `LocalCapture`,
+    /// so it dies exactly when the capture does.
+    fn update_self_preview_textures(&mut self, ctx: &egui::Context) {
+        for (capture_id, capture) in self.captures.iter_mut() {
+            let ShareStatus::Active(ShareHandle::Video(handle)) = &capture.status else {
+                continue;
+            };
+            let Some(image) = handle.self_preview_frame() else {
+                continue;
+            };
+            match &mut capture.self_preview_texture {
+                Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
+                None => {
+                    let name = format!("self-preview-{}", capture_id.0);
+                    capture.self_preview_texture = Some(ctx.load_texture(name, image, egui::TextureOptions::LINEAR));
+                }
+            }
         }
     }
 
@@ -500,7 +764,12 @@ impl Connected {
             }
         }
     }
+}
 
+/// Room-scoped operations: presence, watching, and the room's own view state.
+/// Everything in here was already correctly room-scoped as `Connected`; the
+/// only change is that there can now be several of them.
+impl RoomSession {
     /// The `stream_id` of `owner`'s currently-announced audio stream, if
     /// any — used by `toggle_watch` to auto-subscribe audio alongside video
     /// from the same sender. `announced-streams` state (`self.streams`) is
@@ -675,39 +944,6 @@ impl Connected {
         any_active
     }
 
-    /// Upload any freshly captured self-preview frames (see
-    /// `capture::CaptureHandle::self_preview_frame` and
-    /// `superdoc/features/self-preview.md`) to each active outbound video
-    /// share's own texture. Call once per repaint alongside
-    /// `update_watch_textures`; cheap no-op when nothing new has arrived.
-    ///
-    /// Unlike `update_watch_textures`, this doesn't need to drive the repaint
-    /// cadence itself: the self-preview branch is capped to a fixed, modest
-    /// rate (`capture::SELF_PREVIEW_BRANCH_FRAMERATE`), well within what
-    /// `update()`'s existing idle-fallback repaint interval already keeps up
-    /// with, so no extra `ctx.request_repaint()` is needed for this alone.
-    fn update_self_preview_textures(&mut self, ctx: &egui::Context) {
-        for (stream_id, share) in self.active_shares.iter() {
-            let ShareStatus::Active(ShareHandle::Video(handle)) = &share.status else {
-                continue;
-            };
-            let Some(image) = handle.self_preview_frame() else {
-                continue;
-            };
-            match self.self_preview_textures.get_mut(stream_id) {
-                Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
-                None => {
-                    let name = format!("self-preview-{stream_id}");
-                    self.self_preview_textures.insert(*stream_id, ctx.load_texture(name, image, egui::TextureOptions::LINEAR));
-                }
-            }
-        }
-        // Drop textures for shares that no longer exist (stopped/replaced),
-        // so this map doesn't grow unboundedly over a long session's worth
-        // of start/stop cycles.
-        self.self_preview_textures.retain(|stream_id, _| self.active_shares.contains_key(stream_id));
-    }
-
     /// "Pop out" clicked for `(owner, stream_id)`: mark that `WatchEntry` as
     /// popped-out so the central panel stops rendering it and `show_popouts`
     /// starts giving it its own native window instead.
@@ -731,12 +967,17 @@ impl Connected {
     /// viewport — `show_viewport_deferred` must be called every frame a
     /// viewport should keep existing, per egui's viewport API. Call once per
     /// repaint, alongside `update_watch_textures`.
-    fn show_popouts(&mut self, ctx: &egui::Context) {
+    ///
+    /// `handle` is this session's own `RoomHandle`, mixed into each
+    /// viewport's id: `(owner, stream_id)` alone is only unique within one
+    /// connection, so two rooms could otherwise hash to the same
+    /// `ViewportId` and fight over one OS window.
+    fn show_popouts(&mut self, ctx: &egui::Context, handle: RoomHandle) {
         for ((owner, stream_id), entry) in self.watches.iter() {
             let Some(popout) = &entry.popout else { continue };
             let owner = *owner;
             let stream_id = *stream_id;
-            let viewport_id = egui::ViewportId::from_hash_of((owner, stream_id));
+            let viewport_id = egui::ViewportId::from_hash_of((handle.0, owner, stream_id));
             let decoder = entry.decoder.clone();
             let texture = popout.texture.clone();
             let close_requested = popout.close_requested.clone();
@@ -840,6 +1081,13 @@ impl Connected {
 
 impl App {
     fn start_connect(&mut self) {
+        let endpoint = match &self.endpoint {
+            Ok(endpoint) => endpoint.clone(),
+            Err(e) => {
+                self.status = Status::Error(e.clone());
+                return;
+            }
+        };
         let join_string = self.join_string.clone();
         let display_name = self.display_name.clone();
         let (tx, rx) = oneshot::channel();
@@ -847,11 +1095,90 @@ impl App {
         self.status = Status::Connecting;
 
         tokio::spawn(async move {
-            let result = ScreenshareClient::connect(&join_string, &display_name)
+            let result = ScreenshareClient::connect(&endpoint, &join_string, &display_name)
                 .await
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
         });
+    }
+
+    /// Insert a freshly connected room and return its handle. The one place
+    /// a `RoomSession` is born — used by `poll_connect_result` and, in tests,
+    /// to stand a session up directly.
+    fn insert_room(
+        &mut self,
+        client: ScreenshareClient,
+        snapshot: PresenceSnapshotState,
+        event_rx: mpsc::UnboundedReceiver<ClientEvent>,
+    ) -> RoomHandle {
+        let handle = RoomHandle(self.next_room_handle);
+        self.next_room_handle = self.next_room_handle.wrapping_add(1);
+        self.rooms.insert(
+            handle,
+            RoomSession {
+                client,
+                event_rx,
+                members: snapshot.members,
+                streams: snapshot.streams,
+                save_name: String::new(),
+                saved: false,
+                destinations: Vec::new(),
+                next_stream_id: 0,
+                watches: HashMap::new(),
+                watch_error: None,
+                selected_watch: None,
+                audio_watches: HashMap::new(),
+                preview_cache: PreviewCache::new(),
+                preview_textures: HashMap::new(),
+            },
+        );
+        handle
+    }
+
+    /// Tear one room down: drop every capture feeding it (stage 1 has exactly
+    /// one destination per capture, so a room's destinations *are* whole
+    /// captures), drop the session — which drops its decoders — and re-point
+    /// `active_room` at whatever is left.
+    ///
+    /// Only this room's captures: a capture with no destination in `handle`
+    /// is untouched, which is the whole point of `App` owning captures.
+    ///
+    /// **Invariant this depends on:** dropping the *whole* capture is right
+    /// only while each capture feeds exactly one room. Once fan-out lands, this
+    /// must remove just `handle`'s destinations and drop the capture only when
+    /// its `destinations` map is left empty — otherwise leaving one room tears
+    /// down a pipeline another room is still using, the exact failure that
+    /// `App`-owned (rather than room-owned) captures exist to prevent. The
+    /// `debug_assert!` below fails loudly in tests if a later stage adds a
+    /// second destination without revisiting this function.
+    fn disconnect_room(&mut self, handle: RoomHandle) {
+        let Some(room) = self.rooms.shift_remove(&handle) else { return };
+        for destination_id in room.destinations {
+            let Some((capture_id, capture, _)) = find_destination(&self.captures, destination_id) else {
+                continue;
+            };
+            debug_assert_eq!(
+                capture.destinations.len(),
+                1,
+                "disconnect_room drops whole captures; capture {capture_id:?} feeds several rooms, \
+                 so it must instead lose only this room's destination (see this method's docs)"
+            );
+            self.drop_capture_fire_and_forget(capture_id);
+        }
+        if self.active_room == Some(handle) {
+            self.active_room = self.rooms.keys().next().copied();
+        }
+        // Back on the join screen with nothing joined: reset the two pieces
+        // of `App`-level capture state that used to die with the singleton
+        // `Connected`, so a rejoin looks exactly like a first join (a fresh
+        // audio-source listing, no stale error banner) rather than inheriting
+        // the previous session's leftovers. Deliberately *only* when the last
+        // room goes: with several rooms joined, one leaving must not disturb
+        // what the others are showing.
+        if self.rooms.is_empty() {
+            self.audio_sources_requested = false;
+            self.share_error = None;
+        }
     }
 
     fn poll_connect_result(&mut self) {
@@ -860,31 +1187,11 @@ impl App {
             Ok(Ok((client, snapshot, event_rx))) => {
                 self.status = Status::Idle;
                 self.connect_rx = None;
-                self.connected = Some(Connected {
-                    client,
-                    event_rx,
-                    members: snapshot.members,
-                    streams: snapshot.streams,
-                    save_name: String::new(),
-                    saved: false,
-                    active_shares: HashMap::new(),
-                    share_error: None,
-                    next_stream_id: 0,
-                    bitrate_kbps: DEFAULT_BITRATE_KBPS,
-                    framerate: DEFAULT_FRAMERATE,
-                    audio_sources: Vec::new(),
-                    audio_sources_error: None,
-                    audio_sources_requested: false,
-                    audio_sources_rx: None,
-                    selected_audio_source: None,
-                    watches: HashMap::new(),
-                    watch_error: None,
-                    selected_watch: None,
-                    audio_watches: HashMap::new(),
-                    preview_cache: PreviewCache::new(),
-                    preview_textures: HashMap::new(),
-                    self_preview_textures: HashMap::new(),
-                });
+                let handle = self.insert_room(client, snapshot, event_rx);
+                // Single-room UI for now: the newest join is what the
+                // connected screen shows. The multi-room sidebar replaces
+                // this with an explicit selection.
+                self.active_room = Some(handle);
             }
             Ok(Err(e)) => {
                 self.status = Status::Error(e);
@@ -898,105 +1205,121 @@ impl App {
         }
     }
 
+    /// Drain every joined room's event channel, not just one. Each room owns
+    /// its own connection and therefore its own channel; nothing here is
+    /// shared between rooms except `captures`, which is why `rooms` and
+    /// `captures` are borrowed as separate fields rather than through `self`.
+    ///
+    /// Rooms whose control connection closed are collected and torn down
+    /// after the loop, since removing from `rooms` mid-iteration isn't
+    /// allowed.
     fn drain_events(&mut self, ctx: &egui::Context) {
-        let Some(connected) = &mut self.connected else { return };
-        while let Ok(event) = connected.event_rx.try_recv() {
-            match event {
-                ClientEvent::PresenceDelta(PresenceEvent::MemberJoined(member)) => {
-                    connected.members.retain(|m| m.conn_id != member.conn_id);
-                    connected.members.push(member);
-                }
-                ClientEvent::PresenceDelta(PresenceEvent::MemberLeft { conn_id }) => {
-                    connected.members.retain(|m| m.conn_id != conn_id);
-                }
-                ClientEvent::PresenceDelta(PresenceEvent::StreamStarted(info)) => {
-                    if let Some(m) = connected.members.iter_mut().find(|m| m.conn_id == info.owner) {
-                        m.stream_count = m.stream_count.saturating_add(1);
+        let mut closed: Vec<(RoomHandle, String)> = Vec::new();
+        let App { rooms, captures, .. } = self;
+
+        for (handle, room) in rooms.iter_mut() {
+            let handle = *handle;
+            while let Ok(event) = room.event_rx.try_recv() {
+                match event {
+                    ClientEvent::PresenceDelta(PresenceEvent::MemberJoined(member)) => {
+                        room.members.retain(|m| m.conn_id != member.conn_id);
+                        room.members.push(member);
                     }
-                    connected.streams.retain(|s| !(s.owner == info.owner && s.stream_id == info.stream_id));
-                    connected.streams.push(info);
-                }
-                ClientEvent::PresenceDelta(PresenceEvent::StreamStopped { conn_id, stream_id }) => {
-                    if let Some(m) = connected.members.iter_mut().find(|m| m.conn_id == conn_id) {
-                        m.stream_count = m.stream_count.saturating_sub(1);
+                    ClientEvent::PresenceDelta(PresenceEvent::MemberLeft { conn_id }) => {
+                        room.members.retain(|m| m.conn_id != conn_id);
                     }
-                    connected.streams.retain(|s| !(s.owner == conn_id && s.stream_id == stream_id));
-                    connected.preview_cache.remove(conn_id, stream_id);
-                    connected.preview_textures.remove(&(conn_id, stream_id));
-                }
-                // Only meaningful for a stream we're actively *sending*
-                // (relay spec §9: both are sent only to the connection that
-                // owns `stream_id`) — forward to that stream's live
-                // `CaptureHandle` so `capture.rs`'s pump loop can
-                // pause/resume the encoder and force keyframes. A miss (no
-                // `active_shares` entry, not `Active` yet, or an audio
-                // share) is a normal, silent no-op: audio has no encoder to
-                // pause, and a `Starting`/`Stopping`/absent share has
-                // nothing listening yet.
-                ClientEvent::SubscriberCount { stream_id, count } => {
-                    if let Some(ActiveShare { status: ShareStatus::Active(ShareHandle::Video(handle)), .. }) =
-                        connected.active_shares.get(&stream_id)
-                    {
-                        handle.notify_subscriber_count(count);
-                    }
-                }
-                ClientEvent::KeyframeRequest { stream_id } => {
-                    if let Some(ActiveShare { status: ShareStatus::Active(ShareHandle::Video(handle)), .. }) =
-                        connected.active_shares.get(&stream_id)
-                    {
-                        handle.notify_keyframe_request();
-                    }
-                }
-                ClientEvent::MediaFrame(frame) => {
-                    let key = (frame.conn_id, frame.stream_id);
-                    if let Some(entry) = connected.watches.get_mut(&key) {
-                        entry.decoder.lock().unwrap().feed(&frame);
-                    }
-                    // A given (conn_id, stream_id) only ever matches one of
-                    // `watches` (video) or `audio_watches` (audio) — each
-                    // owner allocates a distinct stream_id per share
-                    // regardless of kind — so both are checked
-                    // unconditionally rather than needing to know the
-                    // frame's `StreamKind` up front.
-                    if let Some(audio_watch) = connected.audio_watches.get_mut(&key) {
-                        audio_watch.decoder.feed(&frame);
-                    }
-                }
-                ClientEvent::Preview(preview) => match decode::decode_preview(&preview) {
-                    Ok(image) => {
-                        let key = (preview.conn_id, preview.stream_id);
-                        // Upload/update the roster thumbnail texture right
-                        // away, mirroring `WatchEntry`'s
-                        // create-once-then-`set`-in-place pattern (see
-                        // `update_watch_textures`) rather than reuploading
-                        // an unchanged image every repaint.
-                        match connected.preview_textures.get_mut(&key) {
-                            Some(tex) => tex.set(image.clone(), egui::TextureOptions::LINEAR),
-                            None => {
-                                let name = format!("preview-{:016x}-{}", preview.conn_id, preview.stream_id);
-                                let tex = ctx.load_texture(name, image.clone(), egui::TextureOptions::LINEAR);
-                                connected.preview_textures.insert(key, tex);
-                            }
+                    ClientEvent::PresenceDelta(PresenceEvent::StreamStarted(info)) => {
+                        if let Some(m) = room.members.iter_mut().find(|m| m.conn_id == info.owner) {
+                            m.stream_count = m.stream_count.saturating_add(1);
                         }
-                        connected.preview_cache.update(preview.conn_id, preview.stream_id, image);
+                        room.streams.retain(|s| !(s.owner == info.owner && s.stream_id == info.stream_id));
+                        room.streams.push(info);
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            "failed to decode preview for stream {} on conn {:016x}: {e:#}",
-                            preview.stream_id,
-                            preview.conn_id
-                        );
+                    ClientEvent::PresenceDelta(PresenceEvent::StreamStopped { conn_id, stream_id }) => {
+                        if let Some(m) = room.members.iter_mut().find(|m| m.conn_id == conn_id) {
+                            m.stream_count = m.stream_count.saturating_sub(1);
+                        }
+                        room.streams.retain(|s| !(s.owner == conn_id && s.stream_id == stream_id));
+                        room.preview_cache.remove(conn_id, stream_id);
+                        room.preview_textures.remove(&(conn_id, stream_id));
                     }
-                },
-                ClientEvent::ControlClosed(reason) => {
-                    self.status = Status::Error(t!("errors.disconnected", reason = reason).to_string());
-                    if let Some(connected) = &mut self.connected {
-                        connected.stop_all_shares_fire_and_forget();
+                    // Only meaningful for a stream we're actively *sending*
+                    // (relay spec §9: both are sent only to the connection
+                    // that owns `stream_id`) — forward to that stream's live
+                    // `CaptureHandle` so `capture.rs`'s pump loop can
+                    // pause/resume the encoder and force keyframes. Looked up
+                    // by `(room, stream_id)`, never `stream_id` alone: the
+                    // same small integer means a different stream in every
+                    // room. A miss (no such destination, not `Active` yet, or
+                    // an audio capture) is a normal, silent no-op: audio has
+                    // no encoder to pause, and a `Starting`/`Stopping`/absent
+                    // capture has nothing listening yet.
+                    ClientEvent::SubscriberCount { stream_id, count } => {
+                        if let Some(LocalCapture { status: ShareStatus::Active(ShareHandle::Video(h)), .. }) =
+                            capture_feeding(captures, handle, stream_id)
+                        {
+                            h.notify_subscriber_count(count);
+                        }
                     }
-                    self.connected = None;
-                    return;
+                    ClientEvent::KeyframeRequest { stream_id } => {
+                        if let Some(LocalCapture { status: ShareStatus::Active(ShareHandle::Video(h)), .. }) =
+                            capture_feeding(captures, handle, stream_id)
+                        {
+                            h.notify_keyframe_request();
+                        }
+                    }
+                    ClientEvent::MediaFrame(frame) => {
+                        let key = (frame.conn_id, frame.stream_id);
+                        if let Some(entry) = room.watches.get_mut(&key) {
+                            entry.decoder.lock().unwrap().feed(&frame);
+                        }
+                        // A given (conn_id, stream_id) only ever matches one
+                        // of `watches` (video) or `audio_watches` (audio) —
+                        // each owner allocates a distinct stream_id per share
+                        // regardless of kind — so both are checked
+                        // unconditionally rather than needing to know the
+                        // frame's `StreamKind` up front.
+                        if let Some(audio_watch) = room.audio_watches.get_mut(&key) {
+                            audio_watch.decoder.feed(&frame);
+                        }
+                    }
+                    ClientEvent::Preview(preview) => match decode::decode_preview(&preview) {
+                        Ok(image) => {
+                            let key = (preview.conn_id, preview.stream_id);
+                            // Upload/update the roster thumbnail texture right
+                            // away, mirroring `WatchEntry`'s
+                            // create-once-then-`set`-in-place pattern (see
+                            // `update_watch_textures`) rather than reuploading
+                            // an unchanged image every repaint.
+                            match room.preview_textures.get_mut(&key) {
+                                Some(tex) => tex.set(image.clone(), egui::TextureOptions::LINEAR),
+                                None => {
+                                    let name = format!("preview-{:016x}-{}", preview.conn_id, preview.stream_id);
+                                    let tex = ctx.load_texture(name, image.clone(), egui::TextureOptions::LINEAR);
+                                    room.preview_textures.insert(key, tex);
+                                }
+                            }
+                            room.preview_cache.update(preview.conn_id, preview.stream_id, image);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "failed to decode preview for stream {} on conn {:016x}: {e:#}",
+                                preview.stream_id,
+                                preview.conn_id
+                            );
+                        }
+                    },
+                    ClientEvent::ControlClosed(reason) => {
+                        closed.push((handle, reason));
+                        break;
+                    }
                 }
             }
+        }
+
+        for (handle, reason) in closed {
+            self.status = Status::Error(t!("errors.disconnected", reason = reason).to_string());
+            self.disconnect_room(handle);
         }
     }
 
@@ -1128,16 +1451,52 @@ impl App {
         });
     }
 
+    /// The connected screen, rendered for `active_room`.
+    ///
+    /// `self` is destructured up front rather than accessed field-by-field:
+    /// the screen mixes room-scoped state (`rooms[active_room]`) with
+    /// `App`-scoped capture state (`captures`, `share_error`, the audio-source
+    /// list), and taking them as independent bindings is what lets both be
+    /// live at once. The capture-side *actions* still can't run here — they
+    /// need `&mut self` whole — so they're recorded and applied after the
+    /// borrow ends, the same collect-then-apply idiom the stream list already
+    /// used for its watch toggles.
     fn ui_connected_screen(&mut self, ui: &mut egui::Ui) {
-        let Some(connected) = &mut self.connected else { return };
+        let Some(room_handle) = self.active_room else { return };
+
+        let mut start_video = false;
+        let mut start_audio = false;
+        let mut refresh_audio = false;
+        let mut to_stop: Vec<CaptureSourceId> = Vec::new();
+
+        // Borrows of these fields end at their last use below (NLL), which is
+        // what lets the deferred `&mut self` actions run at the bottom.
+        let App {
+            rooms,
+            captures,
+            join_string,
+            display_name,
+            room_store,
+            room_store_error,
+            share_error,
+            bitrate_kbps,
+            framerate,
+            audio_sources,
+            audio_sources_error,
+            audio_sources_requested,
+            audio_sources_rx,
+            selected_audio_source,
+            ..
+        } = self;
+        let Some(room) = rooms.get_mut(&room_handle) else { return };
 
         ui.heading(egui::RichText::new(t!("app.title").to_string()).color(theme::TEXT));
         ui.label(
             egui::RichText::new(
                 t!(
                     "connected.status",
-                    name = self.display_name,
-                    conn_id = format!("{:016x}", connected.client.conn_id())
+                    name = display_name.clone(),
+                    conn_id = format!("{:016x}", room.client.conn_id())
                 )
                 .to_string(),
             )
@@ -1150,30 +1509,30 @@ impl App {
         // cards are for *grouping* related controls).
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(t!("rooms.save_label").to_string()).color(theme::TEXT));
-            ui.text_edit_singleline(&mut connected.save_name);
-            let can_save = !connected.save_name.trim().is_empty();
+            ui.text_edit_singleline(&mut room.save_name);
+            let can_save = !room.save_name.trim().is_empty();
             ui.add_enabled_ui(can_save, |ui| {
                 if ui.add(theme::secondary_button(t!("rooms.save_button").to_string())).clicked() {
-                    self.room_store.upsert(connected.save_name.clone(), self.join_string.clone());
-                    if let Err(e) = self.room_store.save() {
-                        self.room_store_error = Some(e.to_string());
+                    room_store.upsert(room.save_name.clone(), join_string.clone());
+                    if let Err(e) = room_store.save() {
+                        *room_store_error = Some(e.to_string());
                     } else {
-                        connected.saved = true;
+                        room.saved = true;
                     }
                 }
             });
         });
-        if connected.saved {
+        if room.saved {
             ui.colored_label(theme::SUCCESS, t!("rooms.saved_confirmation").to_string());
         }
         ui.add_space(theme::SPACING);
 
-        theme::card(ui, t!("members.header", count = connected.members.len()).as_ref(), |ui| {
+        theme::card(ui, t!("members.header", count = room.members.len()).as_ref(), |ui| {
             egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
                 // Show all members, not just streamers (spec §8/§4.2: a
                 // lurker with stream_count == 0 still appears in the
                 // roster).
-                for member in &connected.members {
+                for member in &room.members {
                     ui.horizontal(|ui| {
                         if member.stream_count > 0 {
                             ui.colored_label(theme::SUCCESS, "\u{25cf}");
@@ -1192,28 +1551,27 @@ impl App {
         });
 
         theme::card(ui, t!("share.video_header").as_ref(), |ui| {
-            theme::slider_row(ui, t!("share.bitrate_label").as_ref(), &mut connected.bitrate_kbps, MIN_BITRATE_KBPS..=MAX_BITRATE_KBPS, 50.0, " kbps");
+            theme::slider_row(ui, t!("share.bitrate_label").as_ref(), bitrate_kbps, MIN_BITRATE_KBPS..=MAX_BITRATE_KBPS, 50.0, " kbps");
             theme::setting_row(ui, t!("share.framerate_label").as_ref(), |ui| {
                 egui::ComboBox::from_id_salt("framerate_combo")
-                    .selected_text(format!("{} fps", connected.framerate))
+                    .selected_text(format!("{} fps", *framerate))
                     .show_ui(ui, |ui| {
                         for &fps in &FRAMERATE_OPTIONS {
-                            ui.selectable_value(&mut connected.framerate, fps, format!("{fps} fps"));
+                            ui.selectable_value(framerate, fps, format!("{fps} fps"));
                         }
                     });
             });
             ui.horizontal(|ui| {
                 // Always enabled: clicking again while a video share is
-                // already active starts *another* one (a second stream_id),
-                // re-prompting the OS portal picker so the user can pick a
-                // different monitor/window.
+                // already active starts *another* capture (its own
+                // destination and stream_id), re-prompting the OS portal
+                // picker so the user can pick a different monitor/window.
                 if ui.add(theme::primary_button(t!("share.screen_button").to_string())).clicked() {
-                    connected.start_video_share();
+                    start_video = true;
                 }
-                let starting_video = connected
-                    .active_shares
+                let starting_video = captures
                     .values()
-                    .any(|s| s.kind == StreamKind::Video && matches!(s.status, ShareStatus::Starting(_)));
+                    .any(|c| c.kind == StreamKind::Video && matches!(c.status, ShareStatus::Starting(_)));
                 if starting_video {
                     ui.spinner();
                     ui.label(egui::RichText::new(t!("share.waiting_permission").to_string()).color(theme::TEXT_DIM));
@@ -1223,63 +1581,66 @@ impl App {
 
         theme::card(ui, t!("share.audio_header").as_ref(), |ui| {
             ui.horizontal(|ui| {
-                if !connected.audio_sources_requested {
-                    connected.audio_sources_requested = true;
-                    connected.refresh_audio_sources();
+                if !*audio_sources_requested {
+                    *audio_sources_requested = true;
+                    refresh_audio = true;
                 }
                 if ui.add(theme::secondary_button(t!("share.refresh_button").to_string())).clicked() {
-                    connected.refresh_audio_sources();
+                    refresh_audio = true;
                 }
-                if connected.audio_sources_rx.is_some() {
+                if audio_sources_rx.is_some() {
                     ui.spinner();
                 }
             });
             ui.horizontal(|ui| {
                 let placeholder = t!("share.select_source_placeholder").to_string();
-                let selected_text = connected
-                    .selected_audio_source
+                let selected_text = selected_audio_source
                     .as_ref()
                     .map(|s| s.name.as_str())
                     .unwrap_or(placeholder.as_str());
                 egui::ComboBox::from_label(t!("share.source_label").to_string())
                     .selected_text(selected_text)
                     .show_ui(ui, |ui| {
-                        for source in &connected.audio_sources {
-                            let selected = connected.selected_audio_source.as_ref() == Some(source);
+                        for source in audio_sources.iter() {
+                            let selected = selected_audio_source.as_ref() == Some(source);
                             if ui.selectable_label(selected, &source.name).clicked() {
-                                connected.selected_audio_source = Some(source.clone());
+                                *selected_audio_source = Some(source.clone());
                             }
                         }
                     });
-                let can_share_audio = connected.selected_audio_source.is_some();
+                let can_share_audio = selected_audio_source.is_some();
                 ui.add_enabled_ui(can_share_audio, |ui| {
                     if ui.add(theme::primary_button(t!("share.audio_button").to_string())).clicked() {
-                        connected.start_audio_share();
+                        start_audio = true;
                     }
                 });
             });
-            if connected.audio_sources.is_empty() && connected.audio_sources_rx.is_none() {
+            if audio_sources.is_empty() && audio_sources_rx.is_none() {
                 ui.label(egui::RichText::new(t!("share.no_audio_sources").to_string()).color(theme::TEXT_FAINT));
             }
-            if let Some(err) = &connected.audio_sources_error {
+            if let Some(err) = audio_sources_error.as_ref() {
                 ui.colored_label(theme::DANGER, t!("share.audio_sources_error", error = err).to_string());
             }
         });
 
+        // What this client is sending *into this room*, walked through the
+        // room's own `destinations` back-references. That ordering (the order
+        // the user started them) replaces the old sort-by-stream_id: with
+        // several rooms, `stream_id` is no longer a session-wide ordering at
+        // all, just a per-connection label.
         theme::card(ui, t!("share.active_header").as_ref(), |ui| {
-            if connected.active_shares.is_empty() {
+            if room.destinations.is_empty() {
                 ui.label(egui::RichText::new(t!("share.none").to_string()).color(theme::TEXT_FAINT));
             } else {
-                let mut stream_ids: Vec<StreamId> = connected.active_shares.keys().copied().collect();
-                stream_ids.sort_unstable();
-                let mut to_stop = Vec::new();
-                for stream_id in stream_ids {
-                    let share = &connected.active_shares[&stream_id];
-                    let kind_label = match share.kind {
+                for destination_id in room.destinations.iter() {
+                    let Some((capture_id, capture, dest)) = find_destination(captures, *destination_id) else {
+                        continue;
+                    };
+                    let kind_label = match capture.kind {
                         StreamKind::Video => t!("share.kind_video").to_string(),
                         StreamKind::Audio => t!("share.kind_audio").to_string(),
                     };
-                    let (state_label, stoppable) = match &share.status {
+                    let (state_label, stoppable) = match &capture.status {
                         ShareStatus::Starting(_) => (t!("share.state_starting").to_string(), false),
                         ShareStatus::Active(_) => (t!("share.state_active").to_string(), true),
                         ShareStatus::Stopping(_) => (t!("share.state_stopping").to_string(), false),
@@ -1289,23 +1650,23 @@ impl App {
                             egui::RichText::new(
                                 t!(
                                     "share.active_line",
-                                    stream_id = stream_id,
+                                    stream_id = dest.stream_id,
                                     kind = kind_label,
-                                    label = share.label.clone(),
+                                    label = capture.label.clone(),
                                     state = state_label
                                 )
                                 .to_string(),
                             )
                             .color(theme::TEXT),
                         );
-                        let stop_label = if share.kind == StreamKind::Audio {
+                        let stop_label = if capture.kind == StreamKind::Audio {
                             t!("share.stop_audio_button").to_string()
                         } else {
                             t!("share.stop_button").to_string()
                         };
                         ui.add_enabled_ui(stoppable, |ui| {
                             if ui.add(theme::danger_button(stop_label)).clicked() {
-                                to_stop.push(stream_id);
+                                to_stop.push(capture_id);
                             }
                         });
                         // Sharer-side live encode rate: the encoder
@@ -1314,7 +1675,7 @@ impl App {
                         // configured framerate is really being hit rather
                         // than just selected in the UI. Video shares
                         // only — audio has no comparable per-frame rate.
-                        if let ShareStatus::Active(ShareHandle::Video(handle)) = &share.status {
+                        if let ShareStatus::Active(ShareHandle::Video(handle)) = &capture.status {
                             ui.label(egui::RichText::new(t!("share.fps_label", fps = handle.encoder_fps()).to_string()).color(theme::TEXT_DIM));
                         }
                     });
@@ -1324,11 +1685,11 @@ impl App {
                     // and only once actually `Active` (a `CaptureHandle` — and
                     // therefore a self-preview frame source — only exists at
                     // that point). See `superdoc/features/self-preview.md`.
-                    if share.kind == StreamKind::Video && matches!(share.status, ShareStatus::Active(_)) {
+                    if capture.kind == StreamKind::Video && matches!(capture.status, ShareStatus::Active(_)) {
                         const SELF_PREVIEW_WIDTH: f32 = 160.0;
                         const SELF_PREVIEW_HEIGHT: f32 = SELF_PREVIEW_WIDTH * 9.0 / 16.0;
                         theme::section_label(ui, t!("share.self_preview_label").as_ref());
-                        match connected.self_preview_textures.get(&stream_id) {
+                        match &capture.self_preview_texture {
                             Some(tex) => {
                                 let tex_size = tex.size_vec2();
                                 let scale = if tex_size.x > 0.0 { SELF_PREVIEW_WIDTH / tex_size.x } else { 1.0 };
@@ -1342,29 +1703,26 @@ impl App {
                         }
                     }
                 }
-                for stream_id in to_stop {
-                    connected.stop_share(stream_id);
-                }
             }
-            if let Some(err) = &connected.share_error {
+            if let Some(err) = share_error.as_ref() {
                 ui.colored_label(theme::DANGER, t!("share.error", error = err).to_string());
             }
         });
 
         theme::card(ui, t!("streams.header").as_ref(), |ui| {
-            if let Some(err) = &connected.watch_error {
+            if let Some(err) = &room.watch_error {
                 ui.colored_label(theme::DANGER, t!("streams.watch_error", error = err).to_string());
             }
-            if connected.streams.is_empty() {
+            if room.streams.is_empty() {
                 ui.label(egui::RichText::new(t!("streams.none_active").to_string()).color(theme::TEXT_FAINT));
             } else {
                 let mut to_toggle: Option<(ConnId, StreamId)> = None;
                 let mut to_pop_out: Option<(ConnId, StreamId)> = None;
                 let mut to_toggle_listen: Option<(ConnId, StreamId)> = None;
                 let unknown_owner = t!("streams.unknown_owner").to_string();
-                for info in &connected.streams {
+                for info in &room.streams {
                     let key = (info.owner, info.stream_id);
-                    let owner_name = connected
+                    let owner_name = room
                         .members
                         .iter()
                         .find(|m| m.conn_id == info.owner)
@@ -1374,13 +1732,13 @@ impl App {
                     if info.kind == StreamKind::Audio {
                         // A sender with video gets their audio
                         // auto-subscribed via the video row's Watch button
-                        // (see `Connected::toggle_watch`) — only an
+                        // (see `RoomSession::toggle_watch`) — only an
                         // audio-only sender (no video announced) gets its
                         // own "Listen" row here.
-                        if connected.owner_has_video(info.owner) {
+                        if room.owner_has_video(info.owner) {
                             continue;
                         }
-                        let listening = connected.audio_watches.contains_key(&key);
+                        let listening = room.audio_watches.contains_key(&key);
                         ui.horizontal(|ui| {
                             ui.vertical(|ui| {
                                 ui.label(
@@ -1407,7 +1765,7 @@ impl App {
                                         ui.colored_label(theme::SUCCESS, t!("streams.listening").to_string());
                                     }
                                 });
-                                if let Some(audio_watch) = connected.audio_watches.get_mut(&key)
+                                if let Some(audio_watch) = room.audio_watches.get_mut(&key)
                                     && theme::slider_row(ui, t!("audio.volume_label").as_ref(), &mut audio_watch.volume_percent, 0..=200, 1.0, "%")
                                 {
                                     audio_watch.decoder.set_volume(audio_watch.volume_percent as f64 / 100.0);
@@ -1417,7 +1775,7 @@ impl App {
                         continue;
                     }
 
-                    let watching = connected.watches.contains_key(&key);
+                    let watching = room.watches.contains_key(&key);
                     ui.horizontal(|ui| {
                         // Thumbnail (or a placeholder box until the first
                         // preview for this stream arrives) — previews
@@ -1427,7 +1785,7 @@ impl App {
                         // below.
                         const THUMB_WIDTH: f32 = 120.0;
                         const THUMB_HEIGHT: f32 = THUMB_WIDTH * 9.0 / 16.0;
-                        match connected.preview_textures.get(&key) {
+                        match room.preview_textures.get(&key) {
                             Some(tex) => {
                                 let tex_size = tex.size_vec2();
                                 let scale = if tex_size.x > 0.0 { THUMB_WIDTH / tex_size.x } else { 1.0 };
@@ -1440,7 +1798,7 @@ impl App {
                             }
                         }
 
-                        let popped_out = connected.watches.get(&key).is_some_and(|e| e.popout.is_some());
+                        let popped_out = room.watches.get(&key).is_some_and(|e| e.popout.is_some());
 
                         ui.vertical(|ui| {
                             ui.label(
@@ -1478,7 +1836,7 @@ impl App {
                                 }
                                 if popped_out {
                                     ui.colored_label(theme::ACCENT, t!("streams.popped_out").to_string());
-                                } else if connected.selected_watch == Some(key) {
+                                } else if room.selected_watch == Some(key) {
                                     ui.colored_label(theme::SUCCESS, t!("streams.viewing").to_string());
                                 }
                             });
@@ -1486,13 +1844,13 @@ impl App {
                     });
                 }
                 if let Some((owner, stream_id)) = to_toggle {
-                    connected.toggle_watch(owner, stream_id);
+                    room.toggle_watch(owner, stream_id);
                 }
                 if let Some((owner, stream_id)) = to_pop_out {
-                    connected.pop_out(owner, stream_id);
+                    room.pop_out(owner, stream_id);
                 }
                 if let Some((owner, stream_id)) = to_toggle_listen {
-                    connected.toggle_listen(owner, stream_id);
+                    room.toggle_listen(owner, stream_id);
                 }
             }
         });
@@ -1509,31 +1867,31 @@ impl App {
             // reflects real decode activity regardless of whether the
             // stream is currently shown inline or popped out into its own
             // window.
-            if let Some(key) = connected.selected_watch
-                && let Some(entry) = connected.watches.get(&key)
+            if let Some(key) = room.selected_watch
+                && let Some(entry) = room.watches.get(&key)
             {
                 let fps = entry.decoder.lock().unwrap().current_fps();
                 ui.label(egui::RichText::new(t!("video.fps_label", fps = format!("{fps:.1}")).to_string()).color(theme::TEXT_DIM));
             }
 
             // If the currently displayed video watch also auto-subscribed
-            // the same sender's audio (see `Connected::toggle_watch`), show
+            // the same sender's audio (see `RoomSession::toggle_watch`), show
             // its volume slider here, right above the video panel —
             // "somewhere sensible in the watched-stream UI", per this
             // task's brief.
-            let linked_audio_key: Option<(ConnId, StreamId)> = connected
+            let linked_audio_key: Option<(ConnId, StreamId)> = room
                 .selected_watch
-                .and_then(|key| connected.watches.get(&key))
+                .and_then(|key| room.watches.get(&key))
                 .and_then(|entry| entry.audio_stream_id)
-                .map(|audio_stream_id| (connected.selected_watch.expect("checked above").0, audio_stream_id));
+                .map(|audio_stream_id| (room.selected_watch.expect("checked above").0, audio_stream_id));
             if let Some(audio_key) = linked_audio_key
-                && let Some(audio_watch) = connected.audio_watches.get_mut(&audio_key)
+                && let Some(audio_watch) = room.audio_watches.get_mut(&audio_key)
                 && theme::slider_row(ui, t!("audio.volume_label").as_ref(), &mut audio_watch.volume_percent, 0..=200, 1.0, "%")
             {
                 audio_watch.decoder.set_volume(audio_watch.volume_percent as f64 / 100.0);
             }
 
-            match connected.selected_watch.and_then(|key| connected.watches.get(&key)) {
+            match room.selected_watch.and_then(|key| room.watches.get(&key)) {
                 Some(entry) if entry.popout.is_some() => {
                     ui.label(egui::RichText::new(t!("video.popped_out_note").to_string()).color(theme::TEXT_DIM));
                 }
@@ -1558,6 +1916,20 @@ impl App {
                 }
             }
         });
+
+        // Capture-side actions, applied now that the room borrow is gone.
+        if refresh_audio {
+            self.refresh_audio_sources();
+        }
+        if start_video {
+            self.start_video_share(room_handle);
+        }
+        if start_audio {
+            self.start_audio_share(room_handle);
+        }
+        for capture_id in to_stop {
+            self.stop_share(capture_id);
+        }
     }
 }
 
@@ -1565,13 +1937,18 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_connect_result();
         self.drain_events(ctx);
+        self.poll_capture_states();
+        self.poll_audio_sources();
+        self.update_self_preview_textures(ctx);
+
+        // Every room's watches are polled and repainted, not just the one the
+        // UI happens to be showing: a `StreamDecoder` that stops being fed
+        // (or stops being drained) stalls, and a room being off-screen is a
+        // view decision, not a reason to starve its decoders.
         let mut has_inline_watch = false;
-        if let Some(connected) = &mut self.connected {
-            connected.poll_share_states();
-            connected.poll_audio_sources();
-            has_inline_watch = connected.update_watch_textures(ctx);
-            connected.update_self_preview_textures(ctx);
-            connected.show_popouts(ctx);
+        for (handle, room) in self.rooms.iter_mut() {
+            has_inline_watch |= room.update_watch_textures(ctx);
+            room.show_popouts(ctx, *handle);
         }
 
         // Whether the OS reports this window as focused right now. `None`
@@ -1605,7 +1982,7 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            if self.connected.is_some() {
+            if self.active_room.is_some() {
                 self.ui_connected_screen(ui);
             } else {
                 self.ui_join_screen(ui);
@@ -1616,7 +1993,7 @@ impl eframe::App for App {
         // has no input to react to yet. Falls back to a much coarser
         // interval while unfocused (also covers the has_inline_watch case
         // above when the window is backgrounded) — see `focused` above.
-        if matches!(self.status, Status::Connecting) || self.connected.is_some() {
+        if matches!(self.status, Status::Connecting) || !self.rooms.is_empty() {
             let interval = if focused { IDLE_REPAINT_INTERVAL } else { UNFOCUSED_REPAINT_INTERVAL };
             ctx.request_repaint_after(interval);
         }
@@ -1630,16 +2007,109 @@ impl eframe::App for App {
     /// `eframe::App::on_exit` is a synchronous callback with no way to block
     /// on (or even poll) async work before eframe tears the window down, so
     /// this can't `.await` `.stop()` to completion the way the voluntary
-    /// `stop_share` path does. Best effort: spawn `.stop()` for every active
-    /// share onto the ambient tokio runtime (mirroring `ControlClosed`'s
-    /// `stop_all_shares_fire_and_forget`) so graceful teardown (portal
+    /// `stop_share` path does. Best effort: spawn `.stop()` for every running
+    /// capture onto the ambient tokio runtime (mirroring `ControlClosed`'s
+    /// `drop_capture_fire_and_forget`) so graceful teardown (portal
     /// session close, relay stop-stream notification) at least gets
     /// *attempted*, rather than relying solely on the handles' `Drop` impls
     /// once this process starts exiting.
     fn on_exit(&mut self) {
-        if let Some(connected) = &mut self.connected {
-            connected.stop_all_shares_fire_and_forget();
+        self.stop_all_captures_fire_and_forget();
+    }
+}
+
+#[cfg(test)]
+mod session_model_tests {
+    //! Pure (no I/O, no GStreamer, no network) coverage for the session
+    //! model's cross-room lookups.
+    //!
+    //! The whole point of the rooms/captures/destinations split is that a
+    //! protocol `StreamId` is only unique *within one connection*: two rooms
+    //! will both hand out `stream_id` 0 for their first outgoing stream, and
+    //! the old singleton `active_shares: HashMap<StreamId, _>` therefore had
+    //! one entry where two were needed. These tests pin the replacement
+    //! behaviour with that collision deliberately constructed.
+    use super::*;
+
+    /// A `LocalCapture` with the given destinations and a never-resolving
+    /// `Starting` status — enough for the lookup functions, which never touch
+    /// the pipeline handle.
+    fn capture_with(destinations: IndexMap<DestinationId, Destination>) -> LocalCapture {
+        let (_tx, rx) = oneshot::channel();
+        LocalCapture {
+            kind: StreamKind::Video,
+            label: "test".to_string(),
+            status: ShareStatus::Starting(rx),
+            destinations,
+            self_preview_texture: None,
         }
+    }
+
+    /// Two rooms, each fed by its own capture, both using `stream_id` 0 —
+    /// exactly the collision the old single-map keying could not represent.
+    fn two_rooms_same_stream_id() -> (IndexMap<CaptureSourceId, LocalCapture>, RoomHandle, RoomHandle) {
+        let (room_a, room_b) = (RoomHandle(0), RoomHandle(1));
+        let mut captures = IndexMap::new();
+        captures.insert(
+            CaptureSourceId(10),
+            capture_with(IndexMap::from([(DestinationId(100), Destination { room: room_a, stream_id: 0 })])),
+        );
+        captures.insert(
+            CaptureSourceId(11),
+            capture_with(IndexMap::from([(DestinationId(101), Destination { room: room_b, stream_id: 0 })])),
+        );
+        (captures, room_a, room_b)
+    }
+
+    #[test]
+    fn capture_feeding_disambiguates_the_same_stream_id_in_two_rooms() {
+        let (captures, room_a, room_b) = two_rooms_same_stream_id();
+
+        // Each room's stream 0 must resolve to *its own* capture. Identity is
+        // checked by pointer comparison against the map entry, since
+        // `LocalCapture` holds a channel receiver and isn't `PartialEq`.
+        let a = capture_feeding(&captures, room_a, 0).expect("room A's stream 0 must resolve");
+        let b = capture_feeding(&captures, room_b, 0).expect("room B's stream 0 must resolve");
+        assert!(std::ptr::eq(a, &captures[&CaptureSourceId(10)]), "room A's stream 0 resolved to the wrong capture");
+        assert!(std::ptr::eq(b, &captures[&CaptureSourceId(11)]), "room B's stream 0 resolved to the wrong capture");
+        assert!(!std::ptr::eq(a, b), "the two rooms' stream 0 must not resolve to the same capture");
+
+        // A stream_id nobody announced in that room is a clean miss, never a
+        // wrong hit borrowed from the other room.
+        assert!(capture_feeding(&captures, room_a, 1).is_none());
+        assert!(capture_feeding(&captures, RoomHandle(2), 0).is_none(), "an unknown room must never match");
+    }
+
+    #[test]
+    fn find_destination_resolves_a_room_back_reference_to_its_owning_capture() {
+        let (captures, room_a, room_b) = two_rooms_same_stream_id();
+
+        let (capture_id, _, dest) = find_destination(&captures, DestinationId(101)).expect("destination must resolve");
+        assert_eq!(capture_id, CaptureSourceId(11));
+        assert_eq!(dest.room, room_b);
+        assert_eq!(dest.stream_id, 0);
+
+        let (capture_id, _, dest) = find_destination(&captures, DestinationId(100)).expect("destination must resolve");
+        assert_eq!(capture_id, CaptureSourceId(10));
+        assert_eq!(dest.room, room_a);
+
+        // Ids come from a counter that never rewinds, so a back-reference to
+        // something already dropped can only ever miss.
+        assert!(find_destination(&captures, DestinationId(999)).is_none());
+    }
+
+    #[tokio::test]
+    async fn session_ids_are_monotonic_and_allocated_from_separate_spaces() {
+        // `App::default()` binds a real UDP socket for the shared endpoint,
+        // so this needs a runtime entered — hence `#[tokio::test]`.
+        let mut app = App::default();
+        assert_eq!(app.alloc_capture_id(), CaptureSourceId(0));
+        assert_eq!(app.alloc_capture_id(), CaptureSourceId(1));
+        // Allocating a destination id must not disturb the capture counter,
+        // and vice versa — they are separate spaces on purpose.
+        assert_eq!(app.alloc_destination_id(), DestinationId(0));
+        assert_eq!(app.alloc_capture_id(), CaptureSourceId(2));
+        assert_eq!(app.alloc_destination_id(), DestinationId(1));
     }
 }
 
@@ -1654,7 +2124,7 @@ mod tests {
     //! `request_repaint_after`) rather than tracking the decoder's actual
     //! output rate.
     //!
-    //! This drives the exact same `Connected`/`App` types and methods
+    //! This drives the exact same `RoomSession`/`App` types and methods
     //! `eframe` calls in production (`drain_events`, `update_watch_textures`)
     //! against a real relay server child process, a real
     //! `videotestsrc ! clockoverlay ! x264enc` capture pipeline (see
@@ -1723,46 +2193,22 @@ mod tests {
             .expect("start_sharing_from_test_source failed");
         let owner = client_a.conn_id();
 
-        // Build the exact `App`/`Connected` shape `poll_connect_result`
-        // builds in production, then wire up a watch on the sharer's stream
-        // the same way `toggle_watch` does — this is the real code under
-        // test, not a re-implementation of it.
-        let mut app = App::default();
-        let mut connected = Connected {
-            client: client_b,
-            event_rx: events_b,
-            members: snapshot_b.members,
-            streams: snapshot_b.streams,
-            save_name: String::new(),
-            saved: false,
-            active_shares: HashMap::new(),
-            share_error: None,
-            next_stream_id: 0,
-            bitrate_kbps: DEFAULT_BITRATE_KBPS,
-            framerate: TEST_FPS,
-            audio_sources: Vec::new(),
-            audio_sources_error: None,
-            audio_sources_requested: false,
-            audio_sources_rx: None,
-            selected_audio_source: None,
-            watches: HashMap::new(),
-            watch_error: None,
-            selected_watch: None,
-            audio_watches: HashMap::new(),
-            preview_cache: PreviewCache::new(),
-            preview_textures: HashMap::new(),
-            self_preview_textures: HashMap::new(),
-        };
+        // Stand the room up through the exact same `App::insert_room` call
+        // `poll_connect_result` uses in production, then wire up a watch on
+        // the sharer's stream the same way `toggle_watch` does — this is the
+        // real code under test, not a re-implementation of it.
+        let mut app = App { framerate: TEST_FPS, ..App::default() };
+        let room_handle = app.insert_room(client_b, snapshot_b, events_b);
+        app.active_room = Some(room_handle);
         let decoder = StreamDecoder::new(TEST_STREAM_ID).expect("failed to build StreamDecoder");
-        connected.watches.insert(
+        app.rooms[&room_handle].watches.insert(
             (owner, TEST_STREAM_ID),
             WatchEntry { decoder: Arc::new(Mutex::new(decoder)), texture: None, popout: None, audio_stream_id: None },
         );
-        app.connected = Some(connected);
 
-        connected_client_b_subscribe(&mut app, owner).await;
+        room_client_b_subscribe(&mut app, room_handle, owner).await;
 
-        // Drive `App::drain_events` + `Connected::update_watch_textures` —
+        // Drive `App::drain_events` + `RoomSession::update_watch_textures` —
         // the real production methods — in a tight loop with a bare
         // `egui::Context` fed `RawInput::default()` every pass: no mouse
         // position, no clicks, no keys, ever. `eframe::Frame` has no public
@@ -1788,8 +2234,8 @@ mod tests {
         while Instant::now() < deadline {
             let _ = ctx.run(egui::RawInput::default(), |ctx| {
                 app.drain_events(ctx);
-                let Some(connected) = &mut app.connected else { return };
-                let has_inline_watch = connected.update_watch_textures(ctx);
+                let Some(room) = app.rooms.get_mut(&room_handle) else { return };
+                let has_inline_watch = room.update_watch_textures(ctx);
                 if has_inline_watch {
                     polls_with_watch += 1;
                     ctx.request_repaint();
@@ -1808,10 +2254,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        let observed_fps = app
-            .connected
-            .as_ref()
-            .unwrap()
+        let observed_fps = app.rooms[&room_handle]
             .watches
             .get(&(owner, TEST_STREAM_ID))
             .unwrap()
@@ -1837,10 +2280,10 @@ mod tests {
     /// Waits for the watcher to see the sharer's `StreamStarted` presence
     /// delta (the relay silently drops a `Subscribe` for a stream it
     /// doesn't know about yet) and then subscribes — mirrors
-    /// `end_to_end_test`'s same wait, just against `Connected::event_rx`
+    /// `end_to_end_test`'s same wait, just against `RoomSession::event_rx`
     /// directly instead of a bare receiver.
-    async fn connected_client_b_subscribe(app: &mut App, owner: ConnId) {
-        let connected = app.connected.as_mut().expect("connected must be set");
+    async fn room_client_b_subscribe(app: &mut App, room_handle: RoomHandle, owner: ConnId) {
+        let connected = app.rooms.get_mut(&room_handle).expect("room must be present");
         let saw_stream_started = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 match connected.event_rx.recv().await {

@@ -41,6 +41,12 @@ tracing-subscriber = "0.3.23"
 uuid = { version = "1.24.0", features = ["v4"] }
 wgpu = { version = "27.0.1", default-features = false, features = ["std", "vulkan", "wgsl"] }
 rust-i18n = "4.2.1"
+# Insertion-ordered maps for the session model in `ui.rs` (`App::rooms`,
+# `App::captures`, `LocalCapture::destinations`). `HashMap`s iteration order is
+# randomized per process, which would make the rooms/streams lists shuffle
+# between rebuilds; these collections are rendered as ordered lists in the UI
+# and must iterate in the order the user created their entries.
+indexmap = "2"
 
 # ashpd (xdg-desktop-portal bindings) is Linux/Unix-only: it shells out to
 # `std::os::unix` internals that simply don't exist on Windows, and portal

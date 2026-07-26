@@ -37,6 +37,21 @@
 //!    future sender), decrypted incoming media frames, decrypted incoming
 //!    previews, and a final "control connection closed" notice.
 //!
+//! # One endpoint, N connections
+//!
+//! [`build_client_endpoint`] builds the local QUIC endpoint (a bound UDP
+//! socket plus this client's TLS/transport config); [`ScreenshareClient::connect`]
+//! takes one by reference rather than building its own.
+//!
+//! `Why:` a `quinn::Endpoint` is a *local socket*, not a peer — one endpoint
+//! can hold any number of outgoing connections to any number of relays, and
+//! multiplexes them on a single UDP socket with a single I/O driver task.
+//! Building one per connection (which is what this module used to do) burned
+//! a socket + driver task per room and made every room's connection
+//! independently configurable by accident. The caller (`ui.rs`'s `App`,
+//! `tui.rs`'s `App`) builds exactly one at construction and hands it to every
+//! `connect()` call, which is what makes multi-room joins cheap.
+//!
 //! `capture.rs` (sending) will use `ScreenshareClient::connection()` +
 //! `nonce_sequence()` + `room_key()` together with `encrypt_frame` and
 //! `fragment::fragment_frame` to actually transmit; `decode.rs` (receiving)
@@ -371,13 +386,19 @@ impl ScreenshareClient {
     /// background tasks that keep reading the control stream, media
     /// datagrams, and preview uni-streams for the lifetime of the
     /// connection, forwarding everything through the returned channel.
+    ///
+    /// `endpoint` is the caller's single shared [`build_client_endpoint`]
+    /// result — see the module docs' "One endpoint, N connections" section.
+    /// Call this once per room; every resulting `ScreenshareClient` is an
+    /// independent connection (own `ConnId`, own nonce space, own room key)
+    /// riding the same local socket.
     pub async fn connect(
+        endpoint: &quinn::Endpoint,
         join_string: &str,
         display_name: &str,
     ) -> Result<(Self, PresenceSnapshotState, mpsc::UnboundedReceiver<ClientEvent>)> {
         let parsed = parse_join_string(join_string)?;
         let remote_addr = resolve_server_addr(&parsed.server).await?;
-        let endpoint = build_client_endpoint()?;
 
         let host = parsed
             .server
@@ -653,7 +674,13 @@ async fn resolve_server_addr(server: &str) -> Result<SocketAddr> {
         .ok_or_else(|| anyhow!("server address {server:?} resolved to no addresses"))
 }
 
-fn build_client_endpoint() -> Result<quinn::Endpoint> {
+/// Build the one local QUIC endpoint every [`ScreenshareClient::connect`]
+/// call shares. See the module docs' "One endpoint, N connections".
+///
+/// Must be called with a Tokio runtime entered (quinn's `runtime-tokio`
+/// feature looks the reactor up at bind time) — both front-ends build this
+/// from inside `main.rs`'s entered runtime.
+pub fn build_client_endpoint() -> Result<quinn::Endpoint> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut crypto = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
