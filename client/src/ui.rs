@@ -596,12 +596,9 @@ fn capture_feeding(
 /// This function is option 2. `net.rs` has no notion of a decoder registry
 /// today (by design — see its module docs' "Public API shape": it hands back
 /// a plain event channel and stays ignorant of what the caller does with
-/// `MediaFrame`s), and `net.rs`'s tests/API are shared by both front-ends
-/// (`ui.rs` and `tui.rs`), each of which will eventually want a *different*
-/// registry shape (`tui.rs` has its own, much simpler single-stream model).
-/// Reaching into `net.rs` to add a `ui.rs`-specific registry would either
-/// leak `ui.rs` types into `net.rs` or force a generic registry trait for a
-/// single caller — real complexity for no behavioral difference, since
+/// `MediaFrame`s). Reaching into `net.rs` to add a `ui.rs`-specific registry
+/// would either leak `ui.rs` types into `net.rs` or force a generic registry
+/// trait for a single caller — real complexity for no behavioral difference, since
 /// `mpsc::UnboundedReceiver::recv().await` already wakes immediately on
 /// arrival with nothing throttling it between `net.rs` and here. Option 2
 /// gets the identical latency characteristics (nothing sits in a channel
