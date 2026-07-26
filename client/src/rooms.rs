@@ -75,6 +75,22 @@ impl RoomStore {
     pub fn remove(&mut self, name: &str) {
         self.rooms.retain(|r| r.name != name);
     }
+
+    /// The saved name for a join string, if this room is saved.
+    ///
+    /// `Why:` the sidebar's ROOMS section renders `room_store ⟕ rooms` — every
+    /// saved room shows, and the ones with a live session get connected
+    /// styling — so it needs to join the two collections on something both
+    /// sides have. The join string is that key: it's the only thing a
+    /// `SavedRoom` and a live session provably agree on (a `RoomHandle` is
+    /// per-session and a saved room has none; the relay-assigned `ConnId` is
+    /// per-connection and a *saved* room has none either). Name is not usable
+    /// as the key in the other direction — the same room can be saved under
+    /// any name the user likes — so the lookup only ever goes join-string →
+    /// name, never the reverse.
+    pub fn name_for(&self, join_string: &str) -> Option<&str> {
+        self.rooms.iter().find(|r| r.join_string == join_string).map(|r| r.name.as_str())
+    }
 }
 
 /// Which `wgpu::PresentMode` the eframe/wgpu render surface is configured
@@ -202,6 +218,18 @@ mod tests {
         store.upsert("friends".to_string(), "x|y|z".to_string());
         assert_eq!(store.rooms.len(), 1);
         assert_eq!(store.rooms[0].join_string, "x|y|z");
+    }
+
+    /// The sidebar joins saved rooms to live sessions on the join string, so
+    /// a hit must be exact and a miss must stay a miss (never fall back to a
+    /// name match — see `name_for`'s docs).
+    #[test]
+    fn name_for_looks_up_by_join_string_only() {
+        let mut store = RoomStore::default();
+        store.upsert("friends".to_string(), "a|b|c".to_string());
+        assert_eq!(store.name_for("a|b|c"), Some("friends"));
+        assert_eq!(store.name_for("x|y|z"), None);
+        assert_eq!(store.name_for("friends"), None);
     }
 
     #[test]

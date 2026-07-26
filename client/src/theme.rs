@@ -110,6 +110,12 @@ pub const ROUNDING_SM: u8 = 8;
 /// (see STYLING-GUIDE.md's "Reserved value-width"), sized to the widest
 /// value this app's rows ever show (e.g. `"40000 kbps"`, `"240 fps"`).
 pub const VALUE_W: f32 = 64.0;
+/// Height of a nav-rail pill (`nav_button`) — deliberately much taller than
+/// a form button's default `interact_size.y`, see that function's docs.
+pub const NAV_BUTTON_HEIGHT: f32 = 38.0;
+/// Diameter of a `status_dot`. Small enough to read as an indicator rather
+/// than a bullet, large enough to still read at a glance in a dense list.
+pub const DOT_SIZE: f32 = 9.0;
 /// Max content width for a single-column, capped-width settings-style panel
 /// (see STYLING-GUIDE.md's "Layout options for a settings-style view").
 pub const PANEL_MAX_WIDTH: f32 = 520.0;
@@ -130,6 +136,60 @@ pub fn tint(base: Color32, alpha: u8) -> Color32 {
     let a = alpha as f32 / 255.0;
     let linear = egui::Rgba::from(base);
     Color32::from(egui::Rgba::from_rgba_premultiplied(linear.r() * a, linear.g() * a, linear.b() * a, a))
+}
+
+// ---------------------------------------------------------------------------
+// Global style
+// ---------------------------------------------------------------------------
+
+/// Push this theme's tokens into egui's *own* baseline visuals, once per
+/// process (`ui.rs` calls this on its first frame).
+///
+/// `Why` this exists on top of the per-widget helpers: the helpers only cover
+/// the widgets this app builds through them. Everything egui draws for itself
+/// — combo-box popups, scroll bars, tooltips, text-edit fields, modal
+/// backdrops — otherwise keeps egui's stock dark palette, which is a
+/// *different* dark grey than `PANEL_*` and reads as an unstyled patch sitting
+/// on top of a themed app. Setting the baseline once is what makes the whole
+/// window belong to one palette instead of two.
+pub fn install(ctx: &egui::Context) {
+    let mut visuals = egui::Visuals::dark();
+    visuals.panel_fill = PANEL_BASE;
+    visuals.window_fill = PANEL_RAISED;
+    visuals.window_stroke = Stroke::new(1.0, BORDER);
+    visuals.window_corner_radius = CornerRadius::same(ROUNDING);
+    visuals.extreme_bg_color = FIELD;
+    visuals.faint_bg_color = PANEL_SUNKEN;
+    visuals.override_text_color = Some(TEXT);
+    visuals.hyperlink_color = ACCENT;
+    visuals.selection.bg_fill = tint(ACCENT, 120);
+    visuals.selection.stroke = Stroke::new(1.0, TEXT);
+
+    for widget in [
+        &mut visuals.widgets.noninteractive,
+        &mut visuals.widgets.inactive,
+        &mut visuals.widgets.hovered,
+        &mut visuals.widgets.active,
+        &mut visuals.widgets.open,
+    ] {
+        widget.corner_radius = CornerRadius::same(ROUNDING_SM);
+        widget.bg_stroke = Stroke::new(1.0, BORDER);
+    }
+    visuals.widgets.noninteractive.bg_fill = PANEL_BASE;
+    visuals.widgets.inactive.bg_fill = BTN;
+    visuals.widgets.inactive.weak_bg_fill = BTN;
+    visuals.widgets.hovered.bg_fill = tint(ACCENT, 60);
+    visuals.widgets.hovered.weak_bg_fill = tint(ACCENT, 60);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, BTN_BORDER);
+    visuals.widgets.active.bg_fill = tint(ACCENT, 110);
+    visuals.widgets.active.weak_bg_fill = tint(ACCENT, 110);
+    visuals.widgets.open.bg_fill = FIELD;
+    visuals.widgets.open.weak_bg_fill = FIELD;
+
+    ctx.set_visuals(visuals);
+    ctx.style_mut(|style| {
+        style.spacing.item_spacing = Vec2::splat(SPACING);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -293,4 +353,84 @@ pub fn secondary_button(text: impl Into<String>) -> impl Widget {
 /// destructive/abort actions (Remove, Disconnect, Stop Sharing).
 pub fn danger_button(text: impl Into<String>) -> impl Widget {
     styled_button(&text.into(), Color32::TRANSPARENT, DANGER, Some(tint(DANGER, 140)), false)
+}
+
+/// A chunky, full-width **nav-rail pill** — the sidebar's Stream Control /
+/// View / Settings switcher. Accent-filled when `active`, a faint hover-only
+/// surface when not.
+///
+/// *Why a fourth button variant, distinct from `primary_button`:* the three
+/// variants above are *form* buttons — they sit inside a card at egui's
+/// default `interact_size` height and are sized to their label. A nav rail
+/// wants the opposite: a fixed, deliberately oversized target that spans the
+/// sidebar's full width and reads as a persistent piece of chrome rather than
+/// an action you press once. Styling that inline at each call site (fill by
+/// active-state, `NAV_BUTTON_HEIGHT`, full-width sizing) would put three
+/// hand-tuned copies of the same look in `ui.rs`, which is exactly what
+/// STYLING-GUIDE.md's "expose each as a `theme::*_button` helper" rule exists
+/// to prevent.
+///
+/// The caller still owns the *width*, since only the caller knows the rail's
+/// measure — use `ui.add_sized([ui.available_width(),
+/// theme::NAV_BUTTON_HEIGHT], theme::nav_button(label, active))`.
+pub fn nav_button(text: impl Into<String>, active: bool) -> impl Widget {
+    let (fill, text_color) = if active {
+        (ACCENT, PRIMARY_TEXT)
+    } else {
+        // Transparent rather than `BTN`: an inactive rail item should read as
+        // part of the sidebar surface, only lifting on hover (egui's own
+        // hover visuals supply that), so the one accent-filled pill is
+        // unambiguously "where you are".
+        (Color32::TRANSPARENT, TEXT_DIM)
+    };
+    egui::Button::new(RichText::new(text.into()).strong().color(text_color))
+        .fill(fill)
+        // Explicitly strokeless in both states, rather than inheriting the
+        // hairline `install()` gives every other widget: an outlined inactive
+        // pill competes with the accent-filled active one, and outlining the
+        // active pill too would double up on a fill that is already the
+        // loudest thing in the rail.
+        .stroke(Stroke::NONE)
+        .corner_radius(CornerRadius::same(ROUNDING))
+        .min_size(Vec2::new(0.0, NAV_BUTTON_HEIGHT))
+}
+
+/// A compact, chrome-free icon-only button for dense list rows (a room row's
+/// watch / leave / forget affordances). Transparent fill, no border, dim text
+/// that egui's own hover visuals lift.
+///
+/// *Why not `secondary_button`:* a bordered, padded button per stream row
+/// would dominate a sidebar row that is mostly label — the round-1 UX note
+/// asked for "icon-only buttons (denser than text buttons)" precisely because
+/// several of these stack inside one expanded room.
+pub fn icon_button(glyph: impl Into<String>) -> impl Widget {
+    egui::Button::new(RichText::new(glyph.into()).color(TEXT_DIM))
+        .fill(Color32::TRANSPARENT)
+        .corner_radius(CornerRadius::same(ROUNDING_SM))
+        .frame(false)
+}
+
+// ---------------------------------------------------------------------------
+// Indicators
+// ---------------------------------------------------------------------------
+
+/// A small round status indicator — the sidebar's per-room live/offline/
+/// reconnecting dot. `filled` draws a solid disc (a live, connected state);
+/// otherwise a hollow ring (saved but not connected), mirroring the
+/// `●`/`○` pair the roster already uses.
+///
+/// Painted rather than rendered as a `●`/`○` glyph because the reconnecting
+/// state animates its *alpha* (a pulse): a colored `RichText` glyph can carry
+/// a per-frame color too, but a painted disc also gives an exact, font-
+/// independent size (`DOT_SIZE`) so every row's label starts at the same x
+/// regardless of which state its dot is in.
+pub fn status_dot(ui: &mut Ui, color: Color32, filled: bool) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(DOT_SIZE), egui::Sense::hover());
+    let center = rect.center();
+    let radius = DOT_SIZE / 2.0;
+    if filled {
+        ui.painter().circle_filled(center, radius, color);
+    } else {
+        ui.painter().circle_stroke(center, radius - 0.5, Stroke::new(1.5, color));
+    }
 }
