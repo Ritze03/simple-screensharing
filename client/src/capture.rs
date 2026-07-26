@@ -121,11 +121,30 @@
 //! independently-encoded outgoing streams), per-destination live settings
 //! changes, and stream transfer, per
 //! `superdoc/brainstorm/ui-redesign-multiroom-streaming.md`'s "branch-swap"
-//! design. Not yet wired into [`start_sharing`]/[`CaptureHandle`] — this pass
-//! only builds and stress-tests the primitive itself ([`branch::add_branch`]/
-//! [`branch::remove_branch`]/[`branch::swap_branch`]); a later stage owns
-//! exposing the tee from [`CaptureHandle`] and building real
-//! `Destination`/`DestinationState` integration on top.
+//! design.
+//!
+//! # Per-destination lifecycle ([`destination`])
+//!
+//! [`destination`] is the state half of the same design: the
+//! [`destination::DestinationState`] machine (`Starting`/`Live`/`Rebuilding`/
+//! `Stalled`/`Failed`), the monotonic wire-PTS invariant that makes a capture
+//! restart look like low framerate rather than a glitch, the cached-IDR stall
+//! protocol, and the pure functions classifying a settings change into the
+//! plan doc's three tiers ([`destination::classify_change`]). It holds no
+//! GStreamer types and no clock of its own, so all of it is unit-testable
+//! against injected `Instant`s.
+//!
+//! The two halves are joined by [`branch::swap_to_new_branch`] (tier 2),
+//! [`branch::stall_all`] and [`branch::rebuild_after_source_restart`]
+//! (tier 3). [`start_sharing`] already creates one
+//! [`destination::DestinationRuntime`] and [`pump_loop`] drives it for real
+//! (wire PTS, IDR caching, first-IDR `Starting` → `Live`, the stall
+//! keepalive); what a later stage still owns is replacing this pipeline's
+//! single *fixed* encoder branch with one dynamic branch per destination, so
+//! one [`CaptureHandle`] carries N of them.
+//!
+//! See `superdoc/architecture/overview.md`'s "Per-destination lifecycle"
+//! section for the full model.
 
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -147,7 +166,7 @@ use gstreamer_video as gst_video;
 use gstreamer_video::prelude::*;
 use tokio::sync::mpsc;
 
-use crate::fragment::fragment_frame;
+use crate::fragment::fragment_frame_with_flags;
 use crate::net::{encrypt_frame, ScreenshareClient};
 use crate::preview::{self, FrameStream, PreviewHandle, RawFrame};
 use crate::protocol::StreamKind;
@@ -884,6 +903,20 @@ pub struct CaptureHandle {
     // `StreamDecoder::latest_frame` uses for the equivalent viewer-side
     // texture-upload pattern in `ui.rs`.
     self_preview_frame: Arc<Mutex<Option<egui::ColorImage>>>,
+    // This capture's destination lifecycle state — the `DestinationState`
+    // machine, the monotonic wire-PTS clock, and the stall protocol's cached
+    // IDR (see [`destination::DestinationRuntime`]). Shared with `pump_loop`,
+    // which writes it as frames flow, and read by `ui.rs` to render the
+    // destination's state.
+    //
+    // One runtime per handle, because this stage's `start_sharing` pipeline
+    // still has exactly one fixed encoder branch and therefore exactly one
+    // destination. Fan-out (N branch-backed destinations off one capture)
+    // holds one of these per destination and drives them with
+    // [`branch::swap_to_new_branch`]/[`branch::stall_all`]/
+    // [`branch::rebuild_after_source_restart`]; nothing about this type
+    // changes when that lands.
+    destination: destination::SharedDestination,
 }
 
 impl Drop for CaptureHandle {
@@ -1042,6 +1075,31 @@ async fn start_sharing_with_source(
     let encoder_fps = Arc::new(AtomicU32::new(0));
     let self_preview_frame: Arc<Mutex<Option<egui::ColorImage>>> = Arc::new(Mutex::new(None));
 
+    // This destination's lifecycle state. `pts_epoch` is anchored here — once,
+    // now — and never moves again for as long as this destination exists; the
+    // `on_pipeline_start` call right after re-anchors only the *offset* onto
+    // the pipeline that was just started. See
+    // [`destination::DestinationRuntime`]'s doc comment for why that split is
+    // what makes a later capture restart look like low framerate rather than a
+    // glitch.
+    let destination_runtime = destination::DestinationRuntime::shared(
+        Instant::now(),
+        destination::VideoParams {
+            width: width as u32,
+            height: height as u32,
+            framerate,
+            bitrate_kbps,
+            backend: preferred_backend,
+        },
+    );
+    {
+        let running_time_us = pipeline.current_running_time().map(|t| t.useconds()).unwrap_or(0);
+        destination_runtime
+            .lock()
+            .unwrap()
+            .on_pipeline_start(running_time_us, Instant::now());
+    }
+
     let pump_client = client.clone();
     let pump_encoder_fps = encoder_fps.clone();
     let self_preview_bridge = SelfPreviewBridge {
@@ -1058,6 +1116,7 @@ async fn start_sharing_with_source(
         encoder_sink_pad,
         pump_encoder_fps,
         self_preview_bridge,
+        destination_runtime.clone(),
     ));
 
     client
@@ -1081,6 +1140,7 @@ async fn start_sharing_with_source(
         control_tx,
         encoder_fps,
         self_preview_frame,
+        destination: destination_runtime,
     })
 }
 
@@ -1331,6 +1391,41 @@ impl CaptureHandle {
     pub fn self_preview_frame(&self) -> Option<egui::ColorImage> {
         self.self_preview_frame.lock().unwrap().take()
     }
+
+    /// Shared handle onto this capture's destination lifecycle state — see
+    /// [`destination::DestinationRuntime`]. `ui.rs` clones this into its own
+    /// `Destination` so the UI can read the state machine without going
+    /// through the handle on every repaint.
+    pub fn destination(&self) -> destination::SharedDestination {
+        self.destination.clone()
+    }
+
+    /// Snapshot of this capture's destination state. `Starting` until the
+    /// first IDR actually reaches the wire, then `Live`.
+    pub fn destination_state(&self) -> destination::DestinationState {
+        self.destination.lock().unwrap().state()
+    }
+
+    /// Tier-3 entry point: the shared capture source is going down, so this
+    /// destination stalls — no `StopStream`, no teardown, just the cached-IDR
+    /// keepalive at ~2fps until the source is back (see
+    /// [`send_stall_keepalive`]). Callers must pair this with
+    /// [`CaptureHandle::note_source_restarted`] once the capture is producing
+    /// again; nothing clears a stall on its own except a real frame arriving.
+    pub fn begin_stall(&self, reason: destination::StallReason) {
+        self.destination.lock().unwrap().begin_stall(reason, Instant::now());
+    }
+
+    /// The capture source is back: re-anchor the wire clock onto the restarted
+    /// pipeline's running time so PTS stays monotonic across the gap (see
+    /// [`destination::DestinationRuntime::on_pipeline_start`]). The stall
+    /// itself ends when the next real IDR is sent, not here — "the pipeline
+    /// restarted" and "the viewer has something decodable again" are different
+    /// events and only the second one should clear the placeholder.
+    pub fn note_source_restarted(&self) {
+        let running_time_us = self.pipeline.current_running_time().map(|t| t.useconds()).unwrap_or(0);
+        self.destination.lock().unwrap().on_pipeline_start(running_time_us, Instant::now());
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1457,8 +1552,17 @@ async fn pump_loop(
     encoder_sink_pad: gst::Pad,
     encoder_fps: Arc<AtomicU32>,
     mut self_preview: SelfPreviewBridge,
+    runtime: destination::SharedDestination,
 ) {
     let start = Instant::now();
+    // The stall protocol's clock. Ticks unconditionally (a `select!` arm
+    // can't be conditionally scheduled without re-creating the interval), but
+    // `send_stall_keepalive` is a cheap early-return whenever the destination
+    // isn't stalled, and the loop's own exit check runs before the `select!`
+    // — so this costs one wakeup every `STALL_RESEND_INTERVAL` and can never
+    // hold the loop open past teardown.
+    let mut stall_ticker = tokio::time::interval(destination::STALL_RESEND_INTERVAL);
+    stall_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut appsink_done = false;
     let mut bus_done = false;
     // Gates loop exit alongside `appsink_done`/`bus_done` (see the doc
@@ -1492,12 +1596,15 @@ async fn pump_loop(
                 match sample {
                     Some(sample) => {
                         record_encoder_frame(&mut encoded_frame_times, &encoder_fps);
-                        if let Err(e) = send_encoded_sample(&client, stream_id, &sample, start) {
+                        if let Err(e) = send_encoded_sample(&client, stream_id, &sample, start, &runtime) {
                             tracing::warn!("dropping encoded frame for stream {stream_id}: {e:#}");
                         }
                     }
                     None => appsink_done = true,
                 }
+            }
+            _ = stall_ticker.tick() => {
+                send_stall_keepalive(&client, stream_id, &runtime);
             }
             msg = bus_stream.next(), if !bus_done => {
                 match msg {
@@ -1585,17 +1692,89 @@ fn handle_bus_message(msg: &gst::Message, bus_done: &mut bool) {
 /// Encrypts, fragments, and sends one encoded access unit as media
 /// datagrams, per protocol-spec §5/§6: PTS-prefixed AEAD encryption via
 /// `net::encrypt_frame` (nonce drawn from the connection's single shared
-/// [`crate::net::NonceSequence`]), then split via `fragment::fragment_frame`
-/// using the frame's nonce counter as `frame_id` — the receiver reconstructs
-/// the same nonce from `(conn_id, frame_id)`, so these must match.
-fn send_encoded_sample(client: &ScreenshareClient, stream_id: u8, sample: &gst::Sample, start: Instant) -> Result<()> {
+/// [`crate::net::NonceSequence`]), then split via
+/// `fragment::fragment_frame_with_flags` using the frame's nonce counter as
+/// `frame_id` — the receiver reconstructs the same nonce from
+/// `(conn_id, frame_id)`, so these must match.
+///
+/// `wire_pts_us` must already have been through
+/// [`destination::DestinationRuntime`]'s monotonic clamp — this function
+/// deliberately takes a finished wire PTS rather than a raw buffer PTS, so
+/// there is exactly one place in this file where a timestamp can reach the
+/// wire and exactly one place the invariant can be broken.
+fn send_media_payload(
+    client: &ScreenshareClient,
+    stream_id: u8,
+    payload: &[u8],
+    wire_pts_us: u64,
+    keyframe: bool,
+    stalled: bool,
+) -> Result<()> {
+    let nonce_seq = client.nonce_sequence();
+    let (nonce, counter) = nonce_seq
+        .next_nonce(stream_id)
+        .map_err(|e| anyhow!("{e}"))
+        .context("cannot send another frame")?;
+
+    let room_key = client.room_key();
+    let ciphertext =
+        encrypt_frame(&room_key, stream_id, nonce, wire_pts_us, payload).context("failed to encrypt frame")?;
+
+    let connection = client.connection();
+    let max_datagram_size = connection
+        .max_datagram_size()
+        .ok_or_else(|| anyhow!("peer does not support QUIC datagrams"))?;
+
+    // `Why:` the `stalled` bit rides the media header's cleartext `flags`
+    // byte, which is **outside** the AEAD's AAD (`net.rs`'s `aead_encrypt`
+    // authenticates only `[version, stream_id]`, because the relay must be
+    // able to read and route the header without the room key — spec §6.2). It
+    // is therefore advisory only: a UI hint for the viewer's
+    // "waiting for capture…" placeholder, nothing more. Never let it drive
+    // teardown, (un)subscribe, or any other decision with a security or
+    // protocol consequence — see `protocol::MEDIA_FLAG_STALLED`. Note what
+    // keeps that safe: a stalled destination keeps sending *real,
+    // authenticated* frames and never sends `StopStream`, so the viewer's
+    // actual media state never depends on this bit being truthful.
+    let mut flags = 0u8;
+    if keyframe {
+        flags |= crate::protocol::MEDIA_FLAG_KEYFRAME;
+    }
+    if stalled {
+        flags |= crate::protocol::MEDIA_FLAG_STALLED;
+    }
+
+    let datagrams =
+        fragment_frame_with_flags(client.conn_id(), stream_id, counter, flags, &ciphertext, max_datagram_size)
+            .context("failed to fragment encrypted frame")?;
+
+    for datagram in datagrams {
+        connection
+            .send_datagram(datagram.into())
+            .map_err(|e| anyhow!("failed to send media datagram: {e}"))?;
+    }
+
+    Ok(())
+}
+
+/// Takes one encoded access unit off the appsink, maps it onto this
+/// destination's wire clock, records it in the [`destination::DestinationRuntime`]
+/// (caching IDRs for the stall protocol and driving the first-IDR
+/// `Starting`/`Stalled` → `Live` transitions), and sends it.
+fn send_encoded_sample(
+    client: &ScreenshareClient,
+    stream_id: u8,
+    sample: &gst::Sample,
+    start: Instant,
+    runtime: &destination::SharedDestination,
+) -> Result<()> {
     let buffer = sample.buffer().ok_or_else(|| anyhow!("sample had no buffer"))?;
 
     // Presentation timestamp in microseconds, per protocol-spec §6.1's
     // 8-byte PTS prefix. `do-timestamp=true` on pipewiresrc gives buffers a
     // pipeline running-time PTS; fall back to wall-clock-since-start on the
     // rare buffer that arrives without one rather than dropping the frame.
-    let pts_us = buffer
+    let buffer_pts_us = buffer
         .pts()
         .map(|t| t.useconds())
         .unwrap_or_else(|| start.elapsed().as_micros() as u64);
@@ -1605,30 +1784,893 @@ fn send_encoded_sample(client: &ScreenshareClient, stream_id: u8, sample: &gst::
     let map = buffer.map_readable().context("failed to map encoded H.264 access unit")?;
     let payload = map.as_slice();
 
-    let nonce_seq = client.nonce_sequence();
-    let (nonce, counter) = nonce_seq
-        .next_nonce(stream_id)
-        .map_err(|e| anyhow!("{e}"))
-        .context("cannot send another frame")?;
+    let (wire_pts_us, stalled) = {
+        let mut runtime = runtime.lock().unwrap();
+        // Note the frame *before* reading `is_stalled`: a real frame arriving
+        // is precisely what ends a stall, so a frame that itself ends the
+        // stall must not still carry the advisory "stalled" bit.
+        runtime.note_encoded_frame(keyframe, payload, Instant::now());
+        (runtime.wire_pts_from_buffer(buffer_pts_us), runtime.is_stalled())
+    };
 
-    let room_key = client.room_key();
-    let ciphertext = encrypt_frame(&room_key, stream_id, nonce, pts_us, payload).context("failed to encrypt frame")?;
+    send_media_payload(client, stream_id, payload, wire_pts_us, keyframe, stalled)
+}
 
-    let connection = client.connection();
-    let max_datagram_size = connection
-        .max_datagram_size()
-        .ok_or_else(|| anyhow!("peer does not support QUIC datagrams"))?;
+/// The stall protocol's send half: while a destination is
+/// [`destination::DestinationState::Stalled`], re-send its cached IDR at
+/// [`destination::STALL_RESEND_INTERVAL`], freshly re-encrypted (new nonce,
+/// per protocol §5 — a nonce is never reused, not even for identical bytes)
+/// and with a wire PTS that keeps advancing in real time.
+///
+/// `Why re-send at all, instead of just going quiet:` going quiet is
+/// indistinguishable from a crashed sender. Re-sending a decodable IDR keeps
+/// the viewer's decoder fed and its stream subscription alive, keeps
+/// `decode.rs`'s no-frames-in-3s backstop from firing, and — because the PTS
+/// keeps advancing on the destination's own unbroken clock — makes the outage
+/// render as a stretch of very low framerate rather than a discontinuity the
+/// viewer's pacer has to hard-reset through. Nothing is torn down: no
+/// `StopStream` is sent, so the viewer never sees a disconnect/resubscribe.
+fn send_stall_keepalive(client: &ScreenshareClient, stream_id: u8, runtime: &destination::SharedDestination) {
+    let now = Instant::now();
+    let Some((payload, wire_pts_us)) = ({
+        let mut runtime = runtime.lock().unwrap();
+        runtime.stall_resend_due(now).map(|idr| {
+            let pts = runtime.wire_pts_from_epoch(now);
+            (idr, pts)
+        })
+    }) else {
+        return;
+    };
 
-    let datagrams = fragment_frame(client.conn_id(), stream_id, counter, keyframe, &ciphertext, max_datagram_size)
-        .context("failed to fragment encrypted frame")?;
+    if let Err(e) = send_media_payload(client, stream_id, &payload, wire_pts_us, true, true) {
+        tracing::warn!("stream {stream_id}: failed to re-send the cached IDR while stalled: {e:#}");
+    }
+}
 
-    for datagram in datagrams {
-        connection
-            .send_datagram(datagram.into())
-            .map_err(|e| anyhow!("failed to send media datagram: {e}"))?;
+// ---------------------------------------------------------------------
+// Per-destination lifecycle: state machine, wire-PTS continuity, stall
+// protocol, and the three-tier change model
+// ---------------------------------------------------------------------
+
+/// Everything that is genuinely *per outgoing destination* rather than per
+/// capture pipeline: the [`DestinationState`] machine, the monotonic wire-PTS
+/// invariant that survives a capture restart, the cached-IDR stall protocol,
+/// and the pure functions classifying a settings change into one of the
+/// plan doc's three tiers.
+///
+/// Deliberately free of GStreamer types (only [`EncoderBackend`] leaks in,
+/// and that's a plain enum): everything here is ordinary Rust state that can
+/// be unit-tested against injected `Instant`s with no pipeline, no portal, and
+/// no clock of its own. The GStreamer half — building/swapping/removing the
+/// branch this state describes — lives in [`branch`], and the two are joined
+/// by [`branch::swap_to_new_branch`]/[`branch::rebuild_after_source_restart`].
+///
+/// See `superdoc/architecture/overview.md`'s "Per-destination lifecycle"
+/// section and `superdoc/brainstorm/ui-redesign-multiroom-streaming.md`.
+pub mod destination {
+    use super::*;
+
+    /// How often a `Stalled` destination re-sends its cached IDR (~2fps, per
+    /// the plan doc). Slow enough to cost almost nothing while a capture is
+    /// down, frequent enough that the viewer's decoder keeps receiving
+    /// decodable frames and never times its stream out.
+    pub const STALL_RESEND_INTERVAL: Duration = Duration::from_millis(500);
+
+    /// Why a destination is in [`DestinationState::Stalled`]. Only ever a
+    /// *capture-source-level* cause: per the plan doc's three-tier model,
+    /// nothing a single destination can ask for on its own is allowed to reach
+    /// this state (see [`ChangeTier`]).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum StallReason {
+        /// The user switched which monitor/window is captured, or raised a
+        /// destination's fps requirement above the source's current rate — a
+        /// deliberate, expected restart of the shared capture source.
+        SourceChanged,
+        /// The capture source died on its own (portal session revoked, device
+        /// unplugged, pipeline error) and is being brought back.
+        SourceLost,
     }
 
-    Ok(())
+    /// Lifecycle of one outgoing destination. Exactly one variant —
+    /// [`DestinationState::Stalled`] — is visible to the viewer; every other
+    /// transition is designed to be invisible (see the plan doc's three-tier
+    /// change model, and [`ChangeTier`] below).
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum DestinationState {
+        /// The branch has been built but hasn't emitted its first IDR yet, so
+        /// nothing decodable has reached the viewer. Entered exactly once, at
+        /// destination creation.
+        Starting,
+        /// Producing frames normally.
+        Live,
+        /// A branch swap is in flight (new resolution/fps/encoder backend for
+        /// *this* destination only). The **old** branch is still authoritative
+        /// and still sending, so this is invisible to the viewer — it exists
+        /// so the UI can show "applying…" and so a swap that never completes
+        /// is diagnosable. Never becomes `Stalled`: a failed swap keeps the
+        /// old branch (see [`branch::SwapOutcome`]).
+        Rebuilding { since: Instant },
+        /// The shared capture source is down. The only viewer-visible state.
+        /// While here the stream is *never* torn down (no `StopStream`); the
+        /// last cached IDR is re-sent at [`STALL_RESEND_INTERVAL`] with
+        /// [`crate::protocol::MEDIA_FLAG_STALLED`] set, so the viewer sees a
+        /// frozen frame at a low framerate rather than a disconnect.
+        Stalled { since: Instant, reason: StallReason },
+        /// Unrecoverable: this destination will not produce frames again
+        /// without user action.
+        Failed(String),
+    }
+
+    impl DestinationState {
+        /// The one state the viewer can tell apart from healthy streaming.
+        pub fn is_stalled(&self) -> bool {
+            matches!(self, DestinationState::Stalled { .. })
+        }
+
+        /// Short, stable identifier for logs/tests (and, later, UI copy keys).
+        pub fn label(&self) -> &'static str {
+            match self {
+                DestinationState::Starting => "starting",
+                DestinationState::Live => "live",
+                DestinationState::Rebuilding { .. } => "rebuilding",
+                DestinationState::Stalled { .. } => "stalled",
+                DestinationState::Failed(_) => "failed",
+            }
+        }
+    }
+
+    /// One destination's encode settings. Independent of every other
+    /// destination fed by the same capture — that independence is exactly what
+    /// [`branch::add_branch`]'s per-branch `videoscale`/`videorate`/capsfilter
+    /// chain buys.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct VideoParams {
+        pub width: u32,
+        pub height: u32,
+        pub framerate: u32,
+        pub bitrate_kbps: u32,
+        pub backend: EncoderBackend,
+    }
+
+    impl VideoParams {
+        pub fn to_encode_settings(self) -> branch::EncodeSettings {
+            branch::EncodeSettings {
+                width: self.width,
+                height: self.height,
+                framerate: self.framerate,
+                bitrate_kbps: self.bitrate_kbps,
+                backend: self.backend,
+            }
+        }
+    }
+
+    /// What the shared capture source is actually producing right now: its
+    /// native frame size and the rate the source element is running at (which
+    /// is `max(fps)` across all its destinations — see
+    /// [`required_source_framerate`]).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SourceCaps {
+        pub width: u32,
+        pub height: u32,
+        pub framerate: u32,
+    }
+
+    /// The plan doc's three-tier change model, plus a no-op tier. Returned by
+    /// [`classify_change`]; determines how much machinery a settings change
+    /// costs and — critically — whether the viewer can tell.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ChangeTier {
+        /// Nothing to do.
+        Unchanged,
+        /// Tier 1 — bitrate only: a live property write on the running
+        /// encoder. No branch, no state change, zero viewer impact.
+        Bitrate,
+        /// Tier 2 — resolution/fps/encoder-backend for *one* destination:
+        /// build a new branch, wait for its first IDR, flip, drop the old one
+        /// ([`branch::swap_to_new_branch`]). `Rebuilding` → `Live`; the viewer
+        /// sees nothing. Other destinations on the same capture are mechanically
+        /// untouched (their own `queue`s isolate them).
+        BranchSwap,
+        /// Tier 3 — the capture **source** must change (different monitor/window,
+        /// or an fps requirement above what the source currently runs at). The
+        /// only tier that stalls, and it stalls **every** destination sharing
+        /// that capture at once — accepted per the plan doc, on the condition
+        /// that it looks like a framerate dip, not a broken stream (which is
+        /// what the stall protocol + PTS invariant below deliver).
+        SourceRestart,
+    }
+
+    /// Which tier a requested settings change falls into, given what the
+    /// shared source is currently producing.
+    ///
+    /// `Why:` the fps rule is the non-obvious one and is checked *first*.
+    /// Anything at or below `source.framerate` is servable entirely inside
+    /// this destination's own branch, because that branch already has its own
+    /// `videorate` doing the downconversion ([`branch::add_branch`]) — so it's
+    /// a tier-2 swap. Going *above* it cannot be: `videorate` can only
+    /// duplicate frames the source actually delivered, so a higher rate has to
+    /// come from the source element itself, which means restarting it — and
+    /// that restart is shared, so it hits every co-located destination. This
+    /// asymmetry (down is free, up is expensive) is the whole reason the
+    /// capture runs at `max(fps)` across its destinations rather than at any
+    /// single destination's rate.
+    pub fn classify_change(source: SourceCaps, from: VideoParams, to: VideoParams) -> ChangeTier {
+        if to.framerate > source.framerate {
+            return ChangeTier::SourceRestart;
+        }
+        if to.width != from.width
+            || to.height != from.height
+            || to.framerate != from.framerate
+            || to.backend != from.backend
+        {
+            return ChangeTier::BranchSwap;
+        }
+        if to.bitrate_kbps != from.bitrate_kbps {
+            return ChangeTier::Bitrate;
+        }
+        ChangeTier::Unchanged
+    }
+
+    /// **Never upscale**: clamp a requested resolution down to at most the
+    /// capture's native size, and the framerate into the pipeline's supported
+    /// range. Framerate is deliberately *not* clamped to the source's rate —
+    /// asking for more than the source runs at is legal, it's just a
+    /// [`ChangeTier::SourceRestart`] rather than a swap.
+    ///
+    /// `Why:` (clamping proportionally rather than per-axis) upscaling wastes
+    /// encode budget on invented pixels and never adds detail, so it's simply
+    /// disallowed — but clamping each axis independently would silently change
+    /// the aspect ratio when only one axis overshoots (e.g. 3840x1080 requested
+    /// off a 1920x1080 capture would become 1920x1080, stretching the image).
+    /// Scaling both axes by the single tightest overshoot ratio keeps the
+    /// picture geometrically correct, which matters because the branch's
+    /// `videoscale` will happily distort otherwise.
+    pub fn clamp_to_source(params: VideoParams, source: SourceCaps) -> VideoParams {
+        let mut out = VideoParams {
+            framerate: params.framerate.clamp(MIN_FRAMERATE, MAX_FRAMERATE),
+            ..params
+        };
+
+        if source.width == 0 || source.height == 0 || out.width == 0 || out.height == 0 {
+            // Source size not negotiated yet (or a caller asking for
+            // "whatever the source is"): nothing to clamp against.
+            return out;
+        }
+
+        if out.width > source.width || out.height > source.height {
+            // Rational arithmetic in u64 rather than floats: exact, and no
+            // rounding surprise that could leave a dimension one pixel over.
+            let (w, h) = (out.width as u64, out.height as u64);
+            let (sw, sh) = (source.width as u64, source.height as u64);
+            // Pick the axis that overshoots most: scale = min(sw/w, sh/h).
+            let (num, den) = if sw * h <= sh * w { (sw, w) } else { (sh, h) };
+            out.width = ((w * num) / den).max(1) as u32;
+            out.height = ((h * num) / den).max(1) as u32;
+        }
+
+        out
+    }
+
+    /// The rate the shared capture source must run at to serve every
+    /// destination: the maximum any of them needs. Everything below that is
+    /// downconverted per-branch by `videorate`, costing nothing extra at the
+    /// source.
+    pub fn required_source_framerate(dest_framerates: impl IntoIterator<Item = u32>) -> u32 {
+        dest_framerates
+            .into_iter()
+            .max()
+            .unwrap_or(DEFAULT_FRAMERATE)
+            .clamp(MIN_FRAMERATE, MAX_FRAMERATE)
+    }
+
+    /// Shared handle onto one destination's [`DestinationRuntime`]. The pump
+    /// task ([`super::pump_loop`]) writes it as frames flow; `ui.rs` reads the
+    /// state to render; the swap/restart orchestrators in [`branch`] drive its
+    /// transitions. A plain `Mutex` (not a channel): this is last-value state,
+    /// and every writer holds it for a few field assignments at most.
+    pub type SharedDestination = Arc<Mutex<DestinationRuntime>>;
+
+    /// Per-destination lifecycle state: the [`DestinationState`] machine, the
+    /// monotonic wire-PTS clock, and the stall protocol's cached IDR.
+    ///
+    /// # The wire-PTS invariant
+    ///
+    /// `Why:` a GStreamer pipeline's running time restarts at 0 every time the
+    /// pipeline is (re)built, so sending buffer PTS straight onto the wire
+    /// makes a capture restart look like the stream jumped *backwards in time*
+    /// — which a viewer-side pacer (`decode.rs`'s `PacingState`) can only read
+    /// as a discontinuity to hard-reset on, i.e. a visible glitch. Making wire
+    /// PTS a property of the **destination** instead fixes that: [`Self::pts_epoch`]
+    /// is set once, at destination creation, and never moves; [`Self::pts_offset_us`]
+    /// is recomputed on every pipeline (re)start so that the new pipeline's
+    /// running time maps back onto that same unbroken timeline. A restart then
+    /// reads to the viewer as *a period of low framerate* (few frames arrived
+    /// during the gap) rather than a break — exactly the illusion the stall
+    /// protocol is built to sustain.
+    ///
+    /// The `max(…, last_sent + 1)` floor in [`Self::wire_pts_from_buffer`] is a
+    /// **hard clamp, not a formula**: it guarantees monotonicity even if the
+    /// offset arithmetic is wrong, if a buffer arrives with a stale PTS from
+    /// before a restart, or if a stall re-send interleaves with a real frame.
+    /// Nothing else in this file may hand a PTS to the wire without going
+    /// through it.
+    pub struct DestinationRuntime {
+        state: DestinationState,
+        /// Fixed at creation; the zero point of this destination's wire clock.
+        /// Never reassigned — reassigning it is exactly the bug this design
+        /// exists to prevent.
+        pts_epoch: Instant,
+        /// Recomputed on every pipeline/branch (re)start, per
+        /// [`Self::on_pipeline_start`].
+        pts_offset_us: u64,
+        /// The last PTS actually put on the wire, if any. `None` before the
+        /// first send so the very first frame is free to be PTS 0.
+        last_sent_pts_us: Option<u64>,
+        /// Last IDR seen from the authoritative branch, re-sent while stalled.
+        last_idr: Option<Vec<u8>>,
+        last_stall_resend: Option<Instant>,
+        params: VideoParams,
+    }
+
+    impl DestinationRuntime {
+        /// A brand-new destination: [`DestinationState::Starting`] until its
+        /// first IDR, with its wire clock's epoch anchored at `now`.
+        pub fn new(now: Instant, params: VideoParams) -> Self {
+            Self {
+                state: DestinationState::Starting,
+                pts_epoch: now,
+                pts_offset_us: 0,
+                last_sent_pts_us: None,
+                last_idr: None,
+                last_stall_resend: None,
+                params,
+            }
+        }
+
+        pub fn shared(now: Instant, params: VideoParams) -> SharedDestination {
+            Arc::new(Mutex::new(Self::new(now, params)))
+        }
+
+        pub fn state(&self) -> DestinationState {
+            self.state.clone()
+        }
+
+        pub fn is_stalled(&self) -> bool {
+            self.state.is_stalled()
+        }
+
+        pub fn params(&self) -> VideoParams {
+            self.params
+        }
+
+        /// Tier-1 change ([`ChangeTier::Bitrate`]): record the new bitrate.
+        /// Deliberately does **not** touch [`Self::state`] — a live encoder
+        /// property write has no lifecycle consequence at all, which is the
+        /// entire point of it being its own tier.
+        pub fn set_bitrate(&mut self, bitrate_kbps: u32) {
+            self.params.bitrate_kbps = bitrate_kbps;
+        }
+
+        /// Record the params a completed branch swap actually applied.
+        pub fn set_params(&mut self, params: VideoParams) {
+            self.params = params;
+        }
+
+        pub fn pts_offset_us(&self) -> u64 {
+            self.pts_offset_us
+        }
+
+        pub fn last_sent_pts_us(&self) -> Option<u64> {
+            self.last_sent_pts_us
+        }
+
+        /// Re-anchor the wire clock onto a freshly (re)started pipeline:
+        /// `pts_offset_us = pts_epoch.elapsed() - pipeline_running_time`.
+        /// Call this **before** any buffer from the new pipeline reaches
+        /// [`Self::wire_pts_from_buffer`].
+        ///
+        /// `Why saturating_sub`: the subtraction is conceptually signed (a
+        /// pipeline whose running time already exceeds this destination's own
+        /// age — possible when a destination is added to a capture that has
+        /// been running for a while — yields a negative offset). Rather than
+        /// carry a signed offset through every arithmetic path, this saturates
+        /// to 0 and lets the monotonic floor in [`Self::wire_pts_from_buffer`]
+        /// absorb the difference: PTS then advances at +1µs per frame for as
+        /// long as the raw values lag, which is ugly but *monotonic*, and
+        /// recovers by itself. Correctness here rests on the clamp, never on
+        /// this arithmetic — see the type's doc comment.
+        pub fn on_pipeline_start(&mut self, pipeline_running_time_us: u64, now: Instant) {
+            let epoch_elapsed_us = now.saturating_duration_since(self.pts_epoch).as_micros() as u64;
+            self.pts_offset_us = epoch_elapsed_us.saturating_sub(pipeline_running_time_us);
+        }
+
+        /// Wire PTS for a real captured buffer:
+        /// `max(buffer_pts + offset, last_sent + 1)`.
+        pub fn wire_pts_from_buffer(&mut self, buffer_pts_us: u64) -> u64 {
+            self.advance_pts(buffer_pts_us.saturating_add(self.pts_offset_us))
+        }
+
+        /// Wire PTS for a synthesized send that has no buffer of its own —
+        /// i.e. a stall re-send of the cached IDR. Derived from the same
+        /// epoch, so a stalled stream's PTS keeps advancing in real time and
+        /// the gap reads as low framerate rather than a frozen clock.
+        pub fn wire_pts_from_epoch(&mut self, now: Instant) -> u64 {
+            let elapsed_us = now.saturating_duration_since(self.pts_epoch).as_micros() as u64;
+            self.advance_pts(elapsed_us)
+        }
+
+        /// The single monotonicity gate — see the type's doc comment.
+        fn advance_pts(&mut self, candidate_us: u64) -> u64 {
+            let pts = match self.last_sent_pts_us {
+                Some(last) => candidate_us.max(last.saturating_add(1)),
+                None => candidate_us,
+            };
+            self.last_sent_pts_us = Some(pts);
+            pts
+        }
+
+        /// One encoded access unit reached the wire from the **authoritative**
+        /// branch. Caches IDRs for the stall protocol and drives the
+        /// first-IDR transitions.
+        ///
+        /// `Why:` this only transitions out of `Starting`/`Stalled`, never out
+        /// of `Rebuilding`. During a swap the *old* branch is still
+        /// authoritative and still emitting its own periodic IDRs (2s GOP) —
+        /// letting those end the rebuild would declare the swap complete
+        /// before the new branch had produced anything, defeating
+        /// make-before-break. `Rebuilding` is exited only by
+        /// [`Self::finish_rebuild`], which the swap orchestrator calls once it
+        /// has actually seen the *new* branch's first IDR.
+        pub fn note_encoded_frame(&mut self, keyframe: bool, payload: &[u8], now: Instant) {
+            if keyframe {
+                self.last_idr = Some(payload.to_vec());
+            }
+            match (&self.state, keyframe) {
+                (DestinationState::Starting, true) | (DestinationState::Stalled { .. }, true) => {
+                    self.state = DestinationState::Live;
+                    self.last_stall_resend = None;
+                    let _ = now;
+                }
+                _ => {}
+            }
+        }
+
+        /// Tier-2: a branch swap is starting. Invisible to the viewer.
+        pub fn begin_rebuild(&mut self, now: Instant) {
+            if matches!(self.state, DestinationState::Failed(_)) {
+                return;
+            }
+            self.state = DestinationState::Rebuilding { since: now };
+        }
+
+        /// Tier-2 completed: the new branch produced its first IDR and is now
+        /// authoritative.
+        pub fn finish_rebuild(&mut self) {
+            if matches!(self.state, DestinationState::Rebuilding { .. }) {
+                self.state = DestinationState::Live;
+            }
+        }
+
+        /// Tier-2 failed: the old branch is still authoritative and still
+        /// live, so go back to `Live` rather than stalling — a failed swap
+        /// must never be worse for the viewer than not having tried.
+        pub fn abandon_rebuild(&mut self) {
+            if matches!(self.state, DestinationState::Rebuilding { .. }) {
+                self.state = DestinationState::Live;
+            }
+        }
+
+        /// Tier-3: the shared capture source went away. Enters the one
+        /// viewer-visible state; the stream itself is *not* torn down.
+        pub fn begin_stall(&mut self, reason: StallReason, now: Instant) {
+            if matches!(self.state, DestinationState::Failed(_)) {
+                return;
+            }
+            if !self.state.is_stalled() {
+                self.state = DestinationState::Stalled { since: now, reason };
+                // Re-send immediately on the next poll rather than waiting a
+                // full interval, so the advisory flag reaches the viewer as
+                // promptly as possible.
+                self.last_stall_resend = None;
+            }
+        }
+
+        pub fn fail(&mut self, message: impl Into<String>) {
+            self.state = DestinationState::Failed(message.into());
+        }
+
+        pub fn cached_idr(&self) -> Option<&[u8]> {
+            self.last_idr.as_deref()
+        }
+
+        /// The stall protocol's pacing gate: `Some(idr)` when this stalled
+        /// destination is due to re-send its cached IDR (~2fps), `None`
+        /// otherwise (not stalled, nothing cached yet, or too soon).
+        pub fn stall_resend_due(&mut self, now: Instant) -> Option<Vec<u8>> {
+            if !self.state.is_stalled() {
+                return None;
+            }
+            if let Some(last) = self.last_stall_resend {
+                if now.saturating_duration_since(last) < STALL_RESEND_INTERVAL {
+                    return None;
+                }
+            }
+            let idr = self.last_idr.clone()?;
+            self.last_stall_resend = Some(now);
+            Some(idr)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Everything here drives `Instant`s in by hand rather than sleeping —
+        /// the same discipline `decode.rs`'s `pacing_*` tests use, and the
+        /// reason this whole module was kept free of clocks and GStreamer.
+        fn t0() -> Instant {
+            Instant::now()
+        }
+
+        fn params(framerate: u32) -> VideoParams {
+            VideoParams {
+                width: 1920,
+                height: 1080,
+                framerate,
+                bitrate_kbps: 8000,
+                backend: EncoderBackend::Software,
+            }
+        }
+
+        // -------------------------------------------------------------
+        // State machine
+        // -------------------------------------------------------------
+
+        #[test]
+        fn a_new_destination_starts_in_starting_and_goes_live_on_its_first_idr() {
+            let now = t0();
+            let mut runtime = DestinationRuntime::new(now, params(30));
+            assert_eq!(runtime.state(), DestinationState::Starting);
+
+            // A delta frame is not enough — nothing decodable has reached the
+            // viewer yet.
+            runtime.note_encoded_frame(false, b"delta", now + Duration::from_millis(10));
+            assert_eq!(runtime.state(), DestinationState::Starting);
+
+            runtime.note_encoded_frame(true, b"idr", now + Duration::from_millis(20));
+            assert_eq!(runtime.state(), DestinationState::Live);
+        }
+
+        /// The subtle one: while a swap is in flight the **old** branch is
+        /// still authoritative and still emitting its own periodic IDRs. Those
+        /// must not end the rebuild — only the new branch actually producing
+        /// does, via `finish_rebuild`.
+        #[test]
+        fn the_old_branchs_idrs_do_not_end_a_rebuild() {
+            let now = t0();
+            let mut runtime = DestinationRuntime::new(now, params(30));
+            runtime.note_encoded_frame(true, b"idr", now);
+            runtime.begin_rebuild(now + Duration::from_millis(100));
+
+            for i in 0..5 {
+                runtime.note_encoded_frame(true, b"old-branch-idr", now + Duration::from_millis(200 + i * 50));
+                assert!(
+                    matches!(runtime.state(), DestinationState::Rebuilding { .. }),
+                    "an IDR from the still-authoritative old branch must not complete the swap"
+                );
+            }
+
+            runtime.finish_rebuild();
+            assert_eq!(runtime.state(), DestinationState::Live);
+        }
+
+        /// A swap that can't be applied must leave the destination exactly as
+        /// it was — still `Live` on its old branch, never `Stalled`.
+        #[test]
+        fn an_abandoned_rebuild_returns_to_live_never_stalled() {
+            let now = t0();
+            let mut runtime = DestinationRuntime::new(now, params(30));
+            runtime.note_encoded_frame(true, b"idr", now);
+            runtime.begin_rebuild(now + Duration::from_millis(10));
+            runtime.abandon_rebuild();
+            assert_eq!(runtime.state(), DestinationState::Live);
+        }
+
+        #[test]
+        fn a_stall_ends_on_the_first_idr_after_the_source_is_back() {
+            let now = t0();
+            let mut runtime = DestinationRuntime::new(now, params(30));
+            runtime.note_encoded_frame(true, b"idr", now);
+
+            runtime.begin_stall(StallReason::SourceChanged, now + Duration::from_secs(1));
+            assert!(runtime.is_stalled());
+
+            // A delta frame can't end it: the viewer has nothing decodable.
+            runtime.note_encoded_frame(false, b"delta", now + Duration::from_secs(2));
+            assert!(runtime.is_stalled());
+
+            runtime.note_encoded_frame(true, b"new-idr", now + Duration::from_secs(3));
+            assert_eq!(runtime.state(), DestinationState::Live);
+        }
+
+        #[test]
+        fn begin_stall_does_not_restart_an_existing_stalls_clock() {
+            let now = t0();
+            let mut runtime = DestinationRuntime::new(now, params(30));
+            runtime.begin_stall(StallReason::SourceLost, now + Duration::from_secs(1));
+            let first = runtime.state();
+            runtime.begin_stall(StallReason::SourceLost, now + Duration::from_secs(5));
+            assert_eq!(runtime.state(), first, "a repeated stall notification must not reset `since`");
+        }
+
+        #[test]
+        fn a_failed_destination_is_terminal_against_stall_and_rebuild() {
+            let now = t0();
+            let mut runtime = DestinationRuntime::new(now, params(30));
+            runtime.fail("encoder exploded");
+            runtime.begin_stall(StallReason::SourceLost, now);
+            runtime.begin_rebuild(now);
+            assert!(matches!(runtime.state(), DestinationState::Failed(_)));
+        }
+
+        // -------------------------------------------------------------
+        // Stall protocol pacing
+        // -------------------------------------------------------------
+
+        #[test]
+        fn stall_resend_paces_at_the_configured_interval_and_only_while_stalled() {
+            let now = t0();
+            let mut runtime = DestinationRuntime::new(now, params(30));
+            runtime.note_encoded_frame(true, b"cached-idr", now);
+
+            // Not stalled: nothing to re-send, however often it's polled.
+            assert!(runtime.stall_resend_due(now).is_none());
+
+            runtime.begin_stall(StallReason::SourceChanged, now);
+            // First poll after entering the stall fires immediately, so the
+            // advisory flag reaches the viewer promptly.
+            assert_eq!(runtime.stall_resend_due(now).as_deref(), Some(&b"cached-idr"[..]));
+            // Too soon.
+            assert!(runtime.stall_resend_due(now + STALL_RESEND_INTERVAL / 2).is_none());
+            // Due again.
+            assert_eq!(
+                runtime.stall_resend_due(now + STALL_RESEND_INTERVAL).as_deref(),
+                Some(&b"cached-idr"[..])
+            );
+
+            // Recovery stops the re-sends.
+            runtime.note_encoded_frame(true, b"fresh", now + Duration::from_secs(9));
+            assert!(runtime.stall_resend_due(now + Duration::from_secs(20)).is_none());
+        }
+
+        #[test]
+        fn a_stall_before_any_idr_was_ever_cached_sends_nothing() {
+            let now = t0();
+            let mut runtime = DestinationRuntime::new(now, params(30));
+            runtime.begin_stall(StallReason::SourceLost, now);
+            assert!(
+                runtime.stall_resend_due(now).is_none(),
+                "with no cached IDR there is nothing decodable to re-send — must not send garbage"
+            );
+        }
+
+        // -------------------------------------------------------------
+        // The wire-PTS invariant
+        // -------------------------------------------------------------
+
+        /// The invariant, stated directly: wire PTS must never go backwards,
+        /// including across a pipeline restart that resets buffer PTS to 0.
+        #[test]
+        fn wire_pts_never_goes_backwards_across_a_simulated_restart() {
+            let epoch = t0();
+            let mut runtime = DestinationRuntime::new(epoch, params(30));
+            runtime.on_pipeline_start(0, epoch);
+
+            let mut sent = Vec::new();
+
+            // 3 seconds of normal capture at 30fps: buffer PTS climbing from 0.
+            for frame in 0..90u64 {
+                sent.push(runtime.wire_pts_from_buffer(frame * 33_333));
+            }
+            let before_restart = *sent.last().unwrap();
+
+            // The capture source is switched: 2s of downtime during which the
+            // stall protocol keeps re-sending on the epoch clock.
+            let restart_at = epoch + Duration::from_secs(5);
+            for tick in 0..4u64 {
+                sent.push(runtime.wire_pts_from_epoch(epoch + Duration::from_millis(3_000 + tick * 500)));
+            }
+
+            // New pipeline: its running time restarts at 0. This is the exact
+            // condition that, without `pts_offset_us`, would send the wire
+            // clock crashing back to zero.
+            runtime.on_pipeline_start(0, restart_at);
+            for frame in 0..90u64 {
+                sent.push(runtime.wire_pts_from_buffer(frame * 33_333));
+            }
+
+            for pair in sent.windows(2) {
+                assert!(
+                    pair[1] > pair[0],
+                    "wire PTS went backwards or stalled: {} -> {} (the monotonic clamp is the whole point)",
+                    pair[0],
+                    pair[1]
+                );
+            }
+
+            // Not just monotonic — the post-restart timeline must actually pick
+            // up near where real time is, so the gap reads as "few frames
+            // arrived", not as a 5-second replay of the past.
+            let first_after_restart = sent[94];
+            assert!(
+                first_after_restart >= before_restart,
+                "the first post-restart frame must not predate the last pre-restart one"
+            );
+            assert!(
+                first_after_restart >= 4_500_000,
+                "post-restart PTS ({first_after_restart}µs) should land near the destination's real elapsed time \
+                 (~5s), not back near zero — that mapping is what makes a restart look like low framerate"
+            );
+        }
+
+        /// The clamp is a hard guarantee, not a consequence of the offset
+        /// arithmetic being right: even fed strictly *decreasing* raw values it
+        /// must still emit a strictly increasing sequence.
+        #[test]
+        fn the_monotonic_clamp_holds_even_against_decreasing_buffer_timestamps() {
+            let epoch = t0();
+            let mut runtime = DestinationRuntime::new(epoch, params(30));
+            runtime.on_pipeline_start(0, epoch);
+
+            let mut last = runtime.wire_pts_from_buffer(1_000_000);
+            for step in (0..20u64).rev() {
+                let pts = runtime.wire_pts_from_buffer(step * 50_000);
+                assert!(pts > last, "clamp failed: {last} -> {pts}");
+                last = pts;
+            }
+        }
+
+        #[test]
+        fn the_first_frame_may_be_pts_zero() {
+            let epoch = t0();
+            let mut runtime = DestinationRuntime::new(epoch, params(30));
+            runtime.on_pipeline_start(0, epoch);
+            assert_eq!(runtime.wire_pts_from_buffer(0), 0, "the very first frame must not be forced off zero");
+            assert!(runtime.wire_pts_from_buffer(0) > 0, "but the second one must advance");
+        }
+
+        #[test]
+        fn on_pipeline_start_maps_the_new_running_time_onto_the_original_epoch() {
+            let epoch = t0();
+            let mut runtime = DestinationRuntime::new(epoch, params(30));
+            runtime.on_pipeline_start(0, epoch + Duration::from_secs(10));
+            assert_eq!(runtime.pts_offset_us(), 10_000_000);
+
+            // A pipeline that had already been running for 4s when this
+            // destination attached: the offset absorbs the difference.
+            runtime.on_pipeline_start(4_000_000, epoch + Duration::from_secs(10));
+            assert_eq!(runtime.pts_offset_us(), 6_000_000);
+        }
+
+        // -------------------------------------------------------------
+        // The three-tier change model
+        // -------------------------------------------------------------
+
+        #[test]
+        fn bitrate_only_changes_are_tier_one() {
+            let source = SourceCaps { width: 1920, height: 1080, framerate: 60 };
+            let from = params(30);
+            let to = VideoParams { bitrate_kbps: 4000, ..from };
+            assert_eq!(classify_change(source, from, to), ChangeTier::Bitrate);
+            assert_eq!(classify_change(source, from, from), ChangeTier::Unchanged);
+        }
+
+        /// The load-bearing asymmetry: at or below the source's rate is a
+        /// branch swap (the branch's own `videorate` downconverts); above it
+        /// needs the source itself to run faster, which is a restart.
+        #[test]
+        fn fps_below_the_source_cap_swaps_and_above_it_restarts() {
+            let source = SourceCaps { width: 1920, height: 1080, framerate: 60 };
+            let from = params(60);
+
+            for lower in [1u32, 15, 30, 59, 60] {
+                assert_eq!(
+                    classify_change(source, from, VideoParams { framerate: lower, ..from }),
+                    if lower == 60 { ChangeTier::Unchanged } else { ChangeTier::BranchSwap },
+                    "{lower}fps is at or below the source's 60fps and must be servable by this branch alone"
+                );
+            }
+
+            for higher in [61u32, 90, 120, 240] {
+                assert_eq!(
+                    classify_change(source, from, VideoParams { framerate: higher, ..from }),
+                    ChangeTier::SourceRestart,
+                    "{higher}fps exceeds the source's 60fps — videorate cannot invent frames, so the source must restart"
+                );
+            }
+        }
+
+        #[test]
+        fn resolution_and_backend_changes_are_tier_two() {
+            let source = SourceCaps { width: 1920, height: 1080, framerate: 60 };
+            let from = params(30);
+            assert_eq!(
+                classify_change(source, from, VideoParams { width: 1280, height: 720, ..from }),
+                ChangeTier::BranchSwap
+            );
+            assert_eq!(
+                classify_change(source, from, VideoParams { backend: EncoderBackend::Vaapi, ..from }),
+                ChangeTier::BranchSwap
+            );
+        }
+
+        /// A resolution change that *also* raises fps past the source cap is
+        /// tier 3, not tier 2 — the fps check has to win.
+        #[test]
+        fn an_fps_increase_dominates_a_simultaneous_resolution_change() {
+            let source = SourceCaps { width: 1920, height: 1080, framerate: 30 };
+            let from = params(30);
+            let to = VideoParams { width: 1280, height: 720, framerate: 120, ..from };
+            assert_eq!(classify_change(source, from, to), ChangeTier::SourceRestart);
+        }
+
+        // -------------------------------------------------------------
+        // Never upscale
+        // -------------------------------------------------------------
+
+        #[test]
+        fn resolution_is_clamped_down_to_the_source_and_never_up() {
+            let source = SourceCaps { width: 1920, height: 1080, framerate: 60 };
+
+            // Below native: untouched.
+            let down = clamp_to_source(VideoParams { width: 1280, height: 720, ..params(30) }, source);
+            assert_eq!((down.width, down.height), (1280, 720));
+
+            // Exactly native: untouched.
+            let exact = clamp_to_source(VideoParams { width: 1920, height: 1080, ..params(30) }, source);
+            assert_eq!((exact.width, exact.height), (1920, 1080));
+
+            // Above native on both axes: clamped to native.
+            let up = clamp_to_source(VideoParams { width: 3840, height: 2160, ..params(30) }, source);
+            assert_eq!((up.width, up.height), (1920, 1080), "must never upscale");
+        }
+
+        /// Clamping proportionally, not per-axis — a per-axis `min` would
+        /// silently stretch the picture when only one axis overshoots.
+        #[test]
+        fn clamping_preserves_aspect_ratio_when_only_one_axis_overshoots() {
+            let source = SourceCaps { width: 1920, height: 1080, framerate: 60 };
+            let clamped = clamp_to_source(VideoParams { width: 3840, height: 1080, ..params(30) }, source);
+            assert_eq!((clamped.width, clamped.height), (1920, 540), "32:9 input must stay 32:9, not become 16:9");
+            assert!(clamped.width <= source.width && clamped.height <= source.height);
+        }
+
+        #[test]
+        fn clamping_leaves_framerate_to_the_tier_model_but_enforces_pipeline_bounds() {
+            let source = SourceCaps { width: 1920, height: 1080, framerate: 30 };
+            // Above the *source's* rate is legal here — it's a SourceRestart,
+            // not something to clamp away.
+            assert_eq!(clamp_to_source(params(120), source).framerate, 120);
+            // Above the *pipeline's* hard ceiling is not.
+            assert_eq!(clamp_to_source(params(10_000), source).framerate, MAX_FRAMERATE);
+            assert_eq!(clamp_to_source(params(0), source).framerate, MIN_FRAMERATE);
+        }
+
+        #[test]
+        fn an_unnegotiated_source_size_clamps_nothing() {
+            let source = SourceCaps { width: 0, height: 0, framerate: 30 };
+            let out = clamp_to_source(VideoParams { width: 3840, height: 2160, ..params(30) }, source);
+            assert_eq!((out.width, out.height), (3840, 2160));
+        }
+
+        #[test]
+        fn the_source_runs_at_the_max_fps_any_destination_needs() {
+            assert_eq!(required_source_framerate([30, 60, 15]), 60);
+            assert_eq!(required_source_framerate([30]), 30);
+            assert_eq!(required_source_framerate([]), DEFAULT_FRAMERATE);
+            assert_eq!(required_source_framerate([1_000]), MAX_FRAMERATE);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1673,16 +2715,86 @@ pub mod branch {
 
     /// A live encode branch built by [`add_branch`]: a `gst::Bin` already
     /// added to its pipeline and linked to a tee request pad, plus
-    /// everything [`remove_branch`] needs to tear it back down. `appsink` is
-    /// public — this is the caller's read side for the branch's encoded
-    /// H.264 output (pull samples off it the same way [`super::pump_loop`]
-    /// does for the pipeline's original fixed encoder branch, e.g. via
-    /// `appsink.stream()`/`try_pull_sample`).
+    /// everything [`remove_branch`] needs to tear it back down.
+    ///
+    /// # Reading this branch's encoded output
+    ///
+    /// Use [`EncodeBranch::next_sample`] (async) or, for a synchronous poll,
+    /// `appsink.try_pull_sample(..)`. **Do not call `appsink.stream()`
+    /// yourself.**
+    ///
+    /// `Why:` `gst_app::AppSink::stream()` is not a view onto the appsink —
+    /// it *installs* callbacks via `gst_app_sink_set_callbacks`, which
+    /// **replaces** whatever callback set was there before, and its `Drop`
+    /// impl (on the `v1_18`-feature-off build this crate pins) resets the
+    /// appsink's callbacks to an empty set. So two `stream()` calls on one
+    /// appsink silently break each other: the first stream's waker is
+    /// unregistered by the second, and dropping either one leaves the
+    /// survivor parked indefinitely — it only ever wakes again by luck, because
+    /// `AppSinkStream::poll_next` opportunistically `try_pull_sample`s before
+    /// parking. That is exactly the collision that would happen here, because
+    /// [`remove_branch`] must itself drain the appsink to EOS while a
+    /// production reader is already consuming it. The fix is structural
+    /// rather than a rule to remember: this field is the branch's **one and
+    /// only** `AppSinkStream`, created lazily on first use and reused by
+    /// everyone — including [`remove_branch`], which receives it by owning the
+    /// whole `EncodeBranch`. Handing the branch to `remove_branch` *is* the
+    /// reader's handoff; there is no window in which two live streams exist.
     pub struct EncodeBranch {
         pub id: BranchId,
         pub appsink: gst_app::AppSink,
         bin: gst::Bin,
         tee_pad: gst::Pad,
+        /// See the type's doc comment — created at most once per branch.
+        stream: Option<gst_app::app_sink::AppSinkStream>,
+    }
+
+    impl EncodeBranch {
+        /// This branch's single `AppSinkStream`, created on first use. See the
+        /// type's doc comment for why there must never be a second one.
+        fn sample_stream(&mut self) -> &mut gst_app::app_sink::AppSinkStream {
+            if self.stream.is_none() {
+                self.stream = Some(self.appsink.stream());
+            }
+            self.stream.as_mut().expect("just populated above")
+        }
+
+        /// Next encoded access unit from this branch, or `None` once the
+        /// branch has reached EOS. Cancel-safe in a `select!` exactly like the
+        /// underlying `AppSinkStream::next`.
+        pub async fn next_sample(&mut self) -> Option<gst::Sample> {
+            self.sample_stream().next().await
+        }
+
+        /// Awaits this branch's first **IDR** (a buffer without
+        /// `DELTA_UNIT`), bounded by `timeout`.
+        ///
+        /// `Why:` "the branch produced a sample" is not the same as "the
+        /// viewer can decode it". A destination is only `Live` once something
+        /// decodable from *this* branch is on the wire, and the whole
+        /// make-before-break flip hinges on that distinction — flipping on the
+        /// first arbitrary sample could hand the viewer a delta frame
+        /// referencing a GOP it never received. In practice both `x264enc` and
+        /// `vah264enc` emit an IDR first, so this normally returns on the very
+        /// first sample; the loop is what makes that a checked property rather
+        /// than an assumption.
+        pub async fn wait_for_first_idr(&mut self, timeout: Duration) -> Result<gst::Sample> {
+            tokio::time::timeout(timeout, async {
+                while let Some(sample) = self.next_sample().await {
+                    let is_idr = sample
+                        .buffer()
+                        .map(|b| !b.flags().contains(gst::BufferFlags::DELTA_UNIT))
+                        .unwrap_or(false);
+                    if is_idr {
+                        return Some(sample);
+                    }
+                }
+                None
+            })
+            .await
+            .map_err(|_| anyhow!("encode branch produced no IDR within {timeout:?}"))?
+            .ok_or_else(|| anyhow!("encode branch ended before producing an IDR"))
+        }
     }
 
     /// Process-wide counter for generating element/bin names that are
@@ -1829,7 +2941,91 @@ pub mod branch {
             return Err(anyhow!("failed to link tee's new request pad to the encode branch: {e:?}"));
         }
 
-        Ok(EncodeBranch { id, appsink, bin, tee_pad })
+        Ok(EncodeBranch { id, appsink, bin, tee_pad, stream: None })
+    }
+
+    /// [`add_branch`] with the same per-branch VAAPI→software fallback
+    /// [`super::start_sharing_with_source`] applies to the whole pipeline:
+    /// if a [`EncoderBackend::Vaapi`] branch fails to construct or link, retry
+    /// once on [`EncoderBackend::Software`] rather than failing the
+    /// destination.
+    ///
+    /// `Why per branch, not once per process:` the existing whole-pipeline
+    /// fallback only ever ran while there was exactly one encoder in flight.
+    /// With fan-out there are N concurrent encode sessions off one capture,
+    /// and VAAPI's concurrent-session limit is small (commonly 2–4) — so the
+    /// *third* destination can fail on a machine where the first two succeeded
+    /// and where [`detect_encoder_backend`]'s process-wide probe still
+    /// correctly reports VAAPI as available. That failure is per-branch and
+    /// transient, exactly the shape a per-branch fallback handles and a
+    /// process-wide probe cannot.
+    pub fn add_branch_with_fallback(
+        pipeline: &gst::Pipeline,
+        tee: &gst::Element,
+        id: BranchId,
+        settings: EncodeSettings,
+    ) -> Result<EncodeBranch> {
+        match add_branch(pipeline, tee, id, settings) {
+            Ok(branch) => Ok(branch),
+            Err(e) if settings.backend == EncoderBackend::Vaapi => {
+                tracing::warn!(
+                    "VAAPI encode branch {id:?} failed to build ({e:#}); falling back to software for this branch only"
+                );
+                add_branch(pipeline, tee, id, EncodeSettings { backend: EncoderBackend::Software, ..settings })
+                    .context("software fallback encode branch also failed to build")
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// How long a freshly-added branch gets to emit its first IDR before it's
+    /// declared non-functional. Generous relative to a 2s GOP: the very first
+    /// encoded frame is always an IDR, so anything approaching this means the
+    /// branch is genuinely not encoding (a VAAPI session that constructed but
+    /// can't run, a starved source), not merely slow.
+    pub const FIRST_IDR_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// [`add_branch_with_fallback`], then actually wait for the branch to
+    /// prove itself by producing its first IDR — falling back to software (and
+    /// tearing the dud branch back down) if a VAAPI branch constructs fine but
+    /// never encodes anything.
+    ///
+    /// `Why the second, runtime fallback:` construction success is a weak
+    /// signal for hardware encode. `vah264enc` can be built and even reach
+    /// `Playing` and *then* fail to produce output when the driver refuses
+    /// another concurrent session — the same reason
+    /// [`super::start_sharing_with_source`] doesn't trust
+    /// [`probe_vaapi_encoder`] alone and re-checks against the real pipeline.
+    /// This is that check, per branch.
+    pub async fn add_branch_live(
+        pipeline: &gst::Pipeline,
+        tee: &gst::Element,
+        id: BranchId,
+        settings: EncodeSettings,
+    ) -> Result<(EncodeBranch, gst::Sample)> {
+        let mut branch = add_branch_with_fallback(pipeline, tee, id, settings)?;
+        match branch.wait_for_first_idr(FIRST_IDR_TIMEOUT).await {
+            Ok(sample) => Ok((branch, sample)),
+            Err(e) if settings.backend == EncoderBackend::Vaapi => {
+                tracing::warn!("VAAPI encode branch {id:?} produced no IDR ({e:#}); retrying on software");
+                // Drain/remove the dud before building its replacement, so a
+                // failed attempt never leaves an orphan branch on the tee.
+                let _ = remove_branch(pipeline, tee, branch).await;
+                let mut fallback = add_branch(
+                    pipeline,
+                    tee,
+                    id,
+                    EncodeSettings { backend: EncoderBackend::Software, ..settings },
+                )
+                .context("software fallback encode branch failed to build")?;
+                let sample = fallback.wait_for_first_idr(FIRST_IDR_TIMEOUT).await?;
+                Ok((fallback, sample))
+            }
+            Err(e) => {
+                let _ = remove_branch(pipeline, tee, branch).await;
+                Err(e)
+            }
+        }
     }
 
     /// Safely removes `branch` from `pipeline`'s `tee`: blocks the tee's src
@@ -1869,8 +3065,18 @@ pub mod branch {
     /// (`repeated_add_remove_cycles_do_not_stall_the_pipeline`) for the
     /// guarantee this buys: dozens of add/remove cycles against a live
     /// pipeline with no stall and no leaked elements.
-    pub async fn remove_branch(pipeline: &gst::Pipeline, tee: &gst::Element, branch: EncodeBranch) -> Result<()> {
-        let EncodeBranch { id: _, appsink, bin, tee_pad } = branch;
+    pub async fn remove_branch(pipeline: &gst::Pipeline, tee: &gst::Element, mut branch: EncodeBranch) -> Result<()> {
+        // Take over the branch's *existing* reader rather than installing a
+        // second one — see [`EncodeBranch`]'s doc comment for why calling
+        // `appsink.stream()` here would silently break whatever was already
+        // reading this branch. `sample_stream()` creates one only if nobody
+        // ever read this branch at all, so the "at most one AppSinkStream per
+        // AppSink, ever" invariant holds on both paths. Taking the branch by
+        // value is what makes this safe by construction: the production reader
+        // cannot still be holding it.
+        let _ = branch.sample_stream();
+        let EncodeBranch { id: _, appsink: _, bin, tee_pad, stream } = branch;
+        let mut appsink_stream = stream.expect("sample_stream() populated it immediately above");
 
         let branch_sink_pad = bin
             .static_pad("sink")
@@ -1925,13 +3131,25 @@ pub mod branch {
         // for the regression guard; it asserts on the tee sink pad's EOS
         // flag precisely because that is the signal that flips first.
         //
-        // We don't remove the probe afterward: it keeps dropping (and
-        // re-sending EOS on) everything aimed at this pad until the pad is
-        // unlinked and released moments later, which is harmless — EOS into
-        // an already-EOS'd branch is a no-op.
+        // We don't remove the probe afterward: it keeps dropping everything
+        // aimed at this pad until the pad is unlinked and released moments
+        // later, which is exactly what we want (the branch must stay starved
+        // for the whole drain window).
+        //
+        // The `sent_eos` one-shot guard, however, *is* needed: this callback
+        // fires once per dropped buffer for the entire drain window (tens of
+        // times at 30fps), and only the first firing has any effect — EOS into
+        // an already-EOS'd branch is a no-op. Re-sending it every time was
+        // merely wasteful when nothing downstream cared; now that a
+        // `DestinationState` machine and a stall protocol hang off branch
+        // removal, keeping a per-buffer `send_event` (which runs the branch's
+        // whole event chain inline on the tee's streaming thread) out of the
+        // hot path is worth the one atomic. `Relaxed` is sufficient: the flag
+        // guards an idempotent operation, not the publication of any data.
         let probe_sink_pad = branch_sink_pad.clone();
+        let sent_eos = std::sync::atomic::AtomicBool::new(false);
         tee_pad.add_probe(gst::PadProbeType::BLOCK_DOWNSTREAM, move |_pad, _info| {
-            if !probe_sink_pad.send_event(gst::event::Eos::new()) {
+            if !sent_eos.swap(true, Ordering::Relaxed) && !probe_sink_pad.send_event(gst::event::Eos::new()) {
                 tracing::warn!("encode branch removal: EOS was not accepted by the branch's entry pad");
             }
             gst::PadProbeReturn::Drop
@@ -1947,7 +3165,6 @@ pub mod branch {
         // structure gets torn down regardless of whether this actually
         // observed EOS, matching `CaptureHandle::stop`'s established
         // "best-effort wait, then force it anyway" shape.
-        let mut appsink_stream = appsink.stream();
         let drained = tokio::time::timeout(Duration::from_secs(5), async {
             while appsink_stream.next().await.is_some() {}
         })
@@ -1997,6 +3214,138 @@ pub mod branch {
         new_settings: EncodeSettings,
     ) -> Result<EncodeBranch> {
         add_branch(pipeline, tee, id, new_settings)
+    }
+
+    // -----------------------------------------------------------------
+    // Orchestrators: the GStreamer mechanics above driven by the
+    // `DestinationState` machine in `super::destination`
+    // -----------------------------------------------------------------
+
+    /// Result of [`swap_to_new_branch`]. Not a plain `Result<EncodeBranch>`
+    /// on purpose.
+    ///
+    /// `Why:` a swap consumes the old branch by value (that ownership transfer
+    /// *is* the appsink-reader handoff — see [`EncodeBranch`]'s doc comment),
+    /// so a plain `Err` would destroy the caller's only handle to a branch
+    /// that is still linked, still `Playing`, and still the destination's sole
+    /// source of frames. Make-before-break is only make-before-break if the
+    /// failure path gives the old branch back: a settings change that can't be
+    /// applied must leave the viewer exactly as they were, never worse.
+    pub enum SwapOutcome {
+        /// The new branch is authoritative and the old one has been removed.
+        Swapped(EncodeBranch),
+        /// The swap failed; the returned branch is the **original**, untouched
+        /// and still live. The destination has been returned to
+        /// [`super::destination::DestinationState::Live`].
+        KeptOld(EncodeBranch, anyhow::Error),
+    }
+
+    /// Tier-2 ([`super::destination::ChangeTier::BranchSwap`]) end to end:
+    /// mark the destination `Rebuilding`, build the replacement branch
+    /// alongside the still-running original, wait for the **new** branch's
+    /// first IDR, only then flip authority and tear the original down.
+    ///
+    /// The viewer never sees anything: the old branch keeps producing for the
+    /// entire window, and this path can never enter
+    /// [`super::destination::DestinationState::Stalled`] — by construction,
+    /// since there is always exactly one live branch at every instant.
+    ///
+    /// `new_settings` is applied as given; callers wanting the never-upscale
+    /// policy should pass it through
+    /// [`super::destination::clamp_to_source`] first.
+    pub async fn swap_to_new_branch(
+        pipeline: &gst::Pipeline,
+        tee: &gst::Element,
+        runtime: &destination::SharedDestination,
+        old: EncodeBranch,
+        new_id: BranchId,
+        new_params: destination::VideoParams,
+    ) -> SwapOutcome {
+        runtime.lock().unwrap().begin_rebuild(Instant::now());
+
+        let built = add_branch_live(pipeline, tee, new_id, new_params.to_encode_settings()).await;
+        let (new_branch, _first_idr) = match built {
+            Ok(v) => v,
+            Err(e) => {
+                runtime.lock().unwrap().abandon_rebuild();
+                return SwapOutcome::KeptOld(old, e);
+            }
+        };
+
+        // The flip itself: from here on the new branch is authoritative. This
+        // is a plain Rust state change (which appsink the pump reads), not a
+        // GStreamer operation — which is exactly why it can be atomic and
+        // therefore invisible.
+        {
+            let mut runtime = runtime.lock().unwrap();
+            runtime.set_params(new_params);
+            runtime.finish_rebuild();
+        }
+
+        if let Err(e) = remove_branch(pipeline, tee, old).await {
+            // The swap already succeeded; a messy teardown of the *old* branch
+            // is a leak to log, not a reason to fail the destination.
+            tracing::warn!("encode branch swap completed but removing the old branch failed: {e:#}");
+        }
+
+        SwapOutcome::Swapped(new_branch)
+    }
+
+    /// Tier-3 ([`super::destination::ChangeTier::SourceRestart`]), first half:
+    /// the shared capture source is going away, so **every** destination fed
+    /// by it stalls at the same instant.
+    ///
+    /// `Why all of them, unconditionally:` they share one real screen grab, so
+    /// there is no way to keep any of them fed while it's down. The plan doc
+    /// records the user explicitly accepting this ("as long as it doesn't look
+    /// broken") — which is what the stall protocol delivers: no `StopStream`,
+    /// the cached IDR keeps being re-sent at ~2fps, and wire PTS keeps
+    /// advancing, so each viewer sees a low-framerate pause rather than a
+    /// stream that disappeared.
+    pub fn stall_all(runtimes: &[destination::SharedDestination], reason: destination::StallReason) {
+        let now = Instant::now();
+        for runtime in runtimes {
+            runtime.lock().unwrap().begin_stall(reason, now);
+        }
+    }
+
+    /// Tier-3, second half: bring one stalled destination back on a
+    /// freshly-restarted capture. Re-anchors the wire clock onto the new
+    /// pipeline's running time *before* any of its buffers can be sent (see
+    /// [`super::destination::DestinationRuntime::on_pipeline_start`]), builds
+    /// the branch, and waits for its first IDR — which is what returns the
+    /// destination to `Live`.
+    pub async fn rebuild_after_source_restart(
+        pipeline: &gst::Pipeline,
+        tee: &gst::Element,
+        runtime: &destination::SharedDestination,
+        id: BranchId,
+        params: destination::VideoParams,
+    ) -> Result<EncodeBranch> {
+        // Order matters: re-anchor first. A buffer from the new pipeline that
+        // reached `wire_pts_from_buffer` before this ran would be timestamped
+        // against the *old* offset — i.e. back near zero — and the monotonic
+        // clamp would then have to drag every subsequent frame forward at
+        // +1µs, pinning the stream's apparent clock for as long as it took to
+        // catch up.
+        let running_time_us = pipeline.current_running_time().map(|t| t.useconds()).unwrap_or(0);
+        runtime.lock().unwrap().on_pipeline_start(running_time_us, Instant::now());
+
+        let (branch, first_idr) = add_branch_live(pipeline, tee, id, params.to_encode_settings())
+            .await
+            .inspect_err(|e| runtime.lock().unwrap().fail(format!("capture restart failed: {e:#}")))?;
+
+        // The first IDR is what actually ends the stall — feed it through the
+        // same accounting a normal frame takes, so the cached IDR and the
+        // `Stalled` → `Live` transition happen exactly once, in one place.
+        // If that one sample happens to be unmappable, the destination simply
+        // stays `Stalled` until the pump sees the branch's next IDR (at most a
+        // GOP away) — degraded, never wedged.
+        if let Some(payload) = first_idr.buffer().and_then(|b| b.map_readable().ok()) {
+            runtime.lock().unwrap().note_encoded_frame(true, payload.as_slice(), Instant::now());
+        }
+
+        Ok(branch)
     }
 
     #[cfg(test)]
@@ -2373,6 +3722,442 @@ pub mod branch {
                 .expect("remove_branch(new) should not hang")
                 .expect("remove_branch(new) should succeed");
 
+            pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+        }
+
+        // -------------------------------------------------------------
+        // Orchestrators: branch mechanics driven by the DestinationState
+        // machine (see `super::super::destination`)
+        // -------------------------------------------------------------
+
+        use super::super::destination::{
+            DestinationRuntime, DestinationState, SharedDestination, StallReason, VideoParams,
+        };
+
+        fn small_params() -> VideoParams {
+            VideoParams {
+                width: 64,
+                height: 64,
+                framerate: 15,
+                bitrate_kbps: 500,
+                backend: EncoderBackend::Software,
+            }
+        }
+
+        /// Adds a branch, waits for its first IDR, and feeds that IDR through
+        /// the runtime — i.e. brings a brand-new destination from `Starting`
+        /// all the way to `Live`, the same way `pump_loop` does in production.
+        async fn start_live_destination(
+            pipeline: &gst::Pipeline,
+            tee: &gst::Element,
+            id: BranchId,
+            params: VideoParams,
+        ) -> (EncodeBranch, SharedDestination) {
+            let runtime = DestinationRuntime::shared(Instant::now(), params);
+            runtime.lock().unwrap().on_pipeline_start(0, Instant::now());
+
+            let (branch, idr) = add_branch_live(pipeline, tee, id, params.to_encode_settings())
+                .await
+                .unwrap_or_else(|e| panic!("{id:?}: add_branch_live failed: {e:#}"));
+            let payload = idr
+                .buffer()
+                .and_then(|b| b.map_readable().ok())
+                .expect("the first IDR sample should be mappable");
+            runtime.lock().unwrap().note_encoded_frame(true, payload.as_slice(), Instant::now());
+            assert_eq!(runtime.lock().unwrap().state(), DestinationState::Live);
+            (branch, runtime)
+        }
+
+        /// The tier-2 guarantee, end to end against a live pipeline: a branch
+        /// swap goes `Live` → `Rebuilding` → `Live` and **never** passes
+        /// through `Stalled` — no viewer-visible interruption at any instant.
+        ///
+        /// `Why the polling watcher rather than checking the state before and
+        /// after:` "ended up Live" is trivially true of a stall that recovered.
+        /// The whole claim being tested is about the *interval*, so the test
+        /// has to sample the interval. The watcher runs on its own worker
+        /// thread (hence `multi_thread`) so it keeps sampling even while the
+        /// swap is inside a blocking GStreamer call rather than an await point.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_branch_swap_goes_rebuilding_then_live_and_never_stalls() {
+            if gst::init().is_err() {
+                eprintln!("skipping: gstreamer not available in this environment");
+                return;
+            }
+
+            let (pipeline, tee) = build_test_pipeline();
+            pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+            let (state_result, ..) = pipeline.state(gst::ClockTime::from_seconds(5));
+            state_result.expect("pipeline should settle into PLAYING");
+
+            let (branch, runtime) = start_live_destination(&pipeline, &tee, BranchId(1), small_params()).await;
+
+            let observed: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let watcher = {
+                let (runtime, observed, stop) = (runtime.clone(), observed.clone(), stop.clone());
+                tokio::spawn(async move {
+                    while !stop.load(Ordering::Relaxed) {
+                        {
+                            let label = runtime.lock().unwrap().state().label();
+                            let mut seen = observed.lock().unwrap();
+                            if seen.last() != Some(&label) {
+                                seen.push(label);
+                            }
+                        }
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                })
+            };
+
+            // A resolution + bitrate change: tier 2, one destination only.
+            let new_params = VideoParams { width: 32, height: 32, bitrate_kbps: 900, ..small_params() };
+            let outcome =
+                swap_to_new_branch(&pipeline, &tee, &runtime, branch, BranchId(2), new_params).await;
+
+            stop.store(true, Ordering::Relaxed);
+            watcher.await.expect("watcher task should not panic");
+
+            let new_branch = match outcome {
+                SwapOutcome::Swapped(b) => b,
+                SwapOutcome::KeptOld(_, e) => panic!("swap should have succeeded: {e:#}"),
+            };
+
+            let seen = observed.lock().unwrap().clone();
+            assert!(
+                !seen.contains(&"stalled"),
+                "a branch swap must never stall the destination — observed transitions: {seen:?}"
+            );
+            assert!(
+                seen.contains(&"rebuilding"),
+                "the swap should have been observable as `Rebuilding` — observed transitions: {seen:?}"
+            );
+            assert_eq!(runtime.lock().unwrap().state(), DestinationState::Live);
+            assert_eq!(
+                runtime.lock().unwrap().params(),
+                new_params,
+                "a completed swap should record the params it actually applied"
+            );
+
+            // The new branch is real and producing, and the old one is gone
+            // (element count back to one dynamic branch's worth).
+            assert!(
+                wait_for_sample(&new_branch.appsink, Duration::from_secs(5)),
+                "the post-swap branch should be producing encoded output"
+            );
+
+            tokio::time::timeout(Duration::from_secs(10), remove_branch(&pipeline, &tee, new_branch))
+                .await
+                .expect("cleanup remove_branch should not hang")
+                .expect("cleanup remove_branch should succeed");
+            pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+        }
+
+        /// A failed swap must give the old branch back, still live, and leave
+        /// the destination `Live` — never `Stalled`, never branchless.
+        #[tokio::test]
+        async fn a_failed_swap_keeps_the_old_branch_and_never_stalls() {
+            if gst::init().is_err() {
+                eprintln!("skipping: gstreamer not available in this environment");
+                return;
+            }
+
+            let (pipeline, tee) = build_test_pipeline();
+            pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+            let (state_result, ..) = pipeline.state(gst::ClockTime::from_seconds(5));
+            state_result.expect("pipeline should settle into PLAYING");
+
+            let (branch, runtime) = start_live_destination(&pipeline, &tee, BranchId(1), small_params()).await;
+
+            // A width of 0 cannot negotiate, so the replacement branch fails
+            // to build — a stand-in for any real "these settings don't work on
+            // this machine" failure.
+            let impossible = VideoParams { width: 0, height: 0, ..small_params() };
+            let outcome = swap_to_new_branch(&pipeline, &tee, &runtime, branch, BranchId(2), impossible).await;
+
+            let old = match outcome {
+                SwapOutcome::KeptOld(old, _) => old,
+                SwapOutcome::Swapped(_) => panic!("a branch with unnegotiable caps should not have swapped in"),
+            };
+            assert_eq!(
+                runtime.lock().unwrap().state(),
+                DestinationState::Live,
+                "a failed swap must leave the destination exactly as it was, never stalled"
+            );
+            assert!(
+                wait_for_sample(&old.appsink, Duration::from_secs(5)),
+                "the original branch must still be producing after a failed swap"
+            );
+
+            tokio::time::timeout(Duration::from_secs(10), remove_branch(&pipeline, &tee, old))
+                .await
+                .expect("cleanup remove_branch should not hang")
+                .expect("cleanup remove_branch should succeed");
+            pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+        }
+
+        /// The tier-3 path, end to end: a capture-source restart stalls
+        /// **every** destination fed by that capture simultaneously, each keeps
+        /// its stream alive with its cached IDR while down, and all of them
+        /// come back to `Live` on the new pipeline — with wire PTS strictly
+        /// increasing straight through the restart, which is what makes the
+        /// outage look like low framerate rather than a glitch.
+        #[tokio::test]
+        async fn a_source_restart_stalls_every_co_located_destination_and_recovers_them_all() {
+            if gst::init().is_err() {
+                eprintln!("skipping: gstreamer not available in this environment");
+                return;
+            }
+
+            // Three destinations off one capture, at deliberately different
+            // settings — the per-destination independence the branch chain's
+            // own videoscale/videorate buys.
+            let settings = [
+                VideoParams { width: 64, height: 64, framerate: 15, ..small_params() },
+                VideoParams { width: 32, height: 32, framerate: 10, ..small_params() },
+                VideoParams { width: 48, height: 48, framerate: 5, ..small_params() },
+            ];
+
+            let (old_pipeline, old_tee) = build_test_pipeline();
+            old_pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+            let (state_result, ..) = old_pipeline.state(gst::ClockTime::from_seconds(5));
+            state_result.expect("pipeline should settle into PLAYING");
+
+            let mut branches = Vec::new();
+            let mut runtimes: Vec<SharedDestination> = Vec::new();
+            for (i, params) in settings.iter().enumerate() {
+                let (branch, runtime) =
+                    start_live_destination(&old_pipeline, &old_tee, BranchId(i as u32), *params).await;
+                branches.push(branch);
+                runtimes.push(runtime);
+            }
+
+            // Send a run of real frames through each destination's wire clock,
+            // recording every PTS that would have gone out.
+            let mut sent: Vec<Vec<u64>> = vec![Vec::new(); runtimes.len()];
+            for (i, branch) in branches.iter_mut().enumerate() {
+                for _ in 0..5 {
+                    let Some(sample) = branch.appsink.try_pull_sample(gst::ClockTime::from_mseconds(500)) else {
+                        break;
+                    };
+                    let pts = sample.buffer().and_then(|b| b.pts()).map(|t| t.useconds()).unwrap_or(0);
+                    sent[i].push(runtimes[i].lock().unwrap().wire_pts_from_buffer(pts));
+                }
+            }
+
+            // --- the source goes down ---
+            stall_all(&runtimes, StallReason::SourceChanged);
+            for (i, runtime) in runtimes.iter().enumerate() {
+                assert!(
+                    runtime.lock().unwrap().state().is_stalled(),
+                    "destination {i} sharing the restarted capture must stall too"
+                );
+            }
+
+            // While stalled, each destination still has something decodable to
+            // re-send — this is what keeps the viewer from seeing a disconnect.
+            let stall_start = Instant::now();
+            for (i, runtime) in runtimes.iter().enumerate() {
+                let mut runtime = runtime.lock().unwrap();
+                for tick in 0..4u32 {
+                    let now = stall_start + super::super::destination::STALL_RESEND_INTERVAL * tick;
+                    let idr = runtime
+                        .stall_resend_due(now)
+                        .unwrap_or_else(|| panic!("destination {i} had no cached IDR to re-send at tick {tick}"));
+                    assert!(!idr.is_empty(), "the cached IDR must be real encoded bytes");
+                    sent[i].push(runtime.wire_pts_from_epoch(now));
+                }
+            }
+
+            for branch in branches.drain(..) {
+                tokio::time::timeout(Duration::from_secs(10), remove_branch(&old_pipeline, &old_tee, branch))
+                    .await
+                    .expect("tearing down the old capture's branches should not hang")
+                    .expect("tearing down the old capture's branches should succeed");
+            }
+            old_pipeline.set_state(gst::State::Null).expect("old pipeline should stop cleanly");
+
+            // --- the source comes back as a brand-new pipeline, whose running
+            // time restarts at zero ---
+            let (new_pipeline, new_tee) = build_test_pipeline();
+            new_pipeline.set_state(gst::State::Playing).expect("new pipeline should reach PLAYING");
+            let (state_result, ..) = new_pipeline.state(gst::ClockTime::from_seconds(5));
+            state_result.expect("new pipeline should settle into PLAYING");
+
+            for (i, params) in settings.iter().enumerate() {
+                let branch = rebuild_after_source_restart(
+                    &new_pipeline,
+                    &new_tee,
+                    &runtimes[i],
+                    BranchId(100 + i as u32),
+                    *params,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("destination {i} failed to rebuild after the restart: {e:#}"));
+                branches.push(branch);
+            }
+
+            for (i, runtime) in runtimes.iter().enumerate() {
+                assert_eq!(
+                    runtime.lock().unwrap().state(),
+                    DestinationState::Live,
+                    "destination {i} should be back to Live once its rebuilt branch produced an IDR"
+                );
+            }
+
+            for (i, branch) in branches.iter_mut().enumerate() {
+                for _ in 0..5 {
+                    let Some(sample) = branch.appsink.try_pull_sample(gst::ClockTime::from_mseconds(500)) else {
+                        break;
+                    };
+                    let pts = sample.buffer().and_then(|b| b.pts()).map(|t| t.useconds()).unwrap_or(0);
+                    sent[i].push(runtimes[i].lock().unwrap().wire_pts_from_buffer(pts));
+                }
+            }
+
+            for (i, ptss) in sent.iter().enumerate() {
+                assert!(
+                    ptss.len() > 8,
+                    "destination {i} should have sent frames on both sides of the restart, got {}",
+                    ptss.len()
+                );
+                for pair in ptss.windows(2) {
+                    assert!(
+                        pair[1] > pair[0],
+                        "destination {i}'s wire PTS went backwards across the capture restart: {} -> {} \
+                         (full sequence: {ptss:?})",
+                        pair[0],
+                        pair[1]
+                    );
+                }
+            }
+
+            for branch in branches.drain(..) {
+                tokio::time::timeout(Duration::from_secs(10), remove_branch(&new_pipeline, &new_tee, branch))
+                    .await
+                    .expect("cleanup should not hang")
+                    .expect("cleanup should succeed");
+            }
+            new_pipeline.set_state(gst::State::Null).expect("new pipeline should stop cleanly");
+        }
+
+        /// Regression guard for the `appsink.stream()` handoff hazard (see
+        /// [`EncodeBranch`]'s doc comment): a branch that a *production reader*
+        /// has already been consuming via [`EncodeBranch::next_sample`] must
+        /// still remove promptly.
+        ///
+        /// `Why the timing assertion is the real check:` `remove_branch`
+        /// installing its own second `AppSinkStream` would not fail loudly — it
+        /// would clobber the reader's callbacks, and whichever of the two
+        /// streams got dropped first would reset the appsink's callbacks to an
+        /// empty set, leaving the survivor's waker unregistered. The drain
+        /// would then only complete by luck (`poll_next` opportunistically
+        /// `try_pull_sample`s before parking), and in the unlucky case it burns
+        /// the full internal 5s drain timeout and logs "did not drain to EOS"
+        /// while still returning `Ok`. Asserting that removal finishes well
+        /// under that timeout is what distinguishes "drained properly" from
+        /// "timed out and forced it anyway".
+        #[tokio::test]
+        async fn a_branch_already_being_read_removes_promptly_without_a_second_appsink_stream() {
+            if gst::init().is_err() {
+                eprintln!("skipping: gstreamer not available in this environment");
+                return;
+            }
+
+            let (pipeline, tee) = build_test_pipeline();
+            pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+            let (state_result, ..) = pipeline.state(gst::ClockTime::from_seconds(5));
+            state_result.expect("pipeline should settle into PLAYING");
+
+            let mut reader_branch =
+                add_branch(&pipeline, &tee, BranchId(1), small_settings()).expect("add_branch should succeed");
+            let sibling =
+                add_branch(&pipeline, &tee, BranchId(2), small_settings()).expect("add_branch should succeed");
+
+            // Consume through the branch's own reader — this is what installs
+            // its single `AppSinkStream`.
+            for _ in 0..3 {
+                let sample = tokio::time::timeout(Duration::from_secs(5), reader_branch.next_sample())
+                    .await
+                    .expect("reading the branch should not hang")
+                    .expect("the branch should produce samples");
+                assert!(sample.buffer().is_some());
+            }
+
+            let started = Instant::now();
+            tokio::time::timeout(Duration::from_secs(10), remove_branch(&pipeline, &tee, reader_branch))
+                .await
+                .expect("remove_branch should not hang")
+                .expect("remove_branch should succeed");
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < Duration::from_secs(3),
+                "removing an already-read branch took {elapsed:?} — that is the internal drain timeout expiring, \
+                 i.e. the appsink's callbacks were clobbered by a second AppSinkStream"
+            );
+
+            assert!(
+                wait_for_sample(&sibling.appsink, Duration::from_secs(5)),
+                "the sibling branch must be unaffected by removing a branch that was being read"
+            );
+
+            tokio::time::timeout(Duration::from_secs(10), remove_branch(&pipeline, &tee, sibling))
+                .await
+                .expect("cleanup should not hang")
+                .expect("cleanup should succeed");
+            pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+        }
+
+        /// Per-destination independence: two branches off the *same* tee,
+        /// asked for different sizes and framerates, must each honour their own
+        /// — that is the whole point of the per-branch
+        /// videoscale/videorate/capsfilter chain.
+        #[tokio::test]
+        async fn two_branches_on_one_capture_honour_their_own_resolutions() {
+            if gst::init().is_err() {
+                eprintln!("skipping: gstreamer not available in this environment");
+                return;
+            }
+
+            let (pipeline, tee) = build_test_pipeline();
+            pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+            let (state_result, ..) = pipeline.state(gst::ClockTime::from_seconds(5));
+            state_result.expect("pipeline should settle into PLAYING");
+
+            // The source is 64x64 (see `build_test_pipeline`); both requests
+            // are downscales, per the never-upscale policy.
+            let big = EncodeSettings { width: 64, height: 64, framerate: 15, ..small_settings() };
+            let small = EncodeSettings { width: 32, height: 32, framerate: 5, ..small_settings() };
+
+            let branch_big = add_branch(&pipeline, &tee, BranchId(1), big).expect("add_branch(big) should succeed");
+            let branch_small =
+                add_branch(&pipeline, &tee, BranchId(2), small).expect("add_branch(small) should succeed");
+
+            assert!(wait_for_sample(&branch_big.appsink, Duration::from_secs(5)), "big branch produced nothing");
+            assert!(wait_for_sample(&branch_small.appsink, Duration::from_secs(5)), "small branch produced nothing");
+
+            let negotiated = |appsink: &gst_app::AppSink| -> (i32, i32) {
+                let caps = appsink
+                    .static_pad("sink")
+                    .and_then(|p| p.current_caps())
+                    .expect("branch appsink should have negotiated caps");
+                let s = caps.structure(0).expect("caps should have a structure");
+                (s.get("width").expect("width"), s.get("height").expect("height"))
+            };
+
+            assert_eq!(negotiated(&branch_big.appsink), (64, 64));
+            assert_eq!(
+                negotiated(&branch_small.appsink),
+                (32, 32),
+                "each branch must encode at its own resolution off the one shared capture"
+            );
+
+            for branch in [branch_big, branch_small] {
+                tokio::time::timeout(Duration::from_secs(10), remove_branch(&pipeline, &tee, branch))
+                    .await
+                    .expect("cleanup should not hang")
+                    .expect("cleanup should succeed");
+            }
             pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
         }
     }

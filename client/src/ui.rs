@@ -43,10 +43,15 @@
 //! sending here?" in its own order.
 //!
 //! **This stage ships exactly one destination per capture** — the fan-out
-//! machinery (dynamic GStreamer tee branches) is later work; the ids and
-//! ownership are already in their final shape so nothing has to be re-keyed
-//! when it lands. The visible UI is likewise still single-room: `active_room`
-//! names the one `RoomSession` the join/roster/share/watch screens drive.
+//! machinery (`capture::branch`'s dynamic GStreamer tee branches) and the
+//! per-destination lifecycle machinery (`capture::destination`) are both built
+//! and tested, but `capture::start_sharing` still builds one *fixed* encoder
+//! branch rather than one branch per destination; the ids and ownership are
+//! already in their final shape so nothing has to be re-keyed when it lands.
+//! Each `Destination` does already carry its own `VideoParams` and a live
+//! `DestinationState` (see `Destination::state`). The visible UI is likewise
+//! still single-room: `active_room` names the one `RoomSession` the
+//! join/roster/share/watch screens drive.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -150,10 +155,7 @@ enum ShareStatus {
 /// `App::captures` → `LocalCapture::destinations`, so both the owning
 /// `CaptureSourceId` and this destination's own `DestinationId` are already
 /// in hand at every use site. Storing them here would be a second copy to
-/// keep in sync, with nothing to gain. Later stages grow this struct with the
-/// genuinely per-destination things (resolution/fps/bitrate, `DestinationState`,
-/// the wire-PTS epoch) — that's what makes it a struct today rather than a
-/// bare `(RoomHandle, StreamId)` tuple.
+/// keep in sync, with nothing to gain.
 struct Destination {
     room: RoomHandle,
     /// This destination's `stream_id` on `room`'s connection — allocated from
@@ -161,6 +163,36 @@ struct Destination {
     /// out to two rooms can (and generally will) carry a different
     /// `stream_id` in each.
     stream_id: StreamId,
+    /// This destination's own encode settings. Genuinely per-destination: two
+    /// rooms fed by the same capture can run different resolutions, framerates
+    /// and bitrates, each served by its own tee branch's
+    /// `videoscale`/`videorate`/encoder chain (`capture::branch::add_branch`).
+    /// Set at creation from the app-level defaults; a later UI stage exposes
+    /// per-destination editing on top of `capture::destination::classify_change`.
+    params: capture::destination::VideoParams,
+    /// Shared handle onto this destination's live lifecycle state — the
+    /// `DestinationState` machine, its monotonic wire-PTS clock, and the stall
+    /// protocol's cached IDR. See `capture::destination::DestinationRuntime`.
+    ///
+    /// `None` only while the capture is still `ShareStatus::Starting` (the
+    /// runtime is created inside `capture::start_sharing`, so it doesn't exist
+    /// until the handle comes back) and for audio destinations, which have no
+    /// video lifecycle. `poll_capture_states` attaches it the moment the
+    /// handle lands; `Destination::state` reports `Starting` until then, which
+    /// is exactly what a not-yet-started destination is.
+    runtime: Option<capture::destination::SharedDestination>,
+}
+
+impl Destination {
+    /// This destination's current lifecycle state — `Starting` before the
+    /// capture handle exists (see `runtime`), otherwise whatever the pump task
+    /// has most recently recorded.
+    fn state(&self) -> capture::destination::DestinationState {
+        match &self.runtime {
+            Some(runtime) => runtime.lock().unwrap().state(),
+            None => capture::destination::DestinationState::Starting,
+        }
+    }
 }
 
 /// One local capture pipeline (video or audio) and every room it feeds.
@@ -698,7 +730,26 @@ impl App {
                 kind: StreamKind::Video,
                 label: t!("share.video_label").to_string(),
                 status: ShareStatus::Starting(rx),
-                destinations: IndexMap::from([(destination_id, Destination { room: room_handle, stream_id })]),
+                destinations: IndexMap::from([(
+                    destination_id,
+                    Destination {
+                        room: room_handle,
+                        stream_id,
+                        // Width/height 0 = "whatever the source is": this
+                        // destination doesn't downscale, so there is nothing to
+                        // clamp against yet (the capture hasn't negotiated a
+                        // size). `capture::destination::clamp_to_source` treats
+                        // 0 as "no constraint" for exactly this case.
+                        params: capture::destination::VideoParams {
+                            width: 0,
+                            height: 0,
+                            framerate,
+                            bitrate_kbps,
+                            backend: capture::EncoderBackend::default(),
+                        },
+                        runtime: None,
+                    },
+                )]),
                 self_preview_texture: None,
             },
         );
@@ -736,7 +787,27 @@ impl App {
                 kind: StreamKind::Audio,
                 label: source.name.clone(),
                 status: ShareStatus::Starting(rx),
-                destinations: IndexMap::from([(destination_id, Destination { room: room_handle, stream_id })]),
+                destinations: IndexMap::from([(
+                    destination_id,
+                    Destination {
+                        room: room_handle,
+                        stream_id,
+                        // Audio destinations carry the video params struct
+                        // inertly — there is no per-destination audio geometry
+                        // to describe, and `runtime` stays `None` because the
+                        // video `DestinationState`/stall machinery has no audio
+                        // counterpart (audio's own always-on-mixer design makes
+                        // toggling invisible by construction; see the plan doc).
+                        params: capture::destination::VideoParams {
+                            width: 0,
+                            height: 0,
+                            framerate: 0,
+                            bitrate_kbps: 0,
+                            backend: capture::EncoderBackend::default(),
+                        },
+                        runtime: None,
+                    },
+                )]),
                 self_preview_texture: None,
             },
         );
@@ -829,7 +900,20 @@ impl App {
         for (capture_id, capture) in self.captures.iter_mut() {
             match &mut capture.status {
                 ShareStatus::Starting(rx) => match rx.try_recv() {
-                    Ok(Ok(handle)) => capture.status = ShareStatus::Active(handle),
+                    Ok(Ok(handle)) => {
+                        // Attach the destination lifecycle runtime the capture
+                        // just created, so `Destination::state` starts
+                        // reporting the real state machine (`Starting` until
+                        // the pump sends the first IDR, then `Live`) instead of
+                        // its not-yet-started placeholder.
+                        if let ShareHandle::Video(video) = &handle {
+                            let runtime = video.destination();
+                            for dest in capture.destinations.values_mut() {
+                                dest.runtime = Some(runtime.clone());
+                            }
+                        }
+                        capture.status = ShareStatus::Active(handle);
+                    }
                     Ok(Err(e)) => {
                         self.share_error = Some(e);
                         to_remove.push(*capture_id);
@@ -2258,6 +2342,24 @@ mod session_model_tests {
         }
     }
 
+    /// A `Destination` with default params and no attached runtime — the
+    /// shape a destination has between "the user clicked Share" and "the
+    /// capture handle came back" (see `Destination::runtime`).
+    fn destination(room: RoomHandle, stream_id: StreamId) -> Destination {
+        Destination {
+            room,
+            stream_id,
+            params: capture::destination::VideoParams {
+                width: 0,
+                height: 0,
+                framerate: DEFAULT_FRAMERATE,
+                bitrate_kbps: DEFAULT_BITRATE_KBPS,
+                backend: capture::EncoderBackend::default(),
+            },
+            runtime: None,
+        }
+    }
+
     /// Two rooms, each fed by its own capture, both using `stream_id` 0 —
     /// exactly the collision the old single-map keying could not represent.
     fn two_rooms_same_stream_id() -> (IndexMap<CaptureSourceId, LocalCapture>, RoomHandle, RoomHandle) {
@@ -2265,13 +2367,43 @@ mod session_model_tests {
         let mut captures = IndexMap::new();
         captures.insert(
             CaptureSourceId(10),
-            capture_with(IndexMap::from([(DestinationId(100), Destination { room: room_a, stream_id: 0 })])),
+            capture_with(IndexMap::from([(DestinationId(100), destination(room_a, 0))])),
         );
         captures.insert(
             CaptureSourceId(11),
-            capture_with(IndexMap::from([(DestinationId(101), Destination { room: room_b, stream_id: 0 })])),
+            capture_with(IndexMap::from([(DestinationId(101), destination(room_b, 0))])),
         );
         (captures, room_a, room_b)
+    }
+
+    /// A destination with no runtime attached yet reports `Starting` — the
+    /// state a not-yet-started destination is genuinely in, rather than
+    /// needing a separate "unknown" variant.
+    #[test]
+    fn destination_without_a_runtime_reports_starting() {
+        let dest = destination(RoomHandle(0), 0);
+        assert_eq!(dest.state(), capture::destination::DestinationState::Starting);
+    }
+
+    /// Once the capture handle lands, `poll_capture_states` attaches its
+    /// runtime and the destination starts reporting the real state machine.
+    #[test]
+    fn attaching_a_runtime_makes_the_destination_report_the_real_state() {
+        let mut dest = destination(RoomHandle(0), 0);
+        let runtime = capture::destination::DestinationRuntime::shared(
+            std::time::Instant::now(),
+            dest.params,
+        );
+        dest.runtime = Some(runtime.clone());
+        assert_eq!(dest.state(), capture::destination::DestinationState::Starting);
+
+        // The pump sends the first IDR: Starting -> Live, visible through the
+        // shared handle without the UI polling the capture at all.
+        runtime
+            .lock()
+            .unwrap()
+            .note_encoded_frame(true, b"idr", std::time::Instant::now());
+        assert_eq!(dest.state(), capture::destination::DestinationState::Live);
     }
 
     #[test]

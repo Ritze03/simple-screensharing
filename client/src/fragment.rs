@@ -26,6 +26,34 @@ pub fn fragment_frame(
     ciphertext: &[u8],
     max_datagram_size: usize,
 ) -> anyhow::Result<Vec<Vec<u8>>> {
+    let flags = if keyframe {
+        crate::protocol::MEDIA_FLAG_KEYFRAME
+    } else {
+        0
+    };
+    fragment_frame_with_flags(conn_id, stream_id, frame_id, flags, ciphertext, max_datagram_size)
+}
+
+/// [`fragment_frame`] with the header's whole `flags` byte supplied directly,
+/// for senders that need to set more than just [`crate::protocol::MEDIA_FLAG_KEYFRAME`]
+/// — currently only `capture.rs`'s stall protocol, which also raises
+/// [`crate::protocol::MEDIA_FLAG_STALLED`] (advisory only; see that constant's
+/// doc comment for why it must never drive anything security-relevant).
+///
+/// `Why:` (a second entry point rather than widening [`fragment_frame`]'s
+/// `keyframe: bool`) every other sender — `audio.rs`, and this module's own
+/// tests — only ever has a keyframe bit to express, and reads far better
+/// saying so than passing a bitmask. Keeping the bool-shaped call the default
+/// also means a caller cannot accidentally pass a raw `1`/`0` where a flags
+/// byte was meant.
+pub fn fragment_frame_with_flags(
+    conn_id: ConnId,
+    stream_id: StreamId,
+    frame_id: u32,
+    flags: u8,
+    ciphertext: &[u8],
+    max_datagram_size: usize,
+) -> anyhow::Result<Vec<Vec<u8>>> {
     let fragment_payload_max = max_datagram_size.saturating_sub(MEDIA_HEADER_LEN);
     if fragment_payload_max == 0 {
         anyhow::bail!("max_datagram_size too small to fit even the media header");
@@ -35,12 +63,6 @@ pub fn fragment_frame(
     let fragment_count = ciphertext.len().div_ceil(fragment_payload_max).max(1);
     let fragment_count_u16 = u16::try_from(fragment_count)
         .map_err(|_| anyhow::anyhow!("frame too large: {fragment_count} fragments exceeds u16"))?;
-
-    let flags = if keyframe {
-        crate::protocol::MEDIA_FLAG_KEYFRAME
-    } else {
-        0
-    };
 
     let mut datagrams = Vec::with_capacity(fragment_count);
     for (index, chunk) in ciphertext.chunks(fragment_payload_max.max(1)).enumerate() {
@@ -233,6 +255,34 @@ mod tests {
         }
 
         assert_eq!(result.expect("frame should be complete"), ciphertext);
+    }
+
+    /// The stall protocol's advisory bit must survive fragmentation and land
+    /// on **every** fragment's header, alongside the keyframe bit — a viewer
+    /// that reassembles from any fragment must see the same flags. See
+    /// `protocol::MEDIA_FLAG_STALLED` for why this bit is cosmetic-only.
+    #[test]
+    fn the_stalled_flag_rides_every_fragment_alongside_the_keyframe_flag() {
+        use crate::protocol::{MEDIA_FLAG_KEYFRAME, MEDIA_FLAG_STALLED};
+
+        let ciphertext: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
+        let datagrams =
+            fragment_frame_with_flags(3, 1, 8, MEDIA_FLAG_KEYFRAME | MEDIA_FLAG_STALLED, &ciphertext, 1200).unwrap();
+        assert!(datagrams.len() > 1, "expected multiple fragments");
+
+        for datagram in &datagrams {
+            let (header, _) = MediaHeader::unpack(datagram).unwrap();
+            assert!(header.is_keyframe(), "a stalled re-send is always an IDR");
+            assert!(header.is_stalled());
+        }
+
+        // And the ordinary path must not set it.
+        let plain = fragment_frame(3, 1, 9, true, &ciphertext, 1200).unwrap();
+        for datagram in &plain {
+            let (header, _) = MediaHeader::unpack(datagram).unwrap();
+            assert!(header.is_keyframe());
+            assert!(!header.is_stalled(), "a normal frame must never claim to be a stalled re-send");
+        }
     }
 
     #[test]

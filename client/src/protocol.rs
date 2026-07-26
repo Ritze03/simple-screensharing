@@ -166,6 +166,32 @@ pub const MEDIA_HEADER_LEN: usize = 19;
 /// bit0 of the `flags` byte: this frame is an H.264 keyframe (IDR).
 pub const MEDIA_FLAG_KEYFRAME: u8 = 0b0000_0001;
 
+/// bit1 of the `flags` byte: **advisory only** — the sender's capture source
+/// is currently down (being switched/restarted) and this frame is a re-send of
+/// the last cached IDR rather than freshly captured content. Set by
+/// `capture.rs`'s stall protocol while a `DestinationState::Stalled`
+/// destination keeps its stream alive at ~2fps; consumed by `decode.rs`
+/// (`StreamDecoder::is_stalled`) purely so a later UI stage can draw a
+/// "waiting for capture…" placeholder over the frozen frame.
+///
+/// `Why:` **this bit is unauthenticated and must stay cosmetic.** The AEAD's
+/// AAD in `net.rs`'s `aead_encrypt`/`aead_decrypt` is exactly
+/// `[PROTOCOL_VERSION, stream_id]` — the `flags` byte of [`MediaHeader`] is
+/// *not* covered by it (and cannot be: the relay reads and forwards the header
+/// without holding the room key, so the header is cleartext by design, spec
+/// §6.2). Anyone on the path can therefore flip this bit on any datagram
+/// without breaking decryption. That is fine for a UI hint — the worst outcome
+/// is a spurious or missing spinner — but it means this bit must **never**
+/// drive teardown, subscribe/unsubscribe, key rotation, resource release, or
+/// any other decision with a security or protocol consequence. Note the
+/// deliberate asymmetry with the stall protocol itself: a stalled destination
+/// keeps sending real, authenticated frames and never sends `StopStream`, so
+/// the viewer's actual media state is driven entirely by authenticated data
+/// even if this bit is forged. [`MEDIA_FLAG_KEYFRAME`] sits in the same
+/// unauthenticated byte and has the same standing (a forged keyframe bit only
+/// costs a failed decode).
+pub const MEDIA_FLAG_STALLED: u8 = 0b0000_0010;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MediaHeader {
     pub version: u8,
@@ -181,6 +207,12 @@ pub struct MediaHeader {
 impl MediaHeader {
     pub fn is_keyframe(&self) -> bool {
         self.flags & MEDIA_FLAG_KEYFRAME != 0
+    }
+
+    /// See [`MEDIA_FLAG_STALLED`] — advisory/cosmetic only, never
+    /// security-relevant.
+    pub fn is_stalled(&self) -> bool {
+        self.flags & MEDIA_FLAG_STALLED != 0
     }
 
     pub fn pack(&self) -> [u8; MEDIA_HEADER_LEN] {

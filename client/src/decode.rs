@@ -675,7 +675,31 @@ pub struct StreamDecoder {
     thread: Option<thread::JoinHandle<()>>,
     /// Live viewer-side FPS tracker — see [`FpsCounter`]/[`Self::current_fps`].
     fps_counter: FpsCounter,
+    /// When this decoder was created — the reference point for
+    /// [`Self::is_stalled`] before any frame has ever arrived.
+    created_at: Instant,
+    /// When the last media frame for this stream arrived (any frame, including
+    /// ones dropped by the pre-keyframe gate in [`Self::feed`] — this measures
+    /// "is the sender still talking to us", not "is decode succeeding").
+    last_frame_at: Option<Instant>,
+    /// Whether the most recent frame carried the sender's advisory
+    /// [`crate::protocol::MEDIA_FLAG_STALLED`] bit.
+    last_frame_stalled: bool,
 }
+
+/// How long without any frame at all before [`StreamDecoder::is_stalled`]
+/// reports a stall on its own, with no signal from the sender.
+///
+/// `Why a silence backstop in addition to the flag:` the flag only arrives
+/// from a sender that is healthy enough to keep sending — it covers the
+/// *graceful* case (capture restarting, stall protocol running). A sender that
+/// crashed, was killed, or lost its network sends nothing at all, and the
+/// viewer would otherwise sit on a frozen frame with no indication anything
+/// was wrong. 3s is comfortably above both the spec's 2s GOP and the stall
+/// protocol's own ~2fps keepalive (`capture::destination::STALL_RESEND_INTERVAL`,
+/// 500ms), so a stalled-but-alive sender is always caught by the flag path
+/// first and never trips this one; only genuine silence does.
+const NO_FRAME_STALL_TIMEOUT: Duration = Duration::from_secs(3);
 
 impl StreamDecoder {
     /// Build and start a decode pipeline dedicated to `stream_id`. Calls
@@ -713,6 +737,9 @@ impl StreamDecoder {
             seen_keyframe: false,
             thread: Some(thread),
             fps_counter: FpsCounter::new(),
+            created_at: Instant::now(),
+            last_frame_at: None,
+            last_frame_stalled: false,
         })
     }
 
@@ -740,6 +767,13 @@ impl StreamDecoder {
         if frame.stream_id != self.stream_id {
             return;
         }
+        // Stall bookkeeping happens *before* the pre-keyframe gate below: a
+        // frame arriving at all is evidence the sender is alive, even if this
+        // decoder can't use it yet. Gating this behind `seen_keyframe` would
+        // make a freshly-subscribed stream report "stalled" for up to a full
+        // GOP purely because it hasn't hit its first keyframe.
+        self.last_frame_at = Some(Instant::now());
+        self.last_frame_stalled = frame.stalled;
         if !self.seen_keyframe {
             if !frame.keyframe {
                 return;
@@ -799,6 +833,40 @@ impl StreamDecoder {
     /// Intended for `ui.rs` to show next to the watched video panel.
     pub fn current_fps(&mut self) -> f64 {
         self.fps_counter.fps()
+    }
+
+    /// Whether this stream should be shown with a "waiting for capture…"
+    /// placeholder: the sender told us it's stalled (its advisory
+    /// [`crate::protocol::MEDIA_FLAG_STALLED`] bit — see
+    /// `capture::send_stall_keepalive`), **or** nothing has arrived for
+    /// [`NO_FRAME_STALL_TIMEOUT`] at all.
+    ///
+    /// Both halves are needed and neither subsumes the other: the flag catches
+    /// a graceful capture restart promptly (the sender is still streaming, just
+    /// re-sending its last IDR, so the silence check would never fire), while
+    /// the silence check catches a sender that died without being able to
+    /// signal anything.
+    ///
+    /// `Why this is only a UI hint:` the flag half of this rides the media
+    /// header's cleartext, unauthenticated `flags` byte (see
+    /// `net::DecryptedMediaFrame::stalled`). Callers may use this to decide
+    /// what to *draw*; nothing may use it to unsubscribe, tear down, or make
+    /// any other decision with a security or protocol consequence. The
+    /// silence half is trustworthy on its own — it's derived purely from local
+    /// observation — but the two are combined here, so treat the result as
+    /// advisory throughout.
+    pub fn is_stalled(&self) -> bool {
+        self.is_stalled_at(Instant::now())
+    }
+
+    /// [`Self::is_stalled`] against an injected `now`, so the timing half can
+    /// be tested without sleeping (same pattern as `PacingState::decide`).
+    pub fn is_stalled_at(&self, now: Instant) -> bool {
+        if self.last_frame_stalled {
+            return true;
+        }
+        let reference = self.last_frame_at.unwrap_or(self.created_at);
+        now.saturating_duration_since(reference) > NO_FRAME_STALL_TIMEOUT
     }
 }
 
@@ -2424,6 +2492,138 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------
+    // Viewer-side stall signal (`StreamDecoder::is_stalled`)
+    // -----------------------------------------------------------------
+    //
+    // These use the injected-`now` `is_stalled_at` rather than sleeping, the
+    // same discipline as the `pacing_*` tests above.
+
+    fn stall_test_frame(stalled: bool) -> DecryptedMediaFrame {
+        DecryptedMediaFrame {
+            conn_id: 1,
+            stream_id: 0,
+            pts: 0,
+            keyframe: true,
+            stalled,
+            // Not decodable, and deliberately so: `is_stalled` is about frame
+            // *arrival*, not decode success, and must not depend on the
+            // pipeline managing to make a picture out of anything.
+            payload: vec![0, 0, 0, 1, 0x65],
+        }
+    }
+
+    /// A decoder that has just been created hasn't missed anything yet — but
+    /// a subscription that never receives a single frame does eventually count
+    /// as stalled, measured from creation.
+    #[test]
+    fn a_fresh_decoder_is_not_immediately_reported_as_stalled() {
+        gstreamer::init().expect("gstreamer init");
+        let created = Instant::now();
+        let decoder = StreamDecoder::new(0).expect("failed to build StreamDecoder");
+        assert!(!decoder.is_stalled_at(created + Duration::from_millis(500)));
+        assert!(
+            decoder.is_stalled_at(created + NO_FRAME_STALL_TIMEOUT + Duration::from_secs(1)),
+            "a stream that never delivered anything at all should eventually report stalled too"
+        );
+    }
+
+    /// The graceful path: the sender is still streaming, but says its capture
+    /// is down. Reported immediately, without waiting out the silence timeout.
+    #[test]
+    fn the_senders_advisory_stalled_flag_is_reported_immediately() {
+        gstreamer::init().expect("gstreamer init");
+        let mut decoder = StreamDecoder::new(0).expect("failed to build StreamDecoder");
+
+        decoder.feed(&stall_test_frame(false));
+        assert!(!decoder.is_stalled_at(Instant::now()));
+
+        decoder.feed(&stall_test_frame(true));
+        assert!(
+            decoder.is_stalled_at(Instant::now()),
+            "a frame carrying MEDIA_FLAG_STALLED must flip the signal on the spot — the sender is still \
+             sending, so the silence backstop would never fire on its own"
+        );
+
+        // ...and clears again the moment real content resumes.
+        decoder.feed(&stall_test_frame(false));
+        assert!(!decoder.is_stalled_at(Instant::now()));
+    }
+
+    /// The ungraceful path: a sender that died without being able to signal
+    /// anything. Nothing arrives at all, so only the local silence timer can
+    /// catch it.
+    #[test]
+    fn silence_longer_than_the_timeout_is_reported_as_stalled() {
+        gstreamer::init().expect("gstreamer init");
+        let mut decoder = StreamDecoder::new(0).expect("failed to build StreamDecoder");
+
+        let arrival = Instant::now();
+        decoder.feed(&stall_test_frame(false));
+
+        assert!(!decoder.is_stalled_at(arrival + Duration::from_millis(500)));
+        assert!(
+            !decoder.is_stalled_at(arrival + NO_FRAME_STALL_TIMEOUT),
+            "exactly at the timeout is not yet a stall"
+        );
+        assert!(
+            decoder.is_stalled_at(arrival + NO_FRAME_STALL_TIMEOUT + Duration::from_millis(1)),
+            "no frame at all for longer than the timeout must report stalled even with no flag from the sender"
+        );
+    }
+
+    /// The two halves of the signal must not race: a stalled-but-alive sender
+    /// keeps re-sending at `STALL_RESEND_INTERVAL`, so the silence backstop can
+    /// only ever fire for a sender that has genuinely gone quiet — never merely
+    /// because the keepalive is slow.
+    #[test]
+    fn the_stall_keepalive_cadence_stays_well_inside_the_silence_backstop() {
+        gstreamer::init().expect("gstreamer init");
+
+        // The constants themselves have to hold this relationship; if someone
+        // raises the keepalive interval past the silence timeout, every stalled
+        // stream would start double-reporting for reasons that look like a bug
+        // in the sender.
+        assert!(
+            crate::capture::destination::STALL_RESEND_INTERVAL * 2 < NO_FRAME_STALL_TIMEOUT,
+            "the stall keepalive must fire several times over inside the silence timeout"
+        );
+
+        let mut decoder = StreamDecoder::new(0).expect("failed to build StreamDecoder");
+        // Frames arriving at the keepalive cadence — but *without* the flag,
+        // isolating the silence half — must never trip the backstop. Each
+        // iteration asks "if the next keepalive were due right now, would the
+        // backstop already have fired?", which is the question that matters.
+        for _ in 0..10 {
+            decoder.feed(&stall_test_frame(false));
+            assert!(
+                !decoder.is_stalled_at(Instant::now() + crate::capture::destination::STALL_RESEND_INTERVAL),
+                "the silence backstop fired within one keepalive interval of a delivered frame"
+            );
+        }
+    }
+
+    /// A stream that hasn't hit its first keyframe yet is *not* stalled — the
+    /// sender is plainly talking to us, this decoder just can't use the frames
+    /// yet. Guards the ordering inside `feed` (bookkeeping before the
+    /// pre-keyframe gate).
+    #[test]
+    fn frames_dropped_before_the_first_keyframe_still_count_as_liveness() {
+        gstreamer::init().expect("gstreamer init");
+        let mut decoder = StreamDecoder::new(0).expect("failed to build StreamDecoder");
+
+        let mut delta = stall_test_frame(false);
+        delta.keyframe = false;
+        for _ in 0..5 {
+            decoder.feed(&delta);
+        }
+        assert!(!decoder.seen_keyframe, "the test's premise: nothing was actually accepted for decode");
+        assert!(
+            !decoder.is_stalled_at(Instant::now()),
+            "pre-keyframe frames are still evidence the sender is alive"
+        );
+    }
+
     /// End-to-end correctness check of the *decode* half of this module,
     /// bypassing the network/crypto layer entirely (out of scope here —
     /// covered by `net.rs`'s own tests): generate a real H.264 stream with
@@ -2470,6 +2670,7 @@ mod tests {
 
         for (i, au) in access_units.iter().enumerate() {
             let frame = DecryptedMediaFrame {
+                stalled: false,
                 conn_id: 1,
                 stream_id: 7,
                 pts: (i as u64) * 33_333,
@@ -2777,6 +2978,7 @@ mod tests {
 
         for (i, packet) in packets.iter().enumerate() {
             let frame = DecryptedMediaFrame {
+                stalled: false,
                 conn_id: 1,
                 stream_id: 9,
                 pts: (i as u64) * 20_000,
@@ -2788,7 +2990,14 @@ mod tests {
 
         // A frame for a different stream_id must be a silent no-op, never a
         // panic or a push into this decoder's pipeline.
-        decoder.feed(&DecryptedMediaFrame { conn_id: 1, stream_id: 200, pts: 0, keyframe: true, payload: vec![1, 2, 3] });
+        decoder.feed(&DecryptedMediaFrame {
+            conn_id: 1,
+            stream_id: 200,
+            pts: 0,
+            keyframe: true,
+            stalled: false,
+            payload: vec![1, 2, 3],
+        });
 
         // Let the pipeline thread drain the channel and push everything
         // through opusdec, then confirm it's still alive (no bus error tore
@@ -3546,6 +3755,7 @@ mod tests {
 
         for &i in &order {
             decoder.feed(&DecryptedMediaFrame {
+                stalled: false,
                 conn_id: 1,
                 stream_id: 11,
                 // PTS follows the packet's true position, not its arrival
