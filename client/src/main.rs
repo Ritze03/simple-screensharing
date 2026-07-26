@@ -21,6 +21,7 @@ extern crate rust_i18n;
 i18n!("locales", fallback = "en");
 
 mod audio;
+mod bandwidth;
 mod capture;
 mod decode;
 #[cfg(test)]
