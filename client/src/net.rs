@@ -329,6 +329,17 @@ pub struct DecryptedMediaFrame {
     pub stream_id: StreamId,
     pub pts: u64,
     pub keyframe: bool,
+    /// The sender flagged this frame as a stalled-capture re-send (see
+    /// [`crate::protocol::MEDIA_FLAG_STALLED`]).
+    ///
+    /// `Why:` this comes from the media header's **cleartext, unauthenticated**
+    /// `flags` byte — the AAD is only `[version, stream_id]` (see
+    /// [`aead_encrypt`]), so unlike every other field on this struct it is not
+    /// covered by the AEAD tag and an on-path attacker can flip it freely. It
+    /// exists purely so `decode.rs` can hand `ui.rs` a "draw the waiting-for-
+    /// capture placeholder" hint; nothing may branch on it that has a security
+    /// or protocol consequence (no teardown, no unsubscribe, no key handling).
+    pub stalled: bool,
     /// Raw codec bytes (one H.264 access unit, or one Opus packet).
     pub payload: Vec<u8>,
 }
@@ -608,6 +619,7 @@ async fn datagram_reader_loop(connection: quinn::Connection, room_key: [u8; 32],
                     stream_id: header.stream_id,
                     pts,
                     keyframe: header.is_keyframe(),
+                    stalled: header.is_stalled(),
                     payload,
                 };
                 if tx.send(ClientEvent::MediaFrame(frame)).is_err() {
