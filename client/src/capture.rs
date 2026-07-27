@@ -367,26 +367,40 @@ fn probe_vaapi_encoder() -> bool {
 /// Default encoder-branch framerate cap, preselected in `ui.rs`'s framerate
 /// dropdown. Deliberately conservative (matches this pipeline's previous
 /// hardcoded `CAPTURE_FRAMERATE` value) rather than jumping straight to the
-/// spec's 240Hz ceiling ([`MAX_FRAMERATE`]): a higher framerate multiplies
-/// both the encoder's CPU cost and (per this module's doc comment on
+/// [`MAX_FRAMERATE`] ceiling: a higher framerate multiplies both the
+/// encoder's CPU cost and (per this module's doc comment on
 /// `build_pipeline`'s `videorate` cap) how finely the same configured
 /// bitrate gets sliced, so a cautious default — especially so soon after the
 /// bitrate-starvation bug this same knob was originally added to fix (see
 /// this module's doc comment) — is safer than maximizing it by default.
-/// Users who want up to 240fps (desktop-only per the original design; the
-/// browser client can stay lower) can select it explicitly.
+/// Users who want up to [`MAX_FRAMERATE`]'s value (desktop-only per the
+/// original design; the browser client can stay lower) can select it
+/// explicitly.
 pub const DEFAULT_FRAMERATE: u32 = 30;
 
-/// Hard ceiling on the user-selectable capture framerate, per the original
-/// project design's "desktop clients support up to 240Hz streaming"
-/// requirement — the browser client isn't held to this, but this is the
-/// native desktop client. [`build_pipeline`] clamps whatever `framerate` it's
-/// given into `MIN_FRAMERATE..=MAX_FRAMERATE` as a defensive belt-and-
-/// suspenders measure (`ui.rs`'s dropdown already only offers values in
-/// range), so a bad/malicious caller can never hand this a `framerate` of 0
-/// (which would make `key-int-max` 0, i.e. "never insert a keyframe past the
-/// first") or something absurdly large.
-pub const MAX_FRAMERATE: u32 = 240;
+/// Hard ceiling on the user-selectable capture framerate. The original
+/// project design's ceiling was 240 ("desktop clients support up to 240Hz
+/// streaming"), later raised to 280 so users can explicitly experiment above
+/// that spec target (`frontend/scripts/stream-control.js`'s framerate
+/// dropdown) — this is *not* the value 67b2c85 capped: that fix was about
+/// the encoder branch having no framerate lock at all (raw variable,
+/// content-driven source rate feeding straight into the encoder's
+/// bitrate/frame division), fixed by the `videorate` cap in
+/// [`build_pipeline`] that locks the branch to whatever `framerate` was
+/// selected — a mechanism that holds at any selected rate, so raising this
+/// ceiling doesn't reintroduce that bug. What raising it *does* do: pushes
+/// CPU/encoder cost higher and slices the same configured bitrate more
+/// finely (see `DEFAULT_FRAMERATE`'s doc comment) with no benefit to viewers
+/// today, since MJPEG-over-HTTP delivery bottlenecks around 20-30fps
+/// regardless of capture framerate (a separate, known follow-up). The
+/// browser client isn't held to this, but this is the native desktop
+/// client. [`build_pipeline`] clamps whatever `framerate` it's given into
+/// `MIN_FRAMERATE..=MAX_FRAMERATE` as a defensive belt-and-suspenders
+/// measure (`ui.rs`'s dropdown already only offers values in range), so a
+/// bad/malicious caller can never hand this a `framerate` of 0 (which would
+/// make `key-int-max` 0, i.e. "never insert a keyframe past the first") or
+/// something absurdly large.
+pub const MAX_FRAMERATE: u32 = 280;
 
 /// See [`MAX_FRAMERATE`].
 pub const MIN_FRAMERATE: u32 = 1;
@@ -496,8 +510,9 @@ impl CaptureSource {
                 // than a fixed constant, so raising/lowering the selected
                 // framerate keeps this in lockstep. Never 0 for any
                 // in-range `framerate` (`MIN_FRAMERATE..=MAX_FRAMERATE` is
-                // `1..=240`, and `1000 / 240 == 4`), so this can never
-                // accidentally disable the keepalive.
+                // `1..=MAX_FRAMERATE`, and `1000 / MAX_FRAMERATE` is always
+                // >= 1 for any sane ceiling), so this can never accidentally
+                // disable the keepalive.
                 let keepalive_ms = (1000 / framerate.clamp(MIN_FRAMERATE, MAX_FRAMERATE)).max(1);
                 format!(
                     "pipewiresrc fd={} path={} do-timestamp=true keepalive-time={keepalive_ms}",
@@ -642,7 +657,7 @@ const PREVIEW_BRANCH_FRAMERATE: u32 = 1;
 /// enough for a small "is this really what I'm sharing" live view without
 /// paying anywhere near the encoder branch's CPU/`videoconvert` cost: a
 /// self-preview thumbnail doesn't need to track the full capture framerate
-/// (up to [`MAX_FRAMERATE`]'s 240) to be useful, and this is comfortably
+/// (up to [`MAX_FRAMERATE`]) to be useful, and this is comfortably
 /// above the ~10-15fps a small preview panel needs to read as live rather
 /// than a slideshow.
 const SELF_PREVIEW_BRANCH_FRAMERATE: u32 = 12;

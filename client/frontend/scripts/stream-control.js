@@ -680,7 +680,14 @@
     const fpsField = el("div", { className: "sc-start-field" });
     fpsField.appendChild(el("label", { className: "field-label", text: "Framerate" }));
     const fpsSelect = el("select");
-    [15, 30, 60].forEach((fps) => fpsSelect.appendChild(el("option", { text: fps + " fps", attrs: { value: String(fps) } })));
+    // 90/120/144/165/240 match real monitor refresh rates; 280 exceeds both
+    // real monitor Hz and the project's documented 240Hz spec ceiling (see
+    // capture::MAX_FRAMERATE's doc comment) — offered anyway per explicit
+    // user request to experiment past that ceiling. MJPEG-over-HTTP delivery
+    // bottlenecks around 20-30fps regardless of capture framerate, so
+    // nothing above that is expected to visibly improve *viewer* playback
+    // yet; this only widens what capture itself can be asked to run at.
+    [15, 30, 60, 90, 120, 144, 165, 240, 280].forEach((fps) => fpsSelect.appendChild(el("option", { text: fps + " fps", attrs: { value: String(fps) } })));
     fpsSelect.value = String(state.startForm.fps);
     fpsSelect.addEventListener("change", () => (state.startForm.fps = Number(fpsSelect.value)));
     fpsField.appendChild(fpsSelect);
