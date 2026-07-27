@@ -63,7 +63,7 @@ use crate::audio::{self, AudioCaptureHandle, AudioSource};
 use crate::bandwidth::{self, AllocInput, Allocation, DestId, DestSpec};
 use crate::capture::{self, CaptureHandle, DestKey};
 use crate::decode::{self, AudioDecoder, PreviewCache, StreamDecoder};
-use crate::net::{ClientEvent, PresenceSnapshotState, ScreenshareClient};
+use crate::net::{ClientEvent, DecryptedMediaFrame, PresenceSnapshotState, ScreenshareClient};
 use crate::protocol::{ConnId, Member, PresenceEvent, StreamId, StreamInfo, StreamKind};
 use crate::rooms::{AppSettings, BandwidthMode, PresentationMode, RoomStore};
 
@@ -468,6 +468,18 @@ pub struct WatchEntry {
     /// with this one. `None` if the sender had no audio stream announced at
     /// watch time.
     pub audio_stream_id: Option<StreamId>,
+    /// Optional second consumer of every raw `MediaFrame` fed to this watch,
+    /// set (from outside `session.rs`) by the Tauri front-end's
+    /// `commands::toggle_watch` right after this entry is created, so
+    /// `src-tauri/src/video_server.rs`'s H.264 relay can tap the same raw
+    /// access units this entry's `decoder` gets, without `session.rs` (this
+    /// crate's front-end-agnostic library) depending on the `src-tauri`
+    /// binary crate that owns the relay. `None` for the plain egui front-end
+    /// (`ui.rs`), which never sets it and only ever reads through `decoder`.
+    /// A plain `std::sync::mpsc::Sender` (not the `tokio::sync::mpsc` used
+    /// elsewhere in this struct) because the relay's producer thread is a
+    /// plain `std::thread`, not a Tokio task.
+    pub raw_tx: Option<std::sync::mpsc::Sender<DecryptedMediaFrame>>,
 }
 
 /// One audio stream currently being decoded/played, whether auto-subscribed
@@ -674,6 +686,7 @@ impl RoomSession {
                             texture: None,
                             popout: None,
                             audio_stream_id,
+                            raw_tx: None,
                         },
                     );
                     self.selected_watch = Some(key);
@@ -1031,6 +1044,13 @@ pub async fn spawn_media_ingestion_task(
                 // needing to know the frame's `StreamKind` up front.
                 if let Some(entry) = watches.lock().unwrap().get(&key) {
                     entry.decoder.lock().unwrap().feed(&frame);
+                    // Tap the same raw access unit for the Tauri front-end's
+                    // H.264 relay (see `WatchEntry::raw_tx`'s doc comment).
+                    // `None` for the plain egui front-end, which never sets
+                    // it.
+                    if let Some(tx) = &entry.raw_tx {
+                        let _ = tx.send(frame.clone());
+                    }
                 }
                 if let Some(audio_watch) = audio_watches.lock().unwrap().get_mut(&key) {
                     audio_watch.decoder.feed(&frame);

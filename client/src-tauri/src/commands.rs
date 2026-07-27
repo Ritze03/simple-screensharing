@@ -287,9 +287,10 @@ pub fn set_bandwidth_floor(managed: State<'_, Managed>, floor_kbps: u32) {
 // toggle_watch` inserts (or removes) a `WatchEntry` synchronously before
 // returning, so right after it runs, `room.watches` having an entry for this
 // key *is* "we just started watching" and not having one *is* "we just
-// stopped" — no separate state to keep in sync. Returns the MJPEG URL
-// `view.js` should point an `<img>` at when a watch just started, or `None`
-// when it just stopped (or the room doesn't exist).
+// stopped" — no separate state to keep in sync. Returns the relay URL
+// `view.js` should open (see `video_server.rs`'s module doc for the wire
+// format) when a watch just started, or `None` when it just stopped (or the
+// room doesn't exist).
 //
 // `owner` is a hex string, not `u64` — see `dto::hex_u64`'s doc comment for
 // why a bare `u64` command parameter is exactly the bug that made the first
@@ -298,15 +299,26 @@ pub fn set_bandwidth_floor(managed: State<'_, Managed>, floor_kbps: u32) {
 pub fn toggle_watch(managed: State<'_, Managed>, room_handle: u32, owner: String, stream_id: u8) -> Result<Option<String>, String> {
     let owner = dto::parse_owner(&owner)?;
     Ok(tauri::async_runtime::block_on(async {
-        let decoder = {
+        // If this call is starting a new watch, wire up a plain
+        // `std::sync::mpsc` channel and hand `WatchEntry::raw_tx` its
+        // sending half *before* releasing the state lock, so the very next
+        // `MediaFrame` the media-ingestion task sees for this stream is
+        // already forwarded — see `WatchEntry::raw_tx`'s doc comment for why
+        // this is a plain `mpsc::Sender` and not the `tokio::sync::mpsc`
+        // used elsewhere.
+        let raw_rx = {
             let mut state = managed.state.lock().unwrap();
             let room = state.rooms.get_mut(&RoomHandle(room_handle))?;
             room.toggle_watch(owner, stream_id);
-            room.watches.lock().unwrap().get(&(owner, stream_id)).map(|w| w.decoder.clone())
+            room.watches.lock().unwrap().get_mut(&(owner, stream_id)).map(|entry| {
+                let (tx, rx) = std::sync::mpsc::channel();
+                entry.raw_tx = Some(tx);
+                rx
+            })
         };
         let key = (room_handle, owner, stream_id);
-        match decoder {
-            Some(decoder) => Some(managed.video_server.start_route(key, decoder)),
+        match raw_rx {
+            Some(rx) => Some(managed.video_server.start_route(key, rx)),
             None => {
                 managed.video_server.stop_route(key);
                 None
@@ -315,7 +327,7 @@ pub fn toggle_watch(managed: State<'_, Managed>, room_handle: u32, owner: String
     }))
 }
 
-/// Look up the MJPEG URL for a stream that's already being watched (or
+/// Look up the relay URL for a stream that's already being watched (or
 /// `None` if it isn't) — lets `view.js` rebuild its whole tile list (e.g. on
 /// tab reload) without needing to have been the caller that started the
 /// watch; see `toggle_watch`'s doc comment for the immediate-feedback path.

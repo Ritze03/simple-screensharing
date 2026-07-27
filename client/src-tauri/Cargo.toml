@@ -15,14 +15,12 @@ serde_json = "1"
 tokio = { version = "1", features = ["rt", "time", "macros"] }
 rust-i18n = "4.2.1"
 
-# `video_server.rs`'s MJPEG-over-HTTP frame path: `libturbojpeg` (checked via
-# `pkg-config --exists libturbojpeg` on this system, present at 3.2.0) is a
-# real system library binding, much faster than the pure-Rust `image` crate's
-# encoder — matters here because every watched tile re-encodes a full frame
-# on every poll tick. `socket2` is needed to clamp the serving TCP socket's
-# send buffer (see `video_server.rs`'s module doc `Why:` note) — something a
-# higher-level HTTP framework doesn't expose.
-turbojpeg = "1.5.1"
+# `video_server.rs`'s H.264 relay: `socket2` is needed to clamp the serving
+# TCP socket's send buffer (see `video_server.rs`'s module doc `Why:` note)
+# — something a higher-level HTTP framework doesn't expose. (Previously also
+# depended on `turbojpeg` for the MJPEG-over-HTTP frame path this module used
+# to serve — removed 2026-07-27 when that path was replaced with a direct
+# H.264 bitstream relay; see `video_server.rs`'s module doc "History".)
 socket2 = "0.6"
 
 # `api_server.rs`'s shared-secret auth token (32 random bytes, hex-encoded) —
