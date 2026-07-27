@@ -20,15 +20,26 @@ use std::sync::Mutex;
 
 use simple_screensharing_client::session::AppState;
 
+use crate::video_server::VideoServer;
+
 pub struct Managed {
     pub state: Mutex<AppState>,
     /// See the module doc comment above for why this exists at all.
     pub egui_ctx: egui::Context,
+    /// The View tab's real video delivery — see `video_server.rs`'s module
+    /// doc. One listener per process, started here so it's available for the
+    /// whole app lifetime; individual streams' routes come and go with
+    /// `toggle_watch` (see `commands.rs`).
+    pub video_server: VideoServer,
 }
 
 impl Managed {
     pub fn new() -> Self {
-        Self { state: Mutex::new(AppState::default()), egui_ctx: egui::Context::default() }
+        Self {
+            state: Mutex::new(AppState::default()),
+            egui_ctx: egui::Context::default(),
+            video_server: VideoServer::start().expect("bind local video-server listener"),
+        }
     }
 }
 

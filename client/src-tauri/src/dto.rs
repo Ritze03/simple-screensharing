@@ -6,9 +6,93 @@
 use serde::Serialize;
 
 use simple_screensharing_client::capture::destination::{DestinationState, VideoParams};
-use simple_screensharing_client::protocol::{Member, StreamInfo};
+use simple_screensharing_client::protocol::{ConnId, Member, StreamInfo};
 use simple_screensharing_client::rooms::BandwidthMode;
 use simple_screensharing_client::session::{self, AppState, RoomHandle};
+
+/// `u64` (`ConnId`/`owner`) as a fixed-width lowercase-hex JSON string —
+/// `serde_json::Number` is an IEEE-754 `f64` under the hood, which only
+/// represents integers exactly up to `2^53`. A real `ConnId` is drawn from
+/// the *full* `u64` range (see `rooms.rs`'s connection-id generation) and
+/// routinely exceeds that, so sending one as a bare JSON number silently
+/// *rounds* it — this was live and reproduced during this feature's own
+/// integration testing: `toggle_watch`'s `owner` round-tripped through
+/// `window.__TAURI__.core.invoke` came back a different `u64` than the one
+/// `MediaFrame`s actually arrived tagged with, so `spawn_media_ingestion_task`
+/// could never find the watch entry to feed — decode silently never started,
+/// with no error anywhere (see `video_server.rs`'s module doc for how this
+/// surfaced: a producer thread that polled forever and never saw a frame).
+/// This exact class of bug (u64 fields losing precision over the JSON
+/// boundary) was already flagged as a known limitation — see
+/// `frontend/scripts/stream-control.js`'s `MOCK_MEMBERS_BY_ROOM` comment,
+/// which called it "not something fixable here" — but was never actually
+/// fixed for the real (non-mock) path until this feature needed it to work.
+/// The existing UI convention already displays every `conn_id` as 16-hex-char
+/// lowercase text (`stream-control.js`'s member-row rendering), so this just
+/// makes that the wire representation too instead of a display-only
+/// afterthought computed from an already-corrupted number.
+mod hex_u64 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &u64, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&format!("{v:016x}"))
+    }
+
+    // `#[serde(with = "hex_u64")]` below is only ever used on `Serialize`-only
+    // DTOs (server -> frontend), so this half is currently unexercised —
+    // kept for symmetry/completeness of the module (and because `serde`'s
+    // `with` attribute convention expects the pair) rather than deleted;
+    // `dto::parse_owner` is the actual deserialize-direction helper used by
+    // commands that take `owner` as a bare string argument.
+    #[allow(dead_code)]
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
+        let s = String::deserialize(d)?;
+        u64::from_str_radix(s.trim_start_matches("0x"), 16).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Parse a `hex_u64`-style string (as produced above, or by
+/// `stream-control.js`'s pre-existing `toString(16).padStart(16, "0")`
+/// display convention) back into a real `ConnId` — the command-parameter
+/// equivalent of `hex_u64::deserialize` for commands that take `owner`
+/// as a bare argument rather than a struct field.
+pub fn parse_owner(owner: &str) -> Result<ConnId, String> {
+    u64::from_str_radix(owner.trim_start_matches("0x"), 16).map_err(|e| format!("invalid owner {owner:?}: {e}"))
+}
+
+/// `protocol::Member`, JSON-safe — see `hex_u64`'s doc comment for why
+/// `conn_id` can't just be `Member`'s own `u64` field re-sent as-is.
+#[derive(Serialize, Clone)]
+pub struct MemberDto {
+    #[serde(with = "hex_u64")]
+    pub conn_id: ConnId,
+    pub display_name: String,
+    pub stream_count: u8,
+}
+
+impl From<&Member> for MemberDto {
+    fn from(m: &Member) -> Self {
+        Self { conn_id: m.conn_id, display_name: m.display_name.clone(), stream_count: m.stream_count }
+    }
+}
+
+/// `protocol::StreamInfo`, JSON-safe — see `hex_u64`'s doc comment.
+#[derive(Serialize, Clone)]
+pub struct StreamInfoDto {
+    #[serde(with = "hex_u64")]
+    pub owner: ConnId,
+    pub stream_id: u8,
+    pub kind: simple_screensharing_client::protocol::StreamKind,
+    pub label: String,
+    pub width: u16,
+    pub height: u16,
+}
+
+impl From<&StreamInfo> for StreamInfoDto {
+    fn from(s: &StreamInfo) -> Self {
+        Self { owner: s.owner, stream_id: s.stream_id, kind: s.kind, label: s.label.clone(), width: s.width, height: s.height }
+    }
+}
 
 /// One row of the sidebar's ROOMS list: the left join of `RoomStore` (saved
 /// rooms) and `AppState::rooms` (live sessions) described in
@@ -42,15 +126,16 @@ pub enum RoomRowState {
 pub struct RoomDetail {
     pub room_handle: u32,
     pub label: String,
-    pub members: Vec<Member>,
-    pub streams: Vec<StreamInfo>,
+    pub members: Vec<MemberDto>,
+    pub streams: Vec<StreamInfoDto>,
     pub watched: Vec<StreamKey>,
     pub listened: Vec<StreamKey>,
 }
 
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StreamKey {
-    pub owner: u64,
+    #[serde(with = "hex_u64")]
+    pub owner: ConnId,
     pub stream_id: u8,
 }
 
@@ -195,8 +280,8 @@ pub fn room_detail(state: &AppState, handle: RoomHandle) -> Option<RoomDetail> {
     Some(RoomDetail {
         room_handle: handle.0,
         label: session::room_label(&state.room_store, &room.join_string),
-        members: room.members.clone(),
-        streams: room.streams.clone(),
+        members: room.members.iter().map(MemberDto::from).collect(),
+        streams: room.streams.iter().map(StreamInfoDto::from).collect(),
         watched,
         listened,
     })

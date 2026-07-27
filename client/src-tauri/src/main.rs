@@ -11,10 +11,12 @@ mod commands;
 mod dto;
 mod driver;
 mod state;
+mod video_server;
 
 use state::Managed;
 
 fn main() {
+    tracing_subscriber::fmt::init();
     // `Managed::new()` builds `session::AppState::default()`, which eagerly
     // binds the client's local QUIC/UDP socket (`net::build_client_endpoint`).
     // That bind requires an entered Tokio reactor (quinn's `runtime-tokio`
@@ -71,6 +73,7 @@ fn main() {
             commands::toggle_listen,
             commands::set_volume,
             commands::pop_out_stream,
+            commands::stream_video_url,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

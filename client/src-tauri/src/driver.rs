@@ -29,13 +29,21 @@
 //!
 //! `Why one shared interval rather than one per concern:` every poll here is
 //! a cheap, non-blocking `try_recv`/map-scan over in-memory state — nothing
-//! like the frame-rate-critical video path (that's the separate MJPEG-over-
-//! HTTP mechanism, explicitly out of scope here). A single few-hundred-ms
-//! tick is already far below any human-perceptible delay for "a stream
-//! finished starting" or "a member joined", so one timer buying one lock
-//! acquisition per tick is simpler than N timers each fighting over the same
-//! mutex for no responsiveness gain. See `superdoc/architecture/overview.md`'s
-//! command/event table for the same note.
+//! like the frame-rate-critical video path, which is deliberately **not**
+//! driven by this tick loop at all: `video_server.rs` runs its own
+//! per-stream producer thread polling at up to 60fps, independent of this
+//! loop's much coarser cadence (see that module's doc comment for the
+//! MJPEG-over-HTTP mechanism itself; as of 2026-07-27 it's implemented and
+//! wired to `toggle_watch`, not a future/out-of-scope item — an earlier
+//! version of this comment claimed it was "a separate, already-prototyped"
+//! mechanism before it existed anywhere; see `video_server.rs`'s doc comment
+//! and `superdoc/ui/FRONTEND-SHELL.md`'s 2026-07-27 entries for that
+//! history). A single few-hundred-ms tick is already far below any
+//! human-perceptible delay for "a stream finished starting" or "a member
+//! joined", so one timer buying one lock acquisition per tick is simpler
+//! than N timers each fighting over the same mutex for no responsiveness
+//! gain. See `superdoc/architecture/overview.md`'s command/event table for
+//! the same note.
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -137,6 +145,12 @@ fn tick(app_handle: &AppHandle, last: &mut Snapshot) {
                 session::Status::Error(e) => e.clone(),
                 _ => "disconnected".to_string(),
             };
+            // A room can disappear without ever going through
+            // `commands::toggle_watch`'s explicit stop path (control-plane
+            // close while still watching something) — without this, that
+            // stream's video-server producer thread and connection-serving
+            // route would leak for the rest of the process's life.
+            managed.video_server.stop_room(handle);
             let _ = app_handle.emit("room-disconnected", serde_json::json!({ "roomHandle": handle, "reason": reason }));
         }
     }
