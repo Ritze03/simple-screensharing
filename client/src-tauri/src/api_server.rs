@@ -250,6 +250,11 @@ fn handle_connection(mut stream: TcpStream, app: &AppHandle) {
     let _ = stream.set_nodelay(true);
     let Some(req) = read_request(&mut stream) else { return };
 
+    if req.method == "OPTIONS" {
+        write_preflight(&mut stream);
+        return;
+    }
+
     if req.path == "/events" {
         handle_sse(stream, app);
         return;
@@ -287,6 +292,7 @@ fn handle_sse(mut stream: TcpStream, app: &AppHandle) {
          Cache-Control: no-cache, no-store\r\n\
          Connection: keep-alive\r\n\
          X-Accel-Buffering: no\r\n\
+         Access-Control-Allow-Origin: *\r\n\
          \r\n";
     if stream.write_all(headers.as_bytes()).is_err() {
         return;
@@ -455,9 +461,25 @@ fn write_response(stream: &mut TcpStream, status: u16, content_type: &str, body:
         500 => "Internal Server Error",
         _ => "Error",
     };
-    let header = format!("HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+    let header = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
     if stream.write_all(header.as_bytes()).is_err() {
         return;
     }
     let _ = stream.write_all(body);
+}
+
+/// Respond to a CORS preflight `OPTIONS` request (any path) with `204 No
+/// Content` and the headers needed to authorize the real `POST`/`GET` that
+/// follows — see module doc's CORS note.
+fn write_preflight(stream: &mut TcpStream) {
+    let header = "HTTP/1.1 204 No Content\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n\
+         Access-Control-Allow-Headers: Content-Type\r\n\
+         Connection: close\r\n\
+         \r\n";
+    let _ = stream.write_all(header.as_bytes());
 }
