@@ -79,6 +79,12 @@
   function stopController(controller) {
     if (!controller) return;
     controller.stopped = true;
+    // Aborts the fetch outright if it's still in flight (no reader yet —
+    // headers haven't come back), and is a harmless no-op if the fetch has
+    // already settled by the time this runs.
+    if (controller.abortController) {
+      controller.abortController.abort();
+    }
     if (controller.reader) {
       controller.reader.cancel().catch(() => {});
     }
@@ -119,7 +125,7 @@
    * `error` state, matching the existing `'stalled'`
    * `.media-tile-placeholder` visual rather than inventing a new one. */
   async function startTileVideo(tile, canvas, errorPlaceholder) {
-    const controller = { decoder: null, reader: null, stopped: false };
+    const controller = { decoder: null, reader: null, stopped: false, abortController: new AbortController() };
     videoControllers.set(tile.id, controller);
 
     const showError = () => {
@@ -142,13 +148,23 @@
   async function startTileVideoInner(tile, canvas, controller, showError) {
     let response;
     try {
-      response = await fetch(tile.videoUrl);
+      response = await fetch(tile.videoUrl, { signal: controller.abortController.signal });
     } catch (e) {
+      // A stop-triggered abort() rejects fetch() with an AbortError — that's
+      // expected teardown, not a real failure, so don't flash the error
+      // placeholder for it.
+      if (controller.stopped) return;
       console.error(`[view] failed to fetch video stream for ${tile.id}:`, e);
       showError();
       return;
     }
-    if (controller.stopped) return;
+    if (controller.stopped) {
+      // Stopped between the fetch resolving and this check (no reader
+      // exists yet for `stopController` to `cancel()` on) — release the
+      // now-unread response body ourselves so the connection doesn't idle.
+      if (response.body) response.body.cancel().catch(() => {});
+      return;
+    }
     if (!response.ok || !response.body) {
       console.error(`[view] video stream fetch for ${tile.id} failed: HTTP ${response.status}`);
       showError();
