@@ -929,6 +929,30 @@ fn isolate_source_from_branch_renegotiation(tee: &gst::Element) -> Result<()> {
 /// there is nothing VAAPI-specific that can fail at this stage. That
 /// fallback now lives per destination, where it belongs — see
 /// [`branch::add_branch_with_fallback`]/[`branch::add_branch_live`].
+///
+/// `Why this is a plain, synchronous fn, never called directly from async
+/// code:` [`Element::state`]'s blocking wait below takes a `ClockTime`
+/// timeout argument, but that timeout is **not reliable** under real-world
+/// contention — measured directly while diagnosing the "repeated Stop→Share
+/// restart cycles permanently wedge the backend" bug (see
+/// `superdoc/ui/FRONTEND-SHELL.md`'s dated entry): starting a new capture
+/// immediately after the previous one's portal session/pipeline finished
+/// tearing down can leave `pipewiresrc`'s state change stuck deep inside
+/// GStreamer/PipeWire's own synchronization for far longer than the 5s
+/// argument here promises — observed anywhere from several seconds to
+/// indefinitely, in the same process, across otherwise-identical repeated
+/// attempts. Every caller of [`start_pipeline`] therefore MUST run it via
+/// `tokio::task::spawn_blocking` (see [`start_sharing_with_source`]) rather
+/// than calling it inline from an `async fn` — a call that can genuinely
+/// never return must never run on one of the Tokio runtime's own (small,
+/// fixed-size) worker threads, or enough repeated stalls permanently starve
+/// every other task sharing that pool, including `driver.rs`'s poll loop and
+/// every other `#[tauri::command]`'s `block_on` continuation — which is
+/// exactly the "every subsequent command silently never resolves" symptom
+/// reported. Moving the block onto `spawn_blocking`'s separate, elastic
+/// thread pool doesn't fix GStreamer's own timeout unreliability, but it
+/// confines the damage to one throwaway blocking-pool thread instead of
+/// starving the whole app.
 fn start_pipeline(source_fragment: &str) -> Result<CapturePipeline> {
     let built = build_pipeline(source_fragment)?;
 
@@ -941,7 +965,9 @@ fn start_pipeline(source_fragment: &str) -> Result<CapturePipeline> {
     // the room this stream exists — announcing a stream that then
     // immediately errors out would be a confusing "stream with no frames"
     // for other members. `state()` blocks until the async state change
-    // settles (success or error) or the timeout elapses.
+    // settles (success or error) or the timeout elapses — see this
+    // function's `Why:` note above for why that promise isn't trusted by any
+    // caller.
     let (state_result, _current, _pending) = built.pipeline.state(gst::ClockTime::from_seconds(5));
     if let Err(e) = state_result {
         let _ = built.pipeline.set_state(gst::State::Null);
@@ -1218,8 +1244,23 @@ async fn start_sharing_with_source(
     let framerate = framerate.clamp(MIN_FRAMERATE, MAX_FRAMERATE);
 
     let source_fragment = capture_source.launch_fragment(framerate);
-    let CapturePipeline { pipeline, tee, preview_sink, self_preview_sink } =
-        start_pipeline(&source_fragment)?;
+    // `Why spawn_blocking:` `start_pipeline` synchronously blocks on
+    // `Element::state()`, whose timeout argument is not reliable under real
+    // contention (a capture started immediately after the previous one's
+    // portal/pipeline teardown can leave GStreamer's state change stuck for
+    // far longer than promised — see `start_pipeline`'s own `Why:` note).
+    // Calling it inline here would block whichever Tokio runtime worker
+    // thread happens to run this task for as long as that stall lasts —
+    // observed anywhere from several seconds to indefinitely — and enough
+    // repeated stalls permanently starve the whole shared worker pool this
+    // process depends on for everything else (`driver.rs`'s poll loop, every
+    // other command). Running it on `spawn_blocking`'s separate, elastic
+    // thread pool instead confines a stuck state-change to one throwaway
+    // thread there, no matter how long (or whether) it ever returns.
+    let built = tokio::task::spawn_blocking(move || start_pipeline(&source_fragment))
+        .await
+        .map_err(|e| anyhow!("capture pipeline startup task panicked: {e}"))??;
+    let CapturePipeline { pipeline, tee, preview_sink, self_preview_sink } = built;
 
     // Size for AnnounceStream and for the never-upscale clamp
     // ([`destination::clamp_to_source`]): read off the tee's negotiated sink
