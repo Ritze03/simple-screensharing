@@ -18,10 +18,11 @@
 // This module also owns the one place every Tauri event listener is
 // registered (`wireEvents`, called once from `init`) — `room-connected`,
 // `room-connect-failed`, `room-disconnected`, `presence-updated`,
-// `destination-state-changed`, `bandwidth-overshoot` — since the sidebar's
-// ROOMS/STREAMS sections are the shell's own state and the other tabs
-// (`stream-control.js`/`view.js`) expose a small `refresh()` this module
-// calls into rather than duplicating six `listen()` calls per file.
+// `destination-state-changed`, `bandwidth-overshoot`, `stream-stats-updated`
+// — since the sidebar's ROOMS/STREAMS sections are the shell's own state and
+// the other tabs (`stream-control.js`/`view.js`) expose a small `refresh()`
+// this module calls into rather than duplicating seven `listen()` calls per
+// file.
 
 (function () {
   "use strict";
@@ -506,9 +507,12 @@
     });
     listen("stream-stats-updated", (event) => {
       // Fires unconditionally ~4x/sec (see `dto::StreamStatsUpdated`'s doc
-      // comment) — `destinations` is `stream-control.js`'s concern,
-      // `watched` (per-tile received fps) is the View tab's; each owner
-      // patches just its own DOM in place rather than re-rendering.
+      // comment), not diffed — this must stay cheap. `destinations` is
+      // `stream-control.js`'s concern, `watched` (per-tile received fps) is
+      // the View tab's; each owner patches just its own DOM in place via
+      // direct `textContent` updates on already-rendered elements rather
+      // than going through a refresh/re-render, so this tick never causes a
+      // flicker or a full rebuild.
       if (window.StreamControl && window.StreamControl.updateStats) window.StreamControl.updateStats(event.payload);
       if (window.ViewTab && window.ViewTab.updateStats) window.ViewTab.updateStats(event.payload);
     });

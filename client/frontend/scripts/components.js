@@ -394,6 +394,14 @@
 
     wrap.appendChild(el("div", { className: "dest-meta", text: `${dest.width}x${dest.height} @ ${dest.framerate}fps` }));
 
+    // Live captured/sent FPS readout — populated out-of-band by
+    // `stream-control.js`'s `updateStats()` on every `stream-stats-updated`
+    // tick (every ~250ms), via direct `textContent` writes rather than going
+    // through this card's normal sig-diffed render path, so a stats tick
+    // never triggers a full card rebuild. Starts hidden until the first tick
+    // arrives for this destination.
+    wrap.appendChild(el("div", { className: "dest-fps-readout", attrs: { hidden: "" } }));
+
     // Inline bitrate edit — only meaningful in Per-Stream mode (Absolute
     // mode's allocator owns the live bitrate; showing a manual field there
     // would be a control whose input is silently overwritten, per

@@ -165,6 +165,15 @@
   color: var(--text-faint);
 }
 
+.dest-fps-readout {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.dest-fps-readout[hidden] {
+  display: none;
+}
+
 .dest-edit-row {
   display: flex;
   align-items: center;
