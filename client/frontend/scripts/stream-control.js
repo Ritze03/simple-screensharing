@@ -887,7 +887,29 @@
     render();
   }
 
-  window.StreamControl = { refresh: init, setOvershoot };
+  // `stream-stats-updated` fires unconditionally every ~250ms (see
+  // `shell.js`'s `wireEvents`), so this deliberately bypasses the normal
+  // sig-diffed `render()` path: it writes straight into each already-
+  // rendered destination card's `.dest-fps-readout` node via `textContent`,
+  // keyed off `destCardEls` (the same destination_id -> {el, sig} map
+  // `updateActiveSharesCard` maintains). A destination in the payload with
+  // no rendered card yet (a startup timing edge case) is skipped rather than
+  // erroring; a rendered card whose destination stopped showing up in the
+  // payload (it just stopped) is simply left with its last value — the
+  // card itself gets torn down separately by `destination-state-changed`.
+  function updateStats(payload) {
+    const destinations = (payload && payload.destinations) || [];
+    destinations.forEach((d) => {
+      const entry = destCardEls.get(d.destination_id);
+      if (!entry) return;
+      const readout = entry.el.querySelector(".dest-fps-readout");
+      if (!readout) return;
+      readout.hidden = false;
+      readout.textContent = `Captured: ${Math.round(d.captured_fps)}fps · Sent: ${Math.round(d.sent_fps)}fps`;
+    });
+  }
+
+  window.StreamControl = { refresh: init, setOvershoot, updateStats };
 
   document.addEventListener("DOMContentLoaded", init);
 })();

@@ -18,10 +18,11 @@
 // This module also owns the one place every Tauri event listener is
 // registered (`wireEvents`, called once from `init`) — `room-connected`,
 // `room-connect-failed`, `room-disconnected`, `presence-updated`,
-// `destination-state-changed`, `bandwidth-overshoot` — since the sidebar's
-// ROOMS/STREAMS sections are the shell's own state and the other tabs
-// (`stream-control.js`/`view.js`) expose a small `refresh()` this module
-// calls into rather than duplicating six `listen()` calls per file.
+// `destination-state-changed`, `bandwidth-overshoot`, `stream-stats-updated`
+// — since the sidebar's ROOMS/STREAMS sections are the shell's own state and
+// the other tabs (`stream-control.js`/`view.js`) expose a small `refresh()`
+// this module calls into rather than duplicating seven `listen()` calls per
+// file.
 
 (function () {
   "use strict";
@@ -503,6 +504,14 @@
     });
     listen("bandwidth-overshoot", (event) => {
       if (window.StreamControl) window.StreamControl.setOvershoot(event.payload.overshootKbps);
+    });
+    listen("stream-stats-updated", (event) => {
+      // Fires unconditionally every ~250ms — not diffed, so this must stay
+      // cheap. `updateStats` writes the per-destination FPS readout via
+      // direct `textContent` updates on the already-rendered cards rather
+      // than going through a refresh/re-render, so this tick never causes a
+      // flicker or a full ACTIVE SHARES rebuild.
+      if (window.StreamControl) window.StreamControl.updateStats(event.payload);
     });
   }
 
