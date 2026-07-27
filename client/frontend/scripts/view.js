@@ -62,6 +62,43 @@
   // controller, same lifecycle `fpsSpans` already follows).
   let videoControllers = new Map();
 
+  // How far back a controller's `frameTimestamps` window looks when
+  // computing its received-fps — mirrors the spirit of `src/capture.rs`'s
+  // `ENCODER_FPS_WINDOW` (a rolling window smooths out per-frame jitter
+  // better than a naive last-interval delta), reimplemented fresh in JS
+  // here since there's no way to share the Rust code across the process
+  // boundary.
+  const FPS_WINDOW_MS = 1500;
+  // Cadence for pushing the locally-computed fps into the DOM — matches
+  // `stream-stats-updated`'s ~4x/sec (250ms) cadence purely for visual
+  // consistency; this counter no longer has anything to do with that event.
+  const FPS_UPDATE_INTERVAL_MS = 250;
+
+  /** Records one decoded-frame timestamp into `controller.frameTimestamps`
+   * and drops anything older than `FPS_WINDOW_MS`, so the array stays
+   * bounded no matter how long the tile has been playing. Called once per
+   * real decoded frame from `decoder.output` in `startTileVideoInner`. */
+  function recordFrame(controller) {
+    const now = performance.now();
+    controller.frameTimestamps.push(now);
+    const cutoff = now - FPS_WINDOW_MS;
+    while (controller.frameTimestamps.length && controller.frameTimestamps[0] < cutoff) {
+      controller.frameTimestamps.shift();
+    }
+  }
+
+  /** Frames-per-second implied by `controller.frameTimestamps` over
+   * whatever span has actually elapsed since the oldest timestamp still in
+   * the window (shorter than `FPS_WINDOW_MS` right after a tile starts, so
+   * early readings aren't inflated by dividing by the full window). */
+  function currentFps(controller) {
+    const timestamps = controller.frameTimestamps;
+    if (timestamps.length < 2) return 0;
+    const spanMs = performance.now() - timestamps[0];
+    if (spanMs <= 0) return 0;
+    return (timestamps.length - 1) / (spanMs / 1000);
+  }
+
   /** Cancels `controller`'s fetch reader and closes its `VideoDecoder`.
    * Operates on the controller object itself, never by looking it back up
    * in `videoControllers` by id — a tile can be re-watched (new fetch, new
@@ -79,6 +116,10 @@
   function stopController(controller) {
     if (!controller) return;
     controller.stopped = true;
+    if (controller.fpsIntervalId != null) {
+      clearInterval(controller.fpsIntervalId);
+      controller.fpsIntervalId = null;
+    }
     // Aborts the fetch outright if it's still in flight (no reader yet —
     // headers haven't come back), and is a harmless no-op if the fetch has
     // already settled by the time this runs.
@@ -125,8 +166,31 @@
    * `error` state, matching the existing `'stalled'`
    * `.media-tile-placeholder` visual rather than inventing a new one. */
   async function startTileVideo(tile, canvas, errorPlaceholder) {
-    const controller = { decoder: null, reader: null, stopped: false, abortController: new AbortController() };
+    const controller = {
+      decoder: null,
+      reader: null,
+      stopped: false,
+      abortController: new AbortController(),
+      // Rolling window of `performance.now()` timestamps, one per real
+      // decoded frame — see `recordFrame`/`currentFps` above. This is the
+      // "received fps" the old `dto::StreamStatsUpdated`-driven counter
+      // used to report before the H.264-relay redesign silently broke it
+      // (see this file's header note); WebCodecs' own `decoder.output`
+      // firing once per genuinely decoded frame makes this tab the actual
+      // source of truth now, not the server.
+      frameTimestamps: [],
+      fpsIntervalId: null,
+    };
     videoControllers.set(tile.id, controller);
+
+    // Owns the fps span for this tile exclusively from here on — see
+    // `updateStats` below for why it skips tiles with an active controller
+    // rather than racing this interval to write the same DOM node.
+    controller.fpsIntervalId = setInterval(() => {
+      const span = fpsSpans.get(tile.id);
+      if (!span) return;
+      span.textContent = `@${Math.round(currentFps(controller))}fps`;
+    }, FPS_UPDATE_INTERVAL_MS);
 
     const showError = () => {
       if (errorPlaceholder) errorPlaceholder.removeAttribute("hidden");
@@ -180,6 +244,7 @@
           frame.close();
           return;
         }
+        recordFrame(controller);
         if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
           canvas.width = frame.displayWidth;
           canvas.height = frame.displayHeight;
@@ -437,11 +502,28 @@
    * already uses) and patches that tile's fps span text in place — no
    * re-render, so no flicker. A tile with no matching entry (timing edge
    * case, or the stream just stopped) is simply left showing its last
-   * value; real removal is handled elsewhere via `refresh()`. */
+   * value; real removal is handled elsewhere via `refresh()`.
+   *
+   * `payload.watched[].received_fps` is permanently 0 for any tile with a
+   * live WebCodecs pipeline (see this file's header note and
+   * `startTileVideo`'s `frameTimestamps`/`recordFrame`/`currentFps` for
+   * why: the server-side counter this event used to report stopped being
+   * fed anything the moment the H.264-relay redesign stopped calling
+   * `StreamDecoder::latest_frame()`). Rather than let this handler and
+   * `startTileVideo`'s own `setInterval` both write the same `<span>` on
+   * different cadences (flicker, and a race over which value "wins" on any
+   * given tick), a tile with an active `videoControllers` entry is skipped
+   * here entirely — that interval owns the span exclusively for as long as
+   * the controller is alive. This branch only still matters for the mock
+   * branch (`window.__TAURI__` absent, so `mockWatched` entries carry a
+   * static `fps` and never get a real controller) and for the brief window
+   * before a tile's `startTileVideo` call has set up its own interval. */
   function updateStats(payload) {
     if (!payload || !Array.isArray(payload.watched)) return;
     for (const w of payload.watched) {
-      const span = fpsSpans.get(`${w.room_handle}:${w.owner}:${w.stream_id}`);
+      const id = `${w.room_handle}:${w.owner}:${w.stream_id}`;
+      if (videoControllers.has(id)) continue;
+      const span = fpsSpans.get(id);
       if (!span) continue;
       span.textContent = `@${Math.round(w.received_fps)}fps`;
     }
