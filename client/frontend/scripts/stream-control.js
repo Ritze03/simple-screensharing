@@ -376,51 +376,109 @@
   }
 
   // ---------------------------------------------------------------------
-  // Render
+  // Render — targeted reconciliation, not `innerHTML = ""` + full rebuild.
+  //
+  // Root cause (see FRONTEND-SHELL.md's poll-driven-re-render click-loss
+  // note): every `presence-updated`/`destination-state-changed` event from
+  // `driver.rs`'s 250ms poll — already diffed per-room/per-destination on
+  // the Rust side before it's ever emitted — called `render()`, which wiped
+  // `#stream-control-root` and rebuilt *every* card and button from scratch
+  // via fresh `addEventListener` calls, even when the event had nothing to
+  // do with most of what got rebuilt (e.g. one destination's state flipping
+  // tore down the Stop button on every *other* destination's card too, and
+  // the bandwidth-mode toggle along with it). A click landing between the
+  // old node's removal and the new node's attachment is silently dropped —
+  // intermittently, since it's a timing race against the poll, not a hang
+  // or crash. Below, each top-level card — and, for Active Shares, each
+  // destination card individually — keeps its DOM node (and listeners)
+  // across a `render()` call unless a cheap signature of the data it
+  // actually displays changed; unchanged destination cards are *moved* into
+  // place (a no-op if already there), never recreated.
   // ---------------------------------------------------------------------
+
+  let gridEl = null;
+  let bandwidthCardEl = null;
+  let bandwidthCardSig = null;
+  let overshootBannerEl = null;
+  let overshootBannerSig = null;
+  let activeSharesCardEl = null;
+  let activeSharesGridEl = null;
+  let activeSharesBodySig = null;
+  const destCardEls = new Map(); // destination_id -> { el, sig }
+  let startCardEl = null;
+  let startCardSig = null;
+  let roomScopedEl = null;
+  let roomScopedSig = null;
+
+  /** Reconciles `parent`'s children to exactly `children` (falsy entries
+   * dropped), reusing/moving existing nodes instead of recreating them —
+   * `insertBefore`/`appendChild` on a node already in the right place is a
+   * no-op, so an unchanged child never leaves the DOM (and never loses its
+   * listeners or an in-flight click). */
+  function syncChildren(parent, children) {
+    const wanted = children.filter(Boolean);
+    wanted.forEach((child, i) => {
+      if (parent.children[i] !== child) parent.insertBefore(child, parent.children[i] || null);
+    });
+    while (parent.children.length > wanted.length) parent.removeChild(parent.lastChild);
+  }
 
   function render() {
     const root = document.getElementById("stream-control-root");
     if (!root) return;
-    root.innerHTML = "";
-
-    const grid = el("div", { className: "sc-grid" });
-    grid.appendChild(renderBandwidthCard());
+    if (!gridEl) {
+      gridEl = el("div", { className: "sc-grid" });
+      root.appendChild(gridEl);
+    }
 
     const alloc = computeAllocation();
     // Real branch: only the backend's own reported overshoot (via the
     // `bandwidth-overshoot` event) drives the banner. Mock branch: the local
     // toy allocator above.
     const overshootKbps = window.__TAURI__ ? realOvershootKbps || 0 : alloc.overshootKbps;
-    if (bandwidth.bandwidth_mode === "absolute" && overshootKbps > 0) {
-      grid.appendChild(
-        warningBanner(
-          window.__TAURI__
-            ? `Over budget by ${overshootKbps} kbps: the guaranteed floors don't fit the maximum. No stream is starved below its floor.`
-            : `Over budget by ${overshootKbps} kbps: the guaranteed floors need ${
-                bandwidth.destination_floor_kbps * alloc.n
-              } kbps but the maximum is ${bandwidth.absolute_total_kbps} kbps. No stream is starved below its floor.`
-        )
-      );
-    }
+    const showBanner = bandwidth.bandwidth_mode === "absolute" && overshootKbps > 0;
+    const bannerText = showBanner
+      ? window.__TAURI__
+        ? `Over budget by ${overshootKbps} kbps: the guaranteed floors don't fit the maximum. No stream is starved below its floor.`
+        : `Over budget by ${overshootKbps} kbps: the guaranteed floors need ${
+            bandwidth.destination_floor_kbps * alloc.n
+          } kbps but the maximum is ${bandwidth.absolute_total_kbps} kbps. No stream is starved below its floor.`
+      : null;
 
-    grid.appendChild(renderActiveSharesCard(alloc));
-    grid.appendChild(renderStartStreamCard());
-    grid.appendChild(renderRoomScopedRow());
-
-    root.appendChild(grid);
+    syncChildren(gridEl, [
+      updateBandwidthCard(),
+      bannerText ? updateOvershootBanner(bannerText) : null,
+      updateActiveSharesCard(alloc),
+      updateStartStreamCard(),
+      updateRoomScopedRow(),
+    ]);
   }
 
   // ---------------------------------------------------------------------
   // Bandwidth card
   // ---------------------------------------------------------------------
 
-  function renderBandwidthCard() {
+  function updateBandwidthCard() {
+    const liveCount = mockDestinations.filter((d) => d.kind !== "audio").length;
+    const roomsFed = new Set(mockDestinations.map((d) => d.room_handle)).size;
+    const sig = JSON.stringify({ bandwidth, liveCount, roomsFed });
+    if (bandwidthCardEl && bandwidthCardSig === sig) return bandwidthCardEl;
+    bandwidthCardSig = sig;
+    bandwidthCardEl = renderBandwidthCard(liveCount, roomsFed);
+    return bandwidthCardEl;
+  }
+
+  function updateOvershootBanner(text) {
+    if (overshootBannerEl && overshootBannerSig === text) return overshootBannerEl;
+    overshootBannerSig = text;
+    overshootBannerEl = warningBanner(text);
+    return overshootBannerEl;
+  }
+
+  function renderBandwidthCard(liveCount, roomsFed) {
     const top = el("div", { className: "sc-bandwidth-top" });
     top.appendChild(bandwidthModeToggle(bandwidth.bandwidth_mode, (mode) => setBandwidthMode(mode)));
 
-    const liveCount = mockDestinations.filter((d) => d.kind !== "audio").length;
-    const roomsFed = new Set(mockDestinations.map((d) => d.room_handle)).size;
     const summaryParts = [`${liveCount} destination${liveCount === 1 ? "" : "s"}`];
     if (roomsFed > 1) summaryParts.push(`streaming to ${roomsFed} rooms — about ${roomsFed}x the outgoing bandwidth of one stream`);
     top.appendChild(el("span", { className: "sc-bandwidth-summary", text: summaryParts.join(" · ") }));
@@ -455,23 +513,47 @@
   }
 
   // ---------------------------------------------------------------------
-  // Active shares card
+  // Active shares card — keyed per-destination reconciliation: a
+  // destination's card DOM node (Stop button included) is only rebuilt when
+  // its own signature changes, and is *moved* rather than recreated when
+  // only its position in the list needs to shift.
   // ---------------------------------------------------------------------
 
-  function renderActiveSharesCard(alloc) {
-    let body;
+  function updateActiveSharesCard(alloc) {
     if (mockDestinations.length === 0) {
-      body = renderEmptyState("No active shares — start one below.", null, null);
-    } else {
-      const gridEl = el("div", { className: "sc-active-shares-grid" });
-      mockDestinations.forEach((dest) => {
-        const roomsAlreadyFedByCapture = mockDestinations.filter((d) => d.capture_id === dest.capture_id).map((d) => d.room_handle);
-        const withShare =
-          bandwidth.bandwidth_mode === "absolute" && dest.kind !== "audio" && dest.state !== "starting"
-            ? Object.assign({}, dest, { computedShareKbps: alloc.share })
-            : dest;
-        gridEl.appendChild(
-          destinationCard(
+      destCardEls.clear();
+      if (!activeSharesCardEl || activeSharesBodySig !== "empty") {
+        activeSharesCardEl = card("ACTIVE SHARES", [renderEmptyState("No active shares — start one below.", null, null)], {
+          className: "sc-active-shares-card",
+        });
+        activeSharesBodySig = "empty";
+        activeSharesGridEl = null;
+      }
+      return activeSharesCardEl;
+    }
+
+    if (!activeSharesCardEl || activeSharesBodySig === "empty") {
+      activeSharesCardEl = card("ACTIVE SHARES", [], { className: "sc-active-shares-card" });
+      activeSharesGridEl = el("div", { className: "sc-active-shares-grid" });
+      activeSharesCardEl.appendChild(activeSharesGridEl);
+    }
+    activeSharesBodySig = "list";
+
+    const seenIds = new Set();
+    const orderedCardEls = mockDestinations.map((dest) => {
+      seenIds.add(dest.destination_id);
+      const roomsAlreadyFedByCapture = mockDestinations.filter((d) => d.capture_id === dest.capture_id).map((d) => d.room_handle);
+      const withShare =
+        bandwidth.bandwidth_mode === "absolute" && dest.kind !== "audio" && dest.state !== "starting"
+          ? Object.assign({}, dest, { computedShareKbps: alloc.share })
+          : dest;
+      const perStreamBitrateEditable = bandwidth.bandwidth_mode === "per_stream" && dest.kind !== "audio";
+      const sig = JSON.stringify({ withShare, perStreamBitrateEditable, roomOptions: mockJoinedRooms, roomsAlreadyFedByCapture });
+
+      let entry = destCardEls.get(dest.destination_id);
+      if (!entry || entry.sig !== sig) {
+        entry = {
+          el: destinationCard(
             withShare,
             {
               onEditApply: (id, patch) => applyDestinationEdit(id, patch),
@@ -479,17 +561,21 @@
               onFanout: (captureId, targetRoomHandle) => fanoutDestination(captureId, targetRoomHandle),
               onStop: (id) => stopDestination(id),
             },
-            {
-              roomOptions: mockJoinedRooms,
-              perStreamBitrateEditable: bandwidth.bandwidth_mode === "per_stream" && dest.kind !== "audio",
-              roomsAlreadyFedByCapture,
-            }
-          )
-        );
-      });
-      body = gridEl;
+            { roomOptions: mockJoinedRooms, perStreamBitrateEditable, roomsAlreadyFedByCapture }
+          ),
+          sig,
+        };
+        destCardEls.set(dest.destination_id, entry);
+      }
+      return entry.el;
+    });
+
+    for (const id of Array.from(destCardEls.keys())) {
+      if (!seenIds.has(id)) destCardEls.delete(id);
     }
-    return card("ACTIVE SHARES", [body], { className: "sc-active-shares-card" });
+
+    syncChildren(activeSharesGridEl, orderedCardEls);
+    return activeSharesCardEl;
   }
 
   function mockTransfer(sourceId, targetRoomHandle) {
@@ -541,6 +627,20 @@
   // ---------------------------------------------------------------------
   // Start a stream card
   // ---------------------------------------------------------------------
+
+  function updateStartStreamCard() {
+    const sig = JSON.stringify({
+      mockJoinedRooms,
+      bandwidthMode: bandwidth.bandwidth_mode,
+      startForm: state.startForm,
+      startInFlight: state.startInFlight,
+      startError: state.startError,
+    });
+    if (startCardEl && startCardSig === sig) return startCardEl;
+    startCardSig = sig;
+    startCardEl = renderStartStreamCard();
+    return startCardEl;
+  }
 
   function renderStartStreamCard() {
     const form = el("div", { className: "sc-start-form" });
@@ -631,6 +731,22 @@
   // ---------------------------------------------------------------------
   // Room-scoped row: Members/rename + Share audio.
   // ---------------------------------------------------------------------
+
+  function updateRoomScopedRow() {
+    const sig = JSON.stringify({
+      mockJoinedRooms,
+      scopedRoomHandle: state.scopedRoomHandle,
+      roomName: state.roomName,
+      savedHint: state.savedHint,
+      members: mockMembersByRoom[state.scopedRoomHandle],
+      mockAudioSources,
+      audioSourceId: state.audioSource.id,
+    });
+    if (roomScopedEl && roomScopedSig === sig) return roomScopedEl;
+    roomScopedSig = sig;
+    roomScopedEl = renderRoomScopedRow();
+    return roomScopedEl;
+  }
 
   function renderRoomScopedRow() {
     const header = el("div", { className: "sc-room-scoped-header" });
