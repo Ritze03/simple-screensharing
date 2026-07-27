@@ -33,21 +33,25 @@
     return Object.assign({}, MOCK_SETTINGS);
   }
 
+  // Both setters update local `state` on *both* branches (not just the mock
+  // one) so the row reflects the new value immediately after a successful
+  // invoke, rather than only after some later full refetch — see
+  // `stream-control.js`'s `setBandwidthMode` for the same fix and the fuller
+  // "Why" (found via the identical symptom: a toggle that visually never
+  // moved after a real, successfully-applied click).
   async function setLanguage(language) {
     if (window.__TAURI__) {
       await window.__TAURI__.core.invoke("set_language", { language });
-    } else {
-      state.language = language;
     }
+    state.language = language;
     render();
   }
 
   async function setPresentationMode(mode) {
     if (window.__TAURI__) {
       await window.__TAURI__.core.invoke("set_presentation_mode", { mode });
-    } else {
-      state.presentation_mode = mode;
     }
+    state.presentation_mode = mode;
     render();
   }
 

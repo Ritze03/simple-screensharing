@@ -164,23 +164,40 @@
     // per character), so the same text on one line squeezed the room name
     // down to nothing at the sidebar's width. Two lines is a deliberate,
     // documented deviation from the mock, not a missed detail.
+    //
+    // For "disconnected" rows specifically, the Reconnect pill + forget
+    // button are *also* left off this head line (moved into the sub-meta
+    // line below instead of appended to `trailing` here): the auto-generated
+    // fallback room name (`Room <hex prefix>`, APP-SHELL.md's "Auto-generated
+    // saved-room names") is exactly the one case where a room can't be told
+    // apart from another without its full name, and at the sidebar's width a
+    // name that long plus a Reconnect pill plus the forget icon left no room
+    // for the name at all — it ellipsized down to an unreadable "Room
+    // 01130…", losing the one distinguishing suffix. Every other row shape
+    // (joined, reconnecting) keeps its trailing content on the head line as
+    // before; only disconnected rows needed the extra line, since only they
+    // pair a Reconnect pill with a name that's allowed to be this long.
     const trailing = el("div", { className: "room-row-trailing" });
     if (room.state === "joined") {
       trailing.appendChild(el("span", { className: "room-meta", text: room.active_stream_count + " active" }));
       trailing.appendChild(iconButton("close", () => handlers.onLeave && handlers.onLeave(room.join_string), { title: "Leave room" }));
+      head.appendChild(trailing);
     } else if (room.state === "reconnecting") {
       // Per APP-SHELL.md's row-state table, "Reconnecting" has no body text
       // at all (—) — the pulsing dot alone carries the state.
       trailing.appendChild(secondaryButton("Reconnect", () => {}, { disabled: true, className: "room-reconnect-btn" }));
-    } else {
-      trailing.appendChild(secondaryButton("Reconnect", () => handlers.onReconnect && handlers.onReconnect(room.join_string), { className: "room-reconnect-btn" }));
-      trailing.appendChild(iconButton("close", () => handlers.onLeave && handlers.onLeave(room.join_string), { title: "Forget room" }));
+      head.appendChild(trailing);
     }
-    head.appendChild(trailing);
     row.appendChild(head);
 
     if (room.state === "disconnected") {
-      row.appendChild(el("div", { className: "room-sub-meta", text: "not connected" }));
+      const subMeta = el("div", { className: "room-sub-meta room-sub-meta-disconnected" });
+      subMeta.appendChild(el("span", { className: "room-sub-meta-text", text: "not connected" }));
+      const actions = el("div", { className: "room-row-trailing" });
+      actions.appendChild(secondaryButton("Reconnect", () => handlers.onReconnect && handlers.onReconnect(room.join_string), { className: "room-reconnect-btn" }));
+      actions.appendChild(iconButton("close", () => handlers.onLeave && handlers.onLeave(room.join_string), { title: "Forget room" }));
+      subMeta.appendChild(actions);
+      row.appendChild(subMeta);
     }
 
     if (room.state === "joined" && expanded) {

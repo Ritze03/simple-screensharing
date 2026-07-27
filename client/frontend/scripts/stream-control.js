@@ -222,30 +222,41 @@
     return Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms))]);
   }
 
+  // Every setter below updates the local `bandwidth` object on *both*
+  // branches, not just the mock one. `updateBandwidthCard()`'s reconciliation
+  // skips rebuilding the card when `JSON.stringify({ bandwidth, ... })`
+  // matches its last-rendered signature — correct for events that don't
+  // touch bandwidth, but if the real branch left `bandwidth` untouched after
+  // a *successful* invoke, the post-invoke `render()` call below computes
+  // the exact same signature as before the click and the toggle/sliders
+  // visually never move, even though the backend's mode did change (only
+  // fixed once some unrelated event happens to trigger a full `init()`
+  // refetch — confirmed by relaunching the app and seeing the real,
+  // persisted mode was correct all along). Setting the field directly here
+  // (mirroring what the mock branch already did) keeps the two branches'
+  // observable behavior identical, same as every other real/mock pair in
+  // this file.
   async function setBandwidthMode(mode) {
     if (window.__TAURI__) {
       await window.__TAURI__.core.invoke("set_bandwidth_mode", { mode });
-    } else {
-      bandwidth.bandwidth_mode = mode;
     }
+    bandwidth.bandwidth_mode = mode;
     render();
   }
 
   async function setAbsoluteTotal(kbps) {
     if (window.__TAURI__) {
       await window.__TAURI__.core.invoke("set_bandwidth_total", { totalKbps: kbps });
-    } else {
-      bandwidth.absolute_total_kbps = kbps;
     }
+    bandwidth.absolute_total_kbps = kbps;
     render();
   }
 
   async function setAbsoluteFloor(kbps) {
     if (window.__TAURI__) {
       await window.__TAURI__.core.invoke("set_bandwidth_floor", { floorKbps: kbps });
-    } else {
-      bandwidth.destination_floor_kbps = kbps;
     }
+    bandwidth.destination_floor_kbps = kbps;
     render();
   }
 
@@ -333,9 +344,14 @@
     if (window.__TAURI__) {
       await window.__TAURI__.core.invoke("rename_room", { joinString, newName: name });
       if (window.Shell) window.Shell.refreshRooms();
-    } else {
-      state.roomName = name;
     }
+    // Same fix as `setBandwidthMode`/`setLanguage` etc.: update the local
+    // value on both branches, not just the mock one — `updateRoomScopedRow`'s
+    // reconciliation signature includes `state.roomName`, and without this
+    // the Room name field would snap back to the pre-rename value (rebuilt
+    // fresh from the still-stale `state.roomName`) right as "Saved." appears,
+    // even though the rename itself succeeded on the backend.
+    state.roomName = name;
     state.savedHint = true;
     render();
   }

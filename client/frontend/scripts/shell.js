@@ -445,6 +445,17 @@
 
   async function refreshRooms() {
     mockRooms = await fetchRooms();
+    // `list_saved_rooms`/`fetchRooms()` returns bare `SavedRoomRow`s with no
+    // roster (see `loadRoomMembers`'s own doc comment) — every already-
+    // expanded room's `.members` from the previous render is gone from these
+    // fresh objects. Without this, any event that calls `refreshRooms()`
+    // (this fires on `presence-updated`, i.e. routinely) would blank an
+    // expanded room's member list back to "No other members yet." even
+    // though the roster hasn't actually changed. Re-fetch it for exactly the
+    // rooms currently expanded so the visible roster survives the refresh.
+    await Promise.all(
+      mockRooms.filter((r) => state.expandedRoomIds.has(r.join_string) && r.state === "joined").map((r) => loadRoomMembers(r))
+    );
     renderRooms();
   }
 
