@@ -101,6 +101,30 @@ pub fn rename_room(managed: State<'_, Managed>, join_string: String, new_name: S
     }
 }
 
+/// Forget a saved room: drop its `RoomStore` entry and persist the removal
+/// immediately, so it doesn't reappear the next time the saved-rooms list is
+/// reloaded from disk (e.g. the next `list_saved_rooms` call, or an app
+/// restart). Keyed by `join_string` rather than a room handle since "forget"
+/// only applies to a saved, disconnected row (`APP-SHELL.md`'s row-state
+/// table), which has no handle at all — mirrors `rename_room`'s lookup.
+pub fn forget_room_impl(state: &mut AppState, join_string: String) -> Result<(), String> {
+    if let Some(name) = state.room_store.name_for(&join_string).map(str::to_string) {
+        state.room_store.remove(&name);
+    }
+    if let Err(e) = state.room_store.save() {
+        state.room_store_error = Some(e.to_string());
+    }
+    match &state.room_store_error {
+        Some(e) => Err(e.clone()),
+        None => Ok(()),
+    }
+}
+
+#[tauri::command]
+pub fn forget_room(managed: State<'_, Managed>, join_string: String) -> Result<(), String> {
+    forget_room_impl(&mut managed.state.lock().unwrap(), join_string)
+}
+
 #[tauri::command]
 pub fn select_active_room(managed: State<'_, Managed>, room_handle: u32) {
     let mut state = managed.state.lock().unwrap();
@@ -426,6 +450,38 @@ mod tests {
         let result = join_room_impl(&mut state, "not-a-valid-join-string".to_string(), String::new());
         assert!(result.is_ok(), "start_connect itself only fails on a dead local endpoint: {result:?}");
         assert!(state.pending_connect.is_some());
+    }
+
+    /// Reproduces the reported bug end-to-end at the command layer: a saved,
+    /// disconnected room's `forget_room` call must remove it from the
+    /// on-disk `RoomStore` file immediately, not just from in-memory state,
+    /// so a later `RoomStore::load()` (e.g. triggered by joining another
+    /// room) doesn't resurrect it.
+    #[test]
+    fn forget_room_persists_the_removal_to_disk() {
+        let _guard = isolated_config_home();
+        let mut store = RoomStore::default();
+        store.upsert("Movie Night".to_string(), "server|00112233|deadbeef".to_string());
+        store.upsert("Gaming Night".to_string(), "server|44556677|c0ffee".to_string());
+        store.save().expect("save room store");
+
+        let mut state = AppState::default();
+        assert_eq!(state.room_store.rooms.len(), 2);
+
+        let result = forget_room_impl(&mut state, "server|00112233|deadbeef".to_string());
+        assert!(result.is_ok(), "forget_room should succeed: {result:?}");
+
+        // In-memory view no longer has it...
+        assert_eq!(state.room_store.rooms.len(), 1);
+        assert_eq!(state.room_store.rooms[0].name, "Gaming Night");
+
+        // ...and, crucially, neither does a fresh load from disk — this is
+        // exactly what the bug report described: the room reappearing once
+        // another action (e.g. joining a different room) reloads/reconciles
+        // from the on-disk file.
+        let reloaded = RoomStore::load().expect("reload room store from disk");
+        assert_eq!(reloaded.rooms.len(), 1, "deletion must be persisted to disk immediately");
+        assert_eq!(reloaded.rooms[0].name, "Gaming Night");
     }
 
     #[test]
