@@ -99,10 +99,17 @@
   const MOCK_BANDWIDTH = { bandwidth_mode: "absolute", absolute_total_kbps: 8000, destination_floor_kbps: 3000 };
 
   const MOCK_MEMBERS_BY_ROOM = {
-    // Kept within `Number.MAX_SAFE_INTEGER` — a real `conn_id` is a `u64` and
-    // can exceed that, which is a wire-format limitation of JSON numbers
-    // shared by every u64 field this frontend receives, not something fixable
-    // here; these mock values are just picked to render exactly.
+    // Kept within `Number.MAX_SAFE_INTEGER` for readability — plain JS
+    // numbers here, unlike the real (Tauri) path. `conn_id`/`owner` used to
+    // be a genuine wire-format limitation ("a real `conn_id` is a `u64` and
+    // can exceed that... not something fixable here"): every u64 crossing
+    // the JSON boundary as a bare number silently loses precision above
+    // 2^53. That's now fixed on the real path — `dto::hex_u64` (Tauri side)
+    // sends `conn_id`/`owner` as lowercase-hex strings instead, see its doc
+    // comment for the real bug this caused (a watched stream's decoder never
+    // receiving frames). The mock branch never crosses that boundary at all,
+    // so it's left as plain numbers here — simpler for these hand-picked
+    // demo values, and there's nothing real to lose precision on.
     1: [{ conn_id: 0x7b29f8d3cc00, display_name: "Ana", resolution: "1920x1080", fps: null }],
     2: [],
     5: [{ conn_id: 0xa1029f8d3c00, display_name: "Priya", resolution: "1280x720", fps: null }],
@@ -799,6 +806,12 @@
       members.forEach((m) => {
         const row = el("div", { className: "sc-member-row" });
         row.appendChild(el("span", { text: m.display_name }));
+        // `m.conn_id` is a real (Tauri) `ConnId`: already a lowercase-hex
+        // string (see `dto::hex_u64`'s doc comment — a bare `u64` loses
+        // precision over JSON) — `.toString(16)` is then a no-op identity
+        // call (`String.prototype.toString` ignores its radix argument), so
+        // this line still works unchanged for the mock branch's plain-number
+        // `conn_id` values too, no branching needed.
         row.appendChild(el("span", { className: "sc-member-row-conn", text: "conn_id " + m.conn_id.toString(16).padStart(16, "0") }));
         body.push(row);
       });

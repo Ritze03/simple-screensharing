@@ -281,33 +281,72 @@ pub fn set_bandwidth_floor(managed: State<'_, Managed>, floor_kbps: u32) {
 
 // See `join_room`'s `Why:` note above — `RoomSession::toggle_watch` spawns
 // (subscribe/unsubscribe control messages).
+//
+// Also starts/stops this stream's real video-frame delivery
+// (`video_server.rs`) in lockstep with the watch itself: `RoomSession::
+// toggle_watch` inserts (or removes) a `WatchEntry` synchronously before
+// returning, so right after it runs, `room.watches` having an entry for this
+// key *is* "we just started watching" and not having one *is* "we just
+// stopped" — no separate state to keep in sync. Returns the MJPEG URL
+// `view.js` should point an `<img>` at when a watch just started, or `None`
+// when it just stopped (or the room doesn't exist).
+//
+// `owner` is a hex string, not `u64` — see `dto::hex_u64`'s doc comment for
+// why a bare `u64` command parameter is exactly the bug that made the first
+// end-to-end test of this command produce a decoder that never saw a frame.
 #[tauri::command]
-pub fn toggle_watch(managed: State<'_, Managed>, room_handle: u32, owner: u64, stream_id: u8) {
-    tauri::async_runtime::block_on(async {
-        if let Some(room) = managed.state.lock().unwrap().rooms.get_mut(&RoomHandle(room_handle)) {
+pub fn toggle_watch(managed: State<'_, Managed>, room_handle: u32, owner: String, stream_id: u8) -> Result<Option<String>, String> {
+    let owner = dto::parse_owner(&owner)?;
+    Ok(tauri::async_runtime::block_on(async {
+        let decoder = {
+            let mut state = managed.state.lock().unwrap();
+            let room = state.rooms.get_mut(&RoomHandle(room_handle))?;
             room.toggle_watch(owner, stream_id);
+            room.watches.lock().unwrap().get(&(owner, stream_id)).map(|w| w.decoder.clone())
+        };
+        let key = (room_handle, owner, stream_id);
+        match decoder {
+            Some(decoder) => Some(managed.video_server.start_route(key, decoder)),
+            None => {
+                managed.video_server.stop_route(key);
+                None
+            }
         }
-    });
+    }))
+}
+
+/// Look up the MJPEG URL for a stream that's already being watched (or
+/// `None` if it isn't) — lets `view.js` rebuild its whole tile list (e.g. on
+/// tab reload) without needing to have been the caller that started the
+/// watch; see `toggle_watch`'s doc comment for the immediate-feedback path.
+#[tauri::command]
+pub fn stream_video_url(managed: State<'_, Managed>, room_handle: u32, owner: String, stream_id: u8) -> Result<Option<String>, String> {
+    let owner = dto::parse_owner(&owner)?;
+    Ok(managed.video_server.url_for((room_handle, owner, stream_id)))
 }
 
 // See `join_room`'s `Why:` note above — `RoomSession::toggle_listen` spawns.
 #[tauri::command]
-pub fn toggle_listen(managed: State<'_, Managed>, room_handle: u32, owner: u64, stream_id: u8) {
+pub fn toggle_listen(managed: State<'_, Managed>, room_handle: u32, owner: String, stream_id: u8) -> Result<(), String> {
+    let owner = dto::parse_owner(&owner)?;
     tauri::async_runtime::block_on(async {
         if let Some(room) = managed.state.lock().unwrap().rooms.get_mut(&RoomHandle(room_handle)) {
             room.toggle_listen(owner, stream_id);
         }
     });
+    Ok(())
 }
 
 #[tauri::command]
-pub fn set_volume(managed: State<'_, Managed>, room_handle: u32, owner: u64, stream_id: u8, volume_percent: u32) {
+pub fn set_volume(managed: State<'_, Managed>, room_handle: u32, owner: String, stream_id: u8, volume_percent: u32) -> Result<(), String> {
+    let owner = dto::parse_owner(&owner)?;
     if let Some(room) = managed.state.lock().unwrap().rooms.get_mut(&RoomHandle(room_handle))
         && let Some(watch) = room.audio_watches.lock().unwrap().get_mut(&(owner, stream_id))
     {
         watch.volume_percent = volume_percent;
         watch.decoder.set_volume(volume_percent as f64 / 100.0);
     }
+    Ok(())
 }
 
 /// Opens a real second OS window showing just one stream — the Tauri
@@ -318,7 +357,8 @@ pub fn set_volume(managed: State<'_, Managed>, room_handle: u32, owner: u64, str
 /// proves the window-opening mechanism — the popout page's real content is
 /// the frontend worker's job.
 #[tauri::command]
-pub fn pop_out_stream(app: tauri::AppHandle, room_handle: u32, owner: u64, stream_id: u8) -> Result<(), String> {
+pub fn pop_out_stream(app: tauri::AppHandle, room_handle: u32, owner: String, stream_id: u8) -> Result<(), String> {
+    let owner = dto::parse_owner(&owner)?;
     let label = format!("popout-{room_handle}-{owner:016x}-{stream_id}");
     let url = format!("index.html?popout=1&room={room_handle}&owner={owner:016x}&stream={stream_id}");
     if let Some(existing) = app.get_webview_window(&label) {
