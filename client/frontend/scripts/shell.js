@@ -264,6 +264,14 @@
       await refreshRooms();
       return;
     }
+    if (window.__TAURI__ && room && room.room_handle == null) {
+      // Disconnected (saved but not joined) row — the ✕ here is "forget",
+      // not "leave": there's no live room_handle to leave, so persist the
+      // removal via `forget_room` instead.
+      await window.__TAURI__.core.invoke("forget_room", { joinString: room.join_string });
+      await refreshRooms();
+      return;
+    }
     mockRooms = mockRooms.filter((r) => r.join_string !== joinString);
     renderRooms();
   }
