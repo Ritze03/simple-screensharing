@@ -131,7 +131,7 @@
    *   'joined'|'disconnected'|'reconnecting', room_handle, active_stream_count },
    *   plus a frontend-only `members` array (fetched separately via `room_detail` —
    *   no single DTO inlines both): [{conn_id, display_name, owner, stream_id,
-   *   resolution, fps, watching}].
+   *   resolution, watching}].
    * @param {object} handlers - { expanded, onToggleExpand, onReconnect, onLeave, onWatch }
    */
   function renderRoomRow(room, handlers) {
@@ -208,7 +208,7 @@
         memberRow.appendChild(
           el("span", {
             className: "room-member-caps",
-            text: m.resolution ? `${m.resolution}@${m.fps || "—"}` : "",
+            text: m.resolution || "",
           })
         );
         memberRow.appendChild(

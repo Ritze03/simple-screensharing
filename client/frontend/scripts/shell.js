@@ -47,7 +47,7 @@
       state: "joined",
       room_handle: 1,
       active_stream_count: 1,
-      members: [{ conn_id: 1, display_name: "Ana", owner: 1, stream_id: 0, resolution: "1920x1080", fps: null, watching: false }],
+      members: [{ conn_id: 1, display_name: "Ana", owner: 1, stream_id: 0, resolution: "1920x1080", watching: false }],
     },
     {
       join_string: "server|22222222|gaming-night-key",
@@ -131,7 +131,6 @@
         owner: m.conn_id,
         stream_id: videoStream ? videoStream.stream_id : 0,
         resolution: videoStream ? `${videoStream.width}x${videoStream.height}` : null,
-        fps: null,
         watching: videoStream ? watchedOwners.has(`${videoStream.owner}:${videoStream.stream_id}`) : false,
       };
     });
