@@ -119,8 +119,36 @@ function waitForServer(timeoutMs = 5000, intervalMs = 200) {
 // Command bridge: POST /command/<name>
 // ---------------------------------------------------------------------
 
+// Real Tauri's `invoke()` accepts JS-conventional camelCase argument keys
+// (e.g. `{ roomHandle: 3 }`) and auto-converts them to the Rust command's
+// snake_case parameter names before dispatch — every call site across
+// `frontend/scripts/*.js` (shell.js, view.js, stream-control.js, settings.js)
+// was written against that convention. `api_server.rs`'s `dispatch()` has no
+// such leniency: it looks up each argument by the Rust parameter name
+// exactly (see its module doc), so a raw passthrough of camelCase keys here
+// mismatches on every command that takes arguments. This replicates Tauri's
+// side of that contract so the frontend needs no changes — e.g.
+// `POST /command/room_detail` was arriving with a *missing* `room_handle`
+// key (sent as `roomHandle`), which reached `src-tauri`'s `get_u32` and
+// failed with "missing or invalid u32 field `room_handle`" (surfaced by
+// `stream-control.js`'s `init()` calling `room_detail` unconditionally on
+// first load, before its first `render()`, so the whole tab body stayed
+// empty — other tabs happened not to hit this: `view.js` only calls
+// `room_detail` inside a loop over already-joined rooms, empty on first
+// load, and `settings.js` never calls it at all).
+function camelToSnake(key) {
+  return key.replace(/[A-Z]/g, (c) => "_" + c.toLowerCase());
+}
+
+function convertArgKeys(args) {
+  if (!args || typeof args !== "object") return args;
+  const out = {};
+  for (const [k, v] of Object.entries(args)) out[camelToSnake(k)] = v;
+  return out;
+}
+
 function postCommand(name, args) {
-  const body = Buffer.from(JSON.stringify(args || {}), "utf8");
+  const body = Buffer.from(JSON.stringify(convertArgKeys(args) || {}), "utf8");
   return new Promise((resolve, reject) => {
     const req = http.request(
       {

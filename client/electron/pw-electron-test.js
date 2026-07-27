@@ -3,7 +3,7 @@ const { _electron: electron } = require("playwright");
 const path = require("path");
 const fs = require("fs");
 
-const ELECTRON_DIR = "/home/mo/GitHubProjects/simple-screensharing/simple-screensharing-client/.claude/worktrees/agent-a2ca6396068080d2a/electron";
+const ELECTRON_DIR = "/home/mo/GitHubProjects/simple-screensharing/simple-screensharing-client/.claude/worktrees/agent-a4709e6b96ed2347a/electron";
 const SCREENSHOT_DIR = __dirname;
 
 const consoleLog = [];
