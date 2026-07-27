@@ -577,6 +577,10 @@ mod tests {
         state.poll_audio_sources();
         state.drain_events(&managed.egui_ctx);
         let _ = managed.egui_ctx.tex_manager().write().take_delta();
+        // See `driver::tick`'s step 3.5 — this mock harness needs the same
+        // stale-watch/route pruning the real driver loop does, or a test
+        // exercising a watched stream that stops would never see it.
+        crate::driver::prune_stale_watches(&state, managed);
         state.apply_bandwidth_allocation();
     }
 

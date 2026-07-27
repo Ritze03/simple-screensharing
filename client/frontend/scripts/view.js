@@ -343,6 +343,15 @@
         if (!detail) continue;
         for (const key of detail.watched) {
           const streamInfo = detail.streams.find((s) => s.owner === key.owner && s.stream_id === key.stream_id);
+          // `detail.watched` and `detail.streams` are pruned independently
+          // server-side (see `src-tauri/src/driver.rs`'s "3.5. Prune
+          // watches..." step) — that prune runs on the same ~250ms tick as
+          // the `presence-updated` this file's `refresh()` reacts to, so in
+          // practice `watched` never outlives `streams` by more than one
+          // tick, but a defensive skip here means this tab never renders a
+          // tile for a stream that's already known to be gone, even in that
+          // brief window, rather than trusting the backend prune alone.
+          if (!streamInfo) continue;
           const member = detail.members.find((m) => m.conn_id === key.owner);
           const videoUrl = await window.__TAURI__.core.invoke("stream_video_url", {
             roomHandle: room.room_handle,
