@@ -484,8 +484,25 @@
     if (!window.__TAURI__) return;
     const { listen } = window.__TAURI__.event;
 
-    listen("room-connected", () => refreshAll());
-    listen("room-disconnected", () => refreshAll());
+    listen("room-connected", () => {
+      refreshAll();
+      // Without this, a room that finishes joining/reconnecting while the
+      // user is already on the Stream Control tab never appears in its
+      // "START A STREAM" room dropdown (stream-control.js's own
+      // `mockJoinedRooms` cache stays stale) until some unrelated event
+      // (`presence-updated`/`destination-state-changed`) happens to fire —
+      // which for a lone joiner in an otherwise-empty room may never
+      // happen. Root cause of "I can't select a room to stream in".
+      if (window.StreamControl) window.StreamControl.refresh();
+      if (window.ViewTab) window.ViewTab.refresh();
+    });
+    listen("room-disconnected", () => {
+      refreshAll();
+      // See `room-connected` above — a disconnected room must drop out of
+      // the same dropdown/cards just as promptly.
+      if (window.StreamControl) window.StreamControl.refresh();
+      if (window.ViewTab) window.ViewTab.refresh();
+    });
     listen("room-connect-failed", (event) => {
       console.error("room-connect-failed", event.payload);
       refreshRooms();
