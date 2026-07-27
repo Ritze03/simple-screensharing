@@ -6,8 +6,12 @@
 //      all the existing capture/network logic; its own Tauri window is
 //      hidden via `"visible": false` in `src-tauri/tauri.conf.json`, so it
 //      never shows its own UI — Electron is the only visible window).
-//   2. Capture the `API_TOKEN=<hex>` line the sidecar prints on stdout once,
-//      before it starts accepting connections.
+//   2. Capture the `API_TOKEN=<hex>` and `API_PORT=<port>` lines the sidecar
+//      prints on stdout once, before it starts accepting connections. The
+//      port is ephemeral (OS-assigned) so multiple sidecar instances can run
+//      side by side without a bind conflict; the sidecar binary itself can
+//      be overridden via the `SIDECAR_BIN` env var (full path), e.g. to
+//      point at a `--release` build instead of the debug default.
 //   3. Poll the server's TCP port until it actually accepts connections
 //      (the token being printed doesn't guarantee the listener is bound).
 //   4. Create the BrowserWindow (secure defaults, preload script) pointing
@@ -27,13 +31,17 @@ const http = require("http");
 const net = require("net");
 const readline = require("readline");
 
-const API_PORT = 47823;
 const API_HOST = "127.0.0.1";
 
-const SIDECAR_PATH = path.join(__dirname, "..", "target", "debug", "simple-screensharing-client-tauri");
+// SIDECAR_BIN: optional full path to the sidecar binary to spawn, overriding
+// the default debug-build path below. Lets a caller (e.g. a dev script that
+// wants representative capture/encode/decode performance) point Electron at
+// a `--release` build without any code change.
+const SIDECAR_PATH = process.env.SIDECAR_BIN || path.join(__dirname, "..", "target", "debug", "simple-screensharing-client-tauri");
 const FRONTEND_INDEX = path.join(__dirname, "..", "frontend", "index.html");
 
 let apiToken = null;
+let apiPort = null;
 let mainWindow = null;
 let sidecarProcess = null;
 let sseAbort = false;
@@ -65,8 +73,8 @@ function spawnSidecar() {
 
     sidecarProcess.on("exit", (code, signal) => {
       console.error(`[sidecar] exited (code=${code}, signal=${signal})`);
-      if (!apiToken) {
-        reject(new Error("sidecar exited before printing API_TOKEN"));
+      if (!apiToken || !apiPort) {
+        reject(new Error("sidecar exited before printing API_TOKEN/API_PORT"));
       }
     });
 
@@ -74,17 +82,22 @@ function spawnSidecar() {
     const errRl = readline.createInterface({ input: sidecarProcess.stderr });
     errRl.on("line", (line) => console.error(`[sidecar] ${line}`));
 
-    // Line-buffer stdout: watch for API_TOKEN=... once, then keep forwarding
-    // every subsequent line to our own console too.
+    // Line-buffer stdout: watch for API_TOKEN=... and API_PORT=... (order
+    // between them doesn't matter), then keep forwarding every subsequent
+    // line to our own console too. Resolve once both have been captured.
     const outRl = readline.createInterface({ input: sidecarProcess.stdout });
     outRl.on("line", (line) => {
       console.log(`[sidecar] ${line}`);
       if (!apiToken) {
         const m = line.match(/^API_TOKEN=([0-9a-f]{64})$/);
-        if (m) {
-          apiToken = m[1];
-          resolve(apiToken);
-        }
+        if (m) apiToken = m[1];
+      }
+      if (!apiPort) {
+        const m = line.match(/^API_PORT=(\d+)$/);
+        if (m) apiPort = Number(m[1]);
+      }
+      if (apiToken && apiPort) {
+        resolve();
       }
     });
   });
@@ -98,7 +111,7 @@ function waitForServer(timeoutMs = 5000, intervalMs = 200) {
   const deadline = Date.now() + timeoutMs;
   return new Promise((resolve, reject) => {
     function attempt() {
-      const socket = net.connect({ host: API_HOST, port: API_PORT }, () => {
+      const socket = net.connect({ host: API_HOST, port: apiPort }, () => {
         socket.end();
         resolve();
       });
@@ -153,7 +166,7 @@ function postCommand(name, args) {
     const req = http.request(
       {
         host: API_HOST,
-        port: API_PORT,
+        port: apiPort,
         path: `/command/${encodeURIComponent(name)}`,
         method: "POST",
         headers: {
@@ -203,7 +216,7 @@ function connectSse() {
   const req = http.get(
     {
       host: API_HOST,
-      port: API_PORT,
+      port: apiPort,
       path: "/events",
       headers: { Authorization: `Bearer ${apiToken}` },
     },

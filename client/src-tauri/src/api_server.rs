@@ -63,16 +63,16 @@
 //! that's what makes the wildcard `Access-Control-Allow-Origin: *` below
 //! safe, not the loopback bind by itself.
 //!
-//! `Why a fixed port rather than an ephemeral one (video_server.rs's
-//! choice):` `video_server.rs` can afford port-per-process discovery through
-//! its own command responses (`toggle_watch`/`stream_video_url` hand back a
-//! full URL). This server *is* the channel every command response travels
-//! over, so the port has to be knowable *before* the first command call —
-//! there's no command response yet to carry it. A fixed, documented port
-//! is the simplest thing that lets an Electron main process hard-code the
-//! base URL. If this ever needs to run multiple instances side by side, that
-//! tradeoff should be revisited (e.g. print the bound port to stdout for a
-//! parent process to capture) — not needed for this step.
+//! `Why an ephemeral port, matching video_server.rs, rather than the fixed
+//! port this module used to bind:` running two sidecar instances
+//! side by side (e.g. a "share" instance and a "watch" instance launched
+//! together for manual testing) would otherwise have the second instance
+//! fail to bind. Like `video_server.rs`, we bind port 0 and let the OS pick
+//! a free ephemeral port, then announce it on stdout (`API_PORT=<port>`,
+//! printed the same way and at the same time as `API_TOKEN=<hex>`) for the
+//! parent (Electron) process to capture before making its first request —
+//! there's no command response yet to carry it, so stdout is the only
+//! channel available this early.
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Condvar, Mutex, OnceLock};
@@ -86,8 +86,10 @@ use tauri::{AppHandle, Manager};
 use crate::commands;
 use crate::state::Managed;
 
-/// Fixed loopback port this server binds — see module doc's `Why a fixed
-/// port` note.
+/// Fallback/default port, no longer used to bind (see module doc's `Why an
+/// ephemeral port` note) — kept only in case some caller still wants a
+/// documented "typical" value to reference.
+#[allow(dead_code)]
 pub const PORT: u16 = 47823;
 
 /// Shared-secret bearer token, generated once at startup and required on
@@ -226,18 +228,25 @@ pub fn spawn(app: AppHandle) {
     let token = API_TOKEN.get_or_init(generate_token);
     println!("API_TOKEN={token}");
 
+    // Bind an ephemeral port (0 = "OS picks a free one"), same as
+    // `video_server.rs`, so multiple sidecar instances can run side by side
+    // without a bind conflict — see module doc's `Why an ephemeral port`
+    // note. Announce the actual assigned port on stdout, same pattern and
+    // timing as `API_TOKEN=` above, so the Electron parent process can
+    // capture it before making its first request.
+    let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind api_server ephemeral port");
+    let port = listener.local_addr().expect("api_server listener local_addr").port();
+    println!("API_PORT={port}");
+
     std::thread::Builder::new()
         .name("api-server-accept".into())
-        .spawn(move || match TcpListener::bind(("127.0.0.1", PORT)) {
-            Ok(listener) => {
-                tracing::info!("api_server: listening on http://127.0.0.1:{PORT}");
-                for stream in listener.incoming() {
-                    let Ok(stream) = stream else { continue };
-                    let app = app.clone();
-                    std::thread::spawn(move || handle_connection(stream, &app));
-                }
+        .spawn(move || {
+            tracing::info!("api_server: listening on http://127.0.0.1:{port}");
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let app = app.clone();
+                std::thread::spawn(move || handle_connection(stream, &app));
             }
-            Err(e) => tracing::error!("api_server: failed to bind 127.0.0.1:{PORT}: {e:#}"),
         })
         .expect("spawn api-server accept thread");
 }
