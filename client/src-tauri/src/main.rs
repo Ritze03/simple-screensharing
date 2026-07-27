@@ -7,6 +7,7 @@
 //! comment for the full "who drives `AppState`'s polling" design note.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod api_server;
 mod commands;
 mod dto;
 mod driver;
@@ -40,6 +41,17 @@ fn main() {
         .manage(managed)
         .setup(|app| {
             driver::spawn(app.handle().clone());
+            // The Electron-migration REST+SSE transport — see
+            // `api_server.rs`'s module doc. Runs alongside the still-live
+            // Tauri `invoke_handler` command surface below (kept in place for
+            // revertibility — every `#[tauri::command]` fn it registers is
+            // exactly what `api_server.rs` also dispatches into, so both
+            // transports call the same code and share the same `Managed`
+            // state). `driver.rs`'s events, however, now only go out over
+            // this SSE transport: `app_handle.emit()` was replaced with
+            // `EventBus::publish()`, so a Tauri-side event listener no longer
+            // receives them (see `driver.rs`'s edit for this task).
+            api_server::spawn(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

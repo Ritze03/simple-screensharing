@@ -20,6 +20,7 @@ use std::sync::Mutex;
 
 use simple_screensharing_client::session::AppState;
 
+use crate::api_server::EventBus;
 use crate::video_server::VideoServer;
 
 pub struct Managed {
@@ -31,6 +32,10 @@ pub struct Managed {
     /// whole app lifetime; individual streams' routes come and go with
     /// `toggle_watch` (see `commands.rs`).
     pub video_server: VideoServer,
+    /// The Electron-migration event transport — see `api_server.rs`'s module
+    /// doc. `driver.rs` publishes here in place of `app_handle.emit()`;
+    /// `api_server.rs`'s SSE endpoint reads from here.
+    pub events: EventBus,
 }
 
 impl Managed {
@@ -39,6 +44,7 @@ impl Managed {
             state: Mutex::new(AppState::default()),
             egui_ctx: egui::Context::default(),
             video_server: VideoServer::start().expect("bind local video-server listener"),
+            events: EventBus::new(),
         }
     }
 }
