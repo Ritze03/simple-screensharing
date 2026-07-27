@@ -1000,3 +1000,373 @@ async fn real_portal_share_fans_out_and_resumes() {
     let _ = events_a.try_recv();
     let _ = events_v.try_recv();
 }
+
+/// TEMP DIAGNOSTIC (bug investigation): the real-portal counterpart of
+/// `late_subscriber_after_unwatched_period_gets_a_real_keyframe` -- same
+/// scenario (sharer broadcasts to an empty room past one GOP interval, then
+/// a first-ever subscriber joins), but via `capture::start_sharing`'s real
+/// `xdg-desktop-portal` ScreenCast session instead of `videotestsrc`, for
+/// maximum fidelity to the originally reported bug.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "opens a real xdg-desktop-portal screencast session and spawns a real relay server"]
+async fn late_subscriber_after_unwatched_period_gets_a_real_keyframe_real_portal() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    let port = pick_free_udp_port().expect("port");
+    let _server = spawn_relay_server(port).expect("relay");
+    let server_addr = format!("127.0.0.1:{port}");
+    let room_id: RoomId = rand::random();
+    let room_key: [u8; 32] = rand::random();
+    let join_string = crate::net::format_join_string(&server_addr, &room_id, &room_key);
+
+    let (sharer, _s, mut events_a) = connect_with_retry(&join_string, "sharer").await.expect("sharer connects");
+    let (viewer, _s, mut events_b) = connect_with_retry(&join_string, "viewer").await.expect("viewer connects");
+    let owner_conn_id = sharer.conn_id();
+
+    eprintln!("[e2e-late-real] calling capture::start_sharing (real portal)");
+    let capture_handle = match capture::start_sharing(&sharer, VIDEO_STREAM_ID, capture::DestKey(0), 8_000, 30).await {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("skipping: no portal screencast session available here ({e:#})");
+            return;
+        }
+    };
+    eprintln!("[e2e-late-real] share started");
+
+    // Confirm the pipeline is actually healthy before trusting the rest.
+    let mut best = 0;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        best = best.max(capture_handle.encoder_fps(capture::DestKey(0)));
+    }
+    eprintln!("[e2e-late-real] destination 0 encoder fps: {best}");
+    assert!(best > 0, "the real-portal share never encoded a frame");
+
+    let start = std::time::Instant::now();
+
+    async fn forward_one_control_event(
+        events_a: &mut tokio::sync::mpsc::UnboundedReceiver<ClientEvent>,
+        capture_handle: &capture::CaptureHandle,
+        start: std::time::Instant,
+    ) -> bool {
+        match events_a.recv().await {
+            Some(ClientEvent::SubscriberCount { stream_id, count }) if stream_id == VIDEO_STREAM_ID => {
+                eprintln!("[e2e-late-real] t={:?} sharer got SubscriberCount({count})", start.elapsed());
+                capture_handle.notify_subscriber_count(capture::DestKey(0), count);
+                true
+            }
+            Some(ClientEvent::KeyframeRequest { stream_id }) if stream_id == VIDEO_STREAM_ID => {
+                eprintln!("[e2e-late-real] t={:?} sharer got KeyframeRequest", start.elapsed());
+                capture_handle.notify_keyframe_request(capture::DestKey(0));
+                true
+            }
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    let unwatched_secs: u64 = std::env::var("E2E_UNWATCHED_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+    eprintln!("[e2e-late-real] letting the sharer broadcast unwatched for {unwatched_secs}s");
+    let unwatched_deadline = tokio::time::sleep(Duration::from_secs(unwatched_secs));
+    tokio::pin!(unwatched_deadline);
+    loop {
+        tokio::select! {
+            _ = &mut unwatched_deadline => break,
+            ok = forward_one_control_event(&mut events_a, &capture_handle, start) => {
+                if !ok { break; }
+            }
+        }
+    }
+
+    eprintln!("[e2e-late-real] viewer subscribing for the first time (late)");
+    let subscribed_at = start.elapsed();
+    viewer.subscribe(owner_conn_id, VIDEO_STREAM_ID).await.expect("viewer: subscribe() failed");
+
+    let mut total_media_frames: u64 = 0;
+    let mut keyframe_media_frames: u64 = 0;
+    let mut first_keyframe_frame_at: Option<std::time::Duration> = None;
+    let mut decoder = StreamDecoder::new(VIDEO_STREAM_ID).expect("failed to build StreamDecoder");
+    let mut first_decoded_at: Option<std::time::Duration> = None;
+
+    let watch_secs: u64 = std::env::var("E2E_LATE_WATCH_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(15);
+    let deadline = tokio::time::sleep(Duration::from_secs(watch_secs));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => break,
+            ok = forward_one_control_event(&mut events_a, &capture_handle, start) => {
+                if !ok { break; }
+            }
+            event = events_b.recv() => {
+                match event {
+                    Some(ClientEvent::MediaFrame(frame))
+                        if frame.conn_id == owner_conn_id && frame.stream_id == VIDEO_STREAM_ID =>
+                    {
+                        total_media_frames += 1;
+                        if frame.keyframe {
+                            keyframe_media_frames += 1;
+                            first_keyframe_frame_at.get_or_insert(start.elapsed());
+                            eprintln!(
+                                "[e2e-late-real] t={:?} viewer got a REASSEMBLED keyframe media frame ({} bytes)",
+                                start.elapsed(), frame.payload.len()
+                            );
+                        }
+                        decoder.feed(&frame);
+                        if decoder.latest_frame().is_some() {
+                            first_decoded_at.get_or_insert(start.elapsed());
+                        }
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+        }
+        if first_decoded_at.is_some() && keyframe_media_frames >= 1 {
+            break;
+        }
+    }
+
+    eprintln!(
+        "[e2e-late-real] done: {total_media_frames} total media frames, {keyframe_media_frames} carried the \
+         keyframe flag, first keyframe frame at {:?} (subscribed at {:?}), first decoded frame at {:?}",
+        first_keyframe_frame_at, subscribed_at, first_decoded_at
+    );
+
+    if let Err(e) = capture_handle.stop().await {
+        tracing::warn!("[e2e-late-real] capture_handle.stop() reported an error (non-fatal): {e:#}");
+    }
+    drop(viewer);
+    let _ = sharer.leave().await;
+
+    assert!(
+        total_media_frames > 0,
+        "viewer never received a single decrypted media frame after subscribing late"
+    );
+    assert!(
+        keyframe_media_frames > 0,
+        "BUG REPRODUCED (real portal): viewer received {total_media_frames} media frames after subscribing \
+         late, but NONE carried a real reassembled keyframe"
+    );
+    assert!(first_decoded_at.is_some(), "viewer never decoded a single frame after subscribing late");
+
+    let latency = first_keyframe_frame_at.unwrap() - subscribed_at;
+    eprintln!("[e2e-late-real] keyframe latency (subscribe -> first real keyframe received): {latency:?}");
+    assert!(latency < Duration::from_secs(5), "took {latency:?} to get a real keyframe after subscribing");
+
+    eprintln!("[e2e-late-real] PASS: late subscriber received a real keyframe within {latency:?}");
+}
+
+/// TEMP DIAGNOSTIC (bug investigation, see `video_server.rs`'s doc comment
+/// on the "no real keyframe reaches a late subscriber" bug): reproduces the
+/// exact reported scenario — a sharer broadcasting to an *empty* room (zero
+/// subscribers, encoder unpaused and running the whole time so its periodic
+/// 2s-GOP keyframes are simply going nowhere) for well over one GOP
+/// interval, then a *first-ever* subscriber joining. Unlike
+/// `resubscribe_after_pause_resumes_encoder_and_frames_flow` (unsubscribe ->
+/// resubscribe, which already passes), this never pauses the encoder at
+/// all — it's the "was already running for a while" case from the bug
+/// report, not the "was paused" case.
+///
+/// Uses a realistic 1080p resolution/bitrate (not the other tests' small
+/// 320x240 test pattern) specifically because a real IDR at that size is
+/// dramatically larger (many more wire fragments) than a delta frame, which
+/// is exactly the axis the small-resolution tests never stress.
+#[tokio::test]
+#[ignore = "spawns a real relay server child process and real GStreamer capture/decode \
+            pipelines; run explicitly with `cargo test end_to_end_test:: -- --ignored --nocapture`"]
+async fn late_subscriber_after_unwatched_period_gets_a_real_keyframe() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    let port = pick_free_udp_port().expect("failed to pick a free UDP port for the test relay");
+    eprintln!("[e2e-late] starting relay server on 127.0.0.1:{port}");
+    let _server = spawn_relay_server(port).expect("failed to spawn relay server child process");
+
+    let server_addr = format!("127.0.0.1:{port}");
+    let room_id: RoomId = rand::random();
+    let room_key: [u8; 32] = rand::random();
+    let join_string = crate::net::format_join_string(&server_addr, &room_id, &room_key);
+
+    eprintln!("[e2e-late] connecting client A (sharer)");
+    let (client_a, _snapshot_a, mut events_a) = connect_with_retry(&join_string, "sharer")
+        .await
+        .expect("client A failed to connect to the relay after retries");
+    eprintln!("[e2e-late] connecting client B (viewer)");
+    let (client_b, _snapshot_b, mut events_b) = connect_with_retry(&join_string, "viewer")
+        .await
+        .expect("client B failed to connect to the relay after retries");
+
+    const LATE_WIDTH: u32 = 1920;
+    const LATE_HEIGHT: u32 = 1080;
+    // TEMP DIAGNOSTIC (bug investigation): override pattern/bitrate to stress
+    // the fragmentation/reassembly path harder -- a much larger, harder to
+    // compress keyframe (more fragments, more wall-clock time in flight) is
+    // exactly the axis a smooth `smpte` bar pattern at default bitrate
+    // doesn't stress.
+    let pattern = std::env::var("E2E_LATE_PATTERN").unwrap_or_else(|_| "smpte".to_string());
+    let bitrate_kbps: u32 =
+        std::env::var("E2E_LATE_BITRATE_KBPS").ok().and_then(|s| s.parse().ok()).unwrap_or(capture::DEFAULT_BITRATE_KBPS);
+    let source_fragment = format!(
+        "videotestsrc is-live=true pattern={pattern} \
+         ! video/x-raw,width={LATE_WIDTH},height={LATE_HEIGHT},framerate={}/1",
+        capture::DEFAULT_FRAMERATE
+    );
+
+    eprintln!("[e2e-late] starting real capture pipeline on client A (1080p, pattern={pattern}, bitrate={bitrate_kbps}kbps)");
+    let capture_handle = capture::start_sharing_from_test_source(
+        &client_a,
+        VIDEO_STREAM_ID,
+        bitrate_kbps,
+        capture::DEFAULT_FRAMERATE,
+        &source_fragment,
+    )
+    .await
+    .expect("start_sharing_from_test_source failed");
+
+    let owner_conn_id = client_a.conn_id();
+    let start = std::time::Instant::now();
+
+    eprintln!("[e2e-late] waiting for client B to see StreamStarted presence delta");
+    let saw_stream_started = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match events_b.recv().await {
+                Some(ClientEvent::PresenceDelta(PresenceEvent::StreamStarted(info)))
+                    if info.owner == owner_conn_id && info.stream_id == VIDEO_STREAM_ID =>
+                {
+                    return true;
+                }
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+    })
+    .await;
+    assert_eq!(saw_stream_started, Ok(true), "client B never observed StreamStarted");
+
+    // Forwards every SubscriberCount/KeyframeRequest client A receives to
+    // `capture_handle`, exactly like `session.rs`'s real event loop
+    // (`ClientEvent::SubscriberCount`/`ClientEvent::KeyframeRequest` arms) —
+    // this is the real wiring under test. NOT spawned as a detached
+    // background task awaited to completion: `events_a` only yields `None`
+    // once client A's connection is torn down, which doesn't happen until
+    // this test calls `client_a.leave()` at the very end -- awaiting such a
+    // task first would deadlock. Instead it's polled inline, alongside
+    // `events_b`, only while this test still has anything left to wait for.
+    async fn forward_one_control_event(
+        events_a: &mut tokio::sync::mpsc::UnboundedReceiver<ClientEvent>,
+        capture_handle: &capture::CaptureHandle,
+        start: std::time::Instant,
+    ) -> bool {
+        match events_a.recv().await {
+            Some(ClientEvent::SubscriberCount { stream_id, count }) if stream_id == VIDEO_STREAM_ID => {
+                eprintln!("[e2e-late] t={:?} client A got SubscriberCount({count})", start.elapsed());
+                capture_handle.notify_subscriber_count(capture::DestKey(0), count);
+                true
+            }
+            Some(ClientEvent::KeyframeRequest { stream_id }) if stream_id == VIDEO_STREAM_ID => {
+                eprintln!("[e2e-late] t={:?} client A got KeyframeRequest", start.elapsed());
+                capture_handle.notify_keyframe_request(capture::DestKey(0));
+                true
+            }
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    // Let the sharer broadcast to an empty room for well over one GOP
+    // interval (2s) before anyone ever subscribes — the exact "subscribes
+    // after it's been running a while" scenario from the bug report.
+    let unwatched_secs: u64 = std::env::var("E2E_UNWATCHED_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+    eprintln!("[e2e-late] letting client A broadcast unwatched for {unwatched_secs}s ({} GOPs)", unwatched_secs / 2);
+    tokio::time::sleep(Duration::from_secs(unwatched_secs)).await;
+
+    eprintln!("[e2e-late] client B subscribing for the first time (late)");
+    let subscribed_at = start.elapsed();
+    client_b
+        .subscribe(owner_conn_id, VIDEO_STREAM_ID)
+        .await
+        .expect("client B: subscribe() failed");
+
+    let mut total_media_frames: u64 = 0;
+    let mut keyframe_media_frames: u64 = 0;
+    let mut first_keyframe_frame_at: Option<std::time::Duration> = None;
+    let mut decoder = StreamDecoder::new(VIDEO_STREAM_ID).expect("failed to build StreamDecoder");
+    let mut first_decoded_at: Option<std::time::Duration> = None;
+
+    let watch_secs: u64 = std::env::var("E2E_LATE_WATCH_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(15);
+    let deadline = tokio::time::sleep(Duration::from_secs(watch_secs));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => break,
+            ok = forward_one_control_event(&mut events_a, &capture_handle, start) => {
+                if !ok { break; }
+            }
+            event = events_b.recv() => {
+                match event {
+                    Some(ClientEvent::MediaFrame(frame))
+                        if frame.conn_id == owner_conn_id && frame.stream_id == VIDEO_STREAM_ID =>
+                    {
+                        total_media_frames += 1;
+                        if frame.keyframe {
+                            keyframe_media_frames += 1;
+                            first_keyframe_frame_at.get_or_insert(start.elapsed());
+                            eprintln!(
+                                "[e2e-late] t={:?} client B got a REASSEMBLED keyframe media frame ({} bytes)",
+                                start.elapsed(), frame.payload.len()
+                            );
+                        }
+                        decoder.feed(&frame);
+                        if let Some(img) = decoder.latest_frame() {
+                            first_decoded_at.get_or_insert(start.elapsed());
+                            let _ = img;
+                        }
+                    }
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+        }
+        if first_decoded_at.is_some() && keyframe_media_frames >= 1 {
+            break;
+        }
+    }
+
+    eprintln!(
+        "[e2e-late] done: {total_media_frames} total media frames, {keyframe_media_frames} carried the \
+         keyframe flag, first keyframe frame at {:?} (subscribed at {:?}), first decoded frame at {:?}",
+        first_keyframe_frame_at, subscribed_at, first_decoded_at
+    );
+
+    if let Err(e) = capture_handle.stop().await {
+        tracing::warn!("[e2e-late] capture_handle.stop() reported an error (non-fatal): {e:#}");
+    }
+    let _ = client_a.leave().await;
+    let _ = client_b.leave().await;
+
+    assert!(
+        total_media_frames > 0,
+        "client B never received a single decrypted media frame after subscribing late"
+    );
+    assert!(
+        keyframe_media_frames > 0,
+        "BUG REPRODUCED: client B received {total_media_frames} media frames after subscribing late, but \
+         NONE of them ever carried a real reassembled keyframe -- this matches the reported symptom \
+         (thousands of consecutive frames, zero keyframes) exactly"
+    );
+    assert!(
+        first_decoded_at.is_some(),
+        "client B never decoded a single frame after subscribing late (seen_keyframe gate never opened)"
+    );
+
+    let latency = first_keyframe_frame_at.unwrap() - subscribed_at;
+    eprintln!("[e2e-late] keyframe latency (subscribe -> first real keyframe received): {latency:?}");
+    assert!(
+        latency < Duration::from_secs(5),
+        "took {latency:?} to get a real keyframe after subscribing -- too slow to be the \
+         on-demand force_keyframe() mechanism (should be near-immediate), consistent with \
+         only the next scheduled 2s GOP boundary ever working, if even that"
+    );
+
+    eprintln!("[e2e-late] PASS: late subscriber received a real keyframe within {latency:?}");
+}

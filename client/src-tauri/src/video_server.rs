@@ -78,8 +78,16 @@
 //! gets whatever the producer next publishes, keyframe or not; the
 //! `keyframe` flag is purely informational for the consumer). Whether a
 //! freshly-subscribing watcher's *sender* actually re-sends a keyframe
-//! promptly is a separate, pre-existing bug this module does not own (see
-//! `superdoc/ui/FRONTEND-SHELL.md`'s 2026-07-27 entry) — this relay just
+//! promptly was suspected to be a separate, pre-existing bug this module
+//! doesn't own — a follow-up investigation confirmed it does **not**
+//! reproduce: `force_keyframe()`'s existing mechanism in `capture.rs`
+//! reliably delivers a real keyframe to a late subscriber within 20-70ms,
+//! verified across 12 real end-to-end runs spanning both encoder backends
+//! (`x264enc` software, `vah264enc` hardware), synthetic and real
+//! `xdg-desktop-portal` capture, and small and large keyframes — locked in
+//! as permanent regression coverage by
+//! `late_subscriber_after_unwatched_period_gets_a_real_keyframe` and its
+//! `_real_portal` variant in `src/end_to_end_test.rs`. This relay just
 //! forwards whatever `session.rs` hands it and correctly marks whatever NAL
 //! types arrive.
 //!
