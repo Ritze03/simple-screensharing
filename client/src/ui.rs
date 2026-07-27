@@ -515,17 +515,11 @@ enum StreamAction {
 /// How many *other* people are streaming into this room right now — the
 /// "N Active Users" in a joined room's collapsed row.
 ///
-/// Distinct owners, not stream count: someone sharing two monitors is one
-/// active user. Our own streams are excluded — "who else is on" is the
-/// question the row answers.
+/// Thin wrapper: the actual logic lives on `RoomSession::active_stream_count`
+/// so the Tauri shell's `dto::saved_room_rows` can share it (see that
+/// method's docs).
 fn active_user_count(room: &RoomSession) -> usize {
-    let me = room.client.conn_id();
-    room.streams
-        .iter()
-        .filter(|s| s.owner != me)
-        .map(|s| s.owner)
-        .collect::<HashSet<_>>()
-        .len()
+    room.active_stream_count()
 }
 
 /// `WxH@FPS` for a *remote* stream, as announced by its sender.

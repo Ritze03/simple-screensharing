@@ -609,6 +609,20 @@ impl RoomSession {
         self.streams.iter().any(|s| s.owner == owner && s.kind == StreamKind::Video)
     }
 
+    /// How many *other* people are streaming into this room right now — the
+    /// "N active" sidebar count both `ui.rs`'s egui ROOMS row and the Tauri
+    /// shell's `SavedRoomRow::active_stream_count` show.
+    ///
+    /// Distinct owners, not stream count: someone sharing two monitors is one
+    /// active user. Our own streams are excluded — this counts who *else* is
+    /// on, not what we're personally sending (that's `destinations.len()`, a
+    /// different number that stays 0 whenever nobody local is sharing even
+    /// though someone else in the room is).
+    pub fn active_stream_count(&self) -> usize {
+        let me = self.client.conn_id();
+        self.streams.iter().filter(|s| s.owner != me).map(|s| s.owner).collect::<std::collections::HashSet<_>>().len()
+    }
+
     /// Start decoding/playing `(owner, stream_id)`'s audio if not already
     /// doing so, and subscribe to it. Shared by `toggle_watch`'s
     /// auto-subscribe-audio-alongside-video path and `toggle_listen`'s

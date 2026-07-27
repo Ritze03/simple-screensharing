@@ -108,6 +108,11 @@ pub struct SavedRoomRow {
     /// `Some` only when `state == Joined` — the handle every other command
     /// keys off.
     pub room_handle: Option<u32>,
+    /// Count of *other* members currently streaming into this room (distinct
+    /// owners, mirrors `RoomSession::active_stream_count`/egui's
+    /// `active_user_count`) — **not** `room.destinations.len()`, which is
+    /// only this client's own outgoing streams and stays 0 whenever nobody
+    /// local is sharing even though someone else in the room is.
     pub active_stream_count: u32,
 }
 
@@ -277,7 +282,7 @@ pub fn saved_room_rows(state: &AppState) -> Vec<SavedRoomRow> {
                 join_string: saved.join_string.clone(),
                 state: RoomRowState::Joined,
                 room_handle: Some(handle.0),
-                active_stream_count: room.destinations.len() as u32,
+                active_stream_count: room.active_stream_count() as u32,
             },
             None if state.is_reconnecting(&saved.join_string) => SavedRoomRow {
                 name: saved.name.clone(),
@@ -306,7 +311,7 @@ pub fn saved_room_rows(state: &AppState) -> Vec<SavedRoomRow> {
                 join_string: room.join_string.clone(),
                 state: RoomRowState::Joined,
                 room_handle: Some(handle.0),
-                active_stream_count: room.destinations.len() as u32,
+                active_stream_count: room.active_stream_count() as u32,
             });
         }
     }
