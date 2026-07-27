@@ -47,7 +47,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 use simple_screensharing_client::session::{self, ConnectOutcome};
 
@@ -108,10 +108,12 @@ fn tick(app_handle: &AppHandle, last: &mut Snapshot) {
             if let Some(detail) = dto::room_detail(&state, handle)
                 && let Ok(payload) = serde_json::to_value(&detail)
             {
+                let _ = app_handle.emit("room-connected", &detail);
                 managed.events.publish("room-connected", payload);
             }
         }
         ConnectOutcome::Failed { error, from_add_card } => {
+            let _ = app_handle.emit("room-connect-failed", serde_json::json!({ "error": error, "fromAddCard": from_add_card }));
             managed.events.publish("room-connect-failed", serde_json::json!({ "error": error, "fromAddCard": from_add_card }));
         }
     }
@@ -153,6 +155,7 @@ fn tick(app_handle: &AppHandle, last: &mut Snapshot) {
             // stream's video-server producer thread and connection-serving
             // route would leak for the rest of the process's life.
             managed.video_server.stop_room(handle);
+            let _ = app_handle.emit("room-disconnected", serde_json::json!({ "roomHandle": handle, "reason": reason }));
             managed.events.publish("room-disconnected", serde_json::json!({ "roomHandle": handle, "reason": reason }));
         }
     }
@@ -163,6 +166,7 @@ fn tick(app_handle: &AppHandle, last: &mut Snapshot) {
     if let Some(alloc) = state.bandwidth.allocation()
         && alloc.overshoot_kbps > 0
     {
+        let _ = app_handle.emit("bandwidth-overshoot", serde_json::json!({ "overshootKbps": alloc.overshoot_kbps }));
         managed.events.publish("bandwidth-overshoot", serde_json::json!({ "overshootKbps": alloc.overshoot_kbps }));
     }
 
@@ -175,6 +179,7 @@ fn tick(app_handle: &AppHandle, last: &mut Snapshot) {
             && let Some(detail) = dto::room_detail(&state, *handle)
             && let Ok(payload) = serde_json::to_value(&detail)
         {
+            let _ = app_handle.emit("presence-updated", &detail);
             managed.events.publish("presence-updated", payload);
         }
     }
@@ -186,6 +191,10 @@ fn tick(app_handle: &AppHandle, last: &mut Snapshot) {
             let label = dto::destination_state_label(&dest.state());
             dest_snapshot.insert(destination_id.0, label);
             if last.destinations.get(&destination_id.0) != Some(&label) {
+                let _ = app_handle.emit(
+                    "destination-state-changed",
+                    serde_json::json!({ "destinationId": destination_id.0, "roomHandle": dest.room.0, "state": label }),
+                );
                 managed.events.publish(
                     "destination-state-changed",
                     serde_json::json!({ "destinationId": destination_id.0, "roomHandle": dest.room.0, "state": label }),
@@ -219,6 +228,10 @@ fn tick(app_handle: &AppHandle, last: &mut Snapshot) {
     // meaningful. `roomHandle: 0` for the same reason — the destination's
     // real room is gone from `AppState` by this point, and nothing reads it.
     for (&destination_id, _) in last.destinations.iter().filter(|(id, _)| !dest_snapshot.contains_key(id)) {
+        let _ = app_handle.emit(
+            "destination-state-changed",
+            serde_json::json!({ "destinationId": destination_id, "roomHandle": 0, "state": "removed" }),
+        );
         managed.events.publish(
             "destination-state-changed",
             serde_json::json!({ "destinationId": destination_id, "roomHandle": 0, "state": "removed" }),
