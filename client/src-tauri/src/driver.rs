@@ -160,6 +160,9 @@ fn tick(app_handle: &AppHandle, last: &mut Snapshot) {
         }
     }
 
+    // 3.5. Prune watches whose underlying stream has stopped.
+    prune_stale_watches(&state, &managed);
+
     // 4. Bandwidth allocation (Absolute-Maximum mode's live wiring; a cheap
     // no-op in Per-Stream mode, see `AppState::apply_bandwidth_allocation`).
     state.apply_bandwidth_allocation();
@@ -268,5 +271,26 @@ fn tick(app_handle: &AppHandle, last: &mut Snapshot) {
     if let Ok(payload) = serde_json::to_value(&stats) {
         let _ = app_handle.emit("stream-stats-updated", &stats);
         managed.events.publish("stream-stats-updated", payload);
+    }
+}
+
+/// Removes any `WatchEntry` (and its `video_server.rs` route) whose
+/// underlying stream is no longer in `room.streams` — i.e. the owner
+/// stopped sharing while someone else was still watching it. Called from
+/// `tick`'s step 3.5 (see that call site's doc comment for the full `Why:`
+/// and the real, reproduced hang this fixes) and from `commands.rs`'s
+/// `test_tick` (its `#[cfg(test)]` stand-in for this function, since
+/// `tick`/`spawn` are hard-wired to a real `AppHandle<Wry<...>>` a mock
+/// Tauri app has no use for — see `test_tick`'s own doc comment). Pulled out
+/// as its own function specifically so both call sites share one
+/// implementation rather than a second copy silently drifting out of sync.
+pub(crate) fn prune_stale_watches(state: &session::AppState, managed: &Managed) {
+    for (handle, room) in &state.rooms {
+        let live: std::collections::HashSet<(u64, u8)> = room.streams.iter().map(|s| (s.owner, s.stream_id)).collect();
+        let stale: Vec<(u64, u8)> = room.watches.lock().unwrap().keys().filter(|k| !live.contains(k)).copied().collect();
+        for (owner, stream_id) in stale {
+            room.watches.lock().unwrap().remove(&(owner, stream_id));
+            managed.video_server.stop_route((handle.0, owner, stream_id));
+        }
     }
 }
