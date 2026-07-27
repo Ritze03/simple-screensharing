@@ -1,0 +1,13 @@
+{
+  "name": "simple-screensharing-client-electron",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Electron shell for simple-screensharing-client; talks to the src-tauri sidecar's REST+SSE api_server instead of Tauri IPC.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^33.0.0"
+  }
+}
