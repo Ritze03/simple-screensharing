@@ -24,7 +24,7 @@
 
 "use strict";
 
-const { app, BrowserWindow, ipcMain } = require("electron");
+const { app, BrowserWindow, ipcMain, screen } = require("electron");
 const { spawn } = require("child_process");
 const path = require("path");
 const http = require("http");
@@ -39,10 +39,13 @@ const API_HOST = "127.0.0.1";
 // a `--release` build without any code change.
 const SIDECAR_PATH = process.env.SIDECAR_BIN || path.join(__dirname, "..", "target", "debug", "simple-screensharing-client-tauri");
 const FRONTEND_INDEX = path.join(__dirname, "..", "frontend", "index.html");
+const VIEWER_HTML = path.join(__dirname, "..", "frontend", "viewer.html");
+const PRELOAD = path.join(__dirname, "preload.js");
 
 let apiToken = null;
 let apiPort = null;
 let mainWindow = null;
+let viewerWindow = null;
 let sidecarProcess = null;
 let sseAbort = false;
 
@@ -306,7 +309,7 @@ function createWindow() {
     height: 600,
     title: "Simple Screensharing",
     webPreferences: {
-      preload: path.join(__dirname, "preload.js"),
+      preload: PRELOAD,
       contextIsolation: true,
       nodeIntegration: false,
     },
@@ -314,6 +317,137 @@ function createWindow() {
 
   mainWindow.loadFile(FRONTEND_INDEX);
 }
+
+// ---------------------------------------------------------------------
+// Viewer window: dedicated fullscreen/borderless stream-viewing window.
+//
+// Only one viewer window at a time for this pass — opening a new one
+// closes/replaces any existing one first (see `open-viewer-window` below).
+// ---------------------------------------------------------------------
+
+function mapDisplay(d) {
+  return {
+    id: d.id,
+    bounds: d.bounds,
+    workArea: d.workArea,
+    isPrimary: d.id === screen.getPrimaryDisplay().id,
+  };
+}
+
+function resolveTargetDisplay(displayId) {
+  if (displayId !== null && displayId !== undefined) {
+    const found = screen.getAllDisplays().find((d) => d.id === displayId);
+    if (found) return found;
+  }
+  // Default: the display nearest the current cursor position (matches this
+  // environment's own window-spawn convention).
+  return screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
+}
+
+// streamKeys is handed to the viewer window via a query string on the
+// loaded file URL (?streamKeys=<json-encoded-array>), read by the later
+// unit's viewer.js on load via `new URLSearchParams(location.search)`.
+// Chosen over an IPC message sent after `did-finish-load` because it's
+// available synchronously to the viewer's own startup code with no race
+// against when the renderer attaches its listener.
+function loadViewerContents(win, streamKeys) {
+  const query = `streamKeys=${encodeURIComponent(JSON.stringify(streamKeys || []))}`;
+  win.loadFile(VIEWER_HTML, { search: query });
+}
+
+// mode: 'fullscreen' | 'borderless'
+// displayId: number | null — null means "nearest the cursor" (see resolveTargetDisplay)
+// streamKeys: string[]
+function openViewerWindow({ mode, displayId, streamKeys }) {
+  if (viewerWindow && !viewerWindow.isDestroyed()) {
+    viewerWindow.close();
+    viewerWindow = null;
+  }
+
+  const target = resolveTargetDisplay(displayId != null ? displayId : null);
+  const { x, y, width, height } = target.bounds;
+
+  const borderless = mode === "borderless";
+
+  // Critical ordering (known Linux WM footgun): position the window on the
+  // target display's bounds FIRST — passed at construction here — and only
+  // call setFullScreen(true) AFTER the window is positioned and shown.
+  // Calling setFullScreen before the window is on the correct
+  // display/visible is unreliable on Linux WMs (can fullscreen on the
+  // wrong/primary display instead of the requested one).
+  viewerWindow = new BrowserWindow({
+    x,
+    y,
+    width,
+    height,
+    frame: !borderless,
+    resizable: true,
+    show: false,
+    webPreferences: {
+      preload: PRELOAD,
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+
+  loadViewerContents(viewerWindow, streamKeys);
+
+  viewerWindow.once("ready-to-show", () => {
+    if (!viewerWindow || viewerWindow.isDestroyed()) return;
+    // Re-assert bounds before showing: some Linux WMs can reposition an
+    // unmapped window on first map, so pin it again right before show().
+    viewerWindow.setBounds(target.bounds);
+    viewerWindow.show();
+
+    if (mode === "fullscreen") {
+      // Standard fullscreen (EWMH _NET_WM_STATE_FULLSCREEN on X11 / xdg-shell
+      // fullscreen on Wayland) — NOT kiosk mode, which is more aggressive
+      // and less predictable across Linux window managers.
+      viewerWindow.setFullScreen(true);
+    } else {
+      // Borderless: full display bounds (not workArea — maximize() would
+      // snap to workArea and exclude panel/taskbar space, which is wrong
+      // here; the user wants true maximum size). Stays a normal,
+      // WM-managed, alt-tabbable window otherwise: resizable, not
+      // always-on-top, not skip-taskbar — chrome-free is the only
+      // difference from a regular window.
+      viewerWindow.setBounds(target.bounds);
+    }
+  });
+
+  viewerWindow.on("leave-full-screen", () => {
+    // Forwards an OS-level fullscreen exit (e.g. an Escape/WM gesture, not
+    // triggered through our own setFullscreen(false) IPC call) to the
+    // renderer so its UI state can stay in sync.
+    if (viewerWindow && !viewerWindow.isDestroyed()) {
+      viewerWindow.webContents.send("viewer-left-fullscreen");
+    }
+  });
+
+  viewerWindow.on("closed", () => {
+    viewerWindow = null;
+  });
+}
+
+ipcMain.handle("list-displays", () => {
+  return screen.getAllDisplays().map(mapDisplay);
+});
+
+ipcMain.handle("open-viewer-window", (_event, opts) => {
+  openViewerWindow(opts || {});
+});
+
+ipcMain.handle("viewer-set-fullscreen", (_event, fullscreen) => {
+  if (viewerWindow && !viewerWindow.isDestroyed()) {
+    viewerWindow.setFullScreen(!!fullscreen);
+  }
+});
+
+ipcMain.handle("viewer-close", () => {
+  if (viewerWindow && !viewerWindow.isDestroyed()) {
+    viewerWindow.close();
+  }
+});
 
 // ---------------------------------------------------------------------
 // App lifecycle

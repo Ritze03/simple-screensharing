@@ -59,3 +59,43 @@ contextBridge.exposeInMainWorld("__TAURI__", {
 // Not strictly required by the frontend today, but harmless and documents
 // which events the bridge forwards.
 void EVENT_NAMES;
+
+// ---------------------------------------------------------------------
+// window.__ELECTRON__ — separate bridge for Electron-native window
+// management (fullscreen/borderless stream viewer window). Distinct from
+// __TAURI__ above: __TAURI__ is a narrow Tauri-invoke/event compatibility
+// shim for talking to the Rust sidecar; this is Electron-specific window
+// control that has no Tauri equivalent, so it gets its own namespace rather
+// than being bolted onto __TAURI__.
+//
+// This same preload script also runs inside the viewer window (main.js
+// passes the identical `preload` path when constructing it), so both
+// window.__ELECTRON__ and window.__TAURI__ are available there too — a
+// later unit's viewer.js can call back into __TAURI__ for stream data with
+// no new backend contract needed.
+contextBridge.exposeInMainWorld("__ELECTRON__", {
+  // Promise<Array<{id, bounds, workArea, isPrimary}>>
+  listDisplays: () => ipcRenderer.invoke("list-displays"),
+
+  // opts: { mode: 'fullscreen' | 'borderless', displayId: number | null, streamKeys: string[] }
+  // displayId: null (or omitted) => display nearest the current cursor position.
+  openViewer: (opts) => ipcRenderer.invoke("open-viewer-window", opts),
+
+  // Toggles fullscreen on the currently-open viewer window. No-op if none is open.
+  setFullscreen: (fullscreen) => ipcRenderer.invoke("viewer-set-fullscreen", fullscreen),
+
+  // Closes the currently-open viewer window, if any.
+  closeViewer: () => ipcRenderer.invoke("viewer-close"),
+
+  // Fires when the viewer window exits fullscreen via an OS-level gesture
+  // (e.g. an Escape/WM shortcut) rather than through setFullscreen(false),
+  // so caller UI state (e.g. a "fullscreen" toggle) can stay in sync.
+  // Mirrors the __TAURI__.event.listen shape: returns Promise<UnlistenFn>.
+  onViewerLeftFullscreen: (callback) => {
+    const handler = () => callback();
+    ipcRenderer.on("viewer-left-fullscreen", handler);
+    return Promise.resolve(() => {
+      ipcRenderer.removeListener("viewer-left-fullscreen", handler);
+    });
+  },
+});
