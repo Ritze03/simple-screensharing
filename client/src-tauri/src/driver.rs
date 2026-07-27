@@ -176,5 +176,36 @@ fn tick(app_handle: &AppHandle, last: &mut Snapshot) {
             }
         }
     }
+    // A destination that was in `last.destinations` but isn't in this tick's
+    // `dest_snapshot` was just removed from `AppState` entirely (Stop
+    // clicked, and — for a capture's last destination — its whole
+    // `LocalCapture` reaped by `poll_capture_states`). `Why this needs its
+    // own pass, not just the loop above:` the loop above can only ever
+    // notice a value *changing* for a key that still exists post-tick; a key
+    // vanishing produces no iteration at all, so it was silently invisible
+    // here. That silence was a real, reproduced bug (see
+    // `superdoc/ui/FRONTEND-SHELL.md`'s 2026-07-27 "Stop never clears" dated
+    // entry): `AppState` itself reaps a stopped destination within about one
+    // tick (confirmed directly against a real relay + real portal capture,
+    // never more than ~300ms), but the frontend only ever re-fetches
+    // `list_active_streams` in response to this exact event (or
+    // `presence-updated`, which the relay deliberately never sends back to
+    // the very client whose own stream just stopped — see `relay.rs`'s
+    // `StopStream` handler, `broadcast(.., Some(conn_id))` excludes the
+    // sender) — so without this, the Stream Control tab's destination card
+    // for *your own* stopped stream never learns it's gone, and stays stuck
+    // showing stale `Live` state until some unrelated event happens to
+    // trigger a refresh. The emitted state label of `"removed"` isn't a real
+    // `DestinationState` variant; the frontend's listener (`shell.js`'s
+    // `wireEvents`) ignores the event payload entirely and just re-fetches,
+    // so any value here only needs to make the event fire, not be otherwise
+    // meaningful. `roomHandle: 0` for the same reason — the destination's
+    // real room is gone from `AppState` by this point, and nothing reads it.
+    for (&destination_id, _) in last.destinations.iter().filter(|(id, _)| !dest_snapshot.contains_key(id)) {
+        let _ = app_handle.emit(
+            "destination-state-changed",
+            serde_json::json!({ "destinationId": destination_id, "roomHandle": 0, "state": "removed" }),
+        );
+    }
     last.destinations = dest_snapshot;
 }

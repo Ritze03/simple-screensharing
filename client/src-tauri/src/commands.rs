@@ -758,4 +758,209 @@ mod tests {
         assert!(sanity.is_some(), "backend is permanently wedged after bandwidth-toggle-then-Stop");
         eprintln!("[hang_repro2] backend still responds — no hang this run.");
     }
+
+    /// DIAGNOSTIC harness for the "Stop genuinely halts the pipeline but the
+    /// destination is never removed from app state" bug — see
+    /// `superdoc/ui/FRONTEND-SHELL.md`'s 2026-07-27 dated entry for the
+    /// original report. Unlike `hang_repro_stop_share_cycles` (which only
+    /// checks that the `stop_share` *command call itself* returns quickly —
+    /// it fires a `tokio::spawn` and returns immediately, so it always
+    /// returns fast even when the bug is present), this test checks the
+    /// thing the bug report actually complains about: that the capture (and
+    /// therefore its destination) is actually *reaped* out of
+    /// `AppState::captures` — i.e. `ShareStatus::Stopping` -> gone — within a
+    /// bounded, human-reasonable time after `stop_share` is called, not just
+    /// that the command returned.
+    ///
+    /// Same real-relay/real-portal prerequisites as `hang_repro_stop_share_cycles`
+    /// (see that test's doc comment). Run with:
+    /// ```text
+    /// HANG_REPRO_RELAY=127.0.0.1:4433 \
+    ///   cargo test --release -p simple-screensharing-client-tauri \
+    ///   -- --ignored --nocapture stop_destination_actually_clears_from_state
+    /// ```
+    #[test]
+    #[ignore]
+    fn stop_destination_actually_clears_from_state() {
+        let _guard = isolated_config_home();
+        let managed = tauri::async_runtime::block_on(async { Managed::new() });
+
+        let app = tauri::test::mock_builder()
+            .manage(managed)
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("build mock tauri app");
+
+        let poller_handle = app.handle().clone();
+        tauri::async_runtime::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+            loop {
+                interval.tick().await;
+                test_tick(&poller_handle.state::<Managed>());
+            }
+        });
+
+        let relay = std::env::var("HANG_REPRO_RELAY").unwrap_or_else(|_| "127.0.0.1:4477".to_string());
+        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let mut room_id = [0u8; 16];
+        let mut room_key = [0u8; 32];
+        for (i, b) in room_id.iter_mut().enumerate() {
+            *b = (seed >> (i % 16 * 4)) as u8 ^ (i as u8) ^ 0xAA;
+        }
+        for (i, b) in room_key.iter_mut().enumerate() {
+            *b = (seed >> (i % 16 * 4)) as u8 ^ (i as u8).wrapping_mul(31) ^ 0xAA;
+        }
+        let join_string = simple_screensharing_client::net::format_join_string(&relay, &room_id, &room_key);
+
+        eprintln!("[stop_reap_repro] joining {join_string}");
+        let handle = app.handle().clone();
+        let jr = join_room(handle.state::<Managed>(), join_string, "StopReaproSharer".to_string());
+        assert!(jr.is_ok(), "join_room returned an error: {jr:?}");
+
+        let room_handle = wait_for(std::time::Duration::from_secs(15), || {
+            app.state::<Managed>().state.lock().unwrap().rooms.keys().next().copied()
+        })
+        .expect("room should connect to the real relay within 15s — is HANG_REPRO_RELAY reachable?");
+        eprintln!("[stop_reap_repro] joined room {room_handle:?}");
+
+        let h = app.handle().clone();
+        let started = call_with_timeout("start_video_share", std::time::Duration::from_secs(5), move || {
+            start_video_share(h.state::<Managed>(), room_handle.0)
+        });
+        assert!(started.is_some(), "start_video_share itself hung");
+
+        let capture_id = wait_for(std::time::Duration::from_secs(30), || {
+            let managed = app.state::<Managed>();
+            let state = managed.state.lock().unwrap();
+            state.captures.iter().find_map(|(id, c)| {
+                matches!(c.status, simple_screensharing_client::session::ShareStatus::Active(_)).then_some(*id)
+            })
+        })
+        .expect("capture should go Active within 30s to set up this repro — this is the very first Stop ever, matching the fresh-app report");
+        eprintln!("[stop_reap_repro] capture {capture_id:?} is Active — clicking Stop exactly once, like the real report");
+
+        let stop_clicked_at = std::time::Instant::now();
+        let h = app.handle().clone();
+        let stopped = call_with_timeout("stop_share", std::time::Duration::from_secs(5), move || {
+            stop_share(h.state::<Managed>(), capture_id.0)
+        });
+        assert!(stopped.is_some(), "stop_share itself hung — see thread dump");
+
+        eprintln!("[stop_reap_repro] stop_share command returned; now polling AppState.captures to see whether the capture is actually reaped");
+        let reaped = wait_for(std::time::Duration::from_secs(20), || {
+            let managed = app.state::<Managed>();
+            let state = managed.state.lock().unwrap();
+            (!state.captures.contains_key(&capture_id)).then_some(())
+        });
+        let elapsed = stop_clicked_at.elapsed();
+        eprintln!("[stop_reap_repro] capture reaped: {} after {:?}", reaped.is_some(), elapsed);
+        assert!(
+            reaped.is_some(),
+            "THE BUG: {elapsed:?} after stop_share was called, the capture (and its destination) is STILL present in \
+             AppState.captures — the pipeline may have genuinely stopped (encoder CPU/frame freeze), but the \
+             Rust-side bookkeeping never caught up. pid {} left running for a debugger to attach.",
+            std::process::id()
+        );
+        assert!(elapsed < std::time::Duration::from_secs(3), "capture was reaped, but took {elapsed:?} — too slow to read as instant in the UI");
+    }
+
+    /// Same as [`stop_destination_actually_clears_from_state`], but repeated
+    /// back-to-back with no pause (start immediately follows the previous
+    /// cycle's Stop) — the exact contention condition
+    /// `superdoc/ui/FRONTEND-SHELL.md`'s `start_pipeline` `Why:` note
+    /// documents as the trigger for GStreamer/PipeWire state changes stalling
+    /// unpredictably. Reports the reap latency of *every* cycle so an
+    /// intermittent stall (rather than a permanent one) still shows up.
+    #[test]
+    #[ignore]
+    fn stop_reap_stress_cycles() {
+        let _guard = isolated_config_home();
+        let managed = tauri::async_runtime::block_on(async { Managed::new() });
+
+        let app = tauri::test::mock_builder()
+            .manage(managed)
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("build mock tauri app");
+
+        let poller_handle = app.handle().clone();
+        tauri::async_runtime::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+            loop {
+                interval.tick().await;
+                test_tick(&poller_handle.state::<Managed>());
+            }
+        });
+
+        let relay = std::env::var("HANG_REPRO_RELAY").unwrap_or_else(|_| "127.0.0.1:4477".to_string());
+        let cycles: u32 = std::env::var("HANG_REPRO_CYCLES").ok().and_then(|s| s.parse().ok()).unwrap_or(8);
+        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let mut room_id = [0u8; 16];
+        let mut room_key = [0u8; 32];
+        for (i, b) in room_id.iter_mut().enumerate() {
+            *b = (seed >> (i % 16 * 4)) as u8 ^ (i as u8) ^ 0x33;
+        }
+        for (i, b) in room_key.iter_mut().enumerate() {
+            *b = (seed >> (i % 16 * 4)) as u8 ^ (i as u8).wrapping_mul(31) ^ 0x33;
+        }
+        let join_string = simple_screensharing_client::net::format_join_string(&relay, &room_id, &room_key);
+
+        eprintln!("[stop_reap_stress] joining {join_string}");
+        let handle = app.handle().clone();
+        let jr = join_room(handle.state::<Managed>(), join_string, "StopReapStressSharer".to_string());
+        assert!(jr.is_ok(), "join_room returned an error: {jr:?}");
+
+        let room_handle = wait_for(std::time::Duration::from_secs(15), || {
+            app.state::<Managed>().state.lock().unwrap().rooms.keys().next().copied()
+        })
+        .expect("room should connect to the real relay within 15s — is HANG_REPRO_RELAY reachable?");
+        eprintln!("[stop_reap_stress] joined room {room_handle:?}");
+
+        let mut max_reap = std::time::Duration::ZERO;
+        for cycle in 0..cycles {
+            eprintln!("[stop_reap_stress] === cycle {cycle}/{cycles}: start_video_share ===");
+            let h = app.handle().clone();
+            let started = call_with_timeout("start_video_share", std::time::Duration::from_secs(5), move || {
+                start_video_share(h.state::<Managed>(), room_handle.0)
+            });
+            assert!(started.is_some(), "start_video_share itself hung — see thread dump");
+
+            let capture_id = wait_for(std::time::Duration::from_secs(30), || {
+                let managed = app.state::<Managed>();
+                let state = managed.state.lock().unwrap();
+                state.captures.iter().find_map(|(id, c)| {
+                    matches!(c.status, simple_screensharing_client::session::ShareStatus::Active(_)).then_some(*id)
+                })
+            });
+            let Some(capture_id) = capture_id else {
+                eprintln!("[stop_reap_stress] cycle {cycle}: capture never went Active within 30s (real-world churn) — skipping this cycle's Stop");
+                continue;
+            };
+            eprintln!("[stop_reap_stress] cycle {cycle}: capture {capture_id:?} Active — clicking Stop");
+
+            let stop_clicked_at = std::time::Instant::now();
+            let h = app.handle().clone();
+            let stopped = call_with_timeout("stop_share", std::time::Duration::from_secs(5), move || {
+                stop_share(h.state::<Managed>(), capture_id.0)
+            });
+            assert!(stopped.is_some(), "cycle {cycle}: stop_share itself hung — see thread dump");
+
+            let reaped = wait_for(std::time::Duration::from_secs(30), || {
+                let managed = app.state::<Managed>();
+                let state = managed.state.lock().unwrap();
+                (!state.captures.contains_key(&capture_id)).then_some(())
+            });
+            let elapsed = stop_clicked_at.elapsed();
+            eprintln!("[stop_reap_stress] cycle {cycle}: reaped={} after {elapsed:?}", reaped.is_some());
+            assert!(
+                reaped.is_some(),
+                "cycle {cycle}: THE BUG — capture never reaped from AppState.captures within 30s of Stop being \
+                 clicked. pid {} left running for a debugger to attach.",
+                std::process::id()
+            );
+            max_reap = max_reap.max(elapsed);
+            // Deliberately no pause — next cycle's start_video_share fires
+            // immediately, exactly the reported trigger condition.
+        }
+        eprintln!("[stop_reap_stress] done — worst-case reap latency across {cycles} cycles: {max_reap:?}");
+        assert!(max_reap < std::time::Duration::from_secs(5), "worst-case reap latency {max_reap:?} is too slow to read as \"a second or two\" in the UI");
+    }
 }
