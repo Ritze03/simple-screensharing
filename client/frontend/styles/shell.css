@@ -205,6 +205,24 @@ input {
   color: var(--text-faint);
 }
 
+/* Disconnected rows put Reconnect/forget on this line instead of the head
+   line (see `renderRoomRow`'s comment) so the room name never has to share
+   its line's width with them — a long auto-generated `Room <hex>` name and
+   the Reconnect pill together didn't fit at the sidebar's width. */
+.room-sub-meta-disconnected {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding-top: 2px;
+}
+
+.room-sub-meta-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* `.btn`'s own `padding` (below) has the same specificity as this rule's and
    is declared later in this file, so without the extra `.btn` qualifier here
    it would win the cascade and silently restore the 6px vertical padding
