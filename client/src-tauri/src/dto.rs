@@ -6,6 +6,7 @@
 use serde::Serialize;
 
 use simple_screensharing_client::capture::destination::{DestinationState, VideoParams};
+use simple_screensharing_client::capture::{QualityLevel, RateControlMode, TuneMode};
 use simple_screensharing_client::protocol::{ConnId, Member, StreamInfo};
 use simple_screensharing_client::rooms::BandwidthMode;
 use simple_screensharing_client::session::{self, AppState, RoomHandle};
@@ -245,6 +246,35 @@ pub fn parse_bandwidth_mode(s: &str) -> Result<BandwidthMode, String> {
         "absolute" => Ok(BandwidthMode::Absolute),
         "per_stream" => Ok(BandwidthMode::PerStream),
         other => Err(format!("unknown bandwidth mode: {other}")),
+    }
+}
+
+/// Stable, snake_case identifiers for the three testing-oriented encoder
+/// tuning knobs (`capture::TuneMode`/`QualityLevel`/`RateControlMode`) —
+/// same `parse_*` convention as [`parse_bandwidth_mode`], used by
+/// `edit_destination`.
+pub fn parse_tune_mode(s: &str) -> Result<TuneMode, String> {
+    match s {
+        "low_latency" => Ok(TuneMode::LowLatency),
+        "best_quality" => Ok(TuneMode::BestQuality),
+        other => Err(format!("unknown tune mode: {other}")),
+    }
+}
+
+pub fn parse_quality_level(s: &str) -> Result<QualityLevel, String> {
+    match s {
+        "performance" => Ok(QualityLevel::Performance),
+        "quality" => Ok(QualityLevel::Quality),
+        other => Err(format!("unknown quality level: {other}")),
+    }
+}
+
+pub fn parse_rate_control_mode(s: &str) -> Result<RateControlMode, String> {
+    match s {
+        "constant" => Ok(RateControlMode::Constant),
+        "adaptive" => Ok(RateControlMode::Adaptive),
+        "quality" => Ok(RateControlMode::Quality),
+        other => Err(format!("unknown rate control mode: {other}")),
     }
 }
 

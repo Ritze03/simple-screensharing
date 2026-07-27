@@ -520,12 +520,15 @@ fn dispatch(name: &str, body: &Value, app: &AppHandle) -> Result<Value, ApiError
         "transfer_destination" => {
             ok(commands::transfer_destination(managed, get_u32(body, "destination_id")?, get_u32(body, "target_room")?))
         }
-        "edit_destination" => ok(commands::edit_destination(
+        "edit_destination" => result(commands::edit_destination(
             managed,
             get_u32(body, "destination_id")?,
             get_u32(body, "scale_percent")?,
             get_u32(body, "framerate")?,
             get_u32(body, "bitrate_kbps")?,
+            get_string(body, "tune")?,
+            get_string(body, "quality_level")?,
+            get_string(body, "rate_control")?,
         )),
         "stop_destination" => ok(commands::stop_destination(managed, get_u32(body, "destination_id")?)),
         "set_bandwidth_mode" => result(commands::set_bandwidth_mode(managed, get_string(body, "mode")?)),

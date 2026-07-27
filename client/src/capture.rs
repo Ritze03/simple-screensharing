@@ -226,24 +226,85 @@ impl EncoderBackend {
     /// including its bitrate/GOP properties. Deliberately returns just the
     /// element description (not surrounding `!`s) so [`build_pipeline`] stays
     /// the single place that assembles the full pipeline string.
-    fn launch_fragment(self, bitrate_kbps: u32, gop_frames: u32) -> String {
+    ///
+    /// `tune`/`quality_level`/`rate_control` are the three live-adjustable
+    /// (routed through [`destination::ChangeTier::BranchSwap`] — see
+    /// that type's doc comment) encoder tuning knobs; each is mapped to the
+    /// matching property for whichever backend `self` is, per the mapping
+    /// documented on [`TuneMode`], [`QualityLevel`] and [`RateControlMode`].
+    fn launch_fragment(
+        self,
+        bitrate_kbps: u32,
+        gop_frames: u32,
+        tune: TuneMode,
+        quality_level: QualityLevel,
+        rate_control: RateControlMode,
+    ) -> String {
         match self {
-            EncoderBackend::Software => format!(
-                "x264enc tune=zerolatency speed-preset=ultrafast bitrate={bitrate_kbps} key-int-max={gop_frames}"
-            ),
+            EncoderBackend::Software => {
+                // `tune=zerolatency` is x264enc's low-latency knob; leaving
+                // `tune` unset entirely is its best-quality (general-purpose
+                // rate/distortion tuning) mode — there is no explicit
+                // "best-quality" value to set, only the absence of the
+                // low-latency one. See [`TuneMode`].
+                let tune_flag = match tune {
+                    TuneMode::LowLatency => "tune=zerolatency ",
+                    TuneMode::BestQuality => "",
+                };
+                let speed_preset = match quality_level {
+                    QualityLevel::Performance => "ultrafast",
+                    QualityLevel::Quality => "veryslow",
+                };
+                // x264enc has no rate-control *enum* like vah264enc's — its
+                // closest control is `pass` (`cbr`/`quant`/`qual`) +
+                // `quantizer`. `Constant` is this backend's existing
+                // implicit default (plain `bitrate=`, no `pass` override —
+                // x264enc's CBR mode). `Adaptive` is deliberately a **no-op**
+                // relative to `Constant`: x264enc's CBR is already
+                // frame-adaptive within its bitrate budget, so there is no
+                // meaningfully different x264enc setting to reach for — this
+                // is a real asymmetry vs. vah264enc's genuine `cbr`/`vbr`
+                // split, documented here rather than silently pretended
+                // symmetric. `Quality` switches to `pass=qual`, x264enc's
+                // constant-quality mode driven by `quantizer` rather than a
+                // bitrate target (the `bitrate=` property above is simply
+                // ignored by x264enc while `pass=qual` is active).
+                let rate_control_flag = match rate_control {
+                    RateControlMode::Constant | RateControlMode::Adaptive => "",
+                    RateControlMode::Quality => " pass=qual quantizer=21",
+                };
+                format!(
+                    "x264enc {tune_flag}speed-preset={speed_preset} bitrate={bitrate_kbps} key-int-max={gop_frames}{rate_control_flag}"
+                )
+            }
             // vah264enc's `bitrate` property is kbps, same units as
             // x264enc's, and it has a `key-int-max` property with the exact
             // same name/semantics as x264enc's — verified via `gst-inspect-1.0
-            // vah264enc`. `rate-control=cbr` matches x264enc's implicit
-            // constant-bitrate behavior here (it's also vah264enc's default,
-            // spelled out for clarity). `target-usage=7` is the fastest end
-            // of vah264enc's 1 (best quality/slowest) – 7 (fastest/lowest
-            // quality) speed/quality knob — the VAAPI analogue of x264enc's
-            // `speed-preset=ultrafast`, appropriate for this pipeline's
-            // zero-latency screen-share use case.
-            EncoderBackend::Vaapi => format!(
-                "{VAAPI_ENCODER_ELEMENT} rate-control=cbr bitrate={bitrate_kbps} key-int-max={gop_frames} target-usage=7"
-            ),
+            // vah264enc`. `target-usage` is the VAAPI analogue of x264enc's
+            // `speed-preset` — 1 (best quality/slowest) – 7 (fastest/lowest
+            // quality) — see [`QualityLevel`]. `rate-control` is vah264enc's
+            // real, native rate-control enum — see [`RateControlMode`].
+            //
+            // `tune` has no VAAPI analogue at all (see [`TuneMode`]'s doc
+            // comment) — deliberately not read here; the field still exists
+            // on this backend's caller-facing settings so the control can be
+            // uniformly present in a request, it's simply a no-op when the
+            // active branch is VAAPI.
+            EncoderBackend::Vaapi => {
+                let _ = tune;
+                let target_usage = match quality_level {
+                    QualityLevel::Performance => 7,
+                    QualityLevel::Quality => 1,
+                };
+                let rate_control_value = match rate_control {
+                    RateControlMode::Constant => "cbr",
+                    RateControlMode::Adaptive => "vbr",
+                    RateControlMode::Quality => "cqp",
+                };
+                format!(
+                    "{VAAPI_ENCODER_ELEMENT} rate-control={rate_control_value} bitrate={bitrate_kbps} key-int-max={gop_frames} target-usage={target_usage}"
+                )
+            }
         }
     }
 
@@ -259,6 +320,69 @@ impl EncoderBackend {
             EncoderBackend::Vaapi => "NV12",
         }
     }
+}
+
+/// Low-latency vs. best-quality encoder tuning — [`EncoderBackend::Software`]
+/// only. Maps to x264enc's `tune` property (`zerolatency` vs. unset — see
+/// [`EncoderBackend::launch_fragment`]). [`EncoderBackend::Vaapi`]'s
+/// `vah264enc` has no real equivalent control, so this field is simply
+/// ignored on that backend (not an error, not surfaced to the caller — a
+/// destination watching a VAAPI-backed branch can still hold any
+/// [`TuneMode`] value, it just has no effect until/unless that destination's
+/// backend becomes [`EncoderBackend::Software`]).
+///
+/// Testing-only knob, like [`QualityLevel`]/[`RateControlMode`]: all three
+/// are live-adjustable per destination via `edit_destination`
+/// (`src-tauri/src/commands.rs`), routed through
+/// [`destination::ChangeTier::BranchSwap`] like every other
+/// resolution/fps/backend change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TuneMode {
+    /// x264enc `tune=zerolatency`. Matches this pipeline's previous
+    /// hardcoded behavior, so this is the default.
+    #[default]
+    LowLatency,
+    /// No `tune` property set — x264enc's general-purpose rate/distortion
+    /// tuning, trading some latency for better compression.
+    BestQuality,
+}
+
+/// Performance vs. quality encode-speed tradeoff, real on both backends:
+/// x264enc's `speed-preset` and vah264enc's `target-usage` are direct
+/// analogues of the same 1 (best quality/slowest) – 7 (fastest/lowest
+/// quality) knob (see [`EncoderBackend::launch_fragment`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QualityLevel {
+    /// x264enc `speed-preset=ultrafast` / vah264enc `target-usage=7` — the
+    /// fastest, lowest-quality end of both scales. Matches this pipeline's
+    /// previous hardcoded defaults, so this is the default.
+    #[default]
+    Performance,
+    /// x264enc `speed-preset=veryslow` / vah264enc `target-usage=1` — the
+    /// slowest, best-quality end of both scales.
+    Quality,
+}
+
+/// Constant/Adaptive/Quality rate control. Native, clean mapping onto
+/// [`EncoderBackend::Vaapi`]'s `rate-control` enum (`cbr`/`vbr`/`cqp`).
+/// [`EncoderBackend::Software`] has no equivalent enum — its closest control
+/// is `pass` (`cbr`/`quant`/`qual`) + `quantizer` — and in particular
+/// `Adaptive` is a deliberate **no-op** there relative to `Constant`: see
+/// [`EncoderBackend::launch_fragment`]'s `Why:` note on that asymmetry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RateControlMode {
+    /// vah264enc `rate-control=cbr`. x264enc: this backend's existing
+    /// implicit default (plain `bitrate=`, no `pass` override). Matches this
+    /// pipeline's previous hardcoded behavior on both backends, so this is
+    /// the default.
+    #[default]
+    Constant,
+    /// vah264enc `rate-control=vbr`. x264enc: no-op, identical output to
+    /// `Constant` — see this type's doc comment.
+    Adaptive,
+    /// vah264enc `rate-control=cqp`. x264enc: `pass=qual` (constant-quality,
+    /// driven by `quantizer` rather than a bitrate target).
+    Quality,
 }
 
 /// Auto-detects which [`EncoderBackend`] to use: prefers [`EncoderBackend::Vaapi`]
@@ -1304,6 +1428,12 @@ async fn start_sharing_with_source(
         // silently falls back to software per branch if this machine's VAAPI
         // can't actually run another concurrent encode session.
         backend: detect_encoder_backend(),
+        // Defaults matching this pipeline's previous hardcoded encoder
+        // properties exactly — see `TuneMode`/`QualityLevel`/
+        // `RateControlMode`'s `#[default]` doc comments.
+        tune: TuneMode::default(),
+        quality_level: QualityLevel::default(),
+        rate_control: RateControlMode::default(),
     };
 
     // Everything from here to the `CaptureHandle` below is fallible, and until
@@ -2611,6 +2741,16 @@ pub mod destination {
         pub framerate: u32,
         pub bitrate_kbps: u32,
         pub backend: EncoderBackend,
+        /// Low-latency vs. best-quality — [`super::TuneMode`]. Software-backend
+        /// only; a no-op while [`Self::backend`] is [`EncoderBackend::Vaapi`].
+        pub tune: TuneMode,
+        /// Performance vs. quality encode speed — [`super::QualityLevel`].
+        /// Real on both backends.
+        pub quality_level: QualityLevel,
+        /// Constant/Adaptive/Quality rate control — [`super::RateControlMode`].
+        /// Native on [`EncoderBackend::Vaapi`]; `Adaptive` is a no-op on
+        /// [`EncoderBackend::Software`] — see that type's doc comment.
+        pub rate_control: RateControlMode,
     }
 
     impl VideoParams {
@@ -2621,6 +2761,9 @@ pub mod destination {
                 framerate: self.framerate,
                 bitrate_kbps: self.bitrate_kbps,
                 backend: self.backend,
+                tune: self.tune,
+                quality_level: self.quality_level,
+                rate_control: self.rate_control,
             }
         }
     }
@@ -2683,6 +2826,16 @@ pub mod destination {
             || to.height != from.height
             || to.framerate != from.framerate
             || to.backend != from.backend
+            // `tune`/`quality_level`/`rate_control` are never live-writable
+            // (see [`super::TuneMode`]/[`super::QualityLevel`]/
+            // [`super::RateControlMode`]'s doc comments) — even though
+            // vah264enc's `target-usage`/`rate-control` technically are,
+            // routing every backend/control through the same `BranchSwap`
+            // path keeps behavior uniform and testable across both. A fast
+            // follow could special-case VAAPI to a true live write later.
+            || to.tune != from.tune
+            || to.quality_level != from.quality_level
+            || to.rate_control != from.rate_control
         {
             return ChangeTier::BranchSwap;
         }
@@ -3014,6 +3167,9 @@ pub mod destination {
                 framerate,
                 bitrate_kbps: 8000,
                 backend: EncoderBackend::Software,
+                tune: TuneMode::default(),
+                quality_level: QualityLevel::default(),
+                rate_control: RateControlMode::default(),
             }
         }
 
@@ -3329,6 +3485,36 @@ pub mod destination {
             );
         }
 
+        /// The three testing-oriented encoder tuning knobs
+        /// (`tune`/`quality_level`/`rate_control`) are never tier-1
+        /// live-writable even though vah264enc's `target-usage`/
+        /// `rate-control` technically are — see [`EncoderBackend::launch_fragment`]'s
+        /// `Why:` note. All three route through the same `BranchSwap` path
+        /// as resolution/fps/backend changes.
+        #[test]
+        fn tuning_knob_changes_are_tier_two() {
+            let source = SourceCaps { width: 1920, height: 1080, framerate: 60 };
+            let from = params(30);
+            assert_eq!(
+                classify_change(source, from, VideoParams { tune: TuneMode::BestQuality, ..from }),
+                ChangeTier::BranchSwap
+            );
+            assert_eq!(
+                classify_change(source, from, VideoParams { quality_level: QualityLevel::Quality, ..from }),
+                ChangeTier::BranchSwap
+            );
+            assert_eq!(
+                classify_change(source, from, VideoParams { rate_control: RateControlMode::Adaptive, ..from }),
+                ChangeTier::BranchSwap
+            );
+            assert_eq!(
+                classify_change(source, from, VideoParams { rate_control: RateControlMode::Quality, ..from }),
+                ChangeTier::BranchSwap
+            );
+            // No change at all in any of the three: still `Unchanged`.
+            assert_eq!(classify_change(source, from, from), ChangeTier::Unchanged);
+        }
+
         /// A resolution change that *also* raises fps past the source cap is
         /// tier 3, not tier 2 — the fps check has to win.
         #[test]
@@ -3436,6 +3622,12 @@ pub mod branch {
         pub framerate: u32,
         pub bitrate_kbps: u32,
         pub backend: EncoderBackend,
+        /// See [`super::TuneMode`].
+        pub tune: TuneMode,
+        /// See [`super::QualityLevel`].
+        pub quality_level: QualityLevel,
+        /// See [`super::RateControlMode`].
+        pub rate_control: RateControlMode,
     }
 
     /// A live encode branch built by [`add_branch`]: a `gst::Bin` already
@@ -3646,7 +3838,13 @@ pub mod branch {
         // `MAX_FRAMERATE`'s doc comment for why this can never be skipped.
         let framerate = settings.framerate.clamp(MIN_FRAMERATE, MAX_FRAMERATE);
         let gop_frames = GOP_SECONDS * framerate;
-        let encoder = settings.backend.launch_fragment(settings.bitrate_kbps, gop_frames);
+        let encoder = settings.backend.launch_fragment(
+            settings.bitrate_kbps,
+            gop_frames,
+            settings.tune,
+            settings.quality_level,
+            settings.rate_control,
+        );
         let raw_format = settings.backend.raw_format();
         // `Why` a size-less capsfilter when either axis is 0: 0 is this
         // codebase's "whatever the source is producing" sentinel (see
@@ -4060,7 +4258,7 @@ pub mod branch {
         KeptOld(EncodeBranch, anyhow::Error),
     }
 
-    /// Tier-2 ([`super::destination::ChangeTier::BranchSwap`]) end to end:
+    /// Tier-2 ([`destination::ChangeTier::BranchSwap`]) end to end:
     /// mark the destination `Rebuilding`, build the replacement branch
     /// alongside the still-running original, wait for the **new** branch's
     /// first IDR, only then flip authority and tear the original down.
@@ -4212,6 +4410,9 @@ pub mod branch {
                 framerate: 15,
                 bitrate_kbps: 500,
                 backend: EncoderBackend::Software,
+                tune: TuneMode::default(),
+                quality_level: QualityLevel::default(),
+                rate_control: RateControlMode::default(),
             }
         }
 
@@ -4386,7 +4587,13 @@ pub mod branch {
         /// down completely and every dynamic-vs-dynamic test would still
         /// pass.
         fn build_fixed_branch_test_pipeline() -> (gst::Pipeline, gst::Element, gst_app::AppSink, gst_app::AppSink) {
-            let encoder = EncoderBackend::Software.launch_fragment(500, 30);
+            let encoder = EncoderBackend::Software.launch_fragment(
+                500,
+                30,
+                TuneMode::default(),
+                QualityLevel::default(),
+                RateControlMode::default(),
+            );
             let raw_format = EncoderBackend::Software.raw_format();
             let description = format!(
                 "videotestsrc is-live=true pattern=smpte \
@@ -4627,6 +4834,9 @@ pub mod branch {
                 framerate: 15,
                 bitrate_kbps: 500,
                 backend: EncoderBackend::Software,
+                tune: TuneMode::default(),
+                quality_level: QualityLevel::default(),
+                rate_control: RateControlMode::default(),
             }
         }
 
@@ -5409,6 +5619,9 @@ pub mod branch {
                 framerate: 30,
                 bitrate_kbps: 4_000,
                 backend: EncoderBackend::Software,
+                tune: TuneMode::default(),
+                quality_level: QualityLevel::default(),
+                rate_control: RateControlMode::default(),
             };
 
             let result = add_branch_live(&built.pipeline, &built.tee, BranchId(1), settings).await;
@@ -5569,7 +5782,13 @@ mod tests {
     /// permission grant this test environment can't provide), runs it, and
     /// returns whether at least one encoded H.264 access unit came out.
     fn run_backend_and_expect_encoded_buffer(backend: EncoderBackend) -> bool {
-        let encoder = backend.launch_fragment(DEFAULT_BITRATE_KBPS, GOP_SECONDS * DEFAULT_FRAMERATE);
+        let encoder = backend.launch_fragment(
+            DEFAULT_BITRATE_KBPS,
+            GOP_SECONDS * DEFAULT_FRAMERATE,
+            TuneMode::default(),
+            QualityLevel::default(),
+            RateControlMode::default(),
+        );
         let raw_format = backend.raw_format();
         let description = format!(
             "videotestsrc num-buffers=10 \
@@ -5630,6 +5849,175 @@ mod tests {
         );
     }
 
+    /// Builds just the encoder element (no surrounding pipeline) from
+    /// [`EncoderBackend::launch_fragment`]'s output, so a test can read back
+    /// the real GStreamer properties the tuning knobs are supposed to set —
+    /// the same "construct via `gst::parse::launch`, downcast, read
+    /// `.property(...)`" pattern [`EncodeBranch::bitrate_kbps`] and its
+    /// tests already use, just without a whole pipeline around it.
+    fn build_encoder_element(
+        backend: EncoderBackend,
+        tune: TuneMode,
+        quality_level: QualityLevel,
+        rate_control: RateControlMode,
+    ) -> gst::Element {
+        let fragment = backend.launch_fragment(4000, 60, tune, quality_level, rate_control);
+        gst::parse::launch(&fragment).unwrap_or_else(|e| panic!("encoder fragment '{fragment}' should parse: {e}"))
+    }
+
+    /// [`TuneMode`] only has a real effect on the software backend — see that
+    /// type's doc comment. `LowLatency` sets x264enc's `tune` bitmask to
+    /// include `zerolatency` (`0x4`); `BestQuality` leaves it unset (`0x0`,
+    /// x264enc's default) since there is no explicit "best quality" tune
+    /// value to set, only the absence of the low-latency one.
+    #[test]
+    fn tune_mode_maps_to_x264enc_tune_property() {
+        if gst::init().is_err() {
+            eprintln!("skipping: gstreamer not available in this environment");
+            return;
+        }
+
+        let low_latency = build_encoder_element(
+            EncoderBackend::Software,
+            TuneMode::LowLatency,
+            QualityLevel::default(),
+            RateControlMode::default(),
+        );
+        let low_latency_tune = low_latency.property_value("tune").serialize().unwrap();
+        assert!(
+            low_latency_tune.to_lowercase().contains("zero"),
+            "TuneMode::LowLatency should set x264enc's `tune` flags to include zerolatency, got '{low_latency_tune}'"
+        );
+
+        let best_quality = build_encoder_element(
+            EncoderBackend::Software,
+            TuneMode::BestQuality,
+            QualityLevel::default(),
+            RateControlMode::default(),
+        );
+        let best_quality_tune = best_quality.property_value("tune").serialize().unwrap();
+        assert!(
+            !best_quality_tune.to_lowercase().contains("zero"),
+            "TuneMode::BestQuality should leave x264enc's `tune` property unset, got '{best_quality_tune}'"
+        );
+    }
+
+    /// [`QualityLevel`] has a real, direct analogue on both backends:
+    /// x264enc's `speed-preset` and vah264enc's `target-usage`.
+    #[test]
+    fn quality_level_maps_to_speed_preset_and_target_usage() {
+        if gst::init().is_err() {
+            eprintln!("skipping: gstreamer not available in this environment");
+            return;
+        }
+
+        let performance = build_encoder_element(
+            EncoderBackend::Software,
+            TuneMode::default(),
+            QualityLevel::Performance,
+            RateControlMode::default(),
+        );
+        // x264enc's `speed-preset` is an enum GEnum; comparing its nick
+        // avoids hardcoding the underlying integer value.
+        assert_eq!(performance.property_value("speed-preset").serialize().unwrap(), "ultrafast");
+
+        let quality = build_encoder_element(
+            EncoderBackend::Software,
+            TuneMode::default(),
+            QualityLevel::Quality,
+            RateControlMode::default(),
+        );
+        assert_eq!(quality.property_value("speed-preset").serialize().unwrap(), "veryslow");
+
+        if gst::ElementFactory::make(VAAPI_ENCODER_ELEMENT).build().is_err() {
+            eprintln!("skipping VAAPI half: '{VAAPI_ENCODER_ELEMENT}' is not available in this environment");
+            return;
+        }
+
+        let vaapi_performance = build_encoder_element(
+            EncoderBackend::Vaapi,
+            TuneMode::default(),
+            QualityLevel::Performance,
+            RateControlMode::default(),
+        );
+        assert_eq!(vaapi_performance.property::<u32>("target-usage"), 7);
+
+        let vaapi_quality = build_encoder_element(
+            EncoderBackend::Vaapi,
+            TuneMode::default(),
+            QualityLevel::Quality,
+            RateControlMode::default(),
+        );
+        assert_eq!(vaapi_quality.property::<u32>("target-usage"), 1);
+    }
+
+    /// [`RateControlMode`] is a clean, native mapping onto vah264enc's own
+    /// `rate-control` enum; on x264enc, `Adaptive` is a deliberate no-op
+    /// relative to `Constant` (see [`EncoderBackend::launch_fragment`]'s
+    /// `Why:` note) while `Quality` switches to `pass=qual`.
+    #[test]
+    fn rate_control_mode_maps_per_backend() {
+        if gst::init().is_err() {
+            eprintln!("skipping: gstreamer not available in this environment");
+            return;
+        }
+
+        let x264_constant = build_encoder_element(
+            EncoderBackend::Software,
+            TuneMode::default(),
+            QualityLevel::default(),
+            RateControlMode::Constant,
+        );
+        let x264_adaptive = build_encoder_element(
+            EncoderBackend::Software,
+            TuneMode::default(),
+            QualityLevel::default(),
+            RateControlMode::Adaptive,
+        );
+        assert_eq!(
+            x264_constant.property_value("pass").serialize().unwrap(),
+            x264_adaptive.property_value("pass").serialize().unwrap(),
+            "Adaptive must be a no-op relative to Constant on the software backend"
+        );
+
+        let x264_quality = build_encoder_element(
+            EncoderBackend::Software,
+            TuneMode::default(),
+            QualityLevel::default(),
+            RateControlMode::Quality,
+        );
+        assert_eq!(x264_quality.property_value("pass").serialize().unwrap(), "qual");
+
+        if gst::ElementFactory::make(VAAPI_ENCODER_ELEMENT).build().is_err() {
+            eprintln!("skipping VAAPI half: '{VAAPI_ENCODER_ELEMENT}' is not available in this environment");
+            return;
+        }
+
+        let vaapi_constant = build_encoder_element(
+            EncoderBackend::Vaapi,
+            TuneMode::default(),
+            QualityLevel::default(),
+            RateControlMode::Constant,
+        );
+        assert_eq!(vaapi_constant.property_value("rate-control").serialize().unwrap(), "cbr");
+
+        let vaapi_adaptive = build_encoder_element(
+            EncoderBackend::Vaapi,
+            TuneMode::default(),
+            QualityLevel::default(),
+            RateControlMode::Adaptive,
+        );
+        assert_eq!(vaapi_adaptive.property_value("rate-control").serialize().unwrap(), "vbr");
+
+        let vaapi_quality = build_encoder_element(
+            EncoderBackend::Vaapi,
+            TuneMode::default(),
+            QualityLevel::default(),
+            RateControlMode::Quality,
+        );
+        assert_eq!(vaapi_quality.property_value("rate-control").serialize().unwrap(), "cqp");
+    }
+
     /// Exercises the two mechanisms `pump_loop` relies on for
     /// pause-at-zero-subscribers/keyframe-on-new-subscriber (see this
     /// module's doc comment and [`CaptureControlEvent`]) directly against a
@@ -5662,7 +6050,13 @@ mod tests {
         // A huge GOP so nothing but the very first frame is a keyframe
         // within this test's short run, isolating the force-key-unit
         // event's effect from x264enc's own periodic keyframing.
-        let encoder = backend.launch_fragment(DEFAULT_BITRATE_KBPS, 10_000);
+        let encoder = backend.launch_fragment(
+            DEFAULT_BITRATE_KBPS,
+            10_000,
+            TuneMode::default(),
+            QualityLevel::default(),
+            RateControlMode::default(),
+        );
         let raw_format = backend.raw_format();
         let description = format!(
             "videotestsrc is-live=true \
@@ -5763,7 +6157,13 @@ mod tests {
         }
 
         let backend = EncoderBackend::Software;
-        let encoder = backend.launch_fragment(DEFAULT_BITRATE_KBPS, GOP_SECONDS * DEFAULT_FRAMERATE);
+        let encoder = backend.launch_fragment(
+            DEFAULT_BITRATE_KBPS,
+            GOP_SECONDS * DEFAULT_FRAMERATE,
+            TuneMode::default(),
+            QualityLevel::default(),
+            RateControlMode::default(),
+        );
         let raw_format = backend.raw_format();
         let description = format!(
             "videotestsrc num-buffers=40 \
@@ -5926,6 +6326,9 @@ mod tests {
             framerate: 15,
             bitrate_kbps: 500,
             backend: EncoderBackend::Software,
+            tune: TuneMode::default(),
+            quality_level: QualityLevel::default(),
+            rate_control: RateControlMode::default(),
         })
         .expect("first branch should build");
         let second = branch::add_branch(&built.pipeline, &built.tee, branch::BranchId(2), branch::EncodeSettings {
@@ -5934,6 +6337,9 @@ mod tests {
             framerate: 10,
             bitrate_kbps: 500,
             backend: EncoderBackend::Software,
+            tune: TuneMode::default(),
+            quality_level: QualityLevel::default(),
+            rate_control: RateControlMode::default(),
         })
         .expect("second branch should build");
 
@@ -5994,6 +6400,9 @@ mod tests {
                     framerate: configured_fps,
                     bitrate_kbps: DEFAULT_BITRATE_KBPS,
                     backend: EncoderBackend::Software,
+                    tune: TuneMode::default(),
+                    quality_level: QualityLevel::default(),
+                    rate_control: RateControlMode::default(),
                 },
             )
             .expect("encode branch should build on the live pipeline");
@@ -6202,6 +6611,9 @@ mod tests {
             framerate: DEFAULT_FRAMERATE,
             bitrate_kbps: DEFAULT_BITRATE_KBPS,
             backend: detect_encoder_backend(),
+            tune: TuneMode::default(),
+            quality_level: QualityLevel::default(),
+            rate_control: RateControlMode::default(),
         };
         let result = branch::add_branch_live(&built.pipeline, &built.tee, branch::BranchId(0), settings).await;
         let (branch, _idr) = match result {

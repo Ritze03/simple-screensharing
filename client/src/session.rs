@@ -280,6 +280,9 @@ pub const AUDIO_DESTINATION_PARAMS: capture::destination::VideoParams = capture:
     framerate: 0,
     bitrate_kbps: 0,
     backend: capture::EncoderBackend::Software,
+    tune: capture::TuneMode::LowLatency,
+    quality_level: capture::QualityLevel::Performance,
+    rate_control: capture::RateControlMode::Constant,
 };
 
 /// A destination's in-progress lifecycle beyond what `DestinationState`
@@ -314,6 +317,13 @@ pub struct DestEdit {
     /// into the encoders without ever touching this field, so switching back
     /// to Per-Stream restores exactly what the user had set here.
     pub bitrate_kbps: u32,
+    /// Low-latency vs. best-quality — `capture::TuneMode`. Testing-oriented
+    /// encoder tuning knob; see that type's doc comment.
+    pub tune: capture::TuneMode,
+    /// Performance vs. quality encode speed — `capture::QualityLevel`.
+    pub quality_level: capture::QualityLevel,
+    /// Constant/Adaptive/Quality rate control — `capture::RateControlMode`.
+    pub rate_control: capture::RateControlMode,
 }
 
 /// One room this capture is being sent into: the room, plus the `stream_id`
@@ -389,7 +399,14 @@ impl Destination {
     /// A fresh edit buffer matching this destination's current settings — the
     /// state a row shows before the user changes anything.
     pub fn edit_from(params: capture::destination::VideoParams) -> DestEdit {
-        DestEdit { scale_percent: 100, framerate: params.framerate, bitrate_kbps: params.bitrate_kbps }
+        DestEdit {
+            scale_percent: 100,
+            framerate: params.framerate,
+            bitrate_kbps: params.bitrate_kbps,
+            tune: params.tune,
+            quality_level: params.quality_level,
+            rate_control: params.rate_control,
+        }
     }
 
     /// Resolve this row's edit buffer into concrete `VideoParams` against what
@@ -411,6 +428,9 @@ impl Destination {
             framerate: self.edit.framerate,
             bitrate_kbps: self.edit.bitrate_kbps,
             backend: self.live_params().backend,
+            tune: self.edit.tune,
+            quality_level: self.edit.quality_level,
+            rate_control: self.edit.rate_control,
         }
     }
 }
@@ -1130,6 +1150,9 @@ impl AppState {
             framerate,
             bitrate_kbps,
             backend: capture::EncoderBackend::default(),
+            tune: capture::TuneMode::default(),
+            quality_level: capture::QualityLevel::default(),
+            rate_control: capture::RateControlMode::default(),
         };
         let (tx, rx) = oneshot::channel();
         self.captures.insert(
@@ -1197,6 +1220,9 @@ impl AppState {
                 framerate: self.framerate,
                 bitrate_kbps: self.bitrate_kbps,
                 backend: capture::EncoderBackend::default(),
+                tune: capture::TuneMode::default(),
+                quality_level: capture::QualityLevel::default(),
+                rate_control: capture::RateControlMode::default(),
             });
 
         let Some(room) = self.rooms.get_mut(&room_handle) else { return };

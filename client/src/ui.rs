@@ -2285,10 +2285,20 @@ mod session_model_tests {
                 framerate: DEFAULT_FRAMERATE,
                 bitrate_kbps: DEFAULT_BITRATE_KBPS,
                 backend: capture::EncoderBackend::default(),
+                tune: capture::TuneMode::default(),
+                quality_level: capture::QualityLevel::default(),
+                rate_control: capture::RateControlMode::default(),
             },
             runtime: None,
             pending: None,
-            edit: DestEdit { scale_percent: 100, framerate: DEFAULT_FRAMERATE, bitrate_kbps: DEFAULT_BITRATE_KBPS },
+            edit: DestEdit {
+                scale_percent: 100,
+                framerate: DEFAULT_FRAMERATE,
+                bitrate_kbps: DEFAULT_BITRATE_KBPS,
+                tune: capture::TuneMode::default(),
+                quality_level: capture::QualityLevel::default(),
+                rate_control: capture::RateControlMode::default(),
+            },
             apply_rx: None,
         }
     }

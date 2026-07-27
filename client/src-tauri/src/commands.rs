@@ -246,6 +246,15 @@ pub fn transfer_destination(managed: State<'_, Managed>, destination_id: u32, ta
 }
 
 /// "Apply" clicked on a destination row's settings edit.
+///
+/// `tune`/`quality_level`/`rate_control` are the three testing-oriented
+/// encoder tuning knobs (`capture::TuneMode`/`QualityLevel`/
+/// `RateControlMode`) — snake_case strings parsed via
+/// `dto::parse_tune_mode`/`parse_quality_level`/`parse_rate_control_mode`,
+/// the same convention `set_bandwidth_mode` uses. Any change to one of the
+/// three (like a resolution/framerate/backend change) is applied as a
+/// `ChangeTier::BranchSwap` by `AppState::apply_destination_edit` →
+/// `capture::destination::classify_change` — never a live property write.
 #[tauri::command]
 pub fn edit_destination(
     managed: State<'_, Managed>,
@@ -253,15 +262,26 @@ pub fn edit_destination(
     scale_percent: u32,
     framerate: u32,
     bitrate_kbps: u32,
-) {
+    tune: String,
+    quality_level: String,
+    rate_control: String,
+) -> Result<(), String> {
+    let tune = dto::parse_tune_mode(&tune)?;
+    let quality_level = dto::parse_quality_level(&quality_level)?;
+    let rate_control = dto::parse_rate_control_mode(&rate_control)?;
+
     let mut state = managed.state.lock().unwrap();
     let destination_id = DestinationId(destination_id);
     state.with_destination(destination_id, |dest| {
         dest.edit.scale_percent = scale_percent;
         dest.edit.framerate = framerate;
         dest.edit.bitrate_kbps = bitrate_kbps;
+        dest.edit.tune = tune;
+        dest.edit.quality_level = quality_level;
+        dest.edit.rate_control = rate_control;
     });
     state.apply_destination_edit(destination_id);
+    Ok(())
 }
 
 // See `join_room`'s `Why:` note above — `stop_destination` spawns.
