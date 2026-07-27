@@ -135,36 +135,68 @@ const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 // The event bus SSE reads from and driver.rs publishes to.
 // ---------------------------------------------------------------------
 
-/// Generalizes `video_server.rs`'s single-slot `Mailbox` from "latest video
-/// frame" to "latest emitted event": the same "overwrite the one slot, bump a
-/// generation counter, block a reader on `Condvar` until it changes" shape,
-/// just carrying a `(event name, JSON payload)` pair instead of a JPEG.
+/// A small ordered, bounded queue of emitted events, broadcast to every SSE
+/// reader via `Condvar`, replacing `app_handle.emit()`.
 ///
-/// `Why this can coalesce two distinct events into one delivery (and that's
-/// an accepted tradeoff, not a bug):` `driver.rs`'s tick loop can publish
-/// several different events (e.g. `presence-updated` then
-/// `destination-state-changed`) within the same lock scope, faster than any
-/// reader could possibly observe the first one — same as a producer thread in
-/// `video_server.rs` can encode a new frame before a slow reader drained the
-/// last one. A reader that was blocked mid-`wait_next` when both publishes
-/// happened only ever sees the *last* one. This is fine here for the same
-/// reason it's fine for video frames: every one of these 6 events exists to
-/// tell the frontend "go re-fetch the thing this describes" (see
-/// `driver.rs`'s `destination-state-changed`/`"removed"` `Why:` note — the
-/// payload is frequently not even meaningful beyond "something changed"), not
-/// to deliver a reliable, ordered log of every state transition. A dropped
-/// *notification* just means the next one (or the client's own periodic
-/// re-fetch) catches the frontend up; nothing here promises delivery of every
-/// individual event.
+/// `Why a bounded queue, not a single overwritable slot (as an earlier
+/// version of this struct was):` a single-slot "overwrite + bump a
+/// generation counter" mailbox — mirroring `video_server.rs`'s `Mailbox` —
+/// was tried first, on the theory that coalescing same-kind duplicate
+/// notifications is harmless (it is: nothing here promises a reliable,
+/// ordered log of every state transition, just "go re-fetch the thing this
+/// describes"). But `driver.rs`'s tick loop always publishes *several
+/// different* events within one synchronous call — critically, its
+/// `stream-stats-updated` fires **unconditionally every tick**, always last,
+/// right after any diff-triggered `presence-updated`/`destination-state-changed`
+/// that tick also happened to produce. With a single slot, that ordering is
+/// fatal, not just lossy: `stream-stats-updated` deterministically overwrites
+/// the diff event before any reader can plausibly wake, re-lock, and observe
+/// it — there is no OS yield point between the `publish()` calls, so a reader
+/// essentially never wins that race. Confirmed directly against this real
+/// struct (`repro_tests::same_tick_publishes_starve_all_but_the_last_event`):
+/// publishing `presence-updated` then `stream-stats-updated` back-to-back, a
+/// fresh reader that then calls `wait_next` sees *only*
+/// `stream-stats-updated` — `presence-updated` is gone, always, not
+/// occasionally. That was the real cause of "ROOMS sidebar active-stream
+/// count stuck at 0 until an unrelated manual refresh" and "Stream Control's
+/// stopped-destination card never disappears": both events fire correctly in
+/// `driver.rs`, and the frontend listener for each is correct and already
+/// wired up (see `shell.js`'s `wireEvents`), but the event essentially never
+/// survives the trip through this bus.
+///
+/// A small ring buffer with a monotonic sequence number per entry fixes this:
+/// every distinct `publish()` gets its own slot, and each reader tracks its
+/// own read cursor (`last_seen`, a sequence number, not a generation) so it
+/// drains every event published since it last read, in order, not just
+/// whatever was newest at wake time. `MAX_BUFFERED` bounds memory for a
+/// reader that's gone away without cleanup (matching the old struct's
+/// bounded-memory property) — only a reader that falls more than
+/// `MAX_BUFFERED` events behind (a full second-plus of ticks with the default
+/// `TICK_INTERVAL`) can still lose events, which is the same "a dropped
+/// notification is fine, the next one or a periodic re-fetch catches up"
+/// tradeoff as before, just no longer triggered by the *ordinary*, every-tick
+/// case above.
 pub struct EventBus {
     inner: Mutex<EventBusInner>,
     cvar: Condvar,
 }
 
+/// How many recent events `EventBus` keeps for a reader to catch up on. Only
+/// needs to cover a handful of events per tick, generously multiplied — see
+/// struct doc's `Why a bounded queue` note for what this actually bounds.
+const MAX_BUFFERED: usize = 64;
+
 #[derive(Default)]
 struct EventBusInner {
-    generation: u64,
-    event: Option<(String, Value)>,
+    /// Sequence number the *next* published event will get. Doubles as "how
+    /// many events have ever been published", so a fresh reader can start
+    /// its cursor here to see only what's published from now on (no replay
+    /// of history from before it connected — matching what `app_handle.emit()`
+    /// did).
+    next_seq: u64,
+    /// Ring buffer of the most recent events, oldest first, each tagged with
+    /// the sequence number it was published at.
+    buffer: std::collections::VecDeque<(u64, String, Value)>,
 }
 
 impl EventBus {
@@ -176,25 +208,36 @@ impl EventBus {
     /// calls it used to make.
     pub fn publish(&self, name: &str, payload: Value) {
         let mut inner = self.inner.lock().unwrap();
-        inner.event = Some((name.to_string(), payload));
-        inner.generation = inner.generation.wrapping_add(1);
+        let seq = inner.next_seq;
+        inner.next_seq += 1;
+        inner.buffer.push_back((seq, name.to_string(), payload));
+        if inner.buffer.len() > MAX_BUFFERED {
+            inner.buffer.pop_front();
+        }
         self.cvar.notify_all();
     }
 
-    /// Block until an event newer than `*last_seen` exists, or `timeout`
-    /// elapses first (`None`). See module doc for why a timed wait, not a
-    /// plain blocking one like `video_server.rs`'s `Mailbox::wait_next`: an
-    /// SSE connection has no per-client teardown signal equivalent to
+    /// The sequence number a brand-new reader should start its `last_seen`
+    /// cursor at, so it only ever sees events published from this point on.
+    pub fn subscribe(&self) -> u64 {
+        self.inner.lock().unwrap().next_seq
+    }
+
+    /// Block until an event at or after `*last_seen` exists, or `timeout`
+    /// elapses first (`None`). Returns (and advances `*last_seen` past) the
+    /// single oldest such event still in the buffer — call this in a loop to
+    /// drain everything a reader missed, in publish order, rather than only
+    /// ever the newest. See module doc for why a timed wait, not a plain
+    /// blocking one like `video_server.rs`'s `Mailbox::wait_next`: an SSE
+    /// connection has no per-client teardown signal equivalent to
     /// `VideoServer::stop_route`, so a client that vanishes with no further
     /// event ever published would otherwise block its serving thread forever.
     fn wait_next(&self, last_seen: &mut u64, timeout: Duration) -> Option<(String, Value)> {
         let mut inner = self.inner.lock().unwrap();
         loop {
-            if inner.generation != *last_seen
-                && let Some(event) = inner.event.clone()
-            {
-                *last_seen = inner.generation;
-                return Some(event);
+            if let Some((seq, name, payload)) = inner.buffer.iter().find(|(seq, _, _)| *seq >= *last_seen) {
+                *last_seen = seq + 1;
+                return Some((name.clone(), payload.clone()));
             }
             let (guard, result) = self.cvar.wait_timeout(inner, timeout).unwrap();
             inner = guard;
@@ -369,11 +412,10 @@ fn handle_sse(mut stream: TcpStream, app: &AppHandle) {
     }
 
     let managed = app.state::<Managed>();
-    // Same "start at generation 0, block for the *next* event" behavior as
-    // `video_server.rs`'s `Mailbox` — no replay of whatever happened before
-    // this client connected, matching what `app_handle.emit()` did (a
-    // listener registered after an emit never saw it either).
-    let mut last_seen = 0u64;
+    // Start the cursor at "now" — no replay of whatever happened before this
+    // client connected, matching what `app_handle.emit()` did (a listener
+    // registered after an emit never saw it either). See `EventBus::subscribe`.
+    let mut last_seen = managed.events.subscribe();
     loop {
         match managed.events.wait_next(&mut last_seen, SSE_KEEPALIVE) {
             Some((name, payload)) => {
@@ -553,4 +595,54 @@ fn write_preflight(stream: &mut TcpStream) {
          Connection: close\r\n\
          \r\n";
     let _ = stream.write_all(header.as_bytes());
+}
+
+#[cfg(test)]
+mod repro_tests {
+    //! Regression coverage for the "ROOMS sidebar active-stream count stuck
+    //! at 0" / "Stream Control stopped-destination card never disappears"
+    //! bugs (2026-07-28) — root-caused to `EventBus`'s old single-slot
+    //! design: `driver.rs`'s tick loop always publishes several distinct
+    //! events within one synchronous call (critically, `stream-stats-updated`
+    //! fires unconditionally *every* tick, always last, right after any
+    //! diff-triggered `presence-updated`/`destination-state-changed` that
+    //! tick also produced), and a single overwritable slot meant the
+    //! always-on event deterministically clobbered the diff event before any
+    //! reader could plausibly observe it — see `EventBus`'s doc comment for
+    //! the full `Why:`. This test pins the fixed, queue-based behavior: every
+    //! distinct event published in a burst is still delivered, in order.
+    use super::EventBus;
+    use serde_json::json;
+
+    #[test]
+    fn same_tick_publishes_are_all_delivered_in_order() {
+        let bus = EventBus::new();
+        let mut last_seen = bus.subscribe();
+
+        // Mirrors driver.rs's real per-tick publish order: a diff-triggered
+        // event, then the *unconditional* stream-stats-updated that fires
+        // every single tick, all inside the same synchronous function call
+        // with no reader synchronization in between.
+        bus.publish("presence-updated", json!({"activeStreamCount": 1}));
+        bus.publish("destination-state-changed", json!({"state": "removed"}));
+        bus.publish("stream-stats-updated", json!({"tick": 1}));
+
+        let timeout = std::time::Duration::from_millis(50);
+        let names: Vec<String> = std::iter::from_fn(|| bus.wait_next(&mut last_seen, timeout)).map(|(name, _)| name).collect();
+
+        // All three survive, in publish order — not just the last one.
+        assert_eq!(names, vec!["presence-updated", "destination-state-changed", "stream-stats-updated"]);
+    }
+
+    #[test]
+    fn a_fresh_subscriber_never_replays_events_published_before_it_connected() {
+        let bus = EventBus::new();
+        bus.publish("presence-updated", json!({"before": true}));
+
+        let mut last_seen = bus.subscribe();
+        bus.publish("presence-updated", json!({"before": false}));
+
+        let (_, payload) = bus.wait_next(&mut last_seen, std::time::Duration::from_millis(50)).expect("event published after subscribing");
+        assert_eq!(payload, json!({"before": false}));
+    }
 }
