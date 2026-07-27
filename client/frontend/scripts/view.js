@@ -40,6 +40,13 @@
 
   let mockWatched = [];
 
+  // Maps tile id (`${room_handle}:${owner}:${stream_id}`) -> that tile's fps
+  // `<span>`, rebuilt on every `render()`. `stream-stats-updated` fires
+  // unconditionally ~4x/sec (see `dto::StreamStatsUpdated`'s doc comment),
+  // so `updateStats` below patches just this span's text in place rather
+  // than re-rendering the tile, to avoid flicker.
+  let fpsSpans = new Map();
+
   async function fetchWatchedStreams() {
     if (window.__TAURI__) {
       const rooms = await window.__TAURI__.core.invoke("list_saved_rooms");
@@ -118,6 +125,11 @@
       return;
     }
 
+    // Full rebuild — every fps span reference from the previous render is
+    // now detached, so start the map fresh for `updateStats` to repopulate
+    // as tiles below register themselves.
+    fpsSpans = new Map();
+
     const grid = el("div", { className: "view-grid" });
     mockWatched.forEach((tile) => grid.appendChild(renderTile(tile)));
     root.appendChild(grid);
@@ -152,8 +164,15 @@
     }
 
     const top = el("div", { className: "media-tile-overlay-top" });
-    const labelText = tile.fps ? `${tile.ownerLabel} · ${tile.roomLabel} · ${tile.resolution}@${tile.fps}` : `${tile.ownerLabel} · ${tile.roomLabel}`;
-    top.appendChild(el("span", { className: "media-tile-label", text: labelText }));
+    const baseLabel = tile.resolution ? `${tile.ownerLabel} · ${tile.roomLabel} · ${tile.resolution}` : `${tile.ownerLabel} · ${tile.roomLabel}`;
+    const label = el("span", { className: "media-tile-label", text: baseLabel + " " });
+    // Separate `<span>` for the fps part so `updateStats` (below, fed by the
+    // `stream-stats-updated` event) can patch just this text node ~4x/sec
+    // without touching (and re-flickering) the rest of the tile.
+    const fpsSpan = el("span", { className: "media-tile-fps", text: tile.fps ? `@${tile.fps}fps` : "" });
+    label.appendChild(fpsSpan);
+    top.appendChild(label);
+    if (tile.id) fpsSpans.set(tile.id, fpsSpan);
     top.appendChild(
       el(
         "button",
@@ -175,7 +194,25 @@
     render();
   }
 
-  window.ViewTab = { refresh: init };
+  /** Fed by `shell.js`'s `stream-stats-updated` listener (~4x/sec,
+   * unconditional — see `dto::StreamStatsUpdated`'s doc comment). Only
+   * `payload.watched` is this tab's concern (`payload.destinations` is
+   * `stream-control.js`'s). Matches each entry to a rendered tile by
+   * `room_handle:owner:stream_id` (same id scheme `fetchWatchedStreams`
+   * already uses) and patches that tile's fps span text in place — no
+   * re-render, so no flicker. A tile with no matching entry (timing edge
+   * case, or the stream just stopped) is simply left showing its last
+   * value; real removal is handled elsewhere via `refresh()`. */
+  function updateStats(payload) {
+    if (!payload || !Array.isArray(payload.watched)) return;
+    for (const w of payload.watched) {
+      const span = fpsSpans.get(`${w.room_handle}:${w.owner}:${w.stream_id}`);
+      if (!span) continue;
+      span.textContent = `@${Math.round(w.received_fps)}fps`;
+    }
+  }
+
+  window.ViewTab = { refresh: init, updateStats };
 
   document.addEventListener("DOMContentLoaded", init);
 })();

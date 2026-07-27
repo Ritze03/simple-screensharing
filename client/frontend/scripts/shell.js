@@ -504,6 +504,14 @@
     listen("bandwidth-overshoot", (event) => {
       if (window.StreamControl) window.StreamControl.setOvershoot(event.payload.overshootKbps);
     });
+    listen("stream-stats-updated", (event) => {
+      // Fires unconditionally ~4x/sec (see `dto::StreamStatsUpdated`'s doc
+      // comment) — `destinations` is `stream-control.js`'s concern,
+      // `watched` (per-tile received fps) is the View tab's; each owner
+      // patches just its own DOM in place rather than re-rendering.
+      if (window.StreamControl && window.StreamControl.updateStats) window.StreamControl.updateStats(event.payload);
+      if (window.ViewTab && window.ViewTab.updateStats) window.ViewTab.updateStats(event.payload);
+    });
   }
 
   // ---------------------------------------------------------------------
