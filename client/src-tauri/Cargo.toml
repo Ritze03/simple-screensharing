@@ -24,6 +24,11 @@ rust-i18n = "4.2.1"
 # higher-level HTTP framework doesn't expose.
 turbojpeg = "1.5.1"
 socket2 = "0.6"
+
+# `api_server.rs`'s shared-secret auth token (32 random bytes, hex-encoded) —
+# already a locked workspace dependency (root `Cargo.toml`), just not
+# previously exposed to this crate.
+rand = "0.10.2"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
