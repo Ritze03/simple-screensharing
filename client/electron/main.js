@@ -337,15 +337,62 @@ app.whenReady().then(async () => {
   });
 });
 
+// Kill the sidecar and make sure it's actually gone: ask nicely (SIGTERM),
+// then force it (SIGKILL) if it hasn't exited within a short grace period.
+// Idempotent — safe to call from multiple lifecycle/signal paths.
+let sidecarKillRequested = false;
+function killSidecar() {
+  if (!sidecarProcess || sidecarKillRequested) return;
+  sidecarKillRequested = true;
+  const proc = sidecarProcess;
+  proc.kill("SIGTERM");
+  const forceKillTimer = setTimeout(() => {
+    if (!proc.killed) proc.kill("SIGKILL");
+  }, 2000);
+  // Don't let this timer keep the event loop (or process exit) alive.
+  forceKillTimer.unref();
+  proc.once("exit", () => clearTimeout(forceKillTimer));
+}
+
 app.on("window-all-closed", () => {
   sseAbort = true;
-  if (sidecarProcess) sidecarProcess.kill();
+  killSidecar();
   if (process.platform !== "darwin") app.quit();
 });
 
 app.on("before-quit", () => {
   sseAbort = true;
-  if (sidecarProcess) sidecarProcess.kill();
+  killSidecar();
 });
+
+// Explicit belt-and-suspenders signal handling, on top of the
+// before-quit/window-all-closed paths above.
+//
+// Verified experimentally (see task history / commit message): on this
+// Electron version (43.x, Linux), the browser process already installs its
+// own internal handling for SIGTERM/SIGHUP/SIGINT that triggers Electron's
+// normal quit flow — `before-quit` fires and the existing
+// `sidecarProcess.kill()` above already runs, even when the signal is sent
+// directly to just this process's PID (not its whole process group), and
+// even though `sidecarProcess` is spawned without `detached: true` (default
+// `false`, same process group as this one). So the sidecar was not actually
+// found to be orphaned by an external SIGTERM/SIGHUP in testing.
+//
+// That said, that cascade is undocumented Electron/Chromium-internal
+// behavior, not a public contract — it could change across Electron
+// versions or platforms. These explicit handlers make the guarantee
+// self-contained and add a SIGKILL fallback (via `killSidecar`'s grace
+// timer) that the implicit path doesn't provide if the sidecar ever hangs
+// on SIGTERM.
+function cleanupAndExit(signal) {
+  console.error(`[electron] received ${signal}, cleaning up sidecar and exiting`);
+  sseAbort = true;
+  killSidecar();
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => cleanupAndExit("SIGTERM"));
+process.on("SIGHUP", () => cleanupAndExit("SIGHUP"));
+process.on("SIGINT", () => cleanupAndExit("SIGINT"));
 
 module.exports = {};
