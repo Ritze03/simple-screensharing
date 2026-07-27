@@ -375,7 +375,15 @@ function openViewerWindow({ mode, displayId, streamKeys }) {
   // Calling setFullScreen before the window is on the correct
   // display/visible is unreliable on Linux WMs (can fullscreen on the
   // wrong/primary display instead of the requested one).
-  viewerWindow = new BrowserWindow({
+  //
+  // Built into a local `win` first (rather than assigning the module-level
+  // `viewerWindow` immediately) so every closure below can identify "am I
+  // still the current window?" by comparing against this specific instance,
+  // not the mutable module-level reference. Without that, a previous
+  // window's delayed/async `closed` event (it can still be closing when a
+  // second `openViewer` call already replaced it) would null out the
+  // *new* window's reference instead of its own.
+  const win = new BrowserWindow({
     x,
     y,
     width,
@@ -389,21 +397,22 @@ function openViewerWindow({ mode, displayId, streamKeys }) {
       nodeIntegration: false,
     },
   });
+  viewerWindow = win;
 
-  loadViewerContents(viewerWindow, streamKeys);
+  loadViewerContents(win, streamKeys);
 
-  viewerWindow.once("ready-to-show", () => {
-    if (!viewerWindow || viewerWindow.isDestroyed()) return;
+  win.once("ready-to-show", () => {
+    if (win.isDestroyed()) return;
     // Re-assert bounds before showing: some Linux WMs can reposition an
     // unmapped window on first map, so pin it again right before show().
-    viewerWindow.setBounds(target.bounds);
-    viewerWindow.show();
+    win.setBounds(target.bounds);
+    win.show();
 
     if (mode === "fullscreen") {
       // Standard fullscreen (EWMH _NET_WM_STATE_FULLSCREEN on X11 / xdg-shell
       // fullscreen on Wayland) — NOT kiosk mode, which is more aggressive
       // and less predictable across Linux window managers.
-      viewerWindow.setFullScreen(true);
+      win.setFullScreen(true);
     } else {
       // Borderless: full display bounds (not workArea — maximize() would
       // snap to workArea and exclude panel/taskbar space, which is wrong
@@ -411,21 +420,24 @@ function openViewerWindow({ mode, displayId, streamKeys }) {
       // WM-managed, alt-tabbable window otherwise: resizable, not
       // always-on-top, not skip-taskbar — chrome-free is the only
       // difference from a regular window.
-      viewerWindow.setBounds(target.bounds);
+      win.setBounds(target.bounds);
     }
   });
 
-  viewerWindow.on("leave-full-screen", () => {
+  win.on("leave-full-screen", () => {
     // Forwards an OS-level fullscreen exit (e.g. an Escape/WM gesture, not
     // triggered through our own setFullscreen(false) IPC call) to the
     // renderer so its UI state can stay in sync.
-    if (viewerWindow && !viewerWindow.isDestroyed()) {
-      viewerWindow.webContents.send("viewer-left-fullscreen");
+    if (!win.isDestroyed()) {
+      win.webContents.send("viewer-left-fullscreen");
     }
   });
 
-  viewerWindow.on("closed", () => {
-    viewerWindow = null;
+  win.on("closed", () => {
+    // Only clear the module-level reference if it still points at this
+    // window — a stale `closed` event from a window that was already
+    // replaced by a later `openViewer` call must not null out the new one.
+    if (viewerWindow === win) viewerWindow = null;
   });
 }
 
