@@ -418,4 +418,344 @@ mod tests {
         let result = join_room(app.state::<Managed>(), "not-a-valid-join-string".to_string(), String::new());
         assert!(result.is_ok(), "join_room should not fail outside a Tokio runtime context: {result:?}");
     }
+
+    /// Calls `f` on its own thread and waits up to `timeout` for it to
+    /// return. Used below to *detect* a hang: an in-process function call
+    /// that genuinely never returns can't otherwise be interrupted, so this
+    /// is how "this command call never resolved" gets turned into an
+    /// observable result instead of blocking the whole test process forever.
+    /// The spawned thread is deliberately leaked on a timeout (there's no
+    /// way to cancel a blocked native thread) — that's fine for a diagnostic
+    /// harness whose whole point is to leave the process alive afterward for
+    /// `gdb -p <pid> -batch -ex "thread apply all bt"` to inspect.
+    fn call_with_timeout<F, T>(label: &str, timeout: std::time::Duration, f: F) -> Option<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let start = std::time::Instant::now();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        match rx.recv_timeout(timeout) {
+            Ok(v) => {
+                eprintln!("[hang_repro] {label} returned after {:?}", start.elapsed());
+                Some(v)
+            }
+            Err(_) => {
+                eprintln!("[hang_repro] !!! HANG DETECTED: {label} did not return within {timeout:?}");
+                None
+            }
+        }
+    }
+
+    /// Stand-in for `driver::tick` that works against `tauri::test`'s
+    /// `MockRuntime` — `driver::tick`/`driver::spawn` are hard-wired to the
+    /// real `AppHandle<Wry<...>>` (they call `app_handle.emit(...)`, which
+    /// this diagnostic harness doesn't need), so this reimplements just the
+    /// state-polling half: the same `Managed::state` lock, the same
+    /// `AppState` poll methods, in the same order, on the same 250ms cadence
+    /// — everything that actually matters for reproducing a lock/scheduling
+    /// race, minus the Tauri event emission a mock app has no listener for
+    /// anyway. See `driver.rs`'s `tick` for the real (annotated) version this
+    /// mirrors.
+    fn test_tick(managed: &Managed) {
+        let mut state = managed.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = state.poll_connect_result();
+        state.poll_capture_states();
+        state.poll_pending_destinations();
+        state.poll_destination_edits();
+        state.poll_audio_sources();
+        state.drain_events(&managed.egui_ctx);
+        let _ = managed.egui_ctx.tex_manager().write().take_delta();
+        state.apply_bandwidth_allocation();
+    }
+
+    /// Polls `f` every 100ms until it returns `Some` or `timeout` elapses.
+    fn wait_for<T>(timeout: std::time::Duration, mut f: impl FnMut() -> Option<T>) -> Option<T> {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(v) = f() {
+                return Some(v);
+            }
+            if start.elapsed() > timeout {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    /// Manual diagnostic harness for the "repeated Stop→Share-Screen restart
+    /// cycles back to back with no pause between attempts ... permanently
+    /// wedges the backend" bug — see `superdoc/ui/FRONTEND-SHELL.md`'s
+    /// 2026-07-27 dated entry for the original report.
+    ///
+    /// Not a normal CI test: it needs a real relay server reachable at
+    /// `HANG_REPRO_RELAY` (`host:port`, default `127.0.0.1:4477`) and a real
+    /// xdg-desktop-portal screencast permission granted by hand for *every*
+    /// iteration (`capture.rs`'s `set_persist_mode(PersistMode::DoNot)` means
+    /// there is no way around a fresh picker each time). Run with:
+    ///
+    /// ```text
+    /// HANG_REPRO_RELAY=127.0.0.1:4477 HANG_REPRO_CYCLES=6 \
+    ///   cargo test --release -p simple-screensharing-client-tauri \
+    ///   -- --ignored --nocapture hang_repro_stop_share_cycles
+    /// ```
+    ///
+    /// Every command call goes through [`call_with_timeout`] so a hang is
+    /// *detected* (reported, with the process left alive) rather than
+    /// silently blocking the test forever — at that point, attach with
+    /// `gdb -p <pid> -batch -ex "thread apply all bt"` from another shell to
+    /// see exactly what every thread is doing.
+    ///
+    /// This calls the exact same `#[tauri::command]` wrapper functions the
+    /// real frontend's `invoke()` calls reach (not just the `_impl` helpers),
+    /// each from its own freshly spawned thread — the same "arbitrary
+    /// external, non-Tokio-runtime thread" context a real IPC dispatch uses
+    /// for a plain `fn` command (see `join_room`'s `Why:` note above) — while
+    /// `driver::spawn`'s real 250ms poll loop runs concurrently in the
+    /// background, exactly as in the real app.
+    #[test]
+    #[ignore]
+    fn hang_repro_stop_share_cycles() {
+        let _guard = isolated_config_home();
+        // Unlike `join_room_outside_a_tokio_runtime_does_not_panic` above,
+        // this test needs a real, *working* QUIC connection all the way
+        // through — building `Managed` inside a throwaway runtime and
+        // dropping that runtime (that test's pattern) leaves
+        // `AppState.endpoint` bound to a reactor that's already gone,
+        // failing every real connection with "endpoint stopping". Use
+        // `tauri::async_runtime::block_on`, exactly like `main.rs`'s real
+        // startup path, so the endpoint is bound inside Tauri's one
+        // persistent shared runtime instead of a throwaway one.
+        let managed = tauri::async_runtime::block_on(async { Managed::new() });
+
+        let app = tauri::test::mock_builder()
+            .manage(managed)
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("build mock tauri app");
+
+        let poller_handle = app.handle().clone();
+        tauri::async_runtime::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+            loop {
+                interval.tick().await;
+                test_tick(&poller_handle.state::<Managed>());
+            }
+        });
+
+        let relay = std::env::var("HANG_REPRO_RELAY").unwrap_or_else(|_| "127.0.0.1:4477".to_string());
+        let cycles: u32 = std::env::var("HANG_REPRO_CYCLES").ok().and_then(|s| s.parse().ok()).unwrap_or(6);
+
+        // A throwaway, non-cryptographic but unique-enough room id/key —
+        // this is a disposable test room on a local relay, not a real
+        // secret. `RoomId = [u8; 16]`, the room key is AES-256 (32 bytes).
+        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let mut room_id = [0u8; 16];
+        let mut room_key = [0u8; 32];
+        for (i, b) in room_id.iter_mut().enumerate() {
+            *b = (seed >> (i % 16 * 4)) as u8 ^ (i as u8);
+        }
+        for (i, b) in room_key.iter_mut().enumerate() {
+            *b = (seed >> (i % 16 * 4)) as u8 ^ (i as u8).wrapping_mul(31);
+        }
+        let join_string = simple_screensharing_client::net::format_join_string(&relay, &room_id, &room_key);
+
+        eprintln!("[hang_repro] joining {join_string}");
+        let handle = app.handle().clone();
+        let jr = join_room(handle.state::<Managed>(), join_string, "HangReproSharer".to_string());
+        assert!(jr.is_ok(), "join_room returned an error: {jr:?}");
+
+        let room_handle = wait_for(std::time::Duration::from_secs(15), || {
+            let managed = app.state::<Managed>();
+            let state = managed.state.lock().unwrap();
+            let status_str = match &state.status {
+                simple_screensharing_client::session::Status::Idle => "Idle".to_string(),
+                simple_screensharing_client::session::Status::Connecting => "Connecting".to_string(),
+                simple_screensharing_client::session::Status::Error(e) => format!("Error({e})"),
+            };
+            eprintln!(
+                "[hang_repro] waiting for connect: status={status_str} pending_connect={} rooms={}",
+                state.pending_connect.is_some(),
+                state.rooms.len()
+            );
+            state.rooms.keys().next().copied()
+        })
+        .expect("room should connect to the real relay within 15s — is HANG_REPRO_RELAY reachable?");
+        eprintln!("[hang_repro] joined room {room_handle:?}");
+
+        // `Why this loop tolerates an individual cycle being slow or failing
+        // outright, rather than treating that as the bug:` GStreamer/PipeWire
+        // genuinely can take a while (or fail once) to settle a brand-new
+        // capture started immediately after the previous one's teardown —
+        // that's real-world churn, not by itself "the backend is
+        // permanently wedged" (the actual reported bug). The property this
+        // harness actually needs to prove is the one from the report: that
+        // every `#[tauri::command]` call — regardless of what any individual
+        // capture attempt is doing — keeps resolving quickly, cycle after
+        // cycle. So every command call here still goes through
+        // `call_with_timeout` and any timeout is still a hard failure; only
+        // "this particular capture didn't reach Active" is treated as
+        // non-fatal and retried on the next cycle.
+        let mut activated = 0u32;
+        for cycle in 0..cycles {
+            eprintln!("[hang_repro] === cycle {cycle}/{cycles}: start_video_share ===");
+            let h = app.handle().clone();
+            let started = call_with_timeout("start_video_share", std::time::Duration::from_secs(5), move || {
+                start_video_share(h.state::<Managed>(), room_handle.0)
+            });
+            assert!(started.is_some(), "start_video_share itself hung — see thread dump");
+
+            eprintln!("[hang_repro] waiting for the capture to go Active (up to 30s) ...");
+            let capture_id = wait_for(std::time::Duration::from_secs(30), || {
+                let managed = app.state::<Managed>();
+                let state = managed.state.lock().unwrap();
+                state.captures.iter().find_map(|(id, c)| {
+                    matches!(c.status, simple_screensharing_client::session::ShareStatus::Active(_)).then_some(*id)
+                })
+            });
+
+            // Every cycle — active capture or not — must still leave the
+            // backend responsive. This is the actual regression check: prove
+            // via a real command round-trip that nothing has wedged, not just
+            // that the loop kept running.
+            let h = app.handle().clone();
+            let sanity =
+                call_with_timeout("list_saved_rooms (per-cycle responsiveness check)", std::time::Duration::from_secs(5), move || {
+                    list_saved_rooms(h.state::<Managed>())
+                });
+            assert!(
+                sanity.is_some(),
+                "cycle {cycle}: the backend is wedged — list_saved_rooms did not resolve. This is the actual bug. \
+                 pid {} is left running for `gdb -p <pid> -batch -ex \"thread apply all bt\"` (attach quickly).",
+                std::process::id()
+            );
+
+            let Some(capture_id) = capture_id else {
+                eprintln!(
+                    "[hang_repro] cycle {cycle}: capture never went Active within 30s, but the backend is still \
+                     responsive (list_saved_rooms OK) — real-world GStreamer/portal churn slowness, not the \
+                     reported permanent-wedge bug. Moving on to the next cycle."
+                );
+                continue;
+            };
+            activated += 1;
+            eprintln!("[hang_repro] capture {capture_id:?} is Active");
+
+            eprintln!(
+                "[hang_repro] === cycle {cycle}: stop_share, then IMMEDIATELY start_video_share again next \
+                 iteration — no pause (this is the reported trigger) ==="
+            );
+            let h = app.handle().clone();
+            let stopped = call_with_timeout("stop_share", std::time::Duration::from_secs(5), move || {
+                stop_share(h.state::<Managed>(), capture_id.0)
+            });
+            assert!(stopped.is_some(), "stop_share itself hung — see thread dump");
+            // Deliberately no sleep here — the next loop iteration's
+            // start_video_share fires immediately, while stop_share's spawned
+            // teardown task may still be in flight. That's the exact
+            // "no pause between attempts" repro condition from the report.
+        }
+
+        eprintln!(
+            "[hang_repro] stress cycles done ({activated}/{cycles} captures actually went Active) — final sanity \
+             check: does the backend still respond at all?"
+        );
+        let h = app.handle().clone();
+        let sanity = call_with_timeout("list_saved_rooms (post-stress sanity check)", std::time::Duration::from_secs(5), move || {
+            list_saved_rooms(h.state::<Managed>())
+        });
+        assert!(sanity.is_some(), "backend is permanently wedged: list_saved_rooms did not resolve after the stress cycles");
+        eprintln!("[hang_repro] backend still responds after {cycles} cycles — no hang this run.");
+    }
+
+    /// Same repro-harness shape as [`hang_repro_stop_share_cycles`], for the
+    /// *other* reported trigger: rapidly toggling bandwidth mode many times
+    /// against one live share, then Stop. See that test's doc comment for
+    /// run instructions/prerequisites (same `HANG_REPRO_RELAY` env var).
+    #[test]
+    #[ignore]
+    fn hang_repro_bandwidth_toggle_then_stop() {
+        let _guard = isolated_config_home();
+        let managed = tauri::async_runtime::block_on(async { Managed::new() });
+
+        let app = tauri::test::mock_builder()
+            .manage(managed)
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("build mock tauri app");
+
+        let poller_handle = app.handle().clone();
+        tauri::async_runtime::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+            loop {
+                interval.tick().await;
+                test_tick(&poller_handle.state::<Managed>());
+            }
+        });
+
+        let relay = std::env::var("HANG_REPRO_RELAY").unwrap_or_else(|_| "127.0.0.1:4477".to_string());
+        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let mut room_id = [0u8; 16];
+        let mut room_key = [0u8; 32];
+        for (i, b) in room_id.iter_mut().enumerate() {
+            *b = (seed >> (i % 16 * 4)) as u8 ^ (i as u8) ^ 0x55;
+        }
+        for (i, b) in room_key.iter_mut().enumerate() {
+            *b = (seed >> (i % 16 * 4)) as u8 ^ (i as u8).wrapping_mul(31) ^ 0x55;
+        }
+        let join_string = simple_screensharing_client::net::format_join_string(&relay, &room_id, &room_key);
+
+        eprintln!("[hang_repro2] joining {join_string}");
+        let handle = app.handle().clone();
+        let jr = join_room(handle.state::<Managed>(), join_string, "HangReproSharer2".to_string());
+        assert!(jr.is_ok(), "join_room returned an error: {jr:?}");
+
+        let room_handle = wait_for(std::time::Duration::from_secs(15), || {
+            app.state::<Managed>().state.lock().unwrap().rooms.keys().next().copied()
+        })
+        .expect("room should connect to the real relay within 15s — is HANG_REPRO_RELAY reachable?");
+        eprintln!("[hang_repro2] joined room {room_handle:?}");
+
+        let h = app.handle().clone();
+        let started = call_with_timeout("start_video_share", std::time::Duration::from_secs(5), move || {
+            start_video_share(h.state::<Managed>(), room_handle.0)
+        });
+        assert!(started.is_some(), "start_video_share itself hung");
+
+        let capture_id = wait_for(std::time::Duration::from_secs(30), || {
+            let managed = app.state::<Managed>();
+            let state = managed.state.lock().unwrap();
+            state.captures.iter().find_map(|(id, c)| {
+                matches!(c.status, simple_screensharing_client::session::ShareStatus::Active(_)).then_some(*id)
+            })
+        })
+        .expect("capture should go Active within 30s to set up this repro");
+        eprintln!("[hang_repro2] capture {capture_id:?} is Active — starting rapid bandwidth-mode toggle stress (15x, no pause)");
+
+        for i in 0..15 {
+            let mode = if i % 2 == 0 { "absolute" } else { "per_stream" };
+            let h = app.handle().clone();
+            let mode_owned = mode.to_string();
+            let result = call_with_timeout(&format!("set_bandwidth_mode({mode})"), std::time::Duration::from_secs(5), move || {
+                set_bandwidth_mode(h.state::<Managed>(), mode_owned)
+            });
+            assert!(result.is_some(), "set_bandwidth_mode hung on toggle {i} — see thread dump");
+        }
+
+        eprintln!("[hang_repro2] toggle stress done — now Stop, immediately");
+        let h = app.handle().clone();
+        let stopped = call_with_timeout("stop_share", std::time::Duration::from_secs(5), move || {
+            stop_share(h.state::<Managed>(), capture_id.0)
+        });
+        assert!(stopped.is_some(), "stop_share itself hung — see thread dump");
+
+        eprintln!("[hang_repro2] final sanity check: does the backend still respond?");
+        let h = app.handle().clone();
+        let sanity = call_with_timeout("list_saved_rooms (post-stress sanity check)", std::time::Duration::from_secs(5), move || {
+            list_saved_rooms(h.state::<Managed>())
+        });
+        assert!(sanity.is_some(), "backend is permanently wedged after bandwidth-toggle-then-Stop");
+        eprintln!("[hang_repro2] backend still responds — no hang this run.");
+    }
 }
