@@ -1035,6 +1035,11 @@ pub struct DestinationHandle {
     cmd_tx: mpsc::UnboundedSender<DestCmd>,
     runtime: destination::SharedDestination,
     encoder_fps: Arc<AtomicU32>,
+    /// This destination's live *sent* rate — see [`SENT_FPS_WINDOW`]. Distinct
+    /// from `encoder_fps`: this counts only access units that actually made
+    /// it onto the wire (`send_media_payload` returned `Ok`), so the two can
+    /// diverge on a send error.
+    sent_fps: Arc<AtomicU32>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -1054,6 +1059,11 @@ impl DestinationHandle {
     /// This destination's live encode rate — see [`ENCODER_FPS_WINDOW`].
     pub fn encoder_fps(&self) -> u32 {
         self.encoder_fps.load(Ordering::Relaxed)
+    }
+
+    /// This destination's live sent rate — see [`SENT_FPS_WINDOW`].
+    pub fn sent_fps(&self) -> u32 {
+        self.sent_fps.load(Ordering::Relaxed)
     }
 
     /// Tier-1 change ([`destination::ChangeTier::Bitrate`]): a live encoder
@@ -1455,6 +1465,7 @@ async fn spawn_destination(
 
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let encoder_fps = Arc::new(AtomicU32::new(0));
+    let sent_fps = Arc::new(AtomicU32::new(0));
     let task = tokio::spawn(destination_pump(
         client.clone(),
         stream_id,
@@ -1463,10 +1474,11 @@ async fn spawn_destination(
         encode_branch,
         runtime.clone(),
         encoder_fps.clone(),
+        sent_fps.clone(),
         cmd_rx,
     ));
 
-    Ok(DestinationHandle { key, stream_id, cmd_tx, runtime, encoder_fps, task })
+    Ok(DestinationHandle { key, stream_id, cmd_tx, runtime, encoder_fps, sent_fps, task })
 }
 
 /// Bridges `preview_sink`'s raw-RGB samples (the tee's low-rate branch, see
@@ -1701,6 +1713,12 @@ impl CaptureHandle {
     /// for an unknown key or a paused encoder.
     pub fn encoder_fps(&self, key: DestKey) -> u32 {
         self.destination(key).map(|d| d.encoder_fps()).unwrap_or(0)
+    }
+
+    /// This destination's live sent rate — see [`SENT_FPS_WINDOW`]. `0` for
+    /// an unknown key or a destination that isn't successfully sending.
+    pub fn sent_fps(&self, key: DestKey) -> u32 {
+        self.destination(key).map(|d| d.sent_fps()).unwrap_or(0)
     }
 
     /// Fan-out / transfer: start sending this *same capture* into another
@@ -2039,6 +2057,32 @@ fn record_encoder_frame(times: &mut VecDeque<Instant>, fps: &AtomicU32) {
     fps.store(rate.round() as u32, Ordering::Relaxed);
 }
 
+/// Sliding-window size for [`CaptureHandle::sent_fps`]'s live rate. Same
+/// width as [`ENCODER_FPS_WINDOW`] so the two numbers are directly
+/// comparable at a glance — a gap between them is a real signal (send
+/// errors), not an artifact of different smoothing.
+const SENT_FPS_WINDOW: Duration = ENCODER_FPS_WINDOW;
+
+/// Records that one encoded access unit was just handed off to the QUIC
+/// connection successfully (i.e. [`send_media_payload`] returned `Ok`, called
+/// from [`destination_pump`]'s appsink-sample arm right after
+/// [`record_encoder_frame`]) and recomputes [`CaptureHandle::sent_fps`]'s
+/// published rate — same sliding-window shape as `record_encoder_frame`, see
+/// its doc comment.
+fn record_sent_frame(times: &mut VecDeque<Instant>, fps: &AtomicU32) {
+    let now = Instant::now();
+    times.push_back(now);
+    while let Some(&oldest) = times.front() {
+        if now.duration_since(oldest) > SENT_FPS_WINDOW {
+            times.pop_front();
+        } else {
+            break;
+        }
+    }
+    let rate = times.len() as f64 / SENT_FPS_WINDOW.as_secs_f64();
+    fps.store(rate.round() as u32, Ordering::Relaxed);
+}
+
 /// Everything one destination's [`destination_pump`] can be asked to do.
 ///
 /// `Why a command channel rather than shared state the UI writes directly:`
@@ -2132,6 +2176,7 @@ async fn destination_pump(
     branch: branch::EncodeBranch,
     runtime: destination::SharedDestination,
     encoder_fps: Arc<AtomicU32>,
+    sent_fps: Arc<AtomicU32>,
     mut cmd_rx: mpsc::UnboundedReceiver<DestCmd>,
 ) {
     let start = Instant::now();
@@ -2145,6 +2190,9 @@ async fn destination_pump(
     // appsink, used to compute this destination's live encode rate — see
     // [`ENCODER_FPS_WINDOW`].
     let mut encoded_frame_times: VecDeque<Instant> = VecDeque::new();
+    // Sliding window of the `Instant`s each encoded access unit was
+    // successfully handed off to the QUIC connection — see [`SENT_FPS_WINDOW`].
+    let mut sent_frame_times: VecDeque<Instant> = VecDeque::new();
     // Mirrors this branch's valve so a `SubscriberCount` transition from one
     // non-zero count to another (e.g. 2 -> 1) doesn't spuriously re-force a
     // keyframe — only an actual 0 -> non-zero (or an explicit
@@ -2170,8 +2218,9 @@ async fn destination_pump(
                 match sample {
                     Some(sample) => {
                         record_encoder_frame(&mut encoded_frame_times, &encoder_fps);
-                        if let Err(e) = send_encoded_sample(&client, stream_id, &sample, start, &runtime) {
-                            tracing::warn!("dropping encoded frame for stream {stream_id}: {e:#}");
+                        match send_encoded_sample(&client, stream_id, &sample, start, &runtime) {
+                            Ok(()) => record_sent_frame(&mut sent_frame_times, &sent_fps),
+                            Err(e) => tracing::warn!("dropping encoded frame for stream {stream_id}: {e:#}"),
                         }
                     }
                     None => branch_ended = true,
@@ -2200,6 +2249,8 @@ async fn destination_pump(
                             // value.
                             encoded_frame_times.clear();
                             encoder_fps.store(0, Ordering::Relaxed);
+                            sent_frame_times.clear();
+                            sent_fps.store(0, Ordering::Relaxed);
                         }
                     }
                     Some(DestCmd::SubscriberCount(_)) => {

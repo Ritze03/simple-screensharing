@@ -238,4 +238,35 @@ fn tick(app_handle: &AppHandle, last: &mut Snapshot) {
         );
     }
     last.destinations = dest_snapshot;
+
+    // 6. Live throughput diagnostics: captured/sent FPS per outgoing
+    // destination, received FPS per watched stream. Unconditional every
+    // tick — see `dto::StreamStatsUpdated`'s doc comment for why this one
+    // is never diff-suppressed like the events above.
+    let mut destinations = Vec::new();
+    for capture in state.captures.values() {
+        let session::ShareStatus::Active(session::ShareHandle::Video(handle)) = &capture.status else { continue };
+        for &destination_id in capture.destinations.keys() {
+            let key = simple_screensharing_client::capture::DestKey(destination_id.0);
+            destinations.push(dto::DestinationStatsDto {
+                destination_id: destination_id.0,
+                captured_fps: handle.encoder_fps(key),
+                sent_fps: handle.sent_fps(key),
+            });
+        }
+    }
+
+    let mut watched = Vec::new();
+    for (handle, room) in &state.rooms {
+        for (&(owner, stream_id), entry) in room.watches.lock().unwrap().iter() {
+            let received_fps = entry.decoder.lock().unwrap().current_fps();
+            watched.push(dto::WatchedStatsDto { room_handle: handle.0, owner, stream_id, received_fps });
+        }
+    }
+
+    let stats = dto::StreamStatsUpdated { destinations, watched };
+    if let Ok(payload) = serde_json::to_value(&stats) {
+        let _ = app_handle.emit("stream-stats-updated", &stats);
+        managed.events.publish("stream-stats-updated", payload);
+    }
 }

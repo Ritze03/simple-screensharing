@@ -179,6 +179,47 @@ pub fn destination_state_label(state: &DestinationState) -> &'static str {
     state.label()
 }
 
+/// `stream-stats-updated` event payload — live throughput diagnostics,
+/// emitted unconditionally every driver tick (see `driver.rs`'s module
+/// docs). Unlike `presence-updated`/`destination-state-changed`, this is
+/// never diff-suppressed: FPS numbers change every tick, so suppressing
+/// no-op ticks would defeat the point of a live readout.
+#[derive(Serialize, Clone)]
+pub struct StreamStatsUpdated {
+    /// One entry per active capture destination (outgoing).
+    pub destinations: Vec<DestinationStatsDto>,
+    /// One entry per active watched stream (incoming).
+    pub watched: Vec<WatchedStatsDto>,
+}
+
+/// One outgoing destination's live throughput: `captured_fps` is
+/// `capture::CaptureHandle::encoder_fps` (encoded frames reaching the
+/// appsink, regardless of send outcome); `sent_fps` is
+/// `capture::CaptureHandle::sent_fps` (only frames that actually made it
+/// onto the wire) — the two can diverge on a send error.
+#[derive(Serialize, Clone)]
+pub struct DestinationStatsDto {
+    pub destination_id: u32,
+    pub captured_fps: u32,
+    pub sent_fps: u32,
+}
+
+/// One watched stream's live throughput: `received_fps` is
+/// `decode::StreamDecoder::current_fps` (new frames actually yielded to the
+/// UI after pacing/staleness drops, not just how often the decoder is
+/// polled). Identified the same flat `room_handle`/`owner`/`stream_id` way
+/// `commands::toggle_watch` takes a watch, rather than nesting a `StreamKey`
+/// struct — matching that existing IPC convention rather than introducing a
+/// second one.
+#[derive(Serialize, Clone)]
+pub struct WatchedStatsDto {
+    pub room_handle: u32,
+    #[serde(with = "hex_u64")]
+    pub owner: ConnId,
+    pub stream_id: u8,
+    pub received_fps: f64,
+}
+
 pub fn pending_label(role: session::PendingRole) -> &'static str {
     match role {
         session::PendingRole::FanOut => "fan_out",
