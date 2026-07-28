@@ -609,15 +609,51 @@ fn handle_connection(mut stream: TcpStream, routes: &Arc<Mutex<HashMap<StreamKey
     // CodecInfo chunk above was already sent for, so this loop only reacts
     // to a *later* change (e.g. a mid-connection `BranchSwap` — see module
     // doc), never re-sending the one already written above.
+    // Whether this connection has relayed a keyframe yet — gates every
+    // VideoFrame chunk below. `wait_update`'s very first call for a brand
+    // new connection returns whatever the mailbox's single slot currently
+    // holds, which is the route's *latest* published frame, not necessarily
+    // a keyframe: a route that's been flowing for a while (the ordinary
+    // steady state once the first watcher has been connected for more than
+    // a GOP or two) has a delta frame cached the vast majority of the time.
+    // A connection that started watching via `toggle_watch` gets a fresh
+    // keyframe forced for it by `capture.rs`'s `force_keyframe()` on
+    // subscribe (see module doc), but a SECOND connection to an
+    // already-watched stream's route (e.g. the standalone viewer window
+    // opening a stream the main window's View tab is already watching —
+    // `stream_video_url` resolves the existing route without a new
+    // `toggle_watch` call) gets no such forced keyframe. Without this gate,
+    // that connection's first VideoFrame chunk could be a delta frame,
+    // which a freshly-configured `VideoDecoder` cannot decode (see
+    // `tile-video.js`'s `startTileVideoInner`) — surfacing as the decoder's
+    // `error` callback and the "Stream error" placeholder, reproduced and
+    // confirmed by
+    // `tests::a_late_connection_to_an_already_flowing_route_gets_a_keyframe_first`.
+    // Every delta frame published before this connection's first keyframe
+    // is simply skipped (not buffered/replayed — consistent with the
+    // single-slot mailbox's never-queue design); `capture.rs`'s periodic
+    // `GOP_SECONDS`-interval keyframe (2s, independent of any subscribe
+    // event) bounds how long that wait can take even with no forced
+    // keyframe. A mid-connection `BranchSwap` (a later `Codec` update) resets
+    // this the same way a fresh connection starts, since `tile-video.js`
+    // resets its decoder on every CodecInfo chunk and needs a keyframe again
+    // right after.
+    let mut has_relayed_keyframe = false;
+
     let mut last_seen = 0u64;
     loop {
         match mailbox.wait_update(&mut last_seen, &mut last_codec_seen) {
             Some(MailboxUpdate::Codec(codec)) => {
+                has_relayed_keyframe = false;
                 if write_chunk(&mut stream, FRAME_TYPE_CODEC_INFO, 0, 0, codec.as_bytes()).is_err() {
                     break;
                 }
             }
             Some(MailboxUpdate::Frame(frame)) => {
+                if !has_relayed_keyframe && !frame.keyframe {
+                    continue;
+                }
+                has_relayed_keyframe = true;
                 let flags = if frame.keyframe { FLAG_KEYFRAME } else { 0 };
                 if write_chunk(&mut stream, FRAME_TYPE_VIDEO, flags, frame.pts_us, &frame.payload).is_err() {
                     break;
@@ -868,6 +904,200 @@ mod tests {
         assert_eq!(flags & FLAG_KEYFRAME, FLAG_KEYFRAME);
         assert_eq!(pts_us, 2_000);
         assert_eq!(payload, synthetic_keyframe_au_different_profile());
+
+        server.stop_route(key);
+    }
+
+    /// Reproduces the actual root cause of the "viewer window shows Stream
+    /// error while the main window's tile keeps working" bug report: a late
+    /// connection to a route that's ALREADY flowing (main window has been
+    /// watching for a while, so the mailbox's *currently cached* frame is a
+    /// delta frame, not a keyframe — the ordinary steady state) must get a
+    /// KEYFRAME as its first VideoFrame chunk, since a fresh `VideoDecoder`
+    /// cannot decode a delta frame with nothing to reference. Before the
+    /// fix, `wait_update`'s first call for a new connection thread returns
+    /// whatever the mailbox currently has cached — keyframe or not — which
+    /// is exactly the bug: the viewer window's second connection to an
+    /// already-watched stream gets no fresh subscribe (no `toggle_watch`
+    /// call — see `stream_video_url`'s doc comment), so `capture.rs`'s
+    /// `force_keyframe()` is never triggered for it, and it silently
+    /// receives a delta frame as its first-ever decode input.
+    #[test]
+    fn a_late_connection_to_an_already_flowing_route_gets_a_keyframe_first() {
+        let server = VideoServer::start().expect("start VideoServer");
+        let key = (1u32, 2u64, 3u8);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let url = server.start_route(key, rx);
+
+        // Simulate the route having been flowing for a while already: a
+        // keyframe, then several delta frames, published *before* the late
+        // connection ever attaches — exactly what a route the main window
+        // has been watching for a bit looks like from the mailbox's point of
+        // view. No connection is reading yet, so each `publish()` simply
+        // overwrites the single slot (by design).
+        tx.send(DecryptedMediaFrame { conn_id: 2, stream_id: 3, pts: 1_000, keyframe: true, stalled: false, payload: synthetic_keyframe_au() })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        for i in 1..=3u64 {
+            tx.send(DecryptedMediaFrame {
+                conn_id: 2,
+                stream_id: 3,
+                pts: 1_000 + i * 33,
+                keyframe: false,
+                stalled: false,
+                payload: synthetic_delta_au(),
+            })
+            .unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // Give the producer thread time to actually publish the last delta
+        // frame into the mailbox before the late connection attaches.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // NOW the late connection attaches — standing in for the viewer
+        // window's fetch() to an already-watched stream's route.
+        let addr = url.trim_start_matches("http://").split('/').next().unwrap();
+        let mut stream = TcpStream::connect(addr).expect("connect to relay");
+        // Bounds this test to a clear failure instead of hanging forever if
+        // a future regression reintroduces a wait-forever bug (e.g. the
+        // keyframe gate never getting satisfied).
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let path = format!("/{}", url.splitn(4, '/').nth(3).unwrap());
+        stream.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes()).unwrap();
+        let mut header_buf = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            stream.read_exact(&mut byte).unwrap();
+            header_buf.push(byte[0]);
+            if header_buf.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let read_chunk = |stream: &mut TcpStream| -> (u8, u8, u64, Vec<u8>) {
+            let mut prefix = [0u8; 4];
+            stream.read_exact(&mut prefix).unwrap();
+            let body_len = u32::from_be_bytes(prefix) as usize;
+            let mut body = vec![0u8; body_len];
+            stream.read_exact(&mut body).unwrap();
+            (body[0], body[1], u64::from_be_bytes(body[2..10].try_into().unwrap()), body[10..].to_vec())
+        };
+
+        let (frame_type, _, _, _) = read_chunk(&mut stream);
+        assert_eq!(frame_type, FRAME_TYPE_CODEC_INFO, "first chunk must always be CodecInfo");
+
+        // More delta frames arrive AFTER the late connection has attached
+        // too — standing in for `capture.rs`'s ordinary encoder output
+        // continuing while this connection has not yet seen a keyframe.
+        // These must be silently skipped, not relayed, since relaying one
+        // as this connection's first VideoFrame chunk is exactly the bug.
+        for i in 4..=5u64 {
+            tx.send(DecryptedMediaFrame {
+                conn_id: 2,
+                stream_id: 3,
+                pts: 1_000 + i * 33,
+                keyframe: false,
+                stalled: false,
+                payload: synthetic_delta_au(),
+            })
+            .unwrap();
+        }
+        // Then a real keyframe — standing in for `capture.rs`'s periodic
+        // `GOP_SECONDS`-interval keyframe (2s, independent of any subscribe
+        // event), which is what actually unblocks a late connection like
+        // this one in the real app.
+        let keyframe_payload = synthetic_keyframe_au();
+        tx.send(DecryptedMediaFrame { conn_id: 2, stream_id: 3, pts: 1_200, keyframe: true, stalled: false, payload: keyframe_payload.clone() })
+            .unwrap();
+
+        let (frame_type, flags, _, payload) = read_chunk(&mut stream);
+        assert_eq!(frame_type, FRAME_TYPE_VIDEO);
+        assert_eq!(
+            flags & FLAG_KEYFRAME,
+            FLAG_KEYFRAME,
+            "a late connection's first VideoFrame chunk must be a keyframe — a fresh VideoDecoder cannot decode a delta frame first"
+        );
+        assert_eq!(payload, keyframe_payload, "the delta frames published before/after connecting must have been skipped, not relayed");
+
+        server.stop_route(key);
+    }
+
+    /// Diagnostic for the "viewer window shows Stream error while the main
+    /// window's tile keeps working" bug report: opens TWO independent
+    /// `TcpStream` connections to the SAME route (standing in for the main
+    /// window's tile and the viewer window's tile both watching the same
+    /// stream) and asserts BOTH receive the CodecInfo chunk and every
+    /// subsequently published frame, not just whichever connected first.
+    #[test]
+    fn two_concurrent_connections_to_the_same_route_both_see_every_frame() {
+        let server = VideoServer::start().expect("start VideoServer");
+        let key = (1u32, 2u64, 3u8);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let url = server.start_route(key, rx);
+
+        let connect = |url: &str| -> TcpStream {
+            let addr = url.trim_start_matches("http://").split('/').next().unwrap();
+            let mut stream = TcpStream::connect(addr).expect("connect to relay");
+            let path = format!("/{}", url.splitn(4, '/').nth(3).unwrap());
+            stream.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes()).unwrap();
+            let mut header_buf = Vec::new();
+            let mut byte = [0u8; 1];
+            loop {
+                stream.read_exact(&mut byte).unwrap();
+                header_buf.push(byte[0]);
+                if header_buf.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream
+        };
+
+        // Connection A ("main window's tile") connects first.
+        let mut conn_a = connect(&url);
+        // Connection B ("viewer window's tile") connects to the SAME route
+        // second — this is the exact structural situation the bug report
+        // describes.
+        let mut conn_b = connect(&url);
+
+        let read_chunk = |stream: &mut TcpStream| -> (u8, u8, u64, Vec<u8>) {
+            let mut prefix = [0u8; 4];
+            stream.read_exact(&mut prefix).unwrap();
+            let body_len = u32::from_be_bytes(prefix) as usize;
+            let mut body = vec![0u8; body_len];
+            stream.read_exact(&mut body).unwrap();
+            (body[0], body[1], u64::from_be_bytes(body[2..10].try_into().unwrap()), body[10..].to_vec())
+        };
+
+        let keyframe_payload = synthetic_keyframe_au();
+        tx.send(DecryptedMediaFrame { conn_id: 2, stream_id: 3, pts: 1_000, keyframe: true, stalled: false, payload: keyframe_payload.clone() })
+            .unwrap();
+
+        // Both connections must independently get CodecInfo then the
+        // keyframe — a shared single-slot mailbox with per-connection
+        // generation counters should serve N readers just fine; this proves
+        // it actually does.
+        for (label, conn) in [("A", &mut conn_a), ("B", &mut conn_b)] {
+            let (frame_type, _, _, payload) = read_chunk(conn);
+            assert_eq!(frame_type, FRAME_TYPE_CODEC_INFO, "connection {label} should get CodecInfo first");
+            assert_eq!(String::from_utf8(payload).unwrap(), "avc1.640028", "connection {label} codec string");
+            let (frame_type, flags, pts_us, payload) = read_chunk(conn);
+            assert_eq!(frame_type, FRAME_TYPE_VIDEO, "connection {label} should get the keyframe next");
+            assert_eq!(flags & FLAG_KEYFRAME, FLAG_KEYFRAME);
+            assert_eq!(pts_us, 1_000);
+            assert_eq!(payload, keyframe_payload, "connection {label} keyframe payload");
+        }
+
+        // A second, later frame must ALSO reach both connections.
+        let delta_payload = synthetic_delta_au();
+        tx.send(DecryptedMediaFrame { conn_id: 2, stream_id: 3, pts: 1_033, keyframe: false, stalled: false, payload: delta_payload.clone() })
+            .unwrap();
+        for (label, conn) in [("A", &mut conn_a), ("B", &mut conn_b)] {
+            let (frame_type, flags, pts_us, payload) = read_chunk(conn);
+            assert_eq!(frame_type, FRAME_TYPE_VIDEO, "connection {label} should get the delta frame");
+            assert_eq!(flags & FLAG_KEYFRAME, 0);
+            assert_eq!(pts_us, 1_033);
+            assert_eq!(payload, delta_payload, "connection {label} delta payload");
+        }
 
         server.stop_route(key);
     }
