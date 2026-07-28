@@ -961,7 +961,7 @@ async fn real_portal_share_fans_out_and_resumes() {
         .expect("fan-out should not hang")
         .expect("fan-out channel")
         .expect("fan-out should succeed");
-    handle.register_destination(second);
+    handle.register_destination(Some(&sharer_b), second);
 
     let mut best_a = 0;
     let mut best_b = 0;

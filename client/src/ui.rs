@@ -1713,7 +1713,11 @@ impl App {
         }
         if let Some(role) = dest.pending {
             let label = match role {
-                PendingRole::FanOut => t!("stream_control.state_adding").to_string(),
+                // `GoingLive` never actually occurs via this egui frontend
+                // (its "Go live" staged-card flow is Tauri-only, see
+                // `session::AppState::go_live`'s doc comment) — same label as
+                // `FanOut` purely so this match stays exhaustive.
+                PendingRole::FanOut | PendingRole::GoingLive => t!("stream_control.state_adding").to_string(),
                 PendingRole::TransferTarget(from) => {
                     t!("stream_control.state_transfer_in", room = self.room_name(from)).to_string()
                 }

@@ -810,7 +810,18 @@
    *   perStreamBitrateEditable: bool, framerateOptions: number[],
    *   roomsAlreadyFedByCapture: number[], editState: {bitrateKbps, framerate, tune,
    *   qualityLevel, rateControl, error}, stalledSince: number|null, audio: object|null,
-   *   audioSources: array }.
+   *   audioSources: array, staged: bool, stagedRoomHandle: number }.
+   *
+   *   `staged` renders the "Share Screen"/"Share another screen" flow's
+   *   pre-"Go live" card instead of a normal live one: `dest` is a
+   *   `StagedCaptureRow`-shaped object ({ capture_id, state: 'starting'|
+   *   'ready', width, height, framerate, bitrate_kbps } — no destination_id/
+   *   room_handle yet), no room/fan-out/transfer/audio affordances are shown,
+   *   the edit grid gains a Room picker (reads/writes `stagedRoomHandle` via
+   *   `handlers.onStagedRoomChange(captureId, roomHandle)`), and the actions
+   *   row is "Go live"/"Cancel" (`handlers.onGoLive(captureId)`/
+   *   `handlers.onCancel(captureId)`) instead of Transfer/Stop. See
+   *   `superdoc/features/stream-control.md`'s 2026-07-28 note.
    *
    *   `editState` is this destination's local edit buffer for everything
    *   `edit_destination` can set (kept by the caller, since `DestinationRow` has
@@ -838,6 +849,9 @@
     // one of the 4 status-vocabulary families (status.css) plus its label.
     const STATE_META = {
       starting: { label: "STARTING", family: "progress" },
+      // Staged capture, portal/pipeline up and "Go live" ready to press — see
+      // `opts.staged`'s doc note below and `dto::StagedCaptureRow`.
+      ready: { label: "READY", family: "progress" },
       rebuilding: { label: "APPLYING", family: "progress" },
       live: { label: "LIVE", family: "live" },
       stalled: { label: "WAITING FOR CAPTURE", family: "degraded" },
@@ -871,27 +885,23 @@
       return wrap;
     }
 
-    // Preview thumbnail — a static icon/gradient placeholder, not a live
-    // decode. A real self-preview (sharer decoding their own outgoing stream
-    // via `tile-video.js`'s `TileVideo`/`stream_video_url`, the same
-    // pipeline the View tab uses) was investigated for this pass: it needs
-    // (a) the sharer's own `conn_id` and (b) the capture's video `stream_id`
-    // to call `toggle_watch`/`stream_video_url` against — neither is exposed
-    // by any existing Tauri command (`DestinationRow` carries no `stream_id`/
-    // `owner`, and no command surfaces "my own conn_id" to the frontend).
-    // `src/preview.rs`'s periodic-thumbnail sender is also not reusable
-    // as-is: it's the *sending* side of a receiver-facing preview stream
-    // (spec §7.1, consumed by `net.rs`'s `handle_preview_stream`/the old
-    // egui UI's texture upload, see `state.rs`), not something this Tauri
-    // command surface exposes either. Both would need a small backend
-    // addition — out of this pass's frontend-only scope — so this stays a
-    // placeholder rather than blocking the rest of the card polish on it.
-    const thumb = el("div", { className: "dest-thumb" }, [icon("videocam", "dest-thumb-icon")]);
-
+    // `Why there is no preview thumbnail here:` there used to be a
+    // `.dest-thumb` column — a static icon/gradient placeholder, never a
+    // live decode (a real self-preview would have needed the sharer's own
+    // `conn_id` and the capture's video `stream_id` to call `toggle_watch`/
+    // `stream_video_url` against, neither of which any Tauri command
+    // exposed). The owner confirmed it was useless precisely because it
+    // never showed the actual stream and asked for it to be removed outright
+    // — see `superdoc/features/stream-control.md`'s 2026-07-28 note — so the
+    // card is now meta/edit/actions only, live or staged, with no preview
+    // column at all.
     const body = el("div", { className: "dest-card-body" });
 
     const head = el("div", { className: "dest-card-head" });
-    head.appendChild(el("span", { className: "dest-room-label", text: dest.room_label }));
+    // Staged: no room chosen yet (that's what the Room field in the edit grid
+    // below is for), so the head just names the card generically instead of
+    // a room it doesn't have.
+    head.appendChild(el("span", { className: "dest-room-label", text: opts.staged ? "Screen Share" : dest.room_label }));
     head.appendChild(statusBadge(meta.family, meta.label, meta.family === "degraded" ? { since: opts.stalledSince } : {}));
     body.appendChild(head);
 
@@ -956,40 +966,46 @@
     // from the live destination list) rendered as small chips, plus a dashed
     // "Also send to…" chip that reveals the same fan-out picker the actions
     // row used to always show inline — restyled into a chip, not rebuilt.
-    const fedRoomIds = opts.roomsAlreadyFedByCapture && opts.roomsAlreadyFedByCapture.length ? opts.roomsAlreadyFedByCapture : [dest.room_handle];
-    const chipRow = el("div", { className: "dest-chip-row" });
-    fedRoomIds.forEach((rid) => {
-      const label = rid === dest.room_handle ? dest.room_label : (((opts.roomOptions || []).find((r) => r.id === rid) || {}).name || String(rid));
-      chipRow.appendChild(el("span", { className: "dest-chip", text: label }));
-    });
-    const fanoutOptions = (opts.roomOptions || []).filter((r) => r.id !== dest.room_handle && !fedRoomIds.includes(r.id));
-    if (fanoutOptions.length > 0) {
-      const addWrap = el("span", { className: "dest-chip-inline-add" });
-      const fanoutSelect = dropdown(
-        fanoutOptions.map((r) => ({ value: r.id, label: r.name })),
-        fanoutOptions[0].id,
-        (value) => {
-          handlers.onFanout && handlers.onFanout(dest.capture_id, Number(value));
-          addBtn.hidden = false;
-          fanoutSelect.hidden = true;
-        },
-        { className: "dest-room-select dest-chip-select" }
-      );
-      fanoutSelect.hidden = true;
-      const addBtn = el("button", {
-        className: "dest-chip-add-btn",
-        text: "+ Also send to…",
-        onClick: () => {
-          addBtn.hidden = true;
-          fanoutSelect.hidden = false;
-          fanoutSelect.focus();
-        },
+    //
+    // Staged: none of this applies — there is no room yet (that's what
+    // "Go live" picks), so the row is skipped entirely rather than showing
+    // fan-out affordances for a destination that doesn't exist.
+    if (!opts.staged) {
+      const fedRoomIds = opts.roomsAlreadyFedByCapture && opts.roomsAlreadyFedByCapture.length ? opts.roomsAlreadyFedByCapture : [dest.room_handle];
+      const chipRow = el("div", { className: "dest-chip-row" });
+      fedRoomIds.forEach((rid) => {
+        const label = rid === dest.room_handle ? dest.room_label : (((opts.roomOptions || []).find((r) => r.id === rid) || {}).name || String(rid));
+        chipRow.appendChild(el("span", { className: "dest-chip", text: label }));
       });
-      addWrap.appendChild(addBtn);
-      addWrap.appendChild(fanoutSelect);
-      chipRow.appendChild(addWrap);
+      const fanoutOptions = (opts.roomOptions || []).filter((r) => r.id !== dest.room_handle && !fedRoomIds.includes(r.id));
+      if (fanoutOptions.length > 0) {
+        const addWrap = el("span", { className: "dest-chip-inline-add" });
+        const fanoutSelect = dropdown(
+          fanoutOptions.map((r) => ({ value: r.id, label: r.name })),
+          fanoutOptions[0].id,
+          (value) => {
+            handlers.onFanout && handlers.onFanout(dest.capture_id, Number(value));
+            addBtn.hidden = false;
+            fanoutSelect.hidden = true;
+          },
+          { className: "dest-room-select dest-chip-select" }
+        );
+        fanoutSelect.hidden = true;
+        const addBtn = el("button", {
+          className: "dest-chip-add-btn",
+          text: "+ Also send to…",
+          onClick: () => {
+            addBtn.hidden = true;
+            fanoutSelect.hidden = false;
+            fanoutSelect.focus();
+          },
+        });
+        addWrap.appendChild(addBtn);
+        addWrap.appendChild(fanoutSelect);
+        chipRow.appendChild(addWrap);
+      }
+      body.appendChild(chipRow);
     }
-    body.appendChild(chipRow);
 
     // The per-destination encoder edit panel: Preset + Framerate always
     // visible, Tune/Quality Level/Rate Control behind the Advanced
@@ -1005,7 +1021,11 @@
     // itself has to stay Per-Stream-only (see its own note below).
     if (opts.encoderTuningEditable) {
       const editState = opts.editState || { tune: "best_quality", qualityLevel: "balanced", rateControl: "constant" };
-      const applyTuning = (patch) => handlers.onEditApply && handlers.onEditApply(dest.destination_id, patch);
+      // Staged `dest` objects (`opts.staged`) have no `destination_id` yet —
+      // key on `capture_id` instead, same id `handlers.onGoLive`/`onCancel`
+      // already use for a staged card.
+      const editId = opts.staged ? dest.capture_id : dest.destination_id;
+      const applyTuning = (patch) => handlers.onEditApply && handlers.onEditApply(editId, patch);
 
       // Simple preset selector — a higher-level "Low-Latency / Balanced /
       // Quality" pill-switch layered over the raw tune/quality_level/
@@ -1035,6 +1055,26 @@
       // column — the preset switch has no value readout, so its third
       // cell is an empty spacer, same trick the Advanced rows below use.
       const editGrid = el("div", { className: "dest-edit-grid" });
+
+      // Staged only: which room "Go live" will send into — the one field a
+      // live destination's edit panel never shows (a live destination
+      // already has a room; "Transfer"/"Also send to…" are what move/add
+      // rooms afterwards). `opts.roomOptions` is the same joined-rooms list
+      // the live card's Transfer picker already uses.
+      if (opts.staged) {
+        const roomRow = el("div", { className: "dest-edit-row" });
+        roomRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Room" }));
+        roomRow.appendChild(
+          dropdown(
+            (opts.roomOptions || []).map((r) => ({ value: r.id, label: r.name })),
+            opts.stagedRoomHandle,
+            (value) => handlers.onStagedRoomChange && handlers.onStagedRoomChange(dest.capture_id, Number(value)),
+            { className: "dest-room-select" }
+          )
+        );
+        roomRow.appendChild(el("span"));
+        editGrid.appendChild(roomRow);
+      }
 
       const presetRow = el("div", { className: "dest-edit-row" });
       presetRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Preset" }));
@@ -1242,26 +1282,44 @@
 
     const actions = el("div", { className: "dest-actions" });
 
-    // Transfer only here — fan-out ("Also send to…") moved into the chip
-    // row above (`chipRow`'s dashed chip), same `handlers.onFanout` call,
-    // just a restyled entry point instead of a second copy of the picker.
-    const roomOptions = (opts.roomOptions || []).filter((r) => r.id !== dest.room_handle);
-    if (roomOptions.length > 0) {
-      const transferSelect = dropdown(
-        roomOptions.map((r) => ({ value: r.id, label: r.name })),
-        roomOptions[0].id,
-        null,
-        { className: "dest-room-select" }
-      );
-      actions.appendChild(transferSelect);
+    if (opts.staged) {
+      // "Go live" in place of the Transfer picker + Stop button a live card
+      // gets: this card has no destination yet, just a running capture and
+      // the room picked above, so there is nothing to transfer and "Cancel"
+      // (not "Stop") is the honest verb for tearing down a capture that was
+      // never actually sent anywhere. Disabled — rather than hidden — while
+      // the capture is still `starting`, so the button doesn't visibly jump
+      // around the row the instant the portal/pipeline comes up.
+      const goLiveBtn = primaryButton("Go live", () => handlers.onGoLive && handlers.onGoLive(dest.capture_id), {
+        className: "dest-action-btn dest-go-live-btn",
+      });
+      if (dest.state !== "ready") goLiveBtn.disabled = true;
+      actions.appendChild(goLiveBtn);
       actions.appendChild(
-        secondaryButton("Transfer", () => handlers.onTransfer && handlers.onTransfer(dest.destination_id, Number(transferSelect.value)), {
-          className: "dest-action-btn",
-        })
+        dangerButton("Cancel", () => handlers.onCancel && handlers.onCancel(dest.capture_id), { className: "dest-action-btn" })
       );
-    }
+    } else {
+      // Transfer only here — fan-out ("Also send to…") moved into the chip
+      // row above (`chipRow`'s dashed chip), same `handlers.onFanout` call,
+      // just a restyled entry point instead of a second copy of the picker.
+      const roomOptions = (opts.roomOptions || []).filter((r) => r.id !== dest.room_handle);
+      if (roomOptions.length > 0) {
+        const transferSelect = dropdown(
+          roomOptions.map((r) => ({ value: r.id, label: r.name })),
+          roomOptions[0].id,
+          null,
+          { className: "dest-room-select" }
+        );
+        actions.appendChild(transferSelect);
+        actions.appendChild(
+          secondaryButton("Transfer", () => handlers.onTransfer && handlers.onTransfer(dest.destination_id, Number(transferSelect.value)), {
+            className: "dest-action-btn",
+          })
+        );
+      }
 
-    actions.appendChild(dangerButton("Stop", () => handlers.onStop && handlers.onStop(dest.destination_id), { className: "dest-action-btn" }));
+      actions.appendChild(dangerButton("Stop", () => handlers.onStop && handlers.onStop(dest.destination_id), { className: "dest-action-btn" }));
+    }
     body.appendChild(actions);
 
     // Audio sub-row — the share's audio, attached to the share rather than
@@ -1270,12 +1328,14 @@
     // screen share, so it renders as one extra line under a hairline rule.
     // Video-only: an audio destination never renders a card, so it never
     // reaches this branch (see `stream-control.js`'s `updateActiveSharesCard`).
-    if (dest.kind !== "audio") {
+    // Also skipped while staged: audio attaches to a *room* (`start_audio_
+    // share`'s `room_handle`), and a staged card doesn't have one until
+    // "Go live" picks it.
+    if (dest.kind !== "audio" && !opts.staged) {
       body.appendChild(el("div", { className: "dest-divider" }));
       body.appendChild(opts.audio ? audioAttachedRow(opts.audio, handlers) : addAudioRow(dest, handlers, opts));
     }
 
-    wrap.appendChild(thumb);
     wrap.appendChild(body);
     return wrap;
   }

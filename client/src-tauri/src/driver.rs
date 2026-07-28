@@ -65,6 +65,9 @@ struct Snapshot {
     rooms: HashMap<u32, String>,
     /// `DestinationId -> state label`.
     destinations: HashMap<u32, &'static str>,
+    /// `CaptureSourceId -> state label`, for staged captures only (see
+    /// `dto::StagedCaptureRow`).
+    staged_captures: HashMap<u32, &'static str>,
 }
 
 pub fn spawn(app_handle: AppHandle) {
@@ -245,6 +248,34 @@ fn tick(app_handle: &AppHandle, last: &mut Snapshot) {
         );
     }
     last.destinations = dest_snapshot;
+
+    // 5.5. Staged captures (the "Go live" flow's staged card — see
+    // `dto::StagedCaptureRow`): same diff-and-emit shape as the destination
+    // snapshot above, including the "vanished this tick" pass — a staged
+    // capture's *only* driver of a state change other than the frontend's own
+    // `stage_video_share`/`go_live`/`stop_share` calls is this poll noticing
+    // `Starting` resolve to `Active` (real capture came up) or the row
+    // disappearing (its first destination just went live, so it's no longer
+    // "staged" — see `dto::staged_capture_rows`'s zero-destinations filter —
+    // or "Cancel" tore it down). The frontend's listener re-fetches `list_
+    // staged_captures` on either event rather than trusting this payload, so
+    // (like `destination-state-changed`'s "removed") the value only needs to
+    // make the event fire.
+    let mut staged_snapshot = HashMap::new();
+    for row in dto::staged_capture_rows(&state) {
+        staged_snapshot.insert(row.capture_id, row.state);
+        if last.staged_captures.get(&row.capture_id) != Some(&row.state) {
+            let payload = serde_json::json!({ "captureId": row.capture_id, "state": row.state });
+            let _ = app_handle.emit("staged-capture-changed", &payload);
+            managed.events.publish("staged-capture-changed", payload);
+        }
+    }
+    for (&capture_id, _) in last.staged_captures.iter().filter(|(id, _)| !staged_snapshot.contains_key(id)) {
+        let payload = serde_json::json!({ "captureId": capture_id, "state": "removed" });
+        let _ = app_handle.emit("staged-capture-changed", &payload);
+        managed.events.publish("staged-capture-changed", payload);
+    }
+    last.staged_captures = staged_snapshot;
 
     // 6. Live throughput diagnostics: captured/sent FPS per outgoing
     // destination, received FPS per watched stream. Unconditional every

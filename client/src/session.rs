@@ -293,6 +293,13 @@ pub enum PendingRole {
     /// A second (third, …) destination off an existing capture is being
     /// brought up — the fan-out case.
     FanOut,
+    /// "Go live" clicked on a staged card: this is a staged capture's
+    /// *first* destination coming up (see `AppState::go_live`). Mechanically
+    /// identical to `FanOut` (same `add_destination_with_params` call), kept
+    /// as its own variant purely so the UI can say "Going live…" instead of
+    /// the fan-out card's "Also sending here…" while it waits for the first
+    /// IDR.
+    GoingLive,
     /// Make-before-break transfer: this is the *new* destination in the
     /// target room, still proving itself. The old one keeps streaming until
     /// this succeeds.
@@ -1405,6 +1412,83 @@ impl AppState {
         });
     }
 
+    /// "Share Screen"/"Share another screen" clicked: the staged half of the
+    /// "Go live" flow (see `superdoc/features/stream-control.md`'s
+    /// 2026-07-28 note). Allocates a capture and spawns
+    /// [`capture::start_capture`] — same portal prompt, same real GStreamer
+    /// pipeline `start_video_share` starts, but with **zero destinations**:
+    /// nothing is sent to any room, and no `AnnounceStream` fires, until
+    /// [`Self::go_live`] attaches the first one. Returns the new capture's id
+    /// so the caller (a Tauri command) can hand it back to the frontend for
+    /// the staged card's "Go live"/"Cancel" buttons and `list_staged_
+    /// captures` to find it by.
+    ///
+    /// `Why this can reuse `stop_share` for "Cancel":` a staged capture is
+    /// `ShareStatus::Active` with an empty `destinations` map — exactly the
+    /// state `stop_share` already knows how to tear down; no separate cancel
+    /// path is needed.
+    pub fn stage_video_share(&mut self) -> CaptureSourceId {
+        let capture_id = self.alloc_capture_id();
+        let framerate = self.framerate;
+        let (tx, rx) = oneshot::channel();
+        self.captures.insert(
+            capture_id,
+            LocalCapture {
+                kind: StreamKind::Video,
+                label: t!("share.video_label").to_string(),
+                status: ShareStatus::Starting(rx),
+                audio_for_capture: None,
+                destinations: IndexMap::new(),
+                self_preview_texture: None,
+            },
+        );
+        self.share_error = None;
+
+        tokio::spawn(async move {
+            let result = capture::start_capture(framerate).await.map(ShareHandle::Video).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+        });
+        capture_id
+    }
+
+    /// "Go live" clicked on a staged card: attach `capture_id`'s first
+    /// destination into `room_handle`, using the *current* process-wide
+    /// framerate/bitrate/tune/quality-level/rate-control settings — the same
+    /// ones the staged card's Preset/Advanced-tuning/Framerate/Bitrate
+    /// controls already write via `set_framerate`/`set_bitrate`/`set_tune`/
+    /// `set_quality_level`/`set_rate_control` (mirroring `start_video_share`'s
+    /// own "applied before the call, not passed as arguments" shape — see
+    /// that method's doc comment). The caller (`stream-control.js`'s
+    /// `saveStartFormDefaults`) persists those same values as the new
+    /// defaults at this exact moment, not while the card is merely staged.
+    ///
+    /// Mechanically this *is* [`Self::add_destination`]'s fan-out primitive —
+    /// see `capture::start_capture`'s doc comment for why attaching the first
+    /// branch to a running, zero-destination tee is not architecturally
+    /// different from attaching the second. The only addition here is
+    /// raising the capture's source-framerate floor first, in case the user
+    /// picked a higher framerate on the staged card than the capture actually
+    /// started at (see [`capture::CaptureHandle::set_source_framerate`]'s
+    /// doc comment for why that never needs a pipeline restart).
+    pub fn go_live(&mut self, capture_id: CaptureSourceId, room_handle: RoomHandle) {
+        if let Some(capture) = self.captures.get(&capture_id)
+            && let ShareStatus::Active(ShareHandle::Video(handle)) = &capture.status
+        {
+            handle.set_source_framerate(self.framerate);
+        }
+        let params = capture::destination::VideoParams {
+            width: 0,
+            height: 0,
+            framerate: self.framerate,
+            bitrate_kbps: self.bitrate_kbps,
+            backend: capture::EncoderBackend::default(),
+            tune: self.tune,
+            quality_level: self.quality_level,
+            rate_control: self.rate_control,
+        };
+        self.add_destination_with_params(capture_id, room_handle, PendingRole::GoingLive, params);
+    }
+
     /// **Fan-out**: send an already-running capture into one more room, as a
     /// second fully independent encoded+encrypted stream off the same screen
     /// grab. `role` distinguishes plain fan-out from the make-before-break
@@ -1575,9 +1659,10 @@ impl AppState {
             match pending.rx.try_recv() {
                 Ok(Ok(handle)) => {
                     let runtime = handle.runtime();
+                    let client = self.rooms.get(&pending.room).map(|room| room.client.clone());
                     if let Some(capture) = self.captures.get_mut(&pending.capture_id) {
                         if let ShareStatus::Active(ShareHandle::Video(capture_handle)) = &mut capture.status {
-                            capture_handle.register_destination(handle);
+                            capture_handle.register_destination(client.as_ref(), handle);
                         }
                         if let Some(dest) = capture.destinations.get_mut(&pending.destination_id) {
                             dest.runtime = Some(runtime);

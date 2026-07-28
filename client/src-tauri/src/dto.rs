@@ -177,6 +177,68 @@ pub struct DestinationRow {
     pub muted: bool,
 }
 
+/// A capture that's running (real screen grab, real GStreamer pipeline, real
+/// negotiated resolution) but has **zero destinations** — the "Share
+/// Screen"/"Share another screen" staged card, before "Go live" is clicked
+/// (see `superdoc/features/stream-control.md`'s 2026-07-28 note and
+/// `session::AppState::stage_video_share`/`go_live`).
+///
+/// `framerate`/`bitrate_kbps`/`tune`/`quality_level`/`rate_control` are the
+/// *process-wide* settings the staged card's Preset/Advanced-tuning/
+/// Framerate/Bitrate controls read and write (`set_framerate`/`set_bitrate`/
+/// `set_tune`/`set_quality_level`/`set_rate_control` — same commands
+/// `start_video_share` already used these for), not per-capture state: a
+/// staged capture has no destination yet to own its own params, so there is
+/// nothing more specific to show here than what "Go live" will actually use.
+#[derive(Serialize, Clone)]
+pub struct StagedCaptureRow {
+    pub capture_id: u32,
+    /// `"starting"` while waiting on the portal/pipeline, `"ready"` once the
+    /// capture is up and "Go live" can be pressed, `"stopping"` while
+    /// "Cancel" (`stop_share`) is tearing it down.
+    pub state: &'static str,
+    /// Real negotiated size, `0x0` until the pipeline reports caps (see
+    /// `capture::CaptureHandle::source_caps`) — usually already valid by the
+    /// time this row is first fetched.
+    pub width: u32,
+    pub height: u32,
+    pub framerate: u32,
+    pub bitrate_kbps: u32,
+    pub tune: TuneMode,
+    pub quality_level: QualityLevel,
+    pub rate_control: RateControlMode,
+}
+
+pub fn staged_capture_rows(state: &AppState) -> Vec<StagedCaptureRow> {
+    let mut rows = Vec::new();
+    for (capture_id, capture) in &state.captures {
+        if capture.kind != simple_screensharing_client::protocol::StreamKind::Video || !capture.destinations.is_empty() {
+            continue;
+        }
+        let (width, height, row_state) = match &capture.status {
+            session::ShareStatus::Starting(_) => (0, 0, "starting"),
+            session::ShareStatus::Stopping(_) => (0, 0, "stopping"),
+            session::ShareStatus::Active(session::ShareHandle::Video(handle)) => {
+                let caps = handle.source_caps();
+                (caps.width, caps.height, "ready")
+            }
+            session::ShareStatus::Active(session::ShareHandle::Audio(_)) => continue,
+        };
+        rows.push(StagedCaptureRow {
+            capture_id: capture_id.0,
+            state: row_state,
+            width,
+            height,
+            framerate: state.framerate,
+            bitrate_kbps: state.bitrate_kbps,
+            tune: state.tune,
+            quality_level: state.quality_level,
+            rate_control: state.rate_control,
+        });
+    }
+    rows
+}
+
 #[derive(Serialize, Clone)]
 pub struct SettingsDto {
     pub language: String,
@@ -304,6 +366,7 @@ pub struct WatchedStatsDto {
 pub fn pending_label(role: session::PendingRole) -> &'static str {
     match role {
         session::PendingRole::FanOut => "fan_out",
+        session::PendingRole::GoingLive => "going_live",
         session::PendingRole::TransferTarget(_) => "transfer_target",
         session::PendingRole::TransferSource(_) => "transfer_source",
     }

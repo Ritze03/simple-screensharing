@@ -301,6 +301,41 @@ pub fn start_video_share(managed: State<'_, Managed>, room_handle: u32) {
     tauri::async_runtime::block_on(async { managed.state.lock().unwrap().start_video_share(RoomHandle(room_handle)) });
 }
 
+/// "Share Screen"/"Share another screen" clicked: start the staged half of
+/// the "Go live" flow (real capture, zero destinations — see
+/// `session::AppState::stage_video_share`'s doc comment). Returns the new
+/// capture's id, which the frontend threads through `go_live`/`stop_share`
+/// for that card's "Go live"/"Cancel" buttons and uses to find its row in
+/// `list_staged_captures`.
+// See `join_room`'s `Why:` note above — `stage_video_share` spawns.
+#[tauri::command]
+pub fn stage_video_share(managed: State<'_, Managed>) -> u32 {
+    tauri::async_runtime::block_on(async { managed.state.lock().unwrap().stage_video_share() }).0
+}
+
+/// "Go live" clicked on a staged card: attach its first destination into
+/// `room_handle`, using whatever framerate/bitrate/tune/quality-level/
+/// rate-control the staged card currently has set (via `set_framerate`/
+/// `set_bitrate`/`set_tune`/`set_quality_level`/`set_rate_control` — same
+/// commands `start_video_share` already relies on for this, see
+/// `AppState::go_live`'s doc comment).
+// See `join_room`'s `Why:` note above — `go_live` spawns
+// (`CaptureHandle::spawn_add_destination`).
+#[tauri::command]
+pub fn go_live(managed: State<'_, Managed>, capture_id: u32, room_handle: u32) {
+    tauri::async_runtime::block_on(async {
+        managed.state.lock().unwrap().go_live(CaptureSourceId(capture_id), RoomHandle(room_handle))
+    });
+}
+
+/// Staged captures (real capture running, zero destinations — see
+/// `dto::StagedCaptureRow`) for the "Share Screen"/"Share another screen"
+/// staged card(s) currently open.
+#[tauri::command]
+pub fn list_staged_captures(managed: State<'_, Managed>) -> Vec<dto::StagedCaptureRow> {
+    dto::staged_capture_rows(&managed.state.lock().unwrap())
+}
+
 /// See `join_room`'s `Why:` note above — `start_audio_share` spawns.
 ///
 /// `forCaptureId` is the screen share this audio is being attached to (the

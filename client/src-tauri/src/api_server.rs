@@ -535,6 +535,9 @@ fn dispatch(name: &str, body: &Value, app: &AppHandle) -> Result<Value, ApiError
         "set_presentation_mode" => result(commands::set_presentation_mode(managed, get_string(body, "mode")?)),
         "set_max_jitter_buffer_ms" => ok(commands::set_max_jitter_buffer_ms(managed, get_u32(body, "ms")?)),
         "start_video_share" => ok(commands::start_video_share(managed, get_u32(body, "room_handle")?)),
+        "stage_video_share" => ok(commands::stage_video_share(managed)),
+        "go_live" => ok(commands::go_live(managed, get_u32(body, "capture_id")?, get_u32(body, "room_handle")?)),
+        "list_staged_captures" => ok(commands::list_staged_captures(managed)),
         "start_audio_share" => {
             ok(commands::start_audio_share(managed, get_u32(body, "room_handle")?, opt_u32(body, "for_capture_id")))
         }

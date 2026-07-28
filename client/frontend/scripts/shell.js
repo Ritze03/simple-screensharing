@@ -1247,6 +1247,16 @@
       refreshStreams();
       if (window.StreamControl) window.StreamControl.refresh();
     });
+    // The "Go live" flow's staged card (see `superdoc/features/
+    // stream-control.md`'s 2026-07-28 note): fires when a staged capture's
+    // portal/pipeline finishes coming up (`starting` -> `ready`), or when it
+    // disappears (its first destination just went live, so it's no longer
+    // "staged" — see `dto::staged_capture_rows`'s zero-destinations filter —
+    // or "Cancel" tore it down). Same "ignore the payload, just re-fetch"
+    // shape as `destination-state-changed` above.
+    listen("staged-capture-changed", () => {
+      if (window.StreamControl) window.StreamControl.refresh();
+    });
     listen("bandwidth-overshoot", (event) => {
       if (window.StreamControl) window.StreamControl.setOvershoot(event.payload.overshootKbps);
     });

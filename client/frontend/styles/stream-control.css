@@ -168,7 +168,12 @@
 }
 
 .dest-card-starting::before,
-.dest-card-rebuilding::before {
+.dest-card-rebuilding::before,
+/* "ready" is a staged capture waiting on "Go live" — same in-progress accent
+   as `starting`/`rebuilding` (see `components.js`'s `destinationCard`'s
+   `STATE_META`, and `superdoc/features/stream-control.md`'s 2026-07-28 note
+   on the staged-card flow). */
+.dest-card-ready::before {
   background-image: repeating-linear-gradient(135deg, var(--pill-accent-bg-lighter) 0 4px, transparent 4px 8px);
   background-size: 12px 12px;
   animation: dest-accent-bar-march 0.7s linear infinite;
@@ -193,85 +198,15 @@
   flex-direction: column;
 }
 
-/* Preview thumbnail — static icon/gradient placeholder (see
-   `components.js`'s `destinationCard` doc comment for why: a real live
-   self-preview needs a backend addition this frontend-only pass doesn't
-   make). Fixed 160x90 per the design handoff. */
-/* A preview thumb stands in for a SCREEN. The prototype paints it as a
-   dark video well — near-black, a fine diagonal weave for texture, a
-   hairline edge, and (when live) a green ring plus a soft outer bloom, so
-   the thumb itself signals "this is on air".
-
-   What shipped instead was a saturated blue-gradient rectangle with a
-   camera glyph on it: the loudest, least screen-like element on the page,
-   and the thing that most made the tab read as flat/generic rather than
-   the mockup's dark-and-lit look. */
-.dest-thumb {
-  flex: 0 0 auto;
-  width: 160px;
-  aspect-ratio: 16 / 9;
-  height: auto;
-  align-self: flex-start;
-  border-radius: var(--rounding-md);
-  background-color: var(--tile-bg);
-  background-image: var(--screen-hatch);
-  border: 1px solid var(--divider);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  position: relative;
-  overflow: hidden;
-}
-
-/* Live share: green ring + bloom (--thumb-ring-live). */
-.dest-card-live .dest-thumb {
-  box-shadow: var(--thumb-ring-live);
-}
-
-/* Degraded share: amber edge + amber hatch wash over the weave. */
-.dest-card-stalled .dest-thumb {
-  border-color: var(--hatch-amber-border);
-  background-image: var(--hatch-amber-gradient-soft), var(--screen-hatch);
-}
-
-.dest-thumb-icon {
-  font-size: 24px;
-  color: var(--text-faint);
-  font-variation-settings: "wght" 300;
-}
-
-.dest-card-live .dest-thumb-icon {
-  color: var(--success);
-}
-
-.dest-card-stalled .dest-thumb-icon {
-  color: var(--warning);
-}
-
-/* "ON AIR" corner plate on a live thumb — prototype 1b/1i. Pure CSS, no
-   markup: the thumb is the positioning context. */
-.dest-card-live .dest-thumb::after {
-  content: "ON AIR";
-  position: absolute;
-  left: 7px;
-  top: 6px;
-  padding: 3px 7px;
-  border-radius: 5px;
-  background: rgba(10, 11, 13, 0.8);
-  color: var(--text);
-  font-size: 8.5px;
-  font-weight: 700;
-  letter-spacing: 0.06em;
-  line-height: 1;
-}
+/* `Why there is no preview-thumbnail styling here any more:` the `.dest-thumb`
+   column (static icon/gradient placeholder, never a live decode — see
+   `components.js`'s `destinationCard` doc comment) was removed outright at
+   the owner's request, since it never showed the actual stream. See
+   `superdoc/features/stream-control.md`'s 2026-07-28 note. */
 
 @media (max-width: 460px) {
   .dest-card:not(.dest-card-failed) {
     flex-direction: column;
-  }
-  .dest-thumb {
-    width: 100%;
-    height: 120px;
   }
 }
 
@@ -632,58 +567,20 @@
   max-width: 110px;
 }
 
-/* -------------------------------------------------------------------
- * Start a stream — a compact inline form, not a wide vertical stack.
- * ----------------------------------------------------------------- */
-
-.sc-start-form {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: end;
-  gap: 10px 16px;
-}
-
-.sc-start-field {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-/* The Room/Framerate fields are `Components.dropdown` now, not `<select>`
-   (see dropdown.css/components.js, 2026-07-28) — its own `.dd-trigger`
-   already carries this same chrome by default, so only `input` (Bitrate)
-   needs it here. */
-.sc-start-field input {
-  background: var(--field);
-  border: 1px solid var(--border);
-  border-radius: var(--rounding-sm);
-  color: var(--text);
-  padding: 5px 8px;
-  outline: none;
-}
-
-.sc-start-field input:focus {
-  border-color: var(--accent);
-}
-
-.sc-start-error {
-  color: var(--danger);
-  font-size: 12px;
-  flex-basis: 100%;
-}
-
-.sc-start-progress {
-  color: var(--text-faint);
-  font-size: 12px;
-  flex-basis: 100%;
-}
+/* `Why there is no "Start a stream" form styling here any more:` that
+   standalone card (Room/Preset/Framerate/Bitrate + a "Share Screen" button)
+   was replaced outright by the staged-card "Go live" flow — see
+   `components.js`'s `destinationCard`'s `opts.staged` and
+   `superdoc/features/stream-control.md`'s 2026-07-28 note. A staged card
+   reuses `.dest-card`/`.dest-edit-grid`/etc., not a form of its own. */
 
 /* -------------------------------------------------------------------
  * Ghost rows — dashed-border entry points at the end of the Active Shares
- * list. "Share another screen" jumps to the real "Start a Stream" form
- * below (no duplicated start logic); "Share audio" expands in place into
- * the same `startAudioShare()` flow the room-scoped SHARE AUDIO card below
- * already exposes — a second entry point onto it, not a second copy of it.
+ * list. "Share another screen" starts a real staged capture right away (the
+ * "Go live" flow, see above) — no duplicated start logic; "Share audio"
+ * expands in place into the same `startAudioShare()` flow the room-scoped
+ * SHARE AUDIO card below already exposes — a second entry point onto it, not
+ * a second copy of it.
  * ----------------------------------------------------------------- */
 
 .sc-ghost-rows {

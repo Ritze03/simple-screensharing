@@ -1386,8 +1386,19 @@ pub struct CaptureHandle {
     source_state: Mutex<destination::SourceCaps>,
     /// One entry per room this capture feeds, in the order they were added.
     /// A `Vec` rather than a map: N is the number of rooms a user is
-    /// simultaneously broadcasting into — a handful at most.
+    /// simultaneously broadcasting into — a handful at most. Empty for a
+    /// **staged** capture (`start_capture`/"Go live" flow, see
+    /// `superdoc/features/stream-control.md`'s 2026-07-28 note): the tee is
+    /// running with zero branches until the first destination is attached.
     destinations: Vec<DestinationHandle>,
+    /// The tee's low-rate RGB branch, held here **unconsumed** until the
+    /// first destination is attached (see [`Self::ensure_preview_task`]).
+    /// Safe to leave unread for however long a staged capture waits for "Go
+    /// live": the branch's appsink is `max-buffers=1 drop=true` (see
+    /// `build_pipeline`), so it only ever holds the latest sample and never
+    /// applies backpressure upstream. `None` once the preview task has
+    /// started (or, for a not-yet-staged legacy build, never populated).
+    preview_sink: Option<gst_app::AppSink>,
 }
 
 impl Drop for CaptureHandle {
@@ -1452,6 +1463,33 @@ pub async fn start_sharing(
     start_sharing_with_source(client, stream_id, key, bitrate_kbps, framerate, capture_source).await
 }
 
+/// **Staged capture, no destination yet** — the "Go live" flow's first half
+/// (see `superdoc/features/stream-control.md`'s 2026-07-28 note). Acquires
+/// the capture source and starts the GStreamer pipeline exactly like
+/// [`start_sharing`] does, but returns before adding any destination branch:
+/// the resulting [`CaptureHandle::destinations`] is empty. Real
+/// resolution/negotiated caps are already known (`source_caps()` is valid
+/// immediately), and `AppState::go_live` (`session.rs`) later attaches the
+/// first destination the same way fan-out attaches every subsequent one — via
+/// [`CaptureHandle::spawn_add_destination`]. Nothing is sent to any room, and
+/// no `AnnounceStream` fires, until that first destination's branch produces
+/// its first IDR.
+///
+/// `Why this is architecturally sound and not a special case:` a running tee
+/// with zero branches hanging off it is already exactly what a capture looks
+/// like for the instant between "pipeline reaches Playing" and "first
+/// destination's branch is added" in the existing `start_sharing_with_source`
+/// path below — this function just stops there instead of immediately
+/// chaining `spawn_destination`. The fan-out path (`add_destination` in
+/// `session.rs`) has always added a branch to an *already-running* tee; this
+/// is the same primitive, just used for the first branch instead of the
+/// second.
+pub async fn start_capture(framerate: u32) -> Result<CaptureHandle> {
+    ensure_gstreamer_initialized()?;
+    let capture_source = acquire_capture_source().await?;
+    start_capture_with_source(framerate, capture_source).await
+}
+
 /// TEST-ONLY seam (see [`CaptureSource::TestSource`]): starts the exact same
 /// tee→branch→encode→appsink→encrypt→fragment→send pipeline [`start_sharing`]
 /// uses internally, sourced from a caller-supplied raw `gst-launch`-syntax
@@ -1486,10 +1524,10 @@ pub async fn start_sharing_from_test_source(
 }
 
 /// Shared body of [`start_sharing`] / [`start_sharing_from_test_source`]:
-/// everything from "a [`CaptureSource`] has been acquired" onward (building
-/// and starting the pipeline, adding the first destination's encode branch,
-/// announcing the stream, wiring up the preview task and the capture-level
-/// bus/self-preview pump).
+/// starts a staged capture ([`start_capture_with_source`]), then immediately
+/// attaches `key`/`stream_id` as its first destination and waits for that
+/// branch's first IDR before returning — the "share and go live in one call"
+/// behaviour both of those public entry points still provide.
 async fn start_sharing_with_source(
     client: &ScreenshareClient,
     stream_id: u8,
@@ -1498,6 +1536,64 @@ async fn start_sharing_with_source(
     framerate: u32,
     capture_source: CaptureSource,
 ) -> Result<CaptureHandle> {
+    let mut handle = start_capture_with_source(framerate, capture_source).await?;
+
+    let source = handle.source_caps();
+    let params = destination::VideoParams {
+        width: source.width,
+        height: source.height,
+        framerate: source.framerate,
+        bitrate_kbps,
+        // Preferred backend for the *branch*; `branch::add_branch_live`
+        // silently falls back to software per branch if this machine's VAAPI
+        // can't actually run another concurrent encode session.
+        backend: detect_encoder_backend(),
+        // "Good mix" defaults, not this pipeline's old hardcoded low-latency
+        // extreme — see `TuneMode`/`QualityLevel`/`RateControlMode`'s
+        // `#[default]` doc comments.
+        tune: TuneMode::default(),
+        quality_level: QualityLevel::default(),
+        rate_control: RateControlMode::default(),
+    };
+
+    // Everything above already owns the pipeline/portal session via `handle`
+    // (its `Drop` is the backstop), so a failure from here on is torn down
+    // with `handle.stop()` — the same graceful teardown any other capture
+    // gets, not a special-cased abandon path.
+    //
+    // `Why this matters:` a bare `?` here was once a real, measured leak.
+    // When the first destination failed to come up, `start_sharing` returned
+    // `Err`, the UI reported "share failed" and showed nothing running —
+    // while the process kept a live PipeWire screencast stream, its
+    // GStreamer element threads and the portal session open **for the rest
+    // of the process's life**, with no affordance to stop it: the user's
+    // screen went on being captured after they were told the share had
+    // failed.
+    let started = spawn_destination(&handle.pipeline, &handle.tee, client, stream_id, key, params).await;
+    match started {
+        Ok(destination) => {
+            handle.ensure_preview_task(client, stream_id);
+            handle.destinations.push(destination);
+            Ok(handle)
+        }
+        Err(e) => {
+            if let Err(stop_err) = handle.stop().await {
+                tracing::warn!("failed to stop capture after its first destination failed to start: {stop_err:#}");
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Shared body of [`start_capture`] and [`start_sharing_with_source`]:
+/// everything from "a [`CaptureSource`] has been acquired" onward that does
+/// **not** depend on any destination — building and starting the pipeline,
+/// and wiring up the capture-level bus/self-preview pump. Returns a
+/// [`CaptureHandle`] with an empty `destinations` list; the tee's low-rate
+/// preview branch is held (unconsumed — see [`CaptureHandle::preview_sink`])
+/// rather than wired to a room, since which room gets the periodic thumbnail
+/// isn't known until a destination exists.
+async fn start_capture_with_source(framerate: u32, capture_source: CaptureSource) -> Result<CaptureHandle> {
     // Defensive clamp — see [`MAX_FRAMERATE`]'s doc comment. `ui.rs`'s
     // dropdown only ever offers values already inside this range, so this is
     // a backstop against a 0/absurd value reaching the `SourceCaps` this
@@ -1527,82 +1623,34 @@ async fn start_sharing_with_source(
         .map_err(|e| anyhow!("capture pipeline startup task panicked: {e}"))??;
     let CapturePipeline { pipeline, tee, preview_sink, self_preview_sink } = built;
 
-    // Size for AnnounceStream and for the never-upscale clamp
-    // ([`destination::clamp_to_source`]): read off the tee's negotiated sink
-    // caps now that the pipeline is playing, falling back to 0x0 ("unknown /
-    // no constraint") if caps haven't landed yet rather than failing the
-    // whole call over a cosmetic field.
+    // Size for the never-upscale clamp ([`destination::clamp_to_source`]) and
+    // for whatever destination is added first: read off the tee's negotiated
+    // sink caps now that the pipeline is playing, falling back to 0x0
+    // ("unknown / no constraint") if caps haven't landed yet rather than
+    // failing the whole call over a cosmetic field.
     let (width, height) = negotiated_size(&tee).unwrap_or((0, 0));
     let source = destination::SourceCaps { width: width as u32, height: height as u32, framerate };
-
-    let params = destination::VideoParams {
-        width: source.width,
-        height: source.height,
-        framerate,
-        bitrate_kbps,
-        // Preferred backend for the *branch*; `branch::add_branch_live`
-        // silently falls back to software per branch if this machine's VAAPI
-        // can't actually run another concurrent encode session.
-        backend: detect_encoder_backend(),
-        // "Good mix" defaults, not this pipeline's old hardcoded low-latency
-        // extreme — see `TuneMode`/`QualityLevel`/`RateControlMode`'s
-        // `#[default]` doc comments.
-        tune: TuneMode::default(),
-        quality_level: QualityLevel::default(),
-        rate_control: RateControlMode::default(),
-    };
-
-    // Everything from here to the `CaptureHandle` below is fallible, and until
-    // that handle exists **nothing else owns the pipeline or the portal
-    // session** — `CaptureHandle::Drop` is the backstop that stops the
-    // pipeline, and there is no handle to drop yet.
-    //
-    // `Why this is wrapped rather than using `?` directly:` a bare `?` here
-    // was a real, measured leak. When the first destination failed to come up,
-    // `start_sharing` returned `Err`, the UI reported "share failed" and
-    // showed nothing running — while the process kept a live PipeWire
-    // screencast stream, its GStreamer element threads and the portal session
-    // open **for the rest of the process's life**, with no affordance to stop
-    // it: the user's screen went on being captured after they were told the
-    // share had failed. Any early return between `start_pipeline` and the
-    // handle must therefore tear the pipeline down and close the portal
-    // session first, which is exactly what `abandon_capture` does.
-    let started = spawn_destination(&pipeline, &tee, client, stream_id, key, params).await;
-    let destination = match started {
-        Ok(destination) => destination,
-        Err(e) => return Err(abandon_capture(pipeline, capture_source, e).await),
-    };
 
     let self_preview_frame: Arc<Mutex<Option<egui::ColorImage>>> = Arc::new(Mutex::new(None));
     let bus = match pipeline.bus() {
         Some(bus) => bus,
-        None => {
-            // The destination's pump is already running; stop it before the
-            // pipeline goes away under it.
-            let _ = destination.stop().await;
-            return Err(abandon_capture(pipeline, capture_source, anyhow!("pipeline has no bus")).await);
-        }
+        None => return Err(abandon_capture(pipeline, capture_source, anyhow!("pipeline has no bus")).await),
     };
     let capture_task = tokio::spawn(capture_loop(
         bus.stream(),
         SelfPreviewBridge { stream: self_preview_sink.stream(), frame: self_preview_frame.clone() },
     ));
 
-    // Now that the pipeline is confirmed Playing and the stream has been
-    // announced, wire up the (already-implemented, capture-agnostic)
-    // periodic preview/thumbnail sender to the tee's low-rate RGB branch.
-    let preview_frames: FrameStream = preview_frame_stream(preview_sink);
-    let preview_handle = preview::spawn_preview_task(client.clone(), stream_id, preview_frames);
-
     Ok(CaptureHandle {
         pipeline,
         tee,
         capture_source,
         capture_task,
-        preview_handle: Some(preview_handle),
+        preview_handle: None,
+        preview_sink: Some(preview_sink),
         self_preview_frame,
         source_state: Mutex::new(source),
-        destinations: vec![destination],
+        destinations: Vec::new(),
     })
 }
 
@@ -2005,8 +2053,39 @@ impl CaptureHandle {
     }
 
     /// Adopt a destination built by [`CaptureHandle::spawn_add_destination`].
-    pub fn register_destination(&mut self, destination: DestinationHandle) {
+    /// `client` is only used to start the periodic room-preview task the
+    /// *first* time this capture ever gains a destination (see
+    /// [`Self::ensure_preview_task`]) — every later `register_destination`
+    /// call (ordinary fan-out into a second/third room) is a no-op there.
+    /// `None` (the destination's own room vanished before this call landed —
+    /// an unlikely but possible race) just skips the preview task; the
+    /// destination is still adopted either way, matching this method's
+    /// pre-"Go live" behaviour of always adopting what it's handed.
+    pub fn register_destination(&mut self, client: Option<&ScreenshareClient>, destination: DestinationHandle) {
+        if let Some(client) = client {
+            self.ensure_preview_task(client, destination.stream_id);
+        }
         self.destinations.push(destination);
+    }
+
+    /// Starts this capture's periodic room-preview task (the tee's low-rate
+    /// RGB branch → downscale/JPEG/encrypt/send, see `preview.rs`) the first
+    /// time it gains a destination, using that destination's room/`stream_id`
+    /// as the one this capture's thumbnail is sent to. A no-op if the task is
+    /// already running (every later destination on this capture — ordinary
+    /// fan-out) or if this build never staged a `preview_sink` to begin with.
+    ///
+    /// `Why "first destination" and not "the capture itself":` a staged
+    /// capture (`start_capture`) has no room to send a thumbnail to yet — see
+    /// [`CaptureHandle::preview_sink`]'s doc comment on why the appsink is
+    /// safe to leave unconsumed until this runs.
+    fn ensure_preview_task(&mut self, client: &ScreenshareClient, stream_id: u8) {
+        if self.preview_handle.is_some() {
+            return;
+        }
+        let Some(sink) = self.preview_sink.take() else { return };
+        let preview_frames: FrameStream = preview_frame_stream(sink);
+        self.preview_handle = Some(preview::spawn_preview_task(client.clone(), stream_id, preview_frames));
     }
 
     /// Stop sending into one room, leaving every other destination of this

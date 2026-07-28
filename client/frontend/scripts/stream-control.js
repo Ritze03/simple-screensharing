@@ -13,24 +13,28 @@
 // either source.
 //
 // Real command surface used here (see `src-tauri/src/commands.rs`):
-//   list_saved_rooms, list_active_streams, get_settings, room_detail,
-//   list_audio_sources, select_audio_source, set_bandwidth_mode,
+//   list_saved_rooms, list_active_streams, list_staged_captures, get_settings,
+//   room_detail, list_audio_sources, select_audio_source, set_bandwidth_mode,
 //   set_bandwidth_total, set_bandwidth_floor, edit_destination,
-//   stop_destination, retry_destination, transfer_destination,
-//   start_destination, start_video_share, set_bitrate, set_framerate,
-//   start_audio_share, rename_room.
-// Notably `start_video_share`/`start_audio_share` only take a `room_handle`
-// — framerate/bitrate/audio-source are process-wide settings applied via
-// `set_framerate`/`set_bitrate`/`select_audio_source` *before* starting the
-// share, not per-call arguments (this file's mock-era stubs guessed
-// otherwise; fixed here to match the real signatures in `commands.rs`).
+//   stop_destination, stop_share, retry_destination, transfer_destination,
+//   start_destination, stage_video_share, go_live, set_bitrate, set_framerate,
+//   set_tune, set_quality_level, set_rate_control, start_audio_share,
+//   rename_room.
+// Notably `stage_video_share`/`start_audio_share` take no encoder
+// arguments — framerate/bitrate/tune/quality-level/rate-control/audio-source
+// are process-wide settings applied via `set_framerate`/`set_bitrate`/
+// `set_tune`/`set_quality_level`/`set_rate_control`/`select_audio_source`
+// *before* the share starts, not per-call arguments. `go_live` (the "Go
+// live" flow's second half, see `superdoc/features/stream-control.md`'s
+// 2026-07-28 note) only takes `captureId`/`roomHandle` for the same reason.
 //
 // Layout, top to bottom (the redesign this fixes vs. the old egui tab, see
 // stream-control.css's header comment):
 //   1. Bandwidth — compact summary strip, mode toggle, overshoot banner.
-//   2. Active shares — the prominent, equal-width destination grid.
-//   3. Start a stream — compact inline form.
-//   4. Room-scoped: Members/rename + Share audio, for one selected room.
+//   2. Active shares — the prominent, equal-width destination grid; staged
+//      ("Share Screen"/"Share another screen", not yet "Go live"'d) cards
+//      render first, ahead of live ones.
+//   3. Room-scoped: Members/rename + Share audio, for one selected room.
 
 (function () {
   "use strict";
@@ -43,14 +47,10 @@
     bandwidthModeToggle,
     destinationCard,
     secondaryButton,
-    primaryButton,
     renderEmptyState,
     emptyRow,
     dropdown,
     attachWheelStep,
-    pillSwitch,
-    ENCODER_PRESETS,
-    activeEncoderPreset,
   } = window.Components;
 
   // ---------------------------------------------------------------------
@@ -144,6 +144,12 @@
 
   let mockJoinedRooms = MOCK_JOINED_ROOMS;
   let mockDestinations = MOCK_DESTINATIONS.slice();
+  // Staged captures — the "Go live" flow's pre-"Go live" cards (`dto::
+  // StagedCaptureRow`, see `superdoc/features/stream-control.md`'s
+  // 2026-07-28 note). Empty by default: unlike `MOCK_DESTINATIONS`, there's
+  // nothing to demo here until "Share Screen"/"Share another screen" is
+  // actually clicked.
+  let mockStagedCaptures = [];
   let bandwidth = Object.assign({}, MOCK_BANDWIDTH);
   let mockAudioSources = MOCK_AUDIO_SOURCES;
   // Real-backend-only: the last `bandwidth-overshoot` event's amount (there's
@@ -185,6 +191,15 @@
       return rows;
     }
     return MOCK_DESTINATIONS.slice();
+  }
+
+  /** Staged captures (see `dto::StagedCaptureRow`) — the "Go live" flow's
+   * pre-"Go live" cards. */
+  async function fetchStagedCaptures() {
+    if (window.__TAURI__) {
+      return await window.__TAURI__.core.invoke("list_staged_captures");
+    }
+    return mockStagedCaptures.slice();
   }
 
   async function fetchBandwidthSettings() {
@@ -370,7 +385,7 @@
    * `stop_destination` + `start_destination` pair, which silently reset a
    * retried destination to default encoder settings and, for a capture's
    * last destination, could tear the whole capture down instead of just the
-   * failed branch. Mock branch mirrors `mockStartStream`'s starting -> live
+   * failed branch. Mock branch mirrors `mockGoLive`'s starting -> live
    * progression at toy timescales. */
   async function retryDestination(dest) {
     if (window.__TAURI__) {
@@ -403,29 +418,44 @@
     mockFanout(captureId, targetRoomHandle);
   }
 
-  async function startVideoShare(roomHandle, fps, bitrateKbps, tune, qualityLevel, rateControl) {
+  /** "Share Screen"/"Share another screen" clicked: start the staged half of
+   * the "Go live" flow — a real capture with zero destinations (see
+   * `session::AppState::stage_video_share`'s doc comment). Returns the new
+   * capture's id; the caller (the ghost row's `onClick`, below) just
+   * triggers a refresh, since the driver's `staged-capture-changed` event
+   * (or, in the mock branch, this function's own direct mutation) is what
+   * actually gets the new card rendered. */
+  async function stageVideoShare() {
     if (window.__TAURI__) {
-      // Framerate/bitrate/tune/quality-level/rate-control are all
-      // process-wide settings applied before the share starts
-      // (`start_video_share` itself only takes a room handle — see this
-      // file's header note); `set_tune`/`set_quality_level`/
-      // `set_rate_control` mirror `set_framerate`/`set_bitrate`'s existing
-      // shape rather than `start_video_share` growing three more arguments
-      // or a follow-up `edit_destination` call.
-      await window.__TAURI__.core.invoke("set_framerate", { fps });
-      await window.__TAURI__.core.invoke("set_bitrate", { kbps: bitrateKbps });
-      await window.__TAURI__.core.invoke("set_tune", { tune });
-      await window.__TAURI__.core.invoke("set_quality_level", { qualityLevel });
-      await window.__TAURI__.core.invoke("set_rate_control", { rateControl });
-      await window.__TAURI__.core.invoke("start_video_share", { roomHandle });
+      // Push the persisted "last used" values into the process-wide encoder
+      // settings *before* staging — `stage_video_share` (like the
+      // `start_video_share` it replaces, see this file's header note) reads
+      // those, not any argument of its own, and the capture's framerate in
+      // particular is fixed at pipeline-build time inside it. Without this,
+      // a staged card would open running whatever `AppState::framerate`/
+      // `bitrate_kbps`/etc last happened to be (its hardcoded first-run
+      // fallback on a fresh launch) instead of what "Go live" last actually
+      // used.
+      const defaults = await fetchStartStreamDefaults();
+      if (defaults) {
+        await window.__TAURI__.core.invoke("set_framerate", { fps: defaults.fps });
+        await window.__TAURI__.core.invoke("set_bitrate", { kbps: defaults.bitrateKbps });
+        await window.__TAURI__.core.invoke("set_tune", { tune: defaults.tune });
+        await window.__TAURI__.core.invoke("set_quality_level", { qualityLevel: defaults.qualityLevel });
+        await window.__TAURI__.core.invoke("set_rate_control", { rateControl: defaults.rateControl });
+      }
+      await window.__TAURI__.core.invoke("stage_video_share");
+      mockStagedCaptures = await fetchStagedCaptures();
+      render();
       return;
     }
-    mockStartStream(roomHandle, fps, bitrateKbps, tune, qualityLevel, rateControl);
+    mockStageVideoShare();
   }
 
-  /** The "START A STREAM" form's persisted last-used values (`rooms::
-   * AppSettings::start_stream_defaults`), fetched once at `init()` to
-   * pre-fill `state.startForm` instead of the hardcoded fallback above. */
+  /** The staged card's persisted last-used encoder values (`rooms::
+   * AppSettings::start_stream_defaults`) — seeds a *new* staged card's edit
+   * buffer (`getStagedEdit`) so it opens showing the same settings "Go live"
+   * last actually used, instead of a hardcoded fallback. */
   async function fetchStartStreamDefaults() {
     if (window.__TAURI__) {
       const d = await window.__TAURI__.core.invoke("get_start_stream_defaults");
@@ -434,34 +464,119 @@
     return null;
   }
 
-  /** Persist the "START A STREAM" form's current values — called after every
-   * change to one of its fields (framerate, bitrate, preset, or a raw
-   * Advanced-tuning knob), mirroring `set_bandwidth_total`/`set_bandwidth_
-   * floor`'s save-on-every-change pattern. Deliberately doesn't touch
-   * `roomHandle`: that's a per-launch UI convenience, not a "last used
-   * encoder settings" preference. */
-  async function saveStartFormDefaults() {
-    if (!window.__TAURI__) return;
-    try {
-      await window.__TAURI__.core.invoke("set_start_stream_defaults", {
-        framerate: state.startForm.fps,
-        bitrateKbps: state.startForm.bitrateKbps,
-        tune: state.startForm.tune,
-        qualityLevel: state.startForm.qualityLevel,
-        rateControl: state.startForm.rateControl,
-      });
-    } catch (e) {
-      console.error("failed to save start-stream defaults", e);
+  // captureId -> { bitrateKbps, framerate, tune, qualityLevel, rateControl,
+  // roomHandle, error }. Local edit buffer for a staged card's controls, same
+  // "caller keeps the state, card renders from the buffer" shape as
+  // `destEditState` (see that map's own doc comment) — a staged capture has
+  // no `DestinationRow` to read tune/quality/rate-control back from either,
+  // and `roomHandle` (which room "Go live" will use) has nowhere else to
+  // live at all until "Go live" is actually pressed.
+  const stagedEditState = new Map();
+
+  function getStagedEdit(staged) {
+    let s = stagedEditState.get(staged.capture_id);
+    if (!s) {
+      s = {
+        bitrateKbps: staged.bitrate_kbps,
+        framerate: staged.framerate,
+        tune: staged.tune,
+        qualityLevel: staged.quality_level,
+        rateControl: staged.rate_control,
+        roomHandle: mockJoinedRooms.length > 0 ? mockJoinedRooms[0].id : null,
+        error: null,
+      };
+      stagedEditState.set(staged.capture_id, s);
     }
+    return s;
   }
 
-  /** Merge a patch (from the Preset switch or a raw Advanced-tuning knob)
-   * into `state.startForm`, persist it, and re-render — mirrors
-   * `applyDestinationEdit`'s merge-buffer-then-send shape, but for the form
-   * that hasn't started a share yet rather than an existing destination. */
-  function applyStartFormTuning(patch) {
-    Object.assign(state.startForm, patch);
-    saveStartFormDefaults();
+  /** Preset/Framerate/Bitrate/Advanced-tuning changed on a staged card.
+   * Mirrors `applyDestinationEdit`'s merge-buffer-then-send shape, but writes
+   * through the same process-wide `set_framerate`/`set_bitrate`/`set_tune`/
+   * `set_quality_level`/`set_rate_control` commands `stage_video_share`'s
+   * predecessor `start_video_share` always used (see this file's header
+   * note) — *not* `set_start_stream_defaults`: per the owner's explicit
+   * request, persisting these as the new defaults happens only once, at
+   * "Go live" (`goLive`, below), not on every keystroke while still staged. */
+  async function applyStagedTuning(captureId, staged, patch) {
+    const edit = getStagedEdit(staged);
+    Object.assign(edit, patch);
+    if (window.__TAURI__) {
+      try {
+        if ("framerate" in patch) await window.__TAURI__.core.invoke("set_framerate", { fps: edit.framerate });
+        if ("bitrateKbps" in patch) await window.__TAURI__.core.invoke("set_bitrate", { kbps: edit.bitrateKbps });
+        if ("tune" in patch) await window.__TAURI__.core.invoke("set_tune", { tune: edit.tune });
+        if ("qualityLevel" in patch) await window.__TAURI__.core.invoke("set_quality_level", { qualityLevel: edit.qualityLevel });
+        if ("rateControl" in patch) await window.__TAURI__.core.invoke("set_rate_control", { rateControl: edit.rateControl });
+        edit.error = null;
+      } catch (e) {
+        edit.error = String(e);
+      }
+      render();
+      return;
+    }
+    const row = mockStagedCaptures.find((c) => c.capture_id === captureId);
+    if (row) Object.assign(row, { bitrate_kbps: edit.bitrateKbps, framerate: edit.framerate, tune: edit.tune, quality_level: edit.qualityLevel, rate_control: edit.rateControl });
+    render();
+  }
+
+  /** Room picker changed on a staged card — purely local (which room "Go
+   * live" will target), nothing to send until "Go live" itself. */
+  function setStagedRoom(captureId, roomHandle) {
+    const s = stagedEditState.get(captureId);
+    if (s) s.roomHandle = roomHandle;
+    render();
+  }
+
+  /** "Go live" clicked: attach the staged capture's first destination into
+   * whichever room the card's Room picker has selected, then persist the
+   * card's current encoder settings as the new "last used" defaults — see
+   * `applyStagedTuning`'s doc note on why this is the one moment that save
+   * happens, mirroring `AppState::go_live`'s own doc comment on the backend
+   * side. */
+  async function goLive(captureId, staged) {
+    const edit = getStagedEdit(staged);
+    if (edit.roomHandle == null) return;
+    if (window.__TAURI__) {
+      // Neither `go_live` nor `start_video_share` (its predecessor — see
+      // this file's header note) returns a `Result`: a capture that fails
+      // to attach shows up as a `failed` destination card once `list_
+      // active_streams` next reflects it, same as any other destination
+      // failure, rather than as a rejected promise here.
+      await window.__TAURI__.core.invoke("go_live", { captureId, roomHandle: edit.roomHandle });
+      try {
+        await window.__TAURI__.core.invoke("set_start_stream_defaults", {
+          framerate: edit.framerate,
+          bitrateKbps: edit.bitrateKbps,
+          tune: edit.tune,
+          qualityLevel: edit.qualityLevel,
+          rateControl: edit.rateControl,
+        });
+      } catch (e) {
+        console.error("failed to save start-stream defaults", e);
+      }
+      stagedEditState.delete(captureId);
+      mockStagedCaptures = await fetchStagedCaptures();
+      mockDestinations = await fetchActiveDestinations();
+      render();
+      return;
+    }
+    mockGoLive(captureId, staged, edit);
+  }
+
+  /** "Cancel" clicked on a staged card: tear the capture down before it ever
+   * sent anything anywhere. Identical primitive to a live card's "Stop"
+   * (`stop_share` — see `AppState::stage_video_share`'s "Why this can reuse
+   * `stop_share`" doc note), just with nothing to detach on the room side. */
+  async function cancelStagedCapture(captureId) {
+    stagedEditState.delete(captureId);
+    if (window.__TAURI__) {
+      await window.__TAURI__.core.invoke("stop_share", { captureId });
+      mockStagedCaptures = await fetchStagedCaptures();
+      render();
+      return;
+    }
+    mockStagedCaptures = mockStagedCaptures.filter((c) => c.capture_id !== captureId);
     render();
   }
 
@@ -523,21 +638,8 @@
     return mockAudioSources;
   }
 
-  const state = {
-    // `fps`/`bitrateKbps`/`tune`/`qualityLevel`/`rateControl` are overwritten
-    // by `init()` with the persisted "last used" values from
-    // `get_start_stream_defaults` (see `superdoc/features/stream-control.md`'s
-    // 2026-07-28 note) — these are just the pre-Tauri/first-run fallback,
-    // matching `session::DEFAULT_FRAMERATE`/`DEFAULT_BITRATE_KBPS` and
-    // `capture::TuneMode`/`QualityLevel`/`RateControlMode`'s own `#[default]`
-    // variants (`best_quality`/`balanced`/`constant`) exactly, so a fresh
-    // install's form shows the same defaults the backend would apply anyway.
-    startForm: { roomHandle: 1, fps: 30, bitrateKbps: 8000, tune: "best_quality", qualityLevel: "balanced", rateControl: "constant" },
-    startInFlight: false,
-    startError: null,
-  };
-
   let destIdSeq = 100;
+  let stagedCaptureIdSeq = 1000;
 
   // ---------------------------------------------------------------------
   // Bandwidth allocation (mock, mirrors `bandwidth::allocate`'s shape at a
@@ -592,6 +694,7 @@
   let activeSharesGridEl = null;
   let activeSharesBodySig = null;
   const destCardEls = new Map(); // destination_id -> { el, sig }
+  const stagedCardEls = new Map(); // capture_id -> { el, sig }
   // audio destination_id -> its `.dest-audio-meter` element, which lives
   // inside the *paired video* destination's card. `updateStats()` needs this
   // indirection because `stream-stats-updated` keys `audio_level` by the
@@ -660,10 +763,12 @@
     return s;
   }
 
-  // The framerates the destination card's Framerate picker offers. Same nine
-  // values the "Start a Stream" form offers (see `renderStartStreamCard`'s
-  // note on why 240/280 are on the list at all), plus this destination's own
-  // current rate if it somehow isn't one of them — a stream started before
+  // The framerates the destination card's Framerate picker offers — the same
+  // nine values a staged card's Framerate picker offers (240/280 exceed real
+  // monitor Hz and the project's documented 240Hz spec ceiling, offered
+  // anyway per explicit user request to experiment past that ceiling), plus
+  // this destination's own current rate if it somehow isn't one of them — a
+  // stream started before
   // this list changed, or one whose rate was clamped server-side, must still
   // be shown truthfully rather than silently snapped to a neighbour.
   const FRAMERATE_OPTIONS = [15, 30, 60, 90, 120, 144, 165, 240, 280];
@@ -673,9 +778,6 @@
     if (!current || FRAMERATE_OPTIONS.includes(current)) return FRAMERATE_OPTIONS;
     return FRAMERATE_OPTIONS.concat([current]).sort((a, b) => a - b);
   }
-  let startCardEl = null;
-  let startCardSig = null;
-
   /** Reconciles `parent`'s children to exactly `children` (falsy entries
    * dropped), reusing/moving existing nodes instead of recreating them —
    * `insertBefore`/`appendChild` on a node already in the right place is a
@@ -711,12 +813,7 @@
           } kbps but the maximum is ${bandwidth.absolute_total_kbps} kbps. No stream is starved below its floor.`
       : null;
 
-    syncChildren(gridEl, [
-      updateBandwidthCard(),
-      bannerText ? updateOvershootBanner(bannerText) : null,
-      updateActiveSharesCard(alloc),
-      updateStartStreamCard(),
-    ]);
+    syncChildren(gridEl, [updateBandwidthCard(), bannerText ? updateOvershootBanner(bannerText) : null, updateActiveSharesCard(alloc)]);
   }
 
   // ---------------------------------------------------------------------
@@ -799,18 +896,17 @@
     if (activeSharesGhostEl) return activeSharesGhostEl;
     const wrap = el("div", { className: "sc-ghost-rows" });
 
-    // "Share another screen" — the real entry point is the "Start a
-    // Stream" card below; this just scrolls/focuses it rather than
-    // duplicating the room/framerate/bitrate form and its start logic.
+    // "Share another screen" — the entry point into the "Go live" flow (see
+    // `superdoc/features/stream-control.md`'s 2026-07-28 note): starts a
+    // real, staged capture right away (portal prompt and all) and lets it
+    // render as its own card in the grid below, rather than opening a
+    // separate form. Nothing is sent to any room — no `AnnounceStream`, no
+    // destination — until that staged card's own "Go live" button is
+    // pressed.
     const screenRow = el("div", {
       className: "sc-ghost-row",
       attrs: { role: "button", tabindex: "0" },
-      onClick: () => {
-        if (!startCardEl) return;
-        startCardEl.scrollIntoView({ behavior: "smooth", block: "center" });
-        const firstControl = startCardEl.querySelector("select, input, button");
-        if (firstControl) firstControl.focus();
-      },
+      onClick: () => stageVideoShare(),
     });
     screenRow.appendChild(icon("cast", "sc-ghost-row-icon sc-ghost-row-icon-accent"));
     screenRow.appendChild(el("span", { text: "Share another screen" }));
@@ -829,10 +925,14 @@
   function updateActiveSharesCard(alloc) {
     // Audio never renders a card of its own, so "is this list empty" is a
     // question about *screen shares* — an audio-only destination list would
-    // otherwise show an empty grid instead of the empty state.
-    if (mockDestinations.filter((d) => d.kind !== "audio").length === 0) {
+    // otherwise show an empty grid instead of the empty state. Staged
+    // captures (real, running, "Go live"-not-yet-pressed shares) count as
+    // non-empty too — a staged card is exactly the kind of thing this grid
+    // exists to show.
+    if (mockDestinations.filter((d) => d.kind !== "audio").length === 0 && mockStagedCaptures.length === 0) {
       audioMeterEls.clear();
       destCardEls.clear();
+      stagedCardEls.clear();
       if (!activeSharesCardEl || activeSharesBodySig !== "empty") {
         activeSharesCardEl = card(
           "ACTIVE SHARES",
@@ -858,6 +958,49 @@
       activeSharesCardEl.appendChild(buildGhostRows());
     }
     activeSharesBodySig = "list";
+
+    // Staged cards render first, ahead of live ones — "Go live" hasn't
+    // happened yet, so there's nothing to compare bandwidth/room chips
+    // against; they're just the capture + its editable settings.
+    const seenStagedIds = new Set();
+    const stagedCardEl = (staged) => {
+      seenStagedIds.add(staged.capture_id);
+      const edit = getStagedEdit(staged);
+      const sig = JSON.stringify({ staged, edit, roomOptions: mockJoinedRooms });
+      let entry = stagedCardEls.get(staged.capture_id);
+      if (!entry || entry.sig !== sig) {
+        const priorAdvancedEl = entry ? entry.el.querySelector(".dest-advanced") : null;
+        const advancedOpen = priorAdvancedEl ? priorAdvancedEl.open : false;
+        entry = {
+          el: destinationCard(
+            staged,
+            {
+              onEditApply: (captureId, patch) => applyStagedTuning(captureId, staged, patch),
+              onStagedRoomChange: (captureId, roomHandle) => setStagedRoom(captureId, roomHandle),
+              onGoLive: (captureId) => goLive(captureId, staged),
+              onCancel: (captureId) => cancelStagedCapture(captureId),
+            },
+            {
+              staged: true,
+              stagedRoomHandle: edit.roomHandle,
+              roomOptions: mockJoinedRooms,
+              encoderTuningEditable: true,
+              perStreamBitrateEditable: perStreamBitrateMode(),
+              framerateOptions: framerateOptionsFor(edit),
+              editState: edit,
+              advancedOpen,
+            }
+          ),
+          sig,
+        };
+        stagedCardEls.set(staged.capture_id, entry);
+      }
+      return entry.el;
+    };
+    const stagedCardElsOrdered = mockStagedCaptures.map(stagedCardEl);
+    for (const id of Array.from(stagedCardEls.keys())) {
+      if (!seenStagedIds.has(id)) stagedCardEls.delete(id);
+    }
 
     const seenIds = new Set();
     audioMeterEls.clear();
@@ -966,7 +1109,7 @@
       if (!seenIds.has(id)) destCardEls.delete(id);
     }
 
-    syncChildren(activeSharesGridEl, orderedCardEls);
+    syncChildren(activeSharesGridEl, stagedCardElsOrdered.concat(orderedCardEls));
     return activeSharesCardEl;
   }
 
@@ -1017,214 +1160,73 @@
   }
 
   // ---------------------------------------------------------------------
-  // Start a stream card
+  // Staged capture flow (mock) — "Share Screen"/"Share another screen"'s
+  // portal-prompt-then-`ready` progression, and "Go live" turning a staged
+  // card into a real destination. See `superdoc/features/stream-
+  // control.md`'s 2026-07-28 note.
   // ---------------------------------------------------------------------
 
-  function updateStartStreamCard() {
-    const sig = JSON.stringify({
-      mockJoinedRooms,
-      bandwidthMode: bandwidth.bandwidth_mode,
-      startForm: state.startForm,
-      startInFlight: state.startInFlight,
-      startError: state.startError,
+  function mockStageVideoShare() {
+    const captureId = stagedCaptureIdSeq++;
+    mockStagedCaptures.push({
+      capture_id: captureId,
+      state: "starting",
+      width: 0,
+      height: 0,
+      framerate: 30,
+      bitrate_kbps: 8000,
+      tune: "best_quality",
+      quality_level: "balanced",
+      rate_control: "constant",
     });
-    if (startCardEl && startCardSig === sig) return startCardEl;
-    startCardSig = sig;
-    startCardEl = renderStartStreamCard();
-    return startCardEl;
+    render();
+    // Mimics the real portal-prompt-then-pipeline-up delay at toy timescale.
+    setTimeout(() => {
+      const row = mockStagedCaptures.find((c) => c.capture_id === captureId);
+      if (!row) return;
+      row.state = "ready";
+      row.width = 1920;
+      row.height = 1080;
+      render();
+    }, 700);
   }
 
-  function renderStartStreamCard() {
-    const form = el("div", { className: "sc-start-form" });
-
-    const roomField = el("div", { className: "sc-start-field" });
-    roomField.appendChild(el("label", { className: "field-label", text: "Room" }));
-    const roomSelect = dropdown(
-      mockJoinedRooms.map((r) => ({ value: r.id, label: r.name })),
-      state.startForm.roomHandle,
-      (value) => (state.startForm.roomHandle = Number(value))
-    );
-    roomField.appendChild(roomSelect);
-    form.appendChild(roomField);
-
-    // Preset — the same "Low-Latency / Balanced / Quality" pill-switch
-    // `destinationCard`'s per-destination edit panel offers for an existing
-    // share (`components.js`'s shared `ENCODER_PRESETS`/`activeEncoderPreset`),
-    // so starting a stream and editing one afterwards offer the identical
-    // set of options rather than the edit panel being strictly richer. See
-    // `superdoc/features/stream-control.md`'s 2026-07-28 note.
-    const presetField = el("div", { className: "sc-start-field" });
-    presetField.appendChild(el("label", { className: "field-label", text: "Preset" }));
-    const activePreset = activeEncoderPreset(state.startForm.tune, state.startForm.qualityLevel, state.startForm.rateControl);
-    presetField.appendChild(
-      pillSwitch(
-        ENCODER_PRESETS.map((p) => ({ value: p.value, label: p.label })),
-        activePreset ? activePreset.value : null,
-        (value) => {
-          const preset = ENCODER_PRESETS.find((p) => p.value === value);
-          if (preset) applyStartFormTuning({ tune: preset.tune, qualityLevel: preset.qualityLevel, rateControl: preset.rateControl });
-        }
-      )
-    );
-    form.appendChild(presetField);
-
-    const fpsField = el("div", { className: "sc-start-field" });
-    fpsField.appendChild(el("label", { className: "field-label", text: "Framerate" }));
-    // 90/120/144/165/240 match real monitor refresh rates; 280 exceeds both
-    // real monitor Hz and the project's documented 240Hz spec ceiling (see
-    // capture::MAX_FRAMERATE's doc comment) — offered anyway per explicit
-    // user request to experiment past that ceiling. MJPEG-over-HTTP delivery
-    // bottlenecks around 20-30fps regardless of capture framerate, so
-    // nothing above that is expected to visibly improve *viewer* playback
-    // yet; this only widens what capture itself can be asked to run at.
-    const fpsSelect = dropdown(
-      [15, 30, 60, 90, 120, 144, 165, 240, 280].map((fps) => ({ value: String(fps), label: fps + " fps" })),
-      String(state.startForm.fps),
-      (value) => applyStartFormTuning({ fps: Number(value) })
-    );
-    fpsField.appendChild(fpsSelect);
-    form.appendChild(fpsField);
-
-    // Offering a manual bitrate in Absolute mode would be a lie — the
-    // allocator overwrites it within a second of the stream going live
-    // (APP-SHELL.md's Stream Control section, item 2).
-    if (bandwidth.bandwidth_mode === "per_stream") {
-      const bitrateField = el("div", { className: "sc-start-field" });
-      bitrateField.appendChild(el("label", { className: "field-label", text: "Bitrate (kbps)" }));
-      const bitrateInput = el("input", {
-        attrs: { type: "number", min: "200", max: "40000", step: "100", value: String(state.startForm.bitrateKbps) },
-      });
-      bitrateInput.addEventListener("change", () => applyStartFormTuning({ bitrateKbps: Number(bitrateInput.value) || 200 }));
-      bitrateField.appendChild(bitrateInput);
-      form.appendChild(bitrateField);
-    }
-
-    // Advanced tuning — the raw Tune/Quality Level/Rate Control knobs behind
-    // a native `<details>` disclosure, same widget and same collapsed-by-
-    // default convention as `destinationCard`'s Advanced section (see that
-    // function's own doc comment on why `<details>` and why the caller has
-    // to thread the open/closed state back in across a rebuild).
-    const priorAdvancedEl = startCardEl ? startCardEl.querySelector(".dest-advanced") : null;
-    const advancedOpen = priorAdvancedEl ? priorAdvancedEl.open : false;
-    const advanced = el("details", { className: "dest-advanced", attrs: advancedOpen ? { open: "" } : {} });
-    advanced.appendChild(el("summary", { className: "dest-advanced-summary", text: "Advanced tuning" }));
-    const advancedBody = el("div", { className: "dest-advanced-body" });
-    const advancedGrid = el("div", { className: "dest-edit-grid dest-edit-grid-nested" });
-
-    const tuneRow = el("div", { className: "dest-edit-row" });
-    tuneRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Tune" }));
-    tuneRow.appendChild(
-      pillSwitch(
-        [
-          { value: "low_latency", label: "Low Latency" },
-          { value: "best_quality", label: "Best Quality" },
-        ],
-        state.startForm.tune,
-        (value) => applyStartFormTuning({ tune: value })
-      )
-    );
-    tuneRow.appendChild(el("span"));
-    advancedGrid.appendChild(tuneRow);
-
-    const qualityRow = el("div", { className: "dest-edit-row" });
-    qualityRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Quality Level" }));
-    qualityRow.appendChild(
-      pillSwitch(
-        [
-          { value: "performance", label: "Performance" },
-          { value: "balanced", label: "Balanced" },
-          { value: "quality", label: "Quality" },
-        ],
-        state.startForm.qualityLevel,
-        (value) => applyStartFormTuning({ qualityLevel: value })
-      )
-    );
-    qualityRow.appendChild(el("span"));
-    advancedGrid.appendChild(qualityRow);
-
-    const rateControlRow = el("div", { className: "dest-edit-row" });
-    rateControlRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Rate Control" }));
-    rateControlRow.appendChild(
-      pillSwitch(
-        [
-          { value: "constant", label: "Constant" },
-          { value: "adaptive", label: "Adaptive" },
-          { value: "quality", label: "Quality" },
-        ],
-        state.startForm.rateControl,
-        (value) => applyStartFormTuning({ rateControl: value })
-      )
-    );
-    rateControlRow.appendChild(el("span"));
-    advancedGrid.appendChild(rateControlRow);
-
-    advancedBody.appendChild(advancedGrid);
-    advanced.appendChild(advancedBody);
-    form.appendChild(advanced);
-
-    form.appendChild(
-      primaryButton("Share Screen", () => {
-        if (state.startInFlight) return;
-        state.startError = null;
-        state.startInFlight = true;
-        render();
-        startVideoShare(
-          state.startForm.roomHandle,
-          state.startForm.fps,
-          state.startForm.bitrateKbps,
-          state.startForm.tune,
-          state.startForm.qualityLevel,
-          state.startForm.rateControl
-        )
-          .catch((e) => {
-            state.startError = String(e);
-          })
-          .finally(() => {
-            state.startInFlight = false;
-            render();
-          });
-      })
-    );
-
-    if (state.startError) form.appendChild(el("div", { className: "sc-start-error", text: state.startError }));
-    if (state.startInFlight) form.appendChild(el("div", { className: "sc-start-progress", text: "Waiting for screen-share permission…" }));
-
-    return card("START A STREAM", [form], { className: "sc-start-stream-card" });
-  }
-
-  function mockStartStream(roomHandle, fps, bitrateKbps, tune, qualityLevel, rateControl) {
-    const room = mockJoinedRooms.find((r) => r.id === roomHandle);
+  function mockGoLive(captureId, staged, edit) {
+    const room = mockJoinedRooms.find((r) => r.id === edit.roomHandle);
+    mockStagedCaptures = mockStagedCaptures.filter((c) => c.capture_id !== captureId);
+    stagedEditState.delete(captureId);
     const newDest = {
-      destination_id: destIdSeq,
-      capture_id: destIdSeq++,
-      room_handle: roomHandle,
-      room_label: room ? room.name : String(roomHandle),
+      destination_id: destIdSeq++,
+      capture_id: captureId,
+      room_handle: edit.roomHandle,
+      room_label: room ? room.name : String(edit.roomHandle),
       kind: "video",
       state: "starting",
-      width: 1920,
-      height: 1080,
-      framerate: fps,
-      bitrate_kbps: bitrateKbps,
+      width: staged.width || 1920,
+      height: staged.height || 1080,
+      framerate: edit.framerate,
+      bitrate_kbps: edit.bitrateKbps,
       pending: null,
     };
     // Seed the edit buffer `getDestEdit` would otherwise lazily default to
     // "best_quality"/"balanced"/"constant" — so the mock destination card's
     // Preset/Advanced-tuning controls reflect what was actually picked on
-    // the "Start a Stream" form, same as the real Tauri branch does via
-    // `set_tune`/`set_quality_level`/`set_rate_control` before `start_video_
-    // share`.
-    destEditState.set(newDest.destination_id, { bitrateKbps, framerate: fps, tune, qualityLevel, rateControl, error: null });
-
-    // Mimics the design handoff's "Waiting for screen-share permission…" ->
-    // Starting -> Live progression (shot 09) at toy timescales.
+    // the staged card, same as the real Tauri branch does via `set_tune`/
+    // `set_quality_level`/`set_rate_control` before `go_live`.
+    destEditState.set(newDest.destination_id, {
+      bitrateKbps: edit.bitrateKbps,
+      framerate: edit.framerate,
+      tune: edit.tune,
+      qualityLevel: edit.qualityLevel,
+      rateControl: edit.rateControl,
+      error: null,
+    });
+    mockDestinations.push(newDest);
+    render();
     setTimeout(() => {
-      mockDestinations.push(newDest);
+      newDest.state = "live";
       render();
-      setTimeout(() => {
-        newDest.state = "live";
-        render();
-      }, 800);
-    }, 700);
+    }, 800);
   }
 
   // ---------------------------------------------------------------------
@@ -1237,12 +1239,8 @@
   async function init() {
     mockJoinedRooms = await fetchJoinedRooms();
     mockDestinations = await fetchActiveDestinations();
+    mockStagedCaptures = await fetchStagedCaptures();
     bandwidth = await fetchBandwidthSettings();
-    // Pre-fill the "Start a Stream" form with the last-used values instead
-    // of the hardcoded fallback `state.startForm` was built with — see
-    // `fetchStartStreamDefaults`'s doc comment.
-    const startDefaults = await fetchStartStreamDefaults();
-    if (startDefaults) Object.assign(state.startForm, startDefaults);
     // `Why audio sources aren't fetched here any more:` nothing renders them
     // until someone opens a share card's "+ Add audio" picker, and that
     // handler re-lists them on open anyway (which applications are producing
@@ -1251,10 +1249,9 @@
     // paint a wait on a real system-audio query — up to `withTimeout`'s full
     // 3s on a machine with no audio server — for data nothing was drawing.
 
-    if (mockJoinedRooms.length > 0 && !mockJoinedRooms.some((r) => r.id === state.startForm.roomHandle)) {
-      state.startForm.roomHandle = mockJoinedRooms[0].id;
-    }
-
+    // Any staged card's Room picker defaults to the first joined room, same
+    // "pick something sane, let the user change it" convention the old
+    // "START A STREAM" form's Room dropdown used — see `getStagedEdit`.
     render();
   }
 
