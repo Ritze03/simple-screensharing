@@ -292,9 +292,17 @@
    * row's own leave/forget icon-button in the action slot stays as a fast
    * path that does NOT open the panel first (its own click handler stops
    * propagation) — a user who already knows they want to leave shouldn't be
-   * forced through the panel to do it. Disconnected/reconnecting rows never
-   * open the panel (there's no live `room_handle`/roster to show for a room
-   * that's not joined) — `onOpenRoom` is only wired for `state === "joined"`.
+   * forced through the panel to do it.
+   *
+   * `Why:` (2026-07-28, room-row redesign) the row click now opens the
+   * panel for EVERY state, not just `joined` — a disconnected/reconnecting
+   * row used to be a dead click outside its caret/action icons, which read
+   * as broken next to the joined rows' full-row affordance. `openRoomPanel`
+   * (shell.js) degrades its content per state (no live roster to show
+   * without a `room_handle`) rather than refusing to open. The
+   * disconnected row's reconnect action stays a fast path independent of
+   * the panel: its caret slot (see below) still stops propagation so
+   * clicking it reconnects without first opening/closing the panel.
    *
    * `Why:` (2026-07-28, member/LIVE tree pass) the row's meta slot used to
    * show a `"{count} active"` summary; it's now always shown below the row
@@ -310,18 +318,20 @@
     handlers = handlers || {};
     const row = el("div", { className: "room-row room-row-" + room.state });
 
-    const head = el("div", { className: "room-row-head" });
-    if (room.state === "joined") {
-      head.classList.add("room-row-head-clickable");
-      head.addEventListener("click", () => handlers.onOpenRoom && handlers.onOpenRoom(room.join_string));
-    }
+    const head = el("div", { className: "room-row-head room-row-head-clickable" });
+    head.addEventListener("click", () => handlers.onOpenRoom && handlers.onOpenRoom(room.join_string));
 
     head.appendChild(statusDot(room.state));
 
     // Caret slot: open the room-detail panel (joined), reconnect
-    // (disconnected), or an empty spacer (reconnecting — "nothing to click
-    // while connecting"). The caret's own click stops propagation so it
-    // doesn't double-fire the head's row-wide click handler above.
+    // (disconnected — now a plain yellow dot rather than the old
+    // `restart_alt` glyph, see `.room-caret-reconnect-dot` in shell.css; the
+    // arrow read as "pointing at itself" per the design owner's screenshot
+    // note), or an empty spacer (reconnecting — "nothing to click while
+    // connecting"). Every caret's own click stops propagation so it doesn't
+    // double-fire the head's row-wide click handler above (which now opens
+    // the panel for every state, not just joined — see this function's doc
+    // comment).
     if (room.state === "joined") {
       head.appendChild(
         el("button", {
@@ -337,9 +347,12 @@
       head.appendChild(
         el("button", {
           className: "room-caret room-caret-reconnect",
-          onClick: () => handlers.onReconnect && handlers.onReconnect(room.join_string),
+          onClick: (e) => {
+            e.stopPropagation();
+            handlers.onReconnect && handlers.onReconnect(room.join_string);
+          },
           attrs: { "aria-label": "Reconnect", title: "Reconnect" },
-        }, [icon("restart_alt")])
+        }, [el("span", { className: "status-dot room-caret-reconnect-dot" })])
       );
     } else {
       head.appendChild(el("span", { className: "room-caret room-caret-spacer" }));
@@ -353,8 +366,12 @@
     // `"{count} active"` summary here; that's now the member/LIVE tree
     // appended below the row instead (see this function's doc comment), so
     // joined falls through to the "—" default.
-    let metaText = "—";
-    if (room.state === "disconnected") metaText = "not connected";
+    // `Why:` (2026-07-28) disconnected used to show a "not connected" meta
+    // string here — redundant with the row's own outline status dot (and
+    // its name already going dim, `.room-row-disconnected .room-name` in
+    // shell.css) per the design owner's screenshot feedback. Falls through
+    // to the same "—" default `reconnecting` already used.
+    const metaText = "—";
     head.appendChild(el("span", { className: "room-meta", text: metaText }));
 
     // Action slot: leave (joined), forget (disconnected), or empty (nothing

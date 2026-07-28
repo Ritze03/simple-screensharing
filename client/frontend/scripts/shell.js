@@ -38,6 +38,7 @@
     iconButton,
     icon,
     el,
+    statusDot,
     hatchedBanner,
     dropdown,
     pillSwitch,
@@ -616,14 +617,17 @@
   // startup.
   // ---------------------------------------------------------------------
 
-  /** Opens the panel for a joined room. Disconnected/reconnecting rows never
-   * reach this (see `renderRoomRow`'s `onOpenRoom` wiring — only attached
-   * for `state === "joined"`), but this guard stays as the defensive
-   * single source of truth: there's no live `room_handle`/roster to show
-   * for a room that isn't actually joined. */
+  /** Opens the panel for a room, any state. `Why:` (2026-07-28, room-row
+   * redesign) this used to require `state === "joined"` — `renderRoomRow`'s
+   * row click only reached `onOpenRoom` for joined rooms, so this guard was
+   * mostly decorative. Now every row's click opens the panel (see
+   * `renderRoomRow`'s doc comment, components.js), so `renderRoomPanel`
+   * itself is what degrades: it skips the Members/Live-streams sections
+   * (which need a live `room_handle`/roster) for a disconnected/reconnecting
+   * room rather than crashing on data that doesn't exist yet. */
   async function openRoomPanel(joinString) {
     const room = mockRooms.find((r) => r.join_string === joinString);
-    if (!room || room.state !== "joined" || room.room_handle == null) return;
+    if (!room) return;
 
     state.activeRoomPanel = joinString;
 
@@ -808,9 +812,14 @@
     panel.innerHTML = "";
 
     // ---- Header: status dot + name + close icon, meta line below. ----
+    // `Why:` (2026-07-28) the dot used to be hardcoded `status-dot-joined`
+    // since the panel only ever opened for joined rooms; now it reflects
+    // the room's real state via the same `statusDot` helper the sidebar row
+    // uses (components.js), so a disconnected/reconnecting room's panel
+    // doesn't lie about being connected.
     const header = el("div", { className: "room-panel-header" });
     const top = el("div", { className: "room-panel-header-top" });
-    top.appendChild(el("span", { className: "status-dot status-dot-joined" }));
+    top.appendChild(statusDot(room.state));
     top.appendChild(renderRoomPanelTitle(room));
     top.appendChild(renderCopyJoinLinkButton(room));
     top.appendChild(
@@ -843,84 +852,99 @@
     //    me, alone" — see this file's own header comment on mock/real
     //    parity) and were never updated to include a self entry, so the old
     //    synthetic-"You"-row/`+1` behavior is still correct there.
+    // `Why:` (2026-07-28) meta line, and the Members/Live-streams sections
+    // below, only make sense for a joined room — there's no live
+    // `room_handle`/roster for a disconnected/reconnecting one (see this
+    // function's other 2026-07-28 note, and `openRoomPanel`'s doc comment).
+    // A disconnected row gets a plain one-line status instead; reconnecting
+    // gets its own "reconnecting…" line — both replace the whole
+    // members/streams body rather than rendering it empty/broken.
+    const isJoined = room.state === "joined";
     const includesSelf = !!window.__TAURI__;
     const members = room.members || [];
-    const memberCount = includesSelf ? members.length : members.length + 1;
-    const sendingCount = myStreamCountForRoom(room);
-    const metaText = `${memberCount} member${memberCount === 1 ? "" : "s"} · you're sending ${sendingCount} stream${sendingCount === 1 ? "" : "s"} here`;
-    header.appendChild(el("div", { className: "room-panel-meta", text: metaText }));
+    if (isJoined) {
+      const memberCount = includesSelf ? members.length : members.length + 1;
+      const sendingCount = myStreamCountForRoom(room);
+      const metaText = `${memberCount} member${memberCount === 1 ? "" : "s"} · you're sending ${sendingCount} stream${sendingCount === 1 ? "" : "s"} here`;
+      header.appendChild(el("div", { className: "room-panel-meta", text: metaText }));
+    } else {
+      const metaText = room.state === "reconnecting" ? "Reconnecting…" : "Not connected";
+      header.appendChild(el("div", { className: "room-panel-meta", text: metaText }));
+    }
     panel.appendChild(header);
 
     const body = el("div", { className: "room-panel-body" });
 
-    // ---- MEMBERS ----
-    const membersSection = el("div", { className: "room-panel-members-section" });
-    membersSection.appendChild(el("div", { className: "room-panel-section-label", text: "Members" }));
-    const memberList = el("div", { className: "room-panel-members" });
+    if (isJoined) {
+      // ---- MEMBERS ----
+      const membersSection = el("div", { className: "room-panel-members-section" });
+      membersSection.appendChild(el("div", { className: "room-panel-section-label", text: "Members" }));
+      const memberList = el("div", { className: "room-panel-members" });
 
-    // No DTO exposes the local client's own `conn_id`/display name to the
-    // frontend (`dto::SettingsDto`/`RoomDetail`/`MemberDto` have no such
-    // field — see `components.js`'s existing note on this same gap), so
-    // there is no general way to pick "which member is me" out of a roster
-    // of 2+ real entries. `stream-control.js`'s `renderMembersCard` avoids
-    // this by never trying: it just renders `room_detail`'s member list
-    // as-is, with no synthetic self row and no self label. Applied here the
-    // same way for the real (`includesSelf`) branch — the one exception is
-    // the single-member case, which is unambiguous without any new
-    // mechanism: a room you're viewing `room_detail` for is always one
-    // you've joined, so if the roster has exactly one entry, that member can
-    // only be you.
-    if (!includesSelf) {
-      const youRow = el("div", { className: "room-panel-member-row room-panel-member-row-you" });
-      youRow.appendChild(el("span", { className: "room-panel-member-name", text: "You" }));
-      youRow.appendChild(el("span", { className: "room-panel-you-badge", text: "YOU" }));
-      memberList.appendChild(youRow);
-      members.forEach((m) => memberList.appendChild(renderRoomPanelMemberRow(room, m)));
-    } else if (members.length === 1) {
-      const youRow = el("div", { className: "room-panel-member-row room-panel-member-row-you" });
-      youRow.appendChild(el("span", { className: "room-panel-member-name", text: "You" }));
-      youRow.appendChild(el("span", { className: "room-panel-you-badge", text: "YOU" }));
-      memberList.appendChild(youRow);
-    } else {
-      members.forEach((m) => memberList.appendChild(renderRoomPanelMemberRow(room, m)));
-    }
-    membersSection.appendChild(memberList);
-    body.appendChild(membersSection);
+      // No DTO exposes the local client's own `conn_id`/display name to the
+      // frontend (`dto::SettingsDto`/`RoomDetail`/`MemberDto` have no such
+      // field — see `components.js`'s existing note on this same gap), so
+      // there is no general way to pick "which member is me" out of a roster
+      // of 2+ real entries. `stream-control.js`'s `renderMembersCard` avoids
+      // this by never trying: it just renders `room_detail`'s member list
+      // as-is, with no synthetic self row and no self label. Applied here the
+      // same way for the real (`includesSelf`) branch — the one exception is
+      // the single-member case, which is unambiguous without any new
+      // mechanism: a room you're viewing `room_detail` for is always one
+      // you've joined, so if the roster has exactly one entry, that member can
+      // only be you.
+      if (!includesSelf) {
+        const youRow = el("div", { className: "room-panel-member-row room-panel-member-row-you" });
+        youRow.appendChild(el("span", { className: "room-panel-member-name", text: "You" }));
+        youRow.appendChild(el("span", { className: "room-panel-you-badge", text: "YOU" }));
+        memberList.appendChild(youRow);
+        members.forEach((m) => memberList.appendChild(renderRoomPanelMemberRow(room, m)));
+      } else if (members.length === 1) {
+        const youRow = el("div", { className: "room-panel-member-row room-panel-member-row-you" });
+        youRow.appendChild(el("span", { className: "room-panel-member-name", text: "You" }));
+        youRow.appendChild(el("span", { className: "room-panel-you-badge", text: "YOU" }));
+        memberList.appendChild(youRow);
+      } else {
+        members.forEach((m) => memberList.appendChild(renderRoomPanelMemberRow(room, m)));
+      }
+      membersSection.appendChild(memberList);
+      body.appendChild(membersSection);
 
-    // ---- LIVE STREAMS ----
-    // Per-stream view of `room.streams` (set by `loadRoomMembers` on the real
-    // branch, hardcoded on the mock branch — see the mock `streams` array's
-    // own comment). Owner display name is looked up in `members`; falls back
-    // to a short id if the owner isn't in the roster for some reason (should
-    // not happen in practice — a stream's owner is always a room member).
-    const watchedKeys = room.watchedKeys || new Set();
-    const streamRows = (room.streams || []).map((s) => {
-      const ownerMember = members.find((m) => m.conn_id === s.owner);
-      return {
-        owner: s.owner,
-        stream_id: s.stream_id,
-        kind: s.kind,
-        label: s.label,
-        resolution: s.kind === "Video" ? `${s.width}x${s.height}` : null,
-        display_name: ownerMember ? ownerMember.display_name : `Stream ${String(s.owner).slice(-4)}`,
-        watching: watchedKeys.has(`${s.owner}:${s.stream_id}`),
-      };
-    });
-    const streamsSection = el("div", { className: "room-panel-members-section" });
-    streamsSection.appendChild(el("div", { className: "room-panel-section-label", text: "Live streams" }));
-    const streamList = el("div", { className: "room-panel-members" });
-    if (streamRows.length === 0) {
-      streamList.appendChild(el("span", { className: "room-panel-member-status", text: "No one is sharing right now." }));
-    } else {
-      streamRows.forEach((s) => streamList.appendChild(renderRoomPanelStreamRow(room, s)));
+      // ---- LIVE STREAMS ----
+      // Per-stream view of `room.streams` (set by `loadRoomMembers` on the real
+      // branch, hardcoded on the mock branch — see the mock `streams` array's
+      // own comment). Owner display name is looked up in `members`; falls back
+      // to a short id if the owner isn't in the roster for some reason (should
+      // not happen in practice — a stream's owner is always a room member).
+      const watchedKeys = room.watchedKeys || new Set();
+      const streamRows = (room.streams || []).map((s) => {
+        const ownerMember = members.find((m) => m.conn_id === s.owner);
+        return {
+          owner: s.owner,
+          stream_id: s.stream_id,
+          kind: s.kind,
+          label: s.label,
+          resolution: s.kind === "Video" ? `${s.width}x${s.height}` : null,
+          display_name: ownerMember ? ownerMember.display_name : `Stream ${String(s.owner).slice(-4)}`,
+          watching: watchedKeys.has(`${s.owner}:${s.stream_id}`),
+        };
+      });
+      const streamsSection = el("div", { className: "room-panel-members-section" });
+      streamsSection.appendChild(el("div", { className: "room-panel-section-label", text: "Live streams" }));
+      const streamList = el("div", { className: "room-panel-members" });
+      if (streamRows.length === 0) {
+        streamList.appendChild(el("span", { className: "room-panel-member-status", text: "No one is sharing right now." }));
+      } else {
+        streamRows.forEach((s) => streamList.appendChild(renderRoomPanelStreamRow(room, s)));
+      }
+      streamsSection.appendChild(streamList);
+      // `Why:` no watcher-count column — see `renderRoomPanelStreamRow`'s doc
+      // comment; this is a genuine relay protocol gap, not an oversight.
+      streamsSection.appendChild(
+        el("div", { className: "room-panel-privacy-note", text: "Watcher counts aren't shown yet — the relay only reports them to a stream's own owner." })
+      );
+      body.appendChild(streamsSection);
     }
-    streamsSection.appendChild(streamList);
-    // `Why:` no watcher-count column — see `renderRoomPanelStreamRow`'s doc
-    // comment; this is a genuine relay protocol gap, not an oversight.
-    streamsSection.appendChild(
-      el("div", { className: "room-panel-privacy-note", text: "Watcher counts aren't shown yet — the relay only reports them to a stream's own owner." })
-    );
-    body.appendChild(streamsSection);
 
     // ---- AUTO-CONNECT ----
     // Join this room automatically at app startup — a persisted per-room
@@ -952,17 +976,52 @@
 
     panel.appendChild(body);
 
-    // ---- Footer: divider (via border-top in CSS) + outline "Leave" ----
+    // ---- Footer: divider (via border-top in CSS) + two outline actions. ----
+    // `Why:` (2026-07-28, room-row redesign) this used to be a single
+    // "Leave this room" button shown only for joined rooms — the only state
+    // that ever reached the panel before. Two changes now that the panel
+    // opens for every state:
+    //  - Relabeled to "Disconnect" (`dangerButton` never rendered an icon of
+    //    its own, so there was none to remove in code — the rename itself
+    //    is the ask: "Leave this room" read oddly once the panel could also
+    //    represent a room that's not currently joined).
+    //  - A second, separate delete/forget button sits next to it, reusing
+    //    the exact same handler the sidebar row's own "Forget room" trash
+    //    icon uses (`openLeaveConfirm` -> `leaveRoom` -> `forget_room` once
+    //    `room.room_handle == null`, see `leaveRoom`'s doc comment) — so
+    //    forgetting a saved room no longer requires closing the panel and
+    //    going back to the sidebar row's own delete icon.
+    // Both buttons are always present (per the design ask), but each is
+    // disabled outside the one state it's actually valid for: "Disconnect"
+    // needs a live connection to drop (joined only — there's no
+    // `force_leave_room`-equivalent for a room you're not in), and "Delete
+    // room" needs `room.room_handle == null` for `forget_room` to apply
+    // (disconnected only — mirrors the sidebar row's own action slot, which
+    // likewise shows exactly one live action per state and none while
+    // reconnecting, nothing safe to act on mid-connect). Disabling rather
+    // than hiding keeps both discoverable in one place instead of the
+    // footer's shape shifting per room state.
     const footer = el("div", { className: "room-panel-footer" });
     footer.appendChild(
       dangerButton(
-        "Leave this room",
+        "Disconnect",
         () => {
           const joinString = room.join_string;
           closeRoomPanel();
           openLeaveConfirm(joinString);
         },
-        { className: "room-panel-leave-btn" }
+        { className: "room-panel-leave-btn", disabled: room.state !== "joined" }
+      )
+    );
+    footer.appendChild(
+      dangerButton(
+        "Delete room",
+        () => {
+          const joinString = room.join_string;
+          closeRoomPanel();
+          openLeaveConfirm(joinString);
+        },
+        { className: "room-panel-leave-btn", disabled: room.state !== "disconnected" }
       )
     );
     panel.appendChild(footer);
