@@ -45,6 +45,22 @@
     console.error("[viewer] failed to parse streamKeys query param:", e);
   }
 
+  // Functional-parity metadata (2026-07-28) — `ownerLabel`/`roomLabel`/
+  // `hasAudio`/`resolution` for the (exactly one, in practice) tile this
+  // window shows, passed straight through by `view.js`'s `popOutWatch` via
+  // `electron/main.js`'s `openPopoutWindow` rather than re-derived here
+  // (that would mean re-fetching `room_detail` and re-joining against
+  // `members`/`streams`, logic `view.js`'s `fetchWatchedStreams` already
+  // did once). Absent entirely in a plain-browser preview (no query
+  // params) or the mock branch, in which case the tile just renders with no
+  // nameplate/overlay — see `renderTile`'s label guard below.
+  const tileMeta = {
+    ownerLabel: params.get("ownerLabel") || null,
+    roomLabel: params.get("roomLabel") || null,
+    hasAudio: params.get("hasAudio") === "1",
+    resolution: params.get("resolution") || null,
+  };
+
   // Local mirror of this window's OS fullscreen state — pop-out windows
   // always open windowed (never fullscreen-at-open, unlike the old
   // fullscreen/borderless viewer), so this starts false. Kept in sync by
@@ -79,6 +95,44 @@
     if (opts.onClick) node.addEventListener("click", opts.onClick);
     (children || []).forEach((c) => c && node.appendChild(c));
     return node;
+  }
+
+  /** A single Material Symbols glyph — mirrors `components.js`'s `icon()`.
+   * Not `window.Components.icon` itself: this standalone window doesn't
+   * load `components.js` (a whole app-shell component library for one
+   * glyph helper is more than this lean window needs), just `fonts.css`
+   * for the underlying `@font-face`. */
+  function icon(name) {
+    return el("span", { className: "material-symbols-outlined", text: name });
+  }
+
+  // Per-tile playback volume/mute — mirrors `view.js`'s own `tileVolume`/
+  // `tileMuted`/`DEFAULT_VOLUME`/`pushVolume` exactly (same range, same
+  // `set_volume` contract), kept as this window's own copy rather than a
+  // shared module because there's only ever one tile here and no re-render
+  // cadence to survive across (unlike `view.js`, this window never tears
+  // down and rebuilds its tile on a timer).
+  const tileVolume = new Map();
+  const tileMuted = new Set();
+  const DEFAULT_VOLUME = 100;
+
+  /** Push this tile's effective volume (0 while muted) to the backend.
+   * `tile.roomHandle` is a real `u32` starting at 0 (see `view.js`'s
+   * `pushVolume` doc comment for why a plain truthiness check would wrongly
+   * drop every call for room_handle 0) — `!= null` is the right guard. */
+  async function pushVolume(tile) {
+    if (!window.__TAURI__ || tile.roomHandle == null) return;
+    const percent = tileMuted.has(tile.id) ? 0 : (tileVolume.get(tile.id) ?? DEFAULT_VOLUME);
+    try {
+      await window.__TAURI__.core.invoke("set_volume", {
+        roomHandle: tile.roomHandle,
+        owner: tile.owner,
+        streamId: tile.streamId,
+        volumePercent: percent,
+      });
+    } catch (e) {
+      console.error("[viewer] set_volume failed", e);
+    }
   }
 
   /** Fetches the user's `max_jitter_buffer_ms` preference once at startup
@@ -128,17 +182,108 @@
         console.error(`[viewer] no video URL resolved for ${rawKey}, skipping tile`);
         continue;
       }
-      tiles.push({ id: parsed.id, videoUrl });
+      tiles.push({
+        id: parsed.id,
+        videoUrl,
+        roomHandle: parsed.roomHandle,
+        owner: parsed.owner,
+        streamId: parsed.streamId,
+        // See `tileMeta`'s doc comment above — same fields for every tile in
+        // this window since every pop-out window shows exactly one stream in
+        // practice, even though this loop stays generic over N keys.
+        ownerLabel: tileMeta.ownerLabel,
+        roomLabel: tileMeta.roomLabel,
+        hasAudio: tileMeta.hasAudio,
+        resolution: tileMeta.resolution,
+      });
     }
     return tiles;
   }
 
+  /** Builds the whole `.viewer-tile-audio` mute+volume pill, appended into
+   * `bottom` and swapped in place on every mute toggle — mirrors `view.js`'s
+   * `renderTile`'s own `buildAudioGroup` closure exactly (same swap-in-
+   * place-on-mute-toggle approach, same reason: only this pill needs to
+   * change, not the whole tile/overlay). */
+  function appendAudioGroup(tile, bottom) {
+    const buildAudioGroup = (muted) => {
+      const group = el("div", { className: "viewer-tile-audio" + (muted ? " viewer-tile-audio-muted" : "") });
+      const muteBtn = el(
+        "button",
+        {
+          className: "viewer-tile-audio-btn",
+          attrs: { title: muted ? "Unmute" : "Mute", "aria-label": muted ? "Unmute" : "Mute" },
+          onClick: (e) => {
+            e.stopPropagation();
+            const nowMuted = !tileMuted.has(tile.id);
+            if (nowMuted) tileMuted.add(tile.id);
+            else tileMuted.delete(tile.id);
+            pushVolume(tile);
+            const next = buildAudioGroup(nowMuted);
+            bottom.replaceChild(next, audioGroup);
+            audioGroup = next;
+          },
+        },
+        [icon(muted ? "volume_off" : "volume_up")]
+      );
+      group.appendChild(muteBtn);
+      if (!muted) {
+        const slider = el("input", {
+          className: "viewer-tile-audio-slider",
+          attrs: { type: "range", min: "0", max: "200", step: "5", "aria-label": "Volume" },
+        });
+        slider.value = String(tileVolume.get(tile.id) ?? DEFAULT_VOLUME);
+        slider.addEventListener("click", (e) => e.stopPropagation());
+        slider.addEventListener("input", () => {
+          tileVolume.set(tile.id, Number(slider.value));
+          pushVolume(tile);
+        });
+        group.appendChild(slider);
+      }
+      return group;
+    };
+    let audioGroup = buildAudioGroup(tileMuted.has(tile.id));
+    bottom.appendChild(audioGroup);
+  }
+
+  /** Same info this stream's tile shows in the main View tab's overlay —
+   * nameplate (owner · room), live fps, and (if this sender has audio) the
+   * mute+volume slider — kept "lean, chrome-free until interacted with" the
+   * same way `view.js` keeps its own grid: the nameplate is always visible,
+   * everything else only reveals on hover/focus via `.viewer-tile-overlay`'s
+   * CSS. Renders nothing extra beyond the bare video when `tileMeta` came
+   * back empty (plain-browser preview with no query params, or a malformed
+   * one) — see `view.js`'s `renderTile` for the main-tab equivalent this
+   * mirrors. */
   function renderTile(tile) {
     const wrap = el("div", { className: "viewer-tile" });
     const canvas = el("canvas", { attrs: { role: "img", "aria-label": tile.id } });
     const errorPlaceholder = el("div", { className: "viewer-tile-placeholder", attrs: { hidden: "hidden" } }, [el("span", { text: "Stream error" })]);
     wrap.appendChild(canvas);
     wrap.appendChild(errorPlaceholder);
+
+    const label = tile.ownerLabel ? (tile.roomLabel ? `${tile.ownerLabel} · ${tile.roomLabel}` : tile.ownerLabel) : null;
+    if (label) {
+      wrap.appendChild(el("div", { className: "viewer-tile-nameplate", text: label }));
+
+      const overlay = el("div", { className: "viewer-tile-overlay" });
+      const top = el("div", { className: "viewer-tile-overlay-top" });
+      const titleText = tile.resolution ? `${label} · ${tile.resolution}` : label;
+      top.appendChild(el("span", { className: "viewer-tile-overlay-title", text: titleText }));
+      overlay.appendChild(top);
+
+      const bottom = el("div", { className: "viewer-tile-overlay-bottom" });
+      if (tile.hasAudio) appendAudioGroup(tile, bottom);
+      const fpsSpan = el("span", { className: "viewer-tile-fps", text: "" });
+      tile.onFps = (fps) => {
+        fpsSpan.textContent = `@${Math.round(fps)}fps`;
+      };
+      bottom.appendChild(fpsSpan);
+      overlay.appendChild(bottom);
+
+      wrap.appendChild(overlay);
+    }
+
     window.TileVideo.startTileVideo(tile, canvas, errorPlaceholder);
     return wrap;
   }

@@ -110,4 +110,21 @@ contextBridge.exposeInMainWorld("__ELECTRON__", {
       ipcRenderer.removeListener("viewer-left-fullscreen", handler);
     });
   },
+
+  // Fires in the MAIN window's renderer (unlike the other three calls above,
+  // which are scoped to whichever pop-out window called them) whenever ANY
+  // pop-out window closes, with that window's streamKey — main.js's
+  // `openPopoutWindow` sends this from the `BrowserWindow`'s own `'closed'`
+  // event. `view.js` uses it to clear the closed stream's held-slot entry
+  // from `poppedOutIds` and re-render, so the main View tab's tile resumes
+  // normal rendering automatically instead of staying stuck as a held
+  // placeholder forever. Mirrors the `Promise<UnlistenFn>` shape the other
+  // listen-style calls here use, even though nothing currently unlistens.
+  onPopoutClosed: (callback) => {
+    const handler = (_ipcEvent, streamKey) => callback(streamKey);
+    ipcRenderer.on("popout-closed", handler);
+    return Promise.resolve(() => {
+      ipcRenderer.removeListener("popout-closed", handler);
+    });
+  },
 });

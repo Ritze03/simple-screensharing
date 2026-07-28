@@ -43,12 +43,11 @@
 // notes, each next to the code it applies to:
 //
 //  - Held slots for popped-out tiles (`poppedOutIds` below) are tracked
-//    client-side only — there's no IPC signal for "the pop-out window
-//    closed", so a held slot only clears when the user clicks its "Bring it
-//    back" button. This is a deliberate best-effort approximation (see the
-//    task brief this shipped against), not a bug: building a real
-//    cross-window close signal is a bigger change than this frontend-only
-//    restyle pass.
+//    client-side, kept in sync two ways: the user's own "Bring it back"
+//    button, and (2026-07-28) a real `window.__ELECTRON__.onPopoutClosed`
+//    IPC signal fired when the pop-out `BrowserWindow` itself closes for any
+//    reason (× button, OS close, etc.) — see the listener registered near
+//    the bottom of this file and `electron/main.js`'s `openPopoutWindow`.
 //
 // Pop-out consolidation (2026-07-28): the "Fullscreen selected"/"Borderless
 // selected" multi-select buttons and their Electron singleton viewer window
@@ -114,9 +113,10 @@
   let roomFilter = null;
 
   // Tile ids currently popped out to their own OS window (`popOutWatch`) —
-  // rendered as a held dashed-border slot instead of video. See this file's
-  // header note on why there's no real "the window closed" signal to clear
-  // this automatically.
+  // rendered as a held dashed-border slot instead of video. Cleared either
+  // by the user's "Bring it back" button or automatically when the pop-out
+  // window closes — see this file's header note and the `onPopoutClosed`
+  // listener near the bottom of this file.
   const poppedOutIds = new Set();
 
   // Dynamic grid layout (2026-07-28) — see `computeGridShape`'s doc comment
@@ -503,7 +503,18 @@
     if (tile.id) poppedOutIds.add(tile.id);
     if (window.__ELECTRON__ && tile.id) {
       try {
-        await window.__ELECTRON__.openPopout({ streamKey: tile.id });
+        // Extra fields beyond `streamKey` (2026-07-28, functional parity
+        // pass) let `viewer.js` render the same nameplate/fps/volume
+        // overlay the main grid's tile shows, without re-deriving them
+        // itself — see `electron/main.js`'s `openPopoutWindow` doc comment
+        // on `meta`.
+        await window.__ELECTRON__.openPopout({
+          streamKey: tile.id,
+          ownerLabel: tile.ownerLabel,
+          roomLabel: tile.roomLabel,
+          hasAudio: !!tile.hasAudio,
+          resolution: tile.resolution || undefined,
+        });
       } catch (e) {
         console.error("openPopout failed", e);
       }
@@ -943,6 +954,22 @@
   }
 
   window.ViewTab = { refresh: init, updateStats };
+
+  // Real "the pop-out window closed" signal (2026-07-28) — see this file's
+  // header note this replaces and `electron/main.js`'s `openPopoutWindow`/
+  // `preload.js`'s `onPopoutClosed`. Registered once here at module load
+  // (NOT inside `init()`, which re-runs on every `refresh()` — e.g. every
+  // `room-connected`/`presence-updated` event via `shell.js` — and would
+  // otherwise pile up a duplicate listener per refresh). Simply deleting the
+  // closed streamKey from `poppedOutIds` and re-rendering is enough to bring
+  // the tile back to normal, real-time-decoding rendering: `renderTile`
+  // already falls through to its normal branches for any id not in
+  // `poppedOutIds` (see its held-slot check at the top).
+  if (window.__ELECTRON__ && window.__ELECTRON__.onPopoutClosed) {
+    window.__ELECTRON__.onPopoutClosed((streamKey) => {
+      if (poppedOutIds.delete(streamKey)) render();
+    });
+  }
 
   document.addEventListener("DOMContentLoaded", init);
 })();
