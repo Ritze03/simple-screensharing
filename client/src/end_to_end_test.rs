@@ -1761,3 +1761,199 @@ async fn retry_destination_preserves_prior_encoder_tuning() {
 
     eprintln!("[e2e-retry] PASS: retried destination {new_id:?} preserved bitrate/tune/quality_level/rate_control");
 }
+
+/// **The "audio follows video" contract, end to end against a real relay.**
+///
+/// This is the regression test for the feature the project owner asked for
+/// verbatim: *"the streamer should be able to enable audio on his share and
+/// the viewer should automatically hear that. No (visual) separate 'stream'
+/// for Audio."* It asserts exactly that, in the order a real session
+/// actually happens in — which is the order the previous implementation got
+/// wrong:
+///
+/// 1. Sharer starts a **video-only** share. Viewer clicks Watch. No audio
+///    watch exists (there's no audio to watch yet).
+/// 2. Sharer **then** enables audio on that share — the normal order, since
+///    you pick a monitor first and an app to capture audio from second.
+/// 3. Without the viewer doing *anything*, an `AudioWatch` for the sharer's
+///    audio stream appears in the viewer's room, marked `auto` (i.e. owned
+///    by the video watch, not by a user action), and its real GStreamer
+///    playback pipeline reaches `Playing` — the viewer is audibly hearing
+///    it.
+/// 4. The viewer stops watching the **video**, and the audio watch goes away
+///    with it.
+///
+/// Step 3 is the part that used to fail: `toggle_watch` latched
+/// `sibling_audio_stream(owner)` once, at watch time, so a viewer who was
+/// already watching when the sharer enabled audio stayed silent forever.
+/// See `session::RoomSession::sync_audio_watches`' doc comment.
+///
+/// Real everything: real relay server child process, real QUIC, real
+/// H.264 capture/encode/encrypt/fragment, real Opus capture through a real
+/// `pw-loopback` off a real PipeWire node, real Opus decode into
+/// `autoaudiosink`. `#[ignore]`d for the same reason every other test in
+/// this module is (needs a built server binary and a live PipeWire session).
+///
+/// Run with:
+/// `cargo test end_to_end_test::watching_video_automatically_delivers -- --ignored --nocapture`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "spawns a real relay server child process, real GStreamer capture/decode pipelines \
+            and a real PipeWire audio node; run explicitly with \
+            `cargo test end_to_end_test:: -- --ignored --nocapture`"]
+async fn watching_video_automatically_delivers_the_sharers_audio_too() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    const AUDIO_STREAM_ID: u8 = 9;
+    const PW_CLIENT_NAME: &str = "ssshare-audio-follows-video-test";
+
+    let port = pick_free_udp_port().expect("failed to pick a free UDP port for the test relay");
+    let _server = spawn_relay_server(port).expect("failed to spawn relay server child process");
+
+    let server_addr = format!("127.0.0.1:{port}");
+    let room_id: RoomId = rand::random();
+    let room_key: [u8; 32] = rand::random();
+    let join_string = crate::net::format_join_string(&server_addr, &room_id, &room_key);
+
+    // --- Sharer (client A): a plain client, driven directly. ---
+    let (client_a, _snapshot_a, events_a) =
+        connect_with_retry(&join_string, "sharer").await.expect("client A failed to connect");
+    let _events_a_keepalive = events_a;
+    let owner = client_a.conn_id();
+
+    // --- Viewer (client B): a real `AppState`/`RoomSession`, because that
+    // is where the behavior under test lives. `insert_room` is the same
+    // entry point `poll_connect_result` uses in production, so this viewer
+    // gets the real media-ingestion task and the real watch maps. ---
+    let (client_b, snapshot_b, events_b) =
+        connect_with_retry(&join_string, "viewer").await.expect("client B failed to connect");
+    let mut viewer = crate::session::AppState::default();
+    let room_handle = viewer.insert_room(client_b, snapshot_b, events_b, join_string.clone());
+    let ctx = egui::Context::default();
+
+    // --- Step 1: video-only share, and the viewer watches it. ---
+    let source_fragment = format!(
+        "videotestsrc is-live=true pattern=smpte \
+         ! video/x-raw,width={WIDTH},height={HEIGHT},framerate=15/1"
+    );
+    let video_handle = capture::start_sharing_from_test_source(
+        &client_a,
+        VIDEO_STREAM_ID,
+        2000,
+        capture::DEFAULT_FRAMERATE,
+        &source_fragment,
+    )
+    .await
+    .expect("start_sharing_from_test_source failed");
+
+    // Wait for the viewer's roster to learn about the video stream.
+    let mut saw_video = false;
+    for _ in 0..80 {
+        viewer.drain_events(&ctx);
+        if viewer.rooms[&room_handle].streams.iter().any(|s| s.owner == owner && s.stream_id == VIDEO_STREAM_ID) {
+            saw_video = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(saw_video, "viewer never saw the sharer's video stream announced");
+
+    viewer.rooms.get_mut(&room_handle).unwrap().toggle_watch(owner, VIDEO_STREAM_ID);
+    assert!(
+        viewer.rooms[&room_handle].watches.lock().unwrap().contains_key(&(owner, VIDEO_STREAM_ID)),
+        "toggle_watch did not create a video watch"
+    );
+    assert!(
+        viewer.rooms[&room_handle].audio_watches.lock().unwrap().is_empty(),
+        "an audio watch appeared before the sharer had any audio stream at all"
+    );
+    eprintln!("[audio-follows-video] step 1 OK: watching video, no audio anywhere yet");
+
+    // --- Step 2: the sharer NOW enables audio, with the viewer already
+    // watching. A synthetic `audiotestsrc ! pipewiresink` app stands in for
+    // "some app on the sharer's machine is playing audio".
+    //
+    // `Why volume=0:` this test runs against a real desktop session, and the
+    // *receiving* end is a real `autoaudiosink` — so a default-amplitude
+    // `audiotestsrc` plays a 440Hz sine out of the developer's actual
+    // speakers for the whole run. (It did. It was exactly as unpleasant as
+    // it sounds, and it interrupted the project owner mid-session.)
+    //
+    // Muting the source weakens nothing this test asserts. Silence is still
+    // a real, continuously produced PCM stream: it goes through the same
+    // real `pw-loopback` tap, the same real Opus encode, encryption,
+    // fragmentation, relay round trip, decryption, jitter buffer and decode
+    // as any other audio. Every assertion below is about *pipeline liveness
+    // and subscription state* — `AudioDecoder::is_alive()`, map membership,
+    // the `auto` flag — none of which depend on the waveform's amplitude.
+    let mut silent_audio_app = Command::new("gst-launch-1.0")
+        .args(["audiotestsrc", "volume=0", "!", "audioconvert", "!", "pipewiresink", &format!("client-name={PW_CLIENT_NAME}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn the synthetic audio-producing app");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let sources = crate::audio::list_audio_sources().expect("list_audio_sources failed against a live pw-dump");
+    let source = sources
+        .iter()
+        .find(|s| s.name.contains(PW_CLIENT_NAME))
+        .cloned()
+        .expect("did not find the synthetic test app among live audio sources");
+    let audio_handle = crate::audio::start_audio_sharing(&client_a, AUDIO_STREAM_ID, &source)
+        .await
+        .expect("start_audio_sharing failed");
+    eprintln!("[audio-follows-video] step 2 OK: sharer enabled audio AFTER the viewer was already watching");
+
+    // --- Step 3: the viewer must pick it up on its own. The ONLY thing
+    // driving this is `drain_events`, i.e. the same polling both frontends
+    // already do — no watch call, no listen call, no user action. ---
+    let mut auto_watch_alive = false;
+    for _ in 0..80 {
+        viewer.drain_events(&ctx);
+        {
+            let audio_watches = viewer.rooms[&room_handle].audio_watches.lock().unwrap();
+            if let Some(watch) = audio_watches.get(&(owner, AUDIO_STREAM_ID)) {
+                assert!(watch.auto, "the auto-subscribed audio watch should be marked `auto`, not a standalone Listen");
+                if watch.decoder.is_alive() {
+                    auto_watch_alive = true;
+                }
+            }
+        }
+        if auto_watch_alive {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        auto_watch_alive,
+        "the viewer never started playing the sharer's audio after it was enabled mid-watch — \
+         this is the exact bug `sync_audio_watches` exists to fix (audio latched at watch time)"
+    );
+    // And the link back to the video watch is recorded, which is what the
+    // frontend's per-tile volume control resolves through.
+    assert_eq!(
+        viewer.rooms[&room_handle].watches.lock().unwrap()[&(owner, VIDEO_STREAM_ID)].audio_stream_id,
+        Some(AUDIO_STREAM_ID),
+        "the video watch should point at the sharer's audio stream"
+    );
+    eprintln!("[audio-follows-video] step 3 OK: viewer is playing the sharer's audio with zero extra actions");
+
+    // --- Step 4: stopping the VIDEO watch stops the audio too. ---
+    viewer.rooms.get_mut(&room_handle).unwrap().toggle_watch(owner, VIDEO_STREAM_ID);
+    assert!(
+        viewer.rooms[&room_handle].watches.lock().unwrap().is_empty(),
+        "toggle_watch did not remove the video watch"
+    );
+    assert!(
+        viewer.rooms[&room_handle].audio_watches.lock().unwrap().is_empty(),
+        "the audio watch outlived the video watch it was riding along with"
+    );
+    eprintln!("[audio-follows-video] step 4 OK: audio torn down together with the video watch");
+
+    let _ = audio_handle.stop().await;
+    let _ = video_handle.stop().await;
+    let _ = silent_audio_app.kill();
+    let _ = silent_audio_app.wait();
+    eprintln!("[audio-follows-video] PASS");
+}
