@@ -455,10 +455,6 @@
   max-width: 130px;
 }
 
-.dest-chip-select[hidden] {
-  display: none;
-}
-
 .dest-computed-share {
   font-size: 11px;
   color: var(--text-faint);
@@ -653,7 +649,10 @@
   gap: 2px;
 }
 
-.sc-start-field select,
+/* The Room/Framerate fields are `Components.dropdown` now, not `<select>`
+   (see dropdown.css/components.js, 2026-07-28) — its own `.dd-trigger`
+   already carries this same chrome by default, so only `input` (Bitrate)
+   needs it here. */
 .sc-start-field input {
   background: var(--field);
   border: 1px solid var(--border);
@@ -663,7 +662,6 @@
   outline: none;
 }
 
-.sc-start-field select:focus,
 .sc-start-field input:focus {
   border-color: var(--accent);
 }
@@ -694,12 +692,11 @@
   color: var(--text-dim);
 }
 
-.sc-room-scoped-header select {
-  background: var(--field);
-  border: 1px solid var(--border);
-  border-radius: var(--rounding-sm);
-  color: var(--text);
-  padding: 4px 8px;
+/* Also a `Components.dropdown` now (see the `.sc-start-field` note above) —
+   `.dd-trigger`'s default chrome already covers this, this just keeps the
+   picker from stretching the full row width like a block element would. */
+.sc-room-scoped-header .dd {
+  width: auto;
 }
 
 /* One card wide since the SHARE AUDIO card was removed (audio attaches to a

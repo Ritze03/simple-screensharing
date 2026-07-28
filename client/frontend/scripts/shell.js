@@ -38,6 +38,7 @@
     iconButton,
     el,
     hatchedBanner,
+    dropdown,
   } = window.Components;
 
   const NAV_TABS = ["Stream Control", "View", "Settings"];
@@ -684,18 +685,19 @@
     if (panelAudioSources.length === 0) {
       audioRow.appendChild(el("span", { className: "room-panel-member-status", text: "No audio sources found." }));
     } else {
-      const select = el("select");
-      panelAudioSources.forEach((s) => select.appendChild(el("option", { text: s.name, attrs: { value: s.id } })));
-      select.value = panelAudioSourceId;
-      select.addEventListener("change", () => {
-        panelAudioSourceId = Number(select.value);
-        // Auto-Connect checked: switching sources re-shares the new one
-        // immediately, same as the initial auto-start below.
-        if (panelAudioAutoConnect) {
-          const source = panelAudioSources.find((s) => s.id === panelAudioSourceId);
-          if (source) startPanelAudioShare(room.room_handle, source);
+      const select = dropdown(
+        panelAudioSources.map((s) => ({ value: s.id, label: s.name })),
+        panelAudioSourceId,
+        (value) => {
+          panelAudioSourceId = Number(value);
+          // Auto-Connect checked: switching sources re-shares the new one
+          // immediately, same as the initial auto-start below.
+          if (panelAudioAutoConnect) {
+            const source = panelAudioSources.find((s) => s.id === panelAudioSourceId);
+            if (source) startPanelAudioShare(room.room_handle, source);
+          }
         }
-      });
+      );
       audioRow.appendChild(select);
     }
     const autoConnectLabel = el("label", {

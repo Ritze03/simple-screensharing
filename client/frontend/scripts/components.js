@@ -501,6 +501,203 @@
   }
 
   // -------------------------------------------------------------------
+  // Dropdown — the custom-styled replacement for native `<select>`. A
+  // native select's open popup is platform/OS chrome CSS cannot reach
+  // (stark white, generic font, no dark theme, no "roll out" animation, and
+  // it looks different per OS/Chromium build) — this rebuilds the same
+  // trigger+popup shape entirely out of ordinary elements so it can be
+  // themed like every other control and animate open/closed. See
+  // superdoc/ui/STYLING-GUIDE.md (2026-07-28) for the full rationale.
+  // -------------------------------------------------------------------
+
+  /**
+   * @param {{value: *, label: string}[]} options - `value` may be any type;
+   *   matching against the current value (and the value handed back to
+   *   `onChange`) is done via `String(value)` equality so callers can use
+   *   numbers, strings, whatever their option's `value` already was — same
+   *   as a native `<select>`, callers that need a number back should
+   *   `Number(...)` it in `onChange`, same as they did with `select.value`.
+   * @param {*} value - the currently-selected option's `value`
+   * @param {(value: *) => void} onChange - fired only on a real user pick,
+   *   never for a programmatic `.value = ...` set (matches native `<select>`,
+   *   which doesn't fire `change` for scripted assignment either).
+   * @param {object} [opts] - { className: string (applied to the trigger
+   *   button, so existing sizing classes like `.dest-room-select` keep
+   *   their `max-width`/padding/etc.), placeholder: string, emptyText:
+   *   string (shown, disabled-looking, when `options` is empty) }
+   * @returns {HTMLElement} a `<div class="dd">` wrapper. Beyond being a
+   *   normal appendable/removable DOM node, it also exposes: a `.value`
+   *   getter/setter (get/set the selection without going through the UI,
+   *   like `select.value`), `.setOptions(newOptions)` (rebuild the option
+   *   list in place, e.g. for an async-refreshed source list), and
+   *   `.focus()` (delegates to the trigger button). The native `.hidden`
+   *   property/attribute works as-is since it's a plain element.
+   */
+  function dropdown(options, value, onChange, opts) {
+    opts = opts || {};
+    const root = el("div", { className: "dd" });
+    const trigger = el("button", {
+      className: "dd-trigger" + (opts.className ? " " + opts.className : ""),
+      attrs: { type: "button" },
+    });
+    const labelEl = el("span", { className: "dd-trigger-label" });
+    trigger.appendChild(labelEl);
+    trigger.appendChild(icon("expand_more", "dd-chevron"));
+    root.appendChild(trigger);
+
+    // The option list lives outside `root` in the DOM (appended to <body>
+    // only while open, removed again on close) rather than as a plain
+    // `position: absolute` child of `root`. Several call sites nest this
+    // control inside an `overflow: hidden` ancestor (`.dest-card`'s rounded
+    // corners, in particular) — an absolutely-positioned child would be
+    // silently clipped there. It's created once and reused across
+    // open/close so re-opening doesn't rebuild it from scratch.
+    const list = el("div", { className: "dd-list", attrs: { role: "listbox" } });
+
+    let currentOptions = options || [];
+    let currentValue = value;
+    let open = false;
+
+    function findOption(v) {
+      return currentOptions.find((o) => String(o.value) === String(v));
+    }
+
+    function renderLabel() {
+      const match = findOption(currentValue);
+      labelEl.textContent = match ? match.label : opts.placeholder || "";
+    }
+
+    function renderOptions() {
+      list.innerHTML = "";
+      if (currentOptions.length === 0) {
+        list.appendChild(el("div", { className: "dd-option-empty", text: opts.emptyText || "No options" }));
+        return;
+      }
+      currentOptions.forEach((o) => {
+        const isSelected = String(o.value) === String(currentValue);
+        const item = el("button", {
+          className: "dd-option" + (isSelected ? " dd-option-selected" : ""),
+          attrs: { type: "button", role: "option", "aria-selected": String(isSelected) },
+        });
+        item.appendChild(el("span", { className: "dd-option-label", text: o.label }));
+        if (isSelected) item.appendChild(icon("check", "dd-option-check"));
+        item.addEventListener("click", () => {
+          currentValue = o.value;
+          renderLabel();
+          renderOptions();
+          closeList();
+          root.dispatchEvent(new Event("change"));
+          onChange && onChange(o.value);
+        });
+        list.appendChild(item);
+      });
+    }
+
+    /** Places `list` (already in <body>) directly under/over the trigger,
+     * flipping above it only when there's not enough room below *and*
+     * there's more room above — a simple check, not full collision/popover
+     * logic (not needed: this app has no nested-scroll-container cases
+     * beyond the simple "near the bottom of the window" one). */
+    function position() {
+      const rect = trigger.getBoundingClientRect();
+      list.style.left = rect.left + "px";
+      // `min-width`, not `width`: a narrow trigger (e.g. the 76px Framerate
+      // picker) would otherwise force every option's label to wrap onto two
+      // lines. Options can be wider than the trigger; they always share its
+      // left edge.
+      list.style.minWidth = rect.width + "px";
+      const spaceBelow = window.innerHeight - rect.bottom;
+      const spaceAbove = rect.top;
+      const wantsFlip = spaceBelow < 160 && spaceAbove > spaceBelow;
+      list.classList.toggle("dd-list-up", wantsFlip);
+      if (wantsFlip) {
+        list.style.bottom = window.innerHeight - rect.top + 4 + "px";
+        list.style.top = "";
+        list.style.maxHeight = Math.max(120, spaceAbove - 12) + "px";
+      } else {
+        list.style.top = rect.bottom + 4 + "px";
+        list.style.bottom = "";
+        list.style.maxHeight = Math.max(120, spaceBelow - 12) + "px";
+      }
+    }
+
+    function onReposition() {
+      if (!trigger.isConnected) {
+        closeList();
+        return;
+      }
+      position();
+    }
+
+    function onDocMouseDown(e) {
+      if (!trigger.isConnected || (!root.contains(e.target) && !list.contains(e.target))) closeList();
+    }
+
+    function onKeyDown(e) {
+      if (e.key === "Escape") {
+        closeList();
+        trigger.focus();
+      }
+    }
+
+    function openList() {
+      if (open) return;
+      open = true;
+      document.body.appendChild(list);
+      position();
+      // A frame late, same "already in the DOM before the class flips"
+      // trick this codebase already uses for its other open/close
+      // transitions (see e.g. shell.css's `.room-panel-scrim-open`) — the
+      // transition needs the closed (scaleY(0.9)/opacity 0) state to have
+      // actually painted first, or the browser coalesces both style
+      // changes into one frame and it just appears instead of rolling out.
+      requestAnimationFrame(() => list.classList.add("dd-list-open"));
+      trigger.classList.add("dd-trigger-open");
+      document.addEventListener("mousedown", onDocMouseDown, true);
+      document.addEventListener("keydown", onKeyDown, true);
+      window.addEventListener("scroll", onReposition, true);
+      window.addEventListener("resize", onReposition);
+    }
+
+    function closeList() {
+      if (!open) return;
+      open = false;
+      list.classList.remove("dd-list-open", "dd-list-up");
+      trigger.classList.remove("dd-trigger-open");
+      document.removeEventListener("mousedown", onDocMouseDown, true);
+      document.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("scroll", onReposition, true);
+      window.removeEventListener("resize", onReposition);
+      if (list.parentNode) list.parentNode.removeChild(list);
+    }
+
+    trigger.addEventListener("click", () => (open ? closeList() : openList()));
+
+    Object.defineProperty(root, "value", {
+      get() {
+        return currentValue;
+      },
+      set(v) {
+        currentValue = v;
+        renderLabel();
+        renderOptions();
+      },
+    });
+    root.setOptions = function (newOptions) {
+      currentOptions = newOptions || [];
+      renderLabel();
+      renderOptions();
+    };
+    root.focus = function () {
+      trigger.focus();
+    };
+
+    renderLabel();
+    renderOptions();
+    return root;
+  }
+
+  // -------------------------------------------------------------------
   // Two-option pill switch — mirrors `theme.rs`'s use of a `selectable_label`
   // pair for exclusive two-choice pickers (the bandwidth mode toggle, the
   // Settings tab's language switcher). One shared implementation so both
@@ -732,8 +929,17 @@
     const fanoutOptions = (opts.roomOptions || []).filter((r) => r.id !== dest.room_handle && !fedRoomIds.includes(r.id));
     if (fanoutOptions.length > 0) {
       const addWrap = el("span", { className: "dest-chip-inline-add" });
-      const fanoutSelect = el("select", { className: "dest-room-select dest-chip-select", attrs: { hidden: "" } });
-      fanoutOptions.forEach((r) => fanoutSelect.appendChild(el("option", { text: r.name, attrs: { value: r.id } })));
+      const fanoutSelect = dropdown(
+        fanoutOptions.map((r) => ({ value: r.id, label: r.name })),
+        fanoutOptions[0].id,
+        (value) => {
+          handlers.onFanout && handlers.onFanout(dest.capture_id, Number(value));
+          addBtn.hidden = false;
+          fanoutSelect.hidden = true;
+        },
+        { className: "dest-room-select dest-chip-select" }
+      );
+      fanoutSelect.hidden = true;
       const addBtn = el("button", {
         className: "dest-chip-add-btn",
         text: "+ Also send to…",
@@ -742,11 +948,6 @@
           fanoutSelect.hidden = false;
           fanoutSelect.focus();
         },
-      });
-      fanoutSelect.addEventListener("change", () => {
-        handlers.onFanout && handlers.onFanout(dest.capture_id, Number(fanoutSelect.value));
-        addBtn.hidden = false;
-        fanoutSelect.hidden = true;
       });
       addWrap.appendChild(addBtn);
       addWrap.appendChild(fanoutSelect);
@@ -846,14 +1047,12 @@
       // what the destination is actually running at.
       const framerateRow = el("div", { className: "dest-edit-row" });
       framerateRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Framerate" }));
-      const framerateSelect = el("select", { className: "dest-room-select dest-framerate-select" });
-      (opts.framerateOptions || [editState.framerate]).forEach((fps) =>
-        framerateSelect.appendChild(el("option", { text: fps + " fps", attrs: { value: String(fps) } }))
+      const framerateSelect = dropdown(
+        (opts.framerateOptions || [editState.framerate]).map((fps) => ({ value: String(fps), label: fps + " fps" })),
+        String(editState.framerate),
+        (value) => applyTuning({ framerate: Number(value) }),
+        { className: "dest-room-select dest-framerate-select" }
       );
-      framerateSelect.value = String(editState.framerate);
-      framerateSelect.addEventListener("change", () => {
-        applyTuning({ framerate: Number(framerateSelect.value) });
-      });
       framerateRow.appendChild(framerateSelect);
       framerateRow.appendChild(el("span"));
       editGrid.appendChild(framerateRow);
@@ -1027,8 +1226,12 @@
     // just a restyled entry point instead of a second copy of the picker.
     const roomOptions = (opts.roomOptions || []).filter((r) => r.id !== dest.room_handle);
     if (roomOptions.length > 0) {
-      const transferSelect = el("select", { className: "dest-room-select" });
-      roomOptions.forEach((r) => transferSelect.appendChild(el("option", { text: r.name, attrs: { value: r.id } })));
+      const transferSelect = dropdown(
+        roomOptions.map((r) => ({ value: r.id, label: r.name })),
+        roomOptions[0].id,
+        null,
+        { className: "dest-room-select" }
+      );
       actions.appendChild(transferSelect);
       actions.appendChild(
         secondaryButton("Transfer", () => handlers.onTransfer && handlers.onTransfer(dest.destination_id, Number(transferSelect.value)), {
@@ -1128,16 +1331,10 @@
     let sources = opts.audioSources || [];
 
     const picker = el("span", { className: "dest-audio-picker", attrs: { hidden: "" } });
-    const select = el("select", { className: "dest-room-select dest-audio-select" });
-    const rebuildOptions = () => {
-      select.innerHTML = "";
-      if (sources.length === 0) {
-        select.appendChild(el("option", { text: "No application is playing audio", attrs: { value: "" } }));
-        return;
-      }
-      sources.forEach((s) => select.appendChild(el("option", { text: s.name, attrs: { value: s.id } })));
-    };
-    rebuildOptions();
+    const optionsFor = () =>
+      sources.length === 0 ? [{ value: "", label: "No application is playing audio" }] : sources.map((s) => ({ value: s.id, label: s.name }));
+    const select = dropdown(optionsFor(), sources.length ? sources[0].id : "", null, { className: "dest-room-select dest-audio-select" });
+    const rebuildOptions = () => select.setOptions(optionsFor());
     picker.appendChild(select);
 
     // While the picker stays open, which applications are producing audio
@@ -1233,6 +1430,7 @@
     renderEmptyState,
     card,
     warningBanner,
+    dropdown,
     pillSwitch,
     bandwidthModeToggle,
     destinationCard,

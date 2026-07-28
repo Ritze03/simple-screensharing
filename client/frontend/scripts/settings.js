@@ -13,7 +13,7 @@
 (function () {
   "use strict";
 
-  const { el, card, pillSwitch, attachWheelStep } = window.Components;
+  const { el, card, pillSwitch, dropdown, attachWheelStep } = window.Components;
 
   const MOCK_SETTINGS = { language: "en", presentation_mode: "auto_vsync", max_jitter_buffer_ms: 2000 };
 
@@ -99,10 +99,9 @@
     langSwitch.classList.add("settings-segmented");
 
     // -- PRESENTATION MODE ------------------------------------------------
-    const select = el("select", { className: "settings-select" });
-    PRESENTATION_MODES.forEach((m) => select.appendChild(el("option", { text: m.label, attrs: { value: m.value } })));
-    select.value = state.presentation_mode;
-    select.addEventListener("change", () => setPresentationMode(select.value));
+    const select = dropdown(PRESENTATION_MODES, state.presentation_mode, (value) => setPresentationMode(value), {
+      className: "settings-select",
+    });
 
     const presentationRow = el("div", { className: "settings-control-row" }, [
       select,
