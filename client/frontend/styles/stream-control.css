@@ -269,7 +269,6 @@
   font-size: 9px;
   font-weight: 400;
   letter-spacing: 0.08em;
-  text-transform: uppercase;
   color: var(--text-faint);
 }
 
@@ -411,9 +410,20 @@
    each starting wherever its own label happens to end. The value column is
    `auto` because only the Bitrate row has a readout; every other row simply
    leaves that cell empty. */
+/* `Why a fixed px, not `max-content`, for column 1:` this class backs two
+   separate grid containers on a staged card — `editGrid` (Room/Preset/
+   Framerate/Bitrate) and the nested `advancedGrid` (Tune/Quality Level/Rate
+   Control) — and each CSS grid sizes its own `max-content` column
+   independently of the other. "Quality Level" is wider than "Preset", so
+   with `max-content` the two grids' control columns landed at different X
+   even though every row otherwise uses this same class — exactly the
+   "should all align" bug the owner flagged. A fixed width both grids share
+   is immune to that: every row's control starts at the same X regardless of
+   which grid instance (or which label) it belongs to. Sized to fit
+   "Quality Level"/"Bitrate (kbps)", the longest labels in play. */
 .dest-edit-grid {
   display: grid;
-  grid-template-columns: max-content minmax(100px, 1fr) auto;
+  grid-template-columns: 96px minmax(100px, 1fr) auto;
   align-items: center;
   gap: 8px 10px;
   padding-top: 10px;
@@ -440,7 +450,6 @@
   white-space: nowrap;
   font-size: 10px;
   letter-spacing: 0.04em;
-  text-transform: uppercase;
   color: var(--text-faint);
 }
 
@@ -555,6 +564,17 @@
   padding: 3px 8px;
   height: auto;
   font-size: 11px;
+}
+
+/* Staged card's "Go live"/"Cancel" are this card's one confirming action,
+   not a routine small button like Transfer/Stop on a live card — bump them
+   well past both `.dest-action-btn` above and the app's default `.btn`
+   (7px 14px / 12px, shell.css) so the size difference reads as deliberate,
+   not marginal. */
+.dest-actions-staged .dest-action-btn {
+  padding: 11px 22px;
+  font-size: 14px;
+  font-weight: 700;
 }
 
 .dest-room-select {

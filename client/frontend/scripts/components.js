@@ -1319,7 +1319,13 @@
       body.appendChild(el("div", { className: "dest-computed-share", text: `Allocated: ${dest.computedShareKbps} kbps` }));
     }
 
-    const actions = el("div", { className: "dest-actions" });
+    // Staged: `dest-actions-staged` bumps `.dest-action-btn` up to a bigger,
+    // more deliberate size than the routine small action buttons live cards
+    // use (Transfer/Stop) — "Go live" is the one confirming action on the
+    // whole card, not a routine icon-sized button, so it (and its "Cancel"
+    // companion) need to read as visibly more prominent. See
+    // `.dest-actions-staged .dest-action-btn` in stream-control.css.
+    const actions = el("div", { className: opts.staged ? "dest-actions dest-actions-staged" : "dest-actions" });
 
     if (opts.staged) {
       // "Go live" in place of the Transfer picker + Stop button a live card
