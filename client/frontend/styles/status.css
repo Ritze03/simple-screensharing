@@ -84,13 +84,14 @@
 }
 
 /* -- degraded ----------------------------------------------------------
- * Shares its hatch fill with `.hatched-banner` below (leave-confirm modal) —
- * one `repeating-linear-gradient`, two consumers. */
+ * Shares its hatch fill with `.hatched-banner` below (leave-confirm modal)
+ * via `--hatch-amber-gradient` (tokens.css) — one gradient declaration,
+ * two consumers, not two copies of the same literal. */
 
 .status-badge-degraded {
   color: var(--warning);
   border-color: var(--hatch-amber-border);
-  background-image: repeating-linear-gradient(45deg, var(--hatch-amber-strong) 0 4px, var(--hatch-amber-weak) 4px 8px);
+  background-image: var(--hatch-amber-gradient);
 }
 
 .status-badge-degraded .status-badge-icon {
@@ -147,7 +148,8 @@
 
 /* -------------------------------------------------------------------
  * Hatched banner — the leave-confirm modal's warning banners, reusing the
- * degraded family's exact hatch fill (see `Components.hatchedBanner`).
+ * degraded family's exact hatch fill via `--hatch-amber-gradient`
+ * (see `Components.hatchedBanner`).
  * ----------------------------------------------------------------- */
 
 .hatched-banner {
@@ -157,7 +159,7 @@
   padding: 8px 10px;
   border: 1px solid var(--hatch-amber-border);
   border-radius: var(--rounding-sm);
-  background-image: repeating-linear-gradient(45deg, var(--hatch-amber-strong) 0 4px, var(--hatch-amber-weak) 4px 8px);
+  background-image: var(--hatch-amber-gradient);
   color: var(--warning);
   font-size: 12px;
 }

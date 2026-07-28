@@ -175,6 +175,16 @@
     for (const id of selectedTileIds) {
       if (!liveIds.has(id)) selectedTileIds.delete(id);
     }
+    // Same prune for `tileStalledSince` — a tile id is `room_handle:owner:
+    // stream_id` and *can* recur (the same stream watched again later), so
+    // leaving a stale entry behind isn't just an unbounded-growth risk over
+    // a long session, it can also make a later re-stall of the same id
+    // report elapsed time from the *previous* stall instead of starting at
+    // 0s (`getStalledSince` only sets a fresh timestamp when the id has no
+    // entry yet).
+    for (const id of tileStalledSince.keys()) {
+      if (!liveIds.has(id)) tileStalledSince.delete(id);
+    }
 
     const controls = el("div", { className: "view-controls" });
     if (!window.__TAURI__) {

@@ -328,6 +328,17 @@
   }
 
   async function stopDestination(destinationId) {
+    // Drop this destination's client-side-tracked maps (stalled-since,
+    // encoder-tuning edit buffer) right away rather than waiting for the
+    // next `updateActiveSharesCard` pass to notice it's gone — that pass
+    // only prunes `destCardEls`, not these two, so a destination stopped
+    // while `stalled` (or with a customized tune/quality/rate-control edit)
+    // would otherwise sit in `destStalledSince`/`destEditState` forever,
+    // keyed by an id that will never come back (`destIdSeq` only grows).
+    // Over a long session with many stop/retry cycles that's a slow,
+    // unbounded leak — small, but avoidable.
+    destStalledSince.delete(destinationId);
+    destEditState.delete(destinationId);
     if (window.__TAURI__) {
       await window.__TAURI__.core.invoke("stop_destination", { destinationId });
       return;

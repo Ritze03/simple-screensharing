@@ -107,6 +107,11 @@
   --hatch-amber-strong: rgba(232, 163, 61, 0.16);
   --hatch-amber-weak: rgba(232, 163, 61, 0.05);
   --hatch-amber-border: rgba(232, 163, 61, 0.4);
+  /* The gradient itself, not just its two color stops — a `background-image`
+     custom property, so `.status-badge-degraded` and `.hatched-banner` in
+     status.css reference one declaration instead of each writing out the
+     same `repeating-linear-gradient(...)` literal. */
+  --hatch-amber-gradient: repeating-linear-gradient(45deg, var(--hatch-amber-strong) 0 4px, var(--hatch-amber-weak) 4px 8px);
 
   /* -------------------------------------------------------------------
    * Spacing / sizing / rounding — ported from theme.rs's constants.
