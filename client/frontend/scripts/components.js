@@ -399,7 +399,11 @@
    * One row per active OUTGOING destination (the sidebar's cross-room
    * "STREAMS"/"OUTGOING" section — see APP-SHELL.md's STREAMS section doc).
    * Follows the same fixed row skeleton as `renderRoomRow`:
-   * `[dot][room/destination label][meta, right-aligned][stop, hover-reveal]`.
+   * `[dot][room/destination label][meta, right-aligned]`, plus a "Stop"
+   * button that's an absolutely-positioned hover/focus-reveal overlay (not
+   * a normal flex child) — it reserves no width at rest, so the label/meta
+   * get the row's full space until hover, matching view.css's
+   * `.media-tile-overlay` hover-reveal pattern.
    *
    * @param {object} stream - a `DestinationRow` DTO shape { destination_id, kind:
    *   'video'|'audio', state: 'starting'|'live'|'rebuilding'|'stalled'|'failed',
@@ -421,12 +425,13 @@
     const metaText = meta.label || (stream.kind === "audio" ? "" : `${stream.width}×${stream.height} @ ${stream.framerate}fps`);
     row.appendChild(el("span", { className: "stream-meta", text: metaText }));
     if (stream.kind === "audio") row.appendChild(icon("volume_up", "stream-audio-glyph"));
-    row.appendChild(
-      iconButton("stop_circle", () => handlers.onStop && handlers.onStop(stream.destination_id), {
-        title: "Stop",
-        className: "stream-stop-btn",
-      })
-    );
+    const stopBtn = dangerButton("Stop", () => handlers.onStop && handlers.onStop(stream.destination_id), {
+      className: "stream-stop-overlay-btn",
+    });
+    stopBtn.prepend(icon("stop_circle"));
+    stopBtn.title = "Stop";
+    stopBtn.setAttribute("aria-label", "Stop");
+    row.appendChild(stopBtn);
     return row;
   }
 

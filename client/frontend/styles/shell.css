@@ -854,6 +854,7 @@ input[type="range"]:focus-visible::-webkit-slider-thumb {
    right-aligned meta (bitrate or a short status word), stop (hover-reveal,
    nothing to accidentally fat-finger while just scanning the list). */
 .stream-row {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 6px;
@@ -886,22 +887,47 @@ input[type="range"]:focus-visible::-webkit-slider-thumb {
   font-size: 11px;
   color: var(--text-faint);
   white-space: nowrap;
-}
-
-.stream-stop-btn {
-  opacity: 0;
-  color: var(--danger);
+  /* Purely decorative text, never interactive — must not steal clicks from
+     the Stop overlay button sitting on top of it once revealed. */
+  pointer-events: none;
+  /* Fades out in lockstep with the Stop overlay fading in (matches
+     view.css's `.media-tile-nameplate` hover-fade next to `.media-tile-overlay`)
+     since the overlay sits right on top of this column. */
   transition: opacity 120ms ease;
 }
 
-.stream-row:hover .stream-stop-btn,
-.stream-stop-btn:focus-visible {
-  opacity: 1;
+.stream-row:hover .stream-meta,
+.stream-row:focus-within .stream-meta {
+  opacity: 0;
 }
 
-.stream-stop-btn:hover {
-  background: rgba(224, 90, 90, 0.14);
-  color: var(--danger);
+/* Stop control — absolutely positioned over the row instead of a normal
+   flex child, so it reserves no width at rest (the label/meta above use the
+   row's full space until hover) and appears as a genuine overlay, not a
+   layout shift. Same 120ms opacity fade as view.css's
+   `.media-tile-overlay`/`.media-tile-nameplate` hover-reveal pattern. */
+.stream-stop-overlay-btn {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  transform: translateY(-50%);
+  padding: 3px 8px;
+  font-size: 11px;
+  gap: 4px;
+  background: var(--elevation-1b);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+.stream-stop-overlay-btn .material-symbols-outlined {
+  font-size: 15px;
+}
+
+.stream-row:hover .stream-stop-overlay-btn,
+.stream-row:focus-within .stream-stop-overlay-btn {
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .empty-state {
