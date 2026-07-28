@@ -36,6 +36,41 @@
     return node;
   }
 
+  /**
+   * Wire a `wheel`-scroll listener onto a `<input type="range">` so hovering
+   * it and scrolling steps the value up/down by exactly the slider's own
+   * `step` (matching the granularity a manual drag/arrow-key already uses),
+   * instead of doing nothing (native range inputs ignore wheel scroll in
+   * Chromium/Electron) or letting the page/container scroll underneath it.
+   *
+   * `Why: scroll-up = increase` — matches the typical OS volume/spinner
+   * convention (macOS/Windows volume sliders, most native spinbuttons):
+   * scrolling "up" (negative `deltaY`) raises the value, "down" lowers it.
+   *
+   * Dispatches both `input` (for any live-preview readout wired on
+   * `input`) and `change` (for whatever handler actually applies/persists
+   * the value) so a wheel tick behaves like a real drag-then-release, not
+   * just one half of it.
+   */
+  function attachWheelStep(sliderEl) {
+    sliderEl.addEventListener(
+      "wheel",
+      (event) => {
+        event.preventDefault();
+        const stepAttr = sliderEl.step;
+        const step = stepAttr && stepAttr !== "any" && Number(stepAttr) ? Number(stepAttr) : 1;
+        const min = sliderEl.min !== "" ? Number(sliderEl.min) : -Infinity;
+        const max = sliderEl.max !== "" ? Number(sliderEl.max) : Infinity;
+        const delta = event.deltaY < 0 ? step : -step;
+        const next = Math.min(max, Math.max(min, Number(sliderEl.value) + delta));
+        sliderEl.value = String(next);
+        sliderEl.dispatchEvent(new Event("input", { bubbles: true }));
+        sliderEl.dispatchEvent(new Event("change", { bubbles: true }));
+      },
+      { passive: false }
+    );
+  }
+
   /** A single Material Symbols glyph, e.g. icon("expand_more"). */
   function icon(name, extraClass) {
     return el("span", {
@@ -858,6 +893,7 @@
         slider.addEventListener("change", () => {
           applyTuning({ bitrateKbps: Number(slider.value) });
         });
+        attachWheelStep(slider);
         editRow.appendChild(slider);
         editRow.appendChild(value);
         editGrid.appendChild(editRow);
@@ -1182,6 +1218,7 @@
   window.Components = {
     el,
     icon,
+    attachWheelStep,
     primaryButton,
     secondaryButton,
     dangerButton,

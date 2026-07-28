@@ -35,7 +35,7 @@
 (function () {
   "use strict";
 
-  const { el, icon, card, warningBanner, bandwidthModeToggle, destinationCard, secondaryButton, primaryButton, renderEmptyState, emptyRow } = window.Components;
+  const { el, icon, card, warningBanner, bandwidthModeToggle, destinationCard, secondaryButton, primaryButton, renderEmptyState, emptyRow, attachWheelStep } = window.Components;
 
   // ---------------------------------------------------------------------
   // Mock data (fallback bodies for the fetch/action functions below).
@@ -756,6 +756,7 @@
     const out = el("span", { className: "sc-bandwidth-field-value", text: value + " kbps" });
     slider.addEventListener("input", () => (out.textContent = slider.value + " kbps"));
     slider.addEventListener("change", () => onChange(Number(slider.value)));
+    attachWheelStep(slider);
     wrap.appendChild(slider);
     wrap.appendChild(out);
     return wrap;
