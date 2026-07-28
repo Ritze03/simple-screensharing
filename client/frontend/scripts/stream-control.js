@@ -16,9 +16,9 @@
 //   list_saved_rooms, list_active_streams, get_settings, room_detail,
 //   list_audio_sources, select_audio_source, set_bandwidth_mode,
 //   set_bandwidth_total, set_bandwidth_floor, edit_destination,
-//   stop_destination, transfer_destination, start_destination,
-//   start_video_share, set_bitrate, set_framerate, start_audio_share,
-//   rename_room.
+//   stop_destination, retry_destination, transfer_destination,
+//   start_destination, start_video_share, set_bitrate, set_framerate,
+//   start_audio_share, rename_room.
 // Notably `start_video_share`/`start_audio_share` only take a `room_handle`
 // — framerate/bitrate/audio-source are process-wide settings applied via
 // `set_framerate`/`set_bitrate`/`select_audio_source` *before* starting the
