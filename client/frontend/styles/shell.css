@@ -296,6 +296,21 @@ input {
   background: rgba(232, 163, 61, 0.14);
 }
 
+/* Disconnected row's reconnect action (2026-07-28): a plain yellow dot,
+   replacing the old `restart_alt` glyph — the design owner's screenshot
+   flagged the arrow as reading like "an arrow pointing at itself" rather
+   than a reconnect affordance. Same `.status-dot` box/size as every other
+   room-state dot (`statusDot`, components.js) for visual consistency, just
+   filled solid warning-yellow with no pulse animation — pulsing is
+   reserved for `.status-dot-reconnecting` (an in-progress reconnect); this
+   one is static because clicking it is what *starts* the reconnect. Sits
+   inside `.room-caret-reconnect`'s 16x16 clickable button, so the click
+   target stays the same size as before even though the dot itself is
+   `--dot-size` (9px). */
+.room-caret-reconnect-dot {
+  background: var(--warning);
+}
+
 /* 12px, per the prototype's room row. It was inheriting the 14px body size,
    which — once the rows moved into their 4px-inset well — left too little
    measure for the name and truncated "Movie Night" to "Movie Nig...". */
@@ -1393,12 +1408,18 @@ input[type="range"]:focus-visible::-webkit-slider-thumb {
 
 .room-panel-footer {
   flex: 0 0 auto;
+  display: flex;
+  gap: 8px;
   padding: 12px 16px 16px;
   border-top: 1px solid var(--inset-border);
 }
 
+/* Two buttons side by side (2026-07-28: "Disconnect" + "Delete room",
+   see `renderRoomPanel`'s footer doc comment, shell.js — was a single
+   full-width button before) — same class shared by both, so `flex: 1 1
+   0` splits the row evenly instead of the old `width: 100%`. */
 .room-panel-leave-btn {
-  width: 100%;
+  flex: 1 1 0;
 }
 
 /* -------------------------------------------------------------------
