@@ -319,7 +319,12 @@
   pointer-events: auto;
   display: flex;
   align-items: center;
-  gap: 6px;
+  /* No `gap` here on purpose: flexbox `gap` reserves its space between
+     children even when one of them is width:0, which was turning the
+     resting (icon-only) pill into an oval instead of a circle. The
+     icon-to-slider spacing and the slider's own trailing spacing are both
+     carried on `.media-tile-audio-slider`'s margins instead, so they
+     collapse to 0 together with its width/opacity at rest. */
   padding: 2px;
   border-radius: 999px;
   /* Needs to read as a distinct badge over arbitrary video content, including
@@ -363,22 +368,35 @@
   color: var(--text-dim, rgba(232, 233, 236, 0.5));
 }
 
+/* Only present in the DOM while the tile is unmuted at all (view.js
+ * doesn't render this element while `tileMuted.has(tile.id)` — see its
+ * `buildAudioGroup`), so these rest values only ever apply to the
+ * unmuted-but-not-hovered state. `margin-right: 6px` + the container's
+ * `padding: 2px` gives 8px between the expanded slider's right edge and
+ * the pill's outer boundary. */
 .media-tile-audio-slider {
   width: 0;
   opacity: 0;
-  margin: 0;
+  margin-left: 0;
+  margin-right: 0;
   accent-color: var(--accent);
   cursor: pointer;
-  transition: width 160ms ease, opacity 160ms ease, margin 160ms ease;
+  transition: width 160ms ease, opacity 160ms ease, margin-left 160ms ease, margin-right 160ms ease;
 }
 
 .media-tile-audio:hover .media-tile-audio-slider,
 .media-tile-audio:focus-within .media-tile-audio-slider {
   width: 84px;
   opacity: 1;
-  /* No margin-right here on purpose: the container's own 2px padding
-     (`.media-tile-audio`, above) is the sole spacer on this side — was
-     6px + 2px = 8px total, owner wants 2px. */
+  /* margin-left: icon-to-slider spacing (was the container's `gap: 6px`,
+     now carried here since `gap` was removed above).
+     margin-right: 5px + the container's 2px padding + its 1px border =
+     8px measured from the slider's right edge to the pill's actual outer
+     (border) edge — reinstated after an earlier pass this session dropped
+     it to ~2-3px; the owner wants 8px, verified via getBoundingClientRect
+     rather than eyeballed. */
+  margin-left: 6px;
+  margin-right: 5px;
 }
 
 /* -------------------------------------------------------------------
