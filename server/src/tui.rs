@@ -80,6 +80,11 @@ struct MemberSnapshot {
     conn_id: u64,
     display_name: String,
     stream_count: u8,
+    /// Number of *other* members' streams this member currently subscribes
+    /// to as a viewer. Mirrors `stream_count` (sharing) but for watching —
+    /// sourced from `ConnState::subscriptions`, which is authoritative for
+    /// per-connection subscribe state (see `room.rs`).
+    watching_count: u8,
 }
 
 struct StreamSnapshot {
@@ -102,6 +107,7 @@ fn take_snapshot(registry: &Registry) -> Snapshot {
                 conn_id: c.conn_id,
                 display_name: c.display_name.clone(),
                 stream_count: c.stream_count,
+                watching_count: c.subscriptions.len() as u8,
             })
             .collect();
         let streams = guard
@@ -552,16 +558,33 @@ fn draw_room_tree(frame: &mut Frame, area: Rect, snap: &Snapshot) {
             let last = room.members.len() - 1;
             for (i, m) in room.members.iter().enumerate() {
                 let branch = if i == last { "\u{2514}\u{2500}" } else { "\u{251c}\u{2500}" };
-                let (indicator, color) = if m.stream_count > 0 {
-                    (format!("\u{25cf} x{}", m.stream_count), Color::Green)
-                } else {
-                    ("\u{25cb} idle".to_string(), Color::DarkGray)
-                };
-                items.push(ListItem::new(Line::from(vec![
+                let mut spans = vec![
                     Span::raw(format!("  {branch} ")),
                     Span::raw(format!("{:<16}", m.display_name)),
-                    Span::styled(indicator, Style::default().fg(color)),
-                ])));
+                ];
+                if m.stream_count == 0 && m.watching_count == 0 {
+                    spans.push(Span::styled(
+                        "\u{25cb} idle",
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                } else {
+                    if m.stream_count > 0 {
+                        spans.push(Span::styled(
+                            format!("\u{25cf} streaming x{}", m.stream_count),
+                            Style::default().fg(Color::Green),
+                        ));
+                    }
+                    if m.watching_count > 0 {
+                        if m.stream_count > 0 {
+                            spans.push(Span::raw(" \u{00b7} "));
+                        }
+                        spans.push(Span::styled(
+                            format!("\u{25d1} watching x{}", m.watching_count),
+                            Style::default().fg(Color::Cyan),
+                        ));
+                    }
+                }
+                items.push(ListItem::new(Line::from(spans)));
             }
         }
     }
@@ -685,20 +708,30 @@ fn draw_rooms(frame: &mut Frame, area: Rect, app: &App, snap: &Snapshot) {
             .members
             .iter()
             .map(|m| {
-                let indicator = if m.stream_count > 0 {
-                    format!("\u{25cf} streaming x{}", m.stream_count)
+                let mut spans = vec![Span::raw(format!("{:<20}", m.display_name))];
+                if m.stream_count == 0 && m.watching_count == 0 {
+                    spans.push(Span::styled(
+                        "\u{25cb} idle",
+                        Style::default().fg(Color::DarkGray),
+                    ));
                 } else {
-                    "\u{25cb} idle".to_string()
-                };
-                let color = if m.stream_count > 0 {
-                    Color::Green
-                } else {
-                    Color::DarkGray
-                };
-                ListItem::new(Line::from(vec![
-                    Span::raw(format!("{:<20}", m.display_name)),
-                    Span::styled(indicator, Style::default().fg(color)),
-                ]))
+                    if m.stream_count > 0 {
+                        spans.push(Span::styled(
+                            format!("\u{25cf} streaming x{}", m.stream_count),
+                            Style::default().fg(Color::Green),
+                        ));
+                    }
+                    if m.watching_count > 0 {
+                        if m.stream_count > 0 {
+                            spans.push(Span::raw(" \u{00b7} "));
+                        }
+                        spans.push(Span::styled(
+                            format!("\u{25d1} watching x{}", m.watching_count),
+                            Style::default().fg(Color::Cyan),
+                        ));
+                    }
+                }
+                ListItem::new(Line::from(spans))
             })
             .collect(),
         None => vec![ListItem::new("(no rooms)")],
