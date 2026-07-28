@@ -123,8 +123,8 @@
   // and mute state, keyed by tile id. Client-side only: `RoomDetail` carries
   // no `volume_percent`, and re-`render()`s happen ~4x/sec off
   // `stream-stats-updated`, so a slider that re-read its value from the DOM
-  // would snap back to the default constantly. Survives re-renders, pruned
-  // alongside `selectedTileIds`.
+  // would snap back to the default constantly. Survives re-renders; pruned
+  // for any tile id no longer in the watched set (see below).
   const tileVolume = new Map();
   const tileMuted = new Set();
   const DEFAULT_VOLUME = 100;
