@@ -434,17 +434,40 @@ mod tests {
     use super::*;
     use simple_screensharing_client::rooms::RoomStore;
 
-    fn isolated_config_home() -> tempfile::TempDir {
+    /// Serializes every test that touches the process-global `XDG_CONFIG_HOME`
+    /// env var. `cargo test` runs tests in parallel threads within one
+    /// process, so without this lock two tests calling
+    /// `isolated_config_home()` concurrently can stomp each other's
+    /// `XDG_CONFIG_HOME` mid-test, leaking one test's room/settings data into
+    /// another's.
+    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Bundles the lock guard together with the `TempDir` so both stay alive
+    /// for the caller's binding lifetime: the `TempDir` must not be dropped
+    /// (or its directory disappears out from under a still-running test),
+    /// and the guard must not be released (or another thread's test can set
+    /// `XDG_CONFIG_HOME` out from under this one) until the test is done.
+    struct IsolatedConfigHome {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        _dir: tempfile::TempDir,
+    }
+
+    fn isolated_config_home() -> IsolatedConfigHome {
+        // Poisoning only happens if an earlier test panicked while holding
+        // this lock; that earlier test's failure is already reported, so
+        // recover the lock rather than cascading the panic into every test
+        // that runs after it.
+        let guard = TEST_ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
-        // SAFETY: tests in this module run sequentially with respect to this
-        // var (no other test in this crate reads/writes `XDG_CONFIG_HOME`),
-        // and `dirs::config_dir()` is only consulted lazily, at the point
-        // `RoomStore`/`AppSettings` load/save — never cached at process
-        // startup — so setting it before use is sufficient.
+        // SAFETY: held under `TEST_ENV_LOCK` for the guard's whole lifetime,
+        // so no other test in this module can read/write `XDG_CONFIG_HOME`
+        // concurrently. `dirs::config_dir()` is only consulted lazily, at the
+        // point `RoomStore`/`AppSettings` load/save — never cached at
+        // process startup — so setting it before use is sufficient.
         unsafe {
             std::env::set_var("XDG_CONFIG_HOME", dir.path());
         }
-        dir
+        IsolatedConfigHome { _guard: guard, _dir: dir }
     }
 
     #[tokio::test]
