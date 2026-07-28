@@ -90,13 +90,15 @@ pub fn join_room(managed: State<'_, Managed>, join_string: String, display_name:
 /// name yet, so pre-seeding the `RoomStore` here is enough — no change
 /// needed there.
 ///
-/// `display_name` is deliberately not a parameter: the Create tab has no
-/// separate display-name field (only Server IP + Room Name, per this
-/// feature's spec), so this passes `String::new()` through to
-/// `join_room_impl`, which — same as the sidebar's silent auto-reconnect
-/// call (`shell.js`'s `displayName: ""` call) — leaves `AppState::display_name`
-/// untouched, silently reusing whatever name the last join used (or the
-/// `whoami_fallback()` OS-username default for a first-ever run).
+/// `display_name` is deliberately not a parameter: display name is now one
+/// global Settings-tab value (`rooms::AppSettings::display_name`,
+/// `set_display_name`), not asked per room/join at all — so this passes
+/// `String::new()` through to `join_room_impl`, which — same as the
+/// sidebar's silent auto-reconnect call and `submitJoin`'s own
+/// `displayName: ""` call (`shell.js`) — leaves `AppState::display_name`
+/// untouched, i.e. whatever it already is: the persisted global setting
+/// (loaded at startup, kept live-current by `set_display_name`), or the
+/// `whoami_fallback()` OS-username default until that setting is ever set.
 pub fn create_room_impl(state: &mut AppState, server: String, room_name: String) -> Result<(), String> {
     let server = server.trim().to_string();
     if server.is_empty() {
@@ -230,6 +232,20 @@ pub fn set_language(managed: State<'_, Managed>, language: String) {
     rust_i18n::set_locale(&language);
     state.language = language.clone();
     simple_screensharing_client::session::save_language(&language);
+}
+
+/// Persist the global display name (Settings tab) — used for every room
+/// join/create from here on, replacing the old per-join "Display name"
+/// field. See `rooms::AppSettings::display_name`'s doc comment for why one
+/// global setting is enough: the wire protocol sends a display name once, at
+/// connect, with no later way to change it for an already-joined room, so
+/// there was never a per-room distinction to preserve.
+#[tauri::command]
+pub fn set_display_name(managed: State<'_, Managed>, display_name: String) {
+    let display_name = display_name.trim().to_string();
+    let mut state = managed.state.lock().unwrap();
+    state.display_name = display_name.clone();
+    simple_screensharing_client::session::save_display_name(&display_name);
 }
 
 #[tauri::command]

@@ -86,6 +86,7 @@ fn main() {
             commands::get_start_stream_defaults,
             commands::set_start_stream_defaults,
             commands::set_language,
+            commands::set_display_name,
             commands::set_presentation_mode,
             commands::set_max_jitter_buffer_ms,
             commands::start_video_share,

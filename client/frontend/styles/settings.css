@@ -52,6 +52,13 @@
   flex: 1 1 0;
 }
 
+/* Display name text field — same fixed 260px column as `.settings-select`
+   so every Settings-tab control lines up at one width, not stretched full
+   card-width like a generic `.field-input`. */
+.settings-name-input {
+  width: 260px;
+}
+
 .settings-select {
   width: 260px;
   background: var(--field);

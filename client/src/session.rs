@@ -1073,8 +1073,17 @@ impl Default for AppState {
         };
         let settings = AppSettings::load();
         rust_i18n::set_locale(&settings.language);
+        // The global display-name setting (Settings tab) wins once it's been
+        // set; empty (never set, or explicitly cleared) falls back to the
+        // OS-username default, same as this app's behavior before the
+        // setting existed — see `rooms::AppSettings::display_name`.
+        let display_name = if settings.display_name.trim().is_empty() {
+            whoami_fallback()
+        } else {
+            settings.display_name.clone()
+        };
         Self {
-            display_name: whoami_fallback(),
+            display_name,
             status: Status::Idle,
             pending_connect: None,
             endpoint: crate::net::build_client_endpoint().map_err(|e| format!("{e:#}")),
@@ -1189,6 +1198,19 @@ pub fn save_start_stream_defaults(
     settings.start_stream_defaults = crate::rooms::StartStreamDefaults { framerate, bitrate_kbps, tune, quality_level, rate_control };
     if let Err(e) = settings.save() {
         tracing::warn!("failed to save start-stream defaults: {e:#}");
+    }
+}
+
+/// Persist the global display name (Settings tab). Mirrors `save_language`'s
+/// load-modify-save shape, for the same reason: don't clobber the sibling
+/// settings. Empty is a valid value to save — it just means "unset", and
+/// `AppState::default()` falls back to `whoami_fallback()` again on the next
+/// launch (see that function's call site above).
+pub fn save_display_name(display_name: &str) {
+    let mut settings = AppSettings::load();
+    settings.display_name = display_name.to_string();
+    if let Err(e) = settings.save() {
+        tracing::warn!("failed to save display name preference: {e:#}");
     }
 }
 

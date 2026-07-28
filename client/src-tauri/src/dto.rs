@@ -250,6 +250,9 @@ pub struct SettingsDto {
     pub max_jitter_buffer_ms: u32,
     pub bitrate_kbps: u32,
     pub framerate: u32,
+    /// The global display name (Settings tab) — see `rooms::AppSettings::
+    /// display_name` and `commands::set_display_name`.
+    pub display_name: String,
 }
 
 /// The "START A STREAM" form's persisted last-used values (`rooms::
@@ -542,5 +545,6 @@ pub fn settings_dto(state: &AppState) -> SettingsDto {
         max_jitter_buffer_ms: state.max_jitter_buffer_ms,
         bitrate_kbps: state.bitrate_kbps,
         framerate: state.framerate,
+        display_name: state.display_name.clone(),
     }
 }

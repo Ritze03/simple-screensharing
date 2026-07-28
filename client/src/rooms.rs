@@ -252,6 +252,19 @@ pub struct AppSettings {
     /// five separate commands.
     #[serde(default)]
     pub start_stream_defaults: StartStreamDefaults,
+    /// The global display name shown to everyone in every room this client
+    /// joins or creates (Settings tab). Replaces what used to be a per-join
+    /// "Display name" field on the Join/Create dialogs — see
+    /// `superdoc/features/stream-control.md`'s 2026-07-28 note on why: the
+    /// wire protocol has no concept of changing a display name after joining
+    /// a given room anyway (`net.rs`/`protocol.rs` send it once, at connect),
+    /// so "one name, set once" is just this client choosing not to re-ask
+    /// for something it would use identically every time regardless.
+    ///
+    /// Empty string means "not set yet" — `AppState::default()` falls back to
+    /// `whoami_fallback()` in that case, same as before this setting existed.
+    #[serde(default)]
+    pub display_name: String,
 }
 
 /// See [`AppSettings::start_stream_defaults`].
@@ -301,6 +314,7 @@ impl Default for AppSettings {
             destination_floor_kbps: Self::default_destination_floor_kbps(),
             max_jitter_buffer_ms: Self::default_max_jitter_buffer_ms(),
             start_stream_defaults: StartStreamDefaults::default(),
+            display_name: String::new(),
         }
     }
 }
@@ -486,6 +500,7 @@ mod tests {
             destination_floor_kbps: 750,
             max_jitter_buffer_ms: 3_500,
             start_stream_defaults: StartStreamDefaults::default(),
+            display_name: "mo".to_string(),
         };
         let toml_str = toml::to_string_pretty(&settings).unwrap();
         let parsed: AppSettings = toml::from_str(&toml_str).unwrap();
@@ -495,6 +510,18 @@ mod tests {
         assert_eq!(parsed.absolute_total_kbps, 12_345);
         assert_eq!(parsed.destination_floor_kbps, 750);
         assert_eq!(parsed.max_jitter_buffer_ms, 3_500);
+        assert_eq!(parsed.display_name, "mo");
+    }
+
+    /// A settings file written before `display_name` existed must still
+    /// parse, defaulting it to empty (not failing to load) — same
+    /// missing-field tolerance as every other field here. Empty is
+    /// `AppState::default()`'s cue to fall back to `whoami_fallback()`, so
+    /// this preserves pre-setting behavior for anyone who never touches it.
+    #[test]
+    fn app_settings_missing_display_name_defaults_to_empty() {
+        let parsed: AppSettings = toml::from_str("language = \"de\"\n").unwrap();
+        assert_eq!(parsed.display_name, "");
     }
 
     /// Both modes' numbers are independent fields, so a settings file written

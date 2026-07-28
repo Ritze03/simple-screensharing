@@ -15,7 +15,7 @@
 
   const { el, card, pillSwitch, dropdown, attachWheelStep } = window.Components;
 
-  const MOCK_SETTINGS = { language: "en", presentation_mode: "auto_vsync", max_jitter_buffer_ms: 2000 };
+  const MOCK_SETTINGS = { language: "en", presentation_mode: "auto_vsync", max_jitter_buffer_ms: 2000, display_name: "" };
 
   const PRESENTATION_MODES = [
     { value: "auto_vsync", label: "Auto Vsync (default)" },
@@ -32,6 +32,7 @@
         language: settings.language,
         presentation_mode: settings.presentation_mode,
         max_jitter_buffer_ms: settings.max_jitter_buffer_ms,
+        display_name: settings.display_name,
       };
     }
     return Object.assign({}, MOCK_SETTINGS);
@@ -43,6 +44,19 @@
   // `stream-control.js`'s `setBandwidthMode` for the same fix and the fuller
   // "Why" (found via the identical symptom: a toggle that visually never
   // moved after a real, successfully-applied click).
+  /** The one global display name, used for every room join/create — see
+   * `shell.js`'s `submitJoin`/`submitCreate` doc comments and
+   * `commands::set_display_name`. Saved on blur/Enter (`change`, not
+   * `input`), same "commit on change, not on every keystroke" pattern the
+   * jitter-buffer slider below uses. */
+  async function setDisplayName(name) {
+    if (window.__TAURI__) {
+      await window.__TAURI__.core.invoke("set_display_name", { displayName: name });
+    }
+    state.display_name = name;
+    render();
+  }
+
   async function setLanguage(language) {
     if (window.__TAURI__) {
       await window.__TAURI__.core.invoke("set_language", { language });
@@ -86,6 +100,20 @@
     const root = document.getElementById("settings-root");
     if (!root) return;
     root.innerHTML = "";
+
+    // -- DISPLAY NAME -------------------------------------------------------
+    // The one name shown to everyone in every room, set once here instead of
+    // asked per join/create (2026-07-28 — see `shell.js`'s `submitJoin`).
+    const nameInput = el("input", {
+      className: "field-input settings-name-input",
+      attrs: { type: "text", placeholder: "e.g. mo", value: state.display_name || "" },
+    });
+    nameInput.addEventListener("change", () => setDisplayName(nameInput.value.trim()));
+
+    const nameBlurb = el("p", {
+      className: "settings-blurb",
+      text: "Shown to everyone when you join or create a room — one name for every room, not asked each time.",
+    });
 
     // -- LANGUAGE ---------------------------------------------------------
     const langSwitch = pillSwitch(
@@ -155,6 +183,7 @@
     ]);
 
     const grid = el("div", { className: "settings-grid" });
+    grid.appendChild(card("DISPLAY NAME", [nameInput, nameBlurb]));
     grid.appendChild(card("LANGUAGE", [langSwitch]));
     grid.appendChild(card("PRESENTATION MODE", [presentationRow, presentationBlurb]));
     grid.appendChild(card("PLAYBACK", [jitterRow, jitterBlurb]));
