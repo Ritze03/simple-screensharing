@@ -2795,7 +2795,7 @@ mod tests {
         let decoder = StreamDecoder::new(TEST_STREAM_ID).expect("failed to build StreamDecoder");
         app.state.rooms[&room_handle].watches.lock().unwrap().insert(
             (owner, TEST_STREAM_ID),
-            WatchEntry { decoder: Arc::new(Mutex::new(decoder)), texture: None, popout: None, audio_stream_id: None },
+            WatchEntry { decoder: Arc::new(Mutex::new(decoder)), texture: None, popout: None, audio_stream_id: None, raw_tx: None },
         );
 
         room_client_b_subscribe(&mut app, room_handle, owner).await;
@@ -2980,7 +2980,7 @@ mod tests {
         let decoder = StreamDecoder::new(TEST_STREAM_ID).expect("failed to build StreamDecoder");
         app.state.rooms[&room_handle].watches.lock().unwrap().insert(
             (owner, TEST_STREAM_ID),
-            WatchEntry { decoder: Arc::new(Mutex::new(decoder)), texture: None, popout: None, audio_stream_id: None },
+            WatchEntry { decoder: Arc::new(Mutex::new(decoder)), texture: None, popout: None, audio_stream_id: None, raw_tx: None },
         );
 
         // The one and only `drain_events` call in this whole test — needed

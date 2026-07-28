@@ -218,14 +218,15 @@
   font-size: 16px;
 }
 
-/* Bottom bar — right-aligned live stats (fps), per 1e's spec. No volume
- * slider here yet: see view.js's header comment for why (no wired-up
- * per-tile "currently listening" signal to hang one off in this pass). */
+/* Bottom bar — audio control on the left, live stats (fps) on the right.
+ * `space-between` rather than `flex-end` so the fps span stays pinned right
+ * whether or not this sender has audio. */
 .media-tile-overlay-bottom {
   pointer-events: none;
   display: flex;
-  justify-content: flex-end;
+  justify-content: space-between;
   align-items: center;
+  gap: 10px;
   padding: 6px 8px;
   background: linear-gradient(to top, rgba(0, 0, 0, 0.5), transparent);
 }
@@ -235,6 +236,76 @@
   font-variant-numeric: tabular-nums;
   color: rgba(232, 233, 236, 0.85);
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
+  margin-left: auto;
+}
+
+/* -------------------------------------------------------------------
+ * Per-tile audio (mute + volume). Only rendered for a sender who is
+ * actually sharing audio; there is no separate "audio stream" row anywhere
+ * in the viewer's UI by design (see view.js's header note).
+ *
+ * The slider is collapsed to zero width by default and expands on
+ * hover/focus-within, so a resting tile shows only a single small speaker
+ * glyph — the grid's "no chrome until you look at it" rule — while still
+ * putting a real, continuous volume control one gesture away.
+ * ----------------------------------------------------------------- */
+
+.media-tile-audio {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.42);
+  backdrop-filter: blur(6px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  transition: background 140ms ease, border-color 140ms ease;
+}
+
+.media-tile-audio:hover,
+.media-tile-audio:focus-within {
+  background: rgba(0, 0, 0, 0.62);
+  border-color: rgba(255, 255, 255, 0.16);
+}
+
+.media-tile-audio-btn {
+  background: none;
+  border: none;
+  color: var(--text);
+  border-radius: 999px;
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+
+.media-tile-audio-btn .material-symbols-outlined {
+  font-size: 16px;
+}
+
+/* Muted reads as "off", not as an error — desaturated, not red. */
+.media-tile-audio-muted .media-tile-audio-btn {
+  color: var(--text-dim, rgba(232, 233, 236, 0.5));
+}
+
+.media-tile-audio-slider {
+  width: 0;
+  opacity: 0;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+  transition: width 160ms ease, opacity 160ms ease, margin 160ms ease;
+}
+
+.media-tile-audio:hover .media-tile-audio-slider,
+.media-tile-audio:focus-within .media-tile-audio-slider {
+  width: 84px;
+  opacity: 1;
+  margin-right: 6px;
 }
 
 /* -------------------------------------------------------------------
