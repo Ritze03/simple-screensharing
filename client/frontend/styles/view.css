@@ -312,16 +312,22 @@
   gap: 6px;
   padding: 2px;
   border-radius: 999px;
-  background: rgba(0, 0, 0, 0.42);
+  /* Needs to read as a distinct badge over arbitrary video content, including
+     near-black frames — 0.42 alpha was nearly invisible against a dark feed
+     (confirmed via zoomed-in screenshot: the pill was technically painting,
+     just too low-contrast to see at a glance). Bumped alpha + border alpha,
+     plus a soft outer shadow so the edge holds even on a black background. */
+  background: rgba(0, 0, 0, 0.72);
   backdrop-filter: blur(6px);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
   transition: background 140ms ease, border-color 140ms ease;
 }
 
 .media-tile-audio:hover,
 .media-tile-audio:focus-within {
-  background: rgba(0, 0, 0, 0.62);
-  border-color: rgba(255, 255, 255, 0.16);
+  background: rgba(0, 0, 0, 0.82);
+  border-color: rgba(255, 255, 255, 0.26);
 }
 
 .media-tile-audio-btn {
@@ -360,7 +366,9 @@
 .media-tile-audio:focus-within .media-tile-audio-slider {
   width: 84px;
   opacity: 1;
-  margin-right: 6px;
+  /* No margin-right here on purpose: the container's own 2px padding
+     (`.media-tile-audio`, above) is the sole spacer on this side — was
+     6px + 2px = 8px total, owner wants 2px. */
 }
 
 /* -------------------------------------------------------------------
