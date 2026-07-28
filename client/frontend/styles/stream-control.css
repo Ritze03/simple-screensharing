@@ -73,7 +73,7 @@
 .sc-bandwidth-field-value {
   color: var(--text);
   font-family: var(--font-mono);
-  font-weight: 600;
+  font-weight: 400; /* mono has no real bold vendored — 700 would still synthesize */
   font-variant-numeric: tabular-nums;
   min-width: var(--value-w);
   text-align: right;
@@ -219,7 +219,7 @@
 
 .dest-room-label {
   flex: 1 1 auto;
-  font-weight: 600;
+  font-weight: 700; /* real face, not synthesized 600 — matches .room-name */
   color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -276,7 +276,7 @@
 .dest-metric-value {
   font-family: var(--font-mono);
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 400; /* mono has no real bold vendored — 700 would still synthesize */
   font-variant-numeric: tabular-nums;
   color: var(--text);
 }
@@ -510,7 +510,7 @@
 .dest-bitrate-value {
   color: var(--text);
   font-family: var(--font-mono);
-  font-weight: 600;
+  font-weight: 400; /* mono has no real bold vendored — 700 would still synthesize */
   font-size: 11px;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
@@ -659,7 +659,7 @@
   background: var(--accent-ghost-bg);
   color: var(--accent);
   font-size: 12px;
-  font-weight: 600;
+  font-weight: 700; /* real face, not synthesized 600 — matches .ghost-add-room-row */
   cursor: pointer;
   transition: background-color 120ms ease;
 }

@@ -125,7 +125,13 @@ body {
   background: rgba(10, 11, 13, 0.78);
   border-radius: 6px;
   padding: 5px 10px;
-  font-size: 12px;
+  /* Deliberately NOT part of the Geist synthesis-weight cleanup
+     (2026-07-29, see fonts.css/FRONTEND-SHELL.md): this window's `body`
+     rule above sets `font-family: system-ui, sans-serif`, not
+     `var(--font-sans)`/Geist, so this 500 renders against the OS system
+     font, not a synthesized Geist weight — a different, out-of-scope
+     situation. Don't "fix" this to 400/700 as part of that cleanup without
+     first deciding whether this window should even switch to Geist. */
   font-weight: 500;
   color: #e8e9ec;
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
