@@ -289,28 +289,52 @@
     const dest = mockDestinations.find((d) => d.destination_id === destinationId);
     // `edit_destination` takes a full edit (scale/framerate/bitrate/tune/
     // quality_level/rate_control), not a sparse patch, but every control in
-    // this panel (the bitrate slider, and the three tune/quality/rate-control
-    // toggles below it) applies on its own change/click — so `patch` here is
-    // only ever the one field that just changed. Merge it onto the tracked
-    // edit buffer and send the *whole* buffer every time, same way the old
-    // scale/framerate hardcoding already did for the fields this tab doesn't
-    // expose a control for.
-    const edit = dest ? getDestEdit(dest) : Object.assign({ bitrateKbps: 3000, tune: "best_quality", qualityLevel: "balanced", rateControl: "constant", error: null }, patch);
+    // this panel (preset, framerate, the bitrate slider, and the three
+    // tune/quality/rate-control toggles) applies on its own change/click — so
+    // `patch` here is only ever the field(s) that just changed. Merge it onto
+    // the tracked edit buffer and send the *whole* buffer every time, same way
+    // the old scale hardcoding already did for the one field this tab still
+    // doesn't expose a control for.
+    const edit = dest
+      ? getDestEdit(dest)
+      : Object.assign(
+          { bitrateKbps: 3000, framerate: 30, tune: "best_quality", qualityLevel: "balanced", rateControl: "constant", error: null },
+          patch
+        );
     Object.assign(edit, patch);
     if (dest) destEditState.set(destinationId, edit);
+
+    // `Why the bitrate sent depends on the bandwidth mode:` in Per-Stream mode
+    // the buffer's value *is* the user's choice and must be sent. In Absolute
+    // mode there is no Bitrate slider (the allocator owns it), so the buffer's
+    // copy is whatever the bitrate happened to be when this card first
+    // rendered — stale by now, and sending it would briefly stomp the
+    // allocator's live value every time the user touched an unrelated control
+    // like the preset. Sending the destination's currently-reported bitrate
+    // instead keeps such an edit a genuine no-op for this field.
+    const bitrateKbps = perStreamBitrateMode() || !dest ? edit.bitrateKbps : dest.bitrate_kbps;
 
     if (window.__TAURI__) {
       try {
         await window.__TAURI__.core.invoke("edit_destination", {
           destinationId,
           scalePercent: 100,
-          framerate: dest ? dest.framerate : 30,
-          bitrateKbps: edit.bitrateKbps,
+          framerate: edit.framerate,
+          bitrateKbps,
           tune: edit.tune,
           qualityLevel: edit.qualityLevel,
           rateControl: edit.rateControl,
         });
         edit.error = null;
+        // Mirror what was just applied onto the local DTO copy so the card's
+        // Bitrate/Framerate *readouts* agree with its controls. Nothing else
+        // will: a tier-1 bitrate write never changes the destination's state
+        // label, so `destination-state-changed` never fires and
+        // `mockDestinations` is never re-fetched (see `destEditState`'s note).
+        if (dest) {
+          dest.bitrate_kbps = bitrateKbps;
+          dest.framerate = edit.framerate;
+        }
       } catch (e) {
         // Invalid enum strings can't happen from this UI (the toggles only
         // ever send the three known values each), but a `BranchSwap` can
@@ -323,8 +347,15 @@
       render();
       return;
     }
-    if (dest) Object.assign(dest, { bitrate_kbps: edit.bitrateKbps });
+    if (dest) Object.assign(dest, { bitrate_kbps: bitrateKbps, framerate: edit.framerate });
     render();
+  }
+
+  /** Whether the Bitrate slider is the user's to set — i.e. whether the
+   * bandwidth allocator is out of the picture. See `destinationCard`'s
+   * Bitrate row for why Absolute mode has no manual bitrate. */
+  function perStreamBitrateMode() {
+    return bandwidth.bandwidth_mode === "per_stream";
   }
 
   async function stopDestination(destinationId) {
@@ -522,14 +553,28 @@
     if (!destStalledSince.has(dest.destination_id)) destStalledSince.set(dest.destination_id, Date.now());
     return destStalledSince.get(dest.destination_id);
   }
-  // destination_id -> { bitrateKbps, tune, qualityLevel, rateControl, error }.
-  // Local edit buffer for `edit_destination`'s fields — write-only, same as
-  // the rest of this panel: `DestinationRow` doesn't expose the server's
-  // current tune/quality_level/rate_control, so there's nothing to read back
-  // and reconcile against. Defaults mirror `capture::TuneMode`/`QualityLevel`/
-  // `RateControlMode`'s `Default` impls (best_quality/balanced/constant — a
-  // deliberate "good mix" out of the box, not either speed/quality extreme;
-  // see those types' doc comments).
+  // destination_id -> { bitrateKbps, framerate, tune, qualityLevel, rateControl, error }.
+  // Local edit buffer for `edit_destination`'s fields, and — since the
+  // destination card renders every control in the edit panel from it — the
+  // single source of truth for what those controls show.
+  //
+  // `Why the buffer and not the `DestinationRow` DTO is what the panel
+  // renders:` the DTO lags, and for some edits it never catches up at all. A
+  // bitrate-only change is a tier-1 live encoder property write, so the
+  // destination stays `live`, so `driver.rs` never emits
+  // `destination-state-changed`, so `shell.js` never calls `refresh()` and
+  // `mockDestinations` is never re-fetched. Rendering the slider from the DTO
+  // therefore showed the pre-edit value indefinitely — the reported "changing
+  // the bitrate just resets the slider back, but I can see the bitrate rising
+  // on the server" bug. `DestinationRow` also has no tune/quality_level/
+  // rate_control fields to read back at all, so those three were always going
+  // to be caller-held; keeping bitrate and framerate in the same buffer makes
+  // the whole panel consistent rather than half-optimistic.
+  //
+  // Defaults mirror `capture::TuneMode`/`QualityLevel`/`RateControlMode`'s
+  // `Default` impls (best_quality/balanced/constant — a deliberate "good mix"
+  // out of the box, not either speed/quality extreme; see those types' doc
+  // comments).
   const destEditState = new Map();
   // destination_id -> number[] (last SPARK_WINDOW `sent_fps` samples, oldest
   // first). No historical stats are fetched from anywhere — this is just a
@@ -544,10 +589,31 @@
   function getDestEdit(dest) {
     let s = destEditState.get(dest.destination_id);
     if (!s) {
-      s = { bitrateKbps: dest.bitrate_kbps, tune: "best_quality", qualityLevel: "balanced", rateControl: "constant", error: null };
+      s = {
+        bitrateKbps: dest.bitrate_kbps,
+        framerate: dest.framerate,
+        tune: "best_quality",
+        qualityLevel: "balanced",
+        rateControl: "constant",
+        error: null,
+      };
       destEditState.set(dest.destination_id, s);
     }
     return s;
+  }
+
+  // The framerates the destination card's Framerate picker offers. Same nine
+  // values the "Start a Stream" form offers (see `renderStartStreamCard`'s
+  // note on why 240/280 are on the list at all), plus this destination's own
+  // current rate if it somehow isn't one of them — a stream started before
+  // this list changed, or one whose rate was clamped server-side, must still
+  // be shown truthfully rather than silently snapped to a neighbour.
+  const FRAMERATE_OPTIONS = [15, 30, 60, 90, 120, 144, 165, 240, 280];
+  function framerateOptionsFor(editState) {
+    if (!editState) return FRAMERATE_OPTIONS;
+    const current = Number(editState.framerate);
+    if (!current || FRAMERATE_OPTIONS.includes(current)) return FRAMERATE_OPTIONS;
+    return FRAMERATE_OPTIONS.concat([current]).sort((a, b) => a - b);
   }
   let startCardEl = null;
   let startCardSig = null;
@@ -777,10 +843,25 @@
         bandwidth.bandwidth_mode === "absolute" && dest.kind !== "audio" && dest.state !== "starting"
           ? Object.assign({}, dest, { computedShareKbps: alloc.share })
           : dest;
-      const perStreamBitrateEditable = bandwidth.bandwidth_mode === "per_stream" && dest.kind !== "audio";
-      const editState = perStreamBitrateEditable ? getDestEdit(dest) : null;
+      // Two separate questions, deliberately two separate flags — see
+      // `destinationCard`'s `opts` doc comment. The encoder tuning panel
+      // (Preset / Framerate / Advanced) is meaningful in *both* bandwidth
+      // modes: none of those fields is the allocator's business. Only the
+      // Bitrate slider inside it is Per-Stream-only, because bitrate is
+      // exactly what the Absolute-mode allocator owns.
+      const encoderTuningEditable = dest.kind !== "audio";
+      const perStreamBitrateEditable = perStreamBitrateMode() && encoderTuningEditable;
+      const editState = encoderTuningEditable ? getDestEdit(dest) : null;
       const stalledSince = getStalledSince(dest);
-      const sig = JSON.stringify({ withShare, perStreamBitrateEditable, editState, roomOptions: mockJoinedRooms, roomsAlreadyFedByCapture, stalledSince });
+      const sig = JSON.stringify({
+        withShare,
+        encoderTuningEditable,
+        perStreamBitrateEditable,
+        editState,
+        roomOptions: mockJoinedRooms,
+        roomsAlreadyFedByCapture,
+        stalledSince,
+      });
 
       let entry = destCardEls.get(dest.destination_id);
       if (!entry || entry.sig !== sig) {
@@ -802,7 +883,16 @@
               onStop: (id) => stopDestination(id),
               onRetry: (d) => retryDestination(d),
             },
-            { roomOptions: mockJoinedRooms, perStreamBitrateEditable, roomsAlreadyFedByCapture, editState, stalledSince, advancedOpen }
+            {
+              roomOptions: mockJoinedRooms,
+              encoderTuningEditable,
+              perStreamBitrateEditable,
+              framerateOptions: framerateOptionsFor(editState),
+              roomsAlreadyFedByCapture,
+              editState,
+              stalledSince,
+              advancedOpen,
+            }
           ),
           sig,
         };

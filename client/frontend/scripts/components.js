@@ -527,16 +527,27 @@
    *   frontend-only `room_label` (looked up by `room_handle`), `pendingRoleText`
    *   (derived from `pending`) and `computedShareKbps` (Absolute-mode allocator
    *   display, not part of any DTO).
-   * @param {object} handlers - { onEditApply(destinationId, {bitrateKbps, tune,
-   *   qualityLevel, rateControl}), onTransfer(destinationId, roomHandle),
+   * @param {object} handlers - { onEditApply(destinationId, {bitrateKbps, framerate,
+   *   tune, qualityLevel, rateControl}), onTransfer(destinationId, roomHandle),
    *   onFanout(captureId, roomHandle), onStop(destinationId) }
-   * @param {object} [opts] - { roomOptions: [{id,name}], perStreamBitrateEditable: bool,
-   *   roomsAlreadyFedByCapture: number[], editState: {tune, qualityLevel, rateControl,
-   *   error}, stalledSince: number|null } — `editState` is this destination's local
-   *   edit buffer for the three testing-oriented encoder tuning knobs (kept by the
-   *   caller, since `DestinationRow` has no fields to read the server's current
-   *   values back from — same write-only limitation the Bitrate slider already
-   *   has). `stalledSince` is the caller's client-side-tracked "first observed
+   * @param {object} [opts] - { roomOptions: [{id,name}], encoderTuningEditable: bool,
+   *   perStreamBitrateEditable: bool, framerateOptions: number[],
+   *   roomsAlreadyFedByCapture: number[], editState: {bitrateKbps, framerate, tune,
+   *   qualityLevel, rateControl, error}, stalledSince: number|null }.
+   *
+   *   `editState` is this destination's local edit buffer for everything
+   *   `edit_destination` can set (kept by the caller, since `DestinationRow` has
+   *   no fields to read the server's current tune/quality/rate-control back
+   *   from). **Every control in this panel renders from `editState`, never from
+   *   the `dest` DTO** — see the Bitrate slider's `Why:` note below for the
+   *   snap-back bug that rule fixes.
+   *
+   *   `encoderTuningEditable` and `perStreamBitrateEditable` gate two different
+   *   things and are deliberately not one flag: the former shows the whole
+   *   panel (Preset / Framerate / Advanced tuning), the latter only decides
+   *   whether the Bitrate slider is among its rows. See where each is used.
+   *
+   *   `stalledSince` is the caller's client-side-tracked "first observed
    *   Stalled at" timestamp (ms epoch) — see `statusBadge`'s doc comment for why
    *   this can't come from the DTO itself.
    */
@@ -693,12 +704,19 @@
     }
     body.appendChild(chipRow);
 
-    // Inline bitrate edit — only meaningful in Per-Stream mode (Absolute
-    // mode's allocator owns the live bitrate; showing a manual field there
-    // would be a control whose input is silently overwritten, per
-    // stream-control.md's "Absolute mode ... allocator writes live bitrates
-    // straight into the encoders without ever touching the manual values").
-    if (opts.perStreamBitrateEditable) {
+    // The per-destination encoder edit panel: Preset + Framerate always
+    // visible, Tune/Quality Level/Rate Control behind the Advanced
+    // disclosure, and — in Per-Stream mode only — a Bitrate slider.
+    //
+    // `Why this is gated on `encoderTuningEditable` and not on
+    // `perStreamBitrateEditable`:` those are two different questions, and
+    // conflating them into the single bitrate flag is what used to hide the
+    // whole panel in Absolute-Maximum mode. Preset/Framerate/Tune/Quality/
+    // Rate Control have nothing to do with the bandwidth allocator — it owns
+    // *bitrate*, and only bitrate — so they are just as meaningful, and just
+    // as safe to apply, in either bandwidth mode. Only the Bitrate slider
+    // itself has to stay Per-Stream-only (see its own note below).
+    if (opts.encoderTuningEditable) {
       const editState = opts.editState || { tune: "best_quality", qualityLevel: "balanced", rateControl: "constant" };
       const applyTuning = (patch) => handlers.onEditApply && handlers.onEditApply(dest.destination_id, patch);
 
@@ -761,22 +779,74 @@
       presetRow.appendChild(el("span"));
       editGrid.appendChild(presetRow);
 
-      const editRow = el("div", { className: "dest-edit-row" });
-      editRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Bitrate (kbps)" }));
-      const slider = el("input", {
-        className: "dest-bitrate-slider",
-        attrs: { type: "range", min: "200", max: "40000", step: "100", value: String(dest.bitrate_kbps) },
+      // Framerate — a regular-user setting, so it lives up here with Preset
+      // and Bitrate rather than behind the Advanced disclosure with the raw
+      // Tune/Rate Control knobs. Until now this tab had no framerate control
+      // at all: `edit_destination` has always taken one, and the caller has
+      // always sent one, but only ever the value the destination already had,
+      // so there was no way to change a running stream's framerate short of
+      // stopping and re-sharing it.
+      //
+      // `Why a <select> and not the pillSwitch the Preset row uses:` the
+      // offered range is the same nine values the "Start a Stream" form
+      // offers (15…280) — nine pills would not fit this column, and matching
+      // that form's own control keeps "the framerate picker" one recognisable
+      // thing in both places. `framerateOptions` carries the current value
+      // even when it isn't one of the nine, so this never silently misreports
+      // what the destination is actually running at.
+      const framerateRow = el("div", { className: "dest-edit-row" });
+      framerateRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Framerate" }));
+      const framerateSelect = el("select", { className: "dest-room-select dest-framerate-select" });
+      (opts.framerateOptions || [editState.framerate]).forEach((fps) =>
+        framerateSelect.appendChild(el("option", { text: fps + " fps", attrs: { value: String(fps) } }))
+      );
+      framerateSelect.value = String(editState.framerate);
+      framerateSelect.addEventListener("change", () => {
+        applyTuning({ framerate: Number(framerateSelect.value) });
       });
-      const value = el("span", { className: "dest-bitrate-value", text: dest.bitrate_kbps + " kbps" });
-      slider.addEventListener("input", () => {
-        value.textContent = slider.value + " kbps";
-      });
-      slider.addEventListener("change", () => {
-        handlers.onEditApply && handlers.onEditApply(dest.destination_id, { bitrateKbps: Number(slider.value) });
-      });
-      editRow.appendChild(slider);
-      editRow.appendChild(value);
-      editGrid.appendChild(editRow);
+      framerateRow.appendChild(framerateSelect);
+      framerateRow.appendChild(el("span"));
+      editGrid.appendChild(framerateRow);
+
+      // Bitrate stays Per-Stream-only, unlike everything else in this panel:
+      // Absolute mode's allocator owns the live bitrate, so a manual field
+      // there would be a control whose input is silently overwritten within
+      // the second (per stream-control.md's "Absolute mode ... allocator
+      // writes live bitrates straight into the encoders without ever touching
+      // the manual values").
+      if (opts.perStreamBitrateEditable) {
+        const editRow = el("div", { className: "dest-edit-row" });
+        editRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Bitrate (kbps)" }));
+        // `Why the slider reads `editState.bitrateKbps` and not
+        // `dest.bitrate_kbps` — the "changing the bitrate just resets the
+        // slider" bug:` this card is rebuilt from scratch whenever its sig
+        // changes, and `editState` is *in* that sig — so the moment a drag
+        // applies, the caller re-renders and this slider is constructed
+        // afresh. Built from the DTO it was constructed from the value the
+        // *server* last reported, which is still the old one: the backend
+        // change had only just been requested. Worse, it stays old forever
+        // for a bitrate-only edit — that's a tier-1 live encoder property
+        // write, so the destination never leaves `live`, so
+        // `destination-state-changed` never fires, so nothing ever re-fetches
+        // `DestinationRow`. The slider therefore snapped back to the previous
+        // value and stayed there while the real bitrate really had changed.
+        // The edit buffer is the value the user actually chose, so it is what
+        // this control renders.
+        const slider = el("input", {
+          className: "dest-bitrate-slider",
+          attrs: { type: "range", min: "200", max: "40000", step: "100", value: String(editState.bitrateKbps) },
+        });
+        const value = el("span", { className: "dest-bitrate-value", text: editState.bitrateKbps + " kbps" });
+        slider.addEventListener("input", () => {
+          value.textContent = slider.value + " kbps";
+        });
+        slider.addEventListener("change", () => {
+          applyTuning({ bitrateKbps: Number(slider.value) });
+        });
+        editRow.appendChild(slider);
+        editRow.appendChild(value);
+        editGrid.appendChild(editRow);
+      }
       body.appendChild(editGrid);
 
       // Three testing-oriented encoder tuning knobs (`edit_destination`'s
@@ -887,7 +957,15 @@
       if (editState.error) {
         body.appendChild(el("div", { className: "dest-edit-error", text: editState.error }));
       }
-    } else if (dest.computedShareKbps !== undefined) {
+    }
+
+    // The allocator's read-only counterpart to the Bitrate slider: in
+    // Absolute-Maximum mode this destination's share is computed, not chosen,
+    // so it's reported rather than offered as a control. Sits outside the
+    // panel above because it is not gated on the same condition — the panel
+    // now renders in *both* bandwidth modes, and this line belongs to
+    // Absolute mode alone.
+    if (dest.computedShareKbps !== undefined) {
       body.appendChild(el("div", { className: "dest-computed-share", text: `Allocated: ${dest.computedShareKbps} kbps` }));
     }
 
