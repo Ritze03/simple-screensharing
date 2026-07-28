@@ -2001,3 +2001,160 @@ async fn watching_video_automatically_delivers_the_sharers_audio_too() {
     let _ = silent_audio_app.wait();
     eprintln!("[audio-follows-video] PASS");
 }
+
+/// Regression test for the 2026-07-28 "Go live" bugs — see
+/// `superdoc/features/stream-control.md`'s dated note.
+///
+/// Reproduces `AppState::go_live` attaching the **first** destination to an
+/// already-running, zero-destination capture (exactly `stage_video_share`'s
+/// "Go live" flow, minus the interactive portal picker —
+/// `capture::start_capture_from_test_source` stands in for
+/// `capture::start_capture` the same way `start_sharing_from_test_source`
+/// stands in for `start_sharing` elsewhere in this module) and asserts the
+/// resulting destination's live params show the **real** negotiated
+/// resolution and the **real** hardware-probed encoder backend, not the
+/// `width: 0, height: 0, backend: EncoderBackend::default()` placeholder
+/// `go_live` used to hardcode:
+///
+/// - **Bug 1** (resolution 0×0 after "Go live"): before the fix, `go_live`
+///   built its `VideoParams` with a hardcoded `width: 0, height: 0` even
+///   though the capture had already been running since `stage_video_share`
+///   and its real negotiated size was available the whole time via
+///   `CaptureHandle::source_caps` — the same real size the staged card had
+///   just correctly displayed. Nothing downstream ever resolves that 0
+///   placeholder back to a real value for a fresh (non-swapped) destination,
+///   so the "Go live" card was stuck at 0×0 forever.
+/// - **Bug 2** (falls back to software x264 instead of real GPU/VAAPI
+///   encode): before the fix, `go_live` used the static
+///   `EncoderBackend::default()` (`Software`, no hardware probing at all)
+///   instead of `detect_encoder_backend()` — unlike
+///   `capture::start_sharing_with_source` (the legacy `start_video_share`
+///   path), which already called `detect_encoder_backend()` internally and
+///   so was never affected by `session.rs`'s static default.
+///
+/// `#[ignore]`d for the same reason every other test in this module is
+/// (needs a built server binary); does **not** need a real xdg-desktop-portal
+/// prompt, PipeWire, or any of DP-1/DP-2/DP-3/HDMI — `TestSource` is a plain
+/// `videotestsrc`.
+#[tokio::test]
+#[ignore = "spawns a real relay server child process and a real GStreamer capture pipeline; \
+            run explicitly with `cargo test end_to_end_test:: -- --ignored --nocapture`"]
+async fn go_live_attaches_the_first_destination_with_real_resolution_and_backend() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    const GO_LIVE_WIDTH: u32 = 640;
+    const GO_LIVE_HEIGHT: u32 = 480;
+    const GO_LIVE_FRAMERATE: u32 = 30;
+
+    let port = pick_free_udp_port().expect("failed to pick a free UDP port for the test relay");
+    eprintln!("[go-live] starting relay server on 127.0.0.1:{port}");
+    let _server = spawn_relay_server(port).expect("failed to spawn relay server child process");
+
+    let server_addr = format!("127.0.0.1:{port}");
+    let room_id: RoomId = rand::random();
+    let room_key: [u8; 32] = rand::random();
+    let join_string = crate::net::format_join_string(&server_addr, &room_id, &room_key);
+
+    eprintln!("[go-live] connecting sharer");
+    let (client, snapshot, events) =
+        connect_with_retry(&join_string, "sharer").await.expect("sharer failed to connect to the relay after retries");
+
+    let source_fragment = format!(
+        "videotestsrc is-live=true pattern=smpte \
+         ! video/x-raw,width={GO_LIVE_WIDTH},height={GO_LIVE_HEIGHT},framerate={GO_LIVE_FRAMERATE}/1"
+    );
+
+    // The staged half: a real, running capture with zero destinations —
+    // exactly `stage_video_share`'s shape.
+    eprintln!("[go-live] starting a zero-destination TestSource capture (the staged half)");
+    let capture_handle = capture::start_capture_from_test_source(GO_LIVE_FRAMERATE, &source_fragment)
+        .await
+        .expect("start_capture_from_test_source failed");
+
+    // Sanity check on this test's own premise: the real negotiated size is
+    // already known on the capture handle, with zero destinations attached —
+    // the exact fact `go_live`'s fix relies on instead of hardcoding 0×0.
+    let staged_caps = capture_handle.source_caps();
+    assert_eq!(
+        (staged_caps.width, staged_caps.height),
+        (GO_LIVE_WIDTH, GO_LIVE_HEIGHT),
+        "a zero-destination capture must already report its real negotiated size \
+         (this is what the staged card displays, and what go_live should read instead of 0×0)"
+    );
+
+    let mut state = crate::session::AppState::default();
+    let room_handle = state.insert_room(client, snapshot, events, join_string);
+
+    let capture_id = state.alloc_capture_id();
+    state.captures.insert(
+        capture_id,
+        crate::session::LocalCapture {
+            kind: crate::protocol::StreamKind::Video,
+            label: "Screen share".to_string(),
+            status: crate::session::ShareStatus::Active(crate::session::ShareHandle::Video(capture_handle)),
+            audio_for_capture: None,
+            destinations: indexmap::IndexMap::new(),
+            self_preview_texture: None,
+        },
+    );
+
+    eprintln!("[go-live] calling AppState::go_live on the staged, zero-destination capture");
+    state.framerate = GO_LIVE_FRAMERATE;
+    state.go_live(capture_id, room_handle);
+
+    let destination_id = {
+        let capture = state.captures.get(&capture_id).expect("capture must still exist right after go_live");
+        assert_eq!(capture.destinations.len(), 1, "go_live should attach exactly one destination");
+        *capture.destinations.keys().next().expect("just asserted len == 1")
+    };
+
+    // Poll until the spawned branch resolves — mirrors `ui.rs`'s own
+    // per-frame `poll_pending_destinations` call, and the identical pattern
+    // in `retry_destination_preserves_prior_encoder_tuning` above.
+    let resolved = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            state.poll_pending_destinations();
+            let pending =
+                state.captures.get(&capture_id).and_then(|c| c.destinations.get(&destination_id)).map(|d| d.pending);
+            match pending {
+                Some(None) => return true,
+                Some(Some(_)) => tokio::time::sleep(Duration::from_millis(50)).await,
+                None => return false,
+            }
+        }
+    })
+    .await;
+    assert_eq!(resolved, Ok(true), "go_live's destination branch never came up");
+
+    let capture = state.captures.get(&capture_id).expect("capture must still exist");
+    let dest = capture.destinations.get(&destination_id).expect("resolved above");
+    let live = dest.live_params();
+
+    assert_eq!(
+        (live.width, live.height),
+        (GO_LIVE_WIDTH, GO_LIVE_HEIGHT),
+        "BUG REPRODUCED: go_live's destination shows {}×{} instead of the real negotiated \
+         {GO_LIVE_WIDTH}×{GO_LIVE_HEIGHT} — the 'Go live' card would show 0×0",
+        live.width,
+        live.height
+    );
+    assert_eq!(
+        live.backend,
+        capture::detect_encoder_backend(),
+        "BUG REPRODUCED: go_live's destination used {:?} instead of this machine's real \
+         detect_encoder_backend() result ({:?}) — every 'Go live' share would silently fall back \
+         to CPU/software encoding regardless of real GPU availability",
+        live.backend,
+        capture::detect_encoder_backend()
+    );
+    eprintln!(
+        "[go-live] PASS: destination live params are {}×{} @ {}fps, backend {:?}",
+        live.width, live.height, live.framerate, live.backend
+    );
+
+    if let crate::session::ShareStatus::Active(crate::session::ShareHandle::Video(handle)) =
+        state.captures.shift_remove(&capture_id).unwrap().status
+    {
+        let _ = handle.stop().await;
+    }
+}

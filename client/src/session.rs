@@ -1471,17 +1471,38 @@ impl AppState {
     /// started at (see [`capture::CaptureHandle::set_source_framerate`]'s
     /// doc comment for why that never needs a pipeline restart).
     pub fn go_live(&mut self, capture_id: CaptureSourceId, room_handle: RoomHandle) {
-        if let Some(capture) = self.captures.get(&capture_id)
+        // Unlike `start_video_share`'s `width: 0, height: 0` ("whatever the
+        // source is negotiated to be" — resolved later inside
+        // `capture::start_sharing_with_source`, which builds its own
+        // `VideoParams` from `handle.source_caps()`/`detect_encoder_backend()`
+        // after the pipeline exists), `go_live` attaches a destination to a
+        // capture that has *already* been running since `stage_video_share` —
+        // its real negotiated size is available right now via
+        // `CaptureHandle::source_caps`, and this is the only place that ever
+        // builds this destination's `VideoParams` (there is no later
+        // "internal" rebuild step to fix a placeholder up, the way
+        // `start_sharing_with_source` does for the legacy path). Leaving
+        // `width`/`height` at 0 here made the "Go live" card permanently show
+        // 0×0 instead of the real resolution the staged card had just shown.
+        // Same reasoning for `backend`: `EncoderBackend::default()` is a
+        // static `Software`, not a real probe, so it silently forced every
+        // "Go live" share onto the CPU encoder — use `detect_encoder_backend`
+        // (the same real hardware probe `start_sharing_with_source` and every
+        // other production call site use) instead.
+        let source = if let Some(capture) = self.captures.get(&capture_id)
             && let ShareStatus::Active(ShareHandle::Video(handle)) = &capture.status
         {
             handle.set_source_framerate(self.framerate);
-        }
+            handle.source_caps()
+        } else {
+            capture::destination::SourceCaps { width: 0, height: 0, framerate: self.framerate }
+        };
         let params = capture::destination::VideoParams {
-            width: 0,
-            height: 0,
+            width: source.width,
+            height: source.height,
             framerate: self.framerate,
             bitrate_kbps: self.bitrate_kbps,
-            backend: capture::EncoderBackend::default(),
+            backend: capture::detect_encoder_backend(),
             tune: self.tune,
             quality_level: self.quality_level,
             rate_control: self.rate_control,
@@ -1506,21 +1527,35 @@ impl AppState {
         // Params for the new destination: copy whichever destination this
         // capture already has (its resolution/framerate are already valid for
         // this source), so fanning out doesn't silently reconfigure anything.
-        let params = capture
-            .destinations
-            .values()
-            .next()
-            .map(|d| d.live_params())
-            .unwrap_or(capture::destination::VideoParams {
-                width: 0,
-                height: 0,
+        //
+        // Fallback (no sibling destination — a genuinely zero-destination
+        // capture, e.g. `go_live` reaching this indirectly, or a future
+        // caller): read the *real* negotiated size straight off the running
+        // `CaptureHandle` (`source_caps()`) instead of a `width: 0, height: 0`
+        // placeholder that nothing downstream ever resolves — see
+        // `go_live`'s doc comment for why that placeholder is fine for
+        // `start_video_share` (whose separate `capture::start_sharing_with_
+        // source` path rebuilds real `VideoParams` internally) but wrong
+        // here, where `add_destination_with_params` uses exactly what's
+        // passed with no later fixup. Same reasoning for `backend`: probe for
+        // real hardware via `detect_encoder_backend` rather than defaulting
+        // to the static `Software` variant.
+        let params = capture.destinations.values().next().map(|d| d.live_params()).unwrap_or_else(|| {
+            let source = match &capture.status {
+                ShareStatus::Active(ShareHandle::Video(handle)) => handle.source_caps(),
+                _ => capture::destination::SourceCaps { width: 0, height: 0, framerate: self.framerate },
+            };
+            capture::destination::VideoParams {
+                width: source.width,
+                height: source.height,
                 framerate: self.framerate,
                 bitrate_kbps: self.bitrate_kbps,
-                backend: capture::EncoderBackend::default(),
+                backend: capture::detect_encoder_backend(),
                 tune: capture::TuneMode::default(),
                 quality_level: capture::QualityLevel::default(),
                 rate_control: capture::RateControlMode::default(),
-            });
+            }
+        });
         self.add_destination_with_params(capture_id, room_handle, role, params);
     }
 
