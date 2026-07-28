@@ -1261,10 +1261,10 @@ input[type="range"]:focus-visible::-webkit-slider-thumb {
 
 .room-panel-checkbox-box {
   flex: 0 0 auto;
-  width: 15px;
-  height: 15px;
+  width: 16px;
+  height: 16px;
   border-radius: 4px;
-  border: 1.5px solid var(--border);
+  border: 1px solid var(--border);
   background: var(--field);
   transition: background 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
   position: relative;
@@ -1275,7 +1275,7 @@ input[type="range"]:focus-visible::-webkit-slider-thumb {
   position: absolute;
   inset: 0;
   border-radius: 2px;
-  margin: 3.5px;
+  margin: 4px;
   background: transparent;
   transition: background 0.12s ease;
 }
