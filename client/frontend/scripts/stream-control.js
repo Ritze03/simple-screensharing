@@ -129,23 +129,6 @@
   // `dto::SettingsDto`'s bandwidth-related fields exactly.
   const MOCK_BANDWIDTH = { bandwidth_mode: "absolute", absolute_total_kbps: 8000, destination_floor_kbps: 3000 };
 
-  const MOCK_MEMBERS_BY_ROOM = {
-    // Kept within `Number.MAX_SAFE_INTEGER` for readability — plain JS
-    // numbers here, unlike the real (Tauri) path. `conn_id`/`owner` used to
-    // be a genuine wire-format limitation ("a real `conn_id` is a `u64` and
-    // can exceed that... not something fixable here"): every u64 crossing
-    // the JSON boundary as a bare number silently loses precision above
-    // 2^53. That's now fixed on the real path — `dto::hex_u64` (Tauri side)
-    // sends `conn_id`/`owner` as lowercase-hex strings instead, see its doc
-    // comment for the real bug this caused (a watched stream's decoder never
-    // receiving frames). The mock branch never crosses that boundary at all,
-    // so it's left as plain numbers here — simpler for these hand-picked
-    // demo values, and there's nothing real to lose precision on.
-    1: [{ conn_id: 0x7b29f8d3cc00, display_name: "Ana", resolution: "1920x1080", fps: null }],
-    2: [],
-    5: [{ conn_id: 0xa1029f8d3c00, display_name: "Priya", resolution: "1280x720", fps: null }],
-  };
-
   const MOCK_AUDIO_SOURCES = [
     { id: 1, name: "Default speakers" },
     { id: 2, name: "Game (app audio)" },
@@ -159,7 +142,6 @@
   let mockJoinedRooms = MOCK_JOINED_ROOMS;
   let mockDestinations = MOCK_DESTINATIONS.slice();
   let bandwidth = Object.assign({}, MOCK_BANDWIDTH);
-  let mockMembersByRoom = MOCK_MEMBERS_BY_ROOM;
   let mockAudioSources = MOCK_AUDIO_SOURCES;
   // Real-backend-only: the last `bandwidth-overshoot` event's amount (there's
   // no local allocator to compute this from in the real branch — the
@@ -208,23 +190,6 @@
       return { bandwidth_mode: settings.bandwidth_mode, absolute_total_kbps: settings.absolute_total_kbps, destination_floor_kbps: settings.destination_floor_kbps };
     }
     return Object.assign({}, MOCK_BANDWIDTH);
-  }
-
-  async function fetchRoomMembers(roomHandle) {
-    if (window.__TAURI__) {
-      const detail = await window.__TAURI__.core.invoke("room_detail", { roomHandle });
-      if (!detail) return [];
-      return detail.members.map((m) => {
-        const videoStream = detail.streams.find((s) => s.owner === m.conn_id && s.kind === "Video");
-        return {
-          conn_id: m.conn_id,
-          display_name: m.display_name,
-          resolution: videoStream ? `${videoStream.width}x${videoStream.height}` : null,
-          fps: null,
-        };
-      });
-    }
-    return mockMembersByRoom[roomHandle] || [];
   }
 
   async function fetchAudioSources() {
@@ -506,26 +471,7 @@
     return mockAudioSources;
   }
 
-  async function renameRoom(joinString, name) {
-    if (window.__TAURI__) {
-      await window.__TAURI__.core.invoke("rename_room", { joinString, newName: name });
-      if (window.Shell) window.Shell.refreshRooms();
-    }
-    // Same fix as `setBandwidthMode`/`setLanguage` etc.: update the local
-    // value on both branches, not just the mock one — `updateRoomScopedRow`'s
-    // reconciliation signature includes `state.roomName`, and without this
-    // the Room name field would snap back to the pre-rename value (rebuilt
-    // fresh from the still-stale `state.roomName`) right as "Saved." appears,
-    // even though the rename itself succeeded on the backend.
-    state.roomName = name;
-    state.savedHint = true;
-    render();
-  }
-
   const state = {
-    scopedRoomHandle: 1,
-    roomName: "Movie Night",
-    savedHint: false,
     startForm: { roomHandle: 1, fps: 30, bitrateKbps: 8000 },
     startInFlight: false,
     startError: null,
@@ -669,8 +615,6 @@
   }
   let startCardEl = null;
   let startCardSig = null;
-  let roomScopedEl = null;
-  let roomScopedSig = null;
 
   /** Reconciles `parent`'s children to exactly `children` (falsy entries
    * dropped), reusing/moving existing nodes instead of recreating them —
@@ -712,7 +656,6 @@
       bannerText ? updateOvershootBanner(bannerText) : null,
       updateActiveSharesCard(alloc),
       updateStartStreamCard(),
-      updateRoomScopedRow(),
     ]);
   }
 
@@ -1127,92 +1070,6 @@
   }
 
   // ---------------------------------------------------------------------
-  // Room-scoped row: Members/rename + Share audio.
-  // ---------------------------------------------------------------------
-
-  function updateRoomScopedRow() {
-    const sig = JSON.stringify({
-      mockJoinedRooms,
-      scopedRoomHandle: state.scopedRoomHandle,
-      roomName: state.roomName,
-      savedHint: state.savedHint,
-      members: mockMembersByRoom[state.scopedRoomHandle],
-    });
-    if (roomScopedEl && roomScopedSig === sig) return roomScopedEl;
-    roomScopedSig = sig;
-    roomScopedEl = renderRoomScopedRow();
-    return roomScopedEl;
-  }
-
-  function renderRoomScopedRow() {
-    const header = el("div", { className: "sc-room-scoped-header" });
-    header.appendChild(el("span", { text: "Room-scoped settings for:" }));
-    const select = dropdown(
-      mockJoinedRooms.map((r) => ({ value: r.id, label: r.name })),
-      state.scopedRoomHandle,
-      async (value) => {
-        state.scopedRoomHandle = Number(value);
-        const room = mockJoinedRooms.find((r) => r.id === state.scopedRoomHandle);
-        state.roomName = room ? room.name : "";
-        state.savedHint = false;
-        mockMembersByRoom[state.scopedRoomHandle] = await fetchRoomMembers(state.scopedRoomHandle);
-        render();
-      }
-    );
-    header.appendChild(select);
-
-    // `Why there is no SHARE AUDIO card here any more:` audio stopped being
-    // a thing you start on its own. It is attached to a screen share, from
-    // that share's own card in ACTIVE SHARES ("+ Add audio"), so a
-    // room-scoped panel for picking a source and starting a standalone audio
-    // stream had no destination to belong to — and the audio it started
-    // rendered as a second, structurally identical card next to the screen
-    // share it was meant to accompany. See
-    // `superdoc/features/stream-control.md` (2026-07-28).
-    const row = el("div", { className: "sc-room-scoped-row" });
-    row.appendChild(renderMembersCard());
-
-    const wrap = el("div", { className: "sc-room-scoped-wrap" });
-    wrap.appendChild(header);
-    wrap.appendChild(row);
-    return wrap;
-  }
-
-  function renderMembersCard() {
-    const members = mockMembersByRoom[state.scopedRoomHandle] || [];
-    const body = [];
-    if (members.length === 0) {
-      body.push(emptyRow("person_off", "No other members yet."));
-    } else {
-      members.forEach((m) => {
-        const row = el("div", { className: "sc-member-row" });
-        row.appendChild(el("span", { text: m.display_name }));
-        // `m.conn_id` is a real (Tauri) `ConnId`: already a lowercase-hex
-        // string (see `dto::hex_u64`'s doc comment — a bare `u64` loses
-        // precision over JSON) — `.toString(16)` is then a no-op identity
-        // call (`String.prototype.toString` ignores its radix argument), so
-        // this line still works unchanged for the mock branch's plain-number
-        // `conn_id` values too, no branching needed.
-        row.appendChild(el("span", { className: "sc-member-row-conn", text: "conn_id " + m.conn_id.toString(16).padStart(16, "0") }));
-        body.push(row);
-      });
-    }
-
-    const scopedRoom = mockJoinedRooms.find((r) => r.id === state.scopedRoomHandle);
-    const renameRow = el("div", { className: "sc-rename-row" });
-    const nameInput = el("input", { attrs: { type: "text", value: state.roomName } });
-    renameRow.appendChild(nameInput);
-    renameRow.appendChild(
-      secondaryButton("Save", () => renameRoom(scopedRoom ? scopedRoom.join_string : "", nameInput.value.trim() || state.roomName))
-    );
-
-    const children = [el("div", { className: "field-label", text: "Room name" }), renameRow];
-    if (state.savedHint) children.push(el("div", { className: "sc-saved-hint", text: "Saved." }));
-
-    return card("MEMBERS", body.concat(children), { className: "sc-members-card" });
-  }
-
-  // ---------------------------------------------------------------------
   // Init — fetches every data touchpoint (mock branch by default in a plain
   // browser), then does the first render. Also the "refresh" this tab
   // exposes on `window.StreamControl` for `shell.js`'s event listeners to
@@ -1231,12 +1088,9 @@
     // paint a wait on a real system-audio query — up to `withTimeout`'s full
     // 3s on a machine with no audio server — for data nothing was drawing.
 
-    if (mockJoinedRooms.length > 0 && !mockJoinedRooms.some((r) => r.id === state.scopedRoomHandle)) {
-      state.scopedRoomHandle = mockJoinedRooms[0].id;
-      state.roomName = mockJoinedRooms[0].name;
+    if (mockJoinedRooms.length > 0 && !mockJoinedRooms.some((r) => r.id === state.startForm.roomHandle)) {
       state.startForm.roomHandle = mockJoinedRooms[0].id;
     }
-    mockMembersByRoom[state.scopedRoomHandle] = await fetchRoomMembers(state.scopedRoomHandle);
 
     render();
   }
