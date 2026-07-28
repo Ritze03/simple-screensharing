@@ -747,7 +747,7 @@
       const PRESETS = [
         { value: "low_latency", label: "Low-Latency", tune: "low_latency", qualityLevel: "performance", rateControl: "constant" },
         { value: "balanced", label: "Balanced", tune: "best_quality", qualityLevel: "balanced", rateControl: "constant" },
-        { value: "quality", label: "Quality", tune: "best_quality", qualityLevel: "quality", rateControl: "constant" },
+        { value: "quality", label: "Quality", tune: "best_quality", qualityLevel: "quality", rateControl: "quality" },
       ];
       // Highlight whichever preset's 3 fields exactly match the current
       // edit state; if the Advanced section was hand-tuned to some other
