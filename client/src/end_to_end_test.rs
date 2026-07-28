@@ -2158,3 +2158,234 @@ async fn go_live_attaches_the_first_destination_with_real_resolution_and_backend
         let _ = handle.stop().await;
     }
 }
+
+/// Reproduces (and proves the fix for) the reported **"big FPS jumps freeze
+/// the viewer"** bug: a real viewer is actively watching (already past its
+/// first keyframe, decoding normally) when the streamer changes its
+/// destination's framerate by a large jump — both up (15 -> 120, a
+/// [`capture::destination::ChangeTier::SourceRestart`] per
+/// [`capture::destination::classify_change`]'s fps rule) and back down (120
+/// -> 15, a [`capture::destination::ChangeTier::BranchSwap`]) — and keeps
+/// decoding frames.
+///
+/// `Why this differs from the two pre-existing branch-swap regression
+/// tests:` `applying_a_preset_never_bursts_a_branch_above_its_configured_framerate`
+/// and `late_watch_after_all_three_tuning_controls_toggled_gets_a_real_keyframe_every_time`
+/// both hold the destination's `framerate` field **constant** across their
+/// swap (only `tune`/`quality_level`/`rate_control` change) — neither one
+/// exercises a branch swap whose `framerate` itself is the changed field, or
+/// a viewer that is already watching (decoding, not just subscribing) across
+/// the seam. This test targets exactly that gap: a real `StreamDecoder`
+/// consuming real, continuously-arriving `MediaFrame`s from a real relay,
+/// spanning a real `change_destination` framerate jump in both directions.
+///
+/// What must hold throughout: [`decode::StreamDecoder::latest_frame`] must
+/// keep yielding new decoded frames — the gap between two consecutive
+/// newly-yielded frames must never exceed a few seconds (measured against
+/// [`capture::destination::STALL_RESEND_INTERVAL`]/GOP-length-scale
+/// budgets, not the tight sub-frame timing `decode.rs`'s own pacing tests
+/// use) either right after the jump, or ever.
+#[tokio::test]
+#[ignore = "spawns a real relay server child process and real GStreamer capture/decode \
+            pipelines; run explicitly with `cargo test end_to_end_test:: -- --ignored --nocapture`"]
+async fn big_fps_jump_mid_stream_keeps_viewer_frames_flowing() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    const NATIVE_FPS: u32 = 30;
+    const LOW_FPS: u32 = 15;
+    const HIGH_FPS: u32 = capture::MAX_FRAMERATE;
+    // Stress harder than the default test resolution: full HD, forced to the
+    // software encoder (`detect_encoder_backend` would otherwise prefer
+    // VAAPI on this machine, which has plenty of headroom to absorb a big
+    // fps jump) so a jump that outpaces real-time encode speed has a chance
+    // to actually show up.
+    const STRESS_WIDTH: u32 = 1920;
+    const STRESS_HEIGHT: u32 = 1080;
+
+    let port = pick_free_udp_port().expect("failed to pick a free UDP port for the test relay");
+    eprintln!("[e2e-fps-jump] starting relay server on 127.0.0.1:{port}");
+    let _server = spawn_relay_server(port).expect("failed to spawn relay server child process");
+    let server_addr = format!("127.0.0.1:{port}");
+    let room_id: RoomId = rand::random();
+    let room_key: [u8; 32] = rand::random();
+    let join_string = crate::net::format_join_string(&server_addr, &room_id, &room_key);
+
+    let (sharer, _snap_a, mut events_a) =
+        connect_with_retry(&join_string, "sharer").await.expect("sharer failed to connect");
+    let (viewer, _snap_b, mut events_b) =
+        connect_with_retry(&join_string, "viewer").await.expect("viewer failed to connect");
+    let owner_conn_id = sharer.conn_id();
+
+    let source_fragment = format!(
+        "videotestsrc is-live=true pattern=smpte \
+         ! video/x-raw,width={STRESS_WIDTH},height={STRESS_HEIGHT},framerate={NATIVE_FPS}/1"
+    );
+    eprintln!("[e2e-fps-jump] starting real capture at {LOW_FPS}fps (native source {NATIVE_FPS}fps)");
+    let capture_handle =
+        capture::start_sharing_from_test_source(&sharer, VIDEO_STREAM_ID, capture::DEFAULT_BITRATE_KBPS, LOW_FPS, &source_fragment)
+            .await
+            .expect("start_sharing_from_test_source failed");
+
+    // Force the destination down to LOW_FPS explicitly rather than trusting
+    // whatever the source negotiated at (matches `start_sharing`'s
+    // `source.framerate` default, which may not equal `LOW_FPS`).
+    let base = capture_handle
+        .destination_runtime(capture::DestKey(0))
+        .expect("destination 0 runtime")
+        .lock()
+        .unwrap()
+        .params();
+    if base.framerate != LOW_FPS {
+        let req = capture_handle
+            .change_destination(capture::DestKey(0), VideoParams { framerate: LOW_FPS, ..base })
+            .expect("classify/apply initial low-fps change");
+        if let Some(done) = req.done {
+            tokio::time::timeout(Duration::from_secs(15), done)
+                .await
+                .expect("initial low-fps swap timed out")
+                .expect("swap channel")
+                .expect("initial low-fps swap failed");
+        }
+    }
+
+    eprintln!("[e2e-fps-jump] waiting for viewer to see StreamStarted");
+    let saw_stream_started = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match events_b.recv().await {
+                Some(ClientEvent::PresenceDelta(PresenceEvent::StreamStarted(info)))
+                    if info.owner == owner_conn_id && info.stream_id == VIDEO_STREAM_ID =>
+                {
+                    return true;
+                }
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+    })
+    .await;
+    assert_eq!(saw_stream_started, Ok(true), "viewer never observed StreamStarted over the real relay");
+
+    viewer.subscribe(owner_conn_id, VIDEO_STREAM_ID).await.expect("viewer: subscribe() failed");
+    let mut decoder = StreamDecoder::new(VIDEO_STREAM_ID).expect("failed to build StreamDecoder");
+
+    // Drains `events_b` for `duration`, forwarding subscriber-count/keyframe
+    // events from `events_a` (mirrors the real `ui.rs` event loop, same
+    // pattern as `late_watch_after_all_three_tuning_controls_toggled_...`
+    // above) and feeding every `MediaFrame` into `decoder`. Returns
+    // (largest gap between two consecutive *newly decoded* frames, total
+    // media frames received, total decoded frames yielded).
+    async fn pump_and_measure(
+        events_a: &mut tokio::sync::mpsc::UnboundedReceiver<ClientEvent>,
+        events_b: &mut tokio::sync::mpsc::UnboundedReceiver<ClientEvent>,
+        capture_handle: &capture::CaptureHandle,
+        decoder: &mut StreamDecoder,
+        owner_conn_id: crate::protocol::ConnId,
+        duration: Duration,
+    ) -> (Duration, u64, u64) {
+        let mut media_frames = 0u64;
+        let mut decoded_frames = 0u64;
+        let mut last_decoded_at: Option<std::time::Instant> = None;
+        let mut max_gap = Duration::ZERO;
+        let deadline = tokio::time::sleep(duration);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => break,
+                event = events_a.recv() => {
+                    match event {
+                        Some(ClientEvent::SubscriberCount { stream_id, count }) if stream_id == VIDEO_STREAM_ID => {
+                            capture_handle.notify_subscriber_count(capture::DestKey(0), count);
+                        }
+                        Some(ClientEvent::KeyframeRequest { stream_id }) if stream_id == VIDEO_STREAM_ID => {
+                            capture_handle.notify_keyframe_request(capture::DestKey(0));
+                        }
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+                event = events_b.recv() => {
+                    match event {
+                        Some(ClientEvent::MediaFrame(frame))
+                            if frame.conn_id == owner_conn_id && frame.stream_id == VIDEO_STREAM_ID =>
+                        {
+                            media_frames += 1;
+                            decoder.feed(&frame);
+                        }
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+            if let Some(_img) = decoder.latest_frame() {
+                decoded_frames += 1;
+                let now = std::time::Instant::now();
+                if let Some(last) = last_decoded_at {
+                    max_gap = max_gap.max(now.saturating_duration_since(last));
+                }
+                last_decoded_at = Some(now);
+            }
+        }
+        (max_gap, media_frames, decoded_frames)
+    }
+
+    eprintln!("[e2e-fps-jump] warming up at {LOW_FPS}fps before touching anything");
+    let (warm_gap, warm_media, warm_decoded) =
+        pump_and_measure(&mut events_a, &mut events_b, &capture_handle, &mut decoder, owner_conn_id, Duration::from_secs(3)).await;
+    eprintln!("[e2e-fps-jump] warmup: max_gap={warm_gap:?}, media={warm_media}, decoded={warm_decoded}");
+    assert!(warm_decoded > 0, "viewer never decoded a single frame before any fps change");
+
+    for (label, from_fps, to_fps) in [("jump UP", LOW_FPS, HIGH_FPS), ("jump DOWN", HIGH_FPS, LOW_FPS)] {
+        eprintln!("[e2e-fps-jump] {label}: {from_fps}fps -> {to_fps}fps");
+        let current = capture_handle
+            .destination_runtime(capture::DestKey(0))
+            .expect("destination 0 runtime")
+            .lock()
+            .unwrap()
+            .params();
+        let target = VideoParams { framerate: to_fps, backend: capture::EncoderBackend::Software, ..current };
+        let req = capture_handle.change_destination(capture::DestKey(0), target).expect("classify/apply fps jump");
+        eprintln!("[e2e-fps-jump] {label}: classified as {:?}", req.tier);
+        if let Some(done) = req.done {
+            tokio::time::timeout(Duration::from_secs(15), done)
+                .await
+                .unwrap_or_else(|_| panic!("{label}: swap timed out"))
+                .expect("swap channel")
+                .unwrap_or_else(|e| panic!("{label}: swap failed: {e}"));
+        }
+
+        let (max_gap, media_frames, decoded_frames) = pump_and_measure(
+            &mut events_a,
+            &mut events_b,
+            &capture_handle,
+            &mut decoder,
+            owner_conn_id,
+            Duration::from_secs(8),
+        )
+        .await;
+        eprintln!(
+            "[e2e-fps-jump] {label}: after the swap, max_gap={max_gap:?}, media={media_frames}, decoded={decoded_frames} \
+             over 8s"
+        );
+
+        assert!(
+            decoded_frames > 0,
+            "BUG REPRODUCED: {label} ({from_fps}fps -> {to_fps}fps) — the viewer decoded ZERO new frames \
+             in the 8s after the fps change (received {media_frames} raw media frames over the relay)"
+        );
+        assert!(
+            max_gap < Duration::from_secs(2),
+            "BUG REPRODUCED: {label} ({from_fps}fps -> {to_fps}fps) — the viewer's decoder stalled for \
+             {max_gap:?} between two consecutive decoded frames, well past a single dropped frame's worth \
+             of latency ({decoded_frames} decoded, {media_frames} raw media frames received)"
+        );
+    }
+
+    if let Err(e) = capture_handle.stop().await {
+        tracing::warn!("[e2e-fps-jump] capture_handle.stop() error (non-fatal): {e:#}");
+    }
+    drop(viewer);
+    let _ = sharer.leave().await;
+
+    eprintln!("[e2e-fps-jump] PASS: viewer kept decoding frames across both big fps jumps");
+}

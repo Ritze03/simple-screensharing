@@ -366,6 +366,56 @@ const PACING_HARD_STALL_GAP: Duration = Duration::from_secs(2);
 /// doc's own repro shape (~600ms of silence, then a burst).
 const PACING_STALENESS_THRESHOLD: Duration = Duration::from_millis(250);
 
+/// `max-size-buffers` for the decode pipeline's `appsrc -> queue ->
+/// h264parse` handoff queue, which is also switched to `leaky=downstream`
+/// alongside this constant (see [`run_pipeline`]).
+///
+/// `Why:` the root cause of the "big FPS jump freezes the viewer" bug. A
+/// plain `ElementFactory::make("queue")` — no `leaky`, GStreamer's own
+/// defaults (`max-size-buffers=200`, `max-size-time=1s`) — is *not* a
+/// "drop and continue" element, it is a bounded buffer that **blocks the
+/// pushing thread** once full. When a big fps jump (or just a fast-enough
+/// stream) pushes access units faster than `avdec_h264` can decode them —
+/// this pipeline is software-decode only, no hardware decode path exists —
+/// this queue fills within about a second and every subsequent
+/// `appsrc.push_buffer()` call in [`pump_loop`] blocks synchronously until
+/// decode drains enough space. `pump_loop` then can't drain
+/// [`StreamDecoder`]'s own bounded ingest channel either, so from the
+/// caller's side `feed()` looks fine (it's `try_send`, non-blocking, and
+/// its own channel absorbs the backlog) while the actual GStreamer pipeline
+/// grinds through an ever-growing, ever-more-stale FIFO backlog in strict
+/// order at whatever rate decode can sustain — a real, multi-second visible
+/// freeze followed by slow-motion catch-up, not the graceful degradation
+/// [`PacingState`] above is designed to provide. `PacingState` cannot help
+/// here at all: it only ever sees a frame *after* it has already been
+/// decoded, so a backlog stuck in this queue, upstream of the decoder, never
+/// reaches it.
+///
+/// This is the exact same failure class `capture.rs`'s own
+/// `ENCODER_QUEUE_MAX_BUFFERS` doc comment describes and fixes on the
+/// encode/sender side ("without a small bounded/leaky config there, a real
+/// capture source's incoming raw-frame rate spiking under motion can outpace
+/// the encoder and the queue's own defaults, blocking the whole pipeline
+/// solid rather than dropping raw frames") — this module just never had the
+/// receive-side analog. `leaky=downstream` (drop the *oldest* buffered
+/// access unit, not reject the newest, when full) plus a small buffer count
+/// makes a struggling decoder skip stale, no-longer-relevant access units
+/// instead of blocking, so it always keeps decoding roughly the *live edge*
+/// of the stream. Dropping a compressed access unit does mean visible
+/// corruption until the next real IDR (h264parse/avdec_h264 can't decode a
+/// delta frame whose reference was skipped) — but that's bounded by the
+/// stream's own GOP length (seconds, not the unbounded/growing latency the
+/// blocking queue produced) and self-heals exactly the way this project
+/// already accepts a stall/pause/resubscribe gap self-healing elsewhere
+/// (see `destination::STALL_RESEND_INTERVAL`'s doc comment).
+///
+/// `Why` 4, matching the encode-side branch appsink's own `max-buffers=4`
+/// rather than `ENCODER_QUEUE_MAX_BUFFERS`'s 2: this queue holds compressed
+/// access units (tens of KB), not raw frames, so a little more slack costs
+/// negligible memory while giving ordinary decode-time jitter (a slightly
+/// slower-than-usual frame or two) more room before anything gets dropped.
+const DECODE_QUEUE_MAX_BUFFERS: u32 = 4;
+
 /// Tracks how often [`StreamDecoder::latest_frame`] actually yields a *new*
 /// decoded frame (not just how often it's polled — `ui.rs` polls once per
 /// repaint regardless of whether anything new has decoded, which would
@@ -889,7 +939,14 @@ fn run_pipeline(rx: std_mpsc::Receiver<PipelineMsg>, latest_frame: LatestFrameSl
         .name("src")
         .build()
         .context("appsrc element unavailable")?;
+    // `leaky=downstream` + a small `max-size-buffers`: see
+    // [`DECODE_QUEUE_MAX_BUFFERS`]'s doc comment for why a plain, default
+    // `queue` here is the root cause of the "big FPS jump freezes the
+    // viewer" bug (it blocks instead of dropping once decode falls behind),
+    // and why leaking the oldest buffered access unit is the right fix.
     let queue = ElementFactory::make("queue")
+        .property_from_str("leaky", "downstream")
+        .property("max-size-buffers", DECODE_QUEUE_MAX_BUFFERS)
         .build()
         .context("queue element unavailable")?;
     let parse = ElementFactory::make("h264parse")
