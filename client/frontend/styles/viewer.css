@@ -1,0 +1,99 @@
+/*
+ * viewer.css — standalone fullscreen/borderless viewer window.
+ *
+ * Deliberately not `view.css`: the viewer window is its own minimal page
+ * (no app shell/sidebar/tabs, see `frontend/viewer.html`), and wants a true
+ * full-viewport black stage rather than `view.css`'s `--panel-sunken` tile
+ * background — black is what actually produces letterbox/pillarbox bars
+ * when a tile's aspect ratio doesn't match its grid cell's.
+ */
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: #000;
+  overflow: hidden;
+}
+
+body {
+  font-family: system-ui, sans-serif;
+}
+
+.viewer-grid {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  /* Columns/rows set inline per-tile-count by viewer.js (ceil(sqrt(n))). */
+  background: #000;
+}
+
+.viewer-tile {
+  position: relative;
+  background: #000;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  min-height: 0;
+}
+
+.viewer-tile canvas {
+  /* `object-fit: contain` inside a cell that fills the grid track is what
+   * produces the letterbox/pillarbox black bars — the cell's own background
+   * is black, so any space the canvas doesn't cover just reads as empty
+   * stage rather than a visible seam. */
+  max-width: 100%;
+  max-height: 100%;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+.viewer-tile-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(232, 233, 236, 0.6);
+  font-size: 13px;
+  pointer-events: none;
+}
+
+.viewer-empty {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(232, 233, 236, 0.6);
+  font-size: 14px;
+}
+
+.viewer-exit-btn {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  z-index: 10;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: none;
+  background: rgba(0, 0, 0, 0.5);
+  color: #fff;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.viewer-exit-btn:hover {
+  background: rgba(0, 0, 0, 0.75);
+}

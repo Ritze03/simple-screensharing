@@ -344,21 +344,35 @@ function resolveTargetDisplay(displayId) {
   return screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
 }
 
-// streamKeys is handed to the viewer window via a query string on the
-// loaded file URL (?streamKeys=<json-encoded-array>), read by the later
-// unit's viewer.js on load via `new URLSearchParams(location.search)`.
+// streamKeys/mode are handed to the viewer window via a query string on the
+// loaded file URL (?streamKeys=<json-encoded-array>&mode=fullscreen|borderless),
+// read by viewer.js on load via `new URLSearchParams(location.search)`.
 // Chosen over an IPC message sent after `did-finish-load` because it's
 // available synchronously to the viewer's own startup code with no race
-// against when the renderer attaches its listener.
-function loadViewerContents(win, streamKeys) {
-  const query = `streamKeys=${encodeURIComponent(JSON.stringify(streamKeys || []))}`;
-  win.loadFile(VIEWER_HTML, { search: query });
+// against when the renderer attaches its listener. `mode` lets viewer.js's
+// Escape handler know whether there's an OS fullscreen state worth exiting
+// before closing (see viewer.js's keydown handler).
+function loadViewerContents(win, streamKeys, mode) {
+  const params = new URLSearchParams();
+  params.set("streamKeys", JSON.stringify(streamKeys || []));
+  params.set("mode", mode || "borderless");
+  // Returns the `loadFile` promise so `openViewerWindow`'s caller (the
+  // `open-viewer-window` IPC handler) can await/reject on a real load
+  // failure instead of it being a silent fire-and-forget — see that
+  // handler's own comment.
+  return win.loadFile(VIEWER_HTML, { search: params.toString() });
 }
 
 // mode: 'fullscreen' | 'borderless'
 // displayId: number | null — null means "nearest the cursor" (see resolveTargetDisplay)
 // streamKeys: string[]
-function openViewerWindow({ mode, displayId, streamKeys }) {
+//
+// Returns the `win.loadFile` promise (see `loadViewerContents`) so a
+// `loadFile` failure (e.g. a bad/missing `VIEWER_HTML` path) rejects this
+// function's own promise instead of failing silently — the `open-viewer-window`
+// IPC handler below awaits this and lets the rejection propagate to the
+// renderer's `openViewer()` caller as a real error instead of a silent hang.
+async function openViewerWindow({ mode, displayId, streamKeys }) {
   if (viewerWindow && !viewerWindow.isDestroyed()) {
     viewerWindow.close();
     viewerWindow = null;
@@ -399,7 +413,7 @@ function openViewerWindow({ mode, displayId, streamKeys }) {
   });
   viewerWindow = win;
 
-  loadViewerContents(win, streamKeys);
+  const loadPromise = loadViewerContents(win, streamKeys, mode);
 
   win.once("ready-to-show", () => {
     if (win.isDestroyed()) return;
@@ -439,6 +453,15 @@ function openViewerWindow({ mode, displayId, streamKeys }) {
     // replaced by a later `openViewer` call must not null out the new one.
     if (viewerWindow === win) viewerWindow = null;
   });
+
+  // Propagate a `loadFile` failure to the caller instead of letting it be a
+  // silent fire-and-forget. Not awaited before `ready-to-show`/`show()`
+  // above on purpose — those stay wired unconditionally so a window that
+  // *does* finish loading still gets positioned/shown even if this await
+  // is still pending when that event fires; this only affects what
+  // `openViewerWindow`'s own promise (and thus `open-viewer-window`'s IPC
+  // response) resolves/rejects with.
+  await loadPromise;
 }
 
 ipcMain.handle("list-displays", () => {
@@ -446,7 +469,11 @@ ipcMain.handle("list-displays", () => {
 });
 
 ipcMain.handle("open-viewer-window", (_event, opts) => {
-  openViewerWindow(opts || {});
+  // Returning (not just calling) `openViewerWindow`'s promise is what lets
+  // a `loadFile` rejection inside it propagate through `ipcMain.handle` as
+  // a rejected `invoke()` on the renderer side — see `openViewerWindow`'s
+  // own doc comment.
+  return openViewerWindow(opts || {});
 });
 
 ipcMain.handle("viewer-set-fullscreen", (_event, fullscreen) => {
