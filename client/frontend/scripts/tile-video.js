@@ -39,13 +39,13 @@
 
   // --- Jitter buffer (RFC 3550-style EWMA over wire-format `pts_us`) ---
   //
-  // Ceiling on the applied playout delay. Hardcoded for now — a
-  // not-yet-landed backend change will add a real user-configurable setting
-  // (`get_settings()`'s response gaining `max_jitter_buffer_ms`). Every
-  // read below goes through this one `let` binding rather than the literal,
-  // so wiring that setting in later is a one-line change (assign
-  // `maxJitterBufferMs` from the fetched settings) instead of a hunt through
-  // the jitter math for inlined `2000`s.
+  // Ceiling on the applied playout delay. Defaults to this module's own
+  // default and is overwritten once at startup by whichever page embeds
+  // this module (`view.js`/`viewer.js`) from the real `get_settings()`
+  // value, via `window.TileVideo.setMaxJitterBufferMs` — see that function
+  // below. Every read below goes through this one `let` binding rather than
+  // a literal, which is what makes that a one-line external call instead of
+  // a hunt through the jitter math for inlined `2000`s.
   const DEFAULT_MAX_JITTER_BUFFER_MS = 2000;
   let maxJitterBufferMs = DEFAULT_MAX_JITTER_BUFFER_MS;
   // Floor applied to the target buffer even when the jitter estimate is
@@ -452,10 +452,21 @@
     }
   }
 
+  /** Overrides the ceiling on applied jitter-buffer delay (see the "Jitter
+   * buffer" block's `maxJitterBufferMs` doc comment above) — called once at
+   * startup by whichever page embeds this module, with the user's real
+   * `get_settings()` value, so both `view.js` and `viewer.js` share one
+   * setting without either needing direct access to this module's private
+   * state. Clamped defensively (the backend already clamps too). */
+  function setMaxJitterBufferMs(ms) {
+    maxJitterBufferMs = clamp(Number(ms) || DEFAULT_MAX_JITTER_BUFFER_MS, 0, 5000);
+  }
+
   window.TileVideo = {
     startTileVideo,
     stopTileVideo,
     stopAllTileVideo,
     hasController,
+    setMaxJitterBufferMs,
   };
 })();

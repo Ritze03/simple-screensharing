@@ -234,7 +234,22 @@
     return wrap;
   }
 
+  /** Fetches the user's `max_jitter_buffer_ms` preference once at startup
+   * and passes it to `tile-video.js`'s `window.TileVideo.setMaxJitterBufferMs`
+   * — the jitter buffer itself lives in that module now (extracted so the
+   * standalone fullscreen/borderless viewer can share it), so this file has
+   * no direct access to the underlying binding. No-op on the mock branch
+   * (no `window.__TAURI__`) — `tile-video.js` just keeps its own
+   * `DEFAULT_MAX_JITTER_BUFFER_MS` starting value, mirroring `settings.js`'s
+   * `fetchSettings` mock fallback. */
+  async function fetchMaxJitterBufferMs() {
+    if (!window.__TAURI__) return;
+    const settings = await window.__TAURI__.core.invoke("get_settings");
+    window.TileVideo.setMaxJitterBufferMs(settings.max_jitter_buffer_ms);
+  }
+
   async function init() {
+    await fetchMaxJitterBufferMs();
     mockWatched = await fetchWatchedStreams();
     render();
   }

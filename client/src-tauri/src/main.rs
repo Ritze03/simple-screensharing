@@ -66,6 +66,7 @@ fn main() {
             commands::get_settings,
             commands::set_language,
             commands::set_presentation_mode,
+            commands::set_max_jitter_buffer_ms,
             commands::start_video_share,
             commands::start_audio_share,
             commands::stop_share,

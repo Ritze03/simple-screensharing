@@ -165,6 +165,17 @@ pub fn set_presentation_mode(managed: State<'_, Managed>, mode: String) -> Resul
     Ok(())
 }
 
+/// Clamped server-side too (defense in depth) even though the frontend's
+/// range input already restricts it to 0..=5000 — see
+/// `rooms::AppSettings::clamp_max_jitter_buffer_ms`.
+#[tauri::command]
+pub fn set_max_jitter_buffer_ms(managed: State<'_, Managed>, ms: u32) {
+    let ms = simple_screensharing_client::rooms::AppSettings::clamp_max_jitter_buffer_ms(ms);
+    let mut state = managed.state.lock().unwrap();
+    state.max_jitter_buffer_ms = ms;
+    simple_screensharing_client::session::save_max_jitter_buffer_ms(ms);
+}
+
 // ---------------------------------------------------------------------
 // Stream Control
 // ---------------------------------------------------------------------

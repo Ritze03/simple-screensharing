@@ -171,6 +171,7 @@ pub struct SettingsDto {
     pub bandwidth_mode: String,
     pub absolute_total_kbps: u32,
     pub destination_floor_kbps: u32,
+    pub max_jitter_buffer_ms: u32,
     pub bitrate_kbps: u32,
     pub framerate: u32,
 }
@@ -394,6 +395,7 @@ pub fn settings_dto(state: &AppState) -> SettingsDto {
         bandwidth_mode: bandwidth_mode_str(state.bandwidth_mode).to_string(),
         absolute_total_kbps: state.absolute_total_kbps,
         destination_floor_kbps: state.destination_floor_kbps,
+        max_jitter_buffer_ms: state.max_jitter_buffer_ms,
         bitrate_kbps: state.bitrate_kbps,
         framerate: state.framerate,
     }
