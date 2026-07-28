@@ -813,7 +813,7 @@
           } kbps but the maximum is ${bandwidth.absolute_total_kbps} kbps. No stream is starved below its floor.`
       : null;
 
-    syncChildren(gridEl, [updateBandwidthCard(), bannerText ? updateOvershootBanner(bannerText) : null, updateActiveSharesCard(alloc)]);
+    syncChildren(gridEl, [updateActiveSharesCard(alloc), updateBandwidthCard(), bannerText ? updateOvershootBanner(bannerText) : null]);
   }
 
   // ---------------------------------------------------------------------
