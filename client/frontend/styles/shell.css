@@ -679,6 +679,14 @@ input[type="range"]:focus-visible::-webkit-slider-thumb {
   background: var(--accent-ghost-bg-hover);
 }
 
+/* Same specificity trap as `.add-room-card[hidden]` above: `.ghost-add-room-row`
+   sets its own `display: flex`, so the `hidden` attribute `shell.js` toggles on
+   `#add-room-btn` (which has this class) is silently overridden without this
+   rule. */
+.ghost-add-room-row[hidden] {
+  display: none;
+}
+
 .ghost-add-room-icon {
   font-size: 16px;
   color: var(--accent);
