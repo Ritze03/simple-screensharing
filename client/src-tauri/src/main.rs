@@ -79,6 +79,7 @@ fn main() {
             commands::transfer_destination,
             commands::edit_destination,
             commands::stop_destination,
+            commands::retry_destination,
             commands::set_bandwidth_mode,
             commands::set_bandwidth_total,
             commands::set_bandwidth_floor,

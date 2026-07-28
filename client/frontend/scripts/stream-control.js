@@ -349,17 +349,20 @@
   }
 
   /** "Retry" action on a Failed destination card's `statusBadge` (see
-   * `components.js`'s `destinationCard`). There's no dedicated
-   * retry-a-failed-destination command in `commands.rs` — the closest real
-   * equivalent is tearing the dead destination down and re-requesting one
-   * for the same capture/room, the same pair `stop_destination`/
-   * `start_destination` already expose for other flows (fan-out uses the
-   * same `start_destination` call). Mock branch mirrors `mockStartStream`'s
-   * starting -> live progression at toy timescales. */
+   * `components.js`'s `destinationCard`). Backed by the dedicated
+   * `retry_destination` command in `commands.rs`, which tears the dead
+   * branch down and brings a fresh one back up in the same room off the
+   * same capture, preserving that destination's own last-configured
+   * bitrate/tune/quality_level/rate_control (see `AppState::
+   * retry_destination`'s `Why:` note) — this used to be a plain
+   * `stop_destination` + `start_destination` pair, which silently reset a
+   * retried destination to default encoder settings and, for a capture's
+   * last destination, could tear the whole capture down instead of just the
+   * failed branch. Mock branch mirrors `mockStartStream`'s starting -> live
+   * progression at toy timescales. */
   async function retryDestination(dest) {
     if (window.__TAURI__) {
-      await window.__TAURI__.core.invoke("stop_destination", { destinationId: dest.destination_id });
-      await window.__TAURI__.core.invoke("start_destination", { captureId: dest.capture_id, roomHandle: dest.room_handle });
+      await window.__TAURI__.core.invoke("retry_destination", { destinationId: dest.destination_id });
       return;
     }
     mockDestinations = mockDestinations.filter((x) => x.destination_id !== dest.destination_id);

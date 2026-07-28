@@ -1217,12 +1217,7 @@ impl AppState {
     /// the Stream Control tab states outright rather than leaving the user to
     /// discover on their uplink.
     pub fn add_destination(&mut self, capture_id: CaptureSourceId, room_handle: RoomHandle, role: PendingRole) {
-        let destination_id = self.alloc_destination_id();
-
         let Some(capture) = self.captures.get(&capture_id) else { return };
-        if capture.kind != StreamKind::Video {
-            return;
-        }
         // Params for the new destination: copy whichever destination this
         // capture already has (its resolution/framerate are already valid for
         // this source), so fanning out doesn't silently reconfigure anything.
@@ -1241,6 +1236,30 @@ impl AppState {
                 quality_level: capture::QualityLevel::default(),
                 rate_control: capture::RateControlMode::default(),
             });
+        self.add_destination_with_params(capture_id, room_handle, role, params);
+    }
+
+    /// The guts of [`Self::add_destination`], taking the new destination's
+    /// encode params explicitly rather than deriving them from a sibling
+    /// destination. Split out for [`Self::retry_destination`], which needs to
+    /// hand in the failed destination's *own* last-known params (its
+    /// bitrate/tune/quality_level/rate_control) instead of the "copy a
+    /// sibling, or fall back to session defaults" rule that's right for a
+    /// genuinely new fan-out but wrong for resurrecting one that already had
+    /// its own tuning — see that method's `Why:` note.
+    fn add_destination_with_params(
+        &mut self,
+        capture_id: CaptureSourceId,
+        room_handle: RoomHandle,
+        role: PendingRole,
+        params: capture::destination::VideoParams,
+    ) {
+        let destination_id = self.alloc_destination_id();
+
+        let Some(capture) = self.captures.get(&capture_id) else { return };
+        if capture.kind != StreamKind::Video {
+            return;
+        }
 
         let Some(room) = self.rooms.get_mut(&room_handle) else { return };
         let stream_id = room.next_stream_id;
@@ -1454,6 +1473,55 @@ impl AppState {
             });
         }
         self.forget_destination(capture_id, destination_id);
+    }
+
+    /// "Retry" clicked on a Failed destination card: tear the dead branch
+    /// down and bring a fresh one right back up in the same room, off the
+    /// same capture — preserving whatever encoder settings
+    /// (bitrate/tune/quality_level/rate_control) this destination had, not
+    /// the capture's/session's defaults.
+    ///
+    /// `Why this doesn't just do `stop_destination` + `add_destination`
+    /// (which is what the front-end used to do by calling the
+    /// `stop_destination`/`start_destination` commands back to back):` two
+    /// problems with that pair. First, params: `add_destination` derives a
+    /// *new* destination's params from a sibling destination still on the
+    /// capture, or the session defaults if there is none — for the common
+    /// case of a capture with exactly one (now-failed) destination, stopping
+    /// it first leaves no sibling to copy from, so the retried destination
+    /// silently resets to defaults instead of resuming with whatever the
+    /// user had tuned (possibly via `edit_destination`). Second,
+    /// `stop_destination` special-cases a capture's *last* destination by
+    /// stopping the whole capture (see its own doc comment) — correct when
+    /// the user is deliberately stopping their only stream, wrong here: a
+    /// retry means one destination's branch died, not the screen grab
+    /// itself, and tearing the whole capture down (racing whether it is even
+    /// `Active` again by the time the replacement is requested) breaks retry
+    /// for exactly the single-destination case it exists to fix. So this
+    /// reads the failed destination's own `params` before removing it, then
+    /// removes just that one branch (mirroring `stop_destination`'s non-last
+    /// path) and re-adds with those same params via
+    /// `add_destination_with_params`, leaving the capture itself untouched
+    /// throughout.
+    pub fn retry_destination(&mut self, destination_id: DestinationId) {
+        let Some((capture_id, _, dest)) = find_destination(&self.captures, destination_id) else { return };
+        let room_handle = dest.room;
+        let params = dest.params;
+        let role = dest.pending;
+
+        if let Some(capture) = self.captures.get_mut(&capture_id)
+            && let ShareStatus::Active(ShareHandle::Video(handle)) = &mut capture.status
+        {
+            let rx = handle.spawn_remove_destination(DestKey(destination_id.0));
+            tokio::spawn(async move {
+                if let Ok(Err(e)) = rx.await {
+                    tracing::warn!("removing a failed destination during retry did not finish cleanly: {e}");
+                }
+            });
+        }
+        self.forget_destination(capture_id, destination_id);
+
+        self.add_destination_with_params(capture_id, room_handle, role.unwrap_or(PendingRole::FanOut), params);
     }
 
     /// "Apply" clicked on a destination row: hand the edited settings to

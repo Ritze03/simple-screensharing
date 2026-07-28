@@ -301,6 +301,18 @@ pub fn stop_destination(managed: State<'_, Managed>, destination_id: u32) {
     tauri::async_runtime::block_on(async { managed.state.lock().unwrap().stop_destination(DestinationId(destination_id)) });
 }
 
+/// "Retry" clicked on a Failed destination card. A dedicated command rather
+/// than the front-end doing `stop_destination` + `start_destination` back to
+/// back (which is what this used to be): see `AppState::retry_destination`'s
+/// `Why:` note — that pairing both lost the destination's tuned encoder
+/// settings and, for a capture's last destination, could tear down the whole
+/// capture instead of just the one failed branch.
+// See `join_room`'s `Why:` note above — `retry_destination` spawns.
+#[tauri::command]
+pub fn retry_destination(managed: State<'_, Managed>, destination_id: u32) {
+    tauri::async_runtime::block_on(async { managed.state.lock().unwrap().retry_destination(DestinationId(destination_id)) });
+}
+
 #[tauri::command]
 pub fn set_bandwidth_mode(managed: State<'_, Managed>, mode: String) -> Result<(), String> {
     let mode = dto::parse_bandwidth_mode(&mode)?;

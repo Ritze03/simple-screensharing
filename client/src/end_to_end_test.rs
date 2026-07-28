@@ -1585,3 +1585,179 @@ async fn late_watch_after_all_three_tuning_controls_toggled_gets_a_real_keyframe
     );
     eprintln!("[e2e-branch-swap-late] PASS: all {iterations} round(s) got a real keyframe promptly");
 }
+
+/// Reproduces (and proves the fix for) the "retry resets a destination's
+/// encoder tuning" bug at the `AppState` layer, against a real capture
+/// pipeline and a real relay connection: a destination is brought up with
+/// non-default `edit_destination`-style tuning (bitrate/tune/quality_level/
+/// rate_control), `AppState::retry_destination` is called on it (the same
+/// path the "Retry" button on a Failed destination card drives via the
+/// `retry_destination` Tauri command), and the resulting *new* destination
+/// must carry the *same* tuning — not the session's defaults. Also proves
+/// the capture itself survives the retry rather than being torn down, which
+/// is what happened before this fix for a capture's *only* destination (see
+/// `AppState::retry_destination`'s `Why:` note for both bugs this closes).
+///
+/// Drives `AppState` directly (not through `commands.rs`, which needs a live
+/// `tauri::App`) — mirrors how `commands.rs`'s own `_impl`-function tests
+/// exercise `AppState` without one. Bypasses `AppState::start_video_share`
+/// (which only knows how to start from the real interactive portal) and
+/// instead assembles the capture/destination records by hand around a real
+/// `capture::start_sharing_from_test_source` handle, the same seam the other
+/// tests in this file use.
+#[tokio::test]
+#[ignore = "spawns a real relay server child process and real GStreamer capture pipeline; \
+            run explicitly with `cargo test end_to_end_test:: -- --ignored --nocapture`"]
+async fn retry_destination_preserves_prior_encoder_tuning() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    let port = pick_free_udp_port().expect("failed to pick a free UDP port for the test relay");
+    eprintln!("[e2e-retry] starting relay server on 127.0.0.1:{port}");
+    let _server = spawn_relay_server(port).expect("failed to spawn relay server child process");
+
+    let server_addr = format!("127.0.0.1:{port}");
+    let room_id: RoomId = rand::random();
+    let room_key: [u8; 32] = rand::random();
+    let join_string = crate::net::format_join_string(&server_addr, &room_id, &room_key);
+
+    eprintln!("[e2e-retry] connecting sharer");
+    let (client, snapshot, events) = connect_with_retry(&join_string, "sharer")
+        .await
+        .expect("sharer failed to connect to the relay after retries");
+
+    let source_fragment = format!(
+        "videotestsrc is-live=true pattern=smpte \
+         ! video/x-raw,width={WIDTH},height={HEIGHT},framerate=15/1"
+    );
+
+    eprintln!("[e2e-retry] starting real capture pipeline (this destination's own DestKey(0))");
+    let capture_handle = capture::start_sharing_from_test_source(
+        &client,
+        VIDEO_STREAM_ID,
+        2000,
+        15,
+        &source_fragment,
+    )
+    .await
+    .expect("start_sharing_from_test_source failed");
+    let initial_runtime = capture_handle.destination_runtime(capture::DestKey(0));
+
+    let mut state = crate::session::AppState::default();
+    let room_handle = state.insert_room(client, snapshot, events, join_string);
+
+    let capture_id = state.alloc_capture_id();
+    let destination_id = state.alloc_destination_id();
+    assert_eq!(
+        destination_id.0, 0,
+        "must line up with start_sharing_from_test_source's hardcoded DestKey(0)"
+    );
+
+    // Non-default tuning: what a user would have set via `edit_destination`
+    // (low-latency's the default; best-quality/quality/adaptive are not)
+    // before this destination later failed and got retried.
+    let tuned_params = VideoParams {
+        width: 0,
+        height: 0,
+        framerate: 15,
+        bitrate_kbps: 777,
+        backend: capture::EncoderBackend::default(),
+        tune: capture::TuneMode::BestQuality,
+        quality_level: capture::QualityLevel::Quality,
+        rate_control: capture::RateControlMode::Adaptive,
+    };
+
+    {
+        let room = state.rooms.get_mut(&room_handle).expect("room was just inserted");
+        room.next_stream_id = 1;
+        room.destinations.push(destination_id);
+    }
+    state.captures.insert(
+        capture_id,
+        crate::session::LocalCapture {
+            kind: crate::protocol::StreamKind::Video,
+            label: "Screen share".to_string(),
+            status: crate::session::ShareStatus::Active(crate::session::ShareHandle::Video(capture_handle)),
+            destinations: indexmap::IndexMap::from([(
+                destination_id,
+                crate::session::Destination {
+                    room: room_handle,
+                    stream_id: 0,
+                    params: tuned_params,
+                    runtime: initial_runtime,
+                    pending: None,
+                    edit: crate::session::Destination::edit_from(tuned_params),
+                    apply_rx: None,
+                },
+            )]),
+            self_preview_texture: None,
+        },
+    );
+
+    eprintln!("[e2e-retry] retrying the (still-live) destination via AppState::retry_destination");
+    state.retry_destination(destination_id);
+
+    // The old destination_id is gone immediately...
+    assert!(
+        crate::session::find_destination(&state.captures, destination_id).is_none(),
+        "the retried destination_id should no longer resolve"
+    );
+
+    // ...replaced by a new destination, still in the same room, off the same
+    // capture, that AppState considers "pending" until the new branch's
+    // spawned task confirms it. Poll until it resolves (or time out) —
+    // mirrors `ui.rs`'s own per-frame `poll_pending_destinations` call.
+    let new_id = {
+        let capture = state.captures.get(&capture_id).expect("capture must still exist after retry");
+        assert_eq!(capture.destinations.len(), 1, "retry should leave exactly one destination on this capture");
+        *capture.destinations.keys().next().expect("just asserted len == 1")
+    };
+    assert_ne!(new_id, destination_id, "retry must allocate a fresh destination id, not reuse the old one");
+
+    let resolved = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            state.poll_pending_destinations();
+            let pending = state
+                .captures
+                .get(&capture_id)
+                .and_then(|c| c.destinations.get(&new_id))
+                .map(|d| d.pending);
+            match pending {
+                Some(None) => return true,
+                Some(Some(_)) => tokio::time::sleep(Duration::from_millis(50)).await,
+                None => return false,
+            }
+        }
+    })
+    .await;
+    assert_eq!(resolved, Ok(true), "the retried destination's replacement branch never came up");
+
+    let capture = state.captures.get(&capture_id).expect("capture must still exist");
+    assert!(
+        matches!(capture.status, crate::session::ShareStatus::Active(_)),
+        "BUG: retrying a capture's only destination must not tear the whole capture down \
+         (that made retry silently fail for the single-destination case)"
+    );
+    let new_dest = capture.destinations.get(&new_id).expect("resolved above");
+    assert_eq!(new_dest.room, room_handle);
+    assert_eq!(
+        new_dest.params.bitrate_kbps, 777,
+        "BUG REPRODUCED: retry reset the bitrate instead of preserving it"
+    );
+    assert_eq!(
+        new_dest.params.tune,
+        capture::TuneMode::BestQuality,
+        "BUG REPRODUCED: retry reset tune to the default instead of preserving it"
+    );
+    assert_eq!(
+        new_dest.params.quality_level,
+        capture::QualityLevel::Quality,
+        "BUG REPRODUCED: retry reset quality_level to the default instead of preserving it"
+    );
+    assert_eq!(
+        new_dest.params.rate_control,
+        capture::RateControlMode::Adaptive,
+        "BUG REPRODUCED: retry reset rate_control to the default instead of preserving it"
+    );
+
+    eprintln!("[e2e-retry] PASS: retried destination {new_id:?} preserved bitrate/tune/quality_level/rate_control");
+}
