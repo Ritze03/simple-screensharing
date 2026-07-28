@@ -358,10 +358,15 @@
    *   frontend-only `room_label` (looked up by `room_handle`), `pendingRoleText`
    *   (derived from `pending`) and `computedShareKbps` (Absolute-mode allocator
    *   display, not part of any DTO).
-   * @param {object} handlers - { onEditApply(destinationId, {bitrateKbps}), onTransfer(destinationId, roomHandle),
+   * @param {object} handlers - { onEditApply(destinationId, {bitrateKbps, tune,
+   *   qualityLevel, rateControl}), onTransfer(destinationId, roomHandle),
    *   onFanout(captureId, roomHandle), onStop(destinationId) }
    * @param {object} [opts] - { roomOptions: [{id,name}], perStreamBitrateEditable: bool,
-   *   roomsAlreadyFedByCapture: number[] }
+   *   roomsAlreadyFedByCapture: number[], editState: {tune, qualityLevel, rateControl,
+   *   error} } — `editState` is this destination's local edit buffer for the three
+   *   testing-oriented encoder tuning knobs (kept by the caller, since
+   *   `DestinationRow` has no fields to read the server's current values back
+   *   from — same write-only limitation the Bitrate slider already has).
    */
   function destinationCard(dest, handlers, opts) {
     handlers = handlers || {};
@@ -424,6 +429,63 @@
       editRow.appendChild(slider);
       editRow.appendChild(value);
       wrap.appendChild(editRow);
+
+      // Three testing-oriented encoder tuning knobs (`edit_destination`'s
+      // `tune`/`quality_level`/`rate_control`) — same `pillSwitch` widget as
+      // the Absolute/Per-Stream bandwidth-mode toggle, one row each since a
+      // three-way row (Rate Control) wouldn't fit next to a two-way one
+      // cleanly. Each button click applies immediately, matching the
+      // Bitrate slider's auto-apply-on-change behavior above (there's no
+      // separate combined "Apply" action in this panel).
+      const editState = opts.editState || { tune: "low_latency", qualityLevel: "performance", rateControl: "constant" };
+      const applyTuning = (patch) => handlers.onEditApply && handlers.onEditApply(dest.destination_id, patch);
+
+      const tuneRow = el("div", { className: "dest-edit-row" });
+      tuneRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Tune" }));
+      tuneRow.appendChild(
+        pillSwitch(
+          [
+            { value: "low_latency", label: "Low Latency" },
+            { value: "best_quality", label: "Best Quality" },
+          ],
+          editState.tune,
+          (value) => applyTuning({ tune: value })
+        )
+      );
+      wrap.appendChild(tuneRow);
+
+      const qualityRow = el("div", { className: "dest-edit-row" });
+      qualityRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Quality Level" }));
+      qualityRow.appendChild(
+        pillSwitch(
+          [
+            { value: "performance", label: "Performance" },
+            { value: "quality", label: "Quality" },
+          ],
+          editState.qualityLevel,
+          (value) => applyTuning({ qualityLevel: value })
+        )
+      );
+      wrap.appendChild(qualityRow);
+
+      const rateControlRow = el("div", { className: "dest-edit-row" });
+      rateControlRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Rate Control" }));
+      rateControlRow.appendChild(
+        pillSwitch(
+          [
+            { value: "constant", label: "Constant" },
+            { value: "adaptive", label: "Adaptive" },
+            { value: "quality", label: "Quality" },
+          ],
+          editState.rateControl,
+          (value) => applyTuning({ rateControl: value })
+        )
+      );
+      wrap.appendChild(rateControlRow);
+
+      if (editState.error) {
+        wrap.appendChild(el("div", { className: "dest-edit-error", text: editState.error }));
+      }
     } else if (dest.computedShareKbps !== undefined) {
       wrap.appendChild(el("div", { className: "dest-computed-share", text: `Allocated: ${dest.computedShareKbps} kbps` }));
     }

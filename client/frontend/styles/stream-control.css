@@ -199,6 +199,11 @@
   text-align: right;
 }
 
+.dest-edit-error {
+  color: var(--danger);
+  font-size: 11px;
+}
+
 .dest-actions {
   display: flex;
   flex-wrap: wrap;

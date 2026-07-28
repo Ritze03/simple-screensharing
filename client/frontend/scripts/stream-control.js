@@ -268,21 +268,44 @@
   }
 
   async function applyDestinationEdit(destinationId, patch) {
+    const dest = mockDestinations.find((d) => d.destination_id === destinationId);
+    // `edit_destination` takes a full edit (scale/framerate/bitrate/tune/
+    // quality_level/rate_control), not a sparse patch, but every control in
+    // this panel (the bitrate slider, and the three tune/quality/rate-control
+    // toggles below it) applies on its own change/click — so `patch` here is
+    // only ever the one field that just changed. Merge it onto the tracked
+    // edit buffer and send the *whole* buffer every time, same way the old
+    // scale/framerate hardcoding already did for the fields this tab doesn't
+    // expose a control for.
+    const edit = dest ? getDestEdit(dest) : Object.assign({ bitrateKbps: 3000, tune: "low_latency", qualityLevel: "performance", rateControl: "constant", error: null }, patch);
+    Object.assign(edit, patch);
+    if (dest) destEditState.set(destinationId, edit);
+
     if (window.__TAURI__) {
-      const dest = mockDestinations.find((d) => d.destination_id === destinationId);
-      // `edit_destination` takes a full edit (scale/framerate/bitrate), not a
-      // sparse patch — this tab only offers a bitrate slider, so scale stays
-      // at 100% and framerate stays whatever the destination already has.
-      await window.__TAURI__.core.invoke("edit_destination", {
-        destinationId,
-        scalePercent: 100,
-        framerate: dest ? dest.framerate : 30,
-        bitrateKbps: patch.bitrateKbps,
-      });
+      try {
+        await window.__TAURI__.core.invoke("edit_destination", {
+          destinationId,
+          scalePercent: 100,
+          framerate: dest ? dest.framerate : 30,
+          bitrateKbps: edit.bitrateKbps,
+          tune: edit.tune,
+          qualityLevel: edit.qualityLevel,
+          rateControl: edit.rateControl,
+        });
+        edit.error = null;
+      } catch (e) {
+        // Invalid enum strings can't happen from this UI (the toggles only
+        // ever send the three known values each), but a `BranchSwap` can
+        // still legitimately fail server-side (e.g. the new encoder config
+        // rejected by the backend) — surface it on the card rather than
+        // swallowing it, same pattern as the "Start a Stream" form's
+        // `state.startError`.
+        edit.error = String(e);
+      }
+      render();
       return;
     }
-    const d = mockDestinations.find((x) => x.destination_id === destinationId);
-    if (d) Object.assign(d, { bitrate_kbps: patch.bitrateKbps });
+    if (dest) Object.assign(dest, { bitrate_kbps: edit.bitrateKbps });
     render();
   }
 
@@ -428,6 +451,22 @@
   let activeSharesGridEl = null;
   let activeSharesBodySig = null;
   const destCardEls = new Map(); // destination_id -> { el, sig }
+  // destination_id -> { bitrateKbps, tune, qualityLevel, rateControl, error }.
+  // Local edit buffer for `edit_destination`'s fields — write-only, same as
+  // the rest of this panel: `DestinationRow` doesn't expose the server's
+  // current tune/quality_level/rate_control, so there's nothing to read back
+  // and reconcile against. Defaults mirror `capture::TuneMode`/`QualityLevel`/
+  // `RateControlMode`'s `Default` impls (low_latency/performance/constant).
+  const destEditState = new Map();
+
+  function getDestEdit(dest) {
+    let s = destEditState.get(dest.destination_id);
+    if (!s) {
+      s = { bitrateKbps: dest.bitrate_kbps, tune: "low_latency", qualityLevel: "performance", rateControl: "constant", error: null };
+      destEditState.set(dest.destination_id, s);
+    }
+    return s;
+  }
   let startCardEl = null;
   let startCardSig = null;
   let roomScopedEl = null;
@@ -571,7 +610,8 @@
           ? Object.assign({}, dest, { computedShareKbps: alloc.share })
           : dest;
       const perStreamBitrateEditable = bandwidth.bandwidth_mode === "per_stream" && dest.kind !== "audio";
-      const sig = JSON.stringify({ withShare, perStreamBitrateEditable, roomOptions: mockJoinedRooms, roomsAlreadyFedByCapture });
+      const editState = perStreamBitrateEditable ? getDestEdit(dest) : null;
+      const sig = JSON.stringify({ withShare, perStreamBitrateEditable, editState, roomOptions: mockJoinedRooms, roomsAlreadyFedByCapture });
 
       let entry = destCardEls.get(dest.destination_id);
       if (!entry || entry.sig !== sig) {
@@ -584,7 +624,7 @@
               onFanout: (captureId, targetRoomHandle) => fanoutDestination(captureId, targetRoomHandle),
               onStop: (id) => stopDestination(id),
             },
-            { roomOptions: mockJoinedRooms, perStreamBitrateEditable, roomsAlreadyFedByCapture }
+            { roomOptions: mockJoinedRooms, perStreamBitrateEditable, roomsAlreadyFedByCapture, editState }
           ),
           sig,
         };
