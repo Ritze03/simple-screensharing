@@ -344,6 +344,68 @@
   font-size: 11px;
 }
 
+/* Advanced tuning disclosure — collapses the three testing-oriented
+   Tune/Quality Level/Rate Control switches (see `components.js`'s
+   `destinationCard`) behind a native `<details>`, so the simple preset +
+   bitrate controls above stay the only thing a regular user sees by
+   default. One `<details>` per destination card, so each card's
+   open/closed state is independent (native browser behavior — no JS). */
+.dest-advanced {
+  margin-top: 2px;
+}
+
+.dest-advanced-summary {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-faint);
+  cursor: pointer;
+  user-select: none;
+  list-style: none; /* hide the default marker triangle, replaced below */
+  width: fit-content;
+}
+
+.dest-advanced-summary::-webkit-details-marker {
+  display: none;
+}
+
+/* Chevron affordance — a plain CSS border-triangle (rotated 90deg when
+   `[open]`), not a Material Symbols glyph: `components.js`'s `el()`/`icon()`
+   helpers build a `<span>` icon, which can't live inside a `<summary>`'s
+   flow the way this small triangle can with zero extra DOM nodes. */
+.dest-advanced-summary::before {
+  content: "";
+  width: 0;
+  height: 0;
+  border-style: solid;
+  border-width: 3.5px 0 3.5px 5px;
+  border-color: transparent transparent transparent var(--text-faint);
+  transition: transform 0.12s ease;
+  flex: 0 0 auto;
+}
+
+.dest-advanced[open] > .dest-advanced-summary::before {
+  transform: rotate(90deg);
+}
+
+.dest-advanced-summary:hover {
+  color: var(--text-dim);
+}
+
+.dest-advanced-summary:hover::before {
+  border-left-color: var(--text-dim);
+}
+
+.dest-advanced-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-light);
+}
+
 .dest-actions {
   display: flex;
   flex-wrap: wrap;
