@@ -13,7 +13,7 @@
 (function () {
   "use strict";
 
-  const { el, card, pillSwitch } = window.Components;
+  const { el, card, pillSwitch, attachWheelStep } = window.Components;
 
   const MOCK_SETTINGS = { language: "en", presentation_mode: "auto_vsync", max_jitter_buffer_ms: 2000 };
 
@@ -129,6 +129,7 @@
       jitterValue.textContent = `${(Number(jitterSlider.value) / 1000).toFixed(1)}s`;
     });
     jitterSlider.addEventListener("change", () => setMaxJitterBufferMs(Number(jitterSlider.value)));
+    attachWheelStep(jitterSlider);
 
     const jitterRow = el("div", { className: "settings-row" }, [
       el("span", { className: "settings-row-label", text: "Max jitter buffer" }),
