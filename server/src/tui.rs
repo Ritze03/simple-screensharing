@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -677,7 +677,15 @@ fn draw_network_graph(frame: &mut Frame, area: Rect, app: &App) {
         .y_axis(
             Axis::default()
                 .bounds([0.0, y_max])
-                .labels([fmt_rate(0.0), fmt_rate(y_max)]),
+                .labels([fmt_rate(0.0), fmt_rate(y_max)])
+                // Each label renders left-aligned in its own fixed-width
+                // gutter by default, so "0.0 B/s" and (e.g.) "12.3 MB/s"
+                // land ragged against the chart's left border as their
+                // digit-count changes. Right-aligning flushes both to the
+                // border consistently — same intent as right_pad_column,
+                // but via ratatui's native per-axis alignment knob since
+                // Axis labels aren't raw strings we can pre-pad ourselves.
+                .labels_alignment(Alignment::Right),
         );
     frame.render_widget(chart, area);
 }
@@ -824,7 +832,12 @@ fn draw_room_detail(frame: &mut Frame, area: Rect, app: &App, snap: &Snapshot) {
                 Cell::from(s.stream_id.to_string()),
                 Cell::from(s.label.clone()),
                 Cell::from(s.subscriber_count.to_string()),
-                Cell::from(fmt_rate(rate)),
+                // Right-align within the fixed-width "Rate" column so the
+                // unit suffix lines up across rows of differing magnitude
+                // (e.g. "4.9 MB/s" vs "12.3 MB/s") — same intent as
+                // right_pad_column, expressed via Text::alignment since a
+                // Table column already reserves fixed cell width.
+                Cell::from(Line::from(fmt_rate(rate)).alignment(Alignment::Right)),
             ])
         })
         .collect();
