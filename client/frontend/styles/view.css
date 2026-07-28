@@ -10,12 +10,23 @@
  * capture…" placeholder state; see `superdoc/ui/APP-SHELL.md`'s update for
  * the `Why:` note on that simplification.
  *
- * Grid sizing: `.view-grid`'s column count is NOT auto-fit/reflow anymore —
- * `view.js`'s `render()` computes `ceil(sqrt(n))` (n = tiles currently
- * shown, including held-slot placeholders so the grid never reshuffles just
- * because a tile popped out) and writes it to `--grid-cols` as an inline
- * style, per 1e's "computed square-ish grid" spec. This file only owns the
- * `repeat(var(--grid-cols), 1fr)` consumption of that variable.
+ * Grid sizing (2026-07-28 — dynamic layout, see `superdoc/features/
+ * viewer-window.md`'s matching dated entry for the `Why:`): `.view-grid`'s
+ * shape is NOT a fixed `ceil(sqrt(n))` "square-ish grid" anymore.
+ * `view.js`'s `computeGridShape` measures the real available area
+ * (`applyGridLayout`, recomputed on tile-count change and on a debounced
+ * resize of `#view-root`) and searches every `rows x cols` split of n tiles
+ * (n includes held-slot placeholders so the grid never reshuffles just
+ * because a tile popped out) for the one that maximizes total displayed
+ * 16:9 video area, writing `--grid-cols`/`--grid-rows` (the shape) and
+ * `--tile-w`/`--tile-h` (that shape's per-tile pixel size, already
+ * aspect-correct) as inline styles. This file only owns consuming those
+ * four variables: explicit pixel track sizes rather than `1fr` mean each
+ * `.media-tile`'s own `aspect-ratio: 16/9` (below) is automatically
+ * satisfied by its grid cell — no change needed to the tile itself — and
+ * `justify-content`/`align-content: center` letterbox/pillarbox the grid
+ * *as a whole* within `.view-grid`'s box when the chosen shape doesn't
+ * exactly fill it.
  */
 
 .view-header {
@@ -77,7 +88,10 @@
 
 .view-grid {
   display: grid;
-  grid-template-columns: repeat(var(--grid-cols, 1), 1fr);
+  grid-template-columns: repeat(var(--grid-cols, 1), var(--tile-w, 1fr));
+  grid-template-rows: repeat(var(--grid-rows, 1), var(--tile-h, auto));
+  justify-content: center;
+  align-content: center;
   gap: 12px;
 }
 
