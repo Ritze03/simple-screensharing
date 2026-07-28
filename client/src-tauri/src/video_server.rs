@@ -73,10 +73,18 @@
 //! section below for why it's delivered this way (in-band, not a REST
 //! field).
 //!
-//! VideoFrame chunks carry raw access units exactly as received — no
-//! keyframe-gating happens in this module (a watcher connecting mid-stream
-//! gets whatever the producer next publishes, keyframe or not; the
-//! `keyframe` flag is purely informational for the consumer). Whether a
+//! VideoFrame chunks carry raw access units exactly as received, with one
+//! exception: `handle_connection`'s relay loop withholds every VideoFrame
+//! chunk from a given connection until it has a keyframe to send as that
+//! connection's *first* one (re-armed on a mid-connection CodecInfo change —
+//! see `handle_connection`'s `has_relayed_keyframe` doc comment). A watcher
+//! started via a fresh `toggle_watch` gets this satisfied almost
+//! immediately by the sender-side mechanism described below; a second,
+//! later connection to an *already-flowing* route (no new `toggle_watch`,
+//! e.g. the standalone viewer window resolving a stream the main window is
+//! already watching via `stream_video_url`) has no such forced keyframe and
+//! instead waits out whatever is left of `capture.rs`'s periodic
+//! `GOP_SECONDS` cycle — see `handle_connection`. Whether a
 //! freshly-subscribing watcher's *sender* actually re-sends a keyframe
 //! promptly was suspected to be a separate, pre-existing bug this module
 //! doesn't own — a follow-up investigation confirmed it does **not**
@@ -87,9 +95,10 @@
 //! `xdg-desktop-portal` capture, and small and large keyframes — locked in
 //! as permanent regression coverage by
 //! `late_subscriber_after_unwatched_period_gets_a_real_keyframe` and its
-//! `_real_portal` variant in `src/end_to_end_test.rs`. This relay just
-//! forwards whatever `session.rs` hands it and correctly marks whatever NAL
-//! types arrive.
+//! `_real_portal` variant in `src/end_to_end_test.rs`. That mechanism only
+//! fires on a genuine subscribe, though — not on a second connection to a
+//! route already flowing — which is exactly the gap this module's own
+//! keyframe gate closes.
 //!
 //! # Codec-string discovery: in-band, not a REST field
 //!
