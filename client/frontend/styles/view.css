@@ -95,6 +95,16 @@
   gap: 12px;
 }
 
+/* Defense-in-depth (2026-07-28, see `superdoc/features/viewer-window.md`'s
+ * follow-up entry on the tile-overflow bug this was found alongside): no
+ * `overflow` rule needed here specifically — `.content` (shell.css) already
+ * sits between this grid and the viewport with `overflow: auto`, so even if
+ * `applyGridLayout`'s measurement is ever wrong again, the failure mode is a
+ * scrollbar on `.content`, not tiles silently clipped or spilling past the
+ * window with no way to reach them. The real fix for the actual bug found
+ * here was in `view.js`'s `applyGridLayout` (a missing-height measurement
+ * bug), not this file. */
+
 /* THE MISSING TILE BORDER (owner review: "I'm missing some ... borders on
    the stream").
  *
