@@ -339,7 +339,7 @@
       return;
     }
 
-    const hasStake = room.active_stream_count > 0 || (room.members || []).some((m) => m.watching);
+    const hasStake = myStreamCountForRoom(room) > 0 || (room.members || []).some((m) => m.watching);
     if (room.state === "joined" && hasStake) {
       state.pendingLeaveRoomId = joinString;
       renderLeaveModal();
@@ -413,7 +413,12 @@
     }
 
     const watchingCount = (room.members || []).filter((m) => m.watching).length;
-    const sendingCount = room.active_stream_count || 0;
+    // Bug: this used to read `room.active_stream_count`, which is the ROOM's
+    // count of *other* members' streams (see `myStreamCountForRoom`'s doc
+    // comment) — a pure watcher sending nothing themselves could still see
+    // "you're sending N streams" here whenever anyone else in the room was
+    // sharing. Use the current user's own outgoing-destination count instead.
+    const sendingCount = myStreamCountForRoom(room);
 
     const modal = el("div", { className: "modal leave-modal" });
 
@@ -539,6 +544,28 @@
     setTimeout(finish, 300);
   }
 
+  /** One non-self member row: name + either a watch toggle (they're
+   * sharing) or a "not sharing" status. Factored out of `renderRoomPanel` so
+   * both the mock ("other members") and real (`room_detail`-as-is) branches
+   * render rows identically. */
+  function renderRoomPanelMemberRow(room, m) {
+    const row = el("div", { className: "room-panel-member-row" });
+    row.appendChild(el("span", { className: "room-panel-member-name", text: m.display_name }));
+    if (m.resolution) {
+      // Sharing: a stop-watching/watch icon toggles our own subscription
+      // to their stream, reusing the real `toggle_watch` command.
+      row.appendChild(
+        iconButton(m.watching ? "visibility_off" : "visibility", () => toggleWatch(room.join_string, m), {
+          title: m.watching ? "Stop watching" : "Watch",
+          className: m.watching ? "watch-active" : "",
+        })
+      );
+    } else {
+      row.appendChild(el("span", { className: "room-panel-member-status", text: "not sharing" }));
+    }
+    return row;
+  }
+
   /** Renders the panel's content for `state.activeRoomPanel`. A no-op when
    * the panel is closed — `closeRoomPanel` owns hiding the scrim itself, so
    * this only needs to (re)build content while it's open, called after
@@ -568,8 +595,28 @@
     // fabricate one. Adding that plumbing is backend scope this pass
     // deliberately stays out of (see the task's SCOPE note) — a real gap,
     // not an oversight.
-    const memberCount = (room.members || []).length + 1; // +1 for the local user, who isn't in `members` (see `loadRoomMembers`'s doc comment: it's the *other* members' roster).
-    const sendingCount = room.active_stream_count || 0;
+    // `Why:` `room.members` means two different things depending on branch
+    // — both intentional, not something to unify away here:
+    //  - Real (`window.__TAURI__`): `loadRoomMembers` -> `room_detail` ->
+    //    the relay's `PresenceSnapshot`, which legitimately *includes the
+    //    caller's own connection* (correct, by-design server behavior — see
+    //    `simple-screensharing-server`). This code used to assume `members`
+    //    was "other members only" and add a synthetic self row + `+1` on
+    //    top regardless, which double-counted/duplicated whenever there was
+    //    exactly one real connection (yourself, alone): "2 members" with
+    //    two rows for the same person. `stream-control.js`'s MEMBERS card
+    //    (`renderMembersCard`) never had this bug because it never adds a
+    //    synthetic row on top of `room_detail`'s list — same fix applied
+    //    below.
+    //  - Mock (no Tauri): the hardcoded arrays at the top of this file model
+    //    "other members" only (e.g. `Gaming Night: members: []` means "just
+    //    me, alone" — see this file's own header comment on mock/real
+    //    parity) and were never updated to include a self entry, so the old
+    //    synthetic-"You"-row/`+1` behavior is still correct there.
+    const includesSelf = !!window.__TAURI__;
+    const members = room.members || [];
+    const memberCount = includesSelf ? members.length : members.length + 1;
+    const sendingCount = myStreamCountForRoom(room);
     const metaText = `${memberCount} member${memberCount === 1 ? "" : "s"} · you're sending ${sendingCount} stream${sendingCount === 1 ? "" : "s"} here`;
     header.appendChild(el("div", { className: "room-panel-meta", text: metaText }));
     panel.appendChild(header);
@@ -581,32 +628,32 @@
     membersSection.appendChild(el("div", { className: "room-panel-section-label", text: "Members" }));
     const memberList = el("div", { className: "room-panel-members" });
 
-    // Synthetic "you" row — no DTO exposes the local client's own display
-    // name to the frontend (`dto::SettingsDto` has no such field; see the
-    // task's audit of `commands.rs`/`dto.rs`), so this reads "You" rather
-    // than fabricating a name. A real gap, not a shortcut.
-    const youRow = el("div", { className: "room-panel-member-row room-panel-member-row-you" });
-    youRow.appendChild(el("span", { className: "room-panel-member-name", text: "You" }));
-    youRow.appendChild(el("span", { className: "room-panel-you-badge", text: "YOU" }));
-    memberList.appendChild(youRow);
-
-    (room.members || []).forEach((m) => {
-      const row = el("div", { className: "room-panel-member-row" });
-      row.appendChild(el("span", { className: "room-panel-member-name", text: m.display_name }));
-      if (m.resolution) {
-        // Sharing: a stop-watching/watch icon toggles our own subscription
-        // to their stream, reusing the real `toggle_watch` command.
-        row.appendChild(
-          iconButton(m.watching ? "visibility_off" : "visibility", () => toggleWatch(room.join_string, m), {
-            title: m.watching ? "Stop watching" : "Watch",
-            className: m.watching ? "watch-active" : "",
-          })
-        );
-      } else {
-        row.appendChild(el("span", { className: "room-panel-member-status", text: "not sharing" }));
-      }
-      memberList.appendChild(row);
-    });
+    // No DTO exposes the local client's own `conn_id`/display name to the
+    // frontend (`dto::SettingsDto`/`RoomDetail`/`MemberDto` have no such
+    // field — see `components.js`'s existing note on this same gap), so
+    // there is no general way to pick "which member is me" out of a roster
+    // of 2+ real entries. `stream-control.js`'s `renderMembersCard` avoids
+    // this by never trying: it just renders `room_detail`'s member list
+    // as-is, with no synthetic self row and no self label. Applied here the
+    // same way for the real (`includesSelf`) branch — the one exception is
+    // the single-member case, which is unambiguous without any new
+    // mechanism: a room you're viewing `room_detail` for is always one
+    // you've joined, so if the roster has exactly one entry, that member can
+    // only be you.
+    if (!includesSelf) {
+      const youRow = el("div", { className: "room-panel-member-row room-panel-member-row-you" });
+      youRow.appendChild(el("span", { className: "room-panel-member-name", text: "You" }));
+      youRow.appendChild(el("span", { className: "room-panel-you-badge", text: "YOU" }));
+      memberList.appendChild(youRow);
+      members.forEach((m) => memberList.appendChild(renderRoomPanelMemberRow(room, m)));
+    } else if (members.length === 1) {
+      const youRow = el("div", { className: "room-panel-member-row room-panel-member-row-you" });
+      youRow.appendChild(el("span", { className: "room-panel-member-name", text: "You" }));
+      youRow.appendChild(el("span", { className: "room-panel-you-badge", text: "YOU" }));
+      memberList.appendChild(youRow);
+    } else {
+      members.forEach((m) => memberList.appendChild(renderRoomPanelMemberRow(room, m)));
+    }
     membersSection.appendChild(memberList);
     body.appendChild(membersSection);
 
@@ -859,6 +906,22 @@
   async function refreshStreams() {
     mockStreams = await fetchStreams();
     renderStreams();
+  }
+
+  /** How many streams *the current user* is personally sending into `room`
+   * right now — i.e. this client's own outgoing destinations targeting
+   * `room.room_handle`, not `room.active_stream_count` (which is the
+   * opposite: `RoomSession::active_stream_count` in `src/session.rs`
+   * explicitly *excludes* the caller's own streams — see its doc comment,
+   * "how many *other* people are streaming"). `mockStreams` (kept fresh by
+   * `refreshStreams`/`fetchStreams`, real branch = `list_active_streams`) is
+   * always this client's own destinations — a destination is only ever
+   * created locally — so filtering it by `room_handle` is the correct,
+   * already-existing source for "am I sending here", reused rather than
+   * inventing a new one. */
+  function myStreamCountForRoom(room) {
+    if (!room || room.room_handle == null) return 0;
+    return mockStreams.filter((s) => s.room_handle === room.room_handle).length;
   }
 
   async function refreshAll() {
