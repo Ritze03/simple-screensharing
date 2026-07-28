@@ -264,14 +264,20 @@
   /* -------------------------------------------------------------------
    * Fonts.
    *
-   * Geist Mono + Material Symbols Outlined are vendored locally (see
-   * frontend/fonts/) rather than pulled from the Google Fonts CDN, so the
-   * shell renders correctly offline and under a CSP-locked Tauri webview.
-   * Only the Regular (400) weight is vendored; bold text falls back to the
-   * browser's synthetic bold (see fonts.css for the full rationale). Falls
-   * back to a system monospace stack if the font fails to load for any
-   * reason.
+   * Geist (sans, Regular + Bold) + Geist Mono (Regular only) + Material
+   * Symbols Outlined are vendored locally (see frontend/fonts/) rather than
+   * pulled from the Google Fonts CDN, so the shell renders correctly
+   * offline and under a CSP-locked Tauri webview. Geist Mono only vendors
+   * the Regular (400) weight; bold mono text falls back to the browser's
+   * synthetic bold (see fonts.css for the full rationale). Falls back to a
+   * system sans/monospace stack if the font fails to load for any reason.
+   *
+   * --font-sans is the app default (body text, labels, titles); --font-mono
+   * is reserved for "value" text — numeric/tabular readouts (resolution,
+   * fps, bitrate, timers, IDs, join-link strings, …) that change at runtime
+   * and would visually shift with a proportional font.
    * ----------------------------------------------------------------- */
+  --font-sans: "Geist", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "Geist Mono", ui-monospace, "JetBrains Mono", "Cascadia Code", Consolas, monospace;
   --font-icons: "Material Symbols Outlined";
 

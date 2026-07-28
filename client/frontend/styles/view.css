@@ -308,6 +308,7 @@
 }
 
 .media-tile-fps {
+  font-family: var(--font-mono);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
   color: rgba(232, 233, 236, 0.85);

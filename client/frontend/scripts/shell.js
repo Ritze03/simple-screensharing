@@ -355,7 +355,7 @@
    * `renderAddRoomCard`'s own Join button so the two entry points can't
    * drift into two slightly different validation/error paths. */
   function renderRoomsEmptyState() {
-    const linkInput = el("input", { className: "field-input", attrs: { type: "text", placeholder: "server | room-id | key" } });
+    const linkInput = el("input", { className: "field-input field-input-mono", attrs: { type: "text", placeholder: "server | room-id | key" } });
     const errorText = el("div", { className: "add-room-error", text: "" });
     errorText.hidden = true;
     const inline = el("div", { className: "empty-state-inline" }, [linkInput, errorText]);
@@ -1195,7 +1195,7 @@
     card.appendChild(roomNameInput);
 
     card.appendChild(el("label", { className: "field-label", text: "Join link" }));
-    const linkInput = el("input", { className: "field-input", attrs: { type: "text" } });
+    const linkInput = el("input", { className: "field-input field-input-mono", attrs: { type: "text" } });
     card.appendChild(linkInput);
 
     card.appendChild(errorText);
