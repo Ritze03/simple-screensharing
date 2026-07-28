@@ -62,6 +62,52 @@
   // visible pacing jump in the playout schedule.
   const MAX_BUFFER_EASE_STEP_MS = 20;
 
+  // --- Sustained-overload catch-up (decode-queue-depth backstop) ---
+  //
+  // `Why this exists, and why it lives here and not in `decode.rs`:` the
+  // jitter buffer above schedules each chunk's `decoder.decode()` call
+  // strictly against a real-time/pts schedule — it never checks whether the
+  // *decoder itself* is keeping up. If the sender's sustained output rate
+  // structurally exceeds what this browser's `VideoDecoder` can sustain
+  // (e.g. a 280fps-equivalent sender against a viewer that only decodes
+  // ~240fps-equivalent), every chunk still gets `decode()`d, right on
+  // schedule — but the decoder's own internal queue (`decodeQueueSize`,
+  // invisible to anything upstream of this callback) backs up more with
+  // every chunk handed to it than it drains, so `decoder.output` (and
+  // therefore the canvas paint) fires later and later relative to real
+  // elapsed time, forever. This is the browser-side twin of the mismatch
+  // `decode.rs`'s module doc describes for the (now-dead, GStreamer/egui)
+  // desktop decode path — same underlying DDA/rate problem — but that
+  // fix cannot be ported over unmodified: `PacingState` only ever skips
+  // *writing a decoded frame to the display sink*, never skips decoding it,
+  // because GStreamer's `avdec_h264` pipeline decodes every frame it's fed
+  // regardless of pacing. `VideoDecoder.decode()` here is exactly the
+  // resource under contention, so the fix has to reduce how much gets
+  // *decoded*, not just how much gets *displayed*.
+  //
+  // Naively dropping an individual queued delta chunk instead of decoding
+  // it is unsafe: H.264 delta frames reference earlier frames in decode
+  // order, so skipping one frame's `decode()` call corrupts every later
+  // delta frame that depended on it — which surfaces as a fatal
+  // `VideoDecoder` `error` (see the `error` callback below), which
+  // `stopController`s the whole tile. That is far worse than the drift
+  // this exists to fix. The one drop that *is* always safe is a **run of
+  // consecutive chunks up to (not including) the next keyframe still
+  // sitting in `pendingChunks`**: a keyframe is self-contained by
+  // definition, so resuming decode from it can never reference anything
+  // that was skipped, and every chunk already handed to `decoder.decode()`
+  // before this check runs is untouched either way. Regular encoder GOPs
+  // (`capture.rs`) already emit periodic keyframes independent of this
+  // mechanism, so a fresh one is normally already waiting in the queue or
+  // arrives again shortly — no new keyframe-request plumbing was added for
+  // this fix.
+  //
+  // `decodeQueueSize` beyond this many pending decode requests is treated
+  // as "falling behind, not just momentarily bursty" — chosen as a few
+  // frames' worth of headroom (normal jitter can transiently bump this by
+  // one or two without the decoder genuinely losing ground).
+  const DECODE_QUEUE_CATCHUP_THRESHOLD = 3;
+
   function clamp(value, lo, hi) {
     return Math.max(lo, Math.min(hi, value));
   }
@@ -116,10 +162,44 @@
     controller.scheduleTimeoutId = setTimeout(() => {
       controller.scheduleTimeoutId = null;
       if (controller.stopped) return;
-      controller.pendingChunks.shift();
-      if (decoder.state === "configured") {
+
+      // Sustained-overload catch-up — see the "Sustained-overload
+      // catch-up" block above for why this checks `decodeQueueSize` (a
+      // live decoder-capacity signal) rather than reasoning about pts
+      // deltas the way `decode.rs`'s dead GStreamer-path pacing did, and
+      // why it only ever drops a run up to the next queued keyframe.
+      // Re-checked against `pendingChunks[0]` here (not the `item`
+      // captured above) since this is the only place either is mutated.
+      if (
+        decoder.decodeQueueSize > DECODE_QUEUE_CATCHUP_THRESHOLD &&
+        controller.pendingChunks.length > 0 &&
+        controller.pendingChunks[0].chunk.type !== "key"
+      ) {
+        // Index 0 is confirmed non-key above (a due keyframe is always
+        // worth decoding as-is, never worth delaying for a later one), so
+        // the search starts at 1 and every index in [0, nextKeyIdx) is
+        // guaranteed non-key — safe to drop as one contiguous run.
+        let nextKeyIdx = -1;
+        for (let i = 1; i < controller.pendingChunks.length; i++) {
+          if (controller.pendingChunks[i].chunk.type === "key") {
+            nextKeyIdx = i;
+            break;
+          }
+        }
+        if (nextKeyIdx > 0) {
+          controller.pendingChunks.splice(0, nextKeyIdx);
+          controller.catchUpDroppedFrames = (controller.catchUpDroppedFrames || 0) + nextKeyIdx;
+          console.warn(
+            `[tile-video] ${tile.id}: decoder falling behind (decodeQueueSize=${decoder.decodeQueueSize}), ` +
+              `dropped ${nextKeyIdx} queued delta frame(s) to catch up to the next keyframe`
+          );
+        }
+      }
+
+      const next = controller.pendingChunks.shift();
+      if (next && decoder.state === "configured") {
         try {
-          decoder.decode(item.chunk);
+          decoder.decode(next.chunk);
         } catch (e) {
           // Same reasoning as the pre-buffering `decode()` call site this
           // replaced: a single bad access unit shouldn't kill the whole
