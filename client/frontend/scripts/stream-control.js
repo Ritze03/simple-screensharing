@@ -48,6 +48,9 @@
     emptyRow,
     dropdown,
     attachWheelStep,
+    pillSwitch,
+    ENCODER_PRESETS,
+    activeEncoderPreset,
   } = window.Components;
 
   // ---------------------------------------------------------------------
@@ -400,17 +403,66 @@
     mockFanout(captureId, targetRoomHandle);
   }
 
-  async function startVideoShare(roomHandle, fps, bitrateKbps) {
+  async function startVideoShare(roomHandle, fps, bitrateKbps, tune, qualityLevel, rateControl) {
     if (window.__TAURI__) {
-      // Framerate/bitrate are process-wide settings applied before the share
-      // starts (`start_video_share` itself only takes a room handle — see
-      // this file's header note).
+      // Framerate/bitrate/tune/quality-level/rate-control are all
+      // process-wide settings applied before the share starts
+      // (`start_video_share` itself only takes a room handle — see this
+      // file's header note); `set_tune`/`set_quality_level`/
+      // `set_rate_control` mirror `set_framerate`/`set_bitrate`'s existing
+      // shape rather than `start_video_share` growing three more arguments
+      // or a follow-up `edit_destination` call.
       await window.__TAURI__.core.invoke("set_framerate", { fps });
       await window.__TAURI__.core.invoke("set_bitrate", { kbps: bitrateKbps });
+      await window.__TAURI__.core.invoke("set_tune", { tune });
+      await window.__TAURI__.core.invoke("set_quality_level", { qualityLevel });
+      await window.__TAURI__.core.invoke("set_rate_control", { rateControl });
       await window.__TAURI__.core.invoke("start_video_share", { roomHandle });
       return;
     }
-    mockStartStream(roomHandle, fps, bitrateKbps);
+    mockStartStream(roomHandle, fps, bitrateKbps, tune, qualityLevel, rateControl);
+  }
+
+  /** The "START A STREAM" form's persisted last-used values (`rooms::
+   * AppSettings::start_stream_defaults`), fetched once at `init()` to
+   * pre-fill `state.startForm` instead of the hardcoded fallback above. */
+  async function fetchStartStreamDefaults() {
+    if (window.__TAURI__) {
+      const d = await window.__TAURI__.core.invoke("get_start_stream_defaults");
+      return { fps: d.framerate, bitrateKbps: d.bitrate_kbps, tune: d.tune, qualityLevel: d.quality_level, rateControl: d.rate_control };
+    }
+    return null;
+  }
+
+  /** Persist the "START A STREAM" form's current values — called after every
+   * change to one of its fields (framerate, bitrate, preset, or a raw
+   * Advanced-tuning knob), mirroring `set_bandwidth_total`/`set_bandwidth_
+   * floor`'s save-on-every-change pattern. Deliberately doesn't touch
+   * `roomHandle`: that's a per-launch UI convenience, not a "last used
+   * encoder settings" preference. */
+  async function saveStartFormDefaults() {
+    if (!window.__TAURI__) return;
+    try {
+      await window.__TAURI__.core.invoke("set_start_stream_defaults", {
+        framerate: state.startForm.fps,
+        bitrateKbps: state.startForm.bitrateKbps,
+        tune: state.startForm.tune,
+        qualityLevel: state.startForm.qualityLevel,
+        rateControl: state.startForm.rateControl,
+      });
+    } catch (e) {
+      console.error("failed to save start-stream defaults", e);
+    }
+  }
+
+  /** Merge a patch (from the Preset switch or a raw Advanced-tuning knob)
+   * into `state.startForm`, persist it, and re-render — mirrors
+   * `applyDestinationEdit`'s merge-buffer-then-send shape, but for the form
+   * that hasn't started a share yet rather than an existing destination. */
+  function applyStartFormTuning(patch) {
+    Object.assign(state.startForm, patch);
+    saveStartFormDefaults();
+    render();
   }
 
   /**
@@ -472,7 +524,15 @@
   }
 
   const state = {
-    startForm: { roomHandle: 1, fps: 30, bitrateKbps: 8000 },
+    // `fps`/`bitrateKbps`/`tune`/`qualityLevel`/`rateControl` are overwritten
+    // by `init()` with the persisted "last used" values from
+    // `get_start_stream_defaults` (see `superdoc/features/stream-control.md`'s
+    // 2026-07-28 note) — these are just the pre-Tauri/first-run fallback,
+    // matching `session::DEFAULT_FRAMERATE`/`DEFAULT_BITRATE_KBPS` and
+    // `capture::TuneMode`/`QualityLevel`/`RateControlMode`'s own `#[default]`
+    // variants (`best_quality`/`balanced`/`constant`) exactly, so a fresh
+    // install's form shows the same defaults the backend would apply anyway.
+    startForm: { roomHandle: 1, fps: 30, bitrateKbps: 8000, tune: "best_quality", qualityLevel: "balanced", rateControl: "constant" },
     startInFlight: false,
     startError: null,
   };
@@ -987,6 +1047,27 @@
     roomField.appendChild(roomSelect);
     form.appendChild(roomField);
 
+    // Preset — the same "Low-Latency / Balanced / Quality" pill-switch
+    // `destinationCard`'s per-destination edit panel offers for an existing
+    // share (`components.js`'s shared `ENCODER_PRESETS`/`activeEncoderPreset`),
+    // so starting a stream and editing one afterwards offer the identical
+    // set of options rather than the edit panel being strictly richer. See
+    // `superdoc/features/stream-control.md`'s 2026-07-28 note.
+    const presetField = el("div", { className: "sc-start-field" });
+    presetField.appendChild(el("label", { className: "field-label", text: "Preset" }));
+    const activePreset = activeEncoderPreset(state.startForm.tune, state.startForm.qualityLevel, state.startForm.rateControl);
+    presetField.appendChild(
+      pillSwitch(
+        ENCODER_PRESETS.map((p) => ({ value: p.value, label: p.label })),
+        activePreset ? activePreset.value : null,
+        (value) => {
+          const preset = ENCODER_PRESETS.find((p) => p.value === value);
+          if (preset) applyStartFormTuning({ tune: preset.tune, qualityLevel: preset.qualityLevel, rateControl: preset.rateControl });
+        }
+      )
+    );
+    form.appendChild(presetField);
+
     const fpsField = el("div", { className: "sc-start-field" });
     fpsField.appendChild(el("label", { className: "field-label", text: "Framerate" }));
     // 90/120/144/165/240 match real monitor refresh rates; 280 exceeds both
@@ -999,7 +1080,7 @@
     const fpsSelect = dropdown(
       [15, 30, 60, 90, 120, 144, 165, 240, 280].map((fps) => ({ value: String(fps), label: fps + " fps" })),
       String(state.startForm.fps),
-      (value) => (state.startForm.fps = Number(value))
+      (value) => applyStartFormTuning({ fps: Number(value) })
     );
     fpsField.appendChild(fpsSelect);
     form.appendChild(fpsField);
@@ -1013,10 +1094,73 @@
       const bitrateInput = el("input", {
         attrs: { type: "number", min: "200", max: "40000", step: "100", value: String(state.startForm.bitrateKbps) },
       });
-      bitrateInput.addEventListener("change", () => (state.startForm.bitrateKbps = Number(bitrateInput.value) || 200));
+      bitrateInput.addEventListener("change", () => applyStartFormTuning({ bitrateKbps: Number(bitrateInput.value) || 200 }));
       bitrateField.appendChild(bitrateInput);
       form.appendChild(bitrateField);
     }
+
+    // Advanced tuning — the raw Tune/Quality Level/Rate Control knobs behind
+    // a native `<details>` disclosure, same widget and same collapsed-by-
+    // default convention as `destinationCard`'s Advanced section (see that
+    // function's own doc comment on why `<details>` and why the caller has
+    // to thread the open/closed state back in across a rebuild).
+    const priorAdvancedEl = startCardEl ? startCardEl.querySelector(".dest-advanced") : null;
+    const advancedOpen = priorAdvancedEl ? priorAdvancedEl.open : false;
+    const advanced = el("details", { className: "dest-advanced", attrs: advancedOpen ? { open: "" } : {} });
+    advanced.appendChild(el("summary", { className: "dest-advanced-summary", text: "Advanced tuning" }));
+    const advancedBody = el("div", { className: "dest-advanced-body" });
+    const advancedGrid = el("div", { className: "dest-edit-grid dest-edit-grid-nested" });
+
+    const tuneRow = el("div", { className: "dest-edit-row" });
+    tuneRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Tune" }));
+    tuneRow.appendChild(
+      pillSwitch(
+        [
+          { value: "low_latency", label: "Low Latency" },
+          { value: "best_quality", label: "Best Quality" },
+        ],
+        state.startForm.tune,
+        (value) => applyStartFormTuning({ tune: value })
+      )
+    );
+    tuneRow.appendChild(el("span"));
+    advancedGrid.appendChild(tuneRow);
+
+    const qualityRow = el("div", { className: "dest-edit-row" });
+    qualityRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Quality Level" }));
+    qualityRow.appendChild(
+      pillSwitch(
+        [
+          { value: "performance", label: "Performance" },
+          { value: "balanced", label: "Balanced" },
+          { value: "quality", label: "Quality" },
+        ],
+        state.startForm.qualityLevel,
+        (value) => applyStartFormTuning({ qualityLevel: value })
+      )
+    );
+    qualityRow.appendChild(el("span"));
+    advancedGrid.appendChild(qualityRow);
+
+    const rateControlRow = el("div", { className: "dest-edit-row" });
+    rateControlRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Rate Control" }));
+    rateControlRow.appendChild(
+      pillSwitch(
+        [
+          { value: "constant", label: "Constant" },
+          { value: "adaptive", label: "Adaptive" },
+          { value: "quality", label: "Quality" },
+        ],
+        state.startForm.rateControl,
+        (value) => applyStartFormTuning({ rateControl: value })
+      )
+    );
+    rateControlRow.appendChild(el("span"));
+    advancedGrid.appendChild(rateControlRow);
+
+    advancedBody.appendChild(advancedGrid);
+    advanced.appendChild(advancedBody);
+    form.appendChild(advanced);
 
     form.appendChild(
       primaryButton("Share Screen", () => {
@@ -1024,7 +1168,14 @@
         state.startError = null;
         state.startInFlight = true;
         render();
-        startVideoShare(state.startForm.roomHandle, state.startForm.fps, state.startForm.bitrateKbps)
+        startVideoShare(
+          state.startForm.roomHandle,
+          state.startForm.fps,
+          state.startForm.bitrateKbps,
+          state.startForm.tune,
+          state.startForm.qualityLevel,
+          state.startForm.rateControl
+        )
           .catch((e) => {
             state.startError = String(e);
           })
@@ -1041,7 +1192,7 @@
     return card("START A STREAM", [form], { className: "sc-start-stream-card" });
   }
 
-  function mockStartStream(roomHandle, fps, bitrateKbps) {
+  function mockStartStream(roomHandle, fps, bitrateKbps, tune, qualityLevel, rateControl) {
     const room = mockJoinedRooms.find((r) => r.id === roomHandle);
     const newDest = {
       destination_id: destIdSeq,
@@ -1056,6 +1207,13 @@
       bitrate_kbps: bitrateKbps,
       pending: null,
     };
+    // Seed the edit buffer `getDestEdit` would otherwise lazily default to
+    // "best_quality"/"balanced"/"constant" — so the mock destination card's
+    // Preset/Advanced-tuning controls reflect what was actually picked on
+    // the "Start a Stream" form, same as the real Tauri branch does via
+    // `set_tune`/`set_quality_level`/`set_rate_control` before `start_video_
+    // share`.
+    destEditState.set(newDest.destination_id, { bitrateKbps, framerate: fps, tune, qualityLevel, rateControl, error: null });
 
     // Mimics the design handoff's "Waiting for screen-share permission…" ->
     // Starting -> Live progression (shot 09) at toy timescales.
@@ -1080,6 +1238,11 @@
     mockJoinedRooms = await fetchJoinedRooms();
     mockDestinations = await fetchActiveDestinations();
     bandwidth = await fetchBandwidthSettings();
+    // Pre-fill the "Start a Stream" form with the last-used values instead
+    // of the hardcoded fallback `state.startForm` was built with — see
+    // `fetchStartStreamDefaults`'s doc comment.
+    const startDefaults = await fetchStartStreamDefaults();
+    if (startDefaults) Object.assign(state.startForm, startDefaults);
     // `Why audio sources aren't fetched here any more:` nothing renders them
     // until someone opens a share card's "+ Add audio" picker, and that
     // handler re-lists them on open anyway (which applications are producing

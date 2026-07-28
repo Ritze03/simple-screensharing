@@ -14,7 +14,7 @@ use simple_screensharing_client::session::{
     AppState, CaptureSourceId, DestinationId, PendingRole, RoomHandle,
 };
 
-use crate::dto::{self, AudioSourceDto, DestinationRow, RoomDetail, SavedRoomRow, SettingsDto};
+use crate::dto::{self, AudioSourceDto, DestinationRow, RoomDetail, SavedRoomRow, SettingsDto, StartStreamDefaultsDto};
 use crate::state::Managed;
 
 // ---------------------------------------------------------------------
@@ -176,6 +176,45 @@ pub fn set_max_jitter_buffer_ms(managed: State<'_, Managed>, ms: u32) {
     simple_screensharing_client::session::save_max_jitter_buffer_ms(ms);
 }
 
+/// The "START A STREAM" form's persisted last-used values — read once when
+/// the Stream Control tab loads to pre-fill `state.startForm`
+/// (`stream-control.js`) instead of the hardcoded defaults it used to reset
+/// to on every launch. Not `AppState`-backed like `get_settings` (nothing
+/// here has a live/in-session counterpart the way `bitrate_kbps`/
+/// `framerate`/bandwidth mode do — this is purely a saved form default), so
+/// this reads straight from the settings file rather than through
+/// `managed.state`.
+#[tauri::command]
+pub fn get_start_stream_defaults() -> StartStreamDefaultsDto {
+    let d = simple_screensharing_client::rooms::AppSettings::load().start_stream_defaults;
+    StartStreamDefaultsDto {
+        framerate: d.framerate,
+        bitrate_kbps: d.bitrate_kbps,
+        tune: d.tune,
+        quality_level: d.quality_level,
+        rate_control: d.rate_control,
+    }
+}
+
+/// Persist the "START A STREAM" form's current values, called whenever the
+/// user changes a field in that form (mirroring `set_bandwidth_total`/`set_
+/// bandwidth_floor`'s save-on-every-change pattern) — see `session::
+/// save_start_stream_defaults`.
+#[tauri::command]
+pub fn set_start_stream_defaults(
+    framerate: u32,
+    bitrate_kbps: u32,
+    tune: String,
+    quality_level: String,
+    rate_control: String,
+) -> Result<(), String> {
+    let tune = dto::parse_tune_mode(&tune)?;
+    let quality_level = dto::parse_quality_level(&quality_level)?;
+    let rate_control = dto::parse_rate_control_mode(&rate_control)?;
+    simple_screensharing_client::session::save_start_stream_defaults(framerate, bitrate_kbps, tune, quality_level, rate_control);
+    Ok(())
+}
+
 // ---------------------------------------------------------------------
 // Stream Control
 // ---------------------------------------------------------------------
@@ -246,6 +285,32 @@ pub fn set_bitrate(managed: State<'_, Managed>, kbps: u32) {
 #[tauri::command]
 pub fn set_framerate(managed: State<'_, Managed>, fps: u32) {
     managed.state.lock().unwrap().framerate = fps;
+}
+
+/// Process-wide encoder tuning knobs for the *next* video capture started —
+/// same "applied before `start_video_share`, not a per-call argument" shape
+/// as `set_bitrate`/`set_framerate` above, set by the "START A STREAM"
+/// form's Preset/Advanced-tuning controls (`stream-control.js`) right before
+/// it invokes `start_video_share`. See `AppState::tune`'s doc comment.
+#[tauri::command]
+pub fn set_tune(managed: State<'_, Managed>, tune: String) -> Result<(), String> {
+    let tune = dto::parse_tune_mode(&tune)?;
+    managed.state.lock().unwrap().tune = tune;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_quality_level(managed: State<'_, Managed>, quality_level: String) -> Result<(), String> {
+    let quality_level = dto::parse_quality_level(&quality_level)?;
+    managed.state.lock().unwrap().quality_level = quality_level;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_rate_control(managed: State<'_, Managed>, rate_control: String) -> Result<(), String> {
+    let rate_control = dto::parse_rate_control_mode(&rate_control)?;
+    managed.state.lock().unwrap().rate_control = rate_control;
+    Ok(())
 }
 
 #[tauri::command]

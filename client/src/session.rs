@@ -987,6 +987,18 @@ pub struct AppState {
     /// Capture framerate cap (fps) to use for the *next* video capture
     /// started.
     pub framerate: u32,
+    /// Encoder tune mode to use for the *next* video capture started —
+    /// mirrors `bitrate_kbps`/`framerate`'s "process-wide setting applied
+    /// before the share starts" shape (set via `set_tune`, read by
+    /// `start_video_share`), rather than a per-call argument. See
+    /// `capture::TuneMode`.
+    pub tune: capture::TuneMode,
+    /// Encoder quality level to use for the *next* video capture started.
+    /// See `tune`'s `Why:` note and `capture::QualityLevel`.
+    pub quality_level: capture::QualityLevel,
+    /// Encoder rate-control mode to use for the *next* video capture
+    /// started. See `tune`'s `Why:` note and `capture::RateControlMode`.
+    pub rate_control: capture::RateControlMode,
     /// Which room the "Start a stream" card will start the next capture in.
     /// `None` until a room is joined; re-pointed by the picker.
     pub new_stream_room: Option<RoomHandle>,
@@ -1057,6 +1069,9 @@ impl Default for AppState {
             share_error: None,
             bitrate_kbps: DEFAULT_BITRATE_KBPS,
             framerate: DEFAULT_FRAMERATE,
+            tune: capture::TuneMode::default(),
+            quality_level: capture::QualityLevel::default(),
+            rate_control: capture::RateControlMode::default(),
             new_stream_room: None,
             bandwidth_mode: settings.bandwidth_mode,
             absolute_total_kbps: settings.absolute_total_kbps,
@@ -1136,6 +1151,25 @@ pub fn save_max_jitter_buffer_ms(ms: u32) {
     settings.max_jitter_buffer_ms = AppSettings::clamp_max_jitter_buffer_ms(ms);
     if let Err(e) = settings.save() {
         tracing::warn!("failed to save jitter buffer preference: {e:#}");
+    }
+}
+
+/// Persist the "START A STREAM" form's current values. Same load-modify-save
+/// shape as `save_bandwidth_settings`, and for the same reason all five are
+/// written together: they're one coherent form, saved on every change to
+/// that form (`src-tauri/src/commands.rs`'s `set_start_stream_defaults`),
+/// so a mid-edit crash never leaves the persisted defaults half-updated.
+pub fn save_start_stream_defaults(
+    framerate: u32,
+    bitrate_kbps: u32,
+    tune: crate::capture::TuneMode,
+    quality_level: crate::capture::QualityLevel,
+    rate_control: crate::capture::RateControlMode,
+) {
+    let mut settings = AppSettings::load();
+    settings.start_stream_defaults = crate::rooms::StartStreamDefaults { framerate, bitrate_kbps, tune, quality_level, rate_control };
+    if let Err(e) = settings.save() {
+        tracing::warn!("failed to save start-stream defaults: {e:#}");
     }
 }
 
@@ -1314,9 +1348,16 @@ impl AppState {
             framerate,
             bitrate_kbps,
             backend: capture::EncoderBackend::default(),
-            tune: capture::TuneMode::default(),
-            quality_level: capture::QualityLevel::default(),
-            rate_control: capture::RateControlMode::default(),
+            // `self.tune`/`self.quality_level`/`self.rate_control`, not
+            // `TuneMode::default()`/etc.: these are the same "process-wide,
+            // set via a pre-start command" setting as `bitrate_kbps`/
+            // `framerate` above (see their own doc comments on `AppState`) —
+            // the "START A STREAM" form's Preset/Advanced-tuning controls
+            // (`stream-control.js`) set them via `set_tune`/`set_quality_
+            // level`/`set_rate_control` before calling this.
+            tune: self.tune,
+            quality_level: self.quality_level,
+            rate_control: self.rate_control,
         };
         let (tx, rx) = oneshot::channel();
         self.captures.insert(

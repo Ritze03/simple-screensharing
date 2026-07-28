@@ -749,6 +749,37 @@
   }
 
   // -------------------------------------------------------------------
+  // Encoder tuning presets — the "Low-Latency / Balanced / Quality" pill
+  // switch layered over the raw tune/quality_level/rate_control fields.
+  // Shared by `destinationCard`'s per-destination edit panel (a running
+  // share) and `stream-control.js`'s "START A STREAM" form (before a share
+  // exists), which is why this lives at module scope instead of inside
+  // `destinationCard` — both need the exact same three combos rather than
+  // two near-copies drifting apart. Values (`low_latency`/`best_quality`/
+  // `performance`/`balanced`/`quality`/`constant`) are `src-tauri/src/
+  // dto.rs`'s exact `parse_tune_mode`/`parse_quality_level`/
+  // `parse_rate_control_mode` wire strings, including `QualityLevel::
+  // Balanced`'s `"balanced"`.
+  //
+  // `Why: "Balanced" as the middle option` — it's the recommended default
+  // for a regular user who doesn't know what "rate control" means;
+  // "Low-Latency" and "Quality" mirror the two extremes the raw Tune switch
+  // already offers, each paired with the Quality Level/Rate Control combo
+  // that actually matches that intent.
+  const ENCODER_PRESETS = [
+    { value: "low_latency", label: "Low-Latency", tune: "low_latency", qualityLevel: "performance", rateControl: "constant" },
+    { value: "balanced", label: "Balanced", tune: "best_quality", qualityLevel: "balanced", rateControl: "constant" },
+    { value: "quality", label: "Quality", tune: "best_quality", qualityLevel: "quality", rateControl: "quality" },
+  ];
+
+  /** Whichever preset's 3 fields exactly match `tune`/`qualityLevel`/
+   * `rateControl`, or `null` if none does (an allowed, unhighlighted state —
+   * see `destinationCard`'s `activePreset` doc note). */
+  function activeEncoderPreset(tune, qualityLevel, rateControl) {
+    return ENCODER_PRESETS.find((p) => p.tune === tune && p.qualityLevel === qualityLevel && p.rateControl === rateControl) || null;
+  }
+
+  // -------------------------------------------------------------------
   // Destination card — the Stream Control tab's Active Shares entry. One of
   // these per outgoing destination, across every room (cross-room, per
   // APP-SHELL.md's STREAMS-section rationale). Deliberately dumb: it renders
@@ -983,30 +1014,15 @@
       // together through the same `onEditApply`/`edit_destination` path as
       // hand-tuning them individually in the Advanced section below — this
       // is a convenience mapping onto those same three fields, not a fourth
-      // field of its own, so nothing changes server-side.
-      //
-      // `Why: "Balanced" as the middle option` — it's the recommended
-      // default for a regular user who doesn't know what "rate control"
-      // means; "Low-Latency" and "Quality" mirror the two extremes the raw
-      // Tune switch already offers, each paired with the Quality Level/Rate
-      // Control combo that actually matches that intent, instead of
-      // leaving those two at whatever the raw switches were last set to.
-      // Values (`low_latency`/`best_quality`/`performance`/`balanced`/
-      // `quality`/`constant`) are `src-tauri/src/dto.rs`'s exact
-      // `parse_tune_mode`/`parse_quality_level`/`parse_rate_control_mode`
-      // wire strings, including `QualityLevel::Balanced`'s `"balanced"`.
-      const PRESETS = [
-        { value: "low_latency", label: "Low-Latency", tune: "low_latency", qualityLevel: "performance", rateControl: "constant" },
-        { value: "balanced", label: "Balanced", tune: "best_quality", qualityLevel: "balanced", rateControl: "constant" },
-        { value: "quality", label: "Quality", tune: "best_quality", qualityLevel: "quality", rateControl: "quality" },
-      ];
+      // field of its own, so nothing changes server-side. See module-scope
+      // `ENCODER_PRESETS`' doc comment above (shared with the "START A
+      // STREAM" form in `stream-control.js`).
+      const PRESETS = ENCODER_PRESETS;
       // Highlight whichever preset's 3 fields exactly match the current
       // edit state; if the Advanced section was hand-tuned to some other
       // combo, none of the 3 preset buttons shows as selected — no
       // validation/blocking, that's an intentional, allowed state.
-      const activePreset = PRESETS.find(
-        (p) => p.tune === editState.tune && p.qualityLevel === editState.qualityLevel && p.rateControl === editState.rateControl
-      );
+      const activePreset = activeEncoderPreset(editState.tune, editState.qualityLevel, editState.rateControl);
 
       // Preset + Bitrate share one grid (`.dest-edit-grid`) so their
       // controls start at the same X regardless of "Preset" vs.
@@ -1439,5 +1455,7 @@
     pillSwitch,
     bandwidthModeToggle,
     destinationCard,
+    ENCODER_PRESETS,
+    activeEncoderPreset,
   };
 })();
