@@ -266,10 +266,10 @@
    *   watching}], and `streams`: every announced stream in the room
    *   ([{owner, stream_id, kind, ...}]) — used here only to test "does this
    *   member's `conn_id` own an entry" for the `[LIVE]` badge.
-   * @param {object} handlers - { onOpenRoom, onReconnect, onLeave }
+   * @param {object} handlers - { onOpenRoom, onReconnect, onLeave, onJoinedRowClick }
    *
    * Per the sidebar-redesign handoff (option 1c): every state renders through
-   * ONE fixed row skeleton — `[dot][caret/reconnect][name][meta, right-
+   * ONE fixed row skeleton — `[dot][caret][name][meta, right-
    * aligned][action]` — rather than each state inventing its own layout. Only
    * the *content* of the caret/meta/action slots changes per state; the slots
    * themselves are always present (even empty, as a spacer) so columns stay
@@ -277,22 +277,36 @@
    * in. This replaces the previous two-line "disconnected" layout (Reconnect
    * pill + forget button on a sub-line) — that variance existed only because
    * the old design put a *labeled* Reconnect button next to a
-   * possibly-long auto-generated name; the redesign's single reconnect
-   * *icon* (↩) in the caret slot is narrow enough to keep everything on one
-   * line without crowding the name out.
+   * possibly-long auto-generated name; the redesign folded that into the
+   * row-wide click (see the 2026-07-29 note below).
    *
    * `Why:` (room-detail-slide-over pass, option 1f) a joined row no longer
-   * expands inline on click to show its member list — clicking anywhere on
-   * a joined row's head (or its caret specifically) now calls
+   * expands inline on click to show its member list — right-clicking a
+   * row's head (or left-clicking its caret specifically) calls
    * `handlers.onOpenRoom` to open the room-detail slide-over panel instead
    * (see shell.js's `openRoomPanel`/`renderRoomPanel`), which owns rename,
-   * audio-share and leave actions. Deliberate UX call: the WHOLE row is
-   * clickable (not just the caret) since "click a room to see its detail"
-   * is the more discoverable target on a dense sidebar list, while the
-   * row's own leave/forget icon-button in the action slot stays as a fast
-   * path that does NOT open the panel first (its own click handler stops
-   * propagation) — a user who already knows they want to leave shouldn't be
-   * forced through the panel to do it.
+   * audio-share and leave actions. The row's own leave/forget icon-button in
+   * the action slot stays as a fast path that does NOT open the panel first
+   * (its own click handler stops propagation) — a user who already knows
+   * they want to leave shouldn't be forced through the panel to do it.
+   *
+   * `Why:` (2026-07-29, full click-semantics overhaul, owner request) plain
+   * left-click no longer opens the settings panel at all — it's now
+   * state-dependent and always the most likely "I want to use this room"
+   * action: disconnected → reconnect (`onReconnect`, same path the old
+   * caret-only reconnect button used — that button is gone now, folded into
+   * the row-wide click since a second, narrower hit-area doing the exact
+   * same thing was redundant once the whole row did it); joined →
+   * `onJoinedRowClick`, which shell.js wires to jump to the View tab,
+   * filtered to this room's streams unless it's the only room currently
+   * joined (see shell.js's `jumpToViewForRoom`). Settings moved to
+   * right-click (`contextmenu`, `preventDefault`ed so the native menu never
+   * shows) for every state, and middle-click (`auxclick`, button 1) now
+   * disconnects a joined room via the same confirm-gated `onLeave` path the
+   * panel's own Disconnect button uses — no bypass of that confirm dialog,
+   * since middle-click is an easy accidental trigger (scroll-wheel click)
+   * that arguably deserves *more* guardrail, not less. A `title` on the row
+   * spells out the three bindings for discoverability.
    *
    * `Why:` (2026-07-28, room-row redesign) the row click now opens the
    * panel for EVERY state, not just `joined` — a disconnected/reconnecting
@@ -319,21 +333,67 @@
     const row = el("div", { className: "room-row room-row-" + room.state });
 
     const head = el("div", { className: "room-row-head room-row-head-clickable" });
-    head.addEventListener("click", () => handlers.onOpenRoom && handlers.onOpenRoom(room.join_string));
+
+    // Row-wide click semantics (2026-07-29 overhaul — replaces the earlier
+    // "every click opens the panel" behavior): left-click is state-dependent
+    // (connect if disconnected, jump-to-View-and-filter if joined),
+    // right-click always opens settings, middle-click disconnects a joined
+    // room. See `title` below for the on-hover summary, and this project's
+    // APP-SHELL.md ROOMS section for the full rationale.
+    head.addEventListener("click", () => {
+      if (room.state === "disconnected") {
+        handlers.onReconnect && handlers.onReconnect(room.join_string);
+      } else if (room.state === "joined") {
+        handlers.onJoinedRowClick && handlers.onJoinedRowClick(room);
+      }
+      // "reconnecting": nothing to do — mid-flight already.
+    });
+
+    // Right-click (any state) opens the settings/detail panel — the row's
+    // old plain-left-click behavior, just moved off left-click since that's
+    // now spoken for above. `preventDefault` suppresses the native OS/
+    // browser context menu (there's no custom menu here — this *is* the
+    // menu action).
+    head.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      handlers.onOpenRoom && handlers.onOpenRoom(room.join_string);
+    });
+
+    // Middle-click: disconnect a joined room via the same confirm-gated path
+    // the panel's own "Disconnect"/✕ button uses (`onLeave` -> `shell.js`'s
+    // `openLeaveConfirm`) — no bypass of the leave-confirm dialog; a
+    // middle-click is an easy accidental trigger (scroll-wheel click), so if
+    // anything it deserves *more* guardrail than a deliberate button click,
+    // not less. No-op for disconnected/reconnecting rows (nothing to
+    // disconnect). `auxclick` is the standard event for non-primary-button
+    // clicks (middle-click never fires a plain `click`); `mousedown` +
+    // `preventDefault` on the same button additionally suppresses X11's
+    // middle-click autoscroll/paste-primary-selection gesture, which would
+    // otherwise fire before `auxclick` does.
+    head.addEventListener("mousedown", (e) => {
+      if (e.button === 1) e.preventDefault();
+    });
+    head.addEventListener("auxclick", (e) => {
+      if (e.button !== 1) return;
+      e.preventDefault();
+      if (room.state === "joined") {
+        handlers.onLeave && handlers.onLeave(room.join_string);
+      }
+    });
+
+    head.title = "Left-click: connect/view · Right-click: settings · Middle-click: disconnect";
 
     head.appendChild(statusDot(room.state));
 
-    // Caret slot: open the room-detail panel (joined), reconnect
-    // (disconnected — an empty hit-area at rest, matching the `reconnecting`
-    // spacer below, with a `restart_alt` glyph that only fades in on
-    // hover/focus; see `.room-caret-reconnect-icon` in shell.css for why —
-    // the row's own hollow status dot already says "not connected", a
-    // second always-visible dot/icon here read as redundant per the design
-    // owner's screenshot feedback), or an empty spacer (reconnecting —
-    // "nothing to click while connecting"). Every caret's own click stops
-    // propagation so it doesn't double-fire the head's row-wide click
-    // handler above (which now opens the panel for every state, not just
-    // joined — see this function's doc comment).
+    // Caret slot: open the room-detail panel (joined) or an empty spacer
+    // (disconnected/reconnecting). The disconnected caret's old standalone
+    // "reconnect" button/icon (`onReconnect`, `restart_alt` glyph) is gone —
+    // the whole row now does that on left-click (see above), so a second,
+    // narrower hit-area doing the exact same thing was redundant scaffolding
+    // once the row-wide handler existed; keeping both would've meant two
+    // code paths for one action with no behavioral difference between them.
+    // Every remaining caret's own click still stops propagation so it
+    // doesn't double-fire the head's row-wide click handler above.
     if (room.state === "joined") {
       head.appendChild(
         el("button", {
@@ -344,17 +404,6 @@
           },
           attrs: { "aria-label": "Room details", title: "Room details" },
         }, [icon("chevron_right")])
-      );
-    } else if (room.state === "disconnected") {
-      head.appendChild(
-        el("button", {
-          className: "room-caret room-caret-reconnect",
-          onClick: (e) => {
-            e.stopPropagation();
-            handlers.onReconnect && handlers.onReconnect(room.join_string);
-          },
-          attrs: { "aria-label": "Reconnect", title: "Reconnect" },
-        }, [el("span", { className: "room-caret-reconnect-icon" }, [icon("restart_alt")])])
       );
     } else {
       head.appendChild(el("span", { className: "room-caret room-caret-spacer" }));

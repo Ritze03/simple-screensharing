@@ -284,33 +284,13 @@ input {
   cursor: default;
 }
 
-.room-caret-reconnect {
-  color: var(--warning);
-}
-
-.room-caret-reconnect:hover {
-  background: rgba(232, 163, 61, 0.14);
-}
-
-/* Disconnected row's reconnect action (2026-07-29): the caret slot renders
-   no dot/icon at rest — matches the empty `.room-caret-spacer` look of the
-   `reconnecting` state, so the row's own hollow `.status-dot-disconnected`
-   is the only "not connected" indicator, per the design owner's screenshot
-   feedback that a second solid yellow dot right next to it read as
-   redundant/cluttered. The `restart_alt` glyph only fades in on hover/focus
-   as a discoverability hint that the slot is clickable — see
-   `.room-caret-reconnect-icon` below. (Previously this slot held a plain
-   solid yellow `.status-dot` — see git history / APP-SHELL.md's 2026-07-28
-   note for that iteration's own rationale, which this entry supersedes.) */
-.room-caret-reconnect-icon {
-  opacity: 0;
-  transition: opacity 0.1s ease;
-}
-
-.room-caret-reconnect:hover .room-caret-reconnect-icon,
-.room-caret-reconnect:focus-visible .room-caret-reconnect-icon {
-  opacity: 1;
-}
+/* 2026-07-29: the disconnected row's dedicated reconnect caret (a separate
+   hover-reveal `restart_alt` icon + its own click handler) was removed here
+   — the whole row now does the same "reconnect" action on left-click (see
+   `renderRoomRow`'s doc comment, components.js), so a second, narrower
+   hit-area doing the exact same thing was redundant scaffolding once the
+   row-wide handler existed. Disconnected rows fall through to the plain
+   `.room-caret-spacer` below, same empty look as `reconnecting`. */
 
 /* 12px, per the prototype's room row. It was inheriting the 14px body size,
    which — once the rows moved into their 4px-inset well — left too little

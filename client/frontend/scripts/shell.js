@@ -273,9 +273,24 @@
             renderRooms();
           },
           onLeave: (joinString) => openLeaveConfirm(joinString),
+          onJoinedRowClick: (clickedRoom) => jumpToViewForRoom(clickedRoom),
         })
       );
     });
+  }
+
+  /** ROOMS row left-click on a *joined* room (`renderRoomRow`'s
+   * `onJoinedRowClick`, components.js) — per the owner's explicit request:
+   * jump to the View tab, and filter it to just this room's streams UNLESS
+   * this is the only currently-connected room (in which case "all rooms" is
+   * already exactly this room, so no filter chip is needed). Reuses
+   * `ViewTab.setRoomFilter` (view.js) rather than reaching into `roomFilter`
+   * directly — that variable is view.js-internal. */
+  function jumpToViewForRoom(room) {
+    setActiveTab("View");
+    if (!window.ViewTab) return;
+    const joinedCount = mockRooms.filter((r) => r.state === "joined").length;
+    window.ViewTab.setRoomFilter(joinedCount > 1 ? room.name : null);
   }
 
   /** Shared watch-toggle used by the room-detail panel's MEMBERS section —

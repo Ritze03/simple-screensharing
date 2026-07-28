@@ -979,7 +979,20 @@
     }
   }
 
-  window.ViewTab = { refresh: init, updateStats };
+  /** Set by `shell.js`'s ROOMS-row left-click handler (joined room, multiple
+   * rooms connected — see `renderRoomRow`'s doc comment in components.js):
+   * jumps the View tab to a single room's tiles instead of "all rooms".
+   * `roomLabel` matches a watched tile's `roomLabel` (== `SavedRoomRow.name`,
+   * see the tile-building code above); pass `null` to clear back to "All
+   * rooms". `render()` already treats an out-of-range label as "fell back to
+   * null" (the room-left/last-tile-ended guard just above `shownTiles`), so
+   * no extra validation is needed here. */
+  function setRoomFilter(roomLabel) {
+    roomFilter = roomLabel;
+    render();
+  }
+
+  window.ViewTab = { refresh: init, updateStats, setRoomFilter };
 
   // Real "the pop-out window closed" signal (2026-07-28) — see this file's
   // header note this replaces and `electron/main.js`'s `openPopoutWindow`/
