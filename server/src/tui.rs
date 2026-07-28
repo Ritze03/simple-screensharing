@@ -12,17 +12,20 @@
 //! (drill in via Enter: per-stream bandwidth, subscriber counts, and a
 //! scrolling event-log tail for that room).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, List, ListItem, Paragraph, Row, Table, Tabs};
+use ratatui::widgets::{
+    Axis, Block, Borders, Cell, Chart, Dataset, GraphType, List, ListItem, Paragraph, Row, Table,
+    Tabs,
+};
 
 use crate::protocol::RoomId;
 use crate::room::Registry;
@@ -30,6 +33,21 @@ use crate::room::Registry;
 const TAB_TITLES: [&str; 3] = ["Overview", "Rooms", "Room Detail"];
 const REDRAW_INTERVAL: Duration = Duration::from_millis(200);
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+/// How often the combined (baseline + session) lifetime counters are
+/// flushed to disk while running. Deliberately coarser than the 1s
+/// bandwidth sample: this is a durability write, not something the UI
+/// needs fresh — periodic-plus-best-effort-on-clean-exit is enough (an
+/// unclean exit loses at most this much of the current session, which is
+/// re-derived from `ByteCounters` on the next graceful save anyway).
+const LIFETIME_SAVE_INTERVAL: Duration = Duration::from_secs(30);
+/// Where the persisted lifetime rx/tx baseline lives, relative to the
+/// working directory — same "relative to cwd" convention as `LOG_DIR` in
+/// `main.rs`, reusing the `logs/` directory rather than adding a new
+/// top-level file.
+const LIFETIME_STATE_PATH: &str = "logs/lifetime.state";
+/// Number of bandwidth samples kept for the Overview network-usage graph
+/// (one point per `SAMPLE_INTERVAL`, so 120 * 1s = the last two minutes).
+const HISTORY_LEN: usize = 120;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -133,10 +151,24 @@ struct App {
     tx_rate: f64,
     per_stream_prev: HashMap<(u64, u8), (Instant, u64)>,
     per_stream_rate: HashMap<(u64, u8), f64>,
+    /// Lifetime rx/tx persisted from *previous* runs (loaded once at
+    /// startup). The displayed lifetime total is this baseline plus the
+    /// current session's own `Snapshot::total_rx`/`total_tx`, which is
+    /// how a genuinely restart-surviving counter is built on top of
+    /// `ByteCounters` (which itself resets to zero every process start).
+    lifetime_rx_base: u64,
+    lifetime_tx_base: u64,
+    last_lifetime_save_at: Instant,
+    /// Rolling bandwidth-rate history for the Overview network-usage
+    /// graph, one point pushed per `maybe_sample` tick, capped at
+    /// `HISTORY_LEN` so it never grows unbounded.
+    rx_history: VecDeque<f64>,
+    tx_history: VecDeque<f64>,
 }
 
 impl App {
     fn new() -> Self {
+        let (lifetime_rx_base, lifetime_tx_base) = load_lifetime_baseline();
         Self {
             tab: Tab::Overview,
             rooms_cursor: 0,
@@ -148,6 +180,11 @@ impl App {
             tx_rate: 0.0,
             per_stream_prev: HashMap::new(),
             per_stream_rate: HashMap::new(),
+            lifetime_rx_base,
+            lifetime_tx_base,
+            last_lifetime_save_at: Instant::now(),
+            rx_history: VecDeque::with_capacity(HISTORY_LEN),
+            tx_history: VecDeque::with_capacity(HISTORY_LEN),
         }
     }
 
@@ -162,6 +199,9 @@ impl App {
         self.tx_rate = (snap.total_tx.saturating_sub(self.last_tx)) as f64 / secs;
         self.last_rx = snap.total_rx;
         self.last_tx = snap.total_tx;
+
+        push_capped(&mut self.rx_history, self.rx_rate);
+        push_capped(&mut self.tx_history, self.tx_rate);
 
         for room in &snap.rooms {
             for s in &room.streams {
@@ -178,17 +218,91 @@ impl App {
             }
         }
         self.last_sample_at = now;
+
+        if now.duration_since(self.last_lifetime_save_at) >= LIFETIME_SAVE_INTERVAL {
+            self.save_lifetime(snap);
+            self.last_lifetime_save_at = now;
+        }
     }
 
     fn selected_room_snapshot<'a>(&self, snap: &'a Snapshot) -> Option<&'a RoomSnapshot> {
         let id = self.selected_room?;
         snap.rooms.iter().find(|r| r.room_id == id)
     }
+
+    /// Combined lifetime (rx, tx) = persisted baseline + this session's
+    /// own cumulative counters.
+    fn lifetime_totals(&self, snap: &Snapshot) -> (u64, u64) {
+        (
+            self.lifetime_rx_base + snap.total_rx,
+            self.lifetime_tx_base + snap.total_tx,
+        )
+    }
+
+    /// Best-effort write of the combined lifetime total back to disk.
+    /// Called periodically from `maybe_sample` and once more on a clean
+    /// ('q'/Ctrl-C) exit from `run_app`; an unclean exit only loses
+    /// whatever the current session added since the last periodic save.
+    fn save_lifetime(&self, snap: &Snapshot) {
+        let (rx, tx) = self.lifetime_totals(snap);
+        save_lifetime_baseline(rx, tx);
+    }
+}
+
+fn push_capped(buf: &mut VecDeque<f64>, value: f64) {
+    if buf.len() >= HISTORY_LEN {
+        buf.pop_front();
+    }
+    buf.push_back(value);
+}
+
+/// Load the persisted lifetime rx/tx baseline written by a previous run.
+/// Missing file, unreadable content, or a malformed line all fall back to
+/// `(0, 0)` — this is best-effort durability, not something worth failing
+/// startup over.
+fn load_lifetime_baseline() -> (u64, u64) {
+    let Ok(content) = std::fs::read_to_string(LIFETIME_STATE_PATH) else {
+        return (0, 0);
+    };
+    let mut rx = 0u64;
+    let mut tx = 0u64;
+    for line in content.lines() {
+        if let Some(v) = line.strip_prefix("rx=") {
+            rx = v.trim().parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("tx=") {
+            tx = v.trim().parse().unwrap_or(0);
+        }
+    }
+    (rx, tx)
+}
+
+/// Persist the combined lifetime rx/tx total as plain `key=value` lines.
+/// Deliberately not a config-file crate (toml/serde_json) — this repo has
+/// none wired up and two `u64`s don't need one.
+fn save_lifetime_baseline(rx: u64, tx: u64) {
+    if let Some(parent) = std::path::Path::new(LIFETIME_STATE_PATH).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(LIFETIME_STATE_PATH, format!("rx={rx}\ntx={tx}\n"));
 }
 
 fn fmt_rate(bytes_per_sec: f64) -> String {
     const UNITS: [&str; 4] = ["B/s", "KB/s", "MB/s", "GB/s"];
     let mut v = bytes_per_sec;
+    let mut unit = 0;
+    while v >= 1024.0 && unit < UNITS.len() - 1 {
+        v /= 1024.0;
+        unit += 1;
+    }
+    format!("{v:.1} {}", UNITS[unit])
+}
+
+/// Scale a raw byte *count* (not a rate — no `/s` suffix) through
+/// B/KB/MB/GB/TB/PB. One tier further than `fmt_rate`'s GB ceiling: a
+/// long-running relay's lifetime total can plausibly reach TB/PB.
+fn fmt_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
+    let mut v = bytes as f64;
     let mut unit = 0;
     while v >= 1024.0 && unit < UNITS.len() - 1 {
         v /= 1024.0;
@@ -242,12 +356,16 @@ fn run_app(terminal: &mut ratatui::DefaultTerminal, registry: &Registry) -> anyh
                     continue;
                 }
                 match key.code {
-                    KeyCode::Char('q') | KeyCode::Char('Q') => return Ok(()),
+                    KeyCode::Char('q') | KeyCode::Char('Q') => {
+                        app.save_lifetime(&snap);
+                        return Ok(());
+                    }
                     KeyCode::Char('c')
                         if key
                             .modifiers
                             .contains(crossterm::event::KeyModifiers::CONTROL) =>
                     {
+                        app.save_lifetime(&snap);
                         return Ok(());
                     }
                     KeyCode::Left => {
@@ -304,6 +422,16 @@ fn draw(frame: &mut Frame, app: &App, snap: &Snapshot) {
         ])
         .split(frame.area());
 
+    // Tabs take the bulk of the top bar; a small right-bound slice shows
+    // the persisted lifetime rx/tx total (part of "genuine lifetime
+    // counter, top bar, right bound" — `Tabs` has no built-in trailing
+    // slot, so this splits the row into two adjacent bordered boxes
+    // rather than rendering `Tabs` across the full width as before).
+    let top_bar = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(20), Constraint::Length(36)])
+        .split(outer[0]);
+
     let selected = match app.tab {
         Tab::Overview => 0,
         Tab::Rooms => 1,
@@ -321,7 +449,18 @@ fn draw(frame: &mut Frame, app: &App, snap: &Snapshot) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         );
-    frame.render_widget(tabs, outer[0]);
+    frame.render_widget(tabs, top_bar[0]);
+
+    let (lifetime_rx, lifetime_tx) = app.lifetime_totals(snap);
+    let lifetime = Paragraph::new(format!(
+        "Lifetime \u{2193}{}  \u{2191}{}",
+        fmt_bytes(lifetime_rx),
+        fmt_bytes(lifetime_tx)
+    ))
+    .style(Style::default().fg(Color::DarkGray))
+    .alignment(Alignment::Right)
+    .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(lifetime, top_bar[1]);
 
     match app.tab {
         Tab::Overview => draw_overview(frame, outer[1], app, snap),
@@ -367,16 +506,135 @@ fn draw_overview(frame: &mut Frame, area: Rect, app: &App, snap: &Snapshot) {
         Line::from(vec![
             Span::raw("Bandwidth in:  "),
             Span::styled(fmt_rate(app.rx_rate), Style::default().fg(Color::Green)),
-            Span::raw(format!("   (total {} bytes)", snap.total_rx)),
+            Span::raw(format!("   (total {})", fmt_bytes(snap.total_rx))),
         ]),
         Line::from(vec![
             Span::raw("Bandwidth out: "),
             Span::styled(fmt_rate(app.tx_rate), Style::default().fg(Color::Green)),
-            Span::raw(format!("   (total {} bytes)", snap.total_tx)),
+            Span::raw(format!("   (total {})", fmt_bytes(snap.total_tx))),
         ]),
     ];
     let block = Block::default().borders(Borders::ALL).title(" Overview ");
     frame.render_widget(Paragraph::new(lines).block(block), rows[0]);
+
+    let lower = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+        .split(rows[1]);
+    draw_room_tree(frame, lower[0], snap);
+    draw_network_graph(frame, lower[1], app);
+}
+
+/// Small all-rooms-at-once tree: every active room with its current
+/// members indented underneath, glanceable without drilling in (unlike
+/// the Rooms tab, which only shows the currently-selected room's
+/// participants).
+fn draw_room_tree(frame: &mut Frame, area: Rect, snap: &Snapshot) {
+    let mut items: Vec<ListItem> = Vec::new();
+    if snap.rooms.is_empty() {
+        items.push(ListItem::new(Span::styled(
+            "(no active rooms)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for room in &snap.rooms {
+            items.push(ListItem::new(Line::from(Span::styled(
+                format!("\u{25a0} {}", hex8(&room.room_id)),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ))));
+            if room.members.is_empty() {
+                items.push(ListItem::new(Line::from(Span::styled(
+                    "  \u{2514}\u{2500} (empty)",
+                    Style::default().fg(Color::DarkGray),
+                ))));
+                continue;
+            }
+            let last = room.members.len() - 1;
+            for (i, m) in room.members.iter().enumerate() {
+                let branch = if i == last { "\u{2514}\u{2500}" } else { "\u{251c}\u{2500}" };
+                let (indicator, color) = if m.stream_count > 0 {
+                    (format!("\u{25cf} x{}", m.stream_count), Color::Green)
+                } else {
+                    ("\u{25cb} idle".to_string(), Color::DarkGray)
+                };
+                items.push(ListItem::new(Line::from(vec![
+                    Span::raw(format!("  {branch} ")),
+                    Span::raw(format!("{:<16}", m.display_name)),
+                    Span::styled(indicator, Style::default().fg(color)),
+                ])));
+            }
+        }
+    }
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(" Tree "));
+    frame.render_widget(list, area);
+}
+
+/// Live rx/tx bandwidth-rate history, filling the space to the right of
+/// the room tree. Sourced from `App::rx_history`/`tx_history`, pushed
+/// once per `maybe_sample` tick and capped at `HISTORY_LEN` points.
+fn draw_network_graph(frame: &mut Frame, area: Rect, app: &App) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Network Usage ");
+    if app.rx_history.is_empty() && app.tx_history.is_empty() {
+        frame.render_widget(
+            Paragraph::new("(gathering samples\u{2026})")
+                .style(Style::default().fg(Color::DarkGray))
+                .block(block),
+            area,
+        );
+        return;
+    }
+
+    let rx_points: Vec<(f64, f64)> = app
+        .rx_history
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (i as f64, *v))
+        .collect();
+    let tx_points: Vec<(f64, f64)> = app
+        .tx_history
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (i as f64, *v))
+        .collect();
+
+    let max_len = app.rx_history.len().max(app.tx_history.len()).max(2);
+    let max_val = app
+        .rx_history
+        .iter()
+        .chain(app.tx_history.iter())
+        .cloned()
+        .fold(0.0_f64, f64::max);
+    // A little headroom above the peak so the line doesn't hug the top
+    // border, and a floor so an idle relay (all-zero history) still
+    // renders a sane, non-degenerate axis.
+    let y_max = (max_val * 1.2).max(1024.0);
+
+    let datasets = vec![
+        Dataset::default()
+            .name("in")
+            .marker(ratatui::symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(Color::Green))
+            .data(&rx_points),
+        Dataset::default()
+            .name("out")
+            .marker(ratatui::symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(Color::Yellow))
+            .data(&tx_points),
+    ];
+
+    let chart = Chart::new(datasets)
+        .block(block)
+        .x_axis(Axis::default().bounds([0.0, (max_len - 1) as f64]))
+        .y_axis(
+            Axis::default()
+                .bounds([0.0, y_max])
+                .labels([fmt_rate(0.0), fmt_rate(y_max)]),
+        );
+    frame.render_widget(chart, area);
 }
 
 fn draw_rooms(frame: &mut Frame, area: Rect, app: &App, snap: &Snapshot) {
