@@ -800,6 +800,51 @@ const PREVIEW_BRANCH_FRAMERATE: u32 = 1;
 /// than a slideshow.
 const SELF_PREVIEW_BRANCH_FRAMERATE: u32 = 12;
 
+/// Self-preview branch's resolution cap (`videoscale` target, see
+/// [`build_pipeline`]) — fixed at a small 16:9 thumbnail size rather than
+/// the uncapped source resolution this branch ran at before.
+///
+/// `Why this exists — a real, reproduced freeze, not a hypothetical:` before
+/// this cap, the self-preview branch carried the *full* negotiated source
+/// resolution (e.g. 1920x1080) all the way to [`sample_to_color_image`],
+/// which converts it with a plain per-pixel Rust loop, synchronously, on
+/// [`capture_loop`]'s own task — the same task/runtime every destination's
+/// `destination_pump` (and therefore every branch-swap `ApplyParams`
+/// command) shares. At [`SELF_PREVIEW_BRANCH_FRAMERATE`] (12fps) that is up
+/// to 12 multi-megapixel synchronous conversions per second competing for
+/// scheduler time with everything else on the runtime, with no `.await`
+/// point inside the loop to let anything else run.
+///
+/// This is what a live `gdb` backtrace, taken while reproducing the
+/// project owner's "changing FPS/preset sometimes hangs the share" report
+/// (`end_to_end_test::late_watch_after_all_three_tuning_controls_toggled_gets_a_real_keyframe_every_time`,
+/// which was observed stuck for 4+ minutes with zero progress before this
+/// fix), actually caught: the single-threaded runtime's own worker thread
+/// executing inside `sample_to_color_image`'s per-pixel loop
+/// (`core::slice::iter::next` → `sample_to_color_image` →
+/// `capture_loop::{async_fn#0}`) at the exact moment it was supposedly
+/// stuck applying a branch swap. That loop has no `.await` inside it, so
+/// nothing else on the runtime — including the very `ApplyParams` reply the
+/// test/UI was waiting on — gets a turn until one whole conversion (and,
+/// since `capture_loop`'s `select!` immediately re-polls a fast-producing
+/// 12fps stream, often several in a row) finishes. Cutting the resolution
+/// here from ~1080p to this thumbnail size cuts each conversion's pixel
+/// count by roughly two orders of magnitude, which is what actually closes
+/// the starvation window — [`SELF_PREVIEW_BRANCH_FRAMERATE`]'s doc comment
+/// already describes this as "a small preview panel" / thumbnail; the
+/// pipeline just never enforced that before now (`superdoc/features/self-preview.md`'s
+/// own text — "scaled to a fixed preview width" — confirms the *display*
+/// side already assumed a small image, so this loses no real fidelity).
+const SELF_PREVIEW_MAX_WIDTH: u32 = 320;
+/// See [`SELF_PREVIEW_MAX_WIDTH`]. 16:9 companion height — self-preview is a
+/// convenience "is this really what I'm sharing" confirmation, not a
+/// pixel-accurate mirror, so a fixed aspect ratio (mild stretch on a
+/// non-16:9 source) is an acceptable tradeoff against the alternative of
+/// negotiating a source-aspect-preserving size from inside a `gst-launch`
+/// string, which `videoscale` cannot do from caps alone without an
+/// additional letterboxing element this fix doesn't need.
+const SELF_PREVIEW_MAX_HEIGHT: u32 = 180;
+
 /// Element name of the tee's third branch — the live sender-side
 /// self-preview appsink (see this module's doc comment and
 /// [`SELF_PREVIEW_BRANCH_FRAMERATE`]), distinct from `preview_sink`'s
@@ -1016,6 +1061,8 @@ fn build_pipeline(source_fragment: &str) -> Result<CapturePipeline> {
          {TEE_NAME}. ! queue leaky=downstream max-size-buffers=1 \
             ! videorate \
             ! video/x-raw,framerate={SELF_PREVIEW_BRANCH_FRAMERATE}/1 \
+            ! videoscale \
+            ! video/x-raw,width={SELF_PREVIEW_MAX_WIDTH},height={SELF_PREVIEW_MAX_HEIGHT} \
             ! videoconvert \
             ! video/x-raw,format=RGB \
             ! appsink name={SELF_PREVIEW_SINK_NAME} emit-signals=false sync=false max-buffers=1 drop=true"
@@ -4176,6 +4223,94 @@ pub mod branch {
     /// can't run, a starved source), not merely slow.
     pub const FIRST_IDR_TIMEOUT: Duration = Duration::from_secs(5);
 
+    /// Bound on [`remove_branch`]'s final `pipeline.remove`/
+    /// `bin.set_state(Null)`/`release_request_pad` tail — see that call
+    /// site's `Why:` note. Generous (well above anything measured on real
+    /// hardware) because this is a last-resort backstop, not a normal-path
+    /// timing budget.
+    pub const BRANCH_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Bound on [`construct_branch_bounded`]'s off-thread
+    /// `add_branch_with_fallback` call — see that function's `Why:` note for
+    /// the real, reproduced hang this closes. 20s: generous relative to
+    /// everything measured on real hardware (worst case seen was ~5s, for a
+    /// cold `QualityLevel::Quality` construction at a very low framerate —
+    /// see `exploratory_lookahead_timing_across_framerates`), while still
+    /// being a hard backstop against the class of stuck
+    /// GStreamer/driver-internal state change this was written for.
+    pub const BRANCH_CONSTRUCTION_TIMEOUT: Duration = Duration::from_secs(20);
+
+    /// Runs `add_branch_with_fallback` (a synchronous, blocking-GStreamer
+    /// call — `bin_from_description_with_name`/`pipeline.add`/
+    /// `bin.sync_state_with_parent`/`tee_pad.link`) on a `spawn_blocking`
+    /// thread, bounded by [`BRANCH_CONSTRUCTION_TIMEOUT`].
+    ///
+    /// `Why this exists, mirroring [`remove_branch`]'s teardown tail:` this
+    /// call was the one remaining *unbounded* blocking GStreamer call in the
+    /// whole swap path, made directly on whatever task/thread
+    /// [`add_branch_live`] runs on (in production, [`destination_pump`]'s own
+    /// task). Real-hardware reproduction (see
+    /// `capture::tests::exploratory_three_sequential_swaps_heartbeat` and
+    /// `end_to_end_test::late_watch_after_all_three_tuning_controls_toggled_gets_a_real_keyframe_every_time`,
+    /// both `#[ignore]`d) caught this call genuinely hanging — multiple
+    /// minutes, no progress — for the third of three rapid sequential
+    /// `VideoParams` swaps (tune, then quality_level, then rate_control) on
+    /// VAAPI with `RateControlMode::Quality` (`rate-control=cqp`) +
+    /// `QualityLevel::Quality` (`target-usage=1`), even though the exact same
+    /// settings applied as a single, isolated `add_branch` call were fast
+    /// (tens of milliseconds) — i.e. this is triggered by cumulative
+    /// VAAPI-session churn (a new hardware encode session being requested
+    /// while the previous swap's session is still being torn down), not by
+    /// these settings alone. A `gdb` backtrace could not be captured (this
+    /// dev sandbox's `ptrace_scope` blocks attaching, even to a child of the
+    /// tracer, and there is no passwordless `sudo` to lower it), but `/proc`
+    /// showed the unmistakable shape of a genuine block: the tokio runtime's
+    /// own thread parked in `futex_wait` while a *different* thread (a
+    /// GStreamer/VAAPI-driver-internal worker, not owned by this process's
+    /// async runtime) sat at 100% CPU — i.e. `sync_state_with_parent` really
+    /// was waiting synchronously for something with no timeout protecting
+    /// it, exactly as this project's own established pattern (every *other*
+    /// blocking wait in this module — the IDR wait, the EOS drain, now the
+    /// teardown tail — already has a bound) says it should never be able to.
+    ///
+    /// This does not "fix" whatever is slow/stuck inside GStreamer or the
+    /// VAAPI driver on cumulative session churn — that's outside this
+    /// module's reach. What it fixes is the blast radius: before this, that
+    /// stall blocked the *entire* async runtime the destination's pump task
+    /// shares with everything else (other destinations, the bus watcher,
+    /// the reply channel back to the UI) for as long as it lasted — which in
+    /// the reproduction above was still climbing past four minutes with no
+    /// sign of ending when the process was killed. After this, the stall is
+    /// confined to one `spawn_blocking` thread, the destination's own
+    /// `ApplyParams` reply arrives (as a timeout error) within
+    /// [`BRANCH_CONSTRUCTION_TIMEOUT`], and every other task on the runtime
+    /// keeps running throughout.
+    async fn construct_branch_bounded(
+        pipeline: &gst::Pipeline,
+        tee: &gst::Element,
+        id: BranchId,
+        settings: EncodeSettings,
+    ) -> Result<EncodeBranch> {
+        let pipeline = pipeline.clone();
+        let tee = tee.clone();
+        match tokio::time::timeout(
+            BRANCH_CONSTRUCTION_TIMEOUT,
+            tokio::task::spawn_blocking(move || add_branch_with_fallback(&pipeline, &tee, id, settings)),
+        )
+        .await
+        {
+            Ok(Ok(result)) => result,
+            Ok(Err(join_err)) => Err(anyhow!("encode branch construction task panicked: {join_err}")),
+            Err(_) => Err(anyhow!(
+                "encode branch construction did not complete within {BRANCH_CONSTRUCTION_TIMEOUT:?} — a \
+                 GStreamer/encoder state change appears stuck; giving up rather than blocking the caller \
+                 (and everything sharing its async runtime) forever. The stuck construction thread is left \
+                 to finish on its own (best-effort); it will not touch a valid tee pad the caller can see \
+                 again since this branch was never returned to it"
+            )),
+        }
+    }
+
     /// [`add_branch_with_fallback`], then actually wait for the branch to
     /// prove itself by producing its first IDR — falling back to software (and
     /// tearing the dud branch back down) if a VAAPI branch constructs fine but
@@ -4194,7 +4329,7 @@ pub mod branch {
         id: BranchId,
         settings: EncodeSettings,
     ) -> Result<(EncodeBranch, gst::Sample)> {
-        let mut branch = add_branch_with_fallback(pipeline, tee, id, settings)?;
+        let mut branch = construct_branch_bounded(pipeline, tee, id, settings).await?;
         match branch.wait_for_first_idr(FIRST_IDR_TIMEOUT).await {
             Ok(sample) => Ok((branch, sample)),
             Err(e) if settings.backend == EncoderBackend::Vaapi => {
@@ -4202,13 +4337,10 @@ pub mod branch {
                 // Drain/remove the dud before building its replacement, so a
                 // failed attempt never leaves an orphan branch on the tee.
                 let _ = remove_branch(pipeline, tee, branch).await;
-                let mut fallback = add_branch(
-                    pipeline,
-                    tee,
-                    id,
-                    EncodeSettings { backend: EncoderBackend::Software, ..settings },
-                )
-                .context("software fallback encode branch failed to build")?;
+                let mut fallback =
+                    construct_branch_bounded(pipeline, tee, id, EncodeSettings { backend: EncoderBackend::Software, ..settings })
+                        .await
+                        .context("software fallback encode branch failed to build")?;
                 // Same cleanup contract as the two sibling failure paths: a
                 // branch that was built and linked but is being abandoned
                 // must be removed, never left orphaned on the tee.
@@ -4385,13 +4517,53 @@ pub mod branch {
 
         let _ = tee_pad.unlink(&branch_sink_pad);
 
-        if let Err(e) = pipeline.remove(&bin) {
-            tracing::warn!("failed to remove encode branch bin from the pipeline: {e}");
+        // `Why this tail is wrapped in a bounded `spawn_blocking` + timeout,
+        // unlike a plain sequential call:` every other blocking wait in this
+        // function (the appsink drain just above) is already bounded — this
+        // was the one exception: `pipeline.remove`/`bin.set_state(Null)` are
+        // genuinely blocking GStreamer calls with no timeout at all around
+        // them, on the same async task [`destination_pump`] awaits a branch
+        // swap from. `set_state(Null)` in particular has to synchronously
+        // tear down every element in `bin` — including the encoder, which
+        // for a branch that's still deep in its own start-up (a slow
+        // `speed-preset`/lookahead configuration on a low framerate can take
+        // several real seconds just to reach its first output — see
+        // `capture::tests::exploratory_lookahead_timing_across_framerates`,
+        // which measured this getting close to [`FIRST_IDR_TIMEOUT`] on this
+        // project's own reference hardware) is exactly the state a dud
+        // branch gets torn down in ([`add_branch_live`]'s failure path calls
+        // this function on precisely that branch). Real-hardware stress
+        // testing (hundreds of swaps across the full framerate/preset
+        // matrix, both encoder backends, warm and cold branches) never
+        // caught this call actually taking long, let alone hanging — but it
+        // was also the only blocking call in this whole module without a
+        // bound, which is reason enough to close the gap: if a GStreamer
+        // element ever *does* stick here (a known class of upstream
+        // encoder-teardown bug), this turns a permanent hang of the
+        // destination's pump task — which stops that destination from ever
+        // processing another command again, `Stop` included — into a loud,
+        // bounded failure instead. The blocking thread is deliberately left
+        // to finish on its own past the timeout (there is no way to cancel a
+        // blocked native call); that's an acceptable one-thread leak against
+        // the alternative of hanging the pump forever.
+        let pipeline = pipeline.clone();
+        let tee = tee.clone();
+        let teardown = tokio::task::spawn_blocking(move || {
+            if let Err(e) = pipeline.remove(&bin) {
+                tracing::warn!("failed to remove encode branch bin from the pipeline: {e}");
+            }
+            if let Err(e) = bin.set_state(gst::State::Null) {
+                tracing::warn!("failed to stop encode branch bin: {e}");
+            }
+            tee.release_request_pad(&tee_pad);
+        });
+        if tokio::time::timeout(BRANCH_TEARDOWN_TIMEOUT, teardown).await.is_err() {
+            tracing::error!(
+                "encode branch teardown (pipeline.remove/bin.set_state(Null)/release_request_pad) did not \
+                 complete within {BRANCH_TEARDOWN_TIMEOUT:?} — a GStreamer element's teardown appears stuck; \
+                 giving up on it rather than hanging this destination's pump task forever"
+            );
         }
-        if let Err(e) = bin.set_state(gst::State::Null) {
-            tracing::warn!("failed to stop encode branch bin: {e}");
-        }
-        tee.release_request_pad(&tee_pad);
 
         Ok(())
     }
@@ -6491,6 +6663,71 @@ mod tests {
             frame.rgb.len(),
             640 * 480 * 3,
             "preview frame RGB buffer should be tightly packed with no stride padding"
+        );
+    }
+
+    /// Regression test for the real root cause behind the reported
+    /// "changing FPS/preset sometimes hangs the screenshare, worse with a
+    /// bigger Hz jump, presets look almost random" bug.
+    ///
+    /// It was never the branch-swap machinery itself (extensive real-hardware
+    /// stress testing — hundreds of swaps across the full framerate/preset
+    /// matrix, both encoder backends, cold and minutes-warm branches — never
+    /// reproduced a hang there). The actual cause, caught with a live `gdb`
+    /// backtrace while reproducing
+    /// `end_to_end_test::late_watch_after_all_three_tuning_controls_toggled_gets_a_real_keyframe_every_time`
+    /// (which was stuck 4+ minutes with zero progress before this fix): the
+    /// self-preview tee branch ([`SELF_PREVIEW_SINK_NAME`]) carried the
+    /// *full* negotiated source resolution — `superdoc/features/self-preview.md`
+    /// and [`SELF_PREVIEW_BRANCH_FRAMERATE`]'s own doc comment call it "a
+    /// small preview panel"/thumbnail, but the pipeline never actually
+    /// enforced that. [`sample_to_color_image`] converts each sample with a
+    /// plain per-pixel Rust loop, synchronously, on [`capture_loop`]'s own
+    /// task — the same task/runtime every destination's `destination_pump`
+    /// (and therefore every branch-swap `ApplyParams` reply) shares. At
+    /// [`SELF_PREVIEW_BRANCH_FRAMERATE`] (12fps), a full ~1080p source meant
+    /// up to 12 multi-megapixel synchronous conversions per second — with no
+    /// `.await` inside the loop to let anything else on the runtime run —
+    /// which is what actually starved the destination pump's command
+    /// processing for minutes at a time.
+    ///
+    /// This test is deliberately NOT a timing-based hang detector (those are
+    /// exactly the kind of flaky-under-load test this bug already made hard
+    /// to reproduce reliably even at the true root cause) — it just asserts
+    /// the actual fix stuck: the self-preview branch's negotiated caps must
+    /// never exceed [`SELF_PREVIEW_MAX_WIDTH`]/[`SELF_PREVIEW_MAX_HEIGHT`],
+    /// regardless of how large the real source is.
+    #[test]
+    fn self_preview_branch_is_capped_to_a_small_thumbnail_regardless_of_source_size() {
+        if gst::init().is_err() {
+            eprintln!("skipping: gstreamer not available in this environment");
+            return;
+        }
+
+        // Deliberately much larger than the cap in both dimensions, so a
+        // regression (the cap silently not applying) can't hide behind a
+        // source that already happened to be small.
+        let source = "videotestsrc is-live=true pattern=smpte \
+             ! video/x-raw,width=1920,height=1080,framerate=30/1";
+        let built = build_pipeline(source).expect("pipeline should construct");
+        built.pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+
+        let sample = built
+            .self_preview_sink
+            .try_pull_sample(gst::ClockTime::from_seconds(5))
+            .expect("self-preview branch should produce at least one sample");
+        let caps = sample.caps().expect("self-preview sample should carry caps");
+        let s = caps.structure(0).expect("self-preview caps should have a structure");
+        let width: i32 = s.get("width").expect("self-preview caps should carry a width");
+        let height: i32 = s.get("height").expect("self-preview caps should carry a height");
+
+        built.pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+
+        assert!(
+            width as u32 <= SELF_PREVIEW_MAX_WIDTH && height as u32 <= SELF_PREVIEW_MAX_HEIGHT,
+            "self-preview branch produced a {width}x{height} frame from a 1920x1080 source — it must be \
+             capped to at most {SELF_PREVIEW_MAX_WIDTH}x{SELF_PREVIEW_MAX_HEIGHT}; an uncapped self-preview \
+             branch is the actual root cause of the reported branch-swap hang (see this test's doc comment)"
         );
     }
 
