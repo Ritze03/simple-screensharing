@@ -709,7 +709,7 @@ fn draw_network_graph(frame: &mut Frame, area: Rect, app: &App) {
         .y_axis(
             Axis::default()
                 .bounds([0.0, y_max])
-                .labels([fmt_rate(0.0), fmt_rate(y_max)])
+                .labels([format!("{} ", fmt_rate(0.0)), format!("{} ", fmt_rate(y_max))])
                 // Each label renders left-aligned in its own fixed-width
                 // gutter by default, so "0.0 B/s" and (e.g.) "12.3 MB/s"
                 // land ragged against the chart's left border as their
@@ -717,6 +717,10 @@ fn draw_network_graph(frame: &mut Frame, area: Rect, app: &App) {
                 // border consistently — same intent as right_pad_column,
                 // but via ratatui's native per-axis alignment knob since
                 // Axis labels aren't raw strings we can pre-pad ourselves.
+                // A trailing space on each label leaves a one-character
+                // margin between the text and the border, matching the
+                // buffering already applied to the lifetime bar and the
+                // bandwidth in/out lines elsewhere in this TUI.
                 .labels_alignment(Alignment::Right),
         );
     frame.render_widget(chart, area);
