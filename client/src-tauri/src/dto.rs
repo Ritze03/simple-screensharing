@@ -223,6 +223,40 @@ pub struct DestinationStatsDto {
     /// `audio::AudioLevel`). `None` for video, which has no such thing.
     /// Drives the VU meter on the screen share card's audio row.
     pub audio_level: Option<f32>,
+    /// This destination's actual live encoder bitrate — `Destination::
+    /// live_params().bitrate_kbps`, the same value `capture::branch::
+    /// DestBranch::set_bitrate_kbps` just wrote (or the initial configured
+    /// one, before any write). `None` for audio, which has no video encoder
+    /// bitrate to report.
+    ///
+    /// `Why this needs its own field, carried on an already-unconditional-
+    /// every-tick payload, rather than a new event:` in Absolute-Maximum
+    /// mode, `AppState::apply_bandwidth_allocation` writes a destination's
+    /// new bitrate straight into its live encoder (a tier-1 property write —
+    /// see `capture::CaptureHandle::set_destination_bitrate`'s doc comment)
+    /// without ever changing `DestinationState`, so `driver.rs`'s tick loop
+    /// never emits `destination-state-changed` for it and `stream-
+    /// control.js`'s `mockDestinations` cache — which is what the
+    /// destination card's "Bitrate" readout renders from — never learns the
+    /// allocator changed anything. This was the reported "the bitrate
+    /// doesn't update when the Absolute Maximum total is changed" bug: the
+    /// real encoder bitrate *did* change (proved for real against GStreamer
+    /// by `capture::branch::tests::
+    /// setting_one_branchs_bitrate_writes_through_to_that_encoder_only`, and
+    /// the decision layer that decides to write it by `ui.rs`'s
+    /// `bandwidth_wiring_tests`), only the frontend's cached display of it
+    /// was stale — the exact same "a live change with no accompanying event"
+    /// shape as `driver.rs`'s `destination-state-changed` "removed" pass
+    /// (see that pass's own doc comment) and `applyDestinationEdit`'s
+    /// Per-Stream-mode optimistic mirror (`stream-control.js`), which is why
+    /// Per-Stream mode never showed this symptom: a user-driven edit has a
+    /// call site to optimistically patch, but an allocator-driven change
+    /// happening entirely inside the backend does not. Piggybacking on
+    /// `stream-stats-updated` (already unconditional every ~250ms, already
+    /// keyed by `destination_id` on the frontend) is cheaper and simpler
+    /// than adding a new diffed event for a field that already changes at
+    /// roughly the same cadence as the FPS counters it travels alongside.
+    pub bitrate_kbps: Option<u32>,
 }
 
 /// One watched stream's live throughput: `received_fps` is

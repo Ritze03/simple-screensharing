@@ -645,15 +645,25 @@
     // gained its inset styling.
     const metaRow = el("div", { className: "dest-meta-row" });
 
-    const metric = (label, value) =>
+    const metric = (label, value, extraValueClass) =>
       el("div", { className: "dest-metric" }, [
         el("span", { className: "dest-metric-label", text: label }),
-        el("span", { className: "dest-metric-value", text: value }),
+        el("span", { className: extraValueClass ? `dest-metric-value ${extraValueClass}` : "dest-metric-value", text: value }),
       ]);
 
     metaRow.appendChild(metric("Resolution", `${dest.width}×${dest.height}`));
     metaRow.appendChild(metric("Framerate", `${dest.framerate} fps`));
-    metaRow.appendChild(metric("Bitrate", `${dest.bitrate_kbps} kbps`));
+    // `dest-metric-bitrate-value`: a dedicated class so `stream-control.js`'s
+    // `updateStats()` can write straight into this node on every
+    // `stream-stats-updated` tick, the same direct-DOM-write path already
+    // used for `.dest-fps-readout`/the sparkline — see that function's `Why:`
+    // note for why this field specifically needs a live-refreshed value
+    // rather than the `dest.bitrate_kbps` this initial render reads (that
+    // cached copy goes stale the moment Absolute-Maximum mode's allocator
+    // changes this destination's live bitrate, since a tier-1 encoder
+    // property write never fires an event that would make `stream-
+    // control.js` refetch it).
+    metaRow.appendChild(metric("Bitrate", `${dest.bitrate_kbps} kbps`, "dest-metric-bitrate-value"));
 
     // Kept (now empty) so anything still keying off `.dest-meta` finds it;
     // the visible text moved into the metric columns above. Also acts as
