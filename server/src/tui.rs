@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
@@ -317,6 +317,17 @@ fn fmt_bytes(bytes: u64) -> String {
     format!("{v:.1} {}", UNITS[unit])
 }
 
+/// Right-align `s` within a fixed-width column by adding leading spaces
+/// (never truncates if `s` is already >= `width`). Uses char count, not
+/// byte length, since values here contain multi-byte arrow glyphs.
+fn right_pad_column(s: String, width: usize) -> String {
+    let len = s.chars().count();
+    if len >= width {
+        return s;
+    }
+    format!("{}{}", " ".repeat(width - len), s)
+}
+
 fn fmt_duration(d: Duration) -> String {
     let secs = d.as_secs();
     let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
@@ -443,6 +454,11 @@ fn draw(frame: &mut Frame, app: &App, snap: &Snapshot) {
         Tab::Rooms => 1,
         Tab::RoomDetail => 2,
     };
+    // Shared with the lifetime box below so its numeric values render in
+    // the exact same style as the active tab.
+    let highlight_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
     let tabs = Tabs::new(TAB_TITLES.to_vec())
         .block(
             Block::default()
@@ -450,22 +466,28 @@ fn draw(frame: &mut Frame, app: &App, snap: &Snapshot) {
                 .title(" simple-screensharing relay "),
         )
         .select(selected)
-        .highlight_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        );
+        .highlight_style(highlight_style);
     frame.render_widget(tabs, top_bar[0]);
 
     let (lifetime_rx, lifetime_tx) = app.lifetime_totals(snap);
-    let lifetime = Paragraph::new(format!(
-        "Lifetime \u{2193}{}  \u{2191}{}",
-        fmt_bytes(lifetime_rx),
-        fmt_bytes(lifetime_tx)
-    ))
-    .style(Style::default().fg(Color::DarkGray))
-    .alignment(Alignment::Right)
-    .block(Block::default().borders(Borders::ALL));
+    let lifetime_label = "Lifetime";
+    // Fixed-width columns (arrow + fmt_bytes output, e.g. "↓784.9 MB" is 9
+    // chars) so the rx/tx fields stay aligned as the numbers tick over
+    // frame to frame, rather than a single flexible gap that would make
+    // only the first gap jitter while the second stayed fixed.
+    const VALUE_COL_WIDTH: usize = 9;
+    let rx_col = right_pad_column(format!("\u{2193}{}", fmt_bytes(lifetime_rx)), VALUE_COL_WIDTH);
+    let tx_col = right_pad_column(format!("\u{2191}{}", fmt_bytes(lifetime_tx)), VALUE_COL_WIDTH);
+    let lifetime_line = Line::from(vec![
+        Span::raw(" "),
+        Span::raw(lifetime_label),
+        Span::raw("    "), // fixed gap before the rx column
+        Span::styled(rx_col, highlight_style),
+        Span::raw("  "), // fixed gap before the tx column
+        Span::styled(tx_col, highlight_style),
+        Span::raw(" "),
+    ]);
+    let lifetime = Paragraph::new(lifetime_line).block(Block::default().borders(Borders::ALL));
     frame.render_widget(lifetime, top_bar[1]);
 
     match app.tab {
