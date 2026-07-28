@@ -101,6 +101,19 @@ pub fn rename_room(managed: State<'_, Managed>, join_string: String, new_name: S
     }
 }
 
+/// Set/clear the room-detail panel's "Auto-Connect" checkbox for a saved
+/// room — see `session::AppState::set_room_auto_connect`'s doc comment for
+/// what the flag means and where it's consumed (`main.rs`'s `.setup()`).
+#[tauri::command]
+pub fn set_room_auto_connect(managed: State<'_, Managed>, join_string: String, auto_connect: bool) -> Result<(), String> {
+    let mut state = managed.state.lock().unwrap();
+    state.set_room_auto_connect(&join_string, auto_connect);
+    match &state.room_store_error {
+        Some(e) => Err(e.clone()),
+        None => Ok(()),
+    }
+}
+
 /// Forget a saved room: drop its `RoomStore` entry and persist the removal
 /// immediately, so it doesn't reappear the next time the saved-rooms list is
 /// reloaded from disk (e.g. the next `list_saved_rooms` call, or an app

@@ -516,6 +516,9 @@ fn dispatch(name: &str, body: &Value, app: &AppHandle) -> Result<Value, ApiError
         "leave_room" => ok(commands::leave_room(managed, get_u32(body, "room_handle")?)),
         "force_leave_room" => ok(commands::force_leave_room(managed, get_u32(body, "room_handle")?)),
         "rename_room" => result(commands::rename_room(managed, get_string(body, "join_string")?, get_string(body, "new_name")?)),
+        "set_room_auto_connect" => {
+            result(commands::set_room_auto_connect(managed, get_string(body, "join_string")?, get_bool(body, "auto_connect")?))
+        }
         "forget_room" => result(commands::forget_room(managed, get_string(body, "join_string")?)),
         "select_active_room" => ok(commands::select_active_room(managed, get_u32(body, "room_handle")?)),
         "get_settings" => ok(commands::get_settings(managed)),

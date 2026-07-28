@@ -1034,6 +1034,17 @@ pub struct AppState {
 
     pub room_store: RoomStore,
     pub room_store_error: Option<String>,
+    /// Join strings still waiting to be auto-connected at startup (see
+    /// `main.rs`'s `.setup()` and [`Self::poll_auto_connect_queue`]). A queue
+    /// rather than firing every `start_connect` at once: `pending_connect`
+    /// is a single slot (one in-flight connect at a time — see
+    /// `start_connect`'s doc comment), so starting a second auto-connect
+    /// before the first resolves would silently overwrite and orphan it
+    /// (its `oneshot` result would arrive with nowhere to be read, and the
+    /// room, even if the handshake succeeded, would never make it into
+    /// `self.rooms`). Drained one at a time by the driver's tick loop
+    /// instead.
+    pub auto_connect_queue: Vec<String>,
     /// Current UI language ("en" or "de"), mirrored into `rust_i18n`'s global
     /// locale on startup and on every toggle.
     pub language: String,
@@ -1086,6 +1097,7 @@ impl Default for AppState {
             selected_audio_source: None,
             room_store,
             room_store_error,
+            auto_connect_queue: Vec::new(),
             language: settings.language,
             presentation_mode: settings.presentation_mode,
             launch_presentation_mode: settings.presentation_mode,
@@ -2188,6 +2200,29 @@ impl AppState {
         }
     }
 
+    /// Set the `RoomStore` entry for `join_string`'s `auto_connect` flag —
+    /// the room-detail panel's "Auto-Connect" checkbox (see
+    /// `superdoc/features/stream-control.md`'s 2026-07-28 entry). Rooms
+    /// flagged this way get rejoined automatically in `main.rs`'s
+    /// `.setup()`.
+    ///
+    /// `Why` this is a new, explicit flag rather than reusing anything
+    /// already here: `AppState::default()` starts `rooms` empty and never
+    /// reconnects anything on its own — there was no existing "resume
+    /// whatever was connected last session" behavior to hook into
+    /// (`is_reconnecting`/`pending_connect` only track an in-flight *manual*
+    /// connect within the current run, not anything that survives a
+    /// restart). This flag is the only mechanism that makes a saved room
+    /// rejoin itself at launch, and it's a deliberate per-room choice the
+    /// user sets, not an inference from whatever happened to be open when
+    /// the app last closed.
+    pub fn set_room_auto_connect(&mut self, join_string: &str, value: bool) {
+        self.room_store.set_auto_connect(join_string, value);
+        if let Err(e) = self.room_store.save() {
+            self.room_store_error = Some(e.to_string());
+        }
+    }
+
     /// Move `f`'s edits onto `destination_id`'s row, wherever it lives.
     /// No-op if the destination is already gone.
     pub fn with_destination(&mut self, destination_id: DestinationId, f: impl FnOnce(&mut Destination)) {
@@ -2232,6 +2267,25 @@ impl AppState {
     /// — what puts a saved row into the amber "reconnecting" state.
     pub fn is_reconnecting(&self, join_string: &str) -> bool {
         self.pending_connect.as_ref().is_some_and(|p| p.join_string == join_string)
+    }
+
+    /// Drain one entry off `auto_connect_queue` into `pending_connect`, if
+    /// the slot is free. Called every driver tick (`driver.rs`'s `tick`,
+    /// right before `poll_connect_result`) so a startup batch of
+    /// auto-connect rooms gets kicked off one at a time as each previous one
+    /// finishes, instead of all at once — see `auto_connect_queue`'s doc
+    /// comment for why one-at-a-time is required, not just simpler.
+    pub fn poll_auto_connect_queue(&mut self) {
+        if self.pending_connect.is_some() {
+            return;
+        }
+        if let Some(join_string) = self.auto_connect_queue.first().cloned() {
+            self.auto_connect_queue.remove(0);
+            // Best-effort: an immediate failure (e.g. endpoint never bound)
+            // surfaces the same way a failed manual join does, via
+            // `self.status`; it doesn't block the rest of the queue.
+            let _ = self.start_connect(join_string, false);
+        }
     }
 
     /// Insert a freshly connected room and return its handle. The one place a

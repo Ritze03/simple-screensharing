@@ -14,6 +14,8 @@ mod driver;
 mod state;
 mod video_server;
 
+use tauri::Manager;
+
 use state::Managed;
 
 fn main() {
@@ -40,6 +42,21 @@ fn main() {
     tauri::Builder::default()
         .manage(managed)
         .setup(|app| {
+            // Queue every saved room with `auto_connect` set (the
+            // room-detail panel's "Auto-Connect" checkbox — see
+            // `session::AppState::set_room_auto_connect`'s doc comment) to
+            // be joined at startup. Only queues here — `driver::spawn`'s
+            // tick loop (started right below) is what actually drains the
+            // queue one room at a time via `poll_auto_connect_queue`, since
+            // `pending_connect` only has room for one in-flight connect.
+            {
+                let managed = app.state::<Managed>();
+                let mut state = managed.state.lock().unwrap();
+                let auto_connect_rooms: Vec<String> =
+                    state.room_store.rooms.iter().filter(|r| r.auto_connect).map(|r| r.join_string.clone()).collect();
+                state.auto_connect_queue.extend(auto_connect_rooms);
+            }
+
             driver::spawn(app.handle().clone());
             // The Electron-migration REST+SSE transport — see
             // `api_server.rs`'s module doc. Runs alongside the still-live
@@ -61,6 +78,7 @@ fn main() {
             commands::leave_room,
             commands::force_leave_room,
             commands::rename_room,
+            commands::set_room_auto_connect,
             commands::select_active_room,
             commands::room_detail,
             commands::get_settings,

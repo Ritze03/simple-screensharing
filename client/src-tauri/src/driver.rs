@@ -102,6 +102,10 @@ fn tick(app_handle: &AppHandle, last: &mut Snapshot) {
     let mut state = managed.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
 
     // 1. Connect attempts.
+    // Kick off the next queued auto-connect room (if any, and if the single
+    // `pending_connect` slot is free) before polling it — see
+    // `AppState::poll_auto_connect_queue`'s doc comment.
+    state.poll_auto_connect_queue();
     match state.poll_connect_result() {
         ConnectOutcome::None => {}
         ConnectOutcome::Joined(handle) => {

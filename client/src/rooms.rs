@@ -19,6 +19,14 @@ pub struct SavedRoom {
     pub name: String,
     /// The full `server|room-id|key` join string (see `net.rs`).
     pub join_string: String,
+    /// When `true`, this room is joined automatically at app startup (see
+    /// `main.rs`'s `.setup()`) — a deliberate, per-room, user-set preference,
+    /// independent of whether the room happened to be connected when the app
+    /// last closed. `#[serde(default)]` so existing `rooms.toml` files
+    /// written before this field existed still parse (they all mean "not
+    /// auto-connected" under the old behavior).
+    #[serde(default)]
+    pub auto_connect: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -70,12 +78,23 @@ impl RoomStore {
         if let Some(existing) = self.rooms.iter_mut().find(|r| r.name == name) {
             existing.join_string = join_string;
         } else {
-            self.rooms.push(SavedRoom { name, join_string });
+            self.rooms.push(SavedRoom { name, join_string, auto_connect: false });
         }
     }
 
     pub fn remove(&mut self, name: &str) {
         self.rooms.retain(|r| r.name != name);
+    }
+
+    /// Flip the `auto_connect` flag for the saved room with this join
+    /// string. No-op (not an error) if the room isn't saved — mirrors
+    /// `name_for`'s "no entry" case rather than surfacing a lookup failure,
+    /// since the frontend only ever offers this checkbox on a row it already
+    /// knows is saved.
+    pub fn set_auto_connect(&mut self, join_string: &str, value: bool) {
+        if let Some(room) = self.rooms.iter_mut().find(|r| r.join_string == join_string) {
+            room.auto_connect = value;
+        }
     }
 
     /// The saved name for a join string, if this room is saved.
@@ -385,6 +404,64 @@ mod tests {
         let toml_str = toml::to_string_pretty(&store).unwrap();
         let parsed: RoomStore = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.rooms, store.rooms);
+    }
+
+    /// A freshly-`upsert`ed room defaults to not-auto-connecting — the
+    /// "Auto-Connect" checkbox in the room-detail panel starts unchecked.
+    #[test]
+    fn upsert_defaults_auto_connect_to_false() {
+        let mut store = RoomStore::default();
+        store.upsert("friends".to_string(), "a|b|c".to_string());
+        assert!(!store.rooms[0].auto_connect);
+    }
+
+    /// `set_auto_connect` flips the flag for the matching join string and
+    /// round-trips through TOML — the persisted-preference path this
+    /// task's Auto-Connect checkbox actually relies on.
+    #[test]
+    fn set_auto_connect_flips_the_matching_room_and_round_trips() {
+        let mut store = RoomStore::default();
+        store.upsert("friends".to_string(), "a|b|c".to_string());
+        store.upsert("other".to_string(), "x|y|z".to_string());
+
+        store.set_auto_connect("a|b|c", true);
+        assert!(store.rooms.iter().find(|r| r.join_string == "a|b|c").unwrap().auto_connect);
+        assert!(!store.rooms.iter().find(|r| r.join_string == "x|y|z").unwrap().auto_connect);
+
+        let toml_str = toml::to_string_pretty(&store).unwrap();
+        let parsed: RoomStore = toml::from_str(&toml_str).unwrap();
+        assert!(parsed.rooms.iter().find(|r| r.join_string == "a|b|c").unwrap().auto_connect);
+
+        // Unset again — also round-trips.
+        store.set_auto_connect("a|b|c", false);
+        assert!(!store.rooms.iter().find(|r| r.join_string == "a|b|c").unwrap().auto_connect);
+    }
+
+    /// A join string with no saved entry is a silent no-op, not a panic —
+    /// mirrors `name_for`'s "miss stays a miss" contract.
+    #[test]
+    fn set_auto_connect_on_unknown_join_string_is_a_no_op() {
+        let mut store = RoomStore::default();
+        store.upsert("friends".to_string(), "a|b|c".to_string());
+        store.set_auto_connect("does-not-exist", true);
+        assert_eq!(store.rooms.len(), 1);
+        assert!(!store.rooms[0].auto_connect);
+    }
+
+    /// A `rooms.toml` written before `auto_connect` existed (no such key in
+    /// the file at all) must still parse, defaulting to `false` — the same
+    /// forward-compat contract `#[serde(default)]` gives every other field
+    /// in this module (see `app_settings_missing_*_defaults` below).
+    #[test]
+    fn legacy_toml_without_auto_connect_field_defaults_to_false() {
+        let toml_str = r#"
+            [[rooms]]
+            name = "friends"
+            join_string = "a|b|c"
+        "#;
+        let parsed: RoomStore = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.rooms.len(), 1);
+        assert!(!parsed.rooms[0].auto_connect);
     }
 
     #[test]

@@ -65,6 +65,7 @@
       state: "joined",
       room_handle: 1,
       active_stream_count: 1,
+      auto_connect: false,
       members: [{ conn_id: 1, display_name: "Ana", owner: 1, stream_id: 0, resolution: "1920x1080", watching: false }],
       // Mock stand-in for `room_detail`'s `streams` (`RoomDetail.streams` /
       // `StreamInfoDto`, `src-tauri/src/dto.rs`) — the room panel's "Live
@@ -80,6 +81,7 @@
       state: "joined",
       room_handle: 2,
       active_stream_count: 0,
+      auto_connect: true,
       members: [],
     },
     {
@@ -88,6 +90,7 @@
       state: "disconnected",
       room_handle: null,
       active_stream_count: 0,
+      auto_connect: false,
       members: [],
     },
     {
@@ -96,6 +99,7 @@
       state: "reconnecting",
       room_handle: null,
       active_stream_count: 0,
+      auto_connect: false,
       members: [],
     },
   ];
@@ -123,30 +127,6 @@
     addRoomOpen: false,
     pendingLeaveRoomId: null,
   };
-
-  // Room-panel-local audio-source picker state (design handoff's AUDIO
-  // section). Kept separate from `stream-control.js`'s own room-scoped
-  // audio row (`state.audioSource`/`mockAudioSources` there) rather than
-  // shared: that row is reached via a room *dropdown* (any joined room, one
-  // at a time, chosen independently of the sidebar) and is a whole-tab
-  // affordance, not scoped to whichever room this panel happens to have
-  // open — see the shell.js audio-integration note below `openRoomPanel`.
-  let panelAudioSources = [];
-  let panelAudioSourceId = null;
-  // `Why:` replaces the old manual "Share Audio" button — when checked, the
-  // panel starts (and keeps) sharing whichever source is selected in the
-  // dropdown with no extra click, and switches automatically if the
-  // selection changes while checked. Reset to unchecked each time a panel
-  // opens (see `openRoomPanel`) so re-opening a room never silently
-  // auto-shares audio the user didn't ask for this session. Unchecking only
-  // stops the *auto-reconnect* behavior going forward — it does not tear
-  // down an already-started share. There is no "stop audio share" command
-  // reachable from this panel to call instead (`startPanelAudioShare`'s two
-  // real commands, `select_audio_source`/`start_audio_share`, have no
-  // counterpart stop invoke in this file); a running share can already be
-  // stopped elsewhere in the UI via the destination card's Stop button
-  // (`stream-control.js`), so this stays the simpler, non-duplicating choice.
-  let panelAudioAutoConnect = false;
 
   // ---------------------------------------------------------------------
   // Data touchpoints
@@ -564,20 +544,15 @@
   // decision). One panel at a time, keyed by `state.activeRoomPanel`
   // (a `join_string`, or null when closed).
   //
-  // AUDIO section integration note: `stream-control.js` already has a
-  // room-scoped "Share Audio" row (`renderShareAudioCard`), but it's reached
-  // through its OWN room dropdown (`state.scopedRoomHandle`) — a whole-tab
-  // affordance for "pick any joined room, then act on it", independent of
-  // whichever sidebar row was clicked. It is not itself scoped to "the room
-  // this panel is currently showing". Rather than wire this panel to that
-  // dropdown's selection (which would silently desync the two — opening
-  // Room A's panel would have no effect on the Stream Control tab's
-  // separately-chosen scoped room), this panel gets its own minimal,
-  // genuinely room-scoped entry point onto the same three real commands
-  // (`list_audio_sources`/`select_audio_source`/`start_audio_share`) fixed
-  // to `state.activeRoomPanel`'s `room_handle` — see `fetchPanelAudioSources`/
-  // `startPanelAudioShare` below. Small, deliberate duplication of a ~15-line
-  // fetch/select/start sequence, not a second data model.
+  // `Why` no AUDIO section here (there used to be one): audio sharing is
+  // handled directly on the video destination's own card in Stream Control
+  // (the "+ Add audio" row) — a second, room-scoped audio-source picker
+  // living in this panel duplicated that with no real purpose, and its
+  // "Auto-Connect" checkbox was originally miswired to mean "auto-start
+  // audio sharing" (a misreading of the design handoff — see this file's
+  // git history, 2026-07-28). The real "Auto-Connect" checkbox below (room
+  // name section) means what the name says: auto-join this room on app
+  // startup.
   // ---------------------------------------------------------------------
 
   /** Opens the panel for a joined room. Disconnected/reconnecting rows never
@@ -590,9 +565,6 @@
     if (!room || room.state !== "joined" || room.room_handle == null) return;
 
     state.activeRoomPanel = joinString;
-    panelAudioSources = [];
-    panelAudioSourceId = null;
-    panelAudioAutoConnect = false;
 
     const scrim = document.getElementById("room-panel-scrim");
     scrim.hidden = false;
@@ -606,10 +578,6 @@
     requestAnimationFrame(() => requestAnimationFrame(() => scrim.classList.add("room-panel-scrim-open")));
 
     await loadRoomMembers(room);
-    if (state.activeRoomPanel === joinString) renderRoomPanel();
-
-    panelAudioSources = await fetchPanelAudioSources();
-    if (panelAudioSources.length > 0) panelAudioSourceId = panelAudioSources[0].id;
     if (state.activeRoomPanel === joinString) renderRoomPanel();
   }
 
@@ -862,53 +830,33 @@
     );
     body.appendChild(streamsSection);
 
-    // ---- AUDIO ----
-    const audioSection = el("div", { className: "room-panel-audio-section" });
-    audioSection.appendChild(el("div", { className: "room-panel-section-label", text: "Audio" }));
-    const audioRow = el("div", { className: "room-panel-audio-row" });
-    if (panelAudioSources.length === 0) {
-      audioRow.appendChild(el("span", { className: "room-panel-member-status", text: "No audio sources found." }));
-    } else {
-      const select = dropdown(
-        panelAudioSources.map((s) => ({ value: s.id, label: s.name })),
-        panelAudioSourceId,
-        (value) => {
-          panelAudioSourceId = Number(value);
-          // Auto-Connect checked: switching sources re-shares the new one
-          // immediately, same as the initial auto-start below.
-          if (panelAudioAutoConnect) {
-            const source = panelAudioSources.find((s) => s.id === panelAudioSourceId);
-            if (source) startPanelAudioShare(room.room_handle, source);
-          }
-        }
-      );
-      audioRow.appendChild(select);
-    }
-    const autoConnectLabel = el("label", {
-      className: "room-panel-autoconnect-row" + (panelAudioSources.length === 0 ? " room-panel-autoconnect-row-disabled" : ""),
-    });
+    // ---- AUTO-CONNECT ----
+    // Join this room automatically at app startup — a persisted per-room
+    // preference (`rooms::SavedRoom::auto_connect`, `commands::
+    // set_room_auto_connect`). This replaces the AUDIO section's old
+    // (incorrectly-wired) checkbox of the same name — audio sharing lives on
+    // the destination card itself now (Stream Control's "+ Add audio"), so a
+    // standalone audio-source picker here had no destination to belong to;
+    // see `superdoc/features/stream-control.md` (2026-07-28). Reuses that old
+    // checkbox's visual treatment (`room-panel-checkbox-*` in shell.css)
+    // rather than a bare native input, and the "Room name" section it used to
+    // live in is gone too — the panel title is click-to-edit now (see
+    // `renderRoomPanelTitle`) — so this gets its own small section.
+    const autoConnectSection = el("div", { className: "room-panel-autoconnect-section" });
+    const autoConnectLabel = el("label", { className: "room-panel-autoconnect-row" });
     const autoConnectCheckbox = el("input", {
       className: "room-panel-checkbox-input",
       attrs: { type: "checkbox" },
     });
-    autoConnectCheckbox.checked = panelAudioAutoConnect;
-    autoConnectCheckbox.disabled = panelAudioSources.length === 0;
+    autoConnectCheckbox.checked = !!room.auto_connect;
     autoConnectCheckbox.addEventListener("change", () => {
-      panelAudioAutoConnect = autoConnectCheckbox.checked;
-      if (panelAudioAutoConnect) {
-        const source = panelAudioSources.find((s) => s.id === panelAudioSourceId);
-        if (source) startPanelAudioShare(room.room_handle, source);
-      }
-      // Unchecking is deliberately a no-op beyond flipping the flag above —
-      // see the `panelAudioAutoConnect` declaration for why this doesn't
-      // also stop an already-running share.
+      setRoomAutoConnect(room.join_string, autoConnectCheckbox.checked);
     });
     autoConnectLabel.appendChild(autoConnectCheckbox);
     autoConnectLabel.appendChild(el("span", { className: "room-panel-checkbox-box" }));
     autoConnectLabel.appendChild(el("span", { className: "room-panel-checkbox-label", text: "Auto-Connect" }));
-    audioRow.appendChild(autoConnectLabel);
-    audioSection.appendChild(audioRow);
-    body.appendChild(audioSection);
+    autoConnectSection.appendChild(autoConnectLabel);
+    body.appendChild(autoConnectSection);
 
     panel.appendChild(body);
 
@@ -940,45 +888,23 @@
     renderRoomPanel();
   }
 
-  async function fetchPanelAudioSources() {
+  /** Persists the room-detail panel's "Auto-Connect" checkbox
+   * (`commands::set_room_auto_connect`) and optimistically updates the local
+   * room so the checkbox doesn't visually snap back while the round trip is
+   * in flight. */
+  async function setRoomAutoConnect(joinString, autoConnect) {
+    const room = mockRooms.find((r) => r.join_string === joinString);
+    if (room) room.auto_connect = autoConnect;
     if (window.__TAURI__) {
       try {
-        return await Promise.race([
-          window.__TAURI__.core.invoke("list_audio_sources"),
-          new Promise((_, reject) => setTimeout(() => reject(new Error("timed out")), 3000)),
-        ]);
+        await window.__TAURI__.core.invoke("set_room_auto_connect", { joinString, autoConnect });
       } catch (e) {
-        console.error("list_audio_sources failed or timed out", e);
-        return [];
+        console.error("set_room_auto_connect failed", e);
       }
-    }
-    return [
-      { id: 1, name: "System Output" },
-      { id: 2, name: "Game (app audio)" },
-    ];
-  }
-
-  async function startPanelAudioShare(roomHandle, source) {
-    if (window.__TAURI__) {
-      await window.__TAURI__.core.invoke("select_audio_source", { id: source.id, name: source.name });
-      await window.__TAURI__.core.invoke("start_audio_share", { roomHandle });
-      await refreshStreams();
-      if (window.StreamControl) window.StreamControl.refresh();
+      await refreshRooms();
       return;
     }
-    mockStreams.push({
-      destination_id: Math.floor(Math.random() * 100000),
-      capture_id: Math.floor(Math.random() * 100000),
-      room_handle: roomHandle,
-      room_label: roomLabelFor(roomHandle),
-      kind: "audio",
-      state: "live",
-      width: 0,
-      height: 0,
-      framerate: 0,
-      bitrate_kbps: 128,
-    });
-    renderStreams();
+    renderRoomPanel();
   }
 
   // ---------------------------------------------------------------------

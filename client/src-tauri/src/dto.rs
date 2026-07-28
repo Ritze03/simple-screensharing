@@ -115,6 +115,11 @@ pub struct SavedRoomRow {
     /// only this client's own outgoing streams and stays 0 whenever nobody
     /// local is sharing even though someone else in the room is.
     pub active_stream_count: u32,
+    /// Mirrors `rooms::SavedRoom::auto_connect` — whether this room is
+    /// rejoined automatically at app startup. Always `false` for the "live
+    /// but not (yet) saved" rows `saved_room_rows` synthesizes below, since
+    /// those have no `SavedRoom` entry to carry the flag.
+    pub auto_connect: bool,
 }
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
@@ -384,6 +389,7 @@ pub fn saved_room_rows(state: &AppState) -> Vec<SavedRoomRow> {
                 state: RoomRowState::Joined,
                 room_handle: Some(handle.0),
                 active_stream_count: room.active_stream_count() as u32,
+                auto_connect: saved.auto_connect,
             },
             None if state.is_reconnecting(&saved.join_string) => SavedRoomRow {
                 name: saved.name.clone(),
@@ -391,6 +397,7 @@ pub fn saved_room_rows(state: &AppState) -> Vec<SavedRoomRow> {
                 state: RoomRowState::Reconnecting,
                 room_handle: None,
                 active_stream_count: 0,
+                auto_connect: saved.auto_connect,
             },
             None => SavedRoomRow {
                 name: saved.name.clone(),
@@ -398,6 +405,7 @@ pub fn saved_room_rows(state: &AppState) -> Vec<SavedRoomRow> {
                 state: RoomRowState::Disconnected,
                 room_handle: None,
                 active_stream_count: 0,
+                auto_connect: saved.auto_connect,
             },
         };
         rows.push(row);
@@ -413,6 +421,7 @@ pub fn saved_room_rows(state: &AppState) -> Vec<SavedRoomRow> {
                 state: RoomRowState::Joined,
                 room_handle: Some(handle.0),
                 active_stream_count: room.active_stream_count() as u32,
+                auto_connect: false,
             });
         }
     }
