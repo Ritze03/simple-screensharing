@@ -30,6 +30,17 @@ and confirm which output is HDMI and its geometry. Keep every test window and an
 region confined to DP-1/DP-2/DP-3. If you're not sure a window landed off HDMI, check again
 before proceeding — don't assume a remembered layout still holds.
 
+**Checking monitor geometry beforehand is not enough by itself** — an incident this session
+had a manually-spawned window (an ad hoc `electron .` + `xwininfo` launch, precisely the
+pattern this skill exists to replace) briefly land at an X-coordinate inside the HDMI range,
+caught and killed within seconds but only because it was noticed. Don't rely on noticing:
+after a window is created, verify **its actual reported position** — e.g. with the Playwright
+`_electron` pattern below, explicitly call `BrowserWindow.setPosition(x, y)` (or equivalent)
+to a known-safe DP-1/2/3 coordinate immediately, then confirm the bounds it reports back are
+what you set — *before* doing anything else with that window (screenshots, interaction,
+capture). Treat "I launched it inside the safe range" and "I confirmed where it actually
+landed" as two separate steps, not one.
+
 ## 1. Build the sidecar
 
 Electron spawns the compiled `src-tauri` binary as its backend sidecar. Build it first,
@@ -59,7 +70,10 @@ electron .
 ```
 
 This opens the real Electron window against the real sidecar. Use this for a fast visual
-check. Remember the safety rule above before you do anything with capture/windows.
+check. **This path does not control where the window lands** — the OS/window manager picks
+its position, which is not guaranteed to be on DP-1/2/3. Prefer the scripted path below,
+which explicitly places and verifies the window's position, whenever you're not physically
+watching the screen as it opens.
 
 ### Scripted verification with Playwright's `_electron` driver
 
@@ -87,6 +101,18 @@ const ELECTRON_DIR = __dirname; // run this script from inside electron/
   const page = await electronApp.firstWindow();
   page.on("console", (msg) => console.log(`[page-console:${msg.type()}] ${msg.text()}`));
   page.on("pageerror", (err) => console.log(`[pageerror] ${err.message}`));
+
+  // Safety: force the window onto a known-safe monitor and CONFIRM it landed there —
+  // don't just launch and assume. Re-run `xrandr --listmonitors` first if you haven't
+  // already this session, and use real DP-1/2/3 coordinates, not these placeholders.
+  const bounds = await electronApp.evaluate(({ BrowserWindow }, [x, y]) => {
+    const win = BrowserWindow.getAllWindows()[0];
+    win.setPosition(x, y);
+    return win.getBounds();
+  }, [50, 50]);
+  console.log("[safety] window bounds after placement:", bounds);
+  // bounds.x/bounds.y must be inside DP-1/2/3's range — verify against this run's
+  // `xrandr --listmonitors` output before proceeding. Abort if it isn't.
 
   await page.waitForSelector("#nav", { timeout: 20000 });
 
