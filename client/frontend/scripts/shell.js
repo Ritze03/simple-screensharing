@@ -162,7 +162,16 @@
 
   function setActiveTab(tab) {
     state.activeTab = tab;
-    renderNav();
+    // Toggle the active class on the existing buttons rather than calling
+    // `renderNav()` (which does `nav.innerHTML = ""` and rebuilds fresh
+    // elements): the CSS active-pill is a `transition:` on `.nav-btn`'s
+    // background-image/color, and a transition never plays on a brand-new
+    // element that's inserted already in its final state — only on a class
+    // change to an element already in the DOM. Rebuilding on every switch
+    // silently made the "sliding pill" transition a no-op.
+    document.querySelectorAll("#nav .nav-btn").forEach((btn) => {
+      btn.classList.toggle("nav-btn-active", btn.dataset.tab === tab);
+    });
     document.querySelectorAll(".tab-panel").forEach((panel) => {
       panel.hidden = panel.dataset.tab !== tab;
     });
