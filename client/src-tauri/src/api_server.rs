@@ -464,6 +464,18 @@ fn get_u32(body: &Value, key: &str) -> Result<u32, ApiError> {
         .ok_or_else(|| ApiError::bad_request(format!("missing or invalid u32 field `{key}`")))
 }
 
+/// Optional `u32` field: absent (or `null`) is a legitimate value, not an
+/// error — unlike [`get_u32`], which is for required fields.
+fn opt_u32(body: &Value, key: &str) -> Option<u32> {
+    body.get(key).and_then(Value::as_u64).and_then(|v| u32::try_from(v).ok())
+}
+
+fn get_bool(body: &Value, key: &str) -> Result<bool, ApiError> {
+    body.get(key)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| ApiError::bad_request(format!("missing or non-boolean field `{key}`")))
+}
+
 fn get_u8(body: &Value, key: &str) -> Result<u8, ApiError> {
     body.get(key)
         .and_then(Value::as_u64)
@@ -511,7 +523,12 @@ fn dispatch(name: &str, body: &Value, app: &AppHandle) -> Result<Value, ApiError
         "set_presentation_mode" => result(commands::set_presentation_mode(managed, get_string(body, "mode")?)),
         "set_max_jitter_buffer_ms" => ok(commands::set_max_jitter_buffer_ms(managed, get_u32(body, "ms")?)),
         "start_video_share" => ok(commands::start_video_share(managed, get_u32(body, "room_handle")?)),
-        "start_audio_share" => ok(commands::start_audio_share(managed, get_u32(body, "room_handle")?)),
+        "start_audio_share" => {
+            ok(commands::start_audio_share(managed, get_u32(body, "room_handle")?, opt_u32(body, "for_capture_id")))
+        }
+        "set_audio_share_muted" => {
+            ok(commands::set_audio_share_muted(managed, get_u32(body, "capture_id")?, get_bool(body, "muted")?))
+        }
         "stop_share" => ok(commands::stop_share(managed, get_u32(body, "capture_id")?)),
         "list_audio_sources" => result(tauri::async_runtime::block_on(commands::list_audio_sources())),
         "select_audio_source" => ok(commands::select_audio_source(managed, get_u32(body, "id")?, get_string(body, "name")?)),

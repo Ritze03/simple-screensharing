@@ -1723,7 +1723,7 @@ impl App {
             };
             return (theme::WARNING, label);
         }
-        match dest.state() {
+        match capture.destination_state(dest) {
             capture::destination::DestinationState::Starting => {
                 (theme::WARNING, t!("share.state_starting").to_string())
             }
@@ -1861,7 +1861,7 @@ impl App {
     fn apply_stream_action(&mut self, action: StreamAction) {
         match action {
             StreamAction::StartCapture(room) => self.state.start_video_share(room),
-            StreamAction::StartAudio(room) => self.state.start_audio_share(room),
+            StreamAction::StartAudio(room) => self.state.start_audio_share(room, None),
             StreamAction::RefreshAudio => self.state.refresh_audio_sources(),
             StreamAction::StopDestination(destination_id) => self.state.stop_destination(destination_id),
             StreamAction::Transfer(destination_id, room) => self.state.transfer_destination(destination_id, room),
@@ -2267,6 +2267,7 @@ mod session_model_tests {
             kind: StreamKind::Video,
             label: "test".to_string(),
             status: ShareStatus::Starting(rx),
+            audio_for_capture: None,
             destinations,
             self_preview_texture: None,
         }
@@ -3135,6 +3136,7 @@ mod tests {
                 kind: StreamKind::Video,
                 label: "test capture".to_string(),
                 status: ShareStatus::Active(ShareHandle::Video(capture_handle)),
+                audio_for_capture: None,
                 destinations: IndexMap::from([(
                     destination_a,
                     Destination {

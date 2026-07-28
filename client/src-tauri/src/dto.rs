@@ -161,6 +161,15 @@ pub struct DestinationRow {
     pub height: u32,
     pub framerate: u32,
     pub bitrate_kbps: u32,
+    /// Audio rows only: the `capture_id` of the screen share this audio was
+    /// attached to, so the frontend can render it as a row *inside* that
+    /// share's card instead of as a card of its own. See
+    /// `session::LocalCapture::audio_for_capture` for why the pairing is
+    /// explicit rather than inferred from the room.
+    pub paired_capture_id: Option<u32>,
+    /// Audio rows only: whether the share is currently muted (the Mute/Unmute
+    /// toggle's state). Always `false` for video.
+    pub muted: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -209,6 +218,11 @@ pub struct DestinationStatsDto {
     pub destination_id: u32,
     pub captured_fps: u32,
     pub sent_fps: u32,
+    /// Audio destinations only: the live capture level, 0.0 (silence) to 1.0
+    /// (full scale), straight off the capture pipeline's `level` element (see
+    /// `audio::AudioLevel`). `None` for video, which has no such thing.
+    /// Drives the VU meter on the screen share card's audio row.
+    pub audio_level: Option<f32>,
 }
 
 /// One watched stream's live throughput: `received_fps` is
@@ -376,12 +390,14 @@ pub fn destination_rows(state: &AppState) -> Vec<DestinationRow> {
                 room_handle: dest.room.0,
                 kind: if capture.kind == simple_screensharing_client::protocol::StreamKind::Audio { "audio" } else { "video" },
                 label: capture.label.clone(),
-                state: destination_state_label(&dest.state()),
+                state: destination_state_label(&capture.destination_state(dest)),
                 pending: dest.pending.map(pending_label),
                 width: params.width,
                 height: params.height,
                 framerate: params.framerate,
                 bitrate_kbps: params.bitrate_kbps,
+                paired_capture_id: capture.audio_for_capture.map(|c| c.0),
+                muted: state.is_audio_share_muted(*capture_id),
             });
         }
     }

@@ -191,7 +191,7 @@ fn tick(app_handle: &AppHandle, last: &mut Snapshot) {
     let mut dest_snapshot = HashMap::new();
     for capture in state.captures.values() {
         for (destination_id, dest) in &capture.destinations {
-            let label = dto::destination_state_label(&dest.state());
+            let label = dto::destination_state_label(&capture.destination_state(dest));
             dest_snapshot.insert(destination_id.0, label);
             if last.destinations.get(&destination_id.0) != Some(&label) {
                 let _ = app_handle.emit(
@@ -247,15 +247,36 @@ fn tick(app_handle: &AppHandle, last: &mut Snapshot) {
     // tick — see `dto::StreamStatsUpdated`'s doc comment for why this one
     // is never diff-suppressed like the events above.
     let mut destinations = Vec::new();
-    for capture in state.captures.values() {
-        let session::ShareStatus::Active(session::ShareHandle::Video(handle)) = &capture.status else { continue };
-        for &destination_id in capture.destinations.keys() {
-            let key = simple_screensharing_client::capture::DestKey(destination_id.0);
-            destinations.push(dto::DestinationStatsDto {
-                destination_id: destination_id.0,
-                captured_fps: handle.encoder_fps(key),
-                sent_fps: handle.sent_fps(key),
-            });
+    for (capture_id, capture) in &state.captures {
+        match &capture.status {
+            session::ShareStatus::Active(session::ShareHandle::Video(handle)) => {
+                for &destination_id in capture.destinations.keys() {
+                    let key = simple_screensharing_client::capture::DestKey(destination_id.0);
+                    destinations.push(dto::DestinationStatsDto {
+                        destination_id: destination_id.0,
+                        captured_fps: handle.encoder_fps(key),
+                        sent_fps: handle.sent_fps(key),
+                        audio_level: None,
+                    });
+                }
+            }
+            // Audio shares have no frame counters, but they do have a live
+            // capture level — which is what the screen share card's audio row
+            // animates. Emitting it on the same already-flowing
+            // `stream-stats-updated` tick keeps the meter off the sig-diffed
+            // render path, exactly like the FPS readout and sparkline.
+            session::ShareStatus::Active(session::ShareHandle::Audio(_)) => {
+                let level = state.audio_share_level(*capture_id).unwrap_or(0.0);
+                for &destination_id in capture.destinations.keys() {
+                    destinations.push(dto::DestinationStatsDto {
+                        destination_id: destination_id.0,
+                        captured_fps: 0,
+                        sent_fps: 0,
+                        audio_level: Some(level),
+                    });
+                }
+            }
+            _ => {}
         }
     }
 

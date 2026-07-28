@@ -1677,6 +1677,7 @@ async fn retry_destination_preserves_prior_encoder_tuning() {
             kind: crate::protocol::StreamKind::Video,
             label: "Screen share".to_string(),
             status: crate::session::ShareStatus::Active(crate::session::ShareHandle::Video(capture_handle)),
+            audio_for_capture: None,
             destinations: indexmap::IndexMap::from([(
                 destination_id,
                 crate::session::Destination {
@@ -1872,21 +1873,26 @@ async fn watching_video_automatically_delivers_the_sharers_audio_too() {
     // watching. A synthetic `audiotestsrc ! pipewiresink` app stands in for
     // "some app on the sharer's machine is playing audio".
     //
-    // `Why volume=0:` this test runs against a real desktop session, and the
-    // *receiving* end is a real `autoaudiosink` — so a default-amplitude
-    // `audiotestsrc` plays a 440Hz sine out of the developer's actual
-    // speakers for the whole run. (It did. It was exactly as unpleasant as
-    // it sounds, and it interrupted the project owner mid-session.)
+    // `Why volume=0.02 and not 0:` this test runs against a real desktop
+    // session and the *receiving* end is a real `autoaudiosink`, so a
+    // default-amplitude `audiotestsrc` plays a 440Hz sine out of the
+    // developer's actual speakers for the whole run. (It did. It was exactly
+    // as unpleasant as it sounds, and it interrupted the project owner
+    // mid-session.) 0.02 is ~34 dB down — inaudible in practice — but,
+    // unlike digital silence, it is *distinguishable from nothing*.
     //
-    // Muting the source weakens nothing this test asserts. Silence is still
-    // a real, continuously produced PCM stream: it goes through the same
-    // real `pw-loopback` tap, the same real Opus encode, encryption,
-    // fragmentation, relay round trip, decryption, jitter buffer and decode
-    // as any other audio. Every assertion below is about *pipeline liveness
-    // and subscription state* — `AudioDecoder::is_alive()`, map membership,
-    // the `auto` flag — none of which depend on the waveform's amplitude.
+    // That distinction is the whole point. This test used to use `volume=0`
+    // on the reasoning that "every assertion here is about pipeline liveness
+    // and subscription state, none of which depend on amplitude" — which was
+    // true, and was the bug: the test passed with flying colours while the
+    // sender was capturing the wrong PipeWire node entirely and no audio
+    // from the shared application ever reached the viewer (see
+    // `audio::build_pipeline`'s doc comment). A test that cannot tell "audio
+    // is flowing" from "audio is not flowing" cannot protect this feature,
+    // so the assertions below now check the sender's real capture level and
+    // the receiver's real packet count, both of which need a signal.
     let mut silent_audio_app = Command::new("gst-launch-1.0")
-        .args(["audiotestsrc", "volume=0", "!", "audioconvert", "!", "pipewiresink", &format!("client-name={PW_CLIENT_NAME}")])
+        .args(["audiotestsrc", "volume=0.02", "!", "audioconvert", "!", "pipewiresink", &format!("client-name={PW_CLIENT_NAME}")])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1938,6 +1944,44 @@ async fn watching_video_automatically_delivers_the_sharers_audio_too() {
         "the video watch should point at the sharer's audio stream"
     );
     eprintln!("[audio-follows-video] step 3 OK: viewer is playing the sharer's audio with zero extra actions");
+
+    // --- Step 3b: and the audio is REAL. Liveness and bookkeeping were all
+    // this used to check, and all of it stayed true while nothing was
+    // audible. These two assertions are the ones that would have caught it:
+    // a non-zero capture level on the sender (the tap is picking up the
+    // application's actual signal) and a non-zero packet count on the
+    // viewer's decoder (those packets crossed the relay and arrived). ---
+    let mut capture_level = 0.0;
+    let mut packets = 0;
+    for _ in 0..80 {
+        viewer.drain_events(&ctx);
+        capture_level = audio_handle.level();
+        packets = viewer.rooms[&room_handle]
+            .audio_watches
+            .lock()
+            .unwrap()
+            .get(&(owner, AUDIO_STREAM_ID))
+            .map(|w| w.decoder.packets_received())
+            .unwrap_or(0);
+        if capture_level > 0.0 && packets > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        capture_level > 0.0,
+        "the sharer's audio capture reported a level of {capture_level} — it is not picking up the \
+         application's signal at all (mis-targeted `pipewiresrc`? see `audio::build_pipeline`)"
+    );
+    assert!(
+        packets > 0,
+        "the viewer's audio decoder received {packets} packets — the pipeline is alive but no audio \
+         is actually arriving, which is exactly the failure this test used to sail straight past"
+    );
+    eprintln!(
+        "[audio-follows-video] step 3b OK: real audio is flowing (sender capture level {capture_level:.3}, \
+         viewer received {packets} Opus packets)"
+    );
 
     // --- Step 4: stopping the VIDEO watch stops the audio too. ---
     viewer.rooms.get_mut(&room_handle).unwrap().toggle_watch(owner, VIDEO_STREAM_ID);

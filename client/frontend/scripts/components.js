@@ -529,7 +529,15 @@
    *   display, not part of any DTO).
    * @param {object} handlers - { onEditApply(destinationId, {bitrateKbps, tune,
    *   qualityLevel, rateControl}), onTransfer(destinationId, roomHandle),
-   *   onFanout(captureId, roomHandle), onStop(destinationId) }
+   *   onFanout(captureId, roomHandle), onStop(destinationId),
+   *   onAddAudio(dest, source), onAudioMute(captureId, muted),
+   *   onAudioStop(audioDestinationId), onRefreshAudioSources() }
+   *
+   * `kind: 'audio'` rows never reach this function any more: audio is not a
+   * stream of its own in this UI, it is a line inside the screen share it
+   * belongs to (`opts.audio`). See `stream-control.js`'s
+   * `updateActiveSharesCard`, which pairs them up and filters audio rows out
+   * of the top-level list.
    * @param {object} [opts] - { roomOptions: [{id,name}], perStreamBitrateEditable: bool,
    *   roomsAlreadyFedByCapture: number[], editState: {tune, qualityLevel, rateControl,
    *   error}, stalledSince: number|null } — `editState` is this destination's local
@@ -538,7 +546,10 @@
    *   values back from — same write-only limitation the Bitrate slider already
    *   has). `stalledSince` is the caller's client-side-tracked "first observed
    *   Stalled at" timestamp (ms epoch) — see `statusBadge`'s doc comment for why
-   *   this can't come from the DTO itself.
+   *   this can't come from the DTO itself. `audio` is this share's paired
+   *   audio `DestinationRow` (or null); `audioSources` is the last-fetched
+   *   `list_audio_sources` result, used to populate the "+ Add audio"
+   *   picker.
    */
   function destinationCard(dest, handlers, opts) {
     handlers = handlers || {};
@@ -568,7 +579,6 @@
     // nothing live to show.
     if (meta.family === "failed") {
       const head = el("div", { className: "dest-card-head" });
-      if (dest.kind === "audio") head.appendChild(icon("volume_up", "stream-audio-glyph"));
       head.appendChild(el("span", { className: "dest-room-label", text: dest.room_label }));
       wrap.appendChild(head);
       wrap.appendChild(
@@ -596,12 +606,11 @@
     // command surface exposes either. Both would need a small backend
     // addition — out of this pass's frontend-only scope — so this stays a
     // placeholder rather than blocking the rest of the card polish on it.
-    const thumb = el("div", { className: "dest-thumb" }, [icon(dest.kind === "audio" ? "volume_up" : "videocam", "dest-thumb-icon")]);
+    const thumb = el("div", { className: "dest-thumb" }, [icon("videocam", "dest-thumb-icon")]);
 
     const body = el("div", { className: "dest-card-body" });
 
     const head = el("div", { className: "dest-card-head" });
-    if (dest.kind === "audio") head.appendChild(icon("volume_up", "stream-audio-glyph"));
     head.appendChild(el("span", { className: "dest-room-label", text: dest.room_label }));
     head.appendChild(statusBadge(meta.family, meta.label, meta.family === "degraded" ? { since: opts.stalledSince } : {}));
     body.appendChild(head);
@@ -630,14 +639,9 @@
         el("span", { className: "dest-metric-value", text: value }),
       ]);
 
-    if (dest.kind === "audio") {
-      // An audio destination has no resolution/framerate to report.
-      metaRow.appendChild(metric("Bitrate", `${dest.bitrate_kbps} kbps`));
-    } else {
-      metaRow.appendChild(metric("Resolution", `${dest.width}×${dest.height}`));
-      metaRow.appendChild(metric("Framerate", `${dest.framerate} fps`));
-      metaRow.appendChild(metric("Bitrate", `${dest.bitrate_kbps} kbps`));
-    }
+    metaRow.appendChild(metric("Resolution", `${dest.width}×${dest.height}`));
+    metaRow.appendChild(metric("Framerate", `${dest.framerate} fps`));
+    metaRow.appendChild(metric("Bitrate", `${dest.bitrate_kbps} kbps`));
 
     // Kept (now empty) so anything still keying off `.dest-meta` finds it;
     // the visible text moved into the metric columns above. Also acts as
@@ -911,9 +915,136 @@
     actions.appendChild(dangerButton("Stop", () => handlers.onStop && handlers.onStop(dest.destination_id), { className: "dest-action-btn" }));
     body.appendChild(actions);
 
+    // Audio sub-row — the share's audio, attached to the share rather than
+    // living in a card (or a whole separate "SHARE AUDIO" panel) of its own.
+    // Audio is not a second stream the user manages; it is a property of the
+    // screen share, so it renders as one extra line under a hairline rule.
+    // Video-only: an audio destination never renders a card, so it never
+    // reaches this branch (see `stream-control.js`'s `updateActiveSharesCard`).
+    if (dest.kind !== "audio") {
+      body.appendChild(el("div", { className: "dest-divider" }));
+      body.appendChild(opts.audio ? audioAttachedRow(opts.audio, handlers) : addAudioRow(dest, handlers, opts));
+    }
+
     wrap.appendChild(thumb);
     wrap.appendChild(body);
     return wrap;
+  }
+
+  /**
+   * The attached-audio line: `[meter] [app name] [Mute/Unmute] [Stop]`.
+   *
+   * @param {object} audio - the paired audio `DestinationRow` (its `label` is
+   *   the captured application's name — `session::start_audio_share` sets the
+   *   capture's label to the picked source's name — and `muted` is the
+   *   toggle's current state).
+   * @param {object} handlers - { onAudioMute(captureId, muted), onAudioStop(destinationId) }
+   */
+  function audioAttachedRow(audio, handlers) {
+    const row = el("div", { className: "dest-audio-row" });
+
+    // Meter: fixed bar count, animated out-of-band by `stream-control.js`'s
+    // `updateStats()` off the `audio_level` field on the already-flowing
+    // `stream-stats-updated` tick — same direct-DOM-write approach as the
+    // FPS readout and sparkline, so a level change never rebuilds the card.
+    // `data-audio-destination-id` is how that function finds this meter from
+    // a stats payload keyed by the *audio* destination id, given the meter
+    // lives inside the *video* destination's card.
+    const meter = el("div", {
+      className: "dest-audio-meter",
+      attrs: { "data-audio-destination-id": String(audio.destination_id), "aria-hidden": "true" },
+    });
+    for (let i = 0; i < AUDIO_METER_BARS; i++) meter.appendChild(el("span", { className: "dest-audio-meter-bar" }));
+    row.appendChild(meter);
+
+    row.appendChild(el("span", { className: "dest-audio-name", text: audio.label, attrs: { title: audio.label } }));
+
+    // `Why a fixed width:` the label flips between "Mute" and "Unmute", and
+    // a button that resizes on every toggle shoves the Stop button next to
+    // it sideways — the owner called this out explicitly. The width is
+    // reserved in CSS (`.dest-audio-mute`, sized for the longer word) rather
+    // than measured here, so it holds regardless of font loading.
+    const muted = !!audio.muted;
+    row.appendChild(
+      secondaryButton(muted ? "Unmute" : "Mute", () => handlers.onAudioMute && handlers.onAudioMute(audio.capture_id, !muted), {
+        className: "dest-audio-mute" + (muted ? " dest-audio-mute-on" : ""),
+      })
+    );
+
+    row.appendChild(
+      dangerButton("Stop", () => handlers.onAudioStop && handlers.onAudioStop(audio.destination_id), { className: "dest-audio-stop" })
+    );
+
+    return row;
+  }
+
+  /** How many bars the attached-audio VU meter draws. */
+  const AUDIO_METER_BARS = 5;
+
+  /**
+   * The no-audio-yet line: a dashed "+ Add audio" affordance that expands in
+   * place into the source picker, reusing the same inline-reveal pattern as
+   * the card's "+ Also send to…" fan-out chip rather than opening a dialog
+   * or sending the user back to a separate panel.
+   *
+   * @param {object} opts - { audioSources: [{id,name}], onRefreshAudioSources }
+   */
+  function addAudioRow(dest, handlers, opts) {
+    const row = el("div", { className: "dest-audio-row dest-audio-row-empty" });
+
+    // The list this picker is currently showing. Held in a local rather than
+    // re-read from `opts.audioSources` on every use, because
+    // `onRefreshAudioSources` *replaces* the caller's array (it reassigns
+    // `mockAudioSources = await fetchAudioSources()`), so `opts.audioSources`
+    // keeps pointing at whichever array existed when this card was built.
+    // Reproduced live in the real app: the picker offered the mock
+    // placeholder sources ("Default speakers", "Game (app audio)") instead of
+    // the running applications `list_audio_sources` had just returned.
+    let sources = opts.audioSources || [];
+
+    const picker = el("span", { className: "dest-audio-picker", attrs: { hidden: "" } });
+    const select = el("select", { className: "dest-room-select dest-audio-select" });
+    const rebuildOptions = () => {
+      select.innerHTML = "";
+      if (sources.length === 0) {
+        select.appendChild(el("option", { text: "No application is playing audio", attrs: { value: "" } }));
+        return;
+      }
+      sources.forEach((s) => select.appendChild(el("option", { text: s.name, attrs: { value: s.id } })));
+    };
+    rebuildOptions();
+    picker.appendChild(select);
+    picker.appendChild(
+      primaryButton("Share", () => {
+        const source = sources.find((s) => String(s.id) === select.value);
+        if (source) handlers.onAddAudio && handlers.onAddAudio(dest, source);
+      }, { className: "dest-audio-share-btn" })
+    );
+
+    const addBtn = el("button", {
+      className: "dest-chip-add-btn dest-audio-add-btn",
+      text: "+ Add audio",
+      onClick: async () => {
+        // Re-list on open: which applications are producing audio changes
+        // constantly, so a list captured at card-build time is stale by
+        // definition. Awaiting here (rather than pre-fetching every render)
+        // also keeps `list_audio_sources`' real system-audio query off the
+        // render path.
+        if (handlers.onRefreshAudioSources) {
+          const fresh = await handlers.onRefreshAudioSources();
+          if (Array.isArray(fresh)) sources = fresh;
+        }
+        rebuildOptions();
+        addBtn.hidden = true;
+        picker.hidden = false;
+        select.focus();
+      },
+    });
+    row.appendChild(icon("volume_off", "dest-audio-empty-icon"));
+    row.appendChild(el("span", { className: "dest-audio-empty-text", text: "No audio attached" }));
+    row.appendChild(addBtn);
+    row.appendChild(picker);
+    return row;
   }
 
   window.Components = {
