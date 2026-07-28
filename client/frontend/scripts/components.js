@@ -554,12 +554,18 @@
     };
     const meta = STATE_META[dest.state] || { label: dest.state, family: "progress" };
 
+    // `dest-card-<state>` also drives the 4px left accent bar (stream-control.css's
+    // `.dest-card::before` family) — solid green for live, an animated
+    // diagonal stripe for starting/rebuilding (progress), the shared amber
+    // hatch for stalled (degraded), reusing status.css's exact status-
+    // vocabulary treatments rather than inventing new colors/animations.
     const wrap = el("div", { className: "dest-card dest-card-" + dest.state });
 
     // Failed is a squared card, not a pill (status.css's `.status-failed-box`
     // header note) — its own compact layout rather than the meta/edit/actions
     // stack every other state gets, since none of that applies to a
-    // destination producing no frames.
+    // destination producing no frames. No preview thumbnail either — there's
+    // nothing live to show.
     if (meta.family === "failed") {
       const head = el("div", { className: "dest-card-head" });
       if (dest.kind === "audio") head.appendChild(icon("volume_up", "stream-audio-glyph"));
@@ -575,17 +581,46 @@
       return wrap;
     }
 
+    // Preview thumbnail — a static icon/gradient placeholder, not a live
+    // decode. A real self-preview (sharer decoding their own outgoing stream
+    // via `tile-video.js`'s `TileVideo`/`stream_video_url`, the same
+    // pipeline the View tab uses) was investigated for this pass: it needs
+    // (a) the sharer's own `conn_id` and (b) the capture's video `stream_id`
+    // to call `toggle_watch`/`stream_video_url` against — neither is exposed
+    // by any existing Tauri command (`DestinationRow` carries no `stream_id`/
+    // `owner`, and no command surfaces "my own conn_id" to the frontend).
+    // `src/preview.rs`'s periodic-thumbnail sender is also not reusable
+    // as-is: it's the *sending* side of a receiver-facing preview stream
+    // (spec §7.1, consumed by `net.rs`'s `handle_preview_stream`/the old
+    // egui UI's texture upload, see `state.rs`), not something this Tauri
+    // command surface exposes either. Both would need a small backend
+    // addition — out of this pass's frontend-only scope — so this stays a
+    // placeholder rather than blocking the rest of the card polish on it.
+    const thumb = el("div", { className: "dest-thumb" }, [icon(dest.kind === "audio" ? "volume_up" : "videocam", "dest-thumb-icon")]);
+
+    const body = el("div", { className: "dest-card-body" });
+
     const head = el("div", { className: "dest-card-head" });
     if (dest.kind === "audio") head.appendChild(icon("volume_up", "stream-audio-glyph"));
     head.appendChild(el("span", { className: "dest-room-label", text: dest.room_label }));
     head.appendChild(statusBadge(meta.family, meta.label, meta.family === "degraded" ? { since: opts.stalledSince } : {}));
-    wrap.appendChild(head);
+    body.appendChild(head);
 
     if (dest.pendingRoleText) {
-      wrap.appendChild(el("div", { className: "dest-pending-role", text: dest.pendingRoleText }));
+      body.appendChild(el("div", { className: "dest-pending-role", text: dest.pendingRoleText }));
     }
 
-    wrap.appendChild(el("div", { className: "dest-meta", text: `${dest.width}x${dest.height} @ ${dest.framerate}fps` }));
+    // Metric line + inline sparkline. The metric line is the existing real
+    // resolution/framerate text; the sparkline (6 bars) is populated
+    // out-of-band by `stream-control.js`'s `updateStats()`, same as the FPS
+    // readout right below — no historical stats are fetched here, just a
+    // fixed-size row of bar elements for that function to write into.
+    const metaRow = el("div", { className: "dest-meta-row" });
+    metaRow.appendChild(el("div", { className: "dest-meta", text: `${dest.width}x${dest.height} @ ${dest.framerate}fps` }));
+    const sparkline = el("div", { className: "dest-sparkline", attrs: { hidden: "" } });
+    for (let i = 0; i < 6; i++) sparkline.appendChild(el("span", { className: "spark-bar spark-bar-empty" }));
+    metaRow.appendChild(sparkline);
+    body.appendChild(metaRow);
 
     // Live captured/sent FPS readout — populated out-of-band by
     // `stream-control.js`'s `updateStats()` on every `stream-stats-updated`
@@ -593,7 +628,43 @@
     // through this card's normal sig-diffed render path, so a stats tick
     // never triggers a full card rebuild. Starts hidden until the first tick
     // arrives for this destination.
-    wrap.appendChild(el("div", { className: "dest-fps-readout", attrs: { hidden: "" } }));
+    body.appendChild(el("div", { className: "dest-fps-readout", attrs: { hidden: "" } }));
+
+    // "Which rooms" chip row — this capture's already-real multi-destination
+    // fan-out (`opts.roomsAlreadyFedByCapture`, computed by `stream-control.js`
+    // from the live destination list) rendered as small chips, plus a dashed
+    // "Also send to…" chip that reveals the same fan-out picker the actions
+    // row used to always show inline — restyled into a chip, not rebuilt.
+    const fedRoomIds = opts.roomsAlreadyFedByCapture && opts.roomsAlreadyFedByCapture.length ? opts.roomsAlreadyFedByCapture : [dest.room_handle];
+    const chipRow = el("div", { className: "dest-chip-row" });
+    fedRoomIds.forEach((rid) => {
+      const label = rid === dest.room_handle ? dest.room_label : (((opts.roomOptions || []).find((r) => r.id === rid) || {}).name || String(rid));
+      chipRow.appendChild(el("span", { className: "dest-chip", text: label }));
+    });
+    const fanoutOptions = (opts.roomOptions || []).filter((r) => r.id !== dest.room_handle && !fedRoomIds.includes(r.id));
+    if (fanoutOptions.length > 0) {
+      const addWrap = el("span", { className: "dest-chip-inline-add" });
+      const fanoutSelect = el("select", { className: "dest-room-select dest-chip-select", attrs: { hidden: "" } });
+      fanoutOptions.forEach((r) => fanoutSelect.appendChild(el("option", { text: r.name, attrs: { value: r.id } })));
+      const addBtn = el("button", {
+        className: "dest-chip-add-btn",
+        text: "+ Also send to…",
+        onClick: () => {
+          addBtn.hidden = true;
+          fanoutSelect.hidden = false;
+          fanoutSelect.focus();
+        },
+      });
+      fanoutSelect.addEventListener("change", () => {
+        handlers.onFanout && handlers.onFanout(dest.capture_id, Number(fanoutSelect.value));
+        addBtn.hidden = false;
+        fanoutSelect.hidden = true;
+      });
+      addWrap.appendChild(addBtn);
+      addWrap.appendChild(fanoutSelect);
+      chipRow.appendChild(addWrap);
+    }
+    body.appendChild(chipRow);
 
     // Inline bitrate edit — only meaningful in Per-Stream mode (Absolute
     // mode's allocator owns the live bitrate; showing a manual field there
@@ -616,7 +687,7 @@
       });
       editRow.appendChild(slider);
       editRow.appendChild(value);
-      wrap.appendChild(editRow);
+      body.appendChild(editRow);
 
       // Three testing-oriented encoder tuning knobs (`edit_destination`'s
       // `tune`/`quality_level`/`rate_control`) — same `pillSwitch` widget as
@@ -640,7 +711,7 @@
           (value) => applyTuning({ tune: value })
         )
       );
-      wrap.appendChild(tuneRow);
+      body.appendChild(tuneRow);
 
       const qualityRow = el("div", { className: "dest-edit-row" });
       qualityRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Quality Level" }));
@@ -654,7 +725,7 @@
           (value) => applyTuning({ qualityLevel: value })
         )
       );
-      wrap.appendChild(qualityRow);
+      body.appendChild(qualityRow);
 
       const rateControlRow = el("div", { className: "dest-edit-row" });
       rateControlRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Rate Control" }));
@@ -669,17 +740,20 @@
           (value) => applyTuning({ rateControl: value })
         )
       );
-      wrap.appendChild(rateControlRow);
+      body.appendChild(rateControlRow);
 
       if (editState.error) {
-        wrap.appendChild(el("div", { className: "dest-edit-error", text: editState.error }));
+        body.appendChild(el("div", { className: "dest-edit-error", text: editState.error }));
       }
     } else if (dest.computedShareKbps !== undefined) {
-      wrap.appendChild(el("div", { className: "dest-computed-share", text: `Allocated: ${dest.computedShareKbps} kbps` }));
+      body.appendChild(el("div", { className: "dest-computed-share", text: `Allocated: ${dest.computedShareKbps} kbps` }));
     }
 
     const actions = el("div", { className: "dest-actions" });
 
+    // Transfer only here — fan-out ("Also send to…") moved into the chip
+    // row above (`chipRow`'s dashed chip), same `handlers.onFanout` call,
+    // just a restyled entry point instead of a second copy of the picker.
     const roomOptions = (opts.roomOptions || []).filter((r) => r.id !== dest.room_handle);
     if (roomOptions.length > 0) {
       const transferSelect = el("select", { className: "dest-room-select" });
@@ -690,23 +764,13 @@
           className: "dest-action-btn",
         })
       );
-
-      const fanoutOptions = roomOptions.filter((r) => !(opts.roomsAlreadyFedByCapture || []).includes(r.id));
-      if (fanoutOptions.length > 0) {
-        const fanoutSelect = el("select", { className: "dest-room-select" });
-        fanoutOptions.forEach((r) => fanoutSelect.appendChild(el("option", { text: r.name, attrs: { value: r.id } })));
-        actions.appendChild(fanoutSelect);
-        actions.appendChild(
-          secondaryButton("Also send to…", () => handlers.onFanout && handlers.onFanout(dest.capture_id, Number(fanoutSelect.value)), {
-            className: "dest-action-btn",
-          })
-        );
-      }
     }
 
     actions.appendChild(dangerButton("Stop", () => handlers.onStop && handlers.onStop(dest.destination_id), { className: "dest-action-btn" }));
-    wrap.appendChild(actions);
+    body.appendChild(actions);
 
+    wrap.appendChild(thumb);
+    wrap.appendChild(body);
     return wrap;
   }
 

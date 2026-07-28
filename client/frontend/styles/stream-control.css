@@ -69,26 +69,81 @@
 }
 
 /* -------------------------------------------------------------------
- * Active shares — the prominent grid. Equal-width tiles via auto-fit, so 1
- * destination reads as one full-width card and 3-4 read as a tidy grid,
- * never a single tiny stub.
+ * Active shares — per the "Broadcast, single column, 660-720px measure"
+ * design handoff (option 1a): one full-width row per destination, not a
+ * multi-column tile grid — a wide row is what makes room for the
+ * thumbnail-left layout below without crowding the metric/chip/action rows.
  * ----------------------------------------------------------------- */
 
 .sc-active-shares-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  display: flex;
+  flex-direction: column;
   gap: 10px;
 }
 
+/* Card is thumbnail (left) + a flex-column content body (right). Failed
+   cards override back to a plain column below — they have no thumb/body
+   split, just a head + the status.css failed box. */
 .dest-card {
   background: var(--panel-sunken);
   border: 1px solid var(--border-light);
   border-radius: var(--rounding-sm);
-  padding: 10px;
+  padding: 10px 10px 10px 14px;
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 12px;
+  min-width: 0;
+  position: relative;
+  overflow: hidden; /* keeps the accent bar within the card's rounded corners */
+}
+
+.dest-card-body {
+  flex: 1 1 auto;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 6px;
-  min-width: 0;
+}
+
+/* 4px left accent bar — reuses status.css's exact progress/live/degraded
+   visual language (marching stripe / static dot / amber hatch), adapted
+   from a pill to a vertical bar, rather than inventing new colors here. */
+.dest-card::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+}
+
+.dest-card-live::before {
+  background: var(--success);
+}
+
+@keyframes dest-accent-bar-march {
+  from {
+    background-position: 0 0;
+  }
+  to {
+    background-position: 0 12px;
+  }
+}
+
+.dest-card-starting::before,
+.dest-card-rebuilding::before {
+  background-image: repeating-linear-gradient(135deg, var(--pill-accent-bg-lighter) 0 4px, transparent 4px 8px);
+  background-size: 12px 12px;
+  animation: dest-accent-bar-march 0.7s linear infinite;
+}
+
+.dest-card-stalled::before {
+  background-image: var(--hatch-amber-gradient);
+}
+
+.dest-card-failed::before {
+  background: var(--danger);
 }
 
 .dest-card-stalled {
@@ -97,6 +152,40 @@
 
 .dest-card-failed {
   border-color: var(--danger);
+  /* No thumb/body split for a failed card — just the head + status.css's
+     failed box, stacked. */
+  flex-direction: column;
+}
+
+/* Preview thumbnail — static icon/gradient placeholder (see
+   `components.js`'s `destinationCard` doc comment for why: a real live
+   self-preview needs a backend addition this frontend-only pass doesn't
+   make). Fixed 160x90 per the design handoff. */
+.dest-thumb {
+  flex: 0 0 auto;
+  width: 160px;
+  height: 90px;
+  border-radius: var(--rounding-sm);
+  background: linear-gradient(135deg, var(--pill-accent-bg-light), var(--pill-accent-bg));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.dest-thumb-icon {
+  font-size: 28px;
+  color: var(--text);
+  opacity: 0.85;
+}
+
+@media (max-width: 460px) {
+  .dest-card:not(.dest-card-failed) {
+    flex-direction: column;
+  }
+  .dest-thumb {
+    width: 100%;
+    height: 120px;
+  }
 }
 
 .dest-card-head {
@@ -123,9 +212,92 @@
   color: var(--accent);
 }
 
+.dest-meta-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .dest-meta {
   font-size: 12px;
   color: var(--text-dim);
+}
+
+/* Inline 6-bar sparkline — a small client-side rolling window of
+   `sent_fps` samples (see `stream-control.js`'s `updateStats`), rendered as
+   plain CSS bars (no charting library). Starts hidden until the first
+   stats tick, same as `.dest-fps-readout` right below it. */
+.dest-sparkline {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 16px;
+}
+
+.dest-sparkline[hidden] {
+  display: none;
+}
+
+.spark-bar {
+  width: 3px;
+  min-height: 2px;
+  border-radius: 1px;
+  background: var(--pill-accent-bg-lighter);
+}
+
+.spark-bar-empty {
+  background: var(--border-light);
+  height: 2px;
+}
+
+/* "Which rooms" chip row — this capture's already-real fan-out destinations
+   (one capture, N rooms), plus a dashed "Also send to…" chip that reveals
+   the same fan-out picker `dest-actions` used to always show inline. */
+.dest-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+
+.dest-chip {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--pill-accent-bg);
+  color: var(--pill-accent-bg-lighter);
+  white-space: nowrap;
+}
+
+.dest-chip-inline-add {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.dest-chip-add-btn {
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: transparent;
+  border: 1px dashed var(--border);
+  color: var(--text-faint);
+  cursor: pointer;
+}
+
+.dest-chip-add-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.dest-chip-select {
+  max-width: 130px;
+}
+
+.dest-chip-select[hidden] {
+  display: none;
 }
 
 .dest-computed-share {
@@ -322,4 +494,70 @@
   color: var(--text);
   padding: 5px 8px;
   flex: 1 1 140px;
+}
+
+/* -------------------------------------------------------------------
+ * Ghost rows — dashed-border entry points at the end of the Active Shares
+ * list. "Share another screen" jumps to the real "Start a Stream" form
+ * below (no duplicated start logic); "Share audio" expands in place into
+ * the same `startAudioShare()` flow the room-scoped SHARE AUDIO card below
+ * already exposes — a second entry point onto it, not a second copy of it.
+ * ----------------------------------------------------------------- */
+
+.sc-ghost-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.sc-ghost-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px dashed var(--border);
+  border-radius: var(--rounding-sm);
+  color: var(--text-dim);
+  font-size: 12px;
+  cursor: pointer;
+  background: none;
+}
+
+.sc-ghost-row:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.sc-ghost-row-icon {
+  font-size: 16px;
+  flex: 0 0 auto;
+}
+
+.sc-ghost-row-icon-accent {
+  color: var(--accent);
+}
+
+.sc-ghost-row-icon-muted {
+  color: var(--text-faint);
+}
+
+.sc-ghost-audio-expand {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px 2px;
+}
+
+.sc-ghost-audio-expand[hidden] {
+  display: none;
+}
+
+.sc-ghost-audio-select {
+  background: var(--field);
+  border: 1px solid var(--border);
+  border-radius: var(--rounding-sm);
+  color: var(--text);
+  padding: 5px 8px;
 }

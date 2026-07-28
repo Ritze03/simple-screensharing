@@ -35,7 +35,7 @@
 (function () {
   "use strict";
 
-  const { el, card, warningBanner, bandwidthModeToggle, destinationCard, secondaryButton, primaryButton, renderEmptyState, emptyRow } = window.Components;
+  const { el, icon, card, warningBanner, bandwidthModeToggle, destinationCard, secondaryButton, primaryButton, renderEmptyState, emptyRow } = window.Components;
 
   // ---------------------------------------------------------------------
   // Mock data (fallback bodies for the fetch/action functions below).
@@ -339,6 +339,7 @@
     // unbounded leak — small, but avoidable.
     destStalledSince.delete(destinationId);
     destEditState.delete(destinationId);
+    destSparkHistory.delete(destinationId);
     if (window.__TAURI__) {
       await window.__TAURI__.core.invoke("stop_destination", { destinationId });
       return;
@@ -525,6 +526,15 @@
   // and reconcile against. Defaults mirror `capture::TuneMode`/`QualityLevel`/
   // `RateControlMode`'s `Default` impls (low_latency/performance/constant).
   const destEditState = new Map();
+  // destination_id -> number[] (last SPARK_WINDOW `sent_fps` samples, oldest
+  // first). No historical stats are fetched from anywhere — this is just a
+  // small client-side rolling window built up tick-by-tick from
+  // `updateStats()`'s already-flowing `stream-stats-updated` payload, purely
+  // to feed the destination card's inline sparkline (`.dest-sparkline`,
+  // `.spark-bar`). Same leak-avoidance rationale as `destStalledSince`/
+  // `destEditState` above — cleared in `stopDestination`.
+  const destSparkHistory = new Map();
+  const SPARK_BARS = 6;
 
   function getDestEdit(dest) {
     let s = destEditState.get(dest.destination_id);
@@ -648,6 +658,80 @@
   // only its position in the list needs to shift.
   // ---------------------------------------------------------------------
 
+  // Ghost rows ("Share another screen" / "Share audio") — built once and
+  // cached (not rebuilt per-render, unlike everything else in this card)
+  // so the audio row's own expand/collapse toggle survives across
+  // `updateActiveSharesCard` calls without needing to thread its state
+  // through a JSON signature. Moved (never recreated) into whichever card
+  // element (`empty`/`list` variant) is currently live, same `appendChild`-
+  // is-a-no-op-when-already-in-place trick `syncChildren` relies on
+  // elsewhere in this file.
+  let activeSharesGhostEl = null;
+
+  function buildGhostRows() {
+    if (activeSharesGhostEl) return activeSharesGhostEl;
+    const wrap = el("div", { className: "sc-ghost-rows" });
+
+    // "Share another screen" — the real entry point is the "Start a
+    // Stream" card below; this just scrolls/focuses it rather than
+    // duplicating the room/framerate/bitrate form and its start logic.
+    const screenRow = el("div", {
+      className: "sc-ghost-row",
+      attrs: { role: "button", tabindex: "0" },
+      onClick: () => {
+        if (!startCardEl) return;
+        startCardEl.scrollIntoView({ behavior: "smooth", block: "center" });
+        const firstControl = startCardEl.querySelector("select, input, button");
+        if (firstControl) firstControl.focus();
+      },
+    });
+    screenRow.appendChild(icon("cast", "sc-ghost-row-icon sc-ghost-row-icon-accent"));
+    screenRow.appendChild(el("span", { text: "Share another screen" }));
+    wrap.appendChild(screenRow);
+
+    // "Share audio" — expands in place into the same `startAudioShare()`
+    // call the room-scoped SHARE AUDIO card below already exposes (not a
+    // second copy of that flow, just a second, more discoverable entry
+    // point onto it).
+    const audioExpand = el("div", { className: "sc-ghost-audio-expand", attrs: { hidden: "" } });
+    const roomSelect = el("select", { className: "sc-ghost-audio-select" });
+    const sourceSelect = el("select", { className: "sc-ghost-audio-select" });
+    audioExpand.appendChild(roomSelect);
+    audioExpand.appendChild(sourceSelect);
+    audioExpand.appendChild(
+      primaryButton("Share Audio", () => {
+        const roomHandle = Number(roomSelect.value);
+        const source = mockAudioSources.find((s) => String(s.id) === sourceSelect.value) || state.audioSource;
+        startAudioShare(roomHandle, source);
+      })
+    );
+
+    const audioRow = el("div", {
+      className: "sc-ghost-row",
+      attrs: { role: "button", tabindex: "0" },
+      onClick: () => {
+        const opening = audioExpand.hidden;
+        audioExpand.hidden = !opening;
+        if (!opening) return;
+        // Repopulate on open — rooms/sources may have changed since the
+        // last time this was expanded.
+        roomSelect.innerHTML = "";
+        mockJoinedRooms.forEach((r) => roomSelect.appendChild(el("option", { text: r.name, attrs: { value: r.id } })));
+        roomSelect.value = state.scopedRoomHandle;
+        sourceSelect.innerHTML = "";
+        mockAudioSources.forEach((s) => sourceSelect.appendChild(el("option", { text: s.name, attrs: { value: s.id } })));
+        sourceSelect.value = state.audioSource.id;
+      },
+    });
+    audioRow.appendChild(icon("volume_up", "sc-ghost-row-icon sc-ghost-row-icon-muted"));
+    audioRow.appendChild(el("span", { text: "Share audio" }));
+    wrap.appendChild(audioRow);
+    wrap.appendChild(audioExpand);
+
+    activeSharesGhostEl = wrap;
+    return wrap;
+  }
+
   function updateActiveSharesCard(alloc) {
     if (mockDestinations.length === 0) {
       destCardEls.clear();
@@ -662,6 +746,7 @@
           ],
           { className: "sc-active-shares-card" }
         );
+        activeSharesCardEl.appendChild(buildGhostRows());
         activeSharesBodySig = "empty";
         activeSharesGridEl = null;
       }
@@ -672,6 +757,7 @@
       activeSharesCardEl = card("ACTIVE SHARES", [], { className: "sc-active-shares-card" });
       activeSharesGridEl = el("div", { className: "sc-active-shares-grid" });
       activeSharesCardEl.appendChild(activeSharesGridEl);
+      activeSharesCardEl.appendChild(buildGhostRows());
     }
     activeSharesBodySig = "list";
 
@@ -1019,9 +1105,42 @@
       const entry = destCardEls.get(d.destination_id);
       if (!entry) return;
       const readout = entry.el.querySelector(".dest-fps-readout");
-      if (!readout) return;
-      readout.hidden = false;
-      readout.textContent = `Captured: ${Math.round(d.captured_fps)}fps · Sent: ${Math.round(d.sent_fps)}fps`;
+      if (readout) {
+        readout.hidden = false;
+        readout.textContent = `Captured: ${Math.round(d.captured_fps)}fps · Sent: ${Math.round(d.sent_fps)}fps`;
+      }
+
+      // Sparkline: same direct-DOM-write approach as the readout above
+      // (bypasses the sig-diffed render path so a stats tick never triggers
+      // a full card rebuild) — push this tick's `sent_fps` onto the rolling
+      // window, then rescale every bar's height against the window's own
+      // max (not a fixed nominal fps ceiling, so both a 30fps and 240fps
+      // stream's sparkline reads as a legible shape rather than one being
+      // permanently pinned near zero).
+      const spark = entry.el.querySelector(".dest-sparkline");
+      if (!spark) return;
+      let hist = destSparkHistory.get(d.destination_id);
+      if (!hist) {
+        hist = [];
+        destSparkHistory.set(d.destination_id, hist);
+      }
+      hist.push(Number(d.sent_fps) || 0);
+      if (hist.length > SPARK_BARS) hist.shift();
+
+      const max = Math.max(1, ...hist);
+      const bars = spark.querySelectorAll(".spark-bar");
+      const padCount = SPARK_BARS - hist.length;
+      bars.forEach((bar, i) => {
+        const histIdx = i - padCount;
+        if (histIdx < 0) {
+          bar.classList.add("spark-bar-empty");
+          bar.style.height = "";
+          return;
+        }
+        bar.classList.remove("spark-bar-empty");
+        bar.style.height = Math.max(8, Math.round((hist[histIdx] / max) * 100)) + "%";
+      });
+      spark.hidden = false;
     });
   }
 
