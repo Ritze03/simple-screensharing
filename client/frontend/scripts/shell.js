@@ -82,9 +82,21 @@
       name: "Gaming Night",
       state: "joined",
       room_handle: 2,
-      active_stream_count: 0,
+      active_stream_count: 2,
       auto_connect: true,
-      members: [],
+      // Mixed LIVE/not-LIVE roster — exercises the sidebar member/LIVE tree
+      // (`renderRoomRow`, components.js) with more than one member and more
+      // than one simultaneous stream, unlike Movie Night's single-member
+      // case above.
+      members: [
+        { conn_id: 10, display_name: "Ben", owner: 10, stream_id: 0, resolution: "1920x1080", watching: false },
+        { conn_id: 11, display_name: "Cleo", owner: 11, stream_id: 0, resolution: "1280x720", watching: false },
+        { conn_id: 12, display_name: "Sam", owner: 12, stream_id: 0, resolution: null, watching: false },
+      ],
+      streams: [
+        { owner: 10, stream_id: 0, kind: "Video", label: "Game", width: 1920, height: 1080 },
+        { owner: 11, stream_id: 0, kind: "Video", label: "Webcam", width: 1280, height: 720 },
+      ],
     },
     {
       join_string: "server|33333333|old-room-key",
@@ -1149,24 +1161,34 @@
   async function refreshRooms() {
     mockRooms = await fetchRooms();
     // `list_saved_rooms`/`fetchRooms()` returns bare `SavedRoomRow`s with no
-    // roster (see `loadRoomMembers`'s own doc comment) — the open panel's
-    // `.members` from the previous render is gone from these fresh objects.
-    // Without this, any event that calls `refreshRooms()` (this fires on
-    // `presence-updated`, i.e. routinely) would blank the open panel's
-    // member list back to empty even though the roster hasn't actually
-    // changed. Re-fetch it for exactly the room the panel currently has
-    // open (if any) so the visible roster survives the refresh.
-    if (state.activeRoomPanel) {
-      const openRoom = mockRooms.find((r) => r.join_string === state.activeRoomPanel);
-      if (openRoom && openRoom.state === "joined" && openRoom.room_handle != null) {
-        await loadRoomMembers(openRoom);
-      } else {
-        // The room the panel was showing disconnected/vanished out from
-        // under it (left elsewhere, connection dropped) — there's no live
-        // detail left to show, so close it rather than render a stale or
-        // broken panel.
-        closeRoomPanel();
-      }
+    // roster (see `loadRoomMembers`'s own doc comment) — every fresh object
+    // needs its `.members`/`.streams` re-fetched via `room_detail`.
+    //
+    // `Why:` (2026-07-28) this used to fetch only the currently-open room
+    // panel's roster, because only the panel rendered a member list. The
+    // sidebar ROOMS list's inline member/LIVE tree (`renderRoomRow`,
+    // components.js) now needs the same data for *every visible joined
+    // room*, not just the open one — so this fetches all of them, in
+    // parallel. This is a real behavior/cost change: one extra
+    // `room_detail` round-trip per joined room, on every event that calls
+    // `refreshRooms()` (including `presence-updated`, which fires
+    // routinely — see this file's header comment). Accepted rather than
+    // building a cheaper "roster summary" endpoint: this app's room/member
+    // counts are small (a friends screensharing app), so the added chatter
+    // is a handful of extra calls, not a scaling risk. See
+    // `superdoc/features/stream-control.md`'s 2026-07-28 note for the full
+    // tradeoff writeup.
+    await Promise.all(
+      mockRooms
+        .filter((r) => r.state === "joined" && r.room_handle != null)
+        .map((r) => loadRoomMembers(r))
+    );
+    if (state.activeRoomPanel && !mockRooms.some((r) => r.join_string === state.activeRoomPanel && r.state === "joined")) {
+      // The room the panel was showing disconnected/vanished out from under
+      // it (left elsewhere, connection dropped) — there's no live detail
+      // left to show, so close it rather than render a stale or broken
+      // panel.
+      closeRoomPanel();
     }
     renderRooms();
     renderRoomPanel();
