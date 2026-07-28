@@ -482,7 +482,7 @@ fn draw(frame: &mut Frame, app: &App, snap: &Snapshot) {
         Span::raw(" "),
         Span::raw(lifetime_label),
         Span::raw("    "), // fixed gap before the rx column
-        Span::styled(rx_col, highlight_style),
+        Span::styled(rx_col, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
         Span::raw("  "), // fixed gap before the tx column
         Span::styled(tx_col, highlight_style),
         Span::raw(" "),
