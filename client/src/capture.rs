@@ -191,6 +191,7 @@ use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use gstreamer_video as gst_video;
 use gstreamer_video::prelude::*;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::fragment::fragment_frame_with_flags;
@@ -338,7 +339,16 @@ impl EncoderBackend {
 /// (`src-tauri/src/commands.rs`), routed through
 /// [`destination::ChangeTier::BranchSwap`] like every other
 /// resolution/fps/backend change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// `Serialize`/`Deserialize` (snake_case via `rename_all`, matching
+/// `src-tauri/src/dto.rs`'s `parse_tune_mode`/`tune_mode_str` wire strings so
+/// a hand-edited `settings.toml` and the JS layer agree on spelling): needed
+/// so `rooms::AppSettings` can persist the "Start a Stream" form's
+/// last-used value the same way it already stores `BandwidthMode`/
+/// `PresentationMode` directly, rather than going through a separate
+/// string-parsing layer just for this one settings field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TuneMode {
     /// x264enc `tune=zerolatency`. Opt in explicitly when low latency matters
     /// more than compression efficiency.
@@ -358,7 +368,8 @@ pub enum TuneMode {
 /// x264enc's `speed-preset` and vah264enc's `target-usage` are direct
 /// analogues of the same 1 (best quality/slowest) – 7 (fastest/lowest
 /// quality) knob (see [`EncoderBackend::launch_fragment`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum QualityLevel {
     /// x264enc `speed-preset=ultrafast` / vah264enc `target-usage=7` — the
     /// fastest, lowest-quality end of both scales. An explicit opt-in for
@@ -383,7 +394,8 @@ pub enum QualityLevel {
 /// is `pass` (`cbr`/`quant`/`qual`) + `quantizer` — and in particular
 /// `Adaptive` is a deliberate **no-op** there relative to `Constant`: see
 /// [`EncoderBackend::launch_fragment`]'s `Why:` note on that asymmetry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RateControlMode {
     /// vah264enc `rate-control=cbr`. x264enc: this backend's existing
     /// implicit default (plain `bitrate=`, no `pass` override). Matches this

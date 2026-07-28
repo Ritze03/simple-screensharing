@@ -519,6 +519,14 @@ fn dispatch(name: &str, body: &Value, app: &AppHandle) -> Result<Value, ApiError
         "forget_room" => result(commands::forget_room(managed, get_string(body, "join_string")?)),
         "select_active_room" => ok(commands::select_active_room(managed, get_u32(body, "room_handle")?)),
         "get_settings" => ok(commands::get_settings(managed)),
+        "get_start_stream_defaults" => ok(commands::get_start_stream_defaults()),
+        "set_start_stream_defaults" => result(commands::set_start_stream_defaults(
+            get_u32(body, "framerate")?,
+            get_u32(body, "bitrate_kbps")?,
+            get_string(body, "tune")?,
+            get_string(body, "quality_level")?,
+            get_string(body, "rate_control")?,
+        )),
         "set_language" => ok(commands::set_language(managed, get_string(body, "language")?)),
         "set_presentation_mode" => result(commands::set_presentation_mode(managed, get_string(body, "mode")?)),
         "set_max_jitter_buffer_ms" => ok(commands::set_max_jitter_buffer_ms(managed, get_u32(body, "ms")?)),
@@ -534,6 +542,9 @@ fn dispatch(name: &str, body: &Value, app: &AppHandle) -> Result<Value, ApiError
         "select_audio_source" => ok(commands::select_audio_source(managed, get_u32(body, "id")?, get_string(body, "name")?)),
         "set_bitrate" => ok(commands::set_bitrate(managed, get_u32(body, "kbps")?)),
         "set_framerate" => ok(commands::set_framerate(managed, get_u32(body, "fps")?)),
+        "set_tune" => result(commands::set_tune(managed, get_string(body, "tune")?)),
+        "set_quality_level" => result(commands::set_quality_level(managed, get_string(body, "quality_level")?)),
+        "set_rate_control" => result(commands::set_rate_control(managed, get_string(body, "rate_control")?)),
         "start_destination" => ok(commands::start_destination(managed, get_u32(body, "capture_id")?, get_u32(body, "room_handle")?)),
         "transfer_destination" => {
             ok(commands::transfer_destination(managed, get_u32(body, "destination_id")?, get_u32(body, "target_room")?))

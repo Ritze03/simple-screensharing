@@ -12,6 +12,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::capture::{QualityLevel, RateControlMode, TuneMode};
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SavedRoom {
     pub name: String,
@@ -214,6 +216,60 @@ pub struct AppSettings {
     /// this just caps how far it's allowed to grow.
     #[serde(default = "AppSettings::default_max_jitter_buffer_ms")]
     pub max_jitter_buffer_ms: u32,
+    /// The "START A STREAM" form's last-used values (`stream-control.js`'s
+    /// `renderStartStreamCard`) — framerate, bitrate, and the three
+    /// testing-oriented encoder tuning knobs, saved on every change so the
+    /// form pre-fills with what was last used instead of resetting to
+    /// hardcoded defaults on each launch (see `superdoc/features/
+    /// stream-control.md`'s 2026-07-28 note).
+    ///
+    /// `Why its own nested struct rather than five flat fields:` every field
+    /// here is set together by `set_start_stream_defaults`
+    /// (`src-tauri/src/commands.rs`) whenever the form changes, unlike the
+    /// bandwidth/jitter fields above which are each their own independent
+    /// setting with its own save call — grouping them mirrors that they are
+    /// one cohesive "form state", the same way `edit_destination` already
+    /// takes the destination edit panel's fields as one bundle rather than
+    /// five separate commands.
+    #[serde(default)]
+    pub start_stream_defaults: StartStreamDefaults,
+}
+
+/// See [`AppSettings::start_stream_defaults`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct StartStreamDefaults {
+    #[serde(default = "StartStreamDefaults::default_framerate")]
+    pub framerate: u32,
+    #[serde(default = "StartStreamDefaults::default_bitrate_kbps")]
+    pub bitrate_kbps: u32,
+    #[serde(default)]
+    pub tune: TuneMode,
+    #[serde(default)]
+    pub quality_level: QualityLevel,
+    #[serde(default)]
+    pub rate_control: RateControlMode,
+}
+
+impl StartStreamDefaults {
+    fn default_framerate() -> u32 {
+        crate::session::DEFAULT_FRAMERATE
+    }
+
+    fn default_bitrate_kbps() -> u32 {
+        crate::session::DEFAULT_BITRATE_KBPS
+    }
+}
+
+impl Default for StartStreamDefaults {
+    fn default() -> Self {
+        Self {
+            framerate: Self::default_framerate(),
+            bitrate_kbps: Self::default_bitrate_kbps(),
+            tune: TuneMode::default(),
+            quality_level: QualityLevel::default(),
+            rate_control: RateControlMode::default(),
+        }
+    }
 }
 
 impl Default for AppSettings {
@@ -225,6 +281,7 @@ impl Default for AppSettings {
             absolute_total_kbps: Self::default_absolute_total_kbps(),
             destination_floor_kbps: Self::default_destination_floor_kbps(),
             max_jitter_buffer_ms: Self::default_max_jitter_buffer_ms(),
+            start_stream_defaults: StartStreamDefaults::default(),
         }
     }
 }
@@ -351,6 +408,7 @@ mod tests {
             absolute_total_kbps: 12_345,
             destination_floor_kbps: 750,
             max_jitter_buffer_ms: 3_500,
+            start_stream_defaults: StartStreamDefaults::default(),
         };
         let toml_str = toml::to_string_pretty(&settings).unwrap();
         let parsed: AppSettings = toml::from_str(&toml_str).unwrap();
@@ -413,6 +471,31 @@ mod tests {
         assert_eq!(AppSettings::clamp_max_jitter_buffer_ms(5000), 5000);
         assert_eq!(AppSettings::clamp_max_jitter_buffer_ms(9999), 5000);
         assert_eq!(AppSettings::clamp_max_jitter_buffer_ms(2000), 2000);
+    }
+
+    /// A settings file written before `start_stream_defaults` existed must
+    /// still parse, defaulting the whole nested struct rather than failing
+    /// to load — same missing-field tolerance as the other fields above.
+    #[test]
+    fn app_settings_missing_start_stream_defaults_defaults() {
+        let parsed: AppSettings = toml::from_str("language = \"de\"\n").unwrap();
+        assert_eq!(parsed.start_stream_defaults, StartStreamDefaults::default());
+    }
+
+    #[test]
+    fn start_stream_defaults_toml_round_trip() {
+        let settings = AppSettings {
+            start_stream_defaults: StartStreamDefaults {
+                framerate: 60,
+                bitrate_kbps: 12_000,
+                tune: crate::capture::TuneMode::LowLatency,
+                quality_level: crate::capture::QualityLevel::Performance,
+                rate_control: crate::capture::RateControlMode::Adaptive,
+            },
+            ..AppSettings::default()
+        };
+        let parsed: AppSettings = toml::from_str(&toml::to_string_pretty(&settings).unwrap()).unwrap();
+        assert_eq!(parsed.start_stream_defaults, settings.start_stream_defaults);
     }
 
     #[test]

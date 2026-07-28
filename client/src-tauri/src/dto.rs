@@ -185,6 +185,27 @@ pub struct SettingsDto {
     pub framerate: u32,
 }
 
+/// The "START A STREAM" form's persisted last-used values (`rooms::
+/// AppSettings::start_stream_defaults`), read by `get_start_stream_defaults`
+/// and pre-filled into `stream-control.js`'s `state.startForm` at load —
+/// see `commands::get_start_stream_defaults`/`set_start_stream_defaults`.
+///
+/// `tune`/`quality_level`/`rate_control` serialize as the same snake_case
+/// strings `edit_destination`'s `tune`/`quality_level`/`rate_control`
+/// arguments already use (`TuneMode`/`QualityLevel`/`RateControlMode` now
+/// derive `Serialize` with `#[serde(rename_all = "snake_case")]` — see
+/// `capture.rs`), so the frontend's Preset/Advanced-tuning controls read this
+/// DTO with the exact same value set they already send back on `set_start_
+/// stream_defaults`/`edit_destination`, no separate string mapping needed.
+#[derive(Serialize, Clone)]
+pub struct StartStreamDefaultsDto {
+    pub framerate: u32,
+    pub bitrate_kbps: u32,
+    pub tune: TuneMode,
+    pub quality_level: QualityLevel,
+    pub rate_control: RateControlMode,
+}
+
 #[derive(Serialize, Clone)]
 pub struct AudioSourceDto {
     pub id: u32,
