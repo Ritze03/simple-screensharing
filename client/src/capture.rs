@@ -428,7 +428,7 @@ pub enum RateControlMode {
 /// Media Foundation's `mfvideoenc` (the natural Windows analogue of VAAPI
 /// here) is a deliberate fast-follow, not an oversight — same staging as
 /// VAAPI itself was after software-only worked first on Linux.
-fn detect_encoder_backend() -> EncoderBackend {
+pub(crate) fn detect_encoder_backend() -> EncoderBackend {
     // TEST-ONLY escape hatch: lets `end_to_end_test.rs` force the software
     // backend even on a machine where VAAPI is actually available, so the
     // live repro can be run against both backends. Never consulted outside
@@ -1521,6 +1521,21 @@ pub async fn start_sharing_from_test_source(
         CaptureSource::TestSource(source_fragment.to_string()),
     )
     .await
+}
+
+/// TEST-ONLY seam, the zero-destination sibling of
+/// [`start_sharing_from_test_source`]: starts a real `TestSource`-backed
+/// capture pipeline (real GStreamer, real negotiated caps via
+/// [`CaptureHandle::source_caps`]) with **no** destination attached — the
+/// exact shape [`start_capture`] hands `AppState::stage_video_share`, minus
+/// the interactive portal prompt. Exists so an automated test can reproduce
+/// the "attach the first destination to an already-running, zero-destination
+/// capture" path (`AppState::go_live`/`add_destination`'s no-sibling
+/// fallback in `session.rs`) without a human clicking the portal picker.
+#[cfg(test)]
+pub async fn start_capture_from_test_source(framerate: u32, source_fragment: &str) -> Result<CaptureHandle> {
+    ensure_gstreamer_initialized()?;
+    start_capture_with_source(framerate, CaptureSource::TestSource(source_fragment.to_string())).await
 }
 
 /// Shared body of [`start_sharing`] / [`start_sharing_from_test_source`]:
