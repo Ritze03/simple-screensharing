@@ -265,7 +265,17 @@
    * set_volume` resolves the sibling audio stream itself (see its doc
    * comment). */
   async function pushVolume(tile) {
-    if (!window.__TAURI__ || !tile.room_handle) return;
+    // `tile.room_handle` is a real `u32` `RoomHandle` (see
+    // `session::RoomSession::next_room_handle`, which starts at 0) — the
+    // first room ever joined in a client session gets handle 0, and `!0` is
+    // `true` in JS. A plain truthiness check here silently dropped every
+    // volume/mute change for that room for the lifetime of the app process
+    // (no error, no retry — `pushVolume` just returned before ever calling
+    // `invoke`), which is exactly the "the slider doesn't work at all" bug
+    // report: an ordinary session's first (and often only) joined room is
+    // room_handle 0. `fetchWatchedStreams` below already gets this right
+    // (`r.room_handle != null`) — this is the one place that didn't.
+    if (!window.__TAURI__ || tile.room_handle == null) return;
     const percent = tileMuted.has(tile.id) ? 0 : (tileVolume.get(tile.id) ?? DEFAULT_VOLUME);
     try {
       await window.__TAURI__.core.invoke("set_volume", {
