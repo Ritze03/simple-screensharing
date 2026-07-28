@@ -463,6 +463,35 @@
   justify-self: start;
 }
 
+/* Tune / Quality Level / Rate Control: fix the *track* width so all three
+   rows measure identical, and make each row's own segments split that
+   track evenly (`flex: 1 1 0` on the buttons) instead of sizing to their
+   own text. Same scoped-modifier pattern as shell.css's `.add-room-tabs`
+   (the Join/Create tab pair) — a class on this particular `pillSwitch`
+   instance, not a change to `.mode-toggle`/`.mode-toggle-btn` themselves,
+   which the bandwidth-mode toggle, language switch, and encoder preset
+   picker still rely on sizing to content.
+   `Why a fixed px, not width: 100%`: unlike `.add-room-tabs`, these rows
+   are `justify-self: start` in their grid cell, not meant to stretch across
+   it — unrelated content (Room/Preset/Framerate/Bitrate rows) can be much
+   wider. A shared fixed total also means Tune (2 options) reads as "same
+   *track* width" as Quality Level/Rate Control (3 options) even though its
+   two segments are individually wider than their three — that's the
+   intended reading of "all the triple selections have the same width": one
+   consistent block, not three independently-sized tracks.
+   `Why 342px`: fits "Performance"/"Low Latency", the longest labels in
+   play, at 700-weight (the active-segment weight) with comfortable padding
+   in the tightest case (3 segments), confirmed by real-app
+   `getBoundingClientRect()` measurement — see stream-control.md. */
+.dest-tuning-toggle {
+  width: 342px;
+}
+
+.dest-tuning-toggle .mode-toggle-btn {
+  flex: 1 1 0;
+  text-align: center;
+}
+
 /* The Framerate picker reuses `.dest-room-select`'s look (see that rule
    further down) so every dropdown on a destination card reads as one
    control family. All it needs on top of that is to stop the grid

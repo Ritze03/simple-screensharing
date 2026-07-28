@@ -1264,16 +1264,21 @@
 
       const tuneRow = el("div", { className: "dest-edit-row" });
       tuneRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Tune" }));
-      tuneRow.appendChild(
-        pillSwitch(
-          [
-            { value: "low_latency", label: "Low Latency" },
-            { value: "best_quality", label: "Best Quality" },
-          ],
-          editState.tune,
-          (value) => applyTuning({ tune: value })
-        )
+      const tuneToggle = pillSwitch(
+        [
+          { value: "low_latency", label: "Low Latency" },
+          { value: "best_quality", label: "Best Quality" },
+        ],
+        editState.tune,
+        (value) => applyTuning({ tune: value })
       );
+      // `.dest-tuning-toggle`: scoped modifier (see shell.css's
+      // `.add-room-tabs` for the precedent this mirrors) that fixes this
+      // track's *total* width to match the Quality Level/Rate Control rows
+      // below, so all three "Advanced tuning" pill switches read as one
+      // aligned block instead of each sizing to its own longest label.
+      tuneToggle.classList.add("dest-tuning-toggle");
+      tuneRow.appendChild(tuneToggle);
       // Empty value cell: `.dest-edit-row` is `display: contents`, so each
       // row must contribute exactly three children or grid auto-placement
       // spills the next row's label into the value column.
@@ -1282,33 +1287,33 @@
 
       const qualityRow = el("div", { className: "dest-edit-row" });
       qualityRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Quality Level" }));
-      qualityRow.appendChild(
-        pillSwitch(
-          [
-            { value: "performance", label: "Performance" },
-            { value: "balanced", label: "Balanced" },
-            { value: "quality", label: "Quality" },
-          ],
-          editState.qualityLevel,
-          (value) => applyTuning({ qualityLevel: value })
-        )
+      const qualityToggle = pillSwitch(
+        [
+          { value: "performance", label: "Performance" },
+          { value: "balanced", label: "Balanced" },
+          { value: "quality", label: "Quality" },
+        ],
+        editState.qualityLevel,
+        (value) => applyTuning({ qualityLevel: value })
       );
+      qualityToggle.classList.add("dest-tuning-toggle");
+      qualityRow.appendChild(qualityToggle);
       qualityRow.appendChild(el("span"));
       advancedGrid.appendChild(qualityRow);
 
       const rateControlRow = el("div", { className: "dest-edit-row" });
       rateControlRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Rate Control" }));
-      rateControlRow.appendChild(
-        pillSwitch(
-          [
-            { value: "constant", label: "Constant" },
-            { value: "adaptive", label: "Adaptive" },
-            { value: "quality", label: "Quality" },
-          ],
-          editState.rateControl,
-          (value) => applyTuning({ rateControl: value })
-        )
+      const rateControlToggle = pillSwitch(
+        [
+          { value: "constant", label: "Constant" },
+          { value: "adaptive", label: "Adaptive" },
+          { value: "quality", label: "Quality" },
+        ],
+        editState.rateControl,
+        (value) => applyTuning({ rateControl: value })
       );
+      rateControlToggle.classList.add("dest-tuning-toggle");
+      rateControlRow.appendChild(rateControlToggle);
       rateControlRow.appendChild(el("span"));
       advancedGrid.appendChild(rateControlRow);
 
