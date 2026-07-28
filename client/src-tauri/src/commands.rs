@@ -64,6 +64,69 @@ pub fn join_room(managed: State<'_, Managed>, join_string: String, display_name:
     tauri::async_runtime::block_on(async { join_room_impl(&mut managed.state.lock().unwrap(), join_string, display_name) })
 }
 
+/// "Create a room": per the server's `Registry::get_or_create_room` (spec
+/// §10), there is no separate create verb on the wire — a room is
+/// auto-created the instant anyone joins a room-id that doesn't exist yet.
+/// So creating, from this client, is just: mint a fresh room-id + key nobody
+/// has used before, format them into a join string with the server address
+/// the user typed, save that join string locally under `room_name` (the
+/// LOCAL-only nickname — never sent over the wire, same meaning as
+/// `SavedRoomRow.name`/`rooms.rs`'s `RoomStore` elsewhere), and then run the
+/// exact same join flow `join_room` already uses. The first joiner of a
+/// freshly-generated id/key implicitly becomes the room's effective creator.
+///
+/// The room *key* is a real AES-256 AEAD secret (`net::ParsedJoinString`'s
+/// doc comment, and `net.rs`'s frame en/decryption), not a display label —
+/// it is generated here, in Rust, with the `rand` crate's default
+/// (CSPRNG-backed) generator via `rand::random()`, the same call
+/// `end_to_end_test.rs`/`audio.rs`'s own room-id/key generation already uses
+/// elsewhere in this codebase — deliberately not in JS, where there is no
+/// equivalent secure-randomness primitive available to the frontend.
+///
+/// Named under `room_name` *before* connecting (rather than letting the
+/// usual id-derived-fallback naming in `AppState::poll_connect_result` name
+/// it) so the room keeps the human-chosen name the user actually typed:
+/// `poll_connect_result` only auto-names a join string that has no saved
+/// name yet, so pre-seeding the `RoomStore` here is enough — no change
+/// needed there.
+///
+/// `display_name` is deliberately not a parameter: the Create tab has no
+/// separate display-name field (only Server IP + Room Name, per this
+/// feature's spec), so this passes `String::new()` through to
+/// `join_room_impl`, which — same as the sidebar's silent auto-reconnect
+/// call (`shell.js`'s `displayName: ""` call) — leaves `AppState::display_name`
+/// untouched, silently reusing whatever name the last join used (or the
+/// `whoami_fallback()` OS-username default for a first-ever run).
+pub fn create_room_impl(state: &mut AppState, server: String, room_name: String) -> Result<(), String> {
+    let server = server.trim().to_string();
+    if server.is_empty() {
+        return Err("server address must not be empty".to_string());
+    }
+    let room_name = room_name.trim().to_string();
+    if room_name.is_empty() {
+        return Err("room name must not be empty".to_string());
+    }
+
+    let room_id: simple_screensharing_client::protocol::RoomId = rand::random();
+    let room_key: [u8; 32] = rand::random();
+    let join_string = simple_screensharing_client::net::format_join_string(&server, &room_id, &room_key);
+
+    // Pre-seed the local name *before* connecting — see doc comment above.
+    state.room_store.upsert(room_name, join_string.clone());
+    if let Err(e) = state.room_store.save() {
+        state.room_store_error = Some(e.to_string());
+    }
+
+    join_room_impl(state, join_string, String::new())
+}
+
+// See `join_room`'s `Why:` note above — `create_room_impl` transitively
+// calls `join_room_impl`, which spawns.
+#[tauri::command]
+pub fn create_room(managed: State<'_, Managed>, server: String, room_name: String) -> Result<(), String> {
+    tauri::async_runtime::block_on(async { create_room_impl(&mut managed.state.lock().unwrap(), server, room_name) })
+}
+
 /// Whether `leave_room` should be preceded by a confirm dialog — exposed as
 /// its own query so the frontend can decide whether to show one *before*
 /// calling `leave_room` (see the app-shell doc's "Leaving a room" section).

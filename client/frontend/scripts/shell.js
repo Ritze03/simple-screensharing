@@ -39,6 +39,7 @@
     el,
     hatchedBanner,
     dropdown,
+    pillSwitch,
   } = window.Components;
 
   const NAV_TABS = ["Stream Control", "View", "Settings"];
@@ -121,6 +122,12 @@
     // clicked into yet).
     activeRoomPanel: null,
     addRoomOpen: false,
+    // Which tab the "+ Create/Join a Room" card shows — "join" is the
+    // default/pre-selected tab (reset here whenever the card is opened, see
+    // the `add-room-btn` click listener below), "create" mints a brand-new
+    // room via the `create_room` command. Segmented control is `pillSwitch`,
+    // the same component `bandwidthModeToggle` uses.
+    addRoomTab: "join",
     pendingLeaveRoomId: null,
   };
 
@@ -386,6 +393,47 @@
     mockRooms.push({
       join_string: joinString,
       name: displayName || "Room " + Math.random().toString(16).slice(2, 6),
+      state: "joined",
+      room_handle: Math.floor(Math.random() * 100000),
+      active_stream_count: 0,
+      members: [],
+    });
+    state.addRoomOpen = false;
+    renderRooms();
+    renderAddRoomCard();
+  }
+
+  /** Create tab's submit — mints a brand-new room. Unlike `submitJoin`, this
+   * has no display-name field: `create_room` (`commands.rs`) passes an empty
+   * display name through to the same `join_room_impl` `submitJoin` uses,
+   * silently reusing whatever display name the last join set (or this app's
+   * OS-username default) — same "leave it, backend already knows" pattern
+   * the sidebar's own silent auto-reconnect join call uses. The room-id/key
+   * pair backing the new room is generated server-side (well, client-Rust-
+   * side) with the `rand` crate, not here in JS — see `create_room`'s doc
+   * comment for why the key can't be minted with client-side JS randomness. */
+  async function submitCreate(server, roomName, errorEl) {
+    if (window.__TAURI__) {
+      if (errorEl) errorEl.hidden = true;
+      try {
+        await window.__TAURI__.core.invoke("create_room", { server, roomName });
+        state.addRoomOpen = false;
+        await refreshRooms();
+        renderAddRoomCard();
+      } catch (e) {
+        if (errorEl) {
+          errorEl.textContent = String(e);
+          errorEl.hidden = false;
+        }
+      }
+      return;
+    }
+
+    const mockRoomId = Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join("");
+    const mockKey = Array.from({ length: 16 }, () => Math.floor(Math.random() * 16).toString(16)).join("");
+    mockRooms.push({
+      join_string: `${server}|${mockRoomId}|${mockKey}`,
+      name: roomName,
       state: "joined",
       room_handle: Math.floor(Math.random() * 100000),
       active_stream_count: 0,
@@ -985,6 +1033,12 @@
   // "+ Add Room" inline card
   // ---------------------------------------------------------------------
 
+  /** Renders the "+ Create/Join a Room" expanded card: a `pillSwitch`
+   * segmented control (Join first/default, Create second — same visual
+   * pattern as `bandwidthModeToggle`'s "Absolute Maximum"/"Per-Stream
+   * Maximum" toggle, reusing the shared component rather than a hand-rolled
+   * tab strip) over one of two field sets, sharing the same
+   * `.add-room-actions` button-row styling either way. */
   function renderAddRoomCard() {
     const card = document.getElementById("add-room-card");
     const btn = document.getElementById("add-room-btn");
@@ -993,8 +1047,57 @@
     if (!state.addRoomOpen) return;
 
     card.innerHTML = "";
-    card.appendChild(el("div", { className: "section-label add-room-label", text: "Add a room" }));
+    card.appendChild(el("div", { className: "section-label add-room-label", text: "Create/Join a Room" }));
+    card.appendChild(
+      pillSwitch(
+        [
+          { value: "join", label: "Join" },
+          { value: "create", label: "Create" },
+        ],
+        state.addRoomTab,
+        (tab) => {
+          state.addRoomTab = tab;
+          renderAddRoomCard();
+        }
+      )
+    );
 
+    const errorText = el("div", { className: "add-room-error", text: "" });
+    errorText.hidden = true;
+    const actions = el("div", { className: "add-room-actions" });
+
+    if (state.addRoomTab === "create") {
+      // Server IP + Room Name only — no display-name field, see
+      // `submitCreate`'s doc comment for why.
+      card.appendChild(el("label", { className: "field-label", text: "Server IP" }));
+      const serverInput = el("input", { className: "field-input", attrs: { type: "text", placeholder: "e.g. relay.example.com:4433" } });
+      card.appendChild(serverInput);
+
+      card.appendChild(el("label", { className: "field-label", text: "Room Name" }));
+      const roomNameInput = el("input", { className: "field-input", attrs: { type: "text", placeholder: "e.g. Movie Night (only you see this)" } });
+      card.appendChild(roomNameInput);
+
+      card.appendChild(errorText);
+
+      actions.appendChild(
+        primaryButton("Create", () => {
+          const server = serverInput.value.trim();
+          const roomName = roomNameInput.value.trim();
+          if (!server || !roomName) return;
+          submitCreate(server, roomName, errorText);
+        })
+      );
+      actions.appendChild(
+        secondaryButton("Cancel", () => {
+          state.addRoomOpen = false;
+          renderAddRoomCard();
+        })
+      );
+      card.appendChild(actions);
+      return;
+    }
+
+    // Join tab (default) — unchanged from before the tab split.
     card.appendChild(el("label", { className: "field-label", text: "Display name" }));
     const nameInput = el("input", { className: "field-input", attrs: { type: "text", placeholder: "e.g. mo" } });
     card.appendChild(nameInput);
@@ -1003,11 +1106,8 @@
     const linkInput = el("input", { className: "field-input", attrs: { type: "text", placeholder: "" } });
     card.appendChild(linkInput);
 
-    const errorText = el("div", { className: "add-room-error", text: "" });
-    errorText.hidden = true;
     card.appendChild(errorText);
 
-    const actions = el("div", { className: "add-room-actions" });
     actions.appendChild(
       primaryButton("Join", () => {
         const joinString = linkInput.value.trim();
@@ -1219,6 +1319,7 @@
 
     document.getElementById("add-room-btn").addEventListener("click", () => {
       state.addRoomOpen = true;
+      state.addRoomTab = "join"; // Join is always the pre-selected tab on open.
       renderAddRoomCard();
     });
 
