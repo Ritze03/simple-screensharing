@@ -113,7 +113,6 @@
 .media-tile {
   position: relative;
   background: var(--tile-bg);
-  border-radius: var(--rounding);
   box-shadow: var(--tile-ring-live);
   aspect-ratio: 16 / 9;
   overflow: hidden;
