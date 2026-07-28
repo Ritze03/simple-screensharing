@@ -19,10 +19,16 @@
  *
  * Only the Regular (400) weight is available for Geist Mono — no separate
  * bold face was vendored (`Geist-Bold.ttf` in the source asset cache is the
- * *sans*, not mono, bold). Elements styled `font-weight: 700` (nav pills,
- * room names, …) get the browser's synthetic/algorithmic bold instead of a
- * true bold glyph. Acceptable for this shell; swap in a real Geist Mono
- * Bold file later if the synthetic weight ever looks off.
+ * *sans*, not mono, bold). Elements styled `font-weight: 700` in mono
+ * context get the browser's synthetic/algorithmic bold instead of a true
+ * bold glyph. Acceptable for this shell; swap in a real Geist Mono Bold
+ * file later if the synthetic weight ever looks off.
+ *
+ * Geist (the sans family, `--font-sans`) is vendored the same way —
+ * `Geist-Regular.ttf` / `Geist-Bold.ttf` — and unlike Geist Mono has both
+ * weights available, so `font-weight: 700` sans text (titles) gets a real
+ * bold glyph, not a synthetic one. This is now the app's default body font;
+ * see shell.css's `body` rule and tokens.css's `--font-sans` comment.
  */
 
 @font-face {
@@ -31,6 +37,22 @@
   font-weight: 400;
   font-display: swap;
   src: url("../fonts/GeistMono-Regular.ttf") format("truetype");
+}
+
+@font-face {
+  font-family: "Geist";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("../fonts/Geist-Regular.ttf") format("truetype");
+}
+
+@font-face {
+  font-family: "Geist";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("../fonts/Geist-Bold.ttf") format("truetype");
 }
 
 @font-face {

@@ -17,7 +17,7 @@ body {
 body {
   background: var(--panel-base);
   color: var(--text);
-  font-family: var(--font-mono);
+  font-family: var(--font-sans);
   font-size: 14px;
   -webkit-font-smoothing: antialiased;
 }
@@ -62,29 +62,25 @@ input {
   gap: 8px;
 }
 
-/* App icon — a small gradient badge, built from the same accent-gradient
-   tokens as the empty-state badge (status.css) rather than a new hardcoded
-   pair, so the two "gradient chip" moments in this UI stay in sync. */
+/* App icon — the real app mark (assets/icons/mark-32.png), which is
+   already a full-color gradient glyph (blue-to-green screens) on a
+   transparent background. It supplies its own color and contrast, so the
+   gradient-badge/glow chip that used to hold the placeholder "cast" icon
+   was dropped rather than kept underneath — a colored badge behind an
+   already-colored mark looked like a swatch-on-a-swatch, not a logo. */
 .app-icon {
   flex: 0 0 auto;
   width: 22px;
   height: 22px;
-  border-radius: 7px;
   display: flex;
   align-items: center;
   justify-content: center;
-  background: var(--accent-mark-gradient);
-  /* The glow is what makes the mark read as a lit chip rather than a
-     flat swatch — it was missing entirely. */
-  box-shadow: var(--accent-glow-mark);
 }
 
-.app-icon .material-symbols-outlined {
-  font-size: 14px;
-  /* Dark-on-accent, per the prototype — light-on-accent is the lower
-     contrast pairing against this blue. */
-  color: var(--primary-text);
-  font-variation-settings: "wght" 500;
+.app-icon img {
+  width: 100%;
+  height: 100%;
+  display: block;
 }
 
 .sidebar-header h1 {
@@ -812,6 +808,14 @@ input[type="range"]:focus-visible::-webkit-slider-thumb {
   border-color: var(--accent);
 }
 
+/* Join-link fields specifically (not every `.field-input` — room name /
+   server host / display name fields stay proportional): the pasted value
+   is a `server|room-id|key` string, the same class of "value" as a hash or
+   an IP address, so it gets the mono face for readability. */
+.field-input-mono {
+  font-family: var(--font-mono);
+}
+
 .add-room-actions {
   display: flex;
   gap: 6px;
@@ -984,6 +988,11 @@ input[type="range"]:focus-visible::-webkit-slider-thumb {
   font-size: 11px;
   color: var(--text-faint);
   white-space: nowrap;
+  /* Usually a "1920x1080 @30fps" reading (falls back to a state label like
+     "Connecting…" for non-live states, which just renders in mono too —
+     acceptable, it's short and static). */
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
   /* Purely decorative text, never interactive — must not steal clicks from
      the Stop overlay button sitting on top of it once revealed. */
   pointer-events: none;
@@ -1084,7 +1093,10 @@ input[type="range"]:focus-visible::-webkit-slider-thumb {
 .tab-panel h2 {
   margin: 0 0 16px;
   font-size: 15px;
-  font-weight: 600;
+  /* 700, not 600: only 400/700 static Geist faces are vendored, so an
+     in-between weight would fall back to a browser-synthesized fake bold
+     instead of the real Bold glyph. Matches the nav/sidebar title weight. */
+  font-weight: 700;
   letter-spacing: -0.01em;
   color: var(--text);
 }

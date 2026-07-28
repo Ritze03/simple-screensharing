@@ -102,6 +102,7 @@
 .settings-row-value {
   flex: 0 0 auto;
   color: var(--text);
+  font-family: var(--font-mono);
   font-weight: 600;
   font-size: 11px;
   font-variant-numeric: tabular-nums;
