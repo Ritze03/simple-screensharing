@@ -181,6 +181,38 @@
     return (timestamps.length - 1) / (spanMs / 1000);
   }
 
+  /** Drops every not-yet-decoded chunk sitting in `controller.pendingChunks`
+   * and cancels whatever decode this controller currently has scheduled —
+   * called right before `decoder.configure()` runs for a *non-first*
+   * CodecInfo chunk (a mid-connection `BranchSwap`, see
+   * `src-tauri/src/video_server.rs`'s module doc). Without this, chunks
+   * queued under the *old* profile (parsing happens immediately on arrival;
+   * only `decoder.decode()` itself is delayed by the jitter buffer — see
+   * `enqueueChunk`) would still be sitting in the queue with their original
+   * `decodeAtMs`, get `decode()`d *after* the reconfigure, and fail against
+   * the now-reconfigured decoder — which fires the decoder's `error`
+   * callback and permanently kills the whole tile (see that callback's own
+   * comment), turning a transient profile swap into a hard failure instead
+   * of the brief, self-healing hiccup it's meant to be. Must clear
+   * `scheduleTimeoutId` via `clearTimeout` (not just empty the array): the
+   * pending `setTimeout` closure already captured its own `item` reference
+   * to the queue head (see `maybeScheduleNext`), so merely truncating the
+   * array wouldn't stop it from decoding that stale item anyway, and its
+   * unconditional `pendingChunks.shift()` would then desync the queue by
+   * dropping whatever's pushed onto it next instead. Also resets the
+   * playout anchor so pacing for the new stream starts fresh rather than
+   * being computed relative to a pts timeline from before the swap.
+   */
+  function resetJitterBuffer(controller) {
+    if (controller.scheduleTimeoutId != null) {
+      clearTimeout(controller.scheduleTimeoutId);
+      controller.scheduleTimeoutId = null;
+    }
+    controller.pendingChunks.length = 0;
+    controller.anchorArrivalMs = null;
+    controller.anchorPtsUs = null;
+  }
+
   /** Cancels `controller`'s fetch reader and closes its `VideoDecoder`.
    * Operates on the controller object itself, never by looking it back up
    * in `videoControllers` by id — a tile can be re-watched (new fetch, new
@@ -420,7 +452,15 @@
           const payload = buf.subarray(14, totalLen);
 
           if (frameType === 0) {
-            // CodecInfo — always the first chunk of the connection.
+            // CodecInfo — always the first chunk of the connection, but can
+            // also arrive again mid-connection after a `BranchSwap` changes
+            // the profile/level (see `src-tauri/src/video_server.rs`'s
+            // module doc). Drop anything already queued under the old
+            // profile before reconfiguring — see `resetJitterBuffer`'s doc
+            // comment for why a stale queued chunk decoded post-reconfigure
+            // would otherwise kill the tile. A no-op on the very first
+            // CodecInfo chunk, since the queue is still empty then.
+            resetJitterBuffer(controller);
             const codec = new TextDecoder().decode(payload);
             try {
               decoder.configure({ codec, optimizeForLatency: true });
