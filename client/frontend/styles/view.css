@@ -158,52 +158,101 @@
 }
 
 /* -------------------------------------------------------------------
- * No-chrome-by-default + hover overlay (1e's core interaction): nothing
- * but the video and the bottom-left name-plate pill until hovered/focused,
- * then the full overlay (name+room top-left, selection/pop-out controls
- * top-right, fps stats bottom-right) fades in.
+ * Always-visible stat bar (2026-07-29 "prominent stats" redesign — see
+ * `superdoc/features/stream-control.md`'s matching dated entry). Replaces
+ * the old `.media-tile-nameplate` pill, which showed only "name · room"
+ * and was the literal thing the owner called "kinda hidden": bigger, at
+ * the top of every tile, on by default (no hover needed), carrying the
+ * same resolution/fps/bitrate/audio-sharing figures that used to be
+ * hover-gated inside `.media-tile-overlay`. Value styling
+ * (`.media-tile-statbar-value`) borrows `--font-mono` + the size/weight/
+ * tabular-nums recipe from `stream-control.css`'s `.dest-metric-value` —
+ * this app's existing vocabulary for "a live numeric readout on a card",
+ * reused here rather than inventing a second one.
  * ----------------------------------------------------------------- */
 
-/* Prototype name plate: an opaque near-black plate (not a 45% black wash,
-   which let the video bleed through and muddied the text) with a live
-   green dot ahead of the name. */
-.media-tile-nameplate {
+.media-tile-statbar {
   position: absolute;
-  left: 12px;
-  bottom: 12px;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 1;
   display: flex;
   align-items: center;
-  gap: 7px;
-  background: rgba(10, 11, 13, 0.78);
-  border-radius: var(--rounding-sm);
-  padding: 5px 10px 5px 8px;
-  font-size: 11px;
-  font-weight: 400; /* real face, not synthesized 500 — quiet overlay label, not a headline */
-  color: var(--text);
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
+  gap: 8px;
+  padding: 8px 12px;
+  background: linear-gradient(180deg, rgba(10, 11, 13, 0.82) 0%, rgba(10, 11, 13, 0.5) 65%, rgba(10, 11, 13, 0) 100%);
   pointer-events: none;
-  max-width: calc(100% - 16px);
+}
+
+.media-tile-statbar-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--success);
+  box-shadow: var(--success-glow);
+}
+
+.media-tile-statbar-name {
+  flex: 0 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  /* Hidden the instant the hover overlay (which repeats the same name,
-   * plus room + resolution) is visible, so the two don't double up. */
-  transition: opacity 0.12s ease;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
 }
 
-.media-tile-nameplate::before {
-  content: "";
+.media-tile-statbar-sep {
   flex: 0 0 auto;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--success);
+  color: rgba(232, 233, 236, 0.4);
+  font-size: 12px;
 }
 
-.media-tile:hover .media-tile-nameplate,
-.media-tile:focus-within .media-tile-nameplate {
-  opacity: 0;
+/* Numeric readouts (resolution/fps/bitrate) — same recipe as
+   `stream-control.css`'s `.dest-metric-value`: mono, tabular-nums, a step
+   smaller and lighter-weight than the name so the bar reads as
+   name-first, stats-second. Empty spans (e.g. fps/bitrate before the first
+   stats tick) collapse via `:empty` so a fresh tile doesn't show a run of
+   bare " · " separators. */
+.media-tile-statbar-value {
+  flex: 0 0 auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: rgba(232, 233, 236, 0.85);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
 }
+
+.media-tile-statbar-value:empty {
+  display: none;
+}
+
+/* Static "this sender is also sharing audio" indicator — just a glyph, no
+   interaction (the actual mute/volume control stays the hover-only
+   `.media-tile-audio` pill below; this is purely informational, matching
+   the "not-on-screen" card's identical badge). */
+.media-tile-statbar-audio-badge {
+  flex: 0 0 auto;
+  margin-left: 2px;
+  display: flex;
+  align-items: center;
+  color: var(--accent);
+}
+
+.media-tile-statbar-audio-badge .material-symbols-outlined {
+  font-size: 15px;
+}
+
+/* -------------------------------------------------------------------
+ * Hover overlay: now just the hover-reveal actions (pop-out/stop
+ * watching) and the audio mute/volume control — stats live in the
+ * always-visible `.media-tile-statbar` above instead.
+ * ----------------------------------------------------------------- */
 
 /* One full-tile vertical scrim (dark at both ends, clear through the
    middle) rather than two separate strip gradients — the prototype's
@@ -214,7 +263,7 @@
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  background: linear-gradient(180deg, rgba(10, 11, 13, 0.72) 0%, rgba(10, 11, 13, 0.1) 40%, rgba(10, 11, 13, 0.82) 100%);
+  background: linear-gradient(180deg, rgba(10, 11, 13, 0.55) 0%, rgba(10, 11, 13, 0.1) 40%, rgba(10, 11, 13, 0.82) 100%);
   opacity: 0;
   transition: opacity 0.12s ease;
   pointer-events: none;
@@ -227,30 +276,10 @@
 
 .media-tile-overlay-top {
   display: flex;
-  justify-content: space-between;
+  justify-content: flex-end;
   align-items: flex-start;
   gap: 8px;
   padding: 8px;
-  font-size: 11px;
-  color: rgba(232, 233, 236, 0.85);
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
-}
-
-/* Groups the title span + fps span (2026-07-28) so fps reads as part of the
- * same continuous string ("Ana · Movie Night · 1920x1080 @30fps") instead of
- * a disconnected element elsewhere in the overlay, while staying two
- * separate DOM nodes — `tile.onFps`/`updateStats` (view.js) need to keep
- * patching just the fps `<span>`'s text in place on its own tick without
- * touching the title. Plain inline flow (no `display: flex`) is enough:
- * both children are inline `<span>`s, so they lay out on the same line. */
-.media-tile-overlay-title-wrap {
-  pointer-events: none;
-  padding-top: 2px;
-  min-width: 0;
-}
-
-.media-tile-overlay-title {
-  pointer-events: none;
 }
 
 /* Wraps the selection checkbox + pop-out button so both can opt back into
@@ -296,8 +325,9 @@
   background: var(--danger);
 }
 
-/* Bottom bar — audio control only (fps moved up next to the title/
- * resolution, 2026-07-28 — see `.media-tile-overlay-title-wrap` above). */
+/* Bottom bar — audio mute/volume control only (stats live in
+ * `.media-tile-statbar` now, 2026-07-29 — see that rule's header note
+ * above). */
 .media-tile-overlay-bottom {
   pointer-events: none;
   display: flex;
@@ -305,14 +335,6 @@
   align-items: center;
   gap: 10px;
   padding: 10px 12px;
-}
-
-.media-tile-fps {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-  color: rgba(232, 233, 236, 0.85);
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
 }
 
 /* -------------------------------------------------------------------
@@ -569,57 +591,113 @@
   color: var(--text-faint);
 }
 
-.view-not-on-screen-chips {
+.view-not-on-screen-cards {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 10px;
 }
 
-/* Raised card chip at the button radius, per the prototype — this was a
-   sunken 999px lozenge, i.e. lower than the page it sits on. */
-.view-not-on-screen-chip {
+/* Redesigned 2026-07-29 (owner: "kinda hidden ... not visible enough") —
+ * from a small single-line text chip into a substantially bigger card:
+ * two-line info stack (name+room, then resolution/audio meta) plus a
+ * bigger, more clickable play button. `--accent-glow-soft` on hover is the
+ * same "this card wants a click" glow `tokens.css` already uses for other
+ * accent-bordered affordances (e.g. the app-icon badge), reused here
+ * rather than inventing a new hover treatment. */
+.view-not-on-screen-card {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: 12px;
   background: var(--panel-raised);
   border: 1px solid var(--border);
-  border-radius: var(--rounding-sm);
-  padding: 6px 11px 6px 9px;
-  font-size: 11px;
+  border-radius: var(--rounding-md, 10px);
+  padding: 10px 12px 10px 14px;
+  min-width: 220px;
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+
+.view-not-on-screen-card:hover {
+  border-color: var(--accent);
+  box-shadow: var(--accent-glow-soft);
+}
+
+.view-not-on-screen-card-info {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.view-not-on-screen-card-name {
+  font-size: 13px;
+  font-weight: 600;
   color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-/* Hollow dot — these streams are available but NOT on screen, so they
-   deliberately do not get the lit green of a live one. */
-.view-not-on-screen-chip::before {
-  content: "";
-  flex: 0 0 auto;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  border: 1px solid var(--text-faint);
+.view-not-on-screen-card-room {
+  font-size: 11px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
-/* A bare accent glyph, not a filled navy disc — the prototype's play
-   affordance on these chips is just the icon in --accent. */
-.view-not-on-screen-chip-play {
-  pointer-events: auto;
-  background: transparent;
-  border: none;
+.view-not-on-screen-card-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 1px;
+}
+
+/* Resolution readout — same mono/tabular-nums recipe as the on-screen
+ * tile's `.media-tile-statbar-value` and `stream-control.css`'s
+ * `.dest-metric-value`, this app's established "live numeric readout"
+ * vocabulary. */
+.view-not-on-screen-card-value {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+}
+
+.view-not-on-screen-card-audio {
+  display: flex;
+  align-items: center;
   color: var(--accent);
+}
+
+.view-not-on-screen-card-audio .material-symbols-outlined {
+  font-size: 14px;
+}
+
+/* Filled accent circle, not a bare glyph — a bigger, more obviously
+ * clickable play affordance than the old chip's small icon-only button. */
+.view-not-on-screen-card-play {
+  pointer-events: auto;
+  flex: 0 0 auto;
+  margin-left: auto;
+  background: var(--accent-gradient);
+  box-shadow: var(--accent-glow-mark);
+  border: none;
+  color: var(--primary-text, #0b0c10);
   border-radius: 50%;
-  width: 20px;
-  height: 20px;
+  width: 34px;
+  height: 34px;
   display: flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
+  transition: transform 120ms ease;
 }
 
-.view-not-on-screen-chip-play .material-symbols-outlined {
-  font-size: 14px;
+.view-not-on-screen-card-play:hover {
+  transform: scale(1.06);
 }
 
-.view-not-on-screen-chip-play:hover {
-  background: var(--accent-chip-bg);
+.view-not-on-screen-card-play .material-symbols-outlined {
+  font-size: 18px;
 }

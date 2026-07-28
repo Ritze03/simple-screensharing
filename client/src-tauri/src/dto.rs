@@ -366,6 +366,12 @@ pub struct WatchedStatsDto {
     pub owner: ConnId,
     pub stream_id: u8,
     pub received_fps: f64,
+    /// Real received throughput, not the sender's configured encoder
+    /// bitrate — see `decode::ByteRateCounter`'s doc comment for why a
+    /// viewer measures this off actually-arrived bytes rather than reading
+    /// it from the sender (a viewer has no live channel back to the
+    /// sender's own `DestinationStatsDto::bitrate_kbps`).
+    pub received_bitrate_kbps: f64,
 }
 
 pub fn pending_label(role: session::PendingRole) -> &'static str {
