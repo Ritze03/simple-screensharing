@@ -35,7 +35,19 @@
 (function () {
   "use strict";
 
-  const { el, icon, card, warningBanner, bandwidthModeToggle, destinationCard, secondaryButton, primaryButton, renderEmptyState, emptyRow } = window.Components;
+  const {
+    el,
+    icon,
+    card,
+    warningBanner,
+    bandwidthModeToggle,
+    destinationCard,
+    secondaryButton,
+    primaryButton,
+    renderEmptyState,
+    emptyRow,
+    dropdown,
+  } = window.Components;
 
   // ---------------------------------------------------------------------
   // Mock data (fallback bodies for the fetch/action functions below).
@@ -1022,16 +1034,16 @@
 
     const roomField = el("div", { className: "sc-start-field" });
     roomField.appendChild(el("label", { className: "field-label", text: "Room" }));
-    const roomSelect = el("select");
-    mockJoinedRooms.forEach((r) => roomSelect.appendChild(el("option", { text: r.name, attrs: { value: r.id } })));
-    roomSelect.value = state.startForm.roomHandle;
-    roomSelect.addEventListener("change", () => (state.startForm.roomHandle = Number(roomSelect.value)));
+    const roomSelect = dropdown(
+      mockJoinedRooms.map((r) => ({ value: r.id, label: r.name })),
+      state.startForm.roomHandle,
+      (value) => (state.startForm.roomHandle = Number(value))
+    );
     roomField.appendChild(roomSelect);
     form.appendChild(roomField);
 
     const fpsField = el("div", { className: "sc-start-field" });
     fpsField.appendChild(el("label", { className: "field-label", text: "Framerate" }));
-    const fpsSelect = el("select");
     // 90/120/144/165/240 match real monitor refresh rates; 280 exceeds both
     // real monitor Hz and the project's documented 240Hz spec ceiling (see
     // capture::MAX_FRAMERATE's doc comment) — offered anyway per explicit
@@ -1039,9 +1051,11 @@
     // bottlenecks around 20-30fps regardless of capture framerate, so
     // nothing above that is expected to visibly improve *viewer* playback
     // yet; this only widens what capture itself can be asked to run at.
-    [15, 30, 60, 90, 120, 144, 165, 240, 280].forEach((fps) => fpsSelect.appendChild(el("option", { text: fps + " fps", attrs: { value: String(fps) } })));
-    fpsSelect.value = String(state.startForm.fps);
-    fpsSelect.addEventListener("change", () => (state.startForm.fps = Number(fpsSelect.value)));
+    const fpsSelect = dropdown(
+      [15, 30, 60, 90, 120, 144, 165, 240, 280].map((fps) => ({ value: String(fps), label: fps + " fps" })),
+      String(state.startForm.fps),
+      (value) => (state.startForm.fps = Number(value))
+    );
     fpsField.appendChild(fpsSelect);
     form.appendChild(fpsField);
 
@@ -1131,17 +1145,18 @@
   function renderRoomScopedRow() {
     const header = el("div", { className: "sc-room-scoped-header" });
     header.appendChild(el("span", { text: "Room-scoped settings for:" }));
-    const select = el("select");
-    mockJoinedRooms.forEach((r) => select.appendChild(el("option", { text: r.name, attrs: { value: r.id } })));
-    select.value = state.scopedRoomHandle;
-    select.addEventListener("change", async () => {
-      state.scopedRoomHandle = Number(select.value);
-      const room = mockJoinedRooms.find((r) => r.id === state.scopedRoomHandle);
-      state.roomName = room ? room.name : "";
-      state.savedHint = false;
-      mockMembersByRoom[state.scopedRoomHandle] = await fetchRoomMembers(state.scopedRoomHandle);
-      render();
-    });
+    const select = dropdown(
+      mockJoinedRooms.map((r) => ({ value: r.id, label: r.name })),
+      state.scopedRoomHandle,
+      async (value) => {
+        state.scopedRoomHandle = Number(value);
+        const room = mockJoinedRooms.find((r) => r.id === state.scopedRoomHandle);
+        state.roomName = room ? room.name : "";
+        state.savedHint = false;
+        mockMembersByRoom[state.scopedRoomHandle] = await fetchRoomMembers(state.scopedRoomHandle);
+        render();
+      }
+    );
     header.appendChild(select);
 
     // `Why there is no SHARE AUDIO card here any more:` audio stopped being

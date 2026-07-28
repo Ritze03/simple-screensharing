@@ -1172,14 +1172,13 @@ input[type="range"]:focus-visible::-webkit-slider-thumb {
   align-items: center;
 }
 
-.room-panel-audio-row select {
+/* The audio-source picker (`Components.dropdown`, replacing a native
+   `<select>` — see dropdown.css/components.js, 2026-07-28): its own
+   `.dd`/`.dd-trigger` already carry the field chrome, this just fits it
+   into the row's flex layout the way the select used to size itself. */
+.room-panel-audio-row .dd {
   flex: 1 1 auto;
   min-width: 0;
-  background: var(--field);
-  border: 1px solid var(--border);
-  border-radius: var(--rounding-sm);
-  color: var(--text);
-  padding: 6px 8px;
 }
 
 .room-panel-rename-row {
