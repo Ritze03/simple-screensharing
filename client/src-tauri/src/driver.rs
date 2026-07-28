@@ -161,7 +161,7 @@ fn tick(app_handle: &AppHandle, last: &mut Snapshot) {
     }
 
     // 3.5. Prune watches whose underlying stream has stopped.
-    prune_stale_watches(&state, &managed);
+    prune_stale_watches(&mut state, &managed);
 
     // 4. Bandwidth allocation (Absolute-Maximum mode's live wiring; a cheap
     // no-op in Per-Stream mode, see `AppState::apply_bandwidth_allocation`).
@@ -284,13 +284,19 @@ fn tick(app_handle: &AppHandle, last: &mut Snapshot) {
 /// Tauri app has no use for — see `test_tick`'s own doc comment). Pulled out
 /// as its own function specifically so both call sites share one
 /// implementation rather than a second copy silently drifting out of sync.
-pub(crate) fn prune_stale_watches(state: &session::AppState, managed: &Managed) {
-    for (handle, room) in &state.rooms {
+pub(crate) fn prune_stale_watches(state: &mut session::AppState, managed: &Managed) {
+    for (handle, room) in state.rooms.iter_mut() {
         let live: std::collections::HashSet<(u64, u8)> = room.streams.iter().map(|s| (s.owner, s.stream_id)).collect();
         let stale: Vec<(u64, u8)> = room.watches.lock().unwrap().keys().filter(|k| !live.contains(k)).copied().collect();
         for (owner, stream_id) in stale {
             room.watches.lock().unwrap().remove(&(owner, stream_id));
             managed.video_server.stop_route((handle.0, owner, stream_id));
         }
+        // A `WatchEntry` dropped here never went through `toggle_watch`, so
+        // nothing else would ever release the audio watch that was riding
+        // along with it (or its relay-side subscription). Reconciling right
+        // after the prune keeps "audio follows video" true on this path too —
+        // see `session::RoomSession::sync_audio_watches`.
+        room.sync_audio_watches();
     }
 }

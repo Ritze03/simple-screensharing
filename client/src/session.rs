@@ -480,13 +480,18 @@ pub struct WatchEntry {
     /// `Some` while this stream is displayed in its own native window instead
     /// of the central panel.
     pub popout: Option<PopoutState>,
-    /// The stream_id of the same sender's audio stream, if one was active
-    /// when this video watch started (see `RoomSession::toggle_watch`'s
-    /// auto-subscribe-audio behavior) and got auto-subscribed alongside it.
-    /// Looked up in `RoomSession::audio_watches` to render the volume slider
-    /// next to the video panel and to tear the audio watch down together
-    /// with this one. `None` if the sender had no audio stream announced at
-    /// watch time.
+    /// The stream_id of the same sender's audio stream, if that sender
+    /// currently has one announced — the link that makes "watching someone's
+    /// video automatically hears their audio" work (see
+    /// `RoomSession::sync_audio_watches`). Looked up in
+    /// `RoomSession::audio_watches` to render the volume slider next to the
+    /// video panel. `None` while the sender has no audio stream announced.
+    ///
+    /// `Why it is re-derived continuously rather than latched at watch time:`
+    /// a sharer can enable "Share Audio" at any moment, including long after
+    /// someone started watching their screen. Latching this once, in
+    /// `toggle_watch`, meant every viewer who was already watching stayed
+    /// permanently silent — see `sync_audio_watches`' doc comment.
     pub audio_stream_id: Option<StreamId>,
     /// Optional second consumer of every raw `MediaFrame` fed to this watch,
     /// set (from outside `session.rs`) by the Tauri front-end's
@@ -512,6 +517,17 @@ pub struct AudioWatch {
     /// 0-200, the value bound to this stream's volume slider. Applied to
     /// `decoder` (as `volume_percent / 100.0`) whenever the slider changes.
     pub volume_percent: u32,
+    /// `true` when this watch exists only because we're watching the same
+    /// sender's *video* (`sync_audio_watches` owns it, and will tear it down
+    /// again the moment that video watch or that audio stream goes away).
+    /// `false` for a standalone "Listen" on an audio-only sender
+    /// (`toggle_listen`), which only the user turns off again.
+    ///
+    /// `Why the flag is needed:` both kinds live in the same
+    /// `audio_watches` map, and `sync_audio_watches` reconciles that map
+    /// against "who am I watching video from" — without a marker it would
+    /// happily tear down a deliberate standalone Listen as "not desired".
+    pub auto: bool,
 }
 
 /// State for a `WatchEntry` currently rendered in its own
@@ -647,14 +663,14 @@ impl RoomSession {
     /// doing so, and subscribe to it. Shared by `toggle_watch`'s
     /// auto-subscribe-audio-alongside-video path and `toggle_listen`'s
     /// standalone audio-only path.
-    pub fn start_audio_watch(&mut self, owner: ConnId, stream_id: StreamId) {
+    pub fn start_audio_watch(&mut self, owner: ConnId, stream_id: StreamId, auto: bool) {
         let key = (owner, stream_id);
         if self.audio_watches.lock().unwrap().contains_key(&key) {
             return;
         }
         match AudioDecoder::new(stream_id) {
             Ok(decoder) => {
-                self.audio_watches.lock().unwrap().insert(key, AudioWatch { decoder, volume_percent: 100 });
+                self.audio_watches.lock().unwrap().insert(key, AudioWatch { decoder, volume_percent: 100, auto });
                 self.watch_error = None;
 
                 let client = self.client.clone();
@@ -685,18 +701,103 @@ impl RoomSession {
         }
     }
 
+    /// Make the set of auto-subscribed audio watches match reality: exactly
+    /// one audio watch per sender we currently have a *video* watch on, for
+    /// as long as that sender has an audio stream announced — and nothing
+    /// else.
+    ///
+    /// This is the whole "audio follows video" feature. One user action
+    /// (Watch) gets both media; there is no separate audio subscribe/watch
+    /// step, and no viewer-facing audio stream to click. See
+    /// `superdoc/features/video-pipeline.md`'s 2026-07-28 block.
+    ///
+    /// `Why a reconcile pass instead of doing this once inside toggle_watch:`
+    /// the naive version (latch `sibling_audio_stream(owner)` at the instant
+    /// the video watch starts, tear it down when it stops) is only correct if
+    /// the sender's audio stream exists *before* the viewer clicks Watch and
+    /// never changes afterwards. Neither holds:
+    ///
+    /// - A sharer typically starts their screen share first and only then
+    ///   picks an app in the Share Audio row. Every viewer already watching
+    ///   at that moment latched `None` and stayed permanently silent, with no
+    ///   way to fix it short of un-watching and re-watching. That is the bug
+    ///   the owner reported as "the viewer should just hear it".
+    /// - A sender with two monitors shared is two `WatchEntry`s but one audio
+    ///   stream. Un-watching one of them tore down the audio the *other* one
+    ///   was still relying on.
+    /// - `driver.rs`'s `prune_stale_watches` and a room's control-plane close
+    ///   both drop `WatchEntry`s without ever going through `toggle_watch`,
+    ///   so the paired audio watch (and its subscription) leaked.
+    ///
+    /// Reconciling from current state handles all four cases with one rule
+    /// and no bookkeeping to keep in sync. Called from `AppState::drain_events`
+    /// — i.e. right after the `StreamStarted`/`StreamStopped` events that can
+    /// change the answer are applied, on both frontends' polling cadence.
+    /// Idempotent and allocation-light; returns immediately in the common
+    /// case of nothing being watched at all.
+    pub fn sync_audio_watches(&mut self) {
+        if self.watches.lock().unwrap().is_empty() && self.audio_watches.lock().unwrap().is_empty() {
+            return;
+        }
+
+        // Desired auto set: the sibling audio stream of every sender we have
+        // a video watch on. Also refreshes each `WatchEntry::audio_stream_id`
+        // so the UI's volume control can find the audio stream behind a tile.
+        let mut desired: Vec<(ConnId, StreamId)> = Vec::new();
+        {
+            let mut watches = self.watches.lock().unwrap();
+            for (&(owner, _), entry) in watches.iter_mut() {
+                let sibling = self.streams.iter().find(|s| s.owner == owner && s.kind == StreamKind::Audio).map(|s| s.stream_id);
+                entry.audio_stream_id = sibling;
+                if let Some(stream_id) = sibling
+                    && !desired.contains(&(owner, stream_id))
+                {
+                    desired.push((owner, stream_id));
+                }
+            }
+        }
+
+        // Tear down anything that shouldn't be playing any more: an auto
+        // watch whose video watch (or whose audio stream) is gone, and — for
+        // both auto and standalone-Listen watches alike — anything whose
+        // stream the sender stopped announcing.
+        let stale: Vec<(ConnId, StreamId)> = self
+            .audio_watches
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(key, watch)| {
+                let (owner, stream_id) = **key;
+                let still_announced = self.streams.iter().any(|s| s.owner == owner && s.stream_id == stream_id);
+                !still_announced || (watch.auto && !desired.contains(&(owner, stream_id)))
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        for (owner, stream_id) in stale {
+            self.teardown_audio_watch(owner, stream_id);
+        }
+
+        // `start_audio_watch` is a no-op for one that's already running, so
+        // this is the "started sharing audio while I was already watching"
+        // case and nothing else.
+        for (owner, stream_id) in desired {
+            self.start_audio_watch(owner, stream_id, true);
+        }
+    }
+
     /// "Watch"/"Stop Watching" clicked for `(owner, stream_id)`. Subscribing
     /// and unsubscribing are async (control-plane round trip) so they're
     /// fired onto the runtime and not awaited here; the decoder itself is
     /// created/dropped synchronously since that's cheap.
     ///
-    /// If `owner` also has an active audio stream, it's auto-subscribed and
-    /// played alongside the video (see `start_audio_watch`), and torn down
-    /// together with the video watch when watching stops.
+    /// The sender's audio, if they have any, comes along automatically — see
+    /// [`RoomSession::sync_audio_watches`], which this calls on both edges so
+    /// the audio starts/stops in the same user action rather than waiting for
+    /// the next `drain_events` tick.
     pub fn toggle_watch(&mut self, owner: ConnId, stream_id: StreamId) {
         let key = (owner, stream_id);
         let removed = self.watches.lock().unwrap().remove(&key);
-        if let Some(entry) = removed {
+        if removed.is_some() {
             if self.selected_watch == Some(key) {
                 self.selected_watch = self.watches.lock().unwrap().keys().next().copied();
             }
@@ -706,20 +807,16 @@ impl RoomSession {
                     tracing::warn!("unsubscribe({owner:016x}, {stream_id}) failed: {e:#}");
                 }
             });
-            if let Some(audio_stream_id) = entry.audio_stream_id {
-                self.teardown_audio_watch(owner, audio_stream_id);
-            }
         } else {
             match StreamDecoder::new(stream_id) {
                 Ok(decoder) => {
-                    let audio_stream_id = self.sibling_audio_stream(owner);
                     self.watches.lock().unwrap().insert(
                         key,
                         WatchEntry {
                             decoder: Arc::new(Mutex::new(decoder)),
                             texture: None,
                             popout: None,
-                            audio_stream_id,
+                            audio_stream_id: None,
                             raw_tx: None,
                         },
                     );
@@ -732,27 +829,25 @@ impl RoomSession {
                             tracing::warn!("subscribe({owner:016x}, {stream_id}) failed: {e:#}");
                         }
                     });
-
-                    if let Some(audio_stream_id) = audio_stream_id {
-                        self.start_audio_watch(owner, audio_stream_id);
-                    }
                 }
                 Err(e) => {
                     self.watch_error = Some(format!("{e:#}"));
+                    return;
                 }
             }
         }
+        self.sync_audio_watches();
     }
 
     /// "Listen"/"Stop Listening" clicked for an audio-only stream (a sender
-    /// with no video announced — see `owner_has_video`). Just toggles that
-    /// stream's `AudioWatch` via the same start/teardown helpers
-    /// `toggle_watch` uses for its auto-subscribed audio.
+    /// with no video announced — see `owner_has_video`). A *standalone*
+    /// watch (`auto: false`): unlike the audio that rides along with a video
+    /// watch, `sync_audio_watches` never turns this one off on its own.
     pub fn toggle_listen(&mut self, owner: ConnId, stream_id: StreamId) {
         if self.audio_watches.lock().unwrap().contains_key(&(owner, stream_id)) {
             self.teardown_audio_watch(owner, stream_id);
         } else {
-            self.start_audio_watch(owner, stream_id);
+            self.start_audio_watch(owner, stream_id, false);
         }
     }
 }
@@ -2301,6 +2396,14 @@ impl AppState {
                     }
                 }
             }
+
+            // Right after this room's `StreamStarted`/`StreamStopped` events
+            // have been applied to `room.streams` — the only inputs that can
+            // change the answer — make its auto-subscribed audio match. This
+            // is what makes a sharer enabling Share Audio *while* someone is
+            // already watching them become audible on the next tick, with no
+            // action by the viewer. See `sync_audio_watches`' doc comment.
+            room.sync_audio_watches();
         }
 
         for (handle, reason) in closed {
