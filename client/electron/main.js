@@ -24,7 +24,7 @@
 
 "use strict";
 
-const { app, BrowserWindow, ipcMain } = require("electron");
+const { app, BrowserWindow, ipcMain, Menu } = require("electron");
 const { spawn } = require("child_process");
 const path = require("path");
 const http = require("http");
@@ -449,6 +449,7 @@ ipcMain.handle("viewer-close", (event) => {
 // ---------------------------------------------------------------------
 
 app.whenReady().then(async () => {
+  Menu.setApplicationMenu(null);
   try {
     await spawnSidecar();
     await waitForServer();
