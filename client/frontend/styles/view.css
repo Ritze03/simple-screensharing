@@ -268,6 +268,13 @@
   font-size: 16px;
 }
 
+/* Stop-watching button reuses `.media-tile-popout-btn`'s layout/sizing —
+ * only the hover color differs, to read as the destructive one of the
+ * overlay actions. */
+.media-tile-stop-btn:hover {
+  background: var(--danger);
+}
+
 /* Bottom bar — audio control on the left, live stats (fps) on the right.
  * `space-between` rather than `flex-end` so the fps span stays pinned right
  * whether or not this sender has audio. */
