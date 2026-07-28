@@ -813,44 +813,66 @@
     // for a viewer to want is "quieter" or "off". Rendered before the fps
     // span so it sits bottom-left, opposite the stats.
     if (tile.hasAudio) {
-      const muted = tileMuted.has(tile.id);
-      const audioGroup = el("div", { className: "media-tile-audio" + (muted ? " media-tile-audio-muted" : "") });
-      const muteBtn = el(
-        "button",
-        {
-          className: "media-tile-audio-btn",
-          attrs: { title: muted ? "Unmute" : "Mute", "aria-label": muted ? `Unmute ${tile.ownerLabel}` : `Mute ${tile.ownerLabel}` },
-          onClick: (e) => {
-            e.stopPropagation();
-            if (tileMuted.has(tile.id)) tileMuted.delete(tile.id);
-            else tileMuted.add(tile.id);
-            pushVolume(tile);
-            render();
+      // Builds the whole `.media-tile-audio` pill for a given mute state.
+      // The mute button below swaps this element in place (`bottom.
+      // replaceChild`) instead of calling the top-level `render()` — that
+      // used to be the actual cause of the "muting flickers" bug report:
+      // `render()` tears down and restarts *every* tile's video pipeline
+      // (`window.TileVideo.stopAllTileVideo()`, see `render()` above), so
+      // clicking mute on one tile flashed the whole grid while every
+      // canvas re-decoded from scratch just to swap one icon. Only this
+      // tile's audio pill actually needs to change.
+      //
+      // The slider is only appended while `!muted` (never for a muted
+      // tile) — genuinely absent from the DOM, not just CSS-collapsed —
+      // both per the "don't show the slider at all while muted" spec and
+      // because a flex child that's absent, rather than present-but-
+      // zero-width, is what keeps the muted pill's footprint a true circle
+      // (see view.css's `.media-tile-audio` comment on why `gap` was
+      // dropped in favor of the slider's own margins).
+      const buildAudioGroup = (muted) => {
+        const group = el("div", { className: "media-tile-audio" + (muted ? " media-tile-audio-muted" : "") });
+        const muteBtn = el(
+          "button",
+          {
+            className: "media-tile-audio-btn",
+            attrs: { title: muted ? "Unmute" : "Mute", "aria-label": muted ? `Unmute ${tile.ownerLabel}` : `Mute ${tile.ownerLabel}` },
+            onClick: (e) => {
+              e.stopPropagation();
+              const nowMuted = !tileMuted.has(tile.id);
+              if (nowMuted) tileMuted.add(tile.id);
+              else tileMuted.delete(tile.id);
+              pushVolume(tile);
+              const next = buildAudioGroup(nowMuted);
+              bottom.replaceChild(next, audioGroup);
+              audioGroup = next;
+            },
           },
-        },
-        [icon(muted ? "volume_off" : "volume_up")]
-      );
-      const slider = el("input", {
-        className: "media-tile-audio-slider",
-        attrs: {
-          type: "range",
-          min: "0",
-          max: "200",
-          step: "5",
-          "aria-label": `Volume for ${tile.ownerLabel}`,
-        },
-      });
-      slider.value = String(tileVolume.get(tile.id) ?? DEFAULT_VOLUME);
-      slider.addEventListener("click", (e) => e.stopPropagation());
-      slider.addEventListener("input", () => {
-        tileVolume.set(tile.id, Number(slider.value));
-        // Dragging the slider off 0 is an implicit unmute — the two controls
-        // would otherwise contradict each other on screen.
-        if (Number(slider.value) > 0) tileMuted.delete(tile.id);
-        pushVolume(tile);
-      });
-      audioGroup.appendChild(muteBtn);
-      audioGroup.appendChild(slider);
+          [icon(muted ? "volume_off" : "volume_up")]
+        );
+        group.appendChild(muteBtn);
+        if (!muted) {
+          const slider = el("input", {
+            className: "media-tile-audio-slider",
+            attrs: {
+              type: "range",
+              min: "0",
+              max: "200",
+              step: "5",
+              "aria-label": `Volume for ${tile.ownerLabel}`,
+            },
+          });
+          slider.value = String(tileVolume.get(tile.id) ?? DEFAULT_VOLUME);
+          slider.addEventListener("click", (e) => e.stopPropagation());
+          slider.addEventListener("input", () => {
+            tileVolume.set(tile.id, Number(slider.value));
+            pushVolume(tile);
+          });
+          group.appendChild(slider);
+        }
+        return group;
+      };
+      let audioGroup = buildAudioGroup(tileMuted.has(tile.id));
       bottom.appendChild(audioGroup);
     }
 
