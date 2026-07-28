@@ -86,7 +86,6 @@ fn main() {
             commands::toggle_watch,
             commands::toggle_listen,
             commands::set_volume,
-            commands::pop_out_stream,
             commands::stream_video_url,
         ])
         .run(tauri::generate_context!())

@@ -24,7 +24,7 @@
 
 "use strict";
 
-const { app, BrowserWindow, ipcMain, screen } = require("electron");
+const { app, BrowserWindow, ipcMain } = require("electron");
 const { spawn } = require("child_process");
 const path = require("path");
 const http = require("http");
@@ -45,9 +45,15 @@ const PRELOAD = path.join(__dirname, "preload.js");
 let apiToken = null;
 let apiPort = null;
 let mainWindow = null;
-let viewerWindow = null;
 let sidecarProcess = null;
 let sseAbort = false;
+
+// Pop-out windows: one independent `BrowserWindow` per popped-out stream,
+// keyed by streamKey (`${room_handle}:${owner}:${stream_id}`, the same
+// tile-id scheme `view.js` uses) — NOT a singleton. See `openPopoutWindow`
+// below and `superdoc/features/viewer-window.md`'s 2026-07-28 entry for why
+// this replaced the old singleton fullscreen/borderless viewer window.
+const popoutWindows = new Map();
 
 // ---------------------------------------------------------------------
 // Sidecar spawn + token capture
@@ -319,232 +325,122 @@ function createWindow() {
 }
 
 // ---------------------------------------------------------------------
-// Viewer window: dedicated fullscreen/borderless stream-viewing window.
+// Pop-out windows: the one "view a stream in its own OS window" mechanism.
 //
-// Only one viewer window at a time for this pass — opening a new one
-// closes/replaces any existing one first (see `open-viewer-window` below).
+// 2026-07-28 consolidation (see `superdoc/features/viewer-window.md`'s
+// matching dated entry): this replaced two other, overlapping mechanisms —
+// (1) the old singleton fullscreen/borderless viewer window that used to
+// live here (opening a new one always closed/replaced whatever was open),
+// and (2) `src-tauri/src/commands.rs`'s `pop_out_stream` Tauri command,
+// which opened a *native Tauri* `WebviewWindowBuilder` window pointed at
+// the full `index.html` app shell (nav tabs, sidebar, everything) — a
+// leftover from before the Tauri->Electron shell migration
+// (`superdoc/ui/FRONTEND-SHELL.md`'s 2026-07-28 entry) that the rest of the
+// app no longer uses for window management at all. Electron's
+// multi-`BrowserWindow` support was already the mechanism used for real
+// fullscreen; it's also the better home for "one lean window per stream",
+// so that's what this became, and `pop_out_stream` was deleted rather than
+// kept alongside it.
+//
+// One `BrowserWindow` PER STREAM (`popoutWindows`, keyed by streamKey) —
+// deliberately NOT a singleton, unlike the old fullscreen/borderless
+// window: popping out a second stream must not close the first (this
+// matches `pop_out_stream`'s pre-existing per-stream-label behavior, which
+// this consolidation preserves rather than regresses). Each window opens
+// as a normal, lean, chrome-free (no app-shell chrome — still has a normal
+// OS window frame/titlebar) windowed pop-out; F11 inside it toggles real
+// OS fullscreen without closing the window, including on exit (see
+// `viewer-set-fullscreen`/`leave-full-screen` below and `viewer.js`'s
+// keydown handler).
 // ---------------------------------------------------------------------
 
-function mapDisplay(d) {
-  return {
-    id: d.id,
-    bounds: d.bounds,
-    workArea: d.workArea,
-    isPrimary: d.id === screen.getPrimaryDisplay().id,
-  };
-}
-
-function resolveTargetDisplay(displayId) {
-  if (displayId !== null && displayId !== undefined) {
-    const found = screen.getAllDisplays().find((d) => d.id === displayId);
-    if (found) return found;
-  }
-  // Default: the display nearest the current cursor position (matches this
-  // environment's own window-spawn convention).
-  return screen.getDisplayNearestPoint(screen.getCursorScreenPoint());
-}
-
-// streamKeys/mode are handed to the viewer window via a query string on the
-// loaded file URL (?streamKeys=<json-encoded-array>&mode=fullscreen|borderless),
-// read by viewer.js on load via `new URLSearchParams(location.search)`.
-// Chosen over an IPC message sent after `did-finish-load` because it's
-// available synchronously to the viewer's own startup code with no race
-// against when the renderer attaches its listener. `mode` lets viewer.js's
-// Escape handler know whether there's an OS fullscreen state worth exiting
-// before closing (see viewer.js's keydown handler).
-function loadViewerContents(win, streamKeys, mode) {
-  const params = new URLSearchParams();
-  params.set("streamKeys", JSON.stringify(streamKeys || []));
-  params.set("mode", mode || "borderless");
-  // Returns the `loadFile` promise so `openViewerWindow`'s caller (the
-  // `open-viewer-window` IPC handler) can await/reject on a real load
-  // failure instead of it being a silent fire-and-forget — see that
-  // handler's own comment.
-  return win.loadFile(VIEWER_HTML, { search: params.toString() });
-}
-
-// mode: 'fullscreen' | 'borderless'
-// displayId: number | null — null means "nearest the cursor" (see resolveTargetDisplay)
-// streamKeys: string[]
-//
-// Returns the `win.loadFile` promise (see `loadViewerContents`) so a
-// `loadFile` failure (e.g. a bad/missing `VIEWER_HTML` path) rejects this
-// function's own promise instead of failing silently — the `open-viewer-window`
-// IPC handler below awaits this and lets the rejection propagate to the
-// renderer's `openViewer()` caller as a real error instead of a silent hang.
-async function openViewerWindow({ mode, displayId, streamKeys }) {
-  if (viewerWindow && !viewerWindow.isDestroyed()) {
-    viewerWindow.close();
-    viewerWindow = null;
+// Returns the `win.loadFile` promise so a `loadFile` failure (e.g. a bad/
+// missing `VIEWER_HTML` path) rejects this function's own promise instead
+// of failing silently — the `open-popout-window` IPC handler below awaits
+// this and lets the rejection propagate to the renderer's `openPopout()`
+// caller as a real error instead of a silent hang.
+async function openPopoutWindow(streamKey) {
+  const existing = popoutWindows.get(streamKey);
+  if (existing && !existing.isDestroyed()) {
+    // Same stream already popped out — focus it instead of opening a
+    // duplicate window, mirroring the old Tauri `pop_out_stream` command's
+    // per-label reuse.
+    existing.focus();
+    return;
   }
 
-  const target = resolveTargetDisplay(displayId != null ? displayId : null);
-  const { x, y, width, height } = target.bounds;
-
-  const borderless = mode === "borderless";
-
-  // Critical ordering (known Linux WM footgun): position the window on the
-  // target display's bounds FIRST — passed at construction here — and only
-  // call setFullScreen(true) AFTER the window is positioned and shown.
-  // Calling setFullScreen before the window is on the correct
-  // display/visible is unreliable on Linux WMs (can fullscreen on the
-  // wrong/primary display instead of the requested one).
-  //
-  // Built into a local `win` first (rather than assigning the module-level
-  // `viewerWindow` immediately) so every closure below can identify "am I
-  // still the current window?" by comparing against this specific instance,
-  // not the mutable module-level reference. Without that, a previous
-  // window's delayed/async `closed` event (it can still be closing when a
-  // second `openViewer` call already replaced it) would null out the
-  // *new* window's reference instead of its own.
-  //
-  // resizable: false at construction (WM-tiling mitigation — see below):
-  // deliberately NOT `true` here even though the window ends up resizable
-  // for its whole visible life. Restored to `true` once the window has
-  // settled — see the `ready-to-show` handler.
   const win = new BrowserWindow({
-    x,
-    y,
-    width,
-    height,
-    frame: !borderless,
-    resizable: false,
-    show: false,
+    width: 640,
+    height: 400,
+    title: "Simple Screensharing — Stream",
     webPreferences: {
       preload: PRELOAD,
       contextIsolation: true,
       nodeIntegration: false,
     },
   });
-  viewerWindow = win;
-
-  const loadPromise = loadViewerContents(win, streamKeys, mode);
-
-  win.once("ready-to-show", () => {
-    if (win.isDestroyed()) return;
-    // Re-assert bounds before showing: some Linux WMs can reposition an
-    // unmapped window on first map, so pin it again right before show().
-    win.setBounds(target.bounds);
-    win.show();
-
-    // --- Tiling-WM mitigation (verified against a real Hyprland/dwindle
-    // session; see git history for the reproduction) -----------------
-    //
-    // On a tiling Wayland compositor with no floating rule for this app
-    // (the common case — this app can't ship compositor config), a
-    // freshly-mapped normal/resizable toplevel gets folded into the
-    // tiling layout and split with whatever else is on that workspace
-    // (e.g. the main app window), landing at an arbitrary fraction of
-    // some display's size/position instead of the requested bounds.
-    // `setBounds` alone — even called again right after `show()` — does
-    // NOT fix this: the WM's tiling placement wins regardless of how many
-    // times bounds are re-asserted, because tiling is a layout decision,
-    // not a transient position the WM "gives back" a moment later.
-    //
-    // Also worth recording: under a *native* Wayland session (not
-    // XWayland), the Wayland protocol itself forbids clients from
-    // requesting an absolute global surface position at all — placement
-    // is entirely compositor-owned by design. `BrowserWindow`'s x/y are
-    // therefore a hint at best; there is no Electron API that can force
-    // absolute positioning on native Wayland. This is a platform
-    // constraint, not something fixable from the app side.
-    //
-    // The one thing that IS controllable from Electron's API surface:
-    // most tiling WMs (Hyprland, sway, i3, ...) auto-float a window whose
-    // reported size is fixed (min size == max size), because tiling a
-    // window that refuses to be resized doesn't make sense to them.
-    // Creating the window `resizable: false` and re-applying bounds
-    // reliably lands it — floating, undivided, on the correct display —
-    // even where plain `setBounds` after `show()` does not (confirmed via
-    // `hyprctl clients` across repeated runs). `resizable` is restored to
-    // `true` shortly after, once the WM has floated it, so the window
-    // behaves like an ordinary resizable window for the rest of its life
-    // (the product intent for borderless mode — see below).
-    //
-    // Known remaining gap, NOT fixed by the above (same root cause: no
-    // absolute-positioning protocol on native Wayland): if `target` is a
-    // display other than the currently-focused one, Hyprland was observed
-    // floating the new window onto the focused display instead of the
-    // requested one, ignoring the x/y hint entirely — reproduced directly
-    // against `hyprctl clients`. There is no Electron/BrowserWindow API
-    // that requests "place me on output N" from a tiling Wayland
-    // compositor; this is a genuine platform limitation, not an app bug.
-    // Multi-monitor "open on display X" is therefore only reliable on
-    // native Wayland when X is already the focused display (X11/XWayland
-    // sessions are not affected — X11 honors the requested position).
-    const settle = () => {
-      if (win.isDestroyed()) return;
-      win.setBounds(target.bounds);
-
-      if (mode === "fullscreen") {
-        // Standard fullscreen (EWMH _NET_WM_STATE_FULLSCREEN on X11 /
-        // xdg-shell fullscreen on Wayland) — NOT kiosk mode, which is more
-        // aggressive and less predictable across Linux window managers.
-        win.setFullScreen(true);
-      } else {
-        // Borderless: full display bounds (not workArea — maximize() would
-        // snap to workArea and exclude panel/taskbar space, which is wrong
-        // here; the user wants true maximum size). Stays a normal,
-        // WM-managed, alt-tabbable window otherwise: resizable, not
-        // always-on-top, not skip-taskbar — chrome-free is the only
-        // difference from a regular window.
-        win.setBounds(target.bounds);
-      }
-
-      win.setResizable(true);
-    };
-    // A short delay, not the same tick as show(): the WM needs a moment
-    // to actually map/float the window before we can rely on its placement.
-    setTimeout(settle, 150);
-  });
+  popoutWindows.set(streamKey, win);
 
   win.on("leave-full-screen", () => {
     // Forwards an OS-level fullscreen exit (e.g. an Escape/WM gesture, not
-    // triggered through our own setFullscreen(false) IPC call) to the
-    // renderer so its UI state can stay in sync.
+    // triggered through our own setFullscreen(false) IPC call) to this
+    // window's own renderer so its UI state can stay in sync. Deliberately
+    // does NOT close the window — see viewer.js's `onViewerLeftFullscreen`
+    // handler; conflating "no longer fullscreen" with "close the window"
+    // was the pre-consolidation bug this feature explicitly fixes.
     if (!win.isDestroyed()) {
       win.webContents.send("viewer-left-fullscreen");
     }
   });
 
   win.on("closed", () => {
-    // Only clear the module-level reference if it still points at this
-    // window — a stale `closed` event from a window that was already
-    // replaced by a later `openViewer` call must not null out the new one.
-    if (viewerWindow === win) viewerWindow = null;
+    // Only clear the map entry if it still points at this window — a stale
+    // `closed` event from a window that was already replaced (same
+    // streamKey popped out again after the first was closing) must not
+    // delete a newer window's entry.
+    if (popoutWindows.get(streamKey) === win) popoutWindows.delete(streamKey);
   });
 
-  // Propagate a `loadFile` failure to the caller instead of letting it be a
-  // silent fire-and-forget. Not awaited before `ready-to-show`/`show()`
-  // above on purpose — those stay wired unconditionally so a window that
-  // *does* finish loading still gets positioned/shown even if this await
-  // is still pending when that event fires; this only affects what
-  // `openViewerWindow`'s own promise (and thus `open-viewer-window`'s IPC
-  // response) resolves/rejects with.
-  await loadPromise;
+  // streamKeys is handed to viewer.js via a query string on the loaded file
+  // URL (?streamKeys=<json-encoded-array-of-one>), read on load via `new
+  // URLSearchParams(location.search)`. Chosen over an IPC message sent
+  // after `did-finish-load` because it's available synchronously to the
+  // viewer's own startup code with no race against when the renderer
+  // attaches its listener. Wrapped in a one-element array because
+  // viewer.js's tile-resolving/grid code is still generic over N tiles
+  // (unchanged, still shared/tested code) even though every pop-out window
+  // now always shows exactly one.
+  const params = new URLSearchParams();
+  params.set("streamKeys", JSON.stringify([streamKey]));
+  return win.loadFile(VIEWER_HTML, { search: params.toString() });
 }
 
-ipcMain.handle("list-displays", () => {
-  return screen.getAllDisplays().map(mapDisplay);
-});
-
-ipcMain.handle("open-viewer-window", (_event, opts) => {
-  // Returning (not just calling) `openViewerWindow`'s promise is what lets
+ipcMain.handle("open-popout-window", (_event, opts) => {
+  const streamKey = opts && opts.streamKey;
+  if (!streamKey) return Promise.reject(new Error("open-popout-window requires a streamKey"));
+  // Returning (not just calling) `openPopoutWindow`'s promise is what lets
   // a `loadFile` rejection inside it propagate through `ipcMain.handle` as
-  // a rejected `invoke()` on the renderer side — see `openViewerWindow`'s
-  // own doc comment.
-  return openViewerWindow(opts || {});
+  // a rejected `invoke()` on the renderer side.
+  return openPopoutWindow(streamKey);
 });
 
-ipcMain.handle("viewer-set-fullscreen", (_event, fullscreen) => {
-  if (viewerWindow && !viewerWindow.isDestroyed()) {
-    viewerWindow.setFullScreen(!!fullscreen);
+// Both handlers below resolve which pop-out window they apply to via
+// `event.sender` (the calling renderer's own `WebContents`) rather than any
+// module-level "the current window" reference — each pop-out window's own
+// preload/renderer calls these implicitly targeting itself, which is what
+// makes multiple simultaneous pop-out windows each independently
+// fullscreen-able/closable with no key-threading needed on the JS side.
+ipcMain.handle("viewer-set-fullscreen", (event, fullscreen) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (win && !win.isDestroyed()) {
+    win.setFullScreen(!!fullscreen);
   }
 });
 
-ipcMain.handle("viewer-close", () => {
-  if (viewerWindow && !viewerWindow.isDestroyed()) {
-    viewerWindow.close();
+ipcMain.handle("viewer-close", (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (win && !win.isDestroyed()) {
+    win.close();
   }
 });
 

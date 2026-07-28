@@ -8,7 +8,7 @@
 //! directly (rather than the `tauri::State` the `#[tauri::command]` fns
 //! receive) so tests can call them against a real `AppState` without needing
 //! a running `tauri::App` — see the `tests` module at the bottom.
-use tauri::{Manager, State};
+use tauri::State;
 
 use simple_screensharing_client::session::{
     AppState, CaptureSourceId, DestinationId, PendingRole, RoomHandle,
@@ -448,34 +448,30 @@ pub fn set_volume(managed: State<'_, Managed>, room_handle: u32, owner: String, 
     Ok(())
 }
 
-/// Opens a real second OS window showing just one stream — the Tauri
-/// replacement for the old egui `show_viewport_deferred` pop-out (see the
-/// task brief). Points at the same `frontend/index.html` shell with query
-/// parameters identifying the stream; a later frontend stage reads those to
-/// render just that one tile instead of the full shell. This command only
-/// proves the window-opening mechanism — the popout page's real content is
-/// the frontend worker's job.
-#[tauri::command]
-pub fn pop_out_stream(app: tauri::AppHandle, room_handle: u32, owner: String, stream_id: u8) -> Result<(), String> {
-    let owner = dto::parse_owner(&owner)?;
-    let label = format!("popout-{room_handle}-{owner:016x}-{stream_id}");
-    let url = format!("index.html?popout=1&room={room_handle}&owner={owner:016x}&stream={stream_id}");
-    if let Some(existing) = app.get_webview_window(&label) {
-        let _ = existing.set_focus();
-        return Ok(());
-    }
-    tauri::WebviewWindowBuilder::new(&app, label, tauri::WebviewUrl::App(url.into()))
-        .title("Simple Screensharing — Stream")
-        .inner_size(640.0, 400.0)
-        .build()
-        .map(|_| ())
-        .map_err(|e| format!("{e:#}"))
-}
+// `pop_out_stream` (a native Tauri `WebviewWindowBuilder` second window
+// pointed at the full `index.html` app shell) was removed 2026-07-28: the
+// window-in-its-own-OS-window feature it half-built was consolidated onto
+// Electron's `BrowserWindow`-based pop-out mechanism instead
+// (`electron/main.js`'s `openPopoutWindow` / `frontend/scripts/view.js`'s
+// `popOutWatch`, both loading the lean `frontend/viewer.html` rather than
+// the full shell). See `superdoc/features/viewer-window.md`'s 2026-07-28
+// entry for the full rationale — in short, this command was a leftover
+// from before the Tauri->Electron shell migration
+// (`superdoc/ui/FRONTEND-SHELL.md`) that nothing in the frontend actually
+// finished wiring up (`index.html`'s `?popout=1` query param was never
+// read by any JS), while Electron's window management already had a real,
+// working, per-stream multi-window mechanism (originally built for
+// fullscreen/borderless) that this consolidation extended instead.
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use simple_screensharing_client::rooms::RoomStore;
+    // `Manager` (for `AppHandle`/`App::state()`) is only needed by test
+    // helpers below — the one production call site that needed it
+    // (`pop_out_stream`) was removed 2026-07-28; see this file's note where
+    // that command used to be.
+    use tauri::Manager;
 
     /// Serializes every test that touches the process-global `XDG_CONFIG_HOME`
     /// env var. `cargo test` runs tests in parallel threads within one
