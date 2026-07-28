@@ -62,35 +62,47 @@ void EVENT_NAMES;
 
 // ---------------------------------------------------------------------
 // window.__ELECTRON__ — separate bridge for Electron-native window
-// management (fullscreen/borderless stream viewer window). Distinct from
-// __TAURI__ above: __TAURI__ is a narrow Tauri-invoke/event compatibility
-// shim for talking to the Rust sidecar; this is Electron-specific window
-// control that has no Tauri equivalent, so it gets its own namespace rather
-// than being bolted onto __TAURI__.
+// management (the pop-out stream viewer window). Distinct from __TAURI__
+// above: __TAURI__ is a narrow Tauri-invoke/event compatibility shim for
+// talking to the Rust sidecar; this is Electron-specific window control
+// that has no Tauri equivalent, so it gets its own namespace rather than
+// being bolted onto __TAURI__.
 //
-// This same preload script also runs inside the viewer window (main.js
-// passes the identical `preload` path when constructing it), so both
-// window.__ELECTRON__ and window.__TAURI__ are available there too — a
-// later unit's viewer.js can call back into __TAURI__ for stream data with
-// no new backend contract needed.
+// This same preload script also runs inside every pop-out window (main.js
+// passes the identical `preload` path when constructing one), so both
+// window.__ELECTRON__ and window.__TAURI__ are available there too —
+// viewer.js calls back into __TAURI__ for stream data with no new backend
+// contract needed.
+//
+// 2026-07-28 consolidation: this used to back a *singleton* fullscreen/
+// borderless viewer window (`openViewer({mode, displayId, streamKeys})`).
+// That's gone — see `superdoc/features/viewer-window.md`'s matching dated
+// entry. `openPopout` below opens one independent window per stream
+// instead; `setFullscreen`/`closeViewer`/`onViewerLeftFullscreen` are
+// unchanged in shape but now implicitly scoped to whichever pop-out window
+// the calling renderer lives in (`electron/main.js` resolves that via
+// `BrowserWindow.fromWebContents(event.sender)`, not a module-level
+// singleton reference), so the same three calls work correctly no matter
+// how many pop-out windows are open at once.
 contextBridge.exposeInMainWorld("__ELECTRON__", {
-  // Promise<Array<{id, bounds, workArea, isPrimary}>>
-  listDisplays: () => ipcRenderer.invoke("list-displays"),
+  // opts: { streamKey: string } — `${room_handle}:${owner}:${stream_id}`,
+  // the same tile-id scheme `view.js` already uses. Opens a new lean
+  // pop-out window for that stream, or focuses the existing one if this
+  // stream is already popped out (mirrors the old Tauri `pop_out_stream`
+  // command's per-stream-label reuse behavior).
+  openPopout: (opts) => ipcRenderer.invoke("open-popout-window", opts),
 
-  // opts: { mode: 'fullscreen' | 'borderless', displayId: number | null, streamKeys: string[] }
-  // displayId: null (or omitted) => display nearest the current cursor position.
-  openViewer: (opts) => ipcRenderer.invoke("open-viewer-window", opts),
-
-  // Toggles fullscreen on the currently-open viewer window. No-op if none is open.
+  // Toggles real OS fullscreen on the pop-out window this was called from.
   setFullscreen: (fullscreen) => ipcRenderer.invoke("viewer-set-fullscreen", fullscreen),
 
-  // Closes the currently-open viewer window, if any.
+  // Closes the pop-out window this was called from.
   closeViewer: () => ipcRenderer.invoke("viewer-close"),
 
-  // Fires when the viewer window exits fullscreen via an OS-level gesture
-  // (e.g. an Escape/WM shortcut) rather than through setFullscreen(false),
-  // so caller UI state (e.g. a "fullscreen" toggle) can stay in sync.
-  // Mirrors the __TAURI__.event.listen shape: returns Promise<UnlistenFn>.
+  // Fires when the pop-out window this is called from exits fullscreen via
+  // an OS-level gesture (e.g. an Escape/WM shortcut) rather than through
+  // setFullscreen(false), so caller UI state (e.g. an F11 toggle) can stay
+  // in sync. Mirrors the __TAURI__.event.listen shape: returns
+  // Promise<UnlistenFn>.
   onViewerLeftFullscreen: (callback) => {
     const handler = () => callback();
     ipcRenderer.on("viewer-left-fullscreen", handler);

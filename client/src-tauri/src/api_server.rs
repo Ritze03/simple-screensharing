@@ -548,9 +548,6 @@ fn dispatch(name: &str, body: &Value, app: &AppHandle) -> Result<Value, ApiError
             get_u8(body, "stream_id")?,
             get_u32(body, "volume_percent")?,
         )),
-        "pop_out_stream" => {
-            result(commands::pop_out_stream(app.clone(), get_u32(body, "room_handle")?, get_string(body, "owner")?, get_u8(body, "stream_id")?))
-        }
         other => Err(ApiError::not_found(format!("unknown command `{other}`"))),
     }
 }

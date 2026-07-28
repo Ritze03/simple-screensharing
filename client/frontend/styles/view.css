@@ -202,13 +202,6 @@
   opacity: 1;
 }
 
-/* A tile with its selection checkbox checked stays "lit" even unhovered —
- * otherwise there'd be no way to see what's currently selected for
- * "Fullscreen selected"/"Borderless selected" without hovering every tile. */
-.media-tile:has(.media-tile-select-checkbox:checked) .media-tile-overlay {
-  opacity: 1;
-}
-
 .media-tile-overlay-top {
   display: flex;
   justify-content: space-between;
@@ -234,13 +227,6 @@
   align-items: center;
   gap: 6px;
   flex: 0 0 auto;
-}
-
-.media-tile-select-checkbox {
-  width: 15px;
-  height: 15px;
-  cursor: pointer;
-  accent-color: var(--accent);
 }
 
 /* Frosted translucent-white control chip, per the prototype's tile
@@ -366,10 +352,9 @@
 
 /* -------------------------------------------------------------------
  * Held-slot placeholder — a tile that's popped out to its own OS window
- * (`popOutWatch`) or currently shown in the standalone fullscreen/
- * borderless viewer (`requestOpenViewer`) keeps its grid slot rather than
- * disappearing (which would reflow every other tile's size). Dashed border
- * distinguishes it at a glance from a real video tile.
+ * (`popOutWatch`) keeps its grid slot rather than disappearing (which would
+ * reflow every other tile's size). Dashed border distinguishes it at a
+ * glance from a real video tile.
  * ----------------------------------------------------------------- */
 
 /* A held slot isn't live, so it drops the green ring and takes the
@@ -470,19 +455,6 @@
   align-items: center;
   gap: 8px;
   margin-bottom: 10px;
-}
-
-/* "Fullscreen selected" / "Borderless selected" — only rendered when
- * `window.__ELECTRON__` exists (see view.js's render()), reusing the
- * standard `.btn.btn-secondary` look rather than a bespoke style. */
-.view-viewer-actions {
-  display: flex;
-  gap: 6px;
-}
-
-.view-viewer-action-btn {
-  font-size: 12px;
-  padding: 4px 10px;
 }
 
 .view-demo-toggle {

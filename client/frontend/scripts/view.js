@@ -23,10 +23,10 @@
 // wire format this URL now serves (it replaced the old MJPEG-over-HTTP
 // delivery this file used to just point an `<img>` at). The actual
 // fetch/parse-chunks/decode/jitter-buffer pipeline lives in
-// `tile-video.js`'s `window.TileVideo` (extracted so the standalone
-// fullscreen/borderless viewer window can drive the same pipeline against
-// its own tiles) — this file only owns grid layout, tile creation/removal,
-// and the fps `<span>` DOM wiring (`fpsSpans`/`updateStats`).
+// `tile-video.js`'s `window.TileVideo` (extracted so the standalone pop-out
+// viewer window — see below — can drive the same pipeline against its own
+// tile) — this file only owns grid layout, tile creation/removal, and the
+// fps `<span>` DOM wiring (`fpsSpans`/`updateStats`).
 //
 // Known gap: no DTO carries a per-watched-stream "is this actually
 // decoding right now" signal, so every real tile still renders in the
@@ -42,13 +42,24 @@
 // filter, and the "NOT ON SCREEN" rail below. Scoped-down/known-limitation
 // notes, each next to the code it applies to:
 //
-//  - Held slots for popped-out/viewer tiles (`poppedOutIds`/`viewerHeldIds`
-//    below) are tracked client-side only — there's no IPC signal for "the
-//    pop-out window closed" or "the viewer window closed", so a held slot
-//    only clears when the user clicks its "Bring it back" button. This is a
-//    deliberate best-effort approximation (see the task brief this shipped
-//    against), not a bug: building a real cross-window close signal is a
-//    bigger change than this frontend-only restyle pass.
+//  - Held slots for popped-out tiles (`poppedOutIds` below) are tracked
+//    client-side only — there's no IPC signal for "the pop-out window
+//    closed", so a held slot only clears when the user clicks its "Bring it
+//    back" button. This is a deliberate best-effort approximation (see the
+//    task brief this shipped against), not a bug: building a real
+//    cross-window close signal is a bigger change than this frontend-only
+//    restyle pass.
+//
+// Pop-out consolidation (2026-07-28): the "Fullscreen selected"/"Borderless
+// selected" multi-select buttons and their Electron singleton viewer window
+// are gone — see `superdoc/features/viewer-window.md`'s matching dated entry.
+// The per-tile "Pop out" button (`popOutWatch`) below is now the one
+// mechanism for viewing a stream in its own OS window: it opens (or, for an
+// already-popped-out stream, focuses) a lean chrome-free window via
+// `window.__ELECTRON__.openPopout`, one independent window per stream
+// (multiple streams can each be popped out simultaneously). F11 inside that
+// window toggles real OS fullscreen; exiting fullscreen never closes it —
+// see `frontend/scripts/viewer.js`.
 //  - Per-tile volume/mute (2026-07-28): a tile whose sender is also sharing
 //    audio gets a mute button + volume slider in its hover overlay, wired to
 //    the real `commands::set_volume`. There is deliberately NO listen/unlisten
@@ -98,10 +109,8 @@
   // `init()`/`refresh()`, same cadence as `mockWatched`.
   let notOnScreenStreams = [];
 
-  // Selected room filter chip ("All rooms" when null). Same "don't reset on
-  // every render()" treatment as `selectedTileIds` below — only pruned back
-  // to null right before a render if the selected room no longer has any
-  // tiles.
+  // Selected room filter chip ("All rooms" when null) — pruned back to null
+  // right before a render if the selected room no longer has any tiles.
   let roomFilter = null;
 
   // Tile ids currently popped out to their own OS window (`popOutWatch`) —
@@ -109,20 +118,6 @@
   // header note on why there's no real "the window closed" signal to clear
   // this automatically.
   const poppedOutIds = new Set();
-
-  // Tile ids currently sent to the standalone fullscreen/borderless viewer
-  // window (`requestOpenViewer`), mapped to which mode ("fullscreen" /
-  // "borderless") so the held-slot placeholder can say which. Same
-  // best-effort caveat as `poppedOutIds`.
-  const viewerHeldIds = new Map();
-
-  // Tile ids (`${room_handle}:${owner}:${stream_id}`) the user has explicitly
-  // checked via each tile's own selection checkbox, for the "Fullscreen
-  // selected" / "Borderless selected" buttons below. Deliberately NOT
-  // cleared on every `render()` (a `stream-stats-updated`-driven re-render
-  // shouldn't silently wipe a selection the user just made) — only trimmed
-  // to drop ids for tiles that no longer exist, right before each render.
-  let selectedTileIds = new Set();
 
   // Per-tile playback volume (0-200, matching `commands::set_volume`'s range)
   // and mute state, keyed by tile id. Client-side only: `RoomDetail` carries
@@ -300,7 +295,6 @@
    * reappear in the "NOT ON SCREEN" rail on its own (`fetchWatchedStreams`
    * derives that rail from `detail.streams` minus `detail.watched`). */
   async function stopWatching(tile) {
-    if (tile.id) selectedTileIds.delete(tile.id);
     if (window.__TAURI__) {
       await window.__TAURI__.core.invoke("toggle_watch", { roomHandle: tile.room_handle, owner: tile.owner, streamId: tile.stream_id });
       await init();
@@ -321,6 +315,15 @@
     render();
   }
 
+  /** The one "view this stream in its own window" mechanism (see this
+   * file's header note on the 2026-07-28 consolidation). `window.__ELECTRON__
+   * .openPopout` (see `electron/main.js`'s `open-popout-window` IPC handler
+   * and `electron/preload.js`'s bridge) opens a lean chrome-free
+   * `viewer.html` window for exactly this one stream — or, if this stream is
+   * already popped out, focuses that existing window instead of creating a
+   * duplicate (mirrors the old Tauri `pop_out_stream` command's
+   * label-reuse behavior). Each stream gets its own independent window;
+   * popping out a second stream never closes the first. */
   async function popOutWatch(tile) {
     // Held-slot pattern: track locally regardless of branch (real or mock)
     // so the grid slot survives as a dashed-border placeholder instead of
@@ -328,36 +331,15 @@
     // there's no way to clear this automatically when the popped-out window
     // closes.
     if (tile.id) poppedOutIds.add(tile.id);
-    if (window.__TAURI__) {
-      await window.__TAURI__.core.invoke("pop_out_stream", { roomHandle: tile.room_handle, owner: tile.owner, streamId: tile.stream_id });
+    if (window.__ELECTRON__ && tile.id) {
+      try {
+        await window.__ELECTRON__.openPopout({ streamKey: tile.id });
+      } catch (e) {
+        console.error("openPopout failed", e);
+      }
       render();
       return;
     }
-    render();
-  }
-
-  /** `window.__ELECTRON__.openViewer` is the entry point built by the
-   * fullscreen/borderless viewer feature (see `electron/main.js`'s
-   * `open-viewer-window` IPC handler and `electron/preload.js`'s bridge) —
-   * this is the only place in the View tab that calls it. `displayId: null`
-   * defers to `resolveTargetDisplay`'s nearest-cursor-display default;
-   * exposing a display picker here is a reasonable follow-up but out of
-   * scope for this pass (see `electron/main.js`'s `list-displays` IPC,
-   * already wired and ready for one).
-   *
-   * Selection default, per the feature's original design intent: with
-   * nothing checked, act on every currently-visible tile rather than
-   * forcing the user to select first for the common single-stream case. */
-  function requestOpenViewer(mode) {
-    if (!window.__ELECTRON__) return;
-    const streamKeys = selectedTileIds.size > 0 ? Array.from(selectedTileIds) : mockWatched.map((t) => t.id);
-    if (streamKeys.length === 0) return;
-    // Held-slot pattern, same as `popOutWatch` above: every tile sent to the
-    // viewer window keeps its grid slot as a placeholder rather than
-    // vanishing. See this file's header note on the "no window-closed
-    // signal" caveat this shares with the pop-out case.
-    for (const id of streamKeys) viewerHeldIds.set(id, mode);
-    window.__ELECTRON__.openViewer({ mode, displayId: null, streamKeys });
     render();
   }
 
@@ -366,12 +348,7 @@
     if (!root) return;
     root.innerHTML = "";
 
-    // Drop selection entries for tiles that no longer exist (stream ended,
-    // room left, etc.) before deciding what "selected" means for this render.
     const liveIds = new Set(mockWatched.map((t) => t.id));
-    for (const id of selectedTileIds) {
-      if (!liveIds.has(id)) selectedTileIds.delete(id);
-    }
     // Same prune for the per-tile audio state — a tile id can recur (the same
     // stream watched again later), and a stale mute would silently carry over
     // into that new watch.
@@ -398,9 +375,6 @@
     for (const id of poppedOutIds) {
       if (!liveIds.has(id)) poppedOutIds.delete(id);
     }
-    for (const id of viewerHeldIds.keys()) {
-      if (!liveIds.has(id)) viewerHeldIds.delete(id);
-    }
     // Room filter: fall back to "All rooms" if the selected room dropped
     // out of the watched set entirely (room left, or its last tile ended).
     const roomLabels = [...new Set(mockWatched.map((t) => t.roomLabel))];
@@ -408,10 +382,10 @@
 
     const header = el("div", { className: "view-header" });
     const roomCount = roomLabels.length;
-    // "On screen" deliberately excludes held-slot tiles (popped out /
-    // sent to the viewer window) — they're still watched, but not actually
-    // displayed in this grid right now.
-    const onScreenCount = mockWatched.filter((t) => !t.id || (!poppedOutIds.has(t.id) && !viewerHeldIds.has(t.id))).length;
+    // "On screen" deliberately excludes held-slot tiles (popped out to
+    // their own window) — they're still watched, but not actually displayed
+    // in this grid right now.
+    const onScreenCount = mockWatched.filter((t) => !t.id || !poppedOutIds.has(t.id)).length;
     header.appendChild(
       el("div", {
         className: "view-header-count",
@@ -457,19 +431,6 @@
             render();
           },
         })
-      );
-    }
-    // Hidden entirely (not just disabled) when there's no Electron bridge —
-    // same pattern as this codebase's existing `window.__TAURI__` guards —
-    // so a plain browser-preview session can't throw clicking a button that
-    // has nothing to call. Also hidden when there are zero watched streams:
-    // nothing to show fullscreen.
-    if (window.__ELECTRON__ && mockWatched.length > 0) {
-      controls.appendChild(
-        el("div", { className: "view-viewer-actions" }, [
-          secondaryButton("Fullscreen selected", () => requestOpenViewer("fullscreen"), { className: "view-viewer-action-btn" }),
-          secondaryButton("Borderless selected", () => requestOpenViewer("borderless"), { className: "view-viewer-action-btn" }),
-        ])
       );
     }
     root.appendChild(controls);
@@ -537,11 +498,11 @@
     root.appendChild(rail);
   }
 
-  /** Held-slot placeholder — see this file's header note on `poppedOutIds`/
-   * `viewerHeldIds`. Deliberately renders NO video/overlay/checkbox
-   * machinery at all (the tile is genuinely not decoding — its controller
-   * was never started for a held tile, see `renderTile` below), just the
-   * dashed-border "bring it back" affordance the design spec calls for. */
+  /** Held-slot placeholder — see this file's header note on `poppedOutIds`.
+   * Deliberately renders NO video/overlay/checkbox machinery at all (the
+   * tile is genuinely not decoding — its controller was never started for a
+   * held tile, see `renderTile` below), just the dashed-border "bring it
+   * back" affordance the design spec calls for. */
   function renderHeldSlot(tile, reasonText) {
     const wrap = el("div", { className: "media-tile media-tile-held" });
     wrap.appendChild(icon("picture_in_picture_alt"));
@@ -550,10 +511,7 @@
       secondaryButton(
         "Bring it back",
         () => {
-          if (tile.id) {
-            poppedOutIds.delete(tile.id);
-            viewerHeldIds.delete(tile.id);
-          }
+          if (tile.id) poppedOutIds.delete(tile.id);
           render();
         },
         { className: "media-tile-held-btn" }
@@ -563,15 +521,10 @@
   }
 
   function renderTile(tile) {
-    // Held-slot pattern (1e spec): a tile popped out to its own window, or
-    // currently shown in the fullscreen/borderless viewer window, keeps its
-    // grid slot but shows a placeholder instead of re-decoding video nobody
-    // is looking at here. Checked before every other state below.
+    // Held-slot pattern (1e spec): a tile popped out to its own window keeps
+    // its grid slot but shows a placeholder instead of re-decoding video
+    // nobody is looking at here. Checked before every other state below.
     if (tile.id && poppedOutIds.has(tile.id)) return renderHeldSlot(tile, "in a separate window");
-    if (tile.id && viewerHeldIds.has(tile.id)) {
-      const mode = viewerHeldIds.get(tile.id);
-      return renderHeldSlot(tile, mode === "borderless" ? "in a borderless window" : "in fullscreen");
-    }
 
     const wrap = el("div", { className: "media-tile" });
 
@@ -631,25 +584,7 @@
     const titleText = tile.resolution ? `${tile.ownerLabel} · ${tile.roomLabel} · ${tile.resolution}` : `${tile.ownerLabel} · ${tile.roomLabel}`;
     top.appendChild(el("span", { className: "media-tile-overlay-title", text: titleText }));
 
-    // Per-tile selection checkbox, feeding `selectedTileIds` for the
-    // "Fullscreen selected" / "Borderless selected" buttons in
-    // `.view-controls`. Only meaningful once Electron's viewer bridge
-    // exists — hidden otherwise so a mock/browser-preview session doesn't
-    // show a control with no consumer.
     const actions = el("div", { className: "media-tile-overlay-actions" });
-    if (tile.id && window.__ELECTRON__) {
-      const checkbox = el("input", {
-        className: "media-tile-select-checkbox",
-        attrs: { type: "checkbox", title: "Select for fullscreen/borderless", "aria-label": `Select ${tile.ownerLabel} for fullscreen/borderless` },
-      });
-      checkbox.checked = selectedTileIds.has(tile.id);
-      checkbox.addEventListener("click", (e) => e.stopPropagation());
-      checkbox.addEventListener("change", () => {
-        if (checkbox.checked) selectedTileIds.add(tile.id);
-        else selectedTileIds.delete(tile.id);
-      });
-      actions.appendChild(checkbox);
-    }
     actions.appendChild(
       el(
         "button",
