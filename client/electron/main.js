@@ -359,7 +359,8 @@ function createWindow() {
 // of failing silently — the `open-popout-window` IPC handler below awaits
 // this and lets the rejection propagate to the renderer's `openPopout()`
 // caller as a real error instead of a silent hang.
-async function openPopoutWindow(streamKey) {
+async function openPopoutWindow(streamKey, meta) {
+  meta = meta || {};
   const existing = popoutWindows.get(streamKey);
   if (existing && !existing.isDestroyed()) {
     // Same stream already popped out — focus it instead of opening a
@@ -399,6 +400,20 @@ async function openPopoutWindow(streamKey) {
     // streamKey popped out again after the first was closing) must not
     // delete a newer window's entry.
     if (popoutWindows.get(streamKey) === win) popoutWindows.delete(streamKey);
+
+    // "The pop-out window closed" signal (2026-07-28): tells the main
+    // window's renderer which streamKey's window just closed, so `view.js`
+    // can drop it from `poppedOutIds` and let that tile resume normal
+    // rendering automatically — see that file's header note this replaces
+    // ("no real 'the window closed' signal ... no way to clear this
+    // automatically"). Fired unconditionally on every close (manual × close,
+    // OS close button, or window destroyed some other way), not just the
+    // map-cleanup branch above, since the renderer-side state needs to
+    // clear regardless of whether this was the "current" window for that
+    // streamKey.
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("popout-closed", streamKey);
+    }
   });
 
   // streamKeys is handed to viewer.js via a query string on the loaded file
@@ -410,8 +425,23 @@ async function openPopoutWindow(streamKey) {
   // viewer.js's tile-resolving/grid code is still generic over N tiles
   // (unchanged, still shared/tested code) even though every pop-out window
   // now always shows exactly one.
+  //
+  // `meta` (2026-07-28, functional parity pass): the caller's own
+  // `ownerLabel`/`roomLabel`/`hasAudio`/`resolution` for this tile, passed
+  // straight through as extra query params rather than having viewer.js
+  // re-derive them itself (which would mean re-fetching `room_detail` and
+  // re-joining against `members`/`streams` — logic `view.js`'s
+  // `fetchWatchedStreams` already did once to build the tile `popOutWatch`
+  // was called with). `hasAudio` is stringified as "1"/omitted rather than
+  // "true"/"false" so `viewer.js`'s `params.get("hasAudio") === "1"` check
+  // stays a plain equality, matching how absent-vs-present is used
+  // elsewhere in this file's query-string handling.
   const params = new URLSearchParams();
   params.set("streamKeys", JSON.stringify([streamKey]));
+  if (meta.ownerLabel) params.set("ownerLabel", meta.ownerLabel);
+  if (meta.roomLabel) params.set("roomLabel", meta.roomLabel);
+  if (meta.hasAudio) params.set("hasAudio", "1");
+  if (meta.resolution) params.set("resolution", meta.resolution);
   return win.loadFile(VIEWER_HTML, { search: params.toString() });
 }
 
@@ -421,7 +451,7 @@ ipcMain.handle("open-popout-window", (_event, opts) => {
   // Returning (not just calling) `openPopoutWindow`'s promise is what lets
   // a `loadFile` rejection inside it propagate through `ipcMain.handle` as
   // a rejected `invoke()` on the renderer side.
-  return openPopoutWindow(streamKey);
+  return openPopoutWindow(streamKey, opts || {});
 });
 
 // Both handlers below resolve which pop-out window they apply to via
