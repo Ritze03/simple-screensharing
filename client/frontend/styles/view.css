@@ -406,6 +406,22 @@
   font-size: 12px;
 }
 
+/* `.media-tile-placeholder`'s own `display: flex` above has the same
+   specificity as the UA stylesheet's `[hidden] { display: none }` and loads
+   later, so it silently wins and the `hidden` attribute set/cleared by
+   `tile-video.js`'s `showError()`/`hideError()` stops actually hiding
+   anything — the "Stream error" label rendered permanently over every tile,
+   including ones decoding and drawing real frames fine, regardless of what
+   `hidden` was set to. Same class of bug as `.add-room-card[hidden]` in
+   `shell.css` (see that rule's comment) — every class that sets its own
+   `display` on a toggle-shown element needs this same override. Root cause
+   of the 2026-07-28 "ghost Stream error" bug actually being a *CSS* bug, not
+   a `showError`/`hideError` JS-logic gap: see `superdoc/features/
+   viewer-window.md`'s follow-up entry. */
+.media-tile-placeholder[hidden] {
+  display: none;
+}
+
 /* Degraded tile swaps the live ring for an amber one — same "the outline
    tells you the state" idea, different family. The hatch drops to the
    faint variant: the badge-scale gradient tiled across a whole tile read

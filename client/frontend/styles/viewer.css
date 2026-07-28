@@ -65,6 +65,17 @@ body {
   pointer-events: none;
 }
 
+/* Same bug/fix as `.media-tile-placeholder[hidden]` in `view.css` — this
+   class's own `display: flex` above has the same specificity as the UA
+   stylesheet's `[hidden] { display: none }`, so without this override the
+   `hidden` attribute `tile-video.js`'s `showError()`/`hideError()` toggle
+   never actually hides anything: the "Stream error" label rendered
+   permanently over every pop-out tile regardless of decode state. See
+   `superdoc/features/viewer-window.md`'s 2026-07-28 follow-up entry. */
+.viewer-tile-placeholder[hidden] {
+  display: none;
+}
+
 .viewer-empty {
   position: fixed;
   inset: 0;
