@@ -572,7 +572,7 @@
    (7px 14px / 12px, shell.css) so the size difference reads as deliberate,
    not marginal. */
 .dest-actions-staged .dest-action-btn {
-  padding: 11px 22px;
+  padding: 6px 22px;
   font-size: 14px;
   font-weight: 700;
 }
