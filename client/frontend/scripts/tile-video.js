@@ -346,20 +346,36 @@
       if (errorPlaceholder) errorPlaceholder.removeAttribute("hidden");
     };
 
+    // Counterpart to `showError` — called from `decoder.output` (below)
+    // every time a frame actually makes it to the canvas. Nothing before
+    // this fix ever re-hid `errorPlaceholder` once shown, so a transient,
+    // self-recovering error (e.g. one bad `decode()`/`configure()` call
+    // during connection setup that the pipeline immediately recovers from,
+    // with the read loop continuing and more frames arriving) left a
+    // permanent "Stream error" label stuck over a video that was visibly
+    // playing fine. A real fatal error (fetch failure, non-OK HTTP
+    // response, an unrecoverable decoder `error` that tears the controller
+    // down, or the read loop's own catch/exit) never reaches this path
+    // again — no more frames ever decode once the controller is stopped, so
+    // the placeholder correctly stays visible for those cases.
+    const hideError = () => {
+      if (errorPlaceholder) errorPlaceholder.setAttribute("hidden", "hidden");
+    };
+
     // Every exit path below (including the two early `return`s right after
     // this) funnels through this `finally`, so a fetch failure can't leak
     // this controller in `videoControllers` forever — see `stopController`'s
     // doc comment for why this is own-controller cleanup, not a
     // `stopTileVideo(tile.id)` map lookup.
     try {
-      await startTileVideoInner(tile, canvas, controller, showError);
+      await startTileVideoInner(tile, canvas, controller, showError, hideError);
     } finally {
       stopController(controller);
       if (videoControllers.get(tile.id) === controller) videoControllers.delete(tile.id);
     }
   }
 
-  async function startTileVideoInner(tile, canvas, controller, showError) {
+  async function startTileVideoInner(tile, canvas, controller, showError, hideError) {
     let response;
     try {
       response = await fetch(tile.videoUrl, { signal: controller.abortController.signal });
@@ -406,6 +422,13 @@
         }
         canvas.getContext("2d").drawImage(frame, 0, 0, canvas.width, canvas.height);
         frame.close();
+        // A real frame just made it all the way to the canvas — whatever
+        // error (if any) fired earlier on this controller's pipeline was
+        // transient/self-recovering, so clear the stuck overlay. See
+        // `hideError`'s doc comment above for why this can never mask a
+        // genuinely fatal error: those all stop the controller, which stops
+        // `decoder.output` from ever firing again.
+        hideError();
       },
       error: (e) => {
         console.error(`[tile-video] VideoDecoder error for ${tile.id}:`, e);
