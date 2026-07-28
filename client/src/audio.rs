@@ -36,9 +36,15 @@
 //!    is completely untouched — confirmed live by watching `pw-link -l`
 //!    show both the original link and the new one simultaneously.
 //! 4. `output.X` is then captured like any normal PipeWire audio source:
-//!    `pipewiresrc path=<output.X's node id> ! audioconvert ! audioresample
-//!    ! opusenc ! appsink`, verified live end-to-end (real `440`/`550`Hz
-//!    `audiotestsrc` app → loopback → Opus packets out of `appsink`).
+//!    `pipewiresrc target-object=<output.X's object.serial> ! audioconvert
+//!    ! audioresample ! volume ! level ! opusenc ! appsink`, and the
+//!    resulting link is then *verified* against `pw-dump` before the stream
+//!    is announced ([`wait_for_capture_link`]). **`target-object` and the
+//!    `object.serial`, not `path` and the registry node id** — see
+//!    [`build_pipeline`]'s doc comment for the difference, and for the fact
+//!    that getting it wrong silently shares the user's microphone instead of
+//!    the application they picked (which is exactly what shipped on
+//!    2026-07-28 before this was fixed).
 //!
 //! # Threading / async model
 //!
@@ -51,11 +57,14 @@
 //! # Scope
 //!
 //! Application-output audio only, per this project's design — never
-//! microphone/physical-input capture. UI wiring (a source-picker for
-//! [`list_audio_sources`]) is a later task; this module is just the API.
+//! microphone/physical-input capture. [`wait_for_capture_link`] is what
+//! makes that a guarantee rather than an intention. The UI that drives this
+//! is the "+ Add audio" row on a screen share's card in Stream Control (see
+//! `superdoc/features/stream-control.md`).
 
-use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -222,8 +231,14 @@ fn node_port_ids(objects: &[PwObject], node_id: u64, direction: &str) -> Vec<u32
 /// creates (see module docs for what each end is for).
 struct LoopbackNodes {
     /// `output.<loopback_name>`, `Stream/Output/Audio` — what we capture
-    /// from via `pipewiresrc`.
+    /// from via `pipewiresrc`. This is the *registry object id* (`pw-dump`'s
+    /// top-level `id`), which is what `pw-link` takes.
     output_node_id: u32,
+    /// The same node's `object.serial`. A **different number** from
+    /// `output_node_id`, and the only one `pipewiresrc`'s `target-object`
+    /// understands — see [`build_pipeline`]'s doc comment for why getting
+    /// this wrong silently captured the microphone instead.
+    output_node_serial: u64,
     /// `input.<loopback_name>`, `Stream/Input/Audio` — what we `pw-link`
     /// the target application's output ports into.
     input_node_id: u32,
@@ -232,7 +247,8 @@ struct LoopbackNodes {
 fn find_loopback_nodes(objects: &[PwObject], loopback_name: &str) -> Option<LoopbackNodes> {
     let output_name = format!("output.{loopback_name}");
     let input_name = format!("input.{loopback_name}");
-    let mut nodes: HashMap<&str, u32> = HashMap::new();
+    let mut output: Option<(u32, u64)> = None;
+    let mut input: Option<u32> = None;
     for obj in objects {
         if obj.obj_type.as_deref() != Some("PipeWire:Interface:Node") {
             continue;
@@ -241,14 +257,39 @@ fn find_loopback_nodes(objects: &[PwObject], loopback_name: &str) -> Option<Loop
         let Some(props) = &info.props else { continue };
         let Some(name) = prop_str(props, "node.name") else { continue };
         if name == output_name {
-            nodes.insert("output", obj.id);
+            output = Some((obj.id, prop_u64(props, "object.serial")?));
         } else if name == input_name {
-            nodes.insert("input", obj.id);
+            input = Some(obj.id);
         }
     }
-    Some(LoopbackNodes {
-        output_node_id: *nodes.get("output")?,
-        input_node_id: *nodes.get("input")?,
+    let (output_node_id, output_node_serial) = output?;
+    Some(LoopbackNodes { output_node_id, output_node_serial, input_node_id: input? })
+}
+
+/// The registry object id of the `pipewiresrc` capture stream node named
+/// `capture_node_name` (`pipewiresrc`'s `client-name` becomes the stream
+/// node's `node.name`, verified live against `pw-dump`), if it has appeared
+/// in the graph yet.
+fn find_capture_node(objects: &[PwObject], capture_node_name: &str) -> Option<u32> {
+    objects.iter().find_map(|obj| {
+        if obj.obj_type.as_deref() != Some("PipeWire:Interface:Node") {
+            return None;
+        }
+        let props = obj.info.as_ref()?.props.as_ref()?;
+        (prop_str(props, "node.name")? == capture_node_name).then_some(obj.id)
+    })
+}
+
+/// Whether `objects` contains a link carrying audio from node
+/// `output_node_id` into node `input_node_id`.
+fn nodes_are_linked(objects: &[PwObject], output_node_id: u32, input_node_id: u32) -> bool {
+    objects.iter().any(|obj| {
+        if obj.obj_type.as_deref() != Some("PipeWire:Interface:Link") {
+            return false;
+        }
+        let Some(props) = obj.info.as_ref().and_then(|i| i.props.as_ref()) else { return false };
+        prop_u64(props, "link.output.node") == Some(output_node_id as u64)
+            && prop_u64(props, "link.input.node") == Some(input_node_id as u64)
     })
 }
 
@@ -369,14 +410,129 @@ fn kill_and_wait(child: &mut Child) {
 }
 
 // ---------------------------------------------------------------------
+// Capture level metering
+// ---------------------------------------------------------------------
+
+/// How often the capture pipeline's `level` element reports the signal
+/// level, in nanoseconds. 100 ms is fast enough for a meter to read as live
+/// and slow enough that the messages cost nothing.
+const LEVEL_INTERVAL_NS: u64 = 100_000_000;
+
+/// The quietest level the meter distinguishes from silence. `level` reports
+/// RMS in dBFS and digital silence comes back as an enormous negative
+/// number (`-700` dB was observed live), so everything below this floor is
+/// clamped to 0 rather than producing a meaningless sliver of bar.
+const LEVEL_FLOOR_DB: f64 = -60.0;
+
+/// The live capture level of one audio share, as a 0.0-1.0 fraction, shared
+/// between the GStreamer bus handler that writes it and whoever renders it.
+///
+/// `Why an atomic and not a channel/mutex:` this is a *display* value with
+/// exactly one writer and no history — a reader only ever wants the newest
+/// number, and a missed update is invisible at 10 Hz. An `AtomicU32`
+/// holding `f32::to_bits` makes both sides lock-free, which matters because
+/// the writer is a GStreamer streaming thread.
+#[derive(Clone, Default)]
+pub struct AudioLevel(Arc<AtomicU32>);
+
+impl AudioLevel {
+    fn store(&self, level: f32) {
+        self.0.store(level.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+    }
+
+    /// Newest captured level, 0.0 (silence) to 1.0 (full scale).
+    pub fn get(&self) -> f32 {
+        f32::from_bits(self.0.load(Ordering::Relaxed))
+    }
+}
+
+/// Turns one `level` element message into a 0.0-1.0 meter reading: the
+/// loudest channel's RMS, mapped from dBFS onto [`LEVEL_FLOOR_DB`]..0.
+///
+/// Split out from [`handle_bus_message`] so the dB→fraction mapping is
+/// unit-testable without a live pipeline.
+fn level_fraction_from_rms_db(rms_db: impl IntoIterator<Item = f64>) -> Option<f32> {
+    let loudest = rms_db.into_iter().fold(f64::NEG_INFINITY, f64::max);
+    if !loudest.is_finite() {
+        return None;
+    }
+    Some((((loudest - LEVEL_FLOOR_DB) / -LEVEL_FLOOR_DB).clamp(0.0, 1.0)) as f32)
+}
+
+/// Reads the per-channel RMS values out of a `level` element message.
+fn rms_db_from_level_message(structure: &gst::StructureRef) -> Option<Vec<f64>> {
+    // `glib` is not a direct dependency of this crate; `gstreamer` re-exports
+    // the exact version it was built against, which is the one that matters
+    // for a `GValue` handed over by a GStreamer element.
+    let rms = structure.get::<gst::glib::ValueArray>("rms").ok()?;
+    Some(rms.iter().filter_map(|v| v.get::<f64>().ok()).collect())
+}
+
+// ---------------------------------------------------------------------
 // GStreamer pipeline construction
 // ---------------------------------------------------------------------
 
-fn build_pipeline(loopback_output_node_id: u32) -> Result<(gst::Pipeline, gst_app::AppSink)> {
+/// Builds the Opus capture pipeline that taps `output.<loopback_name>`.
+///
+/// # Why `target-object=<object.serial>`, and not `path=<node id>`
+///
+/// This used to be `pipewiresrc path={loopback_output_node_id}`, and that
+/// was the bug that made the whole feature silently do the wrong thing:
+///
+/// - `path` is **deprecated** (`gst-inspect-1.0 pipewiresrc`: "The source
+///   path to connect to (NULL = default) … deprecated"); `target-object` is
+///   its replacement.
+/// - Both take *"the source name/serial"* — a node's `object.serial` or its
+///   `node.name`. They do **not** take `pw-dump`'s top-level registry `id`,
+///   which is a different number entirely (measured live on this machine:
+///   the loopback output node was registry id `333`, `object.serial`
+///   `18643`). Passing the registry id therefore matched nothing.
+/// - And a `pipewiresrc` whose target does not match anything does not
+///   fail. `node.autoconnect` defaults to `true`, so the session manager
+///   links it to the **default audio source instead — the microphone**.
+///   Confirmed live via `pw-link -l`: the capture stream came up linked to
+///   `easyeffects_source:capture_FL`, i.e. the sharer's mic, not the app
+///   they picked. That is why the viewer heard nothing from the shared
+///   application: the app's audio was never captured at all.
+///
+/// [`wait_for_capture_link`] exists because that failure mode is silent and
+/// is a privacy problem, not just a broken feature — see its doc comment.
+///
+/// `client-name` is set so the resulting stream node is findable by name in
+/// `pw-dump` (`pipewiresrc` copies `client-name` into the stream node's
+/// `node.name`, verified live), which is what makes that check possible.
+///
+/// The explicit `channels=2` caps filter pins the tap to stereo. Without
+/// it, `audioconvert`'s wide-open sink caps let PipeWire negotiate **mono**
+/// and link only `output_FL` — verified live (`ssshare-cap2:input_MONO`),
+/// i.e. music shared through this path silently lost its right channel.
+/// The loopback is always created with `pw-loopback`'s default `[FL, FR]`
+/// channel map, so requesting 2 channels here can't over-ask.
+///
+/// The `level` element sits on the decoded-PCM side (it only understands
+/// `audio/x-raw`, so it has to be before `opusenc`) and posts an element
+/// message every [`LEVEL_INTERVAL_NS`]; [`handle_bus_message`] folds those
+/// into [`AudioCaptureHandle::level`], which is what the Stream Control
+/// card's little VU meter draws. `post-messages` is the element's default
+/// but is stated explicitly because the whole feature silently stops
+/// working if it ever isn't.
+///
+/// `volume name=mute` backs [`AudioCaptureHandle::set_muted`], and sits
+/// deliberately **before** `level`: muting therefore flattens the meter as
+/// well as silencing the stream. `Why:` the meter's job is to answer "is my
+/// audio going out right now" — a bar still bouncing while the share is
+/// muted answers that question wrongly. Muting with `volume` rather than by
+/// pausing the send keeps a continuous Opus stream flowing, so the viewer's
+/// jitter buffer and packet-loss concealment never see a mute as a
+/// multi-second dropout to conceal.
+fn build_pipeline(loopback_output_node_serial: u64, capture_node_name: &str) -> Result<(gst::Pipeline, gst_app::AppSink, gst::Element)> {
     let description = format!(
-        "pipewiresrc path={loopback_output_node_id} do-timestamp=true \
+        "pipewiresrc target-object={loopback_output_node_serial} client-name={capture_node_name} do-timestamp=true \
+         ! audio/x-raw,channels=2 \
          ! audioconvert \
          ! audioresample \
+         ! volume name=mute \
+         ! level name=level post-messages=true interval={LEVEL_INTERVAL_NS} \
          ! opusenc \
          ! appsink name=sink emit-signals=false sync=false max-buffers=32 drop=true"
     );
@@ -393,7 +549,69 @@ fn build_pipeline(loopback_output_node_id: u32) -> Result<(gst::Pipeline, gst_ap
         .downcast::<gst_app::AppSink>()
         .map_err(|_| anyhow!("'sink' element is not an AppSink"))?;
 
-    Ok((pipeline, sink))
+    let mute = pipeline
+        .by_name("mute")
+        .ok_or_else(|| anyhow!("pipeline has no element named 'mute'"))?;
+
+    Ok((pipeline, sink, mute))
+}
+
+/// Polls `pw-dump` until the `pipewiresrc` stream node called
+/// `capture_node_name` exists **and** is actually linked to
+/// `loopback_output_node_id`, or `timeout` elapses.
+///
+/// # Why this is not paranoia
+///
+/// `pipewiresrc` connects with `node.autoconnect=true`. If its
+/// `target-object` doesn't resolve, PipeWire does not error — the session
+/// manager just links the capture stream to the **default audio source**,
+/// which on a normal desktop is the microphone. The pipeline then reaches
+/// `PLAYING` and produces perfectly valid Opus packets, so every signal
+/// [`start_audio_sharing`] used to check (`set_state` succeeded, the
+/// pipeline reported a state, packets flowed) reads as success while the
+/// application the user picked is not being captured and their microphone
+/// is being broadcast to the room instead. Nothing downstream can tell the
+/// difference. This check is the only place that can.
+///
+/// It doubles as the real "capture has started" gate: for a live source
+/// like `pipewiresrc`, `Element::state()` reports
+/// `Ok(StateChangeSuccess::Async)` while the source is still stuck waiting
+/// to negotiate — which the old `if let Err(..)` check treated as success,
+/// so a capture that never connected to anything at all still announced
+/// itself to the room as a working stream.
+async fn wait_for_capture_link(
+    capture_node_name: &str,
+    loopback_output_node_id: u32,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut last_capture_node = None;
+    loop {
+        let objects = run_pw_dump()?;
+        if let Some(capture_node_id) = find_capture_node(&objects, capture_node_name) {
+            last_capture_node = Some(capture_node_id);
+            if nodes_are_linked(&objects, loopback_output_node_id, capture_node_id) {
+                tracing::info!(
+                    "audio capture stream '{capture_node_name}' (node {capture_node_id}) is linked to loopback output node {loopback_output_node_id}"
+                );
+                return Ok(());
+            }
+        }
+        if Instant::now() >= deadline {
+            match last_capture_node {
+                Some(id) => bail!(
+                    "audio capture stream '{capture_node_name}' (node {id}) never linked to the loopback \
+                     output node {loopback_output_node_id} — refusing to share, because a pipewiresrc that \
+                     misses its target silently captures the default source (the microphone) instead"
+                ),
+                None => bail!(
+                    "audio capture stream '{capture_node_name}' never appeared in the PipeWire graph \
+                     (the capture pipeline never connected)"
+                ),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -412,6 +630,15 @@ pub struct AudioCaptureHandle {
     pipeline: gst::Pipeline,
     loopback_child: Child,
     pump_task: tokio::task::JoinHandle<()>,
+    level: AudioLevel,
+    /// The pipeline's `volume name=mute` element — see
+    /// [`AudioCaptureHandle::set_muted`].
+    mute_element: gst::Element,
+    /// The application whose audio this share is capturing — the name the
+    /// user picked in the source list. Surfaced next to the share's level
+    /// meter in Stream Control, so the row can say *what* is being shared
+    /// rather than just that something is.
+    source_name: String,
 }
 
 /// Starts sharing `source`'s audio on `stream_id`: spins up a private
@@ -448,7 +675,8 @@ pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, sour
         return Err(e);
     }
 
-    let (pipeline, appsink) = match build_pipeline(loopback.output_node_id) {
+    let capture_node_name = format!("{loopback_name}-cap");
+    let (pipeline, appsink, mute_element) = match build_pipeline(loopback.output_node_serial, &capture_node_name) {
         Ok(v) => v,
         Err(e) => {
             kill_and_wait(&mut loopback_child);
@@ -471,6 +699,15 @@ pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, sour
         return Err(anyhow!("audio capture pipeline failed to reach PLAYING: {e:?}"));
     }
 
+    // ...and then confirm it is capturing *the loopback* and not whatever
+    // the session manager felt like connecting it to. See
+    // `wait_for_capture_link` for why reaching PLAYING is not enough.
+    if let Err(e) = wait_for_capture_link(&capture_node_name, loopback.output_node_id, Duration::from_secs(5)).await {
+        let _ = pipeline.set_state(gst::State::Null);
+        kill_and_wait(&mut loopback_child);
+        return Err(e);
+    }
+
     let stream = appsink.stream();
     let bus = match pipeline.bus() {
         Some(b) => b,
@@ -482,8 +719,9 @@ pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, sour
     };
     let bus_stream = bus.stream();
 
+    let level = AudioLevel::default();
     let pump_client = client.clone();
-    let pump_task = tokio::spawn(pump_loop(pump_client, stream_id, stream, bus_stream));
+    let pump_task = tokio::spawn(pump_loop(pump_client, stream_id, stream, bus_stream, level.clone()));
 
     // No width/height for audio (spec's AnnounceStream fields exist for
     // video streams' benefit); 0x0 signals "not applicable".
@@ -504,6 +742,9 @@ pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, sour
         pipeline,
         loopback_child,
         pump_task,
+        level,
+        mute_element,
+        source_name: source.name.clone(),
     })
 }
 
@@ -529,6 +770,32 @@ impl Drop for AudioCaptureHandle {
 }
 
 impl AudioCaptureHandle {
+    /// Newest capture level, 0.0-1.0 — what the Stream Control card's VU
+    /// meter draws. Updated ~10x/s while the pipeline is running (see
+    /// [`LEVEL_INTERVAL_NS`]), and left at its last value once it stops.
+    pub fn level(&self) -> f32 {
+        self.level.get()
+    }
+
+    /// The name of the application being captured, as picked in the source
+    /// list.
+    pub fn source_name(&self) -> &str {
+        &self.source_name
+    }
+
+    /// Mute/unmute what this share sends, without stopping it — the Stream
+    /// Control card's Mute toggle. See [`build_pipeline`] for why this is a
+    /// `volume` element ahead of the meter rather than a pause in the send
+    /// loop.
+    pub fn set_muted(&self, muted: bool) {
+        self.mute_element.set_property("mute", muted);
+    }
+
+    /// Whether this share is currently muted.
+    pub fn is_muted(&self) -> bool {
+        self.mute_element.property::<bool>("mute")
+    }
+
     /// Tears the audio share down cleanly: stops the GStreamer pipeline,
     /// waits for the background send task to finish draining, kills the
     /// `pw-loopback` process (which also removes its `pw-link` connections —
@@ -604,6 +871,7 @@ async fn pump_loop(
     stream_id: u8,
     mut appsink_stream: gst_app::app_sink::AppSinkStream,
     mut bus_stream: gst::bus::BusStream,
+    level: AudioLevel,
 ) {
     let start = Instant::now();
     let mut appsink_done = false;
@@ -626,7 +894,7 @@ async fn pump_loop(
             }
             msg = bus_stream.next(), if !bus_done => {
                 match msg {
-                    Some(msg) => handle_bus_message(&msg, &mut bus_done),
+                    Some(msg) => handle_bus_message(&msg, &mut bus_done, &level),
                     None => bus_done = true,
                 }
             }
@@ -634,8 +902,17 @@ async fn pump_loop(
     }
 }
 
-fn handle_bus_message(msg: &gst::Message, bus_done: &mut bool) {
+fn handle_bus_message(msg: &gst::Message, bus_done: &mut bool, level: &AudioLevel) {
     match msg.view() {
+        gst::MessageView::Element(element) => {
+            if let Some(s) = element.structure()
+                && s.name() == "level"
+                && let Some(rms) = rms_db_from_level_message(s)
+                && let Some(fraction) = level_fraction_from_rms_db(rms)
+            {
+                level.store(fraction);
+            }
+        }
         gst::MessageView::Error(err) => {
             tracing::error!(
                 "audio capture pipeline error from {}: {} ({})",
@@ -776,7 +1053,31 @@ mod tests {
                 "info": {
                     "props": {
                         "media.class": "Stream/Output/Audio",
-                        "node.name": "output.ssshare-loopback-3-abc123"
+                        "node.name": "output.ssshare-loopback-3-abc123",
+                        "object.serial": 18643
+                    }
+                }
+            },
+            {
+                "id": 700,
+                "type": "PipeWire:Interface:Node",
+                "info": {
+                    "props": {
+                        "media.class": "Stream/Input/Audio",
+                        "node.name": "ssshare-loopback-3-abc123-cap",
+                        "object.serial": 18700
+                    }
+                }
+            },
+            {
+                "id": 701,
+                "type": "PipeWire:Interface:Link",
+                "info": {
+                    "props": {
+                        "link.output.node": 262,
+                        "link.output.port": 284,
+                        "link.input.node": 700,
+                        "link.input.port": 699
                     }
                 }
             }
@@ -856,6 +1157,34 @@ mod tests {
         assert_eq!(nodes.output_node_id, 262);
         assert_eq!(nodes.input_node_id, 319);
         assert!(find_loopback_nodes(&objects, "no-such-loopback").is_none());
+    }
+
+    /// The registry object id and `object.serial` of the same node are
+    /// different numbers, and `build_pipeline` must use the *serial* — see
+    /// its doc comment for what happened when it didn't (the microphone got
+    /// shared instead of the chosen application). Pinning both here keeps
+    /// the two from being quietly conflated again.
+    #[test]
+    fn find_loopback_nodes_reports_the_object_serial_not_the_registry_id() {
+        let objects = fixture_objects();
+        let nodes = find_loopback_nodes(&objects, "ssshare-loopback-3-abc123").expect("both nodes present in fixture");
+        assert_eq!(nodes.output_node_serial, 18643);
+        assert_ne!(nodes.output_node_serial, nodes.output_node_id as u64);
+    }
+
+    /// The guard that catches "`pipewiresrc` connected to something, but not
+    /// to our loopback" — the shape a mis-targeted capture takes.
+    #[test]
+    fn capture_link_check_accepts_the_real_link_and_rejects_a_missing_one() {
+        let objects = fixture_objects();
+        let capture_node = find_capture_node(&objects, "ssshare-loopback-3-abc123-cap").expect("capture node in fixture");
+        assert_eq!(capture_node, 700);
+        assert!(find_capture_node(&objects, "ssshare-loopback-9-nope-cap").is_none());
+
+        assert!(nodes_are_linked(&objects, 262, capture_node), "the fixture's loopback->capture link should be found");
+        // Same nodes, wrong direction, and a node pair with no link at all.
+        assert!(!nodes_are_linked(&objects, capture_node, 262));
+        assert!(!nodes_are_linked(&objects, 319, capture_node));
     }
 
     /// Sanity-checks that the pipeline description this module builds is

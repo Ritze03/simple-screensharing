@@ -445,6 +445,22 @@ pub struct LocalCapture {
     /// the source's name for audio.
     pub label: String,
     pub status: ShareStatus,
+    /// For an **audio** capture: the video capture this audio share was
+    /// started as a companion to, if any. `None` for every video capture, and
+    /// for a standalone audio share started without a screen share to attach
+    /// to.
+    ///
+    /// `Why the link is explicit and not inferred:` the Stream Control tab no
+    /// longer gives audio a card of its own — a shared application's audio
+    /// renders as an extra row inside its screen share's card (see
+    /// `superdoc/features/stream-control.md`), so the frontend has to know
+    /// *which* card a given audio share belongs in. "Same room" alone is
+    /// ambiguous the moment someone shares two monitors into one room: both
+    /// cards would claim the same audio row, and Stop on either would kill
+    /// audio for both without saying so. Recording the pairing at the moment
+    /// the user clicks "Add audio" on a specific card is unambiguous and
+    /// costs one `Option`.
+    pub audio_for_capture: Option<CaptureSourceId>,
     /// Rooms this capture is being sent into.
     pub destinations: IndexMap<DestinationId, Destination>,
     /// Live self-preview texture for this capture (video only), created
@@ -460,6 +476,42 @@ pub struct LocalCapture {
     /// ever one connection — collides the moment two rooms exist, since
     /// `stream_id` is only unique within one connection.
     pub self_preview_texture: Option<egui::TextureHandle>,
+}
+
+impl LocalCapture {
+    /// The lifecycle state to *show* for `dest`, folding in this capture's
+    /// own start/stop status.
+    ///
+    /// `Why this exists instead of just` `dest.state()`: `Destination::state`
+    /// derives everything from `runtime`, the video encode branch's shared
+    /// state — and an **audio** destination never has one (see
+    /// [`AUDIO_DESTINATION_PARAMS`]'s note). `Destination::state` maps
+    /// `runtime: None` to `Starting`, which for video means "the branch
+    /// hasn't emitted its first IDR yet" and resolves within a beat, but for
+    /// audio was permanent: every audio share sat on "STARTING" forever, no
+    /// matter how healthy it was. Reported by the project owner the first
+    /// time the feature was used for real.
+    ///
+    /// So for audio the capture handle *is* the state: `Starting` while
+    /// `audio::start_audio_sharing` is still in flight, `Live` once it has
+    /// landed (it only returns `Ok` after the pipeline is playing **and**
+    /// verified to be capturing the right PipeWire node — see
+    /// `audio::wait_for_capture_link`). Audio has no per-destination
+    /// stall/rebuild machinery for the other states to come from.
+    pub fn destination_state(&self, dest: &Destination) -> capture::destination::DestinationState {
+        use capture::destination::DestinationState;
+        if self.kind != StreamKind::Audio {
+            return dest.state();
+        }
+        match &self.status {
+            ShareStatus::Starting(_) => DestinationState::Starting,
+            ShareStatus::Active(_) => DestinationState::Live,
+            // Nothing in `DestinationState` means "being torn down"; the row
+            // is about to disappear either way, and `Starting` is the one
+            // non-alarming transient state, which is what "Stopping" is.
+            ShareStatus::Stopping(_) => DestinationState::Starting,
+        }
+    }
 }
 
 /// One stream currently being watched: its decoder, plus the texture handle
@@ -1273,6 +1325,7 @@ impl AppState {
                 kind: StreamKind::Video,
                 label: t!("share.video_label").to_string(),
                 status: ShareStatus::Starting(rx),
+                audio_for_capture: None,
                 destinations: IndexMap::from([(
                     destination_id,
                     Destination {
@@ -1816,10 +1869,15 @@ impl AppState {
         }
     }
 
-    /// "Share Audio" clicked: same shape as `start_video_share`, for the
+    /// "Add audio" clicked: same shape as `start_video_share`, for the
     /// currently selected source. No-op if no source is selected (the button
     /// is disabled in that case).
-    pub fn start_audio_share(&mut self, room_handle: RoomHandle) {
+    ///
+    /// `for_capture` is the video capture this audio is being attached to, so
+    /// its row can be rendered inside that capture's card — see
+    /// [`LocalCapture::audio_for_capture`]. `None` starts a standalone audio
+    /// share, which still works and simply has no card to nest into.
+    pub fn start_audio_share(&mut self, room_handle: RoomHandle, for_capture: Option<CaptureSourceId>) {
         let Some(source) = self.selected_audio_source.clone() else {
             return;
         };
@@ -1839,6 +1897,7 @@ impl AppState {
                 kind: StreamKind::Audio,
                 label: source.name.clone(),
                 status: ShareStatus::Starting(rx),
+                audio_for_capture: for_capture,
                 destinations: IndexMap::from([(
                     destination_id,
                     Destination {
@@ -1868,6 +1927,34 @@ impl AppState {
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
         });
+    }
+
+    /// Mute/unmute an audio share without stopping it — the Mute toggle on
+    /// the screen share's card. No-op for a video capture or one that isn't
+    /// running yet. Returns whether the capture is muted afterwards, so the
+    /// caller doesn't need a second round trip to render the new label.
+    pub fn set_audio_share_muted(&mut self, capture_id: CaptureSourceId, muted: bool) -> bool {
+        let Some(capture) = self.captures.get(&capture_id) else { return false };
+        let ShareStatus::Active(ShareHandle::Audio(handle)) = &capture.status else { return false };
+        handle.set_muted(muted);
+        handle.is_muted()
+    }
+
+    /// Whether `capture_id` is a running, currently-muted audio share.
+    pub fn is_audio_share_muted(&self, capture_id: CaptureSourceId) -> bool {
+        match self.captures.get(&capture_id).map(|c| &c.status) {
+            Some(ShareStatus::Active(ShareHandle::Audio(handle))) => handle.is_muted(),
+            _ => false,
+        }
+    }
+
+    /// The live capture level (0.0-1.0) of `capture_id` if it is a running
+    /// audio share — what the card's VU meter draws.
+    pub fn audio_share_level(&self, capture_id: CaptureSourceId) -> Option<f32> {
+        match self.captures.get(&capture_id).map(|c| &c.status) {
+            Some(ShareStatus::Active(ShareHandle::Audio(handle))) => Some(handle.level()),
+            _ => None,
+        }
     }
 
     /// "Stop"/"Stop Sharing Audio" clicked for `capture_id`: hand the

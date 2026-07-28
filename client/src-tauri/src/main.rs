@@ -69,6 +69,7 @@ fn main() {
             commands::set_max_jitter_buffer_ms,
             commands::start_video_share,
             commands::start_audio_share,
+            commands::set_audio_share_muted,
             commands::stop_share,
             commands::list_audio_sources,
             commands::select_audio_source,

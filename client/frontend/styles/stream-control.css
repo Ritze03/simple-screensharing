@@ -702,16 +702,15 @@
   padding: 4px 8px;
 }
 
+/* One card wide since the SHARE AUDIO card was removed (audio attaches to a
+   screen share's own card now — see stream-control.js's `renderRoomScopedRow`
+   and superdoc/features/stream-control.md, 2026-07-28). Kept as a grid rather
+   than collapsed to a bare div so a future second room-scoped card drops
+   straight back into the same two-column rhythm. */
 .sc-room-scoped-row {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr;
   gap: 12px;
-}
-
-@media (max-width: 620px) {
-  .sc-room-scoped-row {
-    grid-template-columns: 1fr;
-  }
 }
 
 .sc-member-row {
@@ -746,22 +745,6 @@
 .sc-saved-hint {
   color: var(--success);
   font-size: 11px;
-}
-
-.sc-share-audio-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  align-items: center;
-}
-
-.sc-share-audio-row select {
-  background: var(--field);
-  border: 1px solid var(--border);
-  border-radius: var(--rounding-sm);
-  color: var(--text);
-  padding: 5px 8px;
-  flex: 1 1 140px;
 }
 
 /* -------------------------------------------------------------------
@@ -807,18 +790,6 @@
 
 /* Secondary ghost ("Share audio") stays muted — the prototype gives it a
    plain surface, so the two entry points aren't equally loud. */
-.sc-ghost-row-muted {
-  border: 1px solid var(--divider);
-  background: var(--elevation-1b);
-  color: var(--text-dim);
-}
-
-.sc-ghost-row-muted:hover {
-  border-color: var(--btn-border);
-  background: var(--elevation-1b);
-  color: var(--text);
-}
-
 .sc-ghost-row-icon {
   font-size: 16px;
   flex: 0 0 auto;
@@ -828,26 +799,136 @@
   color: var(--accent);
 }
 
-.sc-ghost-row-icon-muted {
+/* -------------------------------------------------------------------
+ * Attached audio row — the last line of a screen share's card, under a
+ * hairline rule. Audio is a property of the share, not a stream of its
+ * own, so it gets one row inside the card rather than a card (or a
+ * separate SHARE AUDIO panel) of its own.
+ *
+ *   [VU meter] [application name] ......... [Mute/Unmute] [Stop]
+ *
+ * Palette is all `tokens.css` roles — `--divider` for the rule,
+ * `--success` + `--success-glow` for a live meter bar (the same "lit, not
+ * printed" treatment the LIVE badge's dot uses), `--text-faint` for an
+ * unlit one.
+ * ----------------------------------------------------------------- */
+
+.dest-divider {
+  height: 1px;
+  background: var(--divider);
+  margin: 8px 0 7px;
+}
+
+.dest-audio-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 24px;
+}
+
+/* Meter: fixed-width so the name column never shifts as bars light up.
+   Bars are bottom-aligned and grow upward, VU-style. */
+.dest-audio-meter {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  width: 26px;
+  height: 14px;
+  flex: 0 0 auto;
+}
+
+.dest-audio-meter-bar {
+  flex: 1 1 auto;
+  height: 20%;
+  min-height: 2px;
+  border-radius: 1px;
+  background: var(--text-faint);
+  opacity: 0.45;
+  transition: height 90ms linear, opacity 90ms linear, background-color 90ms linear;
+}
+
+.dest-audio-meter-bar.dest-audio-meter-bar-lit {
+  background: var(--success);
+  opacity: 1;
+  box-shadow: var(--success-glow);
+}
+
+/* Muted: the meter is deliberately flat and grey (the capture pipeline's
+   `volume` element sits before its `level` element, so a muted share
+   genuinely reports zero — see `audio::build_pipeline`). */
+.dest-audio-meter-muted .dest-audio-meter-bar {
+  background: var(--text-faint);
+  opacity: 0.3;
+  box-shadow: none;
+}
+
+.dest-audio-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Fixed width, sized for the longer of "Mute"/"Unmute", so toggling the
+   label never reflows the row (the Stop button beside it would otherwise
+   slide sideways on every click). */
+.dest-audio-mute {
+  flex: 0 0 auto;
+  width: 64px;
+  padding: 3px 0;
+  height: auto;
+  font-size: 11px;
+  text-align: center;
+}
+
+.dest-audio-mute-on {
+  color: var(--warning);
+  border-color: var(--warning);
+}
+
+.dest-audio-stop {
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  height: auto;
+  font-size: 11px;
+}
+
+/* No audio attached yet. */
+.dest-audio-empty-icon {
+  font-size: 15px;
+  color: var(--text-faint);
+  flex: 0 0 auto;
+}
+
+.dest-audio-empty-text {
+  flex: 1 1 auto;
+  font-size: 11px;
   color: var(--text-faint);
 }
 
-.sc-ghost-audio-expand {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-  padding: 8px 10px 2px;
+.dest-audio-add-btn {
+  flex: 0 0 auto;
 }
 
-.sc-ghost-audio-expand[hidden] {
+.dest-audio-picker {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.dest-audio-picker[hidden] {
   display: none;
 }
 
-.sc-ghost-audio-select {
-  background: var(--field);
-  border: 1px solid var(--border);
-  border-radius: var(--rounding-sm);
-  color: var(--text);
-  padding: 5px 8px;
+.dest-audio-select {
+  max-width: 150px;
+}
+
+.dest-audio-share-btn {
+  padding: 3px 8px;
+  height: auto;
+  font-size: 11px;
 }

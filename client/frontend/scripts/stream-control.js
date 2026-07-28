@@ -435,10 +435,17 @@
     mockStartStream(roomHandle, fps, bitrateKbps);
   }
 
-  async function startAudioShare(roomHandle, source) {
+  /**
+   * Start sharing `source`'s audio into `roomHandle`, attached to the screen
+   * share `forCaptureId` — audio is no longer a stream of its own in this
+   * UI, it's a row inside the share it belongs to, and the backend records
+   * the pairing so the frontend knows which card to put it in (see
+   * `session::LocalCapture::audio_for_capture`).
+   */
+  async function startAudioShare(roomHandle, source, forCaptureId) {
     if (window.__TAURI__) {
       await window.__TAURI__.core.invoke("select_audio_source", { id: source.id, name: source.name });
-      await window.__TAURI__.core.invoke("start_audio_share", { roomHandle });
+      await window.__TAURI__.core.invoke("start_audio_share", { roomHandle, forCaptureId: forCaptureId ?? null });
       return;
     }
     const room = mockJoinedRooms.find((r) => r.id === roomHandle);
@@ -448,14 +455,42 @@
       room_handle: roomHandle,
       room_label: room ? room.name : String(roomHandle),
       kind: "audio",
+      label: source.name,
       state: "live",
       width: 0,
       height: 0,
       framerate: 0,
       bitrate_kbps: 128,
       pending: null,
+      paired_capture_id: forCaptureId ?? null,
+      muted: false,
     });
     render();
+  }
+
+  /** Mute/unmute a running audio share in place (its card row's toggle). */
+  async function setAudioShareMuted(captureId, muted) {
+    if (window.__TAURI__) {
+      await window.__TAURI__.core.invoke("set_audio_share_muted", { captureId, muted });
+      // The DTO is the source of truth for the button's label; refetch so
+      // the next render picks the new state up rather than trusting a local
+      // guess that could disagree with the pipeline.
+      mockDestinations = await fetchActiveDestinations();
+    } else {
+      const d = mockDestinations.find((x) => x.capture_id === captureId);
+      if (d) d.muted = muted;
+    }
+    render();
+  }
+
+  /** Re-list the system's currently-audio-producing applications, for the
+   * "+ Add audio" picker on a share's card. Returns the fresh list: this
+   * reassigns `mockAudioSources`, so a caller holding the previous array
+   * would otherwise keep showing the old (on first open: the mock
+   * placeholder) sources — see `addAudioRow` in components.js. */
+  async function refreshAudioSources() {
+    mockAudioSources = await fetchAudioSources();
+    return mockAudioSources;
   }
 
   async function renameRoom(joinString, name) {
@@ -481,7 +516,6 @@
     startForm: { roomHandle: 1, fps: 30, bitrateKbps: 8000 },
     startInFlight: false,
     startError: null,
-    audioSource: MOCK_AUDIO_SOURCES[0],
   };
 
   let destIdSeq = 100;
@@ -539,6 +573,11 @@
   let activeSharesGridEl = null;
   let activeSharesBodySig = null;
   const destCardEls = new Map(); // destination_id -> { el, sig }
+  // audio destination_id -> its `.dest-audio-meter` element, which lives
+  // inside the *paired video* destination's card. `updateStats()` needs this
+  // indirection because `stream-stats-updated` keys `audio_level` by the
+  // audio destination, not the card it's drawn in.
+  const audioMeterEls = new Map();
   // destination_id -> ms epoch first observed 'stalled'. No DTO carries a
   // "since" timestamp for `DestinationState::Stalled` (see `statusBadge`'s
   // doc comment in components.js) — tracked client-side here instead, the
@@ -760,54 +799,22 @@
     screenRow.appendChild(el("span", { text: "Share another screen" }));
     wrap.appendChild(screenRow);
 
-    // "Share audio" — expands in place into the same `startAudioShare()`
-    // call the room-scoped SHARE AUDIO card below already exposes (not a
-    // second copy of that flow, just a second, more discoverable entry
-    // point onto it).
-    const audioExpand = el("div", { className: "sc-ghost-audio-expand", attrs: { hidden: "" } });
-    const roomSelect = el("select", { className: "sc-ghost-audio-select" });
-    const sourceSelect = el("select", { className: "sc-ghost-audio-select" });
-    audioExpand.appendChild(roomSelect);
-    audioExpand.appendChild(sourceSelect);
-    audioExpand.appendChild(
-      primaryButton("Share Audio", () => {
-        const roomHandle = Number(roomSelect.value);
-        const source = mockAudioSources.find((s) => String(s.id) === sourceSelect.value) || state.audioSource;
-        startAudioShare(roomHandle, source);
-      })
-    );
-
-    // `-muted`: the prototype draws the audio row as a plain surface, not
-    // the dashed-accent invitation "Share another screen" gets — two
-    // equally loud ghost rows compete (see stream-control.css).
-    const audioRow = el("div", {
-      className: "sc-ghost-row sc-ghost-row-muted",
-      attrs: { role: "button", tabindex: "0" },
-      onClick: () => {
-        const opening = audioExpand.hidden;
-        audioExpand.hidden = !opening;
-        if (!opening) return;
-        // Repopulate on open — rooms/sources may have changed since the
-        // last time this was expanded.
-        roomSelect.innerHTML = "";
-        mockJoinedRooms.forEach((r) => roomSelect.appendChild(el("option", { text: r.name, attrs: { value: r.id } })));
-        roomSelect.value = state.scopedRoomHandle;
-        sourceSelect.innerHTML = "";
-        mockAudioSources.forEach((s) => sourceSelect.appendChild(el("option", { text: s.name, attrs: { value: s.id } })));
-        sourceSelect.value = state.audioSource.id;
-      },
-    });
-    audioRow.appendChild(icon("volume_up", "sc-ghost-row-icon sc-ghost-row-icon-muted"));
-    audioRow.appendChild(el("span", { text: "Share audio" }));
-    wrap.appendChild(audioRow);
-    wrap.appendChild(audioExpand);
+    // `Why there is no "Share audio" ghost row:` it started a *standalone*
+    // audio share, which no longer has anywhere to render — audio belongs to
+    // a screen share now and is added from that share's own card ("+ Add
+    // audio"). Leaving this entry point would have been the one way to
+    // create an audio share with no card to live in.
 
     activeSharesGhostEl = wrap;
     return wrap;
   }
 
   function updateActiveSharesCard(alloc) {
-    if (mockDestinations.length === 0) {
+    // Audio never renders a card of its own, so "is this list empty" is a
+    // question about *screen shares* — an audio-only destination list would
+    // otherwise show an empty grid instead of the empty state.
+    if (mockDestinations.filter((d) => d.kind !== "audio").length === 0) {
+      audioMeterEls.clear();
       destCardEls.clear();
       if (!activeSharesCardEl || activeSharesBodySig !== "empty") {
         activeSharesCardEl = card(
@@ -836,9 +843,27 @@
     activeSharesBodySig = "list";
 
     const seenIds = new Set();
-    const orderedCardEls = mockDestinations.map((dest) => {
+    audioMeterEls.clear();
+    // Audio destinations are not cards. Each one is rendered as a row inside
+    // the screen share's card it was attached to — matched on the pairing the
+    // backend recorded (`paired_capture_id`, see
+    // `session::LocalCapture::audio_for_capture`) *and* the room, since one
+    // capture can be fanned out to several rooms and each room's audio is its
+    // own share. An audio row with no matching video card left (only
+    // reachable if a share was torn down out from under it, or an audio share
+    // was started by the old egui frontend) simply doesn't render here; the
+    // sidebar's OUTGOING list still lists and can stop it, so it is never
+    // invisible or stranded.
+    const videoDestinations = mockDestinations.filter((d) => d.kind !== "audio");
+    const audioFor = (videoDest) =>
+      mockDestinations.find(
+        (d) => d.kind === "audio" && d.paired_capture_id === videoDest.capture_id && d.room_handle === videoDest.room_handle
+      ) || null;
+
+    const orderedCardEls = videoDestinations.map((dest) => {
       seenIds.add(dest.destination_id);
-      const roomsAlreadyFedByCapture = mockDestinations.filter((d) => d.capture_id === dest.capture_id).map((d) => d.room_handle);
+      const audio = audioFor(dest);
+      const roomsAlreadyFedByCapture = videoDestinations.filter((d) => d.capture_id === dest.capture_id).map((d) => d.room_handle);
       const withShare =
         bandwidth.bandwidth_mode === "absolute" && dest.kind !== "audio" && dest.state !== "starting"
           ? Object.assign({}, dest, { computedShareKbps: alloc.share })
@@ -861,6 +886,12 @@
         roomOptions: mockJoinedRooms,
         roomsAlreadyFedByCapture,
         stalledSince,
+        // Only the fields the audio row actually renders — deliberately NOT
+        // the whole audio row object, and emphatically not its level: the VU
+        // meter is animated by direct DOM writes from `updateStats()`, so
+        // folding a 10Hz level into this signature would rebuild the card
+        // (and every listener on it) ten times a second.
+        audio: audio ? { id: audio.destination_id, capture: audio.capture_id, label: audio.label, muted: audio.muted } : null,
       });
 
       let entry = destCardEls.get(dest.destination_id);
@@ -882,6 +913,10 @@
               onFanout: (captureId, targetRoomHandle) => fanoutDestination(captureId, targetRoomHandle),
               onStop: (id) => stopDestination(id),
               onRetry: (d) => retryDestination(d),
+              onAddAudio: (d, source) => startAudioShare(d.room_handle, source, d.capture_id),
+              onAudioMute: (captureId, muted) => setAudioShareMuted(captureId, muted),
+              onAudioStop: (audioDestinationId) => stopDestination(audioDestinationId),
+              onRefreshAudioSources: () => refreshAudioSources(),
             },
             {
               roomOptions: mockJoinedRooms,
@@ -892,11 +927,20 @@
               editState,
               stalledSince,
               advancedOpen,
+              audio,
+              audioSources: mockAudioSources,
             }
           ),
           sig,
         };
         destCardEls.set(dest.destination_id, entry);
+      }
+      // Index this card's VU meter by the *audio* destination id, because
+      // that's the key `stream-stats-updated` reports `audio_level` under
+      // even though the meter lives inside the video destination's card.
+      if (audio) {
+        const meter = entry.el.querySelector(`.dest-audio-meter[data-audio-destination-id="${audio.destination_id}"]`);
+        if (meter) audioMeterEls.set(audio.destination_id, meter);
       }
       return entry.el;
     });
@@ -1077,8 +1121,6 @@
       roomName: state.roomName,
       savedHint: state.savedHint,
       members: mockMembersByRoom[state.scopedRoomHandle],
-      mockAudioSources,
-      audioSourceId: state.audioSource.id,
     });
     if (roomScopedEl && roomScopedSig === sig) return roomScopedEl;
     roomScopedSig = sig;
@@ -1102,9 +1144,16 @@
     });
     header.appendChild(select);
 
+    // `Why there is no SHARE AUDIO card here any more:` audio stopped being
+    // a thing you start on its own. It is attached to a screen share, from
+    // that share's own card in ACTIVE SHARES ("+ Add audio"), so a
+    // room-scoped panel for picking a source and starting a standalone audio
+    // stream had no destination to belong to — and the audio it started
+    // rendered as a second, structurally identical card next to the screen
+    // share it was meant to accompany. See
+    // `superdoc/features/stream-control.md` (2026-07-28).
     const row = el("div", { className: "sc-room-scoped-row" });
     row.appendChild(renderMembersCard());
-    row.appendChild(renderShareAudioCard());
 
     const wrap = el("div", { className: "sc-room-scoped-wrap" });
     wrap.appendChild(header);
@@ -1146,26 +1195,6 @@
     return card("MEMBERS", body.concat(children), { className: "sc-members-card" });
   }
 
-  function renderShareAudioCard() {
-    const row = el("div", { className: "sc-share-audio-row" });
-    row.appendChild(
-      secondaryButton("Refresh", async () => {
-        mockAudioSources = await fetchAudioSources();
-        if (!mockAudioSources.some((s) => s.id === state.audioSource.id)) state.audioSource = mockAudioSources[0] || state.audioSource;
-        render();
-      })
-    );
-    const select = el("select");
-    mockAudioSources.forEach((s) => select.appendChild(el("option", { text: s.name, attrs: { value: s.id } })));
-    select.value = state.audioSource.id;
-    select.addEventListener("change", () => {
-      state.audioSource = mockAudioSources.find((s) => String(s.id) === select.value) || state.audioSource;
-    });
-    row.appendChild(select);
-    row.appendChild(primaryButton("Share Audio", () => startAudioShare(state.scopedRoomHandle, state.audioSource)));
-    return card("SHARE AUDIO", [row], { className: "sc-share-audio-card" });
-  }
-
   // ---------------------------------------------------------------------
   // Init — fetches every data touchpoint (mock branch by default in a plain
   // browser), then does the first render. Also the "refresh" this tab
@@ -1177,14 +1206,19 @@
     mockJoinedRooms = await fetchJoinedRooms();
     mockDestinations = await fetchActiveDestinations();
     bandwidth = await fetchBandwidthSettings();
-    mockAudioSources = await fetchAudioSources();
+    // `Why audio sources aren't fetched here any more:` nothing renders them
+    // until someone opens a share card's "+ Add audio" picker, and that
+    // handler re-lists them on open anyway (which applications are producing
+    // audio changes by the second, so a list fetched at startup would be
+    // stale by the time it's shown). Listing them here only bought the first
+    // paint a wait on a real system-audio query — up to `withTimeout`'s full
+    // 3s on a machine with no audio server — for data nothing was drawing.
 
     if (mockJoinedRooms.length > 0 && !mockJoinedRooms.some((r) => r.id === state.scopedRoomHandle)) {
       state.scopedRoomHandle = mockJoinedRooms[0].id;
       state.roomName = mockJoinedRooms[0].name;
       state.startForm.roomHandle = mockJoinedRooms[0].id;
     }
-    if (mockAudioSources.length > 0 && !mockAudioSources.some((s) => s.id === state.audioSource.id)) state.audioSource = mockAudioSources[0];
     mockMembersByRoom[state.scopedRoomHandle] = await fetchRoomMembers(state.scopedRoomHandle);
 
     render();
@@ -1208,6 +1242,15 @@
   function updateStats(payload) {
     const destinations = (payload && payload.destinations) || [];
     destinations.forEach((d) => {
+      // Audio destinations report a level instead of frame counters, and
+      // their readout lives in another destination's card — handled first,
+      // and separately, because `destCardEls` has no entry for them at all.
+      if (d.audio_level !== null && d.audio_level !== undefined) {
+        const meter = audioMeterEls.get(d.destination_id);
+        if (meter) paintAudioMeter(meter, d.audio_level);
+        return;
+      }
+
       const entry = destCardEls.get(d.destination_id);
       if (!entry) return;
       const readout = entry.el.querySelector(".dest-fps-readout");
@@ -1247,6 +1290,32 @@
         bar.style.height = Math.max(8, Math.round((hist[histIdx] / max) * 100)) + "%";
       });
       spark.hidden = false;
+    });
+  }
+
+  /**
+   * Draw one VU-meter frame: light the leftmost `level * bars` bars and set
+   * every bar's height from the same level, so the meter reads as a small
+   * rising/falling block rather than a binary on/off.
+   *
+   * `Why the height curve isn't linear:` `audio_level` is already a dB-scaled
+   * fraction (see `audio::level_fraction_from_rms_db`), but ordinary speech
+   * and music still spend most of their time in the lower half of it. Each
+   * bar gets a share of the range so the bar nearest the left lights first
+   * and the rightmost only at near-full-scale — the usual VU behaviour, and
+   * the thing that makes the meter legible at a glance rather than a
+   * uniformly twitching block.
+   */
+  function paintAudioMeter(meter, level) {
+    const clamped = Math.max(0, Math.min(1, Number(level) || 0));
+    const bars = meter.querySelectorAll(".dest-audio-meter-bar");
+    bars.forEach((bar, i) => {
+      const threshold = i / bars.length;
+      const lit = clamped > threshold;
+      bar.classList.toggle("dest-audio-meter-bar-lit", lit);
+      // Each bar fills across its own 1/N slice of the level range.
+      const fill = Math.max(0, Math.min(1, (clamped - threshold) * bars.length));
+      bar.style.height = Math.round(20 + fill * 80) + "%";
     });
   }
 

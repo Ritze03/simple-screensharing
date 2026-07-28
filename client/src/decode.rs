@@ -279,7 +279,7 @@
 //! GStreamer streaming thread, and nothing here ever sleeps.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -1472,6 +1472,17 @@ pub struct AudioDecoder {
     /// degrade gracefully (log + drop) regardless — but cheap enough to be
     /// worth exposing.
     alive: Arc<AtomicBool>,
+    /// How many Opus packets [`AudioDecoder::feed`] has accepted for this
+    /// stream.
+    ///
+    /// `Why this is worth counting:` a live pipeline proves the *receiver*
+    /// is ready, not that any audio is arriving — and that difference is
+    /// exactly what shipped broken. The end-to-end test asserted
+    /// [`AudioDecoder::is_alive`] and subscription bookkeeping, all of which
+    /// stayed true while the sender was capturing the wrong PipeWire node
+    /// and the viewer heard nothing at all. This is the cheapest signal that
+    /// says "audio is really crossing the wire", so a test can assert it.
+    packets_received: Arc<AtomicU64>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -1505,11 +1516,17 @@ impl AudioDecoder {
             })
             .context("failed to spawn audio decode pipeline thread")?;
 
-        Ok(Self { stream_id, tx, alive, thread: Some(thread) })
+        Ok(Self { stream_id, tx, alive, packets_received: Arc::new(AtomicU64::new(0)), thread: Some(thread) })
     }
 
     pub fn stream_id(&self) -> StreamId {
         self.stream_id
+    }
+
+    /// How many Opus packets have reached this decoder — see
+    /// [`AudioDecoder::packets_received`]'s field docs.
+    pub fn packets_received(&self) -> u64 {
+        self.packets_received.load(Ordering::Relaxed)
     }
 
     /// Whether the pipeline thread is currently in `Playing`. `false` both
@@ -1560,6 +1577,7 @@ impl AudioDecoder {
         if frame.stream_id != self.stream_id {
             return;
         }
+        self.packets_received.fetch_add(1, Ordering::Relaxed);
         let msg = AudioPipelineMsg::Packet { pts_us: frame.pts, data: frame.payload.clone() };
         if self.tx.send(msg).is_err() {
             tracing::warn!(

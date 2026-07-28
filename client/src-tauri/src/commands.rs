@@ -186,10 +186,29 @@ pub fn start_video_share(managed: State<'_, Managed>, room_handle: u32) {
     tauri::async_runtime::block_on(async { managed.state.lock().unwrap().start_video_share(RoomHandle(room_handle)) });
 }
 
-// See `join_room`'s `Why:` note above — `start_audio_share` spawns.
+/// See `join_room`'s `Why:` note above — `start_audio_share` spawns.
+///
+/// `forCaptureId` is the screen share this audio is being attached to (the
+/// "Add audio" affordance lives on a share's own card now, not in a
+/// standalone SHARE AUDIO card), so the resulting audio destination can be
+/// rendered as a row inside that card. Omit it for a standalone audio share.
 #[tauri::command]
-pub fn start_audio_share(managed: State<'_, Managed>, room_handle: u32) {
-    tauri::async_runtime::block_on(async { managed.state.lock().unwrap().start_audio_share(RoomHandle(room_handle)) });
+pub fn start_audio_share(managed: State<'_, Managed>, room_handle: u32, for_capture_id: Option<u32>) {
+    tauri::async_runtime::block_on(async {
+        managed
+            .state
+            .lock()
+            .unwrap()
+            .start_audio_share(RoomHandle(room_handle), for_capture_id.map(CaptureSourceId))
+    });
+}
+
+/// Mute/unmute a running audio share in place — the Mute/Unmute toggle on
+/// the screen share card's audio row. Returns the resulting muted state so
+/// the button can relabel itself without a follow-up query.
+#[tauri::command]
+pub fn set_audio_share_muted(managed: State<'_, Managed>, capture_id: u32, muted: bool) -> bool {
+    managed.state.lock().unwrap().set_audio_share_muted(CaptureSourceId(capture_id), muted)
 }
 
 // See `join_room`'s `Why:` note above — `stop_share` spawns.
