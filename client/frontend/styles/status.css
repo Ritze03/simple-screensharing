@@ -1,0 +1,307 @@
+/*
+ * status.css — shared status-vocabulary + empty-state + leave-confirm-modal
+ * component CSS, from the "Stream Control Redesign Options" design handoff.
+ *
+ * ONE place for these rules — `stream-control.js`/`view.js`/`shell.js` all
+ * consume the classes here (via `Components.statusBadge`/`renderEmptyState`/
+ * `Components.emptyRow`/`Components.hatchedBanner`, see `components.js`)
+ * rather than each file rolling its own copy. Colors come from
+ * `tokens.css`'s `--pill-*`/`--hatch-amber-*` tokens, not hardcoded hex.
+ *
+ * -----------------------------------------------------------------------
+ * Status vocabulary — four families, matching `capture::DestinationState`'s
+ * real variants (`starting`/`live`/`rebuilding`/`stalled`/`failed`, see
+ * `src/capture.rs`), each with a *deliberately* distinct visual treatment
+ * so the family reads at a glance without reading the label text:
+ *
+ *   - progress (starting/rebuilding): tinted pill + a small marching-dashed
+ *     bar — motion signals "something is happening".
+ *   - live: tinted pill + a solid, STATIC dot — calm/no-motion is itself
+ *     the "everything's fine" signal; never add an animation here.
+ *   - degraded (stalled): amber 45°-hatch fill + warning icon + an
+ *     elapsed-seconds counter (see `components.js`'s `statusBadge`, which
+ *     owns the counter's `setInterval`).
+ *   - failed: NOT a pill — a squared card with a headline, the raw error
+ *     demoted into a small monospace sub-block, and Retry/Dismiss actions.
+ * ----------------------------------------------------------------------- */
+
+@keyframes march {
+  from {
+    background-position: 0 0;
+  }
+  to {
+    background-position: 14px 0;
+  }
+}
+
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+}
+
+/* -- progress -------------------------------------------------------- */
+
+.status-badge-progress {
+  background: var(--pill-progress-bg);
+  border-color: var(--pill-progress-border);
+  color: var(--pill-accent-bg-lighter);
+}
+
+.status-badge-bar {
+  width: 14px;
+  height: 4px;
+  flex: 0 0 auto;
+  border-radius: 2px;
+  background-image: repeating-linear-gradient(90deg, var(--pill-accent-bg-lighter) 0 4px, transparent 4px 7px);
+  background-size: 14px 4px;
+  animation: march 0.65s linear infinite;
+}
+
+/* -- live -------------------------------------------------------------
+ * No animation anywhere in this block, on purpose — see the header note. */
+
+.status-badge-live {
+  background: var(--pill-live-bg);
+  border-color: var(--pill-live-border);
+  color: var(--success);
+}
+
+.status-badge-dot {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--success);
+}
+
+/* -- degraded ----------------------------------------------------------
+ * Shares its hatch fill with `.hatched-banner` below (leave-confirm modal) —
+ * one `repeating-linear-gradient`, two consumers. */
+
+.status-badge-degraded {
+  color: var(--warning);
+  border-color: var(--hatch-amber-border);
+  background-image: repeating-linear-gradient(45deg, var(--hatch-amber-strong) 0 4px, var(--hatch-amber-weak) 4px 8px);
+}
+
+.status-badge-degraded .status-badge-icon {
+  font-size: 12px;
+  flex: 0 0 auto;
+}
+
+/* -- failed -------------------------------------------------------------
+ * A squared card, not a pill — the one family that isn't an inline badge. */
+
+.status-failed-box {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid var(--danger);
+  border-radius: var(--rounding-sm);
+  background: rgba(224, 90, 90, 0.08);
+}
+
+.status-failed-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.status-failed-icon {
+  flex: 0 0 auto;
+  font-size: 18px;
+  color: var(--danger);
+}
+
+.status-failed-headline {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.status-failed-sub {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-faint);
+  background: var(--panel-sunken);
+  border-radius: var(--rounding-sm);
+  padding: 4px 6px;
+  overflow-wrap: anywhere;
+}
+
+.status-failed-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+/* -------------------------------------------------------------------
+ * Hatched banner — the leave-confirm modal's warning banners, reusing the
+ * degraded family's exact hatch fill (see `Components.hatchedBanner`).
+ * ----------------------------------------------------------------- */
+
+.hatched-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--hatch-amber-border);
+  border-radius: var(--rounding-sm);
+  background-image: repeating-linear-gradient(45deg, var(--hatch-amber-strong) 0 4px, var(--hatch-amber-weak) 4px 8px);
+  color: var(--warning);
+  font-size: 12px;
+}
+
+.hatched-banner-icon {
+  flex: 0 0 auto;
+  font-size: 16px;
+}
+
+/* -------------------------------------------------------------------
+ * Standardized empty state — icon-in-a-badge + headline + one-sentence
+ * body + one primary action, reused across every whole-panel empty state
+ * (see `Components.renderEmptyState`).
+ * ----------------------------------------------------------------- */
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 6px;
+  padding: 16px 10px;
+}
+
+.empty-state-badge {
+  width: 46px;
+  height: 46px;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  margin-bottom: 2px;
+  background: linear-gradient(135deg, var(--pill-accent-bg-light), var(--pill-accent-bg));
+}
+
+.empty-state-badge-icon {
+  font-size: 22px;
+  color: var(--text);
+}
+
+.empty-state-headline {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.empty-state-body {
+  margin: 0;
+  max-width: 320px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.empty-state-action {
+  width: 100%;
+  margin-top: 4px;
+}
+
+.empty-state-inline {
+  width: 100%;
+  max-width: 280px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+/* Lighter, no-badge version for in-context "this list is empty" rows (a
+ * room's member list, a destination's transfer-target list, ...) — icon +
+ * text only, no big gradient badge. */
+
+.empty-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 2px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.empty-row-icon {
+  flex: 0 0 auto;
+  font-size: 14px;
+}
+
+/* -------------------------------------------------------------------
+ * Leave-room confirm dialog restyle.
+ * ----------------------------------------------------------------- */
+
+/* `.modal.leave-modal` (not just `.leave-modal`) so this reliably beats
+   `.modal`'s own `width: 320px` (shell.css) regardless of stylesheet
+   load order — same specificity, two classes, would otherwise be a
+   losing/winning coin flip based purely on `<link>` order in index.html. */
+.modal.leave-modal {
+  width: 440px;
+}
+
+.leave-modal-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+
+.leave-modal-icon {
+  flex: 0 0 auto;
+  font-size: 26px;
+  color: var(--danger);
+}
+
+.leave-modal-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.leave-modal-subtext {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.leave-modal-banners {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 12px 0 4px;
+}
+
+.leave-modal-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 14px;
+}
+
+.leave-modal-esc-hint {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.leave-modal-actions {
+  display: flex;
+  gap: 8px;
+}

@@ -40,7 +40,7 @@
 (function () {
   "use strict";
 
-  const { el, icon, renderEmptyState, secondaryButton } = window.Components;
+  const { el, icon, renderEmptyState, secondaryButton, statusBadge } = window.Components;
 
   const MOCK_WATCHED = [
     { id: "w1", ownerLabel: "Ana", roomLabel: "Movie Night", resolution: "1920x1080", fps: 30, state: "live", hue: 220 },
@@ -68,6 +68,20 @@
   // for why that module reaches back out through a callback instead of
   // touching this DOM node itself (it knows nothing about tile layout).
   let fpsSpans = new Map();
+
+  // tile.id -> ms epoch first observed 'stalled'. No per-watched-stream DTO
+  // carries a "since" timestamp (see this file's header note on the known
+  // decode-health gap) — tracked client-side, same pattern as
+  // `stream-control.js`'s `destStalledSince`.
+  const tileStalledSince = new Map();
+  function getStalledSince(tile) {
+    if (tile.state !== "stalled") {
+      tileStalledSince.delete(tile.id);
+      return null;
+    }
+    if (!tileStalledSince.has(tile.id)) tileStalledSince.set(tile.id, Date.now());
+    return tileStalledSince.get(tile.id);
+  }
 
   async function fetchWatchedStreams() {
     if (window.__TAURI__) {
@@ -200,7 +214,12 @@
     window.TileVideo.stopAllTileVideo();
 
     if (mockWatched.length === 0) {
-      root.appendChild(renderEmptyState("Nobody's on screen right now — pick someone from a room in the sidebar and click Watch.", null, null));
+      root.appendChild(
+        renderEmptyState("Pick someone from a room in the sidebar and click Watch.", null, null, {
+          icon: "visibility",
+          headline: "Nobody's on screen",
+        })
+      );
       return;
     }
 
@@ -215,7 +234,7 @@
     if (tile.state === "stalled") {
       const placeholder = el("div", { className: "media-tile-placeholder" });
       placeholder.appendChild(el("div", { className: "media-tile-spinner" }));
-      placeholder.appendChild(el("span", { text: "Waiting for capture…" }));
+      placeholder.appendChild(statusBadge("degraded", "WAITING FOR CAPTURE", { since: getStalledSince(tile) }));
       wrap.appendChild(placeholder);
     } else if (tile.videoUrl) {
       // Real video: a `<canvas>` driven by a WebCodecs `VideoDecoder`

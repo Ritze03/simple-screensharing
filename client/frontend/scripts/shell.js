@@ -27,7 +27,7 @@
 (function () {
   "use strict";
 
-  const { renderNavButton, renderRoomRow, renderStreamRow, renderEmptyState, secondaryButton, primaryButton, el } = window.Components;
+  const { renderNavButton, renderRoomRow, renderStreamRow, renderEmptyState, secondaryButton, primaryButton, el, hatchedBanner } = window.Components;
 
   const NAV_TABS = ["Stream Control", "View", "Settings"];
 
@@ -40,7 +40,13 @@
   // `loadRoomMembers` below for the real branch).
   // ---------------------------------------------------------------------
 
-  let mockRooms = [
+  // `?emptyRooms` dev-only query flag reaches the ROOMS section's
+  // first-launch/no-saved-rooms empty state (see `renderRoomsEmptyState`)
+  // without hand-editing this array — same spirit as `streams-demo-toggle`/
+  // `view-demo-toggle`'s runtime toggles elsewhere in this file, just a URL
+  // flag instead of a button since this one needs to be true from the very
+  // first render (before any toggle could fire).
+  let mockRooms = new URLSearchParams(location.search).has("emptyRooms") ? [] : [
     {
       join_string: "server|11111111|movie-night-key",
       name: "Movie Night",
@@ -84,7 +90,11 @@
 
   const state = {
     activeTab: "Stream Control",
-    expandedRoomIds: new Set([mockRooms[0].join_string]), // Movie Night starts expanded, matching the reference shot.
+    // Movie Night starts expanded, matching the reference shot — guarded
+    // against an empty `mockRooms` (the real first-launch/no-saved-rooms
+    // case this pass's ROOMS empty state exists for) rather than crashing
+    // `init()` before the nav/empty-state ever paints.
+    expandedRoomIds: new Set(mockRooms.length > 0 ? [mockRooms[0].join_string] : []),
     addRoomOpen: false,
     pendingLeaveRoomId: null,
   };
@@ -165,7 +175,7 @@
     list.innerHTML = "";
 
     if (mockRooms.length === 0) {
-      list.appendChild(el("p", { className: "rooms-empty-hint", text: "No rooms yet — add one below." }));
+      list.appendChild(renderRoomsEmptyState());
       return;
     }
 
@@ -210,6 +220,63 @@
         })
       );
     });
+  }
+
+  /** Standardized empty state for the ROOMS section (first-launch/no-rooms
+   * case) — per the redesign, this one specifically shows the join-string
+   * input INLINE rather than gating it behind the "+ Add Room" button
+   * below (which stays for every non-empty case). Shares `submitJoin` with
+   * `renderAddRoomCard`'s own Join button so the two entry points can't
+   * drift into two slightly different validation/error paths. */
+  function renderRoomsEmptyState() {
+    const linkInput = el("input", { className: "field-input", attrs: { type: "text", placeholder: "server | room-id | key" } });
+    const nameInput = el("input", { className: "field-input", attrs: { type: "text", placeholder: "Display name (optional)" } });
+    const errorText = el("div", { className: "add-room-error", text: "" });
+    errorText.hidden = true;
+    const inline = el("div", { className: "empty-state-inline" }, [linkInput, nameInput, errorText]);
+
+    return renderEmptyState("Paste a join link from whoever invited you to get started.", "Join", () => {
+      const joinString = linkInput.value.trim();
+      if (!joinString) return;
+      submitJoin(joinString, nameInput.value.trim(), errorText);
+    }, { icon: "meeting_room", headline: "No rooms yet", inline, className: "empty-state-rooms" });
+  }
+
+  /** Shared join flow for both the ROOMS empty state's inline form and the
+   * "+ Add Room" card's Join button below — same real/mock branches either
+   * used to duplicate inline. */
+  async function submitJoin(joinString, displayName, errorEl) {
+    if (window.__TAURI__) {
+      if (errorEl) errorEl.hidden = true;
+      try {
+        await window.__TAURI__.core.invoke("join_room", { joinString, displayName });
+        // Same "success saves" note as `renderAddRoomCard`'s own Join
+        // handler: `join_room` upserts + emits `room-connected`; this is a
+        // belt-and-braces immediate paint in case that event hasn't landed
+        // yet by the time this await resolves.
+        state.addRoomOpen = false;
+        await refreshRooms();
+        renderAddRoomCard();
+      } catch (e) {
+        if (errorEl) {
+          errorEl.textContent = String(e);
+          errorEl.hidden = false;
+        }
+      }
+      return;
+    }
+
+    mockRooms.push({
+      join_string: joinString,
+      name: displayName || "Room " + Math.random().toString(16).slice(2, 6),
+      state: "joined",
+      room_handle: Math.floor(Math.random() * 100000),
+      active_stream_count: 0,
+      members: [],
+    });
+    state.addRoomOpen = false;
+    renderRooms();
+    renderAddRoomCard();
   }
 
   function openLeaveConfirm(joinString) {
@@ -289,6 +356,17 @@
     renderRooms();
   }
 
+  /**
+   * Leave-room confirm dialog. Per the design handoff: 440px, a red
+   * `logout` icon + "Leave {RoomName}?" title, a "you can rejoin any time"
+   * reassurance line, up to 2 stacked amber hatched-warning banners (only
+   * the ones that actually apply — a room can have neither, either, or
+   * both of "you're watching a stream here" / "you're sending streams
+   * here"), and a footer with an "ESC to cancel" hint, Cancel on the left,
+   * "Leave room" (danger) on the right. Danger-on-the-right is deliberate
+   * here, not the more common danger-on-left convention — a documented
+   * choice from the original handoff, not a bug to "fix".
+   */
   function renderLeaveModal() {
     const overlay = document.getElementById("modal-overlay");
     overlay.innerHTML = "";
@@ -303,23 +381,40 @@
     }
 
     const watchingCount = (room.members || []).filter((m) => m.watching).length;
-    const modal = el("div", { className: "modal" });
-    modal.appendChild(el("div", { className: "modal-title", text: "Leave room" }));
-    modal.appendChild(el("div", { className: "modal-heading", text: `Leave ${room.name}?` }));
-    modal.appendChild(
-      el("div", {
-        className: "modal-body",
-        text:
-          watchingCount > 0
-            ? `You are watching ${watchingCount} stream(s) here — leaving closes them.`
-            : `You have an active outgoing share in this room — leaving stops it.`,
+    const sendingCount = room.active_stream_count || 0;
+
+    const modal = el("div", { className: "modal leave-modal" });
+
+    const head = el("div", { className: "leave-modal-head" });
+    head.appendChild(el("span", { className: "material-symbols-outlined leave-modal-icon", text: "logout" }));
+    const headText = el("div", { className: "leave-modal-head-text" });
+    headText.appendChild(el("div", { className: "leave-modal-title", text: `Leave ${room.name}?` }));
+    headText.appendChild(el("div", { className: "leave-modal-subtext", text: "You can rejoin any time with the same join link." }));
+    head.appendChild(headText);
+    modal.appendChild(head);
+
+    const banners = el("div", { className: "leave-modal-banners" });
+    if (watchingCount > 0) {
+      banners.appendChild(hatchedBanner(`You're watching ${watchingCount} stream${watchingCount === 1 ? "" : "s"} here — leaving closes ${watchingCount === 1 ? "it" : "them"}.`));
+    }
+    if (sendingCount > 0) {
+      banners.appendChild(hatchedBanner(`You're sending ${sendingCount} stream${sendingCount === 1 ? "" : "s"} here — leaving stops ${sendingCount === 1 ? "it" : "them"}.`));
+    }
+    if (banners.children.length > 0) modal.appendChild(banners);
+
+    const footer = el("div", { className: "leave-modal-footer" });
+    footer.appendChild(el("span", { className: "leave-modal-esc-hint", text: "ESC to cancel" }));
+    const actions = el("div", { className: "leave-modal-actions" });
+    actions.appendChild(
+      secondaryButton("Cancel", () => {
+        state.pendingLeaveRoomId = null;
+        renderLeaveModal();
       })
     );
-    const actions = el("div", { className: "modal-actions" });
     actions.appendChild(
       el("button", {
         className: "btn btn-danger",
-        text: "Leave",
+        text: "Leave room",
         onClick: async () => {
           const joinString = state.pendingLeaveRoomId;
           state.pendingLeaveRoomId = null;
@@ -328,13 +423,9 @@
         },
       })
     );
-    actions.appendChild(
-      secondaryButton("Cancel", () => {
-        state.pendingLeaveRoomId = null;
-        renderLeaveModal();
-      })
-    );
-    modal.appendChild(actions);
+    footer.appendChild(actions);
+    modal.appendChild(footer);
+
     overlay.appendChild(modal);
     overlay.hidden = false;
   }
@@ -367,40 +458,10 @@
 
     const actions = el("div", { className: "add-room-actions" });
     actions.appendChild(
-      primaryButton("Join", async () => {
+      primaryButton("Join", () => {
         const joinString = linkInput.value.trim();
         if (!joinString) return;
-
-        if (window.__TAURI__) {
-          errorText.hidden = true;
-          try {
-            await window.__TAURI__.core.invoke("join_room", { joinString, displayName: nameInput.value.trim() });
-            // On success: `join_room` upserts into RoomStore and the room
-            // appears live via the `room-connected` event (no staging step,
-            // per APP-SHELL.md — "success saves"). `refreshRooms` here is a
-            // belt-and-braces immediate paint in case the event hasn't
-            // landed yet by the time this await resolves.
-            state.addRoomOpen = false;
-            await refreshRooms();
-            renderAddRoomCard();
-          } catch (e) {
-            errorText.textContent = String(e);
-            errorText.hidden = false;
-          }
-          return;
-        }
-
-        mockRooms.push({
-          join_string: joinString,
-          name: nameInput.value.trim() || "Room " + Math.random().toString(16).slice(2, 6),
-          state: "joined",
-          room_handle: Math.floor(Math.random() * 100000),
-          active_stream_count: 0,
-          members: [],
-        });
-        state.addRoomOpen = false;
-        renderRooms();
-        renderAddRoomCard();
+        submitJoin(joinString, nameInput.value.trim(), errorText);
       })
     );
     actions.appendChild(
@@ -421,9 +482,9 @@
     list.innerHTML = "";
     if (mockStreams.length === 0) {
       list.appendChild(
-        renderEmptyState("You're not sharing anything.", "+ Start a Stream", () => {
+        renderEmptyState("Start a stream from the Stream Control tab to see it here.", "+ Start a Stream", () => {
           setActiveTab("Stream Control");
-        })
+        }, { icon: "cast", headline: "You're not sharing anything" })
       );
       return;
     }
@@ -557,6 +618,17 @@
     document.getElementById("add-room-btn").addEventListener("click", () => {
       state.addRoomOpen = true;
       renderAddRoomCard();
+    });
+
+    // "ESC to cancel" — the leave-confirm modal's footer hint (see
+    // `renderLeaveModal`). Wired unconditionally (not gated behind
+    // `window.__TAURI__`) so it works the same in a mock/browser-preview
+    // session as in the real app.
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && state.pendingLeaveRoomId) {
+        state.pendingLeaveRoomId = null;
+        renderLeaveModal();
+      }
     });
 
     document.querySelectorAll(".tab-panel").forEach((panel) => {

@@ -120,12 +120,6 @@ input {
   padding-bottom: 8px;
 }
 
-.rooms-empty-hint {
-  margin: 0 4px;
-  font-size: 12px;
-  color: var(--text-faint);
-}
-
 .room-row {
   border-radius: var(--rooms-row-radius);
   padding: 6px 4px;
@@ -262,12 +256,6 @@ input {
   white-space: nowrap;
 }
 
-.room-members-empty {
-  font-size: 11px;
-  color: var(--text-faint);
-  padding: 2px 0;
-}
-
 /* -------------------------------------------------------------------
  * Status dot — three states.
  * ----------------------------------------------------------------- */
@@ -306,35 +294,9 @@ input {
   }
 }
 
-/* Destination states (Stream Control's Active Shares) — same `.status-dot`
-   base, different fills/animations. `starting`/`rebuilding` share the
-   room-row's pulse animation (both are "something is happening, wait");
-   `stalled` reuses the hollow-ring treatment `disconnected` already
-   established. */
-.status-dot-live {
-  background: var(--success);
-}
-
-.status-dot-starting {
-  background: var(--accent);
-  animation: pulse-dot 1.4s ease-in-out infinite;
-}
-
-.status-dot-rebuilding {
-  background: var(--warning);
-  animation: pulse-dot 1.4s ease-in-out infinite;
-}
-
-.status-dot-stalled {
-  background: transparent;
-  border: 1.5px solid var(--warning);
-  width: calc(var(--dot-size) - 3px);
-  height: calc(var(--dot-size) - 3px);
-}
-
-.status-dot-failed {
-  background: var(--danger);
-}
+/* Destination states (Stream Control's Active Shares) now use the
+   `.status-badge*` status-vocabulary classes instead of a colored dot — see
+   `status.css` and `components.js`'s `statusBadge`. */
 
 /* -------------------------------------------------------------------
  * Card — generic equal-width section container, shared by Stream Control /
@@ -677,32 +639,8 @@ input {
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
 }
 
-.modal-title {
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--accent);
-  margin-bottom: 8px;
-}
-
-.modal-heading {
-  font-size: 15px;
-  font-weight: 700;
-  color: var(--text);
-  margin-bottom: 6px;
-}
-
-.modal-body {
-  font-size: 12px;
-  color: var(--warning);
-  margin-bottom: 14px;
-}
-
-.modal-actions {
-  display: flex;
-  gap: 8px;
-}
+/* Leave-room confirm dialog's own layout (`.leave-modal*`) lives in
+   status.css, alongside its shared `.hatched-banner` warning treatment. */
 
 /* -------------------------------------------------------------------
  * Scrollbars — thin, matches the dark rail rather than the OS default.

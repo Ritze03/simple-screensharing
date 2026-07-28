@@ -90,6 +90,24 @@
   --pill-accent-bg-light: #5c7bf7;
   --pill-accent-bg-lighter: #8ea3f9;
 
+  /* Status-vocabulary pill treatments (see `frontend/styles/status.css` for
+     the classes that consume these — one shared definition, not duplicated
+     per-file). Translucent fills so a badge reads as a tint over the card
+     it sits on, not a solid chip; --pill-accent-bg-lighter above doubles as
+     the "in-progress" family's text color (design-handoff hex #8ea3f9). */
+  --pill-progress-bg: rgba(76, 110, 245, 0.14);
+  --pill-progress-border: rgba(76, 110, 245, 0.4);
+  --pill-live-bg: rgba(80, 200, 120, 0.12);
+  --pill-live-border: rgba(80, 200, 120, 0.35);
+
+  /* Amber hatch fill shared by the "degraded" status family (status.css's
+     `.status-badge-degraded`) and the leave-room confirm dialog's warning
+     banners (`.hatched-banner`) — same repeating-linear-gradient stripes,
+     one pair of tokens so the two never drift apart. */
+  --hatch-amber-strong: rgba(232, 163, 61, 0.16);
+  --hatch-amber-weak: rgba(232, 163, 61, 0.05);
+  --hatch-amber-border: rgba(232, 163, 61, 0.4);
+
   /* -------------------------------------------------------------------
    * Spacing / sizing / rounding — ported from theme.rs's constants.
    * ----------------------------------------------------------------- */

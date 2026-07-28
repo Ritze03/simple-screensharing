@@ -122,6 +122,102 @@
   }
 
   // -------------------------------------------------------------------
+  // Status vocabulary — four families (progress/live/degraded/failed),
+  // matching `capture::DestinationState`'s real variants (see
+  // `src/capture.rs`: `Starting`/`Live`/`Rebuilding`/`Stalled`/`Failed`).
+  // Visual rules live in `status.css`'s `.status-badge*`/`.status-failed-*`
+  // classes; this is just the DOM-building side, one function callers reach
+  // for instead of hand-rolling a pill per file.
+  //
+  // `degraded` is the one family with a live-updating part: it always shows
+  // an elapsed-seconds count next to the label (e.g. "WAITING FOR CAPTURE ·
+  // 4s"). No DTO carries a "since" timestamp for `Stalled` today (out of
+  // this pass's frontend-only scope to add one) — callers that want the
+  // counter to be accurate pass `options.since` (a client-side `Date.now()`
+  // recorded the first time they observed this state, e.g.
+  // `stream-control.js`'s `destStalledSince` map). The badge owns its own
+  // `setInterval` (mirrors `tile-video.js`'s fps-interval pattern) and
+  // stops itself once its node leaves the DOM — checked on each tick via
+  // `isConnected` rather than requiring every caller to remember to call a
+  // `.destroy()`, since this codebase's render paths don't have a uniform
+  // unmount hook to call one from.
+  // -------------------------------------------------------------------
+
+  /**
+   * @param {'progress'|'live'|'degraded'|'failed'} family
+   * @param {string} label - short, stable, e.g. "STARTING" / "LIVE" /
+   *   "WAITING FOR CAPTURE" / "Share failed". Failed's `label` is a full
+   *   plain-language headline, not a state keyword.
+   * @param {object} [options] - degraded: { since: number (ms epoch) }.
+   *   failed: { errorText, onRetry, onDismiss }.
+   */
+  function statusBadge(family, label, options) {
+    options = options || {};
+
+    if (family === "failed") {
+      const box = el("div", { className: "status-failed-box" });
+      const head = el("div", { className: "status-failed-head" });
+      head.appendChild(icon("error", "status-failed-icon"));
+      head.appendChild(el("span", { className: "status-failed-headline", text: label }));
+      box.appendChild(head);
+      box.appendChild(
+        el("div", {
+          className: "status-failed-sub",
+          text: options.errorText || "No further error detail is available for this destination.",
+        })
+      );
+      const actions = el("div", { className: "status-failed-actions" });
+      actions.appendChild(secondaryButton("Dismiss", () => options.onDismiss && options.onDismiss(), { className: "status-failed-dismiss" }));
+      actions.appendChild(primaryButton("Retry", () => options.onRetry && options.onRetry(), { className: "status-failed-retry" }));
+      box.appendChild(actions);
+      return box;
+    }
+
+    const badge = el("span", { className: "status-badge status-badge-" + family });
+    if (family === "progress") {
+      badge.appendChild(el("span", { className: "status-badge-bar" }));
+    } else if (family === "live") {
+      badge.appendChild(el("span", { className: "status-badge-dot" }));
+    } else if (family === "degraded") {
+      badge.appendChild(icon("warning", "status-badge-icon"));
+    }
+    const text = el("span", { className: "status-badge-label", text: label });
+    badge.appendChild(text);
+
+    if (family === "degraded" && options.since) {
+      let intervalId = null;
+      const tick = () => {
+        if (!badge.isConnected) {
+          clearInterval(intervalId);
+          return;
+        }
+        const elapsedS = Math.max(0, Math.round((Date.now() - options.since) / 1000));
+        text.textContent = `${label} · ${elapsedS}s`;
+      };
+      tick();
+      intervalId = setInterval(tick, 1000);
+    }
+
+    return badge;
+  }
+
+  /** Shared hatch fill with `.status-badge-degraded` (same CSS rule, see
+   * status.css) — used by the leave-room confirm dialog's warning banners.
+   * Not one of the 4 status families itself (it's a page-level warning
+   * banner, not a state pill), just visually related enough to reuse the
+   * same amber-hatch treatment rather than inventing a second one. */
+  function hatchedBanner(text) {
+    return el("div", { className: "hatched-banner" }, [icon("warning", "hatched-banner-icon"), el("span", { className: "hatched-banner-text", text })]);
+  }
+
+  /** Lighter, no-badge empty-row for in-context "this list is empty" rows
+   * (a room's member list, ...) — icon + text only, no big gradient badge.
+   * See `renderEmptyState` below for the whole-panel version. */
+  function emptyRow(glyph, text) {
+    return el("div", { className: "empty-row" }, [icon(glyph, "empty-row-icon"), el("span", { text })]);
+  }
+
+  // -------------------------------------------------------------------
   // Room row — the sidebar ROOMS section's per-room row + expanded member
   // list, per APP-SHELL.md's three-state table.
   // -------------------------------------------------------------------
@@ -220,7 +316,7 @@
         memberList.appendChild(memberRow);
       });
       if (!room.members || room.members.length === 0) {
-        memberList.appendChild(el("div", { className: "room-members-empty", text: "No other members yet." }));
+        memberList.appendChild(emptyRow("person_off", "No other members yet."));
       }
       row.appendChild(memberList);
     }
@@ -250,10 +346,34 @@
     return row;
   }
 
-  /** Empty-state block: message + optional primary action. */
-  function renderEmptyState(message, actionLabel, onAction) {
-    const wrap = el("div", { className: "empty-state" });
-    wrap.appendChild(el("p", { className: "empty-state-message", text: message }));
+  /**
+   * Standardized whole-panel empty state: icon-in-a-badge + one bold
+   * headline + one sentence of body copy + one primary action. Used across
+   * every "there's nothing here" panel (no rooms yet, nobody sharing in a
+   * room, nobody on screen, no active shares) so they all read as the same
+   * visual language rather than each screen inventing its own.
+   *
+   * Backward-compatible with every existing 2/3-arg call site: without
+   * `opts.headline`, `message` itself becomes the (only) headline line, no
+   * separate body line — the simplest correct case for a caller that just
+   * has one short sentence to say.
+   *
+   * @param {string} message - body copy (or the headline, if `opts.headline`
+   *   is absent).
+   * @param {string|null} actionLabel
+   * @param {(() => void)|null} onAction
+   * @param {object} [opts] - { icon: glyph name, headline: string,
+   *   inline: Element (e.g. an inline join-room form), className }
+   */
+  function renderEmptyState(message, actionLabel, onAction, opts) {
+    opts = opts || {};
+    const wrap = el("div", { className: "empty-state" + (opts.className ? " " + opts.className : "") });
+    wrap.appendChild(el("div", { className: "empty-state-badge" }, [icon(opts.icon || "info", "empty-state-badge-icon")]));
+    wrap.appendChild(el("p", { className: "empty-state-headline", text: opts.headline || message }));
+    if (opts.headline) {
+      wrap.appendChild(el("p", { className: "empty-state-body", text: message }));
+    }
+    if (opts.inline) wrap.appendChild(opts.inline);
     if (actionLabel) {
       wrap.appendChild(primaryButton(actionLabel, onAction, { className: "empty-state-action" }));
     }
@@ -363,34 +483,53 @@
    *   onFanout(captureId, roomHandle), onStop(destinationId) }
    * @param {object} [opts] - { roomOptions: [{id,name}], perStreamBitrateEditable: bool,
    *   roomsAlreadyFedByCapture: number[], editState: {tune, qualityLevel, rateControl,
-   *   error} } — `editState` is this destination's local edit buffer for the three
-   *   testing-oriented encoder tuning knobs (kept by the caller, since
-   *   `DestinationRow` has no fields to read the server's current values back
-   *   from — same write-only limitation the Bitrate slider already has).
+   *   error}, stalledSince: number|null } — `editState` is this destination's local
+   *   edit buffer for the three testing-oriented encoder tuning knobs (kept by the
+   *   caller, since `DestinationRow` has no fields to read the server's current
+   *   values back from — same write-only limitation the Bitrate slider already
+   *   has). `stalledSince` is the caller's client-side-tracked "first observed
+   *   Stalled at" timestamp (ms epoch) — see `statusBadge`'s doc comment for why
+   *   this can't come from the DTO itself.
    */
   function destinationCard(dest, handlers, opts) {
     handlers = handlers || {};
     opts = opts || {};
-    const STATE_LABEL = {
-      starting: "Starting",
-      live: "Live",
-      rebuilding: "Applying…",
-      stalled: "Waiting for capture…",
-      failed: "Failed",
+    // Maps `capture::DestinationState`'s real variants (src/capture.rs) to
+    // one of the 4 status-vocabulary families (status.css) plus its label.
+    const STATE_META = {
+      starting: { label: "STARTING", family: "progress" },
+      rebuilding: { label: "APPLYING", family: "progress" },
+      live: { label: "LIVE", family: "live" },
+      stalled: { label: "WAITING FOR CAPTURE", family: "degraded" },
+      failed: { label: dest.room_label ? `${dest.room_label} stream failed` : "Stream failed", family: "failed" },
     };
+    const meta = STATE_META[dest.state] || { label: dest.state, family: "progress" };
 
     const wrap = el("div", { className: "dest-card dest-card-" + dest.state });
 
+    // Failed is a squared card, not a pill (status.css's `.status-failed-box`
+    // header note) — its own compact layout rather than the meta/edit/actions
+    // stack every other state gets, since none of that applies to a
+    // destination producing no frames.
+    if (meta.family === "failed") {
+      const head = el("div", { className: "dest-card-head" });
+      if (dest.kind === "audio") head.appendChild(icon("volume_up", "stream-audio-glyph"));
+      head.appendChild(el("span", { className: "dest-room-label", text: dest.room_label }));
+      wrap.appendChild(head);
+      wrap.appendChild(
+        statusBadge("failed", meta.label, {
+          errorText: dest.errorText,
+          onRetry: () => handlers.onRetry && handlers.onRetry(dest),
+          onDismiss: () => handlers.onStop && handlers.onStop(dest.destination_id),
+        })
+      );
+      return wrap;
+    }
+
     const head = el("div", { className: "dest-card-head" });
-    head.appendChild(statusDot(dest.state));
     if (dest.kind === "audio") head.appendChild(icon("volume_up", "stream-audio-glyph"));
     head.appendChild(el("span", { className: "dest-room-label", text: dest.room_label }));
-    head.appendChild(
-      el("span", {
-        className: "dest-state-badge dest-state-badge-" + dest.state,
-        text: STATE_LABEL[dest.state] || dest.state,
-      })
-    );
+    head.appendChild(statusBadge(meta.family, meta.label, meta.family === "degraded" ? { since: opts.stalledSince } : {}));
     wrap.appendChild(head);
 
     if (dest.pendingRoleText) {
@@ -531,6 +670,9 @@
     iconButton,
     renderNavButton,
     statusDot,
+    statusBadge,
+    hatchedBanner,
+    emptyRow,
     renderRoomRow,
     renderStreamRow,
     renderEmptyState,

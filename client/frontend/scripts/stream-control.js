@@ -35,7 +35,7 @@
 (function () {
   "use strict";
 
-  const { el, card, warningBanner, bandwidthModeToggle, destinationCard, secondaryButton, primaryButton, renderEmptyState } = window.Components;
+  const { el, card, warningBanner, bandwidthModeToggle, destinationCard, secondaryButton, primaryButton, renderEmptyState, emptyRow } = window.Components;
 
   // ---------------------------------------------------------------------
   // Mock data (fallback bodies for the fetch/action functions below).
@@ -88,6 +88,24 @@
       framerate: 30,
       bitrate_kbps: 3000,
       pending: null,
+    },
+    // Demo-only failed destination — see this file's mock/real fallback
+    // header note; `errorText` here stands in for the raw error string a
+    // real `DestinationState::Failed(String)` carries, since `DestinationRow`
+    // (dto.rs) doesn't surface it yet (frontend-only pass, no backend touch).
+    {
+      destination_id: 4,
+      capture_id: 4,
+      room_handle: 2,
+      room_label: "Gaming Night",
+      kind: "audio",
+      state: "failed",
+      width: 0,
+      height: 0,
+      framerate: 0,
+      bitrate_kbps: 128,
+      pending: null,
+      errorText: "encoder init failed: no matching PipeWire node for source id 42",
     },
   ];
 
@@ -318,6 +336,30 @@
     render();
   }
 
+  /** "Retry" action on a Failed destination card's `statusBadge` (see
+   * `components.js`'s `destinationCard`). There's no dedicated
+   * retry-a-failed-destination command in `commands.rs` — the closest real
+   * equivalent is tearing the dead destination down and re-requesting one
+   * for the same capture/room, the same pair `stop_destination`/
+   * `start_destination` already expose for other flows (fan-out uses the
+   * same `start_destination` call). Mock branch mirrors `mockStartStream`'s
+   * starting -> live progression at toy timescales. */
+  async function retryDestination(dest) {
+    if (window.__TAURI__) {
+      await window.__TAURI__.core.invoke("stop_destination", { destinationId: dest.destination_id });
+      await window.__TAURI__.core.invoke("start_destination", { captureId: dest.capture_id, roomHandle: dest.room_handle });
+      return;
+    }
+    mockDestinations = mockDestinations.filter((x) => x.destination_id !== dest.destination_id);
+    const newDest = Object.assign({}, dest, { destination_id: destIdSeq++, state: "starting" });
+    mockDestinations.push(newDest);
+    render();
+    setTimeout(() => {
+      newDest.state = "live";
+      render();
+    }, 800);
+  }
+
   async function transferDestination(destinationId, targetRoomHandle) {
     if (window.__TAURI__) {
       await window.__TAURI__.core.invoke("transfer_destination", { destinationId, targetRoom: targetRoomHandle });
@@ -451,6 +493,20 @@
   let activeSharesGridEl = null;
   let activeSharesBodySig = null;
   const destCardEls = new Map(); // destination_id -> { el, sig }
+  // destination_id -> ms epoch first observed 'stalled'. No DTO carries a
+  // "since" timestamp for `DestinationState::Stalled` (see `statusBadge`'s
+  // doc comment in components.js) — tracked client-side here instead, the
+  // same way this file already recomputes `pendingRoleText` etc. locally.
+  const destStalledSince = new Map();
+
+  function getStalledSince(dest) {
+    if (dest.state !== "stalled") {
+      destStalledSince.delete(dest.destination_id);
+      return null;
+    }
+    if (!destStalledSince.has(dest.destination_id)) destStalledSince.set(dest.destination_id, Date.now());
+    return destStalledSince.get(dest.destination_id);
+  }
   // destination_id -> { bitrateKbps, tune, qualityLevel, rateControl, error }.
   // Local edit buffer for `edit_destination`'s fields — write-only, same as
   // the rest of this panel: `DestinationRow` doesn't expose the server's
@@ -585,9 +641,16 @@
     if (mockDestinations.length === 0) {
       destCardEls.clear();
       if (!activeSharesCardEl || activeSharesBodySig !== "empty") {
-        activeSharesCardEl = card("ACTIVE SHARES", [renderEmptyState("No active shares — start one below.", null, null)], {
-          className: "sc-active-shares-card",
-        });
+        activeSharesCardEl = card(
+          "ACTIVE SHARES",
+          [
+            renderEmptyState("Start sharing your screen or audio below to see it here.", null, null, {
+              icon: "cast",
+              headline: "No active shares yet",
+            }),
+          ],
+          { className: "sc-active-shares-card" }
+        );
         activeSharesBodySig = "empty";
         activeSharesGridEl = null;
       }
@@ -611,7 +674,8 @@
           : dest;
       const perStreamBitrateEditable = bandwidth.bandwidth_mode === "per_stream" && dest.kind !== "audio";
       const editState = perStreamBitrateEditable ? getDestEdit(dest) : null;
-      const sig = JSON.stringify({ withShare, perStreamBitrateEditable, editState, roomOptions: mockJoinedRooms, roomsAlreadyFedByCapture });
+      const stalledSince = getStalledSince(dest);
+      const sig = JSON.stringify({ withShare, perStreamBitrateEditable, editState, roomOptions: mockJoinedRooms, roomsAlreadyFedByCapture, stalledSince });
 
       let entry = destCardEls.get(dest.destination_id);
       if (!entry || entry.sig !== sig) {
@@ -623,8 +687,9 @@
               onTransfer: (id, targetRoomHandle) => transferDestination(id, targetRoomHandle),
               onFanout: (captureId, targetRoomHandle) => fanoutDestination(captureId, targetRoomHandle),
               onStop: (id) => stopDestination(id),
+              onRetry: (d) => retryDestination(d),
             },
-            { roomOptions: mockJoinedRooms, perStreamBitrateEditable, roomsAlreadyFedByCapture, editState }
+            { roomOptions: mockJoinedRooms, perStreamBitrateEditable, roomsAlreadyFedByCapture, editState, stalledSince }
           ),
           sig,
         };
@@ -848,7 +913,7 @@
     const members = mockMembersByRoom[state.scopedRoomHandle] || [];
     const body = [];
     if (members.length === 0) {
-      body.push(el("div", { className: "sc-member-row-conn", text: "No other members yet." }));
+      body.push(emptyRow("person_off", "No other members yet."));
     } else {
       members.forEach((m) => {
         const row = el("div", { className: "sc-member-row" });
