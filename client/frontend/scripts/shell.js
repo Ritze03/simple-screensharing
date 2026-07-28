@@ -125,6 +125,20 @@
   // open — see the shell.js audio-integration note below `openRoomPanel`.
   let panelAudioSources = [];
   let panelAudioSourceId = null;
+  // `Why:` replaces the old manual "Share Audio" button — when checked, the
+  // panel starts (and keeps) sharing whichever source is selected in the
+  // dropdown with no extra click, and switches automatically if the
+  // selection changes while checked. Reset to unchecked each time a panel
+  // opens (see `openRoomPanel`) so re-opening a room never silently
+  // auto-shares audio the user didn't ask for this session. Unchecking only
+  // stops the *auto-reconnect* behavior going forward — it does not tear
+  // down an already-started share. There is no "stop audio share" command
+  // reachable from this panel to call instead (`startPanelAudioShare`'s two
+  // real commands, `select_audio_source`/`start_audio_share`, have no
+  // counterpart stop invoke in this file); a running share can already be
+  // stopped elsewhere in the UI via the destination card's Stop button
+  // (`stream-control.js`), so this stays the simpler, non-duplicating choice.
+  let panelAudioAutoConnect = false;
 
   // ---------------------------------------------------------------------
   // Data touchpoints
@@ -507,6 +521,7 @@
     state.activeRoomPanel = joinString;
     panelAudioSources = [];
     panelAudioSourceId = null;
+    panelAudioAutoConnect = false;
 
     const scrim = document.getElementById("room-panel-scrim");
     scrim.hidden = false;
@@ -674,15 +689,38 @@
       select.value = panelAudioSourceId;
       select.addEventListener("change", () => {
         panelAudioSourceId = Number(select.value);
+        // Auto-Connect checked: switching sources re-shares the new one
+        // immediately, same as the initial auto-start below.
+        if (panelAudioAutoConnect) {
+          const source = panelAudioSources.find((s) => s.id === panelAudioSourceId);
+          if (source) startPanelAudioShare(room.room_handle, source);
+        }
       });
       audioRow.appendChild(select);
     }
-    audioRow.appendChild(
-      primaryButton("Share Audio", () => {
+    const autoConnectLabel = el("label", {
+      className: "room-panel-autoconnect-row" + (panelAudioSources.length === 0 ? " room-panel-autoconnect-row-disabled" : ""),
+    });
+    const autoConnectCheckbox = el("input", {
+      className: "room-panel-checkbox-input",
+      attrs: { type: "checkbox" },
+    });
+    autoConnectCheckbox.checked = panelAudioAutoConnect;
+    autoConnectCheckbox.disabled = panelAudioSources.length === 0;
+    autoConnectCheckbox.addEventListener("change", () => {
+      panelAudioAutoConnect = autoConnectCheckbox.checked;
+      if (panelAudioAutoConnect) {
         const source = panelAudioSources.find((s) => s.id === panelAudioSourceId);
         if (source) startPanelAudioShare(room.room_handle, source);
-      }, { disabled: panelAudioSources.length === 0, className: "room-panel-share-audio-btn" })
-    );
+      }
+      // Unchecking is deliberately a no-op beyond flipping the flag above —
+      // see the `panelAudioAutoConnect` declaration for why this doesn't
+      // also stop an already-running share.
+    });
+    autoConnectLabel.appendChild(autoConnectCheckbox);
+    autoConnectLabel.appendChild(el("span", { className: "room-panel-checkbox-box" }));
+    autoConnectLabel.appendChild(el("span", { className: "room-panel-checkbox-label", text: "Auto-Connect" }));
+    audioRow.appendChild(autoConnectLabel);
     audioSection.appendChild(audioRow);
     body.appendChild(audioSection);
 
