@@ -416,14 +416,34 @@ pub fn toggle_listen(managed: State<'_, Managed>, room_handle: u32, owner: Strin
     Ok(())
 }
 
+/// Set playback volume (0-200%) for `owner`'s audio.
+///
+/// `stream_id` may be either the audio stream's own id *or* the id of the
+/// video stream the frontend is showing for that sender. `Why accept both:`
+/// audio follows video (see `session.rs`'s `sync_audio_watches`) and is
+/// deliberately never surfaced to a viewer as its own stream, so the View
+/// tab's per-tile volume control only ever knows the *video* stream_id it
+/// rendered the tile from — it has no audio stream_id to pass and shouldn't
+/// need one. Resolving the sibling here keeps that ignorance in the
+/// frontend, where it belongs, instead of leaking the audio stream id back
+/// into a UI whose whole point is that audio isn't a separate thing.
+/// A direct hit on the audio id still works unchanged, for the standalone
+/// audio-only "Listen" case.
 #[tauri::command]
 pub fn set_volume(managed: State<'_, Managed>, room_handle: u32, owner: String, stream_id: u8, volume_percent: u32) -> Result<(), String> {
     let owner = dto::parse_owner(&owner)?;
-    if let Some(room) = managed.state.lock().unwrap().rooms.get_mut(&RoomHandle(room_handle))
-        && let Some(watch) = room.audio_watches.lock().unwrap().get_mut(&(owner, stream_id))
-    {
-        watch.volume_percent = volume_percent;
-        watch.decoder.set_volume(volume_percent as f64 / 100.0);
+    if let Some(room) = managed.state.lock().unwrap().rooms.get_mut(&RoomHandle(room_handle)) {
+        let audio_stream_id = if room.audio_watches.lock().unwrap().contains_key(&(owner, stream_id)) {
+            Some(stream_id)
+        } else {
+            room.sibling_audio_stream(owner)
+        };
+        if let Some(audio_stream_id) = audio_stream_id
+            && let Some(watch) = room.audio_watches.lock().unwrap().get_mut(&(owner, audio_stream_id))
+        {
+            watch.volume_percent = volume_percent;
+            watch.decoder.set_volume(volume_percent as f64 / 100.0);
+        }
     }
     Ok(())
 }
@@ -646,7 +666,7 @@ mod tests {
         // See `driver::tick`'s step 3.5 — this mock harness needs the same
         // stale-watch/route pruning the real driver loop does, or a test
         // exercising a watched stream that stops would never see it.
-        crate::driver::prune_stale_watches(&state, managed);
+        crate::driver::prune_stale_watches(&mut state, managed);
         state.apply_bandwidth_allocation();
     }
 

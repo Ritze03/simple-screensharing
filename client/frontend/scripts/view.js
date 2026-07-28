@@ -49,16 +49,19 @@
 //    deliberate best-effort approximation (see the task brief this shipped
 //    against), not a bug: building a real cross-window close signal is a
 //    bigger change than this frontend-only restyle pass.
-//  - No per-tile volume slider: `commands::set_volume` is real, but it only
-//    affects a stream already in a room's `audio_watches` ("listened") set,
-//    and nothing in this frontend currently exposes a way to turn listening
-//    on/off for a watched stream (`toggle_listen`/`RoomDetail.listened` are
-//    wired on the backend but never called from any script) — wiring a
-//    volume slider here would mean building that whole listen-toggle
-//    feature first, which is out of scope for a grid restyle. Skipped
-//    rather than faking a slider with nothing behind it.
-//  - No global volume icon in the header, same reasoning as above (no real
-//    hook to wire it to).
+//  - Per-tile volume/mute (2026-07-28): a tile whose sender is also sharing
+//    audio gets a mute button + volume slider in its hover overlay, wired to
+//    the real `commands::set_volume`. There is deliberately NO listen/unlisten
+//    toggle: the sender's audio is already subscribed and playing by the time
+//    a tile exists, because the backend pairs it with the video watch
+//    automatically (`session.rs`'s `sync_audio_watches`). A viewer never sees
+//    a sender's audio as its own stream — see `superdoc/features/
+//    video-pipeline.md`'s 2026-07-28 "Audio follows video" block. (This
+//    replaces an older note here that said a volume slider was unwireable
+//    because listening had to be toggled on first; that's no longer true.)
+//  - No global volume icon in the header: per-tile is the meaningful scope
+//    (each sender's audio is independently adjustable), and a master volume
+//    would need a mixer concept the backend doesn't have.
 //  - The "NOT ON SCREEN" rail (streams the user can watch but isn't) is
 //    real-data on the Tauri branch (`detail.streams` minus `detail.watched`,
 //    joined with `detail.members` for the display name) but has one gap: no
@@ -73,8 +76,11 @@
   const { el, icon, renderEmptyState, secondaryButton, statusBadge } = window.Components;
 
   const MOCK_WATCHED = [
-    { id: "w1", ownerLabel: "Ana", roomLabel: "Movie Night", resolution: "1920x1080", fps: 30, state: "live", hue: 220 },
-    { id: "w2", ownerLabel: "Priya", roomLabel: "Book Club", resolution: "1280x720", fps: 60, state: "live", hue: 160 },
+    // `hasAudio` mirrors the real branch's per-sender audio flag so a
+    // plain-browser/Playwright run exercises both the with-audio and
+    // without-audio tile layouts.
+    { id: "w1", ownerLabel: "Ana", roomLabel: "Movie Night", resolution: "1920x1080", fps: 30, state: "live", hue: 220, hasAudio: true },
+    { id: "w2", ownerLabel: "Priya", roomLabel: "Book Club", resolution: "1280x720", fps: 60, state: "live", hue: 160, hasAudio: false },
     { id: "w3", ownerLabel: "Sam", roomLabel: "Gaming Night", resolution: "1920x1080", fps: null, state: "stalled", hue: 0 },
   ];
 
@@ -117,6 +123,38 @@
   // shouldn't silently wipe a selection the user just made) — only trimmed
   // to drop ids for tiles that no longer exist, right before each render.
   let selectedTileIds = new Set();
+
+  // Per-tile playback volume (0-200, matching `commands::set_volume`'s range)
+  // and mute state, keyed by tile id. Client-side only: `RoomDetail` carries
+  // no `volume_percent`, and re-`render()`s happen ~4x/sec off
+  // `stream-stats-updated`, so a slider that re-read its value from the DOM
+  // would snap back to the default constantly. Survives re-renders, pruned
+  // alongside `selectedTileIds`.
+  const tileVolume = new Map();
+  const tileMuted = new Set();
+  const DEFAULT_VOLUME = 100;
+
+  /** Push a tile's effective volume (0 while muted) to the backend.
+   *
+   * Note the `streamId` passed is the tile's *video* stream id — this tab
+   * never learns the sender's audio stream id and deliberately shouldn't:
+   * audio isn't a separate thing a viewer interacts with. `commands::
+   * set_volume` resolves the sibling audio stream itself (see its doc
+   * comment). */
+  async function pushVolume(tile) {
+    if (!window.__TAURI__ || !tile.room_handle) return;
+    const percent = tileMuted.has(tile.id) ? 0 : (tileVolume.get(tile.id) ?? DEFAULT_VOLUME);
+    try {
+      await window.__TAURI__.core.invoke("set_volume", {
+        roomHandle: tile.room_handle,
+        owner: tile.owner,
+        streamId: tile.stream_id,
+        volumePercent: percent,
+      });
+    } catch (e) {
+      console.error("set_volume failed", e);
+    }
+  }
 
   // Maps tile id (`${room_handle}:${owner}:${stream_id}`) -> that tile's fps
   // `<span>`, rebuilt on every `render()`. `stream-stats-updated` fires
@@ -183,6 +221,15 @@
             // See this file's header note: no real per-stream decode-health
             // signal is wired up yet, so every real tile is 'live'.
             state: "live",
+            // Does this sender have audio riding along with their video? The
+            // backend has already auto-subscribed and started *playing* it by
+            // the time a tile exists (see `session.rs`'s
+            // `sync_audio_watches`) — this flag exists only to decide whether
+            // to draw a volume control on the tile, never to start or stop
+            // anything. Deliberately not a separate entry anywhere: the whole
+            // point is that a viewer never sees "someone's audio" as its own
+            // stream to act on.
+            hasAudio: detail.streams.some((s) => s.owner === key.owner && s.kind === "Audio"),
             // `key.owner` is a lowercase-hex `ConnId` string (no `0x`
             // prefix — see `dto::hex_u64`'s doc comment for why it's a
             // string at all, not a JS `Number`), so it needs the prefix
@@ -291,6 +338,15 @@
     const liveIds = new Set(mockWatched.map((t) => t.id));
     for (const id of selectedTileIds) {
       if (!liveIds.has(id)) selectedTileIds.delete(id);
+    }
+    // Same prune for the per-tile audio state — a tile id can recur (the same
+    // stream watched again later), and a stale mute would silently carry over
+    // into that new watch.
+    for (const id of tileMuted) {
+      if (!liveIds.has(id)) tileMuted.delete(id);
+    }
+    for (const id of tileVolume.keys()) {
+      if (!liveIds.has(id)) tileVolume.delete(id);
     }
     // Same prune for `tileStalledSince` — a tile id is `room_handle:owner:
     // stream_id` and *can* recur (the same stream watched again later), so
@@ -580,6 +636,56 @@
     // patch just this text node ~4x/sec without touching (and
     // re-flickering) the rest of the tile.
     const bottom = el("div", { className: "media-tile-overlay-bottom" });
+
+    // Audio control — present only when this sender is actually sharing
+    // audio, and *only* as a volume/mute knob on their video tile. There is
+    // no "listen" toggle here on purpose: the audio is already playing by the
+    // time this tile exists (the backend subscribed it together with the
+    // video — `session.rs`'s `sync_audio_watches`), so the only thing left
+    // for a viewer to want is "quieter" or "off". Rendered before the fps
+    // span so it sits bottom-left, opposite the stats.
+    if (tile.hasAudio) {
+      const muted = tileMuted.has(tile.id);
+      const audioGroup = el("div", { className: "media-tile-audio" + (muted ? " media-tile-audio-muted" : "") });
+      const muteBtn = el(
+        "button",
+        {
+          className: "media-tile-audio-btn",
+          attrs: { title: muted ? "Unmute" : "Mute", "aria-label": muted ? `Unmute ${tile.ownerLabel}` : `Mute ${tile.ownerLabel}` },
+          onClick: (e) => {
+            e.stopPropagation();
+            if (tileMuted.has(tile.id)) tileMuted.delete(tile.id);
+            else tileMuted.add(tile.id);
+            pushVolume(tile);
+            render();
+          },
+        },
+        [icon(muted ? "volume_off" : "volume_up")]
+      );
+      const slider = el("input", {
+        className: "media-tile-audio-slider",
+        attrs: {
+          type: "range",
+          min: "0",
+          max: "200",
+          step: "5",
+          "aria-label": `Volume for ${tile.ownerLabel}`,
+        },
+      });
+      slider.value = String(tileVolume.get(tile.id) ?? DEFAULT_VOLUME);
+      slider.addEventListener("click", (e) => e.stopPropagation());
+      slider.addEventListener("input", () => {
+        tileVolume.set(tile.id, Number(slider.value));
+        // Dragging the slider off 0 is an implicit unmute — the two controls
+        // would otherwise contradict each other on screen.
+        if (Number(slider.value) > 0) tileMuted.delete(tile.id);
+        pushVolume(tile);
+      });
+      audioGroup.appendChild(muteBtn);
+      audioGroup.appendChild(slider);
+      bottom.appendChild(audioGroup);
+    }
+
     const fpsSpan = el("span", { className: "media-tile-fps", text: tile.fps ? `@${tile.fps}fps` : "" });
     bottom.appendChild(fpsSpan);
     overlay.appendChild(bottom);
