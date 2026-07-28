@@ -236,9 +236,21 @@
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
 }
 
-.media-tile-overlay-title {
+/* Groups the title span + fps span (2026-07-28) so fps reads as part of the
+ * same continuous string ("Ana · Movie Night · 1920x1080 @30fps") instead of
+ * a disconnected element elsewhere in the overlay, while staying two
+ * separate DOM nodes — `tile.onFps`/`updateStats` (view.js) need to keep
+ * patching just the fps `<span>`'s text in place on its own tick without
+ * touching the title. Plain inline flow (no `display: flex`) is enough:
+ * both children are inline `<span>`s, so they lay out on the same line. */
+.media-tile-overlay-title-wrap {
   pointer-events: none;
   padding-top: 2px;
+  min-width: 0;
+}
+
+.media-tile-overlay-title {
+  pointer-events: none;
 }
 
 /* Wraps the selection checkbox + pop-out button so both can opt back into
@@ -284,13 +296,12 @@
   background: var(--danger);
 }
 
-/* Bottom bar — audio control on the left, live stats (fps) on the right.
- * `space-between` rather than `flex-end` so the fps span stays pinned right
- * whether or not this sender has audio. */
+/* Bottom bar — audio control only (fps moved up next to the title/
+ * resolution, 2026-07-28 — see `.media-tile-overlay-title-wrap` above). */
 .media-tile-overlay-bottom {
   pointer-events: none;
   display: flex;
-  justify-content: space-between;
+  justify-content: flex-start;
   align-items: center;
   gap: 10px;
   padding: 10px 12px;
@@ -301,7 +312,6 @@
   font-variant-numeric: tabular-nums;
   color: rgba(232, 233, 236, 0.85);
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
-  margin-left: auto;
 }
 
 /* -------------------------------------------------------------------
