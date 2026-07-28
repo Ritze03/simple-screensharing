@@ -60,6 +60,20 @@
     return node;
   }
 
+  /** Fetches the user's `max_jitter_buffer_ms` preference once at startup
+   * and passes it to `tile-video.js`'s `window.TileVideo.setMaxJitterBufferMs`
+   * — mirrors `view.js`'s `fetchMaxJitterBufferMs` exactly (same command,
+   * same setter). This window loads `tile-video.js` fresh in its own JS
+   * context (see the module doc comment above), so without this call it
+   * silently falls back to that module's own `DEFAULT_MAX_JITTER_BUFFER_MS`
+   * instead of the user's configured ceiling. No-op on the mock branch (no
+   * `window.__TAURI__`), matching `view.js`. */
+  async function fetchMaxJitterBufferMs() {
+    if (!window.__TAURI__) return;
+    const settings = await window.__TAURI__.core.invoke("get_settings");
+    window.TileVideo.setMaxJitterBufferMs(settings.max_jitter_buffer_ms);
+  }
+
   /** Resolves each parsed stream key to a video URL via the same
    * `stream_video_url` command the View tab's `fetchWatchedStreams` calls,
    * and builds a `{ id, videoUrl }`-shaped tile — the minimal shape
@@ -185,6 +199,7 @@
 
   async function init() {
     setupExitControls();
+    await fetchMaxJitterBufferMs();
     const tiles = await resolveTiles(streamKeys);
     renderGrid(tiles);
   }
