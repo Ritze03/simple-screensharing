@@ -66,6 +66,13 @@
       room_handle: 1,
       active_stream_count: 1,
       members: [{ conn_id: 1, display_name: "Ana", owner: 1, stream_id: 0, resolution: "1920x1080", watching: false }],
+      // Mock stand-in for `room_detail`'s `streams` (`RoomDetail.streams` /
+      // `StreamInfoDto`, `src-tauri/src/dto.rs`) — the room panel's "Live
+      // streams" section reads this directly on the mock branch since
+      // `loadRoomMembers` (which populates it on the real branch) short-circuits
+      // without `window.__TAURI__`. Kept in sync with `members[0]` above (same
+      // owner/resolution) so both sections describe the same stream.
+      streams: [{ owner: 1, stream_id: 0, kind: "Video", label: "Screen", width: 1920, height: 1080 }],
     },
     {
       join_string: "server|22222222|gaming-night-key",
@@ -186,6 +193,16 @@
         watching: videoStream ? watchedOwners.has(`${videoStream.owner}:${videoStream.stream_id}`) : false,
       };
     });
+    // `detail.streams` as-is (every announced stream, not just one per
+    // member) plus the same `watched` set, both read by the room panel's
+    // "Live streams" section (`renderRoomPanel`/`renderRoomPanelStreamRow`
+    // below). `room.members` above only ever surfaces one Video stream per
+    // member (a pre-existing limitation, see its own inline comment); this
+    // is the fuller per-stream view the STREAMS tree needs — see
+    // `superdoc/features/stream-control.md`'s 2026-07-28 note for why a
+    // per-stream *watcher count* can't be added alongside it yet.
+    room.streams = detail.streams;
+    room.watchedKeys = watchedOwners;
   }
 
   // ---------------------------------------------------------------------
@@ -267,6 +284,59 @@
       if (m) m.watching = !m.watching;
     }
     renderRoomPanel();
+  }
+
+  /** Watch-toggle for the room-detail panel's "Live streams" section — same
+   * `toggle_watch` command `toggleWatch` (MEMBERS section) and `view.js`'s
+   * `playNotOnScreen`/`stopWatchingTile` already call, generalized to any
+   * stream row (`{owner, stream_id, watching}`) rather than assuming one
+   * Video stream per member. Unlike `toggleWatch`, this also switches the
+   * user to the View tab on a *start* (not a stop) — the owner's request was
+   * explicitly "so i can connect to them from there", and `setActiveTab` is
+   * a pure view-switcher per this file's header note, so flipping tabs here
+   * is a safe, side-effect-free UI move layered on top of the real
+   * side-effecting `toggle_watch` call above it. */
+  async function toggleStreamWatch(joinString, streamRow) {
+    const room = mockRooms.find((x) => x.join_string === joinString);
+    if (!room) return;
+    const wasWatching = !!streamRow.watching;
+    if (window.__TAURI__) {
+      await window.__TAURI__.core.invoke("toggle_watch", { roomHandle: room.room_handle, owner: streamRow.owner, streamId: streamRow.stream_id });
+      await loadRoomMembers(room);
+      if (window.ViewTab) window.ViewTab.refresh();
+    } else {
+      room.watchedKeys = room.watchedKeys || new Set();
+      const key = `${streamRow.owner}:${streamRow.stream_id}`;
+      if (room.watchedKeys.has(key)) room.watchedKeys.delete(key);
+      else room.watchedKeys.add(key);
+    }
+    if (!wasWatching) setActiveTab("View");
+    renderRoomPanel();
+  }
+
+  /** One row of the room-detail panel's "Live streams" section — every
+   * announced stream in the room (`room.streams`, from `room_detail`'s
+   * `RoomDetail.streams` / `StreamInfoDto`), not just the one-video-per-member
+   * view `renderRoomPanelMemberRow` above shows. No watcher-count column:
+   * the relay only reports `SubscriberCount` to a stream's own owner (spec
+   * §9 — "other members never receive another stream's subscriber count"),
+   * so this client has no way to know how many people are watching someone
+   * else's stream without a wire-protocol change. See
+   * `superdoc/features/stream-control.md`'s 2026-07-28 note. */
+  function renderRoomPanelStreamRow(room, s) {
+    const row = el("div", { className: "room-panel-member-row" });
+    const nameText = s.label ? `${s.display_name} — ${s.label}` : s.display_name;
+    row.appendChild(el("span", { className: "room-panel-member-name", text: nameText }));
+    const metaParts = [s.kind === "Video" ? "Video" : "Audio"];
+    if (s.resolution) metaParts.push(s.resolution);
+    row.appendChild(el("span", { className: "room-panel-member-status", text: metaParts.join(" · ") }));
+    row.appendChild(
+      iconButton(s.watching ? "visibility_off" : "visibility", () => toggleStreamWatch(room.join_string, s), {
+        title: s.watching ? "Stop watching" : "Watch",
+        className: s.watching ? "watch-active" : "",
+      })
+    );
+    return row;
   }
 
   /** Standardized empty state for the ROOMS section (first-launch/no-rooms
@@ -677,6 +747,41 @@
     }
     membersSection.appendChild(memberList);
     body.appendChild(membersSection);
+
+    // ---- LIVE STREAMS ----
+    // Per-stream view of `room.streams` (set by `loadRoomMembers` on the real
+    // branch, hardcoded on the mock branch — see the mock `streams` array's
+    // own comment). Owner display name is looked up in `members`; falls back
+    // to a short id if the owner isn't in the roster for some reason (should
+    // not happen in practice — a stream's owner is always a room member).
+    const watchedKeys = room.watchedKeys || new Set();
+    const streamRows = (room.streams || []).map((s) => {
+      const ownerMember = members.find((m) => m.conn_id === s.owner);
+      return {
+        owner: s.owner,
+        stream_id: s.stream_id,
+        kind: s.kind,
+        label: s.label,
+        resolution: s.kind === "Video" ? `${s.width}x${s.height}` : null,
+        display_name: ownerMember ? ownerMember.display_name : `Stream ${String(s.owner).slice(-4)}`,
+        watching: watchedKeys.has(`${s.owner}:${s.stream_id}`),
+      };
+    });
+    const streamsSection = el("div", { className: "room-panel-members-section" });
+    streamsSection.appendChild(el("div", { className: "room-panel-section-label", text: "Live streams" }));
+    const streamList = el("div", { className: "room-panel-members" });
+    if (streamRows.length === 0) {
+      streamList.appendChild(el("span", { className: "room-panel-member-status", text: "No one is sharing right now." }));
+    } else {
+      streamRows.forEach((s) => streamList.appendChild(renderRoomPanelStreamRow(room, s)));
+    }
+    streamsSection.appendChild(streamList);
+    // `Why:` no watcher-count column — see `renderRoomPanelStreamRow`'s doc
+    // comment; this is a genuine relay protocol gap, not an oversight.
+    streamsSection.appendChild(
+      el("div", { className: "room-panel-privacy-note", text: "Watcher counts aren't shown yet — the relay only reports them to a stream's own owner." })
+    );
+    body.appendChild(streamsSection);
 
     // ---- AUDIO ----
     const audioSection = el("div", { className: "room-panel-audio-section" });
