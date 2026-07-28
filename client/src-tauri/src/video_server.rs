@@ -95,19 +95,45 @@
 //!
 //! Neither `x264enc` nor `vah264enc` in `capture.rs` sets an explicit
 //! `profile=` property, so the AVC profile/level isn't statically knowable —
-//! it has to be read from the stream itself. This module parses it once per
-//! route, from the first SPS NAL (`nal_unit_type == 7`) seen in any keyframe
-//! access unit (see [`parse_avc_codec_string`]), and caches it (profile
-//! doesn't change mid-stream). Rather than adding a second round trip (e.g.
-//! extending `stream_video_url`'s DTO with a codec field, which would need
-//! the frontend to poll or race it against the relay actually having seen a
-//! keyframe), the codec string is delivered as the CodecInfo chunk described
-//! above — always the first thing any connection to a route receives,
-//! computed exactly once and cached on the route so a second/third viewer
-//! opening the same stream gets it immediately rather than waiting for
-//! another keyframe. This keeps `commands.rs`/`stream_video_url`'s existing
-//! shape (URL discovery only) untouched and keeps the whole contract inside
-//! one place a frontend consumer has to read: this module's own wire format.
+//! it has to be read from the stream itself. This module parses it from the
+//! first SPS NAL (`nal_unit_type == 7`) seen in any keyframe access unit
+//! (see [`parse_avc_codec_string`]) and caches it on the route so a
+//! second/third viewer opening the same stream gets it immediately rather
+//! than waiting for another keyframe. Rather than adding a second round trip
+//! (e.g. extending `stream_video_url`'s DTO with a codec field, which would
+//! need the frontend to poll or race it against the relay actually having
+//! seen a keyframe), the codec string is delivered as the CodecInfo chunk
+//! described above — always the first thing any connection to a route
+//! receives. This keeps `commands.rs`/`stream_video_url`'s existing shape
+//! (URL discovery only) untouched and keeps the whole contract inside one
+//! place a frontend consumer has to read: this module's own wire format.
+//!
+//! `Why this is re-derived on every keyframe, not just the first:` profile
+//! does *not* stay constant for a route's whole lifetime — `capture.rs`'s
+//! `BranchSwap` (triggered by the live `tune`/`quality_level`/`rate_control`
+//! encoder-tuning controls) rebuilds the encoder element from scratch, and
+//! `x264enc` picks its AVC profile/level automatically from `speed-preset`
+//! when no explicit `profile=` is set (confirmed empirically:
+//! `speed-preset=ultrafast` emits `avc1.42c01f` — Baseline, level 3.1 —
+//! while `speed-preset=veryslow` on the same resolution emits
+//! `avc1.640032` — High, level 5.0 — from the exact same `x264enc` pipeline
+//! fragment `capture.rs` builds). A route that cached only the *first*
+//! keyframe's codec string would keep handing a stale, mismatched string to
+//! every connection made after a `BranchSwap` changed it — `VideoDecoder.
+//! configure()` succeeds (the string still parses fine), but every
+//! `decode()` call against the new bitstream then fails, since the browser
+//! configured a decoder for the old profile/level. That was a real,
+//! reproduced bug: a watcher connecting after the sharer toggled any of
+//! those three controls got stuck at 0fps with a `Stream error` decode
+//! failure. `produce()` below now re-derives the codec string from *every*
+//! keyframe's SPS (not just the first) and [`Mailbox::set_codec`] only
+//! bumps the route's codec generation when the derived string actually
+//! changed; [`handle_connection`]'s relay loop watches that generation
+//! alongside the frame generation and pushes a fresh CodecInfo chunk to
+//! *every already-connected* watcher the moment it changes, not only to new
+//! connections — `tile-video.js`'s `VideoDecoder.configure()` is already
+//! safe to call again on a live decoder (it resets it; the next chunk must
+//! be a keyframe, which is exactly what a `BranchSwap` forces).
 //!
 //! # The two details carried over from the MJPEG design, unchanged
 //!
@@ -192,11 +218,12 @@ struct RawFrame {
 /// blocks until the stored generation differs from `g`, then takes whatever
 /// is current (never queued, never replayed).
 ///
-/// Also carries this route's codec string once known (see module doc,
-/// "Codec-string discovery") — a separate slot on the same `Mutex`/`Condvar`
-/// rather than a second mailbox, since it's set at most once per route and
-/// every connection needs to read it exactly once, up front, regardless of
-/// which frame generation is current when it connects.
+/// Also carries this route's codec string (see module doc, "Codec-string
+/// discovery") — a separate slot on the same `Mutex`/`Condvar` rather than a
+/// second mailbox, since every connection needs to read the *current* value
+/// up front regardless of which frame generation is current when it
+/// connects, and (unlike the frame slot) already-connected readers also need
+/// to notice a later change — see `codec_generation`'s doc comment.
 struct Mailbox {
     inner: Mutex<MailboxInner>,
     cvar: Condvar,
@@ -206,12 +233,23 @@ struct MailboxInner {
     generation: u64,
     frame: Option<RawFrame>,
     codec: Option<Arc<str>>,
+    /// Bumped every time `codec` actually *changes* value (never on a
+    /// same-value `set_codec` call — see its doc comment). A connection
+    /// remembers the generation it last sent a CodecInfo chunk for and
+    /// re-checks this alongside the frame generation on every wakeup, so a
+    /// mid-connection `BranchSwap` that changes the encoder's profile/level
+    /// (see module doc) gets a fresh CodecInfo chunk pushed to it instead of
+    /// silently decoding against a stale one.
+    codec_generation: u64,
     closed: bool,
 }
 
 impl Mailbox {
     fn new() -> Self {
-        Self { inner: Mutex::new(MailboxInner { generation: 0, frame: None, codec: None, closed: false }), cvar: Condvar::new() }
+        Self {
+            inner: Mutex::new(MailboxInner { generation: 0, frame: None, codec: None, codec_generation: 0, closed: false }),
+            cvar: Condvar::new(),
+        }
     }
 
     /// Overwrite the slot with a new frame. Called only by this stream's
@@ -223,13 +261,18 @@ impl Mailbox {
         self.cvar.notify_all();
     }
 
-    /// Record this route's codec string, once. A no-op if already set (the
-    /// first keyframe's SPS wins; profile doesn't change mid-stream, so
-    /// later calls would only ever agree anyway).
+    /// Record this route's current codec string. A no-op — no generation
+    /// bump, no wakeup — if it's unchanged from the cached value (the common
+    /// case: most keyframes reconfirm the same profile/level the route
+    /// already has cached). Only actually updates, bumps
+    /// `codec_generation`, and wakes waiters when the derived string
+    /// *differs* from what's cached — i.e. a `BranchSwap` changed the
+    /// encoder's profile/level (see module doc).
     fn set_codec(&self, codec: String) {
         let mut inner = self.inner.lock().unwrap();
-        if inner.codec.is_none() {
+        if inner.codec.as_deref() != Some(codec.as_str()) {
             inner.codec = Some(Arc::from(codec));
+            inner.codec_generation = inner.codec_generation.wrapping_add(1);
             self.cvar.notify_all();
         }
     }
@@ -242,11 +285,14 @@ impl Mailbox {
     }
 
     /// Block until the codec string is known (or the mailbox closes).
-    fn wait_codec(&self) -> Option<Arc<str>> {
+    /// Returns it along with the codec generation it was read at, so the
+    /// caller can tell a later `set_codec` change apart from the one it
+    /// already has.
+    fn wait_codec(&self) -> Option<(Arc<str>, u64)> {
         let mut inner = self.inner.lock().unwrap();
         loop {
             if let Some(codec) = &inner.codec {
-                return Some(codec.clone());
+                return Some((codec.clone(), inner.codec_generation));
             }
             if inner.closed {
                 return None;
@@ -255,15 +301,26 @@ impl Mailbox {
         }
     }
 
-    /// Block until a frame newer than `*last_seen` exists (or the mailbox
-    /// closes), then return it and advance `*last_seen`. Never returns a
-    /// frame the caller has already seen, and never buffers more than one.
-    fn wait_next(&self, last_seen: &mut u64) -> Option<RawFrame> {
+    /// Block until either a frame newer than `*last_frame_gen` or a codec
+    /// string newer than `*last_codec_gen` exists (or the mailbox closes),
+    /// then return whichever is ready and advance the corresponding
+    /// counter. Checks the codec first so a change is always delivered
+    /// before any frame encoded under it — matches `produce()`'s own
+    /// ordering (`set_codec` before `publish` for the same access unit).
+    /// Never returns something the caller has already seen, and never
+    /// buffers more than one frame.
+    fn wait_update(&self, last_frame_gen: &mut u64, last_codec_gen: &mut u64) -> Option<MailboxUpdate> {
         let mut inner = self.inner.lock().unwrap();
         loop {
-            if inner.generation != *last_seen && inner.frame.is_some() {
-                *last_seen = inner.generation;
-                return inner.frame.clone();
+            if inner.codec_generation != *last_codec_gen {
+                *last_codec_gen = inner.codec_generation;
+                if let Some(codec) = &inner.codec {
+                    return Some(MailboxUpdate::Codec(codec.clone()));
+                }
+            }
+            if inner.generation != *last_frame_gen && inner.frame.is_some() {
+                *last_frame_gen = inner.generation;
+                return Some(MailboxUpdate::Frame(inner.frame.clone().unwrap()));
             }
             if inner.closed {
                 return None;
@@ -271,6 +328,12 @@ impl Mailbox {
             inner = self.cvar.wait(inner).unwrap();
         }
     }
+}
+
+/// What [`Mailbox::wait_update`] hands a connection thread to relay.
+enum MailboxUpdate {
+    Codec(Arc<str>),
+    Frame(RawFrame),
 }
 
 struct Route {
@@ -364,13 +427,16 @@ impl VideoServer {
 }
 
 /// Producer: forward every access unit `rx` delivers straight to the
-/// mailbox, and derive this route's codec string from the first keyframe
-/// that contains an SPS. Exits as soon as `stop` is observed or `rx`
-/// disconnects (the `WatchEntry`/`RoomSession` that owned the sending half
-/// was torn down), whichever comes first.
+/// mailbox, and derive this route's codec string from every keyframe that
+/// contains an SPS (not just the first — see module doc for why: a
+/// `BranchSwap` can change the encoder's profile/level mid-route).
+/// `Mailbox::set_codec` is idempotent for an unchanged value, so this costs
+/// nothing extra beyond a cheap SPS scan on the (infrequent) keyframes.
+/// Exits as soon as `stop` is observed or `rx` disconnects (the
+/// `WatchEntry`/`RoomSession` that owned the sending half was torn down),
+/// whichever comes first.
 fn produce(rx: Receiver<DecryptedMediaFrame>, mailbox: Arc<Mailbox>, stop: Arc<AtomicBool>) {
     tracing::debug!("video_server: producer thread started");
-    let mut codec_known = false;
     let mut published_any = false;
     while !stop.load(Ordering::Relaxed) {
         let frame = match rx.recv_timeout(RECV_POLL_INTERVAL) {
@@ -379,11 +445,10 @@ fn produce(rx: Receiver<DecryptedMediaFrame>, mailbox: Arc<Mailbox>, stop: Arc<A
             Err(RecvTimeoutError::Disconnected) => break,
         };
 
-        if !codec_known && frame.keyframe {
+        if frame.keyframe {
             if let Some(codec) = parse_avc_codec_string(&frame.payload) {
                 tracing::debug!("video_server: derived codec string {codec:?}");
                 mailbox.set_codec(codec);
-                codec_known = true;
             }
         }
 
@@ -530,22 +595,35 @@ fn handle_connection(mut stream: TcpStream, routes: &Arc<Mutex<HashMap<StreamKey
     // "Wire format" and "Codec-string discovery". Blocks until the route's
     // producer has derived it from a keyframe's SPS (or the route closes
     // first, e.g. the watch was stopped before any keyframe ever arrived).
-    let Some(codec) = mailbox.wait_codec() else { return };
+    let Some((codec, mut last_codec_seen)) = mailbox.wait_codec() else { return };
     if write_chunk(&mut stream, FRAME_TYPE_CODEC_INFO, 0, 0, codec.as_bytes()).is_err() {
         return;
     }
 
     // Deliberately starts at generation 0 with nothing yet seen: the first
-    // `wait_next` call returns whatever the producer has already published
-    // (if generation has already moved past 0 by the time we get here) or
-    // blocks until it does — either way, a viewer that opens a tile before
-    // the first frame is ready simply waits for it instead of erroring.
+    // `wait_update` call returns whatever the producer has already
+    // published (if generation has already moved past 0 by the time we get
+    // here) or blocks until it does — either way, a viewer that opens a tile
+    // before the first frame is ready simply waits for it instead of
+    // erroring. `last_codec_seen` starts at the generation the initial
+    // CodecInfo chunk above was already sent for, so this loop only reacts
+    // to a *later* change (e.g. a mid-connection `BranchSwap` — see module
+    // doc), never re-sending the one already written above.
     let mut last_seen = 0u64;
     loop {
-        let Some(frame) = mailbox.wait_next(&mut last_seen) else { break };
-        let flags = if frame.keyframe { FLAG_KEYFRAME } else { 0 };
-        if write_chunk(&mut stream, FRAME_TYPE_VIDEO, flags, frame.pts_us, &frame.payload).is_err() {
-            break;
+        match mailbox.wait_update(&mut last_seen, &mut last_codec_seen) {
+            Some(MailboxUpdate::Codec(codec)) => {
+                if write_chunk(&mut stream, FRAME_TYPE_CODEC_INFO, 0, 0, codec.as_bytes()).is_err() {
+                    break;
+                }
+            }
+            Some(MailboxUpdate::Frame(frame)) => {
+                let flags = if frame.keyframe { FLAG_KEYFRAME } else { 0 };
+                if write_chunk(&mut stream, FRAME_TYPE_VIDEO, flags, frame.pts_us, &frame.payload).is_err() {
+                    break;
+                }
+            }
+            None => break,
         }
     }
 }
@@ -681,6 +759,115 @@ mod tests {
         assert_eq!(flags & FLAG_KEYFRAME, 0);
         assert_eq!(pts_us, 1_033);
         assert_eq!(payload, delta_payload);
+
+        server.stop_route(key);
+    }
+
+    /// A second synthetic keyframe with a *different* SPS profile/level from
+    /// [`synthetic_keyframe_au`] — Baseline (`profile_idc = 0x42`), no extra
+    /// constraints, Level 3.1 (`level_idc = 0x1f`) — standing in for the
+    /// real profile/level jump this project measured `capture.rs`'s
+    /// `x264enc` actually producing across a `BranchSwap` between
+    /// `speed-preset=veryslow` and `speed-preset=ultrafast` at the same
+    /// resolution (`avc1.640032` vs. `avc1.42c01f`, see module doc).
+    fn synthetic_keyframe_au_different_profile() -> Vec<u8> {
+        let mut au = Vec::new();
+        au.extend_from_slice(&[0, 0, 0, 1]);
+        au.push(0x67);
+        au.extend_from_slice(&[0x42, 0xc0, 0x1f]);
+        au.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        au.extend_from_slice(&[0, 0, 1]);
+        au.push(0x65);
+        au.extend_from_slice(&[0x11, 0x22, 0x33]);
+        au
+    }
+
+    /// Regression test for the reproduced bug: a watcher connects, gets the
+    /// route's first CodecInfo chunk and a keyframe under it (exactly like
+    /// [`relay_streams_codec_info_then_frames_in_wire_format`]), then the
+    /// simulated `BranchSwap` sends a keyframe with a *different* SPS
+    /// profile/level — standing in for `capture.rs` rebuilding the encoder
+    /// with a different `tune`/`quality_level`/`rate_control` after the
+    /// watcher already connected. Before the fix, `Mailbox::set_codec` was a
+    /// no-op after the first call and the connection's relay loop never
+    /// re-checked the codec at all, so the already-connected watcher would
+    /// silently keep decoding new-profile frames against the old cached
+    /// codec string — exactly the "stuck at 0fps / decode failure" bug this
+    /// asserts against by requiring a *second* CodecInfo chunk, with the new
+    /// profile, arrive before the new keyframe.
+    #[test]
+    fn relay_pushes_a_fresh_codec_info_chunk_when_a_branch_swap_changes_profile() {
+        let server = VideoServer::start().expect("start VideoServer");
+        let key = (1u32, 2u64, 3u8);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let url = server.start_route(key, rx);
+
+        let addr = url.trim_start_matches("http://").split('/').next().unwrap();
+        let mut stream = TcpStream::connect(addr).expect("connect to relay");
+        let path = format!("/{}", url.splitn(4, '/').nth(3).unwrap());
+        stream.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes()).unwrap();
+
+        let mut header_buf = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            stream.read_exact(&mut byte).unwrap();
+            header_buf.push(byte[0]);
+            if header_buf.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+
+        let read_chunk = |stream: &mut TcpStream| -> (u8, u8, u64, Vec<u8>) {
+            let mut prefix = [0u8; 4];
+            stream.read_exact(&mut prefix).unwrap();
+            let body_len = u32::from_be_bytes(prefix) as usize;
+            let mut body = vec![0u8; body_len];
+            stream.read_exact(&mut body).unwrap();
+            let frame_type = body[0];
+            let flags = body[1];
+            let pts_us = u64::from_be_bytes(body[2..10].try_into().unwrap());
+            let payload = body[10..].to_vec();
+            (frame_type, flags, pts_us, payload)
+        };
+
+        // First keyframe, "pre-swap" profile — connection gets CodecInfo
+        // then the keyframe, same as the existing happy-path test.
+        tx.send(DecryptedMediaFrame {
+            conn_id: 2,
+            stream_id: 3,
+            pts: 1_000,
+            keyframe: true,
+            stalled: false,
+            payload: synthetic_keyframe_au(),
+        })
+        .unwrap();
+        let (frame_type, _, _, payload) = read_chunk(&mut stream);
+        assert_eq!(frame_type, FRAME_TYPE_CODEC_INFO);
+        assert_eq!(String::from_utf8(payload).unwrap(), "avc1.640028");
+        let (frame_type, _, _, _) = read_chunk(&mut stream);
+        assert_eq!(frame_type, FRAME_TYPE_VIDEO);
+
+        // Simulated `BranchSwap`: a keyframe with a different SPS arrives on
+        // the same still-open connection. The relay must push a fresh
+        // CodecInfo chunk (with the new profile) before the new keyframe,
+        // not just keep relaying frames under the stale cached string.
+        tx.send(DecryptedMediaFrame {
+            conn_id: 2,
+            stream_id: 3,
+            pts: 2_000,
+            keyframe: true,
+            stalled: false,
+            payload: synthetic_keyframe_au_different_profile(),
+        })
+        .unwrap();
+        let (frame_type, _, _, payload) = read_chunk(&mut stream);
+        assert_eq!(frame_type, FRAME_TYPE_CODEC_INFO, "expected a second CodecInfo chunk after the profile changed");
+        assert_eq!(String::from_utf8(payload).unwrap(), "avc1.42c01f");
+        let (frame_type, flags, pts_us, payload) = read_chunk(&mut stream);
+        assert_eq!(frame_type, FRAME_TYPE_VIDEO);
+        assert_eq!(flags & FLAG_KEYFRAME, FLAG_KEYFRAME);
+        assert_eq!(pts_us, 2_000);
+        assert_eq!(payload, synthetic_keyframe_au_different_profile());
 
         server.stop_route(key);
     }
