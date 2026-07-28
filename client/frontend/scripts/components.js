@@ -1183,16 +1183,20 @@
 
       const presetRow = el("div", { className: "dest-edit-row" });
       presetRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Preset" }));
-      presetRow.appendChild(
-        pillSwitch(
-          PRESETS.map((p) => ({ value: p.value, label: p.label })),
-          activePreset ? activePreset.value : null,
-          (value) => {
-            const preset = PRESETS.find((p) => p.value === value);
-            if (preset) applyTuning({ tune: preset.tune, qualityLevel: preset.qualityLevel, rateControl: preset.rateControl });
-          }
-        )
+      const presetToggle = pillSwitch(
+        PRESETS.map((p) => ({ value: p.value, label: p.label })),
+        activePreset ? activePreset.value : null,
+        (value) => {
+          const preset = PRESETS.find((p) => p.value === value);
+          if (preset) applyTuning({ tune: preset.tune, qualityLevel: preset.qualityLevel, rateControl: preset.rateControl });
+        }
       );
+      // `.dest-tuning-toggle`: same shared fixed-width modifier as
+      // Tune/Quality Level/Rate Control below, so Preset's 3-way toggle
+      // lines up with the same track width instead of sizing to its own
+      // content — see that class's own doc comment (stream-control.css).
+      presetToggle.classList.add("dest-tuning-toggle");
+      presetRow.appendChild(presetToggle);
       presetRow.appendChild(el("span"));
       editGrid.appendChild(presetRow);
 
