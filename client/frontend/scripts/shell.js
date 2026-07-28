@@ -146,6 +146,14 @@
     // the same component `bandwidthModeToggle` uses.
     addRoomTab: "join",
     pendingLeaveRoomId: null,
+    // Own display name, for the MEMBERS panel's self row (see
+    // `renderRoomPanel`) — fetched lazily from `get_settings` the first
+    // time a room panel opens and cached here for the session (it only
+    // changes via a fresh `join_room` call, which is rare enough not to
+    // warrant re-fetching on every panel open). Null until fetched (or on
+    // the mock branch, where there's no backend `AppState::display_name`
+    // to read — falls back to "You" in that case, same as before).
+    myDisplayName: null,
   };
 
   // ---------------------------------------------------------------------
@@ -627,6 +635,15 @@
 
     state.activeRoomPanel = joinString;
 
+    if (state.myDisplayName == null && window.__TAURI__) {
+      try {
+        const settings = await window.__TAURI__.core.invoke("get_settings");
+        state.myDisplayName = settings.display_name || null;
+      } catch {
+        // Leave null — renderRoomPanel falls back to "You".
+      }
+    }
+
     const scrim = document.getElementById("room-panel-scrim");
     scrim.hidden = false;
     renderRoomPanel();
@@ -872,13 +889,13 @@
     // only be you.
     if (!includesSelf) {
       const youRow = el("div", { className: "room-panel-member-row room-panel-member-row-you" });
-      youRow.appendChild(el("span", { className: "room-panel-member-name", text: "You" }));
+      youRow.appendChild(el("span", { className: "room-panel-member-name", text: state.myDisplayName || "You" }));
       youRow.appendChild(el("span", { className: "room-panel-you-badge", text: "YOU" }));
       memberList.appendChild(youRow);
       members.forEach((m) => memberList.appendChild(renderRoomPanelMemberRow(room, m)));
     } else if (members.length === 1) {
       const youRow = el("div", { className: "room-panel-member-row room-panel-member-row-you" });
-      youRow.appendChild(el("span", { className: "room-panel-member-name", text: "You" }));
+      youRow.appendChild(el("span", { className: "room-panel-member-name", text: state.myDisplayName || "You" }));
       youRow.appendChild(el("span", { className: "room-panel-you-badge", text: "YOU" }));
       memberList.appendChild(youRow);
     } else {

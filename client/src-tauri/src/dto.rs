@@ -241,6 +241,13 @@ pub fn staged_capture_rows(state: &AppState) -> Vec<StagedCaptureRow> {
 
 #[derive(Serialize, Clone)]
 pub struct SettingsDto {
+    /// The local user's own display name (`AppState::display_name`) — last
+    /// value sent to `join_room`, or the OS-username default if never
+    /// joined. Exposed so the frontend can show the real name instead of a
+    /// hardcoded "You" label on the caller's own MEMBERS row (`shell.js`'s
+    /// `renderRoomPanel`) — previously there was no DTO field for this at
+    /// all (see that function's own comment on the gap this fixes).
+    pub display_name: String,
     pub language: String,
     pub presentation_mode: String,
     pub launch_presentation_mode: String,
@@ -533,6 +540,7 @@ pub fn destination_rows(state: &AppState) -> Vec<DestinationRow> {
 
 pub fn settings_dto(state: &AppState) -> SettingsDto {
     SettingsDto {
+        display_name: state.display_name.clone(),
         language: state.language.clone(),
         presentation_mode: presentation_mode_key(state.presentation_mode).to_string(),
         launch_presentation_mode: presentation_mode_key(state.launch_presentation_mode).to_string(),
