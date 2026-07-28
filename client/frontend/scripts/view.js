@@ -193,33 +193,65 @@
   }
 
   /** Measures `.content` (the always-present scroll container all tabs
-   * share — stable even while this tab's panel is `hidden`) minus the
-   * header/controls above the grid and the "not on screen" rail below it
-   * (both measured from their real rendered heights, not assumed), then
-   * writes the resulting shape as CSS custom properties on `currentGridEl`.
-   * No-ops if the grid isn't currently rendered, or if the available box
-   * measures to 0 (this tab's panel is `hidden`, or a render happened
-   * before first layout) — the `ResizeObserver` below re-fires this once
-   * real dimensions are available (a `hidden` -> visible panel transition
-   * itself is a resize of `#view-root`, from 0 to its real size). */
+   * share — stable even while this tab's panel is `hidden`) minus everything
+   * above the grid (via the grid's own rendered top, see the `Why:` note
+   * inside for why this isn't a hand-enumerated sibling list anymore) and
+   * the "not on screen" rail below it (measured from its real rendered
+   * height, not assumed), then writes the resulting shape as CSS custom
+   * properties on `currentGridEl`. No-ops if the grid isn't currently
+   * rendered, or if the available box measures to 0 or negative (this tab's
+   * panel is `hidden`, or a render happened before first layout) — the
+   * `ResizeObserver` below re-fires this once real dimensions are available
+   * (a `hidden` -> visible panel transition itself is a resize of
+   * `#view-root`, from 0 to its real size). */
   function applyGridLayout() {
     if (!currentGridEl || currentTileCount <= 0) return;
     const content = document.querySelector(".content");
     if (!content) return;
     const cs = getComputedStyle(content);
     const availWidth = content.clientWidth - parseFloat(cs.paddingLeft || "0") - parseFloat(cs.paddingRight || "0");
-    const totalHeight = content.clientHeight - parseFloat(cs.paddingTop || "0") - parseFloat(cs.paddingBottom || "0");
-    if (availWidth <= 0 || totalHeight <= 0) return;
+    if (availWidth <= 0) return;
 
-    // Literal 10/10/16 below are `.view-header`/`.view-controls`'s
-    // `margin-bottom` and `.view-not-on-screen`'s `margin-top` in view.css —
-    // kept in sync manually, same as `GRID_GAP_PX` above.
-    const headerEl = document.querySelector(".view-header");
-    const controlsEl = document.querySelector(".view-controls");
+    // Bug (2026-07-28, see `superdoc/features/viewer-window.md`'s follow-up
+    // entry): this used to derive `availHeight` from `.content`'s total
+    // height minus *assumed* sibling heights (`.view-header`/`.view-controls`
+    // above, `.view-not-on-screen` below, with hardcoded margin literals).
+    // That list silently missed the `<h2>` tab title that sits above
+    // `#view-root` (see index.html) — its ~35px (19px line box + 16px
+    // margin-bottom) was never subtracted, so `availHeight` came out that
+    // much too tall on every render. Harmless when width was the binding
+    // constraint (the extra vertical slack just went unused), but on
+    // height-constrained shapes (e.g. a 1-column stack, or any shape close
+    // to filling the container's height) the grid was sized into space that
+    // didn't actually exist, pushing its bottom — and the "not on screen"
+    // rail below it — past `.content`'s visible bottom edge.
+    //
+    // Fixed by anchoring the top measurement to `currentGridEl`'s own
+    // rendered top (`getBoundingClientRect().top`) instead of re-deriving it
+    // from a hand-maintained list of siblings above it. The grid's top
+    // position only depends on the layout of *everything before it* in the
+    // DOM (h2, header, controls, and whatever else may be added later) —
+    // never on the grid's own height — so this can't go stale the way an
+    // enumerated sibling list can, and there's no gap-count/margin literal
+    // to keep in sync for the "above" side anymore.
+    const contentRect = content.getBoundingClientRect();
+    const contentPaddingBottom = parseFloat(cs.paddingBottom || "0");
+    // `content.clientHeight` spans `.content`'s full padding box (no border
+    // on `.content`, so the border box and padding box coincide); subtract
+    // the bottom padding to land on the real bottom edge of the usable
+    // (scrollable) content area.
+    const contentBottom = contentRect.top + content.clientHeight - contentPaddingBottom;
+    const gridTop = currentGridEl.getBoundingClientRect().top;
+
+    // The "not on screen" rail still needs its own hardcoded margin-top
+    // (`.view-not-on-screen`'s `16px` in view.css) — it sits *after* the
+    // grid, so it can't be folded into the same "measure up to my own top"
+    // trick without moving the grid's height computation into a second pass.
     const railEl = document.querySelector(".view-not-on-screen");
-    const usedAbove = (headerEl ? headerEl.getBoundingClientRect().height + 10 : 0) + (controlsEl ? controlsEl.getBoundingClientRect().height + 10 : 0);
     const usedBelow = railEl ? railEl.getBoundingClientRect().height + 16 : 0;
-    const availHeight = totalHeight - usedAbove - usedBelow;
+
+    const availHeight = contentBottom - gridTop - usedBelow;
+    if (availHeight <= 0) return;
 
     const { cols, rows, tileWidth, tileHeight } = computeGridShape(currentTileCount, availWidth, availHeight);
     currentGridEl.style.setProperty("--grid-cols", String(cols));
