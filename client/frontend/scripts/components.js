@@ -691,12 +691,12 @@
 
       // Three testing-oriented encoder tuning knobs (`edit_destination`'s
       // `tune`/`quality_level`/`rate_control`) — same `pillSwitch` widget as
-      // the Absolute/Per-Stream bandwidth-mode toggle, one row each since a
-      // three-way row (Rate Control) wouldn't fit next to a two-way one
-      // cleanly. Each button click applies immediately, matching the
-      // Bitrate slider's auto-apply-on-change behavior above (there's no
-      // separate combined "Apply" action in this panel).
-      const editState = opts.editState || { tune: "low_latency", qualityLevel: "performance", rateControl: "constant" };
+      // the Absolute/Per-Stream bandwidth-mode toggle, one row each since
+      // these three-way rows (Quality Level, Rate Control) wouldn't fit next
+      // to a two-way one cleanly. Each button click applies immediately,
+      // matching the Bitrate slider's auto-apply-on-change behavior above
+      // (there's no separate combined "Apply" action in this panel).
+      const editState = opts.editState || { tune: "best_quality", qualityLevel: "balanced", rateControl: "constant" };
       const applyTuning = (patch) => handlers.onEditApply && handlers.onEditApply(dest.destination_id, patch);
 
       const tuneRow = el("div", { className: "dest-edit-row" });
@@ -719,6 +719,7 @@
         pillSwitch(
           [
             { value: "performance", label: "Performance" },
+            { value: "balanced", label: "Balanced" },
             { value: "quality", label: "Quality" },
           ],
           editState.qualityLevel,

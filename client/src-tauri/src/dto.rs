@@ -265,6 +265,7 @@ pub fn parse_tune_mode(s: &str) -> Result<TuneMode, String> {
 pub fn parse_quality_level(s: &str) -> Result<QualityLevel, String> {
     match s {
         "performance" => Ok(QualityLevel::Performance),
+        "balanced" => Ok(QualityLevel::Balanced),
         "quality" => Ok(QualityLevel::Quality),
         other => Err(format!("unknown quality level: {other}")),
     }

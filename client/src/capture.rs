@@ -253,6 +253,7 @@ impl EncoderBackend {
                 };
                 let speed_preset = match quality_level {
                     QualityLevel::Performance => "ultrafast",
+                    QualityLevel::Balanced => "medium",
                     QualityLevel::Quality => "veryslow",
                 };
                 // x264enc has no rate-control *enum* like vah264enc's — its
@@ -294,6 +295,7 @@ impl EncoderBackend {
                 let _ = tune;
                 let target_usage = match quality_level {
                     QualityLevel::Performance => 7,
+                    QualityLevel::Balanced => 4,
                     QualityLevel::Quality => 1,
                 };
                 let rate_control_value = match rate_control {
@@ -338,12 +340,17 @@ impl EncoderBackend {
 /// resolution/fps/backend change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TuneMode {
-    /// x264enc `tune=zerolatency`. Matches this pipeline's previous
-    /// hardcoded behavior, so this is the default.
-    #[default]
+    /// x264enc `tune=zerolatency`. Opt in explicitly when low latency matters
+    /// more than compression efficiency.
     LowLatency,
     /// No `tune` property set — x264enc's general-purpose rate/distortion
-    /// tuning, trading some latency for better compression.
+    /// tuning, trading some latency for better compression. The default:
+    /// the original product requirement was "low latency should be an
+    /// option, but quality also has to be achievable — by default a good
+    /// mix", and a few tens of milliseconds of extra latency in exchange for
+    /// meaningfully better compression is a better out-of-the-box tradeoff
+    /// for most streams than defaulting to the latency extreme.
+    #[default]
     BestQuality,
 }
 
@@ -354,10 +361,17 @@ pub enum TuneMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum QualityLevel {
     /// x264enc `speed-preset=ultrafast` / vah264enc `target-usage=7` — the
-    /// fastest, lowest-quality end of both scales. Matches this pipeline's
-    /// previous hardcoded defaults, so this is the default.
-    #[default]
+    /// fastest, lowest-quality end of both scales. An explicit opt-in for
+    /// callers that need to minimize encode CPU cost above all else.
     Performance,
+    /// x264enc `speed-preset=medium` / vah264enc `target-usage=4` — the
+    /// midpoint of both scales (x264's own upstream default preset is
+    /// `medium`). The default: per the "good mix" product requirement (see
+    /// [`TuneMode`]'s doc comment), neither speed nor quality extreme should
+    /// be the out-of-the-box behavior — this sits between [`Self::Performance`]
+    /// and [`Self::Quality`].
+    #[default]
+    Balanced,
     /// x264enc `speed-preset=veryslow` / vah264enc `target-usage=1` — the
     /// slowest, best-quality end of both scales.
     Quality,
@@ -1428,9 +1442,9 @@ async fn start_sharing_with_source(
         // silently falls back to software per branch if this machine's VAAPI
         // can't actually run another concurrent encode session.
         backend: detect_encoder_backend(),
-        // Defaults matching this pipeline's previous hardcoded encoder
-        // properties exactly — see `TuneMode`/`QualityLevel`/
-        // `RateControlMode`'s `#[default]` doc comments.
+        // "Good mix" defaults, not this pipeline's old hardcoded low-latency
+        // extreme — see `TuneMode`/`QualityLevel`/`RateControlMode`'s
+        // `#[default]` doc comments.
         tune: TuneMode::default(),
         quality_level: QualityLevel::default(),
         rate_control: RateControlMode::default(),
@@ -3496,7 +3510,7 @@ pub mod destination {
             let source = SourceCaps { width: 1920, height: 1080, framerate: 60 };
             let from = params(30);
             assert_eq!(
-                classify_change(source, from, VideoParams { tune: TuneMode::BestQuality, ..from }),
+                classify_change(source, from, VideoParams { tune: TuneMode::LowLatency, ..from }),
                 ChangeTier::BranchSwap
             );
             assert_eq!(
@@ -4410,8 +4424,20 @@ pub mod branch {
                 framerate: 15,
                 bitrate_kbps: 500,
                 backend: EncoderBackend::Software,
-                tune: TuneMode::default(),
-                quality_level: QualityLevel::default(),
+                // Deliberately not `TuneMode`/`QualityLevel::default()`:
+                // these tests are exercising branch/pause/resume
+                // *mechanics*, not the tuning knobs, and need the encoder to
+                // reliably keep up in real time on a plain CI machine.
+                // `BestQuality` (no `tune=zerolatency`) lets x264enc hold
+                // frames in its lookahead/B-frame buffer before emitting any
+                // output at all, and `Balanced`'s `medium` preset is
+                // measurably slower than `ultrafast` — both were observed to
+                // starve these short real-time pipelines of frames within
+                // the test's time budget. Pin the fast/low-latency end
+                // explicitly so this stays deterministic regardless of what
+                // `TuneMode`/`QualityLevel`'s defaults are.
+                tune: TuneMode::LowLatency,
+                quality_level: QualityLevel::Performance,
                 rate_control: RateControlMode::default(),
             }
         }
@@ -5921,6 +5947,14 @@ mod tests {
         // avoids hardcoding the underlying integer value.
         assert_eq!(performance.property_value("speed-preset").serialize().unwrap(), "ultrafast");
 
+        let balanced = build_encoder_element(
+            EncoderBackend::Software,
+            TuneMode::default(),
+            QualityLevel::Balanced,
+            RateControlMode::default(),
+        );
+        assert_eq!(balanced.property_value("speed-preset").serialize().unwrap(), "medium");
+
         let quality = build_encoder_element(
             EncoderBackend::Software,
             TuneMode::default(),
@@ -5941,6 +5975,14 @@ mod tests {
             RateControlMode::default(),
         );
         assert_eq!(vaapi_performance.property::<u32>("target-usage"), 7);
+
+        let vaapi_balanced = build_encoder_element(
+            EncoderBackend::Vaapi,
+            TuneMode::default(),
+            QualityLevel::Balanced,
+            RateControlMode::default(),
+        );
+        assert_eq!(vaapi_balanced.property::<u32>("target-usage"), 4);
 
         let vaapi_quality = build_encoder_element(
             EncoderBackend::Vaapi,
@@ -6050,11 +6092,19 @@ mod tests {
         // A huge GOP so nothing but the very first frame is a keyframe
         // within this test's short run, isolating the force-key-unit
         // event's effect from x264enc's own periodic keyframing.
+        //
+        // `TuneMode::LowLatency`/`QualityLevel::Performance`, not
+        // `::default()`: this is a real-time pipeline mechanics test (valve
+        // gating / forced keyframes), not a tuning-knob test — it needs the
+        // encoder to emit output immediately and keep up in real time, which
+        // `BestQuality`'s lookahead/B-frame buffering and `Balanced`'s
+        // `medium` preset were both observed to not reliably do on a plain
+        // CI machine (see `small_settings`'s `Why:` note above).
         let encoder = backend.launch_fragment(
             DEFAULT_BITRATE_KBPS,
             10_000,
-            TuneMode::default(),
-            QualityLevel::default(),
+            TuneMode::LowLatency,
+            QualityLevel::Performance,
             RateControlMode::default(),
         );
         let raw_format = backend.raw_format();
@@ -6380,7 +6430,12 @@ mod tests {
         // rate under test) makes the branch's `videorate` — not the source's
         // own delivery rate — the thing actually being measured, mirroring
         // how a real portal source can deliver well above the configured rate
-        // under motion.
+        // under motion. `TuneMode::LowLatency`/`QualityLevel::Performance`
+        // are pinned explicitly below (not `::default()`) for the same
+        // reason: this test measures real-time output rate, and
+        // `BestQuality`'s lookahead buffering / `Balanced`'s `medium` preset
+        // were observed to starve it of frames on a plain CI machine (see
+        // `branch::tests::small_settings`'s `Why:` note).
         let source = "videotestsrc is-live=true pattern=smpte \
              ! video/x-raw,width=64,height=64,framerate=60/1";
 
@@ -6400,8 +6455,8 @@ mod tests {
                     framerate: configured_fps,
                     bitrate_kbps: DEFAULT_BITRATE_KBPS,
                     backend: EncoderBackend::Software,
-                    tune: TuneMode::default(),
-                    quality_level: QualityLevel::default(),
+                    tune: TuneMode::LowLatency,
+                    quality_level: QualityLevel::Performance,
                     rate_control: RateControlMode::default(),
                 },
             )
