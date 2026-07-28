@@ -382,10 +382,10 @@
 
     const row = el("div", { className: "stream-row" });
     row.appendChild(el("span", { className: "status-dot " + meta.dotClass }));
-    if (stream.kind === "audio") row.appendChild(icon("volume_up", "stream-audio-glyph"));
     row.appendChild(el("span", { className: "stream-label", text: stream.room_label }));
-    const metaText = meta.label || (stream.bitrate_kbps ? `${stream.bitrate_kbps} kbps` : `${stream.width}x${stream.height}@${stream.framerate}`);
+    const metaText = meta.label || (stream.kind === "audio" ? "" : `${stream.width}×${stream.height} @ ${stream.framerate}fps`);
     row.appendChild(el("span", { className: "stream-meta", text: metaText }));
+    if (stream.kind === "audio") row.appendChild(icon("volume_up", "stream-audio-glyph"));
     row.appendChild(
       iconButton("stop_circle", () => handlers.onStop && handlers.onStop(stream.destination_id), {
         title: "Stop",
