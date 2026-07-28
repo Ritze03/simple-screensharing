@@ -558,6 +558,27 @@
       stagedEditState.delete(captureId);
       mockStagedCaptures = await fetchStagedCaptures();
       mockDestinations = await fetchActiveDestinations();
+      // Seed the edit buffer `getDestEdit` would otherwise lazily default to
+      // "best_quality"/"balanced"/"constant" for the destination that just
+      // appeared, so the live card's Preset/Advanced-tuning controls reflect
+      // what was actually picked on the staged card, instead of the
+      // hardcoded fallback — `DestinationRow` (the DTO `fetchActiveDestinations`
+      // reads) has no tune/quality_level/rate_control fields, so this is the
+      // only place the frontend can recover them from. `go_live` attaches
+      // exactly one new destination per call (see `session::AppState::
+      // go_live`), so matching on `capture_id` is unambiguous.
+      for (const dest of mockDestinations) {
+        if (dest.capture_id === captureId && dest.kind === "video") {
+          destEditState.set(dest.destination_id, {
+            bitrateKbps: edit.bitrateKbps,
+            framerate: edit.framerate,
+            tune: edit.tune,
+            qualityLevel: edit.qualityLevel,
+            rateControl: edit.rateControl,
+            error: null,
+          });
+        }
+      }
       render();
       return;
     }
@@ -1211,8 +1232,8 @@
     // Seed the edit buffer `getDestEdit` would otherwise lazily default to
     // "best_quality"/"balanced"/"constant" — so the mock destination card's
     // Preset/Advanced-tuning controls reflect what was actually picked on
-    // the staged card, same as the real Tauri branch does via `set_tune`/
-    // `set_quality_level`/`set_rate_control` before `go_live`.
+    // the staged card, same as the real Tauri branch does (see the matching
+    // `destEditState.set(...)` in `goLive`, above).
     destEditState.set(newDest.destination_id, {
       bitrateKbps: edit.bitrateKbps,
       framerate: edit.framerate,
