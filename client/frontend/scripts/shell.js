@@ -81,7 +81,9 @@
     },
   ];
 
-  let mockStreams = [{ destination_id: 1, capture_id: 1, room_handle: 1, kind: "video", room_label: "Movie Night", width: 1920, height: 1080, framerate: 30 }];
+  let mockStreams = [
+    { destination_id: 1, capture_id: 1, room_handle: 1, kind: "video", room_label: "Movie Night", state: "live", width: 1920, height: 1080, framerate: 30, bitrate_kbps: 6000 },
+  ];
 
   // ---------------------------------------------------------------------
   // UI state (frontend-only; not persisted, matches the "no cross-session
@@ -172,6 +174,8 @@
 
   function renderRooms() {
     const list = document.getElementById("rooms-list");
+    const count = document.getElementById("rooms-count");
+    if (count) count.textContent = mockRooms.length > 0 ? String(mockRooms.length) : "";
     list.innerHTML = "";
 
     if (mockRooms.length === 0) {
@@ -474,7 +478,14 @@
   }
 
   // ---------------------------------------------------------------------
-  // STREAMS section
+  // STREAMS / "OUTGOING" section — sidebar-redesign (option 1c) restyled
+  // this in place rather than building a new section: it already sourced
+  // its data from the real `list_active_streams` command (the same DTO
+  // `stream-control.js`'s Active Shares grid reads via its own
+  // `fetchActiveDestinations()`), already returned one row per active
+  // outgoing DESTINATION (not per capture — a capture fanned out to N rooms
+  // already produced N rows here), and was already cross-room per
+  // APP-SHELL.md's STREAMS section doc. Only the row markup/labels changed.
   // ---------------------------------------------------------------------
 
   function renderStreams() {
@@ -488,7 +499,22 @@
       );
       return;
     }
-    mockStreams.forEach((s) => list.appendChild(renderStreamRow(s)));
+    mockStreams.forEach((s) => list.appendChild(renderStreamRow(s, { onStop: (destinationId) => stopDestination(destinationId) })));
+  }
+
+  /** Sidebar's lighter-weight entry point onto the same real `stop_destination`
+   * command `stream-control.js`'s own Stop button calls (see that file's
+   * `stopDestination`) — not a second copy of any stop logic, just another
+   * caller of the one command. */
+  async function stopDestination(destinationId) {
+    if (window.__TAURI__) {
+      await window.__TAURI__.core.invoke("stop_destination", { destinationId });
+      await refreshStreams();
+      if (window.StreamControl) window.StreamControl.refresh();
+      return;
+    }
+    mockStreams = mockStreams.filter((s) => s.destination_id !== destinationId);
+    renderStreams();
   }
 
   // Dev-only affordance so both the populated and empty STREAMS states are
@@ -501,7 +527,10 @@
       return;
     }
     toggle.addEventListener("click", () => {
-      mockStreams = mockStreams.length === 0 ? [{ destination_id: 1, capture_id: 1, room_handle: 1, kind: "video", room_label: "Movie Night", width: 1920, height: 1080, framerate: 30 }] : [];
+      mockStreams =
+        mockStreams.length === 0
+          ? [{ destination_id: 1, capture_id: 1, room_handle: 1, kind: "video", room_label: "Movie Night", state: "live", width: 1920, height: 1080, framerate: 30, bitrate_kbps: 6000 }]
+          : [];
       renderStreams();
     });
   }

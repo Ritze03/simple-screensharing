@@ -229,6 +229,19 @@
    *   no single DTO inlines both): [{conn_id, display_name, owner, stream_id,
    *   resolution, watching}].
    * @param {object} handlers - { expanded, onToggleExpand, onReconnect, onLeave, onWatch }
+   *
+   * Per the sidebar-redesign handoff (option 1c): every state renders through
+   * ONE fixed row skeleton — `[dot][caret/reconnect][name][meta, right-
+   * aligned][action]` — rather than each state inventing its own layout. Only
+   * the *content* of the caret/meta/action slots changes per state; the slots
+   * themselves are always present (even empty, as a spacer) so columns stay
+   * aligned down the whole ROOMS list regardless of which states are mixed
+   * in. This replaces the previous two-line "disconnected" layout (Reconnect
+   * pill + forget button on a sub-line) — that variance existed only because
+   * the old design put a *labeled* Reconnect button next to a
+   * possibly-long auto-generated name; the redesign's single reconnect
+   * *icon* (↩) in the caret slot is narrow enough to keep everything on one
+   * line without crowding the name out.
    */
   function renderRoomRow(room, handlers) {
     handlers = handlers || {};
@@ -237,6 +250,10 @@
 
     const head = el("div", { className: "room-row-head" });
 
+    head.appendChild(statusDot(room.state));
+
+    // Caret slot: expand/collapse toggle (joined), reconnect (disconnected),
+    // or an empty spacer (reconnecting — "nothing to click while connecting").
     if (room.state === "joined") {
       head.appendChild(
         el("button", {
@@ -245,56 +262,39 @@
           attrs: { "aria-label": expanded ? "Collapse" : "Expand" },
         }, [icon(expanded ? "expand_more" : "chevron_right")])
       );
+    } else if (room.state === "disconnected") {
+      head.appendChild(
+        el("button", {
+          className: "room-caret room-caret-reconnect",
+          onClick: () => handlers.onReconnect && handlers.onReconnect(room.join_string),
+          attrs: { "aria-label": "Reconnect", title: "Reconnect" },
+        }, [icon("restart_alt")])
+      );
     } else {
       head.appendChild(el("span", { className: "room-caret room-caret-spacer" }));
     }
 
-    head.appendChild(statusDot(room.state));
     head.appendChild(el("span", { className: "room-name", text: room.name }));
 
-    // Trailing content deliberately carries only short/fixed-width chips +
-    // buttons, never the free-text state body — see the sub-line appended
-    // below. `theme.rs`'s reference table puts the "not connected" body text
-    // right next to the name on one line, which reads fine in the handoff's
-    // proportional-font mockup; Geist Mono is a monospace face (much wider
-    // per character), so the same text on one line squeezed the room name
-    // down to nothing at the sidebar's width. Two lines is a deliberate,
-    // documented deviation from the mock, not a missed detail.
-    //
-    // For "disconnected" rows specifically, the Reconnect pill + forget
-    // button are *also* left off this head line (moved into the sub-meta
-    // line below instead of appended to `trailing` here): the auto-generated
-    // fallback room name (`Room <hex prefix>`, APP-SHELL.md's "Auto-generated
-    // saved-room names") is exactly the one case where a room can't be told
-    // apart from another without its full name, and at the sidebar's width a
-    // name that long plus a Reconnect pill plus the forget icon left no room
-    // for the name at all — it ellipsized down to an unreadable "Room
-    // 01130…", losing the one distinguishing suffix. Every other row shape
-    // (joined, reconnecting) keeps its trailing content on the head line as
-    // before; only disconnected rows needed the extra line, since only they
-    // pair a Reconnect pill with a name that's allowed to be this long.
-    const trailing = el("div", { className: "room-row-trailing" });
-    if (room.state === "joined") {
-      trailing.appendChild(el("span", { className: "room-meta", text: room.active_stream_count + " active" }));
-      trailing.appendChild(iconButton("close", () => handlers.onLeave && handlers.onLeave(room.join_string), { title: "Leave room" }));
-      head.appendChild(trailing);
-    } else if (room.state === "reconnecting") {
-      // Per APP-SHELL.md's row-state table, "Reconnecting" has no body text
-      // at all (—) — the pulsing dot alone carries the state.
-      trailing.appendChild(secondaryButton("Reconnect", () => {}, { disabled: true, className: "room-reconnect-btn" }));
-      head.appendChild(trailing);
-    }
-    row.appendChild(head);
+    // Meta slot: short, fixed-width, right-aligned status text — never the
+    // free-text state body (that would fight the name for width on this
+    // monospace, narrow-sidebar layout).
+    let metaText = "—";
+    if (room.state === "joined") metaText = room.active_stream_count + " active";
+    else if (room.state === "disconnected") metaText = "not connected";
+    head.appendChild(el("span", { className: "room-meta", text: metaText }));
 
-    if (room.state === "disconnected") {
-      const subMeta = el("div", { className: "room-sub-meta room-sub-meta-disconnected" });
-      subMeta.appendChild(el("span", { className: "room-sub-meta-text", text: "not connected" }));
-      const actions = el("div", { className: "room-row-trailing" });
-      actions.appendChild(secondaryButton("Reconnect", () => handlers.onReconnect && handlers.onReconnect(room.join_string), { className: "room-reconnect-btn" }));
-      actions.appendChild(iconButton("close", () => handlers.onLeave && handlers.onLeave(room.join_string), { title: "Forget room" }));
-      subMeta.appendChild(actions);
-      row.appendChild(subMeta);
+    // Action slot: leave (joined), forget (disconnected), or empty (nothing
+    // to act on mid-reconnect). Always present so the column stays aligned.
+    const actionSlot = el("span", { className: "room-action-slot" });
+    if (room.state === "joined") {
+      actionSlot.appendChild(iconButton("close", () => handlers.onLeave && handlers.onLeave(room.join_string), { title: "Leave room", className: "room-row-action-btn" }));
+    } else if (room.state === "disconnected") {
+      actionSlot.appendChild(iconButton("delete", () => handlers.onLeave && handlers.onLeave(room.join_string), { title: "Forget room", className: "room-row-action-btn" }));
     }
+    head.appendChild(actionSlot);
+
+    row.appendChild(head);
 
     if (room.state === "joined" && expanded) {
       const memberList = el("div", { className: "room-members" });
@@ -328,19 +328,49 @@
   // Stream row — the sidebar STREAMS section's per-destination row.
   // -------------------------------------------------------------------
 
+  /** Maps `capture::DestinationState`'s variants to the sidebar OUTGOING
+   * row's dot color + short meta label — same 4-family status vocabulary as
+   * `statusBadge`/`destinationCard` (status.css), just a plain dot instead of
+   * a pill (this row is dense enough that a full badge would crowd the
+   * bitrate/room-label columns). */
+  const OUTGOING_STATE_META = {
+    starting: { label: "STARTING", dotClass: "status-dot-progress" },
+    rebuilding: { label: "APPLYING", dotClass: "status-dot-progress" },
+    live: { label: null, dotClass: "status-dot-live" },
+    stalled: { label: "STALLED", dotClass: "status-dot-degraded" },
+    failed: { label: "FAILED", dotClass: "status-dot-failed" },
+  };
+
   /**
-   * @param {object} stream - a `DestinationRow` DTO shape { kind: 'video'|'audio',
-   *   width, height, framerate }, plus a frontend-only `room_label` (looked up from
-   *   the room's `SavedRoomRow.name` by `room_handle` — `DestinationRow` itself only
-   *   carries the numeric handle, not a display name).
+   * One row per active OUTGOING destination (the sidebar's cross-room
+   * "STREAMS"/"OUTGOING" section — see APP-SHELL.md's STREAMS section doc).
+   * Follows the same fixed row skeleton as `renderRoomRow`:
+   * `[dot][room/destination label][meta, right-aligned][stop, hover-reveal]`.
+   *
+   * @param {object} stream - a `DestinationRow` DTO shape { destination_id, kind:
+   *   'video'|'audio', state: 'starting'|'live'|'rebuilding'|'stalled'|'failed',
+   *   width, height, framerate, bitrate_kbps }, plus a frontend-only `room_label`
+   *   (looked up from the room's `SavedRoomRow.name` by `room_handle` —
+   *   `DestinationRow` itself only carries the numeric handle, not a display name).
+   * @param {object} [handlers] - { onStop(destinationId) } — calls the same real
+   *   `stop_destination` command `stream-control.js`'s own Stop button uses; this
+   *   is just a lighter-weight sidebar entry point onto that one command, not a
+   *   second copy of any stop logic.
    */
-  function renderStreamRow(stream) {
+  function renderStreamRow(stream, handlers) {
+    handlers = handlers || {};
+    const meta = OUTGOING_STATE_META[stream.state] || { label: null, dotClass: "status-dot-live" };
+
     const row = el("div", { className: "stream-row" });
+    row.appendChild(el("span", { className: "status-dot " + meta.dotClass }));
     if (stream.kind === "audio") row.appendChild(icon("volume_up", "stream-audio-glyph"));
+    row.appendChild(el("span", { className: "stream-label", text: stream.room_label }));
+    const metaText = meta.label || (stream.bitrate_kbps ? `${stream.bitrate_kbps} kbps` : `${stream.width}x${stream.height}@${stream.framerate}`);
+    row.appendChild(el("span", { className: "stream-meta", text: metaText }));
     row.appendChild(
-      el("span", {
-        className: "stream-label",
-        text: `${stream.room_label}: ${stream.width}x${stream.height}@${stream.framerate}`,
+      iconButton("stop_circle", () => handlers.onStop && handlers.onStop(stream.destination_id), {
+        title: "Stop",
+        className: "stream-stop-btn",
       })
     );
     return row;
