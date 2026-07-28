@@ -712,6 +712,24 @@
 
     const wrap = el("div", { className: "media-tile" });
 
+    // Double-click to fullscreen this tile in the *current* window (2026-07-28)
+    // — distinct from `popOutWatch` above, which opens a whole separate OS
+    // window. This is the plain Web Fullscreen API (`Element.
+    // requestFullscreen`/`document.exitFullscreen`): a second dblclick while
+    // already fullscreen exits it, and the browser's native Escape handling
+    // exits it too (nothing in this file's or `shell.js`'s `keydown`
+    // listeners calls `preventDefault()` on Escape, so that native behavior
+    // is untouched). `requestFullscreen()` returns a `Promise` that can
+    // reject (e.g. denied by the browser/security context) — caught here so
+    // that never surfaces as an unhandled-rejection console error.
+    wrap.addEventListener("dblclick", () => {
+      if (document.fullscreenElement === wrap) {
+        document.exitFullscreen().catch(() => {});
+      } else if (wrap.requestFullscreen) {
+        wrap.requestFullscreen().catch(() => {});
+      }
+    });
+
     if (tile.state === "stalled") {
       const placeholder = el("div", { className: "media-tile-placeholder media-tile-waiting" });
       placeholder.appendChild(el("div", { className: "media-tile-waiting-accent" }));
@@ -739,7 +757,7 @@
       wrap.appendChild(errorPlaceholder);
       tile.onFps = (fps) => {
         const span = fpsSpans.get(tile.id);
-        if (span) span.textContent = `@${Math.round(fps)}fps`;
+        if (span) span.textContent = ` @${Math.round(fps)}fps`;
       };
       window.TileVideo.startTileVideo(tile, canvas, errorPlaceholder);
     } else {
@@ -765,8 +783,21 @@
     const overlay = el("div", { className: "media-tile-overlay" });
 
     const top = el("div", { className: "media-tile-overlay-top" });
+    // Title + fps read as one continuous string ("Ana · Movie Night ·
+    // 1920x1080 @30fps") — the fps is a separate `<span>` immediately after
+    // the title text (not folded into the same text node) so `tile.onFps`
+    // and `updateStats` below can keep patching just that span's text in
+    // place ~4x/sec (or on `startTileVideo`'s own faster interval) without
+    // rebuilding the title or the tile. `.media-tile-overlay-title-wrap`
+    // groups both spans as one flex item so they still sit together at the
+    // left of `.media-tile-overlay-top`, opposite the actions.
+    const titleWrap = el("div", { className: "media-tile-overlay-title-wrap" });
     const titleText = tile.resolution ? `${tile.ownerLabel} · ${tile.roomLabel} · ${tile.resolution}` : `${tile.ownerLabel} · ${tile.roomLabel}`;
-    top.appendChild(el("span", { className: "media-tile-overlay-title", text: titleText }));
+    titleWrap.appendChild(el("span", { className: "media-tile-overlay-title", text: titleText }));
+    const fpsSpan = el("span", { className: "media-tile-fps", text: tile.fps ? ` @${tile.fps}fps` : "" });
+    titleWrap.appendChild(fpsSpan);
+    top.appendChild(titleWrap);
+    if (tile.id) fpsSpans.set(tile.id, fpsSpan);
 
     const actions = el("div", { className: "media-tile-overlay-actions" });
     actions.appendChild(
@@ -799,10 +830,8 @@
     top.appendChild(actions);
     overlay.appendChild(top);
 
-    // Bottom bar — right-aligned fps stats (1e spec). Separate `<span>` so
-    // `updateStats` (below, fed by the `stream-stats-updated` event) can
-    // patch just this text node ~4x/sec without touching (and
-    // re-flickering) the rest of the tile.
+    // Bottom bar — audio control only now (fps moved up next to the
+    // resolution in the title, 2026-07-28 — see `titleWrap` above).
     const bottom = el("div", { className: "media-tile-overlay-bottom" });
 
     // Audio control — present only when this sender is actually sharing
@@ -876,10 +905,7 @@
       bottom.appendChild(audioGroup);
     }
 
-    const fpsSpan = el("span", { className: "media-tile-fps", text: tile.fps ? `@${tile.fps}fps` : "" });
-    bottom.appendChild(fpsSpan);
     overlay.appendChild(bottom);
-    if (tile.id) fpsSpans.set(tile.id, fpsSpan);
 
     wrap.appendChild(overlay);
 
@@ -938,7 +964,7 @@
       if (window.TileVideo.hasController(id)) continue;
       const span = fpsSpans.get(id);
       if (!span) continue;
-      span.textContent = `@${Math.round(w.received_fps)}fps`;
+      span.textContent = ` @${Math.round(w.received_fps)}fps`;
     }
   }
 
