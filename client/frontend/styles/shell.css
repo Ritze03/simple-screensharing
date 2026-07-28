@@ -346,6 +346,75 @@ input {
 }
 
 /* -------------------------------------------------------------------
+ * Member/LIVE tree — one row per current member of a joined room,
+ * indented below the room's own head row. Replaces the old "{count}
+ * active" meta-slot summary (2026-07-28) — see `renderRoomRow`'s doc
+ * comment (components.js).
+ * ----------------------------------------------------------------- */
+
+.room-member-tree {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  /* Lines up under `.room-name`, past the dot/caret columns to its left
+     (statusDot + caret, ~21px) plus the head's own gap. */
+  padding: 2px 0 2px 21px;
+}
+
+.room-member-tree-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 16px;
+}
+
+.room-member-tree-name {
+  flex: 1 1 auto;
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.room-member-tree-name::before {
+  content: "- ";
+  color: var(--text-faint);
+}
+
+/* Same pill shape/weight as the "Stop" destination-card action button
+   (`.btn.btn-danger.dest-action-btn`, stream-control.css: `padding: 3px
+   8px`, `.btn`'s `border-radius: var(--rounding-md)`) — a red-bordered,
+   red-text outline pill — but with a dot + "LIVE" instead of an icon +
+   "Stop" label, and a genuine red dot (not this app's usual green
+   `--success` live color) per an explicit "red dot" request for this
+   element specifically. */
+.room-member-live-badge {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  border-radius: var(--rounding-md);
+  border: 1px solid var(--danger-border);
+  color: var(--danger);
+  font-size: 9.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.room-member-live-dot {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--danger);
+}
+
+/* -------------------------------------------------------------------
  * Status dot — three states.
  * ----------------------------------------------------------------- */
 
@@ -368,8 +437,6 @@ input {
 .status-dot-disconnected {
   background: transparent;
   border: 1.5px solid var(--text-faint);
-  width: calc(var(--dot-size) - 3px);
-  height: calc(var(--dot-size) - 3px);
 }
 
 .status-dot-reconnecting {

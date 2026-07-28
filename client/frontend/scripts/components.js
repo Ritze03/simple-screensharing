@@ -260,9 +260,12 @@
   /**
    * @param {object} room - a `SavedRoomRow` DTO shape { name, join_string, state:
    *   'joined'|'disconnected'|'reconnecting', room_handle, active_stream_count },
-   *   plus a frontend-only `members` array (fetched separately via `room_detail` —
-   *   no single DTO inlines both): [{conn_id, display_name, owner, stream_id,
-   *   resolution, watching}].
+   *   plus two frontend-only arrays populated together via `room_detail` (no
+   *   single DTO inlines any of this — see `loadRoomMembers`, shell.js):
+   *   `members`: [{conn_id, display_name, owner, stream_id, resolution,
+   *   watching}], and `streams`: every announced stream in the room
+   *   ([{owner, stream_id, kind, ...}]) — used here only to test "does this
+   *   member's `conn_id` own an entry" for the `[LIVE]` badge.
    * @param {object} handlers - { onOpenRoom, onReconnect, onLeave }
    *
    * Per the sidebar-redesign handoff (option 1c): every state renders through
@@ -279,20 +282,29 @@
    * line without crowding the name out.
    *
    * `Why:` (room-detail-slide-over pass, option 1f) a joined row no longer
-   * expands inline to show its member list — clicking anywhere on a joined
-   * row's head (or its caret specifically) now calls `handlers.onOpenRoom`
-   * to open the room-detail slide-over panel instead (see shell.js's
-   * `openRoomPanel`/`renderRoomPanel`), which owns the member list, rename,
-   * audio-share and leave actions this row used to spill into an inline
-   * `.room-members` block. Deliberate UX call: the WHOLE row is clickable
-   * (not just the caret) since "click a room to see its detail" is the more
-   * discoverable target on a dense sidebar list, while the row's own
-   * leave/forget icon-button in the action slot stays as a fast path that
-   * does NOT open the panel first (its own click handler stops propagation)
-   * — a user who already knows they want to leave shouldn't be forced
-   * through the panel to do it. Disconnected/reconnecting rows never open
-   * the panel (there's no live `room_handle`/roster to show for a room
+   * expands inline on click to show its member list — clicking anywhere on
+   * a joined row's head (or its caret specifically) now calls
+   * `handlers.onOpenRoom` to open the room-detail slide-over panel instead
+   * (see shell.js's `openRoomPanel`/`renderRoomPanel`), which owns rename,
+   * audio-share and leave actions. Deliberate UX call: the WHOLE row is
+   * clickable (not just the caret) since "click a room to see its detail"
+   * is the more discoverable target on a dense sidebar list, while the
+   * row's own leave/forget icon-button in the action slot stays as a fast
+   * path that does NOT open the panel first (its own click handler stops
+   * propagation) — a user who already knows they want to leave shouldn't be
+   * forced through the panel to do it. Disconnected/reconnecting rows never
+   * open the panel (there's no live `room_handle`/roster to show for a room
    * that's not joined) — `onOpenRoom` is only wired for `state === "joined"`.
+   *
+   * `Why:` (2026-07-28, member/LIVE tree pass) the row's meta slot used to
+   * show a `"{count} active"` summary; it's now always shown below the row
+   * itself, one line per current member, each carrying a `[LIVE]` pill if
+   * that member owns a stream in `room.streams` — the same per-stream
+   * roster `renderRoomPanelStreamRow` (shell.js) already reads for the
+   * panel's "Live streams" section, reused here rather than re-derived. See
+   * `superdoc/features/stream-control.md`'s 2026-07-28 note for the
+   * eager-roster-fetch tradeoff this required in `shell.js`'s
+   * `refreshRooms`.
    */
   function renderRoomRow(room, handlers) {
     handlers = handlers || {};
@@ -337,10 +349,12 @@
 
     // Meta slot: short, fixed-width, right-aligned status text — never the
     // free-text state body (that would fight the name for width on this
-    // monospace, narrow-sidebar layout).
+    // monospace, narrow-sidebar layout). Joined rooms used to show a
+    // `"{count} active"` summary here; that's now the member/LIVE tree
+    // appended below the row instead (see this function's doc comment), so
+    // joined falls through to the "—" default.
     let metaText = "—";
-    if (room.state === "joined") metaText = room.active_stream_count + " active";
-    else if (room.state === "disconnected") metaText = "not connected";
+    if (room.state === "disconnected") metaText = "not connected";
     head.appendChild(el("span", { className: "room-meta", text: metaText }));
 
     // Action slot: leave (joined), forget (disconnected), or empty (nothing
@@ -374,6 +388,31 @@
     head.appendChild(actionSlot);
 
     row.appendChild(head);
+
+    // Member/LIVE tree — one indented row per current member of a joined
+    // room, LIVE-badged if that member owns a stream in `room.streams`
+    // (populated by `loadRoomMembers`, same source `renderRoomPanelStreamRow`
+    // reads for the panel's "Live streams" section — reused here, not
+    // re-derived). Disconnected/reconnecting rooms never have a live roster
+    // to show (`room.members` is only populated for joined rooms).
+    if (room.state === "joined" && (room.members || []).length > 0) {
+      const liveOwners = new Set((room.streams || []).map((s) => s.owner));
+      const tree = el("div", { className: "room-member-tree" });
+      room.members.forEach((m) => {
+        const memberRow = el("div", { className: "room-member-tree-row" });
+        memberRow.appendChild(el("span", { className: "room-member-tree-name", text: m.display_name }));
+        if (liveOwners.has(m.conn_id)) {
+          memberRow.appendChild(
+            el("span", { className: "room-member-live-badge" }, [
+              el("span", { className: "room-member-live-dot" }),
+              el("span", { text: "LIVE" }),
+            ])
+          );
+        }
+        tree.appendChild(memberRow);
+      });
+      row.appendChild(tree);
+    }
 
     return row;
   }
