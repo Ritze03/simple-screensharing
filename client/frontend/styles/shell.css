@@ -1099,14 +1099,50 @@ input[type="range"]:focus-visible::-webkit-slider-thumb {
   gap: 8px;
 }
 
-.room-panel-title {
+/* Wraps the title span (or, while editing, the input + privacy note) so
+   the header-top flex row always has one flex item here regardless of
+   which state it's in. */
+.room-panel-title-wrap {
   flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* Click-to-edit affordance: same hover-highlight language as
+   `.btn-secondary`/`.btn-icon`/`.room-row` (`var(--wash-hover-1)`), plus a
+   pointer cursor so the plain-looking text doesn't read as inert. */
+.room-panel-title {
+  display: block;
+  margin: -2px -5px;
+  padding: 2px 5px;
+  border-radius: var(--rounding-sm);
   font-size: 16px;
   font-weight: 600;
   color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.12s ease;
+}
+
+.room-panel-title:hover,
+.room-panel-title:focus-visible {
+  background: var(--wash-hover-1);
+}
+
+.room-panel-title:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--accent-ring-inset, var(--accent));
+}
+
+.room-panel-title-input {
+  width: 100%;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.room-panel-title-privacy-note {
+  margin-top: 4px;
 }
 
 .room-panel-close {
@@ -1278,16 +1314,6 @@ input[type="range"]:focus-visible::-webkit-slider-thumb {
 
 .room-panel-checkbox-input:disabled + .room-panel-checkbox-box {
   opacity: 0.5;
-}
-
-.room-panel-rename-row {
-  display: flex;
-  gap: 8px;
-}
-
-.room-panel-rename-row .field-input {
-  flex: 1 1 auto;
-  min-width: 0;
 }
 
 .room-panel-privacy-note {
