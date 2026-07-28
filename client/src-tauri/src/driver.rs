@@ -323,8 +323,11 @@ fn tick(app_handle: &AppHandle, last: &mut Snapshot) {
     let mut watched = Vec::new();
     for (handle, room) in &state.rooms {
         for (&(owner, stream_id), entry) in room.watches.lock().unwrap().iter() {
-            let received_fps = entry.decoder.lock().unwrap().current_fps();
-            watched.push(dto::WatchedStatsDto { room_handle: handle.0, owner, stream_id, received_fps });
+            let mut decoder = entry.decoder.lock().unwrap();
+            let received_fps = decoder.current_fps();
+            let received_bitrate_kbps = decoder.received_bitrate_kbps();
+            drop(decoder);
+            watched.push(dto::WatchedStatsDto { room_handle: handle.0, owner, stream_id, received_fps, received_bitrate_kbps });
         }
     }
 

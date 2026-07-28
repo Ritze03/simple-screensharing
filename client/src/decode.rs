@@ -410,6 +410,58 @@ impl FpsCounter {
     }
 }
 
+/// Rolling received-throughput tracker for [`StreamDecoder::received_
+/// bitrate_kbps`] — same sliding-window shape as [`FpsCounter`] just above
+/// (timestamp + payload size instead of just a timestamp), reusing
+/// [`DECODE_FPS_WINDOW`] so the two live readouts (fps, bitrate) smooth over
+/// the same span and stay visually in sync on the View tab's tile overlay.
+///
+/// `Why measured here instead of read off the sender's encoder:` a viewer
+/// has no live channel back to the sender's `capture::branch::DestBranch`
+/// bitrate (that's cross-process, over the relay, and this decoder doesn't
+/// even know which of the sender's possibly-several destinations it is).
+/// Counting the compressed access-unit bytes this decoder actually receives
+/// is the only bitrate figure a *viewer* can honestly report, and it is
+/// arguably the more useful number anyway: it reflects what's actually
+/// arriving after any relay/network loss, not just what the sender is
+/// configured to emit.
+struct ByteRateCounter {
+    samples: VecDeque<(Instant, usize)>,
+}
+
+impl ByteRateCounter {
+    fn new() -> Self {
+        Self { samples: VecDeque::new() }
+    }
+
+    /// Record one newly-received access unit's compressed size in bytes.
+    fn record(&mut self, bytes: usize) {
+        let now = Instant::now();
+        self.samples.push_back((now, bytes));
+        self.prune(now);
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while let Some(&(oldest, _)) = self.samples.front() {
+            if now.duration_since(oldest) > DECODE_FPS_WINDOW {
+                self.samples.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Current received bitrate in kbps, averaged over the last
+    /// [`DECODE_FPS_WINDOW`]. Decays toward 0 the same way [`FpsCounter::
+    /// fps`] does if nothing new arrives.
+    fn kbps(&mut self) -> f64 {
+        let now = Instant::now();
+        self.prune(now);
+        let total_bytes: usize = self.samples.iter().map(|&(_, n)| n).sum();
+        (total_bytes as f64 * 8.0 / 1000.0) / DECODE_FPS_WINDOW.as_secs_f64()
+    }
+}
+
 /// Paces decoded video frames against their capture-time PTS instead of
 /// displaying each one the instant it finishes decoding.
 ///
@@ -675,6 +727,9 @@ pub struct StreamDecoder {
     thread: Option<thread::JoinHandle<()>>,
     /// Live viewer-side FPS tracker — see [`FpsCounter`]/[`Self::current_fps`].
     fps_counter: FpsCounter,
+    /// Live viewer-side received-bitrate tracker — see [`ByteRateCounter`]/
+    /// [`Self::received_bitrate_kbps`].
+    byte_counter: ByteRateCounter,
     /// When this decoder was created — the reference point for
     /// [`Self::is_stalled`] before any frame has ever arrived.
     created_at: Instant,
@@ -737,6 +792,7 @@ impl StreamDecoder {
             seen_keyframe: false,
             thread: Some(thread),
             fps_counter: FpsCounter::new(),
+            byte_counter: ByteRateCounter::new(),
             created_at: Instant::now(),
             last_frame_at: None,
             last_frame_stalled: false,
@@ -774,6 +830,12 @@ impl StreamDecoder {
         // GOP purely because it hasn't hit its first keyframe.
         self.last_frame_at = Some(Instant::now());
         self.last_frame_stalled = frame.stalled;
+        // Counted here, ahead of the pre-keyframe gate below, so the bitrate
+        // readout reflects real received network throughput even during the
+        // brief pre-keyframe window where frames are being dropped rather
+        // than decoded (matches `last_frame_at`'s same "arrival, not decode
+        // success" reasoning just above).
+        self.byte_counter.record(frame.payload.len());
         if !self.seen_keyframe {
             if !frame.keyframe {
                 return;
@@ -833,6 +895,16 @@ impl StreamDecoder {
     /// Intended for `ui.rs` to show next to the watched video panel.
     pub fn current_fps(&mut self) -> f64 {
         self.fps_counter.fps()
+    }
+
+    /// Live received bitrate in kbps — real compressed bytes arriving for
+    /// this stream, averaged over the last [`DECODE_FPS_WINDOW`]. See
+    /// [`ByteRateCounter`]'s doc comment for why this is receiver-measured
+    /// rather than read off the sender's configured encoder bitrate.
+    /// Intended for `ui.rs`/the View tab's tile overlay to show next to
+    /// `current_fps`.
+    pub fn received_bitrate_kbps(&mut self) -> f64 {
+        self.byte_counter.kbps()
     }
 
     /// Whether this stream should be shown with a "waiting for capture…"

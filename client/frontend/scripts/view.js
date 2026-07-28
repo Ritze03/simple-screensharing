@@ -88,17 +88,20 @@
   const MOCK_WATCHED = [
     // `hasAudio` mirrors the real branch's per-sender audio flag so a
     // plain-browser/Playwright run exercises both the with-audio and
-    // without-audio tile layouts.
-    { id: "w1", ownerLabel: "Ana", roomLabel: "Movie Night", resolution: "1920x1080", fps: 30, state: "live", hue: 220, hasAudio: true },
-    { id: "w2", ownerLabel: "Priya", roomLabel: "Book Club", resolution: "1280x720", fps: 60, state: "live", hue: 160, hasAudio: false },
-    { id: "w3", ownerLabel: "Sam", roomLabel: "Gaming Night", resolution: "1920x1080", fps: null, state: "stalled", hue: 0 },
+    // without-audio tile layouts. `bitrate` mirrors the real branch's
+    // `received_bitrate_kbps` (see `updateStats`/`dto::WatchedStatsDto`) —
+    // a static stand-in since there's no real decode pipeline to measure in
+    // the mock branch.
+    { id: "w1", ownerLabel: "Ana", roomLabel: "Movie Night", resolution: "1920x1080", fps: 30, bitrate: 4200, state: "live", hue: 220, hasAudio: true },
+    { id: "w2", ownerLabel: "Priya", roomLabel: "Book Club", resolution: "1280x720", fps: 60, bitrate: 2600, state: "live", hue: 160, hasAudio: false },
+    { id: "w3", ownerLabel: "Sam", roomLabel: "Gaming Night", resolution: "1920x1080", fps: null, bitrate: null, state: "stalled", hue: 0 },
   ];
 
   // Mock-only stand-in for the "NOT ON SCREEN" rail's real-branch data (see
   // `fetchWatchedStreams`'s real branch for how that's actually derived).
   const MOCK_NOT_ON_SCREEN = [
-    { room_handle: null, owner: "w4", stream_id: 0, ownerLabel: "Jonas", roomLabel: "Movie Night" },
-    { room_handle: null, owner: "w5", stream_id: 0, ownerLabel: "Lea", roomLabel: "Book Club" },
+    { room_handle: null, owner: "w4", stream_id: 0, ownerLabel: "Jonas", roomLabel: "Movie Night", resolution: "1920x1080", hasAudio: true },
+    { room_handle: null, owner: "w5", stream_id: 0, ownerLabel: "Lea", roomLabel: "Book Club", resolution: "1280x720", hasAudio: false },
   ];
 
   let mockWatched = [];
@@ -332,6 +335,15 @@
   // touching this DOM node itself (it knows nothing about tile layout).
   let fpsSpans = new Map();
 
+  // Same pattern as `fpsSpans` above, for the bitrate readout in the
+  // always-visible stat bar (2026-07-29 prominent-stats redesign). Only
+  // `updateStats` writes these — there is no client-side (`tile-video.js`)
+  // bitrate source the way there is for fps, since `received_bitrate_kbps`
+  // is counted server-side off real received bytes (see `decode::
+  // ByteRateCounter`'s doc comment) and stays accurate regardless of which
+  // decode path the tile's video is using.
+  let bitrateSpans = new Map();
+
   // tile.id -> ms epoch first observed 'stalled'. No per-watched-stream DTO
   // carries a "since" timestamp (see this file's header note on the known
   // decode-health gap) — tracked client-side, same pattern as
@@ -382,6 +394,12 @@
             roomLabel: room.name,
             resolution: streamInfo ? `${streamInfo.width}x${streamInfo.height}` : null,
             fps: null,
+            // Patched in place by `updateStats` from `stream-stats-updated`'s
+            // `payload.watched[].received_bitrate_kbps` (`dto::
+            // WatchedStatsDto`) — real received throughput, not the sender's
+            // configured encoder bitrate (see that DTO field's doc comment).
+            // Starts `null` (nothing measured yet this tick).
+            bitrate: null,
             videoUrl,
             // See this file's header note: no real per-stream decode-health
             // signal is wired up yet, so every real tile is 'live'.
@@ -416,6 +434,17 @@
             stream_id: s.stream_id,
             ownerLabel: member ? member.display_name : String(s.owner),
             roomLabel: room.name,
+            // Same `StreamInfoDto` this room's watched-tile join above reads
+            // `streamInfo.width`/`.height` from (and the same source
+            // `shell.js`'s `renderRoomPanelStreamRow` already shows a
+            // resolution string for) — announced up-front by the sender, so
+            // it's available even before this stream is ever watched.
+            // Bitrate has no such pre-watch source (it's a live encode/
+            // transport stat — see this file's header note on the on-screen
+            // tile overlay for where that one *is* available), so it's
+            // deliberately omitted here rather than shown as a fake number.
+            resolution: `${s.width}x${s.height}`,
+            hasAudio: detail.streams.some((other) => other.owner === s.owner && other.kind === "Audio"),
           });
         }
       }
@@ -445,10 +474,12 @@
       id: `${item.roomLabel}:${item.owner}:${item.stream_id}`,
       ownerLabel: item.ownerLabel,
       roomLabel: item.roomLabel,
-      resolution: null,
+      resolution: item.resolution ?? null,
       fps: null,
+      bitrate: null,
       state: "live",
       hue: Math.floor(Math.random() * 360),
+      hasAudio: item.hasAudio ?? false,
     });
     render();
   }
@@ -481,6 +512,8 @@
       stream_id: 0,
       ownerLabel: tile.ownerLabel,
       roomLabel: tile.roomLabel,
+      resolution: tile.resolution ?? null,
+      hasAudio: tile.hasAudio ?? false,
     });
     render();
   }
@@ -623,6 +656,7 @@
     // early return too, otherwise clearing the last watched tile would
     // leak that tile's reader/decoder.
     fpsSpans = new Map();
+    bitrateSpans = new Map();
     window.TileVideo.stopAllTileVideo();
 
     if (mockWatched.length === 0) {
@@ -667,28 +701,48 @@
    * nothing to show, rather than an empty labeled section. Returns the
    * appended element (or `null`) so `render()`'s grid-layout math can read
    * its real rendered height. */
+  /** "Not on screen" rail (2026-07-29 prominent-stats redesign): the owner's
+   * complaint ("kinda hidden ... not visible enough") applies most literally
+   * here — this used to be a row of small text chips with nothing but a
+   * name and a tiny play icon, easy to miss above an otherwise-empty grid.
+   * Now a row of bigger cards, each showing the same resolution/audio-
+   * sharing info the sidebar's room panel already has for an
+   * announced-but-not-yet-watched stream (see `fetchWatchedStreams`'s real
+   * branch, which now carries `item.resolution`/`.hasAudio` through from
+   * the same `StreamInfoDto` `shell.js`'s `renderRoomPanelStreamRow`
+   * reads). No bitrate here on purpose — see this file's header note by
+   * `fetchWatchedStreams` for why that figure genuinely doesn't exist
+   * before a stream is actually being watched. */
   function renderNotOnScreenRail(root) {
     if (notOnScreenStreams.length === 0) return null;
     const rail = el("div", { className: "view-not-on-screen" });
     rail.appendChild(el("div", { className: "view-not-on-screen-label", text: "Not on screen" }));
-    const chips = el("div", { className: "view-not-on-screen-chips" });
+    const cards = el("div", { className: "view-not-on-screen-cards" });
     notOnScreenStreams.forEach((item) => {
-      chips.appendChild(
-        el("div", { className: "view-not-on-screen-chip" }, [
-          el("span", { text: `${item.ownerLabel} · ${item.roomLabel}` }),
-          el(
-            "button",
-            {
-              className: "view-not-on-screen-chip-play",
-              attrs: { title: `Watch ${item.ownerLabel}`, "aria-label": `Watch ${item.ownerLabel}` },
-              onClick: () => playNotOnScreen(item),
-            },
-            [icon("play_arrow")]
-          ),
-        ])
+      const meta = el("div", { className: "view-not-on-screen-card-meta" });
+      if (item.resolution) meta.appendChild(el("span", { className: "view-not-on-screen-card-value", text: item.resolution }));
+      if (item.hasAudio) {
+        const audioBadge = el("span", { className: "view-not-on-screen-card-audio", attrs: { title: "Sharing audio", "aria-label": "Sharing audio" } });
+        audioBadge.appendChild(icon("volume_up"));
+        meta.appendChild(audioBadge);
+      }
+      const info = el("div", { className: "view-not-on-screen-card-info" }, [
+        el("span", { className: "view-not-on-screen-card-name", text: item.ownerLabel }),
+        el("span", { className: "view-not-on-screen-card-room", text: item.roomLabel }),
+        meta,
+      ]);
+      const playBtn = el(
+        "button",
+        {
+          className: "view-not-on-screen-card-play",
+          attrs: { title: `Watch ${item.ownerLabel}`, "aria-label": `Watch ${item.ownerLabel}` },
+          onClick: () => playNotOnScreen(item),
+        },
+        [icon("play_arrow")]
       );
+      cards.appendChild(el("div", { className: "view-not-on-screen-card" }, [info, playBtn]));
     });
-    rail.appendChild(chips);
+    rail.appendChild(cards);
     root.appendChild(rail);
     return rail;
   }
@@ -768,7 +822,7 @@
       wrap.appendChild(errorPlaceholder);
       tile.onFps = (fps) => {
         const span = fpsSpans.get(tile.id);
-        if (span) span.textContent = ` @${Math.round(fps)}fps`;
+        if (span) span.textContent = `${Math.round(fps)}fps`;
       };
       window.TileVideo.startTileVideo(tile, canvas, errorPlaceholder);
     } else {
@@ -785,31 +839,52 @@
       );
     }
 
-    // No-chrome-by-default + hover overlay (1e spec): the name-plate pill is
-    // always visible (bottom-left, minimal — just name · room), everything
-    // else (room+resolution detail, selection checkbox, pop-out button, fps
-    // stats) only fades in on hover/focus via `.media-tile-overlay`'s CSS.
-    wrap.appendChild(el("div", { className: "media-tile-nameplate", text: `${tile.ownerLabel} · ${tile.roomLabel}` }));
+    // Always-visible stat bar (2026-07-29 "prominent stats" redesign — see
+    // this file's header note and `superdoc/features/stream-control.md`'s
+    // matching dated entry): the owner did NOT ask for stats gated behind
+    // hover, and the previous `.media-tile-nameplate` pill only ever showed
+    // "name · room", nothing else. This bar always sits at the top of the
+    // tile — no hover required — and carries the same resolution/fps/
+    // bitrate/audio-sharing figures the hover overlay used to be the only
+    // way to see. `tile.resolution`/`.fps`/`.bitrate` render as
+    // `--font-mono` values per this session's font convention (see
+    // `superdoc/ui/FRONTEND-SHELL.md`'s Fonts section); the owner·room name
+    // stays the sans default. `fpsSpan`/`bitrateSpan` are separate DOM
+    // nodes (not folded into one text node) so `tile.onFps` and
+    // `updateStats` below can keep patching just their own text in place
+    // ~4x/sec without rebuilding the whole bar.
+    const statbar = el("div", { className: "media-tile-statbar" });
+    statbar.appendChild(el("span", { className: "media-tile-statbar-dot" }));
+    statbar.appendChild(el("span", { className: "media-tile-statbar-name", text: `${tile.ownerLabel} · ${tile.roomLabel}` }));
+    if (tile.resolution) {
+      statbar.appendChild(el("span", { className: "media-tile-statbar-sep", text: "·" }));
+      statbar.appendChild(el("span", { className: "media-tile-statbar-value", text: tile.resolution }));
+    }
+    const fpsSpan = el("span", { className: "media-tile-statbar-value media-tile-fps", text: tile.fps ? `${tile.fps}fps` : "" });
+    statbar.appendChild(fpsSpan);
+    if (tile.id) fpsSpans.set(tile.id, fpsSpan);
+    const bitrateSpan = el("span", {
+      className: "media-tile-statbar-value media-tile-bitrate",
+      text: tile.bitrate ? `${tile.bitrate >= 1000 ? (tile.bitrate / 1000).toFixed(1) + " Mbps" : Math.round(tile.bitrate) + " kbps"}` : "",
+    });
+    statbar.appendChild(bitrateSpan);
+    if (tile.id) bitrateSpans.set(tile.id, bitrateSpan);
+    if (tile.hasAudio) {
+      const audioBadge = el("span", { className: "media-tile-statbar-audio-badge", attrs: { title: "Sharing audio", "aria-label": "Sharing audio" } });
+      audioBadge.appendChild(icon("volume_up"));
+      statbar.appendChild(audioBadge);
+    }
+    wrap.appendChild(statbar);
 
+    // No-chrome-by-default hover overlay (1e spec, scoped down 2026-07-29):
+    // stats moved into the always-visible `.media-tile-statbar` above, so
+    // this overlay is now just the hover-reveal actions (pop-out/stop
+    // watching, top-right) and the audio mute/volume control (bottom-left)
+    // — controls a viewer reaches for occasionally, not stats they want to
+    // glance at constantly.
     const overlay = el("div", { className: "media-tile-overlay" });
 
     const top = el("div", { className: "media-tile-overlay-top" });
-    // Title + fps read as one continuous string ("Ana · Movie Night ·
-    // 1920x1080 @30fps") — the fps is a separate `<span>` immediately after
-    // the title text (not folded into the same text node) so `tile.onFps`
-    // and `updateStats` below can keep patching just that span's text in
-    // place ~4x/sec (or on `startTileVideo`'s own faster interval) without
-    // rebuilding the title or the tile. `.media-tile-overlay-title-wrap`
-    // groups both spans as one flex item so they still sit together at the
-    // left of `.media-tile-overlay-top`, opposite the actions.
-    const titleWrap = el("div", { className: "media-tile-overlay-title-wrap" });
-    const titleText = tile.resolution ? `${tile.ownerLabel} · ${tile.roomLabel} · ${tile.resolution}` : `${tile.ownerLabel} · ${tile.roomLabel}`;
-    titleWrap.appendChild(el("span", { className: "media-tile-overlay-title", text: titleText }));
-    const fpsSpan = el("span", { className: "media-tile-fps", text: tile.fps ? ` @${tile.fps}fps` : "" });
-    titleWrap.appendChild(fpsSpan);
-    top.appendChild(titleWrap);
-    if (tile.id) fpsSpans.set(tile.id, fpsSpan);
-
     const actions = el("div", { className: "media-tile-overlay-actions" });
     actions.appendChild(
       el(
@@ -967,15 +1042,31 @@
    * alive. This branch only still matters for the mock branch
    * (`window.__TAURI__` absent, so `mockWatched` entries carry a static
    * `fps` and never get a real controller) and for the brief window before
-   * a tile's `startTileVideo` call has set up its own interval. */
+   * a tile's `startTileVideo` call has set up its own interval.
+   *
+   * `payload.watched[].received_bitrate_kbps` (added 2026-07-29 alongside
+   * the View tab's prominent-stats redesign — see `decode::
+   * ByteRateCounter`'s doc comment) does NOT have the fps field's "dead
+   * unless WebCodecs isn't running" problem: it's counted in `decode::
+   * StreamDecoder::feed`, which every incoming media frame still passes
+   * through regardless of whether anything downstream ever calls
+   * `latest_frame()` (see `session.rs`'s `entry.decoder.lock().unwrap()
+   * .feed(&frame)`). So the bitrate span is patched here unconditionally,
+   * even for a tile with an active `TileVideo` controller — there's no
+   * equivalent client-side bitrate source to prefer instead. */
   function updateStats(payload) {
     if (!payload || !Array.isArray(payload.watched)) return;
     for (const w of payload.watched) {
       const id = `${w.room_handle}:${w.owner}:${w.stream_id}`;
+      const bitrateSpan = bitrateSpans.get(id);
+      if (bitrateSpan) {
+        bitrateSpan.textContent =
+          w.received_bitrate_kbps >= 1000 ? `${(w.received_bitrate_kbps / 1000).toFixed(1)} Mbps` : `${Math.round(w.received_bitrate_kbps)} kbps`;
+      }
       if (window.TileVideo.hasController(id)) continue;
       const span = fpsSpans.get(id);
       if (!span) continue;
-      span.textContent = ` @${Math.round(w.received_fps)}fps`;
+      span.textContent = `${Math.round(w.received_fps)}fps`;
     }
   }
 
