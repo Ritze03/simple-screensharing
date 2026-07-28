@@ -119,6 +119,134 @@
   // this automatically.
   const poppedOutIds = new Set();
 
+  // Dynamic grid layout (2026-07-28) — see `computeGridShape`'s doc comment
+  // for the algorithm and `applyGridLayout` for how it's wired to the DOM.
+  // `currentGridEl`/`currentTileCount` are the last-rendered grid's element
+  // and on-screen tile count (including held slots), kept outside `render()`
+  // so a debounced resize can recompute the layout without a full rebuild
+  // (which would tear down every tile's video pipeline — see `render()`'s
+  // `stopAllTileVideo()` call).
+  let currentGridEl = null;
+  let currentTileCount = 0;
+  let gridLayoutDebounce = null;
+
+  // Must match `.view-grid`'s `gap` in view.css.
+  const GRID_GAP_PX = 12;
+
+  /** Pure layout math — no DOM access, easy to sanity-check standalone (see
+   * this file's matching `superdoc/features/viewer-window.md` entry for how
+   * this was verified without a JS test framework).
+   *
+   * Replaces the old `ceil(sqrt(n))` "square-ish grid" heuristic, which only
+   * looked at the tile count and ignored the window's actual shape — in a
+   * tall/narrow window, 2 side-by-side 16:9 tiles each shrink to fit the
+   * width, wasting most of the window's height as letterboxing above/below.
+   *
+   * For every `cols` from 1 to `n` (rows = `ceil(n / cols)`, the minimum
+   * rows that fit `n` tiles at that column count — never more, per the task
+   * brief's `(rows-1) * cols < n` invariant, which `ceil` already
+   * guarantees), this computes the size a single 16:9 tile would render at
+   * if `availWidth x availHeight` were evenly divided into that `rows x
+   * cols` grid (accounting for `gap` between cells), then picks whichever
+   * `rows x cols` shape maximizes that per-tile displayed area. Since every
+   * candidate is a uniform grid (all cells the same size), maximizing
+   * per-tile area is equivalent to maximizing total displayed video area
+   * across all `n` tiles — the wasted-space slots from `rows * cols > n`
+   * (e.g. 3 tiles in a 2x2 grid, one cell empty) don't change any
+   * individual tile's size, so they don't need special-casing here. */
+  function computeGridShape(n, availWidth, availHeight, gap = GRID_GAP_PX, aspect = 16 / 9) {
+    const w = Math.max(0, availWidth);
+    const h = Math.max(0, availHeight);
+    if (n <= 1) {
+      let tileWidth = w;
+      let tileHeight = tileWidth / aspect;
+      if (tileHeight > h) {
+        tileHeight = h;
+        tileWidth = tileHeight * aspect;
+      }
+      return { cols: 1, rows: n, tileWidth, tileHeight };
+    }
+
+    let best = null;
+    for (let cols = 1; cols <= n; cols++) {
+      const rows = Math.ceil(n / cols);
+      if ((rows - 1) * cols >= n) continue; // dead case per the invariant above; ceil() never actually hits this
+      const cellWidth = (w - gap * (cols - 1)) / cols;
+      const cellHeight = (h - gap * (rows - 1)) / rows;
+      if (cellWidth <= 0 || cellHeight <= 0) continue;
+      let tileWidth = cellWidth;
+      let tileHeight = tileWidth / aspect;
+      if (tileHeight > cellHeight) {
+        tileHeight = cellHeight;
+        tileWidth = tileHeight * aspect;
+      }
+      const area = tileWidth * tileHeight;
+      if (!best || area > best.area) best = { cols, rows, tileWidth, tileHeight, area };
+    }
+    // Degenerate fallback (availWidth/availHeight not yet laid out, e.g. 0):
+    // single row, n columns, no aspect clamp against a nonexistent height.
+    if (!best) {
+      const tileWidth = n > 0 ? w / n : 0;
+      return { cols: Math.max(1, n), rows: 1, tileWidth, tileHeight: tileWidth / aspect };
+    }
+    return best;
+  }
+
+  /** Measures `.content` (the always-present scroll container all tabs
+   * share — stable even while this tab's panel is `hidden`) minus the
+   * header/controls above the grid and the "not on screen" rail below it
+   * (both measured from their real rendered heights, not assumed), then
+   * writes the resulting shape as CSS custom properties on `currentGridEl`.
+   * No-ops if the grid isn't currently rendered, or if the available box
+   * measures to 0 (this tab's panel is `hidden`, or a render happened
+   * before first layout) — the `ResizeObserver` below re-fires this once
+   * real dimensions are available (a `hidden` -> visible panel transition
+   * itself is a resize of `#view-root`, from 0 to its real size). */
+  function applyGridLayout() {
+    if (!currentGridEl || currentTileCount <= 0) return;
+    const content = document.querySelector(".content");
+    if (!content) return;
+    const cs = getComputedStyle(content);
+    const availWidth = content.clientWidth - parseFloat(cs.paddingLeft || "0") - parseFloat(cs.paddingRight || "0");
+    const totalHeight = content.clientHeight - parseFloat(cs.paddingTop || "0") - parseFloat(cs.paddingBottom || "0");
+    if (availWidth <= 0 || totalHeight <= 0) return;
+
+    // Literal 10/10/16 below are `.view-header`/`.view-controls`'s
+    // `margin-bottom` and `.view-not-on-screen`'s `margin-top` in view.css —
+    // kept in sync manually, same as `GRID_GAP_PX` above.
+    const headerEl = document.querySelector(".view-header");
+    const controlsEl = document.querySelector(".view-controls");
+    const railEl = document.querySelector(".view-not-on-screen");
+    const usedAbove = (headerEl ? headerEl.getBoundingClientRect().height + 10 : 0) + (controlsEl ? controlsEl.getBoundingClientRect().height + 10 : 0);
+    const usedBelow = railEl ? railEl.getBoundingClientRect().height + 16 : 0;
+    const availHeight = totalHeight - usedAbove - usedBelow;
+
+    const { cols, rows, tileWidth, tileHeight } = computeGridShape(currentTileCount, availWidth, availHeight);
+    currentGridEl.style.setProperty("--grid-cols", String(cols));
+    currentGridEl.style.setProperty("--grid-rows", String(Math.max(1, rows)));
+    currentGridEl.style.setProperty("--tile-w", `${tileWidth.toFixed(2)}px`);
+    currentGridEl.style.setProperty("--tile-h", `${tileHeight.toFixed(2)}px`);
+  }
+
+  // Recomputes the layout (debounced) on any resize of `#view-root` — real
+  // window/sidebar resizes while this tab is visible, and also the
+  // 0-size -> real-size jump when switching onto this tab from another one
+  // (`shell.js`'s `setActiveTab` just flips the `hidden` attribute; it
+  // doesn't know to call back into this file, so this observer is what
+  // catches that transition instead of leaving a stale/zeroed layout up).
+  (function watchGridContainerResize() {
+    const watchedEl = document.getElementById("view-root");
+    if (!watchedEl || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => {
+      if (gridLayoutDebounce) clearTimeout(gridLayoutDebounce);
+      gridLayoutDebounce = setTimeout(() => {
+        gridLayoutDebounce = null;
+        applyGridLayout();
+      }, 120);
+    });
+    observer.observe(watchedEl);
+  })();
+
   // Per-tile playback volume (0-200, matching `commands::set_volume`'s range)
   // and mute state, keyed by tile id. Client-side only: `RoomDetail` carries
   // no `volume_percent`, and re-`render()`s happen ~4x/sec off
@@ -452,29 +580,42 @@
         })
       );
       renderNotOnScreenRail(root);
+      currentGridEl = null;
+      currentTileCount = 0;
       return;
     }
 
     const shownTiles = roomFilter === null ? mockWatched : mockWatched.filter((t) => t.roomLabel === roomFilter);
 
     const grid = el("div", { className: "view-grid" });
-    // 1e's "Watch grid" spec: a computed square-ish column count
-    // (`ceil(sqrt(n))`) rather than the old organic `auto-fit` reflow — n
-    // includes held-slot placeholders (popped-out/viewer tiles below) so
-    // the grid doesn't reshuffle every other tile just because one left the
-    // grid for another window.
-    grid.style.setProperty("--grid-cols", String(Math.max(1, Math.ceil(Math.sqrt(shownTiles.length)))));
+    // 1e's "Watch grid" spec: n includes held-slot placeholders (popped-out
+    // tiles below) so the grid doesn't reshuffle every other tile just
+    // because one left the grid for another window. The actual rows x cols
+    // shape (and per-tile pixel size) is no longer a fixed `ceil(sqrt(n))`
+    // — see `computeGridShape`'s doc comment above and `applyGridLayout`
+    // just below, which measures the real available area and picks the
+    // shape that maximizes total displayed 16:9 video area.
     shownTiles.forEach((tile) => grid.appendChild(renderTile(tile)));
-    root.appendChild(grid);
 
-    renderNotOnScreenRail(root);
+    // Rail appended first (still ends up after the grid in the DOM, see
+    // below) so `applyGridLayout` can read its real rendered height as part
+    // of the grid's vertical budget.
+    const railEl = renderNotOnScreenRail(root);
+    if (railEl) root.insertBefore(grid, railEl);
+    else root.appendChild(grid);
+
+    currentGridEl = grid;
+    currentTileCount = shownTiles.length;
+    applyGridLayout();
   }
 
   /** "NOT ON SCREEN" rail — see this file's header note for the real-branch
    * data source and its one known gap. Renders nothing when there's
-   * nothing to show, rather than an empty labeled section. */
+   * nothing to show, rather than an empty labeled section. Returns the
+   * appended element (or `null`) so `render()`'s grid-layout math can read
+   * its real rendered height. */
   function renderNotOnScreenRail(root) {
-    if (notOnScreenStreams.length === 0) return;
+    if (notOnScreenStreams.length === 0) return null;
     const rail = el("div", { className: "view-not-on-screen" });
     rail.appendChild(el("div", { className: "view-not-on-screen-label", text: "Not on screen" }));
     const chips = el("div", { className: "view-not-on-screen-chips" });
@@ -496,6 +637,7 @@
     });
     rail.appendChild(chips);
     root.appendChild(rail);
+    return rail;
   }
 
   /** Held-slot placeholder — see this file's header note on `poppedOutIds`.
