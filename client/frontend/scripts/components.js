@@ -411,19 +411,17 @@
 
     head.appendChild(el("span", { className: "room-name", text: room.name }));
 
-    // Meta slot: short, fixed-width, right-aligned status text — never the
-    // free-text state body (that would fight the name for width on this
-    // monospace, narrow-sidebar layout). Joined rooms used to show a
-    // `"{count} active"` summary here; that's now the member/LIVE tree
-    // appended below the row instead (see this function's doc comment), so
-    // joined falls through to the "—" default.
-    // `Why:` (2026-07-28) disconnected used to show a "not connected" meta
-    // string here — redundant with the row's own outline status dot (and
-    // its name already going dim, `.room-row-disconnected .room-name` in
-    // shell.css) per the design owner's screenshot feedback. Falls through
-    // to the same "—" default `reconnecting` already used.
-    const metaText = "—";
-    head.appendChild(el("span", { className: "room-meta", text: metaText }));
+    // Meta slot: fixed-width spacer that keeps the action icon's column
+    // aligned across every row — never free-text state body (that would
+    // fight the name for width on this narrow sidebar). Joined rooms used
+    // to show a `"{count} active"` summary here; that's now the member/LIVE
+    // tree appended below the row instead (see this function's doc
+    // comment). Disconnected used to show a "not connected" string, and
+    // both states used to fall back to a literal "—" placeholder — both
+    // redundant with the row's own status dot and, per the design owner's
+    // feedback, visual clutter — so this renders empty now, purely for
+    // layout, not as a text placeholder.
+    head.appendChild(el("span", { className: "room-meta" }));
 
     // Action slot: leave (joined), forget (disconnected), or empty (nothing
     // to act on mid-reconnect). Always present so the column stays aligned.
