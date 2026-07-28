@@ -74,6 +74,125 @@
   // consistency; this counter no longer has anything to do with that event.
   const FPS_UPDATE_INTERVAL_MS = 250;
 
+  // --- Jitter buffer (RFC 3550-style EWMA over wire-format `pts_us`) ---
+  //
+  // Ceiling on the applied playout delay. Hardcoded for now — a
+  // not-yet-landed backend change will add a real user-configurable setting
+  // (`get_settings()`'s response gaining `max_jitter_buffer_ms`). Every
+  // read below goes through this one `let` binding rather than the literal,
+  // so wiring that setting in later is a one-line change to `init()`
+  // (assign `maxJitterBufferMs` from the fetched settings) instead of a
+  // hunt through the jitter math for inlined `2000`s.
+  const DEFAULT_MAX_JITTER_BUFFER_MS = 2000;
+  let maxJitterBufferMs = DEFAULT_MAX_JITTER_BUFFER_MS;
+  // Floor applied to the target buffer even when the jitter estimate is
+  // (near-)zero, e.g. right at stream start — RFC 3550's own jitter
+  // estimator has no such floor, but a few tens of ms of slack absorbs the
+  // ordinary scheduling noise of `setTimeout`/decode itself rather than
+  // starting the buffer at literally 0ms.
+  const JITTER_BUFFER_FLOOR_MS = 40;
+  // RFC 3550 section 6.4.1's smoothing constant (1/16) for the jitter EWMA.
+  const JITTER_EWMA_ALPHA = 1 / 16;
+  // Max change to `appliedBufferMs` per chunk arrival — caps how fast the
+  // applied delay can move even if `target_buffer_ms` jumps a lot in one
+  // step, so buffer growth/shrink is an invisible drift rather than a
+  // visible pacing jump in the playout schedule.
+  const MAX_BUFFER_EASE_STEP_MS = 20;
+
+  function clamp(value, lo, hi) {
+    return Math.max(lo, Math.min(hi, value));
+  }
+
+  /** RFC 3550 6.4.1-style jitter EWMA update, fed by each VideoFrame
+   * chunk's *arrival* time and the wire format's `pts_us` (the sender's
+   * capture-time PTS) — not by decode or draw time, which this buffer
+   * deliberately delays. `controller.lastArrivalMs`/`lastPtsUs` carry the
+   * previous chunk's readings across calls; the very first chunk on a
+   * connection has no previous sample to diff against and is skipped (this
+   * function still seeds `lastArrivalMs`/`lastPtsUs` for it). A chunk that
+   * arrives very late (e.g. after a real buffer underrun) naturally
+   * produces a large `deviation` here — arrival delta far outpacing the pts
+   * delta — so a stall feeds the *next* target buffer calculation without
+   * any separate "detect underrun" branch. */
+  function updateJitterEstimate(controller, arrivalMs, ptsUs) {
+    if (controller.lastArrivalMs != null) {
+      const deviation = (arrivalMs - controller.lastArrivalMs) - (ptsUs - controller.lastPtsUs) / 1000;
+      controller.jitterEwmaMs += (Math.abs(deviation) - controller.jitterEwmaMs) * JITTER_EWMA_ALPHA;
+    }
+    controller.lastArrivalMs = arrivalMs;
+    controller.lastPtsUs = ptsUs;
+  }
+
+  /** Eases `controller.appliedBufferMs` toward the jitter-derived target by
+   * at most `MAX_BUFFER_EASE_STEP_MS`, rather than snapping straight to the
+   * target — see `MAX_BUFFER_EASE_STEP_MS`'s comment. Call once per chunk
+   * arrival, after `updateJitterEstimate` has folded in that chunk's
+   * sample. */
+  function updateAppliedBuffer(controller) {
+    const target = clamp(controller.jitterEwmaMs * 4 + JITTER_BUFFER_FLOOR_MS, 0, maxJitterBufferMs);
+    const diff = target - controller.appliedBufferMs;
+    controller.appliedBufferMs += clamp(diff, -MAX_BUFFER_EASE_STEP_MS, MAX_BUFFER_EASE_STEP_MS);
+  }
+
+  /** Pops and decodes `controller.pendingChunks[0]` once its scheduled
+   * playout time arrives, then reschedules itself for whatever's next in
+   * the queue. A no-op (does not set a timeout) whenever the queue is
+   * currently empty — the next `enqueueChunk` call kicks scheduling back
+   * off, so an empty queue just means nothing is pending, not a stuck
+   * scheduler. Guarded by `controller.scheduleTimeoutId` so at most one
+   * timeout is ever outstanding per controller; `stopController` clears
+   * that id (see its doc comment for why teardown here follows the same
+   * own-controller-only discipline as the fetch/decoder cleanup). */
+  function maybeScheduleNext(controller, decoder, tile) {
+    if (controller.stopped) return;
+    if (controller.scheduleTimeoutId != null) return;
+    if (controller.pendingChunks.length === 0) return;
+
+    const item = controller.pendingChunks[0];
+    const delay = Math.max(0, item.decodeAtMs - performance.now());
+    controller.scheduleTimeoutId = setTimeout(() => {
+      controller.scheduleTimeoutId = null;
+      if (controller.stopped) return;
+      controller.pendingChunks.shift();
+      if (decoder.state === "configured") {
+        try {
+          decoder.decode(item.chunk);
+        } catch (e) {
+          // Same reasoning as the pre-buffering `decode()` call site this
+          // replaced: a single bad access unit shouldn't kill the whole
+          // tile — log and keep going, a sustained problem surfaces via the
+          // decoder's own `error` callback.
+          console.error(`[view] VideoDecoder.decode() failed for ${tile.id}:`, e);
+        }
+      }
+      maybeScheduleNext(controller, decoder, tile);
+    }, delay);
+  }
+
+  /** Queues one already-parsed VideoFrame chunk for delayed decode instead
+   * of decoding it immediately — see this file's `startTileVideoInner` doc
+   * comment and the module header's jitter-buffer note for why the delay
+   * lives here (buffering cheap still-encoded chunk data) rather than after
+   * decode (buffering ~3MB `VideoFrame`s). Anchors the playout schedule on
+   * the very first chunk (post-keyframe/post-CodecInfo) it sees for this
+   * controller; every later chunk's target decode time is anchored off that
+   * same `(anchorArrivalMs, anchorPtsUs)` pair plus the current eased
+   * buffer. */
+  function enqueueChunk(controller, decoder, tile, ptsUs, chunk) {
+    const arrivalMs = performance.now();
+    updateJitterEstimate(controller, arrivalMs, ptsUs);
+    updateAppliedBuffer(controller);
+
+    if (controller.anchorArrivalMs == null) {
+      controller.anchorArrivalMs = arrivalMs;
+      controller.anchorPtsUs = ptsUs;
+    }
+    const decodeAtMs = controller.anchorArrivalMs + (ptsUs - controller.anchorPtsUs) / 1000 + controller.appliedBufferMs;
+
+    controller.pendingChunks.push({ decodeAtMs, chunk });
+    maybeScheduleNext(controller, decoder, tile);
+  }
+
   /** Records one decoded-frame timestamp into `controller.frameTimestamps`
    * and drops anything older than `FPS_WINDOW_MS`, so the array stays
    * bounded no matter how long the tile has been playing. Called once per
@@ -120,6 +239,17 @@
       clearInterval(controller.fpsIntervalId);
       controller.fpsIntervalId = null;
     }
+    // Same class of bug this file has already hit once (see this
+    // function's own doc comment above): a scheduled `decode()` firing
+    // after teardown would feed a closing/closed decoder. Clearing the
+    // timeout here — the only place a pending decode is ever scheduled —
+    // and dropping the queue means no `maybeScheduleNext` callback can fire
+    // for this controller again after this point.
+    if (controller.scheduleTimeoutId != null) {
+      clearTimeout(controller.scheduleTimeoutId);
+      controller.scheduleTimeoutId = null;
+    }
+    controller.pendingChunks.length = 0;
     // Aborts the fetch outright if it's still in flight (no reader yet —
     // headers haven't come back), and is a harmless no-op if the fetch has
     // already settled by the time this runs.
@@ -157,14 +287,19 @@
    * doc for the wire format), parses the length-prefixed chunk stream
    * (buffering across `read()` calls since a chunk can straddle two network
    * reads), configures a `VideoDecoder` from the first CodecInfo chunk, and
-   * feeds every VideoFrame chunk to it as an `EncodedVideoChunk`. Decoded
-   * frames are drawn directly in `decoder.output` (the simplest correct
-   * pattern here — the decoder itself already paces output, so no separate
-   * rAF loop is needed) and immediately `close()`d to release their
-   * underlying resources. `errorPlaceholder` is revealed (and the canvas
-   * left showing its last frame underneath) if the decoder enters its
-   * `error` state, matching the existing `'stalled'`
-   * `.media-tile-placeholder` visual rather than inventing a new one. */
+   * feeds every VideoFrame chunk through the jitter buffer above
+   * (`enqueueChunk`/`maybeScheduleNext`) rather than calling
+   * `decoder.decode()` on it immediately — see the "Jitter buffer" block
+   * for why the delay sits before decode (buffering cheap still-encoded
+   * chunk data) rather than after. Decoded frames are still drawn directly
+   * in `decoder.output` the moment each delayed `decode()` call produces
+   * one (the simplest correct pattern here — the decoder itself already
+   * paces output, so no separate rAF loop is needed) and immediately
+   * `close()`d to release their underlying resources — that part is
+   * unchanged. `errorPlaceholder` is revealed (and the canvas left showing
+   * its last frame underneath) if the decoder enters its `error` state,
+   * matching the existing `'stalled'` `.media-tile-placeholder` visual
+   * rather than inventing a new one. */
   async function startTileVideo(tile, canvas, errorPlaceholder) {
     const controller = {
       decoder: null,
@@ -180,6 +315,20 @@
       // source of truth now, not the server.
       frameTimestamps: [],
       fpsIntervalId: null,
+      // Jitter buffer state — see the "Jitter buffer" block above for the
+      // constants/helpers these feed. `pendingChunks` holds still-encoded
+      // `{ decodeAtMs, chunk: EncodedVideoChunk }` entries (cheap, KBs
+      // each), never decoded `VideoFrame`s (~3MB each at 1080p) — decode
+      // itself still happens right before draw, just delayed until each
+      // chunk's scheduled time via `maybeScheduleNext`'s `setTimeout`.
+      pendingChunks: [],
+      jitterEwmaMs: 0,
+      appliedBufferMs: 0,
+      anchorArrivalMs: null,
+      anchorPtsUs: null,
+      lastArrivalMs: null,
+      lastPtsUs: null,
+      scheduleTimeoutId: null,
     };
     videoControllers.set(tile.id, controller);
 
@@ -244,6 +393,12 @@
           frame.close();
           return;
         }
+        // `output` still fires (and draws) immediately once the delayed
+        // `decoder.decode()` call above actually runs — the jitter buffer
+        // only moves *when* decode is called, not what happens after — so
+        // `recordFrame` here now measures true display-time fps rather
+        // than network-arrival fps, a strict improvement over the old
+        // decode-immediately behavior with no code change needed.
         recordFrame(controller);
         if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
           canvas.width = frame.displayWidth;
@@ -306,20 +461,16 @@
               showError();
             }
           } else if (frameType === 1 && decoder.state === "configured") {
-            try {
-              decoder.decode(
-                new EncodedVideoChunk({
-                  type: flags & 0x01 ? "key" : "delta",
-                  timestamp: Number(ptsUs),
-                  data: payload,
-                })
-              );
-            } catch (e) {
-              // A single bad access unit shouldn't kill the whole tile —
-              // log and keep decoding subsequent chunks. A sustained
-              // problem surfaces via the decoder's own `error` callback.
-              console.error(`[view] VideoDecoder.decode() failed for ${tile.id}:`, e);
-            }
+            // Parsing/construction happens immediately on arrival as
+            // before; only the `decoder.decode()` call itself is delayed —
+            // see `enqueueChunk`/`maybeScheduleNext` above for the jitter
+            // buffer this now goes through instead of decoding inline.
+            const chunk = new EncodedVideoChunk({
+              type: flags & 0x01 ? "key" : "delta",
+              timestamp: Number(ptsUs),
+              data: payload,
+            });
+            enqueueChunk(controller, decoder, tile, Number(ptsUs), chunk);
           }
 
           buf = buf.slice(totalLen);
