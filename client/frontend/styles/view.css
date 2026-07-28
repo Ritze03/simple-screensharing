@@ -72,6 +72,23 @@
   padding: 2px 6px;
 }
 
+/* Wraps the selection checkbox + pop-out button so both can opt back into
+ * pointer events (the overlay itself is `pointer-events: none` so it never
+ * blocks clicks through to the tile below). */
+.media-tile-overlay-actions {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.media-tile-select-checkbox {
+  width: 15px;
+  height: 15px;
+  cursor: pointer;
+  accent-color: var(--accent);
+}
+
 .media-tile-popout-btn {
   pointer-events: auto;
   background: rgba(0, 0, 0, 0.4);
@@ -121,7 +138,22 @@
 .view-controls {
   display: flex;
   justify-content: flex-end;
+  align-items: center;
+  gap: 8px;
   margin-bottom: 10px;
+}
+
+/* "Fullscreen selected" / "Borderless selected" — only rendered when
+ * `window.__ELECTRON__` exists (see view.js's render()), reusing the
+ * standard `.btn.btn-secondary` look rather than a bespoke style. */
+.view-viewer-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.view-viewer-action-btn {
+  font-size: 12px;
+  padding: 4px 10px;
 }
 
 .view-demo-toggle {

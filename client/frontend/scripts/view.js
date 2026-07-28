@@ -40,7 +40,7 @@
 (function () {
   "use strict";
 
-  const { el, icon, renderEmptyState } = window.Components;
+  const { el, icon, renderEmptyState, secondaryButton } = window.Components;
 
   const MOCK_WATCHED = [
     { id: "w1", ownerLabel: "Ana", roomLabel: "Movie Night", resolution: "1920x1080", fps: 30, state: "live", hue: 220 },
@@ -49,6 +49,14 @@
   ];
 
   let mockWatched = [];
+
+  // Tile ids (`${room_handle}:${owner}:${stream_id}`) the user has explicitly
+  // checked via each tile's own selection checkbox, for the "Fullscreen
+  // selected" / "Borderless selected" buttons below. Deliberately NOT
+  // cleared on every `render()` (a `stream-stats-updated`-driven re-render
+  // shouldn't silently wipe a selection the user just made) — only trimmed
+  // to drop ids for tiles that no longer exist, right before each render.
+  let selectedTileIds = new Set();
 
   // Maps tile id (`${room_handle}:${owner}:${stream_id}`) -> that tile's fps
   // `<span>`, rebuilt on every `render()`. `stream-stats-updated` fires
@@ -123,10 +131,36 @@
     if (t) t.poppedOut = true;
   }
 
+  /** `window.__ELECTRON__.openViewer` is the entry point built by the
+   * fullscreen/borderless viewer feature (see `electron/main.js`'s
+   * `open-viewer-window` IPC handler and `electron/preload.js`'s bridge) —
+   * this is the only place in the View tab that calls it. `displayId: null`
+   * defers to `resolveTargetDisplay`'s nearest-cursor-display default;
+   * exposing a display picker here is a reasonable follow-up but out of
+   * scope for this pass (see `electron/main.js`'s `list-displays` IPC,
+   * already wired and ready for one).
+   *
+   * Selection default, per the feature's original design intent: with
+   * nothing checked, act on every currently-visible tile rather than
+   * forcing the user to select first for the common single-stream case. */
+  function requestOpenViewer(mode) {
+    if (!window.__ELECTRON__) return;
+    const streamKeys = selectedTileIds.size > 0 ? Array.from(selectedTileIds) : mockWatched.map((t) => t.id);
+    if (streamKeys.length === 0) return;
+    window.__ELECTRON__.openViewer({ mode, displayId: null, streamKeys });
+  }
+
   function render() {
     const root = document.getElementById("view-root");
     if (!root) return;
     root.innerHTML = "";
+
+    // Drop selection entries for tiles that no longer exist (stream ended,
+    // room left, etc.) before deciding what "selected" means for this render.
+    const liveIds = new Set(mockWatched.map((t) => t.id));
+    for (const id of selectedTileIds) {
+      if (!liveIds.has(id)) selectedTileIds.delete(id);
+    }
 
     const controls = el("div", { className: "view-controls" });
     if (!window.__TAURI__) {
@@ -139,6 +173,19 @@
             render();
           },
         })
+      );
+    }
+    // Hidden entirely (not just disabled) when there's no Electron bridge —
+    // same pattern as this codebase's existing `window.__TAURI__` guards —
+    // so a plain browser-preview session can't throw clicking a button that
+    // has nothing to call. Also hidden when there are zero watched streams:
+    // nothing to show fullscreen.
+    if (window.__ELECTRON__ && mockWatched.length > 0) {
+      controls.appendChild(
+        el("div", { className: "view-viewer-actions" }, [
+          secondaryButton("Fullscreen selected", () => requestOpenViewer("fullscreen"), { className: "view-viewer-action-btn" }),
+          secondaryButton("Borderless selected", () => requestOpenViewer("borderless"), { className: "view-viewer-action-btn" }),
+        ])
       );
     }
     root.appendChild(controls);
@@ -218,7 +265,27 @@
     label.appendChild(fpsSpan);
     top.appendChild(label);
     if (tile.id) fpsSpans.set(tile.id, fpsSpan);
-    top.appendChild(
+
+    // Per-tile selection checkbox, feeding `selectedTileIds` for the
+    // "Fullscreen selected" / "Borderless selected" buttons in
+    // `.view-controls`. Only meaningful once Electron's viewer bridge
+    // exists — hidden otherwise so a mock/browser-preview session doesn't
+    // show a control with no consumer.
+    const actions = el("div", { className: "media-tile-overlay-actions" });
+    if (tile.id && window.__ELECTRON__) {
+      const checkbox = el("input", {
+        className: "media-tile-select-checkbox",
+        attrs: { type: "checkbox", title: "Select for fullscreen/borderless", "aria-label": `Select ${tile.ownerLabel} for fullscreen/borderless` },
+      });
+      checkbox.checked = selectedTileIds.has(tile.id);
+      checkbox.addEventListener("click", (e) => e.stopPropagation());
+      checkbox.addEventListener("change", () => {
+        if (checkbox.checked) selectedTileIds.add(tile.id);
+        else selectedTileIds.delete(tile.id);
+      });
+      actions.appendChild(checkbox);
+    }
+    actions.appendChild(
       el(
         "button",
         {
@@ -229,6 +296,7 @@
         [icon("open_in_new")]
       )
     );
+    top.appendChild(actions);
     wrap.appendChild(top);
 
     return wrap;
