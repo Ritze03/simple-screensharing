@@ -295,7 +295,7 @@
     // edit buffer and send the *whole* buffer every time, same way the old
     // scale/framerate hardcoding already did for the fields this tab doesn't
     // expose a control for.
-    const edit = dest ? getDestEdit(dest) : Object.assign({ bitrateKbps: 3000, tune: "low_latency", qualityLevel: "performance", rateControl: "constant", error: null }, patch);
+    const edit = dest ? getDestEdit(dest) : Object.assign({ bitrateKbps: 3000, tune: "best_quality", qualityLevel: "balanced", rateControl: "constant", error: null }, patch);
     Object.assign(edit, patch);
     if (dest) destEditState.set(destinationId, edit);
 
@@ -527,7 +527,9 @@
   // the rest of this panel: `DestinationRow` doesn't expose the server's
   // current tune/quality_level/rate_control, so there's nothing to read back
   // and reconcile against. Defaults mirror `capture::TuneMode`/`QualityLevel`/
-  // `RateControlMode`'s `Default` impls (low_latency/performance/constant).
+  // `RateControlMode`'s `Default` impls (best_quality/balanced/constant — a
+  // deliberate "good mix" out of the box, not either speed/quality extreme;
+  // see those types' doc comments).
   const destEditState = new Map();
   // destination_id -> number[] (last SPARK_WINDOW `sent_fps` samples, oldest
   // first). No historical stats are fetched from anywhere — this is just a
@@ -542,7 +544,7 @@
   function getDestEdit(dest) {
     let s = destEditState.get(dest.destination_id);
     if (!s) {
-      s = { bitrateKbps: dest.bitrate_kbps, tune: "low_latency", qualityLevel: "performance", rateControl: "constant", error: null };
+      s = { bitrateKbps: dest.bitrate_kbps, tune: "best_quality", qualityLevel: "balanced", rateControl: "constant", error: null };
       destEditState.set(dest.destination_id, s);
     }
     return s;
