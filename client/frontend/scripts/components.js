@@ -228,7 +228,7 @@
    *   plus a frontend-only `members` array (fetched separately via `room_detail` —
    *   no single DTO inlines both): [{conn_id, display_name, owner, stream_id,
    *   resolution, watching}].
-   * @param {object} handlers - { expanded, onToggleExpand, onReconnect, onLeave, onWatch }
+   * @param {object} handlers - { onOpenRoom, onReconnect, onLeave }
    *
    * Per the sidebar-redesign handoff (option 1c): every state renders through
    * ONE fixed row skeleton — `[dot][caret/reconnect][name][meta, right-
@@ -242,25 +242,49 @@
    * possibly-long auto-generated name; the redesign's single reconnect
    * *icon* (↩) in the caret slot is narrow enough to keep everything on one
    * line without crowding the name out.
+   *
+   * `Why:` (room-detail-slide-over pass, option 1f) a joined row no longer
+   * expands inline to show its member list — clicking anywhere on a joined
+   * row's head (or its caret specifically) now calls `handlers.onOpenRoom`
+   * to open the room-detail slide-over panel instead (see shell.js's
+   * `openRoomPanel`/`renderRoomPanel`), which owns the member list, rename,
+   * audio-share and leave actions this row used to spill into an inline
+   * `.room-members` block. Deliberate UX call: the WHOLE row is clickable
+   * (not just the caret) since "click a room to see its detail" is the more
+   * discoverable target on a dense sidebar list, while the row's own
+   * leave/forget icon-button in the action slot stays as a fast path that
+   * does NOT open the panel first (its own click handler stops propagation)
+   * — a user who already knows they want to leave shouldn't be forced
+   * through the panel to do it. Disconnected/reconnecting rows never open
+   * the panel (there's no live `room_handle`/roster to show for a room
+   * that's not joined) — `onOpenRoom` is only wired for `state === "joined"`.
    */
   function renderRoomRow(room, handlers) {
     handlers = handlers || {};
-    const expanded = !!handlers.expanded;
     const row = el("div", { className: "room-row room-row-" + room.state });
 
     const head = el("div", { className: "room-row-head" });
+    if (room.state === "joined") {
+      head.classList.add("room-row-head-clickable");
+      head.addEventListener("click", () => handlers.onOpenRoom && handlers.onOpenRoom(room.join_string));
+    }
 
     head.appendChild(statusDot(room.state));
 
-    // Caret slot: expand/collapse toggle (joined), reconnect (disconnected),
-    // or an empty spacer (reconnecting — "nothing to click while connecting").
+    // Caret slot: open the room-detail panel (joined), reconnect
+    // (disconnected), or an empty spacer (reconnecting — "nothing to click
+    // while connecting"). The caret's own click stops propagation so it
+    // doesn't double-fire the head's row-wide click handler above.
     if (room.state === "joined") {
       head.appendChild(
         el("button", {
           className: "room-caret",
-          onClick: () => handlers.onToggleExpand && handlers.onToggleExpand(room.join_string),
-          attrs: { "aria-label": expanded ? "Collapse" : "Expand" },
-        }, [icon(expanded ? "expand_more" : "chevron_right")])
+          onClick: (e) => {
+            e.stopPropagation();
+            handlers.onOpenRoom && handlers.onOpenRoom(room.join_string);
+          },
+          attrs: { "aria-label": "Room details", title: "Room details" },
+        }, [icon("chevron_right")])
       );
     } else if (room.state === "disconnected") {
       head.appendChild(
@@ -286,40 +310,35 @@
 
     // Action slot: leave (joined), forget (disconnected), or empty (nothing
     // to act on mid-reconnect). Always present so the column stays aligned.
+    // Both buttons stop propagation — this stays a fast path independent of
+    // the panel, not an implicit "open panel then leave" detour.
     const actionSlot = el("span", { className: "room-action-slot" });
     if (room.state === "joined") {
-      actionSlot.appendChild(iconButton("close", () => handlers.onLeave && handlers.onLeave(room.join_string), { title: "Leave room", className: "room-row-action-btn" }));
+      actionSlot.appendChild(
+        iconButton(
+          "close",
+          (e) => {
+            e.stopPropagation();
+            handlers.onLeave && handlers.onLeave(room.join_string);
+          },
+          { title: "Leave room", className: "room-row-action-btn" }
+        )
+      );
     } else if (room.state === "disconnected") {
-      actionSlot.appendChild(iconButton("delete", () => handlers.onLeave && handlers.onLeave(room.join_string), { title: "Forget room", className: "room-row-action-btn" }));
+      actionSlot.appendChild(
+        iconButton(
+          "delete",
+          (e) => {
+            e.stopPropagation();
+            handlers.onLeave && handlers.onLeave(room.join_string);
+          },
+          { title: "Forget room", className: "room-row-action-btn" }
+        )
+      );
     }
     head.appendChild(actionSlot);
 
     row.appendChild(head);
-
-    if (room.state === "joined" && expanded) {
-      const memberList = el("div", { className: "room-members" });
-      (room.members || []).forEach((m) => {
-        const memberRow = el("div", { className: "room-member-row" });
-        memberRow.appendChild(el("span", { className: "room-member-name", text: m.display_name }));
-        memberRow.appendChild(
-          el("span", {
-            className: "room-member-caps",
-            text: m.resolution || "",
-          })
-        );
-        memberRow.appendChild(
-          iconButton(m.watching ? "visibility" : "play_arrow", () => handlers.onWatch && handlers.onWatch(room.join_string, m), {
-            title: m.watching ? "Watching" : "Watch",
-            className: m.watching ? "watch-active" : "",
-          })
-        );
-        memberList.appendChild(memberRow);
-      });
-      if (!room.members || room.members.length === 0) {
-        memberList.appendChild(emptyRow("person_off", "No other members yet."));
-      }
-      row.appendChild(memberList);
-    }
 
     return row;
   }

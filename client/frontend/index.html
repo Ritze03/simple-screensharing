@@ -66,6 +66,15 @@
         <h2>Settings</h2>
         <div id="settings-root"></div>
       </section>
+
+      <!-- Room-detail slide-over (design handoff option 1f) — an
+           `inset: 0` scrim + panel absolutely positioned INSIDE `.content`
+           (not a `.modal-overlay`/fixed dialog), so it slides in from the
+           content area's left edge rather than centering over the whole
+           window. See shell.js's `openRoomPanel`/`renderRoomPanel`. -->
+      <div class="room-panel-scrim" id="room-panel-scrim" hidden>
+        <aside class="room-panel" id="room-panel" role="dialog" aria-label="Room details"></aside>
+      </div>
     </main>
   </div>
 

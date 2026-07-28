@@ -113,6 +113,13 @@
      same `repeating-linear-gradient(...)` literal. */
   --hatch-amber-gradient: repeating-linear-gradient(45deg, var(--hatch-amber-strong) 0 4px, var(--hatch-amber-weak) 4px 8px);
 
+  /* Room-detail slide-over header wash (design handoff option 1f) — the
+     accent's own rgb triplet (76, 110, 245 == --accent, #4c6ef5) faded to
+     transparent, top-to-bottom. No existing token was this specific
+     accent-to-transparent wash, so it's added here rather than reused. */
+  --accent-header-wash: linear-gradient(160deg, rgba(76, 110, 245, 0.14), transparent);
+  --accent-row-tint: rgba(76, 110, 245, 0.09);
+
   /* -------------------------------------------------------------------
    * Spacing / sizing / rounding — ported from theme.rs's constants.
    * ----------------------------------------------------------------- */

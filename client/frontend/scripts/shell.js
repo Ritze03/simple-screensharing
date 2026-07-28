@@ -27,7 +27,18 @@
 (function () {
   "use strict";
 
-  const { renderNavButton, renderRoomRow, renderStreamRow, renderEmptyState, secondaryButton, primaryButton, el, hatchedBanner } = window.Components;
+  const {
+    renderNavButton,
+    renderRoomRow,
+    renderStreamRow,
+    renderEmptyState,
+    secondaryButton,
+    primaryButton,
+    dangerButton,
+    iconButton,
+    el,
+    hatchedBanner,
+  } = window.Components;
 
   const NAV_TABS = ["Stream Control", "View", "Settings"];
 
@@ -92,14 +103,28 @@
 
   const state = {
     activeTab: "Stream Control",
-    // Movie Night starts expanded, matching the reference shot — guarded
-    // against an empty `mockRooms` (the real first-launch/no-saved-rooms
-    // case this pass's ROOMS empty state exists for) rather than crashing
-    // `init()` before the nav/empty-state ever paints.
-    expandedRoomIds: new Set(mockRooms.length > 0 ? [mockRooms[0].join_string] : []),
+    // `join_string` of the room whose detail slide-over is currently open
+    // (or null). Replaces the old `expandedRoomIds` set — see
+    // `renderRoomRow`'s `Why:` note in components.js: a joined room row no
+    // longer expands inline, it opens this panel instead. Starts closed
+    // (the old inline-expand's "Movie Night starts expanded, matching the
+    // reference shot" default doesn't carry over — there's no equivalent
+    // "start open" cue in the 1f handoff for a panel the user hasn't
+    // clicked into yet).
+    activeRoomPanel: null,
     addRoomOpen: false,
     pendingLeaveRoomId: null,
   };
+
+  // Room-panel-local audio-source picker state (design handoff's AUDIO
+  // section). Kept separate from `stream-control.js`'s own room-scoped
+  // audio row (`state.audioSource`/`mockAudioSources` there) rather than
+  // shared: that row is reached via a room *dropdown* (any joined room, one
+  // at a time, chosen independently of the sidebar) and is a whole-tab
+  // affordance, not scoped to whichever room this panel happens to have
+  // open — see the shell.js audio-integration note below `openRoomPanel`.
+  let panelAudioSources = [];
+  let panelAudioSourceId = null;
 
   // ---------------------------------------------------------------------
   // Data touchpoints
@@ -195,17 +220,7 @@
     mockRooms.forEach((room) => {
       list.appendChild(
         renderRoomRow(room, {
-          expanded: state.expandedRoomIds.has(room.join_string),
-          onToggleExpand: async (joinString) => {
-            if (state.expandedRoomIds.has(joinString)) {
-              state.expandedRoomIds.delete(joinString);
-            } else {
-              state.expandedRoomIds.add(joinString);
-              const r = mockRooms.find((x) => x.join_string === joinString);
-              if (r) await loadRoomMembers(r);
-            }
-            renderRooms();
-          },
+          onOpenRoom: (joinString) => openRoomPanel(joinString),
           onReconnect: async (joinString) => {
             if (window.__TAURI__) {
               await window.__TAURI__.core.invoke("join_room", { joinString, displayName: "" });
@@ -217,22 +232,26 @@
             renderRooms();
           },
           onLeave: (joinString) => openLeaveConfirm(joinString),
-          onWatch: async (joinString, member) => {
-            const room = mockRooms.find((x) => x.join_string === joinString);
-            if (!room) return;
-            if (window.__TAURI__) {
-              await window.__TAURI__.core.invoke("toggle_watch", { roomHandle: room.room_handle, owner: member.owner, streamId: member.stream_id });
-              await loadRoomMembers(room);
-              if (window.ViewTab) window.ViewTab.refresh();
-            } else {
-              const m = room.members.find((mm) => mm.conn_id === member.conn_id);
-              if (m) m.watching = !m.watching;
-            }
-            renderRooms();
-          },
         })
       );
     });
+  }
+
+  /** Shared watch-toggle used by the room-detail panel's MEMBERS section —
+   * same real `toggle_watch` command the old inline row's watch icon used
+   * to call directly. */
+  async function toggleWatch(joinString, member) {
+    const room = mockRooms.find((x) => x.join_string === joinString);
+    if (!room) return;
+    if (window.__TAURI__) {
+      await window.__TAURI__.core.invoke("toggle_watch", { roomHandle: room.room_handle, owner: member.owner, streamId: member.stream_id });
+      await loadRoomMembers(room);
+      if (window.ViewTab) window.ViewTab.refresh();
+    } else {
+      const m = room.members.find((mm) => mm.conn_id === member.conn_id);
+      if (m) m.watching = !m.watching;
+    }
+    renderRoomPanel();
   }
 
   /** Standardized empty state for the ROOMS section (first-launch/no-rooms
@@ -444,6 +463,267 @@
   }
 
   // ---------------------------------------------------------------------
+  // Room-detail slide-over (design handoff option 1f) — replaces the
+  // sidebar's old inline expand-to-show-members interaction (see
+  // `renderRoomRow`'s `Why:` note in components.js for the row-click UX
+  // decision). One panel at a time, keyed by `state.activeRoomPanel`
+  // (a `join_string`, or null when closed).
+  //
+  // AUDIO section integration note: `stream-control.js` already has a
+  // room-scoped "Share Audio" row (`renderShareAudioCard`), but it's reached
+  // through its OWN room dropdown (`state.scopedRoomHandle`) — a whole-tab
+  // affordance for "pick any joined room, then act on it", independent of
+  // whichever sidebar row was clicked. It is not itself scoped to "the room
+  // this panel is currently showing". Rather than wire this panel to that
+  // dropdown's selection (which would silently desync the two — opening
+  // Room A's panel would have no effect on the Stream Control tab's
+  // separately-chosen scoped room), this panel gets its own minimal,
+  // genuinely room-scoped entry point onto the same three real commands
+  // (`list_audio_sources`/`select_audio_source`/`start_audio_share`) fixed
+  // to `state.activeRoomPanel`'s `room_handle` — see `fetchPanelAudioSources`/
+  // `startPanelAudioShare` below. Small, deliberate duplication of a ~15-line
+  // fetch/select/start sequence, not a second data model.
+  // ---------------------------------------------------------------------
+
+  /** Opens the panel for a joined room. Disconnected/reconnecting rows never
+   * reach this (see `renderRoomRow`'s `onOpenRoom` wiring — only attached
+   * for `state === "joined"`), but this guard stays as the defensive
+   * single source of truth: there's no live `room_handle`/roster to show
+   * for a room that isn't actually joined. */
+  async function openRoomPanel(joinString) {
+    const room = mockRooms.find((r) => r.join_string === joinString);
+    if (!room || room.state !== "joined" || room.room_handle == null) return;
+
+    state.activeRoomPanel = joinString;
+    panelAudioSources = [];
+    panelAudioSourceId = null;
+
+    const scrim = document.getElementById("room-panel-scrim");
+    scrim.hidden = false;
+    renderRoomPanel();
+    // Two nested rAFs — same "already-in-the-DOM before the class flips"
+    // trick `setActiveTab` uses for the nav pill: a transition never plays
+    // on a class added in the same frame an element's `hidden` was cleared,
+    // only on a class change to an element the browser has already painted
+    // once (hence one rAF to get past this frame, a second to be sure the
+    // first has been laid out).
+    requestAnimationFrame(() => requestAnimationFrame(() => scrim.classList.add("room-panel-scrim-open")));
+
+    await loadRoomMembers(room);
+    if (state.activeRoomPanel === joinString) renderRoomPanel();
+
+    panelAudioSources = await fetchPanelAudioSources();
+    if (panelAudioSources.length > 0) panelAudioSourceId = panelAudioSources[0].id;
+    if (state.activeRoomPanel === joinString) renderRoomPanel();
+  }
+
+  /** Closes the panel (scrim click, close icon, ESC, or the room it was
+   * showing disappearing out from under it). Animates the transform/opacity
+   * back out, then hides the scrim once the transition ends (with a timeout
+   * fallback in case `transitionend` never fires — e.g. the panel was
+   * already at 0 width for some reason — so the scrim can never get stuck
+   * invisible-but-still-blocking-clicks). */
+  function closeRoomPanel() {
+    state.activeRoomPanel = null;
+    const scrim = document.getElementById("room-panel-scrim");
+    const panel = document.getElementById("room-panel");
+    scrim.classList.remove("room-panel-scrim-open");
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      scrim.hidden = true;
+      panel.removeEventListener("transitionend", finish);
+    };
+    panel.addEventListener("transitionend", finish);
+    setTimeout(finish, 300);
+  }
+
+  /** Renders the panel's content for `state.activeRoomPanel`. A no-op when
+   * the panel is closed — `closeRoomPanel` owns hiding the scrim itself, so
+   * this only needs to (re)build content while it's open, called after
+   * every data change that could affect it (member list, active-stream
+   * count, rename, refresh events). */
+  function renderRoomPanel() {
+    const panel = document.getElementById("room-panel");
+    if (!state.activeRoomPanel) return;
+    const room = mockRooms.find((r) => r.join_string === state.activeRoomPanel);
+    if (!room) return;
+    panel.innerHTML = "";
+
+    // ---- Header: status dot + name + close icon, meta line below. ----
+    const header = el("div", { className: "room-panel-header" });
+    const top = el("div", { className: "room-panel-header-top" });
+    top.appendChild(el("span", { className: "status-dot status-dot-joined" }));
+    top.appendChild(el("span", { className: "room-panel-title", text: room.name }));
+    top.appendChild(
+      iconButton("close", () => closeRoomPanel(), { title: "Close", className: "room-panel-close" })
+    );
+    header.appendChild(top);
+
+    // `Why:` no "joined {duration} ago" clause — neither `SavedRoomRow` nor
+    // `RoomDetail` (`src-tauri/src/dto.rs`) nor `RoomSession`
+    // (`src/session.rs`) tracks a join timestamp anywhere in the data
+    // model, and the design handoff explicitly says to omit rather than
+    // fabricate one. Adding that plumbing is backend scope this pass
+    // deliberately stays out of (see the task's SCOPE note) — a real gap,
+    // not an oversight.
+    const memberCount = (room.members || []).length + 1; // +1 for the local user, who isn't in `members` (see `loadRoomMembers`'s doc comment: it's the *other* members' roster).
+    const sendingCount = room.active_stream_count || 0;
+    const metaText = `${memberCount} member${memberCount === 1 ? "" : "s"} · you're sending ${sendingCount} stream${sendingCount === 1 ? "" : "s"} here`;
+    header.appendChild(el("div", { className: "room-panel-meta", text: metaText }));
+    panel.appendChild(header);
+
+    const body = el("div", { className: "room-panel-body" });
+
+    // ---- MEMBERS ----
+    const membersSection = el("div", { className: "room-panel-members-section" });
+    membersSection.appendChild(el("div", { className: "room-panel-section-label", text: "Members" }));
+    const memberList = el("div", { className: "room-panel-members" });
+
+    // Synthetic "you" row — no DTO exposes the local client's own display
+    // name to the frontend (`dto::SettingsDto` has no such field; see the
+    // task's audit of `commands.rs`/`dto.rs`), so this reads "You" rather
+    // than fabricating a name. A real gap, not a shortcut.
+    const youRow = el("div", { className: "room-panel-member-row room-panel-member-row-you" });
+    youRow.appendChild(el("span", { className: "room-panel-member-name", text: "You" }));
+    youRow.appendChild(el("span", { className: "room-panel-you-badge", text: "YOU" }));
+    memberList.appendChild(youRow);
+
+    (room.members || []).forEach((m) => {
+      const row = el("div", { className: "room-panel-member-row" });
+      row.appendChild(el("span", { className: "room-panel-member-name", text: m.display_name }));
+      if (m.resolution) {
+        // Sharing: a stop-watching/watch icon toggles our own subscription
+        // to their stream, reusing the real `toggle_watch` command.
+        row.appendChild(
+          iconButton(m.watching ? "visibility_off" : "visibility", () => toggleWatch(room.join_string, m), {
+            title: m.watching ? "Stop watching" : "Watch",
+            className: m.watching ? "watch-active" : "",
+          })
+        );
+      } else {
+        row.appendChild(el("span", { className: "room-panel-member-status", text: "not sharing" }));
+      }
+      memberList.appendChild(row);
+    });
+    membersSection.appendChild(memberList);
+    body.appendChild(membersSection);
+
+    // ---- AUDIO ----
+    const audioSection = el("div", { className: "room-panel-audio-section" });
+    audioSection.appendChild(el("div", { className: "room-panel-section-label", text: "Audio" }));
+    const audioRow = el("div", { className: "room-panel-audio-row" });
+    if (panelAudioSources.length === 0) {
+      audioRow.appendChild(el("span", { className: "room-panel-member-status", text: "No audio sources found." }));
+    } else {
+      const select = el("select");
+      panelAudioSources.forEach((s) => select.appendChild(el("option", { text: s.name, attrs: { value: s.id } })));
+      select.value = panelAudioSourceId;
+      select.addEventListener("change", () => {
+        panelAudioSourceId = Number(select.value);
+      });
+      audioRow.appendChild(select);
+    }
+    audioRow.appendChild(
+      primaryButton("Share Audio", () => {
+        const source = panelAudioSources.find((s) => s.id === panelAudioSourceId);
+        if (source) startPanelAudioShare(room.room_handle, source);
+      }, { disabled: panelAudioSources.length === 0, className: "room-panel-share-audio-btn" })
+    );
+    audioSection.appendChild(audioRow);
+    body.appendChild(audioSection);
+
+    // ---- ROOM NAME ----
+    const nameSection = el("div", { className: "room-panel-name-section" });
+    nameSection.appendChild(el("div", { className: "room-panel-section-label", text: "Room name" }));
+    const renameRow = el("div", { className: "room-panel-rename-row" });
+    const nameInput = el("input", { className: "field-input", attrs: { type: "text", value: room.name } });
+    renameRow.appendChild(nameInput);
+    renameRow.appendChild(
+      secondaryButton("Save", () => renamePanelRoom(room.join_string, nameInput.value.trim() || room.name))
+    );
+    nameSection.appendChild(renameRow);
+    // Verified against `rename_saved_room` (src/session.rs): it only ever
+    // touches the local `RoomStore` file (`room_store.upsert` + `.save()`)
+    // — never sends the new name over the wire — so this claim holds.
+    nameSection.appendChild(
+      el("div", { className: "room-panel-privacy-note", text: "Only you see this name. It never leaves your machine." })
+    );
+    body.appendChild(nameSection);
+
+    panel.appendChild(body);
+
+    // ---- Footer: divider (via border-top in CSS) + outline "Leave" ----
+    const footer = el("div", { className: "room-panel-footer" });
+    footer.appendChild(
+      dangerButton(
+        "Leave this room",
+        () => {
+          const joinString = room.join_string;
+          closeRoomPanel();
+          openLeaveConfirm(joinString);
+        },
+        { className: "room-panel-leave-btn" }
+      )
+    );
+    panel.appendChild(footer);
+  }
+
+  async function renamePanelRoom(joinString, newName) {
+    if (window.__TAURI__) {
+      await window.__TAURI__.core.invoke("rename_room", { joinString, newName });
+      await refreshRooms();
+      return;
+    }
+    const room = mockRooms.find((r) => r.join_string === joinString);
+    if (room) room.name = newName;
+    renderRooms();
+    renderRoomPanel();
+  }
+
+  async function fetchPanelAudioSources() {
+    if (window.__TAURI__) {
+      try {
+        return await Promise.race([
+          window.__TAURI__.core.invoke("list_audio_sources"),
+          new Promise((_, reject) => setTimeout(() => reject(new Error("timed out")), 3000)),
+        ]);
+      } catch (e) {
+        console.error("list_audio_sources failed or timed out", e);
+        return [];
+      }
+    }
+    return [
+      { id: 1, name: "System Output" },
+      { id: 2, name: "Game (app audio)" },
+    ];
+  }
+
+  async function startPanelAudioShare(roomHandle, source) {
+    if (window.__TAURI__) {
+      await window.__TAURI__.core.invoke("select_audio_source", { id: source.id, name: source.name });
+      await window.__TAURI__.core.invoke("start_audio_share", { roomHandle });
+      await refreshStreams();
+      if (window.StreamControl) window.StreamControl.refresh();
+      return;
+    }
+    mockStreams.push({
+      destination_id: Math.floor(Math.random() * 100000),
+      capture_id: Math.floor(Math.random() * 100000),
+      room_handle: roomHandle,
+      room_label: roomLabelFor(roomHandle),
+      kind: "audio",
+      state: "live",
+      width: 0,
+      height: 0,
+      framerate: 0,
+      bitrate_kbps: 128,
+    });
+    renderStreams();
+  }
+
+  // ---------------------------------------------------------------------
   // "+ Add Room" inline card
   // ---------------------------------------------------------------------
 
@@ -553,17 +833,27 @@
   async function refreshRooms() {
     mockRooms = await fetchRooms();
     // `list_saved_rooms`/`fetchRooms()` returns bare `SavedRoomRow`s with no
-    // roster (see `loadRoomMembers`'s own doc comment) — every already-
-    // expanded room's `.members` from the previous render is gone from these
-    // fresh objects. Without this, any event that calls `refreshRooms()`
-    // (this fires on `presence-updated`, i.e. routinely) would blank an
-    // expanded room's member list back to "No other members yet." even
-    // though the roster hasn't actually changed. Re-fetch it for exactly the
-    // rooms currently expanded so the visible roster survives the refresh.
-    await Promise.all(
-      mockRooms.filter((r) => state.expandedRoomIds.has(r.join_string) && r.state === "joined").map((r) => loadRoomMembers(r))
-    );
+    // roster (see `loadRoomMembers`'s own doc comment) — the open panel's
+    // `.members` from the previous render is gone from these fresh objects.
+    // Without this, any event that calls `refreshRooms()` (this fires on
+    // `presence-updated`, i.e. routinely) would blank the open panel's
+    // member list back to empty even though the roster hasn't actually
+    // changed. Re-fetch it for exactly the room the panel currently has
+    // open (if any) so the visible roster survives the refresh.
+    if (state.activeRoomPanel) {
+      const openRoom = mockRooms.find((r) => r.join_string === state.activeRoomPanel);
+      if (openRoom && openRoom.state === "joined" && openRoom.room_handle != null) {
+        await loadRoomMembers(openRoom);
+      } else {
+        // The room the panel was showing disconnected/vanished out from
+        // under it (left elsewhere, connection dropped) — there's no live
+        // detail left to show, so close it rather than render a stale or
+        // broken panel.
+        closeRoomPanel();
+      }
+    }
     renderRooms();
+    renderRoomPanel();
   }
 
   async function refreshStreams() {
@@ -658,14 +948,29 @@
       renderAddRoomCard();
     });
 
+    // Room-detail panel: clicking the scrim closes it. `#room-panel` sits
+    // inside `#room-panel-scrim` in the DOM, so a click anywhere inside the
+    // panel bubbles up to this same listener — the `e.target.id` check is
+    // what limits "closes" to a click that actually landed on the scrim's
+    // own background, not on the panel or anything in it (standard
+    // "click outside" pattern).
+    document.getElementById("room-panel-scrim").addEventListener("click", (e) => {
+      if (e.target.id === "room-panel-scrim") closeRoomPanel();
+    });
+
     // "ESC to cancel" — the leave-confirm modal's footer hint (see
-    // `renderLeaveModal`). Wired unconditionally (not gated behind
-    // `window.__TAURI__`) so it works the same in a mock/browser-preview
-    // session as in the real app.
+    // `renderLeaveModal`) — and the same key closes the room-detail panel
+    // when it's the frontmost thing open (the leave modal, if also open,
+    // takes priority since it renders on top of the panel). Wired
+    // unconditionally (not gated behind `window.__TAURI__`) so it works the
+    // same in a mock/browser-preview session as in the real app.
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && state.pendingLeaveRoomId) {
+      if (e.key !== "Escape") return;
+      if (state.pendingLeaveRoomId) {
         state.pendingLeaveRoomId = null;
         renderLeaveModal();
+      } else if (state.activeRoomPanel) {
+        closeRoomPanel();
       }
     });
 
