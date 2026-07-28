@@ -450,7 +450,12 @@
     );
     actions.appendChild(
       el("button", {
-        className: "btn btn-danger",
+        // Solid red, per the prototype's leave-confirm: Cancel is the
+        // outlined/neutral option on the left and the destructive action is
+        // the filled one on the right, "where the eye lands last". Both
+        // being outlines gave them equal weight and left the dialog with no
+        // visual primary at all.
+        className: "btn btn-danger-solid",
         text: "Leave room",
         onClick: async () => {
           const joinString = state.pendingLeaveRoomId;
@@ -1040,9 +1045,64 @@
     document.querySelectorAll(".tab-panel").forEach((panel) => {
       panel.hidden = panel.dataset.tab !== state.activeTab;
     });
+
+    initRangeFill();
   }
 
-  window.Shell = { refreshRooms, refreshStreams, refreshAll };
+  // -------------------------------------------------------------------
+  // Slider fill (design-fidelity pass, 2026-07-28).
+  //
+  // The prototype's sliders show an accent GRADIENT filling the track up to
+  // the thumb. Chromium — the engine behind both the Tauri webview target
+  // and Electron — has no `::-moz-range-progress` equivalent and cannot
+  // paint that natively, so CSS alone leaves every slider as a flat grey
+  // groove (which is what shipped). Firefox-family engines get the fill for
+  // free from the `::-moz-range-progress` rule in shell.css.
+  //
+  // Rather than hand-roll a div-based slider — losing keyboard support, the
+  // native drag behaviour and the a11y semantics of a real `input[range]` —
+  // publish the value as a percentage in `--range-pct` and let CSS draw the
+  // fill as a hard-stop gradient on the track. Delegated at the document,
+  // and re-applied on each `render()`, because most of these inputs are
+  // re-created wholesale by their tab.
+  // -------------------------------------------------------------------
+
+  function paintRange(input) {
+    const min = Number(input.min || 0);
+    const max = Number(input.max || 100);
+    const span = max - min;
+    const pct = span > 0 ? ((Number(input.value) - min) / span) * 100 : 0;
+    input.style.setProperty("--range-pct", pct.toFixed(2) + "%");
+  }
+
+  let rangeDelegated = false;
+
+  function initRangeFill() {
+    document.querySelectorAll('input[type="range"]').forEach(paintRange);
+    if (rangeDelegated) return;
+    rangeDelegated = true;
+
+    // Drag/keyboard updates.
+    document.addEventListener("input", (e) => {
+      if (e.target && e.target.matches && e.target.matches('input[type="range"]')) paintRange(e.target);
+    });
+
+    // Initial paint for sliders that appear later. Stream Control and
+    // Settings re-create their inputs inside their own `render()`, which
+    // this module neither calls nor is called by — an observer keeps the
+    // fill correct without every tab having to remember to ask for it.
+    new MutationObserver((records) => {
+      for (const rec of records) {
+        for (const node of rec.addedNodes) {
+          if (node.nodeType !== 1) continue;
+          if (node.matches('input[type="range"]')) paintRange(node);
+          node.querySelectorAll && node.querySelectorAll('input[type="range"]').forEach(paintRange);
+        }
+      }
+    }).observe(document.body, { childList: true, subtree: true });
+  }
+
+  window.Shell = { refreshRooms, refreshStreams, refreshAll, paintRanges: initRangeFill };
 
   document.addEventListener("DOMContentLoaded", init);
 })();

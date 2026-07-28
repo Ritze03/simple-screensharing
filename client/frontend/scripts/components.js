@@ -615,8 +615,35 @@
     // out-of-band by `stream-control.js`'s `updateStats()`, same as the FPS
     // readout right below — no historical stats are fetched here, just a
     // fixed-size row of bar elements for that function to write into.
+    // The prototype breaks these numbers out as LABELLED columns in a sunken
+    // inset — RESOLUTION / FRAMERATE / BITRATE, each a micro-caps label over
+    // a tabular value, sparkline pushed to the right end. That
+    // labelled-instrument look is a good part of what the owner meant by
+    // "futuristic"; the port had collapsed it to one unlabelled string
+    // ("1920x1080 @ 30fps"), which read as a stray caption once the strip
+    // gained its inset styling.
     const metaRow = el("div", { className: "dest-meta-row" });
-    metaRow.appendChild(el("div", { className: "dest-meta", text: `${dest.width}x${dest.height} @ ${dest.framerate}fps` }));
+
+    const metric = (label, value) =>
+      el("div", { className: "dest-metric" }, [
+        el("span", { className: "dest-metric-label", text: label }),
+        el("span", { className: "dest-metric-value", text: value }),
+      ]);
+
+    if (dest.kind === "audio") {
+      // An audio destination has no resolution/framerate to report.
+      metaRow.appendChild(metric("Bitrate", `${dest.bitrate_kbps} kbps`));
+    } else {
+      metaRow.appendChild(metric("Resolution", `${dest.width}×${dest.height}`));
+      metaRow.appendChild(metric("Framerate", `${dest.framerate} fps`));
+      metaRow.appendChild(metric("Bitrate", `${dest.bitrate_kbps} kbps`));
+    }
+
+    // Kept (now empty) so anything still keying off `.dest-meta` finds it;
+    // the visible text moved into the metric columns above. Also acts as
+    // the flex spacer that pushes the sparkline to the right edge.
+    metaRow.appendChild(el("div", { className: "dest-meta" }));
+
     const sparkline = el("div", { className: "dest-sparkline", attrs: { hidden: "" } });
     for (let i = 0; i < 6; i++) sparkline.appendChild(el("span", { className: "spark-bar spark-bar-empty" }));
     metaRow.appendChild(sparkline);
@@ -672,6 +699,14 @@
     // stream-control.md's "Absolute mode ... allocator writes live bitrates
     // straight into the encoders without ever touching the manual values").
     if (opts.perStreamBitrateEditable) {
+      // All four tuning rows share ONE grid so their label / control /
+      // value columns line up (see `.dest-edit-grid` in
+      // stream-control.css). Previously each row was an independent flex
+      // container, so the control's start X was a function of its own
+      // label's text width — "Bitrate (kbps)" and "Tune" began in
+      // different places and the group read as ragged.
+      const editGrid = el("div", { className: "dest-edit-grid" });
+
       const editRow = el("div", { className: "dest-edit-row" });
       editRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Bitrate (kbps)" }));
       const slider = el("input", {
@@ -687,7 +722,7 @@
       });
       editRow.appendChild(slider);
       editRow.appendChild(value);
-      body.appendChild(editRow);
+      editGrid.appendChild(editRow);
 
       // Three testing-oriented encoder tuning knobs (`edit_destination`'s
       // `tune`/`quality_level`/`rate_control`) — same `pillSwitch` widget as
@@ -711,7 +746,11 @@
           (value) => applyTuning({ tune: value })
         )
       );
-      body.appendChild(tuneRow);
+      // Empty value cell: `.dest-edit-row` is `display: contents`, so each
+      // row must contribute exactly three children or grid auto-placement
+      // spills the next row's label into the value column.
+      tuneRow.appendChild(el("span"));
+      editGrid.appendChild(tuneRow);
 
       const qualityRow = el("div", { className: "dest-edit-row" });
       qualityRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Quality Level" }));
@@ -725,7 +764,11 @@
           (value) => applyTuning({ qualityLevel: value })
         )
       );
-      body.appendChild(qualityRow);
+      // Empty value cell: `.dest-edit-row` is `display: contents`, so each
+      // row must contribute exactly three children or grid auto-placement
+      // spills the next row's label into the value column.
+      qualityRow.appendChild(el("span"));
+      editGrid.appendChild(qualityRow);
 
       const rateControlRow = el("div", { className: "dest-edit-row" });
       rateControlRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Rate Control" }));
@@ -740,7 +783,13 @@
           (value) => applyTuning({ rateControl: value })
         )
       );
-      body.appendChild(rateControlRow);
+      // Empty value cell: `.dest-edit-row` is `display: contents`, so each
+      // row must contribute exactly three children or grid auto-placement
+      // spills the next row's label into the value column.
+      rateControlRow.appendChild(el("span"));
+      editGrid.appendChild(rateControlRow);
+
+      body.appendChild(editGrid);
 
       if (editState.error) {
         body.appendChild(el("div", { className: "dest-edit-error", text: editState.error }));

@@ -709,8 +709,11 @@
       })
     );
 
+    // `-muted`: the prototype draws the audio row as a plain surface, not
+    // the dashed-accent invitation "Share another screen" gets — two
+    // equally loud ghost rows compete (see stream-control.css).
     const audioRow = el("div", {
-      className: "sc-ghost-row",
+      className: "sc-ghost-row sc-ghost-row-muted",
       attrs: { role: "button", tabindex: "0" },
       onClick: () => {
         const opening = audioExpand.hidden;

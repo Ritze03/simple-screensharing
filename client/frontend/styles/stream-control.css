@@ -37,34 +37,52 @@
   color: var(--text-dim);
 }
 
+/* Slider rows share ONE grid, so every track starts at the same X.
+ *
+ * Bug this fixes (owner review): each `.sc-bandwidth-field` used to be its
+ * own flex row, so the slider's start position was pushed right by the
+ * width of that row's own label — "Total maximum" and "Floor per stream"
+ * are different lengths, so the two tracks began at different X and the
+ * group read as ragged rather than as a column.
+ *
+ * `.sc-bandwidth-field` is `display: contents`, which promotes its label /
+ * slider / value into THIS grid, so all rows resolve against the same three
+ * column tracks. `max-content` on the label column means the column
+ * auto-sizes to the longest label rather than to a guessed fixed width —
+ * which matters because the German strings run ~30% longer and a hardcoded
+ * px width would either clip them or leave a gutter in English.
+ */
 .sc-bandwidth-controls {
-  display: flex;
+  display: grid;
+  grid-template-columns: max-content minmax(120px, 1fr) max-content;
   align-items: center;
-  flex-wrap: wrap;
-  gap: 8px 16px;
+  gap: 10px 14px;
   font-size: 12px;
   color: var(--text-dim);
 }
 
 .sc-bandwidth-field {
-  display: flex;
-  align-items: center;
-  gap: 6px;
+  display: contents;
 }
 
 .sc-bandwidth-field input[type="range"] {
-  width: 160px;
+  width: 100%;
+  min-width: 0;
 }
 
 .sc-bandwidth-field-value {
   color: var(--text);
   font-weight: 600;
+  font-variant-numeric: tabular-nums;
   min-width: var(--value-w);
-  display: inline-block;
+  text-align: right;
 }
 
+/* Full-bleed explanatory line under the grid. */
 .sc-fanout-note {
+  grid-column: 1 / -1;
   font-size: 11px;
+  line-height: 1.6;
   color: var(--text-faint);
 }
 
@@ -84,18 +102,34 @@
 /* Card is thumbnail (left) + a flex-column content body (right). Failed
    cards override back to a plain column below — they have no thumb/body
    split, just a head + the status.css failed box. */
+/* Elevation, corrected. This was filled with --panel-sunken — DARKER than
+   the page — so every active share read as a hole punched in the surface
+   rather than a card resting on it. The prototype fills it with a subtle
+   vertical lift off --panel-raised, at the full 14px card radius, and lets
+   the 4px state bar down the left edge carry the colour. */
 .dest-card {
-  background: var(--panel-sunken);
-  border: 1px solid var(--border-light);
-  border-radius: var(--rounding-sm);
-  padding: 10px 10px 10px 14px;
+  background: var(--card-gradient);
+  border: 1px solid var(--border);
+  border-radius: var(--rounding);
+  padding: 13px 13px 13px 17px;
   display: flex;
   flex-direction: row;
-  align-items: flex-start;
-  gap: 12px;
+  align-items: stretch;
+  gap: 15px;
   min-width: 0;
   position: relative;
   overflow: hidden; /* keeps the accent bar within the card's rounded corners */
+  /* Depth. The prototype is a flat mockup and paints no shadow on these,
+     but a card that casts nothing reads as a coloured rectangle rather
+     than a surface; a restrained ambient shadow plus a hairline top
+     highlight is what sells the elevation the palette is already
+     implying. Deliberate deviation, kept subtle. */
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25), 0 6px 18px rgba(0, 0, 0, 0.18);
+  transition: box-shadow 160ms ease, border-color 160ms ease;
+}
+
+.dest-card:hover {
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25), 0 10px 26px rgba(0, 0, 0, 0.26);
 }
 
 .dest-card-body {
@@ -118,8 +152,10 @@
   width: 4px;
 }
 
+/* The live bar fades out downward rather than being a flat green stripe —
+   it reads as light spilling from the top of the card. */
 .dest-card-live::before {
-  background: var(--success);
+  background: linear-gradient(180deg, var(--success) 0%, rgba(80, 200, 120, 0.15) 100%);
 }
 
 @keyframes dest-accent-bar-march {
@@ -147,11 +183,11 @@
 }
 
 .dest-card-stalled {
-  border-color: var(--warning);
+  border-color: var(--hatch-amber-border);
 }
 
 .dest-card-failed {
-  border-color: var(--danger);
+  border-color: var(--danger-border);
   /* No thumb/body split for a failed card — just the head + status.css's
      failed box, stacked. */
   flex-direction: column;
@@ -161,21 +197,72 @@
    `components.js`'s `destinationCard` doc comment for why: a real live
    self-preview needs a backend addition this frontend-only pass doesn't
    make). Fixed 160x90 per the design handoff. */
+/* A preview thumb stands in for a SCREEN. The prototype paints it as a
+   dark video well — near-black, a fine diagonal weave for texture, a
+   hairline edge, and (when live) a green ring plus a soft outer bloom, so
+   the thumb itself signals "this is on air".
+
+   What shipped instead was a saturated blue-gradient rectangle with a
+   camera glyph on it: the loudest, least screen-like element on the page,
+   and the thing that most made the tab read as flat/generic rather than
+   the mockup's dark-and-lit look. */
 .dest-thumb {
   flex: 0 0 auto;
   width: 160px;
-  height: 90px;
-  border-radius: var(--rounding-sm);
-  background: linear-gradient(135deg, var(--pill-accent-bg-light), var(--pill-accent-bg));
+  aspect-ratio: 16 / 9;
+  height: auto;
+  align-self: flex-start;
+  border-radius: var(--rounding-md);
+  background-color: var(--tile-bg);
+  background-image: var(--screen-hatch);
+  border: 1px solid var(--divider);
   display: flex;
   align-items: center;
   justify-content: center;
+  position: relative;
+  overflow: hidden;
+}
+
+/* Live share: green ring + bloom (--thumb-ring-live). */
+.dest-card-live .dest-thumb {
+  box-shadow: var(--thumb-ring-live);
+}
+
+/* Degraded share: amber edge + amber hatch wash over the weave. */
+.dest-card-stalled .dest-thumb {
+  border-color: var(--hatch-amber-border);
+  background-image: var(--hatch-amber-gradient-soft), var(--screen-hatch);
 }
 
 .dest-thumb-icon {
-  font-size: 28px;
+  font-size: 24px;
+  color: var(--text-faint);
+  font-variation-settings: "wght" 300;
+}
+
+.dest-card-live .dest-thumb-icon {
+  color: var(--success);
+}
+
+.dest-card-stalled .dest-thumb-icon {
+  color: var(--warning);
+}
+
+/* "ON AIR" corner plate on a live thumb — prototype 1b/1i. Pure CSS, no
+   markup: the thumb is the positioning context. */
+.dest-card-live .dest-thumb::after {
+  content: "ON AIR";
+  position: absolute;
+  left: 7px;
+  top: 6px;
+  padding: 3px 7px;
+  border-radius: 5px;
+  background: rgba(10, 11, 13, 0.8);
   color: var(--text);
-  opacity: 0.85;
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  line-height: 1;
 }
 
 @media (max-width: 460px) {
@@ -212,16 +299,50 @@
   color: var(--accent);
 }
 
+/* Metric strip. The prototype breaks the card's numbers out into a SUNKEN
+   inset within the card (resolution / encoder / bitrate + the sparkline),
+   which is what gives the card its instrument-panel feel. The port left
+   them as a bare text line floating on the card. Styling the existing
+   `.dest-meta-row` as that inset gets the same read without restructuring
+   the row into labelled columns. */
 .dest-meta-row {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 10px 22px;
+  padding: 9px 12px;
+  background: var(--elevation-1b);
+  border: 1px solid var(--inset-border);
+  border-radius: var(--rounding-md);
 }
 
+/* Spacer that pushes the sparkline to the right edge (see components.js). */
 .dest-meta {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* One labelled metric column: micro-caps label over a tabular value. */
+.dest-metric {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.dest-metric-label {
+  font-size: 9px;
+  font-weight: 400;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.dest-metric-value {
   font-size: 12px;
-  color: var(--text-dim);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
 }
 
 /* Inline 6-bar sparkline — a small client-side rolling window of
@@ -239,15 +360,32 @@
   display: none;
 }
 
+/* Green, not blue. In the prototype the throughput sparkline is part of
+   the LIVE (green) vocabulary, ramping from a dim green through to full
+   --success at the newest sample; rendering it in accent blue put it in
+   the "in progress" family instead, which is the opposite signal. */
 .spark-bar {
   width: 3px;
   min-height: 2px;
   border-radius: 1px;
-  background: var(--pill-accent-bg-lighter);
+  background: var(--success);
 }
 
-.spark-bar-empty {
-  background: var(--border-light);
+/* Older samples sit back on the dimmer greens the prototype uses for the
+   left-hand end of the ramp. */
+.spark-bar:nth-child(1),
+.spark-bar:nth-child(2) {
+  background: var(--pill-success-bg-dim);
+}
+
+.spark-bar:nth-child(3),
+.spark-bar:nth-child(4) {
+  background: var(--pill-success-bg);
+}
+
+.spark-bar-empty,
+.spark-bar-empty:nth-child(n) {
+  background: var(--divider);
   height: 2px;
 }
 
@@ -261,14 +399,32 @@
   gap: 4px;
 }
 
+/* A destination chip names a ROOM this capture is already going to — in
+   the prototype it's a dark, hairline-bordered tag with a live green dot,
+   not the solid navy pill this shipped with (which competed with the
+   accent-blue "add" affordance right next to it and made the two look
+   like the same kind of control). */
 .dest-chip {
-  font-size: 10px;
-  font-weight: 600;
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: var(--pill-accent-bg);
-  color: var(--pill-accent-bg-lighter);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 400;
+  padding: 5px 10px 5px 8px;
+  border-radius: var(--rounding-sm);
+  background: var(--elevation-1b);
+  border: 1px solid var(--divider);
+  color: var(--text);
   white-space: nowrap;
+}
+
+.dest-chip::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--success);
 }
 
 .dest-chip-inline-add {
@@ -277,18 +433,21 @@
   gap: 4px;
 }
 
+/* Dashed ACCENT — the prototype's "add a room" affordance, matching every
+   other ghost/add control (see shell.css's `.ghost-add-room-row`). */
 .dest-chip-add-btn {
-  font-size: 10px;
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: transparent;
-  border: 1px dashed var(--border);
-  color: var(--text-faint);
+  font-size: 11px;
+  padding: 5px 10px 5px 8px;
+  border-radius: var(--rounding-sm);
+  background: var(--accent-chip-bg);
+  border: 1px dashed var(--accent-chip-border);
+  color: var(--accent);
   cursor: pointer;
 }
 
 .dest-chip-add-btn:hover {
   border-color: var(--accent);
+  background: var(--accent-ghost-bg-hover);
   color: var(--accent);
 }
 
@@ -314,30 +473,56 @@
   display: none;
 }
 
-.dest-edit-row {
-  display: flex;
+/* Same shared-grid treatment as `.sc-bandwidth-controls` above (see its
+   note): the four per-destination tuning rows — Bitrate / Tune / Quality
+   Level / Rate Control — line their controls up in one column instead of
+   each starting wherever its own label happens to end. The value column is
+   `auto` because only the Bitrate row has a readout; the three pillSwitch
+   rows simply leave that cell empty. */
+.dest-edit-grid {
+  display: grid;
+  grid-template-columns: max-content minmax(100px, 1fr) auto;
   align-items: center;
-  gap: 6px;
-  font-size: 11px;
+  gap: 8px 10px;
+  padding-top: 10px;
+  margin-top: 2px;
+  border-top: 1px solid var(--divider);
+}
+
+.dest-edit-row {
+  display: contents;
 }
 
 .dest-edit-label {
   margin: 0;
   white-space: nowrap;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+/* The three pillSwitch rows have no value cell — stop their control
+   stretching across it, so every switch is left-aligned in column 2. */
+.dest-edit-row .mode-toggle {
+  justify-self: start;
 }
 
 .dest-bitrate-slider {
-  flex: 1 1 auto;
-  min-width: 60px;
+  width: 100%;
+  min-width: 0;
 }
 
 .dest-bitrate-value {
   color: var(--text);
   font-weight: 600;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
-  min-width: 60px;
+  min-width: 72px;
   text-align: right;
 }
+
 
 .dest-edit-error {
   color: var(--danger);
@@ -511,21 +696,43 @@
   margin-top: 10px;
 }
 
+/* "Share another screen" is the prototype's headline invitation on this
+   tab: a full-width 48px dashed-accent row with a faint accent wash and an
+   accent label. It was a grey dashed outline with grey text — visually a
+   disabled placeholder rather than the main call to action. */
 .sc-ghost-row {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 10px;
-  border: 1px dashed var(--border);
-  border-radius: var(--rounding-sm);
-  color: var(--text-dim);
+  gap: 11px;
+  min-height: 48px;
+  padding: 0 13px;
+  border: 1px dashed var(--accent-ghost-border);
+  border-radius: var(--rounding-well);
+  background: var(--accent-ghost-bg);
+  color: var(--accent);
   font-size: 12px;
+  font-weight: 600;
   cursor: pointer;
-  background: none;
+  transition: background-color 120ms ease;
 }
 
 .sc-ghost-row:hover {
   border-color: var(--accent);
+  background: var(--accent-ghost-bg-hover);
+  color: var(--accent);
+}
+
+/* Secondary ghost ("Share audio") stays muted — the prototype gives it a
+   plain surface, so the two entry points aren't equally loud. */
+.sc-ghost-row-muted {
+  border: 1px solid var(--divider);
+  background: var(--elevation-1b);
+  color: var(--text-dim);
+}
+
+.sc-ghost-row-muted:hover {
+  border-color: var(--btn-border);
+  background: var(--elevation-1b);
   color: var(--text);
 }
 

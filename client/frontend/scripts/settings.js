@@ -67,36 +67,59 @@
     render();
   }
 
+  // Layout note (2026-07-28 design-fidelity pass): the prototype's Settings
+  // tab is a stack of *one-concern cards*, each headed by its own micro-caps
+  // label (LANGUAGE / PRESENTATION MODE / ...) — not one "SETTINGS" card with
+  // every control crammed in as label-on-the-left rows. Two things were
+  // genuinely missing rather than merely mis-styled, and the owner's review
+  // ("I'm missing some settings") is about these:
+  //
+  //   1. The prose under PRESENTATION MODE explaining what the modes trade
+  //      off. Without it the dropdown is three meaningless words.
+  //   2. The closing info/about card. It's the only place the app states
+  //      its local-only privacy property, which is a product promise, not
+  //      decoration.
+  //
+  // No control was added or removed: `max_jitter_buffer_ms` postdates the
+  // mockup and keeps its slider, moved into a PLAYBACK card of its own.
   function render() {
     const root = document.getElementById("settings-root");
     if (!root) return;
     root.innerHTML = "";
 
-    const langRow = el("div", { className: "settings-row" });
-    langRow.appendChild(el("span", { className: "settings-row-label", text: "Language" }));
-    langRow.appendChild(
-      pillSwitch(
-        [
-          { value: "en", label: "English" },
-          { value: "de", label: "Deutsch" },
-        ],
-        state.language,
-        (lang) => setLanguage(lang)
-      )
+    // -- LANGUAGE ---------------------------------------------------------
+    const langSwitch = pillSwitch(
+      [
+        { value: "en", label: "English" },
+        { value: "de", label: "Deutsch" },
+      ],
+      state.language,
+      (lang) => setLanguage(lang)
     );
+    langSwitch.classList.add("settings-segmented");
 
-    const presentationRow = el("div", { className: "settings-row" });
-    presentationRow.appendChild(el("span", { className: "settings-row-label", text: "Presentation mode" }));
+    // -- PRESENTATION MODE ------------------------------------------------
     const select = el("select", { className: "settings-select" });
     PRESENTATION_MODES.forEach((m) => select.appendChild(el("option", { text: m.label, attrs: { value: m.value } })));
     select.value = state.presentation_mode;
     select.addEventListener("change", () => setPresentationMode(select.value));
-    presentationRow.appendChild(select);
 
-    const hint = el("div", { className: "settings-hint", text: "Presentation mode changes take effect after restarting the app." });
+    const presentationRow = el("div", { className: "settings-control-row" }, [
+      select,
+      // Inline, next to the control it qualifies — per the prototype, where
+      // "Restart to apply" sits beside the dropdown rather than as a
+      // full-width sentence below it.
+      el("span", { className: "settings-hint settings-hint-inline", text: "Restart to apply" }),
+    ]);
 
-    const jitterRow = el("div", { className: "settings-row" });
-    jitterRow.appendChild(el("span", { className: "settings-row-label", text: "Max jitter buffer" }));
+    const presentationBlurb = el("p", {
+      className: "settings-blurb",
+      text:
+        "Vsync is smoothest. Mailbox and Immediate trade a little tearing for lower latency — " +
+        "worth trying if a stream feels behind.",
+    });
+
+    // -- PLAYBACK (jitter buffer) -----------------------------------------
     const jitterValue = el("span", { className: "settings-row-value", text: `${(state.max_jitter_buffer_ms / 1000).toFixed(1)}s` });
     const jitterSlider = el("input", {
       className: "settings-range",
@@ -106,16 +129,36 @@
       jitterValue.textContent = `${(Number(jitterSlider.value) / 1000).toFixed(1)}s`;
     });
     jitterSlider.addEventListener("change", () => setMaxJitterBufferMs(Number(jitterSlider.value)));
-    jitterRow.appendChild(jitterSlider);
-    jitterRow.appendChild(jitterValue);
 
-    const jitterHint = el("div", {
-      className: "settings-hint",
+    const jitterRow = el("div", { className: "settings-row" }, [
+      el("span", { className: "settings-row-label", text: "Max jitter buffer" }),
+      jitterSlider,
+      jitterValue,
+    ]);
+
+    const jitterBlurb = el("p", {
+      className: "settings-blurb",
       text: "Smooths network hiccups. The buffer grows automatically only when needed, up to this ceiling.",
     });
 
+    // -- About ------------------------------------------------------------
+    // Deliberately no version number: the prototype shows "0.4", but that
+    // was the designer's placeholder and there is no command exposing the
+    // real crate version to the frontend yet. Printing a made-up version is
+    // worse than printing none. See FRONTEND-SHELL.md's 2026-07-28 note.
+    const about = el("div", { className: "card settings-about" }, [
+      el("span", { className: "material-symbols-outlined settings-about-icon", text: "info" }),
+      el("span", {
+        className: "settings-about-text",
+        text: "Simple Screensharing — nothing but your preferences and room list is stored on this machine.",
+      }),
+    ]);
+
     const grid = el("div", { className: "settings-grid" });
-    grid.appendChild(card("SETTINGS", [langRow, presentationRow, hint, jitterRow, jitterHint]));
+    grid.appendChild(card("LANGUAGE", [langSwitch]));
+    grid.appendChild(card("PRESENTATION MODE", [presentationRow, presentationBlurb]));
+    grid.appendChild(card("PLAYBACK", [jitterRow, jitterBlurb]));
+    grid.appendChild(about);
     root.appendChild(grid);
   }
 
