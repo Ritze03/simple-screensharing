@@ -41,6 +41,11 @@ const SIDECAR_PATH = process.env.SIDECAR_BIN || path.join(__dirname, "..", "targ
 const FRONTEND_INDEX = path.join(__dirname, "..", "frontend", "index.html");
 const VIEWER_HTML = path.join(__dirname, "..", "frontend", "viewer.html");
 const PRELOAD = path.join(__dirname, "preload.js");
+// 256px source: large enough for the window manager/taskbar to downscale
+// cleanly on Linux without passing multiple sizes (Electron scales a single
+// PNG itself). See `superdoc/ui/APP-SHELL.md`'s icon note for the full kept-
+// resolution rationale.
+const APP_ICON = path.join(__dirname, "..", "frontend", "assets", "icons", "mark-256.png");
 
 let apiToken = null;
 let apiPort = null;
@@ -314,6 +319,7 @@ function createWindow() {
     width: 800,
     height: 600,
     title: "Simple Screensharing",
+    icon: APP_ICON,
     webPreferences: {
       preload: PRELOAD,
       contextIsolation: true,
@@ -374,6 +380,10 @@ async function openPopoutWindow(streamKey, meta) {
     width: 640,
     height: 400,
     title: "Simple Screensharing — Stream",
+    // Each pop-out is its own top-level OS window and gets its own taskbar
+    // entry (Linux/Windows), so it carries the same app icon as the main
+    // window rather than falling back to Electron's default icon.
+    icon: APP_ICON,
     webPreferences: {
       preload: PRELOAD,
       contextIsolation: true,
