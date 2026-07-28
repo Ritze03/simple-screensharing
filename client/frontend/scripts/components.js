@@ -1103,10 +1103,52 @@
     };
     rebuildOptions();
     picker.appendChild(select);
+
+    // While the picker stays open, which applications are producing audio
+    // can keep changing (an app can start playing well after the picker was
+    // opened) — poll `list_audio_sources` again periodically so the list
+    // catches up without the user having to close and reopen the picker.
+    // Owns its own `setInterval` and stops itself once the picker is no
+    // longer visible/attached, same self-stopping `isConnected` pattern
+    // `statusBadge`'s degraded-elapsed-time ticker uses above (this
+    // codebase's render paths have no uniform unmount hook to call a
+    // `.destroy()` from instead).
+    const AUDIO_SOURCE_POLL_MS = 5000;
+    let audioPollId = null;
+    function stopAudioSourcePolling() {
+      if (audioPollId !== null) {
+        clearInterval(audioPollId);
+        audioPollId = null;
+      }
+    }
+    function startAudioSourcePolling() {
+      if (audioPollId !== null || !handlers.onRefreshAudioSources) return;
+      audioPollId = setInterval(async () => {
+        if (!picker.isConnected || picker.hidden) {
+          stopAudioSourcePolling();
+          return;
+        }
+        const fresh = await handlers.onRefreshAudioSources();
+        if (!picker.isConnected || picker.hidden) {
+          // The picker could have closed (or the whole card been rebuilt
+          // out from under it) while the await above was in flight.
+          stopAudioSourcePolling();
+          return;
+        }
+        if (Array.isArray(fresh)) {
+          sources = fresh;
+          const previousValue = select.value;
+          rebuildOptions();
+          if (sources.some((s) => String(s.id) === previousValue)) select.value = previousValue;
+        }
+      }, AUDIO_SOURCE_POLL_MS);
+    }
+
     picker.appendChild(
       primaryButton("Share", () => {
         const source = sources.find((s) => String(s.id) === select.value);
         if (source) handlers.onAddAudio && handlers.onAddAudio(dest, source);
+        stopAudioSourcePolling();
       }, { className: "dest-audio-share-btn" })
     );
 
@@ -1127,6 +1169,7 @@
         addBtn.hidden = true;
         picker.hidden = false;
         select.focus();
+        startAudioSourcePolling();
       },
     });
     row.appendChild(icon("volume_off", "dest-audio-empty-icon"));
