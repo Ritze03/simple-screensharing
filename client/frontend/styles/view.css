@@ -260,6 +260,14 @@
 .media-tile-overlay {
   position: absolute;
   inset: 0;
+  /* Must outrank .media-tile-statbar's z-index: 1 — both are positioned
+     siblings occupying the same top-of-tile region (the statbar is
+     always-visible; this overlay's `.media-tile-overlay-top` actions sit in
+     the exact same corner on hover), and CSS paints a z-index: auto sibling
+     UNDER a sibling with an explicit z-index regardless of DOM order. Without
+     this, the pop-out/stop-watching buttons render (and were reported as)
+     drawn below the statbar's gradient. */
+  z-index: 2;
   display: flex;
   flex-direction: column;
   justify-content: space-between;

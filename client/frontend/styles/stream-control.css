@@ -611,13 +611,18 @@
   font-weight: 700;
 }
 
+/* `padding` bumped from the original `3px 4px` (which rendered at ~23px —
+   visibly shorter than the app's standard 32px `.btn` height right next to
+   it, e.g. "Go live"/"Cancel" on the same staged card) up to match: real
+   Electron measurement, see `superdoc/ui/FRONTEND-SHELL.md`'s 2026-07-29
+   "dropdowns were shorter than buttons" entry. */
 .dest-room-select {
   background: var(--field);
   border: 1px solid var(--border);
   border-radius: var(--rounding-sm);
   color: var(--text);
   font-size: 11px;
-  padding: 3px 4px;
+  padding: 8px 8px;
   max-width: 110px;
 }
 
