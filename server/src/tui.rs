@@ -509,6 +509,20 @@ fn draw(frame: &mut Frame, app: &App, snap: &Snapshot) {
     );
 }
 
+/// Fixed width for the rate segment of the "Bandwidth in:"/"Bandwidth out:"
+/// lines, sized to comfortably fit the longest plausible `fmt_rate` output
+/// ("1023.9 GB/s" is 11 chars, since `fmt_rate` only rolls over to the next
+/// unit once the value reaches 1024). Keeps the "(total ..." text that
+/// follows starting at the same column on both lines regardless of the
+/// rate's actual digit count.
+const BANDWIDTH_RATE_COL_WIDTH: usize = 11;
+
+/// Fixed width for the total-value segment inside "(total ...)" on the
+/// bandwidth lines, sized to comfortably fit the longest plausible
+/// `fmt_bytes` output ("1023.9 PB" is 9 chars). Keeps both lines'
+/// parenthetical blocks the same shape as totals grow at different rates.
+const BANDWIDTH_TOTAL_COL_WIDTH: usize = 9;
+
 fn draw_overview(frame: &mut Frame, area: Rect, app: &App, snap: &Snapshot) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -533,13 +547,31 @@ fn draw_overview(frame: &mut Frame, area: Rect, app: &App, snap: &Snapshot) {
         ]),
         Line::from(vec![
             Span::raw("Bandwidth in:  "),
-            Span::styled(fmt_rate(app.rx_rate), Style::default().fg(Color::Green)),
-            Span::raw(format!("   (total {})", fmt_bytes(snap.total_rx))),
+            Span::styled(
+                right_pad_column(fmt_rate(app.rx_rate), BANDWIDTH_RATE_COL_WIDTH),
+                Style::default().fg(Color::Green),
+            ),
+            Span::styled(
+                format!(
+                    "   (total {})",
+                    right_pad_column(fmt_bytes(snap.total_rx), BANDWIDTH_TOTAL_COL_WIDTH)
+                ),
+                Style::default().fg(Color::Green),
+            ),
         ]),
         Line::from(vec![
             Span::raw("Bandwidth out: "),
-            Span::styled(fmt_rate(app.tx_rate), Style::default().fg(Color::Green)),
-            Span::raw(format!("   (total {})", fmt_bytes(snap.total_tx))),
+            Span::styled(
+                right_pad_column(fmt_rate(app.tx_rate), BANDWIDTH_RATE_COL_WIDTH),
+                Style::default().fg(Color::Yellow),
+            ),
+            Span::styled(
+                format!(
+                    "   (total {})",
+                    right_pad_column(fmt_bytes(snap.total_tx), BANDWIDTH_TOTAL_COL_WIDTH)
+                ),
+                Style::default().fg(Color::Yellow),
+            ),
         ]),
     ];
     let block = Block::default().borders(Borders::ALL).title(" Overview ");
