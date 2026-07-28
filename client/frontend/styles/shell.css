@@ -682,6 +682,21 @@ input[type="range"]:focus-visible::-webkit-slider-thumb {
   font-weight: 700;
 }
 
+/* Join/Create tabs on the "Create/Join a Room" card: each segment gets
+   exactly 50% of the row, not its own text-sized width (so "Join" and
+   "Create" render the same width). Same scoped-modifier pattern as
+   settings.css's `.settings-segmented` (language switch) — a class on this
+   particular `pillSwitch` instance, not a change to `.mode-toggle-btn`
+   itself, which other pillSwitch call sites (bandwidth mode, language,
+   encoder preset) still rely on sizing to content. */
+.add-room-tabs {
+  width: 100%;
+}
+
+.add-room-tabs .mode-toggle-btn {
+  flex: 1 1 0;
+}
+
 /* -------------------------------------------------------------------
  * "+ Add Room"
  * ----------------------------------------------------------------- */

@@ -355,26 +355,37 @@
    * drift into two slightly different validation/error paths. */
   function renderRoomsEmptyState() {
     const linkInput = el("input", { className: "field-input", attrs: { type: "text", placeholder: "server | room-id | key" } });
-    const nameInput = el("input", { className: "field-input", attrs: { type: "text", placeholder: "Display name (optional)" } });
     const errorText = el("div", { className: "add-room-error", text: "" });
     errorText.hidden = true;
-    const inline = el("div", { className: "empty-state-inline" }, [linkInput, nameInput, errorText]);
+    const inline = el("div", { className: "empty-state-inline" }, [linkInput, errorText]);
 
     return renderEmptyState("Paste a join link from whoever invited you to get started.", "Join", () => {
       const joinString = linkInput.value.trim();
       if (!joinString) return;
-      submitJoin(joinString, nameInput.value.trim(), errorText);
+      submitJoin(joinString, errorText);
     }, { icon: "meeting_room", headline: "No rooms yet", inline, className: "empty-state-rooms" });
   }
 
   /** Shared join flow for both the ROOMS empty state's inline form and the
    * "+ Add Room" card's Join button below — same real/mock branches either
-   * used to duplicate inline. */
-  async function submitJoin(joinString, displayName, errorEl) {
+   * used to duplicate inline.
+   *
+   * No display-name parameter: display name is now one global Settings-tab
+   * value (`settings.js`, `set_display_name`), not asked per join/create —
+   * see `superdoc/features/stream-control.md`'s 2026-07-28 note. `join_room`
+   * still takes a `displayName` argument (unchanged Tauri command signature,
+   * kept for its Rust test call sites), but this always passes `""`, the
+   * same "leave it, backend already knows" call the sidebar's silent
+   * auto-reconnect and `submitCreate` below already made — `join_room_impl`
+   * only overwrites `AppState::display_name` when given a non-empty value,
+   * so `""` here just means "use whatever's currently set", which is now
+   * always the persisted global setting (loaded into `AppState::display_name`
+   * at startup, kept live-current by `set_display_name`). */
+  async function submitJoin(joinString, errorEl) {
     if (window.__TAURI__) {
       if (errorEl) errorEl.hidden = true;
       try {
-        await window.__TAURI__.core.invoke("join_room", { joinString, displayName });
+        await window.__TAURI__.core.invoke("join_room", { joinString, displayName: "" });
         // Same "success saves" note as `renderAddRoomCard`'s own Join
         // handler: `join_room` upserts + emits `room-connected`; this is a
         // belt-and-braces immediate paint in case that event hasn't landed
@@ -393,7 +404,7 @@
 
     mockRooms.push({
       join_string: joinString,
-      name: displayName || "Room " + Math.random().toString(16).slice(2, 6),
+      name: "Room " + Math.random().toString(16).slice(2, 6),
       state: "joined",
       room_handle: Math.floor(Math.random() * 100000),
       active_stream_count: 0,
@@ -1035,19 +1046,24 @@
 
     card.innerHTML = "";
     card.appendChild(el("div", { className: "section-label add-room-label", text: "Create/Join a Room" }));
-    card.appendChild(
-      pillSwitch(
-        [
-          { value: "join", label: "Join" },
-          { value: "create", label: "Create" },
-        ],
-        state.addRoomTab,
-        (tab) => {
-          state.addRoomTab = tab;
-          renderAddRoomCard();
-        }
-      )
+    // `.add-room-tabs` mirrors `settings.js`'s `.settings-segmented` modifier
+    // on this same shared `pillSwitch` — a scoped equal-width override (see
+    // `shell.css`) rather than a change to `pillSwitch`/`.mode-toggle`
+    // itself, which other call sites (bandwidth mode toggle, language
+    // switch, encoder preset picker) still rely on sizing to content.
+    const tabs = pillSwitch(
+      [
+        { value: "join", label: "Join" },
+        { value: "create", label: "Create" },
+      ],
+      state.addRoomTab,
+      (tab) => {
+        state.addRoomTab = tab;
+        renderAddRoomCard();
+      }
     );
+    tabs.classList.add("add-room-tabs");
+    card.appendChild(tabs);
 
     const errorText = el("div", { className: "add-room-error", text: "" });
     errorText.hidden = true;
@@ -1084,11 +1100,9 @@
       return;
     }
 
-    // Join tab (default) — unchanged from before the tab split.
-    card.appendChild(el("label", { className: "field-label", text: "Display name" }));
-    const nameInput = el("input", { className: "field-input", attrs: { type: "text", placeholder: "e.g. mo" } });
-    card.appendChild(nameInput);
-
+    // Join tab (default). No "Display name" field — display name is now one
+    // global Settings-tab value, not asked per join; see `submitJoin`'s doc
+    // comment.
     card.appendChild(el("label", { className: "field-label", text: "Join link (server|room-id|key)" }));
     const linkInput = el("input", { className: "field-input", attrs: { type: "text", placeholder: "" } });
     card.appendChild(linkInput);
@@ -1099,7 +1113,7 @@
       primaryButton("Join", () => {
         const joinString = linkInput.value.trim();
         if (!joinString) return;
-        submitJoin(joinString, nameInput.value.trim(), errorText);
+        submitJoin(joinString, errorText);
       })
     );
     actions.appendChild(

@@ -532,6 +532,7 @@ fn dispatch(name: &str, body: &Value, app: &AppHandle) -> Result<Value, ApiError
             get_string(body, "rate_control")?,
         )),
         "set_language" => ok(commands::set_language(managed, get_string(body, "language")?)),
+        "set_display_name" => ok(commands::set_display_name(managed, get_string(body, "display_name")?)),
         "set_presentation_mode" => result(commands::set_presentation_mode(managed, get_string(body, "mode")?)),
         "set_max_jitter_buffer_ms" => ok(commands::set_max_jitter_buffer_ms(managed, get_u32(body, "ms")?)),
         "start_video_share" => ok(commands::start_video_share(managed, get_u32(body, "room_handle")?)),
