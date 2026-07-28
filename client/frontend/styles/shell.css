@@ -292,19 +292,24 @@ input {
   background: rgba(232, 163, 61, 0.14);
 }
 
-/* Disconnected row's reconnect action (2026-07-28): a plain yellow dot,
-   replacing the old `restart_alt` glyph — the design owner's screenshot
-   flagged the arrow as reading like "an arrow pointing at itself" rather
-   than a reconnect affordance. Same `.status-dot` box/size as every other
-   room-state dot (`statusDot`, components.js) for visual consistency, just
-   filled solid warning-yellow with no pulse animation — pulsing is
-   reserved for `.status-dot-reconnecting` (an in-progress reconnect); this
-   one is static because clicking it is what *starts* the reconnect. Sits
-   inside `.room-caret-reconnect`'s 16x16 clickable button, so the click
-   target stays the same size as before even though the dot itself is
-   `--dot-size` (9px). */
-.room-caret-reconnect-dot {
-  background: var(--warning);
+/* Disconnected row's reconnect action (2026-07-29): the caret slot renders
+   no dot/icon at rest — matches the empty `.room-caret-spacer` look of the
+   `reconnecting` state, so the row's own hollow `.status-dot-disconnected`
+   is the only "not connected" indicator, per the design owner's screenshot
+   feedback that a second solid yellow dot right next to it read as
+   redundant/cluttered. The `restart_alt` glyph only fades in on hover/focus
+   as a discoverability hint that the slot is clickable — see
+   `.room-caret-reconnect-icon` below. (Previously this slot held a plain
+   solid yellow `.status-dot` — see git history / APP-SHELL.md's 2026-07-28
+   note for that iteration's own rationale, which this entry supersedes.) */
+.room-caret-reconnect-icon {
+  opacity: 0;
+  transition: opacity 0.1s ease;
+}
+
+.room-caret-reconnect:hover .room-caret-reconnect-icon,
+.room-caret-reconnect:focus-visible .room-caret-reconnect-icon {
+  opacity: 1;
 }
 
 /* 12px, per the prototype's room row. It was inheriting the 14px body size,
@@ -386,11 +391,6 @@ input {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.room-member-tree-name::before {
-  content: "- ";
-  color: var(--text-faint);
 }
 
 /* Same pill shape/weight as the "Stop" destination-card action button

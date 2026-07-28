@@ -324,14 +324,16 @@
     head.appendChild(statusDot(room.state));
 
     // Caret slot: open the room-detail panel (joined), reconnect
-    // (disconnected — now a plain yellow dot rather than the old
-    // `restart_alt` glyph, see `.room-caret-reconnect-dot` in shell.css; the
-    // arrow read as "pointing at itself" per the design owner's screenshot
-    // note), or an empty spacer (reconnecting — "nothing to click while
-    // connecting"). Every caret's own click stops propagation so it doesn't
-    // double-fire the head's row-wide click handler above (which now opens
-    // the panel for every state, not just joined — see this function's doc
-    // comment).
+    // (disconnected — an empty hit-area at rest, matching the `reconnecting`
+    // spacer below, with a `restart_alt` glyph that only fades in on
+    // hover/focus; see `.room-caret-reconnect-icon` in shell.css for why —
+    // the row's own hollow status dot already says "not connected", a
+    // second always-visible dot/icon here read as redundant per the design
+    // owner's screenshot feedback), or an empty spacer (reconnecting —
+    // "nothing to click while connecting"). Every caret's own click stops
+    // propagation so it doesn't double-fire the head's row-wide click
+    // handler above (which now opens the panel for every state, not just
+    // joined — see this function's doc comment).
     if (room.state === "joined") {
       head.appendChild(
         el("button", {
@@ -352,7 +354,7 @@
             handlers.onReconnect && handlers.onReconnect(room.join_string);
           },
           attrs: { "aria-label": "Reconnect", title: "Reconnect" },
-        }, [el("span", { className: "status-dot room-caret-reconnect-dot" })])
+        }, [el("span", { className: "room-caret-reconnect-icon" }, [icon("restart_alt")])])
       );
     } else {
       head.appendChild(el("span", { className: "room-caret room-caret-spacer" }));
