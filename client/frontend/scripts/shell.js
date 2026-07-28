@@ -36,6 +36,7 @@
     primaryButton,
     dangerButton,
     iconButton,
+    icon,
     el,
     hatchedBanner,
     dropdown,
@@ -736,6 +737,36 @@
     return wrap;
   }
 
+  /** "Copy join link" icon-button for the room panel header — copies
+   * `room.join_string` (the full `server|room-id|key` string, same value
+   * the "Join a room" dialog's join-link field uses) to the clipboard via
+   * `navigator.clipboard.writeText`. Flashes the icon to a checkmark for
+   * 1.5s as click confirmation, then reverts — this file has no existing
+   * "brief confirmation" component to reuse, so this is the minimal
+   * self-contained version of that pattern. */
+  function renderCopyJoinLinkButton(room) {
+    let revertTimer = null;
+    const btn = iconButton(
+      "content_copy",
+      () => {
+        navigator.clipboard.writeText(room.join_string);
+        btn.innerHTML = "";
+        btn.appendChild(icon("check"));
+        btn.title = "Copied!";
+        btn.setAttribute("aria-label", "Copied!");
+        clearTimeout(revertTimer);
+        revertTimer = setTimeout(() => {
+          btn.innerHTML = "";
+          btn.appendChild(icon("content_copy"));
+          btn.title = "Copy join link";
+          btn.setAttribute("aria-label", "Copy join link");
+        }, 1500);
+      },
+      { title: "Copy join link", className: "room-panel-copy-link" }
+    );
+    return btn;
+  }
+
   /** Renders the panel's content for `state.activeRoomPanel`. A no-op when
    * the panel is closed — `closeRoomPanel` owns hiding the scrim itself, so
    * this only needs to (re)build content while it's open, called after
@@ -753,6 +784,7 @@
     const top = el("div", { className: "room-panel-header-top" });
     top.appendChild(el("span", { className: "status-dot status-dot-joined" }));
     top.appendChild(renderRoomPanelTitle(room));
+    top.appendChild(renderCopyJoinLinkButton(room));
     top.appendChild(
       iconButton("close", () => closeRoomPanel(), { title: "Close", className: "room-panel-close" })
     );
