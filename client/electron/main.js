@@ -397,13 +397,18 @@ async function openViewerWindow({ mode, displayId, streamKeys }) {
   // window's delayed/async `closed` event (it can still be closing when a
   // second `openViewer` call already replaced it) would null out the
   // *new* window's reference instead of its own.
+  //
+  // resizable: false at construction (WM-tiling mitigation — see below):
+  // deliberately NOT `true` here even though the window ends up resizable
+  // for its whole visible life. Restored to `true` once the window has
+  // settled — see the `ready-to-show` handler.
   const win = new BrowserWindow({
     x,
     y,
     width,
     height,
     frame: !borderless,
-    resizable: true,
+    resizable: false,
     show: false,
     webPreferences: {
       preload: PRELOAD,
@@ -422,20 +427,75 @@ async function openViewerWindow({ mode, displayId, streamKeys }) {
     win.setBounds(target.bounds);
     win.show();
 
-    if (mode === "fullscreen") {
-      // Standard fullscreen (EWMH _NET_WM_STATE_FULLSCREEN on X11 / xdg-shell
-      // fullscreen on Wayland) — NOT kiosk mode, which is more aggressive
-      // and less predictable across Linux window managers.
-      win.setFullScreen(true);
-    } else {
-      // Borderless: full display bounds (not workArea — maximize() would
-      // snap to workArea and exclude panel/taskbar space, which is wrong
-      // here; the user wants true maximum size). Stays a normal,
-      // WM-managed, alt-tabbable window otherwise: resizable, not
-      // always-on-top, not skip-taskbar — chrome-free is the only
-      // difference from a regular window.
+    // --- Tiling-WM mitigation (verified against a real Hyprland/dwindle
+    // session; see git history for the reproduction) -----------------
+    //
+    // On a tiling Wayland compositor with no floating rule for this app
+    // (the common case — this app can't ship compositor config), a
+    // freshly-mapped normal/resizable toplevel gets folded into the
+    // tiling layout and split with whatever else is on that workspace
+    // (e.g. the main app window), landing at an arbitrary fraction of
+    // some display's size/position instead of the requested bounds.
+    // `setBounds` alone — even called again right after `show()` — does
+    // NOT fix this: the WM's tiling placement wins regardless of how many
+    // times bounds are re-asserted, because tiling is a layout decision,
+    // not a transient position the WM "gives back" a moment later.
+    //
+    // Also worth recording: under a *native* Wayland session (not
+    // XWayland), the Wayland protocol itself forbids clients from
+    // requesting an absolute global surface position at all — placement
+    // is entirely compositor-owned by design. `BrowserWindow`'s x/y are
+    // therefore a hint at best; there is no Electron API that can force
+    // absolute positioning on native Wayland. This is a platform
+    // constraint, not something fixable from the app side.
+    //
+    // The one thing that IS controllable from Electron's API surface:
+    // most tiling WMs (Hyprland, sway, i3, ...) auto-float a window whose
+    // reported size is fixed (min size == max size), because tiling a
+    // window that refuses to be resized doesn't make sense to them.
+    // Creating the window `resizable: false` and re-applying bounds
+    // reliably lands it — floating, undivided, on the correct display —
+    // even where plain `setBounds` after `show()` does not (confirmed via
+    // `hyprctl clients` across repeated runs). `resizable` is restored to
+    // `true` shortly after, once the WM has floated it, so the window
+    // behaves like an ordinary resizable window for the rest of its life
+    // (the product intent for borderless mode — see below).
+    //
+    // Known remaining gap, NOT fixed by the above (same root cause: no
+    // absolute-positioning protocol on native Wayland): if `target` is a
+    // display other than the currently-focused one, Hyprland was observed
+    // floating the new window onto the focused display instead of the
+    // requested one, ignoring the x/y hint entirely — reproduced directly
+    // against `hyprctl clients`. There is no Electron/BrowserWindow API
+    // that requests "place me on output N" from a tiling Wayland
+    // compositor; this is a genuine platform limitation, not an app bug.
+    // Multi-monitor "open on display X" is therefore only reliable on
+    // native Wayland when X is already the focused display (X11/XWayland
+    // sessions are not affected — X11 honors the requested position).
+    const settle = () => {
+      if (win.isDestroyed()) return;
       win.setBounds(target.bounds);
-    }
+
+      if (mode === "fullscreen") {
+        // Standard fullscreen (EWMH _NET_WM_STATE_FULLSCREEN on X11 /
+        // xdg-shell fullscreen on Wayland) — NOT kiosk mode, which is more
+        // aggressive and less predictable across Linux window managers.
+        win.setFullScreen(true);
+      } else {
+        // Borderless: full display bounds (not workArea — maximize() would
+        // snap to workArea and exclude panel/taskbar space, which is wrong
+        // here; the user wants true maximum size). Stays a normal,
+        // WM-managed, alt-tabbable window otherwise: resizable, not
+        // always-on-top, not skip-taskbar — chrome-free is the only
+        // difference from a regular window.
+        win.setBounds(target.bounds);
+      }
+
+      win.setResizable(true);
+    };
+    // A short delay, not the same tick as show(): the WM needs a moment
+    // to actually map/float the window before we can rely on its placement.
+    setTimeout(settle, 150);
   });
 
   win.on("leave-full-screen", () => {
