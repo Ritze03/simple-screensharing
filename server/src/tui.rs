@@ -690,13 +690,15 @@ fn draw_network_graph(frame: &mut Frame, area: Rect, app: &App) {
 
     let datasets = vec![
         Dataset::default()
-            .name("in")
+            // Padded with a leading/trailing space so the legend box (which
+            // hugs the name tightly by default) doesn't read as cramped.
+            .name(" in ")
             .marker(ratatui::symbols::Marker::Braille)
             .graph_type(GraphType::Line)
             .style(Style::default().fg(Color::Green))
             .data(&rx_points),
         Dataset::default()
-            .name("out")
+            .name(" out ")
             .marker(ratatui::symbols::Marker::Braille)
             .graph_type(GraphType::Line)
             .style(Style::default().fg(Color::Yellow))
