@@ -1,5 +1,6 @@
 /*
- * view.css — View tab: auto-tiled grid of watched streams.
+ * view.css — View tab: the "Watch grid" (design handoff "Stream Control
+ * Redesign Options", option 1e).
  *
  * Tiles are chrome-free (`.media-tile`), per APP-SHELL.md's `theme::media_frame`
  * note ("letterboxed against PANEL_SUNKEN, no card border or title, because a
@@ -8,18 +9,70 @@
  * design (<800ms / 800ms-6s / >6s) is simplified to one "Waiting for
  * capture…" placeholder state; see `superdoc/ui/APP-SHELL.md`'s update for
  * the `Why:` note on that simplification.
+ *
+ * Grid sizing: `.view-grid`'s column count is NOT auto-fit/reflow anymore —
+ * `view.js`'s `render()` computes `ceil(sqrt(n))` (n = tiles currently
+ * shown, including held-slot placeholders so the grid never reshuffles just
+ * because a tile popped out) and writes it to `--grid-cols` as an inline
+ * style, per 1e's "computed square-ish grid" spec. This file only owns the
+ * `repeat(var(--grid-cols), 1fr)` consumption of that variable.
  */
+
+.view-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.view-header-count {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+/* Segmented room filter — "All rooms" + one chip per room currently on
+ * screen. Only rendered when there's more than one room to filter between
+ * (see view.js's render()); a single-room session has nothing to segment. */
+.view-room-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.view-room-filter-chip {
+  background: transparent;
+  border: 1px solid var(--border-light);
+  color: var(--text-dim);
+  border-radius: 999px;
+  padding: 3px 10px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.view-room-filter-chip:hover {
+  color: var(--text);
+  border-color: var(--text-faint);
+}
+
+.view-room-filter-chip.active {
+  background: var(--pill-accent-bg);
+  border-color: var(--pill-accent-bg-light);
+  color: var(--text);
+}
 
 .view-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-  gap: 10px;
+  grid-template-columns: repeat(var(--grid-cols, 1), 1fr);
+  gap: 12px;
 }
 
 .media-tile {
   position: relative;
   background: var(--panel-sunken);
-  border-radius: var(--rounding-sm);
+  border-radius: var(--rounding);
   aspect-ratio: 16 / 9;
   overflow: hidden;
   display: flex;
@@ -42,8 +95,9 @@
   opacity: 0.9;
 }
 
-/* Real video — the MJPEG-over-HTTP `<img>` (see video_server.rs). Cover the
- * tile without distorting aspect ratio, same framing the mock gradient used. */
+/* Real video — a `<canvas>` driven by WebCodecs (see tile-video.js). Cover
+ * the tile without distorting aspect ratio, same framing the mock gradient
+ * used. */
 .media-tile-video {
   position: absolute;
   inset: 0;
@@ -52,24 +106,76 @@
   object-fit: cover;
 }
 
-.media-tile-overlay-top {
+/* -------------------------------------------------------------------
+ * No-chrome-by-default + hover overlay (1e's core interaction): nothing
+ * but the video and the bottom-left name-plate pill until hovered/focused,
+ * then the full overlay (name+room top-left, selection/pop-out controls
+ * top-right, fps stats bottom-right) fades in.
+ * ----------------------------------------------------------------- */
+
+.media-tile-nameplate {
   position: absolute;
-  top: 6px;
   left: 8px;
-  right: 8px;
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
+  bottom: 8px;
+  background: rgba(0, 0, 0, 0.45);
+  border-radius: var(--rounding-sm);
+  padding: 3px 8px;
   font-size: 11px;
-  color: rgba(232, 233, 236, 0.85);
+  color: rgba(232, 233, 236, 0.9);
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
+  pointer-events: none;
+  max-width: calc(100% - 16px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  /* Hidden the instant the hover overlay (which repeats the same name,
+   * plus room + resolution) is visible, so the two don't double up. */
+  transition: opacity 0.12s ease;
+}
+
+.media-tile:hover .media-tile-nameplate,
+.media-tile:focus-within .media-tile-nameplate {
+  opacity: 0;
+}
+
+.media-tile-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  opacity: 0;
+  transition: opacity 0.12s ease;
   pointer-events: none;
 }
 
-.media-tile-label {
-  background: rgba(0, 0, 0, 0.35);
-  border-radius: var(--rounding-sm);
-  padding: 2px 6px;
+.media-tile:hover .media-tile-overlay,
+.media-tile:focus-within .media-tile-overlay {
+  opacity: 1;
+}
+
+/* A tile with its selection checkbox checked stays "lit" even unhovered —
+ * otherwise there'd be no way to see what's currently selected for
+ * "Fullscreen selected"/"Borderless selected" without hovering every tile. */
+.media-tile:has(.media-tile-select-checkbox:checked) .media-tile-overlay {
+  opacity: 1;
+}
+
+.media-tile-overlay-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px;
+  font-size: 11px;
+  color: rgba(232, 233, 236, 0.85);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
+  background: linear-gradient(to bottom, rgba(0, 0, 0, 0.5), transparent);
+}
+
+.media-tile-overlay-title {
+  pointer-events: none;
+  padding-top: 2px;
 }
 
 /* Wraps the selection checkbox + pop-out button so both can opt back into
@@ -80,6 +186,7 @@
   display: flex;
   align-items: center;
   gap: 6px;
+  flex: 0 0 auto;
 }
 
 .media-tile-select-checkbox {
@@ -111,28 +218,106 @@
   font-size: 16px;
 }
 
-.media-tile-placeholder {
+/* Bottom bar — right-aligned live stats (fps), per 1e's spec. No volume
+ * slider here yet: see view.js's header comment for why (no wired-up
+ * per-tile "currently listening" signal to hang one off in this pass). */
+.media-tile-overlay-bottom {
+  pointer-events: none;
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  padding: 6px 8px;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.5), transparent);
+}
+
+.media-tile-fps {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: rgba(232, 233, 236, 0.85);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
+}
+
+/* -------------------------------------------------------------------
+ * Held-slot placeholder — a tile that's popped out to its own OS window
+ * (`popOutWatch`) or currently shown in the standalone fullscreen/
+ * borderless viewer (`requestOpenViewer`) keeps its grid slot rather than
+ * disappearing (which would reflow every other tile's size). Dashed border
+ * distinguishes it at a glance from a real video tile.
+ * ----------------------------------------------------------------- */
+
+.media-tile-held {
+  border: 1.5px dashed var(--border-light);
+  background: var(--panel-sunken);
   display: flex;
   flex-direction: column;
   align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: var(--text-faint);
+  text-align: center;
+  padding: 10px;
+}
+
+.media-tile-held .material-symbols-outlined {
+  font-size: 22px;
+  color: var(--text-faint);
+}
+
+.media-tile-held-text {
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.media-tile-held-btn {
+  font-size: 11px;
+  padding: 3px 10px;
+}
+
+/* -------------------------------------------------------------------
+ * Waiting-for-capture — reuses the "degraded" status family's hatch fill
+ * (`--hatch-amber-gradient`, tokens.css; see status.css's header note on
+ * that family) rather than a second copy of the same gradient literal.
+ * ----------------------------------------------------------------- */
+
+.media-tile-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
   gap: 8px;
   color: var(--text-faint);
   font-size: 12px;
 }
 
-.media-tile-spinner {
-  width: 20px;
-  height: 20px;
-  border-radius: 50%;
-  border: 2px solid var(--border-light);
-  border-top-color: var(--warning);
-  animation: media-tile-spin 0.9s linear infinite;
+.media-tile-waiting {
+  background-image: var(--hatch-amber-gradient);
 }
 
-@keyframes media-tile-spin {
-  to {
-    transform: rotate(360deg);
+.media-tile-waiting-accent {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: var(--warning);
+  animation: media-tile-breathe 1.6s ease-in-out infinite;
+}
+
+@keyframes media-tile-breathe {
+  0%,
+  100% {
+    opacity: 0.3;
   }
+  50% {
+    opacity: 1;
+  }
+}
+
+.media-tile-waiting .material-symbols-outlined {
+  font-size: 22px;
+  color: var(--warning);
 }
 
 .view-controls {
@@ -169,4 +354,64 @@
 .view-demo-toggle:hover {
   color: var(--text-dim);
   border-color: var(--text-faint);
+}
+
+/* -------------------------------------------------------------------
+ * "NOT ON SCREEN" rail — streams the user can watch but isn't currently
+ * displaying (see view.js's `fetchWatchedStreams` for how this list is
+ * derived, and its header comment for the real-branch-only caveat).
+ * ----------------------------------------------------------------- */
+
+.view-not-on-screen {
+  margin-top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.view-not-on-screen-label {
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.view-not-on-screen-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.view-not-on-screen-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--panel-sunken);
+  border: 1px solid var(--border-light);
+  border-radius: 999px;
+  padding: 4px 6px 4px 12px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.view-not-on-screen-chip-play {
+  pointer-events: auto;
+  background: var(--pill-accent-bg);
+  border: none;
+  color: var(--text);
+  border-radius: 50%;
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+
+.view-not-on-screen-chip-play .material-symbols-outlined {
+  font-size: 14px;
+}
+
+.view-not-on-screen-chip-play:hover {
+  background: var(--pill-accent-bg-light);
 }

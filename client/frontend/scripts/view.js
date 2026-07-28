@@ -36,6 +36,36 @@
 // entering its `error` state *is* surfaced (see `tile-video.js`'s
 // `startTileVideo`), reusing the same `.media-tile-placeholder` visual the
 // `'stalled'` state uses.
+//
+// "Watch grid" restyle (design handoff "Stream Control Redesign Options",
+// option 1e) — grid layout, hover chrome, held-slot placeholders, room
+// filter, and the "NOT ON SCREEN" rail below. Scoped-down/known-limitation
+// notes, each next to the code it applies to:
+//
+//  - Held slots for popped-out/viewer tiles (`poppedOutIds`/`viewerHeldIds`
+//    below) are tracked client-side only — there's no IPC signal for "the
+//    pop-out window closed" or "the viewer window closed", so a held slot
+//    only clears when the user clicks its "Bring it back" button. This is a
+//    deliberate best-effort approximation (see the task brief this shipped
+//    against), not a bug: building a real cross-window close signal is a
+//    bigger change than this frontend-only restyle pass.
+//  - No per-tile volume slider: `commands::set_volume` is real, but it only
+//    affects a stream already in a room's `audio_watches` ("listened") set,
+//    and nothing in this frontend currently exposes a way to turn listening
+//    on/off for a watched stream (`toggle_listen`/`RoomDetail.listened` are
+//    wired on the backend but never called from any script) — wiring a
+//    volume slider here would mean building that whole listen-toggle
+//    feature first, which is out of scope for a grid restyle. Skipped
+//    rather than faking a slider with nothing behind it.
+//  - No global volume icon in the header, same reasoning as above (no real
+//    hook to wire it to).
+//  - The "NOT ON SCREEN" rail (streams the user can watch but isn't) is
+//    real-data on the Tauri branch (`detail.streams` minus `detail.watched`,
+//    joined with `detail.members` for the display name) but has one gap: no
+//    DTO here distinguishes "a stream I'm broadcasting myself" from "a
+//    stream a room-mate is broadcasting", so the rail can list the user's
+//    own outgoing stream with no way to hide it. A real fix needs a backend
+//    DTO change; out of scope for this pass.
 
 (function () {
   "use strict";
@@ -48,7 +78,37 @@
     { id: "w3", ownerLabel: "Sam", roomLabel: "Gaming Night", resolution: "1920x1080", fps: null, state: "stalled", hue: 0 },
   ];
 
+  // Mock-only stand-in for the "NOT ON SCREEN" rail's real-branch data (see
+  // `fetchWatchedStreams`'s real branch for how that's actually derived).
+  const MOCK_NOT_ON_SCREEN = [
+    { room_handle: null, owner: "w4", stream_id: 0, ownerLabel: "Jonas", roomLabel: "Movie Night" },
+    { room_handle: null, owner: "w5", stream_id: 0, ownerLabel: "Lea", roomLabel: "Book Club" },
+  ];
+
   let mockWatched = [];
+
+  // "NOT ON SCREEN" rail data — streams the user can watch but isn't
+  // currently displaying. Rebuilt by `fetchWatchedStreams` on every
+  // `init()`/`refresh()`, same cadence as `mockWatched`.
+  let notOnScreenStreams = [];
+
+  // Selected room filter chip ("All rooms" when null). Same "don't reset on
+  // every render()" treatment as `selectedTileIds` below — only pruned back
+  // to null right before a render if the selected room no longer has any
+  // tiles.
+  let roomFilter = null;
+
+  // Tile ids currently popped out to their own OS window (`popOutWatch`) —
+  // rendered as a held dashed-border slot instead of video. See this file's
+  // header note on why there's no real "the window closed" signal to clear
+  // this automatically.
+  const poppedOutIds = new Set();
+
+  // Tile ids currently sent to the standalone fullscreen/borderless viewer
+  // window (`requestOpenViewer`), mapped to which mode ("fullscreen" /
+  // "borderless") so the held-slot placeholder can say which. Same
+  // best-effort caveat as `poppedOutIds`.
+  const viewerHeldIds = new Map();
 
   // Tile ids (`${room_handle}:${owner}:${stream_id}`) the user has explicitly
   // checked via each tile's own selection checkbox, for the "Fullscreen
@@ -88,9 +148,11 @@
       const rooms = await window.__TAURI__.core.invoke("list_saved_rooms");
       const joined = rooms.filter((r) => r.state === "joined" && r.room_handle != null);
       const tiles = [];
+      const notOnScreen = [];
       for (const room of joined) {
         const detail = await window.__TAURI__.core.invoke("room_detail", { roomHandle: room.room_handle });
         if (!detail) continue;
+        const watchedKeys = new Set(detail.watched.map((k) => `${k.owner}:${k.stream_id}`));
         for (const key of detail.watched) {
           const streamInfo = detail.streams.find((s) => s.owner === key.owner && s.stream_id === key.stream_id);
           // `detail.watched` and `detail.streams` are pruned independently
@@ -128,21 +190,70 @@
             hue: Number(BigInt("0x" + key.owner) % 360n),
           });
         }
+        // "NOT ON SCREEN" rail: this room's announced video streams the
+        // user isn't currently watching. See this file's header note for
+        // the "can't tell my own outgoing stream apart" gap this leaves.
+        for (const s of detail.streams) {
+          if (s.kind !== "Video") continue;
+          const k = `${s.owner}:${s.stream_id}`;
+          if (watchedKeys.has(k)) continue;
+          const member = detail.members.find((m) => m.conn_id === s.owner);
+          notOnScreen.push({
+            room_handle: room.room_handle,
+            owner: s.owner,
+            stream_id: s.stream_id,
+            ownerLabel: member ? member.display_name : String(s.owner),
+            roomLabel: room.name,
+          });
+        }
       }
+      notOnScreenStreams = notOnScreen;
       return tiles;
     }
+    notOnScreenStreams = MOCK_NOT_ON_SCREEN.slice();
     return MOCK_WATCHED.slice();
   }
 
-  async function popOutWatch(tile) {
+  /** "Play" action on a "NOT ON SCREEN" rail chip — starts watching that
+   * stream via the same `toggle_watch` command the sidebar's own per-member
+   * Watch button already uses (`shell.js`'s `onWatch` handler), then
+   * refetches so the new tile appears in the grid and the chip drops out of
+   * the rail. */
+  async function playNotOnScreen(item) {
     if (window.__TAURI__) {
-      await window.__TAURI__.core.invoke("pop_out_stream", { roomHandle: tile.room_handle, owner: tile.owner, streamId: tile.stream_id });
+      await window.__TAURI__.core.invoke("toggle_watch", { roomHandle: item.room_handle, owner: item.owner, streamId: item.stream_id });
+      await init();
       return;
     }
-    // Mock: no real second OS window in a plain browser; flag it locally so
-    // a Playwright test can assert the click was registered.
-    const t = mockWatched.find((x) => x.id === tile.id);
-    if (t) t.poppedOut = true;
+    // Mock: no backend `watched` set exists in a plain browser — synthesize
+    // the tile locally so a Playwright run can exercise the rail's "play"
+    // action end to end.
+    notOnScreenStreams = notOnScreenStreams.filter((x) => x !== item);
+    mockWatched.push({
+      id: `${item.roomLabel}:${item.owner}:${item.stream_id}`,
+      ownerLabel: item.ownerLabel,
+      roomLabel: item.roomLabel,
+      resolution: null,
+      fps: null,
+      state: "live",
+      hue: Math.floor(Math.random() * 360),
+    });
+    render();
+  }
+
+  async function popOutWatch(tile) {
+    // Held-slot pattern: track locally regardless of branch (real or mock)
+    // so the grid slot survives as a dashed-border placeholder instead of
+    // reflowing the rest of the grid. See this file's header note on why
+    // there's no way to clear this automatically when the popped-out window
+    // closes.
+    if (tile.id) poppedOutIds.add(tile.id);
+    if (window.__TAURI__) {
+      await window.__TAURI__.core.invoke("pop_out_stream", { roomHandle: tile.room_handle, owner: tile.owner, streamId: tile.stream_id });
+      render();
+      return;
+    }
+    render();
   }
 
   /** `window.__ELECTRON__.openViewer` is the entry point built by the
@@ -161,7 +272,13 @@
     if (!window.__ELECTRON__) return;
     const streamKeys = selectedTileIds.size > 0 ? Array.from(selectedTileIds) : mockWatched.map((t) => t.id);
     if (streamKeys.length === 0) return;
+    // Held-slot pattern, same as `popOutWatch` above: every tile sent to the
+    // viewer window keeps its grid slot as a placeholder rather than
+    // vanishing. See this file's header note on the "no window-closed
+    // signal" caveat this shares with the pop-out case.
+    for (const id of streamKeys) viewerHeldIds.set(id, mode);
     window.__ELECTRON__.openViewer({ mode, displayId: null, streamKeys });
+    render();
   }
 
   function render() {
@@ -185,6 +302,60 @@
     for (const id of tileStalledSince.keys()) {
       if (!liveIds.has(id)) tileStalledSince.delete(id);
     }
+    // Same prune for the held-slot tracking sets — a tile that's gone for
+    // good (stream ended, room left) shouldn't leave a dangling held-slot
+    // placeholder behind, or a stale entry that could wrongly "hold" a
+    // different later tile that happens to reuse the same id.
+    for (const id of poppedOutIds) {
+      if (!liveIds.has(id)) poppedOutIds.delete(id);
+    }
+    for (const id of viewerHeldIds.keys()) {
+      if (!liveIds.has(id)) viewerHeldIds.delete(id);
+    }
+    // Room filter: fall back to "All rooms" if the selected room dropped
+    // out of the watched set entirely (room left, or its last tile ended).
+    const roomLabels = [...new Set(mockWatched.map((t) => t.roomLabel))];
+    if (roomFilter !== null && !roomLabels.includes(roomFilter)) roomFilter = null;
+
+    const header = el("div", { className: "view-header" });
+    const roomCount = roomLabels.length;
+    // "On screen" deliberately excludes held-slot tiles (popped out /
+    // sent to the viewer window) — they're still watched, but not actually
+    // displayed in this grid right now.
+    const onScreenCount = mockWatched.filter((t) => !t.id || (!poppedOutIds.has(t.id) && !viewerHeldIds.has(t.id))).length;
+    header.appendChild(
+      el("div", {
+        className: "view-header-count",
+        text: `${onScreenCount} on screen · ${roomCount} room${roomCount === 1 ? "" : "s"}`,
+      })
+    );
+    if (roomLabels.length > 1) {
+      const filter = el("div", { className: "view-room-filter" });
+      filter.appendChild(
+        el("button", {
+          className: "view-room-filter-chip" + (roomFilter === null ? " active" : ""),
+          text: "All rooms",
+          onClick: () => {
+            roomFilter = null;
+            render();
+          },
+        })
+      );
+      roomLabels.forEach((label) => {
+        filter.appendChild(
+          el("button", {
+            className: "view-room-filter-chip" + (roomFilter === label ? " active" : ""),
+            text: label,
+            onClick: () => {
+              roomFilter = label;
+              render();
+            },
+          })
+        );
+      });
+      header.appendChild(filter);
+    }
+    root.appendChild(header);
 
     const controls = el("div", { className: "view-controls" });
     if (!window.__TAURI__) {
@@ -230,20 +401,95 @@
           headline: "Nobody's on screen",
         })
       );
+      renderNotOnScreenRail(root);
       return;
     }
 
+    const shownTiles = roomFilter === null ? mockWatched : mockWatched.filter((t) => t.roomLabel === roomFilter);
+
     const grid = el("div", { className: "view-grid" });
-    mockWatched.forEach((tile) => grid.appendChild(renderTile(tile)));
+    // 1e's "Watch grid" spec: a computed square-ish column count
+    // (`ceil(sqrt(n))`) rather than the old organic `auto-fit` reflow — n
+    // includes held-slot placeholders (popped-out/viewer tiles below) so
+    // the grid doesn't reshuffle every other tile just because one left the
+    // grid for another window.
+    grid.style.setProperty("--grid-cols", String(Math.max(1, Math.ceil(Math.sqrt(shownTiles.length)))));
+    shownTiles.forEach((tile) => grid.appendChild(renderTile(tile)));
     root.appendChild(grid);
+
+    renderNotOnScreenRail(root);
+  }
+
+  /** "NOT ON SCREEN" rail — see this file's header note for the real-branch
+   * data source and its one known gap. Renders nothing when there's
+   * nothing to show, rather than an empty labeled section. */
+  function renderNotOnScreenRail(root) {
+    if (notOnScreenStreams.length === 0) return;
+    const rail = el("div", { className: "view-not-on-screen" });
+    rail.appendChild(el("div", { className: "view-not-on-screen-label", text: "Not on screen" }));
+    const chips = el("div", { className: "view-not-on-screen-chips" });
+    notOnScreenStreams.forEach((item) => {
+      chips.appendChild(
+        el("div", { className: "view-not-on-screen-chip" }, [
+          el("span", { text: `${item.ownerLabel} · ${item.roomLabel}` }),
+          el(
+            "button",
+            {
+              className: "view-not-on-screen-chip-play",
+              attrs: { title: `Watch ${item.ownerLabel}`, "aria-label": `Watch ${item.ownerLabel}` },
+              onClick: () => playNotOnScreen(item),
+            },
+            [icon("play_arrow")]
+          ),
+        ])
+      );
+    });
+    rail.appendChild(chips);
+    root.appendChild(rail);
+  }
+
+  /** Held-slot placeholder — see this file's header note on `poppedOutIds`/
+   * `viewerHeldIds`. Deliberately renders NO video/overlay/checkbox
+   * machinery at all (the tile is genuinely not decoding — its controller
+   * was never started for a held tile, see `renderTile` below), just the
+   * dashed-border "bring it back" affordance the design spec calls for. */
+  function renderHeldSlot(tile, reasonText) {
+    const wrap = el("div", { className: "media-tile media-tile-held" });
+    wrap.appendChild(icon("picture_in_picture_alt"));
+    wrap.appendChild(el("div", { className: "media-tile-held-text", text: `${tile.ownerLabel} is ${reasonText}` }));
+    wrap.appendChild(
+      secondaryButton(
+        "Bring it back",
+        () => {
+          if (tile.id) {
+            poppedOutIds.delete(tile.id);
+            viewerHeldIds.delete(tile.id);
+          }
+          render();
+        },
+        { className: "media-tile-held-btn" }
+      )
+    );
+    return wrap;
   }
 
   function renderTile(tile) {
+    // Held-slot pattern (1e spec): a tile popped out to its own window, or
+    // currently shown in the fullscreen/borderless viewer window, keeps its
+    // grid slot but shows a placeholder instead of re-decoding video nobody
+    // is looking at here. Checked before every other state below.
+    if (tile.id && poppedOutIds.has(tile.id)) return renderHeldSlot(tile, "in a separate window");
+    if (tile.id && viewerHeldIds.has(tile.id)) {
+      const mode = viewerHeldIds.get(tile.id);
+      return renderHeldSlot(tile, mode === "borderless" ? "in a borderless window" : "in fullscreen");
+    }
+
     const wrap = el("div", { className: "media-tile" });
 
     if (tile.state === "stalled") {
-      const placeholder = el("div", { className: "media-tile-placeholder" });
-      placeholder.appendChild(el("div", { className: "media-tile-spinner" }));
+      const placeholder = el("div", { className: "media-tile-placeholder media-tile-waiting" });
+      placeholder.appendChild(el("div", { className: "media-tile-waiting-accent" }));
+      placeholder.appendChild(icon("hourglass_top"));
       placeholder.appendChild(statusBadge("degraded", "WAITING FOR CAPTURE", { since: getStalledSince(tile) }));
       wrap.appendChild(placeholder);
     } else if (tile.videoUrl) {
@@ -284,16 +530,17 @@
       );
     }
 
+    // No-chrome-by-default + hover overlay (1e spec): the name-plate pill is
+    // always visible (bottom-left, minimal — just name · room), everything
+    // else (room+resolution detail, selection checkbox, pop-out button, fps
+    // stats) only fades in on hover/focus via `.media-tile-overlay`'s CSS.
+    wrap.appendChild(el("div", { className: "media-tile-nameplate", text: `${tile.ownerLabel} · ${tile.roomLabel}` }));
+
+    const overlay = el("div", { className: "media-tile-overlay" });
+
     const top = el("div", { className: "media-tile-overlay-top" });
-    const baseLabel = tile.resolution ? `${tile.ownerLabel} · ${tile.roomLabel} · ${tile.resolution}` : `${tile.ownerLabel} · ${tile.roomLabel}`;
-    const label = el("span", { className: "media-tile-label", text: baseLabel + " " });
-    // Separate `<span>` for the fps part so `updateStats` (below, fed by the
-    // `stream-stats-updated` event) can patch just this text node ~4x/sec
-    // without touching (and re-flickering) the rest of the tile.
-    const fpsSpan = el("span", { className: "media-tile-fps", text: tile.fps ? `@${tile.fps}fps` : "" });
-    label.appendChild(fpsSpan);
-    top.appendChild(label);
-    if (tile.id) fpsSpans.set(tile.id, fpsSpan);
+    const titleText = tile.resolution ? `${tile.ownerLabel} · ${tile.roomLabel} · ${tile.resolution}` : `${tile.ownerLabel} · ${tile.roomLabel}`;
+    top.appendChild(el("span", { className: "media-tile-overlay-title", text: titleText }));
 
     // Per-tile selection checkbox, feeding `selectedTileIds` for the
     // "Fullscreen selected" / "Borderless selected" buttons in
@@ -326,7 +573,19 @@
       )
     );
     top.appendChild(actions);
-    wrap.appendChild(top);
+    overlay.appendChild(top);
+
+    // Bottom bar — right-aligned fps stats (1e spec). Separate `<span>` so
+    // `updateStats` (below, fed by the `stream-stats-updated` event) can
+    // patch just this text node ~4x/sec without touching (and
+    // re-flickering) the rest of the tile.
+    const bottom = el("div", { className: "media-tile-overlay-bottom" });
+    const fpsSpan = el("span", { className: "media-tile-fps", text: tile.fps ? `@${tile.fps}fps` : "" });
+    bottom.appendChild(fpsSpan);
+    overlay.appendChild(bottom);
+    if (tile.id) fpsSpans.set(tile.id, fpsSpan);
+
+    wrap.appendChild(overlay);
 
     return wrap;
   }
