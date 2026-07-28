@@ -1242,11 +1242,26 @@
         .filter((r) => r.state === "joined" && r.room_handle != null)
         .map((r) => loadRoomMembers(r))
     );
-    if (state.activeRoomPanel && !mockRooms.some((r) => r.join_string === state.activeRoomPanel && r.state === "joined")) {
-      // The room the panel was showing disconnected/vanished out from under
-      // it (left elsewhere, connection dropped) — there's no live detail
-      // left to show, so close it rather than render a stale or broken
-      // panel.
+    // `Why:` (2026-07-28, room-row redesign) this used to close the panel
+    // whenever its room wasn't `"joined"` — back when `openRoomPanel` only
+    // ever opened for a joined room, so "not joined anymore" and "nothing
+    // left to show" were the same condition. They aren't anymore:
+    // `renderRoomPanel` now degrades cleanly for a disconnected/reconnecting
+    // room (see its own doc comment), so a room dropping out of `joined`
+    // (e.g. the user's own "Disconnect" click, which calls `refreshRooms`
+    // as part of `leaveRoom`) should re-render the panel in its
+    // disconnected form, not slam it shut out from under the user who just
+    // clicked the button that caused it. Verified against the real app: the
+    // old `&& r.state === "joined"` clause here closed the panel the
+    // instant `refreshRooms()` ran after ANY change while a
+    // disconnected/reconnecting room's panel was open (Auto-Connect toggle
+    // included, since `setRoomAutoConnect` also calls `refreshRooms`) —
+    // invisible under mock-only testing because the mock branch's
+    // `setRoomAutoConnect` never calls `refreshRooms` at all. The only
+    // remaining reason to auto-close is the room genuinely disappearing
+    // from the saved-room list (forgotten from elsewhere, e.g. another
+    // window) — checked by join_string alone now, regardless of state.
+    if (state.activeRoomPanel && !mockRooms.some((r) => r.join_string === state.activeRoomPanel)) {
       closeRoomPanel();
     }
     renderRooms();
