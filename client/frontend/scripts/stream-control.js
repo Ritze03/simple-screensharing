@@ -1259,6 +1259,25 @@
         readout.textContent = `Captured: ${Math.round(d.captured_fps)}fps · Sent: ${Math.round(d.sent_fps)}fps`;
       }
 
+      // The destination's real live bitrate — see `DestinationStatsDto::
+      // bitrate_kbps`'s doc comment for why this can't wait for the normal
+      // sig-diffed `render()` path: in Absolute-Maximum mode the allocator
+      // changes this value with a tier-1 encoder property write that never
+      // fires `destination-state-changed`, so `mockDestinations` (and thus
+      // every other rendering of `dest.bitrate_kbps`, e.g. the edit panel's
+      // "Bitrate" readout when it isn't the live editable slider) would
+      // otherwise show a stale number indefinitely — the reported "the
+      // bitrate doesn't update when the Total Maximum changes" bug.
+      // `d.bitrate_kbps` is `null` for audio (handled above) — nothing else
+      // sends `null` here, so this is exactly "was this destination's row
+      // video".
+      if (d.bitrate_kbps !== null && d.bitrate_kbps !== undefined) {
+        const dest = mockDestinations.find((x) => x.destination_id === d.destination_id);
+        if (dest) dest.bitrate_kbps = d.bitrate_kbps;
+        const bitrateValue = entry.el.querySelector(".dest-metric-bitrate-value");
+        if (bitrateValue) bitrateValue.textContent = `${d.bitrate_kbps} kbps`;
+      }
+
       // Sparkline: same direct-DOM-write approach as the readout above
       // (bypasses the sig-diffed render path so a stats tick never triggers
       // a full card rebuild) — push this tick's `sent_fps` onto the rolling

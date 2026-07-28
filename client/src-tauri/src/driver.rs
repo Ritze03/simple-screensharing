@@ -250,13 +250,17 @@ fn tick(app_handle: &AppHandle, last: &mut Snapshot) {
     for (capture_id, capture) in &state.captures {
         match &capture.status {
             session::ShareStatus::Active(session::ShareHandle::Video(handle)) => {
-                for &destination_id in capture.destinations.keys() {
+                for (&destination_id, dest) in &capture.destinations {
                     let key = simple_screensharing_client::capture::DestKey(destination_id.0);
                     destinations.push(dto::DestinationStatsDto {
                         destination_id: destination_id.0,
                         captured_fps: handle.encoder_fps(key),
                         sent_fps: handle.sent_fps(key),
                         audio_level: None,
+                        // The destination's real live bitrate — see this
+                        // field's doc comment for why this can't just be
+                        // read once at render time.
+                        bitrate_kbps: Some(dest.live_params().bitrate_kbps),
                     });
                 }
             }
@@ -273,6 +277,7 @@ fn tick(app_handle: &AppHandle, last: &mut Snapshot) {
                         captured_fps: 0,
                         sent_fps: 0,
                         audio_level: Some(level),
+                        bitrate_kbps: None,
                     });
                 }
             }
