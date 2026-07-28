@@ -474,11 +474,12 @@
 }
 
 /* Same shared-grid treatment as `.sc-bandwidth-controls` above (see its
-   note): the four per-destination tuning rows — Bitrate / Tune / Quality
-   Level / Rate Control — line their controls up in one column instead of
+   note): the per-destination tuning rows — Preset / Framerate / Bitrate in
+   the always-visible grid, Tune / Quality Level / Rate Control in the
+   nested Advanced one — line their controls up in one column instead of
    each starting wherever its own label happens to end. The value column is
-   `auto` because only the Bitrate row has a readout; the three pillSwitch
-   rows simply leave that cell empty. */
+   `auto` because only the Bitrate row has a readout; every other row simply
+   leaves that cell empty. */
 .dest-edit-grid {
   display: grid;
   grid-template-columns: max-content minmax(100px, 1fr) auto;
@@ -515,6 +516,16 @@
 /* The three pillSwitch rows have no value cell — stop their control
    stretching across it, so every switch is left-aligned in column 2. */
 .dest-edit-row .mode-toggle {
+  justify-self: start;
+}
+
+/* The Framerate picker reuses `.dest-room-select`'s look (see that rule
+   further down) so every dropdown on a destination card reads as one
+   control family. All it needs on top of that is to stop the grid
+   stretching it across the whole control column — the same
+   `justify-self: start` the pillSwitch rows get above, for the same
+   reason. */
+.dest-framerate-select {
   justify-self: start;
 }
 

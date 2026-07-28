@@ -846,6 +846,49 @@ const ENCODER_QUEUE_MAX_BUFFERS: u32 = 2;
 /// response to both is to resume at the live edge.
 const BRANCH_MAX_DUPLICATION_TIME_NS: u64 = 1_000_000_000;
 
+/// `videorate`'s `skip-to-first` for every encode branch: *"don't produce
+/// buffers before the first one we receive"*.
+///
+/// `Why this must be on — the "changing the preset makes the FPS shoot up to
+/// 300+ and sometimes crashes the stream" bug:` a `videorate` whose output
+/// timeline is unanchored starts that timeline at its **segment start**, not
+/// at the first buffer it actually sees. Every branch this module builds is
+/// added to a pipeline that is *already running* ([`branch::add_branch`] is
+/// called for a tier-2 swap, for a fan-out/transfer destination, and after a
+/// source restart — never at pipeline construction), and it inherits the
+/// capture's segment, which started when the *capture* started. So the new
+/// branch's `videorate` considered itself late by the capture's entire
+/// elapsed lifetime and raced to catch up, emitting one encoded access unit
+/// per frame period of that whole history as fast as the encoder could chew
+/// them — every one of which [`destination_pump`] then encrypts, fragments
+/// and pushes at the relay.
+///
+/// Measured, on this project's own real desktop capture with the machine's
+/// real (VAAPI) encoder, by
+/// `applying_a_preset_never_bursts_a_branch_above_its_configured_framerate`:
+/// a destination configured at 30fps burst to a **peak of 76fps** after a
+/// preset change on a capture that had been up 3 seconds, and to **181fps**
+/// (~350fps instantaneous) on one that had been up 10 seconds — the burst
+/// scales linearly with how long the share has been live, which is why a
+/// real, minutes-old share produced the reported 300+ and took the stream
+/// down with it.
+///
+/// `Why not [`BRANCH_MAX_DUPLICATION_TIME_NS`] instead:` that bounds
+/// duplication *between two buffers this branch actually received*, which is
+/// the pause/resume case it was added for. It does not govern the
+/// segment-start-to-first-buffer catch-up at all — the measurement above was
+/// taken with `max-duplication-time` already set to one second and the branch
+/// still replayed ten. The two settings fix two different holes and both are
+/// required.
+///
+/// `Why this is safe for the static-screen guarantee:` `skip-to-first` only
+/// decides where the output timeline *starts*. Once the first real buffer has
+/// arrived, `drop-only=false` duplication behaves exactly as before, so a
+/// branch still holds its configured framerate on a completely static
+/// desktop (`a_destinations_framerate_actually_caps_its_encoder_output_rate`
+/// still passes unchanged).
+const BRANCH_SKIP_TO_FIRST: bool = true;
+
 /// The one raw pixel format the whole capture is pinned to between the
 /// source and the `tee` (see [`build_pipeline`]). Every branch converts away
 /// from it as it likes; nothing negotiates *back* through it.
@@ -3032,6 +3075,70 @@ pub mod destination {
             self.pts_offset_us = epoch_elapsed_us.saturating_sub(pipeline_running_time_us);
         }
 
+        /// Re-anchor the wire clock onto a **replacement encode branch's** own
+        /// timeline, given the PTS of the first buffer that branch produced.
+        /// Call this at the swap's flip, before any buffer from the new branch
+        /// can reach [`Self::wire_pts_from_buffer`] —
+        /// [`branch::swap_to_new_branch`] does.
+        ///
+        /// `Why a swap needs this at all — the second half of the "changing
+        /// the preset ... sometimes crashes the stream" bug:` a branch added
+        /// to an already-running pipeline does **not** start its output
+        /// timeline at the pipeline's current running time. Its `videorate`
+        /// anchors on the inherited segment instead, so the replacement branch
+        /// begins emitting PTS from roughly where the *capture* started —
+        /// measured on this project's own real desktop capture as a first
+        /// buffer 10.1s behind the running time on a capture that had been up
+        /// 10.1s (`applying_a_preset_never_bursts_a_branch_above_its_configured_framerate`'s
+        /// instrumentation), i.e. the lag is exactly the share's age.
+        ///
+        /// Without re-anchoring, every one of those buffers maps to a wire PTS
+        /// below the last one already sent, so [`Self::advance_pts`]'s
+        /// monotonic floor takes over and the stream advances **+1µs per
+        /// frame** until the branch's raw PTS climbs back past where the old
+        /// branch left off — i.e. for the entire age of the share. On a
+        /// minutes-old share that is minutes of frames arriving effectively
+        /// simultaneously as far as the viewer's pacer is concerned. The
+        /// clamp is doing its job (nothing ever goes backwards), but "ugly and
+        /// recovers by itself" only holds for a lag of milliseconds, which is
+        /// what [`Self::on_pipeline_start`] was written for.
+        ///
+        /// `Why the branch's first buffer PTS and not the pipeline's running
+        /// time:` the whole point is that those two are *not* the same for a
+        /// mid-stream branch. Anchoring on what the branch actually produced
+        /// works on either timeline.
+        ///
+        /// `Why this corrects the offset only when the seam actually goes
+        /// backwards, instead of recomputing it unconditionally like
+        /// [`Self::on_pipeline_start`]:` a replacement branch whose timeline
+        /// *does* line up with the wire clock needs no correction at all, and
+        /// recomputing anyway would move the offset — forwards, silently
+        /// jumping the viewer's clock, for no reason. The only thing broken
+        /// here is a seam that lands in the past, so that is the only thing
+        /// this touches.
+        ///
+        /// `Why `last_sent_pts_us` is the anchor rather than the epoch:` the
+        /// epoch form ([`Self::on_pipeline_start`]) subtracts the branch's
+        /// timestamp from this destination's age, which needs the branch's
+        /// numbers to be small — and a capture source is free to hand out
+        /// enormous PTS values (this project's own test source stamps buffers
+        /// ~41 days in), where that subtraction saturates to zero and silently
+        /// does nothing. Anchoring on the last PTS actually put on the wire is
+        /// arithmetic on two values from the same scale, so it can't saturate
+        /// away, and it is also exactly the quantity the seam has to be
+        /// continuous with.
+        pub fn on_branch_swapped(&mut self, first_buffer_pts_us: u64) {
+            let Some(last_sent_us) = self.last_sent_pts_us else {
+                // Nothing has reached the wire yet, so there is no seam to
+                // bridge — whatever the new branch emits first is free to be
+                // this destination's first PTS.
+                return;
+            };
+            if first_buffer_pts_us.saturating_add(self.pts_offset_us) < last_sent_us {
+                self.pts_offset_us = last_sent_us.saturating_sub(first_buffer_pts_us);
+            }
+        }
+
         /// Wire PTS for a real captured buffer:
         /// `max(buffer_pts + offset, last_sent + 1)`.
         pub fn wire_pts_from_buffer(&mut self, buffer_pts_us: u64) -> u64 {
@@ -3405,6 +3512,71 @@ pub mod destination {
                 first_after_restart >= 4_500_000,
                 "post-restart PTS ({first_after_restart}µs) should land near the destination's real elapsed time \
                  (~5s), not back near zero — that mapping is what makes a restart look like low framerate"
+            );
+        }
+
+        /// A branch swap hands the destination a replacement branch whose
+        /// timeline starts back near the *capture's* start rather than at the
+        /// current running time (see [`DestinationRuntime::on_branch_swapped`]
+        /// for the measurement). Monotonicity alone is not enough here: the
+        /// clamp would happily emit the whole post-swap stream at +1µs per
+        /// frame, which is a technically-legal timeline the viewer's pacer
+        /// cannot render. The frames have to keep their real spacing.
+        #[test]
+        fn a_branch_swap_keeps_real_frame_spacing_when_the_new_branch_restarts_its_timeline() {
+            let epoch = t0();
+            let mut runtime = DestinationRuntime::new(epoch, params(30));
+            runtime.on_pipeline_start(0, epoch);
+
+            // 10 seconds of streaming at 30fps.
+            let mut last_before = 0;
+            for frame in 0..300u64 {
+                last_before = runtime.wire_pts_from_buffer(frame * 33_333);
+            }
+
+            // The preset click: the replacement branch's own timeline starts
+            // one frame period in, i.e. ten seconds behind where the old
+            // branch left off.
+            runtime.on_branch_swapped(33_333);
+
+            let mut sent = Vec::new();
+            for frame in 1..=90u64 {
+                sent.push(runtime.wire_pts_from_buffer(frame * 33_333));
+            }
+
+            assert!(sent[0] >= last_before, "the seam must not go backwards: {last_before} -> {}", sent[0]);
+            for pair in sent.windows(2) {
+                let delta = pair[1] - pair[0];
+                assert!(
+                    (30_000..40_000).contains(&delta),
+                    "post-swap frames are {delta}µs apart instead of one 30fps frame period — the wire clock \
+                     is running through the monotonic clamp rather than carrying real presentation times"
+                );
+            }
+        }
+
+        /// The other side of the same coin: a swap whose replacement branch
+        /// *does* continue the timeline must not be "corrected" into a forward
+        /// jump. Re-anchoring repairs a broken seam; it is not a toll every
+        /// swap pays.
+        #[test]
+        fn a_branch_swap_that_continues_the_timeline_leaves_the_wire_clock_alone() {
+            let epoch = t0();
+            let mut runtime = DestinationRuntime::new(epoch, params(30));
+            runtime.on_pipeline_start(0, epoch);
+
+            for frame in 0..300u64 {
+                runtime.wire_pts_from_buffer(frame * 33_333);
+            }
+            let offset_before = runtime.pts_offset_us();
+
+            // The replacement branch picks up exactly where the old one left
+            // off — nothing to repair.
+            runtime.on_branch_swapped(300 * 33_333);
+            assert_eq!(
+                runtime.pts_offset_us(),
+                offset_before,
+                "a seam that is already continuous must leave the offset untouched"
             );
         }
 
@@ -3894,12 +4066,17 @@ pub mod branch {
         // precisely *because* the `valve` above is upstream of it — see
         // [`super::BRANCH_MAX_DUPLICATION_TIME_NS`] and
         // `a_long_pause_resumes_at_the_live_edge_instead_of_replaying_the_gap`.
+        //
+        // `skip-to-first=true` is load-bearing too, for a *different* reason
+        // than `max-duplication-time` — see [`super::BRANCH_SKIP_TO_FIRST`]'s
+        // doc comment for the runaway-fps incident it fixes.
         let description = format!(
             "queue leaky=downstream max-size-buffers={ENCODER_QUEUE_MAX_BUFFERS} \
              ! valve name={valve_name} drop=false drop-mode=forward-sticky-events \
              ! videoconvert \
              ! videoscale \
-             ! videorate drop-only=false max-duplication-time={BRANCH_MAX_DUPLICATION_TIME_NS} \
+             ! videorate drop-only=false skip-to-first={BRANCH_SKIP_TO_FIRST} \
+               max-duplication-time={BRANCH_MAX_DUPLICATION_TIME_NS} \
              ! video/x-raw,format={raw_format}{scale_caps},framerate={framerate}/1 \
              ! {encoder} name={encoder_name} \
              ! video/x-h264,stream-format=byte-stream,alignment=au \
@@ -4296,7 +4473,7 @@ pub mod branch {
         runtime.lock().unwrap().begin_rebuild(Instant::now());
 
         let built = add_branch_live(pipeline, tee, new_id, new_params.to_encode_settings()).await;
-        let (new_branch, _first_idr) = match built {
+        let (new_branch, first_idr) = match built {
             Ok(v) => v,
             Err(e) => {
                 runtime.lock().unwrap().abandon_rebuild();
@@ -4309,8 +4486,15 @@ pub mod branch {
         // GStreamer operation — which is exactly why it can be atomic and
         // therefore invisible.
         {
+            // The replacement branch brings its own timeline with it (see
+            // `on_branch_swapped`) — re-anchor the wire clock onto it here,
+            // inside the same lock as the flip, so there is no instant at
+            // which the new branch is authoritative while the wire clock is
+            // still anchored on the old one's.
+            let first_pts_us = first_idr.buffer().and_then(|b| b.pts()).map(|t| t.useconds()).unwrap_or(0);
             let mut runtime = runtime.lock().unwrap();
             runtime.set_params(new_params);
+            runtime.on_branch_swapped(first_pts_us);
             runtime.finish_rebuild();
         }
 
@@ -5013,9 +5197,33 @@ pub mod branch {
                 DestinationState::Live,
                 "a failed swap must leave the destination exactly as it was, never stalled"
             );
+            assert_eq!(old.id, BranchId(1), "the branch handed back must be the *original*, not the failed replacement");
+            // `Why this checks the branch is still live in the pipeline rather
+            // than still producing samples:` the 1x1 negotiation failure this
+            // test injects doesn't only fail the replacement branch — the
+            // `NOT_NEGOTIATED` it returns travels back up through the shared
+            // `tee` and kills `videotestsrc` outright ("streaming stopped,
+            // reason not-negotiated", visible under `GST_DEBUG=2`). That is
+            // the same upstream-propagation hazard [`remove_branch`] documents
+            // at length, here provoked deliberately by the failure injection,
+            // and it means *no* branch on this pipeline can produce anything
+            // afterwards. The older form of this assertion pulled one sample
+            // and passed, but only because the pre-`skip-to-first` catch-up
+            // burst (see [`super::BRANCH_SKIP_TO_FIRST`]) happened to leave a
+            // straggler queued in the appsink — a coincidence, not the
+            // property being tested. What `KeptOld` actually promises, and
+            // what is checkable here, is that the caller gets its original
+            // branch back intact and still wired into a `Playing` pipeline
+            // rather than a torn-down husk.
             assert!(
-                wait_for_sample(&old.appsink, Duration::from_secs(5)),
-                "the original branch must still be producing after a failed swap"
+                old.appsink.has_as_ancestor(&pipeline),
+                "the original branch must still be wired into the pipeline after a failed swap, not torn down"
+            );
+            let (_, branch_state, _) = old.appsink.state(gst::ClockTime::ZERO);
+            assert_ne!(
+                branch_state,
+                gst::State::Null,
+                "the original branch must not have been nulled out from under the caller"
             );
 
             tokio::time::timeout(Duration::from_secs(10), remove_branch(&pipeline, &tee, old))
@@ -5438,10 +5646,27 @@ pub mod branch {
                 .expect("add_branch");
             assert!(wait_for_sample(&branch.appsink, Duration::from_secs(20)), "branch produced nothing to begin with");
 
-            // Last PTS the branch emitted before the pause, drained down to
-            // whatever was already in flight when the valve closed.
-            branch.set_paused(true, 0);
+            // Last PTS the branch emitted before the pause. Sampled from a
+            // short window of *live* output first, then topped up with
+            // whatever was still in flight when the valve closed.
+            //
+            // `Why the live window rather than only draining after pausing:`
+            // closing the valve stops raw frames at the branch's entry, so
+            // what is left downstream afterwards is at most a buffer or two
+            // and can legitimately be nothing at all (`videorate` holds its
+            // current frame until the next one arrives to compare against,
+            // and with [`super::BRANCH_SKIP_TO_FIRST`] there is no start-up
+            // burst padding the appsink either). Reading a real PTS off the
+            // running branch first makes this independent of that race; the
+            // drain below still runs, so the value is the *last* one emitted.
             let mut last_pts_before = None;
+            let warmup = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < warmup {
+                if let Some(sample) = branch.appsink.try_pull_sample(gst::ClockTime::from_mseconds(100)) {
+                    last_pts_before = sample.buffer().and_then(|b| b.pts()).or(last_pts_before);
+                }
+            }
+            branch.set_paused(true, 0);
             while let Some(sample) = branch.appsink.try_pull_sample(gst::ClockTime::from_mseconds(100)) {
                 last_pts_before = sample.buffer().and_then(|b| b.pts()).or(last_pts_before);
             }
@@ -6507,6 +6732,225 @@ mod tests {
             "changing the configured framerate from {low_configured} to {high_configured} did not \
              meaningfully change the measured output rate ({low_measured:.1}fps vs {high_measured:.1}fps) — \
              looks like the parameter isn't actually reaching the pipeline, just like the bug this test guards against"
+        );
+    }
+
+    /// A real desktop-capture source fragment for the real-hardware tests
+    /// below, or `None` on a machine where `ximagesrc` can't grab a screen.
+    ///
+    /// `Why `ximagesrc` and not the real portal source:` the portal path
+    /// ([`CaptureSource::Portal`]) needs an interactive consent dialog no
+    /// automated test can click — but the thing under test here is what the
+    /// *branch* does with real, damage-driven, full-resolution desktop frames,
+    /// which `ximagesrc` delivers just as genuinely (real pixels, real
+    /// 1920x1080 encode cost, real variable arrival rate) while
+    /// [`CaptureSource::TestSource`] keeps the rest of the pipeline identical.
+    ///
+    /// **Region is pinned to the first monitor's 1920x1080 origin block on
+    /// purpose** — never a full multi-head X screen grab — so this test can
+    /// never capture whatever is on another output.
+    #[cfg(unix)]
+    fn real_desktop_source() -> Option<String> {
+        if gst::ElementFactory::find("ximagesrc").is_none() {
+            return None;
+        }
+        // `Why no `do-timestamp=true` here, unlike the production
+        // `pipewiresrc` fragment:` on `ximagesrc` that property stamps buffers
+        // off the raw clock instead of pipeline running time, which would make
+        // this test's PTS arithmetic wildly unrepresentative of production.
+        // Plain `basesrc` timestamping gives running-time PTS starting at ~0 —
+        // exactly what `pipewiresrc do-timestamp=true` produces (see
+        // [`send_encoded_sample`]).
+        Some(
+            "ximagesrc startx=0 starty=0 endx=1919 endy=1079 use-damage=false \
+             ! video/x-raw,framerate=60/1"
+                .to_string(),
+        )
+    }
+
+    /// What [`drain_branch_like_the_pump`] observed over its window.
+    struct DrainStats {
+        /// Peak sliding-window encode rate, computed with exactly
+        /// [`record_encoder_frame`]'s window and arithmetic — so this is the
+        /// same number the destination card's "Captured: N fps" readout shows.
+        peak_fps: f64,
+        total: u32,
+        /// How many frames got a wire PTS only 1µs past the previous one, i.e.
+        /// how many fell through [`destination::DestinationRuntime`]'s
+        /// monotonic clamp instead of carrying a real timestamp.
+        clamped_pts: u32,
+    }
+
+    /// Drains `branch` for `window` exactly the way [`destination_pump`]'s
+    /// sample arm does — including running every buffer's PTS through the
+    /// destination's real wire clock ([`send_encoded_sample`]'s
+    /// `wire_pts_from_buffer` call), which is what makes the PTS half of the
+    /// swap observable here.
+    async fn drain_branch_like_the_pump(
+        branch: &mut branch::EncodeBranch,
+        runtime: &destination::SharedDestination,
+        window: Duration,
+    ) -> DrainStats {
+        let mut times: VecDeque<Instant> = VecDeque::new();
+        let mut stats = DrainStats { peak_fps: 0.0, total: 0, clamped_pts: 0 };
+        let mut last_wire_pts: Option<u64> = None;
+        let deadline = Instant::now() + window;
+        while Instant::now() < deadline {
+            let Ok(Some(sample)) = tokio::time::timeout(Duration::from_millis(250), branch.next_sample()).await else {
+                continue;
+            };
+            stats.total += 1;
+
+            let buffer_pts_us = sample.buffer().and_then(|b| b.pts()).map(|t| t.useconds()).unwrap_or(0);
+            let wire_pts_us = runtime.lock().unwrap().wire_pts_from_buffer(buffer_pts_us);
+            if last_wire_pts.is_some_and(|last| wire_pts_us.saturating_sub(last) <= 1) {
+                stats.clamped_pts += 1;
+            }
+            last_wire_pts = Some(wire_pts_us);
+
+            let now = Instant::now();
+            times.push_back(now);
+            while let Some(&oldest) = times.front() {
+                if now.duration_since(oldest) > ENCODER_FPS_WINDOW {
+                    times.pop_front();
+                } else {
+                    break;
+                }
+            }
+            stats.peak_fps = stats.peak_fps.max(times.len() as f64 / ENCODER_FPS_WINDOW.as_secs_f64());
+        }
+        stats
+    }
+
+    /// Regression test for the reported **"changing the preset makes the FPS
+    /// shoot up to 300+ and sometimes crashes the stream"** bug.
+    ///
+    /// Applying a preset from the Streams tab's edit panel changes `tune`,
+    /// `quality_level` *and* `rate_control` in one `edit_destination` call,
+    /// which [`destination::classify_change`] turns into a single
+    /// [`destination::ChangeTier::BranchSwap`]. The swap is `await`ed inside
+    /// [`destination_pump`]'s own loop, so for its entire duration **nothing
+    /// drains this destination's appsink** — this test reproduces that exactly
+    /// (the `swap_to_new_branch().await` below is the only thing running while
+    /// it's in flight, same as in the pump).
+    ///
+    /// What must hold afterwards: the destination keeps producing at its own
+    /// configured framerate. A burst well above it is not cosmetic — every one
+    /// of those access units is encrypted, fragmented and pushed at the relay
+    /// (see [`destination_pump`]'s send arm), which is what took the live
+    /// stream down.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn applying_a_preset_never_bursts_a_branch_above_its_configured_framerate() {
+        if gst::init().is_err() {
+            eprintln!("skipping: gstreamer not available in this environment");
+            return;
+        }
+        let Some(source) = real_desktop_source() else {
+            eprintln!("skipping: no ximagesrc on this machine, can't grab a real desktop");
+            return;
+        };
+
+        const CONFIGURED_FPS: u32 = 30;
+
+        let built = build_pipeline(&source).expect("pipeline should construct");
+        built.pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+        let (state_result, ..) = built.pipeline.state(gst::ClockTime::from_seconds(10));
+        if state_result.is_err() {
+            built.pipeline.set_state(gst::State::Null).ok();
+            eprintln!("skipping: real desktop capture pipeline never reached PLAYING here");
+            return;
+        }
+
+        // The destination as the user had it before touching anything: the
+        // "Low-Latency" preset's three fields.
+        let before = destination::VideoParams {
+            width: 1920,
+            height: 1080,
+            framerate: CONFIGURED_FPS,
+            bitrate_kbps: DEFAULT_BITRATE_KBPS,
+            // Whatever this machine would really pick, so the test exercises
+            // the branch the owner's app actually runs.
+            backend: detect_encoder_backend(),
+            tune: TuneMode::LowLatency,
+            quality_level: QualityLevel::Performance,
+            rate_control: RateControlMode::Constant,
+        };
+        // Exactly what clicking "Balanced" in the edit panel sends: three
+        // fields at once, nothing else changed.
+        let after = destination::VideoParams {
+            tune: TuneMode::BestQuality,
+            quality_level: QualityLevel::Balanced,
+            ..before
+        };
+        assert_eq!(
+            destination::classify_change(
+                destination::SourceCaps { width: 1920, height: 1080, framerate: CONFIGURED_FPS },
+                before,
+                after
+            ),
+            destination::ChangeTier::BranchSwap,
+            "a preset click must be a tier-2 branch swap — otherwise this test isn't exercising the reported path"
+        );
+
+        let runtime = destination::DestinationRuntime::shared(Instant::now(), before);
+        let mut branch = branch::add_branch(&built.pipeline, &built.tee, branch::BranchId(0), before.to_encode_settings())
+            .expect("encode branch should build on the live pipeline");
+
+        // `Why ten seconds and not one:` the burst this guards against is
+        // proportional to how long the capture has been running when the
+        // preset is clicked (see [`BRANCH_SKIP_TO_FIRST`]) — a share that just
+        // started has nothing to replay and would pass even while broken.
+        let before_stats = drain_branch_like_the_pump(&mut branch, &runtime, Duration::from_secs(10)).await;
+        eprintln!(
+            "before the preset change: peak {:.1}fps over {} access units, {} clamped PTS",
+            before_stats.peak_fps, before_stats.total, before_stats.clamped_pts
+        );
+
+        let mut branch = match branch::swap_to_new_branch(&built.pipeline, &built.tee, &runtime, branch, branch::BranchId(1), after).await
+        {
+            branch::SwapOutcome::Swapped(b) => b,
+            branch::SwapOutcome::KeptOld(b, e) => {
+                eprintln!("preset swap failed on this machine ({e:#}); nothing to measure");
+                drop(b);
+                built.pipeline.set_state(gst::State::Null).ok();
+                return;
+            }
+        };
+
+        let after_stats = drain_branch_like_the_pump(&mut branch, &runtime, Duration::from_secs(6)).await;
+        eprintln!(
+            "after the preset change: peak {:.1}fps over {} access units, {} clamped PTS",
+            after_stats.peak_fps, after_stats.total, after_stats.clamped_pts
+        );
+
+        drop(branch);
+        built.pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+
+        // 2x the configured rate is already far beyond any legitimate
+        // scheduling jitter; the reported bug was ten times the cap.
+        assert!(
+            after_stats.peak_fps <= CONFIGURED_FPS as f64 * 2.0,
+            "after applying a preset the branch burst to {:.1}fps, way above its configured \
+             {CONFIGURED_FPS}fps (it was {:.1}fps before the change) — this is the runaway-fps \
+             bug: every one of those frames is encrypted, fragmented and pushed at the relay",
+            after_stats.peak_fps,
+            before_stats.peak_fps
+        );
+
+        // The other half of the same bug: the replacement branch brings its
+        // own (capture-age-behind) timeline, so without the re-anchor in
+        // `swap_to_new_branch` every post-swap frame falls through the
+        // monotonic clamp at +1µs and the viewer's pacer gets a stream of
+        // effectively simultaneous frames. A handful right at the seam is
+        // fine; hundreds is the bug.
+        assert!(
+            after_stats.clamped_pts <= 2,
+            "{} of the {} frames after the preset change got a wire PTS only 1µs past the previous one — \
+             the replacement branch's timeline was never re-anchored, so the whole stream is timestamped \
+             through DestinationRuntime's monotonic clamp instead of carrying real presentation times",
+            after_stats.clamped_pts,
+            after_stats.total
         );
     }
 
