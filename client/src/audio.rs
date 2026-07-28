@@ -1252,6 +1252,7 @@ mod tests {
         let mut app = Command::new("gst-launch-1.0")
             .args([
                 "audiotestsrc",
+                "volume=0.02",
                 "!",
                 "audioconvert",
                 "!",
@@ -1359,6 +1360,7 @@ mod tests {
         let mut app = Command::new("gst-launch-1.0")
             .args([
                 "audiotestsrc",
+                "volume=0.02",
                 "!",
                 "audioconvert",
                 "!",
