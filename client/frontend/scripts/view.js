@@ -241,6 +241,39 @@
     render();
   }
 
+  /** "Stop watching" button on an on-screen tile — stops watching that
+   * stream via the same `toggle_watch` command `playNotOnScreen` above uses
+   * to *start* one. `toggle_watch` is a genuine toggle (see
+   * `src-tauri/src/commands.rs`'s doc comment: it inserts a `WatchEntry` if
+   * there wasn't one, removes it if there was — same call, opposite
+   * direction depending on current state), so calling it again here for an
+   * already-watched key is exactly the "stop" half of that same command,
+   * not a separate one. Refetching afterwards drops this tile from the grid
+   * and, since the stream is still announced in the room, lets it
+   * reappear in the "NOT ON SCREEN" rail on its own (`fetchWatchedStreams`
+   * derives that rail from `detail.streams` minus `detail.watched`). */
+  async function stopWatching(tile) {
+    if (tile.id) selectedTileIds.delete(tile.id);
+    if (window.__TAURI__) {
+      await window.__TAURI__.core.invoke("toggle_watch", { roomHandle: tile.room_handle, owner: tile.owner, streamId: tile.stream_id });
+      await init();
+      return;
+    }
+    // Mock: no backend `watched` set exists in a plain browser — remove the
+    // tile locally and hand it back to the "NOT ON SCREEN" rail (mirrors
+    // `playNotOnScreen`'s reverse move) so a Playwright run can exercise
+    // stop-then-restart end to end.
+    mockWatched = mockWatched.filter((t) => t.id !== tile.id);
+    notOnScreenStreams.push({
+      room_handle: null,
+      owner: tile.id,
+      stream_id: 0,
+      ownerLabel: tile.ownerLabel,
+      roomLabel: tile.roomLabel,
+    });
+    render();
+  }
+
   async function popOutWatch(tile) {
     // Held-slot pattern: track locally regardless of branch (real or mock)
     // so the grid slot survives as a dashed-border placeholder instead of
@@ -570,6 +603,22 @@
           onClick: () => popOutWatch(tile),
         },
         [icon("open_in_new")]
+      )
+    );
+    // Stop watching this tile — see `stopWatching`'s doc comment above for
+    // why the same `toggle_watch` command used to start a watch is also the
+    // right one to stop it. Rightmost of the two action buttons (destructive
+    // action farthest right, same convention `shell.js`'s leave-room button
+    // uses — see its own doc comment for that call).
+    actions.appendChild(
+      el(
+        "button",
+        {
+          className: "media-tile-popout-btn media-tile-stop-btn",
+          attrs: { title: "Stop watching", "aria-label": `Stop watching ${tile.ownerLabel}` },
+          onClick: () => stopWatching(tile),
+        },
+        [icon("close")]
       )
     );
     top.appendChild(actions);

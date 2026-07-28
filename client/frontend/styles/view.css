@@ -218,6 +218,13 @@
   font-size: 16px;
 }
 
+/* Stop-watching button reuses `.media-tile-popout-btn`'s layout/sizing —
+ * only the hover color differs, to read as the destructive one of the two
+ * overlay actions. */
+.media-tile-stop-btn:hover {
+  background: var(--danger);
+}
+
 /* Bottom bar — right-aligned live stats (fps), per 1e's spec. No volume
  * slider here yet: see view.js's header comment for why (no wired-up
  * per-tile "currently listening" signal to hang one off in this pass). */
