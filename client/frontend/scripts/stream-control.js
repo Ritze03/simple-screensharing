@@ -781,6 +781,14 @@
 
       let entry = destCardEls.get(dest.destination_id);
       if (!entry || entry.sig !== sig) {
+        // The outgoing card (if any) is about to be thrown away and rebuilt
+        // from scratch — carry its Advanced-tuning `<details>` open/closed
+        // state into the replacement so editing a control (including one
+        // inside Advanced itself) doesn't visibly collapse the section the
+        // user just opened. See `destinationCard`'s `advancedOpen` doc
+        // comment in components.js.
+        const priorAdvancedEl = entry ? entry.el.querySelector(".dest-advanced") : null;
+        const advancedOpen = priorAdvancedEl ? priorAdvancedEl.open : false;
         entry = {
           el: destinationCard(
             withShare,
@@ -791,7 +799,7 @@
               onStop: (id) => stopDestination(id),
               onRetry: (d) => retryDestination(d),
             },
-            { roomOptions: mockJoinedRooms, perStreamBitrateEditable, roomsAlreadyFedByCapture, editState, stalledSince }
+            { roomOptions: mockJoinedRooms, perStreamBitrateEditable, roomsAlreadyFedByCapture, editState, stalledSince, advancedOpen }
           ),
           sig,
         };

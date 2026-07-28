@@ -672,6 +672,55 @@
     // stream-control.md's "Absolute mode ... allocator writes live bitrates
     // straight into the encoders without ever touching the manual values").
     if (opts.perStreamBitrateEditable) {
+      const editState = opts.editState || { tune: "best_quality", qualityLevel: "balanced", rateControl: "constant" };
+      const applyTuning = (patch) => handlers.onEditApply && handlers.onEditApply(dest.destination_id, patch);
+
+      // Simple preset selector — a higher-level "Low-Latency / Balanced /
+      // Quality" pill-switch layered over the raw tune/quality_level/
+      // rate_control fields below, per stream-control.md's simple/advanced
+      // split. Picking a preset applies all three underlying fields
+      // together through the same `onEditApply`/`edit_destination` path as
+      // hand-tuning them individually in the Advanced section below — this
+      // is a convenience mapping onto those same three fields, not a fourth
+      // field of its own, so nothing changes server-side.
+      //
+      // `Why: "Balanced" as the middle option` — it's the recommended
+      // default for a regular user who doesn't know what "rate control"
+      // means; "Low-Latency" and "Quality" mirror the two extremes the raw
+      // Tune switch already offers, each paired with the Quality Level/Rate
+      // Control combo that actually matches that intent, instead of
+      // leaving those two at whatever the raw switches were last set to.
+      // Values (`low_latency`/`best_quality`/`performance`/`balanced`/
+      // `quality`/`constant`) are `src-tauri/src/dto.rs`'s exact
+      // `parse_tune_mode`/`parse_quality_level`/`parse_rate_control_mode`
+      // wire strings, including `QualityLevel::Balanced`'s `"balanced"`.
+      const PRESETS = [
+        { value: "low_latency", label: "Low-Latency", tune: "low_latency", qualityLevel: "performance", rateControl: "constant" },
+        { value: "balanced", label: "Balanced", tune: "best_quality", qualityLevel: "balanced", rateControl: "constant" },
+        { value: "quality", label: "Quality", tune: "best_quality", qualityLevel: "quality", rateControl: "constant" },
+      ];
+      // Highlight whichever preset's 3 fields exactly match the current
+      // edit state; if the Advanced section was hand-tuned to some other
+      // combo, none of the 3 preset buttons shows as selected — no
+      // validation/blocking, that's an intentional, allowed state.
+      const activePreset = PRESETS.find(
+        (p) => p.tune === editState.tune && p.qualityLevel === editState.qualityLevel && p.rateControl === editState.rateControl
+      );
+
+      const presetRow = el("div", { className: "dest-edit-row" });
+      presetRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Preset" }));
+      presetRow.appendChild(
+        pillSwitch(
+          PRESETS.map((p) => ({ value: p.value, label: p.label })),
+          activePreset ? activePreset.value : null,
+          (value) => {
+            const preset = PRESETS.find((p) => p.value === value);
+            if (preset) applyTuning({ tune: preset.tune, qualityLevel: preset.qualityLevel, rateControl: preset.rateControl });
+          }
+        )
+      );
+      body.appendChild(presetRow);
+
       const editRow = el("div", { className: "dest-edit-row" });
       editRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Bitrate (kbps)" }));
       const slider = el("input", {
@@ -691,13 +740,42 @@
 
       // Three testing-oriented encoder tuning knobs (`edit_destination`'s
       // `tune`/`quality_level`/`rate_control`) — same `pillSwitch` widget as
-      // the Absolute/Per-Stream bandwidth-mode toggle, one row each since
-      // these three-way rows (Quality Level, Rate Control) wouldn't fit next
-      // to a two-way one cleanly. Each button click applies immediately,
-      // matching the Bitrate slider's auto-apply-on-change behavior above
-      // (there's no separate combined "Apply" action in this panel).
-      const editState = opts.editState || { tune: "best_quality", qualityLevel: "balanced", rateControl: "constant" };
-      const applyTuning = (patch) => handlers.onEditApply && handlers.onEditApply(dest.destination_id, patch);
+      // the Absolute/Per-Stream bandwidth-mode toggle, one row each since a
+      // three-way row (Rate Control) wouldn't fit next to a two-way one
+      // cleanly. Each button click applies immediately, matching the
+      // Bitrate slider's auto-apply-on-change behavior above (there's no
+      // separate combined "Apply" action in this panel).
+      //
+      // `Why:` behind `<details>` — these three switches are the panel's
+      // "testing-oriented" knobs (per this file's own doc comment above),
+      // not something a regular user needs to see to just start a stream.
+      // Per stream-control.md's simple/advanced split, only the preset
+      // selector and Bitrate slider above stay always-visible;
+      // Tune/Quality Level/Rate Control move behind a native
+      // `<details>/<summary>` disclosure, collapsed by default. `<details>`
+      // was picked over hand-rolled show/hide state because (a) this
+      // component library has no existing toggle primitive that fits
+      // (`pillSwitch` is an exclusive-choice picker, not a disclosure), and
+      // (b) each destination card creates its own `<details>` element
+      // here, so expand/collapse state is naturally per-card (no shared/
+      // global open flag to manage) and needs no JS wiring beyond the
+      // browser's own native behavior — same instinct as this file's
+      // "prefer the platform" pattern elsewhere (e.g. relying on
+      // `<select>`'s native change event rather than a custom dropdown).
+      // `opts.advancedOpen` — this card rebuilds from scratch (a fresh
+      // `<details>` node) on every edit, per `stream-control.js`'s sig-diffed
+      // render (any editState change, including a click inside Advanced
+      // itself, invalidates the sig and swaps in a whole new card element).
+      // A brand-new `<details>` always starts closed, so without this the
+      // panel would visibly snap shut right after the very click that used
+      // it (e.g. picking a preset, or flipping Rate Control) — the caller
+      // reads the outgoing card's current open/closed state before
+      // replacing it and threads it back in here so the disclosure survives
+      // its own re-render, same "caller keeps the state" pattern this file
+      // already uses for `editState` itself.
+      const advanced = el("details", { className: "dest-advanced", attrs: opts.advancedOpen ? { open: "" } : {} });
+      advanced.appendChild(el("summary", { className: "dest-advanced-summary", text: "Advanced tuning" }));
+      const advancedBody = el("div", { className: "dest-advanced-body" });
 
       const tuneRow = el("div", { className: "dest-edit-row" });
       tuneRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Tune" }));
@@ -711,7 +789,7 @@
           (value) => applyTuning({ tune: value })
         )
       );
-      body.appendChild(tuneRow);
+      advancedBody.appendChild(tuneRow);
 
       const qualityRow = el("div", { className: "dest-edit-row" });
       qualityRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Quality Level" }));
@@ -726,7 +804,7 @@
           (value) => applyTuning({ qualityLevel: value })
         )
       );
-      body.appendChild(qualityRow);
+      advancedBody.appendChild(qualityRow);
 
       const rateControlRow = el("div", { className: "dest-edit-row" });
       rateControlRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Rate Control" }));
@@ -741,8 +819,16 @@
           (value) => applyTuning({ rateControl: value })
         )
       );
-      body.appendChild(rateControlRow);
+      advancedBody.appendChild(rateControlRow);
 
+      advanced.appendChild(advancedBody);
+      body.appendChild(advanced);
+
+      // Error stays outside (and below) the `<details>`, not nested inside
+      // it — `applyDestinationEdit` sets `editState.error` for a failed
+      // apply of *any* control in this panel, including the always-visible
+      // Bitrate slider above, so it needs to be visible regardless of the
+      // advanced section's collapsed/expanded state.
       if (editState.error) {
         body.appendChild(el("div", { className: "dest-edit-error", text: editState.error }));
       }
