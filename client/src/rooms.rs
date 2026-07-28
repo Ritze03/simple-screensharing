@@ -208,6 +208,12 @@ pub struct AppSettings {
     /// anyone (round-1 Q8).
     #[serde(default = "AppSettings::default_destination_floor_kbps")]
     pub destination_floor_kbps: u32,
+    /// Ceiling on the View tab's jitter buffer, in milliseconds (plan doc:
+    /// user-configurable instead of the buffer's earlier hardcoded 2000ms).
+    /// The buffer itself still grows only as far as live jitter demands —
+    /// this just caps how far it's allowed to grow.
+    #[serde(default = "AppSettings::default_max_jitter_buffer_ms")]
+    pub max_jitter_buffer_ms: u32,
 }
 
 impl Default for AppSettings {
@@ -218,6 +224,7 @@ impl Default for AppSettings {
             bandwidth_mode: BandwidthMode::default(),
             absolute_total_kbps: Self::default_absolute_total_kbps(),
             destination_floor_kbps: Self::default_destination_floor_kbps(),
+            max_jitter_buffer_ms: Self::default_max_jitter_buffer_ms(),
         }
     }
 }
@@ -241,6 +248,20 @@ impl AppSettings {
     /// a slideshow.
     fn default_destination_floor_kbps() -> u32 {
         500
+    }
+
+    /// 2000ms: the jitter buffer's original hardcoded ceiling, kept as the
+    /// default so this setting's introduction is a no-op for anyone who
+    /// never touches it.
+    fn default_max_jitter_buffer_ms() -> u32 {
+        2000
+    }
+
+    /// Clamp range for `max_jitter_buffer_ms`: 0 (buffer effectively
+    /// disabled) to 5000ms (well above any jitter this app is expected to
+    /// smooth; a higher ceiling just adds playout latency for no benefit).
+    pub fn clamp_max_jitter_buffer_ms(ms: u32) -> u32 {
+        ms.clamp(0, 5000)
     }
 
     /// `$XDG_CONFIG_HOME/simple-screensharing/settings.toml` (or the
@@ -329,6 +350,7 @@ mod tests {
             bandwidth_mode: BandwidthMode::Absolute,
             absolute_total_kbps: 12_345,
             destination_floor_kbps: 750,
+            max_jitter_buffer_ms: 3_500,
         };
         let toml_str = toml::to_string_pretty(&settings).unwrap();
         let parsed: AppSettings = toml::from_str(&toml_str).unwrap();
@@ -337,6 +359,7 @@ mod tests {
         assert_eq!(parsed.bandwidth_mode, BandwidthMode::Absolute);
         assert_eq!(parsed.absolute_total_kbps, 12_345);
         assert_eq!(parsed.destination_floor_kbps, 750);
+        assert_eq!(parsed.max_jitter_buffer_ms, 3_500);
     }
 
     /// Both modes' numbers are independent fields, so a settings file written
@@ -372,6 +395,24 @@ mod tests {
     fn app_settings_missing_presentation_mode_defaults() {
         let parsed: AppSettings = toml::from_str("language = \"de\"\n").unwrap();
         assert_eq!(parsed.presentation_mode, PresentationMode::AutoVsync);
+    }
+
+    /// Same missing-field tolerance as above, for `max_jitter_buffer_ms`
+    /// specifically — a settings file written before this field existed must
+    /// still parse and default it to the jitter buffer's original hardcoded
+    /// ceiling.
+    #[test]
+    fn app_settings_missing_max_jitter_buffer_ms_defaults() {
+        let parsed: AppSettings = toml::from_str("language = \"de\"\n").unwrap();
+        assert_eq!(parsed.max_jitter_buffer_ms, 2000);
+    }
+
+    #[test]
+    fn clamp_max_jitter_buffer_ms_clamps_to_0_5000() {
+        assert_eq!(AppSettings::clamp_max_jitter_buffer_ms(0), 0);
+        assert_eq!(AppSettings::clamp_max_jitter_buffer_ms(5000), 5000);
+        assert_eq!(AppSettings::clamp_max_jitter_buffer_ms(9999), 5000);
+        assert_eq!(AppSettings::clamp_max_jitter_buffer_ms(2000), 2000);
     }
 
     #[test]

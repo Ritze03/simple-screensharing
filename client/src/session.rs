@@ -850,6 +850,9 @@ pub struct AppState {
     pub absolute_total_kbps: u32,
     /// Absolute-Maximum mode's guaranteed per-destination floor (persisted).
     pub destination_floor_kbps: u32,
+    /// Ceiling on the View tab's jitter buffer, in milliseconds (persisted).
+    /// See `rooms::AppSettings::max_jitter_buffer_ms`.
+    pub max_jitter_buffer_ms: u32,
     /// Rate limiting, hysteresis and last-allocation bookkeeping for
     /// Absolute-Maximum mode. Never persisted: it describes this session's
     /// live encoders.
@@ -911,6 +914,7 @@ impl Default for AppState {
             bandwidth_mode: settings.bandwidth_mode,
             absolute_total_kbps: settings.absolute_total_kbps,
             destination_floor_kbps: settings.destination_floor_kbps,
+            max_jitter_buffer_ms: settings.max_jitter_buffer_ms,
             bandwidth: BandwidthController::new(),
             pending_destinations: Vec::new(),
             audio_sources: Vec::new(),
@@ -972,6 +976,19 @@ pub fn save_bandwidth_settings(mode: BandwidthMode, absolute_total_kbps: u32, de
     settings.destination_floor_kbps = destination_floor_kbps;
     if let Err(e) = settings.save() {
         tracing::warn!("failed to save bandwidth preferences: {e:#}");
+    }
+}
+
+/// Persist the jitter buffer ceiling. Mirrors `save_language`/
+/// `save_presentation_mode`'s load-modify-save shape, for the same reason:
+/// don't clobber the sibling settings. Clamps to `AppSettings`' 0..=5000
+/// range so a corrupt or out-of-range caller can't persist a value the
+/// frontend's own range input wouldn't allow.
+pub fn save_max_jitter_buffer_ms(ms: u32) {
+    let mut settings = AppSettings::load();
+    settings.max_jitter_buffer_ms = AppSettings::clamp_max_jitter_buffer_ms(ms);
+    if let Err(e) = settings.save() {
+        tracing::warn!("failed to save jitter buffer preference: {e:#}");
     }
 }
 

@@ -15,7 +15,7 @@
 
   const { el, card, pillSwitch } = window.Components;
 
-  const MOCK_SETTINGS = { language: "en", presentation_mode: "auto_vsync" };
+  const MOCK_SETTINGS = { language: "en", presentation_mode: "auto_vsync", max_jitter_buffer_ms: 2000 };
 
   const PRESENTATION_MODES = [
     { value: "auto_vsync", label: "Auto Vsync (default)" },
@@ -28,7 +28,11 @@
   async function fetchSettings() {
     if (window.__TAURI__) {
       const settings = await window.__TAURI__.core.invoke("get_settings");
-      return { language: settings.language, presentation_mode: settings.presentation_mode };
+      return {
+        language: settings.language,
+        presentation_mode: settings.presentation_mode,
+        max_jitter_buffer_ms: settings.max_jitter_buffer_ms,
+      };
     }
     return Object.assign({}, MOCK_SETTINGS);
   }
@@ -52,6 +56,14 @@
       await window.__TAURI__.core.invoke("set_presentation_mode", { mode });
     }
     state.presentation_mode = mode;
+    render();
+  }
+
+  async function setMaxJitterBufferMs(ms) {
+    if (window.__TAURI__) {
+      await window.__TAURI__.core.invoke("set_max_jitter_buffer_ms", { ms });
+    }
+    state.max_jitter_buffer_ms = ms;
     render();
   }
 
@@ -83,8 +95,27 @@
 
     const hint = el("div", { className: "settings-hint", text: "Presentation mode changes take effect after restarting the app." });
 
+    const jitterRow = el("div", { className: "settings-row" });
+    jitterRow.appendChild(el("span", { className: "settings-row-label", text: "Max jitter buffer" }));
+    const jitterValue = el("span", { className: "settings-row-value", text: `${(state.max_jitter_buffer_ms / 1000).toFixed(1)}s` });
+    const jitterSlider = el("input", {
+      className: "settings-range",
+      attrs: { type: "range", min: "0", max: "5000", step: "100", value: String(state.max_jitter_buffer_ms) },
+    });
+    jitterSlider.addEventListener("input", () => {
+      jitterValue.textContent = `${(Number(jitterSlider.value) / 1000).toFixed(1)}s`;
+    });
+    jitterSlider.addEventListener("change", () => setMaxJitterBufferMs(Number(jitterSlider.value)));
+    jitterRow.appendChild(jitterSlider);
+    jitterRow.appendChild(jitterValue);
+
+    const jitterHint = el("div", {
+      className: "settings-hint",
+      text: "Smooths network hiccups. The buffer grows automatically only when needed, up to this ceiling.",
+    });
+
     const grid = el("div", { className: "settings-grid" });
-    grid.appendChild(card("SETTINGS", [langRow, presentationRow, hint]));
+    grid.appendChild(card("SETTINGS", [langRow, presentationRow, hint, jitterRow, jitterHint]));
     root.appendChild(grid);
   }
 

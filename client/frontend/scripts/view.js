@@ -76,13 +76,13 @@
 
   // --- Jitter buffer (RFC 3550-style EWMA over wire-format `pts_us`) ---
   //
-  // Ceiling on the applied playout delay. Hardcoded for now — a
-  // not-yet-landed backend change will add a real user-configurable setting
-  // (`get_settings()`'s response gaining `max_jitter_buffer_ms`). Every
-  // read below goes through this one `let` binding rather than the literal,
-  // so wiring that setting in later is a one-line change to `init()`
-  // (assign `maxJitterBufferMs` from the fetched settings) instead of a
-  // hunt through the jitter math for inlined `2000`s.
+  // Ceiling on the applied playout delay. Defaults to the backend's own
+  // default (`rooms::AppSettings::default_max_jitter_buffer_ms`) and is
+  // overwritten once during `init()` from the real `get_settings()` value —
+  // see `fetchMaxJitterBufferMs`. Every read below goes through this one
+  // `let` binding rather than a literal, which is what made wiring the real
+  // setting in a one-line change to `init()` instead of a hunt through the
+  // jitter math for inlined `2000`s.
   const DEFAULT_MAX_JITTER_BUFFER_MS = 2000;
   let maxJitterBufferMs = DEFAULT_MAX_JITTER_BUFFER_MS;
   // Floor applied to the target buffer even when the jitter estimate is
@@ -649,7 +649,20 @@
     return wrap;
   }
 
+  /** Fetches the user's `max_jitter_buffer_ms` preference once at startup
+   * (see the "Jitter buffer" block's `maxJitterBufferMs` doc comment above)
+   * and assigns it into that module-level binding so every later jitter
+   * calculation picks it up. No-op on the mock branch (no `window.__TAURI__`)
+   * — `maxJitterBufferMs` just keeps its `DEFAULT_MAX_JITTER_BUFFER_MS`
+   * starting value, mirroring `settings.js`'s `fetchSettings` mock fallback. */
+  async function fetchMaxJitterBufferMs() {
+    if (!window.__TAURI__) return;
+    const settings = await window.__TAURI__.core.invoke("get_settings");
+    maxJitterBufferMs = settings.max_jitter_buffer_ms;
+  }
+
   async function init() {
+    await fetchMaxJitterBufferMs();
     mockWatched = await fetchWatchedStreams();
     render();
   }

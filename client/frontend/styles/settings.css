@@ -1,7 +1,8 @@
 /*
- * settings.css — Settings tab. Smallest of the three: one card, two rows,
- * per APP-SHELL.md ("the pre-existing settings card ... relocated and
- * restyled. No settings were added, removed or redesigned").
+ * settings.css — Settings tab. One card; started as two rows per APP-SHELL.md
+ * ("the pre-existing settings card ... relocated and restyled. No settings
+ * were added, removed or redesigned") and has since gained the jitter-buffer
+ * ceiling row.
  */
 
 .settings-grid {
@@ -34,4 +35,16 @@
 .settings-hint {
   font-size: 11px;
   color: var(--text-faint);
+}
+
+.settings-range {
+  flex: 1;
+  accent-color: var(--accent);
+}
+
+.settings-row-value {
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  min-width: 3.5ch;
+  text-align: right;
 }
