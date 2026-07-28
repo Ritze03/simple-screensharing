@@ -94,6 +94,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 
 use crate::capture;
+use crate::capture::destination::VideoParams;
 use crate::decode::StreamDecoder;
 use crate::net::{ClientEvent, ScreenshareClient};
 use crate::protocol::{PresenceEvent, RoomId};
@@ -1369,4 +1370,218 @@ async fn late_subscriber_after_unwatched_period_gets_a_real_keyframe() {
     );
 
     eprintln!("[e2e-late] PASS: late subscriber received a real keyframe within {latency:?}");
+}
+
+/// Regression coverage (2026-07-28, investigation of a 1/2 full-smoke-test
+/// failure against `unattended/goal-2026-07-28`'s tip): share, then toggle
+/// all three live encoder-tuning controls (`tune`/`quality_level`/
+/// `rate_control`, each a real `capture.rs` `BranchSwap`), THEN start
+/// watching for the first time — the exact sequence the smoke test's one
+/// failing run had.
+///
+/// `Why this lives at the `capture`/`session`/`net` layer, not
+/// `src-tauri`'s `video_server.rs`:` the two crates' dependency direction
+/// is one-way (`src-tauri` depends on this lib crate, never the reverse —
+/// see `src-tauri/Cargo.toml`), and `capture::start_sharing_from_test_source`
+/// is `#[cfg(test)]`-gated (real portal consent can't be automated) so it
+/// literally does not exist in a normal dependent build — there is no way
+/// for a `src-tauri`-side test to drive a real `BranchSwap` through this
+/// exact seam. `video_server.rs`'s own codec-cache/keyframe-gate logic is
+/// unchanged since its fix (confirmed by `git diff` showing no code change,
+/// only a doc comment, since `97d4f68`/`c9ac1b6`) and already has synthetic
+/// regression coverage for that logic specifically
+/// (`relay_pushes_a_fresh_codec_info_chunk_when_a_branch_swap_changes_profile`,
+/// `a_late_connection_to_an_already_flowing_route_gets_a_keyframe_first`).
+/// What synthetic coverage *can't* exercise is whether the real
+/// `force_keyframe()`/`SubscriberCount` mechanism those `video_server.rs`
+/// guarantees depend on actually delivers a prompt, real keyframe when a
+/// first-ever subscribe follows hard on the heels of three real,
+/// back-to-back `BranchSwap`s — exactly the scenario this test drives, for
+/// real, in a loop.
+///
+/// Reran 14/14 clean (2 + 12 iterations) at this investigation's tip; the
+/// original 1/2 smoke-test failure was concluded to be residual flakiness
+/// in the real multi-window Electron/portal harness, not a regression in
+/// this mechanism (see the 2026-07-28 entry in
+/// `superdoc/features/video-pipeline.md` for the full writeup).
+///
+/// Loops `E2E_BRANCH_SWAP_LATE_WATCH_ITERATIONS` times (default 10),
+/// reusing one relay server process but a fresh random room id/key and a
+/// fresh sharer/viewer connection pair each iteration (cheaper than
+/// spawning a new relay per round while still giving each round a clean
+/// room — no state from a previous round can leak into the next one that
+/// matters here). Fails loudly, with the failing iteration number, on the
+/// first round that doesn't get a real keyframe promptly.
+#[tokio::test]
+#[ignore = "spawns a real relay server child process and real GStreamer capture/decode \
+            pipelines; run explicitly with \
+            `cargo test end_to_end_test::branch_swap -- --ignored --nocapture`"]
+async fn late_watch_after_all_three_tuning_controls_toggled_gets_a_real_keyframe_every_time() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    let iterations: u32 =
+        std::env::var("E2E_BRANCH_SWAP_LATE_WATCH_ITERATIONS").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
+
+    let port = pick_free_udp_port().expect("failed to pick a free UDP port for the test relay");
+    eprintln!("[e2e-branch-swap-late] starting relay server on 127.0.0.1:{port} for {iterations} iteration(s)");
+    let _server = spawn_relay_server(port).expect("failed to spawn relay server child process");
+    let server_addr = format!("127.0.0.1:{port}");
+
+    let mut failures: Vec<String> = Vec::new();
+
+    for round in 1..=iterations {
+        eprintln!("[e2e-branch-swap-late] ===== round {round}/{iterations} =====");
+        let room_id: RoomId = rand::random();
+        let room_key: [u8; 32] = rand::random();
+        let join_string = crate::net::format_join_string(&server_addr, &room_id, &room_key);
+
+        let (sharer, _snap_a, mut events_a) =
+            connect_with_retry(&join_string, "sharer").await.expect("sharer failed to connect");
+        let (viewer, _snap_b, mut events_b) =
+            connect_with_retry(&join_string, "viewer").await.expect("viewer failed to connect");
+        let owner_conn_id = sharer.conn_id();
+
+        let source_fragment = format!(
+            "videotestsrc is-live=true pattern=smpte ! video/x-raw,width=1920,height=1080,framerate={}/1",
+            capture::DEFAULT_FRAMERATE
+        );
+        let capture_handle = capture::start_sharing_from_test_source(
+            &sharer,
+            VIDEO_STREAM_ID,
+            capture::DEFAULT_BITRATE_KBPS,
+            capture::DEFAULT_FRAMERATE,
+            &source_fragment,
+        )
+        .await
+        .expect("start_sharing_from_test_source failed");
+
+        // Let the initial branch actually settle into real encoding before
+        // touching it — matches a real user waiting to see "LIVE" before
+        // reaching for the tuning controls.
+        let mut warm_fps = 0;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            warm_fps = warm_fps.max(capture_handle.encoder_fps(capture::DestKey(0)));
+        }
+        assert!(warm_fps > 0, "round {round}: initial share never encoded a frame");
+
+        // The exact three live controls the bug report named, applied
+        // sequentially and awaited to completion each time — "toggle Tune,
+        // toggle Quality Level, toggle Rate Control", not three changes
+        // batched into one swap.
+        let base = capture_handle
+            .destination_runtime(capture::DestKey(0))
+            .expect("destination 0 runtime")
+            .lock()
+            .unwrap()
+            .params();
+        let after_tune = VideoParams { tune: capture::TuneMode::BestQuality, ..base };
+        let after_quality = VideoParams { quality_level: capture::QualityLevel::Quality, ..after_tune };
+        let after_rate_control = VideoParams { rate_control: capture::RateControlMode::Quality, ..after_quality };
+
+        for (label, params) in [
+            ("tune", after_tune),
+            ("quality_level", after_quality),
+            ("rate_control", after_rate_control),
+        ] {
+            let req = capture_handle.change_destination(capture::DestKey(0), params).expect("classify/apply change");
+            if let Some(done) = req.done {
+                tokio::time::timeout(Duration::from_secs(15), done)
+                    .await
+                    .unwrap_or_else(|_| panic!("round {round}: BranchSwap for {label} timed out"))
+                    .expect("swap channel")
+                    .unwrap_or_else(|e| panic!("round {round}: BranchSwap for {label} failed: {e}"));
+            }
+            eprintln!("[e2e-branch-swap-late] round {round}: {label} toggle applied ({:?})", req.tier);
+        }
+
+        // ONLY NOW does the watcher start watching — the exact ordering the
+        // smoke test's one failing run had (watch started after all three
+        // toggles, not before).
+        eprintln!("[e2e-branch-swap-late] round {round}: viewer subscribing for the first time (post-toggles)");
+        let start = std::time::Instant::now();
+        viewer.subscribe(owner_conn_id, VIDEO_STREAM_ID).await.expect("viewer: subscribe() failed");
+
+        async fn forward_one_control_event(
+            events_a: &mut tokio::sync::mpsc::UnboundedReceiver<ClientEvent>,
+            capture_handle: &capture::CaptureHandle,
+        ) -> bool {
+            match events_a.recv().await {
+                Some(ClientEvent::SubscriberCount { stream_id, count }) if stream_id == VIDEO_STREAM_ID => {
+                    capture_handle.notify_subscriber_count(capture::DestKey(0), count);
+                    true
+                }
+                Some(ClientEvent::KeyframeRequest { stream_id }) if stream_id == VIDEO_STREAM_ID => {
+                    capture_handle.notify_keyframe_request(capture::DestKey(0));
+                    true
+                }
+                Some(_) => true,
+                None => false,
+            }
+        }
+
+        let mut first_keyframe_at: Option<Duration> = None;
+        let mut total_frames = 0u64;
+        let deadline = tokio::time::sleep(Duration::from_secs(10));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => break,
+                ok = forward_one_control_event(&mut events_a, &capture_handle) => {
+                    if !ok { break; }
+                }
+                event = events_b.recv() => {
+                    match event {
+                        Some(ClientEvent::MediaFrame(frame))
+                            if frame.conn_id == owner_conn_id && frame.stream_id == VIDEO_STREAM_ID =>
+                        {
+                            total_frames += 1;
+                            if frame.keyframe {
+                                first_keyframe_at.get_or_insert(start.elapsed());
+                            }
+                        }
+                        Some(_) => {}
+                        None => break,
+                    }
+                }
+            }
+            if first_keyframe_at.is_some() {
+                break;
+            }
+        }
+
+        if let Err(e) = capture_handle.stop().await {
+            tracing::warn!("[e2e-branch-swap-late] round {round}: capture_handle.stop() error (non-fatal): {e:#}");
+        }
+        drop(viewer);
+        let _ = sharer.leave().await;
+
+        match first_keyframe_at {
+            Some(latency) if latency < Duration::from_secs(5) => {
+                eprintln!("[e2e-branch-swap-late] round {round}: PASS — real keyframe within {latency:?}");
+            }
+            Some(latency) => {
+                let msg = format!("round {round}: keyframe arrived but took {latency:?} (>= 5s)");
+                eprintln!("[e2e-branch-swap-late] {msg}");
+                failures.push(msg);
+            }
+            None => {
+                let msg = format!(
+                    "round {round}: BUG REPRODUCED — no keyframe ever arrived within 10s of subscribing \
+                     ({total_frames} total frames received)"
+                );
+                eprintln!("[e2e-branch-swap-late] {msg}");
+                failures.push(msg);
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "{}/{iterations} round(s) failed to get a prompt real keyframe after a late watch \
+         following all three tuning-control toggles:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+    eprintln!("[e2e-branch-swap-late] PASS: all {iterations} round(s) got a real keyframe promptly");
 }
