@@ -30,9 +30,31 @@ pub fn list_saved_rooms(managed: State<'_, Managed>) -> Vec<SavedRoomRow> {
     list_saved_rooms_impl(&managed.state.lock().unwrap())
 }
 
-pub fn join_room_impl(state: &mut AppState, join_string: String, display_name: String) -> Result<(), String> {
+pub fn join_room_impl(state: &mut AppState, join_string: String, display_name: String, room_name: String) -> Result<(), String> {
     if !display_name.trim().is_empty() {
         state.display_name = display_name;
+    }
+    let room_name = room_name.trim().to_string();
+    if !room_name.is_empty() {
+        // Pre-seed the local name *before* connecting, same as
+        // `create_room_impl` does below — see that function's doc comment
+        // for the full rationale (keeps the human-typed name instead of
+        // `poll_connect_result`'s id-derived fallback, which only fires when
+        // `RoomStore::name_for` has no entry for this join string yet).
+        //
+        // `Why:` unconditional `upsert` here (matching `create_room_impl`'s
+        // own unconditional call), not "only if not already saved"
+        // (`poll_connect_result`'s own guard): a name typed into the Join
+        // tab is a deliberate choice by the user for *this* join, same as
+        // Create's Room Name field, so it should win even if this join
+        // string happened to already have a saved name. `upsert` keys by
+        // name (not join string), so this can only overwrite a room already
+        // saved under this exact name — it can't collide with some other
+        // saved room under a different name.
+        state.room_store.upsert(room_name, join_string.clone());
+        if let Err(e) = state.room_store.save() {
+            state.room_store_error = Some(e.to_string());
+        }
     }
     state.start_connect(join_string, true)
 }
@@ -60,8 +82,8 @@ pub fn join_room_impl(state: &mut AppState, join_string: String, display_name: S
 // mutating command below that (transitively) spawns — each carries a short
 // pointer back to this note rather than repeating it.
 #[tauri::command]
-pub fn join_room(managed: State<'_, Managed>, join_string: String, display_name: String) -> Result<(), String> {
-    tauri::async_runtime::block_on(async { join_room_impl(&mut managed.state.lock().unwrap(), join_string, display_name) })
+pub fn join_room(managed: State<'_, Managed>, join_string: String, display_name: String, room_name: String) -> Result<(), String> {
+    tauri::async_runtime::block_on(async { join_room_impl(&mut managed.state.lock().unwrap(), join_string, display_name, room_name) })
 }
 
 /// "Create a room": per the server's `Registry::get_or_create_room` (spec
@@ -119,7 +141,9 @@ pub fn create_room_impl(state: &mut AppState, server: String, room_name: String)
         state.room_store_error = Some(e.to_string());
     }
 
-    join_room_impl(state, join_string, String::new())
+    // Room name is already pre-seeded above — pass `String::new()` so
+    // `join_room_impl`'s own (now-redundant) upsert is a no-op.
+    join_room_impl(state, join_string, String::new(), String::new())
 }
 
 // See `join_room`'s `Why:` note above — `create_room_impl` transitively
@@ -740,7 +764,7 @@ mod tests {
         // exercises the full command delegation path (start_connect spawning
         // onto the runtime) and resolves to a real, reportable failure rather
         // than hanging or panicking.
-        let result = join_room_impl(&mut state, "not-a-valid-join-string".to_string(), String::new());
+        let result = join_room_impl(&mut state, "not-a-valid-join-string".to_string(), String::new(), String::new());
         assert!(result.is_ok(), "start_connect itself only fails on a dead local endpoint: {result:?}");
         assert!(state.pending_connect.is_some());
     }
@@ -816,7 +840,7 @@ mod tests {
         // "there is no reactor running, must be called from the context of
         // a Tokio 1.x runtime" — fatal in the real app because it happens
         // inside a non-unwindable FFI callback.
-        let result = join_room(app.state::<Managed>(), "not-a-valid-join-string".to_string(), String::new());
+        let result = join_room(app.state::<Managed>(), "not-a-valid-join-string".to_string(), String::new(), String::new());
         assert!(result.is_ok(), "join_room should not fail outside a Tokio runtime context: {result:?}");
     }
 
@@ -969,7 +993,7 @@ mod tests {
 
         eprintln!("[hang_repro] joining {join_string}");
         let handle = app.handle().clone();
-        let jr = join_room(handle.state::<Managed>(), join_string, "HangReproSharer".to_string());
+        let jr = join_room(handle.state::<Managed>(), join_string, "HangReproSharer".to_string(), String::new());
         assert!(jr.is_ok(), "join_room returned an error: {jr:?}");
 
         let room_handle = wait_for(std::time::Duration::from_secs(15), || {
@@ -1113,7 +1137,7 @@ mod tests {
 
         eprintln!("[hang_repro2] joining {join_string}");
         let handle = app.handle().clone();
-        let jr = join_room(handle.state::<Managed>(), join_string, "HangReproSharer2".to_string());
+        let jr = join_room(handle.state::<Managed>(), join_string, "HangReproSharer2".to_string(), String::new());
         assert!(jr.is_ok(), "join_room returned an error: {jr:?}");
 
         let room_handle = wait_for(std::time::Duration::from_secs(15), || {
@@ -1218,7 +1242,7 @@ mod tests {
 
         eprintln!("[stop_reap_repro] joining {join_string}");
         let handle = app.handle().clone();
-        let jr = join_room(handle.state::<Managed>(), join_string, "StopReaproSharer".to_string());
+        let jr = join_room(handle.state::<Managed>(), join_string, "StopReaproSharer".to_string(), String::new());
         assert!(jr.is_ok(), "join_room returned an error: {jr:?}");
 
         let room_handle = wait_for(std::time::Duration::from_secs(15), || {
@@ -1310,7 +1334,7 @@ mod tests {
 
         eprintln!("[stop_reap_stress] joining {join_string}");
         let handle = app.handle().clone();
-        let jr = join_room(handle.state::<Managed>(), join_string, "StopReapStressSharer".to_string());
+        let jr = join_room(handle.state::<Managed>(), join_string, "StopReapStressSharer".to_string(), String::new());
         assert!(jr.is_ok(), "join_room returned an error: {jr:?}");
 
         let room_handle = wait_for(std::time::Duration::from_secs(15), || {

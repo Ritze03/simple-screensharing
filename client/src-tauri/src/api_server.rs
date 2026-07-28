@@ -470,6 +470,15 @@ fn opt_u32(body: &Value, key: &str) -> Option<u32> {
     body.get(key).and_then(Value::as_u64).and_then(|v| u32::try_from(v).ok())
 }
 
+/// Optional `String` field, defaulting to `""` when absent — mirrors
+/// `opt_u32`'s "missing is legitimate" contract, for `join_room`'s new
+/// `room_name` param (an unset room name, same as an omitted one, means
+/// "leave the existing/id-derived naming alone" — see `join_room_impl`'s
+/// doc comment).
+fn opt_string(body: &Value, key: &str) -> String {
+    body.get(key).and_then(Value::as_str).unwrap_or("").to_string()
+}
+
 fn get_bool(body: &Value, key: &str) -> Result<bool, ApiError> {
     body.get(key)
         .and_then(Value::as_bool)
@@ -508,7 +517,7 @@ fn dispatch(name: &str, body: &Value, app: &AppHandle) -> Result<Value, ApiError
         "list_saved_rooms" => ok(commands::list_saved_rooms(managed)),
         "list_active_streams" => ok(commands::list_active_streams(managed)),
         "room_detail" => ok(commands::room_detail(managed, get_u32(body, "room_handle")?)),
-        "join_room" => result(commands::join_room(managed, get_string(body, "join_string")?, get_string(body, "display_name")?)),
+        "join_room" => result(commands::join_room(managed, get_string(body, "join_string")?, get_string(body, "display_name")?, opt_string(body, "room_name"))),
         "create_room" => result(commands::create_room(managed, get_string(body, "server")?, get_string(body, "room_name")?)),
         "toggle_watch" => {
             result(commands::toggle_watch(managed, get_u32(body, "room_handle")?, get_string(body, "owner")?, get_u8(body, "stream_id")?))

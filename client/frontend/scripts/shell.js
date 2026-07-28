@@ -363,7 +363,11 @@
     return renderEmptyState("Paste a join link from whoever invited you to get started.", "Join", () => {
       const joinString = linkInput.value.trim();
       if (!joinString) return;
-      submitJoin(joinString, errorText);
+      // No room-name field here (see this function's own doc comment on
+      // why it's out of scope for the "+ Add Room" card's new field) —
+      // `""` preserves this entry point's existing id-derived-name-on-join
+      // behavior unchanged.
+      submitJoin(joinString, "", errorText);
     }, { icon: "meeting_room", headline: "No rooms yet", inline, className: "empty-state-rooms" });
   }
 
@@ -381,12 +385,20 @@
    * only overwrites `AppState::display_name` when given a non-empty value,
    * so `""` here just means "use whatever's currently set", which is now
    * always the persisted global setting (loaded into `AppState::display_name`
-   * at startup, kept live-current by `set_display_name`). */
-  async function submitJoin(joinString, errorEl) {
+   * at startup, kept live-current by `set_display_name`).
+   *
+   * `roomName` is optional (defaults to `""` at every call site below except
+   * the "+ Add Room" card's Join tab, which now has its own field for it —
+   * see `renderAddRoomCard`'s doc comment on that field): an empty string
+   * means "no local nickname typed", same "leave it, backend already knows"
+   * convention as `displayName` above — `join_room_impl` only pre-seeds
+   * `room_store` when `roomName` is non-empty, otherwise the existing
+   * id-derived fallback naming in `poll_connect_result` applies unchanged. */
+  async function submitJoin(joinString, roomName, errorEl) {
     if (window.__TAURI__) {
       if (errorEl) errorEl.hidden = true;
       try {
-        await window.__TAURI__.core.invoke("join_room", { joinString, displayName: "" });
+        await window.__TAURI__.core.invoke("join_room", { joinString, displayName: "", roomName: roomName || "" });
         // Same "success saves" note as `renderAddRoomCard`'s own Join
         // handler: `join_room` upserts + emits `room-connected`; this is a
         // belt-and-braces immediate paint in case that event hasn't landed
@@ -405,7 +417,10 @@
 
     mockRooms.push({
       join_string: joinString,
-      name: "Room " + Math.random().toString(16).slice(2, 6),
+      // Typed name wins, same as the real `join_room_impl` pre-seed; falls
+      // back to the id-derived-style random name when left blank, matching
+      // `poll_connect_result`'s real fallback behavior.
+      name: (roomName && roomName.trim()) || "Room " + Math.random().toString(16).slice(2, 6),
       state: "joined",
       room_handle: Math.floor(Math.random() * 100000),
       active_stream_count: 0,
@@ -1104,7 +1119,7 @@
     if (!state.addRoomOpen) return;
 
     card.innerHTML = "";
-    card.appendChild(el("div", { className: "section-label add-room-label", text: "Create/Join a Room" }));
+    card.appendChild(el("div", { className: "section-label add-room-label", text: "Create / Join a Room" }));
     // `.add-room-tabs` mirrors `settings.js`'s `.settings-segmented` modifier
     // on this same shared `pillSwitch` — a scoped equal-width override (see
     // `shell.css`) rather than a change to `pillSwitch`/`.mode-toggle`
@@ -1129,15 +1144,17 @@
     const actions = el("div", { className: "add-room-actions" });
 
     if (state.addRoomTab === "create") {
-      // Server IP + Room Name only — no display-name field, see
-      // `submitCreate`'s doc comment for why.
-      card.appendChild(el("label", { className: "field-label", text: "Server IP" }));
-      const serverInput = el("input", { className: "field-input", attrs: { type: "text", placeholder: "e.g. relay.example.com:4433" } });
-      card.appendChild(serverInput);
-
+      // Room Name + Server IP only — no display-name field, see
+      // `submitCreate`'s doc comment for why. Room Name first, Server IP
+      // second: local-nickname field before connection-detail field, same
+      // order as the Join tab below.
       card.appendChild(el("label", { className: "field-label", text: "Room Name" }));
-      const roomNameInput = el("input", { className: "field-input", attrs: { type: "text", placeholder: "e.g. Movie Night (only you see this)" } });
+      const roomNameInput = el("input", { className: "field-input", attrs: { type: "text" } });
       card.appendChild(roomNameInput);
+
+      card.appendChild(el("label", { className: "field-label", text: "Server IP" }));
+      const serverInput = el("input", { className: "field-input", attrs: { type: "text" } });
+      card.appendChild(serverInput);
 
       card.appendChild(errorText);
 
@@ -1162,8 +1179,23 @@
     // Join tab (default). No "Display name" field — display name is now one
     // global Settings-tab value, not asked per join; see `submitJoin`'s doc
     // comment.
-    card.appendChild(el("label", { className: "field-label", text: "Join link (server|room-id|key)" }));
-    const linkInput = el("input", { className: "field-input", attrs: { type: "text", placeholder: "" } });
+    //
+    // "Room name" is this room's LOCAL-only nickname (same concept as
+    // Create's own "Room Name" field, and `SavedRoomRow.name`/`rooms.rs`'s
+    // `RoomStore` — never sent over the wire), shown above the join-link
+    // field so both tabs lead with the local-nickname field before the
+    // connection-detail field. Deliberately optional (unlike Create's Room
+    // Name, which is required): leaving it blank preserves today's
+    // join-then-auto-name-from-id behavior (`join_room_impl` only pre-seeds
+    // `room_store` when this is non-empty; `poll_connect_result`'s
+    // id-derived fallback naming still applies otherwise). `!joinString`
+    // stays the only required-field gate on the Join button.
+    card.appendChild(el("label", { className: "field-label", text: "Room Name" }));
+    const roomNameInput = el("input", { className: "field-input", attrs: { type: "text" } });
+    card.appendChild(roomNameInput);
+
+    card.appendChild(el("label", { className: "field-label", text: "Join link" }));
+    const linkInput = el("input", { className: "field-input", attrs: { type: "text" } });
     card.appendChild(linkInput);
 
     card.appendChild(errorText);
@@ -1172,7 +1204,7 @@
       primaryButton("Join", () => {
         const joinString = linkInput.value.trim();
         if (!joinString) return;
-        submitJoin(joinString, errorText);
+        submitJoin(joinString, roomNameInput.value.trim(), errorText);
       })
     );
     actions.appendChild(
