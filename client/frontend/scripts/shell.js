@@ -657,6 +657,85 @@
     return row;
   }
 
+  /** The room panel header's title: click-to-edit in place, replacing the
+   * old separate "ROOM NAME" form section that used to sit further down
+   * the panel body (removed 2026-07-28 — see
+   * `superdoc/features/stream-control.md` for the rationale). Clicking the
+   * plain-text title swaps it for a pre-filled `<input>`, reusing the same
+   * `renamePanelRoom` call the old "Save" button used. Commit/cancel
+   * behavior: Enter commits, Escape reverts without saving, and blur
+   * (clicking away) commits too — chosen over blur-discards because users
+   * who click away from an inline-edit field generally expect their typed
+   * text to stick, not vanish silently.
+   *
+   * The privacy note ("Only you see this name...") that used to be a
+   * permanent fixture of the old section now only appears while actively
+   * editing, right under the input — keeps the panel's resting state
+   * clean per the "looks cleaner" ask, without dropping the disclosure.
+   * Verified against `rename_saved_room` (src/session.rs): it only ever
+   * touches the local `RoomStore` file (`room_store.upsert` + `.save()`)
+   * — never sends the new name over the wire — so the claim still holds. */
+  function renderRoomPanelTitle(room) {
+    const wrap = el("span", { className: "room-panel-title-wrap" });
+    const title = el("span", { className: "room-panel-title", text: room.name });
+    title.tabIndex = 0;
+    title.title = "Click to rename";
+
+    const startEdit = () => {
+      wrap.innerHTML = "";
+      const input = el("input", {
+        className: "field-input room-panel-title-input",
+        attrs: { type: "text", value: room.name },
+      });
+      const note = el("div", {
+        className: "room-panel-privacy-note room-panel-title-privacy-note",
+        text: "Only you see this name. It never leaves your machine.",
+      });
+
+      // Enter, Escape, and blur can each fire in sequence (e.g. Enter
+      // blurs the input as a side effect) — `settled` makes sure only the
+      // first of them actually commits/cancels.
+      let settled = false;
+      const commit = () => {
+        if (settled) return;
+        settled = true;
+        renamePanelRoom(room.join_string, input.value.trim() || room.name);
+      };
+      const cancel = () => {
+        if (settled) return;
+        settled = true;
+        renderRoomPanel();
+      };
+
+      input.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          commit();
+        } else if (e.key === "Escape") {
+          e.preventDefault();
+          cancel();
+        }
+      });
+      input.addEventListener("blur", commit);
+
+      wrap.appendChild(input);
+      wrap.appendChild(note);
+      input.focus();
+      input.select();
+    };
+
+    title.addEventListener("click", startEdit);
+    title.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        startEdit();
+      }
+    });
+
+    wrap.appendChild(title);
+    return wrap;
+  }
+
   /** Renders the panel's content for `state.activeRoomPanel`. A no-op when
    * the panel is closed — `closeRoomPanel` owns hiding the scrim itself, so
    * this only needs to (re)build content while it's open, called after
@@ -673,7 +752,7 @@
     const header = el("div", { className: "room-panel-header" });
     const top = el("div", { className: "room-panel-header-top" });
     top.appendChild(el("span", { className: "status-dot status-dot-joined" }));
-    top.appendChild(el("span", { className: "room-panel-title", text: room.name }));
+    top.appendChild(renderRoomPanelTitle(room));
     top.appendChild(
       iconButton("close", () => closeRoomPanel(), { title: "Close", className: "room-panel-close" })
     );
@@ -830,24 +909,6 @@
     audioRow.appendChild(autoConnectLabel);
     audioSection.appendChild(audioRow);
     body.appendChild(audioSection);
-
-    // ---- ROOM NAME ----
-    const nameSection = el("div", { className: "room-panel-name-section" });
-    nameSection.appendChild(el("div", { className: "room-panel-section-label", text: "Room name" }));
-    const renameRow = el("div", { className: "room-panel-rename-row" });
-    const nameInput = el("input", { className: "field-input", attrs: { type: "text", value: room.name } });
-    renameRow.appendChild(nameInput);
-    renameRow.appendChild(
-      secondaryButton("Save", () => renamePanelRoom(room.join_string, nameInput.value.trim() || room.name))
-    );
-    nameSection.appendChild(renameRow);
-    // Verified against `rename_saved_room` (src/session.rs): it only ever
-    // touches the local `RoomStore` file (`room_store.upsert` + `.save()`)
-    // — never sends the new name over the wire — so this claim holds.
-    nameSection.appendChild(
-      el("div", { className: "room-panel-privacy-note", text: "Only you see this name. It never leaves your machine." })
-    );
-    body.appendChild(nameSection);
 
     panel.appendChild(body);
 
