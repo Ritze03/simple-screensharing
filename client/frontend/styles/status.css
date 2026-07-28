@@ -37,14 +37,15 @@
 .status-badge {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  padding: 2px 8px;
+  gap: 7px;
+  padding: 4px 10px 4px 8px;
   border-radius: 999px;
   border: 1px solid transparent;
-  font-size: 10px;
+  font-size: 9.5px;
   font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.03em;
+  letter-spacing: 0.05em;
+  line-height: 1;
   white-space: nowrap;
 }
 
@@ -81,6 +82,7 @@
   flex: 0 0 auto;
   border-radius: 50%;
   background: var(--success);
+  box-shadow: var(--success-glow);
 }
 
 /* -- degraded ----------------------------------------------------------
@@ -102,13 +104,16 @@
 /* -- failed -------------------------------------------------------------
  * A squared card, not a pill — the one family that isn't an inline badge. */
 
+/* Half-strength red edge (prototype: rgba(224,90,90,.42)) — a solid
+   --danger 1px box around a tinted panel is louder than the prototype's
+   and fights the Retry button inside it. */
 .status-failed-box {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  padding: 10px;
-  border: 1px solid var(--danger);
-  border-radius: var(--rounding-sm);
+  padding: 11px;
+  border: 1px solid rgba(224, 90, 90, 0.42);
+  border-radius: var(--rounding-md);
   background: rgba(224, 90, 90, 0.08);
 }
 
@@ -134,9 +139,9 @@
   font-family: var(--font-mono);
   font-size: 10.5px;
   color: var(--text-faint);
-  background: var(--panel-sunken);
-  border-radius: var(--rounding-sm);
-  padding: 4px 6px;
+  background: var(--elevation-16);
+  border-radius: 5px;
+  padding: 6px 8px;
   overflow-wrap: anywhere;
 }
 
@@ -156,12 +161,13 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 10px;
+  padding: 11px 12px;
   border: 1px solid var(--hatch-amber-border);
-  border-radius: var(--rounding-sm);
-  background-image: var(--hatch-amber-gradient);
+  border-radius: var(--rounding-md);
+  background-image: var(--hatch-amber-gradient-soft);
   color: var(--warning);
-  font-size: 12px;
+  font-size: 11px;
+  line-height: 1.6;
 }
 
 .hatched-banner-icon {
@@ -184,6 +190,10 @@
   padding: 16px 10px;
 }
 
+/* The prototype's empty-state plate is a soft-cornered TINT panel with an
+   inset accent ring and a light accent glyph — not a solid navy circle.
+   The solid-disc version read as a heavy avatar dropped into an otherwise
+   quiet empty state. */
 .empty-state-badge {
   width: 46px;
   height: 46px;
@@ -191,14 +201,16 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  border-radius: 50%;
+  border-radius: var(--rounding);
   margin-bottom: 2px;
-  background: linear-gradient(135deg, var(--pill-accent-bg-light), var(--pill-accent-bg));
+  background: linear-gradient(140deg, rgba(76, 110, 245, 0.28), rgba(76, 110, 245, 0.06));
+  box-shadow: inset 0 0 0 1px rgba(76, 110, 245, 0.3);
 }
 
 .empty-state-badge-icon {
-  font-size: 22px;
-  color: var(--text);
+  font-size: 23px;
+  color: var(--pill-accent-bg-lighter);
+  font-variation-settings: "wght" 300;
 }
 
 .empty-state-headline {

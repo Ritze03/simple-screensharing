@@ -42,7 +42,11 @@ input {
   width: var(--sidebar-width);
   flex: 0 0 var(--sidebar-width);
   background: var(--sidebar-rail);
-  border-right: 1px solid var(--border);
+  /* The rail is already a full elevation step below the content area; a
+     --border-weight edge on top of that reads as a seam. The prototype
+     uses --panel-raised here — barely visible, just enough to stop the
+     two darks bleeding into each other. */
+  border-right: 1px solid var(--panel-raised);
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -69,12 +73,18 @@ input {
   display: flex;
   align-items: center;
   justify-content: center;
-  background: linear-gradient(135deg, var(--pill-accent-bg-light), var(--pill-accent-bg));
+  background: var(--accent-mark-gradient);
+  /* The glow is what makes the mark read as a lit chip rather than a
+     flat swatch — it was missing entirely. */
+  box-shadow: var(--accent-glow-mark);
 }
 
 .app-icon .material-symbols-outlined {
   font-size: 14px;
-  color: var(--text);
+  /* Dark-on-accent, per the prototype — light-on-accent is the lower
+     contrast pairing against this blue. */
+  color: var(--primary-text);
+  font-variation-settings: "wght" 500;
 }
 
 .sidebar-header h1 {
@@ -101,20 +111,20 @@ input {
   margin: 0 12px 10px;
   padding: 4px;
   background: var(--elevation-16);
-  border: 1px solid var(--border);
-  border-radius: var(--rounding);
+  border: 1px solid var(--well-border);
+  border-radius: var(--rounding-well);
 }
 
 .nav-btn {
   height: var(--nav-button-height);
   width: 100%;
   border: none;
-  border-radius: var(--rounding-sm);
+  border-radius: var(--rounding-md);
   background: transparent;
   color: var(--text-dim);
   font-weight: 700;
   cursor: pointer;
-  transition: background-color 150ms ease, background-image 150ms ease, color 150ms ease;
+  transition: background-color 150ms ease, background-image 150ms ease, color 150ms ease, box-shadow 150ms ease;
 }
 
 .nav-btn:hover {
@@ -122,10 +132,14 @@ input {
   color: var(--text);
 }
 
+/* The active tab is a *lit* accent pill: the prototype's gradient runs to
+   the bright accent (not down into #2b3ea8, which is what made this look
+   like a muddy navy slab), carries a drop-glow, and sets dark text on it. */
 .nav-btn-active,
 .nav-btn-active:hover {
-  background-image: linear-gradient(135deg, var(--pill-accent-bg-light), var(--pill-accent-bg));
-  color: var(--text);
+  background-image: var(--nav-active-gradient);
+  box-shadow: var(--accent-glow-soft);
+  color: var(--primary-text);
 }
 
 /* -------------------------------------------------------------------
@@ -141,53 +155,98 @@ input {
   overflow: hidden;
 }
 
+/* Section heading. The prototype's is a *rule*, not just a word: an
+   accent micro-caps label, an optional count, then a 1px line running to
+   the right edge. Only the label was implemented — without the rule the
+   sidebar sections read as loose floating text rather than as banded
+   groups. `::after` gives us the line with no markup change. */
 .section-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   margin: 8px 4px 6px;
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 700;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.11em;
   text-transform: uppercase;
   color: var(--accent);
 }
 
+.section-label::after {
+  content: "";
+  flex: 1 1 auto;
+  height: 1px;
+  background: var(--well-border);
+}
+
+/* ROOMS puts its count between the label and the rule, so the rule moves
+   up to the head row and the label's own is suppressed. */
 .rooms-section-head {
   display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 6px;
+  align-items: center;
+  gap: 8px;
 }
 
 .rooms-section-label {
+  flex: 0 0 auto;
   margin-right: 0;
 }
 
+.rooms-section-label::after {
+  display: none;
+}
+
+.rooms-section-head::after {
+  content: "";
+  flex: 1 1 auto;
+  height: 1px;
+  background: var(--well-border);
+}
+
 .rooms-count {
-  margin: 0 4px 6px 0;
-  font-size: 11px;
+  flex: 0 0 auto;
+  margin: 0;
+  font-size: 10px;
   font-weight: 700;
   color: var(--text-faint);
 }
 
+/* The room list is a raised WELL inside the sunken rail, not bare rows on
+   the rail itself (prototype 1c: "the room list sits in a raised well
+   inside it"). This container — background, hairline border, 12px radius,
+   4px inset — was missing, which is a large part of the owner's "missing
+   ... borders" note: the sidebar had no drawn structure at all. */
 .rooms-list {
   flex: 1 1 auto;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  padding-bottom: 8px;
+  gap: 1px;
+  padding: 4px;
+  background: var(--elevation-16);
+  border: 1px solid var(--well-border);
+  border-radius: var(--rounding-well);
 }
 
 .room-row {
   border-radius: var(--rooms-row-radius);
-  padding: 6px 4px;
+  padding: 4px 6px;
 }
 
+/* A joined room is a lit row: accent wash plus an inset accent ring. The
+   flat #1F2024 fill this had gave joined and idle rooms nearly identical
+   weight, so "which rooms am I actually in" wasn't readable at a glance. */
 .room-row-joined {
-  background: var(--wash-active-2);
+  background: var(--accent-row-selected);
+  box-shadow: var(--accent-ring-inset);
 }
 
 .room-row:hover {
-  background: var(--wash-hover-2);
+  background: var(--elevation-1b);
+}
+
+.room-row-joined:hover {
+  background: var(--accent-row-selected);
 }
 
 /* Fixed row skeleton, applied consistently across every room state (see
@@ -198,8 +257,8 @@ input {
 .room-row-head {
   display: flex;
   align-items: center;
-  gap: 6px;
-  min-height: 24px;
+  gap: 5px;
+  min-height: 22px;
 }
 
 .room-caret {
@@ -237,8 +296,12 @@ input {
   background: rgba(232, 163, 61, 0.14);
 }
 
+/* 12px, per the prototype's room row. It was inheriting the 14px body size,
+   which — once the rows moved into their 4px-inset well — left too little
+   measure for the name and truncated "Movie Night" to "Movie Nig...". */
 .room-name {
   flex: 1 1 auto;
+  font-size: 12px;
   font-weight: 600;
   color: var(--text);
   overflow: hidden;
@@ -251,9 +314,9 @@ input {
 }
 
 .room-meta {
-  flex: 0 0 88px;
-  width: 88px;
-  font-size: 11px;
+  flex: 0 0 84px;
+  width: 84px;
+  font-size: 10px;
   color: var(--text-faint);
   text-align: right;
   overflow: hidden;
@@ -294,8 +357,12 @@ input {
   display: inline-block;
 }
 
+/* Glow, not just fill. In the prototype every "connected/live" dot carries
+   a 6px green bloom — it is the single most repeated futuristic cue in the
+   design and it was absent everywhere. */
 .status-dot-joined {
   background: var(--success);
+  box-shadow: var(--success-glow);
 }
 
 .status-dot-disconnected {
@@ -326,6 +393,7 @@ input {
    static, same "no motion = all's well" rule as `.status-badge-live`. */
 .status-dot-live {
   background: var(--success);
+  box-shadow: var(--success-glow);
 }
 
 .status-dot-progress {
@@ -354,31 +422,149 @@ input {
   background: var(--panel-raised);
   border: 1px solid var(--border);
   border-radius: var(--rounding);
-  padding: 16px;
+  padding: 15px;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 12px;
   min-width: 0;
+  /* Deliberate deviation from the (flat) mockup: an ambient shadow. The
+     prototype is a static image and paints none, but without one a card is
+     just a lighter rectangle — the shadow is what makes the elevation the
+     palette implies actually read on a real screen. Kept restrained. */
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25), 0 6px 18px rgba(0, 0, 0, 0.18);
 }
 
+/* -------------------------------------------------------------------
+ * Focus. The old port left every control on the UA default focus ring
+ * (or, where `outline: none` was set, on nothing at all). One consistent
+ * accent halo across buttons/inputs/rows is both an accessibility fix and
+ * part of what makes the UI feel considered rather than unstyled.
+ * ----------------------------------------------------------------- */
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--rounding-sm);
+}
+
+.btn:focus-visible,
+.nav-btn:focus-visible,
+.mode-toggle-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.field-input:focus-visible,
+select:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-chip-bg);
+}
+
+/* A heading INSIDE a card is muted and ruleless — the accent-plus-rule
+   treatment is reserved for headings that band a whole region of the
+   screen (ACTIVE SHARES, ROOMS, MEMBERS). Without this split every card
+   grew a blue title and a divider, which is louder than the prototype and
+   made a page of cards look like a page of alerts. */
 .card-label {
-  margin: 0 0 2px;
+  margin: 0;
+  color: var(--text-dim);
+  letter-spacing: 0.09em;
+}
+
+.card-label::after {
+  display: none;
+}
+
+/* -------------------------------------------------------------------
+ * Range inputs. The prototype's sliders are a thin sunken track with an
+ * accent GRADIENT fill and a light 14px knob that casts a shadow. The UA
+ * default (a flat grey groove with a solid accent-color thumb, which is
+ * all `accent-color` buys you) is the single most "unstyled" widget left
+ * on the page, and it appears on Broadcast, Settings, and every
+ * destination card's bitrate row.
+ * ----------------------------------------------------------------- */
+
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 18px;
+  background: transparent;
+  cursor: pointer;
+}
+
+/* `--range-pct` is published by shell.js's `paintRange` (see its note for
+   why JS is involved at all); the hard-stop gradient turns it into the
+   prototype's accent-filled track. Falls back to an unfilled track if the
+   variable is ever missing. */
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 5px;
+  border-radius: 3px;
+  background-color: var(--slider-track-bg);
+  background-image: linear-gradient(90deg, #2b3ea8 0%, var(--accent) var(--range-pct, 0%), transparent var(--range-pct, 0%));
+  border: 1px solid var(--inset-border);
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: -5px;
+  border-radius: 50%;
+  background: var(--text);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
+}
+
+input[type="range"]::-moz-range-track {
+  height: 5px;
+  border-radius: 3px;
+  background: var(--slider-track-bg);
+  border: 1px solid var(--inset-border);
+}
+
+/* Firefox/WebKitGTK can paint the filled portion natively; Chromium can't,
+   which is why the track above is neutral and this is progressive
+   enhancement rather than the primary treatment. */
+input[type="range"]::-moz-range-progress {
+  height: 5px;
+  border-radius: 3px;
+  background: var(--slider-fill);
+}
+
+input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border: none;
+  border-radius: 50%;
+  background: var(--text);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.6);
+}
+
+input[type="range"]:focus-visible::-webkit-slider-thumb {
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.6), 0 0 0 3px var(--accent-chip-bg);
 }
 
 /* -------------------------------------------------------------------
  * Warning banner — mirrors `theme::warning_banner` (bandwidth overshoot).
  * ----------------------------------------------------------------- */
 
+/* Hatched, not flat. The prototype's degraded/warning family is defined by
+   its 45-degree hatch texture ("reads as degraded even in a screenshot, at
+   a glance, without colour") — the status *badges* got it, but this
+   banner, the biggest warning surface in the app, kept a flat tint and a
+   full-strength solid border. */
 .warning-banner {
   display: flex;
   align-items: center;
   gap: 8px;
-  background: rgba(232, 163, 61, 0.12);
-  border: 1px solid var(--warning);
-  border-radius: var(--rounding-sm);
-  padding: 8px 12px;
+  background-image: var(--hatch-amber-gradient-soft);
+  border: 1px solid var(--hatch-amber-border);
+  border-radius: var(--rounding-md);
+  padding: 10px 12px;
   color: var(--warning);
   font-size: 12px;
+  line-height: 1.55;
 }
 
 .warning-banner-icon {
@@ -390,20 +576,31 @@ input {
  * Mode toggle / pill switch — bandwidth mode, settings language switcher.
  * ----------------------------------------------------------------- */
 
+/* Segmented control, not two loose buttons. The prototype renders every
+   exclusive two-choice picker (bandwidth mode, language) as one sunken
+   track holding N segments, with the selected segment lifted out of it by
+   an accent gradient + dark text. Two separately-bordered pills — what
+   this was — reads as "two buttons, one of which happens to be blue". */
 .mode-toggle {
   display: inline-flex;
-  gap: 4px;
+  gap: 3px;
+  padding: 3px;
+  background: var(--elevation-1b);
+  border: 1px solid var(--inset-border);
+  border-radius: var(--rounding-md);
 }
 
 .mode-toggle-btn {
-  border: 1px solid var(--btn-border);
+  border: none;
   background: transparent;
   color: var(--text-dim);
-  border-radius: var(--rounding-sm);
-  padding: 4px 10px;
-  font-size: 12px;
+  border-radius: 6px;
+  padding: 7px 14px;
+  font-size: 11px;
   font-weight: 600;
+  line-height: 1;
   cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease;
 }
 
 .mode-toggle-btn:hover {
@@ -413,9 +610,9 @@ input {
 
 .mode-toggle-btn-active,
 .mode-toggle-btn-active:hover {
-  background: var(--pill-accent-bg);
-  border-color: var(--accent);
-  color: var(--text);
+  background: var(--accent-gradient);
+  color: var(--primary-text);
+  font-weight: 700;
 }
 
 /* -------------------------------------------------------------------
@@ -455,29 +652,36 @@ input {
    button, without moving the actual entry point (this element still opens
    the same `#add-room-card` right below it — see `shell.js`'s
    `add-room-btn` listener). */
+/* Ghost = dashed ACCENT, not dashed grey. Every "add something" affordance
+   in the prototype is drawn in the accent (dashed border, faint accent
+   tint, accent label) so it reads as an invitation. Rendering them in
+   --text-faint made them look disabled. */
 .ghost-add-room-row {
   display: flex;
   align-items: center;
   gap: 8px;
   width: 100%;
-  padding: 6px 8px;
-  border: 1px dashed var(--border-light);
-  border-radius: var(--rooms-row-radius);
-  background: transparent;
-  color: var(--text-faint);
+  padding: 8px 10px;
+  border: 1px dashed var(--accent-ghost-border);
+  border-radius: var(--rounding-well);
+  background: var(--accent-ghost-bg);
+  color: var(--accent);
   font-family: inherit;
   font-size: 12px;
+  font-weight: 600;
   cursor: pointer;
+  transition: background-color 120ms ease;
 }
 
 .ghost-add-room-row:hover {
-  color: var(--text-dim);
-  border-color: var(--text-faint);
-  background: var(--wash-hover-1);
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-ghost-bg-hover);
 }
 
 .ghost-add-room-icon {
   font-size: 16px;
+  color: var(--accent);
 }
 
 .add-room-label {
@@ -517,11 +721,14 @@ input {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: var(--rounding);
+  gap: 5px;
+  /* 9px, not the 14px card radius — see --rounding-md. */
+  border-radius: var(--rounding-md);
   border: 1px solid transparent;
-  padding: 6px 14px;
+  padding: 7px 14px;
   cursor: pointer;
   font-weight: 600;
+  font-size: 12px;
 }
 
 .btn:disabled {
@@ -529,14 +736,22 @@ input {
   opacity: 0.55;
 }
 
+/* Primary = gradient + accent drop-glow. A flat `background: var(--accent)`
+   is the single most visible flattening in the old port: the prototype's
+   primary buttons are lit chips that cast light onto the card under them. */
 .btn-primary {
-  background: var(--accent);
+  background: var(--accent-gradient);
+  box-shadow: var(--accent-glow);
   color: var(--primary-text);
   font-weight: 700;
 }
 
 .btn-primary:hover:not(:disabled) {
   filter: brightness(1.08);
+}
+
+.btn-primary:disabled {
+  box-shadow: none;
 }
 
 .btn-secondary {
@@ -552,11 +767,26 @@ input {
 .btn-danger {
   background: transparent;
   color: var(--danger);
-  border-color: var(--danger);
+  /* Half-strength red edge, per the prototype — a full-saturation border
+     on an outline button competes with the actual destructive action. */
+  border-color: var(--danger-border);
 }
 
 .btn-danger:hover:not(:disabled) {
-  background: rgba(224, 90, 90, 0.12);
+  background: var(--danger-tint);
+  border-color: var(--danger);
+}
+
+/* Solid destructive — the confirm button in the leave dialog. */
+.btn-danger-solid {
+  background: var(--danger);
+  color: var(--primary-text);
+  border-color: transparent;
+  font-weight: 700;
+}
+
+.btn-danger-solid:hover:not(:disabled) {
+  filter: brightness(1.08);
 }
 
 .btn-icon {
@@ -592,15 +822,20 @@ input {
 .streams-section {
   flex: 0 0 auto;
   padding: 4px 12px 14px;
-  border-top: 1px solid var(--border);
 }
 
+/* Same raised well as `.rooms-list` — OUTGOING is the second banded group
+   on the rail and the prototype gives it identical chrome. */
 .streams-list {
   max-height: var(--streams-max-height);
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 1px;
+  padding: 4px;
+  background: var(--elevation-16);
+  border: 1px solid var(--well-border);
+  border-radius: var(--rounding-well);
 }
 
 /* OUTGOING row — same fixed-skeleton spirit as the ROOMS rows: dot, label,
@@ -611,13 +846,13 @@ input {
   align-items: center;
   gap: 6px;
   padding: 4px 4px 4px 6px;
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--text-dim);
   border-radius: var(--rounding-sm);
 }
 
 .stream-row:hover {
-  background: var(--wash-hover-1);
+  background: var(--elevation-1b);
 }
 
 .stream-audio-glyph {
@@ -703,8 +938,14 @@ input {
   padding: 24px;
 }
 
+/* The prototype's screen title is a restrained 15px semibold sitting on
+   the same baseline as the status pill beside it — not a browser-default
+   24px <h2>, which dwarfed everything under it and broke the type scale. */
 .tab-panel h2 {
-  margin-top: 0;
+  margin: 0 0 16px;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
   color: var(--text);
 }
 
@@ -733,7 +974,7 @@ input {
 .modal-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.5);
+  background: rgba(8, 9, 11, 0.55);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -744,13 +985,16 @@ input {
   display: none;
 }
 
+/* A dialog is the most-raised surface in the app, so it takes the raised
+   fill (it was using --elevation-19, *darker* than the page behind it) and
+   a deep 70px shadow that actually separates it from the scrim. */
 .modal {
-  background: var(--elevation-19);
-  border: 1px solid var(--border-light);
-  border-radius: var(--rounding);
-  padding: 16px;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 20px 22px 18px;
   width: 320px;
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+  box-shadow: var(--modal-shadow);
 }
 
 /* Leave-room confirm dialog's own layout (`.leave-modal*`) lives in
@@ -788,11 +1032,11 @@ input {
 .room-panel {
   position: absolute;
   inset: 0 auto 0 0;
-  width: 460px;
+  width: 430px;
   max-width: 90%;
-  background: var(--elevation-19);
-  border-right: 1px solid var(--border-light);
-  box-shadow: 12px 0 32px rgba(0, 0, 0, 0.4);
+  background: var(--elevation-1b);
+  border-right: 1px solid var(--border);
+  box-shadow: 26px 0 60px rgba(0, 0, 0, 0.5);
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -808,7 +1052,7 @@ input {
   flex: 0 0 auto;
   padding: 16px 16px 12px;
   background-image: var(--accent-header-wash);
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--inset-border);
 }
 
 .room-panel-header-top {
@@ -847,13 +1091,24 @@ input {
   gap: 16px;
 }
 
+/* Same label-plus-rule treatment as `.section-label` (see its note). */
 .room-panel-section-label {
-  margin: 0 0 8px;
-  font-size: 11px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin: 0 0 11px;
+  font-size: 10px;
   font-weight: 700;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.11em;
   text-transform: uppercase;
   color: var(--accent);
+}
+
+.room-panel-section-label::after {
+  content: "";
+  flex: 1 1 auto;
+  height: 1px;
+  background: var(--inset-border);
 }
 
 .room-panel-members {
@@ -892,8 +1147,8 @@ input {
   color: var(--accent);
   background: var(--pill-progress-bg);
   border: 1px solid var(--pill-progress-border);
-  border-radius: var(--rounding-sm);
-  padding: 1px 6px;
+  border-radius: 4px;
+  padding: 2px 6px;
 }
 
 .room-panel-member-status {
@@ -938,7 +1193,7 @@ input {
 .room-panel-footer {
   flex: 0 0 auto;
   padding: 12px 16px 16px;
-  border-top: 1px solid var(--border);
+  border-top: 1px solid var(--inset-border);
 }
 
 .room-panel-leave-btn {

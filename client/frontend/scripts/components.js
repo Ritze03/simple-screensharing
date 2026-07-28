@@ -615,8 +615,35 @@
     // out-of-band by `stream-control.js`'s `updateStats()`, same as the FPS
     // readout right below — no historical stats are fetched here, just a
     // fixed-size row of bar elements for that function to write into.
+    // The prototype breaks these numbers out as LABELLED columns in a sunken
+    // inset — RESOLUTION / FRAMERATE / BITRATE, each a micro-caps label over
+    // a tabular value, sparkline pushed to the right end. That
+    // labelled-instrument look is a good part of what the owner meant by
+    // "futuristic"; the port had collapsed it to one unlabelled string
+    // ("1920x1080 @ 30fps"), which read as a stray caption once the strip
+    // gained its inset styling.
     const metaRow = el("div", { className: "dest-meta-row" });
-    metaRow.appendChild(el("div", { className: "dest-meta", text: `${dest.width}x${dest.height} @ ${dest.framerate}fps` }));
+
+    const metric = (label, value) =>
+      el("div", { className: "dest-metric" }, [
+        el("span", { className: "dest-metric-label", text: label }),
+        el("span", { className: "dest-metric-value", text: value }),
+      ]);
+
+    if (dest.kind === "audio") {
+      // An audio destination has no resolution/framerate to report.
+      metaRow.appendChild(metric("Bitrate", `${dest.bitrate_kbps} kbps`));
+    } else {
+      metaRow.appendChild(metric("Resolution", `${dest.width}×${dest.height}`));
+      metaRow.appendChild(metric("Framerate", `${dest.framerate} fps`));
+      metaRow.appendChild(metric("Bitrate", `${dest.bitrate_kbps} kbps`));
+    }
+
+    // Kept (now empty) so anything still keying off `.dest-meta` finds it;
+    // the visible text moved into the metric columns above. Also acts as
+    // the flex spacer that pushes the sparkline to the right edge.
+    metaRow.appendChild(el("div", { className: "dest-meta" }));
+
     const sparkline = el("div", { className: "dest-sparkline", attrs: { hidden: "" } });
     for (let i = 0; i < 6; i++) sparkline.appendChild(el("span", { className: "spark-bar spark-bar-empty" }));
     metaRow.appendChild(sparkline);
@@ -707,6 +734,18 @@
         (p) => p.tune === editState.tune && p.qualityLevel === editState.qualityLevel && p.rateControl === editState.rateControl
       );
 
+      // Preset + Bitrate share one grid (`.dest-edit-grid`) so their
+      // controls start at the same X regardless of "Preset" vs.
+      // "Bitrate (kbps)" label width — previously each row was an
+      // independent flex container, so a row's control started wherever
+      // its own label happened to end and the group read as ragged.
+      // `.dest-edit-row` is `display: contents`, so each row must
+      // contribute exactly three children (label / control / value) or
+      // grid auto-placement spills the next row's label into the value
+      // column — the preset switch has no value readout, so its third
+      // cell is an empty spacer, same trick the Advanced rows below use.
+      const editGrid = el("div", { className: "dest-edit-grid" });
+
       const presetRow = el("div", { className: "dest-edit-row" });
       presetRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Preset" }));
       presetRow.appendChild(
@@ -719,7 +758,8 @@
           }
         )
       );
-      body.appendChild(presetRow);
+      presetRow.appendChild(el("span"));
+      editGrid.appendChild(presetRow);
 
       const editRow = el("div", { className: "dest-edit-row" });
       editRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Bitrate (kbps)" }));
@@ -736,7 +776,8 @@
       });
       editRow.appendChild(slider);
       editRow.appendChild(value);
-      body.appendChild(editRow);
+      editGrid.appendChild(editRow);
+      body.appendChild(editGrid);
 
       // Three testing-oriented encoder tuning knobs (`edit_destination`'s
       // `tune`/`quality_level`/`rate_control`) — same `pillSwitch` widget as
@@ -776,6 +817,13 @@
       const advanced = el("details", { className: "dest-advanced", attrs: opts.advancedOpen ? { open: "" } : {} });
       advanced.appendChild(el("summary", { className: "dest-advanced-summary", text: "Advanced tuning" }));
       const advancedBody = el("div", { className: "dest-advanced-body" });
+      // Own nested grid (not `editGrid` above — that one's already closed
+      // out into `body`) so Tune/Quality Level/Rate Control line up with
+      // each other the same way Preset/Bitrate do above. `-nested` drops
+      // `.dest-edit-grid`'s own top border/padding, since `.dest-advanced-
+      // body` already draws that separator from the "Advanced tuning"
+      // summary above it — see stream-control.css.
+      const advancedGrid = el("div", { className: "dest-edit-grid dest-edit-grid-nested" });
 
       const tuneRow = el("div", { className: "dest-edit-row" });
       tuneRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Tune" }));
@@ -789,7 +837,11 @@
           (value) => applyTuning({ tune: value })
         )
       );
-      advancedBody.appendChild(tuneRow);
+      // Empty value cell: `.dest-edit-row` is `display: contents`, so each
+      // row must contribute exactly three children or grid auto-placement
+      // spills the next row's label into the value column.
+      tuneRow.appendChild(el("span"));
+      advancedGrid.appendChild(tuneRow);
 
       const qualityRow = el("div", { className: "dest-edit-row" });
       qualityRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Quality Level" }));
@@ -804,7 +856,8 @@
           (value) => applyTuning({ qualityLevel: value })
         )
       );
-      advancedBody.appendChild(qualityRow);
+      qualityRow.appendChild(el("span"));
+      advancedGrid.appendChild(qualityRow);
 
       const rateControlRow = el("div", { className: "dest-edit-row" });
       rateControlRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Rate Control" }));
@@ -819,8 +872,10 @@
           (value) => applyTuning({ rateControl: value })
         )
       );
-      advancedBody.appendChild(rateControlRow);
+      rateControlRow.appendChild(el("span"));
+      advancedGrid.appendChild(rateControlRow);
 
+      advancedBody.appendChild(advancedGrid);
       advanced.appendChild(advancedBody);
       body.appendChild(advanced);
 

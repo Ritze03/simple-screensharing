@@ -1,11 +1,32 @@
 /*
  * tokens.css — shared design-token source of truth for the Tauri frontend.
  *
- * This file is a 1:1 CSS translation of `src/theme.rs` (the egui desktop
- * client's central theme module), plus a handful of new sidebar-specific
- * elevation/wash tokens taken from the design handoff (see
- * `superdoc/ui/APP-SHELL.md` and the handoff screenshots under
- * `project/shots/*.png`, cross-referenced by exact hex against `theme.rs`).
+ * SOURCE OF TRUTH: the redesign prototype,
+ * `Stream Control Redesign Options/Simple Screensharing Redesign.dc.html`
+ * (option "1i — Clickable, full window at 1440x900", the assembled design).
+ * Every hex below is lifted from that file.
+ *
+ * Why that matters (2026-07-28 correction): this file previously described
+ * itself as "a 1:1 CSS translation of `src/theme.rs`", and it was — but
+ * `theme.rs` is the *old* egui client's palette, i.e. the "before" the
+ * redesign was commissioned to replace. The handoff's `shots/*.png` are
+ * likewise screenshots of that old app (they ship next to `theme.rs`/`ui.rs`
+ * in the same folder — they are the designer's *input*, not the mockup).
+ * Porting from them reproduced the old greys under the new layout, which is
+ * why the owner's review said "some of the colors are not right". The
+ * elevation ramp is now the prototype's:
+ *
+ *     old (theme.rs)        new (prototype)
+ *     PANEL_SUNKEN #17181B  ->  #16171A
+ *     PANEL_BASE   #1E1F22  ->  #1B1C1F
+ *     PANEL_RAISED #27282D  ->  #24252A
+ *     BORDER       #3A3B40  ->  #34353B
+ *
+ * The prototype also carries a layer of chrome the old egui theme had no
+ * vocabulary for at all — accent gradients, coloured glows, hairline rings,
+ * hatched textures. Those live in the "Effects" block near the bottom; they
+ * are what makes the design read as "futuristic", so they are tokens, not
+ * one-off literals at the call site.
  *
  * Every other frontend/ file (shell.css today; Stream Control / View /
  * Settings styles later) should reference these custom properties by role
@@ -20,20 +41,33 @@
 
 :root {
   /* -------------------------------------------------------------------
-   * Color tokens — ported 1:1 from theme.rs (see that file for the
-   * design-rationale comments behind each choice; kept short here).
+   * Color tokens — from the redesign prototype (see the header note for
+   * the old-theme.rs values these replaced, and why).
    * ----------------------------------------------------------------- */
 
   /* Brand accent — nav active pill, primary buttons, selection tint. */
   --accent: #4c6ef5;
 
-  /* Elevation tiers (dark -> light): sunken < base < raised. */
-  --panel-sunken: #17181b;
-  --panel-base: #1e1f22;
-  --panel-raised: #27282d;
+  /* Elevation tiers (dark -> light): sunken < base < raised.
+     The prototype's whole point is that a card sits *above* the page, so
+     --panel-raised must be lighter than --panel-base. (It is. It was also
+     lighter before — but Stream Control's destination cards were filled
+     with --panel-sunken, which read as holes punched in the page.) */
+  --panel-sunken: #16171a;
+  --panel-base: #1b1c1f;
+  --panel-raised: #24252a;
 
-  /* Hairline borders / dividers. */
-  --border: #3a3b40;
+  /* Hairline borders / dividers — three weights, because the prototype
+     uses a different one per elevation and collapsing them to a single
+     grey is what made the sidebar and the cards read as the same tier.
+       --border       card / panel edge on a raised surface   (#34353B)
+       --divider      inside-a-card rule, muted separator     (#2A2B30)
+       --inset-border edge of a *sunken* inset within a card  (#26272C)
+       --well-border  edge of a sidebar well on the rail      (#1F2024) */
+  --border: #34353b;
+  --divider: #2a2b30;
+  --inset-border: #26272c;
+  --well-border: #1f2024;
 
   /* Text */
   --text: #e8e9ec;
@@ -78,9 +112,15 @@
   --wash-active-1: #2a2b30;
   --wash-active-2: #1f2024;
 
-  /* Lighter border variant, used where --border reads too heavy against a
-     raised surface (e.g. the joined-room row's card border). */
-  --border-light: #34353b;
+  /* Kept as an alias of --border: before the repalette these were two
+     different greys (#3A3B40 / #34353B), but the prototype only has one
+     card-edge value, so both names now resolve to it. Retained so the
+     existing call sites don't all have to change in one sweep. */
+  --border-light: var(--border);
+
+  /* Video-surface black — Watch tiles and Broadcast preview thumbs. Darker
+     than --panel-sunken so a video sits in a well, never on a card. */
+  --tile-bg: #101114;
 
   /* Status pill backgrounds (tinted fills for badges/pills, not raw
      severity text). */
@@ -98,7 +138,7 @@
   --pill-progress-bg: rgba(76, 110, 245, 0.14);
   --pill-progress-border: rgba(76, 110, 245, 0.4);
   --pill-live-bg: rgba(80, 200, 120, 0.12);
-  --pill-live-border: rgba(80, 200, 120, 0.35);
+  --pill-live-border: rgba(80, 200, 120, 0.3);
 
   /* Amber hatch fill shared by the "degraded" status family (status.css's
      `.status-badge-degraded`) and the leave-room confirm dialog's warning
@@ -121,12 +161,95 @@
   --accent-row-tint: rgba(76, 110, 245, 0.09);
 
   /* -------------------------------------------------------------------
+   * Effects — gradients, glows, rings, textures.
+   *
+   * This whole block was MISSING from the first redesign implementation.
+   * The old egui theme painted flat fills and 1px strokes and nothing
+   * else, so a port that took `theme.rs` as its source had no token for
+   * any of this — and a structural review ("is there a card here? is the
+   * label accent-coloured?") passes cleanly without it, because every
+   * element is present and correctly placed. It just looks flat. This is
+   * the layer the owner meant by "it looked way more futuristic in the
+   * mockup".
+   *
+   * Rule of thumb from the prototype: accent surfaces are a vertical
+   * gradient plus a coloured drop-glow; live/streaming surfaces get a
+   * green hairline ring (and, for hero surfaces, an outer bloom);
+   * degraded surfaces get a 45-degree hatch instead of a flat tint.
+   * ----------------------------------------------------------------- */
+
+  /* Accent fills. Primary buttons and the active segment of a segmented
+     control; `--nav-active-gradient`'s 100deg is the nav rail's own
+     slightly-off-vertical variant. Text on all of these is
+     --primary-text (#0B0C10), NOT --text: the prototype's accent is
+     bright enough that light-on-accent is the low-contrast choice. */
+  --accent-gradient: linear-gradient(180deg, #5c7bf7 0%, var(--accent) 100%);
+  --nav-active-gradient: linear-gradient(100deg, #5c7bf7 0%, var(--accent) 100%);
+  --accent-mark-gradient: linear-gradient(140deg, #5c7bf7 0%, #2b3ea8 100%);
+
+  /* Accent glows — a coloured drop shadow under an accent surface. */
+  --accent-glow: 0 3px 14px rgba(76, 110, 245, 0.35);
+  --accent-glow-soft: 0 2px 10px rgba(76, 110, 245, 0.3);
+  --accent-glow-mark: 0 2px 10px rgba(76, 110, 245, 0.4);
+
+  /* Live/green signals. The dot glow is what makes a "LIVE" indicator
+     read as lit rather than printed; the ring/bloom pair is the Watch
+     tile's and the Broadcast preview thumb's outline. */
+  --success-glow: 0 0 6px rgba(80, 200, 120, 0.8);
+  --success-glow-strong: 0 0 7px rgba(80, 200, 120, 0.9);
+  --tile-ring-live: 0 0 0 1px rgba(80, 200, 120, 0.2);
+  --thumb-ring-live: 0 0 0 1px rgba(80, 200, 120, 0.18), 0 0 22px rgba(80, 200, 120, 0.1);
+
+  /* Accent ring — the selected sidebar room row, and the composer card. */
+  --accent-ring-inset: inset 0 0 0 1px rgba(76, 110, 245, 0.28);
+  --accent-row-selected: rgba(76, 110, 245, 0.16);
+
+  /* Dashed accent affordance — "ghost" rows and chips that add something
+     ("Share another screen", "Also send to...", "+ Add a room"). */
+  --accent-ghost-bg: rgba(76, 110, 245, 0.07);
+  --accent-ghost-bg-hover: rgba(76, 110, 245, 0.14);
+  --accent-ghost-border: rgba(76, 110, 245, 0.4);
+  --accent-chip-bg: rgba(76, 110, 245, 0.1);
+  --accent-chip-border: rgba(76, 110, 245, 0.45);
+
+  /* Card lift — the hero (first/live) destination card is a shade lighter
+     at its top edge than a plain card, so it reads as nearer. */
+  --card-gradient: linear-gradient(180deg, #26282c 0%, var(--panel-raised) 100%);
+
+  /* Screen-surface texture. Stands in for decoded video on a preview
+     thumbnail: a fine diagonal weave, not a flat black rectangle (and
+     emphatically not the saturated blue placeholder this shipped with). */
+  --screen-hatch: repeating-linear-gradient(115deg, var(--elevation-19) 0 8px, var(--elevation-14) 8px 16px);
+
+  /* Slider track/fill — a filled range control, gradient like the buttons. */
+  --slider-fill: linear-gradient(90deg, #2b3ea8 0%, var(--accent) 100%);
+  --slider-track-bg: var(--elevation-1b);
+
+  /* Danger fills. */
+  --danger-tint: rgba(224, 90, 90, 0.12);
+  --danger-border: rgba(224, 90, 90, 0.5);
+  --modal-shadow: 0 26px 70px rgba(0, 0, 0, 0.7);
+
+  /* Softer sibling of --hatch-amber-gradient, for large surfaces (warning
+     banners) where the badge-sized 4px/8px stripe reads as noise. */
+  --hatch-amber-gradient-soft: repeating-linear-gradient(45deg, rgba(232, 163, 61, 0.1) 0 6px, rgba(232, 163, 61, 0.04) 6px 12px);
+  /* Faintest of the three, for full-tile surfaces: a hatch tuned for a
+     badge is far too loud stretched across a whole video tile. */
+  --hatch-amber-gradient-faint: repeating-linear-gradient(45deg, rgba(232, 163, 61, 0.05) 0 8px, transparent 8px 16px);
+
+  /* -------------------------------------------------------------------
    * Spacing / sizing / rounding — ported from theme.rs's constants.
    * ----------------------------------------------------------------- */
 
   --spacing: 7px;
   --rounding: 14px;
+  /* --rounding-md (9px) is the prototype's button/input/inset radius; the
+     old theme had only one small radius, so buttons inherited the 14px
+     card radius and read as lozenges rather than the design's soft rects. */
+  --rounding-md: 9px;
   --rounding-sm: 8px;
+  /* Sidebar wells (nav track, ROOMS list, OUTGOING list). */
+  --rounding-well: 12px;
   --value-w: 64px;
   --nav-button-height: 38px;
   --dot-size: 9px;

@@ -36,30 +36,42 @@
 /* Segmented room filter — "All rooms" + one chip per room currently on
  * screen. Only rendered when there's more than one room to filter between
  * (see view.js's render()); a single-room session has nothing to segment. */
+/* Segmented control in a sunken track — same primitive as the bandwidth
+   mode / language switches (shell.css `.mode-toggle`). It was a row of
+   free-floating outlined pills, which read as filter *tags* rather than
+   as one exclusive selector. */
 .view-room-filter {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
+  gap: 3px;
+  padding: 3px;
+  background: var(--elevation-16);
+  border: 1px solid var(--inset-border);
+  border-radius: var(--rounding-md);
 }
 
 .view-room-filter-chip {
   background: transparent;
-  border: 1px solid var(--border-light);
-  color: var(--text-dim);
-  border-radius: 999px;
-  padding: 3px 10px;
-  font-size: 11px;
+  border: none;
+  color: var(--text-faint);
+  border-radius: 6px;
+  padding: 6px 11px;
+  font-size: 10.5px;
+  font-weight: 500;
+  line-height: 1;
   cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease;
 }
 
 .view-room-filter-chip:hover {
   color: var(--text);
-  border-color: var(--text-faint);
 }
 
+/* The active segment here is a neutral raised chip, not accent — the
+   prototype reserves the accent gradient for actions, and a room filter
+   is navigation. */
 .view-room-filter-chip.active {
-  background: var(--pill-accent-bg);
-  border-color: var(--pill-accent-bg-light);
+  background: var(--btn);
   color: var(--text);
 }
 
@@ -69,10 +81,26 @@
   gap: 12px;
 }
 
+/* THE MISSING TILE BORDER (owner review: "I'm missing some ... borders on
+   the stream").
+ *
+ * The prototype gives every live Watch tile a green hairline RING —
+ * `box-shadow: 0 0 0 1px rgba(80,200,120,.2)` — not a `border`. That
+ * distinction is the whole reason it went missing: this file's header
+ * correctly notes that a video surface "must never read as a settings
+ * widget" and so must carry no card border, and the implementation
+ * concluded from that there should be no outline at all. The prototype's
+ * answer is subtler — no border-box border (which would inset the video
+ * and read as chrome), but a 1px lit ring sitting outside it, tinted with
+ * the live-green, so the tile reads as *powered* while staying chrome-free.
+ *
+ * The fill is also corrected to --tile-bg (#101114): a video well is a
+ * step darker than --panel-sunken, so the ring has something to sit on. */
 .media-tile {
   position: relative;
-  background: var(--panel-sunken);
+  background: var(--tile-bg);
   border-radius: var(--rounding);
+  box-shadow: var(--tile-ring-live);
   aspect-ratio: 16 / 9;
   overflow: hidden;
   display: flex;
@@ -113,15 +141,22 @@
  * top-right, fps stats bottom-right) fades in.
  * ----------------------------------------------------------------- */
 
+/* Prototype name plate: an opaque near-black plate (not a 45% black wash,
+   which let the video bleed through and muddied the text) with a live
+   green dot ahead of the name. */
 .media-tile-nameplate {
   position: absolute;
-  left: 8px;
-  bottom: 8px;
-  background: rgba(0, 0, 0, 0.45);
+  left: 12px;
+  bottom: 12px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  background: rgba(10, 11, 13, 0.78);
   border-radius: var(--rounding-sm);
-  padding: 3px 8px;
+  padding: 5px 10px 5px 8px;
   font-size: 11px;
-  color: rgba(232, 233, 236, 0.9);
+  font-weight: 500;
+  color: var(--text);
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
   pointer-events: none;
   max-width: calc(100% - 16px);
@@ -133,17 +168,30 @@
   transition: opacity 0.12s ease;
 }
 
+.media-tile-nameplate::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--success);
+}
+
 .media-tile:hover .media-tile-nameplate,
 .media-tile:focus-within .media-tile-nameplate {
   opacity: 0;
 }
 
+/* One full-tile vertical scrim (dark at both ends, clear through the
+   middle) rather than two separate strip gradients — the prototype's
+   overlay dims the whole tile so the controls read against any frame. */
 .media-tile-overlay {
   position: absolute;
   inset: 0;
   display: flex;
   flex-direction: column;
   justify-content: space-between;
+  background: linear-gradient(180deg, rgba(10, 11, 13, 0.72) 0%, rgba(10, 11, 13, 0.1) 40%, rgba(10, 11, 13, 0.82) 100%);
   opacity: 0;
   transition: opacity 0.12s ease;
   pointer-events: none;
@@ -170,7 +218,6 @@
   font-size: 11px;
   color: rgba(232, 233, 236, 0.85);
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
-  background: linear-gradient(to bottom, rgba(0, 0, 0, 0.5), transparent);
 }
 
 .media-tile-overlay-title {
@@ -196,14 +243,17 @@
   accent-color: var(--accent);
 }
 
+/* Frosted translucent-white control chip, per the prototype's tile
+   overlay — a black square reads as a hole in the video. */
 .media-tile-popout-btn {
   pointer-events: auto;
-  background: rgba(0, 0, 0, 0.4);
+  background: rgba(232, 233, 236, 0.1);
+  backdrop-filter: blur(6px);
   border: none;
   color: var(--text);
   border-radius: var(--rounding-sm);
-  width: 24px;
-  height: 24px;
+  width: 30px;
+  height: 30px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -211,7 +261,7 @@
 }
 
 .media-tile-popout-btn:hover {
-  background: rgba(0, 0, 0, 0.6);
+  background: rgba(232, 233, 236, 0.2);
 }
 
 .media-tile-popout-btn .material-symbols-outlined {
@@ -227,8 +277,7 @@
   justify-content: space-between;
   align-items: center;
   gap: 10px;
-  padding: 6px 8px;
-  background: linear-gradient(to top, rgba(0, 0, 0, 0.5), transparent);
+  padding: 10px 12px;
 }
 
 .media-tile-fps {
@@ -316,9 +365,12 @@
  * distinguishes it at a glance from a real video tile.
  * ----------------------------------------------------------------- */
 
+/* A held slot isn't live, so it drops the green ring and takes the
+   prototype's dashed placeholder treatment instead. */
 .media-tile-held {
-  border: 1.5px dashed var(--border-light);
-  background: var(--panel-sunken);
+  border: 1px dashed var(--border);
+  background: var(--elevation-16);
+  box-shadow: none;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -362,8 +414,22 @@
   font-size: 12px;
 }
 
+/* Degraded tile swaps the live ring for an amber one — same "the outline
+   tells you the state" idea, different family. The hatch drops to the
+   faint variant: the badge-scale gradient tiled across a whole tile read
+   as a loud amber blanket rather than the prototype's subtle texture over
+   the held last frame. */
 .media-tile-waiting {
-  background-image: var(--hatch-amber-gradient);
+  background-color: var(--tile-bg);
+  background-image: var(--hatch-amber-gradient-faint);
+}
+
+.media-tile:has(.media-tile-waiting) {
+  box-shadow: 0 0 0 1px var(--hatch-amber-border);
+}
+
+.media-tile-waiting-accent {
+  background: linear-gradient(90deg, transparent, var(--warning), transparent);
 }
 
 .media-tile-waiting-accent {
@@ -442,7 +508,8 @@
 
 .view-not-on-screen-label {
   font-size: 10px;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.11em;
+  font-weight: 700;
   text-transform: uppercase;
   color: var(--text-faint);
 }
@@ -453,23 +520,38 @@
   gap: 8px;
 }
 
+/* Raised card chip at the button radius, per the prototype — this was a
+   sunken 999px lozenge, i.e. lower than the page it sits on. */
 .view-not-on-screen-chip {
   display: flex;
   align-items: center;
-  gap: 6px;
-  background: var(--panel-sunken);
-  border: 1px solid var(--border-light);
-  border-radius: 999px;
-  padding: 4px 6px 4px 12px;
-  font-size: 11.5px;
-  color: var(--text-dim);
+  gap: 7px;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--rounding-sm);
+  padding: 6px 11px 6px 9px;
+  font-size: 11px;
+  color: var(--text);
 }
 
+/* Hollow dot — these streams are available but NOT on screen, so they
+   deliberately do not get the lit green of a live one. */
+.view-not-on-screen-chip::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  border: 1px solid var(--text-faint);
+}
+
+/* A bare accent glyph, not a filled navy disc — the prototype's play
+   affordance on these chips is just the icon in --accent. */
 .view-not-on-screen-chip-play {
   pointer-events: auto;
-  background: var(--pill-accent-bg);
+  background: transparent;
   border: none;
-  color: var(--text);
+  color: var(--accent);
   border-radius: 50%;
   width: 20px;
   height: 20px;
@@ -484,5 +566,5 @@
 }
 
 .view-not-on-screen-chip-play:hover {
-  background: var(--pill-accent-bg-light);
+  background: var(--accent-chip-bg);
 }

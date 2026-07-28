@@ -1,50 +1,128 @@
 /*
- * settings.css — Settings tab. One card; started as two rows per APP-SHELL.md
- * ("the pre-existing settings card ... relocated and restyled. No settings
- * were added, removed or redesigned") and has since gained the jitter-buffer
- * ceiling row.
+ * settings.css — Settings tab.
+ *
+ * 2026-07-28 design-fidelity pass: this used to be a single "SETTINGS" card
+ * of label-left/control-right rows. The prototype ("Simple Screensharing
+ * Redesign.dc.html", option 1i) is a stack of one-concern cards, each with
+ * its own micro-caps heading and, where a control needs explaining, a
+ * paragraph of prose under it — plus a closing info card. See settings.js's
+ * `render()` for which parts were genuinely missing rather than mis-styled.
  */
 
 .settings-grid {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  max-width: 480px;
+  /* 600px per the prototype's Settings column (was 480px). */
+  max-width: 600px;
 }
 
 .settings-row {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 12px;
 }
 
+/* Fixed label column, for the same reason the bandwidth sliders got a
+   shared grid (see stream-control.css): a slider whose start X depends on
+   its label's text width can never line up with a sibling row. */
 .settings-row-label {
+  flex: 0 0 auto;
+  min-width: 140px;
   color: var(--text);
   font-weight: 600;
+  font-size: 12px;
+}
+
+/* A control plus its inline qualifier ("Restart to apply"). */
+.settings-control-row {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  flex-wrap: wrap;
+}
+
+/* The language switch is a fixed-width segmented track in the prototype,
+   not a shrink-to-fit pair of buttons. */
+.settings-segmented {
+  width: 260px;
+}
+
+.settings-segmented .mode-toggle-btn {
+  flex: 1 1 0;
 }
 
 .settings-select {
+  width: 260px;
   background: var(--field);
   border: 1px solid var(--border);
   border-radius: var(--rounding-sm);
   color: var(--text);
-  padding: 5px 8px;
+  padding: 8px 10px;
+  font-size: 11.5px;
+}
+
+.settings-select:focus {
+  outline: none;
+  border-color: var(--accent);
 }
 
 .settings-hint {
-  font-size: 11px;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+/* Sits beside the control it qualifies; italic marks it as an aside rather
+   than a second label. */
+.settings-hint-inline {
+  font-style: italic;
+}
+
+/* Explanatory prose under a control — the part that was missing entirely
+   under PRESENTATION MODE, leaving three unexplained mode names. */
+.settings-blurb {
+  margin: 0;
+  font-size: 10.5px;
+  line-height: 1.65;
   color: var(--text-faint);
 }
 
 .settings-range {
-  flex: 1;
+  flex: 1 1 auto;
   accent-color: var(--accent);
 }
 
 .settings-row-value {
-  color: var(--text-faint);
+  flex: 0 0 auto;
+  color: var(--text);
+  font-weight: 600;
+  font-size: 11px;
   font-variant-numeric: tabular-nums;
-  min-width: 3.5ch;
+  min-width: 4ch;
   text-align: right;
+}
+
+/* Info/about card — sits a tier BELOW a normal card (sunken fill, muted
+   border), so it reads as a footnote to the stack rather than a fourth
+   setting. */
+.settings-about {
+  flex-direction: row;
+  align-items: center;
+  gap: 12px;
+  padding: 15px;
+  background: var(--elevation-16);
+  border-color: var(--inset-border);
+}
+
+.settings-about-icon {
+  flex: 0 0 auto;
+  font-size: 18px;
+  color: var(--text-faint);
+  font-variation-settings: "wght" 300;
+}
+
+.settings-about-text {
+  font-size: 10.5px;
+  line-height: 1.6;
+  color: var(--text-faint);
 }
