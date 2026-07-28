@@ -241,12 +241,10 @@ pub fn staged_capture_rows(state: &AppState) -> Vec<StagedCaptureRow> {
 
 #[derive(Serialize, Clone)]
 pub struct SettingsDto {
-    /// The local user's own display name (`AppState::display_name`) — last
-    /// value sent to `join_room`, or the OS-username default if never
-    /// joined. Exposed so the frontend can show the real name instead of a
-    /// hardcoded "You" label on the caller's own MEMBERS row (`shell.js`'s
-    /// `renderRoomPanel`) — previously there was no DTO field for this at
-    /// all (see that function's own comment on the gap this fixes).
+    /// The user's global display name (`rooms::AppSettings::display_name`,
+    /// set via `commands::set_display_name`) — used everywhere a name is
+    /// shown, including the caller's own MEMBERS row in `shell.js`'s
+    /// `renderRoomPanel` (previously hardcoded to "You").
     pub display_name: String,
     pub language: String,
     pub presentation_mode: String,
@@ -257,9 +255,6 @@ pub struct SettingsDto {
     pub max_jitter_buffer_ms: u32,
     pub bitrate_kbps: u32,
     pub framerate: u32,
-    /// The global display name (Settings tab) — see `rooms::AppSettings::
-    /// display_name` and `commands::set_display_name`.
-    pub display_name: String,
 }
 
 /// The "START A STREAM" form's persisted last-used values (`rooms::
@@ -553,6 +548,5 @@ pub fn settings_dto(state: &AppState) -> SettingsDto {
         max_jitter_buffer_ms: state.max_jitter_buffer_ms,
         bitrate_kbps: state.bitrate_kbps,
         framerate: state.framerate,
-        display_name: state.display_name.clone(),
     }
 }
