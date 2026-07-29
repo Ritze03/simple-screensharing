@@ -102,6 +102,11 @@ body {
   font-size: 14px;
 }
 
+/* Same dark/black + outline + blur recipe as `.media-tile-popout-btn`
+   (`view.css`, 2026-07-29 restyle) so this window's "exit this view"
+   affordance reads as the same design language as the View tab's
+   pop-out/stop-watching buttons — only the shape/size/position stay this
+   button's own (circular, fixed top-right), per the task brief. */
 .viewer-exit-btn {
   position: fixed;
   top: 12px;
@@ -110,8 +115,9 @@ body {
   width: 32px;
   height: 32px;
   border-radius: 50%;
-  border: none;
-  background: rgba(0, 0, 0, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(16, 17, 20, 0.55);
+  backdrop-filter: blur(6px);
   color: #fff;
   font-size: 18px;
   line-height: 1;
@@ -122,7 +128,7 @@ body {
 }
 
 .viewer-exit-btn:hover {
-  background: rgba(0, 0, 0, 0.75);
+  background: rgba(16, 17, 20, 0.75);
 }
 
 /* -------------------------------------------------------------------

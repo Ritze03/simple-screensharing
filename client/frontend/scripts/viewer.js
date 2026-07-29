@@ -243,6 +243,23 @@
           tileVolume.set(tile.id, Number(slider.value));
           pushVolume(tile);
         });
+        // Release focus once a mouse-driven drag ends (`mouseup`, not every
+        // `input` tick) — this window's tile fills virtually the whole
+        // viewport with nothing else to focus, so a slider left focused
+        // after the mouse moves away keeps `.viewer-tile:focus-within`
+        // (viewer.css) true forever, pinning `.media-tile-overlay`/
+        // `-vignette` visible even once the mouse is nowhere near the tile
+        // (confirmed live: `document.activeElement` stayed this slider,
+        // both opacities stuck at 1, after a drag + mouse-away). `mouseup`
+        // rather than blurring on every `input` event so a keyboard user
+        // who tabs to the slider (no `mouseup` fires for that) keeps it
+        // focused and visible — the accessibility case `:focus-within`
+        // exists for in the first place is unaffected (no `mouseup` fires
+        // for a keyboard interaction, so this listener never blurs a
+        // tabbed-to slider); only the mouse-drag-then-walk-away case, which
+        // has no such justification in a single-tile window, gets released.
+        slider.addEventListener("mouseup", () => slider.blur());
+
         group.appendChild(slider);
       }
       return group;
@@ -315,8 +332,17 @@
       const vignette = el("div", { className: "media-tile-vignette" });
       const overlay = el("div", { className: "media-tile-overlay" });
 
+      // Empty top spacer, mirroring `view.js`'s `renderTile` exactly — with
+      // only one flex child, `.media-tile-overlay`'s `justify-content:
+      // space-between` collapses to `flex-start` and the lone child renders
+      // at the TOP instead of the bottom. A second (empty) flex child
+      // restores the two-item distribution this window has no other use
+      // for (see the doc comment above: no pop-out/stop-watching buttons
+      // belong in here), without needing to touch `view.css`'s shared rule.
+      const top = el("div", { className: "media-tile-overlay-top" });
       const bottom = el("div", { className: "media-tile-overlay-bottom" });
       if (tile.hasAudio) appendAudioGroup(tile, bottom);
+      overlay.appendChild(top);
       overlay.appendChild(bottom);
 
       wrap.appendChild(vignette);
