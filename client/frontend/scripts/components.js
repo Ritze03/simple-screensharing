@@ -1596,7 +1596,7 @@
 
     picker.appendChild(
       primaryButton("Share", () => {
-        const source = sources.find((s) => String(s.id) === select.value);
+        const source = sources.find((s) => String(s.id) === String(select.value));
         if (source) handlers.onAddAudio && handlers.onAddAudio(dest, source);
         stopAudioSourcePolling();
       }, { className: "dest-audio-share-btn" + (opts.staged ? " dest-audio-share-btn-staged" : "") })
