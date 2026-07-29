@@ -53,7 +53,9 @@ input {
 }
 
 .sidebar-header {
-  padding: 12px 12px 10px;
+  padding: 18px;
+  display: flex;
+  justify-content: center;
 }
 
 .app-brand {
@@ -70,8 +72,8 @@ input {
    already-colored mark looked like a swatch-on-a-swatch, not a logo. */
 .app-icon {
   flex: 0 0 auto;
-  width: 22px;
-  height: 22px;
+  width: 30px;
+  height: 30px;
   display: flex;
   align-items: center;
   justify-content: center;
