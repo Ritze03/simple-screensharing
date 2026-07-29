@@ -933,34 +933,94 @@
   }
 
   // -------------------------------------------------------------------
-  // Encoder tuning presets — the "Low-Latency / Balanced / Quality" pill
-  // switch layered over the raw tune/quality_level/rate_control fields.
-  // Shared by `destinationCard`'s per-destination edit panel (a running
-  // share) and `stream-control.js`'s "START A STREAM" form (before a share
-  // exists), which is why this lives at module scope instead of inside
-  // `destinationCard` — both need the exact same three combos rather than
-  // two near-copies drifting apart. Values (`low_latency`/`best_quality`/
-  // `performance`/`balanced`/`quality`/`constant`) are `src-tauri/src/
-  // dto.rs`'s exact `parse_tune_mode`/`parse_quality_level`/
+  // Encoder tuning presets — the "Low-Latency / Balanced / Quality / Gaming"
+  // pill switch layered over the raw tune/quality_level/rate_control/
+  // gop_millis fields. Shared by `destinationCard`'s per-destination edit
+  // panel (a running share) and `stream-control.js`'s "START A STREAM" form
+  // (before a share exists), which is why this lives at module scope
+  // instead of inside `destinationCard` — both need the exact same combos
+  // rather than near-copies drifting apart. Values (`low_latency`/
+  // `best_quality`/`performance`/`balanced`/`quality`/`cqp`/`qvbr`) are
+  // `src-tauri/src/dto.rs`'s exact `parse_tune_mode`/`parse_quality_level`/
   // `parse_rate_control_mode` wire strings, including `QualityLevel::
-  // Balanced`'s `"balanced"`.
+  // Balanced`'s `"balanced"`. `gopMillis` is a plain number (ms), not a
+  // parsed string — see `capture::DEFAULT_GOP_MILLIS`/`GAMING_GOP_MILLIS`
+  // below.
   //
-  // `Why: "Balanced" as the middle option` — it's the recommended default
-  // for a regular user who doesn't know what "rate control" means;
-  // "Low-Latency" and "Quality" mirror the two extremes the raw Tune switch
-  // already offers, each paired with the Quality Level/Rate Control combo
-  // that actually matches that intent.
+  // 2026-07-30: rate control collapsed from three variants (Constant/
+  // Adaptive/Quality) to two real ones — `cqp` (was `Quality`, unchanged
+  // behavior) and `qvbr` (new: `vah264enc`'s "Quality-defined VBR", replaces
+  // the never-tuned `Adaptive`/`vbr` — see `capture::RateControlMode`'s doc
+  // comment). Every preset that used to say `rateControl: "quality"` (i.e.
+  // all three) has been re-decided per its own stated purpose, not
+  // blanket-defaulted:
+  // - Low-Latency wants predictable, non-quality-seeking behavior — `cqp`.
+  // - Balanced and Quality both want "spend the bandwidth budget on
+  //   quality", which is exactly what `qvbr` now does for real — `qvbr`.
+  // - Gaming (new) is CQP, not QVBR: fast-paced/motion-heavy content rarely
+  //   holds still, so QVBR's "spend leftover budget on stillness" upside
+  //   rarely triggers, while CQP's fixed, predictable per-frame quality
+  //   holds up more consistently under constant motion. Paired with a much
+  //   shorter GOP (`GAMING_GOP_MILLIS`, ~0.75s vs. the 2s default) for
+  //   faster recovery from motion artifacts, and the fast end of Quality
+  //   Level (`performance`/`target-usage=7`) to favor low encode latency.
+  //
+  // `Why: "Balanced" as the middle, default option` — it's the recommended
+  // default for a regular user who doesn't know what "rate control" means
+  // (and matches `AppState::default()`'s own tune/quality_level/rate_control,
+  // so a freshly-launched app's "next capture" settings already are the
+  // Balanced preset); "Low-Latency"/"Quality"/"Gaming" mirror the other
+  // points on the Tune/Quality Level/Rate Control/GOP space worth naming.
+  // Mirrors `capture::DEFAULT_GOP_MILLIS` (2s, the protocol-spec default);
+  // kept as its own named constant here rather than a bare `2000` so the
+  // three non-Gaming presets' intent ("the default GOP, unchanged") reads
+  // clearly next to Gaming's `GAMING_GOP_MILLIS` override.
+  const DEFAULT_GOP_MILLIS = 2000;
+  const GAMING_GOP_MILLIS = 750;
   const ENCODER_PRESETS = [
-    { value: "low_latency", label: "Low-Latency", tune: "low_latency", qualityLevel: "performance", rateControl: "quality" },
-    { value: "balanced", label: "Balanced", tune: "best_quality", qualityLevel: "balanced", rateControl: "quality" },
-    { value: "quality", label: "Quality", tune: "best_quality", qualityLevel: "quality", rateControl: "quality" },
+    {
+      value: "low_latency",
+      label: "Low-Latency",
+      tune: "low_latency",
+      qualityLevel: "performance",
+      rateControl: "cqp",
+      gopMillis: DEFAULT_GOP_MILLIS,
+    },
+    {
+      value: "balanced",
+      label: "Balanced",
+      tune: "best_quality",
+      qualityLevel: "balanced",
+      rateControl: "qvbr",
+      gopMillis: DEFAULT_GOP_MILLIS,
+    },
+    {
+      value: "quality",
+      label: "Quality",
+      tune: "best_quality",
+      qualityLevel: "quality",
+      rateControl: "qvbr",
+      gopMillis: DEFAULT_GOP_MILLIS,
+    },
+    {
+      value: "gaming",
+      label: "Gaming",
+      tune: "low_latency",
+      qualityLevel: "performance",
+      rateControl: "cqp",
+      gopMillis: GAMING_GOP_MILLIS,
+    },
   ];
 
-  /** Whichever preset's 3 fields exactly match `tune`/`qualityLevel`/
-   * `rateControl`, or `null` if none does (an allowed, unhighlighted state —
-   * see `destinationCard`'s `activePreset` doc note). */
-  function activeEncoderPreset(tune, qualityLevel, rateControl) {
-    return ENCODER_PRESETS.find((p) => p.tune === tune && p.qualityLevel === qualityLevel && p.rateControl === rateControl) || null;
+  /** Whichever preset's fields exactly match `tune`/`qualityLevel`/
+   * `rateControl`/`gopMillis`, or `null` if none does (an allowed,
+   * unhighlighted state — see `destinationCard`'s `activePreset` doc note). */
+  function activeEncoderPreset(tune, qualityLevel, rateControl, gopMillis) {
+    return (
+      ENCODER_PRESETS.find(
+        (p) => p.tune === tune && p.qualityLevel === qualityLevel && p.rateControl === rateControl && p.gopMillis === gopMillis
+      ) || null
+    );
   }
 
   // -------------------------------------------------------------------
@@ -980,7 +1040,7 @@
    *   (derived from `pending`) and `computedShareKbps` (Absolute-mode allocator
    *   display, not part of any DTO).
    * @param {object} handlers - { onEditApply(destinationId, {bitrateKbps, framerate,
-   *   tune, qualityLevel, rateControl}), onTransfer(destinationId, roomHandle),
+   *   tune, qualityLevel, rateControl, gopMillis}), onTransfer(destinationId, roomHandle),
    *   onFanout(captureId, roomHandle), onStop(destinationId),
    *   onAddAudio(dest, source), onAudioMute(captureId, muted),
    *   onAudioStop(audioDestinationId), onRefreshAudioSources() }
@@ -993,7 +1053,7 @@
    * @param {object} [opts] - { roomOptions: [{id,name}], encoderTuningEditable: bool,
    *   perStreamBitrateEditable: bool, framerateOptions: number[],
    *   roomsAlreadyFedByCapture: number[], editState: {bitrateKbps, framerate, tune,
-   *   qualityLevel, rateControl, error}, stalledSince: number|null, audio: object|null,
+   *   qualityLevel, rateControl, gopMillis, error}, stalledSince: number|null, audio: object|null,
    *   audioSources: array, staged: bool, stagedRoomHandle: number }.
    *
    *   `staged` renders the "Share Screen"/"Share another screen" flow's
@@ -1207,7 +1267,12 @@
     // as safe to apply, in either bandwidth mode. Only the Bitrate slider
     // itself has to stay Per-Stream-only (see its own note below).
     if (opts.encoderTuningEditable) {
-      const editState = opts.editState || { tune: "best_quality", qualityLevel: "balanced", rateControl: "constant" };
+      const editState = opts.editState || {
+        tune: "best_quality",
+        qualityLevel: "balanced",
+        rateControl: "qvbr",
+        gopMillis: DEFAULT_GOP_MILLIS,
+      };
       // Staged `dest` objects (`opts.staged`) have no `destination_id` yet —
       // key on `capture_id` instead, same id `handlers.onGoLive`/`onCancel`
       // already use for a staged card.
@@ -1229,7 +1294,7 @@
       // edit state; if the Advanced section was hand-tuned to some other
       // combo, none of the 3 preset buttons shows as selected — no
       // validation/blocking, that's an intentional, allowed state.
-      const activePreset = activeEncoderPreset(editState.tune, editState.qualityLevel, editState.rateControl);
+      const activePreset = activeEncoderPreset(editState.tune, editState.qualityLevel, editState.rateControl, editState.gopMillis);
 
       // Preset + Bitrate share one grid (`.dest-edit-grid`) so their
       // controls start at the same X regardless of "Preset" vs.
@@ -1300,7 +1365,14 @@
         activePreset ? activePreset.value : null,
         (value) => {
           const preset = PRESETS.find((p) => p.value === value);
-          if (preset) applyTuning({ tune: preset.tune, qualityLevel: preset.qualityLevel, rateControl: preset.rateControl });
+          if (preset) {
+            applyTuning({
+              tune: preset.tune,
+              qualityLevel: preset.qualityLevel,
+              rateControl: preset.rateControl,
+              gopMillis: preset.gopMillis,
+            });
+          }
         }
       );
       // `.dest-tuning-toggle`: same shared fixed-width modifier as
@@ -1439,13 +1511,19 @@
       qualityRow.appendChild(el("span"));
       advancedGrid.appendChild(qualityRow);
 
+      // Plain-language labels, not raw GStreamer jargon (`cqp`/`qvbr`) — per
+      // this file's own naming convention (compare `QualityLevel`'s
+      // Performance/Balanced/Quality above). "Efficient" = `cqp`
+      // (conservative/"resourceful" bandwidth use — never spends more than a
+      // fixed per-frame quality needs); "Max Quality" = `qvbr` (spends up to
+      // the full bandwidth budget for the best quality that fits — see
+      // `capture::RateControlMode`'s doc comment).
       const rateControlRow = el("div", { className: "dest-edit-row" });
       rateControlRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Rate Control" }));
       const rateControlToggle = pillSwitch(
         [
-          { value: "constant", label: "Constant" },
-          { value: "adaptive", label: "Adaptive" },
-          { value: "quality", label: "Quality" },
+          { value: "cqp", label: "Efficient" },
+          { value: "qvbr", label: "Max Quality" },
         ],
         editState.rateControl,
         (value) => applyTuning({ rateControl: value })
