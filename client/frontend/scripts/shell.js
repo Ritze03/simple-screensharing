@@ -255,6 +255,18 @@
 
     if (mockRooms.length === 0) {
       list.appendChild(renderRoomsEmptyState());
+      // The empty state above no longer offers its own join/create action
+      // (see `renderRoomsEmptyState`'s doc comment), so with zero rooms the
+      // "+ Create/Join a Room" card auto-opens as the replacement entry
+      // point — but only transitioning closed->open here, not resetting
+      // `addRoomTab` (and not re-rendering) on every `renderRooms()` call
+      // (e.g. from `refreshRooms()` on `presence-updated`) while the user is
+      // already mid-typing or has switched to the Create tab.
+      if (!state.addRoomOpen) {
+        state.addRoomOpen = true;
+        state.addRoomTab = "join"; // Join is always the pre-selected tab on open, same as the "+ Add Room" button.
+        renderAddRoomCard();
+      }
       return;
     }
 
@@ -364,26 +376,16 @@
   }
 
   /** Standardized empty state for the ROOMS section (first-launch/no-rooms
-   * case) — per the redesign, this one specifically shows the join-string
-   * input INLINE rather than gating it behind the "+ Add Room" button
-   * below (which stays for every non-empty case). Shares `submitJoin` with
-   * `renderAddRoomCard`'s own Join button so the two entry points can't
-   * drift into two slightly different validation/error paths. */
+   * case) — badge + headline + body only, no inline form or action: the "+
+   * Create/Join a Room" card (`renderAddRoomCard`, auto-opened by
+   * `renderRooms` whenever there are zero rooms) is the entry point for
+   * joining/creating now, so this empty state doesn't need its own. */
   function renderRoomsEmptyState() {
-    const linkInput = el("input", { className: "field-input field-input-mono", attrs: { type: "text", placeholder: "server | room-id | key" } });
-    const errorText = el("div", { className: "add-room-error", text: "" });
-    errorText.hidden = true;
-    const inline = el("div", { className: "empty-state-inline" }, [linkInput, errorText]);
-
-    return renderEmptyState("Paste a join link from whoever invited you to get started.", "Join", () => {
-      const joinString = linkInput.value.trim();
-      if (!joinString) return;
-      // No room-name field here (see this function's own doc comment on
-      // why it's out of scope for the "+ Add Room" card's new field) —
-      // `""` preserves this entry point's existing id-derived-name-on-join
-      // behavior unchanged.
-      submitJoin(joinString, "", errorText);
-    }, { icon: "meeting_room", headline: "No rooms yet", inline, className: "empty-state-rooms" });
+    return renderEmptyState("Paste a join link from whoever invited you to get started.", null, null, {
+      icon: "meeting_room",
+      headline: "No rooms yet",
+      className: "empty-state-rooms",
+    });
   }
 
   /** Shared join flow for both the ROOMS empty state's inline form and the

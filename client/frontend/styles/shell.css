@@ -1034,6 +1034,16 @@ input[type="range"]:focus-visible::-webkit-slider-thumb {
   gap: 8px;
 }
 
+/* ROOMS-only: `.rooms-list` (above) is `display:flex; flex-direction:column`
+   with this empty state as its sole child, so `margin: auto 0` (the
+   standard flex-item vertical-centering trick) centers it in the well's
+   available height. Scoped to this modifier class, not the base
+   `.empty-state`, so it doesn't affect the other (top-aligned-by-design)
+   empty states elsewhere that share that base class. */
+.empty-state-rooms {
+  margin: auto 0;
+}
+
 .empty-state-message {
   margin: 0;
   font-size: 12px;
