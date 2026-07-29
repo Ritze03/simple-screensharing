@@ -510,15 +510,30 @@
    * get the row's full space until hover, matching view.css's
    * `.media-tile-overlay` hover-reveal pattern.
    *
+   * A video destination with a paired audio destination (see
+   * `shell.js`'s `renderStreams`, which does the pairing/grouping) is
+   * rendered as a single combined row: identical to a plain video row,
+   * except a `volume_up` glyph is appended at the end for the paired audio
+   * — same glyph/class an unpaired audio row uses for itself, just
+   * repositioned onto the combined row instead of getting a whole row of
+   * its own. "Stop" on a combined row still only stops the VIDEO
+   * destination (`handlers.onStop` is always called with the video row's
+   * `destination_id`) — the paired audio destination is independent
+   * backend-side and keeps flowing.
+   *
    * @param {object} stream - a `DestinationRow` DTO shape { destination_id, kind:
    *   'video'|'audio', state: 'starting'|'live'|'rebuilding'|'stalled'|'failed',
    *   width, height, framerate, bitrate_kbps }, plus a frontend-only `room_label`
    *   (looked up from the room's `SavedRoomRow.name` by `room_handle` —
    *   `DestinationRow` itself only carries the numeric handle, not a display name).
-   * @param {object} [handlers] - { onStop(destinationId) } — calls the same real
-   *   `stop_destination` command `stream-control.js`'s own Stop button uses; this
-   *   is just a lighter-weight sidebar entry point onto that one command, not a
-   *   second copy of any stop logic.
+   *   For a combined row this is always the VIDEO row; see `handlers.audioRow`.
+   * @param {object} [handlers] - { onStop(destinationId), audioRow } —
+   *   `onStop` calls the same real `stop_destination` command
+   *   `stream-control.js`'s own Stop button uses (lighter-weight sidebar entry
+   *   point onto that one command, not a second copy of any stop logic);
+   *   `audioRow`, if present, is the paired audio `DestinationRow` folded
+   *   into this row — only its `volume_up` glyph is used, it never gets its
+   *   own Stop affordance here.
    */
   function renderStreamRow(stream, handlers) {
     handlers = handlers || {};
@@ -529,7 +544,7 @@
     row.appendChild(el("span", { className: "stream-label", text: stream.room_label }));
     const metaText = meta.label || (stream.kind === "audio" ? "" : `${stream.width}×${stream.height} @ ${stream.framerate}fps`);
     row.appendChild(el("span", { className: "stream-meta", text: metaText }));
-    if (stream.kind === "audio") row.appendChild(icon("volume_up", "stream-audio-glyph"));
+    if (stream.kind === "audio" || handlers.audioRow) row.appendChild(icon("volume_up", "stream-audio-glyph"));
     const stopBtn = dangerButton("Stop", () => handlers.onStop && handlers.onStop(stream.destination_id), {
       className: "stream-stop-overlay-btn",
     });

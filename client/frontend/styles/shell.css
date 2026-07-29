@@ -1019,11 +1019,6 @@ input[type="range"]:focus-visible::-webkit-slider-thumb {
 
 .stream-stop-overlay-btn .material-symbols-outlined {
   font-size: 15px;
-  /* Material Symbols glyphs sit slightly high inside their own line-height
-     box, so even inside a properly flex-centered `.btn` they read as
-     off-center against the "Stop" label's baseline. Nudge down a hair to
-     true them up. */
-  transform: translateY(0.5px);
 }
 
 .stream-row:hover .stream-stop-overlay-btn,
