@@ -253,6 +253,7 @@ pub struct SettingsDto {
     pub absolute_total_kbps: u32,
     pub destination_floor_kbps: u32,
     pub max_jitter_buffer_ms: u32,
+    pub catch_up_speed_percent: u32,
     pub bitrate_kbps: u32,
     pub framerate: u32,
 }
@@ -552,6 +553,7 @@ pub fn settings_dto(state: &AppState) -> SettingsDto {
         absolute_total_kbps: state.absolute_total_kbps,
         destination_floor_kbps: state.destination_floor_kbps,
         max_jitter_buffer_ms: state.max_jitter_buffer_ms,
+        catch_up_speed_percent: state.catch_up_speed_percent,
         bitrate_kbps: state.bitrate_kbps,
         framerate: state.framerate,
     }

@@ -89,6 +89,7 @@ fn main() {
             commands::set_display_name,
             commands::set_presentation_mode,
             commands::set_max_jitter_buffer_ms,
+            commands::set_catch_up_speed_percent,
             commands::start_video_share,
             commands::stage_video_share,
             commands::go_live,

@@ -15,7 +15,13 @@
 
   const { el, card, pillSwitch, dropdown, attachWheelStep } = window.Components;
 
-  const MOCK_SETTINGS = { language: "en", presentation_mode: "auto_vsync", max_jitter_buffer_ms: 2000, display_name: "" };
+  const MOCK_SETTINGS = {
+    language: "en",
+    presentation_mode: "auto_vsync",
+    max_jitter_buffer_ms: 2000,
+    catch_up_speed_percent: 5,
+    display_name: "",
+  };
 
   const PRESENTATION_MODES = [
     { value: "auto_vsync", label: "Auto Vsync (default)" },
@@ -32,6 +38,7 @@
         language: settings.language,
         presentation_mode: settings.presentation_mode,
         max_jitter_buffer_ms: settings.max_jitter_buffer_ms,
+        catch_up_speed_percent: settings.catch_up_speed_percent,
         display_name: settings.display_name,
       };
     }
@@ -78,6 +85,20 @@
       await window.__TAURI__.core.invoke("set_max_jitter_buffer_ms", { ms });
     }
     state.max_jitter_buffer_ms = ms;
+    render();
+  }
+
+  /** Ceiling on the jitter buffer's catch-up playback speed (5-10%). Same
+   * mock/real fallback and local-state-mutation pattern as
+   * `setMaxJitterBufferMs` right above — and, like that setting, takes
+   * effect for `tile-video.js`'s pipeline via `view.js`/`viewer.js`'s own
+   * one-time `get_settings()` read at startup (see those files'
+   * `fetchMaxJitterBufferMs`), not by pushing live from here. */
+  async function setCatchUpSpeedPercent(percent) {
+    if (window.__TAURI__) {
+      await window.__TAURI__.core.invoke("set_catch_up_speed_percent", { percent });
+    }
+    state.catch_up_speed_percent = percent;
     render();
   }
 
@@ -169,6 +190,35 @@
       text: "Smooths network hiccups. The buffer grows automatically only when needed, up to this ceiling.",
     });
 
+    // -- PLAYBACK (catch-up speed) ------------------------------------------
+    // Sibling control to the jitter-buffer slider right above: bounds how
+    // much faster than live the buffer is allowed to play back while
+    // shrinking itself back down after a jitter spike (`tile-video.js`'s
+    // `updateAppliedBuffer`) — always active, this only caps how aggressive
+    // it's allowed to get. Range fixed to 5-10%, per the project owner's
+    // ask, so step 1 covers the whole slider.
+    const catchUpValue = el("span", { className: "settings-row-value", text: `${state.catch_up_speed_percent}%` });
+    const catchUpSlider = el("input", {
+      className: "settings-range",
+      attrs: { type: "range", min: "5", max: "10", step: "1", value: String(state.catch_up_speed_percent) },
+    });
+    catchUpSlider.addEventListener("input", () => {
+      catchUpValue.textContent = `${Number(catchUpSlider.value)}%`;
+    });
+    catchUpSlider.addEventListener("change", () => setCatchUpSpeedPercent(Number(catchUpSlider.value)));
+    attachWheelStep(catchUpSlider);
+
+    const catchUpRow = el("div", { className: "settings-row" }, [
+      el("span", { className: "settings-row-label", text: "Catch-up speed" }),
+      catchUpSlider,
+      catchUpValue,
+    ]);
+
+    const catchUpBlurb = el("p", {
+      className: "settings-blurb",
+      text: "How much faster than live the buffer is allowed to play back while shrinking after a jitter spike.",
+    });
+
     // -- About ------------------------------------------------------------
     // Deliberately no version number: the prototype shows "0.4", but that
     // was the designer's placeholder and there is no command exposing the
@@ -186,7 +236,7 @@
     grid.appendChild(card("DISPLAY NAME", [nameInput, nameBlurb]));
     grid.appendChild(card("LANGUAGE", [langSwitch]));
     grid.appendChild(card("PRESENTATION MODE", [presentationRow, presentationBlurb]));
-    grid.appendChild(card("PLAYBACK", [jitterRow, jitterBlurb]));
+    grid.appendChild(card("PLAYBACK", [jitterRow, jitterBlurb, catchUpRow, catchUpBlurb]));
     grid.appendChild(about);
     root.appendChild(grid);
   }
