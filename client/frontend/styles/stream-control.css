@@ -759,16 +759,6 @@
   box-shadow: none;
 }
 
-.dest-audio-name {
-  flex: 1 1 auto;
-  min-width: 0;
-  font-size: 11px;
-  color: var(--text-dim);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 /* Fixed width, sized for the longer of "Mute"/"Unmute", so toggling the
    label never reflows the row (the Stop button beside it would otherwise
    slide sideways on every click).
@@ -802,33 +792,6 @@
 .dest-audio-stop {
   flex: 0 0 auto;
   padding: 6px 22px;
-  height: auto;
-  font-size: 14px;
-}
-
-/* Attached row: the meter/name/Mute/Stop line stays as it was, but now
-   wraps a second line underneath for the always-visible source picker +
-   Switch (2026-07-29, on-the-fly audio switching) — `flex-wrap` rather than
-   a taller fixed row, since the top line's own height/alignment shouldn't
-   change just because a second line got added below it. */
-.dest-audio-row-attached {
-  flex-wrap: wrap;
-  row-gap: 8px;
-}
-
-.dest-audio-switch-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex: 1 1 100%;
-  /* Lines up with `.dest-audio-name` above, past the meter's fixed 26px +
-     the row's 8px gap. */
-  padding-left: 34px;
-}
-
-.dest-audio-switch-btn {
-  flex: 0 0 auto;
-  padding: 6px 14px;
   height: auto;
   font-size: 14px;
 }
@@ -911,6 +874,28 @@
 .dest-audio-select {
   min-width: 331px;
   max-width: 420px;
+}
+
+/* In the attached row, the picker sits inline on the single meter/picker/
+   Mute/Stop line — doubling as the name display, replacing the old raw
+   `.dest-audio-name` text + separate "Switch" button (2026-07-29, instant
+   switch-on-select). The shared `.dest-audio-select` sizing above (a
+   generous fixed min/max-width) was tuned for the not-yet-attached picker's
+   own standalone inline-flex context; here it shares the line with two
+   32px buttons, so both the outer `.dd` (the flex item `dropdown()`
+   actually returns — `.dest-audio-select`/`.dest-room-select` land on the
+   inner `.dd-trigger` button, not on it, so it needs its own rule) and the
+   trigger itself flex to fill whatever space is left, and `.dd-trigger-
+   label`'s existing ellipsis handles a long name. */
+.dest-audio-row-attached > .dd {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.dest-audio-row-attached .dest-audio-select {
+  width: 100%;
+  min-width: 0;
+  max-width: none;
 }
 
 /* Was 3px 8px / 11px, with a bigger `-staged` modifier layered on for staged
