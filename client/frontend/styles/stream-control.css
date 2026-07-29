@@ -736,10 +736,18 @@
   transition: height 90ms linear, opacity 90ms linear, background-color 90ms linear;
 }
 
+/* `--success-glow`'s blur radius (6px) is fine on the round, few-pixel LIVE
+   dot it was designed for, but each meter bar is only ~3.6px wide — the same
+   blur bleeds sideways past the bar's actual edges and makes a lit bar read
+   as visibly fatter than an unlit one, even though the underlying box width
+   never changes (confirmed via getBoundingClientRect during the fix for this
+   bug — see stream-control.js's `paintAudioMeter`, which only ever sets
+   `height`). Scoped-down glow here, not a change to the shared token, so
+   other `--success-glow` users (LIVE badge dot, etc.) are unaffected. */
 .dest-audio-meter-bar.dest-audio-meter-bar-lit {
   background: var(--success);
   opacity: 1;
-  box-shadow: var(--success-glow);
+  box-shadow: 0 0 1px rgba(80, 200, 120, 0.8);
 }
 
 /* Muted: the meter is deliberately flat and grey (the capture pipeline's
