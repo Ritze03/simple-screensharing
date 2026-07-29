@@ -966,7 +966,20 @@
     const stagedCardEl = (staged) => {
       seenStagedIds.add(staged.capture_id);
       const edit = getStagedEdit(staged);
-      const sig = JSON.stringify({ staged, edit, roomOptions: mockJoinedRooms });
+      // Same pairing lookup `orderedCardEls` below uses for live cards
+      // (matched on `paired_capture_id`) — a staged capture can already have
+      // audio attached to it (see `onAddAudio` below), so its card needs to
+      // find that row the same way a live card's does. No room match here:
+      // unlike a live card (which can fan the same capture into several
+      // rooms), a staged capture has exactly one room — whichever the Room
+      // picker currently holds — so `paired_capture_id` alone is unambiguous.
+      const audio = mockDestinations.find((d) => d.kind === "audio" && d.paired_capture_id === staged.capture_id) || null;
+      const sig = JSON.stringify({
+        staged,
+        edit,
+        roomOptions: mockJoinedRooms,
+        audio: audio ? { id: audio.destination_id, capture: audio.capture_id, label: audio.label, muted: audio.muted } : null,
+      });
       let entry = stagedCardEls.get(staged.capture_id);
       if (!entry || entry.sig !== sig) {
         const priorAdvancedEl = entry ? entry.el.querySelector(".dest-advanced") : null;
@@ -979,6 +992,15 @@
               onStagedRoomChange: (captureId, roomHandle) => setStagedRoom(captureId, roomHandle),
               onGoLive: (captureId) => goLive(captureId, staged),
               onCancel: (captureId) => cancelStagedCapture(captureId),
+              // Uses the staged card's OWN room picker (`edit.roomHandle`,
+              // defaulted in `getStagedEdit` — the same value "Go live"
+              // itself sends), not a `dest.room_handle` field a staged
+              // capture doesn't have. See `destinationCard`'s "Why this also
+              // renders while staged" doc note in components.js.
+              onAddAudio: (d, source) => startAudioShare(edit.roomHandle, source, d.capture_id),
+              onAudioMute: (captureId, muted) => setAudioShareMuted(captureId, muted),
+              onAudioStop: (audioDestinationId) => stopDestination(audioDestinationId),
+              onRefreshAudioSources: () => refreshAudioSources(),
             },
             {
               staged: true,
@@ -989,6 +1011,8 @@
               framerateOptions: framerateOptionsFor(edit),
               editState: edit,
               advancedOpen,
+              audio,
+              audioSources: mockAudioSources,
             }
           ),
           sig,

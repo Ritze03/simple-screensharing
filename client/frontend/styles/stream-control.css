@@ -795,6 +795,23 @@
   flex: 0 0 auto;
 }
 
+/* On a staged card, "+ Add audio" sits next to (well, above — it's the
+   card's only other row) "Go live"/"Cancel", which are already bumped to
+   32px tall (`.dest-actions-staged .dest-action-btn` above) because they're
+   the card's one deliberate confirming action, not a routine small button.
+   A staged card has no live-card norm to defer to, so match that same
+   32px rather than the small `.dest-chip-add-btn` sizing a live card's row
+   uses. Padding chosen to land on 32px measured live (`getBoundingClientRect`
+   height), not assumed from the numbers alone — font-size changes
+   line-height in ways padding math alone doesn't predict (see this
+   session's `.dest-actions-staged .dest-action-btn` note above, learned the
+   same way). */
+.dest-audio-add-btn-staged {
+  padding: 6px 14px 6px 12px;
+  font-size: 14px;
+  font-weight: 700;
+}
+
 .dest-audio-picker {
   display: inline-flex;
   align-items: center;
