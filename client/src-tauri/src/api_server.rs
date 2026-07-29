@@ -550,6 +550,11 @@ fn dispatch(name: &str, body: &Value, app: &AppHandle) -> Result<Value, ApiError
         "stop_share" => ok(commands::stop_share(managed, get_u32(body, "capture_id")?)),
         "list_audio_sources" => result(tauri::async_runtime::block_on(commands::list_audio_sources())),
         "select_audio_source" => ok(commands::select_audio_source(managed, get_u32(body, "id")?, get_string(body, "name")?)),
+        "start_audio_level_tap" => {
+            result(tauri::async_runtime::block_on(commands::start_audio_level_tap(managed, get_u32(body, "source_id")?)))
+        }
+        "poll_audio_level_tap" => ok(commands::poll_audio_level_tap(managed, get_u32(body, "tap_id")?)),
+        "stop_audio_level_tap" => ok(commands::stop_audio_level_tap(managed, get_u32(body, "tap_id")?)),
         "set_bitrate" => ok(commands::set_bitrate(managed, get_u32(body, "kbps")?)),
         "set_framerate" => ok(commands::set_framerate(managed, get_u32(body, "fps")?)),
         "set_tune" => result(commands::set_tune(managed, get_string(body, "tune")?)),

@@ -253,6 +253,13 @@ pub struct CaptureSourceId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DestinationId(pub u32);
 
+/// Identifies one live [`audio::AudioLevelTapHandle`] — a candidate source's
+/// dropdown-entry meter, not a real share (see that type's doc comment).
+/// Scoped tightly to however long one dropdown is open on the frontend: see
+/// [`AppState::start_audio_level_tap`]/[`AppState::stop_audio_level_tap`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AudioLevelTapId(pub u32);
+
 /// Either kind of running outbound share this client can hold onto.
 pub enum ShareHandle {
     Video(CaptureHandle),
@@ -1116,6 +1123,16 @@ pub struct AppState {
     pub audio_sources_rx: Option<oneshot::Receiver<Result<Vec<AudioSource>, String>>>,
     pub selected_audio_source: Option<AudioSource>,
 
+    /// Live non-announcing level taps backing the "Add audio"/"Switch"
+    /// dropdown's per-candidate meters — see [`AudioLevelTapId`] and
+    /// [`audio::AudioLevelTapHandle`]. Only ever holds entries for however
+    /// long a dropdown is actually open on the frontend; there is no
+    /// standing/background tap.
+    pub audio_level_taps: HashMap<AudioLevelTapId, audio::AudioLevelTapHandle>,
+    /// Monotonic allocator for [`AudioLevelTapId`] — same never-rewind,
+    /// never-reuse rationale as the "Session ids" note above.
+    pub next_audio_level_tap_id: u32,
+
     pub room_store: RoomStore,
     pub room_store_error: Option<String>,
     /// Join strings still waiting to be auto-connected at startup (see
@@ -1188,6 +1205,8 @@ impl Default for AppState {
             audio_sources_requested: false,
             audio_sources_rx: None,
             selected_audio_source: None,
+            audio_level_taps: HashMap::new(),
+            next_audio_level_tap_id: 0,
             room_store,
             room_store_error,
             auto_connect_queue: Vec::new(),
@@ -2284,6 +2303,51 @@ impl AppState {
         match self.captures.get(&capture_id).map(|c| &c.status) {
             Some(ShareStatus::Active(ShareHandle::Audio(handle))) => Some(handle.level()),
             _ => None,
+        }
+    }
+
+    /// Starts a non-announcing level tap for one dropdown candidate —
+    /// backs the "Add audio"/"Switch" picker's per-entry meter (see
+    /// [`audio::AudioLevelTapHandle`]'s doc comment for why this is a
+    /// separate, much cheaper thing than a real audio share). `source` is
+    /// resolved by the caller against a fresh `list_audio_sources()` call
+    /// (see `commands::start_audio_level_tap`) rather than trusted from
+    /// whatever the frontend already had cached, since the whole point of
+    /// this tap is to describe a source's *current* state.
+    ///
+    /// Errors (no `object.serial` for this node, or the GStreamer pipeline
+    /// failing to construct) are non-fatal to the caller — the frontend
+    /// just leaves that one entry's meter unlit rather than failing the
+    /// whole dropdown open.
+    pub fn start_audio_level_tap(&mut self, source: &AudioSource) -> Result<u32, String> {
+        let serial = source
+            .serial
+            .ok_or_else(|| format!("'{}' has no PipeWire object.serial to tap yet", source.name))?;
+        let handle = audio::start_level_tap(serial).map_err(|e| format!("{e:#}"))?;
+        let id = self.next_audio_level_tap_id;
+        self.next_audio_level_tap_id = self.next_audio_level_tap_id.wrapping_add(1);
+        self.audio_level_taps.insert(AudioLevelTapId(id), handle);
+        Ok(id)
+    }
+
+    /// Newest reading (0.0-1.0) of a live level tap, or `None` if `tap_id`
+    /// doesn't (or no longer) name one — e.g. it was already stopped, which
+    /// the frontend's poll loop treats the same as "nothing to paint" rather
+    /// than an error.
+    pub fn audio_level_tap_level(&self, tap_id: u32) -> Option<f32> {
+        self.audio_level_taps.get(&AudioLevelTapId(tap_id)).map(|h| h.level())
+    }
+
+    /// Tears one level tap down — called for every still-open tap the
+    /// instant a dropdown closes (see [`AudioLevelTapId`]'s doc comment for
+    /// why none of these are meant to outlive that). Spawned rather than
+    /// awaited for the same reason `stop_share_one` below is: the caller
+    /// (a synchronous Tauri command) can't await, and there's no result the
+    /// frontend needs back — the tap is gone from `audio_level_taps`
+    /// immediately, so a re-poll after this returns correctly sees nothing.
+    pub fn stop_audio_level_tap(&mut self, tap_id: u32) {
+        if let Some(handle) = self.audio_level_taps.remove(&AudioLevelTapId(tap_id)) {
+            tokio::spawn(async move { handle.stop().await });
         }
     }
 

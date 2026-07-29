@@ -163,6 +163,14 @@ pub struct AudioSource {
     /// Best-effort human-readable label: `node.description`, falling back
     /// to `application.name`, then `media.name`, then the raw `node.name`.
     pub name: String,
+    /// The node's `object.serial`, if `pw-dump` reported one — the number
+    /// [`start_level_tap`]'s `pipewiresrc target-object=` needs (see
+    /// [`build_pipeline`]'s doc comment for why `target-object` takes the
+    /// serial and not the registry `id` above). `None` on the rare node that
+    /// doesn't carry the property yet (a brand new one `pw-dump` caught
+    /// mid-registration); [`start_level_tap`] just fails with a clear error
+    /// for that one entry rather than mis-tapping it.
+    pub serial: Option<u64>,
 }
 
 /// Lists every application currently producing audio: PipeWire nodes with
@@ -198,7 +206,8 @@ fn extract_audio_sources(objects: &[PwObject]) -> Vec<AudioSource> {
             .unwrap_or(node_name)
             .to_string();
         let name = if name.is_empty() { format!("(unnamed stream {})", obj.id) } else { name };
-        sources.push(AudioSource { id: obj.id, name });
+        let serial = prop_u64(props, "object.serial");
+        sources.push(AudioSource { id: obj.id, name, serial });
     }
     sources
 }
@@ -859,6 +868,143 @@ impl AudioCaptureHandle {
 }
 
 // ---------------------------------------------------------------------
+// Non-announcing level taps (dropdown-entry meters)
+// ---------------------------------------------------------------------
+
+/// A lightweight, private level reading for one *candidate* audio source —
+/// **not** a share: this never loopbacks, links, encodes, or announces
+/// anything to the relay. It exists purely so the "Add audio"/"Switch"
+/// dropdown can show a live meter next to each option, so the user can tell
+/// which running application is actually making sound before picking it —
+/// see `superdoc/features/stream-control.md` for the feature this backs.
+///
+/// # Why a separate, much simpler pipeline than [`AudioCaptureHandle`]
+///
+/// [`start_audio_sharing`]'s pipeline is the real capture path: it has to
+/// prove (via [`wait_for_capture_link`]) it's tapping the exact node the
+/// user picked, because getting that wrong would silently broadcast the
+/// wrong audio (or the microphone) to the whole room. A level tap has no
+/// such stake — nothing downstream of it ever leaves this process, so a
+/// mistargeted tap is a wrong-looking meter, not a privacy incident. That's
+/// what justifies skipping the `pw-loopback` + `pw-link` indirection
+/// entirely and tapping the candidate node directly with `pipewiresrc
+/// target-object=<serial>` — one pipeline per candidate, no extra process,
+/// nothing else in the graph to build or tear down, and no
+/// [`wait_for_capture_link`]-style verification step needed either.
+///
+/// `Why `autoconnect` is left at its default (`true`), unlike this doc
+/// comment originally assumed:` the obvious-looking hardening —
+/// `autoconnect=false`, so a mistargeted tap reads silence instead of
+/// falling back to whatever the session manager likes best — turns out not
+/// to mean what it sounds like for `pipewiresrc`. Confirmed live (a bare
+/// `gst-launch-1.0 pipewiresrc target-object=<serial> autoconnect=false ...`
+/// against a real running source): the pipeline hangs forever in
+/// `READY -> PAUSED`, because `autoconnect=false` disables `pipewiresrc`
+/// from connecting to *anything* at all, including the `target-object` it
+/// was explicitly given — it isn't "only skip the fallback", it's "never
+/// connect, ever", and nothing in this element's GStreamer properties
+/// offers "use `target-object` but never fall back". So `autoconnect`
+/// stays at its default; a level tap's `target-object` either resolves (the
+/// normal case) or — per [`build_pipeline`]'s doc comment on the same
+/// failure mode — falls back to the session manager's default source. For
+/// a real share that's a privacy bug ([`wait_for_capture_link`] exists
+/// because of it); for a tap that never leaves this process, it is, at
+/// worst, one dropdown entry's meter looking momentarily wrong, so it's
+/// left as a known, harmless edge case rather than solved with a property
+/// that turns out to break the pipeline outright.
+pub struct AudioLevelTapHandle {
+    pipeline: gst::Pipeline,
+    level: AudioLevel,
+    pump_task: tokio::task::JoinHandle<()>,
+}
+
+/// Starts a non-announcing level tap on the PipeWire node whose
+/// `object.serial` is `node_serial` (see [`AudioSource::serial`]). Returns
+/// once the pipeline has been asked to play — deliberately does **not**
+/// wait for it to reach `Playing` or verify what it linked to (see
+/// [`AudioLevelTapHandle`]'s doc comment for why that's fine here): a
+/// dropdown entry's meter just reads 0 until the tap actually starts
+/// producing `level` messages, which is a fine "not making sound yet"
+/// starting state for a UI meter to show.
+pub fn start_level_tap(node_serial: u64) -> Result<AudioLevelTapHandle> {
+    ensure_gstreamer_initialized()?;
+
+    let description = format!(
+        "pipewiresrc target-object={node_serial} do-timestamp=true \
+         ! audio/x-raw \
+         ! audioconvert \
+         ! level name=level post-messages=true interval={LEVEL_INTERVAL_NS} \
+         ! fakesink sync=false"
+    );
+    let element = gst::parse::launch(&description)
+        .with_context(|| format!("failed to construct audio level-tap pipeline: {description}"))?;
+    let pipeline = element
+        .downcast::<gst::Pipeline>()
+        .map_err(|_| anyhow!("gst::parse::launch did not return a top-level Pipeline"))?;
+
+    if let Err(e) = pipeline.set_state(gst::State::Playing).context("failed to start audio level-tap pipeline") {
+        let _ = pipeline.set_state(gst::State::Null);
+        return Err(e);
+    }
+
+    let bus = match pipeline.bus() {
+        Some(b) => b,
+        None => {
+            let _ = pipeline.set_state(gst::State::Null);
+            return Err(anyhow!("audio level-tap pipeline has no bus"));
+        }
+    };
+
+    let level = AudioLevel::default();
+    let pump_task = tokio::spawn(level_tap_pump_loop(bus.stream(), level.clone()));
+
+    Ok(AudioLevelTapHandle { pipeline, level, pump_task })
+}
+
+impl AudioLevelTapHandle {
+    /// Newest tap reading, 0.0-1.0 — same scale/curve as
+    /// [`AudioCaptureHandle::level`] (both go through
+    /// [`level_fraction_from_rms_db`]), so a dropdown-entry meter and the
+    /// always-visible share meter read consistently.
+    pub fn level(&self) -> f32 {
+        self.level.get()
+    }
+
+    /// Tears the tap down: stops the pipeline and aborts the bus-pump task.
+    /// No relay/EOS drain needed (unlike [`AudioCaptureHandle::stop`]) —
+    /// there's no downstream consumer to hand a graceful EOS to, just a
+    /// `fakesink`, so a hard stop is the whole teardown.
+    pub async fn stop(self) {
+        let _ = self.pipeline.set_state(gst::State::Null);
+        self.pump_task.abort();
+    }
+}
+
+impl Drop for AudioLevelTapHandle {
+    /// Backstop mirroring [`AudioCaptureHandle`]'s `Drop`: if a caller drops
+    /// this handle instead of calling `stop()` (e.g. the dropdown closing
+    /// tears down every tap in a batch without awaiting each one), the
+    /// pipeline still stops synchronously so no `pipewiresrc` element is
+    /// left running.
+    fn drop(&mut self) {
+        let _ = self.pipeline.set_state(gst::State::Null);
+    }
+}
+
+/// Bus-only pump for a level tap: no appsink/encode/send side at all, just
+/// folding `level` element messages into `level` (mirrors [`pump_loop`]'s
+/// bus half, minus the `appsink_stream` side pump_loop also has to drive).
+async fn level_tap_pump_loop(mut bus_stream: gst::bus::BusStream, level: AudioLevel) {
+    let mut bus_done = false;
+    while let Some(msg) = bus_stream.next().await {
+        handle_bus_message(&msg, &mut bus_done, &level);
+        if bus_done {
+            return;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // Encode → encrypt → fragment → send pump
 // ---------------------------------------------------------------------
 
@@ -1001,7 +1147,8 @@ mod tests {
                     "props": {
                         "media.class": "Stream/Output/Audio",
                         "node.name": "test-audio-app",
-                        "node.description": "TestApp"
+                        "node.description": "TestApp",
+                        "object.serial": 90210
                     }
                 }
             },
@@ -1089,7 +1236,7 @@ mod tests {
     fn extract_audio_sources_finds_real_app_excludes_own_loopback_and_wrong_class() {
         let objects = fixture_objects();
         let sources = extract_audio_sources(&objects);
-        assert_eq!(sources, vec![AudioSource { id: 262, name: "TestApp".to_string() }]);
+        assert_eq!(sources, vec![AudioSource { id: 262, name: "TestApp".to_string(), serial: Some(90210) }]);
     }
 
     #[test]
@@ -1289,6 +1436,122 @@ mod tests {
         kill_and_wait(&mut loopback_child);
         let _ = app.kill();
         let _ = app.wait();
+    }
+
+    /// Exercises [`start_level_tap`] against two real, simultaneously
+    /// running synthetic audio sources with visibly different volumes,
+    /// confirming: the two taps' readings actually differ (proving the
+    /// meter reflects *which* source is making sound, not just "some
+    /// source somewhere"), and that `stop()` leaves no `pipewiresrc`
+    /// element/pipeline behind — checked via `pgrep` for this test's own
+    /// `gst-launch-1.0` processes staying up (the taps must not touch
+    /// those) alongside confirming the tap pipelines' own state after
+    /// `stop()`. Not runnable unattended/in CI (spawns real system
+    /// processes + needs a live PipeWire session), hence `#[ignore]`. Run
+    /// manually with: `cargo test audio::tests::level_tap_reflects_the_right_source_and_tears_down_cleanly -- --ignored --nocapture`
+    ///
+    /// `Why the client-name carries a random suffix:` confirmed live,
+    /// WirePlumber's stream-restore keeps a per-`node.name`/
+    /// `application.name` volume that silently attenuates a *fixed*
+    /// client-name's signal further and further across repeated test runs
+    /// during this feature's development — a real environment gotcha, not
+    /// a bug in [`start_level_tap`]. A random suffix sidesteps it by never
+    /// reusing a name WirePlumber has state for.
+    ///
+    /// `Why `stream-properties=props,node.autoconnect=(boolean)false` on
+    /// both source apps, and why the volumes are capped at 5%/2%:` a plain
+    /// `pipewiresink` (no `stream-properties` override) is real, live,
+    /// audibly-routed audio — WirePlumber's default policy auto-links any
+    /// new `Stream/Output/Audio` node to the real default sink (speakers),
+    /// same as any other application. Earlier revisions of this test (and
+    /// of the ad hoc verification scripts around this feature) missed that
+    /// and were genuinely audible on the dev machine — confirmed the hard
+    /// way, corrected here. `node.autoconnect=false` stops WirePlumber's
+    /// policy from linking this node to the real sink at all (it only
+    /// controls the *policy* auto-link, not whether our own
+    /// `pipewiresrc target-object=` can still explicitly target it — that
+    /// keeps working, confirmed live), and the 5%/2% volumes are a second,
+    /// independent safety margin in case autoconnect is ever re-enabled by
+    /// a future edit.
+    #[tokio::test]
+    #[ignore]
+    async fn level_tap_reflects_the_right_source_and_tears_down_cleanly() {
+        let run_id = uuid::Uuid::new_v4().simple().to_string();
+        let loud_name = format!("ssshare-leveltap-loud-{run_id}");
+        let quiet_name = format!("ssshare-leveltap-quiet-{run_id}");
+        let mut loud = Command::new("gst-launch-1.0")
+            .args([
+                "audiotestsrc",
+                "volume=0.05",
+                "!",
+                "audioconvert",
+                "!",
+                "pipewiresink",
+                &format!("client-name={loud_name}"),
+                "stream-properties=props,node.autoconnect=(boolean)false",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn loud synthetic app");
+        let mut quiet = Command::new("gst-launch-1.0")
+            .args([
+                "audiotestsrc",
+                "volume=0.02",
+                "!",
+                "audioconvert",
+                "!",
+                "pipewiresink",
+                &format!("client-name={quiet_name}"),
+                "stream-properties=props,node.autoconnect=(boolean)false",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to spawn quiet synthetic app");
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let sources = list_audio_sources().expect("list_audio_sources should succeed against a live pw-dump");
+        let loud_source = sources.iter().find(|s| s.name.contains(&loud_name)).cloned().expect("loud source not listed");
+        let quiet_source = sources.iter().find(|s| s.name.contains(&quiet_name)).cloned().expect("quiet source not listed");
+        let loud_serial = loud_source.serial.expect("loud source should have an object.serial");
+        let quiet_serial = quiet_source.serial.expect("quiet source should have an object.serial");
+
+        let loud_tap = start_level_tap(loud_serial).expect("failed to start loud tap");
+        let quiet_tap = start_level_tap(quiet_serial).expect("failed to start quiet tap");
+
+        // Give both pipelines time to negotiate and start posting `level`
+        // messages (LEVEL_INTERVAL_NS = 100ms; a few seconds is comfortably
+        // enough even on a loaded CI-like box).
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        let loud_level = loud_tap.level();
+        let quiet_level = quiet_tap.level();
+        eprintln!("[level-tap-test] loud_level={loud_level} quiet_level={quiet_level}");
+        assert!(loud_level > 0.05, "loud source's tap should read a clearly non-zero level, got {loud_level}");
+        assert!(loud_level > quiet_level, "loud source's tap ({loud_level}) should read louder than the quiet one ({quiet_level})");
+
+        loud_tap.stop().await;
+        quiet_tap.stop().await;
+
+        // Teardown check: neither this test's own synthetic apps (which the
+        // taps must never touch — non-destructive by design, see
+        // `AudioLevelTapHandle`'s doc comment) nor any tap pipeline element
+        // should still show up in the PipeWire graph.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let objects_after = run_pw_dump().expect("pw-dump should still succeed after teardown");
+        let still_has_loud_app = objects_after.iter().any(|o| {
+            o.info.as_ref().and_then(|i| i.props.as_ref()).and_then(|p| prop_str(p, "node.name")).map(|n| n == loud_name).unwrap_or(false)
+        });
+        assert!(still_has_loud_app, "the synthetic source app itself should still be running/listed — taps must be non-destructive");
+
+        let _ = loud.kill();
+        let _ = loud.wait();
+        let _ = quiet.kill();
+        let _ = quiet.wait();
     }
 
     /// Regression test for the "Stop Sharing Audio" hang: starts a real

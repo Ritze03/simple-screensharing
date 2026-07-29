@@ -649,15 +649,45 @@
    * @param {object} [opts] - { className: string (applied to the trigger
    *   button, so existing sizing classes like `.dest-room-select` keep
    *   their `max-width`/padding/etc.), placeholder: string, emptyText:
-   *   string (shown, disabled-looking, when `options` is empty) }
+   *   string (shown, disabled-looking, when `options` is empty), withMeter:
+   *   boolean (render a small live-level meter next to every option's
+   *   label — see [`AUDIO SOURCE PICKER LEVEL METERS`] below; painted via
+   *   `.setOptionLevel(value, fraction)`, not by this function itself),
+   *   onOpen: () => void, onClose: () => void (fired when the option list
+   *   opens/closes — this is what lets a caller scope work, like the
+   *   per-option level taps below, to exactly "the dropdown is on screen")
+   *   }
    * @returns {HTMLElement} a `<div class="dd">` wrapper. Beyond being a
    *   normal appendable/removable DOM node, it also exposes: a `.value`
    *   getter/setter (get/set the selection without going through the UI,
    *   like `select.value`), `.setOptions(newOptions)` (rebuild the option
-   *   list in place, e.g. for an async-refreshed source list), and
+   *   list in place, e.g. for an async-refreshed source list),
+   *   `.setOptionLevel(value, fraction)` (paint one option's meter in place,
+   *   no rebuild — only meaningful when `opts.withMeter` is set), and
    *   `.focus()` (delegates to the trigger button). The native `.hidden`
    *   property/attribute works as-is since it's a plain element.
    */
+  /** How many bars an `opts.withMeter` dropdown option's mini level meter
+   * draws. Fewer than `AUDIO_METER_BARS` (the attached-share meter, defined
+   * below) — an option row is a lot narrower than a destination card. */
+  const DD_OPTION_METER_BARS = 3;
+
+  /** Same lit/height curve as `stream-control.js`'s `paintAudioMeter` (see
+   * that function's doc comment for the "why" — this is the smaller,
+   * dropdown-option-row sibling of the same meter, kept in `components.js`
+   * rather than shared across the two files' separate IIFEs). */
+  function paintDdOptionMeter(meter, level) {
+    const clamped = Math.max(0, Math.min(1, Number(level) || 0));
+    const bars = meter.querySelectorAll(".dd-option-meter-bar");
+    bars.forEach((bar, i) => {
+      const threshold = i / bars.length;
+      const lit = clamped > threshold;
+      bar.classList.toggle("dd-option-meter-bar-lit", lit);
+      const fill = Math.max(0, Math.min(1, (clamped - threshold) * bars.length));
+      bar.style.height = Math.round(20 + fill * 80) + "%";
+    });
+  }
+
   function dropdown(options, value, onChange, opts) {
     opts = opts || {};
     const root = el("div", { className: "dd" });
@@ -704,6 +734,12 @@
           className: "dd-option" + (isSelected ? " dd-option-selected" : ""),
           attrs: { type: "button", role: "option", "aria-selected": String(isSelected) },
         });
+        item.dataset.optionValue = String(o.value);
+        if (opts.withMeter) {
+          const meter = el("div", { className: "dd-option-meter", attrs: { "aria-hidden": "true" } });
+          for (let i = 0; i < DD_OPTION_METER_BARS; i++) meter.appendChild(el("span", { className: "dd-option-meter-bar" }));
+          item.appendChild(meter);
+        }
         item.appendChild(el("span", { className: "dd-option-label", text: o.label }));
         if (isSelected) item.appendChild(icon("check", "dd-option-check"));
         item.addEventListener("click", () => {
@@ -782,6 +818,7 @@
       document.addEventListener("keydown", onKeyDown, true);
       window.addEventListener("scroll", onReposition, true);
       window.addEventListener("resize", onReposition);
+      opts.onOpen && opts.onOpen();
     }
 
     function closeList() {
@@ -794,6 +831,7 @@
       window.removeEventListener("scroll", onReposition, true);
       window.removeEventListener("resize", onReposition);
       if (list.parentNode) list.parentNode.removeChild(list);
+      opts.onClose && opts.onClose();
     }
 
     trigger.addEventListener("click", () => (open ? closeList() : openList()));
@@ -812,6 +850,17 @@
       currentOptions = newOptions || [];
       renderLabel();
       renderOptions();
+    };
+    // Paints one option's meter in place — no rebuild, so a ~100ms level
+    // poll (see `audioSourcePickerCore`) never touches the rest of the
+    // (possibly currently-open, currently-scrolled) list. Looked up by
+    // `data-option-value` rather than array index since `currentOptions`
+    // can be re-sorted/rebuilt out from under a stale index.
+    root.setOptionLevel = function (value, fraction) {
+      const item = list.querySelector(`.dd-option[data-option-value="${CSS.escape(String(value))}"]`);
+      if (!item) return;
+      const meter = item.querySelector(".dd-option-meter");
+      if (meter) paintDdOptionMeter(meter, fraction);
     };
     root.focus = function () {
       trigger.focus();
@@ -1527,14 +1576,102 @@
    * this file's out-of-band tickers (no uniform unmount hook exists here to
    * call a `.destroy()` from instead).
    *
-   * @param {object} handlers - { onRefreshAudioSources() }
+   * # Per-option level meters
+   *
+   * Every option also carries a live level meter (`dropdown`'s
+   * `opts.withMeter`), so the user can tell *which* running application is
+   * actually making sound before picking it, rather than guessing from the
+   * name alone — the whole point of this follow-up (2026-07-29). This is
+   * backed by non-announcing per-candidate "level taps"
+   * (`audio::AudioLevelTapHandle` on the Rust side — a real GStreamer
+   * `pipewiresrc ! level ! fakesink` per candidate, but never linked into a
+   * loopback, never encoded, never announced to the room: see that type's
+   * doc comment for why a real share's pipeline can't just be reused here).
+   *
+   * `Why scoped to "the dropdown is open", not the picker's whole mount
+   * lifetime (unlike the 5s source re-poll above, which already runs for
+   * the attached row's entire lifetime):` a real tap is a real GStreamer
+   * pipeline process-internally, one per currently-listed candidate — fine
+   * for the ~1-10s a dropdown is actually open and looked at, not something
+   * that should run continuously behind an always-visible "Switch" row that
+   * usually just sits there closed. `dropdown`'s `onOpen`/`onClose` hooks
+   * are exactly the mount-scoped signal needed: start a tap per currently
+   * listed source the instant the list opens, stop every one of them the
+   * instant it closes (or the picker itself unmounts mid-open — `isActive`
+   * covers that the same way it already covers the source-list poll).
+   *
+   * @param {object} handlers - { onRefreshAudioSources(),
+   *   onStartAudioLevelTap(sourceId) -> Promise<number|null> (tap id, or
+   *   null if the tap couldn't be started), onPollAudioLevelTap(tapId) ->
+   *   Promise<number|null> (0.0-1.0, or null), onStopAudioLevelTap(tapId) }
    * @param {object} opts - { audioSources: [{id,name}] }
    */
   function audioSourcePickerCore(handlers, opts) {
     let sources = opts.audioSources || [];
     const optionsFor = () =>
       sources.length === 0 ? [{ value: "", label: "No application is playing audio" }] : sources.map((s) => ({ value: s.id, label: s.name }));
-    const select = dropdown(optionsFor(), sources.length ? sources[0].id : "", null, { className: "dest-room-select dest-audio-select" });
+
+    // sourceId -> tapId, only populated while the list is open. A `Map`
+    // (not just an array) so `stopAllTaps` can fire every stop in one pass
+    // and `pollTaps` can look levels up by the same key `setOptionLevel`
+    // paints with (the option's `value`, i.e. the source id).
+    const activeTaps = new Map();
+    let tapPollId = null;
+
+    function stopAllTaps() {
+      if (tapPollId !== null) {
+        clearInterval(tapPollId);
+        tapPollId = null;
+      }
+      for (const tapId of activeTaps.values()) {
+        handlers.onStopAudioLevelTap && handlers.onStopAudioLevelTap(tapId);
+      }
+      activeTaps.clear();
+    }
+
+    async function startTapsForCurrentSources() {
+      if (!handlers.onStartAudioLevelTap) return;
+      const wanted = new Set(sources.map((s) => String(s.id)));
+      // Drop taps for sources that are no longer listed (the 5s source
+      // re-poll can run while the dropdown is open and drop/add entries).
+      for (const [sourceId, tapId] of Array.from(activeTaps.entries())) {
+        if (!wanted.has(sourceId)) {
+          handlers.onStopAudioLevelTap && handlers.onStopAudioLevelTap(tapId);
+          activeTaps.delete(sourceId);
+        }
+      }
+      // Start taps for anything newly listed that doesn't have one yet.
+      await Promise.all(
+        sources
+          .filter((s) => !activeTaps.has(String(s.id)))
+          .map(async (s) => {
+            const tapId = await handlers.onStartAudioLevelTap(s.id);
+            if (tapId !== null && tapId !== undefined) activeTaps.set(String(s.id), tapId);
+          })
+      );
+    }
+
+    function startTapPolling() {
+      if (tapPollId !== null || !handlers.onPollAudioLevelTap) return;
+      tapPollId = setInterval(async () => {
+        for (const [sourceId, tapId] of Array.from(activeTaps.entries())) {
+          const level = await handlers.onPollAudioLevelTap(tapId);
+          select.setOptionLevel(sourceId, level || 0);
+        }
+        // `LEVEL_INTERVAL_NS` on the Rust side (`audio.rs`) is 100ms — match
+        // that cadence here so the meter reads as live rather than lagging
+        // the backend's own update rate.
+      }, 100);
+    }
+
+    const select = dropdown(optionsFor(), sources.length ? sources[0].id : "", null, {
+      className: "dest-room-select dest-audio-select",
+      withMeter: true,
+      onOpen: () => {
+        startTapsForCurrentSources().then(startTapPolling);
+      },
+      onClose: stopAllTaps,
+    });
     const rebuildOptions = () => select.setOptions(optionsFor());
 
     let pollId = null;
@@ -1563,6 +1700,12 @@
           const previousValue = select.value;
           rebuildOptions();
           if (sources.some((s) => String(s.id) === previousValue)) select.value = previousValue;
+          // Reconcile the live taps against the fresh list too, but only if
+          // the list is actually open right now — `startTapsForCurrentSources`
+          // is a no-op-safe call otherwise (nothing polls an empty
+          // `activeTaps`), but there's no reason to spin up taps for a
+          // closed dropdown nobody's looking at.
+          if (tapPollId !== null) startTapsForCurrentSources();
         }
       }, AUDIO_SOURCE_POLL_MS);
     }
@@ -1576,6 +1719,12 @@
       rebuildOptions,
       startPolling,
       stopPolling,
+      // Exposed so a caller that unmounts the picker outright (rather than
+      // just closing the dropdown — e.g. the whole card being rebuilt while
+      // the list happened to be open) can still guarantee no tap outlives
+      // it. `dropdown`'s own `onClose` already covers the ordinary
+      // click-away/Escape/select-an-option paths.
+      stopAllTaps,
     };
   }
 
