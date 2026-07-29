@@ -2645,7 +2645,7 @@ async fn start_audio_share_rejects_a_merely_staged_video_capture() {
         },
     );
 
-    state.selected_audio_source = Some(crate::audio::AudioSource { id: 0, name: "Test app".to_string() });
+    state.selected_audio_source = Some(crate::audio::AudioSource { id: 0, name: "Test app".to_string(), serial: None });
     // `room_handle` never gets looked up: the gate must reject before that,
     // so an id naming no real room at all is deliberate here, not sloppy —
     // if this ever *didn't* error, the next line inside `start_audio_share`
@@ -2744,7 +2744,7 @@ async fn start_audio_share_succeeds_once_the_video_capture_is_live() {
     }
     assert_eq!(state.captures[&video_capture_id].destinations.len(), 1, "test setup: video capture must be live");
 
-    state.selected_audio_source = Some(crate::audio::AudioSource { id: 0, name: "Test app".to_string() });
+    state.selected_audio_source = Some(crate::audio::AudioSource { id: 0, name: "Test app".to_string(), serial: None });
     let result = state.start_audio_share(room_handle, video_capture_id);
     assert!(result.is_ok(), "start_audio_share must succeed against a live for_capture, got {result:?}");
 

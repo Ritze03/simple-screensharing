@@ -148,6 +148,10 @@
 }
 
 .dd-option-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -155,6 +159,40 @@
   font-size: 14px;
   color: var(--accent);
   flex: 0 0 auto;
+}
+
+/* Per-option level meter (2026-07-29 audio-source-dropdown follow-up): a
+   smaller sibling of `.dest-audio-meter`/`.dest-audio-meter-bar`
+   (stream-control.css) — same bottom-aligned/grow-upward VU shape and the
+   same lit/height curve (`paintDdOptionMeter` in components.js mirrors
+   `paintAudioMeter`), just narrower to fit an option row rather than a
+   destination card. Fixed width so the label column doesn't shift as bars
+   light up, same reasoning as the attached-share meter. Placed before the
+   label (`components.js`'s `renderOptions`) so it reads left-to-right as
+   "how loud, then what app" — the whole point of this feature. */
+.dd-option-meter {
+  display: flex;
+  align-items: flex-end;
+  gap: 1.5px;
+  width: 18px;
+  height: 12px;
+  flex: 0 0 auto;
+}
+
+.dd-option-meter-bar {
+  flex: 1 1 auto;
+  height: 20%;
+  min-height: 2px;
+  border-radius: 1px;
+  background: var(--text-faint);
+  opacity: 0.45;
+  transition: height 90ms linear, opacity 90ms linear, background-color 90ms linear;
+}
+
+.dd-option-meter-bar.dd-option-meter-bar-lit {
+  background: var(--success);
+  opacity: 1;
+  box-shadow: 0 0 1px rgba(80, 200, 120, 0.8);
 }
 
 .dd-option-empty {

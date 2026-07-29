@@ -439,7 +439,50 @@ pub async fn list_audio_sources() -> Result<Vec<AudioSourceDto>, String> {
 #[tauri::command]
 pub fn select_audio_source(managed: State<'_, Managed>, id: u32, name: String) {
     managed.state.lock().unwrap().selected_audio_source =
-        Some(simple_screensharing_client::audio::AudioSource { id, name });
+        Some(simple_screensharing_client::audio::AudioSource { id, name, serial: None });
+}
+
+/// Starts a non-announcing per-candidate level tap for the "Add
+/// audio"/"Switch" dropdown's meters — see `session::AppState::
+/// start_audio_level_tap` and `audio::AudioLevelTapHandle`'s doc comments
+/// for why this is a separate, much lighter thing than `start_audio_share`.
+/// Re-lists sources here (rather than trusting `source_id` against whatever
+/// the frontend already had) so the tap is built against `object.serial`
+/// for the node as it exists right now — same freshness reasoning as
+/// `list_audio_sources` itself. Returns the tap id the frontend polls/stops
+/// with; `Err` (e.g. the source vanished, or has no `object.serial` yet)
+/// just means that one dropdown entry's meter stays unlit.
+#[tauri::command]
+pub async fn start_audio_level_tap(managed: State<'_, Managed>, source_id: u32) -> Result<u32, String> {
+    let source = tokio::task::spawn_blocking(simple_screensharing_client::audio::list_audio_sources)
+        .await
+        .map_err(|e| format!("audio source listing task panicked: {e}"))?
+        .map_err(|e| format!("{e:#}"))?
+        .into_iter()
+        .find(|s| s.id == source_id)
+        .ok_or_else(|| "audio source is no longer listed".to_string())?;
+    managed.state.lock().unwrap().start_audio_level_tap(&source)
+}
+
+/// Polls a live level tap's newest reading (0.0-1.0), or `None` once it's
+/// been stopped/never existed — the dropdown's ~100ms poll loop, matching
+/// the backend's own `LEVEL_INTERVAL_NS` cadence (see `audio.rs`).
+#[tauri::command]
+pub fn poll_audio_level_tap(managed: State<'_, Managed>, tap_id: u32) -> Option<f32> {
+    managed.state.lock().unwrap().audio_level_tap_level(tap_id)
+}
+
+// See `join_room`'s `Why:` note above — `stop_audio_level_tap` spawns
+// (`AudioLevelTapHandle::stop` is handed off to a `tokio::spawn`ed task the
+// same way `stop_share` hands off `AudioCaptureHandle::stop`), so this needs
+// the same `block_on` wrapper to have a runtime to spawn onto. Missing this
+// wrapper panicked the whole request thread the first time this was wired
+// up through `api_server.rs`'s plain-thread HTTP dispatch (confirmed live:
+// "socket hang up" on the Electron side, `tokio::spawn` called with no
+// runtime entered on the Rust side) — fixed here rather than reintroduced.
+#[tauri::command]
+pub fn stop_audio_level_tap(managed: State<'_, Managed>, tap_id: u32) {
+    tauri::async_runtime::block_on(async { managed.state.lock().unwrap().stop_audio_level_tap(tap_id) });
 }
 
 #[tauri::command]

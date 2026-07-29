@@ -243,6 +243,67 @@
     return Promise.race([promise, new Promise((_, reject) => setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms))]);
   }
 
+  // -----------------------------------------------------------------------
+  // Audio-source dropdown level taps — non-announcing per-candidate meters
+  // (2026-07-29 follow-up to the always-visible audio-source dropdown, see
+  // `components.js`'s `audioSourcePickerCore` doc comment for the full
+  // design). Real branch calls the three Tauri commands `audio.rs`/
+  // `commands.rs` added for this; mock branch fakes a plausible-looking
+  // wobble per source id so the dropdown is exercisable without a live
+  // PipeWire session — same real/mock split as every other call in this
+  // file.
+  // -----------------------------------------------------------------------
+
+  /** Mock-only: tapId -> sourceId, so `pollAudioLevelTapMock` knows which
+   * source's fake wobble to compute. A real tap id comes back from the
+   * Rust side instead (see `AppState::start_audio_level_tap`). */
+  const mockLevelTaps = new Map();
+  let mockLevelTapSeq = 1;
+
+  async function startAudioLevelTap(sourceId) {
+    if (window.__TAURI__) {
+      try {
+        return await withTimeout(window.__TAURI__.core.invoke("start_audio_level_tap", { sourceId }), 3000);
+      } catch (e) {
+        console.error("start_audio_level_tap failed", e);
+        return null;
+      }
+    }
+    const tapId = mockLevelTapSeq++;
+    mockLevelTaps.set(tapId, sourceId);
+    return tapId;
+  }
+
+  async function pollAudioLevelTap(tapId) {
+    if (tapId === null || tapId === undefined) return null;
+    if (window.__TAURI__) {
+      try {
+        return await window.__TAURI__.core.invoke("poll_audio_level_tap", { tapId });
+      } catch (e) {
+        return null;
+      }
+    }
+    const sourceId = mockLevelTaps.get(tapId);
+    if (sourceId === undefined) return null;
+    // A source-id-seeded sine wobble: distinct sources visibly read
+    // differently (one mostly quiet, one clearly "talking") instead of
+    // every mock meter moving in lockstep, which is what actually exercises
+    // "can you tell them apart" in a browser/mock dev loop.
+    const seed = (Number(sourceId) || 0) % 7;
+    const t = Date.now() / 1000;
+    const wobble = 0.5 + 0.5 * Math.sin(t * 1.7 + seed);
+    return Math.max(0, Math.min(1, wobble * (0.25 + 0.15 * seed)));
+  }
+
+  function stopAudioLevelTap(tapId) {
+    if (tapId === null || tapId === undefined) return;
+    if (window.__TAURI__) {
+      window.__TAURI__.core.invoke("stop_audio_level_tap", { tapId }).catch((e) => console.error("stop_audio_level_tap failed", e));
+      return;
+    }
+    mockLevelTaps.delete(tapId);
+  }
+
   // Every setter below updates the local `bandwidth` object on *both*
   // branches, not just the mock one. `updateBandwidthCard()`'s reconciliation
   // skips rebuilding the card when `JSON.stringify({ bandwidth, ... })`
@@ -1068,6 +1129,9 @@
               // actually renders here today — wired anyway for symmetry.
               onSwitchAudio: (d, audio, source) => switchAudioShare(edit.roomHandle, d.capture_id, audio, source),
               onRefreshAudioSources: () => refreshAudioSources(),
+              onStartAudioLevelTap: (sourceId) => startAudioLevelTap(sourceId),
+              onPollAudioLevelTap: (tapId) => pollAudioLevelTap(tapId),
+              onStopAudioLevelTap: (tapId) => stopAudioLevelTap(tapId),
             },
             {
               staged: true,
@@ -1169,6 +1233,9 @@
               onAudioStop: (audioDestinationId) => stopDestination(audioDestinationId),
               onSwitchAudio: (d, audio, source) => switchAudioShare(d.room_handle, d.capture_id, audio, source),
               onRefreshAudioSources: () => refreshAudioSources(),
+              onStartAudioLevelTap: (sourceId) => startAudioLevelTap(sourceId),
+              onPollAudioLevelTap: (tapId) => pollAudioLevelTap(tapId),
+              onStopAudioLevelTap: (tapId) => stopAudioLevelTap(tapId),
             },
             {
               roomOptions: mockJoinedRooms,
