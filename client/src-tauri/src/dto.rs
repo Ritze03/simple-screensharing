@@ -375,6 +375,22 @@ pub struct WatchedStatsDto {
     pub received_bitrate_kbps: f64,
 }
 
+/// A tile's current volume/mute state, as `commands::get_volume` reports it
+/// back to whichever window (View tab or a pop-out) asks — the backend
+/// (`RoomSession::audio_watches` / `audio_volume_by_owner`) is the single
+/// source of truth both windows read from, rather than each window's own
+/// JS `tileVolume`/`tileMuted` state (which is per-renderer-process and
+/// can't see the other window's changes — see this DTO's 2026-07-29 doc
+/// entry in `superdoc/features/video-pipeline.md` for the bug this fixes).
+#[derive(Serialize, Clone)]
+pub struct VolumeStateDto {
+    /// 0-200, the slider's *desired* value — unlike the value historically
+    /// pushed to the decoder, this is never zeroed just because `muted` is
+    /// true, so unmuting can restore it.
+    pub volume_percent: u32,
+    pub muted: bool,
+}
+
 pub fn pending_label(role: session::PendingRole) -> &'static str {
     match role {
         session::PendingRole::FanOut => "fan_out",

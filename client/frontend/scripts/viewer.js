@@ -112,23 +112,33 @@
   // shared module because there's only ever one tile here and no re-render
   // cadence to survive across (unlike `view.js`, this window never tears
   // down and rebuilds its tile on a timer).
+  //
+  // 2026-07-29: seeded from the backend's real state (`commands::
+  // get_volume`) inside `resolveTiles` below, before this window ever
+  // renders its tile — this is the pop-out-open half of the cross-window
+  // volume sync fix; see `view.js`'s matching `tileVolume` doc comment for
+  // the full picture (this window resuming from the View tab's tile) and
+  // `ensureVolumeSeeded` there for the other direction (the View tab's tile
+  // resuming from this window's changes once it closes).
   const tileVolume = new Map();
   const tileMuted = new Set();
   const DEFAULT_VOLUME = 100;
 
-  /** Push this tile's effective volume (0 while muted) to the backend.
-   * `tile.roomHandle` is a real `u32` starting at 0 (see `view.js`'s
-   * `pushVolume` doc comment for why a plain truthiness check would wrongly
-   * drop every call for room_handle 0) — `!= null` is the right guard. */
+  /** Push this tile's volume/mute state to the backend. Sends the *desired*
+   * slider value even while muted — see `view.js`'s `pushVolume` doc
+   * comment on why `muted` is now its own explicit flag rather than folded
+   * into a zeroed volume. */
   async function pushVolume(tile) {
     if (!window.__TAURI__ || tile.roomHandle == null) return;
-    const percent = tileMuted.has(tile.id) ? 0 : (tileVolume.get(tile.id) ?? DEFAULT_VOLUME);
+    const muted = tileMuted.has(tile.id);
+    const percent = tileVolume.get(tile.id) ?? DEFAULT_VOLUME;
     try {
       await window.__TAURI__.core.invoke("set_volume", {
         roomHandle: tile.roomHandle,
         owner: tile.owner,
         streamId: tile.streamId,
         volumePercent: percent,
+        muted,
       });
     } catch (e) {
       console.error("[viewer] set_volume failed", e);
@@ -184,6 +194,29 @@
       if (!videoUrl) {
         console.error(`[viewer] no video URL resolved for ${rawKey}, skipping tile`);
         continue;
+      }
+      // Seed this tile's volume/mute state from the backend's real value
+      // (`commands::get_volume`) before `renderTile` ever builds its audio
+      // pill — this is what shows e.g. 40% here instead of `DEFAULT_VOLUME`
+      // when a tile already adjusted in the View tab gets popped out. Runs
+      // before `renderGrid` (see `init()` below, which awaits this whole
+      // function first), so there's no render-then-patch needed the way
+      // `view.js`'s `ensureVolumeSeeded` needs one (that window's tiles can
+      // already be on screen by the time a fetch resolves).
+      if (tileMeta.hasAudio) {
+        try {
+          const state = await window.__TAURI__.core.invoke("get_volume", {
+            roomHandle: parsed.roomHandle,
+            owner: parsed.owner,
+            streamId: parsed.streamId,
+          });
+          if (state) {
+            tileVolume.set(parsed.id, state.volume_percent);
+            if (state.muted) tileMuted.add(parsed.id);
+          }
+        } catch (e) {
+          console.error(`[viewer] get_volume failed for ${rawKey}:`, e);
+        }
       }
       tiles.push({
         id: parsed.id,

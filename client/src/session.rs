@@ -580,9 +580,20 @@ pub struct WatchEntry {
 /// `RoomSession::audio_watches`.
 pub struct AudioWatch {
     pub decoder: AudioDecoder,
-    /// 0-200, the value bound to this stream's volume slider. Applied to
-    /// `decoder` (as `volume_percent / 100.0`) whenever the slider changes.
+    /// 0-200, the *desired* value bound to this stream's volume slider —
+    /// kept as-is even while `muted` is true, so unmuting restores it
+    /// rather than resuming from 0. The value actually applied to
+    /// `decoder` is `if muted { 0.0 } else { volume_percent / 100.0 }` (see
+    /// `commands::set_volume`).
     pub volume_percent: u32,
+    /// Mirrors the frontend's own per-tile mute toggle. Kept as its own
+    /// bool (2026-07-29) rather than folded into `volume_percent` (which
+    /// used to just get zeroed by the frontend before it was sent) so a
+    /// backend query (`commands::get_volume`) can tell a viewer's "muted at
+    /// 40%" apart from "explicitly dragged to 0%" — both windows (View tab
+    /// and any pop-out) need that distinction to restore the right slider
+    /// state. See `superdoc/features/video-pipeline.md`'s 2026-07-29 entry.
+    pub muted: bool,
     /// `true` when this watch exists only because we're watching the same
     /// sender's *video* (`sync_audio_watches` owns it, and will tear it down
     /// again the moment that video watch or that audio stream goes away).
@@ -809,11 +820,24 @@ impl RoomSession {
                 // under a fresh `stream_id` — see `audio_volume_by_owner`'s
                 // doc comment) — default to 100 only if this owner has no
                 // recorded preference yet.
+                //
+                // `muted` always starts `false` here: `audio_volume_by_owner`
+                // only remembers the numeric slider value, not mute — a
+                // known, narrow gap (a viewer who muted a sender, then has
+                // that sender restart/switch their audio source before
+                // unmuting, hears audio resume rather than staying silent).
+                // Not the bug this field was added to fix (that's the
+                // cross-window View-tab/pop-out sync — see `muted`'s doc
+                // comment on `AudioWatch`), and out of scope to close here;
+                // closing it would mean widening `audio_volume_by_owner` to
+                // remember mute too, which touches `ui.rs`'s egui slider and
+                // `end_to_end_test.rs`'s existing regression test for this
+                // map's original purpose.
                 let volume_percent = self.audio_volume_by_owner.get(&owner).copied().unwrap_or(100);
                 if volume_percent != 100 {
                     decoder.set_volume(volume_percent as f64 / 100.0);
                 }
-                self.audio_watches.lock().unwrap().insert(key, AudioWatch { decoder, volume_percent, auto });
+                self.audio_watches.lock().unwrap().insert(key, AudioWatch { decoder, volume_percent, muted: false, auto });
                 self.watch_error = None;
 
                 let client = self.client.clone();

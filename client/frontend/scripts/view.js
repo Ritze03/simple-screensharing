@@ -283,16 +283,43 @@
   })();
 
   // Per-tile playback volume (0-200, matching `commands::set_volume`'s range)
-  // and mute state, keyed by tile id. Client-side only: `RoomDetail` carries
-  // no `volume_percent`, and re-`render()`s happen ~4x/sec off
+  // and mute state, keyed by tile id. Re-`render()`s happen ~4x/sec off
   // `stream-stats-updated`, so a slider that re-read its value from the DOM
-  // would snap back to the default constantly. Survives re-renders; pruned
-  // for any tile id no longer in the watched set (see below).
+  // would snap back to the default constantly, hence keeping it here instead
+  // and surviving re-renders; pruned for any tile id no longer in the
+  // watched set (see below).
+  //
+  // 2026-07-29: this used to be this window's *only* copy, with no way for
+  // the View tab and a pop-out `viewer.js` window (two separate renderer
+  // processes, hence two separate JS heaps) to see each other's changes —
+  // the reported "volume setting isn't visually shared between the in
+  // window and the popped out view" bug. Fixed by treating the backend
+  // (`RoomSession::audio_watches`, via the new `commands::get_volume` query)
+  // as the single source of truth: `ensureVolumeSeeded` below fetches it the
+  // first time this window renders a given tile id, so both directions
+  // (pop-out opens showing a tile already adjusted here; this tab's tile
+  // returning from a held slot after showing a value adjusted in the
+  // pop-out) pick up the real value instead of `DEFAULT_VOLUME`. These Maps
+  // remain the fast local cache `pushVolume`'s reads and the slider's
+  // initial DOM value use — only the *first* sighting of a tile id per
+  // window needs the round trip.
   const tileVolume = new Map();
   const tileMuted = new Set();
   const DEFAULT_VOLUME = 100;
 
-  /** Push a tile's effective volume (0 while muted) to the backend.
+  // Tile ids this window has already seeded from `get_volume` — read this
+  // once per tile id, not on every render (`render()` fires ~4x/sec), or a
+  // user actively dragging the slider would keep getting overwritten by a
+  // racing fetch of the pre-drag value. Pruned alongside `tileVolume`/
+  // `tileMuted` below so a stream watched again later (a recycled tile id)
+  // gets re-seeded rather than trusting a stale local guess.
+  const seededVolumeIds = new Set();
+
+  /** Push a tile's volume/mute state to the backend. Sends the *desired*
+   * slider value even while muted (the backend now keeps `muted` as its own
+   * flag — see `AudioWatch::muted`'s doc comment — precisely so unmuting,
+   * from either window, restores the pre-mute value instead of resuming
+   * from a flattened 0).
    *
    * Note the `streamId` passed is the tile's *video* stream id — this tab
    * never learns the sender's audio stream id and deliberately shouldn't:
@@ -311,16 +338,45 @@
     // room_handle 0. `fetchWatchedStreams` below already gets this right
     // (`r.room_handle != null`) — this is the one place that didn't.
     if (!window.__TAURI__ || tile.room_handle == null) return;
-    const percent = tileMuted.has(tile.id) ? 0 : (tileVolume.get(tile.id) ?? DEFAULT_VOLUME);
+    const muted = tileMuted.has(tile.id);
+    const percent = tileVolume.get(tile.id) ?? DEFAULT_VOLUME;
     try {
       await window.__TAURI__.core.invoke("set_volume", {
         roomHandle: tile.room_handle,
         owner: tile.owner,
         streamId: tile.stream_id,
         volumePercent: percent,
+        muted,
       });
     } catch (e) {
       console.error("set_volume failed", e);
+    }
+  }
+
+  /** Seed `tileVolume`/`tileMuted` for a tile this window hasn't rendered
+   * before, from the backend's real current state (`commands::get_volume`)
+   * rather than leaving it at `DEFAULT_VOLUME`/unmuted — see `tileVolume`'s
+   * doc comment above for why this is the fix for the cross-window sync
+   * bug. Fire-and-forget: `renderTile` calls this once per unseen tile id
+   * and doesn't await it, then re-`render()`s when it resolves so the
+   * slider updates in place rather than blocking the tile's first paint on
+   * a round trip. */
+  async function ensureVolumeSeeded(tile) {
+    if (!window.__TAURI__ || tile.room_handle == null || !tile.id || seededVolumeIds.has(tile.id)) return;
+    seededVolumeIds.add(tile.id);
+    try {
+      const state = await window.__TAURI__.core.invoke("get_volume", {
+        roomHandle: tile.room_handle,
+        owner: tile.owner,
+        streamId: tile.stream_id,
+      });
+      if (!state) return;
+      tileVolume.set(tile.id, state.volume_percent);
+      if (state.muted) tileMuted.add(tile.id);
+      else tileMuted.delete(tile.id);
+      render();
+    } catch (e) {
+      console.error("get_volume failed", e);
     }
   }
 
@@ -571,6 +627,9 @@
     }
     for (const id of tileVolume.keys()) {
       if (!liveIds.has(id)) tileVolume.delete(id);
+    }
+    for (const id of seededVolumeIds) {
+      if (!liveIds.has(id)) seededVolumeIds.delete(id);
     }
     // Same prune for `tileStalledSince` — a tile id is `room_handle:owner:
     // stream_id` and *can* recur (the same stream watched again later), so
@@ -937,6 +996,11 @@
     // for a viewer to want is "quieter" or "off". Rendered before the fps
     // span so it sits bottom-left, opposite the stats.
     if (tile.hasAudio) {
+      // Fire-and-forget: seeds `tileVolume`/`tileMuted` from the backend's
+      // real state the first time this window renders this tile id — see
+      // `ensureVolumeSeeded`'s doc comment.
+      ensureVolumeSeeded(tile);
+
       // Builds the whole `.media-tile-audio` pill for a given mute state.
       // The mute button below swaps this element in place (`bottom.
       // replaceChild`) instead of calling the top-level `render()` — that
@@ -1110,6 +1174,16 @@
   // `poppedOutIds` (see its held-slot check at the top).
   if (window.__ELECTRON__ && window.__ELECTRON__.onPopoutClosed) {
     window.__ELECTRON__.onPopoutClosed((streamKey) => {
+      // Also drop `streamKey` out of `seededVolumeIds` (NOT `tileVolume`/
+      // `tileMuted` themselves — those get an instant, no-flicker value
+      // from the render below, then `ensureVolumeSeeded` confirms/corrects
+      // it right after): while popped out, the pop-out window's own
+      // `pushVolume` calls could have changed the backend's real value
+      // (e.g. the user dragged the slider from 40% to 70% in that window),
+      // and this tab's `seededVolumeIds` marker from *before* it was popped
+      // out would otherwise skip re-fetching it, showing the stale
+      // pre-pop-out value forever instead of picking up 70%.
+      seededVolumeIds.delete(streamKey);
       if (poppedOutIds.delete(streamKey)) render();
     });
   }

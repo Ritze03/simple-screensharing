@@ -591,6 +591,13 @@ fn dispatch(name: &str, body: &Value, app: &AppHandle) -> Result<Value, ApiError
             get_string(body, "owner")?,
             get_u8(body, "stream_id")?,
             get_u32(body, "volume_percent")?,
+            get_bool(body, "muted")?,
+        )),
+        "get_volume" => result(commands::get_volume(
+            managed,
+            get_u32(body, "room_handle")?,
+            get_string(body, "owner")?,
+            get_u8(body, "stream_id")?,
         )),
         other => Err(ApiError::not_found(format!("unknown command `{other}`"))),
     }
