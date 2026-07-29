@@ -158,17 +158,17 @@
 }
 
 /* -------------------------------------------------------------------
- * Always-visible stat bar (2026-07-29 "prominent stats" redesign — see
+ * Stat bar (originally the 2026-07-29 "prominent stats" redesign — see
  * `superdoc/features/stream-control.md`'s matching dated entry). Replaces
  * the old `.media-tile-nameplate` pill, which showed only "name · room"
  * and was the literal thing the owner called "kinda hidden": bigger, at
- * the top of every tile, on by default (no hover needed), carrying the
- * same resolution/fps/bitrate/audio-sharing figures that used to be
- * hover-gated inside `.media-tile-overlay`. Value styling
- * (`.media-tile-statbar-value`) borrows `--font-mono` + the size/weight/
- * tabular-nums recipe from `stream-control.css`'s `.dest-metric-value` —
- * this app's existing vocabulary for "a live numeric readout on a card",
- * reused here rather than inventing a second one.
+ * the top of every tile, carrying the same resolution/fps/bitrate/
+ * audio-sharing figures that used to be hover-gated inside
+ * `.media-tile-overlay`. Value styling (`.media-tile-statbar-value`)
+ * borrows `--font-mono` + the size/weight/tabular-nums recipe from
+ * `stream-control.css`'s `.dest-metric-value` — this app's existing
+ * vocabulary for "a live numeric readout on a card", reused here rather
+ * than inventing a second one.
  *
  * 2026-07-29, later same day — shrunk from a full-tile-width gradient bar
  * to a compact top-left pill (same "dark translucent chip" visual language
@@ -181,9 +181,21 @@
  * showing": a full-width dark gradient scrim across the top of every tile,
  * at rest, is visually indistinguishable from "a vignette overlay" even
  * though it's a different, deliberately-always-visible element. Shrinking
- * it to a content-sized pill keeps the stats always visible (still an
- * explicit requirement, see the redesign note above) while no longer
- * reading as a second always-on overlay.
+ * it to a content-sized pill kept the stats always visible (still an
+ * explicit requirement at the time, see the redesign note above) while no
+ * longer reading as a second always-on overlay.
+ *
+ * 2026-07-29, later still — REVERSAL: the owner came back and explicitly
+ * asked for the opposite of the "no hover needed" decision above, twice,
+ * with specifics ("make sure that all of the elements disappear, if the
+ * window/area is not hovered... In window, the info overlay (name,
+ * channel, resolution and so on) stays visible" — named as the bug, not a
+ * misunderstanding). So this bar is now hover-gated exactly like
+ * `.media-tile-vignette`/`.media-tile-overlay` below: opacity 0 at rest,
+ * opacity 1 on `.media-tile:hover`/`:focus-within`, same transition. The
+ * "always visible, shrunk to a pill so it doesn't read as an overlay"
+ * reasoning above is now historical — kept for context on why the pill
+ * shape exists, not as the current visibility rule.
  * ----------------------------------------------------------------- */
 
 .media-tile-statbar {
@@ -202,6 +214,13 @@
   border: 1px solid rgba(255, 255, 255, 0.14);
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
   pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
+.media-tile:hover .media-tile-statbar,
+.media-tile:focus-within .media-tile-statbar {
+  opacity: 1;
 }
 
 .media-tile-statbar-dot {
@@ -361,16 +380,26 @@
    translucent over the video, a visible hairline border so the chip reads
    as a distinct control rather than blending into the tile, plus the blur.
    Shared by the pop-out window's `.viewer-exit-btn` (`viewer.css`) for the
-   same "exit this view" look in both windows. */
+   same "exit this view" look in both windows.
+
+   2026-07-29, later still — circular + height-unified with the stat bar:
+   changed from a rounded square (`--rounding-sm`) to a true circle
+   (`border-radius: 50%`), matching `.viewer-exit-btn`'s shape. Size changed
+   from 30px to 29px to match `.media-tile-statbar`'s own rendered height —
+   measured live via `getBoundingClientRect()` in the real Electron app
+   (29px, not the 30/32px these buttons used before), not just read off the
+   CSS padding math, since font metrics/line-height can shift the real
+   number. `.viewer-exit-btn` (`viewer.css`) was bumped to the same 29px for
+   the same reason. */
 .media-tile-popout-btn {
   pointer-events: auto;
   background: rgba(16, 17, 20, 0.55);
   backdrop-filter: blur(6px);
   border: 1px solid rgba(255, 255, 255, 0.16);
   color: var(--text);
-  border-radius: var(--rounding-sm);
-  width: 30px;
-  height: 30px;
+  border-radius: 50%;
+  width: 29px;
+  height: 29px;
   display: flex;
   align-items: center;
   justify-content: center;
