@@ -1580,24 +1580,22 @@
   }
 
   /**
-   * The attached-audio line: `[meter] [app name] [Mute/Unmute] [Stop]`,
-   * followed by an always-visible source picker + "Switch" — unlike the
-   * not-yet-attached picker, this one never unmounts once a share is live,
-   * so the user can change source without a separate Stop-then-"+ Add
-   * audio" round trip (2026-07-29, owner asked for on-the-fly source
-   * switching — a follow-up piece adding level meters to each dropdown
-   * entry is a separate task layered on top of this one, not built here).
+   * The attached-audio line: `[meter] [source picker] [Mute/Unmute] [Stop]`
+   * — the dropdown *is* the name display (it starts on whatever's live) and
+   * switches source immediately on selection, no separate "Switch" button
+   * (2026-07-29, owner asked to collapse the two-line picker+Switch button
+   * down to a single always-visible dropdown that acts on `change` — the
+   * raw name text and the button were redundant with what the dropdown
+   * already shows/does once switching is instant. A follow-up piece adding
+   * level meters to each dropdown entry is a separate task layered on top
+   * of this one, not built here).
    *
-   * `Why "Switch" instead of auto-switching on select:` picking a source in
-   * the dropdown is cheap to undo (just don't press Switch); a real
-   * stop+restart of the capture firing on every dropdown click would not
-   * be.
-   *
-   * `Why disabled when the selection matches the live source:` `onSwitchAudio`
-   * is a real stop-then-start cycle under the hood (see `stream-control.js`),
-   * not a no-op — there's no cheaper "you actually changed something" check,
-   * so the button just refuses to fire rather than needlessly tearing down
-   * and rebuilding a perfectly fine active share. Matched by name rather
+   * `Why instant switch is fine here (unlike a destructive action):`
+   * `onSwitchAudio` is a real stop-then-start cycle under the hood (see
+   * `stream-control.js`), so firing it on every selection would be wasteful
+   * — but not unsafe — for a redundant reselect of the already-live source;
+   * the no-op guard below exists purely to skip that waste, not to prevent
+   * harm the way a confirming button click would. Matched by name rather
    * than id: `DestinationRow` (`dto.rs`) only carries the source's `label`,
    * not the source id `select_audio_source` was given, so name is the only
    * thread connecting "what's live" back to "what's in the picker's list" —
@@ -1631,7 +1629,24 @@
     for (let i = 0; i < AUDIO_METER_BARS; i++) meter.appendChild(el("span", { className: "dest-audio-meter-bar" }));
     row.appendChild(meter);
 
-    row.appendChild(el("span", { className: "dest-audio-name", text: audio.label, attrs: { title: audio.label } }));
+    // Source picker, in the name text's old spot — it now doubles as the
+    // name display (its selected option reads the live source's name).
+    const core = audioSourcePickerCore(handlers, opts);
+    const select = core.select;
+
+    // Default the picker to whatever's already live, matched by name (see
+    // this function's doc comment for why name, not id) — falls back to the
+    // list's first entry (the dropdown's own default) when the live source
+    // isn't in the current list, e.g. it just stopped producing audio.
+    const liveSource = core.getSources().find((s) => s.name === audio.label);
+    if (liveSource) select.value = liveSource.id;
+
+    select.addEventListener("change", () => {
+      const source = core.getSources().find((s) => String(s.id) === String(select.value));
+      if (source && source.name !== audio.label) handlers.onSwitchAudio && handlers.onSwitchAudio(dest, audio, source);
+    });
+
+    row.appendChild(select);
 
     // `Why a fixed width:` the label flips between "Mute" and "Unmute", and
     // a button that resizes on every toggle shoves the Stop button next to
@@ -1648,41 +1663,6 @@
     row.appendChild(
       dangerButton("Stop", () => handlers.onAudioStop && handlers.onAudioStop(audio.destination_id), { className: "dest-audio-stop" })
     );
-
-    // Always-visible switch picker: a second line, under the same row's
-    // flex-wrap, so the meter/name/Mute/Stop line above stays exactly as it
-    // was rather than getting crowded to fit a dropdown + button in.
-    const switchRow = el("div", { className: "dest-audio-switch-row" });
-    const core = audioSourcePickerCore(handlers, opts);
-    const select = core.select;
-
-    // Default the picker to whatever's already live, matched by name (see
-    // this function's doc comment for why name, not id) — falls back to the
-    // list's first entry (the dropdown's own default) when the live source
-    // isn't in the current list, e.g. it just stopped producing audio.
-    const liveSource = core.getSources().find((s) => s.name === audio.label);
-    if (liveSource) select.value = liveSource.id;
-
-    const switchBtn = secondaryButton(
-      "Switch",
-      () => {
-        const source = core.getSources().find((s) => String(s.id) === String(select.value));
-        if (source) handlers.onSwitchAudio && handlers.onSwitchAudio(dest, audio, source);
-      },
-      { className: "dest-audio-switch-btn" }
-    );
-    const isSameAsLive = () => {
-      const source = core.getSources().find((s) => String(s.id) === String(select.value));
-      return !source || source.name === audio.label;
-    };
-    switchBtn.disabled = isSameAsLive();
-    select.addEventListener("change", () => {
-      switchBtn.disabled = isSameAsLive();
-    });
-
-    switchRow.appendChild(select);
-    switchRow.appendChild(switchBtn);
-    row.appendChild(switchRow);
 
     core.startPolling(() => row.isConnected);
 
