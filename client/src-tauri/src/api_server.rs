@@ -562,6 +562,7 @@ fn dispatch(name: &str, body: &Value, app: &AppHandle) -> Result<Value, ApiError
         "set_tune" => result(commands::set_tune(managed, get_string(body, "tune")?)),
         "set_quality_level" => result(commands::set_quality_level(managed, get_string(body, "quality_level")?)),
         "set_rate_control" => result(commands::set_rate_control(managed, get_string(body, "rate_control")?)),
+        "set_gop_millis" => ok(commands::set_gop_millis(managed, get_u32(body, "gop_millis")?)),
         "start_destination" => ok(commands::start_destination(managed, get_u32(body, "capture_id")?, get_u32(body, "room_handle")?)),
         "transfer_destination" => {
             ok(commands::transfer_destination(managed, get_u32(body, "destination_id")?, get_u32(body, "target_room")?))
@@ -575,6 +576,7 @@ fn dispatch(name: &str, body: &Value, app: &AppHandle) -> Result<Value, ApiError
             get_string(body, "tune")?,
             get_string(body, "quality_level")?,
             get_string(body, "rate_control")?,
+            get_u32(body, "gop_millis")?,
         )),
         "stop_destination" => ok(commands::stop_destination(managed, get_u32(body, "destination_id")?)),
         "set_bandwidth_mode" => result(commands::set_bandwidth_mode(managed, get_string(body, "mode")?)),

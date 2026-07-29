@@ -566,6 +566,20 @@ pub fn set_rate_control(managed: State<'_, Managed>, rate_control: String) -> Re
     Ok(())
 }
 
+/// GOP/keyframe interval (ms), process-wide for the *next* video capture
+/// started — same shape as `set_tune`/`set_quality_level`/`set_rate_control`
+/// above, driven by the Preset picker (`components.js`'s `ENCODER_PRESETS`;
+/// the Gaming preset is the only one that sets this away from
+/// `capture::DEFAULT_GOP_MILLIS`). Deliberately **not** persisted to
+/// `settings.toml` like `set_start_stream_defaults`'s fields — a plain
+/// process-wide session default that resets to the protocol-spec 2s figure
+/// on every launch, since a shorter GOP is a preset-specific tradeoff, not a
+/// standalone setting worth remembering across restarts on its own.
+#[tauri::command]
+pub fn set_gop_millis(managed: State<'_, Managed>, gop_millis: u32) {
+    managed.state.lock().unwrap().gop_millis = gop_millis;
+}
+
 #[tauri::command]
 pub fn list_active_streams(managed: State<'_, Managed>) -> Vec<DestinationRow> {
     dto::destination_rows(&managed.state.lock().unwrap())
@@ -613,6 +627,7 @@ pub fn edit_destination(
     tune: String,
     quality_level: String,
     rate_control: String,
+    gop_millis: u32,
 ) -> Result<(), String> {
     let tune = dto::parse_tune_mode(&tune)?;
     let quality_level = dto::parse_quality_level(&quality_level)?;
@@ -627,6 +642,7 @@ pub fn edit_destination(
         dest.edit.tune = tune;
         dest.edit.quality_level = quality_level;
         dest.edit.rate_control = rate_control;
+        dest.edit.gop_millis = gop_millis;
     });
     state.apply_destination_edit(destination_id);
     Ok(())

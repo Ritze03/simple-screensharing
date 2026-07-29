@@ -18,15 +18,16 @@
 //   set_bandwidth_total, set_bandwidth_floor, edit_destination,
 //   stop_destination, stop_share, retry_destination, transfer_destination,
 //   start_destination, stage_video_share, go_live, set_bitrate, set_framerate,
-//   set_tune, set_quality_level, set_rate_control, start_audio_share,
-//   rename_room.
+//   set_tune, set_quality_level, set_rate_control, set_gop_millis,
+//   start_audio_share, rename_room.
 // Notably `stage_video_share`/`start_audio_share` take no encoder
-// arguments — framerate/bitrate/tune/quality-level/rate-control/audio-source
-// are process-wide settings applied via `set_framerate`/`set_bitrate`/
-// `set_tune`/`set_quality_level`/`set_rate_control`/`select_audio_source`
-// *before* the share starts, not per-call arguments. `go_live` (the "Go
-// live" flow's second half, see `superdoc/features/stream-control.md`'s
-// 2026-07-28 note) only takes `captureId`/`roomHandle` for the same reason.
+// arguments — framerate/bitrate/tune/quality-level/rate-control/gop-millis/
+// audio-source are process-wide settings applied via `set_framerate`/
+// `set_bitrate`/`set_tune`/`set_quality_level`/`set_rate_control`/
+// `set_gop_millis`/`select_audio_source` *before* the share starts, not
+// per-call arguments. `go_live` (the "Go live" flow's second half, see
+// `superdoc/features/stream-control.md`'s 2026-07-28 note) only takes
+// `captureId`/`roomHandle` for the same reason.
 //
 // Layout, top to bottom (the redesign this fixes vs. the old egui tab, see
 // stream-control.css's header comment):
@@ -355,7 +356,15 @@
     const edit = dest
       ? getDestEdit(dest)
       : Object.assign(
-          { bitrateKbps: 3000, framerate: 30, tune: "best_quality", qualityLevel: "balanced", rateControl: "constant", error: null },
+          {
+            bitrateKbps: 3000,
+            framerate: 30,
+            tune: "best_quality",
+            qualityLevel: "balanced",
+            rateControl: "qvbr",
+            gopMillis: 2000,
+            error: null,
+          },
           patch
         );
     Object.assign(edit, patch);
@@ -381,6 +390,7 @@
           tune: edit.tune,
           qualityLevel: edit.qualityLevel,
           rateControl: edit.rateControl,
+          gopMillis: edit.gopMillis,
         });
         edit.error = null;
         // Mirror what was just applied onto the local DTO copy so the card's
@@ -505,6 +515,13 @@
         await window.__TAURI__.core.invoke("set_quality_level", { qualityLevel: defaults.qualityLevel });
         await window.__TAURI__.core.invoke("set_rate_control", { rateControl: defaults.rateControl });
       }
+      // `gop_millis` is *not* one of `start_stream_defaults`' persisted
+      // fields (see `capture::DEFAULT_GOP_MILLIS`'s doc comment: it's a
+      // preset-specific tradeoff, not a standalone setting worth
+      // remembering across restarts) — always reset it to the protocol
+      // default here so a previous staged card's Gaming preset (a shorter
+      // GOP) can never silently bleed into the next one.
+      await window.__TAURI__.core.invoke("set_gop_millis", { gopMillis: 2000 });
       await window.__TAURI__.core.invoke("stage_video_share");
       mockStagedCaptures = await fetchStagedCaptures();
       render();
@@ -543,6 +560,7 @@
         tune: staged.tune,
         qualityLevel: staged.quality_level,
         rateControl: staged.rate_control,
+        gopMillis: staged.gop_millis,
         roomHandle: mockJoinedRooms.length > 0 ? mockJoinedRooms[0].id : null,
         error: null,
       };
@@ -569,6 +587,7 @@
         if ("tune" in patch) await window.__TAURI__.core.invoke("set_tune", { tune: edit.tune });
         if ("qualityLevel" in patch) await window.__TAURI__.core.invoke("set_quality_level", { qualityLevel: edit.qualityLevel });
         if ("rateControl" in patch) await window.__TAURI__.core.invoke("set_rate_control", { rateControl: edit.rateControl });
+        if ("gopMillis" in patch) await window.__TAURI__.core.invoke("set_gop_millis", { gopMillis: edit.gopMillis });
         edit.error = null;
       } catch (e) {
         edit.error = String(e);
@@ -577,7 +596,16 @@
       return;
     }
     const row = mockStagedCaptures.find((c) => c.capture_id === captureId);
-    if (row) Object.assign(row, { bitrate_kbps: edit.bitrateKbps, framerate: edit.framerate, tune: edit.tune, quality_level: edit.qualityLevel, rate_control: edit.rateControl });
+    if (row) {
+      Object.assign(row, {
+        bitrate_kbps: edit.bitrateKbps,
+        framerate: edit.framerate,
+        tune: edit.tune,
+        quality_level: edit.qualityLevel,
+        rate_control: edit.rateControl,
+        gop_millis: edit.gopMillis,
+      });
+    }
     render();
   }
 
@@ -620,14 +648,14 @@
       mockStagedCaptures = await fetchStagedCaptures();
       mockDestinations = await fetchActiveDestinations();
       // Seed the edit buffer `getDestEdit` would otherwise lazily default to
-      // "best_quality"/"balanced"/"constant" for the destination that just
+      // "best_quality"/"balanced"/"qvbr" for the destination that just
       // appeared, so the live card's Preset/Advanced-tuning controls reflect
       // what was actually picked on the staged card, instead of the
       // hardcoded fallback — `DestinationRow` (the DTO `fetchActiveDestinations`
-      // reads) has no tune/quality_level/rate_control fields, so this is the
-      // only place the frontend can recover them from. `go_live` attaches
-      // exactly one new destination per call (see `session::AppState::
-      // go_live`), so matching on `capture_id` is unambiguous.
+      // reads) has no tune/quality_level/rate_control/gop_millis fields, so
+      // this is the only place the frontend can recover them from. `go_live`
+      // attaches exactly one new destination per call (see `session::
+      // AppState::go_live`), so matching on `capture_id` is unambiguous.
       for (const dest of mockDestinations) {
         if (dest.capture_id === captureId && dest.kind === "video") {
           destEditState.set(dest.destination_id, {
@@ -636,6 +664,7 @@
             tune: edit.tune,
             qualityLevel: edit.qualityLevel,
             rateControl: edit.rateControl,
+            gopMillis: edit.gopMillis,
             error: null,
           });
         }
@@ -831,7 +860,7 @@
     if (!destStalledSince.has(dest.destination_id)) destStalledSince.set(dest.destination_id, Date.now());
     return destStalledSince.get(dest.destination_id);
   }
-  // destination_id -> { bitrateKbps, framerate, tune, qualityLevel, rateControl, error }.
+  // destination_id -> { bitrateKbps, framerate, tune, qualityLevel, rateControl, gopMillis, error }.
   // Local edit buffer for `edit_destination`'s fields, and — since the
   // destination card renders every control in the edit panel from it — the
   // single source of truth for what those controls show.
@@ -850,9 +879,9 @@
   // the whole panel consistent rather than half-optimistic.
   //
   // Defaults mirror `capture::TuneMode`/`QualityLevel`/`RateControlMode`'s
-  // `Default` impls (best_quality/balanced/constant — a deliberate "good mix"
-  // out of the box, not either speed/quality extreme; see those types' doc
-  // comments).
+  // `Default` impls (best_quality/balanced/qvbr — a deliberate "good mix" out
+  // of the box, not either speed/quality extreme; see those types' doc
+  // comments), plus `capture::DEFAULT_GOP_MILLIS` for `gopMillis`.
   const destEditState = new Map();
   // destination_id -> number[] (last SPARK_WINDOW `sent_fps` samples, oldest
   // first). No historical stats are fetched from anywhere — this is just a
@@ -872,7 +901,8 @@
         framerate: dest.framerate,
         tune: "best_quality",
         qualityLevel: "balanced",
-        rateControl: "constant",
+        rateControl: "qvbr",
+        gopMillis: 2000,
         error: null,
       };
       destEditState.set(dest.destination_id, s);
@@ -1336,7 +1366,8 @@
       bitrate_kbps: 8000,
       tune: "best_quality",
       quality_level: "balanced",
-      rate_control: "constant",
+      rate_control: "qvbr",
+      gop_millis: 2000,
     });
     render();
     // Mimics the real portal-prompt-then-pipeline-up delay at toy timescale.
@@ -1368,7 +1399,7 @@
       pending: null,
     };
     // Seed the edit buffer `getDestEdit` would otherwise lazily default to
-    // "best_quality"/"balanced"/"constant" — so the mock destination card's
+    // "best_quality"/"balanced"/"qvbr" — so the mock destination card's
     // Preset/Advanced-tuning controls reflect what was actually picked on
     // the staged card, same as the real Tauri branch does (see the matching
     // `destEditState.set(...)` in `goLive`, above).
@@ -1378,6 +1409,7 @@
       tune: edit.tune,
       qualityLevel: edit.qualityLevel,
       rateControl: edit.rateControl,
+      gopMillis: edit.gopMillis,
       error: null,
     });
     mockDestinations.push(newDest);

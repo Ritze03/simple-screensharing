@@ -640,7 +640,7 @@ mod tests {
                 bitrate_kbps: 12_000,
                 tune: crate::capture::TuneMode::LowLatency,
                 quality_level: crate::capture::QualityLevel::Performance,
-                rate_control: crate::capture::RateControlMode::Adaptive,
+                rate_control: crate::capture::RateControlMode::Cqp,
             },
             ..AppSettings::default()
         };

@@ -2320,6 +2320,7 @@ mod session_model_tests {
                 tune: capture::TuneMode::default(),
                 quality_level: capture::QualityLevel::default(),
                 rate_control: capture::RateControlMode::default(),
+                gop_millis: capture::DEFAULT_GOP_MILLIS,
             },
             runtime: None,
             pending: None,
@@ -2330,6 +2331,7 @@ mod session_model_tests {
                 tune: capture::TuneMode::default(),
                 quality_level: capture::QualityLevel::default(),
                 rate_control: capture::RateControlMode::default(),
+                gop_millis: capture::DEFAULT_GOP_MILLIS,
             },
             apply_rx: None,
         }

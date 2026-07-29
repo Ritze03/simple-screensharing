@@ -207,6 +207,10 @@ pub struct StagedCaptureRow {
     pub tune: TuneMode,
     pub quality_level: QualityLevel,
     pub rate_control: RateControlMode,
+    /// GOP/keyframe interval (ms) — see `capture::destination::
+    /// VideoParams::gop_millis`. Preset-driven (Gaming uses a shorter
+    /// interval), not its own Advanced-tuning control.
+    pub gop_millis: u32,
 }
 
 pub fn staged_capture_rows(state: &AppState) -> Vec<StagedCaptureRow> {
@@ -234,6 +238,7 @@ pub fn staged_capture_rows(state: &AppState) -> Vec<StagedCaptureRow> {
             tune: state.tune,
             quality_level: state.quality_level,
             rate_control: state.rate_control,
+            gop_millis: state.gop_millis,
         });
     }
     rows
@@ -438,9 +443,8 @@ pub fn parse_quality_level(s: &str) -> Result<QualityLevel, String> {
 
 pub fn parse_rate_control_mode(s: &str) -> Result<RateControlMode, String> {
     match s {
-        "constant" => Ok(RateControlMode::Constant),
-        "adaptive" => Ok(RateControlMode::Adaptive),
-        "quality" => Ok(RateControlMode::Quality),
+        "cqp" => Ok(RateControlMode::Cqp),
+        "qvbr" => Ok(RateControlMode::Qvbr),
         other => Err(format!("unknown rate control mode: {other}")),
     }
 }

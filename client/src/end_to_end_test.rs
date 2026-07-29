@@ -1477,7 +1477,7 @@ async fn late_watch_after_all_three_tuning_controls_toggled_gets_a_real_keyframe
             .params();
         let after_tune = VideoParams { tune: capture::TuneMode::BestQuality, ..base };
         let after_quality = VideoParams { quality_level: capture::QualityLevel::Quality, ..after_tune };
-        let after_rate_control = VideoParams { rate_control: capture::RateControlMode::Quality, ..after_quality };
+        let after_rate_control = VideoParams { rate_control: capture::RateControlMode::Cqp, ..after_quality };
 
         for (label, params) in [
             ("tune", after_tune),
@@ -1653,8 +1653,8 @@ async fn retry_destination_preserves_prior_encoder_tuning() {
     );
 
     // Non-default tuning: what a user would have set via `edit_destination`
-    // (low-latency's the default; best-quality/quality/adaptive are not)
-    // before this destination later failed and got retried.
+    // (low-latency's the default; best-quality/quality/cqp are not) before
+    // this destination later failed and got retried.
     let tuned_params = VideoParams {
         width: 0,
         height: 0,
@@ -1663,7 +1663,8 @@ async fn retry_destination_preserves_prior_encoder_tuning() {
         backend: capture::EncoderBackend::default(),
         tune: capture::TuneMode::BestQuality,
         quality_level: capture::QualityLevel::Quality,
-        rate_control: capture::RateControlMode::Adaptive,
+        rate_control: capture::RateControlMode::Cqp,
+        gop_millis: capture::DEFAULT_GOP_MILLIS,
     };
 
     {
@@ -1756,7 +1757,7 @@ async fn retry_destination_preserves_prior_encoder_tuning() {
     );
     assert_eq!(
         new_dest.params.rate_control,
-        capture::RateControlMode::Adaptive,
+        capture::RateControlMode::Cqp,
         "BUG REPRODUCED: retry reset rate_control to the default instead of preserving it"
     );
 
@@ -2713,6 +2714,7 @@ async fn start_audio_share_succeeds_once_the_video_capture_is_live() {
         tune: capture::TuneMode::default(),
         quality_level: capture::QualityLevel::default(),
         rate_control: capture::RateControlMode::default(),
+        gop_millis: capture::DEFAULT_GOP_MILLIS,
     };
     {
         let room = state.rooms.get_mut(&room_handle).unwrap();
@@ -2820,6 +2822,7 @@ async fn stop_share_tears_down_a_paired_audio_capture_too() {
         tune: capture::TuneMode::default(),
         quality_level: capture::QualityLevel::default(),
         rate_control: capture::RateControlMode::default(),
+        gop_millis: capture::DEFAULT_GOP_MILLIS,
     };
 
     let video_capture_id = state.alloc_capture_id();

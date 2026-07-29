@@ -289,7 +289,8 @@ pub const AUDIO_DESTINATION_PARAMS: capture::destination::VideoParams = capture:
     backend: capture::EncoderBackend::Software,
     tune: capture::TuneMode::LowLatency,
     quality_level: capture::QualityLevel::Performance,
-    rate_control: capture::RateControlMode::Constant,
+    rate_control: capture::RateControlMode::Cqp,
+    gop_millis: capture::DEFAULT_GOP_MILLIS,
 };
 
 /// A destination's in-progress lifecycle beyond what `DestinationState`
@@ -336,8 +337,13 @@ pub struct DestEdit {
     pub tune: capture::TuneMode,
     /// Performance vs. quality encode speed — `capture::QualityLevel`.
     pub quality_level: capture::QualityLevel,
-    /// Constant/Adaptive/Quality rate control — `capture::RateControlMode`.
+    /// CQP/QVBR rate control — `capture::RateControlMode`.
     pub rate_control: capture::RateControlMode,
+    /// Keyframe/GOP interval in milliseconds — see
+    /// `capture::destination::VideoParams::gop_millis`. Preset-driven (the
+    /// Gaming preset uses a shorter interval); not a raw Advanced-tuning
+    /// control of its own.
+    pub gop_millis: u32,
 }
 
 /// One room this capture is being sent into: the room, plus the `stream_id`
@@ -420,6 +426,7 @@ impl Destination {
             tune: params.tune,
             quality_level: params.quality_level,
             rate_control: params.rate_control,
+            gop_millis: params.gop_millis,
         }
     }
 
@@ -445,6 +452,7 @@ impl Destination {
             tune: self.edit.tune,
             quality_level: self.edit.quality_level,
             rate_control: self.edit.rate_control,
+            gop_millis: self.edit.gop_millis,
         }
     }
 }
@@ -1122,6 +1130,10 @@ pub struct AppState {
     /// Encoder rate-control mode to use for the *next* video capture
     /// started. See `tune`'s `Why:` note and `capture::RateControlMode`.
     pub rate_control: capture::RateControlMode,
+    /// GOP/keyframe interval (ms) to use for the *next* video capture
+    /// started. See `tune`'s `Why:` note and
+    /// `capture::destination::VideoParams::gop_millis`.
+    pub gop_millis: u32,
     /// Which room the "Start a stream" card will start the next capture in.
     /// `None` until a room is joined; re-pointed by the picker.
     pub new_stream_room: Option<RoomHandle>,
@@ -1239,6 +1251,7 @@ impl Default for AppState {
             tune: capture::TuneMode::default(),
             quality_level: capture::QualityLevel::default(),
             rate_control: capture::RateControlMode::default(),
+            gop_millis: capture::DEFAULT_GOP_MILLIS,
             new_stream_room: None,
             bandwidth_mode: settings.bandwidth_mode,
             absolute_total_kbps: settings.absolute_total_kbps,
@@ -1555,6 +1568,7 @@ impl AppState {
             tune: self.tune,
             quality_level: self.quality_level,
             rate_control: self.rate_control,
+            gop_millis: self.gop_millis,
         };
         let (tx, rx) = oneshot::channel();
         self.captures.insert(
@@ -1684,6 +1698,7 @@ impl AppState {
             tune: self.tune,
             quality_level: self.quality_level,
             rate_control: self.rate_control,
+            gop_millis: self.gop_millis,
         };
         self.add_destination_with_params(capture_id, room_handle, PendingRole::GoingLive, params);
     }
@@ -1732,6 +1747,7 @@ impl AppState {
                 tune: capture::TuneMode::default(),
                 quality_level: capture::QualityLevel::default(),
                 rate_control: capture::RateControlMode::default(),
+                gop_millis: capture::DEFAULT_GOP_MILLIS,
             }
         });
         self.add_destination_with_params(capture_id, room_handle, role, params);
