@@ -1397,12 +1397,11 @@
       body.appendChild(el("div", { className: "dest-computed-share", text: `Allocated: ${dest.computedShareKbps} kbps` }));
     }
 
-    // Staged: `dest-actions-staged` bumps `.dest-action-btn` up to a bigger,
-    // more deliberate size than the routine small action buttons live cards
-    // use (Transfer/Stop) — "Go live" is the one confirming action on the
-    // whole card, not a routine icon-sized button, so it (and its "Cancel"
-    // companion) need to read as visibly more prominent. See
-    // `.dest-actions-staged .dest-action-btn` in stream-control.css.
+    // `dest-actions-staged` no longer changes button sizing — `.dest-action-btn`
+    // itself is 32px now for both staged (Go live/Cancel) and live
+    // (Transfer/Stop) cards (2026-07-29, owner asked for live's Stop to match
+    // staged's size). Class kept on the staged row regardless, in case other
+    // staged-only layout rules get hung off it later.
     const actions = el("div", { className: opts.staged ? "dest-actions dest-actions-staged" : "dest-actions" });
 
     if (opts.staged) {
@@ -1594,12 +1593,16 @@
       }, AUDIO_SOURCE_POLL_MS);
     }
 
+    // `dest-audio-share-btn` is the same 32px size on both staged and live
+    // cards now (2026-07-29 — owner asked for live cards' Share to match
+    // Stop's bump), so there is no `-staged` modifier to conditionally add
+    // any more; see the class's definition in stream-control.css.
     picker.appendChild(
       primaryButton("Share", () => {
         const source = sources.find((s) => String(s.id) === String(select.value));
         if (source) handlers.onAddAudio && handlers.onAddAudio(dest, source);
         stopAudioSourcePolling();
-      }, { className: "dest-audio-share-btn" + (opts.staged ? " dest-audio-share-btn-staged" : "") })
+      }, { className: "dest-audio-share-btn" })
     );
 
     // Staged cards get a bigger "+ Add audio" — same rationale as
