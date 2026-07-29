@@ -798,6 +798,33 @@
   font-size: 14px;
 }
 
+/* Attached row: the meter/name/Mute/Stop line stays as it was, but now
+   wraps a second line underneath for the always-visible source picker +
+   Switch (2026-07-29, on-the-fly audio switching) — `flex-wrap` rather than
+   a taller fixed row, since the top line's own height/alignment shouldn't
+   change just because a second line got added below it. */
+.dest-audio-row-attached {
+  flex-wrap: wrap;
+  row-gap: 8px;
+}
+
+.dest-audio-switch-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 100%;
+  /* Lines up with `.dest-audio-name` above, past the meter's fixed 26px +
+     the row's 8px gap. */
+  padding-left: 34px;
+}
+
+.dest-audio-switch-btn {
+  flex: 0 0 auto;
+  padding: 6px 14px;
+  height: auto;
+  font-size: 14px;
+}
+
 /* No audio attached yet. */
 .dest-audio-empty-icon {
   font-size: 15px;
