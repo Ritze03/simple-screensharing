@@ -56,13 +56,67 @@
   const JITTER_BUFFER_FLOOR_MS = 40;
   // RFC 3550 section 6.4.1's smoothing constant (1/16) for the jitter EWMA.
   const JITTER_EWMA_ALPHA = 1 / 16;
-  // Max change to `appliedBufferMs` per chunk arrival — caps how fast the
-  // applied delay can move even if `target_buffer_ms` jumps a lot in one
-  // step, so buffer growth/shrink is an invisible drift rather than a
-  // visible pacing jump in the playout schedule.
+  // Max change to `appliedBufferMs` per chunk arrival, in the *growing*
+  // direction only — caps how fast the applied delay can move even if
+  // `target_buffer_ms` jumps a lot in one step, so a jitter spike is an
+  // invisible drift rather than a visible pacing jump in the playout
+  // schedule. The *shrinking* direction (buffer easing back down once
+  // there's slack to shed) is governed separately, by
+  // `catchUpSpeedFraction` below — see that constant's comment for why a
+  // flat per-chunk step isn't the right shape for that direction.
   const MAX_BUFFER_EASE_STEP_MS = 20;
 
+  // Ceiling, as a fraction of wall-clock time, on how much faster than live
+  // the applied jitter buffer is allowed to shrink — i.e. how much faster
+  // than 1.0x `pts` seconds are allowed to elapse per wall-clock second
+  // while `appliedBufferMs` is easing down toward its target. Project
+  // owner, verbatim: "It should also lower itself slightly over time, so a
+  // short interruption doesn't make the screenshare delayed for the
+  // remainder of the time. It should run at max 5%-10% faster... to
+  // basically catch up to live again." Overwritten once at startup (and on
+  // every Settings change) via `setCatchUpSpeedPercent`, mirroring
+  // `maxJitterBufferMs`'s own `let`-binding/setter shape — see that
+  // constant's comment.
+  //
+  // `Why capping the buffer's shrink RATE is the same thing as capping
+  // playback SPEED:` `enqueueChunk`'s schedule is `decodeAtMs = anchor +
+  // ptsElapsed + appliedBufferMs`. Real wall-clock time drives
+  // `decodeAtMs` forward (the scheduler fires each chunk once
+  // `performance.now()` reaches its `decodeAtMs`), so over any stretch of
+  // wall-clock time `dt`, `decodeAtMs` also advances by `dt`. Since
+  // `decodeAtMs`'s formula is `ptsElapsed + appliedBufferMs` (plus a fixed
+  // anchor), that means `ptsElapsed` advances by `dt - Δ(appliedBufferMs)`
+  // over the same stretch — i.e. by more than `dt` exactly when
+  // `appliedBufferMs` is shrinking. The implied playback speed (pts-seconds
+  // consumed per wall-clock second) is therefore `1 + shrinkRate`, where
+  // `shrinkRate` is how fast `appliedBufferMs` is decreasing per
+  // wall-clock ms. Bounding `shrinkRate` at `catchUpSpeedFraction` (below,
+  // in `updateAppliedBuffer`) therefore bounds playback speed at exactly
+  // `1 + catchUpSpeedFraction` — a genuine, continuously-applied speed cap,
+  // expressed without needing a second, separate "virtual clock" variable:
+  // `appliedBufferMs`'s own eased value already *is* that virtual clock's
+  // offset from real time.
+  const DEFAULT_CATCH_UP_SPEED_PERCENT = 5;
+  let catchUpSpeedFraction = DEFAULT_CATCH_UP_SPEED_PERCENT / 100;
+
   // --- Sustained-overload catch-up (decode-queue-depth backstop) ---
+  //
+  // `Why this doesn't fight or double-apply with `catchUpSpeedFraction`
+  // above:` the two mechanisms react to different signals and touch
+  // different state. `catchUpSpeedFraction` only ever adjusts
+  // `appliedBufferMs` — i.e. *when* an already-queued chunk's `decode()`
+  // call is scheduled to fire — in response to the jitter EWMA settling
+  // down after a spike. The backstop below reacts to `decoder.
+  // decodeQueueSize` — a live signal about the decoder's own internal
+  // capacity, invisible to anything upstream of this callback — and its
+  // only action is dropping already-*scheduled* chunks from
+  // `pendingChunks` outright, never touching `appliedBufferMs` or any
+  // chunk's `decodeAtMs`. A stream that's simultaneously easing its buffer
+  // down (mild network-jitter recovery) and overloading the decoder
+  // (structural rate mismatch) would see both act in the same pass with no
+  // conflict: the schedule keeps advancing at its capped catch-up rate,
+  // and separately, whatever's still overdue when the decoder is behind
+  // gets pruned to the next keyframe.
   //
   // `Why this exists, and why it lives here and not in `decode.rs`:` the
   // jitter buffer above schedules each chunk's `decoder.decode()` call
@@ -132,15 +186,41 @@
     controller.lastPtsUs = ptsUs;
   }
 
-  /** Eases `controller.appliedBufferMs` toward the jitter-derived target by
-   * at most `MAX_BUFFER_EASE_STEP_MS`, rather than snapping straight to the
-   * target — see `MAX_BUFFER_EASE_STEP_MS`'s comment. Call once per chunk
-   * arrival, after `updateJitterEstimate` has folded in that chunk's
-   * sample. */
-  function updateAppliedBuffer(controller) {
+  /** Eases `controller.appliedBufferMs` toward the jitter-derived target,
+   * rather than snapping straight to it — call once per chunk arrival,
+   * after `updateJitterEstimate` has folded in that chunk's sample.
+   * `nowMs` is that same chunk's arrival time (`enqueueChunk`'s
+   * `performance.now()` reading), reused here rather than re-read, so both
+   * calls agree on exactly what instant this update covers.
+   *
+   * The two directions are capped differently on purpose:
+   *  - *Growing* (jitter got worse): capped at a flat `MAX_BUFFER_EASE_STEP_MS`
+   *    per chunk, same as before this change — a jitter spike should absorb
+   *    into the schedule as an invisible drift, not a visible jump, and
+   *    chunk-count is a fine proxy for that since spikes are rare and
+   *    growing quickly is what avoids an audible/visible underrun.
+   *  - *Shrinking* (there's slack to shed, catching back up to live): capped
+   *    at `catchUpSpeedFraction` of the wall-clock time elapsed since the
+   *    last update, not a flat per-chunk step — see
+   *    `DEFAULT_CATCH_UP_SPEED_PERCENT`'s comment above for why a per-chunk
+   *    cap can't express a genuine percent-of-real-time speed ceiling (it
+   *    silently scales with fps instead), and for the derivation of why
+   *    this wall-time-relative cap
+   *    on the buffer's shrink rate is mathematically the same thing as
+   *    capping playback speed at `1 + catchUpSpeedFraction`.
+   */
+  function updateAppliedBuffer(controller, nowMs) {
     const target = clamp(controller.jitterEwmaMs * 4 + JITTER_BUFFER_FLOOR_MS, 0, maxJitterBufferMs);
     const diff = target - controller.appliedBufferMs;
-    controller.appliedBufferMs += clamp(diff, -MAX_BUFFER_EASE_STEP_MS, MAX_BUFFER_EASE_STEP_MS);
+    if (diff >= 0) {
+      controller.appliedBufferMs += Math.min(diff, MAX_BUFFER_EASE_STEP_MS);
+    } else {
+      const elapsedMs = controller.lastBufferUpdateMs == null ? 0 : Math.max(0, nowMs - controller.lastBufferUpdateMs);
+      const maxShrinkMs = elapsedMs * catchUpSpeedFraction;
+      controller.appliedBufferMs += Math.max(diff, -maxShrinkMs);
+    }
+    controller.appliedBufferMs = clamp(controller.appliedBufferMs, 0, maxJitterBufferMs);
+    controller.lastBufferUpdateMs = nowMs;
   }
 
   /** Pops and decodes `controller.pendingChunks[0]` once its scheduled
@@ -224,7 +304,7 @@
   function enqueueChunk(controller, decoder, tile, ptsUs, chunk) {
     const arrivalMs = performance.now();
     updateJitterEstimate(controller, arrivalMs, ptsUs);
-    updateAppliedBuffer(controller);
+    updateAppliedBuffer(controller, arrivalMs);
 
     if (controller.anchorArrivalMs == null) {
       controller.anchorArrivalMs = arrivalMs;
@@ -281,7 +361,12 @@
    * unconditional `pendingChunks.shift()` would then desync the queue by
    * dropping whatever's pushed onto it next instead. Also resets the
    * playout anchor so pacing for the new stream starts fresh rather than
-   * being computed relative to a pts timeline from before the swap.
+   * being computed relative to a pts timeline from before the swap. Also
+   * resets `lastBufferUpdateMs` for the same reason: leaving it set to a
+   * pre-swap timestamp would make the very first post-swap
+   * `updateAppliedBuffer` call see a large `elapsedMs` gap and permit an
+   * outsized one-off shrink, i.e. briefly blow straight through the
+   * catch-up speed cap it's meant to enforce.
    */
   function resetJitterBuffer(controller) {
     if (controller.scheduleTimeoutId != null) {
@@ -291,6 +376,7 @@
     controller.pendingChunks.length = 0;
     controller.anchorArrivalMs = null;
     controller.anchorPtsUs = null;
+    controller.lastBufferUpdateMs = null;
   }
 
   /** Cancels `controller`'s fetch reader and closes its `VideoDecoder`.
@@ -405,6 +491,12 @@
       pendingChunks: [],
       jitterEwmaMs: 0,
       appliedBufferMs: 0,
+      // Wall-clock time of the last `updateAppliedBuffer` call — `null`
+      // until the first chunk, so that call's very first shrink-direction
+      // step has no elapsed interval to measure against yet (see
+      // `updateAppliedBuffer`'s `elapsedMs` — resolves to a no-op shrink
+      // that update, which is fine: shrinking starts from the next chunk).
+      lastBufferUpdateMs: null,
       anchorArrivalMs: null,
       anchorPtsUs: null,
       lastArrivalMs: null,
@@ -605,11 +697,25 @@
     maxJitterBufferMs = clamp(Number(ms) || DEFAULT_MAX_JITTER_BUFFER_MS, 0, 5000);
   }
 
+  /** Overrides the ceiling on the jitter buffer's catch-up playback speed
+   * (see `DEFAULT_CATCH_UP_SPEED_PERCENT`'s doc comment above) — same
+   * once-at-startup wiring shape as `setMaxJitterBufferMs` right above:
+   * called by `view.js`/`viewer.js` with the user's real `get_settings()`
+   * value. Takes a *percent* (5-10), matching the Settings slider and
+   * `rooms::AppSettings::catch_up_speed_percent`; stored internally as a
+   * fraction since that's what `updateAppliedBuffer`'s math wants. Clamped
+   * defensively (the backend already clamps too). */
+  function setCatchUpSpeedPercent(percent) {
+    const clamped = clamp(Number(percent) || DEFAULT_CATCH_UP_SPEED_PERCENT, 5, 10);
+    catchUpSpeedFraction = clamped / 100;
+  }
+
   window.TileVideo = {
     startTileVideo,
     stopTileVideo,
     stopAllTileVideo,
     hasController,
     setMaxJitterBufferMs,
+    setCatchUpSpeedPercent,
   };
 })();

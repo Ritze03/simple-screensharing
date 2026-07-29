@@ -1096,6 +1096,10 @@ pub struct AppState {
     /// Ceiling on the View tab's jitter buffer, in milliseconds (persisted).
     /// See `rooms::AppSettings::max_jitter_buffer_ms`.
     pub max_jitter_buffer_ms: u32,
+    /// Ceiling, as a percent of wall-clock time, on the jitter buffer's
+    /// catch-up playback speed (persisted). See
+    /// `rooms::AppSettings::catch_up_speed_percent`.
+    pub catch_up_speed_percent: u32,
     /// Rate limiting, hysteresis and last-allocation bookkeeping for
     /// Absolute-Maximum mode. Never persisted: it describes this session's
     /// live encoders.
@@ -1181,6 +1185,7 @@ impl Default for AppState {
             absolute_total_kbps: settings.absolute_total_kbps,
             destination_floor_kbps: settings.destination_floor_kbps,
             max_jitter_buffer_ms: settings.max_jitter_buffer_ms,
+            catch_up_speed_percent: settings.catch_up_speed_percent,
             bandwidth: BandwidthController::new(),
             pending_destinations: Vec::new(),
             audio_sources: Vec::new(),
@@ -1256,6 +1261,18 @@ pub fn save_max_jitter_buffer_ms(ms: u32) {
     settings.max_jitter_buffer_ms = AppSettings::clamp_max_jitter_buffer_ms(ms);
     if let Err(e) = settings.save() {
         tracing::warn!("failed to save jitter buffer preference: {e:#}");
+    }
+}
+
+/// Persist the catch-up speed ceiling. Mirrors `save_max_jitter_buffer_ms`'s
+/// load-modify-save shape and defense-in-depth clamp — don't clobber the
+/// sibling settings, and don't trust a corrupt/out-of-range caller over the
+/// frontend's own 5-10 range input.
+pub fn save_catch_up_speed_percent(percent: u32) {
+    let mut settings = AppSettings::load();
+    settings.catch_up_speed_percent = AppSettings::clamp_catch_up_speed_percent(percent);
+    if let Err(e) = settings.save() {
+        tracing::warn!("failed to save catch-up speed preference: {e:#}");
     }
 }
 

@@ -292,6 +292,17 @@ pub fn set_max_jitter_buffer_ms(managed: State<'_, Managed>, ms: u32) {
     simple_screensharing_client::session::save_max_jitter_buffer_ms(ms);
 }
 
+/// Clamped server-side too (defense in depth) even though the frontend's
+/// range input already restricts it to 5..=10 — see
+/// `rooms::AppSettings::clamp_catch_up_speed_percent`.
+#[tauri::command]
+pub fn set_catch_up_speed_percent(managed: State<'_, Managed>, percent: u32) {
+    let percent = simple_screensharing_client::rooms::AppSettings::clamp_catch_up_speed_percent(percent);
+    let mut state = managed.state.lock().unwrap();
+    state.catch_up_speed_percent = percent;
+    simple_screensharing_client::session::save_catch_up_speed_percent(percent);
+}
+
 /// The "START A STREAM" form's persisted last-used values — read once when
 /// the Stream Control tab loads to pre-fill `state.startForm`
 /// (`stream-control.js`) instead of the hardcoded defaults it used to reset
