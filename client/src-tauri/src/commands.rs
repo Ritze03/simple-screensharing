@@ -444,7 +444,7 @@ pub fn select_audio_source(managed: State<'_, Managed>, id: u32, name: String) {
 
 /// Starts a non-announcing per-candidate level tap for the "Add
 /// audio"/"Switch" dropdown's meters — see `session::AppState::
-/// start_audio_level_tap` and `audio::AudioLevelTapHandle`'s doc comments
+/// insert_audio_level_tap` and `audio::AudioLevelTapHandle`'s doc comments
 /// for why this is a separate, much lighter thing than `start_audio_share`.
 /// Re-lists sources here (rather than trusting `source_id` against whatever
 /// the frontend already had) so the tap is built against `object.serial`
@@ -452,6 +452,28 @@ pub fn select_audio_source(managed: State<'_, Managed>, id: u32, name: String) {
 /// `list_audio_sources` itself. Returns the tap id the frontend polls/stops
 /// with; `Err` (e.g. the source vanished, or has no `object.serial` yet)
 /// just means that one dropdown entry's meter stays unlit.
+///
+/// `Why `audio::start_level_tap` runs inside its own `spawn_blocking`,
+/// separate from the one above and *before* `AppState`'s mutex is ever
+/// taken:` its doc comment claims `pipeline.set_state(Playing)` returns as
+/// soon as the state change is *requested*, without waiting for it to
+/// complete — true in the common case, but confirmed live (real dropdown
+/// open, real PipeWire session, one candidate among several) that
+/// `set_state` can still block synchronously for several seconds on a node
+/// PipeWire hasn't fully brought up yet (an idle/suspended stream in
+/// particular). The old code called `session::AppState::start_audio_level_tap`
+/// — which built the *entire* GStreamer pipeline, including that
+/// `set_state` call — while holding `managed.state`'s lock for the whole
+/// dropdown-open burst of concurrent taps. One slow/stuck candidate then
+/// held that lock indefinitely, and every other command needing it —
+/// including unrelated `start_audio_level_tap` calls for perfectly healthy
+/// sources, and, worse, `start_audio_share` for the "Share" button on the
+/// very same dropdown — queued behind it forever. That's the root cause
+/// both the "visualizer never lights up" and "clicking Share does nothing"
+/// bug reports traced back to. Building the pipeline here, before taking
+/// the lock at all, means a stuck candidate only ever blocks its own
+/// request (which the frontend's `withTimeout` already treats as "leave
+/// this one meter unlit") instead of every other command in the app.
 #[tauri::command]
 pub async fn start_audio_level_tap(managed: State<'_, Managed>, source_id: u32) -> Result<u32, String> {
     let source = tokio::task::spawn_blocking(simple_screensharing_client::audio::list_audio_sources)
@@ -461,7 +483,14 @@ pub async fn start_audio_level_tap(managed: State<'_, Managed>, source_id: u32) 
         .into_iter()
         .find(|s| s.id == source_id)
         .ok_or_else(|| "audio source is no longer listed".to_string())?;
-    managed.state.lock().unwrap().start_audio_level_tap(&source)
+    let serial = source
+        .serial
+        .ok_or_else(|| format!("'{}' has no PipeWire object.serial to tap yet", source.name))?;
+    let handle = tokio::task::spawn_blocking(move || simple_screensharing_client::audio::start_level_tap(serial))
+        .await
+        .map_err(|e| format!("audio level-tap task panicked: {e}"))?
+        .map_err(|e| format!("{e:#}"))?;
+    Ok(managed.state.lock().unwrap().insert_audio_level_tap(handle))
 }
 
 /// Polls a live level tap's newest reading (0.0-1.0), or `None` once it's
