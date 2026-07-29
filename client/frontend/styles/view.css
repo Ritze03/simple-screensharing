@@ -271,11 +271,41 @@
  * Hover overlay: now just the hover-reveal actions (pop-out/stop
  * watching) and the audio mute/volume control — stats live in the
  * always-visible `.media-tile-statbar` above instead.
+ *
+ * Split into two positioned siblings, `.media-tile-vignette` (below) and
+ * `.media-tile-overlay` (below's comment explains why): a single element
+ * can't paint its own background below a sibling while its children paint
+ * above that same sibling — one z-index applies to the whole stacking
+ * context, background included. The vignette needed to sit BELOW the
+ * always-visible `.media-tile-statbar` (so it never dims/obscures the stat
+ * pill) while the buttons/slider still needed to sit ABOVE it, so the
+ * gradient moved out into its own element with its own, lower z-index.
+ * Both still fade together via the same `.media-tile:hover`/`:focus-within`
+ * selectors so they read as one overlay to the viewer.
  * ----------------------------------------------------------------- */
 
 /* One full-tile vertical scrim (dark at both ends, clear through the
    middle) rather than two separate strip gradients — the prototype's
-   overlay dims the whole tile so the controls read against any frame. */
+   overlay dims the whole tile so the controls read against any frame.
+   Deliberately UNDER `.media-tile-statbar` (z-index: 1) — no explicit
+   z-index needed since `auto` already paints below a sibling that has one,
+   but see the "was 2" note in `.media-tile-overlay` below for the bug this
+   split fixed. */
+.media-tile-vignette {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  background: linear-gradient(180deg, rgba(10, 11, 13, 0.55) 0%, rgba(10, 11, 13, 0.1) 40%, rgba(10, 11, 13, 0.82) 100%);
+  opacity: 0;
+  transition: opacity 0.12s ease;
+  pointer-events: none;
+}
+
+.media-tile:hover .media-tile-vignette,
+.media-tile:focus-within .media-tile-vignette {
+  opacity: 1;
+}
+
 .media-tile-overlay {
   position: absolute;
   inset: 0;
@@ -285,12 +315,17 @@
      the exact same corner on hover), and CSS paints a z-index: auto sibling
      UNDER a sibling with an explicit z-index regardless of DOM order. Without
      this, the pop-out/stop-watching buttons render (and were reported as)
-     drawn below the statbar's gradient. */
+     drawn below the statbar's gradient.
+     This rule used to also carry the vignette gradient as its own
+     `background`, which meant the gradient outranked the statbar too and
+     visibly dimmed the stat pill on hover — the gradient now lives in the
+     `.media-tile-vignette` sibling above instead, so only the buttons/
+     slider need (and get) this z-index: 2. */
   z-index: 2;
   display: flex;
   flex-direction: column;
   justify-content: space-between;
-  background: linear-gradient(180deg, rgba(10, 11, 13, 0.55) 0%, rgba(10, 11, 13, 0.1) 40%, rgba(10, 11, 13, 0.82) 100%);
+  background: none;
   opacity: 0;
   transition: opacity 0.12s ease;
   pointer-events: none;
