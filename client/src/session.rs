@@ -686,6 +686,32 @@ pub struct RoomSession {
     /// thumbnail, keyed the same way as `preview_cache`/`watches`. Mirrors
     /// `WatchEntry::texture`'s create-once/`set`-in-place pattern.
     pub preview_textures: HashMap<(ConnId, StreamId), egui::TextureHandle>,
+
+    /// Last volume percent (0-200) a viewer explicitly chose for each
+    /// sender, keyed by owner `ConnId` alone — *not* `(ConnId, StreamId)`.
+    ///
+    /// `Why owner-only:` `AudioWatch::volume_percent` (the actually-playing
+    /// copy) lives inside the `audio_watches` map keyed by the audio
+    /// stream's own volatile `stream_id`, which is torn down and
+    /// re-allocated by `sync_audio_watches` every time the sender restarts
+    /// or switches their audio source (`teardown_audio_watch` drops the
+    /// whole `AudioWatch`, `start_audio_watch` creates a fresh one). Without
+    /// this owner-scoped copy surviving that churn, every restart/switch
+    /// silently reset the viewer's chosen volume back to the
+    /// hardcoded-100 default in `start_audio_watch`. Set from
+    /// `commands::set_volume` and `ui.rs`'s inline slider (the only two
+    /// places a volume ever changes), consulted by `start_audio_watch` as
+    /// the initial value for a newly created `AudioWatch`.
+    ///
+    /// Keying by `ConnId` alone (not paired with any stream id) is safe
+    /// because `ConnId` is fresh-random per connection (see
+    /// `superdoc/architecture/protocol-spec.md` §3.1), not a small
+    /// server-assigned counter — a stale entry surviving a `MemberLeft`
+    /// cannot practically collide with a later, unrelated sender's
+    /// `ConnId`. Cleared on `MemberLeft` anyway (see
+    /// `AppState::drain_events`), purely so this map doesn't grow forever
+    /// across a long-lived room with many join/leave cycles.
+    pub audio_volume_by_owner: HashMap<ConnId, u32>,
 }
 
 impl RoomSession {
@@ -728,8 +754,18 @@ impl RoomSession {
             return;
         }
         match AudioDecoder::new(stream_id) {
-            Ok(decoder) => {
-                self.audio_watches.lock().unwrap().insert(key, AudioWatch { decoder, volume_percent: 100, auto });
+            Ok(mut decoder) => {
+                // Resume at whatever this owner's audio was last set to
+                // (survives the sender restarting/switching their audio
+                // source, which tears down and recreates the `AudioWatch`
+                // under a fresh `stream_id` — see `audio_volume_by_owner`'s
+                // doc comment) — default to 100 only if this owner has no
+                // recorded preference yet.
+                let volume_percent = self.audio_volume_by_owner.get(&owner).copied().unwrap_or(100);
+                if volume_percent != 100 {
+                    decoder.set_volume(volume_percent as f64 / 100.0);
+                }
+                self.audio_watches.lock().unwrap().insert(key, AudioWatch { decoder, volume_percent, auto });
                 self.watch_error = None;
 
                 let client = self.client.clone();
@@ -2484,6 +2520,7 @@ impl AppState {
                 audio_watches,
                 preview_cache: PreviewCache::new(),
                 preview_textures: HashMap::new(),
+                audio_volume_by_owner: HashMap::new(),
             },
         );
         handle
@@ -2636,6 +2673,13 @@ impl AppState {
                     }
                     ClientEvent::PresenceDelta(PresenceEvent::MemberLeft { conn_id }) => {
                         room.members.retain(|m| m.conn_id != conn_id);
+                        // Not required for correctness — `ConnId` is
+                        // fresh-random per connection, so a later, unrelated
+                        // sender is never expected to collide with this one
+                        // — but keeps `audio_volume_by_owner` from growing
+                        // forever across a long-lived room with many
+                        // join/leave cycles. See that field's doc comment.
+                        room.audio_volume_by_owner.remove(&conn_id);
                     }
                     ClientEvent::PresenceDelta(PresenceEvent::StreamStarted(info)) => {
                         if let Some(m) = room.members.iter_mut().find(|m| m.conn_id == info.owner) {

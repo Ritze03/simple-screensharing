@@ -2077,6 +2077,12 @@ impl App {
                     && theme::slider_row(ui, t!("audio.volume_label").as_ref(), &mut audio_watch.volume_percent, 0..=200, 1.0, "%")
                 {
                     audio_watch.decoder.set_volume(audio_watch.volume_percent as f64 / 100.0);
+                    let volume_percent = audio_watch.volume_percent;
+                    drop(audio_watches);
+                    // Remember this owner's chosen volume independent of the
+                    // current audio stream id — see
+                    // `RoomSession::audio_volume_by_owner`'s doc comment.
+                    room.audio_volume_by_owner.insert(audio_key.0, volume_percent);
                 }
             }
 

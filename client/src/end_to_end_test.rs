@@ -2002,6 +2002,224 @@ async fn watching_video_automatically_delivers_the_sharers_audio_too() {
     eprintln!("[audio-follows-video] PASS");
 }
 
+/// Regression test: a viewer's chosen volume for a sender must survive that
+/// sender restarting or switching their audio source.
+///
+/// Root cause this guards against: `AudioWatch::volume_percent` — the
+/// actually-playing copy of a viewer's volume choice — lives inside
+/// `audio_watches`, keyed by `(owner, audio stream_id)`. The audio
+/// stream_id is volatile: every time a sender stops and starts an audio
+/// share (a manual restart, or switching which app they're sharing audio
+/// from) it gets a fresh id from `next_stream_id`. `sync_audio_watches`
+/// correctly notices the old `(owner, old_stream_id)` is no longer
+/// announced and tears the whole `AudioWatch` down (dropping
+/// `volume_percent` with it), then creates a brand new one for
+/// `(owner, new_stream_id)` — which, before this fix, always started at
+/// the hardcoded 100 in `start_audio_watch`, silently resetting whatever
+/// the viewer had chosen. `RoomSession::audio_volume_by_owner` is the
+/// owner-scoped copy that survives this churn; `start_audio_watch`
+/// consults it instead of hardcoding 100.
+///
+/// Real everything, same shape as
+/// `watching_video_automatically_delivers_the_sharers_audio_too` just above:
+/// real relay server, real QUIC, real video capture, real Opus audio
+/// capture off a real PipeWire node via a synthetic `audiotestsrc`.
+/// `#[ignore]`d for the same reason every other test in this module is.
+///
+/// Run with:
+/// `cargo test end_to_end_test::volume_survives_sender_audio_restart -- --ignored --nocapture`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "spawns a real relay server child process, real GStreamer capture/decode pipelines \
+            and a real PipeWire audio node; run explicitly with \
+            `cargo test end_to_end_test:: -- --ignored --nocapture`"]
+async fn volume_survives_sender_audio_restart_or_switch() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    const AUDIO_STREAM_ID_A: u8 = 9;
+    const AUDIO_STREAM_ID_B: u8 = 10;
+    const PW_CLIENT_NAME_A: &str = "ssshare-volume-persists-test-a";
+    const PW_CLIENT_NAME_B: &str = "ssshare-volume-persists-test-b";
+    const CHOSEN_VOLUME: u32 = 50;
+
+    let port = pick_free_udp_port().expect("failed to pick a free UDP port for the test relay");
+    let _server = spawn_relay_server(port).expect("failed to spawn relay server child process");
+
+    let server_addr = format!("127.0.0.1:{port}");
+    let room_id: RoomId = rand::random();
+    let room_key: [u8; 32] = rand::random();
+    let join_string = crate::net::format_join_string(&server_addr, &room_id, &room_key);
+
+    // --- Sharer (client A): a plain client, driven directly. ---
+    let (client_a, _snapshot_a, events_a) =
+        connect_with_retry(&join_string, "sharer").await.expect("client A failed to connect");
+    let _events_a_keepalive = events_a;
+    let owner = client_a.conn_id();
+
+    // --- Viewer (client B): a real `AppState`/`RoomSession`. ---
+    let (client_b, snapshot_b, events_b) =
+        connect_with_retry(&join_string, "viewer").await.expect("client B failed to connect");
+    let mut viewer = crate::session::AppState::default();
+    let room_handle = viewer.insert_room(client_b, snapshot_b, events_b, join_string.clone());
+    let ctx = egui::Context::default();
+
+    // --- Step 1: sharer starts video, viewer watches it. ---
+    let source_fragment = format!(
+        "videotestsrc is-live=true pattern=smpte \
+         ! video/x-raw,width={WIDTH},height={HEIGHT},framerate=15/1"
+    );
+    let video_handle = capture::start_sharing_from_test_source(
+        &client_a,
+        VIDEO_STREAM_ID,
+        2000,
+        capture::DEFAULT_FRAMERATE,
+        &source_fragment,
+    )
+    .await
+    .expect("start_sharing_from_test_source failed");
+
+    let mut saw_video = false;
+    for _ in 0..80 {
+        viewer.drain_events(&ctx);
+        if viewer.rooms[&room_handle].streams.iter().any(|s| s.owner == owner && s.stream_id == VIDEO_STREAM_ID) {
+            saw_video = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(saw_video, "viewer never saw the sharer's video stream announced");
+
+    viewer.rooms.get_mut(&room_handle).unwrap().toggle_watch(owner, VIDEO_STREAM_ID);
+    eprintln!("[volume-persists] step 1 OK: video shared and watched");
+
+    // --- Step 2: sharer starts its FIRST audio share (volume=0.02, same
+    // "audible but inaudible" rationale as the sibling test above). ---
+    let mut silent_audio_app_a = Command::new("gst-launch-1.0")
+        .args(["audiotestsrc", "volume=0.02", "!", "audioconvert", "!", "pipewiresink", &format!("client-name={PW_CLIENT_NAME_A}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn the first synthetic audio-producing app");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let sources = crate::audio::list_audio_sources().expect("list_audio_sources failed against a live pw-dump");
+    let source_a = sources
+        .iter()
+        .find(|s| s.name.contains(PW_CLIENT_NAME_A))
+        .cloned()
+        .expect("did not find the first synthetic test app among live audio sources");
+    let audio_handle_a = crate::audio::start_audio_sharing(&client_a, AUDIO_STREAM_ID_A, &source_a)
+        .await
+        .expect("start_audio_sharing (first) failed");
+
+    let mut auto_watch_alive = false;
+    for _ in 0..80 {
+        viewer.drain_events(&ctx);
+        if viewer.rooms[&room_handle]
+            .audio_watches
+            .lock()
+            .unwrap()
+            .get(&(owner, AUDIO_STREAM_ID_A))
+            .is_some_and(|w| w.decoder.is_alive())
+        {
+            auto_watch_alive = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(auto_watch_alive, "the viewer never auto-subscribed the sharer's first audio stream");
+    eprintln!("[volume-persists] step 2 OK: first audio stream ({AUDIO_STREAM_ID_A}) auto-subscribed");
+
+    // --- Step 3: the viewer sets a non-default volume. This is exactly
+    // what both real call sites (Tauri's `commands::set_volume` and egui's
+    // inline slider in `ui.rs`) do: update the live `AudioWatch` AND record
+    // the owner-scoped standing preference. ---
+    {
+        let room = viewer.rooms.get_mut(&room_handle).unwrap();
+        {
+            let mut audio_watches = room.audio_watches.lock().unwrap();
+            let watch = audio_watches.get_mut(&(owner, AUDIO_STREAM_ID_A)).expect("first audio watch vanished");
+            watch.volume_percent = CHOSEN_VOLUME;
+            watch.decoder.set_volume(CHOSEN_VOLUME as f64 / 100.0);
+        }
+        room.audio_volume_by_owner.insert(owner, CHOSEN_VOLUME);
+    }
+    assert_eq!(
+        viewer.rooms[&room_handle].audio_watches.lock().unwrap()[&(owner, AUDIO_STREAM_ID_A)].volume_percent,
+        CHOSEN_VOLUME,
+        "setting the volume did not take effect on the live AudioWatch"
+    );
+    eprintln!("[volume-persists] step 3 OK: viewer set volume to {CHOSEN_VOLUME}%");
+
+    // --- Step 4: the sharer restarts/switches their audio source — stop
+    // the first share, start a second one under a DIFFERENT stream_id
+    // (exactly what a real restart/switch does: `next_stream_id` hands out
+    // a fresh id every time). ---
+    audio_handle_a.stop().await.expect("stopping the first audio share failed");
+    let _ = silent_audio_app_a.kill();
+    let _ = silent_audio_app_a.wait();
+
+    let mut old_torn_down = false;
+    for _ in 0..80 {
+        viewer.drain_events(&ctx);
+        if !viewer.rooms[&room_handle].audio_watches.lock().unwrap().contains_key(&(owner, AUDIO_STREAM_ID_A)) {
+            old_torn_down = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(old_torn_down, "the old audio watch never got torn down after the sharer stopped its audio stream");
+    eprintln!("[volume-persists] step 4a OK: old audio watch ({AUDIO_STREAM_ID_A}) torn down");
+
+    let mut silent_audio_app_b = Command::new("gst-launch-1.0")
+        .args(["audiotestsrc", "volume=0.02", "!", "audioconvert", "!", "pipewiresink", &format!("client-name={PW_CLIENT_NAME_B}")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to spawn the second synthetic audio-producing app");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let sources = crate::audio::list_audio_sources().expect("list_audio_sources (second) failed against a live pw-dump");
+    let source_b = sources
+        .iter()
+        .find(|s| s.name.contains(PW_CLIENT_NAME_B))
+        .cloned()
+        .expect("did not find the second synthetic test app among live audio sources");
+    let audio_handle_b = crate::audio::start_audio_sharing(&client_a, AUDIO_STREAM_ID_B, &source_b)
+        .await
+        .expect("start_audio_sharing (second) failed");
+
+    // --- Step 5: the NEW audio watch must come up already at the viewer's
+    // chosen volume, not reset to 100. This is the exact regression. ---
+    let mut new_watch_volume: Option<u32> = None;
+    for _ in 0..80 {
+        viewer.drain_events(&ctx);
+        if let Some(w) = viewer.rooms[&room_handle].audio_watches.lock().unwrap().get(&(owner, AUDIO_STREAM_ID_B)) {
+            new_watch_volume = Some(w.volume_percent);
+            if w.decoder.is_alive() {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        new_watch_volume,
+        Some(CHOSEN_VOLUME),
+        "the viewer's volume reset to {new_watch_volume:?} after the sharer restarted/switched audio — \
+         expected it to stay at {CHOSEN_VOLUME}% (this is the exact bug `audio_volume_by_owner` exists to fix)"
+    );
+    eprintln!(
+        "[volume-persists] step 5 OK: new audio stream ({AUDIO_STREAM_ID_B}) came up at {CHOSEN_VOLUME}%, not reset to 100"
+    );
+
+    let _ = audio_handle_b.stop().await;
+    let _ = video_handle.stop().await;
+    let _ = silent_audio_app_b.kill();
+    let _ = silent_audio_app_b.wait();
+    eprintln!("[volume-persists] PASS");
+}
+
 /// Regression test for the 2026-07-28 "Go live" bugs — see
 /// `superdoc/features/stream-control.md`'s dated note.
 ///
