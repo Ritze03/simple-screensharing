@@ -736,7 +736,18 @@
         });
         item.dataset.optionValue = String(o.value);
         if (opts.withMeter) {
-          const meter = el("div", { className: "dd-option-meter", attrs: { "aria-hidden": "true" } });
+          // Starts in the `dd-option-meter-loading` state (a CSS pulse, see
+          // dropdown.css) rather than the dim rest state: a level tap takes
+          // a real GStreamer pipeline a moment to spin up
+          // (`start_audio_level_tap`/`poll_audio_level_tap`, wired in
+          // `audioSourcePickerCore`), and a bar that just sits dim during
+          // that gap reads as "this app makes no sound" rather than "still
+          // finding out" — the owner asked for a loading/indeterminate
+          // animation to fill that gap. `setOptionLevel` below clears this
+          // class the instant the first real reading lands for this option,
+          // handing off to `paintDdOptionMeter`'s normal level-driven
+          // painting.
+          const meter = el("div", { className: "dd-option-meter dd-option-meter-loading", attrs: { "aria-hidden": "true" } });
           for (let i = 0; i < DD_OPTION_METER_BARS; i++) meter.appendChild(el("span", { className: "dd-option-meter-bar" }));
           item.appendChild(meter);
         }
@@ -860,7 +871,11 @@
       const item = list.querySelector(`.dd-option[data-option-value="${CSS.escape(String(value))}"]`);
       if (!item) return;
       const meter = item.querySelector(".dd-option-meter");
-      if (meter) paintDdOptionMeter(meter, fraction);
+      if (!meter) return;
+      // First real reading for this option: hand off from the loading pulse
+      // to normal level-driven painting.
+      meter.classList.remove("dd-option-meter-loading");
+      paintDdOptionMeter(meter, fraction);
     };
     root.focus = function () {
       trigger.focus();
