@@ -894,7 +894,10 @@
   // -------------------------------------------------------------------
 
   /**
-   * @param {{value: string, label: string}[]} options
+   * @param {{value: string, label: string, title?: string}[]} options - `title`
+   *   is optional per-option tooltip text (native `title` attribute); omit it
+   *   and the button gets no tooltip at all, so existing callers that don't
+   *   pass it are unaffected.
    * @param {string} value - currently selected option's `value`
    * @param {(value: string) => void} onChange
    */
@@ -906,6 +909,7 @@
           className: "mode-toggle-btn" + (opt.value === value ? " mode-toggle-btn-active" : ""),
           text: opt.label,
           onClick: () => onChange(opt.value),
+          attrs: opt.title ? { title: opt.title } : {},
         })
       );
     });
@@ -981,6 +985,7 @@
     {
       value: "low_latency",
       label: "Low-Latency",
+      title: "Fastest encode, prioritizes reduced delay over compression efficiency.",
       tune: "low_latency",
       qualityLevel: "performance",
       rateControl: "cqp",
@@ -989,6 +994,7 @@
     {
       value: "balanced",
       label: "Balanced",
+      title: "The default — a good mix of latency and quality.",
       tune: "best_quality",
       qualityLevel: "balanced",
       rateControl: "qvbr",
@@ -997,6 +1003,7 @@
     {
       value: "quality",
       label: "Quality",
+      title: "Maximizes visual quality within the bandwidth ceiling.",
       tune: "best_quality",
       qualityLevel: "quality",
       rateControl: "qvbr",
@@ -1005,6 +1012,7 @@
     {
       value: "gaming",
       label: "Gaming",
+      title: "Tuned for fast-motion/gaming content — shorter keyframe interval for quicker recovery from motion artifacts.",
       tune: "low_latency",
       qualityLevel: "performance",
       rateControl: "cqp",
@@ -1361,7 +1369,7 @@
       const presetRow = el("div", { className: "dest-edit-row" });
       presetRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Preset" }));
       const presetToggle = pillSwitch(
-        PRESETS.map((p) => ({ value: p.value, label: p.label })),
+        PRESETS.map((p) => ({ value: p.value, label: p.label, title: p.title })),
         activePreset ? activePreset.value : null,
         (value) => {
           const preset = PRESETS.find((p) => p.value === value);
@@ -1476,8 +1484,8 @@
       tuneRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Tune" }));
       const tuneToggle = pillSwitch(
         [
-          { value: "low_latency", label: "Low Latency" },
-          { value: "best_quality", label: "Best Quality" },
+          { value: "low_latency", label: "Low Latency", title: "Reduces encode delay for real-time responsiveness." },
+          { value: "best_quality", label: "Best Quality", title: "The default — trades a little latency for meaningfully better compression." },
         ],
         editState.tune,
         (value) => applyTuning({ tune: value })
@@ -1499,9 +1507,9 @@
       qualityRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Quality Level" }));
       const qualityToggle = pillSwitch(
         [
-          { value: "performance", label: "Performance" },
-          { value: "balanced", label: "Balanced" },
-          { value: "quality", label: "Quality" },
+          { value: "performance", label: "Performance", title: "Fastest encode speed, more compression artifacts." },
+          { value: "balanced", label: "Balanced", title: "The default — the midpoint between speed and compression efficiency." },
+          { value: "quality", label: "Quality", title: "Slowest encode speed, best compression efficiency for a given bitrate." },
         ],
         editState.qualityLevel,
         (value) => applyTuning({ qualityLevel: value })
@@ -1522,8 +1530,8 @@
       rateControlRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Rate Control" }));
       const rateControlToggle = pillSwitch(
         [
-          { value: "cqp", label: "Efficient" },
-          { value: "qvbr", label: "Max Quality" },
+          { value: "cqp", label: "Efficient", title: "Conservative, predictable bandwidth use — doesn't necessarily use all of the available bandwidth ceiling." },
+          { value: "qvbr", label: "Max Quality", title: "The default — spends available bandwidth up to the configured ceiling for the best achievable quality." },
         ],
         editState.rateControl,
         (value) => applyTuning({ rateControl: value })
