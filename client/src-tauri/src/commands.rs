@@ -86,6 +86,22 @@ pub fn join_room(managed: State<'_, Managed>, join_string: String, display_name:
     tauri::async_runtime::block_on(async { join_room_impl(&mut managed.state.lock().unwrap(), join_string, display_name, room_name) })
 }
 
+pub fn cancel_connect_impl(state: &mut AppState) {
+    state.cancel_connect();
+}
+
+/// Cancel the in-flight connect attempt — the right-click menu's "Disconnect"
+/// while a room row shows "Reconnecting…" (either the 15s timeout hasn't
+/// fired yet, or the user doesn't want to wait for it). Unlike `join_room` et
+/// al, this needs no `block_on`: `AppState::cancel_connect` only calls
+/// `AbortHandle::abort()` (a plain flag flip, not a `tokio::spawn`) and never
+/// touches the reactor itself — see `join_room`'s `Why:` note above for the
+/// class of bug that guard exists for; this command doesn't belong to it.
+#[tauri::command]
+pub fn cancel_connect(managed: State<'_, Managed>) {
+    cancel_connect_impl(&mut managed.state.lock().unwrap());
+}
+
 /// "Create a room": per the server's `Registry::get_or_create_room` (spec
 /// §10), there is no separate create verb on the wire — a room is
 /// auto-created the instant anyone joins a room-id that doesn't exist yet.

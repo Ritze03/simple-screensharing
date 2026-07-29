@@ -102,6 +102,7 @@ errors.share_start_task_ended: "Die Aufgabe zum Starten der Freigabe wurde unerw
 errors.share_stop_task_ended: "Die Aufgabe zum Beenden der Freigabe wurde unerwartet beendet"
 errors.audio_sources_task_ended: "Die Aufgabe zum Abrufen der Audioquellen wurde unerwartet beendet"
 errors.connect_task_ended: "Die Verbindungsaufgabe wurde unerwartet beendet"
+errors.connect_timed_out: "Zeitüberschreitung beim Verbinden nach 15s"
 errors.disconnected: "Verbindung getrennt: %{reason}"
 
 share.destination_line: "%{room} — %{state}"

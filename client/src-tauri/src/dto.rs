@@ -499,6 +499,27 @@ pub fn saved_room_rows(state: &AppState) -> Vec<SavedRoomRow> {
             });
         }
     }
+    // A first-time join with no typed room name never got upserted into
+    // `room_store` before connecting (`join_room_impl` only pre-seeds a name
+    // when the caller passed a non-empty one) — without this, such a connect
+    // has no row at all to show "Reconnecting…" on, and therefore nothing to
+    // right-click Disconnect on. Synthesize one from `pending_connect`
+    // itself, same id-derived-name fallback `poll_connect_result` uses on
+    // success, purely for display: this never touches `room_store`, so it
+    // stays gone the instant the connect resolves either way (nothing to
+    // clean up).
+    if let Some(pending) = &state.pending_connect {
+        if state.room_store.name_for(&pending.join_string).is_none() {
+            rows.push(SavedRoomRow {
+                name: session::room_label(&state.room_store, &pending.join_string),
+                join_string: pending.join_string.clone(),
+                state: RoomRowState::Reconnecting,
+                room_handle: None,
+                active_stream_count: 0,
+                auto_connect: false,
+            });
+        }
+    }
     rows
 }
 

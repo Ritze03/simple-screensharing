@@ -65,3 +65,10 @@ indexmap = "2"
 # which is what was actually breaking `cargo build` there.
 [target.'cfg(unix)'.dependencies]
 ashpd = { version = "0.13.13", features = ["screencast"] }
+
+# `test-util` (paused/advanceable virtual time) lets `session.rs`'s connect
+# timeout test simulate the 15s-class wait without a real 15s sleep — see
+# that test's doc comment. Dev-only: this feature must never end up in the
+# release binary (it changes `tokio::time`'s runtime behavior process-wide).
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["test-util"] }

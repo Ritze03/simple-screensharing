@@ -102,6 +102,7 @@ errors.share_start_task_ended: "share-start task ended unexpectedly"
 errors.share_stop_task_ended: "share-stop task ended unexpectedly"
 errors.audio_sources_task_ended: "audio source listing task ended unexpectedly"
 errors.connect_task_ended: "connection task ended unexpectedly"
+errors.connect_timed_out: "connect timed out after 15s"
 errors.disconnected: "disconnected: %{reason}"
 
 share.destination_line: "%{room} — %{state}"

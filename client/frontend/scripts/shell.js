@@ -1051,24 +1051,34 @@
     //    going back to the sidebar row's own delete icon.
     // Both buttons are always present (per the design ask), but each is
     // disabled outside the one state it's actually valid for: "Disconnect"
-    // needs a live connection to drop (joined only — there's no
-    // `force_leave_room`-equivalent for a room you're not in), and "Delete
-    // room" needs `room.room_handle == null` for `forget_room` to apply
-    // (disconnected only — mirrors the sidebar row's own action slot, which
-    // likewise shows exactly one live action per state and none while
-    // reconnecting, nothing safe to act on mid-connect). Disabling rather
+    // needs either a live connection to drop (joined) or an in-flight
+    // connect to cancel (reconnecting — see below), and "Delete room" needs
+    // `room.room_handle == null` for `forget_room` to apply (disconnected
+    // only — mirrors the sidebar row's own action slot). Disabling rather
     // than hiding keeps both discoverable in one place instead of the
     // footer's shape shifting per room state.
+    //
+    // `Why:` (2026-07-29) "reconnecting" used to disable Disconnect
+    // entirely — there was no way to cancel an in-flight connect attempt.
+    // Now that `cancel_connect` exists (aborts the pending connect task
+    // outright, see `session::AppState::cancel_connect`), Disconnect is
+    // enabled for that state too, but takes a different branch: there's no
+    // live connection/destinations/watches to lose, so the "are you sure"
+    // confirm dialog (`openLeaveConfirm`) doesn't apply — cancel directly.
     const footer = el("div", { className: "room-panel-footer" });
     footer.appendChild(
       dangerButton(
         "Disconnect",
         () => {
+          if (room.state === "reconnecting") {
+            cancelConnect(room.join_string);
+            return;
+          }
           const joinString = room.join_string;
           closeRoomPanel();
           openLeaveConfirm(joinString);
         },
-        { className: "room-panel-leave-btn", disabled: room.state !== "joined" }
+        { className: "room-panel-leave-btn", disabled: room.state !== "joined" && room.state !== "reconnecting" }
       )
     );
     footer.appendChild(
@@ -1083,6 +1093,25 @@
       )
     );
     panel.appendChild(footer);
+  }
+
+  /** Cancels an in-flight connect attempt (`commands::cancel_connect`) —
+   * the room-detail panel's Disconnect button while `room.state ===
+   * "reconnecting"`. Closes the panel immediately rather than waiting for a
+   * round trip: `cancel_connect` never fails (no-op if nothing is pending),
+   * and `refreshRooms` (driven by the sidebar's existing poll) picks up the
+   * row flipping to "disconnected" the same way any other state change does.
+   */
+  async function cancelConnect(joinString) {
+    closeRoomPanel();
+    if (window.__TAURI__) {
+      await window.__TAURI__.core.invoke("cancel_connect");
+      await refreshRooms();
+      return;
+    }
+    const room = mockRooms.find((r) => r.join_string === joinString);
+    if (room) room.state = "disconnected";
+    renderRooms();
   }
 
   async function renamePanelRoom(joinString, newName) {
