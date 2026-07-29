@@ -882,6 +882,15 @@
     // watching, top-right) and the audio mute/volume control (bottom-left)
     // — controls a viewer reaches for occasionally, not stats they want to
     // glance at constantly.
+    //
+    // The dark vignette gradient itself is a separate sibling element
+    // (`.media-tile-vignette`), appended before this one, so it can sit
+    // BELOW `.media-tile-statbar` in z-order while this overlay's buttons/
+    // slider stay above it — see view.css's comments on both rules for why
+    // one element/z-index couldn't serve both needs. Both fade together via
+    // the same `.media-tile:hover`/`:focus-within` CSS selectors so they
+    // still read as one overlay to the viewer.
+    const vignette = el("div", { className: "media-tile-vignette" });
     const overlay = el("div", { className: "media-tile-overlay" });
 
     const top = el("div", { className: "media-tile-overlay-top" });
@@ -993,6 +1002,7 @@
 
     overlay.appendChild(bottom);
 
+    wrap.appendChild(vignette);
     wrap.appendChild(overlay);
 
     return wrap;
