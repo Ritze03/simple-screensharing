@@ -607,11 +607,20 @@
    * UI, it's a row inside the share it belongs to, and the backend records
    * the pairing so the frontend knows which card to put it in (see
    * `session::LocalCapture::audio_for_capture`).
+   *
+   * `forCaptureId` is mandatory now, not optional: the backend rejects a
+   * `for_capture_id` naming a capture that isn't live yet (zero destinations
+   * — see `session::AppState::start_audio_share`'s doc comment for the hard
+   * "no audio-only streams" invariant), so this can only ever be called for
+   * a live card's `+ Add audio` — a staged card's is rendered disabled
+   * instead (`addAudioUnavailableRow` in components.js), never wired to this
+   * function at all. The `await` below can therefore reject; callers don't
+   * currently need to handle that beyond not calling this while staged.
    */
   async function startAudioShare(roomHandle, source, forCaptureId) {
     if (window.__TAURI__) {
       await window.__TAURI__.core.invoke("select_audio_source", { id: source.id, name: source.name });
-      await window.__TAURI__.core.invoke("start_audio_share", { roomHandle, forCaptureId: forCaptureId ?? null });
+      await window.__TAURI__.core.invoke("start_audio_share", { roomHandle, forCaptureId });
       return;
     }
     const room = mockJoinedRooms.find((r) => r.id === roomHandle);
@@ -988,12 +997,18 @@
       seenStagedIds.add(staged.capture_id);
       const edit = getStagedEdit(staged);
       // Same pairing lookup `orderedCardEls` below uses for live cards
-      // (matched on `paired_capture_id`) — a staged capture can already have
-      // audio attached to it (see `onAddAudio` below), so its card needs to
-      // find that row the same way a live card's does. No room match here:
-      // unlike a live card (which can fan the same capture into several
-      // rooms), a staged capture has exactly one room — whichever the Room
-      // picker currently holds — so `paired_capture_id` alone is unambiguous.
+      // (matched on `paired_capture_id`). In normal operation this never
+      // matches for a staged capture any more — the backend refuses to
+      // start audio against one (see `session::AppState::start_audio_
+      // share`'s doc comment), and the staged card's own audio row renders
+      // disabled (`onAddAudio` below is unreachable from it now — see
+      // `components.js`'s `addAudioUnavailableRow`) — but the lookup stays
+      // defensive, same shape as the live-card path, in case an audio
+      // capture from before this fix (or a future caller) is somehow still
+      // paired to a staged one. No room match needed here: unlike a live
+      // card (which can fan the same capture into several rooms), a staged
+      // capture has exactly one room — whichever the Room picker currently
+      // holds — so `paired_capture_id` alone is unambiguous.
       const audio = mockDestinations.find((d) => d.kind === "audio" && d.paired_capture_id === staged.capture_id) || null;
       const sig = JSON.stringify({
         staged,

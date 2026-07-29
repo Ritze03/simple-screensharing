@@ -936,11 +936,14 @@
    *   pre-"Go live" card instead of a normal live one: `dest` is a
    *   `StagedCaptureRow`-shaped object ({ capture_id, state: 'starting'|
    *   'ready', width, height, framerate, bitrate_kbps } — no destination_id/
-   *   room_handle yet), no room/fan-out/transfer/audio affordances are shown,
-   *   the edit grid gains a Room picker (reads/writes `stagedRoomHandle` via
+   *   room_handle yet), no room/fan-out/transfer affordances are shown, the
+   *   edit grid gains a Room picker (reads/writes `stagedRoomHandle` via
    *   `handlers.onStagedRoomChange(captureId, roomHandle)`), and the actions
    *   row is "Go live"/"Cancel" (`handlers.onGoLive(captureId)`/
-   *   `handlers.onCancel(captureId)`) instead of Transfer/Stop. See
+   *   `handlers.onCancel(captureId)`) instead of Transfer/Stop. The audio
+   *   row *is* still shown, but non-interactive — see `addAudioRow`'s "Why
+   *   this is disabled while staged" doc note below for why a staged card
+   *   can no longer offer a working "+ Add audio". See
    *   `superdoc/features/stream-control.md`'s 2026-07-28 note.
    *
    *   `editState` is this destination's local edit buffer for everything
@@ -1466,24 +1469,28 @@
     // Video-only: an audio destination never renders a card, so it never
     // reaches this branch (see `stream-control.js`'s `updateActiveSharesCard`).
     //
-    // `Why this also renders while staged (it didn't at first):` the
-    // original reasoning was "audio attaches to a *room*, and a staged card
-    // doesn't have one until Go live picks it" — false. A staged card's Room
-    // picker (`onStagedRoomChange`, right above) already resolves a real
-    // room_handle before Go live is ever pressed (`stream-control.js`'s
-    // `getStagedEdit().roomHandle`, defaulted to the first joined room) —
-    // it's the exact value "Go live" itself sends. Hiding the row here made
-    // "+ Add audio" vanish the instant "Share Screen" landed on a staged
-    // card instead of a live one (this session's "Go live" staging redesign
-    // introduced that gap), which is what the project owner reported as
-    // "Streaming Audio doesn't work anymore" — the affordance wasn't broken,
-    // it was just unreachable until Go live. `stream-control.js`'s staged
-    // card wiring now passes its own `onAddAudio` (using the staged room
-    // picker's value) and its own paired-audio lookup, same shape as the
-    // live-card path just above.
+    // `Why the row still renders while staged, but disabled:` this used to
+    // be a fully working "+ Add audio" here too (a staged card's Room picker
+    // already resolves a real room_handle before Go live is ever pressed, so
+    // there was never a *technical* reason it couldn't attach audio early).
+    // That turned out to violate a hard backend invariant instead: a staged
+    // capture is a real GStreamer pipeline with **zero destinations** —
+    // nothing announced to any room yet (see `session::AppState::
+    // stage_video_share`'s doc comment) — so audio attached to it announced
+    // a live, video-less "orphan" stream immediately, visible forever in the
+    // room panel's stream list with no video to actually pair with. The
+    // backend now refuses this (`AppState::start_audio_share` errors unless
+    // the paired capture already has a destination), so this row is disabled
+    // rather than removed: hiding it entirely reintroduces the exact "+ Add
+    // audio vanished on a staged card" regression the project owner reported
+    // before (see the git history for this comment), whereas a disabled row
+    // with a clear reason still tells the user where the affordance went and
+    // when it comes back.
     if (dest.kind !== "audio") {
       body.appendChild(el("div", { className: "dest-divider" }));
-      body.appendChild(opts.audio ? audioAttachedRow(opts.audio, handlers) : addAudioRow(dest, handlers, opts));
+      body.appendChild(
+        opts.audio ? audioAttachedRow(opts.audio, handlers) : opts.staged ? addAudioUnavailableRow() : addAudioRow(dest, handlers, opts)
+      );
     }
 
     wrap.appendChild(body);
@@ -1650,6 +1657,31 @@
     row.appendChild(el("span", { className: "dest-audio-empty-text", text: "No audio attached" }));
     row.appendChild(addBtn);
     row.appendChild(picker);
+    return row;
+  }
+
+  /**
+   * The staged card's non-interactive stand-in for `addAudioRow` — same
+   * icon/text shape, but the "+ Add audio" affordance is replaced with a
+   * plain disabled-looking hint instead of a button, and there is no picker
+   * to expand into. See `destinationCard`'s "Why the row still renders while
+   * staged, but disabled" doc note just above its call site for why: a
+   * staged capture has zero destinations (nothing announced to any room
+   * yet), so starting audio against it would create exactly the orphan,
+   * video-less "LIVE" stream the backend now refuses outright
+   * (`AppState::start_audio_share`).
+   */
+  function addAudioUnavailableRow() {
+    const row = el("div", { className: "dest-audio-row dest-audio-row-empty dest-audio-row-disabled" });
+    row.appendChild(icon("volume_off", "dest-audio-empty-icon"));
+    row.appendChild(el("span", { className: "dest-audio-empty-text", text: "No audio attached" }));
+    row.appendChild(
+      el("span", {
+        className: "dest-chip-add-btn dest-audio-add-btn dest-audio-add-btn-staged dest-audio-add-btn-disabled",
+        text: "+ Add audio (available once you Go Live)",
+        attrs: { "aria-disabled": "true" },
+      })
+    );
     return row;
   }
 

@@ -381,16 +381,19 @@ pub fn list_staged_captures(managed: State<'_, Managed>) -> Vec<dto::StagedCaptu
 /// `forCaptureId` is the screen share this audio is being attached to (the
 /// "Add audio" affordance lives on a share's own card now, not in a
 /// standalone SHARE AUDIO card), so the resulting audio destination can be
-/// rendered as a row inside that card. Omit it for a standalone audio share.
+/// rendered as a row inside that card. Mandatory, not `Option`: there is no
+/// standalone-audio mode any more (see `session::AppState::start_audio_
+/// share`'s doc comment for the "no audio-only streams, ever" invariant this
+/// enforces), and returns an error rather than silently no-opping if
+/// `for_capture_id` names a capture that isn't live yet — the frontend
+/// should keep this button disabled/hidden until then (see `stream-
+/// control.js`), but this is the backstop that makes it a hard rule instead
+/// of a UI convention.
 #[tauri::command]
-pub fn start_audio_share(managed: State<'_, Managed>, room_handle: u32, for_capture_id: Option<u32>) {
+pub fn start_audio_share(managed: State<'_, Managed>, room_handle: u32, for_capture_id: u32) -> Result<(), String> {
     tauri::async_runtime::block_on(async {
-        managed
-            .state
-            .lock()
-            .unwrap()
-            .start_audio_share(RoomHandle(room_handle), for_capture_id.map(CaptureSourceId))
-    });
+        managed.state.lock().unwrap().start_audio_share(RoomHandle(room_handle), CaptureSourceId(for_capture_id))
+    })
 }
 
 /// Mute/unmute a running audio share in place — the Mute/Unmute toggle on

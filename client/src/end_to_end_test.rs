@@ -2607,3 +2607,297 @@ async fn big_fps_jump_mid_stream_keeps_viewer_frames_flowing() {
 
     eprintln!("[e2e-fps-jump] PASS: viewer kept decoding frames across both big fps jumps");
 }
+
+/// Regression test for the "orphan audio-only stream" bug (2026-07-29 — see
+/// this task's dispatch notes / `superdoc/features/stream-control.md`):
+/// `AppState::start_audio_share` used to announce a live audio stream
+/// against **any** `for_capture` id that merely existed, without checking
+/// whether that capture was actually live (had a destination). Clicking
+/// "+ Add audio" on a staged (pre-"Go live") video card — a real capture
+/// with **zero** destinations, per `stage_video_share`'s doc comment — used
+/// to create exactly that: a video-less "LIVE" stream visible forever in
+/// the room panel with nothing to pair it to.
+///
+/// Needs no relay server, no real GStreamer pipeline, and no PipeWire — the
+/// rejection happens before any of that is touched (see `start_audio_share`'s
+/// "Why this checks liveness, not just existence" doc note), so unlike every
+/// other test in this module this one is cheap and NOT `#[ignore]`d.
+#[tokio::test]
+async fn start_audio_share_rejects_a_merely_staged_video_capture() {
+    let mut state = crate::session::AppState::default();
+
+    // A real `stage_video_share` call needs a real portal-backed capture
+    // pipeline; the only fact this test's gate actually depends on is "zero
+    // destinations", so a bare `LocalCapture` with an empty `destinations`
+    // map reproduces the exact shape `stage_video_share` leaves behind
+    // without needing one.
+    let capture_id = state.alloc_capture_id();
+    let (_tx, rx) = tokio::sync::oneshot::channel();
+    state.captures.insert(
+        capture_id,
+        crate::session::LocalCapture {
+            kind: crate::protocol::StreamKind::Video,
+            label: "Screen share".to_string(),
+            status: crate::session::ShareStatus::Starting(rx),
+            audio_for_capture: None,
+            destinations: indexmap::IndexMap::new(),
+            self_preview_texture: None,
+        },
+    );
+
+    state.selected_audio_source = Some(crate::audio::AudioSource { id: 0, name: "Test app".to_string() });
+    // `room_handle` never gets looked up: the gate must reject before that,
+    // so an id naming no real room at all is deliberate here, not sloppy —
+    // if this ever *didn't* error, the next line inside `start_audio_share`
+    // would be a room lookup against a handle that doesn't exist.
+    let bogus_room_handle = crate::session::RoomHandle(0);
+
+    let result = state.start_audio_share(bogus_room_handle, capture_id);
+    assert!(
+        result.is_err(),
+        "BUG REPRODUCED: start_audio_share must reject a for_capture that is only staged \
+         (zero destinations), not silently announce an orphan audio-only stream"
+    );
+    assert_eq!(
+        state.captures.len(),
+        1,
+        "the rejected call must not have created a new (audio) capture entry"
+    );
+    eprintln!("[audio-gate] PASS: start_audio_share({result:?}) rejected a staged for_capture");
+}
+
+/// Companion to the rejection test above: once the paired video capture is
+/// actually live (has at least one destination — the exact fact `go_live`/
+/// `add_destination_with_params` establish), `start_audio_share` must still
+/// work. Uses a real `videotestsrc`-backed capture (no interactive portal,
+/// no PipeWire) wired up with a manually-attached destination to reach
+/// "live" directly, the same construction `go_live_attaches_the_first_
+/// destination_with_real_resolution_and_backend` above uses for the
+/// "staged" half — this test just skips straight to the post-`go_live`
+/// shape instead of calling `go_live` itself, since that path is already
+/// covered by that other test.
+#[tokio::test]
+#[ignore = "spawns a real relay server child process and a real GStreamer capture pipeline; \
+            run explicitly with `cargo test end_to_end_test:: -- --ignored --nocapture`"]
+async fn start_audio_share_succeeds_once_the_video_capture_is_live() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    let port = pick_free_udp_port().expect("failed to pick a free UDP port for the test relay");
+    let _server = spawn_relay_server(port).expect("failed to spawn relay server child process");
+
+    let server_addr = format!("127.0.0.1:{port}");
+    let room_id: RoomId = rand::random();
+    let room_key: [u8; 32] = rand::random();
+    let join_string = crate::net::format_join_string(&server_addr, &room_id, &room_key);
+
+    let (client, snapshot, events) =
+        connect_with_retry(&join_string, "sharer").await.expect("sharer failed to connect to the relay after retries");
+
+    let source_fragment = "videotestsrc is-live=true pattern=smpte \
+         ! video/x-raw,width=640,height=480,framerate=30/1";
+    let capture_handle =
+        capture::start_capture_from_test_source(30, source_fragment).await.expect("start_capture_from_test_source failed");
+    let source = capture_handle.source_caps();
+
+    let mut state = crate::session::AppState::default();
+    let room_handle = state.insert_room(client, snapshot, events, join_string);
+
+    let video_capture_id = state.alloc_capture_id();
+    let destination_id = state.alloc_destination_id();
+    let params = VideoParams {
+        width: source.width,
+        height: source.height,
+        framerate: 30,
+        bitrate_kbps: 2000,
+        backend: capture::detect_encoder_backend(),
+        tune: capture::TuneMode::default(),
+        quality_level: capture::QualityLevel::default(),
+        rate_control: capture::RateControlMode::default(),
+    };
+    {
+        let room = state.rooms.get_mut(&room_handle).unwrap();
+        let stream_id = room.next_stream_id;
+        room.next_stream_id = room.next_stream_id.wrapping_add(1);
+        room.destinations.push(destination_id);
+        state.captures.insert(
+            video_capture_id,
+            crate::session::LocalCapture {
+                kind: crate::protocol::StreamKind::Video,
+                label: "Screen share".to_string(),
+                status: crate::session::ShareStatus::Active(crate::session::ShareHandle::Video(capture_handle)),
+                audio_for_capture: None,
+                destinations: indexmap::IndexMap::from([(
+                    destination_id,
+                    crate::session::Destination {
+                        room: room_handle,
+                        stream_id,
+                        params,
+                        runtime: None,
+                        pending: None,
+                        edit: crate::session::Destination::edit_from(params),
+                        apply_rx: None,
+                    },
+                )]),
+                self_preview_texture: None,
+            },
+        );
+    }
+    assert_eq!(state.captures[&video_capture_id].destinations.len(), 1, "test setup: video capture must be live");
+
+    state.selected_audio_source = Some(crate::audio::AudioSource { id: 0, name: "Test app".to_string() });
+    let result = state.start_audio_share(room_handle, video_capture_id);
+    assert!(result.is_ok(), "start_audio_share must succeed against a live for_capture, got {result:?}");
+
+    let audio_capture_id = state
+        .captures
+        .iter()
+        .find(|(id, c)| **id != video_capture_id && c.audio_for_capture == Some(video_capture_id))
+        .map(|(id, _)| *id)
+        .expect("start_audio_share must have created a new capture paired to the video one");
+    assert_eq!(
+        state.captures[&audio_capture_id].destinations.len(),
+        1,
+        "the paired audio capture must have been announced with exactly one destination"
+    );
+    eprintln!("[audio-gate] PASS: start_audio_share succeeded once the paired capture was live");
+
+    if let crate::session::ShareStatus::Active(crate::session::ShareHandle::Video(handle)) =
+        state.captures.shift_remove(&video_capture_id).unwrap().status
+    {
+        let _ = handle.stop().await;
+    }
+}
+
+/// Regression test for the "no teardown cascade" half of the same bug:
+/// stopping/cancelling a video capture must also stop any audio capture
+/// paired to it (`LocalCapture::audio_for_capture`), so cancelling a staged
+/// (or stopping a live) video share can never leave its audio share running
+/// orphaned. Stands two real `videotestsrc` captures in for "video" and
+/// "audio" — the cascade logic only ever looks at `audio_for_capture`
+/// linkage and `ShareStatus`, never `kind`, so a second video-kind test
+/// capture exercises the exact same code path a real audio capture would.
+#[tokio::test]
+#[ignore = "spawns a real relay server child process and two real GStreamer capture pipelines; \
+            run explicitly with `cargo test end_to_end_test:: -- --ignored --nocapture`"]
+async fn stop_share_tears_down_a_paired_audio_capture_too() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+    let port = pick_free_udp_port().expect("failed to pick a free UDP port for the test relay");
+    let _server = spawn_relay_server(port).expect("failed to spawn relay server child process");
+
+    let server_addr = format!("127.0.0.1:{port}");
+    let room_id: RoomId = rand::random();
+    let room_key: [u8; 32] = rand::random();
+    let join_string = crate::net::format_join_string(&server_addr, &room_id, &room_key);
+
+    let (client, snapshot, events) =
+        connect_with_retry(&join_string, "sharer").await.expect("sharer failed to connect to the relay after retries");
+
+    let source_fragment = "videotestsrc is-live=true pattern=smpte \
+         ! video/x-raw,width=640,height=480,framerate=30/1";
+    let video_handle =
+        capture::start_capture_from_test_source(30, source_fragment).await.expect("video start_capture_from_test_source failed");
+    let audio_stand_in_handle =
+        capture::start_capture_from_test_source(30, source_fragment).await.expect("audio-stand-in start_capture_from_test_source failed");
+
+    let mut state = crate::session::AppState::default();
+    let room_handle = state.insert_room(client, snapshot, events, join_string);
+
+    let make_destination = |state: &mut crate::session::AppState| -> (crate::session::DestinationId, crate::protocol::StreamId) {
+        let destination_id = state.alloc_destination_id();
+        let room = state.rooms.get_mut(&room_handle).unwrap();
+        let stream_id = room.next_stream_id;
+        room.next_stream_id = room.next_stream_id.wrapping_add(1);
+        room.destinations.push(destination_id);
+        (destination_id, stream_id)
+    };
+    let params = VideoParams {
+        width: 640,
+        height: 480,
+        framerate: 30,
+        bitrate_kbps: 2000,
+        backend: capture::detect_encoder_backend(),
+        tune: capture::TuneMode::default(),
+        quality_level: capture::QualityLevel::default(),
+        rate_control: capture::RateControlMode::default(),
+    };
+
+    let video_capture_id = state.alloc_capture_id();
+    let (video_dest_id, video_stream_id) = make_destination(&mut state);
+    state.captures.insert(
+        video_capture_id,
+        crate::session::LocalCapture {
+            kind: crate::protocol::StreamKind::Video,
+            label: "Screen share".to_string(),
+            status: crate::session::ShareStatus::Active(crate::session::ShareHandle::Video(video_handle)),
+            audio_for_capture: None,
+            destinations: indexmap::IndexMap::from([(
+                video_dest_id,
+                crate::session::Destination {
+                    room: room_handle,
+                    stream_id: video_stream_id,
+                    params,
+                    runtime: None,
+                    pending: None,
+                    edit: crate::session::Destination::edit_from(params),
+                    apply_rx: None,
+                },
+            )]),
+            self_preview_texture: None,
+        },
+    );
+
+    let audio_capture_id = state.alloc_capture_id();
+    let (audio_dest_id, audio_stream_id) = make_destination(&mut state);
+    state.captures.insert(
+        audio_capture_id,
+        crate::session::LocalCapture {
+            kind: crate::protocol::StreamKind::Audio,
+            label: "Test app".to_string(),
+            status: crate::session::ShareStatus::Active(crate::session::ShareHandle::Video(audio_stand_in_handle)),
+            audio_for_capture: Some(video_capture_id),
+            destinations: indexmap::IndexMap::from([(
+                audio_dest_id,
+                crate::session::Destination {
+                    room: room_handle,
+                    stream_id: audio_stream_id,
+                    params,
+                    runtime: None,
+                    pending: None,
+                    edit: crate::session::Destination::edit_from(params),
+                    apply_rx: None,
+                },
+            )]),
+            self_preview_texture: None,
+        },
+    );
+
+    eprintln!("[stop-cascade] calling stop_share on the VIDEO capture only");
+    state.stop_share(video_capture_id);
+
+    assert!(
+        matches!(state.captures[&video_capture_id].status, crate::session::ShareStatus::Stopping(_)),
+        "stop_share must have moved the video capture itself into Stopping"
+    );
+    assert!(
+        matches!(state.captures[&audio_capture_id].status, crate::session::ShareStatus::Stopping(_)),
+        "BUG REPRODUCED: stop_share on a video capture must cascade to any paired audio capture \
+         (LocalCapture::audio_for_capture) too, instead of leaving it Active/orphaned"
+    );
+
+    // Let both spawned `.stop()` tasks land, same poll-to-completion pattern
+    // `go_live_attaches_the_first_destination_with_real_resolution_and_backend`
+    // uses for its destination branch above.
+    let reaped = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            state.poll_capture_states();
+            if !state.captures.contains_key(&video_capture_id) && !state.captures.contains_key(&audio_capture_id) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    assert_eq!(reaped, Ok(true), "both the video capture and its cascaded-stop audio capture must eventually be reaped");
+    eprintln!("[stop-cascade] PASS: paired audio capture was torn down together with its video capture");
+}

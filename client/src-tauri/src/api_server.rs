@@ -464,17 +464,10 @@ fn get_u32(body: &Value, key: &str) -> Result<u32, ApiError> {
         .ok_or_else(|| ApiError::bad_request(format!("missing or invalid u32 field `{key}`")))
 }
 
-/// Optional `u32` field: absent (or `null`) is a legitimate value, not an
-/// error — unlike [`get_u32`], which is for required fields.
-fn opt_u32(body: &Value, key: &str) -> Option<u32> {
-    body.get(key).and_then(Value::as_u64).and_then(|v| u32::try_from(v).ok())
-}
-
-/// Optional `String` field, defaulting to `""` when absent — mirrors
-/// `opt_u32`'s "missing is legitimate" contract, for `join_room`'s new
-/// `room_name` param (an unset room name, same as an omitted one, means
-/// "leave the existing/id-derived naming alone" — see `join_room_impl`'s
-/// doc comment).
+/// Optional `String` field, defaulting to `""` when absent — for
+/// `join_room`'s `room_name` param (an unset room name, same as an omitted
+/// one, means "leave the existing/id-derived naming alone" — see
+/// `join_room_impl`'s doc comment).
 fn opt_string(body: &Value, key: &str) -> String {
     body.get(key).and_then(Value::as_str).unwrap_or("").to_string()
 }
@@ -549,7 +542,7 @@ fn dispatch(name: &str, body: &Value, app: &AppHandle) -> Result<Value, ApiError
         "go_live" => ok(commands::go_live(managed, get_u32(body, "capture_id")?, get_u32(body, "room_handle")?)),
         "list_staged_captures" => ok(commands::list_staged_captures(managed)),
         "start_audio_share" => {
-            ok(commands::start_audio_share(managed, get_u32(body, "room_handle")?, opt_u32(body, "for_capture_id")))
+            result(commands::start_audio_share(managed, get_u32(body, "room_handle")?, get_u32(body, "for_capture_id")?))
         }
         "set_audio_share_muted" => {
             ok(commands::set_audio_share_muted(managed, get_u32(body, "capture_id")?, get_bool(body, "muted")?))
