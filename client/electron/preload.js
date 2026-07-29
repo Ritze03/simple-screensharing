@@ -92,6 +92,14 @@ contextBridge.exposeInMainWorld("__ELECTRON__", {
   // command's per-stream-label reuse behavior).
   openPopout: (opts) => ipcRenderer.invoke("open-popout-window", opts),
 
+  // Closes the pop-out window for `streamKey` — called from the MAIN
+  // window (unlike `closeViewer`/`setFullscreen` below, which act on
+  // whichever pop-out window called them). Backs `view.js`'s held-slot
+  // "Bring it back" button: this window's own `closed` handler in
+  // `main.js` fires the existing `popout-closed` signal, so `view.js`'s
+  // `onPopoutClosed` listener does the cleanup, not the caller of this.
+  closePopout: (streamKey) => ipcRenderer.invoke("close-popout-window", streamKey),
+
   // Toggles real OS fullscreen on the pop-out window this was called from.
   setFullscreen: (fullscreen) => ipcRenderer.invoke("viewer-set-fullscreen", fullscreen),
 
