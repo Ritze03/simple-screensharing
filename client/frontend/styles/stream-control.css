@@ -594,19 +594,21 @@
   margin-top: 2px;
 }
 
+/* Was 3px 8px / 11px, distinct from (and smaller than) the staged card's
+   Go-live/Cancel — the idea being Transfer/Stop on a live card were
+   "routine" small buttons vs. staged's one deliberate confirming action.
+   2026-07-29: owner asked for live cards' Stop (and by the same class,
+   Transfer) to grow too — screenshot showed them still too small next to
+   everything else. Since `.dest-action-btn` is used at exactly these 4
+   call sites (staged Go-live/Cancel, live Transfer/Stop — see
+   `dest-action-btn` grep in components.js) and the owner now wants ALL of
+   them at the same size, there's no live-only "routine small" tier left to
+   preserve — bumped the base rule itself to the size that used to be the
+   `.dest-actions-staged` modifier and dropped that now-redundant modifier
+   rule rather than adding a parallel `-live` one. */
 .dest-action-btn {
-  padding: 3px 8px;
-  height: auto;
-  font-size: 11px;
-}
-
-/* Staged card's "Go live"/"Cancel" are this card's one confirming action,
-   not a routine small button like Transfer/Stop on a live card — bump them
-   well past both `.dest-action-btn` above and the app's default `.btn`
-   (7px 14px / 12px, shell.css) so the size difference reads as deliberate,
-   not marginal. */
-.dest-actions-staged .dest-action-btn {
   padding: 6px 22px;
+  height: auto;
   font-size: 14px;
   font-weight: 700;
 }
@@ -801,16 +803,19 @@
 }
 
 /* On a staged card, "+ Add audio" sits next to (well, above — it's the
-   card's only other row) "Go live"/"Cancel", which are already bumped to
-   32px tall (`.dest-actions-staged .dest-action-btn` above) because they're
-   the card's one deliberate confirming action, not a routine small button.
-   A staged card has no live-card norm to defer to, so match that same
-   32px rather than the small `.dest-chip-add-btn` sizing a live card's row
-   uses. Padding chosen to land on 32px measured live (`getBoundingClientRect`
+   card's only other row) "Go live"/"Cancel", which are 32px tall
+   (`.dest-action-btn` above) because they're the card's one deliberate
+   confirming action, not a routine small button. Match that same 32px
+   rather than the small `.dest-chip-add-btn` sizing a live card's row uses.
+   Padding chosen to land on 32px measured live (`getBoundingClientRect`
    height), not assumed from the numbers alone — font-size changes
    line-height in ways padding math alone doesn't predict (see this
-   session's `.dest-actions-staged .dest-action-btn` note above, learned the
-   same way). */
+   session's `.dest-action-btn` note above, learned the same way).
+   2026-07-29: `.dest-action-btn`/`.dest-audio-share-btn` grew to this same
+   32px on LIVE cards too (Stop/Share), but this "+ Add audio" *button*
+   (the dashed affordance, not the Share confirm) stays live-card-small —
+   the owner only asked to grow Stop/Share this round; left this one alone
+   per the same judgment call, see stream-control.md changelog. */
 .dest-audio-add-btn-staged {
   padding: 6px 14px 6px 12px;
   font-size: 14px;
@@ -845,19 +850,16 @@
   max-width: 420px;
 }
 
+/* Was 3px 8px / 11px, with a bigger `-staged` modifier layered on for staged
+   cards (see `.dest-action-btn`'s note above for the parallel history).
+   2026-07-29: owner asked for live cards' "Share" (audio picker confirm) to
+   grow to match Stop, which just got the same treatment — this class is
+   only ever used for the Share button (staged and live both), so, same
+   reasoning as `.dest-action-btn`, the base rule absorbs the old modifier's
+   size and the modifier is dropped as redundant. */
 .dest-audio-share-btn {
-  padding: 3px 8px;
-  height: auto;
-  font-size: 11px;
-}
-
-/* Staged cards get a bigger "Share" button — same rationale as
-   `.dest-audio-add-btn-staged` right above and `.dest-actions-staged
-   .dest-action-btn` (Go live/Cancel): this picker's confirm action is a
-   staged card's other deliberate-sized affordance, not routine small-button
-   territory. */
-.dest-audio-share-btn-staged {
   padding: 6px 22px;
+  height: auto;
   font-size: 14px;
   font-weight: 700;
 }
