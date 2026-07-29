@@ -1489,7 +1489,11 @@
     if (dest.kind !== "audio") {
       body.appendChild(el("div", { className: "dest-divider" }));
       body.appendChild(
-        opts.audio ? audioAttachedRow(opts.audio, handlers) : opts.staged ? addAudioUnavailableRow() : addAudioRow(dest, handlers, opts)
+        opts.audio
+          ? audioAttachedRow(dest, opts.audio, handlers, opts)
+          : opts.staged
+          ? addAudioUnavailableRow()
+          : addAudioRow(dest, handlers, opts)
       );
     }
 
@@ -1497,17 +1501,121 @@
     return wrap;
   }
 
+  /** How many bars the attached-audio VU meter draws. */
+  const AUDIO_METER_BARS = 5;
+
+  /** How often the source picker re-lists which applications are currently
+   * producing audio — shared by both the not-yet-attached "+ Add audio"
+   * picker and the always-visible attached-row picker below (see
+   * `audioSourcePickerCore`'s doc comment for why either needs to keep
+   * polling at all). */
+  const AUDIO_SOURCE_POLL_MS = 5000;
+
   /**
-   * The attached-audio line: `[meter] [app name] [Mute/Unmute] [Stop]`.
+   * Shared guts of the audio-source `<select>` used by both `addAudioRow`
+   * (not-yet-attached) and `audioAttachedRow`'s always-visible "Switch"
+   * picker: the dropdown itself, plus the periodic `list_audio_sources`
+   * re-poll that keeps it current while it's on screen (an application can
+   * start producing audio well after the picker was built — and for the
+   * attached row, the picker is on screen for the entire life of the share,
+   * not just a briefly-opened popover, so it needs this even more).
    *
+   * Callers own when polling starts/stops (`startPolling`/`stopPolling`) and
+   * supply their own "is this picker still meant to be live" check, since
+   * the two call sites differ (a hideable popover vs. an always-mounted
+   * row) — same self-stopping `isConnected`-style pattern as the rest of
+   * this file's out-of-band tickers (no uniform unmount hook exists here to
+   * call a `.destroy()` from instead).
+   *
+   * @param {object} handlers - { onRefreshAudioSources() }
+   * @param {object} opts - { audioSources: [{id,name}] }
+   */
+  function audioSourcePickerCore(handlers, opts) {
+    let sources = opts.audioSources || [];
+    const optionsFor = () =>
+      sources.length === 0 ? [{ value: "", label: "No application is playing audio" }] : sources.map((s) => ({ value: s.id, label: s.name }));
+    const select = dropdown(optionsFor(), sources.length ? sources[0].id : "", null, { className: "dest-room-select dest-audio-select" });
+    const rebuildOptions = () => select.setOptions(optionsFor());
+
+    let pollId = null;
+    function stopPolling() {
+      if (pollId !== null) {
+        clearInterval(pollId);
+        pollId = null;
+      }
+    }
+    function startPolling(isActive) {
+      if (pollId !== null || !handlers.onRefreshAudioSources) return;
+      pollId = setInterval(async () => {
+        if (!isActive()) {
+          stopPolling();
+          return;
+        }
+        const fresh = await handlers.onRefreshAudioSources();
+        if (!isActive()) {
+          // The picker could have closed (or the whole card been rebuilt
+          // out from under it) while the await above was in flight.
+          stopPolling();
+          return;
+        }
+        if (Array.isArray(fresh)) {
+          sources = fresh;
+          const previousValue = select.value;
+          rebuildOptions();
+          if (sources.some((s) => String(s.id) === previousValue)) select.value = previousValue;
+        }
+      }, AUDIO_SOURCE_POLL_MS);
+    }
+
+    return {
+      select,
+      getSources: () => sources,
+      setSources: (s) => {
+        sources = s;
+      },
+      rebuildOptions,
+      startPolling,
+      stopPolling,
+    };
+  }
+
+  /**
+   * The attached-audio line: `[meter] [app name] [Mute/Unmute] [Stop]`,
+   * followed by an always-visible source picker + "Switch" — unlike the
+   * not-yet-attached picker, this one never unmounts once a share is live,
+   * so the user can change source without a separate Stop-then-"+ Add
+   * audio" round trip (2026-07-29, owner asked for on-the-fly source
+   * switching — a follow-up piece adding level meters to each dropdown
+   * entry is a separate task layered on top of this one, not built here).
+   *
+   * `Why "Switch" instead of auto-switching on select:` picking a source in
+   * the dropdown is cheap to undo (just don't press Switch); a real
+   * stop+restart of the capture firing on every dropdown click would not
+   * be.
+   *
+   * `Why disabled when the selection matches the live source:` `onSwitchAudio`
+   * is a real stop-then-start cycle under the hood (see `stream-control.js`),
+   * not a no-op — there's no cheaper "you actually changed something" check,
+   * so the button just refuses to fire rather than needlessly tearing down
+   * and rebuilding a perfectly fine active share. Matched by name rather
+   * than id: `DestinationRow` (`dto.rs`) only carries the source's `label`,
+   * not the source id `select_audio_source` was given, so name is the only
+   * thread connecting "what's live" back to "what's in the picker's list" —
+   * good enough since the list is keyed by human-readable app names anyway.
+   *
+   * @param {object} dest - the paired video `DestinationRow`, for the room
+   *   handle/capture id a switch needs to start the new share against.
    * @param {object} audio - the paired audio `DestinationRow` (its `label` is
    *   the captured application's name — `session::start_audio_share` sets the
    *   capture's label to the picked source's name — and `muted` is the
    *   toggle's current state).
-   * @param {object} handlers - { onAudioMute(captureId, muted), onAudioStop(destinationId) }
+   * @param {object} handlers - { onAudioMute(captureId, muted),
+   *   onAudioStop(destinationId), onSwitchAudio(dest, audio, source),
+   *   onRefreshAudioSources() }
+   * @param {object} opts - { audioSources: [{id,name}] }
    */
-  function audioAttachedRow(audio, handlers) {
-    const row = el("div", { className: "dest-audio-row" });
+  function audioAttachedRow(dest, audio, handlers, opts) {
+    const row = el("div", { className: "dest-audio-row dest-audio-row-attached" });
 
     // Meter: fixed bar count, animated out-of-band by `stream-control.js`'s
     // `updateStats()` off the `audio_level` field on the already-flowing
@@ -1541,11 +1649,45 @@
       dangerButton("Stop", () => handlers.onAudioStop && handlers.onAudioStop(audio.destination_id), { className: "dest-audio-stop" })
     );
 
+    // Always-visible switch picker: a second line, under the same row's
+    // flex-wrap, so the meter/name/Mute/Stop line above stays exactly as it
+    // was rather than getting crowded to fit a dropdown + button in.
+    const switchRow = el("div", { className: "dest-audio-switch-row" });
+    const core = audioSourcePickerCore(handlers, opts);
+    const select = core.select;
+
+    // Default the picker to whatever's already live, matched by name (see
+    // this function's doc comment for why name, not id) — falls back to the
+    // list's first entry (the dropdown's own default) when the live source
+    // isn't in the current list, e.g. it just stopped producing audio.
+    const liveSource = core.getSources().find((s) => s.name === audio.label);
+    if (liveSource) select.value = liveSource.id;
+
+    const switchBtn = secondaryButton(
+      "Switch",
+      () => {
+        const source = core.getSources().find((s) => String(s.id) === String(select.value));
+        if (source) handlers.onSwitchAudio && handlers.onSwitchAudio(dest, audio, source);
+      },
+      { className: "dest-audio-switch-btn" }
+    );
+    const isSameAsLive = () => {
+      const source = core.getSources().find((s) => String(s.id) === String(select.value));
+      return !source || source.name === audio.label;
+    };
+    switchBtn.disabled = isSameAsLive();
+    select.addEventListener("change", () => {
+      switchBtn.disabled = isSameAsLive();
+    });
+
+    switchRow.appendChild(select);
+    switchRow.appendChild(switchBtn);
+    row.appendChild(switchRow);
+
+    core.startPolling(() => row.isConnected);
+
     return row;
   }
-
-  /** How many bars the attached-audio VU meter draws. */
-  const AUDIO_METER_BARS = 5;
 
   /**
    * The no-audio-yet line: a dashed "+ Add audio" affordance that expands in
@@ -1558,62 +1700,17 @@
   function addAudioRow(dest, handlers, opts) {
     const row = el("div", { className: "dest-audio-row dest-audio-row-empty" });
 
-    // The list this picker is currently showing. Held in a local rather than
-    // re-read from `opts.audioSources` on every use, because
-    // `onRefreshAudioSources` *replaces* the caller's array (it reassigns
-    // `mockAudioSources = await fetchAudioSources()`), so `opts.audioSources`
-    // keeps pointing at whichever array existed when this card was built.
-    // Reproduced live in the real app: the picker offered the mock
-    // placeholder sources ("Default speakers", "Game (app audio)") instead of
-    // the running applications `list_audio_sources` had just returned.
-    let sources = opts.audioSources || [];
+    // Dropdown + polling: shared with `audioAttachedRow`'s always-visible
+    // "Switch" picker, see `audioSourcePickerCore`'s doc comment. Note that
+    // `core.getSources()`/`core.setSources()` replace this closure's whole
+    // view of the source list on a poll tick (`onRefreshAudioSources`
+    // reassigns the array), same "don't hold a stale reference" reasoning
+    // that comment used to explain here directly.
+    const core = audioSourcePickerCore(handlers, opts);
+    const select = core.select;
 
     const picker = el("span", { className: "dest-audio-picker", attrs: { hidden: "" } });
-    const optionsFor = () =>
-      sources.length === 0 ? [{ value: "", label: "No application is playing audio" }] : sources.map((s) => ({ value: s.id, label: s.name }));
-    const select = dropdown(optionsFor(), sources.length ? sources[0].id : "", null, { className: "dest-room-select dest-audio-select" });
-    const rebuildOptions = () => select.setOptions(optionsFor());
     picker.appendChild(select);
-
-    // While the picker stays open, which applications are producing audio
-    // can keep changing (an app can start playing well after the picker was
-    // opened) — poll `list_audio_sources` again periodically so the list
-    // catches up without the user having to close and reopen the picker.
-    // Owns its own `setInterval` and stops itself once the picker is no
-    // longer visible/attached, same self-stopping `isConnected` pattern
-    // `statusBadge`'s degraded-elapsed-time ticker uses above (this
-    // codebase's render paths have no uniform unmount hook to call a
-    // `.destroy()` from instead).
-    const AUDIO_SOURCE_POLL_MS = 5000;
-    let audioPollId = null;
-    function stopAudioSourcePolling() {
-      if (audioPollId !== null) {
-        clearInterval(audioPollId);
-        audioPollId = null;
-      }
-    }
-    function startAudioSourcePolling() {
-      if (audioPollId !== null || !handlers.onRefreshAudioSources) return;
-      audioPollId = setInterval(async () => {
-        if (!picker.isConnected || picker.hidden) {
-          stopAudioSourcePolling();
-          return;
-        }
-        const fresh = await handlers.onRefreshAudioSources();
-        if (!picker.isConnected || picker.hidden) {
-          // The picker could have closed (or the whole card been rebuilt
-          // out from under it) while the await above was in flight.
-          stopAudioSourcePolling();
-          return;
-        }
-        if (Array.isArray(fresh)) {
-          sources = fresh;
-          const previousValue = select.value;
-          rebuildOptions();
-          if (sources.some((s) => String(s.id) === previousValue)) select.value = previousValue;
-        }
-      }, AUDIO_SOURCE_POLL_MS);
-    }
 
     // `dest-audio-share-btn` is the same 32px size on both staged and live
     // cards now (2026-07-29 — owner asked for live cards' Share to match
@@ -1621,9 +1718,9 @@
     // any more; see the class's definition in stream-control.css.
     picker.appendChild(
       primaryButton("Share", () => {
-        const source = sources.find((s) => String(s.id) === String(select.value));
+        const source = core.getSources().find((s) => String(s.id) === String(select.value));
         if (source) handlers.onAddAudio && handlers.onAddAudio(dest, source);
-        stopAudioSourcePolling();
+        core.stopPolling();
       }, { className: "dest-audio-share-btn" })
     );
 
@@ -1643,13 +1740,13 @@
         // render path.
         if (handlers.onRefreshAudioSources) {
           const fresh = await handlers.onRefreshAudioSources();
-          if (Array.isArray(fresh)) sources = fresh;
+          if (Array.isArray(fresh)) core.setSources(fresh);
         }
-        rebuildOptions();
+        core.rebuildOptions();
         addBtn.hidden = true;
         picker.hidden = false;
         select.focus();
-        startAudioSourcePolling();
+        core.startPolling(() => picker.isConnected && !picker.hidden);
       },
     });
     row.appendChild(icon("volume_off", "dest-audio-empty-icon"));

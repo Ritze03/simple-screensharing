@@ -643,6 +643,32 @@
     render();
   }
 
+  /**
+   * "Switch" on the always-visible audio picker (`audioAttachedRow` in
+   * components.js): change a *live* share's audio source in one gesture,
+   * rather than the user having to press Stop and then separately reopen a
+   * picker and press Share. Sequenced as the two existing calls run back to
+   * back — stop the current audio destination, then `await` it finishing
+   * before starting the new one — not a new backend capability: no
+   * in-place GStreamer pipeline retarget exists (or is worth building; see
+   * this feature's design note in the project docs for why), so this is
+   * exactly the stop-then-restart cycle `AudioWatch`'s teardown/recreate
+   * already handles today, just triggered from one button instead of two.
+   * The `await` on `stopDestination` matters: starting the new capture
+   * before the old one has actually torn down would briefly run two audio
+   * captures at once, which nothing else in this codebase's single-capture-
+   * per-destination assumption expects.
+   *
+   * Volume survives this for free on the viewer side — `RoomSession::
+   * audio_volume_by_owner` in `session.rs` is keyed by owner connection, not
+   * by stream id, specifically so a sender's audio restarting or switching
+   * doesn't reset what a viewer had it set to.
+   */
+  async function switchAudioShare(roomHandle, forCaptureId, audio, source) {
+    await stopDestination(audio.destination_id);
+    await startAudioShare(roomHandle, source, forCaptureId);
+  }
+
   /** Mute/unmute a running audio share in place (its card row's toggle). */
   async function setAudioShareMuted(captureId, muted) {
     if (window.__TAURI__) {
@@ -1036,6 +1062,11 @@
               onAddAudio: (d, source) => startAudioShare(edit.roomHandle, source, d.capture_id),
               onAudioMute: (captureId, muted) => setAudioShareMuted(captureId, muted),
               onAudioStop: (audioDestinationId) => stopDestination(audioDestinationId),
+              // Same "unreachable in practice" note as `onAddAudio` above:
+              // `opts.audio` on a staged card is defensive-only (the backend
+              // refuses audio against a staged capture), so Switch never
+              // actually renders here today — wired anyway for symmetry.
+              onSwitchAudio: (d, audio, source) => switchAudioShare(edit.roomHandle, d.capture_id, audio, source),
               onRefreshAudioSources: () => refreshAudioSources(),
             },
             {
@@ -1136,6 +1167,7 @@
               onAddAudio: (d, source) => startAudioShare(d.room_handle, source, d.capture_id),
               onAudioMute: (captureId, muted) => setAudioShareMuted(captureId, muted),
               onAudioStop: (audioDestinationId) => stopDestination(audioDestinationId),
+              onSwitchAudio: (d, audio, source) => switchAudioShare(d.room_handle, d.capture_id, audio, source),
               onRefreshAudioSources: () => refreshAudioSources(),
             },
             {
