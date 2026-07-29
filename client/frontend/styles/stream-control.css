@@ -763,13 +763,26 @@
 
 /* Fixed width, sized for the longer of "Mute"/"Unmute", so toggling the
    label never reflows the row (the Stop button beside it would otherwise
-   slide sideways on every click). */
+   slide sideways on every click).
+   `2026-07-29: bumped to the app's standard 32px .btn height` — these were
+   still the original small `3px 0` / `11px` routine-button sizing while
+   every other button on this tab (`.dest-action-btn`, `.dest-audio-share-btn`,
+   `.dest-audio-add-btn-staged`) had already grown to 32px this session. The
+   owner's screenshot showed Mute/Stop visibly short next to "Floorp" — this
+   is that fix. Same recipe as `.dest-action-btn`/`.dest-audio-share-btn`
+   (`padding` vertical 6px, `font-size` 14px, relying on `.btn`'s base
+   `font-weight: 700`), confirmed 32px by real Electron
+   `getBoundingClientRect()` measurement with a real Floorp audio source
+   attached, not assumed from the padding numbers alone (see
+   `superdoc/features/stream-control.md`'s 2026-07-29 entry). `width` bumped
+   76px (from 64px) so "Unmute" still fits at the larger 14px/700 size
+   without wrapping. */
 .dest-audio-mute {
   flex: 0 0 auto;
-  width: 64px;
-  padding: 3px 0;
+  width: 76px;
+  padding: 6px 0;
   height: auto;
-  font-size: 11px;
+  font-size: 14px;
   text-align: center;
 }
 
@@ -780,9 +793,9 @@
 
 .dest-audio-stop {
   flex: 0 0 auto;
-  padding: 3px 8px;
+  padding: 6px 22px;
   height: auto;
-  font-size: 11px;
+  font-size: 14px;
 }
 
 /* No audio attached yet. */
