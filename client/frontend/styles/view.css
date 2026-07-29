@@ -169,19 +169,38 @@
  * tabular-nums recipe from `stream-control.css`'s `.dest-metric-value` —
  * this app's existing vocabulary for "a live numeric readout on a card",
  * reused here rather than inventing a second one.
+ *
+ * 2026-07-29, later same day — shrunk from a full-tile-width gradient bar
+ * to a compact top-left pill (same "dark translucent chip" visual language
+ * as the bottom-left `.media-tile-audio` pill below). Investigated a report
+ * that "the overlay is always shown, it should only show on hover": a real
+ * Electron/Playwright check (see `superdoc/features/video-pipeline.md`'s
+ * matching dated entry) confirmed `.media-tile-overlay` itself *was*
+ * correctly hover-gated (opacity 0/pointer-events:none at rest, verified
+ * live) — this bar, not that overlay, was what read as "an overlay always
+ * showing": a full-width dark gradient scrim across the top of every tile,
+ * at rest, is visually indistinguishable from "a vignette overlay" even
+ * though it's a different, deliberately-always-visible element. Shrinking
+ * it to a content-sized pill keeps the stats always visible (still an
+ * explicit requirement, see the redesign note above) while no longer
+ * reading as a second always-on overlay.
  * ----------------------------------------------------------------- */
 
 .media-tile-statbar {
   position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
+  top: 8px;
+  left: 8px;
+  max-width: calc(100% - 16px);
   z-index: 1;
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 12px;
-  background: linear-gradient(180deg, rgba(10, 11, 13, 0.82) 0%, rgba(10, 11, 13, 0.5) 65%, rgba(10, 11, 13, 0) 100%);
+  padding: 5px 10px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.62);
+  backdrop-filter: blur(6px);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
   pointer-events: none;
 }
 
