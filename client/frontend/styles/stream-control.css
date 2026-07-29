@@ -767,7 +767,7 @@
    `2026-07-29: bumped to the app's standard 32px .btn height` — these were
    still the original small `3px 0` / `11px` routine-button sizing while
    every other button on this tab (`.dest-action-btn`, `.dest-audio-share-btn`,
-   `.dest-audio-add-btn-staged`) had already grown to 32px this session. The
+   `.dest-audio-add-btn-lg`) had already grown to 32px this session. The
    owner's screenshot showed Mute/Stop visibly short next to "Floorp" — this
    is that fix. Same recipe as `.dest-action-btn`/`.dest-audio-share-btn`
    (`padding` vertical 6px, `font-size` 14px, relying on `.btn`'s base
@@ -815,21 +815,22 @@
   flex: 0 0 auto;
 }
 
-/* On a staged card, "+ Add audio" sits next to (well, above — it's the
-   card's only other row) "Go live"/"Cancel", which are 32px tall
-   (`.dest-action-btn` above) because they're the card's one deliberate
-   confirming action, not a routine small button. Match that same 32px
-   rather than the small `.dest-chip-add-btn` sizing a live card's row uses.
-   Padding chosen to land on 32px measured live (`getBoundingClientRect`
-   height), not assumed from the numbers alone — font-size changes
-   line-height in ways padding math alone doesn't predict (see this
-   session's `.dest-action-btn` note above, learned the same way).
-   2026-07-29: `.dest-action-btn`/`.dest-audio-share-btn` grew to this same
-   32px on LIVE cards too (Stop/Share), but this "+ Add audio" *button*
-   (the dashed affordance, not the Share confirm) stays live-card-small —
-   the owner only asked to grow Stop/Share this round; left this one alone
-   per the same judgment call, see stream-control.md changelog. */
-.dest-audio-add-btn-staged {
+/* "+ Add audio" sits next to (well, above — it's the card's only other row)
+   "Go live"/"Cancel" on a staged card, or the Mute/Stop row on a live card —
+   either way it reads as a deliberate affordance, not a routine small
+   button, so it gets the app's standard 32px (`.dest-action-btn` above)
+   rather than the small `.dest-chip-add-btn` sizing. Padding chosen to land
+   on 32px measured live (`getBoundingClientRect` height), not assumed from
+   the numbers alone — font-size changes line-height in ways padding math
+   alone doesn't predict (see this session's `.dest-action-btn` note above,
+   learned the same way).
+   2026-07-29: this class used to be staged-only (name and all) — the owner
+   flagged via screenshot that the live button visibly shrank the instant a
+   card went live, because `addAudioRow` only added it when `opts.staged`.
+   Same fix `.dest-audio-share-btn` already got above: apply unconditionally
+   on both staged and live cards, and rename off `-staged` since it no
+   longer is. */
+.dest-audio-add-btn-lg {
   padding: 6px 14px 6px 12px;
   font-size: 14px;
   font-weight: 700;
@@ -839,9 +840,10 @@
    components.js) — a staged capture has zero destinations, so starting
    audio against it would announce an orphan stream (see that function's doc
    comment). Rendered as a `<span>`, not a `<button>`, so there is nothing to
-   click; the faded look plus the "(available once you Go Live)" copy is
-   what tells the user this is temporarily out of reach, not permanently
-   gone. */
+   click; the faded opacity/cursor/pointer-events below is what tells the
+   user this is temporarily out of reach, not permanently gone — as of
+   2026-07-29 there's no extra "(available once you Go Live)" copy doing
+   that job too, per the owner. */
 .dest-audio-add-btn-disabled {
   cursor: default;
   opacity: 0.5;
