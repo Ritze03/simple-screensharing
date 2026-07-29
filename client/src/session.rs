@@ -2065,21 +2065,43 @@ impl AppState {
     }
 
     /// "Add audio" clicked: same shape as `start_video_share`, for the
-    /// currently selected source. No-op if no source is selected (the button
-    /// is disabled in that case).
+    /// currently selected source. No-op (returns `Ok(())`) if no source is
+    /// selected (the button is disabled in that case).
     ///
     /// `for_capture` is the video capture this audio is being attached to, so
     /// its row can be rendered inside that capture's card — see
-    /// [`LocalCapture::audio_for_capture`]. `None` starts a standalone audio
-    /// share, which still works and simply has no card to nest into.
-    pub fn start_audio_share(&mut self, room_handle: RoomHandle, for_capture: Option<CaptureSourceId>) {
+    /// [`LocalCapture::audio_for_capture`]. There is no standalone-audio mode
+    /// any more: **every** audio share must be paired to a video capture —
+    /// see this crate's hard invariant ("no audio-only streams, ever"), so
+    /// `for_capture` is mandatory here, not an `Option`.
+    ///
+    /// `Why this checks liveness, not just existence:` `for_capture` can
+    /// legitimately name a capture that exists but is only **staged**
+    /// (`stage_video_share` ran, `go_live` hasn't yet — zero destinations,
+    /// nothing announced to any room). The frontend's staged card exposes
+    /// "+Add audio" before "Go Live" is clicked, and until this check
+    /// existed, clicking it there would announce a live audio stream paired
+    /// to a video capture that was not actually sending anything —
+    /// exactly the orphan, video-less "LIVE" row the hard invariant above
+    /// forbids. A capture counts as live iff it has at least one destination
+    /// (`add_destination_with_params`/`go_live` are the only things that ever
+    /// push one), so `!destinations.is_empty()` is the same staged-vs-live
+    /// test the rest of this module already relies on — no new flag needed.
+    pub fn start_audio_share(&mut self, room_handle: RoomHandle, for_capture: CaptureSourceId) -> Result<(), String> {
+        let is_live = self.captures.get(&for_capture).is_some_and(|c| !c.destinations.is_empty());
+        if !is_live {
+            return Err(
+                "cannot start audio share: the paired screen share is not live yet — click \"Go Live\" first"
+                    .to_string(),
+            );
+        }
         let Some(source) = self.selected_audio_source.clone() else {
-            return;
+            return Ok(());
         };
         let capture_id = self.alloc_capture_id();
         let destination_id = self.alloc_destination_id();
 
-        let Some(room) = self.rooms.get_mut(&room_handle) else { return };
+        let Some(room) = self.rooms.get_mut(&room_handle) else { return Ok(()) };
         let stream_id = room.next_stream_id;
         room.next_stream_id = room.next_stream_id.wrapping_add(1);
         room.destinations.push(destination_id);
@@ -2092,7 +2114,7 @@ impl AppState {
                 kind: StreamKind::Audio,
                 label: source.name.clone(),
                 status: ShareStatus::Starting(rx),
-                audio_for_capture: for_capture,
+                audio_for_capture: Some(for_capture),
                 destinations: IndexMap::from([(
                     destination_id,
                     Destination {
@@ -2122,6 +2144,7 @@ impl AppState {
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
         });
+        Ok(())
     }
 
     /// Mute/unmute an audio share without stopping it — the Mute toggle on
@@ -2157,7 +2180,32 @@ impl AppState {
     /// (`.stop()` is async on both `CaptureHandle` and `AudioCaptureHandle`).
     /// The `LocalCapture` stays in the map, in `Stopping`, so the UI can show
     /// that state; `poll_capture_states` reaps it once the stop lands.
+    ///
+    /// `Why this cascades to paired audio:` a video capture can have an audio
+    /// capture riding along (`LocalCapture::audio_for_capture` pointing back
+    /// at it) — either live, or merely staged waiting for the video to go
+    /// live. Stopping/cancelling the video without also stopping that audio
+    /// would leave it running forever with no video left to belong to,
+    /// exactly the orphan-audio state the hard "no audio-only streams" rule
+    /// forbids. This covers both cancelling a staged video card (which
+    /// reuses this same function, see `stage_video_share`'s doc comment) and
+    /// stopping a live one.
     pub fn stop_share(&mut self, capture_id: CaptureSourceId) {
+        let paired_audio: Vec<CaptureSourceId> = self
+            .captures
+            .iter()
+            .filter(|(id, c)| **id != capture_id && c.audio_for_capture == Some(capture_id))
+            .map(|(id, _)| *id)
+            .collect();
+        for audio_capture_id in paired_audio {
+            self.stop_share_one(audio_capture_id);
+        }
+        self.stop_share_one(capture_id);
+    }
+
+    /// The single-capture teardown [`Self::stop_share`] applies to
+    /// `capture_id` itself and, first, to any paired audio it cascades to.
+    fn stop_share_one(&mut self, capture_id: CaptureSourceId) {
         let Some(capture) = self.captures.get_mut(&capture_id) else {
             return;
         };

@@ -835,6 +835,19 @@
   font-weight: 700;
 }
 
+/* Staged card's non-interactive stand-in (`addAudioUnavailableRow` in
+   components.js) — a staged capture has zero destinations, so starting
+   audio against it would announce an orphan stream (see that function's doc
+   comment). Rendered as a `<span>`, not a `<button>`, so there is nothing to
+   click; the faded look plus the "(available once you Go Live)" copy is
+   what tells the user this is temporarily out of reach, not permanently
+   gone. */
+.dest-audio-add-btn-disabled {
+  cursor: default;
+  opacity: 0.5;
+  pointer-events: none;
+}
+
 .dest-audio-picker {
   display: inline-flex;
   align-items: center;

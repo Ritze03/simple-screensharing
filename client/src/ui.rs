@@ -1865,7 +1865,28 @@ impl App {
     fn apply_stream_action(&mut self, action: StreamAction) {
         match action {
             StreamAction::StartCapture(room) => self.state.start_video_share(room),
-            StreamAction::StartAudio(room) => self.state.start_audio_share(room, None),
+            // `start_audio_share` no longer accepts a standalone (unpaired)
+            // audio share — see its doc comment for the hard "no audio-only
+            // streams" invariant. This legacy egui panel has no per-share
+            // "attach to" affordance of its own (that's the Tauri frontend's
+            // per-card redesign — see `superdoc/features/stream-control.md`),
+            // so pair it with whichever of this room's video captures is
+            // already live (`start_video_share` always creates one
+            // destination immediately, so "has a capture with a destination
+            // in this room" is exactly "has a live share here"); no-op if
+            // there isn't one, same as the disabled-button case this used to
+            // rely on for "no source selected".
+            StreamAction::StartAudio(room) => {
+                let for_capture = self
+                    .state
+                    .captures
+                    .iter()
+                    .find(|(_, c)| c.kind == StreamKind::Video && c.destinations.values().any(|d| d.room == room))
+                    .map(|(id, _)| *id);
+                if let Some(for_capture) = for_capture {
+                    let _ = self.state.start_audio_share(room, for_capture);
+                }
+            }
             StreamAction::RefreshAudio => self.state.refresh_audio_sources(),
             StreamAction::StopDestination(destination_id) => self.state.stop_destination(destination_id),
             StreamAction::Transfer(destination_id, room) => self.state.transfer_destination(destination_id, room),
