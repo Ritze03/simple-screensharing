@@ -827,7 +827,12 @@
   display: none;
 }
 
+/* `min-width` added 2026-07-29 — with only a `max-width` cap and no floor,
+   this shrank to fit whatever short/empty label happened to be selected
+   (e.g. before any real audio source is picked), collapsing to barely more
+   than the dropdown chevron. */
 .dest-audio-select {
+  min-width: 100px;
   max-width: 150px;
 }
 
@@ -835,4 +840,15 @@
   padding: 3px 8px;
   height: auto;
   font-size: 11px;
+}
+
+/* Staged cards get a bigger "Share" button — same rationale as
+   `.dest-audio-add-btn-staged` right above and `.dest-actions-staged
+   .dest-action-btn` (Go live/Cancel): this picker's confirm action is a
+   staged card's other deliberate-sized affordance, not routine small-button
+   territory. */
+.dest-audio-share-btn-staged {
+  padding: 6px 22px;
+  font-size: 14px;
+  font-weight: 700;
 }

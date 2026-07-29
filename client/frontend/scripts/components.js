@@ -1181,6 +1181,36 @@
         editGrid.appendChild(roomRow);
       }
 
+      // Framerate — a regular-user setting, so it lives up here with Preset
+      // and Bitrate rather than behind the Advanced disclosure with the raw
+      // Tune/Rate Control knobs. Until now this tab had no framerate control
+      // at all: `edit_destination` has always taken one, and the caller has
+      // always sent one, but only ever the value the destination already had,
+      // so there was no way to change a running stream's framerate short of
+      // stopping and re-sharing it.
+      //
+      // `Why a <select> and not the pillSwitch the Preset row uses:` the
+      // offered range is the same nine values the "Start a Stream" form
+      // offers (15…280) — nine pills would not fit this column, and matching
+      // that form's own control keeps "the framerate picker" one recognisable
+      // thing in both places. `framerateOptions` carries the current value
+      // even when it isn't one of the nine, so this never silently misreports
+      // what the destination is actually running at.
+      //
+      // `Why Framerate comes before Preset:` per explicit request — order
+      // swapped 2026-07-29, was Preset-then-Framerate.
+      const framerateRow = el("div", { className: "dest-edit-row" });
+      framerateRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Framerate" }));
+      const framerateSelect = dropdown(
+        (opts.framerateOptions || [editState.framerate]).map((fps) => ({ value: String(fps), label: fps + " fps" })),
+        String(editState.framerate),
+        (value) => applyTuning({ framerate: Number(value) }),
+        { className: "dest-room-select dest-framerate-select" }
+      );
+      framerateRow.appendChild(framerateSelect);
+      framerateRow.appendChild(el("span"));
+      editGrid.appendChild(framerateRow);
+
       const presetRow = el("div", { className: "dest-edit-row" });
       presetRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Preset" }));
       const presetToggle = pillSwitch(
@@ -1199,33 +1229,6 @@
       presetRow.appendChild(presetToggle);
       presetRow.appendChild(el("span"));
       editGrid.appendChild(presetRow);
-
-      // Framerate — a regular-user setting, so it lives up here with Preset
-      // and Bitrate rather than behind the Advanced disclosure with the raw
-      // Tune/Rate Control knobs. Until now this tab had no framerate control
-      // at all: `edit_destination` has always taken one, and the caller has
-      // always sent one, but only ever the value the destination already had,
-      // so there was no way to change a running stream's framerate short of
-      // stopping and re-sharing it.
-      //
-      // `Why a <select> and not the pillSwitch the Preset row uses:` the
-      // offered range is the same nine values the "Start a Stream" form
-      // offers (15…280) — nine pills would not fit this column, and matching
-      // that form's own control keeps "the framerate picker" one recognisable
-      // thing in both places. `framerateOptions` carries the current value
-      // even when it isn't one of the nine, so this never silently misreports
-      // what the destination is actually running at.
-      const framerateRow = el("div", { className: "dest-edit-row" });
-      framerateRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Framerate" }));
-      const framerateSelect = dropdown(
-        (opts.framerateOptions || [editState.framerate]).map((fps) => ({ value: String(fps), label: fps + " fps" })),
-        String(editState.framerate),
-        (value) => applyTuning({ framerate: Number(value) }),
-        { className: "dest-room-select dest-framerate-select" }
-      );
-      framerateRow.appendChild(framerateSelect);
-      framerateRow.appendChild(el("span"));
-      editGrid.appendChild(framerateRow);
 
       // Bitrate stays Per-Stream-only, unlike everything else in this panel:
       // Absolute mode's allocator owns the live bitrate, so a manual field
@@ -1596,7 +1599,7 @@
         const source = sources.find((s) => String(s.id) === select.value);
         if (source) handlers.onAddAudio && handlers.onAddAudio(dest, source);
         stopAudioSourcePolling();
-      }, { className: "dest-audio-share-btn" })
+      }, { className: "dest-audio-share-btn" + (opts.staged ? " dest-audio-share-btn-staged" : "") })
     );
 
     // Staged cards get a bigger "+ Add audio" — same rationale as
