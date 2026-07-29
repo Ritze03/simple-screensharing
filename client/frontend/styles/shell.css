@@ -64,16 +64,20 @@ input {
   gap: 8px;
 }
 
-/* App icon — the real app mark (assets/icons/mark-32.png), which is
-   already a full-color gradient glyph (blue-to-green screens) on a
-   transparent background. It supplies its own color and contrast, so the
-   gradient-badge/glow chip that used to hold the placeholder "cast" icon
-   was dropped rather than kept underneath — a colored badge behind an
-   already-colored mark looked like a swatch-on-a-swatch, not a logo. */
+/* App icon — the real app mark, which is already a full-color gradient
+   glyph (blue-to-green screens) on a transparent background. It supplies
+   its own color and contrast, so the gradient-badge/glow chip that used to
+   hold the placeholder "cast" icon was dropped rather than kept underneath
+   — a colored badge behind an already-colored mark looked like a
+   swatch-on-a-swatch, not a logo.
+   45px = 30px + 50%, per explicit request (2026-07-29). At this size the
+   sidebar switched its `<img>` source from `mark-32.png` to `mark-256.png`
+   (index.html) — upscaling a 32px source ~1.5x would read soft/blurry;
+   downscaling the 256px source renders crisp. */
 .app-icon {
   flex: 0 0 auto;
-  width: 30px;
-  height: 30px;
+  width: 45px;
+  height: 45px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -87,7 +91,8 @@ input {
 
 .sidebar-header h1 {
   margin: 0;
-  font-size: 15px;
+  /* 18px = 15px + 20%, per explicit request (2026-07-29). */
+  font-size: 18px;
   font-weight: 700;
   color: var(--text);
 }
