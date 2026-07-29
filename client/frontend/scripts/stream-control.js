@@ -881,14 +881,14 @@
   }
 
   // The framerates the destination card's Framerate picker offers — the same
-  // nine values a staged card's Framerate picker offers (240/280 exceed real
-  // monitor Hz and the project's documented 240Hz spec ceiling, offered
-  // anyway per explicit user request to experiment past that ceiling), plus
-  // this destination's own current rate if it somehow isn't one of them — a
-  // stream started before
+  // eight values a staged card's Framerate picker offers (240 exceeds real
+  // monitor Hz but is the project's documented spec ceiling, offered as the
+  // top value per explicit user request to experiment up to that ceiling),
+  // plus this destination's own current rate if it somehow isn't one of them
+  // — a stream started before
   // this list changed, or one whose rate was clamped server-side, must still
   // be shown truthfully rather than silently snapped to a neighbour.
-  const FRAMERATE_OPTIONS = [15, 30, 60, 90, 120, 144, 165, 240, 280];
+  const FRAMERATE_OPTIONS = [15, 30, 60, 90, 120, 144, 165, 240];
   function framerateOptionsFor(editState) {
     if (!editState) return FRAMERATE_OPTIONS;
     const current = Number(editState.framerate);
