@@ -189,10 +189,56 @@
   transition: height 90ms linear, opacity 90ms linear, background-color 90ms linear;
 }
 
+/* No `box-shadow` here (unlike `.dest-audio-meter-bar-lit`, which keeps a
+   tightened one) — measured fresh (2026-07-29), not assumed identical to
+   that already-fixed sibling. Real Electron + `getBoundingClientRect()`:
+   every bar, lit or unlit, is exactly 5px wide in the DOM at this meter's
+   size — so the width mismatch the owner kept seeing here was never a real
+   layout difference. Zoomed real screenshots (lit vs. unlit, same crop
+   scale) showed why anyway: a lit bar's glow spills a soft anti-aliased
+   fringe past its sharp box edge, and at this meter's ~5px bar width that
+   fringe reads as a much bigger fraction of the bar than it does on
+   `.dest-audio-meter`'s wider (~26px/5-bar) bars, where the identical `0 0
+   1px` glow was already confirmed fixed. Dropping the glow outright (rather
+   than shrinking it further) removes the fringe entirely; full opacity +
+   the saturated `--success` color still read clearly as "lit" without it. */
 .dd-option-meter-bar.dd-option-meter-bar-lit {
   background: var(--success);
   opacity: 1;
-  box-shadow: 0 0 1px rgba(80, 200, 120, 0.8);
+}
+
+/* Loading state: shown from the moment the dropdown opens (and its level
+   taps are still spinning up) until `setOptionLevel`'s first real reading
+   arrives for this option — a skeleton-style pulse, not the dim "definitely
+   silent" rest state, so the brief gap doesn't misread as "this app makes
+   no sound". Each bar's `animation-delay` staggers off `nth-child` so the
+   three bars ripple left-to-right rather than pulsing in lockstep — a small
+   wave, in the same spirit as the app's other skeleton/shimmer loading
+   states. `paintDdOptionMeter`/`setOptionLevel` (components.js) clear the
+   `-loading` class the instant real data lands, which also cancels this
+   animation and hands off to the normal height/opacity transition above. */
+.dd-option-meter.dd-option-meter-loading .dd-option-meter-bar {
+  animation: dd-option-meter-pulse 1.1s ease-in-out infinite;
+}
+
+.dd-option-meter.dd-option-meter-loading .dd-option-meter-bar:nth-child(2) {
+  animation-delay: 0.12s;
+}
+
+.dd-option-meter.dd-option-meter-loading .dd-option-meter-bar:nth-child(3) {
+  animation-delay: 0.24s;
+}
+
+@keyframes dd-option-meter-pulse {
+  0%,
+  100% {
+    height: 20%;
+    opacity: 0.35;
+  }
+  50% {
+    height: 70%;
+    opacity: 0.75;
+  }
 }
 
 .dd-option-empty {
