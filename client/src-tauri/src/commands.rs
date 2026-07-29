@@ -679,6 +679,12 @@ pub fn set_volume(managed: State<'_, Managed>, room_handle: u32, owner: String, 
             watch.volume_percent = volume_percent;
             watch.decoder.set_volume(volume_percent as f64 / 100.0);
         }
+        // Remember this owner's chosen volume independent of the current
+        // audio stream id, so it survives the sender restarting/switching
+        // their audio source (which tears down and recreates the
+        // `AudioWatch` under a fresh `stream_id` — see
+        // `RoomSession::audio_volume_by_owner`'s doc comment).
+        room.audio_volume_by_owner.insert(owner, volume_percent);
     }
     Ok(())
 }
