@@ -5,7 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Viewer</title>
   <link rel="icon" href="assets/icons/mark-32.png" />
+  <link rel="stylesheet" href="styles/tokens.css" />
   <link rel="stylesheet" href="styles/fonts.css" />
+  <!-- `.media-tile-statbar`/`.media-tile-vignette`/`.media-tile-overlay`/
+       `.media-tile-audio*` — the View tab's tile-overlay chrome, reused
+       directly (not hand-copied) so this window's pop-out tile stays in
+       sync with the View tab automatically. See viewer.css's header note
+       for why this window still links its own stylesheet too. -->
+  <link rel="stylesheet" href="styles/view.css" />
   <link rel="stylesheet" href="styles/viewer.css" />
 </head>
 <body>

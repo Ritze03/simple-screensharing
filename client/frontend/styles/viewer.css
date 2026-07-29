@@ -1,11 +1,27 @@
 /*
  * viewer.css — standalone fullscreen/borderless viewer window.
  *
- * Deliberately not `view.css`: the viewer window is its own minimal page
- * (no app shell/sidebar/tabs, see `frontend/viewer.html`), and wants a true
- * full-viewport black stage rather than `view.css`'s `--panel-sunken` tile
- * background — black is what actually produces letterbox/pillarbox bars
- * when a tile's aspect ratio doesn't match its grid cell's.
+ * Deliberately not a full replacement of `view.css`: the viewer window is
+ * its own minimal page (no app shell/sidebar/tabs, see `frontend/
+ * viewer.html`), and wants a true full-viewport black stage rather than
+ * `view.css`'s `--panel-sunken` tile background — black is what actually
+ * produces letterbox/pillarbox bars when a tile's aspect ratio doesn't match
+ * its grid cell's. This file only owns that stage chrome (grid/canvas
+ * sizing, the × exit button, the error placeholder) now.
+ *
+ * 2026-07-29 ("pop-out overlay parity" — see `superdoc/features/
+ * viewer-window.md`'s matching dated entry for the `Why:`): the tile's
+ * statbar/vignette/hover-overlay/audio-control chrome used to be hand-copied
+ * here as a parallel `.viewer-tile-*` vocabulary, and had already drifted
+ * from the View tab's `.media-tile-*` rules (no stat-pill styling, no
+ * vignette layer at all). That vocabulary is gone — `viewer.html` now links
+ * `view.css` directly and `viewer.js` builds the real `.media-tile-statbar`/
+ * `.media-tile-vignette`/`.media-tile-overlay`/`.media-tile-audio*` DOM, so
+ * the two windows' tile overlays can't drift out of sync again. The only
+ * thing still needed here is wiring `.media-tile-vignette`/`.media-tile-
+ * overlay`'s hover-reveal to *this* window's own tile wrapper class
+ * (`.viewer-tile`, not `.media-tile` — see the rule below for why the two
+ * aren't just merged into one class).
  */
 
 html,
@@ -110,138 +126,27 @@ body {
 }
 
 /* -------------------------------------------------------------------
- * Functional parity overlay (2026-07-28): nameplate, fps, and mute/volume —
- * the same info the main View tab's `.media-tile` overlay shows (see
- * `view.css`'s matching `.media-tile-*` rules), copied/adapted here rather
- * than shared via a `<link>` because this window intentionally loads no
- * other app-shell CSS. Same "always-visible nameplate, everything else
- * reveals on hover/focus" no-chrome-by-default rule `view.css` uses.
+ * Tile overlay parity (2026-07-29): the statbar/vignette/overlay/audio
+ * *rules themselves* now live in `view.css`'s `.media-tile-*` classes only
+ * (linked into `viewer.html` — see this file's header note); nothing here
+ * duplicates their declarations. The one thing genuinely local to this
+ * window is the hover *trigger*: `view.css` gates `.media-tile-vignette`/
+ * `.media-tile-overlay` behind `.media-tile:hover`/`:focus-within`, but this
+ * window's tile wrapper is `.viewer-tile` (its own class, kept separate from
+ * `.media-tile` on purpose — `.media-tile` also carries a 16:9
+ * `aspect-ratio` and a green "live" box-shadow ring meant for the View tab's
+ * fixed-size grid cells, both wrong for this window's full-bleed
+ * letterboxed stage). These two rules are what make the same vignette/
+ * overlay fade in on hover here too, without pulling in either unwanted
+ * property.
  * ------------------------------------------------------------------- */
 
-.viewer-tile-nameplate {
-  position: absolute;
-  left: 12px;
-  bottom: 12px;
-  background: rgba(10, 11, 13, 0.78);
-  border-radius: 6px;
-  padding: 5px 10px;
-  /* Deliberately NOT part of the Geist synthesis-weight cleanup
-     (2026-07-29, see fonts.css/FRONTEND-SHELL.md): this window's `body`
-     rule above sets `font-family: system-ui, sans-serif`, not
-     `var(--font-sans)`/Geist, so this 500 renders against the OS system
-     font, not a synthesized Geist weight — a different, out-of-scope
-     situation. Don't "fix" this to 400/700 as part of that cleanup without
-     first deciding whether this window should even switch to Geist. */
-  font-weight: 500;
-  color: #e8e9ec;
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
-  pointer-events: none;
-  max-width: calc(100% - 16px);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.viewer-tile:hover .viewer-tile-nameplate,
-.viewer-tile:focus-within .viewer-tile-nameplate {
-  opacity: 0;
-}
-
-.viewer-tile-overlay {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  flex-direction: column;
-  justify-content: space-between;
-  background: linear-gradient(180deg, rgba(10, 11, 13, 0.72) 0%, rgba(10, 11, 13, 0.1) 40%, rgba(10, 11, 13, 0.82) 100%);
-  opacity: 0;
-  transition: opacity 0.12s ease;
-  pointer-events: none;
-}
-
-.viewer-tile:hover .viewer-tile-overlay,
-.viewer-tile:focus-within .viewer-tile-overlay {
+.viewer-tile:hover .media-tile-vignette,
+.viewer-tile:focus-within .media-tile-vignette {
   opacity: 1;
 }
 
-.viewer-tile-overlay-top {
-  padding: 8px 44px 8px 8px; /* right padding clears the fixed × button */
-  font-size: 12px;
-  color: rgba(232, 233, 236, 0.85);
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
-}
-
-.viewer-tile-overlay-bottom {
-  pointer-events: none;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 12px;
-}
-
-.viewer-tile-fps {
-  font-size: 12px;
-  font-variant-numeric: tabular-nums;
-  color: rgba(232, 233, 236, 0.85);
-  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
-  margin-left: auto;
-}
-
-.viewer-tile-audio {
-  pointer-events: auto;
-  display: flex;
-  align-items: center;
-  padding: 2px;
-  border-radius: 999px;
-  background: rgba(0, 0, 0, 0.72);
-  backdrop-filter: blur(6px);
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
-  transition: background 140ms ease, border-color 140ms ease;
-}
-
-.viewer-tile-audio:hover,
-.viewer-tile-audio:focus-within {
-  background: rgba(0, 0, 0, 0.82);
-  border-color: rgba(255, 255, 255, 0.26);
-}
-
-.viewer-tile-audio-btn {
-  background: none;
-  border: none;
-  color: #e8e9ec;
-  border-radius: 999px;
-  width: 24px;
-  height: 24px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  flex: 0 0 auto;
-}
-
-.viewer-tile-audio-btn .material-symbols-outlined {
-  font-size: 16px;
-}
-
-.viewer-tile-audio-muted .viewer-tile-audio-btn {
-  color: rgba(232, 233, 236, 0.5);
-}
-
-.viewer-tile-audio-slider {
-  width: 0;
-  opacity: 0;
-  margin-left: 0;
-  margin-right: 0;
-  cursor: pointer;
-  transition: width 160ms ease, opacity 160ms ease, margin-left 160ms ease, margin-right 160ms ease;
-}
-
-.viewer-tile-audio:hover .viewer-tile-audio-slider,
-.viewer-tile-audio:focus-within .viewer-tile-audio-slider {
-  width: 84px;
+.viewer-tile:hover .media-tile-overlay,
+.viewer-tile:focus-within .media-tile-overlay {
   opacity: 1;
-  margin-left: 6px;
-  margin-right: 5px;
 }

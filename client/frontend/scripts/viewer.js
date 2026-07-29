@@ -203,18 +203,20 @@
     return tiles;
   }
 
-  /** Builds the whole `.viewer-tile-audio` mute+volume pill, appended into
+  /** Builds the whole `.media-tile-audio` mute+volume pill, appended into
    * `bottom` and swapped in place on every mute toggle — mirrors `view.js`'s
    * `renderTile`'s own `buildAudioGroup` closure exactly (same swap-in-
    * place-on-mute-toggle approach, same reason: only this pill needs to
-   * change, not the whole tile/overlay). */
+   * change, not the whole tile/overlay; same `.media-tile-audio*` class
+   * names too now — 2026-07-29, see viewer.css's header note — so this and
+   * the View tab's version render identically). */
   function appendAudioGroup(tile, bottom) {
     const buildAudioGroup = (muted) => {
-      const group = el("div", { className: "viewer-tile-audio" + (muted ? " viewer-tile-audio-muted" : "") });
+      const group = el("div", { className: "media-tile-audio" + (muted ? " media-tile-audio-muted" : "") });
       const muteBtn = el(
         "button",
         {
-          className: "viewer-tile-audio-btn",
+          className: "media-tile-audio-btn",
           attrs: { title: muted ? "Unmute" : "Mute", "aria-label": muted ? "Unmute" : "Mute" },
           onClick: (e) => {
             e.stopPropagation();
@@ -232,7 +234,7 @@
       group.appendChild(muteBtn);
       if (!muted) {
         const slider = el("input", {
-          className: "viewer-tile-audio-slider",
+          className: "media-tile-audio-slider",
           attrs: { type: "range", min: "0", max: "200", step: "5", "aria-label": "Volume" },
         });
         slider.value = String(tileVolume.get(tile.id) ?? DEFAULT_VOLUME);
@@ -249,46 +251,106 @@
     bottom.appendChild(audioGroup);
   }
 
-  /** Same info this stream's tile shows in the main View tab's overlay —
-   * nameplate (owner · room), live fps, and (if this sender has audio) the
-   * mute+volume slider — kept "lean, chrome-free until interacted with" the
-   * same way `view.js` keeps its own grid: the nameplate is always visible,
-   * everything else only reveals on hover/focus via `.viewer-tile-overlay`'s
-   * CSS. Renders nothing extra beyond the bare video when `tileMeta` came
-   * back empty (plain-browser preview with no query params, or a malformed
-   * one) — see `view.js`'s `renderTile` for the main-tab equivalent this
-   * mirrors. */
+  // `tile.id` -> its statbar's live fps/bitrate `<span>`s — mirrors
+  // `view.js`'s own `fpsSpans`/`bitrateSpans` module-level maps exactly (see
+  // `updateStats` below, fed the same `stream-stats-updated` event `view.js`
+  // consumes). Only ever holds the one tile this window actually shows in
+  // practice, but kept keyed by id rather than a single variable so it stays
+  // consistent with `resolveTiles`'s generic-over-N-keys shape.
+  const fpsSpans = new Map();
+  const bitrateSpans = new Map();
+
+  /** Same info this stream's tile shows in the main View tab: an
+   * always-visible `.media-tile-statbar` (dot/name/resolution/fps/bitrate/
+   * audio badge) plus, on hover, the `.media-tile-vignette` scrim and
+   * `.media-tile-overlay`'s audio mute/volume control — the actual
+   * `.media-tile-*` DOM `view.js`'s `renderTile` builds (see viewer.html's
+   * header note on why: linking the real CSS instead of hand-copying it
+   * only pays off if the DOM shape matches it too). Two deliberate
+   * differences from the View tab's overlay-top, both because this window
+   * IS the pop-out already:
+   *   - no pop-out button (can't pop out again from inside the pop-out)
+   *   - no "stop watching" button — closing this window (the × button, or
+   *     the OS close affordance) already fully stops watching this stream,
+   *     so a second control that does the same thing would be redundant.
+   *     `overlay-top` is simply never appended here.
+   * Renders nothing beyond the bare video when `tileMeta` came back empty
+   * (plain-browser preview with no query params, or a malformed one) — same
+   * guard `view.js` doesn't need (it always has real tile data) but this
+   * window's bare-video fallback does. */
   function renderTile(tile) {
     const wrap = el("div", { className: "viewer-tile" });
-    const canvas = el("canvas", { attrs: { role: "img", "aria-label": tile.id } });
+    // Deliberately NOT `.media-tile-video` — that class is `object-fit:
+    // cover` (fills the View tab's fixed-aspect grid cell, cropping).
+    // `.viewer-tile canvas` below already gives this window's canvas its
+    // own `object-fit: contain` letterbox treatment, which is the right one
+    // for a full-bleed single-stream stage.
+    const canvas = el("canvas", { attrs: { role: "img", "aria-label": tile.ownerLabel || tile.id } });
     const errorPlaceholder = el("div", { className: "viewer-tile-placeholder", attrs: { hidden: "hidden" } }, [el("span", { text: "Stream error" })]);
     wrap.appendChild(canvas);
     wrap.appendChild(errorPlaceholder);
 
     const label = tile.ownerLabel ? (tile.roomLabel ? `${tile.ownerLabel} · ${tile.roomLabel}` : tile.ownerLabel) : null;
     if (label) {
-      wrap.appendChild(el("div", { className: "viewer-tile-nameplate", text: label }));
+      const statbar = el("div", { className: "media-tile-statbar" });
+      statbar.appendChild(el("span", { className: "media-tile-statbar-dot" }));
+      statbar.appendChild(el("span", { className: "media-tile-statbar-name", text: label }));
+      if (tile.resolution) {
+        statbar.appendChild(el("span", { className: "media-tile-statbar-sep", text: "·" }));
+        statbar.appendChild(el("span", { className: "media-tile-statbar-value", text: tile.resolution }));
+      }
+      const fpsSpan = el("span", { className: "media-tile-statbar-value", text: "" });
+      statbar.appendChild(fpsSpan);
+      fpsSpans.set(tile.id, fpsSpan);
+      const bitrateSpan = el("span", { className: "media-tile-statbar-value", text: "" });
+      statbar.appendChild(bitrateSpan);
+      bitrateSpans.set(tile.id, bitrateSpan);
+      if (tile.hasAudio) {
+        const audioBadge = el("span", { className: "media-tile-statbar-audio-badge", attrs: { title: "Sharing audio", "aria-label": "Sharing audio" } });
+        audioBadge.appendChild(icon("volume_up"));
+        statbar.appendChild(audioBadge);
+      }
+      wrap.appendChild(statbar);
 
-      const overlay = el("div", { className: "viewer-tile-overlay" });
-      const top = el("div", { className: "viewer-tile-overlay-top" });
-      const titleText = tile.resolution ? `${label} · ${tile.resolution}` : label;
-      top.appendChild(el("span", { className: "viewer-tile-overlay-title", text: titleText }));
-      overlay.appendChild(top);
+      const vignette = el("div", { className: "media-tile-vignette" });
+      const overlay = el("div", { className: "media-tile-overlay" });
 
-      const bottom = el("div", { className: "viewer-tile-overlay-bottom" });
+      const bottom = el("div", { className: "media-tile-overlay-bottom" });
       if (tile.hasAudio) appendAudioGroup(tile, bottom);
-      const fpsSpan = el("span", { className: "viewer-tile-fps", text: "" });
-      tile.onFps = (fps) => {
-        fpsSpan.textContent = `@${Math.round(fps)}fps`;
-      };
-      bottom.appendChild(fpsSpan);
       overlay.appendChild(bottom);
 
+      wrap.appendChild(vignette);
       wrap.appendChild(overlay);
+
+      tile.onFps = (fps) => {
+        fpsSpan.textContent = `${Math.round(fps)}fps`;
+      };
     }
 
     window.TileVideo.startTileVideo(tile, canvas, errorPlaceholder);
     return wrap;
+  }
+
+  /** Live bitrate for the statbar — mirrors `view.js`'s own `updateStats`
+   * (same `stream-stats-updated` payload shape, same `room_handle:owner:
+   * stream_id` id scheme). Unlike `view.js`, this window has no `shell.js`
+   * loaded to fan the event out for it, so it listens for the Tauri event
+   * itself (see `init` below) — both windows share the same `preload.js`,
+   * so `window.__TAURI__.event` is available here too. Fps is not patched
+   * here: `tile.onFps` above (fed by this window's own `TileVideo`
+   * controller) already owns that span exclusively, same as `view.js`'s
+   * `TileVideo.hasController` skip. No-op on the mock branch (no
+   * `window.__TAURI__`, so this listener is never registered at all). */
+  function updateStats(payload) {
+    if (!payload || !Array.isArray(payload.watched)) return;
+    for (const w of payload.watched) {
+      const id = `${w.room_handle}:${w.owner}:${w.stream_id}`;
+      const bitrateSpan = bitrateSpans.get(id);
+      if (bitrateSpan) {
+        bitrateSpan.textContent =
+          w.received_bitrate_kbps >= 1000 ? `${(w.received_bitrate_kbps / 1000).toFixed(1)} Mbps` : `${Math.round(w.received_bitrate_kbps)} kbps`;
+      }
+    }
   }
 
   function renderGrid(tiles) {
@@ -394,8 +456,21 @@
     window.TileVideo.stopAllTileVideo();
   });
 
+  /** Subscribes this window to the same `stream-stats-updated` event
+   * `shell.js` fans out to `view.js`'s `updateStats` in the main window —
+   * this window has no `shell.js`, so it listens directly. Both windows
+   * share the same `preload.js` (see the module doc comment), so
+   * `window.__TAURI__.event.listen` is available here unchanged. No-op on
+   * the mock branch, matching every other `window.__TAURI__`-gated call in
+   * this file. */
+  function listenForStats() {
+    if (!window.__TAURI__) return;
+    window.__TAURI__.event.listen("stream-stats-updated", (event) => updateStats(event.payload));
+  }
+
   async function init() {
     setupExitControls();
+    listenForStats();
     await fetchMaxJitterBufferMs();
     const tiles = await resolveTiles(streamKeys);
     renderGrid(tiles);
