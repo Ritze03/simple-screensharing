@@ -1448,10 +1448,23 @@
     // screen share, so it renders as one extra line under a hairline rule.
     // Video-only: an audio destination never renders a card, so it never
     // reaches this branch (see `stream-control.js`'s `updateActiveSharesCard`).
-    // Also skipped while staged: audio attaches to a *room* (`start_audio_
-    // share`'s `room_handle`), and a staged card doesn't have one until
-    // "Go live" picks it.
-    if (dest.kind !== "audio" && !opts.staged) {
+    //
+    // `Why this also renders while staged (it didn't at first):` the
+    // original reasoning was "audio attaches to a *room*, and a staged card
+    // doesn't have one until Go live picks it" — false. A staged card's Room
+    // picker (`onStagedRoomChange`, right above) already resolves a real
+    // room_handle before Go live is ever pressed (`stream-control.js`'s
+    // `getStagedEdit().roomHandle`, defaulted to the first joined room) —
+    // it's the exact value "Go live" itself sends. Hiding the row here made
+    // "+ Add audio" vanish the instant "Share Screen" landed on a staged
+    // card instead of a live one (this session's "Go live" staging redesign
+    // introduced that gap), which is what the project owner reported as
+    // "Streaming Audio doesn't work anymore" — the affordance wasn't broken,
+    // it was just unreachable until Go live. `stream-control.js`'s staged
+    // card wiring now passes its own `onAddAudio` (using the staged room
+    // picker's value) and its own paired-audio lookup, same shape as the
+    // live-card path just above.
+    if (dest.kind !== "audio") {
       body.appendChild(el("div", { className: "dest-divider" }));
       body.appendChild(opts.audio ? audioAttachedRow(opts.audio, handlers) : addAudioRow(dest, handlers, opts));
     }
@@ -1586,8 +1599,14 @@
       }, { className: "dest-audio-share-btn" })
     );
 
+    // Staged cards get a bigger "+ Add audio" — same rationale as
+    // `.dest-actions-staged .dest-action-btn` right above (Go live/Cancel):
+    // this is a staged card's only other clickable affordance besides those
+    // two, so it needs to read at the same deliberate size, not the small
+    // routine-action sizing a live card's row uses. See
+    // `.dest-audio-add-btn-staged` in stream-control.css.
     const addBtn = el("button", {
-      className: "dest-chip-add-btn dest-audio-add-btn",
+      className: "dest-chip-add-btn dest-audio-add-btn" + (opts.staged ? " dest-audio-add-btn-staged" : ""),
       text: "+ Add audio",
       onClick: async () => {
         // Re-list on open: which applications are producing audio changes
