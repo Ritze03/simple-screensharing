@@ -1205,11 +1205,11 @@
       // stopping and re-sharing it.
       //
       // `Why a <select> and not the pillSwitch the Preset row uses:` the
-      // offered range is the same nine values the "Start a Stream" form
-      // offers (15…280) — nine pills would not fit this column, and matching
+      // offered range is the same eight values the "Start a Stream" form
+      // offers (15…240) — eight pills would not fit this column, and matching
       // that form's own control keeps "the framerate picker" one recognisable
       // thing in both places. `framerateOptions` carries the current value
-      // even when it isn't one of the nine, so this never silently misreports
+      // even when it isn't one of the eight, so this never silently misreports
       // what the destination is actually running at.
       //
       // `Why Framerate comes before Preset:` per explicit request — order
