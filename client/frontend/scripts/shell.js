@@ -1239,7 +1239,24 @@
   // `fetchActiveDestinations()`), already returned one row per active
   // outgoing DESTINATION (not per capture — a capture fanned out to N rooms
   // already produced N rows here), and was already cross-room per
-  // APP-SHELL.md's STREAMS section doc. Only the row markup/labels changed.
+  // APP-SHELL.md's STREAMS section doc.
+  //
+  // A video destination with audio attached used to render as two separate
+  // rows (one `kind: "video"`, one `kind: "audio"`). It's now folded into
+  // one combined row: the audio row's `volume_up` glyph moves onto the end
+  // of its paired video row instead of getting a row of its own. Pairing is
+  // matched the same way `stream-control.js`'s `destinationCard` already
+  // matches an audio row to its video card — `paired_capture_id ===
+  // capture_id` *and* same `room_handle` (one capture can fan out to
+  // several rooms, each with its own audio) — see that file's `audioFor`.
+  // An audio destination with no matching video row present in the list
+  // (audio-only share, or the video side already tore down) still renders
+  // as its own row, unchanged. The combined row's "Stop" still stops only
+  // the VIDEO destination (`stop_destination` operates per-destination and
+  // the two captures are independent — stopping the video destination does
+  // not touch the paired audio destination server/backend-side), so the
+  // audio keeps flowing on its own row/destination if the caller wants it
+  // stopped separately.
   // ---------------------------------------------------------------------
 
   function renderStreams() {
@@ -1253,7 +1270,23 @@
       );
       return;
     }
-    mockStreams.forEach((s) => list.appendChild(renderStreamRow(s, { onStop: (destinationId) => stopDestination(destinationId) })));
+    const videoRows = mockStreams.filter((s) => s.kind !== "audio");
+    const audioFor = (videoRow) =>
+      mockStreams.find(
+        (s) => s.kind === "audio" && s.paired_capture_id === videoRow.capture_id && s.room_handle === videoRow.room_handle
+      ) || null;
+    const pairedAudioIds = new Set();
+    const rows = videoRows.map((videoRow) => {
+      const audioRow = audioFor(videoRow);
+      if (audioRow) pairedAudioIds.add(audioRow.destination_id);
+      return { videoRow, audioRow };
+    });
+    // Unpaired audio (audio-only shares, or a stranded audio row) still gets
+    // its own row, same as before.
+    mockStreams.filter((s) => s.kind === "audio" && !pairedAudioIds.has(s.destination_id)).forEach((audioRow) => rows.push({ videoRow: audioRow, audioRow: null }));
+    rows.forEach(({ videoRow, audioRow }) =>
+      list.appendChild(renderStreamRow(videoRow, { onStop: (destinationId) => stopDestination(destinationId), audioRow }))
+    );
   }
 
   /** Sidebar's lighter-weight entry point onto the same real `stop_destination`
