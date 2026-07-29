@@ -718,6 +718,47 @@ impl RoomSession {
         self.streams.iter().filter(|s| s.owner != me).map(|s| s.owner).collect::<std::collections::HashSet<_>>().len()
     }
 
+    /// Record that `info.owner` has started a stream: bump their member
+    /// row's `stream_count` and drop `info` into `streams`, replacing any
+    /// existing entry for the same `(owner, stream_id)` pair rather than
+    /// duplicating it.
+    ///
+    /// `Why this exists as a reusable method, not just inline in the
+    /// presence-delta handler:` the relay deliberately excludes the
+    /// announcing connection from its own `StreamStarted`/`StreamStopped`
+    /// broadcasts (`except: Some(conn_id)` in the server's `relay.rs`), so a
+    /// stream *we* just started never arrives back as a `PresenceEvent` —
+    /// nothing would otherwise ever add our own stream to `streams`, and the
+    /// sidebar's `[LIVE]` badge (`renderRoomRow` in `components.js`, driven
+    /// by `liveOwners.has(m.conn_id)`) would never light up for ourselves.
+    /// The call sites that actually bring a local destination live
+    /// (`AppState::poll_pending_destinations`, `AppState::poll_capture_
+    /// states`) call this directly, synthesizing exactly the `StreamInfo`
+    /// the server's own broadcast would have carried; `AppState::drain_
+    /// events`'s `StreamStarted` handler calls it too, for every *other*
+    /// member's stream, so both paths stay identical.
+    pub fn note_stream_started(&mut self, info: StreamInfo) {
+        if let Some(m) = self.members.iter_mut().find(|m| m.conn_id == info.owner) {
+            m.stream_count = m.stream_count.saturating_add(1);
+        }
+        self.streams.retain(|s| !(s.owner == info.owner && s.stream_id == info.stream_id));
+        self.streams.push(info);
+    }
+
+    /// The stop-side of [`Self::note_stream_started`] — decrements
+    /// `owner`'s `stream_count` and drops the matching `(owner, stream_id)`
+    /// entry out of `streams`. Called both for our own stream stopping
+    /// (from `AppState`'s various teardown paths, for the same "the relay
+    /// never echoes this back to us" reason as `note_stream_started`) and,
+    /// from `AppState::drain_events`, for every other member's
+    /// `StreamStopped`.
+    pub fn note_stream_stopped(&mut self, owner: ConnId, stream_id: StreamId) {
+        if let Some(m) = self.members.iter_mut().find(|m| m.conn_id == owner) {
+            m.stream_count = m.stream_count.saturating_sub(1);
+        }
+        self.streams.retain(|s| !(s.owner == owner && s.stream_id == stream_id));
+    }
+
     /// Start decoding/playing `(owner, stream_id)`'s audio if not already
     /// doing so, and subscribe to it. Shared by `toggle_watch`'s
     /// auto-subscribe-audio-alongside-video path and `toggle_listen`'s
@@ -1726,6 +1767,31 @@ impl AppState {
                             dest.pending = None;
                         }
                     }
+                    // This destination is now genuinely live (its `Announce
+                    // Stream` already went out inside `spawn_add_destination`
+                    // — see `capture::spawn_destination`'s doc comment on
+                    // "announce after the first IDR"): synthesize the
+                    // self-owned `StreamInfo` the relay's own `StreamStarted`
+                    // broadcast would have carried, since the relay never
+                    // echoes it back to the connection that announced it. See
+                    // `RoomSession::note_stream_started`'s doc comment.
+                    if let Some(dest) =
+                        self.captures.get(&pending.capture_id).and_then(|c| c.destinations.get(&pending.destination_id))
+                    {
+                        let stream_id = dest.stream_id;
+                        let (width, height) = (dest.params.width as u16, dest.params.height as u16);
+                        if let Some(room) = self.rooms.get_mut(&pending.room) {
+                            let owner = room.client.conn_id();
+                            room.note_stream_started(StreamInfo {
+                                owner,
+                                stream_id,
+                                kind: StreamKind::Video,
+                                label: "Screen".to_string(),
+                                width,
+                                height,
+                            });
+                        }
+                    }
                     // The new destination is live: this is the "break" half of
                     // make-before-break, and the only place the old
                     // destination is ever torn down.
@@ -1783,8 +1849,18 @@ impl AppState {
     /// Drop one destination from the local model (no pipeline work): used when
     /// bringing it up failed, so there is nothing to tear down.
     pub fn forget_destination(&mut self, capture_id: CaptureSourceId, destination_id: DestinationId) {
-        if let Some(capture) = self.captures.get_mut(&capture_id) {
-            capture.destinations.shift_remove(&destination_id);
+        let removed = self.captures.get_mut(&capture_id).and_then(|capture| capture.destinations.shift_remove(&destination_id));
+        // Mirror `StreamStopped` for our own stream, same reasoning as
+        // `poll_pending_destinations`'s `note_stream_started` call — see
+        // `RoomSession::note_stream_started`'s doc comment. A destination
+        // that never got as far as its `AnnounceStream` (the failed-to-come-
+        // up path this function also serves) never had a `streams` entry to
+        // begin with; `note_stream_stopped`'s `retain` is a safe no-op then.
+        if let Some(dest) = &removed
+            && let Some(room) = self.rooms.get_mut(&dest.room)
+        {
+            let owner = room.client.conn_id();
+            room.note_stream_stopped(owner, dest.stream_id);
         }
         for room in self.rooms.values_mut() {
             room.destinations.retain(|d| *d != destination_id);
@@ -2213,6 +2289,14 @@ impl AppState {
         for (destination_id, dest) in capture.destinations.iter() {
             if let Some(room) = self.rooms.get_mut(&dest.room) {
                 room.destinations.retain(|d| d != destination_id);
+                // Mirror `StreamStopped` for our own stream — same
+                // "the relay never echoes this back to us" reasoning as
+                // `forget_destination`/`poll_capture_states`'s `note_stream_
+                // started`. A destination that never made it past `Starting`
+                // (e.g. a failed capture start) never had a `streams` entry;
+                // `note_stream_stopped`'s `retain` is a safe no-op then.
+                let owner = room.client.conn_id();
+                room.note_stream_stopped(owner, dest.stream_id);
             }
             // Drop the allocator's memory of what this destination's encoder
             // was last set to, so a stopped stream stops counting as
@@ -2226,6 +2310,12 @@ impl AppState {
     /// Poll every in-flight capture start/stop, if any. Call once per frame.
     pub fn poll_capture_states(&mut self) {
         let mut to_remove = Vec::new();
+        // Self-owned streams to record once the loop below is done mutably
+        // borrowing `self.captures` — see the push site's comment for why
+        // this can't just call `self.rooms.get_mut(..)` inline. `owner` is
+        // filled in from each room's own `ConnId` afterwards, not stored
+        // here, since this loop never borrows `self.rooms`.
+        let mut started: Vec<(RoomHandle, StreamId, StreamKind, String, u16, u16)> = Vec::new();
         for (capture_id, capture) in self.captures.iter_mut() {
             match &mut capture.status {
                 ShareStatus::Starting(rx) => match rx.try_recv() {
@@ -2248,6 +2338,31 @@ impl AppState {
                                     dest.params = runtime.lock().unwrap().params();
                                 }
                             }
+                        }
+                        // By the time this task's `tx` resolved `Ok`, its
+                        // `AnnounceStream` already went out (both
+                        // `capture::start_sharing`/`start_sharing_with_source`
+                        // and `audio::start_audio_sharing` only return success
+                        // after announcing — see their own doc comments). This
+                        // is `start_video_share`'s/`start_audio_share`'s
+                        // "destination actually went live" moment, the
+                        // `ShareStatus::Starting` counterpart to `poll_
+                        // pending_destinations`'s `Ok(Ok(handle))` arm for
+                        // `go_live`/fan-out/transfer — mirror `StreamStarted`
+                        // for our own stream here too. See `RoomSession::
+                        // note_stream_started`'s doc comment for why nothing
+                        // else ever will.
+                        for dest in capture.destinations.values() {
+                            let label = match capture.kind {
+                                StreamKind::Video => "Screen".to_string(),
+                                StreamKind::Audio => capture.label.clone(),
+                            };
+                            let (width, height) = if capture.kind == StreamKind::Video {
+                                (dest.params.width as u16, dest.params.height as u16)
+                            } else {
+                                (0, 0)
+                            };
+                            started.push((dest.room, dest.stream_id, capture.kind, label, width, height));
                         }
                         capture.status = ShareStatus::Active(handle);
                     }
@@ -2274,6 +2389,12 @@ impl AppState {
                     }
                 },
                 ShareStatus::Active(_) => {}
+            }
+        }
+        for (room_handle, stream_id, kind, label, width, height) in started {
+            if let Some(room) = self.rooms.get_mut(&room_handle) {
+                let owner = room.client.conn_id();
+                room.note_stream_started(StreamInfo { owner, stream_id, kind, label, width, height });
             }
         }
         for capture_id in to_remove {
@@ -2638,17 +2759,10 @@ impl AppState {
                         room.members.retain(|m| m.conn_id != conn_id);
                     }
                     ClientEvent::PresenceDelta(PresenceEvent::StreamStarted(info)) => {
-                        if let Some(m) = room.members.iter_mut().find(|m| m.conn_id == info.owner) {
-                            m.stream_count = m.stream_count.saturating_add(1);
-                        }
-                        room.streams.retain(|s| !(s.owner == info.owner && s.stream_id == info.stream_id));
-                        room.streams.push(info);
+                        room.note_stream_started(info);
                     }
                     ClientEvent::PresenceDelta(PresenceEvent::StreamStopped { conn_id, stream_id }) => {
-                        if let Some(m) = room.members.iter_mut().find(|m| m.conn_id == conn_id) {
-                            m.stream_count = m.stream_count.saturating_sub(1);
-                        }
-                        room.streams.retain(|s| !(s.owner == conn_id && s.stream_id == stream_id));
+                        room.note_stream_stopped(conn_id, stream_id);
                         room.preview_cache.remove(conn_id, stream_id);
                         room.preview_textures.remove(&(conn_id, stream_id));
                     }
