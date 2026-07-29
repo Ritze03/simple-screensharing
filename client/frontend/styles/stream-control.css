@@ -830,10 +830,19 @@
 /* `min-width` added 2026-07-29 — with only a `max-width` cap and no floor,
    this shrank to fit whatever short/empty label happened to be selected
    (e.g. before any real audio source is picked), collapsing to barely more
-   than the dropdown chevron. */
+   than the dropdown chevron. Bumped further the same day to guarantee room
+   for a real 40-character source name without ellipsis-truncating: measured
+   (real Chromium canvas `measureText`, this element's actual font/size,
+   worst-case all-caps "AAAA…" — the widest realistic glyph run) at 294px for
+   40 characters, plus this trigger's own chrome — 16px padding (`.dest-
+   room-select`'s `padding: 8px 8px` wins the cascade over `dropdown.css`'s
+   own `.dd-trigger` padding), 6px label-to-chevron gap, 15px chevron —
+   rounds up to 331px. `max-width` raised well above that so it still
+   actually bounds something (a name much longer than 40 chars), not a
+   contradiction with the new floor. */
 .dest-audio-select {
-  min-width: 100px;
-  max-width: 150px;
+  min-width: 331px;
+  max-width: 420px;
 }
 
 .dest-audio-share-btn {
