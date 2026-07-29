@@ -1627,14 +1627,13 @@
       }, { className: "dest-audio-share-btn" })
     );
 
-    // Staged cards get a bigger "+ Add audio" — same rationale as
-    // `.dest-actions-staged .dest-action-btn` right above (Go live/Cancel):
-    // this is a staged card's only other clickable affordance besides those
-    // two, so it needs to read at the same deliberate size, not the small
-    // routine-action sizing a live card's row uses. See
-    // `.dest-audio-add-btn-staged` in stream-control.css.
+    // `dest-audio-add-btn-lg` is the same 32px size on both staged and live
+    // cards now (2026-07-29 — owner flagged the button visibly shrinking the
+    // moment a card goes live, same class of fix as `dest-audio-share-btn`
+    // above), so it's unconditional rather than `opts.staged`-gated; see the
+    // class's definition in stream-control.css.
     const addBtn = el("button", {
-      className: "dest-chip-add-btn dest-audio-add-btn" + (opts.staged ? " dest-audio-add-btn-staged" : ""),
+      className: "dest-chip-add-btn dest-audio-add-btn dest-audio-add-btn-lg",
       text: "+ Add audio",
       onClick: async () => {
         // Re-list on open: which applications are producing audio changes
@@ -1669,7 +1668,11 @@
    * staged capture has zero destinations (nothing announced to any room
    * yet), so starting audio against it would create exactly the orphan,
    * video-less "LIVE" stream the backend now refuses outright
-   * (`AppState::start_audio_share`).
+   * (`AppState::start_audio_share`). Text reads just "+ Add audio", same as
+   * the live button — the faded `dest-audio-add-btn-disabled` treatment
+   * (opacity/cursor/pointer-events) is what communicates "unavailable", not
+   * extra copy (2026-07-29, owner asked to drop the "(available once you Go
+   * Live)" annotation as redundant with the visual state).
    */
   function addAudioUnavailableRow() {
     const row = el("div", { className: "dest-audio-row dest-audio-row-empty dest-audio-row-disabled" });
@@ -1677,8 +1680,8 @@
     row.appendChild(el("span", { className: "dest-audio-empty-text", text: "No audio attached" }));
     row.appendChild(
       el("span", {
-        className: "dest-chip-add-btn dest-audio-add-btn dest-audio-add-btn-staged dest-audio-add-btn-disabled",
-        text: "+ Add audio (available once you Go Live)",
+        className: "dest-chip-add-btn dest-audio-add-btn dest-audio-add-btn-lg dest-audio-add-btn-disabled",
+        text: "+ Add audio",
         attrs: { "aria-disabled": "true" },
       })
     );
