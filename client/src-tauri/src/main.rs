@@ -120,6 +120,7 @@ fn main() {
             commands::toggle_watch,
             commands::toggle_listen,
             commands::set_volume,
+            commands::get_volume,
             commands::stream_video_url,
         ])
         .run(tauri::generate_context!())

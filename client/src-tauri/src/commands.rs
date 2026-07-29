@@ -753,7 +753,7 @@ pub fn toggle_listen(managed: State<'_, Managed>, room_handle: u32, owner: Strin
     Ok(())
 }
 
-/// Set playback volume (0-200%) for `owner`'s audio.
+/// Set playback volume (0-200%) and mute state for `owner`'s audio.
 ///
 /// `stream_id` may be either the audio stream's own id *or* the id of the
 /// video stream the frontend is showing for that sender. `Why accept both:`
@@ -766,8 +766,14 @@ pub fn toggle_listen(managed: State<'_, Managed>, room_handle: u32, owner: Strin
 /// into a UI whose whole point is that audio isn't a separate thing.
 /// A direct hit on the audio id still works unchanged, for the standalone
 /// audio-only "Listen" case.
+///
+/// `volume_percent` is stored as-is (the slider's *desired* value) even
+/// while `muted` is true — `AudioWatch::volume_percent`'s doc comment
+/// explains why: it lets the eventual unmute (or another window's
+/// `get_volume` query) recover the pre-mute value instead of seeing a
+/// flattened 0. The decoder itself still gets muted immediately.
 #[tauri::command]
-pub fn set_volume(managed: State<'_, Managed>, room_handle: u32, owner: String, stream_id: u8, volume_percent: u32) -> Result<(), String> {
+pub fn set_volume(managed: State<'_, Managed>, room_handle: u32, owner: String, stream_id: u8, volume_percent: u32, muted: bool) -> Result<(), String> {
     let owner = dto::parse_owner(&owner)?;
     if let Some(room) = managed.state.lock().unwrap().rooms.get_mut(&RoomHandle(room_handle)) {
         let audio_stream_id = if room.audio_watches.lock().unwrap().contains_key(&(owner, stream_id)) {
@@ -779,7 +785,9 @@ pub fn set_volume(managed: State<'_, Managed>, room_handle: u32, owner: String, 
             && let Some(watch) = room.audio_watches.lock().unwrap().get_mut(&(owner, audio_stream_id))
         {
             watch.volume_percent = volume_percent;
-            watch.decoder.set_volume(volume_percent as f64 / 100.0);
+            watch.muted = muted;
+            let effective = if muted { 0.0 } else { volume_percent as f64 / 100.0 };
+            watch.decoder.set_volume(effective);
         }
         // Remember this owner's chosen volume independent of the current
         // audio stream id, so it survives the sender restarting/switching
@@ -789,6 +797,40 @@ pub fn set_volume(managed: State<'_, Managed>, room_handle: u32, owner: String, 
         room.audio_volume_by_owner.insert(owner, volume_percent);
     }
     Ok(())
+}
+
+/// Read back `owner`'s current volume/mute state — the counterpart query to
+/// `set_volume`, added (2026-07-29) so a tile's slider can show the real
+/// state instead of a per-window default of 100%/unmuted. `RoomSession::
+/// audio_watches` (mirrored to both the View tab and any pop-out window
+/// through this one command) is the single source of truth both windows
+/// read at the moment they render a tile they haven't seen before in this
+/// window's lifetime — see `frontend/scripts/view.js`'s `ensureVolumeSeeded`
+/// and `viewer.js`'s matching copy.
+///
+/// Resolves `stream_id` the same video-or-audio-id-both-work way
+/// `set_volume` does (see its doc comment). Defaults to 100%/unmuted (the
+/// same default the frontend used before this command existed) when no
+/// audio watch is found yet, e.g. a tile whose audio subscription hasn't
+/// been reconciled by `sync_audio_watches` the instant the tile first
+/// renders.
+#[tauri::command]
+pub fn get_volume(managed: State<'_, Managed>, room_handle: u32, owner: String, stream_id: u8) -> Result<dto::VolumeStateDto, String> {
+    let owner = dto::parse_owner(&owner)?;
+    let state = managed.state.lock().unwrap();
+    let Some(room) = state.rooms.get(&RoomHandle(room_handle)) else {
+        return Ok(dto::VolumeStateDto { volume_percent: 100, muted: false });
+    };
+    let audio_stream_id =
+        if room.audio_watches.lock().unwrap().contains_key(&(owner, stream_id)) { Some(stream_id) } else { room.sibling_audio_stream(owner) };
+    let Some(audio_stream_id) = audio_stream_id else {
+        return Ok(dto::VolumeStateDto { volume_percent: 100, muted: false });
+    };
+    let watches = room.audio_watches.lock().unwrap();
+    let Some(watch) = watches.get(&(owner, audio_stream_id)) else {
+        return Ok(dto::VolumeStateDto { volume_percent: 100, muted: false });
+    };
+    Ok(dto::VolumeStateDto { volume_percent: watch.volume_percent, muted: watch.muted })
 }
 
 // `pop_out_stream` (a native Tauri `WebviewWindowBuilder` second window
