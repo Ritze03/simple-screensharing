@@ -308,6 +308,22 @@ function dispatchEvent(eventName, dataText) {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send(eventName, payload);
   }
+  // Pop-out windows have no `shell.js` to fan events out for them — they
+  // listen for the one they care about (`stream-stats-updated`, see
+  // `viewer.js`'s `listenForStats`) directly via `window.__TAURI__.event
+  // .listen`, which is backed by a plain `ipcRenderer.on(eventName, ...)` in
+  // `preload.js`. Without this, that `.on()` registration never received
+  // anything: SSE events used to be forwarded to `mainWindow` only, so a
+  // pop-out window's bitrate readout stayed permanently blank (root cause
+  // of the pop-out "bitrate never shows" bug — confirmed live, fixed here).
+  // Forwarding every event to every pop-out window (not just the one whose
+  // stream this event happens to concern) is harmless: a pop-out window
+  // only has an `ipcRenderer.on` listener for events it actually asked for
+  // (just `stream-stats-updated`), so sending it e.g. `room-connected` is
+  // simply never read.
+  for (const win of popoutWindows.values()) {
+    if (win && !win.isDestroyed()) win.webContents.send(eventName, payload);
+  }
 }
 
 // ---------------------------------------------------------------------
@@ -479,6 +495,23 @@ ipcMain.handle("viewer-set-fullscreen", (event, fullscreen) => {
 
 ipcMain.handle("viewer-close", (event) => {
   const win = BrowserWindow.fromWebContents(event.sender);
+  if (win && !win.isDestroyed()) {
+    win.close();
+  }
+});
+
+// Unlike the two handlers above (which resolve their target window via the
+// calling renderer's own `event.sender`), this one is called FROM the main
+// window to close a *different* window — the pop-out window for a given
+// stream — so it resolves its target via `streamKey` against `popoutWindows`
+// instead. Backs `view.js`'s "Bring it back" held-slot button: closing the
+// real pop-out `BrowserWindow` here fires that window's own `closed` handler
+// above unconditionally, which sends `popout-closed` back to `mainWindow` —
+// `view.js`'s existing `onPopoutClosed` listener does the
+// `poppedOutIds`/render cleanup from that signal, so this handler itself
+// doesn't need to (and shouldn't) duplicate it.
+ipcMain.handle("close-popout-window", (_event, streamKey) => {
+  const win = popoutWindows.get(streamKey);
   if (win && !win.isDestroyed()) {
     win.close();
   }

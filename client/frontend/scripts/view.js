@@ -807,18 +807,95 @@
   }
 
   /** Held-slot placeholder — see this file's header note on `poppedOutIds`.
-   * Deliberately renders NO video/overlay/checkbox machinery at all (the
-   * tile is genuinely not decoding — its controller was never started for a
-   * held tile, see `renderTile` below), just the dashed-border "bring it
-   * back" affordance the design spec calls for. */
+   * Deliberately renders NO video/overlay/checkbox machinery (the tile is
+   * genuinely not decoding here — its `TileVideo` controller was never
+   * started for a held tile, see `renderTile` below), just the dashed-
+   * border "bring it back" affordance plus a live stat bar.
+   *
+   * 2026-07-30 investigation into what that stat bar can honestly show
+   * while held (owner's ask: "should ALSO show the same live stat bar"):
+   * popping a stream out does NOT tear down or move its backend `watch`
+   * (`popOutWatch` above never calls `toggle_watch`; the pop-out window's
+   * own `resolveTiles` only *resolves* the same already-existing watch's
+   * video URL, it doesn't create a new one) — so `room.watches` keeps
+   * running for a held tile exactly as it did before it was popped out, and
+   * the sidecar keeps emitting real `stream-stats-updated` ticks for it
+   * regardless of which window (if any) is actually looking. That makes two
+   * of the always-visible stat bar's fields genuinely live even while held:
+   *   - `received_bitrate_kbps` (`decode::StreamDecoder::feed`, called for
+   *     every incoming media frame regardless of whether anything
+   *     downstream ever renders it — see `updateStats`'s doc comment above)
+   *     — wired here exactly like `renderTile`'s own `bitrateSpan`.
+   *   - the dot/name/room/resolution/audio-badge fields, which were always
+   *     static per-tile metadata, not a live signal, even in the normal
+   *     (non-held) tile.
+   * fps is the one field that can't honestly be live here: `received_fps`
+   * (the OTHER field this same event carries) is permanently 0 for every
+   * stream project-wide — see `updateStats`'s doc comment on why the
+   * server-side counter behind it has been dead since the H.264-relay
+   * redesign — so the ONLY fps source this app has at all is `tile-video
+   * .js`'s own client-side WebCodecs decode counter, which a held tile
+   * deliberately does not run (that's the whole point of holding: no
+   * decoding for a stream nobody's looking at in this window). Faking a
+   * frozen last-known fps here would misrepresent a number that was never
+   * live to begin with even when the tile was on screen normally in some
+   * configurations (mock/pre-controller-start) — simplest honest choice:
+   * omit the fps span entirely rather than show a number that cannot
+   * update. */
   function renderHeldSlot(tile, reasonText) {
     const wrap = el("div", { className: "media-tile media-tile-held" });
+
+    const statbar = el("div", { className: "media-tile-statbar" });
+    statbar.appendChild(el("span", { className: "media-tile-statbar-dot" }));
+    statbar.appendChild(el("span", { className: "media-tile-statbar-name", text: `${tile.ownerLabel} · ${tile.roomLabel}` }));
+    if (tile.resolution) {
+      statbar.appendChild(el("span", { className: "media-tile-statbar-sep", text: "·" }));
+      statbar.appendChild(el("span", { className: "media-tile-statbar-value", text: tile.resolution }));
+    }
+    // No fps span here — see the doc comment above on why fps genuinely has
+    // no live source while held. Bitrate keeps updating via `updateStats`
+    // (same `bitrateSpans` map every non-held tile uses) for exactly the
+    // reason explained above: the byte-rate counter behind it runs
+    // independent of any window's decode.
+    const bitrateSpan = el("span", { className: "media-tile-statbar-value media-tile-bitrate", text: "" });
+    statbar.appendChild(bitrateSpan);
+    if (tile.id) bitrateSpans.set(tile.id, bitrateSpan);
+    if (tile.hasAudio) {
+      const audioBadge = el("span", { className: "media-tile-statbar-audio-badge", attrs: { title: "Sharing audio", "aria-label": "Sharing audio" } });
+      audioBadge.appendChild(icon("volume_up"));
+      statbar.appendChild(audioBadge);
+    }
+    wrap.appendChild(statbar);
+
     wrap.appendChild(icon("picture_in_picture_alt"));
     wrap.appendChild(el("div", { className: "media-tile-held-text", text: `${tile.ownerLabel} is ${reasonText}` }));
     wrap.appendChild(
       secondaryButton(
         "Bring it back",
-        () => {
+        async () => {
+          // Close the real pop-out `BrowserWindow` too (2026-07-30) — this
+          // used to be pure client-side state (`poppedOutIds.delete` +
+          // `render()`), leaving the actual window open and still decoding
+          // while the main window ALSO resumed rendering the same stream.
+          // Closing it here fires that window's own `closed` handler in
+          // `main.js`, which sends the existing `popout-closed` IPC signal
+          // back unconditionally — the `onPopoutClosed` listener near the
+          // bottom of this file does the `poppedOutIds.delete`/`render()`
+          // cleanup from THAT signal, so this handler deliberately does NOT
+          // also do it here (that would be a double-delete/double-render
+          // race with no benefit: `Set.delete`/the listener's guard make a
+          // second delete a harmless no-op, but doing the work twice serves
+          // no purpose). Guarded for the mock/plain-browser branch, which
+          // has no real window to close — that branch keeps the old
+          // client-state-only behavior.
+          if (window.__ELECTRON__ && window.__ELECTRON__.closePopout && tile.id) {
+            try {
+              await window.__ELECTRON__.closePopout(tile.id);
+            } catch (e) {
+              console.error("closePopout failed", e);
+            }
+            return;
+          }
           if (tile.id) poppedOutIds.delete(tile.id);
           render();
         },
