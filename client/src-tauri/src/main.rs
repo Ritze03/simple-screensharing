@@ -74,6 +74,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::list_saved_rooms,
             commands::join_room,
+            commands::cancel_connect,
             commands::create_room,
             commands::leave_needs_confirm,
             commands::leave_room,

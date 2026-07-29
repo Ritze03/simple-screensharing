@@ -511,6 +511,7 @@ fn dispatch(name: &str, body: &Value, app: &AppHandle) -> Result<Value, ApiError
         "list_active_streams" => ok(commands::list_active_streams(managed)),
         "room_detail" => ok(commands::room_detail(managed, get_u32(body, "room_handle")?)),
         "join_room" => result(commands::join_room(managed, get_string(body, "join_string")?, get_string(body, "display_name")?, opt_string(body, "room_name"))),
+        "cancel_connect" => ok(commands::cancel_connect(managed)),
         "create_room" => result(commands::create_room(managed, get_string(body, "server")?, get_string(body, "room_name")?)),
         "toggle_watch" => {
             result(commands::toggle_watch(managed, get_u32(body, "room_handle")?, get_string(body, "owner")?, get_u8(body, "stream_id")?))

@@ -1013,6 +1013,14 @@ pub struct PendingConnect {
     /// failure can be reported inside that card (which stays open) rather
     /// than as a detached error under the ROOMS list.
     pub from_add_card: bool,
+    /// Handle to the `tokio::spawn`ed connect task, so a user-initiated
+    /// cancel (`AppState::cancel_connect`) can abort it outright rather than
+    /// waiting for it to resolve on its own. Safe to abort at any point up to
+    /// success: `ScreenshareClient::connect` doesn't spawn any fan-out tasks
+    /// (`control_reader_loop`/`datagram_reader_loop`/`preview_uni_loop`) until
+    /// *after* it returns `Ok`, so there is nothing left half-registered to
+    /// unwind — see `net.rs`'s `connect`.
+    pub abort: tokio::task::AbortHandle,
 }
 
 /// What a just-resolved connect attempt was — returned by
@@ -1161,7 +1169,17 @@ pub struct AppState {
     /// change). Compared against `presentation_mode` to show a "restart to
     /// apply" hint only once the two diverge.
     pub launch_presentation_mode: PresentationMode,
+    /// How long `start_connect` waits for `ScreenshareClient::connect` before
+    /// giving up with a timeout error. `pub(crate)` and mutable (rather than a
+    /// bare constant) purely so tests can shrink it instead of literally
+    /// sleeping 15s — production always leaves this at
+    /// [`DEFAULT_CONNECT_TIMEOUT`].
+    pub(crate) connect_timeout: Duration,
 }
+
+/// Default value of [`AppState::connect_timeout`] — the feature request's
+/// "connecting should time out after 15 seconds".
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl Default for AppState {
     fn default() -> Self {
@@ -1218,6 +1236,7 @@ impl Default for AppState {
             language: settings.language,
             presentation_mode: settings.presentation_mode,
             launch_presentation_mode: settings.presentation_mode,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         }
     }
 }
@@ -2666,17 +2685,46 @@ impl AppState {
             }
         };
         let display_name = self.display_name.clone();
+        let timeout = self.connect_timeout;
+        let connect_join_string = join_string.clone();
         let (tx, rx) = oneshot::channel();
-        self.pending_connect = Some(PendingConnect { rx, join_string: join_string.clone(), from_add_card });
-        self.status = Status::Connecting;
 
-        tokio::spawn(async move {
-            let result = ScreenshareClient::connect(&endpoint, &join_string, &display_name)
-                .await
-                .map_err(|e| format!("{e:#}"));
+        let join_handle = tokio::spawn(async move {
+            let result = match tokio::time::timeout(
+                timeout,
+                ScreenshareClient::connect(&endpoint, &connect_join_string, &display_name),
+            )
+            .await
+            {
+                Ok(result) => result.map_err(|e| format!("{e:#}")),
+                Err(_elapsed) => Err(t!("errors.connect_timed_out").to_string()),
+            };
             let _ = tx.send(result);
         });
+        self.pending_connect = Some(PendingConnect {
+            rx,
+            join_string: join_string.clone(),
+            from_add_card,
+            abort: join_handle.abort_handle(),
+        });
+        self.status = Status::Connecting;
         Ok(())
+    }
+
+    /// Cancel the in-flight connect attempt, if any — the right-click menu's
+    /// "Disconnect" while a room row is showing "Reconnecting…"
+    /// (`shell.js`'s `renderRoomPanel`). Aborts the spawned task outright
+    /// rather than waiting for `ScreenshareClient::connect` to notice; see
+    /// `PendingConnect::abort`'s doc comment for why that's safe pre-success.
+    ///
+    /// No-op if nothing is pending — the same "at most one" invariant
+    /// `start_connect`/`poll_auto_connect_queue` already rely on (only one
+    /// `pending_connect` slot exists), so there's nothing to disambiguate.
+    pub fn cancel_connect(&mut self) {
+        if let Some(pending) = self.pending_connect.take() {
+            pending.abort.abort();
+            self.status = Status::Idle;
+        }
     }
 
     /// Whether `join_string` is the room a connect is currently in flight for
@@ -3009,5 +3057,105 @@ impl AppState {
             self.status = Status::Error(t!("errors.disconnected", reason = reason).to_string());
             self.disconnect_room(handle);
         }
+    }
+}
+
+#[cfg(test)]
+mod connect_timeout_and_cancel_tests {
+    use super::*;
+
+    /// A syntactically valid join string pointing at TEST-NET-1
+    /// (`192.0.2.0/24`, reserved by RFC 5737 for documentation/examples,
+    /// guaranteed never to route anywhere real) — the QUIC handshake's
+    /// `.await` inside `ScreenshareClient::connect` blocks on real network
+    /// I/O against it and never resolves on its own, which is exactly the
+    /// "unreachable server" shape both tests below need.
+    fn unreachable_join_string() -> String {
+        crate::net::format_join_string("192.0.2.1:4433", &[0u8; 16], &[0x42u8; 32])
+    }
+
+    /// The connect timeout fires and reports failure once `connect_timeout`
+    /// elapses, without the test waiting that long for real: `start_paused =
+    /// true` gives this test tokio's virtual clock, and `tokio::time::advance`
+    /// jumps it forward directly — `tokio::time::timeout`'s internal sleep
+    /// fires off that virtual clock, so this proves the same code path the
+    /// real 15s default takes without a real 15s (or even a real fraction of
+    /// a second) sleep. `connect_timeout` is shrunk first purely so the
+    /// `advance` call is small and the intent ("past the deadline") reads
+    /// clearly — the mechanism doesn't depend on the specific duration.
+    #[tokio::test(start_paused = true)]
+    async fn connect_times_out_and_reports_failure_without_a_real_wait() {
+        let mut state = AppState::default();
+        state.connect_timeout = Duration::from_millis(50);
+
+        state.start_connect(unreachable_join_string(), false).expect("start_connect should not fail synchronously");
+        assert!(state.pending_connect.is_some());
+
+        // Let the spawned task actually start running (DNS-resolve the
+        // literal IP, kick off the QUIC handshake) before advancing time —
+        // otherwise `tokio::time::timeout`'s inner sleep hasn't even been
+        // constructed yet for `advance` to fast-forward past.
+        tokio::task::yield_now().await;
+
+        // Nothing has resolved yet — the connect is still (virtually) in
+        // flight.
+        assert!(matches!(state.poll_connect_result(), ConnectOutcome::None));
+
+        tokio::time::advance(Duration::from_millis(100)).await;
+        // Let the now-fired timeout's task actually run and send its result;
+        // may take a couple of scheduling rounds, so poll a few times rather
+        // than assuming one `yield_now` is enough.
+        let mut outcome = ConnectOutcome::None;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            outcome = state.poll_connect_result();
+            if !matches!(outcome, ConnectOutcome::None) {
+                break;
+            }
+        }
+
+        match outcome {
+            ConnectOutcome::Failed { error, from_add_card } => {
+                assert!(error.contains("timed out"), "expected a timeout error, got: {error}");
+                assert!(!from_add_card);
+            }
+            other => panic!("expected ConnectOutcome::Failed, got a different outcome: {}", matches!(other, ConnectOutcome::None)),
+        }
+        assert!(state.pending_connect.is_none(), "pending_connect must be cleared once resolved");
+    }
+
+    /// `cancel_connect` aborts an in-flight attempt outright — the room
+    /// panel's Disconnect button while a row shows "Reconnecting…". Checks
+    /// both ends: `pending_connect` is cleared immediately (what makes the
+    /// row flip back to disconnected), and the aborted task actually stops
+    /// running rather than silently finishing in the background later (what
+    /// "no leaked task" means here — see `PendingConnect::abort`'s doc
+    /// comment for why aborting mid-handshake is safe).
+    #[tokio::test(start_paused = true)]
+    async fn cancel_connect_aborts_the_in_flight_attempt_without_leaking() {
+        let mut state = AppState::default();
+        // Timeout deliberately left far longer than this test needs — this
+        // test is about the user-initiated cancel path, not the timeout, so
+        // the timeout must not be the thing that resolves it first.
+        state.connect_timeout = Duration::from_secs(60);
+
+        state.start_connect(unreachable_join_string(), false).expect("start_connect should not fail synchronously");
+        let pending = state.pending_connect.as_ref().expect("pending_connect must be set");
+        let abort_handle = pending.abort.clone();
+        assert!(!abort_handle.is_finished(), "connect task should still be in flight before cancelling");
+
+        state.cancel_connect();
+        assert!(state.pending_connect.is_none(), "cancel_connect must clear pending_connect immediately");
+        assert!(matches!(state.status, Status::Idle));
+
+        // Give the abort a chance to actually take effect on the task.
+        tokio::task::yield_now().await;
+        assert!(abort_handle.is_finished(), "the spawned connect task must actually stop running, not just be forgotten");
+
+        // Advancing well past even the (irrelevantly long) timeout must not
+        // resurrect a result — there's nothing left to resolve.
+        tokio::time::advance(Duration::from_secs(120)).await;
+        tokio::task::yield_now().await;
+        assert!(matches!(state.poll_connect_result(), ConnectOutcome::None));
     }
 }
