@@ -2323,28 +2323,16 @@ impl AppState {
         }
     }
 
-    /// Starts a non-announcing level tap for one dropdown candidate —
-    /// backs the "Add audio"/"Switch" picker's per-entry meter (see
-    /// [`audio::AudioLevelTapHandle`]'s doc comment for why this is a
-    /// separate, much cheaper thing than a real audio share). `source` is
-    /// resolved by the caller against a fresh `list_audio_sources()` call
-    /// (see `commands::start_audio_level_tap`) rather than trusted from
-    /// whatever the frontend already had cached, since the whole point of
-    /// this tap is to describe a source's *current* state.
-    ///
-    /// Errors (no `object.serial` for this node, or the GStreamer pipeline
-    /// failing to construct) are non-fatal to the caller — the frontend
-    /// just leaves that one entry's meter unlit rather than failing the
-    /// whole dropdown open.
-    pub fn start_audio_level_tap(&mut self, source: &AudioSource) -> Result<u32, String> {
-        let serial = source
-            .serial
-            .ok_or_else(|| format!("'{}' has no PipeWire object.serial to tap yet", source.name))?;
-        let handle = audio::start_level_tap(serial).map_err(|e| format!("{e:#}"))?;
+    /// Registers an already-constructed level tap (built by the caller via
+    /// [`audio::start_level_tap`] *before* taking this lock — see
+    /// `commands::start_audio_level_tap`'s doc comment for why building the
+    /// GStreamer pipeline can't happen while holding `AppState`'s mutex) and
+    /// returns the id the frontend polls/stops it with.
+    pub fn insert_audio_level_tap(&mut self, handle: audio::AudioLevelTapHandle) -> u32 {
         let id = self.next_audio_level_tap_id;
         self.next_audio_level_tap_id = self.next_audio_level_tap_id.wrapping_add(1);
         self.audio_level_taps.insert(AudioLevelTapId(id), handle);
-        Ok(id)
+        id
     }
 
     /// Newest reading (0.0-1.0) of a live level tap, or `None` if `tap_id`
