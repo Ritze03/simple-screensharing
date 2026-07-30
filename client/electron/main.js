@@ -33,19 +33,33 @@ const readline = require("readline");
 
 const API_HOST = "127.0.0.1";
 
+// Packaged (AppImage) vs dev path resolution: when packaged, `__dirname`
+// resolves inside `app.asar` and the sibling `../frontend`/`../target`
+// source-tree directories no longer exist alongside it — the build script's
+// `extraResources` (see `electron/package.json`'s `build` key) instead copies
+// `frontend/` and the release sidecar binary into
+// `process.resourcesPath` (`resources/frontend`, `resources/sidecar/...`) at
+// build time, so packaged lookups must root there instead of `__dirname`.
+const RESOURCES_ROOT = app.isPackaged ? process.resourcesPath : path.join(__dirname, "..");
+
 // SIDECAR_BIN: optional full path to the sidecar binary to spawn, overriding
-// the default debug-build path below. Lets a caller (e.g. a dev script that
-// wants representative capture/encode/decode performance) point Electron at
-// a `--release` build without any code change.
-const SIDECAR_PATH = process.env.SIDECAR_BIN || path.join(__dirname, "..", "target", "debug", "simple-screensharing-client-tauri");
-const FRONTEND_INDEX = path.join(__dirname, "..", "frontend", "index.html");
-const VIEWER_HTML = path.join(__dirname, "..", "frontend", "viewer.html");
+// the default path below. Lets a caller (e.g. a dev script that wants
+// representative capture/encode/decode performance) point Electron at a
+// `--release` build without any code change. Packaged builds always use the
+// bundled release binary under `resources/sidecar/`.
+const SIDECAR_PATH =
+  process.env.SIDECAR_BIN ||
+  (app.isPackaged
+    ? path.join(RESOURCES_ROOT, "sidecar", "simple-screensharing-client-tauri")
+    : path.join(RESOURCES_ROOT, "target", "debug", "simple-screensharing-client-tauri"));
+const FRONTEND_INDEX = path.join(RESOURCES_ROOT, "frontend", "index.html");
+const VIEWER_HTML = path.join(RESOURCES_ROOT, "frontend", "viewer.html");
 const PRELOAD = path.join(__dirname, "preload.js");
 // 256px source: large enough for the window manager/taskbar to downscale
 // cleanly on Linux without passing multiple sizes (Electron scales a single
 // PNG itself). See `superdoc/ui/APP-SHELL.md`'s icon note for the full kept-
 // resolution rationale.
-const APP_ICON = path.join(__dirname, "..", "frontend", "assets", "icons", "mark-256.png");
+const APP_ICON = path.join(RESOURCES_ROOT, "frontend", "assets", "icons", "mark-256.png");
 
 let apiToken = null;
 let apiPort = null;

@@ -5,13 +5,38 @@
   "description": "Electron shell for simple-screensharing-client; talks to the src-tauri sidecar's REST+SSE api_server instead of Tauri IPC.",
   "main": "main.js",
   "scripts": {
-    "start": "electron ."
+    "start": "electron .",
+    "build:appimage": "cargo build --release -p simple-screensharing-client-tauri --manifest-path ../Cargo.toml && electron-builder --linux AppImage"
   },
   "devDependencies": {
     "electron": "^43.2.0",
+    "electron-builder": "^26.15.3",
     "playwright": "^1.62.0"
   },
   "allowScripts": {
     "electron@33.4.11": true
+  },
+  "build": {
+    "appId": "net.simplescreensharing.client",
+    "productName": "simple-screensharing-client",
+    "directories": {
+      "output": "../dist"
+    },
+    "files": [
+      "**/*",
+      "!pw-electron-test.js"
+    ],
+    "extraResources": [
+      { "from": "../frontend", "to": "frontend" },
+      {
+        "from": "../target/release/simple-screensharing-client-tauri",
+        "to": "sidecar/simple-screensharing-client-tauri"
+      }
+    ],
+    "linux": {
+      "target": ["AppImage"],
+      "icon": "../src-tauri/icons/icon.png",
+      "category": "Network"
+    }
   }
 }
