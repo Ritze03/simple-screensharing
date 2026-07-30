@@ -75,7 +75,15 @@
   font-family: var(--font-mono);
   font-weight: 400; /* mono has no real bold vendored — 700 would still synthesize */
   font-variant-numeric: tabular-nums;
-  min-width: var(--value-w);
+  /* Fixed to the widest realistic string ("99999 kbps" — 5 digits is the
+     realistic ceiling) so the label's own width never drives the grid's
+     value column — without this the slider track (column 2, `1fr`) grows
+     and shrinks as the digit count changes (e.g. 500 -> 10000), because
+     `min-width: var(--value-w)` referenced a custom property that was
+     never defined anywhere, making the whole declaration invalid and
+     falling back to `auto` (content-sized). */
+  min-width: 10ch;
+  flex-shrink: 0;
   text-align: right;
 }
 
