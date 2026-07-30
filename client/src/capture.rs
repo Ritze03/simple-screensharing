@@ -751,7 +751,23 @@ pub fn detect_encoder_backend() -> EncoderBackend {
 /// Never panics; any failure at either step just means "not available",
 /// logged at `info` level (this is an expected, handled path on machines
 /// without a supported GPU, not a warning-worthy problem).
+///
+/// `Why `ensure_gstreamer_initialized()` first:` this can now run before any
+/// capture ever starts — the codec selector's `supported_codecs`/
+/// `StagedCaptureRow::supported_codecs` call `detect_encoder_backend`
+/// (transitively, this fn) as soon as the Stream Control tab loads, not just
+/// from [`start_sharing`]. Without this, `gst::ElementFactory::make` below
+/// panics ("GStreamer has not been initialized") on that very first call of
+/// a session, since nothing else has necessarily called `gst::init()` yet by
+/// then. `gst::init()` is idempotent/cheap after the first call, so paying
+/// for it here on every `probe_vaapi_encoder` call (itself cached behind
+/// [`detect_encoder_backend`]'s `OnceLock`, so this really only runs once
+/// per process) is free.
 fn probe_vaapi_encoder() -> bool {
+    if let Err(e) = ensure_gstreamer_initialized() {
+        tracing::info!("GStreamer failed to initialize ({e}); using software encoder");
+        return false;
+    }
     if let Err(e) = gst::ElementFactory::make(VAAPI_ENCODER_ELEMENT).build() {
         tracing::info!(
             "VAAPI encoder element '{VAAPI_ENCODER_ELEMENT}' is not available ({e}); using software encoder"
