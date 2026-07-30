@@ -5,6 +5,16 @@ name: Windows build
 # natively on a windows-latest GitHub-hosted runner so a Windows-using friend
 # can download the resulting .exe (+ its GStreamer runtime DLLs) from the
 # workflow run and smoke-test it.
+#
+# 2026-07-30: switched from building the old standalone egui binary to
+# building the real app — the Electron shell (electron/, packaged via
+# electron-builder --win portable) spawning the src-tauri sidecar as a
+# child process, mirroring the Linux AppImage build (see electron/
+# package.json's `build.linux`/`build.win`). The sidecar is still built by
+# `cargo build`, cross-compiled at the x86_64-pc-windows-msvc target
+# (native on this windows-latest runner, so "cross-compiled" only in the
+# sense of a non-default target triple); electron-builder just packages the
+# Electron shell + that sidecar .exe + GStreamer runtime around it.
 on:
   push:
     branches: [master]
@@ -160,61 +170,58 @@ jobs:
           pkg-config --modversion gstreamer-app-1.0
           pkg-config --modversion gstreamer-video-1.0
 
-      - name: cargo build --release
+      # Only the sidecar needs building here — the old standalone egui
+      # binary (`simple-screensharing-client`) isn't part of the packaged
+      # app anymore, and skipping it keeps this build faster.
+      - name: cargo build --release (src-tauri sidecar)
         shell: pwsh
-        run: cargo build --release --target x86_64-pc-windows-msvc --locked
+        run: cargo build --release --target x86_64-pc-windows-msvc --locked -p simple-screensharing-client-tauri
 
-      # --- Package the artifact ------------------------------------------
-      # Ship the .exe alongside GStreamer's runtime DLLs and plugins so the
-      # friend doesn't need to install GStreamer themselves. Bundling the
-      # whole GStreamer bin/plugin set (rather than hand-picking a minimal
-      # DLL subset) is deliberately conservative: this app depends on
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: npm install (electron/)
+        shell: pwsh
+        run: npm install
+        working-directory: electron
+
+      # --- Stage the GStreamer runtime for electron-builder ---------------
+      # electron-builder's `build.win.extraResources` (electron/package.json)
+      # pulls the sidecar's runtime DLLs/plugins from here into the packaged
+      # app's `resources/win/` — mirrors the old standalone-binary artifact's
+      # bin/ + lib/gstreamer-1.0 layout, just staged as electron-builder
+      # input instead of the final artifact directly. Bundling the whole
+      # GStreamer bin/plugin set (rather than hand-picking a minimal DLL
+      # subset) is deliberately conservative: this app depends on
       # gstreamer-app/-video on top of core, and hand-tracing the exact
       # transitive DLL closure is brittle for a one-off smoke-test build.
-      - name: Stage build output for the artifact
+      - name: Stage GStreamer runtime for packaging
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $dist = "dist"
-          New-Item -ItemType Directory -Force -Path "$dist\bin" | Out-Null
-          New-Item -ItemType Directory -Force -Path "$dist\lib\gstreamer-1.0" | Out-Null
+          $runtime = "electron\win-runtime"
+          New-Item -ItemType Directory -Force -Path "$runtime\bin" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$runtime\lib\gstreamer-1.0" | Out-Null
+          Copy-Item "$env:GST_ROOT\bin\*.dll" "$runtime\bin\"
+          Copy-Item "$env:GST_ROOT\lib\gstreamer-1.0\*" "$runtime\lib\gstreamer-1.0\" -Recurse
 
-          Copy-Item "target\x86_64-pc-windows-msvc\release\simple-screensharing-client.exe" "$dist\bin\"
-          Copy-Item "$env:GST_ROOT\bin\*.dll" "$dist\bin\"
-
-          # Plugins (encoders/decoders/etc.), looked up by GStreamer
-          # relative to the DLLs at ..\lib\gstreamer-1.0 — which is exactly
-          # the bin\ + lib\ layout staged here.
-          Copy-Item "$env:GST_ROOT\lib\gstreamer-1.0\*" "$dist\lib\gstreamer-1.0\" -Recurse
-
-          # Fallback launcher in case relative-path plugin discovery
-          # doesn't kick in on the friend's machine: sets GST_PLUGIN_PATH
-          # explicitly before starting the exe.
-          Set-Content -Encoding ascii -Path "$dist\run.bat" -Value @'
-          @echo off
-          set GST_PLUGIN_PATH=%~dp0lib\gstreamer-1.0
-          set PATH=%~dp0bin;%PATH%
-          start "" "%~dp0bin\simple-screensharing-client.exe"
-          '@
-
-          Set-Content -Encoding ascii -Path "$dist\README.txt" -Value @'
-          Simple Screensharing Client - Windows smoke-test build
-          ========================================================
-
-          Double-click run.bat to launch it. That also works if GStreamer's
-          automatic plugin discovery doesn't find lib\gstreamer-1.0 on its
-          own. Running bin\simple-screensharing-client.exe directly should
-          work too in most cases.
-
-          This is an unsigned CI build intended for smoke-testing only -
-          Windows SmartScreen may warn about it being from an unknown
-          publisher.
-          '@
+      # Builds a portable (single self-contained, no-install) .exe — matches
+      # the "fully self-contained, just hand someone a file" spirit of the
+      # Linux AppImage build. NSIS (an installer) was the alternative; not
+      # chosen because this is a smoke-test hand-off to a friend, not a
+      # distributed release, so skipping an install step is the better fit.
+      - name: electron-builder --win portable
+        shell: pwsh
+        run: npm run build:win
+        working-directory: electron
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: simple-screensharing-client-windows-${{ env.GST_ARCH }}
-          path: dist/
+          path: |
+            dist/*.exe
           if-no-files-found: error
           retention-days: 14

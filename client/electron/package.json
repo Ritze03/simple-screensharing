@@ -6,7 +6,8 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "build:appimage": "cargo build --release -p simple-screensharing-client-tauri --manifest-path ../Cargo.toml && electron-builder --linux AppImage"
+    "build:appimage": "cargo build --release -p simple-screensharing-client-tauri --manifest-path ../Cargo.toml && electron-builder --linux AppImage",
+    "build:win": "electron-builder --win portable"
   },
   "devDependencies": {
     "electron": "^43.2.0",
@@ -27,16 +28,36 @@
       "!pw-electron-test.js"
     ],
     "extraResources": [
-      { "from": "../frontend", "to": "frontend" },
-      {
-        "from": "../target/release/simple-screensharing-client-tauri",
-        "to": "sidecar/simple-screensharing-client-tauri"
-      }
+      { "from": "../frontend", "to": "frontend" }
     ],
     "linux": {
       "target": ["AppImage"],
       "icon": "../src-tauri/icons/icon.png",
-      "category": "Network"
+      "category": "Network",
+      "extraResources": [
+        {
+          "from": "../target/release/simple-screensharing-client-tauri",
+          "to": "sidecar/simple-screensharing-client-tauri"
+        }
+      ]
+    },
+    "win": {
+      "target": ["portable"],
+      "icon": "../src-tauri/icons/icon.ico",
+      "extraResources": [
+        {
+          "from": "../target/x86_64-pc-windows-msvc/release/simple-screensharing-client-tauri.exe",
+          "to": "win/bin/simple-screensharing-client-tauri.exe"
+        },
+        {
+          "from": "win-runtime/bin",
+          "to": "win/bin"
+        },
+        {
+          "from": "win-runtime/lib/gstreamer-1.0",
+          "to": "win/lib/gstreamer-1.0"
+        }
+      ]
     }
   }
 }
