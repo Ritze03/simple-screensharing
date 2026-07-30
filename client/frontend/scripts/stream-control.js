@@ -18,16 +18,16 @@
 //   set_bandwidth_total, set_bandwidth_floor, edit_destination,
 //   stop_destination, stop_share, retry_destination, transfer_destination,
 //   start_destination, stage_video_share, go_live, set_bitrate, set_framerate,
-//   set_tune, set_quality_level, set_rate_control, set_gop_millis,
-//   start_audio_share, rename_room.
+//   set_tune, set_quality_level, set_rate_control, set_gop_millis, set_codec,
+//   supported_codecs, start_audio_share, rename_room.
 // Notably `stage_video_share`/`start_audio_share` take no encoder
 // arguments — framerate/bitrate/tune/quality-level/rate-control/gop-millis/
-// audio-source are process-wide settings applied via `set_framerate`/
+// codec/audio-source are process-wide settings applied via `set_framerate`/
 // `set_bitrate`/`set_tune`/`set_quality_level`/`set_rate_control`/
-// `set_gop_millis`/`select_audio_source` *before* the share starts, not
-// per-call arguments. `go_live` (the "Go live" flow's second half, see
-// `superdoc/features/stream-control.md`'s 2026-07-28 note) only takes
-// `captureId`/`roomHandle` for the same reason.
+// `set_gop_millis`/`set_codec`/`select_audio_source` *before* the share
+// starts, not per-call arguments. `go_live` (the "Go live" flow's second
+// half, see `superdoc/features/stream-control.md`'s 2026-07-28 note) only
+// takes `captureId`/`roomHandle` for the same reason.
 //
 // Layout, top to bottom (the redesign this fixes vs. the old egui tab, see
 // stream-control.css's header comment):
@@ -153,6 +153,19 @@
   let mockStagedCaptures = [];
   let bandwidth = Object.assign({}, MOCK_BANDWIDTH);
   let mockAudioSources = MOCK_AUDIO_SOURCES;
+  // Which codecs this machine's encoder backend can actually produce
+  // (`commands::supported_codecs`, `["h264"]` on software fallback,
+  // `["h264","h265","av1"]` on VAAPI) — fetched once at init (see `init()`
+  // below) and fed to every destination card's Codec pill switch as
+  // `supportedCodecs` so it can grey out/disable options this machine can't
+  // actually use. Defaults to `["h264"]`, the conservative safe-fallback
+  // value, until the real fetch resolves. A staged card's own row also
+  // carries this same list (`dto::StagedCaptureRow::supported_codecs`) —
+  // this global exists because a *live* `DestinationRow` has no such field
+  // of its own to read it from, and the value is a backend/hardware
+  // property that doesn't vary per capture anyway, so one shared fetch
+  // serves both card kinds.
+  let supportedCodecs = ["h264"];
   // Real-backend-only: the last `bandwidth-overshoot` event's amount (there's
   // no local allocator to compute this from in the real branch — the
   // session-side `apply_bandwidth_allocation` owns that, and reports it live
@@ -179,6 +192,17 @@
       return rows.filter((r) => r.state === "joined").map((r) => ({ id: r.room_handle, name: r.name, join_string: r.join_string }));
     }
     return MOCK_JOINED_ROOMS;
+  }
+
+  /** See `supportedCodecs`'s doc comment above. Mock branch offers all
+   * three — there's no real hardware to probe in a plain browser, and
+   * offering all three in mock mode lets the codec selector's full UI (all
+   * three enabled) be exercised without `window.__TAURI__`. */
+  async function fetchSupportedCodecs() {
+    if (window.__TAURI__) {
+      return await window.__TAURI__.core.invoke("supported_codecs");
+    }
+    return ["h264", "h265", "av1"];
   }
 
   async function fetchActiveDestinations() {
@@ -363,6 +387,7 @@
             qualityLevel: "balanced",
             rateControl: "qvbr",
             gopMillis: 2000,
+            codec: "h264",
             error: null,
           },
           patch
@@ -391,6 +416,7 @@
           qualityLevel: edit.qualityLevel,
           rateControl: edit.rateControl,
           gopMillis: edit.gopMillis,
+          codec: edit.codec,
         });
         edit.error = null;
         // Mirror what was just applied onto the local DTO copy so the card's
@@ -514,6 +540,7 @@
         await window.__TAURI__.core.invoke("set_tune", { tune: defaults.tune });
         await window.__TAURI__.core.invoke("set_quality_level", { qualityLevel: defaults.qualityLevel });
         await window.__TAURI__.core.invoke("set_rate_control", { rateControl: defaults.rateControl });
+        await window.__TAURI__.core.invoke("set_codec", { codec: defaults.codec });
       }
       // `gop_millis` is *not* one of `start_stream_defaults`' persisted
       // fields (see `capture::DEFAULT_GOP_MILLIS`'s doc comment: it's a
@@ -537,7 +564,14 @@
   async function fetchStartStreamDefaults() {
     if (window.__TAURI__) {
       const d = await window.__TAURI__.core.invoke("get_start_stream_defaults");
-      return { fps: d.framerate, bitrateKbps: d.bitrate_kbps, tune: d.tune, qualityLevel: d.quality_level, rateControl: d.rate_control };
+      return {
+        fps: d.framerate,
+        bitrateKbps: d.bitrate_kbps,
+        tune: d.tune,
+        qualityLevel: d.quality_level,
+        rateControl: d.rate_control,
+        codec: d.codec,
+      };
     }
     return null;
   }
@@ -561,6 +595,7 @@
         qualityLevel: staged.quality_level,
         rateControl: staged.rate_control,
         gopMillis: staged.gop_millis,
+        codec: staged.codec,
         roomHandle: mockJoinedRooms.length > 0 ? mockJoinedRooms[0].id : null,
         error: null,
       };
@@ -588,6 +623,7 @@
         if ("qualityLevel" in patch) await window.__TAURI__.core.invoke("set_quality_level", { qualityLevel: edit.qualityLevel });
         if ("rateControl" in patch) await window.__TAURI__.core.invoke("set_rate_control", { rateControl: edit.rateControl });
         if ("gopMillis" in patch) await window.__TAURI__.core.invoke("set_gop_millis", { gopMillis: edit.gopMillis });
+        if ("codec" in patch) await window.__TAURI__.core.invoke("set_codec", { codec: edit.codec });
         edit.error = null;
       } catch (e) {
         edit.error = String(e);
@@ -604,6 +640,7 @@
         quality_level: edit.qualityLevel,
         rate_control: edit.rateControl,
         gop_millis: edit.gopMillis,
+        codec: edit.codec,
       });
     }
     render();
@@ -640,6 +677,7 @@
           tune: edit.tune,
           qualityLevel: edit.qualityLevel,
           rateControl: edit.rateControl,
+          codec: edit.codec,
         });
       } catch (e) {
         console.error("failed to save start-stream defaults", e);
@@ -665,6 +703,7 @@
             qualityLevel: edit.qualityLevel,
             rateControl: edit.rateControl,
             gopMillis: edit.gopMillis,
+            codec: edit.codec,
             error: null,
           });
         }
@@ -903,6 +942,12 @@
         qualityLevel: "balanced",
         rateControl: "qvbr",
         gopMillis: 2000,
+        // `DestinationRow` has no `codec` field to read back (same "always
+        // going to be caller-held" reasoning as tune/quality_level/
+        // rate_control above), so a destination this tab didn't itself just
+        // create via `goLive`'s `destEditState.set(...)` (below) falls back
+        // to the wire-protocol default, `"h264"`.
+        codec: "h264",
         error: null,
       };
       destEditState.set(dest.destination_id, s);
@@ -1170,6 +1215,10 @@
               encoderTuningEditable: true,
               perStreamBitrateEditable: perStreamBitrateMode(),
               framerateOptions: framerateOptionsFor(edit),
+              // `staged.supported_codecs` is this specific `StagedCaptureRow`'s
+              // own field (see `dto.rs`); fall back to the globally-fetched
+              // list only if a mock/older row happens not to carry it.
+              supportedCodecs: staged.supported_codecs || supportedCodecs,
               editState: edit,
               advancedOpen,
               audio,
@@ -1231,6 +1280,7 @@
         roomOptions: mockJoinedRooms,
         roomsAlreadyFedByCapture,
         stalledSince,
+        supportedCodecs,
         // Only the fields the audio row actually renders — deliberately NOT
         // the whole audio row object, and emphatically not its level: the VU
         // meter is animated by direct DOM writes from `updateStats()`, so
@@ -1272,6 +1322,11 @@
               encoderTuningEditable,
               perStreamBitrateEditable,
               framerateOptions: framerateOptionsFor(editState),
+              // `DestinationRow` has no `supported_codecs` field of its own
+              // (unlike `StagedCaptureRow`) — the globally-fetched list is
+              // the only source for a live card. See `supportedCodecs`'s
+              // module-scope doc comment.
+              supportedCodecs,
               roomsAlreadyFedByCapture,
               editState,
               stalledSince,
@@ -1368,6 +1423,8 @@
       quality_level: "balanced",
       rate_control: "qvbr",
       gop_millis: 2000,
+      codec: "h264",
+      supported_codecs: supportedCodecs,
     });
     render();
     // Mimics the real portal-prompt-then-pipeline-up delay at toy timescale.
@@ -1410,6 +1467,7 @@
       qualityLevel: edit.qualityLevel,
       rateControl: edit.rateControl,
       gopMillis: edit.gopMillis,
+      codec: edit.codec,
       error: null,
     });
     mockDestinations.push(newDest);
@@ -1432,6 +1490,7 @@
     mockDestinations = await fetchActiveDestinations();
     mockStagedCaptures = await fetchStagedCaptures();
     bandwidth = await fetchBandwidthSettings();
+    supportedCodecs = await fetchSupportedCodecs();
     // `Why audio sources aren't fetched here any more:` nothing renders them
     // until someone opens a share card's "+ Add audio" picker, and that
     // handler re-lists them on open anyway (which applications are producing

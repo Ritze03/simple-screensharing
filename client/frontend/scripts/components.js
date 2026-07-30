@@ -894,22 +894,32 @@
   // -------------------------------------------------------------------
 
   /**
-   * @param {{value: string, label: string, title?: string}[]} options - `title`
-   *   is optional per-option tooltip text (native `title` attribute); omit it
-   *   and the button gets no tooltip at all, so existing callers that don't
-   *   pass it are unaffected.
+   * @param {{value: string, label: string, title?: string, disabled?: boolean}[]} options
+   *   - `title` is optional per-option tooltip text (native `title`
+   *   attribute); omit it and the button gets no tooltip at all, so existing
+   *   callers that don't pass it are unaffected. `disabled` greys the option
+   *   out and makes it unclickable — for options the codec selector needs to
+   *   offer but the current machine's encoder backend can't actually produce
+   *   (see `commands::supported_codecs`'s doc comment); existing callers
+   *   that don't pass it are likewise unaffected.
    * @param {string} value - currently selected option's `value`
    * @param {(value: string) => void} onChange
    */
   function pillSwitch(options, value, onChange) {
     const wrap = el("div", { className: "mode-toggle" });
     options.forEach((opt) => {
+      const attrs = {};
+      if (opt.title) attrs.title = opt.title;
+      if (opt.disabled) attrs.disabled = "";
       wrap.appendChild(
         el("button", {
-          className: "mode-toggle-btn" + (opt.value === value ? " mode-toggle-btn-active" : ""),
+          className:
+            "mode-toggle-btn" +
+            (opt.value === value ? " mode-toggle-btn-active" : "") +
+            (opt.disabled ? " mode-toggle-btn-disabled" : ""),
           text: opt.label,
-          onClick: () => onChange(opt.value),
-          attrs: opt.title ? { title: opt.title } : {},
+          onClick: opt.disabled ? null : () => onChange(opt.value),
+          attrs,
         })
       );
     });
@@ -1031,6 +1041,19 @@
     );
   }
 
+  // Codec pill switch — H.264/AV1/H.265, values are `dto::video_codec_str`'s
+  // exact wire strings ("h264"/"h265"/"av1"), used by `set_codec`/
+  // `edit_destination`/`set_start_stream_defaults`. Shared module-scope
+  // constant for the same reason `ENCODER_PRESETS` is: `destinationCard`'s
+  // live-destination edit panel and the staged-card panel both need the
+  // exact same three options. Order (H.264, AV1, H.265) matches the order
+  // the project owner asked for.
+  const CODEC_OPTIONS = [
+    { value: "h264", label: "H.264", title: "Most compatible — decodes everywhere, including hardware that can't do H.265/AV1." },
+    { value: "av1", label: "AV1", title: "Modern, royalty-free, best efficiency on Intel/NVIDIA hardware." },
+    { value: "h265", label: "H.265", title: "Best quality on this hardware; licensing caveats on some platforms/browsers." },
+  ];
+
   // -------------------------------------------------------------------
   // Destination card — the Stream Control tab's Active Shares entry. One of
   // these per outgoing destination, across every room (cross-room, per
@@ -1060,9 +1083,17 @@
    * of the top-level list.
    * @param {object} [opts] - { roomOptions: [{id,name}], encoderTuningEditable: bool,
    *   perStreamBitrateEditable: bool, framerateOptions: number[],
-   *   roomsAlreadyFedByCapture: number[], editState: {bitrateKbps, framerate, tune,
-   *   qualityLevel, rateControl, gopMillis, error}, stalledSince: number|null, audio: object|null,
+   *   supportedCodecs: string[], roomsAlreadyFedByCapture: number[],
+   *   editState: {bitrateKbps, framerate, tune, qualityLevel, rateControl,
+   *   gopMillis, codec, error}, stalledSince: number|null, audio: object|null,
    *   audioSources: array, staged: bool, stagedRoomHandle: number }.
+   *
+   *   `supportedCodecs` — which codecs (`"h264"`/`"h265"`/`"av1"`) this
+   *   machine's encoder backend can actually produce
+   *   (`commands::supported_codecs`/`StagedCaptureRow::supported_codecs`).
+   *   The Codec pill switch disables any option not in this list. Defaults
+   *   to `["h264"]` if omitted, so an unfetched/omitted list never offers an
+   *   option that would silently downgrade.
    *
    *   `staged` renders the "Share Screen"/"Share another screen" flow's
    *   pre-"Go live" card instead of a normal live one: `dest` is a
@@ -1280,6 +1311,7 @@
         qualityLevel: "balanced",
         rateControl: "qvbr",
         gopMillis: DEFAULT_GOP_MILLIS,
+        codec: "h264",
       };
       // Staged `dest` objects (`opts.staged`) have no `destination_id` yet —
       // key on `capture_id` instead, same id `handlers.onGoLive`/`onCancel`
@@ -1365,6 +1397,33 @@
       framerateRow.appendChild(framerateSelect);
       framerateRow.appendChild(el("span"));
       editGrid.appendChild(framerateRow);
+
+      // Codec — H.264/AV1/H.265, between Framerate and Preset per explicit
+      // placement request. Styled identically to the Quality Level pill
+      // switch below (same `pillSwitch`/`.dest-tuning-toggle` combo), but
+      // lives up here rather than behind the Advanced disclosure: which
+      // codec to encode with is as much a regular-user decision as Preset/
+      // Framerate, not a testing-oriented knob like Tune/Quality Level/Rate
+      // Control.
+      //
+      // `opts.supportedCodecs` — which codecs this machine's encoder backend
+      // can actually produce (`commands::supported_codecs`/
+      // `StagedCaptureRow::supported_codecs`, `["h264"]` on software
+      // fallback). Defaults to `["h264"]` (the safe fallback) if the caller
+      // hasn't fetched it yet, so this never offers an option that would
+      // silently downgrade before the real list has loaded.
+      const supportedCodecs = opts.supportedCodecs || ["h264"];
+      const codecRow = el("div", { className: "dest-edit-row" });
+      codecRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Codec" }));
+      const codecToggle = pillSwitch(
+        CODEC_OPTIONS.map((c) => ({ ...c, disabled: !supportedCodecs.includes(c.value) })),
+        editState.codec || "h264",
+        (value) => applyTuning({ codec: value })
+      );
+      codecToggle.classList.add("dest-tuning-toggle");
+      codecRow.appendChild(codecToggle);
+      codecRow.appendChild(el("span"));
+      editGrid.appendChild(codecRow);
 
       const presetRow = el("div", { className: "dest-edit-row" });
       presetRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Preset" }));

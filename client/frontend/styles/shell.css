@@ -684,6 +684,19 @@ input[type="range"]:focus-visible::-webkit-slider-thumb {
   font-weight: 700;
 }
 
+/* Unavailable option (e.g. a codec `supported_codecs` says this machine's
+   encoder backend can't actually produce) — greyed out and inert, distinct
+   from the plain idle state above so it reads as "can't", not "just hasn't
+   been picked yet". Never combined with `-active` in practice (a disabled
+   option is never the current selection), so no joint rule is needed. */
+.mode-toggle-btn-disabled,
+.mode-toggle-btn-disabled:hover {
+  background: transparent;
+  color: var(--text-dim);
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
 /* Join/Create tabs on the "Create/Join a Room" card: each segment gets
    exactly 50% of the row, not its own text-sized width (so "Join" and
    "Create" render the same width). Same scoped-modifier pattern as
