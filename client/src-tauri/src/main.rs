@@ -109,6 +109,8 @@ fn main() {
             commands::set_quality_level,
             commands::set_rate_control,
             commands::set_gop_millis,
+            commands::set_codec,
+            commands::supported_codecs,
             commands::list_active_streams,
             commands::start_destination,
             commands::transfer_destination,

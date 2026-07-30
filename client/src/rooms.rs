@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::capture::{QualityLevel, RateControlMode, TuneMode};
+use crate::capture::{QualityLevel, RateControlMode, TuneMode, VideoCodec};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SavedRoom {
@@ -290,6 +290,12 @@ pub struct StartStreamDefaults {
     pub quality_level: QualityLevel,
     #[serde(default)]
     pub rate_control: RateControlMode,
+    /// `#[serde(default)]` (-> `VideoCodec::H264`) is load-bearing here:
+    /// every existing user's on-disk `settings.toml` predates this field, so
+    /// it must deserialize to exactly the behavior they already had rather
+    /// than fail to load — see `VideoCodec`'s own `#[default]` doc comment.
+    #[serde(default)]
+    pub codec: VideoCodec,
 }
 
 impl StartStreamDefaults {
@@ -310,6 +316,7 @@ impl Default for StartStreamDefaults {
             tune: TuneMode::default(),
             quality_level: QualityLevel::default(),
             rate_control: RateControlMode::default(),
+            codec: VideoCodec::default(),
         }
     }
 }
@@ -641,11 +648,28 @@ mod tests {
                 tune: crate::capture::TuneMode::LowLatency,
                 quality_level: crate::capture::QualityLevel::Performance,
                 rate_control: crate::capture::RateControlMode::Cqp,
+                codec: crate::capture::VideoCodec::H265,
             },
             ..AppSettings::default()
         };
         let parsed: AppSettings = toml::from_str(&toml::to_string_pretty(&settings).unwrap()).unwrap();
         assert_eq!(parsed.start_stream_defaults, settings.start_stream_defaults);
+    }
+
+    /// A `settings.toml` written before `codec` existed (no `codec` key at
+    /// all in the nested `start_stream_defaults` table) must still parse and
+    /// default `codec` to `VideoCodec::H264` — the same missing-field
+    /// tolerance `app_settings_missing_start_stream_defaults_defaults`
+    /// exercises for the whole nested struct, but specifically isolating this
+    /// one new field so a future regression that makes `codec` accidentally
+    /// required is caught here rather than only at the whole-struct level.
+    #[test]
+    fn start_stream_defaults_missing_codec_defaults_to_h264() {
+        let parsed: AppSettings = toml::from_str(
+            "[start_stream_defaults]\nframerate = 60\nbitrate_kbps = 12000\ntune = \"low_latency\"\nquality_level = \"performance\"\nrate_control = \"qvbr\"\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.start_stream_defaults.codec, crate::capture::VideoCodec::H264);
     }
 
     #[test]
