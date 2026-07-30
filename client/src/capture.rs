@@ -308,30 +308,47 @@ impl EncoderBackend {
                 };
                 let rate_control_value = match rate_control {
                     RateControlMode::Cqp => "cqp",
-                    RateControlMode::Qvbr => "qvbr",
+                    // Despite the variant's name, this now maps to
+                    // vah264enc's `vbr` (plain Variable Bitrate), not the
+                    // literal `qvbr` enum value — see [`RateControlMode::Qvbr`]'s
+                    // doc comment for the full story (a real, measured driver
+                    // bug means `qvbr`'s bitrate ceiling is silently ignored
+                    // on this hardware, while `vbr`'s is genuinely honored)
+                    // and for why the identifier itself was kept anyway.
+                    RateControlMode::Qvbr => "vbr",
                 };
-                // `Qvbr` needs two more properties `Cqp` doesn't:
-                // - `qpi`: in `qvbr` mode this is vah264enc's *quality
-                //   factor* (its doc: "In ICQ and QVBR modes, it specifies a
-                //   quality factor"), not a literal QP like in `cqp` mode.
-                //   Tuned to [`QVBR_QUALITY_FACTOR`] — deliberately lower
-                //   than `cqp`'s untouched element default of 26, so QVBR
-                //   reads as visibly higher quality than CQP at the same
-                //   nominal bitrate/preset (see that constant's doc comment
-                //   for the exact value and why).
+                // `Qvbr`/`vbr` needs two more properties `Cqp` doesn't:
+                // - `target-percentage`: VBR-only property, "the percentage
+                //   for 'target bitrate'/'maximum bitrate'" — the real encode
+                //   target is `bitrate * target-percentage / 100`, with
+                //   `bitrate` acting as the ceiling. Left at the element's
+                //   default of 66%, this is exactly the previously-removed
+                //   `Adaptive` mode's diagnosed pop-in cause (the real target
+                //   swinging between ~66-100% of the ceiling as content
+                //   changed) — see [`RateControlMode::Qvbr`]'s doc comment.
+                //   Set to [`VBR_TARGET_PERCENTAGE`], deliberately high (close
+                //   to the ceiling) so the real target sits near `bitrate`
+                //   instead of swinging down toward two-thirds of it.
                 // - `cpb-size`: vah264enc's VBV buffer size in Kb, `0` (its
-                //   default) means "auto-calculate" — explicit and set to
-                //   roughly 1x the configured bitrate, standard VBV-buffer
-                //   sizing practice for a ~1s-scale buffer, so QVBR has real
-                //   headroom to spend the bitrate ceiling on quality rather
-                //   than being throttled by an undersized buffer.
-                // `Cqp` deliberately leaves `qpi`/`qpp`/`qpb` unset at the
-                // element's own default (26) — see [`RateControlMode::Cqp`]'s
-                // doc comment for why that stays untuned.
+                //   default) means "auto-calculate" (empirically, roughly 1x
+                //   `bitrate` here — the same naive "1-second-equivalent"
+                //   sizing the old `qvbr` implementation used explicitly).
+                //   Set deliberately *tighter* than that via
+                //   [`VBR_CPB_SIZE_NUMERATOR`]/[`VBR_CPB_SIZE_DENOMINATOR`] —
+                //   see that constant's doc comment for the exact fraction
+                //   and the measured rationale — so the encoder re-evaluates
+                //   its rate target against a smaller buffer, adjusting more
+                //   often in finer steps instead of swinging widely between
+                //   infrequent large-buffer refill cycles.
+                // `Cqp` deliberately leaves `qpi`/`qpp`/`qpb`/`target-percentage`
+                // unset at the element's own defaults — see
+                // [`RateControlMode::Cqp`]'s doc comment for why that stays
+                // untuned.
                 let quality_extra = match rate_control {
                     RateControlMode::Cqp => String::new(),
                     RateControlMode::Qvbr => {
-                        format!(" qpi={QVBR_QUALITY_FACTOR} cpb-size={bitrate_kbps}")
+                        let cpb_size = bitrate_kbps * VBR_CPB_SIZE_NUMERATOR / VBR_CPB_SIZE_DENOMINATOR;
+                        format!(" target-percentage={VBR_TARGET_PERCENTAGE} cpb-size={cpb_size}")
                     }
                 };
                 // `b-frames=0`: see the software branch's matching `Why:`
@@ -426,14 +443,39 @@ pub enum QualityLevel {
 /// bitrate-swing artifacts, and `Constant`/`cbr` added a third mode without a
 /// real quality-seeking option; the product decision was to collapse to two
 /// clearly distinct, deliberately-tuned modes instead of three where one was
-/// half-finished). Native, clean mapping onto [`EncoderBackend::Vaapi`]'s
-/// `rate-control` enum (`cqp`/`qvbr` — `qvbr` is vah264enc's "Quality-defined
-/// VBR": [`Self::Qvbr`] targets quality via `qpi` while still respecting
-/// `bitrate` as a ceiling and `cpb-size` as the VBV buffer — see
-/// [`EncoderBackend::launch_fragment`]). [`EncoderBackend::Software`] has no
-/// equivalent enum — its closest control is `pass` (`cbr`/`quant`/`qual`) +
-/// `quantizer`; see [`EncoderBackend::launch_fragment`]'s `Why:` note for how
-/// each variant maps there.
+/// half-finished).
+///
+/// **2026-07-30 follow-up — `Self::Qvbr` no longer literally means `qvbr`.**
+/// A real driver limitation was confirmed on the reference hardware (AMD RX
+/// 7900 XTX, Mesa radeonsi VA-API): `vah264enc`'s actual `rate-control=qvbr`
+/// mode silently ignores the configured `bitrate` ceiling entirely (a 2000
+/// vs. 8000 kbps ceiling produced identical, much-higher real output; a
+/// driver warning — `Driver does not support attribute
+/// VAConfigAttribEncQuantization` — confirms the driver doesn't honor it).
+/// Plain `rate-control=vbr` was measured to genuinely respect the ceiling on
+/// the same hardware. So this variant now emits `rate-control=vbr` (tuned
+/// with [`VBR_TARGET_PERCENTAGE`]/[`VBR_CPB_SIZE_NUMERATOR`]+
+/// [`VBR_CPB_SIZE_DENOMINATOR`] — see [`EncoderBackend::launch_fragment`]) —
+/// deliberately tuned to avoid the *original* reason `vbr` was removed (the
+/// old `Adaptive` mode's unset-`target-percentage` pop-in artifact).
+///
+/// Why the variant keeps the name `Qvbr` rather than being renamed to match:
+/// the wire string `"qvbr"` (via `#[serde(rename_all = "snake_case")]` below)
+/// is both the frontend's `rateControl` value (`frontend/scripts/
+/// stream-control.js`, `components.js`) and the on-disk persisted field in
+/// `AppSettings`/`StartStreamDefaults` (`rooms.rs`) — renaming would touch
+/// ~15 frontend call sites *and* silently break existing users' persisted
+/// settings files (an unknown enum variant fails that field's
+/// deserialization, not a graceful per-field fallback). That cost was judged
+/// disproportionate to a purely internal/cosmetic rename; the user-visible
+/// "Max Quality" label and the wire contract are unaffected either way. Read
+/// `Self::Qvbr` as "the max-quality mode", not literally "the mode that sets
+/// `rate-control=qvbr`" — this comment is the map from one to the other.
+///
+/// [`EncoderBackend::Software`] has no equivalent enum — its closest control
+/// is `pass` (`cbr`/`quant`/`qual`) + `quantizer`; see
+/// [`EncoderBackend::launch_fragment`]'s `Why:` note for how each variant
+/// maps there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RateControlMode {
@@ -445,40 +487,60 @@ pub enum RateControlMode {
     /// per-frame quality that never spends more of the configured bitrate
     /// ceiling than a static QP happens to need.
     Cqp,
-    /// vah264enc `rate-control=qvbr` ("Quality-defined VBR"): targets a
-    /// quality factor (`qpi`, tuned lower than [`Self::Cqp`]'s implicit 26 —
-    /// see [`EncoderBackend::launch_fragment`] for the exact value and why)
-    /// while still respecting `bitrate` as a real ceiling and `cpb-size` as
-    /// its VBV buffer — "spend up to the bandwidth budget for the best
-    /// quality that fits", the mode `Adaptive`/`vbr` was meant to be but
-    /// never got tuned to be (see this type's doc comment). x264enc has no
-    /// native QVBR-equivalent knob either, so this variant maps to x264enc's
-    /// plain untouched `bitrate=` property (no `pass` override) — its
-    /// default single-pass rate control is already the closest analogue
-    /// x264enc offers to "quality-seeking within a bitrate ceiling", the same
-    /// rationale the old `Adaptive`/`Constant` no-op relied on. The default:
-    /// the product's "max out available bandwidth for the best quality that
-    /// fits" is the desired out-of-the-box behavior now that a real QVBR mode
-    /// exists to deliver it, rather than [`Self::Cqp`]'s deliberately
-    /// conservative bandwidth use.
+    /// vah264enc `rate-control=vbr` (plain Variable Bitrate — see this type's
+    /// doc comment for why this variant, still named `Qvbr`, no longer emits
+    /// literal `rate-control=qvbr`): targets [`VBR_TARGET_PERCENTAGE`]% of
+    /// `bitrate` as the real encode target, with `bitrate` itself acting as a
+    /// ceiling genuinely respected on the reference hardware (unlike `qvbr`'s
+    /// — see this type's doc comment), and a deliberately tightened
+    /// `cpb-size` (see [`VBR_CPB_SIZE_NUMERATOR`]/[`VBR_CPB_SIZE_DENOMINATOR`])
+    /// so the encoder adjusts against a smaller VBV buffer instead of
+    /// swinging widely between infrequent large-buffer refill cycles — "spend
+    /// up to the bandwidth budget for the best quality that fits", the mode
+    /// `Adaptive`/`vbr` was meant to be but never got tuned to be (see this
+    /// type's doc comment). x264enc has no native QVBR-equivalent knob
+    /// either, so this variant maps to x264enc's plain untouched `bitrate=`
+    /// property (no `pass` override) — its default single-pass rate control
+    /// is already the closest analogue x264enc offers to "quality-seeking
+    /// within a bitrate ceiling", the same rationale the old
+    /// `Adaptive`/`Constant` no-op relied on. The default: the product's "max
+    /// out available bandwidth for the best quality that fits" is the
+    /// desired out-of-the-box behavior, rather than [`Self::Cqp`]'s
+    /// deliberately conservative bandwidth use.
     #[default]
     Qvbr,
 }
 
-/// [`RateControlMode::Qvbr`]'s `qpi` quality factor on `vah264enc`
-/// ([`EncoderBackend::launch_fragment`]). Chosen at 20, four steps below
-/// [`RateControlMode::Cqp`]'s untouched element default of 26 (`qpi`'s scale
-/// is 0-51, lower is higher quality): a 4-step QP delta is a well-established
-/// visibly-different quality step in H.264 encoding (each unit is roughly a
-/// constant *relative* bitrate/quality change, not a linear one), so this is
-/// deliberately picked to read as clearly higher quality than CQP side by
-/// side rather than a marginal, hard-to-perceive tweak — while staying well
-/// short of single digits, where `qpi` starts asking for more bits than most
-/// realistic bitrate ceilings can actually deliver (QVBR's whole point is
-/// that the `bitrate`/`cpb-size` ceiling — not this factor — is what
-/// ultimately caps output, so an overly aggressive `qpi` mostly just wastes
-/// headroom rather than helping).
-const QVBR_QUALITY_FACTOR: u32 = 20;
+/// [`RateControlMode::Qvbr`]'s `target-percentage` on `vah264enc`'s
+/// `rate-control=vbr` ([`EncoderBackend::launch_fragment`]) — "the percentage
+/// for 'target bitrate'/'maximum bitrate'" (element doc), i.e. the real
+/// encode target is `bitrate * target-percentage / 100`. Left at the
+/// element's own default of 66%, this is exactly the previously-removed
+/// `Adaptive` mode's diagnosed pop-in cause (see
+/// [`RateControlMode::Qvbr`]'s doc comment). Set high (close to the 50-100
+/// range's ceiling) so the real target sits near the configured `bitrate`
+/// ceiling rather than swinging down toward two-thirds of it — measured live
+/// (see `superdoc/features/stream-control.md`'s 2026-07-30 follow-up entry)
+/// to hold real output bitrate stable over changing content, unlike the
+/// unset-default 66% baseline.
+const VBR_TARGET_PERCENTAGE: u32 = 95;
+
+/// [`RateControlMode::Qvbr`]'s `cpb-size` numerator/denominator on
+/// `vah264enc`'s `rate-control=vbr` ([`EncoderBackend::launch_fragment`]):
+/// `cpb-size = bitrate_kbps * NUMERATOR / DENOMINATOR` Kb. `cpb-size` is in
+/// Kb and `bitrate` is in kbps, so a ratio of 1 is exactly a 1-second VBV
+/// buffer; the previous (`qvbr`-era) implementation used exactly that (a
+/// naive "1x bitrate" ~1s buffer). This constant deliberately picks something
+/// meaningfully *smaller* — 3/8 of a second's worth — on the hypothesis (see
+/// this project's task history) that a smaller VBV buffer forces more
+/// frequent, finer-grained rate adjustment, smoothing out the bitrate swings
+/// that caused the original pop-in complaint, rather than letting bitrate
+/// swing dramatically between infrequent large-buffer refill cycles.
+/// Measured live (see `superdoc/features/stream-control.md`'s 2026-07-30
+/// follow-up entry) to reduce achieved-bitrate variance relative to the
+/// untuned (default `cpb-size`, default `target-percentage`) VBR baseline.
+const VBR_CPB_SIZE_NUMERATOR: u32 = 3;
+const VBR_CPB_SIZE_DENOMINATOR: u32 = 8;
 
 /// Auto-detects which [`EncoderBackend`] to use: prefers [`EncoderBackend::Vaapi`]
 /// when a working VAAPI H.264 encoder is actually available on this machine,
@@ -6607,13 +6669,14 @@ mod tests {
     }
 
     /// [`RateControlMode`] is a clean, native mapping onto vah264enc's own
-    /// `rate-control` enum (`cqp`/`qvbr`); on x264enc, `Qvbr` maps to plain
-    /// untouched `bitrate=` (no `pass` override, its closest available
+    /// `rate-control` enum (`cqp`/`vbr` — `Qvbr` maps to `vbr`, not literal
+    /// `qvbr`, see that variant's doc comment); on x264enc, `Qvbr` maps to
+    /// plain untouched `bitrate=` (no `pass` override, its closest available
     /// analogue — see [`EncoderBackend::launch_fragment`]'s `Why:` note)
     /// while `Cqp` switches to `pass=qual`. Also confirms `Qvbr`'s VAAPI-only
-    /// `qpi`/`cpb-size` are genuinely applied and genuinely different from
-    /// `Cqp`'s untouched element defaults — not silently falling back to the
-    /// same behavior.
+    /// `target-percentage`/`cpb-size` are genuinely applied and genuinely
+    /// different from `Cqp`'s untouched element defaults — not silently
+    /// falling back to the same behavior.
     #[test]
     fn rate_control_mode_maps_per_backend() {
         if gst::init().is_err() {
@@ -6651,8 +6714,10 @@ mod tests {
             RateControlMode::Cqp,
         );
         assert_eq!(vaapi_cqp.property_value("rate-control").serialize().unwrap(), "cqp");
-        // `Cqp` leaves `qpi` at the element's own default (26) — untouched.
+        // `Cqp` leaves `qpi` at the element's own default (26) and
+        // `target-percentage` unset (66%, VBR-only anyway) — untouched.
         assert_eq!(vaapi_cqp.property::<u32>("qpi"), 26);
+        assert_eq!(vaapi_cqp.property::<u32>("target-percentage"), 66);
 
         let vaapi_qvbr = build_encoder_element(
             EncoderBackend::Vaapi,
@@ -6660,19 +6725,27 @@ mod tests {
             QualityLevel::default(),
             RateControlMode::Qvbr,
         );
-        assert_eq!(vaapi_qvbr.property_value("rate-control").serialize().unwrap(), "qvbr");
-        // `Qvbr` tunes `qpi` lower than `Cqp`'s untouched default, so QVBR
-        // reads as visibly higher quality at the same nominal settings — see
-        // [`QVBR_QUALITY_FACTOR`]'s doc comment for the exact value/why.
-        assert_eq!(vaapi_qvbr.property::<u32>("qpi"), QVBR_QUALITY_FACTOR);
+        // Despite the variant's name, this is `vbr`, not literal `qvbr` — see
+        // [`RateControlMode::Qvbr`]'s doc comment for why.
+        assert_eq!(vaapi_qvbr.property_value("rate-control").serialize().unwrap(), "vbr");
+        // `Qvbr` tunes `target-percentage` well above `Cqp`'s untouched
+        // default (66%, itself moot under `cqp` since that property is
+        // VBR-only), so the real encode target sits close to the configured
+        // ceiling instead of swinging down toward two-thirds of it — see
+        // [`VBR_TARGET_PERCENTAGE`]'s doc comment for the exact value/why.
+        assert_eq!(vaapi_qvbr.property::<u32>("target-percentage"), VBR_TARGET_PERCENTAGE);
         assert!(
-            vaapi_qvbr.property::<u32>("qpi") < vaapi_cqp.property::<u32>("qpi"),
-            "Qvbr's qpi must be lower (higher quality) than Cqp's untouched default"
+            vaapi_qvbr.property::<u32>("target-percentage") > vaapi_cqp.property::<u32>("target-percentage"),
+            "Qvbr's target-percentage must be higher than the untuned 66% default"
         );
-        // `cpb-size` set to roughly 1x the configured bitrate (4000 kbps,
-        // per [`build_encoder_element`]'s hardcoded test bitrate) — not left
-        // at the element's own `0` ("auto-calculate") default.
-        assert_eq!(vaapi_qvbr.property::<u32>("cpb-size"), 4000);
+        // `cpb-size` set to a deliberately tight fraction of the configured
+        // bitrate (4000 kbps, per [`build_encoder_element`]'s hardcoded test
+        // bitrate) — not left at the element's own `0` ("auto-calculate")
+        // default, and meaningfully smaller than a naive 1x-bitrate buffer.
+        assert_eq!(
+            vaapi_qvbr.property::<u32>("cpb-size"),
+            4000 * VBR_CPB_SIZE_NUMERATOR / VBR_CPB_SIZE_DENOMINATOR
+        );
         assert_eq!(vaapi_cqp.property::<u32>("cpb-size"), 0, "Cqp must not set cpb-size at all");
     }
 
