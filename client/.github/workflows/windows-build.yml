@@ -15,6 +15,17 @@ name: Windows build
 # (native on this windows-latest runner, so "cross-compiled" only in the
 # sense of a non-default target triple); electron-builder just packages the
 # Electron shell + that sidecar .exe + GStreamer runtime around it.
+#
+# 2026-07-30 (same day): delivery switched from `actions/upload-artifact`
+# to a GitHub Release asset (`gh release create/upload`, tag
+# `windows-dev-build`, recreated every run). Actions artifact storage hit
+# an account-level quota bug where GitHub's usage counter didn't reflect
+# reality even immediately after all old artifacts were deleted (its own
+# error says usage is only recalculated every 6-12h) — Releases use
+# separate storage untouched by that counter, so this sidesteps it
+# entirely rather than waiting out the recalculation window. This is a
+# rolling dev-build pointer, not a versioned release process — the tag
+# and its single release are deleted and recreated fresh each run.
 on:
   push:
     branches: [master]
@@ -43,6 +54,14 @@ env:
   # step (PATH, PKG_CONFIG_PATH, packaging) needs to reference.
   GST_INSTALL_PARENT: "C:\\gstreamer"
   GST_ROOT: "C:\\gstreamer\\1.0\\msvc_x86_64"
+  # Rolling tag for the dev-build GitHub Release the .exe is published to
+  # (see the "Publish .exe as a GitHub Release asset" step below).
+  RELEASE_TAG: "windows-dev-build"
+
+# Needed for `gh release create/upload` (default GITHUB_TOKEN permissions
+# are read-only otherwise).
+permissions:
+  contents: write
 
 jobs:
   windows-build:
@@ -217,11 +236,41 @@ jobs:
         run: npm run build:win
         working-directory: electron
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: simple-screensharing-client-windows-${{ env.GST_ARCH }}
-          path: |
-            dist/*.exe
-          if-no-files-found: error
-          retention-days: 14
+      # --- Publish as a GitHub Release asset -------------------------------
+      # Not `actions/upload-artifact`: Actions artifact storage has an
+      # account-level quota bug where deleting old artifacts didn't free
+      # the counter it checks (GitHub's own error says usage is only
+      # recalculated every 6-12h), so uploads kept failing with "Artifact
+      # storage quota has been hit" even at 0 artifacts. Releases use
+      # separate storage untouched by that counter. `RELEASE_TAG` is a
+      # rolling pointer (delete + recreate every run) — this is a
+      # dev-build hand-off, not a versioned release process.
+      - name: Publish .exe as a GitHub Release asset
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = Get-ChildItem -Path "dist" -Filter "*.exe" | Select-Object -First 1
+          if (-not $exe) {
+            Write-Host "::error::No .exe found in dist/ to publish."
+            exit 1
+          }
+          Write-Host "Publishing $($exe.FullName) ($([math]::Round($exe.Length / 1MB, 1)) MB) to release tag $env:RELEASE_TAG"
+
+          # Ignore failure: the tag/release may not exist yet on the first
+          # run, or between runs if someone deleted it manually.
+          gh release delete $env:RELEASE_TAG --yes --cleanup-tag 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "No existing '$env:RELEASE_TAG' release to delete (fine on first run)."
+          }
+
+          gh release create $env:RELEASE_TAG $exe.FullName `
+            --title "Windows dev build ($env:RELEASE_TAG)" `
+            --notes "Automated Windows smoke-test build from workflow run $env:GITHUB_RUN_ID (commit $env:GITHUB_SHA). Unsigned CI build — Windows SmartScreen may warn about it being from an unknown publisher. This tag is recreated on every run of windows-build.yml; it does not track a fixed commit." `
+            --prerelease `
+            --target $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::gh release create failed."
+            exit 1
+          }
