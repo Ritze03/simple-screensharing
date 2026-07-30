@@ -47,11 +47,31 @@ const RESOURCES_ROOT = app.isPackaged ? process.resourcesPath : path.join(__dirn
 // representative capture/encode/decode performance) point Electron at a
 // `--release` build without any code change. Packaged builds always use the
 // bundled release binary under `resources/sidecar/`.
+// Windows packaged builds stage the sidecar exe together with its
+// GStreamer runtime DLLs/plugins under `resources/win/` (see `build.win`
+// in package.json) instead of the Linux AppImage's `resources/sidecar/`,
+// because the DLLs must sit beside the .exe for Windows' default DLL
+// search order to find them (see GST_PLUGIN_PATH below for the plugin
+// registry, which isn't covered by that search order).
+const SIDECAR_EXE_NAME =
+  process.platform === "win32"
+    ? "simple-screensharing-client-tauri.exe"
+    : "simple-screensharing-client-tauri";
 const SIDECAR_PATH =
   process.env.SIDECAR_BIN ||
   (app.isPackaged
-    ? path.join(RESOURCES_ROOT, "sidecar", "simple-screensharing-client-tauri")
-    : path.join(RESOURCES_ROOT, "target", "debug", "simple-screensharing-client-tauri"));
+    ? process.platform === "win32"
+      ? path.join(RESOURCES_ROOT, "win", "bin", SIDECAR_EXE_NAME)
+      : path.join(RESOURCES_ROOT, "sidecar", SIDECAR_EXE_NAME)
+    : path.join(RESOURCES_ROOT, "target", "debug", SIDECAR_EXE_NAME));
+// Belt-and-suspenders plugin path for the packaged Windows build, mirroring
+// the windows-build.yml smoke-test artifact's run.bat: GStreamer normally
+// finds its plugins relative to the DLL it loaded from, but setting this
+// explicitly avoids depending on that discovery working in every case.
+const SIDECAR_ENV =
+  app.isPackaged && process.platform === "win32"
+    ? { ...process.env, GST_PLUGIN_PATH: path.join(RESOURCES_ROOT, "win", "lib", "gstreamer-1.0") }
+    : process.env;
 const FRONTEND_INDEX = path.join(RESOURCES_ROOT, "frontend", "index.html");
 const VIEWER_HTML = path.join(RESOURCES_ROOT, "frontend", "viewer.html");
 const PRELOAD = path.join(__dirname, "preload.js");
@@ -92,6 +112,7 @@ function spawnSidecar() {
   return new Promise((resolve, reject) => {
     sidecarProcess = spawn(SIDECAR_PATH, [], {
       stdio: ["ignore", "pipe", "pipe"],
+      env: SIDECAR_ENV,
     });
 
     sidecarProcess.on("error", (err) => {

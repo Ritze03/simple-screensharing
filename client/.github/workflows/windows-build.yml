@@ -5,6 +5,27 @@ name: Windows build
 # natively on a windows-latest GitHub-hosted runner so a Windows-using friend
 # can download the resulting .exe (+ its GStreamer runtime DLLs) from the
 # workflow run and smoke-test it.
+#
+# 2026-07-30: switched from building the old standalone egui binary to
+# building the real app — the Electron shell (electron/, packaged via
+# electron-builder --win portable) spawning the src-tauri sidecar as a
+# child process, mirroring the Linux AppImage build (see electron/
+# package.json's `build.linux`/`build.win`). The sidecar is still built by
+# `cargo build`, cross-compiled at the x86_64-pc-windows-msvc target
+# (native on this windows-latest runner, so "cross-compiled" only in the
+# sense of a non-default target triple); electron-builder just packages the
+# Electron shell + that sidecar .exe + GStreamer runtime around it.
+#
+# 2026-07-30 (same day): delivery switched from `actions/upload-artifact`
+# to a GitHub Release asset (`gh release create/upload`, tag
+# `windows-dev-build`, recreated every run). Actions artifact storage hit
+# an account-level quota bug where GitHub's usage counter didn't reflect
+# reality even immediately after all old artifacts were deleted (its own
+# error says usage is only recalculated every 6-12h) — Releases use
+# separate storage untouched by that counter, so this sidesteps it
+# entirely rather than waiting out the recalculation window. This is a
+# rolling dev-build pointer, not a versioned release process — the tag
+# and its single release are deleted and recreated fresh each run.
 on:
   push:
     branches: [master]
@@ -33,6 +54,14 @@ env:
   # step (PATH, PKG_CONFIG_PATH, packaging) needs to reference.
   GST_INSTALL_PARENT: "C:\\gstreamer"
   GST_ROOT: "C:\\gstreamer\\1.0\\msvc_x86_64"
+  # Rolling tag for the dev-build GitHub Release the .exe is published to
+  # (see the "Publish .exe as a GitHub Release asset" step below).
+  RELEASE_TAG: "windows-dev-build"
+
+# Needed for `gh release create/upload` (default GITHUB_TOKEN permissions
+# are read-only otherwise).
+permissions:
+  contents: write
 
 jobs:
   windows-build:
@@ -160,61 +189,88 @@ jobs:
           pkg-config --modversion gstreamer-app-1.0
           pkg-config --modversion gstreamer-video-1.0
 
-      - name: cargo build --release
+      # Only the sidecar needs building here — the old standalone egui
+      # binary (`simple-screensharing-client`) isn't part of the packaged
+      # app anymore, and skipping it keeps this build faster.
+      - name: cargo build --release (src-tauri sidecar)
         shell: pwsh
-        run: cargo build --release --target x86_64-pc-windows-msvc --locked
+        run: cargo build --release --target x86_64-pc-windows-msvc --locked -p simple-screensharing-client-tauri
 
-      # --- Package the artifact ------------------------------------------
-      # Ship the .exe alongside GStreamer's runtime DLLs and plugins so the
-      # friend doesn't need to install GStreamer themselves. Bundling the
-      # whole GStreamer bin/plugin set (rather than hand-picking a minimal
-      # DLL subset) is deliberately conservative: this app depends on
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: npm install (electron/)
+        shell: pwsh
+        run: npm install
+        working-directory: electron
+
+      # --- Stage the GStreamer runtime for electron-builder ---------------
+      # electron-builder's `build.win.extraResources` (electron/package.json)
+      # pulls the sidecar's runtime DLLs/plugins from here into the packaged
+      # app's `resources/win/` — mirrors the old standalone-binary artifact's
+      # bin/ + lib/gstreamer-1.0 layout, just staged as electron-builder
+      # input instead of the final artifact directly. Bundling the whole
+      # GStreamer bin/plugin set (rather than hand-picking a minimal DLL
+      # subset) is deliberately conservative: this app depends on
       # gstreamer-app/-video on top of core, and hand-tracing the exact
       # transitive DLL closure is brittle for a one-off smoke-test build.
-      - name: Stage build output for the artifact
+      - name: Stage GStreamer runtime for packaging
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $dist = "dist"
-          New-Item -ItemType Directory -Force -Path "$dist\bin" | Out-Null
-          New-Item -ItemType Directory -Force -Path "$dist\lib\gstreamer-1.0" | Out-Null
+          $runtime = "electron\win-runtime"
+          New-Item -ItemType Directory -Force -Path "$runtime\bin" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$runtime\lib\gstreamer-1.0" | Out-Null
+          Copy-Item "$env:GST_ROOT\bin\*.dll" "$runtime\bin\"
+          Copy-Item "$env:GST_ROOT\lib\gstreamer-1.0\*" "$runtime\lib\gstreamer-1.0\" -Recurse
 
-          Copy-Item "target\x86_64-pc-windows-msvc\release\simple-screensharing-client.exe" "$dist\bin\"
-          Copy-Item "$env:GST_ROOT\bin\*.dll" "$dist\bin\"
+      # Builds a portable (single self-contained, no-install) .exe — matches
+      # the "fully self-contained, just hand someone a file" spirit of the
+      # Linux AppImage build. NSIS (an installer) was the alternative; not
+      # chosen because this is a smoke-test hand-off to a friend, not a
+      # distributed release, so skipping an install step is the better fit.
+      - name: electron-builder --win portable
+        shell: pwsh
+        run: npm run build:win
+        working-directory: electron
 
-          # Plugins (encoders/decoders/etc.), looked up by GStreamer
-          # relative to the DLLs at ..\lib\gstreamer-1.0 — which is exactly
-          # the bin\ + lib\ layout staged here.
-          Copy-Item "$env:GST_ROOT\lib\gstreamer-1.0\*" "$dist\lib\gstreamer-1.0\" -Recurse
+      # --- Publish as a GitHub Release asset -------------------------------
+      # Not `actions/upload-artifact`: Actions artifact storage has an
+      # account-level quota bug where deleting old artifacts didn't free
+      # the counter it checks (GitHub's own error says usage is only
+      # recalculated every 6-12h), so uploads kept failing with "Artifact
+      # storage quota has been hit" even at 0 artifacts. Releases use
+      # separate storage untouched by that counter. `RELEASE_TAG` is a
+      # rolling pointer (delete + recreate every run) — this is a
+      # dev-build hand-off, not a versioned release process.
+      - name: Publish .exe as a GitHub Release asset
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = Get-ChildItem -Path "dist" -Filter "*.exe" | Select-Object -First 1
+          if (-not $exe) {
+            Write-Host "::error::No .exe found in dist/ to publish."
+            exit 1
+          }
+          Write-Host "Publishing $($exe.FullName) ($([math]::Round($exe.Length / 1MB, 1)) MB) to release tag $env:RELEASE_TAG"
 
-          # Fallback launcher in case relative-path plugin discovery
-          # doesn't kick in on the friend's machine: sets GST_PLUGIN_PATH
-          # explicitly before starting the exe.
-          Set-Content -Encoding ascii -Path "$dist\run.bat" -Value @'
-          @echo off
-          set GST_PLUGIN_PATH=%~dp0lib\gstreamer-1.0
-          set PATH=%~dp0bin;%PATH%
-          start "" "%~dp0bin\simple-screensharing-client.exe"
-          '@
+          # Ignore failure: the tag/release may not exist yet on the first
+          # run, or between runs if someone deleted it manually.
+          gh release delete $env:RELEASE_TAG --yes --cleanup-tag 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "No existing '$env:RELEASE_TAG' release to delete (fine on first run)."
+          }
 
-          Set-Content -Encoding ascii -Path "$dist\README.txt" -Value @'
-          Simple Screensharing Client - Windows smoke-test build
-          ========================================================
-
-          Double-click run.bat to launch it. That also works if GStreamer's
-          automatic plugin discovery doesn't find lib\gstreamer-1.0 on its
-          own. Running bin\simple-screensharing-client.exe directly should
-          work too in most cases.
-
-          This is an unsigned CI build intended for smoke-testing only -
-          Windows SmartScreen may warn about it being from an unknown
-          publisher.
-          '@
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: simple-screensharing-client-windows-${{ env.GST_ARCH }}
-          path: dist/
-          if-no-files-found: error
-          retention-days: 14
+          gh release create $env:RELEASE_TAG $exe.FullName `
+            --title "Windows dev build ($env:RELEASE_TAG)" `
+            --notes "Automated Windows smoke-test build from workflow run $env:GITHUB_RUN_ID (commit $env:GITHUB_SHA). Unsigned CI build — Windows SmartScreen may warn about it being from an unknown publisher. This tag is recreated on every run of windows-build.yml; it does not track a fixed commit." `
+            --prerelease `
+            --target $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::gh release create failed."
+            exit 1
+          }
