@@ -6,7 +6,7 @@
 use serde::Serialize;
 
 use simple_screensharing_client::capture::destination::{DestinationState, VideoParams};
-use simple_screensharing_client::capture::{QualityLevel, RateControlMode, TuneMode};
+use simple_screensharing_client::capture::{QualityLevel, RateControlMode, TuneMode, VideoCodec};
 use simple_screensharing_client::protocol::{ConnId, Member, StreamInfo};
 use simple_screensharing_client::rooms::BandwidthMode;
 use simple_screensharing_client::session::{self, AppState, RoomHandle};
@@ -211,6 +211,14 @@ pub struct StagedCaptureRow {
     /// VideoParams::gop_millis`. Preset-driven (Gaming uses a shorter
     /// interval), not its own Advanced-tuning control.
     pub gop_millis: u32,
+    pub codec: VideoCodec,
+    /// Which codecs are actually usable for the backend this staged capture
+    /// would use — `capture::supported_codecs(capture::detect_encoder_
+    /// backend())`, as snake_case strings (`video_codec_str`). The frontend
+    /// codec selector should grey out/disable any option not in this list
+    /// rather than let a user pick one that silently downgrades — see
+    /// `capture::supported_codecs`'s doc comment.
+    pub supported_codecs: Vec<&'static str>,
 }
 
 pub fn staged_capture_rows(state: &AppState) -> Vec<StagedCaptureRow> {
@@ -228,6 +236,7 @@ pub fn staged_capture_rows(state: &AppState) -> Vec<StagedCaptureRow> {
             }
             session::ShareStatus::Active(session::ShareHandle::Audio(_)) => continue,
         };
+        let backend = simple_screensharing_client::capture::detect_encoder_backend();
         rows.push(StagedCaptureRow {
             capture_id: capture_id.0,
             state: row_state,
@@ -239,6 +248,11 @@ pub fn staged_capture_rows(state: &AppState) -> Vec<StagedCaptureRow> {
             quality_level: state.quality_level,
             rate_control: state.rate_control,
             gop_millis: state.gop_millis,
+            codec: state.codec,
+            supported_codecs: simple_screensharing_client::capture::supported_codecs(backend)
+                .iter()
+                .map(|c| video_codec_str(*c))
+                .collect(),
         });
     }
     rows
@@ -282,6 +296,7 @@ pub struct StartStreamDefaultsDto {
     pub tune: TuneMode,
     pub quality_level: QualityLevel,
     pub rate_control: RateControlMode,
+    pub codec: VideoCodec,
 }
 
 #[derive(Serialize, Clone)]
@@ -446,6 +461,27 @@ pub fn parse_rate_control_mode(s: &str) -> Result<RateControlMode, String> {
         "cqp" => Ok(RateControlMode::Cqp),
         "qvbr" => Ok(RateControlMode::Qvbr),
         other => Err(format!("unknown rate control mode: {other}")),
+    }
+}
+
+/// Stable, snake_case identifier for a [`VideoCodec`] — same `parse_*`/
+/// `*_str` convention as [`parse_bandwidth_mode`]/[`bandwidth_mode_str`],
+/// used by `set_codec`/`edit_destination`/`set_start_stream_defaults` and by
+/// [`staged_capture_rows`]'s `supported_codecs` list.
+pub fn video_codec_str(codec: VideoCodec) -> &'static str {
+    match codec {
+        VideoCodec::H264 => "h264",
+        VideoCodec::H265 => "h265",
+        VideoCodec::Av1 => "av1",
+    }
+}
+
+pub fn parse_video_codec(s: &str) -> Result<VideoCodec, String> {
+    match s {
+        "h264" => Ok(VideoCodec::H264),
+        "h265" => Ok(VideoCodec::H265),
+        "av1" => Ok(VideoCodec::Av1),
+        other => Err(format!("unknown video codec: {other}")),
     }
 }
 

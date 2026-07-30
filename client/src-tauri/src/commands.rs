@@ -336,6 +336,7 @@ pub fn get_start_stream_defaults() -> StartStreamDefaultsDto {
         tune: d.tune,
         quality_level: d.quality_level,
         rate_control: d.rate_control,
+        codec: d.codec,
     }
 }
 
@@ -350,11 +351,20 @@ pub fn set_start_stream_defaults(
     tune: String,
     quality_level: String,
     rate_control: String,
+    codec: String,
 ) -> Result<(), String> {
     let tune = dto::parse_tune_mode(&tune)?;
     let quality_level = dto::parse_quality_level(&quality_level)?;
     let rate_control = dto::parse_rate_control_mode(&rate_control)?;
-    simple_screensharing_client::session::save_start_stream_defaults(framerate, bitrate_kbps, tune, quality_level, rate_control);
+    let codec = dto::parse_video_codec(&codec)?;
+    simple_screensharing_client::session::save_start_stream_defaults(
+        framerate,
+        bitrate_kbps,
+        tune,
+        quality_level,
+        rate_control,
+        codec,
+    );
     Ok(())
 }
 
@@ -580,6 +590,33 @@ pub fn set_gop_millis(managed: State<'_, Managed>, gop_millis: u32) {
     managed.state.lock().unwrap().gop_millis = gop_millis;
 }
 
+/// Process-wide codec (H.264/H.265/AV1) for the *next* video capture started
+/// — same shape as `set_tune`/`set_quality_level`/`set_rate_control` above.
+/// The frontend should only ever send a value from `supported_codecs`'s
+/// current result for this machine's backend (see that command's doc
+/// comment) — this command does not itself re-validate against the backend,
+/// since [`simple_screensharing_client::capture::EncoderBackend::actual_codec`]
+/// already makes an unsupported combination degrade safely (to H.264)
+/// rather than fail, and re-validating here would just duplicate that
+/// gating in a second place.
+#[tauri::command]
+pub fn set_codec(managed: State<'_, Managed>, codec: String) -> Result<(), String> {
+    let codec = dto::parse_video_codec(&codec)?;
+    managed.state.lock().unwrap().codec = codec;
+    Ok(())
+}
+
+/// Which codecs (`"h264"`/`"h265"`/`"av1"`) are actually usable on this
+/// machine's current encoder backend — the mechanism Stage 2's frontend
+/// codec selector should call to grey out/disable unavailable options. See
+/// `capture::supported_codecs`'s doc comment for why this is a static
+/// function of the backend rather than a live per-codec hardware probe.
+#[tauri::command]
+pub fn supported_codecs() -> Vec<&'static str> {
+    let backend = simple_screensharing_client::capture::detect_encoder_backend();
+    simple_screensharing_client::capture::supported_codecs(backend).iter().map(|c| dto::video_codec_str(*c)).collect()
+}
+
 #[tauri::command]
 pub fn list_active_streams(managed: State<'_, Managed>) -> Vec<DestinationRow> {
     dto::destination_rows(&managed.state.lock().unwrap())
@@ -628,10 +665,12 @@ pub fn edit_destination(
     quality_level: String,
     rate_control: String,
     gop_millis: u32,
+    codec: String,
 ) -> Result<(), String> {
     let tune = dto::parse_tune_mode(&tune)?;
     let quality_level = dto::parse_quality_level(&quality_level)?;
     let rate_control = dto::parse_rate_control_mode(&rate_control)?;
+    let codec = dto::parse_video_codec(&codec)?;
 
     let mut state = managed.state.lock().unwrap();
     let destination_id = DestinationId(destination_id);
@@ -643,6 +682,7 @@ pub fn edit_destination(
         dest.edit.quality_level = quality_level;
         dest.edit.rate_control = rate_control;
         dest.edit.gop_millis = gop_millis;
+        dest.edit.codec = codec;
     });
     state.apply_destination_edit(destination_id);
     Ok(())

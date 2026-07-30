@@ -455,7 +455,7 @@ fn produce(rx: Receiver<DecryptedMediaFrame>, mailbox: Arc<Mailbox>, stop: Arc<A
         };
 
         if frame.keyframe {
-            if let Some(codec) = parse_avc_codec_string(&frame.payload) {
+            if let Some(codec) = derive_codec_string(&frame.payload) {
                 tracing::debug!("video_server: derived codec string {codec:?}");
                 mailbox.set_codec(codec);
             }
@@ -508,6 +508,446 @@ fn parse_avc_codec_string(access_unit: &[u8]) -> Option<String> {
         i = nal_start;
     }
     None
+}
+
+// ---------------------------------------------------------------------
+// H.265/AV1 codec-string derivation
+//
+// `Why this is a byte-sniffing dispatcher and not a codec field carried on
+// the wire:` `protocol.rs`'s `AnnounceStream`/`StreamInfo` carry no codec
+// field (confirmed at this feature's design time — see `superdoc/features/
+// stream-control.md`'s dated entry), and this module's whole codec-string
+// design already derives everything from the bitstream itself rather than
+// trusting a caller-declared value (see this module's "Codec-string
+// discovery" doc section above — that section's own reasoning, "the
+// bitstream is the only thing that can't go stale", applies just as much to
+// *which* codec a stream is as to *which profile/level*). Extending that to
+// discriminate the codec itself, not just its profile/level, needed a
+// **structural**, not merely probabilistic, signal — and `capture.rs`
+// deliberately provides exactly one: H.264/H.265 branches are always built
+// with `stream-format=byte-stream` (Annex-B, i.e. every access unit starts
+// with a `00 00 01`/`00 00 00 01` start code), while the AV1 branch is
+// always built with `stream-format=obu-stream` (raw OBUs, **no** start
+// codes at all — see `capture.rs`'s `branch::add_branch` output-caps
+// selection). So "does this access unit begin with an Annex-B start code"
+// is a deterministic AV1-vs-{H.264,H.265} discriminator, not a guess.
+//
+// H.264 vs. H.265 within the Annex-B branch is not quite as clean — both
+// use start-code-prefixed NAL units, and there is genuinely no field on
+// `DecryptedMediaFrame`/the wire media header that says which. The
+// disambiguator used below (`looks_like_hevc_param_set_nal`) is a real
+// **judgment call**, not a proven-safe discriminator like the Annex-B/OBU
+// one above: it works by re-interpreting each NAL's header both ways
+// (H.264's 1-byte header vs. H.265's 2-byte header) and checking whether the
+// H.265 interpretation lands on a real parameter-set NAL type (VPS/SPS/PPS,
+// 32-34) — which, worked through by hand for both this dev machine's actual
+// `vah264enc` SPS (`0x67` -> H.265 type 51, not a param set) and actual
+// `vah265enc` VPS/SPS (`0x40`/`0x42` -> H.265 type 32/33, real param sets),
+// does not collide for either encoder's real output. It is still a
+// heuristic: a byte-for-byte proof it can never misfire for some other
+// encoder's output does not exist. The alternative — adding a codec field
+// to `protocol.rs`'s wire types — would remove the ambiguity entirely, but
+// is a real, deliberately out-of-scope-for-this-stage cross-cutting protocol
+// change (see this task's brief); flagged here and in this feature's final
+// report as the one genuine ambiguity in this stage's design, not silently
+// resolved.
+// ---------------------------------------------------------------------
+
+/// `true` if `access_unit` begins with an Annex-B start code — see this
+/// section's doc comment for why that's a reliable AV1-vs-{H.264,H.265}
+/// discriminator rather than a guess. Real encoder output always has the
+/// start code at offset 0 (one access unit per buffer, `alignment=au`), but
+/// this scans a short prefix rather than requiring exactly offset 0 as
+/// cheap defensive slack.
+fn looks_like_annex_b(access_unit: &[u8]) -> bool {
+    access_unit.len() >= 8 && (0..4).any(|start| {
+        access_unit[start..].starts_with(&[0, 0, 1]) || access_unit[start..].starts_with(&[0, 0, 0, 1])
+    })
+}
+
+/// Top-level codec-string dispatcher — see this section's doc comment.
+/// Tries H.265 before H.264 within the Annex-B branch (see
+/// `looks_like_hevc_param_set_nal`'s doc comment for why that order is
+/// deliberately safe for both real encoders' output).
+fn derive_codec_string(access_unit: &[u8]) -> Option<String> {
+    if looks_like_annex_b(access_unit) {
+        parse_hevc_codec_string(access_unit).or_else(|| parse_avc_codec_string(access_unit))
+    } else {
+        parse_av1_codec_string(access_unit)
+    }
+}
+
+/// Remove Annex-B emulation-prevention bytes (a `0x03` immediately following
+/// two `0x00` bytes already emitted) from an escaped RBSP. Unlike
+/// [`parse_avc_codec_string`] (which only ever reads the first 3 RBSP bytes,
+/// too early for an emulation-prevention byte to have appeared yet — see
+/// that function's doc comment), [`parse_hevc_codec_string`] reads 13 RBSP
+/// bytes into `profile_tier_level()`, which real `vah265enc` output
+/// routinely inserts emulation-prevention bytes within (confirmed against
+/// this dev machine's actual output) — skipping this step silently
+/// corrupts every field read after the first `0x03`.
+fn strip_emulation_prevention(escaped_rbsp: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(escaped_rbsp.len());
+    let mut zero_run = 0u32;
+    for &byte in escaped_rbsp {
+        if zero_run >= 2 && byte == 0x03 {
+            zero_run = 0;
+            continue;
+        }
+        out.push(byte);
+        zero_run = if byte == 0 { zero_run + 1 } else { 0 };
+    }
+    out
+}
+
+/// H.265 `nal_unit_type` for an SPS (spec Table 7-1).
+const HEVC_NAL_TYPE_SPS: u8 = 33;
+
+/// `true` if the NAL starting at `access_unit[nal_start..]` looks like a
+/// real H.265 SPS under H.265's 2-byte NAL header layout
+/// (`forbidden_zero_bit(1) + nal_unit_type(6) + nuh_layer_id_msb(1)` in the
+/// first byte) — see this section's doc comment for why this is the
+/// H.264-vs-H.265 disambiguator and its real, judgment-call-flagged
+/// limitations.
+///
+/// `Why SPS only, not also VPS/PPS:` [`parse_hevc_codec_string`] reads
+/// `profile_tier_level()` at a fixed one-byte offset into the RBSP that is
+/// only correct for an SPS (`sps_video_parameter_set_id` +
+/// `sps_max_sub_layers_minus1` + `sps_temporal_id_nesting_flag`, exactly one
+/// byte). A VPS has a *two*-byte prefix before its own
+/// `profile_tier_level()` (`vps_video_parameter_set_id` +
+/// `vps_base_layer_internal_flag` + `vps_base_layer_available_flag` +
+/// `vps_max_layers_minus1` + `vps_max_sub_layers_minus1` +
+/// `vps_temporal_id_nesting_flag` + `vps_reserved_0xffff_16bits`, two
+/// bytes), and a PPS has no `profile_tier_level()` at all — either would
+/// silently misparse under this SPS-shaped offset if matched. A real VPS
+/// always precedes its SPS in encoder output (confirmed against this dev
+/// machine's actual `vah265enc` output — VPS is the very first NAL), so an
+/// earlier version of this function that matched any of VPS/SPS/PPS reliably
+/// matched the *wrong* NAL (the VPS) first; restricting to SPS fixed it.
+fn looks_like_hevc_param_set_nal(access_unit: &[u8], nal_start: usize) -> bool {
+    let Some(&byte0) = access_unit.get(nal_start) else { return false };
+    if byte0 & 0x80 != 0 {
+        return false; // forbidden_zero_bit must be 0
+    }
+    let nal_unit_type = (byte0 >> 1) & 0x3f;
+    nal_unit_type == HEVC_NAL_TYPE_SPS
+}
+
+/// Derive a WebCodecs `hev1.<profile>.<compat>.<tier><level>` codec string
+/// from the first SPS NAL's `profile_tier_level()` (H.265 §7.3.3, ISO/IEC
+/// 14496-15 Annex E.3's codec-string mapping) — the H.265 analogue of
+/// [`parse_avc_codec_string`]. Scans for the first NAL whose H.265-header
+/// interpretation is an SPS (see [`looks_like_hevc_param_set_nal`] for why
+/// SPS specifically, not VPS/PPS too).
+///
+/// Deliberately omits the trailing constraint-indicator-flags segment
+/// (`.CC` — see `general_constraint_indicator_flags()`) when all 6 of its
+/// bytes are zero (the common case for a plain Main-profile encode), and
+/// includes it (each nonzero-through byte as lowercase hex, trailing
+/// all-zero bytes trimmed) otherwise — matching this dev machine's actual
+/// `vah265enc` SPS output, hand-verified byte-for-byte against the spec
+/// while building this parser.
+fn parse_hevc_codec_string(access_unit: &[u8]) -> Option<String> {
+    let mut i = 0usize;
+    while i + 2 < access_unit.len() {
+        let marker_len = if access_unit[i] == 0 && access_unit[i + 1] == 0 && access_unit[i + 2] == 1 {
+            3
+        } else if i + 3 < access_unit.len() && access_unit[i] == 0 && access_unit[i + 1] == 0 && access_unit[i + 2] == 0 && access_unit[i + 3] == 1 {
+            4
+        } else {
+            i += 1;
+            continue;
+        };
+
+        let nal_start = i + marker_len;
+        if looks_like_hevc_param_set_nal(access_unit, nal_start) {
+            // RBSP starts after the 2-byte NAL header. Grab up through the
+            // next start code (or end of buffer) as the still-escaped RBSP —
+            // generous, since we only need the first 13 de-escaped bytes,
+            // but the exact de-escaped length isn't known up front.
+            let rbsp_start = nal_start + 2;
+            let rbsp_end = access_unit[rbsp_start..]
+                .windows(3)
+                .position(|w| w == [0, 0, 1])
+                .map(|p| rbsp_start + p)
+                .unwrap_or(access_unit.len());
+            let escaped = access_unit.get(rbsp_start..rbsp_end)?;
+            let rbsp = strip_emulation_prevention(escaped);
+            if rbsp.len() < 13 {
+                i = nal_start;
+                continue;
+            }
+
+            // rbsp[0]: vps/sps_video_parameter_set_id(4) +
+            // sps_max_sub_layers_minus1(3) + sps_temporal_id_nesting_flag(1)
+            // — skipped, not needed for the codec string.
+            let profile_byte = rbsp[1];
+            let general_profile_space = (profile_byte >> 6) & 0x03;
+            let general_tier_flag = (profile_byte >> 5) & 0x01;
+            let general_profile_idc = profile_byte & 0x1f;
+            let compat_flags = u32::from_be_bytes([rbsp[2], rbsp[3], rbsp[4], rbsp[5]]);
+            let constraint_bytes = &rbsp[6..12];
+            let general_level_idc = rbsp[12];
+
+            let space_char = match general_profile_space {
+                0 => "",
+                1 => "A",
+                2 => "B",
+                _ => "C",
+            };
+            let tier_char = if general_tier_flag == 1 { 'H' } else { 'L' };
+            // "in reverse bit order" per Annex E.3 — see this function's doc
+            // comment.
+            let compat_reversed = compat_flags.reverse_bits();
+
+            let mut codec = format!("hev1.{space_char}{general_profile_idc}.{compat_reversed:x}.{tier_char}{general_level_idc}");
+
+            let last_nonzero = constraint_bytes.iter().rposition(|&b| b != 0);
+            if let Some(last_nonzero) = last_nonzero {
+                for byte in &constraint_bytes[..=last_nonzero] {
+                    codec.push_str(&format!(".{byte:x}"));
+                }
+            }
+
+            return Some(codec);
+        }
+        i = nal_start;
+    }
+    None
+}
+
+/// Minimal MSB-first bit reader, used only by [`parse_av1_sequence_header`]
+/// — the AV1 fields this module needs
+/// (`seq_profile`/`seq_level_idx`/`seq_tier`/bit depth) are not byte-aligned
+/// in the bitstream, unlike H.264/H.265's SPS (whole bytes, read directly
+/// above).
+struct BitReader<'a> {
+    data: &'a [u8],
+    bit_pos: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, bit_pos: 0 }
+    }
+
+    fn f(&mut self, n: u32) -> Option<u32> {
+        let mut value = 0u32;
+        for _ in 0..n {
+            let byte_idx = self.bit_pos / 8;
+            let bit_idx = 7 - (self.bit_pos % 8);
+            let byte = *self.data.get(byte_idx)?;
+            let bit = (byte >> bit_idx) & 1;
+            value = (value << 1) | u32::from(bit);
+            self.bit_pos += 1;
+        }
+        Some(value)
+    }
+
+    /// AV1 spec 4.10.3 `uvlc()`.
+    fn uvlc(&mut self) -> Option<u32> {
+        let mut leading_zeros = 0u32;
+        loop {
+            if self.f(1)? == 1 {
+                break;
+            }
+            leading_zeros += 1;
+            if leading_zeros >= 32 {
+                return Some(u32::MAX);
+            }
+        }
+        let value = self.f(leading_zeros)?;
+        Some(value + (1u32 << leading_zeros) - 1)
+    }
+}
+
+/// AV1 `obu_type` for a Sequence Header OBU (spec §6.2.2).
+const AV1_OBU_TYPE_SEQUENCE_HEADER: u8 = 1;
+
+/// Read a byte-aligned `leb128(num_bytes)` value (AV1 spec §4.10.5),
+/// returning the value and how many bytes it consumed.
+fn read_leb128(data: &[u8]) -> Option<(u64, usize)> {
+    let mut value: u64 = 0;
+    for (i, &byte) in data.iter().enumerate().take(8) {
+        value |= u64::from(byte & 0x7f) << (i * 7);
+        if byte & 0x80 == 0 {
+            return Some((value, i + 1));
+        }
+    }
+    None
+}
+
+/// Scan a raw AV1 "obu-stream" access unit (one temporal unit's worth of raw
+/// OBUs, `has_size_field=1` on every OBU — no Annex-B start codes at all,
+/// see this section's doc comment and `capture.rs`'s `vaav1enc` output
+/// caps) for the first Sequence Header OBU and derive a WebCodecs
+/// `av01.<profile>.<level><tier>.<bitdepth>` codec string from it — the AV1
+/// analogue of [`parse_avc_codec_string`]/[`parse_hevc_codec_string`].
+/// Deliberately omits the optional trailing color-description fields
+/// (`.CP.TC.MC.FR.G`): the AV1 codec-string registration allows omitting
+/// them, in which case a decoder assumes SDR/BT.709 defaults — which
+/// matches what this pipeline actually produces (no HDR/wide-gamut support
+/// anywhere in this codebase yet), so there's nothing more specific to
+/// report.
+fn parse_av1_codec_string(access_unit: &[u8]) -> Option<String> {
+    let mut offset = 0usize;
+    while offset < access_unit.len() {
+        let header_byte = *access_unit.get(offset)?;
+        if header_byte & 0x80 != 0 {
+            return None; // obu_forbidden_bit must be 0
+        }
+        let obu_type = (header_byte >> 3) & 0x0f;
+        let extension_flag = (header_byte >> 2) & 1;
+        let has_size_field = (header_byte >> 1) & 1;
+        let mut cursor = offset + 1;
+        if extension_flag == 1 {
+            cursor += 1; // skip the one-byte extension header
+        }
+        if has_size_field == 0 {
+            // Can't safely locate the next OBU without fully decoding this
+            // one's payload — never emitted by this pipeline (`vaav1enc`
+            // always sets `has_size_field=1`, confirmed against this dev
+            // machine's actual output).
+            return None;
+        }
+        let (obu_size, leb_len) = read_leb128(access_unit.get(cursor..)?)?;
+        let payload_start = cursor + leb_len;
+        let payload_end = payload_start + usize::try_from(obu_size).ok()?;
+        let payload = access_unit.get(payload_start..payload_end)?;
+
+        if obu_type == AV1_OBU_TYPE_SEQUENCE_HEADER {
+            return parse_av1_sequence_header(payload);
+        }
+        offset = payload_end;
+    }
+    None
+}
+
+/// Parse a Sequence Header OBU's payload (AV1 spec §5.5.1) far enough to
+/// derive `seq_profile`/`seq_level_idx[0]`/`seq_tier[0]`/bit depth — see
+/// [`parse_av1_codec_string`]'s doc comment for the resulting string format.
+///
+/// `Why this can return `None` on structurally valid AV1 that the H.264/
+/// H.265 parsers above would never bail on for equivalent content:` full
+/// sequence-header parsing (`timing_info()`/`decoder_model_info()`/
+/// `operating_parameters_info()`) is substantially more involved than
+/// H.264/H.265's fixed, byte-aligned `profile_tier_level()` layout. This
+/// parser handles the common single-operating-point case — including the
+/// `reduced_still_picture_header` fast path — but bails out (`None`, same
+/// as "no SPS in this access unit" for H.264) rather than implement
+/// `operating_parameters_info()`'s variable-length decoder-buffer-model
+/// fields, which nothing in this pipeline ever sets
+/// (`decoder_model_info_present_flag` was `0` in every access unit observed
+/// from this dev machine's real `vaav1enc` output while building this
+/// parser).
+fn parse_av1_sequence_header(payload: &[u8]) -> Option<String> {
+    let mut r = BitReader::new(payload);
+    let seq_profile = r.f(3)?;
+    let _still_picture = r.f(1)?;
+    let reduced_still_picture_header = r.f(1)?;
+
+    let (seq_level_idx0, seq_tier0);
+    if reduced_still_picture_header == 1 {
+        seq_level_idx0 = r.f(5)?;
+        seq_tier0 = 0;
+    } else {
+        let timing_info_present_flag = r.f(1)?;
+        if timing_info_present_flag == 1 {
+            let _num_units_in_display_tick = r.f(32)?;
+            let _time_scale = r.f(32)?;
+            let equal_picture_interval = r.f(1)?;
+            if equal_picture_interval == 1 {
+                let _num_ticks_per_picture_minus_1 = r.uvlc()?;
+            }
+            let decoder_model_info_present_flag = r.f(1)?;
+            if decoder_model_info_present_flag == 1 {
+                // decoder_model_info()/operating_parameters_info() — bail,
+                // see this function's doc comment.
+                return None;
+            }
+        }
+        let initial_display_delay_present_flag = r.f(1)?;
+        let operating_points_cnt_minus_1 = r.f(5)?;
+        let mut level0 = 0;
+        let mut tier0 = 0;
+        for i in 0..=operating_points_cnt_minus_1 {
+            let _operating_point_idc = r.f(12)?;
+            let seq_level_idx = r.f(5)?;
+            let seq_tier = if seq_level_idx > 7 { r.f(1)? } else { 0 };
+            if initial_display_delay_present_flag == 1 {
+                let present = r.f(1)?;
+                if present == 1 {
+                    let _initial_display_delay_minus_1 = r.f(4)?;
+                }
+            }
+            if i == 0 {
+                level0 = seq_level_idx;
+                tier0 = seq_tier;
+            }
+        }
+        seq_level_idx0 = level0;
+        seq_tier0 = tier0;
+    }
+
+    let frame_width_bits_minus_1 = r.f(4)?;
+    let frame_height_bits_minus_1 = r.f(4)?;
+    let _max_frame_width_minus_1 = r.f(frame_width_bits_minus_1 + 1)?;
+    let _max_frame_height_minus_1 = r.f(frame_height_bits_minus_1 + 1)?;
+    let frame_id_numbers_present_flag = if reduced_still_picture_header == 1 { 0 } else { r.f(1)? };
+    if frame_id_numbers_present_flag == 1 {
+        let _delta_frame_id_length_minus_2 = r.f(4)?;
+        let _additional_frame_id_length_minus_1 = r.f(3)?;
+    }
+    let _use_128x128_superblock = r.f(1)?;
+    let _enable_filter_intra = r.f(1)?;
+    let _enable_intra_edge_filter = r.f(1)?;
+
+    if reduced_still_picture_header == 0 {
+        let _enable_interintra_compound = r.f(1)?;
+        let _enable_masked_compound = r.f(1)?;
+        let _enable_warped_motion = r.f(1)?;
+        let _enable_dual_filter = r.f(1)?;
+        let enable_order_hint = r.f(1)?;
+        if enable_order_hint == 1 {
+            let _enable_jnt_comp = r.f(1)?;
+            let _enable_ref_frame_mvs = r.f(1)?;
+        }
+        let seq_choose_screen_content_tools = r.f(1)?;
+        let seq_force_screen_content_tools =
+            if seq_choose_screen_content_tools == 1 { 2 /* SELECT_SCREEN_CONTENT_TOOLS */ } else { r.f(1)? };
+        if seq_force_screen_content_tools > 0 {
+            let seq_choose_integer_mv = r.f(1)?;
+            if seq_choose_integer_mv == 0 {
+                let _seq_force_integer_mv = r.f(1)?;
+            }
+        }
+        if enable_order_hint == 1 {
+            let _order_hint_bits_minus_1 = r.f(3)?;
+        }
+    }
+
+    let _enable_superres = r.f(1)?;
+    let _enable_cdef = r.f(1)?;
+    let _enable_restoration = r.f(1)?;
+
+    // color_config() (AV1 spec §5.5.2) — only as far as BitDepth, per this
+    // function's doc comment.
+    let high_bitdepth = r.f(1)?;
+    let bit_depth = if seq_profile == 2 && high_bitdepth == 1 {
+        if r.f(1)? == 1 {
+            12 // twelve_bit
+        } else {
+            10
+        }
+    } else if high_bitdepth == 1 {
+        10
+    } else {
+        8
+    };
+
+    let tier_char = if seq_tier0 == 1 { 'H' } else { 'M' };
+    Some(format!("av01.{seq_profile}.{seq_level_idx0:02}{tier_char}.{bit_depth:02}"))
 }
 
 fn accept_loop(listener: TcpListener, routes: Arc<Mutex<HashMap<StreamKey, Route>>>) {
@@ -712,6 +1152,69 @@ mod tests {
     #[test]
     fn parse_avc_codec_string_none_without_sps() {
         assert_eq!(parse_avc_codec_string(&synthetic_delta_au()), None);
+    }
+
+    /// The exact first bytes of a real `vah265enc` access unit, captured on
+    /// this dev machine (AMD RX 7900 XTX, GStreamer 1.28.5) via:
+    /// `gst-launch-1.0 videotestsrc num-buffers=3 ! videoconvert !
+    /// video/x-raw,format=NV12,width=320,height=240 ! vah265enc !
+    /// video/x-h265,stream-format=byte-stream,alignment=au ! filesink
+    /// location=...` — real hardware output, not synthesized, per this
+    /// feature's real-hardware testing bar. Contains one VPS NAL, one SPS
+    /// NAL (Main profile, Main tier, `general_level_idc = 60` i.e. Level
+    /// 2.0, one nonzero constraint-indicator-flags byte, `0x90` —
+    /// `general_progressive_source_flag`/`general_frame_only_constraint_
+    /// flag` set, the rest 0), and the start of one PPS NAL. Hand-verified
+    /// byte-for-byte against the H.265 spec's
+    /// `profile_tier_level()` layout (including the real Annex-B
+    /// emulation-prevention `0x03` bytes this SPS actually contains) while
+    /// building [`parse_hevc_codec_string`].
+    fn real_vah265enc_keyframe_prefix() -> Vec<u8> {
+        vec![
+            0x00, 0x00, 0x00, 0x01, 0x40, 0x01, 0x0c, 0x01, 0xff, 0xff, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x90, 0x00, 0x00,
+            0x03, 0x00, 0x00, 0x03, 0x00, 0x3c, 0x2c, 0x09, 0x00, 0x00, 0x00, 0x01, 0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00,
+            0x03, 0x00, 0x90, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x3c, 0xa0, 0x0a, 0x08, 0x0f, 0x16, 0x8b, 0x92, 0x42,
+            0x95, 0xa7, 0xff, 0x00, 0x01, 0x00, 0x01, 0x01, 0x00, 0x00, 0x03, 0x00, 0x01, 0x00, 0x00, 0x03, 0x00, 0x1e, 0x08,
+            0x00, 0x00, 0x00, 0x01, 0x44, 0x01, 0xc0, 0x77, 0xc0, 0x89, 0x00, 0x00, 0x00, 0x01,
+        ]
+    }
+
+    /// The exact first bytes of a real `vaav1enc` access unit, captured on
+    /// this dev machine the same way as [`real_vah265enc_keyframe_prefix`]
+    /// (`... ! vaav1enc ! video/x-av1,stream-format=obu-stream,alignment=tu
+    /// ! filesink ...`). Contains a temporal-delimiter OBU (size 0) followed
+    /// by a Sequence Header OBU: profile 0 (Main), `reduced_still_picture_
+    /// header = 0` with a single operating point at `seq_level_idx = 0`
+    /// (Level 2.0), Main tier, 8-bit — cross-checked against `ffprobe -v
+    /// trace` decoding this exact real capture independently (`profile=Main
+    /// level=0`), not just this parser's own hand-derived math, while
+    /// building [`parse_av1_sequence_header`].
+    fn real_vaav1enc_keyframe_prefix() -> Vec<u8> {
+        vec![
+            0x12, 0x00, 0x0a, 0x0b, 0x00, 0x00, 0x00, 0x04, 0x3c, 0xff, 0xbc, 0x02, 0x15, 0x00, 0x40, 0x1a, 0x0f, 0x10, 0x02,
+            0x40, 0x02, 0x41, 0xc7, 0x1c, 0x70, 0x50, 0x00, 0x02, 0x08, 0x61, 0x9e, 0x79, 0x22, 0xec, 0x97, 0x80, 0x00, 0xc8,
+            0xf2, 0x94,
+        ]
+    }
+
+    #[test]
+    fn parse_hevc_codec_string_reads_real_vah265enc_sps() {
+        assert_eq!(parse_hevc_codec_string(&real_vah265enc_keyframe_prefix()).as_deref(), Some("hev1.1.6.L60.90"));
+    }
+
+    #[test]
+    fn parse_av1_codec_string_reads_real_vaav1enc_sequence_header() {
+        assert_eq!(parse_av1_codec_string(&real_vaav1enc_keyframe_prefix()).as_deref(), Some("av01.0.00M.08"));
+    }
+
+    /// [`derive_codec_string`] must route each real codec's output to its
+    /// own parser (not silently return `None` or a wrong-codec string) —
+    /// the actual dispatch [`produce`] relies on.
+    #[test]
+    fn derive_codec_string_dispatches_by_bitstream_shape() {
+        assert_eq!(derive_codec_string(&synthetic_keyframe_au()).as_deref(), Some("avc1.640028"));
+        assert_eq!(derive_codec_string(&real_vah265enc_keyframe_prefix()).as_deref(), Some("hev1.1.6.L60.90"));
+        assert_eq!(derive_codec_string(&real_vaav1enc_keyframe_prefix()).as_deref(), Some("av01.0.00M.08"));
     }
 
     /// End-to-end over a real loopback socket: starts a route, connects a

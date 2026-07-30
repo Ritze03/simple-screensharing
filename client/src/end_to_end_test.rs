@@ -1665,6 +1665,7 @@ async fn retry_destination_preserves_prior_encoder_tuning() {
         quality_level: capture::QualityLevel::Quality,
         rate_control: capture::RateControlMode::Cqp,
         gop_millis: capture::DEFAULT_GOP_MILLIS,
+        codec: capture::VideoCodec::default(),
     };
 
     {
@@ -2715,6 +2716,7 @@ async fn start_audio_share_succeeds_once_the_video_capture_is_live() {
         quality_level: capture::QualityLevel::default(),
         rate_control: capture::RateControlMode::default(),
         gop_millis: capture::DEFAULT_GOP_MILLIS,
+        codec: capture::VideoCodec::default(),
     };
     {
         let room = state.rooms.get_mut(&room_handle).unwrap();
@@ -2823,6 +2825,7 @@ async fn stop_share_tears_down_a_paired_audio_capture_too() {
         quality_level: capture::QualityLevel::default(),
         rate_control: capture::RateControlMode::default(),
         gop_millis: capture::DEFAULT_GOP_MILLIS,
+        codec: capture::VideoCodec::default(),
     };
 
     let video_capture_id = state.alloc_capture_id();

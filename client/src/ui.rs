@@ -2321,6 +2321,7 @@ mod session_model_tests {
                 quality_level: capture::QualityLevel::default(),
                 rate_control: capture::RateControlMode::default(),
                 gop_millis: capture::DEFAULT_GOP_MILLIS,
+                codec: capture::VideoCodec::default(),
             },
             runtime: None,
             pending: None,
@@ -2332,6 +2333,7 @@ mod session_model_tests {
                 quality_level: capture::QualityLevel::default(),
                 rate_control: capture::RateControlMode::default(),
                 gop_millis: capture::DEFAULT_GOP_MILLIS,
+                codec: capture::VideoCodec::default(),
             },
             apply_rx: None,
         }

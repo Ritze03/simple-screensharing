@@ -207,6 +207,26 @@ use crate::protocol::StreamKind;
 /// (GStreamer 1.28.5) that only `vah264enc` is present.
 const VAAPI_ENCODER_ELEMENT: &str = "vah264enc";
 
+/// [`EncoderBackend::Vaapi`]'s H.265 encoder element — confirmed present via
+/// `gst-inspect-1.0 vah265enc` on this dev machine (AMD RX 7900 XTX, RDNA3,
+/// GStreamer 1.28.5, `va` plugin). Its `rate-control` (`cbr`/`vbr`/`cqp`),
+/// `bitrate`, `key-int-max` and `target-usage` properties have the exact same
+/// names/ranges/semantics as [`VAAPI_ENCODER_ELEMENT`]'s (re-verified by
+/// direct `gst-inspect-1.0` comparison, not assumed) — see
+/// [`EncoderBackend::launch_fragment`].
+const VAAPI_H265_ENCODER_ELEMENT: &str = "vah265enc";
+
+/// [`EncoderBackend::Vaapi`]'s AV1 encoder element — confirmed present via
+/// `gst-inspect-1.0 vaav1enc` on this dev machine. Its `rate-control`/
+/// `bitrate`/`key-int-max`/`target-usage` properties are also
+/// name-and-semantics-compatible with [`VAAPI_ENCODER_ELEMENT`]'s — but its
+/// SRC caps are `video/x-av1` with `stream-format=obu-stream,alignment=tu`
+/// (no Annex-B start codes at all), unlike `vah264enc`/`vah265enc`'s
+/// `stream-format=byte-stream,alignment=au` — see
+/// [`EncoderBackend::launch_fragment`] and [`branch::add_branch`]'s output
+/// caps selection.
+const VAAPI_AV1_ENCODER_ELEMENT: &str = "vaav1enc";
+
 /// Which H.264 encoder element a [`start_sharing`] pipeline uses.
 ///
 /// [`start_sharing`] doesn't take this as a parameter — it auto-detects via
@@ -233,6 +253,13 @@ impl EncoderBackend {
     /// that type's doc comment) encoder tuning knobs; each is mapped to the
     /// matching property for whichever backend `self` is, per the mapping
     /// documented on [`TuneMode`], [`QualityLevel`] and [`RateControlMode`].
+    ///
+    /// `codec` selects which encoder element [`EncoderBackend::Vaapi`] uses
+    /// (`vah264enc`/`vah265enc`/`vaav1enc` — see [`VideoCodec`]); it is
+    /// silently ignored on [`EncoderBackend::Software`], which only ever has
+    /// `x264enc` (H.264) available — see [`supported_codecs`] and
+    /// [`EncoderBackend::actual_codec`], which is what callers must consult
+    /// to know what this backend *actually* produced.
     fn launch_fragment(
         self,
         bitrate_kbps: u32,
@@ -240,9 +267,17 @@ impl EncoderBackend {
         tune: TuneMode,
         quality_level: QualityLevel,
         rate_control: RateControlMode,
+        codec: VideoCodec,
     ) -> String {
         match self {
             EncoderBackend::Software => {
+                // Software backend only ever has `x264enc` (H.264) available
+                // — see [`supported_codecs`] — so `codec` is a no-op here,
+                // exactly like `tune` is a no-op on [`EncoderBackend::Vaapi`]
+                // below. Callers that need to know what codec actually came
+                // out must go through [`EncoderBackend::actual_codec`], not
+                // assume the requested `codec` was honored.
+                let _ = codec;
                 // `tune=zerolatency` is x264enc's low-latency knob; leaving
                 // `tune` unset entirely is its best-quality (general-purpose
                 // rate/distortion tuning) mode — there is no explicit
@@ -317,6 +352,19 @@ impl EncoderBackend {
                     // and for why the identifier itself was kept anyway.
                     RateControlMode::Qvbr => "vbr",
                 };
+                // `vah265enc`/`vaav1enc` both expose the exact same
+                // `rate-control`/`bitrate`/`key-int-max`/`target-usage`/
+                // `target-percentage`/`cpb-size` property names, ranges and
+                // enum values as `vah264enc` — all three derive from the same
+                // GStreamer VA-plugin base encoder class — confirmed via
+                // `gst-inspect-1.0` on this dev machine (see
+                // [`VAAPI_H265_ENCODER_ELEMENT`]/[`VAAPI_AV1_ENCODER_ELEMENT`]'s
+                // doc comments) — so only the element name varies by codec.
+                let element = match codec {
+                    VideoCodec::H264 => VAAPI_ENCODER_ELEMENT,
+                    VideoCodec::H265 => VAAPI_H265_ENCODER_ELEMENT,
+                    VideoCodec::Av1 => VAAPI_AV1_ENCODER_ELEMENT,
+                };
                 // `Qvbr`/`vbr` needs two more properties `Cqp` doesn't:
                 // - `target-percentage`: VBR-only property, "the percentage
                 //   for 'target bitrate'/'maximum bitrate'" — the real encode
@@ -352,9 +400,19 @@ impl EncoderBackend {
                     }
                 };
                 // `b-frames=0`: see the software branch's matching `Why:`
-                // note above — pinned explicitly on both backends.
+                // note above — pinned explicitly on both backends, but only
+                // for H.264/H.265: `vaav1enc` has no `b-frames` property at
+                // all (confirmed via `gst-inspect-1.0 vaav1enc` and a real
+                // pipeline-parse failure — "no property \"b-frames\" in
+                // element \"vaav1enc\"" — when this was tried unconditionally
+                // on real VAAPI hardware), so it's simply omitted for AV1
+                // rather than pinned to a property that doesn't exist.
+                let b_frames_flag = match codec {
+                    VideoCodec::H264 | VideoCodec::H265 => " b-frames=0",
+                    VideoCodec::Av1 => "",
+                };
                 format!(
-                    "{VAAPI_ENCODER_ELEMENT} rate-control={rate_control_value} bitrate={bitrate_kbps} key-int-max={gop_frames} target-usage={target_usage} b-frames=0{quality_extra}"
+                    "{element} rate-control={rate_control_value} bitrate={bitrate_kbps} key-int-max={gop_frames} target-usage={target_usage}{b_frames_flag}{quality_extra}"
                 )
             }
         }
@@ -371,6 +429,96 @@ impl EncoderBackend {
             EncoderBackend::Software => "I420",
             EncoderBackend::Vaapi => "NV12",
         }
+    }
+
+    /// The codec this backend will *actually* produce for a requested
+    /// `codec` — as opposed to `codec` itself, which is merely what was
+    /// asked for. [`EncoderBackend::Software`] only ever has `x264enc`
+    /// available (see [`supported_codecs`]), so it silently produces H.264
+    /// regardless of what was requested, exactly like it silently ignores
+    /// [`TuneMode`] differences [`EncoderBackend::Vaapi`] has none of.
+    /// [`EncoderBackend::Vaapi`] honors whatever [`VideoCodec`] was
+    /// requested.
+    ///
+    /// Callers that need to know what's really coming out of the pipeline —
+    /// [`branch::add_branch`]'s output-caps selection, and anything
+    /// reporting the codec upstream — must call this rather than trust the
+    /// requested [`VideoCodec`] as-is, since a `Vaapi` request can silently
+    /// downgrade to `Software`/H.264 via [`branch::add_branch_with_fallback`]'s
+    /// per-branch fallback.
+    pub fn actual_codec(self, requested: VideoCodec) -> VideoCodec {
+        match self {
+            EncoderBackend::Software => VideoCodec::H264,
+            EncoderBackend::Vaapi => requested,
+        }
+    }
+}
+
+/// Which video codec an encoder produces. Threaded through the same
+/// settings pipeline as [`RateControlMode`]/[`QualityLevel`]
+/// (`VideoParams` → `EncodeSettings` → `DestEdit` → `dto.rs` → persisted
+/// `rooms::AppSettings`), live-adjustable per destination via
+/// `edit_destination` like those two (a codec change is always a
+/// [`destination::ChangeTier::BranchSwap`] — see [`destination::
+/// classify_change`] — never a live property write, since swapping the
+/// encoder *element* itself is unavoidably a branch rebuild).
+///
+/// `#[default]` is [`Self::H264`] — the safest choice: it's this pipeline's
+/// original, only-ever-shipped codec, so every existing user's persisted
+/// settings (no `codec` field in their on-disk `settings.toml` before this)
+/// deserialize to exactly the behavior they already had. Same reasoning as
+/// why `RateControlMode::Adaptive`'s wire string stayed `"qvbr"`-adjacent
+/// rather than renamed after the VBR fix — don't break existing configs.
+///
+/// See [`supported_codecs`] for which codecs are actually usable on a given
+/// [`EncoderBackend`] — H.265/AV1 require [`EncoderBackend::Vaapi`], since
+/// no software H.265/AV1 encoder is confirmed installed on this machine (no
+/// `x265enc`/`aomenc`/`svtav1enc`/etc. assumed present — see this module's
+/// task brief). Stage 2 (the frontend codec selector) should call
+/// [`supported_codecs`] to grey out unavailable options rather than let a
+/// user pick one that silently falls back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoCodec {
+    /// `x264enc` (software) / `vah264enc` (VAAPI). The only codec available
+    /// on [`EncoderBackend::Software`].
+    #[default]
+    H264,
+    /// `vah265enc` (VAAPI only — see this type's doc comment).
+    H265,
+    /// `vaav1enc` (VAAPI only — see this type's doc comment).
+    Av1,
+}
+
+/// Every [`VideoCodec`] variant, in the stable order [`supported_codecs`]
+/// returns.
+const ALL_CODECS: [VideoCodec; 3] = [VideoCodec::H264, VideoCodec::H265, VideoCodec::Av1];
+
+/// Which [`VideoCodec`]s are actually usable on `backend`. The mechanism
+/// Stage 2's frontend codec selector should call (via a `src-tauri` command
+/// wrapping this) to grey out/disable options the current backend can't
+/// produce, rather than letting a user pick one that silently downgrades —
+/// see [`EncoderBackend::actual_codec`] for what happens if a mismatched
+/// combination reaches the pipeline anyway (it doesn't error, it silently
+/// downgrades, which is exactly the surprise this function lets a caller
+/// avoid).
+///
+/// Deliberately backend-only, not a live per-machine capability probe of
+/// `vah265enc`/`vaav1enc` specifically (unlike [`detect_encoder_backend`]'s
+/// own `vah264enc`-availability probe): every machine with a working
+/// [`EncoderBackend::Vaapi`] this session has been tested on has both
+/// (they're both part of the same `va` GStreamer plugin as `vah264enc`), and
+/// a static, no-I/O function is simpler and enough for Stage 2 to gate the
+/// UI correctly. A machine where `vah264enc` works but `vah265enc`/
+/// `vaav1enc` mysteriously don't would still fail at
+/// [`branch::add_branch_with_fallback`]'s per-branch fallback (silently
+/// dropping to software/H.264) rather than crash — a real gap, but a narrow
+/// and already-handled one, not worth a second runtime probe pipeline for
+/// this stage.
+pub fn supported_codecs(backend: EncoderBackend) -> &'static [VideoCodec] {
+    match backend {
+        EncoderBackend::Software => &ALL_CODECS[0..1],
+        EncoderBackend::Vaapi => &ALL_CODECS,
     }
 }
 
@@ -559,7 +707,11 @@ const VBR_CPB_SIZE_DENOMINATOR: u32 = 8;
 /// Media Foundation's `mfvideoenc` (the natural Windows analogue of VAAPI
 /// here) is a deliberate fast-follow, not an oversight — same staging as
 /// VAAPI itself was after software-only worked first on Linux.
-pub(crate) fn detect_encoder_backend() -> EncoderBackend {
+/// `pub`, not `pub(crate)`: `src-tauri`'s `commands::supported_codecs`/
+/// `dto::staged_capture_rows` need this to know which [`VideoCodec`]s
+/// [`supported_codecs`] should report for *this* machine's real backend,
+/// not just accept a caller-supplied guess.
+pub fn detect_encoder_backend() -> EncoderBackend {
     // TEST-ONLY escape hatch: lets `end_to_end_test.rs` force the software
     // backend even on a machine where VAAPI is actually available, so the
     // live repro can be run against both backends. Never consulted outside
@@ -1716,6 +1868,7 @@ async fn start_sharing_with_source(
         quality_level: QualityLevel::default(),
         rate_control: RateControlMode::default(),
         gop_millis: DEFAULT_GOP_MILLIS,
+        codec: VideoCodec::default(),
     };
 
     // Everything above already owns the pipeline/portal session via `handle`
@@ -3113,6 +3266,10 @@ pub mod destination {
         /// faster recovery from motion artifacts (see that constant's doc
         /// comment).
         pub gop_millis: u32,
+        /// H.264/H.265/AV1 — [`super::VideoCodec`]. Only meaningful on
+        /// [`EncoderBackend::Vaapi`]; [`EncoderBackend::Software`] silently
+        /// always produces H.264 — see [`super::EncoderBackend::actual_codec`].
+        pub codec: VideoCodec,
     }
 
     impl VideoParams {
@@ -3127,6 +3284,7 @@ pub mod destination {
                 quality_level: self.quality_level,
                 rate_control: self.rate_control,
                 gop_millis: self.gop_millis,
+                codec: self.codec,
             }
         }
     }
@@ -3203,6 +3361,11 @@ pub mod destination {
             // encoder property — a preset switch to/from Gaming's shorter
             // GOP is a `BranchSwap` like every other tuning knob above.
             || to.gop_millis != from.gop_millis
+            // A codec change swaps the encoder *element* itself (`vah264enc`
+            // -> `vah265enc`, etc.) — there is no live property that could
+            // ever make that a tier-1 write, so this is unconditionally a
+            // `BranchSwap` on both backends.
+            || to.codec != from.codec
         {
             return ChangeTier::BranchSwap;
         }
@@ -3602,6 +3765,7 @@ pub mod destination {
                 quality_level: QualityLevel::default(),
                 rate_control: RateControlMode::default(),
                 gop_millis: DEFAULT_GOP_MILLIS,
+                codec: VideoCodec::default(),
             }
         }
 
@@ -4014,6 +4178,22 @@ pub mod destination {
             assert_eq!(classify_change(source, from, from), ChangeTier::Unchanged);
         }
 
+        /// A codec change (H.264 -> H.265/AV1) is also tier 2 — see
+        /// `classify_change`'s `Why:` note on `to.codec != from.codec`.
+        #[test]
+        fn codec_changes_are_tier_two() {
+            let source = SourceCaps { width: 1920, height: 1080, framerate: 60 };
+            let from = params(30);
+            assert_eq!(
+                classify_change(source, from, VideoParams { codec: VideoCodec::H265, ..from }),
+                ChangeTier::BranchSwap
+            );
+            assert_eq!(
+                classify_change(source, from, VideoParams { codec: VideoCodec::Av1, ..from }),
+                ChangeTier::BranchSwap
+            );
+        }
+
         /// A resolution change that *also* raises fps past the source cap is
         /// tier 3, not tier 2 — the fps check has to win.
         #[test]
@@ -4129,6 +4309,8 @@ pub mod branch {
         pub rate_control: RateControlMode,
         /// See [`super::destination::VideoParams::gop_millis`].
         pub gop_millis: u32,
+        /// See [`super::VideoCodec`].
+        pub codec: VideoCodec,
     }
 
     /// A live encode branch built by [`add_branch`]: a `gst::Bin` already
@@ -4352,8 +4534,32 @@ pub mod branch {
             settings.tune,
             settings.quality_level,
             settings.rate_control,
+            settings.codec,
         );
         let raw_format = settings.backend.raw_format();
+        // What the encoder element selected above will *actually* emit —
+        // not `settings.codec` itself, since [`EncoderBackend::Software`]
+        // silently always produces H.264 regardless of what was requested
+        // (see [`EncoderBackend::actual_codec`]). This is what picks the
+        // matching downstream caps immediately below.
+        let actual_codec = settings.backend.actual_codec(settings.codec);
+        // Output caps per codec — confirmed via `gst-inspect-1.0`'s SRC pad
+        // template on each element (see [`VAAPI_H265_ENCODER_ELEMENT`]/
+        // [`VAAPI_AV1_ENCODER_ELEMENT`]'s doc comments): `vah264enc`/
+        // `vah265enc` both emit Annex-B (`stream-format=byte-stream,
+        // alignment=au`), matching `x264enc`'s own output caps — only the
+        // media type name differs. `vaav1enc` is fundamentally different:
+        // AV1 has no Annex-B start-code framing at all, so its caps are
+        // `stream-format=obu-stream,alignment=tu` (raw OBUs, one temporal
+        // unit per buffer) — `video_server.rs`'s codec-string derivation
+        // relies on exactly this Annex-B-vs-OBU-stream distinction to tell
+        // an AV1 access unit apart from an H.264/H.265 one with no other
+        // hint (see that module's `detect_codec_and_derive_string`).
+        let output_caps = match actual_codec {
+            VideoCodec::H264 => "video/x-h264,stream-format=byte-stream,alignment=au",
+            VideoCodec::H265 => "video/x-h265,stream-format=byte-stream,alignment=au",
+            VideoCodec::Av1 => "video/x-av1,stream-format=obu-stream,alignment=tu",
+        };
         // `Why` a size-less capsfilter when either axis is 0: 0 is this
         // codebase's "whatever the source is producing" sentinel (see
         // [`super::destination::clamp_to_source`], which treats it as "nothing
@@ -4401,7 +4607,7 @@ pub mod branch {
                max-duplication-time={BRANCH_MAX_DUPLICATION_TIME_NS} \
              ! video/x-raw,format={raw_format}{scale_caps},framerate={framerate}/1 \
              ! {encoder} name={encoder_name} \
-             ! video/x-h264,stream-format=byte-stream,alignment=au \
+             ! {output_caps} \
              ! appsink name={appsink_name} emit-signals=false sync=false max-buffers=4 drop=true"
         );
 
@@ -5071,6 +5277,7 @@ pub mod branch {
                 quality_level: QualityLevel::Performance,
                 rate_control: RateControlMode::default(),
                 gop_millis: DEFAULT_GOP_MILLIS,
+                codec: VideoCodec::default(),
             }
         }
 
@@ -5251,6 +5458,7 @@ pub mod branch {
                 TuneMode::default(),
                 QualityLevel::default(),
                 RateControlMode::default(),
+                VideoCodec::default(),
             );
             let raw_format = EncoderBackend::Software.raw_format();
             let description = format!(
@@ -5496,6 +5704,7 @@ pub mod branch {
                 quality_level: QualityLevel::default(),
                 rate_control: RateControlMode::default(),
                 gop_millis: DEFAULT_GOP_MILLIS,
+                codec: VideoCodec::default(),
             }
         }
 
@@ -6323,6 +6532,7 @@ pub mod branch {
                 quality_level: QualityLevel::default(),
                 rate_control: RateControlMode::default(),
                 gop_millis: DEFAULT_GOP_MILLIS,
+                codec: VideoCodec::default(),
             };
 
             let result = add_branch_live(&built.pipeline, &built.tee, BranchId(1), settings).await;
@@ -6475,28 +6685,41 @@ mod tests {
     use super::*;
 
     /// Shared by [`pipeline_elements_link_and_produce_encoded_output`] and
-    /// [`vaapi_pipeline_links_and_produces_encoded_output`]: builds a
-    /// `videotestsrc ! videoconvert ! video/x-raw,format=<backend's format> !
-    /// <backend's encoder> ! video/x-h264,... ! appsink` pipeline (the same
-    /// chain [`build_pipeline`] produces, with `videotestsrc` standing in for
-    /// `pipewiresrc fd=… path=…` since a real portal fd needs an interactive
-    /// permission grant this test environment can't provide), runs it, and
-    /// returns whether at least one encoded H.264 access unit came out.
-    fn run_backend_and_expect_encoded_buffer(backend: EncoderBackend) -> bool {
+    /// [`vaapi_pipeline_links_and_produces_encoded_output`] (and their H.265/
+    /// AV1 analogues): builds a `videotestsrc ! videoconvert !
+    /// video/x-raw,format=<backend's format> ! <backend's encoder> !
+    /// <codec's output caps> ! appsink` pipeline (the same chain
+    /// [`build_pipeline`]/[`branch::add_branch`] produce, with `videotestsrc`
+    /// standing in for `pipewiresrc fd=… path=…` since a real portal fd needs
+    /// an interactive permission grant this test environment can't provide),
+    /// runs it, and returns whether at least one encoded access unit came
+    /// out. `codec` picks both the encoder element (on
+    /// [`EncoderBackend::Vaapi`] — see [`EncoderBackend::launch_fragment`])
+    /// and the matching output caps (see [`branch::add_branch`]'s output-caps
+    /// selection, mirrored here rather than shared code since this is a
+    /// standalone `gst::parse::launch` pipeline, not a `branch::add_branch`
+    /// call).
+    fn run_backend_and_expect_encoded_buffer(backend: EncoderBackend, codec: VideoCodec) -> bool {
         let encoder = backend.launch_fragment(
             DEFAULT_BITRATE_KBPS,
             (DEFAULT_GOP_MILLIS * DEFAULT_FRAMERATE) / 1000,
             TuneMode::default(),
             QualityLevel::default(),
             RateControlMode::default(),
+            codec,
         );
         let raw_format = backend.raw_format();
+        let output_caps = match backend.actual_codec(codec) {
+            VideoCodec::H264 => "video/x-h264,stream-format=byte-stream,alignment=au",
+            VideoCodec::H265 => "video/x-h265,stream-format=byte-stream,alignment=au",
+            VideoCodec::Av1 => "video/x-av1,stream-format=obu-stream,alignment=tu",
+        };
         let description = format!(
             "videotestsrc num-buffers=10 \
              ! videoconvert \
              ! video/x-raw,format={raw_format} \
              ! {encoder} \
-             ! video/x-h264,stream-format=byte-stream,alignment=au \
+             ! {output_caps} \
              ! appsink name=sink emit-signals=false sync=false"
         );
 
@@ -6545,7 +6768,7 @@ mod tests {
         }
 
         assert!(
-            run_backend_and_expect_encoded_buffer(EncoderBackend::Software),
+            run_backend_and_expect_encoded_buffer(EncoderBackend::Software, VideoCodec::H264),
             "expected at least one encoded H.264 access unit from the software encoder test pipeline"
         );
     }
@@ -6562,7 +6785,21 @@ mod tests {
         quality_level: QualityLevel,
         rate_control: RateControlMode,
     ) -> gst::Element {
-        let fragment = backend.launch_fragment(4000, 60, tune, quality_level, rate_control);
+        build_encoder_element_for_codec(backend, tune, quality_level, rate_control, VideoCodec::H264)
+    }
+
+    /// [`build_encoder_element`], with an explicit [`VideoCodec`] — used by
+    /// the H.265/AV1 property-mapping tests below, which need a non-default
+    /// codec's element (`vah265enc`/`vaav1enc`) rather than always
+    /// `vah264enc`.
+    fn build_encoder_element_for_codec(
+        backend: EncoderBackend,
+        tune: TuneMode,
+        quality_level: QualityLevel,
+        rate_control: RateControlMode,
+        codec: VideoCodec,
+    ) -> gst::Element {
+        let fragment = backend.launch_fragment(4000, 60, tune, quality_level, rate_control, codec);
         gst::parse::launch(&fragment).unwrap_or_else(|e| panic!("encoder fragment '{fragment}' should parse: {e}"))
     }
 
@@ -6795,6 +7032,7 @@ mod tests {
             TuneMode::LowLatency,
             QualityLevel::Performance,
             RateControlMode::default(),
+            VideoCodec::default(),
         );
         let raw_format = backend.raw_format();
         let description = format!(
@@ -6902,6 +7140,7 @@ mod tests {
             TuneMode::default(),
             QualityLevel::default(),
             RateControlMode::default(),
+            VideoCodec::default(),
         );
         let raw_format = backend.raw_format();
         let description = format!(
@@ -7134,6 +7373,7 @@ mod tests {
             quality_level: QualityLevel::default(),
             rate_control: RateControlMode::default(),
             gop_millis: DEFAULT_GOP_MILLIS,
+            codec: VideoCodec::default(),
         })
         .expect("first branch should build");
         let second = branch::add_branch(&built.pipeline, &built.tee, branch::BranchId(2), branch::EncodeSettings {
@@ -7146,6 +7386,7 @@ mod tests {
             quality_level: QualityLevel::default(),
             rate_control: RateControlMode::default(),
             gop_millis: DEFAULT_GOP_MILLIS,
+            codec: VideoCodec::default(),
         })
         .expect("second branch should build");
 
@@ -7215,6 +7456,7 @@ mod tests {
                     quality_level: QualityLevel::Performance,
                     rate_control: RateControlMode::default(),
                     gop_millis: DEFAULT_GOP_MILLIS,
+                    codec: VideoCodec::default(),
                 },
             )
             .expect("encode branch should build on the live pipeline");
@@ -7410,6 +7652,7 @@ mod tests {
             // see `components.js`'s `ENCODER_PRESETS`.
             rate_control: RateControlMode::Cqp,
             gop_millis: DEFAULT_GOP_MILLIS,
+            codec: VideoCodec::default(),
         };
         // Exactly what clicking "Balanced" in the edit panel sends: three
         // fields at once, nothing else changed.
@@ -7512,8 +7755,183 @@ mod tests {
         }
 
         assert!(
-            run_backend_and_expect_encoded_buffer(EncoderBackend::Vaapi),
+            run_backend_and_expect_encoded_buffer(EncoderBackend::Vaapi, VideoCodec::H264),
             "VAAPI probe reported available, but the real vah264enc pipeline produced no encoded output"
+        );
+    }
+
+    /// [`vaapi_pipeline_links_and_produces_encoded_output`]'s H.265 analogue:
+    /// real-hardware proof the `videoconvert ! NV12 ! vah265enc !
+    /// video/x-h265,stream-format=byte-stream,alignment=au ! appsink` chain
+    /// actually links and produces output on this machine — not merely that
+    /// `gst-inspect-1.0 vah265enc` lists the element. Gated on
+    /// [`probe_vaapi_encoder`] (which only probes `vah264enc`, the baseline
+    /// "is VAAPI usable at all" check — see [`supported_codecs`]'s doc
+    /// comment on why H.265/AV1 don't get their own separate runtime probe)
+    /// rather than skipped independently, since a machine without a working
+    /// VAAPI device can't run any of the three VAAPI encoders.
+    #[test]
+    fn vaapi_h265_pipeline_links_and_produces_encoded_output() {
+        if gst::init().is_err() {
+            eprintln!("skipping: gstreamer not available in this environment");
+            return;
+        }
+
+        if !probe_vaapi_encoder() {
+            eprintln!("skipping: VAAPI is not available/functional on this machine");
+            return;
+        }
+
+        if gst::ElementFactory::make(VAAPI_H265_ENCODER_ELEMENT).build().is_err() {
+            eprintln!(
+                "skipping: '{VAAPI_H265_ENCODER_ELEMENT}' is not available on this machine even though vah264enc is"
+            );
+            return;
+        }
+
+        assert!(
+            run_backend_and_expect_encoded_buffer(EncoderBackend::Vaapi, VideoCodec::H265),
+            "vah265enc is available, but the real H.265 VAAPI pipeline produced no encoded output"
+        );
+    }
+
+    /// [`vaapi_pipeline_links_and_produces_encoded_output`]'s AV1 analogue —
+    /// see that test's and [`vaapi_h265_pipeline_links_and_produces_encoded_output`]'s
+    /// doc comments. This is also real proof that
+    /// [`run_backend_and_expect_encoded_buffer`]'s AV1 output caps
+    /// (`stream-format=obu-stream,alignment=tu` — no Annex-B start codes,
+    /// unlike H.264/H.265) actually negotiate against `vaav1enc`'s real SRC
+    /// caps, not just that they're a plausible guess.
+    #[test]
+    fn vaapi_av1_pipeline_links_and_produces_encoded_output() {
+        if gst::init().is_err() {
+            eprintln!("skipping: gstreamer not available in this environment");
+            return;
+        }
+
+        if !probe_vaapi_encoder() {
+            eprintln!("skipping: VAAPI is not available/functional on this machine");
+            return;
+        }
+
+        if gst::ElementFactory::make(VAAPI_AV1_ENCODER_ELEMENT).build().is_err() {
+            eprintln!(
+                "skipping: '{VAAPI_AV1_ENCODER_ELEMENT}' is not available on this machine even though vah264enc is"
+            );
+            return;
+        }
+
+        assert!(
+            run_backend_and_expect_encoded_buffer(EncoderBackend::Vaapi, VideoCodec::Av1),
+            "vaav1enc is available, but the real AV1 VAAPI pipeline produced no encoded output"
+        );
+    }
+
+    /// [`quality_level_maps_to_speed_preset_and_target_usage`]'s H.265/AV1
+    /// analogue: `target-usage` maps identically to `vah264enc`'s on both
+    /// (confirmed via `gst-inspect-1.0` — same property name, same 1-7
+    /// range, same semantics), so this only needs to check one representative
+    /// value per codec rather than repeat the full Performance/Balanced/
+    /// Quality sweep already covered for `vah264enc`.
+    #[test]
+    fn quality_level_maps_to_target_usage_on_h265_and_av1() {
+        if gst::init().is_err() {
+            eprintln!("skipping: gstreamer not available in this environment");
+            return;
+        }
+        if !probe_vaapi_encoder() {
+            eprintln!("skipping: VAAPI is not available/functional on this machine");
+            return;
+        }
+
+        if gst::ElementFactory::make(VAAPI_H265_ENCODER_ELEMENT).build().is_ok() {
+            let h265_quality = build_encoder_element_for_codec(
+                EncoderBackend::Vaapi,
+                TuneMode::default(),
+                QualityLevel::Quality,
+                RateControlMode::default(),
+                VideoCodec::H265,
+            );
+            assert_eq!(h265_quality.property::<u32>("target-usage"), 1);
+        } else {
+            eprintln!("skipping H.265 half: '{VAAPI_H265_ENCODER_ELEMENT}' is not available in this environment");
+        }
+
+        if gst::ElementFactory::make(VAAPI_AV1_ENCODER_ELEMENT).build().is_ok() {
+            let av1_performance = build_encoder_element_for_codec(
+                EncoderBackend::Vaapi,
+                TuneMode::default(),
+                QualityLevel::Performance,
+                RateControlMode::default(),
+                VideoCodec::Av1,
+            );
+            assert_eq!(av1_performance.property::<u32>("target-usage"), 7);
+        } else {
+            eprintln!("skipping AV1 half: '{VAAPI_AV1_ENCODER_ELEMENT}' is not available in this environment");
+        }
+    }
+
+    /// [`rate_control_mode_maps_per_backend`]'s H.265/AV1 analogue: both
+    /// `vah265enc`/`vaav1enc` expose the same `cbr`/`vbr`/`cqp` `rate-control`
+    /// enum as `vah264enc` (confirmed via `gst-inspect-1.0`).
+    #[test]
+    fn rate_control_mode_maps_on_h265_and_av1() {
+        if gst::init().is_err() {
+            eprintln!("skipping: gstreamer not available in this environment");
+            return;
+        }
+        if !probe_vaapi_encoder() {
+            eprintln!("skipping: VAAPI is not available/functional on this machine");
+            return;
+        }
+
+        if gst::ElementFactory::make(VAAPI_H265_ENCODER_ELEMENT).build().is_ok() {
+            let h265_quality = build_encoder_element_for_codec(
+                EncoderBackend::Vaapi,
+                TuneMode::default(),
+                QualityLevel::default(),
+                RateControlMode::Cqp,
+                VideoCodec::H265,
+            );
+            assert_eq!(h265_quality.property_value("rate-control").serialize().unwrap(), "cqp");
+        } else {
+            eprintln!("skipping H.265 half: '{VAAPI_H265_ENCODER_ELEMENT}' is not available in this environment");
+        }
+
+        if gst::ElementFactory::make(VAAPI_AV1_ENCODER_ELEMENT).build().is_ok() {
+            let av1_adaptive = build_encoder_element_for_codec(
+                EncoderBackend::Vaapi,
+                TuneMode::default(),
+                QualityLevel::default(),
+                RateControlMode::Qvbr,
+                VideoCodec::Av1,
+            );
+            assert_eq!(av1_adaptive.property_value("rate-control").serialize().unwrap(), "vbr");
+        } else {
+            eprintln!("skipping AV1 half: '{VAAPI_AV1_ENCODER_ELEMENT}' is not available in this environment");
+        }
+    }
+
+    /// [`EncoderBackend::Software`] only ever produces H.264 — see
+    /// [`EncoderBackend::actual_codec`] — regardless of the requested
+    /// [`VideoCodec`]. [`supported_codecs`] is what a caller should consult
+    /// to avoid ever making this request in the first place; this test locks
+    /// in the silent-downgrade behavior for the case something upstream
+    /// doesn't.
+    #[test]
+    fn software_backend_always_produces_h264_regardless_of_requested_codec() {
+        assert_eq!(EncoderBackend::Software.actual_codec(VideoCodec::H264), VideoCodec::H264);
+        assert_eq!(EncoderBackend::Software.actual_codec(VideoCodec::H265), VideoCodec::H264);
+        assert_eq!(EncoderBackend::Software.actual_codec(VideoCodec::Av1), VideoCodec::H264);
+        assert_eq!(EncoderBackend::Vaapi.actual_codec(VideoCodec::H265), VideoCodec::H265);
+    }
+
+    #[test]
+    fn supported_codecs_gates_h265_and_av1_to_vaapi_only() {
+        assert_eq!(supported_codecs(EncoderBackend::Software), &[VideoCodec::H264]);
+        assert_eq!(
+            supported_codecs(EncoderBackend::Vaapi),
+            &[VideoCodec::H264, VideoCodec::H265, VideoCodec::Av1]
         );
     }
 
@@ -7649,6 +8067,7 @@ mod tests {
             quality_level: QualityLevel::default(),
             rate_control: RateControlMode::default(),
             gop_millis: DEFAULT_GOP_MILLIS,
+            codec: VideoCodec::default(),
         };
         let result = branch::add_branch_live(&built.pipeline, &built.tee, branch::BranchId(0), settings).await;
         let (branch, _idr) = match result {

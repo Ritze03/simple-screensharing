@@ -291,6 +291,7 @@ pub const AUDIO_DESTINATION_PARAMS: capture::destination::VideoParams = capture:
     quality_level: capture::QualityLevel::Performance,
     rate_control: capture::RateControlMode::Cqp,
     gop_millis: capture::DEFAULT_GOP_MILLIS,
+    codec: capture::VideoCodec::H264,
 };
 
 /// A destination's in-progress lifecycle beyond what `DestinationState`
@@ -344,6 +345,8 @@ pub struct DestEdit {
     /// Gaming preset uses a shorter interval); not a raw Advanced-tuning
     /// control of its own.
     pub gop_millis: u32,
+    /// H.264/H.265/AV1 — `capture::VideoCodec`.
+    pub codec: capture::VideoCodec,
 }
 
 /// One room this capture is being sent into: the room, plus the `stream_id`
@@ -427,6 +430,7 @@ impl Destination {
             quality_level: params.quality_level,
             rate_control: params.rate_control,
             gop_millis: params.gop_millis,
+            codec: params.codec,
         }
     }
 
@@ -453,6 +457,7 @@ impl Destination {
             quality_level: self.edit.quality_level,
             rate_control: self.edit.rate_control,
             gop_millis: self.edit.gop_millis,
+            codec: self.edit.codec,
         }
     }
 }
@@ -1134,6 +1139,9 @@ pub struct AppState {
     /// started. See `tune`'s `Why:` note and
     /// `capture::destination::VideoParams::gop_millis`.
     pub gop_millis: u32,
+    /// Encoder codec (H.264/H.265/AV1) to use for the *next* video capture
+    /// started. See `tune`'s `Why:` note and `capture::VideoCodec`.
+    pub codec: capture::VideoCodec,
     /// Which room the "Start a stream" card will start the next capture in.
     /// `None` until a room is joined; re-pointed by the picker.
     pub new_stream_room: Option<RoomHandle>,
@@ -1252,6 +1260,7 @@ impl Default for AppState {
             quality_level: capture::QualityLevel::default(),
             rate_control: capture::RateControlMode::default(),
             gop_millis: capture::DEFAULT_GOP_MILLIS,
+            codec: capture::VideoCodec::default(),
             new_stream_room: None,
             bandwidth_mode: settings.bandwidth_mode,
             absolute_total_kbps: settings.absolute_total_kbps,
@@ -1362,9 +1371,11 @@ pub fn save_start_stream_defaults(
     tune: crate::capture::TuneMode,
     quality_level: crate::capture::QualityLevel,
     rate_control: crate::capture::RateControlMode,
+    codec: crate::capture::VideoCodec,
 ) {
     let mut settings = AppSettings::load();
-    settings.start_stream_defaults = crate::rooms::StartStreamDefaults { framerate, bitrate_kbps, tune, quality_level, rate_control };
+    settings.start_stream_defaults =
+        crate::rooms::StartStreamDefaults { framerate, bitrate_kbps, tune, quality_level, rate_control, codec };
     if let Err(e) = settings.save() {
         tracing::warn!("failed to save start-stream defaults: {e:#}");
     }
@@ -1569,6 +1580,7 @@ impl AppState {
             quality_level: self.quality_level,
             rate_control: self.rate_control,
             gop_millis: self.gop_millis,
+            codec: self.codec,
         };
         let (tx, rx) = oneshot::channel();
         self.captures.insert(
@@ -1699,6 +1711,7 @@ impl AppState {
             quality_level: self.quality_level,
             rate_control: self.rate_control,
             gop_millis: self.gop_millis,
+            codec: self.codec,
         };
         self.add_destination_with_params(capture_id, room_handle, PendingRole::GoingLive, params);
     }
@@ -1748,6 +1761,7 @@ impl AppState {
                 quality_level: capture::QualityLevel::default(),
                 rate_control: capture::RateControlMode::default(),
                 gop_millis: capture::DEFAULT_GOP_MILLIS,
+                codec: capture::VideoCodec::default(),
             }
         });
         self.add_destination_with_params(capture_id, room_handle, role, params);
