@@ -1,19 +1,25 @@
 # Stream Control (desktop client)
 
-**Added 2026-07-26.** Stage 2 of the three-stage UI build (see `superdoc/ui/APP-SHELL.md`):
-the Stream Control tab's real feature set — starting and editing outgoing streams,
-**multi-destination fan-out**, **transfer** between rooms, and the two **bandwidth modes**
-with `bandwidth::allocate` wired into live encoders.
+> **Status (2026-10-14).** The client is now one native egui binary. The **backend** half of this
+> page is current: `client/src/capture.rs` (with its inline `destination` and `branch` modules), `session.rs`,
+> `bandwidth.rs`, `presets.rs`, `rooms.rs`. That covers "The shape of a capture", fan-out,
+> transfer, the three tiers, "Capture/encode performance" (#39, with the rotated-output check from
+> #35), "Idle monitors" and the silence watchdog (#32), resuming, the encoder-tuning backend
+> mapping, "Video codec selection", and the bandwidth modes. The **UI** half of this page
+> (everything that names `frontend/scripts/*.js`, `stream-control.js`, `src-tauri/`,
+> `commands.rs`, `window.__TAURI__`, `.media-tile-*` CSS, Electron) describes the **removed Electron
+> frontend** and is history: "Go live" staging as a UI flow, the "START A STREAM" form, "What the
+> tab renders" and "Coverage", the edit-panel bug write-ups, the whole audio-card story
+> (from "Sharing audio" to the end, except the backend facts about `pw-loopback`/node ids), and the
+> "bitrate doesn't update" display bug. The egui equivalents are `client/src/ui/stream_settings.rs`,
+> `ui/action_bar.rs`, `ui/room.rs`, `ui/modals.rs` (see `superdoc/ui/APP-SHELL.md`).
+> The 320x180 "self-preview" branch drawn in the diagrams still exists but nothing consumes it
+> (`superdoc/features/self-preview.md`).
 
-The session-model operations and `BandwidthController` live in
-`simple-screensharing-client/src/session.rs` (extracted from `src/ui.rs`'s `App` during
-the Tauri port — `ui.rs` itself is dead code today, see `architecture/overview.md`'s
-"Process model"), driven for real by `src-tauri/src/commands.rs`'s `edit_destination`/
-`start_destination`/`transfer_destination`/`set_bandwidth_*` and rendered by
-`frontend/scripts/stream-control.js`. `src/capture.rs` is unchanged by the Electron
-migration — per-destination encode branches and their pumps, the change-tier routing, and
-(as of 2026-07-28) the encoder tuning controls below all still live there. `src/rooms.rs`
-holds the persisted preferences. The plan this stage originally implemented is
+**Added 2026-07-26.** Stage 2 of the three-stage UI build (see `superdoc/ui/APP-SHELL.md`):
+the Stream Control tab's real feature set: starting and editing outgoing streams,
+**multi-destination fan-out**, **transfer** between rooms, and the two **bandwidth modes**
+with `bandwidth::allocate` wired into live encoders. The plan it implemented is
 `superdoc/brainstorm/ui-redesign-multiroom-streaming.md` (final plan items 4, 5 and 7).
 
 ---
@@ -26,14 +32,14 @@ One capture is **one screen grab, one GStreamer pipeline, N destinations**:
 GPU domain (Linux portal + VA stack, the normal case; 2026-10-14, #39):
 pipewiresrc(DMA-BUF) ! vapostproc(video-direction=auto) ! VAMemory NV12 ! tee
     ├─ queue ! videorate(1fps)  ! vapostproc ! BGRx ! videoconvert ! RGB ! appsink   (JPEG thumbnails, fixed)
-    ├─ queue ! videorate(12fps) ! vapostproc(320x180) ! BGRx ! videoconvert ! RGB ! appsink   (self-preview, fixed)
+    ├─ queue ! videorate(12fps) ! vapostproc(320x180) ! BGRx ! videoconvert ! RGB ! appsink   (self-preview, fixed; UNUSED, see self-preview.md)
     ├─ queue ! valve[RateCap] ! vapostproc ! VAMemory NV12 ! capssetter(fps) ! va*enc ! appsink   ← destination A (room 1)
     └─ queue ! valve[RateCap] ! vapostproc ! VAMemory NV12 ! capssetter(fps) ! va*enc ! appsink   ← destination B (room 2)
 
 System domain (Windows, x264enc machines, tests):
 <platform source> ! videoconvert ! capsfilter(format=BGRx) ! tee
     ├─ queue ! videorate(1fps)  ! RGB ! appsink   (JPEG thumbnails, fixed)
-    ├─ queue ! videorate(12fps) ! videoscale(320x180) ! RGB ! appsink   (sender self-preview, fixed)
+    ├─ queue ! videorate(12fps) ! videoscale(320x180) ! RGB ! appsink   (sender self-preview, fixed; UNUSED, see self-preview.md)
     ├─ queue ! valve[RateCap] ! videoconvert ! videoscale ! capssetter(fps) ! encoder ! appsink   ← destination A (room 1)
     └─ queue ! valve[RateCap] ! videoconvert ! videoscale ! capssetter(fps) ! encoder ! appsink   ← destination B (room 2)
 ```

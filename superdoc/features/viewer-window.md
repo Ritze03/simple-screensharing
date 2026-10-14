@@ -1,6 +1,63 @@
-# Pop-Out Stream Viewer
+# Viewer: watches, pop-out windows
 
-## Reversal: hover-gate the stat bar AND the × close button too (2026-07-29)
+> **Status (2026-10-14).** The viewer is the native egui client. "Pop-out windows" and "A watch's
+> lifecycle" below are current. Everything under **"History: the Electron pop-out window"**
+> (`electron/main.js`, `viewer.html`, `tile-video.js`, DOM overlays) describes the removed Electron
+> build; it is kept for the *why* behind the hover/fullscreen rules the egui port copied. Display
+> internals: `superdoc/features/video-pipeline.md` "Native display".
+
+## Pop-out windows (`client/src/ui/popout.rs`)
+
+Each watched stream tile has a pop-out action; a pop-out is one **deferred egui viewport per
+stream** (`StreamKey = (RoomHandle, ConnId, StreamId)`), re-declared every frame it should exist
+(egui's viewport contract). Any number of streams can be popped out at once.
+
+- **Shared view, no second decode.** The viewport paints the same `Arc<Mutex<VideoView>>` as the tile
+  (`paint(ui, ui.max_rect(), Fit::Contain)`), so GPU textures and the decoder are shared and the tile
+  shows a placeholder while popped (`VideoViews`' `popped` flag, `ui/video.rs`).
+- **Hover chrome** (the Electron `body:hover` rule, no idle timeout): while the pointer is anywhere in
+  the window a vignette, a top row `[statbar][x]` and a bottom audio pill (`[mute][slider 0-200 %][%]`,
+  or "No audio shared") appear. Statbar = `[dot][name . room][WxH][decoded/presented fps][bitrate]`
+  in fixed tabular-width fields. A "waiting"/"stalled" chip is always shown (not hover-gated). The
+  chrome data is refreshed by the main window at most 4x a second into a `Shared` struct, and
+  volume changes go back through `Shared::pending_volume`: `Why:` the viewport closure must be
+  `Send + Sync + 'static` and cannot hold `Cx`, and screens never mutate `AppState` themselves. When
+  not hovered the closure only locks the view and paints (no allocation, no `request_repaint`).
+- **F11** toggles fullscreen; **Esc** only *leaves* fullscreen and never closes (the Electron rule,
+  kept on purpose: a stray Esc must not kill someone's stream window).
+- **Closing brings the stream back.** The x button or an OS close sets `close_requested`, which the
+  next main-window frame turns into `UiAction::BringBack`: the stream returns to its tile.
+- **Performance:** pop-outs hold 240/240 fps (decoded/presented) when the presentation mode is
+  Mailbox. With Fifo a pop-out starves the main window; see `superdoc/features/presentation-modes.md`.
+- Window title "sharer . room"; first size from the stream's aspect ratio; app id
+  `simple-screensharing-popout`.
+
+## A watch's lifecycle (viewer side, `client/src/session.rs`)
+
+Full detail in `superdoc/architecture/implementation-notes.md` (tasks #36 and #40); the rules:
+
+- **A watch ends when the sharer stops (#40).** On the relay's `StreamStopped`
+  `RoomSession::end_watch_of_stopped` removes the watch (tile, decoder and GPU view go away
+  instead of freezing on the last frame) and remembers it for `RESUME_AFTER_STOP` = **30 s**. If the
+  same sharer announces a stream of the same kind and label in that window, it takes the dead tile's
+  place with no click. `Why 30 s and not the 60 s reconnect window:` this was a deliberate stop, so a
+  surprise subscribe minutes later would cost bandwidth unasked; but stop, pick another monitor in
+  the portal, go live takes a few seconds.
+- **Auto-reconnect re-matches watches (#36).** After a dropped connection the room is *suspended*
+  (see `superdoc/meta/TERMINOLOGY.md`), and what the user was watching is kept as `WantedStream`s identified by
+  **owner display name + kind + label** (never `ConnId`/`StreamId`, which change). Streams not yet
+  re-announced are waited for `REWATCH_GRACE` = **60 s**, matching the browser client's resume list.
+- **AV1 is cropped to the announced size (#40).** VCN4 (RX 7900 XTX) encodes 1080p as 1082 lines and
+  nothing in the bitstream names the padding; the decoder crops to the size from `StreamInfo`
+  (`StreamDecoder::set_display_size`). Detail: `video-pipeline.md` "Visible size, not coded size".
+
+## History: the Electron pop-out window
+
+> Everything below describes the removed Electron build (`electron/`, `frontend/viewer.html`,
+> `tile-video.js`, DOM/CSS overlays, `window.__ELECTRON__`). It is not current behaviour. Section
+> headings are marked "(history)".
+
+## Reversal: hover-gate the stat bar AND the × close button too (2026-07-29) (history)
 
 Follow-up to (and partial reversal of) the "prominent stats" redesign recorded further down
 this file and in `view.css`'s `.media-tile-statbar` comment: the owner explicitly asked, twice,
@@ -37,7 +94,7 @@ match — see `superdoc/features/stream-control.md`'s matching entry for the ful
 (shared CSS/measurement, recorded once there to avoid duplicating the same paragraph in both
 docs).
 
-## Three overlay-parity bugs fixed: slider position, button restyle, focus-within stuck-open (2026-07-29)
+## Three overlay-parity bugs fixed: slider position, button restyle, focus-within stuck-open (2026-07-29) (history)
 
 Follow-up to this same day's entry below (which gave the pop-out window the View tab's real
 `.media-tile-*` overlay DOM/CSS) — three bugs the port introduced, all in
@@ -102,7 +159,7 @@ verification stayed on Playwright's CDP-synthetic mouse (proven to correctly dri
 `:hover` state when the target coordinate is on-page) rather than real OS input. Also ran the
 full `cargo test --workspace`: 181 + 12 passed, 0 failed, 22 + 4 ignored (pre-existing).
 
-## Pop-out tile now reuses the View tab's real `.media-tile-*` overlay (2026-07-29)
+## Pop-out tile now reuses the View tab's real `.media-tile-*` overlay (2026-07-29) (history)
 
 Closed the last drift gap the 2026-07-28 entry below left open: that entry gave the pop-out
 window's tile *functional* parity (nameplate, fps, mute/volume) but still through its own
@@ -176,7 +233,7 @@ attempts), which is the safety-critical half of that contract. Also ran the full
 checklist): 181 + 12 passed, 0 failed, 22 + 4 ignored (pre-existing, require `--ignored` or
 real hardware, unrelated to this change).
 
-## Auto-return on close, and full stats/volume parity in the pop-out window (2026-07-28)
+## Auto-return on close, and full stats/volume parity in the pop-out window (2026-07-28) (history)
 
 Two gaps this file's own header/comments used to flag explicitly as known limitations —
 both closed:
@@ -238,7 +295,7 @@ post-Electron migration (`superdoc/architecture/overview.md`'s "Process model" s
 Electron's multi-`BrowserWindow` support is what makes a *real* OS-level fullscreen window
 possible at all.
 
-## What it does
+## What it does (history)
 
 Each tile in the View tab's Watch grid has a "Pop out" button
 (`frontend/scripts/view.js`'s `popOutWatch`). Clicking it opens a lean, chrome-free
@@ -259,7 +316,7 @@ via Electron's `leave-full-screen` window event and forwarded to the renderer
 (`viewer-left-fullscreen`) purely to keep UI state in sync — that handler does not, and
 must not, call close.
 
-## Architecture
+## Architecture (history)
 
 | Piece | Role |
 | --- | --- |
@@ -269,7 +326,7 @@ must not, call close.
 | `frontend/scripts/tile-video.js` | The shared decode module (`window.TileVideo`) both `view.js` (main window) and `viewer.js` (pop-out window) call into, so the two never drift into two different decode implementations. See `superdoc/features/video-pipeline.md`. |
 | `frontend/scripts/view.js` | Owns `poppedOutIds` (which tiles are currently popped out, for the held-slot placeholder) and the per-tile "Pop out" button that calls `window.__ELECTRON__.openPopout({ streamKey })`. |
 
-## Data flow: a stream key, not a raw tile object, crosses the window boundary
+## Data flow: a stream key, not a raw tile object, crosses the window boundary (history)
 
 `view.js` passes a `streamKey` — `"room_handle:owner:stream_id"` (this project's existing
 tile-id scheme; `owner` is a lowercase-hex `ConnId` string with no colons in it, per
@@ -285,7 +342,7 @@ string is available synchronously to `viewer.js`'s own startup code, with no rac
 when the renderer attaches a listener for a postload IPC message — `main.js`'s own comment
 on `openPopoutWindow` calls this out explicitly.
 
-## Known platform-specific traps (Linux, found and fixed against real window managers)
+## Known platform-specific traps (Linux, found and fixed against real window managers) (history)
 
 Found and fixed by testing against a real Hyprland/dwindle tiling session and real
 X11/XWayland behavior while this was still the fullscreen/borderless *display-takeover*
@@ -309,7 +366,7 @@ knowing if this code is touched again:
   display today (see "Deliberately not built here" below), so there's nothing this
   constraint currently breaks.
 
-## Jitter buffer setting now respected (2026-07-28)
+## Jitter buffer setting now respected (2026-07-28) (history)
 
 `viewer.js`'s `init()` calls `fetchMaxJitterBufferMs()` (mirrors `view.js`'s function of
 the same name exactly — same `get_settings` invoke, same `window.TileVideo.setMaxJitterBufferMs`
@@ -326,7 +383,7 @@ window keeps the value it fetched at open time — matches the rest of the app, 
 settings-changed live-push event anywhere (`shell.js`'s `listen()` calls only cover
 room/presence/stream-stats events); building one is out of scope for this fix.
 
-## Ghost "Stream error" label fixed (2026-07-28)
+## Ghost "Stream error" label fixed (2026-07-28) (history)
 
 Popping a stream into fullscreen/borderless (or, it turned out, just watching one plain
 on-screen) could leave a "Stream error" label stuck over video that was visibly playing
@@ -338,7 +395,7 @@ cause and fix: `superdoc/features/video-pipeline.md`'s "`errorPlaceholder` now c
 once playback recovers" section — the bug and fix live entirely in the shared
 `window.TileVideo` module, nothing viewer-window-specific was needed.
 
-## Ghost "Stream error" label, follow-up: the real bug was CSS, not `hideError()` (2026-07-28)
+## Ghost "Stream error" label, follow-up: the real bug was CSS, not `hideError()` (2026-07-28) (history)
 
 The label came back after the fix above — still visible, in both the pop-out window and
 plain on-screen tiles, with video visibly playing fine underneath. **This is a different,
@@ -404,7 +461,7 @@ canvas happens to be drawing underneath (a mostly-dark captured frame reads as "
 tile", not "an error label sitting over working video") — not because the element's own
 visibility was ever actually changing.
 
-## Watch grid gained a per-tile "stop watching" button (2026-07-28)
+## Watch grid gained a per-tile "stop watching" button (2026-07-28) (history)
 
 Not part of this feature's own IPC (no Electron/`__ELECTRON__` involved), but touches the
 same tile overlay this doc's "Architecture" table already points at (`view.js`'s
@@ -427,7 +484,7 @@ Mock branch (no `window.__TAURI__`): removes the tile from `mockWatched` and pus
 equivalent entry onto `notOnScreenStreams` directly, mirroring `playNotOnScreen`'s reverse
 move, so a Playwright/browser-preview run can exercise stop-then-restart without a backend.
 
-## 2026-07-28: consolidation — three window-creation mechanisms became one
+## 2026-07-28: consolidation — three window-creation mechanisms became one (history)
 
 Before this pass there were **three** separate "view a stream in its own window"
 mechanisms in this codebase, which the project owner asked to be consolidated into one:
@@ -526,7 +583,7 @@ the pop-out button's one-line `onClick` handler forwards directly to the exact
 `window.__ELECTRON__.openPopout` call exercised above, so this is a thin, already-read
 wiring layer over a mechanism that was verified end-to-end.
 
-## Deliberately not built here
+## Deliberately not built here (history)
 
 Per-tile aspect-ratio-aware grid layout in **this** file's pop-out window
 (`frontend/scripts/viewer.js` still uses the plain `ceil(sqrt(n))` columns /
@@ -540,7 +597,7 @@ the 2026-07-28 consolidation, since nothing needs to force a pop-out window onto
 specific display); resizing/repositioning a pop-out window after it's open without
 closing and reopening it.
 
-## Main-window Watch grid: `ceil(sqrt(n))` replaced by an area-maximizing rows x cols search (2026-07-28)
+## Main-window Watch grid: `ceil(sqrt(n))` replaced by an area-maximizing rows x cols search (2026-07-28) (history)
 
 The **main window's** Watch grid (`frontend/scripts/view.js`'s `render()`/
 `computeGridShape`/`applyGridLayout` — not this file's pop-out window, see the note just
@@ -607,7 +664,7 @@ each shrinking to a third of it), 1400x700 (wide — 3 tiles as 2x2, large tiles
 900x850 (square-ish content area — 3 tiles as 1x3, matching the pure-math prediction), all
 without touching the real HDMI-connected display.
 
-## Watch grid area-maximizing layout, follow-up: tiles overflowing the viewport on certain window shapes (2026-07-28)
+## Watch grid area-maximizing layout, follow-up: tiles overflowing the viewport on certain window shapes (2026-07-28) (history)
 
 Follow-up to the entry just above, found the same day: the project owner reported the
 Watch grid (2 mock tiles, 1 column x 2 rows — exactly the "stack them" shape the feature

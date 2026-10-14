@@ -1,26 +1,21 @@
-# Video Pipeline: native decode (current) and the H.264-over-HTTP relay + browser-side WebCodecs display (being replaced)
+# Video Pipeline: native decode and GPU display
 
-> **Status (2026-10-14).** The **decode side** of this page was rewritten for the native
-> decoder (`client/src/decode.rs`, see "Native decode" below): it handles H.264, H.265 and AV1
-> and is built to feed a GPU renderer. The **display side** (HTTP relay in `video_server.rs`,
-> WebCodecs in the Electron renderer, `tile-video.js` jitter buffer, the View-tab stat bar and
-> everything below "Wire format") describes the Electron build that still ships and is **being
-> replaced; see the egui GPU renderer (I9, in progress)**. Another task (I22) rewrites the
-> display-side sections once the renderer lands; they are left as the accurate record of the old
-> stack until then.
+> **Status (2026-10-14).** The client is one native egui binary. This page's current content is
+> **"Native decode"** (access units to NV12 frames) and **"Native display"** (NV12 frames to
+> the screen via wgpu), plus a short **"Capture side"** pointer list. Everything under
+> **"History: the Electron-era display path"** (HTTP relay in `video_server.rs`, WebCodecs in the
+> Electron renderer, `tile-video.js` jitter buffer, the View-tab stat bar, the Electron audio
+> notes) describes code that no longer exists or is being deleted (I23, in progress). It is kept
+> as the record of *why* things were built that way; do not treat it as current behaviour.
+> The browser client (`docs/`) has its own WebCodecs pipeline, which is current but lives in
+> `superdoc/features/website.md`.
 
-**Added 2026-07-28** (backfilling docs for work that landed across several sessions before
-this page existed — see `superdoc/architecture/overview.md`'s dated module-map entries for
-the detailed build history this page summarizes). How the View tab actually gets decoded
-video onto screen, end to end: the wire format between the Rust sidecar and the Electron
-renderer, the client-side jitter buffer, and how the three live encoder-tuning controls
-(`superdoc/features/stream-control.md`) interact with an in-flight watch. Lives in
-`client/` (this monorepo).
+Where each side lives:
 
-Not covered by `superdoc/features/stream-control.md` (which is about the *encode* side —
-building/editing/tiering outgoing destinations) or `superdoc/features/self-preview.md`
-(sender-side only, a completely different mechanism — a live GStreamer `egui::ColorImage`
-texture, not HTTP, not WebCodecs). This page is the *decode/delivery* side, for a watcher.
+- **Encode / capture / fan-out:** `superdoc/features/stream-control.md` (see "Capture side" below).
+- **Decode + display for a watcher:** this page, `client/src/decode.rs` + `decode/`.
+- **Pop-out windows:** `superdoc/features/viewer-window.md`.
+- **Wire format between peers:** `superdoc/architecture/protocol-spec.md`.
 
 ## Native decode (`client/src/decode.rs` + `decode/{codec,video,frame}.rs`)
 
@@ -92,7 +87,7 @@ Decoded padding lines are black. Not fixable at the encoder from `capture.rs` sh
 rewriting the OBU headers.
 
 **Legacy adapter.** `latest_frame() -> egui::ColorImage` still exists (CPU NV12 to RGBA at poll
-time) only for the old `ui.rs`.
+time) from before the GPU renderer; the UI no longer uses it (display goes through `VideoView`).
 
 **Benchmark** (`client/examples/decode_bench.rs`, 1080p, decode throughput):
 
@@ -105,7 +100,71 @@ time) only for the old `ui.rs`.
 Every codec clears the 240 fps target in hardware; in software only H.264 does, which is why
 the hardware path is first and the fallback is a safety net, not a plan.
 
-## The two ends (Electron build; display side being replaced)
+## Native display (`client/src/decode/render.rs` + `render.wgsl`)
+
+**Added 2026-10-14 (I9).** Replaces "HTTP relay + WebCodecs in a `<canvas>`" (see History). The
+module doc comment in `render.rs` is the authority; the points below are the ones an agent needs
+before touching it. The UI side (`VideoViews`, tiles, hover chrome) is in `superdoc/ui/APP-SHELL.md`.
+
+- **NV12 stays NV12 until the shader.** `queue.write_texture` uploads straight from the decoder's
+  mapped slices (`bytes_per_row = stride`): Y as `R8Unorm` (w x h), UV as `Rg8Unorm`
+  (ceil(w/2) x ceil(h/2)). `render.wgsl` converts YUV to RGB; the matrix (BT.601 / 709 / 2020) and
+  the limited/full range expansion are folded into three affine rows on the CPU
+  (`yuv_to_rgb_rows`) and passed as a uniform, so the shader has no per-standard branches. Textures
+  are recreated only on a size change.
+- **Drawn with an egui paint callback** (`VideoCallback`), letterboxed (`Fit::Contain`) into the rect
+  the caller gives `VideoView::show`/`paint`. `paint` resets the viewport to the full unclamped video
+  rect and relies on egui's scissor for clipping, because egui clamps a callback's viewport to the
+  screen and would otherwise squash a partially off-screen video.
+- **Textures are per stream, shared across viewports.** One `VideoRenderer` lives in
+  `callback_resources` (eframe has one wgpu device for every viewport); GPU state is keyed by the
+  decoder's `FrameSource`. A stream shown in a tile *and* a pop-out is uploaded once per decoded
+  frame, whichever viewport paints first. `Why:` half the upload bandwidth, and it gives the
+  presenter rule for free.
+- **Presenter rule:** `FrameSource::note_presented()` is called **once per frame**, when it is first
+  uploaded for display, no matter how many views draw it. `Why:` no "designated presenter" to keep
+  in sync as views come and go (closing a pop-out cannot stop the count), and "presented fps" then
+  means distinct frames that reached a screen. A frame superseded before any repaint uploads it is
+  not counted.
+- **Repaint is frame-driven, not polled.** Each `VideoView` runs one waker thread (`run_waker`,
+  thread name `video-repaint`) that sleeps on `FrameSource::wait_for_newer` and calls
+  `ctx.request_repaint_after_for(1 us, viewport)` per new frame. `Why not request_repaint_of:`
+  egui turns every zero-delay request into *two* passes "to let things settle", which at 240 fps
+  doubled the paint rate (480/s measured); a non-zero delay skips that and still means "now". The
+  waker exits when its view stops being shown (500 ms `HIDDEN_AFTER`) and respawns on the next
+  visible show; screens never call `request_repaint()` for video.
+- **Measured:** 240 fps presented on DP-1 (279.75 Hz), 1080p. Pop-outs hold 240/240 in Mailbox mode,
+  which is why Mailbox is the default; see `superdoc/features/presentation-modes.md`.
+
+## Capture side (summary; detail lives in `stream-control.md`)
+
+The decoder in this page only sees what the capture pipeline produces. Three things changed that
+a decode-side reader will meet:
+
+- **Orientation (#35).** `pipewiresrc` turns `SPA_META_VideoTransform` into an `image-orientation`
+  tag and the pipeline follows it (`video-direction=auto`), so a rotated monitor arrives upright. The
+  stage is spliced in lazily on the System domain because `videoflip` costs about 0.8 ms per 1080p
+  frame even when idle; in the GPU domain the source `vapostproc` is the stage. The tee answers caps
+  queries with BGRx at any size, because otherwise `vapostproc` shrank the capture to 320x180. There is
+  no transform table of our own. Live-verified: the portal sends rotate-180 for DP-2. See
+  `capture.rs` `orientation_fragment` and `stream-control.md` "Live-verified: rotated outputs (#35)".
+- **Performance (#39).** 120-240 fps of *unique* frames, PipeWire `min-buffers`, `RateCap`, and the
+  GPU/System **capture domain**: `stream-control.md` "Capture/encode performance".
+- **Idle monitors (#32).** The first branch waits for the source's first repaint; a silence watchdog
+  moves a quiet destination to `Stalled(SourceLost)` and viewers are fed a cached IDR meanwhile:
+  `stream-control.md` "Idle monitors" and "Silence watchdog".
+
+
+## History: the Electron-era display path
+
+> **Everything from here to the end of the file describes the Electron build** (Rust sidecar
+> `src-tauri/`, `video_server.rs`, `frontend/scripts/*.js`, WebCodecs). It is superseded by "Native
+> display" above, and the code is being deleted (I23). Section headings are marked "(history)".
+> One thing in it is **still current**: the audio-follows-video pairing rule
+> `RoomSession::sync_audio_watches` (`client/src/session.rs`), in the "Audio follows video"
+> section; the Electron UI details around it are not.
+
+## The two ends (Electron build; display side being replaced) (history)
 
 - **Sender side**: unchanged by anything in this doc. `capture.rs` encodes H.264 / H.265 / AV1
   (`features/stream-control.md`, "Video codec selection"), encrypts, fragments, and sends over the QUIC media-datagram plane — see
@@ -134,7 +193,7 @@ the hardware path is first and the fallback is a safety net, not a plan.
   `VideoDecoder.configure()`'s `description` is omitted, so no Annex-B→AVCC bitstream
   conversion is needed anywhere in this pipeline.
 
-## Why this replaced an MJPEG-over-HTTP design
+## Why this replaced an MJPEG-over-HTTP design (history)
 
 An earlier version of this same delivery path decoded every frame with GStreamer
 (`decode.rs`'s old software `StreamDecoder`; since reworked, see "Native decode" above) and re-encoded it as JPEG, served as `multipart/x-mixed-replace`. That paid
@@ -144,7 +203,7 @@ JPEG regardless of whether the underlying access unit was a keyframe). Relaying 
 H.264 and decoding it *in the browser* deletes that round trip entirely and removes the
 poll-rate ceiling — frames forward the instant they arrive.
 
-## Wire format
+## Wire format (history)
 
 The HTTP response body (`Content-Type: application/octet-stream`, never terminates while
 the watch is active) is a sequence of chunks, each:
@@ -185,7 +244,7 @@ string is instead **parsed live out of each keyframe's SPS NAL**
 in-band as a CodecInfo chunk, not as a REST field — because it can genuinely change
 mid-stream (see the `BranchSwap` interaction below).
 
-## Encoder-tuning interaction: codec string is re-derived per keyframe, not cached once
+## Encoder-tuning interaction: codec string is re-derived per keyframe, not cached once (history)
 
 This mechanism exists because of a real, real-hardware-verified bug (2026-07-28): a
 watcher connecting **after** the sharer had toggled the live encoder-tuning controls
@@ -221,7 +280,7 @@ version is that none of `x264enc`/`vah264enc`'s tuning properties are safely wri
 `Playing` element, so "change one of these" is definitionally "build a new encoder," which
 is exactly what a branch swap already exists to do safely.
 
-## `errorPlaceholder` now clears itself once playback recovers (2026-07-28)
+## `errorPlaceholder` now clears itself once playback recovers (2026-07-28) (history)
 
 **Bug** (reported by the project owner): turning a watched stream fullscreen/borderless
 (`superdoc/features/viewer-window.md`) — and, it turns out, plain on-screen View tab tiles
@@ -261,7 +320,7 @@ change.
 No server-side change was needed or made here — this is purely about the client no longer
 leaving a stale overlay up past the moment its own pipeline recovered.
 
-## Client-side jitter buffer (`tile-video.js`)
+## Client-side jitter buffer (`tile-video.js`) (history)
 
 Without buffering, `startTileVideo` used to call `decoder.decode()` immediately on every
 chunk as it arrived off the wire, so network jitter translated directly into visible
@@ -315,7 +374,7 @@ exact same fetch+parse+decode+jitter pipeline against its own `<canvas>` grid, i
 of DOM layout — both callers share one `window.TileVideo` module rather than maintaining
 two copies that could drift.
 
-## Sustained sender-rate-exceeds-decoder overload: unbounded drift, and the fix (2026-07-29)
+## Sustained sender-rate-exceeds-decoder overload: unbounded drift, and the fix (2026-07-29) (history)
 
 **Bug report:** when the viewer's decode pipeline structurally cannot keep up with the
 sender's sustained framerate (reported repro: ~280fps-equivalent sent, viewer only ever
@@ -385,7 +444,7 @@ needs stronger confidence, the next step would be to add an artificial per-chunk
 knob (test-only) to `tile-video.js` to deterministically simulate "decoder slower than sender"
 without needing real hardware limits.
 
-## Audio follows video — and never appears as its own stream to a viewer
+## Audio follows video — and never appears as its own stream to a viewer (history)
 
 **Added 2026-07-28.**
 
@@ -505,7 +564,7 @@ about waveform content.
 
 ---
 
-## The audio was never captured (2026-07-28)
+## The audio was never captured (2026-07-28) (history)
 
 The receiving half documented above was correct and is unchanged. The **sending** half was
 not: `audio.rs` targeted its `pipewiresrc` with `path=<pw-dump registry node id>`, a
@@ -555,7 +614,7 @@ measurements swung between +5.8 dB (reinforcing) and −3.6 dB (cancelling) with
 in configuration. Two decorrelated noise copies add in *power*, which is monotonic and
 reproduced to 0.01 dB across runs.
 
-## The volume slider did nothing for the first room joined each session (2026-07-28)
+## The volume slider did nothing for the first room joined each session (2026-07-28) (history)
 
 Reported as "when viewing, the volume slider doesn't work at all" — a real regression from
 the state documented above, not a flaw in that verification. Root cause was a single
@@ -606,7 +665,7 @@ Exact linear-gain math both directions, confirming the `volume` GStreamer elemen
 (and everything downstream of `commands::set_volume`) was never the problem — only the
 frontend's dropped `invoke` call was.
 
-## Viewer's chosen volume reset to 100% whenever the sender restarted/switched audio (2026-07-29)
+## Viewer's chosen volume reset to 100% whenever the sender restarted/switched audio (2026-07-29) (history)
 
 Reported as: a viewer sets a tile's volume to e.g. 50%, then the **sender** (not the viewer)
 restarts their screen/audio share or switches which app they're sharing audio from — and the
@@ -662,7 +721,7 @@ interactive xdg-desktop-portal dialog was needed — only the *viewer* needed to
 app): real volume slider set to 50%, real sender-side audio restart/switch, real slider still
 reading 50% afterward (was hardcoded back to 100 before the fix).
 
-## View tab stats made prominent: always-visible stat bar, bigger "not on screen" cards, and a real received-bitrate DTO field (2026-07-29)
+## View tab stats made prominent: always-visible stat bar, bigger "not on screen" cards, and a real received-bitrate DTO field (2026-07-29) (history)
 
 **Owner's request, verbatim:** *"In the view Tab, the streams are kinda 'hidden' or not
 visible enough. It would be nice, if its design is more stylish and prominent. Just bigger.
@@ -782,7 +841,7 @@ mock/browser path:
   `hyprctl monitors`-focused-output safety check immediately before every real
   `go_live` call, not just once per session.
 
-## Hover-overlay action buttons painted under the stat bar (2026-07-29)
+## Hover-overlay action buttons painted under the stat bar (2026-07-29) (history)
 
 **Owner's report, verbatim:** *"For the stream hover overlay, draw the buttons (top right)
 above the vignette."* Regression from the "View tab stats made prominent" redesign directly
@@ -816,7 +875,7 @@ in the overlapping region really triggered `stopWatching()` — the tile visibly
 on-screen grid into "Not on screen" — proving the click isn't swallowed by the
 now-underneath statbar.
 
-## "Overlay always shown, should only show on hover" — investigated, was statbar/overlay conflation, not a hover-gating bug (2026-07-29)
+## "Overlay always shown, should only show on hover" — investigated, was statbar/overlay conflation, not a hover-gating bug (2026-07-29) (history)
 
 **Owner's report, verbatim:** *"right now, for the stream the overlay is always shown. It
 should only be shown, when hovered. Also, the whole overlay text, buttons and volume should
@@ -877,7 +936,7 @@ its own point too. Screenshots at rest and on hover confirm the visual read: a c
 at rest, the full hover vignette with legible top-right buttons and bottom-left volume
 control on hover.
 
-## Reversal: "always-visible stat bar" un-done — hover-gated like everything else now, plus rounded/height-unified overlay buttons (2026-07-29)
+## Reversal: "always-visible stat bar" un-done — hover-gated like everything else now, plus rounded/height-unified overlay buttons (2026-07-29) (history)
 
 **This deliberately reverses the "View tab stats made prominent" redesign above** (which
 explicitly argued for "no hover needed" — stats visible at all times) **and the investigation
@@ -944,7 +1003,7 @@ real `getBoundingClientRect()`/`getComputedStyle()` calls and a real Playwright 
 - `cargo test --workspace`: 181 passed, 0 failed, 22 ignored (pre-existing, real-relay/GStreamer
   tests requiring `--ignored`), no regressions.
 
-## Mute-toggle flicker, slider DOM presence, and pill shape (2026-07-28)
+## Mute-toggle flicker, slider DOM presence, and pill shape (2026-07-28) (history)
 
 Four related fixes to the per-tile `.media-tile-audio` pill (`view.js`'s `renderTile`,
 `view.css`), all reported together against the same screenshot:
@@ -985,7 +1044,7 @@ identity** across both toggles (no rebuild, no flicker). Measured the muted pill
 28×28px, confirmed `.media-tile-audio-slider` is absent from `querySelector` results while
 muted and reappears on unmute, and measured the real-hover expanded gap at exactly 8px.
 
-## View tab and pop-out window disagreed on a tile's displayed volume/mute (2026-07-29)
+## View tab and pop-out window disagreed on a tile's displayed volume/mute (2026-07-29) (history)
 
 **Bug** (project owner): *"The volume setting isn't visually shared between the in window
 and the popped out view (but the volume doesn't change, so it is right logically)."* — the
@@ -1081,7 +1140,7 @@ screenshots this bug report asks for.
 `volume_survives_sender_audio_restart_or_switch` real-hardware regression test run
 explicitly) showed no regressions.
 
-## Status
+## Status (history)
 
 **Built and verified** (real hardware, real relay, real portal capture unless noted):
 

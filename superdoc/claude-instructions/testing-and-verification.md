@@ -101,7 +101,26 @@ exec 9>/tmp/claude-1000/sss-gui.lock && flock 9   # at the top of your script; r
 
 Keep a locked session to a few minutes: launch, screenshot, click, kill, release. Think
 and edit code outside the lock. Release only after your windows are closed and focus is
-restored. (The lock file is a few bytes; `/tmp` is fine for that, see the target-dir rule
+restored.
+
+Rules learned the hard way (overnight 2026-10-14):
+
+- **Don't let the lock leak into children.** Children inherit fd 9, so a leftover child
+  (e.g. the client's `pw-loopback`) keeps holding the lock after your script dies; this
+  blocked two workers once. Launch everything inside the lock with fd 9 closed:
+  `cmd 9>&- &`.
+- **No long reservations** such as `flock /tmp/claude-1000/sss-gui.lock sleep 14400`. One
+  worker's 4-hour reservation stalled two others for over 30 minutes. Lock per scenario and
+  release it while you analyse or rebuild.
+- **Never broad-kill.** No `pkill -x simple-screensh` / `pkill -f simple-screensharing`:
+  every worker's clients and relays share those names (one such kill ended another
+  worker's run mid-way). Kill only PIDs you recorded at launch, or match on something
+  unique to your run (your port, your scratch config path).
+- **Per-run names in `client/scripts/`.** The scripts use per-run tmux session names
+  (recorded in `$SCRATCH/tmux.session` by `rig.sh up`) and an `ANIM_PIDFILE` for
+  `animate.sh` (#43), so concurrent runs cannot stop each other's relay or animation. Export
+  the `ANIM_PIDFILE=` line that `animate.sh start` prints so `animate.sh stop` finds yours;
+  see `client/scripts/README.md`. (The lock file is a few bytes; `/tmp` is fine for that, see the target-dir rule
 below for what is not.)
 
 ### Prove the binary you launch is your build
