@@ -1,6 +1,8 @@
-//! Video decode pipeline: turns reassembled+decrypted H.264 access units for
-//! one subscribed stream into `egui::ColorImage`s that `ui.rs` can upload to
-//! a texture on each repaint.
+//! Video decode pipeline: turns reassembled+decrypted H.264 / H.265 / AV1
+//! access units for one subscribed stream (codec detected from the bitstream)
+//! into GPU-uploadable NV12 [`DecodedFrame`]s, using VA hardware decoders with
+//! a software fallback. A legacy adapter still hands the old egui UI
+//! `egui::ColorImage`s.
 //!
 //! # Why this module's input isn't raw datagram bytes or a room key
 //!
@@ -25,104 +27,81 @@
 //! `stream_id` it's currently subscribed to/displaying and call
 //! `StreamDecoder::feed` with each match.
 //!
-//! # GStreamer pipeline
+//! # Video: codec-agnostic, VA-first, GPU-ready
 //!
 //! ```text
-//! appsrc ! queue ! h264parse ! avdec_h264 ! videoconvert ! video/x-raw,format=RGBA ! appsink
+//! HW:  appsrc ! <h264|h265|av1>parse ! va<h264|h265|av1>dec ! video/x-raw,format=NV12 ! appsink
+//! SW:  appsrc ! <h264|h265|av1>parse ! <avdec_h264|avdec_h265|av1dec> ! videoconvert ! video/x-raw,format=NV12 ! appsink
 //! ```
 //!
-//! `avdec_h264` (GStreamer's libav-backed software H.264 decoder — verified
-//! present via `gst-inspect-1.0 avdec_h264` against the system's GStreamer
-//! 1.28.5 install) is used directly rather than `decodebin`, since the
-//! input codec is fixed and already known (H.264 per spec §6.1), so there
-//! is nothing for autoplugging to discover. A hardware decoder would be a
-//! nice-to-have but this pass is explicitly scoped "correctness over
-//! performance". The `queue` element gives GStreamer its own streaming
-//! thread for parse/decode/convert, so pushing a buffer into `appsrc` from
-//! `feed()` returns quickly instead of synchronously running the whole
-//! decode chain on the caller's thread.
+//! The mechanism lives in `decode/video.rs` (pipeline thread, VA-first with
+//! software fallback, codec switching), `decode/codec.rs` (bitstream codec
+//! sniffing) and `decode/frame.rs` (the NV12 [`DecodedFrame`], the shared
+//! latest-frame slot [`FrameSource`], decode/present statistics).
 //!
-//! # Pacing and frame-skipping
+//! `Why the codec is sniffed:` the wire protocol carries no codec tag, on
+//! purpose (a tag can go stale when a sender edits a destination to another
+//! codec; the bitstream can't). The decoder drops access units until a
+//! keyframe sniffs as H.264/H.265/AV1, builds that codec's pipeline, and
+//! rebuilds it if a later keyframe sniffs as a different codec.
 //!
-//! Decoded frames are not displayed the instant they finish decoding: they
-//! are paced against the sender's capture-time PTS (`pts_us`, threaded
-//! through end-to-end from `capture.rs`) by [`PacingState`], owned by
-//! `appsink`'s `new_sample` callback. Pacing alone bounds *latency*
-//! (falling too far behind re-bases instead of accumulating an
-//! ever-growing delay) but says nothing about *throughput*: if a sender is
-//! capturing/encoding at a higher framerate than this viewer's decode
-//! pipeline can sustain (e.g. a 240fps sender against a decoder that only
-//! keeps up with 120fps), re-basing alone still displays every decoded
-//! frame — just each one a little later than it should be — which reads as
-//! the picture slowly drifting out of sync with real elapsed time rather
-//! than as a stall.
+//! `Why NV12 output:` VA decoders produce NV12; a GPU renderer uploads the Y
+//! and UV planes as two textures and converts YUV to RGB in a shader. The old
+//! `videoconvert ! RGBA` stage did that work on the CPU per frame, which caps
+//! throughput far below the 120-240 fps target. The legacy
+//! [`StreamDecoder::latest_frame`] still hands the egui UI an `egui::ColorImage`
+//! by converting NV12 to RGBA on the CPU at poll time, only for as long as the
+//! old UI exists.
 //!
-//! `Why:` `PacingState` tracks a running *pts budget* — how much sender
-//! pts-time has accumulated toward "earning" the next display slot — and
-//! skips (tells `new_sample` to drop the frame, never writing it into the
-//! display sink) whenever a frame hasn't earned enough budget yet. This is
-//! the standard accumulator/DDA technique for down-converting a frame rate:
-//! it settles into skipping almost exactly the fraction the sustained rate
-//! mismatch demands (e.g. ~50% for a 240fps sender against a 120fps-capable
-//! viewer), not 0% (every frame displayed late, forever drifting) or ~100%
-//! (skip-storm with no recovery). See [`PacingState`]'s own doc comment for
-//! the full rationale, including why a *consecutive-badly-behind-events*
-//! counter (an earlier version of this mechanism) does not work for a
-//! gradual per-frame differential.
+//! `Why no queue/videoconvert in the HW chain:` `appsrc` runs its own
+//! streaming thread, so a separate `queue` only added a thread hop, and the
+//! backlog policy that the old leaky `queue` provided now lives in the
+//! pipeline thread where it can see keyframes (see `video::trim_backlog`; a
+//! leaky queue drops the *oldest* access unit, which on a freshly built
+//! pipeline is the keyframe it needs). The VA decoder downloads its surfaces
+//! to system-memory NV12 itself when downstream asks for plain `video/x-raw`,
+//! so no converter is needed either.
 //!
-//! `PacingState` also carries a second, independent defense: an absolute,
-//! wall-clock-anchored staleness backstop (`epoch`/[`PACING_STALENESS_THRESHOLD`]).
-//! The pts-budget mechanism above only ever compares *consecutive* frames,
-//! which is exactly right for a gradual, sustained rate mismatch but blind
-//! to a *bursty* one: if something upstream of `feed`/`decide` (e.g. an
-//! unbounded or throttled event-delivery channel between the network layer
-//! and this module's caller) lets a batch of frames back up and then
-//! delivers the whole backlog at once, `pts_budget`'s consecutive-frame
-//! view sees each backlogged frame as "decode finished early" and paces it
-//! out with a real-time sleep — a literal real-time replay of stale
-//! history, the "fast-forward catch-up" symptom this backstop exists to
-//! prevent (see `superdoc/brainstorm/ui-redesign-multiroom-streaming.md`,
-//! "Performance/Rendering" round 2, and the "fps bug fixes" bullet in that
-//! doc's Final Plan section). The two mechanisms are complementary, not
-//! redundant: `pts_budget` handles *sustained* mismatch, the staleness
-//! backstop handles *bursty* delivery; see [`PacingState::epoch`]'s own doc
-//! comment for the full design (in particular why it re-anchors only on
-//! the first frame and a hard reset, and why the check is scoped to just
-//! the "ahead of schedule" branch of [`PacingState::decide`]).
+//! # Output, stats and pacing
 //!
-//! This backstop only covers the pacing math itself. It does not fix the
-//! upstream cause of a delivery burst — decoupling `MediaFrame` ingestion
-//! from the UI's repaint cadence, so a backlog never has a chance to form
-//! in the first place — which is a separate, `ui.rs`-side fix tracked in
-//! the same plan doc entry.
+//! Decoded frames are published as `Arc<DecodedFrame>` into a latest-only slot
+//! ([`FrameSource`]): a renderer polls [`FrameSource::frame_counter`] (one
+//! atomic load) and uploads only when it changed. Ingestion never waits for a
+//! consumer and never triggers a UI repaint.
+//!
+//! There is **no pacing in the decoder any more**: the appsink is `sync=false`
+//! and frames are published the moment they come out. `Why:` low latency
+//! matters more than smoothness here, and the right place to pace is where the
+//! frame is presented, which knows the display's refresh. The previous
+//! in-callback pacing slept on GStreamer's streaming thread, which would cap
+//! decode throughput at the sender's frame rate. [`PacingState`] (the
+//! pts-budget/staleness algorithm and its tests, unchanged) is kept as a `pub`
+//! building block for that presenter.
+//!
+//! Statistics are separate and both exposed: **decoded fps** is counted by a
+//! pad probe at the decoder output ([`StreamDecoder::decoded_fps`],
+//! [`StreamDecoder::current_fps`]); **presented fps** is counted when the
+//! consumer reports a frame shown ([`FrameSource::note_presented`], or each
+//! legacy `latest_frame()` yield). `Why:` the old `current_fps()` incremented
+//! only inside `latest_frame()`, so it reported how often the UI picked frames
+//! up, not how fast the decoder ran.
 //!
 //! # Threading
 //!
-//! Each `StreamDecoder` owns one background `std::thread` (plain
-//! `std::thread`, not `tokio::spawn_blocking`, since this is a long-lived
-//! pipeline for the decoder's whole lifetime, not a bounded blocking call
-//! inside an async task) that builds the pipeline, drives it to `Playing`,
-//! and then just relays incoming access units (received over a
-//! `std::sync::mpsc` channel fed by `feed()`) into `appsrc`. Decoded RGBA
-//! frames arrive via `appsink`'s `new_sample` callback, invoked by
-//! GStreamer on its own internal streaming thread (downstream of the
-//! `queue`); that callback converts the sample straight to an
-//! `egui::ColorImage` and stores it in a `Mutex<Option<ColorImage>>` slot
-//! shared with the `StreamDecoder` handle, overwriting any previous unread
-//! frame. That's the "drop and continue" policy applied to decoded output
-//! too: if `ui.rs` hasn't polled [`StreamDecoder::latest_frame`] since the
-//! last decode, the older frame is discarded rather than queued, so the
-//! displayed image never falls behind live. Both `feed()` and
-//! `latest_frame()` are non-blocking.
+//! Each `StreamDecoder` owns one background `std::thread` that owns the
+//! GStreamer pipeline and relays access units received over a bounded
+//! `std::sync::mpsc` channel (fed by non-blocking `feed()`) into `appsrc`.
+//! Decoded frames are published from the appsink's `new_sample` callback on
+//! GStreamer's own streaming thread. `feed()` and every read accessor are
+//! non-blocking.
 //!
 //! # Error handling
 //!
-//! A single corrupt/incomplete access unit (e.g. one downstream of a frame
-//! the `Reassembler` had to drop for missing fragments) or a decoder error
-//! is logged and skipped — the GStreamer bus is drained for error/warning
-//! messages each loop iteration without tearing the pipeline down, and
-//! `appsink`'s callback treats a failed sample conversion the same way.
-//! Nothing in this module panics on bad media content.
+//! A corrupt/incomplete access unit or a decoder warning is logged and
+//! skipped; decoders run with `max-errors=-1` so garbage never aborts the
+//! stream. A *pipeline-level* error from a hardware decoder (or no output
+//! within its probation window) demotes that codec to software; see
+//! `decode/video.rs`. Nothing in this module panics on bad media content.
 //!
 //! # Audio
 //!
@@ -281,29 +260,31 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use gstreamer::prelude::*;
 use gstreamer::{Bus, Buffer, Caps, ClockTime, Element, ElementFactory, Message, MessageView, Pipeline, State};
-use gstreamer_app::{AppSink, AppSinkCallbacks, AppSrc};
-use gstreamer_video::prelude::*;
-use gstreamer_video::{VideoFrameRef, VideoInfo};
+#[cfg(test)]
+use gstreamer_app::AppSink;
+use gstreamer_app::AppSrc;
 
 use crate::net::{DecryptedMediaFrame, DecryptedPreview};
 use crate::protocol::{ConnId, StreamId};
 
-/// Shared slot the appsink callback writes into and `latest_frame()` reads
-/// (and clears) from.
-type LatestFrameSlot = Arc<Mutex<Option<egui::ColorImage>>>;
+mod codec;
+mod frame;
+#[cfg(test)]
+mod test_util;
+mod video;
+#[cfg(test)]
+mod video_tests;
 
-/// Message sent from `feed()`/`Drop` to the pipeline-owning thread.
-enum PipelineMsg {
-    AccessUnit { pts_us: u64, data: Vec<u8> },
-    Shutdown,
-}
+pub use codec::{sniff, VideoCodec};
+pub use frame::{DecodedFrame, DecoderInfo, DecoderStats, FrameSource, YuvMatrix};
+use video::PipelineMsg;
 
 /// Sliding-window size for [`StreamDecoder::current_fps`] — wide enough to
 /// smooth over normal frame-to-frame jitter but narrow enough to react
@@ -317,9 +298,13 @@ const DECODE_FPS_WINDOW: Duration = Duration::from_secs(2);
 /// to the pipeline thread without blocking the caller, not to buffer a
 /// backlog — a slow decoder should show a slightly stale live frame (via
 /// the existing appsink drop policy), not an ever-growing queue of stale
-/// input. A handful of frames is enough to absorb normal scheduling jitter
-/// between the two threads.
-const VIDEO_INGEST_CHANNEL_CAPACITY: usize = 8;
+/// input.
+///
+/// `Why 32 (was 8):` 8 access units is 33 ms at the 240 fps target; a short
+/// scheduling hiccup on the pipeline thread would drop access units and
+/// corrupt the picture until the next keyframe. 32 is ~133 ms at 240 fps, still
+/// bounded, and each entry is a compressed access unit (tens of KB).
+const VIDEO_INGEST_CHANNEL_CAPACITY: usize = 32;
 
 /// How large a *single* decode-to-decode wall-clock gap (`dt_wall` between
 /// two consecutive calls to [`PacingState::decide`]) has to be before it's
@@ -365,56 +350,6 @@ const PACING_HARD_STALL_GAP: Duration = Duration::from_secs(2);
 /// tight loop — see `pacing_staleness_backstop_*` below, using the plan
 /// doc's own repro shape (~600ms of silence, then a burst).
 const PACING_STALENESS_THRESHOLD: Duration = Duration::from_millis(250);
-
-/// `max-size-buffers` for the decode pipeline's `appsrc -> queue ->
-/// h264parse` handoff queue, which is also switched to `leaky=downstream`
-/// alongside this constant (see [`run_pipeline`]).
-///
-/// `Why:` the root cause of the "big FPS jump freezes the viewer" bug. A
-/// plain `ElementFactory::make("queue")` — no `leaky`, GStreamer's own
-/// defaults (`max-size-buffers=200`, `max-size-time=1s`) — is *not* a
-/// "drop and continue" element, it is a bounded buffer that **blocks the
-/// pushing thread** once full. When a big fps jump (or just a fast-enough
-/// stream) pushes access units faster than `avdec_h264` can decode them —
-/// this pipeline is software-decode only, no hardware decode path exists —
-/// this queue fills within about a second and every subsequent
-/// `appsrc.push_buffer()` call in [`pump_loop`] blocks synchronously until
-/// decode drains enough space. `pump_loop` then can't drain
-/// [`StreamDecoder`]'s own bounded ingest channel either, so from the
-/// caller's side `feed()` looks fine (it's `try_send`, non-blocking, and
-/// its own channel absorbs the backlog) while the actual GStreamer pipeline
-/// grinds through an ever-growing, ever-more-stale FIFO backlog in strict
-/// order at whatever rate decode can sustain — a real, multi-second visible
-/// freeze followed by slow-motion catch-up, not the graceful degradation
-/// [`PacingState`] above is designed to provide. `PacingState` cannot help
-/// here at all: it only ever sees a frame *after* it has already been
-/// decoded, so a backlog stuck in this queue, upstream of the decoder, never
-/// reaches it.
-///
-/// This is the exact same failure class `capture.rs`'s own
-/// `ENCODER_QUEUE_MAX_BUFFERS` doc comment describes and fixes on the
-/// encode/sender side ("without a small bounded/leaky config there, a real
-/// capture source's incoming raw-frame rate spiking under motion can outpace
-/// the encoder and the queue's own defaults, blocking the whole pipeline
-/// solid rather than dropping raw frames") — this module just never had the
-/// receive-side analog. `leaky=downstream` (drop the *oldest* buffered
-/// access unit, not reject the newest, when full) plus a small buffer count
-/// makes a struggling decoder skip stale, no-longer-relevant access units
-/// instead of blocking, so it always keeps decoding roughly the *live edge*
-/// of the stream. Dropping a compressed access unit does mean visible
-/// corruption until the next real IDR (h264parse/avdec_h264 can't decode a
-/// delta frame whose reference was skipped) — but that's bounded by the
-/// stream's own GOP length (seconds, not the unbounded/growing latency the
-/// blocking queue produced) and self-heals exactly the way this project
-/// already accepts a stall/pause/resubscribe gap self-healing elsewhere
-/// (see `destination::STALL_RESEND_INTERVAL`'s doc comment).
-///
-/// `Why` 4, matching the encode-side branch appsink's own `max-buffers=4`
-/// rather than `ENCODER_QUEUE_MAX_BUFFERS`'s 2: this queue holds compressed
-/// access units (tens of KB), not raw frames, so a little more slack costs
-/// negligible memory while giving ordinary decode-time jitter (a slightly
-/// slower-than-usual frame or two) more room before anything gets dropped.
-const DECODE_QUEUE_MAX_BUFFERS: u32 = 4;
 
 /// Tracks how often [`StreamDecoder::latest_frame`] actually yields a *new*
 /// decoded frame (not just how often it's polled — `ui.rs` polls once per
@@ -515,10 +450,18 @@ impl ByteRateCounter {
 /// Paces decoded video frames against their capture-time PTS instead of
 /// displaying each one the instant it finishes decoding.
 ///
+/// **Status:** the decoder itself no longer paces (it publishes every frame
+/// the moment it is decoded, see the module docs). This type is kept — `pub`,
+/// with its unit tests — as the building block for the *presenter*, which is
+/// where pacing belongs now: call [`Self::decide`] when a frame is about to
+/// be shown. The text below was written for the old in-appsink-callback use
+/// and still describes the algorithm accurately; read "the callback" as "the
+/// presenter".
+///
 /// # Why pacing lives here instead of `sync=true` on the appsink
 ///
 /// `pts_us` (threaded through decrypt -> [`PipelineMsg::AccessUnit`] ->
-/// stamped onto the `appsrc` buffer in `pump_loop`) is the *sender's* own
+/// stamped onto the `appsrc` buffer in `video::Active::push`) is the *sender's* own
 /// running time — `start.elapsed()` since that capture session began (see
 /// `capture.rs`/`audio.rs`) — not wall-clock/epoch time, and has no defined
 /// relationship to this pipeline's own running-time clock. Flipping the
@@ -571,7 +514,7 @@ impl ByteRateCounter {
 /// moment `dt_wall` returns to matching `dt_pts` (viewer catches up, or the
 /// sender's rate drops), because nothing about it depends on how long the
 /// mismatch has been going on, only on the current step's own numbers.
-struct PacingState {
+pub struct PacingState {
     /// `(pts_us, local_instant)` of the most recent frame `decide` was
     /// given — *any* decision, not just displayed ones — used to compute
     /// the next call's `dt_pts`/`dt_wall`. `None` until the first frame is
@@ -652,7 +595,7 @@ struct PacingState {
 /// What [`PacingState::decide`] wants the caller to do with the next
 /// decoded frame.
 #[derive(Debug, PartialEq, Eq)]
-enum PacingDecision {
+pub enum PacingDecision {
     /// Display the frame. `Some(duration)` means sleep that long first;
     /// `None` means display it immediately (already on pace, or already
     /// past due).
@@ -665,7 +608,7 @@ enum PacingDecision {
 }
 
 impl PacingState {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self { last: None, pts_budget: Duration::ZERO, epoch: None }
     }
 
@@ -674,7 +617,7 @@ impl PacingState {
     /// deterministic given its inputs — kept free of any GStreamer or
     /// thread-sleeping so it's unit-testable on its own; see
     /// `tests::pacing_*` below.
-    fn decide(&mut self, pts_us: u64, now: Instant) -> PacingDecision {
+    pub fn decide(&mut self, pts_us: u64, now: Instant) -> PacingDecision {
         let Some((last_pts, last_instant)) = self.last else {
             // First frame ever: nothing to pace against yet, display now
             // and start tracking from here. Also anchors `epoch` — see
@@ -762,21 +705,26 @@ impl PacingState {
     }
 }
 
-/// Decodes one subscribed video stream's incoming H.264 access units into
-/// `egui::ColorImage` frames. See the module docs for the pipeline shape and
-/// threading rationale.
+/// Decodes one subscribed video stream's incoming access units (H.264,
+/// H.265 or AV1, detected from the bitstream) into NV12 [`DecodedFrame`]s.
+/// See the module docs for the pipeline shape and threading rationale.
+///
+/// Renderers should take a [`FrameSource`] via [`Self::frames`] and poll that;
+/// [`Self::latest_frame`] is the legacy `egui::ColorImage` adapter.
 pub struct StreamDecoder {
     stream_id: StreamId,
     tx: std_mpsc::SyncSender<PipelineMsg>,
-    latest_frame: LatestFrameSlot,
-    /// An H.264 decoder can't produce anything from a mid-GOP delta frame
-    /// alone, so frames are dropped until the first keyframe is seen —
-    /// otherwise every frame between subscribing and the next keyframe (up
-    /// to the spec's 2-second GOP) would just be decode-error log spam.
+    /// Output slot + stats shared with the pipeline thread.
+    frames: FrameSource,
+    /// `seq` of the last frame [`Self::latest_frame`] handed out, so it
+    /// yields each frame at most once.
+    legacy_seen_seq: u64,
+    /// A decoder can't produce anything from a mid-GOP delta frame alone, so
+    /// frames are dropped until the first keyframe is seen — otherwise every
+    /// frame between subscribing and the next keyframe (up to the spec's
+    /// 2-second GOP) would just be decode-error log spam.
     seen_keyframe: bool,
     thread: Option<thread::JoinHandle<()>>,
-    /// Live viewer-side FPS tracker — see [`FpsCounter`]/[`Self::current_fps`].
-    fps_counter: FpsCounter,
     /// Live viewer-side received-bitrate tracker — see [`ByteRateCounter`]/
     /// [`Self::received_bitrate_kbps`].
     byte_counter: ByteRateCounter,
@@ -811,9 +759,19 @@ impl StreamDecoder {
     /// `gstreamer::init()` (idempotent — safe alongside other
     /// `StreamDecoder`s or a future `capture.rs`).
     pub fn new(stream_id: StreamId) -> Result<Self> {
+        Self::with_options(stream_id, true)
+    }
+
+    /// Like [`Self::new`] but never uses a VA hardware decoder. For
+    /// benchmarks and as an escape hatch if a driver misbehaves.
+    pub fn new_software_only(stream_id: StreamId) -> Result<Self> {
+        Self::with_options(stream_id, false)
+    }
+
+    fn with_options(stream_id: StreamId, allow_hardware: bool) -> Result<Self> {
         gstreamer::init().context("failed to initialize GStreamer")?;
 
-        let latest_frame: LatestFrameSlot = Arc::new(Mutex::new(None));
+        let shared = frame::Shared::new();
         // Bounded, not `std_mpsc::channel()`'s unbounded queue: this is the
         // pre-decode ingest path, and the module's own stated policy is
         // "drop and continue" everywhere else (the appsink downstream is
@@ -825,11 +783,11 @@ impl StreamDecoder {
         // why that policy over drop-oldest).
         let (tx, rx) = std_mpsc::sync_channel::<PipelineMsg>(VIDEO_INGEST_CHANNEL_CAPACITY);
 
-        let pipeline_frame_slot = latest_frame.clone();
+        let pipeline_shared = shared.clone();
         let thread = thread::Builder::new()
             .name(format!("decode-stream-{stream_id}"))
             .spawn(move || {
-                if let Err(e) = run_pipeline(rx, pipeline_frame_slot) {
+                if let Err(e) = video::run(rx, pipeline_shared, allow_hardware) {
                     tracing::error!("decode pipeline for stream {stream_id} exited with error: {e:#}");
                 }
             })
@@ -838,10 +796,10 @@ impl StreamDecoder {
         Ok(Self {
             stream_id,
             tx,
-            latest_frame,
+            frames: FrameSource(shared),
+            legacy_seen_seq: 0,
             seen_keyframe: false,
             thread: Some(thread),
-            fps_counter: FpsCounter::new(),
             byte_counter: ByteRateCounter::new(),
             created_at: Instant::now(),
             last_frame_at: None,
@@ -894,6 +852,7 @@ impl StreamDecoder {
         }
         let msg = PipelineMsg::AccessUnit {
             pts_us: frame.pts,
+            keyframe: frame.keyframe,
             data: frame.payload.clone(),
         };
         match self.tx.try_send(msg) {
@@ -903,6 +862,7 @@ impl StreamDecoder {
                 // drop this access unit rather than growing an unbounded
                 // backlog. Matches the "drop and continue" policy the
                 // appsink already applies downstream of decode.
+                self.frames.add_dropped(1);
                 tracing::debug!(
                     "decode ingest channel for stream {} is full; dropping access unit (decoder falling behind)",
                     self.stream_id
@@ -921,30 +881,61 @@ impl StreamDecoder {
         }
     }
 
-    /// Non-blocking poll for the most recently decoded frame. Returns
-    /// `None` if nothing new has been decoded since the last call. Intended
-    /// to be called once per `ui.rs` repaint and, when `Some`, uploaded via
-    /// an `egui::TextureHandle::set`.
-    ///
-    /// Every `Some` return is recorded by [`Self::current_fps`]'s counter —
-    /// this is what makes `current_fps` measure real decode throughput
-    /// rather than `ui.rs`'s repaint rate: a slow/stalled decoder still gets
-    /// polled every repaint, but only actually *yields* a new frame at the
-    /// real decode rate.
-    pub fn latest_frame(&mut self) -> Option<egui::ColorImage> {
-        let frame = self.latest_frame.lock().unwrap().take();
-        if frame.is_some() {
-            self.fps_counter.record();
-        }
-        frame
+    /// A cloneable, thread-safe handle to this decoder's output — the API a
+    /// GPU renderer uses (see [`FrameSource`]). Does not need the lock around
+    /// the `StreamDecoder` and stays usable after the decoder is dropped.
+    pub fn frames(&self) -> FrameSource {
+        self.frames.clone()
     }
 
-    /// Live viewer-side FPS: how many *new* frames [`Self::latest_frame`]
-    /// actually yielded over the last [`DECODE_FPS_WINDOW`] — i.e. real
-    /// playback smoothness, not just how often the UI happens to poll.
-    /// Intended for `ui.rs` to show next to the watched video panel.
+    /// Snapshot of codec, active decoder element, and decoded/presented fps.
+    pub fn stats(&self) -> DecoderStats {
+        self.frames.stats()
+    }
+
+    /// The codec sniffed from the stream, once known.
+    pub fn codec(&self) -> Option<VideoCodec> {
+        self.stats().info.codec
+    }
+
+    /// GStreamer element factory of the active decoder (e.g. `"vah264dec"`,
+    /// `"avdec_h265"`), once a pipeline is up.
+    pub fn decoder_name(&self) -> Option<String> {
+        self.stats().info.decoder_name
+    }
+
+    /// Non-blocking poll, **legacy egui adapter**: the most recently decoded
+    /// frame converted NV12 to RGBA on the CPU, or `None` if nothing new has
+    /// been decoded since the last call. Each yielded frame also counts as
+    /// "presented" in [`DecoderStats::presented_fps`].
+    ///
+    /// New code should use [`Self::frames`] and upload the NV12 planes to the
+    /// GPU instead; this exists only so the old UI keeps working.
+    pub fn latest_frame(&mut self) -> Option<egui::ColorImage> {
+        let frame = self.frames.latest_if_newer(self.legacy_seen_seq)?;
+        self.legacy_seen_seq = frame.seq;
+        self.frames.note_presented();
+        Some(frame.to_color_image())
+    }
+
+    /// Live decode FPS: frames leaving the decoder over the last
+    /// [`DECODE_FPS_WINDOW`], counted at the decoder output regardless of
+    /// whether anyone consumes them. (Before the decoder rework this counted
+    /// `latest_frame()` yields, i.e. presented frames; see
+    /// [`Self::presented_fps`] for that.)
     pub fn current_fps(&mut self) -> f64 {
-        self.fps_counter.fps()
+        self.decoded_fps()
+    }
+
+    /// Frames per second leaving the decoder (rolling [`DECODE_FPS_WINDOW`]).
+    pub fn decoded_fps(&self) -> f64 {
+        self.stats().decoded_fps
+    }
+
+    /// Frames per second the consumer reported showing (legacy
+    /// `latest_frame()` yields plus [`FrameSource::note_presented`]).
+    pub fn presented_fps(&self) -> f64 {
+        self.stats().presented_fps
     }
 
     /// Live received bitrate in kbps — real compressed bytes arriving for
@@ -1001,165 +992,6 @@ impl Drop for StreamDecoder {
     }
 }
 
-/// Builds the pipeline, drives it to `Playing`, and pumps `rx` until
-/// `Shutdown` (or the channel disconnects because every `StreamDecoder`
-/// handle was dropped) — see module docs "Threading".
-fn run_pipeline(rx: std_mpsc::Receiver<PipelineMsg>, latest_frame: LatestFrameSlot) -> Result<()> {
-    let pipeline = Pipeline::new();
-
-    let src = ElementFactory::make("appsrc")
-        .name("src")
-        .build()
-        .context("appsrc element unavailable")?;
-    // `leaky=downstream` + a small `max-size-buffers`: see
-    // [`DECODE_QUEUE_MAX_BUFFERS`]'s doc comment for why a plain, default
-    // `queue` here is the root cause of the "big FPS jump freezes the
-    // viewer" bug (it blocks instead of dropping once decode falls behind),
-    // and why leaking the oldest buffered access unit is the right fix.
-    let queue = ElementFactory::make("queue")
-        .property_from_str("leaky", "downstream")
-        .property("max-size-buffers", DECODE_QUEUE_MAX_BUFFERS)
-        .build()
-        .context("queue element unavailable")?;
-    let parse = ElementFactory::make("h264parse")
-        .build()
-        .context("h264parse element unavailable")?;
-    let decoder = ElementFactory::make("avdec_h264")
-        .build()
-        .context("avdec_h264 element unavailable (is gst-libav installed?)")?;
-    let convert = ElementFactory::make("videoconvert")
-        .build()
-        .context("videoconvert element unavailable")?;
-    let sink = ElementFactory::make("appsink")
-        .name("sink")
-        .build()
-        .context("appsink element unavailable")?;
-
-    pipeline
-        .add_many([&src, &queue, &parse, &decoder, &convert, &sink])
-        .context("failed to add elements to pipeline")?;
-    Element::link_many([&src, &queue, &parse, &decoder, &convert]).context("failed to link decode chain")?;
-
-    let rgba_caps = Caps::builder("video/x-raw").field("format", "RGBA").build();
-    convert
-        .link_filtered(&sink, &rgba_caps)
-        .context("failed to link videoconvert -> appsink with RGBA caps")?;
-
-    let appsrc = src
-        .dynamic_cast::<AppSrc>()
-        .map_err(|_| anyhow!("appsrc element was not an AppSrc"))?;
-    appsrc.set_caps(Some(
-        &Caps::builder("video/x-h264")
-            .field("stream-format", "byte-stream")
-            .field("alignment", "au")
-            .build(),
-    ));
-    appsrc.set_is_live(true);
-    appsrc.set_format(gstreamer::Format::Time);
-
-    let appsink = sink
-        .dynamic_cast::<AppSink>()
-        .map_err(|_| anyhow!("appsink element was not an AppSink"))?;
-    // Always hold at most the newest decoded frame — matches the
-    // drop-and-continue policy: a slow consumer sees the latest frame, not
-    // a growing backlog.
-    appsink.set_property("sync", false);
-    appsink.set_property("max-buffers", 1u32);
-    appsink.set_property("drop", true);
-
-    let sink_frame_slot = latest_frame;
-    // `Mutex`, not a plain field, because `new_sample` below is `Fn`, not
-    // `FnMut` (GStreamer may in principle re-invoke it concurrently, and
-    // the closure trait bound requires `Sync`) — same pattern already used
-    // for `sink_frame_slot` just above. This callback runs on GStreamer's
-    // own streaming thread downstream of the `queue` element (see module
-    // docs "Threading"), never on an async runtime thread, so blocking it
-    // with `std::thread::sleep` below for pacing is correct and matches
-    // how a GStreamer `sync=true` sink element would behave internally.
-    let pacing = Mutex::new(PacingState::new());
-    appsink.set_callbacks(
-        AppSinkCallbacks::builder()
-            .new_sample(move |sink| {
-                match pull_color_image(sink) {
-                    Ok(Some((image, Some(pts_us)))) => {
-                        match pacing.lock().unwrap().decide(pts_us, Instant::now()) {
-                            PacingDecision::Display(Some(delay)) => {
-                                std::thread::sleep(delay);
-                                *sink_frame_slot.lock().unwrap() = Some(image);
-                            }
-                            PacingDecision::Display(None) => {
-                                *sink_frame_slot.lock().unwrap() = Some(image);
-                            }
-                            PacingDecision::Skip => {
-                                // Not enough accumulated pts-budget to
-                                // afford this frame's real-time cost (see
-                                // `PacingState::decide`) — decode throughput
-                                // sustainably below the sender's output
-                                // rate: drop this frame — do not write it
-                                // into the sink slot — rather than display
-                                // every decoded frame at a rate the viewer
-                                // can't sustain, which is what caused the
-                                // slow drift this mechanism replaced.
-                            }
-                        }
-                    }
-                    Ok(Some((image, None))) => {
-                        // No PTS on the decoded buffer (shouldn't normally
-                        // happen since `pump_loop` always stamps one, but
-                        // never worth failing the whole stream over) —
-                        // display immediately rather than pace blindly.
-                        *sink_frame_slot.lock().unwrap() = Some(image);
-                    }
-                    Ok(None) => {}
-                    Err(e) => tracing::warn!("dropping frame that failed RGBA conversion: {e:#}"),
-                }
-                Ok(gstreamer::FlowSuccess::Ok)
-            })
-            .build(),
-    );
-
-    let bus = pipeline.bus().ok_or_else(|| anyhow!("pipeline has no bus"))?;
-
-    pipeline
-        .set_state(State::Playing)
-        .context("failed to start decode pipeline")?;
-
-    let result = pump_loop(&rx, &appsrc, &bus);
-
-    let _ = appsrc.end_of_stream();
-    let _ = pipeline.set_state(State::Null);
-    result
-}
-
-/// Feed loop: pushes access units into `appsrc` as they arrive and drains
-/// the bus for error/warning logging in between, until told to shut down.
-fn pump_loop(rx: &std_mpsc::Receiver<PipelineMsg>, appsrc: &AppSrc, bus: &Bus) -> Result<()> {
-    loop {
-        while let Some(msg) = bus.pop() {
-            log_bus_message(&msg);
-        }
-
-        match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(PipelineMsg::AccessUnit { pts_us, data }) => {
-                let mut buffer = Buffer::from_slice(data);
-                if let Some(buffer_mut) = buffer.get_mut() {
-                    buffer_mut.set_pts(ClockTime::from_useconds(pts_us));
-                }
-                // A push failure here (e.g. decoder choking on a corrupt
-                // access unit downstream of a dropped fragment) is exactly
-                // the "glitch and continue" case: log and move on to the
-                // next frame rather than treating it as fatal.
-                if let Err(e) = appsrc.push_buffer(buffer) {
-                    tracing::warn!("appsrc dropped an access unit: {e:?}");
-                }
-            }
-            Ok(PipelineMsg::Shutdown) => return Ok(()),
-            Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std_mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-        }
-    }
-}
-
 fn log_bus_message(msg: &Message) {
     match msg.view() {
         MessageView::Error(e) => {
@@ -1180,66 +1012,6 @@ fn log_bus_message(msg: &Message) {
         }
         _ => {}
     }
-}
-
-/// Pull the newest available sample off `sink` and convert it to an
-/// `egui::ColorImage`, respecting the negotiated row stride (RGBA rows can
-/// be padded past `width * 4` bytes depending on the decoder/converter, so
-/// this must not assume a tightly packed buffer). Also returns the
-/// decoded buffer's PTS (in microseconds), if it has one, for
-/// [`PacingState`] to schedule display against — this is the same
-/// capture-time `pts_us` `pump_loop` stamped onto the pre-decode buffer;
-/// GStreamer propagates it downstream through `h264parse`/`avdec_h264`/
-/// `videoconvert` unless something along the chain drops it.
-fn pull_color_image(sink: &AppSink) -> Result<Option<(egui::ColorImage, Option<u64>)>> {
-    let sample = match sink.try_pull_sample(ClockTime::from_mseconds(0)) {
-        Some(s) => s,
-        None => return Ok(None),
-    };
-    let buffer = sample.buffer().ok_or_else(|| anyhow!("sample had no buffer"))?;
-    let pts_us = buffer.pts().map(|pts| pts.useconds());
-    let caps = sample.caps().ok_or_else(|| anyhow!("sample had no caps"))?;
-    let info = VideoInfo::from_caps(caps).context("failed to parse negotiated video caps")?;
-
-    let frame = VideoFrameRef::from_buffer_ref_readable(buffer, &info)
-        .map_err(|_| anyhow!("failed to map decoded video buffer readable"))?;
-
-    let width = frame.width() as usize;
-    let height = frame.height() as usize;
-    let stride = frame.plane_stride()[0] as usize;
-    let plane = frame
-        .plane_data(0)
-        .map_err(|_| anyhow!("decoded frame had no plane 0 data"))?;
-
-    let packed = pack_rgba_rows(plane, width, height, stride)?;
-
-    Ok(Some((
-        egui::ColorImage::from_rgba_unmultiplied([width, height], &packed),
-        pts_us,
-    )))
-}
-
-/// Tightly packs `height` RGBA rows of `width * 4` bytes each out of `plane`,
-/// which is laid out with `stride` bytes between the start of consecutive
-/// rows (`stride >= width * 4`; any bytes past `width * 4` on a given row
-/// are alignment padding GStreamer added and must be skipped rather than
-/// copied — copying them, or worse, assuming `stride == width * 4` and
-/// reading straight through the padding into the next row's data, is what
-/// produces the sheared/banded frames this function exists to prevent. See
-/// `pack_rgba_rows_skips_stride_padding_instead_of_shearing_rows` below for
-/// a synthetic, GStreamer-independent proof.
-fn pack_rgba_rows(plane: &[u8], width: usize, height: usize, stride: usize) -> Result<Vec<u8>> {
-    let row_bytes = width * 4;
-    let mut packed = Vec::with_capacity(row_bytes * height);
-    for row in 0..height {
-        let start = row * stride;
-        let end = start + row_bytes;
-        let Some(row_slice) = plane.get(start..end) else {
-            anyhow::bail!("decoded frame plane shorter than expected (stride/height mismatch)");
-        };
-        packed.extend_from_slice(row_slice);
-    }
-    Ok(packed)
 }
 
 // ---------------------------------------------------------------------
@@ -1843,7 +1615,7 @@ const AUDIO_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Feed loop: runs incoming Opus packets through [`AudioJitterBuffer`] and
 /// pushes what it releases into `appsrc`, applies volume changes to the
 /// `volume` element, and drains the bus for error/warning logging in
-/// between, until told to shut down. Mirrors video's `pump_loop`, plus the
+/// between, until told to shut down. Mirrors the video pipeline thread's feed loop (`video::run`), plus the
 /// jitter buffer (which video does not need — see the module docs).
 fn pump_audio_loop(rx: &std_mpsc::Receiver<AudioPipelineMsg>, appsrc: &AppSrc, volume: &Element, bus: &Bus) -> Result<()> {
     // Both owned outright by this thread — see the module docs' audio
@@ -2934,66 +2706,6 @@ mod tests {
             .abs()
             .max((a.g() as i32 - b.g() as i32).abs())
             .max((a.b() as i32 - b.b() as i32).abs())
-    }
-
-    /// Fast, deterministic, GStreamer-independent proof that
-    /// `pack_rgba_rows` correctly skips stride padding rather than
-    /// shearing the image, whether or not the local GStreamer install
-    /// happens to pad RGBA rows for a given width (RGBA rows are always a
-    /// multiple of 4 bytes, so the common `round-up-to-4` stride policy
-    /// never pads them — real padding only shows up with certain
-    /// decoder/converter backends, e.g. GPU/hardware paths that align to
-    /// 16/32/64+ byte boundaries regardless of format. This test builds
-    /// that scenario by hand instead of hoping the CI machine's software
-    /// decoder happens to produce it.)
-    #[test]
-    fn pack_rgba_rows_skips_stride_padding_instead_of_shearing_rows() {
-        const WIDTH: usize = 3;
-        const HEIGHT: usize = 4;
-        const ROW_BYTES: usize = WIDTH * 4;
-        const PADDING: usize = 12; // stride = row_bytes + 12, e.g. 32-byte SIMD alignment
-        const STRIDE: usize = ROW_BYTES + PADDING;
-
-        // Each row's real pixel bytes are filled with a distinct, easily
-        // recognizable value (row index repeated); the padding bytes past
-        // `ROW_BYTES` are filled with a sentinel (0xEE) that must never
-        // appear in the packed output.
-        let mut plane = vec![0xEEu8; STRIDE * HEIGHT];
-        for row in 0..HEIGHT {
-            let start = row * STRIDE;
-            for b in &mut plane[start..start + ROW_BYTES] {
-                *b = row as u8;
-            }
-        }
-
-        let packed = pack_rgba_rows(&plane, WIDTH, HEIGHT, STRIDE).expect("packing should succeed");
-
-        let mut expected = Vec::with_capacity(ROW_BYTES * HEIGHT);
-        for row in 0..HEIGHT {
-            expected.extend(std::iter::repeat(row as u8).take(ROW_BYTES));
-        }
-        assert_eq!(
-            packed, expected,
-            "stride-aware packing produced the wrong bytes: expected each row's real pixels \
-             tightly packed with no padding, got something else (rows shifted/sheared or padding leaked in)"
-        );
-        assert!(
-            !packed.contains(&0xEE),
-            "padding sentinel byte leaked into the packed output — stride was not skipped correctly"
-        );
-
-        // The naive bug this guards against: treating the buffer as if
-        // `stride == row_bytes` (i.e. `plane[..ROW_BYTES * HEIGHT]`) reads
-        // straight through the padding into the next row, shearing the
-        // image. Confirm that naive slice does NOT equal the correct
-        // output — proving this test actually discriminates the bug from
-        // the fix, not just checking dimensions.
-        let naive = &plane[..ROW_BYTES * HEIGHT];
-        assert_ne!(
-            naive, expected.as_slice(),
-            "test fixture is degenerate: the naive (stride-ignoring) extraction accidentally \
-             matches the correct one, so this test wouldn't actually catch the bug"
-        );
     }
 
     /// Encodes `num_buffers` frames of `videotestsrc` to H.264 (byte-stream,
