@@ -61,6 +61,11 @@ pub struct ModalsState {
     tab: AddTab,
     join_link: String,
     join_name: String,
+    /// The link text `prefill_name` last looked at (it only acts on a change).
+    seen_link: String,
+    /// The name `prefill_name` put into `join_name` from a pasted link; the
+    /// field still holding exactly this means the user did not touch it.
+    prefilled_name: Option<String>,
     server: String,
     create_name: String,
     /// The shown `create_result` was dismissed by switching tabs (the shell
@@ -89,6 +94,8 @@ impl ModalsState {
                 self.tab = AddTab::Join;
                 self.join_link.clear();
                 self.join_name.clear();
+                self.seen_link.clear();
+                self.prefilled_name = None;
                 self.create_name.clear();
                 self.result_dismissed = false;
                 self.server = last_server(cx).unwrap_or_default();
@@ -102,6 +109,26 @@ impl ModalsState {
                 self.rename = cx.room(room).map(|r| r.name).unwrap_or_default();
             }
             _ => {}
+        }
+    }
+}
+
+impl ModalsState {
+    /// When the join-link field changed to a link carrying a room name (5th
+    /// field), fill the name field with it, unless the user typed a name of
+    /// their own: the field is empty or still holds the previous prefill.
+    /// `Why:` user request 2026-10-15, a pasted link pre-fills the name but it
+    /// stays editable and what is in the field on "Join" is what is saved.
+    fn prefill_name(&mut self) {
+        if self.join_link == self.seen_link {
+            return;
+        }
+        self.seen_link.clone_from(&self.join_link);
+        let Some(name) = parse_join_string(&self.join_link).ok().and_then(|p| p.name) else { return };
+        let untouched = self.join_name.trim().is_empty() || self.prefilled_name.as_deref() == Some(self.join_name.as_str());
+        if untouched {
+            self.join_name.clone_from(&name);
+            self.prefilled_name = Some(name);
         }
     }
 }
@@ -238,6 +265,7 @@ fn create_join(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
                             None,
                             |ui| widgets::text_field(ui, &mut st.join_link, "server|room-id|key"),
                         );
+                        st.prefill_name();
                         let name = widgets::ctrl_row(
                             ui,
                             &tr("ui.modal.room_name", "Room name"),
@@ -781,6 +809,46 @@ mod tests {
         assert!(!masked.contains(key_field), "the key must not be shown");
         assert_eq!(parsed.room_key, [7u8; 32]);
         assert_eq!(masked_link("garbage"), "••••••••");
+    }
+
+    #[test]
+    fn pasted_link_prefills_the_name_unless_the_user_typed_one() {
+        use simple_screensharing_client::net::format_join_string_full;
+        let link = |n: &str| format_join_string_full("r:1", &[1; 16], &[2; 32], None, Some(n));
+        let mut st = ModalsState::default();
+
+        // Paste: empty name field gets the link's name.
+        st.join_link = link("Friday Films");
+        st.prefill_name();
+        assert_eq!(st.join_name, "Friday Films");
+
+        // User edits the prefill; pasting another link must not overwrite it.
+        st.join_name = "My name".into();
+        st.join_link = link("Other");
+        st.prefill_name();
+        assert_eq!(st.join_name, "My name");
+
+        // Cleared by the user: a new paste may prefill again.
+        st.join_name.clear();
+        st.join_link = link("Third");
+        st.prefill_name();
+        assert_eq!(st.join_name, "Third");
+
+        // An untouched prefill is replaced by the next paste's name.
+        st.join_link = link("Fourth");
+        st.prefill_name();
+        assert_eq!(st.join_name, "Fourth");
+
+        // A link without a name, or an unparsable one, leaves the field alone;
+        // so does an unchanged link text (no re-prefill every frame).
+        st.join_link = simple_screensharing_client::net::format_join_string("r:1", &[1; 16], &[2; 32]);
+        st.prefill_name();
+        st.join_link = "garbage".into();
+        st.prefill_name();
+        assert_eq!(st.join_name, "Fourth");
+        st.join_name = "typed".into();
+        st.prefill_name();
+        assert_eq!(st.join_name, "typed");
     }
 
     #[test]

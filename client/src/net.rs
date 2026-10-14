@@ -217,8 +217,13 @@ impl std::error::Error for JoinRejectedError {}
 // Join-string parsing
 // ---------------------------------------------------------------------
 
-/// A parsed `server|room-id|key[|certhash]` join string. See module docs for
-/// the encoding of each field.
+/// Longest room name (in chars) a link's 5th field may carry; longer names
+/// are cut. The UI has no cap of its own for typed names, so this is the one
+/// limit and it only exists to keep a hostile link from filling the field.
+pub const MAX_LINK_ROOM_NAME_CHARS: usize = 64;
+
+/// A parsed `server|room-id|key[|certhash[|name]]` join string. See module
+/// docs for the encoding of each field and `protocol-spec.md` §11.4.
 #[derive(Debug, Clone)]
 pub struct ParsedJoinString {
     pub server: String,
@@ -226,12 +231,17 @@ pub struct ParsedJoinString {
     pub room_key: [u8; 32],
     /// The relay certificate's SHA-256, if the link carried one (4th field).
     pub cert_hash: Option<CertHash>,
+    /// The room's display name, if the link carried one (5th field,
+    /// percent-encoded UTF-8). Only a suggestion for the add-room dialog: it
+    /// is not part of the room's identity. A name that does not decode is
+    /// `None`, never an error.
+    pub name: Option<String>,
 }
 
 pub fn parse_join_string(s: &str) -> Result<ParsedJoinString> {
     const EXPECTED: &str = "expected server|room-id|key or server|room-id|key|certhash";
     let s = s.trim();
-    let mut parts = s.splitn(4, '|');
+    let mut parts = s.splitn(5, '|');
     let server = parts
         .next()
         .filter(|p| !p.is_empty())
@@ -247,6 +257,7 @@ pub fn parse_join_string(s: &str) -> Result<ParsedJoinString> {
         Some(h) => Some(decode_cert_hash(h).context("join string has an invalid cert hash")?),
         None => None,
     };
+    let name = parts.next().and_then(decode_link_name);
 
     let room_id = parse_room_id_hex(room_id_str)?;
     let room_key = parse_room_key_base64(key_str)?;
@@ -256,6 +267,7 @@ pub fn parse_join_string(s: &str) -> Result<ParsedJoinString> {
         room_id,
         room_key,
         cert_hash,
+        name,
     })
 }
 
@@ -276,16 +288,76 @@ pub fn format_join_string_with_hash(
     room_key: &[u8; 32],
     cert_hash: Option<&CertHash>,
 ) -> String {
+    format_join_string_full(server, room_id, room_key, cert_hash, None)
+}
+
+/// [`format_join_string_with_hash`] plus the optional 5th field: the room's
+/// display name. A blank name yields the 3/4-field form; a name without a hash
+/// leaves the 4th field empty (`server|id|key||name`).
+pub fn format_join_string_full(
+    server: &str,
+    room_id: &RoomId,
+    room_key: &[u8; 32],
+    cert_hash: Option<&CertHash>,
+    name: Option<&str>,
+) -> String {
     let mut out = format!(
         "{server}|{}|{}",
         encode_room_id_hex(room_id),
         URL_SAFE_NO_PAD.encode(room_key)
     );
-    if let Some(hash) = cert_hash {
+    let name = name.map(str::trim).filter(|n| !n.is_empty());
+    if cert_hash.is_some() || name.is_some() {
         out.push('|');
-        out.push_str(&encode_cert_hash(hash));
+        if let Some(hash) = cert_hash {
+            out.push_str(&encode_cert_hash(hash));
+        }
+    }
+    if let Some(name) = name {
+        out.push('|');
+        out.push_str(&encode_link_name(name));
     }
     out
+}
+
+/// Percent-encode `name` as UTF-8: RFC 3986 unreserved characters
+/// (`A-Za-z0-9-._~`) stay, every other byte (including `|` and `%`) becomes
+/// `%XX`. A browser decodes this with `decodeURIComponent`.
+fn encode_link_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for b in name.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Inverse of [`encode_link_name`], lenient: `None` for a malformed `%`
+/// sequence, invalid UTF-8, or a name that is empty after trimming. Control
+/// characters are dropped and the result is capped at
+/// [`MAX_LINK_ROOM_NAME_CHARS`] chars.
+fn decode_link_name(field: &str) -> Option<String> {
+    let bytes = field.trim().as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes.get(i + 1..i + 3)?;
+            let hex = std::str::from_utf8(hex).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    let decoded = String::from_utf8(out).ok()?;
+    let name: String = decoded.chars().filter(|c| !c.is_control()).take(MAX_LINK_ROOM_NAME_CHARS).collect();
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 fn parse_room_id_hex(s: &str) -> Result<RoomId> {
@@ -673,11 +745,13 @@ impl ScreenshareClient {
         self.cert_hash
     }
 
-    /// A shareable `server|room-id|key|certhash` link for the room this
+    /// A shareable `server|room-id|key|certhash|name` link for the room this
     /// connection is in. `server` is the relay address as the invitee should
     /// type it (`host:port`); the room id and key come from this connection.
-    pub fn invite_link(&self, server: &str) -> String {
-        format_join_string_with_hash(server, &self.room_id, &self.room_key, self.cert_hash.as_ref())
+    /// `room_name` is the saved name the invitee's add-room dialog pre-fills
+    /// (`None`/blank: no 5th field).
+    pub fn invite_link(&self, server: &str, room_name: Option<&str>) -> String {
+        format_join_string_full(server, &self.room_id, &self.room_key, self.cert_hash.as_ref(), room_name)
     }
 
     /// Shared nonce sequence for this connection. A future `capture.rs`
@@ -1048,7 +1122,65 @@ mod tests {
         let base = format_join_string("h:1", &[1u8; 16], &test_key());
         assert!(parse_join_string(&format!("{base}|not-base64!")).is_err());
         assert!(parse_join_string(&format!("{base}|AAAA")).is_err(), "wrong length");
-        assert!(parse_join_string(&format!("{base}|{}|extra", encode_cert_hash(&[0u8; 32]))).is_err());
+    }
+
+    #[test]
+    fn join_string_name_round_trip_all_forms() {
+        let (id, key) = ([0x12u8; 16], test_key());
+        let hash = cert_hash_of_der(b"cert");
+        let hash_s = encode_cert_hash(&hash);
+        // name + hash
+        let l = format_join_string_full("h:1", &id, &key, Some(&hash), Some("Friday Films"));
+        assert!(l.ends_with(&format!("|{hash_s}|Friday%20Films")), "{l}");
+        let p = parse_join_string(&l).unwrap();
+        assert_eq!((p.name.as_deref(), p.cert_hash), (Some("Friday Films"), Some(hash)));
+        // name, no hash: empty 4th field
+        let l = format_join_string_full("h:1", &id, &key, None, Some("Movies"));
+        assert!(l.ends_with("||Movies"), "{l}");
+        let p = parse_join_string(&l).unwrap();
+        assert_eq!((p.name.as_deref(), p.cert_hash), (Some("Movies"), None));
+        // blank name = old forms
+        assert_eq!(format_join_string_full("h:1", &id, &key, None, Some("  ")), format_join_string("h:1", &id, &key));
+        assert_eq!(
+            format_join_string_full("h:1", &id, &key, Some(&hash), None),
+            format_join_string_with_hash("h:1", &id, &key, Some(&hash))
+        );
+        // old 3/4-field links have no name
+        assert_eq!(parse_join_string(&format_join_string("h:1", &id, &key)).unwrap().name, None);
+        assert_eq!(parse_join_string(&format!("{}|{hash_s}", format_join_string("h:1", &id, &key))).unwrap().name, None);
+        // empty 5th field
+        assert_eq!(parse_join_string(&format!("{}||", format_join_string("h:1", &id, &key))).unwrap().name, None);
+    }
+
+    #[test]
+    fn join_string_name_special_characters() {
+        let (id, key) = ([3u8; 16], test_key());
+        for name in ["a|b", "100%", "%41", "with space", "Größe Ünï", "Movie \u{1F3AC} night", "~-._ok", "a|b|c|d"] {
+            let l = format_join_string_full("h:1", &id, &key, None, Some(name));
+            assert_eq!(l.matches('|').count(), 4, "name must not add separators: {l}");
+            assert!(l.is_ascii(), "{l}");
+            let p = parse_join_string(&l).unwrap();
+            assert_eq!(p.name.as_deref(), Some(name), "{l}");
+            assert_eq!(p.room_id, id);
+        }
+        // browser encodeURIComponent output (leaves !'()* alone) decodes too
+        let base = format_join_string("h:1", &id, &key);
+        assert_eq!(parse_join_string(&format!("{base}||Hi!%20(x)")).unwrap().name.as_deref(), Some("Hi! (x)"));
+    }
+
+    #[test]
+    fn join_string_bad_name_is_dropped_not_rejected() {
+        let base = format_join_string("h:1", &[1u8; 16], &test_key());
+        for bad in ["100%", "%4", "%zz", "%FF%FE", "%0A", "   ", "%20%20"] {
+            let p = parse_join_string(&format!("{base}||{bad}")).expect("link must still parse");
+            assert_eq!(p.name, None, "{bad}");
+            assert_eq!(p.room_key, test_key());
+        }
+        // trimmed, control chars dropped, capped
+        assert_eq!(parse_join_string(&format!("{base}||%20%20Hi%0A%20")).unwrap().name.as_deref(), Some("Hi"));
+        let long = "x".repeat(200);
+        let p = parse_join_string(&format!("{base}||{long}")).unwrap();
+        assert_eq!(p.name.unwrap().chars().count(), MAX_LINK_ROOM_NAME_CHARS);
     }
 
     #[test]
