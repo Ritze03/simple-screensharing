@@ -531,18 +531,18 @@ fn draw_overview(frame: &mut Frame, area: Rect, app: &App, snap: &Snapshot) {
 
     let lines = vec![
         Line::from(vec![
-            Span::raw("Listening on:  "),
+            Span::raw("Listening on:      "),
             Span::styled(
                 snap.listen_addr.to_string(),
                 Style::default().fg(Color::Cyan),
             ),
         ]),
         Line::from(vec![
-            Span::raw("Uptime:        "),
+            Span::raw("Uptime:            "),
             Span::raw(fmt_duration(snap.uptime)),
         ]),
         Line::from(vec![
-            Span::raw("Active rooms:  "),
+            Span::raw("Active rooms:      "),
             Span::raw(snap.room_count.to_string()),
         ]),
         Line::from(vec![
