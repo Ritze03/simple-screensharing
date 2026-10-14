@@ -41,6 +41,15 @@ its "Proposed" tab).
   panel was too squished for the number of controls.
 - **Leave sits in the room header.** *Why:* user's call; it is a room-level action, not
   a sharing one, so it is not in the (sharing) action bar.
+- **Narrow windows (960 px minimum → ~656 px header / action band):** nothing clips;
+  controls degrade in a fixed order instead. Action bar: the status text truncates down
+  to 72 px first, then buttons go icon-only (label in the tooltip): Live = Stream
+  settings → `N rooms ▾` to `N ▾` → audio compact → Stop sharing; Staged/Picking =
+  Stream settings → audio → Discard → Go live. Header: Copy invite link icon-only →
+  meta line dropped whole (never "2 pe…") → Leave icon-only → bare Auto-connect checkbox.
+  *Why:* redundant controls go first (Stream settings is on the own card, Copy invite
+  link in ⋯, the meta counts in People); the primary action keeps its words longest.
+  Details in the `action_bar.rs` module doc and `room::show_header`.
 - **No self-preview** of your own share. *Why:* matches the Electron app's deliberate
   removal (see `superdoc/features/self-preview.md`).
 

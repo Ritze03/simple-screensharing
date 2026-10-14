@@ -22,6 +22,22 @@
 //!
 //! Leave is not here: it lives in the room header (user request).
 //!
+//! # Narrow windows
+//! At the 960 px minimum window the bar is ~656 px wide, too narrow for every
+//! label (German most of all). Each layout picks the lowest degradation
+//! level ([`fit_level`]) that leaves the status fill [`STATUS_MIN_W`]:
+//! first the status text shrinks (it truncates with "…"), then buttons
+//! collapse to icon-only (the label moves into the tooltip) in this order:
+//! - Live: Stream settings → `N rooms ▾` becomes `N ▾` → audio compact
+//!   (icon-only `Share audio ▾`, or the source name capped shorter) → Stop
+//!   sharing.
+//! - Picking / Staged: Stream settings → audio compact → Discard → Go live.
+//! - Idle: Share audio (disabled anyway); Share screen keeps its label.
+//!
+//! `Why` this order: the least used / most redundant control goes first
+//! (Stream settings is also on the own share card), and the one action the
+//! bar exists for (Stop sharing, Go live) keeps its words longest.
+//!
 //! The popover bodies for Also send to / Move to are shared with the
 //! stream-settings modal (`pub(super)` helpers at the bottom), so the two
 //! lists can't drift.
@@ -41,6 +57,25 @@ use crate::widgets::{self, Btn, FILL, HBox, Pill, PillLead, PopItem, Slot, fixed
 
 /// Popover width (mockup `.popup`: 340).
 pub(super) const POPOVER_W: f32 = 340.0;
+
+/// Narrowest the status fill gets before the bar starts collapsing buttons
+/// (still room for "Screen…" / "H.264 · 6…"). `Why` this small: the status
+/// repeats what the own share card shows, while a German "Teilen beenden"
+/// at 960 px only keeps its label if the status gives up ~90 px first.
+const STATUS_MIN_W: f32 = 72.0;
+
+/// The bar's degradation level (see "Narrow windows" above): the lowest
+/// `level` in `0..=max` whose fixed slots (`fixed(level)` = their summed
+/// width; `n` fixed slots + the status fill = `n` gaps) leave the status fill
+/// at least [`STATUS_MIN_W`]; `max` if none does.
+fn fit_level(avail: f32, n: usize, max: usize, fixed: impl Fn(usize) -> f32) -> usize {
+    (0..=max).find(|l| avail - fixed(*l) - theme::S2 * n as f32 >= STATUS_MIN_W).unwrap_or(max)
+}
+
+/// `b` icon-only when `on` (its label moves into the tooltip `tip`).
+fn icon_only<'a>(b: Btn<'a>, on: bool, tip: &'a str) -> Btn<'a> {
+    if on { Btn { label: "", ..b }.tip(tip) } else { b }
+}
 
 /// Action-bar UI state.
 #[derive(Default)]
@@ -88,21 +123,30 @@ fn paused(ui: &mut Ui) {
 }
 
 fn idle(ui: &mut Ui, cx: &mut Cx, room: RoomHandle) {
+    // Any destination elsewhere (even Starting) offers the add/move menu; the
+    // "live in" line only counts rooms where the share is actually on air.
     let others: Vec<RoomHandle> = cx.live_rooms().into_iter().filter(|r| *r != room).collect();
+    let on_air: Vec<RoomHandle> = cx.on_air_rooms().into_iter().filter(|r| *r != room).collect();
     let share_l = tr("ui.bar.share_screen", "Share screen");
     let audio_l = tr("ui.bar.share_audio", "Share audio");
     let audio_tip = tr("ui.bar.share_audio_first", "Share a screen first; audio rides along with it");
+    let audio_tip_full = format!("{audio_l}\n{audio_tip}");
     let mut share = Btn::primary(&share_l).icon("screen_share").large();
     if !others.is_empty() {
         share = share.trailing("expand_more");
     }
-    let audio = Btn::secondary(&audio_l).icon("volume_up").large().enabled(false).tip(&audio_tip);
+    let audio_at = |l: usize| {
+        let b = Btn::secondary(&audio_l).icon("volume_up").large().enabled(false).tip(&audio_tip);
+        icon_only(b, l >= 1, &audio_tip_full)
+    };
+    let level = if on_air.is_empty() { 0 } else { fit_level(ui.available_width(), 2, 1, |l| share.width(ui) + audio_at(l).width(ui)) };
+    let audio = audio_at(level);
     let slots = [fixed(share.width(ui)), fixed(audio.width(ui)), FILL];
     let row = HBox::new("action_bar", theme::CTL_H_LG).gap(theme::S2).slots(&slots).show(ui);
     let share_clicked = row.show(ui, 0, Align::Min, |ui| share.show_sized(ui, row.cell(0).width())).clicked();
     row.show(ui, 1, Align::Min, |ui| audio.show_sized(ui, row.cell(1).width()));
-    if !others.is_empty() {
-        let names: Vec<String> = others.iter().map(|r| cx.room_name(*r)).collect();
+    if !on_air.is_empty() {
+        let names: Vec<String> = on_air.iter().map(|r| cx.room_name(*r)).collect();
         let text = tr_with("ui.bar.live_elsewhere", "Your screen is live in %{rooms}", &[("rooms", &names.join(", "))]);
         let c = row.cell(2);
         paint_text(ui, Rect::from_x_y_ranges(c.left() + theme::S1..=c.right(), c.y_range()), &text, t2_font(false), theme::TEXT_DIM, Align::Min);
@@ -122,10 +166,16 @@ fn staged(ui: &mut Ui, cx: &mut Cx, room: RoomHandle, capture: CaptureSourceId, 
     let settings_l = tr("ui.bar.stream_settings", "Stream settings");
     let discard_l = tr("ui.bar.discard", "Discard");
     let go_l = tr("ui.bar.go_live", "Go live");
-    let settings = Btn::secondary(&settings_l).icon("tune").large().enabled(!picking);
-    let discard = Btn::secondary(&discard_l).large();
-    let go = Btn::primary(&go_l).icon("cast").large().enabled(!picking);
-    let audio = AudioSlot::new(ui, staged_audio.as_ref().map(|a| a.name.clone()), false, None, !picking);
+    let staged_name = staged_audio.as_ref().map(|a| a.name.clone());
+    // Degradation order: see "Narrow windows" in the module doc.
+    let settings_at = |l: usize| icon_only(Btn::secondary(&settings_l).icon("tune").large().enabled(!picking), l >= 1, &settings_l);
+    let audio_at = |l: usize| AudioSlot::new(ui, staged_name.clone(), false, None, !picking, l >= 2);
+    let discard_at = |l: usize| if l >= 3 { Btn::secondary("").icon("close").large().tip(&discard_l) } else { Btn::secondary(&discard_l).large() };
+    let go_at = |l: usize| icon_only(Btn::primary(&go_l).icon("cast").large().enabled(!picking), l >= 4, &go_l);
+    let level = fit_level(ui.available_width(), 6, 4, |l| {
+        84.0 + audio_at(l).width + settings_at(l).width(ui) + 1.0 + discard_at(l).width(ui) + go_at(l).width(ui)
+    });
+    let (settings, audio, discard, go) = (settings_at(level), audio_at(level), discard_at(level), go_at(level));
     let slots = [
         fixed(84.0),
         FILL,
@@ -189,10 +239,20 @@ fn live(ui: &mut Ui, cx: &mut Cx, room: RoomHandle, capture: CaptureSourceId, de
     let rooms_l = rooms_count(n_rooms);
     let rooms_tip = tr("ui.bar.rooms_tip", "Rooms this stream goes to");
     let stop_l = tr("ui.bar.stop_sharing", "Stop sharing");
-    let settings = Btn::secondary(&settings_l).icon("tune").large();
-    let rooms = Btn::secondary(&rooms_l).icon("cast").trailing("expand_more").large().tip(&rooms_tip);
-    let stop = Btn::danger_solid(&stop_l).icon("stop_screen_share").large();
-    let audio = AudioSlot::new(ui, audio_name, muted, Some(lit), true);
+    let rooms_n = n_rooms.to_string();
+    let rooms_tip_full = format!("{rooms_l}\n{rooms_tip}");
+    // Degradation order: see "Narrow windows" in the module doc.
+    let settings_at = |l: usize| icon_only(Btn::secondary(&settings_l).icon("tune").large(), l >= 1, &settings_l);
+    let rooms_at = |l: usize| {
+        let (label, tip) = if l >= 2 { (&rooms_n, &rooms_tip_full) } else { (&rooms_l, &rooms_tip) };
+        Btn::secondary(label).icon("cast").trailing("expand_more").large().tip(tip)
+    };
+    let audio_at = |l: usize| AudioSlot::new(ui, audio_name.clone(), muted, Some(lit), true, l >= 3);
+    let stop_at = |l: usize| icon_only(Btn::danger_solid(&stop_l).icon("stop_screen_share").large(), l >= 4, &stop_l);
+    let level = fit_level(ui.available_width(), 6, 4, |l| {
+        84.0 + audio_at(l).width + settings_at(l).width(ui) + rooms_at(l).width(ui) + 1.0 + stop_at(l).width(ui)
+    });
+    let (settings, rooms, audio, stop) = (settings_at(level), rooms_at(level), audio_at(level), stop_at(level));
     let slots = [
         fixed(84.0),
         FILL,
@@ -259,6 +319,10 @@ struct AudioSlot {
     /// Meter bars lit; `None` = no meter (a staged choice isn't capturing yet).
     lit: Option<u8>,
     enabled: bool,
+    /// Narrow bar: icon-only `Share audio ▾`, shorter source name.
+    compact: bool,
+    /// The source name is cut short (its full form goes in the tooltip).
+    truncated: bool,
     width: f32,
     label_w: f32,
 }
@@ -272,27 +336,34 @@ struct AudioOut {
 const AUDIO_MUTE_W: f32 = 36.0;
 const AUDIO_PAD: f32 = 10.0;
 const AUDIO_NAME_MAX: f32 = 150.0;
+/// [`AUDIO_NAME_MAX`] in a narrow bar.
+const AUDIO_NAME_MAX_COMPACT: f32 = 64.0;
 
 impl AudioSlot {
-    fn new(ui: &Ui, name: Option<String>, muted: bool, lit: Option<u8>, enabled: bool) -> Self {
+    fn new(ui: &Ui, name: Option<String>, muted: bool, lit: Option<u8>, enabled: bool, compact: bool) -> Self {
+        let mut truncated = false;
         let (width, label_w) = match &name {
             None => {
                 let l = tr("ui.bar.share_audio", "Share audio");
-                (Btn::secondary(&l).icon("volume_up").trailing("expand_more").large().width(ui), 0.0)
+                let l = if compact { "" } else { l.as_str() };
+                (Btn::secondary(l).icon("volume_up").trailing("expand_more").large().width(ui), 0.0)
             }
             Some(n) => {
-                let lw = text_width(ui, n, font(Weight::Bold, 12.5), 0.0).ceil().min(AUDIO_NAME_MAX);
+                let full = text_width(ui, n, font(Weight::Bold, 12.5), 0.0).ceil();
+                let lw = full.min(if compact { AUDIO_NAME_MAX_COMPACT } else { AUDIO_NAME_MAX });
+                truncated = lw < full;
                 let meter_w = if lit.is_some() { theme::S2 + 23.0 } else { 0.0 };
                 (AUDIO_MUTE_W + 1.0 + AUDIO_PAD + lw + meter_w + theme::S2 + theme::ICON_BTN + AUDIO_PAD, lw)
             }
         };
-        Self { name, muted, lit, enabled, width, label_w }
+        Self { name, muted, lit, enabled, compact, truncated, width, label_w }
     }
 
     fn show(&self, ui: &mut Ui, cell: Rect) -> AudioOut {
         let Some(name) = &self.name else {
             let l = tr("ui.bar.share_audio", "Share audio");
             let b = Btn::secondary(&l).icon("volume_up").trailing("expand_more").large().enabled(self.enabled);
+            let b = icon_only(b, self.compact, &l);
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(cell));
             let open = b.show_sized(&mut child, cell.width()).clicked();
             return AudioOut { mute: false, open, anchor: cell };
@@ -337,7 +408,8 @@ impl AudioSlot {
             tr("ui.bar.mute_audio", "Mute shared audio")
         };
         let mute = mute.on_hover_text(mute_tip);
-        let src = src.on_hover_text(tr("ui.bar.change_audio", "Change audio source"));
+        let change = tr("ui.bar.change_audio", "Change audio source");
+        let src = src.on_hover_text(if self.truncated { format!("{name}\n{change}") } else { change });
         AudioOut {
             mute: mute.clicked(),
             open: src.clicked(),
