@@ -2806,20 +2806,17 @@ impl AppState {
 
     /// Rename the `RoomStore` entry for `join_string` to `new_name`.
     ///
-    /// `Why` remove-then-upsert rather than a plain `upsert`: `RoomStore` is
-    /// keyed by *name*, so upserting under a new name would leave the old
-    /// entry behind and the sidebar would show the same room twice — once
-    /// connected, once as a stale saved row.
+    /// `RoomStore` is keyed by the room's identity (not its name), so this
+    /// touches exactly the one entry for that room. A room that isn't saved
+    /// yet is saved under `new_name` (the Auto-Connect checkbox relies on
+    /// this for an unsaved live room). A blank name is ignored.
     pub fn rename_saved_room(&mut self, join_string: &str, new_name: String) {
-        if let Some(old) = self.room_store.name_for(join_string).map(str::to_string)
-            && old != new_name
-        {
-            self.room_store.remove(&old);
+        if self.room_store.get(join_string).is_some() {
+            self.room_store.rename(join_string, &new_name);
+        } else {
+            self.room_store.upsert(new_name, join_string.to_string());
         }
-        self.room_store.upsert(new_name, join_string.to_string());
-        if let Err(e) = self.room_store.save() {
-            self.room_store_error = Some(e.to_string());
-        }
+        self.save_room_store();
     }
 
     /// Set the `RoomStore` entry for `join_string`'s `auto_connect` flag —
@@ -2917,7 +2914,7 @@ impl AppState {
     /// Whether `join_string` is the room a connect is currently in flight for
     /// — what puts a saved row into the amber "reconnecting" state.
     pub fn is_reconnecting(&self, join_string: &str) -> bool {
-        self.pending_connect.as_ref().is_some_and(|p| p.join_string == join_string)
+        self.pending_connect.as_ref().is_some_and(|p| RoomStore::same_room(&p.join_string, join_string))
     }
 
     /// Drain one entry off `auto_connect_queue` into `pending_connect`, if
@@ -3359,10 +3356,11 @@ impl AppState {
     /// `Why:` unconditional `upsert` (not "only if not already saved", which
     /// is `poll_connect_result`'s own guard): a name typed into the Join or
     /// Create form is a deliberate choice by the user for *this* join, so it
-    /// should win even if this join string happened to already have a saved
-    /// name. `upsert` keys by name (not join string), so this can only
-    /// overwrite a room already saved under this exact name — it can't
-    /// collide with some other saved room under a different name.
+    /// wins over a name this room already had saved. `RoomStore::upsert` keys
+    /// by room identity (join string minus cert hash), so a room that is
+    /// already saved is updated in place (typed name, newest join string) and
+    /// never duplicated; a blank `room_name` keeps the existing name and only
+    /// refreshes the stored join string.
     fn seed_room_name(&mut self, room_name: String, join_string: String) {
         self.room_store.upsert(room_name, join_string);
         self.save_room_store();
@@ -3381,7 +3379,10 @@ impl AppState {
             self.display_name = display_name;
         }
         let room_name = room_name.trim().to_string();
-        if !room_name.is_empty() {
+        // Also refresh an already-saved room's stored join string (e.g. a
+        // fresh cert hash) when no name was typed; an unsaved room with a
+        // blank name stays unsaved until the connect succeeds.
+        if !room_name.is_empty() || self.room_store.get(&join_string).is_some() {
             self.seed_room_name(room_name, join_string.clone());
         }
         self.start_connect(join_string, true)
@@ -3445,9 +3446,7 @@ impl AppState {
     /// A join string that isn't saved is a no-op that still re-saves (and
     /// reports any sticky store error).
     pub fn forget_room(&mut self, join_string: &str) -> Result<(), String> {
-        if let Some(name) = self.room_store.name_for(join_string).map(str::to_string) {
-            self.room_store.remove(&name);
-        }
+        self.room_store.remove(join_string);
         self.save_room_store();
         self.room_store_result()
     }
@@ -3957,6 +3956,102 @@ mod ui_ops_tests {
         let reloaded = RoomStore::load().unwrap();
         assert_eq!(reloaded.rooms.len(), 1, "deletion must be persisted to disk immediately");
         assert_eq!(reloaded.rooms[0].name, "Gaming Night");
+    }
+
+    fn room_link(id: u8, hash: Option<&[u8]>) -> String {
+        let hash = hash.map(crate::protocol::cert_hash_of_der);
+        crate::net::format_join_string_with_hash("192.0.2.1:4433", &[id; 16], &[0x42u8; 32], hash.as_ref())
+    }
+
+    /// Bug #31 at the `AppState` level: the same link joined under two names
+    /// is one saved room (the second name wins), and rename / forget /
+    /// auto-connect then act on that one entry, persisted to disk.
+    #[tokio::test(start_paused = true)]
+    async fn one_saved_room_per_link_across_join_rename_autoconnect_and_forget() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        let js = room_link(1, None);
+
+        state.join_room(js.clone(), String::new(), "MovieNight".to_string()).unwrap();
+        state.cancel_connect();
+        state.join_room(js.clone(), String::new(), "Films".to_string()).unwrap();
+        state.cancel_connect();
+        assert_eq!(state.room_store.rooms.len(), 1);
+        assert_eq!(state.room_store.rooms[0].name, "Films");
+
+        // A rejoin with a fresh cert hash and no typed name: same entry, same
+        // name, newest link stored.
+        let rotated = room_link(1, Some(b"rotated cert"));
+        state.join_room(rotated.clone(), String::new(), String::new()).unwrap();
+        state.cancel_connect();
+        assert_eq!(state.room_store.rooms.len(), 1);
+        assert_eq!(state.room_store.rooms[0].name, "Films");
+        assert_eq!(state.room_store.rooms[0].join_string, rotated);
+
+        // A second, unrelated room so "exactly one" is observable.
+        state.rename_saved_room(&room_link(2, None), "Other".to_string());
+        assert_eq!(state.room_store.rooms.len(), 2);
+
+        // Any spelling of the link addresses the same single entry.
+        state.rename_saved_room(&js, "Cinema".to_string());
+        state.set_room_auto_connect(&js, true);
+        assert_eq!(state.room_store.rooms[0].name, "Cinema");
+        assert!(state.room_store.rooms[0].auto_connect);
+        assert_eq!(state.room_store.rooms[1].name, "Other");
+        assert!(!state.room_store.rooms[1].auto_connect);
+        let on_disk = RoomStore::load().unwrap();
+        assert_eq!(on_disk.rooms.len(), 2);
+        assert_eq!(on_disk.rooms[0].name, "Cinema");
+
+        state.forget_room(&js).unwrap();
+        assert_eq!(state.room_store.rooms.len(), 1);
+        assert_eq!(state.room_store.rooms[0].name, "Other");
+        assert_eq!(RoomStore::load().unwrap().rooms.len(), 1, "forget must be persisted");
+    }
+
+    /// The `RoomKey` guarantee (key = stored join string): joining, renaming
+    /// or re-joining under another name never changes it.
+    #[tokio::test(start_paused = true)]
+    async fn saved_room_key_is_stable_across_name_only_changes() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        let js = room_link(1, Some(b"cert"));
+
+        state.join_room(js.clone(), String::new(), "A".to_string()).unwrap();
+        state.cancel_connect();
+        state.join_room(js.clone(), String::new(), "B".to_string()).unwrap();
+        state.cancel_connect();
+        state.rename_saved_room(&js, "C".to_string());
+
+        assert_eq!(state.room_store.rooms.len(), 1);
+        assert_eq!(state.room_store.rooms[0].join_string, js);
+        assert_eq!(state.room_store.rooms[0].name, "C");
+    }
+
+    /// A `rooms.toml` that already has duplicates is merged on load and the
+    /// cleaned file is written back.
+    #[tokio::test]
+    async fn loading_a_rooms_file_with_duplicates_merges_and_saves_them() {
+        let _home = isolated_config_home();
+        let old = room_link(1, Some(b"old"));
+        let new = room_link(1, Some(b"new"));
+        let store = RoomStore {
+            rooms: vec![
+                crate::rooms::SavedRoom { name: "MovieNight".to_string(), join_string: old, auto_connect: true },
+                crate::rooms::SavedRoom { name: "Films".to_string(), join_string: new.clone(), auto_connect: false },
+            ],
+        };
+        store.save().unwrap();
+
+        let state = AppState::default();
+        assert_eq!(state.room_store.rooms.len(), 1);
+        assert_eq!(state.room_store.rooms[0].name, "Films");
+        assert_eq!(state.room_store.rooms[0].join_string, new);
+        assert!(state.room_store.rooms[0].auto_connect);
+
+        // Written back: a raw read of the file sees one entry.
+        let raw = std::fs::read_to_string(RoomStore::config_path()).unwrap();
+        assert_eq!(raw.matches("[[rooms]]").count(), 1);
     }
 
     #[tokio::test]

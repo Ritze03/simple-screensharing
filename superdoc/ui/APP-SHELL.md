@@ -345,8 +345,8 @@ immediately; on success the room is upserted into the store — under the typed 
 one was given, otherwise an id-derived name (see "Field reorder + Room Name on Join tab"
 below) — and appears live in the list; on failure the card stays open with the error
 inline and **nothing is saved**. The Stream Control tab's "Room name" row can still rename
-that entry afterwards (remove-then-upsert, since `RoomStore` is keyed by name and a plain
-upsert would leave the old entry behind as a phantom second row).
+that entry afterwards (`RoomStore::rename`; the store is keyed by room identity, not name —
+see "Saved-room identity (2026-10-14)" at the end of this page).
 
 **Create tab (2026-07-28).** Room Name + Server IP (Room Name first as of the 2026-07-28
 field reorder below — see that note for why), `[Create]`/`[Cancel]`, wired to a new
@@ -410,8 +410,9 @@ call this pass didn't override.
   (matching `create_room_impl`'s own unconditional call), not "only if not already saved"
   (`poll_connect_result`'s own guard) — a name typed into the Join tab is treated as a
   deliberate override for this join, same as Create's Room Name always has been; `upsert`
-  keys by name (not join string), so this can only overwrite a room already saved under
-  that exact name, not collide with an unrelated one. `create_room_impl` itself now passes
+  keys by room identity (join string minus cert hash), so a link already saved under
+  another name is renamed in place, never duplicated (it used to be keyed by name, which
+  made that case create a second entry — fixed 2026-10-14). `create_room_impl` itself now passes
   `String::new()` for this new parameter into `join_room_impl` (it already pre-seeded the
   name itself, before this parameter existed, so this keeps that pre-seed the sole write).
   `api_server.rs`'s HTTP dispatch table gained a matching `opt_string` helper (mirrors the
@@ -606,3 +607,27 @@ restart-to-apply hint), relocated and restyled, plus a DISPLAY NAME card added
   room-row carets are therefore `⏵` U+23F5 / `⏷` U+23F7 (Miscellaneous Technical), which
   render, are a matched pair at caret size, and stay visually distinct from the `▶` watch
   glyph. Check any new icon this way before adding it.
+
+## Saved-room identity (2026-10-14)
+
+One saved room per room. `RoomStore` (`client/src/rooms.rs`) identifies an entry by
+`room_identity(join_string)`: server + room id + key, **without** the optional 4th cert-hash
+field (parsed via `net::parse_join_string`, re-encoded canonically; an unparseable legacy
+string falls back to its first three `|` fields). `upsert`, `get`, `name_for`, `rename`,
+`remove` and `set_auto_connect` all go through it, so each touches exactly one entry.
+
+`Why` not keyed by name: names are free local nicknames, so name-keying let one link joined
+as "MovieNight" then "Films" become two entries (both shown connected, one leave dropping
+both, forget removing only one). `Why` not the whole string: the relay's cert hash rotates;
+a rotated cert must update the entry, not add a second one.
+
+- `upsert(name, js)` on an existing room: non-blank `name` wins (blank keeps the old one),
+  stored join string becomes `js` (newest form), `auto_connect` untouched.
+- Migration: `RoomStore::load` calls `merge_duplicates` and writes the file back if
+  anything merged. Per duplicate group: first entry's position, **last** non-blank name,
+  last entry's join string, `auto_connect` OR-ed. `Why` last: the file has no timestamps and
+  the old store appended on every new name / rename, so file order is the recency signal.
+- UI `RoomKey` = the saved entry's stored (connectable) join string. It is stable across
+  name-only upserts and re-saves of the identical string; it changes only when a different
+  spelling of the same room (new cert hash) replaces it. `RoomStore::same_room(a, b)`
+  compares two join strings by identity, for UI code matching a live session to a key.
