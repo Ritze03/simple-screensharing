@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Simple Screensharing
+GenericName=Screen sharing
+Comment=Share your screen and audio with friends, or watch theirs
+Exec=simple-screensharing-client
+Icon=simple-screensharing
+Terminal=false
+Categories=AudioVideo;
+# The egui app sets its Wayland app_id / X11 class to this.
+StartupWMClass=simple-screensharing

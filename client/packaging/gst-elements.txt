@@ -1,0 +1,36 @@
+# Elements that must resolve from the BUNDLED plugin set (build-in-container.sh runs
+# gst-inspect-1.0 against the AppDir with host plugins disabled). One per line.
+# The va* elements are not listed: they are registered per VA device at plugin
+# load, so they only exist where a GPU render node does (not in the build container).
+# They are checked by the real-hardware test, see README.md.
+appsrc
+appsink
+queue
+tee
+valve
+capsfilter
+videoconvert
+videoscale
+videorate
+videoflip
+videotestsrc
+audioconvert
+audioresample
+audiotestsrc
+volume
+capssetter
+level
+opusenc
+opusdec
+jpegdec
+h264parse
+h265parse
+av1parse
+pipewiresrc
+pipewiresink
+autoaudiosink
+pulsesink
+x264enc
+avdec_h264
+avdec_h265
+av1dec

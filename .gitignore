@@ -7,3 +7,6 @@ client/.playwright-mcp/
 # relay-generated TLS cert/key (server/src/cert.rs); secret, never commit
 /state/
 /server/state/
+
+# AppImage / relay tarball output of build-appimage.sh
+/dist/
