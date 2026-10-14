@@ -143,6 +143,19 @@ struct Chain {
     sw_decoder: &'static str,
 }
 
+/// The hardware decoder factory for this platform: VA on Linux and other
+/// Unixes, Direct3D 11 (`d3d11*dec`, gst-plugins-bad's `d3d11` plugin) on
+/// Windows. Both are tried first and demoted to the software decoder by the
+/// same probation logic, so a machine without a usable GPU decoder (a VM with
+/// only a basic display adapter, say) still plays everything through libav.
+///
+/// Why D3D11 and not D3D12 (`d3d12h264dec`): the D3D11 decoders have shipped
+/// in every GStreamer 1.2x Windows build and work on every vendor's driver;
+/// the D3D12 ones are newer and need a D3D12 video-decode capable adapter.
+const fn hw(va: &'static str, d3d11: &'static str) -> &'static str {
+    if cfg!(windows) { d3d11 } else { va }
+}
+
 fn chain(codec: VideoCodec) -> Chain {
     let annex_b = |media: &str| {
         Caps::builder(media)
@@ -154,13 +167,13 @@ fn chain(codec: VideoCodec) -> Chain {
         VideoCodec::H264 => Chain {
             appsrc_caps: annex_b("video/x-h264"),
             parse: "h264parse",
-            hw_decoder: "vah264dec",
+            hw_decoder: hw("vah264dec", "d3d11h264dec"),
             sw_decoder: "avdec_h264",
         },
         VideoCodec::H265 => Chain {
             appsrc_caps: annex_b("video/x-h265"),
             parse: "h265parse",
-            hw_decoder: "vah265dec",
+            hw_decoder: hw("vah265dec", "d3d11h265dec"),
             sw_decoder: "avdec_h265",
         },
         VideoCodec::Av1 => Chain {
@@ -169,7 +182,7 @@ fn chain(codec: VideoCodec) -> Chain {
                 .field("alignment", "tu")
                 .build(),
             parse: "av1parse",
-            hw_decoder: "vaav1dec",
+            hw_decoder: hw("vaav1dec", "d3d11av1dec"),
             // libaom, wrapped by gst-plugins-bad's `av1`. (No dav1d on this
             // machine; if `dav1ddec` is ever present it is the faster choice.)
             sw_decoder: "av1dec",

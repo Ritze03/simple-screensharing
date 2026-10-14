@@ -128,12 +128,20 @@ fn main() -> anyhow::Result<()> {
         // with the override that forces `AutoVsync` for this run (the stored
         // setting is left alone).
         tracing::warn!("presentation mode {presentation_mode:?} is not supported by this surface; relaunching with Vsync");
-        use std::os::unix::process::CommandExt;
-        let err = std::process::Command::new(std::env::current_exe()?)
-            .args(std::env::args_os().skip(1))
-            .env(PRESENT_FALLBACK_ENV, "1")
-            .exec();
-        return Err(err.into());
+        let mut relaunch = std::process::Command::new(std::env::current_exe()?);
+        relaunch.args(std::env::args_os().skip(1)).env(PRESENT_FALLBACK_ENV, "1");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            return Err(relaunch.exec().into());
+        }
+        // Windows has no `exec`: run the second instance to completion as a
+        // child and exit with its status (the first window is already gone).
+        #[cfg(not(unix))]
+        {
+            let status = relaunch.status()?;
+            std::process::exit(status.code().unwrap_or(1));
+        }
     }
     result?;
     Ok(())
