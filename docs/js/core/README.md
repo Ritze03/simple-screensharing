@@ -207,7 +207,7 @@ Behaviour that matches the native sender:
 | `crypto.js` | AES-256-GCM via WebCrypto; `NonceSequence` (ONE u32 counter per connection shared by video, audio and previews, never wraps: the last legal value is `0xFFFFFFFF`, then `NonceSpaceExhausted` and the room client reconnects with a fresh ConnId); AAD `[version, stream_id]` |
 | `fragment.js` | `fragmentFrame` (encrypt once, then split to <= 1000 bytes including the header) and `Reassembler` (drops a frame on any missing fragment, in-flight cap 2, 200 ms staleness, straggler floor, reports drops) |
 | `codec.js` | codec sniffing (H.264/H.265/AV1) and WebCodecs codec strings from the SPS / sequence header (`avc1.PPCCLL`, `hev1…`, `av01…`) |
-| `jitter.js` | adaptive jitter buffer (RFC 3550 EWMA, growth cap, `catchUpSpeedPercent` shrink cap, decode-queue backstop) ported from the Electron `tile-video.js`, one timer drains all due chunks |
+| `jitter.js` | adaptive jitter buffer (RFC 3550 EWMA, growth cap, `catchUpSpeedPercent` shrink cap, decode-queue backstop) ported from the desktop client's former WebCodecs `tile-video.js` (replaced by the native decoder), one timer drains all due chunks |
 | `video-rx.js` | per-stream receive pipeline (`VideoReceiver`: loss gate -> jitter buffer -> `VideoDecoder`, reconfigures on codec change, recovers from decoder errors) and `CanvasRenderer` |
 | `video-tx.js` | `VideoSender` (track -> `VideoEncoder`, keyframe policy, static-source keepalive, AV1 shaping), `probeEncoders`, `ENCODER_PRESETS`, `MediaClock` |
 | `audio.js` | `AudioReceiver` (Opus `AudioDecoder` -> WebAudio, PTS-placed playback, gain 0..2) and `AudioSender` (`AudioEncoder`) |

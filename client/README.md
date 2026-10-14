@@ -1,80 +1,60 @@
 # simple-screensharing-client
 
-Desktop client for the simple-screensharing platform — share your screen (and mic) or
-watch others', end-to-end encrypted. An Electron app shell (`electron/`) driving an
-HTML/CSS/JS frontend (`frontend/`), backed by a headless Rust/Tauri sidecar process
-(`src-tauri/`) that does the real work: screen/audio capture, hardware/software encode,
-encrypt, and the reverse (decode/decrypt/display) for watching others. The Electron
-renderer and the sidecar talk over a local REST+SSE API, not Tauri IPC.
+The native desktop client: one Rust binary with an egui UI. Share your screen (and an
+app's audio) to one or more rooms, or watch others', end to end encrypted; the relay
+(`../server/`) only forwards ciphertext. Linux first (Wayland portal + PipeWire, VA-API
+GPU encode and decode); Windows is in progress, see `../superdoc/features/windows.md`.
 
-## Features
+## What it does
 
-- **Screen and audio sharing**, to one or more rooms at once, with live per-destination
-  fan-out, transfer between rooms, and mid-stream resolution/framerate/bitrate edits.
-- **Codec selection** — H.264, AV1, or H.265, user-selectable per stream. Options
-  unsupported by the local hardware/VAAPI driver are automatically grayed out.
-- **Four encoder presets** — Low-Latency, Balanced (default), Quality, Gaming — each a
-  combination of Tune, Quality Level, Rate Control and (for Gaming) a shorter keyframe
-  interval; the Advanced section below the preset pills lets any of those be hand-tuned
-  independently.
-- **Rate Control modes** — "Efficient" (constant-quality CQP: conservative, predictable
-  bandwidth use) and "Max Quality" (VBR-tuned: spends up to the configured bitrate
-  ceiling for the best achievable quality, the default).
-- Automatic VAAPI hardware encoding with software (`x264enc`) fallback.
-- Multi-room, multi-stream viewing with pop-out windows per stream.
+- **Share** a screen and/or one application's audio to several rooms at once (fan-out,
+  move a stream between rooms, edit resolution / fps / bitrate while live).
+- **Codecs** H.264, H.265, AV1 (picked per stream; options the GPU cannot do are greyed
+  out), four encoder presets (Low-Latency, Balanced, Quality, Gaming) plus hand tuning.
+  Hardware VA-API encode with a software `x264enc` fallback.
+- **Watch** many streams: hardware decode (software fallback), NV12 uploaded to the GPU and
+  converted in a shader, per-stream pop-out windows.
+- **Reconnects by itself** after a dropped connection and restores watches and shares.
+- 240 fps end to end is reached: H.265 with VA encode and decode, AV1 and H.264 Gaming
+  presets about 240 with the Performance setting.
 
-## Architecture
+## Build and run
 
-Two OS processes, not one:
-
-- **Electron process (parent)** — `electron/main.js` is the app shell: a `BrowserWindow`
-  loading `frontend/index.html` as the renderer. On startup it spawns the compiled
-  `src-tauri` binary as a child process ("the sidecar"), waits for it to report its
-  locally-bound API port and start accepting connections, then opens the window. Every
-  frontend `invoke()` call is forwarded to the sidecar's `POST /command/<name>`
-  (bearer-token authenticated); every backend event arrives over a single `GET /events`
-  Server-Sent-Events stream.
-- **Rust sidecar process (child)** — `src-tauri/`, a headless Tauri app (`visible: false`)
-  built around `src-tauri/src/api_server.rs`, a small REST+SSE server in front of the
-  same command surface and capture/network/decode pipeline the project's Rust code
-  implements (`src/capture.rs`, `src/audio.rs`, `src/net.rs`, `src/protocol.rs`, etc.).
-
-See `superdoc/architecture/overview.md` (one directory up, in the `simple-screensharing`
-planning workspace) for the full data-flow and module map.
-
-## Prerequisites
-
-- Rust (stable, 2024 edition) with the workspace's `src-tauri` member buildable.
-- Node.js + npm, for the `electron/` shell.
-- Linux: GStreamer with VAAPI plugins (`vah264enc`/`vah265enc`/`av1enc` as available) for
-  hardware encoding; falls back to software (`x264enc`) automatically if unavailable.
-
-## Development
+Needs a Rust toolchain and GStreamer (with the VA plugins for hardware codecs; `check-deps.sh`
+reports what is missing). From the repo root:
 
 ```bash
-cargo build -p simple-screensharing-client-tauri   # build the sidecar
-cd electron
-[ -d node_modules ] || npm install
-electron .                                          # launch the real app
+cargo run -p simple-screensharing-server     # relay; its TUI needs a tty, port 4433, cert state in ./state/ of the cwd
+cargo run -p simple-screensharing-client     # the app (--release for frame-rate work)
+cargo run -p simple-screensharing-client -- --gallery   # every widget with fake data (design QC only)
 ```
 
-See `.claude/skills/run/SKILL.md` for the tested, scripted-verification recipe (Playwright's
-`_electron` driver), including the safety rules around monitor placement during testing.
+Create a room in the client, copy the join link (`server|room-id|key|certhash`) and join
+from a second client or from the browser client in `../docs/`.
 
-## Packaging
+## AppImage
 
-- **Linux AppImage** — self-contained, via `electron-builder`:
-  ```bash
-  cd electron && npm run build:appimage
-  ```
-  or, from the monorepo root, the wrapper script:
-  ```bash
-  ./build-appimage.sh
-  ```
-  (builds the sidecar in release mode, then packages it with `electron-builder`; output
-  lands in `dist/`).
-- **Windows `.exe`** — built natively on a `windows-latest` GitHub Actions runner (see
-  `.github/workflows/windows-build.yml`), packaged as an `electron-builder --win portable`
-  build alongside the cross-compiled (`x86_64-pc-windows-msvc`) sidecar and its GStreamer
-  runtime DLLs. Not committed to the repo — delivered as a GitHub Release asset (rolling
-  `windows-dev-build` tag, recreated on each run) rather than a repo file.
+`./build-appimage.sh` (repo root) builds a self-contained Linux AppImage in a Debian 13
+container, bundling GStreamer 1.26; GPU drivers, libva, PipeWire and the portal come from
+the host. Supported hosts, build steps and the reasoning: [`packaging/README.md`](packaging/README.md).
+
+## Where the code lives
+
+| Path | What |
+| --- | --- |
+| `src/ui/` | the egui app shell, screens and modals (`mod.rs` is the map), `apply.rs` is the one place UI actions change state |
+| `src/widgets/` | pure egui building blocks (vbox/hbox/slot rows) and `gallery.rs`; `src/theme.rs` design tokens |
+| `src/session.rs` | `AppState`: rooms, captures, destinations, watches, reconnect; the UI is a thin view over it |
+| `src/capture.rs`, `src/audio.rs` | screen / audio capture and encode pipelines |
+| `src/decode/`, `src/decode.rs` | codec sniffing, VA/software decode, the GPU renderer (`render.rs`) |
+| `src/net.rs`, `src/fragment.rs`, `src/protocol.rs` | QUIC, encryption, fragmentation; wire types come from `../protocol/` |
+| `scripts/` | scripted real-app test helpers ([`scripts/README.md`](scripts/README.md)) |
+
+Full module map and data flow: [`../superdoc/architecture/overview.md`](../superdoc/architecture/overview.md).
+
+## Testing
+
+`cargo test -p simple-screensharing-client` is necessary but not sufficient. User-visible
+changes are verified against the real binary and a real relay on a real compositor, never
+the gallery alone. Rules and machine safety: [`../superdoc/claude-instructions/testing-and-verification.md`](../superdoc/claude-instructions/testing-and-verification.md);
+launch recipe: [`.claude/skills/run/SKILL.md`](.claude/skills/run/SKILL.md).
