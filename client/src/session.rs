@@ -2569,6 +2569,33 @@ impl AppState {
         let Some(capture) = self.captures.get_mut(&capture_id) else {
             return;
         };
+        if matches!(capture.status, ShareStatus::Starting(_)) {
+            // Cancel a capture whose start is still in flight (e.g. the OS
+            // screen picker is open). Tear-down-on-arrival, not cancel-early:
+            // the start future lives in a spawned task that `ShareStatus` has
+            // no abort handle for, and the portal dialog can't be closed from
+            // here without changing `capture.rs`. So we swap to `Stopping`
+            // and let a task wait for the start result: if it comes up, stop
+            // the handle at once (closing the portal session, never going
+            // live and never attaching a destination); if it fails or the
+            // task died (user dismissed the picker), that's the desired
+            // outcome, not an error. `poll_capture_states` then reaps the
+            // entry and its destinations like any other stop.
+            let (tx, rx) = oneshot::channel();
+            let ShareStatus::Starting(start_rx) = std::mem::replace(&mut capture.status, ShareStatus::Stopping(rx))
+            else {
+                unreachable!("just matched Starting above");
+            };
+            tokio::spawn(async move {
+                let result = match start_rx.await {
+                    Ok(Ok(ShareHandle::Video(h))) => h.stop().await.map_err(|e| format!("{e:#}")),
+                    Ok(Ok(ShareHandle::Audio(h))) => h.stop().await.map_err(|e| format!("{e:#}")),
+                    Ok(Err(_)) | Err(_) => Ok(()),
+                };
+                let _ = tx.send(result);
+            });
+            return;
+        }
         if !matches!(capture.status, ShareStatus::Active(_)) {
             return;
         }
@@ -4120,6 +4147,51 @@ mod ui_ops_tests {
     async fn supported_codecs_always_offers_h264_first() {
         let codecs = AppState::supported_codecs();
         assert_eq!(codecs.first(), Some(&capture::VideoCodec::H264));
+    }
+
+    // ---- cancelling a capture whose start is still in flight ----
+
+    #[tokio::test]
+    async fn stopping_a_starting_capture_cancels_it_and_never_goes_live() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        let (capture_id, _dest) = insert_destination(&mut state);
+        // Replace the inert receiver with one we control (the "picker").
+        let (tx, rx) = oneshot::channel();
+        state.captures.get_mut(&capture_id).unwrap().status = ShareStatus::Starting(rx);
+
+        state.stop_share(capture_id);
+        assert!(matches!(state.captures[&capture_id].status, ShareStatus::Stopping(_)));
+
+        // The user picks nothing / the start fails after the discard.
+        assert!(tx.send(Err("picker closed".to_string())).is_ok());
+        for _ in 0..100 {
+            state.poll_capture_states();
+            if !state.captures.contains_key(&capture_id) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!state.captures.contains_key(&capture_id), "cancelled capture must be removed");
+        assert!(state.share_error.is_none(), "a cancelled start is not an error");
+        assert!(state.pending_destinations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stopping_a_starting_capture_whose_start_task_died_is_reaped() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        let (capture_id, _dest) = insert_destination(&mut state); // sender already dropped
+        state.stop_share(capture_id);
+        for _ in 0..100 {
+            state.poll_capture_states();
+            if !state.captures.contains_key(&capture_id) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!state.captures.contains_key(&capture_id));
+        assert!(state.share_error.is_none());
     }
 
     // ---- destination edits ----
