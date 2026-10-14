@@ -687,11 +687,14 @@ pub fn value_box(ui: &mut Ui, text: &str) -> Response {
 pub fn value_box_with<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), theme::CTL_H), Sense::hover());
     value_frame(ui, rect, false);
-    // Content-sized widgets (meter, icon) centred in the box: a top-down centred
-    // layout inside a rect whose top is offset so a widget of up to the box height
-    // ends up vertically centred by the `Align::Center` cross axis of a horizontal one.
-    let mut child = ui
-        .new_child(egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::left_to_right(Align::Center).with_main_align(Align::Center)));
+    // Content-sized widgets (meter, icon) centred in the box on both axes. Why
+    // `centered_and_justified`: a `left_to_right(Center).with_main_align(Center)` child
+    // only centres on the cross axis; egui ignores the main align of a non-justified
+    // horizontal layout, so the meter sat at the box's left edge (task #65). Justified,
+    // the widget's frame is the whole box and `allocate_exact_size` centres its rect in it.
+    let mut child = ui.new_child(
+        egui::UiBuilder::new().max_rect(rect).layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight)),
+    );
     child.shrink_clip_rect(rect);
     add(&mut child)
 }
