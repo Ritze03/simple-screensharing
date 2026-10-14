@@ -144,7 +144,7 @@ case "$STEP" in
       [[ -n "$(dump_get bitrate)" ]] || die "setup: no bitrate slider (absolute bandwidth mode?)"
       mclick bitrate -36; sleep 0.2                         # the row's 72 pt value box
       swaymsg "[pid=$(hs_pid_of client1)] focus" >/dev/null
-      wtype -M ctrl a -m ctrl "$kbps" -k Return
+      hs_type -M ctrl a -m ctrl "$kbps" -k Return
       dump_wait bitrate "$kbps" 3 || die "setup: bitrate is $(dump_get bitrate), wanted $kbps (wtype: keyboard capability/keymap issue? use START_KBPS at rig up)"
     fi
     log "setup: $(dump_get fps) fps, $(dump_get codec), $(dump_get preset), $(dump_get bitrate) kbps"
@@ -179,7 +179,7 @@ case "$STEP" in
     grim -g "$((ox + $3)),$((oy + $4)) ${5}x${6}" "${1:?FILE}" ;;
   click)     wclick "$1" "$2" "$3" ;;
   move)      wmove "$1" "$2" "$3" ;;
-  key)       n="${1:?N}"; shift; swaymsg "[pid=$(hs_pid_of "client$n")] focus" >/dev/null; wtype "$@" ;;
+  key)       n="${1:?N}"; shift; swaymsg "[pid=$(hs_pid_of "client$n")] focus" >/dev/null; hs_type "$@" ;;
   tree)      swaymsg -t get_tree | jq -r '.nodes[] | select(.type=="output") | .name as $o | [.. | objects | select(.type? == "con" and .pid? != null)] | .[] | "\($o)\t\(.name)\tpid \(.pid)\t\(.rect)"' ;;
   *) die "unknown step $STEP" ;;
 esac
