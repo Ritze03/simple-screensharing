@@ -256,10 +256,15 @@ pub enum UiAction {
     ClosePopover,
 
     // --- rooms ------------------------------------------------------------
-    /// Connect / reconnect a saved room ("Connect", "Retry now").
+    /// Connect a saved room ("Connect").
     Connect(RoomKey),
-    /// Abort the in-flight connect.
-    CancelConnect,
+    /// "Retry now" on the Reconnecting banner: start this room's next
+    /// reconnect attempt immediately (`AppState::reconnect_now`).
+    RetryNow(RoomKey),
+    /// "Cancel" on the Reconnecting banner / "Leave" while reconnecting: stop
+    /// reconnecting this room (`AppState::cancel_reconnect`), or abort a
+    /// first-time connect to it. The room stays in the list, disconnected.
+    CancelReconnect(RoomKey),
     /// Join a pasted link; `room_name` (may be empty) is the local nickname.
     /// On success the room is selected and a `CreateJoin` modal closes; on
     /// failure `Shell::join_error` is set.
@@ -438,6 +443,15 @@ pub enum ShareState {
     Paused,
 }
 
+/// Our share's phase in one room ([`Cx::my_phase`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MyPhase {
+    /// Sending (Live, Rebuilding or Stalled).
+    OnAir,
+    /// No destination there is on air yet; at least one is Starting.
+    Starting,
+}
+
 /// What every screen gets: read access to all shared state, and the action
 /// queue. See the module docs for the contract.
 pub struct Cx<'a> {
@@ -545,7 +559,9 @@ impl<'a> Cx<'a> {
         share_state(self.state, self.shell, handle)
     }
 
-    /// Rooms one of our video captures is live in (for "Live in N rooms").
+    /// Rooms one of our video captures is live in **or still starting in**
+    /// (any destination). For "is something of ours in that room"; use
+    /// [`Self::on_air_rooms`] for "Live in N rooms".
     pub fn live_rooms(&self) -> Vec<RoomHandle> {
         let mut out: Vec<RoomHandle> = Vec::new();
         for c in self.state.captures.values().filter(|c| c.kind == StreamKind::Video) {
@@ -556,6 +572,29 @@ impl<'a> Cx<'a> {
             }
         }
         out
+    }
+
+    /// Where our share in `room` stands: `None` if nothing of ours is there.
+    /// `Why:` a destination stays `Starting` until its first frame (an idle
+    /// screen can take a long time); showing it as Live meanwhile was wrong.
+    pub fn my_phase(&self, room: RoomHandle) -> Option<MyPhase> {
+        let mut out = None;
+        for c in self.state.captures.values().filter(|c| c.kind == StreamKind::Video) {
+            for d in c.destinations.values().filter(|d| d.room == room) {
+                match c.destination_state(d) {
+                    DestinationState::Live | DestinationState::Rebuilding { .. } | DestinationState::Stalled { .. } => return Some(MyPhase::OnAir),
+                    DestinationState::Starting => out = Some(MyPhase::Starting),
+                    DestinationState::Failed(_) => {}
+                }
+            }
+        }
+        out
+    }
+
+    /// Rooms our screen is actually on air in (Live, Rebuilding or Stalled;
+    /// not Starting or Failed). For "Live in N rooms" and live badges.
+    pub fn on_air_rooms(&self) -> Vec<RoomHandle> {
+        self.live_rooms().into_iter().filter(|h| self.my_phase(*h) == Some(MyPhase::OnAir)).collect()
     }
 
     /// Our video captures that have at least one destination.
@@ -810,6 +849,9 @@ impl App {
             Some(rs) => simple_screensharing_client::decode::render::VideoRenderer::register(rs),
             None => tracing::error!("no wgpu render state: video tiles will stay black"),
         }
+        // SIGTERM/SIGINT/SIGHUP close the window, so `on_exit` leaves every
+        // room cleanly and peers drop us at once instead of on a timeout.
+        simple_screensharing_client::session::install_shutdown_signal_handlers(cc.egui_ctx.clone());
         Self::with_state(AppState::default())
     }
 
@@ -903,14 +945,27 @@ impl App {
         self.toast(tr_with("ui.toast.connected", "Connected to %{room}", &[("room", &name.to_string())]), "check_circle");
     }
 
-    /// Drop staged entries whose capture is gone; auto-open the settings
-    /// modal once the picker resolves (mockup `stage()`).
+    /// Drop staged entries whose capture is gone or whose room is gone (and
+    /// stop that capture: nothing else would); auto-open the settings modal
+    /// once the picker resolves (mockup `stage()`).
+    ///
+    /// `Why a reconnecting room keeps its staged share:` the handle is stable
+    /// across the outage (`ReconnectState::handle`), so the staged card simply
+    /// reappears when the room is back instead of re-prompting the OS picker.
     fn poll_staged(&mut self) {
         let state = &self.state;
+        let mut orphaned = Vec::new();
         self.shell.staged.retain(|room, s| {
-            state.rooms.contains_key(room)
-                && state.captures.get(&s.capture).is_some_and(|c| c.destinations.is_empty() && !matches!(c.status, ShareStatus::Stopping(_)))
+            let capture_ok = state.captures.get(&s.capture).is_some_and(|c| c.destinations.is_empty() && !matches!(c.status, ShareStatus::Stopping(_)));
+            let room_ok = state.rooms.contains_key(room) || state.reconnects.contains_key(room);
+            if capture_ok && !room_ok {
+                orphaned.push(s.capture);
+            }
+            capture_ok && room_ok
         });
+        for capture in orphaned {
+            self.state.stop_share(capture);
+        }
         let selected = match &self.nav.view {
             View::Room(key) => self.state.rooms.iter().find(|(_, r)| same_room(&r.join_string, key)).map(|(h, _)| *h),
             _ => None,
@@ -1087,10 +1142,11 @@ impl eframe::App for App {
         }
     }
 
-    /// Best effort graceful teardown of every running capture on quit (the
-    /// sync callback can't await `.stop()`; see `stop_all_captures_fire_and_forget`).
+    /// Clean exit: leave every room (`Leave` + close, so peers drop us at
+    /// once) and stop every capture, blocking up to 1.5 s. Also the path a
+    /// SIGTERM/SIGINT/SIGHUP takes (see `App::new`).
     fn on_exit(&mut self) {
-        self.state.stop_all_captures_fire_and_forget();
+        self.state.shutdown_blocking(std::time::Duration::from_millis(1500));
     }
 }
 
