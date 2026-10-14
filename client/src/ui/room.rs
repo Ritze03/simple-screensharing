@@ -206,7 +206,11 @@ pub fn show_header(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
     };
     let meta = r.handle.and_then(|h| cx.session(h).map(|s| (h, s.members.len()))).map(|(h, n)| {
         let sharing = cx.shares_in(h).len() + usize::from(matches!(cx.share_state(&r), ShareState::Live { .. }));
-        tr_with("ui.room.meta", "%{people} people · %{sharing} sharing", &[("people", &n.to_string()), ("sharing", &sharing.to_string())])
+        if n == 1 {
+            tr_with("ui.room.meta_one", "1 person · %{sharing} sharing", &[("sharing", &sharing.to_string())])
+        } else {
+            tr_with("ui.room.meta", "%{people} people · %{sharing} sharing", &[("people", &n.to_string()), ("sharing", &sharing.to_string())])
+        }
     });
     row.show(ui, 0, Align::Min, |ui| {
         let h2 = font(Weight::Bold, theme::FS_H2);
