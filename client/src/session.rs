@@ -65,7 +65,7 @@ use crate::capture::{self, CaptureHandle, DestKey};
 use crate::decode::{self, AudioDecoder, PreviewCache, StreamDecoder};
 use crate::net::{ClientEvent, DecryptedMediaFrame, PresenceSnapshotState, ScreenshareClient};
 use crate::protocol::{ConnId, Member, PresenceEvent, StreamId, StreamInfo, StreamKind};
-use crate::rooms::{AppSettings, BandwidthMode, PresentationMode, RoomStore};
+use crate::rooms::{AppSettings, BandwidthMode, PresentationMode, RoomStore, StartStreamDefaults};
 
 pub type ConnectResult = Result<(ScreenshareClient, PresenceSnapshotState, mpsc::UnboundedReceiver<ClientEvent>), String>;
 
@@ -256,7 +256,7 @@ pub struct DestinationId(pub u32);
 /// Identifies one live [`audio::AudioLevelTapHandle`] — a candidate source's
 /// dropdown-entry meter, not a real share (see that type's doc comment).
 /// Scoped tightly to however long one dropdown is open on the frontend: see
-/// [`AppState::start_audio_level_tap`]/[`AppState::stop_audio_level_tap`].
+/// [`build_audio_level_tap`] + [`AppState::insert_audio_level_tap`]/[`AppState::stop_audio_level_tap`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AudioLevelTapId(pub u32);
 
@@ -321,6 +321,7 @@ pub enum PendingRole {
 /// The editable half of a destination row: the user's in-progress choices,
 /// kept as UI-friendly values (a downscale percentage rather than a pixel
 /// size) and resolved against the live source caps at apply time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DestEdit {
     /// One of `ui.rs`'s `RESOLUTION_SCALES` percentages.
     pub scale_percent: u32,
@@ -597,12 +598,12 @@ pub struct AudioWatch {
     /// kept as-is even while `muted` is true, so unmuting restores it
     /// rather than resuming from 0. The value actually applied to
     /// `decoder` is `if muted { 0.0 } else { volume_percent / 100.0 }` (see
-    /// `commands::set_volume`).
+    /// [`effective_gain`]).
     pub volume_percent: u32,
     /// Mirrors the frontend's own per-tile mute toggle. Kept as its own
     /// bool (2026-07-29) rather than folded into `volume_percent` (which
     /// used to just get zeroed by the frontend before it was sent) so a
-    /// backend query (`commands::get_volume`) can tell a viewer's "muted at
+    /// backend query (`RoomSession::volume`) can tell a viewer's "muted at
     /// 40%" apart from "explicitly dragged to 0%" — both windows (View tab
     /// and any pop-out) need that distinction to restore the right slider
     /// state. See `superdoc/features/video-pipeline.md`'s 2026-07-29 entry.
@@ -618,6 +619,51 @@ pub struct AudioWatch {
     /// against "who am I watching video from" — without a marker it would
     /// happily tear down a deliberate standalone Listen as "not desired".
     pub auto: bool,
+}
+
+/// Default playback volume, percent — what a freshly created audio watch
+/// starts at, and what [`VolumeState::default`] reports for "no audio watch
+/// yet".
+pub const DEFAULT_VOLUME_PERCENT: u32 = 100;
+
+/// A viewer's volume/mute state for one sender's audio — what a tile's volume
+/// slider shows. See [`RoomSession::volume`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeState {
+    /// 0-200, the slider's *desired* value — never zeroed just because
+    /// `muted` is true, so unmuting can restore it.
+    pub volume_percent: u32,
+    pub muted: bool,
+}
+
+impl Default for VolumeState {
+    fn default() -> Self {
+        Self { volume_percent: DEFAULT_VOLUME_PERCENT, muted: false }
+    }
+}
+
+/// The gain actually handed to the audio decoder: `0.0` while muted,
+/// otherwise `volume_percent / 100`.
+pub fn effective_gain(volume_percent: u32, muted: bool) -> f64 {
+    if muted { 0.0 } else { volume_percent as f64 / 100.0 }
+}
+
+/// The `stream_id` of `owner`'s announced audio stream in `streams`, if any.
+pub fn sibling_audio_stream_in(streams: &[StreamInfo], owner: ConnId) -> Option<StreamId> {
+    streams.iter().find(|s| s.owner == owner && s.kind == StreamKind::Audio).map(|s| s.stream_id)
+}
+
+/// Which audio stream a volume call about `stream_id` means: `stream_id`
+/// itself if `has_audio_watch(stream_id)` (a direct hit on the audio id),
+/// otherwise `owner`'s sibling audio stream (the caller passed the *video*
+/// stream id). See [`RoomSession::set_volume`] for why both are accepted.
+pub fn resolve_audio_stream_id(
+    streams: &[StreamInfo],
+    owner: ConnId,
+    stream_id: StreamId,
+    has_audio_watch: impl Fn(StreamId) -> bool,
+) -> Option<StreamId> {
+    if has_audio_watch(stream_id) { Some(stream_id) } else { sibling_audio_stream_in(streams, owner) }
 }
 
 /// State for a `WatchEntry` currently rendered in its own
@@ -730,7 +776,7 @@ pub struct RoomSession {
     /// this owner-scoped copy surviving that churn, every restart/switch
     /// silently reset the viewer's chosen volume back to the
     /// hardcoded-100 default in `start_audio_watch`. Set from
-    /// `commands::set_volume` and `ui.rs`'s inline slider (the only two
+    /// `RoomSession::set_volume` and `ui.rs`'s inline slider (the only two
     /// places a volume ever changes), consulted by `start_audio_watch` as
     /// the initial value for a newly created `AudioWatch`.
     ///
@@ -750,7 +796,67 @@ impl RoomSession {
     /// any — used by `toggle_watch` to auto-subscribe audio alongside video
     /// from the same sender.
     pub fn sibling_audio_stream(&self, owner: ConnId) -> Option<StreamId> {
-        self.streams.iter().find(|s| s.owner == owner && s.kind == StreamKind::Audio).map(|s| s.stream_id)
+        sibling_audio_stream_in(&self.streams, owner)
+    }
+
+    /// Set playback volume (0-200%) and mute state for `owner`'s audio.
+    ///
+    /// `stream_id` may be either the audio stream's own id *or* the id of the
+    /// video stream the UI is showing for that sender. `Why accept both:`
+    /// audio follows video (see [`Self::sync_audio_watches`]) and is
+    /// deliberately never surfaced to a viewer as its own stream, so the View
+    /// tab's per-tile volume control only ever knows the *video* stream_id it
+    /// rendered the tile from — it has no audio stream_id to pass and
+    /// shouldn't need one. Resolving the sibling here keeps that ignorance in
+    /// the UI, where it belongs, instead of leaking the audio stream id back
+    /// into a UI whose whole point is that audio isn't a separate thing. A
+    /// direct hit on the audio id still works unchanged, for the standalone
+    /// audio-only "Listen" case.
+    ///
+    /// `volume_percent` is stored as-is (the slider's *desired* value) even
+    /// while `muted` is true — [`AudioWatch::volume_percent`]'s doc comment
+    /// explains why: it lets the eventual unmute (or another window's
+    /// [`Self::volume`] query) recover the pre-mute value instead of seeing a
+    /// flattened 0. The decoder itself still gets muted immediately
+    /// ([`effective_gain`]).
+    pub fn set_volume(&mut self, owner: ConnId, stream_id: StreamId, volume_percent: u32, muted: bool) {
+        {
+            let mut watches = self.audio_watches.lock().unwrap();
+            let audio_stream_id =
+                resolve_audio_stream_id(&self.streams, owner, stream_id, |id| watches.contains_key(&(owner, id)));
+            if let Some(audio_stream_id) = audio_stream_id
+                && let Some(watch) = watches.get_mut(&(owner, audio_stream_id))
+            {
+                watch.volume_percent = volume_percent;
+                watch.muted = muted;
+                watch.decoder.set_volume(effective_gain(volume_percent, muted));
+            }
+        }
+        // Remember this owner's chosen volume independent of the current
+        // audio stream id, so it survives the sender restarting/switching
+        // their audio source (which tears down and recreates the
+        // `AudioWatch` under a fresh `stream_id` — see
+        // `RoomSession::audio_volume_by_owner`'s doc comment).
+        self.audio_volume_by_owner.insert(owner, volume_percent);
+    }
+
+    /// Read back `owner`'s current volume/mute state — the counterpart query
+    /// to [`Self::set_volume`], so a tile's slider can show the real state
+    /// instead of a per-window default. [`RoomSession::audio_watches`] is the
+    /// single source of truth every window reads when it renders a tile it
+    /// hasn't seen before.
+    ///
+    /// Resolves `stream_id` the same video-or-audio-id-both-work way
+    /// [`Self::set_volume`] does. Defaults to 100%/unmuted
+    /// ([`VolumeState::default`]) when no audio watch is found yet, e.g. a
+    /// tile whose audio subscription hasn't been reconciled by
+    /// `sync_audio_watches` the instant the tile first renders.
+    pub fn volume(&self, owner: ConnId, stream_id: StreamId) -> VolumeState {
+        let watches = self.audio_watches.lock().unwrap();
+        resolve_audio_stream_id(&self.streams, owner, stream_id, |id| watches.contains_key(&(owner, id)))
+            .and_then(|audio_stream_id| watches.get(&(owner, audio_stream_id)))
+            .map(|watch| VolumeState { volume_percent: watch.volume_percent, muted: watch.muted })
+            .unwrap_or_default()
     }
 
     /// Whether `owner` currently has an announced video stream — used to
@@ -846,7 +952,7 @@ impl RoomSession {
                 // remember mute too, which touches `ui.rs`'s egui slider and
                 // `end_to_end_test.rs`'s existing regression test for this
                 // map's original purpose.
-                let volume_percent = self.audio_volume_by_owner.get(&owner).copied().unwrap_or(100);
+                let volume_percent = self.audio_volume_by_owner.get(&owner).copied().unwrap_or(DEFAULT_VOLUME_PERCENT);
                 if volume_percent != 100 {
                     decoder.set_volume(volume_percent as f64 / 100.0);
                 }
@@ -2398,7 +2504,7 @@ impl AppState {
 
     /// Registers an already-constructed level tap (built by the caller via
     /// [`audio::start_level_tap`] *before* taking this lock — see
-    /// `commands::start_audio_level_tap`'s doc comment for why building the
+    /// [`build_audio_level_tap`]'s doc comment for why building the
     /// GStreamer pipeline can't happen while holding `AppState`'s mutex) and
     /// returns the id the frontend polls/stops it with.
     pub fn insert_audio_level_tap(&mut self, handle: audio::AudioLevelTapHandle) -> u32 {
@@ -3114,6 +3220,437 @@ impl AppState {
     }
 }
 
+// ---------------------------------------------------------------------
+// UI-facing operations
+// ---------------------------------------------------------------------
+//
+// Everything below used to live in the Tauri sidecar's command layer
+// (`src-tauri/src/commands.rs`) or in the JS frontend. It is here so that any
+// UI — the sidecar's thin command wrappers today, the native egui UI
+// tomorrow — stays a thin view over `AppState` and never re-implements
+// business logic. The commands keep only protocol translation (JSON string
+// <-> enum, `u32` handles) and the `tauri::async_runtime::block_on` wrappers
+// their `Why:` notes explain.
+
+/// A freshly minted room: the local nickname plus the join string (which
+/// contains the room *key* — never log or display it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JoinLink {
+    /// The LOCAL-only nickname the room was saved under (never sent over the
+    /// wire).
+    pub room_name: String,
+    pub join_string: String,
+}
+
+/// List currently-audio-producing applications without blocking the async
+/// executor: `audio::list_audio_sources` shells out to `pw-dump`
+/// synchronously, so it runs on the blocking pool.
+///
+/// Deliberately bypasses [`AppState::refresh_audio_sources`]/
+/// [`AppState::poll_audio_sources`] (the fire-then-poll-next-frame pattern):
+/// a caller that can `.await` has a natural async return point and needs no
+/// poll.
+pub async fn list_audio_sources_async() -> Result<Vec<AudioSource>, String> {
+    tokio::task::spawn_blocking(audio::list_audio_sources)
+        .await
+        .map_err(|e| format!("audio source listing task panicked: {e}"))?
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Resolve the PipeWire `object.serial` to tap for `source_id` out of a
+/// fresh listing. `Err` (the source vanished, or has no serial yet) just
+/// means that one dropdown entry's meter stays unlit.
+pub fn pick_level_tap_serial(sources: Vec<AudioSource>, source_id: u32) -> Result<u64, String> {
+    let source =
+        sources.into_iter().find(|s| s.id == source_id).ok_or_else(|| "audio source is no longer listed".to_string())?;
+    source.serial.ok_or_else(|| format!("'{}' has no PipeWire object.serial to tap yet", source.name))
+}
+
+/// Build a non-announcing per-candidate level tap for the "Add audio"/"Switch"
+/// dropdown's meters — see [`AppState::insert_audio_level_tap`] and
+/// [`audio::AudioLevelTapHandle`]'s doc comments for why this is a separate,
+/// much lighter thing than [`AppState::start_audio_share`]. Hand the result to
+/// [`AppState::insert_audio_level_tap`] to get the id the UI polls/stops it
+/// with.
+///
+/// Re-lists sources here (rather than trusting `source_id` against whatever
+/// the UI already had) so the tap is built against `object.serial` for the
+/// node as it exists right now.
+///
+/// `Why this is a free async fn that must run *before* `AppState` is ever
+/// locked/borrowed, with its own `spawn_blocking`:` the doc comment of
+/// `audio::start_level_tap` claims `pipeline.set_state(Playing)` returns as
+/// soon as the state change is *requested*, without waiting for it to
+/// complete — true in the common case, but confirmed live (real dropdown
+/// open, real PipeWire session, one candidate among several) that
+/// `set_state` can still block synchronously for several seconds on a node
+/// PipeWire hasn't fully brought up yet (an idle/suspended stream in
+/// particular). The old code built the *entire* GStreamer pipeline,
+/// including that `set_state` call, while holding the sidecar's `AppState`
+/// mutex for the whole dropdown-open burst of concurrent taps. One slow/stuck
+/// candidate then held that lock indefinitely, and every other command
+/// needing it — including unrelated taps for perfectly healthy sources and,
+/// worse, `start_audio_share` for the "Share" button on the very same
+/// dropdown — queued behind it forever. That was the root cause of both the
+/// "visualizer never lights up" and "clicking Share does nothing" bug
+/// reports. Building the pipeline before taking the lock means a stuck
+/// candidate only ever blocks its own request (which the UI's timeout already
+/// treats as "leave this one meter unlit") instead of every other command in
+/// the app.
+pub async fn build_audio_level_tap(source_id: u32) -> Result<audio::AudioLevelTapHandle, String> {
+    let serial = pick_level_tap_serial(list_audio_sources_async().await?, source_id)?;
+    tokio::task::spawn_blocking(move || audio::start_level_tap(serial))
+        .await
+        .map_err(|e| format!("audio level-tap task panicked: {e}"))?
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Room management: join / create / forget.
+impl AppState {
+    /// `Ok(())` unless a `RoomStore` save has failed (sticky — the error is
+    /// never cleared, so once a save has failed every later call reports it).
+    pub fn room_store_result(&self) -> Result<(), String> {
+        match &self.room_store_error {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
+        }
+    }
+
+    /// Persist `room_store`, recording (not propagating) a failure in
+    /// `room_store_error`.
+    fn save_room_store(&mut self) {
+        if let Err(e) = self.room_store.save() {
+            self.room_store_error = Some(e.to_string());
+        }
+    }
+
+    /// Save `join_string` under the local nickname `room_name` *before*
+    /// connecting, so the room keeps the human-chosen name instead of
+    /// `poll_connect_result`'s id-derived fallback (which only fires when
+    /// `RoomStore::name_for` has no entry for this join string yet).
+    ///
+    /// `Why:` unconditional `upsert` (not "only if not already saved", which
+    /// is `poll_connect_result`'s own guard): a name typed into the Join or
+    /// Create form is a deliberate choice by the user for *this* join, so it
+    /// should win even if this join string happened to already have a saved
+    /// name. `upsert` keys by name (not join string), so this can only
+    /// overwrite a room already saved under this exact name — it can't
+    /// collide with some other saved room under a different name.
+    fn seed_room_name(&mut self, room_name: String, join_string: String) {
+        self.room_store.upsert(room_name, join_string);
+        self.save_room_store();
+    }
+
+    /// Join `join_string`. `display_name` (if non-blank) replaces the
+    /// session's display name; `room_name` (if non-blank after trimming) is
+    /// the local nickname to save the room under before connecting — see
+    /// [`Self::seed_room_name`]. Leaving it blank preserves the
+    /// join-then-auto-name-from-id behaviour.
+    ///
+    /// Spawns the connect task, so it needs a Tokio runtime entered (see
+    /// [`Self::start_connect`]).
+    pub fn join_room(&mut self, join_string: String, display_name: String, room_name: String) -> Result<(), String> {
+        if !display_name.trim().is_empty() {
+            self.display_name = display_name;
+        }
+        let room_name = room_name.trim().to_string();
+        if !room_name.is_empty() {
+            self.seed_room_name(room_name, join_string.clone());
+        }
+        self.start_connect(join_string, true)
+    }
+
+    /// "Create a room", minus the connect: per the server's
+    /// `Registry::get_or_create_room` (spec §10) there is no separate create
+    /// verb on the wire — a room is auto-created the instant anyone joins a
+    /// room-id that doesn't exist yet. So creating, from this client, is just:
+    /// mint a fresh room-id + key nobody has used before, format them into a
+    /// join string with `server`, and save that join string locally under
+    /// `room_name`. Joining it ([`Self::create_and_join_room`], or
+    /// [`Self::start_connect`] on the returned link) then makes the first
+    /// joiner the room's effective creator.
+    ///
+    /// The room *key* is a real AES-256 AEAD secret (`net::ParsedJoinString`,
+    /// and `net.rs`'s frame en/decryption), not a display label — it is
+    /// generated here, in Rust, with the `rand` crate's default
+    /// (CSPRNG-backed) generator, deliberately not in a JS frontend, where
+    /// there is no equivalent secure-randomness primitive.
+    ///
+    /// `server` and `room_name` are trimmed and must be non-empty.
+    pub fn create_room(&mut self, server: &str, room_name: &str) -> Result<JoinLink, String> {
+        let server = server.trim();
+        if server.is_empty() {
+            return Err("server address must not be empty".to_string());
+        }
+        let room_name = room_name.trim().to_string();
+        if room_name.is_empty() {
+            return Err("room name must not be empty".to_string());
+        }
+
+        let room_id: crate::protocol::RoomId = rand::random();
+        let room_key: [u8; 32] = rand::random();
+        let join_string = crate::net::format_join_string(server, &room_id, &room_key);
+
+        self.seed_room_name(room_name.clone(), join_string.clone());
+        Ok(JoinLink { room_name, join_string })
+    }
+
+    /// [`Self::create_room`] followed by the same join flow
+    /// [`Self::join_room`] uses.
+    ///
+    /// Display name is deliberately not a parameter: it is one global
+    /// Settings value ([`Self::set_display_name`]), not asked per room, so
+    /// this passes an empty one through — which leaves
+    /// [`AppState::display_name`] untouched. The room name is already
+    /// pre-seeded by `create_room`, so `join_room`'s own upsert is skipped
+    /// too.
+    pub fn create_and_join_room(&mut self, server: &str, room_name: &str) -> Result<(), String> {
+        let link = self.create_room(server, room_name)?;
+        self.join_room(link.join_string, String::new(), String::new())
+    }
+
+    /// Forget a saved room: drop its `RoomStore` entry and persist the
+    /// removal immediately, so it doesn't reappear the next time the store is
+    /// reloaded from disk. Keyed by join string rather than a room handle
+    /// since "forget" only applies to a saved, disconnected row, which has no
+    /// handle at all — mirrors [`Self::rename_saved_room`]'s lookup.
+    ///
+    /// A join string that isn't saved is a no-op that still re-saves (and
+    /// reports any sticky store error).
+    pub fn forget_room(&mut self, join_string: &str) -> Result<(), String> {
+        if let Some(name) = self.room_store.name_for(join_string).map(str::to_string) {
+            self.room_store.remove(&name);
+        }
+        self.save_room_store();
+        self.room_store_result()
+    }
+}
+
+/// Persisted global settings.
+impl AppState {
+    /// Switch the UI language, persisting the choice and updating
+    /// `rust_i18n`'s global locale.
+    pub fn set_language(&mut self, language: &str) {
+        rust_i18n::set_locale(language);
+        self.language = language.to_string();
+        save_language(language);
+    }
+
+    /// Persist the global display name (Settings tab; trimmed). Used for
+    /// every room join/create from here on: the wire protocol sends a display
+    /// name once, at connect, with no later way to change it for an
+    /// already-joined room, so there was never a per-room distinction to
+    /// preserve. See `rooms::AppSettings::display_name`.
+    pub fn set_display_name(&mut self, display_name: &str) {
+        let display_name = display_name.trim().to_string();
+        save_display_name(&display_name);
+        self.display_name = display_name;
+    }
+
+    /// Only takes effect on the *next* launch — see
+    /// `superdoc/features/presentation-modes.md`.
+    pub fn set_presentation_mode(&mut self, mode: PresentationMode) {
+        self.presentation_mode = mode;
+        save_presentation_mode(mode);
+    }
+
+    /// Clamped here too (defense in depth) even though the UI's range input
+    /// already restricts it to 0..=5000 — see
+    /// `rooms::AppSettings::clamp_max_jitter_buffer_ms`. Returns the value
+    /// actually stored.
+    pub fn set_max_jitter_buffer_ms(&mut self, ms: u32) -> u32 {
+        let ms = AppSettings::clamp_max_jitter_buffer_ms(ms);
+        self.max_jitter_buffer_ms = ms;
+        save_max_jitter_buffer_ms(ms);
+        ms
+    }
+
+    /// Clamped here too (defense in depth) even though the UI's range input
+    /// already restricts it to 5..=10 — see
+    /// `rooms::AppSettings::clamp_catch_up_speed_percent`. Returns the value
+    /// actually stored.
+    pub fn set_catch_up_speed_percent(&mut self, percent: u32) -> u32 {
+        let percent = AppSettings::clamp_catch_up_speed_percent(percent);
+        self.catch_up_speed_percent = percent;
+        save_catch_up_speed_percent(percent);
+        percent
+    }
+
+    /// Absolute-Maximum mode's per-client total, kbit/s (persisted along with
+    /// the mode and floor — see [`save_bandwidth_settings`]).
+    pub fn set_bandwidth_total(&mut self, total_kbps: u32) {
+        self.absolute_total_kbps = total_kbps;
+        save_bandwidth_settings(self.bandwidth_mode, self.absolute_total_kbps, self.destination_floor_kbps);
+    }
+
+    /// Absolute-Maximum mode's guaranteed per-destination floor, kbit/s
+    /// (persisted along with the mode and total).
+    pub fn set_bandwidth_floor(&mut self, floor_kbps: u32) {
+        self.destination_floor_kbps = floor_kbps;
+        save_bandwidth_settings(self.bandwidth_mode, self.absolute_total_kbps, self.destination_floor_kbps);
+    }
+
+    /// What the allocator currently assigns `destination_id`, kbit/s — the
+    /// per-stream share of the Absolute-Maximum budget the destination card
+    /// shows. `None` until the first allocation tick has run for a
+    /// destination (Per-Stream mode, or the destination is still starting).
+    ///
+    /// The JS frontend showed a toy equal split here (`computeAllocation`,
+    /// `floor`-clamped `total / n`, even against the real backend); the real
+    /// allocator weights by `width*height*fps` and honours floors/ceilings,
+    /// so this reads its actual result instead.
+    pub fn allocated_kbps(&self, destination_id: DestinationId) -> Option<u32> {
+        let id = DestId(destination_id.0);
+        self.bandwidth.allocation()?.per_destination.iter().find(|(d, _)| *d == id).map(|(_, kbps)| *kbps)
+    }
+
+    /// How far the last allocation overshot the Absolute-Maximum total
+    /// (floors alone not fitting the budget), kbit/s; `0` if it fit or no
+    /// allocation has run. Drives the overshoot warning banner.
+    pub fn bandwidth_overshoot_kbps(&self) -> u32 {
+        self.bandwidth.allocation().map_or(0, |a| a.overshoot_kbps)
+    }
+}
+
+/// The "Start a stream" form: persisted defaults, the live "next capture"
+/// settings, and encoder presets.
+impl AppState {
+    /// The form's persisted last-used values, read straight from the
+    /// settings file. Not `AppState`-backed like the bandwidth settings
+    /// (nothing here has a live/in-session counterpart *as a saved
+    /// default*), so this is a disk read.
+    ///
+    /// An associated function (no `&self`) because it needs no session
+    /// state, which lets the sidecar's `get_start_stream_defaults` command
+    /// stay lock-free.
+    pub fn start_stream_defaults() -> StartStreamDefaults {
+        AppSettings::load().start_stream_defaults
+    }
+
+    /// Persist `defaults` as the form's last-used values. Does not touch the
+    /// live "next capture" fields — see [`Self::apply_start_stream_defaults`]
+    /// for the other direction.
+    pub fn set_start_stream_defaults(defaults: StartStreamDefaults) {
+        save_start_stream_defaults(
+            defaults.framerate,
+            defaults.bitrate_kbps,
+            defaults.tune,
+            defaults.quality_level,
+            defaults.rate_control,
+            defaults.codec,
+        );
+    }
+
+    /// The live "next capture" settings in persisted-defaults shape
+    /// (everything the form saves; GOP is deliberately not part of it).
+    pub fn current_start_stream_settings(&self) -> StartStreamDefaults {
+        StartStreamDefaults {
+            framerate: self.framerate,
+            bitrate_kbps: self.bitrate_kbps,
+            tune: self.tune,
+            quality_level: self.quality_level,
+            rate_control: self.rate_control,
+            codec: self.codec,
+        }
+    }
+
+    /// Persist the live "next capture" settings as the new last-used
+    /// defaults.
+    pub fn save_current_start_stream_defaults(&self) {
+        Self::set_start_stream_defaults(self.current_start_stream_settings());
+    }
+
+    /// Push the persisted last-used values into the live "next capture"
+    /// fields, and reset `gop_millis` to [`capture::DEFAULT_GOP_MILLIS`].
+    ///
+    /// `Why this exists:` [`Self::stage_video_share`] (like the
+    /// `start_video_share` it replaced) reads those process-wide fields, not
+    /// arguments of its own, and the capture's framerate in particular is
+    /// fixed at pipeline-build time inside it. Without this, a staged card
+    /// would open running whatever the fields last happened to be (the
+    /// hardcoded first-run fallback on a fresh launch) instead of what "Go
+    /// live" last actually used.
+    ///
+    /// `Why GOP is reset and not restored:` `gop_millis` is *not* one of the
+    /// persisted fields — it is a preset-specific tradeoff (only Gaming moves
+    /// it, see `presets.rs`), not a standalone setting worth remembering
+    /// across restarts. It is always reset to the protocol default here so a
+    /// previous staged card's Gaming preset (a shorter GOP) can never
+    /// silently bleed into the next one.
+    pub fn apply_start_stream_defaults(&mut self) {
+        let d = Self::start_stream_defaults();
+        self.framerate = d.framerate;
+        self.bitrate_kbps = d.bitrate_kbps;
+        self.tune = d.tune;
+        self.quality_level = d.quality_level;
+        self.rate_control = d.rate_control;
+        self.codec = d.codec;
+        self.gop_millis = capture::DEFAULT_GOP_MILLIS;
+    }
+
+    /// "Share Screen" clicked: [`Self::apply_start_stream_defaults`], then
+    /// [`Self::stage_video_share`].
+    pub fn stage_video_share_with_saved_defaults(&mut self) -> CaptureSourceId {
+        self.apply_start_stream_defaults();
+        self.stage_video_share()
+    }
+
+    /// "Go live" clicked: [`Self::go_live`], then persist the card's current
+    /// encoder settings as the new last-used defaults.
+    ///
+    /// `Why the save happens here and not on every change:` per the project
+    /// owner's explicit request, the defaults are persisted once, at "Go
+    /// live", not on every keystroke while the card is merely staged.
+    pub fn go_live_and_save_defaults(&mut self, capture_id: CaptureSourceId, room_handle: RoomHandle) {
+        self.go_live(capture_id, room_handle);
+        self.save_current_start_stream_defaults();
+    }
+
+    /// Which codecs are actually usable on this machine's current encoder
+    /// backend — the mechanism the codec selector uses to grey out
+    /// unavailable options. See `capture::supported_codecs` for why this is a
+    /// static function of the backend rather than a live per-codec probe.
+    /// (The backend detection itself is probed once and cached for the
+    /// process's lifetime.)
+    pub fn supported_codecs() -> &'static [capture::VideoCodec] {
+        capture::supported_codecs(capture::detect_encoder_backend())
+    }
+}
+
+/// Destination edits.
+impl AppState {
+    /// "Apply" clicked on a destination row's settings edit: replace the
+    /// row's edit buffer with `edit`, then apply it.
+    ///
+    /// Any change to tune / quality level / rate control (like a
+    /// resolution / framerate / backend change) is applied as a
+    /// `ChangeTier::BranchSwap` by [`Self::apply_destination_edit`] →
+    /// `capture::destination::classify_change` — never a live property write.
+    /// No-op if the destination is already gone.
+    pub fn edit_destination(&mut self, destination_id: DestinationId, edit: DestEdit) {
+        self.with_destination(destination_id, |dest| dest.edit = edit);
+        self.apply_destination_edit(destination_id);
+    }
+}
+
+/// Viewer-side audio.
+impl AppState {
+    /// Set `owner`'s playback volume (0-200%) and mute state in `room`.
+    /// `stream_id` may be the audio stream's id or the video stream's — see
+    /// [`RoomSession::set_volume`]. No-op for an unknown room.
+    pub fn set_volume(&mut self, room: RoomHandle, owner: ConnId, stream_id: StreamId, volume_percent: u32, muted: bool) {
+        if let Some(room) = self.rooms.get_mut(&room) {
+            room.set_volume(owner, stream_id, volume_percent, muted);
+        }
+    }
+
+    /// `owner`'s current volume/mute state in `room` — see
+    /// [`RoomSession::volume`]. Defaults (100%, unmuted) for an unknown room.
+    pub fn volume(&self, room: RoomHandle, owner: ConnId, stream_id: StreamId) -> VolumeState {
+        self.rooms.get(&room).map(|room| room.volume(owner, stream_id)).unwrap_or_default()
+    }
+}
+
 #[cfg(test)]
 mod connect_timeout_and_cancel_tests {
     use super::*;
@@ -3139,6 +3676,7 @@ mod connect_timeout_and_cancel_tests {
     /// clearly — the mechanism doesn't depend on the specific duration.
     #[tokio::test(start_paused = true)]
     async fn connect_times_out_and_reports_failure_without_a_real_wait() {
+        let _home = super::test_support::isolated_config_home();
         let mut state = AppState::default();
         state.connect_timeout = Duration::from_millis(50);
 
@@ -3187,6 +3725,7 @@ mod connect_timeout_and_cancel_tests {
     /// comment for why aborting mid-handshake is safe).
     #[tokio::test(start_paused = true)]
     async fn cancel_connect_aborts_the_in_flight_attempt_without_leaking() {
+        let _home = super::test_support::isolated_config_home();
         let mut state = AppState::default();
         // Timeout deliberately left far longer than this test needs — this
         // test is about the user-initiated cancel path, not the timeout, so
@@ -3211,5 +3750,513 @@ mod connect_timeout_and_cancel_tests {
         tokio::time::advance(Duration::from_secs(120)).await;
         tokio::task::yield_now().await;
         assert!(matches!(state.poll_connect_result(), ConnectOutcome::None));
+    }
+}
+
+/// Shared fixtures for tests that construct a real [`AppState`] (which reads —
+/// and, for the persisted-settings operations, writes — the on-disk config).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::path::PathBuf;
+    use std::sync::MutexGuard;
+
+    use super::*;
+
+    /// Serializes every test that touches the process-global
+    /// `XDG_CONFIG_HOME` env var: `cargo test` runs tests in parallel threads
+    /// within one process, so without this two tests would stomp each other's
+    /// config dir mid-test.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Points `XDG_CONFIG_HOME` at a private temp dir for the guard's
+    /// lifetime (and removes it afterwards). Hold it for the whole test: the
+    /// lock must stay held (or another test could repoint the env var out
+    /// from under this one) and the dir must stay alive.
+    pub(crate) struct IsolatedConfigHome {
+        _guard: MutexGuard<'static, ()>,
+        dir: PathBuf,
+    }
+
+    impl Drop for IsolatedConfigHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    pub(crate) fn isolated_config_home() -> IsolatedConfigHome {
+        // Poisoning only happens if an earlier test panicked while holding the
+        // lock; that failure is already reported, so recover rather than
+        // cascading the panic into every later test.
+        let guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!("simple-screensharing-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp config home");
+        // SAFETY: held under `ENV_LOCK` for the guard's whole lifetime, so no
+        // other test using this helper reads or writes the variable
+        // concurrently. `dirs::config_dir()` is consulted lazily, at the point
+        // `RoomStore`/`AppSettings` load/save — never cached.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+        }
+        // Fail loudly (rather than scribble over the developer's real config)
+        // on a platform where `XDG_CONFIG_HOME` doesn't steer `dirs`.
+        assert!(
+            RoomStore::config_path().starts_with(&dir) && AppSettings::config_path().starts_with(&dir),
+            "XDG_CONFIG_HOME did not redirect the config dir on this platform"
+        );
+        IsolatedConfigHome { _guard: guard, dir }
+    }
+
+    pub(crate) fn video_params() -> capture::destination::VideoParams {
+        capture::destination::VideoParams {
+            width: 1920,
+            height: 1080,
+            framerate: 60,
+            bitrate_kbps: 8000,
+            backend: capture::EncoderBackend::Software,
+            tune: capture::TuneMode::BestQuality,
+            quality_level: capture::QualityLevel::Balanced,
+            rate_control: capture::RateControlMode::Qvbr,
+            gop_millis: capture::DEFAULT_GOP_MILLIS,
+            codec: capture::VideoCodec::H264,
+        }
+    }
+
+    /// Inserts a video capture (still `Starting`, so edits are stored but never
+    /// reach an encoder) holding one destination, and returns their ids.
+    pub(crate) fn insert_destination(state: &mut AppState) -> (CaptureSourceId, DestinationId) {
+        let capture_id = state.alloc_capture_id();
+        let destination_id = state.alloc_destination_id();
+        let params = video_params();
+        let mut destinations = IndexMap::new();
+        destinations.insert(
+            destination_id,
+            Destination {
+                room: RoomHandle(0),
+                stream_id: 0,
+                params,
+                runtime: None,
+                pending: None,
+                edit: Destination::edit_from(params),
+                apply_rx: None,
+            },
+        );
+        let (_tx, rx) = oneshot::channel();
+        state.captures.insert(
+            capture_id,
+            LocalCapture {
+                kind: StreamKind::Video,
+                label: "test".to_string(),
+                status: ShareStatus::Starting(rx),
+                audio_for_capture: None,
+                destinations,
+                self_preview_texture: None,
+            },
+        );
+        (capture_id, destination_id)
+    }
+}
+
+/// Tests for the operations moved out of the Tauri sidecar's command layer.
+/// Each needs a real `AppState` (so `#[tokio::test]`: its constructor binds a
+/// QUIC endpoint) pointed at a private config dir, but no network and no
+/// GStreamer.
+#[cfg(test)]
+mod ui_ops_tests {
+    use super::test_support::*;
+    use super::*;
+
+    fn stream(owner: ConnId, stream_id: StreamId, kind: StreamKind) -> StreamInfo {
+        StreamInfo { owner, stream_id, kind, label: String::new(), width: 0, height: 0 }
+    }
+
+    // ---- rooms ----
+
+    #[tokio::test]
+    async fn create_room_mints_a_fresh_valid_join_string_and_persists_the_name() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+
+        let a = state.create_room("relay.example:4433", "Movie Night").unwrap();
+        let b = state.create_room("relay.example:4433", "Game Night").unwrap();
+
+        assert_eq!(a.room_name, "Movie Night");
+        assert_ne!(a.join_string, b.join_string, "every created room must get its own id/key");
+        let parsed = crate::net::parse_join_string(&a.join_string).expect("minted join string must parse");
+        assert_eq!(parsed.server, "relay.example:4433");
+        let parsed_b = crate::net::parse_join_string(&b.join_string).unwrap();
+        assert_ne!(parsed.room_id, parsed_b.room_id);
+        assert_ne!(parsed.room_key, parsed_b.room_key);
+
+        // Pre-seeded in memory *and* on disk.
+        assert_eq!(state.room_store.name_for(&a.join_string), Some("Movie Night"));
+        let reloaded = RoomStore::load().unwrap();
+        assert_eq!(reloaded.rooms.len(), 2);
+        assert_eq!(reloaded.name_for(&b.join_string), Some("Game Night"));
+        assert!(state.room_store_result().is_ok());
+    }
+
+    #[tokio::test]
+    async fn create_room_trims_and_rejects_blank_input_without_touching_the_store() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+
+        assert_eq!(state.create_room("   ", "Movie Night").unwrap_err(), "server address must not be empty");
+        assert_eq!(state.create_room("relay:4433", " \t").unwrap_err(), "room name must not be empty");
+        assert!(state.room_store.rooms.is_empty());
+
+        let link = state.create_room("  relay:4433 ", "  Movie Night  ").unwrap();
+        assert_eq!(link.room_name, "Movie Night");
+        assert_eq!(crate::net::parse_join_string(&link.join_string).unwrap().server, "relay:4433");
+    }
+
+    /// The reported bug at the lib level: forgetting a saved room must remove it
+    /// from the on-disk store immediately, not just from memory, so a later
+    /// `RoomStore::load()` doesn't resurrect it.
+    #[tokio::test]
+    async fn forget_room_persists_the_removal_to_disk() {
+        let _home = isolated_config_home();
+        let mut store = RoomStore::default();
+        store.upsert("Movie Night".to_string(), "server|00112233|deadbeef".to_string());
+        store.upsert("Gaming Night".to_string(), "server|44556677|c0ffee".to_string());
+        store.save().unwrap();
+
+        let mut state = AppState::default();
+        assert_eq!(state.room_store.rooms.len(), 2);
+
+        state.forget_room("server|00112233|deadbeef").expect("forget should succeed");
+
+        assert_eq!(state.room_store.rooms.len(), 1);
+        assert_eq!(state.room_store.rooms[0].name, "Gaming Night");
+        let reloaded = RoomStore::load().unwrap();
+        assert_eq!(reloaded.rooms.len(), 1, "deletion must be persisted to disk immediately");
+        assert_eq!(reloaded.rooms[0].name, "Gaming Night");
+    }
+
+    #[tokio::test]
+    async fn forget_room_on_an_unknown_join_string_is_a_harmless_ok() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        state.room_store.upsert("Keep".to_string(), "a|b|c".to_string());
+        assert!(state.forget_room("x|y|z").is_ok());
+        assert_eq!(state.room_store.rooms.len(), 1);
+    }
+
+    /// A failed store save is sticky: reported by `forget_room` and by
+    /// `room_store_result` for every later call (behaviour carried over from
+    /// the command layer).
+    #[tokio::test]
+    async fn room_store_errors_are_sticky_and_reported() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        assert!(state.room_store_result().is_ok());
+        state.room_store_error = Some("disk full".to_string());
+        assert_eq!(state.room_store_result().unwrap_err(), "disk full");
+        assert_eq!(state.forget_room("a|b|c").unwrap_err(), "disk full");
+    }
+
+    /// `join_room` pre-seeds the typed name *before* connecting, applies a
+    /// non-blank display name, and kicks off the connect.
+    #[tokio::test(start_paused = true)]
+    async fn join_room_seeds_the_name_and_display_name_then_starts_connecting() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+
+        state.join_room("not-a-valid-join-string".to_string(), "Alice".to_string(), "  Movie Night  ".to_string()).unwrap();
+
+        assert_eq!(state.display_name, "Alice");
+        assert_eq!(state.room_store.name_for("not-a-valid-join-string"), Some("Movie Night"));
+        assert_eq!(RoomStore::load().unwrap().rooms.len(), 1, "the name must be saved to disk too");
+        assert!(state.pending_connect.is_some());
+        assert!(state.pending_connect.as_ref().unwrap().from_add_card);
+        state.cancel_connect();
+
+        // Blank display name and blank room name change nothing.
+        state.join_room("other".to_string(), "  ".to_string(), "   ".to_string()).unwrap();
+        assert_eq!(state.display_name, "Alice");
+        assert_eq!(state.room_store.rooms.len(), 1, "a blank room name must not create a saved room");
+        state.cancel_connect();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn create_and_join_room_saves_the_room_and_connects_without_touching_the_display_name() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        let display_name = state.display_name.clone();
+
+        state.create_and_join_room("192.0.2.1:4433", "Movie Night").unwrap();
+
+        assert_eq!(state.display_name, display_name);
+        assert_eq!(state.room_store.rooms.len(), 1);
+        assert_eq!(state.room_store.rooms[0].name, "Movie Night");
+        let pending = state.pending_connect.as_ref().expect("create must start connecting");
+        assert_eq!(pending.join_string, state.room_store.rooms[0].join_string);
+        state.cancel_connect();
+
+        // Validation errors surface before anything is saved or connected.
+        assert!(state.create_and_join_room("", "x").is_err());
+        assert!(state.pending_connect.is_none());
+        assert_eq!(state.room_store.rooms.len(), 1);
+    }
+
+    // ---- persisted settings ----
+
+    #[tokio::test]
+    async fn display_name_is_trimmed_and_persisted() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        state.set_display_name("  Mo  ");
+        assert_eq!(state.display_name, "Mo");
+        assert_eq!(AppSettings::load().display_name, "Mo");
+    }
+
+    #[tokio::test]
+    async fn jitter_buffer_and_catch_up_speed_are_clamped_then_persisted() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+
+        assert_eq!(state.set_max_jitter_buffer_ms(99_999), 5000);
+        assert_eq!(state.max_jitter_buffer_ms, 5000);
+        assert_eq!(AppSettings::load().max_jitter_buffer_ms, 5000);
+        assert_eq!(state.set_max_jitter_buffer_ms(1500), 1500);
+
+        assert_eq!(state.set_catch_up_speed_percent(0), 5);
+        assert_eq!(state.set_catch_up_speed_percent(50), 10);
+        assert_eq!(state.catch_up_speed_percent, 10);
+        let saved = AppSettings::load();
+        assert_eq!(saved.catch_up_speed_percent, 10);
+        assert_eq!(saved.max_jitter_buffer_ms, 1500, "saving one setting must not clobber its siblings");
+    }
+
+    #[tokio::test]
+    async fn bandwidth_total_and_floor_persist_together_with_the_mode() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        state.bandwidth_mode = BandwidthMode::Absolute;
+
+        state.set_bandwidth_total(12_345);
+        state.set_bandwidth_floor(750);
+
+        assert_eq!((state.absolute_total_kbps, state.destination_floor_kbps), (12_345, 750));
+        let saved = AppSettings::load();
+        assert_eq!(saved.absolute_total_kbps, 12_345);
+        assert_eq!(saved.destination_floor_kbps, 750);
+        assert_eq!(saved.bandwidth_mode, BandwidthMode::Absolute);
+    }
+
+    #[tokio::test]
+    async fn language_and_presentation_mode_are_persisted() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        // "en" only: `rust_i18n`'s locale is process-global and other tests
+        // assert on English messages.
+        state.set_language("en");
+        state.set_presentation_mode(PresentationMode::Mailbox);
+        assert_eq!(state.language, "en");
+        assert_eq!(state.presentation_mode, PresentationMode::Mailbox);
+        let saved = AppSettings::load();
+        assert_eq!(saved.language, "en");
+        assert_eq!(saved.presentation_mode, PresentationMode::Mailbox);
+    }
+
+    // ---- start-a-stream form ----
+
+    fn sample_defaults() -> StartStreamDefaults {
+        StartStreamDefaults {
+            framerate: 120,
+            bitrate_kbps: 15_000,
+            tune: capture::TuneMode::LowLatency,
+            quality_level: capture::QualityLevel::Quality,
+            rate_control: capture::RateControlMode::Cqp,
+            codec: capture::VideoCodec::Av1,
+        }
+    }
+
+    #[tokio::test]
+    async fn start_stream_defaults_round_trip_without_clobbering_siblings() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        state.set_bandwidth_total(31_000);
+
+        assert_eq!(AppState::start_stream_defaults(), StartStreamDefaults::default());
+        AppState::set_start_stream_defaults(sample_defaults());
+        assert_eq!(AppState::start_stream_defaults(), sample_defaults());
+        assert_eq!(AppSettings::load().absolute_total_kbps, 31_000);
+    }
+
+    /// Staging a share must open with the *saved* last-used values, and must
+    /// always reset the (never-persisted) GOP so a previous Gaming preset
+    /// can't bleed into the next card.
+    #[tokio::test]
+    async fn apply_start_stream_defaults_loads_saved_values_and_resets_gop() {
+        let _home = isolated_config_home();
+        AppState::set_start_stream_defaults(sample_defaults());
+        let mut state = AppState::default();
+        state.gop_millis = 750;
+        state.framerate = 30;
+
+        state.apply_start_stream_defaults();
+
+        assert_eq!(state.current_start_stream_settings(), sample_defaults());
+        assert_eq!(state.gop_millis, capture::DEFAULT_GOP_MILLIS);
+    }
+
+    #[tokio::test]
+    async fn save_current_start_stream_defaults_persists_the_live_fields() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        state.framerate = 144;
+        state.bitrate_kbps = 22_000;
+        state.codec = capture::VideoCodec::H265;
+        state.gop_millis = 750;
+
+        state.save_current_start_stream_defaults();
+
+        let saved = AppState::start_stream_defaults();
+        assert_eq!(saved, state.current_start_stream_settings());
+        assert_eq!((saved.framerate, saved.bitrate_kbps, saved.codec), (144, 22_000, capture::VideoCodec::H265));
+    }
+
+    #[tokio::test]
+    async fn supported_codecs_always_offers_h264_first() {
+        let codecs = AppState::supported_codecs();
+        assert_eq!(codecs.first(), Some(&capture::VideoCodec::H264));
+    }
+
+    // ---- destination edits ----
+
+    #[tokio::test]
+    async fn edit_destination_replaces_the_whole_edit_buffer() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        let (capture_id, destination_id) = insert_destination(&mut state);
+        let edit = DestEdit {
+            scale_percent: 50,
+            framerate: 144,
+            bitrate_kbps: 12_000,
+            tune: capture::TuneMode::LowLatency,
+            quality_level: capture::QualityLevel::Performance,
+            rate_control: capture::RateControlMode::Cqp,
+            gop_millis: 750,
+            codec: capture::VideoCodec::Av1,
+        };
+
+        state.edit_destination(destination_id, edit);
+
+        let dest = &state.captures[&capture_id].destinations[&destination_id];
+        assert_eq!(dest.edit, edit);
+        // Not active yet, so nothing was applied to an encoder or reported.
+        assert!(state.share_error.is_none());
+        assert_eq!(dest.params, video_params(), "live params only change when the capture applies the edit");
+    }
+
+    #[tokio::test]
+    async fn edit_destination_on_a_missing_destination_is_a_no_op() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        let (_, destination_id) = insert_destination(&mut state);
+        let edit = Destination::edit_from(video_params());
+        state.edit_destination(DestinationId(destination_id.0 + 99), edit);
+    }
+
+    // ---- bandwidth display ----
+
+    fn spec(id: u32, floor_kbps: u32) -> bandwidth::DestSpec {
+        bandwidth::DestSpec { id: DestId(id), width: 1920, height: 1080, fps: 60, floor_kbps, ceiling_kbps: Some(MAX_BITRATE_KBPS) }
+    }
+
+    #[tokio::test]
+    async fn allocated_kbps_reads_the_last_allocation() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        assert_eq!(state.allocated_kbps(DestinationId(7)), None, "nothing allocated yet");
+        assert_eq!(state.bandwidth_overshoot_kbps(), 0);
+
+        let input = bandwidth::AllocInput { total_kbps: 10_000, audio_reserved_kbps: 0, destinations: vec![spec(7, 500), spec(8, 500)] };
+        state.bandwidth.tick(Instant::now(), &input).expect("first tick is never rate limited");
+
+        assert_eq!(state.allocated_kbps(DestinationId(7)), Some(5000));
+        assert_eq!(state.allocated_kbps(DestinationId(8)), Some(5000));
+        assert_eq!(state.allocated_kbps(DestinationId(9)), None, "unknown destination");
+        assert_eq!(state.bandwidth_overshoot_kbps(), 0);
+    }
+
+    #[tokio::test]
+    async fn bandwidth_overshoot_is_reported_when_floors_do_not_fit() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        let input = bandwidth::AllocInput { total_kbps: 10_000, audio_reserved_kbps: 0, destinations: vec![spec(1, 6000), spec(2, 6000)] };
+        state.bandwidth.tick(Instant::now(), &input).unwrap();
+        assert_eq!(state.bandwidth_overshoot_kbps(), 2000);
+    }
+
+    // ---- viewer-side audio ----
+
+    #[test]
+    fn effective_gain_is_zero_while_muted_otherwise_percent_over_100() {
+        assert_eq!(effective_gain(100, false), 1.0);
+        assert_eq!(effective_gain(200, false), 2.0);
+        assert_eq!(effective_gain(40, false), 0.4);
+        assert_eq!(effective_gain(40, true), 0.0, "muted silences the decoder regardless of the slider value");
+    }
+
+    #[test]
+    fn volume_state_defaults_to_full_and_unmuted() {
+        assert_eq!(VolumeState::default(), VolumeState { volume_percent: 100, muted: false });
+    }
+
+    #[test]
+    fn sibling_audio_stream_finds_the_owners_audio_only() {
+        let streams = [stream(1, 0, StreamKind::Video), stream(2, 3, StreamKind::Audio), stream(1, 1, StreamKind::Audio)];
+        assert_eq!(sibling_audio_stream_in(&streams, 1), Some(1));
+        assert_eq!(sibling_audio_stream_in(&streams, 2), Some(3));
+        assert_eq!(sibling_audio_stream_in(&streams, 9), None);
+        assert_eq!(sibling_audio_stream_in(&[stream(1, 0, StreamKind::Video)], 1), None, "video-only sender has no sibling");
+    }
+
+    /// The volume control is handed either the audio stream's own id (a direct
+    /// hit — the standalone "Listen" case) or the *video* stream id the tile
+    /// was rendered from (resolved to the owner's sibling audio stream).
+    #[test]
+    fn volume_calls_accept_the_audio_id_or_the_video_id() {
+        let streams = [stream(1, 0, StreamKind::Video), stream(1, 1, StreamKind::Audio)];
+        let watching_audio_1 = |id: StreamId| id == 1;
+
+        // Direct hit on the audio watch.
+        assert_eq!(resolve_audio_stream_id(&streams, 1, 1, watching_audio_1), Some(1));
+        // Video id -> sibling audio stream.
+        assert_eq!(resolve_audio_stream_id(&streams, 1, 0, watching_audio_1), Some(1));
+        // A direct hit wins even when the owner also has a (different) sibling.
+        let two_audio = [stream(1, 1, StreamKind::Audio), stream(1, 2, StreamKind::Audio)];
+        assert_eq!(resolve_audio_stream_id(&two_audio, 1, 2, |id| id == 2), Some(2));
+        // No watch and no announced audio stream: nothing to resolve.
+        assert_eq!(resolve_audio_stream_id(&[stream(1, 0, StreamKind::Video)], 1, 0, |_| false), None);
+    }
+
+    #[tokio::test]
+    async fn volume_calls_for_an_unknown_room_default_and_do_not_panic() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        state.set_volume(RoomHandle(42), 1, 0, 150, true);
+        assert_eq!(state.volume(RoomHandle(42), 1, 0), VolumeState { volume_percent: 100, muted: false });
+    }
+
+    #[test]
+    fn level_tap_serial_is_picked_from_a_fresh_listing() {
+        let src = |id, serial| AudioSource { id, name: format!("app{id}"), serial };
+        let sources = vec![src(1, Some(100)), src(2, None)];
+        assert_eq!(pick_level_tap_serial(sources.clone(), 1), Ok(100));
+        assert_eq!(pick_level_tap_serial(sources.clone(), 3), Err("audio source is no longer listed".to_string()));
+        assert_eq!(
+            pick_level_tap_serial(sources, 2),
+            Err("'app2' has no PipeWire object.serial to tap yet".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_audio_level_taps_are_inert() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        assert_eq!(state.audio_level_tap_level(5), None);
+        state.stop_audio_level_tap(5);
     }
 }

@@ -42,6 +42,7 @@ pub mod decode;
 mod end_to_end_test;
 pub mod fragment;
 pub mod net;
+pub mod presets;
 pub mod preview;
 pub mod protocol;
 pub mod rooms;
