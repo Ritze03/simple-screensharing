@@ -307,13 +307,17 @@ pub fn person_row(ui: &mut Ui, row: &PersonRow) -> Response {
 // Destination row
 // ---------------------------------------------------------------------------
 
+/// The least name width [`dest_row`] keeps before it drops its kbps slot.
+pub const DEST_NAME_MIN: f32 = 72.0;
+
 /// Data for [`dest_row`].
 #[derive(Clone, Copy, Debug)]
 pub struct DestRow<'a> {
     /// This room (accent chip look, radio icon, `note`).
     pub current: bool,
     pub name: &'a str,
-    /// Faint note after the name of the current row (the caller's "this room").
+    /// Faint note after the name of the current row (the caller's "this
+    /// room"); empty for none.
     pub note: &'a str,
     /// Tooltip of the × (the caller's "Stop sending to <room>").
     pub remove_tip: &'a str,
@@ -332,10 +336,23 @@ pub enum DestAction {
     Remove,
 }
 
-/// Destination row (40 px) in the "Sending to" card.
+/// Destination row (40 px) in the "Sending to" card:
+/// `[18 icon][fill name note][84 pill][76 kbps][32 ×]`.
+///
+/// Too narrow for that plus [`DEST_NAME_MIN`] of name (the real stream-settings
+/// modal never is: at the 960 px minimum window its column is ~400 px; a
+/// sidebar-width card is), the row goes compact: `[18][fill name][pill][32 ×]`
+/// with the pill slot only as wide as the pill, no note, and the name + rate
+/// in the row's tooltip, so the name keeps some room and the × is never clipped.
 pub fn dest_row(ui: &mut Ui, row: &DestRow) -> DestAction {
     const SLOTS: [Slot; 5] = [fixed(18.0), FILL, fixed(84.0), fixed(76.0), fixed(32.0)];
-    let r = HBox::new("dest_row", theme::DEST_ROW_H).pad(theme::S3, theme::S1).slots(&SLOTS).show(ui);
+    let full_w = 18.0 + 84.0 + 76.0 + 32.0 + 4.0 * theme::S2 + theme::S3 + theme::S1 + DEST_NAME_MIN;
+    let compact = ui.available_width() < full_w;
+    // Compact: the pill slot shrinks to the pill itself, the note goes and
+    // the row's tooltip carries the full name and the rate.
+    let compact_slots = [fixed(18.0), FILL, fixed(row.pill.width(ui).min(84.0)), fixed(32.0)];
+    let r = HBox::new("dest_row", theme::DEST_ROW_H).pad(theme::S3, theme::S1).slots(if compact { &compact_slots } else { &SLOTS }).show(ui);
+    let x_slot = if compact { 3 } else { 4 };
     let (bg, border, icon, icon_col) = if row.current {
         (theme::ACCENT_CHIP_BG, theme::ACCENT_CHIP_BORDER, "radio_button_checked", theme::ACCENT_LIGHTER)
     } else {
@@ -344,20 +361,25 @@ pub fn dest_row(ui: &mut Ui, row: &DestRow) -> DestAction {
     ui.painter().rect(r.rect, CornerRadius::same(theme::ROUNDING_SM), bg, Stroke::new(1.0_f32, border), StrokeKind::Inside);
     r.icon(ui, 0, icon, 16.0, icon_col);
     let cell = r.cell(1);
-    let note_w = if row.current { 6.0 + super::text_width(ui, row.note, font(Weight::Regular, theme::FS_TINY), 0.0) } else { 0.0 };
+    let show_note = row.current && !row.note.is_empty() && !compact;
+    let note_w = if show_note { 6.0 + super::text_width(ui, row.note, font(Weight::Regular, theme::FS_TINY), 0.0) } else { 0.0 };
     let g = text_galley(ui, row.name, font(Weight::Bold, theme::FS_LABEL), theme::TEXT, (cell.width() - note_w).max(0.0), 0.0);
     let gr = paint_galley(ui, cell, g, Align::Min);
-    if row.current {
+    if show_note {
         let nr = Rect::from_x_y_ranges(gr.right() + 6.0..=cell.right(), cell.y_range());
         paint_text(ui, nr, row.note, font(Weight::Regular, theme::FS_TINY), theme::TEXT_FAINT, Align::Min);
     }
     let pc = r.cell(2);
     let pw = row.pill.width(ui).min(pc.width());
     row.pill.paint(ui, Rect::from_min_size(pos2(pc.left(), pc.center().y - theme::PILL_H / 2.0), vec2(pw, theme::PILL_H)));
-    r.text(ui, 3, row.kbps, font(Weight::Mono, 11.5), theme::TEXT_DIM, Align::Max);
+    if compact {
+        r.response.clone().on_hover_text(format!("{} · {}", row.name, row.kbps));
+    } else {
+        r.text(ui, 3, row.kbps, font(Weight::Mono, 11.5), theme::TEXT_DIM, Align::Max);
+    }
     let mut action = DestAction::None;
     if row.removable {
-        let clicked = r.show(ui, 4, Align::Center, |ui| {
+        let clicked = r.show(ui, x_slot, Align::Center, |ui| {
             super::icon_btn(ui, "close", super::IconBtnKind::Small, row.remove_tip).clicked()
         });
         if clicked {

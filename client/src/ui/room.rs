@@ -188,7 +188,7 @@ pub fn show_header(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
     let copy_tip = tr("ui.room.copy_invite_offline_tip", "Connect first: the link includes the relay's certificate");
     let leave_tip = match r.conn {
         ConnState::Joined => tr("ui.room.leave_tip", "Leave room"),
-        ConnState::Reconnecting => tr("ui.room.leave_reconnecting_tip", "Stop connecting to this room"),
+        ConnState::Connecting | ConnState::Reconnecting => tr("ui.room.leave_reconnecting_tip", "Stop connecting to this room"),
         ConnState::Disconnected => tr("ui.room.leave_offline_tip", "You're not connected to this room"),
     };
     let copy_tip_on = if joined.is_none() { format!("{copy_lbl}\n{copy_tip}") } else { copy_lbl.clone() };
@@ -218,21 +218,31 @@ pub fn show_header(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
     // Title: [h2][status pill][meta], gap 12.
     let pill_l = match r.conn {
         ConnState::Joined => tr("ui.room.connected", "Connected"),
+        ConnState::Connecting => tr("ui.room.connecting_pill", "Connecting"),
         ConnState::Reconnecting => tr("ui.room.reconnecting_pill", "Reconnecting"),
         ConnState::Disconnected => tr("ui.room.not_connected", "Not connected"),
     };
     let pill = match r.conn {
         ConnState::Joined => Pill::live(&pill_l).lead(widgets::PillLead::Dot),
+        ConnState::Connecting => Pill::progress(&pill_l),
         ConnState::Reconnecting => Pill::degraded(&pill_l),
         ConnState::Disconnected => Pill::muted(&pill_l),
     };
     let meta = r.handle.and_then(|h| cx.session(h).map(|s| (h, s.members.len()))).map(|(h, n)| {
         let sharing = cx.shares_in(h).len() + usize::from(matches!(cx.share_state(&r), ShareState::Live { .. }));
-        if n == 1 {
-            tr_with("ui.room.meta_one", "1 person · %{sharing} sharing", &[("sharing", &sharing.to_string())])
+        // Singular and plural per half: German conjugates the verb
+        // ("1 teilt", "2 teilen"), so one key per count shape, not one string.
+        let people = if n == 1 {
+            tr("ui.room.meta_people_one", "1 person")
         } else {
-            tr_with("ui.room.meta", "%{people} people · %{sharing} sharing", &[("people", &n.to_string()), ("sharing", &sharing.to_string())])
-        }
+            tr_with("ui.room.meta_people", "%{count} people", &[("count", &n.to_string())])
+        };
+        let sharing = if sharing == 1 {
+            tr("ui.room.meta_sharing_one", "1 sharing")
+        } else {
+            tr_with("ui.room.meta_sharing", "%{count} sharing", &[("count", &sharing.to_string())])
+        };
+        format!("{people} · {sharing}")
     });
     let h2 = font(Weight::Bold, theme::FS_H2);
     let meta_f = font(Weight::Regular, theme::FS_SMALL);
@@ -277,7 +287,7 @@ pub fn show_header(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
     if row.show(ui, 3, Align::Min, |ui| leave.show_sized(ui, w)).clicked() {
         match (r.conn, r.handle) {
             (ConnState::Joined, Some(h)) => cx.act(UiAction::Leave(h)),
-            (ConnState::Reconnecting, _) => cx.act(UiAction::CancelReconnect(r.key.clone())),
+            (ConnState::Connecting | ConnState::Reconnecting, _) => cx.act(UiAction::CancelReconnect(r.key.clone())),
             _ => {}
         }
     }
@@ -369,6 +379,11 @@ enum CardItem<'a> {
 fn room_body(ui: &mut Ui, cx: &mut Cx, st: &mut RoomState, r: &RoomEntry) {
     match (r.conn, r.handle) {
         (ConnState::Disconnected, _) => {
+            // The last Connect failed: say why, above the usual empty state.
+            if let Some(e) = cx.shell.connect_error(&r.key) {
+                let text = tr_with("ui.room.connect_failed", "Couldn't connect: %{error}", &[("error", e)]);
+                widgets::banner(ui, widgets::BannerKind::Warn, "error", &text, None);
+            }
             let title = tr_with("ui.room.offline_title", "You're not connected to %{room}", &[("room", &r.name)]);
             let text = tr("ui.room.offline_text", "It stays in your list so you can come back with one click.");
             let connect = tr("ui.room.connect", "Connect");
@@ -378,6 +393,13 @@ fn room_body(ui: &mut Ui, cx: &mut Cx, st: &mut RoomState, r: &RoomEntry) {
                 Some(0) => cx.act(UiAction::Connect(r.key.clone())),
                 Some(1) => cx.act(UiAction::OpenModal(Modal::ForgetConfirm { room: r.key.clone() })),
                 _ => {}
+            }
+        }
+        (ConnState::Connecting, _) => {
+            let title = tr_with("ui.room.connecting_title", "Connecting to %{room}…", &[("room", &r.name)]);
+            let cancel = tr("ui.room.cancel", "Cancel");
+            if empty_state(ui, "sync", &title, None, &[Btn::secondary(&cancel).large()]) == Some(0) {
+                cx.act(UiAction::CancelReconnect(r.key.clone()));
             }
         }
         (ConnState::Reconnecting, _) | (_, None) => {
@@ -962,6 +984,7 @@ fn share_card(ui: &mut Ui, cx: &Cx, h: RoomHandle, info: &StreamInfo, acts: &mut
     thumb_corners(ui, thumb, Some("LIVE"), has_audio && !audio_only);
 
     let me = cx.my_conn(h) == Some(info.owner);
+    let label = super::share_label(&info.label);
     let name = cx.member_name(h, info.owner);
     let specs = if audio_only {
         tr("ui.room.audio_only", "Audio only")
@@ -975,7 +998,7 @@ fn share_card(ui: &mut Ui, cx: &Cx, h: RoomHandle, info: &StreamInfo, acts: &mut
         let listening = cx.is_watching(key);
         let (l_on, l_off) = (tr("ui.room.listen", "Listen"), tr("ui.room.stop_listening", "Stop listening"));
         let b = if listening { Btn::secondary(&l_off).icon("volume_off") } else { Btn::primary(&l_on).icon("volume_up") };
-        if card_info(ui, info_r, who, &info.label, &specs, &[b]).is_some() {
+        if card_info(ui, info_r, who, &label, &specs, &[b]).is_some() {
             acts.push(UiAction::ToggleListen(key));
         }
     } else {
@@ -983,7 +1006,7 @@ fn share_card(ui: &mut Ui, cx: &Cx, h: RoomHandle, info: &StreamInfo, acts: &mut
         let pop = tr("ui.room.pop_out", "Pop out");
         let pop_tip = tr("ui.room.pop_out_card_tip", "Watch in its own window");
         let btns = [Btn::primary(&watch).icon("play_arrow"), Btn::secondary(&pop).icon("open_in_new").tip(&pop_tip)];
-        match card_info(ui, info_r, who, &info.label, &specs, &btns) {
+        match card_info(ui, info_r, who, &label, &specs, &btns) {
             Some(0) => acts.push(UiAction::Watch(key)),
             Some(1) => acts.push(UiAction::WatchPoppedOut(key)),
             _ => {}
@@ -1034,7 +1057,7 @@ fn my_card(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSourceId, destin
     // "You" label's: German "Du" made it a "D").
     let my_name = cx.my_conn(h).map(|me| cx.member_name(h, me)).unwrap_or_else(|| cx.state.display_name.clone());
     let settings = tr("ui.room.stream_settings", "Stream settings");
-    if card_info(ui, info_r, (&you, &my_name, 0), &c.label, &specs,&[Btn::secondary(&settings).icon("tune")]).is_some() {
+    if card_info(ui, info_r, (&you, &my_name, 0), &super::share_label(&c.label), &specs, &[Btn::secondary(&settings).icon("tune")]).is_some() {
         acts.push(UiAction::OpenModal(Modal::StreamSettings { capture, room: h }));
     }
 }
@@ -1082,8 +1105,13 @@ pub fn show_people(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
         }
         widgets::heading(ui, &tr("ui.room.people", "People"), None, false);
         // Wraps: the German line is wider than the 207 px column.
+        let text = if r.conn == ConnState::Connecting {
+            tr("ui.room.people_connecting", "Shown once the room is connected")
+        } else {
+            tr("ui.room.people_paused", "Back when the room reconnects")
+        };
         let mut job = egui::text::LayoutJob::single_section(
-            tr("ui.room.people_paused", "Back when the room reconnects"),
+            text,
             egui::TextFormat { font_id: font(Weight::Regular, theme::FS_SMALL), color: theme::TEXT_FAINT, line_height: Some(16.0), ..Default::default() },
         );
         job.wrap.max_width = ui.available_width();

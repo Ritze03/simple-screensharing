@@ -37,6 +37,7 @@ impl App {
 
             // --- rooms ---------------------------------------------------
             UiAction::Connect(key) => {
+                self.shell.clear_connect_error(&key);
                 if self.state.pending_connect.is_some() {
                     // One connect at a time (lib invariant): queue it.
                     if !self.state.auto_connect_queue.iter().any(|k| same_room(k, &key)) {
@@ -100,6 +101,7 @@ impl App {
                     self.state.cancel_connect();
                 }
                 self.state.auto_connect_queue.retain(|k| !same_room(k, &key));
+                self.shell.clear_connect_error(&key);
                 if let Err(e) = self.state.forget_room(&key) {
                     self.toast(tr_with("ui.toast.save_failed", "Couldn't save: %{error}", &[("error", &e.to_string())]), "error");
                 }
