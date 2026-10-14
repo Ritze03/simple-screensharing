@@ -8,10 +8,10 @@ Read this before building or changing any control, row, card or screen.
 
 Two sources, with a fixed precedence:
 
-1. **Electron design wins on looks**: colours, sizes, radii, type, the segmented/checkbox
+1. **The former Electron app's design wins on looks** (that app is removed; its design lives on as the reference, see `FRONTEND-SHELL.md`): colours, sizes, radii, type, the segmented/checkbox
    look, copy. The approved room-centric HTML mockup
-   (https://claude.ai/artifact/5yA1iHf1YnXqmABkZajCe4) is lifted from the Electron app's
-   `client/frontend/styles/tokens.css`; every constant in `theme.rs` names the CSS variable
+   (https://claude.ai/artifact/5yA1iHf1YnXqmABkZajCe4) is lifted from the former Electron app's
+   `tokens.css` (deleted in the egui rework); every constant in `theme.rs` names the CSS variable
    it came from so the two can be diffed.
 2. **The user's egui guide wins on construction**: how a control or row is built so it
    cannot overflow or drift. That guide is
@@ -19,7 +19,7 @@ Two sources, with a fixed precedence:
    (a different project; read it for the longer rationale). The conventions adapted here
    are the sections below that say "from the Forza guide".
 
-*Why this split:* the Electron app is the look the user approved and keeps; the Forza guide
+*Why this split:* the former Electron app is the look the user approved and keeps; the Forza guide
 encodes hard-won egui layout lessons (egui grows a `Ui` to fit a too-wide child, so one
 long row can push a whole card over its neighbour). We want the first one's appearance
 built with the second one's discipline.
@@ -30,8 +30,8 @@ built with the second one's discipline.
 | --- | --- | --- |
 | Label | control 50/50 `columns(2)`, labels wrap | Fixed **120 px label slot**, text truncates with "…" (tooltip carries the full text). Rows in every card line up at the same x and a long German label can't change a row's height. |
 | Value spinner `DragValue`, default alignment | `num_box`: right-aligned **mono** value in the fixed 72 px slot, drag to change, click to type | Matches the mockup's `.num` boxes; right alignment keeps digits column-aligned as values grow. |
-| Segmented control: its own look | The mockup's segmented/checkbox look | Electron wins on looks. |
-| Geist Mono as the UI font | **Geist** (sans) for text, **GeistMono only for numbers** | The Electron app is sans with mono readouts; a monospace UI made labels wide enough to squeeze room names (see `FRONTEND-SHELL.md`, deviations). |
+| Segmented control: its own look | The mockup's segmented/checkbox look | The Electron-era look wins. |
+| Geist Mono as the UI font | **Geist** (sans) for text, **GeistMono only for numbers** | The former Electron app was sans with mono readouts; a monospace UI made labels wide enough to squeeze room names (see `FRONTEND-SHELL.md`, deviations). |
 
 ## The layout rule: explicit nested boxes, fixed-size slots
 
@@ -99,14 +99,14 @@ number at a call site; if a role is missing, add a named `pub const` to `theme.r
   row 32 (`ROW_H`) / subrow 24, dest row 40, label slot 120 (`LABEL_W`), value slot 72
   (`VALUE_W`), spacing 4/8/12/16 (`S1..S4`), sidebar 272, People 232, modal 520/640/1120.
   Radii `ROUNDING*` (14 card, 12 well, 9, 8, 6).
-- **Colours** (Electron/mockup values): surfaces `SIDEBAR_RAIL` < `PANEL_SUNKEN` <
+- **Colours** (former-Electron/mockup values): surfaces `SIDEBAR_RAIL` < `PANEL_SUNKEN` <
   `PANEL_BASE` < `PANEL_RAISED`; text `TEXT`/`TEXT_DIM`/`TEXT_FAINT`; `ACCENT` (+
   `_LIGHT`/`_DEEP`/`_LIGHTER`); state `SUCCESS` (live/connected), `WARNING`
   (reconnecting/degraded), `DANGER`; borders `BORDER`, `DIVIDER`, `INSET_BORDER`,
   `WELL_BORDER`; field/button fills `FIELD`, `BTN`. Translucent tokens (pill backgrounds,
   accent washes, scrim) are named consts built by `theme::rgba` (a `const fn` over
   `Color32::from_rgba_unmultiplied_const`).
-- **Dark only**: the Electron app never had a light theme.
+- **Dark only**: the former Electron app never had a light theme.
 - **Fonts**: Geist Regular + Bold (text), GeistMono Regular (numbers only, never bold),
   Material Symbols Outlined (icons), all embedded from `client/assets/fonts/` (licences in
   `LICENSES/`). `theme::font(Weight::{Regular,Bold,Mono}, size)`; type scale `FS_*`.

@@ -62,7 +62,7 @@ its "Proposed" tab).
   width either stacks English for nothing or still truncates German. *Why the banner
   keeps its words:* Retry now is its whole point. Details in `stream_settings.rs`
   (`column_need`) and `room::reconnect_banner`.
-- **No self-preview** of your own share. *Why:* matches the Electron app's deliberate
+- **No self-preview** of your own share. *Why:* matches the former Electron app's deliberate
   removal (see `superdoc/features/self-preview.md`).
 
 ### Layout implementation rule
@@ -127,8 +127,8 @@ the next launch (`superdoc/features/presentation-modes.md`).
 Pop-out: the view sits in an `Arc<Mutex<VideoView>>` so the deferred viewport closure
 (`Send + Sync + 'static`) can paint the same view the tile would; while `popped` the tile
 shows a placeholder. The pop-out has hover-gated chrome (statbar, audio pill), F11
-fullscreen, and Escape only *leaves* fullscreen, never closes (the Electron viewer's
-rules, `superdoc/features/viewer-window.md`).
+fullscreen, and Escape only *leaves* fullscreen, never closes (the former Electron viewer's
+rules, carried over; `superdoc/features/viewer-window.md`).
 
 ## Behavioural rules that carried over
 
@@ -209,7 +209,7 @@ in `client/locales/{en,de}.yml`, German in du-form; check with
   pay bandwidth for") and `active_room` as a single designated room driving the tabs. The
   new design replaces all three: sharing is room-scoped in the action bar, and "Sharing
   elsewhere" is reachable from the user band's Outgoing popover.
-- **Electron + HTML frontend** (2026-07-26 to 2026-10, `client/frontend/`): see
+- **Electron + HTML frontend** (2026-07-26 to 2026-10, removed): see
   `FRONTEND-SHELL.md`. Its look (tokens, copy, behaviours) is the reference the egui UI
   copies; its structure is gone.
 - The full text of the earlier versions of this page (nav rail, click semantics, STREAMS,

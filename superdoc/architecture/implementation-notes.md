@@ -24,7 +24,7 @@ Found by I19 in a real two-client run.
   label): the watch entry, hence the decoder, goes; `ui::video::VideoViews::sync` then drops the GPU
   `VideoView` on the next frame. The selection moves on. No `unsubscribe` is sent (the relay already
   dropped the stream and its subscriber list). The relay sends `StreamStopped` for every stream of a
-  member that leaves or drops, so that case is covered too. The old Electron shell did this in
+  member that leaves or drops, so that case is covered too. The former Electron shell (removed) did this in
   `driver::prune_stale_watches`; the egui path never had it.
 - **Re-share resumes the watch (decision).** The stopped watch is remembered in
   `RoomSession::resume_after_stop` for `RESUME_AFTER_STOP` (30 s) and matched like a reconnect's
@@ -121,20 +121,21 @@ timeout) because nothing sent `Leave` or closed the QUIC connection. Both fixed 
 ## Rework foundation: monorepo, shared protocol, native decoder, lib consolidation (2026-10-14)
 
 Same-day sibling of the WebTransport block below (newest first). **Context for everything
-here:** the whole client is being reworked. Electron, the HTML frontend and the Tauri sidecar are
-being replaced by **one native egui app with a room-centric UI**. A **browser client** is coming
+here:** the whole client was reworked. Electron, the HTML frontend and the Tauri sidecar were
+replaced by **one native egui app with a room-centric UI**. A **browser client** is coming
 in `docs/`, served by GitHub Pages. The relay gains WebTransport (the block below). The plan and
 its decisions live in `.claude/teamlead/plan/rework-the-entire-thing.md` (Goal, D1-D34). The
 requirement driving the foundation work: screen sharing at **>= 120 fps end to end, ideally 240**.
 The foundation tasks below landed before any UI work and are the divergence from the
-"Electron + sidecar" architecture the rest of this page and `overview.md` still describe.
+former "Electron + sidecar" architecture (older entries on this page describe it; `overview.md`
+has the current map).
 
 - **I1, monorepo.** The workspace root is now one repository (private GitHub
   `Ritze03/simple-screensharing`, all rework on branch `rework`). `client/` and `server/` were
   imported from the old separate repos **with full history** (a `filter-branch` subdirectory
   rewrite, then a merge with `--allow-unrelated-histories`); the old branches are kept as
   `archive/client/*` (86) and `archive/server/*` (7). Root Cargo workspace: members `client`,
-  `client/src-tauri`, `server`, `protocol`, resolver 3; the root `Cargo.lock` started from the
+  `client/src-tauri` (since deleted), `server`, `protocol`, resolver 3; the root `Cargo.lock` started from the
   client's. The old nested repo directories and the empty `simple-screensharing-website/` were
   deleted. `Why:` server, desktop client and the upcoming browser client must change in
   lockstep, and the project owner asked for one repo. Consequences still visible in the tree:
@@ -165,7 +166,7 @@ The foundation tasks below landed before any UI work and are the divergence from
   software H.264, which cannot reach 120-240 fps. Detail: `features/video-pipeline.md` "Native
   decode".
 - **I4, sidecar logic moved into the lib.** What only lived in
-  `client/src-tauri/src/commands.rs` now lives on `session::AppState`, and `commands.rs` is thin:
+  `client/src-tauri/src/commands.rs` (since deleted) now lives on `session::AppState`; the sidecar kept only thin wrappers:
   create/join/forget room, the settings setters with their clamps, start-stream defaults,
   `edit_destination`, bandwidth total/floor, allocated kbps and overshoot, the audio-level tap,
   volume resolution, supported codecs. The JS encoder presets became `client/src/presets.rs`:
@@ -177,7 +178,7 @@ The foundation tasks below landed before any UI work and are the divergence from
   | Quality | BestQuality | Quality | Qvbr | 2000 ms |
   | Gaming | LowLatency | Performance | Cqp | 750 ms |
 
-  `Why:` the Electron/Tauri layers are being deleted, and the new egui UI must stay a thin view
+  `Why:` the Electron/Tauri layers were deleted in the egui rework, and the new egui UI must stay a thin view
   over `AppState` rather than re-implement what the sidecar did.
 - **I5, the bin links the lib.** `client/src/main.rs` no longer re-declares the core modules
   (they previously compiled twice, once per crate); it declares only `ui`, `theme` and
@@ -207,7 +208,7 @@ Spec: `protocol-spec.md` §11. What was decided while building it, and why:
   (`MAX_MEDIA_DATAGRAM_LEN` in the protocol crate).
 - **Cert lifecycle.** 13-day ECDSA P-256 (browsers: ≤ 14 days, P-256 only), `notBefore`
   back-dated by 1 h *inside* the 13 days; rotation at < 2 days left; persisted to
-  `state/` (gitignored, key file 0600) so a restart keeps the hash. A sidecar `cert.meta`
+  `state/` (gitignored, key file 0600) so a restart keeps the hash. A companion `cert.meta` file
   stores `notAfter` and the SAN list because reading `notAfter` back out of the PEM would need
   an X.509 parser dependency; missing/mismatched meta simply regenerates. Test hooks:
   `--cert-validity-secs` / `--cert-rotate-before-secs`, and `CertSource::SelfSigned`'s fields.
@@ -615,6 +616,10 @@ records — `termwiz`/`termina` never compile).
   contended, and asserts the route snapshot never diverges from the subscriber set).
 
 ## QC findings
+
+> **History note:** the 2026-07-27 entry below was written in the Electron/Tauri era and names
+> the removed Tauri app and `#[tauri::command]` layer. Kept as a dated record; the egui client
+> has no such layer.
 
 ### 2026-07-27 — final pre-egui-removal QC pass: real relay + real Tauri app, GUI automation blocked
 

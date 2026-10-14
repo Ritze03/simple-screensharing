@@ -1,5 +1,5 @@
-// Adaptive jitter buffer for still-encoded video chunks, adapted from the Electron frontend's
-// `client/frontend/scripts/tile-video.js` (same maths, tuned against this wire format).
+// Adaptive jitter buffer for still-encoded video chunks, adapted from the former Electron frontend's
+// `tile-video.js` (removed in the egui rework; same maths, tuned against this wire format).
 //
 // Chunks are held (cheap: KBs each, never decoded VideoFrames) and released for decode at
 //   decodeAt = anchorArrival + (pts - anchorPts) + appliedBuffer

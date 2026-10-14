@@ -1172,7 +1172,7 @@ async fn late_subscriber_after_unwatched_period_gets_a_real_keyframe_real_portal
 }
 
 /// TEMP DIAGNOSTIC (bug investigation, the "no real keyframe reaches a late
-/// subscriber" bug of the removed Electron video relay): reproduces the
+/// subscriber" bug of the since-removed Electron video relay): reproduces the
 /// exact reported scenario — a sharer broadcasting to an *empty* room (zero
 /// subscribers, encoder unpaused and running the whole time so its periodic
 /// 2s-GOP keyframes are simply going nowhere) for well over one GOP

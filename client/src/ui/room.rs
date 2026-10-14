@@ -23,7 +23,7 @@
 //!   16:9 ([`single_tile_width`]) so the share cards stay in view; more → two
 //!   equal columns ([`room_tile_cols`]).
 //! - "Watched streams": every watched stream, so the tiles are fitted into
-//!   the viewport with the old Electron `computeGridShape` ([`grid_shape`]).
+//!   the viewport with `grid_shape` (a port of the former Electron frontend's `computeGridShape`) ([`grid_shape`]).
 //!   `Why` not the room rule there: that view has nothing below the tiles, so
 //!   the biggest tiles that fit beat a fixed two-column grid that scrolls.
 //!
@@ -99,7 +99,7 @@ pub fn room_tile_cols(n: usize, avail_w: f32) -> usize {
     if n <= 1 || avail_w < 2.0 * MIN_TILE_W + theme::GRID_GAP { 1 } else { 2 }
 }
 
-/// Port of the Electron `computeGridShape` (`frontend/scripts/view.js`): the
+/// Port of the former Electron frontend's `computeGridShape` (removed in the egui rework): the
 /// column count and tile width that give `n` 16:9 tiles the largest area in
 /// `w × h` with `gap` between them. Shapes whose tiles would be narrower than
 /// [`MIN_TILE_W`] are skipped (the view then scrolls instead of shrinking

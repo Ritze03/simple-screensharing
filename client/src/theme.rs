@@ -2,8 +2,8 @@
 //! the global `egui::Style`, the embedded fonts, and the icon font lookup.
 //!
 //! **Source of truth for every value here:** the approved "Proposed" room-centric mockup
-//! (`:root` block of its CSS), whose colors are lifted from the Electron app's
-//! `client/frontend/styles/tokens.css`. Each constant names its CSS variable so the two
+//! (`:root` block of its CSS), whose colors are lifted from the former Electron
+//! frontend's `tokens.css` (removed in the egui rework). Each constant names its CSS variable so the two
 //! can be diffed. Reference colors by *role* (`ACCENT`, `TEXT_DIM`, …), never by raw hex
 //! at a call site.
 //!
@@ -13,7 +13,7 @@
 //!
 //! Entry point: [`apply`] — fonts + visuals + spacing. Call once at startup.
 //!
-//! The app is dark-only: the Electron app never had a light theme (`color-scheme: dark`).
+//! The app is dark-only: the former Electron app never had a light theme (`color-scheme: dark`).
 
 #![allow(dead_code)] // design tokens: not every token has a caller until the new screens land
 

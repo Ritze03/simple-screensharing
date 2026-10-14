@@ -16,7 +16,7 @@ browser leg. How to test safely on this machine (headless vs headed, GUI lock, r
 
 ## Shape
 
-Static GitHub-Pages site, **no build step, no npm runtime dependency, no CDN** (fonts are self-hosted
+Static GitHub-Pages site, **no build step, no bundler or package-manager dependencies, no CDN** (fonts are self-hosted
 in `docs/assets/fonts/`). Plain ES modules with relative imports; all paths relative so `docs/` can be
 served under `/simple-screensharing/`.
 
@@ -42,7 +42,7 @@ docs/dev/        harness, tests, scenarios, e2e        (README.md)  not linked f
   header (`MAX_MEDIA_DATAGRAM_LEN`). `Why 1000:` Chromium's `datagrams.maxDatagramSize` is 1024; the
   session refuses to join below 1000.
 - **Media:** WebCodecs encode/decode (H.264, AV1; H.265 decode only), Opus via WebCodecs +
-  WebAudio, an adaptive jitter buffer ported from the Electron `tile-video.js`, the 30 s JPEG room
+  WebAudio, an adaptive jitter buffer ported from the former Electron frontend's `tile-video.js` (removed in the egui rework), the 30 s JPEG room
   previews, and the same bitstream-based codec sniffing as native (`codec.js`).
 - **Identity across reconnects:** every stream info carries a **`stableKey`** (room + sharer name +
   kind + label); a reconnect gives the sharer a fresh ConnId and so a new stream key, and the core

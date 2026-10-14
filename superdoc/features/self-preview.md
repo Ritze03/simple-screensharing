@@ -2,7 +2,7 @@
 
 > **Status (2026-10-14): history, plus an unused library remnant.** The sender-side "Your
 > preview" thumbnail is **not shown by the app any more**. The UI half was dropped when the
-> client was rebuilt as one egui binary (I11); this matches the Electron build, which removed the
+> client was rebuilt as one egui binary (I11); this matches the former Electron build, which removed the
 > same preview on purpose (commit `a4be944` in the old client repo, per the project owner's
 > brief; that commit is not in this repo, so it could not be re-read). What remains is the
 > capture-side plumbing below, which nothing consumes.
