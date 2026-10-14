@@ -1,7 +1,7 @@
 //! Encoder presets and the small option tables the Stream Control UI offers.
 //!
-//! Ported from the JS frontend (`frontend/scripts/components.js`'s
-//! `ENCODER_PRESETS` / `activeEncoderPreset` / `CODEC_OPTIONS`, and
+//! Ported from the former Electron frontend (its `components.js`, removed in
+//! the egui rework: `ENCODER_PRESETS` / `activeEncoderPreset` / `CODEC_OPTIONS`, and
 //! `stream-control.js`'s `FRAMERATE_OPTIONS` / `framerateOptionsFor`) so the
 //! native UI stays a thin view over the lib: it asks this module "which
 //! preset is active?" and "what does picking Gaming set?" instead of owning
@@ -313,7 +313,7 @@ fn localized(key: &'static str) -> &'static str {
 mod tests {
     use super::*;
 
-    /// The JS `ENCODER_PRESETS` table (`frontend/scripts/components.js`
+    /// The former JS `ENCODER_PRESETS` table (the Electron frontend's `components.js`, removed
     /// ~:994), copied verbatim as `(value, label, title, tune, qualityLevel,
     /// rateControl, gopMillis)` with the JS wire strings
     /// (`dto::parse_tune_mode` etc.) and `DEFAULT_GOP_MILLIS = 2000`,

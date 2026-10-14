@@ -10,7 +10,7 @@
 //! PipeWire's own CLI tools are shelled out to via [`std::process::Command`]
 //! rather than binding `libpipewire` directly — simpler to get right and
 //! maintain for this project, per the accepted design (based on how
-//! ScreegoElectronScreenshare solves the same problem on Linux):
+//! the ScreegoElectronScreenshare project solves the same problem on Linux):
 //!
 //! 1. [`list_audio_sources`] runs `pw-dump` (PipeWire's full graph, as JSON)
 //!    and returns every node with `media.class = "Stream/Output/Audio"` —

@@ -4254,7 +4254,7 @@ pub fn install_shutdown_signal_handlers(_ctx: egui::Context) {}
 // UI-facing operations
 // ---------------------------------------------------------------------
 //
-// Everything below used to live in the (removed) Tauri sidecar's command layer
+// Everything below used to live in the former (removed) Tauri sidecar's command layer
 // or in the JS frontend. It is here so that the UI stays a thin view over
 // `AppState` and never re-implements business logic.
 

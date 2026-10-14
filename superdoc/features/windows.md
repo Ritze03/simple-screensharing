@@ -112,12 +112,14 @@ viewer would otherwise pick that one.
   (`New-NetFirewallRule -Direction Inbound -Protocol UDP -LocalPort 4433 -Action Allow`).
 - The relay's TUI needs a console: started through `Win32_Process.Create` (a hidden session 0 console) or a
   scheduled task in the interactive session.
-- **The relay does not build or work on Windows as it is** (`server/` is a separate crate; the fixes below were
-  applied in a copy inside the VM; the exact diff, tested on Linux (16 server tests pass) and Windows, is `client/packaging/windows/server-windows.patch`, apply it with `git apply`):
-  1. `tokio::signal::unix` in `server/src/main.rs` does not compile. A `Sigterm` shim that never fires on Windows fixes it.
+- **The relay builds and works on Windows as it is** (`cargo build --release -p simple-screensharing-server`, or
+  `build.ps1 -Server`). Two Windows fixes are in `server/` (tested on Linux, 16 server tests, and in the VM, where
+  Linux and Windows clients both connected):
+  1. `tokio::signal::unix` in `server/src/main.rs` does not compile on Windows. A `Sigterm` shim (unix: the real
+     signal; elsewhere: never fires, Ctrl-C still works) fixes it.
   2. `Endpoint::server` on `[::]` leaves `IPV6_V6ONLY` at the Windows default (on), so **IPv4 clients never connect**
-     (`QUIC handshake failed: timed out`; `localhost` works because it resolves to `::1`). Binding the socket with
-     `socket2` and `set_only_v6(false)` first fixes it (quinn's own doc: "platform defaults for dual-stack
+     (`QUIC handshake failed: timed out`; `localhost` works because it resolves to `::1`). `build_endpoint_with` in
+     `server/src/relay.rs` now binds the socket with `socket2` and `set_only_v6(false)` first, which fixes it (quinn's own doc: "platform defaults for dual-stack
      sockets vary").
 
 ## Windows virtual NIC: UDP send offload loses QUIC datagrams

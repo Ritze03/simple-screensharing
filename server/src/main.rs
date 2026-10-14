@@ -171,7 +171,7 @@ async fn main() -> Result<()> {
     let tui_thread = std::thread::spawn(move || tui::run(tui_registry, tui_stop));
     let mut tui_join = tokio::task::spawn_blocking(move || tui_thread.join());
 
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigterm = Sigterm::new()?;
 
     // Wait for whichever comes first: the TUI quitting, SIGINT/SIGTERM.
     let tui_done = tokio::select! {
@@ -230,4 +230,29 @@ async fn main() -> Result<()> {
     // straggling blocking task in the runtime.
     drop(_log_guard);
     std::process::exit(0);
+}
+
+/// SIGTERM on Unix; Windows has no equivalent (Ctrl-C is handled
+/// separately), so there `recv` never completes.
+#[cfg(unix)]
+struct Sigterm(tokio::signal::unix::Signal);
+#[cfg(unix)]
+impl Sigterm {
+    fn new() -> std::io::Result<Self> {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).map(Self)
+    }
+    async fn recv(&mut self) -> Option<()> {
+        self.0.recv().await
+    }
+}
+#[cfg(not(unix))]
+struct Sigterm;
+#[cfg(not(unix))]
+impl Sigterm {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self)
+    }
+    async fn recv(&mut self) -> Option<()> {
+        std::future::pending().await
+    }
 }
