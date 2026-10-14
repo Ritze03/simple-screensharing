@@ -71,9 +71,9 @@
 //!
 //! # Running this test
 //!
-//! Requires: the server repo built at
-//! `~/GitHubProjects/simple-screensharing/simple-screensharing-server`
-//! (release or debug profile), a working GStreamer install (same requirement every other
+//! Requires: the relay built in this workspace
+//! (`cargo build -p simple-screensharing-server`; found under
+//! `$CARGO_TARGET_DIR` or `<workspace>/target`, see [`server_target_dir`]), a working GStreamer install (same requirement every other
 //! `capture.rs`/`decode.rs` test already has), and the `script`/`setsid`
 //! utilities (`util-linux`; present on essentially every Linux desktop).
 //! Not runnable in a typical unattended CI container without those, and
@@ -83,7 +83,7 @@
 //! `capture::tests::vaapi_pipeline_links_and_produces_encoded_output`):
 //!
 //! ```sh
-//! cargo test end_to_end_test:: -- --ignored --nocapture
+//! cargo test -p simple-screensharing-client --lib -- --ignored end_to_end_test:: --skip real_portal --nocapture
 //! ```
 
 use std::net::UdpSocket;
@@ -106,6 +106,8 @@ use crate::protocol::{PresenceEvent, RoomId};
 pub(crate) struct ServerGuard {
     child: Child,
     port: u16,
+    /// Scratch cwd we created (and so remove on drop); `None` if caller-owned.
+    work_dir: Option<PathBuf>,
 }
 
 impl Drop for ServerGuard {
@@ -120,6 +122,9 @@ impl Drop for ServerGuard {
         let _ = Command::new("pkill")
             .args(["-f", &format!("simple-screensharing-server {}", self.port)])
             .status();
+        if let Some(dir) = &self.work_dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 }
 
@@ -135,45 +140,57 @@ pub(crate) fn pick_free_udp_port() -> Result<u16> {
     Ok(socket.local_addr()?.port())
 }
 
-/// Locates the built server binary in the sibling checkout this project's
-/// repos are fixed to live in (see this task's own instructions / the
-/// client repo's README). Prefers a release build (faster to run) but
-/// falls back to debug.
-/// Candidate sibling-checkout roots for the relay server repo, in preference
-/// order. Two, not one: the workspace originally nested each repo under a
-/// `master/` directory and no longer does. Probing both keeps this harness
-/// working on either layout instead of failing with a path that simply isn't
-/// there any more.
-pub(crate) fn server_repo_candidates() -> Result<Vec<PathBuf>> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow!("could not determine home directory"))?;
-    Ok(vec![
-        home.join("GitHubProjects/simple-screensharing/simple-screensharing-server"),
-        home.join("GitHubProjects/simple-screensharing/master/simple-screensharing-server"),
-    ])
+/// Directory holding the built relay binary's `debug/` and `release/` dirs:
+/// the runtime `CARGO_TARGET_DIR` if set, otherwise the workspace target dir
+/// (`<this crate>/../target`, the monorepo's shared target).
+///
+/// Why: the repo is one Cargo workspace (`client/` + `server/`), so
+/// `simple-screensharing-server` lands in the same target dir as this test
+/// binary. `CARGO_TARGET_DIR` is read at runtime (not `env!`) because it is
+/// usually exported in the shell that runs `cargo test`, and a shared or
+/// redirected target dir is exactly the case where the manifest-relative guess
+/// is wrong.
+pub(crate) fn server_target_dir() -> PathBuf {
+    match std::env::var_os("CARGO_TARGET_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target"),
+    }
 }
 
-fn server_binary_path() -> Result<PathBuf> {
-    // The candidate roots below predate the monorepo (one shared `target/` at
-    // the workspace root), so they no longer find a binary there: point
-    // `SSSHARE_SERVER_BIN` at `<target>/debug/simple-screensharing-server`
-    // (and optionally `SSSHARE_SERVER_CWD` at a scratch directory, which is
-    // where the relay puts its `logs/` and `state/`).
+/// Compat shim for `audio.rs`'s `stop_returns_promptly_and_reaps_pw_loopback`
+/// (not owned by this change), which joins `target/{release,debug}/...` onto
+/// each returned root. Returns the parent of [`server_target_dir`], so that
+/// join resolves correctly only while the target dir is literally named
+/// `target`. TODO: switch that test to [`server_binary_path`] and delete this.
+pub(crate) fn server_repo_candidates() -> Result<Vec<PathBuf>> {
+    let target = server_target_dir();
+    let root = target.parent().ok_or_else(|| anyhow!("target dir {target:?} has no parent"))?;
+    Ok(vec![root.to_path_buf()])
+}
+
+/// Locates the built relay binary under [`server_target_dir`]. If both a
+/// release and a debug build exist, the more recently built one wins (avoids
+/// silently testing against a stale binary). Does not build it: a missing
+/// binary is a clear error telling the user to build it, rather than a hidden
+/// multi-minute `cargo build` (and a nested cargo lock) inside a test.
+pub(crate) fn server_binary_path() -> Result<PathBuf> {
+    // Explicit override wins (e.g. a binary built in a different worktree).
     if let Ok(p) = std::env::var("SSSHARE_SERVER_BIN") {
         return Ok(PathBuf::from(p));
     }
-    let candidates = server_repo_candidates()?;
-    for repo in &candidates {
-        for profile in ["release", "debug"] {
-            let binary = repo.join(format!("target/{profile}/simple-screensharing-server"));
-            if binary.is_file() {
-                return Ok(binary);
-            }
-        }
-    }
-    Err(anyhow!(
-        "server binary not found under any of {candidates:?} (target/release or target/debug) — \
-         build the server repo first (`cargo build --release` in it)"
-    ))
+    let target = server_target_dir();
+    let newest = ["release", "debug"]
+        .iter()
+        .map(|profile| target.join(profile).join("simple-screensharing-server"))
+        .filter(|binary| binary.is_file())
+        .max_by_key(|binary| std::fs::metadata(binary).and_then(|m| m.modified()).ok());
+    newest.ok_or_else(|| {
+        anyhow!(
+            "relay server binary not found at {0}/{{debug,release}}/simple-screensharing-server - \
+             build it first with `cargo build -p simple-screensharing-server`",
+            target.display()
+        )
+    })
 }
 
 /// Spawns the real relay server binary as a child process listening on
@@ -182,23 +199,19 @@ fn server_binary_path() -> Result<PathBuf> {
 pub(crate) fn spawn_relay_server(port: u16) -> Result<ServerGuard> {
     let binary = server_binary_path()?;
     // The server writes its `logs/` directory relative to its current
-    // working directory (see its `main.rs`'s `LOG_DIR`). Without an
-    // explicit `current_dir`, it would inherit *this test process's* cwd
-    // (the client repo root) and litter a `logs/` directory there instead
-    // of alongside the server binary where it belongs.
-    let server_repo_dir = binary
-        .parent() // .../target/release or .../target/debug
-        .and_then(|p| p.parent()) // .../target
-        .and_then(|p| p.parent()) // server repo root
-        .ok_or_else(|| anyhow!("could not determine server repo directory from {binary:?}"))?
-        .to_path_buf();
-    let server_repo_dir = std::env::var("SSSHARE_SERVER_CWD")
-        .map(PathBuf::from)
-        .unwrap_or(server_repo_dir);
+    // working directory (see its `main.rs`'s `LOG_DIR`). Give it a private
+    // per-port temp dir (removed by `ServerGuard` on drop) so it litters
+    // neither the workspace nor the test cwd. `SSSHARE_SERVER_CWD` overrides
+    // it with a caller-owned directory, which is never deleted.
+    let (work_dir, owned) = match std::env::var_os("SSSHARE_SERVER_CWD") {
+        Some(dir) => (PathBuf::from(dir), false),
+        None => (std::env::temp_dir().join(format!("sss-relay-{}-{port}", std::process::id())), true),
+    };
+    std::fs::create_dir_all(&work_dir).context("failed to create relay working dir")?;
     let cmd_string = format!("{} {port}", binary.display());
     let child = Command::new("setsid")
         .args(["script", "-qc", &cmd_string, "/dev/null"])
-        .current_dir(&server_repo_dir)
+        .current_dir(&work_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -207,7 +220,7 @@ pub(crate) fn spawn_relay_server(port: u16) -> Result<ServerGuard> {
             "failed to spawn relay server child process \
              (requires `setsid` and `script` from util-linux)",
         )?;
-    Ok(ServerGuard { child, port })
+    Ok(ServerGuard { child, port, work_dir: owned.then_some(work_dir) })
 }
 
 /// Retries [`ScreenshareClient::connect`] with a short backoff, giving a
@@ -261,7 +274,7 @@ const HEIGHT: u32 = 240;
 
 #[tokio::test]
 #[ignore = "spawns a real relay server child process and real GStreamer capture/decode \
-            pipelines; run explicitly with `cargo test end_to_end_test:: -- --ignored --nocapture`"]
+            pipelines; run explicitly with `cargo test -p simple-screensharing-client --lib -- --ignored end_to_end_test:: --skip real_portal --nocapture`"]
 async fn real_capture_encrypt_fragment_relay_decode_round_trip() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
@@ -435,7 +448,7 @@ async fn real_capture_encrypt_fragment_relay_decode_round_trip() {
 /// under test.
 #[tokio::test]
 #[ignore = "spawns a real relay server child process and real GStreamer capture/decode \
-            pipelines; run explicitly with `cargo test end_to_end_test:: -- --ignored --nocapture`"]
+            pipelines; run explicitly with `cargo test -p simple-screensharing-client --lib -- --ignored end_to_end_test:: --skip real_portal --nocapture`"]
 async fn resubscribe_after_pause_resumes_encoder_and_frames_flow() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
@@ -735,7 +748,7 @@ async fn resubscribe_after_pause_resumes_encoder_and_frames_flow() {
 /// breaks after having already been forced once).
 #[tokio::test]
 #[ignore = "spawns a real relay server child process and real GStreamer capture/decode \
-            pipelines; run explicitly with `cargo test end_to_end_test:: -- --ignored --nocapture`"]
+            pipelines; run explicitly with `cargo test -p simple-screensharing-client --lib -- --ignored end_to_end_test:: --skip real_portal --nocapture`"]
 async fn repeated_pause_resume_cycles_keep_resuming() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
@@ -1186,7 +1199,7 @@ async fn late_subscriber_after_unwatched_period_gets_a_real_keyframe_real_portal
 /// is exactly the axis the small-resolution tests never stress.
 #[tokio::test]
 #[ignore = "spawns a real relay server child process and real GStreamer capture/decode \
-            pipelines; run explicitly with `cargo test end_to_end_test:: -- --ignored --nocapture`"]
+            pipelines; run explicitly with `cargo test -p simple-screensharing-client --lib -- --ignored end_to_end_test:: --skip real_portal --nocapture`"]
 async fn late_subscriber_after_unwatched_period_gets_a_real_keyframe() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
@@ -1618,7 +1631,7 @@ async fn late_watch_after_all_three_tuning_controls_toggled_gets_a_real_keyframe
 /// tests in this file use.
 #[tokio::test]
 #[ignore = "spawns a real relay server child process and real GStreamer capture pipeline; \
-            run explicitly with `cargo test end_to_end_test:: -- --ignored --nocapture`"]
+            run explicitly with `cargo test -p simple-screensharing-client --lib -- --ignored end_to_end_test:: --skip real_portal --nocapture`"]
 async fn retry_destination_preserves_prior_encoder_tuning() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
@@ -1813,7 +1826,7 @@ async fn retry_destination_preserves_prior_encoder_tuning() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "spawns a real relay server child process, real GStreamer capture/decode pipelines \
             and a real PipeWire audio node; run explicitly with \
-            `cargo test end_to_end_test:: -- --ignored --nocapture`"]
+            `cargo test -p simple-screensharing-client --lib -- --ignored end_to_end_test:: --skip real_portal --nocapture`"]
 async fn watching_video_automatically_delivers_the_sharers_audio_too() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
@@ -2044,7 +2057,7 @@ async fn watching_video_automatically_delivers_the_sharers_audio_too() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "spawns a real relay server child process, real GStreamer capture/decode pipelines \
             and a real PipeWire audio node; run explicitly with \
-            `cargo test end_to_end_test:: -- --ignored --nocapture`"]
+            `cargo test -p simple-screensharing-client --lib -- --ignored end_to_end_test:: --skip real_portal --nocapture`"]
 async fn volume_survives_sender_audio_restart_or_switch() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
@@ -2269,7 +2282,7 @@ async fn volume_survives_sender_audio_restart_or_switch() {
 /// `videotestsrc`.
 #[tokio::test]
 #[ignore = "spawns a real relay server child process and a real GStreamer capture pipeline; \
-            run explicitly with `cargo test end_to_end_test:: -- --ignored --nocapture`"]
+            run explicitly with `cargo test -p simple-screensharing-client --lib -- --ignored end_to_end_test:: --skip real_portal --nocapture`"]
 async fn go_live_attaches_the_first_destination_with_real_resolution_and_backend() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
@@ -2418,7 +2431,7 @@ async fn go_live_attaches_the_first_destination_with_real_resolution_and_backend
 /// use) either right after the jump, or ever.
 #[tokio::test]
 #[ignore = "spawns a real relay server child process and real GStreamer capture/decode \
-            pipelines; run explicitly with `cargo test end_to_end_test:: -- --ignored --nocapture`"]
+            pipelines; run explicitly with `cargo test -p simple-screensharing-client --lib -- --ignored end_to_end_test:: --skip real_portal --nocapture`"]
 async fn big_fps_jump_mid_stream_keeps_viewer_frames_flowing() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
@@ -2691,7 +2704,7 @@ async fn start_audio_share_rejects_a_merely_staged_video_capture() {
 /// covered by that other test.
 #[tokio::test]
 #[ignore = "spawns a real relay server child process and a real GStreamer capture pipeline; \
-            run explicitly with `cargo test end_to_end_test:: -- --ignored --nocapture`"]
+            run explicitly with `cargo test -p simple-screensharing-client --lib -- --ignored end_to_end_test:: --skip real_portal --nocapture`"]
 async fn start_audio_share_succeeds_once_the_video_capture_is_live() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
@@ -2793,7 +2806,7 @@ async fn start_audio_share_succeeds_once_the_video_capture_is_live() {
 /// capture exercises the exact same code path a real audio capture would.
 #[tokio::test]
 #[ignore = "spawns a real relay server child process and two real GStreamer capture pipelines; \
-            run explicitly with `cargo test end_to_end_test:: -- --ignored --nocapture`"]
+            run explicitly with `cargo test -p simple-screensharing-client --lib -- --ignored end_to_end_test:: --skip real_portal --nocapture`"]
 async fn stop_share_tears_down_a_paired_audio_capture_too() {
     let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
@@ -2951,4 +2964,362 @@ async fn native_client_learns_the_relay_cert_hash_and_tolerates_a_stale_one() {
     let stale = crate::net::format_join_string_with_hash(&server_addr, &room_id, &room_key, Some(&[0xEE; 32]));
     let (c, _s, _ev_c) = connect_with_retry(&stale, "c").await.expect("a stale pin must not block a native client");
     assert_eq!(c.current_cert_hash(), Some(hash), "reports what the relay really presented, not what the link said");
+}
+
+// ---------------------------------------------------------------------------
+// Session-logic tests driving `session::AppState` directly (no UI).
+//
+// Ported from the old egui `ui::App` test module. They exercise the same
+// production session code the UI front-ends call (`insert_room`,
+// `add_destination`, `transfer_destination`, `apply_bandwidth_allocation`,
+// `drain_events`, ...) against a real relay child process and a real
+// GStreamer capture/decode pipeline.
+// ---------------------------------------------------------------------------
+
+mod session_logic {
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use indexmap::IndexMap;
+
+    use super::{connect_with_retry, pick_free_udp_port, spawn_relay_server};
+    use crate::capture::{self, DestKey};
+    use crate::net::ClientEvent;
+    use crate::protocol::{ConnId, PresenceEvent, StreamKind};
+    use crate::rooms::BandwidthMode;
+    use crate::session::{
+        AppState, Destination, DestinationId, LocalCapture, PendingRole, RoomHandle, ShareHandle, ShareStatus,
+        WatchEntry,
+    };
+
+    const TEST_STREAM_ID: u8 = 1;
+    /// High enough that a starved ingestion path is obvious, low enough for a
+    /// software x264enc/avdec_h264 round trip on ordinary test hardware.
+    const TEST_FPS: u32 = 100;
+
+    /// Points settings/rooms files at a throwaway dir.
+    ///
+    /// `Why:` `set_bandwidth_mode` and `create_room` *persist*, and `rooms.rs`
+    /// resolves its config path through `dirs::config_dir()` at call time, so
+    /// without this a test would rewrite the developer's own
+    /// `~/.config/simple-screensharing/`. `set_var` is `unsafe` because another
+    /// thread could read the environment concurrently; this runs before any
+    /// room, capture or task of the calling test exists. (Both tests set the
+    /// same variable to a per-process dir, so a concurrent run is harmless.)
+    fn isolate_config(tag: &str) -> std::path::PathBuf {
+        let config_home = std::env::temp_dir().join(format!("sss-{tag}-test-{}", std::process::id()));
+        std::fs::create_dir_all(&config_home).expect("temp config dir");
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", &config_home) };
+        config_home
+    }
+
+    /// Polls `state` (draining room events and pending work, the way a
+    /// front-end's frame tick does) until `done` or the deadline passes.
+    async fn wait_for(state: &mut AppState, timeout: Duration, done: impl Fn(&AppState) -> bool) {
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            state.drain_events(&ctx);
+            state.poll_capture_states();
+            state.poll_pending_destinations();
+            state.poll_destination_edits();
+            if done(state) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("condition not met within {timeout:?}");
+    }
+
+    /// Waits for the watcher to see the sharer's `StreamStarted` presence delta
+    /// (the relay silently drops a `Subscribe` for a stream it doesn't know
+    /// about yet), then subscribes.
+    async fn subscribe_when_announced(state: &mut AppState, room: RoomHandle, owner: ConnId) {
+        let session = state.rooms.get_mut(&room).expect("room must be present");
+        let saw = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match session.event_rx.recv().await {
+                    Some(ClientEvent::PresenceDelta(PresenceEvent::StreamStarted(info)))
+                        if info.owner == owner && info.stream_id == TEST_STREAM_ID =>
+                    {
+                        return true;
+                    }
+                    Some(_) => continue,
+                    None => return false,
+                }
+            }
+        })
+        .await;
+        assert_eq!(saw, Ok(true), "watcher never observed the sharer's StreamStarted delta");
+        session.client.subscribe(owner, TEST_STREAM_ID).await.expect("subscribe() failed");
+    }
+
+    /// Regression test for the "fast-forward catch-up" fps bug: media
+    /// ingestion (`insert_room`'s `spawn_media_ingestion_task`) must feed the
+    /// `StreamDecoder` straight off the raw connection channel, independent of
+    /// `AppState::drain_events` ever being called.
+    ///
+    /// Before the fix nothing but `drain_events` called `feed()`, so with
+    /// `drain_events` starved (an unfocused window throttling the frame tick)
+    /// the decoder saw nothing. Here `drain_events` is never called, yet the
+    /// decoder must keep decoding at close to the sender's rate. Frames are
+    /// counted at the decoder output via `FrameSource::frames_decoded()`, so no
+    /// consumer polling is involved at all.
+    #[tokio::test]
+    #[ignore = "spawns a real relay server child process and a real GStreamer capture/decode pipeline; \
+                run with `cargo test -p simple-screensharing-client --lib -- --ignored end_to_end_test:: --skip real_portal`"]
+    async fn media_ingestion_keeps_feeding_the_decoder_while_drain_events_is_starved() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        gstreamer::init().expect("gstreamer init");
+        let config_home = isolate_config("ingestion");
+
+        let port = pick_free_udp_port().expect("failed to pick a free UDP port for the test relay");
+        let _server = spawn_relay_server(port).expect("failed to spawn relay server child process");
+        let mut state = AppState::default();
+        let join_string =
+            state.create_room(&format!("127.0.0.1:{port}"), "ingestion").expect("create_room").join_string;
+
+        let (client_a, _snapshot_a, events_a) =
+            connect_with_retry(&join_string, "sharer").await.expect("sharer failed to connect");
+        let (client_b, snapshot_b, events_b) =
+            connect_with_retry(&join_string, "watcher").await.expect("watcher failed to connect");
+        let _events_a_keepalive = events_a;
+
+        let source_fragment = format!(
+            "videotestsrc is-live=true pattern=ball \
+             ! clockoverlay time-format=\"%H:%M:%S%.3f\" \
+             ! video/x-raw,width=320,height=240,framerate={TEST_FPS}/1"
+        );
+        let capture_handle =
+            capture::start_sharing_from_test_source(&client_a, TEST_STREAM_ID, 4000, TEST_FPS, &source_fragment)
+                .await
+                .expect("start_sharing_from_test_source failed");
+        let owner = client_a.conn_id();
+
+        // `insert_room` is where the ingestion task is spawned in production;
+        // using it (not a hand-rolled `RoomSession`) tests the real wiring.
+        state.framerate = TEST_FPS;
+        let room = state.insert_room(client_b, snapshot_b, events_b, join_string.clone());
+        state.active_room = Some(room);
+        let decoder = crate::decode::StreamDecoder::new(TEST_STREAM_ID).expect("failed to build StreamDecoder");
+        let frames = decoder.frames();
+        state.rooms[&room].watches.lock().unwrap().insert(
+            (owner, TEST_STREAM_ID),
+            WatchEntry {
+                decoder: Arc::new(Mutex::new(decoder)),
+                texture: None,
+                popout: None,
+                audio_stream_id: None,
+                raw_tx: None,
+            },
+        );
+
+        // Observe the StreamStarted delta straight off the room's forward
+        // channel (not via `drain_events`), then subscribe. Nothing drains
+        // events through `AppState` for the rest of the test.
+        subscribe_when_announced(&mut state, room, owner).await;
+
+        let start_count = frames.frames_decoded();
+        let started = Instant::now();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let decoded = frames.frames_decoded() - start_count;
+        let elapsed = started.elapsed().as_secs_f64();
+        let decoded_fps = frames.stats().decoded_fps;
+        eprintln!(
+            "[ingestion] drain_events never called: {decoded} frames in {elapsed:.1}s \
+             ({:.1} fps average), rolling decoded_fps = {decoded_fps:.1}",
+            decoded as f64 / elapsed
+        );
+
+        if let Err(e) = capture_handle.stop().await {
+            tracing::warn!("[ingestion] capture_handle.stop() reported an error (non-fatal): {e:#}");
+        }
+        let _ = std::fs::remove_dir_all(&config_home);
+
+        assert!(
+            decoded as f64 / elapsed > 40.0 && decoded_fps > 40.0,
+            "decoder starved ({decoded} frames in {elapsed:.1}s, rolling {decoded_fps:.1} fps) \
+             with drain_events never called - media delivery still depends on drain_events, \
+             i.e. the 'fast-forward catch-up' backlog bug is not fixed"
+        );
+    }
+
+    /// Stream Control, end to end against a real relay and a real GStreamer
+    /// capture: **fan-out** (one capture, a second independently encoded and
+    /// encrypted destination in another room), **transfer** (make-before-break
+    /// to a third room) and **Absolute-Maximum bandwidth**
+    /// (`bandwidth::allocate` applied to the live encoders).
+    ///
+    /// `Why` all three in one test: they share one expensive fixture (a relay
+    /// child process, three real QUIC connections, an encode pipeline), and the
+    /// interesting failures are in how they interact - a fan-out that leaves the
+    /// allocator with a destination it can't find, or a transfer that completes
+    /// but leaves a stale destination behind, would pass a narrower test.
+    #[tokio::test]
+    #[ignore = "spawns a real relay server child process and a real GStreamer capture pipeline; \
+                run with `cargo test -p simple-screensharing-client --lib -- --ignored end_to_end_test:: --skip real_portal`"]
+    async fn fan_out_transfer_and_absolute_bandwidth_across_three_rooms() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        gstreamer::init().expect("gstreamer init");
+        let config_home = isolate_config("stream-control");
+
+        let port = pick_free_udp_port().expect("failed to pick a free UDP port for the test relay");
+        let _server = spawn_relay_server(port).expect("failed to spawn relay server child process");
+        let server_addr = format!("127.0.0.1:{port}");
+
+        let mut state = AppState::default();
+        let mut handles = Vec::new();
+        let mut clients = Vec::new();
+        for name in ["room-a", "room-b", "room-c"] {
+            let join_string = state.create_room(&server_addr, name).expect("create_room").join_string;
+            let (client, snapshot, events) = connect_with_retry(&join_string, name)
+                .await
+                .unwrap_or_else(|e| panic!("{name} failed to connect: {e:#}"));
+            clients.push(client.clone());
+            handles.push(state.insert_room(client, snapshot, events, join_string));
+        }
+        let (room_a, room_b, room_c) = (handles[0], handles[1], handles[2]);
+
+        // Start a capture into room A as `start_video_share` does, then adopt
+        // the handle the way `poll_capture_states` does. (The real
+        // `start_video_share` goes through the interactive portal, which no
+        // unattended test can drive - hence the `TestSource` seam.)
+        let capture_id = state.alloc_capture_id();
+        let destination_a = state.alloc_destination_id();
+        assert_eq!(destination_a, DestinationId(0), "the test source's DestKey(0) must match the first destination id");
+        let stream_id = {
+            let room = state.rooms.get_mut(&room_a).expect("room A");
+            let stream_id = room.next_stream_id;
+            room.next_stream_id += 1;
+            room.destinations.push(destination_a);
+            stream_id
+        };
+        let source_fragment = "videotestsrc is-live=true pattern=ball \
+             ! video/x-raw,width=320,height=240,framerate=30/1";
+        let capture_handle =
+            capture::start_sharing_from_test_source(&clients[0], stream_id, 4_000, 30, source_fragment)
+                .await
+                .expect("start_sharing_from_test_source failed");
+        let runtime = capture_handle.destination_runtime(DestKey(destination_a.0));
+        let params = runtime.as_ref().expect("the first destination must exist").lock().unwrap().params();
+        state.captures.insert(
+            capture_id,
+            LocalCapture {
+                kind: StreamKind::Video,
+                label: "test capture".to_string(),
+                status: ShareStatus::Active(ShareHandle::Video(capture_handle)),
+                audio_for_capture: None,
+                destinations: IndexMap::from([(
+                    destination_a,
+                    Destination {
+                        room: room_a,
+                        stream_id,
+                        params,
+                        runtime,
+                        pending: None,
+                        edit: Destination::edit_from(params),
+                        apply_rx: None,
+                    },
+                )]),
+                self_preview_texture: None,
+            },
+        );
+
+        // --- Fan-out: the same capture into room B as a second stream. ---
+        state.add_destination(capture_id, room_b, PendingRole::FanOut);
+        wait_for(&mut state, Duration::from_secs(20), |s| s.pending_destinations.is_empty()).await;
+        assert!(state.share_error.is_none(), "fan-out reported an error: {:?}", state.share_error);
+        {
+            let capture = state.captures.get(&capture_id).expect("capture must still exist");
+            assert_eq!(capture.destinations.len(), 2, "fan-out must add a second destination to the same capture");
+            let rooms: HashSet<RoomHandle> = capture.destinations.values().map(|d| d.room).collect();
+            assert_eq!(rooms, HashSet::from([room_a, room_b]), "the two destinations must be in different rooms");
+            for (id, dest) in &capture.destinations {
+                assert!(dest.runtime.is_some(), "destination {id:?} has no live runtime after fan-out");
+            }
+        }
+        // Both destinations must reach `Live` - each has its own encode branch
+        // producing IDRs, which is what makes fan-out two real encoded streams
+        // rather than one stream claimed twice.
+        wait_for(&mut state, Duration::from_secs(20), |s| {
+            s.captures[&capture_id]
+                .destinations
+                .values()
+                .all(|d| d.state() == capture::destination::DestinationState::Live)
+        })
+        .await;
+
+        // --- Absolute-Maximum bandwidth over both destinations. ---
+        state.set_bandwidth_total(6_000);
+        state.set_bandwidth_floor(500);
+        state.set_bandwidth_mode(BandwidthMode::Absolute);
+        state.apply_bandwidth_allocation();
+        let applied: Vec<u32> = state.captures[&capture_id]
+            .destinations
+            .keys()
+            .map(|id| state.allocated_kbps(*id).unwrap_or_else(|| panic!("{id:?} got no allocation")))
+            .collect();
+        assert_eq!(applied.iter().sum::<u32>(), 6_000, "the whole per-client budget should be assigned: {applied:?}");
+        assert_eq!(state.bandwidth_overshoot_kbps(), 0, "6000 kbps comfortably covers two 500 kbps floors");
+
+        // A second immediate call must be rate-limited away entirely.
+        let before = state.bandwidth.applied_kbps(destination_a);
+        state.set_bandwidth_total(40_000);
+        state.apply_bandwidth_allocation();
+        assert_eq!(
+            state.bandwidth.applied_kbps(destination_a),
+            before,
+            "a recompute inside the rate-limit window must not reach the encoders"
+        );
+
+        // --- Transfer room B's destination to room C, make-before-break. ---
+        let destination_b = *state.captures[&capture_id]
+            .destinations
+            .iter()
+            .find(|(_, d)| d.room == room_b)
+            .map(|(id, _)| id)
+            .expect("room B destination");
+        state.transfer_destination(destination_b, room_c);
+        // While in flight the *old* destination is still there and still marked
+        // as the transfer's source - the "make" half being visible rather than
+        // a silent swap.
+        assert!(
+            matches!(
+                state.captures[&capture_id].destinations[&destination_b].pending,
+                Some(PendingRole::TransferSource(room)) if room == room_c
+            ),
+            "the source destination should be marked mid-transfer"
+        );
+
+        wait_for(&mut state, Duration::from_secs(20), |s| s.pending_destinations.is_empty()).await;
+        assert!(state.share_error.is_none(), "transfer reported an error: {:?}", state.share_error);
+        {
+            let capture = state.captures.get(&capture_id).expect("capture must survive a transfer");
+            let rooms: HashSet<RoomHandle> = capture.destinations.values().map(|d| d.room).collect();
+            assert_eq!(
+                rooms,
+                HashSet::from([room_a, room_c]),
+                "after the transfer the capture must feed room A and room C, and no longer room B"
+            );
+            assert_eq!(capture.destinations.len(), 2, "a transfer must not leave the old destination behind");
+            assert!(
+                capture.destinations.values().all(|d| d.pending.is_none()),
+                "no destination should still be marked mid-transfer once it settled"
+            );
+        }
+        // Room A's destination - the one nobody touched - must have kept
+        // streaming across both the fan-out and the transfer.
+        assert_eq!(
+            state.captures[&capture_id].destinations[&destination_a].state(),
+            capture::destination::DestinationState::Live,
+            "an unrelated destination of the same capture must be untouched by fan-out/transfer"
+        );
+        // Mode switch back with settled destinations must not panic.
+        state.set_bandwidth_mode(BandwidthMode::PerStream);
+
+        state.stop_all_captures_fire_and_forget();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let _ = std::fs::remove_dir_all(&config_home);
+    }
 }
