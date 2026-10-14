@@ -50,6 +50,13 @@
 //! [`BandwidthController`], driven every frame by
 //! [`AppState::apply_bandwidth_allocation`].
 //!
+//! **Reconnecting and leaving.** A room that drops unexpectedly is suspended
+//! and reconnected by itself ([`ReconnectState`], [`AppState::reconnects`]; the
+//! "Auto-reconnect and clean exit" section of the `AppState` impl has the
+//! design), keeping its [`RoomHandle`], the user's watches and our own shares.
+//! A user Leave / Forget / exit never reconnects and tells the relay we left
+//! ([`AppState::disconnect_room`], [`AppState::shutdown_blocking`]).
+//!
 //! See `ui.rs`'s module docs for the app-shell/nav-tab layer this sits under.
 
 use std::collections::HashMap;
@@ -63,11 +70,88 @@ use crate::audio::{self, AudioCaptureHandle, AudioSource};
 use crate::bandwidth::{self, AllocInput, Allocation, DestId, DestSpec};
 use crate::capture::{self, CaptureHandle, DestKey};
 use crate::decode::{self, AudioDecoder, PreviewCache, StreamDecoder};
-use crate::net::{ClientEvent, DecryptedMediaFrame, PresenceSnapshotState, ScreenshareClient};
+use crate::net::{ClientEvent, CloseCause, DecryptedMediaFrame, PresenceSnapshotState, ScreenshareClient};
 use crate::protocol::{ConnId, Member, PresenceEvent, StreamId, StreamInfo, StreamKind};
 use crate::rooms::{AppSettings, BandwidthMode, PresentationMode, RoomStore, StartStreamDefaults};
 
-pub type ConnectResult = Result<(ScreenshareClient, PresenceSnapshotState, mpsc::UnboundedReceiver<ClientEvent>), String>;
+pub type ConnectResult = Result<(ScreenshareClient, PresenceSnapshotState, mpsc::UnboundedReceiver<ClientEvent>), ConnectError>;
+
+/// Why a connect attempt failed: the text the UI shows, plus the
+/// [`CloseCause`] the reconnect policy decides on (`retry_delay`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectError {
+    pub message: String,
+    pub cause: CloseCause,
+}
+
+impl ConnectError {
+    fn other(message: String) -> Self {
+        Self { message, cause: CloseCause::Other }
+    }
+
+    fn from_anyhow(e: &anyhow::Error) -> Self {
+        Self { message: format!("{e:#}"), cause: CloseCause::from_error(e) }
+    }
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+// ---------------------------------------------------------------------
+// Auto-reconnect policy (pure; the state machine is `ReconnectState`)
+// ---------------------------------------------------------------------
+
+/// First step of the backoff after the immediate retry.
+pub const RECONNECT_BACKOFF_BASE: Duration = Duration::from_millis(500);
+/// The backoff never waits longer than this between attempts.
+pub const RECONNECT_BACKOFF_CAP: Duration = Duration::from_secs(15);
+/// Minimum wait between attempts while the relay says the room is full: the
+/// room only frees up when someone leaves, so hammering it helps nobody.
+pub const ROOM_FULL_RETRY: Duration = Duration::from_secs(5);
+/// One reconnect attempt gives up after this long (shorter than a manual
+/// connect's [`DEFAULT_CONNECT_TIMEOUT`]): a dead relay would otherwise hold
+/// the single connect slot for 15 s per attempt and starve the backoff.
+pub const RECONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(8);
+/// How long after a reconnect a watch whose stream has not been re-announced
+/// yet is still waited for. Matches the browser client's "resume" list (60 s).
+pub const REWATCH_GRACE: Duration = Duration::from_secs(60);
+
+/// Wait before the attempt that follows `failed` failed attempts of one
+/// outage: 0 (immediate), then 0.5 s, 1, 2, 4, 8, capped at 15 s.
+///
+/// `Why immediate first:` the common outage is a relay restart or a blip, and
+/// the connection is usually back within a second; waiting before the first
+/// try just adds latency to the common case. `Why exponential after:` a relay
+/// that is really down should not be probed in a tight loop by every client.
+pub fn backoff_delay(failed: u32) -> Duration {
+    if failed == 0 {
+        return Duration::ZERO;
+    }
+    let steps = (failed - 1).min(16);
+    RECONNECT_BACKOFF_BASE.saturating_mul(1u32 << steps).min(RECONNECT_BACKOFF_CAP)
+}
+
+/// What to do after the connection (or a reconnect attempt) ended with
+/// `cause`, `failed` attempts into the outage: `Some(wait)` before the next
+/// attempt, or `None` to stop and surface the error.
+///
+/// - [`CloseCause::RelayShutdown`] (`0x200`): the relay told us it is going
+///   away, so the first retry is immediate; later failures back off normally.
+/// - [`CloseCause::Malformed`] (`0x101`): retrying the same `Join` cannot
+///   succeed, so stop.
+/// - [`CloseCause::RoomFull`] (`0x102`): keep trying, but not faster than
+///   [`ROOM_FULL_RETRY`] (the browser's "room full, still trying").
+/// - [`CloseCause::Other`]: backoff.
+pub fn retry_delay(cause: CloseCause, failed: u32) -> Option<Duration> {
+    match cause {
+        CloseCause::Malformed => None,
+        CloseCause::RoomFull => Some(backoff_delay(failed).max(ROOM_FULL_RETRY)),
+        CloseCause::RelayShutdown | CloseCause::Other => Some(backoff_delay(failed)),
+    }
+}
 
 /// A reasonable default encode bitrate, preselected on the bitrate slider.
 pub const DEFAULT_BITRATE_KBPS: u32 = 8000;
@@ -708,8 +792,60 @@ pub struct PopoutState {
 
 pub enum Status {
     Idle,
+    /// A connect attempt is in flight, or at least one room is waiting to
+    /// reconnect (see [`AppState::reconnects`]). Kept set for the whole outage,
+    /// not just while an attempt runs, because the UI only keeps its frame loop
+    /// (and so the retry timers) ticking while this is `Connecting`.
     Connecting,
     Error(String),
+}
+
+/// A stream the user was watching (or, for audio-only senders, listening to)
+/// before a reconnect, named by what survives it. See [`match_wanted`].
+///
+/// `Why not the `(ConnId, StreamId)` key:` both change when the owner
+/// reconnects (a `ConnId` is fresh per connection, a `StreamId` is re-allocated
+/// per announce), so after a relay restart the old key names nothing. The
+/// display name plus kind plus label is what a person would call "the same
+/// stream", and it is the browser client's `stableKey` minus the room (the room
+/// is implied here).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WantedStream {
+    pub owner_name: String,
+    pub kind: StreamKind,
+    pub label: String,
+    /// This was the room's selected (central panel) watch.
+    pub selected: bool,
+    /// The viewer's volume for this owner, carried over so a re-watch does not
+    /// reset a slider the user had moved.
+    pub volume_percent: Option<u32>,
+}
+
+/// Find the stream that `wanted` now refers to: an announced stream of the
+/// right kind and label whose owner is a member with the same display name,
+/// that `is_taken` does not already claim (so two wanted streams of one owner
+/// with the same label, such as two "Screen"s, pick two different streams).
+/// Our own streams (`me`) never match. Candidates are tried in
+/// `(owner, stream_id)` order so the result is deterministic.
+///
+/// Limits (same as the browser's): two members with one name sharing one label
+/// are interchangeable, and a renamed member or a changed label is a different
+/// stream.
+pub fn match_wanted(
+    wanted: &WantedStream,
+    me: ConnId,
+    members: &[Member],
+    streams: &[StreamInfo],
+    is_taken: impl Fn(ConnId, StreamId) -> bool,
+) -> Option<(ConnId, StreamId)> {
+    let mut candidates: Vec<&StreamInfo> = streams
+        .iter()
+        .filter(|s| s.owner != me && s.kind == wanted.kind && s.label == wanted.label)
+        .filter(|s| members.iter().any(|m| m.conn_id == s.owner && m.display_name == wanted.owner_name))
+        .filter(|s| !is_taken(s.owner, s.stream_id))
+        .collect();
+    candidates.sort_by_key(|s| (s.owner, s.stream_id));
+    candidates.first().map(|s| (s.owner, s.stream_id))
 }
 
 /// One joined room: its QUIC connection and everything genuinely scoped to
@@ -812,9 +948,103 @@ pub struct RoomSession {
     /// `AppState::drain_events`), purely so this map doesn't grow forever
     /// across a long-lived room with many join/leave cycles.
     pub audio_volume_by_owner: HashMap<ConnId, u32>,
+
+    /// Watches carried over from before a reconnect that are still waiting for
+    /// their stream to be announced again (the owner may be reconnecting too,
+    /// and a relay restart empties the room). Resolved against the roster by
+    /// [`Self::apply_rewatch`] on every event pass; dropped at
+    /// `rewatch_deadline` ([`REWATCH_GRACE`]) so a stream that never comes back
+    /// does not start watching minutes later out of the blue.
+    pub rewatch: Vec<WantedStream>,
+    pub rewatch_deadline: Option<Instant>,
 }
 
 impl RoomSession {
+    /// The streams this session is watching or listening to, as
+    /// [`WantedStream`]s (video watches and standalone-Listen audio; the audio
+    /// that rides along with a video watch is re-derived by
+    /// [`Self::sync_audio_watches`]). Entries whose stream or owner is no
+    /// longer in the roster are skipped: there is nothing to match them by.
+    pub fn wanted_streams(&self) -> Vec<WantedStream> {
+        let name_of = |owner: ConnId| self.members.iter().find(|m| m.conn_id == owner).map(|m| m.display_name.clone());
+        let info_of = |owner: ConnId, stream_id: StreamId| self.streams.iter().find(|s| s.owner == owner && s.stream_id == stream_id);
+        let mut out = Vec::new();
+        let mut keys: Vec<(ConnId, StreamId)> = self.watches.lock().unwrap().keys().copied().collect();
+        keys.sort();
+        for key in keys {
+            if let (Some(owner_name), Some(info)) = (name_of(key.0), info_of(key.0, key.1)) {
+                out.push(WantedStream {
+                    owner_name,
+                    kind: info.kind,
+                    label: info.label.clone(),
+                    selected: self.selected_watch == Some(key),
+                    volume_percent: self.audio_volume_by_owner.get(&key.0).copied(),
+                });
+            }
+        }
+        let mut keys: Vec<(ConnId, StreamId)> =
+            self.audio_watches.lock().unwrap().iter().filter(|(_, w)| !w.auto).map(|(k, _)| *k).collect();
+        keys.sort();
+        for key in keys {
+            if let (Some(owner_name), Some(info)) = (name_of(key.0), info_of(key.0, key.1)) {
+                out.push(WantedStream {
+                    owner_name,
+                    kind: info.kind,
+                    label: info.label.clone(),
+                    selected: false,
+                    volume_percent: self.audio_volume_by_owner.get(&key.0).copied(),
+                });
+            }
+        }
+        out
+    }
+
+    /// Resolve [`Self::rewatch`] against the current roster: start watching
+    /// every wanted stream that is announced again, keep waiting for the rest
+    /// until `rewatch_deadline`. Cheap when `rewatch` is empty (the normal
+    /// case), so `drain_events` calls it for every room every pass.
+    pub fn apply_rewatch(&mut self, now: Instant) {
+        if self.rewatch.is_empty() {
+            return;
+        }
+        if self.rewatch_deadline.is_some_and(|deadline| now >= deadline) {
+            self.rewatch.clear();
+            return;
+        }
+        let me = self.client.conn_id();
+        let mut still_waiting = Vec::new();
+        for wanted in std::mem::take(&mut self.rewatch) {
+            let found = {
+                let watches = self.watches.lock().unwrap();
+                let audio = self.audio_watches.lock().unwrap();
+                match_wanted(&wanted, me, &self.members, &self.streams, |owner, id| {
+                    watches.contains_key(&(owner, id)) || audio.contains_key(&(owner, id))
+                })
+            };
+            if let (Some((owner, _)), Some(volume)) = (found, wanted.volume_percent) {
+                self.audio_volume_by_owner.insert(owner, volume);
+            }
+            match (found, wanted.kind) {
+                (Some((owner, stream_id)), StreamKind::Video) => {
+                    self.toggle_watch(owner, stream_id);
+                    if wanted.selected {
+                        self.selected_watch = Some((owner, stream_id));
+                    }
+                }
+                // Audio rides along with its owner's video watch
+                // (`sync_audio_watches`); only a sender with no video needs an
+                // explicit Listen.
+                (Some((owner, stream_id)), StreamKind::Audio) => {
+                    if !self.owner_has_video(owner) {
+                        self.toggle_listen(owner, stream_id);
+                    }
+                }
+                (None, _) => still_waiting.push(wanted),
+            }
+        }
+        self.rewatch = still_waiting;
+    }
+
     /// The `stream_id` of `owner`'s currently-announced audio stream, if
     /// any — used by `toggle_watch` to auto-subscribe audio alongside video
     /// from the same sender.
@@ -1187,6 +1417,82 @@ pub struct PendingConnect {
     /// *after* it returns `Ok`, so there is nothing left half-registered to
     /// unwind — see `net.rs`'s `connect`.
     pub abort: tokio::task::AbortHandle,
+    /// `Some(handle)` when this attempt is an automatic reconnect of the room
+    /// that used to be `handle` (see [`ReconnectState`]); the result then
+    /// re-inserts the room under the same handle and restores what the user
+    /// had, instead of being treated as a fresh join.
+    pub reconnect: Option<RoomHandle>,
+}
+
+/// Something of ours that was being sent into a room when its connection
+/// dropped, kept so it can be re-established on the new connection.
+#[derive(Debug, Clone)]
+pub enum SuspendedShare {
+    /// A video destination. The capture itself keeps running (a screen grab
+    /// is a local thing and the portal prompt must not come back); only the
+    /// encode branch bound to the dead connection was removed.
+    Video { capture: CaptureSourceId, params: capture::destination::VideoParams, role: PendingRole },
+    /// An audio share paired with `for_capture`. Its capture is bound to the
+    /// dead connection as a whole, so it was stopped; this restarts it.
+    Audio { for_capture: CaptureSourceId, source: AudioSource },
+}
+
+/// One room that dropped unexpectedly and is being reconnected. Lives in
+/// [`AppState::reconnects`] from the drop until the room is back (the entry is
+/// then consumed), the user cancels or leaves, or the relay rejects the join
+/// for good (`Malformed`). It is what makes [`AppState::is_reconnecting`] true
+/// for the whole outage, including the waits between attempts.
+///
+/// Public fields are the read side for the UI (banner: attempt count, next
+/// retry, last error; People panel: last-known roster). The captured user
+/// intent (watches, shares) is private: it only ever flows back into the new
+/// connection.
+pub struct ReconnectState {
+    pub join_string: String,
+    /// The handle the room had and gets back: kept stable so everything
+    /// keyed by it (a destination's `room`, `active_room`, the UI's staged
+    /// shares and views) stays valid across the outage.
+    pub handle: RoomHandle,
+    /// Attempts started in this outage (0 before the first retry).
+    pub attempts: u32,
+    /// When the next attempt may start; `None` while one is in flight.
+    pub next_retry: Option<Instant>,
+    /// The error of the last failed attempt (or the reason the connection
+    /// dropped, before the first attempt).
+    pub last_error: Option<String>,
+    /// Why the connection / last attempt ended; drives [`retry_delay`].
+    pub cause: CloseCause,
+    pub since: Instant,
+    /// The roster and streams as they were when the connection dropped, so the
+    /// People panel is not empty during the outage. Stale by definition.
+    pub members: Vec<Member>,
+    pub streams: Vec<StreamInfo>,
+    shares: Vec<SuspendedShare>,
+    wanted: Vec<WantedStream>,
+    was_active_room: bool,
+    /// Set by the legacy no-key `cancel_connect()`; the entry is dropped at the
+    /// next poll unless `start_connect`/`reconnect_now` revives it first. See
+    /// `AppState::cancel_connect`.
+    cancelled: bool,
+}
+
+impl ReconnectState {
+    /// Time until the next attempt starts (`ZERO` if due, `None` while one is
+    /// in flight). For "retrying in 4 s".
+    pub fn retry_in(&self, now: Instant) -> Option<Duration> {
+        self.next_retry.map(|at| at.saturating_duration_since(now))
+    }
+
+    /// Whether an attempt is running right now.
+    pub fn attempt_in_flight(&self) -> bool {
+        self.next_retry.is_none()
+    }
+
+    /// Whether the relay said the room is full (the UI can say "room full,
+    /// still trying").
+    pub fn room_full(&self) -> bool {
+        self.cause == CloseCause::RoomFull
+    }
 }
 
 /// What a just-resolved connect attempt was — returned by
@@ -1331,6 +1637,15 @@ pub struct AppState {
     /// `self.rooms`). Drained one at a time by the driver's tick loop
     /// instead.
     pub auto_connect_queue: Vec<String>,
+    /// Rooms whose connection dropped unexpectedly and are being reconnected,
+    /// by their (kept) handle. See [`ReconnectState`] and the "Auto-reconnect"
+    /// section of the `AppState` impl.
+    pub reconnects: IndexMap<RoomHandle, ReconnectState>,
+    /// The audio source each running audio share was started with, so a
+    /// reconnect can restart it (the capture only keeps the source's name).
+    pub audio_share_sources: HashMap<CaptureSourceId, AudioSource>,
+    /// Set by [`Self::begin_shutdown`]: from then on nothing reconnects.
+    pub shutting_down: bool,
     /// Current UI language ("en" or "de"), mirrored into `rust_i18n`'s global
     /// locale on startup and on every toggle.
     pub language: String,
@@ -1348,6 +1663,9 @@ pub struct AppState {
     /// sleeping 15s — production always leaves this at
     /// [`DEFAULT_CONNECT_TIMEOUT`].
     pub(crate) connect_timeout: Duration,
+    /// Per-attempt timeout of an automatic reconnect; test-shrinkable like
+    /// `connect_timeout`. Production leaves [`RECONNECT_ATTEMPT_TIMEOUT`].
+    pub(crate) reconnect_attempt_timeout: Duration,
 }
 
 /// Default value of [`AppState::connect_timeout`] — the feature request's
@@ -1408,10 +1726,14 @@ impl Default for AppState {
             room_store,
             room_store_error,
             auto_connect_queue: Vec::new(),
+            reconnects: IndexMap::new(),
+            audio_share_sources: HashMap::new(),
+            shutting_down: false,
             language: settings.language,
             presentation_mode: settings.presentation_mode,
             launch_presentation_mode: settings.presentation_mode,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            reconnect_attempt_timeout: RECONNECT_ATTEMPT_TIMEOUT,
         }
     }
 }
@@ -2489,6 +2811,18 @@ impl AppState {
         let Some(source) = self.selected_audio_source.clone() else {
             return Ok(());
         };
+        self.start_audio_share_with(room_handle, for_capture, source)
+    }
+
+    /// [`Self::start_audio_share`] with the source given explicitly: what a
+    /// reconnect uses to bring a share back with the source it was started
+    /// with, not whatever the dropdown has selected by now.
+    fn start_audio_share_with(
+        &mut self,
+        room_handle: RoomHandle,
+        for_capture: CaptureSourceId,
+        source: AudioSource,
+    ) -> Result<(), String> {
         let capture_id = self.alloc_capture_id();
         let destination_id = self.alloc_destination_id();
 
@@ -2498,6 +2832,7 @@ impl AppState {
         room.destinations.push(destination_id);
         let client = room.client.clone();
 
+        self.audio_share_sources.insert(capture_id, source.clone());
         let (tx, rx) = oneshot::channel();
         self.captures.insert(
             capture_id,
@@ -2685,6 +3020,7 @@ impl AppState {
     /// synchronously when `AppState` goes away right after this call.
     pub fn drop_capture_fire_and_forget(&mut self, capture_id: CaptureSourceId) {
         let Some(capture) = self.captures.shift_remove(&capture_id) else { return };
+        self.audio_share_sources.remove(&capture_id);
         self.forget_destinations_of(&capture);
         let ShareStatus::Active(handle) = capture.status else { return };
         tokio::spawn(async move {
@@ -2825,6 +3161,7 @@ impl AppState {
             }
         }
         for capture_id in to_remove {
+            self.audio_share_sources.remove(&capture_id);
             if let Some(capture) = self.captures.shift_remove(&capture_id) {
                 self.forget_destinations_of(&capture);
             }
@@ -2929,6 +3266,25 @@ impl AppState {
     /// error line — the caller (`ui::App::start_connect`) owns that UI-only
     /// field, so failure is reported back via `Err` rather than mutated here.
     pub fn start_connect(&mut self, join_string: String, from_add_card: bool) -> Result<(), String> {
+        // Connecting to a room that is already being reconnected is "Retry
+        // now" (and revives an entry the legacy `cancel_connect` just parked):
+        // same room, same intent, so it stays an automatic reconnect with its
+        // attempt count instead of becoming a manual connect that gives up on
+        // the first failure.
+        if let Some(handle) = self.reconnect_handle_for(&join_string) {
+            if let Some(entry) = self.reconnects.get_mut(&handle) {
+                entry.cancelled = false;
+            }
+            self.reconnect_now(&join_string);
+            return Ok(());
+        }
+        self.spawn_connect(join_string, from_add_card, None)
+    }
+
+    /// The one place a connect task is spawned. `reconnect` marks an
+    /// automatic reconnect attempt (shorter timeout, result routed back into
+    /// its [`ReconnectState`]).
+    fn spawn_connect(&mut self, join_string: String, from_add_card: bool, reconnect: Option<RoomHandle>) -> Result<(), String> {
         let endpoint = match &self.endpoint {
             Ok(endpoint) => endpoint.clone(),
             Err(e) => {
@@ -2937,7 +3293,7 @@ impl AppState {
             }
         };
         let display_name = self.display_name.clone();
-        let timeout = self.connect_timeout;
+        let timeout = if reconnect.is_some() { self.reconnect_attempt_timeout.min(self.connect_timeout) } else { self.connect_timeout };
         let connect_join_string = join_string.clone();
         let (tx, rx) = oneshot::channel();
 
@@ -2948,8 +3304,8 @@ impl AppState {
             )
             .await
             {
-                Ok(result) => result.map_err(|e| format!("{e:#}")),
-                Err(_elapsed) => Err(t!("errors.connect_timed_out").to_string()),
+                Ok(result) => result.map_err(|e| ConnectError::from_anyhow(&e)),
+                Err(_elapsed) => Err(ConnectError::other(t!("errors.connect_timed_out").to_string())),
             };
             let _ = tx.send(result);
         });
@@ -2958,6 +3314,7 @@ impl AppState {
             join_string: join_string.clone(),
             from_add_card,
             abort: join_handle.abort_handle(),
+            reconnect,
         });
         self.status = Status::Connecting;
         Ok(())
@@ -2972,17 +3329,40 @@ impl AppState {
     /// No-op if nothing is pending — the same "at most one" invariant
     /// `start_connect`/`poll_auto_connect_queue` already rely on (only one
     /// `pending_connect` slot exists), so there's nothing to disambiguate.
+    ///
+    /// **Reconnects.** This takes no room, so it cannot say which reconnect the
+    /// user means. With exactly one room reconnecting there is nothing to
+    /// disambiguate: that room is parked as `cancelled`, dropped at the next
+    /// `poll_reconnects` unless `start_connect` revives it first, which is
+    /// exactly the current UI's "Retry now" (`CancelConnect` then
+    /// `Connect(key)` in one frame) versus its "Cancel" (`CancelConnect`
+    /// alone). With several rooms reconnecting it only aborts the attempt in
+    /// flight (that room just retries at once): never guess which of the user's
+    /// rooms to give up on. Prefer [`Self::cancel_reconnect`] and
+    /// [`Self::reconnect_now`], which name the room.
     pub fn cancel_connect(&mut self) {
+        let single = self.reconnects.len() == 1;
+        let mut touched = None;
         if let Some(pending) = self.pending_connect.take() {
             pending.abort.abort();
-            self.status = Status::Idle;
+            touched = pending.reconnect;
+        } else if single {
+            touched = self.reconnects.keys().next().copied();
         }
+        if let Some(entry) = touched.and_then(|h| self.reconnects.get_mut(&h)) {
+            entry.next_retry = Some(Instant::now());
+            entry.cancelled = single;
+        }
+        self.refresh_status();
     }
 
-    /// Whether `join_string` is the room a connect is currently in flight for
-    /// — what puts a saved row into the amber "reconnecting" state.
+    /// Whether `join_string` is a room we are connecting to or waiting to
+    /// reconnect — what puts a saved row into the amber "reconnecting" state
+    /// and keeps the room page on its Reconnecting banner (not the "Connect"
+    /// button) through the waits between attempts.
     pub fn is_reconnecting(&self, join_string: &str) -> bool {
         self.pending_connect.as_ref().is_some_and(|p| RoomStore::same_room(&p.join_string, join_string))
+            || self.reconnect_handle_for(join_string).is_some()
     }
 
     /// Drain one entry off `auto_connect_queue` into `pending_connect`, if
@@ -2991,7 +3371,11 @@ impl AppState {
     /// auto-connect rooms gets kicked off one at a time as each previous one
     /// finishes, instead of all at once — see `auto_connect_queue`'s doc
     /// comment for why one-at-a-time is required, not just simpler.
+    ///
+    /// Also drives the reconnect timers ([`Self::poll_reconnects`]), first, so
+    /// a room that dropped wins the connect slot over a queued fresh room.
     pub fn poll_auto_connect_queue(&mut self) {
+        self.poll_reconnects();
         if self.pending_connect.is_some() {
             return;
         }
@@ -3021,7 +3405,20 @@ impl AppState {
     ) -> RoomHandle {
         let handle = RoomHandle(self.next_room_handle);
         self.next_room_handle = self.next_room_handle.wrapping_add(1);
+        self.insert_room_at(handle, client, snapshot, event_rx, join_string);
+        handle
+    }
 
+    /// [`Self::insert_room`] under a given handle: how a reconnected room gets
+    /// the handle it had before the drop (see [`ReconnectState::handle`]).
+    fn insert_room_at(
+        &mut self,
+        handle: RoomHandle,
+        client: ScreenshareClient,
+        snapshot: PresenceSnapshotState,
+        event_rx: mpsc::UnboundedReceiver<ClientEvent>,
+        join_string: String,
+    ) {
         let watches: Arc<Mutex<HashMap<(ConnId, StreamId), WatchEntry>>> = Arc::new(Mutex::new(HashMap::new()));
         let audio_watches: Arc<Mutex<HashMap<(ConnId, StreamId), AudioWatch>>> = Arc::new(Mutex::new(HashMap::new()));
 
@@ -3059,9 +3456,10 @@ impl AppState {
                 preview_cache: PreviewCache::new(),
                 preview_textures: HashMap::new(),
                 audio_volume_by_owner: HashMap::new(),
+                rewatch: Vec::new(),
+                rewatch_deadline: None,
             },
         );
-        handle
     }
 
     /// Tear one room down: stop sending into it, drop the session — which
@@ -3077,8 +3475,20 @@ impl AppState {
     /// Does **not** touch `ui::App`'s UI-only fields (`expanded_rooms`,
     /// `leave_confirm`) — its thin wrapper of the same name clears those
     /// afterwards.
+    ///
+    /// **Leaves cleanly:** sends `Leave` and closes the QUIC connection
+    /// ([`ScreenshareClient::leave_and_close`]) so the relay and the other
+    /// members drop us now rather than at the relay's idle timeout (60-75 s).
+    /// For a room that is only waiting to reconnect (no session) it ends the
+    /// wait instead ([`Self::cancel_reconnect`]). Either way the room is not
+    /// reconnected afterwards: reconnecting is for unexpected drops only.
     pub fn disconnect_room(&mut self, handle: RoomHandle) {
+        if self.reconnects.contains_key(&handle) {
+            self.discard_reconnect(handle);
+            return;
+        }
         let Some(room) = self.rooms.shift_remove(&handle) else { return };
+        spawn_leave(room.client.clone());
         for destination_id in room.destinations {
             let Some((capture_id, capture, _)) = find_destination(&self.captures, destination_id) else {
                 continue;
@@ -3151,9 +3561,16 @@ impl AppState {
         let result = match pending.rx.try_recv() {
             Ok(result) => result,
             Err(oneshot::error::TryRecvError::Empty) => return ConnectOutcome::None,
-            Err(oneshot::error::TryRecvError::Closed) => Err(t!("errors.connect_task_ended").to_string()),
+            Err(oneshot::error::TryRecvError::Closed) => Err(ConnectError::other(t!("errors.connect_task_ended").to_string())),
         };
         let Some(pending) = self.pending_connect.take() else { return ConnectOutcome::None };
+
+        // An automatic reconnect attempt has its own bookkeeping.
+        if let Some(handle) = pending.reconnect
+            && self.reconnects.contains_key(&handle)
+        {
+            return self.finish_reconnect_attempt(handle, result);
+        }
 
         match result {
             Ok((client, snapshot, event_rx)) => {
@@ -3175,11 +3592,13 @@ impl AppState {
                 }
                 // Newly joined room becomes what the content tabs drive.
                 self.active_room = Some(handle);
+                self.refresh_status();
                 ConnectOutcome::Joined(handle)
             }
             Err(e) => {
-                self.status = Status::Error(e.clone());
-                ConnectOutcome::Failed { error: e, from_add_card: pending.from_add_card }
+                self.status = Status::Error(e.message.clone());
+                self.refresh_status();
+                ConnectOutcome::Failed { error: e.message, from_add_card: pending.from_add_card }
             }
         }
     }
@@ -3189,9 +3608,11 @@ impl AppState {
     /// shared between rooms except `captures`, which is why `rooms` and
     /// `captures` are borrowed as separate fields rather than through `self`.
     ///
-    /// Rooms whose control connection closed are collected and torn down
-    /// after the loop, since removing from `rooms` mid-iteration isn't
-    /// allowed.
+    /// Rooms whose control connection closed are collected and, after the
+    /// loop (removing from `rooms` mid-iteration isn't allowed), suspended for
+    /// reconnecting (`suspend_room`) or torn down. Also resolves carried-over
+    /// watches as streams are re-announced and drives the reconnect timers
+    /// (`poll_reconnects`).
     ///
     /// Takes `ctx: &egui::Context` purely to upload freshly decoded preview
     /// thumbnails (`ClientEvent::Preview`) the same frame they arrive —
@@ -3303,14 +3724,553 @@ impl AppState {
             // already watching them become audible on the next tick, with no
             // action by the viewer. See `sync_audio_watches`' doc comment.
             room.sync_audio_watches();
+            // Watches carried over a reconnect: pick up their streams as the
+            // re-announces arrive (a no-op when there are none).
+            room.apply_rewatch(Instant::now());
         }
 
         for (handle, reason) in closed {
+            let cause = self.rooms.get(&handle).and_then(|r| r.client.close_cause()).unwrap_or(CloseCause::Other);
+            self.suspend_room(handle, reason, cause);
+        }
+        self.poll_reconnects();
+    }
+}
+
+// ---------------------------------------------------------------------
+// Auto-reconnect and clean exit
+// ---------------------------------------------------------------------
+//
+// A room whose connection drops unexpectedly (`ClientEvent::ControlClosed`:
+// relay restart, network loss, idle timeout) is not torn down any more. It is
+// *suspended*: the `RoomSession` goes away, but a `ReconnectState` takes its
+// place in `AppState::reconnects`, holding the room's handle, the last-known
+// roster, and what the user had running (watches, our own shares). Attempts
+// then run through the ordinary connect slot (`pending_connect`) on a backoff
+// until the room is back, the user leaves/forgets/cancels, or the relay
+// rejects the join for good.
+//
+// `Why the room's handle is kept:` everything that refers to a room by
+// `RoomHandle` (a destination's `room`, `active_room`, the UI's staged shares,
+// open views and modals) then stays valid across the outage with no remapping.
+// Handles must never alias a *different* room; reusing one for the same room
+// is safe.
+//
+// `Why a dropped room has no `RoomSession` while reconnecting:` the UI derives
+// "Reconnecting" from "no session for this saved room, but `is_reconnecting`"
+// (`ui::room_entries`), so keeping a half-dead session around would show the
+// room as joined. The last-known roster lives on the `ReconnectState` instead.
+//
+// `Why our shares are rebuilt, not re-pointed:` a branch is bound to the
+// connection that existed when it was built (its client clone, nonce space,
+// room key, announced `StreamId`), and a new connection has a fresh `ConnId`.
+// Removing the branch and adding a new one on the new room uses only existing
+// capture primitives (it is what `retry_destination` already does); the
+// *capture* (the screen grab and its portal session) keeps running throughout,
+// so there is no new picker prompt. The cost is one encoder re-init per share.
+
+impl AppState {
+    /// The handle of the reconnect entry for `join_string` (same room, any
+    /// cert hash), if one exists.
+    fn reconnect_handle_for(&self, join_string: &str) -> Option<RoomHandle> {
+        self.reconnects.iter().find(|(_, r)| RoomStore::same_room(&r.join_string, join_string)).map(|(h, _)| *h)
+    }
+
+    /// The reconnect state of the room `join_string`, if it is reconnecting:
+    /// attempt count, next retry, last error, last-known roster. `None` for a
+    /// room that is joined, disconnected, or merely connecting for the first
+    /// time.
+    pub fn reconnect_info(&self, join_string: &str) -> Option<&ReconnectState> {
+        self.reconnect_handle_for(join_string).and_then(|h| self.reconnects.get(&h))
+    }
+
+    /// Keep [`Status`] truthful: `Connecting` while a connect is in flight or a
+    /// room waits to reconnect, back to `Idle` when neither (an `Error` stays
+    /// until something replaces it).
+    fn refresh_status(&mut self) {
+        if self.pending_connect.is_some() || !self.reconnects.is_empty() {
+            self.status = Status::Connecting;
+        } else if matches!(self.status, Status::Connecting) {
+            self.status = Status::Idle;
+        }
+    }
+
+    /// The control connection of `handle` ended without the user asking for it
+    /// (`reason` is the text of the `ControlClosed` event, `cause` the QUIC
+    /// close code mapped by [`CloseCause`]). Suspends the room for
+    /// reconnecting, or, when it must not reconnect, tears it down like a user
+    /// leave.
+    ///
+    /// Not reconnected: the room is not in the saved list (reconnecting is for
+    /// rooms that stay in it), the app is shutting down, or the relay called
+    /// the join malformed ([`retry_delay`]).
+    fn suspend_room(&mut self, handle: RoomHandle, reason: String, cause: CloseCause) {
+        let Some(join_string) = self.rooms.get(&handle).map(|r| r.join_string.clone()) else { return };
+        let reconnect = !self.shutting_down && retry_delay(cause, 0).is_some() && self.room_store.name_for(&join_string).is_some();
+        if !reconnect {
             self.status = Status::Error(t!("errors.disconnected", reason = reason).to_string());
             self.disconnect_room(handle);
+            return;
+        }
+
+        let Some(room) = self.rooms.shift_remove(&handle) else { return };
+        // The connection is dead, or (if only the control stream died) at
+        // least useless: make sure it is closed so the relay drops us.
+        spawn_leave(room.client.clone());
+
+        let me = room.client.conn_id();
+        let wanted = room.wanted_streams();
+        // Last-known roster for the People panel, without ourselves and our
+        // own streams: those belong to the dead connection's `ConnId`.
+        let members: Vec<Member> = room.members.iter().filter(|m| m.conn_id != me).cloned().collect();
+        let streams: Vec<StreamInfo> = room.streams.iter().filter(|s| s.owner != me).cloned().collect();
+
+        let mut shares = Vec::new();
+        for destination_id in room.destinations.clone() {
+            if let Some(share) = self.suspend_destination(destination_id) {
+                shares.push(share);
+            }
+        }
+
+        let was_active_room = self.active_room == Some(handle);
+        if was_active_room {
+            self.active_room = self.rooms.keys().next().copied();
+        }
+        // Dropping the session drops its decoders and ingestion task.
+        drop(room);
+
+        self.reconnects.insert(
+            handle,
+            ReconnectState {
+                join_string,
+                handle,
+                attempts: 0,
+                // `retry_delay(.., 0)` is always zero: the first retry is
+                // immediate, whatever the cause.
+                next_retry: Some(Instant::now()),
+                last_error: Some(reason),
+                cause,
+                since: Instant::now(),
+                members,
+                streams,
+                shares,
+                wanted,
+                was_active_room,
+                cancelled: false,
+            },
+        );
+        self.status = Status::Connecting;
+    }
+
+    /// Take one of our destinations off a room whose connection died, keeping
+    /// the capture. Returns what to put back on the new connection, if
+    /// anything. See the section comment for why this removes rather than
+    /// re-points.
+    fn suspend_destination(&mut self, destination_id: DestinationId) -> Option<SuspendedShare> {
+        let (capture_id, capture, dest) = find_destination(&self.captures, destination_id)?;
+        let kind = capture.kind;
+        let audio_for = capture.audio_for_capture;
+        let label = capture.label.clone();
+        let pending = dest.pending;
+        let params = dest.live_params();
+        let active = matches!(capture.status, ShareStatus::Active(_));
+        let starting = matches!(capture.status, ShareStatus::Starting(_));
+
+        let share = match kind {
+            StreamKind::Video if active => {
+                if let Some(capture) = self.captures.get_mut(&capture_id)
+                    && let ShareStatus::Active(ShareHandle::Video(handle)) = &mut capture.status
+                {
+                    // Removes the branch; its `StopStream` goes to a dead
+                    // connection and fails harmlessly.
+                    let rx = handle.spawn_remove_destination(DestKey(destination_id.0));
+                    tokio::spawn(async move {
+                        if let Ok(Err(e)) = rx.await {
+                            tracing::debug!("removing a destination after a connection drop did not finish cleanly: {e}");
+                        }
+                    });
+                }
+                match pending {
+                    // A transfer half cannot be resumed: the other half (in a
+                    // room that is still up) carries on alone.
+                    Some(PendingRole::TransferSource(_)) => None,
+                    Some(role @ PendingRole::TransferTarget(_)) => {
+                        self.clear_transfer_marker(capture_id, role);
+                        None
+                    }
+                    _ => Some(SuspendedShare::Video { capture: capture_id, params, role: PendingRole::GoingLive }),
+                }
+            }
+            StreamKind::Audio if active => {
+                let source = self
+                    .audio_share_sources
+                    .get(&capture_id)
+                    .cloned()
+                    .or_else(|| self.audio_sources.iter().find(|s| s.name == label).cloned());
+                // The whole audio capture is bound to the dead connection;
+                // stop it and start a fresh one later.
+                self.stop_share_one(capture_id);
+                match (audio_for, source) {
+                    (Some(for_capture), Some(source)) => Some(SuspendedShare::Audio { for_capture, source }),
+                    _ => None,
+                }
+            }
+            // Mid-start: no handle to take apart yet. Cancel it the way a user
+            // stop would (torn down on arrival); the user starts it again.
+            _ if starting => {
+                self.stop_share_one(capture_id);
+                None
+            }
+            _ => None,
+        };
+        // Gone from the local model either way, so a later reap of a stopping
+        // capture cannot touch the reconnected room's (re-numbered) streams.
+        self.forget_destination(capture_id, destination_id);
+        share
+    }
+
+    /// "Retry now": make `join_string`'s reconnect attempt start right away,
+    /// replacing a hung in-flight one and skipping the remaining wait. No-op
+    /// for a room that is not reconnecting. (If another room's connect holds
+    /// the single connect slot the attempt starts as soon as it frees up.)
+    pub fn reconnect_now(&mut self, join_string: &str) {
+        let Some(handle) = self.reconnect_handle_for(join_string) else { return };
+        if self.pending_connect.as_ref().is_some_and(|p| p.reconnect == Some(handle))
+            && let Some(pending) = self.pending_connect.take()
+        {
+            pending.abort.abort();
+        }
+        let now = Instant::now();
+        if let Some(entry) = self.reconnects.get_mut(&handle) {
+            entry.cancelled = false;
+            entry.next_retry = Some(now);
+        }
+        self.poll_reconnects_at(now);
+    }
+
+    /// Stop reconnecting `join_string`: abort an attempt in flight, drop the
+    /// wait, and stop the captures that only existed to feed that room. The
+    /// room stays in the list, disconnected, with its Connect button. No-op for
+    /// a room that is not reconnecting. This is "Cancel" on the Reconnecting
+    /// banner; leaving or forgetting the room does it too.
+    pub fn cancel_reconnect(&mut self, join_string: &str) {
+        if let Some(handle) = self.reconnect_handle_for(join_string) {
+            self.discard_reconnect(handle);
+        }
+    }
+
+    /// Remove `handle`'s reconnect entry and everything hanging off it.
+    fn discard_reconnect(&mut self, handle: RoomHandle) {
+        let Some(entry) = self.reconnects.shift_remove(&handle) else { return };
+        if self.pending_connect.as_ref().is_some_and(|p| p.reconnect == Some(handle))
+            && let Some(pending) = self.pending_connect.take()
+        {
+            pending.abort.abort();
+        }
+        // A screen grab kept only for this room's sake has nothing to send to
+        // now and nobody can see it: stop it (this cascades to its audio).
+        for share in &entry.shares {
+            if let SuspendedShare::Video { capture, .. } = share
+                && self.captures.get(capture).is_some_and(|c| c.destinations.is_empty())
+            {
+                self.stop_share(*capture);
+            }
+        }
+        self.refresh_status();
+    }
+
+    /// Drive the reconnect timers: drop entries that were cancelled or whose
+    /// room left the list, then, if the connect slot is free, start the attempt
+    /// that is due. Called from [`Self::poll_auto_connect_queue`] and
+    /// [`Self::drain_events`], i.e. every frame/tick in both front-ends, so
+    /// callers need nothing extra.
+    pub fn poll_reconnects(&mut self) {
+        self.poll_reconnects_at(Instant::now());
+    }
+
+    fn poll_reconnects_at(&mut self, now: Instant) {
+        let doomed: Vec<RoomHandle> = self
+            .reconnects
+            .iter()
+            .filter(|(_, r)| r.cancelled || self.shutting_down || self.room_store.name_for(&r.join_string).is_none())
+            .map(|(h, _)| *h)
+            .collect();
+        for handle in doomed {
+            self.discard_reconnect(handle);
+        }
+        if self.pending_connect.is_some() {
+            return;
+        }
+        let due = self
+            .reconnects
+            .iter()
+            .filter(|(_, r)| r.next_retry.is_some_and(|at| at <= now))
+            .min_by_key(|(_, r)| r.next_retry)
+            .map(|(h, _)| *h);
+        if let Some(handle) = due {
+            self.begin_reconnect_attempt(handle, now);
+        }
+    }
+
+    fn begin_reconnect_attempt(&mut self, handle: RoomHandle, now: Instant) {
+        let Some(entry) = self.reconnects.get_mut(&handle) else { return };
+        entry.attempts += 1;
+        entry.next_retry = None;
+        let join_string = entry.join_string.clone();
+        let failed = entry.attempts;
+        if let Err(e) = self.spawn_connect(join_string, false, Some(handle))
+            && let Some(entry) = self.reconnects.get_mut(&handle)
+        {
+            // The local endpoint itself is unusable; nothing to wait for, but
+            // do not spin either.
+            entry.last_error = Some(e);
+            entry.next_retry = Some(now + backoff_delay(failed));
+        }
+    }
+
+    /// Route the result of a reconnect attempt: success re-inserts the room
+    /// under its old handle and restores the user's intent; failure schedules
+    /// the next attempt per [`retry_delay`], or gives up on a malformed join.
+    fn finish_reconnect_attempt(&mut self, handle: RoomHandle, result: ConnectResult) -> ConnectOutcome {
+        match result {
+            Ok((client, snapshot, event_rx)) => {
+                let Some(entry) = self.reconnects.shift_remove(&handle) else { return ConnectOutcome::None };
+                self.insert_room_at(handle, client, snapshot, event_rx, entry.join_string.clone());
+                self.restore_after_reconnect(handle, entry);
+                self.status = Status::Idle;
+                self.refresh_status();
+                ConnectOutcome::Joined(handle)
+            }
+            Err(e) => {
+                let Some(entry) = self.reconnects.get_mut(&handle) else { return ConnectOutcome::None };
+                entry.last_error = Some(e.message.clone());
+                entry.cause = e.cause;
+                match retry_delay(e.cause, entry.attempts) {
+                    Some(wait) => {
+                        entry.next_retry = Some(Instant::now() + wait);
+                        self.refresh_status();
+                        ConnectOutcome::None
+                    }
+                    None => {
+                        // The relay will never accept this join: surface it
+                        // and fall back to a plain disconnected room.
+                        self.discard_reconnect(handle);
+                        self.status = Status::Error(e.message.clone());
+                        self.refresh_status();
+                        ConnectOutcome::Failed { error: e.message, from_add_card: false }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Put back what the user had before the drop, on the freshly inserted
+    /// room: the active-room pointer, our own shares, and the watches (the
+    /// latter resolve against the roster, now and as streams are re-announced).
+    fn restore_after_reconnect(&mut self, handle: RoomHandle, entry: ReconnectState) {
+        let now = Instant::now();
+        if entry.was_active_room && self.active_room.is_none() {
+            self.active_room = Some(handle);
+        }
+        if let Some(room) = self.rooms.get_mut(&handle) {
+            room.rewatch = entry.wanted;
+            room.rewatch_deadline = Some(now + REWATCH_GRACE);
+            room.apply_rewatch(now);
+        }
+        // Video first: an audio share is only valid next to a live video one.
+        for share in &entry.shares {
+            if let SuspendedShare::Video { capture, params, role } = share
+                && self.captures.get(capture).is_some_and(|c| matches!(c.status, ShareStatus::Active(ShareHandle::Video(_))))
+            {
+                self.add_destination_with_params(*capture, handle, *role, *params);
+            }
+        }
+        for share in entry.shares {
+            if let SuspendedShare::Audio { for_capture, source } = share
+                && self.captures.get(&for_capture).is_some_and(|c| !c.destinations.is_empty())
+                && let Err(e) = self.start_audio_share_with(handle, for_capture, source)
+            {
+                self.share_error = Some(e);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Clean exit
+    // -----------------------------------------------------------------
+
+    /// Start leaving everything and return the future that finishes the job
+    /// (all of it bounded by `timeout`). Synchronous part: stop reconnecting,
+    /// cancel connects, drop every room session, take every running capture.
+    /// The future: send `Leave` and close each room's QUIC connection (so the
+    /// relay and the other members drop us within a round trip, not after the
+    /// relay's 60-75 s idle timeout), close the endpoint and give quinn up to
+    /// 500 ms to flush the `CONNECTION_CLOSE` frames (`Endpoint::wait_idle`),
+    /// while the captures are stopped alongside (a pipeline can take seconds
+    /// to drain; it must not delay the leave).
+    ///
+    /// Idempotent: a second call finds nothing left to do. After it the state
+    /// must not be used to connect again.
+    ///
+    /// Prefer [`Self::shutdown`] / [`Self::shutdown_blocking`]; this is the
+    /// seam for a caller that wants to run the future itself.
+    pub fn begin_shutdown(&mut self, timeout: Duration) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        self.shutting_down = true;
+        if let Some(pending) = self.pending_connect.take() {
+            pending.abort.abort();
+        }
+        self.reconnects.clear();
+        self.auto_connect_queue.clear();
+        self.status = Status::Idle;
+
+        let clients: Vec<ScreenshareClient> = self.rooms.values().map(|r| r.client.clone()).collect();
+        let endpoint = self.endpoint.as_ref().ok().cloned();
+        let mut stops: Vec<ShareHandle> = Vec::new();
+        for (_, capture) in std::mem::take(&mut self.captures) {
+            // A capture still starting is dropped here; its start task's
+            // result then has nowhere to go and the handle's `Drop` backstop
+            // releases the pipeline.
+            if let ShareStatus::Active(handle) = capture.status {
+                stops.push(handle);
+            }
+        }
+        self.pending_destinations.clear();
+        self.rooms.clear();
+        self.active_room = None;
+
+        Box::pin(async move {
+            let leave = async {
+                futures_util::future::join_all(clients.iter().map(|c| c.leave_and_close())).await;
+                if let Some(endpoint) = &endpoint {
+                    endpoint.close(crate::net::CLOSE_CLIENT_LEAVE.into(), b"exit");
+                    let _ = tokio::time::timeout(Duration::from_millis(500), endpoint.wait_idle()).await;
+                }
+            };
+            let stop = futures_util::future::join_all(stops.into_iter().map(|handle| async move {
+                let result = match handle {
+                    ShareHandle::Video(h) => h.stop().await,
+                    ShareHandle::Audio(h) => h.stop().await,
+                };
+                if let Err(e) = result {
+                    tracing::warn!("stopping a capture during shutdown failed: {e:#}");
+                }
+            }));
+            if tokio::time::timeout(timeout, futures_util::future::join(leave, stop)).await.is_err() {
+                tracing::warn!("shutdown did not finish within {timeout:?}; exiting anyway");
+                // Whatever the leave did not reach, the closes below still do.
+                for client in &clients {
+                    client.connection().close(crate::net::CLOSE_CLIENT_LEAVE.into(), b"exit");
+                }
+            }
+        })
+    }
+
+    /// [`Self::begin_shutdown`], awaited. For callers already in async code.
+    pub async fn shutdown(&mut self, timeout: Duration) {
+        self.begin_shutdown(timeout).await;
+    }
+
+    /// [`Self::begin_shutdown`], blocking the calling thread until it is done
+    /// or `timeout` (plus a small margin) has passed. This is what a
+    /// synchronous exit hook calls: eframe's `App::on_exit`, a signal handler.
+    ///
+    /// Must run on a thread that is **not** a worker of the runtime it needs
+    /// (the work is spawned onto it and waited for over a plain channel); the
+    /// main thread of `main.rs`, where the multi-thread runtime is entered, is
+    /// right. With no runtime at all it builds a throwaway one.
+    pub fn shutdown_blocking(&mut self, timeout: Duration) {
+        let fut = self.begin_shutdown(timeout);
+        let margin = Duration::from_millis(250);
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                runtime.spawn(async move {
+                    fut.await;
+                    let _ = tx.send(());
+                });
+                let _ = rx.recv_timeout(timeout + margin);
+            }
+            Err(_) => {
+                if let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                    runtime.block_on(fut);
+                }
+            }
         }
     }
 }
+
+/// Send `Leave` and close `client`'s connection in the background; with no
+/// runtime to spawn on, just close it.
+fn spawn_leave(client: ScreenshareClient) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => {
+            runtime.spawn(async move { client.leave_and_close().await });
+        }
+        Err(_) => client.connection().close(crate::net::CLOSE_CLIENT_LEAVE.into(), b"leave"),
+    }
+}
+
+static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether SIGTERM/SIGINT/SIGHUP was received since
+/// [`install_shutdown_signal_handlers`].
+pub fn shutdown_requested() -> bool {
+    SHUTDOWN_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// How long after the first signal the process force-exits if the UI never got
+/// round to closing (a wedged frame loop must not make `kill` ineffective).
+pub const SIGNAL_EXIT_GRACE: Duration = Duration::from_secs(4);
+
+/// Turn SIGTERM, SIGINT and SIGHUP into a normal window close, so the app's
+/// ordinary exit path (`eframe::App::on_exit` -> [`AppState::shutdown_blocking`])
+/// runs and the relay is told we left. The first signal asks the root viewport
+/// to close and wakes the frame loop; the second, or [`SIGNAL_EXIT_GRACE`]
+/// without an exit, kills the process.
+///
+/// `Why via the window and not touching `AppState` here:` the state is owned by
+/// the UI thread (`ui::App`), so the only safe way for a signal task to get a
+/// clean shutdown is to ask that thread to run it.
+///
+/// Needs a Tokio runtime entered on the calling thread (`main.rs` has one);
+/// without one it does nothing. Call once, from `ui::App::new`.
+#[cfg(unix)]
+pub fn install_shutdown_signal_handlers(ctx: egui::Context) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else { return };
+    runtime.spawn(async move {
+        let (Ok(mut term), Ok(mut int), Ok(mut hup)) =
+            (signal(SignalKind::terminate()), signal(SignalKind::interrupt()), signal(SignalKind::hangup()))
+        else {
+            tracing::warn!("could not install the SIGTERM/SIGINT handlers; the relay will only learn of an exit by timeout");
+            return;
+        };
+        let mut seen = 0u32;
+        loop {
+            tokio::select! {
+                _ = term.recv() => {}
+                _ = int.recv() => {}
+                _ = hup.recv() => {}
+            }
+            seen += 1;
+            SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+            if seen > 1 {
+                std::process::exit(130);
+            }
+            tracing::info!("termination signal received, closing the window");
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            ctx.request_repaint();
+            std::thread::spawn(|| {
+                std::thread::sleep(SIGNAL_EXIT_GRACE);
+                std::process::exit(143);
+            });
+        }
+    });
+}
+
+/// No signal handling off Unix (the client only runs on Linux today).
+#[cfg(not(unix))]
+pub fn install_shutdown_signal_handlers(_ctx: egui::Context) {}
 
 // ---------------------------------------------------------------------
 // UI-facing operations
@@ -3513,7 +4473,11 @@ impl AppState {
     ///
     /// A join string that isn't saved is a no-op that still re-saves (and
     /// reports any sticky store error).
+    ///
+    /// Also ends any reconnect of that room: reconnecting is only for rooms
+    /// that stay in the list.
     pub fn forget_room(&mut self, join_string: &str) -> Result<(), String> {
+        self.cancel_reconnect(join_string);
         self.room_store.remove(join_string);
         self.save_room_store();
         self.room_store_result()
@@ -4538,5 +5502,691 @@ mod ui_ops_tests {
         let mut state = AppState::default();
         assert_eq!(state.audio_level_tap_level(5), None);
         state.stop_audio_level_tap(5);
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::test_support::*;
+    use super::*;
+
+    fn member(conn_id: ConnId, name: &str) -> Member {
+        Member { conn_id, display_name: name.to_string(), stream_count: 0 }
+    }
+
+    fn stream(owner: ConnId, stream_id: StreamId, kind: StreamKind, label: &str) -> StreamInfo {
+        StreamInfo { owner, stream_id, kind, label: label.to_string(), width: 0, height: 0 }
+    }
+
+    fn wanted(name: &str, kind: StreamKind, label: &str) -> WantedStream {
+        WantedStream { owner_name: name.to_string(), kind, label: label.to_string(), selected: false, volume_percent: None }
+    }
+
+    // ---- policy ----------------------------------------------------------
+
+    #[test]
+    fn backoff_is_immediate_then_doubles_from_half_a_second_to_the_cap() {
+        let ms = Duration::from_millis;
+        let schedule: Vec<Duration> = (0..9).map(backoff_delay).collect();
+        assert_eq!(schedule, vec![ms(0), ms(500), ms(1000), ms(2000), ms(4000), ms(8000), ms(15_000), ms(15_000), ms(15_000)]);
+        // Far past any realistic outage: no overflow, still capped.
+        assert_eq!(backoff_delay(u32::MAX), RECONNECT_BACKOFF_CAP);
+    }
+
+    #[test]
+    fn close_causes_map_to_retry_policy() {
+        // Relay restart: immediate first retry, then ordinary backoff.
+        assert_eq!(retry_delay(CloseCause::RelayShutdown, 0), Some(Duration::ZERO));
+        assert_eq!(retry_delay(CloseCause::RelayShutdown, 2), Some(Duration::from_secs(1)));
+        // Transport drops back off the same way.
+        assert_eq!(retry_delay(CloseCause::Other, 0), Some(Duration::ZERO));
+        assert_eq!(retry_delay(CloseCause::Other, 3), Some(Duration::from_secs(2)));
+        // Room full: never faster than the slow floor, the long backoff once it exceeds it.
+        assert_eq!(retry_delay(CloseCause::RoomFull, 0), Some(ROOM_FULL_RETRY));
+        assert_eq!(retry_delay(CloseCause::RoomFull, 1), Some(ROOM_FULL_RETRY));
+        assert_eq!(retry_delay(CloseCause::RoomFull, 6), Some(RECONNECT_BACKOFF_CAP));
+        // Malformed join: give up.
+        assert_eq!(retry_delay(CloseCause::Malformed, 0), None);
+        assert_eq!(retry_delay(CloseCause::Malformed, 5), None);
+    }
+
+    // ---- re-matching watches ---------------------------------------------
+
+    #[test]
+    fn a_watch_is_rematched_by_owner_name_kind_and_label_not_by_ids() {
+        let members = [member(10, "alice"), member(11, "bob")];
+        let streams = [stream(10, 3, StreamKind::Video, "Screen"), stream(11, 0, StreamKind::Video, "Screen")];
+        let w = wanted("bob", StreamKind::Video, "Screen");
+        assert_eq!(match_wanted(&w, 99, &members, &streams, |_, _| false), Some((11, 0)));
+        // A different label, kind or name is a different stream.
+        assert_eq!(match_wanted(&wanted("bob", StreamKind::Video, "Other"), 99, &members, &streams, |_, _| false), None);
+        assert_eq!(match_wanted(&wanted("bob", StreamKind::Audio, "Screen"), 99, &members, &streams, |_, _| false), None);
+        assert_eq!(match_wanted(&wanted("carol", StreamKind::Video, "Screen"), 99, &members, &streams, |_, _| false), None);
+        // Our own streams never match.
+        assert_eq!(match_wanted(&w, 11, &members, &streams, |_, _| false), None);
+    }
+
+    #[test]
+    fn two_wanted_streams_with_the_same_key_pick_different_streams() {
+        let members = [member(10, "alice")];
+        let streams = [stream(10, 5, StreamKind::Video, "Screen"), stream(10, 2, StreamKind::Video, "Screen")];
+        let w = wanted("alice", StreamKind::Video, "Screen");
+        // Lowest stream id first, then the next one once that is taken.
+        assert_eq!(match_wanted(&w, 99, &members, &streams, |_, _| false), Some((10, 2)));
+        assert_eq!(match_wanted(&w, 99, &members, &streams, |o, s| (o, s) == (10, 2)), Some((10, 5)));
+        assert_eq!(match_wanted(&w, 99, &members, &streams, |_, _| true), None);
+    }
+
+    // ---- the reconnect state machine, without a network --------------------
+
+    fn saved_state(tag: &str) -> (IsolatedConfigHome, AppState, String) {
+        let home = isolated_config_home();
+        let mut state = AppState::default();
+        let js = state.create_room("127.0.0.1:9", tag).expect("create_room").join_string;
+        (home, state, js)
+    }
+
+    fn fake_entry(handle: RoomHandle, join_string: &str) -> ReconnectState {
+        ReconnectState {
+            join_string: join_string.to_string(),
+            handle,
+            attempts: 0,
+            next_retry: Some(Instant::now()),
+            last_error: Some("dropped".to_string()),
+            cause: CloseCause::Other,
+            since: Instant::now(),
+            members: vec![member(1, "alice")],
+            streams: Vec::new(),
+            shares: Vec::new(),
+            wanted: Vec::new(),
+            was_active_room: false,
+            cancelled: false,
+        }
+    }
+
+    fn connect_err(cause: CloseCause) -> ConnectResult {
+        Err(ConnectError { message: format!("{cause:?}"), cause })
+    }
+
+    #[tokio::test]
+    async fn a_waiting_room_reads_as_reconnecting_and_keeps_the_ui_ticking() {
+        let (_home, mut state, js) = saved_state("waiting");
+        let mut entry = fake_entry(RoomHandle(7), &js);
+        entry.next_retry = Some(Instant::now() + Duration::from_secs(60));
+        state.reconnects.insert(RoomHandle(7), entry);
+        state.refresh_status();
+        assert!(state.is_reconnecting(&js), "a room between attempts must not fall back to Disconnected");
+        assert!(matches!(state.status, Status::Connecting), "the UI only repaints on Connecting");
+        let info = state.reconnect_info(&js).expect("info");
+        assert_eq!(info.attempts, 0);
+        assert!(info.retry_in(Instant::now()).unwrap() > Duration::from_secs(50));
+        assert_eq!(info.members.len(), 1, "the last-known roster is exposed");
+    }
+
+    #[tokio::test]
+    async fn an_attempt_starts_when_due_and_a_failure_schedules_the_next_one_by_backoff() {
+        let (_home, mut state, js) = saved_state("due");
+        state.reconnect_attempt_timeout = Duration::from_millis(150);
+        state.reconnects.insert(RoomHandle(3), fake_entry(RoomHandle(3), &js));
+
+        state.poll_reconnects();
+        let pending = state.pending_connect.as_ref().expect("a due entry starts an attempt");
+        assert_eq!(pending.reconnect, Some(RoomHandle(3)));
+        assert!(!pending.from_add_card);
+        assert_eq!(state.reconnects[&RoomHandle(3)].attempts, 1);
+        assert!(state.reconnects[&RoomHandle(3)].attempt_in_flight());
+
+        // Nothing listens on port 9, so the attempt times out and counts as a failure.
+        let outcome = loop {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            match state.poll_connect_result() {
+                ConnectOutcome::None if state.pending_connect.is_some() => continue,
+                other => break other,
+            }
+        };
+        assert!(matches!(outcome, ConnectOutcome::None), "a failed attempt is not a UI-visible failure");
+        let entry = &state.reconnects[&RoomHandle(3)];
+        let wait = entry.retry_in(Instant::now()).expect("next attempt scheduled");
+        // 1 failed attempt -> 0.5 s.
+        assert!(wait <= Duration::from_millis(500) && wait > Duration::from_millis(300), "wait = {wait:?}");
+        assert!(entry.last_error.is_some());
+        assert!(state.is_reconnecting(&js));
+    }
+
+    #[tokio::test]
+    async fn room_full_keeps_retrying_slowly_and_says_so() {
+        let (_home, mut state, js) = saved_state("full");
+        let mut entry = fake_entry(RoomHandle(1), &js);
+        entry.attempts = 1;
+        entry.next_retry = None;
+        state.reconnects.insert(RoomHandle(1), entry);
+        let outcome = state.finish_reconnect_attempt(RoomHandle(1), connect_err(CloseCause::RoomFull));
+        assert!(matches!(outcome, ConnectOutcome::None));
+        let info = state.reconnect_info(&js).expect("still reconnecting");
+        assert!(info.room_full());
+        assert!(info.retry_in(Instant::now()).unwrap() >= Duration::from_secs(4));
+        assert!(info.last_error.as_deref().unwrap().contains("RoomFull"));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_join_stops_and_surfaces_the_error() {
+        let (_home, mut state, js) = saved_state("malformed");
+        let mut entry = fake_entry(RoomHandle(1), &js);
+        entry.attempts = 1;
+        entry.next_retry = None;
+        state.reconnects.insert(RoomHandle(1), entry);
+        let outcome = state.finish_reconnect_attempt(RoomHandle(1), connect_err(CloseCause::Malformed));
+        match outcome {
+            ConnectOutcome::Failed { error, from_add_card } => {
+                assert!(error.contains("Malformed"));
+                assert!(!from_add_card);
+            }
+            _ => panic!("a terminal failure must be reported"),
+        }
+        assert!(!state.is_reconnecting(&js));
+        assert!(state.reconnects.is_empty());
+        assert!(matches!(state.status, Status::Error(_)), "status = surfaced error, not Connecting");
+    }
+
+    #[tokio::test]
+    async fn cancel_reconnect_names_the_room_and_leaves_the_others_alone() {
+        let (_home, mut state, js_a) = saved_state("cancel-a");
+        let js_b = state.create_room("127.0.0.1:9", "cancel-b").unwrap().join_string;
+        for (h, js) in [(1, &js_a), (2, &js_b)] {
+            let mut e = fake_entry(RoomHandle(h), js);
+            e.next_retry = Some(Instant::now() + Duration::from_secs(30));
+            state.reconnects.insert(RoomHandle(h), e);
+        }
+        state.cancel_reconnect(&js_a);
+        assert!(!state.is_reconnecting(&js_a));
+        assert!(state.is_reconnecting(&js_b));
+        state.cancel_reconnect("not|a|room");
+        assert_eq!(state.reconnects.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_room_ends_its_reconnect() {
+        let (_home, mut state, js) = saved_state("forget");
+        let mut e = fake_entry(RoomHandle(1), &js);
+        e.next_retry = Some(Instant::now() + Duration::from_secs(30));
+        state.reconnects.insert(RoomHandle(1), e);
+        state.forget_room(&js).unwrap();
+        assert!(state.reconnects.is_empty());
+        assert!(!state.is_reconnecting(&js));
+    }
+
+    #[tokio::test]
+    async fn a_room_that_left_the_saved_list_is_dropped_by_the_poll() {
+        let (_home, mut state, js) = saved_state("delisted");
+        state.reconnects.insert(RoomHandle(1), fake_entry(RoomHandle(1), &js));
+        state.room_store.remove(&js);
+        state.poll_reconnects();
+        assert!(state.reconnects.is_empty());
+        assert!(state.pending_connect.is_none(), "no attempt for a room that is not in the list");
+    }
+
+    /// The current UI's "Retry now" is `CancelConnect` then `Connect(key)` in one
+    /// frame, and its "Cancel" is `CancelConnect` alone. Both must work without
+    /// UI changes for the single-room case.
+    #[tokio::test]
+    async fn legacy_cancel_then_connect_is_retry_now_and_cancel_alone_cancels() {
+        let (_home, mut state, js) = saved_state("legacy");
+        state.reconnect_attempt_timeout = Duration::from_secs(5);
+        let mut e = fake_entry(RoomHandle(1), &js);
+        e.next_retry = Some(Instant::now() + Duration::from_secs(30));
+        state.reconnects.insert(RoomHandle(1), e);
+
+        // Retry now: cancel, then connect, then the next poll.
+        state.cancel_connect();
+        assert!(state.reconnects[&RoomHandle(1)].cancelled);
+        state.start_connect(js.clone(), false).unwrap();
+        assert!(!state.reconnects[&RoomHandle(1)].cancelled, "connecting revives the parked reconnect");
+        let pending = state.pending_connect.as_ref().expect("retry now starts an attempt at once");
+        assert_eq!(pending.reconnect, Some(RoomHandle(1)), "and it stays an automatic reconnect");
+        state.poll_reconnects();
+        assert!(state.is_reconnecting(&js));
+
+        // Cancel alone: the in-flight attempt is aborted and the entry dropped at the next poll.
+        state.cancel_connect();
+        assert!(state.pending_connect.is_none());
+        assert!(state.is_reconnecting(&js), "still listed until the next poll, so a Connect can revive it");
+        state.poll_reconnects();
+        assert!(!state.is_reconnecting(&js));
+        assert!(matches!(state.status, Status::Idle));
+    }
+
+    #[tokio::test]
+    async fn legacy_cancel_never_guesses_between_several_reconnecting_rooms() {
+        let (_home, mut state, js_a) = saved_state("legacy-multi-a");
+        let js_b = state.create_room("127.0.0.1:9", "legacy-multi-b").unwrap().join_string;
+        for (h, js) in [(1, &js_a), (2, &js_b)] {
+            let mut e = fake_entry(RoomHandle(h), js);
+            e.next_retry = Some(Instant::now() + Duration::from_secs(30));
+            state.reconnects.insert(RoomHandle(h), e);
+        }
+        state.cancel_connect();
+        state.poll_reconnects();
+        assert!(state.is_reconnecting(&js_a) && state.is_reconnecting(&js_b), "no room may be given up on by a key-less cancel");
+        assert!(state.reconnects.values().all(|e| !e.cancelled));
+    }
+
+    #[tokio::test]
+    async fn reconnect_now_replaces_a_hung_attempt_and_skips_the_wait() {
+        let (_home, mut state, js) = saved_state("now");
+        let mut e = fake_entry(RoomHandle(1), &js);
+        e.next_retry = Some(Instant::now() + Duration::from_secs(30));
+        state.reconnects.insert(RoomHandle(1), e);
+        state.reconnect_now(&js);
+        assert_eq!(state.reconnects[&RoomHandle(1)].attempts, 1);
+        assert!(state.pending_connect.is_some());
+        state.reconnect_now(&js);
+        assert_eq!(state.reconnects[&RoomHandle(1)].attempts, 2, "a second Retry now restarts the attempt");
+        state.cancel_reconnect(&js);
+        assert!(state.pending_connect.is_none(), "cancelling aborts the attempt that belonged to the room");
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_reconnecting_and_is_idempotent() {
+        let (_home, mut state, js) = saved_state("shutdown");
+        state.reconnects.insert(RoomHandle(1), fake_entry(RoomHandle(1), &js));
+        state.shutdown(Duration::from_millis(500)).await;
+        assert!(state.reconnects.is_empty());
+        assert!(state.pending_connect.is_none());
+        state.poll_reconnects();
+        assert!(state.pending_connect.is_none());
+        state.shutdown(Duration::from_millis(500)).await;
+    }
+}
+
+/// Auto-reconnect and clean exit against a real relay (child process) and, for
+/// the share tests, a real GStreamer capture (`videotestsrc`; the portal cannot
+/// be driven unattended). All `#[ignore]`d like the rest of the end-to-end
+/// suite:
+///
+/// ```text
+/// cargo test -p simple-screensharing-client --lib -- --ignored session::reconnect_e2e:: --test-threads=1 --nocapture
+/// ```
+#[cfg(test)]
+mod reconnect_e2e {
+    use std::net::UdpSocket;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    use indexmap::IndexMap;
+
+    use super::test_support::*;
+    use super::*;
+    use crate::capture::{self, DestKey};
+    use crate::end_to_end_test::{ServerGuard, connect_with_retry, pick_free_udp_port, server_binary_path, spawn_relay_server};
+    use crate::net::ClientEvent;
+    use crate::protocol::PresenceEvent;
+
+    const TEST_FPS: u32 = 30;
+
+    /// One front-end frame for `state`, as `ui::App::poll` runs it.
+    fn tick(state: &mut AppState, ctx: &egui::Context) {
+        state.poll_auto_connect_queue();
+        state.poll_connect_result();
+        state.drain_events(ctx);
+        state.poll_capture_states();
+        state.poll_pending_destinations();
+        state.poll_destination_edits();
+    }
+
+    /// Tick every state until `done` or the deadline; panics with `what`.
+    async fn drive(states: &mut [&mut AppState], timeout: Duration, what: &str, mut done: impl FnMut(&mut [&mut AppState]) -> bool) -> Duration {
+        let ctx = egui::Context::default();
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            for state in states.iter_mut() {
+                tick(state, &ctx);
+            }
+            if done(states) {
+                return started.elapsed();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("{what}: not met within {timeout:?}");
+    }
+
+    /// Tick every state for `duration` (the "nothing must happen" wait).
+    async fn run_for(states: &mut [&mut AppState], duration: Duration) {
+        let ctx = egui::Context::default();
+        let started = Instant::now();
+        while started.elapsed() < duration {
+            for state in states.iter_mut() {
+                tick(state, &ctx);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Waits until the relay answers, so a test's first connect is not racing
+    /// its start-up.
+    async fn await_relay(join_string: &str) {
+        let (probe, _snapshot, _events) = connect_with_retry(join_string, "probe").await.expect("relay never came up");
+        probe.leave_and_close().await;
+    }
+
+    /// Stop the relay the way an operator does (SIGINT -> `relay::shutdown`, so
+    /// connected clients get `CONNECTION_CLOSE 0x200`), wait for its port, and
+    /// start a fresh one on the same port.
+    async fn restart_relay(old: ServerGuard, port: u16) -> ServerGuard {
+        let binary = server_binary_path().expect("relay binary");
+        let _ = Command::new("pkill").args(["-INT", "-f", &format!("^{} {port}$", binary.display())]).status();
+        let mut freed = false;
+        for _ in 0..60 {
+            if UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(freed, "the relay did not exit on SIGINT");
+        // Dropping the old guard runs `pkill -f "simple-screensharing-server <port>"`:
+        // it must be gone before the new relay exists, or it would kill that one.
+        drop(old);
+        spawn_relay_server(port).expect("respawn relay")
+    }
+
+    fn frames_decoded(state: &AppState, room: RoomHandle, key: (ConnId, StreamId)) -> u64 {
+        let session = &state.rooms[&room];
+        let watches = session.watches.lock().unwrap();
+        watches.get(&key).map(|w| w.decoder.lock().unwrap().frames().frames_decoded()).unwrap_or(0)
+    }
+
+    /// Put a test-source capture into `room` as the first destination of a new
+    /// capture (what `start_video_share` does, minus the interactive portal).
+    async fn share_test_source(state: &mut AppState, room: RoomHandle) -> CaptureSourceId {
+        let capture_id = state.alloc_capture_id();
+        let destination_id = state.alloc_destination_id();
+        assert_eq!(destination_id, DestinationId(0), "the test source's DestKey(0) must match the first destination id");
+        let session = state.rooms.get_mut(&room).expect("room");
+        let stream_id = session.next_stream_id;
+        session.next_stream_id += 1;
+        session.destinations.push(destination_id);
+        let client = session.client.clone();
+        let fragment = format!("videotestsrc is-live=true pattern=ball ! video/x-raw,width=320,height=240,framerate={TEST_FPS}/1");
+        let handle = capture::start_sharing_from_test_source(&client, stream_id, 2_000, TEST_FPS, &fragment)
+            .await
+            .expect("start_sharing_from_test_source");
+        let runtime = handle.destination_runtime(DestKey(destination_id.0));
+        let params = runtime.as_ref().expect("first destination").lock().unwrap().params();
+        state.captures.insert(
+            capture_id,
+            LocalCapture {
+                kind: StreamKind::Video,
+                label: "test capture".to_string(),
+                status: ShareStatus::Active(ShareHandle::Video(handle)),
+                audio_for_capture: None,
+                destinations: IndexMap::from([(
+                    destination_id,
+                    Destination { room, stream_id, params, runtime, pending: None, edit: Destination::edit_from(params), apply_rx: None },
+                )]),
+                self_preview_texture: None,
+            },
+        );
+        capture_id
+    }
+
+    fn stream_of(state: &AppState, room: RoomHandle, owner_name: &str) -> Option<(ConnId, StreamId)> {
+        let session = state.rooms.get(&room)?;
+        let owner = session.members.iter().find(|m| m.display_name == owner_name)?.conn_id;
+        session.streams.iter().find(|s| s.owner == owner && s.kind == StreamKind::Video).map(|s| (s.owner, s.stream_id))
+    }
+
+    /// The headline case: the relay restarts (SIGINT, `0x200`). The watcher
+    /// rejoins by itself under the same handle, its watch resumes on the
+    /// re-announced stream (new owner `ConnId`, found by name + kind + label),
+    /// and the sharer's capture keeps running and re-announces into the new
+    /// connection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "spawns a real relay server child process (and a real GStreamer capture)"]
+    async fn relay_restart_is_survived_the_watch_and_the_own_share_come_back() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        gstreamer::init().expect("gstreamer init");
+        let _home = isolated_config_home();
+        let port = pick_free_udp_port().expect("free port");
+        let relay = spawn_relay_server(port).expect("relay");
+
+        let mut watcher = AppState::default();
+        let mut sharer = AppState::default();
+        let join_string = watcher.create_room(&format!("127.0.0.1:{port}"), "restart").expect("create_room").join_string;
+        await_relay(&join_string).await;
+        watcher.join_room(join_string.clone(), "watcher".into(), String::new()).expect("join");
+        sharer.join_room(join_string.clone(), "sharer".into(), "restart".into()).expect("join");
+        drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(10), "both joined", |s| {
+            !s[0].rooms.is_empty() && !s[1].rooms.is_empty()
+        })
+        .await;
+        let wh = *watcher.rooms.keys().next().unwrap();
+        let sh = *sharer.rooms.keys().next().unwrap();
+
+        let capture_id = share_test_source(&mut sharer, sh).await;
+        drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(10), "watcher sees the stream", |s| {
+            stream_of(s[0], wh, "sharer").is_some()
+        })
+        .await;
+        let (old_owner, old_stream) = stream_of(&watcher, wh, "sharer").unwrap();
+        watcher.rooms.get_mut(&wh).unwrap().toggle_watch(old_owner, old_stream);
+        drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(15), "first frames decoded", |s| {
+            frames_decoded(s[0], wh, (old_owner, old_stream)) > 5
+        })
+        .await;
+
+        // --- restart ---
+        let relay = restart_relay(relay, port).await;
+        let restarted = Instant::now();
+
+        drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(5), "watcher notices the drop", |s| !s[0].rooms.contains_key(&wh))
+            .await;
+        // The outage is visible as a truthful Reconnecting state, with the roster kept.
+        assert!(watcher.is_reconnecting(&join_string), "a dropped room must read as reconnecting, not disconnected");
+        assert!(matches!(watcher.status, Status::Connecting));
+        {
+            let info = watcher.reconnect_info(&join_string).expect("reconnect info");
+            assert_eq!(info.cause, CloseCause::RelayShutdown, "the relay's 0x200 must be read from the QUIC close");
+            assert!(info.members.iter().any(|m| m.display_name == "sharer"), "last-known roster is kept for the People panel");
+            assert!(!info.members.iter().any(|m| m.display_name == "watcher"), "we are not in our own last-known roster");
+        }
+
+        let back = drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(15), "both rooms back", |s| {
+            s[0].rooms.contains_key(&wh) && s[1].rooms.contains_key(&sh)
+        })
+        .await;
+        eprintln!("[restart] both clients rejoined {:.2}s after the relay was restarted (loop waited {back:?})", restarted.elapsed().as_secs_f64());
+        assert!(restarted.elapsed() < Duration::from_secs(8), "reconnect took {:?}", restarted.elapsed());
+        assert!(!watcher.is_reconnecting(&join_string));
+        assert!(watcher.reconnects.is_empty() && sharer.reconnects.is_empty());
+        assert!(matches!(watcher.status, Status::Idle));
+
+        // The sharer's capture survived and its destination was rebuilt on the new connection.
+        drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(15), "own destination live again", |s| {
+            let capture = &s[1].captures[&capture_id];
+            capture.destinations.len() == 1
+                && capture.destinations.values().all(|d| d.room == sh && d.pending.is_none() && d.state() == capture::destination::DestinationState::Live)
+        })
+        .await;
+        assert!(sharer.share_error.is_none(), "{:?}", sharer.share_error);
+        assert!(matches!(sharer.captures[&capture_id].status, ShareStatus::Active(_)), "the capture itself was never restarted");
+
+        // The watch resumed on the re-announced stream.
+        drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(15), "watch resumed", |s| {
+            stream_of(s[0], wh, "sharer").is_some_and(|key| frames_decoded(s[0], wh, key) > 5)
+        })
+        .await;
+        let (new_owner, new_stream) = stream_of(&watcher, wh, "sharer").unwrap();
+        assert_ne!(new_owner, old_owner, "a reconnect gives the sharer a fresh ConnId, so this proves the name-based re-match");
+        assert!(watcher.rooms[&wh].watches.lock().unwrap().contains_key(&(new_owner, new_stream)));
+        assert!(!watcher.rooms[&wh].watches.lock().unwrap().contains_key(&(old_owner, old_stream)));
+        eprintln!("[restart] watch resumed {:.2}s after the restart", restarted.elapsed().as_secs_f64());
+
+        watcher.shutdown(Duration::from_secs(2)).await;
+        sharer.shutdown(Duration::from_secs(3)).await;
+        drop(relay);
+    }
+
+    /// Reconnecting is for unexpected drops only: a user Leave, a Forget, and a
+    /// Cancel must leave the room down even though the relay is fine. A Leave
+    /// is also seen by the other members at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "spawns a real relay server child process"]
+    async fn user_leave_forget_and_cancel_do_not_reconnect() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let _home = isolated_config_home();
+        let port = pick_free_udp_port().expect("free port");
+        let relay = spawn_relay_server(port).expect("relay");
+        let mut app = AppState::default();
+        let join_string = app.create_room(&format!("127.0.0.1:{port}"), "leave").expect("create_room").join_string;
+        await_relay(&join_string).await;
+        let (peer, _snapshot, mut peer_events) = connect_with_retry(&join_string, "peer").await.expect("peer");
+
+        app.join_room(join_string.clone(), "app".into(), String::new()).expect("join");
+        drive(&mut [&mut app], Duration::from_secs(10), "joined", |s| !s[0].rooms.is_empty()).await;
+        let handle = *app.rooms.keys().next().unwrap();
+        let app_conn = app.rooms[&handle].client.conn_id();
+
+        // --- user Leave: peer sees it within a second, nothing reconnects ---
+        let left_at = tokio::spawn(async move {
+            loop {
+                match peer_events.recv().await {
+                    Some(ClientEvent::PresenceDelta(PresenceEvent::MemberLeft { conn_id })) if conn_id == app_conn => return Instant::now(),
+                    Some(_) => {}
+                    None => panic!("peer event channel closed before MemberLeft"),
+                }
+            }
+        });
+        let leave_called = Instant::now();
+        app.disconnect_room(handle);
+        let seen = left_at.await.expect("peer task");
+        let took = seen.duration_since(leave_called);
+        eprintln!("[leave] peer saw MemberLeft {took:?} after disconnect_room");
+        assert!(took < Duration::from_secs(1), "peer saw the leave after {took:?}");
+        run_for(&mut [&mut app], Duration::from_secs(3)).await;
+        assert!(app.rooms.is_empty() && app.reconnects.is_empty() && app.pending_connect.is_none(), "a user Leave must not reconnect");
+        assert!(!app.is_reconnecting(&join_string));
+
+        // --- Cancel while reconnecting: join again, drop the relay under it, cancel, bring the relay back ---
+        app.start_connect(join_string.clone(), false).expect("connect");
+        drive(&mut [&mut app], Duration::from_secs(10), "rejoined", |s| !s[0].rooms.is_empty()).await;
+        let handle = *app.rooms.keys().next().unwrap();
+        let relay = restart_relay(relay, port).await;
+        drive(&mut [&mut app], Duration::from_secs(5), "drop noticed", |s| !s[0].rooms.contains_key(&handle)).await;
+        assert!(app.is_reconnecting(&join_string));
+        app.cancel_reconnect(&join_string);
+        assert!(!app.is_reconnecting(&join_string));
+        run_for(&mut [&mut app], Duration::from_secs(3)).await;
+        assert!(app.rooms.is_empty() && app.pending_connect.is_none(), "a cancelled reconnect must not come back by itself");
+
+        // --- Forget while reconnecting (and the saved row going away) ---
+        app.start_connect(join_string.clone(), false).expect("connect");
+        drive(&mut [&mut app], Duration::from_secs(10), "rejoined again", |s| !s[0].rooms.is_empty()).await;
+        let handle = *app.rooms.keys().next().unwrap();
+        let relay = restart_relay(relay, port).await;
+        drive(&mut [&mut app], Duration::from_secs(5), "drop noticed again", |s| !s[0].rooms.contains_key(&handle)).await;
+        app.forget_room(&join_string).expect("forget");
+        run_for(&mut [&mut app], Duration::from_secs(3)).await;
+        assert!(app.rooms.is_empty() && app.reconnects.is_empty() && app.pending_connect.is_none(), "a forgotten room must not reconnect");
+
+        peer.leave_and_close().await;
+        drop(relay);
+    }
+
+    /// Exit (`shutdown_blocking`, what `on_exit` and the signal path call) tells
+    /// the relay we left within a round trip, not after its 60-75 s idle
+    /// timeout, even while sharing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "spawns a real relay server child process (and a real GStreamer capture)"]
+    async fn clean_exit_is_seen_by_a_peer_in_under_a_second() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        gstreamer::init().expect("gstreamer init");
+        let _home = isolated_config_home();
+        let port = pick_free_udp_port().expect("free port");
+        let relay = spawn_relay_server(port).expect("relay");
+        let mut app = AppState::default();
+        let join_string = app.create_room(&format!("127.0.0.1:{port}"), "exit").expect("create_room").join_string;
+        await_relay(&join_string).await;
+        let (peer, _snapshot, mut peer_events) = connect_with_retry(&join_string, "peer").await.expect("peer");
+
+        app.join_room(join_string.clone(), "app".into(), String::new()).expect("join");
+        drive(&mut [&mut app], Duration::from_secs(10), "joined", |s| !s[0].rooms.is_empty()).await;
+        let handle = *app.rooms.keys().next().unwrap();
+        let app_conn = app.rooms[&handle].client.conn_id();
+        share_test_source(&mut app, handle).await;
+        // The peer has seen us (and our stream) before we leave.
+        let seen_left = tokio::spawn(async move {
+            loop {
+                match peer_events.recv().await {
+                    Some(ClientEvent::PresenceDelta(PresenceEvent::MemberLeft { conn_id })) if conn_id == app_conn => return Instant::now(),
+                    Some(_) => {}
+                    None => panic!("peer event channel closed before MemberLeft"),
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let called = Instant::now();
+        app.shutdown_blocking(Duration::from_secs(5));
+        let returned = called.elapsed();
+        let seen = seen_left.await.expect("peer task").duration_since(called);
+        eprintln!("[exit] peer saw MemberLeft {seen:?} after shutdown_blocking was called; the call itself took {returned:?}");
+        assert!(seen < Duration::from_secs(1), "peer saw the exit after {seen:?}");
+        assert!(app.rooms.is_empty() && app.captures.is_empty());
+
+        peer.leave_and_close().await;
+        drop(relay);
+    }
+
+    /// A full room is retried slowly, not given up on, and not hammered: the
+    /// error is kept for the UI ("room full, still trying"), and the room is
+    /// joined as soon as a slot frees up and the user presses Retry now.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "spawns a real relay server child process"]
+    async fn a_full_room_keeps_being_retried_slowly_and_is_joined_when_a_slot_frees() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let _home = isolated_config_home();
+        let port = pick_free_udp_port().expect("free port");
+        let relay = spawn_relay_server(port).expect("relay");
+        let mut app = AppState::default();
+        let join_string = app.create_room(&format!("127.0.0.1:{port}"), "full").expect("create_room").join_string;
+        await_relay(&join_string).await;
+        app.join_room(join_string.clone(), "app".into(), String::new()).expect("join");
+        drive(&mut [&mut app], Duration::from_secs(10), "joined", |s| !s[0].rooms.is_empty()).await;
+        let handle = *app.rooms.keys().next().unwrap();
+
+        // Restart the relay without ticking `app`, and fill the new room to the brim
+        // before it gets a chance to rejoin.
+        let relay = restart_relay(relay, port).await;
+        let mut others = Vec::new();
+        for i in 0..crate::protocol::MAX_ROOM_MEMBERS {
+            others.push(connect_with_retry(&join_string, &format!("p{i}")).await.expect("filler"));
+        }
+
+        drive(&mut [&mut app], Duration::from_secs(10), "room-full noticed", |s| {
+            s[0].reconnect_info(&join_string).is_some_and(|i| i.room_full())
+        })
+        .await;
+        {
+            let info = app.reconnect_info(&join_string).unwrap();
+            assert!(info.last_error.as_deref().unwrap().contains("RoomFull"), "error kept for the UI: {:?}", info.last_error);
+            assert!(info.retry_in(Instant::now()).unwrap() > Duration::from_secs(3), "slow retry, not a tight loop");
+        }
+        let attempts = app.reconnect_info(&join_string).unwrap().attempts;
+        run_for(&mut [&mut app], Duration::from_secs(2)).await;
+        assert_eq!(app.reconnect_info(&join_string).unwrap().attempts, attempts, "no attempts while the slow wait runs");
+        assert!(app.is_reconnecting(&join_string), "still trying");
+
+        // A slot frees; Retry now gets in.
+        let (leaver, _, _) = others.pop().unwrap();
+        leaver.leave_and_close().await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        app.reconnect_now(&join_string);
+        drive(&mut [&mut app], Duration::from_secs(10), "joined after a slot freed", |s| s[0].rooms.contains_key(&handle)).await;
+        assert!(app.reconnects.is_empty());
+
+        for (client, _, _) in others {
+            client.leave_and_close().await;
+        }
+        drop(relay);
     }
 }
