@@ -709,6 +709,12 @@ they were, never worse.
 
 ### Stall protocol
 
+A destination enters `Stalled` on a deliberate source restart (`branch::stall_all`) and,
+since 2026-10-14, when a `Live` un-paused branch produces nothing for
+`destination::silence_threshold` (`DestinationRuntime::stall_if_silent`). See
+`features/stream-control.md` ("Idle monitors") for why a capture can also have *no first
+frame at all*, which is handled before a branch exists (`branch::wait_for_source_frame`).
+
 While `Stalled`, the destination is **never torn down** — no `StopStream`, so the viewer
 never sees a disconnect/resubscribe. Instead `capture.rs`'s `send_stall_keepalive` re-sends
 the destination's last cached IDR every `STALL_RESEND_INTERVAL` (500ms, ~2fps), freshly
