@@ -71,9 +71,19 @@ timeout) because nothing sent `Leave` or closed the QUIC connection. Both fixed 
   no thumbnail of our share until it is restarted. Fix: `ensure_preview_task` restarts the task
   when its client's connection is closed, which needs `preview_sink` kept (cloned) instead of
   `take()`n. (2) A relay that dies without a `CONNECTION_CLOSE` (SIGKILL, power loss) is only
-  noticed on the next packet or after the 60 s idle timeout. (3) The UI cannot yet name the room
-  on Retry now / Cancel or show the attempt count; the lib API is ready (`reconnect_now`,
-  `cancel_reconnect`, `reconnect_info`), see the task #36 hand-off.
+  noticed on the next packet or after the 60 s idle timeout.
+- **UI wiring (task #37).** The banner's Retry now / Cancel are `UiAction::RetryNow(key)` /
+  `CancelReconnect(key)` (`reconnect_now` / `cancel_reconnect`; Cancel also aborts a first-time
+  connect); the old `CancelConnect` action is gone. The banner adds "Attempt N · Retrying in N s"
+  (or "Trying now…", "Room full, still trying") and one short "Last error" line from
+  `reconnect_info`. The People panel lists the last-known roster dimmed, with our own row
+  prepended from the display name (the lib's copy leaves us out). `on_exit` calls
+  `shutdown_blocking(1.5 s)` and `App::new` installs the signal handlers. A staged (not yet
+  live) share survives an outage; one whose room is really gone has its capture stopped.
+  "Live" (People pill, sidebar cast icon, "Live in N rooms") now means a destination that is
+  on air (`Cx::my_phase` / `on_air_rooms`); while Starting the UI says so, and the share card
+  carries the idle-screen hint as a tooltip. `Why:` a share waiting for an idle screen's
+  first frame used to read as Live although nobody saw anything.
 
 ## Rework foundation: monorepo, shared protocol, native decoder, lib consolidation (2026-10-14)
 

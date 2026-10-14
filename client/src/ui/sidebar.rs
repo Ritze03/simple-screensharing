@@ -163,7 +163,8 @@ fn room_lines(cx: &Cx) -> Vec<Line> {
         out.push(Line::Room {
             name: r.name.clone(),
             dot,
-            live: mine.is_some(),
+            // The cast icon only once it's on air, not while Starting.
+            live: mine.is_some() && handle.and_then(|h| cx.my_phase(h)) == Some(super::MyPhase::OnAir),
             num: (handle.is_some() && n > 0).then_some(n as u32),
             selected: super::view_is_room(&cx.nav.view, &r.key),
             tip: tip.to_string(),
@@ -173,7 +174,8 @@ fn room_lines(cx: &Cx) -> Vec<Line> {
         if let Some((capture, fps)) = mine {
             out.push(Line::Sharer {
                 icon: "cast",
-                tone: IconTone::Live,
+                // Green only once it's on air; dim while still Starting.
+                tone: if cx.my_phase(h) == Some(super::MyPhase::OnAir) { IconTone::Live } else { IconTone::Dim },
                 name: tr("ui.sidebar.you", "You").to_string(),
                 fps: Some(fps),
                 tip: Some(tr("ui.sidebar.you_tip", "Your stream here — open its settings").to_string()),
@@ -220,7 +222,10 @@ pub fn show_user_band(ui: &mut Ui, cx: &mut Cx, _st: &mut SidebarState) {
     let row = HBox::new("user_band", theme::BAND_H).slots(&[fixed(theme::AVATAR), FILL, fixed(theme::CTL_H)]).show(ui);
     let name = cx.state.display_name.clone();
     let initial: String = name.chars().next().map(|c| c.to_string()).unwrap_or_default();
-    let n_live = cx.live_rooms().len();
+    // Only rooms we're actually on air in; a share still Starting (e.g. an
+    // idle screen waiting for its first frame) says "Starting…" instead.
+    let n_live = cx.on_air_rooms().len();
+    let starting = n_live == 0 && cx.live_rooms().iter().any(|h| cx.my_phase(*h) == Some(super::MyPhase::Starting));
     let online = cx.rooms().iter().any(|r| r.conn == ConnState::Joined);
     let av = Rect::from_center_size(row.cell(0).center(), vec2(theme::AVATAR, theme::AVATAR));
     widgets::paint_avatar(ui, av, &initial, 0, online);
@@ -234,6 +239,7 @@ pub fn show_user_band(ui: &mut Ui, cx: &mut Cx, _st: &mut SidebarState) {
         ui.painter().rect_filled(hot, CornerRadius::same(theme::ROUNDING_XS), theme::WASH_HOVER_1);
     }
     let status = match n_live {
+        0 if starting => tr("ui.sidebar.starting", "Starting…").to_string(),
         0 => tr("ui.sidebar.not_sharing", "Not sharing").to_string(),
         1 => tr("ui.sidebar.live_in_one_room", "Live in 1 room").to_string(),
         n => tr_with("ui.sidebar.live_in_rooms", "Live in %{count} rooms", &[("count", &n.to_string())]),
@@ -241,7 +247,7 @@ pub fn show_user_band(ui: &mut Ui, cx: &mut Cx, _st: &mut SidebarState) {
     let top = Rect::from_x_y_ranges(who.x_range(), who.center().y - 15.0..=who.center().y + 1.0);
     let bottom = Rect::from_x_y_ranges(who.x_range(), who.center().y + 1.0..=who.center().y + 15.0);
     widgets::paint_text(ui, top, &name, font(Weight::Bold, theme::FS_ROW), theme::TEXT, Align::Min);
-    let status_col = if n_live > 0 { theme::SUCCESS } else { theme::TEXT_DIM };
+    let status_col = if n_live > 0 { theme::SUCCESS } else if starting { theme::ACCENT_LIGHTER } else { theme::TEXT_DIM };
     widgets::paint_text(ui, bottom, &status, font(Weight::Regular, theme::FS_TINY), status_col, Align::Min);
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tr("ui.sidebar.outgoing_tip", "Your outgoing streams"));
     if resp.clicked() {

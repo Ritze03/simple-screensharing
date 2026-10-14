@@ -46,7 +46,15 @@ impl App {
                     self.toast(tr_with("ui.toast.connect_failed", "Couldn't connect: %{error}", &[("error", &e.to_string())]), "error");
                 }
             }
-            UiAction::CancelConnect => self.state.cancel_connect(),
+            UiAction::RetryNow(key) => self.state.reconnect_now(&key),
+            UiAction::CancelReconnect(key) => {
+                self.state.cancel_reconnect(&key);
+                // Still "reconnecting" = a first-time connect to this room is
+                // in flight (no reconnect entry): abort that.
+                if self.state.is_reconnecting(&key) {
+                    self.state.cancel_connect();
+                }
+            }
             UiAction::JoinRoom { join_string, room_name } => {
                 let join_string = join_string.trim().to_string();
                 self.shell.join_error = None;

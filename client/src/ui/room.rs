@@ -42,9 +42,9 @@ use simple_screensharing_client::capture::VideoCodec;
 use simple_screensharing_client::capture::destination::DestinationState;
 use simple_screensharing_client::decode::render::Fit;
 use simple_screensharing_client::protocol::{ConnId, StreamInfo, StreamKind};
-use simple_screensharing_client::session::{CaptureSourceId, DestinationId, RoomHandle};
+use simple_screensharing_client::session::{CaptureSourceId, DestinationId, ReconnectState, RoomHandle};
 
-use super::{ConnState, Cx, Modal, PopoverKind, RoomEntry, ShareState, StreamKey, UiAction, View, tr, tr_with};
+use super::{ConnState, Cx, Modal, MyPhase, PopoverKind, RoomEntry, ShareState, StreamKey, UiAction, View, tr, tr_with};
 use crate::theme::{self, Weight, font};
 use crate::widgets::{self, Btn, FILL, HBox, IconBtnKind, PersonRow, Pill, fixed, paint_text, text_width};
 
@@ -241,7 +241,7 @@ pub fn show_header(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
     if row.show(ui, 3, Align::Min, |ui| leave.show_sized(ui, w)).clicked() {
         match (r.conn, r.handle) {
             (ConnState::Joined, Some(h)) => cx.act(UiAction::Leave(h)),
-            (ConnState::Reconnecting, _) => cx.act(UiAction::CancelConnect),
+            (ConnState::Reconnecting, _) => cx.act(UiAction::CancelReconnect(r.key.clone())),
             _ => {}
         }
     }
@@ -345,12 +345,9 @@ fn room_body(ui: &mut Ui, cx: &mut Cx, st: &mut RoomState, r: &RoomEntry) {
             }
         }
         (ConnState::Reconnecting, _) | (_, None) => {
-            match reconnect_banner(ui) {
-                Some(0) => {
-                    cx.act(UiAction::CancelConnect);
-                    cx.act(UiAction::Connect(r.key.clone()));
-                }
-                Some(1) => cx.act(UiAction::CancelConnect),
+            match reconnect_banner(ui, cx.state.reconnect_info(&r.key)) {
+                Some(0) => cx.act(UiAction::RetryNow(r.key.clone())),
+                Some(1) => cx.act(UiAction::CancelReconnect(r.key.clone())),
                 _ => {}
             }
             section(ui, &tr("ui.room.sharing", "Sharing in this room"), 0, |ui| {
@@ -417,11 +414,39 @@ fn section(ui: &mut Ui, title: &str, count: usize, body: impl FnOnce(&mut Ui)) {
     });
 }
 
+/// The second and third banner lines: "Attempt 3 · Retrying in 4 s" (or
+/// "Trying now…", or "Room full, still trying"), then a short last error.
+fn reconnect_details(info: &ReconnectState, now: std::time::Instant) -> (String, Option<String>) {
+    let mut parts = Vec::new();
+    if info.attempts > 0 {
+        parts.push(tr_with("ui.room.reconnect_attempt", "Attempt %{count}", &[("count", &info.attempts.to_string())]));
+    }
+    if info.room_full() {
+        parts.push(tr("ui.room.reconnect_room_full", "Room full, still trying").to_string());
+    }
+    match info.retry_in(now) {
+        None => parts.push(tr("ui.room.reconnect_trying", "Trying now…").to_string()),
+        Some(d) => {
+            let secs = d.as_secs_f32().ceil() as u64;
+            parts.push(tr_with("ui.room.reconnect_retry_in", "Retrying in %{seconds} s", &[("seconds", &secs.to_string())]));
+        }
+    }
+    // Room full already says it all; otherwise one short line of the error.
+    let error = info.last_error.as_deref().filter(|_| !info.room_full()).and_then(|e| e.lines().map(str::trim).find(|l| !l.is_empty())).map(|e| {
+        let short: String = if e.chars().count() > 90 { e.chars().take(89).chain(['…']).collect() } else { e.to_string() };
+        tr_with("ui.room.reconnect_last_error", "Last error: %{error}", &[("error", &short)])
+    });
+    (parts.join(" · "), error)
+}
+
 /// The reconnecting banner (mockup `hbox·banner`, amber hatch):
-/// `[18 icon][fill text][Retry now][Cancel]`. Returns the clicked button.
+/// `[18 icon][fill text][Retry now][Cancel]`. The text is the headline plus,
+/// once the lib has a reconnect entry, a dim status line (attempt, countdown,
+/// room full) and a last-error line. Returns the clicked button.
 /// `Why` not `widgets::banner`: it has one action and this needs two.
-fn reconnect_banner(ui: &mut Ui) -> Option<usize> {
+fn reconnect_banner(ui: &mut Ui, info: Option<&ReconnectState>) -> Option<usize> {
     let text = tr("ui.room.reconnecting_banner", "Reconnecting to this room. Your shares here are paused until it's back.");
+    let details = info.map(|i| reconnect_details(i, std::time::Instant::now()));
     let retry_l = tr("ui.room.retry", "Retry now");
     let cancel_l = tr("ui.room.cancel", "Cancel");
     let btns = [Btn::secondary(&retry_l), Btn::secondary(&cancel_l)];
@@ -432,6 +457,13 @@ fn reconnect_banner(ui: &mut Ui) -> Option<usize> {
         text.clone(),
         egui::TextFormat { font_id: font(Weight::Regular, theme::FS_SMALL), color: theme::WARNING, line_height: Some(16.0), ..Default::default() },
     );
+    if let Some((status, error)) = &details {
+        let dim = egui::TextFormat { font_id: font(Weight::Regular, theme::FS_TINY), color: theme::TEXT_DIM, line_height: Some(15.0), ..Default::default() };
+        job.append(&format!("\n{status}"), 0.0, dim.clone());
+        if let Some(e) = error {
+            job.append(&format!("\n{e}"), 0.0, dim);
+        }
+    }
     job.wrap.max_width = text_w.max(40.0);
     let galley = ui.painter().layout_job(job);
     let inner_h = galley.size().y.max(theme::CTL_H);
@@ -897,6 +929,10 @@ fn my_card(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSourceId, destin
         DestinationState::Failed(_) => tr("ui.room.chip_failed", "FAILED"),
     };
     thumb_corners(ui, thumb, Some(&chip), false);
+    if cx.destination_state(c, d) == DestinationState::Starting && cx.state.capture_awaiting_first_frame(capture) {
+        ui.interact(thumb, Id::new(("my_card_thumb", capture, destination)), Sense::hover())
+            .on_hover_text(tr("ui.waiting_frame_hint", "An idle screen sends no picture until something on it changes. Move the mouse over the shared screen and the stream starts."));
+    }
 
     let params = match &d.runtime {
         Some(rt) => rt.lock().unwrap().params(),
@@ -918,12 +954,43 @@ fn my_card(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSourceId, destin
 // People
 // ---------------------------------------------------------------------------
 
+/// Our row while our share here is still Starting: an accent "in progress"
+/// pill (marching bar, no text) in the row's 44 px live slot, where the green
+/// LIVE pill goes once it is on air. `Why no text:` "STARTING" does not fit
+/// 44 px; the row's tooltip says it. The slot is `person_row`'s
+/// `[22][fill][44][18]`, pad 4/4, gap 8, so it ends 4 + 18 + 8 px from the right.
+fn starting_badge(ui: &Ui, row: &Response) {
+    let pill = Pill::progress("");
+    let w = pill.width(ui).min(44.0);
+    let right = row.rect.right() - theme::S1 - 18.0 - theme::S2;
+    pill.paint(ui, Rect::from_min_size(pos2(right - w, row.rect.center().y - theme::PILL_H / 2.0), vec2(w, theme::PILL_H)));
+}
+
 /// People panel: `[heading PEOPLE n][vbox·people → person_row …]`, you first.
 pub fn show_people(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
     let Some(r) = cx.selected_room() else { return };
     let Some((h, s)) = r.handle.and_then(|h| cx.session(h).map(|s| (h, s))) else {
-        // Reconnecting: the lib keeps no last-known roster, so there's nothing
-        // honest to list.
+        // Reconnecting: the roster as it was when the room dropped, dimmed
+        // (`stale`), us first. The lib's copy leaves us out (`suspend_room`
+        // filters our conn id), so our row comes from the display name; it is
+        // never live (our shares are paused).
+        if let Some(info) = cx.state.reconnect_info(&r.key) {
+            widgets::heading(ui, &tr("ui.room.people", "People"), Some(&(info.members.len() + 1).to_string()), false);
+            let live_l = tr("ui.pill.live", "Live");
+            let you_tag = tr("ui.room.you", "You").to_lowercase();
+            let stale_tip = tr("ui.room.people_stale_tip", "As it was before the connection dropped");
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let me = PersonRow { name: &cx.state.display_name, color: avatar_color(true, 0), you: Some(&you_tag), live: false, live_label: &live_l, watching: false, idle: true, stale: true };
+                widgets::person_row(ui, &me).on_hover_text(&stale_tip);
+                for m in &info.members {
+                    let live = info.streams.iter().any(|i| i.owner == m.conn_id);
+                    let row = PersonRow { name: &m.display_name, color: avatar_color(false, m.conn_id), you: None, live, live_label: &live_l, watching: false, idle: !live, stale: true };
+                    widgets::person_row(ui, &row).on_hover_text(&stale_tip);
+                }
+            });
+            return;
+        }
         widgets::heading(ui, &tr("ui.room.people", "People"), None, false);
         // Wraps: the German line is wider than the 207 px column.
         let mut job = egui::text::LayoutJob::single_section(
@@ -937,7 +1004,13 @@ pub fn show_people(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
         return;
     };
     let me = s.client.conn_id();
-    let i_live = cx.live_rooms().contains(&h);
+    let my_phase = cx.my_phase(h);
+    let starting_l = tr("ui.room.people_starting", "Starting…");
+    let starting_tip = if cx.live_captures().iter().any(|(id, c)| c.destinations.values().any(|d| d.room == h) && cx.state.capture_awaiting_first_frame(*id)) {
+        format!("{starting_l}\n{}", tr("ui.waiting_frame_hint", "An idle screen sends no picture until something on it changes. Move the mouse over the shared screen and the stream starts."))
+    } else {
+        starting_l.to_string()
+    };
     widgets::heading(ui, &tr("ui.room.people", "People"), Some(&s.members.len().to_string()), false);
     let watches = s.watches.lock().unwrap();
     let audio = s.audio_watches.lock().unwrap();
@@ -949,9 +1022,10 @@ pub fn show_people(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
         let order = s.members.iter().filter(|m| m.conn_id == me).chain(s.members.iter().filter(|m| m.conn_id != me));
         for m in order {
             let you = m.conn_id == me;
-            let live = if you { i_live } else { s.streams.iter().any(|i| i.owner == m.conn_id) };
+            let live = if you { my_phase == Some(MyPhase::OnAir) } else { s.streams.iter().any(|i| i.owner == m.conn_id) };
+            let starting = you && my_phase == Some(MyPhase::Starting);
             let watching = !you && (watches.keys().any(|k| k.0 == m.conn_id) || audio.iter().any(|(k, a)| k.0 == m.conn_id && !a.auto));
-            widgets::person_row(
+            let resp = widgets::person_row(
                 ui,
                 &PersonRow {
                     name: &m.display_name,
@@ -960,10 +1034,14 @@ pub fn show_people(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
                     live,
                     live_label: &live_l,
                     watching,
-                    idle: !live,
+                    idle: !live && !starting,
                     stale: false,
                 },
             );
+            if starting {
+                starting_badge(ui, &resp);
+                resp.on_hover_text(&starting_tip);
+            }
         }
     });
 }
