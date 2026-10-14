@@ -8,11 +8,11 @@ geometry, `launch-lib.sh: sss_check_monitors`). Facts about the machine:
 
 | Script | Purpose |
 | --- | --- |
-| `launch-lib.sh` | shared functions: monitor safety check, build (own `target/`), scratch dir, relay cert hash, join string, per-client scratch config (`rooms.toml` auto-connect + `settings.toml`; `SSS_LANGUAGE=de` seeds the UI language, default `en`), spawn + place windows, kill by pid file |
+| `launch-lib.sh` | shared functions: monitor safety check, build (own `target/`), scratch dir, relay cert hash, join string, per-client scratch config (`rooms.toml` auto-connect + `settings.toml`; `SSS_LANGUAGE=de` seeds the UI language, default `en`), spawn + place windows (each client gets `SSS_UI_DUMP=<scratch>/ui<n>.txt`), kill by pid file |
 | `rig.sh up\|down` | two-client rig via `launch-test-tmux.sh` in its own uniquely named tmux session (recorded in `<scratch>/tmux.session`), sharer started with the GStreamer stats tracer (`<scratch>/gst1.log`) |
 | `session.sh scenarios\|audio-peek\|run` | one short locked GUI session: take the GUI lock (wait), rig + animation up, steps, always tear down + refocus DP-3 + release |
 | `animate.sh start\|stop [MON]` | per-run pidfile (`ANIM_PIDFILE`, else `$SCRATCH/animate.pid`, else a unique one printed by `start`); fullscreen `vkcube` (mailbox) on a monitor so capture has content at the refresh rate |
-| `drive.sh MON STEP` | ydotool driver for the two-client rig (share, setup, go live, watch, hover, sample, stop, ...). Coordinates assume both clients tiled on DP-2 |
+| `drive.sh MON STEP` | ydotool driver for the two-client rig (share, setup, go live, watch, hover, sample, stop, ...). `setup` / `golive` / `mclick` click the stream-settings modal by the rects the sharer writes to `SSS_UI_DUMP` (`<scratch>/ui1.txt`) plus its window position from `mmsg`, and read each value back (exit 1 if one did not take); the other steps' fixed coordinates assume both clients tiled on DP-2 |
 | `ui-click.sh` | move/click at a global coordinate; hides ydotool's -1080 y offset; refuses HDMI points |
 | `picker-answer.sh` | answer the portal picker safely (checks the preselection, types `dp`, Enter) |
 | `run-scenario.sh` | one measured share: receiver tooltip screenshots over ~30 s + sender per-stage rates |
