@@ -9,9 +9,9 @@ geometry, `launch-lib.sh: sss_check_monitors`). Facts about the machine:
 | Script | Purpose |
 | --- | --- |
 | `launch-lib.sh` | shared functions: monitor safety check, build (own `target/`), scratch dir, relay cert hash, join string, per-client scratch config (`rooms.toml` auto-connect + `settings.toml`), spawn + place windows, kill by pid file |
-| `rig.sh up\|down` | two-client rig via `launch-test-tmux.sh`, sharer started with the GStreamer stats tracer (`<scratch>/gst1.log`) |
+| `rig.sh up\|down` | two-client rig via `launch-test-tmux.sh` in its own uniquely named tmux session (recorded in `<scratch>/tmux.session`), sharer started with the GStreamer stats tracer (`<scratch>/gst1.log`) |
 | `session.sh scenarios\|audio-peek\|run` | one short locked GUI session: take the GUI lock (wait), rig + animation up, steps, always tear down + refocus DP-3 + release |
-| `animate.sh start\|stop [MON]` | fullscreen `vkcube` (mailbox) on a monitor so capture has content at the refresh rate |
+| `animate.sh start\|stop [MON]` | per-run pidfile (`ANIM_PIDFILE`, else `$SCRATCH/animate.pid`, else a unique one printed by `start`); fullscreen `vkcube` (mailbox) on a monitor so capture has content at the refresh rate |
 | `drive.sh MON STEP` | ydotool driver for the two-client rig (share, setup, go live, watch, hover, sample, stop, ...). Coordinates assume both clients tiled on DP-2 |
 | `ui-click.sh` | move/click at a global coordinate; hides ydotool's -1080 y offset; refuses HDMI points |
 | `picker-answer.sh` | answer the portal picker safely (checks the preselection, types `dp`, Enter) |
@@ -22,9 +22,9 @@ geometry, `launch-lib.sh: sss_check_monitors`). Facts about the machine:
 | `wlr-capture-rate.sh` | compositor's own wlr-screencopy rate for an output (wf-recorder) |
 | `enc-bench.sh` | raw `vah264enc`/`vah265enc`/`vaav1enc` throughput at 1080p |
 | `audio-probe.py` | peak/RMS of a given app's playback stream |
-| `stop-launch.sh` | stop what a scratch dir's launch started (client process groups, tmux sessions) |
+| `stop-launch.sh` | stop what a scratch dir's launch started (client process groups, the tmux session named in `<scratch>/tmux.session` or given as arg 2; no shared default) |
 | `test-launch-fg.sh` | smoke test of `launch-test.sh` (non-tmux variant) |
 
-Rules baked in: never `pkill` by name (it matches other workers' processes); tmux targets use
+Rules baked in: never touch a shared-named resource (tmux session, pidfile): every run owns uniquely named ones; never `pkill` by name (it matches other workers' processes); tmux targets use
 `=name` (a bare name prefix-matches `name-watchdog`); every child is started with fd 9 closed
 so it can never keep the GUI lock.

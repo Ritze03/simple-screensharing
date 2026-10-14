@@ -134,6 +134,13 @@ The core hands you decoded `VideoFrame`s; two ways to consume them:
 * `watch(key, { onFrame })` / `handle.setFrameCallback(fn)`: you receive each `VideoFrame` and **must `close()` it** (hardware
   decoders have a small surface pool; holding frames stalls decoding).
 
+* **Padding is cropped before you see a frame.** Some encoders code more lines than the picture has (the AMD VCN4 AV1 encoder
+  codes 1920x1080 as 1920x1082, with no crop in the bitstream; Mesa issue 9185). `VideoReceiver` crops every decoded frame
+  (zero-copy `new VideoFrame(frame, { visibleRect })`) to the decoder's own `visibleRect` if it reports one, else to the
+  size the sender announced in the stream list (`StreamInfo.width/height`) when the frame is larger by less than 64 px in each
+  direction. Canvas, track and `onFrame` consumers all get the cropped frame, and watch stats `width`/`height` are the visible
+  size. Same rule as the native viewer (`client/src/decode/frame.rs` `visible_rect`); the pure function is `visibleRectFor(frame, hint)`.
+
 * `handle.videoTrack()`: a `MediaStreamTrack` (Chromium `MediaStreamTrackGenerator`) of the decoded frames, for a `<video>`,
   Picture-in-Picture or recording. It adds the browser's own video pipeline latency and pacing, so the canvas is the default.
 

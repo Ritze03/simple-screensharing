@@ -19,6 +19,8 @@ source "$SELF_DIR/launch-lib.sh"
 LOCK="${LOCK:-/tmp/claude-1000/sss-gui.lock}"
 FOCUS_BACK="${FOCUS_BACK:-DP-3}"
 mkdir -p "$(dirname "$LOCK")"
+# This session's own animation pidfile: `animate.sh stop` from another run can never kill it.
+export ANIM_PIDFILE="${ANIM_PIDFILE:-${XDG_RUNTIME_DIR:-/tmp}/sss-animate-session-$$.pid}"
 exec 9>"$LOCK"
 log "waiting for the GUI lock ..."
 flock -w "${LOCK_WAIT:-1800}" 9 || die "could not get the GUI lock in ${LOCK_WAIT:-1800}s"

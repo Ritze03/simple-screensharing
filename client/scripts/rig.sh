@@ -21,6 +21,11 @@ case "$cmd" in
     mkdir -p "$SCRATCH"
     rm -f "$SCRATCH/gst1.log"
     export SCRATCH
+    # Own, uniquely named relay session (launch-test-tmux.sh would default to the shared `sssrelay`);
+    # recorded so `down` stops exactly this one.
+    TMUX_SESSION="sssrig-$(basename "$SCRATCH")-$$-$RANDOM"
+    export TMUX_SESSION
+    echo "$TMUX_SESSION" >"$SCRATCH/tmux.session"
     ATTACH=0 \
     CLIENT_ENV_1="GST_TRACERS=stats GST_DEBUG=GST_TRACER:7 GST_DEBUG_NO_COLOR=1 GST_DEBUG_FILE=$SCRATCH/gst1.log" \
       "$REPO_ROOT/launch-test-tmux.sh"

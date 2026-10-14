@@ -27,9 +27,8 @@
 #                             OUTDIR/montage.png (read that one)
 #   stopshare                 sharer: stop sharing (clicks the red Stop button)
 #   unwatch                   viewer: close the watched tile (x on its stats row).
-#                             Needed after the sharer stops: the viewer keeps a frozen
-#                             0 fps tile of the ended stream (bug), and the next
-#                             share then shows up as a second card instead.
+#                             (The viewer's watch ends by itself on StreamStopped, so
+#                             this is only for closing a live tile.)
 #   shot FILE                 screenshot of MONITOR (grim -o MONITOR)
 
 set -uo pipefail

@@ -635,6 +635,10 @@ export class RoomClient extends EventTarget {
     let impl;
     if (info.kind === "video") {
       impl = new VideoReceiver({
+        announcedSize: () => {
+          const i = this.streams.get(key) || info;
+          return i.width > 0 && i.height > 0 ? { width: i.width, height: i.height } : null;
+        },
         onFrame: (frame) => {
           const h = this.watches.get(key);
           if (h) h._deliver(frame);

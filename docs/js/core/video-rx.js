@@ -9,6 +9,30 @@ import { deriveCodecString } from "./codec.js";
 import { JitterBuffer } from "./jitter.js";
 
 const FPS_WINDOW_MS = 1500;
+const MAX_PADDING = 64; // same constant as client/src/decode/frame.rs
+
+/**
+ * The visible rectangle of a decoded frame, or null when the whole frame is visible. Mirrors the native viewer's
+ * `visible_rect` (client/src/decode/frame.rs):
+ * 1. a crop the decoder reports itself (`visibleRect` smaller than the coded size) wins;
+ * 2. else the size the sender announced (`hint` = {width,height}), when the frame is larger than it by less
+ *    than MAX_PADDING in each direction (and not smaller): the padding is at the bottom/right.
+ * Why 2: the AMD VCN4 AV1 encoder codes 1920x1080 as 1920x1082 and signals no crop anywhere in the bitstream
+ * (render_and_frame_size_different = 0, Mesa issue 9185); only the announced StreamInfo size says 1080.
+ * @param {{codedWidth:number,codedHeight:number,visibleRect?:{x:number,y:number,width:number,height:number}|null}} f
+ * @param {{width:number,height:number}|null} [hint]
+ * @returns {{x:number,y:number,width:number,height:number}|null}
+ */
+export function visibleRectFor(f, hint) {
+  const cw = f.codedWidth, ch = f.codedHeight;
+  const r = f.visibleRect;
+  if (r && r.width > 0 && r.height > 0 && (r.width < cw || r.height < ch)) return { x: r.x, y: r.y, width: r.width, height: r.height };
+  const w = hint && hint.width, h = hint && hint.height;
+  if (w > 0 && h > 0 && w <= cw && h <= ch && cw - w < MAX_PADDING && ch - h < MAX_PADDING && (w !== cw || h !== ch)) {
+    return { x: 0, y: 0, width: w, height: h };
+  }
+  return null;
+}
 
 export class VideoReceiver {
   /**
@@ -19,9 +43,10 @@ export class VideoReceiver {
    * @param {number} [o.catchUpSpeedPercent]
    * @param {"no-preference"|"prefer-hardware"|"prefer-software"} [o.hardwareAcceleration]
    */
-  constructor({ onFrame, onEvent = () => {}, maxJitterBufferMs, catchUpSpeedPercent, hardwareAcceleration = "no-preference", now = () => performance.now(), DecoderClass = null }) {
+  constructor({ onFrame, announcedSize = () => null, onEvent = () => {}, maxJitterBufferMs, catchUpSpeedPercent, hardwareAcceleration = "no-preference", now = () => performance.now(), DecoderClass = null }) {
     this.DecoderClass = DecoderClass; // tests inject a fake decoder; default is the global VideoDecoder
     this.onFrame = onFrame;
+    this.announcedSize = announcedSize; // () => {width,height}|null: the size the sender announced for this stream
     this.onEvent = onEvent;
     this.hardwareAcceleration = hardwareAcceleration;
     this.now = now;
@@ -137,14 +162,31 @@ export class VideoReceiver {
     };
   }
 
+  /** Re-wrap a frame that has padding (see visibleRectFor) as a zero-copy VideoFrame of just the visible rect. */
+  #cropped(frame) {
+    let rect = null;
+    try {
+      rect = visibleRectFor(frame, this.announcedSize());
+    } catch {}
+    if (!rect) return frame;
+    try {
+      const out = new VideoFrame(frame, { visibleRect: rect });
+      frame.close();
+      return out;
+    } catch {
+      return frame; // showing the padding beats losing the frame
+    }
+  }
+
   #createDecoder() {
     const Decoder = this.DecoderClass || VideoDecoder;
     const decoder = new Decoder({
-      output: (frame) => {
+      output: (decoded) => {
         if (this.closed || decoder !== this.decoder) {
-          frame.close();
+          decoded.close();
           return;
         }
+        const frame = this.#cropped(decoded);
         this.stats.decoded++;
         this.stats.width = frame.displayWidth;
         this.stats.height = frame.displayHeight;
