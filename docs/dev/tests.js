@@ -9,7 +9,8 @@ import { base64urlDecode, bytesToHex, createRoom, formatJoinLink, hexToBytes, Jo
 import { NonceSequence, NonceSpaceExhausted, buildAad, buildNonce, decryptFrame, decryptPreview, encryptFrame, encryptPreview, importRoomKey } from "../js/core/crypto.js";
 import { Reassembler, fragmentFrame } from "../js/core/fragment.js";
 import { deriveCodecString, sniffCodec } from "../js/core/codec.js";
-import { DECODE_QUEUE_CATCHUP_THRESHOLD, JitterBuffer, clampCatchUpSpeedPercent, clampMaxJitterBufferMs } from "../js/core/jitter.js";
+import { DECODE_QUEUE_CATCHUP_THRESHOLD, JitterBuffer, MAX_DECODE_QUEUE, clampCatchUpSpeedPercent, clampMaxJitterBufferMs } from "../js/core/jitter.js";
+import { VideoReceiver } from "../js/core/video-rx.js";
 import { ENCODER_PRESETS } from "../js/core/video-tx.js";
 
 const tests = [];
@@ -487,8 +488,7 @@ test("jitter: steady 120 fps stream is delayed by ~the 40 ms floor and drains in
   }
   ok(Math.abs(jb.appliedBufferMs - 40) < 1, `applied buffer ${jb.appliedBufferMs}`);
   const out = [];
-  const { items } = jb.drain(now + 1000);
-  out.push(...items);
+  while (jb.size) out.push(...jb.drain(now + 1000, 0).items); // the decoder takes up to MAX_DECODE_QUEUE per call
   eq(out, Array.from({ length: 600 }, (_, i) => i), "FIFO order");
 });
 
@@ -546,9 +546,9 @@ test("jitter: decode-queue backstop drops the delta run up to the next queued ke
   const seq = [["K0", true], ["d1", false], ["d2", false], ["d3", false], ["K4", true], ["d5", false]];
   seq.forEach(([n, key], i) => jb.push(n, { ptsUs: i * 1000, keyframe: key }, 0));
   // head is a keyframe: never skipped
-  let r = jb.drain(1000, DECODE_QUEUE_CATCHUP_THRESHOLD + 5);
+  let r = jb.drain(1000, DECODE_QUEUE_CATCHUP_THRESHOLD + 2);
   eq(r.dropped, 0);
-  eq(r.items, ["K0", "d1", "d2", "d3", "K4", "d5"]);
+  eq(r.items, ["K0", "d1", "d2"], "head is a keyframe: nothing skipped; only the decoder's remaining budget (8 - 5) is released");
   // head is a delta with a keyframe queued behind it
   const jb2 = new JitterBuffer({ maxJitterBufferMs: 0 });
   [["d1", false], ["d2", false], ["K3", true], ["d4", false]].forEach(([n, key], i) => jb2.push(n, { ptsUs: i * 1000, keyframe: key }, 0));
@@ -558,13 +558,85 @@ test("jitter: decode-queue backstop drops the delta run up to the next queued ke
   // no keyframe queued: nothing is dropped (dropping would corrupt references)
   const jb3 = new JitterBuffer({ maxJitterBufferMs: 0 });
   [["d1", false], ["d2", false]].forEach(([n, key], i) => jb3.push(n, { ptsUs: i * 1000, keyframe: key }, 0));
-  r = jb3.drain(1000, 99);
+  r = jb3.drain(1000, 5);
   eq(r.dropped, 0);
   eq(r.items, ["d1", "d2"]);
   // decoder keeping up: nothing dropped
   const jb4 = new JitterBuffer({ maxJitterBufferMs: 0 });
   [["d1", false], ["K2", true]].forEach(([n, key], i) => jb4.push(n, { ptsUs: i * 1000, keyframe: key }, 0));
   eq(jb4.drain(1000, 1).dropped, 0);
+});
+
+test("jitter: the decoder is never handed more than MAX_DECODE_QUEUE requests; the rest waits in the buffer", () => {
+  const jb = new JitterBuffer({ maxJitterBufferMs: 0 });
+  for (let i = 0; i < 20; i++) jb.push(i, { ptsUs: i * 1000, keyframe: i === 0 }, 0);
+  eq(jb.drain(1000, 0).items.length, MAX_DECODE_QUEUE, "empty decoder queue: up to the cap");
+  eq(jb.drain(1000, MAX_DECODE_QUEUE).items.length, 0, "full decoder queue: nothing released");
+  eq(jb.drain(1000, MAX_DECODE_QUEUE - 3).items.length, 3, "released as the decoder dequeues");
+  eq(jb.size, 20 - MAX_DECODE_QUEUE - 3);
+});
+
+test("video receiver: a decoder slower than the stream keeps bounded latency (drops to keyframes) instead of an unbounded backlog", async () => {
+  const { codec } = await vec();
+  const keyAu = hexToBytes(codec.find((c) => c.name === "vah264enc").auHex);
+  const delta = new Uint8Array([0, 0, 0, 1, 0x41, 1, 2, 3, 4, 5, 6, 7, 8]);
+  const decoded = [];
+  let maxQueue = 0;
+  class SlowDecoder {
+    static async isConfigSupported() {
+      return { supported: true };
+    }
+    constructor({ output }) {
+      this.output = output;
+      this.state = "unconfigured";
+      this.decodeQueueSize = 0;
+      this.q = [];
+      this.timer = setInterval(() => {
+        const c = this.q.shift(); // ~100 fps decoder
+        if (!c) return;
+        this.decodeQueueSize--;
+        decoded.push(c.timestamp);
+        this.output({ displayWidth: 1, displayHeight: 1, close() {} });
+        if (this.ondequeue) this.ondequeue();
+      }, 10);
+    }
+    configure() {
+      this.state = "configured";
+    }
+    decode(chunk) {
+      this.q.push(chunk);
+      this.decodeQueueSize++;
+      maxQueue = Math.max(maxQueue, this.decodeQueueSize);
+    }
+    close() {
+      this.state = "closed";
+      clearInterval(this.timer);
+    }
+  }
+  const rx = new VideoReceiver({ onFrame: (f) => f.close(), DecoderClass: SlowDecoder, maxJitterBufferMs: 0 });
+  // 250 fps for 4 s into a 100 fps decoder, a keyframe every 50 frames (0.2 s)
+  const periodMs = 4;
+  const t0 = performance.now();
+  let n = 0;
+  let lastPush = 0;
+  while (performance.now() - t0 < 4000) {
+    const due = Math.floor((performance.now() - t0) / periodMs);
+    while (n <= due) {
+      const ptsUs = n * periodMs * 1000;
+      rx.pushFrame({ ptsUs, keyframe: n % 50 === 0, payload: n % 50 === 0 ? keyAu : delta });
+      lastPush = ptsUs;
+      n++;
+    }
+    await new Promise((r) => setTimeout(r, 2));
+  }
+  await new Promise((r) => setTimeout(r, 50));
+  const lastDecoded = decoded.at(-1);
+  rx.close();
+  ok(maxQueue <= MAX_DECODE_QUEUE, `decoder queue peaked at ${maxQueue}, cap ${MAX_DECODE_QUEUE}`);
+  ok(decoded.length > 200, `decoder kept working (${decoded.length} decoded)`);
+  const lagMs = (lastPush - lastDecoded) / 1000;
+  ok(lagMs < 600, `latency stays within about one GOP (0.2 s) plus the decoder cap, not growing without bound: lag ${lagMs.toFixed(0)} ms`);
+  ok(rx.jb.catchUpDropped > 100, `catch-up dropped delta runs to keyframes (${rx.jb.catchUpDropped})`);
 });
 
 test("jitter: reset() clears queue and pacing anchor", () => {

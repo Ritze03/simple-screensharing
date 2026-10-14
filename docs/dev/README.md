@@ -42,7 +42,9 @@ docs/dev/relay.sh stop 14433
 * `--flag --disable-frame-rate-limit --flag --disable-gpu-vsync` matters: without it headless Chromium's compositor ticks at
   60 Hz, which caps `canvas.captureStream` at 60 fps and makes every 120/240 fps number meaningless.
 * Chromium launches headless by default. `HEADED=1` shows real windows (needed for GPU video decode: headless GPU paths crash
-  in this environment, `GPU process exited unexpectedly: exit_code=139/8704`). Only do that on a monitor you own.
+  in this environment, `GPU process exited unexpectedly: exit_code=139/8704`); the runner refuses unless `SSS_GUI_LOCKED=1` is
+  set, which you only do while holding the shared desktop lock (`flock` on `/tmp/claude-1000/sss-gui.lock`) with focus on a free monitor.
+* Do **not** pass `--use-fake-ui-for-media-stream` for `getDisplayMedia` tests: it made Chromium pick a `screen:0:0` source.
 * GPU decode needs `--flag --enable-features=VaapiVideoDecoder,VaapiIgnoreDriverChecks,AcceleratedVideoDecodeLinuxGL --flag --ignore-gpu-blocklist`.
   Chromium 153 on this machine has **no** hardware *encode* path for WebCodecs (all `prefer-hardware` encoder probes fail),
   so browser-side encoding is software (OpenH264, libaom/SVT-AV1).
@@ -72,7 +74,11 @@ Browser sharer -> relay -> browser viewer, synthetic noisy pattern (a worst case
 | AV1, VAAPI decode (headed) | | 117.7 (79 ms) | 111.7 (89 ms) | | |
 | H.265 | not encodable in this Chromium (no hardware encoder, no software one) | | | | |
 
-Everything above 60 fps is limited by the browser's **software encoder** (the capture source delivered the full requested
+The table is from runs on a quiet machine. The same matrix re-run at load average ~12 (other workers building/testing) gave, as
+decoded fps at 60/120/240: H.264 60 / 89 / 46 and AV1 60 / 54 / 16 (viewer p50 82 ms .. 1.3 s): both software codecs are CPU-bound, so
+expect large run-to-run variation on a busy machine. The matrix prints `load1` per row.
+
+Everything above 60 fps is limited by the browser's **software encoder** (and, on a loaded machine, by software decode) (the capture source delivered the full requested
 rate, `captured == generated`), not by the transport, relay, decryption or decoder: 0 lost frames, 0 decoder errors, `txDropped` 0
 in every run. Real screen content is far cheaper to encode than this noise.
 

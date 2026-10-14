@@ -103,6 +103,9 @@ const DEFAULT_FLAGS = [
 export function launchChromium(url, { flags = [], userDataDir, bin = "/usr/bin/chromium" } = {}) {
   const dir = userDataDir || mkdtempSync(join(tmpdir(), "ssshare-chromium-"));
   // HEADED=1 drops --headless (real window; only ever do this on a monitor you own, see the testing notes) - needed for GPU video paths.
+  if (process.env.HEADED && !process.env.SSS_GUI_LOCKED) {
+    throw new Error("HEADED=1 needs the shared GUI lock: run under `exec 9>/tmp/claude-1000/sss-gui.lock && flock 9` and set SSS_GUI_LOCKED=1 (see the testing notes)");
+  }
   const base = process.env.HEADED ? DEFAULT_FLAGS.filter((f) => !f.startsWith("--headless")) : DEFAULT_FLAGS;
   const proc = spawn(bin, [...base, `--user-data-dir=${dir}`, ...flags, url], { stdio: ["ignore", "ignore", "pipe"] });
   let stderr = "";

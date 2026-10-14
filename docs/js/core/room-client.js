@@ -15,7 +15,7 @@ import { ENCODER_PRESETS, MediaClock, VideoSender, probeEncoders } from "./video
 
 const STATS_INTERVAL_MS = 1000;
 const MAX_TX_QUEUE = 8; // frames waiting for encrypt+send per stream before we drop
-const MAX_PENDING_DATAGRAMS = 1500; // ~1.5 MB queued inside WebTransport
+const MAX_PENDING_DATAGRAMS = 400; // ~400 KB queued inside WebTransport; more than that is latency, not throughput
 const MAX_RX_QUEUE = 64;
 const RESUBSCRIBE_MIN_INTERVAL_MS = 1500;
 const BACKOFF_MS = [500, 1000, 2000, 4000, 8000, 10000];

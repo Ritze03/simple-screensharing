@@ -19,6 +19,10 @@ export const JITTER_BUFFER_FLOOR_MS = 40;
 const JITTER_EWMA_ALPHA = 1 / 16; // RFC 3550 6.4.1
 const MAX_BUFFER_EASE_STEP_MS = 20;
 export const DECODE_QUEUE_CATCHUP_THRESHOLD = 3;
+// Never hand the decoder more than this many pending decode() requests: a decoder slower than the stream (weak laptop,
+// CPU contention) would otherwise accumulate an unbounded private backlog that the backstop above can never touch, and
+// latency would grow without limit. Held chunks stay in the jitter buffer, where the backstop can skip to a keyframe.
+export const MAX_DECODE_QUEUE = 8;
 
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
@@ -106,9 +110,9 @@ export class JitterBuffer {
   }
 
   /**
-   * Pop every chunk due at `nowMs`. `decodeQueueSize` is the decoder's own backlog; when it is above
-   * the threshold and the head is a delta frame, the run of queued deltas up to the next queued
-   * keyframe is discarded instead (always safe: a keyframe references nothing).
+   * Pop every chunk due at `nowMs`, but at most `MAX_DECODE_QUEUE - decodeQueueSize` of them. `decodeQueueSize` is the
+   * decoder's own backlog; when it is above the threshold and the head is a delta frame, the run of queued deltas up
+   * to the next queued keyframe is discarded instead (always safe: a keyframe references nothing).
    * @returns {{items:any[], dropped:number}}
    */
   drain(nowMs, decodeQueueSize = 0) {
@@ -128,11 +132,18 @@ export class JitterBuffer {
       }
     }
     const items = [];
-    while (this.pending.length && this.pending[0].decodeAtMs <= nowMs) items.push(this.pending.shift().item);
+    const budget = Math.max(0, MAX_DECODE_QUEUE - decodeQueueSize);
+    while (this.pending.length && this.pending[0].decodeAtMs <= nowMs && items.length < budget) items.push(this.pending.shift().item);
     return { items, dropped };
   }
 
   get size() {
     return this.pending.length;
+  }
+
+  /** How long the oldest held chunk has been overdue, ms (0 when nothing is held back), and whether a keyframe is queued. */
+  overdue(nowMs) {
+    if (!this.pending.length) return { ms: 0, hasKeyframe: false };
+    return { ms: Math.max(0, nowMs - this.pending[0].decodeAtMs), hasKeyframe: this.pending.some((p) => p.keyframe) };
   }
 }

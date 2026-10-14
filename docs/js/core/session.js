@@ -119,6 +119,11 @@ export class RelaySession {
     try {
       wt.datagrams.incomingHighWaterMark = 1 << 14; // keyframes arrive as hundreds of fragments in one burst
     } catch {}
+    try {
+      // Media older than this is useless (and the receiver drops the frame anyway): let the browser discard stale datagrams
+      // instead of sending them late. Without it a congested/CPU-starved sender queued seconds of video (measured: 2.8 s).
+      wt.datagrams.outgoingMaxAge = 250;
+    } catch {}
     wt.closed.then(
       (info) => this.#closed(info || { closeCode: 0, reason: "" }),
       (err) => this.#closed({ error: err }),

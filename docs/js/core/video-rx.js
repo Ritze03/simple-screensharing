@@ -19,7 +19,8 @@ export class VideoReceiver {
    * @param {number} [o.catchUpSpeedPercent]
    * @param {"no-preference"|"prefer-hardware"|"prefer-software"} [o.hardwareAcceleration]
    */
-  constructor({ onFrame, onEvent = () => {}, maxJitterBufferMs, catchUpSpeedPercent, hardwareAcceleration = "no-preference", now = () => performance.now() }) {
+  constructor({ onFrame, onEvent = () => {}, maxJitterBufferMs, catchUpSpeedPercent, hardwareAcceleration = "no-preference", now = () => performance.now(), DecoderClass = null }) {
+    this.DecoderClass = DecoderClass; // tests inject a fake decoder; default is the global VideoDecoder
     this.onFrame = onFrame;
     this.onEvent = onEvent;
     this.hardwareAcceleration = hardwareAcceleration;
@@ -109,7 +110,7 @@ export class VideoReceiver {
     this.unsupported = null;
     this.onEvent("codec", { codec: info.codec, codecString: info.string });
     const cfg = this.#decoderConfig();
-    VideoDecoder.isConfigSupported(cfg).then(
+    (this.DecoderClass || VideoDecoder).isConfigSupported(cfg).then(
       (r) => {
         if (!r.supported && this.config && this.config.string === info.string) {
           this.unsupported = info.string;
@@ -137,7 +138,8 @@ export class VideoReceiver {
   }
 
   #createDecoder() {
-    const decoder = new VideoDecoder({
+    const Decoder = this.DecoderClass || VideoDecoder;
+    const decoder = new Decoder({
       output: (frame) => {
         if (this.closed || decoder !== this.decoder) {
           frame.close();
@@ -154,6 +156,13 @@ export class VideoReceiver {
       },
     });
     this.decoder = decoder;
+    // The decoder took a request off its queue: submit more of what the jitter buffer is holding back.
+    decoder.ondequeue = () => {
+      if (decoder === this.decoder && this.jb.size) {
+        this.#run();
+        this.#schedule();
+      }
+    };
     try {
       decoder.configure(this.#decoderConfig());
     } catch (e) {
@@ -178,7 +187,17 @@ export class VideoReceiver {
   #run() {
     const d = this.decoder;
     if (!d || d.state !== "configured") return;
-    const { items } = this.jb.drain(this.now(), d.decodeQueueSize);
+    const t = this.now();
+    const { items } = this.jb.drain(t, d.decodeQueueSize);
+    // The decoder cannot keep up and the backlog has no keyframe to skip to: ask for one (the room client re-requests,
+    // rate limited), otherwise latency would climb to a whole GOP before the backstop can drop anything.
+    if (this.jb.size) {
+      const o = this.jb.overdue(t);
+      if (o.ms > 750 && !o.hasKeyframe && t - this.lastWaitEvent > 1000) {
+        this.lastWaitEvent = t;
+        this.onEvent("need-keyframe", { reason: "overload" });
+      }
+    }
     for (const chunk of items) {
       try {
         d.decode(chunk);
