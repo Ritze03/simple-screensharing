@@ -2,7 +2,7 @@
 //
 // The wire protocol carries NO codec tag (deliberately: a tag can go stale when a sender switches
 // codec, the bitstream cannot). Ported from `client/src/decode/codec.rs` (sniffing) and
-// `client/src-tauri/src/video_server.rs` (codec strings; used by the Electron frontend).
+// the former Tauri sidecar's `video_server.rs` (codec strings; removed in the egui rework).
 //
 // What native senders emit (client/src/capture.rs):
 //   H.264 / H.265  Annex-B (`00 00 01` / `00 00 00 01` start codes), one access unit per frame,

@@ -1,25 +1,24 @@
 # Stream Control (desktop client)
 
-> **Status (2026-10-14).** The client is now one native egui binary. The **backend** half of this
-> page is current: `client/src/capture.rs` (with its inline `destination` and `branch` modules), `session.rs`,
-> `bandwidth.rs`, `presets.rs`, `rooms.rs`. That covers "The shape of a capture", fan-out,
-> transfer, the three tiers, "Capture/encode performance" (#39, with the rotated-output check from
-> #35), "Idle monitors" and the silence watchdog (#32), resuming, the encoder-tuning backend
-> mapping, "Video codec selection", and the bandwidth modes. The **UI** half of this page
-> (everything that names `frontend/scripts/*.js`, `stream-control.js`, `src-tauri/`,
-> `commands.rs`, `window.__TAURI__`, `.media-tile-*` CSS, Electron) describes the **removed Electron
-> frontend** and is history: "Go live" staging as a UI flow, the "START A STREAM" form, "What the
-> tab renders" and "Coverage", the edit-panel bug write-ups, the whole audio-card story
-> (from "Sharing audio" to the end, except the backend facts about `pw-loopback`/node ids), and the
-> "bitrate doesn't update" display bug. The egui equivalents are `client/src/ui/stream_settings.rs`,
+> **Status (2026-10-14).** The client is one native egui binary and this page is its
+> **backend** reference: `client/src/capture.rs` (with its inline `destination` and `branch`
+> modules), `session.rs`, `bandwidth.rs`, `presets.rs`, `rooms.rs`. It covers "The shape of a
+> capture", staging and "Go live", fan-out, transfer, the three tiers, "Capture/encode
+> performance" (#39, with the rotated-output check from #35), "Idle monitors" and the silence
+> watchdog (#32), resuming, the encoder-tuning backend mapping, "Video codec selection", the
+> bandwidth modes, and the audio-share backend. The UI lives in `client/src/ui/stream_settings.rs`,
 > `ui/action_bar.rs`, `ui/room.rs`, `ui/modals.rs` (see `superdoc/ui/APP-SHELL.md`).
+> The removed Electron frontend's per-widget write-ups (edit panel, START A STREAM form, tab
+> layout, sidebar tree, audio-card button audits) were dropped from this page; the *why* that
+> outlived them is in "History: the Electron UI" at the end, the full text in version control
+> (`git log -- superdoc/features/stream-control.md`).
 > The 320x180 "self-preview" branch drawn in the diagrams still exists but nothing consumes it
 > (`superdoc/features/self-preview.md`).
 
-**Added 2026-07-26.** Stage 2 of the three-stage UI build (see `superdoc/ui/APP-SHELL.md`):
-the Stream Control tab's real feature set: starting and editing outgoing streams,
-**multi-destination fan-out**, **transfer** between rooms, and the two **bandwidth modes**
-with `bandwidth::allocate` wired into live encoders. The plan it implemented is
+**Added 2026-07-26.** The feature set built in the second stage of the original three-stage UI
+plan (`superdoc/ui/APP-SHELL.md`): starting and editing outgoing streams, **multi-destination
+fan-out**, **transfer** between rooms, and the two **bandwidth modes** with
+`bandwidth::allocate` wired into live encoders. The plan it implemented is
 `superdoc/brainstorm/ui-redesign-multiroom-streaming.md` (final plan items 4, 5 and 7).
 
 ---
@@ -76,251 +75,55 @@ the self-preview branch.
 
 ## "Go live": staging a capture with zero destinations, then attaching the first one (2026-07-28)
 
-**Owner's request, verbatim:** *"Lets make it so when i press 'Share another screen', it
-opens the stream UI with the settings visible, but the stream is not running yet. In the
-corner there should be a 'Go live' button, which actually goes live with it. The current
-settings, when pressing 'Go live' should be saved as standards for the next time. Also,
-remove the preview, since it doesnt show the current stream anyways."*
+**Owner's request:** pressing "Share another screen" opens the stream settings with the real
+capture already running but **nothing sent**; a "Go live" button then actually goes live, and the
+settings used at that moment are saved as the defaults for next time. (The dead-weight preview
+thumbnail on the card was removed in the same request: it never showed the actual stream.)
 
-Before this, "Share Screen"/"Share another screen" called `AppState::start_video_share`
-directly: one call that acquired the capture source (the OS portal prompt), built the
-pipeline, added the *first* destination's encode branch, and announced the stream to its
-room, all in one shot — there was no way to see the real, portal-negotiated resolution or
-adjust settings before something was already being sent.
+**Why no pipeline restructuring was needed:** the fan-out primitive
+(`CaptureHandle::spawn_add_destination`) already adds a branch to a *running* tee, and a capture
+pipeline is fully `Playing` with real negotiated caps before its first destination exists. So the
+split was only in the entry points:
 
-**The architectural question, and why the answer turned out to be "no restructuring
-needed":** the fan-out primitive (`AppState::add_destination` / `capture::branch::
-add_branch_live`, see below) already adds a destination branch to an *already-running* tee.
-The only question was whether a capture could start with **zero** branches on that tee to
-begin with — i.e., whether "capture running, tee up, nothing subscribed to it yet" is a
-state the pipeline already tolerates, or something that needed careful new pipeline-
-construction work. Tracing `capture::start_sharing`'s old body (`start_sharing_with_source`)
-showed the pipeline is fully up, `Playing`, and reporting real negotiated caps *before* the
-first destination's branch is ever added — the old code just immediately chained
-`spawn_destination` right after. Splitting there needed no pipeline surgery at all:
+- `capture::start_capture(framerate) -> CaptureHandle` is the staged half: source acquired
+  (portal prompt), pipeline up, bus pump running, `destinations` empty.
+  `start_sharing`/`start_sharing_from_test_source` call a shared helper and then attach their
+  first destination as before (the one-call path, still used by `AppState::start_video_share`).
+- `AppState::stage_video_share() -> CaptureSourceId` (`session.rs`) allocates the id and inserts a
+  `LocalCapture` with an empty `destinations` map. No room, no `stream_id`, no `AnnounceStream`.
+- `AppState::go_live(capture_id, room_handle)` is `add_destination`'s fan-out primitive used for
+  the first branch. It raises the source-framerate floor if needed
+  (`CaptureHandle::set_source_framerate`), builds `VideoParams` from the *current* process-wide
+  framerate/bitrate/tune/quality/rate-control/codec, and calls `add_destination_with_params` with
+  `PendingRole::GoingLive` (identical to `FanOut`, a separate variant only so the UI says "Going
+  live" rather than "Also sending here" while it waits for the first IDR).
+- **Room-preview thumbnail:** `preview::spawn_preview_task` needs a client and `stream_id`, which a
+  staged capture lacks, so `CaptureHandle` holds the preview appsink unconsumed
+  (`max-buffers=1 drop=true`, so no backpressure) until the first destination is registered;
+  `ensure_preview_task` then starts it once, and only a capture's first-ever destination gets the
+  periodic thumbnail.
+- "Cancel" on a staged capture is just `stop_share` on the capture id.
 
-- **`capture::start_capture(framerate) -> Result<CaptureHandle>`** (new) is the "staged"
-  half: acquires the capture source, builds and starts the pipeline, wires up the
-  capture-level bus/self-preview pump — everything `start_sharing` used to do up to and
-  including "pipeline confirmed `Playing`, real caps known" — and returns a `CaptureHandle`
-  whose `destinations` list is empty. `capture::start_sharing`/`start_sharing_from_test_source`
-  (unchanged public signatures) now call a shared `start_capture_with_source` helper for that
-  part, then immediately attach their first destination the way they always did — the
-  "share and go live in one call" behavior those two entry points still provide (still used
-  by `AppState::start_video_share`, which is now dead code from the UI's perspective but
-  kept, along with its own real-hardware hang/stress tests in `src-tauri/src/commands.rs`,
-  rather than deleted mid-investigation).
-- **`AppState::stage_video_share() -> CaptureSourceId`** (new, `session.rs`) is the
-  `start_video_share`-shaped wrapper: allocates a capture id, spawns `capture::start_capture`,
-  inserts a `LocalCapture` with an **empty** `destinations` map. No room, no `stream_id`, no
-  `AnnounceStream` — nothing is sent anywhere yet.
-- **`AppState::go_live(capture_id, room_handle)`** (new) *is* `add_destination`'s fan-out
-  primitive, just used for the first branch instead of the second: it raises the capture's
-  source-framerate floor if the staged card's Framerate control was set above what the
-  pipeline actually started at (`CaptureHandle::set_source_framerate` — no restart needed,
-  see "Editing a live destination" below for why a branch's own `videorate` already serves
-  higher framerates off a lower-floor source), builds a `VideoParams` from the *current*
-  process-wide `framerate`/`bitrate_kbps`/`tune`/`quality_level`/`rate_control` (the same
-  fields the staged card's controls write via `set_framerate`/`set_bitrate`/`set_tune`/
-  `set_quality_level`/`set_rate_control` — unchanged commands, same "process-wide, applied
-  before the call" shape `start_video_share` always used), and calls the existing
-  `add_destination_with_params` with a new `PendingRole::GoingLive` (mechanically identical
-  to `PendingRole::FanOut`, kept as its own variant only so the UI says "Going live…" instead
-  of "Also sending here…" while it waits for the first IDR).
+**Two regressions found right after, both from `go_live`/`add_destination` building `VideoParams`
+by hand (2026-07-28):**
 
-**The one real subtlety: the periodic room-preview thumbnail.** `preview::spawn_preview_task`
-needs a `client`/`stream_id` to send into — neither exists for a staged, destination-less
-capture. `CaptureHandle` now holds the tee's low-rate preview branch as an **unconsumed**
-`preview_sink: Option<gst_app::AppSink>` until the first destination is attached (safe to
-leave unread indefinitely: that appsink is `max-buffers=1 drop=true`, so it never applies
-backpressure upstream — see `build_pipeline`). A new `CaptureHandle::ensure_preview_task`
-starts the preview task the first time *any* destination is registered (called from both
-`register_destination`, now taking an `Option<&ScreenshareClient>`, and inline in
-`start_sharing_with_source`'s own single-call path) and is a no-op on every destination after
-that — exactly matching the pre-existing behavior that only a capture's first-ever
-destination gets the periodic thumbnail at all.
+1. *Resolution 0x0 after going live.* The placeholder `width: 0, height: 0` was never resolved for a
+   destination attached via `add_destination_with_params` (fan-out, transfer and `go_live` all use
+   it). Fix: with no sibling destination to copy, read `handle.source_caps()` off the capture.
+2. *GPU (VAAPI) encoding silently disabled.* They used `EncoderBackend::default()` (static
+   `Software`) instead of `capture::detect_encoder_backend()`, and nothing downstream re-derives the
+   backend (`branch::add_branch_live` uses `VideoParams.backend` as given), so every "Go live"
+   encoded on the CPU. Fix: call `detect_encoder_backend()` (now `pub(crate)`). `start_video_share`'s
+   own default is harmless because `start_sharing_with_source` builds its own params.
+   Coverage: `end_to_end_test::go_live_attaches_the_first_destination_with_real_resolution_and_backend`
+   (`#[ignore]`d, real relay + test-source capture; it failed before the fix with `left: (0, 0),
+   right: (640, 480)`).
 
-**Frontend.** `stream-control.js`'s "Share another screen" ghost row now calls a new
-`stageVideoShare()` (pushes the persisted `get_start_stream_defaults` into the process-wide
-settings first, then `stage_video_share`) instead of scrolling to a separate form — the old
-"START A STREAM" card (see the section below) is gone. The staged capture renders as a card
-in the same Active Shares grid, via `components.js`'s `destinationCard(dest, handlers,
-{staged: true, ...})`: same Preset/Framerate/Bitrate/Advanced-tuning panel a live
-destination's edit gets, plus a Room picker (nothing else has anywhere to put "which room
-Go Live will use"), and a "Go live"/"Cancel" action pair in place of Transfer/Stop — "Cancel"
-is just `stop_share` on the capture id, since a staged capture is `ShareStatus::Active` with
-zero destinations, exactly the state `stop_share` already knows how to tear down. Editing a
-staged card's controls calls the same `set_framerate`/`set_bitrate`/`set_tune`/
-`set_quality_level`/`set_rate_control` commands the old form did — `stagedEditState`
-(capture_id -> edit buffer) is the new form's counterpart to `destEditState`. Persisting
-those values as the new defaults (`set_start_stream_defaults`) now fires exactly once, at
-"Go live" (`goLive()`), not on every keystroke like the old form's `saveStartFormDefaults`
-did — per the owner's explicit request. New backend surface: `stage_video_share`, `go_live`,
-`list_staged_captures` (`dto::StagedCaptureRow` — capture id, `starting`/`ready`/`stopping`
-state, real negotiated width/height once known, and the process-wide encoder settings, since
-a staged capture has no destination of its own to own more specific values than that), all
-wired into `src-tauri/src/commands.rs`/`main.rs`/`api_server.rs` the same way every other
-command pair is. `driver.rs` gained a `staged-capture-changed` event (same diff-and-emit,
-"vanished this tick" shape as `destination-state-changed`) so the frontend refreshes when a
-staged capture finishes coming up or disappears (went live, or was cancelled).
-
-**Preview thumbnail removed, live or staged, per explicit request.** `components.js`'s
-`destinationCard` no longer renders a `.dest-thumb` column at all — it was always a static
-icon/gradient placeholder (see its own now-removed doc comment: "a real live self-preview
-needs a backend addition this frontend-only pass doesn't make"), never a live decode. The
-owner confirmed it was useless specifically because it never showed the actual stream, and
-asked for it gone outright, not just for the new staged card. All of `.dest-thumb`'s CSS
-(size, ON AIR corner plate, live/stalled ring treatments) was deleted from
-`stream-control.css` along with it.
-
-**Verified against the real app** (Electron + the real `src-tauri` sidecar over its
-REST+SSE `api_server`, driven with Playwright's `_electron`, not the frontend's mock
-branch — this environment's `xdg-desktop-portal` did not block on an interactive consent
-dialog, so the full flow could be driven end to end without a human click):
-clicking "Share another screen" staged a real capture (portal prompt resolved, real
-1920×1080 negotiated resolution shown, card state `ready`) while `list_active_streams`
-stayed empty — nothing was live. Changing the staged card's Framerate from 120 to 60 fps
-was reflected immediately in `list_staged_captures`. Clicking "Go live" produced a real,
-`live`-state entry in `list_active_streams` at `framerate: 60`, and `get_start_stream_
-defaults` picked up `framerate: 60` immediately afterward — confirming persistence fires at
-"Go live", not before. Stopping that destination returned `list_active_streams` to empty
-with no residual state. Separately: `cargo build --lib -p simple-screensharing-client` and
-`cargo build -p simple-screensharing-client-tauri` both pass; `cargo test -p
-simple-screensharing-client --lib` (159 passed, 0 failed, 13 ignored — no regressions); the
-two real-hardware regression tests this session's earlier freeze/burst fixes added
-(`capture::tests::applying_a_preset_never_bursts_a_branch_above_its_configured_framerate`
-and `end_to_end_test::late_watch_after_all_three_tuning_controls_toggled_gets_a_real_
-keyframe_every_time`, the latter run 10/10 rounds) both still pass — the "split pipeline
-construction from the first destination" refactor above introduced no new hang/burst.
-
-`Known, pre-existing, unrelated quirk noticed during verification:` a fanned-out or
-just-gone-live destination's `list_active_streams` row reports `width: 0, height: 0` even
-though the real negotiated size is known (`CaptureHandle::source_caps`) — `poll_capture_
-states` only backfills a fresh destination's `params` from its real runtime state on the
-*first* destination of a capture (the `start_video_share` path), not one added later via
-`add_destination`/`add_destination_with_params` (fan-out, transfer, and now `go_live`).
-This predates this feature — plain "Also send to…" fan-out has always had it — and is out
-of scope here; noted for whoever picks up the fan-out geometry-readout gap next.
-
----
-
-### Two real regressions in "Go live", fixed: resolution stuck at 0×0, and GPU (VAAPI) encoding silently disabled (2026-07-28)
-
-Follow-up to the "Go live" flow above — the "known, pre-existing quirk" noted there turned
-out to be exactly right, and a second, previously-unnoticed bug shared its root shape.
-
-**Bug 1 — resolution 0×0 after "Go live" (was correct while staged).** Root cause,
-confirmed: `AppState::go_live` (`session.rs`) built the new destination's `VideoParams`
-with a hardcoded `width: 0, height: 0`, and — unlike `capture::start_sharing_with_source`
-(the still-alive-but-dead-from-the-UI `start_video_share` path), which internally rebuilds
-a fresh `VideoParams` from `handle.source_caps()` *after* the pipeline is up — nothing ever
-resolves that placeholder back to a real value for a destination attached via
-`add_destination_with_params` (fan-out, transfer, and `go_live` all go through it). The
-capture's real negotiated size **was** known at the moment `go_live` ran (it's exactly what
-the staged card had just displayed, via `CaptureHandle::source_caps`) — it just wasn't being
-read. `AppState::add_destination`'s own "no sibling destination to copy" fallback had the
-identical bug for the same reason (reachable if a capture with zero destinations is ever
-fanned out via the public `add_destination` entry point directly, not just via `go_live`).
-Fix: both call sites now read `handle.source_caps()` off the capture's own `CaptureHandle`
-when there's no sibling destination to copy from, instead of defaulting to `0, 0`.
-
-**Bug 2 — GPU (VAAPI) hardware encoding silently disabled, falling back to CPU (software
-x264).** Root cause, confirmed via `git log -p -L` on the three call sites: `session.rs`'s
-`go_live`, `add_destination`'s fallback, and `start_video_share` have *always* built their
-`VideoParams` with `backend: capture::EncoderBackend::default()` — a static `Software`, not
-a call to the real hardware probe `capture::detect_encoder_backend()` (cached VAAPI-vs-
-software detection, used correctly by `capture::start_sharing_with_source` and every other
-internal `capture.rs` call site). Whether this mattered depended entirely on whether
-anything downstream re-derives the backend — traced and confirmed it does **not**:
-`CaptureHandle::spawn_add_destination` → `spawn_destination` → `branch::add_branch_live`
-uses `VideoParams.backend` (via `to_encode_settings()`) exactly as given, straight into
-which encoder element (`vah264enc` vs `x264enc`) gets built. So for `go_live`/
-`add_destination` (which call `spawn_add_destination` directly with whatever `session.rs`
-passed), the static `Software` default was real and load-bearing — every "Go live" share
-silently ran CPU encoding regardless of this machine's real VAAPI capability.
-`start_video_share`'s own `EncoderBackend::default()`, by contrast, is harmless/vestigial:
-that path calls `capture::start_sharing`, whose `start_sharing_with_source` builds its
-*own* internal `VideoParams` (real `source_caps()` + real `detect_encoder_backend()`) and
-never looks at the placeholder `session.rs` constructed — it's used only as `Destination`
-bookkeeping during the brief `Starting` state before the real runtime params land. Left
-unchanged for that reason (fixing it would be a no-op; the doc comment on `go_live`
-explains the asymmetry). Fix: `go_live` and `add_destination`'s fallback now call
-`capture::detect_encoder_backend()` (made `pub(crate)`, previously private to `capture.rs`)
-instead of `EncoderBackend::default()`.
-
-**Verified on real hardware** (this machine: AMD Radeon RX 7900 XTX, `vah264enc` via the
-`va` GStreamer plugin). Added
-`end_to_end_test::go_live_attaches_the_first_destination_with_real_resolution_and_backend`
-(`src/end_to_end_test.rs`, `#[ignore]`d like this module's other real-relay tests): spawns a
-real relay server, starts a real zero-destination `TestSource` capture (`capture::
-start_capture_from_test_source`, a new test-only sibling of `start_sharing_from_test_source`
-so this doesn't need an interactive portal prompt or touch any real monitor), calls the
-real `AppState::go_live`, and asserts the resulting destination's live params show the real
-640×480 negotiated size and `EncoderBackend::Vaapi` (this machine's real
-`detect_encoder_backend()` result) — not `0, 0`/`Software`. Confirmed this test fails
-against the pre-fix code exactly as described (`left: (0, 0), right: (640, 480)`) by
-temporarily reverting the `session.rs` change and rerunning it, then confirmed it passes
-again after restoring the fix, with the real `capture.rs` log line `VAAPI hardware H.264
-encoder 'vah264enc' is available` and `backend Vaapi` in the output. `cargo build --lib
--p simple-screensharing-client` and `cargo build -p simple-screensharing-client-tauri` both
-pass; `cargo test -p simple-screensharing-client --lib` is 159 passed / 0 failed / 14
-ignored (one more ignored than before — the new test); the pre-existing real-hardware
-`end_to_end_test::` suite (`retry_destination_preserves_prior_encoder_tuning`,
-`resubscribe_after_pause_resumes_encoder_and_frames_flow`,
-`late_watch_after_all_three_tuning_controls_toggled_gets_a_real_keyframe_every_time`,
-`real_portal_share_fans_out_and_resumes`, etc.) and `capture::tests::vaapi_pipeline_links_
-and_produces_encoded_output`/`detect_encoder_backend_returns_without_panicking` all still
-pass — no regressions from either fix.
-
----
-
-## Bug: "Go live" visually reset Tune/Quality Level/Rate Control to Balanced (2026-07-29)
-
-**Owner's report, verbatim:** *"When i set a config before starting the stream and then
-start a stream, it resets to 'Balanced' again."* — change Quality Level (or Tune/Rate
-Control) on a staged card, press "Go live", and the resulting live card showed
-"Balanced"/"Best Quality"/"Constant" instead of what was actually picked.
-
-**Root cause: a frontend display-only bug, not a backend regression.** `getDestEdit(dest)`
-(`frontend/scripts/stream-control.js`) is the per-live-destination local cache the
-Preset/Advanced-tuning controls render from; when it has no cached entry yet for a
-`destination_id` it falls back to hardcoded defaults (`best_quality`/`balanced`/
-`constant`) — the same fallback a fresh page load intentionally uses before any real value
-is known. The mock path's `mockGoLive` explicitly seeded this cache right when creating the
-new live destination, but the **real** (`window.__TAURI__`) branch of `goLive` never did:
-it called `go_live`, `set_start_stream_defaults`, re-fetched destinations, and rendered —
-without ever writing the new destination's actual tuning into `destEditState`. Confirmed
-`dto::DestinationRow` (`src-tauri/src/dto.rs`) carries no `tune`/`quality_level`/
-`rate_control` fields at all, so `destEditState` seeded at creation time is the *only* place
-the frontend can ever recover these values from — nothing later re-derives them from a
-fetch. The backend itself was never affected: `session::AppState::go_live` builds its
-`VideoParams` from `self.tune`/`self.quality_level`/`self.rate_control`, which
-`applyStagedTuning`'s `set_tune`/`set_quality_level`/`set_rate_control` calls had already
-set on the staged card, before "Go live" was ever pressed — the encoder kept running at the
-picked setting the whole time; only the UI's redisplay of it was wrong.
-
-**Fix:** the real branch of `goLive` now seeds `destEditState` for the destination(s) that
-`fetchActiveDestinations()` shows as newly live for this `captureId`, the same shape
-`mockGoLive` already used, using the `edit` object already in scope from
-`getStagedEdit(staged)`. `go_live` attaches exactly one new destination per call
-(`session::AppState::go_live` calls `add_destination_with_params` once), so matching on
-`capture_id` (scoped to `kind === "video"`, since a paired audio destination shares the same
-`capture_id` via `paired_capture_id`) is unambiguous. `mockGoLive`'s own comment, which had
-claimed the real branch already did this (it didn't — that was the bug), now points at the
-real branch's matching `destEditState.set(...)` instead of restating the rationale a second
-time.
-
-**Verified on real hardware** via the `run` skill's Playwright `_electron` driver, with a
-real local relay server (`simple-screensharing-server`, spawned headless the same
-`setsid script -qc ...` way `end_to_end_test.rs` does) so a real room could be joined:
-staged a real capture, opened Advanced tuning, picked Low Latency / Quality / Adaptive
-(all three away from their defaults), pressed "Go live", and confirmed the live card showed
-`[Low Latency, Quality, Adaptive]` — not reset. Reverting just the `stream-control.js`
-change (`git stash`) and rerunning the identical script reproduced the reported bug exactly:
-the live card showed `[Best Quality, Balanced, Constant]` despite the same picks on the
-staged card. `cargo build --lib -p simple-screensharing-client` and `cargo build -p
-simple-screensharing-client-tauri` both pass; `cargo test -p simple-screensharing-client
---lib` is 160 passed / 0 failed / 15 ignored, no regressions.
+**Defaults are saved once, at "Go live"**, not on every control change (the owner's explicit ask);
+see "Start-stream defaults" below. A UI that renders a live card must seed its displayed tuning from
+what it just staged: the destination row carries no tune/quality/rate-control fields, so the
+staged values are the only copy (the former Electron UI once showed "Balanced" on a card that really ran
+the staged "Low Latency" because it skipped this seed; the encoder was never affected).
 
 ---
 
@@ -719,8 +522,8 @@ resolution/framerate/bitrate: **Tune** (Low-Latency / Best Quality — `BestQual
 Control** (Constant / Adaptive / Quality — `Constant` default). Defined as `TuneMode`,
 `QualityLevel`, `RateControlMode` in `capture.rs`, exposed via `edit_destination`'s
 `tune`/`quality_level`/`rate_control` params (snake_case strings, same convention as every
-other `edit_destination` param) and as `pillSwitch` controls in the destination edit panel
-(`stream-control.js`/`components.js`).
+other `edit_destination` param) and as controls in the destination settings
+(`client/src/ui/stream_settings.rs`).
 
 `Why the defaults are `BestQuality`/`Balanced`, not either speed/quality extreme` — the
 original product requirement (from this feature's owner) was explicit: "Low latency should
@@ -739,65 +542,27 @@ needed fixing. Regression coverage for the new mapping:
 `capture::tests::quality_level_maps_to_speed_preset_and_target_usage` (asserts `Balanced` →
 `medium`/`4` on both backends) and `capture::destination::tests::tuning_knob_changes_are_tier_two`.
 
-### Simple/advanced split in the edit panel (2026-07-28)
+### Presets (simple) over the raw tuning fields (advanced)
 
-**The problem:** these three switches (plus the bitrate slider) started out fully
-unconditionally visible on every destination's edit panel, all the time — reasonable for the
-"testing-oriented encoder tuning knobs" they were originally built as, but a real UX bug
-against this project's own requirement ("make it easy for regular users and powerful for
-advanced users"): a regular user opening a destination card to just check/nudge the bitrate
-was shown Tune/Quality Level/Rate Control jargon they don't need.
+*Why two tiers:* the project requirement is "easy for regular users and powerful for advanced
+users", and showing Tune/Quality/Rate Control jargon on every card failed the first half. A
+**preset** is a convenience over the same three raw fields, never a fourth field: picking one sets
+`tune`/`quality_level`/`rate_control` together through the same `edit_destination` call a single
+raw control uses. The table lives in `client/src/presets.rs` (ported from the former Electron
+frontend's `ENCODER_PRESETS`; it later gained a fourth preset, Gaming, see "Rate control collapses
+..." below):
 
-**The fix — two tiers, per destination card:**
+| Preset | `tune` | `quality_level` | `rate_control` |
+| --- | --- | --- | --- |
+| Low-Latency | `low_latency` | `performance` | `constant` |
+| Balanced (default) | `best_quality` | `balanced` | `constant` |
+| Quality | `best_quality` | `quality` | `quality` |
 
-- **Simple (always visible):** a new **Preset** `pillSwitch` — *Low-Latency / Balanced /
-  Quality* — sitting above the existing Bitrate slider. This is a convenience layer over the
-  same three raw fields below, not a fourth field of its own: picking a preset sets
-  `tune`/`quality_level`/`rate_control` together through the same `onEditApply`/
-  `edit_destination` call any individual raw switch already used. Mapping (`components.js`'s
-  `destinationCard`, `PRESETS` const):
+The active preset is computed from the destination's current three fields (whichever preset
+matches exactly); a hand-tuned combination selects none, an intentional unvalidated state. The raw
+fields sit behind an "Advanced" disclosure that must keep its open state across re-renders.
+Framerate is a regular-user control (always visible); the raw knobs are not.
 
-  | Preset | `tune` | `quality_level` | `rate_control` |
-  | --- | --- | --- | --- |
-  | Low-Latency | `low_latency` | `performance` | `constant` |
-  | Balanced (default/middle option) | `best_quality` | `balanced` | `constant` |
-  | Quality | `best_quality` | `quality` | `quality` |
-
-  The active preset button is computed live from the destination's current
-  tune/quality_level/rate_control (highlight whichever preset's 3 fields match exactly); if
-  the Advanced section was hand-tuned to some other combo, none of the 3 preset buttons
-  shows selected — an intentional, unvalidated state, not an error.
-
-  `Why: "balanced" as a `quality_level` string` — at the time this preset selector was
-  written, `parse_quality_level` (`dto.rs`) only accepted `performance`/`quality`; a
-  `QualityLevel::Balanced` variant parsed from `"balanced"` was landing concurrently from a
-  sibling branch (`fix/balanced-encoder-defaults`). The frontend was written against the
-  string the backend would accept once merged, rather than blocking on it. That branch has
-  since landed `QualityLevel::Balanced` (`"balanced"`, mapping to `speed-preset=medium`/
-  `target-usage=4`) as the backend's own `#[default]`, and extended the raw Quality Level
-  `pillSwitch` in the Advanced section below to a three-way Performance/Balanced/Quality
-  switch — so this preset selector's "Balanced" button and the raw switch's own "Balanced"
-  option now agree, and picking either applies cleanly server-side.
-
-- **Advanced (collapsed by default):** the raw Tune/Quality Level/Rate Control `pillSwitch`
-  rows, unchanged in behavior/values, moved inside a native `<details class="dest-advanced">`
-  /`<summary>` disclosure ("Advanced tuning", chevron affordance in `stream-control.css`).
-  `<details>` was chosen over hand-rolled show/hide state because this component library has
-  no existing disclosure primitive (`pillSwitch` is an exclusive-choice picker, not a
-  toggle-visibility one) and because each destination card gets its own `<details>` element,
-  so expand/collapse state is naturally independent per card with zero extra state to manage.
-
-  `Why the caller threads `advancedOpen` back in:` `stream-control.js` rebuilds a
-  destination's card element from scratch (a fresh DOM subtree) on *any* edit-state change,
-  including a click on a control inside Advanced itself — a brand-new `<details>` always
-  starts closed, so without extra care the section would visibly snap shut right after the
-  very click that used it. The fix: before replacing a card, the caller reads the outgoing
-  `.dest-advanced` element's `.open` and passes it back in as `opts.advancedOpen` to the new
-  `destinationCard(...)` call, so the disclosure survives its own re-render. The
-  `dest-edit-error` line (shown when an `edit_destination` call fails) stays outside/below the
-  `<details>` regardless of its state — it can be set by the always-visible Bitrate slider
-  too, not just an Advanced-only control, so it must stay visible independent of whether
-  Advanced is expanded.
 
 **Why these are tier 2 (`BranchSwap`), not tier 1 (a live property write) — including for
 `RateControlMode::Adaptive`, which turns out to be a no-op on one backend:** none of
@@ -812,57 +577,14 @@ destination" above). Routing these three through the *same* `classify_change`/
 readiness gate and the `KeptOld`-on-failure safety net for free, with zero new
 state-machine code.
 
-### Four bugs found in owner testing of the edit panel, fixed (2026-07-28)
 
-The first hands-on test of the panel above (by this project's owner, on a real share)
-turned up four separate defects. All four are fixed; recorded here because three of them
-are the kind of mistake that is easy to make again, and the fourth was a genuine
-stream-killer with a non-obvious cause.
+### Burst and wire-clock bugs found in owner testing of the edit panel (2026-07-28)
 
-**1. The whole panel only appeared in Per-Stream Maximum mode.** A single flag,
-`perStreamBitrateEditable` (`stream-control.js`), gated *both* "should this destination
-have an edit panel at all" and "should that panel contain a Bitrate slider". Those are two
-different questions and only the second one has anything to do with the bandwidth mode:
-the allocator owns **bitrate**, and only bitrate, so Preset/Framerate/Tune/Quality Level/
-Rate Control are equally meaningful and equally safe to apply in either mode. Split into
-two flags — `encoderTuningEditable` (any non-audio destination, both modes) gates the
-panel, `perStreamBitrateEditable` (Per-Stream + non-audio) gates only the Bitrate row.
-Absolute mode's read-only `Allocated: N kbps` line moved out of the panel's `else` branch
-so it still renders now that the panel itself always does. In Absolute mode an edit that
-doesn't touch bitrate sends the destination's *currently reported* bitrate rather than the
-edit buffer's copy, so touching the preset can't briefly stomp the allocator's live value
-with a stale number.
-
-**2. No way to change framerate on a running stream.** `edit_destination` has always taken
-a `framerate`, and `applyDestinationEdit` has always sent one — but hardcoded to the value
-the destination already had, so it was a no-op on every call and there was no control
-anywhere in the tab. Added a **Framerate** row to the always-visible half of the panel
-(alongside Preset/Bitrate, not behind Advanced — framerate is a regular-user concern, the
-raw Tune/Rate Control knobs are not). It is a `<select>` rather than a `pillSwitch`: it
-offers the same nine values the "Start a Stream" form does (15…280), which is far too many
-for a pill row, and reusing that form's own control keeps "the framerate picker" one
-recognisable thing in both places. A destination whose current rate isn't one of the nine
-gets it appended, so the control never misreports what is actually running.
-
-**3. The Bitrate slider snapped back to the old value after every change** — while the
-backend really had applied it (observed server-side). Two causes stacked:
-
-- The slider was constructed from `dest.bitrate_kbps` (the `DestinationRow` DTO) rather
-  than from the local edit buffer. The card is rebuilt from scratch whenever its `sig`
-  changes and the edit buffer *is* part of that `sig`, so applying a value immediately
-  re-rendered the card — rebuilding the slider from the value the server had last
-  reported, i.e. the old one.
-- That stale value never self-corrected, because a bitrate-only edit is **tier 1** (a live
-  encoder property write): the destination never leaves `live`, so `driver.rs` never emits
-  `destination-state-changed`, so `shell.js` never calls `StreamControl.refresh()`, so
-  `mockDestinations` is never re-fetched. The DTO's `bitrate_kbps` stayed wrong
-  indefinitely.
-
-Fixed by making the local edit buffer (`destEditState`) the single source of truth for
-*every* control in the panel — bitrate and framerate included, joining the three tuning
-knobs that were always caller-held because `DestinationRow` has no fields to read them back
-from. A successful apply also mirrors the applied values onto the local DTO copy so the
-card's `BITRATE`/`FRAMERATE` readouts agree with its controls.
+The first hands-on test of the edit panel found four defects. Three were former-Electron-UI state bugs
+(the panel only shown in one bandwidth mode, no framerate control on a running stream, and the
+bitrate slider rebuilt from a stale DTO value). The lasting rules: the UI's local edit buffer is the
+single source of truth for every control, and the allocator owns *bitrate only*, so the other
+controls stay editable in both bandwidth modes. The fourth was a real backend bug:
 
 **4. Changing the preset made the FPS shoot to 300+ and sometimes killed the stream.**
 The serious one. Two independent defects in the tier-2 branch swap, both of which scale
@@ -1118,7 +840,7 @@ explicit call: maximize quality by default, not conserve bandwidth by default).
 
 The Advanced panel's raw `Rate Control` `pillSwitch` now shows two plain-language options,
 "Efficient" (Cqp) and "Max Quality" (Qvbr), replacing the old three raw mode names. The four
-`ENCODER_PRESETS` (`components.js`) were re-assigned per-preset rather than blanket-defaulted:
+`ENCODER_PRESETS` (now `client/src/presets.rs`) were re-assigned per-preset rather than blanket-defaulted:
 
 | Preset | `tune` | `quality_level` | `rate_control` | GOP |
 | --- | --- | --- | --- | --- |
@@ -1138,7 +860,7 @@ hardcoded `GOP_SECONDS = 2` regardless of its other settings. `gop_millis: u32` 
 end-to-end: `capture::destination::VideoParams`/`branch::EncodeSettings` →
 `classify_change` (a `BranchSwap` trigger, same tier as the other three tuning knobs) →
 `add_branch`'s frame-count formula → `session::DestEdit`/`AppState` →
-`dto::StagedCaptureRow`/`edit_destination` → a new `set_gop_millis` command → the frontend.
+`dto::StagedCaptureRow`/`edit_destination` → a new `set_gop_millis` command → the UI.
 Deliberately **not** persisted to `settings.toml` — it's a preset-specific tradeoff, not a
 standalone remembered setting, so `stageVideoShare()` always resets it to 2000ms before
 staging a fresh capture.
@@ -1242,13 +964,13 @@ of the old `qpi=20 cpb-size=bitrate_kbps` (1x buffer). The `qpi` property is dro
 it's a `qvbr`/`icq`-specific quality-factor knob, meaningless under plain `vbr`. `Cqp`/"Efficient"
 is untouched. The enum variant keeps the name `Qvbr` despite no longer emitting literal
 `rate-control=qvbr` — see `capture.rs`'s doc comment on `RateControlMode` for the full reasoning
-(short version: the wire string `"qvbr"` is both the frontend's `rateControl` value in
+(short version: the wire string `"qvbr"` is both the UI's `rateControl` value in
 ~15 call sites and the on-disk persisted field in `AppSettings`, so renaming it would break
 existing users' saved settings for a purely cosmetic gain; the user-facing "Max Quality" label is
 unaffected either way).
 
 **Verified live, real hardware, real `vah264enc`, same AMD RX 7900 XTX** — not the full two-party
-Electron+relay+viewer path this time (a sender's own `DestinationStatsDto::bitrate_kbps` merely
+relay+viewer path this time (a sender's own `DestinationStatsDto::bitrate_kbps` merely
 echoes the *configured* bitrate, not a measured one — see that field's doc comment in `dto.rs` —
 so seeing the real achieved bitrate requires a second party's `received_bitrate_kbps`, out of scope
 for this pass's effort budget), but the exact same GStreamer element and properties
@@ -1285,9 +1007,8 @@ genuinely demanding content):
   unit test (real `gst::init()` + real `vah264enc` element construction) — `Cqp` still emits
   `rate-control=cqp`, untouched `qpi=26`, `cpb-size=0`; only `Qvbr`'s VAAPI branch changed.
 - `cargo test --workspace` passes (183 + 12 tests, 0 failed).
-- A real Electron app launch (built sidecar + real `electron/main.js`, driven via Playwright's
-  `_electron`) loaded with zero console errors after this change, confirming no regression to app
-  startup; driving a full two-party watch session to read a viewer's real
+- The app (then the Electron shell) still launched without console errors after this change;
+  driving a full two-party watch session to read a viewer's real
   `received_bitrate_kbps` was not done in this pass — flagged above as the honest verification gap.
 
 **Why these specific values**: `target-percentage=95` sits at the high end of the property's
@@ -1299,7 +1020,7 @@ result above already shows a real improvement at this value, so no further tunin
 tighter (e.g. 0.25x) or looser (0.5x) value remains unexplored if the current setting turns out to
 need further adjustment after real-world (non-scripted) use.
 
-### Interaction with the View tab: codec-string re-derivation
+### Interaction with viewers: codec-string re-derivation
 
 Toggling any of these three controls on a *live* destination triggers a real `BranchSwap`
 — a new encoder with (potentially) a different H.264 profile/level. `x264enc` in
@@ -1307,11 +1028,12 @@ particular picks its AVC profile/level automatically from `speed-preset` with no
 `profile=` set anywhere in this pipeline, so a Performance→Quality toggle can genuinely
 change the bitstream's profile out from under an already-connected WebCodecs watcher. This
 was a real, real-hardware-verified bug (a watcher connecting *after* all three controls had
-been toggled got stuck at 0fps) — the fix lives entirely on the View tab's delivery side
-and is documented in full, including the regression coverage and a since-closed
-investigation into a flaky-looking recurrence, in `superdoc/features/video-pipeline.md`'s
-"Encoder-tuning interaction" section. Nothing about `capture.rs`'s own tuning-control
-mechanism needed to change for that fix.
+been toggled got stuck at 0fps) — the fix lived entirely on the viewer's delivery side (the
+codec string is re-derived from every keyframe's bitstream, never cached once). The native decoder
+has the same property by construction: `decode/codec.rs` sniffs the codec from the bitstream
+(`superdoc/meta/TERMINOLOGY.md` "Sniffing"). Regression coverage:
+`end_to_end_test::late_watch_after_all_three_tuning_controls_toggled_gets_a_real_keyframe_every_time`.
+Nothing about `capture.rs`'s own tuning-control mechanism needed to change for that fix.
 
 ---
 
@@ -1319,9 +1041,9 @@ mechanism needed to change for that fix.
 
 **Scope of this entry:** this is the *backend + wire protocol* half of adding a codec
 selector to the stream control UI (approved after a codec-comparison discussion this
-session settled on offering all three codecs, not picking one). A separate Stage 2 builds
-the frontend selector on top of the contract documented here — `frontend/` was
-deliberately untouched by this stage.
+session settled on offering all three codecs, not picking one). A separate Stage 2 built
+the UI selector on top of the contract documented here (now the codec row in
+`client/src/ui/stream_settings.rs`).
 
 ### The `VideoCodec` enum and its threading
 
@@ -1339,7 +1061,8 @@ A codec change is unconditionally a tier-2 `BranchSwap` (`capture::destination::
 classify_change`) on both backends — there is no live property that could ever make
 swapping the encoder *element itself* (`vah264enc` → `vah265enc`, etc.) a tier-1 write.
 
-New/changed `src-tauri` commands (mirroring `set_quality_level`/`set_rate_control`):
+New/changed settings entry points (mirroring `set_quality_level`/`set_rate_control`; originally
+Tauri commands, now `AppState` methods):
 
 - `set_codec(codec: String)` — process-wide codec for the *next* video capture started
   (same "applied before `start_video_share`" shape as `set_tune` etc.).
@@ -1360,9 +1083,9 @@ software-backend real-hardware test `software_backend_always_produces_h264_regar
 requested_codec`). This mirrors how `EncoderBackend::Vaapi` already silently ignores
 `TuneMode` — a no-op, not an error.
 
-Stage 2's frontend must call the new `supported_codecs` command (wraps `capture::
+The UI calls `AppState::supported_codecs` (wraps `capture::
 supported_codecs(capture::detect_encoder_backend())`, returning `["h264"]` on
-`Software` or `["h264", "h265", "av1"]` on `Vaapi`) to grey out/disable H.265/AV1 in the
+`Software` or `["h264", "h265", "av1"]` on `Vaapi`) to grey out H.265/AV1 in the
 selector on a machine that would silently downgrade them, rather than let a user pick an
 option that quietly does something else. `dto::StagedCaptureRow` also carries this same
 list (`supported_codecs: Vec<&'static str>`) alongside the staged card's other encoder
@@ -1398,8 +1121,9 @@ downstream of the encoder):
 
 ### The `CodecInfo` wire chunk: generalized to all three codecs, still purely bitstream-derived
 
-`src-tauri/src/video_server.rs`'s `CodecInfo` chunk (the in-band WebCodecs codec string
-every watch connection gets first — see that module's own doc comment) now derives
+The former sidecar's `video_server.rs` `CodecInfo` chunk (the in-band WebCodecs codec string
+every watch connection gets first; removed in the egui rework, the native equivalent is
+`decode/codec.rs` sniffing and the browser's is `docs/js/core/codec.js`) derived
 `avc1.PPCCLL` / `hev1.<profile>.<compat>.<tier><level>[.<constraints>]` /
 `av01.<profile>.<level><tier>.<bitdepth>` strings, one parser per codec
 (`parse_avc_codec_string`/`parse_hevc_codec_string`/`parse_av1_codec_string`), dispatched
@@ -1447,102 +1171,34 @@ hand-derived bit-tracing first produced a wrong expected value.
 
 ### Explicitly NOT in scope for this stage
 
-No `frontend/` changes (`pillSwitch`, `components.js`, `view.js` — Stage 2). No change to
+No UI changes (that was Stage 2). No change to
 `protocol.rs`'s `AnnounceStream`/`StreamInfo` (see the wire-chunk section above for why,
 and the ambiguity that choice leaves open). No live per-codec VAAPI availability probing
 beyond the existing `vah264enc`-only one.
 
 ---
 
-## The "START A STREAM" form gets the same options as editing a live destination, and remembers them (2026-07-28)
 
-**Superseded (2026-07-28, later the same day):** the standalone "START A STREAM" card this
-section describes is gone — replaced by the staged-capture "Go live" flow in "'Go live':
-staging a capture with zero destinations, then attaching the first one" above, which reuses
-`destinationCard`'s Preset/Advanced-tuning/Framerate/Bitrate panel instead of a separate
-form. The mechanisms this section documents (process-wide `tune`/`quality_level`/
-`rate_control` on `AppState`, the `set_tune`/`set_quality_level`/`set_rate_control` commands,
-`rooms::StartStreamDefaults`/`get_start_stream_defaults`/`set_start_stream_defaults`) are
-all still exactly as described below and still exactly how the new flow persists its
-settings — only *when* persistence fires changed (now: once, at "Go live", not on every
-form edit). Left in place rather than deleted: the reasoning for *why* each of these pieces
-exists is still accurate and still the reason the new flow could reuse them as-is.
+## Start-stream defaults: process-wide settings applied before a capture starts
 
-**Owner's request, verbatim:** *"The 'START A STREAM' UI should offer the same options as I
-have after creating a stream and editing it. Right now, it only offers to change the frame
-rate. These settings (only for the start stream part) should be saved, so they can be used
-the next time."*
+*Why this shape:* `edit_destination` needs an existing `destination_id`, and a stream that has not
+started has none. Rather than invent a third settings mechanism, a not-yet-started stream uses the
+existing pattern: **process-wide settings on `AppState`** (`framerate`, `bitrate_kbps`, `tune`,
+`quality_level`, `rate_control`, `codec`, with setters that clamp), read by
+`go_live`/`start_video_share` when they build the first destination's `VideoParams`.
 
-Before this, `renderStartStreamCard` (`stream-control.js`) offered only a Room dropdown, a
-Framerate dropdown, and — Per-Stream mode only — a manual Bitrate field: strictly less than
-the destination edit panel above (which also has the Preset selector and the Advanced
-Tune/Quality Level/Rate Control disclosure), even though both panels apply to the exact same
-`VideoParams` shape. Two changes closed that gap:
-
-**1. Same controls, shared code.** The Preset `pillSwitch` mapping (`ENCODER_PRESETS` —
-Low-Latency/Balanced/Quality → tune+qualityLevel+rateControl, see "Encoder tuning controls"
-above) moved out of `destinationCard` to module scope in `components.js`, alongside a small
-`activeEncoderPreset(tune, qualityLevel, rateControl)` helper, and both are now exported on
-`window.Components`. `renderStartStreamCard` renders the identical Preset row plus an
-identical `<details class="dest-advanced">` Advanced-tuning disclosure (Tune/Quality
-Level/Rate Control `pillSwitch` rows) using the same CSS classes and the same collapsed-by-
-default/reopen-across-rerender convention `destinationCard`'s Advanced section already
-established (`priorAdvancedEl`/`advancedOpen`, read off the outgoing `startCardEl` before
-building its replacement).
-
-**2. Wiring a form that has no destination yet.** `edit_destination` (the mechanism the edit
-panel uses) needs an existing `destination_id` — a stream that has not started yet has none.
-Rather than invent a third settings-application mechanism, this follows the *existing*
-pattern this file's own header comment already documents for framerate/bitrate: **process-
-wide settings, applied via a pre-start command, read by `start_video_share` when it builds
-the first destination's `VideoParams`.** `AppState` gained three new fields — `tune: TuneMode`,
-`quality_level: QualityLevel`, `rate_control: RateControlMode` (`session.rs`), mirroring
-`framerate`/`bitrate_kbps` exactly — and three new commands, `set_tune`/`set_quality_level`/
-`set_rate_control` (`src-tauri/src/commands.rs`, `dto::parse_tune_mode`/`parse_quality_level`/
-`parse_rate_control_mode` for the string→enum step, same convention `edit_destination` already
-uses). `start_video_share` (`session.rs`) now reads `self.tune`/`self.quality_level`/
-`self.rate_control` into the new destination's `VideoParams` instead of hardcoding
-`TuneMode::default()` etc. `startVideoShare` (`stream-control.js`) calls all five setters —
-`set_framerate`/`set_bitrate`/`set_tune`/`set_quality_level`/`set_rate_control` — before
-`start_video_share`, same shape as the pre-existing framerate/bitrate pair.
-
-**3. Persistence.** New `rooms::StartStreamDefaults` (framerate, bitrate_kbps, tune,
-quality_level, rate_control), nested as `AppSettings::start_stream_defaults` — the same
-"local TOML settings file, loaded at startup, written on every change" mechanism
-`save_bandwidth_settings`/`save_max_jitter_buffer_ms` already use, not a new one.
-`TuneMode`/`QualityLevel`/`RateControlMode` (`capture.rs`) gained `Serialize`/`Deserialize`
-derives (`#[serde(rename_all = "snake_case")]`, matching `dto.rs`'s existing wire strings
-exactly) so they can be stored directly, the same way `BandwidthMode`/`PresentationMode`
-already are, rather than going through a string-parsing layer just for this one field.
-`session::save_start_stream_defaults(...)` follows the existing load-modify-save shape
-(loads the current `AppSettings`, replaces just this nested struct, saves — never clobbers
-the sibling settings). Two new Tauri commands, `get_start_stream_defaults`/
-`set_start_stream_defaults` (`src-tauri/src/commands.rs`, plus their `dto::
-StartStreamDefaultsDto`) — a dedicated pair rather than folding into `get_settings`'s
-`SettingsDto`, because `SettingsDto`'s `bitrate_kbps`/`framerate` fields mirror **live
-`AppState`** (reset to `DEFAULT_BITRATE_KBPS`/`DEFAULT_FRAMERATE` every launch — see the
-`session.rs` module doc's "every launch starts fresh" note), which is a different question
-from "what did the form last save", and there is no live `AppState` field for
-tune/quality_level/rate_control to mirror in the first place (those only exist per-
-destination, via each running share's own edit buffer). `stream-control.js`'s `init()` calls
-`get_start_stream_defaults` and merges the result onto `state.startForm`'s hardcoded
-first-run fallback (which matches the backend's own `#[default]`s exactly: 30fps/8000kbps/
-`best_quality`/`balanced`/`constant`); every Preset click, Advanced-tuning pill click,
-framerate change and bitrate change calls `set_start_stream_defaults` with the form's full
-current state (`applyStartFormTuning`) — deliberately excluding `roomHandle`, which is a
-per-launch UI convenience, not a remembered encoder preference.
-
-**Verified against the real app** (Electron + the real `src-tauri` sidecar over its REST+SSE
-`api_server`, not the frontend's mock branch): the Preset/Advanced-tuning controls render
-identically to the edit panel's; changing Tune/Quality Level/Rate Control/Framerate writes
-through to the real `~/.config/simple-screensharing/settings.toml`
-`[start_stream_defaults]` block; closing the app and launching a fresh Electron+sidecar
-process reloads exactly those values into the form (confirmed via the Advanced-tuning
-panel's active pill state and the Framerate readout after the relaunch). Separately, joining
-a real relay-backed room and clicking "Share Screen" with Framerate set to 60 in the form
-produced a live destination reporting `framerate: 60` via `list_active_streams` — direct
-confirmation the pre-start-command mechanism (identical code path for tune/quality_level/
-rate_control) actually reaches the encoder, not just the settings file.
+**Persistence:** `rooms::StartStreamDefaults` (nested as `AppSettings::start_stream_defaults`) uses
+the same local-TOML load-modify-save mechanism as `save_bandwidth_settings`
+(`session::save_start_stream_defaults` never clobbers sibling settings). `TuneMode`/`QualityLevel`/
+`RateControlMode`/`VideoCodec` derive `Serialize`/`Deserialize` with `snake_case`, so the stored
+strings equal the wire strings; every new field is `#[serde(default)]` so an older `settings.toml`
+still loads. *Why separate from the live `AppState` settings view:* the live `framerate`/
+`bitrate_kbps` reset to defaults every launch ("every launch starts fresh"), which is a different
+question from "what did the user last save"; tune/quality/rate-control only exist per destination.
+First-run fallback equals the backend `#[default]`s: 30 fps / 8000 kbps / `best_quality` /
+`balanced` / `constant` / H.264. The `[start_stream_defaults]` block is written to `settings.toml`
+in the app's config dir; check a persistence change with a scratch `XDG_CONFIG_HOME` and the `run`
+skill's `drive.sh`.
 
 ---
 
@@ -1605,76 +1261,6 @@ Both live in `BandwidthController`, which owns no `App` state and calls no clock
 `decode.rs`'s `PacingState`, and the reason the timing behaviour can be tested without
 sleeping.
 
-### 2026-07-28 — "the bitrate doesn't update when Total Maximum changes" — frontend display bug, not a backend one
-
-**Reported:** dragging Absolute-Maximum mode's "Total maximum" slider never changed a
-destination's displayed bitrate, while Per-Stream mode's own per-destination slider did.
-
-**Investigated for real, not just by reading code** (the mechanism above reads as
-structurally correct on paper, which is exactly why this needed a real-hardware check):
-
-- The decision layer (`BandwidthController::tick`'s rate limit + hysteresis) is already
-  covered by `ui.rs`'s `bandwidth_wiring_tests` — re-ran them: all pass, and they
-  demonstrably do react to a `total_kbps` change once the rate limit clears.
-- Whether a decided write reaches a *real* encoder is covered, for real GStreamer (not a
-  mock), by `capture::branch::tests::
-  setting_one_branchs_bitrate_writes_through_to_that_encoder_only` — re-ran it against a
-  real pipeline: passes, and the test reads the bitrate back off the live element, not off
-  a detached handle. Confirms the backend really does write the new bitrate into the real
-  encoder.
-- `driver.rs`'s tick loop calls `AppState::apply_bandwidth_allocation()` **unconditionally
-  every 250ms tick**, not gated behind a room being connected or any UI tab being open —
-  confirmed by reading `driver.rs::tick` step 4, no early-return before it.
-- So the backend was never the problem: `set_bandwidth_total` writes the new total,
-  `apply_bandwidth_allocation` picks it up on its next scheduled tick (≤1s later, per the
-  rate limit) and writes the real encoder property when the change clears hysteresis.
-
-**Root cause, entirely in the frontend:** the destination card's **"Bitrate" metric**
-(`frontend/scripts/components.js`, the `metric("Bitrate", ...)` row shown on every
-destination card in both modes) reads `dest.bitrate_kbps` off `stream-control.js`'s
-`mockDestinations` cache. That cache is only ever refreshed by re-fetching
-`list_active_streams`, which only happens on a `destination-state-changed`/
-`presence-updated` event. The allocator's write is a **tier-1 property write**
-(`capture::CaptureHandle::set_destination_bitrate`) — deliberately chosen *because* it has
-no lifecycle consequence, so it never changes `DestinationState` and never fires either
-event. Per-Stream mode never showed this symptom because `applyDestinationEdit` has a
-call site to optimistically mirror the user's own edit onto `dest.bitrate_kbps` the instant
-it's sent (see that function's own `Why:` comment); an allocator-driven change happening
-entirely inside the backend, off the back of a slider in a *different* mode, has no such
-call site to patch from. Exactly the same "a live change with no accompanying event" shape
-as the already-fixed 2026-07-27 "Stop never clears" bug in `driver.rs` (see that entry) —
-different symptom, same root cause class.
-
-Note this is **not** the same thing as the "Allocated: N kbps" line also shown in Absolute
-mode (`updateActiveSharesCard`'s `computedShareKbps`) — that one is a **frontend-local
-recompute** off `bandwidth.absolute_total_kbps` (itself updated optimistically by
-`setAbsoluteTotal`) and *does* update immediately on every slider release. It was the
-"Bitrate" metric specifically that stayed stale.
-
-**Fix:** rather than adding another diff-suppressed event (more plumbing for a value that
-already changes on roughly the same cadence as the FPS counters below it), the destination's
-live bitrate now rides the *existing* `stream-stats-updated` payload, which is already
-unconditional every driver tick (never diff-suppressed — see `dto::StreamStatsUpdated`'s
-own doc comment) and already keyed by `destination_id` on the frontend for the FPS readout.
-`dto::DestinationStatsDto` gained a `bitrate_kbps: Option<u32>` field (`None` for audio),
-populated in `driver.rs` from `dest.live_params().bitrate_kbps` — the same real,
-runtime-cached value `dto::destination_rows` already trusted for everything else. On the
-frontend, `stream-control.js`'s `updateStats()` now also writes that value straight into
-`mockDestinations` (so the cache agrees with the backend for any subsequent full render)
-and directly into the card's `.dest-metric-bitrate-value` DOM node (a new dedicated class on
-that span, in `components.js`), the same direct-DOM-write pattern already used for the FPS
-readout and sparkline — bypassing the sig-diffed `render()` path entirely so a stats tick
-never triggers a full card rebuild.
-
-**Verified:** `cargo build --lib -p simple-screensharing-client` and
-`cargo build -p simple-screensharing-client-tauri` clean; `cargo test -p
-simple-screensharing-client --lib` — 153 passed, 0 failed, 13 ignored (real-hardware tests,
-unchanged), same pass count as before this change. The real-GStreamer bitrate-write test
-above was re-run specifically (not just the full suite) as the closest existing coverage to
-"does a live bitrate write really reach the encoder," both before touching anything (to rule
-out a regressed backend) and after (to confirm the fix didn't disturb it) — passed both
-times.
-
 ### Overshoot
 
 `allocate` never starves a destination below its floor and never silently exceeds the
@@ -1686,125 +1272,30 @@ maximum is Z kbps. No stream is starved below its floor."*
 
 ---
 
-## What the tab renders
+## Retrying a failed destination
 
-Top to bottom: **Active shares** (every destination across every room) → **Bandwidth**
-(mode toggle + that mode's settings + fan-out multiplication note) + overshoot banner →
-**Start a stream** (room picker over *joined* rooms, framerate, bitrate when Per-Stream
-mode is on). The SHARE AUDIO card that used to sit beside the room-scoped row below was
-removed on 2026-07-28 — see "Audio is a row on the share" below — and the room-scoped
-row itself (a room picker plus a Members/rename card) was removed the same day; see
-"Room-scoped settings row removed" below.
+A `Failed` destination's Retry calls `AppState::retry_destination` (`session.rs`), not
+`stop_destination` + `start_destination`.
 
-**Active shares moved above Bandwidth (2026-07-29).** Owner's request: swap the two
-cards' order. The overshoot banner moved together with the Bandwidth card rather than
-staying pinned to the top — it's a bandwidth-budget warning contextually tied to that
-card, so it stays visually adjacent to what it explains. `stream-control.js`'s `render()`
-now calls `syncChildren(gridEl, [updateActiveSharesCard(alloc), updateBandwidthCard(),
-bannerText ? updateOvershootBanner(bannerText) : null])` — `syncChildren` (local to
-`stream-control.js`) is positional/order-driven DOM reconciliation (`insertBefore` by
-index), so the reorder is a pure array-order change with no other code affected.
+**Why:** that pairing used to be the implementation and had two real bugs. It lost the failed
+destination's last-configured bitrate/tune/quality/rate-control (a new destination copies params
+from a *sibling* on the capture, and the common case has none, so it silently reset to defaults).
+Worse, `stop_destination` tears down the *whole capture* once its destination count hits one, so
+`start_destination` bailed silently and retry failed outright for the single-destination case.
+`retry_destination` reads the failed destination's params first, removes just that branch without
+touching `ShareStatus`, and re-adds a replacement in the same room with the same params.
+Coverage: `end_to_end_test::retry_destination_preserves_prior_encoder_tuning` (real relay + real
+capture).
 
-### Room-scoped settings row removed (2026-07-28)
-
-Owner's request, verbatim: *"remove the Room-scoped settings ('Room-scoped settings
-for'), since it just clutters the UI and is barely useful."*
-
-Removed the whole "Room-scoped settings for:" row: its room-picker header, the MEMBERS
-card (member list + `conn_id` display), and the room-name rename field/Save button/
-"Saved." hint beneath it (`stream-control.js`'s `updateRoomScopedRow`/
-`renderRoomScopedRow`/`renderMembersCard`, plus the `.sc-room-scoped-*`/`.sc-members-
-card`/`.sc-member-row`/`.sc-rename-row`/`.sc-saved-hint` CSS in `stream-control.css`).
-
-**Why it was safe to delete outright, not just trim:** it was a straight duplicate of
-functionality the sidebar's room detail side panel (`shell.js`'s `renderRoomPanel`,
-opened by clicking a room in the sidebar's ROOMS list) already provides — the same
-members list and the same room-name rename field, reached one click away instead of
-buried in a second, disconnected room picker on this tab. Confirmed by reading
-`renderRoomPanel` before deleting anything: it independently fetches/renders members
-(`room-panel-members`) and has its own rename flow (`renamePanelRoom`, its own
-`rename_room` invoke call) — no code path here was the *only* place either piece of
-functionality lived.
-
-Also removed as now-orphaned: `mockMembersByRoom`/`MOCK_MEMBERS_BY_ROOM`,
-`fetchRoomMembers`, `renameRoom` (this tab's own copy — `shell.js`'s `renamePanelRoom`
-is a separate function with its own `rename_room` call and was left untouched), and the
-`state.scopedRoomHandle`/`state.roomName`/`state.savedHint` fields. `state.startForm
-.roomHandle` (the *Start a stream* card's own room picker) is unrelated and was kept,
-including `init()`'s default-to-first-joined-room logic for it (re-keyed off
-`state.startForm.roomHandle` instead of the deleted `state.scopedRoomHandle`).
-
-Each non-audio destination card carries the encoder edit panel described under "Encoder
-tuning controls" above: **Preset** and **Framerate** always visible in *both* bandwidth
-modes, **Bitrate** as a third always-visible row in Per-Stream mode only, and
-Tune/Quality Level/Rate Control behind the collapsed "Advanced tuning" disclosure. In
-Absolute mode the Bitrate row is replaced by the read-only `Allocated: N kbps` line the
-allocator drives.
-
-**Equal-width tuning toggles (2026-07-29).** Tune (2 options), Quality Level (3), and Rate
-Control (3) each render as their own `pillSwitch` and, before this fix, each button sized to
-its own label text — "Low Latency"/"Best Quality"/"Performance"/etc. all landed at visibly
-different widths within and across the three rows. Fixed with a `.dest-tuning-toggle`
-modifier class (`components.js`, styled in `stream-control.css`), applied only to these
-three `pillSwitch` instances: a fixed `width: 342px` on the track plus `flex: 1 1 0` on
-`.mode-toggle-btn` inside it, so a row's segments split that width evenly and all three
-rows' tracks measure identical. Same scoped-modifier pattern as `APP-SHELL.md`'s
-`.add-room-tabs` (Join/Create tabs) and `settings.css`'s `.settings-segmented` (language
-switch) — a class on this particular `pillSwitch` instance, not a change to
-`.mode-toggle`/`.mode-toggle-btn` themselves, which the bandwidth-mode toggle, language
-switch, and encoder preset picker still rely on sizing to content.
-
-`Why 342px total, not width: 100%`: unlike `.add-room-tabs`, these rows are
-`justify-self: start` in `.dest-edit-grid` (see that class's own `Why a fixed px` comment
-in `stream-control.css`, which set the 96px label column all six Room/Preset/Framerate/
-Tune/Quality Level/Rate Control rows now share) — not meant to stretch across their grid
-cell, since unrelated rows (Room/Preset/Framerate) can be much wider. 342px was sized to
-comfortably fit "Performance"/"Low Latency", the longest labels in play, in the tightest
-case (3 segments), and confirmed by real-app `getBoundingClientRect()` measurement in
-Electron: all three tracks measure exactly 342px, with each row's buttons equal-width to
-its own siblings (Tune's two segments ~165.5px each; Quality Level's and Rate Control's
-three segments ~109.3px each).
-
-`Why a shared fixed total instead of sizing each row to its own content`: the owner's ask
-was "all the triple selections should have the same width" for the whole block, which
-necessarily means Tune's two (wider) segments and Quality Level/Rate Control's three
-(narrower) segments are *not* the same per-button width as each other — only the track
-total is shared. This mirrors the `.dest-edit-grid` label-column fix's own approach: one
-fixed number every row agrees on, rather than each row solving its own layout
-independently and drifting apart.
-
-The destination list is deliberately **cross-room**, like the sidebar's STREAMS section: a
-destination is bandwidth the user is paying for right now, and hiding it behind a room
-selection would make fan-out invisible. Each row shows a status dot + label folding the
-capture's start/stop state, the pending transfer/fan-out role, and the live
-`DestinationState` (`Starting` / `Live` / `Applying…` for `Rebuilding` / `Waiting for
-capture…` for `Stalled` / `Failed`) — the minimal honest surfacing of the stall protocol.
-The full tiered restart placeholder (800ms / 6s tiers) is stage 3, on the View tab.
-
-A `Failed` row's "Retry" action (`stream-control.js`'s `retryDestination`) calls a
-dedicated `retry_destination` Tauri command (`commands.rs` → `AppState::retry_destination`
-in `session.rs`), not `stop_destination` + `start_destination`.
-
-**Why:** that pairing used to be the implementation, and had two real bugs. First, it
-didn't preserve the failed destination's last-configured bitrate/tune/quality_level/
-rate_control — `start_destination` only derives new-destination params by copying a
-sibling still on the capture, so for a capture's *only* destination (the common case)
-there was no sibling to copy from and it silently reset to session defaults. Second,
-worse: `stop_destination` tears down the *whole capture* once its destination count hits
-≤1 — correct when the user deliberately stops their only stream, wrong for a retry where
-only that one branch died — so `start_destination` afterward bailed silently (capture no
-longer `Active`) and retry actually failed outright for the single-destination case, the
-most common one. `retry_destination` reads the failed destination's own params before
-removing it, tears down just that one branch without touching `ShareStatus`, and re-adds
-a replacement in the same room with those same params — never touching the rest of the
-capture. Regression coverage:
-`end_to_end_test::retry_destination_preserves_prior_encoder_tuning` (real relay + real
-GStreamer capture, asserts both tuning preservation and that the capture stays `Active`
-for the single-destination case).
-
-The mode toggle is a pair of `selectable_label`s rather than a new theme component:
-`theme.rs` has no radio-group helper, and a two-option exclusive choice is exactly what the
-Settings tab's language switcher already expresses this way.
+The destination list is deliberately **cross-room**: a destination is bandwidth the user is paying
+for right now, and hiding it behind a room selection would make fan-out invisible. Each row folds
+the capture's start/stop state, the pending transfer/fan-out role and the live `DestinationState`
+(`Starting` / `Live` / `Rebuilding` as "Applying" / `Stalled` as "Waiting for capture" / `Failed`)
+into one status. A destination's live bitrate rides the per-tick stats payload
+(`DestinationStatsDto::bitrate_kbps`): the allocator writes it as a tier-1 property write that
+emits no state-change event, so a UI that only refreshes on state changes shows a stale rate under
+Absolute Maximum. That bug once looked like a backend fault when the allocator was fine (checked
+with `capture::branch::tests::setting_one_branchs_bitrate_writes_through_to_that_encoder_only`).
 
 ---
 
@@ -1829,7 +1320,7 @@ Settings tab's language switcher already expresses this way.
   at once) and drained the way `destination_pump` drains it. Asserts both that the
   replacement branch stays at its configured rate and that its frames carry real
   presentation times rather than falling through the wire clock's monotonic clamp. See
-  "Four bugs found in owner testing of the edit panel" above.
+  "Burst and wire-clock bugs found in owner testing" above.
 - `capture::destination::tests::a_branch_swap_keeps_real_frame_spacing_when_the_new_branch_restarts_its_timeline`
   and `…::a_branch_swap_that_continues_the_timeline_leaves_the_wire_clock_alone` — the
   wire-clock re-anchor's arithmetic, and that it stays a no-op on a seam that was already
@@ -1861,10 +1352,9 @@ should be able to enable audio on his share."* Audio is still its own `LocalCapt
 its own `StreamKind::Audio` stream id on the wire, started via `list_audio_sources` →
 `select_audio_source` → `start_audio_share`. Your own outgoing audio destination still
 appears in your OUTGOING sidebar list with a `volume_up` glyph — that is your own share,
-not a viewer-facing artifact. (A 2026-07-28 investigation initially misread the
-`kind === "audio"` branches in `components.js` as the viewer-facing "separate audio
-stream" to delete; they were not that, and were left alone at the time. They have since
-been removed for a different and correct reason — see below.)
+not a viewer-facing artifact. (A 2026-07-28 investigation initially misread some
+UI branches as the viewer-facing "separate audio stream" to delete; they were the sharer's own
+outgoing rows and were left alone.)
 
 What changed is entirely on the **watcher's** side: a viewer never sees another person's
 audio as a separate stream, row, or "Listen" action. Watching someone's video
@@ -1872,7 +1362,7 @@ automatically subscribes and plays their audio, and stops it again when the watc
 The full architecture, the rejected alternatives, and the four cases that broke the
 previous "latch the pairing at watch time" approach are in
 `superdoc/features/video-pipeline.md`'s "Audio follows video" section — including why
-audio is played inside the Rust sidecar rather than relayed to the browser like video is.
+audio is played in-process rather than relayed to a display layer like video was.
 
 Note this leaves the two halves deliberately asymmetric, and that is the point: *sending*
 audio is an explicit choice the sharer makes about their own machine, so it has UI;
@@ -1945,807 +1435,46 @@ and nothing for the slider to change. It works as designed once (1) is fixed.
 
 ---
 
-## Audio is a row on the share, not a card of its own
-
-**Added 2026-07-28.** Owner's request, verbatim: *"attach the Audio part to the
-Screenshare and not make it its own separate card. Just extend the streams card, add a
-horizontal separator and then the following line: [SmallVolumeFeedbackVisualizer]
-[StreamedAudioApplicationName] [Mute/Unmute](Fixed width, on text change) [Stop] — Keep
-the modern look."*
-
-Before this, audio showed up **twice** as a thing of its own: a standalone SHARE AUDIO
-card in the room-scoped row, and a full destination card in ACTIVE SHARES structurally
-indistinguishable from a screen share's. Both are gone.
-
-A screen share's card now ends with a `.dest-divider` hairline and one extra row:
-
-```text
-[■■▪··] ssshare-noise ...................... [ Mute ] [ Stop ]
- meter   captured application               fixed-w   audio only
-```
-
-- **Meter** (`.dest-audio-meter`, 5 bars) — driven by `audio_level` on the existing
-  `stream-stats-updated` tick, written straight into the DOM by `stream-control.js`'s
-  `updateStats()` (never through the sig-diffed render path, same as the FPS readout and
-  the sparkline). The level comes from a `level` element in the capture pipeline, folded
-  into `audio::AudioLevel` (an `AtomicU32` of `f32::to_bits` — one writer, no history,
-  lock-free for a GStreamer streaming thread) and surfaced as
-  `DestinationStatsDto::audio_level`.
-- **Application name** — `DestinationRow::label`, which for an audio capture already was
-  the picked source's name.
-- **Mute/Unmute** — `commands::set_audio_share_muted` → `AudioCaptureHandle::set_muted`,
-  a `volume name=mute` element in the capture pipeline. Placed deliberately **before**
-  `level`, so muting flattens the meter too: the meter's job is to answer "is my audio
-  going out right now", and a bar still bouncing while muted answers that wrongly. Muting
-  with `volume` rather than by pausing the send keeps a continuous Opus stream flowing, so
-  the viewer's jitter buffer never sees a mute as a multi-second dropout to conceal.
-  The button is a **fixed 76px** (`.dest-audio-mute`, widened from 64px on 2026-07-29 to fit
-  "Unmute" at the tab's now-standard 32px button size), sized for the longer word, so the
-  label swap never shoves Stop sideways.
-- **Stop** — plain `stop_destination(<audio destination id>)`. Safe to reuse as-is: an
-  audio capture always has exactly one destination, so `stop_destination` takes its
-  `destinations.len() <= 1` branch and stops that capture only. The screen share is a
-  different `capture_id` and is untouched.
-
-With no audio attached, the same slot shows `No audio attached` plus a dashed
-**+ Add audio** chip that expands in place into the source picker — the same
-inline-reveal pattern as the card's existing "+ Also send to…" fan-out chip. It re-lists
-`list_audio_sources` **on open**, because which applications are producing audio changes
-by the second.
-
-### Pairing audio to a card
-
-`LocalCapture::audio_for_capture: Option<CaptureSourceId>`, set from
-`start_audio_share(room_handle, for_capture)` and exposed as
-`DestinationRow::paired_capture_id`. The frontend matches on `paired_capture_id` **and**
-`room_handle`.
-
-`Why an explicit link and not "same room":` one capture can be fanned out to several
-rooms, and someone sharing two monitors into one room is two cards but potentially one
-audio share — "same room" would make both cards claim the same audio row, and Stop on
-either would silently kill audio for both. Recording the pairing at the moment the user
-clicks "+ Add audio" on a specific card is unambiguous and costs one `Option`.
-
-### What was removed, and the one entry point that went with it
-
-- `stream-control.js`'s `renderShareAudioCard()` and the `.sc-share-audio-*` styles.
-- The `.sc-ghost-row` "Share audio" row. It started a *standalone* audio share, which now
-  has no card to render in — leaving it would have been the one way to create an audio
-  share the UI cannot show.
-- `components.js`'s `dest.kind === "audio"` branches in `destinationCard` (thumb glyph,
-  head glyph, audio-only metric row, failed-card head). Audio rows never reach that
-  function any more.
-
-An audio destination that somehow has no matching video card (a share torn down out from
-under it, or one started by the legacy egui frontend) renders nothing in ACTIVE SHARES,
-but is still listed and stoppable in the sidebar's OUTGOING list — so it can never be
-stranded invisibly.
-
-### Real-world verification (2026-07-28)
-
-Not the synthetic test this time. Two real Electron clients against a real relay, sharing
-a real screen plus a throwaway decorrelated-noise application, with the audible result
-measured off the output device's monitor:
-
-| viewer volume | measured RMS at the speakers | expected |
-|---|---|---|
-| 0%   | −30.80 dBFS (source only) | baseline |
-| 100% | −28.09 dBFS (**+2.71 dB**) | +3.01 dB (one more equal-power copy) |
-| 200% | −24.29 dBFS (**+6.51 dB**) | +6.99 dB (source + 4× power) |
-| 0%   | −30.80 dBFS | exactly back to baseline |
-
-Sharer-side Mute produced exactly the baseline figure and `audio_level` went to `0.0`.
-The sidecar logged `audio capture stream '…-cap' (node 86) is linked to loopback output
-node 355` — i.e. the tap, not the microphone. `Why noise and not a tone:` a 440 Hz sine
-reproduced ~100 ms late by the viewer phase-cancels against the original unpredictably
-(measurements swung between +5.8 dB and −3.6 dB); two decorrelated noise copies add in
-power, which is monotonic and reproducible to 0.01 dB.
-
-### Freshness investigation (2026-07-28)
-
-Owner report: *"the Audio source dropdown should update more often (at least, when i open
-it, but also periodically maybe)? Right now, when an audio source appears, after opening
-the page, it doesn't reflect that (entry missing)."*
-
-Investigated the whole path end to end rather than trusting a static read:
-
-- **`audio::list_audio_sources`** (`src/audio.rs`) shells out to `pw-dump` fresh on every
-  call — no cache, no memoization, nothing built once at startup. Verified live: started
-  the sidecar once, queried `list_audio_sources` (baseline: 3 real apps), then — without
-  restarting the sidecar — launched a throwaway `gst-launch-1.0 audiotestsrc ! audioconvert
-  ! pipewiresink client-name=claude-test-new-source` and queried again on the *same running
-  process*. The new node appeared immediately, correctly excluded PipeWire `Client` objects
-  that carry lookalike `media.class` props but aren't `PipeWire:Interface:Node` (a red
-  herring hit mid-investigation — a `pw-dump` skim without the `obj_type` filter makes it
-  look like a node is missing when it's actually a non-node object correctly skipped).
-- **`commands::list_audio_sources`** and **`api_server.rs`'s `/command/list_audio_sources`**
-  (the real Electron-shell transport, per this doc's "Electron migration" note above) both
-  call straight into the same function, `.await`ed fresh per request — no caching layer at
-  the Tauri-command or HTTP-dispatch level either.
-- **`components.js`'s `addAudioRow`** already re-invokes `onRefreshAudioSources` and rebuilds
-  the `<select>` from the fresh result on every "+ Add audio" click — see the `Why` comment
-  right above it, which documents a *previous* bug (a stale closure over the mock-data array)
-  already fixed before this pass.
-
-**Conclusion: no caching/staleness bug found anywhere in the current on-open path** —
-backend, Tauri IPC, HTTP/Electron IPC, and frontend all re-query live on every open, verified
-against real `pw-dump` output, not assumed from source alone. The core "when I open it"
-behavior the owner asked for was already correct.
-
-**What was missing, and what shipped:** the owner also asked for it to refresh *while the
-picker stays open* ("periodically maybe"), which nothing implemented — the list was fetched
-once per open, not while idling open afterward. Added periodic polling to `addAudioRow`
-(`components.js`): a 5s `setInterval`, started when the picker opens, that re-calls
-`onRefreshAudioSources` and rebuilds the `<select>` (preserving the current selection if it's
-still present in the fresh list). Stops itself once the picker is hidden/torn out of the DOM
-(`picker.isConnected` check) or once "Share" is clicked — same self-stopping `isConnected`
-pattern `statusBadge`'s degraded-elapsed-time ticker already uses in this file, since this
-codebase's render paths have no uniform unmount hook to call a `.destroy()` from instead.
-
-### Room-detail panel's Audio section removed; real "Auto-Connect" (join room on app
-startup) added (2026-07-28, corrected)
-
-**This replaces an earlier, wrong version of this same entry.** A previous pass
-misread the owner's request and wired "Auto-Connect" to mean "auto-start audio sharing"
-— checking it called `startPanelAudioShare` for whichever source was selected in the
-panel's own room-scoped Audio picker (a source `<select>` fixed to whichever room the
-panel was open for, duplicating `fetchPanelAudioSources`/`startPanelAudioShare`
-independently of `stream-control.js`'s destination-card audio row). The owner's actual
-correction: *"The Auto Connect wasnt supposed to be for the Audio. It was supposed to
-be for connecting to the room on startup. The Audio part in the room settings makes no
-sense, remove it."*
-
-**What shipped instead:**
-
-1. **The whole AUDIO section is gone** — the source dropdown, the "No audio sources
-   found" fallback, and the old (wrongly-wired) checkbox, all removed from
-   `renderRoomPanel` (`shell.js`). Also removed as now-dead: `panelAudioSources`/
-   `panelAudioSourceId`/`panelAudioAutoConnect` (module-level state) and
-   `fetchPanelAudioSources`/`startPanelAudioShare` (their fetch/select/start helpers) —
-   nothing else in `shell.js` referenced them. Audio sharing for a room is already
-   reachable one tab over, on the video destination's own card in Stream Control (the
-   "+ Add audio" row) — a second, room-scoped audio picker living in this panel was
-   redundant even before the miswiring bug, so nothing replaces it here.
-2. **A real "Auto-Connect" checkbox** — persisted per saved room, meaning what the name
-   says: join this room automatically the next time the app starts, independent of
-   whatever happened to be connected when it last closed. Lives in the room-detail
-   panel's "Room name" section (next to the rename row), reusing the same
-   `.room-panel-checkbox-input`/`.room-panel-checkbox-box`/`.room-panel-autoconnect-row`
-   visual treatment the old (removed) audio checkbox used — same custom-checkbox styling
-   in `shell.css`, just re-pointed at a real feature instead of recreated. The
-   audio-row-specific CSS (`.room-panel-audio-row` and its `.dd` fit rule) and the
-   `-disabled` checkbox-row variant (the new checkbox is never disabled) were deleted as
-   dead; the checkbox classes themselves were kept and reused.
-
-**Backend (new):**
-
-- `rooms::SavedRoom` (`src/rooms.rs`) gained `auto_connect: bool`
-  (`#[serde(default)]`, so a `rooms.toml` written before this field existed still
-  parses, defaulting to `false`). `RoomStore::set_auto_connect(join_string, value)` sets
-  it for the matching saved room (no-op, not an error, if the join string isn't saved —
-  mirrors `name_for`'s "miss stays a miss" contract).
-- `AppState::set_room_auto_connect` (`src/session.rs`) calls that and persists
-  (`room_store.save()`), same load/set/save shape as `rename_saved_room`.
-- New Tauri command `set_room_auto_connect(join_string, auto_connect)`
-  (`src-tauri/src/commands.rs`), registered in **both** dispatch surfaces —
-  `main.rs`'s `tauri::generate_handler!` list (native Tauri IPC) and
-  `api_server.rs`'s `dispatch()` match (the Electron-migration REST bridge every real
-  run of this app actually goes through, see that module's doc). Missing the second
-  registration was caught during this task's own real-backend verification pass (see
-  below) — the frontend's `invoke()` call resolved to `{"error":"unknown command
-  \`set_room_auto_connect\`"}` until both were added.
-- `dto::SavedRoomRow` gained `auto_connect: bool`, populated from `SavedRoom::
-  auto_connect` in `saved_room_rows()` (`false` for the "live room with no saved entry
-  yet" synthesized rows, which have no `SavedRoom` to read it from).
-- **Startup auto-connect:** `AppState` gained `auto_connect_queue: Vec<String>` — a
-  queue, not "just call `start_connect` once per flagged room in `.setup()`", because
-  `pending_connect` is a single slot (one in-flight connect at a time); firing several
-  `start_connect`s back-to-back at startup would silently overwrite/orphan every one but
-  the last (its `oneshot` result arrives with nothing left to read it, and the room —
-  even on a successful handshake — never makes it into `self.rooms`). `main.rs`'s
-  `.setup()` now enqueues every saved room with `auto_connect == true`; the driver's
-  tick loop (`driver.rs`) calls the new `AppState::poll_auto_connect_queue()` right
-  before `poll_connect_result()` each tick, which drains one queued join string into
-  `pending_connect` whenever that slot is free — so a startup batch of auto-connect
-  rooms joins one at a time as each previous one resolves, not all at once.
-- `AppState::default()` was confirmed (by reading it, not assumed) to start `rooms`
-  empty and reconnect nothing on its own — there was no pre-existing "resume whatever
-  was connected last session" mechanism to hook into or conflict with. This flag is the
-  only thing that makes a saved room rejoin itself at launch.
-
-**Verified against the real app, not the mock/browser branch** (per this task's
-explicit instruction): `cargo build --lib -p simple-screensharing-client`,
-`cargo build -p simple-screensharing-client-tauri`, and `cargo test -p
-simple-screensharing-client --lib` (157 passed, 0 failed, up from 153 — 4 new
-`rooms::tests` covering `set_auto_connect`'s found/not-found cases and the legacy-TOML
-default) all pass. `node --check frontend/scripts/shell.js` passes.
-
-Live verification ran the real sidecar binary (`target/debug/
-simple-screensharing-client-tauri`, the exact binary Electron spawns) directly against
-its real REST `api_server` — driven with `curl` using the printed `API_TOKEN`/
-`API_PORT`, the same transport `electron/preload.js` bridges every `invoke()` call
-through — with `XDG_CONFIG_HOME` pointed at an isolated scratch dir (never touching the
-shared `~/.config/simple-screensharing/rooms.toml` this machine's other live sessions
-use) and a real join string against the project's already-running relay server on
-`127.0.0.1:4433`:
-
-1. `list_saved_rooms` showed the seeded room with `auto_connect: false`.
-2. `set_room_auto_connect` (join_string, true) returned success; `list_saved_rooms`
-   immediately reflected `auto_connect: true`, and the on-disk `rooms.toml` in the
-   isolated config dir showed `auto_connect = true` — the persistence round-trip.
-3. Killed the sidecar and started a fresh instance against the same config dir (a real
-   cold restart, not a simulated one) with two saved rooms, one `auto_connect = true`
-   (`AutoVerify`) and one `false` (`NotAuto`). The very first `list_saved_rooms` poll
-   after the new process came up showed `AutoVerify` already `state: "joined"` — reached
-   with zero manual `join_room` calls from the test — while `NotAuto` stayed
-   `"disconnected"`. This is the actual startup-auto-connect behavior working, not just
-   the flag persisting.
-
-An attempted GUI (mouse-driven, screenshot) pass through the real Electron app was
-started but abandoned: the test desktop turned out to be actively shared with other
-concurrent agents' sessions (windows tiling across the same free monitors, a shared
-`~/.config/simple-screensharing/rooms.toml` another agent was concurrently writing to),
-and a stray click during window-position discovery corresponded with this task's own
-sidecar process receiving `SIGTERM` from something outside this task's control. Given
-that, further mouse automation was judged too likely to interfere with other agents'
-in-flight work and was dropped in favor of the direct-REST verification above, which
-exercises the identical real backend/command surface the GUI would have, without the
-shared-desktop risk. The AUDIO section's removal and the new checkbox's presence/wiring
-were confirmed by code inspection instead (`grep` across `shell.js` turns up zero
-remaining references to any of the removed audio-panel identifiers or CSS classes).
-
-### Room-detail panel: title is now click-to-edit, the separate "ROOM NAME" section is gone (2026-07-28)
-
-Owner request: *"when the room settings are open, just let me click the title, to edit the
-name. Looks cleaner."* The panel used to show the room name twice — once as a plain,
-non-interactive `.room-panel-title` span in the header, and again in a dedicated "ROOM
-NAME" section further down the body (its own label, a pre-filled `<input>`, and a "Save"
-button calling `renamePanelRoom`). The second section is now gone; the header title itself
-is the editor.
-
-`shell.js`'s `renderRoomPanel` (~line 606) now calls a new `renderRoomPanelTitle(room)`
-helper (defined just above `renderRoomPanel`) instead of building the plain title span
-inline. Clicking the title swaps it for a text `<input>` pre-filled with the current name,
-in the same header slot (`.room-panel-title-wrap`). Commit/cancel behavior:
-
-- **Enter** commits — calls `renamePanelRoom(room.join_string, <trimmed value>)`, same as
-  the old "Save" button did.
-- **Escape** reverts without saving (re-renders the panel, discarding the edit).
-- **Blur** (clicking away) also commits.
-
-`Why blur commits rather than discards:` the task explicitly left this an open call, with
-a lean toward "saving on blur is the friendlier default since users often click away
-expecting their edit to stick." Went with that — Escape is the one deliberate
-discard-and-revert path; clicking away is treated as "done editing," not "abandon this."
-A `settled` flag inside the closure makes sure only one of commit/cancel actually fires
-even though Enter's keydown handler and the input's blur handler can both observe the same
-interaction (Enter itself doesn't reliably blur the input first).
-
-The privacy note ("Only you see this name. It never leaves your machine.") that used to be
-a permanent fixture under the old section now only renders while the title is actively
-being edited (`.room-panel-title-privacy-note`, appended next to the input) — not shown at
-rest, keeping the header clean per the "looks cleaner" ask, without dropping the
-disclosure itself. The underlying claim was re-verified against `rename_saved_room`
-(`src/session.rs`): it only touches the local `RoomStore` file
-(`room_store.upsert` + `.save()`), never sends the new name over the wire.
-
-Styling: hover/focus affordance on the title reuses `var(--wash-hover-1)`, the same
-hover-highlight token `.btn-secondary`/`.btn-icon`/`.room-row` already use elsewhere in
-this file, so clickable-title behavior reads as part of the same visual language rather
-than a one-off. New classes: `.room-panel-title-wrap`, `.room-panel-title-input`,
-`.room-panel-title-privacy-note` (`shell.css`); the old `.room-panel-rename-row` rule was
-deleted (dead now that the "ROOM NAME" section is gone), `.room-panel-privacy-note` itself
-was kept since the new title editor still uses it.
-
-**Verified:** `node --check frontend/scripts/shell.js` passes. Two verification passes:
-
-1. Mock-mode pass (`frontend/index.html` loaded directly in a browser, no Tauri backend,
-   `window.__TAURI__` undefined so `renamePanelRoom` takes the mock branch): opened a
-   room's side panel, clicked the title, confirmed it became an input pre-filled with the
-   current name, typed a new name and pressed Enter (title updated, sidebar room row
-   updated too), reopened the editor and clicked away to blur (also committed), reopened
-   once more and pressed Escape (reverted, no save) — all four outcomes matched the
-   behavior described above.
-2. **Real-backend pass** (the one that actually matters for shipping this): built this
-   worktree's sidecar (`cargo build -p simple-screensharing-client-tauri`), launched the
-   real Electron shell against it with `XDG_CONFIG_HOME` pointed at an isolated scratch
-   dir (so it could never touch the real `~/.config/simple-screensharing/rooms.toml` a
-   live session elsewhere on the machine might be using), joined a real room against the
-   project's already-running relay server on `127.0.0.1:4433`, opened its panel, clicked
-   the title, typed a new name, pressed Enter, and confirmed the rename round-tripped
-   through the real `rename_room` Tauri command all the way to disk — the on-disk
-   `rooms.toml` in the isolated config dir showed `name = "Renamed For Real"` after the
-   edit, not just an in-memory/mock state change.
-
----
-
-### Sidebar ROOMS list: inline member/LIVE tree replaces "{count} active", LIVE badge styling, disconnected-dot size fix (2026-07-28)
-
-Three owner requests against the sidebar ROOMS list (`frontend/scripts/components.js`'s
-`renderRoomRow`, `frontend/styles/shell.css`).
-
-**Member/LIVE tree.** The room row's meta slot used to show a `"{count} active"` summary
-for joined rooms. It's now removed (joined falls through to the same "—" default the
-`reconnecting` state already used) and replaced with an always-visible tree below the row:
-one indented line per current member (`- <display_name>`), with a `[LIVE]` pill next to any
-member who owns a stream. "Owns a stream" reuses the exact same per-stream roster
-`renderRoomPanelStreamRow` (`shell.js`) already reads for the room-detail panel's "Live
-streams" section — `room.streams` (every announced stream, `{owner, stream_id, kind, ...}`,
-populated by `loadRoomMembers` from `room_detail`) tested against each member's `conn_id` —
-not re-derived. New markup: `.room-member-tree` / `.room-member-tree-row` /
-`.room-member-tree-name` (`shell.css`).
-
-`Why:` (data-fetch tradeoff) `list_saved_rooms` (`dto::SavedRoomRow`) doesn't inline a
-roster, so `room.members`/`room.streams` only existed for whichever single room's
-detail panel happened to be open (`loadRoomMembers`, fetch-on-open). Showing the tree for
-*every visible joined room* in the sidebar needed a real behavior change:
-`shell.js`'s `refreshRooms()` now calls `loadRoomMembers` (one `room_detail` round-trip)
-for every joined room in parallel, not just the open panel's room, on every refresh —
-including on `presence-updated`, which fires routinely. Accepted rather than adding a
-cheaper "roster summary" DTO/command: this app's room/member counts are small (a friends
-screensharing app), so the added chatter is a handful of extra calls per refresh, not a
-scaling risk. Revisit if room/member counts ever grow enough for this to show up as
-actual latency.
-
-**LIVE badge styling.** Owner: match the "Stop" destination-card button's pill shape/
-weight (`.btn.btn-danger.dest-action-btn`: `padding: 3px 8px`, `border-radius:
-var(--rounding-md)`, danger-colored outline border + text — see `stream-control.css`'s
-`.dest-action-btn` and `shell.css`'s `.btn-danger`), but with a dot + "LIVE" text instead
-of an icon + "Stop" label. New classes `.room-member-live-badge` / `.room-member-live-dot`
-(`shell.css`) copy that padding/radius/border treatment. Color: a **genuine red dot**
-(`var(--danger)`), not this app's usual green `--success` "live" family
-(`.status-dot-joined`/`.status-badge-live`, `status.css`) — the owner's "with a red dot"
-instruction was explicit about wanting red for this specific element, so it's taken
-literally rather than folded into the green convention.
-
-**Disconnected-dot size fix.** `.status-dot-disconnected` used to override `width`/`height`
-to `calc(var(--dot-size) - 3px)` — 3px smaller than `.status-dot-joined`/
-`.status-dot-reconnecting`, which both render at the full `var(--dot-size)`. That override
-is now removed; the disconnected dot keeps its existing hollow-ring look (`background:
-transparent; border: 1.5px solid var(--text-faint)`) but at the same size as every other
-status dot. Confirmed by screenshot comparison (mock mode) that this was the entire cause
-of the size mismatch — no separate icon/glyph was involved.
-
-**Verified:** `node --check` on `components.js`/`shell.js` passes. No backend/Rust files
-were touched (the member/stream data was already surfaced via the existing `room_detail`
-command through `loadRoomMembers`), so no `cargo build`/`cargo test` pass was needed for
-this change. Ran the app in mock mode (`frontend/index.html` served statically, no Tauri
-backend, driven with Playwright — `window.__TAURI__` undefined) with an enriched
-Gaming Night mock entry (3 members, 2 concurrently live) added alongside Movie Night's
-existing single-member/single-stream entry specifically to exercise a multi-member,
-mixed-LIVE tree. Screenshots confirmed: the ROOMS list shows the member tree with `[LIVE]`
-pills instead of "N active" text; the pills render as small red-outline pills with a red
-dot, matching the "Stop" button's pill weight; and the "Old Room" (disconnected) status dot
-is now the same size as the joined/reconnecting dots. Test window stayed off `HDMI-A-1`
-(confirmed free monitors via `xrandr --listmonitors` first, per this session's safety
-constraint) — a Playwright-driven static-file view has no on-screen window placement to
-begin with, but the constraint was checked before starting regardless.
-
----
-
-### Investigated: "Streaming Audio doesn't work anymore" report; fixed "+ Add audio" being unreachable on a staged card (2026-07-29)
-
-Owner report: audio sharing, previously working, stopped working. Investigated the whole
-real (non-mock) chain rather than guessing from the day's changelog:
-
-- **Dispatch registration** — `start_audio_share`/`select_audio_source` are present, with
-  matching arg names, in both `src-tauri/src/main.rs`'s `generate_handler!` list and
-  `api_server.rs`'s REST dispatch table. Not the "registered in one but not the other"
-  class of bug that hit `set_room_auto_connect` earlier this session.
-- **The resolution/GPU-encoding `go_live`/`add_destination` fix (`b0394bb`, this session)
-  does not touch the audio path at all** — `add_destination_with_params` bails out early
-  (`if capture.kind != StreamKind::Video { return; }`) before it ever reaches the
-  `handle.source_caps()` call that fix added, and `start_audio_share` (`session.rs`) is a
-  wholly separate code path that never calls `add_destination`/`go_live`. Confirmed by
-  reading, not assumed.
-- **`src/audio.rs` has had zero functional changes** since `e8d8385` (the "it was
-  broadcasting the microphone, not the app" fix earlier this session) — only a test-only
-  `volume=0.02` tweak (`47b0e2d`). The capture/link/announce pipeline itself is untouched.
-- **Real-hardware proof the pipeline itself still works:** ran
-  `end_to_end_test::watching_video_automatically_delivers_the_sharers_audio_too` (real
-  relay, real capture, real PipeWire loopback+link, real Opus decode) — passed, with real
-  audio flowing (sender capture level 0.366, viewer received 4 Opus packets). Separately,
-  drove the real Electron app + real built sidecar with Playwright's `_electron` driver,
-  calling `select_audio_source`/`start_audio_share` against a real running application
-  (TeamSpeak) exactly as the frontend does: reached `state: "live"` within ~1s, no error.
-  **The backend audio-sharing chain is not regressed.**
-- **The actual regression: an unreachable UI entry point.** This session's "Go live"
-  staging redesign (`a4be944`) made a fresh screen share land in a **staged** card (no
-  destination yet) instead of going live immediately, and — in the same commit —
-  `components.js`'s `destinationCard` was written to skip the audio row entirely while
-  `opts.staged` is true, with the reasoning "audio attaches to a room, and a staged card
-  doesn't have one until Go live picks it." That reasoning doesn't hold: a staged card's
-  own Room picker (`stream-control.js`'s `getStagedEdit().roomHandle`, defaulted to the
-  first joined room, changeable via `onStagedRoomChange`) already resolves the exact
-  `room_handle` "Go live" itself sends — nothing about it is unavailable pre-Go-live. The
-  practical effect: since `a4be944` landed, **"+ Add audio" doesn't exist anywhere in the
-  UI from the moment a share starts until "Go live" is pressed** — not disabled, not
-  hidden-with-a-hint, just structurally absent. A user used to attaching audio as part of
-  starting a share (the pre-staging-redesign flow) hits a wall with no visible affordance
-  and no error, which reads exactly as "audio sharing doesn't work anymore." Confirmed by
-  loading the real (mock-data) UI in a browser and staging a fresh share: the resulting
-  card showed Resolution/Framerate/Bitrate/Room/Preset/Framerate/Advanced tuning/Go
-  live/Cancel — no audio row of any kind. This is a legitimate mock-data check per this
-  project's testing policy: it's pure DOM/CSS structure, not real Tauri/backend behavior.
-
-**Fix (`frontend/scripts/components.js`, `frontend/scripts/stream-control.js`):**
-
-- `destinationCard`'s audio-row block now renders for `dest.kind !== "audio"` unconditionally
-  (dropped the `&& !opts.staged` exclusion) — a staged card gets the same "No audio
-  attached" / "+ Add audio" / attached-audio row a live card does.
-- `stream-control.js`'s `stagedCardEl` now looks up any audio already paired to the staged
-  capture (`mockDestinations.find(d => d.kind === "audio" && d.paired_capture_id ===
-  staged.capture_id)` — no room match needed, unlike the live-card lookup, since a staged
-  capture has exactly one room, not a fan-out set) and passes a staged-specific
-  `onAddAudio: (d, source) => startAudioShare(edit.roomHandle, source, d.capture_id)` —
-  using the staged card's own Room-picker value, not a `dest.room_handle` field a staged
-  capture's DTO (`StagedCaptureRow`) doesn't have. `onAudioMute`/`onAudioStop`/
-  `onRefreshAudioSources` are reused unchanged (they operate on capture/destination ids,
-  identical either way). No backend/Rust change was needed — `start_audio_share`
-  (`session.rs`) already accepted any valid `room_handle` + optional `for_capture_id`; the
-  only gap was the frontend never calling it from a staged card at all.
-
-**Height (the separate, already-diagnosed styling ask):** the staged card's "+ Add audio"
-now needs to read at the same deliberate size as its "Go live"/"Cancel" (`.dest-actions-
-staged .dest-action-btn`, bumped to a measured 32px tall earlier this session), not the
-small routine-button sizing `.dest-chip-add-btn` uses on a live card (measured 26px — a
-live card already has Transfer/Stop for its "routine" affordances, so a small audio button
-there doesn't read as under-weighted the way it would on a staged card, which has nothing
-else routine to compare against). Added `.dest-audio-add-btn-staged` (new modifier class,
-applied only when `opts.staged`, mirroring the existing `.dest-actions-staged .dest-action-
-btn` scoped-modifier pattern rather than changing `.dest-chip-add-btn`/`.dest-audio-add-btn`
-globally, which live cards also use): `padding: 6px 14px 6px 12px; font-size: 14px;
-font-weight: 700`. Landed on those numbers by measuring the *real rendered* height
-(`getBoundingClientRect().height`) after each attempt rather than trusting the padding math
-— a first pass at `padding: 7px …` measured 34px, not 32px, confirming this session's
-existing lesson (font-size changes line-height in ways padding numbers alone don't
-predict) applies here too. Final measurement: staged "+ Add audio" is exactly 32px,
-matching `.dest-go-live-btn`; the live-card "+ Add audio" is untouched at 26px.
-
-**Verified:**
-
-- `cargo build --lib -p simple-screensharing-client` and `cargo build -p
-  simple-screensharing-client-tauri` pass (no Rust changed, but confirmed clean).
-- `cargo test -p simple-screensharing-client --lib`: 160 passed, 0 failed, 15 ignored — no
-  regressions.
-- `cargo test -p simple-screensharing-client --lib -- --ignored`, including
-  `watching_video_automatically_delivers_the_sharers_audio_too` (real audio flowing, see
-  above): all pass.
-- `node --check` on both touched JS files passes.
-- Real-app pass (Playwright `_electron` driver against the real built sidecar + a real
-  running relay, `xrandr --listmonitors` checked first per this session's HDMI-safety
-  rule, window confirmed off `HDMI-A-1`): `select_audio_source`/`start_audio_share` against
-  a real running application reached `state: "live"` in under 1.5s with no error — the
-  exact backend call the fixed staged-card button now makes.
-- Mock-data browser pass (legitimate for this pure-DOM/CSS half of the change, per this
-  project's testing policy): staged a fresh share, confirmed "+ Add audio" now renders on
-  it, measured its height at 32px against `.dest-go-live-btn`'s 32px — exact match — and
-  confirmed the live-card instance is unaffected (still 26px).
-- Driving an actual staged **video** capture through the real portal consent flow (rather
-  than mock data) to click-test the fixed button end-to-end was not attempted: `xdg-
-  desktop-portal`'s `ScreenCast` picker is a native, interactive system dialog outside
-  Playwright's Electron driver's reach (this codebase's own real-hardware Rust tests work
-  around this with a `videotestsrc`-backed test-only capture seam,
-  `capture::start_sharing_from_test_source`, which has no exposed Tauri command). The
-  real-app coverage above exercises the exact same `start_audio_share` backend call the
-  button makes (proven working with real hardware), and the frontend wiring change is a
-  parameter substitution into that same already-real-verified call — not a new code path.
-
-### Follow-up same day: the picker was reachable but "Share" silently no-op'd — a `String`/`Number` mismatch in the dropdown value compare (2026-07-29)
-
-The fix above made "+ Add audio" **reachable**; it did not make it **work**. Next owner
-report, seconds after confirming the picker opened: *"Pressing the Share button just does
-nothing right now"* — a source ("Floorp") visibly selected in the dropdown, no error, no
-loading state, no card change, on a **live** card (staged not yet confirmed broken/working
-at report time).
-
-**Root cause, confirmed by reading before touching anything:** `dto::AudioSourceDto.id` is
-`u32` (`src-tauri/src/dto.rs`) — it round-trips through Tauri/REST JSON as a JS `Number`,
-never a string. `Components.dropdown()`'s `.value` getter (`components.js`) returns
-`currentValue` **raw, unstringified** — it's set from `o.value` (`= s.id`, a `Number`) the
-instant an option is clicked. `addAudioRow`'s "Share" button handler compared:
-
-```js
-const source = sources.find((s) => String(s.id) === select.value);
-```
-
-`String(262) === 262` is `false` — always, for every real source, since `s.id` is a `Number`
-on both sides of the `===` and only one side went through `String(...)`. `source` was
-therefore always `undefined`, the bare `if (source) handlers.onAddAudio && …` guard silently
-did nothing (no `try/catch`, no error path exists there at all), and `stopAudioSourcePolling()`
-still ran — so the picker just closed with no observable effect, exactly matching "Share does
-nothing." This is the same shape of bug this project has hit before with loose `===` across a
-serialization boundary — see `dropdown()`'s own `findOption` (`String(o.value) === String(v)`,
-both sides stringified), which is what the *rendering* path already did correctly; the Share
-handler was the one caller that didn't follow that pattern.
-
-**Both card types were equally broken** — `addAudioRow` is one shared implementation for
-staged and live cards, so this wasn't staged-vs-live at all (unlike the "unreachable" bug
-above, which genuinely was staged-only). The owner's report happened to be on a live card
-first; testing confirmed the staged card was identically broken before the fix and identically
-fixed after.
-
-**Fix (`frontend/scripts/components.js`, one line):**
-
-```js
-const source = sources.find((s) => String(s.id) === String(select.value));
-```
-
-Matches `dropdown()`'s own `findOption` convention: stringify both sides of an id compare that
-crosses a JSON-serialization boundary, never just one.
-
-**Verified — real Electron + real built sidecar, Playwright `_electron` driver, per this
-project's testing policy (not mock/browser):** staged a real capture (real `xdg-desktop-portal`
-consent already granted from earlier in this session, so the picker reached a real `READY`
-card with no portal prompt needed this run), used "+ Add audio," selected the real,
-already-running **Floorp** browser (per the owner's explicit instruction — no synthetic
-beep/tone) from the real `list_audio_sources` result, clicked "Share":
-- **Staged card:** row correctly went from "No audio attached" to a live "Floorp / Mute /
-  Stop" row.
-- **Live card** (staged the same capture, pressed "Go live" first, then repeated the same
-  "+ Add audio" → select Floorp → Share flow): same correct result, "Floorp / Mute / Stop"
-  row appeared on the live destination card.
-- One earlier attempt (staged card, first try) showed the picker collapsing back to "No audio
-  attached" with a too-short 1.5s wait after the click — not a repeat of this bug: the backend
-  call (`select_audio_source` → `start_audio_share`) genuinely takes a variable amount of time
-  to bring the real PipeWire capture up, and the frontend UI update, in the real branch, relies
-  entirely on the backend's `destination-state-changed` event round-trip (`startAudioShare`'s
-  real branch calls no `render()` of its own — unlike `setAudioShareMuted` right below it in the
-  same file, which does). A longer wait on the retry showed the row appear correctly. Worth
-  a future look if the owner reports the row taking a visibly long time to appear after
-  "Share," but it did not reproduce the "does nothing at all, ever" symptom this task was
-  scoped to — that was the `String`/`Number` compare above, and it's fixed.
-- `cargo build --lib -p simple-screensharing-client`: passes (no Rust touched).
-- `cargo test -p simple-screensharing-client --lib`: 160 passed, 0 failed, 15 ignored — no
-  regressions.
-- `node --check` on the touched file passes.
-
-### Follow-up same day: live cards' "Stop"/"Share" were still small — the staged-vs-live size distinction removed entirely (2026-07-29)
-
-Owner, from a screenshot of a running/live share's card: *"For a running stream, the 'Share'
-and 'Stop' buttons are still too small."* Earlier the same day, only the **staged** card's
-"Go live"/"Cancel" (`.dest-actions-staged .dest-action-btn`) and "+ Add audio"
-(`.dest-audio-add-btn-staged`) were bumped to a measured 32px — the live card's equivalent
-"routine" buttons (Transfer/Stop, sharing `.dest-action-btn`'s base rule; and the audio
-picker's "Share" confirm, `.dest-audio-share-btn`) were deliberately left at the smaller
-~22px size on the theory that a live card already has other "routine" actions to compare
-against, so a small button there wouldn't read as under-weighted. The owner's report is
-direct evidence that theory didn't hold in practice.
-
-**Approach chosen: base-class bump, not a new `-live` modifier.** `.dest-action-btn` is used
-at exactly four call sites — staged "Go live"/"Cancel" and live "Transfer"/"Stop"
-(`components.js`'s `destinationCard`, ~line 1417-1444) — confirmed by grepping every use
-before touching anything. `.dest-audio-share-btn` is used at exactly one call site (the
-audio picker's "Share" button, `addAudioRow`, staged and live alike), with the `-staged`
-modifier conditionally added only for staged cards. Since the owner now wants **all** of
-these at the same size, there is no longer a live-only "small/routine" tier left to
-preserve, so the cleanest fix was to bump the base rules themselves to the values the
-`-staged` modifiers used to carry, and delete those modifiers as redundant rather than add
-a parallel `-live` variant next to them:
-
-```css
-.dest-action-btn {
-  padding: 6px 22px;
-  height: auto;
-  font-size: 14px;
-  font-weight: 700;
-}
-.dest-audio-share-btn {
-  padding: 6px 22px;
-  height: auto;
-  font-size: 14px;
-  font-weight: 700;
-}
-```
-
-`.dest-actions-staged .dest-action-btn` and `.dest-audio-share-btn-staged` were removed from
-`stream-control.css`; `components.js`'s conditional `+ " dest-audio-share-btn-staged"` on the
-Share button's `className` was removed too (now just `"dest-audio-share-btn"` unconditionally
-— nothing in the DOM changes between staged and live for this button any more). `.dest-actions-
-staged` itself is kept as a class on the staged row (in case future staged-only layout rules
-want it) but no longer changes any button's size.
-
-**"+ Add audio" (the dashed affordance, not the Share confirm) was deliberately left alone.**
-The owner's report named "Share" and "Stop" specifically, not this button, and it didn't look
-visibly mismatched next to the now-bigger Stop in a real screenshot — it sits in its own row
-(the audio row, next to "No audio attached"/the attached-audio state), not directly beside
-Stop in the same row, so the size difference doesn't read as jarring the way Stop/Share
-themselves did sitting directly in the button row. `.dest-audio-add-btn-staged` (the staged
-card's already-bumped version, from the block above) is untouched.
-
-**Superseded later the same day — see "Full sweep" below.** This "left alone" call turned out
-to be about the wrong buttons: the owner's next screenshot was of the audio row's own
-Mute/Stop (`.dest-audio-mute`/`.dest-audio-stop`), not this "+ Add audio" chip, and came with
-an explicit "all of them" instruction that closed off further per-button judgment calls on
-this tab.
-
-**Measured (real Electron + real built sidecar + a real local relay server, Playwright
-`_electron` driver, `getBoundingClientRect()` — not assumed from padding math, per this
-session's own recurring lesson that font-size changes line-height non-obviously):**
-
-| Button | Before | After |
-| --- | --- | --- |
-| Live "Stop" | 43.7×22 px | 78.7×32 px |
-| Live "Share" (audio picker confirm) | 49.6×22 px | 86.2×32 px |
-| Staged "Go live" (unaffected, sanity check) | 93.0×32 px | 93.0×32 px |
-| Staged "Cancel" (unaffected, sanity check) | 93.9×32 px | 93.9×32 px |
-| Staged "+ Add audio" (unaffected, sanity check) | 107.5×32 px | 107.5×32 px |
-
-"Transfer" shares `.dest-action-btn` with "Stop" (same call-site class), so it grows
-identically — not a separate decision, per the class audit above; not separately measured
-since a second joined room is needed to render it at all and the class is proven identical.
-
-**Verified — real app, not mock/browser:** `xrandr --listmonitors` checked first (DP-1/2/3
-free, HDMI-A-1 untouched — window placed at DP-1's `50,50` and bounds confirmed in-range).
-Built this worktree's own sidecar (`cargo build -p simple-screensharing-client-tauri`),
-spawned a real local relay (`simple-screensharing-server`'s prebuilt binary, headless via the
-same `setsid script -qc ...` wrapper the Rust `end_to_end_test.rs` harness uses, an isolated
-`XDG_CONFIG_HOME` scratch dir so it never touched the shared `rooms.toml`), and drove the real
-Electron app with Playwright's `_electron` driver: joined a real room over that relay
-(`join_room` invoked directly, bypassing the join form), staged a real capture via "Share
-another screen" (real `xdg-desktop-portal` consent resolved non-interactively, as it did
-earlier this session), selected the room, clicked "Go live" to get a genuinely `live`-state
-destination card, then measured Stop/Share both **before** this change (`git stash` to the
-pre-edit tree) and **after** (`git stash pop`) in separate runs against the same real flow —
-table above. Screenshots of both card types confirmed visually: the live card's Stop/Share
-now read at the same weight as the staged card's Go live/Cancel/+ Add audio, and the staged
-card itself is pixel-identical to before (no regression from removing its now-redundant
-`-staged` modifier rules). `node --check` on both touched files passes.
-
-### Full sweep: the audio row's own Mute/Stop, and an exhaustive audit of every button on the tab (2026-07-29)
-
-Owner, from a screenshot of the audio row next to "Floorp": *"Mute" and "Stop" are visibly
-too small next to 'Floorp' (a real audio source). Make sure that all of the buttons on this
-page have the same height as the ones in 'CREATE / JOIN A ROOM' (32px tall, to be very clear
-about this!) Make sure to apply this to all of them (including for the Stream 'Go live' and
-'Stop').* Explicit "all of them" — no further per-button judgment calls, full sweep of every
-button-like element reachable from the Stream Control tab's render tree
-(`stream-control.js`/`components.js`).
-
-**The actual bug: `.dest-audio-mute`/`.dest-audio-stop` were never touched by the two earlier
-2026-07-29 passes above** — both of those bumped `.dest-action-btn` (Go live/Cancel/Transfer/
-Stop) and `.dest-audio-share-btn` (the audio picker's "Share" confirm) to 32px, but the
-*attached-audio row's* own Mute/Stop buttons (rendered by `audioAttachedRow` in
-`components.js`, ~line 1487) still carried their original small sizing (`padding: 3px 0`/
-`3px 8px`, `font-size: 11px`) — exactly what the owner's screenshot showed, ~22px tall next to
-32px-tall siblings.
-
-**Fix — same recipe as `.dest-action-btn`/`.dest-audio-share-btn`:**
-
-```css
-.dest-audio-mute {
-  flex: 0 0 auto;
-  width: 76px;       /* was 64px — widened to fit "Unmute" at the larger font */
-  padding: 6px 0;     /* was 3px 0 */
-  height: auto;
-  font-size: 14px;    /* was 11px */
-  text-align: center;
-}
-.dest-audio-stop {
-  flex: 0 0 auto;
-  padding: 6px 22px;  /* was 3px 8px */
-  height: auto;
-  font-size: 14px;    /* was 11px */
-}
-```
-
-**Exhaustive audit of every button-like element on the tab** (every `primaryButton`/
-`secondaryButton`/`dangerButton`/raw `<button>` reachable from `stream-control.js`'s render
-tree, cross-checked against `stream-control.css`):
-
-| Class | Where | Before | After | Verdict |
-| --- | --- | --- | --- | --- |
-| `.dest-go-live-btn` (`.dest-action-btn`) | staged card "Go live" | 32px | 32px | already correct |
-| `.dest-action-btn` (danger) | staged card "Cancel" | 32px | 32px | already correct |
-| `.dest-action-btn` (danger) | live card "Stop" | 32px | 32px | already correct |
-| `.dest-action-btn` (secondary) | live card "Transfer" | — | — | same call-site class as Stop; not separately re-rendered this pass (needs a 2nd joined room), proven identical by class audit, not re-measured |
-| `.dest-audio-share-btn` | audio picker "Share" confirm (staged + live) | 32px | 32px | already correct |
-| `.dest-audio-add-btn-staged` | staged card "+ Add audio" | 32px | 32px | already correct |
-| `.dest-audio-mute` | attached-audio row "Mute"/"Unmute" | **22px** | **32px** | **fixed this pass** |
-| `.dest-audio-stop` | attached-audio row "Stop" | **22px** | **32px** | **fixed this pass** |
-| `.mode-toggle-btn` | BANDWIDTH card's Absolute/Per-Stream toggle; the Tune/Quality Level/Rate Control pill switches | 25px | 25px (unchanged) | **flagged, not changed** — see below |
-| `.sc-ghost-row` | "Share another screen" ghost row | 48px | 48px (unchanged) | **flagged, not changed** — see below |
-| `.dest-chip-add-btn` (base, no `-staged`) | live card's "+ Also send to…" fan-out chip; live card's non-staged "+ Add audio" | ~26px (per earlier session note) | unchanged | **flagged, not changed** — see below |
-
-**Two classes deliberately left alone — judgment calls, not oversights:**
-
-- **`.mode-toggle-btn`** (`.mode-toggle`/`.mode-toggle-btn` in `shell.css`) is a segmented
-  pill *switch* (Absolute Maximum / Per-Stream Maximum; Low-Latency / Balanced / Quality;
-  Tune/Quality Level/Rate Control), not a momentary-action button — it reads and behaves like
-  a tab strip (compare `.add-room-tabs`, the Join/Create tabs on the Create/Join dialog, which
-  share this same base class and are also not 32px). Forcing it to 32px would make the
-  BANDWIDTH card's mode toggle taller than its own label row and inconsistent with every other
-  pill switch in the app (language switch, encoder preset picker) that this same class backs
-  outside the Stream Control tab too. Left at its current 25px.
-- **`.sc-ghost-row`** ("Share another screen") is a deliberate 48px "headline invitation" —
-  documented in `stream-control.css` as intentionally *larger*, not smaller, than a routine
-  button: a full-width dashed-accent CTA row, not a button chip. Shrinking it to 32px would
-  make the tab's primary entry point read as a routine action instead of the headline one.
-  Left at its current 48px.
-- **`.dest-chip-add-btn`** (base rule, backing the fan-out "+ Also send to…" chip and the
-  live card's non-staged "+ Add audio") is the same dashed/chip "ghost add" visual family as
-  `shell.css`'s `.ghost-add-room-row` used elsewhere in the app for the identical affordance
-  ("add another X" as a muted secondary action, not a primary confirm) — changing it here
-  alone would make this tab's chip style diverge from that established cross-app pattern.
-  Not re-measured this pass (neither renders without extra setup a full sweep didn't need:
-  fan-out needs a second federated room, and the live "+ Add audio" chip is superseded the
-  instant audio is attached, at which point Mute/Stop render instead) — flagged here instead
-  of silently left alone, per the instruction to call out rather than assume.
-
-**Verified — real app, not mock/browser.** `xrandr --listmonitors` checked first (DP-1/2/3
-free 0–5759px, HDMI-A-1 untouched from 5760px on). Built sidecar reused from this session
-(`target/debug/simple-screensharing-client-tauri`, pointed at via `SIDECAR_BIN`). Playwright
-`_electron` driver against this worktree's real `electron/main.js`, window forced to DP-1
-(`50,50`) and bounds confirmed in-range before interacting. Drove the real flow: "Share
-another screen" → staged card → opened the audio picker → selected the real running
-**Floorp** browser (already producing real system audio, confirmed via `pactl list
-sink-inputs` showing an active `application.name = "Floorp"` sink input — no synthetic test
-tone spawned) → "Share" → real Mute/Stop rendered on the staged card, then "Go live" → same
-real Mute/Stop measured again on the live card. `getBoundingClientRect()` on every button
-class above, both before and after the CSS edit, in two separate real-app runs — not assumed
-from padding math (this project's own recurring lesson: font-size changes line-height in ways
-padding numbers alone don't predict). Screenshots confirm visually: Mute/Stop now read at the
-same weight as Go live/Cancel/Stop/Share on both card types, with a real green audio-level
-meter animating next to "Floorp". `node --check` on `components.js` (untouched — this pass
-was CSS-only) and `stream-control.js` (untouched) both pass.
-
----
-
-### Per-option level meters get a loading state; the "still-inconsistent bar width" report's real root cause measured fresh (2026-07-29)
-
-Earlier the same day, the audio source dropdown's per-option level meters (`.dd-option-meter`/
-`.dd-option-meter-bar`, `components.js`'s `DD_OPTION_METER_BARS`/`paintDdOptionMeter`, backed
-by real per-candidate `AudioLevelTapHandle` taps via `start_audio_level_tap`/
-`poll_audio_level_tap`) shipped, and a follow-up ("Tighten the lit VU-meter bar's glow")
-copied `.dest-audio-meter-bar-lit`'s already-confirmed `box-shadow: 0 0 1px` fix onto this
-meter's `.dd-option-meter-bar-lit`. The owner reported the bars still visibly differed in
-width after that fix. Two asks this pass: add a loading state for the gap before the first
-real level arrives, and actually root-cause the width report instead of assuming the same fix
-applied elsewhere.
-
-**Loading state.** Every option's meter now starts in a `.dd-option-meter-loading` state
-(`components.js`'s `renderOptions`) — a CSS pulse (`dropdown.css`'s `dd-option-meter-pulse`
-keyframes, bars staggered via `animation-delay` on `nth-child` so it ripples rather than
-blinking in lockstep) instead of the plain dim rest state, covering the gap between "dropdown
-just opened, tap just started" and "first real reading arrives." `setOptionLevel` clears the
-class the instant real data lands for that option, handing off to the existing
-`paintDdOptionMeter` height/opacity painting.
-
-**Root cause, measured fresh rather than assumed:** real Electron + real sidecar + a real
-local relay (spawned the same `setsid script -qc ...` way `end_to_end_test.rs` does, isolated
-`XDG_CONFIG_HOME`), Playwright `_electron` driver, real system audio (Floorp actually
-producing sound). `getBoundingClientRect()` on every `.dd-option-meter-bar`, lit and unlit
-alike, across several captured frames: **every bar measured exactly 5px wide in the DOM,
-lit or unlit, with or without the `box-shadow`.** There was never a real layout-width
-difference. Zoomed real screenshots (same crop/scale, lit vs. unlit) showed the actual cause:
-a lit bar's `box-shadow` glow spills a soft anti-aliased fringe past its otherwise-sharp box
-edge. At `.dest-audio-meter-bar`'s larger scale (~26px meter / 5 bars) that same `0 0 1px`
-fringe is a small fraction of the bar and reads as fine; at this meter's much smaller scale
-(18px / 3 bars ≈ 5px/bar) the identical absolute fringe width is proportionally far more of
-the bar, so it visibly widened the lit bars despite zero DOM difference — confirming the
-task's "irradiation/perceptual illusion, not geometry" hypothesis. Fix: removed the
-`box-shadow` from `.dd-option-meter-bar-lit` entirely (rather than shrinking it further) —
-full opacity plus the saturated `--success` color still read clearly as "lit" without any
-glow, and a before/after zoomed screenshot comparison confirmed the fringe is gone and lit/
-unlit bars now show pixel-crisp, equal-width edges. `.dest-audio-meter-bar-lit` was left
-untouched — its glow was already confirmed correct at its own scale; this was never actually
-the same bug in two places, despite looking identical in the CSS diff.
-
-**Verified — real app, not mock/browser.** `xrandr --listmonitors` checked first (DP-1/2/3
-free, HDMI-A-1 untouched — window placed at DP-1's `50,50`, bounds confirmed in-range). Built
-this worktree's sidecar, spawned a real local relay on an isolated port/`XDG_CONFIG_HOME`
-scratch dir, created and joined a real room via the real `create_room` command, staged a real
-capture via "Share another screen" (real portal consent resolved non-interactively), selected
-the room, "Go live," then "+ Add audio" to open the real level-metered dropdown against a
-real audio source (Floorp, already producing sound — a synthetic `audiotestsrc` test tone was
-also spawned as an extra candidate row, capped to 5% real routed volume per this session's
-audio-testing policy, verified via `pactl list sink-inputs` before capping and cleaned up
-after). Confirmed: the loading pulse shows on every option immediately on open (`.dd-option-
-meter-loading` present on all rendered meters right after the dropdown opens) and clears the
-instant each option's first real reading lands. `getBoundingClientRect()` measurements (lit
-and unlit, before and after the CSS fix) and zoomed real screenshots both confirm the bars now
-read as equal width. `cargo test --lib -p simple-screensharing-client`: 163 passed, 0 failed,
-19 ignored — no regressions. `node --check` on `components.js` passes.
+## Audio is a row on the share, not a card of its own (backend facts)
+
+**Owner's request (2026-07-28):** attach audio to the screen share instead of making it its own
+card: a meter, the captured application's name, Mute and Stop on one extra row of the share.
+(Audio is still its own `LocalCapture` and its own `StreamKind::Audio` stream id on the wire; only
+its *presentation* is bundled.)
+
+- **Meter:** a `level` element in the capture pipeline, folded into `audio::AudioLevel` (an
+  `AtomicU32` of `f32::to_bits`: one writer, no history, lock-free for a GStreamer streaming
+  thread) and surfaced as `DestinationStatsDto::audio_level` on the per-tick stats.
+- **Mute:** `AudioCaptureHandle::set_muted`, a `volume name=mute` element placed *before* `level`,
+  so muting flattens the meter too (the meter answers "is my audio going out", and a bouncing bar
+  while muted would answer wrongly). *Why mute with `volume` and not by pausing the send:* a
+  continuous Opus stream keeps the viewer's jitter buffer from seeing a mute as a multi-second
+  dropout.
+- **Stop:** plain `stop_destination(<audio destination id>)`; an audio capture always has exactly
+  one destination, so it stops that capture only and the screen share is untouched.
+- **Pairing:** `LocalCapture::audio_for_capture: Option<CaptureSourceId>`, set from
+  `start_audio_share(room_handle, for_capture)` (exposed as `DestinationRow::paired_capture_id`).
+  *Why an explicit link and not "same room":* one capture can fan out to several rooms and someone
+  sharing two monitors into one room has two shares but possibly one audio share; "same room" would
+  make both claim it and Stop on either would kill audio for both.
+- **No stranded audio:** an audio destination with no matching video card (a share torn down under
+  it) must still be listed and stoppable so it can never be stranded invisibly.
+- **Source list freshness:** `audio::list_audio_sources` shells out to `pw-dump` on every call (no
+  cache) and filters to real `PipeWire:Interface:Node` objects (PipeWire `Client` objects carry
+  lookalike `media.class` props); the UI re-lists on open and while the picker stays open. Per-option
+  level meters use real per-candidate taps (`start_audio_level_tap`/`poll_audio_level_tap`).
+- **Real playback measurement** (viewer volume 0/100/200 % gave +0.0/+2.7/+6.5 dB at the speakers)
+  is recorded with its decorrelated-noise rationale in `superdoc/features/video-pipeline.md`
+  ("Audio follows video").
+
+### Auto-Connect (join a saved room at startup)
+
+`rooms::SavedRoom::auto_connect: bool` (`#[serde(default)]`, so older `rooms.toml` files load as
+`false`), `AppState::set_room_auto_connect`, and `AppState::auto_connect_queue` drained one room at a
+time by `poll_auto_connect_queue`. *Why a queue:* `pending_connect` is a single slot, so firing
+several `start_connect`s at startup would orphan every one but the last. Nothing else makes a
+saved room rejoin itself at launch. (A first misreading wired this checkbox to "auto-start audio
+sharing"; the owner's correction: it means "connect to the room on startup".)
 
 ---
 
@@ -2757,3 +1486,26 @@ the View tab's tiled grid and tiered restart placeholders; per-destination floor
 *per* destination (one global floor is exposed, and every destination shares the project's
 40 Mbit/s ceiling); an idle-audio reservation in `AllocInput::audio_reserved_kbps` (left
 explicit at 0 until audio becomes an attachment with a known constant rate).
+
+
+## History: the Electron UI (removed)
+
+The Stream Control tab used to be an Electron HTML page (`stream-control.js`, `components.js`,
+`.media-tile-*` CSS) over the Rust sidecar's REST bridge (`src-tauri/src/commands.rs`, `dto.rs`,
+`api_server.rs`), verified with Playwright's `_electron` driver. All of it was deleted in the egui
+rework (I23). Roughly 1500 lines of per-widget write-ups were removed from this page; they are in
+version control (`git log -- superdoc/features/stream-control.md`). The *why* that outlived them:
+
+- **Every settings control must read from one local edit buffer.** Several bugs (slider snapping
+  back, "Balanced" shown after Go live, stale bitrate readout, a volume slider that disagreed
+  between windows) were the same shape: a control rebuilt from a server DTO that had no field for
+  the value, or a live change that fires no event.
+- **A `String`/`Number` mismatch in a dropdown compare silently broke "Share"** (the audio source id
+  is a `u32`; the dropdown returned the raw number). Compare ids by type, not by `String()`.
+- **Tests must separate "audio flowing" from "audio absent"** (see the audio bugs above).
+- **Room-scoped settings row removal:** the tab's room picker plus members card duplicated the
+  sidebar's room detail panel and was deleted rather than trimmed; the egui equivalent is the room
+  settings modal in `ui/modals.rs`.
+- **Verification then:** a real Electron shell + built sidecar + a real relay, sometimes with
+  fabricated stream keys. **Today:** the `run` skill with `rig.sh`/`drive.sh`
+  (`client/.claude/skills/run/SKILL.md`, `client/scripts/`).

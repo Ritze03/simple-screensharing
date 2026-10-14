@@ -4,8 +4,8 @@
 `APP-SHELL.md` (layout, modules, rules) and `STYLING-GUIDE.md` (how it is built). Rewritten
 2026-10-14 from a ~1480-line description of `client/frontend/` (plain HTML/CSS/JS, no
 framework or bundler) shown in an Electron `BrowserWindow` over a Rust sidecar
-(`client/src-tauri/`, REST + SSE; originally a Tauri webview). That frontend is being
-deleted (task I23).
+(`client/src-tauri/`, REST + SSE; originally a Tauri webview). That frontend was deleted in the
+egui rework (task I23).
 
 The full old text (tab-by-tab behaviour, DTO shapes, event wiring, dated QC notes) is
 preserved in git: `git show 3f2d5d3:superdoc/ui/FRONTEND-SHELL.md`.

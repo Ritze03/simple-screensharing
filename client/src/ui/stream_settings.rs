@@ -41,7 +41,7 @@
 //! lib's `apply_rx` is pending or the branch is `Rebuilding`). Sliders keep
 //! their value in [`StreamSettingsState`] while dragged and push one action on
 //! release. Codecs this machine's encoder backend can't produce are greyed
-//! out (`AppState::supported_codecs`, as the Electron app did).
+//! out (`AppState::supported_codecs`, as the former Electron app did).
 //!
 //! Owns [`PopoverKind::AlsoSendTo`] / [`PopoverKind::MoveTo`] (same lists as
 //! the bar's "N rooms ▾", see `action_bar::RoomTargets`).
@@ -66,7 +66,7 @@ use crate::widgets::{
     self, BannerKind, Btn, DestAction, DestRow, FILL, FooterClick, HBox, ModalSpec, Pill, fade, paint_gradient, paint_galley, text_galley,
 };
 
-/// Bandwidth slider ranges (the Electron app's).
+/// Bandwidth slider ranges (carried over from the former Electron app).
 const TOTAL_RANGE: std::ops::RangeInclusive<u32> = 500..=40_000;
 const FLOOR_RANGE: std::ops::RangeInclusive<u32> = 100..=20_000;
 const BW_STEP: f64 = 100.0;
