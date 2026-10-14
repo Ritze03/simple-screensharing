@@ -656,6 +656,29 @@ test("presets: the four native presets are mapped", () => {
 
 // ------------------------------------------------------------------------------------------------ reverse vectors (JS -> Rust)
 
+test("session: relay close codes map to rejections; unknown/absent codes map to nothing", async () => {
+  const { CLOSE_CODES, classifyClose } = await import("../js/core/session.js");
+  eq(classifyClose({ closeCode: 0x102 }), "room-full");
+  eq(classifyClose({ closeCode: 0x101 }), "malformed");
+  eq(classifyClose({ closeCode: 0x200 }), "relay-shutdown");
+  eq(classifyClose({ closeCode: 0, reason: "bye" }), null);
+  eq(classifyClose({ error: new Error("Connection lost.") }), null);
+  eq(classifyClose(null), null);
+  eq([CLOSE_CODES.MALFORMED, CLOSE_CODES.ROOM_FULL, CLOSE_CODES.SHUTDOWN], [0x101, 0x102, 0x200]);
+});
+
+test("ui i18n: en and de have the same keys and placeholders; German uses 'du', never 'Sie'", async () => {
+  const { DICT } = await import("../js/ui/i18n.js");
+  const ph = (s) => [...String(s).matchAll(/%\{(\w+)\}/g)].map((m) => m[1]).sort().join(",");
+  const missingDe = Object.keys(DICT.en).filter((k) => !(k in DICT.de));
+  const extraDe = Object.keys(DICT.de).filter((k) => !(k in DICT.en));
+  eq([missingDe, extraDe], [[], []], "key parity");
+  const badPh = Object.keys(DICT.en).filter((k) => ph(DICT.en[k]) !== ph(DICT.de[k]));
+  eq(badPh, [], "placeholders differ");
+  const formal = Object.entries(DICT.de).filter(([, v]) => /\b(Sie|Ihr|Ihre|Ihren|Ihrem|Ihrer|Ihres|Ihnen)\b/.test(v) || /\b(Beitrittslink|Freigabe)/.test(v)).map(([k]) => k);
+  eq(formal, [], "formal/old-term German strings");
+});
+
 test("reverse vectors: JS-made frames/previews/control messages/links for Rust to verify", async () => {
   const keyBytes = randomBytes(32);
   const key = await importRoomKey(keyBytes);

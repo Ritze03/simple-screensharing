@@ -36,11 +36,29 @@ DER, base64url without padding (needed by browsers for a self-signed relay; omit
 | `formatJoinLink(server, roomId, roomKey, certHash?)` | the inverse |
 | `createRoom(server, { name?, certHash? })` | random id + key from `crypto.getRandomValues`; returns `{ link, name, server, roomId, roomKey }`. The name is a local label only, never on the wire. |
 
-**Link expiry.** The relay rotates its self-signed certificate about every 11 days, which makes the hash in older links
-stale. A failed handshake rejects `connect()` with a `ConnectError` whose `mayBeExpiredLink` is `true` (when the link had a
-hash) and whose message tells the user to ask for a fresh invite link (`EXPIRED_LINK_HINT`). The browser cannot tell a stale
-hash from a relay that is down; the message says so. During auto-reconnect the same condition is reported as an `error` event
-with `code: "link-expired"` (non-fatal, retries continue).
+**Link expiry vs relay down (what the browser can and cannot tell).** The relay rotates its self-signed certificate about
+every 11 days, which makes the hash in older links stale. **Chromium 153 reports every handshake failure identically**: a
+wrong hash, a closed port, an unresolvable host and a self-signed certificate without a hash all reject `ready` and `closed`
+with `WebTransportError: Opening handshake failed.` (`source: "session"`, no `streamErrorCode`, and the durations overlap, so
+timing does not separate them either; measured in `dev/` runs). So the core infers from history, per page:
+a server+hash pair that has completed a handshake once is *verified*. After that a failed handshake is `ConnectError{code:
+"handshake-failed", reason: "unreachable"}` (`mayBeExpiredLink` false; reconnect `error` code `relay-unreachable`): the relay
+is not answering. Only a hash that has **never** worked here gives `reason: "unreachable-or-expired-link"` with
+`mayBeExpiredLink: true` and the hedged message `EXPIRED_LINK_HINT` ("may be offline, or this invite link may have expired").
+Consequence: the `link-expired` reconnect error can only fire for a client that never connected with that hash, i.e. in practice
+never during auto-reconnect; the narrow case it no longer catches is a certificate rotated while the page stayed open and the
+connection then dropped (the reconnect then reports `relay-unreachable` until the page is reloaded and the link is replaced).
+`handshake-failed` attempts that hang are cut off after 8 s (`HANDSHAKE_TIMEOUT_MS`) and can be cancelled (see `reconnectNow()`).
+
+**Relay close codes (task #29).** The relay now writes `JoinRejected{RoomFull|Malformed}`, `finish()`es the control stream and
+waits (up to 2 s) for the peer before closing with `0x102` / `0x101`, and closes the endpoint with `0x200` "relay shutting down".
+Chromium **does not expose any of these codes**: a QUIC `CONNECTION_CLOSE` with an application code surfaces as
+`WebTransportError: Connection lost.` (no `closeCode`, `closed` *rejects* instead of resolving with a `WebTransportCloseInfo`),
+measured for all three. The control-stream frame is what carries the information: `connect()` now rejects with
+`JoinRejectedError{reason: "RoomFull"|"Malformed"}` (the old `join-no-reply` guess remains only for an undecodable first
+frame, which the relay drops without a reply, and for relays older than #29). `classifyClose(info)` maps the codes if a browser
+ever reports them. A relay shutdown is noticed within a few milliseconds (CONNECTION_CLOSE arrives; no 21 s idle wait) and the
+first reconnect attempt is immediate (50 ms), then exponential backoff, so a restarted relay is rejoined in about 0.6 s.
 
 ## `RoomClient` (extends `EventTarget`)
 
@@ -60,7 +78,9 @@ new RoomClient({
 
 | | |
 | --- | --- |
-| `connect(linkOrParsed, displayName?)` | Resolves when joined. Rejects `JoinLinkError`, `ConnectError` (`code`: `handshake-failed`, `no-webtransport`, `datagram-too-small`, `join-no-reply`), `JoinRejectedError` (`reason`: `RoomFull`, `Malformed`). After the first success the client reconnects by itself. |
+| `connect(linkOrParsed, displayName?)` | Resolves when joined. Rejects `JoinLinkError`, `ConnectError` (`code`: `handshake-failed` + `reason`, `no-webtransport`, `datagram-too-small`, `join-no-reply`, `relay-shutdown`), `JoinRejectedError` (`reason`: `RoomFull`, `Malformed`). After the first success the client reconnects by itself. |
+| `reconnectNow()` | "Retry now". While `reconnecting`: skips the backoff wait and cancels a handshake that is stuck. While `connected`: drops the connection and joins again (fresh ConnId, so **other** viewers of your shares see them restart). Shares stay registered and are re-announced, watches stay (a watched stream keeps its key unless its owner reconnected). Resolves with the state after the attempt (`connected`, or `reconnecting` if it failed and retries go on). Nothing is dropped, unlike `disconnect()` + `connect()`. |
+| `findStreamByStableKey(stableKey, { exceptKeys })` | The stream now in the room with that identity, or `null` (see "Stable stream identity"). |
 | `disconnect()` | Stops shares and watches, sends `Leave`, lets queued datagrams flush, closes. |
 | `watch(key, { canvas?, onFrame?, audio = true })` | Subscribe. Returns a `WatchHandle`. Watching a video stream also subscribes the owner's audio stream ("audio follows video", re-evaluated when that audio stream appears or disappears). |
 | `unwatch(key)` | Unsubscribes the stream and its followed audio. |
@@ -78,7 +98,16 @@ new RoomClient({
 
 **Ids** are lowercase hex strings (`selfId`, `owner`, member `id`: the 64-bit ConnId, 16 chars). A stream key is
 `"<ownerHex>:<streamId>"`; `streamKey(owner, id)` builds one.
-A reconnect gives a fresh ConnId, so stream keys of the reconnecting peer change (see `watch-ended`).
+A reconnect gives a fresh ConnId, so stream keys of the reconnecting peer change (see `watch-ended` and "Stable stream identity").
+
+**Stable stream identity.** Every stream info (in `streams`, `client.streams`, `findStreamByStableKey`) carries `stableKey` =
+`<room id hex>/<owner display name>/<kind>/<label>`, which survives the owner's reconnect while `key` does not. `watch-ended` carries
+the same `stableKey` (plus `ownerName`, `label`, `kind`), also when the stream vanished because *this* client reconnected into a
+restarted relay. Decision (task I20): the core does **not** transparently re-bind a `WatchHandle` to the new key, because on the
+wire a sharer that reconnected is indistinguishable from one that stopped and started again, so how long to wait and what to show
+in between is a UI policy. The UI keeps a 60 s "resume" list keyed by `stableKey` and re-watches (same volume/mute) when
+`findStreamByStableKey` finds the stream again. Limits: two members with the same name sharing the same label collide (the UI
+picks the first unwatched match); a renamed member or a changed label is a different stream.
 
 ### Events (`CustomEvent`, payload in `event.detail`)
 
@@ -88,12 +117,12 @@ A reconnect gives a fresh ConnId, so stream keys of the reconnecting peer change
 | `roster` | `{ members: [{ id, name, streamCount, self }] }`. Every member, including lurkers (`streamCount === 0`). |
 | `streams` | `{ streams: [{ key, owner, ownerName, streamId, kind: "video"\|"audio", label, width, height, self }] }`. Full list on every change. |
 | `preview` | `{ key, owner, streamId, blob }` a decrypted JPEG (about 320 px wide) of someone else's video stream. Delivered on join (the relay replays its cache) and about every 30 s. `client.previews` keeps the latest. |
-| `stats` | every second: `{ watching: { key: {...} }, sharing: [...], transport, droppedFrames }`. Watch stats: `receivedFps, decodedFps, bitrateKbps, jitterMs, bufferMs, width, height, codec, codecString, lossEvents, decoderErrors, decryptFailures, skippedDeltas, needKeyframe, stalled, ...`; audio: `packets, decodedFrames, underruns, level, volume, muted`. `transport` is `WebTransport.getStats()` (RTT etc.) when the browser offers it. |
+| `stats` | every second: `{ watching: { key: {...} }, sharing: [...], transport, droppedFrames }`. Watch stats: `receivedFps, decodedFps, bitrateKbps, jitterMs, bufferMs, width, height, codec, codecString, lossEvents, decoderErrors, decryptFailures, skippedDeltas, needKeyframe, stalled, ...`; audio: `packets, decodedFrames, underruns, level, volume, muted` (`level` = peak meter 0..1 with a ~0.5 s hold, not one frame's instant peak). `transport` is `WebTransport.getStats()` (RTT etc.) when the browser offers it. |
 | `subscribers` | `{ streamId, count }` for **your own** shares (from the relay). |
-| `watch-ended` | `{ key, reason }` the stream you were watching stopped (or its owner left or reconnected). The handle is already removed. |
+| `watch-ended` | `{ key, reason, stableKey, ownerName, label, kind }` the stream you were watching stopped (or its owner left or reconnected, or you reconnected into a relay that no longer has it). The handle is already removed. |
 | `media` | `{ key, type, ... }`: `codec` (a keyframe revealed `codec` / `codecString`), `unsupported` (this browser cannot decode that codec), `decoder-error`, `need-keyframe`. |
 | `share` | `{ state: "started"\|"stopped"\|"ended-by-browser"\|"no-audio"\|"no-frames", share, message? }`. `ended-by-browser`: the user clicked the browser's "Stop sharing". `no-frames`: 4 s after starting, the source had not delivered a single frame. |
-| `error` | `{ code, message, fatal, error }`. Codes: `connection-lost` (fatal, only without `autoReconnect`), `link-expired`, `reconnect-failed`, `join-rejected`, `nonce-exhausted`, `encoder-error`, `audio-encoder-error`, `audio-share-unavailable`, `send-failed`, `preview-failed`. |
+| `error` | `{ code, message, fatal, error }`. Codes: `connection-lost` (fatal, only without `autoReconnect`), `relay-unreachable` (reconnect attempt failed, the hash is known good), `room-full` (reconnect hit a full room; retries go on), `link-expired` (only for a hash that never worked in this page, see above), `reconnect-failed`, `join-rejected`, `nonce-exhausted`, `encoder-error`, `audio-encoder-error`, `audio-share-unavailable`, `send-failed`, `preview-failed`. |
 
 ### Rendering (`WatchHandle`)
 
@@ -185,21 +214,16 @@ Behaviour that matches the native sender:
 * Media is datagrams of at most 1000 bytes (`MAX_MEDIA_DATAGRAM_LEN`); the session refuses to join if
   `datagrams.maxDatagramSize < 1000` (Chromium reports 1024). `datagrams.incomingHighWaterMark` is raised because a keyframe arrives as hundreds of fragments in one burst.
 * `disconnect()` waits ~150 ms after `Leave` before closing: datagrams written just before a close can be lost.
-* **Dead relay detection takes as long as the QUIC idle timeout** (measured: about 21 s in Chromium 153, also when the relay
-  is quit cleanly with `q` in its TUI) because no `CONNECTION_CLOSE` reaches the browser; then `reconnecting` begins and the
-  restarted relay is rejoined automatically.
+* **Relay gone.** A relay that shuts down gracefully (TUI `q`, task #29) is noticed within milliseconds (measured 0 ms to the
+  `reconnecting` state) and the client is back in about 0.6 s after the relay restarts. A relay that is killed or unplugged
+  sends nothing, so that is only noticed after the QUIC idle timeout (about 21 s in Chromium 153).
 * **Loss recovery** (`lossRecovery: "resubscribe"`): a lost frame breaks the reference chain, so the receiver stops feeding
   deltas, and asks for a keyframe the only way a viewer can: `Unsubscribe` + `Subscribe` (the relay then sends the sender a
   `KeyframeRequest`), at most every 1.5 s and again while still waiting. `"wait"` just waits for the next scheduled keyframe.
 
-## Known relay issues (found while building this; relay code is not part of this task)
+## Known relay issues
 
-1. **`JoinRejected` is lost to a connection drop.** After writing `JoinRejected` (e.g. `RoomFull`) `perform_join` returns and
-   `handle_connection` drops the session immediately (`server/src/relay.rs`, the `None => return Ok(())` arm), without
-   `finish()`ing the control stream or waiting for the peer to read it. Chromium never delivers the frame: the control stream
-   errors with `WebTransportError: Connection lost.` and no close code/reason (`dev/scenarios.js`, "room is full"). The client
-   therefore reports `ConnectError { code: "join-no-reply" }` ("the room may be full") instead of `JoinRejectedError`. A fix is to
-   `ctrl_send.finish()` and wait briefly for `stopped()` (or send a WebTransport close with a reason) before dropping.
-2. A relay that is stopped (even a clean quit via the TUI) is only noticed by browsers after the ~21 s idle timeout, because
-   the endpoint is not closed with `CONNECTION_CLOSE` on shutdown. A graceful `endpoint.close()` on quit would make clients
-   reconnect immediately.
+Both issues found while building the core (JoinRejected lost to a connection drop; no CONNECTION_CLOSE on shutdown) were fixed
+by relay task #29 and verified in `dev/scenarios.js` ("room is full", "relay restart", "close codes"). What remains: the relay's
+application close codes are invisible to Chromium (see "Relay close codes"), and an undecodable first control frame is dropped
+without any reply (`read_control_frame(...)?` in `perform_join`), so a browser with a protocol bug sees `join-no-reply`.

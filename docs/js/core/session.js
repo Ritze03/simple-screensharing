@@ -6,16 +6,49 @@ import {
 } from "./protocol.js";
 import { NonceSequence } from "./crypto.js";
 
-/** Handshake failure. When the link carried a cert hash this is most often a stale hash. */
+/**
+ * Connect failure. `code`: `handshake-failed`, `no-webtransport`, `datagram-too-small`, `join-no-reply`, `relay-shutdown`.
+ *
+ * For `handshake-failed`, `reason` says what the browser lets us conclude. Chromium reports EVERY handshake failure as the
+ * same `WebTransportError: Opening handshake failed.` (source "session", no code), whether the relay is down, the host does
+ * not resolve, or the pinned certificate hash does not match (measured, see README), so the core infers from history:
+ *  - `"unreachable"`: this server+hash pair completed a handshake earlier in this page, so the hash is known good and
+ *    the relay is simply not answering (down, restarting, network). `mayBeExpiredLink` is false.
+ *  - `"unreachable-or-expired-link"`: the link carries a hash that has never been seen to work here; the relay may be down
+ *    or the hash may be stale. `mayBeExpiredLink` is true (only then).
+ *  - `"no-hash"`: the link has no hash (CA-certificate relay or native-only link).
+ */
 export class ConnectError extends Error {
-  constructor(message, { code, cause, mayBeExpiredLink = false } = {}) {
+  constructor(message, { code, cause, mayBeExpiredLink = false, reason = null } = {}) {
     super(message);
     this.name = "ConnectError";
     this.code = code;
+    this.reason = reason;
     this.cause = cause;
     this.mayBeExpiredLink = mayBeExpiredLink;
   }
 }
+
+/**
+ * Application close codes the relay uses (server/src/relay.rs). Chromium 153 does NOT expose them: a QUIC
+ * CONNECTION_CLOSE with an application code surfaces as `WebTransportError: Connection lost.` with no close code, so
+ * these are mapped only if a browser ever reports them. The JoinRejected frame on the control stream is the reliable signal.
+ */
+export const CLOSE_CODES = { MALFORMED: 0x101, ROOM_FULL: 0x102, SHUTDOWN: 0x200 };
+
+/** What a WebTransport close info says, as far as the browser tells us (null = nothing useful). */
+export function classifyClose(info) {
+  const code = info && typeof info.closeCode === "number" ? info.closeCode : null;
+  if (code === CLOSE_CODES.ROOM_FULL) return "room-full";
+  if (code === CLOSE_CODES.MALFORMED) return "malformed";
+  if (code === CLOSE_CODES.SHUTDOWN) return "relay-shutdown";
+  return null;
+}
+
+/** server+hash pairs that completed a WebTransport handshake in this page: their hash is known good. */
+const verifiedHashes = new Set();
+const hashKey = (server, certHash) => `${server}|${Array.from(certHash, (b) => b.toString(16).padStart(2, "0")).join("")}`;
+export const isHashVerified = (server, certHash) => !!certHash && verifiedHashes.has(hashKey(server, certHash));
 
 export class JoinRejectedError extends Error {
   constructor(reason) {
@@ -33,12 +66,13 @@ export class JoinRejectedError extends Error {
 }
 
 export const EXPIRED_LINK_HINT =
-  "Could not connect to the relay. If the relay is running, this invite link has probably expired: the relay rotates its certificate about every 11 days, which invalidates the certificate hash inside older links. Ask for a fresh invite link.";
+  "Could not connect to the relay. It may be offline, or this invite link may have expired: the relay rotates its certificate about every 11 days, which invalidates the certificate hash inside older links. Ask for a fresh invite link.";
 
 export function supportsWebTransport() {
   return typeof WebTransport !== "undefined";
 }
 
+const HANDSHAKE_TIMEOUT_MS = 8000;
 const MAX_PREVIEW_STREAM_BYTES = 4 * 1024 * 1024;
 
 async function readAll(readable, limit) {
@@ -68,9 +102,11 @@ async function readAll(readable, limit) {
 export class RelaySession {
   /**
    * Open the WebTransport session. Rejects with ConnectError.
-   * @param {{server:string, certHash:Uint8Array|null}} o   server = host:port
+   * @param {{server:string, certHash:Uint8Array|null, signal?:AbortSignal, timeoutMs?:number}} o   server = host:port.
+   *   `signal` aborts a handshake in flight (ConnectError code "aborted"); a handshake still pending after `timeoutMs`
+   *   is given up on (Chromium would otherwise keep retransmitting its Initial packet for many seconds).
    */
-  static async open({ server, certHash }) {
+  static async open({ server, certHash, signal = null, timeoutMs = HANDSHAKE_TIMEOUT_MS }) {
     if (!supportsWebTransport()) {
       throw new ConnectError("This browser does not support WebTransport (needed to reach the relay). Use a current Chrome, Edge or Firefox.", { code: "no-webtransport" });
     }
@@ -78,20 +114,43 @@ export class RelaySession {
     const opts = {};
     if (certHash) opts.serverCertificateHashes = [{ algorithm: "sha-256", value: certHash }];
     let wt;
-    try {
-      wt = new WebTransport(url, opts);
-      wt.closed.catch(() => {});
-      await wt.ready;
-    } catch (e) {
+    let aborted = false;
+    let timer = null;
+    const onAbort = () => {
+      aborted = true;
       try {
         wt && wt.close();
       } catch {}
+    };
+    const cleanup = () => {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", onAbort);
+    };
+    try {
+      if (signal && signal.aborted) throw new Error("aborted");
+      wt = new WebTransport(url, opts);
+      wt.closed.catch(() => {});
+      if (signal) signal.addEventListener("abort", onAbort, { once: true });
+      if (timeoutMs) timer = setTimeout(() => wt.close(), timeoutMs);
+      await wt.ready;
+    } catch (e) {
+      cleanup();
+      if (aborted || (signal && signal.aborted)) throw new ConnectError("The connection attempt was cancelled.", { code: "aborted", cause: e });
+      try {
+        wt && wt.close();
+      } catch {}
+      if (certHash && isHashVerified(server, certHash)) {
+        throw new ConnectError(`The relay at ${server} is not answering (it may be down or restarting).`, { code: "handshake-failed", reason: "unreachable", cause: e });
+      }
       throw new ConnectError(certHash ? EXPIRED_LINK_HINT : `Could not connect to the relay at ${server}. If it uses a self-signed certificate, the invite link must contain its certificate hash (4th field).`, {
         code: "handshake-failed",
+        reason: certHash ? "unreachable-or-expired-link" : "no-hash",
         cause: e,
         mayBeExpiredLink: !!certHash,
       });
     }
+    cleanup();
+    if (certHash) verifiedHashes.add(hashKey(server, certHash));
     const max = wt.datagrams.maxDatagramSize;
     if (max < MAX_MEDIA_DATAGRAM_LEN) {
       wt.close();
@@ -153,11 +212,19 @@ export class RelaySession {
         await this.#write(encodeClientToRelay({ type: "Join", connId: this.connId, roomId, displayName }));
         msg = await this.#readOne();
       } catch (e) {
-        // The relay drops the connection right after a refusal, and the refusal itself can be lost with it
-        // (relay race, see README "Known relay issues"): don't pretend to know why.
-        await Promise.race([this.wt.closed.catch(() => null), new Promise((r) => setTimeout(r, 150))]); // let closeInfo arrive
-        const err = new ConnectError("The relay closed the connection right after the join request without answering. The room may be full (8 members maximum), or the relay refused the link.", { code: "join-no-reply", cause: e });
-        err.closeInfo = this.closeInfo; // WebTransport close code/reason if the relay sent one
+        // The relay delivers JoinRejected on the control stream before it closes, so a normal refusal never lands here.
+        // We get here when the connection died without any reply: an undecodable first frame (the relay just drops
+        // those), a relay going down mid-join, or an older relay. Let closeInfo arrive and map a close code if the browser
+        // reports one (Chromium does not, see CLOSE_CODES); otherwise don't pretend to know why.
+        await Promise.race([this.wt.closed.catch(() => null), new Promise((r) => setTimeout(r, 150))]);
+        const kind = classifyClose(this.closeInfo);
+        if (kind === "room-full") throw new JoinRejectedError("RoomFull");
+        if (kind === "malformed") throw new JoinRejectedError("Malformed");
+        const err =
+          kind === "relay-shutdown"
+            ? new ConnectError("The relay is shutting down.", { code: "relay-shutdown", cause: e })
+            : new ConnectError("The relay closed the connection right after the join request without answering. The room may be full (8 members maximum), or the relay refused the link.", { code: "join-no-reply", cause: e });
+        err.closeInfo = this.closeInfo;
         throw err;
       }
       if (msg.type === "PresenceSnapshot") snapshot = msg;

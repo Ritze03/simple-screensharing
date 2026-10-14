@@ -13,7 +13,7 @@ all paths relative so GitHub Pages can serve `docs/` under `/simple-screensharin
 | `rooms.js` | one `RoomEntry` per saved room: its `RoomClient`, state, roster, streams, previews, watches; core events -> state |
 | `capture.js` | outgoing streams: a capture (one `getDisplayMedia` pick) and its destinations (one `startShare` per room), bandwidth split, live edits |
 | `popout.js` | pop-out viewer: Document Picture-in-Picture, fallback Fullscreen |
-| `i18n.js` | en/de dictionary, `t(key, vars)` with the native `%{var}` placeholders |
+| `i18n.js` | en/de dictionary, `t(key, vars)` with the native `%{var}` placeholders. German is the informal "du" form with the native terms (identical strings where key and English text match `client/locales/de.yml`) |
 
 ## Design notes (the why)
 
@@ -27,12 +27,17 @@ all paths relative so GitHub Pages can serve `docs/` under `/simple-screensharin
 * **Live edits.** Bitrate applies in place (`ShareHandle.setBitrate`). Framerate, codec and preset cannot change on a
   running WebCodecs share, so the destination restarts (new share first, then the old one stops); the modal says so.
 * **Resume after reconnects.** A reconnect gives the sharer a fresh ConnId and therefore a new stream key, which ends the
-  watch. The UI remembers ended watches for 60 s and re-watches when the same sharer's stream (name + label) reappears;
-  after a relay restart the viewer is back on the stream within about a second.
-* **Expired links.** A failed first connect whose link carries a certificate hash says "This link expired, ask for a fresh
-  invite link". During auto-reconnect the core cannot tell a stale hash from a relay that is down, so the reconnect banner
-  switches to the expiry wording only after 4 failed attempts.
-* **Room full** shows the same text for `JoinRejectedError{RoomFull}` and for `ConnectError{code: "join-no-reply"}`.
+  watch. The core cannot tell that from a stop + restart, so the UI remembers ended watches for 60 s, keyed by the core's
+  `stableKey` (room + sharer name + kind + label), and re-watches (same volume/mute) when the same one reappears; after a relay
+  restart the viewer is back on the stream within about a second. The 60 s policy is UI-side on purpose (see the core README).
+* **Retry now** calls the core's `reconnectNow()`: no backoff wait, nothing dropped (shares are re-announced, watches
+  re-subscribed). It used to disconnect and rejoin, which dropped and restored shares by hand.
+* **Why a room is unreachable.** First connect with a certificate hash that never worked in this page says "could not reach the
+  relay, it may be offline or this invite link expired" (Chromium cannot tell those apart, see the core README). Once the hash
+  has worked, a failing reconnect says "the relay is not answering, it may be down or restarting" and never blames the link.
+  A full room on reconnect gets its own banner and the page keeps trying.
+* **Room full** shows `JoinRejectedError{RoomFull}`, which now arrives properly on the control stream (relay task #29);
+  `ConnectError{code: "join-no-reply"}` gets its own softer text.
 * **Audio source.** Browsers decide which audio comes with the picked screen/window/tab, so the audio control offers mute
   only; changing the source means picking again.
 * **Pop-out.** `documentPictureInPicture.requestWindow()` (Chromium 116+) is a real always-on-top window; the tile's canvas

@@ -239,10 +239,11 @@ function renderMain() {
     if (r.state === "reconnecting") {
       // The browser cannot tell a stale certificate hash from a relay that is down, so the expiry hint only shows
       // once a few attempts have failed (a relay restart is back within one or two).
-      const expired = r.expired && r.attempt >= 4;
-      center.appendChild(banner(expired ? "link_off" : "sync_problem",
-        expired ? t("ui.room.reconnect_expired", { attempt: r.attempt }) : t("ui.room.reconnecting_banner", { attempt: Math.max(1, r.attempt) }),
-        h("button", { class: "btn btn-secondary", type: "button", onclick: () => retryNow(r) }, t("ui.room.retry_now")), { error: expired }));
+      const issue = r.issue; // "unreachable" | "full" | null (null: a connection was just lost)
+      const attempt = Math.max(1, r.attempt);
+      center.appendChild(banner(issue ? "link_off" : "sync_problem",
+        issue === "unreachable" ? t("ui.room.reconnect_unreachable", { attempt }) : issue === "full" ? t("ui.room.reconnect_full", { attempt }) : t("ui.room.reconnecting_banner", { attempt }),
+        h("button", { class: "btn btn-secondary", type: "button", onclick: () => retryNow(r) }, t("ui.room.retry_now")), { error: !!issue }));
     }
     renderRoomContent(r, center);
   }

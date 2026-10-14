@@ -4,7 +4,7 @@
 import { RoomClient, parseJoinLink, ConnectError, JoinRejectedError, JoinLinkError } from "../core/index.js";
 import { S, invalidate, toast, persistRooms } from "./store.js";
 import { t } from "./i18n.js";
-import { onShareEvent, onShareStats, stopDestsInRoom, restartDestsInRoom } from "./capture.js";
+import { onShareEvent, onShareStats, stopDestsInRoom } from "./capture.js";
 import { closePopout } from "./popout.js";
 
 export class RoomEntry {
@@ -19,12 +19,11 @@ export class RoomEntry {
     this.state = "disconnected"; // disconnected | connecting | joined | reconnecting
     this.attempt = 0;
     this.error = null; // last connect error text (shown in the disconnected view)
-    this.expired = false; // reconnect attempts report a probably-expired link
+    this.issue = null; // why the last reconnect attempt failed: "unreachable" | "full" | null
     this.members = [];
     this.streams = [];
     this.previews = new Map(); // key -> object URL
     this.watches = new Map(); // key -> Watch
-    this.wanted = []; // keys to re-watch after a manual reconnect
     this.resume = []; // watches that ended recently, resumed when the same sharer's stream reappears
   }
   get selfId() {
@@ -48,7 +47,8 @@ export const roomById = (id) => S.rooms.find((r) => r.id === id) || null;
 export function connectErrorText(e) {
   if (e instanceof JoinRejectedError) return e.reason === "RoomFull" ? t("ui.err.room_full") : e.message;
   if (e instanceof ConnectError) {
-    if (e.mayBeExpiredLink) return t("ui.err.link_expired");
+    if (e.mayBeExpiredLink) return t("ui.err.unreachable_or_expired");
+    if (e.reason === "unreachable") return t("ui.err.unreachable");
     if (e.code === "join-no-reply") return t("ui.err.join_no_reply");
     if (e.code === "no-webtransport") return t("ui.err.no_webtransport");
     return e.message;
@@ -64,14 +64,13 @@ export async function connectRoom(r, { quiet = false } = {}) {
   r.client = client;
   r.state = "connecting";
   r.error = null;
-  r.expired = false;
+  r.issue = null;
   wire(r, client);
   invalidate();
   try {
     await client.connect(r.link);
     if (r.client !== client) return; // left meanwhile
     if (!quiet) toast(t("ui.toast.connected", { room: r.name }), "check_circle");
-    for (const key of r.wanted.splice(0)) if (client.streams.has(key)) watchStream(r, key);
   } catch (e) {
     if (r.client !== client) return;
     r.client = null;
@@ -96,18 +95,14 @@ export async function disconnectRoom(r) {
   if (client) await client.disconnect().catch(() => {});
 }
 
-/** "Retry now" during a reconnect: the core has no public retry, so drop the connection and join again. */
+/** "Retry now" during a reconnect: the core skips its backoff wait; shares and watches stay registered and come back with it. */
 export async function retryNow(r) {
   if (!r.client) return connectRoom(r);
-  const client = r.client;
-  r.wanted = [...r.watches.keys()];
-  const restart = stopDestsInRoom(r.id, { keepConfig: true });
-  for (const key of [...r.watches.keys()]) unwatchStream(r, key, { silent: true });
-  r.client = null;
-  r.state = "disconnected";
-  await client.disconnect().catch(() => {});
-  await connectRoom(r, { quiet: true });
-  if (r.state === "joined") restartDestsInRoom(r, restart);
+  try {
+    await r.client.reconnectNow();
+  } catch (e) {
+    toast(t("ui.toast.connect_failed", { room: r.name }), "error", { err: true });
+  }
 }
 
 function clearPreviews(r) {
@@ -122,7 +117,7 @@ function wire(r, client) {
     r.state = map[d.state] || r.state;
     r.attempt = d.attempt || 0;
     if (d.state === "connected") {
-      r.expired = false;
+      r.issue = null;
       resumeWatches(r);
     }
     if (d.state === "connected" && d.reconnected) toast(t("ui.toast.reconnected", { room: r.name }), "check_circle");
@@ -162,8 +157,9 @@ function wire(r, client) {
     if (!w) return;
     endWatch(r, w);
     // A reconnect (theirs or ours, e.g. a relay restart) gives the sharer a fresh ConnId, so the same share comes back
-    // under a new stream key. Remember it for a minute and resume watching when it reappears.
-    const entry = { ownerName: w.ownerName, label: w.label, vol: w.vol, muted: w.muted, until: Date.now() + RESUME_MS };
+    // under a new stream key. The core cannot tell that from a stop + restart, so remember the stream's stableKey for
+    // a minute and resume watching when the same one reappears (the policy lives here, the identity comes from the core).
+    const entry = { stableKey: d.stableKey, ownerName: w.ownerName, label: w.label, vol: w.vol, muted: w.muted, until: Date.now() + RESUME_MS };
     r.resume.push(entry);
     setTimeout(() => {
       if (r.resume.includes(entry)) toast(t("ui.toast.watch_ended", { name: w.ownerName }), "tv_off");
@@ -180,8 +176,11 @@ function wire(r, client) {
   on("share", (d) => onShareEvent(r, d));
   on("subscribers", () => invalidate());
   on("error", (d) => {
-    if (d.code === "link-expired") {
-      r.expired = true;
+    if (d.code === "link-expired" || d.code === "relay-unreachable") {
+      r.issue = "unreachable";
+      invalidate();
+    } else if (d.code === "room-full") {
+      r.issue = "full";
       invalidate();
     } else if (d.code === "encoder-error") {
       toast(t("ui.toast.encoder_error", { error: d.message }), "error", { err: true });
@@ -203,7 +202,7 @@ function resumeWatches(r) {
   r.resume = r.resume.filter((e) => e.until > now);
   if (!r.resume.length || r.state !== "joined") return;
   for (const e of [...r.resume]) {
-    const s = r.streams.find((x) => x.kind === "video" && !x.self && !r.watches.has(x.key) && (x.ownerName || r.memberName(x.owner)) === e.ownerName && x.label === e.label);
+    const s = r.streams.find((x) => x.kind === "video" && !x.self && !r.watches.has(x.key) && (e.stableKey ? x.stableKey === e.stableKey : (x.ownerName || r.memberName(x.owner)) === e.ownerName && x.label === e.label));
     if (!s) continue;
     r.resume.splice(r.resume.indexOf(e), 1);
     const w = watchStream(r, s.key);

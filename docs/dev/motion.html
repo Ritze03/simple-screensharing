@@ -1,0 +1,32 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>motion</title>
+<style>html,body{margin:0;background:#000;overflow:hidden}canvas{display:block;width:100vw;height:100vh}</style>
+<canvas id="c"></canvas>
+<script>
+// Dev-only: full-window moving test content for screen-capture tests (e.g. native portal capture of a monitor). Every
+// animation frame redraws drifting rectangles plus a big frame counter, so the compositor reports damage at the display rate.
+const c = document.getElementById("c");
+const ctx = c.getContext("2d", { alpha: false });
+const rects = Array.from({ length: 60 }, (_, i) => ({ x: Math.random(), y: Math.random(), w: 0.03 + Math.random() * 0.12, h: 0.03 + Math.random() * 0.12, vx: (Math.random() - 0.5) * 0.004, vy: (Math.random() - 0.5) * 0.004, hue: Math.random() * 360 }));
+let n = 0;
+function resize() { c.width = innerWidth; c.height = innerHeight; }
+addEventListener("resize", resize);
+resize();
+function frame(t) {
+  n++;
+  ctx.fillStyle = `hsl(${(n * 2) % 360} 35% 20%)`;
+  ctx.fillRect(0, 0, c.width, c.height);
+  for (const r of rects) {
+    r.x = (r.x + r.vx + 1) % 1;
+    r.y = (r.y + r.vy + 1) % 1;
+    ctx.fillStyle = `hsl(${r.hue} 60% 50%)`;
+    ctx.fillRect(r.x * c.width, r.y * c.height, r.w * c.width, r.h * c.height);
+  }
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 120px monospace";
+  ctx.fillText(String(n), 40, 140);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>

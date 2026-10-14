@@ -95,7 +95,7 @@ export class AudioReceiver {
         buf.copyToChannel(plane, c);
         for (let i = 0; i < frames; i += 16) peak = Math.max(peak, Math.abs(plane[i]));
       }
-      this.level = peak;
+      this.level = Math.max(peak, this.level * 0.97); // peak meter with a ~0.5 s hold (20 ms frames), not one frame's instant peak
       const now = this.ctx.currentTime;
       const ptsUs = data.timestamp;
       let when;

@@ -92,6 +92,7 @@ scenario("unreachable relay -> ConnectError (not a hang)", async () => {
     err = e;
   }
   ok(err instanceof ConnectError, `got ${err && err.name}`);
+  ok(err.reason === "unreachable-or-expired-link", `a hash that never worked cannot be told apart from a down relay: reason=${err.reason}`);
   return { ms: Math.round(performance.now() - t0) };
 });
 
@@ -129,16 +130,54 @@ scenario("room is full at 8 members (JoinRejectedError RoomFull), a seat frees u
   } catch (e) {
     err = e;
   }
-  // The relay closes the connection right after writing JoinRejected and the frame can be lost with it
-  // (relay race, reported in README "Known relay issues"); the client then reports "join-no-reply".
-  const viaRejection = err instanceof JoinRejectedError && err.reason === "RoomFull";
-  const viaClose = err instanceof ConnectError && err.code === "join-no-reply";
-  ok(viaRejection || viaClose, `got ${err && err.name} ${err && (err.reason || err.code)}`);
+  // The relay (task #29) writes JoinRejected, finish()es the control stream and waits for us before closing, so the
+  // frame arrives: a proper JoinRejectedError, not the old join-no-reply guess.
+  ok(err instanceof JoinRejectedError && err.reason === "RoomFull", `got ${err && err.name} ${err && (err.reason || err.code)}`);
   ok(/full/i.test(err.message), "human readable message");
   await cs[7].disconnect();
   const again = await client(room.link, "m8-retry");
   ok(again.state === "connected", "joins once a seat is free");
-  return { rejectedVia: viaRejection ? "JoinRejected{RoomFull}" : "connection closed before the frame arrived (relay race)", closeInfo: err.closeInfo || null, cause: err.cause && String(err.cause.message || err.cause) };
+  return { rejectedVia: "JoinRejected{RoomFull} on the control stream" };
+});
+
+scenario("a first frame that is not Join -> JoinRejected{Malformed} on the control stream", async () => {
+  const { RelaySession } = await import("../js/core/session.js");
+  const { ControlFrameReader, decodeRelayToClient, encodeClientToRelay, frameControl } = await import("../js/core/protocol.js");
+  const s = await RelaySession.open({ server: RELAY, certHash: hashBytes() });
+  const bidi = await s.wt.createBidirectionalStream();
+  const w = bidi.writable.getWriter();
+  const r = bidi.readable.getReader();
+  await w.write(frameControl(encodeClientToRelay({ type: "Leave" })));
+  const fr = new ControlFrameReader();
+  const msgs = [];
+  let ended = false;
+  try {
+    for (;;) {
+      const { value, done } = await r.read();
+      if (done) {
+        ended = true;
+        break;
+      }
+      for (const f of fr.push(value)) msgs.push(decodeRelayToClient(f));
+    }
+  } catch (e) {}
+  s.wt.close();
+  ok(msgs.some((m) => m.type === "JoinRejected" && m.reason === "Malformed"), `got ${JSON.stringify(msgs)} (stream ended cleanly: ${ended})`);
+  return { msgs };
+});
+
+scenario("close codes: what Chromium shows for a relay-side close (0x102 after RoomFull)", async () => {
+  const room = newRoom();
+  for (let i = 0; i < 8; i++) await client(room.link, `m${i}`);
+  const { RelaySession } = await import("../js/core/session.js");
+  const { ControlFrameReader, decodeRelayToClient, encodeClientToRelay, frameControl, randomConnId } = await import("../js/core/protocol.js");
+  const s = await RelaySession.open({ server: RELAY, certHash: hashBytes() });
+  const bidi = await s.wt.createBidirectionalStream();
+  const w = bidi.writable.getWriter();
+  await w.write(frameControl(encodeClientToRelay({ type: "Join", connId: randomConnId(), roomId: room.roomId, displayName: "late" })));
+  // do not hang up: the relay waits up to 2 s for that, then closes with 0x102
+  const info = await Promise.race([s.wt.closed.then((i) => ({ closed: i }), (e) => ({ error: { name: e.name, message: e.message, source: e.source, streamErrorCode: e.streamErrorCode } })), sleep(6000).then(() => ({ timeout: true }))]);
+  return { closeInfoSeenByChromium: info };
 });
 
 scenario("roster + streams events as peers join, share, stop, leave", async () => {
@@ -419,20 +458,86 @@ scenario("relay restart: clients reconnect on their own, shares are re-announced
   const oldA = a.selfId;
   await kvSet("restart-relay", String(Date.now()));
   await kvGet("relay-restarted", { timeoutMs: 40_000 });
-  // The relay process is gone without any CONNECTION_CLOSE reaching the browser, so detection takes as long as the QUIC
-  // idle timeout (measured below), not milliseconds.
+  // The relay shuts down gracefully (CONNECTION_CLOSE, task #29), so the browser notices within milliseconds, and the
+  // first retry is immediate. (A relay that is killed or unplugged is still only noticed after the ~21 s idle timeout.)
   const t0 = performance.now();
   await waitFor(() => events(a, "state").some((e) => e.d.state === "reconnecting") && events(b, "state").some((e) => e.d.state === "reconnecting"), 90_000, "both clients noticed the outage");
   const detectedAfterMs = Math.round(performance.now() - t0);
   await waitFor(() => a.state === "connected" && b.state === "connected", 40_000, "both reconnected");
+  const reconnectedAfterMs = Math.round(performance.now() - t0);
+  ok(!events(a, "error").some((e) => e.d.code === "link-expired"), "an outage with a known-good hash is never reported as an expired link");
   ok(a.selfId !== oldA, "fresh ConnId after reconnect");
   ok(events(b, "watch-ended").length >= 1, "the old stream key ended for the viewer");
   const st2 = await waitFor(() => streamOf(b, a), 10_000, "sharer re-announced");
   b.watch(st2.key, { canvas: document.body.appendChild(document.createElement("canvas")) });
   await waitFor(() => (b.watchStats(st2.key) || {}).decoded > 5, 10_000, "viewer decodes after the restart");
   src.stop();
-  return { outageDetectedAfterMs: detectedAfterMs, reconnectEvents: events(a, "state").map((e) => e.d.state) };
+  return { outageDetectedAfterMs: detectedAfterMs, reconnectedAfterMs, reconnectEvents: events(a, "state").map((e) => e.d.state), errors: events(a, "error").map((e) => e.d.code) };
 }, { timeoutMs: 170_000 });
+
+scenario("relay down for a while: relay-unreachable (never link-expired), reconnectNow() skips the backoff", async () => {
+  const room = newRoom();
+  const a = await client(room.link, "alice");
+  const b = await client(room.link, "bob");
+  const src = makePatternSource(320, 180, 15);
+  await a.startShare({ stream: src.stream, fps: 15, bitrateKbps: 500, label: "Desk" });
+  const st = await waitFor(() => streamOf(b, a), 5000, "stream");
+  b.watch(st.key, { canvas: document.body.appendChild(document.createElement("canvas")) });
+  await waitFor(() => (b.watchStats(st.key) || {}).decoded > 5, 8000, "decoding");
+  await kvSet("stop-relay", "1");
+  await kvGet("relay-stopped", { timeoutMs: 20_000 });
+  await waitFor(() => events(a, "error").filter((e) => e.d.code === "relay-unreachable").length >= 3, 20_000, "three failed attempts reported as relay-unreachable");
+  ok(!events(a, "error").some((e) => e.d.code === "link-expired"), "no link-expired while the relay is down");
+  ok(a.state === "reconnecting", `state ${a.state}`);
+  await kvSet("start-relay", "1");
+  await kvGet("relay-started", { timeoutMs: 20_000 });
+  const t0 = performance.now();
+  // Retry now: no waiting for the (by now up to 8 s) backoff timer.
+  const stateAfter = await a.reconnectNow();
+  const ms = Math.round(performance.now() - t0);
+  ok(stateAfter === "connected" && a.state === "connected", `reconnectNow resolved with ${stateAfter}`);
+  ok(ms < 6000, `reconnectNow took ${ms} ms`);
+  ok(a.shares.length === 1, "the share is still registered");
+  await waitFor(() => b.state === "connected", 20_000, "bob back too");
+  const st2 = await waitFor(() => streamOf(b, a), 10_000, "alice's share re-announced");
+  b.watch(st2.key, { canvas: document.body.appendChild(document.createElement("canvas")) });
+  await waitFor(() => (b.watchStats(st2.key) || {}).decoded > 5, 10_000, "bob decodes the re-announced share");
+  src.stop();
+  return { reconnectNowMs: ms, errors: events(a, "error").map((e) => e.d.code) };
+}, { timeoutMs: 120_000 });
+
+scenario("reconnectNow() while connected keeps shares + watches of unaffected streams; stableKey survives the new ConnId", async () => {
+  const room = newRoom();
+  const a = await client(room.link, "alice");
+  const b = await client(room.link, "bob");
+  const sa = makePatternSource(320, 180, 15);
+  const sb = makePatternSource(320, 180, 15);
+  await a.startShare({ stream: sa.stream, fps: 15, bitrateKbps: 500, label: "Desk" });
+  await b.startShare({ stream: sb.stream, fps: 15, bitrateKbps: 500, label: "Laptop" });
+  const sta = await waitFor(() => streamOf(b, a), 5000, "alice's stream at bob");
+  const stb = await waitFor(() => streamOf(a, b), 5000, "bob's stream at alice");
+  ok(sta.stableKey && sta.stableKey === (await waitFor(() => streamOf(b, a), 1000, "again")).stableKey, "stableKey present and stable");
+  b.watch(sta.key, { canvas: document.body.appendChild(document.createElement("canvas")) });
+  a.watch(stb.key, { canvas: document.body.appendChild(document.createElement("canvas")) });
+  await waitFor(() => (b.watchStats(sta.key) || {}).decoded > 5 && (a.watchStats(stb.key) || {}).decoded > 5, 10_000, "both decode");
+  const oldB = b.selfId;
+  const decodedBefore = (b.watchStats(sta.key) || {}).decoded;
+  const state = await b.reconnectNow(); // bob restarts his connection
+  ok(state === "connected" && b.selfId !== oldB, "bob has a fresh ConnId");
+  ok(b.shares.length === 1, "bob's share stays registered");
+  ok(b.watches.has(sta.key), "bob's watch of alice (who did not reconnect) kept the same key and handle");
+  await waitFor(() => (b.watchStats(sta.key) || {}).decoded > decodedBefore + 5, 10_000, "bob keeps decoding alice");
+  // alice saw bob's old stream end (watch-ended carries the stableKey) and the new one appear under the same stableKey
+  const ended = await waitFor(() => events(a, "watch-ended").find((e) => e.d.key === stb.key), 5000, "watch-ended at alice");
+  ok(ended.d.stableKey === stb.stableKey, `watch-ended.stableKey ${ended.d.stableKey} vs ${stb.stableKey}`);
+  const nb = await waitFor(() => a.findStreamByStableKey(stb.stableKey, { exceptKeys: [stb.key] }), 5000, "bob's re-announced stream by stableKey");
+  ok(nb.key !== stb.key && nb.owner === b.selfId, "same stableKey, new key, new owner id");
+  a.watch(nb.key, { canvas: document.body.appendChild(document.createElement("canvas")) });
+  await waitFor(() => (a.watchStats(nb.key) || {}).decoded > 5, 10_000, "alice decodes bob's new stream");
+  sa.stop();
+  sb.stop();
+  return { oldKey: stb.key, newKey: nb.key, stableKey: nb.stableKey };
+}, { timeoutMs: 60_000 });
 
 // ---------------------------------------------------------------------------------------------------------------
 
