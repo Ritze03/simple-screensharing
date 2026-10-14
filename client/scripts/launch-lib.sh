@@ -3,6 +3,10 @@
 # launch-lib.sh — shared helpers for the repo-root launch-test.sh and
 # launch-test-tmux.sh. Source it, don't run it.
 #
+# LEGACY (2026-10-14): the monitor/placement functions act on the user's REAL desktop
+# (Hyprland via hyprctl; MangoWC via mmsg also supported). Agents must not use them; tests run in
+# the headless sway rig (client/scripts/hs-rig.sh).
+#
 # Everything here is about running the REAL native stack on a dev machine:
 # the relay (`simple-screensharing-server`) and N instances of the egui client
 # (`simple-screensharing-client`), each with its own scratch config dir, each
@@ -39,11 +43,24 @@ GUI_LOCK_FILE="${GUI_LOCK_FILE:-}"       # e.g. /tmp/claude-1000/sss-gui.lock wh
 # Monitor safety: refuse to put anything on HDMI
 # ---------------------------------------------------------------------------
 
-# The compositor's monitors as "name x y w h" lines (MangoWC: mmsg).
+# Which compositor we are on: "hyprland" (hyprctl, HYPRLAND_INSTANCE_SIGNATURE set), "mango"
+# (MangoWC, mmsg) or "" (neither). Hyprland wins when both tools exist.
+sss_wm() {
+  if [[ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]] && command -v hyprctl >/dev/null 2>&1; then echo hyprland
+  elif command -v mmsg >/dev/null 2>&1; then echo mango
+  fi
+}
+
+# The compositor's monitors as "name x y w h" lines (logical size: Hyprland's
+# width/height are the mode in pixels, so divide by scale and swap on 90/270 degree transforms).
 sss_monitors() {
-  command -v mmsg >/dev/null 2>&1 || return 1
   command -v jq >/dev/null 2>&1 || return 1
-  mmsg get all-monitors | jq -r '.monitors[] | "\(.name) \(.x) \(.y) \(.width) \(.height)"'
+  case "$(sss_wm)" in
+    hyprland) hyprctl -j monitors | jq -r '.[] | (if .transform % 2 == 1 then [.height, .width] else [.width, .height] end) as $s
+                | "\(.name) \(.x) \(.y) \($s[0] / .scale | floor) \($s[1] / .scale | floor)"' ;;
+    mango) mmsg get all-monitors | jq -r '.monitors[] | "\(.name) \(.x) \(.y) \(.width) \(.height)"' ;;
+    *) return 1 ;;
+  esac
 }
 
 # sss_check_monitors NAME...
@@ -58,8 +75,8 @@ sss_check_monitors() {
   fi
   local layout
   if ! layout="$(sss_monitors)" || [[ -z "$layout" ]]; then
-    echo "ERROR: cannot read the monitor layout (needs mmsg + jq on MangoWC)." >&2
-    echo "       Refusing to place windows blind. Set SSS_SKIP_MONITOR_CHECK=1 to override on another compositor." >&2
+    echo "ERROR: cannot read the monitor layout (needs hyprctl on Hyprland, or mmsg on MangoWC, plus jq)." >&2
+    echo "       Refusing to place windows blind. Set SSS_SKIP_MONITOR_CHECK=1 to override on another compositor (placement still needs hyprctl or mmsg)." >&2
     return 1
   fi
   local want n x y w h hx hy hw hh hname bad=0
@@ -86,7 +103,31 @@ sss_check_monitors() {
 sss_monitor_rect() { sss_monitors | awk -v m="$1" '$1==m {print $2, $3, $4, $5}'; }
 
 # Name of the currently focused monitor (so focus can be restored afterwards).
-sss_focused_monitor() { mmsg get all-monitors 2>/dev/null | jq -r '.monitors[] | select(.active) | .name' | head -1; }
+sss_focused_monitor() {
+  case "$(sss_wm)" in
+    hyprland) hyprctl -j monitors 2>/dev/null | jq -r '.[] | select(.focused) | .name' | head -1 ;;
+    mango) mmsg get all-monitors 2>/dev/null | jq -r '.monitors[] | select(.active) | .name' | head -1 ;;
+  esac
+}
+
+# Give focus to a monitor (new windows open on the focused one). Best effort.
+sss_focus_monitor() {
+  case "$(sss_wm)" in
+    hyprland) sss_hypr "hl.dsp.focus({ monitor = \"$1\" })" focusmonitor "$1" ;;
+    mango) mmsg dispatch focusmon,"$1" >/dev/null 2>&1 ;;
+  esac
+  return 0
+}
+
+# sss_hypr LUA_DISPATCH LEGACY_NAME LEGACY_ARG
+# Hyprland 0.55+ takes Lua dispatchers in `hyprctl dispatch` (the user's config is hyprland.lua);
+# older versions / hyprlang configs take the classic "name arg" form. Try Lua, fall back to legacy.
+# Prints nothing; returns 0 when hyprctl answered "ok".
+sss_hypr() {
+  local out
+  out="$(hyprctl dispatch "$1" 2>&1)"; [[ "$out" == ok* ]] && return 0
+  out="$(hyprctl dispatch "$2" "$3" 2>&1)"; [[ "$out" == ok* ]]
+}
 
 # ---------------------------------------------------------------------------
 # Optional shared-desktop GUI lock
@@ -193,8 +234,36 @@ TOML
 # Spawning and window placement
 # ---------------------------------------------------------------------------
 
-sss_client_id_for_pid() { mmsg get all-clients | jq -r --argjson p "$1" '.clients[] | select(.pid==$p) | .id' | head -1; }
-sss_client_monitor() { mmsg get all-clients | jq -r --argjson i "$1" '.clients[] | select(.id==$i) | .monitor'; }
+# A window is identified by an "id": MangoWC's client id, Hyprland's window address (0x...).
+sss_client_id_for_pid() {
+  case "$(sss_wm)" in
+    hyprland) hyprctl -j clients | jq -r --argjson p "$1" '[.[] | select(.pid==$p)][0].address // empty' ;;
+    mango) mmsg get all-clients | jq -r --argjson p "$1" '.clients[] | select(.pid==$p) | .id' | head -1 ;;
+  esac
+}
+# Monitor NAME the window is on (Hyprland reports a numeric monitor id: mapped through the monitor list).
+sss_client_monitor() {
+  case "$(sss_wm)" in
+    hyprland) hyprctl -j clients | jq -r --arg a "$1" --argjson m "$(hyprctl -j monitors)" \
+                '.[] | select(.address==$a) | .monitor as $i | $m[] | select(.id==$i) | .name' ;;
+    mango) mmsg get all-clients | jq -r --argjson i "$1" '.clients[] | select(.id==$i) | .monitor' ;;
+  esac
+}
+
+# sss_float_move_resize ID X Y W H: float the window and put it at global X,Y with size WxH.
+sss_float_move_resize() {
+  local id="$1" x="$2" y="$3" w="$4" h="$5"
+  case "$(sss_wm)" in
+    hyprland)
+      sss_hypr "hl.dsp.window.float({ action = \"enable\", window = \"address:$id\" })" setfloating "address:$id"
+      sss_hypr "hl.dsp.window.move({ x = $x, y = $y, relative = false, window = \"address:$id\" })" movewindowpixel "exact $x $y,address:$id"
+      sss_hypr "hl.dsp.window.resize({ x = $w, y = $h, relative = false, window = \"address:$id\" })" resizewindowpixel "exact $w $h,address:$id" ;;
+    mango)
+      mmsg dispatch togglefloating client,"$id" >/dev/null
+      mmsg dispatch movewin,"$x","$y" client,"$id" >/dev/null
+      mmsg dispatch resizewin,"$w","$h" client,"$id" >/dev/null ;;
+  esac
+}
 
 # sss_place PID MONITOR
 # Waits for PID's window; if it did not open on MONITOR, floats it and moves it
@@ -210,9 +279,7 @@ sss_place() {
   [[ -n "$id" ]] || { echo "ERROR: no window for pid $pid after 20 s" >&2; return 1; }
   if [[ "$(sss_client_monitor "$id")" != "$mon" ]]; then
     read -r x y w h <<<"$(sss_monitor_rect "$mon")"
-    mmsg dispatch togglefloating client,"$id" >/dev/null
-    mmsg dispatch movewin,$((x + 60)),$((y + 60)) client,"$id" >/dev/null
-    mmsg dispatch resizewin,$((w - 120)),$((h - 120)) client,"$id" >/dev/null
+    sss_float_move_resize "$id" $((x + 60)) $((y + 60)) $((w - 120)) $((h - 120))
     sleep 0.5
   fi
   [[ "$(sss_client_monitor "$id")" == "$mon" ]] || { echo "ERROR: window $id (pid $pid) is on '$(sss_client_monitor "$id")', wanted $mon" >&2; return 1; }
@@ -225,7 +292,7 @@ CLIENT_PIDS=()
 sss_spawn_client() {
   local n="$1" mon="$2" cfg="$SCRATCH/cfg$n"
   sss_seed_config "$cfg" "client-$n"
-  mmsg dispatch focusmon,"$mon" >/dev/null 2>&1 || true     # new windows open on the focused monitor
+  sss_focus_monitor "$mon"     # new windows open on the focused monitor
   log "starting client #$n on $mon (XDG_CONFIG_HOME=$cfg, log $SCRATCH/client$n.log)"
   # CLIENT_ENV_<n> ("A=1 B=2") adds environment for client n only, e.g. GST_DEBUG_FILE
   # for the sharer (two clients must not write the same file).
@@ -247,7 +314,7 @@ sss_spawn_clients() {
     sss_spawn_client "$n" "${mons[$(( (n - 1) % ${#mons[@]} ))]}" || return 1
     sleep 1
   done
-  [[ -n "$prev" ]] && mmsg dispatch focusmon,"$prev" >/dev/null 2>&1
+  [[ -n "$prev" ]] && sss_focus_monitor "$prev"
   return 0
 }
 

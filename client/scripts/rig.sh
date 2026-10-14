@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# LEGACY (2026-10-14): works on the user's REAL MangoWC desktop only (puts the clients on real monitors via mmsg). Agents must not
+# LEGACY (2026-10-14): works on the user's REAL desktop only (puts the clients on real monitors via launch-lib.sh: Hyprland or MangoWC). Agents must not
 # use it: since the headless switch all real-app tests run in the private headless sway rig,
 # see hs-rig.sh and superdoc/claude-instructions/testing-and-verification.md. Headless: hs-rig.sh.
 #

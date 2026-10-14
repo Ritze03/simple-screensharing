@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# LEGACY (2026-10-14): puts client windows on the user's REAL MangoWC desktop (mmsg, real monitors).
+# LEGACY (2026-10-14): puts client windows on the user's REAL desktop (Hyprland via hyprctl; MangoWC via mmsg also supported; real monitors).
 # Agents must not use it: since the headless switch all real-app tests run in the private headless
 # sway rig, see client/scripts/hs-rig.sh and superdoc/claude-instructions/testing-and-verification.md.
 # Why: the user works at that machine and asked for tests off their desktop. The script refuses
@@ -38,7 +38,7 @@ Env var overrides:
   CLIENTS           number of client instances (default: 2)
   CLIENT_MONITORS   monitor per client, space separated, wraps around
                     (default: "DP-2 DP-2"). Refused if any is an HDMI output
-                    or overlaps one (checked with mmsg; MangoWC).
+                    or overlaps one (checked with hyprctl on Hyprland or mmsg on MangoWC).
   PROFILE           release (default) or debug. Use release for fps work.
   CARGO_TARGET_DIR  build dir (default: <repo>/target, on disk, never /tmp)
   SCRATCH           scratch dir for configs/logs/relay state
@@ -57,7 +57,7 @@ Env var overrides:
                     returns (several agents sharing one desktop); the relay and
                     clients never inherit it
   SSS_SKIP_MONITOR_CHECK=1
-                    skip the HDMI safety check (non-MangoWC compositors only)
+                    skip the HDMI safety check (compositors other than Hyprland/MangoWC only)
 
 This run's relay session would be '$TMUX_SESSION' (a new name each run unless
 TMUX_SESSION is set); a watchdog session '$TMUX_SESSION-watchdog' stops the

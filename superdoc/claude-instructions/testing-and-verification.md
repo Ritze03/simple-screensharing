@@ -20,8 +20,8 @@ any substitute, and it removes the judgment call about when a substitute is "goo
 
 **The compositor is a private headless sway that you start yourself (`client/scripts/hs-rig.sh
 up`). The user's real desktop is never used for tests.** Nothing in a test may touch the user's
-real outputs or input: no windows, no `mmsg`, no `ydotool`, no `grim` without the rig's
-environment, no real portal picker. Never touch the user's real outputs (MangoWC: DP-1, DP-2,
+real outputs or input: no windows, no `hyprctl dispatch`/`mmsg`, no `ydotool`, no `grim` without the rig's
+environment, no real portal picker. Never touch the user's real outputs (Hyprland: DP-1, DP-2,
 DP-3, HDMI-A-1). The GUI lock is not needed (the rig shares nothing visible with anyone).
 
 What does **not** count as verification of app behaviour:
@@ -100,7 +100,7 @@ Rules for working in it:
   the pattern (`HS_PATTERN=none` only for idle-monitor tests).
 - Use `PROFILE=release` (the default) for any fps/latency judgment; debug is far too slow for
   240 fps.
-- What the rig cannot do: it is sway, not MangoWC (compositor-specific behaviour such as
+- What the rig cannot do: it is sway, not the user's Hyprland (compositor-specific behaviour such as
   output layout events, scratchpads, DPMS is not exercised); the headless 240 Hz output is
   paced by a timer in the headless backend, not a monitor (vsync, tearing and VRR behaviour are not
   representative; throughput is: ~239 fps captured from it); the audio path is not testable (below);
@@ -136,7 +136,8 @@ the default; `HS_PIPEWIRE=shared` is available but you should not need it.) See
 
 ## Machine safety
 
-- **Never touch the user's real outputs** (MangoWC: DP-1, DP-2, DP-3, HDMI-A-1; the last one
+- **Never touch the user's real outputs** (Hyprland, layout read 2026-10-14: DP-1 at 0,0
+  1920x1080@280 Hz, DP-2 at 1920,0, DP-3 at -1920,0, HDMI-A-1 at 0,-1080 above DP-1; the last one
   holds their WinBoat RDP window). No window, click, screenshot or capture there. Re-check: if
   a command of yours has no rig environment it is aimed at the real session.
 - **PipeWire**: the rig's own instance is private. If you ever use the shared one, screencast
@@ -206,6 +207,10 @@ started, and say in your report what you started and that you stopped it.
 
 ## History
 
+- **2026-10-14: the user switched their desktop from MangoWC to Hyprland 0.56.2** (same output
+  names; layout in "Machine safety"). The repo-root `launch-test*.sh` (via
+  `client/scripts/launch-lib.sh`) gained `hyprctl` support next to `mmsg`; the HDMI refusal and
+  overlap check work on both. Rules above are unchanged: agents still never run them.
 - **2026-10-14 (user request): everything moved into a private headless sway rig.** The user,
   back at their desk, asked to keep testing in headless sway and to stop audio tests. The
   real-desktop rules (monitor table with HDMI-A-1 forbidden zone, `mmsg`, GUI lock, `ydotool`

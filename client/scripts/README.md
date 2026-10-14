@@ -3,7 +3,7 @@
 Dev tooling for running and measuring the real native stack (relay + egui client).
 
 **Since 2026-10-14 all real-app testing runs in a private headless sway rig (`hs-*`).** The
-user's real MangoWC desktop is never used for tests; the scripts that only work there are kept
+user's real desktop (Hyprland; MangoWC also supported) is never used for tests; the scripts that only work there are kept
 as **legacy** (bottom of this page) and carry a banner. The rule and the machine facts:
 `superdoc/claude-instructions/testing-and-verification.md`.
 
@@ -69,17 +69,21 @@ tile x) are constants at the top of `hs-drive.sh`, measured on the 1920x1080 ful
 
 | Script | Purpose |
 | --- | --- |
-| `launch-lib.sh` | build (own `target/`), scratch dir, relay cert hash, join string, per-client scratch config (`rooms.toml` auto-connect + `settings.toml`; `SSS_LANGUAGE=de` seeds the UI language; `START_CODEC/FPS/KBPS` the stream form). Its mmsg/monitor functions are legacy. |
+| `launch-lib.sh` | build (own `target/`), scratch dir, relay cert hash, join string, per-client scratch config (`rooms.toml` auto-connect + `settings.toml`; `SSS_LANGUAGE=de` seeds the UI language; `START_CODEC/FPS/KBPS` the stream form). Its monitor/window-placement functions (`hyprctl` on Hyprland, `mmsg` on MangoWC) are legacy. |
 | `gst-rate.py` | buffers/s per pad from the tracer log (`--summary`: capture / encode-branch input / encoder output) |
 | `portal-probe.py` | own ScreenCast portal session, rate of `pipewiresrc` into a chosen tail (run it with `hs-probe.sh`). `--src` adds pipewiresrc properties, `--watch` prints buffers/s of named tail elements. Use a tail that starts with a video caps filter (`video/x-raw ! ...`), never a bare `fakesink` (see its docstring). #39 found the 140 fps portal ceiling with it, see `superdoc/features/stream-control.md` "Capture/encode performance" |
 | `enc-bench.sh` | raw `vah264enc`/`vah265enc`/`vaav1enc` throughput at 1080p (no desktop involved) |
 | `pw-node-rate.sh` | rate of a PipeWire node (against whatever PipeWire the env points at) |
 | `stop-launch.sh` | stop what a legacy launch scratch dir started |
 
-## Legacy: real MangoWC desktop only (do not use for tests)
+## Legacy: real desktop only (Hyprland; MangoWC also supported; do not use for tests)
 
-Kept for history and for the user's own use. All of them move windows with `mmsg`, click with
+Kept for history and for the user's own use. All of them move windows with `hyprctl`/`mmsg`, click with
 `ydotool`, or answer the real portal picker, i.e. they act on the user's real session.
+
+Only `launch-lib.sh` (so repo-root `launch-test*.sh`, `rig.sh`, `stop-launch.sh`) was ported to
+Hyprland (2026-10-14, the user's desktop changed); the other scripts here, e.g. `test-launch-fg.sh`
+and `drive.sh`, still use `mmsg` and only work on MangoWC.
 
 | Script | Replaced by |
 | --- | --- |
