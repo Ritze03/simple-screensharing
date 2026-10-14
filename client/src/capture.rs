@@ -1956,6 +1956,11 @@ pub struct CaptureHandle {
     // normally (bare-drop backstop path) is fine, per `PreviewHandle`'s own
     // doc comment (dropping `stop_tx` promptly stops its background task).
     preview_handle: Option<PreviewHandle>,
+    /// The client the running [`Self::preview_handle`] sends through, kept so
+    /// [`Self::ensure_preview_task`] can tell when that connection died (a
+    /// reconnect hands the capture a *new* client) and move the preview task
+    /// over to it.
+    preview_client: Option<ScreenshareClient>,
     // Latest frame off the self-preview tee branch (see
     // [`SELF_PREVIEW_BRANCH_FRAMERATE`]), written by [`capture_loop`] and read
     // back (and cleared) via [`CaptureHandle::self_preview_frame`] — the same
@@ -2254,6 +2259,7 @@ async fn start_capture_with_source(framerate: u32, capture_source: CaptureSource
         capture_source,
         capture_task,
         preview_handle: None,
+        preview_client: None,
         preview_sink: Some(preview_sink),
         self_preview_frame,
         source_state: Mutex::new(source),
@@ -2692,13 +2698,29 @@ impl CaptureHandle {
     /// capture (`start_capture`) has no room to send a thumbnail to yet — see
     /// [`CaptureHandle::preview_sink`]'s doc comment on why the appsink is
     /// safe to leave unconsumed until this runs.
+    ///
+    /// `Why it also restarts:` the task is bound to one client and one
+    /// `stream_id`. After an automatic reconnect the session rebuilds this
+    /// capture's destinations on a *new* client (no new picker), and the old
+    /// task keeps failing on the dead connection, so peers would see no
+    /// thumbnail of the share until the capture was restarted. So when the
+    /// client the task was started with has a closed connection and the caller
+    /// brings a live one, the old task is stopped and a new one started on the
+    /// new client and stream id. This is why the `AppSink` is cloned, not
+    /// taken: a fresh frame stream can be made from it as often as needed.
     fn ensure_preview_task(&mut self, client: &ScreenshareClient, stream_id: u8) {
         if self.preview_handle.is_some() {
-            return;
+            let dead = self.preview_client.as_ref().is_some_and(|c| c.connection().close_reason().is_some());
+            if !dead || client.connection().close_reason().is_some() {
+                return;
+            }
+            // Dropping the handle stops its task promptly (see `PreviewHandle`).
+            self.preview_handle = None;
         }
-        let Some(sink) = self.preview_sink.take() else { return };
+        let Some(sink) = self.preview_sink.clone() else { return };
         let preview_frames: FrameStream = preview_frame_stream(sink);
         self.preview_handle = Some(preview::spawn_preview_task(client.clone(), stream_id, preview_frames));
+        self.preview_client = Some(client.clone());
     }
 
     /// Stop sending into one room, leaving every other destination of this
@@ -9271,6 +9293,65 @@ mod tests {
             std::fs::write(&path, out).expect("write ppm");
             eprintln!("[viewer] wrote {path}");
         }
+    }
+
+    /// After a reconnect the session hands the capture a *new* client for the
+    /// rebuilt destination; the room-preview task must move over to it instead
+    /// of failing forever on the dead connection
+    /// ([`CaptureHandle::ensure_preview_task`]).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "spawns a real relay server (SSSHARE_SERVER_BIN)"]
+    async fn preview_task_moves_to_the_new_client_after_a_reconnect() {
+        use crate::end_to_end_test::{connect_with_retry, pick_free_udp_port, spawn_relay_server};
+        use crate::protocol::RoomId;
+
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let port = pick_free_udp_port().expect("port");
+        let _server = spawn_relay_server(port).expect("relay");
+        let join = crate::net::format_join_string(
+            &format!("127.0.0.1:{port}"),
+            &rand::random::<RoomId>(),
+            &rand::random::<[u8; 32]>(),
+        );
+        let (first, _s, _e1) = connect_with_retry(&join, "sharer").await.expect("sharer joins");
+        let mut handle = start_sharing_from_test_source(
+            &first,
+            1,
+            DEFAULT_BITRATE_KBPS,
+            DEFAULT_FRAMERATE,
+            "videotestsrc is-live=true ! video/x-raw,width=320,height=180",
+        )
+        .await
+        .expect("share starts");
+        assert_eq!(handle.preview_client.as_ref().map(|c| c.conn_id()), Some(first.conn_id()));
+
+        // Same client again (e.g. a second room on a live connection): untouched.
+        let params = handle.destination_runtime(DestKey(0)).expect("runtime").lock().unwrap().params();
+        let same = handle
+            .spawn_add_destination(&first, 2, DestKey(1), params.clone())
+            .await
+            .expect("channel")
+            .expect("destination");
+        handle.register_destination(Some(&first), same);
+        assert_eq!(handle.preview_client.as_ref().map(|c| c.conn_id()), Some(first.conn_id()));
+
+        // The connection dies; a new client takes over.
+        first.connection().close(0u32.into(), b"test drop");
+        let (second, _s, _e2) = connect_with_retry(&join, "sharer").await.expect("sharer rejoins");
+        assert_ne!(first.conn_id(), second.conn_id());
+        let rebuilt = handle
+            .spawn_add_destination(&second, 3, DestKey(2), params)
+            .await
+            .expect("channel")
+            .expect("destination");
+        handle.register_destination(Some(&second), rebuilt);
+        assert_eq!(
+            handle.preview_client.as_ref().map(|c| c.conn_id()),
+            Some(second.conn_id()),
+            "the preview task must be restarted on the new client"
+        );
+        assert!(handle.preview_handle.is_some());
+        handle.stop().await.expect("stops");
     }
 
     // ----- orientation stage ([`orientation_fragment`]) -----
