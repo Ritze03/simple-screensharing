@@ -77,6 +77,8 @@ def main():
     ap.add_argument("--secs", type=int, default=10)
     ap.add_argument("--tail", default="fakesink sync=false")
     ap.add_argument("--keepalive", type=int, default=0)
+    ap.add_argument("--watch", default="", help="comma-separated element names in --tail whose src-pad buffers/s are also printed (name them with name=X)")
+    ap.add_argument("--src", default="", help="extra pipewiresrc properties, e.g. 'min-buffers=8 max-buffers=16'")
     ap.add_argument("--cursor", type=int, default=0, help="portal cursor_mode: 0 none/default, 1 hidden, 2 embedded (what the app uses), 4 metadata")
     a = ap.parse_args()
 
@@ -101,7 +103,7 @@ def main():
     fd = fdl.get(ret.unpack()[0])
 
     ka = f" keepalive-time={a.keepalive}" if a.keepalive else ""
-    desc = f"pipewiresrc name=src fd={fd} path={node} do-timestamp=true{ka} ! {a.tail}"
+    desc = f"pipewiresrc name=src fd={fd} path={node} do-timestamp=true{ka} {a.src} ! {a.tail}"
     print("pipeline:", desc, flush=True)
     pipe = Gst.parse_launch(desc)
     src = pipe.get_by_name("src")
@@ -118,6 +120,27 @@ def main():
         return Gst.PadProbeReturn.OK
 
     src.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, probe)
+
+    def event_probe(_pad, info):
+        ev = info.get_event()
+        if ev is not None and ev.type == Gst.EventType.TAG:
+            print(f"  TAG event at pipewiresrc: {ev.parse_tag().to_string()}", flush=True)
+        return Gst.PadProbeReturn.OK
+
+    src.get_static_pad("src").add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, event_probe)
+    watch = {}
+    for nm in [w for w in a.watch.split(",") if w]:
+        el = pipe.get_by_name(nm)
+        if el is None:
+            sys.exit(f"--watch: no element named {nm}")
+        watch[nm] = [0, 0]
+
+        def mk(nm):
+            def wprobe(_pad, _info):
+                watch[nm][0] += 1
+                return Gst.PadProbeReturn.OK
+            return wprobe
+        el.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, mk(nm))
     pipe.set_state(Gst.State.PLAYING)
     t0 = time.time()
     last = 0
@@ -126,7 +149,11 @@ def main():
         time.sleep(1.0)
         c = count[0]
         rates.append(c - last)
-        print(f"  t={time.time()-t0:4.1f}s  pipewiresrc buffers/s = {c - last}", flush=True)
+        extra = ""
+        for nm, v in watch.items():
+            extra += f"  {nm}={v[0] - v[1]}"
+            v[1] = v[0]
+        print(f"  t={time.time()-t0:4.1f}s  pipewiresrc buffers/s = {c - last}{extra}", flush=True)
         last = c
     caps = src.get_static_pad("src").get_current_caps()
     print("caps:", caps.to_string() if caps else None)
