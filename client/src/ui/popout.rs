@@ -7,11 +7,11 @@
 //! this module turns into [`UiAction::BringBack`] on the next main-window
 //! frame.
 //!
-//! Feature set of the Electron viewer window (`frontend/viewer.html`,
-//! `superdoc/features/viewer-window.md`), drawn like the mockup's tile
+//! The pop-out viewport's feature set (see `superdoc/features/viewer-window.md`
+//! for the behaviour spec and its history), drawn like the mockup's tile
 //! overlay:
-//! - **Hover-gated chrome**: while the pointer is anywhere in the window (the
-//!   Electron `body:hover`; no idle timeout there either) a vignette, a top
+//! - **Hover-gated chrome**: while the pointer is anywhere in the window
+//!   (no idle timeout) a vignette, a top
 //!   row `[fill statbar][29 ×]` and a bottom audio pill. The statbar is
 //!   `[dot][name · room][WxH][dec/pres fps][bitrate]`, mono values in fixed
 //!   tabular-width fields so they don't jitter.
@@ -21,7 +21,7 @@
 //! - **Waiting / stalled**: a centred chip before the first frame and while
 //!   the decoder reports a stall (always shown, not hover-gated).
 //! - **F11** toggles fullscreen, **Escape** only leaves fullscreen (never
-//!   closes — the Electron rule).
+//!   closes).
 //! - Title "sharer · room"; first size from the stream's aspect ratio.
 //!
 //! Performance: the viewport closure only locks the view and paints it when

@@ -76,7 +76,7 @@ Results (this machine, Chromium 153, relay + native client built from this branc
 | 2c AV1 60 / 120 | pass: 59.9 / 120.0 fps (the native AV1 stream declares 1920x1082) |
 | 2d H.265 60 (headed Chromium, VAAPI decode) | pass: 60.1 fps, 8.4 Mbps; headless cannot decode H.265 |
 | 3 room full (9th member) | pass: the UI shows "This room is full (8 people at most)" (`JoinRejected{RoomFull}` on the control stream) |
-| 4 relay restart | browser: reconnecting at 0 ms, joined again after 0.6 s, share kept live; viewers re-watch by `stableKey`. **Native does not reconnect by itself** (stays on "Not connected"); manual Connect + Watch works |
+| 4 relay restart | browser: reconnecting at 0 ms, joined again after 0.6 s, share kept live; viewers re-watch by `stableKey`. *measured before the native auto-reconnect landed (#36/#37): the native client then stayed on "Not connected"; it now retries by itself and restores its watches/shares (`session.rs` `ReconnectState`)* |
 | 5 pop-out of a native stream (Document PiP, headed) | pass: PiP window with the canvas, 60 fps decoded and audio continue |
 | 6 links | browser-created link -> native Join modal: pass; native "Copy invite link" is byte-identical to it (hash kept). Native Create minted link has **no cert hash**: the browser refuses it with a clear message; the native "Copy invite link" of the live room has it and the browser joins |
 
@@ -85,11 +85,13 @@ are real Opus frames of that quiet signal. `level` is a peak meter with a ~0.5 s
 
 Findings outside the website (not fixed here):
 
-* **Native sender frames of a rotated output are rotated.** DP-2 is configured `rr:2` (180 degrees) in mango; a portal capture of it
-  arrives 180 degrees rotated in every viewer (`VideoFrame.rotation` is 0, the pixels are rotated; DP-1 arrives upright, the native
-  viewer shows DP-1 upright). The native pipeline ignores the PipeWire `VideoTransform` meta.
-* **A killed or closed native app stays in the room for about 60-75 s** (the relay's idle timeout): no `Leave` / close on SIGTERM or window close.
-* The native app does not auto-reconnect after a relay restart (see scenario 4).
+* **Native sender frames of a rotated output were rotated** (found here, fixed since in #35). DP-2 is configured `rr:2` (180 degrees)
+  in mango; a portal capture of it arrived 180 degrees rotated in every viewer (`VideoFrame.rotation` is 0, the pixels were rotated).
+  The native capture now turns the PipeWire `SPA_META_VideoTransform` into an orientation stage, so the viewer sees it upright
+  (`client/src/capture.rs` module doc, `orientation_fragment`).
+* **A killed or closed native app used to stay in the room for about 60-75 s** (the relay's idle timeout). Since #36 SIGTERM/SIGINT
+  and window close run a clean exit that tells the relay we left (`session.rs` `install_shutdown_signal_handlers`, `AppState::shutdown`).
+* The native app did not auto-reconnect after a relay restart (scenario 4); it does since #36/#37.
 
 ## Vectors (Rust -> JS and JS -> Rust)
 
@@ -97,7 +99,7 @@ Findings outside the website (not fixed here):
 `net`/`fragment` code: every `ClientToRelay`/`RelayToClient` variant as postcard hex, both fixed headers, ten
 encrypt+fragment cases (empty payload, one byte over a fragment, exactly two fragments, `u32::MAX` counter, 600-byte datagram
 cap, ...), three previews, 23 join-link strings classified by the real Rust parser, and 18 codec-sniff / codec-string cases
-(real x264/x265/VA/SVT/libaom output, strings computed by the Electron sidecar's Rust code).
+(real x264/x265/VA/SVT/libaom output, strings computed by the native client's Rust code).
 `tests.js` asserts JS reproduces the ciphertext/datagrams byte-exactly and decodes the Rust bytes. In the other direction the
 test page also emits JS-made frames/previews/control messages/links (`reverse`), and the same Rust program decrypts,
 reassembles and parses them: `RUST VERIFIED 20 JS-produced vectors`.

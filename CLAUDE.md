@@ -1,9 +1,10 @@
 # simple-screensharing
 
-Planning workspace for a friends screensharing platform; see
-`superdoc/architecture/overview.md`. This repo currently holds no source code — the
-actual implementation lives in sibling repos (Rust relay server, Rust/egui desktop
-client, browser-viewer site) that don't exist yet.
+Friends screensharing platform, one monorepo (Cargo workspace on branch `rework`):
+`client/` (native Rust/egui desktop app: capture, encode, decode, UI), `server/` (Rust QUIC/WebTransport
+relay with a ratatui TUI), `protocol/` (shared wire crate), `docs/` (the GitHub-Pages browser client,
+watch and share; `docs/js/core` protocol+media core, `docs/js/ui` UI, `docs/dev` test harness) and
+`superdoc/` (this knowledge base). Orientation: `README.md`, then `superdoc/architecture/overview.md`.
 
 <!-- superdoc:start v2 -->
 ## Docs: read before you touch, update after you change
@@ -29,8 +30,8 @@ optional, on-demand read.
 - **Version policy** — @superdoc/claude-instructions/documentation-version-policy.md — how
   this project bumps doc/version markers.
 - **Testing and verification** — @superdoc/claude-instructions/testing-and-verification.md —
-  verify against the real app (not mock/browser) whenever a change touches real Tauri/Electron
-  behavior; how to launch it safely.
+  verify against the real egui binary + a real relay (not the `--gallery`, mocks or a browser);
+  how to launch it safely. The launch recipe is `client/.claude/skills/run/SKILL.md`.
 
 Path base: `CLAUDE.md` uses repo-root-relative paths (`@superdoc/...`, `` `superdoc/...` ``);
 links *inside* docs are docs-relative. Precedence: `CLAUDE.md` is authoritative for
