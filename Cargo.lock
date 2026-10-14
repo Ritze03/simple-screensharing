@@ -4513,6 +4513,7 @@ dependencies = [
  "serde",
  "serde_json",
  "simple-screensharing-protocol",
+ "socket2",
  "time",
  "tokio",
  "tracing",

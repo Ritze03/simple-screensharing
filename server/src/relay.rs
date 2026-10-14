@@ -198,8 +198,31 @@ pub fn build_endpoint(listen_addr: SocketAddr) -> Result<Endpoint> {
 /// rotation, `run`). The caller keeps the manager and runs
 /// [`CertManager::maintain`] if the cert should rotate.
 pub fn build_endpoint_with(listen_addr: SocketAddr, certs: &CertManager) -> Result<Endpoint> {
-    Endpoint::server(certs.server_config()?, listen_addr)
-        .with_context(|| format!("binding QUIC endpoint on {listen_addr}"))
+    // `Endpoint::server` leaves the platform default for IPV6_V6ONLY, which is
+    // "on" on Windows: a `[::]` listener would then never see an IPv4 client.
+    // Bind the socket ourselves and ask for dual-stack explicitly (what
+    // `Endpoint::client` does internally).
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(listen_addr),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )
+    .context("creating the QUIC UDP socket")?;
+    if listen_addr.is_ipv6() {
+        if let Err(e) = socket.set_only_v6(false) {
+            tracing::debug!(%e, "unable to make the QUIC socket dual-stack");
+        }
+    }
+    socket
+        .bind(&listen_addr.into())
+        .with_context(|| format!("binding QUIC endpoint on {listen_addr}"))?;
+    Endpoint::new(
+        quinn::EndpointConfig::default(),
+        Some(certs.server_config()?),
+        socket.into(),
+        Arc::new(quinn::TokioRuntime),
+    )
+    .with_context(|| format!("creating QUIC endpoint on {listen_addr}"))
 }
 
 /// Run the accept loop on an already-bound endpoint until the process is

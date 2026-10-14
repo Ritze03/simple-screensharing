@@ -1797,8 +1797,8 @@ fn isolate_source_from_branch_renegotiation(tee: &gst::Element, domain: CaptureD
 /// code:` [`Element::state`]'s blocking wait below takes a `ClockTime`
 /// timeout argument, but that timeout is **not reliable** under real-world
 /// contention — measured directly while diagnosing the "repeated Stop→Share
-/// restart cycles permanently wedge the backend" bug (history:
-/// `superdoc/ui/FRONTEND-SHELL.md`'s dated entry): starting a new capture
+/// restart cycles permanently wedge the backend" bug (history: the
+/// Electron-era frontend notes, since removed from the docs): starting a new capture
 /// immediately after the previous one's portal session/pipeline finished
 /// tearing down can leave `pipewiresrc`'s state change stuck deep inside
 /// GStreamer/PipeWire's own synchronization for far longer than the 5s

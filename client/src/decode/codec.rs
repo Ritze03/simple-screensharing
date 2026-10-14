@@ -6,7 +6,7 @@
 //! deliberate — a sender can switch codec by editing a destination, and a tag
 //! that can go stale is worse than none. The bitstream cannot go stale, so the
 //! receiver reads the codec out of it. This is the Rust port of the
-//! discrimination the Electron sidecar's `video_server.rs` does to derive
+//! discrimination the former Electron sidecar's `video_server.rs` (removed) does to derive
 //! WebCodecs codec strings; only the *codec* decision is kept here (profile /
 //! level strings are a browser concern).
 //!

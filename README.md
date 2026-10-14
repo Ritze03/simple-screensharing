@@ -30,7 +30,7 @@ a second client or the browser client. Details: [`client/README.md`](client/READ
   (and a relay tarball) in a Debian 13 container; it bundles GStreamer and uses the host's GPU
   stack, PipeWire and portal. Supported: Fedora 42+, Ubuntu 25.10 / 26.04, Debian 13, Arch
   (Ubuntu 24.04 is not). See [`client/packaging/README.md`](client/packaging/README.md).
-- **Windows:** in progress, see [`superdoc/features/windows.md`](superdoc/features/windows.md).
+- **Windows:** builds with MSVC + GStreamer 1.26.9 and is packaged by `client/packaging/windows/package.ps1`; Linux<->Windows sharing is verified headless. The GUI window and screen capture on a real desktop session are not verified yet. See [`superdoc/features/windows.md`](superdoc/features/windows.md).
 - **Browser:** the client in `docs/` is meant to be served by GitHub Pages (not enabled yet).
   Locally: `node docs/dev/headless.mjs serve --port 8123`, see [`docs/dev/README.md`](docs/dev/README.md).
 
