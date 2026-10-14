@@ -76,6 +76,21 @@ bitrate section below). `StreamDecoder::decoded_fps()` / `presented_fps()` are t
 accessors; `current_fps()` is kept for the old UI. `received_bitrate_kbps()` is unchanged: it
 counts compressed bytes in `feed()`.
 
+**Visible size, not coded size (task #40, 2026-10-14).** `DecodedFrame::width/height` are the
+visible picture. Order of preference (`frame::visible_rect`): the decoder's `GstVideoCropMeta`
+if the buffer has one; else the size the sender announced in `StreamInfo` (set with
+`StreamDecoder::set_display_size`, which `RoomSession::toggle_watch` calls), when the frame is
+less than 64 px larger in each direction. The planes start at the crop origin, so `y()`/`uv()`
+and the strides stay valid and the GPU renderer samples only the visible area.
+`Why the announced size is needed:` `vaav1enc` on this machine (AMD VCN4, RX 7900 XTX) encodes
+1920x1080 as 1920x1082: the AV1 sequence header says `max_frame_height = 1082`, the frame header
+uses it and has `render_and_frame_size_different = 0`, so `vaav1enc`'s own caps say 1080 but the
+decoder (`vaav1dec`) outputs 1920x1082 with no crop meta. Nothing in the bitstream names the
+two padding lines (a known VCN4 hardware limitation: AV1 block alignment 64x16; also Mesa issue
+9185). 720p, 1088 and 1440p come out right; `vah264dec`/`vah265dec` already give 1080.
+Decoded padding lines are black. Not fixable at the encoder from `capture.rs` short of
+rewriting the OBU headers.
+
 **Legacy adapter.** `latest_frame() -> egui::ColorImage` still exists (CPU NV12 to RGBA at poll
 time) only for the old `ui.rs`.
 

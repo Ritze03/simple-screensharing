@@ -42,6 +42,16 @@ pub struct VideoViews {
     order: Vec<StreamKey>,
 }
 
+impl VideoEntry {
+    fn new(source: simple_screensharing_client::decode::FrameSource) -> Self {
+        Self {
+            view: Arc::new(Mutex::new(VideoView::new(source))),
+            popped: false,
+            close_requested: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
 impl VideoViews {
     /// Create views for new watches, drop views of ended ones.
     pub fn sync(&mut self, state: &AppState) {
@@ -51,14 +61,21 @@ impl VideoViews {
             for ((owner, stream_id), entry) in watches.iter() {
                 let key = (*handle, *owner, *stream_id);
                 live.push(key);
-                if let std::collections::hash_map::Entry::Vacant(slot) = self.entries.entry(key) {
-                    let source = entry.decoder.lock().unwrap().frames();
-                    slot.insert(VideoEntry {
-                        view: Arc::new(Mutex::new(VideoView::new(source))),
-                        popped: false,
-                        close_requested: Arc::new(AtomicBool::new(false)),
-                    });
-                    self.order.push(key);
+                let source = entry.decoder.lock().unwrap().frames();
+                match self.entries.entry(key) {
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(VideoEntry::new(source));
+                        self.order.push(key);
+                    }
+                    // Same key, different decoder: the watch ended and a new
+                    // one took the key between two frames (the room's stream
+                    // id counters make this unlikely, not impossible). Keeping
+                    // the old view would show the dead stream's last frame.
+                    std::collections::hash_map::Entry::Occupied(mut slot) => {
+                        if !slot.get().view.lock().unwrap().source().same_source(&source) {
+                            slot.insert(VideoEntry::new(source));
+                        }
+                    }
                 }
             }
         }

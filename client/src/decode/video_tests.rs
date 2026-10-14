@@ -346,3 +346,69 @@ fn a_stream_the_va_decoder_rejects_is_decoded_in_software() {
     assert_eq!((frame.width, frame.height), (W, H));
     assert_smpte_bars(&frame);
 }
+
+/// Feed a VA-encoded 1920x1080 clip into a decoder (told the announced size)
+/// and check the frames come out at the visible size. `vaav1enc` on AMD VCN4
+/// writes 1082 into the sequence and frame headers for 1080-line input (and
+/// `render_and_frame_size_different = 0`), so the VA decoder's caps say
+/// 1920x1082 with no crop meta; only the announced size says 1080.
+/// H.264/H.265 come out of `vah264dec`/`vah265dec` already at 1080.
+fn check_va_1080p(codec: VideoCodec) {
+    gstreamer::init().expect("gstreamer init");
+    super::test_util::init_logging();
+    let Some(aus) = super::test_util::encode_clip_va(codec, 1920, 1080, 30).expect("encode failed") else {
+        eprintln!("SKIP: no VA encoder for {}", codec.name());
+        return;
+    };
+    let mut dec = StreamDecoder::new(STREAM).unwrap();
+    // What the sender announces (`StreamInfo::width/height`).
+    dec.set_display_size(1920, 1080);
+    let source = dec.frames();
+    for au in &aus {
+        dec.feed(&media(au));
+    }
+    assert!(wait_for(20, || source.frames_decoded() >= aus.len() as u64 - 2), "{}: only {} frames decoded", codec.name(), source.frames_decoded());
+    let frame = source.latest().expect("a decoded frame");
+    eprintln!("{} decoded via {:?}: {}x{} strides {}/{}", codec.name(), dec.decoder_name(), frame.width, frame.height, frame.y_stride, frame.uv_stride);
+    assert_eq!((frame.width, frame.height), (1920, 1080), "{} must decode at the visible size", codec.name());
+    assert!(frame.y().len() >= frame.y_stride * 1079 + 1920);
+    assert!(frame.uv().len() >= frame.uv_stride * 539 + 1920);
+    assert_smpte_bars(&frame);
+}
+
+#[test]
+fn av1_from_the_va_encoder_decodes_at_1920x1080() {
+    check_va_1080p(VideoCodec::Av1);
+}
+
+#[test]
+fn h264_from_the_va_encoder_decodes_at_1920x1080() {
+    check_va_1080p(VideoCodec::H264);
+}
+
+#[test]
+fn h265_from_the_va_encoder_decodes_at_1920x1080() {
+    check_va_1080p(VideoCodec::H265);
+}
+
+#[test]
+fn visible_rect_prefers_the_decoder_crop_then_the_announced_size() {
+    use super::frame::visible_rect;
+    assert_eq!(visible_rect(None, None, 1920, 1088), (0, 0, 1920, 1088));
+    // Decoder crop wins.
+    assert_eq!(visible_rect(Some((0, 0, 1920, 1080)), Some((1280, 720)), 1920, 1088), (0, 0, 1920, 1080));
+    assert_eq!(visible_rect(Some((2, 4, 100, 50)), None, 1920, 1088), (2, 4, 100, 50));
+    // A broken crop (outside, empty, odd origin, overflow) is ignored.
+    assert_eq!(visible_rect(Some((0, 0, 1920, 1090)), None, 1920, 1088), (0, 0, 1920, 1088));
+    assert_eq!(visible_rect(Some((0, 0, 0, 10)), None, 1920, 1088), (0, 0, 1920, 1088));
+    assert_eq!(visible_rect(Some((1, 0, 100, 100)), None, 1920, 1088), (0, 0, 1920, 1088));
+    assert_eq!(visible_rect(Some((u32::MAX, 0, 2, 2)), None, 1920, 1088), (0, 0, 1920, 1088));
+    // The announced size crops small padding at the bottom/right only.
+    assert_eq!(visible_rect(None, Some((1920, 1080)), 1920, 1082), (0, 0, 1920, 1080));
+    assert_eq!(visible_rect(None, Some((1920, 1080)), 1920, 1080), (0, 0, 1920, 1080));
+    assert_eq!(visible_rect(None, Some((1900, 1080)), 1920, 1082), (0, 0, 1900, 1080));
+    // A frame smaller than announced, or a real resolution change, is left alone.
+    assert_eq!(visible_rect(None, Some((1920, 1080)), 1280, 720), (0, 0, 1280, 720));
+    assert_eq!(visible_rect(None, Some((1280, 720)), 1920, 1080), (0, 0, 1920, 1080));
+    assert_eq!(visible_rect(None, Some((0, 0)), 1920, 1082), (0, 0, 1920, 1082));
+}

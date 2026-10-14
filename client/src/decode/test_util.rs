@@ -103,3 +103,47 @@ pub(crate) fn encode_clip_format(
     pipeline.set_state(State::Null)?;
     Ok(Some(aus))
 }
+
+/// Encode `num_buffers` frames of SMPTE bars with the VA hardware encoder for
+/// `codec`, exactly as `capture.rs` would (NV12 in, `obu-stream`/`byte-stream`
+/// out). `Ok(None)` if the VA encoder element is missing. Unlike the software
+/// encoders this exercises the real sender's stream properties, such as
+/// `vaav1enc` declaring a 1082-line sequence header for 1080 lines.
+pub(crate) fn encode_clip_va(codec: VideoCodec, width: u32, height: u32, num_buffers: u32) -> Result<Option<Vec<Au>>> {
+    let (factory, caps) = match codec {
+        VideoCodec::H264 => ("vah264enc", "video/x-h264,stream-format=byte-stream,alignment=au"),
+        VideoCodec::H265 => ("vah265enc", "video/x-h265,stream-format=byte-stream,alignment=au"),
+        VideoCodec::Av1 => ("vaav1enc", "video/x-av1,stream-format=obu-stream,alignment=tu"),
+    };
+    if !have(factory) {
+        return Ok(None);
+    }
+    let desc = format!(
+        "videotestsrc num-buffers={num_buffers} pattern=smpte is-live=false \
+         ! video/x-raw,format=NV12,width={width},height={height},framerate=30/1 \
+         ! {factory} ! {caps} ! appsink name=out sync=false"
+    );
+    let pipeline = gstreamer::parse::launch(&desc)?.downcast::<Pipeline>().map_err(|_| anyhow!("not a pipeline"))?;
+    let sink = pipeline.by_name("out").and_then(|e: Element| e.downcast::<AppSink>().ok()).ok_or_else(|| anyhow!("no appsink"))?;
+    if pipeline.set_state(State::Playing).is_err() {
+        return Ok(None);
+    }
+    let mut aus: Vec<Au> = Vec::new();
+    loop {
+        match sink.try_pull_sample(ClockTime::from_seconds(10)) {
+            Some(sample) => {
+                let buffer = sample.buffer().ok_or_else(|| anyhow!("sample without buffer"))?;
+                let map = buffer.map_readable()?;
+                aus.push(Au {
+                    data: map.as_slice().to_vec(),
+                    keyframe: !buffer.flags().contains(BufferFlags::DELTA_UNIT),
+                    pts_us: aus.len() as u64 * 33_333,
+                });
+            }
+            None if sink.is_eos() => break,
+            None => return Err(anyhow!("{factory} stalled after {} access units", aus.len())),
+        }
+    }
+    pipeline.set_state(State::Null)?;
+    Ok(Some(aus))
+}

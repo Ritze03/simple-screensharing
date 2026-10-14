@@ -118,6 +118,18 @@ pub const RECONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(8);
 /// How long after a reconnect a watch whose stream has not been re-announced
 /// yet is still waited for. Matches the browser client's "resume" list (60 s).
 pub const REWATCH_GRACE: Duration = Duration::from_secs(60);
+/// How long after a watched stream was *stopped by its sharer* (relay
+/// `StreamStopped`) the same sharer's next stream of the same kind and label
+/// is picked up as the same watch again.
+///
+/// `Why resume at all:` stop-and-restart is how a sharer switches monitor or
+/// window or fixes a stuck share, and a viewer who was watching them means to
+/// keep watching: the new stream takes the dead tile's place, with no click.
+/// `Why only a short window (not [`REWATCH_GRACE`]):` unlike a connection drop
+/// this was a deliberate stop; minutes later an automatic subscribe (and the
+/// bandwidth it costs) would be a surprise. The portal picker takes a few
+/// seconds, 30 s covers "stop, pick something else, go live".
+pub const RESUME_AFTER_STOP: Duration = Duration::from_secs(30);
 
 /// Wait before the attempt that follows `failed` failed attempts of one
 /// outage: 0 (immediate), then 0.5 s, 1, 2, 4, 8, capped at 15 s.
@@ -957,6 +969,11 @@ pub struct RoomSession {
     /// does not start watching minutes later out of the blue.
     pub rewatch: Vec<WantedStream>,
     pub rewatch_deadline: Option<Instant>,
+    /// Watches whose stream the sharer stopped (see [`RESUME_AFTER_STOP`]),
+    /// each with its own deadline. Resolved by [`Self::apply_rewatch`] the
+    /// same way as `rewatch`, but kept apart because the deadlines differ
+    /// per entry and the two have different causes.
+    pub resume_after_stop: Vec<(WantedStream, Instant)>,
 }
 
 impl RoomSession {
@@ -999,50 +1016,102 @@ impl RoomSession {
         out
     }
 
-    /// Resolve [`Self::rewatch`] against the current roster: start watching
-    /// every wanted stream that is announced again, keep waiting for the rest
-    /// until `rewatch_deadline`. Cheap when `rewatch` is empty (the normal
-    /// case), so `drain_events` calls it for every room every pass.
+    /// Resolve [`Self::rewatch`] and [`Self::resume_after_stop`] against the
+    /// current roster: start watching every wanted stream that is announced
+    /// (again), keep waiting for the rest until their deadline. Cheap when
+    /// both are empty (the normal case), so `drain_events` calls it for every
+    /// room every pass.
     pub fn apply_rewatch(&mut self, now: Instant) {
-        if self.rewatch.is_empty() {
+        if self.rewatch.is_empty() && self.resume_after_stop.is_empty() {
             return;
         }
         if self.rewatch_deadline.is_some_and(|deadline| now >= deadline) {
             self.rewatch.clear();
-            return;
         }
-        let me = self.client.conn_id();
         let mut still_waiting = Vec::new();
         for wanted in std::mem::take(&mut self.rewatch) {
-            let found = {
-                let watches = self.watches.lock().unwrap();
-                let audio = self.audio_watches.lock().unwrap();
-                match_wanted(&wanted, me, &self.members, &self.streams, |owner, id| {
-                    watches.contains_key(&(owner, id)) || audio.contains_key(&(owner, id))
-                })
-            };
-            if let (Some((owner, _)), Some(volume)) = (found, wanted.volume_percent) {
-                self.audio_volume_by_owner.insert(owner, volume);
-            }
-            match (found, wanted.kind) {
-                (Some((owner, stream_id)), StreamKind::Video) => {
-                    self.toggle_watch(owner, stream_id);
-                    if wanted.selected {
-                        self.selected_watch = Some((owner, stream_id));
-                    }
-                }
-                // Audio rides along with its owner's video watch
-                // (`sync_audio_watches`); only a sender with no video needs an
-                // explicit Listen.
-                (Some((owner, stream_id)), StreamKind::Audio) => {
-                    if !self.owner_has_video(owner) {
-                        self.toggle_listen(owner, stream_id);
-                    }
-                }
-                (None, _) => still_waiting.push(wanted),
+            if !self.rewatch_one(&wanted) {
+                still_waiting.push(wanted);
             }
         }
         self.rewatch = still_waiting;
+
+        let mut still_waiting = Vec::new();
+        for (wanted, deadline) in std::mem::take(&mut self.resume_after_stop) {
+            if now < deadline && !self.rewatch_one(&wanted) {
+                still_waiting.push((wanted, deadline));
+            }
+        }
+        self.resume_after_stop = still_waiting;
+    }
+
+    /// Start `wanted` if a matching stream is announced right now. Returns
+    /// whether it was matched (and so is no longer waiting).
+    fn rewatch_one(&mut self, wanted: &WantedStream) -> bool {
+        let me = self.client.conn_id();
+        let found = {
+            let watches = self.watches.lock().unwrap();
+            let audio = self.audio_watches.lock().unwrap();
+            match_wanted(wanted, me, &self.members, &self.streams, |owner, id| {
+                watches.contains_key(&(owner, id)) || audio.contains_key(&(owner, id))
+            })
+        };
+        let Some((owner, stream_id)) = found else { return false };
+        if let Some(volume) = wanted.volume_percent {
+            self.audio_volume_by_owner.insert(owner, volume);
+        }
+        match wanted.kind {
+            StreamKind::Video => {
+                self.toggle_watch(owner, stream_id);
+                if wanted.selected {
+                    self.selected_watch = Some((owner, stream_id));
+                }
+            }
+            // Audio rides along with its owner's video watch
+            // (`sync_audio_watches`); only a sender with no video needs an
+            // explicit Listen.
+            StreamKind::Audio => {
+                if !self.owner_has_video(owner) {
+                    self.toggle_listen(owner, stream_id);
+                }
+            }
+        }
+        true
+    }
+
+    /// The sharer stopped `(owner, stream_id)` (relay `StreamStopped`): end
+    /// our video watch of it, so its tile, decoder and GPU view go away
+    /// instead of freezing on the last frame, and remember it for
+    /// [`RESUME_AFTER_STOP`] so a re-share by the same person takes its place.
+    /// Call *before* [`Self::note_stream_stopped`]: the owner's name and the
+    /// stream's label are read from the roster. No-op when we are not watching
+    /// that stream. Audio needs nothing here: [`Self::sync_audio_watches`]
+    /// already drops audio whose stream is no longer announced.
+    ///
+    /// No `unsubscribe` is sent: the relay dropped the stream together with
+    /// its subscriber list, so there is nothing left to unsubscribe from.
+    pub fn end_watch_of_stopped(&mut self, owner: ConnId, stream_id: StreamId, now: Instant) {
+        let key = (owner, stream_id);
+        let wanted = {
+            let owner_name = self.members.iter().find(|m| m.conn_id == owner).map(|m| m.display_name.clone());
+            let info = self.streams.iter().find(|s| s.owner == owner && s.stream_id == stream_id);
+            owner_name.zip(info).map(|(owner_name, info)| WantedStream {
+                owner_name,
+                kind: info.kind,
+                label: info.label.clone(),
+                selected: self.selected_watch == Some(key),
+                volume_percent: self.audio_volume_by_owner.get(&owner).copied(),
+            })
+        };
+        if self.watches.lock().unwrap().remove(&key).is_none() {
+            return;
+        }
+        if self.selected_watch == Some(key) {
+            self.selected_watch = self.watches.lock().unwrap().keys().min().copied();
+        }
+        if let Some(wanted) = wanted {
+            self.resume_after_stop.push((wanted, now + RESUME_AFTER_STOP));
+        }
     }
 
     /// The `stream_id` of `owner`'s currently-announced audio stream, if
@@ -1349,6 +1418,14 @@ impl RoomSession {
         } else {
             match StreamDecoder::new(stream_id) {
                 Ok(decoder) => {
+                    // The announced picture size lets the decoder crop an
+                    // encoder's padding lines (AMD AV1 codes 1080 as 1082).
+                    if let Some(info) = self.streams.iter().find(|s| s.owner == owner && s.stream_id == stream_id)
+                        && info.width > 0
+                        && info.height > 0
+                    {
+                        decoder.set_display_size(u32::from(info.width), u32::from(info.height));
+                    }
                     self.watches.lock().unwrap().insert(
                         key,
                         WatchEntry {
@@ -3458,6 +3535,7 @@ impl AppState {
                 audio_volume_by_owner: HashMap::new(),
                 rewatch: Vec::new(),
                 rewatch_deadline: None,
+                resume_after_stop: Vec::new(),
             },
         );
     }
@@ -3644,6 +3722,9 @@ impl AppState {
                         room.note_stream_started(info);
                     }
                     ClientEvent::PresenceDelta(PresenceEvent::StreamStopped { conn_id, stream_id }) => {
+                        // Before the roster forgets the stream: ends a watch
+                        // of it (no frozen tile) and queues its resume.
+                        room.end_watch_of_stopped(conn_id, stream_id, Instant::now());
                         room.note_stream_stopped(conn_id, stream_id);
                         room.preview_cache.remove(conn_id, stream_id);
                         room.preview_textures.remove(&(conn_id, stream_id));
@@ -6020,6 +6101,85 @@ mod reconnect_e2e {
         assert!(watcher.rooms[&wh].watches.lock().unwrap().contains_key(&(new_owner, new_stream)));
         assert!(!watcher.rooms[&wh].watches.lock().unwrap().contains_key(&(old_owner, old_stream)));
         eprintln!("[restart] watch resumed {:.2}s after the restart", restarted.elapsed().as_secs_f64());
+
+        watcher.shutdown(Duration::from_secs(2)).await;
+        sharer.shutdown(Duration::from_secs(3)).await;
+        drop(relay);
+    }
+
+    /// The sharer stops (the relay announces `StreamStopped`): the viewer's
+    /// watch ends within a second, no frozen tile is left behind (the watch
+    /// entry, which owns the decoder, is gone, and `ui::video::VideoViews::sync`
+    /// drops the GPU view with it). The same sharer going live again within
+    /// `RESUME_AFTER_STOP` takes the dead tile's place without a click.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "spawns a real relay server child process (and a real GStreamer capture)"]
+    async fn sharer_stop_ends_the_watch_and_a_reshare_resumes_it() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        gstreamer::init().expect("gstreamer init");
+        let _home = isolated_config_home();
+        let port = pick_free_udp_port().expect("free port");
+        let relay = spawn_relay_server(port).expect("relay");
+
+        let mut watcher = AppState::default();
+        let mut sharer = AppState::default();
+        let join_string = watcher.create_room(&format!("127.0.0.1:{port}"), "stop").expect("create_room").join_string;
+        await_relay(&join_string).await;
+        watcher.join_room(join_string.clone(), "watcher".into(), String::new()).expect("join");
+        sharer.join_room(join_string.clone(), "sharer".into(), "stop".into()).expect("join");
+        drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(10), "both joined", |s| {
+            !s[0].rooms.is_empty() && !s[1].rooms.is_empty()
+        })
+        .await;
+        let wh = *watcher.rooms.keys().next().unwrap();
+        let sh = *sharer.rooms.keys().next().unwrap();
+
+        let capture_id = share_test_source(&mut sharer, sh).await;
+        drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(10), "watcher sees the stream", |s| stream_of(s[0], wh, "sharer").is_some())
+            .await;
+        let (owner, first_stream) = stream_of(&watcher, wh, "sharer").unwrap();
+        watcher.rooms.get_mut(&wh).unwrap().toggle_watch(owner, first_stream);
+        drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(15), "first frames decoded", |s| {
+            frames_decoded(s[0], wh, (owner, first_stream)) > 5
+        })
+        .await;
+        assert_eq!(watcher.rooms[&wh].selected_watch, Some((owner, first_stream)));
+
+        // --- the sharer stops: the watch must go, fast ---
+        sharer.stop_share(capture_id);
+        let stopped = Instant::now();
+        drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(5), "watch removed after the stop", |s| {
+            s[0].rooms[&wh].watches.lock().unwrap().is_empty()
+        })
+        .await;
+        let took = stopped.elapsed();
+        eprintln!("[stop] the viewer's watch was gone {took:?} after stop_share returned");
+        assert!(took < Duration::from_secs(1), "watch lingered {took:?} after the sharer stopped");
+        {
+            let room = &watcher.rooms[&wh];
+            assert!(room.selected_watch.is_none(), "the selection must not point at the dead stream");
+            assert!(room.streams.iter().all(|s| s.owner != owner), "the roster forgot the stream");
+            assert_eq!(room.resume_after_stop.len(), 1, "the stopped watch is remembered for a re-share");
+        }
+        // Nothing comes back by itself while the sharer is not sharing.
+        run_for(&mut [&mut watcher, &mut sharer], Duration::from_millis(500)).await;
+        assert!(watcher.rooms[&wh].watches.lock().unwrap().is_empty());
+
+        // --- the same sharer goes live again: the new stream replaces the dead tile ---
+        // (the test source is bound to DestKey(0), the first destination)
+        sharer.next_destination_id = 0;
+        share_test_source(&mut sharer, sh).await;
+        drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(15), "watch resumed on the new stream", |s| {
+            stream_of(s[0], wh, "sharer").is_some_and(|key| frames_decoded(s[0], wh, key) > 5)
+        })
+        .await;
+        let (new_owner, second_stream) = stream_of(&watcher, wh, "sharer").unwrap();
+        assert_eq!(new_owner, owner, "same connection, new stream");
+        assert_ne!(second_stream, first_stream);
+        let room = &watcher.rooms[&wh];
+        assert_eq!(room.watches.lock().unwrap().len(), 1, "exactly one watch: the new stream, no stale one");
+        assert_eq!(room.selected_watch, Some((new_owner, second_stream)));
+        assert!(room.resume_after_stop.is_empty());
 
         watcher.shutdown(Duration::from_secs(2)).await;
         sharer.shutdown(Duration::from_secs(3)).await;

@@ -14,6 +14,39 @@ separate `simple-screensharing-server` / `simple-screensharing-client` repos, an
 references use those old names (now `server/` and `client/`). Cross-checked against
 `architecture/protocol-spec.md`.
 
+## Native client: stopped streams, AV1 size, staged-modal meter (2026-10-14, task #40)
+
+Found by I19 in a real two-client run.
+
+- **A stopped stream ends the watch.** `drain_events` ignored the relay's `StreamStopped` for
+  `RoomSession::watches`, so the viewer kept a frozen 0 fps tile (and "Watched streams 1"). It now
+  calls `RoomSession::end_watch_of_stopped` (before `note_stream_stopped`, which forgets the name and
+  label): the watch entry, hence the decoder, goes; `ui::video::VideoViews::sync` then drops the GPU
+  `VideoView` on the next frame. The selection moves on. No `unsubscribe` is sent (the relay already
+  dropped the stream and its subscriber list). The relay sends `StreamStopped` for every stream of a
+  member that leaves or drops, so that case is covered too. The old Electron shell did this in
+  `driver::prune_stale_watches`; the egui path never had it.
+- **Re-share resumes the watch (decision).** The stopped watch is remembered in
+  `RoomSession::resume_after_stop` for `RESUME_AFTER_STOP` (30 s) and matched like a reconnect's
+  (`WantedStream`: owner name + kind + label, `rewatch_one`), so the same person going live again
+  takes the dead tile's place with no click, with the same selection and volume.
+  `Why resume:` stop/start is how a sharer switches monitor or fixes a stuck share; a viewer who was
+  watching means to keep watching, and the reported symptom was the new share showing up as a separate
+  card. `Why only 30 s (not the reconnect's 60 s):` a deliberate stop is not an outage; minutes later an
+  automatic subscribe would be a surprise. A user's own "stop watching" never queues a resume.
+  Separate from `rewatch` because each entry has its own deadline and a different cause.
+- **AV1 1080p arrives as 1082 lines.** See `features/video-pipeline.md` ("Visible size"): the
+  sender (VCN4) really encodes 1082 lines with no render size; the receiver crops to the announced
+  size.
+- **Staged "Set up your stream" modal: the meter never moved.** Level taps exist only after
+  `UiAction::StartLevelTaps`, and only the bar's audio popover sent it; a staged capture has no audio
+  share to read a level from either. `stream_settings::sync_level_taps` now starts a tap for every audio
+  source while the staged modal is open (restarted when the source list changes) and stops them on
+  any footer button / Escape / click-outside; the Source card reads the chosen source's tap
+  (`cx.source_level`). Known gap: if the shell closes the modal by itself (capture or room vanished)
+  the taps run until the next `StartLevelTaps`/`StopLevelTaps`; fixing that needs a hook in
+  `ui/mod.rs`.
+
 ## Native client: auto-reconnect and clean exit (2026-10-14, task #36)
 
 Found by I20 in real runs: after a relay restart the egui client sat on "Not connected" until a
