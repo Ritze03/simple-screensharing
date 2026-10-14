@@ -388,8 +388,18 @@ fn destinations_card(
     widgets::card(ui, &title, Some(&count), |ui| {
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = theme::S1;
+            let note = tr("ui.stream.this_room", "this room");
             for r in &rows {
-                let row = DestRow { current: r.current, name: &r.name, pill: r.pill.0.pill(&r.pill.1), kbps: &r.kbps, removable: r.id.is_some() };
+                let remove_tip = tr_with("ui.stream.stop_in", "Stop sharing in %{room}", &[("room", &r.name)]);
+                let row = DestRow {
+                    current: r.current,
+                    name: &r.name,
+                    note: &note,
+                    remove_tip: &remove_tip,
+                    pill: r.pill.0.pill(&r.pill.1),
+                    kbps: &r.kbps,
+                    removable: r.id.is_some(),
+                };
                 if widgets::dest_row(ui, &row) == DestAction::Remove
                     && let Some(id) = r.id
                 {

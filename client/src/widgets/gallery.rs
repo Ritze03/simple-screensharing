@@ -269,11 +269,11 @@ impl Gallery {
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             let people = [
-                PersonRow { name: "mo", color: 0, you: true, live: true, watching: false, idle: false, stale: false },
-                PersonRow { name: "Ana", color: 1, you: false, live: true, watching: true, idle: false, stale: false },
-                PersonRow { name: "Jonas", color: 3, you: false, live: true, watching: false, idle: false, stale: false },
-                PersonRow { name: "Mia", color: 4, you: false, live: false, watching: false, idle: true, stale: false },
-                PersonRow { name: "Maximilian-Alexander", color: 2, you: false, live: true, watching: true, idle: false, stale: false },
+                PersonRow { name: "mo", color: 0, you: Some("you"), live: true, live_label: "Live", watching: false, idle: false, stale: false },
+                PersonRow { name: "Ana", color: 1, you: None, live: true, live_label: "Live", watching: true, idle: false, stale: false },
+                PersonRow { name: "Jonas", color: 3, you: None, live: true, live_label: "Live", watching: false, idle: false, stale: false },
+                PersonRow { name: "Mia", color: 4, you: None, live: false, live_label: "Live", watching: false, idle: true, stale: false },
+                PersonRow { name: "Maximilian-Alexander", color: 2, you: None, live: true, live_label: "Live", watching: true, idle: false, stale: false },
             ];
             for p in &people {
                 person_row(ui, p);
@@ -282,8 +282,8 @@ impl Gallery {
         heading(ui, "People (last known)", Some("2"), false);
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            person_row(ui, &PersonRow { name: "Noah", color: 2, you: false, live: true, watching: false, idle: false, stale: true });
-            person_row(ui, &PersonRow { name: "Ivy", color: 3, you: false, live: false, watching: false, idle: true, stale: true });
+            person_row(ui, &PersonRow { name: "Noah", color: 2, you: None, live: true, live_label: "Live", watching: false, idle: false, stale: true });
+            person_row(ui, &PersonRow { name: "Ivy", color: 3, you: None, live: false, live_label: "Live", watching: false, idle: true, stale: true });
         });
         heading(ui, "Popup", None, false);
         popup_frame(ui, |ui| {
@@ -315,10 +315,10 @@ impl Gallery {
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = theme::S1;
             let rows = [
-                DestRow { current: true, name: "Movie Night", pill: Pill::live("Live"), kbps: "6000 kbps", removable: true },
-                DestRow { current: false, name: "Book Club", pill: Pill::live("Live"), kbps: "6000 kbps", removable: true },
-                DestRow { current: false, name: "Gaming Night", pill: Pill::progress("Starting"), kbps: "12000 kbps", removable: true },
-                DestRow { current: false, name: "Study Group (staged)", pill: Pill::muted("Not live"), kbps: "—", removable: false },
+                DestRow { current: true, name: "Movie Night", note: "this room", remove_tip: "Stop sending", pill: Pill::live("Live"), kbps: "6000 kbps", removable: true },
+                DestRow { current: false, name: "Book Club", note: "this room", remove_tip: "Stop sending", pill: Pill::live("Live"), kbps: "6000 kbps", removable: true },
+                DestRow { current: false, name: "Gaming Night", note: "this room", remove_tip: "Stop sending", pill: Pill::progress("Starting"), kbps: "12000 kbps", removable: true },
+                DestRow { current: false, name: "Study Group (staged)", note: "this room", remove_tip: "Stop sending", pill: Pill::muted("Not live"), kbps: "—", removable: false },
             ];
             for d in &rows {
                 if dest_row(ui, d) == DestAction::Remove {

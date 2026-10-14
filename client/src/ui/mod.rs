@@ -858,6 +858,12 @@ impl App {
         // Rate-limited + hysteresis-filtered internally; cheap most frames.
         self.state.apply_bandwidth_allocation();
 
+        // A failed share start/stop would otherwise vanish without a word
+        // (nothing else in the new UI shows `share_error`).
+        if let Some(e) = self.state.share_error.take() {
+            self.now = ctx.input(|i| i.time);
+            self.toast(tr_with("share.error", "Share error: %{error}", &[("error", &e)]), "error");
+        }
         self.videos.sync(&self.state);
         self.poll_staged();
         self.poll_level_taps();
@@ -1131,7 +1137,7 @@ fn user_band(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
 }
 
 /// Toasts (mockup `.toasts`): bottom centre, 72 px above the window bottom,
-/// stacked upwards, pill-shaped, `PANEL_RAISED` + border, icon in `SUCCESS`.
+/// stacked upwards, pill-shaped, `PANEL_RAISED` + border, icon in `SUCCESS` (`DANGER` for the "error" icon).
 fn paint_toasts(ctx: &egui::Context, toasts: &[Toast]) {
     if toasts.is_empty() {
         return;
@@ -1147,7 +1153,8 @@ fn paint_toasts(ctx: &egui::Context, toasts: &[Toast]) {
         painter.rect(rect, CornerRadius::same(16), theme::PANEL_RAISED, Stroke::new(1.0_f32, theme::BORDER), egui::StrokeKind::Inside);
         let ir = Rect::from_min_size(pos2(rect.left() + 14.0, rect.top()), vec2(16.0, rect.height()));
         let glyph = theme::icon(t.icon);
-        painter.text(ir.center(), egui::Align2::CENTER_CENTER, glyph, theme::icon_font(16.0), theme::SUCCESS);
+        let icon_col = if t.icon == "error" { theme::DANGER } else { theme::SUCCESS };
+        painter.text(ir.center(), egui::Align2::CENTER_CENTER, glyph, theme::icon_font(16.0), icon_col);
         painter.text(pos2(ir.right() + theme::S2, rect.center().y), egui::Align2::LEFT_CENTER, &t.text, f.clone(), theme::TEXT);
         y -= theme::CTL_H + theme::S1;
     }

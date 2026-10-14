@@ -421,16 +421,27 @@ fn reconnect_banner(ui: &mut Ui) -> Option<usize> {
     let retry_l = tr("ui.room.retry", "Retry now");
     let cancel_l = tr("ui.room.cancel", "Cancel");
     let btns = [Btn::secondary(&retry_l), Btn::secondary(&cancel_l)];
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), theme::CTL_H + 2.0 * theme::S2 + 2.0), Sense::hover());
+    // The text wraps (German runs ~20 % longer); the banner grows to fit it.
+    let pad = vec2(theme::S3 + 1.0, theme::S2 + 1.0);
+    let text_w = ui.available_width() - 2.0 * pad.x - theme::ICON - btns.iter().map(|b| b.width(ui) + theme::S2).sum::<f32>() - theme::S2;
+    let mut job = egui::text::LayoutJob::single_section(
+        text.clone(),
+        egui::TextFormat { font_id: font(Weight::Regular, theme::FS_SMALL), color: theme::WARNING, line_height: Some(16.0), ..Default::default() },
+    );
+    job.wrap.max_width = text_w.max(40.0);
+    let galley = ui.painter().layout_job(job);
+    let inner_h = galley.size().y.max(theme::CTL_H);
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), inner_h + 2.0 * pad.y), Sense::hover());
     let r = CornerRadius::same(theme::ROUNDING_MD);
     widgets::paint_hatch(ui.painter(), rect, r, 6.0, theme::HATCH_AMBER_SOFT_A, theme::HATCH_AMBER_SOFT_B);
     ui.painter().rect_stroke(rect, r, Stroke::new(1.0_f32, theme::HATCH_AMBER_BORDER), StrokeKind::Inside);
-    let inner = rect.shrink2(vec2(theme::S3 + 1.0, theme::S2 + 1.0));
+    let inner = rect.shrink2(pad);
     let mut child = ui.new_child(UiBuilder::new().max_rect(inner).layout(Layout::left_to_right(Align::Center)));
     let slots = [fixed(theme::ICON), FILL, fixed(btns[0].width(ui)), fixed(btns[1].width(ui))];
-    let row = HBox::new("hbox·banner", theme::CTL_H).slots(&slots).show(&mut child);
+    let row = HBox::new("hbox·banner", inner_h).slots(&slots).show(&mut child);
     row.icon(&child, 0, "sync_problem", theme::ICON, theme::WARNING);
-    row.text(&child, 1, &text, font(Weight::Regular, theme::FS_SMALL), theme::WARNING, Align::Min);
+    let tc = row.cell(1);
+    child.painter().with_clip_rect(tc.intersect(child.clip_rect())).galley(pos2(tc.left(), tc.center().y - galley.size().y / 2.0), galley, theme::WARNING);
     let mut clicked = None;
     for (i, b) in btns.iter().enumerate() {
         let w = row.cell(i + 2).width();
@@ -910,8 +921,15 @@ pub fn show_people(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
         // Reconnecting: the lib keeps no last-known roster, so there's nothing
         // honest to list.
         widgets::heading(ui, &tr("ui.room.people", "People"), None, false);
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), theme::ROW_H), Sense::hover());
-        paint_text(ui, rect, &tr("ui.room.people_paused", "Back when the room reconnects"), font(Weight::Regular, theme::FS_SMALL), theme::TEXT_FAINT, Align::Min);
+        // Wraps: the German line is wider than the 207 px column.
+        let mut job = egui::text::LayoutJob::single_section(
+            tr("ui.room.people_paused", "Back when the room reconnects"),
+            egui::TextFormat { font_id: font(Weight::Regular, theme::FS_SMALL), color: theme::TEXT_FAINT, line_height: Some(16.0), ..Default::default() },
+        );
+        job.wrap.max_width = ui.available_width();
+        let galley = ui.painter().layout_job(job);
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), galley.size().y.max(theme::ROW_H)), Sense::hover());
+        ui.painter().galley(pos2(rect.left(), rect.center().y - galley.size().y / 2.0), galley, theme::TEXT_FAINT);
         return;
     };
     let me = s.client.conn_id();
@@ -919,6 +937,9 @@ pub fn show_people(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
     widgets::heading(ui, &tr("ui.room.people", "People"), Some(&s.members.len().to_string()), false);
     let watches = s.watches.lock().unwrap();
     let audio = s.audio_watches.lock().unwrap();
+    // The mockup's faint lowercase "you" tag / "LIVE" pill, from existing keys.
+    let you_tag = tr("ui.room.you", "You").to_lowercase();
+    let live_l = tr("ui.pill.live", "Live");
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
         let order = s.members.iter().filter(|m| m.conn_id == me).chain(s.members.iter().filter(|m| m.conn_id != me));
@@ -928,7 +949,16 @@ pub fn show_people(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
             let watching = !you && (watches.keys().any(|k| k.0 == m.conn_id) || audio.iter().any(|(k, a)| k.0 == m.conn_id && !a.auto));
             widgets::person_row(
                 ui,
-                &PersonRow { name: &m.display_name, color: avatar_color(you, m.conn_id), you, live, watching, idle: !live, stale: false },
+                &PersonRow {
+                    name: &m.display_name,
+                    color: avatar_color(you, m.conn_id),
+                    you: you.then_some(you_tag.as_str()),
+                    live,
+                    live_label: &live_l,
+                    watching,
+                    idle: !live,
+                    stale: false,
+                },
             );
         }
     });

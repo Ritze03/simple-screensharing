@@ -113,8 +113,8 @@ fn rows_of_a_type_align_and_share_height() {
                     &RoomRow { lead: RoomLead::Dot(DotState::Joined), name, live: LiveSlot::Off, num, unit: Unit::None, selected: false },
                 );
                 sharer_row(ui, &SharerRow { icon: "cast", tone: IconTone::Live, name, num: Some(240), unit: "fps" });
-                person_row(ui, &PersonRow { name, color: 1, you: false, live: true, watching: true, idle: false, stale: false });
-                dest_row(ui, &DestRow { current: false, name, pill: Pill::live("Live"), kbps: "6000 kbps", removable: true });
+                person_row(ui, &PersonRow { name, color: 1, you: None, live: true, live_label: "Live", watching: true, idle: false, stale: false });
+                dest_row(ui, &DestRow { current: false, name, note: "this room", remove_tip: "Stop", pill: Pill::live("Live"), kbps: "6000 kbps", removable: true });
                 pop_item(ui, &PopItem::new("speaker", name).meter(2));
             }
         });
