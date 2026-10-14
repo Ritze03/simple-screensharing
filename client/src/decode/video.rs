@@ -183,9 +183,13 @@ fn chain(codec: VideoCodec) -> Chain {
                 .build(),
             parse: "av1parse",
             hw_decoder: hw("vaav1dec", "d3d11av1dec"),
-            // libaom, wrapped by gst-plugins-bad's `av1`. (No dav1d on this
-            // machine; if `dav1ddec` is ever present it is the faster choice.)
-            sw_decoder: "av1dec",
+            // Linux: libaom, wrapped by gst-plugins-bad's `av1`. (No dav1d on
+            // that machine; if `dav1ddec` is ever present it is the faster
+            // choice.) Windows: the official GStreamer MSVC build ships dav1d
+            // (`dav1ddec`, gst-plugins-rs) but not the libaom wrapper `av1dec`
+            // (checked with gst-inspect on 1.26.9), so dav1d is the only
+            // software AV1 decoder there.
+            sw_decoder: if cfg!(windows) { "dav1ddec" } else { "av1dec" },
         },
     }
 }

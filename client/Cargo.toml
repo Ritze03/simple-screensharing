@@ -15,6 +15,17 @@ path = "src/lib.rs"
 name = "simple-screensharing-client"
 path = "src/main.rs"
 
+[features]
+# Exposes `capture::start_sharing_from_test_source` (a `videotestsrc` capture
+# seam that tests use) to the `test_sender` example: a headless sender that
+# needs neither a display nor a portal. Off by default, so a normal build is
+# unchanged.
+test-source = []
+
+[[example]]
+name = "test_sender"
+required-features = ["test-source"]
+
 [dependencies]
 aes-gcm = "0.11.0"
 anyhow = "1.0.104"

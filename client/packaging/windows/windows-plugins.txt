@@ -1,0 +1,28 @@
+# GStreamer plugins bundled into the Windows package (one per line, name without the
+# "gst" prefix and ".dll"). Curated, like client/packaging/gst-plugins.txt: the full
+# runtime is ~1.6 GB (620 MB of DLLs in bin\ plus 1 GB of plugins), the client needs about 20.
+#
+# plugin             elements the client uses from it
+coreelements         # queue, tee, valve, capsfilter, identity, fakesink, taginject
+app                  # appsrc, appsink
+videoconvertscale    # videoconvert, videoscale
+videorate            # videorate
+videotestsrc         # videotestsrc (tests, test_sender example)
+videofilter          # videoflip (software orientation stage)
+audioconvert         # audioconvert
+audioresample        # audioresample
+volume               # volume
+opus                 # opusenc, opusdec
+level                # level
+jpeg                 # jpegdec
+videoparsersbad      # h264parse, h265parse, av1parse
+typefindfunctions    # caps detection for the parsers
+autodetect           # autoaudiosink
+wasapi2              # wasapi2src / wasapi2sink (audio playback; audio capture is not built on Windows yet)
+d3d11                # d3d11screencapturesrc (capture), d3d11h264dec / d3d11h265dec / d3d11av1dec (GPU decode), d3d11convert, d3d11download
+mediafoundation      # mfh264enc / mfh265enc (hardware encode, not used by capture.rs yet)
+x264                 # x264enc, software H.264 encode (what capture.rs uses on Windows today)
+libav                # avdec_h264, avdec_h265, software decode fallback
+dav1d                # dav1ddec, software AV1 decode (the Windows build has no libaom `av1dec`)
+nvcodec              # nvh264dec / nvh264enc ..., loads only where an NVIDIA driver exists
+qsv                  # Intel Quick Sync, loads only where an Intel GPU exists

@@ -4826,12 +4826,14 @@ pub(crate) mod test_support {
         // `RoomStore`/`AppSettings` load/save — never cached.
         unsafe {
             std::env::set_var("XDG_CONFIG_HOME", &dir);
+            // `dirs` ignores XDG_CONFIG_HOME on Windows; this one is honoured everywhere.
+            std::env::set_var("SSS_CONFIG_HOME", &dir);
         }
         // Fail loudly (rather than scribble over the developer's real config)
         // on a platform where `XDG_CONFIG_HOME` doesn't steer `dirs`.
         assert!(
             RoomStore::config_path().starts_with(&dir) && AppSettings::config_path().starts_with(&dir),
-            "XDG_CONFIG_HOME did not redirect the config dir on this platform"
+            "SSS_CONFIG_HOME did not redirect the config dir"
         );
         IsolatedConfigHome { _guard: guard, dir }
     }

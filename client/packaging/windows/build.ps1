@@ -14,7 +14,7 @@
       powershell -ExecutionPolicy Bypass -File client\packaging\windows\build.ps1
 
 .PARAMETER Repo       Repository root (default: two levels above this script's folder's parent).
-.PARAMETER Gst        GStreamer root (default: $env:GSTREAMER_1_0_ROOT_MSVC_X86_64, else C:\gstreamer\1.0\msvc_x86_64).
+.PARAMETER Gst        GStreamer root (default: $env:GSTREAMER_1_0_ROOT_MSVC_X86_64, else C:\Program Files\gstreamer\1.0\msvc_x86_64).
 .PARAMETER TargetDir  CARGO_TARGET_DIR. Keep it on a local disk, outside the source tree if you sync the tree.
 .PARAMETER Debug      Build the dev profile instead of --release.
 .PARAMETER Server     Also build the relay (simple-screensharing-server).
@@ -28,7 +28,7 @@ param(
 )
 $ErrorActionPreference = "Stop"
 
-if (-not $Gst) { $Gst = "C:\gstreamer\1.0\msvc_x86_64" }
+if (-not $Gst) { $Gst = "C:\Program Files\gstreamer\1.0\msvc_x86_64" }
 $Gst = $Gst.TrimEnd("\")
 if (-not (Test-Path "$Gst\lib\pkgconfig\gstreamer-1.0.pc")) {
   throw "GStreamer devel files not found under '$Gst' (lib\pkgconfig\gstreamer-1.0.pc). Install the *devel* MSI too, or pass -Gst."
@@ -42,7 +42,7 @@ $env:PKG_CONFIG_PATH = "$Gst\lib\pkgconfig"
 $env:PATH = "$Gst\bin;$env:PATH"
 $env:CARGO_TARGET_DIR = $TargetDir
 
-$profileArgs = if ($Debug) { @() } else { @("--release") }
+$profileArgs = @(if ($Debug) { } else { "--release" })
 $packages = @("-p", "simple-screensharing-client")
 if ($Server) { $packages += @("-p", "simple-screensharing-server") }
 

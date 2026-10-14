@@ -62,7 +62,40 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Mode>, St
     }
 }
 
+/// Windows package: point GStreamer at the plugins shipped next to the exe.
+///
+/// `package.ps1` (client/packaging/windows) lays out `gst-plugins\` and
+/// `gst-plugin-scanner.exe` beside `simple-screensharing-client.exe`. When that
+/// folder exists the exe uses it and ignores any GStreamer installed on the
+/// machine (a second, different install on PATH would otherwise be mixed in);
+/// without it (a developer build) nothing is touched and the system install
+/// (`GSTREAMER_1_0_ROOT_MSVC_X86_64` / PATH) is used. Must run before the
+/// first GStreamer call, hence first thing in `main`, while still single-threaded.
+#[cfg(windows)]
+fn use_bundled_gstreamer() {
+    let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) else { return };
+    let plugins = dir.join("gst-plugins");
+    if !plugins.is_dir() {
+        return;
+    }
+    // SAFETY: called first in `main`, before any other thread exists.
+    unsafe {
+        std::env::set_var("GST_PLUGIN_SYSTEM_PATH_1_0", &plugins);
+        std::env::set_var("GST_PLUGIN_PATH_1_0", &plugins);
+        std::env::set_var("GST_PLUGIN_SCANNER_1_0", dir.join("gst-plugin-scanner.exe"));
+        // Keep the plugin registry per user, not next to the (possibly read-only) exe.
+        if std::env::var_os("GST_REGISTRY_1_0").is_none() {
+            if let Some(cache) = dirs::cache_dir() {
+                let _ = std::fs::create_dir_all(cache.join("simple-screensharing"));
+                std::env::set_var("GST_REGISTRY_1_0", cache.join("simple-screensharing").join("gst-registry.bin"));
+            }
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    use_bundled_gstreamer();
     let mode = match parse_args(std::env::args().skip(1)) {
         Ok(Some(mode)) => mode,
         Ok(None) => {
