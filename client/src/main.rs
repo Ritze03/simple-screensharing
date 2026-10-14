@@ -7,26 +7,17 @@
 //!
 //! # Front-end
 //!
-//! This launches the eframe/egui desktop window (`ui.rs`) — the only
-//! front-end the client has.
+//! This launches the eframe/egui desktop window (`ui.rs`). egui is becoming
+//! the client's only front-end; the Electron shell is still present until it
+//! is removed later. Only the UI modules (`ui`, `theme`) live in this bin; the
+//! core (net, capture, decode, rooms, session, ...) is the
+//! `simple_screensharing_client` lib crate (`lib.rs`).
 
 #[macro_use]
 extern crate rust_i18n;
 
 i18n!("locales", fallback = "en");
 
-mod audio;
-mod bandwidth;
-mod capture;
-mod decode;
-#[cfg(test)]
-mod end_to_end_test;
-mod fragment;
-mod net;
-mod preview;
-mod protocol;
-mod rooms;
-mod session;
 mod theme;
 mod ui;
 
@@ -79,7 +70,7 @@ fn main() -> anyhow::Result<()> {
     // reconfiguration once the window exists, so a change made in the
     // settings UI (`ui.rs`'s presentation-mode dropdown) is picked up on the
     // *next* launch, not live. See `superdoc/features/presentation-modes.md`.
-    let presentation_mode = rooms::AppSettings::load().presentation_mode;
+    let presentation_mode = simple_screensharing_client::rooms::AppSettings::load().presentation_mode;
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([800.0, 600.0])
