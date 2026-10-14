@@ -131,9 +131,12 @@ export class VideoSender {
     this.lastKeyframeAt = -Infinity;
     this.lastEncodedTs = -Infinity;
     this.wasActive = false;
+    this.lastFrame = null; // newest captured frame, kept open so a static source can still be re-encoded as a keyframe
+    this.lastFrameAt = -Infinity;
+    this.keepaliveTimer = null;
     this.stats = {
-      captured: 0, encoded: 0, skippedIdle: 0, skippedRate: 0, droppedBackpressure: 0, keyframes: 0,
-      bytes: 0, keyframesWithoutParams: 0, reconfigures: 0, codecString: null,
+      captured: 0, encoded: 0, keepaliveKeyframes: 0, skippedIdle: 0, skippedRate: 0, droppedBackpressure: 0, keyframes: 0,
+      bytes: 0, keyframesWithoutParams: 0, reconfigures: 0, codecString: null, av1TdAdded: 0, av1SeqHdrAdded: 0,
     };
     this.encTimes = [];
     this.byteTimes = [];
@@ -158,6 +161,32 @@ export class VideoSender {
     const processor = new MediaStreamTrackProcessor({ track: this.track });
     this.reader = processor.readable.getReader();
     this.#pump();
+    this.keepaliveTimer = setInterval(() => this.#keepalive(), 100);
+  }
+
+  // Screen capture is damage-driven: a static screen delivers NO frames, so a keyframe requested for a new viewer (or the
+  // periodic GOP keyframe) would wait until something moves. Re-encode the newest frame as a keyframe instead.
+  #keepalive() {
+    const f = this.lastFrame;
+    const enc = this.encoder;
+    if (!f || this.stopped || !enc || enc.state !== "configured" || !this.isActive()) return;
+    const t = this.now();
+    const idleMs = t - this.lastFrameAt;
+    if (idleMs < 250) return; // frames are flowing; the pump handles keyframes
+    if (!(this.wantKeyframe || t - this.lastKeyframeAt >= this.gopMs)) return;
+    if (enc.encodeQueueSize > this.maxEncodeQueue) return;
+    let copy;
+    try {
+      copy = new VideoFrame(f, { timestamp: f.timestamp + Math.round(idleMs * 1000) });
+      this.wantKeyframe = false;
+      this.lastEncodedTs = copy.timestamp;
+      this.stats.keepaliveKeyframes++;
+      enc.encode(copy, { keyFrame: true });
+    } catch (e) {
+      // frame already closed / encoder closing: ignore, the next real frame takes over
+    } finally {
+      if (copy) copy.close();
+    }
   }
 
   async #configure(width, height) {
@@ -228,9 +257,11 @@ export class VideoSender {
         merged.set(seq, 0);
         merged.set(out, seq.length);
         out = merged;
+        this.stats.av1SeqHdrAdded++;
       }
     }
     if (out[0] !== 0x12) {
+      this.stats.av1TdAdded++;
       const merged = new Uint8Array(2 + out.length);
       merged.set(AV1_TD, 0);
       merged.set(out, 2);
@@ -249,6 +280,10 @@ export class VideoSender {
           break;
         }
         this.stats.captured++;
+        // Keep the newest frame open (released when the next one arrives) for #keepalive.
+        if (this.lastFrame) this.lastFrame.close();
+        this.lastFrame = frame;
+        this.lastFrameAt = this.now();
         try {
           if (this.onCapturedFrame) this.onCapturedFrame(frame);
           const active = this.isActive();
@@ -274,9 +309,9 @@ export class VideoSender {
           const enc = this.encoder;
           if (!enc || enc.state !== "configured") continue;
           if (enc.encodeQueueSize > this.maxEncodeQueue) {
-            // Encoder can't keep up: drop, and the next frame must be a keyframe (delta chain is broken).
+            // Encoder can't keep up: drop this INPUT frame. Nothing was encoded, so no reference chain is broken
+            // (a keyframe is only needed when an already-encoded frame is lost, see RoomClient#sendMedia).
             this.stats.droppedBackpressure++;
-            this.wantKeyframe = true;
             continue;
           }
           const t = this.now();
@@ -285,7 +320,7 @@ export class VideoSender {
           this.lastEncodedTs = frame.timestamp;
           enc.encode(frame, key ? { keyFrame: true } : undefined);
         } finally {
-          frame.close();
+          // `frame` stays open as lastFrame; it is closed when superseded (or on stop)
         }
       }
     } catch (e) {
@@ -317,11 +352,18 @@ export class VideoSender {
 
   stop() {
     this.stopped = true;
+    clearInterval(this.keepaliveTimer);
     try {
       this.reader && this.reader.cancel();
     } catch {}
     try {
       if (this.encoder && this.encoder.state !== "closed") this.encoder.close();
     } catch {}
+    if (this.lastFrame) {
+      try {
+        this.lastFrame.close();
+      } catch {}
+      this.lastFrame = null;
+    }
   }
 }

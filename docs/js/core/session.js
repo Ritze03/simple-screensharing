@@ -143,8 +143,18 @@ export class RelaySession {
     let snapshot = null;
     for (let attempt = 0; attempt < 5 && !snapshot; attempt++) {
       // The relay only notices the stream once data arrives, so Join goes out immediately.
-      await this.#write(encodeClientToRelay({ type: "Join", connId: this.connId, roomId, displayName }));
-      const msg = await this.#readOne();
+      let msg;
+      try {
+        await this.#write(encodeClientToRelay({ type: "Join", connId: this.connId, roomId, displayName }));
+        msg = await this.#readOne();
+      } catch (e) {
+        // The relay drops the connection right after a refusal, and the refusal itself can be lost with it
+        // (relay race, see README "Known relay issues"): don't pretend to know why.
+        await Promise.race([this.wt.closed.catch(() => null), new Promise((r) => setTimeout(r, 150))]); // let closeInfo arrive
+        const err = new ConnectError("The relay closed the connection right after the join request without answering. The room may be full (8 members maximum), or the relay refused the link.", { code: "join-no-reply", cause: e });
+        err.closeInfo = this.closeInfo; // WebTransport close code/reason if the relay sent one
+        throw err;
+      }
       if (msg.type === "PresenceSnapshot") snapshot = msg;
       else if (msg.type === "JoinRejected" && msg.reason === "ConnIdCollision") this.connId = randomConnId();
       else if (msg.type === "JoinRejected") throw new JoinRejectedError(msg.reason);

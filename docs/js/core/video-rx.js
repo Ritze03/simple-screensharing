@@ -28,6 +28,8 @@ export class VideoReceiver {
     this.decoder = null;
     this.config = null; // { codec: "h264"|..., string }
     this.needKeyframe = true; // true until a keyframe has been queued after start / loss / error
+    this.waitingSince = now(); // when we started waiting for a keyframe
+    this.lastWaitEvent = -Infinity;
     this.unsupported = null; // codec string we know we cannot decode
     this.timer = null;
     this.closed = false;
@@ -53,6 +55,7 @@ export class VideoReceiver {
     this.stats.lossEvents++;
     if (!this.needKeyframe) {
       this.needKeyframe = true;
+      this.waitingSince = this.now();
       this.jb.reset(); // queued deltas would decode against a hole
       this.onEvent("need-keyframe", { reason: "loss" });
     }
@@ -79,6 +82,12 @@ export class VideoReceiver {
       this.needKeyframe = false;
     } else if (this.needKeyframe || !this.config || this.unsupported === this.config.string) {
       this.stats.skippedDeltas++;
+      // Still no keyframe a second after we started waiting: the one we asked for may itself have been lost, so say so
+      // again (the room client re-requests, rate limited). Without this a lost recovery keyframe stalls until the next GOP.
+      if (this.needKeyframe && t - this.waitingSince > 1000 && t - this.lastWaitEvent > 1000) {
+        this.lastWaitEvent = t;
+        this.onEvent("need-keyframe", { reason: "waiting" });
+      }
       return;
     }
     const chunk = new EncodedVideoChunk({ type: keyframe ? "key" : "delta", timestamp: ptsUs, data: payload });
@@ -155,6 +164,7 @@ export class VideoReceiver {
   #decoderFailed(e) {
     this.stats.decoderErrors++;
     this.needKeyframe = true;
+    this.waitingSince = this.now();
     this.jb.reset();
     const d = this.decoder;
     this.decoder = null;
