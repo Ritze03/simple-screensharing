@@ -170,6 +170,8 @@ ui.bar.share_screen: "Share screen"
 ui.bar.stop_sharing: "Stop sharing"
 ui.bar.stream_settings: "Stream settings"
 ui.bar.unmute_audio: "Unmute shared audio"
+ui.bar.waiting_sub: "Move the mouse over it to start"
+ui.bar.waiting_title: "Waiting for the screen to change"
 
 #modal
 ui.modal.cancel: "Cancel"
@@ -415,3 +417,4 @@ ui.toast.live_in: "Live in %{room}"
 ui.toast.save_failed: "Couldn't save: %{error}"
 ui.toast.stopped_all: "Stopped all sharing"
 ui.toast.stopped_in: "Stopped sharing in %{room}"
+ui.waiting_frame_hint: "An idle screen sends no picture until something on it changes. Move the mouse over the shared screen and the stream starts."

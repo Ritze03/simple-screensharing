@@ -9,7 +9,10 @@
 //! - Picking / Staged: `[84 pill][fill status][audio][Stream settings][sep][Discard][Go live]`
 //!   (Picking disables audio, Stream settings and Go live).
 //! - Live: `[84 pill][fill status][audio control][Stream settings][N rooms ▾][sep][Stop sharing]`
-//!   (`N rooms ▾` = [`PopoverKind::Rooms`]: Also send to + Move to).
+//!   (`N rooms ▾` = [`PopoverKind::Rooms`]: Also send to + Move to). While
+//!   the pill says Starting only because the capture has no first frame yet
+//!   (an idle monitor), the status reads "Waiting for the screen to change /
+//!   Move the mouse over it to start" (+ tooltip) instead of screen · fps.
 //! - Paused (room reconnecting): `[84 pill][fill status]`.
 //!
 //! "audio" is either a `Share audio ▾` button or, once a source is chosen, the
@@ -204,9 +207,20 @@ fn live(ui: &mut Ui, cx: &mut Cx, room: RoomHandle, capture: CaptureSourceId, de
     paint_pill(ui, row.cell(0), kind.pill(&text).large());
     let params = d.live_params();
     let kbps = dest_kbps(cx, destination, d);
-    let t1 = tr_with("ui.bar.live_title", "%{screen} · %{fps} fps", &[("screen", &screen_name(c)), ("fps", &params.framerate.to_string())]);
-    let t2 = format!("{} · {}", simple_screensharing_client::presets::codec_label(params.codec), fmt_rate(kbps));
-    status_text(ui, row.cell(1), &t1, Some((&t2, true)));
+    if awaiting_first_frame(cx, capture, c, d) {
+        // An idle monitor sends no first frame until something on it repaints
+        // (portal `copy_with_damage`); say so instead of a silent "Starting".
+        let t1 = tr("ui.bar.waiting_title", "Waiting for the screen to change");
+        let t2 = tr("ui.bar.waiting_sub", "Move the mouse over it to start");
+        status_text(ui, row.cell(1), &t1, Some((&t2, false)));
+        ui.interact(row.cell(1), ui.id().with("waiting_tip"), Sense::hover()).on_hover_text(waiting_hint());
+        // The flag flips on the capture thread; poll so Live shows promptly.
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+    } else {
+        let t1 = tr_with("ui.bar.live_title", "%{screen} · %{fps} fps", &[("screen", &screen_name(c)), ("fps", &params.framerate.to_string())]);
+        let t2 = format!("{} · {}", simple_screensharing_client::presets::codec_label(params.codec), fmt_rate(kbps));
+        status_text(ui, row.cell(1), &t1, Some((&t2, true)));
+    }
     let audio_out = audio.show(ui, row.cell(2));
     let settings_clicked = row.show(ui, 3, Align::Min, |ui| settings.show_sized(ui, row.cell(3).width())).clicked();
     let rooms_clicked = row.show(ui, 4, Align::Min, |ui| rooms.show_sized(ui, row.cell(4).width())).clicked();
@@ -658,6 +672,22 @@ pub(super) fn dest_pill(c: &LocalCapture, d: &Destination) -> (PillKind, String)
         DestinationState::Stalled { .. } => (PillKind::Degraded, tr("ui.pill.stalled", "Stalled")),
         DestinationState::Failed(_) => (PillKind::Degraded, tr("ui.pill.failed", "Failed")),
     }
+}
+
+/// `true` while `d` is still Starting because its capture has not produced a
+/// first frame yet: an idle monitor (the portal only sends on repaint) until
+/// something on it changes. See `AppState::capture_awaiting_first_frame`.
+pub(super) fn awaiting_first_frame(cx: &Cx, capture: CaptureSourceId, c: &LocalCapture, d: &Destination) -> bool {
+    matches!(c.destination_state(d), DestinationState::Starting) && cx.state.capture_awaiting_first_frame(capture)
+}
+
+/// The long form of the "waiting for the screen to change" hint (bar tooltip,
+/// stream-settings banner).
+pub(super) fn waiting_hint() -> String {
+    tr(
+        "ui.waiting_frame_hint",
+        "An idle screen sends no picture until something on it changes. Move the mouse over the shared screen and the stream starts.",
+    )
 }
 
 /// Every video destination this client sends, across captures.
