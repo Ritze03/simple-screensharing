@@ -21,6 +21,7 @@ mod transport_tests;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -165,28 +166,68 @@ async fn main() -> Result<()> {
     // safe outside a tokio async execution context (true for a bare
     // std::thread).
     let tui_registry = registry.clone();
-    let tui_thread = std::thread::spawn(move || tui::run(tui_registry));
+    let stop = Arc::new(AtomicBool::new(false));
+    let tui_stop = stop.clone();
+    let tui_thread = std::thread::spawn(move || tui::run(tui_registry, tui_stop));
+    let mut tui_join = tokio::task::spawn_blocking(move || tui_thread.join());
 
-    // Wait for whichever comes first: the TUI quitting, Ctrl-C, or the
-    // relay listener dying unexpectedly.
-    tokio::select! {
-        join = tokio::task::spawn_blocking(move || tui_thread.join()) => {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+    // Wait for whichever comes first: the TUI quitting, SIGINT/SIGTERM.
+    let tui_done = tokio::select! {
+        join = &mut tui_join => {
             match join {
                 Ok(Ok(Ok(()))) => tracing::info!("TUI exited normally, shutting down"),
                 Ok(Ok(Err(e))) => tracing::error!("TUI exited with error: {e:#}"),
                 Ok(Err(_)) => tracing::error!("TUI thread panicked"),
                 Err(e) => tracing::error!("failed to join TUI thread: {e:#}"),
             }
+            true
         }
         _ = tokio::signal::ctrl_c() => {
-            tracing::info!("received Ctrl-C, shutting down");
+            tracing::info!("received SIGINT, shutting down");
+            false
         }
-    }
+        _ = sigterm.recv() => {
+            tracing::info!("received SIGTERM, shutting down");
+            false
+        }
+    };
+
+    // A second signal while shutting down forces an immediate exit.
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+        ratatui::restore();
+        eprintln!("second signal, forcing exit");
+        std::process::exit(130);
+    });
+
+    // Ask the TUI thread to stop (it polls every 200 ms) so it restores the
+    // terminal and the tokio runtime is not left waiting on its blocking
+    // join forever (that was the hang: nothing ever told the TUI to stop).
+    stop.store(true, Ordering::Relaxed);
 
     // Tell connected peers we are going away (close code + reason) so they
     // notice at once instead of after the ~21 s QUIC idle timeout.
     relay::shutdown(&endpoint).await;
 
+    if !tui_done {
+        // Bounded wait for the TUI thread to leave raw mode / alt screen.
+        if tokio::time::timeout(Duration::from_secs(1), &mut tui_join)
+            .await
+            .is_err()
+        {
+            tracing::warn!("TUI thread did not stop in time; restoring terminal");
+            ratatui::restore();
+        }
+    }
+
     tracing::info!("shutdown complete");
-    Ok(())
+    // Drop the guard (flushes logs), then exit without waiting for any
+    // straggling blocking task in the runtime.
+    drop(_log_guard);
+    std::process::exit(0);
 }

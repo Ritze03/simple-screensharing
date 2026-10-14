@@ -14,9 +14,9 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -298,7 +298,11 @@ fn save_lifetime_baseline(rx: u64, tx: u64) {
     if let Some(parent) = std::path::Path::new(LIFETIME_STATE_PATH).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(LIFETIME_STATE_PATH, format!("rx={rx}\ntx={tx}\n"));
+    // Write-then-rename so a kill mid-write never leaves a torn file.
+    let tmp = format!("{LIFETIME_STATE_PATH}.tmp");
+    if std::fs::write(&tmp, format!("rx={rx}\ntx={tx}\n")).is_ok() {
+        let _ = std::fs::rename(&tmp, LIFETIME_STATE_PATH);
+    }
 }
 
 fn fmt_rate(bytes_per_sec: f64) -> String {
@@ -366,20 +370,26 @@ fn hex_conn(id: u64) -> String {
 }
 
 /// Run the TUI event loop on the *calling* thread until the user quits
-/// ('q' or Esc-at-top-level) or `should_stop` returns true. Intended to
+/// ('q' or Esc-at-top-level) or `stop` is set (SIGINT/SIGTERM in main). Intended to
 /// be invoked via `std::thread::spawn` from `main`, not from a tokio
 /// task.
-pub fn run(registry: Arc<Registry>) -> anyhow::Result<()> {
+pub fn run(registry: Arc<Registry>, stop: Arc<AtomicBool>) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
-    let result = run_app(&mut terminal, &registry);
+    let result = run_app(&mut terminal, &registry, &stop);
     ratatui::restore();
     result
 }
 
-fn run_app(terminal: &mut ratatui::DefaultTerminal, registry: &Registry) -> anyhow::Result<()> {
+fn run_app(
+    terminal: &mut ratatui::DefaultTerminal,
+    registry: &Registry,
+    stop: &AtomicBool,
+) -> anyhow::Result<()> {
     let mut app = App::new();
 
-    loop {
+    // `stop` is set by main on SIGINT/SIGTERM; checked every REDRAW_INTERVAL
+    // (the `event::poll` timeout) so the thread can always be joined.
+    while !stop.load(Ordering::Relaxed) {
         let mut snap = take_snapshot(registry);
         app.maybe_sample(&snap);
         // Keep cursor in range as rooms come and go.
@@ -450,6 +460,9 @@ fn run_app(terminal: &mut ratatui::DefaultTerminal, registry: &Registry) -> anyh
             }
         }
     }
+    // Stopped from outside (signal): persist the lifetime counters like 'q'.
+    app.save_lifetime(&take_snapshot(registry));
+    Ok(())
 }
 
 fn draw(frame: &mut Frame, app: &App, snap: &Snapshot) {
