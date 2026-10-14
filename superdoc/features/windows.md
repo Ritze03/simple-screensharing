@@ -113,7 +113,7 @@ viewer would otherwise pick that one.
 - The relay's TUI needs a console: started through `Win32_Process.Create` (a hidden session 0 console) or a
   scheduled task in the interactive session.
 - **The relay does not build or work on Windows as it is** (`server/` is a separate crate; the fixes below were
-  applied in a copy inside the VM and are not committed):
+  applied in a copy inside the VM; the exact diff, tested on Linux (16 server tests pass) and Windows, is `client/packaging/windows/server-windows.patch`, apply it with `git apply`):
   1. `tokio::signal::unix` in `server/src/main.rs` does not compile. A `Sigterm` shim that never fires on Windows fixes it.
   2. `Endpoint::server` on `[::]` leaves `IPV6_V6ONLY` at the Windows default (on), so **IPv4 clients never connect**
      (`QUIC handshake failed: timed out`; `localhost` works because it resolves to `::1`). Binding the socket with
