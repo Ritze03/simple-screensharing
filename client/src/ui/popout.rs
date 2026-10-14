@@ -410,7 +410,10 @@ fn audio_pill(ui: &mut Ui, info: &mut Info) -> Option<(u32, bool)> {
     let slots_on = [fixed(25.0), fixed(110.0), fixed(34.0)];
     let muted_w = text_width(ui, &muted_txt, pct_f.clone(), 0.0).ceil();
     let slots_off = [fixed(25.0), fixed(muted_w)];
-    let (slots, w): (&[_], f32) = if info.muted {
+    // The row shape is fixed by the state it was laid out for; a click on
+    // mute this pass only changes it next pass.
+    let was_muted = info.muted;
+    let (slots, w): (&[_], f32) = if was_muted {
         (&slots_off, 2.0 + 25.0 + 4.0 + muted_w + 10.0)
     } else {
         (&slots_on, 2.0 + 25.0 + 4.0 + 110.0 + 4.0 + 34.0 + 10.0)
@@ -452,8 +455,9 @@ fn audio_pill(ui: &mut Ui, info: &mut Info) -> Option<(u32, bool)> {
     if mute.clicked() {
         info.muted = !info.muted;
         out = Some((info.volume, info.muted));
+        ui.ctx().request_repaint();
     }
-    if info.muted {
+    if was_muted {
         row.text(ui, 1, &muted_txt, pct_f, theme::DANGER, Align::Min);
     } else {
         let mut v = info.volume;
@@ -464,7 +468,7 @@ fn audio_pill(ui: &mut Ui, info: &mut Info) -> Option<(u32, bool)> {
             .changed()
         {
             info.volume = v;
-            out = Some((v, false));
+            out = Some((v, info.muted));
         }
         let pct = format!("{}%", info.volume);
         row.text(

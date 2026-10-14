@@ -239,7 +239,7 @@ fn create_join(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
             }
             match st.tab {
                 AddTab::Join => {
-                    widgets::card(ui, &tr("ui.modal.join_card", "Join"), None, |ui| {
+                    plain_card(ui, |ui| {
                         let link = widgets::ctrl_row(
                             ui,
                             &tr("ui.modal.join_link", "Join link"),
@@ -264,7 +264,7 @@ fn create_join(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
                                 "Room created. Send this link to your friends; anyone with it can join.",
                             ),
                         );
-                        widgets::card(ui, &link.room_name, None, |ui| {
+                        plain_card(ui, |ui| {
                             widgets::ctrl_row(ui, &tr("ui.modal.server", "Server"), None, |ui| {
                                 let server = parse_join_string(&link.join_string)
                                     .map(|p| p.server)
@@ -287,7 +287,6 @@ fn create_join(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
                                 },
                                 |ui| {
                                     copy_clicked = Btn::secondary(&copy)
-                                        .icon("content_copy")
                                         .show_sized(ui, theme::VALUE_W)
                                         .clicked()
                                 },
@@ -295,7 +294,7 @@ fn create_join(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
                         });
                     }
                     _ => {
-                        widgets::card(ui, &tr("ui.modal.create_card", "New room"), None, |ui| {
+                        plain_card(ui, |ui| {
                             let server = widgets::ctrl_row(
                                 ui,
                                 &tr("ui.modal.server", "Server"),
@@ -346,10 +345,7 @@ fn create_join(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
                     ui,
                     &[],
                     None,
-                    &[
-                        Btn::secondary(&cancel),
-                        Btn::primary(&join_now).icon("login").enabled(!awaiting),
-                    ],
+                    &[Btn::primary(&join_now).icon("login").enabled(!awaiting)],
                 )
             } else if tab == AddTab::Join {
                 widgets::modal_footer(
@@ -382,8 +378,11 @@ fn create_join(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
             toast,
         });
     }
-    let primary = click == FooterClick::Trailing(1) || submit;
-    if click == FooterClick::Trailing(0) || (a.close && click == FooterClick::None && !submit) {
+    // Footer: `[Join now]` once a room was minted (mockup), else `[Cancel][primary]`.
+    let primary_i = if minted { 0 } else { 1 };
+    let primary = click == FooterClick::Trailing(primary_i) || submit;
+    let cancel_clicked = !minted && click == FooterClick::Trailing(0);
+    if cancel_clicked || (a.close && click == FooterClick::None && !submit) {
         cx.act(UiAction::CloseModal);
     } else if primary && !awaiting {
         if minted {
@@ -706,7 +705,7 @@ fn rename(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState, room: &str) {
         ctx,
         &spec,
         |ui| {
-            widgets::card(ui, &tr("ui.modal.rename_card", "Room"), None, |ui| {
+            plain_card(ui, |ui| {
                 let r = widgets::ctrl_row(ui, &tr("ui.modal.name", "Name"), None, |ui| {
                     widgets::text_field(ui, &mut st.rename, "")
                 });
@@ -733,6 +732,24 @@ fn rename(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState, room: &str) {
     } else if click == FooterClick::Trailing(0) || a.close {
         cx.act(UiAction::CloseModal);
     }
+}
+
+/// An untitled settings card (mockup `V("Frame · vbox (card)")` without a
+/// title row, as in the create/join and rename modals): the same frame as
+/// `widgets::card`, rows 8 px apart, full width.
+fn plain_card<R>(ui: &mut Ui, body: impl FnOnce(&mut Ui) -> R) -> R {
+    egui::Frame::new()
+        .fill(theme::PANEL_RAISED)
+        .stroke(egui::Stroke::new(1.0_f32, theme::BORDER))
+        .corner_radius(egui::CornerRadius::same(theme::ROUNDING_WELL))
+        .inner_margin(egui::Margin::same(theme::S3 as i8))
+        .show(ui, |ui| {
+            let w = ui.available_width();
+            ui.set_width(w);
+            ui.spacing_mut().item_spacing.y = theme::S2;
+            body(ui)
+        })
+        .inner
 }
 
 /// Dim explanatory text (`.modal p`): 12.5 px, line height 1.55, wraps.
