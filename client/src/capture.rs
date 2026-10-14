@@ -2299,7 +2299,32 @@ pub async fn start_sharing(
 pub async fn start_capture(framerate: u32) -> Result<CaptureHandle> {
     ensure_gstreamer_initialized()?;
     let capture_source = acquire_capture_source().await?;
-    start_capture_with_source(framerate, capture_source).await
+    match start_capture_with_source(framerate, capture_source).await {
+        // `Why one retry on a new portal session (task #59):` stock
+        // xdg-desktop-portal-wlr exits when the `pipewiresrc` start flap lands
+        // after its first frame request, and the odds of that grow with CPU
+        // load (about 1 start in 4 at host load >= 20, none below 10; see
+        // [`decoupled_source`]). Its node is gone with it, so nothing on this
+        // session can recover, but the portal service restarts the backend on
+        // the next request, which makes a fresh session cheap. Once, never in
+        // a loop; a picker-based backend asks the user again, which beats a
+        // dead end that needs the same click anyway.
+        Err(e) if start_is_hopeless(&e) => {
+            tracing::warn!("screen capture lost its portal while starting ({e:#}); requesting a new portal session once");
+            // Lets a restarting backend (systemd `Restart=`, a compositor
+            // autostart script) take its bus name again first.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let capture_source = acquire_capture_source().await.map_err(|retry| {
+                if is_picker_cancelled(&retry) {
+                    retry
+                } else {
+                    retry.context(format!("could not get a new portal session after: {e:#}"))
+                }
+            })?;
+            start_capture_with_source(framerate, capture_source).await
+        }
+        other => other,
+    }
 }
 
 /// TEST-ONLY seam (see [`CaptureSource::TestSource`]): starts the exact same
@@ -2468,7 +2493,7 @@ async fn start_capture_with_source(framerate: u32, capture_source: CaptureSource
     let (built, domain) = match started {
         Ok(started) => started,
         Err(e) => {
-            tracing::error!("screen capture failed to start: {e:#}");
+            tracing::warn!("screen capture failed to start: {e:#}");
             close_portal_quietly(&capture_source).await;
             return Err(e);
         }
