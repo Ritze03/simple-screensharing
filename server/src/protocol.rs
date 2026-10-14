@@ -21,7 +21,6 @@ use serde::{Deserialize, Serialize};
 pub enum FrameError {
     TooLarge(u32),
     Encode(postcard::Error),
-    Closed,
 }
 
 impl std::fmt::Display for FrameError {
@@ -32,7 +31,6 @@ impl std::fmt::Display for FrameError {
                 "control frame length {len} exceeds cap {MAX_CONTROL_FRAME_LEN}"
             ),
             FrameError::Encode(e) => write!(f, "postcard encode error: {e}"),
-            FrameError::Closed => write!(f, "connection closed while reading frame"),
         }
     }
 }

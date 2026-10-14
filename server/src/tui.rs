@@ -81,7 +81,6 @@ struct RoomSnapshot {
 }
 
 struct MemberSnapshot {
-    conn_id: u64,
     display_name: String,
     transport: TransportKind,
     stream_count: u8,
@@ -109,7 +108,6 @@ fn take_snapshot(registry: &Registry) -> Snapshot {
             .connections
             .values()
             .map(|c| MemberSnapshot {
-                conn_id: c.conn_id,
                 display_name: c.display_name.clone(),
                 transport: c.transport,
                 stream_count: c.stream_count,
