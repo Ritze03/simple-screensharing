@@ -27,28 +27,16 @@
 //!   are live in the room or watching streams there.
 //! - **Rename** (520): one Name row, Enter or Save pushes [`UiAction::Rename`].
 
-use std::borrow::Cow;
 
 use egui::{Align, Ui};
 use simple_screensharing_client::net::parse_join_string;
 use simple_screensharing_client::rooms::{AppSettings, PresentationMode};
 use simple_screensharing_client::session::RoomHandle;
 
-use super::{Cx, Modal, ShareState, UiAction};
+use super::{Cx, Modal, ShareState, UiAction, tr, tr_with};
 use crate::theme::{self, Weight, font};
 use crate::widgets::{self, BannerKind, Btn, FooterClick, ModalSpec};
 
-/// `t!(key)`, or `en` while the locale files don't have `key` yet (they come
-/// with I17; until then `t!` returns the key itself). `Why:` raw keys in the
-/// modals made the screenshots useless for comparing against the mockup.
-pub(super) fn tr(key: &str, en: &'static str) -> Cow<'static, str> {
-    let s = t!(key);
-    if s == key {
-        Cow::Borrowed(en)
-    } else {
-        Cow::Owned(s.into_owned())
-    }
-}
 
 /// Which half of the create/join modal is showing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -132,12 +120,7 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState, modal: &Moda
         Modal::Settings => settings(ctx, cx, st),
         Modal::LeaveConfirm { room } => {
             let name = cx.room_name(*room);
-            let title = t!("ui.modal.leave_title", room = name);
-            let title = if title.starts_with("ui.") {
-                format!("Leave {name}?")
-            } else {
-                title.into_owned()
-            };
+            let title = tr_with("ui.modal.leave_title", "Leave %{room}?", &[("room", &name)]);
             let body = tr(
                 "ui.modal.leave_body",
                 "You'll disconnect. The room stays in your list so you can reconnect later.",
@@ -157,12 +140,7 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState, modal: &Moda
         Modal::ForgetConfirm { room } => {
             let entry = cx.room(room);
             let name = entry.as_ref().map(|r| r.name.clone()).unwrap_or_default();
-            let title = t!("ui.modal.forget_title", room = name);
-            let title = if title.starts_with("ui.") {
-                format!("Forget {name}?")
-            } else {
-                title.into_owned()
-            };
+            let title = tr_with("ui.modal.forget_title", "Forget %{room}?", &[("room", &name)]);
             let body = tr(
                 "ui.modal.forget_body",
                 "You'll leave the room and it disappears from your list. You need the invite link to come back.",
@@ -372,7 +350,7 @@ fn create_join(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
     );
 
     if let (true, Some(Ok(link))) = (copy_clicked, &created) {
-        let toast = tr("ui.toast.link_copied", "Join link copied").into_owned();
+        let toast = tr("ui.toast.link_copied", "Join link copied");
         cx.act(UiAction::CopyText {
             text: link.join_string.clone(),
             toast,
@@ -625,8 +603,7 @@ fn leave_warnings(cx: &Cx, room: RoomHandle) -> Vec<String> {
             tr(
                 "ui.modal.warn_watching_one",
                 "You stop watching 1 stream from this room.",
-            )
-            .into_owned(),
+            ),
         );
     } else if watching > 1 {
         out.push(

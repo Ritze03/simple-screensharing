@@ -38,10 +38,10 @@ use simple_screensharing_client::session::{
 };
 
 use super::action_bar::{
-    PillKind, RoomTargets, dest_kbps, dest_pill, find_source, level_lit, pop_heading, rooms_count, screen_name, source_size, tr,
+    PillKind, RoomTargets, dest_kbps, dest_pill, find_source, level_lit, pop_heading, rooms_count, screen_name, source_size,
     video_destination_count,
 };
-use super::{Cx, NextStream, Popover, PopoverKind, UiAction};
+use super::{Cx, NextStream, Popover, PopoverKind, UiAction, tr, tr_with};
 use crate::theme::{self, Weight, font};
 use crate::widgets::{
     self, BannerKind, Btn, DestAction, DestRow, FILL, FooterClick, HBox, ModalSpec, Pill, fade, paint_gradient, paint_galley, text_galley,
@@ -151,11 +151,11 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut StreamSettingsState, capt
     };
     let room_name = cx.room_name(room);
     let screen = screen_name(c);
-    let title = if staged { tr("ui.stream.title_staged", "Set up your stream", &[]) } else { tr("ui.stream.title_live", "Stream settings", &[]) };
+    let title = if staged { tr("ui.stream.title_staged", "Set up your stream") } else { tr("ui.stream.title_live", "Stream settings") };
     let sub = if staged {
-        tr("ui.stream.sub_staged", "%{screen} · goes live in %{room}", &[("screen", &screen), ("room", &room_name)])
+        tr_with("ui.stream.sub_staged", "%{screen} · goes live in %{room}", &[("screen", &screen), ("room", &room_name)])
     } else {
-        tr("ui.stream.sub_live", "Live in %{room} · changes apply right away", &[("room", &room_name)])
+        tr_with("ui.stream.sub_live", "Live in %{room} · changes apply right away", &[("room", &room_name)])
     };
 
     let now = ctx.input(|i| i.time);
@@ -165,7 +165,7 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut StreamSettingsState, capt
     if recent {
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
-    let applying_t = tr("ui.stream.applying", "Applying", &[]);
+    let applying_t = tr("ui.stream.applying", "Applying");
     let spec = ModalSpec {
         id: "stream_settings",
         title: &title,
@@ -174,12 +174,12 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut StreamSettingsState, capt
         head_pill: applying.then(|| Pill::progress(&applying_t).large()),
     };
 
-    let discard = tr("ui.bar.discard", "Discard", &[]);
-    let later = tr("ui.stream.later", "Later", &[]);
-    let go_live = tr("ui.stream.go_live_in", "Go live in %{room}", &[("room", &room_name)]);
-    let stop = tr("ui.stream.stop_in", "Stop sharing in %{room}", &[("room", &room_name)]);
-    let saved = tr("ui.stream.saved", "Saved", &[]);
-    let done = tr("ui.stream.done", "Done", &[]);
+    let discard = tr("ui.bar.discard", "Discard");
+    let later = tr("ui.stream.later", "Later");
+    let go_live = tr_with("ui.stream.go_live_in", "Go live in %{room}", &[("room", &room_name)]);
+    let stop = tr_with("ui.stream.stop_in", "Stop sharing in %{room}", &[("room", &room_name)]);
+    let saved = tr("ui.stream.saved", "Saved");
+    let done = tr("ui.stream.done", "Done");
     let ready = matches!(c.status, simple_screensharing_client::session::ShareStatus::Active(_));
 
     let mut out: Vec<UiAction> = Vec::new();
@@ -288,7 +288,7 @@ fn source_card(ui: &mut Ui, cx: &Cx, c: &LocalCapture, capture: CaptureSourceId,
         Some((id, _)) if !muted => state.audio_share_level(id).map(level_lit).unwrap_or(0),
         _ => 0,
     };
-    let mut names: Vec<String> = vec![tr("ui.stream.no_audio", "No audio", &[])];
+    let mut names: Vec<String> = vec![tr("ui.stream.no_audio", "No audio")];
     names.extend(state.audio_sources.iter().map(|s| s.name.clone()));
     if let Some(cur) = &current
         && !names[1..].contains(cur)
@@ -298,10 +298,10 @@ fn source_card(ui: &mut Ui, cx: &Cx, c: &LocalCapture, capture: CaptureSourceId,
     let mut idx = current.as_ref().and_then(|cur| names[1..].iter().position(|n| n == cur).map(|i| i + 1)).unwrap_or(0);
     let before = idx;
     let mut mute = muted;
-    let change = tr("ui.stream.change", "Change", &[]);
-    let mute_l = tr("ui.stream.mute_audio", "Mute shared audio", &[]);
-    widgets::card(ui, &tr("ui.stream.source", "Source", &[]), None, |ui| {
-        let label = tr("ui.stream.screen", "Screen", &[]);
+    let change = tr("ui.stream.change", "Change");
+    let mute_l = tr("ui.stream.mute_audio", "Mute shared audio");
+    widgets::card(ui, &tr("ui.stream.source", "Source"), None, |ui| {
+        let label = tr("ui.stream.screen", "Screen");
         if staged {
             let (_, clicked) = widgets::ctrl_row_value(
                 ui,
@@ -322,7 +322,7 @@ fn source_card(ui: &mut Ui, cx: &Cx, c: &LocalCapture, capture: CaptureSourceId,
         let opts: Vec<&str> = names.iter().map(String::as_str).collect();
         widgets::ctrl_row_value(
             ui,
-            &tr("ui.stream.audio", "Audio", &[]),
+            &tr("ui.stream.audio", "Audio"),
             None,
             |ui| widgets::select(ui, "stream_audio", &mut idx, &opts),
             |ui| widgets::value_box_with(ui, |ui| widgets::meter(ui, lit)),
@@ -352,9 +352,9 @@ fn destinations_card(
 ) {
     let staged = c.destinations.is_empty();
     let (title, count) = if staged {
-        (tr("ui.stream.goes_live_in", "Goes live in", &[]), rooms_count(1))
+        (tr("ui.stream.goes_live_in", "Goes live in"), rooms_count(1))
     } else {
-        (tr("ui.stream.sending_to", "Sending to", &[]), rooms_count(c.destinations.len()))
+        (tr("ui.stream.sending_to", "Sending to"), rooms_count(c.destinations.len()))
     };
     struct Row {
         id: Option<DestinationId>,
@@ -368,7 +368,7 @@ fn destinations_card(
             id: None,
             current: true,
             name: cx.room_name(room),
-            pill: (PillKind::Muted, tr("ui.pill.not_live", "Not live", &[])),
+            pill: (PillKind::Muted, tr("ui.pill.not_live", "Not live")),
             kbps: "\u{2014}".into(),
         }]
     } else {
@@ -383,8 +383,8 @@ fn destinations_card(
             })
             .collect()
     };
-    let also = tr("ui.stream.also_send_to", "Also send to…", &[]);
-    let move_to = tr("ui.stream.move_to", "Move to…", &[]);
+    let also = tr("ui.stream.also_send_to", "Also send to…");
+    let move_to = tr("ui.stream.move_to", "Move to…");
     widgets::card(ui, &title, Some(&count), |ui| {
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = theme::S1;
@@ -419,11 +419,11 @@ fn destinations_card(
 fn bandwidth_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, c: &LocalCapture, target: Target, out: &mut Vec<UiAction>) {
     let state = cx.state;
     let mut mode = state.bandwidth_mode;
-    let per = tr("ui.stream.bw_per_stream", "Per-stream maximum", &[]);
-    let abs = tr("ui.stream.bw_absolute", "Absolute maximum", &[]);
+    let per = tr("ui.stream.bw_per_stream", "Per-stream maximum");
+    let abs = tr("ui.stream.bw_absolute", "Absolute maximum");
     let staged = c.destinations.is_empty();
-    widgets::card(ui, &tr("ui.stream.bandwidth", "Upload bandwidth", &[]), Some(&tr("ui.stream.bandwidth_all", "all your streams", &[])), |ui| {
-        let changed = widgets::ctrl_row(ui, &tr("ui.stream.bw_mode", "Mode", &[]), None, |ui| {
+    widgets::card(ui, &tr("ui.stream.bandwidth", "Upload bandwidth"), Some(&tr("ui.stream.bandwidth_all", "all your streams")), |ui| {
+        let changed = widgets::ctrl_row(ui, &tr("ui.stream.bw_mode", "Mode"), None, |ui| {
             widgets::segmented(ui, &mut mode, &[(BandwidthMode::PerStream, per.as_str()), (BandwidthMode::Absolute, abs.as_str())])
         });
         if changed {
@@ -435,8 +435,8 @@ fn bandwidth_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, c: &LocalC
         let mut total = st.total.unwrap_or(state.absolute_total_kbps);
         let r = widgets::slider_row(
             ui,
-            &tr("ui.stream.bw_total", "Total maximum", &[]),
-            Some(&tr("ui.stream.bw_total_tip", "kbps across every stream you send", &[])),
+            &tr("ui.stream.bw_total", "Total maximum"),
+            Some(&tr("ui.stream.bw_total_tip", "kbps across every stream you send")),
             &mut total,
             TOTAL_RANGE,
             BW_STEP,
@@ -449,8 +449,8 @@ fn bandwidth_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, c: &LocalC
         let mut floor = st.floor.unwrap_or(state.destination_floor_kbps);
         let r = widgets::slider_row(
             ui,
-            &tr("ui.stream.bw_floor", "Floor per stream", &[]),
-            Some(&tr("ui.stream.bw_floor_tip", "kbps no stream drops below", &[])),
+            &tr("ui.stream.bw_floor", "Floor per stream"),
+            Some(&tr("ui.stream.bw_floor_tip", "kbps no stream drops below")),
             &mut floor,
             FLOOR_RANGE,
             BW_STEP,
@@ -463,10 +463,7 @@ fn bandwidth_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, c: &LocalC
         let n = video_destination_count(cx) + usize::from(staged);
         let over = state.bandwidth_overshoot_kbps();
         if over > 0 || (n as u32).saturating_mul(floor) > total {
-            let text = tr(
-                "ui.stream.bw_over",
-                "Over budget: %{n} streams × %{floor} kbps floor is more than %{total} kbps. No stream drops below its floor.",
-                &[("n", &n.to_string()), ("floor", &floor.to_string()), ("total", &total.to_string())],
+            let text = tr_with("ui.stream.bw_over", "Over budget: %{n} streams × %{floor} kbps floor is more than %{total} kbps. No stream drops below its floor.", &[("n", &n.to_string()), ("floor", &floor.to_string()), ("total", &total.to_string())],
             );
             widgets::banner(ui, BannerKind::Hatched, "warning", &text, None);
         } else {
@@ -476,13 +473,13 @@ fn bandwidth_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, c: &LocalC
             }
             .unwrap_or_else(|| even_share(total, floor, n));
             let text = if n == 1 {
-                tr("ui.stream.bw_one_stream", "1 stream gets the budget", &[])
+                tr("ui.stream.bw_one_stream", "1 stream gets the budget")
             } else {
-                tr("ui.stream.bw_n_streams", "%{n} streams share the budget", &[("n", &n.to_string())])
+                tr_with("ui.stream.bw_n_streams", "%{n} streams share the budget", &[("n", &n.to_string())])
             };
             widgets::ctrl_row_value(
                 ui,
-                &tr("ui.stream.bw_share", "Per stream", &[]),
+                &tr("ui.stream.bw_share", "Per stream"),
                 None,
                 |ui| widgets::readout(ui, &text, Align::Max),
                 |ui| widgets::value_box(ui, &share.to_string()),
@@ -499,16 +496,16 @@ fn video_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, c: &LocalCaptu
     let state = cx.state;
     let v = target.values(state);
     let fps_opts = presets::framerate_options_for(v.framerate);
-    let fps_labels: Vec<String> = fps_opts.iter().map(|f| tr("ui.stream.fps", "%{fps} fps", &[("fps", &f.to_string())])).collect();
+    let fps_labels: Vec<String> = fps_opts.iter().map(|f| tr_with("ui.stream.fps", "%{fps} fps", &[("fps", &f.to_string())])).collect();
     let mut fps_idx = fps_opts.iter().position(|f| *f == v.framerate).unwrap_or(0);
     let supported = AppState::supported_codecs();
-    widgets::card(ui, &tr("ui.stream.video", "Video", &[]), None, |ui| {
+    widgets::card(ui, &tr("ui.stream.video", "Video"), None, |ui| {
         let labels: Vec<&str> = fps_labels.iter().map(String::as_str).collect();
-        let r = widgets::ctrl_row(ui, &tr("ui.stream.framerate", "Framerate", &[]), None, |ui| widgets::select(ui, "stream_fps", &mut fps_idx, &labels));
+        let r = widgets::ctrl_row(ui, &tr("ui.stream.framerate", "Framerate"), None, |ui| widgets::select(ui, "stream_fps", &mut fps_idx, &labels));
         if r.changed() {
             out.push(target.action(NextStream { framerate: fps_opts[fps_idx], ..v }));
         }
-        let bitrate_l = tr("ui.stream.bitrate", "Bitrate", &[]);
+        let bitrate_l = tr("ui.stream.bitrate", "Bitrate");
         if state.bandwidth_mode == BandwidthMode::Absolute {
             let value = match target {
                 Target::Live(d, _) => c.destinations.get(&d).map(|dd| dest_kbps(cx, d, dd)),
@@ -519,8 +516,8 @@ fn video_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, c: &LocalCaptu
             widgets::ctrl_row_value(
                 ui,
                 &bitrate_l,
-                Some(&tr("ui.stream.bitrate_abs_tip", "Absolute maximum mode: the upload budget splits the bitrate across all your streams.", &[])),
-                |ui| widgets::readout(ui, &tr("ui.stream.bitrate_by_budget", "Set by upload budget", &[]), Align::Max),
+                Some(&tr("ui.stream.bitrate_abs_tip", "Absolute maximum mode: the upload budget splits the bitrate across all your streams.")),
+                |ui| widgets::readout(ui, &tr("ui.stream.bitrate_by_budget", "Set by upload budget"), Align::Max),
                 |ui| widgets::value_box(ui, &value),
             );
         } else {
@@ -528,7 +525,7 @@ fn video_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, c: &LocalCaptu
             let r = widgets::slider_row(
                 ui,
                 &bitrate_l,
-                Some(&tr("ui.stream.bitrate_tip", "kbps for this room. Per-stream mode: you set each room's bitrate yourself.", &[])),
+                Some(&tr("ui.stream.bitrate_tip", "kbps for this room. Per-stream mode: you set each room's bitrate yourself.")),
                 &mut kbps,
                 MIN_BITRATE_KBPS..=MAX_BITRATE_KBPS,
                 f64::from(BITRATE_STEP_KBPS),
@@ -542,8 +539,8 @@ fn video_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, c: &LocalCaptu
         let opts: Vec<(VideoCodec, &str, bool, &str)> =
             CODEC_DISPLAY_ORDER.iter().map(|c| (*c, codec_label(*c), supported.contains(c), codec_description(*c))).collect();
         let mut codec = v.codec;
-        let unsupported = tr("ui.stream.codec_unsupported", "This machine's encoder can't produce this codec.", &[]);
-        let changed = widgets::ctrl_row(ui, &tr("ui.stream.codec", "Codec", &[]), None, |ui| seg_gated(ui, &mut codec, &opts, &unsupported));
+        let unsupported = tr("ui.stream.codec_unsupported", "This machine's encoder can't produce this codec.");
+        let changed = widgets::ctrl_row(ui, &tr("ui.stream.codec", "Codec"), None, |ui| seg_gated(ui, &mut codec, &opts, &unsupported));
         if changed {
             out.push(target.action(NextStream { codec, ..v }));
         }
@@ -556,16 +553,16 @@ fn encoder_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, target: Targ
     let mut preset = EncoderPreset::detect(tuning);
     let preset_opts: Vec<(Option<EncoderPreset>, &str, bool, &str)> =
         EncoderPreset::ALL.iter().map(|p| (Some(*p), p.label(), true, p.description())).collect();
-    let adv = tr("ui.stream.advanced", "Advanced tuning", &[]);
-    let (low, best) = (tr("ui.stream.tune_low", "Low latency", &[]), tr("ui.stream.tune_best", "Best quality", &[]));
+    let adv = tr("ui.stream.advanced", "Advanced tuning");
+    let (low, best) = (tr("ui.stream.tune_low", "Low latency"), tr("ui.stream.tune_best", "Best quality"));
     let (perf, bal, qual) = (
-        tr("ui.stream.ql_performance", "Performance", &[]),
-        tr("ui.stream.ql_balanced", "Balanced", &[]),
-        tr("ui.stream.ql_quality", "Quality", &[]),
+        tr("ui.stream.ql_performance", "Performance"),
+        tr("ui.stream.ql_balanced", "Balanced"),
+        tr("ui.stream.ql_quality", "Quality"),
     );
-    let (eff, maxq) = (tr("ui.stream.rc_efficient", "Efficient", &[]), tr("ui.stream.rc_max_quality", "Max quality", &[]));
-    widgets::card(ui, &tr("ui.stream.encoder", "Encoder", &[]), None, |ui| {
-        let changed = widgets::ctrl_row(ui, &tr("ui.stream.preset", "Preset", &[]), None, |ui| seg_gated(ui, &mut preset, &preset_opts, ""));
+    let (eff, maxq) = (tr("ui.stream.rc_efficient", "Efficient"), tr("ui.stream.rc_max_quality", "Max quality"));
+    widgets::card(ui, &tr("ui.stream.encoder", "Encoder"), None, |ui| {
+        let changed = widgets::ctrl_row(ui, &tr("ui.stream.preset", "Preset"), None, |ui| seg_gated(ui, &mut preset, &preset_opts, ""));
         if changed && let Some(p) = preset {
             out.push(target.preset_action(p));
         }
@@ -574,13 +571,13 @@ fn encoder_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, target: Targ
             return;
         }
         let mut tune = v.tune;
-        if widgets::ctrl_row(ui, &tr("ui.stream.tune", "Tune", &[]), None, |ui| {
+        if widgets::ctrl_row(ui, &tr("ui.stream.tune", "Tune"), None, |ui| {
             widgets::segmented(ui, &mut tune, &[(TuneMode::LowLatency, low.as_str()), (TuneMode::BestQuality, best.as_str())])
         }) {
             out.push(target.action(NextStream { tune, ..v }));
         }
         let mut ql = v.quality_level;
-        if widgets::ctrl_row(ui, &tr("ui.stream.quality_level", "Quality level", &[]), None, |ui| {
+        if widgets::ctrl_row(ui, &tr("ui.stream.quality_level", "Quality level"), None, |ui| {
             widgets::segmented(
                 ui,
                 &mut ql,
@@ -592,8 +589,8 @@ fn encoder_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, target: Targ
         let mut rc = v.rate_control;
         if widgets::ctrl_row(
             ui,
-            &tr("ui.stream.rate_control", "Rate control", &[]),
-            Some(&tr("ui.stream.rate_control_tip", "Efficient = QVBR, Max quality = CQP", &[])),
+            &tr("ui.stream.rate_control", "Rate control"),
+            Some(&tr("ui.stream.rate_control_tip", "Efficient = QVBR, Max quality = CQP")),
             |ui| widgets::segmented(ui, &mut rc, &[(RateControlMode::Qvbr, eff.as_str()), (RateControlMode::Cqp, maxq.as_str())]),
         ) {
             out.push(target.action(NextStream { rate_control: rc, ..v }));
@@ -601,8 +598,8 @@ fn encoder_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, target: Targ
         let mut gop = st.gop.unwrap_or(v.gop_millis);
         let r = widgets::slider_row(
             ui,
-            &tr("ui.stream.keyframe", "Keyframe interval", &[]),
-            Some(&tr("ui.stream.keyframe_tip", "GOP length. Shorter recovers faster from fast motion, costs more bitrate.", &[])),
+            &tr("ui.stream.keyframe", "Keyframe interval"),
+            Some(&tr("ui.stream.keyframe_tip", "GOP length. Shorter recovers faster from fast motion, costs more bitrate.")),
             &mut gop,
             GOP_RANGE,
             GOP_STEP,
@@ -629,9 +626,9 @@ fn rooms_popover(ctx: &egui::Context, cx: &mut Cx, capture: CaptureSourceId, roo
     };
     let targets = RoomTargets::of(cx, capture, room);
     let heading = if also {
-        tr("ui.stream.also_heading", "Also send this stream to", &[])
+        tr("ui.stream.also_heading", "Also send this stream to")
     } else {
-        tr("ui.stream.move_heading", "Move this stream to", &[])
+        tr("ui.stream.move_heading", "Move this stream to")
     };
     let mut picked = None;
     let open = super::popover(ctx, &pop, super::action_bar::POPOVER_W, |ui| {

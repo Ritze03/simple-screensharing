@@ -42,8 +42,7 @@ use egui::{
 };
 use simple_screensharing_client::decode::render::{Fit, VideoView};
 
-use super::modals::tr;
-use super::{Cx, StreamKey, UiAction};
+use super::{Cx, StreamKey, UiAction, tr};
 use crate::theme::{self, Weight, font};
 use crate::widgets::{self, FILL, HBox, fixed, paint_icon, paint_text, text_width};
 
@@ -216,9 +215,9 @@ fn viewport(ctx: &egui::Context, shared: &Shared) {
             let first_frame = pic.width() > 0.0;
             if !first_frame || shared.stalled.load(Ordering::Relaxed) {
                 let text = if first_frame {
-                    t!("stream_control.state_stalled")
+                    tr("stream_control.state_stalled", "Waiting for capture…")
                 } else {
-                    t!("video.waiting_frame")
+                    tr("video.waiting_frame", "Waiting for first decoded frame…")
                 };
                 centre_chip(ui, rect, &text);
             }

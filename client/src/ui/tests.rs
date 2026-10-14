@@ -402,6 +402,28 @@ async fn room_list_is_saved_order_and_a_pending_connect_reads_as_reconnecting() 
     app.state.cancel_connect();
 }
 
+/// #31: a join string re-spelled with a (different) relay cert hash is the
+/// same room: one row, found by either spelling, never queued twice.
+#[tokio::test]
+async fn a_cert_hash_respelling_is_the_same_room() {
+    let _home = isolated_home();
+    let a = unreachable_join_string(1);
+    let hashed = format!("{a}|aZzvDUgnp0ZwLozhaaRsgsdWKtMyGPIwNikFgwbCJlg");
+    assert!(same_room(&a, &hashed));
+    let mut app = app_with_rooms(&[("Alpha", a.clone())]);
+    let ctx = ctx();
+    app.state.start_connect(hashed.clone(), false).unwrap();
+    let rooms = room_entries(&app.state);
+    assert_eq!(rooms.len(), 1, "the in-flight respelling must not add a second row");
+    assert_eq!(rooms[0].conn, ConnState::Reconnecting);
+    app.apply(&ctx, UiAction::SelectRoom(hashed.clone()));
+    assert!(view_is_room(&app.nav.view, &a));
+    app.apply(&ctx, UiAction::Connect(a.clone()));
+    app.apply(&ctx, UiAction::Connect(hashed.clone()));
+    assert_eq!(app.state.auto_connect_queue.len(), 1, "queued once whatever the spelling");
+    app.state.cancel_connect();
+}
+
 #[tokio::test]
 async fn auto_connect_rooms_are_queued_at_startup() {
     let _home = isolated_home();

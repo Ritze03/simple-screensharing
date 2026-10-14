@@ -35,7 +35,6 @@
 //! Every string goes through [`tr`]: `t!(key)`, falling back to the English
 //! text until the locale files (I17) have the key.
 
-use std::borrow::Cow;
 
 use egui::epaint::{Mesh, RectShape, Vertex, WHITE_UV};
 use egui::{Align, Color32, CornerRadius, Id, Layout, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, UiBuilder, pos2, vec2};
@@ -45,7 +44,7 @@ use simple_screensharing_client::decode::render::Fit;
 use simple_screensharing_client::protocol::{ConnId, StreamInfo, StreamKind};
 use simple_screensharing_client::session::{CaptureSourceId, DestinationId, RoomHandle};
 
-use super::{ConnState, Cx, Modal, PopoverKind, RoomEntry, ShareState, StreamKey, UiAction, View};
+use super::{ConnState, Cx, Modal, PopoverKind, RoomEntry, ShareState, StreamKey, UiAction, View, tr, tr_with};
 use crate::theme::{self, Weight, font};
 use crate::widgets::{self, Btn, FILL, HBox, IconBtnKind, PersonRow, Pill, fixed, paint_text, text_width};
 
@@ -132,20 +131,6 @@ pub fn grid_shape(n: usize, w: f32, h: f32, gap: f32) -> (usize, f32) {
     }
 }
 
-/// `t!(key)`, or `en` while the locale files don't have `key` yet.
-fn tr(key: &'static str, en: &'static str) -> Cow<'static, str> {
-    let s = t!(key);
-    if s.as_ref() == key || s.ends_with(key) { Cow::Borrowed(en) } else { Cow::Owned(s.into_owned()) }
-}
-
-/// [`tr`] with `%{name}` placeholders filled in.
-fn tr_with(key: &'static str, en: &'static str, args: &[(&str, &str)]) -> String {
-    let mut s = tr(key, en).into_owned();
-    for (k, v) in args {
-        s = s.replace(&format!("%{{{k}}}"), v);
-    }
-    s
-}
 
 /// Avatar gradient for a member: ours is the accent one (as in the user
 /// band), everyone else gets one of the other four, stable per connection.
@@ -179,7 +164,7 @@ pub fn show_header(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
     let Some(r) = room else {
         let (title, meta) = match cx.nav.view {
             View::Watching => (tr("ui.room.watched_title", "Watched streams"), tr("ui.room.watched_meta", "Every stream you're watching, from every room")),
-            _ => (tr("app.title", "Simple Screensharing"), Cow::Borrowed("")),
+            _ => (tr("app.title", "Simple Screensharing"), String::new()),
         };
         let h2 = font(Weight::Bold, theme::FS_H2);
         let tw = text_width(ui, &title, h2.clone(), 0.0).ceil();
@@ -239,7 +224,7 @@ pub fn show_header(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
 
     let mut on = r.auto_connect;
     let auto_tip = tr("ui.room.auto_connect_tip", "Connect to this room when the app starts");
-    if row.show(ui, 1, Align::Min, |ui| widgets::checkbox(ui, &mut on, &auto_lbl)).on_hover_text(auto_tip.as_ref()).changed() {
+    if row.show(ui, 1, Align::Min, |ui| widgets::checkbox(ui, &mut on, &auto_lbl)).on_hover_text(&auto_tip).changed() {
         cx.act(UiAction::SetAutoConnect { room: r.key.clone(), on });
     }
     let w = row.cell(2).width();
@@ -726,7 +711,7 @@ fn audio_pill(ui: &mut Ui, cx: &Cx, st: &mut RoomState, key: StreamKey, bottom: 
         ("volume_up", theme::TEXT, tr("ui.room.mute", "Mute this stream"))
     };
     widgets::paint_icon(&child, mr, icon, 16.0, col);
-    if mresp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip.as_ref()).clicked() {
+    if mresp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(&tip).clicked() {
         acts.push(UiAction::SetVolume { stream: key, volume_percent: vol.volume_percent, muted: !vol.muted });
     }
     let num = Color32::from_rgba_unmultiplied(232, 233, 236, 217);
@@ -739,7 +724,7 @@ fn audio_pill(ui: &mut Ui, cx: &Cx, st: &mut RoomState, key: StreamKey, bottom: 
     let sr = Rect::from_center_size(sc.center(), vec2(sc.width(), theme::CTL_H));
     let mut sl = child.new_child(UiBuilder::new().id_salt(("tile_vol", key)).max_rect(sr).layout(Layout::left_to_right(Align::Center)));
     let mut v = shown;
-    let r = widgets::slider(&mut sl, &mut v, 0..=200, 5.0).on_hover_text(tr("ui.room.volume", "Volume").as_ref());
+    let r = widgets::slider(&mut sl, &mut v, 0..=200, 5.0).on_hover_text(&tr("ui.room.volume", "Volume"));
     if r.dragged() || r.changed() {
         st.vol_drag = Some((key, v));
     }
@@ -790,7 +775,7 @@ fn thumb_corners(ui: &mut Ui, thumb: Rect, live: Option<&str>, audio: bool) {
     };
     if audio {
         let mut r = ui.new_child(UiBuilder::new().max_rect(row).layout(Layout::right_to_left(Align::Center)));
-        widgets::chip_dark(&mut r, Some("volume_up"), false, "").on_hover_text(tr("ui.room.shares_audio", "Shares audio").as_ref());
+        widgets::chip_dark(&mut r, Some("volume_up"), false, "").on_hover_text(&tr("ui.room.shares_audio", "Shares audio"));
     }
 }
 
@@ -846,7 +831,7 @@ fn share_card(ui: &mut Ui, cx: &Cx, h: RoomHandle, info: &StreamInfo, acts: &mut
     let me = cx.my_conn(h) == Some(info.owner);
     let name = cx.member_name(h, info.owner);
     let specs = if audio_only {
-        tr("ui.room.audio_only", "Audio only").into_owned()
+        tr("ui.room.audio_only", "Audio only")
     } else if info.width > 0 && info.height > 0 {
         format!("{}×{}", info.width, info.height)
     } else {
@@ -892,9 +877,9 @@ fn my_card(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSourceId, destin
     thumb_placeholder(ui, thumb, "cast", theme::SUCCESS, &tr("ui.room.my_screen", "Your screen (no self-preview)"));
     let chip = match cx.destination_state(c, d) {
         DestinationState::Live | DestinationState::Rebuilding { .. } => "LIVE".to_owned(),
-        DestinationState::Starting => tr("ui.room.chip_starting", "STARTING").into_owned(),
-        DestinationState::Stalled { .. } => tr("ui.room.chip_stalled", "STALLED").into_owned(),
-        DestinationState::Failed(_) => tr("ui.room.chip_failed", "FAILED").into_owned(),
+        DestinationState::Starting => tr("ui.room.chip_starting", "STARTING"),
+        DestinationState::Stalled { .. } => tr("ui.room.chip_stalled", "STALLED"),
+        DestinationState::Failed(_) => tr("ui.room.chip_failed", "FAILED"),
     };
     thumb_corners(ui, thumb, Some(&chip), false);
 

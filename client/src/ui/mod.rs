@@ -478,7 +478,7 @@ impl<'a> Cx<'a> {
 
     /// One room by key.
     pub fn room(&self, key: &str) -> Option<RoomEntry> {
-        self.rooms().into_iter().find(|r| r.key == key)
+        self.rooms().into_iter().find(|r| same_room(&r.key, key))
     }
 
     /// The room the central area shows, if the view is a room view.
@@ -503,7 +503,7 @@ impl<'a> Cx<'a> {
     pub fn room_name(&self, handle: RoomHandle) -> String {
         match self.state.rooms.get(&handle) {
             Some(room) => room_label(&self.state.room_store, &room.join_string),
-            None => t!("ui.room.unknown").to_string(),
+            None => tr("ui.room.unknown", "Unknown room").to_string(),
         }
     }
 
@@ -621,9 +621,22 @@ impl<'a> Cx<'a> {
     }
 }
 
+/// Whether two join strings name the same room (server + room id + key; a
+/// different relay cert hash is the same room). `Why` never `==`: a saved
+/// spelling and a live session's spelling can differ only in the cert hash
+/// (#31), and `==` then shows one room twice or connects it twice.
+pub fn same_room(a: &str, b: &str) -> bool {
+    simple_screensharing_client::rooms::RoomStore::same_room(a, b)
+}
+
+/// Whether `view` shows the room `key` names.
+pub fn view_is_room(view: &View, key: &str) -> bool {
+    matches!(view, View::Room(k) if same_room(k, key))
+}
+
 /// All rooms, in list order. See [`RoomEntry`].
 pub fn room_entries(state: &AppState) -> Vec<RoomEntry> {
-    let handle_of = |js: &str| state.rooms.iter().find(|(_, r)| r.join_string == js).map(|(h, _)| *h);
+    let handle_of = |js: &str| state.rooms.iter().find(|(_, r)| same_room(&r.join_string, js)).map(|(h, _)| *h);
     let conn_of = |js: &str, handle: Option<RoomHandle>| match handle {
         Some(_) => ConnState::Joined,
         None if state.is_reconnecting(js) => ConnState::Reconnecting,
@@ -645,7 +658,7 @@ pub fn room_entries(state: &AppState) -> Vec<RoomEntry> {
         })
         .collect();
     for (handle, room) in &state.rooms {
-        if out.iter().any(|e| e.key == room.join_string) {
+        if out.iter().any(|e| same_room(&e.key, &room.join_string)) {
             continue;
         }
         out.push(RoomEntry {
@@ -657,7 +670,7 @@ pub fn room_entries(state: &AppState) -> Vec<RoomEntry> {
         });
     }
     if let Some(p) = &state.pending_connect
-        && !out.iter().any(|e| e.key == p.join_string)
+        && !out.iter().any(|e| same_room(&e.key, &p.join_string))
     {
         out.push(RoomEntry {
             key: p.join_string.clone(),
@@ -700,9 +713,9 @@ pub fn paired_audio(state: &AppState, capture: CaptureSourceId) -> Option<Captur
 /// carries no fps (protocol gap), and a viewer can't know it before decoding.
 pub fn remote_stream_geometry(info: &StreamInfo) -> String {
     if info.width == 0 || info.height == 0 {
-        return t!("streams.geometry_unknown").to_string();
+        return tr("streams.geometry_unknown", "—").to_string();
     }
-    t!("streams.geometry", width = info.width, height = info.height, fps = "\u{2014}").to_string()
+    tr_with("streams.geometry", "%{width}x%{height}@%{fps}", &[("width", &info.width.to_string()), ("height", &info.height.to_string()), ("fps", &"\u{2014}".to_string())])
 }
 
 /// `WxH@FPS` for one of our destinations, preferring the live runtime's
@@ -713,9 +726,33 @@ pub fn destination_geometry(dest: &Destination) -> String {
         None => dest.params,
     };
     if params.width == 0 || params.height == 0 {
-        return t!("streams.geometry_unknown").to_string();
+        return tr("streams.geometry_unknown", "—").to_string();
     }
-    t!("streams.geometry", width = params.width, height = params.height, fps = params.framerate).to_string()
+    tr_with("streams.geometry", "%{width}x%{height}@%{fps}", &[("width", &params.width.to_string()), ("height", &params.height.to_string()), ("fps", &params.framerate.to_string())])
+}
+
+// ---------------------------------------------------------------------------
+// Strings
+// ---------------------------------------------------------------------------
+
+/// `t!(key)` in the current locale, or `en` when the locale files have no
+/// entry for `key` (rust-i18n then returns the key itself, or
+/// `<locale>.<key>`). Every UI string goes through this or [`tr_with`].
+/// `Why` a fallback at all: a missing key still reads as English at its real
+/// width instead of `ui.sidebar.rooms`, and the English source text sits next
+/// to each key for `client/locales/check_keys.py` and translators.
+pub fn tr(key: &str, en: &'static str) -> String {
+    let s = t!(key);
+    if s.as_ref() == key || s.ends_with(key) { en.to_string() } else { s.into_owned() }
+}
+
+/// [`tr`] with `%{name}` placeholders filled from `args`.
+pub fn tr_with(key: &str, en: &'static str, args: &[(&str, &str)]) -> String {
+    let mut s = tr(key, en);
+    for (k, v) in args {
+        s = s.replace(&format!("%{{{k}}}"), v);
+    }
+    s
 }
 
 // ---------------------------------------------------------------------------
@@ -898,7 +935,7 @@ impl App {
             self.state.active_room = Some(handle);
         }
         let name = self.state.rooms.get(&handle).map(|r| room_label(&self.state.room_store, &r.join_string)).unwrap_or_default();
-        self.toast(t!("ui.toast.connected", room = name).to_string(), "check_circle");
+        self.toast(tr_with("ui.toast.connected", "Connected to %{room}", &[("room", &name.to_string())]), "check_circle");
     }
 
     /// Drop staged entries whose capture is gone; auto-open the settings
@@ -910,7 +947,7 @@ impl App {
                 && state.captures.get(&s.capture).is_some_and(|c| c.destinations.is_empty() && !matches!(c.status, ShareStatus::Stopping(_)))
         });
         let selected = match &self.nav.view {
-            View::Room(key) => self.state.rooms.iter().find(|(_, r)| &r.join_string == key).map(|(h, _)| *h),
+            View::Room(key) => self.state.rooms.iter().find(|(_, r)| same_room(&r.join_string, key)).map(|(h, _)| *h),
             _ => None,
         };
         for (room, s) in self.shell.staged.iter_mut() {
