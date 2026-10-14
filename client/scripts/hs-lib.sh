@@ -132,8 +132,11 @@ hs_wait() {
 
 # Window (container) JSON of a pid, from the sway tree.
 hs_win_json() {
-  swaymsg -t get_tree | jq -c --argjson p "$1" '[.. | objects | select(.type? == "con" and .pid? == $p)] | first // empty'
+  swaymsg -t get_tree | jq -c --argjson p "$1" '[.. | objects | select((.type? == "con" or .type? == "floating_con") and .pid? == $p)] | first // empty'
 }
+# wtype drops the first key of every run in the headless sway ("Second" arrives as "econd", a lone
+# F11 does nothing). Always type through this: a dummy Shift_L press first, then a pause.
+hs_type() { wtype -k Shift_L -s 300 "$@"; }
 # "x y w h" of the window CONTENT in global pixels (borders are off, so rect == content).
 hs_win_rect() {
   local j; j="$(hs_win_json "$1")"
@@ -141,7 +144,7 @@ hs_win_rect() {
   jq -r '"\(.rect.x + .window_rect.x) \(.rect.y + .window_rect.y) \(.window_rect.width) \(.window_rect.height)"' <<<"$j"
 }
 hs_win_output() {
-  swaymsg -t get_tree | jq -r --argjson p "$1" '.nodes[] | select(.type=="output") | . as $o | [.. | objects | select(.type? == "con" and .pid? == $p)] | select(length>0) | $o.name' | head -1
+  swaymsg -t get_tree | jq -r --argjson p "$1" '.nodes[] | select(.type=="output") | . as $o | [.. | objects | select((.type? == "con" or .type? == "floating_con") and .pid? == $p)] | select(length>0) | $o.name' | head -1
 }
 
 # --- build ---------------------------------------------------------------------------------

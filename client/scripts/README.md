@@ -25,6 +25,7 @@ cd client/scripts                         # SCRATCH defaults to <target>/hs-scra
 screenshots + sender per-stage rates (`gst-rate.py` on the tracer log) -> stop, in one call.
 `hs-rig.sh status` lists processes/outputs/windows, `hs-rig.sh run -- CMD...` runs CMD inside
 the rig's environment (`grim`, `swaymsg`, `wtype`, `busctl`, ...).
+Headless sway's `wtype` drops the first key of each run: type through `hs_type` (`hs-lib.sh`, prepends a dummy Shift_L), never bare `wtype`.
 
 What `up` starts, all under one private `XDG_RUNTIME_DIR` (`/run/user/<uid>/sss-hs-<hash>`, short
 because unix socket paths are limited to 108 bytes; `WAYLAND_DISPLAY` is always the absolute
