@@ -153,6 +153,14 @@ pub(crate) fn server_repo_candidates() -> Result<Vec<PathBuf>> {
 }
 
 fn server_binary_path() -> Result<PathBuf> {
+    // The candidate roots below predate the monorepo (one shared `target/` at
+    // the workspace root), so they no longer find a binary there: point
+    // `SSSHARE_SERVER_BIN` at `<target>/debug/simple-screensharing-server`
+    // (and optionally `SSSHARE_SERVER_CWD` at a scratch directory, which is
+    // where the relay puts its `logs/` and `state/`).
+    if let Ok(p) = std::env::var("SSSHARE_SERVER_BIN") {
+        return Ok(PathBuf::from(p));
+    }
     let candidates = server_repo_candidates()?;
     for repo in &candidates {
         for profile in ["release", "debug"] {
@@ -184,6 +192,9 @@ pub(crate) fn spawn_relay_server(port: u16) -> Result<ServerGuard> {
         .and_then(|p| p.parent()) // server repo root
         .ok_or_else(|| anyhow!("could not determine server repo directory from {binary:?}"))?
         .to_path_buf();
+    let server_repo_dir = std::env::var("SSSHARE_SERVER_CWD")
+        .map(PathBuf::from)
+        .unwrap_or(server_repo_dir);
     let cmd_string = format!("{} {port}", binary.display());
     let child = Command::new("setsid")
         .args(["script", "-qc", &cmd_string, "/dev/null"])
@@ -2906,4 +2917,38 @@ async fn stop_share_tears_down_a_paired_audio_capture_too() {
     .await;
     assert_eq!(reaped, Ok(true), "both the video capture and its cascaded-stop audio capture must eventually be reaped");
     eprintln!("[stop-cascade] PASS: paired audio capture was torn down together with its video capture");
+}
+
+/// The relay's certificate hash reaches native clients' invite links: connecting
+/// with a plain 3-field link yields `current_cert_hash()`, [`ScreenshareClient::invite_link`]
+/// round-trips through the 4-field parser, a *stale* 4-field link still connects
+/// (native does not enforce the pin), and the hash is stable across connections
+/// (the relay persists its certificate). Needs only the relay, no GStreamer.
+#[tokio::test]
+#[ignore = "spawns a real relay server child process; run with `cargo test end_to_end_test:: -- --ignored`"]
+async fn native_client_learns_the_relay_cert_hash_and_tolerates_a_stale_one() {
+    let port = pick_free_udp_port().expect("free UDP port");
+    let _server = spawn_relay_server(port).expect("spawn relay");
+    let server_addr = format!("127.0.0.1:{port}");
+    let room_id: RoomId = rand::random();
+    let room_key: [u8; 32] = rand::random();
+
+    let plain = crate::net::format_join_string(&server_addr, &room_id, &room_key);
+    let (a, _s, _ev_a) = connect_with_retry(&plain, "a").await.expect("connect with a 3-field link");
+    let hash = a.current_cert_hash().expect("relay presented a certificate");
+
+    let invite = a.invite_link(&server_addr);
+    let parsed = crate::net::parse_join_string(&invite).expect("invite link parses");
+    assert_eq!(parsed.cert_hash, Some(hash));
+    assert_eq!(parsed.room_id, room_id);
+    assert_eq!(parsed.room_key, room_key);
+
+    // A second client joining through the 4-field invite sees the same hash.
+    let (b, _s, _ev_b) = connect_with_retry(&invite, "b").await.expect("connect with a 4-field link");
+    assert_eq!(b.current_cert_hash(), Some(hash));
+
+    // A link whose hash is stale (relay rotated) must still connect.
+    let stale = crate::net::format_join_string_with_hash(&server_addr, &room_id, &room_key, Some(&[0xEE; 32]));
+    let (c, _s, _ev_c) = connect_with_retry(&stale, "c").await.expect("a stale pin must not block a native client");
+    assert_eq!(c.current_cert_hash(), Some(hash), "reports what the relay really presented, not what the link said");
 }

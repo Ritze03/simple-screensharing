@@ -219,7 +219,7 @@ impl CertManager {
             };
             tokio::time::sleep(sleep_for).await;
 
-            let result = match &self.source {
+            let renewed = match &self.source {
                 CertSource::SelfSigned { .. } => {
                     let due = self
                         .info()
@@ -228,7 +228,7 @@ impl CertManager {
                     if !due {
                         continue;
                     }
-                    self.rotate_now().map(Some)
+                    self.rotate_now()
                 }
                 CertSource::Provided { .. } => {
                     let mtime = self.provided_mtime();
@@ -236,25 +236,21 @@ impl CertManager {
                         continue;
                     }
                     provided_mtime = mtime;
-                    self.reload_provided().map(Some)
+                    self.reload_provided()
                 }
             };
-            match result.and_then(|info: Option<CertInfo>| {
-                self.server_config().map(|cfg| (info, cfg))
-            }) {
+            match renewed.and_then(|info| self.server_config().map(|cfg| (info, cfg))) {
                 Ok((info, cfg)) => {
                     endpoint.set_server_config(Some(cfg));
-                    if let Some(info) = info {
-                        tracing::info!(
-                            hash = %crate::protocol::encode_cert_hash(&info.hash),
-                            rotations = info.rotations,
-                            "certificate rotated; existing connections are unaffected"
-                        );
-                        registry.set_cert_info(info);
-                    }
+                    tracing::info!(
+                        hash = %crate::protocol::encode_cert_hash(&info.hash),
+                        rotations = info.rotations,
+                        "certificate renewed; existing connections are unaffected"
+                    );
+                    registry.set_cert_info(info);
                 }
                 Err(e) => {
-                    tracing::error!("certificate rotation failed, keeping the old one: {e:#}");
+                    tracing::error!("certificate renewal failed, keeping the old one: {e:#}");
                     // Avoid a hot loop if it keeps failing.
                     tokio::time::sleep(Duration::from_secs(5)).await;
                 }
@@ -557,5 +553,47 @@ mod tests {
         assert_ne!(before.hash, after.hash);
         assert_eq!(after.rotations, 1);
         assert_eq!(mgr.info().hash, after.hash);
+    }
+
+    /// `--cert/--key` (what certbot / Let's Encrypt produce): served as-is,
+    /// never rotated by us, picked up again by `reload_provided`.
+    #[test]
+    fn provided_ca_cert_is_served_unrotated_and_reloadable() {
+        let dir = std::env::temp_dir().join(format!("ssshare-provided-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write_pair = |name: &str| {
+            let key = rcgen::generate_simple_self_signed(vec![name.to_string()]).unwrap();
+            std::fs::write(dir.join("fullchain.pem"), key.cert.pem()).unwrap();
+            std::fs::write(dir.join("privkey.pem"), key.signing_key.serialize_pem()).unwrap();
+            cert_hash_of_der(key.cert.der())
+        };
+        let first = write_pair("relay.example.com");
+        let mgr = CertManager::new(CertSource::Provided {
+            cert: dir.join("fullchain.pem"),
+            key: dir.join("privkey.pem"),
+        })
+        .unwrap();
+        let info = mgr.info();
+        assert_eq!(info.hash, first);
+        assert!(!info.self_signed && info.rotate_at.is_none() && info.not_after.is_none());
+        mgr.server_config().expect("usable as a quinn server config");
+        assert!(mgr.rotate_now().is_err(), "a CA cert is never rotated by the relay");
+
+        let second = write_pair("relay.example.com");
+        assert_ne!(first, second);
+        let reloaded = mgr.reload_provided().unwrap();
+        assert_eq!(reloaded.hash, second);
+        assert_eq!(mgr.info().hash, second);
+
+        // Missing files are an error at startup, not a silent fallback.
+        assert!(
+            CertManager::new(CertSource::Provided {
+                cert: dir.join("nope.pem"),
+                key: dir.join("privkey.pem"),
+            })
+            .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
