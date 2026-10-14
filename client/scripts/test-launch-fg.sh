@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 #
+# LEGACY (2026-10-14): works on the user's REAL MangoWC desktop only (smoke test of the real-desktop launch-test.sh). Agents must not
+# use it: since the headless switch all real-app tests run in the private headless sway rig,
+# see hs-rig.sh and superdoc/claude-instructions/testing-and-verification.md. 
+#
 # test-launch-fg.sh — smoke test of the repo-root launch-test.sh (the non-tmux
 # variant): runs it inside a throwaway tmux session (its relay TUI needs a pty),
 # checks both client windows land on DP-2, quits the relay with 'q' and checks the

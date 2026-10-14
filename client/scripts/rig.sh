@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 #
+# LEGACY (2026-10-14): works on the user's REAL MangoWC desktop only (puts the clients on real monitors via mmsg). Agents must not
+# use it: since the headless switch all real-app tests run in the private headless sway rig,
+# see hs-rig.sh and superdoc/claude-instructions/testing-and-verification.md. Headless: hs-rig.sh.
+#
 # rig.sh — bring the two-client measurement rig up or down: relay in tmux, a
 # SHARER (client 1) started with the GStreamer stats tracer writing
 # <scratch>/gst1.log (read by gst-rate.py), a VIEWER (client 2), both tiled on

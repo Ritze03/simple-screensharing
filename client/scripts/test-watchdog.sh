@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 #
+# LEGACY (2026-10-14): works on the user's REAL MangoWC desktop only (smoke test of the real-desktop launch scripts). Agents must not
+# use it: since the headless switch all real-app tests run in the private headless sway rig,
+# see hs-rig.sh and superdoc/claude-instructions/testing-and-verification.md. 
+#
 # test-watchdog.sh — run inside `session.sh run client/scripts/test-watchdog.sh`
 # (rig up, lock held): kills the relay's tmux session and checks launch-test-tmux.sh's
 # watchdog then stops both clients (process groups from <scratch>/client.pids).

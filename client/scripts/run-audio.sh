@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 #
+# LEGACY (2026-10-14): works on the user's REAL MangoWC desktop only (audio sharing with the real Spotify stream; NO audio tests are run any more). Agents must not
+# use it: since the headless switch all real-app tests run in the private headless sway rig,
+# see hs-rig.sh and superdoc/claude-instructions/testing-and-verification.md. Do not use.
+#
 # run-audio.sh — share the screen WITH Spotify's per-app audio stream and prove
 # the viewer plays it. Run inside session.sh (rig + animation up, lock held):
 #   session.sh run client/scripts/run-audio.sh LABEL [SPOTIFY_STREAM_VOLUME_PCT]

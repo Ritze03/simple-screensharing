@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 #
+# LEGACY (2026-10-14): works on the user's REAL MangoWC desktop only (ydotool pointer moves/clicks on real outputs). Agents must not
+# use it: since the headless switch all real-app tests run in the private headless sway rig,
+# see hs-rig.sh and superdoc/claude-instructions/testing-and-verification.md. Headless: swaymsg seat - cursor, see hs-drive.sh.
+#
 # ui-click.sh — move the pointer to a GLOBAL layout coordinate with ydotool and
 # optionally click. Hides this desktop's ydotool quirk (absolute y is offset by
 # -1080) and refuses any point that lies inside an HDMI output's rectangle.

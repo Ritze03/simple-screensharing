@@ -2,9 +2,7 @@
 """portal-probe.py: how fast does a real xdg-desktop-portal screencast deliver
 buffers, and how much of that survives a given downstream chain?
 
-Opens its OWN ScreenCast portal session (the portal picker appears: pick the
-monitor like the app does, type "dp" + Enter after checking last-choice.json
-names the right output), then runs
+Opens its OWN ScreenCast portal session, then runs
     pipewiresrc fd=<portal fd> path=<node> do-timestamp=true ! <TAIL>
 and prints, once per second, buffers/s at pipewiresrc's source pad plus the
 memory type of the buffers (dma-buf vs system memory) and the negotiated caps.
@@ -15,11 +13,19 @@ delivers 276 fps (wlr-capture-rate.sh). Running the same source into different
 tails separates "portal/xdpw produces N fps" from "videoconvert / the copy out of
 GPU memory limits to N fps".
 
-Usage: portal-probe.py [--secs N] [--tail "fakesink sync=false"] [--keepalive MS]
-  e.g. --tail "fakesink sync=false"                        (no copy: source rate)
+Run it against the HEADLESS rig with hs-probe.sh: the rig's portal has no picker, the session
+is granted at once. (On the user's real desktop the picker would appear; agents must not do
+that, see superdoc/claude-instructions/testing-and-verification.md.)
+
+Usage: portal-probe.py [--secs N] [--tail "video/x-raw ! fakesink sync=false"] [--keepalive MS]
+  e.g. --tail "video/x-raw ! fakesink sync=false"          (no copy: source rate)
        --tail "videoconvert ! fakesink sync=false"         (what the app does first)
        --tail "videoconvert ! video/x-raw,format=NV12 ! fakesink sync=false"
-Never run while another picker is open.
+  Do NOT use a bare "fakesink": its caps are ANY, so pipewiresrc's PipeWire node gets media.class
+  Stream/Input/Unknown and WirePlumber 0.5 refuses to link it to the Video/Source ("stream error:
+  target not found"). Any tail that starts with a video caps filter or a video element is fine.
+  Also pass --src "min-buffers=8": with the portal's default 2-buffer pool a plain fakesink tail
+  gets one frame and then "out of buffers" (see features/stream-control.md).
 """
 import argparse
 import os
