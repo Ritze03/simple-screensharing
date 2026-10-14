@@ -1,0 +1,5 @@
+/* Self-hosted fonts (no CDN). Licences: ../assets/fonts/LICENSES/ */
+@font-face { font-family: "Geist"; font-style: normal; font-weight: 400; font-display: swap; src: url("../assets/fonts/Geist-Regular.ttf") format("truetype"); }
+@font-face { font-family: "Geist"; font-style: normal; font-weight: 700; font-display: swap; src: url("../assets/fonts/Geist-Bold.ttf") format("truetype"); }
+@font-face { font-family: "Geist Mono"; font-style: normal; font-weight: 400; font-display: swap; src: url("../assets/fonts/GeistMono-Regular.ttf") format("truetype"); }
+@font-face { font-family: "Material Symbols Outlined"; font-style: normal; font-weight: 400; font-display: block; src: url("../assets/fonts/MaterialSymbolsOutlined.woff2") format("woff2"); }
