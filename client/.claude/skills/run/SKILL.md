@@ -102,8 +102,7 @@ instead of, the rig run for anything user-visible. For video checks without the 
 ## If it breaks
 
 `$SCRATCH/{sway,xdpw,xdp,wireplumber,pipewire,client1,client2,relay.err}.log` (default
-`<target>/hs-scratch/rig/`). Known traps (details in `client/scripts/README.md`): stock
-xdg-desktop-portal-wlr on sway crashes a share (`session already has a frame object`; the rig
-uses the user's `xdg-desktop-portal-wlr-patched` when present); a bare `fakesink` probe tail
+`<target>/hs-scratch/rig/`). Known traps (details in `client/scripts/README.md`): `session already has a frame object` in `xdpw.log` means the start-up stream flap is back (#52 fixed it; the rig runs the stock
+xdg-desktop-portal-wlr, `HS_XDPW=patched` picks the user's build); a bare `fakesink` probe tail
 cannot link (`target not found`); the legacy real-desktop scripts (`drive.sh`, `ui-click.sh`,
 `picker-answer.sh`, `animate.sh`, `session.sh`, `rig.sh`, `run-audio.sh`) are off limits.

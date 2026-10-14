@@ -28,7 +28,7 @@
 # group started with setsid), logs $SCRATCH/<name>.log.
 #
 # Env (all optional): SCRATCH, HS_PORT (relay UDP port, default a random free one), PROFILE (release|debug, default release), CARGO_TARGET_DIR,
-#   HS_NO_BUILD=1, HS_PIPEWIRE=private|shared, HS_XDPW=<path>|stock (see hs_xdpw_bin), HS_PATTERN=vkcube|gst|none, HS_FPS (capture
+#   HS_NO_BUILD=1, HS_PIPEWIRE=private|shared, HS_XDPW=stock|patched|<path> (see hs_xdpw_bin), HS_PATTERN=vkcube|gst|none, HS_FPS (capture
 #   output refresh, default 240), HS_MAX_FPS (xdpw max_fps, default = HS_FPS), RUST_LOG,
 #   START_CODEC/START_FPS/START_KBPS (pre-fill the stream form), SSS_LANGUAGE, HS_TRACE=0 (no
 #   GStreamer stats tracer on the sharer).
@@ -267,21 +267,24 @@ hs_start_pipewire() {
   hs_wait 15 "WirePlumber's linking policy" bash -c "pw-dump | jq -e '.[] | select(.type==\"PipeWire:Interface:Metadata\")' >/dev/null"
 }
 
-# Which xdg-desktop-portal-wlr to run. HS_XDPW=<path> overrides; HS_XDPW=stock forces the distro one.
-# Default: the user's own build ~/.local/bin/xdg-desktop-portal-wlr-patched when present (it only
-# captures through wlr-screencopy), else the stock /usr/lib one.
-# Why: stock 0.8.4 on sway 1.12 picks ext-image-copy-capture and dies with
+# Which xdg-desktop-portal-wlr to run. Default: the stock /usr/lib/xdg-desktop-portal-wlr, what
+# ordinary sway users run (0.8.4 captures through ext-image-copy-capture), so the rig covers it.
+# HS_XDPW=patched picks the user's own build ~/.local/bin/xdg-desktop-portal-wlr-patched (wlr-screencopy
+# only); HS_XDPW=<path> runs any binary; HS_XDPW=stock is the default, spelled out.
+# Why stock is the default: it used to crash the share, because pipewiresrc takes its stream
+# streaming -> paused -> streaming at start and, behind the client's heavy GPU tail, the resume
+# landed after the portal had asked for its first frame; stock xdpw then creates a second frame object
 #   "ext_image_copy_capture_session_v1#18: error 1: session already has a frame object"
-# (wl_display_dispatch failed: Protocol error) as soon as the client's GPU capture pipeline
-# flaps the PipeWire stream streaming -> paused -> streaming while it starts; that kills the portal
-# node mid-start ("target not found", "GPU capture path failed to start ... StateChangeError").
-# portal-probe.py does not flap the stream, so it works with the stock one.
+# (wl_display_dispatch failed: Protocol error), the portal node is gone ("target not found",
+# "GPU capture path failed to start ... StateChangeError"). Since #52 the client puts a queue behind
+# pipewiresrc (capture::decoupled_source), the flap lands before any frame request and xdpw survives.
+# portal-probe.py never flapped because its tail is cheap (no heavy chain to delay the caps push).
 hs_xdpw_bin() {
   local alt="$HOME/.local/bin/xdg-desktop-portal-wlr-patched"
   case "${HS_XDPW:-}" in
-    stock) echo /usr/lib/xdg-desktop-portal-wlr ;;
-    "")    if [[ -x "$alt" ]]; then echo "$alt"; else echo /usr/lib/xdg-desktop-portal-wlr; fi ;;
-    *)     echo "$HS_XDPW" ;;
+    ""|stock) echo /usr/lib/xdg-desktop-portal-wlr ;;
+    patched)  [[ -x "$alt" ]] || die "HS_XDPW=patched but $alt is missing"; echo "$alt" ;;
+    *)        echo "$HS_XDPW" ;;
   esac
 }
 

@@ -147,7 +147,7 @@ export class Page {
 }
 
 export async function launchBrowser({ url = "about:blank", headed = false, flags = [], bin = "/usr/bin/chromium", userDataDir, viewport = [1440, 900], grantClipboard = true } = {}) {
-  if (headed && !process.env.SSS_GUI_LOCKED) throw new Error("headed Chromium needs the shared GUI lock (SSS_GUI_LOCKED=1, see docs/dev/README.md)");
+  if (headed && !process.env.SSS_GUI_LOCKED) throw new Error("headed Chromium runs only inside the headless sway rig: client/scripts/hs-rig.sh run -- env SSS_GUI_LOCKED=1 HEADED=1 node ... (see docs/dev/README.md)");
   const dir = userDataDir || mkdtempSync(join(tmpdir(), "sss-cdp-"));
   const args = [...BASE_FLAGS, ...(headed ? [] : ["--headless=new"]), "--remote-debugging-port=0", `--user-data-dir=${dir}`, ...flags, "about:blank"];
   const proc = spawn(bin, args, { stdio: ["ignore", "ignore", "pipe"] });
