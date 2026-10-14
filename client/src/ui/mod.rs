@@ -82,11 +82,6 @@
 //! overlays with `ui.painter_at(resp.rect)`). Never `request_repaint()` for
 //! video: the view repaints at the stream's frame rate on its own.
 
-// The shared contract (selectors, actions, popover kinds) is defined up front
-// for the screen workers; parts of it have no caller until their screens
-// land. Remove once every screen is built.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 
 use egui::{Align, Color32, CornerRadius, Frame, Id, Layout, Margin, Rect, Stroke, Ui, UiBuilder, pos2, vec2};
@@ -102,7 +97,7 @@ use simple_screensharing_client::session::{
 use tokio::sync::oneshot;
 
 use crate::theme::{self, Weight, font};
-use crate::widgets::{self, BandEdge, paint_text};
+use crate::widgets::{self, BandEdge};
 
 pub mod action_bar;
 mod apply;
@@ -283,8 +278,6 @@ pub enum UiAction {
     SetAutoConnect { room: RoomKey, on: bool },
     /// Copy the live connection's invite link (with cert hash) + toast.
     CopyInviteLink(RoomHandle),
-    /// Copy arbitrary text to the clipboard + toast (e.g. a minted link).
-    CopyText { text: String, toast: String },
 
     // --- watching ---------------------------------------------------------
     /// Start watching (idempotent). Audio from the same sender follows.
@@ -313,8 +306,6 @@ pub enum UiAction {
     /// Stop one destination (the × on a dest row, "Stop sharing" in a room).
     /// The capture stops too if it was its last destination.
     StopDestination(DestinationId),
-    /// Stop a whole capture, every room.
-    StopCapture(CaptureSourceId),
     /// Stop every capture ("Stop all sharing").
     StopAllSharing,
     /// Also send `capture` to `room` (fan-out).
@@ -323,7 +314,6 @@ pub enum UiAction {
     MoveDestination { destination: DestinationId, room: RoomHandle },
     /// Move every destination of `capture` into `room` ("Move X here").
     MoveCaptureHere { capture: CaptureSourceId, room: RoomHandle },
-    RetryDestination(DestinationId),
     /// Replace a live destination's settings and apply them now.
     EditDestination { destination: DestinationId, edit: DestEdit },
     ApplyPresetToDestination { destination: DestinationId, preset: EncoderPreset },
@@ -356,9 +346,6 @@ pub enum UiAction {
     SetCatchUpSpeed(u32),
 
     // --- misc -------------------------------------------------------------
-    Toast { text: String, icon: &'static str },
-    /// Clear `state.status`'s error and `state.share_error`.
-    ClearErrors,
 }
 
 // ---------------------------------------------------------------------------
@@ -601,10 +588,6 @@ impl<'a> Cx<'a> {
         self.shell.level_taps.get(&source_id).and_then(|tap| self.state.audio_level_tap_level(*tap))
     }
 
-    /// Whether `modal` is the open modal.
-    pub fn modal_is(&self, modal: &Modal) -> bool {
-        self.nav.modal.as_ref() == Some(modal)
-    }
 
     /// The open popover if it is `kind`.
     pub fn popover_of(&self, kind: &PopoverKind) -> Option<&'a Popover> {
@@ -709,27 +692,7 @@ pub fn paired_audio(state: &AppState, capture: CaptureSourceId) -> Option<Captur
     state.captures.iter().find(|(_, c)| c.audio_for_capture == Some(capture)).map(|(id, _)| *id)
 }
 
-/// `WxH@FPS` for a remote stream. The framerate is always "—": `StreamInfo`
-/// carries no fps (protocol gap), and a viewer can't know it before decoding.
-pub fn remote_stream_geometry(info: &StreamInfo) -> String {
-    if info.width == 0 || info.height == 0 {
-        return tr("streams.geometry_unknown", "—").to_string();
-    }
-    tr_with("streams.geometry", "%{width}x%{height}@%{fps}", &[("width", &info.width.to_string()), ("height", &info.height.to_string()), ("fps", &"\u{2014}".to_string())])
-}
 
-/// `WxH@FPS` for one of our destinations, preferring the live runtime's
-/// negotiated params over the requested ones (`0` = "source size").
-pub fn destination_geometry(dest: &Destination) -> String {
-    let params = match &dest.runtime {
-        Some(runtime) => runtime.lock().unwrap().params(),
-        None => dest.params,
-    };
-    if params.width == 0 || params.height == 0 {
-        return tr("streams.geometry_unknown", "—").to_string();
-    }
-    tr_with("streams.geometry", "%{width}x%{height}@%{fps}", &[("width", &params.width.to_string()), ("height", &params.height.to_string()), ("fps", &params.framerate.to_string())])
-}
 
 // ---------------------------------------------------------------------------
 // Strings
@@ -773,12 +736,17 @@ pub fn popover(ctx: &egui::Context, pop: &Popover, width: f32, body: impl FnOnce
         .corner_radius(CornerRadius::same(10))
         .inner_margin(Margin::same(6))
         .shadow(egui::Shadow { offset: [0, 14], blur: 40, spread: 0, color: Color32::from_black_alpha(153) });
-    egui::Popup::new(id, ctx.clone(), pop.anchor, egui::LayerId::new(egui::Order::Foreground, id))
+    // Last frame's size (the first frame assumes a zero height and corrects
+    // itself on the next).
+    let size = egui::AreaState::load(ctx, id).and_then(|s| s.size).unwrap_or(vec2(width, 0.0));
+    let pos = popover_pos(ctx.content_rect(), pop.anchor, size);
+    let top_left = egui::RectAlign { parent: egui::Align2::LEFT_TOP, child: egui::Align2::LEFT_TOP };
+    egui::Popup::new(id, ctx.clone(), pos, egui::LayerId::new(egui::Order::Foreground, id))
         .open_bool(&mut open)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-        .align(egui::RectAlign::BOTTOM_START)
-        .align_alternatives(&[egui::RectAlign::TOP_START, egui::RectAlign::BOTTOM_END, egui::RectAlign::TOP_END])
-        .gap(6.0)
+        .align(top_left)
+        .align_alternatives(&[])
+        .gap(0.0)
         .width(width)
         .frame(frame)
         .show(|ui| {
@@ -789,40 +757,28 @@ pub fn popover(ctx: &egui::Context, pop: &Popover, width: f32, body: impl FnOnce
     open
 }
 
-/// An hbox `[fill][btn][btn]…` of `name`: natural-width buttons after one
-/// fill cell, gap 8, as tall as the tallest button. Returns the row (cell 0
-/// is the fill, button `i` is cell `i + 1` — use its rect as a popover
-/// anchor) and the index of the clicked button.
-pub fn fill_then_buttons(ui: &mut Ui, name: &'static str, btns: &[widgets::Btn]) -> (widgets::HRow, Option<usize>) {
-    let h = btns.iter().map(|b| b.height()).fold(theme::CTL_H, f32::max);
-    let mut slots = vec![widgets::FILL];
-    slots.extend(btns.iter().map(|b| widgets::fixed(b.width(ui))));
-    let row = widgets::HBox::new(name, h).slots(&slots).show(ui);
-    let mut clicked = None;
-    for (i, b) in btns.iter().enumerate() {
-        let w = row.cell(i + 1).width();
-        if row.show(ui, i + 1, Align::Min, |ui| b.show_sized(ui, w)).clicked() {
-            clicked = Some(i);
-        }
+/// Where a popover of `size` anchored at `anchor` goes in `screen` (the
+/// mockup's `positionPopup`): left edges aligned, 6 px below the anchor, or
+/// above it when it would cross the window bottom; pushed left to stay 8 px
+/// inside the right edge, never closer than 8 px to the top/left.
+/// `Why` not egui's `RectAlign` alternatives: those flip to right-aligned
+/// (`*_END`) near the right edge, so the bottom bar's "N rooms ▾" popover
+/// jumped to the button's left instead of hanging off it like the mockup.
+pub fn popover_pos(screen: Rect, anchor: Rect, size: egui::Vec2) -> egui::Pos2 {
+    const GAP: f32 = 6.0;
+    const EDGE: f32 = 8.0;
+    let mut x = anchor.left();
+    if x + size.x > screen.right() - EDGE {
+        x = screen.right() - size.x - EDGE;
     }
-    (row, clicked)
+    let mut y = anchor.bottom() + GAP;
+    if y + size.y > screen.bottom() - EDGE {
+        y = anchor.top() - size.y - GAP;
+    }
+    pos2(x.max(screen.left() + EDGE), y.max(screen.top() + EDGE))
 }
 
-/// A labelled placeholder filling `ui`'s remaining width at height `h`: a
-/// dashed outline with the region name. For screen stubs.
-pub fn placeholder(ui: &mut Ui, label: &str, h: f32) -> Rect {
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), egui::Sense::hover());
-    widgets::paint_dashed_rect(
-        ui.painter(),
-        rect.shrink(0.5),
-        CornerRadius::same(theme::ROUNDING_SM),
-        Stroke::new(1.0_f32, theme::BORDER),
-        4.0,
-        3.0,
-    );
-    paint_text(ui, rect.shrink2(vec2(theme::S2, 0.0)), label, font(Weight::Mono, theme::FS_TINY), theme::TEXT_FAINT, Align::Center);
-    rect
-}
+
 
 // ---------------------------------------------------------------------------
 // App
@@ -926,7 +882,10 @@ impl App {
         if awaited {
             self.shell.awaiting_join = None;
             self.shell.join_error = None;
-            if self.nav.modal == Some(Modal::CreateJoin) {
+            // "Join now" after Create keeps the modal open: it then offers the
+            // live connection's invite link (with the relay cert hash).
+            let minted = matches!(&self.shell.create_result, Some(Ok(l)) if same_room(&l.join_string, &js));
+            if self.nav.modal == Some(Modal::CreateJoin) && !minted {
                 self.nav.modal = None;
             }
         }
@@ -1132,6 +1091,7 @@ impl eframe::App for App {
 /// The shell regions laid out in the latest pass, by name ("brand",
 /// "sidebar_body", "user_band", "room_header", "action_bar", "people",
 /// "room_body"). For tests and layout QC.
+#[cfg(test)]
 pub fn shell_regions(ctx: &egui::Context) -> Vec<(&'static str, Rect)> {
     ctx.data(|d| d.get_temp::<(u64, Vec<(&'static str, Rect)>)>(Id::new("ui_shell_regions"))).map(|(_, v)| v).unwrap_or_default()
 }

@@ -15,8 +15,12 @@
 //!   `cx.shell.awaiting_join` shows a progress banner meanwhile). Create pushes
 //!   [`UiAction::CreateRoom`] (minted link in `cx.shell.create_result`), then
 //!   shows the link — masked, because it carries the room key and this is a
-//!   screen-sharing app — with Copy ([`UiAction::CopyText`]) and "Join now"
-//!   (`JoinRoom`). The server field is pre-filled with the server of the most
+//!   screen-sharing app — with "Join now" (`JoinRoom`; the modal stays open).
+//!   Copy is enabled only once that room is connected and copies the live
+//!   connection's invite link ([`UiAction::CopyInviteLink`]). `Why:` the
+//!   minted link has no relay cert hash, so browsers can't use it; the live
+//!   link carries it. The footer then turns into "Done".
+//!   The server field is pre-filled with the server of the most
 //!   recently saved room. `Why:` the lib keeps no "last server" setting, and
 //!   the newest saved room is the last server the user created or joined on.
 //! - **Settings** (`Modal::Settings`, 640): cards Profile / Language / Display /
@@ -192,6 +196,16 @@ fn create_join(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
         _ => None,
     };
     let minted = matches!(created, Some(Ok(_))) && st.tab == AddTab::Create;
+    // The minted link has no relay cert hash (browsers can't use it), so Copy
+    // waits for the live connection and copies its invite link instead
+    // (`UiAction::CopyInviteLink`, cert hash included). `App::on_joined` keeps
+    // this modal open when the join came from "Join now".
+    let joined = match &created {
+        Some(Ok(link)) => cx.state.rooms.iter().find(|(_, r)| super::same_room(&r.join_string, &link.join_string)).map(|(h, _)| *h),
+        _ => None,
+    };
+    let done = tr("ui.stream.done", "Done");
+    let copy_tip = tr("ui.room.copy_invite_offline_tip", "Connect first: the link includes the relay's certificate");
     // The footer closure can't borrow `st` next to the body's `&mut`: it uses
     // this pass's start values (a tab switch requests a repaint below).
     let tab = st.tab;
@@ -264,9 +278,9 @@ fn create_join(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
                                     )
                                 },
                                 |ui| {
-                                    copy_clicked = Btn::secondary(&copy)
-                                        .show_sized(ui, theme::VALUE_W)
-                                        .clicked()
+                                    let b = Btn::secondary(&copy).enabled(joined.is_some());
+                                    let b = if joined.is_none() { b.tip(&copy_tip) } else { b };
+                                    copy_clicked = b.show_sized(ui, theme::VALUE_W).clicked()
                                 },
                             );
                         });
@@ -318,7 +332,9 @@ fn create_join(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
             }
         },
         |ui| {
-            click = if minted {
+            click = if minted && joined.is_some() {
+                widgets::modal_footer(ui, &[], None, &[Btn::primary(&done)])
+            } else if minted {
                 widgets::modal_footer(
                     ui,
                     &[],
@@ -349,18 +365,15 @@ fn create_join(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
         },
     );
 
-    if let (true, Some(Ok(link))) = (copy_clicked, &created) {
-        let toast = tr("ui.toast.link_copied", "Join link copied");
-        cx.act(UiAction::CopyText {
-            text: link.join_string.clone(),
-            toast,
-        });
+    if let (true, Some(h)) = (copy_clicked, joined) {
+        cx.act(UiAction::CopyInviteLink(h));
     }
     // Footer: `[Join now]` once a room was minted (mockup), else `[Cancel][primary]`.
     let primary_i = if minted { 0 } else { 1 };
     let primary = click == FooterClick::Trailing(primary_i) || submit;
     let cancel_clicked = !minted && click == FooterClick::Trailing(0);
-    if cancel_clicked || (a.close && click == FooterClick::None && !submit) {
+    let done_clicked = primary && minted && joined.is_some();
+    if cancel_clicked || done_clicked || (a.close && click == FooterClick::None && !submit) {
         cx.act(UiAction::CloseModal);
     } else if primary && !awaiting {
         if minted {

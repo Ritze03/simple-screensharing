@@ -5,7 +5,7 @@
 use std::sync::atomic::Ordering;
 
 use simple_screensharing_client::net::parse_join_string;
-use simple_screensharing_client::session::{self, PendingRole, Status};
+use simple_screensharing_client::session::{self, PendingRole};
 
 use super::{App, Modal, StagedShare, UiAction, View, paired_audio, room_entries, same_room, tr, tr_with, view_is_room};
 
@@ -130,10 +130,6 @@ impl App {
                     Err(e) => self.toast(tr_with("ui.toast.copy_failed", "Couldn't copy the invite link: %{error}", &[("error", &format!("{e:#}"))]), "error"),
                 }
             }
-            UiAction::CopyText { text, toast } => {
-                ctx.copy_text(text);
-                self.toast(toast, "content_copy");
-            }
 
             // --- watching ------------------------------------------------
             UiAction::Watch((room, owner, stream)) => {
@@ -227,7 +223,6 @@ impl App {
                     }
                 }
             }
-            UiAction::StopCapture(capture) => self.state.stop_share(capture),
             UiAction::StopAllSharing => {
                 let ids: Vec<_> = self.state.captures.keys().copied().collect();
                 for id in ids {
@@ -262,7 +257,6 @@ impl App {
                 }
                 self.nav.popover = None;
             }
-            UiAction::RetryDestination(d) => self.state.retry_destination(d),
             UiAction::EditDestination { destination, edit } => self.state.edit_destination(destination, edit),
             UiAction::ApplyPresetToDestination { destination, preset } => self.state.apply_preset_to_destination(destination, preset),
             UiAction::SetNextStream(n) => {
@@ -334,15 +328,6 @@ impl App {
             }
             UiAction::SetCatchUpSpeed(p) => {
                 self.state.set_catch_up_speed_percent(p);
-            }
-
-            // --- misc ----------------------------------------------------
-            UiAction::Toast { text, icon } => self.toast(text, icon),
-            UiAction::ClearErrors => {
-                if matches!(self.state.status, Status::Error(_)) {
-                    self.state.status = Status::Idle;
-                }
-                self.state.share_error = None;
             }
         }
     }

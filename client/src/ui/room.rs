@@ -724,7 +724,7 @@ fn audio_pill(ui: &mut Ui, cx: &Cx, st: &mut RoomState, key: StreamKey, bottom: 
     let sr = Rect::from_center_size(sc.center(), vec2(sc.width(), theme::CTL_H));
     let mut sl = child.new_child(UiBuilder::new().id_salt(("tile_vol", key)).max_rect(sr).layout(Layout::left_to_right(Align::Center)));
     let mut v = shown;
-    let r = widgets::slider(&mut sl, &mut v, 0..=200, 5.0).on_hover_text(&tr("ui.room.volume", "Volume"));
+    let r = widgets::slider(&mut sl, &mut v, 0..=200, 5.0).on_hover_text(tr("ui.room.volume", "Volume"));
     if r.dragged() || r.changed() {
         st.vol_drag = Some((key, v));
     }
@@ -775,7 +775,7 @@ fn thumb_corners(ui: &mut Ui, thumb: Rect, live: Option<&str>, audio: bool) {
     };
     if audio {
         let mut r = ui.new_child(UiBuilder::new().max_rect(row).layout(Layout::right_to_left(Align::Center)));
-        widgets::chip_dark(&mut r, Some("volume_up"), false, "").on_hover_text(&tr("ui.room.shares_audio", "Shares audio"));
+        widgets::chip_dark(&mut r, Some("volume_up"), false, "").on_hover_text(tr("ui.room.shares_audio", "Shares audio"));
     }
 }
 

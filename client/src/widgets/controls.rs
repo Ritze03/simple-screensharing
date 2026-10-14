@@ -460,10 +460,27 @@ pub fn paint_avatar(ui: &Ui, rect: Rect, initial: &str, color: usize, presence: 
     let fs = if rect.height() <= theme::AVATAR_SM { 10.5 } else { 13.0 };
     paint_text(ui, rect, &initial.to_uppercase(), font(Weight::Bold, fs), Color32::WHITE, Align::Center);
     if presence {
-        let c = pos2(rect.right() - 3.0, rect.bottom() - 3.0);
-        p.circle_filled(c, 5.0, theme::ELEV_14);
-        p.circle_filled(c, 3.0, theme::SUCCESS);
+        // Mockup `.avatar .pres`: a 10 px green dot with a 2 px ring in the user
+        // band's `ELEV_14` (content-box, so 14 px outer) at right/bottom -2, i.e.
+        // centred 5 px in from the corner.
+        let c = pos2(rect.right() - 5.0, rect.bottom() - 5.0);
+        p.circle_filled(c, 7.0, theme::ELEV_14);
+        p.circle_filled(c, 5.0, theme::SUCCESS);
     }
+}
+
+/// The two-rectangle brand mark (mockup `.mark`, 30x22), vertically centred at
+/// the left of `cell`: an accent outline behind a green outline filled with `bg`
+/// (the surface it sits on) that knocks the back one out. The CSS boxes are
+/// content-box (`19x13` / `15x11` plus a 2.5 px border each side), so the
+/// outer boxes are 24x18 at the top-left and 20x16 at the bottom-right.
+pub fn paint_brand_mark(ui: &Ui, cell: Rect, bg: Color32) {
+    let o = pos2(cell.left(), (cell.center().y - 11.0).round());
+    let p = ui.painter();
+    let back = Rect::from_min_size(o, vec2(24.0, 18.0));
+    let front = Rect::from_min_size(o + vec2(10.0, 6.0), vec2(20.0, 16.0));
+    p.rect_stroke(back, cr(5), Stroke::new(2.5_f32, theme::ACCENT_LIGHT), StrokeKind::Inside);
+    p.rect(front, cr(5), bg, Stroke::new(2.5_f32, theme::SUCCESS), StrokeKind::Inside);
 }
 
 /// A 5-bar audio level meter (23×14): `lit` bars (0–5) green, the 5th amber when `hot`.
@@ -618,13 +635,15 @@ pub fn slider<N: egui::emath::Numeric>(ui: &mut Ui, value: &mut N, range: std::o
     let (rect, mut resp) = ui.allocate_exact_size(vec2(w, theme::CTL_H), Sense::click_and_drag());
     let (lo, hi) = (range.start().to_f64(), range.end().to_f64());
     const THUMB: f32 = 14.0;
-    let track =
-        Rect::from_min_max(pos2(rect.left() + THUMB / 2.0, rect.center().y - 2.5), pos2(rect.right() - THUMB / 2.0, rect.center().y + 2.5));
+    // CSS range input: the 5 px track spans the full width; the thumb's centre
+    // travels inside it, half a thumb in from each end.
+    let track = Rect::from_min_max(pos2(rect.left(), rect.center().y - 2.5), pos2(rect.right(), rect.center().y + 2.5));
+    let travel = track.x_range().shrink(THUMB / 2.0);
     if ui.is_enabled()
         && let Some(pos) = resp.interact_pointer_pos()
         && (resp.dragged() || resp.clicked())
     {
-        let t = ((pos.x - track.left()) / track.width().max(1.0)).clamp(0.0, 1.0) as f64;
+        let t = ((pos.x - travel.min) / travel.span().max(1.0)).clamp(0.0, 1.0) as f64;
         let mut v = lo + t * (hi - lo);
         if step > 0.0 {
             v = lo + ((v - lo) / step).round() * step;
@@ -638,11 +657,12 @@ pub fn slider<N: egui::emath::Numeric>(ui: &mut Ui, value: &mut N, range: std::o
     let t = if hi > lo { ((value.to_f64() - lo) / (hi - lo)).clamp(0.0, 1.0) as f32 } else { 0.0 };
     let p = ui.painter();
     p.rect(track, cr(3), theme::ELEV_1B, Stroke::new(1.0_f32, theme::INSET_BORDER), StrokeKind::Outside);
-    let fill = Rect::from_min_max(track.min, pos2(track.left() + track.width() * t, track.bottom()));
-    if fill.width() > 0.5 {
+    let thumb_x = travel.min + travel.span() * t;
+    let fill = Rect::from_min_max(track.min, pos2(thumb_x, track.bottom()));
+    if t > 0.0 {
         paint_gradient(p, fill, cr(3), 90.0, theme::ACCENT_DEEP, theme::ACCENT);
     }
-    let c = pos2(track.left() + track.width() * t, track.center().y);
+    let c = pos2(thumb_x, track.center().y);
     p.circle_filled(c + vec2(0.0, 1.0), THUMB / 2.0 + 1.5, Color32::from_black_alpha(90));
     let thumb = if resp.hovered() || resp.dragged() { Color32::WHITE } else { theme::TEXT };
     p.circle_filled(c, THUMB / 2.0, thumb);
@@ -854,7 +874,8 @@ fn paint_section_label(ui: &Ui, rect: Rect, title: &str, count: Option<&str>) ->
     let mut x = paint_galley(ui, rect, g, Align::Min).right();
     if let Some(c) = count {
         x += theme::S2;
-        let g = text_galley(ui, c, font(Weight::Mono, theme::FS_UNIT), theme::TEXT_FAINT, (rect.right() - x).max(0.0), 0.0);
+        // CSS `.section-label .count` inherits `text-transform: uppercase` ("1 ROOM").
+        let g = text_galley(ui, &c.to_uppercase(), font(Weight::Mono, theme::FS_UNIT), theme::TEXT_FAINT, (rect.right() - x).max(0.0), 0.0);
         x = paint_galley(ui, Rect::from_x_y_ranges(x..=rect.right(), rect.y_range()), g, Align::Min).right();
     }
     x
@@ -892,7 +913,7 @@ pub enum BannerKind {
 pub fn banner(ui: &mut Ui, kind: BannerKind, icon: &str, text: &str, action: Option<&str>) -> bool {
     let w = ui.available_width();
     let pad = vec2(theme::S3, theme::S2);
-    let btn = action.map(|a| Btn::secondary(a));
+    let btn = action.map(Btn::secondary);
     let btn_w = btn.map(|b| b.width(ui) + theme::S2).unwrap_or(0.0);
     let text_w = (w - 2.0 * pad.x - theme::ICON - theme::S2 - btn_w).max(10.0);
     let (fg, tf) = match kind {

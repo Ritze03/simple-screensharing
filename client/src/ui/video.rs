@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-use egui::{Rect, Response, Ui, Vec2};
+use egui::{Response, Ui, Vec2};
 use simple_screensharing_client::decode::render::{Fit, VideoView};
 use simple_screensharing_client::protocol::{ConnId, StreamId};
 use simple_screensharing_client::session::{AppState, RoomHandle};
@@ -91,11 +91,6 @@ impl VideoViews {
         Some(entry.view.lock().unwrap().show(ui, size, fit))
     }
 
-    /// Draw into `rect` without allocating; returns the picture rect.
-    pub fn paint(&self, key: StreamKey, ui: &Ui, rect: Rect, fit: Fit) -> Option<Rect> {
-        let entry = self.entries.get(&key)?;
-        Some(entry.view.lock().unwrap().paint(ui, rect, fit))
-    }
 
     /// Newest frame size in pixels (`None` before the first frame).
     pub fn frame_size(&self, key: StreamKey) -> Option<(u32, u32)> {

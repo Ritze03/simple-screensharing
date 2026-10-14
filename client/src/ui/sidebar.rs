@@ -26,7 +26,7 @@
 //! - other sharers: **decoded** fps while we watch the stream (the protocol's
 //!   `StreamInfo` carries no fps — contract "Known lib gaps" #5); empty otherwise.
 
-use egui::{Align, CornerRadius, Rect, Sense, Stroke, Ui, pos2, vec2};
+use egui::{Align, CornerRadius, Rect, Sense, Stroke, Ui, vec2};
 use simple_screensharing_client::protocol::StreamKind;
 
 use super::{ConnState, Cx, Modal, PopoverKind, RoomKey, ShareState, StreamKey, UiAction, View, tr, tr_with};
@@ -49,23 +49,8 @@ pub struct SidebarState {}
 /// Brand band content: `[30 mark][fill label]`.
 pub fn show_brand(ui: &mut Ui, _cx: &mut Cx, _st: &mut SidebarState) {
     let row = HBox::new("brand", theme::BAND_H).slots(&[fixed(30.0), FILL]).show(ui);
-    brand_mark(ui, row.cell(0));
+    widgets::paint_brand_mark(ui, row.cell(0), theme::SIDEBAR_RAIL);
     row.text(ui, 1, &tr("app.title", "Simple Screensharing"), font(Weight::Bold, theme::FS_H3), theme::TEXT, Align::Min);
-}
-
-/// The two-rectangle brand mark (mockup `.mark`), 30×22, vertically centred
-/// in `cell`: an accent outline behind a green outline that knocks it out.
-/// The mockup's pseudo-elements are content-box (`19×13` / `15×11` plus a
-/// 2.5 px border each side), so the outer boxes are 24×18 at the top-left and
-/// 20×16 at the bottom-right. (`widgets::gallery`'s copy uses the inner sizes
-/// as outer ones and comes out too small with almost no overlap.)
-fn brand_mark(ui: &Ui, cell: Rect) {
-    let o = pos2(cell.left(), (cell.center().y - 11.0).round());
-    let p = ui.painter();
-    let back = Rect::from_min_size(o, vec2(24.0, 18.0));
-    let front = Rect::from_min_size(o + vec2(10.0, 6.0), vec2(20.0, 16.0));
-    p.rect_stroke(back, CornerRadius::same(5), Stroke::new(2.5_f32, theme::ACCENT_LIGHT), egui::StrokeKind::Inside);
-    p.rect(front, CornerRadius::same(5), theme::SIDEBAR_RAIL, Stroke::new(2.5_f32, theme::SUCCESS), egui::StrokeKind::Inside);
 }
 
 // ---------------------------------------------------------------------------
@@ -238,15 +223,7 @@ pub fn show_user_band(ui: &mut Ui, cx: &mut Cx, _st: &mut SidebarState) {
     let n_live = cx.live_rooms().len();
     let online = cx.rooms().iter().any(|r| r.conn == ConnState::Joined);
     let av = Rect::from_center_size(row.cell(0).center(), vec2(theme::AVATAR, theme::AVATAR));
-    widgets::paint_avatar(ui, av, &initial, 0, false);
-    if online {
-        // Mockup `.avatar .pres`: 10 px green + 2 px ELEV_14 ring (content-box,
-        // so 14 px outer) at right/bottom −2 → centre 5 px in from the corner.
-        // `Why not paint_avatar(.., true)`: its dot is 6/10 px, visibly smaller.
-        let c = pos2(av.right() - 5.0, av.bottom() - 5.0);
-        ui.painter().circle_filled(c, 7.0, theme::ELEV_14);
-        ui.painter().circle_filled(c, 5.0, theme::SUCCESS);
-    }
+    widgets::paint_avatar(ui, av, &initial, 0, online);
 
     // "who": vbox(name 13 bold / 16 line, status 11 / 14 line); the hover
     // wash is padded 3/6 around it (mockup `.p-user .who`, margin 0 −6).

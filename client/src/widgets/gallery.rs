@@ -188,7 +188,7 @@ impl Gallery {
         ui.spacing_mut().item_spacing.y = 0.0;
         band(ui, theme::SIDEBAR_RAIL, BandEdge::None, theme::S4, |ui| {
             let r = HBox::new("brand", 22.0).slots(&[fixed(30.0), FILL]).show(ui);
-            brand_mark(ui, r.cell(0));
+            paint_brand_mark(ui, r.cell(0), theme::SIDEBAR_RAIL);
             r.text(ui, 1, "Simple Screensharing", font(Weight::Bold, theme::FS_H3), theme::TEXT, Align::Min);
         });
         let user_h = theme::BAND_H;
@@ -545,16 +545,6 @@ impl Gallery {
             },
         );
     }
-}
-
-/// The two-rectangle brand mark (`.mark`), 30×22.
-fn brand_mark(ui: &Ui, cell: Rect) {
-    let o = egui::pos2(cell.left(), cell.center().y - 11.0);
-    let p = ui.painter();
-    let back = Rect::from_min_size(o, vec2(19.0, 13.0));
-    let front = Rect::from_min_size(o + vec2(15.0, 11.0), vec2(15.0, 11.0));
-    p.rect_stroke(back, CornerRadius::same(5), Stroke::new(2.5_f32, theme::ACCENT_LIGHT), egui::StrokeKind::Inside);
-    p.rect(front, CornerRadius::same(5), theme::SIDEBAR_RAIL, Stroke::new(2.5_f32, theme::SUCCESS), egui::StrokeKind::Inside);
 }
 
 /// A popup surface (`.popup`, 340 wide max) — demo only; real popups use egui popups.
