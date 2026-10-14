@@ -15,6 +15,13 @@ const { server, port: httpPort, results, waitersResult, kv } = await startServer
 const url = `http://127.0.0.1:${httpPort}/simple-screensharing/dev/scenarios.html?id=0&relay=${args.relay}&hash=${args.hash}${args.only ? `&only=${encodeURIComponent(args.only)}` : ""}`;
 const b = launchChromium(url, { flags: ["--disable-frame-rate-limit", "--disable-gpu-vsync"] });
 let restarting = false;
+const flags = new Set();
+const once = async (name, fn) => {
+  if (kv.has(name) && !flags.has(name)) {
+    flags.add(name);
+    await fn();
+  }
+};
 const watcher = setInterval(async () => {
   if (kv.has("restart-relay") && !restarting) {
     restarting = true;
@@ -23,6 +30,16 @@ const watcher = setInterval(async () => {
     console.log(`  [runner] relay restarted: ${r.stdout.trim()} ${r.stderr.trim()}`);
     await fetch(`http://127.0.0.1:${httpPort}/kv/relay-restarted`, { method: "POST", body: "1" });
   }
+  await once("stop-relay", async () => {
+    console.log("  [runner] stopping the relay");
+    spawnSync("bash", [resolve(here, "relay.sh"), "stop", port], { encoding: "utf8" });
+    await fetch(`http://127.0.0.1:${httpPort}/kv/relay-stopped`, { method: "POST", body: "1" });
+  });
+  await once("start-relay", async () => {
+    const r = spawnSync("bash", [resolve(here, "relay.sh"), "restart", args["relay-bin"], args["relay-dir"], port], { encoding: "utf8" });
+    console.log(`  [runner] relay started again: ${r.stdout.trim()} ${r.stderr.trim()}`);
+    await fetch(`http://127.0.0.1:${httpPort}/kv/relay-started`, { method: "POST", body: "1" });
+  });
 }, 200);
 let code = 1;
 try {

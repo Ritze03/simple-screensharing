@@ -251,28 +251,11 @@ export function setAudioMuted(c, muted) {
   invalidate();
 }
 
-/** The room is going away (Leave / Forget / manual reconnect): stop our streams there. */
-export function stopDestsInRoom(roomId, { keepConfig = false } = {}) {
-  const restart = [];
+/** The room is going away (Leave / Forget): stop our streams there. */
+export function stopDestsInRoom(roomId) {
   for (const c of [...S.captures]) {
-    const d = c.dests.get(roomId);
-    if (d) {
-      if (keepConfig) restart.push({ cap: c, cfg: { fps: d.fps, codec: d.codec, preset: d.preset, kbps: d.kbps } });
-      stopDest(c, roomId, { keepCapture: keepConfig });
-    }
+    if (c.dests.has(roomId)) stopDest(c, roomId);
     if (c.stagedRoom === roomId && c.state !== "live") discard(c);
-  }
-  return restart;
-}
-export async function restartDestsInRoom(room, list) {
-  for (const { cap, cfg } of list || []) {
-    if (!S.captures.includes(cap)) continue;
-    try {
-      await startDest(cap, room, cfg);
-    } catch (e) {
-      toast(t("ui.toast.share_failed", { error: e.message }), "error", { err: true });
-      if (!cap.dests.size) endCapture(cap);
-    }
   }
 }
 

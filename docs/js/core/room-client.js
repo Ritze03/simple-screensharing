@@ -9,7 +9,7 @@ import {
   STREAM_TYPE_PREVIEW, WIRE_VERSION, clampUtf8, connIdFromHex, connIdToHex, packPreviewHeader, unpackMediaHeader, unpackPreviewHeader,
   MEDIA_FLAG_KEYFRAME, MEDIA_FLAG_STALLED,
 } from "./protocol.js";
-import { ConnectError, JoinRejectedError, RelaySession, supportsWebTransport } from "./session.js";
+import { ConnectError, JoinRejectedError, RelaySession, classifyClose, supportsWebTransport } from "./session.js";
 import { CanvasRenderer, VideoReceiver } from "./video-rx.js";
 import { ENCODER_PRESETS, MediaClock, VideoSender, probeEncoders } from "./video-tx.js";
 
@@ -18,6 +18,7 @@ const MAX_TX_QUEUE = 8; // frames waiting for encrypt+send per stream before we 
 const MAX_PENDING_DATAGRAMS = 400; // ~400 KB queued inside WebTransport; more than that is latency, not throughput
 const MAX_RX_QUEUE = 64;
 const RESUBSCRIBE_MIN_INTERVAL_MS = 1500;
+const FIRST_RECONNECT_MS = 50;
 const BACKOFF_MS = [500, 1000, 2000, 4000, 8000, 10000];
 
 export const streamKey = (ownerHex, streamId) => `${ownerHex}:${streamId}`;
@@ -288,9 +289,16 @@ export class RoomClient extends EventTarget {
     this.dispatchEvent(new CustomEvent("state", { detail: { state, selfId: this.selfId, attempt: this.attempt, ...extra } }));
   }
 
+  #openAbort = null;
   async #establish() {
     const link = this.link;
-    const sess = await RelaySession.open({ server: link.server, certHash: link.certHash });
+    const ac = (this.#openAbort = new AbortController());
+    let sess;
+    try {
+      sess = await RelaySession.open({ server: link.server, certHash: link.certHash, signal: ac.signal });
+    } finally {
+      if (this.#openAbort === ac) this.#openAbort = null;
+    }
     let snapshot;
     try {
       snapshot = await sess.join({ roomId: link.roomId, displayName: clampUtf8(this.displayName) });
@@ -306,12 +314,13 @@ export class RoomClient extends EventTarget {
     sess.onDatagram = (d) => sess === this.session && this.#onDatagram(d);
     sess.onPreviewStream = (b) => sess === this.session && this.#onPreviewStream(b);
     sess.onClosed = (info) => this.#onSessionClosed(sess, info);
+    const before = new Map(this.streams); // infos of the streams we knew, for watch-ended after a reconnect
     this.#applySnapshot(snapshot);
     // Re-establish what we had before a reconnect: subscriptions to streams that still exist (the receivers
     // restart from the next keyframe: datagrams were lost meanwhile), and forget the ones that are gone.
     for (const [key, reasons] of [...this.subRefs]) {
       if (!this.streams.has(key)) {
-        this.#streamGone(key);
+        this.#streamGone(key, before.get(key));
       } else if (reasons.size) {
         const rx = this.subs.get(key);
         if (rx) rx.enqueue({ type: "loss" });
@@ -327,7 +336,7 @@ export class RoomClient extends EventTarget {
     this.session = null;
     for (const rx of this.subs.values()) rx.queue.length = 0;
     if (this.userClosed) return;
-    const reason = info && info.error ? String(info.error.message || info.error) : (info && info.reason) || "connection lost";
+    const reason = classifyClose(info) === "relay-shutdown" ? "relay shutting down" : info && info.error ? String(info.error.message || info.error) : (info && info.reason) || "connection lost";
     if (!this.autoReconnect) {
       this.members.clear();
       this.streams.clear();
@@ -339,25 +348,65 @@ export class RoomClient extends EventTarget {
     this.#scheduleReconnect();
   }
 
+  /**
+   * The first retry after a loss is immediate (a relay that closed our connection on purpose, e.g. a restart, answers
+   * again within a second; a dead one costs one cheap failed attempt), then exponential backoff.
+   */
   #scheduleReconnect() {
     if (this.userClosed) return;
-    const delay = BACKOFF_MS[Math.min(this.attempt, BACKOFF_MS.length - 1)] * (0.75 + Math.random() * 0.5);
+    const delay = this.attempt === 0 ? FIRST_RECONNECT_MS : BACKOFF_MS[Math.min(this.attempt - 1, BACKOFF_MS.length - 1)] * (0.75 + Math.random() * 0.5);
     this.attempt++;
-    this.reconnectTimer = setTimeout(async () => {
-      if (this.userClosed) return;
+    clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = setTimeout(() => this.#attemptReconnect(), delay);
+  }
+
+  #reconnecting = null;
+  /** One reconnect attempt (shared if one is already running). Resolves to the client state afterwards. */
+  #attemptReconnect() {
+    if (this.#reconnecting) return this.#reconnecting;
+    clearTimeout(this.reconnectTimer);
+    this.#reconnecting = (async () => {
+      if (this.userClosed) return this.state;
       try {
         await this.#establish();
         this.attempt = 0;
         this.#setState("connected", { reconnected: true });
       } catch (e) {
-        emitError(this, e instanceof ConnectError && e.mayBeExpiredLink ? "link-expired" : e && e.code ? e.code : "reconnect-failed", e, { fatal: false });
-        if (e instanceof JoinRejectedError && e.reason === "RoomFull") {
-          // keep trying: someone may leave
-        }
-        this.#setState("reconnecting", { reason: e && e.message, attempt: this.attempt });
-        this.#scheduleReconnect();
+        if (this.userClosed || (e instanceof ConnectError && e.code === "aborted")) return this.state; // cancelled by reconnectNow()
+        // Codes: relay-unreachable (handshake failed, hash known good), link-expired (handshake failed, hash never seen to
+        // work: only possible if the page never connected with it; kept for completeness), room-full / malformed
+        // (JoinRejected), join-no-reply, relay-shutdown, reconnect-failed.
+        let code = "reconnect-failed";
+        if (e instanceof JoinRejectedError) code = e.reason === "RoomFull" ? "room-full" : "join-rejected";
+        else if (e instanceof ConnectError) code = e.mayBeExpiredLink ? "link-expired" : e.reason === "unreachable" ? "relay-unreachable" : e.code || code;
+        emitError(this, code, e, { fatal: false });
+        this.#setState("reconnecting", { reason: e && e.message, attempt: this.attempt, error: e });
+        this.#scheduleReconnect(); // a full room keeps being retried: someone may leave
       }
-    }, delay);
+      return this.state;
+    })().finally(() => {
+      this.#reconnecting = null;
+    });
+    return this.#reconnecting;
+  }
+
+  /**
+   * Reconnect right now, keeping everything: shares stay registered and are re-announced, watched streams are re-subscribed
+   * (those whose owner is still in the room keep their key). While `reconnecting` this skips the backoff wait; while
+   * `connected` it drops the connection and joins again (a fresh ConnId, so OTHER viewers of your shares see them restart).
+   * Resolves with the client state after the attempt (`connected` on success, `reconnecting` if it failed and retries go on).
+   */
+  async reconnectNow() {
+    if (this.userClosed || this.state === "idle" || this.state === "closed") throw new Error("not connected to a room; call connect() first");
+    if (this.state === "connected") {
+      this.#restartConnection("reconnect requested");
+    } else if (this.#reconnecting) {
+      // An attempt is already in flight (maybe stuck in a slow handshake): cancel it and start over right now.
+      if (this.#openAbort) this.#openAbort.abort();
+      await this.#reconnecting.catch(() => {});
+      if (this.state === "connected") return this.state;
+    }
+    return this.#attemptReconnect();
   }
 
   /** Force a fresh connection (fresh ConnId, fresh nonce space). */
@@ -390,7 +439,26 @@ export class RoomClient extends EventTarget {
     const key = streamKey(owner, s.streamId);
     this.streams.set(key, {
       key, owner, ownerId: s.owner, streamId: s.streamId, kind: s.kind, label: s.label, width: s.width, height: s.height, self: owner === this.selfId,
+      ownerName: this.members.get(owner)?.name ?? "",
     });
+  }
+
+  /**
+   * Identity of a stream that survives its owner's reconnect (a reconnect gives the owner a new ConnId, so `key` changes):
+   * room + owner's display name + kind + label. Two members with the same name sharing the same label collide; the
+   * caller then picks the first unwatched match. See README "Stable stream identity".
+   */
+  #stableKey(info) {
+    const name = info.ownerName || this.members.get(info.owner)?.name || "";
+    return `${this.link ? this.link.roomIdHex : ""}/${name}/${info.kind}/${info.label}`;
+  }
+
+  /** The stream currently in the room with this `stableKey` (and not `exceptKeys`), or null. */
+  findStreamByStableKey(stableKey, { exceptKeys = [] } = {}) {
+    for (const s of this.streams.values()) {
+      if (!exceptKeys.includes(s.key) && this.#stableKey(s) === stableKey) return { ...s, stableKey };
+    }
+    return null;
   }
 
   #emitRoster() {
@@ -399,7 +467,11 @@ export class RoomClient extends EventTarget {
 
   #emitStreams() {
     const members = this.members;
-    const streams = [...this.streams.values()].map((s) => ({ ...s, ownerName: members.get(s.owner)?.name ?? "" }));
+    const streams = [...this.streams.values()].map((s) => {
+      s.ownerName = members.get(s.owner)?.name ?? s.ownerName;
+      s.stableKey = this.#stableKey(s);
+      return { ...s };
+    });
     this.dispatchEvent(new CustomEvent("streams", { detail: { streams } }));
   }
 
@@ -412,8 +484,8 @@ export class RoomClient extends EventTarget {
           this.#emitRoster();
         } else if (e.type === "MemberLeft") {
           const id = connIdToHex(e.connId);
-          this.members.delete(id);
           for (const [key, s] of [...this.streams]) if (s.owner === id) this.#streamGone(key);
+          this.members.delete(id);
           this.#emitRoster();
           this.#emitStreams();
         } else if (e.type === "StreamStarted") {
@@ -456,8 +528,8 @@ export class RoomClient extends EventTarget {
     }
   }
 
-  #streamGone(key) {
-    const info = this.streams.get(key);
+  #streamGone(key, known = null) {
+    const info = this.streams.get(key) || known;
     this.streams.delete(key);
     this.previews.delete(key);
     if (this.subRefs.has(key)) {
@@ -468,7 +540,9 @@ export class RoomClient extends EventTarget {
     if (w) {
       this.watches.delete(key);
       w.detach();
-      this.dispatchEvent(new CustomEvent("watch-ended", { detail: { key, reason: "stream-stopped" } }));
+      this.dispatchEvent(new CustomEvent("watch-ended", {
+        detail: { key, reason: "stream-stopped", stableKey: info ? this.#stableKey(info) : null, ownerName: info ? info.ownerName : "", label: info ? info.label : "", kind: info ? info.kind : "video" },
+      }));
     }
     this.#reconcileFollowers();
     return info;
