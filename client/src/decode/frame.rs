@@ -25,8 +25,8 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use gstreamer_video::{VideoColorMatrix, VideoColorRange, VideoFrame, VideoInfo};
 
@@ -174,7 +174,7 @@ impl DecodedFrame {
 }
 
 /// `(kr, kb)` luma coefficients for each matrix.
-fn matrix_coefficients(matrix: YuvMatrix) -> (f32, f32) {
+pub(super) fn matrix_coefficients(matrix: YuvMatrix) -> (f32, f32) {
     match matrix {
         YuvMatrix::Bt601 => (0.299, 0.114),
         YuvMatrix::Bt709 => (0.2126, 0.0722),
@@ -281,6 +281,10 @@ pub struct DecoderStats {
 /// thread) and any number of readers.
 pub(super) struct Shared {
     slot: Mutex<Option<Arc<DecodedFrame>>>,
+    /// Signalled (with `slot` as its mutex) on every publish, so a repaint
+    /// waker can sleep until a frame arrives instead of polling
+    /// ([`FrameSource::wait_for_newer`]).
+    arrived: Condvar,
     /// Number of frames published into `slot`; also the `seq` of the newest.
     published: AtomicU64,
     /// Frames seen leaving the decoder (pad probe) — can run ahead of
@@ -297,6 +301,7 @@ impl Shared {
     pub(super) fn new() -> Arc<Self> {
         Arc::new(Self {
             slot: Mutex::new(None),
+            arrived: Condvar::new(),
             published: AtomicU64::new(0),
             decoded_total: AtomicU64::new(0),
             presented_total: AtomicU64::new(0),
@@ -316,8 +321,13 @@ impl Shared {
     /// Replace the latest frame. Overwrites an unread one (latest-only).
     pub(super) fn publish(&self, frame: DecodedFrame) {
         let seq = frame.seq;
-        *self.slot.lock().unwrap() = Some(Arc::new(frame));
+        let mut slot = self.slot.lock().unwrap();
+        *slot = Some(Arc::new(frame));
+        // Stored under the lock so a `wait_for_newer` that checked the
+        // counter under the same lock can't miss the wake-up.
         self.published.store(seq, Ordering::Release);
+        drop(slot);
+        self.arrived.notify_all();
     }
 
     /// Called for every buffer leaving the decoder.
@@ -379,6 +389,37 @@ impl FrameSource {
             return None;
         }
         self.latest().filter(|f| f.seq > last_seen_seq)
+    }
+
+    /// Block until a frame newer than `last_seen_seq` is published or
+    /// `timeout` passes; returns [`Self::frame_counter`] at wake-up (compare
+    /// with `last_seen_seq` to tell the two apart). For repaint wakers
+    /// ([`render::VideoView`](super::render::VideoView)): sleeps on a condvar,
+    /// never spins, and never touches the decoder itself.
+    pub fn wait_for_newer(&self, last_seen_seq: u64, timeout: Duration) -> u64 {
+        if self.frame_counter() > last_seen_seq {
+            return self.frame_counter();
+        }
+        let slot = self.0.slot.lock().unwrap();
+        let _unused = self
+            .0
+            .arrived
+            .wait_timeout_while(slot, timeout, |_| self.0.published.load(Ordering::Acquire) <= last_seen_seq)
+            .unwrap();
+        self.frame_counter()
+    }
+
+    /// Wake every [`Self::wait_for_newer`] caller now (used when a view is
+    /// dropped so its waker thread exits promptly).
+    pub fn wake_waiters(&self) {
+        let _slot = self.0.slot.lock().unwrap();
+        self.0.arrived.notify_all();
+    }
+
+    /// Identity of the underlying decoder output: equal for clones of the
+    /// same `FrameSource`. Lets a renderer key per-stream GPU state.
+    pub fn same_source(&self, other: &FrameSource) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 
     /// Record access units dropped before reaching the decoder (used by
