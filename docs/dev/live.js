@@ -26,6 +26,7 @@ const pattern = q("pattern", "counter");
 const wantAudio = q("audio", "0") === "1";
 const hw = q("hw", "no-preference");
 const preset = q("preset", "balanced");
+const source = q("source", "pattern"); // pattern = share the synthetic MediaStream; tab = real getDisplayMedia of this tab
 const out = document.getElementById("out");
 const show = (o) => (out.textContent = JSON.stringify(o, (_, v) => (typeof v === "bigint" ? `${v}n` : v), 2));
 
@@ -70,13 +71,19 @@ async function main() {
 }
 
 async function runShare(client, result) {
-  const src = makePatternSource(W, H, fps, { audio: wantAudio });
+  const src = makePatternSource(W, H, fps, { audio: wantAudio, speaker: source === "tab" });
   const probes = await probeEncoders({ width: W, height: H, fps, bitrateKbps: bitrate });
   result.encoderProbe = probes;
   log("encoder probe", probes);
   let share;
   try {
-    share = await client.startShare({ stream: src.stream, codec, fps, bitrateKbps: bitrate, audio: wantAudio, preset, hardwareAcceleration: hw, label: `Test ${codec} ${fps}fps` });
+    const real = source === "tab" ? { displayMediaOptions: { preferCurrentTab: true, selfBrowserSurface: "include", systemAudio: "include" } } : { stream: src.stream };
+    share = await client.startShare({ ...real, codec, fps, bitrateKbps: bitrate, audio: wantAudio, preset, hardwareAcceleration: hw, label: `Test ${codec} ${fps}fps` });
+    result.shareTracks = {
+      video: share.videoTrack.getSettings(),
+      audio: share.audioTrack ? share.audioTrack.getSettings() : null,
+      hasAudioStream: share.audioStreamId !== null,
+    };
   } catch (e) {
     src.stop();
     throw e;
@@ -104,8 +111,8 @@ async function runShare(client, result) {
     ...end,
     capturedFps: +((end.captured - base.captured) / elapsed).toFixed(1),
     // averaged over the seconds in which a viewer was subscribed (the encoder idles before/after)
-    avgEncodedFps: +avg(samples.filter((x) => x.encodedFps > 1).map((x) => x.encodedFps)).toFixed(1),
-    avgKbps: +avg(samples.filter((x) => x.kbps > 1).map((x) => x.kbps)).toFixed(0),
+    avgEncodedFps: +(avg(samples.filter((x) => x.encodedFps > 1).map((x) => x.encodedFps)) ?? 0).toFixed(1),
+    avgKbps: +(avg(samples.filter((x) => x.kbps > 1).map((x) => x.kbps)) ?? 0).toFixed(0),
     elapsedS: +elapsed.toFixed(1),
     samples,
   };

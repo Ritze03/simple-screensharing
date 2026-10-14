@@ -111,6 +111,31 @@ export class WatchHandle {
   detach() {
     if (this.renderer) this.renderer.stop();
     this.renderer = null;
+    if (this._trackWriter) {
+      this._trackWriter.close().catch(() => {});
+      this._trackWriter = null;
+      this._track = null;
+      this.onFrame = null;
+    }
+  }
+  /**
+   * Optional alternative to the canvas: a live video `MediaStreamTrack` of the decoded frames (for a `<video>` element,
+   * Picture-in-Picture, recording). It goes through the browser's own video pipeline, which adds latency and frame
+   * pacing of its own: prefer `attachToCanvas` for latency-critical viewing. Chromium-only (`MediaStreamTrackGenerator`).
+   */
+  videoTrack() {
+    if (this._track) return this._track;
+    if (typeof MediaStreamTrackGenerator === "undefined") throw new Error("MediaStreamTrackGenerator is not available in this browser");
+    if (this.renderer) {
+      this.renderer.stop();
+      this.renderer = null;
+    }
+    const gen = new MediaStreamTrackGenerator({ kind: "video" });
+    const writer = gen.writable.getWriter();
+    this._trackWriter = writer;
+    this._track = gen;
+    this.onFrame = (frame) => writer.write(frame).catch(() => frame.close()); // write() takes ownership and closes the frame
+    return gen;
   }
   /** Receive raw VideoFrames instead. The callback OWNS each frame and must frame.close() it. */
   setFrameCallback(fn) {
@@ -874,6 +899,12 @@ export class RoomClient extends EventTarget {
 
     this.#announceShare(share);
     this.#startPreviewTimer(share);
+    // A damage-driven capture of a completely static source can stay silent; tell the UI instead of looking dead.
+    share.noFrameTimer = setTimeout(() => {
+      if (!share.ended && share.sender.stats.captured === 0) {
+        this.dispatchEvent(new CustomEvent("share", { detail: { state: "no-frames", share, message: "The capture source has not delivered a single frame yet (a static screen, or a capture problem)." } }));
+      }
+    }, 4000);
     this.dispatchEvent(new CustomEvent("share", { detail: { state: "started", share } }));
     return share;
   }
@@ -905,6 +936,7 @@ export class RoomClient extends EventTarget {
     if (i >= 0) this.shares.splice(i, 1);
     clearTimeout(share.previewTimer);
     clearInterval(share.previewTimer);
+    clearTimeout(share.noFrameTimer);
     share.sender && share.sender.stop();
     share.audioSender && share.audioSender.stop();
     if (share.ownsStream) share.stream.getTracks().forEach((t) => t.stop());

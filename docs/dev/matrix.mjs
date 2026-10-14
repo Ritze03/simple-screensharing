@@ -9,6 +9,7 @@
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { writeFileSync } from "node:fs";
+import { loadavg } from "node:os";
 import { launchChromium, startServer } from "./headless.mjs";
 
 const BASE = "/simple-screensharing/";
@@ -82,7 +83,7 @@ async function main() {
       process.stdout.write(`${codec} @${fps}fps ${o.size} ${o.bitrate}kbps … `);
       let r;
       try {
-        r = await runPair({ relay: o.relay, hash: o.hash, codec, fps, size: o.size, bitrate: o.bitrate, duration: o.duration, hw: o.hw, flags: o.flags, preset: o.preset, extra: o.audio ? "&audio=1" : "", nativeViewer: o["native-viewer"] || null });
+        r = await runPair({ relay: o.relay, hash: o.hash, codec, fps, size: o.size, bitrate: o.bitrate, duration: o.duration, hw: o.hw, flags: o.flags, preset: o.preset, extra: (o.audio ? "&audio=1" : "") + (o.source ? `&source=${o.source}` : ""), nativeViewer: o["native-viewer"] || null });
       } catch (e) {
         console.log(`FAILED: ${e.message}`);
         rows.push({ codec, fps, error: e.message });
@@ -103,7 +104,7 @@ async function main() {
         txDropped: s.sender?.txDropped, encDropped: s.sender?.droppedBackpressure,
         rxFps: v.receiver?.avgReceivedFps, decFps: v.receiver?.avgDecodedFps, drawnFps: v.receiver?.drawnFps, rxKbps: v.receiver?.avgKbps,
         loss: v.receiver?.lossEvents, lat50: v.receiver?.latencyMs?.p50, lat95: v.receiver?.latencyMs?.p95, bufMs: v.receiver?.bufferMs,
-        res: v.receiver?.resolution, error: s.error || v.error,
+        res: v.receiver?.resolution, load1: +loadavg()[0].toFixed(1), error: s.error || v.error,
       };
       rows.push(row);
       all.push({ row, sharer: s, viewer: { ...v, snapshotJpegDataUrl: undefined } });

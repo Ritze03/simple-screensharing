@@ -349,6 +349,24 @@ scenario("stream stopping under a viewer cleans up (watch-ended, no leaked subsc
   src.stop();
 });
 
+scenario("watch handle can hand out a MediaStreamTrack for a <video> element", async () => {
+  const room = newRoom();
+  const a = await client(room.link, "sharer");
+  const b = await client(room.link, "viewer");
+  const src = makePatternSource(320, 180, 15);
+  await a.startShare({ stream: src.stream, fps: 15, bitrateKbps: 500 });
+  const st = await waitFor(() => streamOf(b, a), 5000, "stream");
+  const h = b.watch(st.key);
+  const video = document.body.appendChild(document.createElement("video"));
+  video.muted = true;
+  video.srcObject = new MediaStream([h.videoTrack()]);
+  await video.play();
+  await waitFor(() => video.videoWidth === 320 && video.videoHeight === 180, 8000, "the <video> shows decoded frames");
+  await waitFor(() => (b.watchStats(st.key) || {}).decoded > 5, 5000, "decoding continues");
+  src.stop();
+  return { videoSize: `${video.videoWidth}x${video.videoHeight}` };
+});
+
 scenario("two rooms at once from one page are isolated", async () => {
   const r1 = newRoom();
   const r2 = newRoom();

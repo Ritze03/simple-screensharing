@@ -5,7 +5,7 @@
 // ---- test pattern: 16-bit frame counter + 24-bit wall clock ms as 40 black/white blocks, plus noisy rectangles ----
 const BLOCK = 12;
 const BITS = 40;
-export function makePatternSource(width, height, targetFps, { audio = false } = {}) {
+export function makePatternSource(width, height, targetFps, { audio = false, speaker = false } = {}) {
   const canvas = document.createElement("canvas");
   canvas.width = width;
   canvas.height = height;
@@ -24,6 +24,7 @@ export function makePatternSource(width, height, targetFps, { audio = false } = 
     const dest = audioCtx.createMediaStreamDestination();
     osc.frequency.value = 440;
     osc.connect(gain).connect(dest);
+    if (speaker) gain.connect(audioCtx.destination); // audible in the tab, so a tab-audio capture has something to take
     osc.start();
     stream.addTrack(dest.stream.getAudioTracks()[0]);
   }

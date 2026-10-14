@@ -97,13 +97,14 @@ const DEFAULT_FLAGS = [
   "--disable-renderer-backgrounding",
   "--disable-backgrounding-occluded-windows",
   "--autoplay-policy=no-user-gesture-required",
-  "--use-fake-ui-for-media-stream",
   "--enable-features=WebCodecs,WebTransport",
 ];
 
 export function launchChromium(url, { flags = [], userDataDir, bin = "/usr/bin/chromium" } = {}) {
   const dir = userDataDir || mkdtempSync(join(tmpdir(), "ssshare-chromium-"));
-  const proc = spawn(bin, [...DEFAULT_FLAGS, `--user-data-dir=${dir}`, ...flags, url], { stdio: ["ignore", "ignore", "pipe"] });
+  // HEADED=1 drops --headless (real window; only ever do this on a monitor you own, see the testing notes) - needed for GPU video paths.
+  const base = process.env.HEADED ? DEFAULT_FLAGS.filter((f) => !f.startsWith("--headless")) : DEFAULT_FLAGS;
+  const proc = spawn(bin, [...base, `--user-data-dir=${dir}`, ...flags, url], { stdio: ["ignore", "ignore", "pipe"] });
   let stderr = "";
   proc.stderr.on("data", (d) => (stderr += d));
   return {
