@@ -11,7 +11,7 @@
 use tauri::State;
 
 use simple_screensharing_client::session::{
-    AppState, CaptureSourceId, DestinationId, PendingRole, RoomHandle,
+    AppState, CaptureSourceId, DestEdit, DestinationId, PendingRole, RoomHandle,
 };
 
 use crate::dto::{self, AudioSourceDto, DestinationRow, RoomDetail, SavedRoomRow, SettingsDto, StartStreamDefaultsDto};
@@ -30,33 +30,9 @@ pub fn list_saved_rooms(managed: State<'_, Managed>) -> Vec<SavedRoomRow> {
     list_saved_rooms_impl(&managed.state.lock().unwrap())
 }
 
+/// See `session::AppState::join_room` (room-name pre-seed + connect).
 pub fn join_room_impl(state: &mut AppState, join_string: String, display_name: String, room_name: String) -> Result<(), String> {
-    if !display_name.trim().is_empty() {
-        state.display_name = display_name;
-    }
-    let room_name = room_name.trim().to_string();
-    if !room_name.is_empty() {
-        // Pre-seed the local name *before* connecting, same as
-        // `create_room_impl` does below — see that function's doc comment
-        // for the full rationale (keeps the human-typed name instead of
-        // `poll_connect_result`'s id-derived fallback, which only fires when
-        // `RoomStore::name_for` has no entry for this join string yet).
-        //
-        // `Why:` unconditional `upsert` here (matching `create_room_impl`'s
-        // own unconditional call), not "only if not already saved"
-        // (`poll_connect_result`'s own guard): a name typed into the Join
-        // tab is a deliberate choice by the user for *this* join, same as
-        // Create's Room Name field, so it should win even if this join
-        // string happened to already have a saved name. `upsert` keys by
-        // name (not join string), so this can only overwrite a room already
-        // saved under this exact name — it can't collide with some other
-        // saved room under a different name.
-        state.room_store.upsert(room_name, join_string.clone());
-        if let Err(e) = state.room_store.save() {
-            state.room_store_error = Some(e.to_string());
-        }
-    }
-    state.start_connect(join_string, true)
+    state.join_room(join_string, display_name, room_name)
 }
 
 // `Why:` `join_room` is a plain (non-`async`) `#[tauri::command]`. Tauri's
@@ -102,64 +78,13 @@ pub fn cancel_connect(managed: State<'_, Managed>) {
     cancel_connect_impl(&mut managed.state.lock().unwrap());
 }
 
-/// "Create a room": per the server's `Registry::get_or_create_room` (spec
-/// §10), there is no separate create verb on the wire — a room is
-/// auto-created the instant anyone joins a room-id that doesn't exist yet.
-/// So creating, from this client, is just: mint a fresh room-id + key nobody
-/// has used before, format them into a join string with the server address
-/// the user typed, save that join string locally under `room_name` (the
-/// LOCAL-only nickname — never sent over the wire, same meaning as
-/// `SavedRoomRow.name`/`rooms.rs`'s `RoomStore` elsewhere), and then run the
-/// exact same join flow `join_room` already uses. The first joiner of a
-/// freshly-generated id/key implicitly becomes the room's effective creator.
-///
-/// The room *key* is a real AES-256 AEAD secret (`net::ParsedJoinString`'s
-/// doc comment, and `net.rs`'s frame en/decryption), not a display label —
-/// it is generated here, in Rust, with the `rand` crate's default
-/// (CSPRNG-backed) generator via `rand::random()`, the same call
-/// `end_to_end_test.rs`/`audio.rs`'s own room-id/key generation already uses
-/// elsewhere in this codebase — deliberately not in JS, where there is no
-/// equivalent secure-randomness primitive available to the frontend.
-///
-/// Named under `room_name` *before* connecting (rather than letting the
-/// usual id-derived-fallback naming in `AppState::poll_connect_result` name
-/// it) so the room keeps the human-chosen name the user actually typed:
-/// `poll_connect_result` only auto-names a join string that has no saved
-/// name yet, so pre-seeding the `RoomStore` here is enough — no change
-/// needed there.
-///
-/// `display_name` is deliberately not a parameter: display name is now one
-/// global Settings-tab value (`rooms::AppSettings::display_name`,
-/// `set_display_name`), not asked per room/join at all — so this passes
-/// `String::new()` through to `join_room_impl`, which — same as the
-/// sidebar's silent auto-reconnect call and `submitJoin`'s own
-/// `displayName: ""` call (`shell.js`) — leaves `AppState::display_name`
-/// untouched, i.e. whatever it already is: the persisted global setting
-/// (loaded at startup, kept live-current by `set_display_name`), or the
-/// `whoami_fallback()` OS-username default until that setting is ever set.
+/// "Create a room": mint a fresh room-id + key, save it under `room_name`, and
+/// join it — see `session::AppState::create_room` /
+/// `session::AppState::create_and_join_room` for the full rationale (no
+/// create verb on the wire, key generated in Rust with the CSPRNG, name
+/// pre-seeded before connecting, why `display_name` is not a parameter).
 pub fn create_room_impl(state: &mut AppState, server: String, room_name: String) -> Result<(), String> {
-    let server = server.trim().to_string();
-    if server.is_empty() {
-        return Err("server address must not be empty".to_string());
-    }
-    let room_name = room_name.trim().to_string();
-    if room_name.is_empty() {
-        return Err("room name must not be empty".to_string());
-    }
-
-    let room_id: simple_screensharing_client::protocol::RoomId = rand::random();
-    let room_key: [u8; 32] = rand::random();
-    let join_string = simple_screensharing_client::net::format_join_string(&server, &room_id, &room_key);
-
-    // Pre-seed the local name *before* connecting — see doc comment above.
-    state.room_store.upsert(room_name, join_string.clone());
-    if let Err(e) = state.room_store.save() {
-        state.room_store_error = Some(e.to_string());
-    }
-
-    // Room name is already pre-seeded above — pass `String::new()` so
-    // `join_room_impl`'s own (now-redundant) upsert is a no-op.
-    join_room_impl(state, join_string, String::new(), String::new())
+    state.create_and_join_room(&server, &room_name)
 }
 
 // See `join_room`'s `Why:` note above — `create_room_impl` transitively
@@ -200,10 +125,7 @@ pub fn force_leave_room(managed: State<'_, Managed>, room_handle: u32) {
 pub fn rename_room(managed: State<'_, Managed>, join_string: String, new_name: String) -> Result<(), String> {
     let mut state = managed.state.lock().unwrap();
     state.rename_saved_room(&join_string, new_name);
-    match &state.room_store_error {
-        Some(e) => Err(e.clone()),
-        None => Ok(()),
-    }
+    state.room_store_result()
 }
 
 /// Set/clear the room-detail panel's "Auto-Connect" checkbox for a saved
@@ -213,29 +135,14 @@ pub fn rename_room(managed: State<'_, Managed>, join_string: String, new_name: S
 pub fn set_room_auto_connect(managed: State<'_, Managed>, join_string: String, auto_connect: bool) -> Result<(), String> {
     let mut state = managed.state.lock().unwrap();
     state.set_room_auto_connect(&join_string, auto_connect);
-    match &state.room_store_error {
-        Some(e) => Err(e.clone()),
-        None => Ok(()),
-    }
+    state.room_store_result()
 }
 
-/// Forget a saved room: drop its `RoomStore` entry and persist the removal
-/// immediately, so it doesn't reappear the next time the saved-rooms list is
-/// reloaded from disk (e.g. the next `list_saved_rooms` call, or an app
-/// restart). Keyed by `join_string` rather than a room handle since "forget"
-/// only applies to a saved, disconnected row (`APP-SHELL.md`'s row-state
-/// table), which has no handle at all — mirrors `rename_room`'s lookup.
+/// Forget a saved room — see `session::AppState::forget_room`. Keyed by
+/// `join_string` rather than a room handle since "forget" only applies to a
+/// saved, disconnected row, which has no handle at all.
 pub fn forget_room_impl(state: &mut AppState, join_string: String) -> Result<(), String> {
-    if let Some(name) = state.room_store.name_for(&join_string).map(str::to_string) {
-        state.room_store.remove(&name);
-    }
-    if let Err(e) = state.room_store.save() {
-        state.room_store_error = Some(e.to_string());
-    }
-    match &state.room_store_error {
-        Some(e) => Err(e.clone()),
-        None => Ok(()),
-    }
+    state.forget_room(&join_string)
 }
 
 #[tauri::command]
@@ -268,68 +175,45 @@ pub fn get_settings(managed: State<'_, Managed>) -> SettingsDto {
 
 #[tauri::command]
 pub fn set_language(managed: State<'_, Managed>, language: String) {
-    let mut state = managed.state.lock().unwrap();
-    rust_i18n::set_locale(&language);
-    state.language = language.clone();
-    simple_screensharing_client::session::save_language(&language);
+    managed.state.lock().unwrap().set_language(&language);
 }
 
-/// Persist the global display name (Settings tab) — used for every room
-/// join/create from here on, replacing the old per-join "Display name"
-/// field. See `rooms::AppSettings::display_name`'s doc comment for why one
-/// global setting is enough: the wire protocol sends a display name once, at
-/// connect, with no later way to change it for an already-joined room, so
-/// there was never a per-room distinction to preserve.
+/// Persist the global display name (Settings tab) — see
+/// `session::AppState::set_display_name`.
 #[tauri::command]
 pub fn set_display_name(managed: State<'_, Managed>, display_name: String) {
-    let display_name = display_name.trim().to_string();
-    let mut state = managed.state.lock().unwrap();
-    state.display_name = display_name.clone();
-    simple_screensharing_client::session::save_display_name(&display_name);
+    managed.state.lock().unwrap().set_display_name(&display_name);
 }
 
 #[tauri::command]
 pub fn set_presentation_mode(managed: State<'_, Managed>, mode: String) -> Result<(), String> {
     let mode = dto::parse_presentation_mode(&mode)?;
-    let mut state = managed.state.lock().unwrap();
-    state.presentation_mode = mode;
-    simple_screensharing_client::session::save_presentation_mode(mode);
+    managed.state.lock().unwrap().set_presentation_mode(mode);
     Ok(())
 }
 
-/// Clamped server-side too (defense in depth) even though the frontend's
-/// range input already restricts it to 0..=5000 — see
-/// `rooms::AppSettings::clamp_max_jitter_buffer_ms`.
+/// Clamped in the lib (defense in depth) — see
+/// `session::AppState::set_max_jitter_buffer_ms`.
 #[tauri::command]
 pub fn set_max_jitter_buffer_ms(managed: State<'_, Managed>, ms: u32) {
-    let ms = simple_screensharing_client::rooms::AppSettings::clamp_max_jitter_buffer_ms(ms);
-    let mut state = managed.state.lock().unwrap();
-    state.max_jitter_buffer_ms = ms;
-    simple_screensharing_client::session::save_max_jitter_buffer_ms(ms);
+    managed.state.lock().unwrap().set_max_jitter_buffer_ms(ms);
 }
 
-/// Clamped server-side too (defense in depth) even though the frontend's
-/// range input already restricts it to 5..=10 — see
-/// `rooms::AppSettings::clamp_catch_up_speed_percent`.
+/// Clamped in the lib (defense in depth) — see
+/// `session::AppState::set_catch_up_speed_percent`.
 #[tauri::command]
 pub fn set_catch_up_speed_percent(managed: State<'_, Managed>, percent: u32) {
-    let percent = simple_screensharing_client::rooms::AppSettings::clamp_catch_up_speed_percent(percent);
-    let mut state = managed.state.lock().unwrap();
-    state.catch_up_speed_percent = percent;
-    simple_screensharing_client::session::save_catch_up_speed_percent(percent);
+    managed.state.lock().unwrap().set_catch_up_speed_percent(percent);
 }
 
 /// The "START A STREAM" form's persisted last-used values — read once when
 /// the Stream Control tab loads to pre-fill `state.startForm`
 /// (`stream-control.js`) instead of the hardcoded defaults it used to reset
-/// to on every launch. Not `AppState`-backed like `get_settings` (nothing
-/// here has a live/in-session counterpart the way `bitrate_kbps`/
-/// `framerate`/bandwidth mode do — this is purely a saved form default), so
-/// this reads straight from the settings file rather than through
-/// `managed.state`.
+/// to on every launch. See `session::AppState::start_stream_defaults` (a
+/// settings-file read).
 #[tauri::command]
 pub fn get_start_stream_defaults() -> StartStreamDefaultsDto {
-    let d = simple_screensharing_client::rooms::AppSettings::load().start_stream_defaults;
+    let d = AppState::start_stream_defaults();
     StartStreamDefaultsDto {
         framerate: d.framerate,
         bitrate_kbps: d.bitrate_kbps,
@@ -357,14 +241,14 @@ pub fn set_start_stream_defaults(
     let quality_level = dto::parse_quality_level(&quality_level)?;
     let rate_control = dto::parse_rate_control_mode(&rate_control)?;
     let codec = dto::parse_video_codec(&codec)?;
-    simple_screensharing_client::session::save_start_stream_defaults(
+    AppState::set_start_stream_defaults(simple_screensharing_client::rooms::StartStreamDefaults {
         framerate,
         bitrate_kbps,
         tune,
         quality_level,
         rate_control,
         codec,
-    );
+    });
     Ok(())
 }
 
@@ -455,11 +339,9 @@ pub fn stop_share(managed: State<'_, Managed>, capture_id: u32) {
 /// point.
 #[tauri::command]
 pub async fn list_audio_sources() -> Result<Vec<AudioSourceDto>, String> {
-    tokio::task::spawn_blocking(simple_screensharing_client::audio::list_audio_sources)
+    simple_screensharing_client::session::list_audio_sources_async()
         .await
-        .map_err(|e| format!("audio source listing task panicked: {e}"))?
         .map(|sources| sources.into_iter().map(|s| AudioSourceDto { id: s.id, name: s.name }).collect())
-        .map_err(|e| format!("{e:#}"))
 }
 
 #[tauri::command]
@@ -469,53 +351,18 @@ pub fn select_audio_source(managed: State<'_, Managed>, id: u32, name: String) {
 }
 
 /// Starts a non-announcing per-candidate level tap for the "Add
-/// audio"/"Switch" dropdown's meters — see `session::AppState::
-/// insert_audio_level_tap` and `audio::AudioLevelTapHandle`'s doc comments
-/// for why this is a separate, much lighter thing than `start_audio_share`.
-/// Re-lists sources here (rather than trusting `source_id` against whatever
-/// the frontend already had) so the tap is built against `object.serial`
-/// for the node as it exists right now — same freshness reasoning as
-/// `list_audio_sources` itself. Returns the tap id the frontend polls/stops
-/// with; `Err` (e.g. the source vanished, or has no `object.serial` yet)
-/// just means that one dropdown entry's meter stays unlit.
+/// audio"/"Switch" dropdown's meters. Returns the tap id the frontend
+/// polls/stops with; `Err` (e.g. the source vanished, or has no
+/// `object.serial` yet) just means that one dropdown entry's meter stays
+/// unlit.
 ///
-/// `Why `audio::start_level_tap` runs inside its own `spawn_blocking`,
-/// separate from the one above and *before* `AppState`'s mutex is ever
-/// taken:` its doc comment claims `pipeline.set_state(Playing)` returns as
-/// soon as the state change is *requested*, without waiting for it to
-/// complete — true in the common case, but confirmed live (real dropdown
-/// open, real PipeWire session, one candidate among several) that
-/// `set_state` can still block synchronously for several seconds on a node
-/// PipeWire hasn't fully brought up yet (an idle/suspended stream in
-/// particular). The old code called `session::AppState::start_audio_level_tap`
-/// — which built the *entire* GStreamer pipeline, including that
-/// `set_state` call — while holding `managed.state`'s lock for the whole
-/// dropdown-open burst of concurrent taps. One slow/stuck candidate then
-/// held that lock indefinitely, and every other command needing it —
-/// including unrelated `start_audio_level_tap` calls for perfectly healthy
-/// sources, and, worse, `start_audio_share` for the "Share" button on the
-/// very same dropdown — queued behind it forever. That's the root cause
-/// both the "visualizer never lights up" and "clicking Share does nothing"
-/// bug reports traced back to. Building the pipeline here, before taking
-/// the lock at all, means a stuck candidate only ever blocks its own
-/// request (which the frontend's `withTimeout` already treats as "leave
-/// this one meter unlit") instead of every other command in the app.
+/// `Why the tap is built before `managed.state` is locked:` see
+/// `session::build_audio_level_tap`'s doc comment — building the GStreamer
+/// pipeline under the `AppState` mutex let one slow candidate block every
+/// other command in the app.
 #[tauri::command]
 pub async fn start_audio_level_tap(managed: State<'_, Managed>, source_id: u32) -> Result<u32, String> {
-    let source = tokio::task::spawn_blocking(simple_screensharing_client::audio::list_audio_sources)
-        .await
-        .map_err(|e| format!("audio source listing task panicked: {e}"))?
-        .map_err(|e| format!("{e:#}"))?
-        .into_iter()
-        .find(|s| s.id == source_id)
-        .ok_or_else(|| "audio source is no longer listed".to_string())?;
-    let serial = source
-        .serial
-        .ok_or_else(|| format!("'{}' has no PipeWire object.serial to tap yet", source.name))?;
-    let handle = tokio::task::spawn_blocking(move || simple_screensharing_client::audio::start_level_tap(serial))
-        .await
-        .map_err(|e| format!("audio level-tap task panicked: {e}"))?
-        .map_err(|e| format!("{e:#}"))?;
+    let handle = simple_screensharing_client::session::build_audio_level_tap(source_id).await?;
     Ok(managed.state.lock().unwrap().insert_audio_level_tap(handle))
 }
 
@@ -613,8 +460,10 @@ pub fn set_codec(managed: State<'_, Managed>, codec: String) -> Result<(), Strin
 /// function of the backend rather than a live per-codec hardware probe.
 #[tauri::command]
 pub fn supported_codecs() -> Vec<&'static str> {
-    let backend = simple_screensharing_client::capture::detect_encoder_backend();
-    simple_screensharing_client::capture::supported_codecs(backend).iter().map(|c| dto::video_codec_str(*c)).collect()
+    // No `managed` parameter (and no lock) on purpose: `AppState::supported_codecs`
+    // doesn't read any session state, and this command is also called while a
+    // slow command holds the lock.
+    AppState::supported_codecs().iter().map(|c| dto::video_codec_str(*c)).collect()
 }
 
 #[tauri::command]
@@ -672,19 +521,10 @@ pub fn edit_destination(
     let rate_control = dto::parse_rate_control_mode(&rate_control)?;
     let codec = dto::parse_video_codec(&codec)?;
 
-    let mut state = managed.state.lock().unwrap();
-    let destination_id = DestinationId(destination_id);
-    state.with_destination(destination_id, |dest| {
-        dest.edit.scale_percent = scale_percent;
-        dest.edit.framerate = framerate;
-        dest.edit.bitrate_kbps = bitrate_kbps;
-        dest.edit.tune = tune;
-        dest.edit.quality_level = quality_level;
-        dest.edit.rate_control = rate_control;
-        dest.edit.gop_millis = gop_millis;
-        dest.edit.codec = codec;
-    });
-    state.apply_destination_edit(destination_id);
+    managed.state.lock().unwrap().edit_destination(
+        DestinationId(destination_id),
+        DestEdit { scale_percent, framerate, bitrate_kbps, tune, quality_level, rate_control, gop_millis, codec },
+    );
     Ok(())
 }
 
@@ -715,24 +555,12 @@ pub fn set_bandwidth_mode(managed: State<'_, Managed>, mode: String) -> Result<(
 
 #[tauri::command]
 pub fn set_bandwidth_total(managed: State<'_, Managed>, total_kbps: u32) {
-    let mut state = managed.state.lock().unwrap();
-    state.absolute_total_kbps = total_kbps;
-    simple_screensharing_client::session::save_bandwidth_settings(
-        state.bandwidth_mode,
-        state.absolute_total_kbps,
-        state.destination_floor_kbps,
-    );
+    managed.state.lock().unwrap().set_bandwidth_total(total_kbps);
 }
 
 #[tauri::command]
 pub fn set_bandwidth_floor(managed: State<'_, Managed>, floor_kbps: u32) {
-    let mut state = managed.state.lock().unwrap();
-    state.destination_floor_kbps = floor_kbps;
-    simple_screensharing_client::session::save_bandwidth_settings(
-        state.bandwidth_mode,
-        state.absolute_total_kbps,
-        state.destination_floor_kbps,
-    );
+    managed.state.lock().unwrap().set_bandwidth_floor(floor_kbps);
 }
 
 // ---------------------------------------------------------------------
@@ -810,83 +638,26 @@ pub fn toggle_listen(managed: State<'_, Managed>, room_handle: u32, owner: Strin
 }
 
 /// Set playback volume (0-200%) and mute state for `owner`'s audio.
-///
-/// `stream_id` may be either the audio stream's own id *or* the id of the
-/// video stream the frontend is showing for that sender. `Why accept both:`
-/// audio follows video (see `session.rs`'s `sync_audio_watches`) and is
-/// deliberately never surfaced to a viewer as its own stream, so the View
-/// tab's per-tile volume control only ever knows the *video* stream_id it
-/// rendered the tile from — it has no audio stream_id to pass and shouldn't
-/// need one. Resolving the sibling here keeps that ignorance in the
-/// frontend, where it belongs, instead of leaking the audio stream id back
-/// into a UI whose whole point is that audio isn't a separate thing.
-/// A direct hit on the audio id still works unchanged, for the standalone
-/// audio-only "Listen" case.
-///
-/// `volume_percent` is stored as-is (the slider's *desired* value) even
-/// while `muted` is true — `AudioWatch::volume_percent`'s doc comment
-/// explains why: it lets the eventual unmute (or another window's
-/// `get_volume` query) recover the pre-mute value instead of seeing a
-/// flattened 0. The decoder itself still gets muted immediately.
+/// `stream_id` may be the audio stream's own id or the video stream's id the
+/// frontend is showing for that sender — resolved in the lib, see
+/// `session::RoomSession::set_volume`.
 #[tauri::command]
 pub fn set_volume(managed: State<'_, Managed>, room_handle: u32, owner: String, stream_id: u8, volume_percent: u32, muted: bool) -> Result<(), String> {
     let owner = dto::parse_owner(&owner)?;
-    if let Some(room) = managed.state.lock().unwrap().rooms.get_mut(&RoomHandle(room_handle)) {
-        let audio_stream_id = if room.audio_watches.lock().unwrap().contains_key(&(owner, stream_id)) {
-            Some(stream_id)
-        } else {
-            room.sibling_audio_stream(owner)
-        };
-        if let Some(audio_stream_id) = audio_stream_id
-            && let Some(watch) = room.audio_watches.lock().unwrap().get_mut(&(owner, audio_stream_id))
-        {
-            watch.volume_percent = volume_percent;
-            watch.muted = muted;
-            let effective = if muted { 0.0 } else { volume_percent as f64 / 100.0 };
-            watch.decoder.set_volume(effective);
-        }
-        // Remember this owner's chosen volume independent of the current
-        // audio stream id, so it survives the sender restarting/switching
-        // their audio source (which tears down and recreates the
-        // `AudioWatch` under a fresh `stream_id` — see
-        // `RoomSession::audio_volume_by_owner`'s doc comment).
-        room.audio_volume_by_owner.insert(owner, volume_percent);
-    }
+    managed.state.lock().unwrap().set_volume(RoomHandle(room_handle), owner, stream_id, volume_percent, muted);
     Ok(())
 }
 
 /// Read back `owner`'s current volume/mute state — the counterpart query to
-/// `set_volume`, added (2026-07-29) so a tile's slider can show the real
-/// state instead of a per-window default of 100%/unmuted. `RoomSession::
-/// audio_watches` (mirrored to both the View tab and any pop-out window
-/// through this one command) is the single source of truth both windows
-/// read at the moment they render a tile they haven't seen before in this
-/// window's lifetime — see `frontend/scripts/view.js`'s `ensureVolumeSeeded`
-/// and `viewer.js`'s matching copy.
-///
-/// Resolves `stream_id` the same video-or-audio-id-both-work way
-/// `set_volume` does (see its doc comment). Defaults to 100%/unmuted (the
-/// same default the frontend used before this command existed) when no
-/// audio watch is found yet, e.g. a tile whose audio subscription hasn't
-/// been reconciled by `sync_audio_watches` the instant the tile first
-/// renders.
+/// `set_volume` (see `session::RoomSession::volume`). Two windows (View tab
+/// and any pop-out) read it for a tile they haven't seen before; see
+/// `frontend/scripts/view.js`'s `ensureVolumeSeeded` and `viewer.js`'s
+/// matching copy.
 #[tauri::command]
 pub fn get_volume(managed: State<'_, Managed>, room_handle: u32, owner: String, stream_id: u8) -> Result<dto::VolumeStateDto, String> {
     let owner = dto::parse_owner(&owner)?;
-    let state = managed.state.lock().unwrap();
-    let Some(room) = state.rooms.get(&RoomHandle(room_handle)) else {
-        return Ok(dto::VolumeStateDto { volume_percent: 100, muted: false });
-    };
-    let audio_stream_id =
-        if room.audio_watches.lock().unwrap().contains_key(&(owner, stream_id)) { Some(stream_id) } else { room.sibling_audio_stream(owner) };
-    let Some(audio_stream_id) = audio_stream_id else {
-        return Ok(dto::VolumeStateDto { volume_percent: 100, muted: false });
-    };
-    let watches = room.audio_watches.lock().unwrap();
-    let Some(watch) = watches.get(&(owner, audio_stream_id)) else {
-        return Ok(dto::VolumeStateDto { volume_percent: 100, muted: false });
-    };
-    Ok(dto::VolumeStateDto { volume_percent: watch.volume_percent, muted: watch.muted })
+    let v = managed.state.lock().unwrap().volume(RoomHandle(room_handle), owner, stream_id);
+    Ok(dto::VolumeStateDto { volume_percent: v.volume_percent, muted: v.muted })
 }
 
 // `pop_out_stream` (a native Tauri `WebviewWindowBuilder` second window
