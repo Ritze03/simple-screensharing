@@ -6242,6 +6242,33 @@ pub mod branch {
                 while branch.appsink.try_pull_sample(gst::ClockTime::ZERO).is_some() {}
                 assert!(wait_for_sample(&branch.appsink, Duration::from_secs(5)), "a sibling stopped after a removal");
             }
+
+            // A tier-2 swap (codec + size + rate) on the live GPU tee works too.
+            let runtime = destination::DestinationRuntime::shared(Instant::now(), small_params());
+            runtime.lock().unwrap().note_encoded_frame(true, b"idr", Instant::now());
+            let first = branches.remove(0);
+            let swapped = swap_to_new_branch(
+                &built.pipeline,
+                &built.tee,
+                &runtime,
+                first,
+                BranchId(10),
+                VideoParams {
+                    width: 160,
+                    height: 90,
+                    framerate: 20,
+                    bitrate_kbps: 1000,
+                    backend: EncoderBackend::Vaapi,
+                    codec: VideoCodec::H265,
+                    ..small_params()
+                },
+            )
+            .await;
+            let swapped = match swapped {
+                SwapOutcome::Swapped(branch) => branch,
+                SwapOutcome::KeptOld(_, e) => panic!("the GPU-tee swap should have succeeded: {e:#}"),
+            };
+            assert!(wait_for_sample(&swapped.appsink, Duration::from_secs(5)), "the swapped branch is silent");
             built.pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
         }
 
