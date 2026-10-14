@@ -31,6 +31,18 @@ its "Proposed" tab).
 
 - Left sidebar **272 px**; room header band **56**; People **232 px**; bottom action band
   **56**. The user band (sidebar bottom) and the action band share one top border line.
+- **Connecting vs Reconnecting** (`ui::ConnState`: `Joined`, `Connecting`, `Reconnecting`,
+  `Disconnected`). `Connecting` is a room's *first* connect in flight (sidebar/header pill
+  "Connecting"); `Reconnecting` is only a suspended room (TERMINOLOGY) that the lib is
+  retrying (`AppState::reconnect_info`). Both show the panels and a "stop connecting" Leave.
+  *Why:* the first Connect of a saved room used to read "Reconnecting" (stage-6 QC).
+  A failed Connect (`start_connect` error) raises an error toast and the room's Disconnected
+  view shows an inline warning banner above the empty state, text
+  `ui.room.connect_failed` ("Couldn't connect: <error>"), cleared on the next Connect.
+- **Share labels** are translated at draw time by `ui::share_label(raw)`: the default capture
+  label and the wire default "Screen" (in any locale) render in the current language, other
+  names (audio sources, peer-chosen labels) as is. The lib stores the label translated at
+  creation, so without this a language switch would leave old shares in the old language.
 - The People panel and action bar exist only while the shown room is joined or
   reconnecting (`Cx::shows_room_panels`); a disconnected room, the "Watched streams" view
   and the welcome view have neither.

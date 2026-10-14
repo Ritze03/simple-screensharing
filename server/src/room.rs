@@ -84,7 +84,6 @@ use crate::protocol::{ConnId, RelayToClient, RoomId, StreamId, StreamKind};
 /// Detail tab).
 #[derive(Debug, Clone)]
 pub struct LogEvent {
-    pub at: std::time::SystemTime,
     pub text: String,
 }
 
@@ -108,7 +107,6 @@ impl EventLog {
             self.buf.pop_front();
         }
         self.buf.push_back(LogEvent {
-            at: std::time::SystemTime::now(),
             text: text.into(),
         });
     }
@@ -278,16 +276,14 @@ pub struct StreamState {
 }
 
 pub struct RoomState {
-    pub room_id: RoomId,
     pub connections: HashMap<ConnId, ConnState>,
     pub streams: HashMap<(ConnId, StreamId), StreamState>,
     pub log: EventLog,
 }
 
 impl RoomState {
-    pub fn new(room_id: RoomId) -> Self {
+    pub fn new() -> Self {
         Self {
-            room_id,
             connections: HashMap::new(),
             streams: HashMap::new(),
             log: EventLog::new(200),
@@ -388,7 +384,7 @@ impl Registry {
         let mut rooms = self.rooms.write().await;
         rooms
             .entry(room_id)
-            .or_insert_with(|| Arc::new(Mutex::new(RoomState::new(room_id))))
+            .or_insert_with(|| Arc::new(Mutex::new(RoomState::new())))
             .clone()
     }
 

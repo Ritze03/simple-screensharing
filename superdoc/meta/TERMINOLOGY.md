@@ -11,6 +11,7 @@ amend the entry here.
 ## Terms
 
 - **Suspended room** — a joined room whose connection dropped unexpectedly: its `RoomSession` is gone but a `ReconnectState` (`AppState::reconnects`) keeps its handle, last-known roster and what the user had running (watches, our shares) while the client retries. Not the same as a room the user left. See `architecture/implementation-notes.md` (task #36).
+- **Connecting vs Reconnecting** (UI) — `ui::ConnState::Connecting` is the *first* connect of a room in flight; `Reconnecting` is only a suspended room (above). Different pill text, same panels. `ui/APP-SHELL.md`.
 - **Wanted stream** — a watch carried over a reconnect, identified by owner display name + kind + label (never by `ConnId`/`StreamId`, which change). `session::WantedStream`.
 
 - **Join link** — `server|room-id|key` or `server|room-id|key|certhash`; everything a client needs to enter a room. `protocol-spec.md` §11.4.
