@@ -1,142 +1,110 @@
 ---
 name: run
-description: Launch and drive the real simple-screensharing-client app (Electron shell + built src-tauri sidecar) for verification. Use whenever asked to run, start, or screenshot this app, or to confirm a change works for real — not just against mock data in a browser.
+description: Launch and drive the real simple-screensharing egui client (plus a relay) on this machine for verification. Use whenever asked to run, start, or screenshot this app, or to confirm a change works for real. The widget gallery alone is not proof of app behaviour.
 ---
 
-# Run: simple-screensharing-client
+# Run: simple-screensharing-client (egui)
 
-This is the concrete, tested procedure for launching the **real** app — the Electron shell
-talking to the real, compiled `src-tauri` sidecar over REST+SSE. It replaces ad hoc
-Playwright/Electron harnesses: several agents independently built their own inconsistent
-throwaway version of this before it existed. Use this skill instead of re-deriving it.
+The tested procedure for launching the **real** native app: the egui binary
+`simple-screensharing-client`, talking to a real relay (`simple-screensharing-server`),
+on this machine's MangoWC desktop. The rule and the full machine facts (monitors,
+GUI lock, portal picker, sudo) live in
+`superdoc/claude-instructions/testing-and-verification.md` (force-loaded via the root
+`CLAUDE.md`); read it first. This skill is only the *how*.
 
-See `superdoc/claude-instructions/testing-and-verification.md` (force-loaded, one directory
-up from this repo) for *when* real-app verification is required versus when plain
-browser+mock is legitimate. This skill only covers *how* to launch it.
+## Safety, every time
 
-## Hard safety rule — check every time, no exceptions
+- `mmsg get all-monitors` first; re-check, don't trust remembered numbers. Layout as of
+  2026-10-14: DP-3 (0,1080) the user's terminal, DP-1 (1920,1080) 279.75 Hz, DP-2
+  (3840,1080), **HDMI-A-1 (1920,0) FORBIDDEN** (user's RDP window). Windows only at x
+  1920-5759, y >= 1080.
+- Hold the GUI lock for the whole interactive part: `exec 9>/tmp/claude-1000/sss-gui.lock && flock 9`.
+- Scratch `XDG_CONFIG_HOME` always (else the user's saved rooms auto-connect).
+- Screenshots: `grim -o DP-1 f.png` or `-o DP-2`. Never HDMI-A-1, never `grim` without `-o`.
+- No sudo, ever. No Cargo target dir under `/tmp`.
 
-DP-1, DP-2, and DP-3 are free for testing. **HDMI has the project owner's real, active,
-maximized session on it.** Never let any test window or screen-capture region touch the
-HDMI output.
+## 1. Build both binaries from your own worktree
 
-Before launching anything, run:
-
-```bash
-xrandr --listmonitors
-```
-
-and confirm which output is HDMI and its geometry. Keep every test window and any capture
-region confined to DP-1/DP-2/DP-3. If you're not sure a window landed off HDMI, check again
-before proceeding — don't assume a remembered layout still holds.
-
-**Checking monitor geometry beforehand is not enough by itself** — an incident this session
-had a manually-spawned window (an ad hoc `electron .` + `xwininfo` launch, precisely the
-pattern this skill exists to replace) briefly land at an X-coordinate inside the HDMI range,
-caught and killed within seconds but only because it was noticed. Don't rely on noticing:
-after a window is created, verify **its actual reported position** — e.g. with the Playwright
-`_electron` pattern below, explicitly call `BrowserWindow.setPosition(x, y)` (or equivalent)
-to a known-safe DP-1/2/3 coordinate immediately, then confirm the bounds it reports back are
-what you set — *before* doing anything else with that window (screenshots, interaction,
-capture). Treat "I launched it inside the safe range" and "I confirmed where it actually
-landed" as two separate steps, not one.
-
-## 1. Build the sidecar
-
-Electron spawns the compiled `src-tauri` binary as its backend sidecar. Build it first,
-every time you've changed Rust code (or if you're not sure it's up to date):
+Build what you launch in your own on-disk target dir (a shared target can contain another
+worktree's newer binary, which cargo happily accepts):
 
 ```bash
-cargo build -p simple-screensharing-client-tauri
+export CARGO_TARGET_DIR="$PWD/target"        # from your worktree root, NOT /tmp
+cargo build -p simple-screensharing-client -p simple-screensharing-server
+CLIENT=$CARGO_TARGET_DIR/debug/simple-screensharing-client
+RELAY=$CARGO_TARGET_DIR/debug/simple-screensharing-server
+grep -c '<a string you just added>' "$CLIENT"   # prove it is your build
 ```
 
-## 2. First-time setup: install Electron's node_modules
+Use `--release` for frame-rate / latency checks (a debug build is too slow to judge 240 fps).
 
-`electron/node_modules` is not always present in a given worktree — several agents hit this.
-Check first, install if missing:
+## 2. Widget gallery (widget/token work only)
 
 ```bash
-cd electron
-[ -d node_modules ] || npm install
+"$CLIENT" --gallery      # every widget helper with fake data
 ```
 
-## 3. Launch the real app
+Good for a new row helper or a token tweak; `widgets::set_debug_slots` draws the slot
+overlay. It does not exercise the app: don't report it as app verification.
 
-### Quick manual "just look at it" launch
+## 3. Relay in tmux, scratch cwd
+
+The relay's TUI needs a pty and it keeps cert state in `./state/` of its cwd.
 
 ```bash
-cd electron
-electron .
+S=$(mktemp -d -p "$HOME/.cache" sss-run.XXXX)       # on disk, not /tmp
+mkdir -p "$S/relay" "$S/cfg"
+tmux new-session -d -s sss-relay -c "$S/relay" "$RELAY"     # default port 4433
 ```
 
-This opens the real Electron window against the real sidecar. Use this for a fast visual
-check. **This path does not control where the window lands** — the OS/window manager picks
-its position, which is not guaranteed to be on DP-1/2/3. Prefer the scripted path below,
-which explicitly places and verifies the window's position, whenever you're not physically
-watching the screen as it opens.
+`docs/dev/relay.sh start <relay-bin> <scratch-dir> [port]` is an alternative that also
+prints `PORT=… HASH=<certhash>`. The join link is `server|room-id|key|certhash`; the
+Create modal in the app mints one and "Copy invite link" yields the full form.
 
-### Scripted verification with Playwright's `_electron` driver
-
-**Use Playwright's Node `_electron` API, not the Playwright MCP browser tools.** The MCP
-browser tools attach to a standalone Chrome instance — they cannot drive the real Electron
-renderer at all, and using them against this app silently verifies nothing. This is a real
-trap that has been hit before. The correct driver is `require("playwright")._electron`,
-launched directly against `electron/main.js`, as a plain Node script run with `node`.
-
-Minimal working pattern (adapt selectors/assertions to what you're verifying):
-
-```js
-// verify.js — run with: node verify.js
-const { _electron: electron } = require("playwright");
-const path = require("path");
-
-const ELECTRON_DIR = __dirname; // run this script from inside electron/
-
-(async () => {
-  const electronApp = await electron.launch({
-    args: [path.join(ELECTRON_DIR, "main.js")],
-    cwd: ELECTRON_DIR,
-  });
-
-  const page = await electronApp.firstWindow();
-  page.on("console", (msg) => console.log(`[page-console:${msg.type()}] ${msg.text()}`));
-  page.on("pageerror", (err) => console.log(`[pageerror] ${err.message}`));
-
-  // Safety: force the window onto a known-safe monitor and CONFIRM it landed there —
-  // don't just launch and assume. Re-run `xrandr --listmonitors` first if you haven't
-  // already this session, and use real DP-1/2/3 coordinates, not these placeholders.
-  const bounds = await electronApp.evaluate(({ BrowserWindow }, [x, y]) => {
-    const win = BrowserWindow.getAllWindows()[0];
-    win.setPosition(x, y);
-    return win.getBounds();
-  }, [50, 50]);
-  console.log("[safety] window bounds after placement:", bounds);
-  // bounds.x/bounds.y must be inside DP-1/2/3's range — verify against this run's
-  // `xrandr --listmonitors` output before proceeding. Abort if it isn't.
-
-  await page.waitForSelector("#nav", { timeout: 20000 });
-
-  // ...drive/assert against the real app here (click tabs, check DOM, etc.)...
-
-  await page.screenshot({ path: path.join(ELECTRON_DIR, "verify.png") });
-
-  await electronApp.close();
-})().catch((err) => {
-  console.error("[harness] FAILED:", err);
-  process.exit(1);
-});
-```
-
-Run it from `electron/`:
+## 4. Client with a scratch config on DP-1 / DP-2
 
 ```bash
-cd electron
-node verify.js
+exec 9>/tmp/claude-1000/sss-gui.lock && flock 9
+mmsg get all-monitors                        # confirm layout, HDMI-A-1 at 1920,0
+mmsg dispatch focusmon,DP-1                  # new windows open on the focused monitor
+XDG_CONFIG_HOME="$S/cfg" "$CLIENT" &  CPID=$!
+sleep 3
+mmsg get all-clients                         # find the window; confirm it is on DP-1/DP-2
+# if needed (absolute coordinates; Y >= 1080):
+#   mmsg dispatch togglefloating client,<id>
+#   mmsg dispatch movewin,2000,1200 client,<id>
+#   mmsg dispatch resizewin,1280,800 client,<id>
+grim -o DP-1 "$S/shot.png"                   # then Read the PNG
 ```
 
-`playwright` is already a devDependency of `electron/package.json`, so no extra install is
-needed beyond step 2 above (`npm install` in `electron/`).
+Drive it with `ydotool` (`mousemove --absolute -x X -y <global_y - 1080>`, `click 0xC0`,
+`type`). Verify with a screenshot before clicking; the Y offset is the usual mistake.
 
-Treat this script as throwaway per verification pass — write it fresh (or adapt the pattern
-above) for the specific tabs/state/DOM you need to check, then discard it. Don't check
-one-off verification scripts into the repo.
+Typical flow: Create/Join modal -> join the relay -> a second client (second scratch
+config, same lock session) or the browser viewer to watch -> "Share screen". The portal
+picker then appears: type `dp`, check `~/.local/state/wlr-share-picker/last-choice.json`
+names DP-1/DP-2, press Enter. Never `grim` a full monitor while the picker is open (its
+thumbnails include HDMI); use `grim -g <region>`. Afterwards `pgrep -af wlr-share-picker`
+must be empty.
+
+For video checks the lead keeps a scratch x264 test-pattern sender built on the lib API
+(ask the lead for its current path); `docs/dev/` has the browser-side sender/viewer
+harness (`docs/dev/README.md`).
+
+## 5. Tear down (always)
+
+```bash
+kill "$CPID"; tmux kill-session -t sss-relay
+mmsg dispatch focusmon,DP-3                  # restore focus to the user's terminal
+rm -rf "$S"; rm -rf ~/.local/share/simple-screensharing* 2>/dev/null   # only if YOU created them
+```
+
+Release the GUI lock only after windows are closed and focus is restored. Say in your
+report which processes you started and that you stopped them.
+
+## Tests that need no window
+
+`cargo test -p simple-screensharing-client` (UI shell tests in `client/src/ui/tests.rs`,
+widget tests, the `every_icon_name_used_in_src_is_in_icons` test) and
+`python3 -I client/locales/check_keys.py` (i18n keys). Run these in addition to, never
+instead of, the real launch for anything user-visible.
