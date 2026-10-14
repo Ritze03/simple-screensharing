@@ -1828,6 +1828,8 @@ fn isolate_source_from_branch_renegotiation(tee: &gst::Element, domain: CaptureD
 
 /// Builds the capture pipeline and drives it to `Playing`, waiting for the
 /// state change to actually settle (success or error) before returning.
+/// Production code uses [`start_pipeline_bounded`] (same steps, bounded and
+/// bus-aware); this synchronous form is kept for the tests.
 ///
 /// On any failure (construction or state-change), tears the pipeline back
 /// down to `Null` before returning `Err`, so a failed attempt never leaks a
@@ -1862,28 +1864,184 @@ fn isolate_source_from_branch_renegotiation(tee: &gst::Element, domain: CaptureD
 /// thread pool doesn't fix GStreamer's own timeout unreliability, but it
 /// confines the damage to one throwaway blocking-pool thread instead of
 /// starving the whole app.
+#[cfg(test)]
 fn start_pipeline(source_fragment: &str, domain: CaptureDomain) -> Result<CapturePipeline> {
     let built = build_pipeline_in(source_fragment, domain)?;
+    play_and_wait(&built.pipeline)?;
+    Ok(built)
+}
 
-    if let Err(e) = built.pipeline.set_state(gst::State::Playing) {
-        let _ = built.pipeline.set_state(gst::State::Null);
-        return Err(anyhow!("failed to start capture pipeline: {e}"));
+/// The blocking half of [`start_pipeline`]: `Playing`, then wait for the state
+/// change to settle. On failure the pipeline is back at `Null` and the error
+/// carries the text of the bus error that explains it (see [`start_failure`]).
+fn play_and_wait(pipeline: &gst::Pipeline) -> Result<()> {
+    if let Err(e) = pipeline.set_state(gst::State::Playing) {
+        let detail = take_bus_error(pipeline);
+        let _ = pipeline.set_state(gst::State::Null);
+        return Err(start_failure(format!("failed to start capture pipeline: {e}"), detail));
     }
 
     // Wait for the pipeline to actually get moving (or fail) before telling
     // the room this stream exists — announcing a stream that then
     // immediately errors out would be a confusing "stream with no frames"
     // for other members. `state()` blocks until the async state change
-    // settles (success or error) or the timeout elapses — see this
-    // function's `Why:` note above for why that promise isn't trusted by any
-    // caller.
-    let (state_result, _current, _pending) = built.pipeline.state(gst::ClockTime::from_seconds(5));
+    // settles (success or error) or the timeout elapses — see
+    // [`start_pipeline`]'s `Why:` note for why that promise isn't trusted by
+    // any caller.
+    let (state_result, _current, _pending) = pipeline.state(gst::ClockTime::from_seconds(5));
     if let Err(e) = state_result {
-        let _ = built.pipeline.set_state(gst::State::Null);
-        return Err(anyhow!("capture pipeline failed to reach PLAYING: {e:?}"));
+        let detail = take_bus_error(pipeline);
+        let _ = pipeline.set_state(gst::State::Null);
+        return Err(start_failure(format!("capture pipeline failed to reach PLAYING: {e:?}"), detail));
     }
+    Ok(())
+}
 
-    Ok(built)
+/// How long one capture start attempt may take before it is given up. A
+/// healthy start settles in 100-300 ms (3 s measured under a 36-thread CPU
+/// stress); a dead portal node leaves `pipewiresrc`'s state change blocked for
+/// 30 s (measured, killed xdpw, `Element failed to change its state`).
+const START_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// The same for the CPU fallback attempt after a GPU start failed. Shorter: if
+/// the GPU attempt died because the portal did (xdpw's flap crash reports as
+/// `not-negotiated` without a `target not found`), this attempt can only run
+/// into the timeout, and the user is waiting for it.
+const FALLBACK_START_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Why a capture start failed in a way a second attempt on the same portal
+/// node cannot fix. Carried as the root cause of the error, see
+/// [`start_is_hopeless`].
+#[derive(Debug)]
+struct StartFailed(String);
+
+impl std::fmt::Display for StartFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StartFailed {}
+
+/// Whether `e` is a [`StartFailed`]: the portal's stream is gone or never
+/// answered, so the CPU fallback must not reconnect to the same node.
+fn start_is_hopeless(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| cause.is::<StartFailed>())
+}
+
+/// Text `pipewiresrc` reports (`on_state_changed`, `stream error: ...`) when
+/// the portal node is gone: the xdpw process died or the stream was closed.
+const SOURCE_GONE_TEXT: &str = "target not found";
+
+/// `what` + the bus error `detail`, as a [`StartFailed`] when the detail says
+/// the portal node is gone and as a plain error otherwise.
+fn start_failure(what: String, detail: Option<String>) -> anyhow::Error {
+    match detail {
+        Some(d) if d.contains(SOURCE_GONE_TEXT) => anyhow::Error::new(StartFailed(format!(
+            "the screen-capture portal's stream is gone ({d}); the portal backend most likely exited"
+        ))),
+        Some(d) => anyhow!("{what}: {d}"),
+        None => anyhow!("{what}"),
+    }
+}
+
+/// The first error message on `pipeline`'s bus as `element: error (debug)`,
+/// removing it. Other message types stay queued for the capture-level watcher.
+///
+/// Waits up to 300 ms for it: a failed state change returns before
+/// `pipewiresrc`'s own error message has reached the bus (measured, #59:
+/// `StateChangeError` with an empty bus, the `target not found` arrived
+/// afterwards), and without the reason a dead portal looks like a GPU failure.
+fn take_bus_error(pipeline: &gst::Pipeline) -> Option<String> {
+    let msg = pipeline.bus()?.timed_pop_filtered(gst::ClockTime::from_mseconds(300), &[gst::MessageType::Error])?;
+    Some(describe_bus_error(&msg))
+}
+
+fn describe_bus_error(msg: &gst::Message) -> String {
+    match msg.view() {
+        gst::MessageView::Error(err) => {
+            let src = err.src().map(|s| s.path_string().to_string()).unwrap_or_else(|| "?".to_string());
+            format!("{src}: {}{}", err.error(), err.debug().map(|d| format!(" ({d})")).unwrap_or_default())
+        }
+        _ => String::new(),
+    }
+}
+
+/// [`start_pipeline`] for async callers, bounded by [`START_TIMEOUT`] and
+/// ended early by the first bus error.
+///
+/// `Why (task #59):` the plain blocking start can sit in `pipewiresrc`'s state
+/// change for 30 s when the portal's node dies (xdpw crash: the stock-xdpw
+/// start-up flap, see [`decoupled_source`]), and then the CPU fallback sat in
+/// another 30 s on the same dead node. The UI stayed on "Waiting for the
+/// screen picker" for that long and the log said nothing. The bus carries the
+/// real reason (`stream error: target not found`) almost at once, so the bus
+/// is polled while the state change runs on a blocking thread; the first
+/// error, or the timeout, ends the attempt. The blocked thread is not
+/// abandoned silently: a task waits for it and then sets the pipeline to
+/// `Null`, because the state change holds the pipeline's state lock and a
+/// `set_state(Null)` from here would block behind it.
+async fn start_pipeline_bounded(source_fragment: &str, domain: CaptureDomain, timeout: Duration) -> Result<CapturePipeline> {
+    let fragment = source_fragment.to_string();
+    let built = tokio::task::spawn_blocking(move || build_pipeline_in(&fragment, domain))
+        .await
+        .map_err(|e| anyhow!("capture pipeline build task panicked: {e}"))??;
+    let pipeline = built.pipeline.clone();
+    let bus = pipeline.bus().ok_or_else(|| anyhow!("capture pipeline has no bus"))?;
+    let mut play = tokio::task::spawn_blocking({
+        let pipeline = pipeline.clone();
+        move || play_and_wait(&pipeline)
+    });
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    let mut tick = tokio::time::interval(Duration::from_millis(50));
+    let failure = loop {
+        tokio::select! {
+            result = &mut play => {
+                return match result {
+                    Ok(Ok(())) => Ok(built),
+                    Ok(Err(e)) => Err(e),
+                    Err(e) => Err(anyhow!("capture pipeline startup task panicked: {e}")),
+                };
+            }
+            _ = tick.tick() => {
+                if let Some(msg) = bus.pop_filtered(&[gst::MessageType::Error]) {
+                    break start_failure(
+                        "capture pipeline reported an error while starting".to_string(),
+                        Some(describe_bus_error(&msg)),
+                    );
+                }
+            }
+            _ = &mut deadline => {
+                break anyhow::Error::new(StartFailed(format!(
+                    "the screen capture did not start within {} s (the portal's stream never answered)",
+                    timeout.as_secs()
+                )));
+            }
+        }
+    };
+    tokio::spawn(async move {
+        let _ = play.await;
+        let _ = tokio::task::spawn_blocking(move || pipeline.set_state(gst::State::Null)).await;
+    });
+    Err(failure)
+}
+
+/// Closes the portal session of a capture that never started, without letting
+/// a dead portal block the caller (the D-Bus call is bounded to 3 s).
+async fn close_portal_quietly(source: &CaptureSource) {
+    #[cfg(unix)]
+    match source {
+        CaptureSource::Portal(portal) => match tokio::time::timeout(Duration::from_secs(3), portal.session.close()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("failed to close the portal session of a capture that did not start: {e}"),
+            Err(_) => tracing::warn!("closing the portal session of a capture that did not start timed out"),
+        },
+        #[cfg(any(test, feature = "test-source"))]
+        CaptureSource::TestSource(_) => {}
+    }
+    #[cfg(not(unix))]
+    let _ = source;
 }
 
 // ---------------------------------------------------------------------
@@ -2276,7 +2434,7 @@ async fn start_capture_with_source(framerate: u32, capture_source: CaptureSource
     let framerate = framerate.clamp(MIN_FRAMERATE, MAX_FRAMERATE);
 
     let source_fragment = capture_source.launch_fragment(framerate);
-    // `Why spawn_blocking:` `start_pipeline` synchronously blocks on
+    // `Why spawn_blocking (inside `start_pipeline_bounded`):` the start synchronously blocks on
     // `Element::state()`, whose timeout argument is not reliable under real
     // contention (a capture started immediately after the previous one's
     // portal/pipeline teardown can leave GStreamer's state change stuck for
@@ -2293,17 +2451,28 @@ async fn start_capture_with_source(framerate: u32, capture_source: CaptureSource
     // `Why the GPU domain falls back to the CPU one on a start failure:` the
     // GPU path depends on the driver accepting DMA-BUF from the compositor and
     // on `vapostproc` negotiating with it. If that fails at start the share
-    // must still come up, just slower, instead of failing outright.
+    // must still come up, just slower, instead of failing outright. Not when
+    // the portal's node itself is gone (`start_is_hopeless`), and each attempt
+    // is bounded by `START_TIMEOUT`, so a failed start ends within seconds.
     let domain = CaptureDomain::for_source(&capture_source);
-    let (built, domain) = tokio::task::spawn_blocking(move || match start_pipeline(&source_fragment, domain) {
-        Err(e) if domain == CaptureDomain::Gpu => {
+    let started = match start_pipeline_bounded(&source_fragment, domain, START_TIMEOUT).await {
+        // `Why not when the failure is a [`StartFailed`]`: the portal's node is
+        // gone or silent, a fresh `pipewiresrc` on it would only wait again
+        // (and, if the portal is alive after all, flap it a second time).
+        Err(e) if domain == CaptureDomain::Gpu && !start_is_hopeless(&e) => {
             tracing::warn!("GPU capture path failed to start ({e:#}); falling back to the CPU path");
-            start_pipeline(&source_fragment, CaptureDomain::System).map(|built| (built, CaptureDomain::System))
+            start_pipeline_bounded(&source_fragment, CaptureDomain::System, FALLBACK_START_TIMEOUT).await.map(|built| (built, CaptureDomain::System))
         }
         other => other.map(|built| (built, domain)),
-    })
-    .await
-    .map_err(|e| anyhow!("capture pipeline startup task panicked: {e}"))??;
+    };
+    let (built, domain) = match started {
+        Ok(started) => started,
+        Err(e) => {
+            tracing::error!("screen capture failed to start: {e:#}");
+            close_portal_quietly(&capture_source).await;
+            return Err(e);
+        }
+    };
     tracing::info!("capture started in the {domain:?} domain");
     let CapturePipeline { pipeline, tee, preview_sink, frame_seen } = built;
 
@@ -8049,6 +8218,36 @@ mod tests {
         let desc = gpu_pipeline_description(portal);
         let q = desc.find(PORTAL_QUEUE_NAME).unwrap();
         assert!(q < desc.find("vapostproc").unwrap());
+    }
+
+    /// Task #59: a bus error naming a vanished portal node is a [`StartFailed`]
+    /// (no CPU fallback on the same node); any other start error stays plain.
+    #[test]
+    fn a_vanished_portal_node_is_a_hopeless_start() {
+        let gone = start_failure(
+            "failed to start".to_string(),
+            Some("pipewiresrc0: stream error: target not found".to_string()),
+        );
+        assert!(start_is_hopeless(&gone), "{gone:#}");
+        assert!(format!("{gone:#}").contains("target not found"));
+        let other = start_failure("failed to start".to_string(), Some("vapostproc0: not-negotiated".to_string()));
+        assert!(!start_is_hopeless(&other), "{other:#}");
+        assert!(!start_is_hopeless(&start_failure("failed to start".to_string(), None)));
+    }
+
+    /// Task #59: a start that errors on the bus ends promptly with that error
+    /// instead of waiting out a state change.
+    #[tokio::test]
+    async fn a_failing_source_ends_the_start_promptly_with_its_error() {
+        if gst::init().is_err() {
+            eprintln!("skipping: gstreamer not available in this environment");
+            return;
+        }
+        let started = Instant::now();
+        let result = start_pipeline_bounded("filesrc location=/nonexistent/sss-59", CaptureDomain::System, START_TIMEOUT).await;
+        let err = result.err().expect("a missing file cannot start a capture");
+        assert!(started.elapsed() < Duration::from_secs(3), "took {:?}", started.elapsed());
+        assert!(format!("{err:#}").contains("sss-59"), "{err:#}");
     }
 
     /// Shared by [`pipeline_elements_link_and_produce_encoded_output`] and

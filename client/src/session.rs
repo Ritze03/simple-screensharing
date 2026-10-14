@@ -386,6 +386,18 @@ fn start_error_string(e: &anyhow::Error) -> String {
     if capture::is_picker_cancelled(e) { SHARE_START_CANCELLED.to_string() } else { format!("{e:#}") }
 }
 
+/// Records a share failure for the UI (`AppState::share_error`, which the UI
+/// turns into an error toast) and writes it to the log.
+///
+/// `Why log it too:` the toast is gone after a few seconds and the staged
+/// "Waiting for the screen picker" entry vanishes with it, so a share that
+/// failed to start (task #59: portal died during start-up) left no trace
+/// anywhere a bug report could point at.
+fn note_share_error(slot: &mut Option<String>, error: String) {
+    tracing::warn!("share error: {error}");
+    *slot = Some(error);
+}
+
 /// Audio destinations carry the video params struct inertly — there is no
 /// per-destination audio geometry to describe, and their `runtime` stays
 /// `None` because the video `DestinationState`/stall machinery has no audio
@@ -2416,7 +2428,7 @@ impl AppState {
                         .get(&pending.capture_id)
                         .is_some_and(|c| c.destinations.contains_key(&pending.destination_id));
                     if still_wanted {
-                        self.share_error = Some(e);
+                        note_share_error(&mut self.share_error, e);
                     }
                     self.forget_destination(pending.capture_id, pending.destination_id);
                     self.clear_transfer_marker(pending.capture_id, pending.role);
@@ -2425,7 +2437,7 @@ impl AppState {
                     still_pending.push(pending);
                 }
                 Err(oneshot::error::TryRecvError::Closed) => {
-                    self.share_error = Some(t!("errors.share_start_task_ended").to_string());
+                    note_share_error(&mut self.share_error, t!("errors.share_start_task_ended").to_string());
                     self.forget_destination(pending.capture_id, pending.destination_id);
                     self.clear_transfer_marker(pending.capture_id, pending.role);
                 }
@@ -2584,7 +2596,7 @@ impl AppState {
                     self.framerate = applied.framerate;
                 }
             }
-            Err(e) => self.share_error = Some(format!("{e:#}")),
+            Err(e) => note_share_error(&mut self.share_error, format!("{e:#}")),
         }
     }
 
@@ -2617,7 +2629,7 @@ impl AppState {
             self.retune_source_framerate(capture_id);
         }
         if let Some(e) = error {
-            self.share_error = Some(e);
+            note_share_error(&mut self.share_error, e);
         }
     }
 
@@ -3105,25 +3117,25 @@ impl AppState {
                         // A dismissed picker is the user's own choice, not a
                         // failure: drop the capture, say nothing.
                         if e != SHARE_START_CANCELLED {
-                            self.share_error = Some(e);
+                            note_share_error(&mut self.share_error, e);
                         }
                         to_remove.push(*capture_id);
                     }
                     Err(oneshot::error::TryRecvError::Empty) => {}
                     Err(oneshot::error::TryRecvError::Closed) => {
-                        self.share_error = Some(t!("errors.share_start_task_ended").to_string());
+                        note_share_error(&mut self.share_error, t!("errors.share_start_task_ended").to_string());
                         to_remove.push(*capture_id);
                     }
                 },
                 ShareStatus::Stopping(rx) => match rx.try_recv() {
                     Ok(Ok(())) => to_remove.push(*capture_id),
                     Ok(Err(e)) => {
-                        self.share_error = Some(e);
+                        note_share_error(&mut self.share_error, e);
                         to_remove.push(*capture_id);
                     }
                     Err(oneshot::error::TryRecvError::Empty) => {}
                     Err(oneshot::error::TryRecvError::Closed) => {
-                        self.share_error = Some(t!("errors.share_stop_task_ended").to_string());
+                        note_share_error(&mut self.share_error, t!("errors.share_stop_task_ended").to_string());
                         to_remove.push(*capture_id);
                     }
                 },
@@ -4068,7 +4080,7 @@ impl AppState {
                 && self.captures.get(&for_capture).is_some_and(|c| !c.destinations.is_empty())
                 && let Err(e) = self.start_audio_share_with(handle, for_capture, source)
             {
-                self.share_error = Some(e);
+                note_share_error(&mut self.share_error, e);
             }
         }
     }
