@@ -4,6 +4,5 @@ target/
 client/dist/
 **/logs/
 client/.playwright-mcp/
-.claude/teamlead/.state/
-.claude/teamlead/board.md
 .claude/scheduled_tasks.lock
+.claude/teamlead/
