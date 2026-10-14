@@ -23,12 +23,24 @@ holds the persisted preferences. The plan this stage originally implemented is
 One capture is **one screen grab, one GStreamer pipeline, N destinations**:
 
 ```text
+GPU domain (Linux portal + VA stack, the normal case; 2026-10-14, #39):
+pipewiresrc(DMA-BUF) ! vapostproc(video-direction=auto) ! VAMemory NV12 ! tee
+    ├─ queue ! videorate(1fps)  ! vapostproc ! BGRx ! videoconvert ! RGB ! appsink   (JPEG thumbnails, fixed)
+    ├─ queue ! videorate(12fps) ! vapostproc(320x180) ! BGRx ! videoconvert ! RGB ! appsink   (self-preview, fixed)
+    ├─ queue ! valve[RateCap] ! vapostproc ! VAMemory NV12 ! capssetter(fps) ! va*enc ! appsink   ← destination A (room 1)
+    └─ queue ! valve[RateCap] ! vapostproc ! VAMemory NV12 ! capssetter(fps) ! va*enc ! appsink   ← destination B (room 2)
+
+System domain (Windows, x264enc machines, tests):
 <platform source> ! videoconvert ! capsfilter(format=BGRx) ! tee
     ├─ queue ! videorate(1fps)  ! RGB ! appsink   (JPEG thumbnails, fixed)
     ├─ queue ! videorate(12fps) ! videoscale(320x180) ! RGB ! appsink   (sender self-preview, fixed)
-    ├─ queue ! valve ! videoconvert ! videoscale ! videorate ! caps ! encoder ! appsink   ← destination A (room 1)
-    └─ queue ! valve ! videoconvert ! videoscale ! videorate ! caps ! encoder ! appsink   ← destination B (room 2)
+    ├─ queue ! valve[RateCap] ! videoconvert ! videoscale ! capssetter(fps) ! encoder ! appsink   ← destination A (room 1)
+    └─ queue ! valve[RateCap] ! videoconvert ! videoscale ! capssetter(fps) ! encoder ! appsink   ← destination B (room 2)
 ```
+
+A destination's fps is a **cap** (`branch::RateCap`, a pad probe on its valve), never a floor:
+no branch ever duplicates a frame. Why both the domains and the cap exist, with the
+measurements: "Capture/encode performance" below.
 
 Every destination branch is **dynamic** (`capture::branch::add_branch`), added and removed
 on the live `Playing` pipeline. Each has its own encoder, its own bitrate, its own pause
@@ -384,12 +396,12 @@ nothing else. No stall is raised, because nothing stalls.
 ceiling only a restart could raise. Measured against a real portal capture, it doesn't:
 the source negotiates `framerate=0/1` — variable, damage-driven — and was observed
 delivering ~94 fps under motion and ~30 fps on a static desktop. The selected framerate
-reaches the source as `pipewiresrc`'s `keepalive-time`, which is a *floor for the idle
-case*, not a ceiling. A destination asking for more is served by its own branch's
-`videorate`, which duplicates to fill the gap; two branches off one real portal capture
-were measured holding 31.5 fps and 5.5 fps simultaneously. So nothing is being withheld
-that a source change would unlock, and the ordinary tier-2 branch swap applies the new
-rate.
+reaches the source only as `pipewiresrc`'s `keepalive-time` (since #39 capped at 30 fps, see
+below), which is a *heartbeat for the idle case*, not a ceiling. A destination asking for
+more is served by its own branch's `RateCap`, which passes at most that many real frames
+per second (it never pads); two branches off one real portal capture were measured holding
+31.5 fps and 5.5 fps simultaneously. So nothing is being withheld that a source change
+would unlock, and the ordinary tier-2 branch swap applies the new rate.
 
 Both mechanisms that *could* have changed the live source's rate were measured and
 rejected: a pre-`tee` `videorate`+capsfilter (the original design) **stalls a real portal
@@ -406,6 +418,134 @@ Lowering happens automatically once a change settles (`App::retune_source_framer
 destinations).
 
 ---
+
+## Capture/encode performance: 120-240 fps of *unique* frames (2026-10-14, #39)
+
+**Requirement (owner):** "at least 120 FPS sharing works or even 240 FPS". The viewer's
+decoder and presenter already reached 240; the *unique* frames (real screen content) did
+not. Measured on this machine (AMD RX 7900 XTX, VA-API; capture DP-1 at 279.75 Hz running
+a fullscreen mailbox `vkcube`; 1080p, 8 Mbps; `client/scripts/session.sh`, the
+`stats` tracer, `client/scripts/portal-probe.py`).
+
+### Four root causes, each measured
+
+1. **The portal delivered exactly half the output's rate (140 of 280 fps) because of the
+   PipeWire buffer pool, not the compositor and not the portal's own scheduling.**
+   `xdg-desktop-portal-wlr` negotiates a pool of two buffers by default. Anything that holds
+   one of them back (here: `pipewiresrc`'s `keepalive-time`, which keeps its last buffer so
+   it can resend it; a slow consumer does the same) leaves the portal one buffer to fill
+   while we process the other, so it waits for a release every frame: exactly one frame per
+   two vblanks. `portal-probe.py`, DMA-BUF path, cursor mode and keepalive swept:
+
+   | keepalive-time | min-buffers | portal rate |
+   | --- | --- | --- |
+   | 0 | default | 279 fps |
+   | 33 ms | default | **140 fps** (every cursor mode: hidden, embedded, default) |
+   | 33 ms | 3, 4, 8 | 279 fps |
+
+   Fix: `pipewiresrc min-buffers=6` (`PORTAL_MIN_BUFFERS`). The cursor mode is not a factor
+   (re-checked with `cursor_mode` 1 and 2 at default buffers: still 140). The old
+   `keepalive-time` was `1000 / selected fps` (4 ms at 240), which also fired on every
+   hiccup of a 3.6 ms-cadence source and injected resends that were indistinguishable from
+   real frames ("pipewiresrc 200 fps", of which ~55 unique); it is now capped at a 30 fps
+   heartbeat (`STATIC_KEEPALIVE_FPS`), which is all a static screen needs.
+2. **Shared-memory buffers.** With `pipewiresrc ! videoconvert` the only caps on offer are
+   system memory, so the portal hands out SHM buffers and the compositor must read the whole
+   8 MB frame back to RAM. Any GPU element downstream makes `pipewiresrc` offer DMA-BUF
+   (`AR24` with the AMD tiled modifier); the same portal then delivers 280 fps at a fraction
+   of the CPU cost. This is the **GPU capture domain** (`capture::CaptureDomain::Gpu`):
+   `pipewiresrc ! vapostproc video-direction=auto ! video/x-raw(memory:VAMemory),format=NV12
+   ! tee`. One GPU pass does the BGRx to NV12 conversion *and* the orientation, the PipeWire
+   buffer is released immediately, and the VA encoders take the VAMemory frames with no
+   download. The CPU `videoconvert` BGRx to NV12 it replaces cost ~4.7 ms per frame (a ~210
+   fps ceiling on the thread that also runs the encoder); on the CPU path the branch now
+   measures only ~40 fps with this machine under load (`SSS_CAPTURE_PATH=system`). The
+   System domain remains for Windows and software-encoder machines, and a GPU pipeline that
+   fails to start falls back to it (`start_capture_with_source`).
+3. **`videorate` padding fed on itself.** A branch's `videorate drop-only=false` duplicated
+   frames up to the target fps. When the encoder could not sustain the target (VA H.264
+   ~165 fps, AV1 ~113-215 fps at 1080p) the leaky queue dropped real frames, `videorate`
+   answered each gap with a run of duplicates, the encoder encoded those, and the queue
+   dropped yet more real frames: 3 unique fps inside a "169 fps" stream. Fix: the branch has
+   no `videorate` any more. `branch::RateCap` (a pad probe on the valve's src) admits at most
+   `fps` frames per second and never invents any; a `capssetter` stamps `framerate=N/1` onto
+   the caps for the encoder's rate control (a `0/1` makes `va*enc` assume 30 fps). A slow
+   encoder now just gets fewer, all real, frames.
+   - **Why not `videorate drop-only=true` / `max-rate`:** it keeps an output grid that falls
+     behind real time whenever the branch was blocked (a saturated encoder pushing back, a
+     paused valve), then passes *every* frame until it has caught up. A 30 fps cap on a
+     60 fps source after a 1.5 s block ran at 66, 60, 54 fps in the three half-seconds that
+     followed (`client/scripts/videorate-burst.py` reproduction; pinned in the other direction by
+     `rate_cap_does_not_burst_after_a_gap`). `RateCap` is the same grid plus "a frame more
+     than one period behind resynchronises it".
+   - **Queues drop old, never new, and never the IDR:** the raw queue after the tee is
+     `leaky=downstream` (drops the *oldest* raw frame). The encoded-side appsink used to be
+     `drop=true`, which discards the oldest *access unit* (possibly the IDR a new viewer
+     needs, or a reference frame); it is now `drop=false max-buffers=8`, so a stalled
+     consumer blocks the encoder and the raw queue absorbs it.
+4. **Encoder ceilings** are hardware limits (see the table); the cap just stops them from
+   starving. Observed in the real app (rate control `vbr`, Balanced) with the viewer's VA
+   decoder running on the same GPU: H.264 ~168 fps, AV1 ~186 fps, H.265 holds the full 240.
+   Standalone (no decoder), `vaav1enc` does ~216 at `target-usage=4` but only ~116 at
+   `target-usage=7`: AV1's `QualityLevel::Performance` mapping to `target-usage=7` is
+   *slower*, not faster, on this driver.
+
+### Result (release build, `session.sh`, 30 s windows, receiver on DP-2)
+
+`capture` = `pipewiresrc` out, `into branch` = after the branch's queue (real frames),
+`enc out` = encoder output, all fps; viewer = tooltip "decoded / shown" and dropped.
+
+| codec @ fps | capture | into branch | enc out | viewer decoded/shown | dropped |
+| --- | --- | --- | --- | --- | --- |
+| H.264 @120 | 277 | 274 | 118 (120.0 in every undisturbed 4 s bucket) | 120 / 120 (113, 96 in the first two samples, CPU load) | 0 |
+| H.264 @240 | 279 | 169 | 169 (encoder-bound) | 164-170 | 0 |
+| H.265 @120 | 280 | 279 | 120.0 | 120 / 120 | 0 |
+| H.265 @165 | 279 | 279 | 164.5 | 164-166 / 164-165 | 0 |
+| H.265 @240 | 280 | 280 | **240.0** | 238-240 / 238-240 | 0 |
+| AV1 @120 | 280 | 280 | 120.0 | 120 / 120 | 0 |
+| AV1 @240 | 280 | 186 | 186 (encoder-bound) | 186 / 186 | 0 |
+
+Before (I19): H.264 @240 3 unique fps / 169 "encoder out"; AV1 @240 3 / 183; H.265 @240
+58-90 unique; H.264 @120 56 unique; the portal ceiling 140. After: every number in the
+"into branch" column is real, unique frames. The bitrate shown for H.265 @120 in I19's
+screenshot was 379 kbps (a stream of duplicates); it is now ~8 Mbps of real content.
+
+### Live-verified: rotated outputs (#35)
+
+DP-2 is rotated 180 degrees in MangoWC. The patched portal **does** send the transform:
+`portal-probe.py` prints `image-orientation=rotate-180` from `pipewiresrc`. In the GPU domain
+the source `vapostproc video-direction=auto` follows that tag (it is the orientation
+stage, with no extra pass). Sharing DP-2 for real, the viewer shows the desktop the way the
+screen is laid out (sharer window left, viewer window right, title bars on top);
+sharing DP-1 is unchanged (upright cube). The System domain keeps #35's lazily spliced
+stage.
+
+### "The first capture session in a fresh process is slow": gone with the buffer-pool fix
+
+I19 saw 46-58 fps in the first session of a fresh client, 139-235 in later ones. Reproduced
+on the pre-#39 binary (same scripts, one `session.sh` with two H.264 @120 shares in one
+client process): **first share 55.9 fps at `pipewiresrc`, second share 139.3 fps**, with the
+branch itself at ~56 fps both times (the CPU `videoconvert` ceiling under load). In the
+first share the capture rate is *pinned to the downstream rate* (flat 54-58 for the whole
+30 s), i.e. the portal is being throttled by a consumer that holds buffers, which is the
+2-buffer pool of root cause 1 above; in the second share the pool evidently had more slack.
+The exact reason a fresh process's first share fares worse was not isolated further. What is
+established: with `min-buffers=6` the capture rate is 277-280 fps in **every** first share of
+a fresh process (7 fresh processes, GPU domain) and also 279 fps in the first of three
+shares on the CPU domain, where the branch is still CPU-bound at ~40 fps. VA init, plugin
+warm-up and the portal itself are not it: a fresh `portal-probe.py` process (always a first
+session) gets 140 or 280 fps from its first second, depending only on keepalive and
+`min-buffers`.
+
+### Operating notes
+
+- `SSS_CAPTURE_PATH=system` forces the CPU domain (A/B measurement, or a machine where
+  DMA-BUF into `vapostproc` misbehaves).
+- `client/scripts/portal-probe.py` gained `--src "<pipewiresrc props>"`, `--watch name,name`
+  (per-element buffers/s for named elements in `--tail`) and prints every `image-orientation`
+  tag; `probe-run.sh` forwards them as `SRC_PROPS` / `WATCH`.
+- AV1 reports 1920x1082 in the viewer both before and after: a `vaav1enc` crop quirk, not
+  from this change.
 
 ## Cancelling the screen picker is silent (2026-10-14)
 
@@ -498,23 +638,23 @@ A destination with zero subscribers pauses its own encoder by closing that branc
 `valve` (idle-stream optimization), and resumes when a subscriber returns. Resuming must
 put the viewer back at the **live edge**.
 
-`Why that needs saying:` the branch's `videorate drop-only=false` is what holds the
-destination's configured framerate on a static screen, by duplicating the last frame it
-saw. The `valve` sits directly *upstream* of that `videorate`, so a pause is
+`Why that needs saying (history):` until 2026-10-14 the branch's `videorate drop-only=false`
+held the destination's configured framerate on a static screen by duplicating the last frame
+it saw. The `valve` sat directly *upstream* of that `videorate`, so a pause was
 indistinguishable from a silent source — and with `max-duplication-time=0` (no limit) the
 moment the valve reopened, `videorate` synthesised one duplicate of the frozen pre-pause
 frame for **every frame period of the entire pause** before letting a live frame through.
 Measured on a 35 s pause: ~1000 stale duplicates encoded, encrypted and sent, which the
 viewer's `decode::PacingState` then paced out by their (evenly spaced, entirely valid) PTS
 — a real-time replay of the whole pause showing one frozen image. The user-visible symptom
-was *"resuming streams doesn't work; the streamer always has to restart"*.
-
-The fix is to bound that gap-filling: `BRANCH_MAX_DUPLICATION_TIME_NS` (1 s). The gaps
-duplication legitimately fills are bounded by `pipewiresrc`'s `keepalive-time`, which is
-one frame period, so a second is orders of magnitude of headroom; anything longer is not a
-static screen but a pause or an outage, and the right answer to both is to resume at the
-live edge. Measured after the fix: 136 ms from resubscribe to first decoded frame, after
-both a 35 s and a 120 s pause.
+was *"resuming streams doesn't work; the streamer always has to restart"*. It was first
+bounded with `BRANCH_MAX_DUPLICATION_TIME_NS` (1 s); #39 removed the cause: a branch no
+longer duplicates anything (`branch::RateCap` only drops), so a paused branch simply
+produces nothing and the first live frame after the valve reopens is the live edge, with
+no bound to tune. The `RateCap` grid resynchronises on a gap rather than chasing it (a
+`videorate drop-only` grid does chase it: see the burst measurement in "Capture/encode
+performance"). Measured before the change: 136 ms from resubscribe to first decoded frame,
+after both a 35 s and a 120 s pause.
 
 ---
 
@@ -691,10 +831,11 @@ pipeline, where it stayed pinned at the configured value throughout.
   encoded access unit per frame period of that whole history as fast as the encoder could
   produce them, each of which `destination_pump` then encrypts, fragments and pushes at the
   relay. Fixed with `videorate skip-to-first=true` on every encode branch
-  (`BRANCH_SKIP_TO_FIRST`, `capture.rs`). Note this is **not** what
-  `max-duplication-time` bounds — that governs duplication between two buffers the branch
-  actually received (the pause/resume replay bug it was added for) and was already set to
-  one second while the branch replayed ten.
+  (`BRANCH_SKIP_TO_FIRST`). Note this is **not** what `max-duplication-time` bounded — that
+  governed duplication between two buffers the branch actually received (the pause/resume
+  replay bug it was added for) and was already set to one second while the branch replayed
+  ten. (Since #39 the branch has no `videorate`; `branch::RateCap` anchors its grid at the
+  first admitted frame, which is the same guarantee.)
 
 - **The wire clock broke at the seam.** Because that replacement branch's timeline starts
   back near the capture's start, every buffer it produced mapped to a wire PTS *below* the
