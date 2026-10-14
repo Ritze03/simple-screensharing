@@ -50,6 +50,15 @@ its "Proposed" tab).
   *Why:* redundant controls go first (Stream settings is on the own card, Copy invite
   link in ⋯, the meta counts in People); the primary action keeps its words longest.
   Details in the `action_bar.rs` module doc and `room::show_header`.
+  Body and modal: the stream-settings modal stacks its two columns into one when a
+  column would be narrower than its widest segmented control / Screen readout needs
+  (measured from the current locale's labels, so it is one column at 960 and two at
+  1280+ in en and de); the reconnect banner moves its buttons under the text when the
+  text column beside them would be under 320 px; empty states wrap, centred.
+  *Why measured, not a fixed breakpoint:* German labels run ~20 % longer, so a fixed
+  width either stacks English for nothing or still truncates German. *Why the banner
+  keeps its words:* Retry now is its whole point. Details in `stream_settings.rs`
+  (`column_need`) and `room::reconnect_banner`.
 - **No self-preview** of your own share. *Why:* matches the Electron app's deliberate
   removal (see `superdoc/features/self-preview.md`).
 

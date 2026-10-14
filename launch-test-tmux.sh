@@ -10,7 +10,9 @@
 set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TMUX_SESSION="${TMUX_SESSION:-sssrelay}"
+# Unique per run unless overridden: a shared default ("sssrelay") let two runs
+# collide, and stop-launch.sh finds a run's session via <SCRATCH>/tmux.session.
+TMUX_SESSION="${TMUX_SESSION:-sssrelay-$$-$RANDOM}"
 
 usage() {
   cat <<EOF
@@ -39,7 +41,8 @@ Env var overrides:
   CLIENT_ENV_<N>    extra environment for client N only, e.g.
                     CLIENT_ENV_1="GST_TRACERS=stats GST_DEBUG=GST_TRACER:7 GST_DEBUG_FILE=/x/gst1.log"
   COPY_LINK=1       also copy the join link to the clipboard (off by default)
-  TMUX_SESSION      tmux session name for the relay (default: sssrelay)
+  TMUX_SESSION      tmux session name for the relay (default: unique per run,
+                    sssrelay-<pid>-<random>; recorded in <SCRATCH>/tmux.session)
   ATTACH            1 = attach to the relay session at the end, 0 = don't
                     (default: 1 if stdin is a terminal)
   GUI_LOCK_FILE     if set, hold an exclusive flock on it until this script
@@ -48,9 +51,11 @@ Env var overrides:
   SSS_SKIP_MONITOR_CHECK=1
                     skip the HDMI safety check (non-MangoWC compositors only)
 
-The relay session is '$TMUX_SESSION'; a watchdog session '$TMUX_SESSION-watchdog'
-stops the clients when the relay session ends. Stop everything with:
-  tmux kill-session -t $TMUX_SESSION
+This run's relay session would be '$TMUX_SESSION' (a new name each run unless
+TMUX_SESSION is set); a watchdog session '$TMUX_SESSION-watchdog' stops the
+clients when the relay session ends. Stop everything with:
+  tmux kill-session -t =$TMUX_SESSION
+or client/scripts/stop-launch.sh <SCRATCH> (reads <SCRATCH>/tmux.session).
 Logs: <SCRATCH>/client<N>.log; relay state + certificate: <SCRATCH>/relay/.
 EOF
 }
@@ -73,26 +78,28 @@ sss_check_monitors "${MONS[@]}" || exit 1
 sss_take_gui_lock
 sss_build
 sss_make_scratch
+echo "$TMUX_SESSION" >"$SCRATCH/tmux.session"
 
 log "starting the relay in tmux session '$TMUX_SESSION' on UDP port $PORT ..."
 # fd 9 closed so the tmux server (which outlives us) never holds the GUI lock.
 tmux new-session -d -s "$TMUX_SESSION" -c "$SCRATCH/relay" "exec '$RELAY_BIN' '$PORT'" 9>&-
-sss_wait_for_cert || { tmux kill-session -t "$TMUX_SESSION" 2>/dev/null; die "relay did not write its certificate in 10 s (tmux session killed)."; }
+sss_wait_for_cert || { tmux kill-session -t "=$TMUX_SESSION" 2>/dev/null; die "relay did not write its certificate in 10 s (tmux session killed)."; }
 sss_make_join_string
 
-sss_spawn_clients || { sss_kill_clients; tmux kill-session -t "$TMUX_SESSION" 2>/dev/null; die "client launch failed; everything stopped."; }
+sss_spawn_clients || { sss_kill_clients; tmux kill-session -t "=$TMUX_SESSION" 2>/dev/null; die "client launch failed; everything stopped."; }
 
 # Watchdog: its own detached tmux session so it survives this script. When the
 # relay session ends, kill the client process groups listed in client.pids.
 WATCHDOG="$TMUX_SESSION-watchdog"
-tmux kill-session -t "$WATCHDOG" 2>/dev/null || true
+tmux kill-session -t "=$WATCHDOG" 2>/dev/null || true
 tmux new-session -d -s "$WATCHDOG" "while tmux has-session -t '=$TMUX_SESSION' 2>/dev/null; do sleep 2; done; for p in \$(cat '$SCRATCH/client.pids'); do kill -TERM -- -\$p 2>/dev/null; done; sleep 1; for p in \$(cat '$SCRATCH/client.pids'); do kill -KILL -- -\$p 2>/dev/null; done" 9>&-
 
 sss_print_summary
-log "relay TUI: tmux attach -t $TMUX_SESSION   (Ctrl-B then D to detach)"
-log "stop everything: tmux kill-session -t $TMUX_SESSION   (the watchdog then stops the clients)"
+log "tmux session: $TMUX_SESSION (recorded in $SCRATCH/tmux.session)"
+log "relay TUI: tmux attach -t =$TMUX_SESSION   (Ctrl-B then D to detach)"
+log "stop everything: tmux kill-session -t =$TMUX_SESSION   (the watchdog then stops the clients)"
 
 if [[ "${ATTACH:-}" == 1 || ( -z "${ATTACH:-}" && -t 0 ) ]]; then
   exec 9>&-    # release the GUI lock (if any) before blocking in the attach
-  tmux attach -t "$TMUX_SESSION"
+  tmux attach -t "=$TMUX_SESSION"
 fi

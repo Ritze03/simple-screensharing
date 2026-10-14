@@ -76,6 +76,9 @@ const MIN_TILE_W: f32 = theme::GRID_PITCH - theme::GRID_GAP;
 const TITLE_NAME_MIN: f32 = 140.0;
 /// Empty-state action row width (`.empty hbox·actions`).
 const EMPTY_ACTIONS_W: f32 = 320.0;
+/// Reconnect banner: below this text-column width the buttons move under the
+/// text (see [`reconnect_banner`]).
+const BANNER_TEXT_MIN: f32 = 320.0;
 
 // ---------------------------------------------------------------------------
 // Pure layout math (tested)
@@ -477,15 +480,26 @@ fn reconnect_details(info: &ReconnectState, now: std::time::Instant) -> (String,
 /// once the lib has a reconnect entry, a dim status line (attempt, countdown,
 /// room full) and a last-error line. Returns the clicked button.
 /// `Why` not `widgets::banner`: it has one action and this needs two.
+///
+/// Narrow (the text column beside the buttons would be under
+/// [`BANNER_TEXT_MIN`]; German at a 960 px window ran to ~9 lines next to
+/// "Jetzt erneut versuchen"): the buttons move under the text, right-aligned,
+/// keeping their words: `[18 icon][fill text]` over `[fill][Retry][Cancel]`.
+/// `Why` not icon-only: Retry is the banner's whole point, and no icon says
+/// "retry *now*" unambiguously next to the sync icon.
 fn reconnect_banner(ui: &mut Ui, info: Option<&ReconnectState>) -> Option<usize> {
     let text = tr("ui.room.reconnecting_banner", "Reconnecting to this room. Your shares here are paused until it's back.");
     let details = info.map(|i| reconnect_details(i, std::time::Instant::now()));
     let retry_l = tr("ui.room.retry", "Retry now");
     let cancel_l = tr("ui.room.cancel", "Cancel");
     let btns = [Btn::secondary(&retry_l), Btn::secondary(&cancel_l)];
+    let bw = [btns[0].width(ui), btns[1].width(ui)];
     // The text wraps (German runs ~20 % longer); the banner grows to fit it.
     let pad = vec2(theme::S3 + 1.0, theme::S2 + 1.0);
-    let text_w = ui.available_width() - 2.0 * pad.x - theme::ICON - btns.iter().map(|b| b.width(ui) + theme::S2).sum::<f32>() - theme::S2;
+    let inner_w = ui.available_width() - 2.0 * pad.x;
+    let beside_w = inner_w - theme::ICON - bw.iter().map(|w| w + theme::S2).sum::<f32>() - theme::S2;
+    let stacked = beside_w < BANNER_TEXT_MIN;
+    let text_w = if stacked { inner_w - theme::ICON - theme::S2 } else { beside_w };
     let mut job = egui::text::LayoutJob::single_section(
         text.clone(),
         egui::TextFormat { font_id: font(Weight::Regular, theme::FS_SMALL), color: theme::WARNING, line_height: Some(16.0), ..Default::default() },
@@ -499,19 +513,38 @@ fn reconnect_banner(ui: &mut Ui, info: Option<&ReconnectState>) -> Option<usize>
     }
     job.wrap.max_width = text_w.max(40.0);
     let galley = ui.painter().layout_job(job);
-    let inner_h = galley.size().y.max(theme::CTL_H);
+    let text_h = galley.size().y;
+    let inner_h = if stacked { text_h.max(theme::ICON) + theme::S2 + theme::CTL_H } else { text_h.max(theme::CTL_H) };
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), inner_h + 2.0 * pad.y), Sense::hover());
     let r = CornerRadius::same(theme::ROUNDING_MD);
     widgets::paint_hatch(ui.painter(), rect, r, 6.0, theme::HATCH_AMBER_SOFT_A, theme::HATCH_AMBER_SOFT_B);
     ui.painter().rect_stroke(rect, r, Stroke::new(1.0_f32, theme::HATCH_AMBER_BORDER), StrokeKind::Inside);
     let inner = rect.shrink2(pad);
+    let mut clicked = None;
+    if stacked {
+        let mut child = ui.new_child(UiBuilder::new().max_rect(inner).layout(Layout::top_down(Align::Min)));
+        child.spacing_mut().item_spacing.y = theme::S2;
+        let top = HBox::new("hbox·banner_text", text_h.max(theme::ICON)).slots(&[fixed(theme::ICON), FILL]).show(&mut child);
+        // The icon sits on the first line (16 px line box), not centred on the block.
+        let ic = top.cell(0);
+        widgets::paint_icon(&child, Rect::from_min_size(ic.min, vec2(ic.width(), 16.0)), "sync_problem", theme::ICON, theme::WARNING);
+        let tc = top.cell(1);
+        child.painter().with_clip_rect(tc.intersect(child.clip_rect())).galley(tc.min, galley, theme::WARNING);
+        let row = HBox::new("hbox·banner_btns", theme::CTL_H).slots(&[FILL, fixed(bw[0]), fixed(bw[1])]).show(&mut child);
+        for (i, b) in btns.iter().enumerate() {
+            let w = row.cell(i + 1).width();
+            if row.show(&mut child, i + 1, Align::Min, |ui| b.show_sized(ui, w)).clicked() {
+                clicked = Some(i);
+            }
+        }
+        return clicked;
+    }
     let mut child = ui.new_child(UiBuilder::new().max_rect(inner).layout(Layout::left_to_right(Align::Center)));
-    let slots = [fixed(theme::ICON), FILL, fixed(btns[0].width(ui)), fixed(btns[1].width(ui))];
+    let slots = [fixed(theme::ICON), FILL, fixed(bw[0]), fixed(bw[1])];
     let row = HBox::new("hbox·banner", inner_h).slots(&slots).show(&mut child);
     row.icon(&child, 0, "sync_problem", theme::ICON, theme::WARNING);
     let tc = row.cell(1);
     child.painter().with_clip_rect(tc.intersect(child.clip_rect())).galley(pos2(tc.left(), tc.center().y - galley.size().y / 2.0), galley, theme::WARNING);
-    let mut clicked = None;
     for (i, b) in btns.iter().enumerate() {
         let w = row.cell(i + 2).width();
         if row.show(&mut child, i + 2, Align::Min, |ui| b.show_sized(ui, w)).clicked() {
@@ -523,25 +556,43 @@ fn reconnect_banner(ui: &mut Ui, info: Option<&ReconnectState>) -> Option<usize>
 
 /// `vbox·empty` (dashed card, pad 24, gap 8, centred): icon 26, bold title,
 /// optional dim line, optional 320 px equal-width button row. Returns the
-/// clicked button.
+/// clicked button. Title and line wrap with every row centred (German at a
+/// 960 px window: "Geteilte Bildschirme kommen zurück, sobald sich der Raum
+/// wieder verbindet." is longer than the card); the card grows to fit.
 fn empty_state(ui: &mut Ui, icon: &str, title: &str, text: Option<&str>, btns: &[Btn]) -> Option<usize> {
     const LINE: f32 = 18.0;
+    let wrap_w = (ui.available_width() - 48.0).max(40.0);
+    let centred = |t: &str, f: egui::FontId, color: Color32| {
+        let fmt = egui::TextFormat { font_id: f, color, line_height: Some(LINE), ..Default::default() };
+        let mut job = egui::text::LayoutJob::single_section(t.to_owned(), fmt);
+        job.wrap.max_width = wrap_w;
+        job.halign = Align::Center;
+        ui.painter().layout_job(job)
+    };
+    let title_g = centred(title, font(Weight::Bold, 13.5), theme::TEXT);
+    let text_g = text.map(|t| centred(t, font(Weight::Regular, theme::FS_LABEL), theme::TEXT_DIM));
+    let title_h = title_g.size().y.max(LINE);
+    let text_h = text_g.as_ref().map_or(0.0, |g| theme::S2 + g.size().y.max(LINE));
     let btn_h = btns.iter().map(|b| b.height()).fold(0.0, f32::max);
-    let h = 24.0 + 26.0 + theme::S2 + LINE + text.map_or(0.0, |_| theme::S2 + LINE) + if btns.is_empty() { 0.0 } else { 2.0 * theme::S2 + btn_h } + 24.0;
+    let h = 24.0 + 26.0 + theme::S2 + title_h + text_h + if btns.is_empty() { 0.0 } else { 2.0 * theme::S2 + btn_h } + 24.0;
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
     let r = CornerRadius::same(theme::ROUNDING_WELL);
     widgets::paint_dashed_rect(ui.painter(), rect.shrink(0.5), r, Stroke::new(1.0_f32, theme::BORDER), 4.0, 3.0);
     let inner = rect.shrink(24.0);
     let mut y = inner.top();
-    let line = |y: f32, h: f32| Rect::from_x_y_ranges(inner.x_range(), y..=y + h);
-    widgets::paint_icon(ui, line(y, 26.0), icon, 26.0, theme::TEXT_FAINT);
+    widgets::paint_icon(ui, Rect::from_x_y_ranges(inner.x_range(), y..=y + 26.0), icon, 26.0, theme::TEXT_FAINT);
     y += 26.0 + theme::S2;
-    paint_text(ui, line(y, LINE), title, font(Weight::Bold, 13.5), theme::TEXT, Align::Center);
-    y += LINE;
-    if let Some(t) = text {
+    // A centre-aligned galley's rows are laid out around x = 0: paint it at
+    // the centre line.
+    let mid = inner.center().x;
+    let painter = ui.painter().with_clip_rect(inner.intersect(ui.clip_rect()));
+    painter.galley(pos2(mid, y), title_g, theme::TEXT);
+    y += title_h;
+    if let Some(g) = text_g {
         y += theme::S2;
-        paint_text(ui, line(y, LINE), t, font(Weight::Regular, theme::FS_LABEL), theme::TEXT_DIM, Align::Center);
-        y += LINE;
+        let gh = g.size().y.max(LINE);
+        painter.galley(pos2(mid, y), g, theme::TEXT_DIM);
+        y += gh;
     }
     if btns.is_empty() {
         return None;
