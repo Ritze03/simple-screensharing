@@ -12,6 +12,14 @@ identical for both; §11 specifies the accept layer (ALPN dispatch, URL path, pi
 self-signed certificate) and the one wire constraint it adds (the 1000-byte datagram cap,
 §6.3).
 
+**Single source of truth in code.** The wire types, header layouts, constants and cert-hash
+encoding are defined once, in the shared crate `protocol/` (`simple-screensharing-protocol`);
+`client/src/protocol.rs` and `server/src/protocol.rs` only re-export it. Its
+`wire_bytes_unchanged` test pins the postcard bytes of every enum variant, so changing this
+spec's wire format means changing that crate and that test deliberately. `Why:` the relay,
+the native client and the coming browser client must change in lockstep (one repo), and two
+independently derived copies (the old layout) could silently drift.
+
 Conventions used throughout:
 
 - All multi-byte integers in **fixed binary headers** (media datagrams, preview streams)
@@ -34,7 +42,7 @@ primitives:
 | --- | --- | --- | --- | --- |
 | **Control** | one **bidirectional** stream (opened by client on connect) | reliable, ordered | both | JOIN/LEAVE/SUBSCRIBE/presence/subscriber-count/keyframe-request (§4) |
 | **Preview** | short-lived **unidirectional** streams (one per preview blob) | reliable, ordered | sender→relay, relay→member | ~30 s encrypted JPEG snapshots (§7) |
-| **Media** | **datagrams** (unreliable) | drop-and-continue, no retransmit | sender→relay, relay→subscriber | fragmented encrypted H.264 / Opus frames (§6) |
+| **Media** | **datagrams** (unreliable) | drop-and-continue, no retransmit | sender→relay, relay→subscriber | fragmented encrypted video (H.264 / H.265 / AV1) and Opus frames (§6) |
 
 **Stream-type discriminator.** Every *unidirectional* stream begins with a 1-byte
 `StreamType` so the receiver knows what it is:
@@ -293,7 +301,7 @@ The preview path uses the same AAD construction with its own `version`/`stream_i
 
 ### 6.1 Encrypt-once-then-fragment
 
-A whole media frame (one H.264 access unit, or one Opus packet) is **encrypted with a
+A whole media frame (one H.264 / H.265 access unit, one AV1 temporal unit, or one Opus packet) is **encrypted with a
 single AEAD operation** (§5.3), consuming **one** counter value, producing
 `ciphertext_with_tag`. **Only then** is that byte blob split into datagram-sized
 fragments. Encryption is per *frame*, never per *fragment*.
@@ -307,7 +315,7 @@ big-endian.
  offset  size  field           type   notes
  ------  ----  --------------  -----   -----------------------------------------
    0      1    version         u8     = 0x01 for this spec (also AAD byte 0)
-   1      1    flags           u8     bit0 = keyframe (H.264 IDR); bit1 = stalled (advisory,
+   1      1    flags           u8     bit0 = keyframe (IDR/IRAP, or AV1 key frame); bit1 = stalled (advisory,
                                       see below); bits2-7 reserved=0
    2      8    conn_id         u64    source ConnId = nonce prefix (bytes 0..8 of nonce)
   10      1    stream_id       u8     which of the sender's streams (also AAD byte 1)
@@ -378,8 +386,17 @@ The plaintext that gets encrypted is:
 ```
  offset  size  field   notes
    0      8    pts     u64, big-endian, capture timestamp in microseconds
-   8    ...    codec   raw H.264 access-unit bytes, or one Opus packet
+   8    ...    codec   one video access unit (H.264 / H.265 Annex-B, or AV1 OBUs), or one Opus packet
 ```
+
+**Video codecs: H.264, H.265 and AV1, with no codec tag on the wire.** The receiver works the
+codec out from the bitstream: it waits for a keyframe access unit carrying parameter sets and
+sniffs it (Annex-B start codes with H.264 vs H.265 parameter-set NAL headers, which are
+disjoint, versus an AV1 OBU sequence header; `client/src/decode/codec.rs::sniff`). A later
+keyframe that sniffs differently rebuilds the decoder. `Why no tag (decision D5):` a tag in the
+header would change the protocol and the relay for no gain, and a tag can go stale when a
+sender edits a destination to another codec mid-stream while the bitstream cannot. The relay
+never looks at the payload, so it needed no change for H.265/AV1.
 
 **Why an 8-byte PTS inside the ciphertext:** it gives receivers an A/V-sync timestamp
 (the verify note flagged its absence) while keeping it authenticated by the GCM tag and
@@ -487,8 +504,8 @@ subscriptions), it updates `streams[(owner, stream_id)].subscribers` and then si
 - **`KeyframeRequest { stream_id }`** on **every subscribe that adds a new subscriber** —
   both the `0 → 1` transition *and* a new viewer joining an already-watched stream.
 
-**Why keyframe on every new subscriber, not only `0 → 1`:** H.264 decoding must begin at
-an IDR. A viewer who subscribes mid-GOP to an already-watched stream has no IDR reference
+**Why keyframe on every new subscriber, not only `0 → 1`:** video decoding (any of the three codecs) must begin at
+a keyframe. A viewer who subscribes mid-GOP to an already-watched stream has no IDR reference
 and would see nothing/garbage until the next scheduled 2 s keyframe — a bad experience
 right after a preview enticed them to click. Forcing an immediate IDR on each new
 subscriber fixes this; the cost is one larger frame, shared to all current subscribers,
