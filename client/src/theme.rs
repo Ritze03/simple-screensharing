@@ -1,188 +1,520 @@
-//! Central egui theme: named color tokens, spacing/rounding constants, and
-//! widget helpers (cards, buttons, checkboxes/radios, two-column control
-//! rows), so `ui.rs` never hard-codes a raw `Color32` or hand-rolls a card
-//! frame at a call site. See `superdoc/ui/STYLING-GUIDE.md` for the rules
-//! this module exists to satisfy — this is that guide's `theme.rs` target.
+//! Central egui theme: the design tokens (colors, sizes, spacing, radii, type scale),
+//! the global `egui::Style`, the embedded fonts, and the icon font lookup.
 //!
-//! Every color is referenced by *role* (`ACCENT`, `DANGER`, …), not by where
-//! it happens to be used, so a future re-theme or accent-color change is a
-//! one-file edit instead of a grep-and-replace across the UI.
+//! **Source of truth for every value here:** the approved "Proposed" room-centric mockup
+//! (`:root` block of its CSS), whose colors are lifted from the Electron app's
+//! `client/frontend/styles/tokens.css`. Each constant names its CSS variable so the two
+//! can be diffed. Reference colors by *role* (`ACCENT`, `TEXT_DIM`, …), never by raw hex
+//! at a call site.
+//!
+//! The widgets that turn these tokens into rows, cards and controls live in
+//! `crate::widgets` (see its module doc for the slot layout model). This module has no
+//! widgets of its own except the **legacy** section at the bottom, which only exists so
+//! the old `ui.rs` keeps compiling unchanged until it is rebuilt on `widgets`.
+//!
+//! Entry points:
+//! - [`apply`] — new design: fonts + visuals + spacing. Call once (the `--gallery` screen
+//!   and every new screen use this).
+//! - [`install`] — legacy: what the old `ui.rs` calls; visuals only, old spacing, no fonts.
+//!
+//! The app is dark-only: the Electron app never had a light theme (`color-scheme: dark`).
 
-use egui::{Color32, CornerRadius, RichText, Stroke, Ui, Vec2, Widget};
+#![allow(dead_code)] // design tokens: not every token has a caller until the new screens land
+
+use egui::{Color32, CornerRadius, FontFamily, FontId, RichText, Stroke, Ui, Vec2, Widget};
 
 // ---------------------------------------------------------------------------
-// Color tokens
+// Color tokens (mockup `:root` / tokens.css)
 // ---------------------------------------------------------------------------
 
-/// Brand accent — section titles, primary buttons, slider defaults,
-/// selection tint, and (deliberately) non-destructive informational
-/// highlights like the "popped out" stream tag: it's the same "this is the
-/// thing to notice" role in every case, just applied to different content.
-///
-/// *Why this value (2026-07-26 redesign pass):* the original `0x5B8BF0` read
-/// as flat and low-saturation for the Discord/Slack-style look this app is
-/// moving toward (see `superdoc/brainstorm/ui-redesign-multiroom-streaming.md`'s
-/// UX/Design-lens critique). `0x4C6EF5` sits in the same saturated
-/// blue-violet neighborhood as reference points like Discord's blurple
-/// without copying that exact brand color — same character, this app's own
-/// hue.
+/// `--accent` — brand accent: section labels, primary buttons, selection, focus.
 pub const ACCENT: Color32 = Color32::from_rgb(0x4C, 0x6E, 0xF5);
-/// Base-tier panel / window background — the middle of three elevation
-/// tiers (`PANEL_SUNKEN` < `PANEL_BASE` < `PANEL_RAISED`), used for the
-/// general app/window background level. See "Elevation tiers" below.
-pub const PANEL_BASE: Color32 = Color32::from_rgb(0x1E, 0x1F, 0x22);
-/// Recessed-tier surface — sits visually *below* `PANEL_BASE`: sidebar
-/// recesses, scroll wells, and the letterboxed background behind a
-/// chrome-free video tile (see `media_frame`). See "Elevation tiers" below.
-pub const PANEL_SUNKEN: Color32 = Color32::from_rgb(0x17, 0x18, 0x1B);
-/// Raised-tier surface — sits visually *above* `PANEL_BASE`: cards and
-/// other content that should read as floating above the base background.
-/// `card()` fills with this tier. See "Elevation tiers" below.
-pub const PANEL_RAISED: Color32 = Color32::from_rgb(0x27, 0x28, 0x2D);
-/// Deprecated alias for `PANEL_BASE`, kept only so any external reference
-/// written against the pre-elevation single-tier palette keeps compiling.
-/// Prefer `PANEL_BASE` (or `PANEL_SUNKEN`/`PANEL_RAISED`) in new code — see
-/// "Elevation tiers" below for which tier to reach for.
-#[deprecated(note = "use PANEL_BASE, PANEL_SUNKEN, or PANEL_RAISED instead")]
-pub const PANEL: Color32 = PANEL_BASE;
-/// Hairline borders and dividers. Still useful alongside the elevation
-/// tiers above (e.g. a hairline between two same-tier surfaces), but no
-/// longer the *only* depth cue — most surface-to-surface contrast should
-/// come from picking a different `PANEL_*` tier first.
-pub const BORDER: Color32 = Color32::from_rgb(0x3A, 0x3B, 0x40);
-/// Primary text.
+/// Top stop of `--accent-gradient` (primary buttons, active segment) and of
+/// `--accent-mark-gradient`.
+pub const ACCENT_LIGHT: Color32 = Color32::from_rgb(0x5C, 0x7B, 0xF7);
+/// `#2b3ea8` — dark end of `--accent-mark-gradient` and the slider fill's start.
+pub const ACCENT_DEEP: Color32 = Color32::from_rgb(0x2B, 0x3E, 0xA8);
+/// `--pill-accent-bg-lighter` — text of in-progress pills, "watching" eye icons.
+pub const ACCENT_LIGHTER: Color32 = Color32::from_rgb(0x8E, 0xA3, 0xF9);
+
+/// `--panel-sunken` — recessed surfaces: right People panel, action bar, dest rows.
+pub const PANEL_SUNKEN: Color32 = Color32::from_rgb(0x16, 0x17, 0x1A);
+/// `--panel-base` — the central panel and modal background.
+pub const PANEL_BASE: Color32 = Color32::from_rgb(0x1B, 0x1C, 0x1F);
+/// `--panel-raised` — cards, share cards, popups.
+pub const PANEL_RAISED: Color32 = Color32::from_rgb(0x24, 0x25, 0x2A);
+/// `--sidebar-rail` — the left sidebar background (deepest surface).
+pub const SIDEBAR_RAIL: Color32 = Color32::from_rgb(0x10, 0x11, 0x14);
+/// `--tile-bg` — video tile / thumbnail backdrop.
+pub const TILE_BG: Color32 = Color32::from_rgb(0x10, 0x11, 0x14);
+/// `--elevation-1b` — segmented-control track, slider track, row hover.
+pub const ELEV_1B: Color32 = Color32::from_rgb(0x1B, 0x1C, 0x1F);
+/// `--elevation-16` — sidebar wells.
+pub const ELEV_16: Color32 = Color32::from_rgb(0x16, 0x17, 0x1A);
+/// `#191a1e` — light stripe of `--screen-hatch`.
+pub const ELEV_19: Color32 = Color32::from_rgb(0x19, 0x1A, 0x1E);
+/// `--elevation-14` — the sidebar's user band; dark stripe of `--screen-hatch`.
+pub const ELEV_14: Color32 = Color32::from_rgb(0x14, 0x15, 0x18);
+/// `--wash-hover-1` — hover wash for buttons, checkboxes, segments, members.
+pub const WASH_HOVER_1: Color32 = Color32::from_rgb(0x24, 0x25, 0x2A);
+/// `--wash-hover-2` — hover wash for popup items.
+pub const WASH_HOVER_2: Color32 = Color32::from_rgb(0x26, 0x27, 0x2C);
+
+/// `--border` — card / panel edge on a raised surface, inputs.
+pub const BORDER: Color32 = Color32::from_rgb(0x34, 0x35, 0x3B);
+/// `--divider` — rules inside a panel: band borders, modal head/foot, separators.
+pub const DIVIDER: Color32 = Color32::from_rgb(0x2A, 0x2B, 0x30);
+/// `--inset-border` — edge of a sunken inset (segmented track, slider track, dest row).
+pub const INSET_BORDER: Color32 = Color32::from_rgb(0x26, 0x27, 0x2C);
+/// `--well-border` — sidebar well edge and the section-heading rule.
+pub const WELL_BORDER: Color32 = Color32::from_rgb(0x1F, 0x20, 0x24);
+
+/// `--text` — primary text.
 pub const TEXT: Color32 = Color32::from_rgb(0xE8, 0xE9, 0xEC);
-/// Secondary text.
+/// `--text-dim` — secondary text, idle icons, readouts.
 pub const TEXT_DIM: Color32 = Color32::from_rgb(0xA8, 0xAA, 0xB2);
-/// Tertiary text — hints, placeholders, "offline"/disabled labels.
+/// `--text-faint` — tertiary text: counts, units, hints, tooltip ⓘ.
 pub const TEXT_FAINT: Color32 = Color32::from_rgb(0x6E, 0x70, 0x78);
-/// Input and code-block backgrounds.
-pub const FIELD: Color32 = Color32::from_rgb(0x28, 0x29, 0x2D);
-/// Secondary button fill.
-pub const BTN: Color32 = Color32::from_rgb(0x2C, 0x2D, 0x32);
-/// Secondary button border.
-pub const BTN_BORDER: Color32 = Color32::from_rgb(0x44, 0x45, 0x4C);
-/// Text drawn on top of an accent-filled primary button.
+/// `--primary-text` — text on accent / danger-solid fills.
 pub const PRIMARY_TEXT: Color32 = Color32::from_rgb(0x0B, 0x0C, 0x10);
-/// Destructive-action red — danger button text/border, error messages.
+
+/// `--field` — input, select and value-box background.
+pub const FIELD: Color32 = Color32::from_rgb(0x28, 0x29, 0x2D);
+/// `--btn` — secondary button fill.
+pub const BTN: Color32 = Color32::from_rgb(0x2C, 0x2D, 0x32);
+/// `--btn-border` — secondary button border, checkbox outline, meter bars (off).
+pub const BTN_BORDER: Color32 = Color32::from_rgb(0x44, 0x45, 0x4C);
+
+/// `--danger` — destructive actions, errors.
 pub const DANGER: Color32 = Color32::from_rgb(0xE0, 0x5A, 0x5A);
-/// Positive/active-state green — streaming indicator dot, "Saved.",
-/// "Viewing"/"Listening" tags.
-///
-/// *Why a new token:* STYLING-GUIDE.md's base palette and its "Severity
-/// colors" section only cover *bad*-state colors (deriving from
-/// `DANGER`/`ACCENT`); it has no equivalent role for a *good*-state
-/// indicator, which this app needs in several places. Adding one named
-/// constant here (rather than a scattered raw green literal) keeps the
-/// "reference by role" rule intact — see this file's note added to
-/// STYLING-GUIDE.md itself.
+/// `--success` — live / connected.
 pub const SUCCESS: Color32 = Color32::from_rgb(0x50, 0xC8, 0x78);
-/// Caution/attention amber — distinct from both `DANGER` (red) and
-/// `SUCCESS` (green): overshoot/approaching-a-limit states that are worth
-/// noticing but aren't failures. First consumer: the bandwidth-overshoot
-/// warning banner (`superdoc/brainstorm/ui-redesign-multiroom-streaming.md`),
-/// added here ahead of that banner landing so the token exists when it's
-/// needed. Follows the same "one named `pub const`, reference by role"
-/// pattern `DANGER`/`SUCCESS` already use — no separate derived
-/// background/border constants, since neither of those has any either
-/// (call sites route through `tint()` as needed).
+/// `--warning` — reconnecting / degraded / over budget.
 pub const WARNING: Color32 = Color32::from_rgb(0xE8, 0xA3, 0x3D);
 
-/// Standard gap between stacked cards / side-by-side columns, and each
-/// card's own inner margin — one number, used everywhere, per
-/// STYLING-GUIDE.md's "Consistent spacing".
-pub const SPACING: f32 = 7.0;
-/// Standard corner rounding for cards, buttons, and media tiles — the
-/// larger of two rounding tiers.
-///
-/// *Why 14, not 8:* the original `8` read as too subtle for the
-/// Discord/Slack-style "chunky" feel this app is moving toward (see
-/// `superdoc/brainstorm/ui-redesign-multiroom-streaming.md`'s UX/Design-lens
-/// critique, which called for 12-16px). Landed in the middle of that range.
-pub const ROUNDING: u8 = 14;
-/// Smaller rounding tier for compact, dense elements — sidebar list rows,
-/// pills — where the full `ROUNDING` would look oversized relative to the
-/// element's own height. Matches the previous single-tier `ROUNDING` value,
-/// so anything already tuned against the old `8` (e.g. compact row mockups)
-/// stays visually consistent.
-pub const ROUNDING_SM: u8 = 8;
-/// Fixed width reserved for a control row's trailing value spinner/preview
-/// (see STYLING-GUIDE.md's "Reserved value-width"), sized to the widest
-/// value this app's rows ever show (e.g. `"40000 kbps"`, `"240 fps"`).
-pub const VALUE_W: f32 = 64.0;
-/// Height of a nav-rail pill (`nav_button`) — deliberately much taller than
-/// a form button's default `interact_size.y`, see that function's docs.
-pub const NAV_BUTTON_HEIGHT: f32 = 38.0;
-/// Explicit height for the three `styled_button` variants (`primary_button`,
-/// `secondary_button`, `danger_button`).
-///
-/// *Why this exists:* left to egui's own default, a `Button`'s height is
-/// `ui.spacing().interact_size.y` (18px) — barely taller than one line of
-/// text with only `button_padding.y` (1px) of slack on each side. Two
-/// problems follow: (1) `corner_radius(ROUNDING)` (14) then exceeds half that
-/// height, so egui clamps the requested corner radius down to fit, and the
-/// button never reaches the full pill shape `ROUNDING` was chosen for; (2)
-/// with almost no vertical slack between the text's own line height and the
-/// button's, a sub-pixel rounding difference between the two reads as
-/// visibly off-center text (see the "Reconnect" button in a saved-but-
-/// disconnected ROOMS row) instead of vanishing into unnoticeable padding.
-/// Setting an explicit height comfortably above both the text's line height
-/// and `2 * ROUNDING` (so the pill's rounded ends are never clamped) gives
-/// `AtomLayout`'s own centering real room to work with, the same way
-/// `nav_button`'s explicit `NAV_BUTTON_HEIGHT` already does.
-pub const FORM_BUTTON_HEIGHT: f32 = 30.0;
-/// Diameter of a `status_dot`. Small enough to read as an indicator rather
-/// than a bullet, large enough to still read at a glance in a dense list.
-pub const DOT_SIZE: f32 = 9.0;
-/// Max content width for a single-column, capped-width settings-style panel
-/// (see STYLING-GUIDE.md's "Layout options for a settings-style view").
-pub const PANEL_MAX_WIDTH: f32 = 520.0;
+const fn rgba(r: u8, g: u8, b: u8, a: f32) -> Color32 {
+    Color32::from_rgba_unmultiplied_const(r, g, b, (a * 255.0 + 0.5) as u8)
+}
 
-/// Blend `base` toward transparent for a translucent fill/stroke (hover
-/// washes, selection tints, …) through `egui::Rgba`'s gamma-correct
-/// conversion, rather than calling `Color32::from_rgba_unmultiplied`
-/// directly at the call site.
-///
-/// *Why:* between egui 0.29 and 0.33, `from_rgba_unmultiplied`'s blend
-/// semantics changed from gamma-correct to a naive per-channel multiply, so
-/// a translucent tint tuned by eye against one behavior can go nearly
-/// invisible under the other. Routing every translucent color through this
-/// one helper makes a future egui upgrade a one-place fix instead of a
-/// UI-wide "why did the tints get fainter" hunt. See
-/// STYLING-GUIDE.md's "egui version footguns".
+/// `--pill-live-bg` / `--pill-live-border`.
+pub const PILL_LIVE_BG: Color32 = rgba(80, 200, 120, 0.12);
+pub const PILL_LIVE_BORDER: Color32 = rgba(80, 200, 120, 0.3);
+/// `--pill-progress-bg` / `--pill-progress-border`.
+pub const PILL_PROGRESS_BG: Color32 = rgba(76, 110, 245, 0.14);
+pub const PILL_PROGRESS_BORDER: Color32 = rgba(76, 110, 245, 0.4);
+/// `--hatch-amber-border` and the two stripe pairs (`--hatch-amber-gradient` for
+/// pills, `--hatch-amber-gradient-soft` for banners).
+pub const HATCH_AMBER_BORDER: Color32 = rgba(232, 163, 61, 0.4);
+pub const HATCH_AMBER_STRONG: Color32 = rgba(232, 163, 61, 0.16);
+pub const HATCH_AMBER_WEAK: Color32 = rgba(232, 163, 61, 0.05);
+pub const HATCH_AMBER_SOFT_A: Color32 = rgba(232, 163, 61, 0.10);
+pub const HATCH_AMBER_SOFT_B: Color32 = rgba(232, 163, 61, 0.04);
+/// `--accent-row-selected` / `--accent-ring-inset` — selected sidebar row.
+pub const ACCENT_ROW_SELECTED: Color32 = rgba(76, 110, 245, 0.16);
+pub const ACCENT_RING: Color32 = rgba(76, 110, 245, 0.28);
+/// `--accent-ghost-*` — dashed "add something" buttons.
+pub const ACCENT_GHOST_BG: Color32 = rgba(76, 110, 245, 0.07);
+pub const ACCENT_GHOST_BG_HOVER: Color32 = rgba(76, 110, 245, 0.14);
+pub const ACCENT_GHOST_BORDER: Color32 = rgba(76, 110, 245, 0.4);
+/// `--accent-chip-*` — the "this room" dest row, info banner.
+pub const ACCENT_CHIP_BG: Color32 = rgba(76, 110, 245, 0.1);
+pub const ACCENT_CHIP_BORDER: Color32 = rgba(76, 110, 245, 0.45);
+/// `--danger-tint` / `--danger-border`.
+pub const DANGER_TINT: Color32 = rgba(224, 90, 90, 0.12);
+pub const DANGER_BORDER: Color32 = rgba(224, 90, 90, 0.5);
+/// `--scrim` — modal backdrop.
+pub const SCRIM: Color32 = rgba(6, 7, 9, 0.66);
+/// `--accent-glow` color (`0 3px 14px`), under primary buttons.
+pub const ACCENT_GLOW: Color32 = rgba(76, 110, 245, 0.35);
+/// `--success-glow` color (`0 0 6px`), around live dots.
+pub const SUCCESS_GLOW: Color32 = rgba(80, 200, 120, 0.8);
+/// `.chip-dark` fill (`rgba(0,0,0,.66)`) — chips over video.
+pub const CHIP_DARK: Color32 = rgba(0, 0, 0, 0.66);
+
+/// Debug-overlay colors (`--ov-*` in the mockup): vbox, hbox, fixed slot, fill slot.
+pub const OV_VBOX: Color32 = rgba(110, 140, 255, 0.85);
+pub const OV_HBOX: Color32 = rgba(232, 163, 61, 0.85);
+pub const OV_SLOT: Color32 = rgba(80, 200, 120, 0.9);
+pub const OV_FILL: Color32 = rgba(200, 200, 210, 0.45);
+
+/// Avatar gradients (`.avatar`, `.avatar.c1`…`.c4`, all `140deg`): `[from, to]`.
+/// Index 0 is the accent mark gradient (used for "you").
+pub const AVATAR_GRADIENTS: [[Color32; 2]; 5] = [
+    [ACCENT_LIGHT, ACCENT_DEEP],
+    [Color32::from_rgb(0xE0, 0x7B, 0x5A), Color32::from_rgb(0xA3, 0x3F, 0x3F)],
+    [Color32::from_rgb(0x50, 0xC8, 0x78), Color32::from_rgb(0x2F, 0x7A, 0x55)],
+    [Color32::from_rgb(0xC5, 0x8A, 0xF9), Color32::from_rgb(0x6B, 0x3F, 0xA8)],
+    [Color32::from_rgb(0xE8, 0xC3, 0x3D), Color32::from_rgb(0x9A, 0x74, 0x20)],
+];
+
+// ---------------------------------------------------------------------------
+// Size / spacing / radius tokens (mockup `--s*`, `--*-h`, `--rounding*`)
+// ---------------------------------------------------------------------------
+
+/// `--s1..--s4` — the only gaps: item spacing, paddings. (`--s0` = 0.)
+pub const S1: f32 = 4.0;
+pub const S2: f32 = 8.0;
+pub const S3: f32 = 12.0;
+pub const S4: f32 = 16.0;
+
+/// `--band-h` — every horizontal band: brand, room header, user band, action bar,
+/// modal head.
+pub const BAND_H: f32 = 56.0;
+/// `--ctl-h` — every button, field, select, segmented control, value box, control row.
+pub const CTL_H: f32 = 32.0;
+/// `--ctl-h-lg` — buttons in the bottom bar and in modal footers.
+pub const CTL_H_LG: f32 = 36.0;
+/// `--pill-h` — status pills (badges). Large pills (`.badge.lg`) are [`PILL_H_LG`].
+pub const PILL_H: f32 = 18.0;
+/// `.badge.lg` height (bottom bar status, modal head "Applying").
+pub const PILL_H_LG: f32 = 22.0;
+/// `--row-h` — room row, person row, popup item.
+pub const ROW_H: f32 = 32.0;
+/// `--subrow-h` — sharer line under a room.
+pub const SUBROW_H: f32 = 24.0;
+/// `.destrow` height.
+pub const DEST_ROW_H: f32 = 40.0;
+/// `.pi.two` — popup item with a sub line.
+pub const POP_ITEM_TWO_H: f32 = 44.0;
+/// `.modal-foot` height.
+pub const MODAL_FOOT_H: f32 = 64.0;
+/// Section heading height (`.section-label`).
+pub const HEADING_H: f32 = 16.0;
+/// Label slot of a control row (`LABEL_W` in the mockup).
+pub const LABEL_W: f32 = 120.0;
+/// Value slot of a control row (`VALUE_W` in the mockup) — fits "40000" / "4000 ms".
+pub const VALUE_W: f32 = 72.0;
+/// Fixed width of the left sidebar (`.p-side`).
+pub const SIDEBAR_W: f32 = 272.0;
+/// Fixed width of the right People panel (`.p-right`).
+pub const PEOPLE_W: f32 = 232.0;
+/// Card/tile grid column pitch: `cols = clamp(floor((avail + 12) / 272), 1, 4)`.
+pub const GRID_PITCH: f32 = 272.0;
+/// Card/tile grid gap (`g3`).
+pub const GRID_GAP: f32 = S3;
+/// Max card/tile grid columns.
+pub const GRID_MAX_COLS: usize = 4;
+/// Default icon size (`.ms`), and the icon slot width used by rows.
+pub const ICON: f32 = 18.0;
+/// Icon size inside buttons (`.btn .ms`).
+pub const ICON_BTN: f32 = 17.0;
+/// Status dot diameter (`.sdot`).
+pub const DOT_SIZE: f32 = 9.0;
+/// Checkbox / radio mark size (`.cbx .box`).
+pub const MARK: f32 = 18.0;
+/// Avatar diameters (`.avatar`, `.avatar.sm`).
+pub const AVATAR: f32 = 32.0;
+pub const AVATAR_SM: f32 = 22.0;
+/// Modal widths (`.modal`, `.wide`, `.xwide`); all are capped at window − 48.
+pub const MODAL_W: f32 = 520.0;
+pub const MODAL_W_WIDE: f32 = 640.0;
+pub const MODAL_W_XWIDE: f32 = 1120.0;
+
+/// `--rounding` — modals (and the legacy card).
+pub const ROUNDING: u8 = 14;
+/// `--rounding-well` — sidebar wells, cards (`.gcard`, `.scard` use 12).
+pub const ROUNDING_WELL: u8 = 12;
+/// `--rounding-md` — buttons, segmented track, banners, insets.
+pub const ROUNDING_MD: u8 = 9;
+/// `--rounding-sm` — rows, fields, icon buttons.
+pub const ROUNDING_SM: u8 = 8;
+/// Small inner radius: segments, value boxes, sub rows, checkbox hover wash, tiles.
+pub const ROUNDING_XS: u8 = 6;
+
+// ---------------------------------------------------------------------------
+// Type scale (mockup font sizes, px == egui points at 1x)
+// ---------------------------------------------------------------------------
+
+/// Font weights available. Geist ships Regular + Bold; GeistMono only Regular (the
+/// mockup's mono text is never bold).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Weight {
+    Regular,
+    Bold,
+    Mono,
+}
+
+/// Body text (`body`, 14) — rarely used directly; rows use [`FS_ROW`].
+pub const FS_BODY: f32 = 14.0;
+/// Room row / person row name, field text (13).
+pub const FS_ROW: f32 = 13.0;
+/// Control-row labels, checkbox labels, dest rows, popup items, banners' big text (12.5).
+pub const FS_LABEL: f32 = 12.5;
+/// Buttons (12, bold), sharer rows, meta, value boxes (mono), banner text.
+pub const FS_SMALL: f32 = 12.0;
+/// Sub lines (11): user status, popup sub, counts (`.num`, mono).
+pub const FS_TINY: f32 = 11.0;
+/// Units (`.unit`, mono 10.5).
+pub const FS_UNIT: f32 = 10.5;
+/// Section label (`.section-label`, 10 bold, uppercase, `0.11em` tracking).
+pub const FS_SECTION: f32 = 10.0;
+/// Pills (`.badge`, 9.5 bold, uppercase, `0.05em` tracking).
+pub const FS_PILL: f32 = 9.5;
+/// Room header title (`h2`, 18 bold).
+pub const FS_H2: f32 = 18.0;
+/// Modal title / brand (`h3`, 15 bold).
+pub const FS_H3: f32 = 15.0;
+
+/// Name of the bold Geist family (`FontFamily::Name`).
+pub const FAMILY_BOLD: &str = "geist-bold";
+/// Name of the Material Symbols family (`FontFamily::Name`).
+pub const FAMILY_ICONS: &str = "material-symbols";
+
+/// A `FontId` for `weight` at `size` points.
+pub fn font(weight: Weight, size: f32) -> FontId {
+    match weight {
+        Weight::Regular => FontId::new(size, FontFamily::Proportional),
+        Weight::Bold => FontId::new(size, FontFamily::Name(FAMILY_BOLD.into())),
+        Weight::Mono => FontId::new(size, FontFamily::Monospace),
+    }
+}
+
+/// The icon font at `size` points.
+pub fn icon_font(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(FAMILY_ICONS.into()))
+}
+
+// ---------------------------------------------------------------------------
+// Fonts
+// ---------------------------------------------------------------------------
+
+static GEIST_REGULAR: &[u8] = include_bytes!("../assets/fonts/Geist-Regular.ttf");
+static GEIST_BOLD: &[u8] = include_bytes!("../assets/fonts/Geist-Bold.ttf");
+static GEIST_MONO: &[u8] = include_bytes!("../assets/fonts/GeistMono-Regular.ttf");
+static MATERIAL_SYMBOLS: &[u8] = include_bytes!("../assets/fonts/MaterialSymbolsOutlined.ttf");
+
+/// Font definitions for the new design: Geist as the proportional face, Geist Mono as
+/// monospace, a named bold family, and a named icon family. egui's bundled fonts stay
+/// as fallbacks (emoji, rare symbols); the icon font is the last fallback of every
+/// text family, so an icon glyph inside ordinary text still renders instead of tofu.
+pub fn font_definitions() -> egui::FontDefinitions {
+    use egui::FontData;
+    use std::sync::Arc;
+
+    let mut defs = egui::FontDefinitions::default();
+    let egui_prop = defs.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
+    let egui_mono = defs.families.get(&FontFamily::Monospace).cloned().unwrap_or_default();
+
+    defs.font_data.insert("geist".into(), Arc::new(FontData::from_static(GEIST_REGULAR)));
+    defs.font_data.insert("geist-bold".into(), Arc::new(FontData::from_static(GEIST_BOLD)));
+    defs.font_data.insert("geist-mono".into(), Arc::new(FontData::from_static(GEIST_MONO)));
+    // Material Symbols: em is 960 units but its ascent+descent span 1152, so egui's
+    // line box is taller than the glyph. The tweak re-centres the glyph's ink on the
+    // line box's centre, so painting an icon galley centred in a rect centres the icon
+    // (verified on screen in the gallery; see `widgets::icon_in`).
+    defs.font_data.insert(
+        "material-symbols".into(),
+        Arc::new(
+            FontData::from_static(MATERIAL_SYMBOLS).tweak(egui::FontTweak { y_offset_factor: ICON_Y_OFFSET_FACTOR, ..Default::default() }),
+        ),
+    );
+
+    let with = |first: &[&str], rest: &[String]| -> Vec<String> {
+        let mut v: Vec<String> = first.iter().map(|s| s.to_string()).collect();
+        v.extend(rest.iter().cloned());
+        v.push("material-symbols".into());
+        v
+    };
+    defs.families.insert(FontFamily::Proportional, with(&["geist"], &egui_prop));
+    defs.families.insert(FontFamily::Monospace, with(&["geist-mono", "geist"], &egui_mono));
+    defs.families.insert(FontFamily::Name(FAMILY_BOLD.into()), with(&["geist-bold", "geist"], &egui_prop));
+    defs.families.insert(FontFamily::Name(FAMILY_ICONS.into()), vec!["material-symbols".into()]);
+    defs
+}
+
+/// Vertical nudge for the icon font, as a fraction of its size (see `font_definitions`).
+const ICON_Y_OFFSET_FACTOR: f32 = 0.0;
+
+// ---------------------------------------------------------------------------
+// Icons
+// ---------------------------------------------------------------------------
+
+/// Material Symbols Outlined icons available through [`icon`], by ligature name, sorted.
+/// egui has no ligature shaping, so each name maps to its private-use codepoint. To add
+/// one: `python3 -I client/assets/fonts/icon-codepoints.py <name>` and paste the line.
+pub const ICONS: &[(&str, char)] = &[
+    ("add", '\u{e145}'),
+    ("add_to_queue", '\u{e05c}'),
+    ("arrow_drop_down", '\u{e5c5}'),
+    ("cast", '\u{e307}'),
+    ("check", '\u{e5ca}'),
+    ("check_circle", '\u{e86c}'),
+    ("chevron_left", '\u{e408}'),
+    ("chevron_right", '\u{e409}'),
+    ("close", '\u{e14c}'),
+    ("cloud_off", '\u{e2c1}'),
+    ("content_copy", '\u{e14d}'),
+    ("crop_square", '\u{e3c1}'),
+    ("delete", '\u{e872}'),
+    ("desktop_windows", '\u{e30c}'),
+    ("edit", '\u{e150}'),
+    ("error", '\u{e000}'),
+    ("expand_less", '\u{e5ce}'),
+    ("expand_more", '\u{e5cf}'),
+    ("forum", '\u{e0bf}'),
+    ("fullscreen", '\u{e5d0}'),
+    ("fullscreen_exit", '\u{e5d1}'),
+    ("grid_view", '\u{e9b0}'),
+    ("info", '\u{e88e}'),
+    ("link", '\u{e157}'),
+    ("login", '\u{ea77}'),
+    ("logout", '\u{e9ba}'),
+    ("meeting_room", '\u{eb4f}'),
+    ("mic", '\u{e029}'),
+    ("more_horiz", '\u{e5d3}'),
+    ("move_down", '\u{eb61}'),
+    ("music_note", '\u{e3a1}'),
+    ("open_in_new", '\u{e895}'),
+    ("pause", '\u{e034}'),
+    ("person", '\u{e7fd}'),
+    ("play_arrow", '\u{e037}'),
+    ("radio_button_checked", '\u{e837}'),
+    ("radio_button_unchecked", '\u{e836}'),
+    ("refresh", '\u{e5d5}'),
+    ("restart_alt", '\u{f053}'),
+    ("screen_share", '\u{e0e2}'),
+    ("settings", '\u{e8b8}'),
+    ("speaker", '\u{e32d}'),
+    ("stop_screen_share", '\u{e0e3}'),
+    ("swap_horiz", '\u{e8d4}'),
+    ("sync", '\u{e627}'),
+    ("sync_problem", '\u{e629}'),
+    ("tune", '\u{e429}'),
+    ("tv_off", '\u{e647}'),
+    ("visibility", '\u{e417}'),
+    ("visibility_off", '\u{e8f5}'),
+    ("volume_off", '\u{e04f}'),
+    ("volume_up", '\u{e050}'),
+    ("warning", '\u{e002}'),
+    ("web", '\u{e051}'),
+];
+
+/// The glyph for a Material Symbols icon name (e.g. `icon("settings")`), as a `String`
+/// to paint with [`icon_font`]. An unknown name is a programming error: it panics in
+/// debug builds (caught by `every_icon_name_resolves`-style tests) and renders the
+/// "error" icon in release builds rather than tofu.
+pub fn icon(name: &str) -> String {
+    icon_char(name).to_string()
+}
+
+/// Like [`icon`], as a `char`.
+pub fn icon_char(name: &str) -> char {
+    match ICONS.binary_search_by(|(n, _)| n.cmp(&name)) {
+        Ok(i) => ICONS[i].1,
+        Err(_) => {
+            debug_assert!(false, "unknown icon {name:?}; add it to theme::ICONS");
+            '\u{e000}'
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Global style (new design)
+// ---------------------------------------------------------------------------
+
+/// Install the new design on `ctx`: fonts, visuals, type scale and spacing. Call once
+/// at startup (before the first frame that draws). Idempotent.
+pub fn apply(ctx: &egui::Context) {
+    ctx.set_fonts(font_definitions());
+
+    let mut v = egui::Visuals::dark();
+    v.override_text_color = Some(TEXT);
+    v.panel_fill = PANEL_BASE;
+    v.window_fill = PANEL_BASE;
+    v.window_stroke = Stroke::new(1.0_f32, BORDER);
+    v.window_corner_radius = CornerRadius::same(ROUNDING);
+    v.window_shadow = egui::Shadow { offset: [0, 26], blur: 70, spread: 0, color: rgba(0, 0, 0, 0.7) };
+    v.popup_shadow = egui::Shadow { offset: [0, 14], blur: 40, spread: 0, color: rgba(0, 0, 0, 0.6) };
+    v.menu_corner_radius = CornerRadius::same(10);
+    v.extreme_bg_color = FIELD;
+    v.text_edit_bg_color = Some(FIELD);
+    v.faint_bg_color = ELEV_16;
+    v.code_bg_color = FIELD;
+    v.hyperlink_color = ACCENT;
+    v.warn_fg_color = WARNING;
+    v.error_fg_color = DANGER;
+    v.selection.bg_fill = rgba(76, 110, 245, 0.45);
+    v.selection.stroke = Stroke::new(1.0_f32, ACCENT);
+
+    let r = CornerRadius::same(ROUNDING_SM);
+    let w = &mut v.widgets;
+    for (wv, fill, stroke, fg) in [
+        (&mut w.noninteractive, PANEL_BASE, BORDER, TEXT_DIM),
+        (&mut w.inactive, BTN, BTN_BORDER, TEXT),
+        (&mut w.hovered, WASH_HOVER_1, BTN_BORDER, TEXT),
+        (&mut w.active, WASH_HOVER_2, ACCENT, TEXT),
+        (&mut w.open, FIELD, BORDER, TEXT),
+    ] {
+        wv.bg_fill = fill;
+        wv.weak_bg_fill = fill;
+        wv.bg_stroke = Stroke::new(1.0_f32, stroke);
+        wv.fg_stroke = Stroke::new(1.0_f32, fg);
+        wv.corner_radius = r;
+        wv.expansion = 0.0;
+    }
+    ctx.set_visuals(v);
+
+    ctx.style_mut(|s| {
+        use egui::TextStyle;
+        s.text_styles = [
+            (TextStyle::Heading, font(Weight::Bold, FS_H2)),
+            (TextStyle::Body, font(Weight::Regular, FS_ROW)),
+            (TextStyle::Button, font(Weight::Bold, FS_SMALL)),
+            (TextStyle::Small, font(Weight::Regular, FS_TINY)),
+            (TextStyle::Monospace, font(Weight::Mono, FS_SMALL)),
+        ]
+        .into();
+        s.spacing.item_spacing = Vec2::new(S2, S2);
+        s.spacing.button_padding = Vec2::new(S3, 0.0);
+        s.spacing.interact_size = Vec2::new(40.0, CTL_H);
+        s.spacing.menu_margin = egui::Margin::same(6);
+        s.spacing.window_margin = egui::Margin::ZERO;
+        s.spacing.icon_width = MARK;
+        s.spacing.icon_spacing = S2;
+        // Labels in this design are never selectable text: selectable labels sense
+        // clicks and would steal them from the clickable rows they sit in.
+        s.interaction.selectable_labels = false;
+    });
+}
+
+// ===========================================================================
+// Legacy — only for the old `ui.rs`. Do NOT use in new code (use `crate::widgets`).
+// Kept verbatim in behavior so the old UI renders as before; colors now come from the
+// shared tokens above (the base/raised/border greys moved by 1–3 levels to the
+// Electron values, everything else is identical).
+// ===========================================================================
+
+/// Legacy: blend `base` toward transparent through gamma-correct `Rgba` (old UI only).
 pub fn tint(base: Color32, alpha: u8) -> Color32 {
     let a = alpha as f32 / 255.0;
     let linear = egui::Rgba::from(base);
     Color32::from(egui::Rgba::from_rgba_premultiplied(linear.r() * a, linear.g() * a, linear.b() * a, a))
 }
 
-// ---------------------------------------------------------------------------
-// Global style
-// ---------------------------------------------------------------------------
+/// Legacy: the old UI's single spacing step (new code uses `S1..S4`).
+pub const SPACING: f32 = 7.0;
+/// Legacy: nav-rail pill height.
+pub const NAV_BUTTON_HEIGHT: f32 = 38.0;
+/// Legacy: old form-button height.
+pub const FORM_BUTTON_HEIGHT: f32 = 30.0;
+/// Legacy: capped settings-panel width.
+pub const PANEL_MAX_WIDTH: f32 = 520.0;
+/// Legacy: old value-spinner width (new rows use [`VALUE_W`]).
+const LEGACY_VALUE_W: f32 = 64.0;
 
-/// Push this theme's tokens into egui's *own* baseline visuals, once per
-/// process (`ui.rs` calls this on its first frame).
-///
-/// `Why` this exists on top of the per-widget helpers: the helpers only cover
-/// the widgets this app builds through them. Everything egui draws for itself
-/// — combo-box popups, scroll bars, tooltips, text-edit fields, modal
-/// backdrops — otherwise keeps egui's stock dark palette, which is a
-/// *different* dark grey than `PANEL_*` and reads as an unstyled patch sitting
-/// on top of a themed app. Setting the baseline once is what makes the whole
-/// window belong to one palette instead of two.
+/// Legacy: the old UI's global visuals (no fonts, 7 px spacing). Called by `ui.rs`.
 pub fn install(ctx: &egui::Context) {
     let mut visuals = egui::Visuals::dark();
     visuals.panel_fill = PANEL_BASE;
     visuals.window_fill = PANEL_RAISED;
-    visuals.window_stroke = Stroke::new(1.0, BORDER);
+    visuals.window_stroke = Stroke::new(1.0_f32, BORDER);
     visuals.window_corner_radius = CornerRadius::same(ROUNDING);
     visuals.extreme_bg_color = FIELD;
     visuals.faint_bg_color = PANEL_SUNKEN;
     visuals.override_text_color = Some(TEXT);
     visuals.hyperlink_color = ACCENT;
     visuals.selection.bg_fill = tint(ACCENT, 120);
-    visuals.selection.stroke = Stroke::new(1.0, TEXT);
-
+    visuals.selection.stroke = Stroke::new(1.0_f32, TEXT);
     for widget in [
         &mut visuals.widgets.noninteractive,
         &mut visuals.widgets.inactive,
@@ -191,52 +523,34 @@ pub fn install(ctx: &egui::Context) {
         &mut visuals.widgets.open,
     ] {
         widget.corner_radius = CornerRadius::same(ROUNDING_SM);
-        widget.bg_stroke = Stroke::new(1.0, BORDER);
+        widget.bg_stroke = Stroke::new(1.0_f32, BORDER);
     }
     visuals.widgets.noninteractive.bg_fill = PANEL_BASE;
     visuals.widgets.inactive.bg_fill = BTN;
     visuals.widgets.inactive.weak_bg_fill = BTN;
     visuals.widgets.hovered.bg_fill = tint(ACCENT, 60);
     visuals.widgets.hovered.weak_bg_fill = tint(ACCENT, 60);
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, BTN_BORDER);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, BTN_BORDER);
     visuals.widgets.active.bg_fill = tint(ACCENT, 110);
     visuals.widgets.active.weak_bg_fill = tint(ACCENT, 110);
     visuals.widgets.open.bg_fill = FIELD;
     visuals.widgets.open.weak_bg_fill = FIELD;
-
     ctx.set_visuals(visuals);
     ctx.style_mut(|style| {
         style.spacing.item_spacing = Vec2::splat(SPACING);
     });
 }
 
-// ---------------------------------------------------------------------------
-// Cards / sections
-// ---------------------------------------------------------------------------
-
-/// An uppercase, small, bold, `ACCENT`-colored section title — usable inside
-/// a `card` or on its own (e.g. above a live-view panel) so both share
-/// exactly the same title styling.
+/// Legacy: uppercase accent section title (old UI).
 pub fn section_label(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text.to_uppercase()).small().strong().color(ACCENT));
 }
 
-/// A bordered, rounded rectangle with an uppercase `ACCENT` title, grouping
-/// related controls — the basic unit for settings/status displays. Owns its
-/// own trailing gap (`SPACING`), so callers stacking cards should zero the
-/// container's own item spacing rather than also `add_space`-ing between
-/// them (see STYLING-GUIDE.md's "Watch out for doubled gaps").
-///
-/// Fills with `PANEL_RAISED` (not the old flat `PANEL`) so a card reads as
-/// sitting a tier *above* the base app background — see "Elevation tiers"
-/// on the `PANEL_*` tokens above. This is the card/form/settings treatment;
-/// for a video tile or other live-media surface, use `media_frame` instead
-/// — never wrap media in `card()`, the plan explicitly calls for chrome-free
-/// media (no border, no title, edge-to-edge).
+/// Legacy: bordered titled card with a trailing gap (old UI). New code: `widgets::card`.
 pub fn card(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui)) {
     egui::Frame::new()
         .fill(PANEL_RAISED)
-        .stroke(Stroke::new(1.0, BORDER))
+        .stroke(Stroke::new(1.0_f32, BORDER))
         .corner_radius(CornerRadius::same(ROUNDING))
         .inner_margin(SPACING)
         .show(ui, |ui| {
@@ -247,52 +561,18 @@ pub fn card(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui)) {
     ui.add_space(SPACING);
 }
 
-/// Chrome-free frame for a video tile or other live-media surface: no
-/// border/stroke, no title, no inner margin — media renders edge-to-edge
-/// inside the tile, unlike `card()`'s bordered-panel-with-title treatment.
-///
-/// *Why this exists:* the UI redesign plan
-/// (`superdoc/brainstorm/ui-redesign-multiroom-streaming.md`) calls for
-/// video tiles to "drop card chrome entirely" — a bordered, titled `card()`
-/// wrapper around a video texture would read as a settings widget, not a
-/// piece of media. `media_frame` is the obvious, correct primitive for that
-/// surface so future tiled-viewing-pane code doesn't reach for `card()` by
-/// habit and accidentally chrome-wrap a video tile.
-///
-/// Fills with `PANEL_SUNKEN` as a letterbox/backdrop color, visible behind
-/// the media wherever its aspect ratio doesn't fill the tile (e.g.
-/// pillarboxing a portrait capture), and keeps `ROUNDING` for the tile's
-/// own corner shape — a Discord/Slack-style tiled grid still wants rounded
-/// tile corners, just no border/title framing them. Note: `Frame` does not
-/// itself clip children to the rounded rect, so a caller drawing a texture
-/// that must not show square corners under the rounding should also round
-/// the image draw (e.g. `egui::Image::corner_radius(…)`), not rely on this
-/// frame alone.
+/// Legacy: chrome-free media frame (old UI).
 pub fn media_frame(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
-    egui::Frame::new()
-        .fill(PANEL_SUNKEN)
-        .corner_radius(CornerRadius::same(ROUNDING))
-        .inner_margin(0)
-        .show(ui, |ui| {
-            add_contents(ui);
-        });
+    egui::Frame::new().fill(PANEL_SUNKEN).corner_radius(CornerRadius::same(ROUNDING)).inner_margin(0).show(ui, |ui| {
+        add_contents(ui);
+    });
 }
 
-/// An inline amber banner for a condition the user should know about but
-/// which isn't an error: a tinted, `WARNING`-stroked block with the message
-/// inside it.
-///
-/// *Why its own primitive rather than a `colored_label`:* the plan doc
-/// specifies the bandwidth-overshoot notice as a *banner* — something with
-/// enough visual weight to be noticed above a section, not a line of amber
-/// text lost among controls — and it's the first of a family (a stalled
-/// destination, a degraded encoder fallback) that must all look the same.
-/// `tint(WARNING, …)` for the fill keeps it legible on `PANEL_RAISED` without
-/// introducing another colour token.
+/// Legacy: amber warning banner (old UI). New code: `widgets::banner`.
 pub fn warning_banner(ui: &mut Ui, message: &str) {
     egui::Frame::new()
         .fill(tint(WARNING, 28))
-        .stroke(Stroke::new(1.0, WARNING))
+        .stroke(Stroke::new(1.0_f32, WARNING))
         .corner_radius(CornerRadius::same(ROUNDING_SM))
         .inner_margin(SPACING)
         .show(ui, |ui| {
@@ -300,16 +580,7 @@ pub fn warning_banner(ui: &mut Ui, message: &str) {
         });
 }
 
-// ---------------------------------------------------------------------------
-// Control rows
-// ---------------------------------------------------------------------------
-
-/// Left-column label for a two-column control row built with `ui.columns`.
-///
-/// `ui.columns` top-aligns each column by default, so a plain `ui.label`
-/// sits at the row's top edge while a taller control beside it renders
-/// vertically centered. This allocates the label a full standard control
-/// height and centers it, so the label + control read as one aligned band.
+/// Legacy: vertically centred left-column label (old UI).
 pub fn row_label(ui: &mut Ui, text: &str) {
     let height = ui.spacing().interact_size.y;
     ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), height), egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -317,35 +588,23 @@ pub fn row_label(ui: &mut Ui, text: &str) {
     });
 }
 
-/// A labeled slider row: label in the left half; in the right half, a
-/// slider filling available space followed by a reserved, fixed-width
-/// `DragValue` (see `VALUE_W`) so the row's right edge never jitters as the
-/// value's digit count changes, and so the exact value can still be typed
-/// directly rather than only dragged.
-///
-/// Returns whether `*value` changed this frame (either control edited it),
-/// mirroring `Response::changed()` — callers that only need to react to a
-/// real edit (e.g. pushing a new volume to a decoder) shouldn't have to
-/// re-derive that from a raw egui `Response` themselves.
+/// Legacy: two-column slider row (old UI). New code: `widgets::slider_row`.
 pub fn slider_row(ui: &mut Ui, label: &str, value: &mut u32, range: std::ops::RangeInclusive<u32>, speed: f64, suffix: &str) -> bool {
     let mut changed = false;
     ui.columns(2, |columns| {
         row_label(&mut columns[0], label);
         columns[1].horizontal(|ui| {
-            let slider_width = (ui.available_width() - VALUE_W - ui.spacing().item_spacing.x).max(1.0);
+            let slider_width = (ui.available_width() - LEGACY_VALUE_W - ui.spacing().item_spacing.x).max(1.0);
             let height = ui.spacing().interact_size.y;
             let slider_response = ui.add_sized([slider_width, height], egui::Slider::new(value, range).show_value(false));
-            let drag_response = ui.add_sized([VALUE_W, height], egui::DragValue::new(value).speed(speed).suffix(suffix));
+            let drag_response = ui.add_sized([LEGACY_VALUE_W, height], egui::DragValue::new(value).speed(speed).suffix(suffix));
             changed = slider_response.changed() || drag_response.changed();
         });
     });
     changed
 }
 
-/// A labeled row whose right half is a `ComboBox` (or any other
-/// content-driven control) rather than a slider — same two-column shape as
-/// `slider_row`, for non-numeric settings like the presentation-mode or
-/// framerate dropdowns.
+/// Legacy: two-column label + control row (old UI). New code: `widgets::ctrl_row`.
 pub fn setting_row(ui: &mut Ui, label: &str, add_control: impl FnOnce(&mut Ui)) {
     ui.columns(2, |columns| {
         row_label(&mut columns[0], label);
@@ -353,19 +612,7 @@ pub fn setting_row(ui: &mut Ui, label: &str, add_control: impl FnOnce(&mut Ui)) 
     });
 }
 
-// Note: STYLING-GUIDE.md also specifies a shared styled checkbox/radio
-// widget family (`styled_checkbox`/`checkbox_row`/`styled_radio`). This app
-// has no checkbox or radio control anywhere yet (nothing in `ui.rs` needed
-// one even after this conformance pass), so that family isn't implemented
-// here — add it, following the guide's documented API shape, when the first
-// real checkbox/radio need shows up, rather than carrying unused widget code
-// speculatively.
-
-// ---------------------------------------------------------------------------
-// Buttons
-// ---------------------------------------------------------------------------
-
-fn styled_button(text: &str, fill: Color32, text_color: Color32, border: Option<Color32>, strong: bool) -> egui::Button<'static> {
+fn legacy_button(text: &str, fill: Color32, text_color: Color32, border: Option<Color32>, strong: bool) -> egui::Button<'static> {
     let mut rich = RichText::new(text.to_owned()).color(text_color);
     if strong {
         rich = rich.strong();
@@ -373,77 +620,37 @@ fn styled_button(text: &str, fill: Color32, text_color: Color32, border: Option<
     let mut button =
         egui::Button::new(rich).fill(fill).corner_radius(CornerRadius::same(ROUNDING)).min_size(Vec2::new(0.0, FORM_BUTTON_HEIGHT));
     if let Some(border) = border {
-        button = button.stroke(Stroke::new(1.0, border));
+        button = button.stroke(Stroke::new(1.0_f32, border));
     }
     button
 }
 
-/// Solid `ACCENT` fill, `PRIMARY_TEXT` text, bold — the one primary action
-/// on a screen (e.g. "Join", "Start sharing").
+/// Legacy: primary form button (old UI). New code: `widgets::Btn::primary`.
 pub fn primary_button(text: impl Into<String>) -> impl Widget {
-    styled_button(&text.into(), ACCENT, PRIMARY_TEXT, None, true)
+    legacy_button(&text.into(), ACCENT, PRIMARY_TEXT, None, true)
 }
 
-/// Neutral `BTN` fill with a `BTN_BORDER` border — the default for
-/// everything else (Cancel-that-isn't-destructive, Reload, Save).
+/// Legacy: secondary form button (old UI). New code: `widgets::Btn::secondary`.
 pub fn secondary_button(text: impl Into<String>) -> impl Widget {
-    styled_button(&text.into(), BTN, TEXT, Some(BTN_BORDER), false)
+    legacy_button(&text.into(), BTN, TEXT, Some(BTN_BORDER), false)
 }
 
-/// Transparent fill, `DANGER`-colored text and a faint `DANGER` border —
-/// destructive/abort actions (Remove, Disconnect, Stop Sharing).
+/// Legacy: danger form button (old UI). New code: `widgets::Btn::danger`.
 pub fn danger_button(text: impl Into<String>) -> impl Widget {
-    styled_button(&text.into(), Color32::TRANSPARENT, DANGER, Some(tint(DANGER, 140)), false)
+    legacy_button(&text.into(), Color32::TRANSPARENT, DANGER, Some(tint(DANGER, 140)), false)
 }
 
-/// A chunky, full-width **nav-rail pill** — the sidebar's Stream Control /
-/// View / Settings switcher. Accent-filled when `active`, a faint hover-only
-/// surface when not.
-///
-/// *Why a fourth button variant, distinct from `primary_button`:* the three
-/// variants above are *form* buttons — they sit inside a card at egui's
-/// default `interact_size` height and are sized to their label. A nav rail
-/// wants the opposite: a fixed, deliberately oversized target that spans the
-/// sidebar's full width and reads as a persistent piece of chrome rather than
-/// an action you press once. Styling that inline at each call site (fill by
-/// active-state, `NAV_BUTTON_HEIGHT`, full-width sizing) would put three
-/// hand-tuned copies of the same look in `ui.rs`, which is exactly what
-/// STYLING-GUIDE.md's "expose each as a `theme::*_button` helper" rule exists
-/// to prevent.
-///
-/// The caller still owns the *width*, since only the caller knows the rail's
-/// measure — use `ui.add_sized([ui.available_width(),
-/// theme::NAV_BUTTON_HEIGHT], theme::nav_button(label, active))`.
+/// Legacy: nav-rail pill (old UI).
 pub fn nav_button(text: impl Into<String>, active: bool) -> impl Widget {
-    let (fill, text_color) = if active {
-        (ACCENT, PRIMARY_TEXT)
-    } else {
-        // Transparent rather than `BTN`: an inactive rail item should read as
-        // part of the sidebar surface, only lifting on hover (egui's own
-        // hover visuals supply that), so the one accent-filled pill is
-        // unambiguously "where you are".
-        (Color32::TRANSPARENT, TEXT_DIM)
-    };
+    let (fill, text_color) = if active { (ACCENT, PRIMARY_TEXT) } else { (Color32::TRANSPARENT, TEXT_DIM) };
     egui::Button::new(RichText::new(text.into()).strong().color(text_color))
         .fill(fill)
-        // Explicitly strokeless in both states, rather than inheriting the
-        // hairline `install()` gives every other widget: an outlined inactive
-        // pill competes with the accent-filled active one, and outlining the
-        // active pill too would double up on a fill that is already the
-        // loudest thing in the rail.
         .stroke(Stroke::NONE)
         .corner_radius(CornerRadius::same(ROUNDING))
         .min_size(Vec2::new(0.0, NAV_BUTTON_HEIGHT))
 }
 
-/// A compact, chrome-free icon-only button for dense list rows (a room row's
-/// watch / leave / forget affordances). Transparent fill, no border, dim text
-/// that egui's own hover visuals lift.
-///
-/// *Why not `secondary_button`:* a bordered, padded button per stream row
-/// would dominate a sidebar row that is mostly label — the round-1 UX note
-/// asked for "icon-only buttons (denser than text buttons)" precisely because
-/// several of these stack inside one expanded room.
+/// Legacy: frameless glyph button (old UI). New code: `widgets::icon_btn`.
 pub fn icon_button(glyph: impl Into<String>) -> impl Widget {
     egui::Button::new(RichText::new(glyph.into()).color(TEXT_DIM))
         .fill(Color32::TRANSPARENT)
@@ -451,20 +658,7 @@ pub fn icon_button(glyph: impl Into<String>) -> impl Widget {
         .frame(false)
 }
 
-// ---------------------------------------------------------------------------
-// Indicators
-// ---------------------------------------------------------------------------
-
-/// A small round status indicator — the sidebar's per-room live/offline/
-/// reconnecting dot. `filled` draws a solid disc (a live, connected state);
-/// otherwise a hollow ring (saved but not connected), mirroring the
-/// `●`/`○` pair the roster already uses.
-///
-/// Painted rather than rendered as a `●`/`○` glyph because the reconnecting
-/// state animates its *alpha* (a pulse): a colored `RichText` glyph can carry
-/// a per-frame color too, but a painted disc also gives an exact, font-
-/// independent size (`DOT_SIZE`) so every row's label starts at the same x
-/// regardless of which state its dot is in.
+/// Legacy: filled / hollow status dot (old UI). New code: `widgets::status_dot`.
 pub fn status_dot(ui: &mut Ui, color: Color32, filled: bool) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(DOT_SIZE), egui::Sense::hover());
     let center = rect.center();
@@ -472,6 +666,35 @@ pub fn status_dot(ui: &mut Ui, color: Color32, filled: bool) {
     if filled {
         ui.painter().circle_filled(center, radius, color);
     } else {
-        ui.painter().circle_stroke(center, radius - 0.5, Stroke::new(1.5, color));
+        ui.painter().circle_stroke(center, radius - 0.5, Stroke::new(1.5_f32, color));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn icon_table_is_sorted_and_unique() {
+        for w in ICONS.windows(2) {
+            assert!(w[0].0 < w[1].0, "ICONS not sorted/unique at {:?} / {:?}", w[0].0, w[1].0);
+        }
+        assert_eq!(icon_char("settings"), '\u{e8b8}');
+        assert_eq!(icon("close"), "\u{e14c}");
+    }
+
+    #[test]
+    fn every_icon_has_a_glyph_in_the_embedded_font() {
+        let ctx = egui::Context::default();
+        apply(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            ctx.fonts_mut(|f| {
+                for (name, ch) in ICONS {
+                    assert!(f.has_glyph(&icon_font(18.0), *ch), "icon {name} missing from font");
+                }
+                assert!(f.has_glyph(&font(Weight::Mono, 12.0), '0'));
+                assert!(f.has_glyph(&font(Weight::Bold, 12.0), '…'));
+            });
+        });
     }
 }
