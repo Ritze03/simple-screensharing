@@ -6,7 +6,8 @@
 //! - [`show_header`]: the padded 56 px header band (pad 16), left-to-right.
 //!   `[fill hbox·title: h2, status pill, meta][room controls: Auto-connect,
 //!   Copy invite link, Leave, ⋯]`, every control 32 px. Owns
-//!   [`PopoverKind::RoomMenu`].
+//!   [`PopoverKind::RoomMenu`]. In a narrow window the controls collapse to
+//!   icons and the meta line drops, in the order commented in `show_header`.
 //! - [`show_body`]: a vbox inside the central ScrollArea (padding 16), gap 16
 //!   between sections: reconnecting banner / "On screen" tiles / "Sharing in
 //!   this room" cards / empty states.
@@ -70,6 +71,9 @@ const CARD_INFO_H: f32 = 12.0 + 22.0 + 8.0 + 16.0 + 8.0 + 32.0 + 12.0;
 const SINGLE_TILE_VH: f32 = 0.46;
 /// Smallest tile width the layouts aim for (a grid column's minimum).
 const MIN_TILE_W: f32 = theme::GRID_PITCH - theme::GRID_GAP;
+/// Room-name width the header keeps before it collapses its controls (a
+/// longer name truncates with "…" once every control is collapsed).
+const TITLE_NAME_MIN: f32 = 140.0;
 /// Empty-state action row width (`.empty hbox·actions`).
 const EMPTY_ACTIONS_W: f32 = 320.0;
 
@@ -184,14 +188,29 @@ pub fn show_header(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
         ConnState::Reconnecting => tr("ui.room.leave_reconnecting_tip", "Stop connecting to this room"),
         ConnState::Disconnected => tr("ui.room.leave_offline_tip", "You're not connected to this room"),
     };
-    let copy = Btn::secondary(&copy_lbl).icon("link").enabled(joined.is_some());
-    let copy = if joined.is_none() { copy.tip(&copy_tip) } else { copy };
-    let leave = Btn::danger(&leave_lbl).icon("logout").enabled(r.conn != ConnState::Disconnected).tip(&leave_tip);
+    let copy_tip_on = if joined.is_none() { format!("{copy_lbl}\n{copy_tip}") } else { copy_lbl.clone() };
+    let leave_tip_on = format!("{leave_lbl}\n{leave_tip}");
+    // Narrow windows (960 px minimum: the band is ~656 px): the lowest level
+    // whose controls leave the title its name (≥ TITLE_NAME_MIN), pill and,
+    // below level 2, the whole meta line. Each level keeps the ones before:
+    // 1 Copy invite link → icon (it is also in the ⋯ menu), 2 meta line
+    // dropped (People and the section headings show the same counts; never
+    // half-cut to "2 pe…"), 3 Leave → icon, 4 Auto-connect → bare checkbox
+    // (its tooltip says what it is). `Why` this order: redundant things go
+    // first, the room's own actions keep their words longest.
+    let copy_at = |l: usize| {
+        let b = Btn::secondary(&copy_lbl).icon("link").enabled(joined.is_some());
+        let b = if joined.is_none() { b.tip(&copy_tip) } else { b };
+        if l >= 1 { Btn { label: "", ..b }.tip(&copy_tip_on) } else { b }
+    };
+    let leave_at = |l: usize| {
+        let b = Btn::danger(&leave_lbl).icon("logout").enabled(r.conn != ConnState::Disconnected).tip(&leave_tip);
+        if l >= 3 { Btn { label: "", ..b }.tip(&leave_tip_on) } else { b }
+    };
     // The checkbox's hover wash reaches 8 px past its text; the mockup leaves
     // 20 px from "Auto-connect" to the next button (12 + the 8 gap).
-    let cb_w = theme::MARK + theme::S2 + text_width(ui, &auto_lbl, font(Weight::Regular, theme::FS_LABEL), 0.0).ceil() + theme::S3;
-    let slots = [FILL, fixed(cb_w), fixed(copy.width(ui)), fixed(leave.width(ui)), fixed(theme::CTL_H)];
-    let row = HBox::new("hbox·room-controls", theme::CTL_H).slots(&slots).show(ui);
+    let cb_full = theme::MARK + theme::S2 + text_width(ui, &auto_lbl, font(Weight::Regular, theme::FS_LABEL), 0.0).ceil() + theme::S3;
+    let cb_at = |l: usize| if l >= 4 { theme::MARK + theme::S3 } else { cb_full };
 
     // Title: [h2][status pill][meta], gap 12.
     let pill_l = match r.conn {
@@ -212,23 +231,37 @@ pub fn show_header(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
             tr_with("ui.room.meta", "%{people} people · %{sharing} sharing", &[("people", &n.to_string()), ("sharing", &sharing.to_string())])
         }
     });
+    let h2 = font(Weight::Bold, theme::FS_H2);
+    let meta_f = font(Weight::Regular, theme::FS_SMALL);
+    let name_w = text_width(ui, &r.name, h2.clone(), 0.0).ceil();
+    let pw = pill.width(ui);
+    let meta_w = meta.as_ref().map_or(0.0, |m| text_width(ui, m, meta_f.clone(), 0.0).ceil());
+    let title_need = |l: usize| name_w.min(TITLE_NAME_MIN) + theme::S3 + pw + if l < 2 && meta.is_some() { theme::S3 + meta_w } else { 0.0 };
+    let controls = |l: usize| cb_at(l) + copy_at(l).width(ui) + leave_at(l).width(ui) + theme::CTL_H + 4.0 * theme::S2;
+    let avail = ui.available_width();
+    let level = (0..=4).find(|l| avail - controls(*l) >= title_need(*l)).unwrap_or(4);
+    let (copy, leave, cb_w) = (copy_at(level), leave_at(level), cb_at(level));
+    let show_meta = meta.as_ref().filter(|_| level < 2);
+    let slots = [FILL, fixed(cb_w), fixed(copy.width(ui)), fixed(leave.width(ui)), fixed(theme::CTL_H)];
+    let row = HBox::new("hbox·room-controls", theme::CTL_H).slots(&slots).show(ui);
+
     row.show(ui, 0, Align::Min, |ui| {
-        let h2 = font(Weight::Bold, theme::FS_H2);
-        let pw = pill.width(ui);
         let avail = ui.available_width();
-        let tw = text_width(ui, &r.name, h2.clone(), 0.0).ceil().min((avail - pw - theme::S3).max(0.0));
+        let meta_room = if show_meta.is_some() { theme::S3 + meta_w } else { 0.0 };
+        let tw = name_w.min((avail - pw - theme::S3 - meta_room).max(0.0));
         let t = HBox::new("hbox·title", theme::CTL_H).gap(theme::S3).slots(&[fixed(tw), fixed(pw), FILL]).show(ui);
         t.text(ui, 0, &r.name, h2, theme::TEXT, Align::Min);
         let c = t.cell(1);
         pill.paint(ui, Rect::from_center_size(c.center(), vec2(pw, theme::PILL_H)));
-        if let Some(m) = &meta {
-            t.text(ui, 2, m, font(Weight::Regular, theme::FS_SMALL), theme::TEXT_DIM, Align::Min);
+        if let Some(m) = show_meta {
+            t.text(ui, 2, m, meta_f, theme::TEXT_DIM, Align::Min);
         }
     });
 
     let mut on = r.auto_connect;
     let auto_tip = tr("ui.room.auto_connect_tip", "Connect to this room when the app starts");
-    if row.show(ui, 1, Align::Min, |ui| widgets::checkbox(ui, &mut on, &auto_lbl)).on_hover_text(&auto_tip).changed() {
+    let (cb_label, auto_tip) = if level >= 4 { (String::new(), format!("{auto_lbl}\n{auto_tip}")) } else { (auto_lbl.clone(), auto_tip) };
+    if row.show(ui, 1, Align::Min, |ui| widgets::checkbox(ui, &mut on, &cb_label)).on_hover_text(&auto_tip).changed() {
         cx.act(UiAction::SetAutoConnect { room: r.key.clone(), on });
     }
     let w = row.cell(2).width();
@@ -827,15 +860,17 @@ fn thumb_corners(ui: &mut Ui, thumb: Rect, live: Option<&str>, audio: bool) {
 }
 
 /// `vbox·info` (pad 12, gap 8): `[hbox·who 22: avatar 22, bold name, fill
-/// dim title][hbox·specs 16][btn_row]`. Returns the clicked button.
-fn card_info(ui: &mut Ui, info: Rect, who: (&str, usize), title: &str, specs: &str, btns: &[Btn]) -> Option<usize> {
+/// dim title][hbox·specs 16][btn_row]`. `who` = (shown name, the display
+/// name the avatar initial comes from, avatar colour); they differ only on
+/// our own card ("You" / "Du" vs our name). Returns the clicked button.
+fn card_info(ui: &mut Ui, info: Rect, who: (&str, &str, usize), title: &str, specs: &str, btns: &[Btn]) -> Option<usize> {
     let inner = info.shrink(theme::S3);
     let mut c = ui.new_child(UiBuilder::new().max_rect(inner).layout(Layout::top_down(Align::Min)));
     c.spacing_mut().item_spacing.y = theme::S2;
     let nf = font(Weight::Bold, 13.5);
     let nw = text_width(&c, who.0, nf.clone(), 0.0).ceil().min(inner.width() * 0.6);
     let row = HBox::new("hbox·who", theme::AVATAR_SM).slots(&[fixed(theme::AVATAR_SM), fixed(nw), FILL]).show(&mut c);
-    widgets::paint_avatar(&c, row.cell(0), &initial(who.0), who.1, false);
+    widgets::paint_avatar(&c, row.cell(0), &initial(who.1), who.2, false);
     row.text(&c, 1, who.0, nf, theme::TEXT, Align::Min);
     row.text(&c, 2, title, font(Weight::Regular, theme::FS_SMALL), theme::TEXT_DIM, Align::Min);
     let row = HBox::new("hbox·specs", 16.0).slots(&[FILL]).show(&mut c);
@@ -884,7 +919,7 @@ fn share_card(ui: &mut Ui, cx: &Cx, h: RoomHandle, info: &StreamInfo, acts: &mut
     } else {
         "—".to_owned()
     };
-    let who = (name.as_str(), avatar_color(me, info.owner));
+    let who = (name.as_str(), name.as_str(), avatar_color(me, info.owner));
     if audio_only {
         let listening = cx.is_watching(key);
         let (l_on, l_off) = (tr("ui.room.listen", "Listen"), tr("ui.room.stop_listening", "Stop listening"));
@@ -944,8 +979,11 @@ fn my_card(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSourceId, destin
     }
     specs.push_str(&format!("{} fps · {}", params.framerate, codec_label(params.codec)));
     let you = tr("ui.room.you", "You");
+    // The avatar shows our name's initial, as our People row does (not the
+    // "You" label's: German "Du" made it a "D").
+    let my_name = cx.my_conn(h).map(|me| cx.member_name(h, me)).unwrap_or_else(|| cx.state.display_name.clone());
     let settings = tr("ui.room.stream_settings", "Stream settings");
-    if card_info(ui, info_r, (&you, 0), &c.label, &specs, &[Btn::secondary(&settings).icon("tune")]).is_some() {
+    if card_info(ui, info_r, (&you, &my_name, 0), &c.label, &specs,&[Btn::secondary(&settings).icon("tune")]).is_some() {
         acts.push(UiAction::OpenModal(Modal::StreamSettings { capture, room: h }));
     }
 }
