@@ -14,6 +14,67 @@ separate `simple-screensharing-server` / `simple-screensharing-client` repos, an
 references use those old names (now `server/` and `client/`). Cross-checked against
 `architecture/protocol-spec.md`.
 
+## Native client: auto-reconnect and clean exit (2026-10-14, task #36)
+
+Found by I20 in real runs: after a relay restart the egui client sat on "Not connected" until a
+manual Connect + Watch, and a killed/closed client lingered in the roster for 60-75 s (relay idle
+timeout) because nothing sent `Leave` or closed the QUIC connection. Both fixed in `session.rs` /
+`net.rs`; the browser core already behaved this way.
+
+- **Dropped room = suspended, not torn down.** `drain_events` used to call `disconnect_room` on
+  `ClientEvent::ControlClosed`. It now calls `suspend_room`: the `RoomSession` goes, a
+  `ReconnectState` in `AppState::reconnects` takes its place (kept `RoomHandle`, last-known roster
+  and streams, attempt count, next retry, last error, cause). `is_reconnecting(join_string)` is true
+  for the whole outage (also between attempts), `Status` stays `Connecting` (the UI only repaints
+  on that), so the existing UI shows its Reconnecting banner with no edits. Only for rooms still in
+  the saved list; user Leave / Forget / Cancel and `shutdown` never reconnect.
+  `Why the handle is kept:` everything keyed by `RoomHandle` (a destination's `room`,
+  `active_room`, the UI's staged shares and views) stays valid across the outage with no remapping.
+  `Why no session while reconnecting:` the UI derives Reconnecting from "no session for a saved
+  room but `is_reconnecting`", so a half-dead session would show as joined.
+- **Retry policy** (`session::retry_delay`, pure): first retry immediate, then 0.5 s, 1, 2, 4, 8,
+  capped at 15 s, forever. Per-attempt timeout 8 s (`RECONNECT_ATTEMPT_TIMEOUT`; a manual connect
+  keeps 15 s) so a dead relay cannot hold the single connect slot and starve the backoff. The
+  failure kind comes from the QUIC application close code (`net::CloseCause`, read with
+  `ScreenshareClient::close_cause()` / `CloseCause::from_error`): `0x200` relay shutdown retries
+  at once, `0x102` room full retries but never faster than 5 s (the error is kept in
+  `last_error`, `ReconnectState::room_full()`), `0x101` malformed stops and surfaces
+  (`ConnectOutcome::Failed`, `Status::Error`), anything else backs off. `connect()` now returns a
+  typed `JoinRejectedError` instead of a bare `bail!`, and falls back to the close code if the
+  relay's close beat the `JoinRejected` frame.
+- **Our shares come back by rebuilding the branch, not re-pointing it.** A branch is bound to the
+  old connection (client clone, nonce space, announced `StreamId`; the new connection has a fresh
+  `ConnId`). `suspend_destination` removes the branch (`spawn_remove_destination`) and records
+  the params; the *capture* (screen grab, portal session) keeps running, so there is no new picker
+  prompt. After the reconnect `add_destination_with_params` rebuilds each branch on the new room
+  (the same primitives `retry_destination` uses): no `capture.rs` change needed. Audio shares are
+  bound to the connection as a whole, so they are stopped and restarted with the source they were
+  started with (`AppState::audio_share_sources`). A capture left with no destination is invisible
+  to the UI; cancelling/forgetting the room stops it. Transfer halves are not resumed.
+- **Watches come back by name.** `WantedStream { owner_name, kind, label }` (the browser's
+  `stableKey` minus the room); `match_wanted` picks the first not-yet-watched stream of a member
+  with that name, so two "Screen"s of one owner map to two streams. Unmatched ones wait in
+  `RoomSession::rewatch` for 60 s (`REWATCH_GRACE`, the browser's resume window) and resolve as
+  re-announces arrive, because a sharer that reconnected is indistinguishable from one that
+  stopped and started again, and after a relay restart the owners rejoin at different moments.
+  Selected watch and per-owner volume carry over; mute and pop-out do not.
+- **Clean exit.** `disconnect_room` (user Leave, Forget) sends `Leave` and closes the connection
+  (`ScreenshareClient::leave_and_close`, code `0x300`). `AppState::shutdown` /
+  `shutdown_blocking(timeout)` do that for every room, close the endpoint with a bounded (500 ms)
+  `wait_idle` so the close frames really leave the socket, and stop the captures alongside (a
+  pipeline can take seconds to drain; it must not delay the leave). `install_shutdown_signal_handlers`
+  turns SIGTERM/SIGINT/SIGHUP into a window close so the normal `on_exit` path runs; a second
+  signal or 4 s without exit force-quits. `Why via the window:` the state belongs to the UI
+  thread, so a signal task can only ask that thread to run the shutdown.
+- **Known gaps.** (1) `capture.rs` binds a capture's room-preview task to the *first*
+  destination's client; after a reconnect it keeps failing on the dead connection, so others see
+  no thumbnail of our share until it is restarted. Fix: `ensure_preview_task` restarts the task
+  when its client's connection is closed, which needs `preview_sink` kept (cloned) instead of
+  `take()`n. (2) A relay that dies without a `CONNECTION_CLOSE` (SIGKILL, power loss) is only
+  noticed on the next packet or after the 60 s idle timeout. (3) The UI cannot yet name the room
+  on Retry now / Cancel or show the attempt count; the lib API is ready (`reconnect_now`,
+  `cancel_reconnect`, `reconnect_info`), see the task #36 hand-off.
+
 ## Rework foundation: monorepo, shared protocol, native decoder, lib consolidation (2026-10-14)
 
 Same-day sibling of the WebTransport block below (newest first). **Context for everything

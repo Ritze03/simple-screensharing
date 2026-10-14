@@ -121,6 +121,99 @@ use crate::protocol::{
 pub const ALPN: &[u8] = b"ssshare/1";
 
 // ---------------------------------------------------------------------
+// Close codes and why a connection ended
+// ---------------------------------------------------------------------
+
+/// Application close code the relay uses when the first control frame was not
+/// a valid `Join` (it sent `JoinRejected{Malformed}` first). Mirrors
+/// `server/src/relay.rs::CLOSE_MALFORMED`.
+pub const CLOSE_MALFORMED: u64 = 0x101;
+/// Application close code: the room is full (`JoinRejected{RoomFull}` first).
+/// Mirrors `server/src/relay.rs::CLOSE_ROOM_FULL`.
+pub const CLOSE_ROOM_FULL: u64 = 0x102;
+/// Application close code: the relay is shutting down; reconnect at once (to
+/// this or a restarted relay). Mirrors `server/src/relay.rs::CLOSE_SHUTDOWN`.
+pub const CLOSE_SHUTDOWN: u64 = 0x200;
+/// Application close code this client uses when it leaves on purpose (user
+/// Leave, Forget, app exit, SIGTERM). Client to relay, so it lives in its own
+/// range; the relay does not inspect it, any close is an implicit `Leave`
+/// (spec section 4.1).
+pub const CLOSE_CLIENT_LEAVE: u32 = 0x300;
+
+/// Why a connection (or a connect attempt) ended, as far as the retry policy
+/// cares. Built from the QUIC application close code the relay sent.
+///
+/// `Why a closed enum and not the raw code:` the policy (`session::retry_delay`)
+/// differs per kind, and an unknown code or a transport error (timeout, reset,
+/// unreachable) must fall into the same "just retry" bucket rather than being
+/// matched on numbers all over the place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseCause {
+    /// `0x200`: the relay is restarting. Retry immediately.
+    RelayShutdown,
+    /// `0x102`: the room is full. Keep retrying slowly.
+    RoomFull,
+    /// `0x101`: the relay did not accept our `Join`. Retrying cannot help.
+    Malformed,
+    /// Anything else: idle timeout, stateless reset, unreachable relay, an
+    /// unknown close code. Retry with backoff.
+    Other,
+}
+
+impl CloseCause {
+    /// Map a QUIC application close code to its cause.
+    pub fn from_code(code: u64) -> Self {
+        match code {
+            CLOSE_SHUTDOWN => Self::RelayShutdown,
+            CLOSE_ROOM_FULL => Self::RoomFull,
+            CLOSE_MALFORMED => Self::Malformed,
+            _ => Self::Other,
+        }
+    }
+
+    /// The cause of a finished QUIC connection: the application close code if
+    /// the relay closed it, [`Self::Other`] for every transport-level end.
+    pub fn from_connection_error(err: &quinn::ConnectionError) -> Self {
+        match err {
+            quinn::ConnectionError::ApplicationClosed(close) => Self::from_code(close.error_code.into_inner()),
+            _ => Self::Other,
+        }
+    }
+
+    /// The cause an error from [`ScreenshareClient::connect`] carries: a typed
+    /// [`JoinRejectedError`] first, otherwise the first `quinn::ConnectionError`
+    /// anywhere in the error chain, otherwise [`Self::Other`].
+    pub fn from_error(err: &anyhow::Error) -> Self {
+        if let Some(rejected) = err.downcast_ref::<JoinRejectedError>() {
+            return match rejected.0 {
+                RejectReason::RoomFull => Self::RoomFull,
+                RejectReason::Malformed => Self::Malformed,
+                RejectReason::ConnIdCollision => Self::Other,
+            };
+        }
+        err.chain()
+            .find_map(|cause| cause.downcast_ref::<quinn::ConnectionError>())
+            .map(Self::from_connection_error)
+            .unwrap_or(Self::Other)
+    }
+}
+
+/// The relay answered our `Join` with `JoinRejected{reason}`. A typed error
+/// (rather than a bare `bail!`) so the reconnect policy can tell a full room
+/// from a malformed join without parsing text; the `Display` text is what the
+/// UI shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JoinRejectedError(pub RejectReason);
+
+impl std::fmt::Display for JoinRejectedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "join rejected: {:?}", self.0)
+    }
+}
+
+impl std::error::Error for JoinRejectedError {}
+
+// ---------------------------------------------------------------------
 // Join-string parsing
 // ---------------------------------------------------------------------
 
@@ -513,7 +606,20 @@ impl ScreenshareClient {
             .await
             .context("failed to send Join")?;
 
-            match read_control_message(&mut recv).await.context("failed to read join response")? {
+            let reply = match read_control_message(&mut recv).await {
+                Ok(reply) => reply,
+                Err(e) => {
+                    // The relay writes `JoinRejected`, then closes with a code
+                    // (task #29). If the close beat the frame to us, the code
+                    // still says why.
+                    return Err(match connection.close_reason().map(|e| CloseCause::from_connection_error(&e)) {
+                        Some(CloseCause::RoomFull) => anyhow::Error::new(JoinRejectedError(RejectReason::RoomFull)),
+                        Some(CloseCause::Malformed) => anyhow::Error::new(JoinRejectedError(RejectReason::Malformed)),
+                        _ => e.context("failed to read join response"),
+                    });
+                }
+            };
+            match reply {
                 RelayToClient::PresenceSnapshot { members, streams } => {
                     break PresenceSnapshotState { members, streams };
                 }
@@ -522,7 +628,7 @@ impl ScreenshareClient {
                     continue;
                 }
                 RelayToClient::JoinRejected { reason } => {
-                    bail!("join rejected: {reason:?}");
+                    return Err(anyhow::Error::new(JoinRejectedError(reason)));
                 }
                 other => bail!("unexpected message before join acknowledgement: {other:?}"),
             }
@@ -619,6 +725,28 @@ impl ScreenshareClient {
 
     pub async fn leave(&self) -> Result<()> {
         self.send_control(&ClientToRelay::Leave).await
+    }
+
+    /// Why this connection ended, or `None` while it is still open. Lets the
+    /// session tell a relay restart (`0x200`) from a transport drop after a
+    /// `ClientEvent::ControlClosed`.
+    pub fn close_cause(&self) -> Option<CloseCause> {
+        self.connection.close_reason().map(|e| CloseCause::from_connection_error(&e))
+    }
+
+    /// Leave on purpose: send `Leave` (bounded, so a wedged control stream
+    /// cannot hold up an exit), then close the QUIC connection with
+    /// [`CLOSE_CLIENT_LEAVE`] so the relay drops us at once instead of after
+    /// its idle timeout.
+    ///
+    /// `Why both:` `Leave` is the protocol's graceful departure, but quinn may
+    /// not have put it on the wire by the time the close goes out; the close
+    /// alone is already an implicit `Leave` for the relay (spec section 4.1),
+    /// so either reaching it is enough. Idempotent and infallible: an already
+    /// closed connection makes both steps no-ops.
+    pub async fn leave_and_close(&self) {
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), self.leave()).await;
+        self.connection.close(CLOSE_CLIENT_LEAVE.into(), b"leave");
     }
 
     async fn send_control(&self, msg: &ClientToRelay) -> Result<()> {
@@ -1002,5 +1130,43 @@ mod tests {
         let ciphertext = encrypt_preview(&key, 4, nonce, jpeg).unwrap();
         let decrypted = decrypt_preview(&key, 4, nonce, &ciphertext).unwrap();
         assert_eq!(decrypted, jpeg);
+    }
+
+    fn app_closed(code: u32) -> quinn::ConnectionError {
+        quinn::ConnectionError::ApplicationClosed(quinn::ApplicationClose { error_code: code.into(), reason: Default::default() })
+    }
+
+    #[test]
+    fn relay_close_codes_map_to_causes() {
+        assert_eq!(CloseCause::from_code(0x200), CloseCause::RelayShutdown);
+        assert_eq!(CloseCause::from_code(0x102), CloseCause::RoomFull);
+        assert_eq!(CloseCause::from_code(0x101), CloseCause::Malformed);
+        assert_eq!(CloseCause::from_code(0), CloseCause::Other);
+        assert_eq!(CloseCause::from_code(0x300), CloseCause::Other, "our own leave code is not a relay verdict");
+        assert_eq!(CloseCause::from_connection_error(&app_closed(0x200)), CloseCause::RelayShutdown);
+        assert_eq!(CloseCause::from_connection_error(&app_closed(0x102)), CloseCause::RoomFull);
+        // Transport-level ends carry no code and just get retried.
+        assert_eq!(CloseCause::from_connection_error(&quinn::ConnectionError::TimedOut), CloseCause::Other);
+        assert_eq!(CloseCause::from_connection_error(&quinn::ConnectionError::Reset), CloseCause::Other);
+        assert_eq!(CloseCause::from_connection_error(&quinn::ConnectionError::LocallyClosed), CloseCause::Other);
+    }
+
+    #[test]
+    fn connect_errors_are_classified_through_their_context_chain() {
+        // A typed rejection wins.
+        let rejected = anyhow::Error::new(JoinRejectedError(RejectReason::RoomFull)).context("joining");
+        assert_eq!(CloseCause::from_error(&rejected), CloseCause::RoomFull);
+        assert_eq!(rejected.to_string(), "joining");
+        assert_eq!(
+            CloseCause::from_error(&anyhow::Error::new(JoinRejectedError(RejectReason::Malformed))),
+            CloseCause::Malformed
+        );
+        assert_eq!(JoinRejectedError(RejectReason::RoomFull).to_string(), "join rejected: RoomFull");
+        // A relay close buried under `.context(..)`, as `connect()` produces them.
+        let closed = anyhow::Error::new(app_closed(0x200)).context("QUIC handshake failed");
+        assert_eq!(CloseCause::from_error(&closed), CloseCause::RelayShutdown);
+        // Anything else is a plain retry.
+        assert_eq!(CloseCause::from_error(&anyhow!("could not resolve server address")), CloseCause::Other);
+        assert_eq!(CloseCause::from_error(&anyhow::Error::new(quinn::ConnectionError::TimedOut)), CloseCause::Other);
     }
 }
