@@ -2,7 +2,7 @@
 // Everything is a plain ES module with relative imports (no build step); see README.md.
 
 export { RoomClient, WatchHandle, ShareHandle, capabilities, probeEncoders, streamKey } from "./room-client.js";
-export { CanvasRenderer } from "./video-rx.js";
+export { CanvasRenderer, visibleRectFor } from "./video-rx.js";
 export { createRoom, parseJoinLink, formatJoinLink, JoinLinkError, base64urlEncode, base64urlDecode } from "./joinlink.js";
 export { ConnectError, JoinRejectedError, EXPIRED_LINK_HINT, CLOSE_CODES, classifyClose, isHashVerified, supportsWebTransport } from "./session.js";
 export { ENCODER_PRESETS } from "./video-tx.js";

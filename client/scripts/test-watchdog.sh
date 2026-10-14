@@ -9,7 +9,8 @@ SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SELF_DIR/launch-lib.sh"
 BIN="$CARGO_TARGET_DIR/release/simple-screensharing-client"
 log "clients before: $(pgrep -fc "$BIN$")"
-tmux kill-session -t "=sssrelay"
+SESSION="$(<"${SCRATCH:-$CARGO_TARGET_DIR/launch-scratch/rig}/tmux.session")"   # this rig's own session (rig.sh up records it)
+tmux kill-session -t "=$SESSION"
 sleep 6
 log "clients after killing the relay session (watchdog should have stopped them): $(pgrep -fc "$BIN$")"
-tmux ls 2>/dev/null | grep -c '^sssrelay' || true
+tmux ls 2>/dev/null | grep -c "^$SESSION" || true
