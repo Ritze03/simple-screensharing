@@ -1040,6 +1040,10 @@ async fn acquire_capture_source() -> Result<CaptureSource> {
 #[cfg(unix)]
 struct PortalCapture {
     node_id: u32,
+    /// Where the portal says the picked monitor sits in the compositor layout
+    /// (`None` when the backend does not report it). Diagnostic only.
+    #[cfg_attr(not(test), allow(dead_code))]
+    position: Option<(i32, i32)>,
     /// Kept alive for the lifetime of the capture: `pipewiresrc` dups the fd
     /// internally when it connects to the PipeWire core, so this is not
     /// double-closed by dropping it after the pipeline is torn down — this
@@ -1047,6 +1051,73 @@ struct PortalCapture {
     /// `examples/screen_cast_gstreamer.rs`.
     _pipewire_fd: OwnedFd,
     session: Session<Screencast>,
+}
+
+/// The user dismissed the OS screen picker. Carried as the root cause of the
+/// error [`open_portal_capture`] returns, so callers can tell a deliberate
+/// cancel from a real failure with [`is_picker_cancelled`] instead of showing
+/// the user an error for something they chose to do.
+#[derive(Debug)]
+pub struct PickerCancelled;
+
+impl std::fmt::Display for PickerCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the screen picker was cancelled")
+    }
+}
+
+impl std::error::Error for PickerCancelled {}
+
+/// Whether `e` (anywhere in its chain) is a [`PickerCancelled`].
+pub fn is_picker_cancelled(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| cause.is::<PickerCancelled>())
+}
+
+/// Whether a portal error from the `Start` step means "the user dismissed the
+/// picker" rather than "the portal failed".
+///
+/// Three shapes count as a dismissal:
+/// - `Error::Response(ResponseError::Cancelled)`: the standard answer, the
+///   backend responded with response code 1.
+/// - `PortalError::Cancelled`: `org.freedesktop.portal.Error.Cancelled`.
+/// - **`org.freedesktop.DBus.Error.AccessDenied: Invalid session`**: what this
+///   machine's `xdg-desktop-portal-wlr-patched` + `wlr-share-picker` actually
+///   produce when the picker is dismissed (Esc, the Cancel button, or the
+///   picker being SIGTERMed). Measured against the real portal: `Start` itself
+///   fails, about a second after the dismissal, with exactly this error. The
+///   frontend has already torn the session down by then, so "the session is
+///   gone" is the portal's only way of saying "nobody is going to be sharing
+///   anything".
+///
+/// Everything else (`Failed`, `NotFound`, `InvalidArgument`, any other D-Bus
+/// error, a missing portal) is a real failure and must still surface.
+#[cfg(unix)]
+fn is_portal_user_cancel(e: &ashpd::Error) -> bool {
+    use ashpd::desktop::ResponseError;
+    match e {
+        ashpd::Error::Response(ResponseError::Cancelled) => true,
+        ashpd::Error::Portal(ashpd::PortalError::Cancelled(_)) => true,
+        ashpd::Error::Portal(ashpd::PortalError::ZBus(e)) | ashpd::Error::Zbus(e) => is_invalid_session_denial(e),
+        _ => false,
+    }
+}
+
+/// The "session no longer exists" denial described on [`is_portal_user_cancel`],
+/// in both the shapes zbus can hand it back as (a raw `MethodError`, or
+/// already mapped onto `fdo::Error::AccessDenied`).
+#[cfg(unix)]
+fn is_invalid_session_denial(e: &ashpd::zbus::Error) -> bool {
+    const DENIED: &str = "org.freedesktop.DBus.Error.AccessDenied";
+    const INVALID_SESSION: &str = "Invalid session";
+    match e {
+        ashpd::zbus::Error::MethodError(name, description, _) => {
+            name.as_str() == DENIED && description.as_deref() == Some(INVALID_SESSION)
+        }
+        ashpd::zbus::Error::FDO(fdo) => {
+            matches!(&**fdo, ashpd::zbus::fdo::Error::AccessDenied(m) if m == INVALID_SESSION)
+        }
+        _ => false,
+    }
 }
 
 /// Runs the portal permission flow: create a session, ask to record a
@@ -1079,12 +1150,28 @@ async fn open_portal_capture() -> Result<PortalCapture> {
         .await
         .context("portal rejected screencast source selection")?;
 
-    let response = proxy
-        .start(&session, None, Default::default())
-        .await
-        .context("screencast portal 'Start' request failed")?
-        .response()
-        .map_err(|e| anyhow!("screencast permission was denied or cancelled: {e}"))?;
+    let request = match proxy.start(&session, None, Default::default()).await {
+        Ok(request) => request,
+        Err(e) => {
+            let _ = session.close().await;
+            return Err(if is_portal_user_cancel(&e) {
+                anyhow::Error::new(PickerCancelled)
+            } else {
+                anyhow::Error::new(e).context("screencast portal 'Start' request failed")
+            });
+        }
+    };
+    let response = match request.response() {
+        Ok(response) => response,
+        Err(e) => {
+            let _ = session.close().await;
+            return Err(if is_portal_user_cancel(&e) {
+                anyhow::Error::new(PickerCancelled)
+            } else {
+                anyhow!("screencast permission was denied: {e}")
+            });
+        }
+    };
 
     let stream = response
         .streams()
@@ -1093,6 +1180,8 @@ async fn open_portal_capture() -> Result<PortalCapture> {
         .ok_or_else(|| anyhow!("portal returned no capturable monitor (permission denied or nothing selected)"))?;
 
     let node_id = stream.pipe_wire_node_id();
+    let position = stream.position();
+    tracing::info!("portal granted node {node_id} (position {position:?}, size {:?})", stream.size());
 
     let pipewire_fd = proxy
         .open_pipe_wire_remote(&session, Default::default())
@@ -1101,6 +1190,7 @@ async fn open_portal_capture() -> Result<PortalCapture> {
 
     Ok(PortalCapture {
         node_id,
+        position,
         _pipewire_fd: pipewire_fd,
         session,
     })
@@ -1313,6 +1403,9 @@ struct CapturePipeline {
     /// [`SELF_PREVIEW_BRANCH_FRAMERATE`] RGB branch feeding the sender-side
     /// self-preview (see [`CaptureHandle::self_preview_frame`]).
     self_preview_sink: gst_app::AppSink,
+    /// Flipped by the first buffer to reach the `tee`; see
+    /// [`CaptureHandle::awaiting_first_frame`].
+    frame_seen: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Builds and links (but does not start) the capture pipeline described in
@@ -1418,7 +1511,19 @@ fn build_pipeline(source_fragment: &str) -> Result<CapturePipeline> {
 
     isolate_source_from_branch_renegotiation(&tee)?;
 
-    Ok(CapturePipeline { pipeline, tee, preview_sink, self_preview_sink })
+    // Installed before the pipeline ever leaves `Null`, so the very first
+    // buffer cannot slip past it. Removes itself after firing: no per-buffer
+    // cost for the life of the capture.
+    let frame_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if let Some(sink_pad) = tee.static_pad("sink") {
+        let seen = frame_seen.clone();
+        sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+            seen.store(true, Ordering::Release);
+            gst::PadProbeReturn::Remove
+        });
+    }
+
+    Ok(CapturePipeline { pipeline, tee, preview_sink, self_preview_sink, frame_seen })
 }
 
 /// Stops a branch being added to the live `tee` from asking everything
@@ -1632,7 +1737,7 @@ impl DestinationHandle {
     /// encode branch off the still-live tee, then tell its room the stream
     /// stopped. Every *other* destination of the same capture is mechanically
     /// untouched (its own `queue` isolates it — see [`branch::remove_branch`]).
-    async fn stop(self) -> Result<()> {
+    pub async fn stop(self) -> Result<()> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         if self.cmd_tx.send(DestCmd::Stop { reply: reply_tx }).is_err() {
             // Pump already gone; nothing left to drain.
@@ -1713,6 +1818,8 @@ pub struct CaptureHandle {
     /// applies backpressure upstream. `None` once the preview task has
     /// started (or, for a not-yet-staged legacy build, never populated).
     preview_sink: Option<gst_app::AppSink>,
+    /// See [`CaptureHandle::awaiting_first_frame`].
+    frame_seen: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for CaptureHandle {
@@ -1952,7 +2059,7 @@ async fn start_capture_with_source(framerate: u32, capture_source: CaptureSource
     let built = tokio::task::spawn_blocking(move || start_pipeline(&source_fragment))
         .await
         .map_err(|e| anyhow!("capture pipeline startup task panicked: {e}"))??;
-    let CapturePipeline { pipeline, tee, preview_sink, self_preview_sink } = built;
+    let CapturePipeline { pipeline, tee, preview_sink, self_preview_sink, frame_seen } = built;
 
     // Size for the never-upscale clamp ([`destination::clamp_to_source`]) and
     // for whatever destination is added first: read off the tee's negotiated
@@ -1973,6 +2080,7 @@ async fn start_capture_with_source(framerate: u32, capture_source: CaptureSource
     ));
 
     Ok(CaptureHandle {
+        frame_seen,
         pipeline,
         tee,
         capture_source,
@@ -2050,8 +2158,14 @@ async fn spawn_destination(
     }
 
     let (encode_branch, first_idr) =
-        branch::add_branch_live(pipeline, tee, branch::BranchId(key.0), params.to_encode_settings())
-            .await
+        branch::add_branch_live_waiting(
+            pipeline,
+            tee,
+            branch::BranchId(key.0),
+            params.to_encode_settings(),
+            branch::SourceWait::Indefinite,
+        )
+        .await
             .with_context(|| format!("failed to bring up the encode branch for stream {stream_id}"))?;
 
     // Feed the branch's proving IDR through the normal accounting so it is
@@ -2535,6 +2649,19 @@ impl CaptureHandle {
     /// The size half is filled in lazily: a capture whose caps hadn't landed
     /// when it started reports `0x0` ("no constraint") until they do, at
     /// which point the real size is cached here for good.
+    /// `true` while this capture has **never** produced a frame.
+    ///
+    /// On a portal/wlroots capture of a monitor where nothing is repainting,
+    /// this stays `true` indefinitely — the compositor only answers a capture
+    /// request once the output commits a new frame (see
+    /// [`branch::wait_for_source_frame`]). Destinations attached in that
+    /// state stay `Starting` rather than failing, and this is what lets a UI
+    /// say *why* ("waiting for the shared screen to change") instead of
+    /// showing an unexplained spinner.
+    pub fn awaiting_first_frame(&self) -> bool {
+        !self.frame_seen.load(Ordering::Acquire)
+    }
+
     pub fn source_caps(&self) -> destination::SourceCaps {
         let mut state = self.source_state.lock().unwrap();
         if (state.width == 0 || state.height == 0)
@@ -2874,7 +3001,20 @@ async fn destination_pump(
                 match sample {
                     Some(sample) => {
                         record_encoder_frame(&mut encoded_frame_times, &encoder_fps);
-                        match send_encoded_sample(&client, stream_id, &sample, start, &runtime) {
+                        // A frame arriving while stalled is only a delta
+                        // unless it happens to be a GOP boundary, and a delta
+                        // cannot end the stall (the viewer has nothing
+                        // decodable to apply it to) — so ask for an IDR now
+                        // instead of waiting out the rest of the GOP.
+                        let was_stalled = runtime.lock().unwrap().is_stalled();
+                        let result = send_encoded_sample(&client, stream_id, &sample, start, &runtime);
+                        if was_stalled
+                            && runtime.lock().unwrap().is_stalled()
+                            && let Some(pad) = branch.as_ref().and_then(|b| b.keyframe_pad())
+                        {
+                            force_keyframe(&pad);
+                        }
+                        match result {
                             Ok(()) => record_sent_frame(&mut sent_frame_times, &sent_fps),
                             Err(e) => tracing::warn!("dropping encoded frame for stream {stream_id}: {e:#}"),
                         }
@@ -2883,6 +3023,15 @@ async fn destination_pump(
                 }
             }
             _ = stall_ticker.tick() => {
+                if !paused && branch.is_some() && !branch_ended {
+                    let mut runtime = runtime.lock().unwrap();
+                    let silence = destination::silence_threshold(runtime.params().framerate);
+                    if runtime.stall_if_silent(Instant::now(), silence) {
+                        tracing::warn!(
+                            "stream {stream_id}: no encoded frame for {silence:?}; re-sending the cached IDR until the capture produces again"
+                        );
+                    }
+                }
                 send_stall_keepalive(&client, stream_id, &runtime);
             }
             cmd = cmd_rx.recv() => {
@@ -2914,6 +3063,7 @@ async fn destination_pump(
                             tracing::info!("stream {stream_id} has a subscriber again; resuming its encoder");
                             branch.set_paused(false, stream_id);
                             paused = false;
+                            runtime.lock().unwrap().restart_silence_clock(Instant::now());
                             // Resuming after a pause means the first frame
                             // back out of the encoder must be a keyframe —
                             // nothing decodable was produced while paused.
@@ -2933,6 +3083,7 @@ async fn destination_pump(
                                 tracing::info!("stream {stream_id} got a keyframe request while paused; resuming its encoder");
                                 branch.set_paused(false, stream_id);
                                 paused = false;
+                                runtime.lock().unwrap().restart_silence_clock(Instant::now());
                             }
                             if let Some(pad) = branch.keyframe_pad() {
                                 force_keyframe(&pad);
@@ -2980,10 +3131,12 @@ async fn destination_pump(
                                 }
                                 branch = Some(new_branch);
                                 branch_ended = false;
+                                runtime.lock().unwrap().restart_silence_clock(Instant::now());
                                 let _ = reply.send(Ok(()));
                             }
                             branch::SwapOutcome::KeptOld(old, e) => {
                                 branch = Some(old);
+                                runtime.lock().unwrap().restart_silence_clock(Instant::now());
                                 let _ = reply.send(Err(format!("{e:#}")));
                             }
                         }
@@ -3192,6 +3345,15 @@ pub mod destination {
     /// down, frequent enough that the viewer's decoder keeps receiving
     /// decodable frames and never times its stream out.
     pub const STALL_RESEND_INTERVAL: Duration = Duration::from_millis(500);
+
+    /// How long a `Live` destination's branch may go without producing an
+    /// access unit before it counts as stalled (see
+    /// [`DestinationRuntime::stall_if_silent`]). Floored at three frame
+    /// periods so a deliberately low framerate is never mistaken for silence.
+    pub fn silence_threshold(framerate: u32) -> Duration {
+        let three_frames = Duration::from_millis(3000 / u64::from(framerate.max(1)));
+        three_frames.max(Duration::from_secs(3))
+    }
 
     /// Why a destination is in [`DestinationState::Stalled`]. Only ever a
     /// *capture-source-level* cause: per the plan doc's three-tier model,
@@ -3489,6 +3651,9 @@ pub mod destination {
         /// Last IDR seen from the authoritative branch, re-sent while stalled.
         last_idr: Option<Vec<u8>>,
         last_stall_resend: Option<Instant>,
+        /// When the authoritative branch last produced an access unit; the
+        /// input to [`Self::stall_if_silent`].
+        last_frame_at: Option<Instant>,
         params: VideoParams,
     }
 
@@ -3503,6 +3668,7 @@ pub mod destination {
                 last_sent_pts_us: None,
                 last_idr: None,
                 last_stall_resend: None,
+                last_frame_at: None,
                 params,
             }
         }
@@ -3666,6 +3832,7 @@ pub mod destination {
         /// [`Self::finish_rebuild`], which the swap orchestrator calls once it
         /// has actually seen the *new* branch's first IDR.
         pub fn note_encoded_frame(&mut self, keyframe: bool, payload: &[u8], now: Instant) {
+            self.last_frame_at = Some(now);
             if keyframe {
                 self.last_idr = Some(payload.to_vec());
             }
@@ -3730,6 +3897,41 @@ pub mod destination {
                 // full interval, so the advisory flag reaches the viewer as
                 // promptly as possible.
                 self.last_stall_resend = None;
+            }
+        }
+
+        /// The silence watchdog: a `Live` destination whose branch has
+        /// produced nothing for `silence` enters [`StallReason::SourceLost`],
+        /// which starts the cached-IDR keepalive. Returns whether it did.
+        ///
+        /// `Why:` the stall protocol's whole purpose is that a viewer's stream
+        /// survives a capture that stops delivering — but until now only a
+        /// *deliberate* source restart ([`branch::stall_all`]) ever entered
+        /// it. A source that simply went quiet (the compositor not answering,
+        /// a portal hiccup) left the viewer with no frames and no sign why,
+        /// until its own no-frames-in-3s backstop fired. With `keepalive-time`
+        /// a healthy static screen never trips this; it is the net underneath
+        /// that.
+        ///
+        /// Only `Live` stalls: `Starting` has no IDR to resend, `Rebuilding`
+        /// has its own bounded lifetime, and the caller must not call this
+        /// for a deliberately paused (valve-closed) branch.
+        pub fn stall_if_silent(&mut self, now: Instant, silence: Duration) -> bool {
+            let Some(last) = self.last_frame_at else { return false };
+            if self.state != DestinationState::Live || now.saturating_duration_since(last) < silence {
+                return false;
+            }
+            self.begin_stall(StallReason::SourceLost, now);
+            self.is_stalled()
+        }
+
+        /// Count silence from `now` rather than from the last frame: called
+        /// when the branch was deliberately not producing (resumed from a
+        /// pause, or the pump was busy swapping), so that gap is not mistaken
+        /// for a dead source by [`Self::stall_if_silent`].
+        pub fn restart_silence_clock(&mut self, now: Instant) {
+            if self.last_frame_at.is_some() {
+                self.last_frame_at = Some(now);
             }
         }
 
@@ -3884,6 +4086,59 @@ pub mod destination {
 
             runtime.note_encoded_frame(true, b"new-idr", now + Duration::from_secs(3));
             assert_eq!(runtime.state(), DestinationState::Live);
+        }
+
+        #[test]
+        fn a_live_destination_that_goes_silent_stalls_and_a_real_idr_revives_it() {
+            let now = t0();
+            let mut runtime = DestinationRuntime::new(now, params(30));
+            let silence = silence_threshold(30);
+            runtime.note_encoded_frame(true, b"idr", now);
+
+            assert!(!runtime.stall_if_silent(now + silence - Duration::from_millis(1), silence));
+            assert!(runtime.stall_if_silent(now + silence, silence));
+            assert!(matches!(runtime.state(), DestinationState::Stalled { reason: StallReason::SourceLost, .. }));
+            // The cached IDR is what the stall protocol re-sends.
+            assert_eq!(runtime.stall_resend_due(now + silence).as_deref(), Some(&b"idr"[..]));
+            // Already stalled: no second transition.
+            assert!(!runtime.stall_if_silent(now + silence * 2, silence));
+
+            runtime.note_encoded_frame(true, b"idr2", now + silence * 2);
+            assert_eq!(runtime.state(), DestinationState::Live);
+        }
+
+        #[test]
+        fn silence_never_stalls_a_destination_that_has_nothing_to_resend_or_is_not_live() {
+            let now = t0();
+            let silence = silence_threshold(30);
+            let mut starting = DestinationRuntime::new(now, params(30));
+            assert!(!starting.stall_if_silent(now + silence * 10, silence), "Starting has no frame yet");
+
+            let mut rebuilding = DestinationRuntime::new(now, params(30));
+            rebuilding.note_encoded_frame(true, b"idr", now);
+            rebuilding.begin_rebuild(now);
+            assert!(!rebuilding.stall_if_silent(now + silence * 10, silence), "a rebuild has its own bound");
+        }
+
+        #[test]
+        fn a_pause_or_busy_pump_does_not_count_as_silence() {
+            let now = t0();
+            let silence = silence_threshold(30);
+            let mut runtime = DestinationRuntime::new(now, params(30));
+            runtime.note_encoded_frame(true, b"idr", now);
+            // Paused for a minute, then resumed.
+            runtime.restart_silence_clock(now + Duration::from_secs(60));
+            assert!(!runtime.stall_if_silent(now + Duration::from_secs(60) + Duration::from_millis(500), silence));
+        }
+
+        #[test]
+        fn the_silence_threshold_scales_with_a_low_framerate() {
+            assert_eq!(silence_threshold(30), Duration::from_secs(3));
+            assert_eq!(silence_threshold(144), Duration::from_secs(3));
+            // At 1 fps a frame every second is normal; 3 frame periods = 3s,
+            // at 0 (defensive) it must not divide by zero.
+            assert!(silence_threshold(1) >= Duration::from_secs(3));
+            assert!(silence_threshold(0) >= Duration::from_secs(3));
         }
 
         #[test]
@@ -4826,6 +5081,135 @@ pub mod branch {
         id: BranchId,
         settings: EncodeSettings,
     ) -> Result<(EncodeBranch, gst::Sample)> {
+        add_branch_live_waiting(pipeline, tee, id, settings, SourceWait::Bounded(SOURCE_FRAME_TIMEOUT)).await
+    }
+
+    /// How long [`add_branch_live`] gives an *already-running* capture to hand
+    /// the tee its next buffer before giving up. With `keepalive-time` that
+    /// is one frame period, so anything near this means the source is dead
+    /// (not idle), and a branch swap should fail back to its old branch
+    /// rather than hold the destination's pump forever.
+    pub const SOURCE_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// How long a capture may stay silent before [`wait_for_source_frame`]
+    /// starts saying so in the log.
+    const SOURCE_SILENCE_WARN_AFTER: Duration = Duration::from_secs(3);
+
+    /// How [`add_branch_live_waiting`] waits for the capture source's next
+    /// buffer.
+    #[derive(Debug, Clone, Copy)]
+    pub enum SourceWait {
+        /// Fail with an error after this long.
+        Bounded(Duration),
+        /// Wait as long as the capture is alive. For a destination's *first*
+        /// branch and for rebuilding after a source restart, where "the
+        /// screen has not changed yet" is a normal state, not a failure.
+        Indefinite,
+    }
+
+    /// Resolves once the capture source has handed the `tee` a buffer —
+    /// **before** the encode branch is built, so the encoder's IDR deadline
+    /// ([`FIRST_IDR_TIMEOUT`]) only ever measures the encoder.
+    ///
+    /// # Why this exists — "sharing an idle monitor dies"
+    ///
+    /// `Why:` a portal `ScreenCast` stream on wlroots (`xdg-desktop-portal-wlr`
+    /// over `wlr-screencopy`'s `copy_with_damage`) is **damage-driven in the
+    /// strictest sense**: the compositor answers a capture request only when
+    /// the output commits a new frame. On a monitor where nothing repaints it
+    /// does not even answer the *first* request, so `pipewiresrc` never
+    /// receives a single buffer. Measured on this machine against the real
+    /// portal, DP-1 idle: `GST_DEBUG=pipewiresrc:6` shows the stream reach
+    /// `streaming`, two buffers allocated, and then `popped buffer (nil)`
+    /// forever; 0.0 fps at the tee for 20s. One pointer movement onto the
+    /// monitor produced a frame, and from then on `keepalive-time` held a
+    /// steady ~29 fps with the pointer gone.
+    ///
+    /// So `keepalive-time` is correct and necessary, but it can only *repeat*
+    /// a buffer the element already has; it cannot conjure the first. Before
+    /// this wait existed, the first destination's branch was built against a
+    /// silent tee, burned its 5s IDR deadline on the hardware encoder, burned
+    /// another 5s on the software retry, and the share died with "encode
+    /// branch produced no IDR" — blaming the encoder for a screen that simply
+    /// had not changed.
+    ///
+    /// Waiting is the honest behaviour: the destination stays "starting" and
+    /// the share comes up the moment anything on that monitor changes. It
+    /// returns an error only if `wait` is bounded and expires, or the capture
+    /// pipeline is torn down underneath it (so a stopped capture never leaves
+    /// this task parked forever).
+    ///
+    /// Implemented as a one-shot `BUFFER` probe on the tee's sink pad. In the
+    /// steady state (a capture that already has a last buffer) the keepalive
+    /// makes it fire within one frame period.
+    pub async fn wait_for_source_frame(pipeline: &gst::Pipeline, tee: &gst::Element, wait: SourceWait) -> Result<()> {
+        let pad = tee.static_pad("sink").ok_or_else(|| anyhow!("tee has no sink pad"))?;
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<()>();
+        let tx = Mutex::new(Some(tx));
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let probe_fired = fired.clone();
+        let probe_id = pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+            if let Some(tx) = tx.lock().unwrap().take() {
+                probe_fired.store(true, Ordering::Release);
+                let _ = tx.send(());
+            }
+            gst::PadProbeReturn::Remove
+        });
+        // Dropping this future (the caller gave up) must not leave a probe
+        // behind on a pad that outlives it.
+        struct ProbeGuard {
+            pad: gst::Pad,
+            id: Option<gst::PadProbeId>,
+            fired: Arc<std::sync::atomic::AtomicBool>,
+        }
+        impl Drop for ProbeGuard {
+            fn drop(&mut self) {
+                if let Some(id) = self.id.take()
+                    && !self.fired.load(Ordering::Acquire)
+                {
+                    self.pad.remove_probe(id);
+                }
+            }
+        }
+        let _guard = ProbeGuard { pad, id: probe_id, fired };
+
+        let started = Instant::now();
+        let mut warned = false;
+        loop {
+            tokio::select! {
+                _ = &mut rx => return Ok(()),
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                    if pipeline.current_state() == gst::State::Null {
+                        return Err(anyhow!("the capture was stopped before its source produced a frame"));
+                    }
+                    let waited = started.elapsed();
+                    if let SourceWait::Bounded(limit) = wait
+                        && waited >= limit
+                    {
+                        return Err(anyhow!("the capture source produced no frame within {limit:?}"));
+                    }
+                    if !warned && waited >= SOURCE_SILENCE_WARN_AFTER {
+                        warned = true;
+                        tracing::warn!(
+                            "the capture source has produced no frame in {waited:?}: an idle monitor only \
+                             delivers a frame once something on it changes; waiting rather than failing"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`add_branch_live`] with an explicit policy for how long to wait for the
+    /// capture source's next buffer first — see [`wait_for_source_frame`].
+    pub async fn add_branch_live_waiting(
+        pipeline: &gst::Pipeline,
+        tee: &gst::Element,
+        id: BranchId,
+        settings: EncodeSettings,
+        source_wait: SourceWait,
+    ) -> Result<(EncodeBranch, gst::Sample)> {
+        wait_for_source_frame(pipeline, tee, source_wait).await?;
         let mut branch = construct_branch_bounded(pipeline, tee, id, settings).await?;
         match branch.wait_for_first_idr(FIRST_IDR_TIMEOUT).await {
             Ok(sample) => Ok((branch, sample)),
@@ -4984,13 +5368,32 @@ pub mod branch {
         // whole event chain inline on the tee's streaming thread) out of the
         // hot path is worth the one atomic. `Relaxed` is sufficient: the flag
         // guards an idempotent operation, not the publication of any data.
-        let probe_sink_pad = branch_sink_pad.clone();
-        let sent_eos = std::sync::atomic::AtomicBool::new(false);
-        tee_pad.add_probe(gst::PadProbeType::BLOCK_DOWNSTREAM, move |_pad, _info| {
-            if !sent_eos.swap(true, Ordering::Relaxed) && !probe_sink_pad.send_event(gst::event::Eos::new()) {
-                tracing::warn!("encode branch removal: EOS was not accepted by the branch's entry pad");
+        let sent_eos = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let send_eos_once = {
+            let sink_pad = branch_sink_pad.clone();
+            let sent_eos = sent_eos.clone();
+            move || {
+                if !sent_eos.swap(true, Ordering::Relaxed) && !sink_pad.send_event(gst::event::Eos::new()) {
+                    tracing::warn!("encode branch removal: EOS was not accepted by the branch's entry pad");
+                }
             }
+        };
+        let send_eos_in_block = send_eos_once.clone();
+        tee_pad.add_probe(gst::PadProbeType::BLOCK_DOWNSTREAM, move |_pad, _info| {
+            send_eos_in_block();
             gst::PadProbeReturn::Drop
+        });
+        // `Why a second, IDLE probe:` the BLOCK_DOWNSTREAM probe above only
+        // fires when *something* is pushed through the tee pad. On a silent
+        // source (an idle desktop — the portal only delivers a buffer on
+        // damage) nothing ever is, so the EOS would never be injected and the
+        // drain below would always burn its full 5s timeout ("did not drain to
+        // EOS within 5s"), leaving the branch's encoder undrained. An IDLE
+        // probe fires immediately when the pad has nothing in flight, and
+        // `send_eos_once`'s shared flag keeps the two from both sending.
+        tee_pad.add_probe(gst::PadProbeType::IDLE, move |_pad, _info| {
+            send_eos_once();
+            gst::PadProbeReturn::Remove
         });
 
         // Wait for that EOS to actually reach the branch's appsink — not
@@ -5216,9 +5619,21 @@ pub mod branch {
         let running_time_us = pipeline.current_running_time().map(|t| t.useconds()).unwrap_or(0);
         runtime.lock().unwrap().on_pipeline_start(running_time_us, Instant::now());
 
-        let (branch, first_idr) = add_branch_live(pipeline, tee, id, params.to_encode_settings())
-            .await
-            .inspect_err(|e| runtime.lock().unwrap().fail(format!("capture restart failed: {e:#}")))?;
+        // Indefinite wait: a freshly restarted capture on an idle monitor has
+        // no frame to give until something changes (see
+        // [`wait_for_source_frame`]), and the destination is `Stalled` — its
+        // viewers are being fed the cached IDR meanwhile — which is exactly
+        // the state this protocol exists for. Failing here would turn "the
+        // screen is idle" into a dead share.
+        let (branch, first_idr) = add_branch_live_waiting(
+            pipeline,
+            tee,
+            id,
+            params.to_encode_settings(),
+            SourceWait::Indefinite,
+        )
+        .await
+        .inspect_err(|e| runtime.lock().unwrap().fail(format!("capture restart failed: {e:#}")))?;
 
         // The first IDR is what actually ends the stall — feed it through the
         // same accounting a normal frame takes, so the cached IDR and the
@@ -6421,6 +6836,9 @@ pub mod branch {
         struct PipeWireProducer {
             pipeline: gst::Pipeline,
             node_id: u32,
+            /// Present only for [`PipeWireProducer::start_static`]: the gate
+            /// that goes silent after the first few frames.
+            gate: Option<gst::Element>,
         }
 
         impl Drop for PipeWireProducer {
@@ -6431,14 +6849,40 @@ pub mod branch {
 
         impl PipeWireProducer {
             fn start(width: u32, height: u32) -> Option<Self> {
-                let node_name = format!("sss-regression-source-{}", std::process::id());
+                Self::start_inner(width, height, false)
+            }
+
+            /// A **damage-driven** producer on an idle desktop: it delivers a
+            /// handful of frames while the stream is being set up and then
+            /// goes completely silent, exactly like a compositor with nothing
+            /// to repaint. Call [`Self::go_silent`] once the consumer is
+            /// connected to stop it (or leave it: the gate closes by itself
+            /// after the first buffer).
+            fn start_static(width: u32, height: u32) -> Option<Self> {
+                Self::start_inner(width, height, true)
+            }
+
+            fn go_silent(&self) {
+                if let Some(gate) = &self.gate {
+                    gate.set_property("drop", true);
+                }
+            }
+
+            fn start_inner(width: u32, height: u32, with_gate: bool) -> Option<Self> {
+                static PRODUCER_SEQ: AtomicU32 = AtomicU32::new(0);
+                let node_name = format!(
+                    "sss-regression-source-{}-{}",
+                    std::process::id(),
+                    PRODUCER_SEQ.fetch_add(1, Ordering::Relaxed)
+                );
                 // `stream-properties` takes a `GstStructure` in
                 // launch syntax — unquoted, or the quotes end up inside the
                 // property value and the node keeps its default name.
+                let gate = if with_gate { "valve name=gate drop=false ! " } else { "" };
                 let description = format!(
                     "videotestsrc is-live=true pattern=ball \
                      ! video/x-raw,format=BGRx,width={width},height={height},framerate=60/1 \
-                     ! pipewiresink mode=provide stream-properties=props,node.name={node_name}"
+                     ! {gate}pipewiresink mode=provide stream-properties=props,node.name={node_name}"
                 );
                 let Ok(element) = gst::parse::launch(&description) else {
                     return None;
@@ -6462,7 +6906,10 @@ pub mod branch {
                     std::thread::sleep(Duration::from_millis(100));
                 };
                 match node_id {
-                    Some(node_id) => Some(Self { pipeline, node_id }),
+                    Some(node_id) => {
+                        let gate = pipeline.by_name("gate");
+                        Some(Self { pipeline, node_id, gate })
+                    }
                     None => {
                         let _ = pipeline.set_state(gst::State::Null);
                         None
@@ -6566,6 +7013,228 @@ pub mod branch {
                 .await
                 .expect("cleanup should not hang")
                 .expect("cleanup should succeed");
+            built.pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+        }
+
+        /// **Regression (static desktop):** a destination branch must come up,
+        /// and keep producing, against a *damage-driven* PipeWire producer that
+        /// has gone completely silent — the shape of an idle monitor.
+        ///
+        /// `Why:` sharing an idle monitor through the real portal ended with
+        /// "encode branch produced no IDR within 5s" while a repainting monitor
+        /// worked. [`a_destination_branch_comes_up_against_a_real_pipewire_source`]
+        /// cannot see that, because its producer repaints at 60 fps forever.
+        #[tokio::test]
+        async fn a_destination_branch_comes_up_against_a_silent_pipewire_source() {
+            if gst::init().is_err() {
+                eprintln!("skipping: gstreamer not available in this environment");
+                return;
+            }
+            let Some(producer) = PipeWireProducer::start_static(1920, 1080) else {
+                eprintln!("skipping: no usable PipeWire daemon/pipewiresink/pw-dump in this environment");
+                return;
+            };
+
+            let built = super::super::build_pipeline(&format!(
+                "pipewiresrc path={} do-timestamp=true keepalive-time=33",
+                producer.node_id
+            ))
+            .expect("pipeline should construct");
+            built.pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+            assert!(
+                wait_until_playing(&built.pipeline, Duration::from_secs(30)),
+                "pipeline never reached PLAYING"
+            );
+            // The compositor delivered what it had; from now on nothing changes.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            producer.go_silent();
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            eprintln!(
+                "[static] raw frames off the tee while the producer is silent: {:.1} fps",
+                tap_tee_rate(&built.pipeline, &built.tee, Duration::from_millis(1500))
+            );
+
+            let (width, height) = super::super::negotiated_size(&built.tee).unwrap_or((0, 0));
+            assert!(width > 0 && height > 0, "the tee should have negotiated a real frame size");
+            let settings = EncodeSettings {
+                width: width as u32,
+                height: height as u32,
+                framerate: 30,
+                bitrate_kbps: 4_000,
+                backend: EncoderBackend::Software,
+                tune: TuneMode::default(),
+                quality_level: QualityLevel::default(),
+                rate_control: RateControlMode::default(),
+                gop_millis: DEFAULT_GOP_MILLIS,
+                codec: VideoCodec::default(),
+            };
+            let started = Instant::now();
+            let result = add_branch_live(&built.pipeline, &built.tee, BranchId(1), settings).await;
+            eprintln!("[static] first IDR after {:?}", started.elapsed());
+            let (branch, _first_idr) =
+                result.expect("a destination branch must come up against a silent (static-desktop) source");
+            let measured = Instant::now();
+            let mut count = 0u32;
+            while measured.elapsed() < Duration::from_secs(3) {
+                if branch.appsink.try_pull_sample(gst::ClockTime::from_mseconds(50)).is_some() {
+                    count += 1;
+                }
+            }
+            eprintln!("[static] {count} encoded access units in 3s after the first IDR");
+            assert!(count >= 20, "a static source must keep producing at roughly the branch rate, got {count} in 3s");
+
+            tokio::time::timeout(Duration::from_secs(10), remove_branch(&built.pipeline, &built.tee, branch))
+                .await
+                .expect("cleanup should not hang")
+                .expect("cleanup should succeed");
+            built.pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+        }
+
+        /// A running capture whose source can be silenced: a `videotestsrc`
+        /// behind a `valve`, standing in for a damage-driven portal stream on
+        /// an idle monitor. Close the gate with [`set_gate_closed`].
+        ///
+        /// `Why the gate starts open and is closed after PLAYING:` the fixed
+        /// preview branches' appsinks need a first buffer to preroll, so a
+        /// test pipeline whose source never delivers cannot reach `Playing`.
+        /// The real portal pipeline does (its source is a live element that
+        /// reports no-preroll); what these tests need is "the tee currently
+        /// gets nothing", which is the same thing from the waiter's side.
+        fn gated_capture() -> super::super::CapturePipeline {
+            let built = super::super::build_pipeline(
+                "videotestsrc is-live=true pattern=smpte \
+                 ! video/x-raw,width=64,height=64,framerate=30/1 \
+                 ! valve name=gate drop=false",
+            )
+            .expect("pipeline should construct");
+            built.pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+            assert!(wait_until_playing(&built.pipeline, Duration::from_secs(30)), "pipeline never reached PLAYING");
+            built
+        }
+
+        fn set_gate_closed(built: &super::super::CapturePipeline, closed: bool) {
+            built.pipeline.by_name("gate").expect("gate").set_property("drop", closed);
+        }
+
+        /// **Regression (idle monitor):** a destination added to a capture
+        /// that has not produced a frame yet must *wait*, not fail — and come
+        /// up as soon as the first frame arrives.
+        ///
+        /// The wait is deliberately longer than twice [`FIRST_IDR_TIMEOUT`]:
+        /// before the fix, a silent source burned the hardware encoder's 5s
+        /// deadline, then the software retry's, and the share died with
+        /// "encode branch produced no IDR".
+        #[tokio::test]
+        async fn a_destination_waits_for_the_first_frame_of_an_idle_source_instead_of_failing() {
+            if gst::init().is_err() {
+                eprintln!("skipping: gstreamer not available in this environment");
+                return;
+            }
+            let built = gated_capture();
+            set_gate_closed(&built, true);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            let pipeline = built.pipeline.clone();
+            let tee = built.tee.clone();
+            let task = tokio::spawn(async move {
+                add_branch_live_waiting(&pipeline, &tee, BranchId(1), small_settings(), SourceWait::Indefinite).await
+            });
+
+            tokio::time::sleep(FIRST_IDR_TIMEOUT + Duration::from_millis(500)).await;
+            assert!(!task.is_finished(), "the destination must keep waiting for an idle source, not fail");
+
+            // The screen finally changes.
+            set_gate_closed(&built, false);
+            let result = tokio::time::timeout(Duration::from_secs(20), task)
+                .await
+                .expect("the branch must come up promptly once a frame arrives")
+                .expect("task must not panic");
+            let (branch, _idr) = result.expect("branch should come up once the source produces");
+
+            tokio::time::timeout(Duration::from_secs(10), remove_branch(&built.pipeline, &built.tee, branch))
+                .await
+                .expect("cleanup should not hang")
+                .expect("cleanup should succeed");
+            built.pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+        }
+
+        /// The bounded flavour (used by branch swaps) still fails on a dead
+        /// source, and a stopped capture releases a waiter instead of leaving
+        /// it parked forever.
+        #[tokio::test]
+        async fn waiting_for_a_source_frame_is_bounded_when_asked_and_ends_when_the_capture_stops() {
+            if gst::init().is_err() {
+                eprintln!("skipping: gstreamer not available in this environment");
+                return;
+            }
+            let built = gated_capture();
+            set_gate_closed(&built, true);
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            let err = wait_for_source_frame(&built.pipeline, &built.tee, SourceWait::Bounded(Duration::from_millis(600)))
+                .await
+                .expect_err("a bounded wait on a dead source must fail");
+            assert!(format!("{err:#}").contains("no frame"), "{err:#}");
+
+            let pipeline = built.pipeline.clone();
+            let tee = built.tee.clone();
+            let waiter =
+                tokio::spawn(async move { wait_for_source_frame(&pipeline, &tee, SourceWait::Indefinite).await });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(!waiter.is_finished());
+            built.pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+            let err = tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("stopping the capture must release the waiter")
+                .expect("task must not panic")
+                .expect_err("a stopped capture is an error for the waiter");
+            assert!(format!("{err:#}").contains("stopped"), "{err:#}");
+        }
+
+        /// `awaiting_first_frame`'s flag is false until a buffer reaches the
+        /// tee, and true after.
+        #[tokio::test]
+        async fn the_capture_reports_when_it_has_produced_its_first_frame() {
+            if gst::init().is_err() {
+                eprintln!("skipping: gstreamer not available in this environment");
+                return;
+            }
+            let built = super::super::build_pipeline(
+                "videotestsrc is-live=true pattern=smpte ! video/x-raw,width=64,height=64,framerate=30/1",
+            )
+            .expect("pipeline should construct");
+            assert!(!built.frame_seen.load(Ordering::Acquire), "nothing has run yet");
+            built.pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+            assert!(wait_until_playing(&built.pipeline, Duration::from_secs(30)), "pipeline never reached PLAYING");
+            assert!(built.frame_seen.load(Ordering::Acquire), "a running source must have flipped the flag");
+            built.pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+        }
+
+        /// Removing a branch from a capture that has gone silent must drain
+        /// promptly. The EOS used to be injected only from a probe that fires
+        /// on the next *buffer*, so on a silent source every removal burned its
+        /// full 5s drain timeout ("did not drain to EOS within 5s") — which is
+        /// what a failed share on an idle monitor logged right after the IDR
+        /// error.
+        #[tokio::test]
+        async fn removing_a_branch_from_a_silent_capture_does_not_wait_out_the_drain_timeout() {
+            if gst::init().is_err() {
+                eprintln!("skipping: gstreamer not available in this environment");
+                return;
+            }
+            let built = gated_capture();
+            let branch = add_branch(&built.pipeline, &built.tee, BranchId(1), small_settings())
+                .expect("branch should build");
+            assert!(wait_for_sample(&branch.appsink, Duration::from_secs(20)), "branch produced nothing");
+
+            // The screen goes idle for good (no keepalive in this test).
+            set_gate_closed(&built, true);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            let started = Instant::now();
+            remove_branch(&built.pipeline, &built.tee, branch).await.expect("removal should succeed");
+            let took = started.elapsed();
+            assert!(took < Duration::from_secs(3), "removal from a silent capture took {took:?}; it waited out the drain timeout");
             built.pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
         }
 
@@ -8055,6 +8724,9 @@ mod tests {
         let source = CaptureSource::Portal(portal);
         let fragment = source.launch_fragment(DEFAULT_FRAMERATE);
         eprintln!("[portal] source fragment: {fragment}");
+        if let CaptureSource::Portal(p) = &source {
+            eprintln!("[portal] node_id={} position={:?}", p.node_id, p.position);
+        }
 
         let built = start_pipeline(&fragment).expect("real capture pipeline should start");
         let (width, height) = negotiated_size(&built.tee).unwrap_or((0, 0));
@@ -8085,7 +8757,9 @@ mod tests {
             gop_millis: DEFAULT_GOP_MILLIS,
             codec: VideoCodec::default(),
         };
+        let idr_started = Instant::now();
         let result = branch::add_branch_live(&built.pipeline, &built.tee, branch::BranchId(0), settings).await;
+        eprintln!("[portal] add_branch_live returned after {:?} (ok={})", idr_started.elapsed(), result.is_ok());
         let (branch, _idr) = match result {
             Ok(v) => v,
             Err(e) => {
@@ -8096,23 +8770,252 @@ mod tests {
         eprintln!("[portal] first IDR received; branch is live");
 
         // Keep it running long enough to prove it is not a one-frame fluke.
-        let deadline = Instant::now() + Duration::from_secs(3);
+        // `SSS_LIVE_SECONDS` lengthens the soak (e.g. 60 for the idle-monitor
+        // check: the branch must keep producing at its configured rate for the
+        // whole time, not just emit the one proving IDR).
+        let seconds: u64 = std::env::var("SSS_LIVE_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+        let deadline = Instant::now() + Duration::from_secs(seconds);
         let mut samples = 0u32;
+        let mut last_report = Instant::now();
+        let mut since_report = 0u32;
         while Instant::now() < deadline {
             if branch.appsink.try_pull_sample(gst::ClockTime::from_mseconds(100)).is_some() {
                 samples += 1;
+                since_report += 1;
+            }
+            if last_report.elapsed() >= Duration::from_secs(5) {
+                eprintln!("[portal] {:.1} encoded fps over the last 5s", since_report as f64 / 5.0);
+                since_report = 0;
+                last_report = Instant::now();
             }
         }
-        eprintln!("[portal] {samples} encoded access units in 3s");
+        eprintln!("[portal] {samples} encoded access units in {seconds}s");
         // Deliberately a loose floor, not a rate check: a genuinely static
         // desktop produces very little damage, so the honest guarantee here is
         // "frames keep coming after the first IDR", which is what the failure
         // this test exists for (zero, forever) violates. Measured on an
         // ordinarily-active desktop this lands around 90 (~30fps).
-        assert!(samples >= 5, "a real capture should keep producing encoded frames, got {samples} in 3s");
+        assert!(
+            samples as u64 >= seconds.max(3) * 5 / 3,
+            "a real capture should keep producing encoded frames, got {samples} in {seconds}s"
+        );
 
         let _ = branch::remove_branch(&built.pipeline, &built.tee, branch).await;
         built.pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+    }
+
+    #[cfg(unix)]
+    mod picker_cancel {
+        use super::super::*;
+        use ashpd::zbus;
+
+        /// The exact error the real portal returned when the picker was
+        /// SIGTERMed (captured from `live_portal_probe`).
+        fn invalid_session_method_error() -> zbus::Error {
+            let call = zbus::Message::method_call("/org/freedesktop/portal/desktop", "Start")
+                .unwrap()
+                .build(&())
+                .unwrap();
+            let reply = zbus::Message::error(&call.header(), "org.freedesktop.DBus.Error.AccessDenied")
+                .unwrap()
+                .build(&"Invalid session")
+                .unwrap();
+            zbus::Error::MethodError(
+                "org.freedesktop.DBus.Error.AccessDenied".try_into().unwrap(),
+                Some("Invalid session".to_string()),
+                reply,
+            )
+        }
+
+        #[test]
+        fn the_real_dismissed_picker_error_is_a_cancel() {
+            let e = ashpd::Error::Portal(ashpd::PortalError::ZBus(invalid_session_method_error()));
+            assert!(is_portal_user_cancel(&e));
+        }
+
+        #[test]
+        fn the_fdo_mapped_form_of_it_is_a_cancel_too() {
+            let fdo = zbus::fdo::Error::AccessDenied("Invalid session".to_string());
+            let e = ashpd::Error::Portal(ashpd::PortalError::ZBus(zbus::Error::FDO(Box::new(fdo))));
+            assert!(is_portal_user_cancel(&e));
+        }
+
+        #[test]
+        fn the_standard_portal_cancel_codes_are_cancels() {
+            assert!(is_portal_user_cancel(&ashpd::Error::Response(ashpd::desktop::ResponseError::Cancelled)));
+            assert!(is_portal_user_cancel(&ashpd::Error::Portal(ashpd::PortalError::Cancelled("x".into()))));
+        }
+
+        #[test]
+        fn real_failures_are_not_cancels() {
+            assert!(!is_portal_user_cancel(&ashpd::Error::Response(ashpd::desktop::ResponseError::Other)));
+            assert!(!is_portal_user_cancel(&ashpd::Error::Portal(ashpd::PortalError::Failed("x".into()))));
+            assert!(!is_portal_user_cancel(&ashpd::Error::Portal(ashpd::PortalError::NotAllowed("x".into()))));
+            assert!(!is_portal_user_cancel(&ashpd::Error::NoResponse));
+            // AccessDenied for some *other* reason is a real denial.
+            let other = zbus::fdo::Error::AccessDenied("not on the allow-list".to_string());
+            assert!(!is_portal_user_cancel(&ashpd::Error::Portal(ashpd::PortalError::ZBus(zbus::Error::FDO(
+                Box::new(other)
+            )))));
+        }
+
+        #[test]
+        fn a_cancel_is_recognised_through_anyhow_context() {
+            let e = anyhow::Error::new(PickerCancelled).context("starting capture");
+            assert!(is_picker_cancelled(&e));
+            assert!(!is_picker_cancelled(&anyhow!("boom")));
+        }
+    }
+
+    /// **The idle-monitor acceptance test**, against the real portal and a real
+    /// relay: share a monitor on which nothing is repainting, and prove a
+    /// viewer gets a frame and keeps getting them.
+    ///
+    /// What it exercises: `capture::start_sharing` must not fail while the
+    /// monitor is idle (the compositor delivers nothing until something on it
+    /// changes — see [`branch::wait_for_source_frame`]), must come up the
+    /// moment something changes, and must then hold a steady rate on
+    /// `keepalive-time` alone.
+    ///
+    /// The "something changes" is a pointer movement onto the picked monitor
+    /// (`ydotool`, after `E2E_NUDGE_AFTER_SECS`, default 7 — past both 5s IDR
+    /// deadlines the old code burned), restored afterwards via `mmsg get
+    /// cursorpos`. Set `E2E_NUDGE_AFTER_SECS=off` to skip it and watch the
+    /// share wait. `E2E_NUDGE_X`/`E2E_NUDGE_Y` are the global coordinates to
+    /// move onto (default: DP-1's centre on this machine).
+    /// `SSS_LIVE_SECONDS` (default 60) is how long the viewer is observed.
+    ///
+    /// Run via the picker-driving script, never unattended: it opens a portal
+    /// dialog, and needs `SSSHARE_SERVER_BIN` pointing at a relay binary.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "opens a real portal picker, moves the pointer, and spawns a real relay"]
+    async fn real_portal_idle_monitor_share_reaches_a_viewer_and_stays_alive() {
+        use crate::end_to_end_test::{connect_with_retry, pick_free_udp_port, spawn_relay_server};
+        use crate::net::ClientEvent;
+        use crate::protocol::RoomId;
+
+        const STREAM_ID: u8 = 1;
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+        let port = pick_free_udp_port().expect("port");
+        let _server = spawn_relay_server(port).expect("relay");
+        let join = crate::net::format_join_string(
+            &format!("127.0.0.1:{port}"),
+            &rand::random::<RoomId>(),
+            &rand::random::<[u8; 32]>(),
+        );
+        let (sharer, _s, mut events_a) = connect_with_retry(&join, "sharer").await.expect("sharer joins");
+        let (viewer, _s, mut events_b) = connect_with_retry(&join, "viewer").await.expect("viewer joins");
+        let owner = sharer.conn_id();
+
+        // The nudge: pointer onto the monitor, then back where it was.
+        let nudge_after = std::env::var("E2E_NUDGE_AFTER_SECS").unwrap_or_else(|_| "7".into());
+        let nudge = (nudge_after != "off").then(|| nudge_after.parse::<u64>().expect("E2E_NUDGE_AFTER_SECS"));
+        let nudge_task = tokio::spawn(async move {
+            let Some(after) = nudge else { return None };
+            tokio::time::sleep(Duration::from_secs(after)).await;
+            let sh = |cmd: &str| {
+                let out = std::process::Command::new("sh").arg("-c").arg(cmd).output().unwrap();
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            };
+            let before: serde_json::Value = serde_json::from_str(&sh("mmsg get cursorpos")).expect("cursorpos");
+            let x: i64 = std::env::var("E2E_NUDGE_X").ok().and_then(|v| v.parse().ok()).unwrap_or(2880);
+            let y: i64 = std::env::var("E2E_NUDGE_Y").ok().and_then(|v| v.parse().ok()).unwrap_or(1620);
+            // ydotool's absolute y is offset by the layout's -1080 on this machine.
+            sh(&format!("ydotool mousemove --absolute -x {x} -y {}", y - 1080));
+            let nudged_at = Instant::now();
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            sh(&format!(
+                "ydotool mousemove --absolute -x {} -y {}",
+                before["x"].as_i64().unwrap(),
+                before["y"].as_i64().unwrap() - 1080
+            ));
+            Some(nudged_at)
+        });
+
+        let begun = Instant::now();
+        eprintln!("[idle] t=0 calling start_sharing (real portal)");
+        let handle = match start_sharing(&sharer, STREAM_ID, DestKey(0), 8_000, 30).await {
+            Ok(h) => h,
+            Err(e) => panic!("sharing an idle monitor must not fail: {e:#}"),
+        };
+        let came_up = begun.elapsed();
+        eprintln!("[idle] share came up after {came_up:?}");
+        let nudged_at = nudge_task.await.expect("nudge task");
+        if let Some(nudged_at) = nudged_at {
+            eprintln!("[idle] pointer nudge was at t={:?}", nudged_at.duration_since(begun));
+        }
+
+        viewer.subscribe(owner, STREAM_ID).await.expect("viewer subscribe");
+        let seconds: u64 = std::env::var("SSS_LIVE_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+        let watch_start = Instant::now();
+        let mut decoder = crate::decode::StreamDecoder::new(STREAM_ID).expect("decoder");
+        let (mut frames, mut window_frames, mut decoded) = (0u32, 0u32, 0u32);
+        let mut first_frame_at: Option<Duration> = None;
+        let mut first_decoded_at: Option<Duration> = None;
+        let mut window_start = Instant::now();
+        let mut min_window_fps = f64::MAX;
+        let deadline = tokio::time::sleep(Duration::from_secs(seconds));
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => break,
+                ev = events_a.recv() => match ev {
+                    Some(ClientEvent::SubscriberCount { stream_id, count }) if stream_id == STREAM_ID => {
+                        handle.notify_subscriber_count(DestKey(0), count);
+                    }
+                    Some(ClientEvent::KeyframeRequest { stream_id }) if stream_id == STREAM_ID => {
+                        handle.notify_keyframe_request(DestKey(0));
+                    }
+                    Some(_) => {}
+                    None => break,
+                },
+                ev = events_b.recv() => match ev {
+                    Some(ClientEvent::MediaFrame(frame)) if frame.conn_id == owner && frame.stream_id == STREAM_ID => {
+                        frames += 1;
+                        window_frames += 1;
+                        first_frame_at.get_or_insert(watch_start.elapsed());
+                        // Decode only until the first picture: a debug-build
+                        // 1080p decode + colour conversion per frame is slower
+                        // than the stream and would make *this loop* the
+                        // bottleneck, reporting a rate the network never had.
+                        if first_decoded_at.is_none() {
+                            decoder.feed(&frame);
+                            if decoder.latest_frame().is_some() {
+                                decoded += 1;
+                                first_decoded_at = Some(watch_start.elapsed());
+                            }
+                        }
+                    }
+                    Some(_) => {}
+                    None => break,
+                },
+            }
+            if window_start.elapsed() >= Duration::from_secs(5) {
+                let fps = window_frames as f64 / window_start.elapsed().as_secs_f64();
+                eprintln!("[idle] t={:?} viewer media fps over the last 5s: {fps:.1}", watch_start.elapsed());
+                // The first window includes the subscribe/keyframe round trip.
+                if watch_start.elapsed() > Duration::from_secs(6) {
+                    min_window_fps = min_window_fps.min(fps);
+                }
+                window_frames = 0;
+                window_start = Instant::now();
+            }
+        }
+        eprintln!(
+            "[idle] viewer: {frames} media frames, {decoded} decoded; first frame {first_frame_at:?} and first \
+             decoded frame {first_decoded_at:?} after subscribing; slowest 5s window {min_window_fps:.1} fps; \
+             sharer encoder fps {}",
+            handle.encoder_fps(DestKey(0))
+        );
+        handle.stop().await.expect("the share should stop cleanly");
+        drop(viewer);
+
+        assert!(first_decoded_at.is_some_and(|t| t < Duration::from_secs(5)), "viewer decoded nothing promptly: {first_decoded_at:?}");
+        if seconds > 12 {
+            assert!(min_window_fps >= 10.0, "the share did not stay alive on a static screen: {min_window_fps:.1} fps");
+        }
     }
 
     /// Exercises the real xdg-desktop-portal `ScreenCast` flow end to end,

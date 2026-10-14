@@ -271,9 +271,32 @@ pub enum ShareHandle {
 /// `.stop()`), so each transition is spawned and its result delivered back
 /// via a oneshot, mirroring `Status`/`connect_rx` above.
 pub enum ShareStatus {
+    /// The start result's `Err` is a display string, except for the one value
+    /// [`SHARE_START_CANCELLED`], which means "the user dismissed the screen
+    /// picker" and is removed silently rather than shown as `share_error`.
     Starting(oneshot::Receiver<Result<ShareHandle, String>>),
     Active(ShareHandle),
     Stopping(oneshot::Receiver<Result<(), String>>),
+}
+
+/// The `Err` value a share-start task sends when the user **dismissed the OS
+/// screen picker** (`capture::is_picker_cancelled`). `poll_capture_states`
+/// removes such a capture without setting `share_error`: cancelling a dialog
+/// is not a failure and must not raise an error toast.
+///
+/// `Why a marker string and not a typed error:` `ShareStatus::Starting`
+/// carries `Result<ShareHandle, String>` and is constructed by tests and the
+/// UI directly; widening the error type would touch all of them for the sake
+/// of one value that is produced in exactly one place ([`start_error_string`])
+/// and consumed in exactly one (`poll_capture_states`). The leading NUL can
+/// never begin a real error message.
+pub const SHARE_START_CANCELLED: &str = "\0share-start-cancelled";
+
+/// Turn a capture-start failure into the `Err` a `ShareStatus::Starting`
+/// channel carries: [`SHARE_START_CANCELLED`] for a dismissed picker, the
+/// full error chain otherwise.
+fn start_error_string(e: &anyhow::Error) -> String {
+    if capture::is_picker_cancelled(e) { SHARE_START_CANCELLED.to_string() } else { format!("{e:#}") }
 }
 
 /// Audio destinations carry the video params struct inertly — there is no
@@ -1717,7 +1740,7 @@ impl AppState {
             let result = capture::start_sharing(&client, stream_id, DestKey(destination_id.0), bitrate_kbps, framerate)
                 .await
                 .map(ShareHandle::Video)
-                .map_err(|e| format!("{e:#}"));
+                .map_err(|e| start_error_string(&e));
             let _ = tx.send(result);
         });
     }
@@ -1755,7 +1778,7 @@ impl AppState {
         self.share_error = None;
 
         tokio::spawn(async move {
-            let result = capture::start_capture(framerate).await.map(ShareHandle::Video).map_err(|e| format!("{e:#}"));
+            let result = capture::start_capture(framerate).await.map(ShareHandle::Video).map_err(|e| start_error_string(&e));
             let _ = tx.send(result);
         });
         capture_id
@@ -2007,6 +2030,25 @@ impl AppState {
         for mut pending in std::mem::take(&mut self.pending_destinations) {
             match pending.rx.try_recv() {
                 Ok(Ok(handle)) => {
+                    // The destination was cancelled (or its whole capture
+                    // stopped) while its branch was still coming up. That
+                    // window is unbounded on an idle monitor, which only
+                    // delivers a first frame once something on it changes, so
+                    // this is a real case rather than a race: tear the
+                    // just-finished stream down instead of adopting a ghost
+                    // nobody can see or stop.
+                    let still_wanted = self
+                        .captures
+                        .get(&pending.capture_id)
+                        .is_some_and(|c| c.destinations.contains_key(&pending.destination_id));
+                    if !still_wanted {
+                        tokio::spawn(async move {
+                            if let Err(e) = handle.stop().await {
+                                tracing::warn!("stopping a cancelled destination did not finish cleanly: {e:#}");
+                            }
+                        });
+                        continue;
+                    }
                     let runtime = handle.runtime();
                     let client = self.rooms.get(&pending.room).map(|room| room.client.clone());
                     if let Some(capture) = self.captures.get_mut(&pending.capture_id) {
@@ -2067,7 +2109,16 @@ impl AppState {
                     }
                 }
                 Ok(Err(e)) => {
-                    self.share_error = Some(e);
+                    // Not an error the user should hear about when they are
+                    // the reason for it: the capture (or this destination) was
+                    // stopped while it was still waiting for its first frame.
+                    let still_wanted = self
+                        .captures
+                        .get(&pending.capture_id)
+                        .is_some_and(|c| c.destinations.contains_key(&pending.destination_id));
+                    if still_wanted {
+                        self.share_error = Some(e);
+                    }
                     self.forget_destination(pending.capture_id, pending.destination_id);
                     self.clear_transfer_marker(pending.capture_id, pending.role);
                 }
@@ -2143,6 +2194,19 @@ impl AppState {
             });
         }
         self.forget_destination(capture_id, destination_id);
+    }
+
+    /// `true` while `capture_id` is a running video capture that has never
+    /// produced a frame — the state an **idle monitor** is in until something
+    /// on it changes (see `capture::branch::wait_for_source_frame`). A
+    /// destination attached to it sits in `Starting` rather than failing, and
+    /// this is what a UI can use to explain why ("waiting for the shared
+    /// screen to change").
+    pub fn capture_awaiting_first_frame(&self, capture_id: CaptureSourceId) -> bool {
+        match self.captures.get(&capture_id).map(|c| &c.status) {
+            Some(ShareStatus::Active(ShareHandle::Video(handle))) => handle.awaiting_first_frame(),
+            _ => false,
+        }
     }
 
     /// "Retry" clicked on a Failed destination card: tear the dead branch
@@ -2726,7 +2790,11 @@ impl AppState {
                         capture.status = ShareStatus::Active(handle);
                     }
                     Ok(Err(e)) => {
-                        self.share_error = Some(e);
+                        // A dismissed picker is the user's own choice, not a
+                        // failure: drop the capture, say nothing.
+                        if e != SHARE_START_CANCELLED {
+                            self.share_error = Some(e);
+                        }
                         to_remove.push(*capture_id);
                     }
                     Err(oneshot::error::TryRecvError::Empty) => {}
@@ -4270,6 +4338,51 @@ mod ui_ops_tests {
         assert!(!state.captures.contains_key(&capture_id), "cancelled capture must be removed");
         assert!(state.share_error.is_none(), "a cancelled start is not an error");
         assert!(state.pending_destinations.is_empty());
+    }
+
+    /// The user dismissing the OS screen picker (nobody pressed Stop) must
+    /// drop the capture silently — no `share_error`, so no error toast.
+    #[tokio::test]
+    async fn a_dismissed_picker_removes_the_capture_without_an_error() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        let (capture_id, _dest) = insert_destination(&mut state);
+        let (tx, rx) = oneshot::channel();
+        state.captures.get_mut(&capture_id).unwrap().status = ShareStatus::Starting(rx);
+
+        let cancelled = anyhow::Error::new(capture::PickerCancelled);
+        assert!(tx.send(Err(start_error_string(&cancelled))).is_ok());
+        state.poll_capture_states();
+
+        assert!(!state.captures.contains_key(&capture_id), "a cancelled capture must be removed");
+        assert!(state.share_error.is_none(), "dismissing the picker is not an error: {:?}", state.share_error);
+    }
+
+    /// …while a real failure still reaches the user, wrapped in context or not.
+    #[tokio::test]
+    async fn a_real_start_failure_still_surfaces_as_a_share_error() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        let (capture_id, _dest) = insert_destination(&mut state);
+        let (tx, rx) = oneshot::channel();
+        state.captures.get_mut(&capture_id).unwrap().status = ShareStatus::Starting(rx);
+
+        let failure = anyhow::anyhow!("the portal exploded").context("screencast portal 'Start' request failed");
+        assert!(tx.send(Err(start_error_string(&failure))).is_ok());
+        state.poll_capture_states();
+
+        assert!(!state.captures.contains_key(&capture_id));
+        let shown = state.share_error.expect("a real failure must be reported");
+        assert!(shown.contains("the portal exploded"), "{shown}");
+    }
+
+    /// A cancel that has been wrapped in `.context(..)` further up the stack is
+    /// still a cancel.
+    #[test]
+    fn a_context_wrapped_cancel_is_still_recognised() {
+        let wrapped = anyhow::Error::new(capture::PickerCancelled).context("starting capture");
+        assert_eq!(start_error_string(&wrapped), SHARE_START_CANCELLED);
+        assert_ne!(start_error_string(&anyhow::anyhow!("boom")), SHARE_START_CANCELLED);
     }
 
     #[tokio::test]

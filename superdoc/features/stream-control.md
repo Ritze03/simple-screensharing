@@ -407,6 +407,91 @@ destinations).
 
 ---
 
+## Cancelling the screen picker is silent (2026-10-14)
+
+Dismissing the portal's picker (Esc, Cancel, or the picker being killed) used to surface
+as `screencast portal 'Start' request failed: ... Invalid session`. Measured against the
+real `xdg-desktop-portal-wlr-patched` + `wlr-share-picker`: the `Start` call itself fails,
+~1 s after the dismissal, with `org.freedesktop.DBus.Error.AccessDenied: Invalid session`
+(not a `Response` code). `capture::is_portal_user_cancel` classifies that, plus the
+standard `ResponseError::Cancelled` and `PortalError::Cancelled`, as a dismissal;
+everything else (`Failed`, `NotFound`, any other D-Bus error, missing portal) is still a
+real failure. A dismissal becomes `capture::PickerCancelled` (find it with
+`is_picker_cancelled`), which `session` turns into `SHARE_START_CANCELLED`: the capture is
+removed and `share_error` stays empty.
+
+---
+
+## Idle monitors: a capture can go without a first frame (2026-10-14)
+
+**Symptom:** sharing an idle monitor (nothing repainting) through the real portal ended
+with `VAAPI encode branch ... produced no IDR (... within 5s); retrying on software`, then
+`encode branch did not drain to EOS within 5s; removing it anyway`, and the share vanished.
+A monitor that repaints worked.
+
+**Root cause (measured, not inferred):** `xdg-desktop-portal-wlr` captures with
+`wlr-screencopy`'s `copy_with_damage`, and the compositor only answers when the output
+commits a new frame. On a monitor where nothing repaints it doesn't answer even the
+*first* request, so `pipewiresrc` never receives a buffer. `GST_DEBUG=pipewiresrc:6` on
+idle DP-1: stream reaches `streaming`, two buffers allocated, then `popped buffer (nil)`
+forever; 0.0 fps at the tee for 20 s. One pointer movement onto the monitor produced a
+frame, and from then on `keepalive-time` held ~29 fps with the pointer gone, for as long
+as it was watched (60 s). So `keepalive-time` is correct but can only *repeat* a buffer it
+already has — it cannot supply the first one. (Side effect seen in the same trace: with
+`keepalive-time` set and no buffer ever received, `pipewiresrc` spins on a nil pop instead
+of sleeping — ~500k log lines/s at `pipewiresrc:6`. Not fixable from here.)
+
+**What the old code did with that:** built the first destination's encode branch against a
+silent tee, burned the hardware encoder's 5 s IDR deadline, burned another 5 s on the
+software retry, and reported the *encoder* as the failure. The drain-to-EOS warning was a
+second bug: `remove_branch` injected its EOS from a `BLOCK_DOWNSTREAM` probe that only fires
+when a buffer is pushed, so on a silent source every removal waited out its full 5 s.
+
+**The fix:**
+
+- `branch::wait_for_source_frame` — before any branch is built, wait for the `tee` to see a
+  buffer (a one-shot `BUFFER` probe on its sink pad). `branch::add_branch_live_waiting`
+  takes a `SourceWait`: `Indefinite` for a destination's first branch and for
+  `rebuild_after_source_restart` (idle is a normal state there, and a stalled destination's
+  viewers are fed the cached IDR meanwhile); `Bounded(SOURCE_FRAME_TIMEOUT)` for tier-2
+  swaps (`add_branch_live`), where the old branch is still running and a dead source should
+  fail back to it. The wait ends with an error if the pipeline goes to `Null`, so a stopped
+  capture never leaves a task parked. The encoder's 5 s IDR deadline now only ever measures
+  the encoder.
+- `remove_branch` also installs an `IDLE` probe, so EOS is injected even when no buffer is
+  in flight.
+- `CaptureHandle::awaiting_first_frame` / `AppState::capture_awaiting_first_frame` expose
+  "this capture has never produced a frame" so a UI can say *why* a destination is still
+  `Starting` ("waiting for the shared screen to change"). **Nothing renders it yet.**
+- `session::poll_pending_destinations` no longer raises `share_error` for a destination
+  whose capture/destination the user already stopped, and stops (instead of adopting) a
+  destination that finishes coming up after it was cancelled. Both windows used to be ~5 s
+  and are now unbounded on an idle monitor.
+
+**What the user sees:** sharing an idle monitor does not fail. The destination stays
+`Starting` until anything on that monitor changes (pointer onto it, a window, a clock),
+then comes up in ~0.2 s. Verified for real: waited 7.2 s, nudge at 7.0 s, viewer's first
+frame 185 ms after subscribing, 24.5–28.4 media fps over the next 60 s untouched
+(`capture::tests::real_portal_idle_monitor_share_reaches_a_viewer_and_stays_alive`).
+
+`Why not get the first frame some other way:` it needs a compositor repaint, which a
+client can't ask for through the portal. A one-shot `wlr-screencopy` `copy` (no damage)
+would return immediately but bypasses the portal's consent flow; a tiny layer-shell surface
+on the captured output would force a commit but is invasive. Both are options if "starts
+only after the first repaint" turns out not to be good enough in practice.
+
+### Silence watchdog (the stall protocol's other entry)
+
+Until now only a *deliberate* source restart ever entered `Stalled`. A source that simply
+went quiet left the viewer with nothing. `DestinationRuntime::stall_if_silent` (driven by
+the pump's 500 ms ticker; threshold `destination::silence_threshold`, ≥3 s) now moves a
+`Live`, un-paused destination to `Stalled(SourceLost)` after that much silence, so the
+cached-IDR keepalive starts; the first frame back also forces an IDR (a delta can't end a
+stall). With `keepalive-time` a healthy static screen never trips it. The silence clock is
+restarted on resume-from-pause and after a swap so those gaps don't count.
+
+---
+
 ## Resuming a paused destination
 
 A destination with zero subscribers pauses its own encoder by closing that branch's
