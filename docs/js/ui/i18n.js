@@ -3,6 +3,9 @@
 // ui.modal.*, ui.stream.*, ui.toast.*) the same key and English text are used, so the two clients read the same.
 // Browser-only wording (pop-out via Picture-in-Picture, "the browser decides the audio", certificate hash, ...)
 // lives under the same namespaces with keys the native app does not have.
+// German is the informal "du" form like client/locales/de.yml, with its terms (Raum, Einladungslink, Bildschirm teilen, Live gehen,
+// Bildrate, Upload-Budget, Auslagern); where a key AND its English text match a native entry the German string is identical (dev/tests.js
+// checks en/de key + placeholder parity and that no formal "Sie" form is left).
 
 const en = {
   "app.title": "Simple Screensharing",

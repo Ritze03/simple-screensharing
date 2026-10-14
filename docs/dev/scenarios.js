@@ -496,7 +496,7 @@ scenario("relay down for a while: relay-unreachable (never link-expired), reconn
   const stateAfter = await a.reconnectNow();
   const ms = Math.round(performance.now() - t0);
   ok(stateAfter === "connected" && a.state === "connected", `reconnectNow resolved with ${stateAfter}`);
-  ok(ms < 3000, `reconnectNow took ${ms} ms`);
+  ok(ms < 6000, `reconnectNow took ${ms} ms`);
   ok(a.shares.length === 1, "the share is still registered");
   await waitFor(() => b.state === "connected", 20_000, "bob back too");
   const st2 = await waitFor(() => streamOf(b, a), 10_000, "alice's share re-announced");

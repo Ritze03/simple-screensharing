@@ -9,6 +9,7 @@
 //   await page.click(".btn");      // CSS selector or {text: "Live gehen"} (matches the innermost element whose text contains it)
 //   await page.screenshot("/path/out.png");
 //   b.consoleErrors                // page code errors (console.error / uncaught), as strings
+//   b.browserNetErrors             // Chromium's own ERR_QUIC_* errors, listed separately
 //   b.netLines                     // Chromium's own stderr lines (ERR_QUIC_* etc.), separately
 //   await b.close();
 //
@@ -74,6 +75,10 @@ export class Page {
     if (r.exceptionDetails) throw new Error(`eval failed: ${r.exceptionDetails.exception?.description || r.exceptionDetails.text}\n${expression.slice(0, 200)}`);
     return r.result.value;
   }
+  /** Run `source` in every new document before page scripts (e.g. to seed localStorage or stub getDisplayMedia). */
+  async addInitScript(source) {
+    await this.send("Page.addScriptToEvaluateOnNewDocument", { source });
+  }
   async goto(url) {
     await this.send("Page.navigate", { url });
     await sleep(300);
@@ -93,7 +98,9 @@ export class Page {
   /** Viewport-centre of the element for a selector or {text, sel?}. */
   async #locate(target) {
     const expr =
-      typeof target === "string"
+      target && target.js // {js: "<expression returning an element>"}
+        ? `(() => { const e = (${target.js}); if (!e) return null; e.scrollIntoView({block:"center"}); const r = e.getBoundingClientRect(); return {x: r.x + r.width/2, y: r.y + r.height/2}; })()`
+        : typeof target === "string"
         ? `(() => { const e = document.querySelector(${JSON.stringify(target)}); if (!e) return null; e.scrollIntoView({block:"center"}); const r = e.getBoundingClientRect(); return {x: r.x + r.width/2, y: r.y + r.height/2}; })()`
         : `(() => { const want = ${JSON.stringify(target.text)}; const sel = ${JSON.stringify(target.sel || "button, [role=button], a, label, .btn, [tabindex], div, span")};
              let best = null; for (const e of document.querySelectorAll(sel)) { const tx = (e.innerText || "").trim(); if (!tx.includes(want)) continue;
@@ -167,7 +174,15 @@ export async function launchBrowser({ url = "about:blank", headed = false, flags
   const conn = new Conn(ws);
   const consoleErrors = [];
   const consoleAll = [];
+  const browserNetErrors = []; // Chromium's own ERR_QUIC_* console errors (expected during deliberate relay downtime)
+  const badRequests = []; // 4xx/5xx responses and failed loads (the site's own 404s etc.)
   conn.on((m) => {
+    if (m.method === "Network.responseReceived") {
+      const r = m.params.response;
+      if (r.status >= 400) badRequests.push(`${r.status} ${r.url}`);
+    } else if (m.method === "Network.loadingFailed") {
+      if (!m.params.canceled) badRequests.push(`failed ${m.params.errorText} (${m.params.requestId})`);
+    }
     if (m.method === "Runtime.consoleAPICalled") {
       const text = m.params.args.map((a) => a.value ?? a.description ?? "").join(" ");
       consoleAll.push(`[${m.params.type}] ${text}`);
@@ -179,14 +194,15 @@ export async function launchBrowser({ url = "about:blank", headed = false, flags
     } else if (m.method === "Log.entryAdded") {
       const e = m.params.entry;
       consoleAll.push(`[log.${e.level}] ${e.text} ${e.url || ""}`);
-      if (e.level === "error") consoleErrors.push(`${e.text} ${e.url || ""}`);
+      // Chromium's own network-stack complaints (ERR_QUIC_* while a relay is deliberately down) are not page-code errors
+      if (e.level === "error") (e.source === "network" || /^Failed to establish a connection/.test(e.text) ? browserNetErrors : consoleErrors).push(`${e.text} ${e.url || ""}`);
     }
   });
   const { targetInfos } = await conn.send("Target.getTargets");
   const tgt = targetInfos.find((t) => t.type === "page");
   const { sessionId } = await conn.send("Target.attachToTarget", { targetId: tgt.targetId, flatten: true });
   const page = new Page(conn, sessionId);
-  for (const d of ["Page", "Runtime", "Log"]) await page.send(`${d}.enable`);
+  for (const d of ["Page", "Runtime", "Log", "Network"]) await page.send(`${d}.enable`);
   if (grantClipboard) {
     await conn.send("Browser.grantPermissions", { permissions: ["clipboardReadWrite", "clipboardSanitizedWrite"], origin: new URL(url).origin }).catch(() => {});
   }
@@ -198,6 +214,8 @@ export async function launchBrowser({ url = "about:blank", headed = false, flags
     conn,
     dir,
     netLines,
+    badRequests,
+    browserNetErrors,
     consoleErrors,
     consoleAll,
     async newPage(u) {

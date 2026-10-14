@@ -20,6 +20,7 @@ under `/<repo>/` (as GitHub Pages does) works: `dev/headless.mjs` serves it unde
 | `scenarios.mjs` | runs `scenarios.html`, restarts the relay when the page asks |
 | `relay.sh` | start/restart/stop a throwaway relay in tmux and print its certificate hash |
 | `pagelog.js` | page -> runner reporting (`/log`, `/result`, `/kv`) |
+| `cdp.mjs`, `e2e-lib.mjs`, `e2e/`, `motion.html` | drive the REAL site UI and the native app end to end (see "End to end") |
 
 ## Running
 
@@ -48,6 +49,47 @@ docs/dev/relay.sh stop 14433
 * GPU decode needs `--flag --enable-features=VaapiVideoDecoder,VaapiIgnoreDriverChecks,AcceleratedVideoDecodeLinuxGL --flag --ignore-gpu-blocklist`.
   Chromium 153 on this machine has **no** hardware *encode* path for WebCodecs (all `prefer-hardware` encoder probes fail),
   so browser-side encoding is software (OpenH264, libaom/SVT-AV1).
+
+## End to end through the real UI and the native app (I20)
+
+`cdp.mjs` is a zero-dependency Chrome DevTools driver (click, type, eval, screenshot, console/network capture, headed or headless);
+`e2e-lib.mjs` wraps the real site UI with it (create/join a room, stub `getDisplayMedia` with the harness pattern source, Go live,
+Watch, measure); `e2e/` holds the runs: `sharer.mjs` / `viewer.mjs` / `viewer-headed.mjs` (browser peers with a file-based command
+channel), `full-room.mjs`, `links.mjs`, `ui-reconnect.mjs`, `browser-to-browser.mjs`, plus `native-session.sh` (one short GUI-locked
+session: scratch `XDG_CONFIG_HOME` seeded with the room, the native app on DP-1/DP-2, ydotool clicks, grim screenshots, clean teardown
+incl. orphan `ssshare-loopback` pw-loopbacks) and `e2e/steps/*.sh` (the click sequences; coordinates are for the 1900x1060 tiled window).
+`motion.html` is full-window moving content for portal captures. Needs: `E2E_OUT` (scratch dir, default `/tmp/sss-e2e`, keep it small),
+`NATIVE_BIN`, `RELAY_BIN`/`RELAY_DIR`. Never run headed without the GUI lock; never put a picker screenshot on a full output.
+
+Serve `docs/` and open `http://127.0.0.1:<port>/simple-screensharing/` (`node docs/dev/headless.mjs serve --port 8123`): the site and
+every module load with no 404 and no console error from page code in all runs below. Chromium's own `ERR_QUIC_*` console errors
+appear only while a relay is deliberately down (the CDP driver lists them separately as `browserNetErrors`).
+
+Results (this machine, Chromium 153, relay + native client built from this branch, 1080p, noisy test content):
+
+| scenario | result |
+| --- | --- |
+| 1a browser (real UI, harness capture + tone) H.264 60 -> native egui | pass: tile via `vah264dec` (hardware), tooltip "Decoded 60 fps shown 60 fps 0 dropped", 11.7 Mbps, audio sink-input created by the app |
+| 1b same, AV1 | pass: `vaav1dec`, decoded 60 / shown 60, 8.0 Mbps, audio |
+| 2a native (real portal picker, Spotify per-app audio) H.264 60 -> browser | pass: 59.9 decoded fps (headless, software decode), 0 loss, 0 decoder errors; audio 50 packets/s decoded, level > 0 |
+| 2b H.264 120 | pass: 119.9 fps |
+| 2c AV1 60 / 120 | pass: 59.9 / 120.0 fps (the native AV1 stream declares 1920x1082) |
+| 2d H.265 60 (headed Chromium, VAAPI decode) | pass: 60.1 fps, 8.4 Mbps; headless cannot decode H.265 |
+| 3 room full (9th member) | pass: the UI shows "This room is full (8 people at most)" (`JoinRejected{RoomFull}` on the control stream) |
+| 4 relay restart | browser: reconnecting at 0 ms, joined again after 0.6 s, share kept live; viewers re-watch by `stableKey`. **Native does not reconnect by itself** (stays on "Not connected"); manual Connect + Watch works |
+| 5 pop-out of a native stream (Document PiP, headed) | pass: PiP window with the canvas, 60 fps decoded and audio continue |
+| 6 links | browser-created link -> native Join modal: pass; native "Copy invite link" is byte-identical to it (hash kept). Native Create minted link has **no cert hash**: the browser refuses it with a clear message; the native "Copy invite link" of the live room has it and the browser joins |
+
+Audio level: Spotify runs at 10 % stream volume (-60 dB), so the captured signal peaks at about 0.0005 (`maxLevel` over 8 s); the packets
+are real Opus frames of that quiet signal. `level` is a peak meter with a ~0.5 s hold; the first version reported one frame's instant peak.
+
+Findings outside the website (not fixed here):
+
+* **Native sender frames of a rotated output are rotated.** DP-2 is configured `rr:2` (180 degrees) in mango; a portal capture of it
+  arrives 180 degrees rotated in every viewer (`VideoFrame.rotation` is 0, the pixels are rotated; DP-1 arrives upright, the native
+  viewer shows DP-1 upright). The native pipeline ignores the PipeWire `VideoTransform` meta.
+* **A killed or closed native app stays in the room for about 60-75 s** (the relay's idle timeout): no `Leave` / close on SIGTERM or window close.
+* The native app does not auto-reconnect after a relay restart (see scenario 4).
 
 ## Vectors (Rust -> JS and JS -> Rust)
 
@@ -100,7 +142,7 @@ Browser sender -> relay -> native viewer (real client lib + the real native `Str
 | H.264 1080p60 + Opus | `avdec_h264`: 845/845 frames decoded, 8 keyframes, PTS monotonic; 704 Opus packets (TOC `0xFC` = CELT FB 20 ms stereo) |
 | AV1 1080p60 | `av1dec`: 848/848 frames decoded, 8 keyframes, PTS monotonic |
 
-(The full browser -> native check, including the egui UI, is I20's job.)
+(The full browser -> native check, including the egui UI, was done in I20: see "End to end" above.)
 
 Real `getDisplayMedia` (tab capture, headed): `startShare()` with no injected stream captured 21 fps of a changing tab (damage-driven),
 reconfigured twice for size changes, encoded H.264 and Opus, and a browser viewer decoded 16.5 fps + audio without errors. Headless
@@ -123,5 +165,5 @@ resolved a `screen:0:0` (display surface `monitor`) source that also yielded no 
 * **Capture is damage-driven:** a static screen delivers no frames at all (the core re-encodes the newest frame as the
   keyframe a new viewer needs). The real tab capture also changes size when the window does: the core reconfigures the encoder
   (2 reconfigures in the run below) and viewers follow from the new SPS.
-* **Detection of a vanished relay** takes the QUIC idle timeout (~21 s), see `js/core/README.md`.
+* **Detection of a vanished relay:** a gracefully stopped relay is noticed at once (CONNECTION_CLOSE, relay task #29); a killed one only after the QUIC idle timeout (~21 s). See `js/core/README.md`.
 * **Datagram size** is capped by `datagrams.maxDatagramSize` (1024 measured), which is why every sender uses 1000.
