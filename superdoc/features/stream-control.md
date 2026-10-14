@@ -357,6 +357,15 @@ session) gets 140 or 280 fps from its first second, depending only on keepalive 
 - AV1 reports 1920x1082 in the viewer both before and after: a `vaav1enc` crop quirk, not
   from this change.
 
+A screenshare start can hang ~30 s ("GPU capture path failed to start ... Element failed to
+change its state", then the CPU fallback hangs on the same source) when another native
+PipeWire stream is stuck `suspended` with an `active` link, e.g. a live
+`audiotestsrc ! pipewiresink` that never starts. PipeWire 1.6.9 then never negotiates any new
+link (no `check_states` for the screencast link) and `pipewiresrc` gives up with
+not-negotiated after 30 s. A cleanly corked/paused stream (PulseAudio cork, native
+`set_active(false)`) does not trigger it. Diagnose with `pw-top`: the stuck stream sits at `S`
+instead of `I`/`R`. Found by task #48; not fixable from the client.
+
 ## Encoder limits made visible; Performance = `target-usage=2` (2026-10-14, #46)
 
 ### `target-usage` on Mesa radeonsi is not the VA spec's order

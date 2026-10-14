@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 #
+# LEGACY (2026-10-14): works on the user's REAL MangoWC desktop only (fullscreen vkcube on a real monitor via mmsg). Agents must not
+# use it: since the headless switch all real-app tests run in the private headless sway rig,
+# see hs-rig.sh and superdoc/claude-instructions/testing-and-verification.md. Headless: hs-rig.sh starts the pattern (HS_PATTERN).
+#
 # animate.sh — run a fullscreen high-frame-rate animation on one monitor so a
 # portal screen capture of that monitor has content changing at the refresh
 # rate. An idle monitor delivers no frames to the portal (capture is

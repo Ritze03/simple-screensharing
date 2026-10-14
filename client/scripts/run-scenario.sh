@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 #
+# LEGACY (2026-10-14): works on the user's REAL MangoWC desktop only (drive.sh + animate.sh on real monitors). Agents must not
+# use it: since the headless switch all real-app tests run in the private headless sway rig,
+# see hs-rig.sh and superdoc/claude-instructions/testing-and-verification.md. Headless: hs-scenario.sh.
+#
 # run-scenario.sh — one measured share: sender -> relay -> viewer, with the
 # receiver's decoded/presented fps (tooltip screenshots) and the sender's
 # per-stage buffer rates (GStreamer stats tracer) over ~30 s.

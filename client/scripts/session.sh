@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 #
+# LEGACY (2026-10-14): works on the user's REAL MangoWC desktop only (takes the real desktop GUI lock and drives real windows). Agents must not
+# use it: since the headless switch all real-app tests run in the private headless sway rig,
+# see hs-rig.sh and superdoc/claude-instructions/testing-and-verification.md. Headless: hs-rig.sh + hs-scenario.sh.
+#
 # session.sh — one SHORT, self-contained locked GUI session: take the shared GUI
 # lock (waiting for it, never holding it while idle), bring the rig and the
 # animation up, run the given steps, then ALWAYS tear everything down, restore

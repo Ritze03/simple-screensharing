@@ -2,19 +2,27 @@
 
 **Mandatory working rule for agents, force-loaded from the repo-root `CLAUDE.md`.**
 
-Last rewritten 2026-10-14 for the native egui client (the Electron/Tauri-sidecar era rules
-are gone; see **History** at the end). The concrete launch recipe is the client's `run`
-skill, `client/.claude/skills/run/SKILL.md`; this page is the rule and the machine facts
-that skill relies on.
+Last rewritten 2026-10-14 for the headless-sway rig (the user asked for all real-app tests to
+move off their desktop; earlier the same day it was rewritten for the native egui client and
+before that the Electron/Tauri-sidecar rules went away; see **History** at the end). The concrete
+launch recipe is the client's `run` skill, `client/.claude/skills/run/SKILL.md`; the rig's
+scripts are documented in `client/scripts/README.md`. This page is the rule and the machine
+facts those two rely on.
 
-## The rule: verify against the real egui binary, by default
+## The rule: verify against the real egui binary, inside the headless rig
 
 Verify every change against the real running app: the compiled
-`simple-screensharing-client` binary (`client/`, crate `simple-screensharing-client`), a
-real relay (`server/`), real windows on a real compositor. This is the default, not a
-fallback for changes you judge risky. It includes pure layout/CSS-style tweaks: once the
-binary is built, launching it is barely more expensive than any substitute, and it removes
-the judgment call about when a substitute is "good enough".
+`simple-screensharing-client` binary (`client/`, crate `simple-screensharing-client`), a real
+relay (`server/`), real windows on a real compositor, a real xdg-desktop-portal screencast,
+real GPU capture/encode/decode. This is the default, not a fallback for changes you judge
+risky. It includes pure layout/CSS-style tweaks: launching the rig is barely more expensive than
+any substitute, and it removes the judgment call about when a substitute is "good enough".
+
+**The compositor is a private headless sway that you start yourself (`client/scripts/hs-rig.sh
+up`). The user's real desktop is never used for tests.** Nothing in a test may touch the user's
+real outputs or input: no windows, no `mmsg`, no `ydotool`, no `grim` without the rig's
+environment, no real portal picker. Never touch the user's real outputs (MangoWC: DP-1, DP-2,
+DP-3, HDMI-A-1). The GUI lock is not needed (the rig shares nothing visible with anyone).
 
 What does **not** count as verification of app behaviour:
 
@@ -27,10 +35,10 @@ What does **not** count as verification of app behaviour:
   `client/src/widgets/tests.rs`, the lib's tests) are necessary, not sufficient.
 - Browser/Playwright MCP tools. They drive a standalone Chrome, never the egui window.
 
-The one legitimate reason to fall back is an environment failure: no display reachable,
-the binary cannot be built, no GPU/Wayland session. Say so explicitly in your report
-("could not launch the real app because X"); never silently substitute and imply
-equivalence.
+The one legitimate reason to fall back is an environment failure: the binary cannot be built,
+the rig cannot start (no GPU render node, sway or the portal packages missing). Say so
+explicitly in your report ("could not run the rig because X"); never silently substitute and
+imply equivalence. Do not fall back to the real desktop.
 
 **Why this is written down**: over one session many dispatched sub-agents defaulted to
 verifying against mocks (browser + mock data) even for changes that depended on real
@@ -42,148 +50,170 @@ rule with a judgment-call exception gets the exception re-argued per agent, so t
 none. After the Electron frontend was replaced by egui the same failure has a new
 spelling, the `--gallery` screen: fine for widgets, not proof of the app.
 
-## Machine safety (hard constraints)
+**Why headless sway (user request, 2026-10-14)**: the user works at that machine. Tests on
+their MangoWC desktop covered or stole their windows, grabbed the keyboard through the portal
+picker (a GTK layer-shell dialog), and needed `ydotool`, a uinput device that injects into the
+*real* session whatever monitor you think you target; one wrong y offset or an HDMI-A-1 window
+(their RDP) was always one typo away. A private headless sway has none of that: virtual outputs,
+its own seat, a portal that grants a screencast without any UI. It also removes the shared
+GUI lock and the multi-agent queue for the one desktop: every worktree runs its own rig in
+parallel. The user also stopped audio tests (below).
 
-### Monitors: never touch HDMI-A-1
-
-The compositor is **MangoWC** (`XDG_CURRENT_DESKTOP=mango`, wlroots-based Wayland), not
-Hyprland: `hyprctl` and `xrandr` tell you nothing useful. Its IPC is `mmsg`. **Re-check
-the layout with `mmsg get all-monitors` before every launch**, every time; layouts change.
-Layout as of 2026-10-14:
-
-| Output | Origin | Notes |
-| --- | --- | --- |
-| DP-3 | x=0 y=1080 | 119.93 Hz. **The user's terminal (ghostty).** Don't cover or close it. |
-| DP-1 | x=1920 y=1080 | 279.75 Hz. Use for 240 fps tests. The user's Spotify lives here as a minimised scratchpad (test audio source): never close or kill it; check `mmsg get all-clients` before placing windows. |
-| DP-2 | x=3840 y=1080 | 119.93 Hz. Empty. |
-| **HDMI-A-1** | x=1920 y=0, above DP-1 | **FORBIDDEN.** The user's WinBoat RDP window (`xfreerdp`) is there. Never place a window, click, screenshot or capture there. |
-
-Safe region for windows and capture: x 1920-5759, y >= 1080 (DP-1 and DP-2). HDMI-A-1
-occupies x 1920-3839, y 0-1079, so a window with a too-small Y lands on it.
-
-- New windows open on the focused monitor. Run `mmsg dispatch focusmon,DP-1` (or `DP-2`)
-  before launching, then confirm where the window actually landed with
-  `mmsg get all-clients`. "Launched on the safe monitor" and "confirmed where it is" are two
-  separate steps. Afterwards restore focus (`mmsg dispatch focusmon,DP-3`, then the user's
-  ghostty).
-- `mmsg dispatch <func>,<args> client,<id>` places windows: `togglefloating`,
-  `movewin,X,Y` (**absolute** global coordinates, not offsets), `resizewin,W,H`.
-  `mmsg -h` lists the rest; find other functions by experiment and restore focus after.
-- Screenshots: `grim -o DP-1 file.png` (or `-o DP-2`). Never `-o HDMI-A-1` and never a
-  full-desktop `grim` without `-o`.
-- Input: `ydotool` (user service `ydotoold` is running; socket `$YDOTOOL_SOCKET`,
-  `~/.YDOTOOL-SOCKET`). `ydotool mousemove --absolute` maps Y with a **-1080 offset** on
-  this setup: to hit global y=1500 pass `-y 420`. Verify with a screenshot before
-  clicking, and double-check targets fall inside DP-1/DP-2.
-
-### Screen-share portal picker
-
-Starting a share opens the portal picker (`xdg-desktop-portal-wlr-patched` ->
-`wlr-share-picker`, a GTK layer-shell dialog that grabs the keyboard).
-
-- Type `dp` (filters to sources containing "dp", so HDMI-A-1 cannot match) and press
-  Enter. It preselects the last choice from
-  `~/.local/state/wlr-share-picker/last-choice.json`; check that file names DP-1 or DP-2
-  before pressing Enter.
-- **Never take a full-monitor screenshot while the picker is open**: its thumbnails
-  include HDMI. To capture the picker use `grim -g <region>` only.
-- Before releasing the GUI lock make sure no picker is left: `pgrep -af wlr-share-picker`.
-  SIGTERM makes it answer "cancel". A forgotten picker blocks every later share request.
-
-### GUI lock: several agents share one desktop
-
-Hold the lock around every interactive GUI session (launching windows, focus changes,
-`ydotool`, `grim`):
+## The rig
 
 ```bash
-exec 9>/tmp/claude-1000/sss-gui.lock && flock 9   # at the top of your script; released on exit
+client/scripts/hs-rig.sh up            # build + sway + bus + PipeWire + portal + relay + pattern + 2 clients
+client/scripts/hs-drive.sh share|setup|golive|watch|hover|shot ...   # or hs-scenario.sh for one measured share
+client/scripts/hs-rig.sh down          # always, when you are done (also removes the private runtime dir)
 ```
 
-Keep a locked session to a few minutes: launch, screenshot, click, kill, release. Think
-and edit code outside the lock. Release only after your windows are closed and focus is
-restored.
+It starts, all in one private `XDG_RUNTIME_DIR` under `/run/user/<uid>/sss-hs-<hash>`:
+a headless sway with three outputs (HEADLESS-1 1920x1080@240 Hz = captured, fullscreen
+`vkcube` on it; HEADLESS-2 = sharer client; HEADLESS-3 = viewer client), a private dbus session,
+a private PipeWire + WirePlumber (`-p policy`, no audio/bluetooth/camera devices), an
+`xdg-desktop-portal` + `xdg-desktop-portal-wlr` (`chooser_type=none`, so a ScreenCast request
+is granted with no picker), a virtual pointer so the seat accepts mouse input, the relay in a
+uniquely named tmux session on a random free UDP port, and two clients with scratch
+`XDG_CONFIG_HOME`/`XDG_DATA_HOME` auto-connected to one room. A scripted share goes live
+through the real portal -> `pipewiresrc` (DMA-BUF) -> `vapostproc` -> VA encode path
+(`CaptureDomain::Gpu`); the viewer decodes it with `vah265dec`/`vah264dec`; screenshot with
+`grim -o HEADLESS-3` (through `hs-drive.sh shot`). Measured 2026-10-14: H.265 @ 240 fps,
+capture 239 fps, encoder output 233 fps, viewer "Decoded 234 fps / shown 234 fps, 0 dropped".
 
-Rules learned the hard way (overnight 2026-10-14):
+Rules for working in it:
 
-- **Don't let the lock leak into children.** Children inherit fd 9, so a leftover child
-  (e.g. the client's `pw-loopback`) keeps holding the lock after your script dies; this
-  blocked two workers once. Launch everything inside the lock with fd 9 closed:
-  `cmd 9>&- &`.
-- **No long reservations** such as `flock /tmp/claude-1000/sss-gui.lock sleep 14400`. One
-  worker's 4-hour reservation stalled two others for over 30 minutes. Lock per scenario and
-  release it while you analyse or rebuild.
-- **Never broad-kill.** No `pkill -x simple-screensh` / `pkill -f simple-screensharing`:
-  every worker's clients and relays share those names (one such kill ended another
-  worker's run mid-way). Kill only PIDs you recorded at launch, or match on something
-  unique to your run (your port, your scratch config path).
-- **Per-run names in `client/scripts/`.** The scripts use per-run tmux session names
-  (recorded in `$SCRATCH/tmux.session` by `rig.sh up`) and an `ANIM_PIDFILE` for
-  `animate.sh` (#43), so concurrent runs cannot stop each other's relay or animation. Export
-  the `ANIM_PIDFILE=` line that `animate.sh start` prints so `animate.sh stop` finds yours;
-  see `client/scripts/README.md`. (The lock file is a few bytes; `/tmp` is fine for that, see the target-dir rule
-below for what is not.)
+- **Always `hs-rig.sh down`** (success, failure, early exit). `up` tears itself down if it fails
+  half way. One rig per `SCRATCH` dir (default: one per worktree, `<target>/hs-scratch/rig`).
+- **Input**: pointer = `swaymsg seat - cursor set X Y` / `cursor press|release button1`
+  (works because `hs-vptr` gives the seat a pointer capability; without a virtual pointer a
+  headless sway seat has capability 0 and clients get no `wl_pointer`); keys = `wtype`. **Never
+  `ydotool`**: it is a uinput device and acts on the user's real session. Exact click targets
+  come from the client's `SSS_UI_DUMP` file (rects in window points, see `hs-drive.sh`) plus the
+  window origin from `swaymsg -t get_tree`.
+- **Screenshots**: `grim -o HEADLESS-n` with the rig's environment only (`hs-drive.sh shot`, or
+  `hs-rig.sh run -- grim ...`). `WAYLAND_DISPLAY` must be the rig's absolute socket path; a
+  bare `grim` (or one with the inherited `WAYLAND_DISPLAY=wayland-0/1`) hits the user's desktop.
+- **`hs-rig.sh run -- CMD`** runs CMD with the rig's environment (`XDG_RUNTIME_DIR`,
+  `WAYLAND_DISPLAY`, `SWAYSOCK`, `DBUS_SESSION_BUS_ADDRESS`).
+- A fullscreen `vkcube` is the moving test pattern (mailbox present mode). An idle output
+  delivers no frames to the portal (capture is damage-driven), so a capture test always needs
+  the pattern (`HS_PATTERN=none` only for idle-monitor tests).
+- Use `PROFILE=release` (the default) for any fps/latency judgment; debug is far too slow for
+  240 fps.
+- What the rig cannot do: it is sway, not MangoWC (compositor-specific behaviour such as
+  output layout events, scratchpads, DPMS is not exercised); the headless 240 Hz output is
+  paced by a timer in the headless backend, not a monitor (vsync, tearing and VRR behaviour are not
+  representative; throughput is: ~239 fps captured from it); the audio path is not testable (below);
+  the real picker UI (`wlr-share-picker`) is not exercised.
+- Portal binary: the rig runs `~/.local/bin/xdg-desktop-portal-wlr-patched` (the user's build, wlr-screencopy only) when it
+  exists, else the stock `/usr/lib/xdg-desktop-portal-wlr`. **Stock 0.8.4 on sway 1.12 crashes the
+  share**: it captures through ext-image-copy-capture and dies with `ext_image_copy_capture_session_v1#18:
+  error 1: session already has a frame object` when the client's GPU pipeline flaps the stream
+  (streaming -> paused -> streaming) at start; the client then logs `GPU capture path failed to
+  start (... StateChangeError)` and the CPU fallback finds no node (`target not found`). Not a
+  client bug that the rig can fix; `HS_XDPW=stock` reproduces it.
+- A bare `fakesink` as the tail of a `pipewiresrc` probe cannot link (caps ANY -> node class
+  `Stream/Input/Unknown` -> WirePlumber 0.5 "target not found"): use `video/x-raw ! fakesink`
+  (`hs-probe.sh`).
+
+## No audio tests (hard rule, user request 2026-10-14)
+
+Do not test audio sharing, level meters or tones; do not create any PipeWire *audio* stream.
+Spotify keeps playing on the user's machine (their own session, not part of the rig): never
+stop, pause or reconfigure it. If you need an example stream for something, Spotify is it, read
+only. The rig's clients never share audio, have `PULSE_SERVER` pointed at a dead socket, and the
+rig's PipeWire is private.
+
+**Why, and the `pipewiresink` stall warning (task #48)**: a live `audiotestsrc ! pipewiresink`
+that gets stuck at state `S` (suspended with an `active` link; check `pw-top`) wedges PipeWire
+link negotiation server-wide (PipeWire 1.6.9): no new link gets a `check_states`, and every new
+screencast `pipewiresrc` times out after 30 s ("GPU capture path failed to start ... Element
+failed to change its state", then the CPU fallback hangs on the same source). A cleanly
+corked/paused stream does not trigger it. **Never create such a stream**; on the user's shared
+PipeWire it also breaks their other apps. (The rig's private PipeWire is immune, one reason it is
+the default; `HS_PIPEWIRE=shared` is available but you should not need it.) See
+`features/stream-control.md` "Capture/encode performance".
+
+## Machine safety
+
+- **Never touch the user's real outputs** (MangoWC: DP-1, DP-2, DP-3, HDMI-A-1; the last one
+  holds their WinBoat RDP window). No window, click, screenshot or capture there. Re-check: if
+  a command of yours has no rig environment it is aimed at the real session.
+- **PipeWire**: the rig's own instance is private. If you ever use the shared one, screencast
+  nodes are just more nodes; do not restart or reconfigure it.
+- **Never broad-kill.** No `pkill -x simple-screensh` / `pkill -f simple-screensharing`: every
+  worker's clients, relays and sways share those names. Kill only PIDs you recorded or the
+  process groups the rig recorded in `$SCRATCH/hs.pids` (`hs-rig.sh down` does exactly that).
+- **sudo**: **workers never run sudo.** If something needs it, report the exact command; only the
+  lead runs it, via its `claude-sudo` tmux session.
+- `/tmp` is a 16 GB RAM tmpfs: see the target-dir rule below.
 
 ### Prove the binary you launch is your build
 
 - A shared `target/` at the repo root can hold a binary another worktree built more
   recently, and cargo's freshness check accepts it. One earlier run executed other
   workers' code without noticing. So **build what you launch in your own worktree's
-  target dir**: `CARGO_TARGET_DIR=<your worktree>/target cargo build -p simple-screensharing-client`
-  (same for `-p simple-screensharing-server`). The first build takes minutes; it is worth it.
-  For plain `cargo build`/`cargo test` *checks* that you won't run, the shared dir is fine.
+  target dir**: `CARGO_TARGET_DIR=<your worktree>/target cargo build --release -p simple-screensharing-client -p simple-screensharing-server`
+  (`hs-rig.sh up` does this: `launch-lib.sh` `sss_build`, target `<worktree>/target`). The
+  first build takes minutes; it is worth it.
 - Before trusting a binary, check it contains a string you just added:
   `grep -c '<new string>' <binary>`.
 - **Never put a Cargo target dir under `/tmp`** (including the scratchpad). `/tmp` is a
   16 GB RAM tmpfs; a 7.7 GB target filled it and broke builds with "Disk quota exceeded".
-  Copy only small binaries to the scratchpad and delete large artifacts when done.
+  Copy only small binaries to the scratchpad and delete large artifacts when done. The rig's
+  scratch dir (`<target>/hs-scratch`) is on disk; the sharer's GStreamer tracer log can reach
+  ~100 MB per minute there (`HS_TRACE=0` to skip, `hs-rig.sh down --purge` to delete).
 - Debug builds panic on icon names missing from `theme::ICONS` (`unknown icon "..."`);
   report it. A release build only shows a blank glyph.
 
-### Always launch with a scratch config
+### Scratch config
 
-Launch the app with `XDG_CONFIG_HOME=<scratch dir>`. Otherwise it loads the user's saved
-rooms and auto-connects them. eframe may also create `~/.local/share/<app-id>/` storage
-dirs: delete any you created.
+The rig launches every client with its own `XDG_CONFIG_HOME`/`XDG_DATA_HOME` in the scratch
+dir; the user's saved rooms never auto-connect. If you launch a client outside the rig
+(for example `--gallery`) set `XDG_CONFIG_HOME=<scratch dir>` yourself; eframe may also create
+`~/.local/share/<app-id>/` storage dirs: delete any you created.
 
 ### The relay
 
 `cargo build -p simple-screensharing-server` (own target dir, see above). Its ratatui TUI
-needs a pty: run it inside `tmux new-session -d`. Default port 4433. Cert state lives in
-`./state/` relative to the working directory, so **start it in a scratch cwd**. For e2e
-tests point them at your own binary with `SSSHARE_SERVER_BIN=<path>` (and
-`SSSHARE_SERVER_CWD=<dir>`); copy the binary somewhere private if others may rebuild it
-meanwhile. Never run the two `real_portal` e2e tests unattended (`--skip real_portal`);
-they open a portal dialog. `docs/dev/relay.sh` starts a throwaway relay in tmux and prints
-its certificate hash.
+needs a pty: the rig runs it inside `tmux new-session -d` (uniquely named, killed by `down`).
+Default port 4433; the rig picks a random free UDP port. Cert state lives in `./state/`
+relative to the working directory, so **start it in a scratch cwd**. For e2e tests point
+them at your own binary with `SSSHARE_SERVER_BIN=<path>` (and `SSSHARE_SERVER_CWD=<dir>`);
+copy the binary somewhere private if others may rebuild it meanwhile. Never run the two
+`real_portal` e2e tests unattended (`--skip real_portal`); they open a portal dialog on the
+real desktop. `docs/dev/relay.sh` starts a throwaway relay in tmux and prints its certificate
+hash.
 
 ### Website (browser viewer) checks
 
-Use `/usr/bin/chromium`. Headless for automated checks (the harness is `docs/dev/`, see
-`docs/dev/README.md`); headed only on DP-1/DP-2 and only while holding the GUI lock.
+Use `/usr/bin/chromium`, **headless only** (the harness is `docs/dev/`, see
+`docs/dev/README.md`). Never open a headed browser window on the user's desktop; if a check
+truly needs headed Chromium (H.265 decode only works on the hardware path, not headless),
+run it inside the rig's sway (untested: `hs-rig.sh run -- chromium --ozone-platform=wayland ...`, window
+on HEADLESS-2/3) and say so in your report.
 
 - Do **not** pass `--use-fake-ui-for-media-stream` for `getDisplayMedia` tests: it picks a
   `screen:0:0` source that delivers no frames (found by a past run). Use a
   `canvas.captureStream()` source or the harness's own runner.
-- H.265 decode only works on the hardware path, so it needs a headed run; it fails
-  headless.
-
-### Audio
-
-Spotify plays on purpose as the real audio source: pick its stream in the per-app audio
-picker for audio-share tests. Never stop it.
-
-### sudo
-
-**Workers never run sudo.** If something needs it, report the exact command; only the
-lead runs it, via its `claude-sudo` tmux session.
 
 ### Clean up
 
-Kill every process you started (relay, client, chromium, static servers, tmux sessions),
-remove scratch config/storage dirs you created, and say so in your report.
+`hs-rig.sh down` (it kills the recorded process groups, the tmux session, removes the private
+runtime dir `/run/user/<uid>/sss-hs-<hash>` and warns about processes that still reference it).
+Remove scratch config/storage dirs you created outside the rig, kill any other process you
+started, and say in your report what you started and that you stopped it.
 
 ## History
 
+- **2026-10-14 (user request): everything moved into a private headless sway rig.** The user,
+  back at their desk, asked to keep testing in headless sway and to stop audio tests. The
+  real-desktop rules (monitor table with HDMI-A-1 forbidden zone, `mmsg`, GUI lock, `ydotool`
+  driving, the real portal picker with `wlr-share-picker`, Spotify as test audio source, headed
+  Chromium on DP-1/DP-2) are gone from this page; the scripts that need them are kept as
+  legacy in `client/scripts/` with a banner. The old monitor layout was DP-3 (0,1080) the
+  user's terminal, DP-1 (1920,1080) 279.75 Hz, DP-2 (3840,1080), HDMI-A-1 (1920,0) above DP-1.
+  Full old text: `git log -- superdoc/claude-instructions/testing-and-verification.md`.
 - **Until 2026-10-14** this page mandated a real Electron shell plus the built `src-tauri`
   sidecar, driven with Playwright's `_electron` driver, and gave the HDMI output as
   starting at x=5760 (contiguous DP-1..DP-3). All of that described the deleted

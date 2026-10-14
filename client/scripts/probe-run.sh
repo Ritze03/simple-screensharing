@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 #
+# LEGACY (2026-10-14): works on the user's REAL MangoWC desktop only (answers the real portal picker). Agents must not
+# use it: since the headless switch all real-app tests run in the private headless sway rig,
+# see hs-rig.sh and superdoc/claude-instructions/testing-and-verification.md. Headless: hs-probe.sh.
+#
 # probe-run.sh — run portal-probe.py once against DP-1 (or MONITOR) and answer
 # the picker safely (picker-answer.sh).
 #
