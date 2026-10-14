@@ -1,3 +1,6 @@
+# LEGACY (2026-10-14): real-desktop step (mmsg, ydotool, real portal picker, shared GUI lock). Sourced only by
+# native-session.sh, which refuses without SSS_ALLOW_REAL_DESKTOP=1. Agents: do the native side in the headless rig
+# (client/scripts/hs-rig.sh + hs-drive.sh, see docs/dev/README.md "Native side in the rig").
 wl-paste -n > $OUT/clip.saved 2>/dev/null || : > $OUT/clip.saved
 echo -n "127.0.0.1:14433" | wl-copy
 click 147 162

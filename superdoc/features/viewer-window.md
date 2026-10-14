@@ -80,5 +80,5 @@ Playwright `_electron`) is in git: `git log -- superdoc/features/viewer-window.m
   the used viewing area". It lives on as `grid_shape` in `client/src/ui/room.rs`, ported from the
   former Electron frontend's `computeGridShape`.
 - **Verification lesson:** the Electron-era checks drove the real shell with synthetic mouse
-  events and fabricated stream keys; the egui equivalent is the `run` skill plus `drive.sh`
+  events and fabricated stream keys; the egui equivalent is the `run` skill plus the headless rig (`hs-rig.sh`, `hs-drive.sh`)
   (`client/.claude/skills/run/SKILL.md`, `client/scripts/`).

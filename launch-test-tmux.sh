@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
 #
+# LEGACY (2026-10-14): puts client windows on the user's REAL MangoWC desktop (mmsg, real monitors).
+# Agents must not use it: since the headless switch all real-app tests run in the private headless
+# sway rig, see client/scripts/hs-rig.sh and superdoc/claude-instructions/testing-and-verification.md.
+# Why: the user works at that machine and asked for tests off their desktop. The script refuses
+# unless SSS_ALLOW_REAL_DESKTOP=1 (the user's own manual use; the legacy client/scripts/rig.sh and
+# test-launch-fg.sh call it too and therefore need that variable exported as well).
+# Headless replacement: client/scripts/hs-rig.sh up.
+#
 # launch-test-tmux.sh — tmux variant of launch-test.sh. Same stack (relay +
 # N native egui clients, scratch configs, pre-joined test room, HDMI safety
 # check), but the relay's TUI lives in a named tmux session you can attach to
@@ -62,6 +70,14 @@ EOF
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then usage; exit 0; fi
 [[ $# -eq 0 ]] || { usage >&2; exit 2; }
+
+# LEGACY guard (2026-10-14): refuse unless explicitly opted in; point at the headless rig instead.
+if [[ "${SSS_ALLOW_REAL_DESKTOP:-}" != 1 ]]; then
+  echo "$(basename "$0"): refused. This opens windows on the user's REAL desktop (legacy)." >&2
+  echo "Use the private headless sway rig instead: client/scripts/hs-rig.sh up  (see client/scripts/README.md)." >&2
+  echo "The user's own manual use: SSS_ALLOW_REAL_DESKTOP=1 $0" >&2
+  exit 3
+fi
 
 # shellcheck source=client/scripts/launch-lib.sh
 source "$SELF_DIR/client/scripts/launch-lib.sh"

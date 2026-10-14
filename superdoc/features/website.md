@@ -11,7 +11,7 @@ kept next to the code, so read them instead of re-deriving anything:
 - `docs/dev/README.md`: the test/measurement harness and the recorded results.
 
 Wire spec (binding for both clients): `superdoc/architecture/protocol-spec.md`, section 11 is the
-browser leg. How to test safely on this machine (headless vs headed, GUI lock, relay):
+browser leg. How to test safely on this machine (headless vs headed inside the headless sway rig, relay):
 `superdoc/claude-instructions/testing-and-verification.md` "Website (browser viewer) checks".
 
 ## Shape
@@ -107,8 +107,8 @@ Watch and share both work. Differences from native, all platform limits:
   zero-dependency DevTools driver) + `e2e-lib.mjs` + `e2e/`.
 - **Do not** pass `--use-fake-ui-for-media-stream` for `getDisplayMedia` tests (it picks a
   `screen:0:0` source that yields no frames); use `canvas.captureStream()` or the harness runner.
-- Headed runs only on DP-1/DP-2 and only while holding the GUI lock (`SSS_GUI_LOCKED=1` is the
-  harness's guard).
+- Headed runs only inside the headless sway rig (`hs-rig.sh run -- env SSS_GUI_LOCKED=1 HEADED=1 ...`, see `docs/dev/README.md`), never on the user's desktop (user request 2026-10-14); `SSS_GUI_LOCKED=1` is the
+  harness's historical opt-in guard.
 - `window.__sss` exposes the UI state for debugging. `index.html#join=<link>` opens the join dialog
   prefilled.
 

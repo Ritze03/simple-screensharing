@@ -219,5 +219,5 @@ that outlived the code:
 - **A "Stream error" placeholder that never cleared** was a shared-module bug (it needed a
   hide on the next decoded frame), and a later recurrence was CSS, not logic.
 - **Verification lesson:** many of the old entries were verified by driving the real shell via
-  Playwright `_electron` with synthetic input. Today use the `run` skill and `drive.sh`
+  Playwright `_electron` with synthetic input. Today use the `run` skill and the headless rig (`hs-rig.sh`, `hs-drive.sh`)
   (`client/.claude/skills/run/SKILL.md`, `client/scripts/`).
