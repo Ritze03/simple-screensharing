@@ -1,10 +1,29 @@
-//! QUIC listener and packet relay logic (spec §1, §10).
+//! Connection accept layer and packet relay logic (spec §1, §10, §11).
 //!
-//! Self-signed cert (native-QUIC-only phase, spec §11 — no CA/domain, no
-//! WebTransport cert-hash-pinning yet). One tokio task per accepted
-//! connection ("connection actor"): it owns the control bidi stream, and
-//! loops `select!`-ing on further control frames, media datagrams, and
-//! incoming preview uni-streams from that connection.
+//! One UDP port, two kinds of peer, told apart by the ALPN the TLS handshake
+//! negotiated (`handle_connection`):
+//!
+//! - `ssshare/1` — the native desktop client, raw QUIC;
+//! - `h3` — a browser, HTTP/3 + WebTransport on path
+//!   [`WEBTRANSPORT_PATH`](crate::protocol::WEBTRANSPORT_PATH).
+//!
+//! Both end up as a [`web_transport_quinn::Session`] (raw QUIC is wrapped with
+//! `Session::raw`, which exists precisely to treat the two uniformly), and
+//! everything after the accept — the connection actor, rooms, forwarding — is
+//! written against that one type. Native and browser members are therefore
+//! equal citizens of a room, with no per-transport branching in the relay.
+//!
+//! `Why web-transport-quinn and not wtransport / h3 + h3-webtransport:` it
+//! runs on the quinn `Connection` the endpoint already produced (so the ALPN
+//! dispatch is one `if`, and `Endpoint::set_server_config` rotation keeps
+//! working), it supports quinn 0.11 and rustls/ring as-is, and its
+//! `Session::raw` removes the need for a hand-rolled transport trait. wtransport
+//! insists on owning its own endpoint, which can't share the port with the
+//! native ALPN; the h3 route means hand-assembling the HTTP/3 session plumbing.
+//!
+//! One tokio task per accepted connection ("connection actor"): it owns the
+//! control bidi stream, and loops `select!`-ing on further control frames,
+//! media datagrams, and incoming preview uni-streams from that connection.
 //!
 //! Each connection additionally gets a **media forwarder task**
 //! ([`media_forward_task`]) that owns the fan-out of that connection's
@@ -17,6 +36,16 @@
 //! The relay never decrypts anything — every operation here reads only
 //! cleartext header fields (`ConnId`, `stream_id`, frame/preview counters)
 //! and forwards opaque ciphertext bytes verbatim.
+//!
+//! # Stream-ordering assumption (browsers and natives alike)
+//!
+//! The **first bidirectional stream the peer opens is the control stream**,
+//! and its first message must be `Join`. (For a browser the HTTP/3 CONNECT
+//! stream is consumed by the WebTransport layer and never surfaces here, so
+//! "first bidi stream" means the first `createBidirectionalStream()`.) A bidi
+//! stream only becomes visible to the relay once the peer writes to it, so the
+//! page must write `Join` right after creating it. Preview uni-streams and
+//! datagrams may be sent any time after that.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -25,23 +54,26 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
-use quinn::{Connection, Endpoint, RecvStream, SendStream};
-use rcgen::CertifiedKey;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use quinn::Endpoint;
 use tokio::sync::{Mutex, mpsc};
+use web_transport_quinn::{ReadExactError, RecvStream, SendStream, Session};
 
+use crate::cert::{CertManager, CertSource};
 use crate::protocol::{
     ClientToRelay, ConnId, MAX_CONTROL_FRAME_LEN, MAX_NAME_LEN, MAX_ROOM_MEMBERS,
-    MediaDatagramHeader, Member, PresenceEvent, PreviewHeader, RejectReason, RelayToClient, RoomId,
-    StreamId, StreamInfo, clamp_utf8, decode_payload, encode_frame,
+    MediaHeader, Member, PresenceEvent, PreviewHeader, RejectReason, RelayToClient, RoomId,
+    STREAM_TYPE_PREVIEW, StreamId, StreamInfo, clamp_utf8, decode_payload, encode_frame,
 };
-use crate::room::{ConnState, Registry, RoomState, StreamRoute, StreamState};
+use crate::room::{ConnState, Registry, RoomState, StreamRoute, StreamState, TransportKind};
 
-/// ALPN identifier for this native-QUIC-only phase. Not mandated by the
-/// wire spec (which is transport-agnostic below the accept layer, §11);
-/// picking a concrete value here just keeps client/server handshakes from
-/// silently accepting an unrelated ALPN.
-pub const ALPN_PROTOCOL: &[u8] = b"ssshare/1";
+/// ALPN of the native transport (raw QUIC). Browsers negotiate `h3` instead
+/// ([`crate::protocol::WEBTRANSPORT_ALPN`]).
+#[cfg(test)]
+pub const ALPN_PROTOCOL: &[u8] = crate::protocol::NATIVE_ALPN;
+
+/// How long a freshly handshaken `h3` peer gets to complete the HTTP/3
+/// SETTINGS + WebTransport CONNECT exchange before being dropped.
+const WEBTRANSPORT_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Max bytes accepted for one preview blob (15-byte header + JPEG
 /// ciphertext). Generous headroom over a typical ~30s discovery
@@ -152,52 +184,21 @@ async fn media_forward_task(
     }
 }
 
-/// Build a self-signed rustls/quinn server config. Generates a fresh
-/// keypair + cert every startup (no persistence, per spec's native-only
-/// phase — no CA, no domain to persist against).
-fn build_server_config() -> Result<quinn::ServerConfig> {
-    let CertifiedKey { cert, signing_key } =
-        rcgen::generate_simple_self_signed(vec!["simple-screenshare.local".to_string()])
-            .context("generating self-signed certificate")?;
-    let cert_der: CertificateDer<'static> = cert.into();
-    let key_der: PrivateKeyDer<'static> =
-        PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into();
-
-    let mut server_crypto = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der)
-        .context("building rustls server config")?;
-    server_crypto.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
-
-    let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
-        .context("adapting rustls config for QUIC")?;
-    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
-
-    // Keep idle connections alive across manual-testing pauses (dialogs,
-    // UI clicking, etc). Without this, quinn's default ~30s idle timeout
-    // drops clients that briefly go quiet. keep_alive_interval must stay
-    // comfortably below max_idle_timeout on at least one peer so pings
-    // keep the connection from ever reaching the idle deadline, while a
-    // truly dead peer still gets reaped in a reasonable time.
-    let mut transport_config = quinn::TransportConfig::default();
-    transport_config
-        .max_idle_timeout(Some(
-            quinn::IdleTimeout::try_from(Duration::from_secs(60))
-                .expect("60s fits in IdleTimeout"),
-        ))
-        .keep_alive_interval(Some(Duration::from_secs(15)));
-    server_config.transport_config(Arc::new(transport_config));
-
-    Ok(server_config)
+/// Bind a QUIC endpoint on `listen_addr` with a throwaway in-memory
+/// self-signed cert (default timings, nothing persisted). Split out from
+/// [`run`] so tests can bind on an ephemeral port (`:0`) and read back the
+/// actual bound address before starting the accept loop.
+#[cfg(test)]
+pub fn build_endpoint(listen_addr: SocketAddr) -> Result<Endpoint> {
+    let certs = CertManager::new(CertSource::ephemeral())?;
+    build_endpoint_with(listen_addr, &certs)
 }
 
-/// Bind a QUIC endpoint on `listen_addr` with a freshly generated
-/// self-signed cert. Split out from [`run`] so tests can bind on an
-/// ephemeral port (`:0`) and read back the actual bound address before
-/// starting the accept loop.
-pub fn build_endpoint(listen_addr: SocketAddr) -> Result<Endpoint> {
-    let server_config = build_server_config()?;
-    Endpoint::server(server_config, listen_addr)
+/// [`build_endpoint`] for a caller-supplied [`CertManager`] (tests that force
+/// rotation, `run`). The caller keeps the manager and runs
+/// [`CertManager::maintain`] if the cert should rotate.
+pub fn build_endpoint_with(listen_addr: SocketAddr, certs: &CertManager) -> Result<Endpoint> {
+    Endpoint::server(certs.server_config()?, listen_addr)
         .with_context(|| format!("binding QUIC endpoint on {listen_addr}"))
 }
 
@@ -218,13 +219,24 @@ pub async fn serve(registry: Arc<Registry>, endpoint: Endpoint) -> Result<()> {
 }
 
 /// Start the QUIC endpoint and run the accept loop until the process is
-/// torn down.
-pub async fn run(registry: Arc<Registry>, listen_addr: SocketAddr) -> Result<()> {
-    let endpoint = build_endpoint(listen_addr)?;
+/// torn down. Also keeps the TLS cert fresh ([`CertManager::maintain`]).
+pub async fn run(
+    registry: Arc<Registry>,
+    listen_addr: SocketAddr,
+    cert_source: CertSource,
+) -> Result<()> {
+    let certs = CertManager::new(cert_source)?;
+    let endpoint = build_endpoint_with(listen_addr, &certs)?;
     let local_addr = endpoint
         .local_addr()
         .context("reading bound local address")?;
-    tracing::info!(%local_addr, "QUIC endpoint listening");
+    registry.set_cert_info(certs.info());
+    tracing::info!(
+        %local_addr,
+        cert_hash = %crate::protocol::encode_cert_hash(&certs.info().hash),
+        "QUIC endpoint listening (ALPN h3 + ssshare/1)"
+    );
+    tokio::spawn(certs.maintain(endpoint.clone(), registry.clone()));
     serve(registry, endpoint).await
 }
 
@@ -236,7 +248,7 @@ async fn read_control_frame(recv: &mut RecvStream) -> Result<Option<ClientToRela
     let mut len_buf = [0u8; 4];
     match recv.read_exact(&mut len_buf).await {
         Ok(()) => {}
-        Err(quinn::ReadExactError::FinishedEarly(0)) => return Ok(None),
+        Err(ReadExactError::FinishedEarly(0)) => return Ok(None),
         Err(e) => bail!("control stream closed reading frame length: {e}"),
     }
     let len = u32::from_be_bytes(len_buf);
@@ -293,7 +305,8 @@ struct Joined {
 /// previews, and broadcasts `MemberJoined` to the rest of the room.
 async fn perform_join(
     registry: &Arc<Registry>,
-    connection: &Connection,
+    connection: &Session,
+    transport: TransportKind,
     ctrl_send: &mut SendStream,
     ctrl_recv: &mut RecvStream,
     control_tx: mpsc::UnboundedSender<RelayToClient>,
@@ -355,6 +368,7 @@ async fn perform_join(
                 display_name: display_name.clone(),
                 control_tx: control_tx.clone(),
                 connection: connection.clone(),
+                transport,
                 subscriptions: HashSet::new(),
                 stream_count: 0,
             },
@@ -387,9 +401,10 @@ async fn perform_join(
             .filter_map(|s| s.last_preview.clone().map(|b| ((s.owner, s.stream_id), b)))
             .collect();
 
-        guard
-            .log
-            .push(format!("{display_name} joined ({conn_id:016x})"));
+        guard.log.push(format!(
+            "{display_name} joined ({conn_id:016x}) via {}",
+            transport_label(transport)
+        ));
 
         // §8: snapshot MUST precede the MemberJoined delta to others.
         let _ = control_tx.send(RelayToClient::PresenceSnapshot { members, streams });
@@ -428,12 +443,90 @@ async fn perform_join(
     }
 }
 
+fn transport_label(t: TransportKind) -> &'static str {
+    match t {
+        TransportKind::Native => "native",
+        TransportKind::Browser => "browser",
+    }
+}
+
+/// Decrements the per-transport connection gauge when a connection ends, on
+/// every exit path.
+struct ConnGauge {
+    registry: Arc<Registry>,
+    kind: TransportKind,
+}
+
+impl ConnGauge {
+    fn new(registry: &Arc<Registry>, kind: TransportKind) -> Self {
+        Self::counter(registry, kind).fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self {
+            registry: registry.clone(),
+            kind,
+        }
+    }
+    fn counter(registry: &Registry, kind: TransportKind) -> &std::sync::atomic::AtomicUsize {
+        match kind {
+            TransportKind::Native => &registry.native_connections,
+            TransportKind::Browser => &registry.browser_connections,
+        }
+    }
+}
+
+impl Drop for ConnGauge {
+    fn drop(&mut self) {
+        Self::counter(&self.registry, self.kind).fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The accept layer: turn a handshaken QUIC connection into a [`Session`]
+/// according to the negotiated ALPN.
+///
+/// - `ssshare/1` -> `Session::raw` (no HTTP/3 at all);
+/// - `h3` -> HTTP/3 SETTINGS + the WebTransport CONNECT; only
+///   `https://.../ssshare` is accepted, anything else gets a 404.
+async fn accept_session(connection: quinn::Connection) -> Result<(Session, TransportKind)> {
+    let alpn = connection
+        .handshake_data()
+        .and_then(|d| d.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+        .and_then(|d| d.protocol.clone());
+    match alpn.as_deref() {
+        Some(a) if a == crate::protocol::NATIVE_ALPN => {
+            Ok((Session::raw(connection), TransportKind::Native))
+        }
+        Some(a) if a == crate::protocol::WEBTRANSPORT_ALPN => {
+            let request = tokio::time::timeout(
+                WEBTRANSPORT_SETUP_TIMEOUT,
+                web_transport_quinn::Request::accept(connection),
+            )
+            .await
+            .context("timed out waiting for the WebTransport CONNECT")?
+            .context("WebTransport handshake failed")?;
+            if request.url.path() != crate::protocol::WEBTRANSPORT_PATH {
+                let path = request.url.path().to_string();
+                let _ = request
+                    .reject(web_transport_quinn::http::StatusCode::NOT_FOUND)
+                    .await;
+                bail!("WebTransport request for unknown path {path:?}");
+            }
+            let session = tokio::time::timeout(WEBTRANSPORT_SETUP_TIMEOUT, request.ok())
+                .await
+                .context("timed out answering the WebTransport CONNECT")?
+                .context("accepting WebTransport session")?;
+            Ok((session, TransportKind::Browser))
+        }
+        other => bail!("unsupported ALPN {:?}", other.map(String::from_utf8_lossy)),
+    }
+}
+
 /// Drive one accepted QUIC connection end to end: join handshake, then
 /// the steady-state control/datagram/uni-stream loop, then cleanup.
 async fn handle_connection(registry: Arc<Registry>, incoming: quinn::Incoming) -> Result<()> {
-    let connection = incoming.await.context("QUIC handshake failed")?;
-    let remote = connection.remote_address();
-    tracing::debug!(%remote, "connection established, awaiting control stream");
+    let quic = incoming.await.context("QUIC handshake failed")?;
+    let remote = quic.remote_address();
+    let (connection, transport) = accept_session(quic).await?;
+    let _gauge = ConnGauge::new(&registry, transport);
+    tracing::debug!(%remote, transport = transport_label(transport), max_datagram = connection.max_datagram_size(), "connection established, awaiting control stream");
 
     let (mut ctrl_send, mut ctrl_recv) = connection
         .accept_bi()
@@ -445,6 +538,7 @@ async fn handle_connection(registry: Arc<Registry>, incoming: quinn::Incoming) -
     let joined = match perform_join(
         &registry,
         &connection,
+        transport,
         &mut ctrl_send,
         &mut ctrl_recv,
         control_tx.clone(),
@@ -460,7 +554,7 @@ async fn handle_connection(registry: Arc<Registry>, incoming: quinn::Incoming) -
         conn_id,
     } = joined;
 
-    tracing::info!(%remote, conn_id = format!("{conn_id:016x}"), room_id = %hex_room(&room_id), "member joined");
+    tracing::info!(%remote, transport = transport_label(transport), conn_id = format!("{conn_id:016x}"), room_id = %hex_room(&room_id), "member joined");
 
     let writer = tokio::spawn(control_writer_task(ctrl_send, control_rx));
 
@@ -506,7 +600,7 @@ async fn connection_loop(
     registry: &Arc<Registry>,
     room: &Arc<Mutex<RoomState>>,
     conn_id: ConnId,
-    connection: &Connection,
+    connection: &Session,
     ctrl_recv: &mut RecvStream,
     media_tx: &mpsc::Sender<MediaFragment>,
     route_tx: &mpsc::UnboundedSender<RouteUpdate>,
@@ -729,7 +823,7 @@ fn enqueue_media_datagram(
     data: Bytes,
     dropped: &mut u64,
 ) {
-    let Some(header) = MediaDatagramHeader::unpack(&data) else {
+    let Ok((header, _)) = MediaHeader::unpack(&data) else {
         tracing::debug!(
             conn_id = format!("{conn_id:016x}"),
             "dropping undersized media datagram"
@@ -788,13 +882,17 @@ async fn handle_preview_uni(
             return;
         }
     };
-    let Some(header) = PreviewHeader::unpack(&data) else {
+    let Ok((header, _)) = PreviewHeader::unpack(&data) else {
         tracing::debug!(
             conn_id = format!("{sender_conn_id:016x}"),
             "dropping malformed preview stream"
         );
         return;
     };
+    if header.stream_type != STREAM_TYPE_PREVIEW {
+        tracing::debug!("dropping uni stream with unknown stream type {:#x}", header.stream_type);
+        return;
+    }
     if header.conn_id != sender_conn_id {
         tracing::warn!(
             conn_id = format!("{sender_conn_id:016x}"),
@@ -817,7 +915,7 @@ async fn handle_preview_uni(
     };
     stream.last_preview = Some(blob.clone());
 
-    let targets: Vec<Connection> = guard
+    let targets: Vec<Session> = guard
         .connections
         .values()
         .filter(|c| c.conn_id != sender_conn_id)
@@ -914,7 +1012,7 @@ fn hex_room(room_id: &RoomId) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     //! End-to-end smoke test: bind the real relay on an ephemeral port,
     //! connect with a throwaway quinn client (self-signed cert accepted
     //! without pinning, matching this native-only phase's threat model
@@ -923,8 +1021,11 @@ mod tests {
     //! this" loop rather than just type-checking the protocol structs.
 
     use super::*;
-    use crate::protocol::{RelayToClient, StreamKind, WIRE_VERSION};
-    use rustls::pki_types::{ServerName, UnixTime};
+    use crate::protocol::{MEDIA_HEADER_LEN, RelayToClient, StreamKind, WIRE_VERSION};
+    // The test peers are plain quinn clients (they are what the native client
+    // is), so shadow the Session-flavoured stream types imported above.
+    use quinn::{Connection, RecvStream, SendStream};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
     use std::net::{IpAddr, Ipv4Addr};
 
     #[derive(Debug)]
@@ -981,7 +1082,7 @@ mod tests {
         }
     }
 
-    fn insecure_client_endpoint() -> Endpoint {
+    pub(crate) fn insecure_client_endpoint() -> Endpoint {
         let mut endpoint = Endpoint::client((IpAddr::V4(Ipv4Addr::LOCALHOST), 0).into())
             .expect("bind client endpoint");
         let mut crypto = rustls::ClientConfig::builder()
@@ -996,13 +1097,13 @@ mod tests {
     }
 
     /// Send one length-prefixed control frame from a test client.
-    async fn send_ctrl(send: &mut SendStream, msg: &ClientToRelay) {
+    pub(crate) async fn send_ctrl(send: &mut SendStream, msg: &ClientToRelay) {
         let framed = encode_frame(msg).expect("encode control frame");
         send.write_all(&framed).await.expect("write control frame");
     }
 
     /// Read one length-prefixed control frame on a test client.
-    async fn recv_ctrl(recv: &mut RecvStream) -> RelayToClient {
+    pub(crate) async fn recv_ctrl(recv: &mut RecvStream) -> RelayToClient {
         let mut len_buf = [0u8; 4];
         recv.read_exact(&mut len_buf).await.expect("read frame len");
         let len = u32::from_be_bytes(len_buf) as usize;
@@ -1011,10 +1112,19 @@ mod tests {
         decode_payload(&payload).expect("decode frame")
     }
 
+    /// [`recv_ctrl`] that returns `None` instead of panicking when the stream ends.
+    pub(crate) async fn try_recv_ctrl(recv: &mut RecvStream) -> Option<RelayToClient> {
+        let mut len_buf = [0u8; 4];
+        recv.read_exact(&mut len_buf).await.ok()?;
+        let mut payload = vec![0u8; u32::from_be_bytes(len_buf) as usize];
+        recv.read_exact(&mut payload).await.ok()?;
+        decode_payload(&payload).ok()
+    }
+
     /// Build one well-formed single-fragment media datagram (spec §6.2)
     /// with an opaque body — the relay never decrypts, so any bytes do.
     fn media_datagram(conn_id: ConnId, stream_id: StreamId, frame_id: u32) -> Bytes {
-        let header = MediaDatagramHeader {
+        let header = MediaHeader {
             version: WIRE_VERSION,
             flags: 0,
             conn_id,
@@ -1023,7 +1133,7 @@ mod tests {
             fragment_index: 0,
             fragment_count: 1,
         };
-        let mut buf = Vec::with_capacity(MediaDatagramHeader::LEN + 32);
+        let mut buf = Vec::with_capacity(MEDIA_HEADER_LEN + 32);
         buf.extend_from_slice(&header.pack());
         buf.extend_from_slice(&[0xAB; 32]);
         Bytes::from(buf)
@@ -1032,7 +1142,7 @@ mod tests {
     /// Poll room state until `pred` holds, or panic after ~2s. Used to
     /// synchronize on the *server* having applied a control message,
     /// rather than sleeping and hoping.
-    async fn await_room_state(
+    pub(crate) async fn await_room_state(
         registry: &Arc<Registry>,
         room_id: RoomId,
         label: &str,
@@ -1171,7 +1281,7 @@ mod tests {
             .await
             .expect("subscriber receives a forwarded datagram within 2s")
             .expect("datagram read ok");
-        let header = MediaDatagramHeader::unpack(&forwarded).expect("forwarded header parses");
+        let (header, _) = MediaHeader::unpack(&forwarded).expect("forwarded header parses");
         assert_eq!(header.conn_id, SHARER, "forwarded verbatim, no rewrite");
         assert_eq!(header.stream_id, STREAM);
 
@@ -1492,7 +1602,7 @@ mod tests {
                     panic!("viewer {conn_id:016x} is subscribed but receives nothing")
                 })
                 .expect("datagram read ok");
-            let header = MediaDatagramHeader::unpack(&forwarded).expect("header parses");
+            let (header, _) = MediaHeader::unpack(&forwarded).expect("header parses");
             assert_eq!(header.conn_id, SHARER);
             assert_eq!(header.stream_id, STREAM);
         }

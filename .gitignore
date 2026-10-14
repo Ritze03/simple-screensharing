@@ -6,3 +6,6 @@ client/dist/
 client/.playwright-mcp/
 .claude/scheduled_tasks.lock
 .claude/teamlead/
+# relay-generated TLS cert/key (server/src/cert.rs); secret, never commit
+/state/
+/server/state/

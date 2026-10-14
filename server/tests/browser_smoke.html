@@ -1,0 +1,226 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>relay WebTransport smoke test</title>
+<!--
+  Driven by server/src/browser_smoke.rs (headless Chromium). It is also a
+  minimal reference for what the real website has to do:
+    new WebTransport("https://host:port/ssshare",
+                     { serverCertificateHashes: [{ algorithm: "sha-256", value }] })
+  with `value` = base64url-decoded 4th field of the join link.
+  Control frames are u32-BE length + postcard; see protocol-spec.md.
+-->
+<script>
+const q = new URLSearchParams(location.search);
+const PORT = q.get("port");
+const HASH = b64uToBytes(q.get("hash"));          // the join link's 4th field
+const ROOM = hexToBytes(q.get("room"));
+const ME = BigInt("0x" + q.get("me"));            // this page's ConnId
+const SHARER = BigInt("0x" + q.get("sharer"));    // a native sharer already in the room
+const SHARER_STREAM = Number(q.get("sharer_stream"));
+const FRAGMENT = 1000;                            // MAX_MEDIA_DATAGRAM_LEN
+
+function b64uToBytes(s) {
+  s = s.replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  return Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+}
+function hexToBytes(h) {
+  return Uint8Array.from(h.match(/../g).map((x) => parseInt(x, 16)));
+}
+// --- minimal postcard writer/reader (varints, u8, strings) ---
+function varint(n) {
+  n = BigInt(n);
+  const out = [];
+  do {
+    let b = Number(n & 0x7fn);
+    n >>= 7n;
+    if (n) b |= 0x80;
+    out.push(b);
+  } while (n);
+  return out;
+}
+function str(s) {
+  const b = new TextEncoder().encode(s);
+  return [...varint(b.length), ...b];
+}
+function frame(payload) {
+  const out = new Uint8Array(4 + payload.length);
+  new DataView(out.buffer).setUint32(0, payload.length);
+  out.set(payload, 4);
+  return out;
+}
+const join = () => frame([0, ...varint(ME), ...ROOM, ...str("browser-smoke")]);
+const announce = (id, label) => frame([2, id, 0, ...str(label), ...varint(1280), ...varint(720)]);
+const subscribe = (target, id) => frame([4, ...varint(target), id]);
+
+class Reader {
+  constructor(buf) { this.b = buf; this.i = 0; }
+  u8() { return this.b[this.i++]; }
+  varint() {
+    let n = 0n, shift = 0n;
+    for (;;) {
+      const b = this.u8();
+      n |= BigInt(b & 0x7f) << shift;
+      if (!(b & 0x80)) return n;
+      shift += 7n;
+    }
+  }
+  str() { const n = Number(this.varint()); const s = new TextDecoder().decode(this.b.slice(this.i, this.i + n)); this.i += n; return s; }
+}
+
+async function readExact(reader, n, state) {
+  const out = new Uint8Array(n);
+  let got = 0;
+  while (got < n) {
+    if (state.buf.length) {
+      const take = Math.min(state.buf.length, n - got);
+      out.set(state.buf.subarray(0, take), got);
+      state.buf = state.buf.subarray(take);
+      got += take;
+      continue;
+    }
+    const { value, done } = await reader.read();
+    if (done) throw new Error("control stream ended");
+    state.buf = value;
+  }
+  return out;
+}
+async function readFrame(reader, state) {
+  const len = new DataView((await readExact(reader, 4, state)).buffer).getUint32(0);
+  return readExact(reader, len, state);
+}
+
+function log(m) { fetch("/log", { method: "POST", body: String(m) }).catch(() => {}); }
+async function post(obj) {
+  await fetch("/result", { method: "POST", body: JSON.stringify(obj) });
+}
+
+async function main() {
+  const url = `https://127.0.0.1:${PORT}/ssshare`;
+  const result = {};
+
+  // 1. A wrong hash must be refused: this is what pinning is for.
+  try {
+    const bad = new WebTransport(url, {
+      serverCertificateHashes: [{ algorithm: "sha-256", value: new Uint8Array(32) }],
+    });
+    bad.closed.catch(() => {});
+    await bad.ready;
+    result.badHashRejected = false;
+    bad.close();
+  } catch (e) {
+    result.badHashRejected = true;
+  }
+
+  // 2. The right hash connects.
+  const wt = new WebTransport(url, {
+    serverCertificateHashes: [{ algorithm: "sha-256", value: HASH }],
+  });
+  await wt.ready;
+  result.maxDatagramSize = wt.datagrams.maxDatagramSize;
+
+  log("ready, max=" + wt.datagrams.maxDatagramSize);
+  // 3. Control stream: first bidi stream, first message Join.
+  const bidi = await wt.createBidirectionalStream();
+  const ctrlW = bidi.writable.getWriter();
+  const ctrlR = bidi.readable.getReader();
+  const st = { buf: new Uint8Array(0) };
+  await ctrlW.write(join());
+  const snap = new Reader(await readFrame(ctrlR, st));
+  result.snapshotVariant = snap.u8();               // 0 = PresenceSnapshot
+  const members = Number(snap.varint());
+  result.snapshotMembers = [];
+  for (let i = 0; i < members; i++) {
+    const id = snap.varint(); const name = snap.str(); snap.u8();
+    result.snapshotMembers.push(id.toString(16) + ":" + name);
+  }
+  result.snapshotStreams = Number(snap.varint());
+
+  // keep draining the control stream so the relay's writer never blocks
+  (async () => { try { for (;;) await readFrame(ctrlR, st); } catch (_) {} })();
+
+  // 4. Become a sharer, and a viewer of the native sharer.
+  await ctrlW.write(announce(0, "browser screen"));
+  await ctrlW.write(subscribe(SHARER, SHARER_STREAM));
+
+  // 5. Datagrams from the native sharer.
+  const gotDatagram = (async () => {
+    const r = wt.datagrams.readable.getReader();
+    for (;;) {
+      const { value, done } = await r.read();
+      if (done) throw new Error("datagrams ended");
+      if (!result.firstRx) { result.firstRx = value.length; log("first datagram rx len=" + value.length); }
+      const dv = new DataView(value.buffer, value.byteOffset, value.byteLength);
+      if (value.length === FRAGMENT && dv.getBigUint64(2) === SHARER && value[10] === SHARER_STREAM) {
+        result.datagramLen = value.length;
+        return;
+      }
+    }
+  })();
+
+  // 6. Preview uni-stream from the native sharer.
+  const gotPreview = (async () => {
+    const r = wt.incomingUnidirectionalStreams.getReader();
+    for (;;) {
+      const { value: s, done } = await r.read();
+      if (done) throw new Error("uni streams ended");
+      const chunks = []; let total = 0;
+      const sr = s.getReader();
+      for (;;) {
+        const { value, done } = await sr.read();
+        if (done) break;
+        chunks.push(value); total += value.length;
+      }
+      const all = new Uint8Array(total); let o = 0;
+      for (const c of chunks) { all.set(c, o); o += c.length; }
+      if (all[0] === 0x01 && new DataView(all.buffer).getBigUint64(2) === SHARER) {
+        result.previewLen = all.length;
+        return;
+      }
+    }
+  })();
+
+  // 7. Our own media + preview towards the native viewer.
+  let frameId = 0, stop = false;
+  (async () => {
+    const w = wt.datagrams.writable.getWriter();
+    log("datagram writer up, max=" + wt.datagrams.maxDatagramSize);
+    while (!stop) {
+      const d = new Uint8Array(FRAGMENT);
+      const dv = new DataView(d.buffer);
+      d[0] = 1; d[1] = 0; dv.setBigUint64(2, ME); d[10] = 0;
+      dv.setUint32(11, frameId++); dv.setUint16(15, 0); dv.setUint16(17, 1);
+      d.fill(0xcd, 19);
+      if (frameId < 3) log('writing datagram ' + frameId);
+      try { await w.write(d); } catch (e) { log('datagram write failed: ' + e); }
+      if (frameId === 5) log('sent 5 datagrams');
+      await new Promise((r) => setTimeout(r, 30));
+    }
+  })();
+  (async () => {
+    while (!stop) {
+      const s = await wt.createUnidirectionalStream();
+      const w = s.getWriter();
+      const p = new Uint8Array(15 + 300);
+      const dv = new DataView(p.buffer);
+      p[0] = 1; p[1] = 1; dv.setBigUint64(2, ME); p[10] = 0; dv.setUint32(11, 1);
+      p.fill(0xab, 15);
+      await w.write(p);
+      await w.close();
+      await new Promise((r) => setTimeout(r, 300));
+    }
+  })();
+
+  await Promise.all([gotDatagram, gotPreview]);
+  log("received from native sharer: datagram " + result.datagramLen + ", preview " + result.previewLen);
+  // Keep sending until the native viewer confirms it got our datagram + preview.
+  while ((await (await fetch("/done")).text()) !== "1") {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  stop = true;
+  await post(result);
+  wt.close();
+}
+
+main().catch((e) => log("ERROR " + (e && e.stack || e)) || post({ error: String(e && e.stack || e) }));
+</script>
