@@ -112,26 +112,24 @@ impl EncoderPreset {
         Self::ALL.into_iter().find(|p| p.value() == value)
     }
 
-    /// Button label (English; the JS table's `label`).
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::LowLatency => "Low-Latency",
-            Self::Balanced => "Balanced",
-            Self::Quality => "Quality",
-            Self::Gaming => "Gaming",
-        }
+    /// Button label, localized (en: the JS table's `label`).
+    pub fn label(self) -> &'static str {
+        localized(match self {
+            Self::LowLatency => "presets.low_latency.label",
+            Self::Balanced => "presets.balanced.label",
+            Self::Quality => "presets.quality.label",
+            Self::Gaming => "presets.gaming.label",
+        })
     }
 
-    /// Tooltip text (English; the JS table's `title`).
-    pub const fn description(self) -> &'static str {
-        match self {
-            Self::LowLatency => "Fastest encode, prioritizes reduced delay over compression efficiency.",
-            Self::Balanced => "The default — a good mix of latency and quality.",
-            Self::Quality => "Maximizes visual quality within the bandwidth ceiling.",
-            Self::Gaming => {
-                "Tuned for fast-motion/gaming content — shorter keyframe interval for quicker recovery from motion artifacts."
-            }
-        }
+    /// Tooltip text, localized (en: the JS table's `title`).
+    pub fn description(self) -> &'static str {
+        localized(match self {
+            Self::LowLatency => "presets.low_latency.description",
+            Self::Balanced => "presets.balanced.description",
+            Self::Quality => "presets.quality.description",
+            Self::Gaming => "presets.gaming.description",
+        })
     }
 
     /// The four encoder fields this preset sets.
@@ -289,13 +287,26 @@ pub const fn codec_label(codec: VideoCodec) -> &'static str {
     }
 }
 
-/// Codec picker tooltip text.
-pub const fn codec_description(codec: VideoCodec) -> &'static str {
-    match codec {
-        VideoCodec::H264 => "Most compatible — decodes everywhere, including hardware that can't do H.265/AV1.",
-        VideoCodec::Av1 => "Modern, royalty-free, best efficiency on Intel/NVIDIA hardware.",
-        VideoCodec::H265 => "Best quality on this hardware; licensing caveats on some platforms/browsers.",
-    }
+/// Codec picker tooltip text, localized.
+pub fn codec_description(codec: VideoCodec) -> &'static str {
+    localized(match codec {
+        VideoCodec::H264 => "presets.codec.h264.description",
+        VideoCodec::Av1 => "presets.codec.av1.description",
+        VideoCodec::H265 => "presets.codec.h265.description",
+    })
+}
+
+/// `t!(key)` as a `&'static str`, so the label/description signatures (and the
+/// UI callers that borrow them into `&str` tables) stay unchanged.
+///
+/// `Why:` the leak is bounded: one entry per (locale, key), interned on first use.
+fn localized(key: &'static str) -> &'static str {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<HashMap<(String, &'static str), &'static str>>> = OnceLock::new();
+    let locale = rust_i18n::locale().to_string();
+    let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
+    cache.entry((locale, key)).or_insert_with(|| Box::leak(rust_i18n::t!(key).into_owned().into_boxed_str()))
 }
 
 #[cfg(test)]
