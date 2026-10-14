@@ -1,115 +1,80 @@
 # Presentation Modes
 
 What the "Presentation mode" setting does, where it lives, and why it works the way it
-does. Lives in `simple-screensharing-client`.
+does. Lives in `client/` (`rooms.rs`, `main.rs`, `ui/modals.rs`).
 
 ## What it does
 
-The desktop client's window is drawn through `eframe`'s `wgpu` renderer, which by
-default configures its `wgpu::Surface` with `PresentMode::AutoVsync` — every frame is
-capped to the display's refresh rate (vsync-locked), with no way for the user to change
-that. The presentation-mode setting exposes the real `wgpu::PresentMode` used to
-configure that surface, so a user can trade vsync's no-tearing guarantee for lower
-latency / an uncapped render rate if they want it.
-
-Three modes are offered, matching `rooms::PresentationMode`:
+The client draws through `eframe`'s `wgpu` renderer. The presentation mode is the real
+`wgpu::PresentMode` the window surface is configured with. Three modes are offered
+(`rooms::PresentationMode`):
 
 | Mode | `wgpu::PresentMode` | Behavior |
 | --- | --- | --- |
-| Vsync (default) | `AutoVsync` | Capped to display refresh, no tearing. Today's implicit behavior before this feature existed. |
-| Immediate (no vsync) | `Immediate` | No cap, submits as soon as a frame is ready. May tear. |
-| Mailbox (no vsync, no tearing) | `Mailbox` | No cap, no tearing, via a single-slot swap instead of a wait-for-vblank queue. Falls back to `Fifo` (vsync) at `Surface::configure()` time on a backend that doesn't support it — no fallback logic needed on the app side, `wgpu` itself handles it. |
+| **Mailbox (default)** | `Mailbox` | No cap, no tearing: presents swap into a single-slot buffer instead of waiting for vblank. |
+| Vsync | `AutoVsync` | Capped to the display refresh, no tearing. Was the default until 2026-10-14. |
+| Immediate | `Immediate` | No cap, submits as soon as a frame is ready. May tear. |
 
-These three are the modes documented as supported everywhere; `Fifo`/`FifoRelaxed`/
-`AutoNoVsync` aren't offered separately since they'd be redundant with the fallback
-behavior of `Immediate`/`Mailbox`/`AutoVsync` above.
+`Fifo`/`FifoRelaxed`/`AutoNoVsync` are not offered separately; they would be redundant with
+these three.
 
-## Where it's stored
+## Why Mailbox is the default (2026-10-14)
 
-`rooms::AppSettings.presentation_mode: PresentationMode` — the same small TOML file as
-the language preference, `$XDG_CONFIG_HOME/simple-screensharing/settings.toml` (see
-`AppSettings::config_path`). Defaults to `PresentationMode::AutoVsync` so a user who
-never touches the setting sees no behavior change from before this feature existed.
+eframe presents its viewports **serially on one thread**, and with `Fifo` (what `AutoVsync`
+resolves to) every present blocks until *that window's own* vblank. With a pop-out window open
+and a stream faster than the monitor's refresh, the windows starve each other: measured on a
+120 Hz monitor with a 240 fps stream, the **main window fell to 69 fps**. Mailbox never blocks
+on vblank and held **240/240 fps in both windows**, and unlike Immediate it does not tear.
+(Pop-outs: `superdoc/features/viewer-window.md`; renderer: `superdoc/features/video-pipeline.md`
+"Native display".)
 
-`main.rs` reads `AppSettings::load().presentation_mode` once at startup and passes
-`PresentationMode::to_wgpu()`'s result into `NativeOptions.wgpu_options.present_mode`
-before calling `eframe::run_native`.
+Only settings files **without** a stored mode get the new default: every save writes the whole
+`AppSettings`, so an existing user's stored `AutoVsync` is kept.
 
-## Where the dropdown lives
+## Where it is stored and applied
 
-`ui::App::ui_settings_card`, a `theme::card`-wrapped settings section rendered by the
-**Settings** nav tab (`ui_settings_tab`), right alongside the existing language toggle —
-it's a global rendering setting, not per-stream or per-room, so it belongs somewhere the
-user reaches regardless of which room they're in, not buried inside room-scoped
-screen-sharing controls. *(Until the 2026-07-26 app-shell pass it lived at the top of the
-old one-time join screen, for the same reason; that screen no longer exists — see
-`superdoc/ui/APP-SHELL.md`.)*
+- `rooms::AppSettings.presentation_mode`, in the settings TOML
+  `$XDG_CONFIG_HOME/simple-screensharing/settings.toml` (`AppSettings::config_path`), next to the
+  language. Its own small enum rather than `wgpu::PresentMode`, so the persisted schema survives a
+  wgpu upgrade that renames variants.
+- `main.rs` reads it once at startup and hands `PresentationMode::to_wgpu()` to
+  `NativeOptions.wgpu_options` (`wgpu_configuration`).
+- **Restart to apply.** The pinned eframe/egui-wgpu (0.33.3, wgpu 27) keeps the surfaces and
+  `WgpuConfiguration` private, so the surface can be configured only once, before the window
+  exists. Selecting a mode saves immediately (`UiAction::SetPresentationMode`) and the dropdown shows
+  a "restart to apply" hint while the selection differs from `launch_presentation_mode`. A real
+  dependency limit, not a design preference: if a future eframe exposes surface reconfiguration,
+  live switching would be strictly better.
 
-Selecting a mode saves it immediately (`save_presentation_mode`), and — since it can't
-take effect until the next launch (see "Why" below) — the row shows a small
-"restart to apply" hint whenever the current selection differs from
-`App::launch_presentation_mode` (the mode that was actually active when this window was
-created).
+## The dropdown
 
-## Why: true `wgpu::PresentMode` switching, not software repaint pacing
+In the **Settings modal** (`ui/modals.rs`, `PRESENTATION_MODES`, locale keys
+`ui.settings.mode_*`), beside the language select. It is a global rendering setting, not per
+room or per stream. (Before the egui rebuild it was a card on the Settings nav tab; see
+`superdoc/ui/APP-SHELL.md` for the current shell.)
 
-This project already has an *unrelated* pacing layer: `decode::PacingState` throttles
-decoded video frames to the sender's capture-time PTS via `thread::sleep` on the decode
-worker thread, upstream of rendering entirely. That mechanism controls *which frame*
-gets shown when; it has nothing to do with *how fast the surface can present*, and this
-feature doesn't touch it.
+## If the mode is unsupported: relaunch with Vsync
 
-Before this feature, the client had no way to affect the actual GPU present cadence: the
-`eframe` window's `wgpu::Surface` was always configured at the default `AutoVsync`, so
-frame delivery to the screen was hard-capped at the monitor's refresh rate no matter what
-the decode side did. The explicit design decision here (not re-litigated by future
-changes without a real reason) is that this ceiling should be removable via a *real*
-`wgpu::PresentMode` change on the render surface — decoupling redraw cadence from vsync
-in software (e.g. just calling `request_repaint()` more often without changing
-`PresentMode`) would not have removed that ceiling, since the surface's own `present()`
-call still blocks/paces itself according to whatever `PresentMode` the surface was
-configured with.
+An earlier version of this page claimed wgpu falls back to Fifo for an unsupported
+`Immediate`/`Mailbox`. **wgpu 27 does not**: it fails fatally with `UnsupportedPresentMode` at
+surface configure. So for any mode except `AutoVsync`, `main.rs`'s adapter selector checks
+`surface.get_capabilities(adapter).present_modes` while choosing the adapter (mirroring wgpu's own
+power-preference ranking), sets `PRESENT_MODE_UNSUPPORTED` and fails the setup if the mode is
+missing. `main` then **relaunches itself** (`exec`, because winit cannot build a second event loop
+in one process) with `SSS_PRESENT_MODE_FALLBACK=1`, which forces `AutoVsync` for that run. The
+stored setting is left alone.
 
-**Runtime swap vs. restart-required — what was actually found:** the pinned
-`eframe`/`egui-wgpu` version (0.33.3, matching pinned `wgpu` 27.0.1) does not expose the
-render surface for reconfiguration once the window exists. `egui_wgpu::Painter` (the
-internal type that owns the `wgpu::Surface` per viewport) keeps its `surfaces` map and
-`WgpuConfiguration` private, and the public API surface (`Painter::render_state()` /
-`eframe::Frame::wgpu_render_state()`) only exposes the `wgpu::Adapter`/`Device`/`Queue`,
-never the `Surface` itself or a method to reconfigure it. So there is no way to call
-`Surface::configure()` again with a new `PresentMode` from application code — the
-surface is only ever configured once, at `NativeOptions.wgpu_options.present_mode`,
-before `eframe::run_native` creates the window. That's why this feature is
-persist-immediately / apply-on-next-launch rather than live: it's a real constraint of
-the pinned dependency version, not a design preference. If a future `eframe`/`egui-wgpu`
-upgrade exposes surface reconfiguration, this should be revisited — swapping live would
-be strictly better UX than requiring a restart.
+## Repaint cadence is not the same thing
 
-Because the actual supported present modes for a given adapter/surface
-(`wgpu::Surface::get_capabilities(&adapter).present_modes`) aren't reachable either
-(same reason — no `Surface` handle available where the dropdown is drawn, before a
-window/surface even exists yet at settings-load time), the three offered modes are
-hardcoded to the well-known cross-platform-safe set (`AutoVsync`/`Immediate`/`Mailbox`)
-rather than queried live. `Immediate`/`Mailbox` fall back to `Fifo` automatically at
-`Surface::configure()` time if a platform doesn't support them, so this is safe even
-without querying capabilities up front.
-
-**Why the repaint-cadence focus gate exists alongside this:** removing the vsync
-*ceiling* is not the same as removing the responsibility to stop rendering when there's
-nothing to see. `ui::App::update` already drove a continuous `ctx.request_repaint()`
-while a stream was being watched inline, uncapped by anything except the surface's own
-`PresentMode`. Once `PresentMode` can be `Immediate`/`Mailbox`, that loop would otherwise
-burn full GPU/CPU even while the window sits unfocused in the background — vsync used to
-provide that ceiling essentially by accident, and this feature explicitly removes it. So
-`update()` now checks `ctx.input(|i| i.viewport().focused)` and only requests the
-full-rate repaint while focused; unfocused, it falls back to a coarser
-`request_repaint_after(UNFOCUSED_REPAINT_INTERVAL)` cadence (500ms) regardless of which
-`PresentationMode` is selected. This applies uniformly — an uncapped mode only relaxes
-the render-rate *ceiling*, the focus check is what keeps a backgrounded window from
-spinning the GPU for no visible benefit.
+Removing the vsync ceiling means nothing throttles repaints any more, so the shell caps idle
+polling itself: `request_repaint_after` of 50 ms focused / 500 ms unfocused
+(`IDLE_REPAINT_INTERVAL` / `UNFOCUSED_REPAINT_INTERVAL`, `ui/mod.rs`). Video repaints are separate
+and frame-driven (a waker thread per view, `video-pipeline.md` "Native display"), so a backgrounded
+window with no video does not spin the GPU in any mode. `decode::PacingState` is unrelated: it
+decides *which frame* is shown, not how fast the surface can present, and it is not on the display
+path today.
 
 ## Related docs
 
-- `superdoc/ui/STYLING-GUIDE.md` — the dropdown and its "restart to apply" hint are
-  built with the `theme.rs` widget helpers this doc's conformance pass introduced.
-- `superdoc/architecture/overview.md` — module map entry for `theme.rs`/`ui.rs`.
+- `superdoc/ui/STYLING-GUIDE.md` and `superdoc/ui/APP-SHELL.md`: the modal and its widgets.
+- `superdoc/architecture/overview.md`: module map.
