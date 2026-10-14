@@ -123,6 +123,19 @@ At most one popover (`Nav.popover`, anchored to the button's rect) and one modal
 modal; Escape, x and a backdrop click close every modal. Toasts are painted last by
 `mod.rs` (2.6 s).
 
+**The stream-settings modal keeps one height whether "Advanced tuning" is open or closed**
+(2026-10-15). While collapsed, `encoder_card` reserves the rows' height as empty space *below*
+the Encoder card (`adv_rows_height`: the rows laid out once in an invisible, non-advancing child
+just to read their height), so the modal is as tall as with Advanced open (still capped by the
+window; the body scrolls when it is short). Test: `encoder_card_height_does_not_depend_on_advanced`.
+*Why:* the user disliked the modal growing and shrinking, and, being centred, jumping, when
+toggling Advanced. A measured pass beats remembering the expanded height (no one-frame resize
+the first time the modal opens closed) and beats a fixed constant (follows font and language);
+the space sits outside the card so it reads as empty body, not an oversized card. It only
+changes the height when the right column is the taller one (it is, in the staged modal).
+Not covered (can still resize it): the encoder-limit and bandwidth-overshoot banners (not
+checked in the rig; the left column has ~90 px slack in the staged modal).
+
 ### Video
 
 `VideoViews` (`cx.videos.show(key, ui, size, Fit::Contain)`) draws a GPU `VideoView`
