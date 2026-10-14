@@ -17,6 +17,14 @@
 //! Every control row is `[120 label][fill control][72 value]` (the widgets
 //! row helpers), so value boxes share one right edge.
 //!
+//! Narrow windows: when half the body is narrower than [`column_need`] (the
+//! widest segmented control's labels at full length, or the Screen readout up
+//! to [`READOUT_NEED_CAP`]), the two columns stack into one in reading order
+//! (where it goes, then how it's encoded); the modal body already scrolls.
+//! In practice: two columns at 1280 and up in en and de, one column at the
+//! 960 minimum (912 px modal). Nothing truncates either way, except a window
+//! title longer than the cap (full text on hover).
+//!
 //! Staged edits go through [`UiAction::SetNextStream`] /
 //! [`UiAction::ApplyPresetToNextStream`]; live edits through
 //! [`UiAction::EditDestination`] / [`UiAction::ApplyPresetToDestination`] and
@@ -60,6 +68,9 @@ const GOP_STEP: f64 = 250.0;
 /// (mockup `touch()`): a bitrate-only change applies instantly and would
 /// otherwise never show any feedback.
 const APPLYING_MIN_SECS: f64 = 0.7;
+/// Most of the Screen readout's width that [`column_need`] makes room for
+/// (fits "Bildschirmfreigabe · 3840×2160"); longer truncates with a tooltip.
+const READOUT_NEED_CAP: f32 = 260.0;
 
 /// Stream-settings modal state.
 #[derive(Default)]
@@ -289,17 +300,83 @@ fn body(
     out: &mut Vec<UiAction>,
     anchors: &mut Anchors,
 ) {
-    widgets::columns(ui, 2, theme::S3, |cols| {
-        let (l, r) = cols.split_at_mut(1);
-        let (l, r) = (&mut l[0], &mut r[0]);
-        l.spacing_mut().item_spacing.y = theme::S3;
-        r.spacing_mut().item_spacing.y = theme::S3;
-        source_card(l, cx, c, capture, room, out);
-        destinations_card(l, cx, c, capture, room, out, anchors);
-        bandwidth_card(l, cx, st, c, target, out);
-        video_card(r, cx, st, c, target, out);
-        encoder_card(r, cx, st, target, out);
-    });
+    let col_w = (ui.available_width() - theme::S3) / 2.0;
+    if col_w >= column_need(ui, c) {
+        widgets::columns(ui, 2, theme::S3, |cols| {
+            let (l, r) = cols.split_at_mut(1);
+            let (l, r) = (&mut l[0], &mut r[0]);
+            l.spacing_mut().item_spacing.y = theme::S3;
+            r.spacing_mut().item_spacing.y = theme::S3;
+            source_card(l, cx, c, capture, room, out);
+            destinations_card(l, cx, c, capture, room, out, anchors);
+            bandwidth_card(l, cx, st, c, target, out);
+            video_card(r, cx, st, c, target, out);
+            encoder_card(r, cx, st, target, out);
+        });
+    } else {
+        // Narrow window: one column in reading order (the body scrolls).
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = theme::S3;
+            source_card(ui, cx, c, capture, room, out);
+            destinations_card(ui, cx, c, capture, room, out, anchors);
+            bandwidth_card(ui, cx, st, c, target, out);
+            video_card(ui, cx, st, c, target, out);
+            encoder_card(ui, cx, st, target, out);
+        });
+    }
+}
+
+/// Width one body column needs so no segmented label and no screen readout
+/// truncates: card chrome + `[120 label][8][control]`, the control being the
+/// widest of every segmented row (equal segments: the longest label in bold,
+/// + 8 text inset, 3 px gaps and 3 px outer inset, as `segmented` /
+/// [`seg_gated`] draw them) and the Screen readout (+ the 72 value slot when
+/// staged, for "Change"). The readout counts up to [`READOUT_NEED_CAP`] only:
+/// a long window title truncates (full text on hover) instead of forcing one
+/// column at every width.
+///
+/// `Why` measured and not a fixed window width: German labels are ~20 %
+/// longer, so a fixed breakpoint either stacks English needlessly or still
+/// truncates German.
+fn column_need(ui: &Ui, c: &LocalCapture) -> f32 {
+    let bold = font(Weight::Bold, theme::FS_SMALL);
+    let seg = |labels: Vec<String>| {
+        let w = labels.iter().map(|l| widgets::text_width(ui, l, bold.clone(), 0.0)).fold(0.0, f32::max);
+        let n = labels.len() as f32;
+        6.0 + n * (w.ceil() + 8.0 + 2.0) + 3.0 * (n - 1.0)
+    };
+    let t = |pairs: &[(&'static str, &'static str)]| pairs.iter().map(|(k, en)| tr(k, en).to_string()).collect::<Vec<String>>();
+    let control = [
+        seg(t(&[("ui.stream.bw_per_stream", "Per-stream maximum"), ("ui.stream.bw_absolute", "Absolute maximum")])),
+        seg(t(&[("ui.stream.tune_low", "Low latency"), ("ui.stream.tune_best", "Best quality")])),
+        seg(t(&[("ui.stream.ql_performance", "Performance"), ("ui.stream.ql_balanced", "Balanced"), ("ui.stream.ql_quality", "Quality")])),
+        seg(t(&[("ui.stream.rc_efficient", "Efficient"), ("ui.stream.rc_max_quality", "Max quality")])),
+        seg(EncoderPreset::ALL.iter().map(|p| p.label().to_string()).collect()),
+        seg(CODEC_DISPLAY_ORDER.iter().map(|c| codec_label(*c).to_string()).collect()),
+    ]
+    .into_iter()
+    .fold(0.0, f32::max);
+    let readout = widgets::text_width(ui, &screen_readout(c), font(Weight::Mono, theme::FS_SMALL), 0.0).ceil().min(READOUT_NEED_CAP)
+        + if c.destinations.is_empty() { theme::S2 + theme::VALUE_W } else { 0.0 };
+    // Card: 1 px border + 12 padding each side.
+    2.0 * (1.0 + theme::S3) + theme::LABEL_W + theme::S2 + control.max(readout)
+}
+
+/// The Screen readout; the full text on hover when it truncates (a long
+/// window title past [`READOUT_NEED_CAP`]).
+fn screen_ro(ui: &mut Ui, text: &str) -> Response {
+    let full = widgets::text_width(ui, text, font(Weight::Mono, theme::FS_SMALL), 0.0);
+    let r = widgets::readout(ui, text, Align::Min);
+    if full > r.rect.width() + 0.5 { r.on_hover_text(text) } else { r }
+}
+
+/// The Source card's Screen readout: "Display 1 · 1920×1080".
+fn screen_readout(c: &LocalCapture) -> String {
+    let screen = screen_name(c);
+    match source_size(c) {
+        Some((w, h)) => format!("{screen} · {w}×{h}"),
+        None => screen,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -309,10 +386,7 @@ fn body(
 fn source_card(ui: &mut Ui, cx: &Cx, c: &LocalCapture, capture: CaptureSourceId, room: RoomHandle, out: &mut Vec<UiAction>) {
     let staged = c.destinations.is_empty();
     let state = cx.state;
-    let mut screen = screen_name(c);
-    if let Some((w, h)) = source_size(c) {
-        screen = format!("{screen} · {w}×{h}");
-    }
+    let screen = screen_readout(c);
     let audio = cx.paired_audio(capture);
     let current: Option<String> = if staged {
         cx.shell.staged.get(&room).and_then(|s| s.audio.as_ref().map(|a| a.name.clone()))
@@ -352,7 +426,7 @@ fn source_card(ui: &mut Ui, cx: &Cx, c: &LocalCapture, capture: CaptureSourceId,
                 ui,
                 &label,
                 None,
-                |ui| widgets::readout(ui, &screen, Align::Min),
+                |ui| screen_ro(ui, &screen),
                 |ui| Btn::secondary(&change).show_sized(ui, theme::VALUE_W).clicked(),
             );
             if clicked {
@@ -362,7 +436,7 @@ fn source_card(ui: &mut Ui, cx: &Cx, c: &LocalCapture, capture: CaptureSourceId,
                 out.push(UiAction::StageShare(room));
             }
         } else {
-            widgets::ctrl_row(ui, &label, None, |ui| widgets::readout(ui, &screen, Align::Min));
+            widgets::ctrl_row(ui, &label, None, |ui| screen_ro(ui, &screen));
         }
         let opts: Vec<&str> = names.iter().map(String::as_str).collect();
         widgets::ctrl_row_value(
