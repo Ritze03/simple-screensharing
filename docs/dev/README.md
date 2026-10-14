@@ -44,7 +44,10 @@ docs/dev/relay.sh stop 14433
   60 Hz, which caps `canvas.captureStream` at 60 fps and makes every 120/240 fps number meaningless.
 * Chromium launches headless by default. `HEADED=1` shows real windows (needed for GPU video decode: headless GPU paths crash
   in this environment, `GPU process exited unexpectedly: exit_code=139/8704`); the runner refuses unless `SSS_GUI_LOCKED=1` is
-  set, which you only do while holding the shared desktop lock (`flock` on `/tmp/claude-1000/sss-gui.lock`) with focus on a free monitor.
+  set. Since 2026-10-14 headed Chromium runs **only inside the headless sway rig**, never on the user's desktop:
+  `client/scripts/hs-rig.sh run -- env SSS_GUI_LOCKED=1 HEADED=1 node docs/dev/headless.mjs run dev/tests.html` (the rig's absolute
+  `WAYLAND_DISPLAY` makes Chromium open its window on the rig's sway; checked 2026-10-14, 37/37 pass). `SSS_GUI_LOCKED` is just the
+  historical name of the opt-in; the old shared desktop lock itself is gone (the rig needs none).
 * Do **not** pass `--use-fake-ui-for-media-stream` for `getDisplayMedia` tests: it made Chromium pick a `screen:0:0` source.
 * GPU decode needs `--flag --enable-features=VaapiVideoDecoder,VaapiIgnoreDriverChecks,AcceleratedVideoDecodeLinuxGL --flag --ignore-gpu-blocklist`.
   Chromium 153 on this machine has **no** hardware *encode* path for WebCodecs (all `prefer-hardware` encoder probes fail),
@@ -55,11 +58,30 @@ docs/dev/relay.sh stop 14433
 `cdp.mjs` is a zero-dependency Chrome DevTools driver (click, type, eval, screenshot, console/network capture, headed or headless);
 `e2e-lib.mjs` wraps the real site UI with it (create/join a room, stub `getDisplayMedia` with the harness pattern source, Go live,
 Watch, measure); `e2e/` holds the runs: `sharer.mjs` / `viewer.mjs` / `viewer-headed.mjs` (browser peers with a file-based command
-channel), `full-room.mjs`, `links.mjs`, `ui-reconnect.mjs`, `browser-to-browser.mjs`, plus `native-session.sh` (one short GUI-locked
-session: scratch `XDG_CONFIG_HOME` seeded with the room, the native app on DP-1/DP-2, ydotool clicks, grim screenshots, clean teardown
-incl. orphan `ssshare-loopback` pw-loopbacks) and `e2e/steps/*.sh` (the click sequences; coordinates are for the 1900x1060 tiled window).
-`motion.html` is full-window moving content for portal captures. Needs: `E2E_OUT` (scratch dir, default `/tmp/sss-e2e`, keep it small),
-`NATIVE_BIN`, `RELAY_BIN`/`RELAY_DIR`. Never run headed without the GUI lock; never put a picker screenshot on a full output.
+channel), `full-room.mjs`, `links.mjs`, `ui-reconnect.mjs`, `browser-to-browser.mjs`, plus `native-session.sh` and `e2e/steps/*.sh`
+(**legacy**: they drove the native app on the user's real DP-1/DP-2 with `mmsg`, `ydotool`, the real portal picker and the shared GUI lock;
+since 2026-10-14 they refuse to run without `SSS_ALLOW_REAL_DESKTOP=1`, which is for the user's own manual use only; see "Native side in
+the rig" below). `motion.html` is full-window moving content for portal captures (the rig's own pattern, `vkcube`, replaces it for native
+shares). Needs: `E2E_OUT` (scratch dir, default `/tmp/sss-e2e`, keep it small), `NATIVE_BIN`, `RELAY_BIN`/`RELAY_DIR`. The browser-only
+runs (`sharer.mjs`, `viewer.mjs`, `full-room.mjs`, `links.mjs`, `ui-reconnect.mjs`, `browser-to-browser.mjs`) use headless Chromium and
+are unaffected.
+
+### Native side in the rig (replaces `native-session.sh` and `steps/`)
+
+*Why:* the user works at the real desktop and asked (2026-10-14) for all tests to run in a private headless sway, and for no more audio
+tests. The click-coordinate steps could not be ported 1:1 (they depend on a 1900x1060 tiled MangoWC window, wl-clipboard and the real
+picker), but the rig has an equivalent for each: `superdoc/claude-instructions/testing-and-verification.md`, `client/scripts/README.md`.
+
+| old step | in the rig |
+| --- | --- |
+| `share-and-measure.sh`, `native-to-native.sh` (native shares, another peer watches) | `client/scripts/hs-scenario.sh LABEL CODEC FPS PRESET` (share, setup, go live, watch, screenshots, per-stage rates), or step by step `hs-drive.sh share\|setup\|golive\|watch\|hover\|shot`. The portal grants HEADLESS-1 without a picker; the moving content is the rig's `vkcube` (`HS_PATTERN=gst` for a ball + clock). |
+| `native-watch.sh` | `hs-drive.sh watch`, `hs-drive.sh hover`, `hs-drive.sh shot F.png`. Its `pactl`/`pw-dump` audio probing is dropped: no audio tests any more. |
+| `share-headed-viewer.sh`, `popout.sh` (browser viewer of a native share, headed for VAAPI decode) | native share as above, then the browser peer headed **inside the rig**: `hs-rig.sh run -- env SSS_GUI_LOCKED=1 node docs/dev/e2e/viewer-headed.mjs <certhash> headed`. Not re-run after the move; the pop-out (Document PiP) step in particular is unverified in sway. |
+| `links-*.sh` (join-link round trip through the native Join modal, clipboard) | not ported. `hs-rig.sh up` already seeds both clients with a join link; the browser-minted-link comparison can be done with `hs-rig.sh run -- wl-copy/wl-paste` plus `hs-drive.sh click/key`, untested. |
+| `relay-restart.sh` | not ported (the rig's relay lives in its own tmux session, `tmux send-keys -t <session> q` then start again with the same `$SCRATCH/relay` state keeps the certificate). |
+
+A browser peer against the rig's relay needs the relay's UDP port and cert hash: both are in the join link `hs-rig.sh up`/`status` prints
+(`host:port|room|key|certhash`). Never run `mmsg` or `ydotool`; run `grim`, `wl-copy` and the like only through `hs-rig.sh run -- ...`.
 
 Serve `docs/` and open `http://127.0.0.1:<port>/simple-screensharing/` (`node docs/dev/headless.mjs serve --port 8123`): the site and
 every module load with no 404 and no console error from page code in all runs below. Chromium's own `ERR_QUIC_*` console errors

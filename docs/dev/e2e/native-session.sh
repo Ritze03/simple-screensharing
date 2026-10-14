@@ -2,6 +2,16 @@
 # usage: native-session.sh <join-link> <tag> <script-file>
 # One short locked GUI session: native app on DP-2 with a scratch config seeded with the room (auto-connect), then run
 # the step script (bash, sourced) which can use: shot <name>, click X Y (absolute global coords), key..., sleep.
+#
+# LEGACY (2026-10-14): drives the user's REAL MangoWC desktop (mmsg, ydotool, the real portal picker, the shared GUI lock).
+# Agents must not use it. Since the headless switch the native side of an interop check runs in the private headless sway
+# rig: client/scripts/hs-rig.sh up + hs-drive.sh (docs/dev/README.md "Native side in the rig"). Why: the user works at that
+# machine and asked for tests off their desktop (superdoc/claude-instructions/testing-and-verification.md). Refuses unless
+# SSS_ALLOW_REAL_DESKTOP=1, which is for the user's own manual use only.
+if [ "${SSS_ALLOW_REAL_DESKTOP:-}" != 1 ]; then
+  echo "native-session.sh: refused (legacy, real desktop). Use client/scripts/hs-rig.sh; see docs/dev/README.md 'Native side in the rig'." >&2
+  exit 3
+fi
 LINK=$1; TAG=$2; STEPS=$3
 case "$LINK" in @*) LINK=$(cat "${LINK#@}");; esac
 exec 9>/tmp/claude-1000/sss-gui.lock && flock 9
