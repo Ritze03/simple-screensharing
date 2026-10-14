@@ -3,11 +3,11 @@
 //! QUIC networking (`net.rs`), wire protocol (`protocol.rs`), fragmentation
 //! (`fragment.rs`), capture (`capture.rs`/`audio.rs`), decode (`decode.rs`),
 //! saved rooms (`rooms.rs`), the shared egui theme (`theme.rs`), and the
-//! egui UI (`ui.rs`) make up the app.
+//! egui UI (`ui/`, shell + contract in `ui/mod.rs`) make up the app.
 //!
 //! # Front-end
 //!
-//! This launches the eframe/egui desktop window (`ui.rs`). egui is becoming
+//! This launches the eframe/egui desktop window (`ui/`). egui is becoming
 //! the client's only front-end; the Electron shell is still present until it
 //! is removed later. Only the UI modules (`ui`, `theme`, `widgets`) live in this
 //! bin; the core (net, capture, decode, rooms, session, ...) is the
@@ -24,6 +24,10 @@ i18n!("locales", fallback = "en");
 mod theme;
 mod ui;
 mod widgets;
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use simple_screensharing_client::rooms::PresentationMode;
 
 const USAGE: &str = "\
 Simple Screensharing client
@@ -87,18 +91,21 @@ fn main() -> anyhow::Result<()> {
     // Presentation mode is only settable here, at surface-creation time: the
     // pinned eframe/egui-wgpu (0.33.3) doesn't expose the render surface for
     // reconfiguration once the window exists, so a change made in the
-    // settings UI (`ui.rs`'s presentation-mode dropdown) is picked up on the
-    // *next* launch, not live. See `superdoc/features/presentation-modes.md`.
-    let presentation_mode = simple_screensharing_client::rooms::AppSettings::load().presentation_mode;
+    // settings modal is picked up on the *next* launch, not live. See
+    // `superdoc/features/presentation-modes.md`.
+    let presentation_mode = if std::env::var_os(PRESENT_FALLBACK_ENV).is_some() {
+        PresentationMode::AutoVsync
+    } else {
+        simple_screensharing_client::rooms::AppSettings::load().presentation_mode
+    };
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([800.0, 600.0])
-            .with_title("Simple Screensharing"),
+            .with_inner_size([1280.0, 800.0])
+            .with_min_inner_size([960.0, 600.0])
+            .with_title("Simple Screensharing")
+            .with_app_id("simple-screensharing"),
         renderer: eframe::Renderer::Wgpu,
-        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
-            present_mode: presentation_mode.to_wgpu(),
-            ..Default::default()
-        },
+        wgpu_options: wgpu_configuration(presentation_mode),
         ..Default::default()
     };
 
@@ -115,12 +122,78 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    eframe::run_native(
-        "Simple Screensharing",
-        native_options,
-        Box::new(|_cc| Ok(Box::new(ui::App::default()))),
-    )?;
+    let result = eframe::run_native("Simple Screensharing", native_options, Box::new(|cc| Ok(Box::new(ui::App::new(cc)))));
+    if result.is_err() && PRESENT_MODE_UNSUPPORTED.load(Ordering::Relaxed) {
+        // The surface lacks the chosen mode (see `wgpu_configuration`).
+        // winit can't build a second event loop in this process, so relaunch
+        // with the override that forces `AutoVsync` for this run (the stored
+        // setting is left alone).
+        tracing::warn!("presentation mode {presentation_mode:?} is not supported by this surface; relaunching with Vsync");
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(std::env::current_exe()?)
+            .args(std::env::args_os().skip(1))
+            .env(PRESENT_FALLBACK_ENV, "1")
+            .exec();
+        return Err(err.into());
+    }
+    result?;
     Ok(())
+}
+
+/// Set for a relaunch after the configured presentation mode turned out to
+/// be unsupported: this run uses `AutoVsync`.
+const PRESENT_FALLBACK_ENV: &str = "SSS_PRESENT_MODE_FALLBACK";
+
+/// Set by the adapter selector when the surface doesn't list the requested
+/// present mode.
+static PRESENT_MODE_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+
+/// eframe's wgpu setup for `mode`. For anything but `AutoVsync` (the only
+/// mode wgpu falls back from by itself) the adapter selector also checks
+/// that the window's surface supports the mode, and fails the setup if not —
+/// an explicit unsupported mode is otherwise a fatal `UnsupportedPresentMode`
+/// at surface configure. `main` turns that failure into a relaunch with
+/// `AutoVsync`. The adapter choice mirrors wgpu's own for the power
+/// preference (discrete, then integrated, … ; first listed wins a tie, so
+/// Vulkan before GL).
+fn wgpu_configuration(mode: PresentationMode) -> eframe::egui_wgpu::WgpuConfiguration {
+    use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup, WgpuSetupCreateNew, wgpu};
+    let requested = mode.to_wgpu();
+    let mut config = WgpuConfiguration { present_mode: requested, ..Default::default() };
+    if mode == PresentationMode::AutoVsync {
+        return config;
+    }
+    let mut setup = WgpuSetupCreateNew::default();
+    let power = setup.power_preference;
+    setup.native_adapter_selector = Some(std::sync::Arc::new(move |adapters: &[wgpu::Adapter], surface: Option<&wgpu::Surface<'_>>| {
+        let rank = |t: wgpu::DeviceType| {
+            use wgpu::DeviceType::*;
+            match (power, t) {
+                (wgpu::PowerPreference::LowPower, IntegratedGpu) => 0,
+                (wgpu::PowerPreference::LowPower, DiscreteGpu) => 1,
+                (_, DiscreteGpu) => 0,
+                (_, IntegratedGpu) => 1,
+                (_, Other) => 2,
+                (_, VirtualGpu) => 3,
+                (_, Cpu) => 4,
+            }
+        };
+        let adapter = adapters
+            .iter()
+            .filter(|a| surface.is_none_or(|s| a.is_surface_supported(s)))
+            .min_by_key(|a| rank(a.get_info().device_type))
+            .ok_or_else(|| "no wgpu adapter can present to this window".to_string())?;
+        if let Some(surface) = surface {
+            let modes = surface.get_capabilities(adapter).present_modes;
+            if !modes.contains(&requested) {
+                PRESENT_MODE_UNSUPPORTED.store(true, Ordering::Relaxed);
+                return Err(format!("present mode {requested:?} unsupported (surface offers {modes:?})"));
+            }
+        }
+        Ok(adapter.clone())
+    }));
+    config.wgpu_setup = WgpuSetup::CreateNew(setup);
+    config
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@
 //!
 //! Stores each saved room as the whole pasted `server|room-id|key` join
 //! string plus a friendly name, rather than splitting it back into fields —
-//! that matches the single-paste-field join UX in `ui.rs` and avoids a
+//! that matches the single-paste-field join UX (`ui/modals.rs`) and avoids a
 //! second place that needs to agree on the join-string encoding
 //! (see `net.rs` module docs for the encoding itself).
 
@@ -124,23 +124,34 @@ impl RoomStore {
 /// `wgpu` upgrade that renames/reorders its variants, and avoids needing
 /// `wgpu`'s `serde` feature for three values.
 ///
-/// Limited to the three modes documented as available everywhere
-/// (`AutoVsync`/`Immediate`/`Mailbox`) rather than exposing every
-/// `wgpu::PresentMode` variant — `Immediate`/`Mailbox` already fall back to
-/// `Fifo` at surface-configure time on a backend that doesn't support them
-/// (see `to_wgpu`), so there's no reason to also offer `Fifo`/`FifoRelaxed`/
-/// `AutoNoVsync` as separate user-facing choices.
+/// Limited to three user-facing choices (`AutoVsync`/`Immediate`/`Mailbox`)
+/// rather than exposing every `wgpu::PresentMode` variant. Only `AutoVsync`
+/// falls back on its own: wgpu 27 rejects an explicit `Immediate`/`Mailbox`
+/// that the surface doesn't list (`UnsupportedPresentMode`, fatal at surface
+/// configure), so the binary checks the surface's capabilities before eframe
+/// configures it and relaunches with `AutoVsync` when the mode is missing
+/// (see `main.rs`'s `wgpu_configuration`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum PresentationMode {
-    /// Vsync-locked to the display refresh rate, no tearing — today's
-    /// implicit behavior (egui-wgpu's own default), kept as the default here
-    /// too so a user who never touches the setting sees no change.
-    #[default]
+    /// Vsync-locked to the display refresh rate (Fifo), no tearing —
+    /// egui-wgpu's own default. Was this app's default until 2026-10-14.
     AutoVsync,
     /// No vsync ceiling: submits frames as soon as they're ready, may tear.
     Immediate,
     /// No vsync ceiling, no tearing: swaps into a single-slot buffer instead
     /// of waiting for the next vblank rather than queuing several frames.
+    ///
+    /// The default. `Why:` eframe presents its viewports serially on one
+    /// thread, and with Fifo every present blocks until that window's own
+    /// vblank. With a pop-out window open and a stream faster than the
+    /// monitor refresh, the windows starve each other: measured on a 120 Hz
+    /// monitor with a 240 fps stream, the main window fell to 69 fps. Mailbox
+    /// never blocks on vblank and held 240 fps in both windows, and unlike
+    /// Immediate it does not tear. Still applied only at launch (restart to
+    /// apply, see `superdoc/features/presentation-modes.md`). Only affects
+    /// settings files without a stored mode: every save writes the whole
+    /// `AppSettings`, so an existing user's stored `AutoVsync` is kept.
+    #[default]
     Mailbox,
 }
 
@@ -150,17 +161,17 @@ impl PresentationMode {
     /// Human-readable label for the presentation-mode dropdown.
     pub fn label(self) -> &'static str {
         match self {
-            Self::AutoVsync => "Vsync (default)",
+            Self::AutoVsync => "Vsync",
             Self::Immediate => "Immediate (no vsync)",
-            Self::Mailbox => "Mailbox (no vsync, no tearing)",
+            Self::Mailbox => "Mailbox (default, no vsync, no tearing)",
         }
     }
 
     /// The actual `wgpu::PresentMode` to configure the render surface with.
-    /// `Immediate`/`Mailbox` aren't guaranteed on every backend, but `wgpu`
-    /// itself falls back to `Fifo` at `Surface::configure()` time for a mode
-    /// missing from `SurfaceCapabilities::present_modes`, so no fallback
-    /// logic is needed on this side.
+    /// `Immediate`/`Mailbox` aren't guaranteed on every backend and wgpu does
+    /// **not** fall back for them (only the `Auto*` modes fall back), so the
+    /// caller must check the surface's `present_modes` first — `main.rs`
+    /// does, and relaunches with `AutoVsync` when the mode is missing.
     pub fn to_wgpu(self) -> wgpu::PresentMode {
         match self {
             Self::AutoVsync => wgpu::PresentMode::AutoVsync,
@@ -515,11 +526,11 @@ mod tests {
         assert_eq!(AppSettings::default().language, "en");
     }
 
-    /// Load-bearing for "no change for users who never touch the setting":
-    /// the default presentation mode must match egui-wgpu's own default.
+    /// Mailbox is the default since 2026-10-14 (see `PresentationMode::Mailbox`'s
+    /// `Why:`: Fifo starves the main window while a pop-out shows a fast stream).
     #[test]
-    fn app_settings_defaults_to_vsync() {
-        assert_eq!(AppSettings::default().presentation_mode, PresentationMode::AutoVsync);
+    fn app_settings_defaults_to_mailbox() {
+        assert_eq!(AppSettings::default().presentation_mode, PresentationMode::Mailbox);
     }
 
     #[test]
@@ -590,7 +601,7 @@ mod tests {
     #[test]
     fn app_settings_missing_presentation_mode_defaults() {
         let parsed: AppSettings = toml::from_str("language = \"de\"\n").unwrap();
-        assert_eq!(parsed.presentation_mode, PresentationMode::AutoVsync);
+        assert_eq!(parsed.presentation_mode, PresentationMode::Mailbox);
     }
 
     /// Same missing-field tolerance as above, for `max_jitter_buffer_ms`
