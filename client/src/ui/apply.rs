@@ -4,7 +4,7 @@
 
 use std::sync::atomic::Ordering;
 
-use simple_screensharing_client::net::parse_join_string;
+use simple_screensharing_client::net::{format_join_string_with_hash, parse_join_string};
 use simple_screensharing_client::session::{self, PendingRole};
 
 use super::{App, Modal, StagedShare, UiAction, View, paired_audio, room_entries, same_room, tr, tr_with, view_is_room};
@@ -57,12 +57,19 @@ impl App {
                 }
             }
             UiAction::JoinRoom { join_string, room_name } => {
-                let join_string = join_string.trim().to_string();
                 self.shell.join_error = None;
-                if let Err(e) = parse_join_string(&join_string) {
-                    self.shell.join_error = Some(format!("{e:#}"));
-                    return;
-                }
+                let parsed = match parse_join_string(&join_string) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        self.shell.join_error = Some(format!("{e:#}"));
+                        return;
+                    }
+                };
+                // Drop the link's 5th field (the suggested room name): the
+                // name field of the dialog already decided what is saved, and
+                // the stored join string stays `server|id|key[|certhash]`.
+                let join_string =
+                    format_join_string_with_hash(&parsed.server, &parsed.room_id, &parsed.room_key, parsed.cert_hash.as_ref());
                 if let Some(h) = self.state.rooms.iter().find(|(_, r)| same_room(&r.join_string, &join_string)).map(|(h, _)| *h) {
                     // Already joined: just show it.
                     self.state.active_room = Some(h);
@@ -134,7 +141,8 @@ impl App {
                 let Some(room) = self.state.rooms.get(&handle) else { return };
                 match parse_join_string(&room.join_string) {
                     Ok(parsed) => {
-                        ctx.copy_text(room.client.invite_link(&parsed.server));
+                        let name = self.state.room_store.name_for(&room.join_string);
+                        ctx.copy_text(room.client.invite_link(&parsed.server, name));
                         self.toast(tr("ui.toast.invite_copied", "Invite link copied").to_string(), "content_copy");
                     }
                     Err(e) => self.toast(tr_with("ui.toast.copy_failed", "Couldn't copy the invite link: %{error}", &[("error", &format!("{e:#}"))]), "error"),

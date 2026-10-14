@@ -185,7 +185,12 @@ These were decided in the earlier UIs and are still the rules.
 - **Create/join modal:** server field pre-filled from the most recently saved room (the lib
   keeps no "last server" setting). A freshly minted link is shown masked (it carries the
   room key) and has no relay cert hash, so browsers can't use it; "Copy invite link" copies
-  the *live connection's* link, which does. A room with no name is labelled from the first 4 bytes of
+  the *live connection's* link, which does, and which also carries the saved room name as the
+  link's 5th field. Pasting a link with a name into the Join tab fills the Room name field
+  (only while that field is empty or still holds the previous prefill; the user can edit it,
+  and what is in the field on Join is what is saved; `apply` drops the 5th field from the
+  stored join string). *Why:* user request 2026-10-15, so a friend does not have to retype
+  the name. A room with no name is labelled from the first 4 bytes of
   its room id in hex (`session::room_label`), never from the join string.
 - **Per-stream numbers are never invented**: sidebar fps = decoded fps while we watch a
   stream (the protocol's `StreamInfo` carries none), or the live destination's frame rate

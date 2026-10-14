@@ -2919,9 +2919,10 @@ async fn native_client_learns_the_relay_cert_hash_and_tolerates_a_stale_one() {
     let (a, _s, _ev_a) = connect_with_retry(&plain, "a").await.expect("connect with a 3-field link");
     let hash = a.current_cert_hash().expect("relay presented a certificate");
 
-    let invite = a.invite_link(&server_addr);
+    let invite = a.invite_link(&server_addr, Some("Friday | Films"));
     let parsed = crate::net::parse_join_string(&invite).expect("invite link parses");
     assert_eq!(parsed.cert_hash, Some(hash));
+    assert_eq!(parsed.name.as_deref(), Some("Friday | Films"));
     assert_eq!(parsed.room_id, room_id);
     assert_eq!(parsed.room_key, room_key);
 

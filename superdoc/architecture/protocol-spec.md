@@ -628,19 +628,51 @@ the new certificate. With `--cert <pem> --key <pem>` the relay serves a CA-issue
 instead (e.g. Let's Encrypt): browsers verify it normally, no hash is needed, nothing is rotated
 (the files are re-read hourly if their mtime changed). Implementation: `server/src/cert.rs`.
 
-### 11.4 Join link, 4th field
+### 11.4 Join link: 4th field (certhash) and 5th field (name)
 
 ```
-server|room-id|key            (CA-certificate relay, or native-only use)
-server|room-id|key|certhash   (self-signed relay; required for browsers)
+server|room-id|key                     (CA-certificate relay, or native-only use)
+server|room-id|key|certhash            (self-signed relay; required for browsers)
+server|room-id|key|certhash|name       (any of the above plus the room's display name)
+server|room-id|key||name               (CA relay: empty certhash field, name present)
 ```
+
+All forms are valid everywhere; a parser that knows only 3/4 fields rejects the 5-field forms
+(the browser parser still does, see below; task #69).
 
 `certhash` = SHA-256 of the relay's **leaf certificate DER**, **base64url, no padding** (43
-characters), same encoding as `key`. Both forms are valid everywhere. The native client does
+characters), same encoding as `key`. An **empty** `certhash` field means "no hash" (that is how a
+name is attached to a link for a CA relay). The native client does
 not enforce it (it logs a mismatch and carries on — the room key already protects the media,
 and a saved link would otherwise break at every rotation) but records the hash of the cert the
 relay actually presented so links it generates (`ScreenshareClient::current_cert_hash()` /
 `invite_link()`) work in a browser.
+
+`name` (5th field, optional) = the room's display name as the sender knows it, **UTF-8,
+percent-encoded**: every byte except the RFC 3986 unreserved set `A-Z a-z 0-9 - . _ ~` is written
+`%XX` (uppercase hex), so `|` and `%` can never appear raw and the field is plain ASCII. This is
+what JS `encodeURIComponent` produces, apart from `! ' ( ) *`, which `encodeURIComponent` leaves
+raw and the native encoder escapes; a decoder must accept both (JS `decodeURIComponent` does).
+Native: `net::format_join_string_full` / `parse_join_string` (`ParsedJoinString::name`).
+Decode rules, all lenient because the name is cosmetic: a missing or empty field, a malformed
+`%` sequence, invalid UTF-8, or a name that is empty after trimming all mean **no name** (the link
+is still accepted); the decoded name is trimmed, control characters are dropped and it is cut at
+**64 characters** (`net::MAX_LINK_ROOM_NAME_CHARS`). The name is not part of the room's identity
+(identity is server + room-id + key, `rooms::room_identity`) and is not stored in the saved
+join string: it only pre-fills the add-room dialog's name field, where the user can still edit it.
+Nothing about the name is secret-relevant: the link already carries the room key and the relay
+never sees the link.
+
+`Why:` user request 2026-10-15: copy-join-link should carry the room name, and pasting it into
+the add-room dialog should fill the name field (still editable before adding). `Why percent-encoding
+and not base64url:` the link stays human-readable, and the browser mirrors it with stdlib
+(`encodeURIComponent` / `decodeURIComponent`).
+
+`Browser compatibility (as of this change):` `docs/js/core/joinlink.js` `parseJoinLink` splits at
+the first three `|` and treats the remainder as the cert hash, so `hash|name` (and `|name`)
+fails the base64url check and is **rejected** with `join string has an invalid cert hash`. The
+browser must learn the 5th field (task #69) before it can open a link copied from a native client
+that has a named room.
 
 `Why links go stale:` a pinned hash is only valid while the relay presents that exact
 certificate, i.e. until its next rotation (a link made right after a rotation is good for ~11
