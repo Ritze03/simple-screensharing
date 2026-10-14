@@ -7,8 +7,3 @@ client/.playwright-mcp/
 .claude/teamlead/.state/
 .claude/teamlead/board.md
 .claude/scheduled_tasks.lock
-
-# TEMPORARY: old nested repos, removed once they are deleted (see I1)
-/simple-screensharing-client/
-/simple-screensharing-server/
-/simple-screensharing-website/
