@@ -1,7 +1,7 @@
 # Rework the entire thing
 
-> **Stage 6** — agent testing (single phase, I1–I26 built) · started 2026-10-13
-> Agents run every `verified by: agent` item for real (headless sway rig, per the user's 2026-10-14 rule), then it's your review.
+> **Stage 7** — your review · started 2026-10-13
+> Agent items are ticked with evidence (one open: the mockup item waits on your fps/codec call). Tick your `verified by: user` items below; anything you find goes back on the board.
 
 ## Goal
 Collapse the desktop client from three UI layers (egui leftovers, Tauri, Electron + HTML) to one native egui app with the room-centric layout, without losing features — and with screen sharing that works end to end at **at least 120 fps, ideally 240 fps**. The core concept stays: symmetric end-to-end encryption, a relay that never decrypts, a server with a small TUI.
