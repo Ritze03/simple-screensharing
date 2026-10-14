@@ -157,12 +157,7 @@ async fn main() -> Result<()> {
 
     let registry = Arc::new(Registry::new(listen_addr));
 
-    let relay_registry = registry.clone();
-    let relay_task = tokio::spawn(async move {
-        if let Err(e) = relay::run(relay_registry, listen_addr, cert_source).await {
-            tracing::error!("relay listener exited with error: {e:#}");
-        }
-    });
+    let endpoint = relay::start(registry.clone(), listen_addr, cert_source)?;
 
     // The TUI owns crossterm/terminal state and does blocking I/O, so it
     // runs on a plain OS thread rather than a tokio task; it talks to the
@@ -188,7 +183,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    relay_task.abort();
+    // Tell connected peers we are going away (close code + reason) so they
+    // notice at once instead of after the ~21 s QUIC idle timeout.
+    relay::shutdown(&endpoint).await;
 
     tracing::info!("shutdown complete");
     Ok(())

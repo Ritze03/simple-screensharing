@@ -218,13 +218,13 @@ pub async fn serve(registry: Arc<Registry>, endpoint: Endpoint) -> Result<()> {
     Ok(())
 }
 
-/// Start the QUIC endpoint and run the accept loop until the process is
-/// torn down. Also keeps the TLS cert fresh ([`CertManager::maintain`]).
-pub async fn run(
+/// Bind the QUIC endpoint and spawn the accept loop and cert maintenance.
+/// Returns the endpoint so the caller can [`shutdown`] it gracefully.
+pub fn start(
     registry: Arc<Registry>,
     listen_addr: SocketAddr,
     cert_source: CertSource,
-) -> Result<()> {
+) -> Result<Endpoint> {
     let certs = CertManager::new(cert_source)?;
     let endpoint = build_endpoint_with(listen_addr, &certs)?;
     let local_addr = endpoint
@@ -237,7 +237,13 @@ pub async fn run(
         "QUIC endpoint listening (ALPN h3 + ssshare/1)"
     );
     tokio::spawn(certs.maintain(endpoint.clone(), registry.clone()));
-    serve(registry, endpoint).await
+    let serving = endpoint.clone();
+    tokio::spawn(async move {
+        if let Err(e) = serve(registry, serving).await {
+            tracing::error!("relay listener exited with error: {e:#}");
+        }
+    });
+    Ok(endpoint)
 }
 
 /// Read one length-prefixed control frame (spec §2). Returns `Ok(None)`
@@ -298,6 +304,57 @@ struct Joined {
     conn_id: ConnId,
 }
 
+/// Application close code: the first control frame was not a valid `Join`
+/// (a `JoinRejected{Malformed}` was sent first).
+pub const CLOSE_MALFORMED: u32 = 0x101;
+/// Application close code: the room already has `MAX_ROOM_MEMBERS` members
+/// (a `JoinRejected{RoomFull}` was sent first).
+pub const CLOSE_ROOM_FULL: u32 = 0x102;
+/// Application close code: the relay is shutting down; clients should
+/// reconnect (to this or a restarted relay).
+pub const CLOSE_SHUTDOWN: u32 = 0x200;
+
+/// Upper bound on how long a terminal rejection waits for the peer to
+/// receive and read the `JoinRejected` frame before the connection is
+/// closed regardless.
+const REJECT_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+/// Upper bound on the graceful shutdown (`CONNECTION_CLOSE` delivery).
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Make a just-written terminal `JoinRejected` actually reach the peer, then
+/// close the session with an application code.
+///
+/// Why not just close: a `CONNECTION_CLOSE` (or dropping the session)
+/// discards stream data the peer has not yet read, so the client saw a bare
+/// "connection lost" instead of the rejection. So: `finish()` the control
+/// stream (FIN after the frame), wait for `stopped()` (the peer has
+/// received everything), then give the peer the remaining budget to read it
+/// and hang up on its own (`closed()`), and only then close ourselves. All
+/// bounded by [`REJECT_FLUSH_TIMEOUT`] so a silent peer cannot pin the task.
+async fn close_after_rejection(
+    connection: &Session,
+    ctrl_send: &mut SendStream,
+    code: u32,
+    reason: &[u8],
+) {
+    let _ = ctrl_send.finish();
+    let _ = tokio::time::timeout(REJECT_FLUSH_TIMEOUT, async {
+        let _ = ctrl_send.stopped().await;
+        connection.closed().await;
+    })
+    .await;
+    connection.close(code, reason);
+}
+
+/// Gracefully shut the endpoint down: every connection gets a
+/// `CONNECTION_CLOSE` with [`CLOSE_SHUTDOWN`], and we wait (bounded) for it
+/// to be sent so peers notice immediately instead of after the QUIC idle
+/// timeout (~21 s) and can auto-reconnect.
+pub async fn shutdown(endpoint: &Endpoint) {
+    endpoint.close(CLOSE_SHUTDOWN.into(), b"relay shutting down");
+    let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, endpoint.wait_idle()).await;
+}
+
 /// Run the join handshake: read `Join` messages off `ctrl_recv` until one
 /// succeeds (retrying past `ConnIdCollision`, per spec §3.1/§4.2) or the
 /// connection gives up / is rejected terminally. On success, registers
@@ -329,6 +386,7 @@ async fn perform_join(
                 },
             )
             .await?;
+            close_after_rejection(connection, ctrl_send, CLOSE_MALFORMED, b"malformed join").await;
             return Ok(None);
         };
         let display_name = clamp_utf8(&display_name, MAX_NAME_LEN);
@@ -346,6 +404,7 @@ async fn perform_join(
             )
             .await?;
             registry.drop_room_if_empty(room_id, &room).await;
+            close_after_rejection(connection, ctrl_send, CLOSE_ROOM_FULL, b"room full").await;
             return Ok(None);
         }
         if guard.connections.contains_key(&conn_id) {
@@ -1677,5 +1736,112 @@ pub(crate) mod tests {
         let guard = room.lock().await;
         assert_eq!(guard.streams.len(), 1);
         assert_eq!(guard.connections.len(), 1);
+    }
+
+    /// Connect a native test client and send one `Join`.
+    async fn connect_and_join(
+        endpoint: &Endpoint,
+        addr: SocketAddr,
+        conn_id: ConnId,
+        room_id: RoomId,
+    ) -> (Connection, SendStream, RecvStream) {
+        let conn = endpoint.connect(addr, "localhost").unwrap().await.expect("handshake");
+        let (mut send, recv) = conn.open_bi().await.expect("control stream");
+        send_ctrl(
+            &mut send,
+            &ClientToRelay::Join { conn_id, room_id, display_name: format!("c{conn_id}") },
+        )
+        .await;
+        (conn, send, recv)
+    }
+
+    /// The 9th joiner must receive `JoinRejected{RoomFull}` (not a bare
+    /// connection loss), followed by an application close with
+    /// [`CLOSE_ROOM_FULL`].
+    #[tokio::test]
+    async fn full_room_delivers_join_rejected_then_closes() {
+        let registry = Arc::new(Registry::new((Ipv4Addr::LOCALHOST, 0).into()));
+        let server = build_endpoint((IpAddr::V4(Ipv4Addr::LOCALHOST), 0).into()).unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(serve(registry, server));
+        let client = insecure_client_endpoint();
+        let room_id: RoomId = [9u8; 16];
+
+        let mut members = Vec::new();
+        for id in 1..=MAX_ROOM_MEMBERS as u64 {
+            let (conn, send, mut recv) = connect_and_join(&client, addr, id, room_id).await;
+            assert!(matches!(recv_ctrl(&mut recv).await, RelayToClient::PresenceSnapshot { .. }));
+            members.push((conn, send, recv));
+        }
+
+        let (conn, _send, mut recv) = connect_and_join(&client, addr, 99, room_id).await;
+        let reply = tokio::time::timeout(Duration::from_secs(5), recv_ctrl(&mut recv))
+            .await
+            .expect("JoinRejected arrives promptly");
+        assert!(matches!(
+            reply,
+            RelayToClient::JoinRejected { reason: RejectReason::RoomFull }
+        ));
+        // Peer hangs up (as a real client would); the relay then closes too.
+        conn.close(0u32.into(), b"ok");
+    }
+
+    /// With a silent peer the relay itself closes with `CLOSE_ROOM_FULL`
+    /// within the bounded flush window.
+    #[tokio::test]
+    async fn full_room_relay_closes_with_code() {
+        let registry = Arc::new(Registry::new((Ipv4Addr::LOCALHOST, 0).into()));
+        let server = build_endpoint((IpAddr::V4(Ipv4Addr::LOCALHOST), 0).into()).unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(serve(registry, server));
+        let client = insecure_client_endpoint();
+        let room_id: RoomId = [8u8; 16];
+        let mut members = Vec::new();
+        for id in 1..=MAX_ROOM_MEMBERS as u64 {
+            let (conn, send, mut recv) = connect_and_join(&client, addr, id, room_id).await;
+            recv_ctrl(&mut recv).await;
+            members.push((conn, send, recv));
+        }
+        let (conn, _send, mut recv) = connect_and_join(&client, addr, 99, room_id).await;
+        assert!(matches!(
+            recv_ctrl(&mut recv).await,
+            RelayToClient::JoinRejected { reason: RejectReason::RoomFull }
+        ));
+        let err = tokio::time::timeout(Duration::from_secs(5), conn.closed())
+            .await
+            .expect("relay closes the connection");
+        match err {
+            quinn::ConnectionError::ApplicationClosed(c) => {
+                assert_eq!(u64::from(c.error_code), CLOSE_ROOM_FULL as u64);
+                assert_eq!(&c.reason[..], b"room full");
+            }
+            other => panic!("unexpected close: {other:?}"),
+        }
+    }
+
+    /// `shutdown` closes live connections at once with `CLOSE_SHUTDOWN`.
+    #[tokio::test]
+    async fn shutdown_closes_connections_promptly() {
+        let registry = Arc::new(Registry::new((Ipv4Addr::LOCALHOST, 0).into()));
+        let server = build_endpoint((IpAddr::V4(Ipv4Addr::LOCALHOST), 0).into()).unwrap();
+        let addr = server.local_addr().unwrap();
+        tokio::spawn(serve(registry, server.clone()));
+        let client = insecure_client_endpoint();
+        let (conn, _send, mut recv) = connect_and_join(&client, addr, 1, [7u8; 16]).await;
+        assert!(matches!(recv_ctrl(&mut recv).await, RelayToClient::PresenceSnapshot { .. }));
+
+        let started = Instant::now();
+        shutdown(&server).await;
+        let err = tokio::time::timeout(Duration::from_secs(3), conn.closed())
+            .await
+            .expect("client sees close promptly");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        match err {
+            quinn::ConnectionError::ApplicationClosed(c) => {
+                assert_eq!(u64::from(c.error_code), CLOSE_SHUTDOWN as u64);
+                assert_eq!(&c.reason[..], b"relay shutting down");
+            }
+            other => panic!("unexpected close: {other:?}"),
+        }
     }
 }
