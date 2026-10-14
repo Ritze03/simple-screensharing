@@ -5,6 +5,33 @@
 //! that matches the single-paste-field join UX (`ui/modals.rs`) and avoids a
 //! second place that needs to agree on the join-string encoding
 //! (see `net.rs` module docs for the encoding itself).
+//!
+//! # Identity: one saved room per room, not per name
+//!
+//! A saved room's identity is [`room_identity`] of its join string: server +
+//! room id + key, *without* the optional 4th cert-hash field. Every lookup in
+//! [`RoomStore`] (`upsert`, `get`, `name_for`, `rename`, `remove`,
+//! `set_auto_connect`) goes through it, so any spelling of the same room
+//! reaches the same single entry.
+//!
+//! `Why` not the name: names are local nicknames the user can pick freely, so
+//! keying by name let "MovieNight" and "Films" both point at one room (two
+//! entries, both shown connected, one leave dropping both, forget removing only
+//! one). `Why` not the whole string: the relay's cert hash rotates, and a
+//! rotated cert must update the existing entry, not create a second one.
+//!
+//! # The UI's `RoomKey`
+//!
+//! The UI (`ui/mod.rs`) identifies a saved room by `RoomKey = SavedRoom::
+//! join_string` and also *connects* with that key, so the key has to stay a
+//! full, connectable join string (an identity string has no cert hash and
+//! would connect unpinned). Guarantee: an `upsert` that only changes the
+//! *name*, or re-saves the identical string, never changes the entry's
+//! `join_string`, so its `RoomKey` is stable. The stored string is replaced
+//! only by a *different spelling* of the same room (typically a fresh cert
+//! hash), because the newest link is the one that connects; that is the only
+//! event that changes a `RoomKey`. Use [`RoomStore::same_room`] to compare a
+//! live session's join string against a key across such a change.
 
 use std::fs;
 use std::path::PathBuf;
@@ -13,6 +40,23 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::capture::{QualityLevel, RateControlMode, TuneMode, VideoCodec};
+use crate::net::{format_join_string, parse_join_string};
+
+/// The identity of the room a join string points at: `server|room-id|key`
+/// with the optional cert-hash field dropped and the room id / key re-encoded
+/// canonically. Two join strings name the same room iff their identities are
+/// equal.
+///
+/// A string that doesn't parse (hand-edited or legacy `rooms.toml` entry) falls
+/// back to its first three `|`-separated fields, trimmed, so it still has a
+/// stable identity and can be forgotten/renamed instead of being stuck.
+pub fn room_identity(join_string: &str) -> String {
+    let s = join_string.trim();
+    match parse_join_string(s) {
+        Ok(p) => format_join_string(&p.server, &p.room_id, &p.room_key),
+        Err(_) => s.splitn(4, '|').take(3).collect::<Vec<_>>().join("|"),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SavedRoom {
@@ -57,8 +101,65 @@ impl RoomStore {
         }
         let contents = fs::read_to_string(&path)
             .with_context(|| format!("failed to read saved rooms from {}", path.display()))?;
-        toml::from_str(&contents)
-            .with_context(|| format!("failed to parse saved rooms file at {}", path.display()))
+        let mut store: Self = toml::from_str(&contents)
+            .with_context(|| format!("failed to parse saved rooms file at {}", path.display()))?;
+        // Migration: a file written while the store was keyed by name may hold
+        // several entries for one room. Merge them and write the cleaned file
+        // back right away (best effort: a failed write-back is not an error,
+        // the next normal `save` rewrites the file anyway).
+        if store.merge_duplicates() {
+            let _ = store.save();
+        }
+        Ok(store)
+    }
+
+    /// Merge entries that share an identity ([`room_identity`]) into one.
+    /// Returns whether anything was merged.
+    ///
+    /// Rule, per group of duplicates: the merged entry keeps the **first**
+    /// entry's position (stable sidebar order); its **name** is the *last*
+    /// non-blank name in the group; its **join string** is the last entry's
+    /// (newest form, e.g. freshest cert hash); `auto_connect` is the OR of all.
+    ///
+    /// `Why` last-wins: the file has no timestamps, so file order is the only
+    /// recency signal. The old name-keyed store appended an entry on every new
+    /// name (a join under a new name, and a rename = remove + upsert), so a
+    /// later entry is the more recently typed or renamed one, which is exactly
+    /// the "typed name wins" rule `upsert` applies from now on.
+    pub fn merge_duplicates(&mut self) -> bool {
+        let mut merged: Vec<(String, SavedRoom)> = Vec::with_capacity(self.rooms.len());
+        let mut changed = false;
+        for room in std::mem::take(&mut self.rooms) {
+            let id = room_identity(&room.join_string);
+            if let Some((_, kept)) = merged.iter_mut().find(|(k, _)| *k == id) {
+                if !room.name.trim().is_empty() {
+                    kept.name = room.name;
+                }
+                kept.join_string = room.join_string;
+                kept.auto_connect |= room.auto_connect;
+                changed = true;
+            } else {
+                merged.push((id, room));
+            }
+        }
+        self.rooms = merged.into_iter().map(|(_, r)| r).collect();
+        changed
+    }
+
+    fn position(&self, join_string: &str) -> Option<usize> {
+        let id = room_identity(join_string);
+        self.rooms.iter().position(|r| room_identity(&r.join_string) == id)
+    }
+
+    /// Whether two join strings name the same room (equal [`room_identity`]).
+    pub fn same_room(a: &str, b: &str) -> bool {
+        room_identity(a) == room_identity(b)
+    }
+
+    /// The saved entry for the room `join_string` names, whichever spelling
+    /// (with or without cert hash) it is given in.
+    pub fn get(&self, join_string: &str) -> Option<&SavedRoom> {
+        self.position(join_string).map(|i| &self.rooms[i])
     }
 
     pub fn save(&self) -> Result<()> {
@@ -72,37 +173,64 @@ impl RoomStore {
             .with_context(|| format!("failed to write saved rooms to {}", path.display()))
     }
 
-    /// Insert a new saved room, or overwrite the existing one with the same
-    /// name.
+    /// Save a room, keyed by identity. If the room is already saved: its name
+    /// becomes `name` when that is non-blank (the typed name wins; a blank
+    /// name keeps the old one) and its stored join string becomes
+    /// `join_string` (the newest form, e.g. with a fresh cert hash);
+    /// `auto_connect` is untouched. Otherwise a new entry is appended.
     pub fn upsert(&mut self, name: String, join_string: String) {
-        if let Some(existing) = self.rooms.iter_mut().find(|r| r.name == name) {
-            existing.join_string = join_string;
-        } else {
-            self.rooms.push(SavedRoom { name, join_string, auto_connect: false });
+        let name = name.trim().to_string();
+        let join_string = join_string.trim().to_string();
+        match self.position(&join_string) {
+            Some(i) => {
+                let existing = &mut self.rooms[i];
+                if !name.is_empty() {
+                    existing.name = name;
+                }
+                existing.join_string = join_string;
+            }
+            None => self.rooms.push(SavedRoom { name, join_string, auto_connect: false }),
         }
     }
 
-    pub fn remove(&mut self, name: &str) {
-        self.rooms.retain(|r| r.name != name);
+    /// Set the name of the one saved entry for this room. No-op if the room
+    /// isn't saved or `name` is blank.
+    pub fn rename(&mut self, join_string: &str, name: &str) {
+        let name = name.trim();
+        if !name.is_empty()
+            && let Some(i) = self.position(join_string)
+        {
+            self.rooms[i].name = name.to_string();
+        }
     }
 
-    /// Flip the `auto_connect` flag for the saved room with this join
-    /// string. No-op (not an error) if the room isn't saved — mirrors
+    /// Remove the one saved entry for the room `join_string` names (any
+    /// spelling). No-op if it isn't saved.
+    pub fn remove(&mut self, join_string: &str) {
+        if let Some(i) = self.position(join_string) {
+            self.rooms.remove(i);
+        }
+    }
+
+    /// Flip the `auto_connect` flag on the one saved entry for this room.
+    /// No-op (not an error) if the room isn't saved — mirrors
     /// `name_for`'s "no entry" case rather than surfacing a lookup failure,
     /// since the frontend only ever offers this checkbox on a row it already
     /// knows is saved.
     pub fn set_auto_connect(&mut self, join_string: &str, value: bool) {
-        if let Some(room) = self.rooms.iter_mut().find(|r| r.join_string == join_string) {
-            room.auto_connect = value;
+        if let Some(i) = self.position(join_string) {
+            self.rooms[i].auto_connect = value;
         }
     }
 
-    /// The saved name for a join string, if this room is saved.
+    /// The saved name for a join string, if this room is saved under a
+    /// non-blank name.
     ///
     /// `Why:` the sidebar's ROOMS section renders `room_store ⟕ rooms` — every
     /// saved room shows, and the ones with a live session get connected
     /// styling — so it needs to join the two collections on something both
-    /// sides have. The join string is that key: it's the only thing a
+    /// sides have. The join string (compared by [`room_identity`], so a
+    /// rotated cert hash still matches) is that key: it's the only thing a
     /// `SavedRoom` and a live session provably agree on (a `RoomHandle` is
     /// per-session and a saved room has none; the relay-assigned `ConnId` is
     /// per-connection and a *saved* room has none either). Name is not usable
@@ -110,7 +238,7 @@ impl RoomStore {
     /// any name the user likes — so the lookup only ever goes join-string →
     /// name, never the reverse.
     pub fn name_for(&self, join_string: &str) -> Option<&str> {
-        self.rooms.iter().find(|r| r.join_string == join_string).map(|r| r.name.as_str())
+        self.get(join_string).map(|r| r.name.as_str()).filter(|n| !n.is_empty())
     }
 }
 
@@ -432,14 +560,174 @@ impl AppSettings {
 mod tests {
     use super::*;
 
+    use crate::net::format_join_string_with_hash;
+    use crate::protocol::{cert_hash_of_der, encode_cert_hash};
+
+    /// Real, parseable join strings for the same room (`id` byte picks the
+    /// room), with and without a cert hash.
+    fn link(server: &str, id: u8, hash: Option<&[u8]>) -> String {
+        let hash = hash.map(cert_hash_of_der);
+        format_join_string_with_hash(server, &[id; 16], &[0x42u8; 32], hash.as_ref())
+    }
+
     #[test]
     fn upsert_adds_then_updates_in_place() {
         let mut store = RoomStore::default();
         store.upsert("friends".to_string(), "a|b|c".to_string());
         assert_eq!(store.rooms.len(), 1);
-        store.upsert("friends".to_string(), "x|y|z".to_string());
+        // Same room, new name: still one entry.
+        store.upsert("pals".to_string(), "a|b|c".to_string());
         assert_eq!(store.rooms.len(), 1);
-        assert_eq!(store.rooms[0].join_string, "x|y|z");
+        assert_eq!(store.rooms[0].name, "pals");
+        // Different room, same name: a second entry (name is not the key).
+        store.upsert("pals".to_string(), "x|y|z".to_string());
+        assert_eq!(store.rooms.len(), 2);
+    }
+
+    /// The reported bug: the same link joined under two names is one entry,
+    /// and the second (typed) name wins.
+    #[test]
+    fn same_link_under_two_names_is_one_entry_with_the_second_name() {
+        let mut store = RoomStore::default();
+        let js = link("relay:4433", 1, None);
+        store.upsert("MovieNight".to_string(), js.clone());
+        store.upsert("Films".to_string(), js.clone());
+        assert_eq!(store.rooms.len(), 1);
+        assert_eq!(store.rooms[0].name, "Films");
+        assert_eq!(store.rooms[0].join_string, js);
+        // A blank typed name keeps the existing one.
+        store.upsert("  ".to_string(), js);
+        assert_eq!(store.rooms[0].name, "Films");
+    }
+
+    /// A rotated relay cert (different 4th field) is the same room: one entry,
+    /// stored link updated to the newest form, name and auto-connect kept.
+    #[test]
+    fn same_link_with_a_different_cert_hash_is_one_entry_and_updates_the_stored_link() {
+        let mut store = RoomStore::default();
+        let old = link("relay:4433", 1, Some(b"old cert"));
+        let new = link("relay:4433", 1, Some(b"new cert"));
+        assert_ne!(old, new);
+        store.upsert("Movies".to_string(), old.clone());
+        store.set_auto_connect(&old, true);
+        store.upsert(String::new(), new.clone());
+        assert_eq!(store.rooms.len(), 1);
+        assert_eq!(store.rooms[0].join_string, new);
+        assert_eq!(store.rooms[0].name, "Movies");
+        assert!(store.rooms[0].auto_connect);
+        // Hash-less and hashed spellings are the same room too.
+        store.upsert(String::new(), link("relay:4433", 1, None));
+        assert_eq!(store.rooms.len(), 1);
+        // A different room id or server is a different room.
+        store.upsert("Other".to_string(), link("relay:4433", 2, None));
+        store.upsert("Elsewhere".to_string(), link("other-relay:4433", 1, None));
+        assert_eq!(store.rooms.len(), 3);
+    }
+
+    /// `RoomKey` (= stored join string) stays stable across upserts that
+    /// don't introduce a new spelling of the link: renames and re-saves of
+    /// the identical string never move it. Only a different spelling (new
+    /// cert hash) replaces it, and then it is the newest, connectable form.
+    #[test]
+    fn stored_join_string_is_stable_across_name_only_upserts() {
+        let mut store = RoomStore::default();
+        let js = link("relay:4433", 1, Some(b"cert"));
+        store.upsert("A".to_string(), js.clone());
+        store.upsert("B".to_string(), js.clone());
+        store.rename(&js, "C");
+        store.upsert(String::new(), js.clone());
+        assert_eq!(store.rooms.len(), 1);
+        assert_eq!(store.rooms[0].join_string, js, "the key must not move on name-only changes");
+        assert_eq!(store.rooms[0].name, "C");
+    }
+
+    /// Rename, forget and auto-connect each hit exactly one entry, found by
+    /// identity (so the cert-hash spelling doesn't matter), leaving the rest.
+    #[test]
+    fn rename_remove_and_auto_connect_affect_exactly_one_entry() {
+        let mut store = RoomStore::default();
+        let a = link("relay:4433", 1, Some(b"cert"));
+        let a_plain = link("relay:4433", 1, None);
+        let b = link("relay:4433", 2, None);
+        // Two rooms that happen to carry the same name.
+        store.upsert("Same".to_string(), a.clone());
+        store.upsert("Same".to_string(), b.clone());
+        assert_eq!(store.rooms.len(), 2);
+
+        store.rename(&a_plain, "Renamed");
+        assert_eq!(store.rooms[0].name, "Renamed");
+        assert_eq!(store.rooms[1].name, "Same");
+
+        store.set_auto_connect(&a_plain, true);
+        assert!(store.rooms[0].auto_connect);
+        assert!(!store.rooms[1].auto_connect);
+
+        store.remove(&a_plain);
+        assert_eq!(store.rooms.len(), 1);
+        assert_eq!(store.rooms[0].join_string, b);
+
+        // Unknown room / blank name: no-ops.
+        store.rename(&a, "Ghost");
+        store.rename(&b, "   ");
+        store.remove(&a);
+        assert_eq!(store.rooms.len(), 1);
+        assert_eq!(store.rooms[0].name, "Same");
+    }
+
+    /// Duplicates already on disk collapse: first position, last non-blank
+    /// name, newest join string, auto_connect OR-ed; unrelated rooms untouched.
+    #[test]
+    fn merge_duplicates_collapses_a_legacy_file() {
+        let a_old = link("relay:4433", 1, Some(b"old"));
+        let a_new = link("relay:4433", 1, Some(b"new"));
+        let b = link("relay:4433", 2, None);
+        let toml_str = format!(
+            r#"
+            [[rooms]]
+            name = "MovieNight"
+            join_string = "{a_old}"
+            auto_connect = true
+
+            [[rooms]]
+            name = "Other"
+            join_string = "{b}"
+
+            [[rooms]]
+            name = "Films"
+            join_string = "{a_new}"
+
+            [[rooms]]
+            name = ""
+            join_string = "{a_new}"
+            "#
+        );
+        let mut store: RoomStore = toml::from_str(&toml_str).unwrap();
+        assert!(store.merge_duplicates());
+        assert_eq!(store.rooms.len(), 2);
+        assert_eq!(store.rooms[0].name, "Films");
+        // The last duplicate supplies the join string; a blank name never
+        // replaces a real one.
+        assert_eq!(store.rooms[0].join_string, a_new);
+        assert!(store.rooms[0].auto_connect);
+        assert_eq!(store.rooms[1].name, "Other");
+        assert!(!store.rooms[1].auto_connect);
+        // Idempotent.
+        assert!(!store.merge_duplicates());
+    }
+
+    #[test]
+    fn room_identity_drops_only_the_cert_hash() {
+        let plain = link("relay:4433", 1, None);
+        let hashed = link("relay:4433", 1, Some(b"cert"));
+        assert!(hashed.ends_with(&encode_cert_hash(&cert_hash_of_der(b"cert"))));
+        assert_eq!(room_identity(&hashed), plain);
+        assert_eq!(room_identity(&format!("  {hashed}\n")), plain);
+        assert_ne!(room_identity(&link("relay:4433", 2, None)), plain);
+        // Unparseable strings fall back to their first three fields.
+        assert_eq!(room_identity("a|b|c|d"), "a|b|c");
+        assert_eq!(room_identity("a|b|c"), "a|b|c");
+        assert_eq!(room_identity("garbage"), "garbage");
+        assert!(RoomStore::same_room(&plain, &hashed));
     }
 
     /// The sidebar joins saved rooms to live sessions on the join string, so
