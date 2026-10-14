@@ -133,8 +133,8 @@ toggling Advanced. A measured pass beats remembering the expanded height (no one
 the first time the modal opens closed) and beats a fixed constant (follows font and language);
 the space sits outside the card so it reads as empty body, not an oversized card. It only
 changes the height when the right column is the taller one (it is, in the staged modal).
-Not covered (can still resize it): the encoder-limit and bandwidth-overshoot banners, and the
-narrow one-column layout when the window is small.
+Not covered (can still resize it): the encoder-limit and bandwidth-overshoot banners (not
+checked in the rig; the left column has ~90 px slack in the staged modal).
 
 ### Video
 
