@@ -11,7 +11,9 @@
 //!   sends nothing until it changes" while a Starting row waits for the
 //!   capture's first frame + equal `[Also send to…][Move to…]`),
 //!   Upload bandwidth (Mode / Total / Floor / Per stream or over-budget banner);
-//! - how it's encoded: Video (Framerate / Bitrate / Codec), Encoder (Preset ×4
+//! - how it's encoded: Video (Framerate / Bitrate / Codec, + an Info banner
+//!   "your encoder reaches about N fps" with a one-click "Use H.265" while a
+//!   live destination is encoder-bound), Encoder (Preset ×4
 //!   + collapsible Advanced: Tune / Quality level / Rate control / Keyframe interval).
 //!
 //! Every control row is `[120 label][fill control][72 value]` (the widgets
@@ -48,7 +50,7 @@ use simple_screensharing_client::session::{
 };
 
 use super::action_bar::{
-    PillKind, RoomTargets, awaiting_first_frame, dest_kbps, dest_pill, find_source, level_lit, pop_heading, rooms_count, screen_name,
+    PillKind, RoomTargets, awaiting_first_frame, dest_kbps, dest_pill, encoder_limited, find_source, level_lit, pop_heading, rooms_count, screen_name,
     source_size, video_destination_count, waiting_hint,
 };
 use super::{Cx, NextStream, Popover, PopoverKind, UiAction, tr, tr_with};
@@ -641,6 +643,25 @@ fn video_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, c: &LocalCaptu
         let r = widgets::ctrl_row(ui, &tr("ui.stream.framerate", "Framerate"), None, |ui| widgets::select(ui, "stream_fps", &mut fps_idx, &labels));
         if r.changed() {
             out.push(target.action(NextStream { framerate: fps_opts[fps_idx], ..v }));
+        }
+        // Encoder-bound at this framerate (#46): say what it really reaches,
+        // and offer H.265 when this machine can encode it and it isn't the
+        // codec already. Live only: a staged stream has no encoder yet.
+        if let Target::Live(id, _) = target
+            && let Some(d) = c.destinations.get(&id)
+            && let Some(l) = encoder_limited(d)
+        {
+            let codec = d.live_params().codec;
+            let text = tr_with(
+                "ui.stream.encoder_limit",
+                "Your encoder reaches about %{n} fps with %{codec} on this machine.",
+                &[("n", &l.encoding_fps.to_string()), ("codec", codec_label(codec))],
+            );
+            let offer = codec != VideoCodec::H265 && supported.contains(&VideoCodec::H265);
+            let use_h265 = tr("ui.stream.use_h265", "Use H.265");
+            if widgets::banner(ui, BannerKind::Info, "info", &text, offer.then_some(use_h265.as_str())) {
+                out.push(target.action(NextStream { codec: VideoCodec::H265, ..v }));
+            }
         }
         let bitrate_l = tr("ui.stream.bitrate", "Bitrate");
         if state.bandwidth_mode == BandwidthMode::Absolute {

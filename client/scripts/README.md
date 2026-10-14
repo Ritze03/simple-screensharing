@@ -8,7 +8,7 @@ geometry, `launch-lib.sh: sss_check_monitors`). Facts about the machine:
 
 | Script | Purpose |
 | --- | --- |
-| `launch-lib.sh` | shared functions: monitor safety check, build (own `target/`), scratch dir, relay cert hash, join string, per-client scratch config (`rooms.toml` auto-connect + `settings.toml`), spawn + place windows, kill by pid file |
+| `launch-lib.sh` | shared functions: monitor safety check, build (own `target/`), scratch dir, relay cert hash, join string, per-client scratch config (`rooms.toml` auto-connect + `settings.toml`; `SSS_LANGUAGE=de` seeds the UI language, default `en`), spawn + place windows, kill by pid file |
 | `rig.sh up\|down` | two-client rig via `launch-test-tmux.sh` in its own uniquely named tmux session (recorded in `<scratch>/tmux.session`), sharer started with the GStreamer stats tracer (`<scratch>/gst1.log`) |
 | `session.sh scenarios\|audio-peek\|run` | one short locked GUI session: take the GUI lock (wait), rig + animation up, steps, always tear down + refocus DP-3 + release |
 | `animate.sh start\|stop [MON]` | per-run pidfile (`ANIM_PIDFILE`, else `$SCRATCH/animate.pid`, else a unique one printed by `start`); fullscreen `vkcube` (mailbox) on a monitor so capture has content at the refresh rate |

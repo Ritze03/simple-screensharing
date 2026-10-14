@@ -166,7 +166,7 @@ sss_make_join_string() {
 # sss_seed_config DIR NAME
 # Writes DIR/simple-screensharing/{rooms.toml,settings.toml} so the client
 # starts already joined to the test room (auto_connect) under display name NAME.
-# Optional env START_CODEC (h264|h265|av1), START_FPS, START_KBPS pre-fill the
+# Optional env SSS_LANGUAGE (en|de, default en) sets the UI language; START_CODEC (h264|h265|av1), START_FPS, START_KBPS pre-fill the
 # stream-settings form ([start_stream_defaults] in settings.toml).
 sss_seed_config() {
   local dir="$1/simple-screensharing" name="$2"
@@ -178,7 +178,7 @@ join_string = "$JOIN_STRING"
 auto_connect = true
 TOML
   {
-    echo "language = \"en\""
+    echo "language = \"${SSS_LANGUAGE:-en}\""
     echo "display_name = \"$name\""
     if [[ -n "${START_CODEC:-}${START_FPS:-}${START_KBPS:-}" ]]; then
       echo "[start_stream_defaults]"

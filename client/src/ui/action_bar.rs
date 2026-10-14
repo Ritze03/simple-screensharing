@@ -44,7 +44,7 @@
 
 use egui::{Align, CornerRadius, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use simple_screensharing_client::audio::AudioSource;
-use simple_screensharing_client::capture::destination::DestinationState;
+use simple_screensharing_client::capture::destination::{DestinationState, EncoderLimited};
 use simple_screensharing_client::protocol::StreamKind;
 use simple_screensharing_client::rooms::BandwidthMode;
 use simple_screensharing_client::session::{
@@ -277,10 +277,30 @@ fn live(ui: &mut Ui, cx: &mut Cx, room: RoomHandle, capture: CaptureSourceId, de
         // The flag flips on the capture thread; poll so Live shows promptly.
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
     } else {
-        let t1 = tr_with("ui.bar.live_title", "%{screen} · %{fps} fps", &[("screen", &screen_name(c)), ("fps", &params.framerate.to_string())]);
+        let screen = screen_name(c);
+        let fps = params.framerate.to_string();
+        let limit = encoder_limited(d);
+        // Encoder-bound (#46): the fps reads "168/240" in the warning colour,
+        // and the tooltip says what that means.
+        let t1 = match limit {
+            Some(l) => tr_with(
+                "ui.bar.live_title_limited",
+                "%{screen} · %{n}/%{fps} fps",
+                &[("screen", &screen), ("n", &l.encoding_fps.to_string()), ("fps", &fps)],
+            ),
+            None => tr_with("ui.bar.live_title", "%{screen} · %{fps} fps", &[("screen", &screen), ("fps", &fps)]),
+        };
         let t2 = format!("{} · {}", simple_screensharing_client::presets::codec_label(params.codec), fmt_rate(kbps));
-        status_text(ui, row.cell(1), &t1, Some((&t2, true)));
+        let c1 = if limit.is_some() { theme::WARNING } else { theme::TEXT };
+        status_text_colored(ui, row.cell(1), &t1, c1, Some((&t2, true)));
+        let tip = match limit {
+            Some(l) => format!("{t1}\n{t2}\n\n{}", encoder_limit_tip(l)),
+            None => format!("{t1}\n{t2}"),
+        };
+        ui.interact(row.cell(1), ui.id().with("live_tip"), Sense::hover()).on_hover_text(tip);
     }
+    // The encoder-limit verdict changes on the pump's clock; 1 Hz is plenty.
+    ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
     let audio_out = audio.show(ui, row.cell(2));
     let settings_clicked = row.show(ui, 3, Align::Min, |ui| settings.show_sized(ui, row.cell(3).width())).clicked();
     let rooms_clicked = row.show(ui, 4, Align::Min, |ui| rooms.show_sized(ui, row.cell(4).width())).clicked();
@@ -753,6 +773,25 @@ pub(super) fn awaiting_first_frame(cx: &Cx, capture: CaptureSourceId, c: &LocalC
     matches!(c.destination_state(d), DestinationState::Starting) && cx.state.capture_awaiting_first_frame(capture)
 }
 
+/// `Some` while `d`'s encoder has been the bottleneck for a while: it
+/// encodes fewer frames than it is offered (see
+/// `capture::destination::EncoderLimit`, #46).
+pub(super) fn encoder_limited(d: &Destination) -> Option<EncoderLimited> {
+    d.runtime.as_ref().and_then(|r| r.lock().ok()?.encoder_limited())
+}
+
+/// Bar tooltip for an encoder-bound destination: "Encoding N of M fps" and
+/// what to do about it.
+fn encoder_limit_tip(l: EncoderLimited) -> String {
+    let head = tr_with(
+        "ui.bar.encoding_n_of_m",
+        "Encoding %{n} of %{fps} fps",
+        &[("n", &l.encoding_fps.to_string()), ("fps", &l.target_fps.to_string())],
+    );
+    let why = tr("ui.bar.encoder_limit_why", "Your encoder can't keep up with this framerate. Stream settings shows what helps.");
+    format!("{head}\n{why}")
+}
+
 /// The long form of the "waiting for the screen to change" hint (bar tooltip,
 /// stream-settings banner).
 pub(super) fn waiting_hint() -> String {
@@ -781,14 +820,19 @@ fn t2_font(mono: bool) -> egui::FontId {
 /// The bar's `vbox·status-text`: bold 12.5/16 line + dim 11/14 line (mono
 /// when it is a rate), centred as a pair in `cell`.
 fn status_text(ui: &Ui, cell: Rect, t1: &str, t2: Option<(&str, bool)>) {
+    status_text_colored(ui, cell, t1, theme::TEXT, t2);
+}
+
+/// [`status_text`] with the first line in `c1`.
+fn status_text_colored(ui: &Ui, cell: Rect, t1: &str, c1: egui::Color32, t2: Option<(&str, bool)>) {
     let f1 = font(Weight::Bold, 12.5);
     match t2 {
         None => {
-            paint_text(ui, cell, t1, f1, theme::TEXT, Align::Min);
+            paint_text(ui, cell, t1, f1, c1, Align::Min);
         }
         Some((t2, mono)) => {
             let top = cell.center().y - 15.0;
-            paint_text(ui, Rect::from_x_y_ranges(cell.x_range(), top..=top + 16.0), t1, f1, theme::TEXT, Align::Min);
+            paint_text(ui, Rect::from_x_y_ranges(cell.x_range(), top..=top + 16.0), t1, f1, c1, Align::Min);
             paint_text(ui, Rect::from_x_y_ranges(cell.x_range(), top + 16.0..=top + 30.0), t2, t2_font(mono), theme::TEXT_DIM, Align::Min);
         }
     }
