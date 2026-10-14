@@ -4,7 +4,8 @@
 //!
 //! # Join-string format and key encoding
 //!
-//! This project's fixed link format is `server|room-id|key`:
+//! This project's link format is `server|room-id|key` with an optional fourth
+//! field, `server|room-id|key|certhash` (both forms are accepted everywhere):
 //!
 //! - `server` — `host:port` of the relay, e.g. `relay.example.com:4433`.
 //! - `room-id` — the spec's 16-byte `RoomId`, encoded as **32 lowercase hex
@@ -17,7 +18,17 @@
 //!   this encoding yet — this is the client's decision, documented here so
 //!   the server/link-generation side can match it.
 //!
-//! Example: `127.0.0.1:4433|00112233445566778899aabbccddeeff|Zm9vYmFyYmF6cXV1eDEyMzQ1Njc4OTAxMjM0NTY`
+//! - `certhash` (optional) — SHA-256 of the relay's leaf TLS certificate (DER),
+//!   **base64url, no padding** (43 chars), same encoding as `key`. A browser
+//!   needs it to pin the relay's self-signed, auto-rotating cert via
+//!   `WebTransport`'s `serverCertificateHashes`; a relay with a real CA cert
+//!   needs no hash and links omit it. The native client does not need it (see
+//!   "Certificate verification") but carries it along so links it generates
+//!   work in a browser: [`ScreenshareClient::current_cert_hash`].
+//!
+//! Examples:
+//! - `127.0.0.1:4433|00112233445566778899aabbccddeeff|Zm9vYmFyYmF6cXV1eDEyMzQ1Njc4OTAxMjM0NTY`
+//! - `127.0.0.1:4433|00112233445566778899aabbccddeeff|Zm9vYmFyYmF6cXV1eDEyMzQ1Njc4OTAxMjM0NTY|<43 chars>`
 //!
 //! # Public API shape
 //!
@@ -59,18 +70,28 @@
 //! event channel. Neither is wired up here — that's out of scope for this
 //! task — but the surface is shaped for them.
 //!
-//! # Certificate verification (native-only phase)
+//! # Certificate verification
 //!
-//! Per spec §11, self-signed cert hash-pinning is explicitly deferred (it
-//! would ride the join link's 4th field, which doesn't exist yet in this
-//! project's 3-field `server|room-id|key` format). Until that lands, this
-//! client skips TLS certificate verification entirely (see
-//! `SkipServerVerification` below) — the QUIC transport is still encrypted
-//! against passive eavesdroppers, but is not authenticated against an
-//! active MITM. That gap is exactly what §11's deferred pinning is meant to
-//! close later; it is *separate* from the AES-256-GCM room-key encryption
-//! (§5), which already protects the actual audio/video/preview payloads end
-//! to end regardless of the transport's cert trust.
+//! Unchanged from the native-only phase: this client skips TLS certificate
+//! verification (see `SkipServerVerification` below) — the QUIC transport is
+//! still encrypted against passive eavesdroppers, but is not authenticated
+//! against an active MITM. That is deliberately *separate* from the
+//! AES-256-GCM room-key encryption (§5), which already protects the actual
+//! audio/video/preview payloads end to end regardless of the transport's cert
+//! trust.
+//!
+//! `Why the cert hash in a link is not enforced here:` the relay rotates its
+//! self-signed cert every ~11 days (browsers cap pinned certs at 14 days), so a
+//! hash saved in an old link goes stale while the room itself is still fine. A
+//! native client that refused to connect on a mismatch would turn every
+//! rotation into a "can't join" bug for saved lounges. It only logs the
+//! mismatch. What it does do is *record* the hash of the cert the relay actually
+//! presented, so links it hands out later carry a hash that works in a browser.
+//!
+//! **Staleness caveat:** [`ScreenshareClient::current_cert_hash`] is the cert
+//! seen when this connection was established. A connection that outlives a
+//! relay rotation keeps reporting the old hash; a fresh connect (e.g. on
+//! reconnect) refreshes it.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -87,7 +108,7 @@ use tokio::sync::{mpsc, Mutex};
 
 use crate::fragment::Reassembler;
 use crate::protocol::{
-    decode_control_payload, encode_control_frame, ClientToRelay, ConnId, MediaHeader, Member,
+    cert_hash_of_der, decode_cert_hash, decode_control_payload, encode_cert_hash, encode_control_frame, ClientToRelay, ConnId, CertHash, MediaHeader, Member,
     PresenceEvent, PreviewHeader, RejectReason, RelayToClient, RoomId, StreamId, StreamInfo,
     StreamKind, MAX_CONTROL_FRAME_LEN, PROTOCOL_VERSION, STREAM_TYPE_PREVIEW,
 };
@@ -103,28 +124,36 @@ pub const ALPN: &[u8] = b"ssshare/1";
 // Join-string parsing
 // ---------------------------------------------------------------------
 
-/// A parsed `server|room-id|key` join string. See module docs for the
-/// encoding of each field.
+/// A parsed `server|room-id|key[|certhash]` join string. See module docs for
+/// the encoding of each field.
 #[derive(Debug, Clone)]
 pub struct ParsedJoinString {
     pub server: String,
     pub room_id: RoomId,
     pub room_key: [u8; 32],
+    /// The relay certificate's SHA-256, if the link carried one (4th field).
+    pub cert_hash: Option<CertHash>,
 }
 
 pub fn parse_join_string(s: &str) -> Result<ParsedJoinString> {
+    const EXPECTED: &str = "expected server|room-id|key or server|room-id|key|certhash";
     let s = s.trim();
-    let mut parts = s.splitn(3, '|');
+    let mut parts = s.splitn(4, '|');
     let server = parts
         .next()
         .filter(|p| !p.is_empty())
-        .ok_or_else(|| anyhow!("join string missing server address (expected server|room-id|key)"))?;
+        .ok_or_else(|| anyhow!("join string missing server address ({EXPECTED})"))?;
     let room_id_str = parts
         .next()
-        .ok_or_else(|| anyhow!("join string missing room id (expected server|room-id|key)"))?;
+        .ok_or_else(|| anyhow!("join string missing room id ({EXPECTED})"))?;
     let key_str = parts
         .next()
-        .ok_or_else(|| anyhow!("join string missing key (expected server|room-id|key)"))?;
+        .ok_or_else(|| anyhow!("join string missing key ({EXPECTED})"))?;
+    // A trailing `|` with nothing after it is treated as "no hash".
+    let cert_hash = match parts.next().map(str::trim).filter(|h| !h.is_empty()) {
+        Some(h) => Some(decode_cert_hash(h).context("join string has an invalid cert hash")?),
+        None => None,
+    };
 
     let room_id = parse_room_id_hex(room_id_str)?;
     let room_key = parse_room_key_base64(key_str)?;
@@ -133,17 +162,37 @@ pub fn parse_join_string(s: &str) -> Result<ParsedJoinString> {
         server: server.to_string(),
         room_id,
         room_key,
+        cert_hash,
     })
 }
 
-/// Build a join string from its parts, using this client's chosen encoding.
-/// Useful for `rooms.rs` (saved lounges) and for generating new room links.
+/// Build a 3-field join string (no cert hash) from its parts, using this
+/// client's chosen encoding. Useful for `rooms.rs` (saved lounges) and for
+/// generating new room links to relays with a CA-issued certificate. Prefer
+/// [`format_join_string_with_hash`] when the relay's hash is known.
 pub fn format_join_string(server: &str, room_id: &RoomId, room_key: &[u8; 32]) -> String {
-    format!(
+    format_join_string_with_hash(server, room_id, room_key, None)
+}
+
+/// [`format_join_string`] with the optional 4th field: the relay certificate's
+/// SHA-256 (see [`ScreenshareClient::current_cert_hash`]). `None` yields the
+/// plain 3-field form.
+pub fn format_join_string_with_hash(
+    server: &str,
+    room_id: &RoomId,
+    room_key: &[u8; 32],
+    cert_hash: Option<&CertHash>,
+) -> String {
+    let mut out = format!(
         "{server}|{}|{}",
         encode_room_id_hex(room_id),
         URL_SAFE_NO_PAD.encode(room_key)
-    )
+    );
+    if let Some(hash) = cert_hash {
+        out.push('|');
+        out.push_str(&encode_cert_hash(hash));
+    }
+    out
 }
 
 fn parse_room_id_hex(s: &str) -> Result<RoomId> {
@@ -388,6 +437,18 @@ pub struct ScreenshareClient {
     room_key: [u8; 32],
     nonce_seq: Arc<NonceSequence>,
     control_send: Arc<Mutex<quinn::SendStream>>,
+    room_id: RoomId,
+    cert_hash: Option<CertHash>,
+}
+
+/// SHA-256 of the leaf certificate the relay presented on `connection`, or
+/// `None` if the TLS stack didn't expose one.
+fn presented_cert_hash(connection: &quinn::Connection) -> Option<CertHash> {
+    let identity = connection.peer_identity()?;
+    let chain = identity
+        .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+        .ok()?;
+    Some(cert_hash_of_der(chain.first()?.as_ref()))
 }
 
 impl ScreenshareClient {
@@ -422,6 +483,17 @@ impl ScreenshareClient {
             .context("failed to start QUIC connection")?
             .await
             .context("QUIC handshake failed")?;
+
+        let cert_hash = presented_cert_hash(&connection);
+        if let (Some(expected), Some(seen)) = (parsed.cert_hash, cert_hash)
+            && expected != seen
+        {
+            // Not fatal, see the module docs: the relay rotates its cert and
+            // old links go stale; media stays protected by the room key.
+            tracing::info!(
+                "relay certificate differs from the hash in the join link (relay rotated its certificate?); continuing"
+            );
+        }
 
         let (mut send, mut recv) = connection
             .open_bi()
@@ -469,6 +541,8 @@ impl ScreenshareClient {
             room_key: parsed.room_key,
             nonce_seq,
             control_send: Arc::new(Mutex::new(send)),
+            room_id: parsed.room_id,
+            cert_hash,
         };
 
         Ok((client, snapshot, event_rx))
@@ -480,6 +554,24 @@ impl ScreenshareClient {
 
     pub fn room_key(&self) -> [u8; 32] {
         self.room_key
+    }
+
+    /// SHA-256 of the TLS certificate the relay presented when this connection
+    /// was established — what a browser must pin to join the same relay. Put
+    /// it in generated invite links via [`format_join_string_with_hash`] or
+    /// [`Self::invite_link`]. `None` only if the TLS stack exposed no peer
+    /// certificate. Stale if the relay rotated since connecting (see the
+    /// module docs); a CA-issued relay cert makes the hash irrelevant but
+    /// harmless.
+    pub fn current_cert_hash(&self) -> Option<CertHash> {
+        self.cert_hash
+    }
+
+    /// A shareable `server|room-id|key|certhash` link for the room this
+    /// connection is in. `server` is the relay address as the invitee should
+    /// type it (`host:port`); the room id and key come from this connection.
+    pub fn invite_link(&self, server: &str) -> String {
+        format_join_string_with_hash(server, &self.room_id, &self.room_key, self.cert_hash.as_ref())
     }
 
     /// Shared nonce sequence for this connection. A future `capture.rs`
@@ -797,6 +889,38 @@ mod tests {
         assert_eq!(parsed.server, "relay.example.com:4433");
         assert_eq!(parsed.room_id, room_id);
         assert_eq!(parsed.room_key, key);
+        assert_eq!(parsed.cert_hash, None);
+        assert_eq!(joined.matches('|').count(), 2, "3-field form has no trailing separator");
+    }
+
+    #[test]
+    fn join_string_round_trip_with_cert_hash() {
+        let room_id: RoomId = [0xabu8; 16];
+        let key = test_key();
+        let hash = cert_hash_of_der(b"some relay certificate");
+        let joined = format_join_string_with_hash("relay.example.com:4433", &room_id, &key, Some(&hash));
+        assert_eq!(joined.matches('|').count(), 3);
+        assert!(joined.ends_with(&encode_cert_hash(&hash)));
+        let parsed = parse_join_string(&joined).unwrap();
+        assert_eq!(parsed.server, "relay.example.com:4433");
+        assert_eq!(parsed.room_id, room_id);
+        assert_eq!(parsed.room_key, key);
+        assert_eq!(parsed.cert_hash, Some(hash));
+        // `None` falls back to the 3-field form, which also still parses.
+        let plain = format_join_string_with_hash("relay.example.com:4433", &room_id, &key, None);
+        assert_eq!(plain, format_join_string("relay.example.com:4433", &room_id, &key));
+        assert_eq!(parse_join_string(&plain).unwrap().cert_hash, None);
+        // Whitespace around a pasted link and a dangling separator are tolerated.
+        assert_eq!(parse_join_string(&format!("  {joined}\n")).unwrap().cert_hash, Some(hash));
+        assert_eq!(parse_join_string(&format!("{plain}|")).unwrap().cert_hash, None);
+    }
+
+    #[test]
+    fn join_string_rejects_bad_cert_hash() {
+        let base = format_join_string("h:1", &[1u8; 16], &test_key());
+        assert!(parse_join_string(&format!("{base}|not-base64!")).is_err());
+        assert!(parse_join_string(&format!("{base}|AAAA")).is_err(), "wrong length");
+        assert!(parse_join_string(&format!("{base}|{}|extra", encode_cert_hash(&[0u8; 32]))).is_err());
     }
 
     #[test]

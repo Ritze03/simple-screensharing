@@ -11,13 +11,27 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use crate::protocol::{ConnId, MediaHeader, StreamId, MEDIA_HEADER_LEN};
+use crate::protocol::{ConnId, MediaHeader, StreamId, MAX_MEDIA_DATAGRAM_LEN, MEDIA_HEADER_LEN};
 
 /// Split one already-AEAD-encrypted frame (`ciphertext_with_tag`) into
 /// wire-ready datagrams (header + this fragment's slice), per spec §6.3.
 ///
 /// `max_datagram_size` should come from `quinn::Connection::max_datagram_size()`;
-/// the usable payload per fragment is `max_datagram_size - MEDIA_HEADER_LEN`.
+/// the usable payload per fragment is `max_datagram_size - MEDIA_HEADER_LEN`,
+/// **but never more than [`MAX_MEDIA_DATAGRAM_LEN`] in total** — see below.
+///
+/// # Browser-compatible datagram size
+///
+/// `Why the cap:` the relay forwards fragments verbatim (it has no key, so it
+/// cannot re-fragment), which means *this* sender decides whether a browser
+/// viewer can receive them and a browser sender decides whether natives can.
+/// A WebTransport peer's datagrams are limited to what
+/// `WebTransport.datagrams.maxDatagramSize` allows — 1024 application bytes in
+/// Chromium — so a native sender that filled quinn's ~1160-byte limit would
+/// produce fragments no browser could ever forward or send. Every sender
+/// therefore fragments to at most [`MAX_MEDIA_DATAGRAM_LEN`] (1000) bytes per
+/// datagram, header included, i.e. 981 payload bytes. Native-to-native works as
+/// before, with ~18% more fragments on big frames.
 pub fn fragment_frame(
     conn_id: ConnId,
     stream_id: StreamId,
@@ -54,6 +68,7 @@ pub fn fragment_frame_with_flags(
     ciphertext: &[u8],
     max_datagram_size: usize,
 ) -> anyhow::Result<Vec<Vec<u8>>> {
+    let max_datagram_size = max_datagram_size.min(MAX_MEDIA_DATAGRAM_LEN);
     let fragment_payload_max = max_datagram_size.saturating_sub(MEDIA_HEADER_LEN);
     if fragment_payload_max == 0 {
         anyhow::bail!("max_datagram_size too small to fit even the media header");
@@ -283,6 +298,27 @@ mod tests {
             assert!(header.is_keyframe());
             assert!(!header.is_stalled(), "a normal frame must never claim to be a stalled re-send");
         }
+    }
+
+    #[test]
+    fn no_datagram_exceeds_the_browser_safe_cap() {
+        let ciphertext = vec![0xAAu8; 50_000];
+        // Whatever the QUIC stack claims it can carry, stay browser-compatible.
+        for claimed in [1200, 1452, 65_000] {
+            let datagrams = fragment_frame(1, 0, 3, true, &ciphertext, claimed).unwrap();
+            assert!(datagrams.iter().all(|d| d.len() <= MAX_MEDIA_DATAGRAM_LEN));
+            assert_eq!(datagrams[0].len(), MAX_MEDIA_DATAGRAM_LEN);
+            let mut reasm = Reassembler::new();
+            let mut out = None;
+            for d in &datagrams {
+                let (h, p) = MediaHeader::unpack(d).unwrap();
+                out = reasm.insert(&h, p).or(out);
+            }
+            assert_eq!(out.unwrap(), ciphertext);
+        }
+        // A smaller claimed size is still honoured.
+        let small = fragment_frame(1, 0, 4, false, &ciphertext, 500).unwrap();
+        assert!(small.iter().all(|d| d.len() <= 500));
     }
 
     #[test]

@@ -6,10 +6,11 @@ from the brainstorm's "Final Verify Results" section into exact, implementable w
 detail. Everything in `superdoc/brainstorm/simple-screensharing-platform.md` is already
 decided and is not re-litigated here.
 
-**Phase scope: NATIVE-ONLY.** This spec targets plain `quinn`-to-`quinn` QUIC. The
-browser/WebTransport leg, ALPN dispatch, and self-signed cert hash-pinning are
-explicitly deferred. Section 11 marks exactly where the WebTransport seam is so it can
-be added later without a protocol rewrite.
+**Transports.** Native clients speak plain `quinn`-to-`quinn` QUIC; browsers speak
+WebTransport (HTTP/3) to the *same* UDP port. Everything in §2–§10 is transport-agnostic and
+identical for both; §11 specifies the accept layer (ALPN dispatch, URL path, pinned
+self-signed certificate) and the one wire constraint it adds (the 1000-byte datagram cap,
+§6.3).
 
 Conventions used throughout:
 
@@ -25,8 +26,8 @@ Conventions used throughout:
 
 ## 1. Transport model and channel map
 
-A native client makes one outbound QUIC connection to the relay (single UDP port). All
-communication rides that one connection, split into three planes over QUIC's native
+A client (native, or a browser over WebTransport — §11) makes one outbound QUIC connection
+to the relay (single UDP port). All communication rides that one connection, split into three planes over QUIC's native
 primitives:
 
 | Plane | QUIC primitive | Reliability | Direction | Carries |
@@ -354,11 +355,21 @@ the connection the datagram arrived on, to reject a client spoofing another's so
 
 ### 6.3 Fragment sizing
 
-The sender queries quinn's current `max_datagram_size()` for the connection and uses
-`fragment_payload_max = max_datagram_size − 19`. It splits `ciphertext_with_tag` into
-`ceil(len / fragment_payload_max)` fragments (the target ~1200-byte MTU yields ~1181
-payload bytes/fragment). The 16-byte GCM tag is simply the tail of `ciphertext_with_tag`
-and is fragmented like any other bytes.
+The sender queries quinn's current `max_datagram_size()` for the connection and clamps it to
+**`MAX_MEDIA_DATAGRAM_LEN = 1000` bytes** (header included, `simple-screensharing-protocol`
+crate), then uses `fragment_payload_max = min(max_datagram_size, 1000) − 19 = 981`. It splits
+`ciphertext_with_tag` into `ceil(len / fragment_payload_max)` fragments. The 16-byte GCM tag
+is simply the tail of `ciphertext_with_tag` and is fragmented like any other bytes.
+
+`Why 1000 and not the ~1160 quinn allows:` the relay forwards fragments verbatim — it has no
+key, so it cannot re-fragment — which means the **sender** decides whether every receiver can
+take its datagrams. A browser's `WebTransport.datagrams.maxDatagramSize` is smaller than raw
+QUIC's: headless Chromium 153 reports **1024** application bytes against this relay (measured
+by `server/src/browser_smoke.rs`), and the WebTransport spec drops anything larger silently.
+Every sender — native (`client/src/fragment.rs`) and browser alike — therefore fragments to at
+most 1000 bytes per datagram. Cost: ~18% more fragments on large frames; benefit: browsers can
+send and receive at all. A browser should still compare `datagrams.maxDatagramSize` against
+1000 at runtime and refuse to join if it is smaller.
 
 ### 6.4 Plaintext media payload layout (inside the AEAD)
 
@@ -549,20 +560,79 @@ Key operations:
 
 ---
 
-## 11. WebTransport seam (deferred — noted, not designed)
+## 11. WebTransport leg (browsers) and the accept layer
 
 Everything above (message catalog, headers, encryption, reassembly, bookkeeping) is
-transport-agnostic. Adding the browser/WebTransport leg later touches only the
-**connection-accept layer**, not the protocol:
+transport-agnostic. The three planes map 1:1 onto WebTransport primitives — control = a WT
+**bidirectional stream**, previews = WT **unidirectional streams**, media = WT **datagrams** —
+so the same framing (§2), the same fixed binary headers (§6/§7), the same nonce/AAD rules, and
+the same relay logic apply unchanged. Only the connection-accept layer differs.
 
-- The three planes map 1:1 onto WebTransport primitives — control = a WT **bidirectional
-  stream**, previews = WT **unidirectional streams**, media = WT **datagrams** — so the
-  same framing (§2), the same fixed binary headers (§6/§7), the same nonce/AAD rules, and
-  the same relay logic apply unchanged.
-- The only additions are (a) an ALPN/HTTP-3 accept path that yields the same stream and
-  datagram handles the native path already produces, and (b) the self-signed cert
-  hash-pinning delivered via the join link's 4th field. Both live entirely at accept time
-  and do not alter any wire structure in this spec.
+### 11.1 One port, two ALPNs
 
-That is the whole seam: a new accept path producing the same handles. No message,
-header, or crypto change is required to add it.
+| Peer | ALPN | Session |
+| --- | --- | --- |
+| Native desktop client | `ssshare/1` | raw QUIC |
+| Browser | `h3` | HTTP/3 + WebTransport |
+
+The relay offers both in the TLS handshake and dispatches on the negotiated one
+(`server/src/relay.rs::accept_session`). A browser must request
+**`https://<host>:<port>/ssshare`**; any other path gets HTTP 404. Both kinds of peer end up as
+the same `web_transport_quinn::Session` inside the relay, so native and browser members are
+equal in rooms and forwarding.
+
+### 11.2 What a browser must do
+
+1. `new WebTransport("https://host:port/ssshare", { serverCertificateHashes: [{ algorithm:
+   "sha-256", value: <32 bytes> }] })` — the hash comes from the join link (§11.4); omit
+   `serverCertificateHashes` when the relay uses a CA certificate.
+2. **Ordering assumption:** open the control stream with `createBidirectionalStream()` and
+   write `Join` to it immediately. The relay treats the **first bidi stream** as control and
+   its first message must be `Join`. (A bidi stream only becomes visible to the relay once the
+   peer writes to it.) The HTTP/3 CONNECT stream is consumed by the WebTransport layer and is
+   not seen here.
+3. Previews: `createUnidirectionalStream()` per blob, §7.1 layout, close to FIN. Incoming
+   previews arrive on `incomingUnidirectionalStreams`, one per blob.
+4. Media: `datagrams.writable` / `datagrams.readable`, one fragment per datagram, **at most
+   1000 bytes** (§6.3). Datagrams are unordered and lossy as ever; the receiver drops a frame
+   with a missing fragment.
+5. Limits worth knowing: control frames ≤ 64 KiB; previews ≤ 2 MiB (relay-side cap); idle
+   timeout 60 s with relay keep-alives every 15 s.
+
+### 11.3 Certificate: pinned, self-signed, auto-rotating
+
+Browsers only accept a hash-pinned certificate if it is **ECDSA P-256** and valid for **at
+most 14 days**. By default the relay generates exactly that: a self-signed P-256 cert valid
+**13 days** (`notBefore` back-dated 1 h for clock skew, inside the 13), persisted in
+`./state/{cert.pem,key.pem,cert.meta}` (so a restart keeps the hash), and **replaced when fewer
+than 2 days remain** by swapping the endpoint's server config. Existing connections keep the
+certificate they were set up with and are never dropped by a rotation; only *new* handshakes see
+the new certificate. With `--cert <pem> --key <pem>` the relay serves a CA-issued chain
+instead (e.g. Let's Encrypt): browsers verify it normally, no hash is needed, nothing is rotated
+(the files are re-read hourly if their mtime changed). Implementation: `server/src/cert.rs`.
+
+### 11.4 Join link, 4th field
+
+```
+server|room-id|key            (CA-certificate relay, or native-only use)
+server|room-id|key|certhash   (self-signed relay; required for browsers)
+```
+
+`certhash` = SHA-256 of the relay's **leaf certificate DER**, **base64url, no padding** (43
+characters), same encoding as `key`. Both forms are valid everywhere. The native client does
+not enforce it (it logs a mismatch and carries on — the room key already protects the media,
+and a saved link would otherwise break at every rotation) but records the hash of the cert the
+relay actually presented so links it generates (`ScreenshareClient::current_cert_hash()` /
+`invite_link()`) work in a browser.
+
+`Why links go stale:` a pinned hash is only valid while the relay presents that exact
+certificate, i.e. until its next rotation (a link made right after a rotation is good for ~11
+days; one made just before is good for days less). A browser whose pinned hash no longer
+matches fails the handshake and should ask for a fresh link. A CA certificate avoids this
+entirely.
+
+### 11.5 Constants, in one place
+
+`simple-screensharing-protocol`: `NATIVE_ALPN = b"ssshare/1"`, `WEBTRANSPORT_ALPN = b"h3"`,
+`WEBTRANSPORT_PATH = "/ssshare"`, `MAX_MEDIA_DATAGRAM_LEN = 1000`, plus
+`cert_hash_of_der` / `encode_cert_hash` / `decode_cert_hash`.

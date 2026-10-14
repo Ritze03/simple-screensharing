@@ -27,8 +27,9 @@ use ratatui::widgets::{
     Tabs,
 };
 
-use crate::protocol::RoomId;
-use crate::room::Registry;
+use crate::cert::CertInfo;
+use crate::protocol::{RoomId, encode_cert_hash};
+use crate::room::{Registry, TransportKind};
 
 const TAB_TITLES: [&str; 3] = ["Overview", "Rooms", "Room Detail"];
 const REDRAW_INTERVAL: Duration = Duration::from_millis(200);
@@ -66,6 +67,9 @@ struct Snapshot {
     room_count: usize,
     total_rx: u64,
     total_tx: u64,
+    native_connections: usize,
+    browser_connections: usize,
+    cert: Option<CertInfo>,
     rooms: Vec<RoomSnapshot>,
 }
 
@@ -79,6 +83,7 @@ struct RoomSnapshot {
 struct MemberSnapshot {
     conn_id: u64,
     display_name: String,
+    transport: TransportKind,
     stream_count: u8,
     /// Number of *other* members' streams this member currently subscribes
     /// to as a viewer. Mirrors `stream_count` (sharing) but for watching —
@@ -106,6 +111,7 @@ fn take_snapshot(registry: &Registry) -> Snapshot {
             .map(|c| MemberSnapshot {
                 conn_id: c.conn_id,
                 display_name: c.display_name.clone(),
+                transport: c.transport,
                 stream_count: c.stream_count,
                 watching_count: c.subscriptions.len() as u8,
             })
@@ -142,6 +148,9 @@ fn take_snapshot(registry: &Registry) -> Snapshot {
         room_count: rooms_map.len(),
         total_rx: registry.bandwidth.rx.load(Ordering::Relaxed),
         total_tx: registry.bandwidth.tx.load(Ordering::Relaxed),
+        native_connections: registry.native_connections.load(Ordering::Relaxed),
+        browser_connections: registry.browser_connections.load(Ordering::Relaxed),
+        cert: registry.cert_info(),
         rooms,
     }
 }
@@ -332,6 +341,20 @@ fn fmt_duration(d: Duration) -> String {
     let secs = d.as_secs();
     let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
     format!("{h:02}:{m:02}:{s:02}")
+}
+
+/// "3d 04h" style span for the certificate countdown (the cert lives for
+/// days, so `fmt_duration`'s HH:MM:SS would be useless here).
+fn fmt_days(d: Duration) -> String {
+    let secs = d.as_secs();
+    let (days, hours, mins) = (secs / 86_400, (secs % 86_400) / 3600, (secs % 3600) / 60);
+    if days > 0 {
+        format!("{days}d {hours:02}h")
+    } else if hours > 0 {
+        format!("{hours}h {mins:02}m")
+    } else {
+        format!("{mins}m {:02}s", secs % 60)
+    }
 }
 
 fn hex8(id: &RoomId) -> String {
@@ -526,10 +549,10 @@ const BANDWIDTH_TOTAL_COL_WIDTH: usize = 9;
 fn draw_overview(frame: &mut Frame, area: Rect, app: &App, snap: &Snapshot) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(7), Constraint::Min(0)])
+        .constraints([Constraint::Length(10), Constraint::Min(0)])
         .split(area);
 
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::raw("Listening on:      "),
             Span::styled(
@@ -544,6 +567,18 @@ fn draw_overview(frame: &mut Frame, area: Rect, app: &App, snap: &Snapshot) {
         Line::from(vec![
             Span::raw("Active rooms:      "),
             Span::raw(snap.room_count.to_string()),
+        ]),
+        Line::from(vec![
+            Span::raw("Connections:       "),
+            Span::styled(
+                format!("{} native", snap.native_connections),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::raw(" / "),
+            Span::styled(
+                format!("{} browser", snap.browser_connections),
+                Style::default().fg(Color::Magenta),
+            ),
         ]),
         Line::from(vec![
             Span::raw("Bandwidth in:  "),
@@ -574,6 +609,54 @@ fn draw_overview(frame: &mut Frame, area: Rect, app: &App, snap: &Snapshot) {
             ),
         ]),
     ];
+    // TLS certificate: the hash is what goes into browser join links (4th
+    // field), the countdown says when the relay swaps the cert for a fresh one
+    // (links carrying the old hash stop working for browsers then).
+    match &snap.cert {
+        Some(cert) => {
+            let hash = encode_cert_hash(&cert.hash);
+            let (note, note_style) = match (cert.self_signed, cert.not_after, cert.rotate_at) {
+                (true, Some(not_after), Some(rotate_at)) => {
+                    let now = std::time::SystemTime::now();
+                    let until = |t: std::time::SystemTime| {
+                        t.duration_since(now).unwrap_or(Duration::ZERO)
+                    };
+                    (
+                        format!(
+                            "expires in {}, rotates in {}",
+                            fmt_days(until(not_after)),
+                            fmt_days(until(rotate_at))
+                        ),
+                        Style::default(),
+                    )
+                }
+                _ => (
+                    "CA-provided, no hash needed, never rotated".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            };
+            lines.push(Line::from(vec![
+                Span::raw("TLS cert hash:     "),
+                Span::styled(hash, Style::default().fg(Color::Cyan)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw("TLS cert:          "),
+                Span::styled(note, note_style),
+                Span::styled(
+                    if cert.rotations > 0 {
+                        format!("   ({} rotation(s) this run)", cert.rotations)
+                    } else {
+                        String::new()
+                    },
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+        None => lines.push(Line::from(vec![
+            Span::raw("TLS cert:          "),
+            Span::styled("(starting)", Style::default().fg(Color::DarkGray)),
+        ])),
+    }
     let block = Block::default().borders(Borders::ALL).title(" Overview ");
     frame.render_widget(Paragraph::new(lines).block(block), rows[0]);
 
@@ -798,6 +881,9 @@ fn draw_rooms(frame: &mut Frame, area: Rect, app: &App, snap: &Snapshot) {
                             Style::default().fg(Color::Cyan),
                         ));
                     }
+                }
+                if m.transport == TransportKind::Browser {
+                    spans.push(Span::styled("  [browser]", Style::default().fg(Color::Magenta)));
                 }
                 ListItem::new(Line::from(spans))
             })

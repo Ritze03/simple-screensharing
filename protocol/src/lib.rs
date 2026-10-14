@@ -316,9 +316,93 @@ impl PreviewHeader {
     }
 }
 
+// ---------------------------------------------------------------------
+// Transport constants shared by relay, native client and the website
+// (spec §11 — WebTransport seam)
+// ---------------------------------------------------------------------
+
+/// ALPN of the native (raw QUIC) transport.
+pub const NATIVE_ALPN: &[u8] = b"ssshare/1";
+
+/// ALPN a browser (HTTP/3 + WebTransport) negotiates. The relay dispatches on
+/// the negotiated ALPN: this one becomes a WebTransport session, [`NATIVE_ALPN`]
+/// a raw-QUIC one.
+pub const WEBTRANSPORT_ALPN: &[u8] = b"h3";
+
+/// URL path a browser must request: `https://host:port/ssshare`. The relay
+/// answers 404 to anything else.
+pub const WEBTRANSPORT_PATH: &str = "/ssshare";
+
+/// Hard cap on the size of **one media datagram as handed to the QUIC stack**
+/// (19-byte [`MediaHeader`] + fragment payload), enforced by the *sender* when
+/// it fragments a frame (`client/src/fragment.rs`; browsers must do the same).
+///
+/// `Why 1000:` the relay forwards fragments verbatim — it cannot re-fragment
+/// without the room key — so the size has to fit the weakest peer, a browser
+/// over WebTransport. **Measured: headless Chromium 153 reports
+/// `WebTransport.datagrams.maxDatagramSize === 1024`** against this relay (the
+/// WebTransport spec drops anything larger silently), well below what raw QUIC
+/// allows (quinn reports 1162 at the 1200-byte minimum MTU). That figure is
+/// application bytes, i.e. already net of the HTTP/3 quarter-stream-id prefix.
+/// 1000 leaves 24 bytes of slack under it
+/// and gives 981 payload bytes per fragment (vs ~1160 before): ~18% more
+/// fragments for large frames, a fair price for a browser being able to send
+/// at all. Receiving is the easy direction: 1000 + prefix (<= 8) fits a
+/// 1200-byte QUIC packet with room to spare. Websites should still compare
+/// `datagrams.maxDatagramSize` against this at runtime and refuse to join if
+/// it is smaller, rather than silently losing every fragment.
+pub const MAX_MEDIA_DATAGRAM_LEN: usize = 1000;
+
+// ---------------------------------------------------------------------
+// Certificate hash (join link 4th field)
+// ---------------------------------------------------------------------
+
+/// SHA-256 of a relay's leaf certificate (DER) — exactly what a browser needs
+/// for `new WebTransport(url, { serverCertificateHashes: [{ algorithm:
+/// "sha-256", value }] })`.
+pub type CertHash = [u8; 32];
+
+/// SHA-256 over the DER encoding of a certificate.
+pub fn cert_hash_of_der(der: &[u8]) -> CertHash {
+    use sha2::Digest;
+    sha2::Sha256::digest(der).into()
+}
+
+/// Encode a [`CertHash`] for the join link: **base64url, no padding** (43
+/// characters) — the same encoding as the room key field.
+pub fn encode_cert_hash(hash: &CertHash) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash)
+}
+
+/// Inverse of [`encode_cert_hash`].
+pub fn decode_cert_hash(s: &str) -> anyhow::Result<CertHash> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(s)
+        .map_err(|e| anyhow::anyhow!("cert hash is not valid base64url (no padding): {e}"))?;
+    <CertHash>::try_from(bytes.as_slice()).map_err(|_| {
+        anyhow::anyhow!(
+            "cert hash must decode to 32 bytes (SHA-256), got {} bytes",
+            bytes.len()
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cert_hash_round_trip() {
+        let hash = cert_hash_of_der(b"not really a certificate");
+        let enc = encode_cert_hash(&hash);
+        assert_eq!(enc.len(), 43);
+        assert!(!enc.contains(['=', '+', '/', '|']));
+        assert_eq!(decode_cert_hash(&enc).unwrap(), hash);
+        assert!(decode_cert_hash("AAAA").is_err());
+        assert!(decode_cert_hash("!!!").is_err());
+    }
 
     #[test]
     fn control_frame_round_trip() {

@@ -13,7 +13,7 @@ platform for friends is built across sibling repos on this machine:
 | --- | --- | --- |
 | Relay server | `~/GitHubProjects/simple-screensharing/simple-screensharing-server` | Rust QUIC relay: broadcasts encrypted room traffic between clients, never decrypts it, plus a ratatui admin TUI. |
 | Desktop client | `~/GitHubProjects/simple-screensharing/simple-screensharing-client` | **Electron app shell (`electron/`) driving an HTML/CSS/JS frontend (`frontend/`), backed by a Rust sidecar process** (`src-tauri/`, still a Tauri binary under the hood — see "Electron migration" below) that does the real work: screen/audio capture, encode, encrypt, and the reverse (decode/decrypt/display) for watching others. The video-frame path itself is decoded **in the browser/Chromium renderer** via WebCodecs, not by the Rust side — see `superdoc/features/video-pipeline.md`. |
-| Browser viewer | *(not started)* | Deferred — the brainstorm's WebTransport/WebCodecs leg (a *standalone* browser-only client with no Electron/desktop shell at all). `protocol-spec.md` §11 marks where this seam goes; nothing exists yet. Not to be confused with the desktop client's own WebCodecs decode, which is Chromium-inside-Electron, not a browser tab. |
+| Browser viewer | *(site not started)* | The standalone browser client (static site, WebTransport + WebCodecs, no Electron). **The relay side is done:** it accepts browsers over WebTransport on the same UDP port as native clients, with a pinned auto-rotating self-signed cert whose hash rides in the join link — `protocol-spec.md` §11. Not to be confused with the desktop client's own WebCodecs decode, which is Chromium-inside-Electron, not a browser tab. |
 
 Both real repos are private GitHub repos, developed and pushed independently of this
 workspace. This page is the up-to-date map of what's actually in them; the historical
@@ -174,11 +174,13 @@ differently once built, see `architecture/implementation-notes.md`.
 
 | Module | Role |
 | --- | --- |
-| `main.rs` | Entry point: logging setup, starts the QUIC listener task and the TUI thread, shuts down on TUI quit or Ctrl-C. |
-| `protocol.rs` | Wire protocol types per `protocol-spec.md`, `postcard`-serialized control messages, hand-packed binary media/preview headers. |
-| `relay.rs` | QUIC listener, self-signed cert setup, one connection-actor task per client plus one **media forwarder task** per client (`media_forward_task`) that owns that client's datagram fan-out, content-blind preview forwarding, keyframe-request debouncing. The actor only validates a datagram header and `try_send`s it to its forwarder over a bounded, drop-on-full queue, so fan-out never delays the actor's next read. |
+| `main.rs` | Entry point: CLI (`[PORT] [--cert/--key] [--state-dir] [--san]`, see `--help`), logging setup, starts the QUIC listener task and the TUI thread, shuts down on TUI quit or Ctrl-C. |
+| `protocol.rs` | Relay-only helpers over the shared `simple-screensharing-protocol` crate (`protocol/`, which owns the wire types, header layouts, transport constants and cert-hash encoding): the 64 KiB-capped control-frame codec and `clamp_utf8`. |
+| `cert.rs` | The TLS certificate: ECDSA P-256 self-signed (13 days, persisted in `state/`, rotated when < 2 days left via `Endpoint::set_server_config`) or a provided CA chain (`--cert/--key`, reloaded on change). Publishes the current hash/expiry for the TUI. See `protocol-spec.md` §11.3. |
+| `relay.rs` | Accept layer + relay logic. One UDP port, two ALPNs: `ssshare/1` (native, raw QUIC) and `h3` (browser, WebTransport on `/ssshare`), both turned into one `web_transport_quinn::Session` type so everything after `accept_session` is transport-agnostic. One connection-actor task per client plus one **media forwarder task** per client (`media_forward_task`) that owns that client's datagram fan-out, content-blind preview forwarding, keyframe-request debouncing. The actor only validates a datagram header and `try_send`s it to its forwarder over a bounded, drop-on-full queue, so fan-out never delays the actor's next read. |
 | `room.rs` | Room/connection/stream state (`Registry`): outer `RwLock` over the room map, per-room `Mutex` for **control-plane** mutations (join, announce, subscribe, leave); the **media data plane** deliberately avoids that mutex, reading a per-stream `StreamRoute` fan-out snapshot instead. Also the admin-log ring buffer (`EventLog`) the TUI reads. Read this module's docs before touching either — they carry the lock-ordering rules. |
-| `tui.rs` | Ratatui admin TUI on its own OS thread: Overview / Rooms / Room Detail tabs, reading the shared `Registry` via `blocking_read`/`blocking_lock`. |
+| `tui.rs` | Ratatui admin TUI on its own OS thread: Overview (incl. native/browser connection counts and the TLS cert hash + expiry/rotation countdown) / Rooms / Room Detail tabs, reading the shared `Registry` via `blocking_read`/`blocking_lock`. |
+| `browser_smoke.rs`, `transport_tests.rs`, `tests/browser_smoke.html` | Test-only. `browser_smoke` drives **headless Chromium** (skips if none on `PATH`) through a real hash-pinned `new WebTransport(...)` join, datagrams and previews against an in-process relay with native peers; `transport_tests` covers ALPN dispatch and certificate rotation under live connections. |
 
 ### Client — `~/GitHubProjects/simple-screensharing/simple-screensharing-client/src/`
 
@@ -871,6 +873,7 @@ entry.
 
 - Overall plan, scope, original design decisions → `superdoc/brainstorm/simple-screensharing-platform.md`
 - Binding wire protocol (headers, nonce construction, message catalog) → `superdoc/architecture/protocol-spec.md`
+- Browser/WebTransport leg: URL path, ALPN, pinned-cert lifecycle, join-link `certhash` field, the 1000-byte datagram cap → `protocol-spec.md` §11 and §6.3
 - Where the real implementation deviated from or refined the plan/spec, and bugs/QC findings from building it → `superdoc/architecture/implementation-notes.md`
 - Documentation discipline for this workspace → `superdoc/claude-instructions/documentation.md`
 - Project vocabulary → `superdoc/meta/TERMINOLOGY.md`

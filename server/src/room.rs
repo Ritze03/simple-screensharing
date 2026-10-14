@@ -69,7 +69,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
-use quinn::Connection;
+use web_transport_quinn::Session;
 use tokio::sync::{Mutex, RwLock, mpsc};
 
 /// `std`'s blocking `RwLock`, used *only* for the media-route snapshot
@@ -146,9 +146,14 @@ pub struct ConnState {
     /// writes a `RelayToClient` frame on that connection's control bidi
     /// stream.
     pub control_tx: mpsc::UnboundedSender<RelayToClient>,
-    /// The raw quinn connection handle, used to open uni streams (preview
-    /// fan-out) and send datagrams (media forwarding) to this member.
-    pub connection: Connection,
+    /// The session handle, used to open uni streams (preview fan-out) and
+    /// send datagrams (media forwarding) to this member. A native member is a
+    /// raw-QUIC [`Session`], a browser a WebTransport one: same type, so
+    /// everything downstream of the accept path is transport-agnostic (see
+    /// `relay::handle_connection`).
+    pub connection: Session,
+    /// How this member connected (for the TUI only).
+    pub transport: TransportKind,
     /// Streams (owned by *other* connections) that this connection is
     /// currently subscribed to.
     pub subscriptions: HashSet<(ConnId, StreamId)>,
@@ -158,12 +163,22 @@ pub struct ConnState {
 }
 
 /// One resolved fan-out destination for a stream's media datagrams: the
-/// subscriber's id (for logging) plus a clone of its `quinn::Connection`
-/// handle (cheap — internally an `Arc`).
+/// subscriber's id (for logging) plus a clone of its [`Session`] handle (cheap
+/// — internally `Arc`s).
 #[derive(Clone)]
 pub struct RouteTarget {
     pub conn_id: ConnId,
-    pub connection: Connection,
+    pub connection: Session,
+}
+
+/// Which transport a member arrived on. Only used for display; nothing in the
+/// relay's logic branches on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportKind {
+    /// Raw QUIC, ALPN `ssshare/1` (the desktop client).
+    Native,
+    /// HTTP/3 WebTransport, ALPN `h3` (the browser viewer).
+    Browser,
 }
 
 /// The media data plane for one stream: an immutable snapshot of the
@@ -334,6 +349,13 @@ pub struct Registry {
     pub bandwidth: ByteCounters,
     pub started_at: std::time::Instant,
     pub listen_addr: std::net::SocketAddr,
+    /// Currently open connections that finished the QUIC handshake, by
+    /// transport (joined or not). Shown by the TUI.
+    pub native_connections: std::sync::atomic::AtomicUsize,
+    pub browser_connections: std::sync::atomic::AtomicUsize,
+    /// The TLS cert currently being served, published by
+    /// [`crate::cert::CertManager::maintain`]. `None` until the relay has one.
+    pub cert: std::sync::RwLock<Option<crate::cert::CertInfo>>,
 }
 
 impl Registry {
@@ -343,7 +365,18 @@ impl Registry {
             bandwidth: ByteCounters::default(),
             started_at: std::time::Instant::now(),
             listen_addr,
+            native_connections: Default::default(),
+            browser_connections: Default::default(),
+            cert: std::sync::RwLock::new(None),
         }
+    }
+
+    pub fn set_cert_info(&self, info: crate::cert::CertInfo) {
+        *self.cert.write().unwrap_or_else(|p| p.into_inner()) = Some(info);
+    }
+
+    pub fn cert_info(&self) -> Option<crate::cert::CertInfo> {
+        self.cert.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Get the room for `room_id`, creating it if this is the first
