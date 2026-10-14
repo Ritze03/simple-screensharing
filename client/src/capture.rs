@@ -10,7 +10,8 @@
 //! desktop Linux) keeps everything in GPU memory:
 //!
 //! ```text
-//! pipewiresrc (DMA-BUF) ! vapostproc video-direction=auto
+//! pipewiresrc (DMA-BUF) ! queue max-size-buffers=2   (see `decoupled_source`: stock xdpw)
+//!   ! vapostproc video-direction=auto
 //!   ! video/x-raw(memory:VAMemory),format=NV12 ! tee name=t
 //!   t. ! queue leaky=downstream max-size-buffers=1 ! videorate drop-only=true ! vapostproc
 //!      ! video/x-raw,format=BGRx,framerate=1/1 ! videoconvert ! video/x-raw,format=RGB
@@ -1604,11 +1605,55 @@ fn build_pipeline_in(source_fragment: &str, domain: CaptureDomain) -> Result<Cap
     }
 }
 
+/// Name of the queue [`decoupled_source`] puts right behind the portal source.
+const PORTAL_QUEUE_NAME: &str = "portal_queue";
+
+/// `source_fragment` with a small `queue` right behind it when it is the
+/// portal's `pipewiresrc`; any other source is returned unchanged.
+///
+/// `Why (task #52, stock xdg-desktop-portal-wlr 0.8.4 on sway 1.12):` the queue
+/// is what stops the capture start from flapping the PipeWire stream. In
+/// `pipewiresrc`'s `READY -> PAUSED` change the stream first goes `streaming`
+/// (a stream starts active, that is how it gets linked and negotiated), and
+/// only once the element's `start()` is done does it call
+/// `pw_stream_set_active(false)` to hold the stream until `PLAYING`, which
+/// then re-activates it. `start()` runs on the source's streaming thread
+/// *after* it has pushed the negotiated caps downstream, and a caps event is
+/// handled synchronously by every element behind the source. Behind a heavy
+/// chain (here `vapostproc`, the tee and the preview branch's own `vapostproc`
+/// and `videoconvert`: ~1.3 ms, `GST_DEBUG=pipewiresrc:6`) the portal has been
+/// `streaming` that long when the pause arrives, i.e. it has already asked the
+/// compositor for its first frame, and the pause + resume 100 us later makes
+/// stock xdpw (ext-image-copy-capture backend, which creates a frame object on
+/// every `streaming` without checking for an outstanding one) ask for a second
+/// frame: `ext_image_copy_capture_session_v1#N: error 1: session already has a
+/// frame object`, xdpw exits, the node is gone and the share fails.
+/// A queue accepts the caps event and hands it to its own thread, so `start()`
+/// follows the `streaming` state by ~100 us, the pause + resume then land
+/// before the portal has requested anything and xdpw never sees the flap.
+/// Measured with `portal-probe.py` and this exact tail against stock xdpw 0.8.4:
+/// without the queue the stream flaps and xdpw dies, 4/4 runs with it do not
+/// flap and deliver 239 fps. Any element order that makes the caps handling
+/// behind the source cheap would do; a queue is the one that does not depend
+/// on which elements follow.
+///
+/// Costs one thread hop per frame. 2 buffers is enough: the portal pool is 16
+/// ([`PORTAL_MIN_BUFFERS`] only raises the floor) and a full queue just blocks
+/// the source like any slow consumer would.
+fn decoupled_source(source_fragment: &str) -> String {
+    if source_fragment.starts_with("pipewiresrc") {
+        format!("{source_fragment} ! queue name={PORTAL_QUEUE_NAME} max-size-buffers=2 max-size-bytes=0 max-size-time=0")
+    } else {
+        source_fragment.to_string()
+    }
+}
+
 /// [`build_pipeline`] with the orientation stage ([`arm_orientation_stage`])
 /// chosen by the caller, so the tests can run both implementations
 /// ([`ORIENTATION_VAPOSTPROC`] and [`ORIENTATION_VIDEOFLIP`]) on any machine.
 /// System domain only: the GPU domain's `vapostproc` is the orientation stage.
 fn build_pipeline_with_orientation(source_fragment: &str, orientation: &str) -> Result<CapturePipeline> {
+    let source_fragment = decoupled_source(source_fragment);
     let description = format!(
         "{source_fragment} \
          ! videoconvert \
@@ -1629,6 +1674,7 @@ fn build_pipeline_with_orientation(source_fragment: &str, orientation: &str) -> 
 /// shaped like this. The preview branch downloads from the GPU itself
 /// (`vapostproc` to a system-memory BGRx, at 1 fps).
 fn gpu_pipeline_description(source_fragment: &str) -> String {
+    let source_fragment = decoupled_source(source_fragment);
     format!(
         "{source_fragment} \
          ! vapostproc name={GPU_STAGE_NAME} video-direction=auto \
@@ -2249,15 +2295,16 @@ async fn start_capture_with_source(framerate: u32, capture_source: CaptureSource
     // on `vapostproc` negotiating with it. If that fails at start the share
     // must still come up, just slower, instead of failing outright.
     let domain = CaptureDomain::for_source(&capture_source);
-    let built = tokio::task::spawn_blocking(move || match start_pipeline(&source_fragment, domain) {
+    let (built, domain) = tokio::task::spawn_blocking(move || match start_pipeline(&source_fragment, domain) {
         Err(e) if domain == CaptureDomain::Gpu => {
             tracing::warn!("GPU capture path failed to start ({e:#}); falling back to the CPU path");
-            start_pipeline(&source_fragment, CaptureDomain::System)
+            start_pipeline(&source_fragment, CaptureDomain::System).map(|built| (built, CaptureDomain::System))
         }
-        other => other,
+        other => other.map(|built| (built, domain)),
     })
     .await
     .map_err(|e| anyhow!("capture pipeline startup task panicked: {e}"))??;
+    tracing::info!("capture started in the {domain:?} domain");
     let CapturePipeline { pipeline, tee, preview_sink, frame_seen } = built;
 
     // Size for the never-upscale clamp ([`destination::clamp_to_source`]) and
@@ -7987,6 +8034,22 @@ pub mod branch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Task #52: the portal source gets the decoupling queue (see
+    /// [`decoupled_source`]) in both domains' descriptions, and any other
+    /// source is left alone.
+    #[test]
+    fn only_the_portal_source_gets_the_decoupling_queue() {
+        let portal = "pipewiresrc fd=7 path=42 do-timestamp=true";
+        let queued = decoupled_source(portal);
+        assert!(queued.starts_with(portal) && queued.contains(&format!("queue name={PORTAL_QUEUE_NAME}")), "{queued}");
+        assert!(gpu_pipeline_description(portal).contains(&format!("{PORTAL_QUEUE_NAME} max-size-buffers=2 ")));
+        assert_eq!(decoupled_source("videotestsrc is-live=true"), "videotestsrc is-live=true");
+        // The queue must sit directly behind the source, in front of the first real element.
+        let desc = gpu_pipeline_description(portal);
+        let q = desc.find(PORTAL_QUEUE_NAME).unwrap();
+        assert!(q < desc.find("vapostproc").unwrap());
+    }
 
     /// Shared by [`pipeline_elements_link_and_produce_encoded_output`] and
     /// [`vaapi_pipeline_links_and_produces_encoded_output`] (and their H.265/
