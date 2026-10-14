@@ -62,7 +62,6 @@ mod session_model {
             status: ShareStatus::Starting(rx),
             audio_for_capture: None,
             destinations,
-            self_preview_texture: None,
         }
     }
 

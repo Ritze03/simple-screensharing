@@ -1,20 +1,11 @@
-//! Session state and business logic for the desktop client, split out of
-//! `ui.rs` as the first step of the egui -> Tauri UI port (see
-//! `superdoc/ui/APP-SHELL.md`'s in-progress-port note).
+//! Session state and business logic for the desktop client.
 //!
 //! Everything in this module is rendering-agnostic: it owns the room/capture/
 //! destination/bandwidth data model and every state transition (connect,
 //! join, share, watch, fan-out, transfer, per-destination edits, bandwidth
-//! allocation, ...), spawns the same background tasks the egui frontend
-//! always has, and depends on `egui` only for the handful of types
-//! (`egui::TextureHandle`) that already lived on this data before this split
-//! — no *new* egui dependency is introduced here. The egui-specific
-//! rendering functions (`ui_*`, `update_watch_textures`, `show_popouts`,
-//! `update_self_preview_textures`, `eframe::App::update`, ...) stay in
-//! `ui.rs`, calling into [`AppState`]/[`RoomSession`]'s methods here instead
-//! of owning any new logic themselves. This is what lets `src-tauri` depend
-//! on this crate as a library (see `lib.rs`) without pulling in eframe/egui
-//! at all.
+//! allocation, ...) and spawns the background tasks behind them. The egui
+//! shell (`ui/`, in the bin crate) only renders it and calls
+//! [`AppState`]/[`RoomSession`]'s methods instead of owning any logic itself.
 //!
 //! # Session data model (rooms, captures, destinations)
 //!
@@ -70,7 +61,7 @@ use crate::audio::{self, AudioCaptureHandle, AudioSource};
 use crate::bandwidth::{self, AllocInput, Allocation, DestId, DestSpec};
 use crate::capture::{self, CaptureHandle, DestKey};
 use crate::decode::{self, AudioDecoder, PreviewCache, StreamDecoder};
-use crate::net::{ClientEvent, CloseCause, DecryptedMediaFrame, PresenceSnapshotState, ScreenshareClient};
+use crate::net::{ClientEvent, CloseCause, PresenceSnapshotState, ScreenshareClient};
 use crate::protocol::{ConnId, Member, PresenceEvent, StreamId, StreamInfo, StreamKind};
 use crate::rooms::{AppSettings, BandwidthMode, PresentationMode, RoomStore, StartStreamDefaults};
 
@@ -610,19 +601,6 @@ pub struct LocalCapture {
     pub audio_for_capture: Option<CaptureSourceId>,
     /// Rooms this capture is being sent into.
     pub destinations: IndexMap<DestinationId, Destination>,
-    /// Live self-preview texture for this capture (video only), created
-    /// lazily on the first captured frame then updated in place. Populated by
-    /// `ui::App::update_self_preview_textures` from
-    /// `CaptureHandle::self_preview_frame`. See
-    /// `superdoc/features/self-preview.md`.
-    ///
-    /// `Why:` (one texture on the capture, rather than a `HashMap<StreamId, _>`
-    /// on the room) a self-preview shows what *this machine is capturing*,
-    /// which is a property of the capture and identical for every room it's
-    /// sent to. Keying it by `stream_id` — as this did while there was only
-    /// ever one connection — collides the moment two rooms exist, since
-    /// `stream_id` is only unique within one connection.
-    pub self_preview_texture: Option<egui::TextureHandle>,
 }
 
 impl LocalCapture {
@@ -661,24 +639,11 @@ impl LocalCapture {
     }
 }
 
-/// One stream currently being watched: its decoder, plus the texture handle
-/// (created lazily on the first decoded frame, then updated in place).
-///
-/// The decoder is behind an `Arc<Mutex<_>>` rather than owned outright
-/// because, once popped out (see `PopoutState`), it needs to be polled from
-/// inside a `show_viewport_deferred` closure — those closures are `Fn`
-/// (callable repeatedly, possibly from the egui backend's own bookkeeping)
-/// rather than `FnMut`, so any state they mutate has to live behind shared
-/// interior mutability rather than being captured by unique reference. The
-/// same `Arc` is cloned into the popout closure while this struct keeps its
-/// own handle, so `drain_events`' `feed()` calls keep working unchanged
-/// regardless of popped-out state.
+/// One stream currently being watched. The decoder is behind an
+/// `Arc<Mutex<_>>` because the media-ingestion task feeds it from its own task
+/// while the UI thread reads decoded frames from it.
 pub struct WatchEntry {
     pub decoder: Arc<Mutex<StreamDecoder>>,
-    pub texture: Option<egui::TextureHandle>,
-    /// `Some` while this stream is displayed in its own native window instead
-    /// of the central panel.
-    pub popout: Option<PopoutState>,
     /// The stream_id of the same sender's audio stream, if that sender
     /// currently has one announced — the link that makes "watching someone's
     /// video automatically hears their audio" work (see
@@ -692,18 +657,6 @@ pub struct WatchEntry {
     /// `toggle_watch`, meant every viewer who was already watching stayed
     /// permanently silent — see `sync_audio_watches`' doc comment.
     pub audio_stream_id: Option<StreamId>,
-    /// Optional second consumer of every raw `MediaFrame` fed to this watch,
-    /// set (from outside `session.rs`) by the Tauri front-end's
-    /// `commands::toggle_watch` right after this entry is created, so
-    /// `src-tauri/src/video_server.rs`'s H.264 relay can tap the same raw
-    /// access units this entry's `decoder` gets, without `session.rs` (this
-    /// crate's front-end-agnostic library) depending on the `src-tauri`
-    /// binary crate that owns the relay. `None` for the plain egui front-end
-    /// (`ui.rs`), which never sets it and only ever reads through `decoder`.
-    /// A plain `std::sync::mpsc::Sender` (not the `tokio::sync::mpsc` used
-    /// elsewhere in this struct) because the relay's producer thread is a
-    /// plain `std::thread`, not a Tokio task.
-    pub raw_tx: Option<std::sync::mpsc::Sender<DecryptedMediaFrame>>,
 }
 
 /// One audio stream currently being decoded/played, whether auto-subscribed
@@ -785,23 +738,6 @@ pub fn resolve_audio_stream_id(
     if has_audio_watch(stream_id) { Some(stream_id) } else { sibling_audio_stream_in(streams, owner) }
 }
 
-/// State for a `WatchEntry` currently rendered in its own
-/// `show_viewport_deferred` window rather than the central panel.
-pub struct PopoutState {
-    /// The popout window's own texture, decoupled from `WatchEntry::texture`
-    /// so the inline central panel and the popout window can each hold the
-    /// most recent frame decoded at their own repaint cadence without
-    /// stepping on each other. Wrapped for the same `Fn`-closure reason as
-    /// `WatchEntry::decoder`.
-    pub texture: Arc<Mutex<Option<egui::TextureHandle>>>,
-    /// Set from inside the popout's `viewport_ui_cb` when it observes
-    /// `ViewportInfo::close_requested()` (OS close button, Alt+F4, etc.).
-    /// Polled once per main-thread frame in `show_popouts` so the entry can
-    /// be un-popped-out (returned to the central panel) instead of just
-    /// leaking into a window that no longer repaints.
-    pub close_requested: Arc<std::sync::atomic::AtomicBool>,
-}
-
 pub enum Status {
     Idle,
     /// A connect attempt is in flight, or at least one room is waiting to
@@ -826,8 +762,6 @@ pub struct WantedStream {
     pub owner_name: String,
     pub kind: StreamKind,
     pub label: String,
-    /// This was the room's selected (central panel) watch.
-    pub selected: bool,
     /// The viewer's volume for this owner, carried over so a re-watch does not
     /// reset a slider the user had moved.
     pub volume_percent: Option<u32>,
@@ -912,8 +846,6 @@ pub struct RoomSession {
     /// entirely.
     pub watches: Arc<Mutex<HashMap<(ConnId, StreamId), WatchEntry>>>,
     pub watch_error: Option<String>,
-    /// Which watched stream of this room's the central video panel displays.
-    pub selected_watch: Option<(ConnId, StreamId)>,
 
     /// Audio streams we're currently subscribed to and playing, keyed by
     /// (owner conn_id, audio stream_id) — the audio stream's own id, not the
@@ -994,7 +926,6 @@ impl RoomSession {
                     owner_name,
                     kind: info.kind,
                     label: info.label.clone(),
-                    selected: self.selected_watch == Some(key),
                     volume_percent: self.audio_volume_by_owner.get(&key.0).copied(),
                 });
             }
@@ -1008,7 +939,6 @@ impl RoomSession {
                     owner_name,
                     kind: info.kind,
                     label: info.label.clone(),
-                    selected: false,
                     volume_percent: self.audio_volume_by_owner.get(&key.0).copied(),
                 });
             }
@@ -1061,12 +991,7 @@ impl RoomSession {
             self.audio_volume_by_owner.insert(owner, volume);
         }
         match wanted.kind {
-            StreamKind::Video => {
-                self.toggle_watch(owner, stream_id);
-                if wanted.selected {
-                    self.selected_watch = Some((owner, stream_id));
-                }
-            }
+            StreamKind::Video => self.toggle_watch(owner, stream_id),
             // Audio rides along with its owner's video watch
             // (`sync_audio_watches`); only a sender with no video needs an
             // explicit Listen.
@@ -1099,15 +1024,11 @@ impl RoomSession {
                 owner_name,
                 kind: info.kind,
                 label: info.label.clone(),
-                selected: self.selected_watch == Some(key),
                 volume_percent: self.audio_volume_by_owner.get(&owner).copied(),
             })
         };
         if self.watches.lock().unwrap().remove(&key).is_none() {
             return;
-        }
-        if self.selected_watch == Some(key) {
-            self.selected_watch = self.watches.lock().unwrap().keys().min().copied();
         }
         if let Some(wanted) = wanted {
             self.resume_after_stop.push((wanted, now + RESUME_AFTER_STOP));
@@ -1190,8 +1111,7 @@ impl RoomSession {
     }
 
     /// How many *other* people are streaming into this room right now — the
-    /// "N active" sidebar count both `ui.rs`'s egui ROOMS row and the Tauri
-    /// shell's `SavedRoomRow::active_stream_count` show.
+    /// "N active" sidebar count the ROOMS row shows.
     ///
     /// Distinct owners, not stream count: someone sharing two monitors is one
     /// active user. Our own streams are excluded — this counts who *else* is
@@ -1214,8 +1134,7 @@ impl RoomSession {
     /// broadcasts (`except: Some(conn_id)` in the server's `relay.rs`), so a
     /// stream *we* just started never arrives back as a `PresenceEvent` —
     /// nothing would otherwise ever add our own stream to `streams`, and the
-    /// sidebar's `[LIVE]` badge (`renderRoomRow` in `components.js`, driven
-    /// by `liveOwners.has(m.conn_id)`) would never light up for ourselves.
+    /// sidebar's LIVE badge would never light up for ourselves.
     /// The call sites that actually bring a local destination live
     /// (`AppState::poll_pending_destinations`, `AppState::poll_capture_
     /// states`) call this directly, synthesizing exactly the `StreamInfo`
@@ -1406,9 +1325,6 @@ impl RoomSession {
         let key = (owner, stream_id);
         let removed = self.watches.lock().unwrap().remove(&key);
         if removed.is_some() {
-            if self.selected_watch == Some(key) {
-                self.selected_watch = self.watches.lock().unwrap().keys().next().copied();
-            }
             let client = self.client.clone();
             tokio::spawn(async move {
                 if let Err(e) = client.unsubscribe(owner, stream_id).await {
@@ -1430,13 +1346,9 @@ impl RoomSession {
                         key,
                         WatchEntry {
                             decoder: Arc::new(Mutex::new(decoder)),
-                            texture: None,
-                            popout: None,
                             audio_stream_id: None,
-                            raw_tx: None,
                         },
                     );
-                    self.selected_watch = Some(key);
                     self.watch_error = None;
 
                     let client = self.client.clone();
@@ -1891,8 +1803,7 @@ pub fn save_catch_up_speed_percent(percent: u32) {
 /// Persist the "START A STREAM" form's current values. Same load-modify-save
 /// shape as `save_bandwidth_settings`, and for the same reason all five are
 /// written together: they're one coherent form, saved on every change to
-/// that form (`src-tauri/src/commands.rs`'s `set_start_stream_defaults`),
-/// so a mid-edit crash never leaves the persisted defaults half-updated.
+/// that form, so a mid-edit crash never leaves the persisted defaults half-updated.
 pub fn save_start_stream_defaults(
     framerate: u32,
     bitrate_kbps: u32,
@@ -2025,13 +1936,6 @@ pub async fn spawn_media_ingestion_task(
                 // needing to know the frame's `StreamKind` up front.
                 if let Some(entry) = watches.lock().unwrap().get(&key) {
                     entry.decoder.lock().unwrap().feed(&frame);
-                    // Tap the same raw access unit for the Tauri front-end's
-                    // H.264 relay (see `WatchEntry::raw_tx`'s doc comment).
-                    // `None` for the plain egui front-end, which never sets
-                    // it.
-                    if let Some(tx) = &entry.raw_tx {
-                        let _ = tx.send(frame.clone());
-                    }
                 }
                 if let Some(audio_watch) = audio_watches.lock().unwrap().get_mut(&key) {
                     audio_watch.decoder.feed(&frame);
@@ -2102,8 +2006,8 @@ impl AppState {
             // set via a pre-start command" setting as `bitrate_kbps`/
             // `framerate` above (see their own doc comments on `AppState`) —
             // the "START A STREAM" form's Preset/Advanced-tuning controls
-            // (`stream-control.js`) set them via `set_tune`/`set_quality_
-            // level`/`set_rate_control` before calling this.
+            // set them via `set_tune`/`set_quality_level`/`set_rate_control`
+            // before calling this.
             tune: self.tune,
             quality_level: self.quality_level,
             rate_control: self.rate_control,
@@ -2130,7 +2034,6 @@ impl AppState {
                         apply_rx: None,
                     },
                 )]),
-                self_preview_texture: None,
             },
         );
         self.share_error = None;
@@ -2151,9 +2054,8 @@ impl AppState {
     /// pipeline `start_video_share` starts, but with **zero destinations**:
     /// nothing is sent to any room, and no `AnnounceStream` fires, until
     /// [`Self::go_live`] attaches the first one. Returns the new capture's id
-    /// so the caller (a Tauri command) can hand it back to the frontend for
-    /// the staged card's "Go live"/"Cancel" buttons and `list_staged_
-    /// captures` to find it by.
+    /// so the caller can address the staged card's "Go live"/"Cancel"
+    /// buttons with it.
     ///
     /// `Why this can reuse `stop_share` for "Cancel":` a staged capture is
     /// `ShareStatus::Active` with an empty `destinations` map — exactly the
@@ -2171,7 +2073,6 @@ impl AppState {
                 status: ShareStatus::Starting(rx),
                 audio_for_capture: None,
                 destinations: IndexMap::new(),
-                self_preview_texture: None,
             },
         );
         self.share_error = None;
@@ -2190,9 +2091,8 @@ impl AppState {
     /// controls already write via `set_framerate`/`set_bitrate`/`set_tune`/
     /// `set_quality_level`/`set_rate_control` (mirroring `start_video_share`'s
     /// own "applied before the call, not passed as arguments" shape — see
-    /// that method's doc comment). The caller (`stream-control.js`'s
-    /// `saveStartFormDefaults`) persists those same values as the new
-    /// defaults at this exact moment, not while the card is merely staged.
+    /// that method's doc comment). The caller persists those same
+    /// values as the new defaults at this exact moment, not while the card is merely staged.
     ///
     /// Mechanically this *is* [`Self::add_destination`]'s fan-out primitive —
     /// see `capture::start_capture`'s doc comment for why attaching the first
@@ -2615,8 +2515,8 @@ impl AppState {
     /// the capture's/session's defaults.
     ///
     /// `Why this doesn't just do `stop_destination` + `add_destination`
-    /// (which is what the front-end used to do by calling the
-    /// `stop_destination`/`start_destination` commands back to back):` two
+    /// (which is what the removed web front-end did, calling the
+    /// stop/start commands back to back):` two
     /// problems with that pair. First, params: `add_destination` derives a
     /// *new* destination's params from a sibling destination still on the
     /// capture, or the session defaults if there is none — for the common
@@ -2935,7 +2835,6 @@ impl AppState {
                         apply_rx: None,
                     },
                 )]),
-                self_preview_texture: None,
             },
         );
         self.share_error = None;
@@ -3002,8 +2901,8 @@ impl AppState {
     /// instant a dropdown closes (see [`AudioLevelTapId`]'s doc comment for
     /// why none of these are meant to outlive that). Spawned rather than
     /// awaited for the same reason `stop_share_one` below is: the caller
-    /// (a synchronous Tauri command) can't await, and there's no result the
-    /// frontend needs back — the tap is gone from `audio_level_taps`
+    /// (synchronous UI code) can't await, and there's no result the UI needs
+    /// back — the tap is gone from `audio_level_taps`
     /// immediately, so a re-poll after this returns correctly sees nothing.
     pub fn stop_audio_level_tap(&mut self, tap_id: u32) {
         if let Some(handle) = self.audio_level_taps.remove(&AudioLevelTapId(tap_id)) {
@@ -3398,8 +3297,7 @@ impl AppState {
     }
 
     /// Cancel the in-flight connect attempt, if any — the right-click menu's
-    /// "Disconnect" while a room row is showing "Reconnecting…"
-    /// (`shell.js`'s `renderRoomPanel`). Aborts the spawned task outright
+    /// "Disconnect" while a room row is showing "Reconnecting…". Aborts the spawned task outright
     /// rather than waiting for `ScreenshareClient::connect` to notice; see
     /// `PendingConnect::abort`'s doc comment for why that's safe pre-success.
     ///
@@ -3528,7 +3426,6 @@ impl AppState {
                 next_stream_id: 0,
                 watches,
                 watch_error: None,
-                selected_watch: None,
                 audio_watches,
                 preview_cache: PreviewCache::new(),
                 preview_textures: HashMap::new(),
@@ -4357,13 +4254,9 @@ pub fn install_shutdown_signal_handlers(_ctx: egui::Context) {}
 // UI-facing operations
 // ---------------------------------------------------------------------
 //
-// Everything below used to live in the Tauri sidecar's command layer
-// (`src-tauri/src/commands.rs`) or in the JS frontend. It is here so that any
-// UI — the sidecar's thin command wrappers today, the native egui UI
-// tomorrow — stays a thin view over `AppState` and never re-implements
-// business logic. The commands keep only protocol translation (JSON string
-// <-> enum, `u32` handles) and the `tauri::async_runtime::block_on` wrappers
-// their `Why:` notes explain.
+// Everything below used to live in the (removed) Tauri sidecar's command layer
+// or in the JS frontend. It is here so that the UI stays a thin view over
+// `AppState` and never re-implements business logic.
 
 /// A freshly minted room: the local nickname plus the join string (which
 /// contains the room *key* — never log or display it).
@@ -4419,7 +4312,7 @@ pub fn pick_level_tap_serial(sources: Vec<AudioSource>, source_id: u32) -> Resul
 /// `set_state` can still block synchronously for several seconds on a node
 /// PipeWire hasn't fully brought up yet (an idle/suspended stream in
 /// particular). The old code built the *entire* GStreamer pipeline,
-/// including that `set_state` call, while holding the sidecar's `AppState`
+/// including that `set_state` call, while holding the old sidecar's `AppState`
 /// mutex for the whole dropdown-open burst of concurrent taps. One slow/stuck
 /// candidate then held that lock indefinitely, and every other command
 /// needing it — including unrelated taps for perfectly healthy sources and,
@@ -4510,8 +4403,8 @@ impl AppState {
     /// The room *key* is a real AES-256 AEAD secret (`net::ParsedJoinString`,
     /// and `net.rs`'s frame en/decryption), not a display label — it is
     /// generated here, in Rust, with the `rand` crate's default
-    /// (CSPRNG-backed) generator, deliberately not in a JS frontend, where
-    /// there is no equivalent secure-randomness primitive.
+    /// (CSPRNG-backed) generator, deliberately not in a web frontend (as the removed
+    /// JS UI once did), where there is no equivalent secure-randomness primitive.
     ///
     /// `server` and `room_name` are trimmed and must be non-empty.
     pub fn create_room(&mut self, server: &str, room_name: &str) -> Result<JoinLink, String> {
@@ -4634,9 +4527,8 @@ impl AppState {
     /// shows. `None` until the first allocation tick has run for a
     /// destination (Per-Stream mode, or the destination is still starting).
     ///
-    /// The JS frontend showed a toy equal split here (`computeAllocation`,
-    /// `floor`-clamped `total / n`, even against the real backend); the real
-    /// allocator weights by `width*height*fps` and honours floors/ceilings,
+    /// The removed JS frontend showed a toy equal split here (`floor`-clamped
+    /// `total / n`); the real allocator weights by `width*height*fps` and honours floors/ceilings,
     /// so this reads its actual result instead.
     pub fn allocated_kbps(&self, destination_id: DestinationId) -> Option<u32> {
         let id = DestId(destination_id.0);
@@ -4660,8 +4552,7 @@ impl AppState {
     /// default*), so this is a disk read.
     ///
     /// An associated function (no `&self`) because it needs no session
-    /// state, which lets the sidecar's `get_start_stream_defaults` command
-    /// stay lock-free.
+    /// state, so callers need not hold the `AppState`.
     pub fn start_stream_defaults() -> StartStreamDefaults {
         AppSettings::load().start_stream_defaults
     }
@@ -4988,14 +4879,13 @@ pub(crate) mod test_support {
                 status: ShareStatus::Starting(rx),
                 audio_for_capture: None,
                 destinations,
-                self_preview_texture: None,
             },
         );
         (capture_id, destination_id)
     }
 }
 
-/// Tests for the operations moved out of the Tauri sidecar's command layer.
+/// Tests for the UI-facing operations above.
 /// Each needs a real `AppState` (so `#[tokio::test]`: its constructor binds a
 /// QUIC endpoint) pointed at a private config dir, but no network and no
 /// GStreamer.
@@ -5600,7 +5490,7 @@ mod reconnect_tests {
     }
 
     fn wanted(name: &str, kind: StreamKind, label: &str) -> WantedStream {
-        WantedStream { owner_name: name.to_string(), kind, label: label.to_string(), selected: false, volume_percent: None }
+        WantedStream { owner_name: name.to_string(), kind, label: label.to_string(), volume_percent: None }
     }
 
     // ---- policy ----------------------------------------------------------
@@ -6004,7 +5894,6 @@ mod reconnect_e2e {
                     destination_id,
                     Destination { room, stream_id, params, runtime, pending: None, edit: Destination::edit_from(params), apply_rx: None },
                 )]),
-                self_preview_texture: None,
             },
         );
         capture_id
@@ -6143,7 +6032,6 @@ mod reconnect_e2e {
             frames_decoded(s[0], wh, (owner, first_stream)) > 5
         })
         .await;
-        assert_eq!(watcher.rooms[&wh].selected_watch, Some((owner, first_stream)));
 
         // --- the sharer stops: the watch must go, fast ---
         sharer.stop_share(capture_id);
@@ -6157,7 +6045,6 @@ mod reconnect_e2e {
         assert!(took < Duration::from_secs(1), "watch lingered {took:?} after the sharer stopped");
         {
             let room = &watcher.rooms[&wh];
-            assert!(room.selected_watch.is_none(), "the selection must not point at the dead stream");
             assert!(room.streams.iter().all(|s| s.owner != owner), "the roster forgot the stream");
             assert_eq!(room.resume_after_stop.len(), 1, "the stopped watch is remembered for a re-share");
         }
@@ -6178,7 +6065,6 @@ mod reconnect_e2e {
         assert_ne!(second_stream, first_stream);
         let room = &watcher.rooms[&wh];
         assert_eq!(room.watches.lock().unwrap().len(), 1, "exactly one watch: the new stream, no stale one");
-        assert_eq!(room.selected_watch, Some((new_owner, second_stream)));
         assert!(room.resume_after_stop.is_empty());
 
         watcher.shutdown(Duration::from_secs(2)).await;

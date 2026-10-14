@@ -157,17 +157,6 @@ pub(crate) fn server_target_dir() -> PathBuf {
     }
 }
 
-/// Compat shim for `audio.rs`'s `stop_returns_promptly_and_reaps_pw_loopback`
-/// (not owned by this change), which joins `target/{release,debug}/...` onto
-/// each returned root. Returns the parent of [`server_target_dir`], so that
-/// join resolves correctly only while the target dir is literally named
-/// `target`. TODO: switch that test to [`server_binary_path`] and delete this.
-pub(crate) fn server_repo_candidates() -> Result<Vec<PathBuf>> {
-    let target = server_target_dir();
-    let root = target.parent().ok_or_else(|| anyhow!("target dir {target:?} has no parent"))?;
-    Ok(vec![root.to_path_buf()])
-}
-
 /// Locates the built relay binary under [`server_target_dir`]. If both a
 /// release and a debug build exist, the more recently built one wins (avoids
 /// silently testing against a stale binary). Does not build it: a missing
@@ -1182,8 +1171,8 @@ async fn late_subscriber_after_unwatched_period_gets_a_real_keyframe_real_portal
     eprintln!("[e2e-late-real] PASS: late subscriber received a real keyframe within {latency:?}");
 }
 
-/// TEMP DIAGNOSTIC (bug investigation, see `video_server.rs`'s doc comment
-/// on the "no real keyframe reaches a late subscriber" bug): reproduces the
+/// TEMP DIAGNOSTIC (bug investigation, the "no real keyframe reaches a late
+/// subscriber" bug of the removed Electron video relay): reproduces the
 /// exact reported scenario — a sharer broadcasting to an *empty* room (zero
 /// subscribers, encoder unpaused and running the whole time so its periodic
 /// 2s-GOP keyframes are simply going nowhere) for well over one GOP
@@ -1403,29 +1392,18 @@ async fn late_subscriber_after_unwatched_period_gets_a_real_keyframe() {
 /// watching for the first time — the exact sequence the smoke test's one
 /// failing run had.
 ///
-/// `Why this lives at the `capture`/`session`/`net` layer, not
-/// `src-tauri`'s `video_server.rs`:` the two crates' dependency direction
-/// is one-way (`src-tauri` depends on this lib crate, never the reverse —
-/// see `src-tauri/Cargo.toml`), and `capture::start_sharing_from_test_source`
-/// is `#[cfg(test)]`-gated (real portal consent can't be automated) so it
-/// literally does not exist in a normal dependent build — there is no way
-/// for a `src-tauri`-side test to drive a real `BranchSwap` through this
-/// exact seam. `video_server.rs`'s own codec-cache/keyframe-gate logic is
-/// unchanged since its fix (confirmed by `git diff` showing no code change,
-/// only a doc comment, since `97d4f68`/`c9ac1b6`) and already has synthetic
-/// regression coverage for that logic specifically
-/// (`relay_pushes_a_fresh_codec_info_chunk_when_a_branch_swap_changes_profile`,
-/// `a_late_connection_to_an_already_flowing_route_gets_a_keyframe_first`).
-/// What synthetic coverage *can't* exercise is whether the real
-/// `force_keyframe()`/`SubscriberCount` mechanism those `video_server.rs`
-/// guarantees depend on actually delivers a prompt, real keyframe when a
-/// first-ever subscribe follows hard on the heels of three real,
-/// back-to-back `BranchSwap`s — exactly the scenario this test drives, for
-/// real, in a loop.
+/// `Why this lives at the `capture`/`session`/`net` layer:`
+/// `capture::start_sharing_from_test_source` is `#[cfg(test)]`-gated (real
+/// portal consent can't be automated), so only a test inside this crate can
+/// drive a real `BranchSwap` through this exact seam. Synthetic coverage
+/// can't exercise whether the real `force_keyframe()`/`SubscriberCount`
+/// mechanism actually delivers a prompt, real keyframe when a first-ever
+/// subscribe follows hard on the heels of three real, back-to-back
+/// `BranchSwap`s — exactly the scenario this test drives, for real, in a loop.
 ///
 /// Reran 14/14 clean (2 + 12 iterations) at this investigation's tip; the
 /// original 1/2 smoke-test failure was concluded to be residual flakiness
-/// in the real multi-window Electron/portal harness, not a regression in
+/// in the (since removed) multi-window Electron/portal harness, not a regression in
 /// this mechanism (see the 2026-07-28 entry in
 /// `superdoc/features/video-pipeline.md` for the full writeup).
 ///
@@ -1615,16 +1593,13 @@ async fn late_watch_after_all_three_tuning_controls_toggled_gets_a_real_keyframe
 /// pipeline and a real relay connection: a destination is brought up with
 /// non-default `edit_destination`-style tuning (bitrate/tune/quality_level/
 /// rate_control), `AppState::retry_destination` is called on it (the same
-/// path the "Retry" button on a Failed destination card drives via the
-/// `retry_destination` Tauri command), and the resulting *new* destination
+/// path the "Retry" button on a Failed destination card drives), and the resulting *new* destination
 /// must carry the *same* tuning — not the session's defaults. Also proves
 /// the capture itself survives the retry rather than being torn down, which
 /// is what happened before this fix for a capture's *only* destination (see
 /// `AppState::retry_destination`'s `Why:` note for both bugs this closes).
 ///
-/// Drives `AppState` directly (not through `commands.rs`, which needs a live
-/// `tauri::App`) — mirrors how `commands.rs`'s own `_impl`-function tests
-/// exercise `AppState` without one. Bypasses `AppState::start_video_share`
+/// Drives `AppState` directly. Bypasses `AppState::start_video_share`
 /// (which only knows how to start from the real interactive portal) and
 /// instead assembles the capture/destination records by hand around a real
 /// `capture::start_sharing_from_test_source` handle, the same seam the other
@@ -1716,7 +1691,6 @@ async fn retry_destination_preserves_prior_encoder_tuning() {
                     apply_rx: None,
                 },
             )]),
-            self_preview_texture: None,
         },
     );
 
@@ -2157,8 +2131,8 @@ async fn volume_survives_sender_audio_restart_or_switch() {
     eprintln!("[volume-persists] step 2 OK: first audio stream ({AUDIO_STREAM_ID_A}) auto-subscribed");
 
     // --- Step 3: the viewer sets a non-default volume. This is exactly
-    // what both real call sites (Tauri's `commands::set_volume` and egui's
-    // inline slider in `ui.rs`) do: update the live `AudioWatch` AND record
+    // what the real call site (the egui volume slider)
+    // does: update the live `AudioWatch` AND record
     // the owner-scoped standing preference. ---
     {
         let room = viewer.rooms.get_mut(&room_handle).unwrap();
@@ -2338,7 +2312,6 @@ async fn go_live_attaches_the_first_destination_with_real_resolution_and_backend
             status: crate::session::ShareStatus::Active(crate::session::ShareHandle::Video(capture_handle)),
             audio_for_capture: None,
             destinations: indexmap::IndexMap::new(),
-            self_preview_texture: None,
         },
     );
 
@@ -2667,7 +2640,6 @@ async fn start_audio_share_rejects_a_merely_staged_video_capture() {
             status: crate::session::ShareStatus::Starting(rx),
             audio_for_capture: None,
             destinations: indexmap::IndexMap::new(),
-            self_preview_texture: None,
         },
     );
 
@@ -2766,7 +2738,6 @@ async fn start_audio_share_succeeds_once_the_video_capture_is_live() {
                         apply_rx: None,
                     },
                 )]),
-                self_preview_texture: None,
             },
         );
     }
@@ -2873,7 +2844,6 @@ async fn stop_share_tears_down_a_paired_audio_capture_too() {
                     apply_rx: None,
                 },
             )]),
-            self_preview_texture: None,
         },
     );
 
@@ -2898,7 +2868,6 @@ async fn stop_share_tears_down_a_paired_audio_capture_too() {
                     apply_rx: None,
                 },
             )]),
-            self_preview_texture: None,
         },
     );
 
@@ -3108,10 +3077,7 @@ mod session_logic {
             (owner, TEST_STREAM_ID),
             WatchEntry {
                 decoder: Arc::new(Mutex::new(decoder)),
-                texture: None,
-                popout: None,
                 audio_stream_id: None,
-                raw_tx: None,
             },
         );
 
@@ -3222,7 +3188,6 @@ mod session_logic {
                         apply_rx: None,
                     },
                 )]),
-                self_preview_texture: None,
             },
         );
 

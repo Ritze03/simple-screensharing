@@ -15,9 +15,6 @@
 //!   t. ! queue leaky=downstream max-size-buffers=1 ! videorate drop-only=true ! vapostproc
 //!      ! video/x-raw,format=BGRx,framerate=1/1 ! videoconvert ! video/x-raw,format=RGB
 //!      ! appsink name=preview_sink
-//!   t. ! queue leaky=downstream max-size-buffers=1 ! videorate drop-only=true ! vapostproc
-//!      ! video/x-raw,format=BGRx,width=320,height=180,framerate=12/1 ! videoconvert
-//!      ! video/x-raw,format=RGB ! appsink name=self_preview_sink
 //!   (+ one dynamic branch per destination, see below)
 //! ```
 //!
@@ -31,16 +28,13 @@
 //!   t. ! queue leaky=downstream max-size-buffers=1 ! videorate drop-only=true ! video/x-raw,framerate=1/1
 //!      ! videoconvert ! video/x-raw,format=RGB
 //!      ! appsink name=preview_sink
-//!   t. ! queue leaky=downstream max-size-buffers=1 ! videorate drop-only=true ! video/x-raw,framerate=12/1
-//!      ! videoconvert ! video/x-raw,format=RGB
-//!      ! appsink name=self_preview_sink
 //!   (+ one dynamically added branch per destination — see below)
 //! ```
 //!
 //! See [`CaptureDomain`] for why the GPU domain exists (it is what makes
 //! 120-240 fps of *unique* frames possible at all).
 //!
-//! Those two branches are the pipeline's only *fixed* ones. **There is no
+//! That branch is the pipeline's only *fixed* one. **There is no
 //! fixed encoder branch**: every outgoing destination — including the first
 //! — is a dynamic branch added to the same `tee` at runtime by
 //! [`branch::add_branch`]:
@@ -108,33 +102,13 @@
 //! duplicate from) and the encoder's rate control (no frames to converge
 //! quality back down on after a motion burst).
 //!
-//! The `tee` feeds a second, low-rate branch whose RGB8 samples back
+//! The fixed, low-rate `preview_sink` branch's RGB8 samples back
 //! [`preview::spawn_preview_task`] (see [`start_sharing`]) — the
 //! already-implemented periodic thumbnail/preview sender in `preview.rs`,
 //! which itself has zero GStreamer dependency and only samples the latest
 //! frame off whatever [`preview::FrameStream`] it's handed every 30s, so
 //! capping the tee branch to ~1fps here is purely a CPU-saving measure, not
 //! something the preview task requires.
-//!
-//! A *third* tee branch (`self_preview_sink`, [`SELF_PREVIEW_BRANCH_FRAMERATE`])
-//! feeds the sender-side self-preview shown in `ui.rs`'s share panel — a
-//! small live view of what's actually being captured, so the person sharing
-//! can confirm what viewers see without waiting on the (much slower, JPEG-
-//! encoded) 30s thumbnail. It is deliberately its own branch rather than a
-//! second consumer of `preview_sink`'s samples.
-//!
-//! Why: `preview_sink` is capped to ~1fps purely because
-//! [`preview::spawn_preview_task`] only ever samples the latest frame every
-//! 30s — bumping that branch's own `videorate` cap to feed a smooth live
-//! preview would also mean paying for `videoconvert`/appsink work at that
-//! higher rate on every frame the JPEG-thumbnail path *doesn't* need, and
-//! would couple the two features' cadences together for no reason. A
-//! dedicated branch keeps the JPEG-thumbnail path's 1fps and the live
-//! self-preview's [`SELF_PREVIEW_BRANCH_FRAMERATE`] fully independent —
-//! changing one's rate can never accidentally affect the other — at the cost
-//! of one extra `queue`/`videorate`/`videoconvert`/`appsink` chain off the
-//! tee, which is cheap next to the encoder branch. See
-//! `superdoc/features/self-preview.md`.
 //!
 //! Two [`EncoderBackend`]s implement the encoder stage: software `x264enc`
 //! (above) and, preferred when actually usable, VAAPI's `vah264enc` (format
@@ -540,7 +514,7 @@ impl EncoderBackend {
 /// [`EncoderBackend`] — H.265/AV1 require [`EncoderBackend::Vaapi`], since
 /// no software H.265/AV1 encoder is confirmed installed on this machine (no
 /// `x265enc`/`aomenc`/`svtav1enc`/etc. assumed present — see this module's
-/// task brief). Stage 2 (the frontend codec selector) should call
+/// task brief). The UI's codec selector should call
 /// [`supported_codecs`] to grey out unavailable options rather than let a
 /// user pick one that silently falls back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -561,9 +535,8 @@ pub enum VideoCodec {
 const ALL_CODECS: [VideoCodec; 3] = [VideoCodec::H264, VideoCodec::H265, VideoCodec::Av1];
 
 /// Which [`VideoCodec`]s are actually usable on `backend`. The mechanism
-/// Stage 2's frontend codec selector should call (via a `src-tauri` command
-/// wrapping this) to grey out/disable options the current backend can't
-/// produce, rather than letting a user pick one that silently downgrades —
+/// the codec selector should call to grey out/disable options the current
+/// backend can't produce, rather than letting a user pick one that silently downgrades —
 /// see [`EncoderBackend::actual_codec`] for what happens if a mismatched
 /// combination reaches the pipeline anyway (it doesn't error, it silently
 /// downgrades, which is exactly the surprise this function lets a caller
@@ -598,14 +571,12 @@ pub fn supported_codecs(backend: EncoderBackend) -> &'static [VideoCodec] {
 /// backend becomes [`EncoderBackend::Software`]).
 ///
 /// Testing-only knob, like [`QualityLevel`]/[`RateControlMode`]: all three
-/// are live-adjustable per destination via `edit_destination`
-/// (`src-tauri/src/commands.rs`), routed through
+/// are live-adjustable per destination via `edit_destination`, routed through
 /// [`destination::ChangeTier::BranchSwap`] like every other
 /// resolution/fps/backend change.
 ///
-/// `Serialize`/`Deserialize` (snake_case via `rename_all`, matching
-/// `src-tauri/src/dto.rs`'s `parse_tune_mode`/`tune_mode_str` wire strings so
-/// a hand-edited `settings.toml` and the JS layer agree on spelling): needed
+/// `Serialize`/`Deserialize` (snake_case via `rename_all`, so a hand-edited
+/// `settings.toml` and the in-app strings agree on spelling): needed
 /// so `rooms::AppSettings` can persist the "Start a Stream" form's
 /// last-used value the same way it already stores `BandwidthMode`/
 /// `PresentationMode` directly, rather than going through a separate
@@ -677,10 +648,9 @@ pub enum QualityLevel {
 ///
 /// Why the variant keeps the name `Qvbr` rather than being renamed to match:
 /// the wire string `"qvbr"` (via `#[serde(rename_all = "snake_case")]` below)
-/// is both the frontend's `rateControl` value (`frontend/scripts/
-/// stream-control.js`, `components.js`) and the on-disk persisted field in
-/// `AppSettings`/`StartStreamDefaults` (`rooms.rs`) — renaming would touch
-/// ~15 frontend call sites *and* silently break existing users' persisted
+/// is both the old web frontend's `rateControl` value and the on-disk
+/// persisted field in `AppSettings`/`StartStreamDefaults` (`rooms.rs`) —
+/// renaming would touch every call site *and* silently break existing users' persisted
 /// settings files (an unknown enum variant fails that field's
 /// deserialization, not a graceful per-field fallback). That cost was judged
 /// disproportionate to a purely internal/cosmetic rename; the user-visible
@@ -775,8 +745,7 @@ const VBR_CPB_SIZE_DENOMINATOR: u32 = 8;
 /// Media Foundation's `mfvideoenc` (the natural Windows analogue of VAAPI
 /// here) is a deliberate fast-follow, not an oversight — same staging as
 /// VAAPI itself was after software-only worked first on Linux.
-/// `pub`, not `pub(crate)`: `src-tauri`'s `commands::supported_codecs`/
-/// `dto::staged_capture_rows` need this to know which [`VideoCodec`]s
+/// `pub`: the UI needs this to know which [`VideoCodec`]s
 /// [`supported_codecs`] should report for *this* machine's real backend,
 /// not just accept a caller-supplied guess.
 pub fn detect_encoder_backend() -> EncoderBackend {
@@ -898,8 +867,7 @@ pub const DEFAULT_FRAMERATE: u32 = 30;
 /// Hard ceiling on the user-selectable capture framerate. The original
 /// project design's ceiling was 240 ("desktop clients support up to 240Hz
 /// streaming"), later raised to 280 so users can explicitly experiment above
-/// that spec target (`frontend/scripts/stream-control.js`'s framerate
-/// dropdown) — this is *not* the value 67b2c85 capped: that fix was about
+/// that spec target (the framerate dropdown) — this is *not* the value 67b2c85 capped: that fix was about
 /// the encoder branch having no framerate lock at all (raw variable,
 /// content-driven source rate feeding straight into the encoder's
 /// bitrate/frame division), fixed by the `videorate` cap in
@@ -945,8 +913,8 @@ const STATIC_KEEPALIVE_FPS: u32 = 30;
 /// field on them — `f64` can't.
 ///
 /// `Why a per-destination override exists at all` (2026-07-30): the Gaming
-/// preset (`frontend/scripts/components.js`'s `ENCODER_PRESETS`) deliberately
-/// asks for a shorter GOP (`GAMING_GOP_MILLIS` there) for faster recovery
+/// preset (the UI's encoder presets) deliberately
+/// asks for a shorter GOP for faster recovery
 /// from motion artifacts — fast-paced/gaming content rarely holds still long
 /// enough for the 2s self-heal ceiling to matter, and the wait for the *next*
 /// keyframe is far more noticeable during constant motion. Every other
@@ -1174,7 +1142,7 @@ pub fn is_picker_cancelled(e: &anyhow::Error) -> bool {
 ///   produce when the picker is dismissed (Esc, the Cancel button, or the
 ///   picker being SIGTERMed). Measured against the real portal: `Start` itself
 ///   fails, about a second after the dismissal, with exactly this error. The
-///   frontend has already torn the session down by then, so "the session is
+///   UI has already torn the session down by then, so "the session is
 ///   gone" is the portal's only way of saying "nobody is going to be sharing
 ///   anything".
 ///
@@ -1294,67 +1262,6 @@ async fn open_portal_capture() -> Result<PortalCapture> {
 /// the latest frame every 30s, so anything above "occasionally" here is
 /// wasted `videoconvert`/appsink work.
 const PREVIEW_BRANCH_FRAMERATE: u32 = 1;
-
-/// Self-preview branch's framerate cap off the tee (see this module's doc
-/// comment and `superdoc/features/self-preview.md`). Chosen to look smooth
-/// enough for a small "is this really what I'm sharing" live view without
-/// paying anywhere near the encoder branch's CPU/`videoconvert` cost: a
-/// self-preview thumbnail doesn't need to track the full capture framerate
-/// (up to [`MAX_FRAMERATE`]) to be useful, and this is comfortably
-/// above the ~10-15fps a small preview panel needs to read as live rather
-/// than a slideshow.
-const SELF_PREVIEW_BRANCH_FRAMERATE: u32 = 12;
-
-/// Self-preview branch's resolution cap (`videoscale` target, see
-/// [`build_pipeline`]) — fixed at a small 16:9 thumbnail size rather than
-/// the uncapped source resolution this branch ran at before.
-///
-/// `Why this exists — a real, reproduced freeze, not a hypothetical:` before
-/// this cap, the self-preview branch carried the *full* negotiated source
-/// resolution (e.g. 1920x1080) all the way to [`sample_to_color_image`],
-/// which converts it with a plain per-pixel Rust loop, synchronously, on
-/// [`capture_loop`]'s own task — the same task/runtime every destination's
-/// `destination_pump` (and therefore every branch-swap `ApplyParams`
-/// command) shares. At [`SELF_PREVIEW_BRANCH_FRAMERATE`] (12fps) that is up
-/// to 12 multi-megapixel synchronous conversions per second competing for
-/// scheduler time with everything else on the runtime, with no `.await`
-/// point inside the loop to let anything else run.
-///
-/// This is what a live `gdb` backtrace, taken while reproducing the
-/// project owner's "changing FPS/preset sometimes hangs the share" report
-/// (`end_to_end_test::late_watch_after_all_three_tuning_controls_toggled_gets_a_real_keyframe_every_time`,
-/// which was observed stuck for 4+ minutes with zero progress before this
-/// fix), actually caught: the single-threaded runtime's own worker thread
-/// executing inside `sample_to_color_image`'s per-pixel loop
-/// (`core::slice::iter::next` → `sample_to_color_image` →
-/// `capture_loop::{async_fn#0}`) at the exact moment it was supposedly
-/// stuck applying a branch swap. That loop has no `.await` inside it, so
-/// nothing else on the runtime — including the very `ApplyParams` reply the
-/// test/UI was waiting on — gets a turn until one whole conversion (and,
-/// since `capture_loop`'s `select!` immediately re-polls a fast-producing
-/// 12fps stream, often several in a row) finishes. Cutting the resolution
-/// here from ~1080p to this thumbnail size cuts each conversion's pixel
-/// count by roughly two orders of magnitude, which is what actually closes
-/// the starvation window — [`SELF_PREVIEW_BRANCH_FRAMERATE`]'s doc comment
-/// already describes this as "a small preview panel" / thumbnail; the
-/// pipeline just never enforced that before now (`superdoc/features/self-preview.md`'s
-/// own text — "scaled to a fixed preview width" — confirms the *display*
-/// side already assumed a small image, so this loses no real fidelity).
-const SELF_PREVIEW_MAX_WIDTH: u32 = 320;
-/// See [`SELF_PREVIEW_MAX_WIDTH`]. 16:9 companion height — self-preview is a
-/// convenience "is this really what I'm sharing" confirmation, not a
-/// pixel-accurate mirror, so a fixed aspect ratio (mild stretch on a
-/// non-16:9 source) is an acceptable tradeoff against the alternative of
-/// negotiating a source-aspect-preserving size from inside a `gst-launch`
-/// string, which `videoscale` cannot do from caps alone without an
-/// additional letterboxing element this fix doesn't need.
-const SELF_PREVIEW_MAX_HEIGHT: u32 = 180;
-
-/// Element name of the tee's third branch — the live sender-side
-/// self-preview appsink (see this module's doc comment and
-/// [`SELF_PREVIEW_BRANCH_FRAMERATE`]), distinct from `preview_sink`'s
-/// existing JPEG-thumbnail branch.
-const SELF_PREVIEW_SINK_NAME: &str = "self_preview_sink";
 
 /// `max-size-buffers` for each encode branch's `queue leaky=downstream`
 /// right after the tee (see [`branch::add_branch`]'s doc comment for the
@@ -1610,29 +1517,26 @@ fn arm_orientation_stage(pipeline: &gst::Pipeline, stage: &str) -> Result<()> {
     Ok(())
 }
 
-/// Element name of the `tee` every branch — fixed (preview/self-preview) and
+/// Element name of the `tee` every branch — fixed (preview) and
 /// dynamic (one per destination, see [`branch`]) — hangs off.
 const TEE_NAME: &str = "t";
 
 /// Everything [`build_pipeline`] hands back: the pipeline itself plus the
-/// two elements a running capture keeps talking to.
+/// elements a running capture keeps talking to.
 struct CapturePipeline {
     pipeline: gst::Pipeline,
     /// Where every encode branch is added ([`branch::add_branch`]).
     tee: gst::Element,
     /// ~1fps RGB branch feeding [`preview::spawn_preview_task`].
     preview_sink: gst_app::AppSink,
-    /// [`SELF_PREVIEW_BRANCH_FRAMERATE`] RGB branch feeding the sender-side
-    /// self-preview (see [`CaptureHandle::self_preview_frame`]).
-    self_preview_sink: gst_app::AppSink,
     /// Flipped by the first buffer to reach the `tee`; see
     /// [`CaptureHandle::awaiting_first_frame`].
     frame_seen: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Builds and links (but does not start) the capture pipeline described in
-/// this module's doc comment: source → `videoconvert` → `tee`, plus the two
-/// *fixed* preview branches. It builds **no encoder at all** — every encoder
+/// this module's doc comment: source → `videoconvert` → `tee`, plus the one
+/// *fixed* preview branch. It builds **no encoder at all** — every encoder
 /// in this pipeline belongs to a destination and is added dynamically by
 /// [`branch::add_branch`].
 ///
@@ -1716,23 +1620,14 @@ fn build_pipeline_with_orientation(source_fragment: &str, orientation: &str) -> 
             ! video/x-raw,framerate={PREVIEW_BRANCH_FRAMERATE}/1 \
             ! videoconvert \
             ! video/x-raw,format=RGB \
-            ! appsink name=preview_sink emit-signals=false sync=false max-buffers=1 drop=true \
-         {TEE_NAME}. ! queue leaky=downstream max-size-buffers=1 \
-            ! videorate drop-only=true \
-            ! video/x-raw,framerate={SELF_PREVIEW_BRANCH_FRAMERATE}/1 \
-            ! videoscale \
-            ! video/x-raw,width={SELF_PREVIEW_MAX_WIDTH},height={SELF_PREVIEW_MAX_HEIGHT} \
-            ! videoconvert \
-            ! video/x-raw,format=RGB \
-            ! appsink name={SELF_PREVIEW_SINK_NAME} emit-signals=false sync=false max-buffers=1 drop=true"
+            ! appsink name=preview_sink emit-signals=false sync=false max-buffers=1 drop=true"
     );
     build_pipeline_from_description(&description, CaptureDomain::System, orientation)
 }
 
 /// The [`CaptureDomain::Gpu`] description: see [`CaptureDomain`] for why it is
-/// shaped like this. The two preview branches download from the GPU
-/// themselves (`vapostproc` to a system-memory BGRx, at 1 and 12 fps), and
-/// the self-preview scales on the GPU before the download.
+/// shaped like this. The preview branch downloads from the GPU itself
+/// (`vapostproc` to a system-memory BGRx, at 1 fps).
 fn gpu_pipeline_description(source_fragment: &str) -> String {
     format!(
         "{source_fragment} \
@@ -1745,14 +1640,7 @@ fn gpu_pipeline_description(source_fragment: &str) -> String {
             ! video/x-raw,format={SOURCE_RAW_FORMAT},framerate={PREVIEW_BRANCH_FRAMERATE}/1 \
             ! videoconvert \
             ! video/x-raw,format=RGB \
-            ! appsink name=preview_sink emit-signals=false sync=false max-buffers=1 drop=true \
-         {TEE_NAME}. ! queue leaky=downstream max-size-buffers=1 \
-            ! videorate drop-only=true \
-            ! vapostproc \
-            ! video/x-raw,format={SOURCE_RAW_FORMAT},width={SELF_PREVIEW_MAX_WIDTH},height={SELF_PREVIEW_MAX_HEIGHT},framerate={SELF_PREVIEW_BRANCH_FRAMERATE}/1 \
-            ! videoconvert \
-            ! video/x-raw,format=RGB \
-            ! appsink name={SELF_PREVIEW_SINK_NAME} emit-signals=false sync=false max-buffers=1 drop=true"
+            ! appsink name=preview_sink emit-signals=false sync=false max-buffers=1 drop=true"
     )
 }
 
@@ -1768,12 +1656,6 @@ fn build_pipeline_from_description(description: &str, domain: CaptureDomain, ori
         .ok_or_else(|| anyhow!("pipeline has no element named 'preview_sink'"))?
         .downcast::<gst_app::AppSink>()
         .map_err(|_| anyhow!("'preview_sink' element is not an AppSink"))?;
-
-    let self_preview_sink = pipeline
-        .by_name(SELF_PREVIEW_SINK_NAME)
-        .ok_or_else(|| anyhow!("pipeline has no element named '{SELF_PREVIEW_SINK_NAME}'"))?
-        .downcast::<gst_app::AppSink>()
-        .map_err(|_| anyhow!("'{SELF_PREVIEW_SINK_NAME}' element is not an AppSink"))?;
 
     let tee = pipeline
         .by_name(TEE_NAME)
@@ -1796,7 +1678,7 @@ fn build_pipeline_from_description(description: &str, domain: CaptureDomain, ori
         });
     }
 
-    Ok(CapturePipeline { pipeline, tee, preview_sink, self_preview_sink, frame_seen })
+    Ok(CapturePipeline { pipeline, tee, preview_sink, frame_seen })
 }
 
 /// Stops a branch being added to the live `tee` from asking everything
@@ -1862,13 +1744,17 @@ fn isolate_source_from_branch_renegotiation(tee: &gst::Element, domain: CaptureD
     .ok_or_else(|| anyhow!("failed to install the renegotiation guard on tee '{TEE_NAME}'"))?;
 
     // Same idea for the CAPS *query*: the tee answers it with the union of its
-    // branches' preferences, and one of them (self-preview) is a fixed
-    // 320x180. A source-side element that can scale (`vapostproc`, see
+    // branches' preferences, and any one of them may be a fixed size (a
+    // destination's encode size, the room-preview branch's vapostproc). A
+    // source-side element that can scale (`vapostproc`, see
     // [`orientation_fragment`]) takes such an answer as an instruction and
-    // shrinks the whole capture to 320x180 before it reaches any encoder.
-    // `videoconvert`/`videoflip` never scale, which is why nothing needed this
-    // before. Answering "anything in the pinned format" keeps every branch's
-    // wishes where they belong, inside the branch.
+    // shrinks the whole capture to that size before it reaches any other
+    // branch. This is not hypothetical: the old 320x180 self-preview branch
+    // (now removed) leaked its size upstream exactly like this. `videoconvert`/
+    // `videoflip` never scale, which is why nothing needed this before.
+    // Answering "anything in the pinned format" keeps every branch's wishes
+    // where they belong, inside the branch. Keep it even though that branch
+    // is gone: both capture domains still rely on it.
     sink.add_probe(gst::PadProbeType::QUERY_DOWNSTREAM, move |_, info| {
         if let Some(gst::PadProbeData::Query(query)) = &mut info.data
             && let gst::QueryViewMut::Caps(q) = query.view_mut()
@@ -1911,7 +1797,7 @@ fn isolate_source_from_branch_renegotiation(tee: &gst::Element, domain: CaptureD
 /// code:` [`Element::state`]'s blocking wait below takes a `ClockTime`
 /// timeout argument, but that timeout is **not reliable** under real-world
 /// contention — measured directly while diagnosing the "repeated Stop→Share
-/// restart cycles permanently wedge the backend" bug (see
+/// restart cycles permanently wedge the backend" bug (history:
 /// `superdoc/ui/FRONTEND-SHELL.md`'s dated entry): starting a new capture
 /// immediately after the previous one's portal session/pipeline finished
 /// tearing down can leave `pipewiresrc`'s state change stuck deep inside
@@ -1924,7 +1810,7 @@ fn isolate_source_from_branch_renegotiation(tee: &gst::Element, domain: CaptureD
 /// never return must never run on one of the Tokio runtime's own (small,
 /// fixed-size) worker threads, or enough repeated stalls permanently starve
 /// every other task sharing that pool, including `driver.rs`'s poll loop and
-/// every other `#[tauri::command]`'s `block_on` continuation — which is
+/// every other task that `block_on`s into the runtime — which is
 /// exactly the "every subsequent command silently never resolves" symptom
 /// reported. Moving the block onto `spawn_blocking`'s separate, elastic
 /// thread pool doesn't fix GStreamer's own timeout unreliability, but it
@@ -2080,8 +1966,8 @@ pub struct CaptureHandle {
     /// Where every destination's encode branch is added/removed.
     tee: gst::Element,
     capture_source: CaptureSource,
-    /// Bus + self-preview pump (see [`capture_loop`]). Per capture, not per
-    /// destination: neither of those two things is destination-scoped.
+    /// Bus watcher (see [`capture_loop`]). Per capture, not per
+    /// destination: the bus is not destination-scoped.
     capture_task: tokio::task::JoinHandle<()>,
     // `Option` (rather than a bare `PreviewHandle`) solely so `stop` can
     // `.take()` it out of `&mut self` to call `PreviewHandle::stop(self)`,
@@ -2096,13 +1982,6 @@ pub struct CaptureHandle {
     /// reconnect hands the capture a *new* client) and move the preview task
     /// over to it.
     preview_client: Option<ScreenshareClient>,
-    // Latest frame off the self-preview tee branch (see
-    // [`SELF_PREVIEW_BRANCH_FRAMERATE`]), written by [`capture_loop`] and read
-    // back (and cleared) via [`CaptureHandle::self_preview_frame`] — the same
-    // "last-value slot behind a `Mutex`" shape `decode.rs`'s
-    // `StreamDecoder::latest_frame` uses for the equivalent viewer-side
-    // texture-upload pattern in `ui.rs`.
-    self_preview_frame: Arc<Mutex<Option<egui::ColorImage>>>,
     /// What this capture is considered to be producing, as the input to
     /// [`destination::classify_change`]/[`destination::clamp_to_source`]. The
     /// size half is GStreamer's real negotiated frame size, cached on first
@@ -2334,7 +2213,7 @@ async fn start_sharing_with_source(
 /// Shared body of [`start_capture`] and [`start_sharing_with_source`]:
 /// everything from "a [`CaptureSource`] has been acquired" onward that does
 /// **not** depend on any destination — building and starting the pipeline,
-/// and wiring up the capture-level bus/self-preview pump. Returns a
+/// and wiring up the capture-level bus watcher. Returns a
 /// [`CaptureHandle`] with an empty `destinations` list; the tee's low-rate
 /// preview branch is held (unconsumed — see [`CaptureHandle::preview_sink`])
 /// rather than wired to a room, since which room gets the periodic thumbnail
@@ -2379,7 +2258,7 @@ async fn start_capture_with_source(framerate: u32, capture_source: CaptureSource
     })
     .await
     .map_err(|e| anyhow!("capture pipeline startup task panicked: {e}"))??;
-    let CapturePipeline { pipeline, tee, preview_sink, self_preview_sink, frame_seen } = built;
+    let CapturePipeline { pipeline, tee, preview_sink, frame_seen } = built;
 
     // Size for the never-upscale clamp ([`destination::clamp_to_source`]) and
     // for whatever destination is added first: read off the tee's negotiated
@@ -2389,15 +2268,11 @@ async fn start_capture_with_source(framerate: u32, capture_source: CaptureSource
     let (width, height) = negotiated_size(&tee).unwrap_or((0, 0));
     let source = destination::SourceCaps { width: width as u32, height: height as u32, framerate };
 
-    let self_preview_frame: Arc<Mutex<Option<egui::ColorImage>>> = Arc::new(Mutex::new(None));
     let bus = match pipeline.bus() {
         Some(bus) => bus,
         None => return Err(abandon_capture(pipeline, capture_source, anyhow!("pipeline has no bus")).await),
     };
-    let capture_task = tokio::spawn(capture_loop(
-        bus.stream(),
-        SelfPreviewBridge { stream: self_preview_sink.stream(), frame: self_preview_frame.clone() },
-    ));
+    let capture_task = tokio::spawn(capture_loop(bus.stream()));
 
     Ok(CaptureHandle {
         frame_seen,
@@ -2408,7 +2283,6 @@ async fn start_capture_with_source(framerate: u32, capture_source: CaptureSource
         preview_handle: None,
         preview_client: None,
         preview_sink: Some(preview_sink),
-        self_preview_frame,
         source_state: Mutex::new(source),
         destinations: Vec::new(),
     })
@@ -2595,47 +2469,6 @@ fn sample_to_raw_frame(sample: &gst::Sample) -> Result<RawFrame> {
         height: height as u32,
         rgb: packed,
     })
-}
-
-/// Converts one `self_preview_sink` RGB8 sample (see this module's doc
-/// comment) into an `egui::ColorImage`, for [`CaptureHandle::self_preview_frame`]
-/// to hand `ui.rs`. Stride-corrects via [`gst_video::VideoFrameRef`] exactly
-/// like [`sample_to_raw_frame`] does for the JPEG-thumbnail branch, then
-/// widens tightly-packed RGB rows to RGBA (alpha opaque) since
-/// `egui::ColorImage::from_rgba_unmultiplied` — the same constructor
-/// `decode.rs`'s `pull_color_image` uses for the viewer-side decoded frame —
-/// expects 4 bytes/pixel, while this branch's negotiated caps are RGB8 (3
-/// bytes/pixel, cheaper for `videoconvert` to produce off the tee than
-/// negotiating RGBA all the way through).
-fn sample_to_color_image(sample: &gst::Sample) -> Result<egui::ColorImage> {
-    let buffer = sample.buffer().ok_or_else(|| anyhow!("self-preview sample had no buffer"))?;
-    let caps = sample.caps().ok_or_else(|| anyhow!("self-preview sample had no caps"))?;
-    let info = gst_video::VideoInfo::from_caps(caps).context("failed to parse self-preview capture caps")?;
-
-    let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info)
-        .map_err(|_| anyhow!("failed to map self-preview capture buffer readable"))?;
-
-    let width = frame.width() as usize;
-    let height = frame.height() as usize;
-    let stride = frame.plane_stride()[0] as usize;
-    let plane = frame
-        .plane_data(0)
-        .map_err(|_| anyhow!("self-preview capture frame had no plane 0 data"))?;
-
-    let row_bytes = width * 3;
-    let mut rgba = Vec::with_capacity(width * height * 4);
-    for row in 0..height {
-        let start = row * stride;
-        let end = start + row_bytes;
-        let Some(row_slice) = plane.get(start..end) else {
-            anyhow::bail!("self-preview capture frame plane shorter than expected (stride/height mismatch)");
-        };
-        for pixel in row_slice.chunks_exact(3) {
-            rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 0xFF]);
-        }
-    }
-
-    Ok(egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba))
 }
 
 /// Negotiated frame size on `element`'s sink pad. Used against the `tee` to
@@ -3058,15 +2891,6 @@ impl CaptureHandle {
         }
     }
 
-    /// Non-blocking poll for the most recently captured self-preview frame
-    /// (see [`SELF_PREVIEW_BRANCH_FRAMERATE`] and
-    /// `superdoc/features/self-preview.md`) — `None` if nothing new has
-    /// arrived since the last call. Mirrors `decode.rs`'s
-    /// `StreamDecoder::latest_frame`'s take-and-clear shape.
-    pub fn self_preview_frame(&self) -> Option<egui::ColorImage> {
-        self.self_preview_frame.lock().unwrap().take()
-    }
-
     /// Tier-3 entry point, first half: the shared capture source is going
     /// down or changing, so **every** destination fed by it stalls at the same
     /// instant — no `StopStream`, no teardown, just the cached-IDR keepalive
@@ -3099,16 +2923,6 @@ impl CaptureHandle {
 // ---------------------------------------------------------------------
 // Encode → encrypt → fragment → send pump
 // ---------------------------------------------------------------------
-
-/// The self-preview branch's appsink stream plus the frame slot it feeds
-/// (see [`SELF_PREVIEW_BRANCH_FRAMERATE`]), bundled into a single
-/// [`pump_loop`] parameter rather than two — the pieces are always
-/// constructed and consumed together, and this keeps `pump_loop`'s argument
-/// count from growing by two instead of one.
-struct SelfPreviewBridge {
-    stream: gst_app::app_sink::AppSinkStream,
-    frame: Arc<Mutex<Option<egui::ColorImage>>>,
-}
 
 /// Sends a `gst_video::UpstreamForceKeyUnitEvent` into the pipeline from
 /// `encoder_sink_pad` (the encoded-output appsink's sink pad — see
@@ -3236,41 +3050,19 @@ enum DestCmd {
     Stop { reply: tokio::sync::oneshot::Sender<Result<(), String>> },
 }
 
-/// Per-**capture** background loop: watches the pipeline bus for error/EOS
-/// and bridges the self-preview branch's raw-RGB samples into their frame
-/// slot (see [`sample_to_color_image`], [`SelfPreviewBridge`], and
-/// [`CaptureHandle::self_preview_frame`]).
+/// Per-**capture** background loop: watches the pipeline bus for error/EOS.
 ///
 /// Deliberately holds nothing destination-scoped: with fan-out there are N
-/// destinations per capture but still exactly one bus and one self-preview
-/// branch, so this loop exists once per capture and every send/encode
-/// concern lives in [`destination_pump`] instead.
-async fn capture_loop(mut bus_stream: gst::bus::BusStream, mut self_preview: SelfPreviewBridge) {
+/// destinations per capture but still exactly one bus, so this loop exists
+/// once per capture and every send/encode concern lives in
+/// [`destination_pump`] instead.
+async fn capture_loop(mut bus_stream: gst::bus::BusStream) {
     let mut bus_done = false;
-    // Gates loop exit alongside `bus_done` so a self-preview branch that
-    // never reaches EOS for any reason can't hang `CaptureHandle::stop`.
-    let mut self_preview_done = false;
 
-    loop {
-        if bus_done && self_preview_done {
-            return;
-        }
-        tokio::select! {
-            msg = bus_stream.next(), if !bus_done => {
-                match msg {
-                    Some(msg) => handle_bus_message(&msg, &mut bus_done),
-                    None => bus_done = true,
-                }
-            }
-            sample = self_preview.stream.next(), if !self_preview_done => {
-                match sample {
-                    Some(sample) => match sample_to_color_image(&sample) {
-                        Ok(image) => *self_preview.frame.lock().unwrap() = Some(image),
-                        Err(e) => tracing::warn!("dropping malformed self-preview frame: {e:#}"),
-                    },
-                    None => self_preview_done = true,
-                }
-            }
+    while !bus_done {
+        match bus_stream.next().await {
+            Some(msg) => handle_bus_message(&msg, &mut bus_done),
+            None => bus_done = true,
         }
     }
 }
@@ -5376,8 +5168,8 @@ pub mod branch {
     /// per-destination VAAPI-vs-software choice, expected in a later stage
     /// per the plan doc) — without its own `videoconvert`, a branch
     /// requesting a format the tee isn't already carrying would simply fail
-    /// to negotiate. The existing preview/self-preview branches already
-    /// establish this exact pattern for the same reason (they need RGB, not
+    /// to negotiate. The existing preview branch already
+    /// establishes this exact pattern for the same reason (it needs RGB, not
     /// whatever the tee happens to carry) — this branch follows it too,
     /// rather than assuming its [`EncodeSettings::backend`] always happens
     /// to match whichever branch won the tee's format negotiation first.
@@ -5422,10 +5214,9 @@ pub mod branch {
         // media type name differs. `vaav1enc` is fundamentally different:
         // AV1 has no Annex-B start-code framing at all, so its caps are
         // `stream-format=obu-stream,alignment=tu` (raw OBUs, one temporal
-        // unit per buffer) — `video_server.rs`'s codec-string derivation
-        // relies on exactly this Annex-B-vs-OBU-stream distinction to tell
-        // an AV1 access unit apart from an H.264/H.265 one with no other
-        // hint (see that module's `detect_codec_and_derive_string`).
+        // unit per buffer) — `decode/codec.rs` relies on exactly this
+        // Annex-B-vs-OBU-stream distinction to tell an AV1 access unit apart
+        // from an H.264/H.265 one with no other hint.
         let output_caps = match actual_codec {
             VideoCodec::H264 => "video/x-h264,stream-format=byte-stream,alignment=au",
             VideoCodec::H265 => "video/x-h265,stream-format=byte-stream,alignment=au",
@@ -5988,7 +5779,7 @@ pub mod branch {
         //
         // So the blast radius is not "this one branch" and not "the next
         // branch to be added": it is the entire capture. Every fixed branch
-        // (the real encoder, the preview, the self-preview) dies with it,
+        // (the real encoder, the preview) dies with it,
         // and every future `request_pad_simple` hands back a pad that is
         // already EOS-flagged, silently black-holing that branch's data with
         // no error ever posted to the bus. Measured directly, not inferred:
@@ -6467,12 +6258,10 @@ pub mod branch {
                 assert!((15.0..=36.0).contains(&fps), "a 30 fps cap on a 120 fps GPU tee produced {fps:.1} fps");
             }
 
-            for (name, sink) in [("preview", &built.preview_sink), ("self-preview", &built.self_preview_sink)] {
-                assert!(
-                    wait_for_sample(sink, Duration::from_secs(10)),
-                    "the {name} branch produced nothing on the GPU tee"
-                );
-            }
+            assert!(
+                wait_for_sample(&built.preview_sink, Duration::from_secs(10)),
+                "the preview branch produced nothing on the GPU tee"
+            );
 
             // Removing a branch from the live GPU tee leaves the siblings running.
             let removed = branches.remove(0);
@@ -8712,71 +8501,6 @@ mod tests {
         );
     }
 
-    /// Regression test for the real root cause behind the reported
-    /// "changing FPS/preset sometimes hangs the screenshare, worse with a
-    /// bigger Hz jump, presets look almost random" bug.
-    ///
-    /// It was never the branch-swap machinery itself (extensive real-hardware
-    /// stress testing — hundreds of swaps across the full framerate/preset
-    /// matrix, both encoder backends, cold and minutes-warm branches — never
-    /// reproduced a hang there). The actual cause, caught with a live `gdb`
-    /// backtrace while reproducing
-    /// `end_to_end_test::late_watch_after_all_three_tuning_controls_toggled_gets_a_real_keyframe_every_time`
-    /// (which was stuck 4+ minutes with zero progress before this fix): the
-    /// self-preview tee branch ([`SELF_PREVIEW_SINK_NAME`]) carried the
-    /// *full* negotiated source resolution — `superdoc/features/self-preview.md`
-    /// and [`SELF_PREVIEW_BRANCH_FRAMERATE`]'s own doc comment call it "a
-    /// small preview panel"/thumbnail, but the pipeline never actually
-    /// enforced that. [`sample_to_color_image`] converts each sample with a
-    /// plain per-pixel Rust loop, synchronously, on [`capture_loop`]'s own
-    /// task — the same task/runtime every destination's `destination_pump`
-    /// (and therefore every branch-swap `ApplyParams` reply) shares. At
-    /// [`SELF_PREVIEW_BRANCH_FRAMERATE`] (12fps), a full ~1080p source meant
-    /// up to 12 multi-megapixel synchronous conversions per second — with no
-    /// `.await` inside the loop to let anything else on the runtime run —
-    /// which is what actually starved the destination pump's command
-    /// processing for minutes at a time.
-    ///
-    /// This test is deliberately NOT a timing-based hang detector (those are
-    /// exactly the kind of flaky-under-load test this bug already made hard
-    /// to reproduce reliably even at the true root cause) — it just asserts
-    /// the actual fix stuck: the self-preview branch's negotiated caps must
-    /// never exceed [`SELF_PREVIEW_MAX_WIDTH`]/[`SELF_PREVIEW_MAX_HEIGHT`],
-    /// regardless of how large the real source is.
-    #[test]
-    fn self_preview_branch_is_capped_to_a_small_thumbnail_regardless_of_source_size() {
-        if gst::init().is_err() {
-            eprintln!("skipping: gstreamer not available in this environment");
-            return;
-        }
-
-        // Deliberately much larger than the cap in both dimensions, so a
-        // regression (the cap silently not applying) can't hide behind a
-        // source that already happened to be small.
-        let source = "videotestsrc is-live=true pattern=smpte \
-             ! video/x-raw,width=1920,height=1080,framerate=30/1";
-        let built = build_pipeline(source).expect("pipeline should construct");
-        built.pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
-
-        let sample = built
-            .self_preview_sink
-            .try_pull_sample(gst::ClockTime::from_seconds(5))
-            .expect("self-preview branch should produce at least one sample");
-        let caps = sample.caps().expect("self-preview sample should carry caps");
-        let s = caps.structure(0).expect("self-preview caps should have a structure");
-        let width: i32 = s.get("width").expect("self-preview caps should carry a width");
-        let height: i32 = s.get("height").expect("self-preview caps should carry a height");
-
-        built.pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
-
-        assert!(
-            width as u32 <= SELF_PREVIEW_MAX_WIDTH && height as u32 <= SELF_PREVIEW_MAX_HEIGHT,
-            "self-preview branch produced a {width}x{height} frame from a 1920x1080 source — it must be \
-             capped to at most {SELF_PREVIEW_MAX_WIDTH}x{SELF_PREVIEW_MAX_HEIGHT}; an uncapped self-preview \
-             branch is the actual root cause of the reported branch-swap hang (see this test's doc comment)"
-        );
-    }
-
     /// **Regression (leak on a failed share):** abandoning a capture that
     /// never became a [`CaptureHandle`] must actually stop its pipeline.
     ///
@@ -9163,8 +8887,7 @@ mod tests {
             backend: detect_encoder_backend(),
             tune: TuneMode::LowLatency,
             quality_level: QualityLevel::Performance,
-            // Low-Latency wants predictable, non-quality-seeking behavior —
-            // see `components.js`'s `ENCODER_PRESETS`.
+            // Low-Latency wants predictable, non-quality-seeking behavior.
             rate_control: RateControlMode::Cqp,
             gop_millis: DEFAULT_GOP_MILLIS,
             codec: VideoCodec::default(),
