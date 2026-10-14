@@ -1,0 +1,99 @@
+#!/bin/sh
+# AppRun for the simple-screensharing AppImage. See client/packaging/README.md.
+#
+# What it does, in order:
+#   1. points GStreamer at the plugins bundled in this AppImage and *only* those
+#      (host plugins are built against the host's GStreamer core, which is not
+#      the bundled one; mixing them is a crash lottery),
+#   2. keeps GStreamer's plugin registry out of the host's own cache file,
+#   3. tells the user (stderr, non-fatal) which host pieces are missing or too old,
+#   4. execs the client.
+# Shared libraries are found through the RPATH linuxdeploy writes into the
+# binaries and the bundled libs ($ORIGIN-relative); LD_LIBRARY_PATH is NOT used,
+# so host tools the client spawns (pw-loopback, pw-link, pw-dump) never pick up
+# bundled libs.
+HERE="$(dirname "$(readlink -f "$0")")"
+APPDIR="${APPDIR:-$HERE}"
+export APPDIR
+
+# --- 1. GStreamer: bundled plugins only ------------------------------------
+# A developer's own GST_* settings must not leak in and defeat the bundle.
+unset GST_PLUGIN_PATH GST_PLUGIN_PATH_1_0 GST_PLUGIN_SYSTEM_PATH
+export GST_PLUGIN_SYSTEM_PATH_1_0="$HERE/usr/lib/gstreamer-1.0"
+export GST_PLUGIN_SCANNER_1_0="$HERE/usr/libexec/gstreamer-1.0/gst-plugin-scanner"
+# Viewer-side audio playback is `autoaudiosink`: it picks pulsesink (bundled, talks to
+# pipewire-pulse or PulseAudio, the path the client is tested with). Fallback for a
+# PipeWire host without a pulse server: rank the native pipewiresink (upstream rank
+# NONE) just below pulsesink (266) so autoaudiosink can fall through to it.
+export GST_PLUGIN_FEATURE_RANK="pipewiresink:260${GST_PLUGIN_FEATURE_RANK:+,$GST_PLUGIN_FEATURE_RANK}"
+# Load no GIO modules from the host: they are built against the host's glib.
+export GIO_MODULE_DIR="$HERE/usr/lib/gio/modules"
+
+# --- 2. Own registry cache ---------------------------------------------------
+# The default is ~/.cache/gstreamer-1.0/registry.*.bin, shared with every
+# GStreamer app on the host; writing our (differently-pathed) plugin set there
+# would make them rescan and vice versa.
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/simple-screensharing"
+if mkdir -p "$CACHE_DIR" 2>/dev/null; then
+    export GST_REGISTRY_1_0="$CACHE_DIR/gst-registry-appimage.bin"
+else
+    export GST_REGISTRY_1_0="${XDG_RUNTIME_DIR:-/tmp}/simple-screensharing-gst-registry.bin"
+fi
+
+# --- 3. Host requirements: warn, never block ---------------------------------
+# Bundled: GStreamer + plugins, codecs, glib, libpulse. NOT bundled (must come from
+# the host; see README.md for why): GPU/VA drivers + libva, Vulkan loader + ICDs,
+# Mesa/libdrm, Wayland/X11 libs, PipeWire (daemon, client lib, pw-* tools),
+# xdg-desktop-portal, libstdc++.
+warn() { echo "simple-screensharing: $*" >&2; }
+ldc="$(command -v ldconfig 2>/dev/null || echo /sbin/ldconfig)"
+have_lib() { "$ldc" -p 2>/dev/null | grep -q "[[:space:]]$1[[:space:]]"; }
+# The numeric part of the host library's file name: libpipewire-0.3.so.0.1402.0 -> 1402
+# (PipeWire 1.4.2), libva.so.2.2200.0 -> 2200 (libva 2.22).
+lib_ver() {
+    p="$("$ldc" -p 2>/dev/null | awk -v l="$1" '$1 == l { print $NF; exit }')"
+    [ -n "$p" ] || return 1
+    f="$(basename "$(readlink -f "$p")")"
+    echo "${f#*.so.*.}" | cut -d. -f1
+}
+# The bundled libgstpipewire / libgstva were built against PipeWire 1.4 / libva 2.22;
+# on an older host they fail to load (undefined symbols): capture / VA would be gone.
+if [ -z "$SSS_NO_HOST_CHECK" ]; then
+    for tool in pw-loopback pw-link pw-dump; do
+        command -v "$tool" >/dev/null 2>&1 || {
+            warn "'$tool' not found: per-app audio capture needs the PipeWire tools" \
+                 "(Debian/Ubuntu: pipewire-bin, Fedora: pipewire-utils, Arch: pipewire)."
+            break
+        }
+    done
+    if have_lib libpipewire-0.3.so.0; then
+        v="$(lib_ver libpipewire-0.3.so.0)"
+        [ "${v:-9999}" -ge 1400 ] 2>/dev/null || \
+            warn "this system's PipeWire is older than 1.4 (libpipewire file version $v): screen and audio" \
+                 "capture will not work. Update PipeWire or use a newer distro release (Ubuntu 25.10+, Fedora 42+, Debian 13+)."
+    else
+        warn "libpipewire-0.3.so.0 not found: screen/audio capture needs PipeWire (install pipewire)."
+    fi
+    if [ -n "$XDG_RUNTIME_DIR" ]; then
+        [ -S "$XDG_RUNTIME_DIR/pipewire-0" ] || \
+            warn "no PipeWire daemon socket ($XDG_RUNTIME_DIR/pipewire-0): screen and audio capture need a running" \
+                 "PipeWire (plus xdg-desktop-portal and a portal backend for your desktop)."
+    else
+        warn "XDG_RUNTIME_DIR is not set: the portal and PipeWire sockets cannot be found (start the app from a desktop session)."
+    fi
+    have_lib libvulkan.so.1 || \
+        warn "libvulkan.so.1 not found: the renderer needs a Vulkan loader and GPU driver" \
+             "(vulkan-icd-loader / libvulkan1 + mesa-vulkan-drivers)."
+    if have_lib libva.so.2 && have_lib libva-drm.so.2; then
+        v="$(lib_ver libva.so.2)"
+        [ "${v:-9999}" -ge 2200 ] 2>/dev/null || \
+            warn "this system's libva is older than 2.22 (file version $v): hardware video encode/decode will not" \
+                 "load, the client falls back to software. Update libva or use a newer distro release."
+    else
+        warn "libva not found: hardware video encode/decode is disabled, falling back to software" \
+             "(install libva / libva2 and your GPU's VA driver: mesa-va-drivers, intel-media-driver)."
+    fi
+fi
+
+# --- 4. Go -----------------------------------------------------------------
+exec "$HERE/usr/bin/simple-screensharing-client" "$@"

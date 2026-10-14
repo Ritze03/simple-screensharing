@@ -1,0 +1,33 @@
+# GStreamer plugins bundled into the AppImage (one per line, name without the
+# "libgst" prefix and ".so"). A curated list instead of linuxdeploy-plugin-gstreamer's
+# "everything": the full Debian set drags in ~250 plugins and several hundred MB
+# (GTK, Qt, opencv, webrtc, ...) that the client never uses.
+#
+# Keep in sync with client/check-deps.sh (the element list); build-in-container.sh
+# fails the build if an element listed in gst-elements.txt is missing from the
+# bundled set, so adding a pipeline element without adding its plugin here is caught.
+#
+# plugin             elements the client uses from it
+coreelements         # queue, tee, valve, capsfilter, identity, fakesink
+app                  # appsrc, appsink
+videoconvertscale    # videoconvert, videoscale
+videorate            # videorate
+videotestsrc         # videotestsrc (tests / gallery)
+videofilter          # videoflip (software orientation stage)
+audioconvert         # audioconvert
+audioresample        # audioresample
+audiotestsrc         # audiotestsrc (tests)
+volume               # volume
+opus                 # opusenc, opusdec
+debug                # capssetter
+level                # level (capture level meter)
+jpeg                 # jpegdec
+videoparsersbad      # h264parse, h265parse, av1parse
+typefindfunctions    # caps detection for the parsers
+pipewire             # pipewiresrc, pipewiresink (links the HOST libpipewire)
+autodetect           # autoaudiosink (watch-side audio playback)
+pulseaudio           # pulsesink, what autoaudiosink picks (via pipewire-pulse on PipeWire hosts); bundled libpulse
+va                   # vah264/vah265/vaav1 enc+dec, vapostproc (links the HOST libva)
+x264                 # x264enc, software H.264 encode fallback (GPL)
+libav                # avdec_h264, avdec_h265, software decode fallback
+aom                  # av1dec (libaom), software AV1 decode fallback
