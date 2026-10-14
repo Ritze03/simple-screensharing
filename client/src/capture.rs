@@ -7816,6 +7816,7 @@ pub mod branch {
         /// way: this test is only worth its runtime while it exercises the
         /// buffer sizes a real screen produces.
         #[tokio::test]
+        #[ignore = "touches the user's real PipeWire session; software 4K x264 with a 5 s budget flakes under host load — run with --ignored on a quiet machine"]
         async fn a_destination_branch_comes_up_against_a_real_pipewire_source() {
             if gst::init().is_err() {
                 eprintln!("skipping: gstreamer not available in this environment");
