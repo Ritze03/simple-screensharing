@@ -375,6 +375,7 @@ pub const ICONS: &[(&str, char)] = &[
     ("screen_share", '\u{e0e2}'),
     ("settings", '\u{e8b8}'),
     ("speaker", '\u{e32d}'),
+    ("stop_circle", '\u{ef71}'),
     ("stop_screen_share", '\u{e0e3}'),
     ("swap_horiz", '\u{e8d4}'),
     ("sync", '\u{e627}'),
@@ -681,6 +682,150 @@ mod tests {
         }
         assert_eq!(icon_char("settings"), '\u{e8b8}');
         assert_eq!(icon("close"), "\u{e14c}");
+    }
+
+    /// Every icon name used through an icon-taking helper anywhere under `src/` must be in
+    /// [`ICONS`], so a typo or a new icon fails here instead of panicking in a debug build.
+    ///
+    /// Plain-text scan, no regex: for each call-site marker below, read the string
+    /// literal(s) inside the call's parentheses (stopping at `;`, an unbalanced `)`, and
+    /// for most markers `{`/`}`). To cover a new helper, add a row to `CALLS`.
+    #[test]
+    fn every_icon_name_used_in_src_is_in_icons() {
+        #[derive(Clone, Copy)]
+        enum Take {
+            /// First literal in the call (icon is the first literal argument).
+            First,
+            /// Last top-level literal in the call (icon is the last argument, after `t!(..)` etc.).
+            LastTop,
+            /// Every literal until `;` (`let icon = match ..`, tuple of icons).
+            All,
+            /// Only if the literal follows the marker directly (`icon: "x"`).
+            Immediate,
+            /// Second argument, as `Some("x")` (`chip_dark(ui, Some("x"), ..)`; `None` is skipped).
+            SecondSome,
+        }
+        use Take::*;
+        const CALLS: &[(&str, Take)] = &[
+            (".icon(", First),
+            (".trailing(", First),
+            ("theme::icon(", First),
+            ("icon_char(", First),
+            ("PopItem::new(", First),
+            ("Lead::Icon(", First),
+            ("icon_btn(", First),
+            ("paint_icon(", First),
+            ("chip_dark(", SecondSome),
+            ("banner(", First),
+            (".toast(", LastTop),
+            ("icon:", Immediate),
+            ("let icon =", All),
+            ("let (icon,", All),
+        ];
+
+        /// Reads the string literal whose opening quote is `b[i]`; returns it and the index after it.
+        fn literal(b: &[u8], i: usize) -> (String, usize) {
+            let mut j = i + 1;
+            while j < b.len() && b[j] != b'"' {
+                j += if b[j] == b'\\' { 2 } else { 1 };
+            }
+            (String::from_utf8_lossy(&b[i + 1..j.min(b.len())]).into_owned(), j + 1)
+        }
+
+        fn scan(src: &str, found: &mut Vec<String>) {
+            // Drop comment lines (docs mention example calls).
+            let code: String = src.lines().filter(|l| !l.trim_start().starts_with("//")).collect::<Vec<_>>().join("\n");
+            let b = code.as_bytes();
+            for &(marker, take) in CALLS {
+                for (at, _) in code.match_indices(marker) {
+                    let mut i = at + marker.len();
+                    if matches!(take, Immediate) {
+                        while i < b.len() && b[i] == b' ' {
+                            i += 1;
+                        }
+                        if b.get(i) == Some(&b'"') {
+                            found.push(literal(b, i).0);
+                        }
+                        continue;
+                    }
+                    if matches!(take, SecondSome) {
+                        let Some(comma) = code[i..].find(',') else { continue };
+                        let rest = code[i + comma + 1..].trim_start();
+                        if let Some(r) = rest.strip_prefix("Some(\"") {
+                            found.push(r.split('"').next().unwrap_or("").to_string());
+                        }
+                        continue;
+                    }
+                    let mut depth = 0i32;
+                    let mut last_top = None;
+                    while i < b.len() {
+                        match b[i] {
+                            b'"' => {
+                                let (lit, next) = literal(b, i);
+                                i = next;
+                                match take {
+                                    First => {
+                                        found.push(lit);
+                                        break;
+                                    }
+                                    All => found.push(lit),
+                                    _ if depth == 0 => last_top = Some(lit),
+                                    _ => {}
+                                }
+                                continue;
+                            }
+                            b'(' => depth += 1,
+                            b')' if depth == 0 => break,
+                            b')' => depth -= 1,
+                            b';' => break,
+                            b'{' | b'}' if !matches!(take, All) => break,
+                            _ => {}
+                        }
+                        i += 1;
+                    }
+                    found.extend(last_top);
+                }
+            }
+            // Icon tuples such as `("cast", IconTone::Live, ..)`.
+            for (at, _) in code.match_indices("\", IconTone::") {
+                if let Some(start) = code[..at].rfind('"') {
+                    found.push(code[start + 1..at].to_string());
+                }
+            }
+        }
+
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    walk(&p, out);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    out.push(p);
+                }
+            }
+        }
+
+        let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&src_dir, &mut files);
+        let mut checked = 0;
+        let mut missing = Vec::new();
+        for f in files {
+            // This file's own tests and docs spell out the markers.
+            if f.file_name().is_some_and(|n| n == "theme.rs") {
+                continue;
+            }
+            let mut found = Vec::new();
+            scan(&std::fs::read_to_string(&f).unwrap(), &mut found);
+            for name in found {
+                checked += 1;
+                if ICONS.binary_search_by(|(n, _)| n.cmp(&name.as_str())).is_err() {
+                    missing.push(format!("{}: {name:?}", f.strip_prefix(&src_dir).unwrap().display()));
+                }
+            }
+        }
+        assert!(checked > 40, "icon scan found only {checked} names; did the call-site markers rot?");
+        assert!(missing.is_empty(), "icon names used but missing from theme::ICONS (see client/assets/fonts/icon-codepoints.py): {missing:#?}");
     }
 
     #[test]
