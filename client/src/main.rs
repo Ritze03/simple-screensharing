@@ -7,9 +7,8 @@
 //!
 //! # Front-end
 //!
-//! This launches the eframe/egui desktop window (`ui/`). egui is becoming
-//! the client's only front-end; the Electron shell is still present until it
-//! is removed later. Only the UI modules (`ui`, `theme`, `widgets`) live in this
+//! This launches the eframe/egui desktop window (`ui/`), the client's only
+//! front-end. Only the UI modules (`ui`, `theme`, `widgets`) live in this
 //! bin; the core (net, capture, decode, rooms, session, ...) is the
 //! `simple_screensharing_client` lib crate (`lib.rs`).
 //!

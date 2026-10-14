@@ -311,15 +311,63 @@ fn nodes_are_linked(objects: &[PwObject], output_node_id: u32, input_node_id: u3
 /// keep running for the duration of the capture; killing it (see
 /// [`AudioCaptureHandle::stop`]) is what tears the loopback (and its
 /// `pw-link` connections) down.
+///
+/// The child is set to die with this process (see [`die_with_parent`]), so a
+/// SIGKILLed or crashed client cannot leave an orphaned `ssshare-loopback-…`
+/// node behind in the PipeWire graph.
 fn spawn_loopback(loopback_name: &str) -> Result<Child> {
-    Command::new("pw-loopback")
-        .args(["--name", loopback_name, "-i", "node.autoconnect=false", "-o", "node.autoconnect=false"])
+    let mut cmd = Command::new("pw-loopback");
+    cmd.args(["--name", loopback_name, "-i", "node.autoconnect=false", "-o", "node.autoconnect=false"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to spawn pw-loopback (is PipeWire's pw-loopback tool installed?)")
+        .stderr(Stdio::null());
+    die_with_parent(&mut cmd);
+    cmd.spawn().context("failed to spawn pw-loopback (is PipeWire's pw-loopback tool installed?)")
 }
+
+/// Makes `cmd`'s child receive SIGTERM when its parent dies, however the
+/// parent dies (including SIGKILL, which no `Drop` or signal handler of ours
+/// can intercept). Linux only (`PR_SET_PDEATHSIG`); a no-op elsewhere.
+///
+/// `Why:` `pw-loopback` is a long-lived helper process. Before this, killing
+/// the client with SIGKILL (or a crash) left it running as an orphan
+/// (ppid 1) with its `ssshare-loopback-…` nodes still in the PipeWire graph;
+/// it happened twice overnight and the orphans held other sessions' locks.
+/// `pw-loopback` quits cleanly on SIGTERM.
+///
+/// Caveat: the kernel ties the signal to the *thread* that spawned the child,
+/// not the process. That is fine for the callers here (tokio runtime worker
+/// threads and the test thread live as long as the process), but it would
+/// not be for a thread that exits early, such as a `spawn_blocking` thread
+/// after its idle timeout: call this only from long-lived threads.
+///
+/// Race: if the parent dies between `fork` and the `prctl`, the signal is
+/// never delivered, so the child compares `getppid()` against the parent it
+/// was forked from and refuses to exec when it is already orphaned.
+#[cfg(target_os = "linux")]
+fn die_with_parent(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: `getpid` has no preconditions.
+    let parent = unsafe { libc::getpid() };
+    // SAFETY: the closure runs in the forked child before exec and calls only
+    // async-signal-safe functions (`prctl`, `getppid`) and builds an
+    // `io::Error` from errno without allocating.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM as libc::c_ulong) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != parent {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn die_with_parent(_cmd: &mut Command) {}
 
 /// The readiness predicate the poll loop in [`wait_for_loopback_ready`]
 /// checks against every `pw-dump` snapshot: `loopback_name`'s two stream
@@ -1582,24 +1630,10 @@ mod tests {
             let socket = UdpSocket::bind("127.0.0.1:0").expect("failed to bind ephemeral probe socket");
             socket.local_addr().expect("local_addr").port()
         };
-        // Same two candidate layouts `end_to_end_test` probes (see
-        // `server_repo_candidates`) — the workspace dropped its old `master/`
-        // nesting level, so a single hardcoded path no longer resolves.
-        let candidates = crate::end_to_end_test::server_repo_candidates().expect("could not determine home directory");
-        let (server_repo, server_binary) = candidates
-            .iter()
-            .flat_map(|repo| ["release", "debug"].map(|p| (repo.clone(), repo.join(format!("target/{p}/simple-screensharing-server")))))
-            .find(|(_, binary)| binary.is_file())
-            .unwrap_or_else(|| panic!("server binary not found under any of {candidates:?} — build the server repo first"));
-        let cmd_string = format!("{} {port}", server_binary.display());
-        let mut server_child = Command::new("setsid")
-            .args(["script", "-qc", &cmd_string, "/dev/null"])
-            .current_dir(&server_repo)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("failed to spawn relay server child process (requires setsid/script)");
+        // Located via `end_to_end_test::server_binary_path` (honours
+        // `SSSHARE_SERVER_BIN` and `CARGO_TARGET_DIR`); the guard kills the
+        // relay on drop.
+        let _server = crate::end_to_end_test::spawn_relay_server(port).expect("failed to spawn the relay server (build it first)");
 
         let server_addr = format!("127.0.0.1:{port}");
         let room_id: crate::protocol::RoomId = rand::random();
@@ -1690,12 +1724,103 @@ mod tests {
         let _ = client.leave().await;
         let _ = app.kill();
         let _ = app.wait();
-        let _ = server_child.kill();
-        let _ = server_child.wait();
-        let _ = Command::new("pkill")
-            .args(["-f", &format!("simple-screensharing-server {port}")])
-            .status();
 
         eprintln!("[audio-stop-test] PASS: stop() returned in {stop_elapsed:?}, pw-loopback (pid {loopback_pid}) reaped");
+    }
+
+    // ---- die_with_parent (PR_SET_PDEATHSIG) ------------------------------
+    //
+    // A child that must die with its parent can only be tested by killing a
+    // parent, and the test process cannot be that parent. So the test
+    // re-executes this very test binary as a "parent" process (the helper
+    // below, selected by an env var), waits for it to publish its child's
+    // pid, SIGKILLs it, and asserts the child follows. Uses `sleep` as the
+    // child, so it needs neither PipeWire nor a display.
+
+    /// Env var that turns [`die_with_parent_helper_process`] from a no-op
+    /// into the helper "parent": its value is the file to publish pids to.
+    #[cfg(target_os = "linux")]
+    const PDEATHSIG_HELPER_ENV: &str = "SSSHARE_TEST_PDEATHSIG_PIDFILE";
+
+    /// Not a test on its own: the process [`child_dies_when_its_parent_is_sigkilled`]
+    /// re-executes and kills. Without the env var it does nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn die_with_parent_helper_process() {
+        let Some(pidfile) = std::env::var_os(PDEATHSIG_HELPER_ENV) else { return };
+        let mut cmd = Command::new("sleep");
+        cmd.arg("300").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        die_with_parent(&mut cmd);
+        let child = cmd.spawn().expect("spawn sleep");
+        // Publish atomically: the watcher must never read a half-written file.
+        let tmp = std::path::PathBuf::from(&pidfile).with_extension("tmp");
+        std::fs::write(&tmp, child.id().to_string()).expect("write pidfile");
+        std::fs::rename(&tmp, &pidfile).expect("publish pidfile");
+        // Wait to be SIGKILLed (the parent test's job); bounded so a broken
+        // test run cannot leave this process around forever.
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    /// `true` while `pid` is a live process (a zombie awaiting its reaper
+    /// counts as dead: it is no longer running anything).
+    #[cfg(target_os = "linux")]
+    fn pid_is_running(pid: u32) -> bool {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            // "pid (comm) S ..." - comm may contain spaces/parens, so the
+            // state is the first field after the *last* ')'.
+            Ok(stat) => stat.rsplit(')').next().and_then(|rest| rest.split_whitespace().next()) != Some("Z"),
+            Err(_) => false,
+        }
+    }
+
+    /// **Regression:** `pw-loopback` survived a SIGKILLed client as an
+    /// orphan (ppid 1). A child spawned through [`die_with_parent`] must die
+    /// when its parent is SIGKILLed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_dies_when_its_parent_is_sigkilled() {
+        let dir = std::env::temp_dir().join(format!("sss-pdeathsig-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let pidfile = dir.join("child.pid");
+
+        let mut parent = Command::new(std::env::current_exe().expect("current_exe"))
+            .args(["--exact", "audio::tests::die_with_parent_helper_process", "--nocapture", "--test-threads=1"])
+            .env(PDEATHSIG_HELPER_ENV, &pidfile)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("re-exec the test binary as the helper parent");
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let child_pid: u32 = loop {
+            if let Some(pid) = std::fs::read_to_string(&pidfile).ok().and_then(|s| s.trim().parse().ok()) {
+                break pid;
+            }
+            if Instant::now() > deadline {
+                let _ = parent.kill();
+                let _ = parent.wait();
+                panic!("the helper parent never published its child's pid");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(pid_is_running(child_pid), "the helper's child (pid {child_pid}) should be running before the kill");
+
+        // SIGKILL: no Drop, no signal handler, exactly the failure case.
+        parent.kill().expect("SIGKILL the helper parent");
+        let _ = parent.wait();
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pid_is_running(child_pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let survived = pid_is_running(child_pid);
+        if survived {
+            // Do not leak the 300s sleeper if the assertion below fails.
+            // SAFETY: plain kill(2) on a pid this test created.
+            unsafe { libc::kill(child_pid as libc::pid_t, libc::SIGKILL) };
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!survived, "child (pid {child_pid}) outlived its SIGKILLed parent: PR_SET_PDEATHSIG is not in effect");
     }
 }

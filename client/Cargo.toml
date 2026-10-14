@@ -3,12 +3,10 @@ name = "simple-screensharing-client"
 version = "0.1.0"
 edition = "2024"
 
-# Explicit lib + bin targets: this crate now serves two consumers — the
-# existing egui/eframe binary below (unchanged) and, as a `[lib]`, the new
-# `src-tauri/` Tauri app (see src/lib.rs). Cargo infers both targets fine
-# without this section (src/lib.rs + src/main.rs coexist by default), but
-# spelling them out makes the two-target shape explicit for anyone reading
-# this manifest.
+# Explicit lib + bin targets: the egui/eframe binary below (UI only: `ui/`,
+# `theme.rs`, `widgets/`) sits on top of the backend `[lib]` (net, capture,
+# decode, session, ...). Cargo would infer both from src/lib.rs + src/main.rs;
+# spelling them out makes the two-target shape explicit.
 [lib]
 name = "simple_screensharing_client"
 path = "src/lib.rs"
@@ -25,13 +23,11 @@ dirs = "6.0.0"
 futures-util = "0.3.33"
 eframe = { version = "0.33.3", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland", "persistence", "serde"] }
 egui = "0.33.3"
-egui_extras = "0.33.3"
 simple-screensharing-protocol = { path = "../protocol" }
 gstreamer = "0.24.5"
 gstreamer-app = "0.24.5"
 gstreamer-video = "0.24.5"
 image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
-postcard = { version = "1.1.3", features = ["use-std"] }
 quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "platform-verifier"] }
 rand = "0.10.2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
@@ -61,6 +57,12 @@ indexmap = "2"
 # which is what was actually breaking `cargo build` there.
 [target.'cfg(unix)'.dependencies]
 ashpd = { version = "0.13.13", features = ["screencast"] }
+
+# `PR_SET_PDEATHSIG` for the `pw-loopback` helper (src/audio.rs
+# `die_with_parent`): the child must die with the client even on SIGKILL.
+# `libc` was already in the dependency tree; this pins no new version.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 # `test-util` (paused/advanceable virtual time) lets `session.rs`'s connect
 # timeout test simulate the 15s-class wait without a real 15s sleep — see

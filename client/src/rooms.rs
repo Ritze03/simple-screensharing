@@ -392,8 +392,8 @@ pub struct AppSettings {
     /// stream-control.md`'s 2026-07-28 note).
     ///
     /// `Why its own nested struct rather than five flat fields:` every field
-    /// here is set together by `set_start_stream_defaults`
-    /// (`src-tauri/src/commands.rs`) whenever the form changes, unlike the
+    /// here is set together by `session::save_start_stream_defaults`
+    /// whenever the form changes, unlike the
     /// bandwidth/jitter fields above which are each their own independent
     /// setting with its own save call — grouping them mirrors that they are
     /// one cohesive "form state", the same way `edit_destination` already
