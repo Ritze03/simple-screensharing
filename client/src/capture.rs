@@ -6,7 +6,9 @@
 //! # Pipeline
 //!
 //! ```text
-//! <platform source> ! videoconvert ! video/x-raw,format=BGRx ! tee name=t
+//! <platform source> ! videoconvert ! video/x-raw,format=BGRx
+//!   [! <vapostproc|videoflip> video-direction=auto  -- only while the source is rotated]
+//!   ! video/x-raw,format=BGRx ! tee name=t
 //!   t. ! queue leaky=downstream max-size-buffers=1 ! videorate ! video/x-raw,framerate=1/1
 //!      ! videoconvert ! video/x-raw,format=RGB
 //!      ! appsink name=preview_sink
@@ -37,6 +39,14 @@
 //! nobody is watching pauses its own encoder (see [`DestCmd`]) without
 //! touching any sibling destination of the same capture. See
 //! `superdoc/features/stream-control.md`.
+//!
+//! The bracketed `video-direction=auto` stage makes a **rotated or mirrored
+//! monitor arrive upright** in every destination and preview: `pipewiresrc`
+//! turns the stream's `SPA_META_VideoTransform` into an `image-orientation`
+//! tag, and the stage follows it (swapping width/height for 90/270). The stage
+//! is spliced in only when such a tag says the picture is rotated, so an
+//! un-rotated source pays nothing. See [`orientation_fragment`] for the why,
+//! the GPU-vs-CPU choice and the measurements.
 //!
 //! The pixel format *is* pinned before the `tee`, and for a closely related
 //! reason: it keeps what the source negotiates independent of which branches
@@ -1388,6 +1398,131 @@ const BRANCH_SKIP_TO_FIRST: bool = true;
 /// the tee are unchanged.
 const SOURCE_RAW_FORMAT: &str = "BGRx";
 
+/// Orientation stage, implementation 1: VA-API post-processing. It rotates and
+/// flips on the GPU, so it is the one to use whenever VA works.
+const ORIENTATION_VAPOSTPROC: &str = "vapostproc video-direction=auto";
+
+/// Orientation stage, implementation 2: the CPU fallback for machines without
+/// a working VA stack.
+const ORIENTATION_VIDEOFLIP: &str = "videoflip video-direction=auto";
+
+/// Names of the two capsfilters the orientation stage is spliced between
+/// ([`arm_orientation_stage`]).
+const ORIENT_IN_NAME: &str = "orient_in";
+const ORIENT_OUT_NAME: &str = "orient_out";
+
+/// Which element does the rotating when the source turns out to be rotated:
+/// the orientation stage that sits between the source and the `tee`, so every
+/// destination branch and both preview branches see an upright picture.
+///
+/// `Why this exists:` a compositor that drives a monitor rotated (e.g.
+/// MangoWC's `rr:2` = 180 degrees) hands the portal/PipeWire stream the
+/// *physical* scan-out orientation and only tells us about it as stream
+/// metadata (`SPA_META_VideoTransform`). Nothing in the old pipeline looked at
+/// it, so a rotated monitor arrived upside down (or sideways) in every viewer.
+///
+/// `pipewiresrc` already reads that metadata and, whenever it changes, sends a
+/// `GST_TAG_IMAGE_ORIENTATION` tag downstream (`rotate-0/90/180/270` and the
+/// four `flip-rotate-*`, one for each of the eight `wl_output` transforms).
+/// Both elements understand `video-direction=auto`, which follows that tag,
+/// so this crate has no transform table of its own to get wrong (it would
+/// need the CW/CCW and flip-then-rotate conventions to match PipeWire's;
+/// `capture::tests` pins what each of the eight tags does). For 90/270 the
+/// element also swaps width and height, so everything downstream just sees
+/// the upright size.
+///
+/// `Why vapostproc first, videoflip second:` measured on 1080p BGRx
+/// (`gst-launch videotestsrc ! ... ! <element> ! fakesink sync=false`, 4000
+/// frames, one core): `videoflip` rotate-180 tops out at about 180 fps, i.e.
+/// it cannot keep a 240 fps source busy, and 90/270 is slower still (about
+/// 110 fps). `vapostproc` (copy up, rotate on the GPU, copy down) does about
+/// 850 fps for 180 and about 270 for 90. It is therefore preferred whenever
+/// the VA encoder probe passed ([`detect_encoder_backend`]) and the element
+/// exists; `videoflip` is the fallback for machines (and Windows) without VA.
+///
+/// `Why the stage is spliced in lazily instead of sitting in the pipeline:`
+/// the requirement is that an un-rotated output pays nothing. `vapostproc` is
+/// close to free in pass-through (2.86 s vs 2.66 s for 4000 frames), but
+/// `videoflip` is *not*: even untagged or with `video-direction=identity` it
+/// costs about 0.8 ms per 1080p frame (5.9 s vs 2.7 s for 4000 frames), and
+/// on Windows no tag ever arrives. So the pipeline is built without the
+/// stage, and [`arm_orientation_stage`] inserts it the moment a non-identity
+/// orientation tag passes.
+///
+/// `Why two capsfilters around the stage:` `vapostproc` is otherwise free to
+/// pick another output format (it likes NV12), which would silently un-pin
+/// [`SOURCE_RAW_FORMAT`]. The second one also gives the stage a fixed output
+/// format to negotiate against; its size is kept from being rescaled by the
+/// tee's caps-query guard (see [`isolate_source_from_branch_renegotiation`]).
+fn orientation_fragment() -> &'static str {
+    use std::sync::OnceLock;
+    static FRAGMENT: OnceLock<&'static str> = OnceLock::new();
+    FRAGMENT.get_or_init(|| {
+        let _ = ensure_gstreamer_initialized();
+        let va_ok = detect_encoder_backend() == EncoderBackend::Vaapi
+            && gst::ElementFactory::find("vapostproc").is_some();
+        if va_ok { ORIENTATION_VAPOSTPROC } else { ORIENTATION_VIDEOFLIP }
+    })
+}
+
+/// Splices `stage` (a `gst-launch` fragment, see [`orientation_fragment`])
+/// between the `orient_in` and `orient_out` capsfilters the first time an
+/// `image-orientation` tag other than `rotate-0` passes between them, then
+/// removes its own probe. Until then those two capsfilters are linked
+/// directly (a capsfilter in pass-through costs nothing).
+///
+/// The splice happens inside a blocking probe on `orient_in`'s src pad, on
+/// the source's streaming thread, before the first buffer that follows the
+/// tag. The new element's sink pad then receives the pad's sticky events
+/// (caps, segment, and the tag itself) as for any newly linked pad, so
+/// `video-direction=auto` sees the tag. If building or linking fails the
+/// stream keeps flowing un-rotated rather than dying, and the failure is
+/// logged.
+fn arm_orientation_stage(pipeline: &gst::Pipeline, stage: &str) -> Result<()> {
+    let before = pipeline.by_name(ORIENT_IN_NAME).ok_or_else(|| anyhow!("no element '{ORIENT_IN_NAME}'"))?;
+    let after = pipeline.by_name(ORIENT_OUT_NAME).ok_or_else(|| anyhow!("no element '{ORIENT_OUT_NAME}'"))?;
+    let src = before.static_pad("src").ok_or_else(|| anyhow!("'{ORIENT_IN_NAME}' has no src pad"))?;
+    let pipeline = pipeline.downgrade();
+    let stage = stage.to_string();
+
+    src.add_probe(gst::PadProbeType::BLOCK | gst::PadProbeType::EVENT_DOWNSTREAM, move |pad, info| {
+        let Some(gst::PadProbeData::Event(event)) = &info.data else { return gst::PadProbeReturn::Pass };
+        let gst::EventView::Tag(tag) = event.view() else { return gst::PadProbeReturn::Pass };
+        let Some(orientation) = tag.tag().get::<gst::tags::ImageOrientation>() else {
+            return gst::PadProbeReturn::Pass;
+        };
+        if orientation.get() == "rotate-0" {
+            return gst::PadProbeReturn::Pass;
+        }
+        tracing::info!("source is rotated ({}); inserting the orientation stage '{stage}'", orientation.get());
+        let result = (|| -> Result<()> {
+            let pipeline = pipeline.upgrade().ok_or_else(|| anyhow!("pipeline is gone"))?;
+            let bin = gst::parse::bin_from_description(&stage, true)?;
+            let peer = after.static_pad("sink").ok_or_else(|| anyhow!("no sink pad on '{ORIENT_OUT_NAME}'"))?;
+            pad.unlink(&peer)?;
+            pipeline.add(&bin)?;
+            bin.sync_state_with_parent()?;
+            let sink = bin.static_pad("sink").ok_or_else(|| anyhow!("stage has no sink pad"))?;
+            let out = bin.static_pad("src").ok_or_else(|| anyhow!("stage has no src pad"))?;
+            pad.link(&sink)?;
+            out.link(&peer)?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            tracing::error!("could not insert the orientation stage, the picture stays as the source sends it: {e:#}");
+            // Best effort: make sure the direct link is back.
+            if let Some(peer) = after.static_pad("sink")
+                && !pad.is_linked()
+            {
+                let _ = pad.link(&peer);
+            }
+        }
+        gst::PadProbeReturn::Remove
+    })
+    .ok_or_else(|| anyhow!("failed to arm the orientation stage"))?;
+    Ok(())
+}
+
 /// Element name of the `tee` every branch — fixed (preview/self-preview) and
 /// dynamic (one per destination, see [`branch`]) — hangs off.
 const TEE_NAME: &str = "t";
@@ -1466,10 +1601,18 @@ struct CapturePipeline {
 /// branch's `videorate` ([`branch::add_branch`]), so nothing in *this*
 /// description depends on it.
 fn build_pipeline(source_fragment: &str) -> Result<CapturePipeline> {
+    build_pipeline_with_orientation(source_fragment, orientation_fragment())
+}
+
+/// [`build_pipeline`] with the orientation stage ([`arm_orientation_stage`])
+/// chosen by the caller, so the tests can run both implementations
+/// ([`ORIENTATION_VAPOSTPROC`] and [`ORIENTATION_VIDEOFLIP`]) on any machine.
+fn build_pipeline_with_orientation(source_fragment: &str, orientation: &str) -> Result<CapturePipeline> {
     let description = format!(
         "{source_fragment} \
          ! videoconvert \
-         ! video/x-raw,format={SOURCE_RAW_FORMAT} \
+         ! capsfilter name={ORIENT_IN_NAME} caps=video/x-raw,format={SOURCE_RAW_FORMAT} \
+         ! capsfilter name={ORIENT_OUT_NAME} caps=video/x-raw,format={SOURCE_RAW_FORMAT} \
          ! tee name={TEE_NAME} \
          {TEE_NAME}. ! queue leaky=downstream max-size-buffers=1 \
             ! videorate \
@@ -1510,6 +1653,7 @@ fn build_pipeline(source_fragment: &str) -> Result<CapturePipeline> {
         .ok_or_else(|| anyhow!("pipeline has no element named '{TEE_NAME}'"))?;
 
     isolate_source_from_branch_renegotiation(&tee)?;
+    arm_orientation_stage(&pipeline, orientation)?;
 
     // Installed before the pipeline ever leaves `Null`, so the very first
     // buffer cannot slip past it. Removes itself after firing: no per-buffer
@@ -1587,6 +1731,30 @@ fn isolate_source_from_branch_renegotiation(tee: &gst::Element) -> Result<()> {
         gst::PadProbeReturn::Ok
     })
     .ok_or_else(|| anyhow!("failed to install the renegotiation guard on tee '{TEE_NAME}'"))?;
+
+    // Same idea for the CAPS *query*: the tee answers it with the union of its
+    // branches' preferences, and one of them (self-preview) is a fixed
+    // 320x180. A source-side element that can scale (`vapostproc`, see
+    // [`orientation_fragment`]) takes such an answer as an instruction and
+    // shrinks the whole capture to 320x180 before it reaches any encoder.
+    // `videoconvert`/`videoflip` never scale, which is why nothing needed this
+    // before. Answering "anything in the pinned format" keeps every branch's
+    // wishes where they belong, inside the branch.
+    sink.add_probe(gst::PadProbeType::QUERY_DOWNSTREAM, |_, info| {
+        if let Some(gst::PadProbeData::Query(query)) = &mut info.data
+            && let gst::QueryViewMut::Caps(q) = query.view_mut()
+        {
+            let any_size = gst::Caps::builder("video/x-raw").field("format", SOURCE_RAW_FORMAT).build();
+            let answer = match q.filter() {
+                Some(filter) => filter.intersect_with_mode(&any_size, gst::CapsIntersectMode::First),
+                None => any_size,
+            };
+            q.set_result(&answer);
+            return gst::PadProbeReturn::Handled;
+        }
+        gst::PadProbeReturn::Ok
+    })
+    .ok_or_else(|| anyhow!("failed to install the caps-query guard on tee '{TEE_NAME}'"))?;
 
     Ok(())
 }
@@ -1788,6 +1956,11 @@ pub struct CaptureHandle {
     // normally (bare-drop backstop path) is fine, per `PreviewHandle`'s own
     // doc comment (dropping `stop_tx` promptly stops its background task).
     preview_handle: Option<PreviewHandle>,
+    /// The client the running [`Self::preview_handle`] sends through, kept so
+    /// [`Self::ensure_preview_task`] can tell when that connection died (a
+    /// reconnect hands the capture a *new* client) and move the preview task
+    /// over to it.
+    preview_client: Option<ScreenshareClient>,
     // Latest frame off the self-preview tee branch (see
     // [`SELF_PREVIEW_BRANCH_FRAMERATE`]), written by [`capture_loop`] and read
     // back (and cleared) via [`CaptureHandle::self_preview_frame`] — the same
@@ -2086,6 +2259,7 @@ async fn start_capture_with_source(framerate: u32, capture_source: CaptureSource
         capture_source,
         capture_task,
         preview_handle: None,
+        preview_client: None,
         preview_sink: Some(preview_sink),
         self_preview_frame,
         source_state: Mutex::new(source),
@@ -2524,13 +2698,29 @@ impl CaptureHandle {
     /// capture (`start_capture`) has no room to send a thumbnail to yet — see
     /// [`CaptureHandle::preview_sink`]'s doc comment on why the appsink is
     /// safe to leave unconsumed until this runs.
+    ///
+    /// `Why it also restarts:` the task is bound to one client and one
+    /// `stream_id`. After an automatic reconnect the session rebuilds this
+    /// capture's destinations on a *new* client (no new picker), and the old
+    /// task keeps failing on the dead connection, so peers would see no
+    /// thumbnail of the share until the capture was restarted. So when the
+    /// client the task was started with has a closed connection and the caller
+    /// brings a live one, the old task is stopped and a new one started on the
+    /// new client and stream id. This is why the `AppSink` is cloned, not
+    /// taken: a fresh frame stream can be made from it as often as needed.
     fn ensure_preview_task(&mut self, client: &ScreenshareClient, stream_id: u8) {
         if self.preview_handle.is_some() {
-            return;
+            let dead = self.preview_client.as_ref().is_some_and(|c| c.connection().close_reason().is_some());
+            if !dead || client.connection().close_reason().is_some() {
+                return;
+            }
+            // Dropping the handle stops its task promptly (see `PreviewHandle`).
+            self.preview_handle = None;
         }
-        let Some(sink) = self.preview_sink.take() else { return };
+        let Some(sink) = self.preview_sink.clone() else { return };
         let preview_frames: FrameStream = preview_frame_stream(sink);
         self.preview_handle = Some(preview::spawn_preview_task(client.clone(), stream_id, preview_frames));
+        self.preview_client = Some(client.clone());
     }
 
     /// Stop sending into one room, leaving every other destination of this
@@ -9033,5 +9223,420 @@ mod tests {
             Ok(p) => eprintln!("portal succeeded: node_id={}", p.node_id),
             Err(e) => eprintln!("portal failed: {e:#}"),
         }
+    }
+
+    /// LIVE end to end for a rotated monitor: real portal -> encoder -> relay
+    /// -> a viewer's native decoder. Writes the first picture the viewer
+    /// decodes to `$SSS_DUMP_PPM` (binary PPM) so it can be compared with
+    /// `grim -o <output>`. Needs a relay binary (`SSSHARE_SERVER_BIN`) and a
+    /// human or script to drive the portal picker.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "opens a real portal picker and spawns a real relay"]
+    async fn real_portal_viewer_frame_dump() {
+        use crate::end_to_end_test::{connect_with_retry, pick_free_udp_port, spawn_relay_server};
+        use crate::net::ClientEvent;
+        use crate::protocol::RoomId;
+
+        const STREAM_ID: u8 = 1;
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let port = pick_free_udp_port().expect("port");
+        let _server = spawn_relay_server(port).expect("relay");
+        let join = crate::net::format_join_string(
+            &format!("127.0.0.1:{port}"),
+            &rand::random::<RoomId>(),
+            &rand::random::<[u8; 32]>(),
+        );
+        let (sharer, _s, mut events_a) = connect_with_retry(&join, "sharer").await.expect("sharer joins");
+        let (viewer, _s, mut events_b) = connect_with_retry(&join, "viewer").await.expect("viewer joins");
+        let owner = sharer.conn_id();
+        let handle = start_sharing(&sharer, STREAM_ID, DestKey(0), 8_000, 30).await.expect("share starts");
+        viewer.subscribe(owner, STREAM_ID).await.expect("viewer subscribe");
+
+        let mut decoder = crate::decode::StreamDecoder::new(STREAM_ID).expect("decoder");
+        let deadline = tokio::time::sleep(Duration::from_secs(20));
+        tokio::pin!(deadline);
+        let mut picture = None;
+        while picture.is_none() {
+            tokio::select! {
+                _ = &mut deadline => break,
+                ev = events_a.recv() => match ev {
+                    Some(ClientEvent::SubscriberCount { stream_id, count }) if stream_id == STREAM_ID => {
+                        handle.notify_subscriber_count(DestKey(0), count);
+                    }
+                    Some(ClientEvent::KeyframeRequest { stream_id }) if stream_id == STREAM_ID => {
+                        handle.notify_keyframe_request(DestKey(0));
+                    }
+                    Some(_) => {}
+                    None => break,
+                },
+                ev = events_b.recv() => match ev {
+                    Some(ClientEvent::MediaFrame(frame)) if frame.conn_id == owner && frame.stream_id == STREAM_ID => {
+                        decoder.feed(&frame);
+                        picture = decoder.latest_frame();
+                    }
+                    Some(_) => {}
+                    None => break,
+                },
+            }
+        }
+        handle.stop().await.expect("the share should stop cleanly");
+        drop(viewer);
+        let picture = picture.expect("the viewer decoded a picture");
+        let [w, h] = picture.size;
+        eprintln!("[viewer] decoded picture {w}x{h}");
+        if let Ok(path) = std::env::var("SSS_DUMP_PPM") {
+            let mut out = format!("P6\n{w} {h}\n255\n").into_bytes();
+            for px in &picture.pixels {
+                out.extend_from_slice(&[px.r(), px.g(), px.b()]);
+            }
+            std::fs::write(&path, out).expect("write ppm");
+            eprintln!("[viewer] wrote {path}");
+        }
+    }
+
+    /// After a reconnect the session hands the capture a *new* client for the
+    /// rebuilt destination; the room-preview task must move over to it instead
+    /// of failing forever on the dead connection
+    /// ([`CaptureHandle::ensure_preview_task`]).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "spawns a real relay server (SSSHARE_SERVER_BIN)"]
+    async fn preview_task_moves_to_the_new_client_after_a_reconnect() {
+        use crate::end_to_end_test::{connect_with_retry, pick_free_udp_port, spawn_relay_server};
+        use crate::protocol::RoomId;
+
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let port = pick_free_udp_port().expect("port");
+        let _server = spawn_relay_server(port).expect("relay");
+        let join = crate::net::format_join_string(
+            &format!("127.0.0.1:{port}"),
+            &rand::random::<RoomId>(),
+            &rand::random::<[u8; 32]>(),
+        );
+        let (first, _s, _e1) = connect_with_retry(&join, "sharer").await.expect("sharer joins");
+        let mut handle = start_sharing_from_test_source(
+            &first,
+            1,
+            DEFAULT_BITRATE_KBPS,
+            DEFAULT_FRAMERATE,
+            "videotestsrc is-live=true ! video/x-raw,width=320,height=180",
+        )
+        .await
+        .expect("share starts");
+        assert_eq!(handle.preview_client.as_ref().map(|c| c.conn_id()), Some(first.conn_id()));
+
+        // Same client again (e.g. a second room on a live connection): untouched.
+        let params = handle.destination_runtime(DestKey(0)).expect("runtime").lock().unwrap().params();
+        let same = handle
+            .spawn_add_destination(&first, 2, DestKey(1), params.clone())
+            .await
+            .expect("channel")
+            .expect("destination");
+        handle.register_destination(Some(&first), same);
+        assert_eq!(handle.preview_client.as_ref().map(|c| c.conn_id()), Some(first.conn_id()));
+
+        // The connection dies; a new client takes over.
+        first.connection().close(0u32.into(), b"test drop");
+        let (second, _s, _e2) = connect_with_retry(&join, "sharer").await.expect("sharer rejoins");
+        assert_ne!(first.conn_id(), second.conn_id());
+        let rebuilt = handle
+            .spawn_add_destination(&second, 3, DestKey(2), params)
+            .await
+            .expect("channel")
+            .expect("destination");
+        handle.register_destination(Some(&second), rebuilt);
+        assert_eq!(
+            handle.preview_client.as_ref().map(|c| c.conn_id()),
+            Some(second.conn_id()),
+            "the preview task must be restarted on the new client"
+        );
+        assert!(handle.preview_handle.is_some());
+        handle.stop().await.expect("stops");
+    }
+
+    // ----- orientation stage ([`orientation_fragment`]) -----
+
+    /// An RGB picture as rows of pixels, for the orientation tests.
+    type Pic = Vec<Vec<[u8; 3]>>;
+
+    fn transpose(p: &Pic) -> Pic {
+        (0..p[0].len()).map(|x| p.iter().map(|row| row[x]).collect()).collect()
+    }
+    fn flip_h(p: &Pic) -> Pic {
+        p.iter().map(|row| row.iter().rev().copied().collect()).collect()
+    }
+    fn flip_v(p: &Pic) -> Pic {
+        p.iter().rev().cloned().collect()
+    }
+
+    /// How an `image-orientation` tag value must change the picture to make it
+    /// upright: the map [`orientation_fragment`]'s doc comment says this crate
+    /// deliberately does not own. It lives here only to pin down what
+    /// `video-direction=auto` does with each of the eight values `pipewiresrc`
+    /// can send (one per `wl_output` transform). `rotate-N` turns the picture N
+    /// degrees clockwise. `flip-rotate-N` is EXIF's mirrored orientations.
+    fn expected_upright(tag: &str, p: &Pic) -> Pic {
+        let cw = |p: &Pic| flip_h(&transpose(p));
+        match tag {
+            "rotate-0" => p.clone(),
+            "rotate-90" => cw(p),
+            "rotate-180" => flip_v(&flip_h(p)),
+            "rotate-270" => flip_v(&transpose(p)),
+            "flip-rotate-0" => flip_h(p),
+            "flip-rotate-90" => flip_v(&flip_h(&transpose(p))),
+            "flip-rotate-180" => flip_v(p),
+            "flip-rotate-270" => transpose(p),
+            other => panic!("unknown orientation tag {other}"),
+        }
+    }
+
+    fn pull_rgb(sink: &gst_app::AppSink) -> Pic {
+        pull_rgb_sample(&sink.try_pull_sample(gst::ClockTime::from_seconds(10)).expect("a preview frame"))
+    }
+
+    fn pull_rgb_sample(sample: &gst::Sample) -> Pic {
+        let caps = sample.caps().expect("caps");
+        let info = gst_video::VideoInfo::from_caps(caps).expect("video info");
+        let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(sample.buffer().expect("buffer"), &info)
+            .expect("map frame");
+        let (w, h) = (frame.width() as usize, frame.height() as usize);
+        let stride = frame.plane_stride()[0] as usize;
+        let data = frame.plane_data(0).expect("plane");
+        (0..h).map(|y| (0..w).map(|x| [data[y * stride + 3 * x], data[y * stride + 3 * x + 1], data[y * stride + 3 * x + 2]]).collect()).collect()
+    }
+
+    /// A 96x48 picture with no mirror or rotation symmetry (an "F" in the top
+    /// left, a block bottom right, a dot top right), as a looping source
+    /// fragment. A JPEG so no extra decoder crate is needed; shapes are
+    /// multiples of 16 px so chroma subsampling cannot smear them.
+    fn asymmetric_test_source() -> String {
+        let (w, h) = (96u32, 48u32);
+        let mut rgb = vec![0u8; (w * h * 3) as usize];
+        let mut fill = |x0: u32, y0: u32, x1: u32, y1: u32, c: [u8; 3]| {
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    rgb[((y * w + x) * 3) as usize..][..3].copy_from_slice(&c);
+                }
+            }
+        };
+        fill(0, 0, 16, 48, [255, 0, 0]);
+        fill(0, 0, 48, 16, [255, 0, 0]);
+        fill(0, 16, 32, 32, [255, 0, 0]);
+        fill(64, 32, 96, 48, [0, 255, 0]);
+        fill(80, 0, 96, 16, [0, 0, 255]);
+        let path = std::env::temp_dir().join(format!("sss-orientation-test-{}.jpg", std::process::id()));
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 100)
+            .encode(&rgb, w, h, image::ExtendedColorType::Rgb8)
+            .expect("encode jpeg");
+        std::fs::write(&path, jpeg).expect("write jpeg");
+        format!(
+            "filesrc location={} ! jpegdec ! imagefreeze num-buffers=30 ! video/x-raw,framerate=30/1",
+            path.display()
+        )
+    }
+
+    /// Runs the capture pipeline over a test pattern carrying `tag` (what
+    /// `pipewiresrc` sends for a rotated output) and returns the frame the
+    /// preview branch sees, i.e. what every branch hanging off the `tee` gets.
+    fn frame_through_orientation_stage(orientation: &str, tag: &str) -> Pic {
+        let source = format!("{} ! taginject tags=image-orientation={tag}", asymmetric_test_source());
+        let built = build_pipeline_with_orientation(&source, orientation).expect("pipeline builds");
+        let elements_before = built.pipeline.children().len();
+        built.pipeline.set_state(gst::State::Playing).expect("playing");
+        let pic = pull_rgb(&built.preview_sink);
+        let spliced = built.pipeline.children().len() - elements_before;
+        built.pipeline.set_state(gst::State::Null).expect("null");
+        assert_eq!(spliced, usize::from(tag != "rotate-0"), "{orientation}: stage spliced in iff the tag says rotated ({tag})");
+        pic
+    }
+
+    fn mean_abs_diff(a: &Pic, b: &Pic) -> f64 {
+        if a.len() != b.len() || a[0].len() != b[0].len() {
+            return f64::MAX;
+        }
+        let mut sum = 0u64;
+        for (ra, rb) in a.iter().zip(b) {
+            for (pa, pb) in ra.iter().zip(rb) {
+                for c in 0..3 {
+                    sum += (pa[c] as i32 - pb[c] as i32).unsigned_abs() as u64;
+                }
+            }
+        }
+        sum as f64 / (a.len() * a[0].len() * 3) as f64
+    }
+
+    const ORIENTATION_TAGS: [&str; 8] = [
+        "rotate-0",
+        "rotate-90",
+        "rotate-180",
+        "rotate-270",
+        "flip-rotate-0",
+        "flip-rotate-90",
+        "flip-rotate-180",
+        "flip-rotate-270",
+    ];
+
+    /// The `image-orientation` tag `pipewiresrc` sends for a rotated output
+    /// must come out upright for all eight transforms, with width and height
+    /// swapped for the 90/270 family, through both implementations of the
+    /// stage. `vapostproc` round-trips through a YUV format, so frames are
+    /// compared by nearest match (smaller mean error than every other
+    /// transform) instead of bit-exactly.
+    fn assert_orientation_stage_uprights_every_transform(orientation: &str) {
+        if gst::init().is_err() {
+            eprintln!("skipping: GStreamer unavailable");
+            return;
+        }
+        let first = orientation.split_whitespace().next().unwrap();
+        if gst::ElementFactory::find(first).is_none() {
+            eprintln!("skipping: {first} is not installed");
+            return;
+        }
+        let reference = frame_through_orientation_stage(orientation, "rotate-0");
+        assert_eq!((reference[0].len(), reference.len()), (96, 48), "rotate-0 must not change the size");
+        let all: Vec<Pic> = ORIENTATION_TAGS.iter().map(|t| expected_upright(t, &reference)).collect();
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert!(mean_abs_diff(a, b) > 10.0, "the test pattern must tell the eight orientations apart");
+            }
+        }
+        for (tag, expected) in ORIENTATION_TAGS.iter().zip(&all) {
+            let got = frame_through_orientation_stage(orientation, tag);
+            let (ew, eh) = (expected[0].len(), expected.len());
+            assert_eq!((got[0].len(), got.len()), (ew, eh), "{orientation}: {tag} must {} width and height", if ew == 48 { "swap" } else { "keep" });
+            let best = ORIENTATION_TAGS
+                .iter()
+                .zip(&all)
+                .map(|(t, e)| (mean_abs_diff(&got, e), *t))
+                .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap())
+                .unwrap();
+            assert_eq!(best.1, *tag, "{orientation}: tag {tag} produced a picture that looks like {} (err {:.1})", best.1, best.0);
+        }
+    }
+
+    #[test]
+    fn videoflip_orientation_stage_uprights_every_transform() {
+        assert_orientation_stage_uprights_every_transform(ORIENTATION_VIDEOFLIP);
+    }
+
+    #[test]
+    fn vapostproc_orientation_stage_uprights_every_transform() {
+        // Needs a working VA device, exactly like the stage's own selection.
+        if detect_encoder_backend() != EncoderBackend::Vaapi {
+            eprintln!("skipping: no VA device");
+            return;
+        }
+        assert_orientation_stage_uprights_every_transform(ORIENTATION_VAPOSTPROC);
+    }
+
+    /// An un-rotated output (no tag at all, which is what a compositor with a
+    /// normal transform produces) must pass through the stage untouched and
+    /// keep its size.
+    #[test]
+    fn untagged_source_passes_through_the_orientation_stage_unchanged() {
+        if gst::init().is_err() {
+            return;
+        }
+        for orientation in [ORIENTATION_VIDEOFLIP, ORIENTATION_VAPOSTPROC] {
+            if gst::ElementFactory::find(orientation.split_whitespace().next().unwrap()).is_none() {
+                continue;
+            }
+            if orientation == ORIENTATION_VAPOSTPROC && detect_encoder_backend() != EncoderBackend::Vaapi {
+                continue;
+            }
+            let built = build_pipeline_with_orientation(&asymmetric_test_source(), orientation).expect("pipeline builds");
+            let elements_before = built.pipeline.children().len();
+            built.pipeline.set_state(gst::State::Playing).expect("playing");
+            let pic = pull_rgb(&built.preview_sink);
+            // Nothing was spliced in: an un-rotated source pays nothing.
+            assert_eq!(built.pipeline.children().len(), elements_before, "{orientation}: no stage without a rotation tag");
+            built.pipeline.set_state(gst::State::Null).expect("null");
+            let tagged = frame_through_orientation_stage(orientation, "rotate-0");
+            assert_eq!((pic[0].len(), pic.len()), (96, 48));
+            assert!(mean_abs_diff(&pic, &tagged) < 1.0, "{orientation}: untagged and rotate-0 must agree");
+        }
+    }
+
+    /// LIVE: shares one monitor through the real portal and writes the frame
+    /// the `tee` carries to `$SSS_DUMP_PPM` (a binary PPM), logging every
+    /// orientation tag `pipewiresrc` sends. This is the check that a rotated
+    /// output really arrives upright: compare the dump with `grim -o <output>`.
+    /// Run: `SSS_DUMP_PPM=/path/frame.ppm cargo test
+    /// capture::tests::live_portal_frame_dump -- --ignored --nocapture`.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore]
+    async fn live_portal_frame_dump() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        ensure_gstreamer_initialized().expect("gstreamer init");
+        let source = CaptureSource::Portal(open_portal_capture().await.expect("portal session"));
+        let fragment = source.launch_fragment(DEFAULT_FRAMERATE);
+        // `SSS_ORIENT=identity|videoflip|vapostproc` swaps the stage for A/B
+        // cost measurements on the same rotated output; default = production.
+        let stage = match std::env::var("SSS_ORIENT").as_deref() {
+            Ok("identity") => "identity",
+            Ok("videoflip") => ORIENTATION_VIDEOFLIP,
+            Ok("vapostproc") => ORIENTATION_VAPOSTPROC,
+            _ => orientation_fragment(),
+        };
+        let built = build_pipeline_with_orientation(&fragment, stage).expect("capture pipeline builds");
+        built.pipeline.set_state(gst::State::Playing).expect("playing");
+
+        // Log every orientation tag that reaches the tee, and what the stage chose.
+        if let Some(pad) = built.tee.static_pad("sink") {
+            pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, |_, info| {
+                if let Some(gst::PadProbeData::Event(ev)) = &info.data
+                    && let gst::EventView::Tag(t) = ev.view()
+                    && let Some(o) = t.tag().get::<gst::tags::ImageOrientation>()
+                {
+                    eprintln!("[dump] image-orientation tag at the tee: {}", o.get());
+                }
+                gst::PadProbeReturn::Ok
+            });
+        }
+        let (w, h) = {
+            let mut tries = 0;
+            loop {
+                if let Some(s) = negotiated_size(&built.tee) {
+                    break s;
+                }
+                tries += 1;
+                assert!(tries < 100, "no caps at the tee");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        eprintln!("[dump] tee size {w}x{h}; stage = {stage}");
+
+        // Take the *last* frame within a couple of seconds so that a tag sent
+        // with the first buffers has long since been applied.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut pic = None;
+        while Instant::now() < deadline {
+            if let Some(s) = built.preview_sink.try_pull_sample(gst::ClockTime::from_mseconds(200)) {
+                pic = Some(pull_rgb_sample(&s));
+            }
+        }
+        let pic = pic.expect("a frame from the portal");
+        let (ph, pw) = (pic.len(), pic[0].len());
+        eprintln!("[dump] frame {pw}x{ph}");
+        if let Ok(path) = std::env::var("SSS_DUMP_PPM") {
+            let mut out = format!("P6\n{pw} {ph}\n255\n").into_bytes();
+            for row in &pic {
+                for px in row {
+                    out.extend_from_slice(px);
+                }
+            }
+            std::fs::write(&path, out).expect("write ppm");
+            eprintln!("[dump] wrote {path}");
+        }
+        if let Ok(secs) = std::env::var("SSS_RATE_SECS") {
+            let secs: u64 = secs.parse().unwrap_or(5);
+            eprintln!(
+                "[dump] raw frames off the tee with stage '{stage}': {:.1} fps",
+                branch::tests::tap_tee_rate(&built.pipeline, &built.tee, Duration::from_secs(secs))
+            );
+        }
+        built.pipeline.set_state(gst::State::Null).expect("null");
     }
 }
