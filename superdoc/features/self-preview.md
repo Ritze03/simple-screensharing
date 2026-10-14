@@ -27,7 +27,7 @@ share stops.
 existing 30s JPEG-thumbnail sender (`preview.rs`). Self-preview adds a **third** branch,
 `appsink name=self_preview_sink` (`queue leaky=downstream max-size-buffers=1 ! videorate
 ! videoscale ! video/x-raw,format=RGB,width=...,height=... ! videoconvert ! appsink ...
-max-buffers=1 drop=true`), capped to its own framerate, `capture::SELF_PREVIEW_BRANCH_
+max-buffers=1 drop=true`; in the GPU capture domain the scale is a `vapostproc` that also downloads to BGRx, see `stream-control.md` "Capture/encode performance" — `videorate` is `drop-only` here since 2026-10-14), capped to its own framerate, `capture::SELF_PREVIEW_BRANCH_
 FRAMERATE` (12fps), **and** its own resolution, `capture::SELF_PREVIEW_MAX_WIDTH`/
 `SELF_PREVIEW_MAX_HEIGHT` (320×180 — added 2026-07-28; see `stream-control.md`'s
 "A follow-up freeze after the burst fix above" entry for the real-hardware hang this

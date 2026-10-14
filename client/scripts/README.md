@@ -18,7 +18,7 @@ geometry, `launch-lib.sh: sss_check_monitors`). Facts about the machine:
 | `run-scenario.sh` | one measured share: receiver tooltip screenshots over ~30 s + sender per-stage rates |
 | `run-audio.sh` | share with Spotify's per-app stream; restores Spotify's volume; `audio-probe.py` records the viewer's playback stream |
 | `gst-rate.py` | buffers/s per pad from the tracer log (`--summary`: capture / encode-branch input / encoder output) |
-| `portal-probe.py`, `probe-run.sh` | own ScreenCast portal session: pipewiresrc rate into a chosen tail (isolates portal vs pipeline) |
+| `portal-probe.py`, `probe-run.sh` | own ScreenCast portal session: pipewiresrc rate into a chosen tail (isolates portal vs pipeline). `--src`/`SRC_PROPS` adds pipewiresrc properties (e.g. `min-buffers=6`), `--watch`/`WATCH` prints buffers/s of named elements inside the tail, every `image-orientation` tag is printed. #39 found the 140 fps portal ceiling with it: `keepalive-time` with the default 2-buffer pool halves the rate, see `superdoc/features/stream-control.md` "Capture/encode performance" |
 | `wlr-capture-rate.sh` | compositor's own wlr-screencopy rate for an output (wf-recorder) |
 | `enc-bench.sh` | raw `vah264enc`/`vah265enc`/`vaav1enc` throughput at 1080p |
 | `audio-probe.py` | peak/RMS of a given app's playback stream |

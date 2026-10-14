@@ -5,18 +5,40 @@
 //!
 //! # Pipeline
 //!
+//! The tee carries frames in one of two [`CaptureDomain`]s. **GPU** (Linux
+//! portal capture on a machine with a working VA stack, the normal case on
+//! desktop Linux) keeps everything in GPU memory:
+//!
+//! ```text
+//! pipewiresrc (DMA-BUF) ! vapostproc video-direction=auto
+//!   ! video/x-raw(memory:VAMemory),format=NV12 ! tee name=t
+//!   t. ! queue leaky=downstream max-size-buffers=1 ! videorate drop-only=true ! vapostproc
+//!      ! video/x-raw,format=BGRx,framerate=1/1 ! videoconvert ! video/x-raw,format=RGB
+//!      ! appsink name=preview_sink
+//!   t. ! queue leaky=downstream max-size-buffers=1 ! videorate drop-only=true ! vapostproc
+//!      ! video/x-raw,format=BGRx,width=320,height=180,framerate=12/1 ! videoconvert
+//!      ! video/x-raw,format=RGB ! appsink name=self_preview_sink
+//!   (+ one dynamic branch per destination, see below)
+//! ```
+//!
+//! and **System** (Windows, software `x264enc` machines, tests) is the
+//! original CPU shape:
+//!
 //! ```text
 //! <platform source> ! videoconvert ! video/x-raw,format=BGRx
 //!   [! <vapostproc|videoflip> video-direction=auto  -- only while the source is rotated]
 //!   ! video/x-raw,format=BGRx ! tee name=t
-//!   t. ! queue leaky=downstream max-size-buffers=1 ! videorate ! video/x-raw,framerate=1/1
+//!   t. ! queue leaky=downstream max-size-buffers=1 ! videorate drop-only=true ! video/x-raw,framerate=1/1
 //!      ! videoconvert ! video/x-raw,format=RGB
 //!      ! appsink name=preview_sink
-//!   t. ! queue leaky=downstream max-size-buffers=1 ! videorate ! video/x-raw,framerate=12/1
+//!   t. ! queue leaky=downstream max-size-buffers=1 ! videorate drop-only=true ! video/x-raw,framerate=12/1
 //!      ! videoconvert ! video/x-raw,format=RGB
 //!      ! appsink name=self_preview_sink
 //!   (+ one dynamically added branch per destination — see below)
 //! ```
+//!
+//! See [`CaptureDomain`] for why the GPU domain exists (it is what makes
+//! 120-240 fps of *unique* frames possible at all).
 //!
 //! Those two branches are the pipeline's only *fixed* ones. **There is no
 //! fixed encoder branch**: every outgoing destination — including the first
@@ -24,13 +46,17 @@
 //! [`branch::add_branch`]:
 //!
 //! ```text
-//!   t. ! queue leaky=downstream ! valve drop-mode=forward-sticky-events
-//!      ! videoconvert ! videoscale ! videorate
-//!      ! video/x-raw,format=<backend's>,width=..,height=..,framerate=<this destination's>/1
-//!      ! <x264enc|vah264enc> bitrate=<this destination's> key-int-max=<gop>
+//!   t. ! queue leaky=downstream ! valve drop-mode=forward-sticky-events   (+ a RateCap probe on the valve's src)
+//!      ! <vapostproc | videoconvert ! videoscale>
+//!      ! video/x-raw[(memory:VAMemory)],format=<backend's>,width=..,height=..
+//!      ! capssetter framerate=<this destination's>/1
+//!      ! <x264enc|vah264enc|vah265enc|vaav1enc> bitrate=<this destination's> key-int-max=<gop>
 //!      ! video/x-h264,stream-format=byte-stream,alignment=au
-//!      ! appsink
+//!      ! appsink drop=false
 //! ```
+//!
+//! The destination's fps is a **cap** ([`branch::RateCap`]), never a floor:
+//! nothing in a branch ever duplicates a frame.
 //!
 //! so one capture feeds N rooms as N independently encoded and independently
 //! encrypted streams (a room key can never be shared across rooms), each with
@@ -43,10 +69,14 @@
 //! The bracketed `video-direction=auto` stage makes a **rotated or mirrored
 //! monitor arrive upright** in every destination and preview: `pipewiresrc`
 //! turns the stream's `SPA_META_VideoTransform` into an `image-orientation`
-//! tag, and the stage follows it (swapping width/height for 90/270). The stage
-//! is spliced in only when such a tag says the picture is rotated, so an
-//! un-rotated source pays nothing. See [`orientation_fragment`] for the why,
-//! the GPU-vs-CPU choice and the measurements.
+//! tag, and the stage follows it (swapping width/height for 90/270). In the
+//! GPU domain the source's `vapostproc` *is* that stage (it has to convert the
+//! colour space anyway, so rotating costs nothing extra). In the System domain
+//! the stage is spliced in only when such a tag says the picture is rotated, so
+//! an un-rotated source pays nothing. See [`orientation_fragment`] for the why,
+//! the GPU-vs-CPU choice and the measurements. Verified live (#39): the patched
+//! `xdg-desktop-portal-wlr` does send the transform for the 180-degree-rotated
+//! DP-2 (`image-orientation=rotate-180`), and the viewer sees it upright.
 //!
 //! The pixel format *is* pinned before the `tee`, and for a closely related
 //! reason: it keeps what the source negotiates independent of which branches
@@ -864,6 +894,20 @@ pub const MAX_FRAMERATE: u32 = 280;
 /// See [`MAX_FRAMERATE`].
 pub const MIN_FRAMERATE: u32 = 1;
 
+/// `pipewiresrc` `min-buffers` for the portal stream. See
+/// [`CaptureSource::launch_fragment`]: with `keepalive-time` set, one buffer is
+/// always held back, and the portal's default pool of two then halves the
+/// delivered rate.
+const PORTAL_MIN_BUFFERS: u32 = 6;
+
+/// Frame rate a *static* screen is kept alive at: `pipewiresrc`'s
+/// `keepalive-time` is `1000 / min(selected fps, this)` ms (see
+/// [`CaptureSource::launch_fragment`] for the why). The keepalive only exists
+/// so an idle desktop still produces periodic frames (the encoder converges,
+/// the viewer sees the stream is alive); it must stay well below any rate a
+/// real source delivers, or its resends compete with real frames.
+const STATIC_KEEPALIVE_FPS: u32 = 30;
+
 /// Protocol-spec's 2-second GOP interval (§9: "the next scheduled 2 s
 /// keyframe") as this pipeline's *default*, in milliseconds — every
 /// destination gets this unless its
@@ -949,47 +993,54 @@ impl CaptureSource {
                 // `keepalive-time=<ms>` is load-bearing, not cosmetic: a
                 // portal `ScreenCast` PipeWire stream is damage-driven by the
                 // compositor (Mutter/KWin/wlroots backends) — it only pushes
-                // a new buffer when something visually changed on screen, as
-                // a bandwidth/CPU-saving optimization at the compositor
-                // level. When the desktop is static, `pipewiresrc` pushes
-                // *nothing at all*, and the `videorate` cap further
-                // downstream (see [`build_pipeline`]) cannot invent frames
-                // out of nothing — it only fills gaps *between* buffers it
-                // actually receives, by duplicating on receipt of the next
-                // one. With no next buffer ever arriving, capture output
-                // (and therefore the stream sent to the viewer) simply stops
-                // until the screen changes again, at which point everything
-                // that piled up since the last real frame gets flushed
-                // through in a burst — this is the reported "sender fps
-                // looks constant but the viewer's fluctuates, and right
-                // after a change the image is frozen and artifacted" bug:
-                // the encoder's rate control was still converging from the
-                // last burst of motion when frame production stopped dead,
-                // so the blockiest frame from that burst is what stays on
-                // screen indefinitely.
+                // a new buffer when something visually changed on screen. When
+                // the desktop is static, `pipewiresrc` pushes *nothing at
+                // all*, so the encoder's rate control has no frames to
+                // converge quality back down on after a motion burst (the
+                // blockiest frame of the burst stays on screen indefinitely),
+                // the viewer sees no sign of life, and the destination's
+                // silence watchdog would fire. `keepalive-time` (ms, 0 =
+                // disabled) makes the element itself resend its last buffer
+                // when the compositor delivers nothing new, turning "zero
+                // frames during an idle gap of arbitrary length" into "the
+                // last frame again on a steady clock".
                 //
-                // `pipewiresrc`'s `keepalive-time` (ms, 0 = disabled per
-                // `gst-inspect-1.0 pipewiresrc`) makes the element itself
-                // periodically resend its last buffer even when the
-                // compositor delivers nothing new, so there is always a
-                // fresh buffer for `videorate` to work with at (at least) the
-                // selected framerate — turning "zero frames during an idle
-                // gap of arbitrary length" into "the last frame duplicated on
-                // a steady clock", which is exactly the "fully static
-                // framerate, always the selected one" behavor asked for.
-                // Set from the *selected* `framerate` (floor of the frame
-                // interval in ms, so this fires at least as often as the
-                // target rate — `videorate`'s own `framerate={framerate}/1`
-                // caps below normalize the exact rate regardless) rather
-                // than a fixed constant, so raising/lowering the selected
-                // framerate keeps this in lockstep. Never 0 for any
-                // in-range `framerate` (`MIN_FRAMERATE..=MAX_FRAMERATE` is
-                // `1..=MAX_FRAMERATE`, and `1000 / MAX_FRAMERATE` is always
-                // >= 1 for any sane ceiling), so this can never accidentally
-                // disable the keepalive.
-                let keepalive_ms = (1000 / framerate.clamp(MIN_FRAMERATE, MAX_FRAMERATE)).max(1);
+                // `Why the interval is capped at STATIC_KEEPALIVE_FPS rather
+                // than following the selected rate (measured, #39):` the
+                // timer fires whenever the *portal* is slower than it. On a
+                // 280 Hz output the portal delivers a buffer every 3.6 ms;
+                // with `keepalive-time=4` any 4 ms hiccup injects a resend of
+                // the previous frame, and those resends are indistinguishable
+                // from real frames downstream. They took queue slots and
+                // `videorate` slots from real frames ("pipewiresrc 200 fps",
+                // of which only 55 were unique). A static screen needs a
+                // heartbeat, not the full selected rate, so it is 30 fps (or
+                // the selected rate when that is lower). Never 0 for any
+                // in-range `framerate`, so it can never disable the keepalive.
+                let keepalive_fps = framerate.clamp(MIN_FRAMERATE, MAX_FRAMERATE).min(STATIC_KEEPALIVE_FPS);
+                let keepalive_ms = (1000 / keepalive_fps).max(1);
+                //
+                // `Why min-buffers={PORTAL_MIN_BUFFERS} (measured, #39 — this is half of the "portal
+                // delivers exactly half the output's rate" ceiling):`
+                // `keepalive-time` makes the element keep its last buffer
+                // (it resends it), so that PipeWire buffer is never handed
+                // back to the producer. The portal negotiates a pool of only
+                // two buffers by default, so with one held back the portal can
+                // only fill one while we process the other, i.e. it waits for
+                // a release every frame. Measured on `xdg-desktop-portal-wlr`
+                // against a 280 Hz output, `client/scripts/portal-probe.py`,
+                // DMA-BUF path (cursor mode and keepalive swept):
+                //
+                // | keepalive-time | min-buffers | fps |
+                // | --- | --- | --- |
+                // | 0 | default | 279 |
+                // | 33 | default | **140** (any cursor mode) |
+                // | 33 | 3, 4, 8 | 279 |
+                //
+                // A few spare buffers cost a few MB of GPU memory and give the
+                // full rate back.
                 format!(
-                    "pipewiresrc fd={} path={} do-timestamp=true keepalive-time={keepalive_ms}",
+                    "pipewiresrc fd={} path={} do-timestamp=true keepalive-time={keepalive_ms} min-buffers={PORTAL_MIN_BUFFERS}",
                     portal._pipewire_fd.as_raw_fd(),
                     portal.node_id
                 )
@@ -1288,77 +1339,6 @@ const SELF_PREVIEW_SINK_NAME: &str = "self_preview_sink";
 /// without ever letting a real backlog accumulate.
 const ENCODER_QUEUE_MAX_BUFFERS: u32 = 2;
 
-/// How large a gap each encode branch's `videorate` will still fill by
-/// duplicating the last frame it saw, in nanoseconds (`videorate`'s
-/// `max-duplication-time`, where `0` means *no limit*).
-///
-/// `Why this must be bounded — the "resuming a stream doesn't work" bug:`
-/// `drop-only=false` is what lets a branch hold its configured framerate on
-/// a completely static screen, by duplicating the last frame instead of
-/// emitting nothing (see [`branch::add_branch`]). Unbounded, that same
-/// mechanism turns every *pause* into a replay. A branch's `valve` sits
-/// directly upstream of its `videorate`, so pausing a destination with no
-/// subscribers looks exactly like a silent source — and the moment the valve
-/// reopened, `videorate` synthesised one duplicate of the frozen pre-pause
-/// frame for every frame period of the entire pause before letting a live
-/// frame through. Measured on a 35s pause: ~1000 stale duplicates encoded,
-/// encrypted and sent, which the viewer's `decode::PacingState` then paced
-/// out by their (evenly spaced, entirely valid) PTS — a real-time replay of
-/// the whole pause showing one frozen image. To the user that is "resuming
-/// doesn't work; I have to restart the share".
-///
-/// `Why one second specifically:` the gaps this is *supposed* to fill are
-/// bounded by the source's own keepalive — `pipewiresrc`'s `keepalive-time`
-/// is one frame period (see [`CaptureSource::launch_fragment`]), so a real
-/// static desktop never goes more than a frame or two without a buffer. A
-/// second is orders of magnitude of headroom over that while capping the
-/// worst-case replay at something imperceptible. Anything longer than this
-/// is not a static screen, it is an outage or a pause, and the right
-/// response to both is to resume at the live edge.
-const BRANCH_MAX_DUPLICATION_TIME_NS: u64 = 1_000_000_000;
-
-/// `videorate`'s `skip-to-first` for every encode branch: *"don't produce
-/// buffers before the first one we receive"*.
-///
-/// `Why this must be on — the "changing the preset makes the FPS shoot up to
-/// 300+ and sometimes crashes the stream" bug:` a `videorate` whose output
-/// timeline is unanchored starts that timeline at its **segment start**, not
-/// at the first buffer it actually sees. Every branch this module builds is
-/// added to a pipeline that is *already running* ([`branch::add_branch`] is
-/// called for a tier-2 swap, for a fan-out/transfer destination, and after a
-/// source restart — never at pipeline construction), and it inherits the
-/// capture's segment, which started when the *capture* started. So the new
-/// branch's `videorate` considered itself late by the capture's entire
-/// elapsed lifetime and raced to catch up, emitting one encoded access unit
-/// per frame period of that whole history as fast as the encoder could chew
-/// them — every one of which [`destination_pump`] then encrypts, fragments
-/// and pushes at the relay.
-///
-/// Measured, on this project's own real desktop capture with the machine's
-/// real (VAAPI) encoder, by
-/// `applying_a_preset_never_bursts_a_branch_above_its_configured_framerate`:
-/// a destination configured at 30fps burst to a **peak of 76fps** after a
-/// preset change on a capture that had been up 3 seconds, and to **181fps**
-/// (~350fps instantaneous) on one that had been up 10 seconds — the burst
-/// scales linearly with how long the share has been live, which is why a
-/// real, minutes-old share produced the reported 300+ and took the stream
-/// down with it.
-///
-/// `Why not [`BRANCH_MAX_DUPLICATION_TIME_NS`] instead:` that bounds
-/// duplication *between two buffers this branch actually received*, which is
-/// the pause/resume case it was added for. It does not govern the
-/// segment-start-to-first-buffer catch-up at all — the measurement above was
-/// taken with `max-duplication-time` already set to one second and the branch
-/// still replayed ten. The two settings fix two different holes and both are
-/// required.
-///
-/// `Why this is safe for the static-screen guarantee:` `skip-to-first` only
-/// decides where the output timeline *starts*. Once the first real buffer has
-/// arrived, `drop-only=false` duplication behaves exactly as before, so a
-/// branch still holds its configured framerate on a completely static
-/// desktop (`a_destinations_framerate_actually_caps_its_encoder_output_rate`
-/// still passes unchanged).
-const BRANCH_SKIP_TO_FIRST: bool = true;
 
 /// The one raw pixel format the whole capture is pinned to between the
 /// source and the `tee` (see [`build_pipeline`]). Every branch converts away
@@ -1397,6 +1377,85 @@ const BRANCH_SKIP_TO_FIRST: bool = true;
 /// conversion, and it stays a packed 4-byte format so the buffer sizes on
 /// the tee are unchanged.
 const SOURCE_RAW_FORMAT: &str = "BGRx";
+
+/// Where the raw frames on the capture's `tee` live, and so which elements the
+/// branches hanging off it are made of.
+///
+/// `Why two domains (the #39 capture/encode rework):` the original pipeline
+/// was `pipewiresrc ! videoconvert ! BGRx ! tee` with a CPU `videoconvert`
+/// BGRx to NV12 in every encode branch. That shape caps real 1080p screen
+/// sharing well under 240 fps for three measured reasons, all removed by
+/// [`Self::Gpu`]:
+///
+/// 1. `pipewiresrc ! videoconvert` only offers system-memory caps, so the
+///    portal (`xdg-desktop-portal-wlr`) hands out **shared-memory** buffers.
+///    The compositor then has to read the whole 8 MB frame back into RAM, which
+///    takes longer than one vblank on a 280 Hz output, so every second
+///    `copy_with_damage` is missed: the portal delivered **140 fps from a
+///    280 Hz output**, exactly half, in four runs. Offering DMA-BUF (any GPU
+///    element downstream does) makes the very same portal deliver **280 fps**
+///    (`client/scripts/portal-probe.py`, tail starting with `vapostproc`,
+///    measured).
+/// 2. CPU `videoconvert` BGRx to NV12 costs ~4.7 ms per 1080p frame (a ~210
+///    fps ceiling) on the thread that also runs the encoder.
+/// 3. Rotating needed a second GPU round trip (see [`orientation_fragment`]).
+///
+/// [`Self::Gpu`] is `pipewiresrc (DMA-BUF) ! vapostproc video-direction=auto !
+/// video/x-raw(memory:VAMemory),format=NV12 ! tee`: one GPU pass does colour
+/// conversion and orientation, the PipeWire buffer is released immediately
+/// (so the portal's small buffer pool never starves behind slow branches), and
+/// the VA encoders take the VAMemory frames with no download at all.
+/// [`Self::System`] is the original shape and stays the fallback for machines
+/// without a working VA stack (software `x264enc`) and for Windows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureDomain {
+    /// System-memory BGRx on the tee; branches convert on the CPU.
+    System,
+    /// VAMemory NV12 on the tee; branches use `vapostproc`.
+    Gpu,
+}
+
+/// Name of the source-side `vapostproc` of a [`CaptureDomain::Gpu`] pipeline.
+/// Its presence is how [`branch::add_branch`] tells which domain the `tee`
+/// carries.
+const GPU_STAGE_NAME: &str = "gpu_in";
+
+/// Caps of the `tee` in [`CaptureDomain::Gpu`].
+const GPU_TEE_CAPS: &str = "video/x-raw(memory:VAMemory),format=NV12";
+
+impl CaptureDomain {
+    /// The domain a running pipeline was built in.
+    fn of(pipeline: &gst::Pipeline) -> Self {
+        if pipeline.by_name(GPU_STAGE_NAME).is_some() { Self::Gpu } else { Self::System }
+    }
+
+    /// The domain to capture `source` in. [`Self::Gpu`] needs a real portal
+    /// source (the only one that can hand out DMA-BUF), a working VA encoder
+    /// stack and `vapostproc`; `SSS_CAPTURE_PATH=system` forces the CPU path
+    /// for A/B measurements.
+    fn for_source(source: &CaptureSource) -> Self {
+        #[cfg(unix)]
+        if matches!(source, CaptureSource::Portal(_)) && gpu_capture_available() {
+            return Self::Gpu;
+        }
+        let _ = source;
+        Self::System
+    }
+}
+
+/// Whether [`CaptureDomain::Gpu`] can be used on this machine (cached).
+#[cfg_attr(not(unix), allow(dead_code))]
+fn gpu_capture_available() -> bool {
+    use std::sync::OnceLock;
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        if std::env::var("SSS_CAPTURE_PATH").is_ok_and(|v| v == "system") {
+            return false;
+        }
+        let _ = ensure_gstreamer_initialized();
+        detect_encoder_backend() == EncoderBackend::Vaapi && gst::ElementFactory::find("vapostproc").is_some()
+    })
+}
 
 /// Orientation stage, implementation 1: VA-API post-processing. It rotates and
 /// flips on the GPU, so it is the one to use whenever VA works.
@@ -1600,13 +1659,23 @@ struct CapturePipeline {
 /// [`CaptureSource::launch_fragment`]) and each destination through its own
 /// branch's `videorate` ([`branch::add_branch`]), so nothing in *this*
 /// description depends on it.
+#[cfg(test)]
 fn build_pipeline(source_fragment: &str) -> Result<CapturePipeline> {
-    build_pipeline_with_orientation(source_fragment, orientation_fragment())
+    build_pipeline_in(source_fragment, CaptureDomain::System)
+}
+
+/// [`build_pipeline`] in an explicit [`CaptureDomain`].
+fn build_pipeline_in(source_fragment: &str, domain: CaptureDomain) -> Result<CapturePipeline> {
+    match domain {
+        CaptureDomain::System => build_pipeline_with_orientation(source_fragment, orientation_fragment()),
+        CaptureDomain::Gpu => build_pipeline_from_description(&gpu_pipeline_description(source_fragment), domain, ""),
+    }
 }
 
 /// [`build_pipeline`] with the orientation stage ([`arm_orientation_stage`])
 /// chosen by the caller, so the tests can run both implementations
 /// ([`ORIENTATION_VAPOSTPROC`] and [`ORIENTATION_VIDEOFLIP`]) on any machine.
+/// System domain only: the GPU domain's `vapostproc` is the orientation stage.
 fn build_pipeline_with_orientation(source_fragment: &str, orientation: &str) -> Result<CapturePipeline> {
     let description = format!(
         "{source_fragment} \
@@ -1615,13 +1684,13 @@ fn build_pipeline_with_orientation(source_fragment: &str, orientation: &str) -> 
          ! capsfilter name={ORIENT_OUT_NAME} caps=video/x-raw,format={SOURCE_RAW_FORMAT} \
          ! tee name={TEE_NAME} \
          {TEE_NAME}. ! queue leaky=downstream max-size-buffers=1 \
-            ! videorate \
+            ! videorate drop-only=true \
             ! video/x-raw,framerate={PREVIEW_BRANCH_FRAMERATE}/1 \
             ! videoconvert \
             ! video/x-raw,format=RGB \
             ! appsink name=preview_sink emit-signals=false sync=false max-buffers=1 drop=true \
          {TEE_NAME}. ! queue leaky=downstream max-size-buffers=1 \
-            ! videorate \
+            ! videorate drop-only=true \
             ! video/x-raw,framerate={SELF_PREVIEW_BRANCH_FRAMERATE}/1 \
             ! videoscale \
             ! video/x-raw,width={SELF_PREVIEW_MAX_WIDTH},height={SELF_PREVIEW_MAX_HEIGHT} \
@@ -1629,8 +1698,38 @@ fn build_pipeline_with_orientation(source_fragment: &str, orientation: &str) -> 
             ! video/x-raw,format=RGB \
             ! appsink name={SELF_PREVIEW_SINK_NAME} emit-signals=false sync=false max-buffers=1 drop=true"
     );
+    build_pipeline_from_description(&description, CaptureDomain::System, orientation)
+}
 
-    let element = gst::parse::launch(&description)
+/// The [`CaptureDomain::Gpu`] description: see [`CaptureDomain`] for why it is
+/// shaped like this. The two preview branches download from the GPU
+/// themselves (`vapostproc` to a system-memory BGRx, at 1 and 12 fps), and
+/// the self-preview scales on the GPU before the download.
+fn gpu_pipeline_description(source_fragment: &str) -> String {
+    format!(
+        "{source_fragment} \
+         ! vapostproc name={GPU_STAGE_NAME} video-direction=auto \
+         ! capsfilter caps={GPU_TEE_CAPS} \
+         ! tee name={TEE_NAME} \
+         {TEE_NAME}. ! queue leaky=downstream max-size-buffers=1 \
+            ! videorate drop-only=true \
+            ! vapostproc \
+            ! video/x-raw,format={SOURCE_RAW_FORMAT},framerate={PREVIEW_BRANCH_FRAMERATE}/1 \
+            ! videoconvert \
+            ! video/x-raw,format=RGB \
+            ! appsink name=preview_sink emit-signals=false sync=false max-buffers=1 drop=true \
+         {TEE_NAME}. ! queue leaky=downstream max-size-buffers=1 \
+            ! videorate drop-only=true \
+            ! vapostproc \
+            ! video/x-raw,format={SOURCE_RAW_FORMAT},width={SELF_PREVIEW_MAX_WIDTH},height={SELF_PREVIEW_MAX_HEIGHT},framerate={SELF_PREVIEW_BRANCH_FRAMERATE}/1 \
+            ! videoconvert \
+            ! video/x-raw,format=RGB \
+            ! appsink name={SELF_PREVIEW_SINK_NAME} emit-signals=false sync=false max-buffers=1 drop=true"
+    )
+}
+
+fn build_pipeline_from_description(description: &str, domain: CaptureDomain, orientation: &str) -> Result<CapturePipeline> {
+    let element = gst::parse::launch(description)
         .with_context(|| format!("failed to construct capture pipeline: {description}"))?;
     let pipeline = element
         .downcast::<gst::Pipeline>()
@@ -1652,8 +1751,10 @@ fn build_pipeline_with_orientation(source_fragment: &str, orientation: &str) -> 
         .by_name(TEE_NAME)
         .ok_or_else(|| anyhow!("pipeline has no element named '{TEE_NAME}'"))?;
 
-    isolate_source_from_branch_renegotiation(&tee)?;
-    arm_orientation_stage(&pipeline, orientation)?;
+    isolate_source_from_branch_renegotiation(&tee, domain)?;
+    if domain == CaptureDomain::System {
+        arm_orientation_stage(&pipeline, orientation)?;
+    }
 
     // Installed before the pipeline ever leaves `Null`, so the very first
     // buffer cannot slip past it. Removes itself after firing: no per-buffer
@@ -1716,7 +1817,7 @@ fn build_pipeline_with_orientation(source_fragment: &str, orientation: &str) -> 
 /// tee carries to whatever that destination wants. So the event has no
 /// legitimate work to do here, and forwarding it only exposes the source to
 /// a renegotiation it cannot survive.
-fn isolate_source_from_branch_renegotiation(tee: &gst::Element) -> Result<()> {
+fn isolate_source_from_branch_renegotiation(tee: &gst::Element, domain: CaptureDomain) -> Result<()> {
     let sink = tee
         .static_pad("sink")
         .ok_or_else(|| anyhow!("tee '{TEE_NAME}' has no sink pad to guard against renegotiation"))?;
@@ -1740,11 +1841,17 @@ fn isolate_source_from_branch_renegotiation(tee: &gst::Element) -> Result<()> {
     // `videoconvert`/`videoflip` never scale, which is why nothing needed this
     // before. Answering "anything in the pinned format" keeps every branch's
     // wishes where they belong, inside the branch.
-    sink.add_probe(gst::PadProbeType::QUERY_DOWNSTREAM, |_, info| {
+    sink.add_probe(gst::PadProbeType::QUERY_DOWNSTREAM, move |_, info| {
         if let Some(gst::PadProbeData::Query(query)) = &mut info.data
             && let gst::QueryViewMut::Caps(q) = query.view_mut()
         {
-            let any_size = gst::Caps::builder("video/x-raw").field("format", SOURCE_RAW_FORMAT).build();
+            let any_size = match domain {
+                CaptureDomain::System => gst::Caps::builder("video/x-raw").field("format", SOURCE_RAW_FORMAT).build(),
+                CaptureDomain::Gpu => gst::Caps::builder("video/x-raw")
+                    .features(["memory:VAMemory"])
+                    .field("format", "NV12")
+                    .build(),
+            };
             let answer = match q.filter() {
                 Some(filter) => filter.intersect_with_mode(&any_size, gst::CapsIntersectMode::First),
                 None => any_size,
@@ -1795,8 +1902,8 @@ fn isolate_source_from_branch_renegotiation(tee: &gst::Element) -> Result<()> {
 /// thread pool doesn't fix GStreamer's own timeout unreliability, but it
 /// confines the damage to one throwaway blocking-pool thread instead of
 /// starving the whole app.
-fn start_pipeline(source_fragment: &str) -> Result<CapturePipeline> {
-    let built = build_pipeline(source_fragment)?;
+fn start_pipeline(source_fragment: &str, domain: CaptureDomain) -> Result<CapturePipeline> {
+    let built = build_pipeline_in(source_fragment, domain)?;
 
     if let Err(e) = built.pipeline.set_state(gst::State::Playing) {
         let _ = built.pipeline.set_state(gst::State::Null);
@@ -2229,9 +2336,21 @@ async fn start_capture_with_source(framerate: u32, capture_source: CaptureSource
     // other command). Running it on `spawn_blocking`'s separate, elastic
     // thread pool instead confines a stuck state-change to one throwaway
     // thread there, no matter how long (or whether) it ever returns.
-    let built = tokio::task::spawn_blocking(move || start_pipeline(&source_fragment))
-        .await
-        .map_err(|e| anyhow!("capture pipeline startup task panicked: {e}"))??;
+    //
+    // `Why the GPU domain falls back to the CPU one on a start failure:` the
+    // GPU path depends on the driver accepting DMA-BUF from the compositor and
+    // on `vapostproc` negotiating with it. If that fails at start the share
+    // must still come up, just slower, instead of failing outright.
+    let domain = CaptureDomain::for_source(&capture_source);
+    let built = tokio::task::spawn_blocking(move || match start_pipeline(&source_fragment, domain) {
+        Err(e) if domain == CaptureDomain::Gpu => {
+            tracing::warn!("GPU capture path failed to start ({e:#}); falling back to the CPU path");
+            start_pipeline(&source_fragment, CaptureDomain::System)
+        }
+        other => other,
+    })
+    .await
+    .map_err(|e| anyhow!("capture pipeline startup task panicked: {e}"))??;
     let CapturePipeline { pipeline, tee, preview_sink, self_preview_sink, frame_seen } = built;
 
     // Size for the never-upscale clamp ([`destination::clamp_to_source`]) and
@@ -4920,6 +5039,67 @@ pub mod branch {
         NEXT_BRANCH_INDEX.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// A frame-rate **cap** for one encode branch: admits buffers so that at
+    /// most `fps` per second get through, never inventing any, and never
+    /// bursting to "catch up" after the branch was blocked or paused.
+    ///
+    /// `Why this instead of `videorate drop-only=true` (measured, #39):`
+    /// videorate's drop-only mode keeps an output grid (`next_ts`, advanced by
+    /// one frame period per frame it passes) and passes every frame whose
+    /// timestamp is at or past the grid. If the branch is blocked for a while
+    /// (a saturated encoder pushing back, or a paused `valve`), the grid falls
+    /// behind real time, and afterwards *every* frame passes until it has
+    /// caught up: a 30 fps cap on a 60 fps source ran at 66, 60 and 54 fps in
+    /// the three half-seconds after a 1.5 s block. That is the "fps shoots up
+    /// to 300+" class of bug this module has fixed before. This type is the
+    /// same grid, plus one rule: a frame that arrives more than one period
+    /// behind the grid resynchronises it instead of being chased.
+    ///
+    /// `Why half a period of tolerance:` a frame that arrives slightly early
+    /// still counts for the grid slot it is nearest to (round to nearest,
+    /// like videorate), so a 280 fps source into a 240 fps cap yields 240, not
+    /// the 140 that "pass only if a full period has elapsed since the last
+    /// one" would. The grid advances by exactly one period per admitted frame,
+    /// so the long-run rate is `min(source rate, fps)`.
+    ///
+    /// The first frame ever admitted anchors the grid at its own timestamp, so a
+    /// branch added to a long-running capture is not judged against the
+    /// capture's (much older) segment start. `videorate` needed `skip-to-first`
+    /// for that; without it a 30 fps branch burst to 76 fps (3 s into a capture)
+    /// and 181 fps (10 s) after a preset change.
+    #[derive(Debug, Clone)]
+    pub struct RateCap {
+        period_ns: u64,
+        next_ns: Option<u64>,
+    }
+
+    impl RateCap {
+        /// A buffer further ahead of the grid than this is a timeline restart
+        /// (a new segment), not a fast source: resynchronise on it.
+        const RESYNC_AHEAD_NS: u64 = 1_000_000_000;
+
+        pub fn new(fps: u32) -> Self {
+            RateCap { period_ns: 1_000_000_000 / u64::from(fps.max(1)), next_ns: None }
+        }
+
+        /// Whether the buffer stamped `pts_ns` is admitted.
+        pub fn admit(&mut self, pts_ns: u64) -> bool {
+            let Some(next) = self.next_ns else {
+                self.next_ns = Some(pts_ns + self.period_ns);
+                return true;
+            };
+            if next > pts_ns + Self::RESYNC_AHEAD_NS {
+                self.next_ns = Some(pts_ns + self.period_ns);
+                return true;
+            }
+            if pts_ns + self.period_ns / 2 < next {
+                return false;
+            }
+            self.next_ns = Some(if pts_ns > next + self.period_ns { pts_ns + self.period_ns } else { next + self.period_ns });
+            true
+        }
+    }
+
     /// Requests a new pad from `tee` and builds+links a fresh, independent
     /// encode branch onto it: `queue leaky=downstream max-size-buffers=2 !
     /// videoconvert ! videoscale ! videorate ! capsfilter(format,w,h,fps) !
@@ -5048,28 +5228,60 @@ pub mod branch {
         // forward sticky events so [`remove_branch`]'s injected EOS still
         // drains through a paused branch instead of hanging its 5s timeout.
         //
-        // `videorate drop-only=false` is what holds this destination's
-        // configured rate on a static screen (duplicating the last frame
-        // rather than emitting nothing); `max-duplication-time` bounds how
-        // much of a gap it will fill that way, which is load-bearing
-        // precisely *because* the `valve` above is upstream of it — see
-        // [`super::BRANCH_MAX_DUPLICATION_TIME_NS`] and
-        // `a_long_pause_resumes_at_the_live_edge_instead_of_replaying_the_gap`.
+        // The target fps is a CAP, never a floor ([`RateCap`], a pad probe on
+        // the valve's src pad). `Why (the #39 "3 unique fps behind a 169 fps
+        // stream" bug):` the branch used to *pad* up to the target by
+        // duplicating frames with `videorate drop-only=false`. When the
+        // encoder cannot sustain the target (VA: H.264 ~165 fps, AV1 ~113 fps
+        // at 1080p) the queue upstream drops frames, `videorate` answers each
+        // gap with a run of duplicates, the encoder spends its time encoding
+        // those, and the queue drops yet more real frames: a feedback loop that
+        // left 3 real frames per second inside a "169 fps" stream. A cap has no
+        // such loop: a slow encoder just gets fewer (all real) frames, and a
+        // static screen is kept alive by `pipewiresrc`'s `keepalive-time` plus
+        // the stall protocol's cached IDR, not by padding here. It also
+        // removes the old pause-replay hazard (`max-duplication-time`), since
+        // nothing is ever synthesised.
         //
-        // `skip-to-first=true` is load-bearing too, for a *different* reason
-        // than `max-duplication-time` — see [`super::BRANCH_SKIP_TO_FIRST`]'s
-        // doc comment for the runaway-fps incident it fixes.
+        // The cap sits right after the valve, before the scale/convert stage,
+        // so frames that will be dropped never cost a GPU/CPU pass. The
+        // `capssetter` after the convert stage only stamps the cap's
+        // `framerate=N/1` onto the caps: the encoder needs the real target
+        // for its rate control (a variable-rate `0/1` makes `va*enc` assume
+        // 30 fps and mis-size every frame), while nothing converts the rate.
+        //
+        // The scale/convert stage follows the capture domain
+        // ([`CaptureDomain`]): on the GPU domain one `vapostproc` scales and
+        // keeps the frame in VAMemory NV12 for the VA encoder (no download);
+        // a software encoder branch on that tee downloads to I420 instead.
+        // On the system domain it is the CPU `videoconvert ! videoscale`.
+        let domain = CaptureDomain::of(pipeline);
+        let convert = match (domain, settings.backend) {
+            (CaptureDomain::Gpu, EncoderBackend::Vaapi) => {
+                format!("! vapostproc ! video/x-raw(memory:VAMemory),format=NV12{scale_caps}")
+            }
+            (CaptureDomain::Gpu, EncoderBackend::Software) => {
+                format!("! vapostproc ! video/x-raw,format={raw_format}{scale_caps}")
+            }
+            (CaptureDomain::System, _) => {
+                format!("! videoconvert ! videoscale ! video/x-raw,format={raw_format}{scale_caps}")
+            }
+        };
+        // The encoded-side appsink must never drop: it used to be
+        // `drop=true`, which discards the *oldest* queued access unit, i.e.
+        // possibly the IDR a new viewer needs or a reference frame the next
+        // P-frames depend on. All load shedding happens in the raw-frame
+        // `queue leaky=downstream` above (which drops the oldest *raw* frame);
+        // if the consumer ever stalls, the encoder blocks and that queue
+        // absorbs it.
         let description = format!(
             "queue leaky=downstream max-size-buffers={ENCODER_QUEUE_MAX_BUFFERS} \
              ! valve name={valve_name} drop=false drop-mode=forward-sticky-events \
-             ! videoconvert \
-             ! videoscale \
-             ! videorate drop-only=false skip-to-first={BRANCH_SKIP_TO_FIRST} \
-               max-duplication-time={BRANCH_MAX_DUPLICATION_TIME_NS} \
-             ! video/x-raw,format={raw_format}{scale_caps},framerate={framerate}/1 \
+             {convert} \
+             ! capssetter caps=video/x-raw,framerate={framerate}/1 join=true replace=false \
              ! {encoder} name={encoder_name} \
              ! {output_caps} \
-             ! appsink name={appsink_name} emit-signals=false sync=false max-buffers=4 drop=true"
+             ! appsink name={appsink_name} emit-signals=false sync=false max-buffers=8 drop=false"
         );
 
         // `ghost_unlinked_pads=true` auto-creates a ghost pad on the bin for
@@ -5091,6 +5303,22 @@ pub mod branch {
         let valve = bin
             .by_name(&valve_name)
             .ok_or_else(|| anyhow!("branch bin has no element named '{valve_name}'"))?;
+
+        let cap = Mutex::new(RateCap::new(framerate));
+        valve
+            .static_pad("src")
+            .ok_or_else(|| anyhow!("valve '{valve_name}' has no src pad"))?
+            .add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+                let Some(gst::PadProbeData::Buffer(buffer)) = &info.data else { return gst::PadProbeReturn::Ok };
+                // A buffer without a timestamp cannot be paced; let it through.
+                let Some(pts) = buffer.pts() else { return gst::PadProbeReturn::Ok };
+                if cap.lock().unwrap().admit(pts.nseconds()) {
+                    gst::PadProbeReturn::Ok
+                } else {
+                    gst::PadProbeReturn::Drop
+                }
+            })
+            .ok_or_else(|| anyhow!("failed to install the frame-rate cap on '{valve_name}'"))?;
 
         let branch_sink_pad = bin.static_pad("sink").ok_or_else(|| {
             anyhow!("branch bin has no ghost sink pad (the queue's sink pad should have been auto-ghosted)")
@@ -5875,6 +6103,175 @@ pub mod branch {
             (pipeline, tee)
         }
 
+        /// Feeds `RateCap` a steady `source_fps` stream for `secs` seconds and
+        /// returns how many frames it admits per second.
+        fn cap_rate(cap_fps: u32, source_fps: u32, secs: u64) -> f64 {
+            let mut cap = RateCap::new(cap_fps);
+            let n = u64::from(source_fps) * secs;
+            let admitted = (0..n).filter(|i| cap.admit(i * 1_000_000_000 / u64::from(source_fps))).count();
+            admitted as f64 / secs as f64
+        }
+
+        #[test]
+        fn rate_cap_holds_the_target_for_a_faster_source() {
+            // 280 Hz portal into the 240 fps cap: 240, not the 140 that
+            // "a full period since the last frame" would give.
+            assert!((cap_rate(240, 280, 10) - 240.0).abs() < 2.0, "{}", cap_rate(240, 280, 10));
+            assert!((cap_rate(30, 60, 10) - 30.0).abs() < 1.0);
+            assert!((cap_rate(120, 280, 10) - 120.0).abs() < 2.0);
+        }
+
+        #[test]
+        fn rate_cap_never_invents_or_pads_for_a_slower_source() {
+            assert_eq!(cap_rate(240, 60, 5), 60.0);
+            assert_eq!(cap_rate(60, 60, 5), 60.0);
+            // 10 fps of "static screen" keepalive stays 10 fps.
+            assert_eq!(cap_rate(240, 10, 5), 10.0);
+        }
+
+        #[test]
+        fn rate_cap_does_not_burst_after_a_gap() {
+            // 60 fps source, 30 fps cap, 1.5 s of nothing (a blocked encoder or
+            // a paused valve), then the source resumes: the 0.5 s right after the
+            // gap must still be ~30 fps. videorate drop-only passed 66, 60 and
+            // 54 fps in the three half-seconds after such a gap.
+            let mut cap = RateCap::new(30);
+            let step = 1_000_000_000u64 / 60;
+            for i in 0..120u64 {
+                cap.admit(i * step);
+            }
+            let resume = 120 * step + 1_500_000_000;
+            let admitted = (0..30u64).filter(|i| cap.admit(resume + i * step)).count();
+            assert!((14..=16).contains(&admitted), "30 source frames after a gap admitted {admitted}, want ~15");
+        }
+
+        #[test]
+        fn rate_cap_resynchronises_on_a_timeline_restart() {
+            let mut cap = RateCap::new(30);
+            for i in 0..60u64 {
+                cap.admit(100_000_000_000 + i * 16_666_667);
+            }
+            // The segment restarted at 0: the very next frames must flow again
+            // instead of being dropped until the old timeline is reached.
+            assert!(cap.admit(0));
+            assert!(cap.admit(33_333_334));
+        }
+
+        /// **The GPU capture domain** (VAMemory NV12 on the tee, `vapostproc`
+        /// in every branch): with a `videotestsrc` standing in for the portal
+        /// (it cannot hand out DMA-BUF, so `vapostproc` uploads), every codec
+        /// the machine can encode comes up on it, a software branch comes up
+        /// on the same tee (the per-branch fallback), the branches obey their
+        /// rate caps, and both preview branches deliver RGB.
+        ///
+        /// Skips (passes) on machines without a working VA stack, where the
+        /// GPU domain is never used.
+        #[tokio::test]
+        async fn gpu_domain_serves_every_codec_a_software_fallback_and_the_previews() {
+            if gst::init().is_err() || !super::super::gpu_capture_available() {
+                eprintln!("skipping: no VA stack here, the GPU capture domain is not used");
+                return;
+            }
+            let built = super::super::build_pipeline_in(
+                "videotestsrc is-live=true pattern=ball ! video/x-raw,width=640,height=360,framerate=120/1",
+                super::super::CaptureDomain::Gpu,
+            )
+            .expect("GPU pipeline should construct");
+            built.pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
+            assert!(wait_until_playing(&built.pipeline, Duration::from_secs(30)), "pipeline never reached PLAYING");
+            assert_eq!(super::super::CaptureDomain::of(&built.pipeline), super::super::CaptureDomain::Gpu);
+
+            let base = EncodeSettings {
+                width: 320,
+                height: 180,
+                framerate: 30,
+                bitrate_kbps: 2000,
+                backend: EncoderBackend::Vaapi,
+                ..small_settings()
+            };
+            let mut branches = Vec::new();
+            for (i, (backend, codec)) in [
+                (EncoderBackend::Vaapi, VideoCodec::H264),
+                (EncoderBackend::Vaapi, VideoCodec::H265),
+                (EncoderBackend::Vaapi, VideoCodec::Av1),
+                (EncoderBackend::Software, VideoCodec::H264),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let branch = add_branch(
+                    &built.pipeline,
+                    &built.tee,
+                    BranchId(i as u32),
+                    EncodeSettings { backend, codec, ..base },
+                )
+                .unwrap_or_else(|e| panic!("{backend:?}/{codec:?} branch must build on the GPU tee: {e:#}"));
+                assert!(
+                    wait_for_sample(&branch.appsink, Duration::from_secs(20)),
+                    "{backend:?}/{codec:?} branch produced nothing on the GPU tee"
+                );
+                branches.push(branch);
+            }
+
+            // 120 fps source, 30 fps caps: ~30 per branch, never more.
+            for branch in &branches {
+                while branch.appsink.try_pull_sample(gst::ClockTime::ZERO).is_some() {}
+                let window = Duration::from_secs(2);
+                let deadline = Instant::now() + window;
+                let mut n = 0u32;
+                while Instant::now() < deadline {
+                    if branch.appsink.try_pull_sample(gst::ClockTime::from_mseconds(20)).is_some() {
+                        n += 1;
+                    }
+                }
+                let fps = f64::from(n) / window.as_secs_f64();
+                assert!((15.0..=36.0).contains(&fps), "a 30 fps cap on a 120 fps GPU tee produced {fps:.1} fps");
+            }
+
+            for (name, sink) in [("preview", &built.preview_sink), ("self-preview", &built.self_preview_sink)] {
+                assert!(
+                    wait_for_sample(sink, Duration::from_secs(10)),
+                    "the {name} branch produced nothing on the GPU tee"
+                );
+            }
+
+            // Removing a branch from the live GPU tee leaves the siblings running.
+            let removed = branches.remove(0);
+            remove_branch(&built.pipeline, &built.tee, removed).await.expect("removal should succeed");
+            for branch in &branches {
+                while branch.appsink.try_pull_sample(gst::ClockTime::ZERO).is_some() {}
+                assert!(wait_for_sample(&branch.appsink, Duration::from_secs(5)), "a sibling stopped after a removal");
+            }
+
+            // A tier-2 swap (codec + size + rate) on the live GPU tee works too.
+            let runtime = destination::DestinationRuntime::shared(Instant::now(), small_params());
+            runtime.lock().unwrap().note_encoded_frame(true, b"idr", Instant::now());
+            let first = branches.remove(0);
+            let swapped = swap_to_new_branch(
+                &built.pipeline,
+                &built.tee,
+                &runtime,
+                first,
+                BranchId(10),
+                VideoParams {
+                    width: 160,
+                    height: 90,
+                    framerate: 20,
+                    bitrate_kbps: 1000,
+                    backend: EncoderBackend::Vaapi,
+                    codec: VideoCodec::H265,
+                    ..small_params()
+                },
+            )
+            .await;
+            let swapped = match swapped {
+                SwapOutcome::Swapped(branch) => branch,
+                SwapOutcome::KeptOld(_, e) => panic!("the GPU-tee swap should have succeeded: {e:#}"),
+            };
+            assert!(wait_for_sample(&swapped.appsink, Duration::from_secs(5)), "the swapped branch is silent");
+            built.pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
+        }
+
         fn small_settings() -> EncodeSettings {
             EncodeSettings {
                 width: 64,
@@ -6488,7 +6885,7 @@ pub mod branch {
             // and it means *no* branch on this pipeline can produce anything
             // afterwards. The older form of this assertion pulled one sample
             // and passed, but only because the pre-`skip-to-first` catch-up
-            // burst (see [`super::BRANCH_SKIP_TO_FIRST`]) happened to leave a
+            // burst (see [`super::branch::RateCap`]) happened to leave a
             // straggler queued in the appsink — a coincidence, not the
             // property being tested. What `KeptOld` actually promises, and
             // what is checkable here, is that the caller gets its original
@@ -6934,7 +7331,7 @@ pub mod branch {
             // what is left downstream afterwards is at most a buffer or two
             // and can legitimately be nothing at all (`videorate` holds its
             // current frame until the next one arrives to compare against,
-            // and with [`super::BRANCH_SKIP_TO_FIRST`] there is no start-up
+            // and with [`super::branch::RateCap`] there is no start-up
             // burst padding the appsink either). Reading a real PTS off the
             // running branch first makes this independent of that race; the
             // drain below still runs, so the value is the *last* one emitted.
@@ -7471,6 +7868,10 @@ pub mod branch {
             assert!(wait_for_sample(&subject.appsink, Duration::from_secs(20)), "subject produced nothing");
 
             let measure = |branch: &EncodeBranch| -> f64 {
+                // The branch's appsink never drops (a backlog from the time
+                // this branch was not being read would inflate the window),
+                // so start from an empty queue.
+                while branch.appsink.try_pull_sample(gst::ClockTime::ZERO).is_some() {}
                 let window = Duration::from_millis(1500);
                 let deadline = Instant::now() + window;
                 let mut count = 0u32;
@@ -8552,7 +8953,7 @@ mod tests {
 
         // `Why ten seconds and not one:` the burst this guards against is
         // proportional to how long the capture has been running when the
-        // preset is clicked (see [`BRANCH_SKIP_TO_FIRST`]) — a share that just
+        // preset is clicked (see [`branch::RateCap`]) — a share that just
         // started has nothing to replay and would pass even while broken.
         let before_stats = drain_branch_like_the_pump(&mut branch, &runtime, Duration::from_secs(10)).await;
         eprintln!(
@@ -8918,7 +9319,7 @@ mod tests {
             eprintln!("[portal] node_id={} position={:?}", p.node_id, p.position);
         }
 
-        let built = start_pipeline(&fragment).expect("real capture pipeline should start");
+        let built = start_pipeline(&fragment, CaptureDomain::for_source(&source)).expect("real capture pipeline should start");
         let (width, height) = negotiated_size(&built.tee).unwrap_or((0, 0));
         eprintln!("[portal] negotiated size at the tee: {width}x{height}");
 
