@@ -1,146 +1,20 @@
-//! Wire protocol types, per `superdoc/architecture/protocol-spec.md`.
+//! Relay-side view of the wire protocol, per `superdoc/architecture/protocol-spec.md`.
 //!
-//! Control-plane messages are `postcard`-encoded and framed on the control
-//! bidi stream with a 4-byte big-endian length prefix (§2 of the spec).
-//! Media datagrams (§6.2) and preview uni-streams (§7.1) use hand-packed
-//! fixed binary headers instead of postcard, to keep per-datagram overhead
-//! minimal — the relay parses/builds these manually.
+//! The wire types, constants and the hand-packed header layouts live in the
+//! shared `simple-screensharing-protocol` crate (`protocol/`), which the client
+//! also uses; everything from it is re-exported here so `crate::protocol::X`
+//! paths keep working. What stays in this file are the relay-only helpers: the
+//! `Option`-returning header parsers the relay's datagram path uses, the
+//! cap-enforcing control-frame codec, and `clamp_utf8`.
+//!
+//! `Why:` the header helpers are thin wrappers that delegate to the shared
+//! crate's `pack`/`unpack` rather than re-implementing the byte layout, so the
+//! layout has exactly one source of truth.
+
+pub use simple_screensharing_protocol::*;
 
 use serde::{Deserialize, Serialize};
-
-/// Connection identifier: a client-chosen random `u64`, doubling as the
-/// AES-GCM nonce prefix for that connection (spec §3.1). The relay treats
-/// it as an opaque routing handle.
-pub type ConnId = u64;
-
-/// Room identifier: 128-bit client-generated value from the join link
-/// (spec §3.2).
-pub type RoomId = [u8; 16];
-
-/// Per-sender-connection stream index, spec §3.3.
-pub type StreamId = u8;
-
-/// Maximum length (in bytes) of a control-frame payload the relay will
-/// accept, per spec §2 ("reject any frame whose length exceeds a sane
-/// cap, e.g. 64 KiB").
-pub const MAX_CONTROL_FRAME_LEN: u32 = 64 * 1024;
-
-/// Maximum UTF-8 byte length for `display_name` / stream `label`, clamped
-/// per spec §4.1 (truncated on a char boundary by the relay).
-pub const MAX_NAME_LEN: usize = 64;
-
-/// Hard cap on room membership (spec §8 / §10 — `RejectReason::RoomFull`).
-pub const MAX_ROOM_MEMBERS: usize = 8;
-
-/// `StreamType` discriminator byte that begins every unidirectional QUIC
-/// stream (spec §1).
-pub const STREAM_TYPE_PREVIEW: u8 = 0x01;
-
-/// Wire version byte used in media/preview headers and as AAD byte 0
-/// (spec §5.3, §6.2, §7.1).
-pub const WIRE_VERSION: u8 = 0x01;
-
-// ---------------------------------------------------------------------
-// §3.4 StreamKind
-// ---------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum StreamKind {
-    Video = 0,
-    Audio = 1,
-}
-
-// ---------------------------------------------------------------------
-// §4.1 ClientToRelay
-// ---------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ClientToRelay {
-    Join {
-        conn_id: u64,
-        room_id: RoomId,
-        display_name: String,
-    },
-    Leave,
-    AnnounceStream {
-        stream_id: u8,
-        kind: StreamKind,
-        label: String,
-        width: u16,
-        height: u16,
-    },
-    StopStream {
-        stream_id: u8,
-    },
-    Subscribe {
-        target: u64,
-        stream_id: u8,
-    },
-    Unsubscribe {
-        target: u64,
-        stream_id: u8,
-    },
-}
-
-// ---------------------------------------------------------------------
-// §4.2 RelayToClient
-// ---------------------------------------------------------------------
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum RelayToClient {
-    PresenceSnapshot {
-        members: Vec<Member>,
-        streams: Vec<StreamInfo>,
-    },
-    PresenceDelta {
-        event: PresenceEvent,
-    },
-    /// Sent only to the stream OWNER.
-    SubscriberCount {
-        stream_id: u8,
-        count: u32,
-    },
-    /// Sent only to the stream OWNER.
-    KeyframeRequest {
-        stream_id: u8,
-    },
-    JoinRejected {
-        reason: RejectReason,
-    },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Member {
-    pub conn_id: u64,
-    pub display_name: String,
-    /// `0` => not sharing; `>0` => sharing this many streams.
-    pub stream_count: u8,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StreamInfo {
-    pub owner: u64,
-    pub stream_id: u8,
-    pub kind: StreamKind,
-    pub label: String,
-    pub width: u16,
-    pub height: u16,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum PresenceEvent {
-    MemberJoined(Member),
-    MemberLeft { conn_id: u64 },
-    StreamStarted(StreamInfo),
-    StreamStopped { conn_id: u64, stream_id: u8 },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RejectReason {
-    RoomFull,
-    ConnIdCollision,
-    Malformed,
-}
+use simple_screensharing_protocol as shared;
 
 // ---------------------------------------------------------------------
 // §2 control-frame length-prefix framing helpers
@@ -202,7 +76,9 @@ pub fn decode_payload<T: for<'de> Deserialize<'de>>(payload: &[u8]) -> Result<T,
 // ---------------------------------------------------------------------
 
 /// Cleartext header prepended to every media datagram. All multi-byte
-/// integers are big-endian. See spec §6.2.
+/// integers are big-endian. See spec §6.2. Same fields as the shared crate's
+/// [`shared::MediaHeader`]; this wrapper adds the relay's `Option`-returning
+/// parser.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MediaDatagramHeader {
     pub version: u8,
@@ -215,36 +91,38 @@ pub struct MediaDatagramHeader {
 }
 
 impl MediaDatagramHeader {
-    pub const LEN: usize = 19;
+    pub const LEN: usize = shared::MEDIA_HEADER_LEN;
     /// bit0 of `flags`: this fragment belongs to a keyframe (H.264 IDR).
-    pub const FLAG_KEYFRAME: u8 = 0b0000_0001;
+    pub const FLAG_KEYFRAME: u8 = shared::MEDIA_FLAG_KEYFRAME;
+
+    fn to_shared(self) -> shared::MediaHeader {
+        shared::MediaHeader {
+            version: self.version,
+            flags: self.flags,
+            conn_id: self.conn_id,
+            stream_id: self.stream_id,
+            frame_id: self.frame_id,
+            fragment_index: self.fragment_index,
+            fragment_count: self.fragment_count,
+        }
+    }
 
     pub fn pack(&self) -> [u8; Self::LEN] {
-        let mut buf = [0u8; Self::LEN];
-        buf[0] = self.version;
-        buf[1] = self.flags;
-        buf[2..10].copy_from_slice(&self.conn_id.to_be_bytes());
-        buf[10] = self.stream_id;
-        buf[11..15].copy_from_slice(&self.frame_id.to_be_bytes());
-        buf[15..17].copy_from_slice(&self.fragment_index.to_be_bytes());
-        buf[17..19].copy_from_slice(&self.fragment_count.to_be_bytes());
-        buf
+        self.to_shared().pack()
     }
 
     /// Parse the header from the front of `data`. Returns `None` if
     /// `data` is shorter than [`Self::LEN`].
     pub fn unpack(data: &[u8]) -> Option<Self> {
-        if data.len() < Self::LEN {
-            return None;
-        }
+        let (h, _) = shared::MediaHeader::unpack(data).ok()?;
         Some(Self {
-            version: data[0],
-            flags: data[1],
-            conn_id: u64::from_be_bytes(data[2..10].try_into().unwrap()),
-            stream_id: data[10],
-            frame_id: u32::from_be_bytes(data[11..15].try_into().unwrap()),
-            fragment_index: u16::from_be_bytes(data[15..17].try_into().unwrap()),
-            fragment_count: u16::from_be_bytes(data[17..19].try_into().unwrap()),
+            version: h.version,
+            flags: h.flags,
+            conn_id: h.conn_id,
+            stream_id: h.stream_id,
+            frame_id: h.frame_id,
+            fragment_index: h.fragment_index,
+            fragment_count: h.fragment_count,
         })
     }
 
@@ -257,9 +135,11 @@ impl MediaDatagramHeader {
 // §7.1 Preview uni-stream header (15 bytes, big-endian, hand-packed)
 // ---------------------------------------------------------------------
 
-/// Cleartext header at the start of every preview uni-stream, *after*
-/// the 1-byte `StreamType` discriminator (spec §1, §7.1). All multi-byte
-/// integers are big-endian.
+/// The relay's view of the preview header (spec §1, §7.1): it always carries
+/// `StreamType = 0x01` implicitly, so there is no `stream_type` field, and
+/// [`Self::unpack`] returns `None` for anything that isn't a preview header.
+/// Shadows the shared crate's `PreviewHeader` (which is what the client uses)
+/// within `crate::protocol`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PreviewHeader {
     pub version: u8,
@@ -269,40 +149,35 @@ pub struct PreviewHeader {
 }
 
 impl PreviewHeader {
-    /// Header length *not including* the leading `StreamType` byte
-    /// (offsets 1..15 in the spec's table, i.e. 14 bytes) plus the
-    /// version byte at offset 1 which is part of this struct... per the
-    /// spec's table the full header (including `StreamType`) is 15
-    /// bytes: `StreamType(1) + version(1) + conn_id(8) + stream_id(1) +
-    /// counter(4) = 15`. This constant is that full 15-byte length,
-    /// including the `StreamType` byte, for callers that read/write the
-    /// whole uni-stream header in one shot.
-    pub const LEN: usize = 15;
+    /// Full header length including the leading `StreamType` byte.
+    pub const LEN: usize = shared::PREVIEW_HEADER_LEN;
 
     /// Pack the full 15-byte header, including the leading
     /// `StreamType = 0x01` byte.
     pub fn pack(&self) -> [u8; Self::LEN] {
-        let mut buf = [0u8; Self::LEN];
-        buf[0] = STREAM_TYPE_PREVIEW;
-        buf[1] = self.version;
-        buf[2..10].copy_from_slice(&self.conn_id.to_be_bytes());
-        buf[10] = self.stream_id;
-        buf[11..15].copy_from_slice(&self.counter.to_be_bytes());
-        buf
+        shared::PreviewHeader {
+            stream_type: STREAM_TYPE_PREVIEW,
+            version: self.version,
+            conn_id: self.conn_id,
+            stream_id: self.stream_id,
+            counter: self.counter,
+        }
+        .pack()
     }
 
     /// Parse the full 15-byte header (including the `StreamType` byte)
     /// from the front of `data`. Returns `None` if too short or the
     /// `StreamType` byte isn't `0x01` (preview).
     pub fn unpack(data: &[u8]) -> Option<Self> {
-        if data.len() < Self::LEN || data[0] != STREAM_TYPE_PREVIEW {
+        let (h, _) = shared::PreviewHeader::unpack(data).ok()?;
+        if h.stream_type != STREAM_TYPE_PREVIEW {
             return None;
         }
         Some(Self {
-            version: data[1],
-            conn_id: u64::from_be_bytes(data[2..10].try_into().unwrap()),
-            stream_id: data[10],
-            counter: u32::from_be_bytes(data[11..15].try_into().unwrap()),
+            version: h.version,
+            conn_id: h.conn_id,
+            stream_id: h.stream_id,
+            counter: h.counter,
         })
     }
 }
@@ -330,7 +205,7 @@ mod tests {
         let h = MediaDatagramHeader {
             version: WIRE_VERSION,
             flags: MediaDatagramHeader::FLAG_KEYFRAME,
-            conn_id: 0x0102_0304_0506_0708,
+            conn_id: 0xAABB_CCDD_EEFF_0011,
             stream_id: 7,
             frame_id: 42,
             fragment_index: 3,
@@ -389,5 +264,31 @@ mod tests {
         let clamped = clamp_utf8(&s, 64);
         assert!(clamped.len() <= 64);
         assert!(String::from_utf8(clamped.into_bytes()).is_ok());
+    }
+
+    /// The relay's wrappers must produce/accept the same bytes as the shared
+    /// crate (the client's view), and the relay's framing must equal the
+    /// client's `encode_control_frame` for in-cap messages.
+    #[test]
+    fn relay_helpers_match_shared_crate() {
+        let m = MediaDatagramHeader {
+            version: WIRE_VERSION,
+            flags: 3,
+            conn_id: 0x0102_0304_0506_0708,
+            stream_id: 7,
+            frame_id: 42,
+            fragment_index: 3,
+            fragment_count: 10,
+        };
+        assert_eq!(m.pack(), m.to_shared().pack());
+        let p = PreviewHeader { version: WIRE_VERSION, conn_id: 5, stream_id: 9, counter: 123 };
+        assert_eq!(p.pack(), shared::PreviewHeader::new(5, 9, 123).pack());
+        assert!(PreviewHeader::unpack(&p.pack()[..14]).is_none());
+        let mut wrong = p.pack();
+        wrong[0] = 0x02;
+        assert!(PreviewHeader::unpack(&wrong).is_none());
+
+        let msg = RelayToClient::KeyframeRequest { stream_id: 3 };
+        assert_eq!(encode_frame(&msg).unwrap(), encode_control_frame(&msg).unwrap());
     }
 }
