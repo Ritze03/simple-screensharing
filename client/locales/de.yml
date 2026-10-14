@@ -170,6 +170,8 @@ ui.bar.share_screen: "Bildschirm teilen"
 ui.bar.stop_sharing: "Teilen beenden"
 ui.bar.stream_settings: "Stream-Einstellungen"
 ui.bar.unmute_audio: "Stummschaltung des geteilten Audios aufheben"
+ui.bar.waiting_sub: "Beweg die Maus darüber, um zu starten"
+ui.bar.waiting_title: "Warte, bis sich der Bildschirm ändert"
 
 #modal
 ui.modal.cancel: "Abbrechen"
@@ -415,3 +417,4 @@ ui.toast.live_in: "Live in %{room}"
 ui.toast.save_failed: "Speichern fehlgeschlagen: %{error}"
 ui.toast.stopped_all: "Alles Teilen beendet"
 ui.toast.stopped_in: "Teilen in %{room} beendet"
+ui.waiting_frame_hint: "Ein ruhender Bildschirm sendet kein Bild, bis sich darauf etwas ändert. Beweg die Maus über den geteilten Bildschirm, dann startet der Stream."

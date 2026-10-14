@@ -7,7 +7,9 @@
 //!
 //! Body: two equal columns (gap 12), each a vbox of cards (gap 12):
 //! - where it goes: Source (Screen / Audio + meter / Mute), Sending to (dest
-//!   rows `[18][fill][84 pill][76 kbps][32 ×]` + equal `[Also send to…][Move to…]`),
+//!   rows `[18][fill][84 pill][76 kbps][32 ×]` + an Info banner "an idle screen
+//!   sends nothing until it changes" while a Starting row waits for the
+//!   capture's first frame + equal `[Also send to…][Move to…]`),
 //!   Upload bandwidth (Mode / Total / Floor / Per stream or over-budget banner);
 //! - how it's encoded: Video (Framerate / Bitrate / Codec), Encoder (Preset ×4
 //!   + collapsible Advanced: Tune / Quality level / Rate control / Keyframe interval).
@@ -38,8 +40,8 @@ use simple_screensharing_client::session::{
 };
 
 use super::action_bar::{
-    PillKind, RoomTargets, dest_kbps, dest_pill, find_source, level_lit, pop_heading, rooms_count, screen_name, source_size,
-    video_destination_count,
+    PillKind, RoomTargets, awaiting_first_frame, dest_kbps, dest_pill, find_source, level_lit, pop_heading, rooms_count, screen_name,
+    source_size, video_destination_count, waiting_hint,
 };
 use super::{Cx, NextStream, Popover, PopoverKind, UiAction, tr, tr_with};
 use crate::theme::{self, Weight, font};
@@ -259,7 +261,7 @@ fn body(
         l.spacing_mut().item_spacing.y = theme::S3;
         r.spacing_mut().item_spacing.y = theme::S3;
         source_card(l, cx, c, capture, room, out);
-        destinations_card(l, cx, c, room, out, anchors);
+        destinations_card(l, cx, c, capture, room, out, anchors);
         bandwidth_card(l, cx, st, c, target, out);
         video_card(r, cx, st, c, target, out);
         encoder_card(r, cx, st, target, out);
@@ -346,11 +348,14 @@ fn destinations_card(
     ui: &mut Ui,
     cx: &Cx,
     c: &LocalCapture,
+    capture: CaptureSourceId,
     room: RoomHandle,
     out: &mut Vec<UiAction>,
     anchors: &mut Anchors,
 ) {
     let staged = c.destinations.is_empty();
+    // Starting only because an idle monitor hasn't sent a first frame yet.
+    let waiting = c.destinations.values().any(|d| awaiting_first_frame(cx, capture, c, d));
     let (title, count) = if staged {
         (tr("ui.stream.goes_live_in", "Goes live in"), rooms_count(1))
     } else {
@@ -407,6 +412,11 @@ fn destinations_card(
                 }
             }
         });
+        if waiting {
+            widgets::banner(ui, BannerKind::Info, "info", &waiting_hint(), None);
+            // The flag flips on the capture thread; poll so Live shows promptly.
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+        }
         if !staged {
             // `btn_row`'s exact shape (equal fills, one height), built here
             // so the two cells' rects can anchor their popovers.
