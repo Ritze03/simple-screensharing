@@ -30,6 +30,7 @@ OUT="${OUT:-$CARGO_TARGET_DIR/results}/$label"
 SAMPLES="${SAMPLES:-7}"
 INTERVAL="${INTERVAL:-5}"
 GSTLOG="$SCRATCH/gst1.log"
+export SCRATCH                             # drive.sh reads the modal dump + pids from it
 d() { "$SELF_DIR/drive.sh" "$MONITOR" "$@"; }
 
 mkdir -p "$OUT"
@@ -39,8 +40,8 @@ mkdir -p "$OUT"
 } >"$OUT/notes.txt"
 
 d share "$TARGET" || exit 1
-d setup "$fps" "$codec" "$preset" ${kbps:+"$kbps"}
-d golive
+d setup "$fps" "$codec" "$preset" ${kbps:+"$kbps"} || { echo "setup FAILED" >>"$OUT/notes.txt"; exit 1; }
+d golive || { echo "golive FAILED" >>"$OUT/notes.txt"; exit 1; }
 sleep 5
 d watch
 sleep 4

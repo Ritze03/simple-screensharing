@@ -23,9 +23,16 @@
 //! widest segmented control's labels at full length, or the Screen readout up
 //! to [`READOUT_NEED_CAP`]), the two columns stack into one in reading order
 //! (where it goes, then how it's encoded); the modal body already scrolls.
-//! In practice: two columns at 1280 and up in en and de, one column at the
-//! 960 minimum (912 px modal). Nothing truncates either way, except a window
-//! title longer than the cap (full text on hover).
+//! The Preset and Codec rows ([`seg_gated`]) size their segments to their
+//! labels when equal segments would truncate (German's four presets), so they
+//! never force the stack on their own (#47: they did, at every width).
+//! In practice (checked on the real app, #47): two columns at 1280 and up in
+//! en and de, one column at the 960 minimum (912 px modal). Nothing truncates
+//! either way, except a window title longer than the cap (full text on hover).
+//!
+//! `SSS_UI_DUMP=<file>` (set by `client/scripts/launch-lib.sh`) makes the
+//! modal write its driven controls' rects and values for `drive.sh`; see
+//! [`drive_dump`].
 //!
 //! Staged edits go through [`UiAction::SetNextStream`] /
 //! [`UiAction::ApplyPresetToNextStream`]; live edits through
@@ -205,11 +212,14 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut StreamSettingsState, capt
     let mut anchors = Anchors::default();
     let mut click = FooterClick::None;
     let cxr: &Cx = cx;
+    drive_dump::begin();
     let action = widgets::modal_shell(
         ctx,
         &spec,
         |ui| body(ui, cxr, st, c, capture, room, target, &mut out, &mut anchors),
         |ui| {
+            // The footer row's rect (`modal_footer` is one full-width HBox).
+            let row = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), theme::CTL_H_LG));
             click = if staged {
                 widgets::modal_footer(
                     ui,
@@ -220,6 +230,8 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut StreamSettingsState, capt
             } else {
                 widgets::modal_footer(ui, &[Btn::danger(&stop).icon("stop_screen_share")], Some(&saved), &[Btn::primary(&done)])
             };
+            // Footer row: leading button(s) from its left edge, trailing from its right.
+            drive_dump::rect(|| "footer".into(), row);
         },
     );
     if out.iter().any(|a| matches!(a, UiAction::EditDestination { .. } | UiAction::ApplyPresetToDestination { .. })) {
@@ -249,6 +261,9 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut StreamSettingsState, capt
         _ if action.close && cx.nav.popover.is_none() => cx.act(UiAction::CloseModal),
         _ => {}
     }
+    let closing = !matches!(click, FooterClick::None) || (action.close && cx.nav.popover.is_none());
+    drive_dump::line(|| format!("mode {}\nready {}\nopen {}", if staged { "staged" } else { "live" }, u8::from(ready), u8::from(!closing)));
+    drive_dump::flush(ctx);
 
     // The open list first, then the buttons: a click outside the list that
     // lands on the other button must close the list before that button's
@@ -264,6 +279,78 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut StreamSettingsState, capt
     if cx.paired_audio(capture).is_some() || st.taps.is_some() {
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
+}
+
+/// Test hook for `client/scripts/drive.sh` (#47): with `SSS_UI_DUMP=<file>`
+/// set, the modal writes where its driven controls are and what they hold,
+/// one `key value…` per line, whenever that changes:
+/// `rect NAME x0 y0 x1 y1` (logical points, window-relative; NAME `fps`,
+/// `codec.I` / `preset.I` indexing `codec_order` / `preset_order`,
+/// `advanced`, `footer`), `fps` / `fps_options` / `codec` / `preset` /
+/// `advanced` / `mode` / `ready` / `open`, plus `ppp` and `screen W H` so the
+/// script can map points to pixels. Unset (always, outside the scripts):
+/// nothing is recorded.
+///
+/// `Why` (#47): `drive.sh` clicked fixed pixel positions read off old
+/// screenshots; the modal grew (the encoder-limit banner) and `setup` silently
+/// kept 30 fps while `golive` missed. Positions from the live layout, and the
+/// values read back, make a miss impossible to overlook.
+mod drive_dump {
+    use std::cell::RefCell;
+    use std::fmt::Write as _;
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    use egui::Rect;
+
+    fn path() -> Option<&'static PathBuf> {
+        static P: OnceLock<Option<PathBuf>> = OnceLock::new();
+        P.get_or_init(|| std::env::var_os("SSS_UI_DUMP").map(PathBuf::from)).as_ref()
+    }
+
+    thread_local! {
+        static BUF: RefCell<String> = const { RefCell::new(String::new()) };
+        static LAST: RefCell<String> = const { RefCell::new(String::new()) };
+    }
+
+    pub fn begin() {
+        if path().is_some() {
+            BUF.with_borrow_mut(String::clear);
+        }
+    }
+
+    pub fn line(text: impl FnOnce() -> String) {
+        if path().is_some() {
+            BUF.with_borrow_mut(|b| {
+                b.push_str(&text());
+                b.push('\n');
+            });
+        }
+    }
+
+    pub fn rect(name: impl FnOnce() -> String, r: Rect) {
+        line(|| format!("rect {} {:.0} {:.0} {:.0} {:.0}", name(), r.min.x, r.min.y, r.max.x, r.max.y));
+    }
+
+    /// Write the frame's lines if they differ from the last write (atomic rename).
+    pub fn flush(ctx: &egui::Context) {
+        let Some(p) = path() else { return };
+        let screen = ctx.content_rect();
+        let mut text = BUF.with_borrow(Clone::clone);
+        let _ = write!(text, "ppp {}\nscreen {:.0} {:.0}\n", ctx.pixels_per_point(), screen.width(), screen.height());
+        if LAST.with_borrow(|l| *l == text) {
+            return;
+        }
+        let tmp = p.with_extension("tmp");
+        if std::fs::write(&tmp, &text).and_then(|()| std::fs::rename(&tmp, p)).is_ok() {
+            LAST.set(text);
+        }
+    }
+}
+
+/// `codec` key for [`drive_dump`]: `h264` / `av1` / `h265`.
+fn codec_key(c: VideoCodec) -> String {
+    codec_label(c).to_lowercase().replace('.', "")
 }
 
 /// Keep a level tap running for every audio source while the *staged* modal
@@ -330,9 +417,10 @@ fn body(
 
 /// Width one body column needs so no segmented label and no screen readout
 /// truncates: card chrome + `[120 label][8][control]`, the control being the
-/// widest of every segmented row (equal segments: the longest label in bold,
-/// + 8 text inset, 3 px gaps and 3 px outer inset, as `segmented` /
-/// [`seg_gated`] draw them) and the Screen readout (+ the 72 value slot when
+/// widest of every segmented row ([`seg_need`]: equal segments for
+/// `widgets::segmented`, label-proportional ones for the Preset and Codec rows,
+/// which [`seg_gated`] draws that way when equal ones would truncate) and the
+/// Screen readout (+ the 72 value slot when
 /// staged, for "Change"). The readout counts up to [`READOUT_NEED_CAP`] only:
 /// a long window title truncates (full text on hover) instead of forcing one
 /// column at every width.
@@ -341,25 +429,30 @@ fn body(
 /// longer, so a fixed breakpoint either stacks English needlessly or still
 /// truncates German.
 fn column_need(ui: &Ui, c: &LocalCapture) -> f32 {
-    let bold = font(Weight::Bold, theme::FS_SMALL);
-    let seg = |labels: Vec<String>| {
-        let w = labels.iter().map(|l| widgets::text_width(ui, l, bold.clone(), 0.0)).fold(0.0, f32::max);
-        let n = labels.len() as f32;
-        6.0 + n * (w.ceil() + 8.0 + 2.0) + 3.0 * (n - 1.0)
-    };
-    let t = |pairs: &[(&'static str, &'static str)]| pairs.iter().map(|(k, en)| tr(k, en).to_string()).collect::<Vec<String>>();
+    let readout_w = widgets::text_width(ui, &screen_readout(c), font(Weight::Mono, theme::FS_SMALL), 0.0);
+    column_need_for(ui, readout_w, c.destinations.is_empty())
+}
+
+/// [`column_need`] from the Screen readout's text width (`staged`: + the
+/// "Change" value slot).
+fn column_need_for(ui: &Ui, readout_w: f32, staged: bool) -> f32 {
+    let t = |pairs: &[(&'static str, &'static str)]| pairs.iter().map(|(k, en)| tr(k, en)).collect::<Vec<String>>();
+    let need = |labels: &[String], equal: bool| seg_need(ui, &labels.iter().map(String::as_str).collect::<Vec<_>>(), equal);
+    let presets: Vec<String> = EncoderPreset::ALL.iter().map(|p| p.label().to_string()).collect();
+    let codecs: Vec<String> = CODEC_DISPLAY_ORDER.iter().map(|c| codec_label(*c).to_string()).collect();
     let control = [
-        seg(t(&[("ui.stream.bw_per_stream", "Per-stream maximum"), ("ui.stream.bw_absolute", "Absolute maximum")])),
-        seg(t(&[("ui.stream.tune_low", "Low latency"), ("ui.stream.tune_best", "Best quality")])),
-        seg(t(&[("ui.stream.ql_performance", "Performance"), ("ui.stream.ql_balanced", "Balanced"), ("ui.stream.ql_quality", "Quality")])),
-        seg(t(&[("ui.stream.rc_efficient", "Efficient"), ("ui.stream.rc_max_quality", "Max quality")])),
-        seg(EncoderPreset::ALL.iter().map(|p| p.label().to_string()).collect()),
-        seg(CODEC_DISPLAY_ORDER.iter().map(|c| codec_label(*c).to_string()).collect()),
+        // `widgets::segmented`: always equal segments.
+        need(&t(&[("ui.stream.bw_per_stream", "Per-stream maximum"), ("ui.stream.bw_absolute", "Absolute maximum")]), true),
+        need(&t(&[("ui.stream.tune_low", "Low latency"), ("ui.stream.tune_best", "Best quality")]), true),
+        need(&t(&[("ui.stream.ql_performance", "Performance"), ("ui.stream.ql_balanced", "Balanced"), ("ui.stream.ql_quality", "Quality")]), true),
+        need(&t(&[("ui.stream.rc_efficient", "Efficient"), ("ui.stream.rc_max_quality", "Max quality")]), true),
+        // [`seg_gated`]: label-proportional when equal would truncate.
+        need(&presets, false),
+        need(&codecs, false),
     ]
     .into_iter()
     .fold(0.0, f32::max);
-    let readout = widgets::text_width(ui, &screen_readout(c), font(Weight::Mono, theme::FS_SMALL), 0.0).ceil().min(READOUT_NEED_CAP)
-        + if c.destinations.is_empty() { theme::S2 + theme::VALUE_W } else { 0.0 };
+    let readout = readout_w.ceil().min(READOUT_NEED_CAP) + if staged { theme::S2 + theme::VALUE_W } else { 0.0 };
     // Card: 1 px border + 12 padding each side.
     2.0 * (1.0 + theme::S3) + theme::LABEL_W + theme::S2 + control.max(readout)
 }
@@ -641,6 +734,9 @@ fn video_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, c: &LocalCaptu
     widgets::card(ui, &tr("ui.stream.video", "Video"), None, |ui| {
         let labels: Vec<&str> = fps_labels.iter().map(String::as_str).collect();
         let r = widgets::ctrl_row(ui, &tr("ui.stream.framerate", "Framerate"), None, |ui| widgets::select(ui, "stream_fps", &mut fps_idx, &labels));
+        drive_dump::rect(|| "fps".into(), r.rect);
+        drive_dump::line(|| format!("fps {}\nfps_options {}", v.framerate, fps_opts.iter().map(u32::to_string).collect::<Vec<_>>().join(" ")));
+        drive_dump::line(|| format!("codec {}\ncodec_order {}", codec_key(v.codec), CODEC_DISPLAY_ORDER.iter().map(|c| codec_key(*c)).collect::<Vec<_>>().join(" ")));
         if r.changed() {
             out.push(target.action(NextStream { framerate: fps_opts[fps_idx], ..v }));
         }
@@ -690,6 +786,9 @@ fn video_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, c: &LocalCaptu
                 0,
                 "",
             );
+            // The value box is the row's right 72 px.
+            drive_dump::rect(|| "bitrate".into(), r.rect);
+            drive_dump::line(|| format!("bitrate {}", v.bitrate_kbps));
             if let Some(k) = commit(r, kbps, &mut st.bitrate) {
                 out.push(target.action(NextStream { bitrate_kbps: k, ..v }));
             }
@@ -698,7 +797,7 @@ fn video_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, c: &LocalCaptu
             CODEC_DISPLAY_ORDER.iter().map(|c| (*c, codec_label(*c), supported.contains(c), codec_description(*c))).collect();
         let mut codec = v.codec;
         let unsupported = tr("ui.stream.codec_unsupported", "This machine's encoder can't produce this codec.");
-        let changed = widgets::ctrl_row(ui, &tr("ui.stream.codec", "Codec"), None, |ui| seg_gated(ui, &mut codec, &opts, &unsupported));
+        let changed = widgets::ctrl_row(ui, &tr("ui.stream.codec", "Codec"), None, |ui| seg_gated(ui, "codec", &mut codec, &opts, &unsupported));
         if changed {
             out.push(target.action(NextStream { codec, ..v }));
         }
@@ -709,6 +808,10 @@ fn encoder_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, target: Targ
     let v = target.values(cx.state);
     let tuning = EncoderTuning { tune: v.tune, quality_level: v.quality_level, rate_control: v.rate_control, gop_millis: v.gop_millis };
     let mut preset = EncoderPreset::detect(tuning);
+    drive_dump::line(|| {
+        let order = EncoderPreset::ALL.iter().map(|p| p.value()).collect::<Vec<_>>().join(" ");
+        format!("preset {}\npreset_order {order}\nadvanced {}", preset.map_or("custom", EncoderPreset::value), u8::from(st.adv_open))
+    });
     let preset_opts: Vec<(Option<EncoderPreset>, &str, bool, &str)> =
         EncoderPreset::ALL.iter().map(|p| (Some(*p), p.label(), true, p.description())).collect();
     let adv = tr("ui.stream.advanced", "Advanced tuning");
@@ -720,11 +823,12 @@ fn encoder_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, target: Targ
     );
     let (eff, maxq) = (tr("ui.stream.rc_efficient", "Efficient"), tr("ui.stream.rc_max_quality", "Max quality"));
     widgets::card(ui, &tr("ui.stream.encoder", "Encoder"), None, |ui| {
-        let changed = widgets::ctrl_row(ui, &tr("ui.stream.preset", "Preset"), None, |ui| seg_gated(ui, &mut preset, &preset_opts, ""));
+        let changed = widgets::ctrl_row(ui, &tr("ui.stream.preset", "Preset"), None, |ui| seg_gated(ui, "preset", &mut preset, &preset_opts, ""));
         if changed && let Some(p) = preset {
             out.push(target.preset_action(p));
         }
-        widgets::collapser(ui, &mut st.adv_open, &adv);
+        let r = widgets::collapser(ui, &mut st.adv_open, &adv);
+        drive_dump::rect(|| "advanced".into(), r.rect);
         if !st.adv_open {
             return;
         }
@@ -841,17 +945,67 @@ fn commit(r: Response, value: u32, buf: &mut Option<u32>) -> Option<u32> {
 /// their description. Same look as `segmented` (32 px, equal segments, gap
 /// 3 inside a 3 px inset); a disabled segment is faded and ignores clicks.
 /// Returns `true` when the selection changed.
-fn seg_gated<T: PartialEq + Copy>(ui: &mut Ui, current: &mut T, options: &[(T, &str, bool, &str)], disabled_tip: &str) -> bool {
+/// Bold width of each segment label (the selected one is bold, the widest case).
+fn seg_label_widths(ui: &Ui, labels: &[&str]) -> Vec<f32> {
+    let bold = font(Weight::Bold, theme::FS_SMALL);
+    labels.iter().map(|l| widgets::text_width(ui, l, bold.clone(), 0.0).ceil()).collect()
+}
+
+/// Outer width a segmented control needs so no label truncates: 3 px inset
+/// each side, 3 px gaps, each segment its label + 8 text inset (+ 2 slack).
+/// `equal`: every segment as wide as the widest label (the `segmented` look);
+/// otherwise each segment as wide as its own label ([`seg_spans`]' fallback).
+fn seg_need(ui: &Ui, labels: &[&str], equal: bool) -> f32 {
+    let w = seg_label_widths(ui, labels);
+    let n = w.len() as f32;
+    let segs = if equal { n * w.iter().copied().fold(0.0, f32::max) } else { w.iter().sum() };
+    6.0 + segs + n * (8.0 + 2.0) + 3.0 * (n - 1.0).max(0.0)
+}
+
+/// Segment spans `(x, w)` inside a [`seg_gated`] control's inner rect: equal
+/// widths while the widest label fits, else label-proportional (each segment
+/// its label + 8, the slack shared equally) so nothing truncates.
+///
+/// `Why` (#47): German's "Niedrige Latenz" made four equal Preset segments
+/// need a 585 px column, more than the 1120 px modal's ~534 px half, so the
+/// modal stacked into one column at every window width. Sizing segments to
+/// their labels only when equal ones would truncate keeps the equal look in
+/// English and every roomy layout, and needs ~110 px less in German.
+fn seg_spans(ui: &Ui, inner_w: f32, labels: &[&str]) -> Vec<(f32, f32)> {
+    let n = labels.len().max(1);
+    let w = seg_label_widths(ui, labels);
+    let gaps = 3.0 * (n as f32 - 1.0);
+    let max = w.iter().copied().fold(0.0, f32::max);
+    if (inner_w - gaps) / n as f32 >= max + 8.0 {
+        return widgets::slot_spans(inner_w, 3.0, &vec![widgets::Slot::Fill; n]);
+    }
+    let natural: f32 = w.iter().map(|w| w + 8.0).sum();
+    let free = inner_w - gaps - natural;
+    // Too narrow even for that (never in this modal: the column stacks
+    // first): shrink proportionally and let the labels truncate.
+    let (extra, scale) = if free >= 0.0 { (free / n as f32, 1.0) } else { (0.0, ((inner_w - gaps) / natural).max(0.0)) };
+    let mut x = 0.0;
+    w.iter()
+        .map(|w| {
+            let span = (x, (w + 8.0) * scale + extra);
+            x += span.1 + 3.0;
+            span
+        })
+        .collect()
+}
+
+fn seg_gated<T: PartialEq + Copy>(ui: &mut Ui, dump: &str, current: &mut T, options: &[(T, &str, bool, &str)], disabled_tip: &str) -> bool {
     let w = ui.available_width();
     let (outer, resp) = ui.allocate_exact_size(vec2(w, theme::CTL_H), Sense::hover());
     let cr = |r: u8| CornerRadius::same(r);
     ui.painter().rect(outer, cr(theme::ROUNDING_MD), theme::ELEV_1B, Stroke::new(1.0_f32, theme::INSET_BORDER), StrokeKind::Inside);
     let inner = outer.shrink(3.0);
-    let n = options.len().max(1);
-    let spans = widgets::slot_spans(inner.width(), 3.0, &vec![widgets::Slot::Fill; n]);
+    let labels: Vec<&str> = options.iter().map(|o| o.1).collect();
+    let spans = seg_spans(ui, inner.width(), &labels);
     let mut changed = false;
     for (i, ((value, label, enabled, tip), (x, sw))) in options.iter().zip(spans).enumerate() {
         let seg = Rect::from_min_size(pos2(inner.left() + x, inner.top()), vec2(sw, inner.height()));
+        drive_dump::rect(|| format!("{dump}.{i}"), seg);
         let sense = if *enabled { Sense::click() } else { Sense::hover() };
         let r = ui.interact(seg, resp.id.with(i), sense);
         let selected = *current == *value;
@@ -878,4 +1032,32 @@ fn seg_gated<T: PartialEq + Copy>(ui: &mut Ui, current: &mut T, options: &[(T, &
         }
     }
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #47: at the modal's full width (1120 − 2 × 20 frame padding, gap 12)
+    /// every shipped locale must get two columns, even with the Screen
+    /// readout at its cap and the staged "Change" slot.
+    #[test]
+    fn every_locale_fits_two_columns_at_full_modal_width() {
+        let col = (theme::MODAL_W_XWIDE - 40.0 - theme::S3) / 2.0;
+        let prev = rust_i18n::locale().to_string();
+        for loc in ["en", "de"] {
+            rust_i18n::set_locale(loc);
+            let ctx = egui::Context::default();
+            theme::apply(&ctx);
+            let mut need = 0.0;
+            // Two frames: fonts load on the first.
+            for _ in 0..2 {
+                let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| need = column_need_for(ui, READOUT_NEED_CAP, true));
+                });
+            }
+            assert!(need <= col, "{loc}: a column needs {need} px, the full-width modal gives {col}");
+        }
+        rust_i18n::set_locale(&prev);
+    }
 }

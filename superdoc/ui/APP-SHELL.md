@@ -53,7 +53,10 @@ its "Proposed" tab).
   Body and modal: the stream-settings modal stacks its two columns into one when a
   column would be narrower than its widest segmented control / Screen readout needs
   (measured from the current locale's labels, so it is one column at 960 and two at
-  1280+ in en and de); the reconnect banner moves its buttons under the text when the
+  1280+ in en and de). The Preset and Codec rows size their segments to their labels
+  when equal segments would truncate, so German's "Niedrige Latenz" no longer forces
+  one column at every width (#47: four equal Preset segments needed a 585 px column,
+  more than the 1120 px modal's ~534 px half). The reconnect banner moves its buttons under the text when the
   text column beside them would be under 320 px; empty states wrap, centred.
   *Why measured, not a fixed breakpoint:* German labels run ~20 % longer, so a fixed
   width either stacks English for nothing or still truncates German. *Why the banner

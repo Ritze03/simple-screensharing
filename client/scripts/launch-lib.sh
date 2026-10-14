@@ -231,7 +231,9 @@ sss_spawn_client() {
   # for the sharer (two clients must not write the same file).
   local extra_var="CLIENT_ENV_$n" extra=()
   [[ -n "${!extra_var:-}" ]] && read -r -a extra <<<"${!extra_var}"
-  env XDG_CONFIG_HOME="$cfg" RUST_LOG="${RUST_LOG:-info}" "${extra[@]}" setsid "$CLIENT_BIN" 9>&- >"$SCRATCH/client$n.log" 2>&1 &
+  # SSS_UI_DUMP: the stream-settings modal's control rects + values, read by drive.sh.
+  rm -f "$SCRATCH/ui$n.txt"
+  env XDG_CONFIG_HOME="$cfg" RUST_LOG="${RUST_LOG:-info}" SSS_UI_DUMP="$SCRATCH/ui$n.txt" "${extra[@]}" setsid "$CLIENT_BIN" 9>&- >"$SCRATCH/client$n.log" 2>&1 &
   CLIENT_PIDS[$n]=$!
   echo "$!" >>"$SCRATCH/client.pids"       # so a different process (trap, watchdog) can stop them
   sss_place "${CLIENT_PIDS[$n]}" "$mon"
