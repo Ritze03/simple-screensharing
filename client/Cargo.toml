@@ -25,6 +25,8 @@ dirs = "6.0.0"
 futures-util = "0.3.33"
 eframe = { version = "0.33.3", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland", "persistence", "serde"] }
 egui = "0.33.3"
+egui_extras = "0.33.3"
+simple-screensharing-protocol = { path = "../protocol" }
 gstreamer = "0.24.5"
 gstreamer-app = "0.24.5"
 gstreamer-video = "0.24.5"

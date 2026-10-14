@@ -1,0 +1,11 @@
+[package]
+name = "simple-screensharing-protocol"
+version = "0.1.0"
+edition = "2024"
+
+# Shared wire types for the relay server and the client. Keep this crate
+# dependency-light: it is the one thing both sides must agree on.
+[dependencies]
+anyhow = "1.0.104"
+postcard = { version = "1.1.3", features = ["use-std"] }
+serde = { version = "1.0.229", features = ["derive"] }
