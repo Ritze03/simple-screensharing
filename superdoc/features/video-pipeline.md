@@ -1,4 +1,13 @@
-# Video Pipeline (View tab): H.264-over-HTTP relay + browser-side WebCodecs
+# Video Pipeline: native decode (current) and the H.264-over-HTTP relay + browser-side WebCodecs display (being replaced)
+
+> **Status (2026-10-14).** The **decode side** of this page was rewritten for the native
+> decoder (`client/src/decode.rs`, see "Native decode" below): it handles H.264, H.265 and AV1
+> and is built to feed a GPU renderer. The **display side** (HTTP relay in `video_server.rs`,
+> WebCodecs in the Electron renderer, `tile-video.js` jitter buffer, the View-tab stat bar and
+> everything below "Wire format") describes the Electron build that still ships and is **being
+> replaced; see the egui GPU renderer (I9, in progress)**. Another task (I22) rewrites the
+> display-side sections once the renderer lands; they are left as the accurate record of the old
+> stack until then.
 
 **Added 2026-07-28** (backfilling docs for work that landed across several sessions before
 this page existed — see `superdoc/architecture/overview.md`'s dated module-map entries for
@@ -6,17 +15,85 @@ the detailed build history this page summarizes). How the View tab actually gets
 video onto screen, end to end: the wire format between the Rust sidecar and the Electron
 renderer, the client-side jitter buffer, and how the three live encoder-tuning controls
 (`superdoc/features/stream-control.md`) interact with an in-flight watch. Lives in
-`simple-screensharing-client`.
+`client/` (this monorepo).
 
 Not covered by `superdoc/features/stream-control.md` (which is about the *encode* side —
 building/editing/tiering outgoing destinations) or `superdoc/features/self-preview.md`
 (sender-side only, a completely different mechanism — a live GStreamer `egui::ColorImage`
 texture, not HTTP, not WebCodecs). This page is the *decode/delivery* side, for a watcher.
 
-## The two ends
+## Native decode (`client/src/decode.rs` + `decode/{codec,video,frame}.rs`)
 
-- **Sender side**: unchanged by anything in this doc. `capture.rs` encodes H.264,
-  encrypts, fragments, and sends over the QUIC media-datagram plane — see
+**Added 2026-10-14 (I3).** Replaces the old `StreamDecoder` that could only do software
+`avdec_h264` into an `egui::ColorImage`. Why it was rewritten: the project requirement is
+>= 120 fps end to end (target 240), and the sender already encoded H.265 and AV1 while the Rust
+decoder could only do software H.264.
+
+**Input:** `StreamDecoder::feed(&DecryptedMediaFrame)` with the access unit `net.rs` already
+reassembled and decrypted (no re-decryption here).
+
+**Codec sniffing (`codec::sniff`).** The wire carries no codec tag (decision D5, `protocol-spec.md`
+§6.4). The decoder drops access units until a keyframe AU that carries parameter sets, then
+looks at the bytes: the first byte separates Annex-B (H.264/H.265, start codes) from an AV1 OBU
+stream, and H.264 vs H.265 parameter-set NAL headers are disjoint. A later keyframe that
+sniffs as a different codec rebuilds the pipeline. `Why not a tag:` it would change the protocol
+and the relay, and a tag goes stale when a sender edits a destination to another codec; the
+bitstream cannot.
+
+**Pipeline** (one decoder thread owns it, `decode/video.rs`):
+
+```text
+HW: appsrc ! {h264,h265,av1}parse ! va{h264,h265,av1}dec ! video/x-raw,format=NV12 ! appsink(sync=false)
+SW: appsrc ! {h264,h265,av1}parse ! {avdec_h264,avdec_h265,av1dec} ! videoconvert ! video/x-raw,format=NV12 ! appsink(sync=false)
+```
+
+- **Software fallback** (dav1d is not installed, hence `av1dec`) kicks in on element
+  build/link failure, a bus error, or no decoded frame within 2 s of the first push
+  (`HW_PROBATION`). It **replays the pushed access units** into the new pipeline so the stream
+  does not wait for the next keyframe, and the choice is **remembered per codec** so a rebuild
+  does not retry the broken hardware path every time.
+- **No leaky queue; the decoder thread owns its backlog.** Above 64 AUs (`BACKLOG_MAX_AUS`) the
+  backlog jumps to the newest keyframe. `Why:` the old leaky `queue` dropped the *oldest* AU,
+  which on a freshly built pipeline is the keyframe it needs, so the decode never started while
+  VA was still initialising. The thread can see keyframe boundaries; a queue cannot.
+- **NV12 out, no CPU colour conversion on the HW path:** VA decoders produce NV12 and the GPU
+  renderer converts YUV to RGB in a shader. The old `videoconvert ! RGBA` stage capped
+  throughput far below the 120-240 fps target.
+- **No pacing in the decoder.** The appsink is `sync=false` and frames are published the moment
+  they come out; pacing belongs where the display refresh is known (the presenter).
+  `PacingState` stays as a `pub` building block for that.
+
+**Output:** zero-copy `Arc<DecodedFrame>` (Y and UV slices of the mapped buffer, strides,
+`pts_us`, `YuvMatrix`, `full_range`) published into a latest-only slot. Consumers hold a
+cloneable `FrameSource`: poll `frame_counter()` (one atomic load), fetch with
+`latest_if_newer(last_seen)`, call `note_presented()` when a frame is actually shown, read
+`stats()`. Ingestion never waits for a consumer and never triggers a UI repaint.
+
+**Stats.** *Decoded* fps is counted by a pad probe on the decoder output; *presented* fps is
+counted by `note_presented()`. They are separate numbers. The old `current_fps` only counted
+inside `latest_frame()`, so with nothing polling it the counter read 0 (see the 2026-07-29
+bitrate section below). `StreamDecoder::decoded_fps()` / `presented_fps()` are the new
+accessors; `current_fps()` is kept for the old UI. `received_bitrate_kbps()` is unchanged: it
+counts compressed bytes in `feed()`.
+
+**Legacy adapter.** `latest_frame() -> egui::ColorImage` still exists (CPU NV12 to RGBA at poll
+time) only for the old `ui.rs`.
+
+**Benchmark** (`client/examples/decode_bench.rs`, 1080p, decode throughput):
+
+| codec | HW (fps) | SW (fps) |
+|-------|---------:|---------:|
+| H.264 | 541      | 250      |
+| H.265 | 488      | 166      |
+| AV1   | 463      | 110      |
+
+Every codec clears the 240 fps target in hardware; in software only H.264 does, which is why
+the hardware path is first and the fallback is a safety net, not a plan.
+
+## The two ends (Electron build; display side being replaced)
+
+- **Sender side**: unchanged by anything in this doc. `capture.rs` encodes H.264 / H.265 / AV1
+  (`features/stream-control.md`, "Video codec selection"), encrypts, fragments, and sends over the QUIC media-datagram plane — see
   `architecture/overview.md`'s "Data flow" and `capture.rs`'s module doc.
 - **Watcher side, Rust sidecar**: `net.rs` reassembles/decrypts. `session.rs`'s
   `spawn_media_ingestion_task` (one per room, always running) is the single place that
@@ -45,8 +122,7 @@ texture, not HTTP, not WebCodecs). This page is the *decode/delivery* side, for 
 ## Why this replaced an MJPEG-over-HTTP design
 
 An earlier version of this same delivery path decoded every frame with GStreamer
-(`decode.rs`'s `StreamDecoder`, now dead code — see `architecture/overview.md`'s "Data
-flow" step 4) and re-encoded it as JPEG, served as `multipart/x-mixed-replace`. That paid
+(`decode.rs`'s old software `StreamDecoder`; since reworked, see "Native decode" above) and re-encoded it as JPEG, served as `multipart/x-mixed-replace`. That paid
 for a full decode+re-encode round trip on every single frame, was capped at a ~60fps poll
 rate, and threw away the source encoder's GOP structure (every "frame" was an independent
 JPEG regardless of whether the underlying access unit was a keyframe). Relaying the raw
@@ -234,8 +310,9 @@ bound, instead of settling into a bounded, slightly-behind-realtime steady state
 **Root cause, and why it lives here and not in `decode.rs`:** `decode.rs`'s module doc
 (and `architecture/overview.md`'s `Why:` note on video pacing) already describes a
 well-designed mechanism for exactly this class of problem — a `pts_budget` DDA/accumulator
-plus a wall-clock staleness backstop, both unit-tested. But `decode.rs`'s video path
-(`StreamDecoder`, GStreamer `avdec_h264` → `egui::ColorImage`) is **dead code** — zero live
+plus a wall-clock staleness backstop, both unit-tested. But at the time (2026-07-29)
+`decode.rs`'s video path (`StreamDecoder`, GStreamer `avdec_h264` → `egui::ColorImage`, since
+replaced by the native decoder, see "Native decode") was **dead code** — zero live
 callers since the Electron migration moved real video decode into the browser (`tile-video.js`'s
 `VideoDecoder`, fed by `video_server.rs`'s raw H.264 relay). That mechanism was never ported
 to the browser path when the decode responsibility moved, and — critically — **couldn't be
@@ -622,7 +699,11 @@ added, end to end:
   access-unit bytes this decoder actually receives is the only bitrate figure a *viewer* can
   honestly report — and arguably the more useful one anyway: it reflects what's actually
   arriving after any relay/network loss, not just what the sender is configured to emit.
-- **Why this figure is NOT subject to the same "dead counter" problem `current_fps` has**
+- *(Update 2026-10-14: the dead-counter problem below is fixed at the source. The reworked
+  decoder counts decoded fps with a pad probe, independent of `latest_frame()`, and exposes
+  presented fps separately; see "Native decode". The text below is the history of why the
+  bitrate was plumbed the way it was.)*
+- **Why this figure is NOT subject to the same "dead counter" problem `current_fps` had**
   (see `updateStats`'s pre-existing doc comment on `received_fps` being permanently 0 for any
   WebCodecs-driven tile): `current_fps` only increments inside `StreamDecoder::latest_frame()`,
   which nothing has called since the H.264-relay/WebCodecs redesign stopped consuming

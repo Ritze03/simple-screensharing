@@ -8,9 +8,79 @@ future reader isn't left wondering why the code doesn't match them exactly. Read
 `architecture/overview.md` if you're about to touch the relay or client and something looks
 different from the spec/brainstorm.
 
-Sources for everything below: `~/GitHubProjects/simple-screensharing/simple-screensharing-server` and
-`~/GitHubProjects/simple-screensharing/simple-screensharing-client` (module doc comments, code, and git
-history), cross-checked against `architecture/protocol-spec.md`.
+Sources for everything below: `server/` and `client/` in this monorepo (module doc comments,
+code, and version history). Entries dated before 2026-10-14 were written when these were the
+separate `simple-screensharing-server` / `simple-screensharing-client` repos, and their file
+references use those old names (now `server/` and `client/`). Cross-checked against
+`architecture/protocol-spec.md`.
+
+## Rework foundation: monorepo, shared protocol, native decoder, lib consolidation (2026-10-14)
+
+Same-day sibling of the WebTransport block below (newest first). **Context for everything
+here:** the whole client is being reworked. Electron, the HTML frontend and the Tauri sidecar are
+being replaced by **one native egui app with a room-centric UI**. A **browser client** is coming
+in `docs/`, served by GitHub Pages. The relay gains WebTransport (the block below). The plan and
+its decisions live in `.claude/teamlead/plan/rework-the-entire-thing.md` (Goal, D1-D34). The
+requirement driving the foundation work: screen sharing at **>= 120 fps end to end, ideally 240**.
+The foundation tasks below landed before any UI work and are the divergence from the
+"Electron + sidecar" architecture the rest of this page and `overview.md` still describe.
+
+- **I1, monorepo.** The workspace root is now one repository (private GitHub
+  `Ritze03/simple-screensharing`, all rework on branch `rework`). `client/` and `server/` were
+  imported from the old separate repos **with full history** (a `filter-branch` subdirectory
+  rewrite, then a merge with `--allow-unrelated-histories`); the old branches are kept as
+  `archive/client/*` (86) and `archive/server/*` (7). Root Cargo workspace: members `client`,
+  `client/src-tauri`, `server`, `protocol`, resolver 3; the root `Cargo.lock` started from the
+  client's. The old nested repo directories and the empty `simple-screensharing-website/` were
+  deleted. `Why:` server, desktop client and the upcoming browser client must change in
+  lockstep, and the project owner asked for one repo. Consequences still visible in the tree:
+  `end_to_end_test.rs::server_repo_candidates` and a few older entries in this file still use
+  the pre-monorepo paths (see "Verification gap" in the block below).
+- **I2, shared protocol crate.** New `protocol/` (`simple-screensharing-protocol`) is the
+  single definition of the wire types and constants; `client/src/protocol.rs` and
+  `server/src/protocol.rs` re-export it. I6 then deleted the relay-only header wrappers and moved
+  the relay onto the shared types. The `wire_bytes_unchanged` test pins the postcard bytes of every
+  enum variant against bytes captured from the old code, so the extraction provably did not
+  change the wire. `Why:` the client's `protocol.rs` was an independently derived copy of the
+  spec (its old doc said to "diff the two if suspecting drift"); one crate makes drift
+  impossible and gives the browser client's work one reference.
+- **I3, decoder rework** (`client/src/decode.rs` + `decode/{codec,video,frame}.rs`).
+  *Diverges from the plan/spec, which said H.264 only, and from the earlier notes that call
+  `StreamDecoder` dead code.* Codec is **sniffed** from the first keyframe AU carrying parameter
+  sets (no wire tag: D5, keeps protocol and relay unchanged); pipeline
+  `parse ! va{h264,h265,av1}dec ! NV12 ! appsink(sync=false)` with software fallback
+  (`avdec_h264` / `avdec_h265` / `av1dec`; dav1d not installed) on build/link failure, bus error
+  or no frame in 2 s, replaying pushed AUs and remembered per codec. The leaky queue was replaced
+  by the decoder thread's own backlog (above 64 AUs it jumps to the newest keyframe) because the
+  leaky queue dropped the keyframe while VA initialised. Output is zero-copy
+  `Arc<DecodedFrame>` via a cloneable `FrameSource`; decoded fps is counted by a pad probe,
+  separately from presented fps, which fixes the old bug where `current_fps` only counted inside
+  `latest_frame()`. Legacy `latest_frame() -> ColorImage` stays for the old UI. 1080p
+  benchmark (`client/examples/decode_bench.rs`): H.264 541 HW / 250 SW fps, H.265 488 / 166,
+  AV1 463 / 110. `Why:` the sender already encoded H.265/AV1 but the Rust decoder could only do
+  software H.264, which cannot reach 120-240 fps. Detail: `features/video-pipeline.md` "Native
+  decode".
+- **I4, sidecar logic moved into the lib.** What only lived in
+  `client/src-tauri/src/commands.rs` now lives on `session::AppState`, and `commands.rs` is thin:
+  create/join/forget room, the settings setters with their clamps, start-stream defaults,
+  `edit_destination`, bandwidth total/floor, allocated kbps and overshoot, the audio-level tap,
+  volume resolution, supported codecs. The JS encoder presets became `client/src/presets.rs`:
+
+  | preset | tune | quality | rate control | GOP |
+  |--------|------|---------|--------------|-----|
+  | LowLatency | LowLatency | Performance | Cqp | 2000 ms |
+  | Balanced | BestQuality | Balanced | Qvbr | 2000 ms |
+  | Quality | BestQuality | Quality | Qvbr | 2000 ms |
+  | Gaming | LowLatency | Performance | Cqp | 750 ms |
+
+  `Why:` the Electron/Tauri layers are being deleted, and the new egui UI must stay a thin view
+  over `AppState` rather than re-implement what the sidecar did.
+- **I5, the bin links the lib.** `client/src/main.rs` no longer re-declares the core modules
+  (they previously compiled twice, once per crate); it declares only `ui`, `theme` and
+  `widgets`. `lib.rs` exports `presets` and `decode` alongside the older modules.
+- **I8, egui design foundation.** New `theme.rs` tokens, the `widgets/` slot-row helpers and a
+  `--gallery` screen (design QC). Documented under `superdoc/ui/` by a separate task; the
+  module map in `overview.md` has the one-line entry.
 
 ## WebTransport leg and the rotating pinned certificate (2026-10-14)
 
@@ -47,7 +117,7 @@ Spec: `protocol-spec.md` §11. What was decided while building it, and why:
   `MediaHeader`/`PreviewHeader` — the relay uses the shared crate's types directly.
 - **Verification gap noticed:** `client/src/end_to_end_test.rs::server_repo_candidates` still
   looks for the relay binary under the old multi-repo layout
-  (`~/GitHubProjects/simple-screensharing/simple-screensharing-server/target/...`), so its
+  (the old per-repo `simple-screensharing-server/target/...`), so its
   `--ignored` tests cannot find the monorepo's `target/` binary without help.
 
 ## TUI front-end removed (2026-07-26)
@@ -80,14 +150,14 @@ would have.
   *and* the nonce's `client_id` prefix. Why: the nonce is transmitted in cleartext anyway
   (nonces are public by design), so there's no confidentiality cost to reusing it as the
   public routing handle, and it removes an entire class of "these two ids drifted out of
-  sync" bugs. See `simple-screensharing-server/src/protocol.rs` (`pub type ConnId = u64`)
-  and the identical type in `simple-screensharing-client/src/protocol.rs`.
+  sync" bugs. See `server/src/protocol.rs` (`pub type ConnId = u64`)
+  and the identical type in `client/src/protocol.rs`.
 - **`frame_id` in the media datagram header is the sender's nonce counter value, not a
   separate counter.** Per spec §6.2/§6.5, each frame is encrypted once with
   `nonce = conn_id ‖ counter`, and that same `counter` is written into the header as
   `frame_id`. This gives fragment-grouping ("which fragments belong to the same frame") and
   nonce reconstruction for free from one field, instead of maintaining two counters that
-  would need to stay in lockstep. See `simple-screensharing-client/src/fragment.rs`
+  would need to stay in lockstep. See `client/src/fragment.rs`
   (`fragment_frame`'s `frame_id: u32` parameter) and `net.rs`'s decrypt path.
 - **A 2-byte AAD (`version ‖ stream_id`) authenticates stream identity.** The nonce already
   binds `conn_id` and `counter`, but not `stream_id` (a sender's multiple streams — e.g. two
@@ -103,7 +173,7 @@ would have.
   it: a `u64` big-endian capture timestamp (microseconds) is prepended to the codec payload
   *before* encryption, so it's authenticated by the same AEAD tag as the frame data — a relay
   can't forge or strip it without breaking authentication. See spec §6.4 and
-  `simple-screensharing-client/src/decode.rs`, which strips the PTS after decrypt.
+  `client/src/decode.rs`, which strips the PTS after decrypt.
 - **Keyframes are requested on every new subscriber, not just the 0→1 transition**, with a
   ~100ms server-side debounce per stream to collapse a burst of near-simultaneous
   `Subscribe`s into one `KeyframeRequest`. The brainstorm's "SUBSCRIBE-triggered forced
@@ -111,7 +181,7 @@ would have.
   on *every* successful new subscription (a second viewer joining also gets a fresh keyframe
   immediately, rather than waiting for the encoder's normal 2-second GOP boundary), simply
   debounced so a thundering herd of subscribers doesn't cause an IDR burst. See
-  `simple-screensharing-server/src/relay.rs`, `KEYFRAME_REQUEST_DEBOUNCE` (100ms) and the
+  `server/src/relay.rs`, `KEYFRAME_REQUEST_DEBOUNCE` (100ms) and the
   `Subscribe` handler's `newly_added`/`send_keyframe` logic.
 - **`postcard`, not `bincode`, is the control-message wire encoding — decided mid-scaffold.**
   Both repos were scaffolded in parallel before the protocol spec was written. The client's
@@ -129,22 +199,22 @@ would have.
   confirmed working against the dev machine's AMD GPU via `gst-inspect-1.0 vah264enc`) and
   transparently falls back to software `x264enc` if VAAPI construction or startup fails for
   any reason. Callers of `start_sharing` never choose a backend explicitly. See
-  `simple-screensharing-client/src/capture.rs`, `EncoderBackend`,
+  `client/src/capture.rs`, `EncoderBackend`,
   `detect_encoder_backend`, `probe_vaapi_encoder`.
 - **Windows support required platform-gating the Linux capture path and adding a native
   Windows one.** `ashpd` (the xdg-desktop-portal `ScreenCast` binding, Linux/D-Bus-only) is
   now behind `#[cfg(unix)]`; a parallel `#[cfg(windows)]` path launches GStreamer's
   `d3d11screencapturesrc` instead, needing no portal/consent flow. Everything downstream of
   the platform-specific source element (`videoconvert`, the `tee`, the encoder, the preview
-  branch) is identical on both platforms. See `simple-screensharing-client/src/capture.rs`'s
+  branch) is identical on both platforms. See `client/src/capture.rs`'s
   module doc comment and `acquire_capture_source`. Confirmed compiling successfully via real
   GitHub Actions Windows CI
-  (`simple-screensharing-client/.github/workflows/windows-build.yml`, `windows-latest`
+  (`client/.github/workflows/windows-build.yml`, `windows-latest`
   runner), which also uploads a downloadable `.exe` + GStreamer runtime DLL bundle as a build
   artifact so a Windows-using friend can smoke-test it without a local toolchain.
 - **Windows has no audio-sharing capability yet — a known limitation, not a bug.** This is
   within original scope: the brief only ever required audio capture on Linux.
-  `simple-screensharing-client/src/audio.rs`'s whole approach (shelling out to `pw-dump`/
+  `client/src/audio.rs`'s whole approach (shelling out to `pw-dump`/
   `pw-loopback`/`pw-link`) is PipeWire-specific and has no Windows equivalent implemented. A
   Windows build compiles (the module isn't `cfg`-gated out) but audio source discovery and
   capture will simply fail at runtime there.
@@ -158,10 +228,10 @@ would have.
   — jumping straight to `Null` tears the elements down without ever sending that event, so
   the stream sits `Pending` forever and the pump task never completes. No unit test exercised
   a live `.stop()` call before the real end-to-end integration test
-  (`simple-screensharing-client/src/end_to_end_test.rs`) awaited one on a real running
+  (`client/src/end_to_end_test.rs`) awaited one on a real running
   pipeline for the first time. Fixed by sending a real EOS event first and *then* driving the
   pipeline to `Null` once the pump task observes completion. See
-  `simple-screensharing-client/src/capture.rs`, `CaptureHandle::stop`.
+  `client/src/capture.rs`, `CaptureHandle::stop`.
 
 ## Bugs found via manual testing (2026-07-25)
 
@@ -178,7 +248,7 @@ extra bug a QC pass turned up along the way.
   `sync=false`, so `decode.rs`'s video `new_sample` callback pushed each decoded frame to
   the sink immediately — the PTS was decrypted and available but never consulted, i.e.
   pure "push as available." Fix: `decode.rs` gained `PacingState`
-  (`simple-screensharing-client/src/decode.rs:352`) and a pure `PacingState::next_delay(pts_us,
+  (`client/src/decode.rs:352`) and a pure `PacingState::next_delay(pts_us,
   now)` function (`decode.rs:368`); the video `new_sample` callback (around `decode.rs:612-618`)
   now sleeps the computed delay before handing the frame to the sink, and re-bases —
   skipping the sleep and resetting its baseline — whenever it's more than 300ms behind, to
@@ -197,7 +267,7 @@ extra bug a QC pass turned up along the way.
   frame still got displayed, just progressively later than the last, re-basing every
   ~300ms of accumulated lag forever, which reads as slow drift rather than a stall. Fix:
   `PacingState::next_delay` became `PacingState::decide`
-  (`simple-screensharing-client/src/decode.rs:368`), returning a `PacingDecision` with a
+  (`client/src/decode.rs:368`), returning a `PacingDecision` with a
   third outcome (`Skip`) alongside the existing "sleep then display"/"display now" ones.
   It tracks how many "badly behind" re-base events have fired *consecutively* (no
   on-time/ahead frame resetting the streak in between); the first one still displays
@@ -257,7 +327,7 @@ extra bug a QC pass turned up along the way.
   audio frequently produced a share error instead of working audio. Root cause: PipeWire
   announces a loopback node and its ports as separate registry events, a beat apart;
   `audio.rs`'s setup polled only for the *node* before proceeding, so
-  `start_audio_sharing` (`simple-screensharing-client/src/audio.rs:429`) intermittently raced
+  `start_audio_sharing` (`client/src/audio.rs:429`) intermittently raced
   ahead of the port registration and `bail!`ed because the fresh loopback's ports didn't
   exist yet. Fix: merged the node-wait and port-wait into one combined poll,
   `wait_for_loopback_ready` (`audio.rs:312`), that only returns once both the node and its
@@ -346,7 +416,7 @@ feature decision, not a bug.
   worker, and every async call (connect, subscribe, start/stop capture) is `tokio::spawn`ed
   with its result collected next tick via `try_recv` — `ui.rs`'s pattern with eframe's
   `update()` callback swapped for an explicit loop. A dedicated OS thread (the shape
-  `simple-screensharing-server/src/tui.rs` uses) would work too but buys nothing here: the
+  `server/src/tui.rs` uses) would work too but buys nothing here: the
   server needs one because its TUI must coexist with a QUIC listener that owns the process,
   whereas in `--tui` mode this loop simply *is* the process's foreground.
 - **`tracing` is redirected to a file, for the same reason the relay server's is.** The TUI
@@ -423,14 +493,14 @@ records — `termwiz`/`termina` never compile).
   fan-out snapshot behind a `std::sync::RwLock`, republished under the room mutex on every
   subscriber change (`RoomState::refresh_route`) and read *without any room lock* per
   fragment. `StreamState::subscribers` stays authoritative; the route is a derived cache.
-  See `simple-screensharing-server/src/room.rs`'s module docs for the lock-ordering rules
+  See `server/src/room.rs`'s module docs for the lock-ordering rules
   (the route lock is a strict leaf) and `src/relay.rs`'s `media_forward_task`.
 - **Why the media queue is bounded and lossy (depth 512, drop-on-full).** The old design
   was lossless but room-stalling; the new one is lossy but isolated. This is safe because
   media is unreliable by construction all the way down: the spec's media plane is
   drop-and-continue with no retransmit (§6.2/§6.5), quinn's own `send_datagram` already
   silently drops the oldest queued datagram when a connection's send buffer overflows, and
-  the client's `Reassembler` (`simple-screensharing-client/src/fragment.rs`) discards an
+  the client's `Reassembler` (`client/src/fragment.rs`) discards an
   incomplete frame as soon as a newer `frame_id` arrives, with a 200 ms backstop. A
   relay-side drop is therefore indistinguishable to the receiver from a drop in transit —
   same missing fragment, same discarded frame, no confusion and no double-counting. An
@@ -446,7 +516,7 @@ records — `termwiz`/`termina` never compile).
 
 Ran against current master (`79d4276`, includes the `join_room` UDP-bind fix). Set up a real,
 isolated environment: a headless nested `sway --backend headless` compositor, a real relay
-server child process (`~/GitHubProjects/simple-screensharing/simple-screensharing-server`,
+server child process (the old `simple-screensharing-server` repo, now `server/`,
 release build), and two Tauri app instances (`target/debug/simple-screensharing-client-tauri`)
 each with fully isolated `XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_CACHE_HOME`, all screenshotted
 via `grim`.
@@ -505,7 +575,7 @@ GUI-level coverage as closed — this pass could not deliver that half honestly.
   never awaited at all: a crash, a panic, or an abrupt disconnect path. This is explicitly a
   backstop, not a replacement for graceful teardown — on Linux the portal session's async
   D-Bus close still needs `.stop()` to actually run for the OS recording indicator to clear
-  promptly. See `simple-screensharing-client/src/capture.rs` (`impl Drop for
+  promptly. See `client/src/capture.rs` (`impl Drop for
   CaptureHandle`) and `src/audio.rs` (`impl Drop for AudioCaptureHandle`).
 - **Nonce/AEAD implementation verified correct by a dedicated security QC pass.** Confirmed:
   a single per-connection nonce counter (`Arc<AtomicU64>`) is genuinely shared across that
@@ -521,9 +591,9 @@ Not deviations from a decision, just work the plan describes that hasn't landed 
 the Status section of `architecture/overview.md` for the full list. One worth flagging
 specifically here because it's easy to miss by reading the protocol code alone: the relay
 already sends `RelayToClient::SubscriberCount` and `RelayToClient::KeyframeRequest` (per
-spec §9, e.g. `simple-screensharing-server/src/relay.rs`'s `Subscribe` handler), and the
+spec §9, e.g. `server/src/relay.rs`'s `Subscribe` handler), and the
 client's `net.rs` already receives and forwards both as `ClientEvent`s — but
-`simple-screensharing-client/src/ui.rs`'s event loop currently just discards them (see the
+`client/src/ui.rs`'s event loop currently just discards them (see the
 `ClientEvent::SubscriberCount { .. } | ClientEvent::KeyframeRequest { .. } => { /* ... */ }`
 arm). So the brainstorm's idle-stream optimization (pause/reduce encoding at 0 subscribers)
 and forced-keyframe-on-subscribe are wired at the protocol level but not yet acted on by the
