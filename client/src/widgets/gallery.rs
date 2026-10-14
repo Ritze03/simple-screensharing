@@ -188,7 +188,7 @@ impl Gallery {
         ui.spacing_mut().item_spacing.y = 0.0;
         band(ui, theme::SIDEBAR_RAIL, BandEdge::None, theme::S4, |ui| {
             let r = HBox::new("brand", 22.0).slots(&[fixed(30.0), FILL]).show(ui);
-            brand_mark(ui, r.cell(0));
+            paint_brand_mark(ui, r.cell(0), theme::SIDEBAR_RAIL);
             r.text(ui, 1, "Simple Screensharing", font(Weight::Bold, theme::FS_H3), theme::TEXT, Align::Min);
         });
         let user_h = theme::BAND_H;
@@ -269,11 +269,11 @@ impl Gallery {
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             let people = [
-                PersonRow { name: "mo", color: 0, you: true, live: true, watching: false, idle: false, stale: false },
-                PersonRow { name: "Ana", color: 1, you: false, live: true, watching: true, idle: false, stale: false },
-                PersonRow { name: "Jonas", color: 3, you: false, live: true, watching: false, idle: false, stale: false },
-                PersonRow { name: "Mia", color: 4, you: false, live: false, watching: false, idle: true, stale: false },
-                PersonRow { name: "Maximilian-Alexander", color: 2, you: false, live: true, watching: true, idle: false, stale: false },
+                PersonRow { name: "mo", color: 0, you: Some("you"), live: true, live_label: "Live", watching: false, idle: false, stale: false },
+                PersonRow { name: "Ana", color: 1, you: None, live: true, live_label: "Live", watching: true, idle: false, stale: false },
+                PersonRow { name: "Jonas", color: 3, you: None, live: true, live_label: "Live", watching: false, idle: false, stale: false },
+                PersonRow { name: "Mia", color: 4, you: None, live: false, live_label: "Live", watching: false, idle: true, stale: false },
+                PersonRow { name: "Maximilian-Alexander", color: 2, you: None, live: true, live_label: "Live", watching: true, idle: false, stale: false },
             ];
             for p in &people {
                 person_row(ui, p);
@@ -282,8 +282,8 @@ impl Gallery {
         heading(ui, "People (last known)", Some("2"), false);
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            person_row(ui, &PersonRow { name: "Noah", color: 2, you: false, live: true, watching: false, idle: false, stale: true });
-            person_row(ui, &PersonRow { name: "Ivy", color: 3, you: false, live: false, watching: false, idle: true, stale: true });
+            person_row(ui, &PersonRow { name: "Noah", color: 2, you: None, live: true, live_label: "Live", watching: false, idle: false, stale: true });
+            person_row(ui, &PersonRow { name: "Ivy", color: 3, you: None, live: false, live_label: "Live", watching: false, idle: true, stale: true });
         });
         heading(ui, "Popup", None, false);
         popup_frame(ui, |ui| {
@@ -315,10 +315,10 @@ impl Gallery {
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = theme::S1;
             let rows = [
-                DestRow { current: true, name: "Movie Night", pill: Pill::live("Live"), kbps: "6000 kbps", removable: true },
-                DestRow { current: false, name: "Book Club", pill: Pill::live("Live"), kbps: "6000 kbps", removable: true },
-                DestRow { current: false, name: "Gaming Night", pill: Pill::progress("Starting"), kbps: "12000 kbps", removable: true },
-                DestRow { current: false, name: "Study Group (staged)", pill: Pill::muted("Not live"), kbps: "—", removable: false },
+                DestRow { current: true, name: "Movie Night", note: "this room", remove_tip: "Stop sending", pill: Pill::live("Live"), kbps: "6000 kbps", removable: true },
+                DestRow { current: false, name: "Book Club", note: "this room", remove_tip: "Stop sending", pill: Pill::live("Live"), kbps: "6000 kbps", removable: true },
+                DestRow { current: false, name: "Gaming Night", note: "this room", remove_tip: "Stop sending", pill: Pill::progress("Starting"), kbps: "12000 kbps", removable: true },
+                DestRow { current: false, name: "Study Group (staged)", note: "this room", remove_tip: "Stop sending", pill: Pill::muted("Not live"), kbps: "—", removable: false },
             ];
             for d in &rows {
                 if dest_row(ui, d) == DestAction::Remove {
@@ -545,16 +545,6 @@ impl Gallery {
             },
         );
     }
-}
-
-/// The two-rectangle brand mark (`.mark`), 30×22.
-fn brand_mark(ui: &Ui, cell: Rect) {
-    let o = egui::pos2(cell.left(), cell.center().y - 11.0);
-    let p = ui.painter();
-    let back = Rect::from_min_size(o, vec2(19.0, 13.0));
-    let front = Rect::from_min_size(o + vec2(15.0, 11.0), vec2(15.0, 11.0));
-    p.rect_stroke(back, CornerRadius::same(5), Stroke::new(2.5_f32, theme::ACCENT_LIGHT), egui::StrokeKind::Inside);
-    p.rect(front, CornerRadius::same(5), theme::SIDEBAR_RAIL, Stroke::new(2.5_f32, theme::SUCCESS), egui::StrokeKind::Inside);
 }
 
 /// A popup surface (`.popup`, 340 wide max) — demo only; real popups use egui popups.

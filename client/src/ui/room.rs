@@ -35,7 +35,6 @@
 //! Every string goes through [`tr`]: `t!(key)`, falling back to the English
 //! text until the locale files (I17) have the key.
 
-use std::borrow::Cow;
 
 use egui::epaint::{Mesh, RectShape, Vertex, WHITE_UV};
 use egui::{Align, Color32, CornerRadius, Id, Layout, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, UiBuilder, pos2, vec2};
@@ -45,7 +44,7 @@ use simple_screensharing_client::decode::render::Fit;
 use simple_screensharing_client::protocol::{ConnId, StreamInfo, StreamKind};
 use simple_screensharing_client::session::{CaptureSourceId, DestinationId, RoomHandle};
 
-use super::{ConnState, Cx, Modal, PopoverKind, RoomEntry, ShareState, StreamKey, UiAction, View};
+use super::{ConnState, Cx, Modal, PopoverKind, RoomEntry, ShareState, StreamKey, UiAction, View, tr, tr_with};
 use crate::theme::{self, Weight, font};
 use crate::widgets::{self, Btn, FILL, HBox, IconBtnKind, PersonRow, Pill, fixed, paint_text, text_width};
 
@@ -132,20 +131,6 @@ pub fn grid_shape(n: usize, w: f32, h: f32, gap: f32) -> (usize, f32) {
     }
 }
 
-/// `t!(key)`, or `en` while the locale files don't have `key` yet.
-fn tr(key: &'static str, en: &'static str) -> Cow<'static, str> {
-    let s = t!(key);
-    if s.as_ref() == key || s.ends_with(key) { Cow::Borrowed(en) } else { Cow::Owned(s.into_owned()) }
-}
-
-/// [`tr`] with `%{name}` placeholders filled in.
-fn tr_with(key: &'static str, en: &'static str, args: &[(&str, &str)]) -> String {
-    let mut s = tr(key, en).into_owned();
-    for (k, v) in args {
-        s = s.replace(&format!("%{{{k}}}"), v);
-    }
-    s
-}
 
 /// Avatar gradient for a member: ours is the accent one (as in the user
 /// band), everyone else gets one of the other four, stable per connection.
@@ -179,7 +164,7 @@ pub fn show_header(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
     let Some(r) = room else {
         let (title, meta) = match cx.nav.view {
             View::Watching => (tr("ui.room.watched_title", "Watched streams"), tr("ui.room.watched_meta", "Every stream you're watching, from every room")),
-            _ => (tr("app.title", "Simple Screensharing"), Cow::Borrowed("")),
+            _ => (tr("app.title", "Simple Screensharing"), String::new()),
         };
         let h2 = font(Weight::Bold, theme::FS_H2);
         let tw = text_width(ui, &title, h2.clone(), 0.0).ceil();
@@ -239,7 +224,7 @@ pub fn show_header(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
 
     let mut on = r.auto_connect;
     let auto_tip = tr("ui.room.auto_connect_tip", "Connect to this room when the app starts");
-    if row.show(ui, 1, Align::Min, |ui| widgets::checkbox(ui, &mut on, &auto_lbl)).on_hover_text(auto_tip.as_ref()).changed() {
+    if row.show(ui, 1, Align::Min, |ui| widgets::checkbox(ui, &mut on, &auto_lbl)).on_hover_text(&auto_tip).changed() {
         cx.act(UiAction::SetAutoConnect { room: r.key.clone(), on });
     }
     let w = row.cell(2).width();
@@ -436,16 +421,27 @@ fn reconnect_banner(ui: &mut Ui) -> Option<usize> {
     let retry_l = tr("ui.room.retry", "Retry now");
     let cancel_l = tr("ui.room.cancel", "Cancel");
     let btns = [Btn::secondary(&retry_l), Btn::secondary(&cancel_l)];
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), theme::CTL_H + 2.0 * theme::S2 + 2.0), Sense::hover());
+    // The text wraps (German runs ~20 % longer); the banner grows to fit it.
+    let pad = vec2(theme::S3 + 1.0, theme::S2 + 1.0);
+    let text_w = ui.available_width() - 2.0 * pad.x - theme::ICON - btns.iter().map(|b| b.width(ui) + theme::S2).sum::<f32>() - theme::S2;
+    let mut job = egui::text::LayoutJob::single_section(
+        text.clone(),
+        egui::TextFormat { font_id: font(Weight::Regular, theme::FS_SMALL), color: theme::WARNING, line_height: Some(16.0), ..Default::default() },
+    );
+    job.wrap.max_width = text_w.max(40.0);
+    let galley = ui.painter().layout_job(job);
+    let inner_h = galley.size().y.max(theme::CTL_H);
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), inner_h + 2.0 * pad.y), Sense::hover());
     let r = CornerRadius::same(theme::ROUNDING_MD);
     widgets::paint_hatch(ui.painter(), rect, r, 6.0, theme::HATCH_AMBER_SOFT_A, theme::HATCH_AMBER_SOFT_B);
     ui.painter().rect_stroke(rect, r, Stroke::new(1.0_f32, theme::HATCH_AMBER_BORDER), StrokeKind::Inside);
-    let inner = rect.shrink2(vec2(theme::S3 + 1.0, theme::S2 + 1.0));
+    let inner = rect.shrink2(pad);
     let mut child = ui.new_child(UiBuilder::new().max_rect(inner).layout(Layout::left_to_right(Align::Center)));
     let slots = [fixed(theme::ICON), FILL, fixed(btns[0].width(ui)), fixed(btns[1].width(ui))];
-    let row = HBox::new("hbox·banner", theme::CTL_H).slots(&slots).show(&mut child);
+    let row = HBox::new("hbox·banner", inner_h).slots(&slots).show(&mut child);
     row.icon(&child, 0, "sync_problem", theme::ICON, theme::WARNING);
-    row.text(&child, 1, &text, font(Weight::Regular, theme::FS_SMALL), theme::WARNING, Align::Min);
+    let tc = row.cell(1);
+    child.painter().with_clip_rect(tc.intersect(child.clip_rect())).galley(pos2(tc.left(), tc.center().y - galley.size().y / 2.0), galley, theme::WARNING);
     let mut clicked = None;
     for (i, b) in btns.iter().enumerate() {
         let w = row.cell(i + 2).width();
@@ -726,7 +722,7 @@ fn audio_pill(ui: &mut Ui, cx: &Cx, st: &mut RoomState, key: StreamKey, bottom: 
         ("volume_up", theme::TEXT, tr("ui.room.mute", "Mute this stream"))
     };
     widgets::paint_icon(&child, mr, icon, 16.0, col);
-    if mresp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip.as_ref()).clicked() {
+    if mresp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(&tip).clicked() {
         acts.push(UiAction::SetVolume { stream: key, volume_percent: vol.volume_percent, muted: !vol.muted });
     }
     let num = Color32::from_rgba_unmultiplied(232, 233, 236, 217);
@@ -739,7 +735,7 @@ fn audio_pill(ui: &mut Ui, cx: &Cx, st: &mut RoomState, key: StreamKey, bottom: 
     let sr = Rect::from_center_size(sc.center(), vec2(sc.width(), theme::CTL_H));
     let mut sl = child.new_child(UiBuilder::new().id_salt(("tile_vol", key)).max_rect(sr).layout(Layout::left_to_right(Align::Center)));
     let mut v = shown;
-    let r = widgets::slider(&mut sl, &mut v, 0..=200, 5.0).on_hover_text(tr("ui.room.volume", "Volume").as_ref());
+    let r = widgets::slider(&mut sl, &mut v, 0..=200, 5.0).on_hover_text(tr("ui.room.volume", "Volume"));
     if r.dragged() || r.changed() {
         st.vol_drag = Some((key, v));
     }
@@ -790,7 +786,7 @@ fn thumb_corners(ui: &mut Ui, thumb: Rect, live: Option<&str>, audio: bool) {
     };
     if audio {
         let mut r = ui.new_child(UiBuilder::new().max_rect(row).layout(Layout::right_to_left(Align::Center)));
-        widgets::chip_dark(&mut r, Some("volume_up"), false, "").on_hover_text(tr("ui.room.shares_audio", "Shares audio").as_ref());
+        widgets::chip_dark(&mut r, Some("volume_up"), false, "").on_hover_text(tr("ui.room.shares_audio", "Shares audio"));
     }
 }
 
@@ -846,7 +842,7 @@ fn share_card(ui: &mut Ui, cx: &Cx, h: RoomHandle, info: &StreamInfo, acts: &mut
     let me = cx.my_conn(h) == Some(info.owner);
     let name = cx.member_name(h, info.owner);
     let specs = if audio_only {
-        tr("ui.room.audio_only", "Audio only").into_owned()
+        tr("ui.room.audio_only", "Audio only")
     } else if info.width > 0 && info.height > 0 {
         format!("{}×{}", info.width, info.height)
     } else {
@@ -892,9 +888,9 @@ fn my_card(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSourceId, destin
     thumb_placeholder(ui, thumb, "cast", theme::SUCCESS, &tr("ui.room.my_screen", "Your screen (no self-preview)"));
     let chip = match cx.destination_state(c, d) {
         DestinationState::Live | DestinationState::Rebuilding { .. } => "LIVE".to_owned(),
-        DestinationState::Starting => tr("ui.room.chip_starting", "STARTING").into_owned(),
-        DestinationState::Stalled { .. } => tr("ui.room.chip_stalled", "STALLED").into_owned(),
-        DestinationState::Failed(_) => tr("ui.room.chip_failed", "FAILED").into_owned(),
+        DestinationState::Starting => tr("ui.room.chip_starting", "STARTING"),
+        DestinationState::Stalled { .. } => tr("ui.room.chip_stalled", "STALLED"),
+        DestinationState::Failed(_) => tr("ui.room.chip_failed", "FAILED"),
     };
     thumb_corners(ui, thumb, Some(&chip), false);
 
@@ -925,8 +921,15 @@ pub fn show_people(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
         // Reconnecting: the lib keeps no last-known roster, so there's nothing
         // honest to list.
         widgets::heading(ui, &tr("ui.room.people", "People"), None, false);
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), theme::ROW_H), Sense::hover());
-        paint_text(ui, rect, &tr("ui.room.people_paused", "Back when the room reconnects"), font(Weight::Regular, theme::FS_SMALL), theme::TEXT_FAINT, Align::Min);
+        // Wraps: the German line is wider than the 207 px column.
+        let mut job = egui::text::LayoutJob::single_section(
+            tr("ui.room.people_paused", "Back when the room reconnects"),
+            egui::TextFormat { font_id: font(Weight::Regular, theme::FS_SMALL), color: theme::TEXT_FAINT, line_height: Some(16.0), ..Default::default() },
+        );
+        job.wrap.max_width = ui.available_width();
+        let galley = ui.painter().layout_job(job);
+        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), galley.size().y.max(theme::ROW_H)), Sense::hover());
+        ui.painter().galley(pos2(rect.left(), rect.center().y - galley.size().y / 2.0), galley, theme::TEXT_FAINT);
         return;
     };
     let me = s.client.conn_id();
@@ -934,6 +937,9 @@ pub fn show_people(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
     widgets::heading(ui, &tr("ui.room.people", "People"), Some(&s.members.len().to_string()), false);
     let watches = s.watches.lock().unwrap();
     let audio = s.audio_watches.lock().unwrap();
+    // The mockup's faint lowercase "you" tag / "LIVE" pill, from existing keys.
+    let you_tag = tr("ui.room.you", "You").to_lowercase();
+    let live_l = tr("ui.pill.live", "Live");
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
         let order = s.members.iter().filter(|m| m.conn_id == me).chain(s.members.iter().filter(|m| m.conn_id != me));
@@ -943,7 +949,16 @@ pub fn show_people(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
             let watching = !you && (watches.keys().any(|k| k.0 == m.conn_id) || audio.iter().any(|(k, a)| k.0 == m.conn_id && !a.auto));
             widgets::person_row(
                 ui,
-                &PersonRow { name: &m.display_name, color: avatar_color(you, m.conn_id), you, live, watching, idle: !live, stale: false },
+                &PersonRow {
+                    name: &m.display_name,
+                    color: avatar_color(you, m.conn_id),
+                    you: you.then_some(you_tag.as_str()),
+                    live,
+                    live_label: &live_l,
+                    watching,
+                    idle: !live,
+                    stale: false,
+                },
             );
         }
     });

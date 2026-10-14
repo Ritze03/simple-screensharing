@@ -5,9 +5,9 @@
 use std::sync::atomic::Ordering;
 
 use simple_screensharing_client::net::parse_join_string;
-use simple_screensharing_client::session::{self, PendingRole, Status};
+use simple_screensharing_client::session::{self, PendingRole};
 
-use super::{App, Modal, StagedShare, UiAction, View, paired_audio, room_entries};
+use super::{App, Modal, StagedShare, UiAction, View, paired_audio, room_entries, same_room, tr, tr_with, view_is_room};
 
 impl App {
     /// Apply one action. `ctx` is only used for the clipboard.
@@ -15,7 +15,7 @@ impl App {
         match action {
             // --- navigation ---------------------------------------------
             UiAction::SelectRoom(key) => {
-                self.state.active_room = self.state.rooms.iter().find(|(_, r)| r.join_string == key).map(|(h, _)| *h);
+                self.state.active_room = self.state.rooms.iter().find(|(_, r)| same_room(&r.join_string, &key)).map(|(h, _)| *h);
                 self.nav.view = View::Room(key);
                 self.nav.popover = None;
             }
@@ -39,11 +39,11 @@ impl App {
             UiAction::Connect(key) => {
                 if self.state.pending_connect.is_some() {
                     // One connect at a time (lib invariant): queue it.
-                    if !self.state.auto_connect_queue.contains(&key) {
+                    if !self.state.auto_connect_queue.iter().any(|k| same_room(k, &key)) {
                         self.state.auto_connect_queue.push(key);
                     }
                 } else if let Err(e) = self.state.start_connect(key, false) {
-                    self.toast(t!("ui.toast.connect_failed", error = e).to_string(), "error");
+                    self.toast(tr_with("ui.toast.connect_failed", "Couldn't connect: %{error}", &[("error", &e.to_string())]), "error");
                 }
             }
             UiAction::CancelConnect => self.state.cancel_connect(),
@@ -54,7 +54,7 @@ impl App {
                     self.shell.join_error = Some(format!("{e:#}"));
                     return;
                 }
-                if let Some(h) = self.state.rooms.iter().find(|(_, r)| r.join_string == join_string).map(|(h, _)| *h) {
+                if let Some(h) = self.state.rooms.iter().find(|(_, r)| same_room(&r.join_string, &join_string)).map(|(h, _)| *h) {
                     // Already joined: just show it.
                     self.state.active_room = Some(h);
                     self.nav.view = View::Room(join_string);
@@ -85,20 +85,20 @@ impl App {
                 }
             }
             UiAction::Forget(key) => {
-                if let Some(h) = self.state.rooms.iter().find(|(_, r)| r.join_string == key).map(|(h, _)| *h) {
+                if let Some(h) = self.state.rooms.iter().find(|(_, r)| same_room(&r.join_string, &key)).map(|(h, _)| *h) {
                     self.state.disconnect_room(h);
                 }
                 if self.state.is_reconnecting(&key) {
                     self.state.cancel_connect();
                 }
-                self.state.auto_connect_queue.retain(|k| k != &key);
+                self.state.auto_connect_queue.retain(|k| !same_room(k, &key));
                 if let Err(e) = self.state.forget_room(&key) {
-                    self.toast(t!("ui.toast.save_failed", error = e).to_string(), "error");
+                    self.toast(tr_with("ui.toast.save_failed", "Couldn't save: %{error}", &[("error", &e.to_string())]), "error");
                 }
-                if self.nav.view == View::Room(key.clone()) {
+                if view_is_room(&self.nav.view, &key) {
                     self.nav.view = room_entries(&self.state).first().map(|r| View::Room(r.key.clone())).unwrap_or_default();
                 }
-                if matches!(&self.nav.modal, Some(Modal::ForgetConfirm { room }) if *room == key) {
+                if matches!(&self.nav.modal, Some(Modal::ForgetConfirm { room }) if same_room(room, &key)) {
                     self.nav.modal = None;
                 }
             }
@@ -125,14 +125,10 @@ impl App {
                 match parse_join_string(&room.join_string) {
                     Ok(parsed) => {
                         ctx.copy_text(room.client.invite_link(&parsed.server));
-                        self.toast(t!("ui.toast.invite_copied").to_string(), "content_copy");
+                        self.toast(tr("ui.toast.invite_copied", "Invite link copied").to_string(), "content_copy");
                     }
-                    Err(e) => self.toast(t!("ui.toast.copy_failed", error = format!("{e:#}")).to_string(), "error"),
+                    Err(e) => self.toast(tr_with("ui.toast.copy_failed", "Couldn't copy the invite link: %{error}", &[("error", &format!("{e:#}"))]), "error"),
                 }
-            }
-            UiAction::CopyText { text, toast } => {
-                ctx.copy_text(text);
-                self.toast(toast, "content_copy");
             }
 
             // --- watching ------------------------------------------------
@@ -193,14 +189,14 @@ impl App {
                     // Audio rides on a live capture only; it's live now.
                     self.state.selected_audio_source = Some(source);
                     if let Err(e) = self.state.start_audio_share(room, capture) {
-                        self.toast(t!("ui.toast.audio_failed", error = e).to_string(), "error");
+                        self.toast(tr_with("ui.toast.audio_failed", "Couldn't share audio: %{error}", &[("error", &e.to_string())]), "error");
                     }
                 }
                 if matches!(self.nav.modal, Some(Modal::StreamSettings { capture: c, .. }) if c == capture) {
                     self.nav.modal = None;
                 }
                 let name = self.room_name(room);
-                self.toast(t!("ui.toast.live_in", room = name).to_string(), "cast");
+                self.toast(tr_with("ui.toast.live_in", "Live in %{room}", &[("room", &name.to_string())]), "cast");
             }
             UiAction::Discard(capture) => {
                 self.state.stop_share(capture);
@@ -214,7 +210,7 @@ impl App {
                 self.state.stop_destination(destination);
                 if let Some(room) = room {
                     let name = self.room_name(room);
-                    self.toast(t!("ui.toast.stopped_in", room = name).to_string(), "stop_circle");
+                    self.toast(tr_with("ui.toast.stopped_in", "Stopped sharing in %{room}", &[("room", &name.to_string())]), "stop_circle");
                     // Keep an open settings modal pointing at a room the
                     // capture still feeds.
                     if let Some(Modal::StreamSettings { capture, room: mroom }) = self.nav.modal.clone()
@@ -227,14 +223,13 @@ impl App {
                     }
                 }
             }
-            UiAction::StopCapture(capture) => self.state.stop_share(capture),
             UiAction::StopAllSharing => {
                 let ids: Vec<_> = self.state.captures.keys().copied().collect();
                 for id in ids {
                     self.state.stop_share(id);
                 }
                 self.nav.popover = None;
-                self.toast(t!("ui.toast.stopped_all").to_string(), "stop_circle");
+                self.toast(tr("ui.toast.stopped_all", "Stopped all sharing").to_string(), "stop_circle");
             }
             UiAction::AddDestination { capture, room } => {
                 self.state.add_destination(capture, room, PendingRole::FanOut);
@@ -262,7 +257,6 @@ impl App {
                 }
                 self.nav.popover = None;
             }
-            UiAction::RetryDestination(d) => self.state.retry_destination(d),
             UiAction::EditDestination { destination, edit } => self.state.edit_destination(destination, edit),
             UiAction::ApplyPresetToDestination { destination, preset } => self.state.apply_preset_to_destination(destination, preset),
             UiAction::SetNextStream(n) => {
@@ -293,7 +287,7 @@ impl App {
                 if let Some(room) = room {
                     self.state.selected_audio_source = Some(source);
                     if let Err(e) = self.state.start_audio_share(room, capture) {
-                        self.toast(t!("ui.toast.audio_failed", error = e).to_string(), "error");
+                        self.toast(tr_with("ui.toast.audio_failed", "Couldn't share audio: %{error}", &[("error", &e.to_string())]), "error");
                     }
                 }
                 self.nav.popover = None;
@@ -335,15 +329,6 @@ impl App {
             UiAction::SetCatchUpSpeed(p) => {
                 self.state.set_catch_up_speed_percent(p);
             }
-
-            // --- misc ----------------------------------------------------
-            UiAction::Toast { text, icon } => self.toast(text, icon),
-            UiAction::ClearErrors => {
-                if matches!(self.state.status, Status::Error(_)) {
-                    self.state.status = Status::Idle;
-                }
-                self.state.share_error = None;
-            }
         }
     }
 
@@ -357,7 +342,7 @@ impl App {
     fn room_name(&self, room: session::RoomHandle) -> String {
         match self.state.rooms.get(&room) {
             Some(r) => session::room_label(&self.state.room_store, &r.join_string),
-            None => t!("ui.room.unknown").to_string(),
+            None => tr("ui.room.unknown", "Unknown room").to_string(),
         }
     }
 }

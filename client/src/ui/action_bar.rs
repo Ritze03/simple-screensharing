@@ -32,7 +32,7 @@ use simple_screensharing_client::session::{
     CaptureSourceId, Destination, DestinationId, LocalCapture, PendingRole, RoomHandle, ShareHandle, ShareStatus,
 };
 
-use super::{ConnState, Cx, Modal, PopoverKind, ShareState, UiAction};
+use super::{ConnState, Cx, Modal, PopoverKind, ShareState, UiAction, tr, tr_with};
 use crate::theme::{self, Weight, font};
 use crate::widgets::{self, Btn, FILL, HBox, Pill, PillLead, PopItem, Slot, fixed, paint_icon, paint_text, text_width};
 
@@ -79,16 +79,16 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, st: &mut ActionBarState) {
 
 fn paused(ui: &mut Ui) {
     let row = HBox::new("action_bar", theme::CTL_H_LG).gap(theme::S2).slots(&[fixed(84.0), FILL]).show(ui);
-    let text = tr("ui.bar.paused", "Paused", &[]);
+    let text = tr("ui.bar.paused", "Paused");
     paint_pill(ui, row.cell(0), Pill::muted(&text).lead(PillLead::Icon("pause")).large());
-    status_text(ui, row.cell(1), &tr("ui.bar.paused_status", "Sharing is paused until the room is back", &[]), None);
+    status_text(ui, row.cell(1), &tr("ui.bar.paused_status", "Sharing is paused until the room is back"), None);
 }
 
 fn idle(ui: &mut Ui, cx: &mut Cx, room: RoomHandle) {
     let others: Vec<RoomHandle> = cx.live_rooms().into_iter().filter(|r| *r != room).collect();
-    let share_l = tr("ui.bar.share_screen", "Share screen", &[]);
-    let audio_l = tr("ui.bar.share_audio", "Share audio", &[]);
-    let audio_tip = tr("ui.bar.share_audio_first", "Share a screen first; audio rides along with it", &[]);
+    let share_l = tr("ui.bar.share_screen", "Share screen");
+    let audio_l = tr("ui.bar.share_audio", "Share audio");
+    let audio_tip = tr("ui.bar.share_audio_first", "Share a screen first; audio rides along with it");
     let mut share = Btn::primary(&share_l).icon("screen_share").large();
     if !others.is_empty() {
         share = share.trailing("expand_more");
@@ -100,7 +100,7 @@ fn idle(ui: &mut Ui, cx: &mut Cx, room: RoomHandle) {
     row.show(ui, 1, Align::Min, |ui| audio.show_sized(ui, row.cell(1).width()));
     if !others.is_empty() {
         let names: Vec<String> = others.iter().map(|r| cx.room_name(*r)).collect();
-        let text = tr("ui.bar.live_elsewhere", "Your screen is live in %{rooms}", &[("rooms", &names.join(", "))]);
+        let text = tr_with("ui.bar.live_elsewhere", "Your screen is live in %{rooms}", &[("rooms", &names.join(", "))]);
         let c = row.cell(2);
         paint_text(ui, Rect::from_x_y_ranges(c.left() + theme::S1..=c.right(), c.y_range()), &text, t2_font(false), theme::TEXT_DIM, Align::Min);
     }
@@ -116,9 +116,9 @@ fn idle(ui: &mut Ui, cx: &mut Cx, room: RoomHandle) {
 fn staged(ui: &mut Ui, cx: &mut Cx, room: RoomHandle, capture: CaptureSourceId, picking: bool) {
     let Some(c) = cx.capture(capture) else { return };
     let staged_audio = cx.shell.staged.get(&room).and_then(|s| s.audio.clone());
-    let settings_l = tr("ui.bar.stream_settings", "Stream settings", &[]);
-    let discard_l = tr("ui.bar.discard", "Discard", &[]);
-    let go_l = tr("ui.bar.go_live", "Go live", &[]);
+    let settings_l = tr("ui.bar.stream_settings", "Stream settings");
+    let discard_l = tr("ui.bar.discard", "Discard");
+    let go_l = tr("ui.bar.go_live", "Go live");
     let settings = Btn::secondary(&settings_l).icon("tune").large().enabled(!picking);
     let discard = Btn::secondary(&discard_l).large();
     let go = Btn::primary(&go_l).icon("cast").large().enabled(!picking);
@@ -135,15 +135,15 @@ fn staged(ui: &mut Ui, cx: &mut Cx, room: RoomHandle, capture: CaptureSourceId, 
     let row = HBox::new("action_bar", theme::CTL_H_LG).gap(theme::S2).slots(&slots).show(ui);
     let (pill_t, t1, t2) = if picking {
         (
-            tr("ui.bar.picking", "Picking", &[]),
-            tr("ui.bar.picking_title", "Choose a screen in the system picker", &[]),
-            tr("ui.bar.picking_sub", "Waiting for the screen picker", &[]),
+            tr("ui.bar.picking", "Picking"),
+            tr("ui.bar.picking_title", "Choose a screen in the system picker"),
+            tr("ui.bar.picking_sub", "Waiting for the screen picker"),
         )
     } else {
         (
-            tr("ui.bar.ready", "Ready", &[]),
-            tr("ui.bar.not_live_yet", "%{screen} · not live yet", &[("screen", &screen_name(c))]),
-            tr("ui.bar.goes_live_in", "Goes live in %{room}", &[("room", &cx.room_name(room))]),
+            tr("ui.bar.ready", "Ready"),
+            tr_with("ui.bar.not_live_yet", "%{screen} · not live yet", &[("screen", &screen_name(c))]),
+            tr_with("ui.bar.goes_live_in", "Goes live in %{room}", &[("room", &cx.room_name(room))]),
         )
     };
     let pill = if picking { Pill::progress(&pill_t) } else { Pill::muted(&pill_t) };
@@ -182,10 +182,10 @@ fn live(ui: &mut Ui, cx: &mut Cx, room: RoomHandle, capture: CaptureSourceId, de
         }
         None => (None, false, 0),
     };
-    let settings_l = tr("ui.bar.stream_settings", "Stream settings", &[]);
+    let settings_l = tr("ui.bar.stream_settings", "Stream settings");
     let rooms_l = rooms_count(n_rooms);
-    let rooms_tip = tr("ui.bar.rooms_tip", "Rooms this stream goes to", &[]);
-    let stop_l = tr("ui.bar.stop_sharing", "Stop sharing", &[]);
+    let rooms_tip = tr("ui.bar.rooms_tip", "Rooms this stream goes to");
+    let stop_l = tr("ui.bar.stop_sharing", "Stop sharing");
     let settings = Btn::secondary(&settings_l).icon("tune").large();
     let rooms = Btn::secondary(&rooms_l).icon("cast").trailing("expand_more").large().tip(&rooms_tip);
     let stop = Btn::danger_solid(&stop_l).icon("stop_screen_share").large();
@@ -204,7 +204,7 @@ fn live(ui: &mut Ui, cx: &mut Cx, room: RoomHandle, capture: CaptureSourceId, de
     paint_pill(ui, row.cell(0), kind.pill(&text).large());
     let params = d.live_params();
     let kbps = dest_kbps(cx, destination, d);
-    let t1 = tr("ui.bar.live_title", "%{screen} · %{fps} fps", &[("screen", &screen_name(c)), ("fps", &params.framerate.to_string())]);
+    let t1 = tr_with("ui.bar.live_title", "%{screen} · %{fps} fps", &[("screen", &screen_name(c)), ("fps", &params.framerate.to_string())]);
     let t2 = format!("{} · {}", simple_screensharing_client::presets::codec_label(params.codec), fmt_rate(kbps));
     status_text(ui, row.cell(1), &t1, Some((&t2, true)));
     let audio_out = audio.show(ui, row.cell(2));
@@ -263,7 +263,7 @@ impl AudioSlot {
     fn new(ui: &Ui, name: Option<String>, muted: bool, lit: Option<u8>, enabled: bool) -> Self {
         let (width, label_w) = match &name {
             None => {
-                let l = tr("ui.bar.share_audio", "Share audio", &[]);
+                let l = tr("ui.bar.share_audio", "Share audio");
                 (Btn::secondary(&l).icon("volume_up").trailing("expand_more").large().width(ui), 0.0)
             }
             Some(n) => {
@@ -277,7 +277,7 @@ impl AudioSlot {
 
     fn show(&self, ui: &mut Ui, cell: Rect) -> AudioOut {
         let Some(name) = &self.name else {
-            let l = tr("ui.bar.share_audio", "Share audio", &[]);
+            let l = tr("ui.bar.share_audio", "Share audio");
             let b = Btn::secondary(&l).icon("volume_up").trailing("expand_more").large().enabled(self.enabled);
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(cell));
             let open = b.show_sized(&mut child, cell.width()).clicked();
@@ -318,12 +318,12 @@ impl AudioSlot {
         x += theme::S2;
         paint_icon(ui, Rect::from_x_y_ranges(x..=x + theme::ICON_BTN, rect.y_range()), "expand_more", theme::ICON_BTN, fade(theme::TEXT));
         let mute_tip = if self.muted {
-            tr("ui.bar.unmute_audio", "Unmute shared audio", &[])
+            tr("ui.bar.unmute_audio", "Unmute shared audio")
         } else {
-            tr("ui.bar.mute_audio", "Mute shared audio", &[])
+            tr("ui.bar.mute_audio", "Mute shared audio")
         };
         let mute = mute.on_hover_text(mute_tip);
-        let src = src.on_hover_text(tr("ui.bar.change_audio", "Change audio source", &[]));
+        let src = src.on_hover_text(tr("ui.bar.change_audio", "Change audio source"));
         AudioOut {
             mute: mute.clicked(),
             open: src.clicked(),
@@ -345,10 +345,10 @@ fn audio_popover(ui: &mut Ui, cx: &mut Cx, _st: &mut ActionBarState) {
     };
     let sources = state.audio_sources.clone();
     let mut picked: Option<UiAction> = None;
-    let heading = tr("ui.audio.heading", "Audio source", &[]);
-    let empty = tr("ui.audio.none", "No app is playing audio", &[]);
-    let refresh = tr("ui.audio.refresh", "Refresh", &[]);
-    let stop = tr("ui.audio.stop", "Stop sharing audio", &[]);
+    let heading = tr("ui.audio.heading", "Audio source");
+    let empty = tr("ui.audio.none", "No app is playing audio");
+    let refresh = tr("ui.audio.refresh", "Refresh");
+    let stop = tr("ui.audio.stop", "Stop sharing audio");
     let levels: Vec<u8> = sources.iter().map(|s| cx.source_level(s.id).map(level_lit).unwrap_or(0)).collect();
     let ctx = ui.ctx().clone();
     let open = super::popover(&ctx, &pop, POPOVER_W, |ui| {
@@ -418,7 +418,7 @@ fn share_menu(ui: &mut Ui, cx: &mut Cx, room: RoomHandle) {
     let Some(pop) = cx.popover_of(&PopoverKind::ShareMenu { room }).cloned() else { return };
     let captures = cx.live_captures();
     let room_name = cx.room_name(room);
-    let heading = tr("ui.share_menu.heading", "Share in %{room}", &[("room", &room_name)]);
+    let heading = tr_with("ui.share_menu.heading", "Share in %{room}", &[("room", &room_name)]);
     let items: Vec<(CaptureSourceId, String, String, String)> = captures
         .iter()
         .filter(|(_, c)| c.destinations.values().all(|d| d.room != room))
@@ -427,15 +427,15 @@ fn share_menu(ui: &mut Ui, cx: &mut Cx, room: RoomHandle) {
             let rooms: Vec<String> = c.destinations.values().map(|d| cx.room_name(d.room)).collect();
             (
                 *id,
-                tr("ui.share_menu.add", "Add %{screen} here too", &[("screen", &screen)]),
-                tr("ui.share_menu.move", "Move %{screen} here", &[("screen", &screen)]),
-                tr("ui.share_menu.move_sub", "Starts here, then stops in %{rooms}", &[("rooms", &rooms.join(", "))]),
+                tr_with("ui.share_menu.add", "Add %{screen} here too", &[("screen", &screen)]),
+                tr_with("ui.share_menu.move", "Move %{screen} here", &[("screen", &screen)]),
+                tr_with("ui.share_menu.move_sub", "Starts here, then stops in %{rooms}", &[("rooms", &rooms.join(", "))]),
             )
         })
         .collect();
-    let add_sub = tr("ui.share_menu.add_sub", "Same capture, one more room", &[]);
-    let other = tr("ui.share_menu.other", "Share a different screen", &[]);
-    let other_sub = tr("ui.share_menu.other_sub", "Opens the system picker", &[]);
+    let add_sub = tr("ui.share_menu.add_sub", "Same capture, one more room");
+    let other = tr("ui.share_menu.other", "Share a different screen");
+    let other_sub = tr("ui.share_menu.other_sub", "Opens the system picker");
     let mut picked = None;
     let ctx = ui.ctx().clone();
     let open = super::popover(&ctx, &pop, POPOVER_W, |ui| {
@@ -467,8 +467,8 @@ fn share_menu(ui: &mut Ui, cx: &mut Cx, room: RoomHandle) {
 fn rooms_popover(ui: &mut Ui, cx: &mut Cx, capture: CaptureSourceId, room: RoomHandle) {
     let Some(pop) = cx.popover_of(&PopoverKind::Rooms { capture, room }).cloned() else { return };
     let ctx = ui.ctx().clone();
-    let also = tr("ui.rooms.also_send_to", "Also send to", &[]);
-    let move_to = tr("ui.rooms.move_to", "Move to", &[]);
+    let also = tr("ui.rooms.also_send_to", "Also send to");
+    let move_to = tr("ui.rooms.move_to", "Move to");
     let targets = RoomTargets::of(cx, capture, room);
     let mut picked = None;
     let open = super::popover(&ctx, &pop, POPOVER_W, |ui| {
@@ -508,9 +508,9 @@ impl RoomTargets {
             .map(|(h, name)| {
                 let n = cx.session(h).map(|s| s.members.len()).unwrap_or(0);
                 let people = if n == 1 {
-                    tr("ui.rooms.one_person", "1 person", &[])
+                    tr("ui.rooms.one_person", "1 person")
                 } else {
-                    tr("ui.rooms.people", "%{count} people", &[("count", &n.to_string())])
+                    tr_with("ui.rooms.people", "%{count} people", &[("count", &n.to_string())])
                 };
                 (h, name, people, dest_in(h))
             })
@@ -519,10 +519,10 @@ impl RoomTargets {
             capture,
             here: dest_in(room),
             rooms,
-            none: tr("ui.rooms.none", "No other connected rooms", &[]),
-            live_there: tr("ui.rooms.live_there", "Live there", &[]),
-            move_sub: tr("ui.rooms.move_sub", "Starts there first, then stops here", &[]),
-            already: tr("ui.rooms.already_live", "Already live there", &[]),
+            none: tr("ui.rooms.none", "No other connected rooms"),
+            live_there: tr("ui.rooms.live_there", "Live there"),
+            move_sub: tr("ui.rooms.move_sub", "Starts there first, then stops here"),
+            already: tr("ui.rooms.already_live", "Already live there"),
         }
     }
 
@@ -581,22 +581,9 @@ impl RoomTargets {
 // Shared helpers (also used by the stream-settings modal)
 // ---------------------------------------------------------------------------
 
-/// `t!(key)`, or `en` (with `%{name}` placeholders filled from `args`) while
-/// the key has no locale entry yet. `Why:` the locale files land later (I17);
-/// until then this keeps real English on screen instead of raw keys, so
-/// layouts can be checked against the mockup at their true widths.
-pub(super) fn tr(key: &str, en: &str, args: &[(&str, &str)]) -> String {
-    let found = t!(key);
-    let mut s = if found == key { en.to_string() } else { found.into_owned() };
-    for (k, v) in args {
-        s = s.replace(&format!("%{{{k}}}"), v);
-    }
-    s
-}
-
 /// "1 room" / "N rooms".
 pub(super) fn rooms_count(n: usize) -> String {
-    if n == 1 { tr("ui.bar.one_room", "1 room", &[]) } else { tr("ui.bar.n_rooms", "%{count} rooms", &[("count", &n.to_string())]) }
+    if n == 1 { tr("ui.bar.one_room", "1 room") } else { tr_with("ui.bar.n_rooms", "%{count} rooms", &[("count", &n.to_string())]) }
 }
 
 /// kbit/s as the mockup prints a rate: "6.0 Mbps", "800 kbps".
@@ -662,14 +649,14 @@ impl PillKind {
 /// Stalled / Failed.
 pub(super) fn dest_pill(c: &LocalCapture, d: &Destination) -> (PillKind, String) {
     if matches!(d.pending, Some(PendingRole::TransferTarget(_) | PendingRole::TransferSource(_))) {
-        return (PillKind::Progress, tr("ui.pill.moving", "Moving", &[]));
+        return (PillKind::Progress, tr("ui.pill.moving", "Moving"));
     }
     match c.destination_state(d) {
-        DestinationState::Live => (PillKind::Live, tr("ui.pill.live", "Live", &[])),
-        DestinationState::Starting => (PillKind::Progress, tr("ui.pill.starting", "Starting", &[])),
-        DestinationState::Rebuilding { .. } => (PillKind::Progress, tr("ui.pill.applying", "Applying", &[])),
-        DestinationState::Stalled { .. } => (PillKind::Degraded, tr("ui.pill.stalled", "Stalled", &[])),
-        DestinationState::Failed(_) => (PillKind::Degraded, tr("ui.pill.failed", "Failed", &[])),
+        DestinationState::Live => (PillKind::Live, tr("ui.pill.live", "Live")),
+        DestinationState::Starting => (PillKind::Progress, tr("ui.pill.starting", "Starting")),
+        DestinationState::Rebuilding { .. } => (PillKind::Progress, tr("ui.pill.applying", "Applying")),
+        DestinationState::Stalled { .. } => (PillKind::Degraded, tr("ui.pill.stalled", "Stalled")),
+        DestinationState::Failed(_) => (PillKind::Degraded, tr("ui.pill.failed", "Failed")),
     }
 }
 

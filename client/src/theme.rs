@@ -8,20 +8,16 @@
 //! at a call site.
 //!
 //! The widgets that turn these tokens into rows, cards and controls live in
-//! `crate::widgets` (see its module doc for the slot layout model). This module has no
-//! widgets of its own except the **legacy** section at the bottom, which only exists so
-//! the old `ui.rs` keeps compiling unchanged until it is rebuilt on `widgets`.
+//! `crate::widgets` (see its module doc for the slot layout model); this module has no
+//! widgets of its own.
 //!
-//! Entry points:
-//! - [`apply`] — new design: fonts + visuals + spacing. Call once (the `--gallery` screen
-//!   and every new screen use this).
-//! - [`install`] — legacy: what the old `ui.rs` calls; visuals only, old spacing, no fonts.
+//! Entry point: [`apply`] — fonts + visuals + spacing. Call once at startup.
 //!
 //! The app is dark-only: the Electron app never had a light theme (`color-scheme: dark`).
 
 #![allow(dead_code)] // design tokens: not every token has a caller until the new screens land
 
-use egui::{Color32, CornerRadius, FontFamily, FontId, RichText, Stroke, Ui, Vec2, Widget};
+use egui::{Color32, CornerRadius, FontFamily, FontId, Stroke, Vec2};
 
 // ---------------------------------------------------------------------------
 // Color tokens (mockup `:root` / tokens.css)
@@ -210,7 +206,7 @@ pub const MODAL_W: f32 = 520.0;
 pub const MODAL_W_WIDE: f32 = 640.0;
 pub const MODAL_W_XWIDE: f32 = 1120.0;
 
-/// `--rounding` — modals (and the legacy card).
+/// `--rounding` — modals.
 pub const ROUNDING: u8 = 14;
 /// `--rounding-well` — sidebar wells, cards (`.gcard`, `.scard` use 12).
 pub const ROUNDING_WELL: u8 = 12;
@@ -448,6 +444,11 @@ pub fn apply(ctx: &egui::Context) {
     ] {
         wv.bg_fill = fill;
         wv.weak_bg_fill = fill;
+        if fill == WASH_HOVER_1 || fill == WASH_HOVER_2 {
+            // Scroll handle while hovered / dragged (no egui widget we use
+            // paints `bg_fill` in these states otherwise).
+            wv.bg_fill = BTN_BORDER;
+        }
         wv.bg_stroke = Stroke::new(1.0_f32, stroke);
         wv.fg_stroke = Stroke::new(1.0_f32, fg);
         wv.corner_radius = r;
@@ -472,203 +473,32 @@ pub fn apply(ctx: &egui::Context) {
         s.spacing.window_margin = egui::Margin::ZERO;
         s.spacing.icon_width = MARK;
         s.spacing.icon_spacing = S2;
+        // Scroll bars: a thin floating handle (no track) drawn 3 px inside the
+        // scroll area's edge, in the dim `BTN` grey (`BTN_BORDER` when hovered /
+        // dragged, via the widget visuals' `bg_fill` above). `Why:` egui's
+        // default floating bar is `TEXT`-coloured and sits flush on the area's
+        // right edge, so the room body's bar painted a bright line over the
+        // People panel's divider; the mockup shows no bar at all at rest.
+        s.spacing.scroll = egui::style::ScrollStyle {
+            floating: true,
+            bar_width: 8.0,
+            floating_width: 4.0,
+            floating_allocated_width: 0.0,
+            handle_min_length: 24.0,
+            bar_inner_margin: 0.0,
+            bar_outer_margin: 3.0,
+            foreground_color: false,
+            dormant_background_opacity: 0.0,
+            active_background_opacity: 0.0,
+            interact_background_opacity: 0.0,
+            dormant_handle_opacity: 0.0,
+            active_handle_opacity: 1.0,
+            interact_handle_opacity: 1.0,
+        };
         // Labels in this design are never selectable text: selectable labels sense
         // clicks and would steal them from the clickable rows they sit in.
         s.interaction.selectable_labels = false;
     });
-}
-
-// ===========================================================================
-// Legacy — only for the old `ui.rs`. Do NOT use in new code (use `crate::widgets`).
-// Kept verbatim in behavior so the old UI renders as before; colors now come from the
-// shared tokens above (the base/raised/border greys moved by 1–3 levels to the
-// Electron values, everything else is identical).
-// ===========================================================================
-
-/// Legacy: blend `base` toward transparent through gamma-correct `Rgba` (old UI only).
-pub fn tint(base: Color32, alpha: u8) -> Color32 {
-    let a = alpha as f32 / 255.0;
-    let linear = egui::Rgba::from(base);
-    Color32::from(egui::Rgba::from_rgba_premultiplied(linear.r() * a, linear.g() * a, linear.b() * a, a))
-}
-
-/// Legacy: the old UI's single spacing step (new code uses `S1..S4`).
-pub const SPACING: f32 = 7.0;
-/// Legacy: nav-rail pill height.
-pub const NAV_BUTTON_HEIGHT: f32 = 38.0;
-/// Legacy: old form-button height.
-pub const FORM_BUTTON_HEIGHT: f32 = 30.0;
-/// Legacy: capped settings-panel width.
-pub const PANEL_MAX_WIDTH: f32 = 520.0;
-/// Legacy: old value-spinner width (new rows use [`VALUE_W`]).
-const LEGACY_VALUE_W: f32 = 64.0;
-
-/// Legacy: the old UI's global visuals (no fonts, 7 px spacing). Called by `ui.rs`.
-pub fn install(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = PANEL_BASE;
-    visuals.window_fill = PANEL_RAISED;
-    visuals.window_stroke = Stroke::new(1.0_f32, BORDER);
-    visuals.window_corner_radius = CornerRadius::same(ROUNDING);
-    visuals.extreme_bg_color = FIELD;
-    visuals.faint_bg_color = PANEL_SUNKEN;
-    visuals.override_text_color = Some(TEXT);
-    visuals.hyperlink_color = ACCENT;
-    visuals.selection.bg_fill = tint(ACCENT, 120);
-    visuals.selection.stroke = Stroke::new(1.0_f32, TEXT);
-    for widget in [
-        &mut visuals.widgets.noninteractive,
-        &mut visuals.widgets.inactive,
-        &mut visuals.widgets.hovered,
-        &mut visuals.widgets.active,
-        &mut visuals.widgets.open,
-    ] {
-        widget.corner_radius = CornerRadius::same(ROUNDING_SM);
-        widget.bg_stroke = Stroke::new(1.0_f32, BORDER);
-    }
-    visuals.widgets.noninteractive.bg_fill = PANEL_BASE;
-    visuals.widgets.inactive.bg_fill = BTN;
-    visuals.widgets.inactive.weak_bg_fill = BTN;
-    visuals.widgets.hovered.bg_fill = tint(ACCENT, 60);
-    visuals.widgets.hovered.weak_bg_fill = tint(ACCENT, 60);
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, BTN_BORDER);
-    visuals.widgets.active.bg_fill = tint(ACCENT, 110);
-    visuals.widgets.active.weak_bg_fill = tint(ACCENT, 110);
-    visuals.widgets.open.bg_fill = FIELD;
-    visuals.widgets.open.weak_bg_fill = FIELD;
-    ctx.set_visuals(visuals);
-    ctx.style_mut(|style| {
-        style.spacing.item_spacing = Vec2::splat(SPACING);
-    });
-}
-
-/// Legacy: uppercase accent section title (old UI).
-pub fn section_label(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text.to_uppercase()).small().strong().color(ACCENT));
-}
-
-/// Legacy: bordered titled card with a trailing gap (old UI). New code: `widgets::card`.
-pub fn card(ui: &mut Ui, title: &str, add_contents: impl FnOnce(&mut Ui)) {
-    egui::Frame::new()
-        .fill(PANEL_RAISED)
-        .stroke(Stroke::new(1.0_f32, BORDER))
-        .corner_radius(CornerRadius::same(ROUNDING))
-        .inner_margin(SPACING)
-        .show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = SPACING;
-            section_label(ui, title);
-            add_contents(ui);
-        });
-    ui.add_space(SPACING);
-}
-
-/// Legacy: chrome-free media frame (old UI).
-pub fn media_frame(ui: &mut Ui, add_contents: impl FnOnce(&mut Ui)) {
-    egui::Frame::new().fill(PANEL_SUNKEN).corner_radius(CornerRadius::same(ROUNDING)).inner_margin(0).show(ui, |ui| {
-        add_contents(ui);
-    });
-}
-
-/// Legacy: amber warning banner (old UI). New code: `widgets::banner`.
-pub fn warning_banner(ui: &mut Ui, message: &str) {
-    egui::Frame::new()
-        .fill(tint(WARNING, 28))
-        .stroke(Stroke::new(1.0_f32, WARNING))
-        .corner_radius(CornerRadius::same(ROUNDING_SM))
-        .inner_margin(SPACING)
-        .show(ui, |ui| {
-            ui.label(RichText::new(message).color(WARNING).strong());
-        });
-}
-
-/// Legacy: vertically centred left-column label (old UI).
-pub fn row_label(ui: &mut Ui, text: &str) {
-    let height = ui.spacing().interact_size.y;
-    ui.allocate_ui_with_layout(Vec2::new(ui.available_width(), height), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-        ui.label(RichText::new(text).color(TEXT));
-    });
-}
-
-/// Legacy: two-column slider row (old UI). New code: `widgets::slider_row`.
-pub fn slider_row(ui: &mut Ui, label: &str, value: &mut u32, range: std::ops::RangeInclusive<u32>, speed: f64, suffix: &str) -> bool {
-    let mut changed = false;
-    ui.columns(2, |columns| {
-        row_label(&mut columns[0], label);
-        columns[1].horizontal(|ui| {
-            let slider_width = (ui.available_width() - LEGACY_VALUE_W - ui.spacing().item_spacing.x).max(1.0);
-            let height = ui.spacing().interact_size.y;
-            let slider_response = ui.add_sized([slider_width, height], egui::Slider::new(value, range).show_value(false));
-            let drag_response = ui.add_sized([LEGACY_VALUE_W, height], egui::DragValue::new(value).speed(speed).suffix(suffix));
-            changed = slider_response.changed() || drag_response.changed();
-        });
-    });
-    changed
-}
-
-/// Legacy: two-column label + control row (old UI). New code: `widgets::ctrl_row`.
-pub fn setting_row(ui: &mut Ui, label: &str, add_control: impl FnOnce(&mut Ui)) {
-    ui.columns(2, |columns| {
-        row_label(&mut columns[0], label);
-        columns[1].horizontal(|ui| add_control(ui));
-    });
-}
-
-fn legacy_button(text: &str, fill: Color32, text_color: Color32, border: Option<Color32>, strong: bool) -> egui::Button<'static> {
-    let mut rich = RichText::new(text.to_owned()).color(text_color);
-    if strong {
-        rich = rich.strong();
-    }
-    let mut button =
-        egui::Button::new(rich).fill(fill).corner_radius(CornerRadius::same(ROUNDING)).min_size(Vec2::new(0.0, FORM_BUTTON_HEIGHT));
-    if let Some(border) = border {
-        button = button.stroke(Stroke::new(1.0_f32, border));
-    }
-    button
-}
-
-/// Legacy: primary form button (old UI). New code: `widgets::Btn::primary`.
-pub fn primary_button(text: impl Into<String>) -> impl Widget {
-    legacy_button(&text.into(), ACCENT, PRIMARY_TEXT, None, true)
-}
-
-/// Legacy: secondary form button (old UI). New code: `widgets::Btn::secondary`.
-pub fn secondary_button(text: impl Into<String>) -> impl Widget {
-    legacy_button(&text.into(), BTN, TEXT, Some(BTN_BORDER), false)
-}
-
-/// Legacy: danger form button (old UI). New code: `widgets::Btn::danger`.
-pub fn danger_button(text: impl Into<String>) -> impl Widget {
-    legacy_button(&text.into(), Color32::TRANSPARENT, DANGER, Some(tint(DANGER, 140)), false)
-}
-
-/// Legacy: nav-rail pill (old UI).
-pub fn nav_button(text: impl Into<String>, active: bool) -> impl Widget {
-    let (fill, text_color) = if active { (ACCENT, PRIMARY_TEXT) } else { (Color32::TRANSPARENT, TEXT_DIM) };
-    egui::Button::new(RichText::new(text.into()).strong().color(text_color))
-        .fill(fill)
-        .stroke(Stroke::NONE)
-        .corner_radius(CornerRadius::same(ROUNDING))
-        .min_size(Vec2::new(0.0, NAV_BUTTON_HEIGHT))
-}
-
-/// Legacy: frameless glyph button (old UI). New code: `widgets::icon_btn`.
-pub fn icon_button(glyph: impl Into<String>) -> impl Widget {
-    egui::Button::new(RichText::new(glyph.into()).color(TEXT_DIM))
-        .fill(Color32::TRANSPARENT)
-        .corner_radius(CornerRadius::same(ROUNDING_SM))
-        .frame(false)
-}
-
-/// Legacy: filled / hollow status dot (old UI). New code: `widgets::status_dot`.
-pub fn status_dot(ui: &mut Ui, color: Color32, filled: bool) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(DOT_SIZE), egui::Sense::hover());
-    let center = rect.center();
-    let radius = DOT_SIZE / 2.0;
-    if filled {
-        ui.painter().circle_filled(center, radius, color);
-    } else {
-        ui.painter().circle_stroke(center, radius - 0.5, Stroke::new(1.5_f32, color));
-    }
 }
 
 #[cfg(test)]

@@ -15,8 +15,12 @@
 //!   `cx.shell.awaiting_join` shows a progress banner meanwhile). Create pushes
 //!   [`UiAction::CreateRoom`] (minted link in `cx.shell.create_result`), then
 //!   shows the link — masked, because it carries the room key and this is a
-//!   screen-sharing app — with Copy ([`UiAction::CopyText`]) and "Join now"
-//!   (`JoinRoom`). The server field is pre-filled with the server of the most
+//!   screen-sharing app — with "Join now" (`JoinRoom`; the modal stays open).
+//!   Copy is enabled only once that room is connected and copies the live
+//!   connection's invite link ([`UiAction::CopyInviteLink`]). `Why:` the
+//!   minted link has no relay cert hash, so browsers can't use it; the live
+//!   link carries it. The footer then turns into "Done".
+//!   The server field is pre-filled with the server of the most
 //!   recently saved room. `Why:` the lib keeps no "last server" setting, and
 //!   the newest saved room is the last server the user created or joined on.
 //! - **Settings** (`Modal::Settings`, 640): cards Profile / Language / Display /
@@ -27,28 +31,16 @@
 //!   are live in the room or watching streams there.
 //! - **Rename** (520): one Name row, Enter or Save pushes [`UiAction::Rename`].
 
-use std::borrow::Cow;
 
 use egui::{Align, Ui};
 use simple_screensharing_client::net::parse_join_string;
 use simple_screensharing_client::rooms::{AppSettings, PresentationMode};
 use simple_screensharing_client::session::RoomHandle;
 
-use super::{Cx, Modal, ShareState, UiAction};
+use super::{Cx, Modal, ShareState, UiAction, tr, tr_with};
 use crate::theme::{self, Weight, font};
 use crate::widgets::{self, BannerKind, Btn, FooterClick, ModalSpec};
 
-/// `t!(key)`, or `en` while the locale files don't have `key` yet (they come
-/// with I17; until then `t!` returns the key itself). `Why:` raw keys in the
-/// modals made the screenshots useless for comparing against the mockup.
-pub(super) fn tr(key: &str, en: &'static str) -> Cow<'static, str> {
-    let s = t!(key);
-    if s == key {
-        Cow::Borrowed(en)
-    } else {
-        Cow::Owned(s.into_owned())
-    }
-}
 
 /// Which half of the create/join modal is showing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -132,12 +124,7 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState, modal: &Moda
         Modal::Settings => settings(ctx, cx, st),
         Modal::LeaveConfirm { room } => {
             let name = cx.room_name(*room);
-            let title = t!("ui.modal.leave_title", room = name);
-            let title = if title.starts_with("ui.") {
-                format!("Leave {name}?")
-            } else {
-                title.into_owned()
-            };
+            let title = tr_with("ui.modal.leave_title", "Leave %{room}?", &[("room", &name)]);
             let body = tr(
                 "ui.modal.leave_body",
                 "You'll disconnect. The room stays in your list so you can reconnect later.",
@@ -157,12 +144,7 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState, modal: &Moda
         Modal::ForgetConfirm { room } => {
             let entry = cx.room(room);
             let name = entry.as_ref().map(|r| r.name.clone()).unwrap_or_default();
-            let title = t!("ui.modal.forget_title", room = name);
-            let title = if title.starts_with("ui.") {
-                format!("Forget {name}?")
-            } else {
-                title.into_owned()
-            };
+            let title = tr_with("ui.modal.forget_title", "Forget %{room}?", &[("room", &name)]);
             let body = tr(
                 "ui.modal.forget_body",
                 "You'll leave the room and it disappears from your list. You need the invite link to come back.",
@@ -214,6 +196,16 @@ fn create_join(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
         _ => None,
     };
     let minted = matches!(created, Some(Ok(_))) && st.tab == AddTab::Create;
+    // The minted link has no relay cert hash (browsers can't use it), so Copy
+    // waits for the live connection and copies its invite link instead
+    // (`UiAction::CopyInviteLink`, cert hash included). `App::on_joined` keeps
+    // this modal open when the join came from "Join now".
+    let joined = match &created {
+        Some(Ok(link)) => cx.state.rooms.iter().find(|(_, r)| super::same_room(&r.join_string, &link.join_string)).map(|(h, _)| *h),
+        _ => None,
+    };
+    let done = tr("ui.stream.done", "Done");
+    let copy_tip = tr("ui.room.copy_invite_offline_tip", "Connect first: the link includes the relay's certificate");
     // The footer closure can't borrow `st` next to the body's `&mut`: it uses
     // this pass's start values (a tab switch requests a repaint below).
     let tab = st.tab;
@@ -286,9 +278,9 @@ fn create_join(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
                                     )
                                 },
                                 |ui| {
-                                    copy_clicked = Btn::secondary(&copy)
-                                        .show_sized(ui, theme::VALUE_W)
-                                        .clicked()
+                                    let b = Btn::secondary(&copy).enabled(joined.is_some());
+                                    let b = if joined.is_none() { b.tip(&copy_tip) } else { b };
+                                    copy_clicked = b.show_sized(ui, theme::VALUE_W).clicked()
                                 },
                             );
                         });
@@ -340,7 +332,9 @@ fn create_join(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
             }
         },
         |ui| {
-            click = if minted {
+            click = if minted && joined.is_some() {
+                widgets::modal_footer(ui, &[], None, &[Btn::primary(&done)])
+            } else if minted {
                 widgets::modal_footer(
                     ui,
                     &[],
@@ -371,18 +365,15 @@ fn create_join(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
         },
     );
 
-    if let (true, Some(Ok(link))) = (copy_clicked, &created) {
-        let toast = tr("ui.toast.link_copied", "Join link copied").into_owned();
-        cx.act(UiAction::CopyText {
-            text: link.join_string.clone(),
-            toast,
-        });
+    if let (true, Some(h)) = (copy_clicked, joined) {
+        cx.act(UiAction::CopyInviteLink(h));
     }
     // Footer: `[Join now]` once a room was minted (mockup), else `[Cancel][primary]`.
     let primary_i = if minted { 0 } else { 1 };
     let primary = click == FooterClick::Trailing(primary_i) || submit;
     let cancel_clicked = !minted && click == FooterClick::Trailing(0);
-    if cancel_clicked || (a.close && click == FooterClick::None && !submit) {
+    let done_clicked = primary && minted && joined.is_some();
+    if cancel_clicked || done_clicked || (a.close && click == FooterClick::None && !submit) {
         cx.act(UiAction::CloseModal);
     } else if primary && !awaiting {
         if minted {
@@ -625,8 +616,7 @@ fn leave_warnings(cx: &Cx, room: RoomHandle) -> Vec<String> {
             tr(
                 "ui.modal.warn_watching_one",
                 "You stop watching 1 stream from this room.",
-            )
-            .into_owned(),
+            ),
         );
     } else if watching > 1 {
         out.push(

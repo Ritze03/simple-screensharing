@@ -46,14 +46,13 @@ fn unreachable_join_string(id: u8) -> String {
 mod session_model {
     use indexmap::IndexMap;
     use simple_screensharing_client::capture;
-    use simple_screensharing_client::protocol::{StreamId, StreamInfo, StreamKind};
+    use simple_screensharing_client::protocol::{StreamId, StreamKind};
     use simple_screensharing_client::session::{
         AppState, CaptureSourceId, DEFAULT_BITRATE_KBPS, DEFAULT_FRAMERATE, DestEdit, Destination, DestinationId, LocalCapture,
         RoomHandle, ShareStatus, capture_feeding, find_destination, room_label,
     };
     use tokio::sync::oneshot;
 
-    use super::super::{destination_geometry, remote_stream_geometry};
 
     fn capture_with(destinations: IndexMap<DestinationId, Destination>) -> LocalCapture {
         let (_tx, rx) = oneshot::channel();
@@ -164,25 +163,6 @@ mod session_model {
         let mut store = simple_screensharing_client::rooms::RoomStore::default();
         store.upsert("movie night".to_string(), join_string.clone());
         assert_eq!(room_label(&store, &join_string), "movie night");
-    }
-
-    #[test]
-    fn remote_stream_geometry_renders_an_em_dash_for_the_missing_framerate() {
-        let info =
-            StreamInfo { owner: 1, stream_id: 0, kind: StreamKind::Video, label: "Screen".to_string(), width: 1920, height: 1080 };
-        assert_eq!(remote_stream_geometry(&info), "1920x1080@\u{2014}");
-        assert_eq!(remote_stream_geometry(&StreamInfo { width: 0, height: 0, ..info }), "\u{2014}");
-    }
-
-    #[test]
-    fn destination_geometry_prefers_the_live_runtime_over_the_requested_params() {
-        let mut dest = destination(RoomHandle(0), 0);
-        assert_eq!(destination_geometry(&dest), "\u{2014}");
-        dest.runtime = Some(capture::destination::DestinationRuntime::shared(
-            std::time::Instant::now(),
-            capture::destination::VideoParams { width: 2560, height: 1440, framerate: 60, ..dest.params },
-        ));
-        assert_eq!(destination_geometry(&dest), "2560x1440@60");
     }
 
     #[tokio::test]
@@ -402,6 +382,28 @@ async fn room_list_is_saved_order_and_a_pending_connect_reads_as_reconnecting() 
     app.state.cancel_connect();
 }
 
+/// #31: a join string re-spelled with a (different) relay cert hash is the
+/// same room: one row, found by either spelling, never queued twice.
+#[tokio::test]
+async fn a_cert_hash_respelling_is_the_same_room() {
+    let _home = isolated_home();
+    let a = unreachable_join_string(1);
+    let hashed = format!("{a}|aZzvDUgnp0ZwLozhaaRsgsdWKtMyGPIwNikFgwbCJlg");
+    assert!(same_room(&a, &hashed));
+    let mut app = app_with_rooms(&[("Alpha", a.clone())]);
+    let ctx = ctx();
+    app.state.start_connect(hashed.clone(), false).unwrap();
+    let rooms = room_entries(&app.state);
+    assert_eq!(rooms.len(), 1, "the in-flight respelling must not add a second row");
+    assert_eq!(rooms[0].conn, ConnState::Reconnecting);
+    app.apply(&ctx, UiAction::SelectRoom(hashed.clone()));
+    assert!(view_is_room(&app.nav.view, &a));
+    app.apply(&ctx, UiAction::Connect(a.clone()));
+    app.apply(&ctx, UiAction::Connect(hashed.clone()));
+    assert_eq!(app.state.auto_connect_queue.len(), 1, "queued once whatever the spelling");
+    app.state.cancel_connect();
+}
+
 #[tokio::test]
 async fn auto_connect_rooms_are_queued_at_startup() {
     let _home = isolated_home();
@@ -520,4 +522,17 @@ async fn shell_regions_match_the_spec_sizes() {
     let regions: HashMap<&str, Rect> = shell_regions(&ctx).into_iter().collect();
     assert!(!regions.contains_key("people") && !regions.contains_key("action_bar"));
     assert_eq!(regions["room_body"], Rect::from_min_max(egui::pos2(theme::SIDEBAR_W, theme::BAND_H), egui::pos2(1280.0, 800.0)));
+}
+
+/// Mockup `positionPopup`: below and left-aligned; above when it would cross
+/// the bottom; pushed left (never flipped to right-aligned) at the right edge.
+#[test]
+fn popover_hangs_off_the_anchor_like_the_mockup() {
+    let screen = Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1280.0, 800.0));
+    let size = egui::vec2(340.0, 200.0);
+    let a = Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(120.0, 32.0));
+    assert_eq!(popover_pos(screen, a, size), egui::pos2(100.0, 88.0));
+    // A bottom-bar button near the right edge: above it, pushed left to 8 px in.
+    let b = Rect::from_min_size(egui::pos2(1000.0, 750.0), egui::vec2(124.0, 36.0));
+    assert_eq!(popover_pos(screen, b, size), egui::pos2(1280.0 - 8.0 - 340.0, 750.0 - 6.0 - 200.0));
 }

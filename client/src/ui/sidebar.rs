@@ -26,10 +26,10 @@
 //! - other sharers: **decoded** fps while we watch the stream (the protocol's
 //!   `StreamInfo` carries no fps — contract "Known lib gaps" #5); empty otherwise.
 
-use egui::{Align, CornerRadius, Rect, Sense, Stroke, Ui, pos2, vec2};
+use egui::{Align, CornerRadius, Rect, Sense, Stroke, Ui, vec2};
 use simple_screensharing_client::protocol::StreamKind;
 
-use super::{ConnState, Cx, Modal, PopoverKind, RoomKey, ShareState, StreamKey, UiAction, View};
+use super::{ConnState, Cx, Modal, PopoverKind, RoomKey, ShareState, StreamKey, UiAction, View, tr, tr_with};
 use crate::theme::{self, Weight, font};
 use crate::widgets::{
     self, Btn, DotState, FILL, HBox, IconBtnKind, IconTone, LiveSlot, PopItem, RoomLead, RoomRow, SharerRow, Unit, fixed,
@@ -49,23 +49,8 @@ pub struct SidebarState {}
 /// Brand band content: `[30 mark][fill label]`.
 pub fn show_brand(ui: &mut Ui, _cx: &mut Cx, _st: &mut SidebarState) {
     let row = HBox::new("brand", theme::BAND_H).slots(&[fixed(30.0), FILL]).show(ui);
-    brand_mark(ui, row.cell(0));
-    row.text(ui, 1, &t!("app.title"), font(Weight::Bold, theme::FS_H3), theme::TEXT, Align::Min);
-}
-
-/// The two-rectangle brand mark (mockup `.mark`), 30×22, vertically centred
-/// in `cell`: an accent outline behind a green outline that knocks it out.
-/// The mockup's pseudo-elements are content-box (`19×13` / `15×11` plus a
-/// 2.5 px border each side), so the outer boxes are 24×18 at the top-left and
-/// 20×16 at the bottom-right. (`widgets::gallery`'s copy uses the inner sizes
-/// as outer ones and comes out too small with almost no overlap.)
-fn brand_mark(ui: &Ui, cell: Rect) {
-    let o = pos2(cell.left(), (cell.center().y - 11.0).round());
-    let p = ui.painter();
-    let back = Rect::from_min_size(o, vec2(24.0, 18.0));
-    let front = Rect::from_min_size(o + vec2(10.0, 6.0), vec2(20.0, 16.0));
-    p.rect_stroke(back, CornerRadius::same(5), Stroke::new(2.5_f32, theme::ACCENT_LIGHT), egui::StrokeKind::Inside);
-    p.rect(front, CornerRadius::same(5), theme::SIDEBAR_RAIL, Stroke::new(2.5_f32, theme::SUCCESS), egui::StrokeKind::Inside);
+    widgets::paint_brand_mark(ui, row.cell(0), theme::SIDEBAR_RAIL);
+    row.text(ui, 1, &tr("app.title", "Simple Screensharing"), font(Weight::Bold, theme::FS_H3), theme::TEXT, Align::Min);
 }
 
 // ---------------------------------------------------------------------------
@@ -91,14 +76,14 @@ pub fn show_body(ui: &mut Ui, cx: &mut Cx, _st: &mut SidebarState) {
             ui,
             &RoomRow {
                 lead: RoomLead::Icon("grid_view"),
-                name: &t!("ui.sidebar.watched_streams"),
+                name: &tr("ui.sidebar.watched_streams", "Watched streams"),
                 live: LiveSlot::Absent,
                 num: Some(watched),
                 unit: Unit::Icon("visibility"),
                 selected: sel_watching,
             },
         )
-        .on_hover_text(t!("ui.sidebar.watched_streams_tip"))
+        .on_hover_text(tr("ui.sidebar.watched_streams_tip", "Every stream you're watching, from every room"))
         .clicked()
     });
     if clicked {
@@ -109,7 +94,7 @@ pub fn show_body(ui: &mut Ui, cx: &mut Cx, _st: &mut SidebarState) {
     ui.add_space(theme::S1);
     let lines = room_lines(cx);
     let n_rooms = lines.iter().filter(|l| matches!(l, Line::Room { .. })).count();
-    widgets::heading(ui, &t!("ui.sidebar.rooms"), Some(&n_rooms.to_string()), true);
+    widgets::heading(ui, &tr("ui.sidebar.rooms", "Rooms"), Some(&n_rooms.to_string()), true);
     if !lines.is_empty() {
         let clicked = widgets::well(ui, |ui| paint_lines(ui, &lines));
         for a in clicked.into_iter().flatten() {
@@ -117,7 +102,7 @@ pub fn show_body(ui: &mut Ui, cx: &mut Cx, _st: &mut SidebarState) {
         }
     }
 
-    if widgets::btn_row(ui, &[Btn::ghost(&t!("ui.sidebar.create_or_join")).icon("add")]).is_some() {
+    if widgets::btn_row(ui, &[Btn::ghost(&tr("ui.sidebar.create_or_join", "Create or join a room")).icon("add")]).is_some() {
         cx.act(UiAction::OpenModal(Modal::CreateJoin));
     }
 }
@@ -160,9 +145,9 @@ fn room_lines(cx: &Cx) -> Vec<Line> {
     let mut out = Vec::new();
     for r in cx.rooms() {
         let (dot, tip) = match r.conn {
-            ConnState::Joined => (DotState::Joined, t!("ui.sidebar.status_connected")),
-            ConnState::Reconnecting => (DotState::Reconnecting, t!("ui.sidebar.status_reconnecting")),
-            ConnState::Disconnected => (DotState::Disconnected, t!("ui.sidebar.status_disconnected")),
+            ConnState::Joined => (DotState::Joined, tr("ui.sidebar.status_connected", "Connected")),
+            ConnState::Reconnecting => (DotState::Reconnecting, tr("ui.sidebar.status_reconnecting", "Reconnecting")),
+            ConnState::Disconnected => (DotState::Disconnected, tr("ui.sidebar.status_disconnected", "Not connected")),
         };
         let handle = r.handle.filter(|_| r.conn == ConnState::Joined);
         // Our live destination here: (capture, destination fps).
@@ -180,7 +165,7 @@ fn room_lines(cx: &Cx) -> Vec<Line> {
             dot,
             live: mine.is_some(),
             num: (handle.is_some() && n > 0).then_some(n as u32),
-            selected: cx.nav.view == View::Room(r.key.clone()),
+            selected: super::view_is_room(&cx.nav.view, &r.key),
             tip: tip.to_string(),
             click: vec![UiAction::SelectRoom(r.key.clone())],
         });
@@ -189,9 +174,9 @@ fn room_lines(cx: &Cx) -> Vec<Line> {
             out.push(Line::Sharer {
                 icon: "cast",
                 tone: IconTone::Live,
-                name: t!("ui.sidebar.you").to_string(),
+                name: tr("ui.sidebar.you", "You").to_string(),
                 fps: Some(fps),
-                tip: Some(t!("ui.sidebar.you_tip").to_string()),
+                tip: Some(tr("ui.sidebar.you_tip", "Your stream here — open its settings").to_string()),
                 click: vec![UiAction::SelectRoom(r.key.clone()), UiAction::OpenModal(Modal::StreamSettings { capture, room: h })],
             });
         }
@@ -238,15 +223,7 @@ pub fn show_user_band(ui: &mut Ui, cx: &mut Cx, _st: &mut SidebarState) {
     let n_live = cx.live_rooms().len();
     let online = cx.rooms().iter().any(|r| r.conn == ConnState::Joined);
     let av = Rect::from_center_size(row.cell(0).center(), vec2(theme::AVATAR, theme::AVATAR));
-    widgets::paint_avatar(ui, av, &initial, 0, false);
-    if online {
-        // Mockup `.avatar .pres`: 10 px green + 2 px ELEV_14 ring (content-box,
-        // so 14 px outer) at right/bottom −2 → centre 5 px in from the corner.
-        // `Why not paint_avatar(.., true)`: its dot is 6/10 px, visibly smaller.
-        let c = pos2(av.right() - 5.0, av.bottom() - 5.0);
-        ui.painter().circle_filled(c, 7.0, theme::ELEV_14);
-        ui.painter().circle_filled(c, 5.0, theme::SUCCESS);
-    }
+    widgets::paint_avatar(ui, av, &initial, 0, online);
 
     // "who": vbox(name 13 bold / 16 line, status 11 / 14 line); the hover
     // wash is padded 3/6 around it (mockup `.p-user .who`, margin 0 −6).
@@ -257,21 +234,21 @@ pub fn show_user_band(ui: &mut Ui, cx: &mut Cx, _st: &mut SidebarState) {
         ui.painter().rect_filled(hot, CornerRadius::same(theme::ROUNDING_XS), theme::WASH_HOVER_1);
     }
     let status = match n_live {
-        0 => t!("ui.sidebar.not_sharing").to_string(),
-        1 => t!("ui.sidebar.live_in_one_room").to_string(),
-        n => t!("ui.sidebar.live_in_rooms", count = n).to_string(),
+        0 => tr("ui.sidebar.not_sharing", "Not sharing").to_string(),
+        1 => tr("ui.sidebar.live_in_one_room", "Live in 1 room").to_string(),
+        n => tr_with("ui.sidebar.live_in_rooms", "Live in %{count} rooms", &[("count", &n.to_string())]),
     };
     let top = Rect::from_x_y_ranges(who.x_range(), who.center().y - 15.0..=who.center().y + 1.0);
     let bottom = Rect::from_x_y_ranges(who.x_range(), who.center().y + 1.0..=who.center().y + 15.0);
     widgets::paint_text(ui, top, &name, font(Weight::Bold, theme::FS_ROW), theme::TEXT, Align::Min);
     let status_col = if n_live > 0 { theme::SUCCESS } else { theme::TEXT_DIM };
     widgets::paint_text(ui, bottom, &status, font(Weight::Regular, theme::FS_TINY), status_col, Align::Min);
-    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(t!("ui.sidebar.outgoing_tip"));
+    let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tr("ui.sidebar.outgoing_tip", "Your outgoing streams"));
     if resp.clicked() {
         cx.toggle_popover(PopoverKind::Outgoing, hot);
     }
 
-    if row.show(ui, 2, Align::Center, |ui| widgets::icon_btn(ui, "settings", IconBtnKind::Plain, &t!("ui.sidebar.settings"))).clicked() {
+    if row.show(ui, 2, Align::Center, |ui| widgets::icon_btn(ui, "settings", IconBtnKind::Plain, &tr("ui.sidebar.settings", "Settings"))).clicked() {
         cx.act(UiAction::OpenModal(Modal::Settings));
     }
 
@@ -293,14 +270,14 @@ pub fn show_user_band(ui: &mut Ui, cx: &mut Cx, _st: &mut SidebarState) {
 /// settings), then "Stop all sharing". Returns the clicked item's actions.
 fn outgoing_body(ui: &mut Ui, cx: &Cx) -> Vec<UiAction> {
     let mut out = Vec::new();
-    pop_heading(ui, &t!("ui.sidebar.outgoing.heading"));
+    pop_heading(ui, &tr("ui.sidebar.outgoing.heading", "You're sharing"));
     let mut any = false;
     for (capture, c) in cx.live_captures() {
         for d in c.destinations.values() {
             any = true;
             let p = d.runtime.as_ref().map_or(d.params, |rt| rt.lock().unwrap().params());
             let room = cx.room_name(d.room);
-            let sub = t!("ui.sidebar.outgoing.sub", screen = c.label, fps = p.framerate, kbps = p.bitrate_kbps).to_string();
+            let sub = tr_with("ui.sidebar.outgoing.sub", "%{screen} · %{fps} fps · %{kbps} kbps", &[("screen", &c.label.to_string()), ("fps", &p.framerate.to_string()), ("kbps", &p.bitrate_kbps.to_string())]);
             if widgets::pop_item(ui, &PopItem::new("cast", &room).sub(&sub)).clicked() {
                 let key: Option<RoomKey> = cx.session(d.room).map(|s| s.join_string.clone());
                 out.extend(key.map(UiAction::SelectRoom));
@@ -310,11 +287,11 @@ fn outgoing_body(ui: &mut Ui, cx: &Cx) -> Vec<UiAction> {
     }
     if !any {
         let r = HBox::new("pop_none", theme::ROW_H).pad(theme::S2, theme::S2).slots(&[FILL]).show(ui);
-        r.text(ui, 0, &t!("ui.sidebar.outgoing.none"), font(Weight::Regular, theme::FS_LABEL), theme::TEXT_DIM, Align::Min);
+        r.text(ui, 0, &tr("ui.sidebar.outgoing.none", "Nothing right now"), font(Weight::Regular, theme::FS_LABEL), theme::TEXT_DIM, Align::Min);
         return out;
     }
     pop_rule(ui);
-    if widgets::pop_item(ui, &PopItem::new("stop_screen_share", &t!("ui.sidebar.outgoing.stop_all")).danger()).clicked() {
+    if widgets::pop_item(ui, &PopItem::new("stop_screen_share", &tr("ui.sidebar.outgoing.stop_all", "Stop all sharing")).danger()).clicked() {
         out.push(UiAction::ClosePopover);
         out.push(UiAction::StopAllSharing);
     }

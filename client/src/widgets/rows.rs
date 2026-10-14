@@ -63,9 +63,21 @@ fn ctrl_label(ui: &mut Ui, rect: Rect, label: &str, tip: Option<&str>) {
     // A label (with its ⓘ) may run into the 8 px gap before the control, minus 2 px of
     // air — "Keyframe interval ⓘ" then fits the 120 slot without truncating.
     let rect = Rect::from_min_max(rect.min, pos2(rect.right() + theme::S2 - 2.0, rect.bottom()));
+    // A label too long for itself plus the ⓘ (German "Keyframe-Abstand") drops
+    // the ⓘ and carries the tooltip itself, instead of truncating the label.
+    let full_w = super::text_width(ui, label, f.clone(), 0.0);
+    let (tip_w, tip_on_label) = if tip.is_some() && full_w + tip_w > rect.width() { (0.0, true) } else { (tip_w, false) };
     let g = text_galley(ui, label, f, theme::TEXT, (rect.width() - tip_w).max(0.0), 0.0);
+    let truncated = g.size().x + 0.5 < full_w;
     let gr = paint_galley(ui, rect, g, Align::Min);
-    if let Some(t) = tip {
+    if tip_on_label || truncated {
+        let hover = match tip {
+            Some(t) if truncated => format!("{label}\n{t}"),
+            Some(t) => t.to_owned(),
+            None => label.to_owned(),
+        };
+        ui.interact(gr, ui.id().with(("label_tip", gr.min.x as i32, gr.min.y as i32)), Sense::hover()).on_hover_text(hover);
+    } else if let Some(t) = tip {
         let r = Rect::from_center_size(pos2(gr.right() + 6.0 + 7.5, rect.center().y), vec2(15.0, 15.0));
         paint_icon(ui, r, "info", 15.0, theme::TEXT_FAINT);
         ui.interact(r, ui.id().with(("tip", r.min.x as i32, r.min.y as i32)), Sense::hover()).on_hover_text(t);
@@ -242,10 +254,12 @@ pub struct PersonRow<'a> {
     pub name: &'a str,
     /// Avatar gradient index (`theme::AVATAR_GRADIENTS`).
     pub color: usize,
-    /// Show the faint "you" after the name.
-    pub you: bool,
+    /// The faint "you" tag after the name (the caller's translation), or `None`.
+    pub you: Option<&'a str>,
     /// Sharing: green "LIVE" pill in the 44 slot.
     pub live: bool,
+    /// The live pill's text (the caller's translation of "Live").
+    pub live_label: &'a str,
     /// You are watching their share: eye icon in the 18 slot.
     pub watching: bool,
     /// Not sharing: name dims.
@@ -268,15 +282,15 @@ pub fn person_row(ui: &mut Ui, row: &PersonRow) -> Response {
         paint_avatar(ui, av, &initial, row.color, false);
         let name_col = if row.idle { theme::TEXT_DIM } else { theme::TEXT };
         let cell = r.cell(1);
-        let you_w = if row.you { 6.0 + super::text_width(ui, "you", font(Weight::Regular, theme::FS_TINY), 0.0) } else { 0.0 };
+        let you_w = row.you.map_or(0.0, |y| 6.0 + super::text_width(ui, y, font(Weight::Regular, theme::FS_TINY), 0.0));
         let g = text_galley(ui, row.name, font(Weight::Regular, theme::FS_ROW), name_col, (cell.width() - you_w).max(0.0), 0.0);
         let gr = paint_galley(ui, cell, g, Align::Min);
-        if row.you {
+        if let Some(y) = row.you {
             let yr = Rect::from_x_y_ranges(gr.right() + 6.0..=cell.right(), cell.y_range());
-            paint_text(ui, yr, "you", font(Weight::Regular, theme::FS_TINY), theme::TEXT_FAINT, Align::Min);
+            paint_text(ui, yr, y, font(Weight::Regular, theme::FS_TINY), theme::TEXT_FAINT, Align::Min);
         }
         if row.live {
-            let pill = Pill::live("Live").lead(super::PillLead::None);
+            let pill = Pill::live(row.live_label).lead(super::PillLead::None);
             let w = pill.width(ui).min(r.cell(2).width());
             let c = r.cell(2);
             pill.paint(ui, Rect::from_min_size(pos2(c.right() - w, c.center().y - theme::PILL_H / 2.0), vec2(w, theme::PILL_H)));
@@ -296,9 +310,13 @@ pub fn person_row(ui: &mut Ui, row: &PersonRow) -> Response {
 /// Data for [`dest_row`].
 #[derive(Clone, Copy, Debug)]
 pub struct DestRow<'a> {
-    /// This room (accent chip look, radio icon, "this room" note).
+    /// This room (accent chip look, radio icon, `note`).
     pub current: bool,
     pub name: &'a str,
+    /// Faint note after the name of the current row (the caller's "this room").
+    pub note: &'a str,
+    /// Tooltip of the × (the caller's "Stop sending to <room>").
+    pub remove_tip: &'a str,
     pub pill: Pill<'a>,
     /// Pre-formatted, e.g. "6000 kbps" or "—".
     pub kbps: &'a str,
@@ -326,12 +344,12 @@ pub fn dest_row(ui: &mut Ui, row: &DestRow) -> DestAction {
     ui.painter().rect(r.rect, CornerRadius::same(theme::ROUNDING_SM), bg, Stroke::new(1.0_f32, border), StrokeKind::Inside);
     r.icon(ui, 0, icon, 16.0, icon_col);
     let cell = r.cell(1);
-    let note_w = if row.current { 6.0 + super::text_width(ui, "this room", font(Weight::Regular, theme::FS_TINY), 0.0) } else { 0.0 };
+    let note_w = if row.current { 6.0 + super::text_width(ui, row.note, font(Weight::Regular, theme::FS_TINY), 0.0) } else { 0.0 };
     let g = text_galley(ui, row.name, font(Weight::Bold, theme::FS_LABEL), theme::TEXT, (cell.width() - note_w).max(0.0), 0.0);
     let gr = paint_galley(ui, cell, g, Align::Min);
     if row.current {
         let nr = Rect::from_x_y_ranges(gr.right() + 6.0..=cell.right(), cell.y_range());
-        paint_text(ui, nr, "this room", font(Weight::Regular, theme::FS_TINY), theme::TEXT_FAINT, Align::Min);
+        paint_text(ui, nr, row.note, font(Weight::Regular, theme::FS_TINY), theme::TEXT_FAINT, Align::Min);
     }
     let pc = r.cell(2);
     let pw = row.pill.width(ui).min(pc.width());
@@ -340,7 +358,7 @@ pub fn dest_row(ui: &mut Ui, row: &DestRow) -> DestAction {
     let mut action = DestAction::None;
     if row.removable {
         let clicked = r.show(ui, 4, Align::Center, |ui| {
-            super::icon_btn(ui, "close", super::IconBtnKind::Small, &format!("Stop sending to {}", row.name)).clicked()
+            super::icon_btn(ui, "close", super::IconBtnKind::Small, row.remove_tip).clicked()
         });
         if clicked {
             action = DestAction::Remove;
