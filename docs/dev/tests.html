@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core unit tests</title>
+<style>
+  body { font: 14px/1.4 system-ui, sans-serif; margin: 16px; background: #111; color: #ddd; }
+  .pass { color: #6c6 } .fail { color: #f66; white-space: pre-wrap }
+  h1 { font-size: 18px } #summary { font-weight: bold; margin: 8px 0 }
+</style>
+</head>
+<body>
+<h1>docs/js/core unit tests</h1>
+<div id="summary">running…</div>
+<ul id="list"></ul>
+<script type="module">
+import { runAll } from "./tests.js";
+import { log, postResult } from "./pagelog.js";
+
+const list = document.getElementById("list");
+const results = await runAll({
+  onResult: (r) => {
+    const li = document.createElement("li");
+    li.className = r.ok ? "pass" : "fail";
+    li.textContent = (r.ok ? "PASS  " : "FAIL  ") + r.name + (r.ok ? "" : "\n      " + r.error);
+    list.appendChild(li);
+    log((r.ok ? "PASS " : "FAIL ") + r.name + (r.ok ? "" : " :: " + r.error));
+  },
+});
+const failed = results.filter((r) => !r.ok);
+document.getElementById("summary").textContent = `${results.length - failed.length}/${results.length} passed`;
+document.getElementById("summary").className = failed.length ? "fail" : "pass";
+await postResult({ ok: failed.length === 0, passed: results.length - failed.length, total: results.length, failed, reverse: window.__reverse });
+</script>
+</body>
+</html>

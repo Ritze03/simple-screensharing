@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core scenarios</title>
+<style>
+  body { font: 12px/1.4 ui-monospace, monospace; margin: 12px; background: #111; color: #ddd; }
+  pre { white-space: pre-wrap; background: #1a1a1a; padding: 8px; }
+  canvas { width: 120px; height: 68px; margin: 2px; background: #000 }
+</style>
+</head>
+<body>
+<h1>RoomClient scenarios (against a real relay)</h1>
+<p>Query: <code>relay=host:port&amp;hash=&lt;cert hash&gt;[&amp;only=substring,…]</code>. Driven by <code>dev/scenarios.mjs</code>.</p>
+<pre id="out">running…</pre>
+<script type="module" src="./scenarios.js"></script>
+</body>
+</html>

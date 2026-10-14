@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>browser capability probe</title>
+<style>body{font:12px/1.4 ui-monospace,monospace;margin:12px;background:#111;color:#ddd}pre{white-space:pre-wrap}</style>
+</head>
+<body>
+<h1>browser capability probe</h1>
+<pre id="out">probing…</pre>
+<script type="module">
+import { capabilities } from "../js/core/index.js";
+import { postResult } from "./pagelog.js";
+
+const res = { userAgent: navigator.userAgent, caps: capabilities(), decode: {}, encode: {}, audio: {} };
+const prefs = ["no-preference", "prefer-hardware", "prefer-software"];
+const dec = {
+  h264: "avc1.640033", h264_main: "avc1.4d0033", h265: "hev1.1.6.L153.B0", h265_hvc1: "hvc1.1.6.L153.B0",
+  av1: "av01.0.13M.08", av1_10bit: "av01.0.13M.10", vp9: "vp09.00.50.08", vp8: "vp8",
+};
+for (const [name, codec] of Object.entries(dec)) {
+  res.decode[name] = {};
+  for (const hw of prefs) {
+    try {
+      const r = await VideoDecoder.isConfigSupported({ codec, hardwareAcceleration: hw, optimizeForLatency: true });
+      res.decode[name][hw] = !!r.supported;
+    } catch (e) { res.decode[name][hw] = "error: " + e.message; }
+  }
+}
+const enc = {
+  h264_annexb: { codec: "avc1.640033", avc: { format: "annexb" } },
+  h264_main_annexb: { codec: "avc1.4d0033", avc: { format: "annexb" } },
+  h265_annexb: { codec: "hev1.1.6.L153.B0", hevc: { format: "annexb" } },
+  av1: { codec: "av01.0.13M.08" },
+  vp9: { codec: "vp09.00.50.08" },
+};
+for (const [name, cfg] of Object.entries(enc)) {
+  res.encode[name] = {};
+  for (const hw of prefs) {
+    for (const [w, h, fps] of [[1920, 1080, 60], [1920, 1080, 240], [2560, 1440, 120], [3840, 2160, 60]]) {
+      try {
+        const r = await VideoEncoder.isConfigSupported({ ...cfg, width: w, height: h, framerate: fps, bitrate: 20_000_000, latencyMode: "realtime", hardwareAcceleration: hw });
+        res.encode[name][`${hw} ${w}x${h}@${fps}`] = !!r.supported;
+      } catch (e) { res.encode[name][`${hw} ${w}x${h}@${fps}`] = "error: " + e.message; }
+    }
+  }
+}
+for (const [name, cfg] of Object.entries({ opus_dec: ["AudioDecoder", { codec: "opus", sampleRate: 48000, numberOfChannels: 2 }], opus_enc: ["AudioEncoder", { codec: "opus", sampleRate: 48000, numberOfChannels: 2, bitrate: 64000, opus: { frameDuration: 20000 } }] })) {
+  try { res.audio[name] = !!(await self[cfg[0]].isConfigSupported(cfg[1])).supported; } catch (e) { res.audio[name] = "error: " + e.message; }
+}
+res.bitrateModes = {};
+for (const mode of ["constant", "variable", "quantizer"]) {
+  try { res.bitrateModes[mode] = !!(await VideoEncoder.isConfigSupported({ codec: "avc1.640033", avc: { format: "annexb" }, width: 1920, height: 1080, bitrateMode: mode })).supported; } catch (e) { res.bitrateModes[mode] = "error: " + e.message; }
+}
+res.webtransport = { present: typeof WebTransport !== "undefined", congestionControl: false };
+try { new WebTransport("https://127.0.0.1:1/x", { congestionControl: "low-latency" }).closed.catch(() => {}); res.webtransport.congestionControl = true; } catch (e) { res.webtransport.congestionControl = String(e); }
+res.misc = { mediaStreamTrackProcessor: typeof MediaStreamTrackProcessor, offscreenCanvas: typeof OffscreenCanvas, audioContextSampleRate: new AudioContext().sampleRate, hardwareConcurrency: navigator.hardwareConcurrency };
+document.getElementById("out").textContent = JSON.stringify(res, null, 2);
+await postResult(res);
+</script>
+</body>
+</html>
