@@ -122,6 +122,10 @@ const IDLE_REPAINT_INTERVAL: std::time::Duration = std::time::Duration::from_mil
 const UNFOCUSED_REPAINT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 /// How long a toast stays up, seconds (mockup: 2.6 s).
 const TOAST_SECS: f64 = 2.6;
+/// How long an error toast (icon "error") stays up, seconds. `Why` longer:
+/// a failed connect or share start is the only word the user gets about it
+/// (stage-6 QC), and its text names a room and a reason worth reading.
+const ERROR_TOAST_SECS: f64 = 6.0;
 
 // ---------------------------------------------------------------------------
 // Shared navigation types
@@ -393,6 +397,10 @@ pub struct Shell {
     pub create_result: Option<Result<JoinLink, String>>,
     /// Last failure of a [`UiAction::JoinRoom`].
     pub join_error: Option<String>,
+    /// Why the last Connect of a room (saved or auto-connect) failed, by
+    /// join string; shown under "Not connected" in that room's view until
+    /// the next attempt starts or it joins. See [`Shell::connect_error`].
+    pub connect_errors: Vec<(RoomKey, String)>,
     /// The join string a `JoinRoom` is waiting on (select it on success).
     pub awaiting_join: Option<RoomKey>,
     /// Running source meters: audio source id → level tap id.
@@ -403,6 +411,25 @@ pub struct Shell {
     tap_generation: u64,
 }
 
+impl Shell {
+    /// The last connect failure of `key`'s room ([`Shell::connect_errors`]).
+    pub fn connect_error(&self, key: &str) -> Option<&str> {
+        self.connect_errors.iter().find(|(k, _)| same_room(k, key)).map(|(_, e)| e.as_str())
+    }
+
+    /// Forget `key`'s connect failure (a new attempt started, or it joined).
+    pub fn clear_connect_error(&mut self, key: &str) {
+        self.connect_errors.retain(|(k, _)| !same_room(k, key));
+    }
+}
+
+/// The first non-empty line of an error, at most 90 characters: what a toast
+/// or a status line has room for.
+pub fn short_error(e: &str) -> String {
+    let line = e.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    if line.chars().count() > 90 { line.chars().take(89).chain(['…']).collect() } else { line.to_string() }
+}
+
 // ---------------------------------------------------------------------------
 // Screen context + selectors
 // ---------------------------------------------------------------------------
@@ -411,7 +438,13 @@ pub struct Shell {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnState {
     Joined,
-    /// A connect for this room is in flight (first connect or reconnect).
+    /// A first-time connect to this room is in flight (no reconnect entry).
+    /// `Why` apart from [`Self::Reconnecting`]: "reconnecting" means a
+    /// suspended room (its connection dropped; `meta/TERMINOLOGY.md`), and the
+    /// first Connect of a saved room read as "Reconnecting" (stage-6 QC).
+    Connecting,
+    /// A suspended room: its connection dropped and the lib is retrying
+    /// (`AppState::reconnect_info` has an entry).
     Reconnecting,
     Disconnected,
 }
@@ -439,7 +472,7 @@ pub enum ShareState {
     Staged { capture: CaptureSourceId },
     /// One of our video captures has a destination here.
     Live { capture: CaptureSourceId, destination: DestinationId },
-    /// The room is reconnecting.
+    /// The room is connecting or reconnecting: nothing to share into.
     Paused,
 }
 
@@ -552,7 +585,7 @@ impl<'a> Cx<'a> {
 
     /// The share state of a room entry for the action bar.
     pub fn share_state(&self, room: &RoomEntry) -> ShareState {
-        if room.conn == ConnState::Reconnecting {
+        if matches!(room.conn, ConnState::Connecting | ConnState::Reconnecting) {
             return ShareState::Paused;
         }
         let Some(handle) = room.handle else { return ShareState::Idle };
@@ -661,7 +694,8 @@ pub fn room_entries(state: &AppState) -> Vec<RoomEntry> {
     let handle_of = |js: &str| state.rooms.iter().find(|(_, r)| same_room(&r.join_string, js)).map(|(h, _)| *h);
     let conn_of = |js: &str, handle: Option<RoomHandle>| match handle {
         Some(_) => ConnState::Joined,
-        None if state.is_reconnecting(js) => ConnState::Reconnecting,
+        None if state.reconnect_info(js).is_some() => ConnState::Reconnecting,
+        None if state.is_reconnecting(js) => ConnState::Connecting,
         None => ConnState::Disconnected,
     };
     let mut out: Vec<RoomEntry> = state
@@ -698,7 +732,7 @@ pub fn room_entries(state: &AppState) -> Vec<RoomEntry> {
             key: p.join_string.clone(),
             name: room_label(&state.room_store, &p.join_string),
             handle: None,
-            conn: ConnState::Reconnecting,
+            conn: conn_of(&p.join_string, None),
             auto_connect: false,
         });
     }
@@ -755,6 +789,26 @@ pub fn tr_with(key: &str, en: &'static str, args: &[(&str, &str)]) -> String {
         s = s.replace(&format!("%{{{k}}}"), v);
     }
     s
+}
+
+/// A share's label as the viewer should read it, in the current language.
+/// The lib stores our own capture's label (`LocalCapture::label`) once, in
+/// the language active when it was created (`share.video_label`), and peers
+/// announce the fixed wire default "Screen". `Why` translate at draw time:
+/// after a language switch "Screen share" would otherwise stay English on the
+/// share card, the action bar, the stream settings and the Outgoing popover.
+/// A label that is a known default in *any* locale (or empty) is shown as the
+/// current locale's text; anything else (an audio source's name, a label a
+/// peer chose) as is.
+pub fn share_label(raw: &str) -> String {
+    let default_in_any_locale = |key: &str| rust_i18n::available_locales!().into_iter().any(|l| t!(key, locale = l).as_ref() == raw);
+    if raw.is_empty() || default_in_any_locale("share.video_label") {
+        tr("share.video_label", "Screen share")
+    } else if raw == "Screen" || default_in_any_locale("ui.stream.screen") {
+        tr("ui.stream.screen", "Screen")
+    } else {
+        raw.to_string()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -882,12 +936,25 @@ impl App {
     /// (video views, staged captures, level taps, toasts).
     fn poll(&mut self, ctx: &egui::Context) {
         self.state.poll_auto_connect_queue();
+        // `ConnectOutcome::Failed` doesn't name the room: note which one is in
+        // flight before polling.
+        let connecting = self.state.pending_connect.as_ref().map(|p| p.join_string.clone());
         match self.state.poll_connect_result() {
             ConnectOutcome::None => {}
             ConnectOutcome::Joined(handle) => self.on_joined(handle),
             ConnectOutcome::Failed { error, from_add_card } => {
                 if from_add_card {
                     self.shell.join_error = Some(error);
+                } else if let Some(key) = connecting {
+                    // A saved room's Connect (or an auto-connect) failed: say
+                    // so, instead of the row silently going back to "Not
+                    // connected" (stage-6 QC).
+                    self.now = ctx.input(|i| i.time);
+                    let name = room_label(&self.state.room_store, &key);
+                    let short = short_error(&error);
+                    self.toast(tr_with("ui.toast.connect_room_failed", "Couldn't connect to %{room}: %{error}", &[("room", &name), ("error", &short)]), "error");
+                    self.shell.clear_connect_error(&key);
+                    self.shell.connect_errors.push((key, short));
                 }
                 self.shell.awaiting_join = None;
             }
@@ -904,7 +971,8 @@ impl App {
         // (nothing else in the new UI shows `share_error`).
         if let Some(e) = self.state.share_error.take() {
             self.now = ctx.input(|i| i.time);
-            self.toast(tr_with("share.error", "Share error: %{error}", &[("error", &e)]), "error");
+            // One line: a toast is a single-line pill.
+            self.toast(tr_with("share.error", "Share error: %{error}", &[("error", &short_error(&e))]), "error");
         }
         self.videos.sync(&self.state);
         self.poll_staged();
@@ -926,6 +994,7 @@ impl App {
 
     fn on_joined(&mut self, handle: RoomHandle) {
         let Some(js) = self.state.rooms.get(&handle).map(|r| r.join_string.clone()) else { return };
+        self.shell.clear_connect_error(&js);
         let awaited = self.shell.awaiting_join.as_deref() == Some(js.as_str());
         if awaited {
             self.shell.awaiting_join = None;
@@ -1009,7 +1078,8 @@ impl App {
     }
 
     pub(crate) fn toast(&mut self, text: String, icon: &'static str) {
-        self.shell.toasts.push(Toast { text, icon, until: self.now + TOAST_SECS });
+        let secs = if icon == "error" { ERROR_TOAST_SECS } else { TOAST_SECS };
+        self.shell.toasts.push(Toast { text, icon, until: self.now + secs });
     }
 
     /// Lay the window out and run every screen. Returns the actions they pushed.

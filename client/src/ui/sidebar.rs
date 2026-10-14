@@ -146,6 +146,7 @@ fn room_lines(cx: &Cx) -> Vec<Line> {
     for r in cx.rooms() {
         let (dot, tip) = match r.conn {
             ConnState::Joined => (DotState::Joined, tr("ui.sidebar.status_connected", "Connected")),
+            ConnState::Connecting => (DotState::Reconnecting, tr("ui.sidebar.status_connecting", "Connecting")),
             ConnState::Reconnecting => (DotState::Reconnecting, tr("ui.sidebar.status_reconnecting", "Reconnecting")),
             ConnState::Disconnected => (DotState::Disconnected, tr("ui.sidebar.status_disconnected", "Not connected")),
         };
@@ -197,7 +198,7 @@ fn room_lines(cx: &Cx) -> Vec<Line> {
                 tone: if watching { IconTone::Watch } else { IconTone::Dim },
                 name: cx.member_name(h, s.owner),
                 fps,
-                tip: (!s.label.is_empty()).then(|| s.label.clone()),
+                tip: (!s.label.is_empty()).then(|| super::share_label(&s.label)),
                 click: vec![UiAction::SelectRoom(r.key.clone())],
             });
         }
@@ -283,7 +284,7 @@ fn outgoing_body(ui: &mut Ui, cx: &Cx) -> Vec<UiAction> {
             any = true;
             let p = d.runtime.as_ref().map_or(d.params, |rt| rt.lock().unwrap().params());
             let room = cx.room_name(d.room);
-            let sub = tr_with("ui.sidebar.outgoing.sub", "%{screen} · %{fps} fps · %{kbps} kbps", &[("screen", &c.label.to_string()), ("fps", &p.framerate.to_string()), ("kbps", &p.bitrate_kbps.to_string())]);
+            let sub = tr_with("ui.sidebar.outgoing.sub", "%{screen} · %{fps} fps · %{kbps} kbps", &[("screen", &super::share_label(&c.label)), ("fps", &p.framerate.to_string()), ("kbps", &p.bitrate_kbps.to_string())]);
             if widgets::pop_item(ui, &PopItem::new("cast", &room).sub(&sub)).clicked() {
                 let key: Option<RoomKey> = cx.session(d.room).map(|s| s.join_string.clone());
                 out.extend(key.map(UiAction::SelectRoom));

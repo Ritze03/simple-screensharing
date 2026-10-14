@@ -573,9 +573,14 @@ fn destinations_card(
     } else {
         (tr("ui.stream.sending_to", "Sending to"), rooms_count(c.destinations.len()))
     };
+    // "this room" means the room on screen behind the modal, never just the
+    // modal's target: after "Move to…" from room B the modal follows the
+    // stream to room C while B is still the room being viewed (stage-6 QC).
+    let viewed = cx.selected_room().and_then(|r| r.handle);
     struct Row {
         id: Option<DestinationId>,
         current: bool,
+        viewed: bool,
         name: String,
         pill: (PillKind, String),
         kbps: String,
@@ -584,6 +589,7 @@ fn destinations_card(
         vec![Row {
             id: None,
             current: true,
+            viewed: viewed == Some(room),
             name: cx.room_name(room),
             pill: (PillKind::Muted, tr("ui.pill.not_live", "Not live")),
             kbps: "\u{2014}".into(),
@@ -594,6 +600,7 @@ fn destinations_card(
             .map(|(id, d)| Row {
                 id: Some(*id),
                 current: d.room == room,
+                viewed: viewed == Some(d.room),
                 name: cx.room_name(d.room),
                 pill: dest_pill(c, d),
                 kbps: format!("{} kbps", dest_kbps(cx, *id, d)),
@@ -611,7 +618,7 @@ fn destinations_card(
                 let row = DestRow {
                     current: r.current,
                     name: &r.name,
-                    note: &note,
+                    note: if r.viewed { &note } else { "" },
                     remove_tip: &remove_tip,
                     pill: r.pill.0.pill(&r.pill.1),
                     kbps: &r.kbps,

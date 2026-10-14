@@ -174,7 +174,8 @@ pub fn modal_frame(ui: &mut Ui, spec: &ModalSpec, max_h: f32, body: impl FnOnce(
                 p.paint(ui, Rect::from_min_size(pos2(pc.right() - pw, pc.center().y - ph / 2.0), vec2(pw, ph)));
             }
             let close_i = slots.len() - 1;
-            if head.show(ui, close_i, Align::Center, |ui| icon_btn(ui, "close", IconBtnKind::Plain, "Close")).clicked() {
+            let close_tip = crate::ui::tr("ui.modal.close", "Close");
+            if head.show(ui, close_i, Align::Center, |ui| icon_btn(ui, "close", IconBtnKind::Plain, &close_tip)).clicked() {
                 action.close = true;
             }
             // Body.

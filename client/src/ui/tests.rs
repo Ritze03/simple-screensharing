@@ -355,7 +355,7 @@ fn ctx() -> egui::Context {
 }
 
 #[tokio::test]
-async fn room_list_is_saved_order_and_a_pending_connect_reads_as_reconnecting() {
+async fn room_list_is_saved_order_and_a_pending_connect_reads_as_connecting() {
     let _home = isolated_home();
     let a = unreachable_join_string(1);
     let b = unreachable_join_string(2);
@@ -368,7 +368,7 @@ async fn room_list_is_saved_order_and_a_pending_connect_reads_as_reconnecting() 
 
     app.state.start_connect(b.clone(), false).unwrap();
     let rooms = room_entries(&app.state);
-    assert_eq!(rooms[1].conn, ConnState::Reconnecting);
+    assert_eq!(rooms[1].conn, ConnState::Connecting);
     // A connect to a link that isn't saved still gets a row.
     app.state.cancel_connect();
     let c = unreachable_join_string(3);
@@ -376,7 +376,7 @@ async fn room_list_is_saved_order_and_a_pending_connect_reads_as_reconnecting() 
     let rooms = room_entries(&app.state);
     assert_eq!(rooms.len(), 3);
     assert_eq!(rooms[2].key, c);
-    assert_eq!(rooms[2].conn, ConnState::Reconnecting);
+    assert_eq!(rooms[2].conn, ConnState::Connecting);
     assert!(!rooms[2].name.contains("AAAA"), "a row name must never contain the key");
     app.state.cancel_connect();
 }
@@ -394,7 +394,7 @@ async fn a_cert_hash_respelling_is_the_same_room() {
     app.state.start_connect(hashed.clone(), false).unwrap();
     let rooms = room_entries(&app.state);
     assert_eq!(rooms.len(), 1, "the in-flight respelling must not add a second row");
-    assert_eq!(rooms[0].conn, ConnState::Reconnecting);
+    assert_eq!(rooms[0].conn, ConnState::Connecting);
     app.apply(&ctx, UiAction::SelectRoom(hashed.clone()));
     assert!(view_is_room(&app.nav.view, &a));
     app.apply(&ctx, UiAction::Connect(a.clone()));
@@ -491,8 +491,8 @@ async fn shell_regions_match_the_spec_sizes() {
     let _home = isolated_home();
     let a = unreachable_join_string(1);
     let mut app = app_with_rooms(&[("Alpha", a.clone())]);
-    // A pending connect makes the selected room "reconnecting": People panel
-    // and action bar are shown (Paused).
+    // A pending first connect makes the selected room "connecting": People
+    // panel and action bar are shown (Paused, with connecting wording).
     app.state.start_connect(a.clone(), false).unwrap();
     let ctx = ctx();
     for (w, h) in [(1280.0, 800.0), (1600.0, 900.0), (1920.0, 1080.0)] {
@@ -534,4 +534,32 @@ fn popover_hangs_off_the_anchor_like_the_mockup() {
     // A bottom-bar button near the right edge: above it, pushed left to 8 px in.
     let b = Rect::from_min_size(egui::pos2(1000.0, 750.0), egui::vec2(124.0, 36.0));
     assert_eq!(popover_pos(screen, b, size), egui::pos2(1280.0 - 8.0 - 340.0, 750.0 - 6.0 - 200.0));
+}
+
+/// Stage-6 QC: our capture's label is stored in its creation language; the
+/// UI shows any locale's default in the current one, and other labels as is.
+#[test]
+fn share_label_translates_known_defaults_only() {
+    let here = tr("share.video_label", "Screen share");
+    assert_eq!(share_label("Screen share"), here);
+    assert_eq!(share_label("Bildschirmfreigabe"), here);
+    assert_eq!(share_label(""), here);
+    assert_eq!(share_label("Screen"), tr("ui.stream.screen", "Screen"));
+    assert_eq!(share_label("Spotify"), "Spotify");
+}
+
+/// A failed Connect's reason is kept per room (any spelling of it) and
+/// cleared by the next attempt.
+#[test]
+fn connect_errors_are_per_room_and_cleared_by_a_new_attempt() {
+    let a = unreachable_join_string(1);
+    let hashed = format!("{a}|aZzvDUgnp0ZwLozhaaRsgsdWKtMyGPIwNikFgwbCJlg");
+    let mut shell = Shell::default();
+    shell.connect_errors.push((a.clone(), "timed out".into()));
+    assert_eq!(shell.connect_error(&hashed), Some("timed out"));
+    assert_eq!(shell.connect_error(&unreachable_join_string(2)), None);
+    shell.clear_connect_error(&hashed);
+    assert_eq!(shell.connect_error(&a), None);
+    assert_eq!(short_error("\n  first line\nsecond"), "first line");
+    assert_eq!(short_error(&"x".repeat(200)).chars().count(), 90);
 }

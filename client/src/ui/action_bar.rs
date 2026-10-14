@@ -102,7 +102,7 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, st: &mut ActionBarState) {
         }
     }
     match (state, room.handle) {
-        (ShareState::Paused, _) | (_, None) => paused(ui),
+        (ShareState::Paused, _) | (_, None) => paused(ui, room.conn == ConnState::Connecting),
         (ShareState::Idle, Some(h)) => idle(ui, cx, h),
         (ShareState::Picking { capture }, Some(h)) => staged(ui, cx, h, capture, true),
         (ShareState::Staged { capture }, Some(h)) => staged(ui, cx, h, capture, false),
@@ -115,8 +115,16 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, st: &mut ActionBarState) {
 // Layouts
 // ---------------------------------------------------------------------------
 
-fn paused(ui: &mut Ui) {
+/// `connecting`: a first connect is in flight (nothing was ever shared here,
+/// so "paused until the room is back" would be wrong).
+fn paused(ui: &mut Ui, connecting: bool) {
     let row = HBox::new("action_bar", theme::CTL_H_LG).gap(theme::S2).slots(&[fixed(84.0), FILL]).show(ui);
+    if connecting {
+        let text = tr("ui.room.connecting_pill", "Connecting");
+        paint_pill(ui, row.cell(0), Pill::progress(&text).large());
+        status_text(ui, row.cell(1), &tr("ui.bar.connecting_status", "You can share once the room is connected"), None);
+        return;
+    }
     let text = tr("ui.bar.paused", "Paused");
     paint_pill(ui, row.cell(0), Pill::muted(&text).lead(PillLead::Icon("pause")).large());
     status_text(ui, row.cell(1), &tr("ui.bar.paused_status", "Sharing is paused until the room is back"), None);
@@ -704,9 +712,10 @@ pub(super) fn level_lit(level: f32) -> u8 {
 }
 
 /// The capture's display name ("Screen share": the portal gives no monitor
-/// name, so this is the lib's label).
+/// name, so this is the lib's label), in the current language
+/// ([`super::share_label`]).
 pub(super) fn screen_name(c: &LocalCapture) -> String {
-    c.label.clone()
+    super::share_label(&c.label)
 }
 
 /// Source resolution of a running video capture, if known yet.

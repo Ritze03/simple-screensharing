@@ -267,7 +267,9 @@ pub fn slot_log(ctx: &egui::Context) -> Vec<LoggedSlot> {
 /// Outline a vbox rect in the debug overlay (no-op when it's off). Containers call it.
 pub fn debug_vbox(ui: &Ui, rect: Rect) {
     if debug_slots(ui.ctx()) {
-        ui.ctx().debug_painter().rect_stroke(rect, 0.0, Stroke::new(1.0_f32, theme::OV_VBOX), StrokeKind::Inside);
+        // Clipped like the hbox outlines: inside a scrolled area the overlay
+        // must not paint over what sits outside it (the gallery header).
+        ui.ctx().debug_painter().with_clip_rect(ui.clip_rect()).rect_stroke(rect, 0.0, Stroke::new(1.0_f32, theme::OV_VBOX), StrokeKind::Inside);
     }
 }
 
