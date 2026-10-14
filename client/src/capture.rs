@@ -5,18 +5,40 @@
 //!
 //! # Pipeline
 //!
+//! The tee carries frames in one of two [`CaptureDomain`]s. **GPU** (Linux
+//! portal capture on a machine with a working VA stack, the normal case on
+//! desktop Linux) keeps everything in GPU memory:
+//!
+//! ```text
+//! pipewiresrc (DMA-BUF) ! vapostproc video-direction=auto
+//!   ! video/x-raw(memory:VAMemory),format=NV12 ! tee name=t
+//!   t. ! queue leaky=downstream max-size-buffers=1 ! videorate drop-only=true ! vapostproc
+//!      ! video/x-raw,format=BGRx,framerate=1/1 ! videoconvert ! video/x-raw,format=RGB
+//!      ! appsink name=preview_sink
+//!   t. ! queue leaky=downstream max-size-buffers=1 ! videorate drop-only=true ! vapostproc
+//!      ! video/x-raw,format=BGRx,width=320,height=180,framerate=12/1 ! videoconvert
+//!      ! video/x-raw,format=RGB ! appsink name=self_preview_sink
+//!   (+ one dynamic branch per destination, see below)
+//! ```
+//!
+//! and **System** (Windows, software `x264enc` machines, tests) is the
+//! original CPU shape:
+//!
 //! ```text
 //! <platform source> ! videoconvert ! video/x-raw,format=BGRx
 //!   [! <vapostproc|videoflip> video-direction=auto  -- only while the source is rotated]
 //!   ! video/x-raw,format=BGRx ! tee name=t
-//!   t. ! queue leaky=downstream max-size-buffers=1 ! videorate ! video/x-raw,framerate=1/1
+//!   t. ! queue leaky=downstream max-size-buffers=1 ! videorate drop-only=true ! video/x-raw,framerate=1/1
 //!      ! videoconvert ! video/x-raw,format=RGB
 //!      ! appsink name=preview_sink
-//!   t. ! queue leaky=downstream max-size-buffers=1 ! videorate ! video/x-raw,framerate=12/1
+//!   t. ! queue leaky=downstream max-size-buffers=1 ! videorate drop-only=true ! video/x-raw,framerate=12/1
 //!      ! videoconvert ! video/x-raw,format=RGB
 //!      ! appsink name=self_preview_sink
 //!   (+ one dynamically added branch per destination — see below)
 //! ```
+//!
+//! See [`CaptureDomain`] for why the GPU domain exists (it is what makes
+//! 120-240 fps of *unique* frames possible at all).
 //!
 //! Those two branches are the pipeline's only *fixed* ones. **There is no
 //! fixed encoder branch**: every outgoing destination — including the first
@@ -24,13 +46,17 @@
 //! [`branch::add_branch`]:
 //!
 //! ```text
-//!   t. ! queue leaky=downstream ! valve drop-mode=forward-sticky-events
-//!      ! videoconvert ! videoscale ! videorate
-//!      ! video/x-raw,format=<backend's>,width=..,height=..,framerate=<this destination's>/1
-//!      ! <x264enc|vah264enc> bitrate=<this destination's> key-int-max=<gop>
+//!   t. ! queue leaky=downstream ! valve drop-mode=forward-sticky-events   (+ a RateCap probe on the valve's src)
+//!      ! <vapostproc | videoconvert ! videoscale>
+//!      ! video/x-raw[(memory:VAMemory)],format=<backend's>,width=..,height=..
+//!      ! capssetter framerate=<this destination's>/1
+//!      ! <x264enc|vah264enc|vah265enc|vaav1enc> bitrate=<this destination's> key-int-max=<gop>
 //!      ! video/x-h264,stream-format=byte-stream,alignment=au
-//!      ! appsink
+//!      ! appsink drop=false
 //! ```
+//!
+//! The destination's fps is a **cap** ([`branch::RateCap`]), never a floor:
+//! nothing in a branch ever duplicates a frame.
 //!
 //! so one capture feeds N rooms as N independently encoded and independently
 //! encrypted streams (a room key can never be shared across rooms), each with
@@ -43,10 +69,14 @@
 //! The bracketed `video-direction=auto` stage makes a **rotated or mirrored
 //! monitor arrive upright** in every destination and preview: `pipewiresrc`
 //! turns the stream's `SPA_META_VideoTransform` into an `image-orientation`
-//! tag, and the stage follows it (swapping width/height for 90/270). The stage
-//! is spliced in only when such a tag says the picture is rotated, so an
-//! un-rotated source pays nothing. See [`orientation_fragment`] for the why,
-//! the GPU-vs-CPU choice and the measurements.
+//! tag, and the stage follows it (swapping width/height for 90/270). In the
+//! GPU domain the source's `vapostproc` *is* that stage (it has to convert the
+//! colour space anyway, so rotating costs nothing extra). In the System domain
+//! the stage is spliced in only when such a tag says the picture is rotated, so
+//! an un-rotated source pays nothing. See [`orientation_fragment`] for the why,
+//! the GPU-vs-CPU choice and the measurements. Verified live (#39): the patched
+//! `xdg-desktop-portal-wlr` does send the transform for the 180-degree-rotated
+//! DP-2 (`image-orientation=rotate-180`), and the viewer sees it upright.
 //!
 //! The pixel format *is* pinned before the `tee`, and for a closely related
 //! reason: it keeps what the source negotiates independent of which branches
@@ -1414,6 +1444,7 @@ impl CaptureDomain {
 }
 
 /// Whether [`CaptureDomain::Gpu`] can be used on this machine (cached).
+#[cfg_attr(not(unix), allow(dead_code))]
 fn gpu_capture_available() -> bool {
     use std::sync::OnceLock;
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
@@ -6202,6 +6233,14 @@ pub mod branch {
                     wait_for_sample(sink, Duration::from_secs(10)),
                     "the {name} branch produced nothing on the GPU tee"
                 );
+            }
+
+            // Removing a branch from the live GPU tee leaves the siblings running.
+            let removed = branches.remove(0);
+            remove_branch(&built.pipeline, &built.tee, removed).await.expect("removal should succeed");
+            for branch in &branches {
+                while branch.appsink.try_pull_sample(gst::ClockTime::ZERO).is_some() {}
+                assert!(wait_for_sample(&branch.appsink, Duration::from_secs(5)), "a sibling stopped after a removal");
             }
             built.pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
         }
