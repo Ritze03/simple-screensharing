@@ -1,0 +1,33 @@
+# Elements that must resolve from the PACKAGED plugin set (package.ps1 runs gst-inspect-1.0
+# against it with the system plugin path disabled). One per line.
+# d3d11 decoders (d3d11h264dec ...) and the GPU encoders are not listed: they are
+# registered per adapter, so they only exist where the GPU supports them (a VM with a
+# basic display adapter has none; the software elements below are the fallback).
+appsrc
+appsink
+queue
+tee
+valve
+capsfilter
+videoconvert
+videoscale
+videorate
+videoflip
+videotestsrc
+audioconvert
+audioresample
+volume
+level
+opusenc
+opusdec
+jpegdec
+h264parse
+h265parse
+av1parse
+autoaudiosink
+d3d11screencapturesrc
+d3d11download
+x264enc
+avdec_h264
+avdec_h265
+dav1ddec

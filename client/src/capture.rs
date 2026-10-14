@@ -967,7 +967,7 @@ enum CaptureSource {
     /// end to end without a human clicking the Wayland portal consent
     /// dialog. Never constructed outside `#[cfg(test)]` code — see
     /// [`start_sharing_from_test_source`].
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-source"))]
     TestSource(String),
 }
 
@@ -1068,7 +1068,7 @@ impl CaptureSource {
                 let _ = framerate;
                 "d3d11screencapturesrc monitor-index=0 do-timestamp=true".to_string()
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-source"))]
             CaptureSource::TestSource(fragment) => {
                 let _ = framerate;
                 fragment.clone()
@@ -2111,7 +2111,7 @@ pub async fn start_capture(framerate: u32) -> Result<CaptureHandle> {
 /// automated). `#[cfg(test)]`-gated: this function does not exist at all in
 /// a non-test build, so it changes nothing about [`start_sharing`]'s
 /// production API or behavior.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-source"))]
 pub async fn start_sharing_from_test_source(
     client: &ScreenshareClient,
     stream_id: u8,
@@ -2140,7 +2140,7 @@ pub async fn start_sharing_from_test_source(
 /// the "attach the first destination to an already-running, zero-destination
 /// capture" path (`AppState::go_live`/`add_destination`'s no-sibling
 /// fallback in `session.rs`) without a human clicking the portal picker.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-source"))]
 pub async fn start_capture_from_test_source(framerate: u32, source_fragment: &str) -> Result<CaptureHandle> {
     ensure_gstreamer_initialized()?;
     start_capture_with_source(framerate, CaptureSource::TestSource(source_fragment.to_string())).await
@@ -2312,7 +2312,7 @@ async fn abandon_capture(pipeline: gst::Pipeline, capture_source: CaptureSource,
                 tracing::warn!("failed to close the portal session of an abandoned capture: {e}");
             }
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-source"))]
         CaptureSource::TestSource(_) => {}
     }
     drop(capture_source);
@@ -2582,7 +2582,7 @@ impl CaptureHandle {
                         tracing::warn!("error closing screencast portal session: {e}");
                     }
                 }
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-source"))]
                 CaptureSource::TestSource(_) => {}
             }
         }
@@ -9794,8 +9794,10 @@ mod tests {
             .expect("encode jpeg");
         std::fs::write(&path, jpeg).expect("write jpeg");
         format!(
+            // Forward slashes: in gst-launch syntax a backslash is an escape, which
+            // mangled `C:\Users\...` into a path that does not exist on Windows.
             "filesrc location={} ! jpegdec ! imagefreeze num-buffers=30 ! video/x-raw,framerate=30/1",
-            path.display()
+            path.display().to_string().replace('\\', "/")
         )
     }
 

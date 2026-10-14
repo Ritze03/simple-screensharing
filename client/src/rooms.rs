@@ -79,12 +79,26 @@ pub struct RoomStore {
     pub rooms: Vec<SavedRoom>,
 }
 
+/// The directory the app's config files live under: `$SSS_CONFIG_HOME` when
+/// set, else the platform's config dir (`dirs::config_dir()`).
+///
+/// Why an own variable: `dirs` honours `XDG_CONFIG_HOME` on Linux but asks the
+/// shell for the Roaming AppData folder on Windows, where no environment
+/// variable steers it. Scratch runs and the unit tests need to redirect the
+/// config (they must never touch a real user's saved rooms), so they set this.
+pub fn config_base_dir() -> Option<PathBuf> {
+    match std::env::var_os("SSS_CONFIG_HOME") {
+        Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
+        _ => dirs::config_dir(),
+    }
+}
+
 impl RoomStore {
     /// `$XDG_CONFIG_HOME/simple-screensharing/rooms.toml` (or the platform
     /// equivalent via the `dirs` crate), falling back to a relative path if
     /// no config directory can be determined.
     pub fn config_path() -> PathBuf {
-        match dirs::config_dir() {
+        match config_base_dir() {
             Some(dir) => dir.join("simple-screensharing").join("rooms.toml"),
             None => PathBuf::from("simple-screensharing-rooms.toml"),
         }
@@ -528,7 +542,7 @@ impl AppSettings {
     /// `$XDG_CONFIG_HOME/simple-screensharing/settings.toml` (or the
     /// platform equivalent), mirroring `RoomStore::config_path`.
     pub fn config_path() -> PathBuf {
-        match dirs::config_dir() {
+        match config_base_dir() {
             Some(dir) => dir.join("simple-screensharing").join("settings.toml"),
             None => PathBuf::from("simple-screensharing-settings.toml"),
         }
