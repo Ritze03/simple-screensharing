@@ -28,7 +28,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use gstreamer_video::{VideoColorMatrix, VideoColorRange, VideoFrame, VideoInfo};
+use gstreamer_video::prelude::*;
+use gstreamer_video::{VideoColorMatrix, VideoColorRange, VideoCropMeta, VideoFrame, VideoInfo};
 
 use super::codec::VideoCodec;
 use super::FpsCounter;
@@ -51,6 +52,11 @@ pub enum YuvMatrix {
 ///
 /// Strides are the decoder's real row pitches (they may exceed the visible
 /// width); upload with `bytes_per_row = *_stride`.
+///
+/// `width`/`height` are the *visible* size: when the decoder reports a crop
+/// (`GstVideoCropMeta`, e.g. a coded size padded beyond the display size) the
+/// planes start at the crop origin, so the layout above holds for the cropped
+/// picture and a renderer never samples the padding.
 pub struct DecodedFrame {
     /// Monotonically increasing, starts at 1: the n-th frame this decoder
     /// published. Equal to [`FrameSource::frame_counter`] at publish time.
@@ -72,6 +78,10 @@ pub struct DecodedFrame {
     /// The codec that produced this frame.
     pub codec: VideoCodec,
     frame: VideoFrame<gstreamer_video::video_frame::Readable>,
+    /// Byte offsets of the visible picture's first sample inside each plane
+    /// (non-zero only for a cropped frame).
+    y_offset: usize,
+    uv_offset: usize,
 }
 
 impl fmt::Debug for DecodedFrame {
@@ -96,19 +106,28 @@ impl DecodedFrame {
         pts_us: Option<u64>,
         seq: u64,
         codec: VideoCodec,
+        display_hint: Option<(u32, u32)>,
     ) -> Result<Self, &'static str> {
         if info.format() != gstreamer_video::VideoFormat::Nv12 {
             return Err("decoded frame is not NV12");
         }
-        let (width, height) = (info.width(), info.height());
-        let y_stride = usize::try_from(info.stride()[0]).map_err(|_| "negative Y stride")?;
-        let uv_stride = usize::try_from(info.stride()[1]).map_err(|_| "negative UV stride")?;
+        let (coded_w, coded_h) = (info.width(), info.height());
+        // The strides of *this buffer* (a `GstVideoMeta` on it overrides the
+        // caps' default layout), not of the caps.
+        let strides = frame.info().stride();
+        let y_stride = usize::try_from(strides[0]).map_err(|_| "negative Y stride")?;
+        let uv_stride = usize::try_from(strides[1]).map_err(|_| "negative UV stride")?;
+        let (crop_x, crop_y, width, height) = visible_rect(frame.buffer().meta::<VideoCropMeta>().map(|m| m.rect()), display_hint, coded_w, coded_h);
+        let y_offset = crop_y as usize * y_stride + crop_x as usize;
+        // NV12 chroma: one `U V` pair (2 bytes) per 2x2 pixels; `visible_rect`
+        // keeps the origin even.
+        let uv_offset = (crop_y as usize / 2) * uv_stride + crop_x as usize;
         let y_len = frame.plane_data(0).map_err(|_| "no Y plane")?.len();
         let uv_len = frame.plane_data(1).map_err(|_| "no UV plane")?.len();
         let uv_rows = (height as usize).div_ceil(2);
         // Last row only needs its visible bytes, not a full stride.
-        let y_min = y_stride * (height as usize - 1) + width as usize;
-        let uv_min = uv_stride * (uv_rows - 1) + 2 * (width as usize).div_ceil(2);
+        let y_min = y_offset + y_stride * (height as usize - 1) + width as usize;
+        let uv_min = uv_offset + uv_stride * (uv_rows - 1) + 2 * (width as usize).div_ceil(2);
         if y_len < y_min || uv_len < uv_min {
             return Err("decoded NV12 planes are shorter than their strides imply");
         }
@@ -137,18 +156,20 @@ impl DecodedFrame {
             full_range,
             codec,
             frame,
+            y_offset,
+            uv_offset,
         })
     }
 
     /// The luma plane, `y_stride * height` bytes (the last row may be short).
     pub fn y(&self) -> &[u8] {
         // Length was validated in `new`.
-        self.frame.plane_data(0).expect("validated at construction")
+        &self.frame.plane_data(0).expect("validated at construction")[self.y_offset..]
     }
 
     /// The interleaved chroma plane.
     pub fn uv(&self) -> &[u8] {
-        self.frame.plane_data(1).expect("validated at construction")
+        &self.frame.plane_data(1).expect("validated at construction")[self.uv_offset..]
     }
 
     /// CPU conversion to a tightly packed RGBA8 buffer (`width * height * 4`
@@ -170,6 +191,55 @@ impl DecodedFrame {
     /// [`Self::to_rgba`] as an `egui::ColorImage`.
     pub fn to_color_image(&self) -> egui::ColorImage {
         egui::ColorImage::from_rgba_unmultiplied([self.width as usize, self.height as usize], &self.to_rgba())
+    }
+}
+
+/// How much larger than the announced size a decoded frame may be and still
+/// be cropped to it. Encoders pad to their block alignment (AMD VCN4: 64 wide,
+/// 16 high); anything bigger is a real resolution change, not padding.
+const MAX_PADDING: u32 = 64;
+
+/// The visible rectangle `(x, y, width, height)` of a `coded_w` x `coded_h`
+/// frame.
+///
+/// 1. The decoder's crop rectangle (`GstVideoCropMeta`), if it reported one.
+///    A crop that is empty, leaves the frame, or has an odd origin (NV12
+///    chroma is 2x2 subsampled, so an odd origin cannot be addressed) is
+///    ignored: showing the padding is better than showing garbage.
+/// 2. Else the size the sender announced for the stream (`hint`), when the
+///    frame is at most [`MAX_PADDING`] larger than it in each direction (and
+///    not smaller): the padding sits at the bottom/right.
+///
+/// `Why 2 exists:` the AMD VCN4 AV1 encoder (`vaav1enc` on an RX 7900 XTX)
+/// codes 1920x1080 as 1920x1082 and signals nothing else: the sequence and
+/// frame headers say 1082 and `render_and_frame_size_different` is 0, so
+/// neither the decoder caps nor a crop meta nor the bitstream knows the
+/// picture is 1080 lines. Only the announced `StreamInfo` size does.
+pub(super) fn visible_rect(crop: Option<(u32, u32, u32, u32)>, hint: Option<(u32, u32)>, coded_w: u32, coded_h: u32) -> (u32, u32, u32, u32) {
+    let whole = (0, 0, coded_w, coded_h);
+    if let Some((x, y, w, h)) = crop
+        && w > 0
+        && h > 0
+        && x % 2 == 0
+        && y % 2 == 0
+        && x.checked_add(w).is_some_and(|r| r <= coded_w)
+        && y.checked_add(h).is_some_and(|b| b <= coded_h)
+    {
+        return (x, y, w, h);
+    }
+    match hint {
+        Some((w, h))
+            if w > 0
+                && h > 0
+                && w <= coded_w
+                && h <= coded_h
+                && coded_w - w < MAX_PADDING
+                && coded_h - h < MAX_PADDING
+                && (w, h) != (coded_w, coded_h) =>
+        {
+            (0, 0, w, h)
+        }
+        _ => whole,
     }
 }
 
@@ -292,6 +362,9 @@ pub(super) struct Shared {
     decoded_total: AtomicU64,
     presented_total: AtomicU64,
     dropped_total: AtomicU64,
+    /// The sender's announced picture size, packed `width << 32 | height`
+    /// (`0` = unknown). See [`visible_rect`].
+    display_hint: AtomicU64,
     decoded_fps: Mutex<FpsCounter>,
     presented_fps: Mutex<FpsCounter>,
     info: Mutex<DecoderInfo>,
@@ -306,10 +379,20 @@ impl Shared {
             decoded_total: AtomicU64::new(0),
             presented_total: AtomicU64::new(0),
             dropped_total: AtomicU64::new(0),
+            display_hint: AtomicU64::new(0),
             decoded_fps: Mutex::new(FpsCounter::new()),
             presented_fps: Mutex::new(FpsCounter::new()),
             info: Mutex::new(DecoderInfo::default()),
         })
+    }
+
+    pub(super) fn set_display_hint(&self, width: u32, height: u32) {
+        self.display_hint.store((u64::from(width) << 32) | u64::from(height), Ordering::Relaxed);
+    }
+
+    pub(super) fn display_hint(&self) -> Option<(u32, u32)> {
+        let v = self.display_hint.load(Ordering::Relaxed);
+        (v != 0).then_some(((v >> 32) as u32, v as u32))
     }
 
     /// Next `seq` to assign. Only the (single) active pipeline publishes, so

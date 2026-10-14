@@ -75,6 +75,9 @@ pub struct StreamSettingsState {
     floor: Option<u32>,
     /// `ctx` time of the last live edit pushed (min "Applying" duration).
     applied_at: Option<f64>,
+    /// Audio source ids the level meters were started for (staged modal
+    /// only; `None` = no taps started by this modal).
+    taps: Option<Vec<u32>>,
 }
 
 /// What the modal edits: one live destination, or the next-stream settings
@@ -139,10 +142,11 @@ struct Anchors {
 pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut StreamSettingsState, capture: CaptureSourceId, room: RoomHandle) {
     let Some(c) = cx.capture(capture) else { return };
     if st.opened_for != Some(capture) {
-        *st = StreamSettingsState { adv_open: st.adv_open, opened_for: Some(capture), ..Default::default() };
+        *st = StreamSettingsState { adv_open: st.adv_open, opened_for: Some(capture), taps: st.taps.take(), ..Default::default() };
         cx.act(UiAction::RefreshAudioSources);
     }
     let staged = c.destinations.is_empty();
+    sync_level_taps(cx, st, staged);
     let here: Option<(DestinationId, &Destination)> = c.destinations.iter().find(|(_, d)| d.room == room).map(|(id, d)| (*id, d));
     let target = match here {
         Some((id, d)) => Target::Live(id, d.edit),
@@ -211,6 +215,12 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut StreamSettingsState, capt
     for a in out {
         cx.act(a);
     }
+    // Any footer button, Escape or a click outside ends the modal: release
+    // the meters it started (nothing else stops them; the bar only stops the
+    // taps of its own popover).
+    if (!matches!(click, FooterClick::None) || (action.close && cx.nav.popover.is_none())) && st.taps.take().is_some() {
+        cx.act(UiAction::StopLevelTaps);
+    }
     match (staged, click) {
         (true, FooterClick::Leading(0)) => cx.act(UiAction::Discard(capture)),
         (true, FooterClick::Trailing(1)) => cx.act(UiAction::GoLive { capture, room }),
@@ -238,8 +248,32 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut StreamSettingsState, capt
         cx.toggle_popover(PopoverKind::MoveTo { capture, room }, r);
     }
     // Audio meter in the Source card.
-    if cx.paired_audio(capture).is_some() {
+    if cx.paired_audio(capture).is_some() || st.taps.is_some() {
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Keep a level tap running for every audio source while the *staged* modal
+/// is open, so the Source card's meter moves before anything is shared (a
+/// staged capture has no audio share to read a level from). Same idea as the
+/// bar's audio popover (`action_bar::sync_level_taps`): start when it opens,
+/// restart when the source list changes, stop when it is no longer needed.
+///
+/// `Why the modal has to do this itself:` taps only exist after an explicit
+/// [`UiAction::StartLevelTaps`], and the bar starts them only for its own
+/// popover. The live modal reads the running share's level instead, so only
+/// the staged one needs them.
+fn sync_level_taps(cx: &mut Cx, st: &mut StreamSettingsState, staged: bool) {
+    if !staged {
+        if st.taps.take().is_some() {
+            cx.act(UiAction::StopLevelTaps);
+        }
+        return;
+    }
+    let ids: Vec<u32> = cx.state.audio_sources.iter().map(|s| s.id).collect();
+    if st.taps.as_ref() != Some(&ids) && !ids.is_empty() {
+        cx.act(UiAction::StartLevelTaps(ids.clone()));
+        st.taps = Some(ids);
     }
 }
 
@@ -288,6 +322,15 @@ fn source_card(ui: &mut Ui, cx: &Cx, c: &LocalCapture, capture: CaptureSourceId,
     let muted = audio.is_some_and(|(id, _)| state.is_audio_share_muted(id));
     let lit = match audio {
         Some((id, _)) if !muted => state.audio_share_level(id).map(level_lit).unwrap_or(0),
+        // Staged: nothing is shared yet, read the chosen source's own tap.
+        None if staged => cx
+            .shell
+            .staged
+            .get(&room)
+            .and_then(|s| s.audio.as_ref())
+            .and_then(|a| cx.source_level(a.id))
+            .map(level_lit)
+            .unwrap_or(0),
         _ => 0,
     };
     let mut names: Vec<String> = vec![tr("ui.stream.no_audio", "No audio")];

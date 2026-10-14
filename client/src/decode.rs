@@ -895,6 +895,14 @@ impl StreamDecoder {
         self.frames.clone()
     }
 
+    /// Tell the decoder the picture size the sender announced for this stream
+    /// (`StreamInfo::width/height`). Frames that come out slightly larger (an
+    /// encoder's block padding, see `frame::visible_rect`) are cropped to it,
+    /// so `DecodedFrame::width/height` are the visible size.
+    pub fn set_display_size(&self, width: u32, height: u32) {
+        self.frames.0.set_display_hint(width, height);
+    }
+
     /// Snapshot of codec, active decoder element, and decoded/presented fps.
     pub fn stats(&self) -> DecoderStats {
         self.frames.stats()

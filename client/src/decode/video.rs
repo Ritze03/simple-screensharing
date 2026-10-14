@@ -327,7 +327,7 @@ fn build(codec: VideoCodec, backend: Backend, shared: &Arc<Shared>) -> Result<Ac
                         return Ok(gstreamer::FlowSuccess::Ok);
                     }
                 };
-                match DecodedFrame::new(mapped, info, pts_us, cb_shared.next_seq(), codec) {
+                match DecodedFrame::new(mapped, info, pts_us, cb_shared.next_seq(), codec, cb_shared.display_hint()) {
                     Ok(frame) => cb_shared.publish(frame),
                     Err(why) => tracing::warn!("dropping decoded frame: {why}"),
                 }
