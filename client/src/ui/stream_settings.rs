@@ -822,6 +822,32 @@ fn encoder_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, target: Targ
     let preset_opts: Vec<(Option<EncoderPreset>, &str, bool, &str)> =
         EncoderPreset::ALL.iter().map(|p| (Some(*p), p.label(), true, p.description())).collect();
     let adv = tr("ui.stream.advanced", "Advanced tuning");
+    let collapsed_extra = widgets::card(ui, &tr("ui.stream.encoder", "Encoder"), None, |ui| {
+        let changed = widgets::ctrl_row(ui, &tr("ui.stream.preset", "Preset"), None, |ui| seg_gated(ui, "preset", &mut preset, &preset_opts, ""));
+        if changed && let Some(p) = preset {
+            out.push(target.preset_action(p));
+        }
+        let r = widgets::collapser(ui, &mut st.adv_open, &adv);
+        drive_dump::rect(|| "advanced".into(), r.rect);
+        if st.adv_open {
+            adv_rows(ui, st, target, v, out);
+            0.0
+        } else {
+            // What the rows would add to the card: their height + the gap above them.
+            adv_rows_height(ui, target, v) + ui.spacing().item_spacing.y
+        }
+    });
+    // Reserve it below the card instead (see `adv_rows_height`). `add_space` only moves
+    // the cursor, which already sits one item gap below the card, so that gap is part
+    // of the reservation. (Not at all when open: even a zero spacer would add the gap
+    // to the column's height.)
+    if collapsed_extra > 0.0 {
+        ui.add_space((collapsed_extra - ui.spacing().item_spacing.y).max(0.0));
+    }
+}
+
+/// The Advanced tuning rows (Tune, Quality level, Rate control, Keyframe interval).
+fn adv_rows(ui: &mut Ui, st: &mut StreamSettingsState, target: Target, v: NextStream, out: &mut Vec<UiAction>) {
     let (low, best) = (tr("ui.stream.tune_low", "Low latency"), tr("ui.stream.tune_best", "Best quality"));
     let (perf, bal, qual) = (
         tr("ui.stream.ql_performance", "Performance"),
@@ -829,56 +855,63 @@ fn encoder_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, target: Targ
         tr("ui.stream.ql_quality", "Quality"),
     );
     let (eff, maxq) = (tr("ui.stream.rc_efficient", "Efficient"), tr("ui.stream.rc_max_quality", "Max quality"));
-    widgets::card(ui, &tr("ui.stream.encoder", "Encoder"), None, |ui| {
-        let changed = widgets::ctrl_row(ui, &tr("ui.stream.preset", "Preset"), None, |ui| seg_gated(ui, "preset", &mut preset, &preset_opts, ""));
-        if changed && let Some(p) = preset {
-            out.push(target.preset_action(p));
-        }
-        let r = widgets::collapser(ui, &mut st.adv_open, &adv);
-        drive_dump::rect(|| "advanced".into(), r.rect);
-        if !st.adv_open {
-            return;
-        }
-        let mut tune = v.tune;
-        if widgets::ctrl_row(ui, &tr("ui.stream.tune", "Tune"), None, |ui| {
-            widgets::segmented(ui, &mut tune, &[(TuneMode::LowLatency, low.as_str()), (TuneMode::BestQuality, best.as_str())])
-        }) {
-            out.push(target.action(NextStream { tune, ..v }));
-        }
-        let mut ql = v.quality_level;
-        if widgets::ctrl_row(ui, &tr("ui.stream.quality_level", "Quality level"), None, |ui| {
-            widgets::segmented(
-                ui,
-                &mut ql,
-                &[(QualityLevel::Performance, perf.as_str()), (QualityLevel::Balanced, bal.as_str()), (QualityLevel::Quality, qual.as_str())],
-            )
-        }) {
-            out.push(target.action(NextStream { quality_level: ql, ..v }));
-        }
-        let mut rc = v.rate_control;
-        if widgets::ctrl_row(
+    let mut tune = v.tune;
+    if widgets::ctrl_row(ui, &tr("ui.stream.tune", "Tune"), None, |ui| {
+        widgets::segmented(ui, &mut tune, &[(TuneMode::LowLatency, low.as_str()), (TuneMode::BestQuality, best.as_str())])
+    }) {
+        out.push(target.action(NextStream { tune, ..v }));
+    }
+    let mut ql = v.quality_level;
+    if widgets::ctrl_row(ui, &tr("ui.stream.quality_level", "Quality level"), None, |ui| {
+        widgets::segmented(
             ui,
-            &tr("ui.stream.rate_control", "Rate control"),
-            Some(&tr("ui.stream.rate_control_tip", "Efficient = QVBR, Max quality = CQP")),
-            |ui| widgets::segmented(ui, &mut rc, &[(RateControlMode::Qvbr, eff.as_str()), (RateControlMode::Cqp, maxq.as_str())]),
-        ) {
-            out.push(target.action(NextStream { rate_control: rc, ..v }));
-        }
-        let mut gop = st.gop.unwrap_or(v.gop_millis);
-        let r = widgets::slider_row(
-            ui,
-            &tr("ui.stream.keyframe", "Keyframe interval"),
-            Some(&tr("ui.stream.keyframe_tip", "GOP length. Shorter recovers faster from fast motion, costs more bitrate.")),
-            &mut gop,
-            GOP_RANGE,
-            GOP_STEP,
-            0,
-            " ms",
-        );
-        if let Some(g) = commit(r, gop, &mut st.gop) {
-            out.push(target.action(NextStream { gop_millis: g, ..v }));
-        }
-    });
+            &mut ql,
+            &[(QualityLevel::Performance, perf.as_str()), (QualityLevel::Balanced, bal.as_str()), (QualityLevel::Quality, qual.as_str())],
+        )
+    }) {
+        out.push(target.action(NextStream { quality_level: ql, ..v }));
+    }
+    let mut rc = v.rate_control;
+    if widgets::ctrl_row(
+        ui,
+        &tr("ui.stream.rate_control", "Rate control"),
+        Some(&tr("ui.stream.rate_control_tip", "Efficient = QVBR, Max quality = CQP")),
+        |ui| widgets::segmented(ui, &mut rc, &[(RateControlMode::Qvbr, eff.as_str()), (RateControlMode::Cqp, maxq.as_str())]),
+    ) {
+        out.push(target.action(NextStream { rate_control: rc, ..v }));
+    }
+    let mut gop = st.gop.unwrap_or(v.gop_millis);
+    let r = widgets::slider_row(
+        ui,
+        &tr("ui.stream.keyframe", "Keyframe interval"),
+        Some(&tr("ui.stream.keyframe_tip", "GOP length. Shorter recovers faster from fast motion, costs more bitrate.")),
+        &mut gop,
+        GOP_RANGE,
+        GOP_STEP,
+        0,
+        " ms",
+    );
+    if let Some(g) = commit(r, gop, &mut st.gop) {
+        out.push(target.action(NextStream { gop_millis: g, ..v }));
+    }
+
+}
+
+/// Height the Advanced rows take, laid out once in an invisible child that advances
+/// nothing. The Encoder card reserves it as empty space below itself while Advanced is
+/// collapsed, so the modal is as tall closed as open.
+///
+/// `Why:` the user disliked the modal growing and shrinking (and jumping, it is
+/// centred) when Advanced was toggled (2026-10-15). A hidden layout pass is
+/// deterministic (no one-frame resize on first open) and follows font and language;
+/// the space sits outside the card (empty body space, not an oversized card). In the
+/// two-column layout it only matters when the right column is the taller one.
+fn adv_rows_height(ui: &mut Ui, target: Target, v: NextStream) -> f32 {
+    let rect = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), f32::INFINITY));
+    let mut ghost = ui.new_child(egui::UiBuilder::new().max_rect(rect).invisible().sizing_pass());
+    // Scratch drag buffers and action sink: the ghost must not touch the real ones.
+    adv_rows(&mut ghost, &mut StreamSettingsState::default(), target, v, &mut Vec::new());
+    ghost.min_rect().height()
 }
 
 // ---------------------------------------------------------------------------
@@ -1066,5 +1099,33 @@ mod tests {
             assert!(need <= col, "{loc}: a column needs {need} px, the full-width modal gives {col}");
         }
         rust_i18n::set_locale(&prev);
+    }
+
+    /// The Encoder card plus its reserved space is as tall closed as open, so
+    /// toggling Advanced never resizes (or moves) the centred modal.
+    #[test]
+    fn encoder_card_height_does_not_depend_on_advanced() {
+        let state = AppState::default();
+        let (nav, shell, videos) = (super::super::Nav::default(), super::super::Shell::default(), super::super::VideoViews::default());
+        let height = |adv_open: bool| {
+            let ctx = egui::Context::default();
+            theme::apply(&ctx);
+            let mut st = StreamSettingsState { adv_open, ..Default::default() };
+            let mut h = 0.0;
+            // Two frames: fonts load on the first.
+            for _ in 0..2 {
+                let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let mut actions = Vec::new();
+                        let cx = Cx::new(&state, &nav, &shell, &videos, &mut actions);
+                        // A scope's rect is its content, like a body column's.
+                        h = ui.scope(|ui| encoder_card(ui, &cx, &mut st, Target::Staged, &mut Vec::new())).response.rect.height();
+                    });
+                });
+            }
+            h
+        };
+        let (open, closed) = (height(true), height(false));
+        assert!((open - closed).abs() < 0.5, "open {open} px vs closed {closed} px");
     }
 }
