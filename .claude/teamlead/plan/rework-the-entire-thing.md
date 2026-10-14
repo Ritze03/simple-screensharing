@@ -1,7 +1,7 @@
 # Rework the entire thing
 
-> **Stage 5** — building (single phase, I1–I26) · started 2026-10-13
-> You're away; agents build and test everything, then it's your review.
+> **Stage 6** — agent testing (single phase, I1–I26 built) · started 2026-10-13
+> Agents run every `verified by: agent` item for real (headless sway rig, per the user's 2026-10-14 rule), then it's your review.
 
 ## Goal
 Collapse the desktop client from three UI layers (egui leftovers, Tauri, Electron + HTML) to one native egui app with the room-centric layout, without losing features — and with screen sharing that works end to end at **at least 120 fps, ideally 240 fps**. The core concept stays: symmetric end-to-end encryption, a relay that never decrypts, a server with a small TUI.
@@ -136,39 +136,39 @@ Collapse the desktop client from three UI layers (egui leftovers, Tauri, Electro
 One phase (**D34**): everything below is built and agent-tested in one run; the `user` items are your review afterwards.
 
 **Repo**
-- [ ] The workspace root is the monorepo: `git log --oneline -- client/` shows the 333+ client commits and `-- server/` the server's 12+ commits; `archive/client/*` branches hold the two unmerged client branches and the stash; `master` and `rework` are on the private `origin`; the nested `simple-screensharing-client/`, `simple-screensharing-server/` and `simple-screensharing-website/` directories are gone — *verified by: agent*
-- [ ] `cargo build --workspace` and `cargo test --workspace` pass, and the `#[ignore]`d real-relay tests pass with `--ignored` — *verified by: agent*
-- [ ] One `protocol` crate is used by client and server; no duplicated `protocol.rs` remains — *verified by: agent*
+- [x] The workspace root is the monorepo: `git log --oneline -- client/` shows the 333+ client commits and `-- server/` the server's 12+ commits; `archive/client/*` branches hold the two unmerged client branches and the stash; `master` and `rework` are on the private `origin`; the nested `simple-screensharing-client/`, `simple-screensharing-server/` and `simple-screensharing-website/` directories are gone — *verified by: agent* — ran `git log -- client/ | wc -l`, `git ls-remote origin`, `find -name .git` → 381 client / 20 server commits, master + rework + 93 archive branches on origin (incl. the 2 unmerged + `stash-volume-sync`), only the root `.git`
+- [x] `cargo build --workspace` and `cargo test --workspace` pass, and the `#[ignore]`d real-relay tests pass with `--ignored` — *verified by: agent* — ran `cargo test --workspace --no-fail-fast` → 309 lib + 47 bin + 5 protocol + 16 server, 0 failed; `--ignored` with own relay → 17 passed (portal/audio tests skipped per the no-audio, no-real-desktop rule); 4 timing tests flake only under load ~40+
+- [x] One `protocol` crate is used by client and server; no duplicated `protocol.rs` remains — *verified by: agent* — ran `git ls-files | grep protocol` + both Cargo.toml → both depend on `../protocol`; `client/src/protocol.rs` is a 6-line re-export, `server/src/protocol.rs` re-export + relay helpers, no wire types
 
 **Core**
-- [ ] Every behaviour that lived only in `src-tauri/commands.rs` (create room, join-name upsert, forget, edit destination, bandwidth total/floor, jitter/catch-up, start-stream defaults, audio-level tap, volume resolution) is a method on the lib's `AppState`/`rooms` with a unit test, and the Rust preset table matches `components.js` `ENCODER_PRESETS` — *verified by: agent*
-- [ ] The decoder auto-detects H.264 / H.265 / AV1 from the bitstream and decodes each with VA hardware decode (software fallback when VA is missing); a benchmark decodes 1080p at ≥ 240 fps per codec on this machine — *verified by: agent*
-- [ ] `client/src/main.rs` declares no shared module (`mod session` etc.) and the bin builds against the lib — *verified by: agent*
+- [x] Every behaviour that lived only in `src-tauri/commands.rs` (create room, join-name upsert, forget, edit destination, bandwidth total/floor, jitter/catch-up, start-stream defaults, audio-level tap, volume resolution) is a method on the lib's `AppState`/`rooms` with a unit test, and the Rust preset table matches `components.js` `ENCODER_PRESETS` — *verified by: agent* — ran `session::ui_ops_tests`, `presets::`, `rooms::tests::upsert` → 34/12/2 passed; each of the 9 behaviours mapped to a method + test; presets match the old JS table field by field (`every_preset_matches_the_js_table_exactly`)
+- [x] The decoder auto-detects H.264 / H.265 / AV1 from the bitstream and decodes each with VA hardware decode (software fallback when VA is missing); a benchmark decodes 1080p at ≥ 240 fps per codec on this machine — *verified by: agent* — ran `decode_bench` (1080p, 600 frames ×3) → vah264dec 461, vah265dec 255, vaav1dec 265 fps; `LIBVA_DRIVER_NAME=bogus` on `decode::video_tests` → 15 passed via avdec_h264/av1dec
+- [x] `client/src/main.rs` declares no shared module (`mod session` etc.) and the bin builds against the lib — *verified by: agent* — ran `grep -n "mod " client/src/main.rs` → only `theme`, `ui`, `widgets` (+ test mod); bin builds in the workspace build
 
 **Server**
-- [ ] Native clients still connect over `ssshare/1`; a browser connects over WebTransport (`h3`) on the same UDP port by pinning the cert hash from the join link; a forced short cert validity shows rotation working; the TUI shows the current hash and expiry; the relay still never decrypts — *verified by: agent*
+- [x] Native clients still connect over `ssshare/1`; a browser connects over WebTransport (`h3`) on the same UDP port by pinning the cert hash from the join link; a forced short cert validity shows rotation working; the TUI shows the current hash and expiry; the relay still never decrypts — *verified by: agent* — ran `simple-screensharing-server --cert-validity-secs 200 --cert-rotate-before-secs 100` + native `test_sender` + headless Chromium on the same UDP port → browser decoded 30 fps H.264 with the pinned hash; TUI hash/expiry changed on rotation (matches openssl), stale hash refused, new hash joined; no aead crate in the server's `cargo tree`
 
 **egui UI**
-- [ ] A widget-gallery screen shows every row helper; an Opus screenshot review finds no misaligned slots or unequal heights — *verified by: agent*
+- [x] A widget-gallery screen shows every row helper; an Opus screenshot review finds no misaligned slots or unequal heights — *verified by: agent* — ran `simple-screensharing-client --gallery` with `SSS_GALLERY_SLOTS=1` in the headless rig → every row helper aligned, equal heights; the narrow `dest_row` overflow and overlay clip it found are fixed in #58
 - [ ] The app matches the mockup's Proposed tab at 1280 / 1600 / 1920 px on DP monitors (Opus screenshot comparison; every deviation listed is fixed) — *verified by: agent*
-- [ ] Every Electron feature from the parity list is reachable in the egui UI (checklist walked with ydotool on DP-1..3) — *verified by: agent*
-- [ ] Every UI string exists in `en` and `de`; switching language shows no raw keys — *verified by: agent*
+- [x] Every Electron feature from the parity list is reachable in the egui UI (checklist walked with ydotool on DP-1..3) — *verified by: agent* — ran `hs-drive.sh` + `swaymsg seat - cursor` + `wtype` in the headless sway rig instead (user's 2026-10-14 rule) → every item reachable (audio only checked for reachability); the silent failed-connect it found is fixed in #58
+- [x] Every UI string exists in `en` and `de`; switching language shows no raw keys — *verified by: agent* — ran `python3 -I client/locales/check_keys.py` → 0 problems (408 en / 408 de after #58); German in the rig shows no raw keys; the label/plural/tooltip nits are fixed in #58
 
 **Performance**
-- [ ] Real end-to-end share (relay + two egui clients, portal capture of DP-1): the receiver measures ≥ 120 fps decoded **and** presented, for H.264, H.265 and AV1 — *verified by: agent*
-- [ ] 240 fps: the receiver decodes ≥ 240 fps for at least one codec and presents ≥ 240 fps on DP-1, or the report names the stage that limits it — *verified by: agent*
+- [x] Real end-to-end share (relay + two egui clients, portal capture of DP-1): the receiver measures ≥ 120 fps decoded **and** presented, for H.264, H.265 and AV1 — *verified by: agent* — ran `hs-scenario.sh <codec>-120 <codec> 120 balanced` in the headless rig (HEADLESS-1 @240 instead of DP-1, per the user's rule) → viewer 120/120 decoded/shown, 0 dropped, via vah264dec / vah265dec / vaav1dec
+- [x] 240 fps: the receiver decodes ≥ 240 fps for at least one codec and presents ≥ 240 fps on DP-1, or the report names the stage that limits it — *verified by: agent* — ran `hs-scenario.sh` at 240 (H.265 balanced, AV1 + H.264 gaming) → viewer 236–239 decoded and shown, 0 dropped; limit is capture: pipewiresrc delivers 238.8–239.3 from the headless output's 240 Hz timer, encoder loses 1–2 more (on the real DP-1 earlier: 240/240 for H.265)
 
 **Website**
-- [ ] `docs/` is static with no build step, and served locally under a `/simple-screensharing/` sub-path (as Pages will) it loads with no 404s or console errors — *verified by: agent*
-- [ ] In real Chromium against the local relay, the website creates and joins a room, watches a native client's share, and shares its own screen to a native client; browser capture/decode fps are measured and documented — *verified by: agent*
+- [x] `docs/` is static with no build step, and served locally under a `/simple-screensharing/` sub-path (as Pages will) it loads with no 404s or console errors — *verified by: agent* — ran `python3 -m http.server` over a `simple-screensharing -> docs` symlink + headless Chromium via `docs/dev/cdp.mjs` → 28 resources all 200, 0 console errors, 0 network errors
+- [x] In real Chromium against the local relay, the website creates and joins a room, watches a native client's share, and shares its own screen to a native client; browser capture/decode fps are measured and documented — *verified by: agent* — ran `hs-rig.sh run -- env SSS_GUI_LOCKED=1 HEADED=1 node …` (headed Chromium inside the rig) → room created in the real Create tab and joined by link; native 120 fps share decoded in the browser at ~120 (H.264, H.265, AV1); browser share decoded natively at 58 (H.264 @60 via vah264dec, AV1 via vaav1dec); numbers match `superdoc/features/website.md:89-95`
 
 **Cleanup, packaging, docs**
-- [ ] `client/electron/`, `client/frontend/`, `client/src-tauri/`, the Windows workflow and `client/.cargo/config.toml` are gone; no `tauri` / `electron` / `npm` reference remains outside historical doc notes; `cargo build --release` and `cargo test` pass — *verified by: agent*
-- [ ] The AppImage builds, launches on a DP monitor, joins a room and plays a stream — *verified by: agent*
-- [ ] `superdoc/` (architecture, features, ui, testing), root `CLAUDE.md`, `README.md` and the `run` skill describe the monorepo, the egui app, the WebTransport server path and the website; none point at Electron or Playwright `_electron` — *verified by: agent* (grep)
+- [x] `client/electron/`, `client/frontend/`, `client/src-tauri/`, the Windows workflow and `client/.cargo/config.toml` are gone; no `tauri` / `electron` / `npm` reference remains outside historical doc notes; `cargo build --release` and `cargo test` pass — *verified by: agent* — ran `ls` on the paths + `git grep -niE 'tauri|electron|\bnpm\b'` + `cargo build --release --workspace` → all gone, 141 hits all history-labelled/"former", plan file or benign; release build and tests green
+- [x] The AppImage builds, launches on a DP monitor, joins a room and plays a stream — *verified by: agent* — ran `./build-appimage.sh --no-server` (23 MB, self-checks 3/3) and launched it on HEADLESS-3 in the rig instead of a DP monitor → joined the rig room and played H.265 @120 via vah265dec ("Decoded 120 fps shown 120 fps … 0 dropped")
+- [x] `superdoc/` (architecture, features, ui, testing), root `CLAUDE.md`, `README.md` and the `run` skill describe the monorepo, the egui app, the WebTransport server path and the website; none point at Electron or Playwright `_electron` — *verified by: agent* (grep) — ran `git grep -niE 'playwright|_electron'` + a dead-link script → hits only in History sections; no dead links besides deliberately historical ones
 
 **Windows**
-- [ ] The client builds and runs in the WinBoat VM over SSH, joins a room and receives a share from the Linux client — *verified by: agent*
+- [x] The client builds and runs in the WinBoat VM over SSH, joins a room and receives a share from the Linux client — *verified by: agent* — ran `build.ps1` + `cargo test --release --lib` in the VM and the `test_viewer` example against a headless Linux `test_sender` → built, 300 tests passed, decoded 34–35 fps H.264 (avdec_h264, VM has no GPU); Windows → Linux 30 fps too. Not covered: the GUI window and `d3d11screencapturesrc` (VM had no logged-in desktop session)
 
 **Your review**
 - [ ] It looks and feels like the mockup, and the room flow is intuitive — *verified by: user*
