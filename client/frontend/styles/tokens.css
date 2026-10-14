@@ -1,0 +1,298 @@
+/*
+ * tokens.css — shared design-token source of truth for the Tauri frontend.
+ *
+ * SOURCE OF TRUTH: the redesign prototype,
+ * `Stream Control Redesign Options/Simple Screensharing Redesign.dc.html`
+ * (option "1i — Clickable, full window at 1440x900", the assembled design).
+ * Every hex below is lifted from that file.
+ *
+ * Why that matters (2026-07-28 correction): this file previously described
+ * itself as "a 1:1 CSS translation of `src/theme.rs`", and it was — but
+ * `theme.rs` is the *old* egui client's palette, i.e. the "before" the
+ * redesign was commissioned to replace. The handoff's `shots/*.png` are
+ * likewise screenshots of that old app (they ship next to `theme.rs`/`ui.rs`
+ * in the same folder — they are the designer's *input*, not the mockup).
+ * Porting from them reproduced the old greys under the new layout, which is
+ * why the owner's review said "some of the colors are not right". The
+ * elevation ramp is now the prototype's:
+ *
+ *     old (theme.rs)        new (prototype)
+ *     PANEL_SUNKEN #17181B  ->  #16171A
+ *     PANEL_BASE   #1E1F22  ->  #1B1C1F
+ *     PANEL_RAISED #27282D  ->  #24252A
+ *     BORDER       #3A3B40  ->  #34353B
+ *
+ * The prototype also carries a layer of chrome the old egui theme had no
+ * vocabulary for at all — accent gradients, coloured glows, hairline rings,
+ * hatched textures. Those live in the "Effects" block near the bottom; they
+ * are what makes the design read as "futuristic", so they are tokens, not
+ * one-off literals at the call site.
+ *
+ * Every other frontend/ file (shell.css today; Stream Control / View /
+ * Settings styles later) should reference these custom properties by role
+ * (`var(--accent)`, `var(--rounding)`, ...) rather than hard-coding a hex or
+ * pixel value at the call site — exactly the discipline theme.rs enforces on
+ * the Rust/egui side. If a design change is needed, it should be a one-file
+ * edit here, not a grep-and-replace across every screen.
+ *
+ * Do not duplicate this file per-screen. Other workers building Stream
+ * Control / View / Settings tab content should `<link>` this same file.
+ */
+
+:root {
+  /* -------------------------------------------------------------------
+   * Color tokens — from the redesign prototype (see the header note for
+   * the old-theme.rs values these replaced, and why).
+   * ----------------------------------------------------------------- */
+
+  /* Brand accent — nav active pill, primary buttons, selection tint. */
+  --accent: #4c6ef5;
+
+  /* Elevation tiers (dark -> light): sunken < base < raised.
+     The prototype's whole point is that a card sits *above* the page, so
+     --panel-raised must be lighter than --panel-base. (It is. It was also
+     lighter before — but Stream Control's destination cards were filled
+     with --panel-sunken, which read as holes punched in the page.) */
+  --panel-sunken: #16171a;
+  --panel-base: #1b1c1f;
+  --panel-raised: #24252a;
+
+  /* Hairline borders / dividers — three weights, because the prototype
+     uses a different one per elevation and collapsing them to a single
+     grey is what made the sidebar and the cards read as the same tier.
+       --border       card / panel edge on a raised surface   (#34353B)
+       --divider      inside-a-card rule, muted separator     (#2A2B30)
+       --inset-border edge of a *sunken* inset within a card  (#26272C)
+       --well-border  edge of a sidebar well on the rail      (#1F2024) */
+  --border: #34353b;
+  --divider: #2a2b30;
+  --inset-border: #26272c;
+  --well-border: #1f2024;
+
+  /* Text */
+  --text: #e8e9ec;
+  --text-dim: #a8aab2;
+  --text-faint: #6e7078;
+
+  /* Inputs / code-block backgrounds. */
+  --field: #28292d;
+
+  /* Secondary button. */
+  --btn: #2c2d32;
+  --btn-border: #44454c;
+
+  /* Text drawn on top of an accent-filled primary surface. */
+  --primary-text: #0b0c10;
+
+  /* Severity colors. */
+  --danger: #e05a5a;
+  --success: #50c878;
+  --warning: #e8a33d;
+
+  /* -------------------------------------------------------------------
+   * New tokens from the design handoff — not yet in theme.rs, scoped to
+   * the sidebar rail specifically (a deeper recess than `--panel-sunken`,
+   * plus a family of hover/active row washes). Confirmed by a prior scout
+   * to not collide with any existing theme.rs value.
+   * ----------------------------------------------------------------- */
+
+  /* Sidebar rail's own sunken background (deeper than --panel-sunken). */
+  --sidebar-rail: #101114;
+
+  /* Additional elevation surfaces seen in the handoff shots. */
+  --elevation-1b: #1b1c1f;
+  --elevation-16: #16171a;
+  --elevation-19: #191a1e;
+  --elevation-14: #141518;
+
+  /* Hover / active row wash tints, for list rows (room rows, stream rows,
+     nav items) that need a subtler lift than a full panel tier swap. */
+  --wash-hover-1: #24252a;
+  --wash-hover-2: #26272c;
+  --wash-active-1: #2a2b30;
+  --wash-active-2: #1f2024;
+
+  /* Kept as an alias of --border: before the repalette these were two
+     different greys (#3A3B40 / #34353B), but the prototype only has one
+     card-edge value, so both names now resolve to it. Retained so the
+     existing call sites don't all have to change in one sweep. */
+  --border-light: var(--border);
+
+  /* Video-surface black — Watch tiles and Broadcast preview thumbs. Darker
+     than --panel-sunken so a video sits in a well, never on a card. */
+  --tile-bg: #101114;
+
+  /* Status pill backgrounds (tinted fills for badges/pills, not raw
+     severity text). */
+  --pill-success-bg: #3f6a4f;
+  --pill-success-bg-dim: #2f4a3a;
+  --pill-accent-bg: #2b3ea8;
+  --pill-accent-bg-light: #5c7bf7;
+  --pill-accent-bg-lighter: #8ea3f9;
+
+  /* Status-vocabulary pill treatments (see `frontend/styles/status.css` for
+     the classes that consume these — one shared definition, not duplicated
+     per-file). Translucent fills so a badge reads as a tint over the card
+     it sits on, not a solid chip; --pill-accent-bg-lighter above doubles as
+     the "in-progress" family's text color (design-handoff hex #8ea3f9). */
+  --pill-progress-bg: rgba(76, 110, 245, 0.14);
+  --pill-progress-border: rgba(76, 110, 245, 0.4);
+  --pill-live-bg: rgba(80, 200, 120, 0.12);
+  --pill-live-border: rgba(80, 200, 120, 0.3);
+
+  /* Amber hatch fill shared by the "degraded" status family (status.css's
+     `.status-badge-degraded`) and the leave-room confirm dialog's warning
+     banners (`.hatched-banner`) — same repeating-linear-gradient stripes,
+     one pair of tokens so the two never drift apart. */
+  --hatch-amber-strong: rgba(232, 163, 61, 0.16);
+  --hatch-amber-weak: rgba(232, 163, 61, 0.05);
+  --hatch-amber-border: rgba(232, 163, 61, 0.4);
+  /* The gradient itself, not just its two color stops — a `background-image`
+     custom property, so `.status-badge-degraded` and `.hatched-banner` in
+     status.css reference one declaration instead of each writing out the
+     same `repeating-linear-gradient(...)` literal. */
+  --hatch-amber-gradient: repeating-linear-gradient(45deg, var(--hatch-amber-strong) 0 4px, var(--hatch-amber-weak) 4px 8px);
+
+  /* Room-detail slide-over header wash (design handoff option 1f) — the
+     accent's own rgb triplet (76, 110, 245 == --accent, #4c6ef5) faded to
+     transparent, top-to-bottom. No existing token was this specific
+     accent-to-transparent wash, so it's added here rather than reused. */
+  --accent-header-wash: linear-gradient(160deg, rgba(76, 110, 245, 0.14), transparent);
+  --accent-row-tint: rgba(76, 110, 245, 0.09);
+
+  /* -------------------------------------------------------------------
+   * Effects — gradients, glows, rings, textures.
+   *
+   * This whole block was MISSING from the first redesign implementation.
+   * The old egui theme painted flat fills and 1px strokes and nothing
+   * else, so a port that took `theme.rs` as its source had no token for
+   * any of this — and a structural review ("is there a card here? is the
+   * label accent-coloured?") passes cleanly without it, because every
+   * element is present and correctly placed. It just looks flat. This is
+   * the layer the owner meant by "it looked way more futuristic in the
+   * mockup".
+   *
+   * Rule of thumb from the prototype: accent surfaces are a vertical
+   * gradient plus a coloured drop-glow; live/streaming surfaces get a
+   * green hairline ring (and, for hero surfaces, an outer bloom);
+   * degraded surfaces get a 45-degree hatch instead of a flat tint.
+   * ----------------------------------------------------------------- */
+
+  /* Accent fills. Primary buttons and the active segment of a segmented
+     control; `--nav-active-gradient`'s 100deg is the nav rail's own
+     slightly-off-vertical variant. Text on all of these is
+     --primary-text (#0B0C10), NOT --text: the prototype's accent is
+     bright enough that light-on-accent is the low-contrast choice. */
+  --accent-gradient: linear-gradient(180deg, #5c7bf7 0%, var(--accent) 100%);
+  --nav-active-gradient: linear-gradient(100deg, #5c7bf7 0%, var(--accent) 100%);
+  --accent-mark-gradient: linear-gradient(140deg, #5c7bf7 0%, #2b3ea8 100%);
+
+  /* Accent glows — a coloured drop shadow under an accent surface. */
+  --accent-glow: 0 3px 14px rgba(76, 110, 245, 0.35);
+  --accent-glow-soft: 0 2px 10px rgba(76, 110, 245, 0.3);
+  --accent-glow-mark: 0 2px 10px rgba(76, 110, 245, 0.4);
+
+  /* Live/green signals. The dot glow is what makes a "LIVE" indicator
+     read as lit rather than printed; the ring/bloom pair is the Watch
+     tile's and the Broadcast preview thumb's outline. */
+  --success-glow: 0 0 6px rgba(80, 200, 120, 0.8);
+  --success-glow-strong: 0 0 7px rgba(80, 200, 120, 0.9);
+  --tile-ring-live: 0 0 0 1px rgba(80, 200, 120, 0.2);
+  --thumb-ring-live: 0 0 0 1px rgba(80, 200, 120, 0.18), 0 0 22px rgba(80, 200, 120, 0.1);
+
+  /* Accent ring — the selected sidebar room row, and the composer card. */
+  --accent-ring-inset: inset 0 0 0 1px rgba(76, 110, 245, 0.28);
+  --accent-row-selected: rgba(76, 110, 245, 0.16);
+
+  /* Dashed accent affordance — "ghost" rows and chips that add something
+     ("Share another screen", "Also send to...", "+ Add a room"). */
+  --accent-ghost-bg: rgba(76, 110, 245, 0.07);
+  --accent-ghost-bg-hover: rgba(76, 110, 245, 0.14);
+  --accent-ghost-border: rgba(76, 110, 245, 0.4);
+  --accent-chip-bg: rgba(76, 110, 245, 0.1);
+  --accent-chip-border: rgba(76, 110, 245, 0.45);
+
+  /* Card lift — the hero (first/live) destination card is a shade lighter
+     at its top edge than a plain card, so it reads as nearer. */
+  --card-gradient: linear-gradient(180deg, #26282c 0%, var(--panel-raised) 100%);
+
+  /* Screen-surface texture. Stands in for decoded video on a preview
+     thumbnail: a fine diagonal weave, not a flat black rectangle (and
+     emphatically not the saturated blue placeholder this shipped with). */
+  --screen-hatch: repeating-linear-gradient(115deg, var(--elevation-19) 0 8px, var(--elevation-14) 8px 16px);
+
+  /* Slider track/fill — a filled range control, gradient like the buttons. */
+  --slider-fill: linear-gradient(90deg, #2b3ea8 0%, var(--accent) 100%);
+  --slider-track-bg: var(--elevation-1b);
+
+  /* Danger fills. */
+  --danger-tint: rgba(224, 90, 90, 0.12);
+  --danger-border: rgba(224, 90, 90, 0.5);
+  --modal-shadow: 0 26px 70px rgba(0, 0, 0, 0.7);
+
+  /* Softer sibling of --hatch-amber-gradient, for large surfaces (warning
+     banners) where the badge-sized 4px/8px stripe reads as noise. */
+  --hatch-amber-gradient-soft: repeating-linear-gradient(45deg, rgba(232, 163, 61, 0.1) 0 6px, rgba(232, 163, 61, 0.04) 6px 12px);
+  /* Faintest of the three, for full-tile surfaces: a hatch tuned for a
+     badge is far too loud stretched across a whole video tile. */
+  --hatch-amber-gradient-faint: repeating-linear-gradient(45deg, rgba(232, 163, 61, 0.05) 0 8px, transparent 8px 16px);
+
+  /* -------------------------------------------------------------------
+   * Spacing / sizing / rounding — ported from theme.rs's constants.
+   * ----------------------------------------------------------------- */
+
+  --spacing: 7px;
+  --rounding: 14px;
+  /* --rounding-md (9px) is the prototype's button/input/inset radius; the
+     old theme had only one small radius, so buttons inherited the 14px
+     card radius and read as lozenges rather than the design's soft rects. */
+  --rounding-md: 9px;
+  --rounding-sm: 8px;
+  /* Sidebar wells (nav track, ROOMS list, OUTGOING list). */
+  --rounding-well: 12px;
+  --value-w: 64px;
+  --nav-button-height: 38px;
+  --dot-size: 9px;
+  --panel-max-width: 520px;
+
+  /* Frontend-only layout constants (no theme.rs equivalent — these are
+     shell-level, not a widget token). */
+  --sidebar-width: 288px;
+  --streams-max-height: 220px;
+  --rooms-row-radius: var(--rounding-sm);
+
+  /* -------------------------------------------------------------------
+   * Fonts.
+   *
+   * Geist (sans, Regular + Bold) + Geist Mono (Regular only) + Material
+   * Symbols Outlined are vendored locally (see frontend/fonts/) rather than
+   * pulled from the Google Fonts CDN, so the shell renders correctly
+   * offline and under a CSP-locked Tauri webview. Geist Mono only vendors
+   * the Regular (400) weight; bold mono text falls back to the browser's
+   * synthetic bold (see fonts.css for the full rationale). Falls back to a
+   * system sans/monospace stack if the font fails to load for any reason.
+   *
+   * --font-sans is the app default (body text, labels, titles); --font-mono
+   * is reserved for "value" text — numeric/tabular readouts (resolution,
+   * fps, bitrate, timers, IDs, join-link strings, …) that change at runtime
+   * and would visually shift with a proportional font.
+   * ----------------------------------------------------------------- */
+  --font-sans: "Geist", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  --font-icons: "Material Symbols Outlined";
+
+  /* This app is always-dark (no light theme), but native form controls
+   * (<select>, <input type="number">'s spinner buttons, <input
+   * type="range">'s track/thumb) fall back to the OS's light chrome for
+   * whatever parts of themselves the engine paints natively, regardless of
+   * the explicit `background`/`color` every select/number input already
+   * sets per-component (see stream-control.css). This has been reported
+   * from the compiled desktop app (Tauri's Linux webview, WebKitGTK) —
+   * plain Chromium (used for local dev) doesn't show it, which is why it's
+   * easy to miss in-browser. `color-scheme: dark` is the standard fix: it
+   * tells the engine which palette to paint its own native chrome in,
+   * without having to `appearance: none` and hand-roll a replacement
+   * dropdown/spinner (see frontend/styles/stream-control.css and
+   * shell.css's `.field-input` for the explicit colors this complements). */
+  color-scheme: dark;
+}

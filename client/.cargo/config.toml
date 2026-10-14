@@ -1,0 +1,12 @@
+# `turbojpeg-sys` (pulled in by `src-tauri`'s `video_server.rs`) defaults to
+# building libjpeg-turbo from source via cmake/nasm when `TURBOJPEG_SOURCE` is
+# unset, which fails on a machine without a NASM assembler installed (this
+# one, confirmed by a failed `cargo build --workspace`: "No
+# CMAKE_ASM_NASM_COMPILER could be found"). This repo's `pkg-config --exists
+# libturbojpeg` check (see `video_server.rs`'s module doc / the task that
+# introduced it) already confirmed the system library is present — pointing
+# `TURBOJPEG_SOURCE` at pkg-config uses that instead of vendoring a from-source
+# build, which is both faster to build and avoids the NASM dependency
+# entirely.
+[env]
+TURBOJPEG_SOURCE = "pkg-config"

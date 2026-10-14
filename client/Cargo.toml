@@ -1,0 +1,74 @@
+[workspace]
+members = [".", "src-tauri"]
+# `resolver = "2"` is edition-2024's default anyway, but spelling it out here
+# avoids any ambiguity now that this manifest is also a workspace root.
+resolver = "2"
+
+[package]
+name = "simple-screensharing-client"
+version = "0.1.0"
+edition = "2024"
+
+# Explicit lib + bin targets: this crate now serves two consumers — the
+# existing egui/eframe binary below (unchanged) and, as a `[lib]`, the new
+# `src-tauri/` Tauri app (see src/lib.rs). Cargo infers both targets fine
+# without this section (src/lib.rs + src/main.rs coexist by default), but
+# spelling them out makes the two-target shape explicit for anyone reading
+# this manifest.
+[lib]
+name = "simple_screensharing_client"
+path = "src/lib.rs"
+
+[[bin]]
+name = "simple-screensharing-client"
+path = "src/main.rs"
+
+[dependencies]
+aes-gcm = "0.11.0"
+anyhow = "1.0.104"
+base64 = "0.23.0"
+dirs = "6.0.0"
+futures-util = "0.3.33"
+eframe = { version = "0.33.3", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland", "persistence", "serde"] }
+egui = "0.33.3"
+gstreamer = "0.24.5"
+gstreamer-app = "0.24.5"
+gstreamer-video = "0.24.5"
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
+postcard = { version = "1.1.3", features = ["use-std"] }
+quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "platform-verifier"] }
+rand = "0.10.2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.145"
+tokio = { version = "1.53.1", features = ["full"] }
+toml = "1.1.3"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+uuid = { version = "1.24.0", features = ["v4"] }
+wgpu = { version = "27.0.1", default-features = false, features = ["std", "vulkan", "wgsl"] }
+rust-i18n = "4.2.1"
+# Insertion-ordered maps for the session model in `ui.rs` (`App::rooms`,
+# `App::captures`, `LocalCapture::destinations`). `HashMap`s iteration order is
+# randomized per process, which would make the rooms/streams lists shuffle
+# between rebuilds; these collections are rendered as ordered lists in the UI
+# and must iterate in the order the user created their entries.
+indexmap = "2"
+
+# ashpd (xdg-desktop-portal bindings) is Linux/Unix-only: it shells out to
+# `std::os::unix` internals that simply don't exist on Windows, and portal
+# permission dialogs are a Wayland/X11-desktop-environment concept with no
+# Windows equivalent anyway. Windows' capture path (src/capture.rs) captures
+# directly via GStreamer's `d3d11screencapturesrc` instead — see that
+# module's `#[cfg(windows)]` capture source code for details. Gating this as
+# a target-specific dependency means it's not even compiled on Windows,
+# which is what was actually breaking `cargo build` there.
+[target.'cfg(unix)'.dependencies]
+ashpd = { version = "0.13.13", features = ["screencast"] }
+
+# `test-util` (paused/advanceable virtual time) lets `session.rs`'s connect
+# timeout test simulate the 15s-class wait without a real 15s sleep — see
+# that test's doc comment. Dev-only: this feature must never end up in the
+# release binary (it changes `tokio::time`'s runtime behavior process-wide).
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["test-util"] }

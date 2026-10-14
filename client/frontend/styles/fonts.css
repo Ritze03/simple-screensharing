@@ -1,0 +1,79 @@
+/*
+ * fonts.css — local @font-face declarations.
+ *
+ * Geist Mono is vendored from a local asset cache
+ * (`ritz/resources/assets/GeistMono-Regular.ttf`, copied in rather than
+ * pulled from the Geist repo/Google Fonts CDN — a prior coordinator message
+ * pointed at this local copy after this file's first pass had already
+ * fetched a variable woff2 from Google Fonts directly; that CDN-sourced
+ * file was removed in favor of this one). Material Symbols Outlined stays
+ * as the woff2 fetched from Google Fonts in that first pass: it was already
+ * vendored locally (not a live CDN reference) and renders correctly, and
+ * the local asset cache's `GeistMonoNerdFont-Regular.otf` alternative would
+ * require hand-mapping each icon glyph to a Nerd Font codepoint with no way
+ * to verify the mapping without a render pass — more risk than reuse for
+ * the handful of icons this shell needs (see APP-SHELL.md's own "Icon
+ * glyphs" note for how easy it is to silently get tofu boxes this way).
+ * Both choices load fully offline either way; no CDN is contacted at
+ * runtime. See `frontend/fonts/LICENSES/` for both fonts' license terms.
+ *
+ * Only the Regular (400) weight is available for Geist Mono — no separate
+ * bold face was vendored (`Geist-Bold.ttf` in the source asset cache is the
+ * *sans*, not mono, bold). Elements styled `font-weight: 700` in mono
+ * context get the browser's synthetic/algorithmic bold instead of a true
+ * bold glyph. Acceptable for this shell; swap in a real Geist Mono Bold
+ * file later if the synthetic weight ever looks off.
+ *
+ * Geist (the sans family, `--font-sans`) is vendored the same way —
+ * `Geist-Regular.ttf` / `Geist-Bold.ttf` — and unlike Geist Mono has both
+ * weights available, so `font-weight: 700` sans text (titles) gets a real
+ * bold glyph, not a synthetic one. This is now the app's default body font;
+ * see shell.css's `body` rule and tokens.css's `--font-sans` comment.
+ */
+
+@font-face {
+  font-family: "Geist Mono";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("../fonts/GeistMono-Regular.ttf") format("truetype");
+}
+
+@font-face {
+  font-family: "Geist";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("../fonts/Geist-Regular.ttf") format("truetype");
+}
+
+@font-face {
+  font-family: "Geist";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("../fonts/Geist-Bold.ttf") format("truetype");
+}
+
+@font-face {
+  font-family: "Material Symbols Outlined";
+  font-style: normal;
+  font-weight: 400;
+  font-display: block;
+  src: url("../fonts/MaterialSymbolsOutlined.woff2") format("woff2");
+}
+
+.material-symbols-outlined {
+  font-family: "Material Symbols Outlined";
+  font-weight: normal;
+  font-style: normal;
+  font-size: 20px;
+  line-height: 1;
+  letter-spacing: normal;
+  text-transform: none;
+  display: inline-block;
+  white-space: nowrap;
+  word-wrap: normal;
+  direction: ltr;
+  -webkit-font-smoothing: antialiased;
+}

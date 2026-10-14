@@ -1,0 +1,921 @@
+/*
+ * stream-control.css — Stream Control tab layout.
+ *
+ * Redesign goal (superdoc/features/stream-control.md, superdoc/ui/APP-SHELL.md,
+ * and the design-critique this port is fixing): the OLD egui tab stacked
+ * content-sized cards in an order that buried ACTIVE SHARES — the single most
+ * important thing on the screen — as a tiny stub below two big forms. This
+ * file's `.sc-grid` is a single equal-width column (every `.card` inside it
+ * is exactly the content area's width, never sized to its own content), and
+ * `stream-control.js` orders Active Shares right after a *compact* bandwidth
+ * summary strip, not after it.
+ */
+
+.sc-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 720px;
+}
+
+/* -------------------------------------------------------------------
+ * Bandwidth — compact strip, not a big form up front. Mode toggle + the
+ * current numbers on one row; the mode-specific inputs sit on the row below,
+ * still compact (no full-width sliders-as-forms).
+ * ----------------------------------------------------------------- */
+
+.sc-bandwidth-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.sc-bandwidth-summary {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+/* Slider rows share ONE grid, so every track starts at the same X.
+ *
+ * Bug this fixes (owner review): each `.sc-bandwidth-field` used to be its
+ * own flex row, so the slider's start position was pushed right by the
+ * width of that row's own label — "Total maximum" and "Floor per stream"
+ * are different lengths, so the two tracks began at different X and the
+ * group read as ragged rather than as a column.
+ *
+ * `.sc-bandwidth-field` is `display: contents`, which promotes its label /
+ * slider / value into THIS grid, so all rows resolve against the same three
+ * column tracks. `max-content` on the label column means the column
+ * auto-sizes to the longest label rather than to a guessed fixed width —
+ * which matters because the German strings run ~30% longer and a hardcoded
+ * px width would either clip them or leave a gutter in English.
+ */
+.sc-bandwidth-controls {
+  display: grid;
+  grid-template-columns: max-content minmax(120px, 1fr) max-content;
+  align-items: center;
+  gap: 10px 14px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.sc-bandwidth-field {
+  display: contents;
+}
+
+.sc-bandwidth-field input[type="range"] {
+  width: 100%;
+  min-width: 0;
+}
+
+.sc-bandwidth-field-value {
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-weight: 400; /* mono has no real bold vendored — 700 would still synthesize */
+  font-variant-numeric: tabular-nums;
+  /* Fixed to the widest realistic string ("99999 kbps" — 5 digits is the
+     realistic ceiling) so the label's own width never drives the grid's
+     value column — without this the slider track (column 2, `1fr`) grows
+     and shrinks as the digit count changes (e.g. 500 -> 10000), because
+     `min-width: var(--value-w)` referenced a custom property that was
+     never defined anywhere, making the whole declaration invalid and
+     falling back to `auto` (content-sized). */
+  min-width: 10ch;
+  flex-shrink: 0;
+  text-align: right;
+}
+
+/* Full-bleed explanatory line under the grid. */
+.sc-fanout-note {
+  grid-column: 1 / -1;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-faint);
+}
+
+/* -------------------------------------------------------------------
+ * Active shares — per the "Broadcast, single column, 660-720px measure"
+ * design handoff (option 1a): one full-width row per destination, not a
+ * multi-column tile grid — a wide row is what makes room for the
+ * thumbnail-left layout below without crowding the metric/chip/action rows.
+ * ----------------------------------------------------------------- */
+
+.sc-active-shares-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* Card is thumbnail (left) + a flex-column content body (right). Failed
+   cards override back to a plain column below — they have no thumb/body
+   split, just a head + the status.css failed box. */
+/* Elevation, corrected. This was filled with --panel-sunken — DARKER than
+   the page — so every active share read as a hole punched in the surface
+   rather than a card resting on it. The prototype fills it with a subtle
+   vertical lift off --panel-raised, at the full 14px card radius, and lets
+   the 4px state bar down the left edge carry the colour. */
+.dest-card {
+  background: var(--card-gradient);
+  border: 1px solid var(--border);
+  border-radius: var(--rounding);
+  padding: 13px 13px 13px 17px;
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+  gap: 15px;
+  min-width: 0;
+  position: relative;
+  overflow: hidden; /* keeps the accent bar within the card's rounded corners */
+  /* Depth. The prototype is a flat mockup and paints no shadow on these,
+     but a card that casts nothing reads as a coloured rectangle rather
+     than a surface; a restrained ambient shadow plus a hairline top
+     highlight is what sells the elevation the palette is already
+     implying. Deliberate deviation, kept subtle. */
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25), 0 6px 18px rgba(0, 0, 0, 0.18);
+  transition: box-shadow 160ms ease, border-color 160ms ease;
+}
+
+.dest-card:hover {
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25), 0 10px 26px rgba(0, 0, 0, 0.26);
+}
+
+.dest-card-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* 4px left accent bar — reuses status.css's exact progress/live/degraded
+   visual language (marching stripe / static dot / amber hatch), adapted
+   from a pill to a vertical bar, rather than inventing new colors here. */
+.dest-card::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 4px;
+}
+
+/* The live bar fades out downward rather than being a flat green stripe —
+   it reads as light spilling from the top of the card. */
+.dest-card-live::before {
+  background: linear-gradient(180deg, var(--success) 0%, rgba(80, 200, 120, 0.15) 100%);
+}
+
+@keyframes dest-accent-bar-march {
+  from {
+    background-position: 0 0;
+  }
+  to {
+    background-position: 0 12px;
+  }
+}
+
+.dest-card-starting::before,
+.dest-card-rebuilding::before,
+/* "ready" is a staged capture waiting on "Go live" — same in-progress accent
+   as `starting`/`rebuilding` (see `components.js`'s `destinationCard`'s
+   `STATE_META`, and `superdoc/features/stream-control.md`'s 2026-07-28 note
+   on the staged-card flow). */
+.dest-card-ready::before {
+  background-image: repeating-linear-gradient(135deg, var(--pill-accent-bg-lighter) 0 4px, transparent 4px 8px);
+  background-size: 12px 12px;
+  animation: dest-accent-bar-march 0.7s linear infinite;
+}
+
+.dest-card-stalled::before {
+  background-image: var(--hatch-amber-gradient);
+}
+
+.dest-card-failed::before {
+  background: var(--danger);
+}
+
+.dest-card-stalled {
+  border-color: var(--hatch-amber-border);
+}
+
+.dest-card-failed {
+  border-color: var(--danger-border);
+  /* No thumb/body split for a failed card — just the head + status.css's
+     failed box, stacked. */
+  flex-direction: column;
+}
+
+/* `Why there is no preview-thumbnail styling here any more:` the `.dest-thumb`
+   column (static icon/gradient placeholder, never a live decode — see
+   `components.js`'s `destinationCard` doc comment) was removed outright at
+   the owner's request, since it never showed the actual stream. See
+   `superdoc/features/stream-control.md`'s 2026-07-28 note. */
+
+@media (max-width: 460px) {
+  .dest-card:not(.dest-card-failed) {
+    flex-direction: column;
+  }
+}
+
+.dest-card-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.dest-room-label {
+  flex: 1 1 auto;
+  font-weight: 700; /* real face, not synthesized 600 — matches .room-name */
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Destination state pill is now `.status-badge*` (status.css), not a
+   bespoke `.dest-state-badge*` — see `components.js`'s `destinationCard`. */
+
+.dest-pending-role {
+  font-size: 11px;
+  font-style: italic;
+  color: var(--accent);
+}
+
+/* Metric strip. The prototype breaks the card's numbers out into a SUNKEN
+   inset within the card (resolution / encoder / bitrate + the sparkline),
+   which is what gives the card its instrument-panel feel. The port left
+   them as a bare text line floating on the card. Styling the existing
+   `.dest-meta-row` as that inset gets the same read without restructuring
+   the row into labelled columns. */
+.dest-meta-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px 22px;
+  padding: 9px 12px;
+  background: var(--elevation-1b);
+  border: 1px solid var(--inset-border);
+  border-radius: var(--rounding-md);
+}
+
+/* Spacer that pushes the sparkline to the right edge (see components.js). */
+.dest-meta {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* One labelled metric column: micro-caps label over a tabular value. */
+.dest-metric {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.dest-metric-label {
+  font-size: 9px;
+  font-weight: 400;
+  letter-spacing: 0.08em;
+  color: var(--text-faint);
+}
+
+.dest-metric-value {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 400; /* mono has no real bold vendored — 700 would still synthesize */
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+/* Inline 6-bar sparkline — a small client-side rolling window of
+   `sent_fps` samples (see `stream-control.js`'s `updateStats`), rendered as
+   plain CSS bars (no charting library). Starts hidden until the first
+   stats tick, same as `.dest-fps-readout` right below it. */
+.dest-sparkline {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 16px;
+}
+
+.dest-sparkline[hidden] {
+  display: none;
+}
+
+/* Green, not blue. In the prototype the throughput sparkline is part of
+   the LIVE (green) vocabulary, ramping from a dim green through to full
+   --success at the newest sample; rendering it in accent blue put it in
+   the "in progress" family instead, which is the opposite signal. */
+.spark-bar {
+  width: 3px;
+  min-height: 2px;
+  border-radius: 1px;
+  background: var(--success);
+}
+
+/* Older samples sit back on the dimmer greens the prototype uses for the
+   left-hand end of the ramp. */
+.spark-bar:nth-child(1),
+.spark-bar:nth-child(2) {
+  background: var(--pill-success-bg-dim);
+}
+
+.spark-bar:nth-child(3),
+.spark-bar:nth-child(4) {
+  background: var(--pill-success-bg);
+}
+
+.spark-bar-empty,
+.spark-bar-empty:nth-child(n) {
+  background: var(--divider);
+  height: 2px;
+}
+
+/* "Which rooms" chip row — this capture's already-real fan-out destinations
+   (one capture, N rooms), plus a dashed "Also send to…" chip that reveals
+   the same fan-out picker `dest-actions` used to always show inline. */
+.dest-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+
+/* A destination chip names a ROOM this capture is already going to — in
+   the prototype it's a dark, hairline-bordered tag with a live green dot,
+   not the solid navy pill this shipped with (which competed with the
+   accent-blue "add" affordance right next to it and made the two look
+   like the same kind of control). */
+.dest-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 400;
+  padding: 5px 10px 5px 8px;
+  border-radius: var(--rounding-sm);
+  background: var(--elevation-1b);
+  border: 1px solid var(--divider);
+  color: var(--text);
+  white-space: nowrap;
+}
+
+.dest-chip::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--success);
+}
+
+.dest-chip-inline-add {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* Dashed ACCENT — the prototype's "add a room" affordance, matching every
+   other ghost/add control (see shell.css's `.ghost-add-room-row`). */
+.dest-chip-add-btn {
+  font-size: 11px;
+  padding: 5px 10px 5px 8px;
+  border-radius: var(--rounding-sm);
+  background: var(--accent-chip-bg);
+  border: 1px dashed var(--accent-chip-border);
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.dest-chip-add-btn:hover {
+  border-color: var(--accent);
+  background: var(--accent-ghost-bg-hover);
+  color: var(--accent);
+}
+
+.dest-chip-select {
+  max-width: 130px;
+}
+
+.dest-computed-share {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.dest-fps-readout {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.dest-fps-readout[hidden] {
+  display: none;
+}
+
+/* Same shared-grid treatment as `.sc-bandwidth-controls` above (see its
+   note): the per-destination tuning rows — Preset / Framerate / Bitrate in
+   the always-visible grid, Tune / Quality Level / Rate Control in the
+   nested Advanced one — line their controls up in one column instead of
+   each starting wherever its own label happens to end. The value column is
+   `auto` because only the Bitrate row has a readout; every other row simply
+   leaves that cell empty. */
+/* `Why a fixed px, not `max-content`, for column 1:` this class backs two
+   separate grid containers on a staged card — `editGrid` (Room/Preset/
+   Framerate/Bitrate) and the nested `advancedGrid` (Tune/Quality Level/Rate
+   Control) — and each CSS grid sizes its own `max-content` column
+   independently of the other. "Quality Level" is wider than "Preset", so
+   with `max-content` the two grids' control columns landed at different X
+   even though every row otherwise uses this same class — exactly the
+   "should all align" bug the owner flagged. A fixed width both grids share
+   is immune to that: every row's control starts at the same X regardless of
+   which grid instance (or which label) it belongs to. Sized to fit
+   "Quality Level"/"Bitrate (kbps)", the longest labels in play. */
+.dest-edit-grid {
+  display: grid;
+  grid-template-columns: 96px minmax(100px, 1fr) auto;
+  align-items: center;
+  gap: 8px 10px;
+  padding-top: 10px;
+  margin-top: 2px;
+  border-top: 1px solid var(--divider);
+}
+
+.dest-edit-row {
+  display: contents;
+}
+
+/* Nested inside `.dest-advanced-body`, which already draws its own top
+   divider/spacing to separate it from the "Advanced tuning" summary —
+   suppress this grid's own (redundant) top border/padding in that
+   context. */
+.dest-edit-grid-nested {
+  padding-top: 0;
+  margin-top: 0;
+  border-top: none;
+}
+
+.dest-edit-label {
+  margin: 0;
+  white-space: nowrap;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  color: var(--text-faint);
+}
+
+/* The three pillSwitch rows have no value cell — stop their control
+   stretching across it, so every switch is left-aligned in column 2. */
+.dest-edit-row .mode-toggle {
+  justify-self: start;
+}
+
+/* Tune / Quality Level / Rate Control: fix the *track* width so all three
+   rows measure identical, and make each row's own segments split that
+   track evenly (`flex: 1 1 0` on the buttons) instead of sizing to their
+   own text. Same scoped-modifier pattern as shell.css's `.add-room-tabs`
+   (the Join/Create tab pair) — a class on this particular `pillSwitch`
+   instance, not a change to `.mode-toggle`/`.mode-toggle-btn` themselves,
+   which the bandwidth-mode toggle, language switch, and encoder preset
+   picker still rely on sizing to content.
+   `Why a fixed px, not width: 100%`: unlike `.add-room-tabs`, these rows
+   are `justify-self: start` in their grid cell, not meant to stretch across
+   it — unrelated content (Room/Preset/Framerate/Bitrate rows) can be much
+   wider. A shared fixed total also means Tune (2 options) reads as "same
+   *track* width" as Quality Level/Rate Control (3 options) even though its
+   two segments are individually wider than their three — that's the
+   intended reading of "all the triple selections have the same width": one
+   consistent block, not three independently-sized tracks.
+   `Why 342px`: fits "Performance"/"Low Latency", the longest labels in
+   play, at 700-weight (the active-segment weight) with comfortable padding
+   in the tightest case (3 segments), confirmed by real-app
+   `getBoundingClientRect()` measurement — see stream-control.md. */
+.dest-tuning-toggle {
+  width: 342px;
+}
+
+.dest-tuning-toggle .mode-toggle-btn {
+  flex: 1 1 0;
+  text-align: center;
+}
+
+/* The Framerate picker reuses `.dest-room-select`'s look (see that rule
+   further down) so every dropdown on a destination card reads as one
+   control family. All it needs on top of that is to stop the grid
+   stretching it across the whole control column — the same
+   `justify-self: start` the pillSwitch rows get above, for the same
+   reason. */
+.dest-framerate-select {
+  justify-self: start;
+}
+
+.dest-bitrate-slider {
+  width: 100%;
+  min-width: 0;
+}
+
+.dest-bitrate-value {
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-weight: 400; /* mono has no real bold vendored — 700 would still synthesize */
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  min-width: 72px;
+  text-align: right;
+}
+
+
+.dest-edit-error {
+  color: var(--danger);
+  font-size: 11px;
+}
+
+/* Advanced tuning disclosure — collapses the three testing-oriented
+   Tune/Quality Level/Rate Control switches (see `components.js`'s
+   `destinationCard`) behind a native `<details>`, so the simple preset +
+   bitrate controls above stay the only thing a regular user sees by
+   default. One `<details>` per destination card, so each card's
+   open/closed state is independent (native browser behavior — no JS). */
+.dest-advanced {
+  margin-top: 2px;
+}
+
+.dest-advanced-summary {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-faint);
+  cursor: pointer;
+  user-select: none;
+  list-style: none; /* hide the default marker triangle, replaced below */
+  width: fit-content;
+}
+
+.dest-advanced-summary::-webkit-details-marker {
+  display: none;
+}
+
+/* Chevron affordance — a plain CSS border-triangle (rotated 90deg when
+   `[open]`), not a Material Symbols glyph: `components.js`'s `el()`/`icon()`
+   helpers build a `<span>` icon, which can't live inside a `<summary>`'s
+   flow the way this small triangle can with zero extra DOM nodes. */
+.dest-advanced-summary::before {
+  content: "";
+  width: 0;
+  height: 0;
+  border-style: solid;
+  border-width: 3.5px 0 3.5px 5px;
+  border-color: transparent transparent transparent var(--text-faint);
+  transition: transform 0.12s ease;
+  flex: 0 0 auto;
+}
+
+.dest-advanced[open] > .dest-advanced-summary::before {
+  transform: rotate(90deg);
+}
+
+.dest-advanced-summary:hover {
+  color: var(--text-dim);
+}
+
+.dest-advanced-summary:hover::before {
+  border-left-color: var(--text-dim);
+}
+
+.dest-advanced-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-light);
+}
+
+.dest-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-top: 2px;
+}
+
+/* Was 3px 8px / 11px, distinct from (and smaller than) the staged card's
+   Go-live/Cancel — the idea being Transfer/Stop on a live card were
+   "routine" small buttons vs. staged's one deliberate confirming action.
+   2026-07-29: owner asked for live cards' Stop (and by the same class,
+   Transfer) to grow too — screenshot showed them still too small next to
+   everything else. Since `.dest-action-btn` is used at exactly these 4
+   call sites (staged Go-live/Cancel, live Transfer/Stop — see
+   `dest-action-btn` grep in components.js) and the owner now wants ALL of
+   them at the same size, there's no live-only "routine small" tier left to
+   preserve — bumped the base rule itself to the size that used to be the
+   `.dest-actions-staged` modifier and dropped that now-redundant modifier
+   rule rather than adding a parallel `-live` one. */
+.dest-action-btn {
+  padding: 6px 22px;
+  height: auto;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+/* `padding` bumped from the original `3px 4px` (which rendered at ~23px —
+   visibly shorter than the app's standard 32px `.btn` height right next to
+   it, e.g. "Go live"/"Cancel" on the same staged card) up to match: real
+   Electron measurement, see `superdoc/ui/FRONTEND-SHELL.md`'s 2026-07-29
+   "dropdowns were shorter than buttons" entry. */
+.dest-room-select {
+  background: var(--field);
+  border: 1px solid var(--border);
+  border-radius: var(--rounding-sm);
+  color: var(--text);
+  font-size: 11px;
+  padding: 8px 8px;
+  max-width: 110px;
+}
+
+/* `Why there is no "Start a stream" form styling here any more:` that
+   standalone card (Room/Preset/Framerate/Bitrate + a "Share Screen" button)
+   was replaced outright by the staged-card "Go live" flow — see
+   `components.js`'s `destinationCard`'s `opts.staged` and
+   `superdoc/features/stream-control.md`'s 2026-07-28 note. A staged card
+   reuses `.dest-card`/`.dest-edit-grid`/etc., not a form of its own. */
+
+/* -------------------------------------------------------------------
+ * Ghost rows — dashed-border entry points at the end of the Active Shares
+ * list. "Share another screen" starts a real staged capture right away (the
+ * "Go live" flow, see above) — no duplicated start logic; "Share audio"
+ * expands in place into the same `startAudioShare()` flow the room-scoped
+ * SHARE AUDIO card below already exposes — a second entry point onto it, not
+ * a second copy of it.
+ * ----------------------------------------------------------------- */
+
+.sc-ghost-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+/* "Share another screen" is the prototype's headline invitation on this
+   tab: a full-width 48px dashed-accent row with a faint accent wash and an
+   accent label. It was a grey dashed outline with grey text — visually a
+   disabled placeholder rather than the main call to action. */
+.sc-ghost-row {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-height: 48px;
+  padding: 0 13px;
+  border: 1px dashed var(--accent-ghost-border);
+  border-radius: var(--rounding-well);
+  background: var(--accent-ghost-bg);
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 700; /* real face, not synthesized 600 — matches .ghost-add-room-row */
+  cursor: pointer;
+  transition: background-color 120ms ease;
+}
+
+.sc-ghost-row:hover {
+  border-color: var(--accent);
+  background: var(--accent-ghost-bg-hover);
+  color: var(--accent);
+}
+
+/* Secondary ghost ("Share audio") stays muted — the prototype gives it a
+   plain surface, so the two entry points aren't equally loud. */
+.sc-ghost-row-icon {
+  font-size: 16px;
+  flex: 0 0 auto;
+}
+
+.sc-ghost-row-icon-accent {
+  color: var(--accent);
+}
+
+/* -------------------------------------------------------------------
+ * Attached audio row — the last line of a screen share's card, under a
+ * hairline rule. Audio is a property of the share, not a stream of its
+ * own, so it gets one row inside the card rather than a card (or a
+ * separate SHARE AUDIO panel) of its own.
+ *
+ *   [VU meter] [application name] ......... [Mute/Unmute] [Stop]
+ *
+ * Palette is all `tokens.css` roles — `--divider` for the rule,
+ * `--success` + `--success-glow` for a live meter bar (the same "lit, not
+ * printed" treatment the LIVE badge's dot uses), `--text-faint` for an
+ * unlit one.
+ * ----------------------------------------------------------------- */
+
+.dest-divider {
+  height: 1px;
+  background: var(--divider);
+  margin: 8px 0 7px;
+}
+
+.dest-audio-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 24px;
+}
+
+/* Meter: fixed-width so the name column never shifts as bars light up.
+   Bars are bottom-aligned and grow upward, VU-style. */
+.dest-audio-meter {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  width: 26px;
+  height: 14px;
+  flex: 0 0 auto;
+}
+
+.dest-audio-meter-bar {
+  flex: 1 1 auto;
+  height: 20%;
+  min-height: 2px;
+  border-radius: 1px;
+  background: var(--text-faint);
+  opacity: 0.45;
+  transition: height 90ms linear, opacity 90ms linear, background-color 90ms linear;
+}
+
+/* `--success-glow`'s blur radius (6px) is fine on the round, few-pixel LIVE
+   dot it was designed for, but each meter bar is only ~3.6px wide — the same
+   blur bleeds sideways past the bar's actual edges and makes a lit bar read
+   as visibly fatter than an unlit one, even though the underlying box width
+   never changes (confirmed via getBoundingClientRect during the fix for this
+   bug — see stream-control.js's `paintAudioMeter`, which only ever sets
+   `height`). Scoped-down glow here, not a change to the shared token, so
+   other `--success-glow` users (LIVE badge dot, etc.) are unaffected. */
+.dest-audio-meter-bar.dest-audio-meter-bar-lit {
+  background: var(--success);
+  opacity: 1;
+  box-shadow: 0 0 1px rgba(80, 200, 120, 0.8);
+}
+
+/* Muted: the meter is deliberately flat and grey (the capture pipeline's
+   `volume` element sits before its `level` element, so a muted share
+   genuinely reports zero — see `audio::build_pipeline`). */
+.dest-audio-meter-muted .dest-audio-meter-bar {
+  background: var(--text-faint);
+  opacity: 0.3;
+  box-shadow: none;
+}
+
+/* Fixed width, sized for the longer of "Mute"/"Unmute", so toggling the
+   label never reflows the row (the Stop button beside it would otherwise
+   slide sideways on every click).
+   `2026-07-29: bumped to the app's standard 32px .btn height` — these were
+   still the original small `3px 0` / `11px` routine-button sizing while
+   every other button on this tab (`.dest-action-btn`, `.dest-audio-share-btn`,
+   `.dest-audio-add-btn-lg`) had already grown to 32px this session. The
+   owner's screenshot showed Mute/Stop visibly short next to "Floorp" — this
+   is that fix. Same recipe as `.dest-action-btn`/`.dest-audio-share-btn`
+   (`padding` vertical 6px, `font-size` 14px, relying on `.btn`'s base
+   `font-weight: 700`), confirmed 32px by real Electron
+   `getBoundingClientRect()` measurement with a real Floorp audio source
+   attached, not assumed from the padding numbers alone (see
+   `superdoc/features/stream-control.md`'s 2026-07-29 entry). `width` bumped
+   76px (from 64px) so "Unmute" still fits at the larger 14px/700 size
+   without wrapping. */
+.dest-audio-mute {
+  flex: 0 0 auto;
+  width: 76px;
+  padding: 6px 0;
+  height: auto;
+  font-size: 14px;
+  text-align: center;
+}
+
+.dest-audio-mute-on {
+  color: var(--warning);
+  border-color: var(--warning);
+}
+
+.dest-audio-stop {
+  flex: 0 0 auto;
+  padding: 6px 22px;
+  height: auto;
+  font-size: 14px;
+}
+
+/* No audio attached yet. */
+.dest-audio-empty-icon {
+  font-size: 15px;
+  color: var(--text-faint);
+  flex: 0 0 auto;
+}
+
+.dest-audio-empty-text {
+  flex: 1 1 auto;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.dest-audio-add-btn {
+  flex: 0 0 auto;
+}
+
+/* "+ Add audio" sits next to (well, above — it's the card's only other row)
+   "Go live"/"Cancel" on a staged card, or the Mute/Stop row on a live card —
+   either way it reads as a deliberate affordance, not a routine small
+   button, so it gets the app's standard 32px (`.dest-action-btn` above)
+   rather than the small `.dest-chip-add-btn` sizing. Padding chosen to land
+   on 32px measured live (`getBoundingClientRect` height), not assumed from
+   the numbers alone — font-size changes line-height in ways padding math
+   alone doesn't predict (see this session's `.dest-action-btn` note above,
+   learned the same way).
+   2026-07-29: this class used to be staged-only (name and all) — the owner
+   flagged via screenshot that the live button visibly shrank the instant a
+   card went live, because `addAudioRow` only added it when `opts.staged`.
+   Same fix `.dest-audio-share-btn` already got above: apply unconditionally
+   on both staged and live cards, and rename off `-staged` since it no
+   longer is. */
+.dest-audio-add-btn-lg {
+  padding: 6px 14px 6px 12px;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+/* Staged card's non-interactive stand-in (`addAudioUnavailableRow` in
+   components.js) — a staged capture has zero destinations, so starting
+   audio against it would announce an orphan stream (see that function's doc
+   comment). Rendered as a `<span>`, not a `<button>`, so there is nothing to
+   click; the faded opacity/cursor/pointer-events below is what tells the
+   user this is temporarily out of reach, not permanently gone — as of
+   2026-07-29 there's no extra "(available once you Go Live)" copy doing
+   that job too, per the owner. */
+.dest-audio-add-btn-disabled {
+  cursor: default;
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.dest-audio-picker {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.dest-audio-picker[hidden] {
+  display: none;
+}
+
+/* `min-width` added 2026-07-29 — with only a `max-width` cap and no floor,
+   this shrank to fit whatever short/empty label happened to be selected
+   (e.g. before any real audio source is picked), collapsing to barely more
+   than the dropdown chevron. Bumped further the same day to guarantee room
+   for a real 40-character source name without ellipsis-truncating: measured
+   (real Chromium canvas `measureText`, this element's actual font/size,
+   worst-case all-caps "AAAA…" — the widest realistic glyph run) at 294px for
+   40 characters, plus this trigger's own chrome — 16px padding (`.dest-
+   room-select`'s `padding: 8px 8px` wins the cascade over `dropdown.css`'s
+   own `.dd-trigger` padding), 6px label-to-chevron gap, 15px chevron —
+   rounds up to 331px. `max-width` raised well above that so it still
+   actually bounds something (a name much longer than 40 chars), not a
+   contradiction with the new floor. */
+.dest-audio-select {
+  min-width: 331px;
+  max-width: 420px;
+}
+
+/* In the attached row, the picker sits inline on the single meter/picker/
+   Mute/Stop line — doubling as the name display, replacing the old raw
+   `.dest-audio-name` text + separate "Switch" button (2026-07-29, instant
+   switch-on-select). The shared `.dest-audio-select` sizing above (a
+   generous fixed min/max-width) was tuned for the not-yet-attached picker's
+   own standalone inline-flex context; here it shares the line with two
+   32px buttons, so both the outer `.dd` (the flex item `dropdown()`
+   actually returns — `.dest-audio-select`/`.dest-room-select` land on the
+   inner `.dd-trigger` button, not on it, so it needs its own rule) and the
+   trigger itself flex to fill whatever space is left, and `.dd-trigger-
+   label`'s existing ellipsis handles a long name. */
+.dest-audio-row-attached > .dd {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.dest-audio-row-attached .dest-audio-select {
+  width: 100%;
+  min-width: 0;
+  max-width: none;
+}
+
+/* Was 3px 8px / 11px, with a bigger `-staged` modifier layered on for staged
+   cards (see `.dest-action-btn`'s note above for the parallel history).
+   2026-07-29: owner asked for live cards' "Share" (audio picker confirm) to
+   grow to match Stop, which just got the same treatment — this class is
+   only ever used for the Share button (staged and live both), so, same
+   reasoning as `.dest-action-btn`, the base rule absorbs the old modifier's
+   size and the modifier is dropped as redundant. */
+.dest-audio-share-btn {
+  padding: 6px 22px;
+  height: auto;
+  font-size: 14px;
+  font-weight: 700;
+}

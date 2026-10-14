@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Simple Screensharing</title>
+  <link rel="icon" href="assets/icons/mark-32.png" />
+  <link rel="stylesheet" href="styles/tokens.css" />
+  <link rel="stylesheet" href="styles/fonts.css" />
+  <link rel="stylesheet" href="styles/dropdown.css" />
+  <link rel="stylesheet" href="styles/status.css" />
+  <link rel="stylesheet" href="styles/shell.css" />
+  <link rel="stylesheet" href="styles/stream-control.css" />
+  <link rel="stylesheet" href="styles/view.css" />
+  <link rel="stylesheet" href="styles/settings.css" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <div class="app-brand">
+          <span class="app-icon" aria-hidden="true"><img src="assets/icons/mark-256.png" alt="" width="45" height="45" /></span>
+          <h1>Simple Screensharing</h1>
+        </div>
+      </div>
+
+      <nav class="nav" id="nav" aria-label="Primary"></nav>
+
+      <section class="rooms-section" aria-label="Rooms">
+        <div class="rooms-section-head">
+          <h2 class="section-label rooms-section-label">Rooms</h2>
+          <span class="rooms-count" id="rooms-count"></span>
+        </div>
+        <div class="rooms-list" id="rooms-list"></div>
+      </section>
+
+      <div class="add-room-wrap">
+        <button class="ghost-add-room-row" id="add-room-btn" type="button">
+          <span class="material-symbols-outlined ghost-add-room-icon">add</span>
+          <span>Create/Join a Room</span>
+        </button>
+        <div class="add-room-card" id="add-room-card" hidden></div>
+      </div>
+
+      <section class="streams-section" aria-label="Outgoing">
+        <h2 class="section-label">Outgoing</h2>
+        <div class="streams-list" id="streams-list"></div>
+        <!-- Dev-only: lets the empty/populated STREAMS states both be
+             reviewed without hand-editing mock data. Not a real feature. -->
+        <button class="streams-demo-toggle" id="streams-demo-toggle" type="button">
+          dev: toggle streams demo state
+        </button>
+      </section>
+    </aside>
+
+    <main class="content">
+      <section class="tab-panel" data-tab="Stream Control">
+        <h2>Stream Control</h2>
+        <div id="stream-control-root"></div>
+      </section>
+
+      <section class="tab-panel" data-tab="View" hidden>
+        <h2>View</h2>
+        <div id="view-root"></div>
+      </section>
+
+      <section class="tab-panel" data-tab="Settings" hidden>
+        <h2>Settings</h2>
+        <div id="settings-root"></div>
+      </section>
+
+      <!-- Room-detail slide-over (design handoff option 1f) — an
+           `inset: 0` scrim + panel absolutely positioned INSIDE `.content`
+           (not a `.modal-overlay`/fixed dialog), so it slides in from the
+           content area's left edge rather than centering over the whole
+           window. See shell.js's `openRoomPanel`/`renderRoomPanel`. -->
+      <div class="room-panel-scrim" id="room-panel-scrim" hidden>
+        <aside class="room-panel" id="room-panel" role="dialog" aria-label="Room details"></aside>
+      </div>
+    </main>
+  </div>
+
+  <div class="modal-overlay" id="modal-overlay" hidden></div>
+
+  <script src="scripts/components.js"></script>
+  <script src="scripts/shell.js"></script>
+  <script src="scripts/stream-control.js"></script>
+  <script src="scripts/tile-video.js"></script>
+  <script src="scripts/view.js"></script>
+  <script src="scripts/settings.js"></script>
+</body>
+</html>

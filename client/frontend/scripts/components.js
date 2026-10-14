@@ -1,0 +1,2102 @@
+// components.js — shared UI primitives for the frontend shell.
+//
+// These are the vanilla-JS equivalent of `theme.rs`'s widget-helper family
+// (`primary_button`, `secondary_button`, `danger_button`, `icon_button`,
+// `nav_button`, `status_dot`, `card`, ...): small factory functions that
+// return a DOM element, styled from `tokens.css` custom properties only
+// (never a hard-coded color/size inline), so later workers building the
+// Stream Control / View / Settings tab content can reuse them instead of
+// hand-rolling their own button/card/dot markup.
+//
+// Every function here is pure with respect to the DOM: it builds and
+// returns an element, wiring only the event listeners it's explicitly given
+// (an `onClick` callback, etc.) — none of them mutate global state or reach
+// into `shell.js`'s mock data directly. That keeps them reusable from any
+// tab's own script without a circular dependency on shell.js.
+//
+// Exposed on `window.Components` (no bundler / module system in this repo,
+// per the frontend's "plain static HTML/CSS/JS" scope) so any script that
+// loads after this one can call e.g. `Components.renderRoomRow(...)`.
+
+(function () {
+  "use strict";
+
+  /** Small helper: create an element, assign props/attrs, append children. */
+  function el(tag, opts, children) {
+    const node = document.createElement(tag);
+    opts = opts || {};
+    if (opts.className) node.className = opts.className;
+    if (opts.text !== undefined) node.textContent = opts.text;
+    if (opts.html !== undefined) node.innerHTML = opts.html;
+    if (opts.attrs) {
+      for (const [k, v] of Object.entries(opts.attrs)) node.setAttribute(k, v);
+    }
+    if (opts.onClick) node.addEventListener("click", opts.onClick);
+    (children || []).forEach((c) => c && node.appendChild(c));
+    return node;
+  }
+
+  /**
+   * Wire a `wheel`-scroll listener onto a `<input type="range">` so hovering
+   * it and scrolling steps the value up/down by exactly the slider's own
+   * `step` (matching the granularity a manual drag/arrow-key already uses),
+   * instead of doing nothing (native range inputs ignore wheel scroll in
+   * Chromium/Electron) or letting the page/container scroll underneath it.
+   *
+   * `Why: scroll-up = increase` — matches the typical OS volume/spinner
+   * convention (macOS/Windows volume sliders, most native spinbuttons):
+   * scrolling "up" (negative `deltaY`) raises the value, "down" lowers it.
+   *
+   * Dispatches both `input` (for any live-preview readout wired on
+   * `input`) and `change` (for whatever handler actually applies/persists
+   * the value) so a wheel tick behaves like a real drag-then-release, not
+   * just one half of it.
+   */
+  function attachWheelStep(sliderEl) {
+    sliderEl.addEventListener(
+      "wheel",
+      (event) => {
+        event.preventDefault();
+        const stepAttr = sliderEl.step;
+        const step = stepAttr && stepAttr !== "any" && Number(stepAttr) ? Number(stepAttr) : 1;
+        const min = sliderEl.min !== "" ? Number(sliderEl.min) : -Infinity;
+        const max = sliderEl.max !== "" ? Number(sliderEl.max) : Infinity;
+        const delta = event.deltaY < 0 ? step : -step;
+        const next = Math.min(max, Math.max(min, Number(sliderEl.value) + delta));
+        sliderEl.value = String(next);
+        sliderEl.dispatchEvent(new Event("input", { bubbles: true }));
+        sliderEl.dispatchEvent(new Event("change", { bubbles: true }));
+      },
+      { passive: false }
+    );
+  }
+
+  /** A single Material Symbols glyph, e.g. icon("expand_more"). */
+  function icon(name, extraClass) {
+    return el("span", {
+      className: "material-symbols-outlined" + (extraClass ? " " + extraClass : ""),
+      text: name,
+    });
+  }
+
+  // -------------------------------------------------------------------
+  // Buttons — mirrors theme.rs's four button variants.
+  // -------------------------------------------------------------------
+
+  /** Solid accent fill — the one primary action on a screen. */
+  function primaryButton(label, onClick, opts) {
+    opts = opts || {};
+    return el("button", {
+      className: "btn btn-primary" + (opts.className ? " " + opts.className : ""),
+      text: label,
+      onClick,
+      attrs: opts.disabled ? { disabled: "disabled" } : {},
+    });
+  }
+
+  /** Neutral fill + border — the default for everything else. */
+  function secondaryButton(label, onClick, opts) {
+    opts = opts || {};
+    return el("button", {
+      className: "btn btn-secondary" + (opts.className ? " " + opts.className : ""),
+      text: label,
+      onClick,
+      attrs: opts.disabled ? { disabled: "disabled" } : {},
+    });
+  }
+
+  /** Transparent fill, danger-colored text/border — destructive actions. */
+  function dangerButton(label, onClick, opts) {
+    opts = opts || {};
+    return el("button", {
+      className: "btn btn-danger" + (opts.className ? " " + opts.className : ""),
+      text: label,
+      onClick,
+      attrs: opts.disabled ? { disabled: "disabled" } : {},
+    });
+  }
+
+  /** Compact, chrome-free icon-only button for dense list rows. */
+  function iconButton(glyph, onClick, opts) {
+    opts = opts || {};
+    const btn = el("button", {
+      className: "btn btn-icon" + (opts.className ? " " + opts.className : ""),
+      onClick,
+      attrs: opts.title ? { title: opts.title, "aria-label": opts.title } : {},
+    });
+    btn.appendChild(icon(glyph));
+    return btn;
+  }
+
+  /**
+   * A chunky, full-width nav-rail pill — mirrors `theme::nav_button`.
+   * Accent-filled + dark text when active, transparent (hover-only lift)
+   * otherwise.
+   */
+  function renderNavButton(label, active, onClick) {
+    return el("button", {
+      className: "nav-btn" + (active ? " nav-btn-active" : ""),
+      text: label,
+      onClick,
+      attrs: { "data-tab": label },
+    });
+  }
+
+  // -------------------------------------------------------------------
+  // Status dot — mirrors `theme::status_dot`.
+  // -------------------------------------------------------------------
+
+  /**
+   * Three states, matching APP-SHELL.md's room-row table:
+   *  - "joined"       -> solid filled SUCCESS dot
+   *  - "reconnecting" -> pulsing WARNING dot (CSS animation)
+   *  - "disconnected" -> hollow TEXT_FAINT ring
+   */
+  function statusDot(state) {
+    return el("span", { className: "status-dot status-dot-" + state });
+  }
+
+  // -------------------------------------------------------------------
+  // Status vocabulary — four families (progress/live/degraded/failed),
+  // matching `capture::DestinationState`'s real variants (see
+  // `src/capture.rs`: `Starting`/`Live`/`Rebuilding`/`Stalled`/`Failed`).
+  // Visual rules live in `status.css`'s `.status-badge*`/`.status-failed-*`
+  // classes; this is just the DOM-building side, one function callers reach
+  // for instead of hand-rolling a pill per file.
+  //
+  // `degraded` is the one family with a live-updating part: it always shows
+  // an elapsed-seconds count next to the label (e.g. "WAITING FOR CAPTURE ·
+  // 4s"). No DTO carries a "since" timestamp for `Stalled` today (out of
+  // this pass's frontend-only scope to add one) — callers that want the
+  // counter to be accurate pass `options.since` (a client-side `Date.now()`
+  // recorded the first time they observed this state, e.g.
+  // `stream-control.js`'s `destStalledSince` map). The badge owns its own
+  // `setInterval` (mirrors `tile-video.js`'s fps-interval pattern) and
+  // stops itself once its node leaves the DOM — checked on each tick via
+  // `isConnected` rather than requiring every caller to remember to call a
+  // `.destroy()`, since this codebase's render paths don't have a uniform
+  // unmount hook to call one from.
+  // -------------------------------------------------------------------
+
+  /**
+   * @param {'progress'|'live'|'degraded'|'failed'} family
+   * @param {string} label - short, stable, e.g. "STARTING" / "LIVE" /
+   *   "WAITING FOR CAPTURE" / "Share failed". Failed's `label` is a full
+   *   plain-language headline, not a state keyword.
+   * @param {object} [options] - degraded: { since: number (ms epoch) }.
+   *   failed: { errorText, onRetry, onDismiss }.
+   */
+  function statusBadge(family, label, options) {
+    options = options || {};
+
+    if (family === "failed") {
+      const box = el("div", { className: "status-failed-box" });
+      const head = el("div", { className: "status-failed-head" });
+      head.appendChild(icon("error", "status-failed-icon"));
+      head.appendChild(el("span", { className: "status-failed-headline", text: label }));
+      box.appendChild(head);
+      box.appendChild(
+        el("div", {
+          className: "status-failed-sub",
+          text: options.errorText || "No further error detail is available for this destination.",
+        })
+      );
+      const actions = el("div", { className: "status-failed-actions" });
+      actions.appendChild(secondaryButton("Dismiss", () => options.onDismiss && options.onDismiss(), { className: "status-failed-dismiss" }));
+      actions.appendChild(primaryButton("Retry", () => options.onRetry && options.onRetry(), { className: "status-failed-retry" }));
+      box.appendChild(actions);
+      return box;
+    }
+
+    const badge = el("span", { className: "status-badge status-badge-" + family });
+    if (family === "progress") {
+      badge.appendChild(el("span", { className: "status-badge-bar" }));
+    } else if (family === "live") {
+      badge.appendChild(el("span", { className: "status-badge-dot" }));
+    } else if (family === "degraded") {
+      badge.appendChild(icon("warning", "status-badge-icon"));
+    }
+    const text = el("span", { className: "status-badge-label", text: label });
+    badge.appendChild(text);
+
+    if (family === "degraded" && options.since) {
+      let intervalId = null;
+      const tick = () => {
+        if (!badge.isConnected) {
+          clearInterval(intervalId);
+          return;
+        }
+        const elapsedS = Math.max(0, Math.round((Date.now() - options.since) / 1000));
+        text.textContent = `${label} · ${elapsedS}s`;
+      };
+      tick();
+      intervalId = setInterval(tick, 1000);
+    }
+
+    return badge;
+  }
+
+  /** Shared hatch fill with `.status-badge-degraded` (same CSS rule, see
+   * status.css) — used by the leave-room confirm dialog's warning banners.
+   * Not one of the 4 status families itself (it's a page-level warning
+   * banner, not a state pill), just visually related enough to reuse the
+   * same amber-hatch treatment rather than inventing a second one. */
+  function hatchedBanner(text) {
+    return el("div", { className: "hatched-banner" }, [icon("warning", "hatched-banner-icon"), el("span", { className: "hatched-banner-text", text })]);
+  }
+
+  /** Lighter, no-badge empty-row for in-context "this list is empty" rows
+   * (a room's member list, ...) — icon + text only, no big gradient badge.
+   * See `renderEmptyState` below for the whole-panel version. */
+  function emptyRow(glyph, text) {
+    return el("div", { className: "empty-row" }, [icon(glyph, "empty-row-icon"), el("span", { text })]);
+  }
+
+  // -------------------------------------------------------------------
+  // Room row — the sidebar ROOMS section's per-room row + expanded member
+  // list, per APP-SHELL.md's three-state table.
+  // -------------------------------------------------------------------
+
+  /**
+   * @param {object} room - a `SavedRoomRow` DTO shape { name, join_string, state:
+   *   'joined'|'disconnected'|'reconnecting', room_handle, active_stream_count },
+   *   plus two frontend-only arrays populated together via `room_detail` (no
+   *   single DTO inlines any of this — see `loadRoomMembers`, shell.js):
+   *   `members`: [{conn_id, display_name, owner, stream_id, resolution,
+   *   watching}], and `streams`: every announced stream in the room
+   *   ([{owner, stream_id, kind, ...}]) — used here only to test "does this
+   *   member's `conn_id` own an entry" for the `[LIVE]` badge.
+   * @param {object} handlers - { onOpenRoom, onReconnect, onLeave, onJoinedRowClick }
+   *
+   * Per the sidebar-redesign handoff (option 1c): every state renders through
+   * ONE fixed row skeleton — `[dot][caret][name][meta, right-
+   * aligned][action]` — rather than each state inventing its own layout. Only
+   * the *content* of the caret/meta/action slots changes per state; the slots
+   * themselves are always present (even empty, as a spacer) so columns stay
+   * aligned down the whole ROOMS list regardless of which states are mixed
+   * in. This replaces the previous two-line "disconnected" layout (Reconnect
+   * pill + forget button on a sub-line) — that variance existed only because
+   * the old design put a *labeled* Reconnect button next to a
+   * possibly-long auto-generated name; the redesign folded that into the
+   * row-wide click (see the 2026-07-29 note below).
+   *
+   * `Why:` (room-detail-slide-over pass, option 1f) a joined row no longer
+   * expands inline on click to show its member list — right-clicking a
+   * row's head (or left-clicking its caret specifically) calls
+   * `handlers.onOpenRoom` to open the room-detail slide-over panel instead
+   * (see shell.js's `openRoomPanel`/`renderRoomPanel`), which owns rename,
+   * audio-share and leave actions. The row's own leave/forget icon-button in
+   * the action slot stays as a fast path that does NOT open the panel first
+   * (its own click handler stops propagation) — a user who already knows
+   * they want to leave shouldn't be forced through the panel to do it.
+   *
+   * `Why:` (2026-07-29, full click-semantics overhaul, owner request) plain
+   * left-click no longer opens the settings panel at all — it's now
+   * state-dependent and always the most likely "I want to use this room"
+   * action: disconnected → reconnect (`onReconnect`, same path the old
+   * caret-only reconnect button used — that button is gone now, folded into
+   * the row-wide click since a second, narrower hit-area doing the exact
+   * same thing was redundant once the whole row did it); joined →
+   * `onJoinedRowClick`, which shell.js wires to jump to the View tab,
+   * filtered to this room's streams unless it's the only room currently
+   * joined (see shell.js's `jumpToViewForRoom`). Settings moved to
+   * right-click (`contextmenu`, `preventDefault`ed so the native menu never
+   * shows) for every state, and middle-click (`auxclick`, button 1) now
+   * disconnects a joined room via the same confirm-gated `onLeave` path the
+   * panel's own Disconnect button uses — no bypass of that confirm dialog,
+   * since middle-click is an easy accidental trigger (scroll-wheel click)
+   * that arguably deserves *more* guardrail, not less. A `title` on the row
+   * spells out the three bindings for discoverability.
+   *
+   * `Why:` (2026-07-28, room-row redesign) the row click now opens the
+   * panel for EVERY state, not just `joined` — a disconnected/reconnecting
+   * row used to be a dead click outside its caret/action icons, which read
+   * as broken next to the joined rows' full-row affordance. `openRoomPanel`
+   * (shell.js) degrades its content per state (no live roster to show
+   * without a `room_handle`) rather than refusing to open. The
+   * disconnected row's reconnect action stays a fast path independent of
+   * the panel: its caret slot (see below) still stops propagation so
+   * clicking it reconnects without first opening/closing the panel.
+   *
+   * `Why:` (2026-07-28, member/LIVE tree pass) the row's meta slot used to
+   * show a `"{count} active"` summary; it's now always shown below the row
+   * itself, one line per current member, each carrying a `[LIVE]` pill if
+   * that member owns a stream in `room.streams` — the same per-stream
+   * roster `renderRoomPanelStreamRow` (shell.js) already reads for the
+   * panel's "Live streams" section, reused here rather than re-derived. See
+   * `superdoc/features/stream-control.md`'s 2026-07-28 note for the
+   * eager-roster-fetch tradeoff this required in `shell.js`'s
+   * `refreshRooms`.
+   */
+  function renderRoomRow(room, handlers) {
+    handlers = handlers || {};
+    const row = el("div", { className: "room-row room-row-" + room.state });
+
+    const head = el("div", { className: "room-row-head room-row-head-clickable" });
+
+    // Row-wide click semantics (2026-07-29 overhaul — replaces the earlier
+    // "every click opens the panel" behavior): left-click is state-dependent
+    // (connect if disconnected, jump-to-View-and-filter if joined),
+    // right-click always opens settings, middle-click disconnects a joined
+    // room. See `title` below for the on-hover summary, and this project's
+    // APP-SHELL.md ROOMS section for the full rationale.
+    head.addEventListener("click", () => {
+      if (room.state === "disconnected") {
+        handlers.onReconnect && handlers.onReconnect(room.join_string);
+      } else if (room.state === "joined") {
+        handlers.onJoinedRowClick && handlers.onJoinedRowClick(room);
+      }
+      // "reconnecting": nothing to do — mid-flight already.
+    });
+
+    // Right-click (any state) opens the settings/detail panel — the row's
+    // old plain-left-click behavior, just moved off left-click since that's
+    // now spoken for above. `preventDefault` suppresses the native OS/
+    // browser context menu (there's no custom menu here — this *is* the
+    // menu action).
+    head.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      handlers.onOpenRoom && handlers.onOpenRoom(room.join_string);
+    });
+
+    // Middle-click: disconnect a joined room via the same confirm-gated path
+    // the panel's own "Disconnect"/✕ button uses (`onLeave` -> `shell.js`'s
+    // `openLeaveConfirm`) — no bypass of the leave-confirm dialog; a
+    // middle-click is an easy accidental trigger (scroll-wheel click), so if
+    // anything it deserves *more* guardrail than a deliberate button click,
+    // not less. No-op for disconnected/reconnecting rows (nothing to
+    // disconnect). `auxclick` is the standard event for non-primary-button
+    // clicks (middle-click never fires a plain `click`); `mousedown` +
+    // `preventDefault` on the same button additionally suppresses X11's
+    // middle-click autoscroll/paste-primary-selection gesture, which would
+    // otherwise fire before `auxclick` does.
+    head.addEventListener("mousedown", (e) => {
+      if (e.button === 1) e.preventDefault();
+    });
+    head.addEventListener("auxclick", (e) => {
+      if (e.button !== 1) return;
+      e.preventDefault();
+      if (room.state === "joined") {
+        handlers.onLeave && handlers.onLeave(room.join_string);
+      }
+    });
+
+    head.title = "Left-click: connect/view · Right-click: settings · Middle-click: disconnect";
+
+    head.appendChild(statusDot(room.state));
+
+    // Caret slot: open the room-detail panel (joined) or an empty spacer
+    // (disconnected/reconnecting). The disconnected caret's old standalone
+    // "reconnect" button/icon (`onReconnect`, `restart_alt` glyph) is gone —
+    // the whole row now does that on left-click (see above), so a second,
+    // narrower hit-area doing the exact same thing was redundant scaffolding
+    // once the row-wide handler existed; keeping both would've meant two
+    // code paths for one action with no behavioral difference between them.
+    // Every remaining caret's own click still stops propagation so it
+    // doesn't double-fire the head's row-wide click handler above.
+    if (room.state === "joined") {
+      head.appendChild(
+        el("button", {
+          className: "room-caret",
+          onClick: (e) => {
+            e.stopPropagation();
+            handlers.onOpenRoom && handlers.onOpenRoom(room.join_string);
+          },
+          attrs: { "aria-label": "Room details", title: "Room details" },
+        }, [icon("chevron_right")])
+      );
+    } else {
+      head.appendChild(el("span", { className: "room-caret room-caret-spacer" }));
+    }
+
+    head.appendChild(el("span", { className: "room-name", text: room.name }));
+
+    // Meta slot: fixed-width spacer that keeps the action icon's column
+    // aligned across every row — never free-text state body (that would
+    // fight the name for width on this narrow sidebar). Joined rooms used
+    // to show a `"{count} active"` summary here; that's now the member/LIVE
+    // tree appended below the row instead (see this function's doc
+    // comment). Disconnected used to show a "not connected" string, and
+    // both states used to fall back to a literal "—" placeholder — both
+    // redundant with the row's own status dot and, per the design owner's
+    // feedback, visual clutter — so this renders empty now, purely for
+    // layout, not as a text placeholder.
+    head.appendChild(el("span", { className: "room-meta" }));
+
+    // Action slot: leave (joined), forget (disconnected), or empty (nothing
+    // to act on mid-reconnect). Always present so the column stays aligned.
+    // Both buttons stop propagation — this stays a fast path independent of
+    // the panel, not an implicit "open panel then leave" detour.
+    const actionSlot = el("span", { className: "room-action-slot" });
+    if (room.state === "joined") {
+      actionSlot.appendChild(
+        iconButton(
+          "close",
+          (e) => {
+            e.stopPropagation();
+            handlers.onLeave && handlers.onLeave(room.join_string);
+          },
+          { title: "Leave room", className: "room-row-action-btn" }
+        )
+      );
+    } else if (room.state === "disconnected") {
+      actionSlot.appendChild(
+        iconButton(
+          "delete",
+          (e) => {
+            e.stopPropagation();
+            handlers.onLeave && handlers.onLeave(room.join_string);
+          },
+          { title: "Forget room", className: "room-row-action-btn" }
+        )
+      );
+    }
+    head.appendChild(actionSlot);
+
+    row.appendChild(head);
+
+    // Member/LIVE tree — one indented row per current member of a joined
+    // room, LIVE-badged if that member owns a stream in `room.streams`
+    // (populated by `loadRoomMembers`, same source `renderRoomPanelStreamRow`
+    // reads for the panel's "Live streams" section — reused here, not
+    // re-derived). Disconnected/reconnecting rooms never have a live roster
+    // to show (`room.members` is only populated for joined rooms).
+    if (room.state === "joined" && (room.members || []).length > 0) {
+      const liveOwners = new Set((room.streams || []).map((s) => s.owner));
+      const tree = el("div", { className: "room-member-tree" });
+      room.members.forEach((m) => {
+        const memberRow = el("div", { className: "room-member-tree-row" });
+        memberRow.appendChild(el("span", { className: "room-member-tree-name", text: m.display_name }));
+        if (liveOwners.has(m.conn_id)) {
+          memberRow.appendChild(
+            el("span", { className: "room-member-live-badge" }, [
+              el("span", { className: "room-member-live-dot" }),
+              el("span", { text: "LIVE" }),
+            ])
+          );
+        }
+        tree.appendChild(memberRow);
+      });
+      row.appendChild(tree);
+    }
+
+    return row;
+  }
+
+  // -------------------------------------------------------------------
+  // Stream row — the sidebar STREAMS section's per-destination row.
+  // -------------------------------------------------------------------
+
+  /** Maps `capture::DestinationState`'s variants to the sidebar OUTGOING
+   * row's dot color + short meta label — same 4-family status vocabulary as
+   * `statusBadge`/`destinationCard` (status.css), just a plain dot instead of
+   * a pill (this row is dense enough that a full badge would crowd the
+   * bitrate/room-label columns). */
+  const OUTGOING_STATE_META = {
+    starting: { label: "STARTING", dotClass: "status-dot-progress" },
+    rebuilding: { label: "APPLYING", dotClass: "status-dot-progress" },
+    live: { label: null, dotClass: "status-dot-live" },
+    stalled: { label: "STALLED", dotClass: "status-dot-degraded" },
+    failed: { label: "FAILED", dotClass: "status-dot-failed" },
+  };
+
+  /**
+   * One row per active OUTGOING destination (the sidebar's cross-room
+   * "STREAMS"/"OUTGOING" section — see APP-SHELL.md's STREAMS section doc).
+   * Follows the same fixed row skeleton as `renderRoomRow`:
+   * `[dot][room/destination label][meta, right-aligned]`, plus a "Stop"
+   * button that's an absolutely-positioned hover/focus-reveal overlay (not
+   * a normal flex child) — it reserves no width at rest, so the label/meta
+   * get the row's full space until hover, matching view.css's
+   * `.media-tile-overlay` hover-reveal pattern.
+   *
+   * A video destination with a paired audio destination (see
+   * `shell.js`'s `renderStreams`, which does the pairing/grouping) is
+   * rendered as a single combined row: identical to a plain video row,
+   * except a `volume_up` glyph is appended at the end for the paired audio
+   * — same glyph/class an unpaired audio row uses for itself, just
+   * repositioned onto the combined row instead of getting a whole row of
+   * its own. "Stop" on a combined row still only stops the VIDEO
+   * destination (`handlers.onStop` is always called with the video row's
+   * `destination_id`) — the paired audio destination is independent
+   * backend-side and keeps flowing.
+   *
+   * @param {object} stream - a `DestinationRow` DTO shape { destination_id, kind:
+   *   'video'|'audio', state: 'starting'|'live'|'rebuilding'|'stalled'|'failed',
+   *   width, height, framerate, bitrate_kbps }, plus a frontend-only `room_label`
+   *   (looked up from the room's `SavedRoomRow.name` by `room_handle` —
+   *   `DestinationRow` itself only carries the numeric handle, not a display name).
+   *   For a combined row this is always the VIDEO row; see `handlers.audioRow`.
+   * @param {object} [handlers] - { onStop(destinationId), audioRow } —
+   *   `onStop` calls the same real `stop_destination` command
+   *   `stream-control.js`'s own Stop button uses (lighter-weight sidebar entry
+   *   point onto that one command, not a second copy of any stop logic);
+   *   `audioRow`, if present, is the paired audio `DestinationRow` folded
+   *   into this row — only its `volume_up` glyph is used, it never gets its
+   *   own Stop affordance here.
+   */
+  function renderStreamRow(stream, handlers) {
+    handlers = handlers || {};
+    const meta = OUTGOING_STATE_META[stream.state] || { label: null, dotClass: "status-dot-live" };
+
+    const row = el("div", { className: "stream-row" });
+    row.appendChild(el("span", { className: "status-dot " + meta.dotClass }));
+    row.appendChild(el("span", { className: "stream-label", text: stream.room_label }));
+    const metaText = meta.label || (stream.kind === "audio" ? "" : `${stream.width}×${stream.height} @ ${stream.framerate}fps`);
+    row.appendChild(el("span", { className: "stream-meta", text: metaText }));
+    if (stream.kind === "audio" || handlers.audioRow) row.appendChild(icon("volume_up", "stream-audio-glyph"));
+    const stopBtn = dangerButton("Stop", () => handlers.onStop && handlers.onStop(stream.destination_id), {
+      className: "stream-stop-overlay-btn",
+    });
+    stopBtn.prepend(icon("stop_circle"));
+    stopBtn.title = "Stop";
+    stopBtn.setAttribute("aria-label", "Stop");
+    row.appendChild(stopBtn);
+    return row;
+  }
+
+  /**
+   * Standardized whole-panel empty state: icon-in-a-badge + one bold
+   * headline + one sentence of body copy + one primary action. Used across
+   * every "there's nothing here" panel (no rooms yet, nobody sharing in a
+   * room, nobody on screen, no active shares) so they all read as the same
+   * visual language rather than each screen inventing its own.
+   *
+   * Backward-compatible with every existing 2/3-arg call site: without
+   * `opts.headline`, `message` itself becomes the (only) headline line, no
+   * separate body line — the simplest correct case for a caller that just
+   * has one short sentence to say.
+   *
+   * @param {string} message - body copy (or the headline, if `opts.headline`
+   *   is absent).
+   * @param {string|null} actionLabel
+   * @param {(() => void)|null} onAction
+   * @param {object} [opts] - { icon: glyph name, headline: string,
+   *   inline: Element (e.g. an inline join-room form), className }
+   */
+  function renderEmptyState(message, actionLabel, onAction, opts) {
+    opts = opts || {};
+    const wrap = el("div", { className: "empty-state" + (opts.className ? " " + opts.className : "") });
+    wrap.appendChild(el("div", { className: "empty-state-badge" }, [icon(opts.icon || "info", "empty-state-badge-icon")]));
+    wrap.appendChild(el("p", { className: "empty-state-headline", text: opts.headline || message }));
+    if (opts.headline) {
+      wrap.appendChild(el("p", { className: "empty-state-body", text: message }));
+    }
+    if (opts.inline) wrap.appendChild(opts.inline);
+    if (actionLabel) {
+      wrap.appendChild(primaryButton(actionLabel, onAction, { className: "empty-state-action" }));
+    }
+    return wrap;
+  }
+
+  // -------------------------------------------------------------------
+  // Card — a generic, equal-width section container. Added for the Stream
+  // Control / View / Settings tab content: `.tab-placeholder-card` (shell.css)
+  // was a one-off for the nav-switcher proof and capped itself at
+  // `--panel-max-width`, which is exactly the "content-sized card" shape the
+  // Stream Control redesign is fixing. `.card` has no width opinion of its
+  // own — the caller's grid/flex container decides equal-width sizing (see
+  // `stream-control.css`'s `.sc-grid`), so a card never reverts to shrinking
+  // to fit its content.
+  // -------------------------------------------------------------------
+
+  /**
+   * @param {string|null} label - section-label heading text, or null/'' for no heading.
+   * @param {Element[]} children
+   * @param {object} [opts] - { className }
+   */
+  function card(label, children, opts) {
+    opts = opts || {};
+    const c = el("div", { className: "card" + (opts.className ? " " + opts.className : "") });
+    if (label) c.appendChild(el("div", { className: "section-label card-label", text: label }));
+    (children || []).forEach((ch) => ch && c.appendChild(ch));
+    return c;
+  }
+
+  // -------------------------------------------------------------------
+  // Warning banner — mirrors `theme::warning_banner` (stream-control.md's
+  // bandwidth-overshoot banner: WARNING-stroked, tinted background).
+  // -------------------------------------------------------------------
+
+  function warningBanner(text) {
+    return el("div", { className: "warning-banner" }, [
+      icon("warning", "warning-banner-icon"),
+      el("span", { className: "warning-banner-text", text }),
+    ]);
+  }
+
+  // -------------------------------------------------------------------
+  // Dropdown — the custom-styled replacement for native `<select>`. A
+  // native select's open popup is platform/OS chrome CSS cannot reach
+  // (stark white, generic font, no dark theme, no "roll out" animation, and
+  // it looks different per OS/Chromium build) — this rebuilds the same
+  // trigger+popup shape entirely out of ordinary elements so it can be
+  // themed like every other control and animate open/closed. See
+  // superdoc/ui/STYLING-GUIDE.md (2026-07-28) for the full rationale.
+  // -------------------------------------------------------------------
+
+  /**
+   * @param {{value: *, label: string}[]} options - `value` may be any type;
+   *   matching against the current value (and the value handed back to
+   *   `onChange`) is done via `String(value)` equality so callers can use
+   *   numbers, strings, whatever their option's `value` already was — same
+   *   as a native `<select>`, callers that need a number back should
+   *   `Number(...)` it in `onChange`, same as they did with `select.value`.
+   * @param {*} value - the currently-selected option's `value`
+   * @param {(value: *) => void} onChange - fired only on a real user pick,
+   *   never for a programmatic `.value = ...` set (matches native `<select>`,
+   *   which doesn't fire `change` for scripted assignment either).
+   * @param {object} [opts] - { className: string (applied to the trigger
+   *   button, so existing sizing classes like `.dest-room-select` keep
+   *   their `max-width`/padding/etc.), placeholder: string, emptyText:
+   *   string (shown, disabled-looking, when `options` is empty), withMeter:
+   *   boolean (render a small live-level meter next to every option's
+   *   label — see [`AUDIO SOURCE PICKER LEVEL METERS`] below; painted via
+   *   `.setOptionLevel(value, fraction)`, not by this function itself),
+   *   onOpen: () => void, onClose: () => void (fired when the option list
+   *   opens/closes — this is what lets a caller scope work, like the
+   *   per-option level taps below, to exactly "the dropdown is on screen")
+   *   }
+   * @returns {HTMLElement} a `<div class="dd">` wrapper. Beyond being a
+   *   normal appendable/removable DOM node, it also exposes: a `.value`
+   *   getter/setter (get/set the selection without going through the UI,
+   *   like `select.value`), `.setOptions(newOptions)` (rebuild the option
+   *   list in place, e.g. for an async-refreshed source list),
+   *   `.setOptionLevel(value, fraction)` (paint one option's meter in place,
+   *   no rebuild — only meaningful when `opts.withMeter` is set), and
+   *   `.focus()` (delegates to the trigger button). The native `.hidden`
+   *   property/attribute works as-is since it's a plain element.
+   */
+  /** How many bars an `opts.withMeter` dropdown option's mini level meter
+   * draws. Fewer than `AUDIO_METER_BARS` (the attached-share meter, defined
+   * below) — an option row is a lot narrower than a destination card. */
+  const DD_OPTION_METER_BARS = 3;
+
+  /** Same lit/height curve as `stream-control.js`'s `paintAudioMeter` (see
+   * that function's doc comment for the "why" — this is the smaller,
+   * dropdown-option-row sibling of the same meter, kept in `components.js`
+   * rather than shared across the two files' separate IIFEs). */
+  function paintDdOptionMeter(meter, level) {
+    const clamped = Math.max(0, Math.min(1, Number(level) || 0));
+    const bars = meter.querySelectorAll(".dd-option-meter-bar");
+    bars.forEach((bar, i) => {
+      const threshold = i / bars.length;
+      const lit = clamped > threshold;
+      bar.classList.toggle("dd-option-meter-bar-lit", lit);
+      const fill = Math.max(0, Math.min(1, (clamped - threshold) * bars.length));
+      bar.style.height = Math.round(20 + fill * 80) + "%";
+    });
+  }
+
+  function dropdown(options, value, onChange, opts) {
+    opts = opts || {};
+    const root = el("div", { className: "dd" });
+    const trigger = el("button", {
+      className: "dd-trigger" + (opts.className ? " " + opts.className : ""),
+      attrs: { type: "button" },
+    });
+    const labelEl = el("span", { className: "dd-trigger-label" });
+    trigger.appendChild(labelEl);
+    trigger.appendChild(icon("expand_more", "dd-chevron"));
+    root.appendChild(trigger);
+
+    // The option list lives outside `root` in the DOM (appended to <body>
+    // only while open, removed again on close) rather than as a plain
+    // `position: absolute` child of `root`. Several call sites nest this
+    // control inside an `overflow: hidden` ancestor (`.dest-card`'s rounded
+    // corners, in particular) — an absolutely-positioned child would be
+    // silently clipped there. It's created once and reused across
+    // open/close so re-opening doesn't rebuild it from scratch.
+    const list = el("div", { className: "dd-list", attrs: { role: "listbox" } });
+
+    let currentOptions = options || [];
+    let currentValue = value;
+    let open = false;
+
+    function findOption(v) {
+      return currentOptions.find((o) => String(o.value) === String(v));
+    }
+
+    function renderLabel() {
+      const match = findOption(currentValue);
+      labelEl.textContent = match ? match.label : opts.placeholder || "";
+    }
+
+    function renderOptions() {
+      list.innerHTML = "";
+      if (currentOptions.length === 0) {
+        list.appendChild(el("div", { className: "dd-option-empty", text: opts.emptyText || "No options" }));
+        return;
+      }
+      currentOptions.forEach((o) => {
+        const isSelected = String(o.value) === String(currentValue);
+        const item = el("button", {
+          className: "dd-option" + (isSelected ? " dd-option-selected" : ""),
+          attrs: { type: "button", role: "option", "aria-selected": String(isSelected) },
+        });
+        item.dataset.optionValue = String(o.value);
+        if (opts.withMeter) {
+          // Starts in the `dd-option-meter-loading` state (a CSS pulse, see
+          // dropdown.css) rather than the dim rest state: a level tap takes
+          // a real GStreamer pipeline a moment to spin up
+          // (`start_audio_level_tap`/`poll_audio_level_tap`, wired in
+          // `audioSourcePickerCore`), and a bar that just sits dim during
+          // that gap reads as "this app makes no sound" rather than "still
+          // finding out" — the owner asked for a loading/indeterminate
+          // animation to fill that gap. `setOptionLevel` below clears this
+          // class the instant the first real reading lands for this option,
+          // handing off to `paintDdOptionMeter`'s normal level-driven
+          // painting.
+          const meter = el("div", { className: "dd-option-meter dd-option-meter-loading", attrs: { "aria-hidden": "true" } });
+          for (let i = 0; i < DD_OPTION_METER_BARS; i++) meter.appendChild(el("span", { className: "dd-option-meter-bar" }));
+          item.appendChild(meter);
+        }
+        item.appendChild(el("span", { className: "dd-option-label", text: o.label }));
+        if (isSelected) item.appendChild(icon("check", "dd-option-check"));
+        item.addEventListener("click", () => {
+          currentValue = o.value;
+          renderLabel();
+          renderOptions();
+          closeList();
+          root.dispatchEvent(new Event("change"));
+          onChange && onChange(o.value);
+        });
+        list.appendChild(item);
+      });
+    }
+
+    /** Places `list` (already in <body>) directly under/over the trigger,
+     * flipping above it only when there's not enough room below *and*
+     * there's more room above — a simple check, not full collision/popover
+     * logic (not needed: this app has no nested-scroll-container cases
+     * beyond the simple "near the bottom of the window" one). */
+    function position() {
+      const rect = trigger.getBoundingClientRect();
+      list.style.left = rect.left + "px";
+      // `min-width`, not `width`: a narrow trigger (e.g. the 76px Framerate
+      // picker) would otherwise force every option's label to wrap onto two
+      // lines. Options can be wider than the trigger; they always share its
+      // left edge.
+      list.style.minWidth = rect.width + "px";
+      const spaceBelow = window.innerHeight - rect.bottom;
+      const spaceAbove = rect.top;
+      const wantsFlip = spaceBelow < 160 && spaceAbove > spaceBelow;
+      list.classList.toggle("dd-list-up", wantsFlip);
+      if (wantsFlip) {
+        list.style.bottom = window.innerHeight - rect.top + 4 + "px";
+        list.style.top = "";
+        list.style.maxHeight = Math.max(120, spaceAbove - 12) + "px";
+      } else {
+        list.style.top = rect.bottom + 4 + "px";
+        list.style.bottom = "";
+        list.style.maxHeight = Math.max(120, spaceBelow - 12) + "px";
+      }
+    }
+
+    function onReposition() {
+      if (!trigger.isConnected) {
+        closeList();
+        return;
+      }
+      position();
+    }
+
+    function onDocMouseDown(e) {
+      if (!trigger.isConnected || (!root.contains(e.target) && !list.contains(e.target))) closeList();
+    }
+
+    function onKeyDown(e) {
+      if (e.key === "Escape") {
+        closeList();
+        trigger.focus();
+      }
+    }
+
+    function openList() {
+      if (open) return;
+      open = true;
+      document.body.appendChild(list);
+      position();
+      // A frame late, same "already in the DOM before the class flips"
+      // trick this codebase already uses for its other open/close
+      // transitions (see e.g. shell.css's `.room-panel-scrim-open`) — the
+      // transition needs the closed (scaleY(0.9)/opacity 0) state to have
+      // actually painted first, or the browser coalesces both style
+      // changes into one frame and it just appears instead of rolling out.
+      requestAnimationFrame(() => list.classList.add("dd-list-open"));
+      trigger.classList.add("dd-trigger-open");
+      document.addEventListener("mousedown", onDocMouseDown, true);
+      document.addEventListener("keydown", onKeyDown, true);
+      window.addEventListener("scroll", onReposition, true);
+      window.addEventListener("resize", onReposition);
+      opts.onOpen && opts.onOpen();
+    }
+
+    function closeList() {
+      if (!open) return;
+      open = false;
+      list.classList.remove("dd-list-open", "dd-list-up");
+      trigger.classList.remove("dd-trigger-open");
+      document.removeEventListener("mousedown", onDocMouseDown, true);
+      document.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("scroll", onReposition, true);
+      window.removeEventListener("resize", onReposition);
+      if (list.parentNode) list.parentNode.removeChild(list);
+      opts.onClose && opts.onClose();
+    }
+
+    trigger.addEventListener("click", () => (open ? closeList() : openList()));
+
+    Object.defineProperty(root, "value", {
+      get() {
+        return currentValue;
+      },
+      set(v) {
+        currentValue = v;
+        renderLabel();
+        renderOptions();
+      },
+    });
+    root.setOptions = function (newOptions) {
+      currentOptions = newOptions || [];
+      renderLabel();
+      renderOptions();
+    };
+    // Paints one option's meter in place — no rebuild, so a ~100ms level
+    // poll (see `audioSourcePickerCore`) never touches the rest of the
+    // (possibly currently-open, currently-scrolled) list. Looked up by
+    // `data-option-value` rather than array index since `currentOptions`
+    // can be re-sorted/rebuilt out from under a stale index.
+    root.setOptionLevel = function (value, fraction) {
+      const item = list.querySelector(`.dd-option[data-option-value="${CSS.escape(String(value))}"]`);
+      if (!item) return;
+      const meter = item.querySelector(".dd-option-meter");
+      if (!meter) return;
+      // First real reading for this option: hand off from the loading pulse
+      // to normal level-driven painting.
+      meter.classList.remove("dd-option-meter-loading");
+      paintDdOptionMeter(meter, fraction);
+    };
+    root.focus = function () {
+      trigger.focus();
+    };
+
+    renderLabel();
+    renderOptions();
+    return root;
+  }
+
+  // -------------------------------------------------------------------
+  // Two-option pill switch — mirrors `theme.rs`'s use of a `selectable_label`
+  // pair for exclusive two-choice pickers (the bandwidth mode toggle, the
+  // Settings tab's language switcher). One shared implementation so both
+  // call sites don't drift into near-copies of each other.
+  // -------------------------------------------------------------------
+
+  /**
+   * @param {{value: string, label: string, title?: string, disabled?: boolean}[]} options
+   *   - `title` is optional per-option tooltip text (native `title`
+   *   attribute); omit it and the button gets no tooltip at all, so existing
+   *   callers that don't pass it are unaffected. `disabled` greys the option
+   *   out and makes it unclickable — for options the codec selector needs to
+   *   offer but the current machine's encoder backend can't actually produce
+   *   (see `commands::supported_codecs`'s doc comment); existing callers
+   *   that don't pass it are likewise unaffected.
+   * @param {string} value - currently selected option's `value`
+   * @param {(value: string) => void} onChange
+   */
+  function pillSwitch(options, value, onChange) {
+    const wrap = el("div", { className: "mode-toggle" });
+    options.forEach((opt) => {
+      const attrs = {};
+      if (opt.title) attrs.title = opt.title;
+      if (opt.disabled) attrs.disabled = "";
+      wrap.appendChild(
+        el("button", {
+          className:
+            "mode-toggle-btn" +
+            (opt.value === value ? " mode-toggle-btn-active" : "") +
+            (opt.disabled ? " mode-toggle-btn-disabled" : ""),
+          text: opt.label,
+          onClick: opt.disabled ? null : () => onChange(opt.value),
+          attrs,
+        })
+      );
+    });
+    return wrap;
+  }
+
+  /**
+   * Bandwidth-mode-specific convenience wrapper over `pillSwitch`, per
+   * stream-control.md's "Absolute Maximum" / "Per-Stream Maximum" naming.
+   * Values match `dto::bandwidth_mode_str`'s wire strings exactly
+   * ("absolute" / "per_stream", underscore — not the "per-stream" hyphen
+   * this file used before it was wired to the real DTO).
+   * @param {'absolute'|'per_stream'} mode
+   * @param {(mode: 'absolute'|'per_stream') => void} onChange
+   */
+  function bandwidthModeToggle(mode, onChange) {
+    return pillSwitch(
+      [
+        { value: "absolute", label: "Absolute Maximum" },
+        { value: "per_stream", label: "Per-Stream Maximum" },
+      ],
+      mode,
+      onChange
+    );
+  }
+
+  // -------------------------------------------------------------------
+  // Encoder tuning presets — the "Low-Latency / Balanced / Quality / Gaming"
+  // pill switch layered over the raw tune/quality_level/rate_control/
+  // gop_millis fields. Shared by `destinationCard`'s per-destination edit
+  // panel (a running share) and `stream-control.js`'s "START A STREAM" form
+  // (before a share exists), which is why this lives at module scope
+  // instead of inside `destinationCard` — both need the exact same combos
+  // rather than near-copies drifting apart. Values (`low_latency`/
+  // `best_quality`/`performance`/`balanced`/`quality`/`cqp`/`qvbr`) are
+  // `src-tauri/src/dto.rs`'s exact `parse_tune_mode`/`parse_quality_level`/
+  // `parse_rate_control_mode` wire strings, including `QualityLevel::
+  // Balanced`'s `"balanced"`. `gopMillis` is a plain number (ms), not a
+  // parsed string — see `capture::DEFAULT_GOP_MILLIS`/`GAMING_GOP_MILLIS`
+  // below.
+  //
+  // 2026-07-30: rate control collapsed from three variants (Constant/
+  // Adaptive/Quality) to two real ones — `cqp` (was `Quality`, unchanged
+  // behavior) and `qvbr` (new: `vah264enc`'s "Quality-defined VBR", replaces
+  // the never-tuned `Adaptive`/`vbr` — see `capture::RateControlMode`'s doc
+  // comment). Every preset that used to say `rateControl: "quality"` (i.e.
+  // all three) has been re-decided per its own stated purpose, not
+  // blanket-defaulted:
+  // - Low-Latency wants predictable, non-quality-seeking behavior — `cqp`.
+  // - Balanced and Quality both want "spend the bandwidth budget on
+  //   quality", which is exactly what `qvbr` now does for real — `qvbr`.
+  // - Gaming (new) is CQP, not QVBR: fast-paced/motion-heavy content rarely
+  //   holds still, so QVBR's "spend leftover budget on stillness" upside
+  //   rarely triggers, while CQP's fixed, predictable per-frame quality
+  //   holds up more consistently under constant motion. Paired with a much
+  //   shorter GOP (`GAMING_GOP_MILLIS`, ~0.75s vs. the 2s default) for
+  //   faster recovery from motion artifacts, and the fast end of Quality
+  //   Level (`performance`/`target-usage=7`) to favor low encode latency.
+  //
+  // `Why: "Balanced" as the middle, default option` — it's the recommended
+  // default for a regular user who doesn't know what "rate control" means
+  // (and matches `AppState::default()`'s own tune/quality_level/rate_control,
+  // so a freshly-launched app's "next capture" settings already are the
+  // Balanced preset); "Low-Latency"/"Quality"/"Gaming" mirror the other
+  // points on the Tune/Quality Level/Rate Control/GOP space worth naming.
+  // Mirrors `capture::DEFAULT_GOP_MILLIS` (2s, the protocol-spec default);
+  // kept as its own named constant here rather than a bare `2000` so the
+  // three non-Gaming presets' intent ("the default GOP, unchanged") reads
+  // clearly next to Gaming's `GAMING_GOP_MILLIS` override.
+  const DEFAULT_GOP_MILLIS = 2000;
+  const GAMING_GOP_MILLIS = 750;
+  const ENCODER_PRESETS = [
+    {
+      value: "low_latency",
+      label: "Low-Latency",
+      title: "Fastest encode, prioritizes reduced delay over compression efficiency.",
+      tune: "low_latency",
+      qualityLevel: "performance",
+      rateControl: "cqp",
+      gopMillis: DEFAULT_GOP_MILLIS,
+    },
+    {
+      value: "balanced",
+      label: "Balanced",
+      title: "The default — a good mix of latency and quality.",
+      tune: "best_quality",
+      qualityLevel: "balanced",
+      rateControl: "qvbr",
+      gopMillis: DEFAULT_GOP_MILLIS,
+    },
+    {
+      value: "quality",
+      label: "Quality",
+      title: "Maximizes visual quality within the bandwidth ceiling.",
+      tune: "best_quality",
+      qualityLevel: "quality",
+      rateControl: "qvbr",
+      gopMillis: DEFAULT_GOP_MILLIS,
+    },
+    {
+      value: "gaming",
+      label: "Gaming",
+      title: "Tuned for fast-motion/gaming content — shorter keyframe interval for quicker recovery from motion artifacts.",
+      tune: "low_latency",
+      qualityLevel: "performance",
+      rateControl: "cqp",
+      gopMillis: GAMING_GOP_MILLIS,
+    },
+  ];
+
+  /** Whichever preset's fields exactly match `tune`/`qualityLevel`/
+   * `rateControl`/`gopMillis`, or `null` if none does (an allowed,
+   * unhighlighted state — see `destinationCard`'s `activePreset` doc note). */
+  function activeEncoderPreset(tune, qualityLevel, rateControl, gopMillis) {
+    return (
+      ENCODER_PRESETS.find(
+        (p) => p.tune === tune && p.qualityLevel === qualityLevel && p.rateControl === rateControl && p.gopMillis === gopMillis
+      ) || null
+    );
+  }
+
+  // Codec pill switch — H.264/AV1/H.265, values are `dto::video_codec_str`'s
+  // exact wire strings ("h264"/"h265"/"av1"), used by `set_codec`/
+  // `edit_destination`/`set_start_stream_defaults`. Shared module-scope
+  // constant for the same reason `ENCODER_PRESETS` is: `destinationCard`'s
+  // live-destination edit panel and the staged-card panel both need the
+  // exact same three options. Order (H.264, AV1, H.265) matches the order
+  // the project owner asked for.
+  const CODEC_OPTIONS = [
+    { value: "h264", label: "H.264", title: "Most compatible — decodes everywhere, including hardware that can't do H.265/AV1." },
+    { value: "av1", label: "AV1", title: "Modern, royalty-free, best efficiency on Intel/NVIDIA hardware." },
+    { value: "h265", label: "H.265", title: "Best quality on this hardware; licensing caveats on some platforms/browsers." },
+  ];
+
+  // -------------------------------------------------------------------
+  // Destination card — the Stream Control tab's Active Shares entry. One of
+  // these per outgoing destination, across every room (cross-room, per
+  // APP-SHELL.md's STREAMS-section rationale). Deliberately dumb: it renders
+  // whatever fields/state the caller hands it and calls back through
+  // `handlers` for every action, so a later worker swapping mock state for
+  // real `invoke()` results only needs to change the caller, not this markup.
+  // -------------------------------------------------------------------
+
+  /**
+   * @param {object} dest - a `DestinationRow` DTO shape { destination_id, capture_id,
+   *   room_handle, kind: 'video'|'audio', state: 'starting'|'live'|'rebuilding'|
+   *   'stalled'|'failed', width, height, framerate, bitrate_kbps, pending }, plus
+   *   frontend-only `room_label` (looked up by `room_handle`), `pendingRoleText`
+   *   (derived from `pending`) and `computedShareKbps` (Absolute-mode allocator
+   *   display, not part of any DTO).
+   * @param {object} handlers - { onEditApply(destinationId, {bitrateKbps, framerate,
+   *   tune, qualityLevel, rateControl, gopMillis}), onTransfer(destinationId, roomHandle),
+   *   onFanout(captureId, roomHandle), onStop(destinationId),
+   *   onAddAudio(dest, source), onAudioMute(captureId, muted),
+   *   onAudioStop(audioDestinationId), onRefreshAudioSources() }
+   *
+   * `kind: 'audio'` rows never reach this function any more: audio is not a
+   * stream of its own in this UI, it is a line inside the screen share it
+   * belongs to (`opts.audio`). See `stream-control.js`'s
+   * `updateActiveSharesCard`, which pairs them up and filters audio rows out
+   * of the top-level list.
+   * @param {object} [opts] - { roomOptions: [{id,name}], encoderTuningEditable: bool,
+   *   perStreamBitrateEditable: bool, framerateOptions: number[],
+   *   supportedCodecs: string[], roomsAlreadyFedByCapture: number[],
+   *   editState: {bitrateKbps, framerate, tune, qualityLevel, rateControl,
+   *   gopMillis, codec, error}, stalledSince: number|null, audio: object|null,
+   *   audioSources: array, staged: bool, stagedRoomHandle: number }.
+   *
+   *   `supportedCodecs` — which codecs (`"h264"`/`"h265"`/`"av1"`) this
+   *   machine's encoder backend can actually produce
+   *   (`commands::supported_codecs`/`StagedCaptureRow::supported_codecs`).
+   *   The Codec pill switch disables any option not in this list. Defaults
+   *   to `["h264"]` if omitted, so an unfetched/omitted list never offers an
+   *   option that would silently downgrade.
+   *
+   *   `staged` renders the "Share Screen"/"Share another screen" flow's
+   *   pre-"Go live" card instead of a normal live one: `dest` is a
+   *   `StagedCaptureRow`-shaped object ({ capture_id, state: 'starting'|
+   *   'ready', width, height, framerate, bitrate_kbps } — no destination_id/
+   *   room_handle yet), no room/fan-out/transfer affordances are shown, the
+   *   edit grid gains a Room picker (reads/writes `stagedRoomHandle` via
+   *   `handlers.onStagedRoomChange(captureId, roomHandle)`), and the actions
+   *   row is "Go live"/"Cancel" (`handlers.onGoLive(captureId)`/
+   *   `handlers.onCancel(captureId)`) instead of Transfer/Stop. The audio
+   *   row *is* still shown, but non-interactive — see `addAudioRow`'s "Why
+   *   this is disabled while staged" doc note below for why a staged card
+   *   can no longer offer a working "+ Add audio". See
+   *   `superdoc/features/stream-control.md`'s 2026-07-28 note.
+   *
+   *   `editState` is this destination's local edit buffer for everything
+   *   `edit_destination` can set (kept by the caller, since `DestinationRow` has
+   *   no fields to read the server's current tune/quality/rate-control back
+   *   from). **Every control in this panel renders from `editState`, never from
+   *   the `dest` DTO** — see the Bitrate slider's `Why:` note below for the
+   *   snap-back bug that rule fixes.
+   *
+   *   `encoderTuningEditable` and `perStreamBitrateEditable` gate two different
+   *   things and are deliberately not one flag: the former shows the whole
+   *   panel (Preset / Framerate / Advanced tuning), the latter only decides
+   *   whether the Bitrate slider is among its rows. See where each is used.
+   *
+   *   `stalledSince` is the caller's client-side-tracked "first observed
+   *   Stalled at" timestamp (ms epoch) — see `statusBadge`'s doc comment for why
+   *   this can't come from the DTO itself. `audio` is this share's paired
+   *   audio `DestinationRow` (or null); `audioSources` is the last-fetched
+   *   `list_audio_sources` result, used to populate the "+ Add audio"
+   *   picker.
+   */
+  function destinationCard(dest, handlers, opts) {
+    handlers = handlers || {};
+    opts = opts || {};
+    // Maps `capture::DestinationState`'s real variants (src/capture.rs) to
+    // one of the 4 status-vocabulary families (status.css) plus its label.
+    const STATE_META = {
+      starting: { label: "STARTING", family: "progress" },
+      // Staged capture, portal/pipeline up and "Go live" ready to press — see
+      // `opts.staged`'s doc note below and `dto::StagedCaptureRow`.
+      ready: { label: "READY", family: "progress" },
+      rebuilding: { label: "APPLYING", family: "progress" },
+      live: { label: "LIVE", family: "live" },
+      stalled: { label: "WAITING FOR CAPTURE", family: "degraded" },
+      failed: { label: dest.room_label ? `${dest.room_label} stream failed` : "Stream failed", family: "failed" },
+    };
+    const meta = STATE_META[dest.state] || { label: dest.state, family: "progress" };
+
+    // `dest-card-<state>` also drives the 4px left accent bar (stream-control.css's
+    // `.dest-card::before` family) — solid green for live, an animated
+    // diagonal stripe for starting/rebuilding (progress), the shared amber
+    // hatch for stalled (degraded), reusing status.css's exact status-
+    // vocabulary treatments rather than inventing new colors/animations.
+    const wrap = el("div", { className: "dest-card dest-card-" + dest.state });
+
+    // Failed is a squared card, not a pill (status.css's `.status-failed-box`
+    // header note) — its own compact layout rather than the meta/edit/actions
+    // stack every other state gets, since none of that applies to a
+    // destination producing no frames. No preview thumbnail either — there's
+    // nothing live to show.
+    if (meta.family === "failed") {
+      const head = el("div", { className: "dest-card-head" });
+      head.appendChild(el("span", { className: "dest-room-label", text: dest.room_label }));
+      wrap.appendChild(head);
+      wrap.appendChild(
+        statusBadge("failed", meta.label, {
+          errorText: dest.errorText,
+          onRetry: () => handlers.onRetry && handlers.onRetry(dest),
+          onDismiss: () => handlers.onStop && handlers.onStop(dest.destination_id),
+        })
+      );
+      return wrap;
+    }
+
+    // `Why there is no preview thumbnail here:` there used to be a
+    // `.dest-thumb` column — a static icon/gradient placeholder, never a
+    // live decode (a real self-preview would have needed the sharer's own
+    // `conn_id` and the capture's video `stream_id` to call `toggle_watch`/
+    // `stream_video_url` against, neither of which any Tauri command
+    // exposed). The owner confirmed it was useless precisely because it
+    // never showed the actual stream and asked for it to be removed outright
+    // — see `superdoc/features/stream-control.md`'s 2026-07-28 note — so the
+    // card is now meta/edit/actions only, live or staged, with no preview
+    // column at all.
+    const body = el("div", { className: "dest-card-body" });
+
+    const head = el("div", { className: "dest-card-head" });
+    // Staged: no room chosen yet (that's what the Room field in the edit grid
+    // below is for), so the head just names the card generically instead of
+    // a room it doesn't have.
+    head.appendChild(el("span", { className: "dest-room-label", text: opts.staged ? "Screen Share" : dest.room_label }));
+    head.appendChild(statusBadge(meta.family, meta.label, meta.family === "degraded" ? { since: opts.stalledSince } : {}));
+    body.appendChild(head);
+
+    if (dest.pendingRoleText) {
+      body.appendChild(el("div", { className: "dest-pending-role", text: dest.pendingRoleText }));
+    }
+
+    // Metric line + inline sparkline. The metric line is the existing real
+    // resolution/framerate text; the sparkline (6 bars) is populated
+    // out-of-band by `stream-control.js`'s `updateStats()`, same as the FPS
+    // readout right below — no historical stats are fetched here, just a
+    // fixed-size row of bar elements for that function to write into.
+    // The prototype breaks these numbers out as LABELLED columns in a sunken
+    // inset — RESOLUTION / FRAMERATE / BITRATE, each a micro-caps label over
+    // a tabular value, sparkline pushed to the right end. That
+    // labelled-instrument look is a good part of what the owner meant by
+    // "futuristic"; the port had collapsed it to one unlabelled string
+    // ("1920x1080 @ 30fps"), which read as a stray caption once the strip
+    // gained its inset styling.
+    const metaRow = el("div", { className: "dest-meta-row" });
+
+    const metric = (label, value, extraValueClass) =>
+      el("div", { className: "dest-metric" }, [
+        el("span", { className: "dest-metric-label", text: label }),
+        el("span", { className: extraValueClass ? `dest-metric-value ${extraValueClass}` : "dest-metric-value", text: value }),
+      ]);
+
+    metaRow.appendChild(metric("Resolution", `${dest.width}×${dest.height}`));
+    metaRow.appendChild(metric("Framerate", `${dest.framerate} fps`));
+    // `dest-metric-bitrate-value`: a dedicated class so `stream-control.js`'s
+    // `updateStats()` can write straight into this node on every
+    // `stream-stats-updated` tick, the same direct-DOM-write path already
+    // used for `.dest-fps-readout`/the sparkline — see that function's `Why:`
+    // note for why this field specifically needs a live-refreshed value
+    // rather than the `dest.bitrate_kbps` this initial render reads (that
+    // cached copy goes stale the moment Absolute-Maximum mode's allocator
+    // changes this destination's live bitrate, since a tier-1 encoder
+    // property write never fires an event that would make `stream-
+    // control.js` refetch it).
+    metaRow.appendChild(metric("Bitrate", `${dest.bitrate_kbps} kbps`, "dest-metric-bitrate-value"));
+
+    // Kept (now empty) so anything still keying off `.dest-meta` finds it;
+    // the visible text moved into the metric columns above. Also acts as
+    // the flex spacer that pushes the sparkline to the right edge.
+    metaRow.appendChild(el("div", { className: "dest-meta" }));
+
+    const sparkline = el("div", { className: "dest-sparkline", attrs: { hidden: "" } });
+    for (let i = 0; i < 6; i++) sparkline.appendChild(el("span", { className: "spark-bar spark-bar-empty" }));
+    metaRow.appendChild(sparkline);
+    body.appendChild(metaRow);
+
+    // Live captured/sent FPS readout — populated out-of-band by
+    // `stream-control.js`'s `updateStats()` on every `stream-stats-updated`
+    // tick (every ~250ms), via direct `textContent` writes rather than going
+    // through this card's normal sig-diffed render path, so a stats tick
+    // never triggers a full card rebuild. Starts hidden until the first tick
+    // arrives for this destination.
+    body.appendChild(el("div", { className: "dest-fps-readout", attrs: { hidden: "" } }));
+
+    // "Which rooms" chip row — this capture's already-real multi-destination
+    // fan-out (`opts.roomsAlreadyFedByCapture`, computed by `stream-control.js`
+    // from the live destination list) rendered as small chips, plus a dashed
+    // "Also send to…" chip that reveals the same fan-out picker the actions
+    // row used to always show inline — restyled into a chip, not rebuilt.
+    //
+    // Staged: none of this applies — there is no room yet (that's what
+    // "Go live" picks), so the row is skipped entirely rather than showing
+    // fan-out affordances for a destination that doesn't exist.
+    if (!opts.staged) {
+      const fedRoomIds = opts.roomsAlreadyFedByCapture && opts.roomsAlreadyFedByCapture.length ? opts.roomsAlreadyFedByCapture : [dest.room_handle];
+      const chipRow = el("div", { className: "dest-chip-row" });
+      fedRoomIds.forEach((rid) => {
+        const label = rid === dest.room_handle ? dest.room_label : (((opts.roomOptions || []).find((r) => r.id === rid) || {}).name || String(rid));
+        chipRow.appendChild(el("span", { className: "dest-chip", text: label }));
+      });
+      const fanoutOptions = (opts.roomOptions || []).filter((r) => r.id !== dest.room_handle && !fedRoomIds.includes(r.id));
+      if (fanoutOptions.length > 0) {
+        const addWrap = el("span", { className: "dest-chip-inline-add" });
+        const fanoutSelect = dropdown(
+          fanoutOptions.map((r) => ({ value: r.id, label: r.name })),
+          fanoutOptions[0].id,
+          (value) => {
+            handlers.onFanout && handlers.onFanout(dest.capture_id, Number(value));
+            addBtn.hidden = false;
+            fanoutSelect.hidden = true;
+          },
+          { className: "dest-room-select dest-chip-select" }
+        );
+        fanoutSelect.hidden = true;
+        const addBtn = el("button", {
+          className: "dest-chip-add-btn",
+          text: "+ Also send to…",
+          onClick: () => {
+            addBtn.hidden = true;
+            fanoutSelect.hidden = false;
+            fanoutSelect.focus();
+          },
+        });
+        addWrap.appendChild(addBtn);
+        addWrap.appendChild(fanoutSelect);
+        chipRow.appendChild(addWrap);
+      }
+      body.appendChild(chipRow);
+    }
+
+    // The per-destination encoder edit panel: Preset + Framerate always
+    // visible, Tune/Quality Level/Rate Control behind the Advanced
+    // disclosure, and — in Per-Stream mode only — a Bitrate slider.
+    //
+    // `Why this is gated on `encoderTuningEditable` and not on
+    // `perStreamBitrateEditable`:` those are two different questions, and
+    // conflating them into the single bitrate flag is what used to hide the
+    // whole panel in Absolute-Maximum mode. Preset/Framerate/Tune/Quality/
+    // Rate Control have nothing to do with the bandwidth allocator — it owns
+    // *bitrate*, and only bitrate — so they are just as meaningful, and just
+    // as safe to apply, in either bandwidth mode. Only the Bitrate slider
+    // itself has to stay Per-Stream-only (see its own note below).
+    if (opts.encoderTuningEditable) {
+      const editState = opts.editState || {
+        tune: "best_quality",
+        qualityLevel: "balanced",
+        rateControl: "qvbr",
+        gopMillis: DEFAULT_GOP_MILLIS,
+        codec: "h264",
+      };
+      // Staged `dest` objects (`opts.staged`) have no `destination_id` yet —
+      // key on `capture_id` instead, same id `handlers.onGoLive`/`onCancel`
+      // already use for a staged card.
+      const editId = opts.staged ? dest.capture_id : dest.destination_id;
+      const applyTuning = (patch) => handlers.onEditApply && handlers.onEditApply(editId, patch);
+
+      // Simple preset selector — a higher-level "Low-Latency / Balanced /
+      // Quality" pill-switch layered over the raw tune/quality_level/
+      // rate_control fields below, per stream-control.md's simple/advanced
+      // split. Picking a preset applies all three underlying fields
+      // together through the same `onEditApply`/`edit_destination` path as
+      // hand-tuning them individually in the Advanced section below — this
+      // is a convenience mapping onto those same three fields, not a fourth
+      // field of its own, so nothing changes server-side. See module-scope
+      // `ENCODER_PRESETS`' doc comment above (shared with the "START A
+      // STREAM" form in `stream-control.js`).
+      const PRESETS = ENCODER_PRESETS;
+      // Highlight whichever preset's 3 fields exactly match the current
+      // edit state; if the Advanced section was hand-tuned to some other
+      // combo, none of the 3 preset buttons shows as selected — no
+      // validation/blocking, that's an intentional, allowed state.
+      const activePreset = activeEncoderPreset(editState.tune, editState.qualityLevel, editState.rateControl, editState.gopMillis);
+
+      // Preset + Bitrate share one grid (`.dest-edit-grid`) so their
+      // controls start at the same X regardless of "Preset" vs.
+      // "Bitrate (kbps)" label width — previously each row was an
+      // independent flex container, so a row's control started wherever
+      // its own label happened to end and the group read as ragged.
+      // `.dest-edit-row` is `display: contents`, so each row must
+      // contribute exactly three children (label / control / value) or
+      // grid auto-placement spills the next row's label into the value
+      // column — the preset switch has no value readout, so its third
+      // cell is an empty spacer, same trick the Advanced rows below use.
+      const editGrid = el("div", { className: "dest-edit-grid" });
+
+      // Staged only: which room "Go live" will send into — the one field a
+      // live destination's edit panel never shows (a live destination
+      // already has a room; "Transfer"/"Also send to…" are what move/add
+      // rooms afterwards). `opts.roomOptions` is the same joined-rooms list
+      // the live card's Transfer picker already uses.
+      if (opts.staged) {
+        const roomRow = el("div", { className: "dest-edit-row" });
+        roomRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Room" }));
+        roomRow.appendChild(
+          dropdown(
+            (opts.roomOptions || []).map((r) => ({ value: r.id, label: r.name })),
+            opts.stagedRoomHandle,
+            (value) => handlers.onStagedRoomChange && handlers.onStagedRoomChange(dest.capture_id, Number(value)),
+            { className: "dest-room-select" }
+          )
+        );
+        roomRow.appendChild(el("span"));
+        editGrid.appendChild(roomRow);
+      }
+
+      // Framerate — a regular-user setting, so it lives up here with Preset
+      // and Bitrate rather than behind the Advanced disclosure with the raw
+      // Tune/Rate Control knobs. Until now this tab had no framerate control
+      // at all: `edit_destination` has always taken one, and the caller has
+      // always sent one, but only ever the value the destination already had,
+      // so there was no way to change a running stream's framerate short of
+      // stopping and re-sharing it.
+      //
+      // `Why a <select> and not the pillSwitch the Preset row uses:` the
+      // offered range is the same eight values the "Start a Stream" form
+      // offers (15…240) — eight pills would not fit this column, and matching
+      // that form's own control keeps "the framerate picker" one recognisable
+      // thing in both places. `framerateOptions` carries the current value
+      // even when it isn't one of the eight, so this never silently misreports
+      // what the destination is actually running at.
+      //
+      // `Why Framerate comes before Preset:` per explicit request — order
+      // swapped 2026-07-29, was Preset-then-Framerate.
+      const framerateRow = el("div", { className: "dest-edit-row" });
+      framerateRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Framerate" }));
+      const framerateSelect = dropdown(
+        (opts.framerateOptions || [editState.framerate]).map((fps) => ({ value: String(fps), label: fps + " fps" })),
+        String(editState.framerate),
+        (value) => applyTuning({ framerate: Number(value) }),
+        { className: "dest-room-select dest-framerate-select" }
+      );
+      framerateRow.appendChild(framerateSelect);
+      framerateRow.appendChild(el("span"));
+      editGrid.appendChild(framerateRow);
+
+      // Codec — H.264/AV1/H.265, between Framerate and Preset per explicit
+      // placement request. Styled identically to the Quality Level pill
+      // switch below (same `pillSwitch`/`.dest-tuning-toggle` combo), but
+      // lives up here rather than behind the Advanced disclosure: which
+      // codec to encode with is as much a regular-user decision as Preset/
+      // Framerate, not a testing-oriented knob like Tune/Quality Level/Rate
+      // Control.
+      //
+      // `opts.supportedCodecs` — which codecs this machine's encoder backend
+      // can actually produce (`commands::supported_codecs`/
+      // `StagedCaptureRow::supported_codecs`, `["h264"]` on software
+      // fallback). Defaults to `["h264"]` (the safe fallback) if the caller
+      // hasn't fetched it yet, so this never offers an option that would
+      // silently downgrade before the real list has loaded.
+      const supportedCodecs = opts.supportedCodecs || ["h264"];
+      const codecRow = el("div", { className: "dest-edit-row" });
+      codecRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Codec" }));
+      const codecToggle = pillSwitch(
+        CODEC_OPTIONS.map((c) => ({ ...c, disabled: !supportedCodecs.includes(c.value) })),
+        editState.codec || "h264",
+        (value) => applyTuning({ codec: value })
+      );
+      codecToggle.classList.add("dest-tuning-toggle");
+      codecRow.appendChild(codecToggle);
+      codecRow.appendChild(el("span"));
+      editGrid.appendChild(codecRow);
+
+      const presetRow = el("div", { className: "dest-edit-row" });
+      presetRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Preset" }));
+      const presetToggle = pillSwitch(
+        PRESETS.map((p) => ({ value: p.value, label: p.label, title: p.title })),
+        activePreset ? activePreset.value : null,
+        (value) => {
+          const preset = PRESETS.find((p) => p.value === value);
+          if (preset) {
+            applyTuning({
+              tune: preset.tune,
+              qualityLevel: preset.qualityLevel,
+              rateControl: preset.rateControl,
+              gopMillis: preset.gopMillis,
+            });
+          }
+        }
+      );
+      // `.dest-tuning-toggle`: same shared fixed-width modifier as
+      // Tune/Quality Level/Rate Control below, so Preset's 3-way toggle
+      // lines up with the same track width instead of sizing to its own
+      // content — see that class's own doc comment (stream-control.css).
+      presetToggle.classList.add("dest-tuning-toggle");
+      presetRow.appendChild(presetToggle);
+      presetRow.appendChild(el("span"));
+      editGrid.appendChild(presetRow);
+
+      // Bitrate stays Per-Stream-only, unlike everything else in this panel:
+      // Absolute mode's allocator owns the live bitrate, so a manual field
+      // there would be a control whose input is silently overwritten within
+      // the second (per stream-control.md's "Absolute mode ... allocator
+      // writes live bitrates straight into the encoders without ever touching
+      // the manual values").
+      if (opts.perStreamBitrateEditable) {
+        const editRow = el("div", { className: "dest-edit-row" });
+        editRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Bitrate (kbps)" }));
+        // `Why the slider reads `editState.bitrateKbps` and not
+        // `dest.bitrate_kbps` — the "changing the bitrate just resets the
+        // slider" bug:` this card is rebuilt from scratch whenever its sig
+        // changes, and `editState` is *in* that sig — so the moment a drag
+        // applies, the caller re-renders and this slider is constructed
+        // afresh. Built from the DTO it was constructed from the value the
+        // *server* last reported, which is still the old one: the backend
+        // change had only just been requested. Worse, it stays old forever
+        // for a bitrate-only edit — that's a tier-1 live encoder property
+        // write, so the destination never leaves `live`, so
+        // `destination-state-changed` never fires, so nothing ever re-fetches
+        // `DestinationRow`. The slider therefore snapped back to the previous
+        // value and stayed there while the real bitrate really had changed.
+        // The edit buffer is the value the user actually chose, so it is what
+        // this control renders.
+        const slider = el("input", {
+          className: "dest-bitrate-slider",
+          attrs: { type: "range", min: "200", max: "40000", step: "100", value: String(editState.bitrateKbps) },
+        });
+        const value = el("span", { className: "dest-bitrate-value", text: editState.bitrateKbps + " kbps" });
+        slider.addEventListener("input", () => {
+          value.textContent = slider.value + " kbps";
+        });
+        slider.addEventListener("change", () => {
+          applyTuning({ bitrateKbps: Number(slider.value) });
+        });
+        attachWheelStep(slider);
+        editRow.appendChild(slider);
+        editRow.appendChild(value);
+        editGrid.appendChild(editRow);
+      }
+      body.appendChild(editGrid);
+
+      // Three testing-oriented encoder tuning knobs (`edit_destination`'s
+      // `tune`/`quality_level`/`rate_control`) — same `pillSwitch` widget as
+      // the Absolute/Per-Stream bandwidth-mode toggle, one row each since a
+      // three-way row (Rate Control) wouldn't fit next to a two-way one
+      // cleanly. Each button click applies immediately, matching the
+      // Bitrate slider's auto-apply-on-change behavior above (there's no
+      // separate combined "Apply" action in this panel).
+      //
+      // `Why:` behind `<details>` — these three switches are the panel's
+      // "testing-oriented" knobs (per this file's own doc comment above),
+      // not something a regular user needs to see to just start a stream.
+      // Per stream-control.md's simple/advanced split, only the preset
+      // selector and Bitrate slider above stay always-visible;
+      // Tune/Quality Level/Rate Control move behind a native
+      // `<details>/<summary>` disclosure, collapsed by default. `<details>`
+      // was picked over hand-rolled show/hide state because (a) this
+      // component library has no existing toggle primitive that fits
+      // (`pillSwitch` is an exclusive-choice picker, not a disclosure), and
+      // (b) each destination card creates its own `<details>` element
+      // here, so expand/collapse state is naturally per-card (no shared/
+      // global open flag to manage) and needs no JS wiring beyond the
+      // browser's own native behavior — same instinct as this file's
+      // "prefer the platform" pattern elsewhere (e.g. relying on
+      // `<select>`'s native change event rather than a custom dropdown).
+      // `opts.advancedOpen` — this card rebuilds from scratch (a fresh
+      // `<details>` node) on every edit, per `stream-control.js`'s sig-diffed
+      // render (any editState change, including a click inside Advanced
+      // itself, invalidates the sig and swaps in a whole new card element).
+      // A brand-new `<details>` always starts closed, so without this the
+      // panel would visibly snap shut right after the very click that used
+      // it (e.g. picking a preset, or flipping Rate Control) — the caller
+      // reads the outgoing card's current open/closed state before
+      // replacing it and threads it back in here so the disclosure survives
+      // its own re-render, same "caller keeps the state" pattern this file
+      // already uses for `editState` itself.
+      const advanced = el("details", { className: "dest-advanced", attrs: opts.advancedOpen ? { open: "" } : {} });
+      advanced.appendChild(el("summary", { className: "dest-advanced-summary", text: "Advanced tuning" }));
+      const advancedBody = el("div", { className: "dest-advanced-body" });
+      // Own nested grid (not `editGrid` above — that one's already closed
+      // out into `body`) so Tune/Quality Level/Rate Control line up with
+      // each other the same way Preset/Bitrate do above. `-nested` drops
+      // `.dest-edit-grid`'s own top border/padding, since `.dest-advanced-
+      // body` already draws that separator from the "Advanced tuning"
+      // summary above it — see stream-control.css.
+      const advancedGrid = el("div", { className: "dest-edit-grid dest-edit-grid-nested" });
+
+      const tuneRow = el("div", { className: "dest-edit-row" });
+      tuneRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Tune" }));
+      const tuneToggle = pillSwitch(
+        [
+          { value: "low_latency", label: "Low Latency", title: "Reduces encode delay for real-time responsiveness." },
+          { value: "best_quality", label: "Best Quality", title: "The default — trades a little latency for meaningfully better compression." },
+        ],
+        editState.tune,
+        (value) => applyTuning({ tune: value })
+      );
+      // `.dest-tuning-toggle`: scoped modifier (see shell.css's
+      // `.add-room-tabs` for the precedent this mirrors) that fixes this
+      // track's *total* width to match the Quality Level/Rate Control rows
+      // below, so all three "Advanced tuning" pill switches read as one
+      // aligned block instead of each sizing to its own longest label.
+      tuneToggle.classList.add("dest-tuning-toggle");
+      tuneRow.appendChild(tuneToggle);
+      // Empty value cell: `.dest-edit-row` is `display: contents`, so each
+      // row must contribute exactly three children or grid auto-placement
+      // spills the next row's label into the value column.
+      tuneRow.appendChild(el("span"));
+      advancedGrid.appendChild(tuneRow);
+
+      const qualityRow = el("div", { className: "dest-edit-row" });
+      qualityRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Quality Level" }));
+      const qualityToggle = pillSwitch(
+        [
+          { value: "performance", label: "Performance", title: "Fastest encode speed, more compression artifacts." },
+          { value: "balanced", label: "Balanced", title: "The default — the midpoint between speed and compression efficiency." },
+          { value: "quality", label: "Quality", title: "Slowest encode speed, best compression efficiency for a given bitrate." },
+        ],
+        editState.qualityLevel,
+        (value) => applyTuning({ qualityLevel: value })
+      );
+      qualityToggle.classList.add("dest-tuning-toggle");
+      qualityRow.appendChild(qualityToggle);
+      qualityRow.appendChild(el("span"));
+      advancedGrid.appendChild(qualityRow);
+
+      // Plain-language labels, not raw GStreamer jargon (`cqp`/`qvbr`) — per
+      // this file's own naming convention (compare `QualityLevel`'s
+      // Performance/Balanced/Quality above). "Efficient" = `cqp`
+      // (conservative/"resourceful" bandwidth use — never spends more than a
+      // fixed per-frame quality needs); "Max Quality" = `qvbr` (spends up to
+      // the full bandwidth budget for the best quality that fits — see
+      // `capture::RateControlMode`'s doc comment).
+      const rateControlRow = el("div", { className: "dest-edit-row" });
+      rateControlRow.appendChild(el("label", { className: "field-label dest-edit-label", text: "Rate Control" }));
+      const rateControlToggle = pillSwitch(
+        [
+          { value: "cqp", label: "Efficient", title: "Conservative, predictable bandwidth use — doesn't necessarily use all of the available bandwidth ceiling." },
+          { value: "qvbr", label: "Max Quality", title: "The default — spends available bandwidth up to the configured ceiling for the best achievable quality." },
+        ],
+        editState.rateControl,
+        (value) => applyTuning({ rateControl: value })
+      );
+      rateControlToggle.classList.add("dest-tuning-toggle");
+      rateControlRow.appendChild(rateControlToggle);
+      rateControlRow.appendChild(el("span"));
+      advancedGrid.appendChild(rateControlRow);
+
+      advancedBody.appendChild(advancedGrid);
+      advanced.appendChild(advancedBody);
+      body.appendChild(advanced);
+
+      // Error stays outside (and below) the `<details>`, not nested inside
+      // it — `applyDestinationEdit` sets `editState.error` for a failed
+      // apply of *any* control in this panel, including the always-visible
+      // Bitrate slider above, so it needs to be visible regardless of the
+      // advanced section's collapsed/expanded state.
+      if (editState.error) {
+        body.appendChild(el("div", { className: "dest-edit-error", text: editState.error }));
+      }
+    }
+
+    // The allocator's read-only counterpart to the Bitrate slider: in
+    // Absolute-Maximum mode this destination's share is computed, not chosen,
+    // so it's reported rather than offered as a control. Sits outside the
+    // panel above because it is not gated on the same condition — the panel
+    // now renders in *both* bandwidth modes, and this line belongs to
+    // Absolute mode alone.
+    if (dest.computedShareKbps !== undefined) {
+      body.appendChild(el("div", { className: "dest-computed-share", text: `Allocated: ${dest.computedShareKbps} kbps` }));
+    }
+
+    // `dest-actions-staged` no longer changes button sizing — `.dest-action-btn`
+    // itself is 32px now for both staged (Go live/Cancel) and live
+    // (Transfer/Stop) cards (2026-07-29, owner asked for live's Stop to match
+    // staged's size). Class kept on the staged row regardless, in case other
+    // staged-only layout rules get hung off it later.
+    const actions = el("div", { className: opts.staged ? "dest-actions dest-actions-staged" : "dest-actions" });
+
+    if (opts.staged) {
+      // "Go live" in place of the Transfer picker + Stop button a live card
+      // gets: this card has no destination yet, just a running capture and
+      // the room picked above, so there is nothing to transfer and "Cancel"
+      // (not "Stop") is the honest verb for tearing down a capture that was
+      // never actually sent anywhere. Disabled — rather than hidden — while
+      // the capture is still `starting`, so the button doesn't visibly jump
+      // around the row the instant the portal/pipeline comes up.
+      const goLiveBtn = primaryButton("Go live", () => handlers.onGoLive && handlers.onGoLive(dest.capture_id), {
+        className: "dest-action-btn dest-go-live-btn",
+      });
+      if (dest.state !== "ready") goLiveBtn.disabled = true;
+      actions.appendChild(goLiveBtn);
+      actions.appendChild(
+        dangerButton("Cancel", () => handlers.onCancel && handlers.onCancel(dest.capture_id), { className: "dest-action-btn" })
+      );
+    } else {
+      // Transfer only here — fan-out ("Also send to…") moved into the chip
+      // row above (`chipRow`'s dashed chip), same `handlers.onFanout` call,
+      // just a restyled entry point instead of a second copy of the picker.
+      const roomOptions = (opts.roomOptions || []).filter((r) => r.id !== dest.room_handle);
+      if (roomOptions.length > 0) {
+        const transferSelect = dropdown(
+          roomOptions.map((r) => ({ value: r.id, label: r.name })),
+          roomOptions[0].id,
+          null,
+          { className: "dest-room-select" }
+        );
+        actions.appendChild(transferSelect);
+        actions.appendChild(
+          secondaryButton("Transfer", () => handlers.onTransfer && handlers.onTransfer(dest.destination_id, Number(transferSelect.value)), {
+            className: "dest-action-btn",
+          })
+        );
+      }
+
+      actions.appendChild(dangerButton("Stop", () => handlers.onStop && handlers.onStop(dest.destination_id), { className: "dest-action-btn" }));
+    }
+    body.appendChild(actions);
+
+    // Audio sub-row — the share's audio, attached to the share rather than
+    // living in a card (or a whole separate "SHARE AUDIO" panel) of its own.
+    // Audio is not a second stream the user manages; it is a property of the
+    // screen share, so it renders as one extra line under a hairline rule.
+    // Video-only: an audio destination never renders a card, so it never
+    // reaches this branch (see `stream-control.js`'s `updateActiveSharesCard`).
+    //
+    // `Why the row still renders while staged, but disabled:` this used to
+    // be a fully working "+ Add audio" here too (a staged card's Room picker
+    // already resolves a real room_handle before Go live is ever pressed, so
+    // there was never a *technical* reason it couldn't attach audio early).
+    // That turned out to violate a hard backend invariant instead: a staged
+    // capture is a real GStreamer pipeline with **zero destinations** —
+    // nothing announced to any room yet (see `session::AppState::
+    // stage_video_share`'s doc comment) — so audio attached to it announced
+    // a live, video-less "orphan" stream immediately, visible forever in the
+    // room panel's stream list with no video to actually pair with. The
+    // backend now refuses this (`AppState::start_audio_share` errors unless
+    // the paired capture already has a destination), so this row is disabled
+    // rather than removed: hiding it entirely reintroduces the exact "+ Add
+    // audio vanished on a staged card" regression the project owner reported
+    // before (see the git history for this comment), whereas a disabled row
+    // with a clear reason still tells the user where the affordance went and
+    // when it comes back.
+    if (dest.kind !== "audio") {
+      body.appendChild(el("div", { className: "dest-divider" }));
+      body.appendChild(
+        opts.audio
+          ? audioAttachedRow(dest, opts.audio, handlers, opts)
+          : opts.staged
+          ? addAudioUnavailableRow()
+          : addAudioRow(dest, handlers, opts)
+      );
+    }
+
+    wrap.appendChild(body);
+    return wrap;
+  }
+
+  /** How many bars the attached-audio VU meter draws. */
+  const AUDIO_METER_BARS = 5;
+
+  /** How often the source picker re-lists which applications are currently
+   * producing audio — shared by both the not-yet-attached "+ Add audio"
+   * picker and the always-visible attached-row picker below (see
+   * `audioSourcePickerCore`'s doc comment for why either needs to keep
+   * polling at all). */
+  const AUDIO_SOURCE_POLL_MS = 5000;
+
+  /**
+   * Shared guts of the audio-source `<select>` used by both `addAudioRow`
+   * (not-yet-attached) and `audioAttachedRow`'s always-visible "Switch"
+   * picker: the dropdown itself, plus the periodic `list_audio_sources`
+   * re-poll that keeps it current while it's on screen (an application can
+   * start producing audio well after the picker was built — and for the
+   * attached row, the picker is on screen for the entire life of the share,
+   * not just a briefly-opened popover, so it needs this even more).
+   *
+   * Callers own when polling starts/stops (`startPolling`/`stopPolling`) and
+   * supply their own "is this picker still meant to be live" check, since
+   * the two call sites differ (a hideable popover vs. an always-mounted
+   * row) — same self-stopping `isConnected`-style pattern as the rest of
+   * this file's out-of-band tickers (no uniform unmount hook exists here to
+   * call a `.destroy()` from instead).
+   *
+   * # Per-option level meters
+   *
+   * Every option also carries a live level meter (`dropdown`'s
+   * `opts.withMeter`), so the user can tell *which* running application is
+   * actually making sound before picking it, rather than guessing from the
+   * name alone — the whole point of this follow-up (2026-07-29). This is
+   * backed by non-announcing per-candidate "level taps"
+   * (`audio::AudioLevelTapHandle` on the Rust side — a real GStreamer
+   * `pipewiresrc ! level ! fakesink` per candidate, but never linked into a
+   * loopback, never encoded, never announced to the room: see that type's
+   * doc comment for why a real share's pipeline can't just be reused here).
+   *
+   * `Why scoped to "the dropdown is open", not the picker's whole mount
+   * lifetime (unlike the 5s source re-poll above, which already runs for
+   * the attached row's entire lifetime):` a real tap is a real GStreamer
+   * pipeline process-internally, one per currently-listed candidate — fine
+   * for the ~1-10s a dropdown is actually open and looked at, not something
+   * that should run continuously behind an always-visible "Switch" row that
+   * usually just sits there closed. `dropdown`'s `onOpen`/`onClose` hooks
+   * are exactly the mount-scoped signal needed: start a tap per currently
+   * listed source the instant the list opens, stop every one of them the
+   * instant it closes (or the picker itself unmounts mid-open — `isActive`
+   * covers that the same way it already covers the source-list poll).
+   *
+   * @param {object} handlers - { onRefreshAudioSources(),
+   *   onStartAudioLevelTap(sourceId) -> Promise<number|null> (tap id, or
+   *   null if the tap couldn't be started), onPollAudioLevelTap(tapId) ->
+   *   Promise<number|null> (0.0-1.0, or null), onStopAudioLevelTap(tapId) }
+   * @param {object} opts - { audioSources: [{id,name}] }
+   */
+  function audioSourcePickerCore(handlers, opts) {
+    let sources = opts.audioSources || [];
+    const optionsFor = () =>
+      sources.length === 0 ? [{ value: "", label: "No application is playing audio" }] : sources.map((s) => ({ value: s.id, label: s.name }));
+
+    // sourceId -> tapId, only populated while the list is open. A `Map`
+    // (not just an array) so `stopAllTaps` can fire every stop in one pass
+    // and `pollTaps` can look levels up by the same key `setOptionLevel`
+    // paints with (the option's `value`, i.e. the source id).
+    const activeTaps = new Map();
+    let tapPollId = null;
+
+    function stopAllTaps() {
+      if (tapPollId !== null) {
+        clearInterval(tapPollId);
+        tapPollId = null;
+      }
+      for (const tapId of activeTaps.values()) {
+        handlers.onStopAudioLevelTap && handlers.onStopAudioLevelTap(tapId);
+      }
+      activeTaps.clear();
+    }
+
+    async function startTapsForCurrentSources() {
+      if (!handlers.onStartAudioLevelTap) return;
+      const wanted = new Set(sources.map((s) => String(s.id)));
+      // Drop taps for sources that are no longer listed (the 5s source
+      // re-poll can run while the dropdown is open and drop/add entries).
+      for (const [sourceId, tapId] of Array.from(activeTaps.entries())) {
+        if (!wanted.has(sourceId)) {
+          handlers.onStopAudioLevelTap && handlers.onStopAudioLevelTap(tapId);
+          activeTaps.delete(sourceId);
+        }
+      }
+      // Start taps for anything newly listed that doesn't have one yet.
+      await Promise.all(
+        sources
+          .filter((s) => !activeTaps.has(String(s.id)))
+          .map(async (s) => {
+            const tapId = await handlers.onStartAudioLevelTap(s.id);
+            if (tapId !== null && tapId !== undefined) activeTaps.set(String(s.id), tapId);
+          })
+      );
+    }
+
+    function startTapPolling() {
+      if (tapPollId !== null || !handlers.onPollAudioLevelTap) return;
+      tapPollId = setInterval(async () => {
+        for (const [sourceId, tapId] of Array.from(activeTaps.entries())) {
+          const level = await handlers.onPollAudioLevelTap(tapId);
+          select.setOptionLevel(sourceId, level || 0);
+        }
+        // `LEVEL_INTERVAL_NS` on the Rust side (`audio.rs`) is 100ms — match
+        // that cadence here so the meter reads as live rather than lagging
+        // the backend's own update rate.
+      }, 100);
+    }
+
+    const select = dropdown(optionsFor(), sources.length ? sources[0].id : "", null, {
+      className: "dest-room-select dest-audio-select",
+      withMeter: true,
+      onOpen: () => {
+        startTapsForCurrentSources().then(startTapPolling);
+      },
+      onClose: stopAllTaps,
+    });
+    const rebuildOptions = () => select.setOptions(optionsFor());
+
+    let pollId = null;
+    function stopPolling() {
+      if (pollId !== null) {
+        clearInterval(pollId);
+        pollId = null;
+      }
+    }
+    function startPolling(isActive) {
+      if (pollId !== null || !handlers.onRefreshAudioSources) return;
+      pollId = setInterval(async () => {
+        if (!isActive()) {
+          stopPolling();
+          return;
+        }
+        const fresh = await handlers.onRefreshAudioSources();
+        if (!isActive()) {
+          // The picker could have closed (or the whole card been rebuilt
+          // out from under it) while the await above was in flight.
+          stopPolling();
+          return;
+        }
+        if (Array.isArray(fresh)) {
+          sources = fresh;
+          const previousValue = select.value;
+          rebuildOptions();
+          if (sources.some((s) => String(s.id) === previousValue)) select.value = previousValue;
+          // Reconcile the live taps against the fresh list too, but only if
+          // the list is actually open right now — `startTapsForCurrentSources`
+          // is a no-op-safe call otherwise (nothing polls an empty
+          // `activeTaps`), but there's no reason to spin up taps for a
+          // closed dropdown nobody's looking at.
+          if (tapPollId !== null) startTapsForCurrentSources();
+        }
+      }, AUDIO_SOURCE_POLL_MS);
+    }
+
+    return {
+      select,
+      getSources: () => sources,
+      setSources: (s) => {
+        sources = s;
+      },
+      rebuildOptions,
+      startPolling,
+      stopPolling,
+      // Exposed so a caller that unmounts the picker outright (rather than
+      // just closing the dropdown — e.g. the whole card being rebuilt while
+      // the list happened to be open) can still guarantee no tap outlives
+      // it. `dropdown`'s own `onClose` already covers the ordinary
+      // click-away/Escape/select-an-option paths.
+      stopAllTaps,
+    };
+  }
+
+  /**
+   * The attached-audio line: `[meter] [source picker] [Mute/Unmute] [Stop]`
+   * — the dropdown *is* the name display (it starts on whatever's live) and
+   * switches source immediately on selection, no separate "Switch" button
+   * (2026-07-29, owner asked to collapse the two-line picker+Switch button
+   * down to a single always-visible dropdown that acts on `change` — the
+   * raw name text and the button were redundant with what the dropdown
+   * already shows/does once switching is instant. A follow-up piece adding
+   * level meters to each dropdown entry is a separate task layered on top
+   * of this one, not built here).
+   *
+   * `Why instant switch is fine here (unlike a destructive action):`
+   * `onSwitchAudio` is a real stop-then-start cycle under the hood (see
+   * `stream-control.js`), so firing it on every selection would be wasteful
+   * — but not unsafe — for a redundant reselect of the already-live source;
+   * the no-op guard below exists purely to skip that waste, not to prevent
+   * harm the way a confirming button click would. Matched by name rather
+   * than id: `DestinationRow` (`dto.rs`) only carries the source's `label`,
+   * not the source id `select_audio_source` was given, so name is the only
+   * thread connecting "what's live" back to "what's in the picker's list" —
+   * good enough since the list is keyed by human-readable app names anyway.
+   *
+   * @param {object} dest - the paired video `DestinationRow`, for the room
+   *   handle/capture id a switch needs to start the new share against.
+   * @param {object} audio - the paired audio `DestinationRow` (its `label` is
+   *   the captured application's name — `session::start_audio_share` sets the
+   *   capture's label to the picked source's name — and `muted` is the
+   *   toggle's current state).
+   * @param {object} handlers - { onAudioMute(captureId, muted),
+   *   onAudioStop(destinationId), onSwitchAudio(dest, audio, source),
+   *   onRefreshAudioSources() }
+   * @param {object} opts - { audioSources: [{id,name}] }
+   */
+  function audioAttachedRow(dest, audio, handlers, opts) {
+    const row = el("div", { className: "dest-audio-row dest-audio-row-attached" });
+
+    // Meter: fixed bar count, animated out-of-band by `stream-control.js`'s
+    // `updateStats()` off the `audio_level` field on the already-flowing
+    // `stream-stats-updated` tick — same direct-DOM-write approach as the
+    // FPS readout and sparkline, so a level change never rebuilds the card.
+    // `data-audio-destination-id` is how that function finds this meter from
+    // a stats payload keyed by the *audio* destination id, given the meter
+    // lives inside the *video* destination's card.
+    const meter = el("div", {
+      className: "dest-audio-meter",
+      attrs: { "data-audio-destination-id": String(audio.destination_id), "aria-hidden": "true" },
+    });
+    for (let i = 0; i < AUDIO_METER_BARS; i++) meter.appendChild(el("span", { className: "dest-audio-meter-bar" }));
+    row.appendChild(meter);
+
+    // Source picker, in the name text's old spot — it now doubles as the
+    // name display (its selected option reads the live source's name).
+    const core = audioSourcePickerCore(handlers, opts);
+    const select = core.select;
+
+    // Default the picker to whatever's already live, matched by name (see
+    // this function's doc comment for why name, not id) — falls back to the
+    // list's first entry (the dropdown's own default) when the live source
+    // isn't in the current list, e.g. it just stopped producing audio.
+    const liveSource = core.getSources().find((s) => s.name === audio.label);
+    if (liveSource) select.value = liveSource.id;
+
+    select.addEventListener("change", () => {
+      const source = core.getSources().find((s) => String(s.id) === String(select.value));
+      if (source && source.name !== audio.label) handlers.onSwitchAudio && handlers.onSwitchAudio(dest, audio, source);
+    });
+
+    row.appendChild(select);
+
+    // `Why a fixed width:` the label flips between "Mute" and "Unmute", and
+    // a button that resizes on every toggle shoves the Stop button next to
+    // it sideways — the owner called this out explicitly. The width is
+    // reserved in CSS (`.dest-audio-mute`, sized for the longer word) rather
+    // than measured here, so it holds regardless of font loading.
+    const muted = !!audio.muted;
+    row.appendChild(
+      secondaryButton(muted ? "Unmute" : "Mute", () => handlers.onAudioMute && handlers.onAudioMute(audio.capture_id, !muted), {
+        className: "dest-audio-mute" + (muted ? " dest-audio-mute-on" : ""),
+      })
+    );
+
+    row.appendChild(
+      dangerButton("Stop", () => handlers.onAudioStop && handlers.onAudioStop(audio.destination_id), { className: "dest-audio-stop" })
+    );
+
+    core.startPolling(() => row.isConnected);
+
+    return row;
+  }
+
+  /**
+   * The no-audio-yet line: a dashed "+ Add audio" affordance that expands in
+   * place into the source picker, reusing the same inline-reveal pattern as
+   * the card's "+ Also send to…" fan-out chip rather than opening a dialog
+   * or sending the user back to a separate panel.
+   *
+   * @param {object} opts - { audioSources: [{id,name}], onRefreshAudioSources }
+   */
+  function addAudioRow(dest, handlers, opts) {
+    const row = el("div", { className: "dest-audio-row dest-audio-row-empty" });
+
+    // Dropdown + polling: shared with `audioAttachedRow`'s always-visible
+    // "Switch" picker, see `audioSourcePickerCore`'s doc comment. Note that
+    // `core.getSources()`/`core.setSources()` replace this closure's whole
+    // view of the source list on a poll tick (`onRefreshAudioSources`
+    // reassigns the array), same "don't hold a stale reference" reasoning
+    // that comment used to explain here directly.
+    const core = audioSourcePickerCore(handlers, opts);
+    const select = core.select;
+
+    const picker = el("span", { className: "dest-audio-picker", attrs: { hidden: "" } });
+    picker.appendChild(select);
+
+    // `dest-audio-share-btn` is the same 32px size on both staged and live
+    // cards now (2026-07-29 — owner asked for live cards' Share to match
+    // Stop's bump), so there is no `-staged` modifier to conditionally add
+    // any more; see the class's definition in stream-control.css.
+    picker.appendChild(
+      primaryButton("Share", () => {
+        const source = core.getSources().find((s) => String(s.id) === String(select.value));
+        if (source) handlers.onAddAudio && handlers.onAddAudio(dest, source);
+        core.stopPolling();
+      }, { className: "dest-audio-share-btn" })
+    );
+
+    // `dest-audio-add-btn-lg` is the same 32px size on both staged and live
+    // cards now (2026-07-29 — owner flagged the button visibly shrinking the
+    // moment a card goes live, same class of fix as `dest-audio-share-btn`
+    // above), so it's unconditional rather than `opts.staged`-gated; see the
+    // class's definition in stream-control.css.
+    const addBtn = el("button", {
+      className: "dest-chip-add-btn dest-audio-add-btn dest-audio-add-btn-lg",
+      text: "+ Add audio",
+      onClick: async () => {
+        // Re-list on open: which applications are producing audio changes
+        // constantly, so a list captured at card-build time is stale by
+        // definition. Awaiting here (rather than pre-fetching every render)
+        // also keeps `list_audio_sources`' real system-audio query off the
+        // render path.
+        if (handlers.onRefreshAudioSources) {
+          const fresh = await handlers.onRefreshAudioSources();
+          if (Array.isArray(fresh)) core.setSources(fresh);
+        }
+        core.rebuildOptions();
+        addBtn.hidden = true;
+        picker.hidden = false;
+        select.focus();
+        core.startPolling(() => picker.isConnected && !picker.hidden);
+      },
+    });
+    row.appendChild(icon("volume_off", "dest-audio-empty-icon"));
+    row.appendChild(el("span", { className: "dest-audio-empty-text", text: "No audio attached" }));
+    row.appendChild(addBtn);
+    row.appendChild(picker);
+    return row;
+  }
+
+  /**
+   * The staged card's non-interactive stand-in for `addAudioRow` — same
+   * icon/text shape, but the "+ Add audio" affordance is replaced with a
+   * plain disabled-looking hint instead of a button, and there is no picker
+   * to expand into. See `destinationCard`'s "Why the row still renders while
+   * staged, but disabled" doc note just above its call site for why: a
+   * staged capture has zero destinations (nothing announced to any room
+   * yet), so starting audio against it would create exactly the orphan,
+   * video-less "LIVE" stream the backend now refuses outright
+   * (`AppState::start_audio_share`). Text reads just "+ Add audio", same as
+   * the live button — the faded `dest-audio-add-btn-disabled` treatment
+   * (opacity/cursor/pointer-events) is what communicates "unavailable", not
+   * extra copy (2026-07-29, owner asked to drop the "(available once you Go
+   * Live)" annotation as redundant with the visual state).
+   */
+  function addAudioUnavailableRow() {
+    const row = el("div", { className: "dest-audio-row dest-audio-row-empty dest-audio-row-disabled" });
+    row.appendChild(icon("volume_off", "dest-audio-empty-icon"));
+    row.appendChild(el("span", { className: "dest-audio-empty-text", text: "No audio attached" }));
+    row.appendChild(
+      el("span", {
+        className: "dest-chip-add-btn dest-audio-add-btn dest-audio-add-btn-lg dest-audio-add-btn-disabled",
+        text: "+ Add audio",
+        attrs: { "aria-disabled": "true" },
+      })
+    );
+    return row;
+  }
+
+  window.Components = {
+    el,
+    icon,
+    attachWheelStep,
+    primaryButton,
+    secondaryButton,
+    dangerButton,
+    iconButton,
+    renderNavButton,
+    statusDot,
+    statusBadge,
+    hatchedBanner,
+    emptyRow,
+    renderRoomRow,
+    renderStreamRow,
+    renderEmptyState,
+    card,
+    warningBanner,
+    dropdown,
+    pillSwitch,
+    bandwidthModeToggle,
+    destinationCard,
+    ENCODER_PRESETS,
+    activeEncoderPreset,
+  };
+})();

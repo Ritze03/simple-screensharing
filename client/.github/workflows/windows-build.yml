@@ -1,0 +1,276 @@
+name: Windows build
+
+# Why this workflow exists: the project owner develops on Linux and has no
+# way to test a Windows build locally. This builds the desktop client
+# natively on a windows-latest GitHub-hosted runner so a Windows-using friend
+# can download the resulting .exe (+ its GStreamer runtime DLLs) from the
+# workflow run and smoke-test it.
+#
+# 2026-07-30: switched from building the old standalone egui binary to
+# building the real app — the Electron shell (electron/, packaged via
+# electron-builder --win portable) spawning the src-tauri sidecar as a
+# child process, mirroring the Linux AppImage build (see electron/
+# package.json's `build.linux`/`build.win`). The sidecar is still built by
+# `cargo build`, cross-compiled at the x86_64-pc-windows-msvc target
+# (native on this windows-latest runner, so "cross-compiled" only in the
+# sense of a non-default target triple); electron-builder just packages the
+# Electron shell + that sidecar .exe + GStreamer runtime around it.
+#
+# 2026-07-30 (same day): delivery switched from `actions/upload-artifact`
+# to a GitHub Release asset (`gh release create/upload`, tag
+# `windows-dev-build`, recreated every run). Actions artifact storage hit
+# an account-level quota bug where GitHub's usage counter didn't reflect
+# reality even immediately after all old artifacts were deleted (its own
+# error says usage is only recalculated every 6-12h) — Releases use
+# separate storage untouched by that counter, so this sidesteps it
+# entirely rather than waiting out the recalculation window. This is a
+# rolling dev-build pointer, not a versioned release process — the tag
+# and its single release are deleted and recreated fresh each run.
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  # Lets the project owner trigger a fresh build on demand from the Actions
+  # tab whenever they want a new build to hand off, without needing a push.
+  workflow_dispatch: {}
+
+env:
+  # Pinned GStreamer release used for both the build-time dev libs and the
+  # runtime DLLs shipped in the artifact. Keep this on an *even* minor
+  # version (1.26.x, 1.24.x, ...) — GStreamer's odd/dev releases (1.27.x,
+  # 1.29.x, ...) switched to a single all-in-one .exe installer instead of
+  # the classic separate runtime + devel .msi pair this workflow relies on.
+  GST_VERSION: "1.26.9"
+  GST_ARCH: "x86_64"
+  # Fixed install location for both MSIs (kept short/simple to avoid any
+  # path-length or space issues with MSVC/pkg-config tooling).
+  #
+  # NOTE: the GStreamer MSI's INSTALLDIR property is the *parent* dir — the
+  # installer appends its own "1.0\msvc_x86_64" (version\arch) subpath onto
+  # whatever INSTALLDIR you give it. So INSTALLDIR must be set to
+  # GST_INSTALL_PARENT ("C:\gstreamer"), and the files actually end up at
+  # GST_ROOT ("C:\gstreamer\1.0\msvc_x86_64"), which is what every other
+  # step (PATH, PKG_CONFIG_PATH, packaging) needs to reference.
+  GST_INSTALL_PARENT: "C:\\gstreamer"
+  GST_ROOT: "C:\\gstreamer\\1.0\\msvc_x86_64"
+  # Rolling tag for the dev-build GitHub Release the .exe is published to
+  # (see the "Publish .exe as a GitHub Release asset" step below).
+  RELEASE_TAG: "windows-dev-build"
+
+# Needed for `gh release create/upload` (default GITHUB_TOKEN permissions
+# are read-only otherwise).
+permissions:
+  contents: write
+
+jobs:
+  windows-build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # windows-latest ships Rust via rustup already, but we pin/verify the
+      # toolchain and explicitly add the MSVC target rather than relying on
+      # whatever happens to be preinstalled.
+      - name: Install Rust (stable, x86_64-pc-windows-msvc)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-msvc-gst${{ env.GST_VERSION }}
+
+      # --- GStreamer -----------------------------------------------------
+      # gstreamer/gstreamer-app/gstreamer-video are thin wrappers around
+      # *-sys crates whose build.rs shells out to pkg-config to locate
+      # GStreamer's headers/libs, so `cargo build` cannot succeed without a
+      # GStreamer *development* install present, and the resulting .exe
+      # needs the GStreamer *runtime* DLLs beside it to actually launch.
+      #
+      # GStreamer doesn't publish an official Chocolatey package, so — per
+      # gstreamer-rs's own README (Windows installation section) and
+      # mirroring how its CI locates GStreamer — we download the two
+      # official MSVC installers directly from gstreamer.freedesktop.org
+      # and run them unattended via msiexec.
+      - name: Cache downloaded GStreamer installers
+        id: gst-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\gst-installers
+          key: gst-installers-${{ env.GST_VERSION }}-${{ env.GST_ARCH }}
+
+      - name: Download GStreamer MSVC installers
+        if: steps.gst-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dir = "$env:RUNNER_TEMP\gst-installers"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $base = "https://gstreamer.freedesktop.org/data/pkg/windows/$env:GST_VERSION/msvc"
+          Invoke-WebRequest -Uri "$base/gstreamer-1.0-msvc-$env:GST_ARCH-$env:GST_VERSION.msi" -OutFile "$dir\gstreamer-runtime.msi"
+          Invoke-WebRequest -Uri "$base/gstreamer-1.0-devel-msvc-$env:GST_ARCH-$env:GST_VERSION.msi" -OutFile "$dir\gstreamer-devel.msi"
+
+      - name: Install GStreamer runtime + devel (silent)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dir = "$env:RUNNER_TEMP\gst-installers"
+
+          function Install-GstMsi($msiPath, $logPath) {
+            # ADDLOCAL=ALL installs every optional MSI feature — all plugin
+            # sets on the runtime installer, and (on the devel installer)
+            # the pkgconfig .pc files + bundled pkg-config.exe that
+            # gstreamer-rs's build scripts need. /qn is fully unattended.
+            $msiArgs = @(
+              "/i", "`"$msiPath`"",
+              "/qn",
+              "ADDLOCAL=ALL",
+              "INSTALLDIR=`"$env:GST_INSTALL_PARENT`"",
+              "/l*v", "`"$logPath`""
+            )
+            $proc = Start-Process -FilePath msiexec.exe -ArgumentList $msiArgs -Wait -PassThru -NoNewWindow
+            if ($proc.ExitCode -ne 0) {
+              Write-Host "::error::msiexec failed for $msiPath with exit code $($proc.ExitCode). See uploaded log for details."
+              exit 1
+            }
+          }
+
+          Install-GstMsi "$dir\gstreamer-runtime.msi" "$env:RUNNER_TEMP\gst-runtime-install.log"
+          Install-GstMsi "$dir\gstreamer-devel.msi" "$env:RUNNER_TEMP\gst-devel-install.log"
+
+      # Upload the msiexec logs whenever the install step (or anything
+      # after it) fails, so a failed run's diagnostics are actually
+      # inspectable instead of just "cargo build had a linker error".
+      - name: Upload GStreamer install logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gstreamer-install-logs
+          path: ${{ runner.temp }}\gst-*-install.log
+          if-no-files-found: ignore
+
+      - name: Configure environment for GStreamer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          # GSTREAMER_1_0_ROOT_MSVC_X86_64 is the variable gstreamer-rs's own
+          # CI/tooling and various build helpers look for.
+          Add-Content -Path $env:GITHUB_ENV -Value "GSTREAMER_1_0_ROOT_MSVC_X86_64=$env:GST_ROOT"
+          # Prepend GStreamer's bin dir to PATH: it holds both the runtime
+          # DLLs (needed at build-time too, e.g. for build-script probes)
+          # and GStreamer's own bundled pkg-config.exe, which per
+          # gstreamer-rs's README must be found *before* any other
+          # pkg-config on PATH.
+          Add-Content -Path $env:GITHUB_PATH -Value "$env:GST_ROOT\bin"
+          # Whichever pkg-config.exe ends up being used needs to be told
+          # where the GStreamer .pc files live.
+          Add-Content -Path $env:GITHUB_ENV -Value "PKG_CONFIG_PATH=$env:GST_ROOT\lib\pkgconfig"
+
+      - name: Install fallback pkg-config (belt-and-suspenders)
+        shell: pwsh
+        run: |
+          # GStreamer's devel MSI is documented to bundle its own
+          # pkg-config.exe, but in case that particular feature wasn't
+          # where expected, make sure *some* working pkg-config is on
+          # PATH too. Because GStreamer's own bin dir was prepended above,
+          # GStreamer's copy (if present) is still found first.
+          choco install pkgconfiglite -y --no-progress
+
+      - name: Sanity-check pkg-config can see GStreamer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Get-Command pkg-config
+          pkg-config --modversion gstreamer-1.0
+          pkg-config --modversion gstreamer-app-1.0
+          pkg-config --modversion gstreamer-video-1.0
+
+      # Only the sidecar needs building here — the old standalone egui
+      # binary (`simple-screensharing-client`) isn't part of the packaged
+      # app anymore, and skipping it keeps this build faster.
+      - name: cargo build --release (src-tauri sidecar)
+        shell: pwsh
+        run: cargo build --release --target x86_64-pc-windows-msvc --locked -p simple-screensharing-client-tauri
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: npm install (electron/)
+        shell: pwsh
+        run: npm install
+        working-directory: electron
+
+      # --- Stage the GStreamer runtime for electron-builder ---------------
+      # electron-builder's `build.win.extraResources` (electron/package.json)
+      # pulls the sidecar's runtime DLLs/plugins from here into the packaged
+      # app's `resources/win/` — mirrors the old standalone-binary artifact's
+      # bin/ + lib/gstreamer-1.0 layout, just staged as electron-builder
+      # input instead of the final artifact directly. Bundling the whole
+      # GStreamer bin/plugin set (rather than hand-picking a minimal DLL
+      # subset) is deliberately conservative: this app depends on
+      # gstreamer-app/-video on top of core, and hand-tracing the exact
+      # transitive DLL closure is brittle for a one-off smoke-test build.
+      - name: Stage GStreamer runtime for packaging
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $runtime = "electron\win-runtime"
+          New-Item -ItemType Directory -Force -Path "$runtime\bin" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$runtime\lib\gstreamer-1.0" | Out-Null
+          Copy-Item "$env:GST_ROOT\bin\*.dll" "$runtime\bin\"
+          Copy-Item "$env:GST_ROOT\lib\gstreamer-1.0\*" "$runtime\lib\gstreamer-1.0\" -Recurse
+
+      # Builds a portable (single self-contained, no-install) .exe — matches
+      # the "fully self-contained, just hand someone a file" spirit of the
+      # Linux AppImage build. NSIS (an installer) was the alternative; not
+      # chosen because this is a smoke-test hand-off to a friend, not a
+      # distributed release, so skipping an install step is the better fit.
+      - name: electron-builder --win portable
+        shell: pwsh
+        run: npm run build:win
+        working-directory: electron
+
+      # --- Publish as a GitHub Release asset -------------------------------
+      # Not `actions/upload-artifact`: Actions artifact storage has an
+      # account-level quota bug where deleting old artifacts didn't free
+      # the counter it checks (GitHub's own error says usage is only
+      # recalculated every 6-12h), so uploads kept failing with "Artifact
+      # storage quota has been hit" even at 0 artifacts. Releases use
+      # separate storage untouched by that counter. `RELEASE_TAG` is a
+      # rolling pointer (delete + recreate every run) — this is a
+      # dev-build hand-off, not a versioned release process.
+      - name: Publish .exe as a GitHub Release asset
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = Get-ChildItem -Path "dist" -Filter "*.exe" | Select-Object -First 1
+          if (-not $exe) {
+            Write-Host "::error::No .exe found in dist/ to publish."
+            exit 1
+          }
+          Write-Host "Publishing $($exe.FullName) ($([math]::Round($exe.Length / 1MB, 1)) MB) to release tag $env:RELEASE_TAG"
+
+          # Ignore failure: the tag/release may not exist yet on the first
+          # run, or between runs if someone deleted it manually.
+          gh release delete $env:RELEASE_TAG --yes --cleanup-tag 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "No existing '$env:RELEASE_TAG' release to delete (fine on first run)."
+          }
+
+          gh release create $env:RELEASE_TAG $exe.FullName `
+            --title "Windows dev build ($env:RELEASE_TAG)" `
+            --notes "Automated Windows smoke-test build from workflow run $env:GITHUB_RUN_ID (commit $env:GITHUB_SHA). Unsigned CI build — Windows SmartScreen may warn about it being from an unknown publisher. This tag is recreated on every run of windows-build.yml; it does not track a fixed commit." `
+            --prerelease `
+            --target $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::gh release create failed."
+            exit 1
+          }
