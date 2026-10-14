@@ -69,6 +69,12 @@
 //! atomic load) and uploads only when it changed. Ingestion never waits for a
 //! consumer and never triggers a UI repaint.
 //!
+//! The GPU display side is [`render`]: `VideoView` draws a `FrameSource` via
+//! an `egui_wgpu` paint callback (NV12 → RGB in WGSL) and drives repaints from
+//! frame arrival through its own waker thread, which sleeps on
+//! [`FrameSource::wait_for_newer`], still never touching ingestion. Numbers:
+//! `examples/render_bench.rs`; the presented-frame rule is in `render`'s docs.
+//!
 //! There is **no pacing in the decoder any more**: the appsink is `sync=false`
 //! and frames are published the moment they come out. `Why:` low latency
 //! matters more than smoothness here, and the right place to pace is where the
@@ -276,6 +282,7 @@ use crate::protocol::{ConnId, StreamId};
 
 mod codec;
 mod frame;
+pub mod render;
 #[cfg(test)]
 mod test_util;
 mod video;
