@@ -105,13 +105,13 @@ Rules for working in it:
   paced by a timer in the headless backend, not a monitor (vsync, tearing and VRR behaviour are not
   representative; throughput is: ~239 fps captured from it); the audio path is not testable (below);
   the real picker UI (`wlr-share-picker`) is not exercised.
-- Portal binary: the rig runs `~/.local/bin/xdg-desktop-portal-wlr-patched` (the user's build, wlr-screencopy only) when it
-  exists, else the stock `/usr/lib/xdg-desktop-portal-wlr`. **Stock 0.8.4 on sway 1.12 crashes the
-  share**: it captures through ext-image-copy-capture and dies with `ext_image_copy_capture_session_v1#18:
-  error 1: session already has a frame object` when the client's GPU pipeline flaps the stream
-  (streaming -> paused -> streaming) at start; the client then logs `GPU capture path failed to
-  start (... StateChangeError)` and the CPU fallback finds no node (`target not found`). Not a
-  client bug that the rig can fix; `HS_XDPW=stock` reproduces it.
+- Portal binary: the rig runs the stock `/usr/lib/xdg-desktop-portal-wlr` (0.8.4, ext-image-copy-capture; what
+  ordinary sway users run). `HS_XDPW=patched` runs the user's `~/.local/bin/xdg-desktop-portal-wlr-patched`
+  (wlr-screencopy only), `HS_XDPW=<path>` any binary. **Why stock**: it used to crash the share
+  (`ext_image_copy_capture_session_v1#18: error 1: session already has a frame object`) when the
+  client's GPU pipeline flapped the stream at start; #52 fixed that in the client (queue behind
+  `pipewiresrc`, see `features/stream-control.md`), so the default now covers the common setup. If that
+  error shows up in `xdpw.log` again, the fix regressed.
 - A bare `fakesink` as the tail of a `pipewiresrc` probe cannot link (caps ANY -> node class
   `Stream/Input/Unknown` -> WirePlumber 0.5 "target not found"): use `video/x-raw ! fakesink`
   (`hs-probe.sh`).
