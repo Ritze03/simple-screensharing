@@ -139,7 +139,7 @@
 //! Two [`EncoderBackend`]s implement the encoder stage: software `x264enc`
 //! (above) and, preferred when actually usable, VAAPI's `vah264enc` (format
 //! NV12 instead of I420, `rate-control=cbr bitrate=<kbps> key-int-max=<gop>
-//! target-usage=7` instead of x264enc's tune/speed-preset). [`start_sharing`]
+//! target-usage=<1|2|4>` instead of x264enc's tune/speed-preset). [`start_sharing`]
 //! auto-detects which to use via [`detect_encoder_backend`]/
 //! [`probe_vaapi_encoder`] and falls back to software automatically if VAAPI
 //! construction or startup fails for any reason — callers don't choose.
@@ -216,7 +216,7 @@
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -376,8 +376,34 @@ impl EncoderBackend {
             // active branch is VAAPI.
             EncoderBackend::Vaapi => {
                 let _ = tune;
+                // `Why Performance is 2, not 7 (#46):` the VA spec reads
+                // target-usage as 1 = best quality … 7 = fastest, but Mesa's
+                // radeonsi driver does not follow that order. Measured on the
+                // dev machine (RX 7900 XTX, Mesa 26.2.4, GStreamer 1.28.8,
+                // `client/scripts/enc-bench.sh`, 1080p NV12, 8 Mbit/s CBR and
+                // VBR alike, fps of raw encoder throughput):
+                //
+                //   target-usage    1     2     3     4     5     6     7
+                //   vah264enc     246   307   307   172   172   172   172
+                //   vah265enc     482   536   536   476   476   476   476
+                //   vaav1enc      526   535   532   217   217   117   117
+                //
+                // The driver groups the values into bands (2-3 / 4-5 / 6-7,
+                // with 1 its own), and 7 was the *slowest* AV1 band: the Gaming
+                // and Low-latency presets (both Performance) encoded AV1 at
+                // 117 fps and H.264 at 172. 2 is the fastest band for all three
+                // codecs. Its quality cost is noise: PSNR on a 1080p60
+                // `testsrc2` clip at 8 Mbit/s, H.265: 40.83 dB at 2, 40.84 at
+                // 4, 40.90 at 7. 1 is not used for Performance: it is slower
+                // than 2 and its rate control overshoots (H.264 wrote 65 %
+                // more bytes than 2 at the same bitrate setting).
+                // Balanced (4) and Quality (1) are unchanged. A driver that
+                // does follow the VA order (Intel iHD) gets a slower,
+                // higher-quality encode for Performance from this; the
+                // encoder-limit hint (`destination::EncoderLimit`) still
+                // tells the user when the encoder caps the framerate.
                 let target_usage = match quality_level {
-                    QualityLevel::Performance => 7,
+                    QualityLevel::Performance => 2,
                     QualityLevel::Balanced => 4,
                     QualityLevel::Quality => 1,
                 };
@@ -608,9 +634,11 @@ pub enum TuneMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QualityLevel {
-    /// x264enc `speed-preset=ultrafast` / vah264enc `target-usage=7` — the
-    /// fastest, lowest-quality end of both scales. An explicit opt-in for
-    /// callers that need to minimize encode CPU cost above all else.
+    /// x264enc `speed-preset=ultrafast` / VA `target-usage=2` — the fastest
+    /// setting of both backends. An explicit opt-in for callers that need to
+    /// minimize encode cost above all else. `2`, not the VA spec's "fastest"
+    /// `7`: Mesa radeonsi is fastest at 2-3 and slowest at 6-7 (measured
+    /// table in [`EncoderBackend::launch_fragment`], #46).
     Performance,
     /// x264enc `speed-preset=medium` / vah264enc `target-usage=4` — the
     /// midpoint of both scales (x264's own upstream default preset is
@@ -3285,6 +3313,12 @@ async fn destination_pump(
     // Sliding window of the `Instant`s each encoded access unit was
     // successfully handed off to the QUIC connection — see [`SENT_FPS_WINDOW`].
     let mut sent_frame_times: VecDeque<Instant> = VecDeque::new();
+    // (when, `offered_frames()`) samples of the current branch over
+    // [`ENCODER_FPS_WINDOW`], for the offered rate the encoder-limit hint
+    // compares against (#46, [`destination::EncoderLimit`]). Keyed by branch
+    // id: a swapped-in branch's counter starts again at 0.
+    let mut offered_samples: VecDeque<(Instant, u64)> = VecDeque::new();
+    let mut offered_branch: Option<branch::BranchId> = None;
     // Mirrors this branch's valve so a `SubscriberCount` transition from one
     // non-zero count to another (e.g. 2 -> 1) doesn't spuriously re-force a
     // keyframe — only an actual 0 -> non-zero (or an explicit
@@ -3332,6 +3366,32 @@ async fn destination_pump(
                 }
             }
             _ = stall_ticker.tick() => {
+                let now = Instant::now();
+                match branch.as_ref().filter(|_| !paused && !branch_ended) {
+                    Some(b) => {
+                        if offered_branch != Some(b.id) {
+                            offered_branch = Some(b.id);
+                            offered_samples.clear();
+                        }
+                        let offered_now = b.offered_frames();
+                        offered_samples.push_back((now, offered_now));
+                        while offered_samples.len() > 2
+                            && offered_samples.front().is_some_and(|(t, _)| now.duration_since(*t) > ENCODER_FPS_WINDOW)
+                        {
+                            offered_samples.pop_front();
+                        }
+                        let (t0, n0) = offered_samples.front().copied().expect("just pushed");
+                        let secs = now.duration_since(t0).as_secs_f64();
+                        if secs >= 1.0 {
+                            let offered_fps = ((offered_now - n0) as f64 / secs).round() as u32;
+                            runtime.lock().unwrap().observe_encoder_rate(now, encoder_fps.load(Ordering::Relaxed), offered_fps);
+                        }
+                    }
+                    None => {
+                        offered_samples.clear();
+                        runtime.lock().unwrap().reset_encoder_limit();
+                    }
+                }
                 if !paused && branch.is_some() && !branch_ended {
                     let mut runtime = runtime.lock().unwrap();
                     let silence = destination::silence_threshold(runtime.params().framerate);
@@ -3914,6 +3974,74 @@ pub mod destination {
             .clamp(MIN_FRAMERATE, MAX_FRAMERATE)
     }
 
+    /// How long the encoder must stay below (or back above) the bar before
+    /// [`EncoderLimit`] changes its verdict (#46: "for more than 3 s").
+    pub const ENCODER_LIMIT_HOLD: Duration = Duration::from_secs(3);
+
+    /// The encoder counts as limiting when it produces less than this
+    /// percentage of the frames it is offered (#46: "more than 10% below").
+    pub const ENCODER_LIMIT_PERCENT: u32 = 90;
+
+    /// A destination's encoder is the bottleneck: it encodes `encoding_fps`
+    /// of the `target_fps` the destination asks for. See [`EncoderLimit`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct EncoderLimited {
+        pub encoding_fps: u32,
+        pub target_fps: u32,
+    }
+
+    /// Sustained "the encoder can't keep up" detector (#46), measured at run
+    /// time, no per-GPU tables.
+    ///
+    /// Compares the encoder's output rate against what it was *offered*:
+    /// `min(frames reaching the branch, target fps)`. `Why` not the target
+    /// alone: the portal only sends a frame when the screen changes, so an
+    /// idle or 60 Hz screen under a 240 fps target would read as an encoder
+    /// limit. Frames reaching the branch are counted before its leaky queue,
+    /// i.e. before an overloaded encoder makes that queue drop them.
+    ///
+    /// The verdict flips only after [`ENCODER_LIMIT_HOLD`] of continuous
+    /// evidence in either direction, so a rate hovering at the 90 % line
+    /// doesn't flicker the hint.
+    #[derive(Debug, Clone, Default)]
+    pub struct EncoderLimit {
+        limited: bool,
+        /// Since when the evidence has contradicted `limited`.
+        flip_since: Option<Instant>,
+        encoding_fps: u32,
+        target_fps: u32,
+    }
+
+    impl EncoderLimit {
+        /// One observation: the encoder produced `encoder_fps` while
+        /// `offered_fps` frames/s reached the branch, against `target_fps`.
+        pub fn observe(&mut self, now: Instant, encoder_fps: u32, offered_fps: u32, target_fps: u32) {
+            let expected = offered_fps.min(target_fps);
+            let below = expected > 0 && u64::from(encoder_fps) * 100 < u64::from(expected) * u64::from(ENCODER_LIMIT_PERCENT);
+            self.encoding_fps = encoder_fps;
+            self.target_fps = target_fps;
+            if below == self.limited {
+                self.flip_since = None;
+                return;
+            }
+            let since = *self.flip_since.get_or_insert(now);
+            if now.duration_since(since) >= ENCODER_LIMIT_HOLD {
+                self.limited = below;
+                self.flip_since = None;
+            }
+        }
+
+        /// Forget everything (paused, rebuilt, not Live): a new encoder or a
+        /// paused one says nothing about the old one's speed.
+        pub fn reset(&mut self) {
+            *self = Self::default();
+        }
+
+        pub fn verdict(&self) -> Option<EncoderLimited> {
+            self.limited.then_some(EncoderLimited { encoding_fps: self.encoding_fps, target_fps: self.target_fps })
+        }
+    }
+
     /// Shared handle onto one destination's [`DestinationRuntime`]. The pump
     /// task ([`super::pump_loop`]) writes it as frames flow; `ui.rs` reads the
     /// state to render; the swap/restart orchestrators in [`branch`] drive its
@@ -3964,6 +4092,8 @@ pub mod destination {
         /// input to [`Self::stall_if_silent`].
         last_frame_at: Option<Instant>,
         params: VideoParams,
+        /// Fed by [`super::destination_pump`]; read by the UI (#46).
+        encoder_limit: EncoderLimit,
     }
 
     impl DestinationRuntime {
@@ -3979,7 +4109,34 @@ pub mod destination {
                 last_stall_resend: None,
                 last_frame_at: None,
                 params,
+                encoder_limit: EncoderLimit::default(),
             }
+        }
+
+        /// `Some` while this `Live` destination's encoder has been the
+        /// bottleneck for a while — see [`EncoderLimit`]. The UI's
+        /// "Encoding N of M fps" hint.
+        pub fn encoder_limited(&self) -> Option<EncoderLimited> {
+            if self.state != DestinationState::Live {
+                return None;
+            }
+            self.encoder_limit.verdict()
+        }
+
+        /// Feed [`EncoderLimit`] one rate observation (the pump does, every
+        /// [`STALL_RESEND_INTERVAL`]). Outside `Live` the tracker resets.
+        pub fn observe_encoder_rate(&mut self, now: Instant, encoder_fps: u32, offered_fps: u32) {
+            if self.state != DestinationState::Live {
+                self.encoder_limit.reset();
+                return;
+            }
+            let target = self.params.framerate;
+            self.encoder_limit.observe(now, encoder_fps, offered_fps, target);
+        }
+
+        /// See [`EncoderLimit::reset`].
+        pub fn reset_encoder_limit(&mut self) {
+            self.encoder_limit.reset();
         }
 
         pub fn shared(now: Instant, params: VideoParams) -> SharedDestination {
@@ -4294,6 +4451,70 @@ pub mod destination {
                 gop_millis: DEFAULT_GOP_MILLIS,
                 codec: VideoCodec::default(),
             }
+        }
+
+        // -------------------------------------------------------------
+        // Encoder limit (#46)
+        // -------------------------------------------------------------
+
+        /// Feeds `runtime` one observation every 500 ms for `secs` seconds,
+        /// starting at `from`; returns the time after the last one.
+        fn feed(runtime: &mut DestinationRuntime, from: Instant, secs: u64, enc: u32, offered: u32) -> Instant {
+            let mut t = from;
+            for _ in 0..secs * 2 {
+                t += Duration::from_millis(500);
+                runtime.observe_encoder_rate(t, enc, offered);
+            }
+            t
+        }
+
+        fn live(framerate: u32) -> (DestinationRuntime, Instant) {
+            let now = t0();
+            let mut runtime = DestinationRuntime::new(now, params(framerate));
+            runtime.note_encoded_frame(true, b"idr", now);
+            assert_eq!(runtime.state(), DestinationState::Live);
+            (runtime, now)
+        }
+
+        #[test]
+        fn encoder_limit_needs_more_than_three_seconds_below_ninety_percent() {
+            let (mut runtime, now) = live(240);
+            // 168 of 240 offered: below 90 %, but not for long enough yet.
+            let t = feed(&mut runtime, now, 2, 168, 280);
+            assert_eq!(runtime.encoder_limited(), None);
+            feed(&mut runtime, t, 2, 168, 280);
+            assert_eq!(runtime.encoder_limited(), Some(EncoderLimited { encoding_fps: 168, target_fps: 240 }));
+        }
+
+        #[test]
+        fn a_source_that_offers_few_frames_is_not_an_encoder_limit() {
+            // Idle screen: the portal offers 20 fps, the encoder makes all 20.
+            let (mut runtime, now) = live(240);
+            feed(&mut runtime, now, 10, 20, 20);
+            assert_eq!(runtime.encoder_limited(), None);
+            // 230 of 240 is within 10 %.
+            feed(&mut runtime, now, 10, 230, 280);
+            assert_eq!(runtime.encoder_limited(), None);
+        }
+
+        #[test]
+        fn encoder_limit_clears_only_after_three_seconds_of_keeping_up_and_outside_live() {
+            let (mut runtime, now) = live(240);
+            let t = feed(&mut runtime, now, 4, 168, 280);
+            assert!(runtime.encoder_limited().is_some());
+            let t = feed(&mut runtime, t, 2, 240, 280);
+            assert!(runtime.encoder_limited().is_some(), "one good second doesn't clear it");
+            let t = feed(&mut runtime, t, 2, 240, 280);
+            assert_eq!(runtime.encoder_limited(), None);
+
+            let t = feed(&mut runtime, t, 4, 168, 280);
+            assert!(runtime.encoder_limited().is_some());
+            // A rebuild (e.g. "Use H.265") forgets the old encoder's verdict.
+            runtime.begin_rebuild(t);
+            assert_eq!(runtime.encoder_limited(), None);
+            runtime.observe_encoder_rate(t, 168, 280);
+            runtime.finish_rebuild();
+            assert_eq!(runtime.encoder_limited(), None);
         }
 
         // -------------------------------------------------------------
@@ -4938,6 +5159,10 @@ pub mod branch {
         valve: gst::Element,
         /// See the type's doc comment — created at most once per branch.
         stream: Option<gst_app::app_sink::AppSinkStream>,
+        /// Frames that reached this branch (counted on its sink pad, before
+        /// the leaky queue): the "offered" side of
+        /// [`super::destination::EncoderLimit`].
+        offered: Arc<AtomicU64>,
     }
 
     impl EncodeBranch {
@@ -4946,6 +5171,11 @@ pub mod branch {
         /// write while `Playing` (see [`super::EncoderBackend::launch_fragment`]).
         pub fn set_bitrate_kbps(&self, bitrate_kbps: u32) {
             self.encoder.set_property("bitrate", bitrate_kbps);
+        }
+
+        /// Frames offered to this branch so far — see the `offered` field.
+        pub fn offered_frames(&self) -> u64 {
+            self.offered.load(Ordering::Relaxed)
         }
 
         /// Current value of the encoder's `bitrate` property, read back off
@@ -5324,6 +5554,15 @@ pub mod branch {
             anyhow!("branch bin has no ghost sink pad (the queue's sink pad should have been auto-ghosted)")
         })?;
 
+        let offered = Arc::new(AtomicU64::new(0));
+        let counter = offered.clone();
+        branch_sink_pad
+            .add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                gst::PadProbeReturn::Ok
+            })
+            .ok_or_else(|| anyhow!("failed to install the offered-frame counter on branch {id:?}"))?;
+
         let tee_pad = tee
             .request_pad_simple("src_%u")
             .ok_or_else(|| anyhow!("tee refused to provide a new request pad (src_%u)"))?;
@@ -5349,7 +5588,7 @@ pub mod branch {
             return Err(anyhow!("failed to link tee's new request pad to the encode branch: {e:?}"));
         }
 
-        Ok(EncodeBranch { id, appsink, bin, tee_pad, encoder: encoder_element, valve, stream: None })
+        Ok(EncodeBranch { id, appsink, bin, tee_pad, encoder: encoder_element, valve, stream: None, offered })
     }
 
     /// [`add_branch`] with the same per-branch VAAPI→software fallback
@@ -5715,7 +5954,7 @@ pub mod branch {
         // value is what makes this safe by construction: the production reader
         // cannot still be holding it.
         let _ = branch.sample_stream();
-        let EncodeBranch { id: _, appsink: _, bin, tee_pad, encoder: _, valve: _, stream } = branch;
+        let EncodeBranch { id: _, appsink: _, bin, tee_pad, encoder: _, valve: _, stream, offered: _ } = branch;
         let mut appsink_stream = stream.expect("sample_stream() populated it immediately above");
 
         let branch_sink_pad = bin
@@ -8162,7 +8401,7 @@ mod tests {
             QualityLevel::Performance,
             RateControlMode::default(),
         );
-        assert_eq!(vaapi_performance.property::<u32>("target-usage"), 7);
+        assert_eq!(vaapi_performance.property::<u32>("target-usage"), 2);
 
         let vaapi_balanced = build_encoder_element(
             EncoderBackend::Vaapi,
@@ -9141,7 +9380,7 @@ mod tests {
                 RateControlMode::default(),
                 VideoCodec::Av1,
             );
-            assert_eq!(av1_performance.property::<u32>("target-usage"), 7);
+            assert_eq!(av1_performance.property::<u32>("target-usage"), 2);
         } else {
             eprintln!("skipping AV1 half: '{VAAPI_AV1_ENCODER_ELEMENT}' is not available in this environment");
         }

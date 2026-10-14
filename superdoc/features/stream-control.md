@@ -493,8 +493,9 @@ a fullscreen mailbox `vkcube`; 1080p, 8 Mbps; `client/scripts/session.sh`, the
    starving. Observed in the real app (rate control `vbr`, Balanced) with the viewer's VA
    decoder running on the same GPU: H.264 ~168 fps, AV1 ~186 fps, H.265 holds the full 240.
    Standalone (no decoder), `vaav1enc` does ~216 at `target-usage=4` but only ~116 at
-   `target-usage=7`: AV1's `QualityLevel::Performance` mapping to `target-usage=7` is
-   *slower*, not faster, on this driver.
+   `target-usage=7`: AV1's `QualityLevel::Performance` mapping to `target-usage=7` was
+   *slower*, not faster, on this driver. Fixed in #46: Performance is now `target-usage=2`,
+   see "Encoder limits made visible" below.
 
 ### Result (release build, `session.sh`, 30 s windows, receiver on DP-2)
 
@@ -552,6 +553,52 @@ session) gets 140 or 280 fps from its first second, depending only on keepalive 
   tag; `probe-run.sh` forwards them as `SRC_PROPS` / `WATCH`.
 - AV1 reports 1920x1082 in the viewer both before and after: a `vaav1enc` crop quirk, not
   from this change.
+
+## Encoder limits made visible; Performance = `target-usage=2` (2026-10-14, #46)
+
+### `target-usage` on Mesa radeonsi is not the VA spec's order
+
+Raw throughput, `client/scripts/enc-bench.sh`, 1080p NV12, 8 Mbit/s (CBR and VBR gave the
+same numbers), RX 7900 XTX, Mesa 26.2.4, GStreamer 1.28.8:
+
+| target-usage | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `vah264enc` | 246 | 307 | 307 | 172 | 172 | 172 | 172 |
+| `vah265enc` | 482 | 536 | 536 | 476 | 476 | 476 | 476 |
+| `vaav1enc` | 526 | 535 | 532 | 217 | 217 | 117 | 117 |
+
+The driver groups the values into bands, and 7 (the spec's "fastest") was the slowest AV1
+band and no faster than 4 for H.264. `QualityLevel::Performance` (Gaming and Low-latency
+presets) now maps to **2**, the fastest band for all three codecs; Balanced (4) and Quality
+(1) are unchanged. **Why 2 and not 1:** 1 is slower and its rate control overshoots (H.264
+wrote 65 % more bytes than at 2 for the same bitrate). Quality cost of 2 is noise (H.265
+PSNR 40.83 dB at 2, 40.84 at 4, 40.90 at 7 on a `testsrc2` clip). Trade-off: a driver that
+follows the VA order (Intel iHD) gets a slower encode for Performance; the hint below still
+tells the user when that caps the framerate. Full table and reasoning:
+`EncoderBackend::launch_fragment` in `client/src/capture.rs`.
+
+Real app, vkcube on DP-1 (280 Hz), 240 fps target, sender stats tracer: AV1 Gaming 107.8 fps
+encoder output before, 240.1 after; H.264 Gaming 239.9 after.
+
+### The encoder-limit hint
+
+`capture::destination::EncoderLimit` (on `DestinationRuntime`, so the UI reads it through
+`Destination::runtime` with no `session.rs` change): every 500 ms the destination pump
+compares the encoder's output fps against `min(frames offered to the branch, target fps)`.
+Offered frames are counted by a probe on the branch bin's sink pad, *before* its leaky
+queue. Below 90 % for more than 3 s → limited; at or above 90 % for more than 3 s →
+cleared; any non-Live state (a rebuild for a codec switch, a pause) resets it.
+**Why against the offered rate, not the target alone:** the portal sends a frame only when
+the screen changes, so an idle or slower monitor under a 240 target would otherwise read as
+an encoder limit. No per-GPU tables: everything is measured at run time.
+
+UI: the action bar's Live status shows `Screen · 172/240 fps` in the warning colour and its
+tooltip (now always present, with the full status) adds "Encoding 172 of 240 fps" plus a
+pointer to Stream settings. The stream-settings Video card shows an Info banner under
+Framerate, "Your encoder reaches about N fps with H.264 on this machine.", with a "Use
+H.265" button when H.265 is in `AppState::supported_codecs()` and not already the codec;
+it applies through the normal `EditDestination` path. Measured: H.264 @240 Balanced → hint
+at 171-173 fps; "Use H.265" → viewer 240-241 fps, hint gone.
 
 ## Cancelling the screen picker is silent (2026-10-14)
 
@@ -1030,7 +1077,7 @@ were re-run and still pass; this fix touches only `decode.rs`, nothing sender-si
 | Control | `x264enc` (Software) | `vah264enc` (Vaapi) |
 | --- | --- | --- |
 | Tune | `tune=zerolatency` (LowLatency) / unset (**BestQuality, default** — x264enc has no explicit "best quality" value, only the *absence* of the low-latency one) | **No equivalent control.** The field is still accepted on any destination — it simply has no effect until/unless that destination's live branch is `Software` |
-| Quality Level | `speed-preset`: `ultrafast` (Performance) / `medium` (**Balanced, default** — x264's own upstream default preset) / `veryslow` (Quality) | `target-usage`: `7` (Performance) / `4` (**Balanced, default** — the midpoint of the 1–7 scale) / `1` (Quality) — direct analogue, same 1 (best/slowest) – 7 (fastest/worst) scale |
+| Quality Level | `speed-preset`: `ultrafast` (Performance) / `medium` (**Balanced, default** — x264's own upstream default preset) / `veryslow` (Quality) | `target-usage`: `2` (Performance; `7` until #46, which is slower on Mesa radeonsi — see "Encoder limits made visible") / `4` (**Balanced, default**) / `1` (Quality) |
 | Rate Control | No native enum — `Constant` (default)/`Adaptive` are both plain `bitrate=` (**`Adaptive` is a deliberate no-op relative to `Constant`** — x264enc's CBR is already frame-adaptive within its budget, so there's no meaningfully different x264enc setting to reach for); `Quality` switches to `pass=qual quantizer=21` (bitrate-target `bitrate=` is then ignored) | `rate-control=cbr`/`vbr`/`cqp` — a genuine three-way native enum, no asymmetry |
 
 `Why the `Adaptive`/`Software` no-op is documented rather than faked with some invented
