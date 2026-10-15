@@ -173,7 +173,7 @@ One phase (**D34**): everything below is built and agent-tested in one run; the 
 **Your review**
 - [x] It looks and feels like the mockup, and the room flow is intuitive — *verified by: user*
 - [x] Watching a real 120+ fps share feels smooth — *verified by: user*
-- [x] The AppImage works for you — *verified by: user* — confirmed by the user 2026-10-15
+- [ ] The AppImage works for you — *verified by: user* — reopened 2026-10-15: starts, but sharing fails on Hyprland (pipewiresrc "unhandled format", board #76)
 - [ ] The website works once you've made the repo public and enabled Pages — *verified by: user*
 - [ ] The Windows build works for you — *verified by: user*
 
