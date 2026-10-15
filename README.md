@@ -48,3 +48,7 @@ presets get about 240 with the Performance setting.
 ## Contributing / agents
 
 Start at [`CLAUDE.md`](CLAUDE.md) and [`superdoc/architecture/overview.md`](superdoc/architecture/overview.md).
+
+## License
+
+MIT, see [`LICENSE`](LICENSE). The AppImage and Windows zip bundle the GPL-licensed x264 GStreamer plugin and LGPL GStreamer/FFmpeg libraries; those keep their own licenses.

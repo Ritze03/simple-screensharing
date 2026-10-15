@@ -2,6 +2,7 @@
 name = "simple-screensharing-client"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 # Explicit lib + bin targets: the egui/eframe binary below (UI only: `ui/`,
 # `theme.rs`, `widgets/`) sits on top of the backend `[lib]` (net, capture,
