@@ -2,6 +2,7 @@
 name = "simple-screensharing-protocol"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 # Shared wire types for the relay server and the client. Keep this crate
 # dependency-light: it is the one thing both sides must agree on.

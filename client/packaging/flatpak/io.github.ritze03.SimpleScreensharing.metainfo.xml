@@ -4,8 +4,7 @@
   <name>Simple Screensharing</name>
   <summary>Share your screen and audio with friends, or watch theirs</summary>
   <metadata_license>CC0-1.0</metadata_license>
-  <!-- ponytail: no LICENSE file in the repo yet; set the real SPDX id before any Flathub submission. -->
-  <project_license>LicenseRef-proprietary</project_license>
+  <project_license>MIT</project_license>
   <url type="homepage">https://github.com/Ritze03/simple-screensharing</url>
   <url type="bugtracker">https://github.com/Ritze03/simple-screensharing/issues</url>
   <developer id="io.github.ritze03">

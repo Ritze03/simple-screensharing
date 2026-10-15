@@ -99,7 +99,7 @@ which adds a registry dependency on Debian's libavcodec path).
 
 ## Licences
 
-The AppImage contains GPL code (x264) and LGPL code (FFmpeg, GStreamer, glib, ...). The client
+The app's own code is MIT (see `LICENSE`); bundled third-party libraries keep their own licenses. The AppImage contains GPL code (x264) and LGPL code (FFmpeg, GStreamer, glib, ...). The client
 is not linked against GPL code, x264 is loaded as a GStreamer plugin. linuxdeploy copies the
 Debian copyright files of the bundled libraries into `usr/share/doc/` inside the AppImage.
 
@@ -167,8 +167,8 @@ Flatpak install starts with its own empty room list, separate from an AppImage's
 **Decision: network at build time.** The module builds with `--share=network` so cargo fetches
 the crates; fine for a local bundle, forbidden on Flathub. Upgrade path (a `ponytail:` note in
 the manifest): generate `cargo-sources.json` with `flatpak-cargo-generator.py Cargo.lock`, list
-it under `sources:` and build `--offline`. The metainfo has `LicenseRef-proprietary` because the
-repo has no LICENSE file yet, and no screenshots; both are needed before a Flathub submission.
+it under `sources:` and build `--offline`. The metainfo has no screenshots, which
+Flathub needs.
 
 **Verified 2026-10-15** (headless rig, `client/scripts/hs-rig.sh`): the bundle (6.6 MB) installed
 `--user`, then the rig's two native clients were replaced by Flatpak instances: the window opens
