@@ -180,6 +180,8 @@ ui.bar.waiting_title: "Warte auf eine Bildänderung"
 #modal
 ui.modal.cancel: "Abbrechen"
 ui.modal.close: "Schließen"
+ui.modal.choose_name_body: "Freunde sehen diesen Namen in Räumen."
+ui.modal.choose_name_title: "Wähle deinen Namen"
 ui.modal.copy: "Kopieren"
 ui.modal.create: "Erstellen"
 ui.modal.create_tab: "Neuen Raum erstellen"
