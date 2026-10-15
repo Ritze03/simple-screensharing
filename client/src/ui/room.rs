@@ -42,7 +42,7 @@ use egui::{Align, Color32, CornerRadius, Id, Layout, Rect, Response, Sense, Shap
 use simple_screensharing_client::capture::VideoCodec;
 use simple_screensharing_client::capture::destination::DestinationState;
 use simple_screensharing_client::decode::render::Fit;
-use simple_screensharing_client::protocol::{ConnId, StreamInfo, StreamKind};
+use simple_screensharing_client::protocol::{StreamInfo, StreamKind};
 use simple_screensharing_client::session::{CaptureSourceId, DestinationId, ReconnectState, RoomHandle};
 
 use super::{ConnState, Cx, Modal, MyPhase, PopoverKind, RoomEntry, ShareState, StreamKey, UiAction, View, tr, tr_with};
@@ -138,12 +138,6 @@ pub fn grid_shape(n: usize, w: f32, h: f32, gap: f32) -> (usize, f32) {
     }
 }
 
-
-/// Avatar gradient for a member: ours is the accent one (as in the user
-/// band), everyone else gets one of the other four, stable per connection.
-fn avatar_color(me: bool, conn: ConnId) -> usize {
-    if me { 0 } else { 1 + (conn % 4) as usize }
-}
 
 fn initial(name: &str) -> String {
     name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default()
@@ -644,6 +638,11 @@ fn tiles(ui: &mut Ui, cx: &mut Cx, st: &mut RoomState, keys: &[StreamKey], cross
             popped_tile(ui, cxr, key, size, cross_room, &mut acts);
         } else if let Some(resp) = cxr.videos.show(key, ui, size, Fit::Contain) {
             tile_chrome(ui, resp.rect);
+            // Double-click = fullscreen. Registered before the overlay, whose
+            // buttons then take their own clicks. Single click does nothing.
+            if ui.interact(resp.rect, Id::new(("tile_dbl", key)), Sense::click()).double_clicked() {
+                acts.push(UiAction::EnterStreamFullscreen(key));
+            }
             tile_overlay(ui, cxr, st, key, resp.rect, cross_room, &mut acts);
         }
     });
@@ -934,16 +933,16 @@ fn thumb_corners(ui: &mut Ui, thumb: Rect, live: Option<&str>, audio: bool) {
 
 /// `vbox·info` (pad 12, gap 8): `[hbox·who 22: avatar 22, bold name, fill
 /// dim title][hbox·specs 16][btn_row]`. `who` = (shown name, the display
-/// name the avatar initial comes from, avatar colour); they differ only on
+/// name the avatar initial and colour come from); they differ only on
 /// our own card ("You" / "Du" vs our name). Returns the clicked button.
-fn card_info(ui: &mut Ui, info: Rect, who: (&str, &str, usize), title: &str, specs: &str, btns: &[Btn]) -> Option<usize> {
+fn card_info(ui: &mut Ui, info: Rect, who: (&str, &str), title: &str, specs: &str, btns: &[Btn]) -> Option<usize> {
     let inner = info.shrink(theme::S3);
     let mut c = ui.new_child(UiBuilder::new().max_rect(inner).layout(Layout::top_down(Align::Min)));
     c.spacing_mut().item_spacing.y = theme::S2;
     let nf = font(Weight::Bold, 13.5);
     let nw = text_width(&c, who.0, nf.clone(), 0.0).ceil().min(inner.width() * 0.6);
     let row = HBox::new("hbox·who", theme::AVATAR_SM).slots(&[fixed(theme::AVATAR_SM), fixed(nw), FILL]).show(&mut c);
-    widgets::paint_avatar(&c, row.cell(0), &initial(who.1), who.2, false);
+    widgets::paint_avatar(&c, row.cell(0), &initial(who.1), theme::avatar_color(who.1), false);
     row.text(&c, 1, who.0, nf, theme::TEXT, Align::Min);
     row.text(&c, 2, title, font(Weight::Regular, theme::FS_SMALL), theme::TEXT_DIM, Align::Min);
     let row = HBox::new("hbox·specs", 16.0).slots(&[FILL]).show(&mut c);
@@ -983,7 +982,6 @@ fn share_card(ui: &mut Ui, cx: &Cx, h: RoomHandle, info: &StreamInfo, acts: &mut
     let has_audio = audio_only || s.sibling_audio_stream(info.owner).is_some();
     thumb_corners(ui, thumb, Some("LIVE"), has_audio && !audio_only);
 
-    let me = cx.my_conn(h) == Some(info.owner);
     let label = super::share_label(&info.label);
     let name = cx.member_name(h, info.owner);
     let specs = if audio_only {
@@ -993,7 +991,7 @@ fn share_card(ui: &mut Ui, cx: &Cx, h: RoomHandle, info: &StreamInfo, acts: &mut
     } else {
         "—".to_owned()
     };
-    let who = (name.as_str(), name.as_str(), avatar_color(me, info.owner));
+    let who = (name.as_str(), name.as_str());
     if audio_only {
         let listening = cx.is_watching(key);
         let (l_on, l_off) = (tr("ui.room.listen", "Listen"), tr("ui.room.stop_listening", "Stop listening"));
@@ -1057,7 +1055,7 @@ fn my_card(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSourceId, destin
     // "You" label's: German "Du" made it a "D").
     let my_name = cx.my_conn(h).map(|me| cx.member_name(h, me)).unwrap_or_else(|| cx.state.display_name.clone());
     let settings = tr("ui.room.stream_settings", "Stream settings");
-    if card_info(ui, info_r, (&you, &my_name, 0), &super::share_label(&c.label), &specs, &[Btn::secondary(&settings).icon("tune")]).is_some() {
+    if card_info(ui, info_r, (&you, &my_name), &super::share_label(&c.label), &specs, &[Btn::secondary(&settings).icon("tune")]).is_some() {
         acts.push(UiAction::OpenModal(Modal::StreamSettings { capture, room: h }));
     }
 }
@@ -1093,11 +1091,11 @@ pub fn show_people(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
             let stale_tip = tr("ui.room.people_stale_tip", "As it was before the connection dropped");
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                let me = PersonRow { name: &cx.state.display_name, color: avatar_color(true, 0), you: Some(&you_tag), live: false, live_label: &live_l, watching: false, idle: true, stale: true };
+                let me = PersonRow { name: &cx.state.display_name, color: theme::avatar_color(&cx.state.display_name), you: Some(&you_tag), live: false, live_label: &live_l, watching: false, idle: true, stale: true };
                 widgets::person_row(ui, &me).on_hover_text(&stale_tip);
                 for m in &info.members {
                     let live = info.streams.iter().any(|i| i.owner == m.conn_id);
-                    let row = PersonRow { name: &m.display_name, color: avatar_color(false, m.conn_id), you: None, live, live_label: &live_l, watching: false, idle: !live, stale: true };
+                    let row = PersonRow { name: &m.display_name, color: theme::avatar_color(&m.display_name), you: None, live, live_label: &live_l, watching: false, idle: !live, stale: true };
                     widgets::person_row(ui, &row).on_hover_text(&stale_tip);
                 }
             });
@@ -1146,7 +1144,7 @@ pub fn show_people(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
                 ui,
                 &PersonRow {
                     name: &m.display_name,
-                    color: avatar_color(you, m.conn_id),
+                    color: theme::avatar_color(&m.display_name),
                     you: you.then_some(you_tag.as_str()),
                     live,
                     live_label: &live_l,
@@ -1205,16 +1203,6 @@ mod tests {
         // Columns never get narrower than a grid column; no fit → scroll.
         let (c, w) = grid_shape(9, 800.0, 100.0, 12.0);
         assert!(w >= MIN_TILE_W && c >= 1, "{c} {w}");
-    }
-
-    #[test]
-    fn avatar_colors_are_stable_and_ours_is_accent() {
-        assert_eq!(avatar_color(true, 7), 0);
-        for conn in 0..20u64 {
-            let c = avatar_color(false, conn);
-            assert!((1..=4).contains(&c));
-            assert_eq!(c, avatar_color(false, conn));
-        }
     }
 
     #[test]

@@ -668,3 +668,21 @@ fn pill_slots_fit_every_label_in_every_locale() {
     }
     assert_eq!(checked, 2 * BAR_PILLS.len());
 }
+
+#[tokio::test]
+async fn stream_fullscreen_needs_a_watched_stream_and_exit_restores_the_window_state() {
+    let _home = isolated_home();
+    let mut app = app_with_rooms(&[]);
+    let ctx = ctx();
+    let key = (RoomHandle(1), 5, 1);
+    // No such watched stream: nothing happens.
+    app.apply(&ctx, UiAction::EnterStreamFullscreen(key));
+    assert!(app.nav.fullscreen.is_none());
+    // A stale state (stream gone) is dropped by the next frame.
+    app.nav.fullscreen = Some(FullscreenStream { key, was_fullscreen: true });
+    app.apply(&ctx, UiAction::ExitStreamFullscreen);
+    assert!(app.nav.fullscreen.is_none());
+    app.nav.fullscreen = Some(FullscreenStream { key, was_fullscreen: false });
+    frame(&mut app, &ctx, egui::vec2(1000.0, 700.0));
+    assert!(app.nav.fullscreen.is_none(), "the stream is not watched, so the layout comes back");
+}

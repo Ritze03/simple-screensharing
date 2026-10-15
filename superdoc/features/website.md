@@ -77,7 +77,7 @@ Watch and share both work. Differences from native, all platform limits:
   room is a separate encoded + encrypted stream"). Done in the UI, not the core.
 - **Pop-out is Document Picture-in-Picture** (`documentPictureInPicture.requestWindow()`, Chromium
   116+): the tile's canvas moves into the PiP window (no second decode); one window per page; falls
-  back to a fullscreen stage. Native pop-outs are real viewports (`viewer-window.md`).
+  back to a fullscreen stage (a tile double-click uses that stage too, see "Double-click fullscreen and avatar colours"). Native pop-outs are real viewports (`viewer-window.md`).
 - **Room full is signalled with the `JoinRejected` frame, not a close code.** Chromium hides every
   WebTransport application close code (a `CONNECTION_CLOSE` surfaces as `WebTransportError:
   Connection lost.`, no `closeCode`), so the relay writes `JoinRejected{RoomFull|Malformed}` on the
@@ -113,6 +113,26 @@ Three user requests, the browser mirrors native tasks #68 and #70 so both client
 
 Verified through the real UI with `docs/dev/e2e/name-modal.mjs` (headless Chromium, throwaway relay) and by the unit vectors
 in `docs/dev/tests.js`.
+
+## Double-click fullscreen and avatar colours (task #77, 2026-10-15)
+
+Both user requests, mirrored from the native client (`superdoc/ui/APP-SHELL.md`, `superdoc/ui/STYLING-GUIDE.md`).
+
+- **Double-click a watched tile = fullscreen** (`app.js` `doFullscreen`), double-click again or Esc = back. It was "pop out"
+  before (the button still pops out). It reuses the pop-out's fullscreen *stage* (`popout.js` `popOut(w, onBack, "fullscreen")`):
+  a `.pip-stage` div appended to `document.body` that holds the canvas, with the statbar and a bring-back button on hover; the
+  tile shows the "is open in fullscreen" placeholder meanwhile. *Why a stage and not `tile.requestFullscreen()` (what the task
+  suggested):* `render()` rebuilds the whole tree (`root.replaceChildren`) on every state change, and a fullscreen element removed
+  from the DOM drops fullscreen, so a tile would have been kicked out of fullscreen by any toast, member join or stats refresh. The
+  stage lives outside `root`; the e2e checks a re-render while fullscreen. Double-click on the stage calls
+  `closePopout` (Esc leaves fullscreen natively and `fullscreenchange` brings the canvas back). The Document-PiP pop-out is
+  unchanged (a PiP window cannot go fullscreen, so no dblclick there). Needs the click's user activation: `dblclick` is one.
+- **Avatar colour from the name** (`dom.js` `avatarHue` / `avatarColor` / `avatarBg`): same algorithm and vectors as native,
+  the contract is in `STYLING-GUIDE.md` "Avatar colour"; `tests.js` asserts the vector table and >= 3:1 contrast on all 360 hues.
+  The old `.avatar.c1..c4` classes (connection-id gradients) are gone; the "you" avatars use the same function.
+- E2E: `docs/dev/e2e/avatar-fullscreen.mjs <relay host:port> <certhash>` (two pages named `client-1` / `client-2`, real double-clicks
+  through CDP `Page.dblclick`, avatar hexes, fullscreen survives a re-render, second double-click and `exitFullscreen()` return the
+  canvas). Headless Chromium's Fullscreen API works (`document.fullscreenElement` is set).
 
 ## Rendering above 60 fps (task #67, 2026-10-15)
 

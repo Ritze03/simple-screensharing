@@ -24,11 +24,12 @@ function stageFor(w, doc, onClose) {
 /**
  * @param w       the watch ({ canvas, ownerName, ... })
  * @param onBack  called once the stream is back in the main window (window closed / fullscreen left)
+ * @param want    "fullscreen" forces the fullscreen stage (double-click on a tile); omitted = PiP when supported
  * @returns "pip" | "fullscreen"
  */
-export async function popOut(w, onBack) {
+export async function popOut(w, onBack, want) {
   if (current) closePopout(current.w);
-  const mode = popoutMode();
+  const mode = want === "fullscreen" ? (document.fullscreenEnabled ? "fullscreen" : null) : popoutMode();
   if (!mode) throw new Error(t("ui.err.no_popout"));
   if (mode === "pip") {
     const win = await window.documentPictureInPicture.requestWindow({ width: 960, height: 540 });
@@ -47,6 +48,7 @@ export async function popOut(w, onBack) {
   }
   const stage = stageFor(w, document, () => document.exitFullscreen().catch(() => {}));
   stage.style.zIndex = "200";
+  stage.addEventListener("dblclick", () => closePopout(w)); // double-click again = back (Esc does the same natively)
   document.body.appendChild(stage);
   current = { w, stage, kind: "fullscreen", onBack };
   const onFs = () => {

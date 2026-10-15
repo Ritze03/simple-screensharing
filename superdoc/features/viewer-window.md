@@ -22,7 +22,8 @@ stream** (`StreamKey = (RoomHandle, ConnId, StreamId)`), re-declared every frame
   volume changes go back through `Shared::pending_volume`: `Why:` the viewport closure must be
   `Send + Sync + 'static` and cannot hold `Cx`, and screens never mutate `AppState` themselves. When
   not hovered the closure only locks the view and paints (no allocation, no `request_repaint`).
-- **F11** toggles fullscreen; **Esc** only *leaves* fullscreen and never closes (the former Electron rule,
+- **F11** or a **double-click** on the video toggles fullscreen (double-click added 2026-10-15, task #77; the chrome's
+  buttons keep their own clicks); **Esc** only *leaves* fullscreen and never closes (the former Electron rule,
   kept on purpose: a stray Esc must not kill someone's stream window).
 - **Closing brings the stream back.** The x button or an OS close sets `close_requested`, which the
   next main-window frame turns into `UiAction::BringBack`: the stream returns to its tile.

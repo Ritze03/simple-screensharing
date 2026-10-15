@@ -169,6 +169,23 @@ shows a placeholder. The pop-out has hover-gated chrome (statbar, audio pill), F
 fullscreen, and Escape only *leaves* fullscreen, never closes (the former Electron viewer's
 rules, carried over; `superdoc/features/viewer-window.md`).
 
+**Double-click a watched tile = fullscreen** (2026-10-15, task #77). `room::tiles` registers a
+`Sense::click` over the tile's video (before the hover overlay, so the overlay's buttons keep their own
+clicks; a single click still does nothing) and a double-click pushes `UiAction::EnterStreamFullscreen(key)`.
+`apply` records `Nav.fullscreen = Some(FullscreenStream { key, was_fullscreen })` (was the window already
+fullscreen?) and sends `ViewportCommand::Fullscreen(true)`. While `Nav.fullscreen` is set, `App::draw` paints
+*only* the stream (black `CentralPanel`, `VideoViews::paint(.., Fit::Contain)`, the same paint as a pop-out:
+no sidebar, bands, modals or toasts; pop-out viewports are still declared). A double-click on it or Escape
+(handled in `App::update`) pushes `ExitStreamFullscreen`, which sends `Fullscreen(was_fullscreen)`, so a window
+that was already fullscreen stays fullscreen. If the stream disappears (unwatched, ended, popped out) the next
+`draw` leaves the mode by itself. A popped-out tile is a placeholder and is not eligible. Inside a pop-out
+viewport a double-click toggles that window's fullscreen like F11 (`popout.rs`, registered before the chrome).
+*Why:* user request 2026-10-15 ("double clicking a share should actually full-screen it"). *Why a mode of
+the main window and not a new viewport:* the pop-out already exists for "own window"; this is the quick
+"fill my screen" gesture and must restore the layout (scroll, selection) untouched. Test:
+`stream_fullscreen_needs_a_watched_stream_and_exit_restores_the_window_state`; verified in the headless rig
+(sway `fullscreen_mode` 0 -> 1 on the double-click, 0 again on Escape from a windowed start).
+
 ## Behavioural rules that carried over
 
 These were decided in the earlier UIs and are still the rules.

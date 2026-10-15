@@ -84,7 +84,7 @@
 
 use std::collections::HashMap;
 
-use egui::{Align, Color32, CornerRadius, Frame, Id, Layout, Margin, Rect, Stroke, Ui, UiBuilder, pos2, vec2};
+use egui::{Align, Color32, CornerRadius, Frame, Id, Layout, Margin, Rect, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
 use simple_screensharing_client::audio::{AudioLevelTapHandle, AudioSource};
 use simple_screensharing_client::capture::destination::DestinationState;
 use simple_screensharing_client::presets::EncoderPreset;
@@ -210,6 +210,18 @@ pub struct Nav {
     pub view: View,
     pub modal: Option<Modal>,
     pub popover: Option<Popover>,
+    /// Double-click fullscreen: the one watched stream filling the whole
+    /// window, with every other region hidden (`draw` shows only it).
+    pub fullscreen: Option<FullscreenStream>,
+}
+
+/// The stream shown fullscreen in the main window ([`Nav::fullscreen`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FullscreenStream {
+    pub key: StreamKey,
+    /// Whether the window was already fullscreen when the stream took over;
+    /// leaving restores that (not unconditionally windowed).
+    pub was_fullscreen: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -300,6 +312,12 @@ pub enum UiAction {
     /// Stop watching (idempotent); closes its pop-out.
     Unwatch(StreamKey),
     PopOut(StreamKey),
+    /// Double-click on a tile: the window goes fullscreen showing only this
+    /// stream ([`Nav::fullscreen`]).
+    EnterStreamFullscreen(StreamKey),
+    /// Double-click / Escape in stream fullscreen: back to the previous layout
+    /// and window state.
+    ExitStreamFullscreen,
     /// Return a popped-out stream to its tile ("Bring back", window closed).
     BringBack(StreamKey),
     /// Toggle a standalone listen on an audio-only sender.
@@ -948,7 +966,7 @@ impl App {
         let view = state.room_store.rooms.first().map(|r| View::Room(r.join_string.clone())).unwrap_or_default();
         Self {
             state,
-            nav: Nav { view, modal: None, popover: None },
+            nav: Nav { view, modal: None, popover: None, fullscreen: None },
             shell: Shell::default(),
             videos: VideoViews::default(),
             sidebar: Default::default(),
@@ -1142,6 +1160,25 @@ impl App {
         let mut actions = Vec::new();
         let App { state, nav, shell, videos, sidebar, room, action_bar, stream_settings, modals, popout, .. } = self;
         let mut cx = Cx::new(state, nav, shell, videos, &mut actions);
+        if let Some(fs) = cx.nav.fullscreen {
+            if cx.videos.get(fs.key).is_some_and(|e| !e.popped) {
+                // Only the stream: no sidebar, bands, modals or toasts.
+                // `Why` the same black `Fit::Contain` paint as a pop-out
+                // (`popout.rs` `viewport`), so the letterboxing is identical.
+                egui::CentralPanel::default().frame(Frame::NONE.fill(Color32::BLACK)).show(ctx, |ui| {
+                    let rect = ui.max_rect();
+                    cx.videos.paint(fs.key, ui, rect, simple_screensharing_client::decode::render::Fit::Contain);
+                    if ui.interact(rect, Id::new("stream_fullscreen"), Sense::click()).double_clicked() {
+                        cx.act(UiAction::ExitStreamFullscreen);
+                    }
+                });
+                popout::show(ctx, &mut cx, popout);
+                return actions;
+            }
+            // The stream ended or was popped out meanwhile: leave and draw
+            // the normal layout this frame.
+            cx.act(UiAction::ExitStreamFullscreen);
+        }
         let room_panels = cx.shows_room_panels();
 
         // Left sidebar: brand band / scroll body / user band, split by hand
@@ -1252,6 +1289,11 @@ impl eframe::App for App {
         // would otherwise close on the same press).
         if self.nav.popover.is_some() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             self.nav.popover = None;
+        }
+
+        // Escape leaves stream fullscreen (no popover or modal is open then).
+        if self.nav.fullscreen.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.apply(ctx, UiAction::ExitStreamFullscreen);
         }
 
         let actions = self.draw(ctx);

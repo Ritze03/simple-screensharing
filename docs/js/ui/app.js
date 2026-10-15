@@ -9,7 +9,7 @@ import { S, onInvalidate, invalidate, toast, persistSettings, persistRooms, load
 import { t, setLang, getLang } from "./i18n.js";
 import {
   h, ic, T, V, H, SL, FILL, pct, fmtKbps, ctrlRow, valBox, sliderRow, seg, cbx, card, secHead, roomRow, sharerRow, personRow, destRow,
-  popItem, btnRow, gridRows, cols, emptyState, banner, meter, modalShell, avatarClass, initial,
+  popItem, btnRow, gridRows, cols, emptyState, banner, meter, modalShell, avatarBg, initial,
 } from "./dom.js";
 import {
   RoomEntry, roomById, connectRoom, disconnectRoom, retryNow, watchStream, unwatchStream, setWatchVolume, setWatchMuted, allWatches,
@@ -198,7 +198,7 @@ function renderSide() {
       S.rooms.length ? V({ cls: "well", g: 0, attrs: { role: "list" } }, rows) : h("div", { class: "side-empty", text: t("ui.sidebar.no_rooms") }),
       H({ g: 0 }, FILL(h("button", { class: "btn btn-ghost wide", type: "button", id: "btn-create-join", onclick: () => openAdd() }, ic("add"), t("ui.sidebar.create_or_join"))))),
     H({ cls: "band bottom p-user", g: 2 },
-      SL(32, h("span", { class: "avatar" }, initial(me()), h("span", { class: "pres" + (S.rooms.some((r) => r.state === "joined") ? "" : " off") }))),
+      SL(32, h("span", { class: "avatar", style: avatarBg(me()) }, initial(me()), h("span", { class: "pres" + (S.rooms.some((r) => r.state === "joined") ? "" : " off") }))),
       FILL(V({ cls: "who", g: 0, attrs: { role: "button", tabindex: "0", title: t("ui.sidebar.outgoing_tip"), onclick: (e) => openPopup("outgoing", e.currentTarget) } },
         T(me(), "b"), h("span", { class: "txt" + (nLive ? " live" : ""), text: nLive ? (nLive === 1 ? t("ui.sidebar.live_in_one_room") : t("ui.sidebar.live_in_rooms", { count: nLive })) : t("ui.sidebar.not_sharing") }))),
       SL(32, h("button", { class: "icon-btn", type: "button", id: "btn-settings", title: t("ui.sidebar.settings"), "aria-label": t("ui.sidebar.settings"), onclick: () => { S.modal = { kind: "settings" }; render(); } }, ic("settings")))));
@@ -324,7 +324,7 @@ function shareCard(r, s) {
       prev ? h("img", { src: prev, alt: "" }) : h("div", { class: "noprev" }, ic("screen_share")),
       V({ cls: "ovl", g: 0 }, H({ g: 2 }, liveChip(), FILL(null), r.hasAudio(s.owner) ? h("span", { class: "chip-dark", title: t("ui.room.shares_audio") }, ic("volume_up")) : null))),
     V({ cls: "card-pad", g: 2 },
-      H({ cls: "who", g: 2, style: "height:22px" }, SL(22, h("span", { class: "avatar sm " + avatarClass(s.owner), text: initial(owner) })), h("b", { text: owner }), FILL(T(s.label || "", "t"))),
+      H({ cls: "who", g: 2, style: "height:22px" }, SL(22, h("span", { class: "avatar sm", style: avatarBg(owner), text: initial(owner) })), h("b", { text: owner }), FILL(T(s.label || "", "t"))),
       H({ g: 0 }, T(s.width ? `${s.width}×${s.height}` : t("ui.room.size_unknown"), "specs")),
       btnRow(
         h("button", { class: "btn btn-primary", type: "button", "data-watch": s.key, disabled: !canWatch, onclick: () => { watchStream(r, s.key); } }, ic("play_arrow"), t("ui.room.watch")),
@@ -339,7 +339,7 @@ function myCard(c, r) {
         H({ g: 2 }, d.state === "live" ? liveChip() : h("span", { class: "chip-dark", text: t("ui.room.starting_chip") }), FILL(null)),
         FILL(V({ cls: "mine-label", g: 1, style: "align-items:center;padding:8px" }, ic("cast"), T(t("ui.room.your_screen"))), { v: true, style: "align-items:center" }))),
     V({ cls: "card-pad", g: 2 },
-      H({ cls: "who", g: 2, style: "height:22px" }, SL(22, h("span", { class: "avatar sm", text: initial(me()) })), h("b", { text: t("ui.sidebar.you") }), FILL(T(captureName(c), "t"))),
+      H({ cls: "who", g: 2, style: "height:22px" }, SL(22, h("span", { class: "avatar sm", style: avatarBg(me()), text: initial(me()) })), h("b", { text: t("ui.sidebar.you") }), FILL(T(captureName(c), "t"))),
       H({ g: 0 }, T(`${captureRes(c)} · ${d.fps} fps · ${codecLabel(d.codec)}`, "specs")),
       btnRow(h("button", { class: "btn btn-secondary", type: "button", onclick: () => openStreamModal(c.id, r.id) }, ic("tune"), t("ui.bar.stream_settings")))));
 }
@@ -368,7 +368,7 @@ function renderTile(r, w, crossRoom) {
   const kbpsEl = liveText(h("span", { class: "v kbps" }), () => watchKbps(w));
   const resEl = liveText(h("span", { class: "v" }), () => watchRes(w, info));
   const hasAudio = r.hasAudio(w.owner);
-  return h("div", { class: "tile", tabindex: "0", "aria-label": t("ui.tile.aria", { name: w.ownerName }), "data-key": w.key, ondblclick: () => doPopOut(r, w) },
+  return h("div", { class: "tile", tabindex: "0", "aria-label": t("ui.tile.aria", { name: w.ownerName }), "data-key": w.key, ondblclick: () => doFullscreen(r, w) },
     kids, h("div", { class: "vig hover-ui" }),
     V({ cls: "ovl hover-ui", g: 0 },
       H({ g: 2 },
@@ -402,6 +402,17 @@ async function doPopOut(r, w) {
   }
   render();
 }
+/** Double-click on a tile: the stream fills the screen. `Why` a body-level stage (popout.js, mode "fullscreen") and not
+ *  tile.requestFullscreen(): render() replaces the whole tree on every state change, which would drop a fullscreen tile. */
+async function doFullscreen(r, w) {
+  try {
+    if (w.popped === "fullscreen") closePopout(w);
+    else if (!w.popped) await popOut(w, () => invalidate(), "fullscreen");
+  } catch (e) {
+    toast(t("ui.toast.popout_failed", { error: e.message }), "error", { err: true });
+  }
+  render();
+}
 function watchAndPop(r, key) {
   const w = watchStream(r, key);
   if (w) doPopOut(r, w);
@@ -418,7 +429,7 @@ function renderPeople(r) {
       const sharing = m.self ? !!capInRoom(r.id) : r.streams.some((s) => s.owner === m.id && s.kind === "video");
       const watching = !m.self && [...r.watches.values()].some((w) => w.owner === m.id);
       return personRow({
-        avatar: h("span", { class: "avatar sm " + (m.self ? "" : avatarClass(m.id)), text: initial(m.name) }),
+        avatar: h("span", { class: "avatar sm", style: avatarBg(m.name), text: initial(m.name) }),
         name: m.name || "?", you: m.self, youLabel: t("ui.room.you_suffix"), idle: !sharing, stale,
         pill: sharing ? h("span", { class: "badge badge-live" }, t("ui.room.live_pill")) : null,
         eye: watching ? ic("visibility", "ico watch") : null,

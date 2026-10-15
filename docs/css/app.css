@@ -185,10 +185,6 @@ select.field { cursor: pointer; padding-right: 6px; }
 .meter i.lit.hot { background: var(--warning); }
 .avatar { width: 32px; height: 32px; border-radius: 50%; background: var(--accent-mark-gradient); color: #fff; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; font-size: 13px; flex: 0 0 auto; position: relative; }
 .avatar.sm { width: 22px; height: 22px; font-size: 10.5px; }
-.avatar.c1 { background: linear-gradient(140deg, #e07b5a, #a33f3f); }
-.avatar.c2 { background: linear-gradient(140deg, #50c878, #2f7a55); }
-.avatar.c3 { background: linear-gradient(140deg, #c58af9, #6b3fa8); }
-.avatar.c4 { background: linear-gradient(140deg, #e8c33d, #9a7420); }
 .avatar .pres { position: absolute; right: -2px; bottom: -2px; width: 10px; height: 10px; border-radius: 50%; border: 2px solid var(--elevation-14); background: var(--success); }
 .avatar .pres.off { background: var(--text-faint); }
 .sdot { width: 9px; height: 9px; border-radius: 50%; box-sizing: border-box; }

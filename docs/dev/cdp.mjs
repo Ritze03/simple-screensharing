@@ -120,6 +120,21 @@ export class Page {
     await this.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: pos.x, y: pos.y, button: "left", clickCount: 1 });
     await sleep(120);
   }
+  /** Real double-click (two press/release pairs with clickCount 1 and 2: the page sees click, click, dblclick, with user activation). */
+  async dblclick(target, { timeout = 10000 } = {}) {
+    let pos = null;
+    const t0 = Date.now();
+    while (!(pos = await this.#locate(target))) {
+      if (Date.now() - t0 > timeout) throw new Error(`dblclick: no element for ${JSON.stringify(target)}`);
+      await sleep(100);
+    }
+    await this.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: pos.x, y: pos.y });
+    for (const clickCount of [1, 2]) {
+      await this.send("Input.dispatchMouseEvent", { type: "mousePressed", x: pos.x, y: pos.y, button: "left", clickCount });
+      await this.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: pos.x, y: pos.y, button: "left", clickCount });
+    }
+    await sleep(200);
+  }
   async hover(target) {
     const pos = await this.#locate(target);
     if (!pos) throw new Error(`hover: no element for ${JSON.stringify(target)}`);

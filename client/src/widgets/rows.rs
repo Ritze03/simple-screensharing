@@ -252,8 +252,8 @@ pub fn sharer_row(ui: &mut Ui, row: &SharerRow) -> Response {
 #[derive(Clone, Copy, Debug)]
 pub struct PersonRow<'a> {
     pub name: &'a str,
-    /// Avatar gradient index (`theme::AVATAR_GRADIENTS`).
-    pub color: usize,
+    /// Avatar colour: `theme::avatar_color(name)`.
+    pub color: Color32,
     /// The faint "you" tag after the name (the caller's translation), or `None`.
     pub you: Option<&'a str>,
     /// Sharing: green "LIVE" pill in the 44 slot.
