@@ -171,9 +171,9 @@ One phase (**D34**): everything below is built and agent-tested in one run; the 
 - [x] The client builds and runs in the WinBoat VM over SSH, joins a room and receives a share from the Linux client — *verified by: agent* — ran `build.ps1` + `cargo test --release --lib` in the VM and the `test_viewer` example against a headless Linux `test_sender` → built, 300 tests passed, decoded 34–35 fps H.264 (avdec_h264, VM has no GPU); Windows → Linux 30 fps too. Not covered: the GUI window and `d3d11screencapturesrc` (VM had no logged-in desktop session)
 
 **Your review**
-- [ ] It looks and feels like the mockup, and the room flow is intuitive — *verified by: user*
-- [ ] Watching a real 120+ fps share feels smooth — *verified by: user*
-- [ ] The AppImage works for you — *verified by: user*
+- [x] It looks and feels like the mockup, and the room flow is intuitive — *verified by: user*
+- [x] Watching a real 120+ fps share feels smooth — *verified by: user*
+- [x] The AppImage works for you — *verified by: user* — confirmed by the user 2026-10-15
 - [ ] The website works once you've made the repo public and enabled Pages — *verified by: user*
 - [ ] The Windows build works for you — *verified by: user*
 
