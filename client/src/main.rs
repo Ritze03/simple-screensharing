@@ -15,6 +15,11 @@
 //! `--gallery` opens the widget gallery (`widgets::gallery`) instead of the app:
 //! every theme/widget helper with fake data, for visual QC of the new design.
 
+// Windows release builds are GUI-subsystem binaries: double-clicking the exe must not open a
+// console window. Consequence: stderr goes nowhere, so `init_logging` writes the log to a file
+// (see there). Debug builds keep the console for `cargo run`.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 #[macro_use]
 extern crate rust_i18n;
 
@@ -93,16 +98,69 @@ fn use_bundled_gstreamer() {
     }
 }
 
+/// Windows GUI-subsystem exe started from a terminal: attach to the parent's console so
+/// `--help` and argument errors are printed there. Only when the process has no usable stdout
+/// handle: attaching replaces the standard handles and would break `> file` / pipe redirection.
+/// No-op without a parent console.
+#[cfg(windows)]
+fn attach_parent_console() {
+    use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_OUTPUT_HANDLE};
+    // SAFETY: plain Win32 calls, no pointers.
+    unsafe {
+        let out = GetStdHandle(STD_OUTPUT_HANDLE);
+        if out.is_null() || out as isize == -1 {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+}
+
+/// Logging. Console builds log to stderr. A Windows release build has no console (see the
+/// `windows_subsystem` attribute at the top), so it appends to
+/// `%LOCALAPPDATA%\simple-screensharing\client.log` instead (truncated once it passes 1 MB).
+/// Falls back to stderr if the file cannot be opened.
+fn init_logging() {
+    #[cfg(all(windows, not(debug_assertions)))]
+    {
+        if let Some(dir) = dirs::cache_dir().map(|d| d.join("simple-screensharing")) {
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("client.log");
+            let big = std::fs::metadata(&path).map(|m| m.len() > 1 << 20).unwrap_or(false);
+            let file = std::fs::OpenOptions::new().create(true).append(!big).write(true).truncate(big).open(&path);
+            if let Ok(file) = file {
+                tracing_subscriber::fmt().with_ansi(false).with_writer(std::sync::Mutex::new(file)).init();
+                // The default panic message goes to the (absent) stderr; keep it in the log.
+                std::panic::set_hook(Box::new(|info| tracing::error!("panic: {info}")));
+                return;
+            }
+        }
+    }
+    tracing_subscriber::fmt::init();
+}
+
 fn main() -> anyhow::Result<()> {
+    let result = run();
+    // Without a console (Windows release) a returned error would vanish with stderr.
+    #[cfg(all(windows, not(debug_assertions)))]
+    if let Err(e) = &result {
+        tracing::error!("exiting with error: {e:#}");
+    }
+    result
+}
+
+fn run() -> anyhow::Result<()> {
     #[cfg(windows)]
     use_bundled_gstreamer();
     let mode = match parse_args(std::env::args().skip(1)) {
         Ok(Some(mode)) => mode,
         Ok(None) => {
+            #[cfg(windows)]
+            attach_parent_console();
             print!("{USAGE}");
             return Ok(());
         }
         Err(e) => {
+            #[cfg(windows)]
+            attach_parent_console();
             eprintln!("error: {e}\n\n{USAGE}");
             std::process::exit(2);
         }
@@ -118,7 +176,7 @@ fn main() -> anyhow::Result<()> {
     let tokio_rt = tokio::runtime::Runtime::new().expect("failed to start tokio runtime");
     let _tokio_guard = tokio_rt.enter();
 
-    tracing_subscriber::fmt::init();
+    init_logging();
 
     // Presentation mode is only settable here, at surface-creation time: the
     // pinned eframe/egui-wgpu (0.33.3) doesn't expose the render surface for
