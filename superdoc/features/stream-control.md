@@ -163,7 +163,7 @@ split was only in the entry points:
 - `AppState::go_live(capture_id, room_handle)` is `add_destination`'s fan-out primitive used for
   the first branch. It raises the source-framerate floor if needed
   (`CaptureHandle::set_source_framerate`), builds `VideoParams` from the *current* process-wide
-  framerate/bitrate/tune/quality/rate-control/codec, and calls `add_destination_with_params` with
+  framerate/bitrate/tune/quality/codec, and calls `add_destination_with_params` with
   `PendingRole::GoingLive` (identical to `FanOut`, a separate variant only so the UI says "Going
   live" rather than "Also sending here" while it waits for the first IDR).
 - **Room-preview thumbnail:** `preview::spawn_preview_task` needs a client and `stream_id`, which a
@@ -190,7 +190,7 @@ by hand (2026-07-28):**
 
 **Defaults are saved once, at "Go live"**, not on every control change (the owner's explicit ask);
 see "Start-stream defaults" below. A UI that renders a live card must seed its displayed tuning from
-what it just staged: the destination row carries no tune/quality/rate-control fields, so the
+what it just staged: the destination row carries no tune/quality fields, so the
 staged values are the only copy (the former Electron UI once showed "Balanced" on a card that really ran
 the staged "Low Latency" because it skipped this seed; the encoder was never affected).
 
@@ -639,7 +639,7 @@ resolution/framerate/bitrate: **Tune** (Low-Latency / Best Quality — `BestQual
 **Quality Level** (Performance / Balanced / Quality — `Balanced` default), and **Rate
 Control** (Constant / Adaptive / Quality — `Constant` default). Defined as `TuneMode`,
 `QualityLevel`, `RateControlMode` in `capture.rs`, exposed via `edit_destination`'s
-`tune`/`quality_level`/`rate_control` params (snake_case strings, same convention as every
+`tune`/`quality_level` params (snake_case strings, same convention as every
 other `edit_destination` param) and as controls in the destination settings
 (`client/src/ui/stream_settings.rs`).
 
@@ -663,7 +663,7 @@ needed fixing. Regression coverage for the new mapping:
 ### Presets (simple) over the raw tuning fields (advanced)
 
 *Why two tiers:* the project requirement is "easy for regular users and powerful for advanced
-users", and showing Tune/Quality/Rate Control jargon on every card failed the first half. A
+users", and showing Tune/Quality/Rate Control jargon (Rate Control has since been removed, #88) on every card failed the first half. A
 **preset** is a convenience over the same three raw fields, never a fourth field: picking one sets
 `tune`/`quality_level`/`rate_control` together through the same `edit_destination` call a single
 raw control uses. The table lives in `client/src/presets.rs` (ported from the former Electron
@@ -1142,6 +1142,8 @@ need further adjustment after real-world (non-scripted) use.
 
 ### Rate control renamed Dynamic / Static; Low-Latency and Gaming move to Dynamic (2026-10-15, #87)
 
+**Superseded the same day (#88): the choice was removed, only Dynamic remains. Kept for the measurements (the rationale).**
+
 **User report (2026-10-15):** "'Efficient' works flawlessly. 'Max quality' freezes on big movements ... Efficient uses like 6 Mbit/s with just my desktop showing, and Max quality like half a Mbit/s, but it should be the other way around, right?"
 
 **The names were backwards, the modes were not switched.** `Cqp` (shown as "Max quality") holds the
@@ -1182,6 +1184,38 @@ presets are Dynamic; Low-Latency vs Gaming still differ by GOP only. A saved Low
 `Cqp` now matches no preset (shown as hand-tuned, Static selected) until a preset is picked again.
 The browser mirrors it: Low-Latency/Gaming use `bitrateMode: "variable"`, the read-only rate-control row
 reads "Dynamic (variable bitrate)".
+
+### Rate control is no longer configurable: always Dynamic (2026-10-15, #88)
+
+**User request (2026-10-15):** "It's probably best if we just make Dynamic the default and remove the ability to
+configure that. So the rate control is just set and it just works, since it behaves really good and the other one
+doesn't behave at all."
+
+`Why:` Static (CQP) froze the stream on motion because it ignores the configured bitrate (measurements in the #87
+section above: 4-70x the configured kbps on busy content); Dynamic held the budget. With one mode that was never
+the wrong choice, the setting was only a way to break a stream, so it was deleted rather than hidden (nothing in
+the UI, presets or settings reads it any more).
+
+**What is gone:** `capture::RateControlMode` (`Cqp`/`Qvbr`) and every `rate_control` field (`VideoParams`,
+`EncodeSettings`, `EncoderTuning`, `DestEdit`, `NextStream`, `AppState`, `StartStreamDefaults`, the
+`launch_fragment` argument); the Advanced "Rate control" row; i18n `ui.stream.rate_control`, `rate_control_tip`,
+`rc_dynamic`, `rc_static`; the browser's read-only row, `bitrateMode` on the presets and the `bitrateMode` override
+on `shareScreen` (the sender always uses `"variable"`). A preset is now `tune` + `quality_level` + GOP; Low-Latency
+vs Gaming is still told apart by GOP alone.
+
+**What is fixed:** VA encoders (`vah264enc`/`vah265enc`/`vaav1enc`) always get `rate-control=vbr
+target-percentage=95 cpb-size=bitrate*3/8` (`VBR_TARGET_PERCENTAGE`, `VBR_CPB_SIZE_*` in `capture.rs`; `vbr`, not the
+literal `qvbr`, because of the Mesa radeonsi ceiling bug documented above); x264enc keeps its plain `bitrate=`
+(`pass` unset). The only backends are Software and Vaapi: there is no Windows/MF encoder branch in this crate.
+
+**Old settings files:** `settings.toml` written while the choice existed has `rate_control = "cqp"` or `"qvbr"` in
+`[start_stream_defaults]`. `StartStreamDefaults` has no `deny_unknown_fields`, so serde ignores the key and the file
+loads as before (everything behaves as Dynamic). Test: `rooms::tests::start_stream_defaults_ignores_removed_rate_control_key`.
+Nothing else persisted the value (destination params are runtime-only).
+
+The tests that used `rate_control` as one of the toggled tuning controls now use `gop_millis` (also a `BranchSwap`):
+`tuning_knob_changes_are_tier_two`, `late_watch_after_all_three_tuning_controls_toggled_...`.
+`rate_control_mode_maps_per_backend` became `rate_control_is_always_dynamic_per_backend` (+ `..._on_h265_and_av1`).
 
 ### Interaction with viewers: codec-string re-derivation
 
@@ -1357,7 +1391,7 @@ the same local-TOML load-modify-save mechanism as `save_bandwidth_settings`
 strings equal the wire strings; every new field is `#[serde(default)]` so an older `settings.toml`
 still loads. *Why separate from the live `AppState` settings view:* the live `framerate`/
 `bitrate_kbps` reset to defaults every launch ("every launch starts fresh"), which is a different
-question from "what did the user last save"; tune/quality/rate-control only exist per destination.
+question from "what did the user last save"; tune/quality only exist per destination.
 First-run fallback equals the backend `#[default]`s: 30 fps / 8000 kbps / `best_quality` /
 `balanced` / `constant` / H.264. The `[start_stream_defaults]` block is written to `settings.toml`
 in the app's config dir; check a persistence change with a scratch `XDG_CONFIG_HOME` and the `run`
@@ -1441,7 +1475,7 @@ A `Failed` destination's Retry calls `AppState::retry_destination` (`session.rs`
 `stop_destination` + `start_destination`.
 
 **Why:** that pairing used to be the implementation and had two real bugs. It lost the failed
-destination's last-configured bitrate/tune/quality/rate-control (a new destination copies params
+destination's last-configured bitrate/tune/quality (a new destination copies params
 from a *sibling* on the capture, and the common case has none, so it silently reset to defaults).
 Worse, `stop_destination` tears down the *whole capture* once its destination count hits one, so
 `start_destination` bailed silently and retry failed outright for the single-destination case.

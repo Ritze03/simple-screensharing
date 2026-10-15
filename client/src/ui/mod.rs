@@ -230,14 +230,13 @@ pub struct FullscreenStream {
 
 /// Encoder settings for the *next* capture (what a staged stream goes live
 /// with): `AppState`'s process-wide `framerate`/`bitrate_kbps`/`tune`/
-/// `quality_level`/`rate_control`/`gop_millis`/`codec` fields.
+/// `quality_level`/`gop_millis`/`codec` fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NextStream {
     pub framerate: u32,
     pub bitrate_kbps: u32,
     pub tune: simple_screensharing_client::capture::TuneMode,
     pub quality_level: simple_screensharing_client::capture::QualityLevel,
-    pub rate_control: simple_screensharing_client::capture::RateControlMode,
     pub gop_millis: u32,
     pub codec: simple_screensharing_client::capture::VideoCodec,
 }
@@ -250,7 +249,6 @@ impl NextStream {
             bitrate_kbps: state.bitrate_kbps,
             tune: state.tune,
             quality_level: state.quality_level,
-            rate_control: state.rate_control,
             gop_millis: state.gop_millis,
             codec: state.codec,
         }

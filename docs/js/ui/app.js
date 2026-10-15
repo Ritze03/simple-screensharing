@@ -597,7 +597,6 @@ function renderStreamModal(M, close) {
   if (S.advOpen) {
     encRows.push(V({ g: 2 },
       ctrlRow(t("ui.stream.tune"), T(p.latencyMode === "realtime" ? t("ui.stream.tune_low_latency") : t("ui.stream.tune_best_quality"), "ro")),
-      ctrlRow(t("ui.stream.rate_control"), T(p.bitrateMode === "constant" ? t("ui.stream.rc_constant") : t("ui.stream.rc_variable"), "ro")),
       ctrlRow(t("ui.stream.keyframe_interval"), T(`${p.gopMs} ms`, "ro")),
       ctrlRow(t("ui.stream.quality_level"), T(t("ui.stream.native_only"), "ro")),
       h("span", { class: "hint", text: t("ui.stream.advanced_browser_note") })));

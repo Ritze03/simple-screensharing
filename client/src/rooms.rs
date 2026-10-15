@@ -39,7 +39,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::capture::{QualityLevel, RateControlMode, TuneMode, VideoCodec};
+use crate::capture::{QualityLevel, TuneMode, VideoCodec};
 use crate::net::{format_join_string, parse_join_string};
 
 /// The identity of the room a join string points at: `server|room-id|key`
@@ -441,8 +441,6 @@ pub struct StartStreamDefaults {
     pub tune: TuneMode,
     #[serde(default)]
     pub quality_level: QualityLevel,
-    #[serde(default)]
-    pub rate_control: RateControlMode,
     /// `#[serde(default)]` (-> `VideoCodec::H264`) is load-bearing here:
     /// every existing user's on-disk `settings.toml` predates this field, so
     /// it must deserialize to exactly the behavior they already had rather
@@ -468,7 +466,6 @@ impl Default for StartStreamDefaults {
             bitrate_kbps: Self::default_bitrate_kbps(),
             tune: TuneMode::default(),
             quality_level: QualityLevel::default(),
-            rate_control: RateControlMode::default(),
             codec: VideoCodec::default(),
         }
     }
@@ -960,7 +957,6 @@ mod tests {
                 bitrate_kbps: 12_000,
                 tune: crate::capture::TuneMode::LowLatency,
                 quality_level: crate::capture::QualityLevel::Performance,
-                rate_control: crate::capture::RateControlMode::Cqp,
                 codec: crate::capture::VideoCodec::H265,
             },
             ..AppSettings::default()
@@ -983,6 +979,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(parsed.start_stream_defaults.codec, crate::capture::VideoCodec::H264);
+    }
+
+    /// Rate control stopped being a setting (#88): settings files saved while
+    /// it was (`rate_control = "cqp"` / `"qvbr"`) must still load, ignoring the
+    /// removed key (serde skips unknown fields; no `deny_unknown_fields`), and
+    /// keep every other value.
+    #[test]
+    fn start_stream_defaults_ignores_removed_rate_control_key() {
+        for old in ["cqp", "qvbr", "adaptive"] {
+            let parsed: AppSettings = toml::from_str(&format!(
+                "[start_stream_defaults]\nframerate = 60\nbitrate_kbps = 12000\ntune = \"low_latency\"\nquality_level = \"performance\"\nrate_control = \"{old}\"\ncodec = \"h265\"\n"
+            ))
+            .unwrap();
+            let d = parsed.start_stream_defaults;
+            assert_eq!((d.framerate, d.bitrate_kbps), (60, 12_000), "rate_control = {old}");
+            assert_eq!(d.tune, crate::capture::TuneMode::LowLatency);
+            assert_eq!(d.codec, crate::capture::VideoCodec::H265);
+        }
     }
 
     #[test]

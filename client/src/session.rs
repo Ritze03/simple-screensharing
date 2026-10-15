@@ -411,7 +411,6 @@ pub const AUDIO_DESTINATION_PARAMS: capture::destination::VideoParams = capture:
     backend: capture::EncoderBackend::Software,
     tune: capture::TuneMode::LowLatency,
     quality_level: capture::QualityLevel::Performance,
-    rate_control: capture::RateControlMode::Cqp,
     gop_millis: capture::DEFAULT_GOP_MILLIS,
     codec: capture::VideoCodec::H264,
 };
@@ -461,8 +460,6 @@ pub struct DestEdit {
     pub tune: capture::TuneMode,
     /// Performance vs. quality encode speed — `capture::QualityLevel`.
     pub quality_level: capture::QualityLevel,
-    /// CQP/QVBR rate control — `capture::RateControlMode`.
-    pub rate_control: capture::RateControlMode,
     /// Keyframe/GOP interval in milliseconds — see
     /// `capture::destination::VideoParams::gop_millis`. Preset-driven (the
     /// Gaming preset uses a shorter interval); not a raw Advanced-tuning
@@ -551,7 +548,6 @@ impl Destination {
             bitrate_kbps: params.bitrate_kbps,
             tune: params.tune,
             quality_level: params.quality_level,
-            rate_control: params.rate_control,
             gop_millis: params.gop_millis,
             codec: params.codec,
         }
@@ -578,7 +574,6 @@ impl Destination {
             backend: self.live_params().backend,
             tune: self.edit.tune,
             quality_level: self.edit.quality_level,
-            rate_control: self.edit.rate_control,
             gop_millis: self.edit.gop_millis,
             codec: self.edit.codec,
         }
@@ -1572,9 +1567,6 @@ pub struct AppState {
     /// Encoder quality level to use for the *next* video capture started.
     /// See `tune`'s `Why:` note and `capture::QualityLevel`.
     pub quality_level: capture::QualityLevel,
-    /// Encoder rate-control mode to use for the *next* video capture
-    /// started. See `tune`'s `Why:` note and `capture::RateControlMode`.
-    pub rate_control: capture::RateControlMode,
     /// GOP/keyframe interval (ms) to use for the *next* video capture
     /// started. See `tune`'s `Why:` note and
     /// `capture::destination::VideoParams::gop_millis`.
@@ -1712,7 +1704,6 @@ impl Default for AppState {
             framerate: DEFAULT_FRAMERATE,
             tune: capture::TuneMode::default(),
             quality_level: capture::QualityLevel::default(),
-            rate_control: capture::RateControlMode::default(),
             gop_millis: capture::DEFAULT_GOP_MILLIS,
             codec: capture::VideoCodec::default(),
             new_stream_room: None,
@@ -1827,12 +1818,11 @@ pub fn save_start_stream_defaults(
     bitrate_kbps: u32,
     tune: crate::capture::TuneMode,
     quality_level: crate::capture::QualityLevel,
-    rate_control: crate::capture::RateControlMode,
     codec: crate::capture::VideoCodec,
 ) {
     let mut settings = AppSettings::load();
     settings.start_stream_defaults =
-        crate::rooms::StartStreamDefaults { framerate, bitrate_kbps, tune, quality_level, rate_control, codec };
+        crate::rooms::StartStreamDefaults { framerate, bitrate_kbps, tune, quality_level, codec };
     if let Err(e) = settings.save() {
         tracing::warn!("failed to save start-stream defaults: {e:#}");
     }
@@ -2019,16 +2009,15 @@ impl AppState {
             framerate,
             bitrate_kbps,
             backend: capture::EncoderBackend::default(),
-            // `self.tune`/`self.quality_level`/`self.rate_control`, not
+            // `self.tune`/`self.quality_level`, not
             // `TuneMode::default()`/etc.: these are the same "process-wide,
             // set via a pre-start command" setting as `bitrate_kbps`/
             // `framerate` above (see their own doc comments on `AppState`) —
             // the "START A STREAM" form's Preset/Advanced-tuning controls
-            // set them via `set_tune`/`set_quality_level`/`set_rate_control`
+            // set them via `set_tune`/`set_quality_level`
             // before calling this.
             tune: self.tune,
             quality_level: self.quality_level,
-            rate_control: self.rate_control,
             gop_millis: self.gop_millis,
             codec: self.codec,
         };
@@ -2104,10 +2093,10 @@ impl AppState {
 
     /// "Go live" clicked on a staged card: attach `capture_id`'s first
     /// destination into `room_handle`, using the *current* process-wide
-    /// framerate/bitrate/tune/quality-level/rate-control settings — the same
+    /// framerate/bitrate/tune/quality-level settings — the same
     /// ones the staged card's Preset/Advanced-tuning/Framerate/Bitrate
     /// controls already write via `set_framerate`/`set_bitrate`/`set_tune`/
-    /// `set_quality_level`/`set_rate_control` (mirroring `start_video_share`'s
+    /// `set_quality_level` (mirroring `start_video_share`'s
     /// own "applied before the call, not passed as arguments" shape — see
     /// that method's doc comment). The caller persists those same
     /// values as the new defaults at this exact moment, not while the card is merely staged.
@@ -2155,7 +2144,6 @@ impl AppState {
             backend: capture::detect_encoder_backend(),
             tune: self.tune,
             quality_level: self.quality_level,
-            rate_control: self.rate_control,
             gop_millis: self.gop_millis,
             codec: self.codec,
         };
@@ -2205,7 +2193,6 @@ impl AppState {
                 backend: capture::detect_encoder_backend(),
                 tune: capture::TuneMode::default(),
                 quality_level: capture::QualityLevel::default(),
-                rate_control: capture::RateControlMode::default(),
                 gop_millis: capture::DEFAULT_GOP_MILLIS,
                 codec: capture::VideoCodec::default(),
             }
@@ -2217,7 +2204,7 @@ impl AppState {
     /// encode params explicitly rather than deriving them from a sibling
     /// destination. Split out for [`Self::retry_destination`], which needs to
     /// hand in the failed destination's *own* last-known params (its
-    /// bitrate/tune/quality_level/rate_control) instead of the "copy a
+    /// bitrate/tune/quality_level) instead of the "copy a
     /// sibling, or fall back to session defaults" rule that's right for a
     /// genuinely new fan-out but wrong for resurrecting one that already had
     /// its own tuning — see that method's `Why:` note.
@@ -2529,7 +2516,7 @@ impl AppState {
     /// "Retry" clicked on a Failed destination card: tear the dead branch
     /// down and bring a fresh one right back up in the same room, off the
     /// same capture — preserving whatever encoder settings
-    /// (bitrate/tune/quality_level/rate_control) this destination had, not
+    /// (bitrate/tune/quality_level) this destination had, not
     /// the capture's/session's defaults.
     ///
     /// `Why this doesn't just do `stop_destination` + `add_destination`
@@ -4586,7 +4573,6 @@ impl AppState {
             defaults.bitrate_kbps,
             defaults.tune,
             defaults.quality_level,
-            defaults.rate_control,
             defaults.codec,
         );
     }
@@ -4599,7 +4585,6 @@ impl AppState {
             bitrate_kbps: self.bitrate_kbps,
             tune: self.tune,
             quality_level: self.quality_level,
-            rate_control: self.rate_control,
             codec: self.codec,
         }
     }
@@ -4633,7 +4618,6 @@ impl AppState {
         self.bitrate_kbps = d.bitrate_kbps;
         self.tune = d.tune;
         self.quality_level = d.quality_level;
-        self.rate_control = d.rate_control;
         self.codec = d.codec;
         self.gop_millis = capture::DEFAULT_GOP_MILLIS;
     }
@@ -4867,7 +4851,6 @@ pub(crate) mod test_support {
             backend: capture::EncoderBackend::Software,
             tune: capture::TuneMode::BestQuality,
             quality_level: capture::QualityLevel::Balanced,
-            rate_control: capture::RateControlMode::Qvbr,
             gop_millis: capture::DEFAULT_GOP_MILLIS,
             codec: capture::VideoCodec::H264,
         }
@@ -5213,7 +5196,6 @@ mod ui_ops_tests {
             bitrate_kbps: 15_000,
             tune: capture::TuneMode::LowLatency,
             quality_level: capture::QualityLevel::Quality,
-            rate_control: capture::RateControlMode::Cqp,
             codec: capture::VideoCodec::Av1,
         }
     }
@@ -5372,7 +5354,6 @@ mod ui_ops_tests {
             bitrate_kbps: 12_000,
             tune: capture::TuneMode::LowLatency,
             quality_level: capture::QualityLevel::Performance,
-            rate_control: capture::RateControlMode::Cqp,
             gop_millis: 750,
             codec: capture::VideoCodec::Av1,
         };

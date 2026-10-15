@@ -173,7 +173,7 @@ const share = await client.startShare({
   label: "Screen", previews: true,
   stream,                       // a MediaStream to share instead of calling getDisplayMedia (tests, custom pickers)
   displayMediaOptions,          // merged into the getDisplayMedia() argument
-  gopMs, latencyMode, bitrateMode, hardwareAcceleration,   // overrides
+  gopMs, latencyMode, hardwareAcceleration,   // overrides
 });
 share.stats(); share.muteAudio(true); share.setBitrate(kbps); share.requestKeyframe(); share.stop();
 share.stream  // the MediaStream, e.g. for a local <video> preview
@@ -204,7 +204,7 @@ Behaviour that matches the native sender:
 | native (`client/src/presets.rs`) | browser |
 | --- | --- |
 | tune `LowLatency` / `BestQuality` | `latencyMode: "realtime"` / `"quality"` |
-| rate control Static (CQP) / Dynamic (QVBR) | `bitrateMode: "constant"` / `"variable"`; every preset uses `"variable"` since #87 (CQP needs per-frame quantizers and Chromium 153 reports `bitrateMode: "quantizer"` unsupported for H.264; CBR is the closest predictable mode) |
+| rate control (not a setting since #88; was Static/Dynamic) | always `bitrateMode: "variable"` (native: always VA `vbr`). CQP needs per-frame quantizers and Chromium 153 reports `bitrateMode: "quantizer"` unsupported for H.264 |
 | GOP / keyframe interval (2 s, Gaming 0.75 s) | forced keyframes every `gopMs` (WebCodecs has no GOP knob) |
 | quality level (x264 speed-preset, VA target-usage) | **native-only**: no WebCodecs equivalent |
 | H.264 profile/level | chosen from size and fps (High, falling back to Main, then Baseline), `probeEncoders()` shows what works |

@@ -301,7 +301,6 @@ impl App {
                 self.state.bitrate_kbps = n.bitrate_kbps;
                 self.state.tune = n.tune;
                 self.state.quality_level = n.quality_level;
-                self.state.rate_control = n.rate_control;
                 self.state.gop_millis = n.gop_millis;
                 self.state.codec = n.codec;
             }

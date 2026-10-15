@@ -1388,7 +1388,8 @@ async fn late_subscriber_after_unwatched_period_gets_a_real_keyframe() {
 /// Regression coverage (2026-07-28, investigation of a 1/2 full-smoke-test
 /// failure against `unattended/goal-2026-07-28`'s tip): share, then toggle
 /// all three live encoder-tuning controls (`tune`/`quality_level`/
-/// `rate_control`, each a real `capture.rs` `BranchSwap`), THEN start
+/// `gop_millis`; the smoke test's third control was `rate_control`, removed in
+/// #88; each a real `capture.rs` `BranchSwap`), THEN start
 /// watching for the first time — the exact sequence the smoke test's one
 /// failing run had.
 ///
@@ -1469,7 +1470,7 @@ async fn late_watch_after_all_three_tuning_controls_toggled_gets_a_real_keyframe
 
         // The exact three live controls the bug report named, applied
         // sequentially and awaited to completion each time — "toggle Tune,
-        // toggle Quality Level, toggle Rate Control", not three changes
+        // toggle Quality Level, toggle Keyframe interval", not three changes
         // batched into one swap.
         let base = capture_handle
             .destination_runtime(capture::DestKey(0))
@@ -1479,12 +1480,12 @@ async fn late_watch_after_all_three_tuning_controls_toggled_gets_a_real_keyframe
             .params();
         let after_tune = VideoParams { tune: capture::TuneMode::BestQuality, ..base };
         let after_quality = VideoParams { quality_level: capture::QualityLevel::Quality, ..after_tune };
-        let after_rate_control = VideoParams { rate_control: capture::RateControlMode::Cqp, ..after_quality };
+        let after_gop = VideoParams { gop_millis: 750, ..after_quality };
 
         for (label, params) in [
             ("tune", after_tune),
             ("quality_level", after_quality),
-            ("rate_control", after_rate_control),
+            ("gop_millis", after_gop),
         ] {
             let req = capture_handle.change_destination(capture::DestKey(0), params).expect("classify/apply change");
             if let Some(done) = req.done {
@@ -1591,8 +1592,8 @@ async fn late_watch_after_all_three_tuning_controls_toggled_gets_a_real_keyframe
 /// Reproduces (and proves the fix for) the "retry resets a destination's
 /// encoder tuning" bug at the `AppState` layer, against a real capture
 /// pipeline and a real relay connection: a destination is brought up with
-/// non-default `edit_destination`-style tuning (bitrate/tune/quality_level/
-/// rate_control), `AppState::retry_destination` is called on it (the same
+/// non-default `edit_destination`-style tuning (bitrate/tune/quality_level),
+/// `AppState::retry_destination` is called on it (the same
 /// path the "Retry" button on a Failed destination card drives), and the resulting *new* destination
 /// must carry the *same* tuning — not the session's defaults. Also proves
 /// the capture itself survives the retry rather than being torn down, which
@@ -1652,7 +1653,7 @@ async fn retry_destination_preserves_prior_encoder_tuning() {
     );
 
     // Non-default tuning: what a user would have set via `edit_destination`
-    // (low-latency's the default; best-quality/quality/cqp are not) before
+    // (low-latency's the default; best-quality/quality are not) before
     // this destination later failed and got retried.
     let tuned_params = VideoParams {
         width: 0,
@@ -1662,7 +1663,6 @@ async fn retry_destination_preserves_prior_encoder_tuning() {
         backend: capture::EncoderBackend::default(),
         tune: capture::TuneMode::BestQuality,
         quality_level: capture::QualityLevel::Quality,
-        rate_control: capture::RateControlMode::Cqp,
         gop_millis: capture::DEFAULT_GOP_MILLIS,
         codec: capture::VideoCodec::default(),
     };
@@ -1754,13 +1754,8 @@ async fn retry_destination_preserves_prior_encoder_tuning() {
         capture::QualityLevel::Quality,
         "BUG REPRODUCED: retry reset quality_level to the default instead of preserving it"
     );
-    assert_eq!(
-        new_dest.params.rate_control,
-        capture::RateControlMode::Cqp,
-        "BUG REPRODUCED: retry reset rate_control to the default instead of preserving it"
-    );
 
-    eprintln!("[e2e-retry] PASS: retried destination {new_id:?} preserved bitrate/tune/quality_level/rate_control");
+    eprintln!("[e2e-retry] PASS: retried destination {new_id:?} preserved bitrate/tune/quality_level");
 }
 
 /// **The "audio follows video" contract, end to end against a real relay.**
@@ -2389,7 +2384,7 @@ async fn go_live_attaches_the_first_destination_with_real_resolution_and_backend
 /// tests:` `applying_a_preset_never_bursts_a_branch_above_its_configured_framerate`
 /// and `late_watch_after_all_three_tuning_controls_toggled_gets_a_real_keyframe_every_time`
 /// both hold the destination's `framerate` field **constant** across their
-/// swap (only `tune`/`quality_level`/`rate_control` change) — neither one
+/// swap (only `tune`/`quality_level` change) — neither one
 /// exercises a branch swap whose `framerate` itself is the changed field, or
 /// a viewer that is already watching (decoding, not just subscribing) across
 /// the seam. This test targets exactly that gap: a real `StreamDecoder`
@@ -2710,7 +2705,6 @@ async fn start_audio_share_succeeds_once_the_video_capture_is_live() {
         backend: capture::detect_encoder_backend(),
         tune: capture::TuneMode::default(),
         quality_level: capture::QualityLevel::default(),
-        rate_control: capture::RateControlMode::default(),
         gop_millis: capture::DEFAULT_GOP_MILLIS,
         codec: capture::VideoCodec::default(),
     };
@@ -2818,7 +2812,6 @@ async fn stop_share_tears_down_a_paired_audio_capture_too() {
         backend: capture::detect_encoder_backend(),
         tune: capture::TuneMode::default(),
         quality_level: capture::QualityLevel::default(),
-        rate_control: capture::RateControlMode::default(),
         gop_millis: capture::DEFAULT_GOP_MILLIS,
         codec: capture::VideoCodec::default(),
     };

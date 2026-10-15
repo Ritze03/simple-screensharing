@@ -924,7 +924,7 @@ export class RoomClient extends EventTarget {
 
     share.sender = new VideoSender({
       track: videoTrack, codec, fps, bitrateKbps, clock,
-      gopMs: o.gopMs ?? preset.gopMs, latencyMode: o.latencyMode ?? preset.latencyMode, bitrateMode: o.bitrateMode ?? preset.bitrateMode,
+      gopMs: o.gopMs ?? preset.gopMs, latencyMode: o.latencyMode ?? preset.latencyMode,
       hardwareAcceleration: o.hardwareAcceleration ?? this.hardwareAcceleration,
       isActive: () => share.subscribers > 0,
       onCapturedFrame: (frame) => {

@@ -12,17 +12,16 @@ export const KEYFRAME_COALESCE_MS = 100; // spec §9: ignore a KeyframeRequest w
 /**
  * Native encoder presets (client/src/presets.rs) mapped onto what WebCodecs can express.
  *  - tune LowLatency   -> latencyMode "realtime"   (BestQuality -> "quality")
- *  - rate control Dynamic (native Qvbr/VA vbr) -> bitrateMode "variable"
- *    rate control Static  (native Cqp)         -> bitrateMode "constant" (no per-frame-QP path here; CBR is the closest
- *    mode, but no preset uses it: Static froze native streams on motion, #87, so all four presets are Dynamic here too)
+ *  - rate control: not a setting (#88). Always bitrateMode "variable" (native Dynamic = VA vbr). The native Static
+ *    (CQP) mode was removed after it froze streams on motion; WebCodecs has no per-frame-QP path here anyway.
  *  - GOP               -> forced keyframe interval (WebCodecs has no GOP knob; we call encode({keyFrame}))
  *  - quality level (x264 speed-preset / VA target-usage): NATIVE-ONLY, no WebCodecs equivalent.
  */
 export const ENCODER_PRESETS = Object.freeze({
-  low_latency: { latencyMode: "realtime", bitrateMode: "variable", gopMs: DEFAULT_GOP_MS },
-  balanced: { latencyMode: "realtime", bitrateMode: "variable", gopMs: DEFAULT_GOP_MS },
-  quality: { latencyMode: "quality", bitrateMode: "variable", gopMs: DEFAULT_GOP_MS },
-  gaming: { latencyMode: "realtime", bitrateMode: "variable", gopMs: 750 },
+  low_latency: { latencyMode: "realtime", gopMs: DEFAULT_GOP_MS },
+  balanced: { latencyMode: "realtime", gopMs: DEFAULT_GOP_MS },
+  quality: { latencyMode: "quality", gopMs: DEFAULT_GOP_MS },
+  gaming: { latencyMode: "realtime", gopMs: 750 },
 });
 
 // H.264 levels: [name byte, MaxMBPS, MaxFS]
@@ -118,10 +117,10 @@ export class VideoSender {
    */
   constructor({
     track, codec, fps, bitrateKbps, onUnit, isActive = () => true, onCapturedFrame = null, onError = () => {},
-    clock = new MediaClock(), gopMs = DEFAULT_GOP_MS, latencyMode = "realtime", bitrateMode = "variable",
+    clock = new MediaClock(), gopMs = DEFAULT_GOP_MS, latencyMode = "realtime",
     hardwareAcceleration = "no-preference", maxEncodeQueue = 4, now = () => performance.now(),
   }) {
-    Object.assign(this, { track, codec, fps, bitrateKbps, onUnit, isActive, onCapturedFrame, onError, clock, gopMs, latencyMode, bitrateMode, hardwareAcceleration, maxEncodeQueue, now });
+    Object.assign(this, { track, codec, fps, bitrateKbps, onUnit, isActive, onCapturedFrame, onError, clock, gopMs, latencyMode, hardwareAcceleration, maxEncodeQueue, now });
     this.encoder = null;
     this.reader = null;
     this.stopped = false;
@@ -195,7 +194,7 @@ export class VideoSender {
     for (const cand of encoderCandidates(this.codec, { width, height, fps: this.fps })) {
       const cfg = {
         ...cand, width, height, framerate: this.fps, bitrate: Math.round(this.bitrateKbps * 1000),
-        bitrateMode: this.bitrateMode, latencyMode: this.latencyMode, hardwareAcceleration: this.hardwareAcceleration,
+        bitrateMode: "variable", latencyMode: this.latencyMode, hardwareAcceleration: this.hardwareAcceleration,
       };
       let r;
       try {

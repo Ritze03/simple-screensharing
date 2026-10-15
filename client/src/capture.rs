@@ -264,11 +264,12 @@ impl EncoderBackend {
     /// element description (not surrounding `!`s) so [`build_pipeline`] stays
     /// the single place that assembles the full pipeline string.
     ///
-    /// `tune`/`quality_level`/`rate_control` are the three live-adjustable
+    /// `tune`/`quality_level` are the two live-adjustable
     /// (routed through [`destination::ChangeTier::BranchSwap`] — see
     /// that type's doc comment) encoder tuning knobs; each is mapped to the
     /// matching property for whichever backend `self` is, per the mapping
-    /// documented on [`TuneMode`], [`QualityLevel`] and [`RateControlMode`].
+    /// documented on [`TuneMode`] and [`QualityLevel`]. Rate control is not
+    /// a knob: it is always the Dynamic (VBR) mode, see [`VBR_TARGET_PERCENTAGE`].
     ///
     /// `codec` selects which encoder element [`EncoderBackend::Vaapi`] uses
     /// (`vah264enc`/`vah265enc`/`vaav1enc` — see [`VideoCodec`]); it is
@@ -282,7 +283,6 @@ impl EncoderBackend {
         gop_frames: u32,
         tune: TuneMode,
         quality_level: QualityLevel,
-        rate_control: RateControlMode,
         codec: VideoCodec,
     ) -> String {
         match self {
@@ -308,24 +308,11 @@ impl EncoderBackend {
                     QualityLevel::Balanced => "medium",
                     QualityLevel::Quality => "veryslow",
                 };
-                // x264enc has no rate-control *enum* like vah264enc's — its
-                // closest control is `pass` (`cbr`/`quant`/`qual`) +
-                // `quantizer`. `Qvbr` maps to this backend's existing
-                // implicit default (plain `bitrate=`, no `pass` override —
-                // x264enc's CBR mode): x264enc has no native QVBR-equivalent
-                // knob either, so its own default single-pass rate control —
-                // already the closest thing it offers to "seek quality within
-                // a bitrate ceiling" — is the best available analogue (the
-                // same reasoning the old `Adaptive`/`Constant` no-op relied
-                // on; see [`RateControlMode`]'s doc comment). `Cqp` switches
-                // to `pass=qual`, x264enc's constant-quality mode driven by
-                // `quantizer` rather than a bitrate target (the `bitrate=`
-                // property above is simply ignored by x264enc while
-                // `pass=qual` is active).
-                let rate_control_flag = match rate_control {
-                    RateControlMode::Qvbr => "",
-                    RateControlMode::Cqp => " pass=qual quantizer=21",
-                };
+                // x264enc has no rate-control *enum* like vah264enc's, and no
+                // QVBR-equivalent knob; its default single-pass mode with a
+                // plain `bitrate=` is the closest thing to Dynamic it offers
+                // (a bitrate target, quality adapts). The removed Static mode
+                // was `pass=qual quantizer=21`, bitrate uncapped.
                 // `bframes=0`: pinned explicitly rather than relied upon as
                 // x264enc's own default (also 0) so it can never silently
                 // drift if that default ever changes — every preset wants 0
@@ -334,7 +321,7 @@ impl EncoderBackend {
                 // fast-motion content can't pick up encode-latency-costing
                 // B-frames from an upstream default change either).
                 format!(
-                    "x264enc {tune_flag}speed-preset={speed_preset} bitrate={bitrate_kbps} key-int-max={gop_frames} bframes=0{rate_control_flag}"
+                    "x264enc {tune_flag}speed-preset={speed_preset} bitrate={bitrate_kbps} key-int-max={gop_frames} bframes=0"
                 )
             }
             // vah264enc's `bitrate` property is kbps, same units as
@@ -342,8 +329,8 @@ impl EncoderBackend {
             // same name/semantics as x264enc's — verified via `gst-inspect-1.0
             // vah264enc`. `target-usage` is the VAAPI analogue of x264enc's
             // `speed-preset` — 1 (best quality/slowest) – 7 (fastest/lowest
-            // quality) — see [`QualityLevel`]. `rate-control` is vah264enc's
-            // real, native rate-control enum — see [`RateControlMode`].
+            // quality) — see [`QualityLevel`]. `rate-control` is always `vbr`
+            // (Dynamic), see [`VBR_TARGET_PERCENTAGE`].
             //
             // `tune` has no VAAPI analogue at all (see [`TuneMode`]'s doc
             // comment) — deliberately not read here; the field still exists
@@ -383,17 +370,10 @@ impl EncoderBackend {
                     QualityLevel::Balanced => 4,
                     QualityLevel::Quality => 1,
                 };
-                let rate_control_value = match rate_control {
-                    RateControlMode::Cqp => "cqp",
-                    // Despite the variant's name, this now maps to
-                    // vah264enc's `vbr` (plain Variable Bitrate), not the
-                    // literal `qvbr` enum value — see [`RateControlMode::Qvbr`]'s
-                    // doc comment for the full story (a real, measured driver
-                    // bug means `qvbr`'s bitrate ceiling is silently ignored
-                    // on this hardware, while `vbr`'s is genuinely honored)
-                    // and for why the identifier itself was kept anyway.
-                    RateControlMode::Qvbr => "vbr",
-                };
+                // `rate-control=vbr`, not the literal `qvbr`: a measured Mesa
+                // radeonsi driver bug means `qvbr` silently ignores the
+                // bitrate ceiling, `vbr`'s is genuinely honored (see
+                // `superdoc/features/stream-control.md` "Rate control").
                 // `vah265enc`/`vaav1enc` both expose the exact same
                 // `rate-control`/`bitrate`/`key-int-max`/`target-usage`/
                 // `target-percentage`/`cpb-size` property names, ranges and
@@ -407,40 +387,22 @@ impl EncoderBackend {
                     VideoCodec::H265 => VAAPI_H265_ENCODER_ELEMENT,
                     VideoCodec::Av1 => VAAPI_AV1_ENCODER_ELEMENT,
                 };
-                // `Qvbr`/`vbr` needs two more properties `Cqp` doesn't:
+                // `vbr` needs two more properties:
                 // - `target-percentage`: VBR-only property, "the percentage
                 //   for 'target bitrate'/'maximum bitrate'" — the real encode
                 //   target is `bitrate * target-percentage / 100`, with
                 //   `bitrate` acting as the ceiling. Left at the element's
-                //   default of 66%, this is exactly the previously-removed
-                //   `Adaptive` mode's diagnosed pop-in cause (the real target
-                //   swinging between ~66-100% of the ceiling as content
-                //   changed) — see [`RateControlMode::Qvbr`]'s doc comment.
-                //   Set to [`VBR_TARGET_PERCENTAGE`], deliberately high (close
-                //   to the ceiling) so the real target sits near `bitrate`
-                //   instead of swinging down toward two-thirds of it.
-                // - `cpb-size`: vah264enc's VBV buffer size in Kb, `0` (its
-                //   default) means "auto-calculate" (empirically, roughly 1x
-                //   `bitrate` here — the same naive "1-second-equivalent"
-                //   sizing the old `qvbr` implementation used explicitly).
-                //   Set deliberately *tighter* than that via
-                //   [`VBR_CPB_SIZE_NUMERATOR`]/[`VBR_CPB_SIZE_DENOMINATOR`] —
-                //   see that constant's doc comment for the exact fraction
-                //   and the measured rationale — so the encoder re-evaluates
-                //   its rate target against a smaller buffer, adjusting more
-                //   often in finer steps instead of swinging widely between
-                //   infrequent large-buffer refill cycles.
-                // `Cqp` deliberately leaves `qpi`/`qpp`/`qpb`/`target-percentage`
-                // unset at the element's own defaults — see
-                // [`RateControlMode::Cqp`]'s doc comment for why that stays
-                // untuned.
-                let quality_extra = match rate_control {
-                    RateControlMode::Cqp => String::new(),
-                    RateControlMode::Qvbr => {
-                        let cpb_size = bitrate_kbps * VBR_CPB_SIZE_NUMERATOR / VBR_CPB_SIZE_DENOMINATOR;
-                        format!(" target-percentage={VBR_TARGET_PERCENTAGE} cpb-size={cpb_size}")
-                    }
-                };
+                //   default of 66%, the real target swung between ~66-100% of
+                //   the ceiling as content changed (the pop-in the old
+                //   `Adaptive` mode had). Set to [`VBR_TARGET_PERCENTAGE`],
+                //   close to the ceiling.
+                // - `cpb-size`: the VBV buffer size in Kb, `0` (default)
+                //   means auto (roughly 1x `bitrate`). Set deliberately
+                //   *tighter* via [`VBR_CPB_SIZE_NUMERATOR`]/
+                //   [`VBR_CPB_SIZE_DENOMINATOR`] (see that constant's doc
+                //   comment) so the encoder adjusts in finer steps.
+                let cpb_size = bitrate_kbps * VBR_CPB_SIZE_NUMERATOR / VBR_CPB_SIZE_DENOMINATOR;
+                let quality_extra = format!(" target-percentage={VBR_TARGET_PERCENTAGE} cpb-size={cpb_size}");
                 // `b-frames=0`: see the software branch's matching `Why:`
                 // note above — pinned explicitly on both backends, but only
                 // for H.264/H.265: `vaav1enc` has no `b-frames` property at
@@ -454,7 +416,7 @@ impl EncoderBackend {
                     VideoCodec::Av1 => "",
                 };
                 format!(
-                    "{element} rate-control={rate_control_value} bitrate={bitrate_kbps} key-int-max={gop_frames} target-usage={target_usage}{b_frames_flag}{quality_extra}"
+                    "{element} rate-control=vbr bitrate={bitrate_kbps} key-int-max={gop_frames} target-usage={target_usage}{b_frames_flag}{quality_extra}"
                 )
             }
         }
@@ -497,7 +459,7 @@ impl EncoderBackend {
 }
 
 /// Which video codec an encoder produces. Threaded through the same
-/// settings pipeline as [`RateControlMode`]/[`QualityLevel`]
+/// settings pipeline as [`QualityLevel`]
 /// (`VideoParams` → `EncodeSettings` → `DestEdit` → `dto.rs` → persisted
 /// `rooms::AppSettings`), live-adjustable per destination via
 /// `edit_destination` like those two (a codec change is always a
@@ -508,9 +470,7 @@ impl EncoderBackend {
 /// `#[default]` is [`Self::H264`] — the safest choice: it's this pipeline's
 /// original, only-ever-shipped codec, so every existing user's persisted
 /// settings (no `codec` field in their on-disk `settings.toml` before this)
-/// deserialize to exactly the behavior they already had. Same reasoning as
-/// why `RateControlMode::Adaptive`'s wire string stayed `"qvbr"`-adjacent
-/// rather than renamed after the VBR fix — don't break existing configs.
+/// deserialize to exactly the behavior they already had.
 ///
 /// See [`supported_codecs`] for which codecs are actually usable on a given
 /// [`EncoderBackend`] — H.265/AV1 require [`EncoderBackend::Vaapi`], since
@@ -572,7 +532,7 @@ pub fn supported_codecs(backend: EncoderBackend) -> &'static [VideoCodec] {
 /// [`TuneMode`] value, it just has no effect until/unless that destination's
 /// backend becomes [`EncoderBackend::Software`]).
 ///
-/// Testing-only knob, like [`QualityLevel`]/[`RateControlMode`]: all three
+/// Testing-only knob, like [`QualityLevel`]: both
 /// are live-adjustable per destination via `edit_destination`, routed through
 /// [`destination::ChangeTier::BranchSwap`] like every other
 /// resolution/fps/backend change.
@@ -626,97 +586,20 @@ pub enum QualityLevel {
     Quality,
 }
 
-/// CQP/QVBR rate control (2026-07-30: replaces the earlier Constant/Adaptive/
-/// Quality three-mode design — `Adaptive`/vah264enc `vbr` never actually got
-/// its `target-percentage` tuned, defaulted to 66%, and produced visible
-/// bitrate-swing artifacts, and `Constant`/`cbr` added a third mode without a
-/// real quality-seeking option; the product decision was to collapse to two
-/// clearly distinct, deliberately-tuned modes instead of three where one was
-/// half-finished).
-///
-/// **2026-07-30 follow-up — `Self::Qvbr` no longer literally means `qvbr`.**
-/// A real driver limitation was confirmed on the reference hardware (AMD RX
-/// 7900 XTX, Mesa radeonsi VA-API): `vah264enc`'s actual `rate-control=qvbr`
-/// mode silently ignores the configured `bitrate` ceiling entirely (a 2000
-/// vs. 8000 kbps ceiling produced identical, much-higher real output; a
-/// driver warning — `Driver does not support attribute
-/// VAConfigAttribEncQuantization` — confirms the driver doesn't honor it).
-/// Plain `rate-control=vbr` was measured to genuinely respect the ceiling on
-/// the same hardware. So this variant now emits `rate-control=vbr` (tuned
-/// with [`VBR_TARGET_PERCENTAGE`]/[`VBR_CPB_SIZE_NUMERATOR`]+
-/// [`VBR_CPB_SIZE_DENOMINATOR`] — see [`EncoderBackend::launch_fragment`]) —
-/// deliberately tuned to avoid the *original* reason `vbr` was removed (the
-/// old `Adaptive` mode's unset-`target-percentage` pop-in artifact).
-///
-/// Why the variant keeps the name `Qvbr` rather than being renamed to match:
-/// the wire string `"qvbr"` (via `#[serde(rename_all = "snake_case")]` below)
-/// is both the old web frontend's `rateControl` value and the on-disk
-/// persisted field in `AppSettings`/`StartStreamDefaults` (`rooms.rs`) —
-/// renaming would touch every call site *and* silently break existing users' persisted
-/// settings files (an unknown enum variant fails that field's
-/// deserialization, not a graceful per-field fallback). That cost was judged
-/// disproportionate to a purely internal/cosmetic rename; the user-visible
-/// label ("Dynamic", see below) and the wire contract are unaffected either
-/// way. Read `Self::Qvbr` as "the Dynamic mode", not literally "the mode that
-/// sets `rate-control=qvbr`" — this comment is the map from one to the other.
-///
-/// **User-visible names (2026-10-15, #87): `Qvbr` = "Dynamic", `Cqp` =
-/// "Static".** They used to be "Efficient" (`Qvbr`) and "Max quality" (`Cqp`),
-/// which read backwards: CQP holds the *quality* per frame constant, so its
-/// bitrate follows the content (tiny on a still desktop, huge on big motion,
-/// and the configured bitrate is NOT a cap); VBR holds the *bitrate* near the
-/// target and lets quality vary. A user whose stream froze on big movements
-/// under "Max quality" (CQP overflowing the link) prompted the rename and
-/// moving Low-Latency/Gaming to `Qvbr`. Dynamic = quality adapts to the
-/// bitrate; Static = the quality is fixed, the bitrate swings.
-///
-/// [`EncoderBackend::Software`] has no equivalent enum — its closest control
-/// is `pass` (`cbr`/`quant`/`qual`) + `quantizer`; see
-/// [`EncoderBackend::launch_fragment`]'s `Why:` note for how each variant
-/// maps there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RateControlMode {
-    /// vah264enc `rate-control=cqp` (constant quantizer, QP fixed at the
-    /// element's own default of 26 — deliberately left unset/untuned, see
-    /// [`EncoderBackend::launch_fragment`]). x264enc: `pass=qual
-    /// quantizer=21` (constant-quality, driven by `quantizer` rather than a
-    /// bitrate target). UI name "Static". Fixed per-frame quality: bitrate
-    /// follows the content (very little on a still screen) but the configured
-    /// bitrate is *not* a ceiling, so big motion can burst past the link's
-    /// capacity and stall the stream (#87).
-    Cqp,
-    /// vah264enc `rate-control=vbr` (plain Variable Bitrate — see this type's
-    /// doc comment for why this variant, still named `Qvbr`, no longer emits
-    /// literal `rate-control=qvbr`): targets [`VBR_TARGET_PERCENTAGE`]% of
-    /// `bitrate` as the real encode target, with `bitrate` itself acting as a
-    /// ceiling genuinely respected on the reference hardware (unlike `qvbr`'s
-    /// — see this type's doc comment), and a deliberately tightened
-    /// `cpb-size` (see [`VBR_CPB_SIZE_NUMERATOR`]/[`VBR_CPB_SIZE_DENOMINATOR`])
-    /// so the encoder adjusts against a smaller VBV buffer instead of
-    /// swinging widely between infrequent large-buffer refill cycles — "spend
-    /// up to the bandwidth budget for the best quality that fits", the mode
-    /// `Adaptive`/`vbr` was meant to be but never got tuned to be (see this
-    /// type's doc comment). x264enc has no native QVBR-equivalent knob
-    /// either, so this variant maps to x264enc's plain untouched `bitrate=`
-    /// property (no `pass` override) — its default single-pass rate control
-    /// is already the closest analogue x264enc offers to "quality-seeking
-    /// within a bitrate ceiling", the same rationale the old
-    /// `Adaptive`/`Constant` no-op relied on. The default: the product's "max
-    /// out available bandwidth for the best quality that fits" is the
-    /// desired out-of-the-box behavior, rather than [`Self::Cqp`]'s
-    /// unbounded bitrate. UI name "Dynamic".
-    #[default]
-    Qvbr,
-}
+// Rate control is not a setting (#88, 2026-10-15): every VA encoder runs Dynamic
+// (`rate-control=vbr`, the constants below), x264enc plain `bitrate=`. There
+// used to be a `RateControlMode { Cqp, Qvbr }` (UI "Static"/"Dynamic"); Static
+// (constant quantizer, bitrate uncapped) froze streams on motion and the user
+// asked for it to go. History and the measurements:
+// `superdoc/features/stream-control.md` "Rate control".
 
-/// [`RateControlMode::Qvbr`]'s `target-percentage` on `vah264enc`'s
+/// the Dynamic mode's `target-percentage` on `vah264enc`'s
 /// `rate-control=vbr` ([`EncoderBackend::launch_fragment`]) — "the percentage
 /// for 'target bitrate'/'maximum bitrate'" (element doc), i.e. the real
 /// encode target is `bitrate * target-percentage / 100`. Left at the
 /// element's own default of 66%, this is exactly the previously-removed
 /// `Adaptive` mode's diagnosed pop-in cause (see
-/// [`RateControlMode::Qvbr`]'s doc comment). Set high (close to the 50-100
+/// `superdoc/features/stream-control.md` "Rate control"). Set high (close to the 50-100
 /// range's ceiling) so the real target sits near the configured `bitrate`
 /// ceiling rather than swinging down toward two-thirds of it — measured live
 /// (see `superdoc/features/stream-control.md`'s 2026-07-30 follow-up entry)
@@ -724,7 +607,7 @@ pub enum RateControlMode {
 /// unset-default 66% baseline.
 const VBR_TARGET_PERCENTAGE: u32 = 95;
 
-/// [`RateControlMode::Qvbr`]'s `cpb-size` numerator/denominator on
+/// the Dynamic mode's `cpb-size` numerator/denominator on
 /// `vah264enc`'s `rate-control=vbr` ([`EncoderBackend::launch_fragment`]):
 /// `cpb-size = bitrate_kbps * NUMERATOR / DENOMINATOR` Kb. `cpb-size` is in
 /// Kb and `bitrate` is in kbps, so a ratio of 1 is exactly a 1-second VBV
@@ -2476,11 +2359,10 @@ async fn start_sharing_with_source(
         // can't actually run another concurrent encode session.
         backend: detect_encoder_backend(),
         // "Good mix" defaults, not this pipeline's old hardcoded low-latency
-        // extreme — see `TuneMode`/`QualityLevel`/`RateControlMode`'s
+        // extreme — see `TuneMode`/`QualityLevel`'s
         // `#[default]` doc comments.
         tune: TuneMode::default(),
         quality_level: QualityLevel::default(),
-        rate_control: RateControlMode::default(),
         gop_millis: DEFAULT_GOP_MILLIS,
         codec: VideoCodec::default(),
     };
@@ -4101,10 +3983,6 @@ pub mod destination {
         /// Performance vs. quality encode speed — [`super::QualityLevel`].
         /// Real on both backends.
         pub quality_level: QualityLevel,
-        /// CQP/QVBR rate control — [`super::RateControlMode`]. Native on
-        /// [`EncoderBackend::Vaapi`]; see that type's doc comment for how
-        /// each variant maps on [`EncoderBackend::Software`].
-        pub rate_control: RateControlMode,
         /// Keyframe/GOP interval in milliseconds — [`super::DEFAULT_GOP_MILLIS`]
         /// for every preset except Gaming, which uses a shorter interval for
         /// faster recovery from motion artifacts (see that constant's doc
@@ -4126,7 +4004,6 @@ pub mod destination {
                 backend: self.backend,
                 tune: self.tune,
                 quality_level: self.quality_level,
-                rate_control: self.rate_control,
                 gop_millis: self.gop_millis,
                 codec: self.codec,
             }
@@ -4191,16 +4068,14 @@ pub mod destination {
             || to.height != from.height
             || to.framerate != from.framerate
             || to.backend != from.backend
-            // `tune`/`quality_level`/`rate_control` are never live-writable
-            // (see [`super::TuneMode`]/[`super::QualityLevel`]/
-            // [`super::RateControlMode`]'s doc comments) — even though
-            // vah264enc's `target-usage`/`rate-control` technically are,
+            // `tune`/`quality_level` are never live-writable
+            // (see [`super::TuneMode`]/[`super::QualityLevel`]'s doc
+            // comments) — even though vah264enc's `target-usage` technically is,
             // routing every backend/control through the same `BranchSwap`
             // path keeps behavior uniform and testable across both. A fast
             // follow could special-case VAAPI to a true live write later.
             || to.tune != from.tune
             || to.quality_level != from.quality_level
-            || to.rate_control != from.rate_control
             // `gop_millis` (`key-int-max`) is likewise not a live-writable
             // encoder property — a preset switch to/from Gaming's shorter
             // GOP is a `BranchSwap` like every other tuning knob above.
@@ -4744,7 +4619,6 @@ pub mod destination {
                 backend: EncoderBackend::Software,
                 tune: TuneMode::default(),
                 quality_level: QualityLevel::default(),
-                rate_control: RateControlMode::default(),
                 gop_millis: DEFAULT_GOP_MILLIS,
                 codec: VideoCodec::default(),
             }
@@ -5244,9 +5118,9 @@ pub mod destination {
             );
         }
 
-        /// The encoder tuning knobs (`tune`/`quality_level`/`rate_control`,
+        /// The encoder tuning knobs (`tune`/`quality_level`,
         /// plus `gop_millis`) are never tier-1 live-writable even though
-        /// vah264enc's `target-usage`/`rate-control` technically are — see
+        /// vah264enc's `target-usage` technically is — see
         /// [`EncoderBackend::launch_fragment`]'s `Why:` note. All of them
         /// route through the same `BranchSwap` path
         /// as resolution/fps/backend changes.
@@ -5260,12 +5134,6 @@ pub mod destination {
             );
             assert_eq!(
                 classify_change(source, from, VideoParams { quality_level: QualityLevel::Quality, ..from }),
-                ChangeTier::BranchSwap
-            );
-            // `from`'s rate_control is `RateControlMode::default()` (`Qvbr`)
-            // — flip it to the other variant, `Cqp`.
-            assert_eq!(
-                classify_change(source, from, VideoParams { rate_control: RateControlMode::Cqp, ..from }),
                 ChangeTier::BranchSwap
             );
             assert_eq!(
@@ -5403,8 +5271,6 @@ pub mod branch {
         pub tune: TuneMode,
         /// See [`super::QualityLevel`].
         pub quality_level: QualityLevel,
-        /// See [`super::RateControlMode`].
-        pub rate_control: RateControlMode,
         /// See [`super::destination::VideoParams::gop_millis`].
         pub gop_millis: u32,
         /// See [`super::VideoCodec`].
@@ -5701,7 +5567,6 @@ pub mod branch {
             gop_frames,
             settings.tune,
             settings.quality_level,
-            settings.rate_control,
             settings.codec,
         );
         let raw_format = settings.backend.raw_format();
@@ -5959,8 +5824,9 @@ pub mod branch {
     /// `end_to_end_test::late_watch_after_all_three_tuning_controls_toggled_gets_a_real_keyframe_every_time`,
     /// both `#[ignore]`d) caught this call genuinely hanging — multiple
     /// minutes, no progress — for the third of three rapid sequential
-    /// `VideoParams` swaps (tune, then quality_level, then rate_control) on
-    /// VAAPI with `RateControlMode::Cqp` (`rate-control=cqp`) +
+    /// `VideoParams` swaps (tune, then quality_level, then rate_control, when
+    /// rate control was still a setting) on
+    /// VAAPI with `rate-control=cqp` +
     /// `QualityLevel::Quality` (`target-usage=1`), even though the exact same
     /// settings applied as a single, isolated `add_branch` call were fast
     /// (tens of milliseconds) — i.e. this is triggered by cumulative
@@ -6826,7 +6692,6 @@ pub mod branch {
                 // `TuneMode`/`QualityLevel`'s defaults are.
                 tune: TuneMode::LowLatency,
                 quality_level: QualityLevel::Performance,
-                rate_control: RateControlMode::default(),
                 gop_millis: DEFAULT_GOP_MILLIS,
                 codec: VideoCodec::default(),
             }
@@ -7008,7 +6873,6 @@ pub mod branch {
                 30,
                 TuneMode::default(),
                 QualityLevel::default(),
-                RateControlMode::default(),
                 VideoCodec::default(),
             );
             let raw_format = EncoderBackend::Software.raw_format();
@@ -7253,7 +7117,6 @@ pub mod branch {
                 backend: EncoderBackend::Software,
                 tune: TuneMode::default(),
                 quality_level: QualityLevel::default(),
-                rate_control: RateControlMode::default(),
                 gop_millis: DEFAULT_GOP_MILLIS,
                 codec: VideoCodec::default(),
             }
@@ -8114,7 +7977,6 @@ pub mod branch {
                 backend: EncoderBackend::Software,
                 tune: TuneMode::default(),
                 quality_level: QualityLevel::default(),
-                rate_control: RateControlMode::default(),
                 gop_millis: DEFAULT_GOP_MILLIS,
                 codec: VideoCodec::default(),
             };
@@ -8185,7 +8047,6 @@ pub mod branch {
                 backend: EncoderBackend::Software,
                 tune: TuneMode::default(),
                 quality_level: QualityLevel::default(),
-                rate_control: RateControlMode::default(),
                 gop_millis: DEFAULT_GOP_MILLIS,
                 codec: VideoCodec::default(),
             };
@@ -8689,7 +8550,6 @@ mod tests {
             (DEFAULT_GOP_MILLIS * DEFAULT_FRAMERATE) / 1000,
             TuneMode::default(),
             QualityLevel::default(),
-            RateControlMode::default(),
             codec,
         );
         let raw_format = backend.raw_format();
@@ -8767,9 +8627,8 @@ mod tests {
         backend: EncoderBackend,
         tune: TuneMode,
         quality_level: QualityLevel,
-        rate_control: RateControlMode,
     ) -> gst::Element {
-        build_encoder_element_for_codec(backend, tune, quality_level, rate_control, VideoCodec::H264)
+        build_encoder_element_for_codec(backend, tune, quality_level, VideoCodec::H264)
     }
 
     /// [`build_encoder_element`], with an explicit [`VideoCodec`] — used by
@@ -8780,10 +8639,9 @@ mod tests {
         backend: EncoderBackend,
         tune: TuneMode,
         quality_level: QualityLevel,
-        rate_control: RateControlMode,
         codec: VideoCodec,
     ) -> gst::Element {
-        let fragment = backend.launch_fragment(4000, 60, tune, quality_level, rate_control, codec);
+        let fragment = backend.launch_fragment(4000, 60, tune, quality_level, codec);
         gst::parse::launch(&fragment).unwrap_or_else(|e| panic!("encoder fragment '{fragment}' should parse: {e}"))
     }
 
@@ -8803,7 +8661,6 @@ mod tests {
             EncoderBackend::Software,
             TuneMode::LowLatency,
             QualityLevel::default(),
-            RateControlMode::default(),
         );
         let low_latency_tune = low_latency.property_value("tune").serialize().unwrap();
         assert!(
@@ -8815,7 +8672,6 @@ mod tests {
             EncoderBackend::Software,
             TuneMode::BestQuality,
             QualityLevel::default(),
-            RateControlMode::default(),
         );
         let best_quality_tune = best_quality.property_value("tune").serialize().unwrap();
         assert!(
@@ -8837,7 +8693,6 @@ mod tests {
             EncoderBackend::Software,
             TuneMode::default(),
             QualityLevel::Performance,
-            RateControlMode::default(),
         );
         // x264enc's `speed-preset` is an enum GEnum; comparing its nick
         // avoids hardcoding the underlying integer value.
@@ -8847,7 +8702,6 @@ mod tests {
             EncoderBackend::Software,
             TuneMode::default(),
             QualityLevel::Balanced,
-            RateControlMode::default(),
         );
         assert_eq!(balanced.property_value("speed-preset").serialize().unwrap(), "medium");
 
@@ -8855,7 +8709,6 @@ mod tests {
             EncoderBackend::Software,
             TuneMode::default(),
             QualityLevel::Quality,
-            RateControlMode::default(),
         );
         assert_eq!(quality.property_value("speed-preset").serialize().unwrap(), "veryslow");
 
@@ -8868,7 +8721,6 @@ mod tests {
             EncoderBackend::Vaapi,
             TuneMode::default(),
             QualityLevel::Performance,
-            RateControlMode::default(),
         );
         assert_eq!(vaapi_performance.property::<u32>("target-usage"), 2);
 
@@ -8876,7 +8728,6 @@ mod tests {
             EncoderBackend::Vaapi,
             TuneMode::default(),
             QualityLevel::Balanced,
-            RateControlMode::default(),
         );
         assert_eq!(vaapi_balanced.property::<u32>("target-usage"), 4);
 
@@ -8884,90 +8735,42 @@ mod tests {
             EncoderBackend::Vaapi,
             TuneMode::default(),
             QualityLevel::Quality,
-            RateControlMode::default(),
         );
         assert_eq!(vaapi_quality.property::<u32>("target-usage"), 1);
     }
 
-    /// [`RateControlMode`] is a clean, native mapping onto vah264enc's own
-    /// `rate-control` enum (`cqp`/`vbr` — `Qvbr` maps to `vbr`, not literal
-    /// `qvbr`, see that variant's doc comment); on x264enc, `Qvbr` maps to
-    /// plain untouched `bitrate=` (no `pass` override, its closest available
-    /// analogue — see [`EncoderBackend::launch_fragment`]'s `Why:` note)
-    /// while `Cqp` switches to `pass=qual`. Also confirms `Qvbr`'s VAAPI-only
-    /// `target-percentage`/`cpb-size` are genuinely applied and genuinely
-    /// different from `Cqp`'s untouched element defaults — not silently
-    /// falling back to the same behavior.
+    /// Rate control is always Dynamic: vah264enc gets `rate-control=vbr` (not
+    /// literal `qvbr`, see `superdoc/features/stream-control.md` "Rate control")
+    /// with the tuned `target-percentage`/`cpb-size`; x264enc keeps its plain
+    /// untouched `bitrate=` (`pass` unset, read back as its default nick).
     #[test]
-    fn rate_control_mode_maps_per_backend() {
+    fn rate_control_is_always_dynamic_per_backend() {
         if gst::init().is_err() {
             eprintln!("skipping: gstreamer not available in this environment");
             return;
         }
 
-        let x264_qvbr = build_encoder_element(
-            EncoderBackend::Software,
-            TuneMode::default(),
-            QualityLevel::default(),
-            RateControlMode::Qvbr,
-        );
-        // No `pass` override at all: x264enc's own plain-`bitrate=` default,
-        // read back as its unset/default nick.
-        assert_eq!(x264_qvbr.property_value("pass").serialize().unwrap(), "cbr");
-
-        let x264_cqp = build_encoder_element(
-            EncoderBackend::Software,
-            TuneMode::default(),
-            QualityLevel::default(),
-            RateControlMode::Cqp,
-        );
-        assert_eq!(x264_cqp.property_value("pass").serialize().unwrap(), "qual");
+        let x264 = build_encoder_element(EncoderBackend::Software, TuneMode::default(), QualityLevel::default());
+        assert_eq!(x264.property_value("pass").serialize().unwrap(), "cbr");
 
         if gst::ElementFactory::make(VAAPI_ENCODER_ELEMENT).build().is_err() {
             eprintln!("skipping VAAPI half: '{VAAPI_ENCODER_ELEMENT}' is not available in this environment");
             return;
         }
 
-        let vaapi_cqp = build_encoder_element(
-            EncoderBackend::Vaapi,
-            TuneMode::default(),
-            QualityLevel::default(),
-            RateControlMode::Cqp,
-        );
-        assert_eq!(vaapi_cqp.property_value("rate-control").serialize().unwrap(), "cqp");
-        // `Cqp` leaves `qpi` at the element's own default (26) and
-        // `target-percentage` unset (66%, VBR-only anyway) — untouched.
-        assert_eq!(vaapi_cqp.property::<u32>("qpi"), 26);
-        assert_eq!(vaapi_cqp.property::<u32>("target-percentage"), 66);
-
-        let vaapi_qvbr = build_encoder_element(
-            EncoderBackend::Vaapi,
-            TuneMode::default(),
-            QualityLevel::default(),
-            RateControlMode::Qvbr,
-        );
-        // Despite the variant's name, this is `vbr`, not literal `qvbr` — see
-        // [`RateControlMode::Qvbr`]'s doc comment for why.
-        assert_eq!(vaapi_qvbr.property_value("rate-control").serialize().unwrap(), "vbr");
-        // `Qvbr` tunes `target-percentage` well above `Cqp`'s untouched
-        // default (66%, itself moot under `cqp` since that property is
-        // VBR-only), so the real encode target sits close to the configured
-        // ceiling instead of swinging down toward two-thirds of it — see
-        // [`VBR_TARGET_PERCENTAGE`]'s doc comment for the exact value/why.
-        assert_eq!(vaapi_qvbr.property::<u32>("target-percentage"), VBR_TARGET_PERCENTAGE);
-        assert!(
-            vaapi_qvbr.property::<u32>("target-percentage") > vaapi_cqp.property::<u32>("target-percentage"),
-            "Qvbr's target-percentage must be higher than the untuned 66% default"
-        );
-        // `cpb-size` set to a deliberately tight fraction of the configured
-        // bitrate (4000 kbps, per [`build_encoder_element`]'s hardcoded test
-        // bitrate) — not left at the element's own `0` ("auto-calculate")
-        // default, and meaningfully smaller than a naive 1x-bitrate buffer.
+        let vaapi = build_encoder_element(EncoderBackend::Vaapi, TuneMode::default(), QualityLevel::default());
+        assert_eq!(vaapi.property_value("rate-control").serialize().unwrap(), "vbr");
+        // `target-percentage` well above the element's 66% default, so the
+        // real encode target sits close to the configured ceiling.
+        assert_eq!(vaapi.property::<u32>("target-percentage"), VBR_TARGET_PERCENTAGE);
+        assert!(vaapi.property::<u32>("target-percentage") > 66);
+        // `cpb-size` a deliberately tight fraction of the configured bitrate
+        // (4000 kbps, per [`build_encoder_element_for_codec`]'s hardcoded test
+        // bitrate), not the element's `0` ("auto") default.
         assert_eq!(
-            vaapi_qvbr.property::<u32>("cpb-size"),
+            vaapi.property::<u32>("cpb-size"),
             4000 * VBR_CPB_SIZE_NUMERATOR / VBR_CPB_SIZE_DENOMINATOR
         );
-        assert_eq!(vaapi_cqp.property::<u32>("cpb-size"), 0, "Cqp must not set cpb-size at all");
     }
 
     /// Exercises the two mechanisms `pump_loop` relies on for
@@ -9015,7 +8818,6 @@ mod tests {
             10_000,
             TuneMode::LowLatency,
             QualityLevel::Performance,
-            RateControlMode::default(),
             VideoCodec::default(),
         );
         let raw_format = backend.raw_format();
@@ -9123,7 +8925,6 @@ mod tests {
             (DEFAULT_GOP_MILLIS * DEFAULT_FRAMERATE) / 1000,
             TuneMode::default(),
             QualityLevel::default(),
-            RateControlMode::default(),
             VideoCodec::default(),
         );
         let raw_format = backend.raw_format();
@@ -9290,7 +9091,6 @@ mod tests {
             backend: EncoderBackend::Software,
             tune: TuneMode::default(),
             quality_level: QualityLevel::default(),
-            rate_control: RateControlMode::default(),
             gop_millis: DEFAULT_GOP_MILLIS,
             codec: VideoCodec::default(),
         })
@@ -9303,7 +9103,6 @@ mod tests {
             backend: EncoderBackend::Software,
             tune: TuneMode::default(),
             quality_level: QualityLevel::default(),
-            rate_control: RateControlMode::default(),
             gop_millis: DEFAULT_GOP_MILLIS,
             codec: VideoCodec::default(),
         })
@@ -9373,7 +9172,6 @@ mod tests {
                     backend: EncoderBackend::Software,
                     tune: TuneMode::LowLatency,
                     quality_level: QualityLevel::Performance,
-                    rate_control: RateControlMode::default(),
                     gop_millis: DEFAULT_GOP_MILLIS,
                     codec: VideoCodec::default(),
                 },
@@ -9518,8 +9316,8 @@ mod tests {
     /// Regression test for the reported **"changing the preset makes the FPS
     /// shoot up to 300+ and sometimes crashes the stream"** bug.
     ///
-    /// Applying a preset from the Streams tab's edit panel changes `tune`,
-    /// `quality_level` *and* `rate_control` in one `edit_destination` call,
+    /// Applying a preset from the Streams tab's edit panel changes `tune` and
+    /// `quality_level` in one `edit_destination` call,
     /// which [`destination::classify_change`] turns into a single
     /// [`destination::ChangeTier::BranchSwap`]. The swap is `await`ed inside
     /// [`destination_pump`]'s own loop, so for its entire duration **nothing
@@ -9567,12 +9365,10 @@ mod tests {
             backend: detect_encoder_backend(),
             tune: TuneMode::LowLatency,
             quality_level: QualityLevel::Performance,
-            // Low-Latency wants predictable, non-quality-seeking behavior.
-            rate_control: RateControlMode::Cqp,
             gop_millis: DEFAULT_GOP_MILLIS,
             codec: VideoCodec::default(),
         };
-        // Exactly what clicking "Balanced" in the edit panel sends: three
+        // Exactly what clicking "Balanced" in the edit panel sends: two
         // fields at once, nothing else changed.
         let after = destination::VideoParams {
             tune: TuneMode::BestQuality,
@@ -9767,7 +9563,6 @@ mod tests {
                 EncoderBackend::Vaapi,
                 TuneMode::default(),
                 QualityLevel::Quality,
-                RateControlMode::default(),
                 VideoCodec::H265,
             );
             assert_eq!(h265_quality.property::<u32>("target-usage"), 1);
@@ -9780,7 +9575,6 @@ mod tests {
                 EncoderBackend::Vaapi,
                 TuneMode::default(),
                 QualityLevel::Performance,
-                RateControlMode::default(),
                 VideoCodec::Av1,
             );
             assert_eq!(av1_performance.property::<u32>("target-usage"), 2);
@@ -9789,11 +9583,11 @@ mod tests {
         }
     }
 
-    /// [`rate_control_mode_maps_per_backend`]'s H.265/AV1 analogue: both
-    /// `vah265enc`/`vaav1enc` expose the same `cbr`/`vbr`/`cqp` `rate-control`
-    /// enum as `vah264enc` (confirmed via `gst-inspect-1.0`).
+    /// [`rate_control_is_always_dynamic_per_backend`]'s H.265/AV1 analogue: both
+    /// `vah265enc`/`vaav1enc` expose the same `rate-control` enum as
+    /// `vah264enc` (confirmed via `gst-inspect-1.0`) and get `vbr` too.
     #[test]
-    fn rate_control_mode_maps_on_h265_and_av1() {
+    fn rate_control_is_dynamic_on_h265_and_av1() {
         if gst::init().is_err() {
             eprintln!("skipping: gstreamer not available in this environment");
             return;
@@ -9804,27 +9598,25 @@ mod tests {
         }
 
         if gst::ElementFactory::make(VAAPI_H265_ENCODER_ELEMENT).build().is_ok() {
-            let h265_quality = build_encoder_element_for_codec(
+            let h265 = build_encoder_element_for_codec(
                 EncoderBackend::Vaapi,
                 TuneMode::default(),
                 QualityLevel::default(),
-                RateControlMode::Cqp,
                 VideoCodec::H265,
             );
-            assert_eq!(h265_quality.property_value("rate-control").serialize().unwrap(), "cqp");
+            assert_eq!(h265.property_value("rate-control").serialize().unwrap(), "vbr");
         } else {
             eprintln!("skipping H.265 half: '{VAAPI_H265_ENCODER_ELEMENT}' is not available in this environment");
         }
 
         if gst::ElementFactory::make(VAAPI_AV1_ENCODER_ELEMENT).build().is_ok() {
-            let av1_adaptive = build_encoder_element_for_codec(
+            let av1 = build_encoder_element_for_codec(
                 EncoderBackend::Vaapi,
                 TuneMode::default(),
                 QualityLevel::default(),
-                RateControlMode::Qvbr,
                 VideoCodec::Av1,
             );
-            assert_eq!(av1_adaptive.property_value("rate-control").serialize().unwrap(), "vbr");
+            assert_eq!(av1.property_value("rate-control").serialize().unwrap(), "vbr");
         } else {
             eprintln!("skipping AV1 half: '{VAAPI_AV1_ENCODER_ELEMENT}' is not available in this environment");
         }
@@ -9986,7 +9778,6 @@ mod tests {
             backend: detect_encoder_backend(),
             tune: TuneMode::default(),
             quality_level: QualityLevel::default(),
-            rate_control: RateControlMode::default(),
             gop_millis: DEFAULT_GOP_MILLIS,
             codec: VideoCodec::default(),
         };

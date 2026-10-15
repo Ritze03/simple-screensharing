@@ -13,7 +13,7 @@
 //!   Upload bandwidth (Mode / Total / Floor / Per stream or over-budget banner);
 //! - how it's encoded: Video (Framerate / Bitrate / Codec; no encoder-limit
 //!   banner or "Use H.265" offer since 2026-10-15, user: "just annoying"), Encoder (Preset ×4
-//!   + collapsible Advanced: Tune / Quality level / Rate control / Keyframe interval).
+//!   + collapsible Advanced: Tune / Quality level / Keyframe interval).
 //!
 //! Every control row is `[120 label][fill control][72 value]` (the widgets
 //! row helpers), so value boxes share one right edge.
@@ -46,7 +46,7 @@
 //! the bar's "N rooms ▾", see `action_bar::RoomTargets`).
 
 use egui::{Align, CornerRadius, Rect, Response, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
-use simple_screensharing_client::capture::{QualityLevel, RateControlMode, TuneMode, VideoCodec};
+use simple_screensharing_client::capture::{QualityLevel, TuneMode, VideoCodec};
 use simple_screensharing_client::presets::{
     self, BITRATE_STEP_KBPS, CODEC_DISPLAY_ORDER, EncoderPreset, EncoderTuning, MIN_BITRATE_KBPS, codec_description, codec_label,
 };
@@ -115,7 +115,6 @@ impl Target {
                 bitrate_kbps: e.bitrate_kbps,
                 tune: e.tune,
                 quality_level: e.quality_level,
-                rate_control: e.rate_control,
                 gop_millis: e.gop_millis,
                 codec: e.codec,
             },
@@ -133,7 +132,6 @@ impl Target {
                     bitrate_kbps: n.bitrate_kbps,
                     tune: n.tune,
                     quality_level: n.quality_level,
-                    rate_control: n.rate_control,
                     gop_millis: n.gop_millis,
                     codec: n.codec,
                 },
@@ -444,7 +442,6 @@ fn column_need_for(ui: &Ui, readout_w: f32, staged: bool) -> f32 {
         need(&t(&[("ui.stream.bw_per_stream", "Per-stream maximum"), ("ui.stream.bw_absolute", "Absolute maximum")]), true),
         need(&t(&[("ui.stream.tune_low", "Low latency"), ("ui.stream.tune_best", "Best quality")]), true),
         need(&t(&[("ui.stream.ql_performance", "Performance"), ("ui.stream.ql_balanced", "Balanced"), ("ui.stream.ql_quality", "Quality")]), true),
-        need(&t(&[("ui.stream.rc_dynamic", "Dynamic"), ("ui.stream.rc_static", "Static")]), true),
         // [`seg_gated`]: label-proportional when equal would truncate.
         need(&presets, false),
         need(&codecs, false),
@@ -793,7 +790,7 @@ fn video_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, c: &LocalCaptu
 
 fn encoder_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, target: Target, out: &mut Vec<UiAction>) {
     let v = target.values(cx.state);
-    let tuning = EncoderTuning { tune: v.tune, quality_level: v.quality_level, rate_control: v.rate_control, gop_millis: v.gop_millis };
+    let tuning = EncoderTuning { tune: v.tune, quality_level: v.quality_level, gop_millis: v.gop_millis };
     let mut preset = EncoderPreset::detect(tuning);
     drive_dump::line(|| {
         let order = EncoderPreset::ALL.iter().map(|p| p.value()).collect::<Vec<_>>().join(" ");
@@ -826,7 +823,7 @@ fn encoder_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, target: Targ
     }
 }
 
-/// The Advanced tuning rows (Tune, Quality level, Rate control, Keyframe interval).
+/// The Advanced tuning rows (Tune, Quality level, Keyframe interval).
 fn adv_rows(ui: &mut Ui, st: &mut StreamSettingsState, target: Target, v: NextStream, out: &mut Vec<UiAction>) {
     let (low, best) = (tr("ui.stream.tune_low", "Low latency"), tr("ui.stream.tune_best", "Best quality"));
     let (perf, bal, qual) = (
@@ -834,7 +831,6 @@ fn adv_rows(ui: &mut Ui, st: &mut StreamSettingsState, target: Target, v: NextSt
         tr("ui.stream.ql_balanced", "Balanced"),
         tr("ui.stream.ql_quality", "Quality"),
     );
-    let (dynamic, fixed) = (tr("ui.stream.rc_dynamic", "Dynamic"), tr("ui.stream.rc_static", "Static"));
     let mut tune = v.tune;
     if widgets::ctrl_row(ui, &tr("ui.stream.tune", "Tune"), None, |ui| {
         widgets::segmented(ui, &mut tune, &[(TuneMode::LowLatency, low.as_str()), (TuneMode::BestQuality, best.as_str())])
@@ -850,18 +846,6 @@ fn adv_rows(ui: &mut Ui, st: &mut StreamSettingsState, target: Target, v: NextSt
         )
     }) {
         out.push(target.action(NextStream { quality_level: ql, ..v }));
-    }
-    let mut rc = v.rate_control;
-    if widgets::ctrl_row(
-        ui,
-        &tr("ui.stream.rate_control", "Rate control"),
-        Some(&tr(
-            "ui.stream.rate_control_tip",
-            "Dynamic: adapts quality to stay within your bitrate. Static: fixed quality per frame - tiny on still screens, but motion spikes can exceed your bitrate and stutter.",
-        )),
-        |ui| widgets::segmented(ui, &mut rc, &[(RateControlMode::Qvbr, dynamic.as_str()), (RateControlMode::Cqp, fixed.as_str())]),
-    ) {
-        out.push(target.action(NextStream { rate_control: rc, ..v }));
     }
     let mut gop = st.gop.unwrap_or(v.gop_millis);
     let r = widgets::slider_row(

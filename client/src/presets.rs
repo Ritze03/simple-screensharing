@@ -9,13 +9,13 @@
 //!
 //! # What a preset is
 //!
-//! A preset is a named combination of four encoder knobs — [`TuneMode`],
-//! [`QualityLevel`], [`RateControlMode`] and the GOP/keyframe interval in
-//! milliseconds ([`EncoderTuning`]). Picking a preset is a convenience
-//! mapping onto those four fields, not a fifth setting: nothing about a
-//! preset is stored anywhere, so "which preset is active" is always derived
-//! from the four fields by [`EncoderPreset::detect`]. A hand-tuned combination
-//! that matches no preset is a legal, unhighlighted state.
+//! A preset is a named combination of three encoder knobs — [`TuneMode`],
+//! [`QualityLevel`] and the GOP/keyframe interval in milliseconds
+//! ([`EncoderTuning`]). Picking a preset is a convenience mapping onto those
+//! three fields, not a fourth setting: nothing about a preset is stored
+//! anywhere, so "which preset is active" is always derived from the three
+//! fields by [`EncoderPreset::detect`]. A hand-tuned combination that matches
+//! no preset is a legal, unhighlighted state.
 //!
 //! Where the presets get applied (inherent methods, defined at the bottom of
 //! this file):
@@ -30,49 +30,43 @@
 //! `session.rs` (already ~4k lines) needs no `crate::presets` import. Callers
 //! see them as ordinary `AppState`/`DestEdit` methods either way.
 //!
-//! # Why these four, and why these values
+//! # Why these three, and why these values
 //!
-//! (Carried over from the JS table's comments; 2026-07-30 rate-control
-//! collapse from three variants to CQP/QVBR.)
-//!
-//! - **Low-Latency** wants predictable, bounded bandwidth: Dynamic (`Qvbr`,
-//!   i.e. VA `vbr`), fastest quality level (`performance`).
-//! - **Balanced** and **Quality** both want "spend the bandwidth budget on
-//!   quality", which is exactly what Dynamic does: `Qvbr`.
-//! - **Gaming** is Dynamic as well, paired with a much shorter GOP
+//! - **Low-Latency**: fastest quality level (`performance`), low-latency tune.
+//! - **Balanced** and **Quality** want "spend the bandwidth budget on
+//!   quality": best-quality tune, `balanced` / `quality` level.
+//! - **Gaming** is Low-Latency's tune and level paired with a much shorter GOP
 //!   ([`GAMING_GOP_MILLIS`], 0.75 s vs. the 2 s default) for faster recovery
-//!   from motion artefacts, and the fast end of Quality Level (`performance`)
-//!   to favour low encode latency.
-//! - `Why:` Low-Latency and Gaming used to be Static (`Cqp`, 2026-07-30 to
-//!   2026-10-15). A constant quantizer ignores the configured bitrate, so big
-//!   motion produced bursts above the link's capacity and the stream froze
-//!   (user report 2026-10-15, task #87). Dynamic keeps the bitrate bounded.
-//!   A saved setting of Low-Latency+Cqp now shows as a hand-tuned
-//!   combination (no highlighted preset) until a preset is picked again.
+//!   from motion artefacts. It differs from Low-Latency in the GOP only.
 //! - **Balanced** is the middle, default option: it equals `AppState`'s own
-//!   default tune/quality/rate-control/GOP, so a freshly launched app's "next
-//!   capture" settings already *are* the Balanced preset.
+//!   default tune/quality/GOP, so a freshly launched app's "next capture"
+//!   settings already *are* the Balanced preset.
+//! - **Rate control is not part of a preset** (removed 2026-10-15, #88): every
+//!   encode is Dynamic (VBR, bitrate bounded). It used to be a fourth knob
+//!   (Dynamic/Static); Low-Latency and Gaming had been Static, whose constant
+//!   quantizer ignored the configured bitrate and froze streams on motion.
+//!   `Why:` user 2026-10-15, Dynamic "just works", so the choice went away.
+//!   See `superdoc/features/stream-control.md` "Rate control".
 
-use crate::capture::{DEFAULT_GOP_MILLIS, QualityLevel, RateControlMode, TuneMode, VideoCodec};
+use crate::capture::{DEFAULT_GOP_MILLIS, QualityLevel, TuneMode, VideoCodec};
 use crate::session::{AppState, DestEdit, DestinationId};
 
 /// GOP/keyframe interval of the Gaming preset, ms. Every other preset keeps
 /// [`DEFAULT_GOP_MILLIS`] (the protocol spec's 2 s self-heal ceiling).
 pub const GAMING_GOP_MILLIS: u32 = 750;
 
-/// The four encoder knobs a preset sets together.
+/// The three encoder knobs a preset sets together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncoderTuning {
     pub tune: TuneMode,
     pub quality_level: QualityLevel,
-    pub rate_control: RateControlMode,
     /// Keyframe/GOP interval in milliseconds (see
     /// `capture::destination::VideoParams::gop_millis`).
     pub gop_millis: u32,
 }
 
 impl EncoderTuning {
-    /// The preset whose four fields exactly match `self`, or `None` for a
+    /// The preset whose three fields exactly match `self`, or `None` for a
     /// hand-tuned combination. Reverse lookup for highlighting the active
     /// preset button.
     pub fn preset(self) -> Option<EncoderPreset> {
@@ -136,37 +130,33 @@ impl EncoderPreset {
         })
     }
 
-    /// The four encoder fields this preset sets.
+    /// The three encoder fields this preset sets.
     pub const fn tuning(self) -> EncoderTuning {
         match self {
             Self::LowLatency => EncoderTuning {
                 tune: TuneMode::LowLatency,
                 quality_level: QualityLevel::Performance,
-                rate_control: RateControlMode::Qvbr,
                 gop_millis: DEFAULT_GOP_MILLIS,
             },
             Self::Balanced => EncoderTuning {
                 tune: TuneMode::BestQuality,
                 quality_level: QualityLevel::Balanced,
-                rate_control: RateControlMode::Qvbr,
                 gop_millis: DEFAULT_GOP_MILLIS,
             },
             Self::Quality => EncoderTuning {
                 tune: TuneMode::BestQuality,
                 quality_level: QualityLevel::Quality,
-                rate_control: RateControlMode::Qvbr,
                 gop_millis: DEFAULT_GOP_MILLIS,
             },
             Self::Gaming => EncoderTuning {
                 tune: TuneMode::LowLatency,
                 quality_level: QualityLevel::Performance,
-                rate_control: RateControlMode::Qvbr,
                 gop_millis: GAMING_GOP_MILLIS,
             },
         }
     }
 
-    /// Whichever preset's four fields exactly match `tuning`, or `None` if
+    /// Whichever preset's three fields exactly match `tuning`, or `None` if
     /// none does (an allowed, unhighlighted state).
     pub fn detect(tuning: EncoderTuning) -> Option<Self> {
         Self::ALL.into_iter().find(|p| p.tuning() == tuning)
@@ -178,17 +168,16 @@ impl EncoderPreset {
 // ---------------------------------------------------------------------
 
 impl DestEdit {
-    /// The four preset-driven encoder fields of this edit buffer.
+    /// The three preset-driven encoder fields of this edit buffer.
     pub fn tuning(&self) -> EncoderTuning {
         EncoderTuning {
             tune: self.tune,
             quality_level: self.quality_level,
-            rate_control: self.rate_control,
             gop_millis: self.gop_millis,
         }
     }
 
-    /// Overwrite tune / quality level / rate control / GOP with `preset`'s
+    /// Overwrite tune / quality level / GOP with `preset`'s
     /// values. Edit buffer only — nothing reaches the live encoder until
     /// [`AppState::apply_destination_edit`] (or use
     /// [`AppState::apply_preset_to_destination`], which does both).
@@ -196,7 +185,6 @@ impl DestEdit {
         let t = preset.tuning();
         self.tune = t.tune;
         self.quality_level = t.quality_level;
-        self.rate_control = t.rate_control;
         self.gop_millis = t.gop_millis;
     }
 
@@ -208,13 +196,12 @@ impl DestEdit {
 }
 
 impl AppState {
-    /// The four preset-driven encoder fields of the live "next capture"
+    /// The three preset-driven encoder fields of the live "next capture"
     /// settings (what the Start-a-stream form edits).
     pub fn start_stream_tuning(&self) -> EncoderTuning {
         EncoderTuning {
             tune: self.tune,
             quality_level: self.quality_level,
-            rate_control: self.rate_control,
             gop_millis: self.gop_millis,
         }
     }
@@ -226,14 +213,13 @@ impl AppState {
     }
 
     /// Picking `preset` on the Start-a-stream form: set the live "next
-    /// capture" tune / quality level / rate control / GOP together. Not
+    /// capture" tune / quality level / GOP together. Not
     /// persisted (GOP never is; the rest is saved at "Go live" by
     /// [`AppState::go_live_and_save_defaults`]).
     pub fn apply_preset_to_start_stream(&mut self, preset: EncoderPreset) {
         let t = preset.tuning();
         self.tune = t.tune;
         self.quality_level = t.quality_level;
-        self.rate_control = t.rate_control;
         self.gop_millis = t.gop_millis;
     }
 
@@ -318,29 +304,27 @@ mod tests {
     use super::*;
 
     /// The former JS `ENCODER_PRESETS` table (the Electron frontend's `components.js`, removed
-    /// ~:994), copied verbatim as `(value, label, title, tune, qualityLevel,
-    /// rateControl, gopMillis)` with the JS wire strings
+    /// ~:994), copied as `(value, label, title, tune, qualityLevel,
+    /// gopMillis)` (its `rateControl` column is gone, #88) with the JS wire strings
     /// (`dto::parse_tune_mode` etc.) and `DEFAULT_GOP_MILLIS = 2000`,
     /// `GAMING_GOP_MILLIS = 750`.
-    const JS_TABLE: [(&str, &str, &str, &str, &str, &str, u32); 4] = [
+    const JS_TABLE: [(&str, &str, &str, &str, &str, u32); 4] = [
         (
             "low_latency",
             "Low-Latency",
             "Fastest encode, prioritizes reduced delay over compression efficiency.",
             "low_latency",
             "performance",
-            "qvbr",
             2000,
         ),
-        ("balanced", "Balanced", "The default — a good mix of latency and quality.", "best_quality", "balanced", "qvbr", 2000),
-        ("quality", "Quality", "Maximizes visual quality within the bandwidth ceiling.", "best_quality", "quality", "qvbr", 2000),
+        ("balanced", "Balanced", "The default — a good mix of latency and quality.", "best_quality", "balanced", 2000),
+        ("quality", "Quality", "Maximizes visual quality within the bandwidth ceiling.", "best_quality", "quality", 2000),
         (
             "gaming",
             "Gaming",
             "Tuned for fast-motion/gaming content — shorter keyframe interval for quicker recovery from motion artifacts.",
             "low_latency",
             "performance",
-            "qvbr",
             750,
         ),
     ];
@@ -358,24 +342,17 @@ mod tests {
             QualityLevel::Quality => "quality",
         }
     }
-    fn rate_control_str(r: RateControlMode) -> &'static str {
-        match r {
-            RateControlMode::Cqp => "cqp",
-            RateControlMode::Qvbr => "qvbr",
-        }
-    }
 
     #[test]
     fn every_preset_matches_the_js_table_exactly() {
         assert_eq!(EncoderPreset::ALL.len(), JS_TABLE.len());
-        for (preset, (value, label, title, tune, quality, rc, gop)) in EncoderPreset::ALL.into_iter().zip(JS_TABLE) {
+        for (preset, (value, label, title, tune, quality, gop)) in EncoderPreset::ALL.into_iter().zip(JS_TABLE) {
             assert_eq!(preset.value(), value);
             assert_eq!(preset.label(), label);
             assert_eq!(preset.description(), title);
             let t = preset.tuning();
             assert_eq!(tune_str(t.tune), tune, "{value} tune");
             assert_eq!(quality_str(t.quality_level), quality, "{value} quality level");
-            assert_eq!(rate_control_str(t.rate_control), rc, "{value} rate control");
             assert_eq!(t.gop_millis, gop, "{value} gop");
         }
     }
@@ -409,7 +386,6 @@ mod tests {
         let tuning = EncoderTuning {
             tune: TuneMode::BestQuality,
             quality_level: QualityLevel::Performance,
-            rate_control: RateControlMode::Cqp,
             gop_millis: DEFAULT_GOP_MILLIS,
         };
         assert_eq!(tuning.preset(), None);
@@ -424,7 +400,6 @@ mod tests {
         let t = EncoderTuning::default();
         assert_eq!(t.tune, TuneMode::default());
         assert_eq!(t.quality_level, QualityLevel::default());
-        assert_eq!(t.rate_control, RateControlMode::default());
         assert_eq!(t.gop_millis, DEFAULT_GOP_MILLIS);
     }
 
@@ -456,7 +431,7 @@ mod tests {
     use crate::session::Destination;
 
     #[test]
-    fn dest_edit_apply_preset_sets_only_the_four_tuning_fields() {
+    fn dest_edit_apply_preset_sets_only_the_three_tuning_fields() {
         let mut edit = Destination::edit_from(video_params());
         edit.scale_percent = 50;
         edit.framerate = 144;

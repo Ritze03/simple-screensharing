@@ -74,7 +74,6 @@ mod session_model {
             backend: capture::EncoderBackend::default(),
             tune: capture::TuneMode::default(),
             quality_level: capture::QualityLevel::default(),
-            rate_control: capture::RateControlMode::default(),
             gop_millis: capture::DEFAULT_GOP_MILLIS,
             codec: capture::VideoCodec::default(),
         };
@@ -90,7 +89,6 @@ mod session_model {
                 bitrate_kbps: DEFAULT_BITRATE_KBPS,
                 tune: capture::TuneMode::default(),
                 quality_level: capture::QualityLevel::default(),
-                rate_control: capture::RateControlMode::default(),
                 gop_millis: capture::DEFAULT_GOP_MILLIS,
                 codec: capture::VideoCodec::default(),
             },

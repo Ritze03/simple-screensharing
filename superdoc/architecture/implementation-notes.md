@@ -171,14 +171,14 @@ has the current map).
   `edit_destination`, bandwidth total/floor, allocated kbps and overshoot, the audio-level tap,
   volume resolution, supported codecs. The JS encoder presets became `client/src/presets.rs`:
 
-  | preset | tune | quality | rate control | GOP |
-  |--------|------|---------|--------------|-----|
-  | LowLatency | LowLatency | Performance | Qvbr | 2000 ms |
-  | Balanced | BestQuality | Balanced | Qvbr | 2000 ms |
-  | Quality | BestQuality | Quality | Qvbr | 2000 ms |
-  | Gaming | LowLatency | Performance | Qvbr | 750 ms |
+  | preset | tune | quality | GOP |
+  |--------|------|---------|-----|
+  | LowLatency | LowLatency | Performance | 2000 ms |
+  | Balanced | BestQuality | Balanced | 2000 ms |
+  | Quality | BestQuality | Quality | 2000 ms |
+  | Gaming | LowLatency | Performance | 750 ms |
 
-  (Table as of 2026-10-15, #87: LowLatency and Gaming were `Cqp` until then; `Qvbr` = UI "Dynamic", `Cqp` = "Static", see `features/stream-control.md` "Rate control renamed Dynamic/Static".)
+  (Table as of 2026-10-15, #88: the rate-control column is gone, every encode is Dynamic/VBR; before that LowLatency and Gaming were `Cqp` (UI "Static"), see `features/stream-control.md` "Rate control".)
 
   `Why:` the Electron/Tauri layers were deleted in the egui rework, and the new egui UI must stay a thin view
   over `AppState` rather than re-implement what the sidecar did.
