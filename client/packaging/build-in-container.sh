@@ -52,14 +52,19 @@ strip "$APPDIR/usr/bin/simple-screensharing-client" || true
 
 PLUGIN_DIR="$(pkg-config --variable=pluginsdir gstreamer-1.0)"
 SCANNER_DIR="$(pkg-config --variable=pluginscannerdir gstreamer-1.0)"
-# /opt/libav: gst-libav built against a minimal FFmpeg (see the Dockerfile); wins over the distro one.
-SEARCH_DIRS=(/opt/libav/lib/gstreamer-1.0 "$PLUGIN_DIR")
+# /opt/libav: gst-libav built against a minimal FFmpeg; /opt/pipewire-gst: gst-plugin-pipewire with
+# the possible_caps fix (see the Dockerfile and README.md); both win over the distro ones.
+SEARCH_DIRS=(/opt/libav/lib/gstreamer-1.0 /opt/pipewire-gst/lib/gstreamer-1.0 "$PLUGIN_DIR")
 while read -r plugin; do
     f=""
     for d in "${SEARCH_DIRS[@]}"; do [ -f "$d/libgst${plugin}.so" ] && { f="$d/libgst${plugin}.so"; break; }; done
     [ -n "$f" ] || die "GStreamer plugin not found: libgst${plugin}.so (listed in gst-plugins.txt)"
     install -m755 "$f" "$APPDIR/usr/lib/gstreamer-1.0/"
 done < <(sed -e 's/#.*//' -e 's/[[:space:]]*$//' "$HERE/gst-plugins.txt" | grep -v '^$')
+# The pipewire plugin must be the patched build, never Debian's (its pipewiresrc dies with
+# "stream error: unhandled format" on xdg-desktop-portal-hyprland, see README.md).
+cmp -s /opt/pipewire-gst/lib/gstreamer-1.0/libgstpipewire.so "$APPDIR/usr/lib/gstreamer-1.0/libgstpipewire.so" \
+    || die "bundled libgstpipewire.so is not the patched /opt/pipewire-gst build"
 install -m755 "$SCANNER_DIR/gst-plugin-scanner" "$APPDIR/usr/libexec/gstreamer-1.0/"
 
 # Icon: the brand mark (docs/assets/icon.svg), rendered to PNG for the AppDir root.
