@@ -6,11 +6,11 @@ sibling docs rather than duplicating them.
 ## Big picture
 
 `simple-screensharing` (this directory) is **one monorepo** (private GitHub repo
-`Ritze03/simple-screensharing`, all rework on branch `rework`) holding the relay server, the
+`Ritze03/simple-screensharing`, the rework landed on `master` 2026-10-15) holding the relay server, the
 desktop client, the shared wire-protocol crate and this documentation. It used to be a docs-only
 workspace over separate `simple-screensharing-server` / `simple-screensharing-client` repos;
 those were imported with full history (old branches kept as `archive/client/*` and
-`archive/server/*`). `Why one repo:` server, desktop client and the browser client must
+`archive/server/*`; deleted from GitHub 2026-10-15, kept in the local git bundle `../simple-screensharing-archive-branches.bundle`, restore: `git fetch <bundle> 'refs/heads/archive/*:refs/heads/archive/*'`). `Why one repo:` server, desktop client and the browser client must
 change in lockstep.
 
 | Path | Role |

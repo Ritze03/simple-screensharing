@@ -1,6 +1,6 @@
 # simple-screensharing
 
-Friends screensharing platform, one monorepo (Cargo workspace on branch `rework`):
+Friends screensharing platform, one monorepo (Cargo workspace on `master`):
 `client/` (native Rust/egui desktop app: capture, encode, decode, UI), `server/` (Rust QUIC/WebTransport
 relay with a ratatui TUI), `protocol/` (shared wire crate), `docs/` (the GitHub-Pages browser client,
 watch and share; `docs/js/core` protocol+media core, `docs/js/ui` UI, `docs/dev` test harness) and

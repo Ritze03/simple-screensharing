@@ -6,7 +6,7 @@ Screensharing for a group of friends: share a screen (plus an app's audio) into 
 and everyone with the room's link watches, in low latency and end to end encrypted. The
 relay forwards ciphertext and never holds the room key.
 
-This is a monorepo on the `rework` branch (not merged to master yet).
+This is a monorepo.
 
 | Part | What |
 | --- | --- |

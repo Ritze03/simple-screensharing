@@ -131,10 +131,10 @@ former "Electron + sidecar" architecture (older entries on this page describe it
 has the current map).
 
 - **I1, monorepo.** The workspace root is now one repository (private GitHub
-  `Ritze03/simple-screensharing`, all rework on branch `rework`). `client/` and `server/` were
+  `Ritze03/simple-screensharing`, the rework was done on branch `rework`, merged into `master` 2026-10-15). `client/` and `server/` were
   imported from the old separate repos **with full history** (a `filter-branch` subdirectory
   rewrite, then a merge with `--allow-unrelated-histories`); the old branches are kept as
-  `archive/client/*` (86) and `archive/server/*` (7). Root Cargo workspace: members `client`,
+  `archive/client/*` (86) and `archive/server/*` (7) (deleted from GitHub 2026-10-15; kept in the local git bundle `../simple-screensharing-archive-branches.bundle`, restore: `git fetch <bundle> 'refs/heads/archive/*:refs/heads/archive/*'`). Root Cargo workspace: members `client`,
   `client/src-tauri` (since deleted), `server`, `protocol`, resolver 3; the root `Cargo.lock` started from the
   client's. The old nested repo directories and the empty `simple-screensharing-website/` were
   deleted. `Why:` server, desktop client and the upcoming browser client must change in
