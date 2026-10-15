@@ -640,6 +640,18 @@ server|room-id|key||name               (CA relay: empty certhash field, name pre
 All forms are valid everywhere; a parser that knows only 3/4 fields rejects the 5-field forms
 (both shipped clients, native and browser, parse all forms; browser: task #69, 2026-10-15).
 
+`server` (1st field) is `host:port`, `1.2.3.4:port` or `[ipv6]:port`, **the port is mandatory**
+(1-65535; a bare IPv6 literal without brackets has no port and is rejected the same way). Clients
+never default it: the relay's own default is 4433 but real deployments use others (41000 on
+`vogelnest.any64.de`), so a silent default turns a typo into an opaque timeout (and a browser
+would quietly try 443). Native `net::parse_server_addr`, browser `parseServerAddr`
+(`docs/js/core/joinlink.js`); the create/join dialog blocks Create/Join on a bad address and a
+connect (also of an already saved room) fails with "server address needs a port, e.g.
+host:4433" instead of a DNS-sounding error. `parse_join_string` / `parseJoinLink` stay lenient on
+the server field so an old saved room with a portless address still loads and shows that error.
+*Why:* user report 2026-10-15 (task #84): `vogelnest.any64.de` without `:41000` gave `could not
+resolve server address ...: invalid socket address`.
+
 `certhash` = SHA-256 of the relay's **leaf certificate DER**, **base64url, no padding** (43
 characters), same encoding as `key`. An **empty** `certhash` field means "no hash" (that is how a
 name is attached to a link for a CA relay). The native client does

@@ -35,6 +35,7 @@ only a name follows: `server|id|key||name`), `name` = the room's display name, U
 
 | function | |
 | --- | --- |
+| `parseServerAddr(str)` | `{ host, port }` for `host:port`, `ip:port`, `[v6]:port` (port 1-65535); throws `JoinLinkError` with `code` `empty` / `no-port` / `bad-port`. The port is never defaulted (`protocol-spec.md` §11.4). `createRoom` and `RelaySession.open` use it. |
 | `parseJoinLink(str)` | `{ server, host, port, roomId, roomIdHex, roomKey, certHash, name }` (`name` is `null` when absent or undecodable); throws `JoinLinkError` with the native wording. Accepts 3, 4 and 5 fields (the 5th keeps any further `\|`, like Rust `splitn(5)`), trims, strict base64url (rejects padding/non-canonical like Rust). |
 | `formatJoinLink(server, roomId, roomKey, certHash?, name?)` | the inverse. The name is encoded like the native encoder: only `A-Za-z0-9-._~` stay raw (`encodeURIComponent` plus `!'()*` escaped), so a link formatted by either client is byte-identical. |
 | `encodeLinkName(name)`, `decodeLinkName(field)`, `MAX_LINK_ROOM_NAME_CHARS` | the name codec on its own (native `encode_link_name` / `decode_link_name`) |

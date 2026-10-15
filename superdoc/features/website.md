@@ -111,6 +111,13 @@ Three user requests, the browser mirrors native tasks #68 and #70 so both client
   *Why:* user request 2026-10-15 (copy link carries the name, pasting fills it). The encoder escapes `!'()*` on top of
   `encodeURIComponent` so a link is byte-identical whichever client made it.
 
+- **Server address needs a port** (task #84, user report 2026-10-15; `protocol-spec.md` §11.4): `parseServerAddr`
+  (`docs/js/core/joinlink.js`, twin of native `parse_server_addr`) rejects a bare host (a browser would quietly use 443 for
+  `https://host/`). The create/join dialog shows an inline hint (`#add-hint`, updated on input without a re-render so focus stays)
+  and disables Create/Join; `createRoom` throws, `RelaySession.open` throws `ConnectError` code `server-no-port` / `server-bad-port`
+  (so a saved portless room shows `ui.err.server_no_port`). A DNS failure cannot be told apart in the browser (WebTransport reports
+  a generic handshake failure). Checked with `docs/dev/e2e/server-port.mjs` (no relay needed).
+
 Verified through the real UI with `docs/dev/e2e/name-modal.mjs` (headless Chromium, throwaway relay) and by the unit vectors
 in `docs/dev/tests.js`.
 

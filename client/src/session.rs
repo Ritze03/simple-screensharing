@@ -4430,6 +4430,7 @@ impl AppState {
         if server.is_empty() {
             return Err("server address must not be empty".to_string());
         }
+        crate::net::parse_server_addr(server).map_err(|e| e.to_string())?;
         let room_name = room_name.trim().to_string();
         if room_name.is_empty() {
             return Err("room name must not be empty".to_string());

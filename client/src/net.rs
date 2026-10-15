@@ -637,11 +637,8 @@ impl ScreenshareClient {
         let parsed = parse_join_string(join_string)?;
         let remote_addr = resolve_server_addr(&parsed.server).await?;
 
-        let host = parsed
-            .server
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(parsed.server.as_str());
+        // Validated by `resolve_server_addr` just above.
+        let host = parse_server_addr(&parsed.server)?.0;
 
         let connection = endpoint
             .connect(remote_addr, host)
@@ -972,12 +969,77 @@ async fn handle_preview_stream(mut recv: quinn::RecvStream, room_key: [u8; 32], 
     }
 }
 
+/// Why a relay address (the server field of a join link / the create dialog)
+/// is unusable. Kept apart from DNS failures so each gets its own message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerAddrError {
+    /// Nothing typed.
+    Empty,
+    /// No port (`host`), or a bare IPv6 literal without brackets (`::1`).
+    NoPort,
+    /// A port that is not a number in 1-65535, or an empty host.
+    BadPort,
+}
+
+impl std::fmt::Display for ServerAddrError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("server address is empty"),
+            Self::NoPort => f.write_str("server address needs a port, e.g. host:4433"),
+            Self::BadPort => f.write_str("server address has an invalid port (use 1-65535), e.g. host:4433"),
+        }
+    }
+}
+
+impl std::error::Error for ServerAddrError {}
+
+/// Split a relay address into `(host, port)`: `host:port`, `1.2.3.4:port` or
+/// `[ipv6]:port` (host returned without the brackets); port 1-65535. A bare
+/// host is [`ServerAddrError::NoPort`], never defaulted.
+///
+/// Why: the relay's default port is 4433 but real deployments use others
+/// (41000 on vogelnest.any64.de); silently adding one turns a typo into an
+/// opaque timeout. The user hit it 2026-10-15: `ToSocketAddrs` on a bare host
+/// fails with "invalid socket address", which read like a DNS failure.
+/// Browser twin: `docs/js/core/joinlink.js` `parseServerAddr`.
+pub fn parse_server_addr(server: &str) -> Result<(&str, u16), ServerAddrError> {
+    let s = server.trim();
+    if s.is_empty() {
+        return Err(ServerAddrError::Empty);
+    }
+    let (host, port) = if let Some(rest) = s.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']').ok_or(ServerAddrError::BadPort)?;
+        match tail.strip_prefix(':') {
+            Some(p) => (host, p),
+            None if tail.is_empty() => return Err(ServerAddrError::NoPort),
+            None => return Err(ServerAddrError::BadPort),
+        }
+    } else {
+        // Exactly one ':' - a second one is a bare IPv6 literal, which has no
+        // way to say where the port starts.
+        match s.split_once(':') {
+            None => return Err(ServerAddrError::NoPort),
+            Some((_, p)) if p.contains(':') => return Err(ServerAddrError::NoPort),
+            Some(hp) => hp,
+        }
+    };
+    if host.is_empty() || port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(ServerAddrError::BadPort);
+    }
+    match port.parse::<u16>() {
+        Ok(p) if p != 0 => Ok((host, p)),
+        _ => Err(ServerAddrError::BadPort),
+    }
+}
+
 async fn resolve_server_addr(server: &str) -> Result<SocketAddr> {
-    tokio::net::lookup_host(server)
+    let (host, port) = parse_server_addr(server)?;
+    // `{e}` inline, not `.context`: the UI shows only the outermost message.
+    tokio::net::lookup_host((host, port))
         .await
-        .with_context(|| format!("could not resolve server address {server:?}"))?
+        .map_err(|e| anyhow!("could not resolve host {host:?}: {e}"))?
         .next()
-        .ok_or_else(|| anyhow!("server address {server:?} resolved to no addresses"))
+        .ok_or_else(|| anyhow!("host {host:?} resolved to no addresses"))
 }
 
 /// Build the one local QUIC endpoint every [`ScreenshareClient::connect`]
@@ -1077,6 +1139,37 @@ mod tests {
 
     fn test_key() -> [u8; 32] {
         [0x42u8; 32]
+    }
+
+    #[test]
+    fn server_addr_needs_a_valid_port() {
+        use ServerAddrError::*;
+        assert_eq!(parse_server_addr("vogelnest.any64.de:41000"), Ok(("vogelnest.any64.de", 41000)));
+        assert_eq!(parse_server_addr("  host:1  "), Ok(("host", 1)));
+        assert_eq!(parse_server_addr("host:65535"), Ok(("host", 65535)));
+        assert_eq!(parse_server_addr("1.2.3.4:4433"), Ok(("1.2.3.4", 4433)));
+        assert_eq!(parse_server_addr("[::1]:4433"), Ok(("::1", 4433)));
+        assert_eq!(parse_server_addr(""), Err(Empty));
+        assert_eq!(parse_server_addr("   "), Err(Empty));
+        assert_eq!(parse_server_addr("host"), Err(NoPort));
+        assert_eq!(parse_server_addr("1.2.3.4"), Err(NoPort));
+        assert_eq!(parse_server_addr("::1"), Err(NoPort), "bare IPv6 has no port");
+        assert_eq!(parse_server_addr("[::1]"), Err(NoPort));
+        assert_eq!(parse_server_addr("host:0"), Err(BadPort));
+        assert_eq!(parse_server_addr("host:70000"), Err(BadPort));
+        assert_eq!(parse_server_addr("host:"), Err(BadPort));
+        assert_eq!(parse_server_addr("host:abc"), Err(BadPort));
+        assert_eq!(parse_server_addr(":4433"), Err(BadPort));
+        assert_eq!(parse_server_addr("[::1:4433"), Err(BadPort));
+    }
+
+    #[tokio::test]
+    async fn connect_errors_tell_a_missing_port_from_a_dns_failure() {
+        let e = resolve_server_addr("vogelnest.any64.de").await.unwrap_err().to_string();
+        assert_eq!(e, "server address needs a port, e.g. host:4433");
+        let e = resolve_server_addr("no-such-host.invalid:4433").await.unwrap_err().to_string();
+        assert!(e.starts_with("could not resolve host \"no-such-host.invalid\": "), "{e}");
+        assert!(resolve_server_addr("127.0.0.1:4433").await.is_ok());
     }
 
     #[test]

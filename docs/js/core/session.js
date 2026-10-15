@@ -5,6 +5,7 @@ import {
   ControlFrameReader, MAX_MEDIA_DATAGRAM_LEN, WEBTRANSPORT_PATH, decodeRelayToClient, encodeClientToRelay, frameControl, randomConnId,
 } from "./protocol.js";
 import { NonceSequence } from "./crypto.js";
+import { parseServerAddr } from "./joinlink.js";
 
 /**
  * Connect failure. `code`: `handshake-failed`, `no-webtransport`, `datagram-too-small`, `join-no-reply`, `relay-shutdown`.
@@ -109,6 +110,11 @@ export class RelaySession {
   static async open({ server, certHash, signal = null, timeoutMs = HANDSHAKE_TIMEOUT_MS }) {
     if (!supportsWebTransport()) {
       throw new ConnectError("This browser does not support WebTransport (needed to reach the relay). Use a current Chrome, Edge or Firefox.", { code: "no-webtransport" });
+    }
+    try {
+      parseServerAddr(server);
+    } catch (e) {
+      throw new ConnectError(e.message, { code: e.code === "no-port" ? "server-no-port" : "server-bad-port", cause: e });
     }
     const url = `https://${server}${WEBTRANSPORT_PATH}`;
     const opts = {};

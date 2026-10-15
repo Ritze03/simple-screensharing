@@ -229,6 +229,20 @@ These were decided in the earlier UIs and are still the rules.
   *Why:* user request 2026-10-15, encourage setting a name instead of silently using the
   default. Caveat: a room joined before the name is saved (auto-connect) keeps the old name
   for its peers until the next connect, the wire sends the name only once.
+- **Server address validation (task #84):** the Create tab's server field and the server part of
+  a pasted join link (checked once the first `|` is typed) must be `host:port` / `ip:port` /
+  `[ipv6]:port`, port 1-65535 (`net::parse_server_addr`; one shared parser). While it is not,
+  a red hint sits under the field ("Add the relay's port, e.g. example.org:4433", or the
+  bad-port variant) and Create / Join is disabled (also Enter); an empty field shows no hint,
+  only the disabled button. `AppState::create_room` rejects it too. A connect to a saved room
+  with a portless server fails with "server address needs a port, e.g. host:4433"; a real DNS
+  failure reads `could not resolve host "...": <resolver error>` (those two are English
+  `anyhow` messages from `net.rs`, like the other connect errors; the dialog hints are i18n keys
+  `ui.modal.server_no_port` / `server_bad_port`). *Why:* user report 2026-10-15, a relay
+  address without its port (`vogelnest.any64.de`, relay on 41000) showed "could not resolve
+  server address ...: invalid socket address", which read like DNS. Not silently defaulted to
+  4433 because real relays use other ports and a default would become an opaque timeout.
+  Browser twin: `docs/js/ui/app.js` (`serverHint`, `joinLinkHint`), `superdoc/features/website.md`.
 - **Create/join modal:** server field pre-filled from the most recently saved room (the lib
   keeps no "last server" setting). A freshly minted link is shown masked (it carries the
   room key) and has no relay cert hash, so browsers can't use it; "Copy invite link" copies

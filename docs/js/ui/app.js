@@ -4,7 +4,7 @@
 // images) by moving them into the new tree. Numbers that change every second (fps, kbps, meters) are patched in
 // place instead of re-rendering, so sliders and hovers are never interrupted.
 
-import { capabilities, createRoom, parseJoinLink, base64urlDecode, ENCODER_PRESETS, probeEncoders } from "../core/index.js";
+import { capabilities, createRoom, parseJoinLink, parseServerAddr, base64urlDecode, ENCODER_PRESETS, probeEncoders } from "../core/index.js";
 import { S, onInvalidate, invalidate, toast, persistSettings, persistRooms, loadRooms, autoName, displayName } from "./store.js";
 import { t, setLang, getLang } from "./i18n.js";
 import {
@@ -840,10 +840,23 @@ function renderAdd(M, close, lgBtn, spacer) {
   let body, foot;
   const tabs = H({ g: 0 }, FILL(seg([["join", t("ui.modal.join_tab")], ["create", t("ui.modal.create_tab")]], M.tab, (v) => { M.tab = v; M.minted = null; M.error = null; render(); })));
   const err = M.error ? h("span", { class: "hint err", text: M.error }) : null;
+  // Inline server-address check (task #84): shown under the link / server field, disables the primary button.
+  const hintNode = h("span", { class: "hint err", id: "add-hint", role: "alert" });
+  const curHint = () => (M.tab === "join" ? joinLinkHint(M.link) : serverHint(M.server));
+  const syncHint = () => {
+    const x = curHint();
+    hintNode.textContent = x || "";
+    hintNode.hidden = !x;
+    const b = document.getElementById(M.tab === "join" ? "btn-join" : "btn-create");
+    if (b) b.disabled = !!x;
+  };
+  const blocked = !!curHint();
+  syncHint();
   const field = (id, key, placeholder, label, cls, tip) => {
     const inp = h("input", { class: "field" + (cls ? " " + cls : ""), id, placeholder, value: M[key] || "", "aria-label": label, spellcheck: "false", autocomplete: "off" });
     inp.addEventListener("input", () => {
       M[key] = inp.value;
+      if (key === "link" || key === "server") syncHint();
       if (key === "link" && prefillName(M)) {
         const n = document.getElementById("add-name");
         if (n) n.value = M.name;
@@ -858,14 +871,14 @@ function renderAdd(M, close, lgBtn, spacer) {
     return openMinted(M);
   };
   if (M.tab === "join") {
-    body = [tabs, card(null, null, field("add-link", "link", "relay.example.com:4433|…|…|…", t("ui.modal.join_link"), "mono"), field("add-name", "name", t("ui.modal.name_placeholder"), t("ui.modal.room_name"), null, t("ui.modal.room_name_tip")), err)];
-    foot = [spacer(), lgBtn("btn-secondary", t("ui.modal.cancel"), close), lgBtn("btn-primary", t("ui.modal.join"), () => doJoin(M), "login", false, "btn-join")];
+    body = [tabs, card(null, null, field("add-link", "link", "relay.example.com:4433|…|…|…", t("ui.modal.join_link"), "mono"), hintNode, field("add-name", "name", t("ui.modal.name_placeholder"), t("ui.modal.room_name"), null, t("ui.modal.room_name_tip")), err)];
+    foot = [spacer(), lgBtn("btn-secondary", t("ui.modal.cancel"), close), lgBtn("btn-primary", t("ui.modal.join"), () => doJoin(M), "login", blocked, "btn-join")];
   } else if (!M.minted) {
     body = [tabs, card(null, null,
       field("add-cname", "name", t("ui.modal.name_placeholder"), t("ui.modal.room_name"), null, t("ui.modal.room_name_tip")),
-      field("add-server", "server", "relay.example.com:4433", t("ui.modal.server"), "mono", t("ui.modal.server_tip")),
+      field("add-server", "server", "relay.example.com:4433", t("ui.modal.server"), "mono", t("ui.modal.server_tip")), hintNode,
       field("add-hash", "hash", t("ui.modal.hash_placeholder"), t("ui.modal.hash"), "mono", t("ui.modal.hash_tip")), err)];
-    foot = [spacer(), lgBtn("btn-secondary", t("ui.modal.cancel"), close), lgBtn("btn-primary", t("ui.modal.create"), () => doCreate(M), "add", false, "btn-create")];
+    foot = [spacer(), lgBtn("btn-secondary", t("ui.modal.cancel"), close), lgBtn("btn-primary", t("ui.modal.create"), () => doCreate(M), "add", blocked, "btn-create")];
   } else {
     body = [tabs, h("p", { text: t("ui.modal.created_text") }),
       card(null, null,
@@ -874,6 +887,22 @@ function renderAdd(M, close, lgBtn, spacer) {
     foot = [spacer(), lgBtn("btn-primary", t("ui.modal.open_room"), () => openMinted(M), null, false, "btn-open-room")];
   }
   return modalShell("", t("ui.sidebar.create_or_join"), null, close, body, foot, null, t("ui.close"));
+}
+
+/** Inline hint for a relay address: null when it is empty (nothing to say yet) or valid. Native twin: `modals.rs` `server_hint`. */
+function serverHint(server) {
+  try {
+    parseServerAddr(server);
+    return null;
+  } catch (e) {
+    return e.code === "no-port" ? t("ui.modal.server_no_port") : e.code === "bad-port" ? t("ui.modal.server_bad_port") : null;
+  }
+}
+/** Same for the server part of a pasted join link; silent until the first `|` (still typing the address before that). */
+function joinLinkHint(link) {
+  const s = String(link || "").trim();
+  const at = s.indexOf("|");
+  return at < 0 ? null : serverHint(s.slice(0, at));
 }
 
 /**
@@ -898,6 +927,7 @@ function prefillName(M) {
 }
 
 function doJoin(M) {
+  if (joinLinkHint(M.link)) return;
   let p;
   try {
     p = parseJoinLink(M.link || "");
@@ -911,6 +941,7 @@ function doJoin(M) {
 }
 function doCreate(M) {
   const server = (M.server || "").trim();
+  if (server && serverHint(server)) return;
   const hashText = (M.hash || "").trim();
   let certHash = null;
   try {

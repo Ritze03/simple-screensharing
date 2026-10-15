@@ -58,6 +58,8 @@ export function connectErrorText(e) {
     if (e.reason === "unreachable") return t("ui.err.unreachable");
     if (e.code === "join-no-reply") return t("ui.err.join_no_reply");
     if (e.code === "no-webtransport") return t("ui.err.no_webtransport");
+    if (e.code === "server-no-port") return t("ui.err.server_no_port");
+    if (e.code === "server-bad-port") return t("ui.err.server_bad_port");
     return e.message;
   }
   if (e instanceof JoinLinkError) return t("ui.err.bad_link", { error: e.message });

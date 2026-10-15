@@ -158,6 +158,35 @@ export function splitHostPort(server) {
 }
 
 /**
+ * Validate a relay address and split it: `host:port`, `1.2.3.4:port` or `[ipv6]:port`, port 1-65535. Throws a
+ * JoinLinkError whose `code` is "empty", "no-port" (bare host, or a bare IPv6 literal) or "bad-port" (not 1-65535, empty
+ * host). Never defaults the port. Native twin: `net.rs` `parse_server_addr`.
+ * Why: real relays use any port (41000 on vogelnest.any64.de, the default is 4433); a silent default turns a typo into an
+ * opaque timeout, and a browser would quietly try 443 for `https://host/`. User hit it 2026-10-15 (task #84).
+ * @returns {{host:string, port:number}}
+ */
+export function parseServerAddr(server) {
+  const s = String(server ?? "").trim();
+  const fail = (code, msg) => Object.assign(new JoinLinkError(msg), { code });
+  if (!s) throw fail("empty", "server address is empty");
+  let host, port;
+  if (s.startsWith("[")) {
+    const m = /^\[([^\]]*)\](?::(.*))?$/.exec(s);
+    if (!m) throw fail("bad-port", "server address has an invalid port (use 1-65535), e.g. host:4433");
+    if (m[2] === undefined) throw fail("no-port", "server address needs a port, e.g. host:4433");
+    [, host, port] = m;
+  } else {
+    const parts = s.split(":");
+    if (parts.length !== 2) throw fail("no-port", "server address needs a port, e.g. host:4433");
+    [host, port] = parts;
+  }
+  if (!host || !/^[0-9]+$/.test(port) || Number(port) < 1 || Number(port) > 65535) {
+    throw fail("bad-port", "server address has an invalid port (use 1-65535), e.g. host:4433");
+  }
+  return { host, port: Number(port) };
+}
+
+/**
  * `server|room-id|key[|certhash[|name]]`. A blank `name` yields the 3/4-field form; a name without a hash leaves the
  * 4th field empty (`server|id|key||name`), like native `format_join_string_full`.
  */
@@ -188,7 +217,7 @@ export function stripLinkName(link) {
  */
 export function createRoom(server, { name = "", certHash = null } = {}) {
   server = String(server).trim();
-  if (!server) throw new JoinLinkError("server address must not be empty");
+  parseServerAddr(server);
   const roomId = crypto.getRandomValues(new Uint8Array(16));
   const roomKey = crypto.getRandomValues(new Uint8Array(32));
   return { name: String(name).trim(), server, roomId, roomKey, link: formatJoinLink(server, roomId, roomKey, certHash, name) };

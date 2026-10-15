@@ -5,7 +5,7 @@
 
 import { PostcardReader, PostcardWriter } from "../js/core/postcard.js";
 import * as P from "../js/core/protocol.js";
-import { MAX_LINK_ROOM_NAME_CHARS, base64urlDecode, bytesToHex, createRoom, encodeLinkName, formatJoinLink, hexToBytes, JoinLinkError, parseJoinLink, splitHostPort, stripLinkName } from "../js/core/joinlink.js";
+import { MAX_LINK_ROOM_NAME_CHARS, base64urlDecode, bytesToHex, createRoom, encodeLinkName, formatJoinLink, hexToBytes, JoinLinkError, parseJoinLink, parseServerAddr, splitHostPort, stripLinkName } from "../js/core/joinlink.js";
 import { NonceSequence, NonceSpaceExhausted, buildAad, buildNonce, decryptFrame, decryptPreview, encryptFrame, encryptPreview, importRoomKey } from "../js/core/crypto.js";
 import { Reassembler, fragmentFrame } from "../js/core/fragment.js";
 import { deriveCodecString, sniffCodec } from "../js/core/codec.js";
@@ -310,7 +310,20 @@ test("createRoom: fresh random id + key, valid link", () => {
   const p = parseJoinLink(a.link);
   eq([bytesToHex(p.roomId), bytesToHex(p.roomKey), p.server], [bytesToHex(a.roomId), bytesToHex(a.roomKey), "relay.example:4433"]);
   throws(() => createRoom("  "), "empty server", JoinLinkError);
+  throws(() => createRoom("relay.example"), "server without a port", JoinLinkError);
   ok(parseJoinLink(createRoom("h:1", { certHash: new Uint8Array(32).fill(9) }).link).certHash.length === 32);
+});
+
+test("parseServerAddr: host:port, ip:port, [v6]:port; a port is required (mirrors native parse_server_addr)", () => {
+  eq(parseServerAddr("vogelnest.any64.de:41000"), { host: "vogelnest.any64.de", port: 41000 });
+  eq(parseServerAddr("  host:1  "), { host: "host", port: 1 });
+  eq(parseServerAddr("host:65535"), { host: "host", port: 65535 });
+  eq(parseServerAddr("1.2.3.4:4433"), { host: "1.2.3.4", port: 4433 });
+  eq(parseServerAddr("[::1]:4433"), { host: "::1", port: 4433 });
+  const code = (s) => throws(() => parseServerAddr(s), `reject ${JSON.stringify(s)}`, JoinLinkError).code;
+  eq(code(""), "empty");
+  for (const s of ["host", "1.2.3.4", "::1", "[::1]"]) eq(code(s), "no-port");
+  for (const s of ["host:0", "host:70000", "host:", "host:abc", ":4433", "[::1]x", "[::1"]) eq(code(s), "bad-port");
 });
 
 // ------------------------------------------------------------------------------------------------ nonce / aad / crypto

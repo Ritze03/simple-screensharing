@@ -33,7 +33,7 @@
 
 
 use egui::{Align, Ui};
-use simple_screensharing_client::net::parse_join_string;
+use simple_screensharing_client::net::{ServerAddrError, parse_join_string, parse_server_addr};
 use simple_screensharing_client::rooms::{AppSettings, PresentationMode};
 use simple_screensharing_client::session::RoomHandle;
 
@@ -245,8 +245,11 @@ fn create_join(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
     // The footer closure can't borrow `st` next to the body's `&mut`: it uses
     // this pass's start values (a tab switch requests a repaint below).
     let tab = st.tab;
-    let can_join = !awaiting && !st.join_link.trim().is_empty();
-    let can_create = !st.server.trim().is_empty() && !st.create_name.trim().is_empty();
+    let join_hint = join_link_hint(&st.join_link);
+    let create_hint = server_hint(&st.server);
+    let can_join = !awaiting && !st.join_link.trim().is_empty() && join_hint.is_none();
+    let can_create =
+        !st.server.trim().is_empty() && create_hint.is_none() && !st.create_name.trim().is_empty();
 
     let mut copy_clicked = false;
     let mut submit = false;
@@ -274,6 +277,9 @@ fn create_join(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
                             None,
                             |ui| widgets::text_field(ui, &mut st.join_link, "server|room-id|key"),
                         );
+                        if let Some(h) = &join_hint {
+                            field_hint(ui, h);
+                        }
                         st.prefill_name();
                         let name = widgets::ctrl_row(
                             ui,
@@ -339,6 +345,9 @@ fn create_join(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
                                     )
                                 },
                             );
+                            if let Some(h) = &create_hint {
+                                field_hint(ui, h);
+                            }
                             let name = widgets::ctrl_row(
                                 ui,
                                 &tr("ui.modal.room_name", "Room name"),
@@ -421,13 +430,13 @@ fn create_join(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
                 });
             }
         } else if st.tab == AddTab::Join {
-            if !st.join_link.trim().is_empty() {
+            if can_join {
                 cx.act(UiAction::JoinRoom {
                     join_string: st.join_link.trim().to_string(),
                     room_name: st.join_name.trim().to_string(),
                 });
             }
-        } else if !st.server.trim().is_empty() && !st.create_name.trim().is_empty() {
+        } else if can_create {
             st.result_dismissed = false;
             cx.act(UiAction::CreateRoom {
                 server: st.server.trim().to_string(),
@@ -827,12 +836,48 @@ fn plain_card<R>(ui: &mut Ui, body: impl FnOnce(&mut Ui) -> R) -> R {
 
 /// Dim explanatory text (`.modal p`): 12.5 px, line height 1.55, wraps.
 fn paragraph(ui: &mut Ui, text: &str) {
+    colored_paragraph(ui, text, theme::TEXT_DIM);
+}
+
+/// Inline validation message under a field row: small, `DANGER`, wraps.
+/// Why: the Create/Join button is disabled while one shows, so the reason has
+/// to be on screen (task #84, a relay address without a port).
+fn field_hint(ui: &mut Ui, text: &str) {
+    ui.add_space(2.0);
+    colored_paragraph(ui, text, theme::DANGER);
+}
+
+/// Hint for the server field of the create dialog; `None` when it is empty
+/// (nothing to say yet, the button is disabled anyway) or valid.
+fn server_hint(server: &str) -> Option<String> {
+    match parse_server_addr(server) {
+        Ok(_) | Err(ServerAddrError::Empty) => None,
+        Err(ServerAddrError::NoPort) => Some(tr(
+            "ui.modal.server_no_port",
+            "Add the relay's port, e.g. example.org:4433",
+        )),
+        Err(ServerAddrError::BadPort) => Some(tr(
+            "ui.modal.server_bad_port",
+            "The port must be a number from 1 to 65535, e.g. example.org:4433",
+        )),
+    }
+}
+
+/// Same check for the server part (before the first `|`) of a pasted join
+/// link. Silent until the first `|` is there: before that the user is still
+/// typing or pasting the address.
+fn join_link_hint(link: &str) -> Option<String> {
+    let link = link.trim();
+    link.split_once('|').and_then(|(server, _)| server_hint(server))
+}
+
+fn colored_paragraph(ui: &mut Ui, text: &str, color: egui::Color32) {
     let w = ui.available_width();
     let mut job = egui::text::LayoutJob::single_section(
         text.to_owned(),
         egui::TextFormat {
             font_id: font(Weight::Regular, theme::FS_LABEL),
-            color: theme::TEXT_DIM,
+            color,
             line_height: Some((theme::FS_LABEL * 1.55).round()),
             ..Default::default()
         },
@@ -840,12 +885,27 @@ fn paragraph(ui: &mut Ui, text: &str) {
     job.wrap.max_width = w;
     let g = ui.painter().layout_job(job);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(w, g.size().y), egui::Sense::hover());
-    ui.painter().galley(rect.min, g, theme::TEXT_DIM);
+    ui.painter().galley(rect.min, g, color);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_field_hint_and_join_link_hint() {
+        assert!(server_hint("").is_none(), "empty: no hint, the button is just disabled");
+        assert!(server_hint("example.org:4433").is_none());
+        assert!(server_hint("[::1]:4433").is_none());
+        for bad in ["example.org", "::1", "example.org:0", "example.org:70000", "example.org:"] {
+            assert!(server_hint(bad).is_some(), "{bad}");
+        }
+        // Join link: silent until the first `|`, then the server part counts.
+        assert!(join_link_hint("example.org").is_none());
+        assert!(join_link_hint("example.org|").is_some());
+        assert!(join_link_hint("  example.org|00|key").is_some());
+        assert!(join_link_hint("example.org:4433|00|key").is_none());
+    }
 
     #[test]
     fn masked_link_never_contains_the_key() {
