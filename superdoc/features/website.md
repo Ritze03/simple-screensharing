@@ -121,6 +121,17 @@ Three user requests, the browser mirrors native tasks #68 and #70 so both client
 Verified through the real UI with `docs/dev/e2e/name-modal.mjs` (headless Chromium, throwaway relay) and by the unit vectors
 in `docs/dev/tests.js`.
 
+## "This browser can't decode H.265" cleared on a codec switch (task #87, 2026-10-15)
+
+User: switching a native share to H.265 shows the tile error when the browser viewer cannot decode it
+("that's good"), but switching back to H.264 left the message. The tile's `w.error` was set on the core's
+`unsupported` media event and nothing cleared it. `docs/js/ui/media-event.js` `applyMediaEvent` now clears it on
+every `codec` event (a keyframe with a different codec string); `VideoReceiver` emits `codec` before the
+async `isConfigSupported` verdict, so an unsupported new codec sets the error again right after. Unit test
+`media events: ...` in `docs/dev/tests.js`. Verified in the rig: headless Chromium viewer against the rig's
+relay, native sharer H.265 (error shown, `h265`, `firstFrame:false`) -> H.264 (error gone, 59 fps).
+The native viewer has no such tile message, so nothing changed there.
+
 ## Double-click fullscreen and avatar colours (task #77, 2026-10-15)
 
 Both user requests, mirrored from the native client (`superdoc/ui/APP-SHELL.md`, `superdoc/ui/STYLING-GUIDE.md`).

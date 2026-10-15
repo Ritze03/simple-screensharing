@@ -35,16 +35,20 @@
 //! (Carried over from the JS table's comments; 2026-07-30 rate-control
 //! collapse from three variants to CQP/QVBR.)
 //!
-//! - **Low-Latency** wants predictable, non-quality-seeking behaviour: CQP,
-//!   fastest quality level (`performance`).
+//! - **Low-Latency** wants predictable, bounded bandwidth: Dynamic (`Qvbr`,
+//!   i.e. VA `vbr`), fastest quality level (`performance`).
 //! - **Balanced** and **Quality** both want "spend the bandwidth budget on
-//!   quality", which is exactly what QVBR does: QVBR.
-//! - **Gaming** is CQP, not QVBR: fast-paced content rarely holds still, so
-//!   QVBR's "spend leftover budget on stillness" upside rarely triggers,
-//!   while CQP's fixed per-frame quality holds up under constant motion. It
-//!   pairs that with a much shorter GOP ([`GAMING_GOP_MILLIS`], 0.75 s vs.
-//!   the 2 s default) for faster recovery from motion artefacts, and the fast
-//!   end of Quality Level (`performance`) to favour low encode latency.
+//!   quality", which is exactly what Dynamic does: `Qvbr`.
+//! - **Gaming** is Dynamic as well, paired with a much shorter GOP
+//!   ([`GAMING_GOP_MILLIS`], 0.75 s vs. the 2 s default) for faster recovery
+//!   from motion artefacts, and the fast end of Quality Level (`performance`)
+//!   to favour low encode latency.
+//! - `Why:` Low-Latency and Gaming used to be Static (`Cqp`, 2026-07-30 to
+//!   2026-10-15). A constant quantizer ignores the configured bitrate, so big
+//!   motion produced bursts above the link's capacity and the stream froze
+//!   (user report 2026-10-15, task #87). Dynamic keeps the bitrate bounded.
+//!   A saved setting of Low-Latency+Cqp now shows as a hand-tuned
+//!   combination (no highlighted preset) until a preset is picked again.
 //! - **Balanced** is the middle, default option: it equals `AppState`'s own
 //!   default tune/quality/rate-control/GOP, so a freshly launched app's "next
 //!   capture" settings already *are* the Balanced preset.
@@ -138,7 +142,7 @@ impl EncoderPreset {
             Self::LowLatency => EncoderTuning {
                 tune: TuneMode::LowLatency,
                 quality_level: QualityLevel::Performance,
-                rate_control: RateControlMode::Cqp,
+                rate_control: RateControlMode::Qvbr,
                 gop_millis: DEFAULT_GOP_MILLIS,
             },
             Self::Balanced => EncoderTuning {
@@ -156,7 +160,7 @@ impl EncoderPreset {
             Self::Gaming => EncoderTuning {
                 tune: TuneMode::LowLatency,
                 quality_level: QualityLevel::Performance,
-                rate_control: RateControlMode::Cqp,
+                rate_control: RateControlMode::Qvbr,
                 gop_millis: GAMING_GOP_MILLIS,
             },
         }
@@ -325,7 +329,7 @@ mod tests {
             "Fastest encode, prioritizes reduced delay over compression efficiency.",
             "low_latency",
             "performance",
-            "cqp",
+            "qvbr",
             2000,
         ),
         ("balanced", "Balanced", "The default — a good mix of latency and quality.", "best_quality", "balanced", "qvbr", 2000),
@@ -336,7 +340,7 @@ mod tests {
             "Tuned for fast-motion/gaming content — shorter keyframe interval for quicker recovery from motion artifacts.",
             "low_latency",
             "performance",
-            "cqp",
+            "qvbr",
             750,
         ),
     ];

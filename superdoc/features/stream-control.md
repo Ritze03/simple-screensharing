@@ -478,12 +478,15 @@ the screen changes, so an idle or slower monitor under a 240 target would otherw
 an encoder limit. No per-GPU tables: everything is measured at run time.
 
 UI: the action bar's Live status shows `Screen · 172/240 fps` in the warning colour and its
-tooltip (now always present, with the full status) adds "Encoding 172 of 240 fps" plus a
-pointer to Stream settings. The stream-settings Video card shows an Info banner under
-Framerate, "Your encoder reaches about N fps with H.264 on this machine.", with a "Use
-H.265" button when H.265 is in `AppState::supported_codecs()` and not already the codec;
-it applies through the normal `EditDestination` path. Measured: H.264 @240 Balanced → hint
-at 171-173 fps; "Use H.265" → viewer 240-241 fps, hint gone.
+tooltip (now always present, with the full status) adds "Encoding 172 of 240 fps".
+Measured: H.264 @240 Balanced → hint at 171-173 fps; H.265 → viewer 240-241 fps, hint gone.
+
+**Removed 2026-10-15 (user, #87): the stream-settings banner.** The Video card used to show an
+Info banner under Framerate, "Your encoder reaches about N fps with H.264 on this machine.",
+with a "Use H.265" button. The user: "it's just annoying". Both strings
+(`ui.stream.encoder_limit`, `ui.stream.use_h265`) and the card code are gone; the measurement
+(`EncoderLimit`) stays because the action bar's status colour and tooltip still use it, and
+`ui.bar.encoder_limit_why` no longer points at Stream settings.
 
 ## Cancelling the screen picker is silent (2026-10-14)
 
@@ -953,6 +956,8 @@ of the available bandwidth as possible for good quality" actually requires given
 specific encoder element supports. **`Qvbr` is now the default** (not `Cqp` — the owner's
 explicit call: maximize quality by default, not conserve bandwidth by default).
 
+**Superseded 2026-10-15 (#87): the "Efficient"/"Max Quality" names and the Low-Latency/Gaming = Cqp rows below were reversed/changed, see "Rate control renamed Dynamic / Static".**
+
 The Advanced panel's raw `Rate Control` `pillSwitch` now shows two plain-language options,
 "Efficient" (Cqp) and "Max Quality" (Qvbr), replacing the old three raw mode names. The four
 `ENCODER_PRESETS` (now `client/src/presets.rs`) were re-assigned per-preset rather than blanket-defaulted:
@@ -1134,6 +1139,49 @@ as a value meaningfully tighter than the old 1x-bitrate buffer per the task's gu
 result above already shows a real improvement at this value, so no further tuning was done, but a
 tighter (e.g. 0.25x) or looser (0.5x) value remains unexplored if the current setting turns out to
 need further adjustment after real-world (non-scripted) use.
+
+### Rate control renamed Dynamic / Static; Low-Latency and Gaming move to Dynamic (2026-10-15, #87)
+
+**User report (2026-10-15):** "'Efficient' works flawlessly. 'Max quality' freezes on big movements ... Efficient uses like 6 Mbit/s with just my desktop showing, and Max quality like half a Mbit/s, but it should be the other way around, right?"
+
+**The names were backwards, the modes were not switched.** `Cqp` (shown as "Max quality") holds the
+*quantizer* (quality per frame) constant, so the bitrate follows the content: tiny on a still desktop, enormous
+on motion, and the configured kbps is not a cap. `Qvbr` (shown as "Efficient", emits VA `rate-control=vbr`)
+holds the *bitrate* near `VBR_TARGET_PERCENTAGE`% (95) of the configured value with the configured value as
+a ceiling, and lets quality vary. "Max quality" sounded like "spends the most" but is the one that spends
+least when nothing moves; "Efficient" sounded frugal but spends toward its budget.
+
+**Measured** (`vah264enc`, 1080p60, 5 s, `b-frames=0 key-int-max=120 target-usage=2`, `videotestsrc` through
+`vapostproc`, same element properties `launch_fragment` builds; 8000 kbps configured):
+
+| content | `vbr` (Dynamic) | `cqp` (Static) |
+| --- | --- | --- |
+| `smpte` (static, detailed) | 7484 kbps | 35591 kbps |
+| `ball` (static, simple) | 131 kbps | 84 kbps |
+| `snow` (noise, worst-case motion) | 9340 kbps | 561864 kbps |
+
+So CQP on busy content produces 4-70x the configured bitrate: a link that cannot carry it drops packets and
+the stream freezes (the user's "freezes on big movements"). Dynamic stays at about the budget. On a real
+1080p60 vkcube in the rig, Low-Latency + Dynamic at 8000 kbps measured 7.6 Mbps at the viewer (= 95 %),
+and the same stream switched live to Static 4.8 Mbps (simple moving content, under the cap; the spikes
+above need more complex content).
+
+**Why Dynamic shows ~6 Mbit/s on a still desktop:** VA `vbr` does not undershoot much on detailed
+content even when it is static: with `target-percentage=95` the rate control keeps spending toward the target
+(it lowers QP on the P frames and the periodic IDRs are large), see the `smpte` row. Truly flat content
+(`ball`) does stay tiny (131 kbps). Text and gradients on a desktop land in between. This is the
+2026-07-30 tuning working as designed (a high target tracks the budget, which is what avoids the old
+"pop-in" swings), not a bug, and was deliberately left alone here. x264 (software) `Qvbr` is plain
+`bitrate=` (ABR-like single pass) and was not measured.
+
+**What changed:** UI names Efficient -> **Dynamic** (`Qvbr`), Max quality -> **Static** (`Cqp`), de
+"Dynamisch" / "Statisch", with a plain-words tooltip (`ui.stream.rate_control_tip`); i18n keys renamed
+`rc_dynamic` / `rc_static`. Enum names and the persisted `"qvbr"`/`"cqp"` values are unchanged (saved
+settings keep working). `presets.rs`: **Low-Latency and Gaming now use `Qvbr`** (Dynamic), so all four
+presets are Dynamic; Low-Latency vs Gaming still differ by GOP only. A saved Low-Latency/Gaming setup with
+`Cqp` now matches no preset (shown as hand-tuned, Static selected) until a preset is picked again.
+The browser mirrors it: Low-Latency/Gaming use `bitrateMode: "variable"`, the read-only rate-control row
+reads "Dynamic (variable bitrate)".
 
 ### Interaction with viewers: codec-string re-derivation
 

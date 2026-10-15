@@ -812,6 +812,22 @@ test("session: relay close codes map to rejections; unknown/absent codes map to 
   eq([CLOSE_CODES.MALFORMED, CLOSE_CODES.ROOM_FULL, CLOSE_CODES.SHUTDOWN], [0x101, 0x102, 0x200]);
 });
 
+test("media events: a codec change clears a stale can't-decode error (H.265 -> H.264); unsupported sets it again", async () => {
+  const { applyMediaEvent } = await import("../js/ui/media-event.js");
+  const tr = (c) => `This browser can't decode ${c}.`;
+  const w = { codec: null, error: null };
+  applyMediaEvent(w, { type: "codec", codec: "h265" }, tr);
+  applyMediaEvent(w, { type: "unsupported", codec: "h265" }, tr);
+  eq(w.error, "This browser can't decode H265.");
+  applyMediaEvent(w, { type: "codec", codec: "h264" }, tr);
+  eq([w.codec, w.error], ["h264", null]);
+  applyMediaEvent(w, { type: "codec", codec: "h265" }, tr);
+  applyMediaEvent(w, { type: "unsupported", codec: "h265" }, tr);
+  eq(w.error !== null, true);
+  eq(applyMediaEvent(w, { type: "need-keyframe" }, tr), false);
+  eq(w.error !== null, true, "unrelated events leave the error alone");
+});
+
 test("ui i18n: en and de have the same keys and placeholders; German uses 'du', never 'Sie'", async () => {
   const { DICT } = await import("../js/ui/i18n.js");
   const ph = (s) => [...String(s).matchAll(/%\{(\w+)\}/g)].map((m) => m[1]).sort().join(",");

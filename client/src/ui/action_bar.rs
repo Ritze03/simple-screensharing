@@ -802,7 +802,7 @@ fn encoder_limit_tip(l: EncoderLimited) -> String {
         "Encoding %{n} of %{fps} fps",
         &[("n", &l.encoding_fps.to_string()), ("fps", &l.target_fps.to_string())],
     );
-    let why = tr("ui.bar.encoder_limit_why", "Your encoder can't keep up with this framerate. Stream settings shows what helps.");
+    let why = tr("ui.bar.encoder_limit_why", "Your encoder can't keep up with this framerate.");
     format!("{head}\n{why}")
 }
 

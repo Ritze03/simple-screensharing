@@ -6,6 +6,7 @@ import { S, invalidate, toast, persistRooms, displayName } from "./store.js";
 import { t, DICT } from "./i18n.js";
 import { onShareEvent, onShareStats, stopDestsInRoom } from "./capture.js";
 import { closePopout } from "./popout.js";
+import { applyMediaEvent } from "./media-event.js";
 
 export class RoomEntry {
   constructor({ id, name, link, auto = true }) {
@@ -178,8 +179,7 @@ function wire(r, client) {
   on("media", (d) => {
     const w = r.watches.get(d.key);
     if (!w) return;
-    if (d.type === "codec") w.codec = d.codec || w.codec;
-    else if (d.type === "unsupported") w.error = t("ui.tile.unsupported", { codec: String(d.codec || "").toUpperCase() || "?" });
+    applyMediaEvent(w, d, (codec) => t("ui.tile.unsupported", { codec }));
     invalidate();
   });
   on("share", (d) => onShareEvent(r, d));

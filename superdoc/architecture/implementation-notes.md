@@ -173,10 +173,12 @@ has the current map).
 
   | preset | tune | quality | rate control | GOP |
   |--------|------|---------|--------------|-----|
-  | LowLatency | LowLatency | Performance | Cqp | 2000 ms |
+  | LowLatency | LowLatency | Performance | Qvbr | 2000 ms |
   | Balanced | BestQuality | Balanced | Qvbr | 2000 ms |
   | Quality | BestQuality | Quality | Qvbr | 2000 ms |
-  | Gaming | LowLatency | Performance | Cqp | 750 ms |
+  | Gaming | LowLatency | Performance | Qvbr | 750 ms |
+
+  (Table as of 2026-10-15, #87: LowLatency and Gaming were `Cqp` until then; `Qvbr` = UI "Dynamic", `Cqp` = "Static", see `features/stream-control.md` "Rate control renamed Dynamic/Static".)
 
   `Why:` the Electron/Tauri layers were deleted in the egui rework, and the new egui UI must stay a thin view
   over `AppState` rather than re-implement what the sidecar did.

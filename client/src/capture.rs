@@ -656,9 +656,19 @@ pub enum QualityLevel {
 /// settings files (an unknown enum variant fails that field's
 /// deserialization, not a graceful per-field fallback). That cost was judged
 /// disproportionate to a purely internal/cosmetic rename; the user-visible
-/// "Max Quality" label and the wire contract are unaffected either way. Read
-/// `Self::Qvbr` as "the max-quality mode", not literally "the mode that sets
-/// `rate-control=qvbr`" — this comment is the map from one to the other.
+/// label ("Dynamic", see below) and the wire contract are unaffected either
+/// way. Read `Self::Qvbr` as "the Dynamic mode", not literally "the mode that
+/// sets `rate-control=qvbr`" — this comment is the map from one to the other.
+///
+/// **User-visible names (2026-10-15, #87): `Qvbr` = "Dynamic", `Cqp` =
+/// "Static".** They used to be "Efficient" (`Qvbr`) and "Max quality" (`Cqp`),
+/// which read backwards: CQP holds the *quality* per frame constant, so its
+/// bitrate follows the content (tiny on a still desktop, huge on big motion,
+/// and the configured bitrate is NOT a cap); VBR holds the *bitrate* near the
+/// target and lets quality vary. A user whose stream froze on big movements
+/// under "Max quality" (CQP overflowing the link) prompted the rename and
+/// moving Low-Latency/Gaming to `Qvbr`. Dynamic = quality adapts to the
+/// bitrate; Static = the quality is fixed, the bitrate swings.
 ///
 /// [`EncoderBackend::Software`] has no equivalent enum — its closest control
 /// is `pass` (`cbr`/`quant`/`qual`) + `quantizer`; see
@@ -671,9 +681,10 @@ pub enum RateControlMode {
     /// element's own default of 26 — deliberately left unset/untuned, see
     /// [`EncoderBackend::launch_fragment`]). x264enc: `pass=qual
     /// quantizer=21` (constant-quality, driven by `quantizer` rather than a
-    /// bitrate target). Conservative/"resourceful" bandwidth use: a fixed
-    /// per-frame quality that never spends more of the configured bitrate
-    /// ceiling than a static QP happens to need.
+    /// bitrate target). UI name "Static". Fixed per-frame quality: bitrate
+    /// follows the content (very little on a still screen) but the configured
+    /// bitrate is *not* a ceiling, so big motion can burst past the link's
+    /// capacity and stall the stream (#87).
     Cqp,
     /// vah264enc `rate-control=vbr` (plain Variable Bitrate — see this type's
     /// doc comment for why this variant, still named `Qvbr`, no longer emits
@@ -694,7 +705,7 @@ pub enum RateControlMode {
     /// `Adaptive`/`Constant` no-op relied on. The default: the product's "max
     /// out available bandwidth for the best quality that fits" is the
     /// desired out-of-the-box behavior, rather than [`Self::Cqp`]'s
-    /// deliberately conservative bandwidth use.
+    /// unbounded bitrate. UI name "Dynamic".
     #[default]
     Qvbr,
 }

@@ -126,7 +126,7 @@ picks the first unwatched match); a renamed member or a changed label is a diffe
 | `stats` | every second: `{ watching: { key: {...} }, sharing: [...], transport, droppedFrames }`. Watch stats: `receivedFps, decodedFps, bitrateKbps, jitterMs, bufferMs, width, height, codec, codecString, lossEvents, decoderErrors, decryptFailures, skippedDeltas, needKeyframe, stalled, ...`; audio: `packets, decodedFrames, underruns, level, volume, muted` (`level` = peak meter 0..1 with a ~0.5 s hold, not one frame's instant peak). `transport` is `WebTransport.getStats()` (RTT etc.) when the browser offers it. |
 | `subscribers` | `{ streamId, count }` for **your own** shares (from the relay). |
 | `watch-ended` | `{ key, reason, stableKey, ownerName, label, kind }` the stream you were watching stopped (or its owner left or reconnected, or you reconnected into a relay that no longer has it). The handle is already removed. |
-| `media` | `{ key, type, ... }`: `codec` (a keyframe revealed `codec` / `codecString`), `unsupported` (this browser cannot decode that codec), `decoder-error`, `need-keyframe`. |
+| `media` | `{ key, type, ... }`: `codec` (a keyframe revealed `codec` / `codecString`), `unsupported` (this browser cannot decode that codec; the UI drops that error on the next `codec` event, i.e. when the sharer switches to a codec string it can decode), `decoder-error`, `need-keyframe`. |
 | `share` | `{ state: "started"\|"stopped"\|"ended-by-browser"\|"no-audio"\|"no-frames", share, message? }`. `ended-by-browser`: the user clicked the browser's "Stop sharing". `no-frames`: 4 s after starting, the source had not delivered a single frame. |
 | `error` | `{ code, message, fatal, error }`. Codes: `connection-lost` (fatal, only without `autoReconnect`), `relay-unreachable` (reconnect attempt failed, the hash is known good), `room-full` (reconnect hit a full room; retries go on), `link-expired` (only for a hash that never worked in this page, see above), `reconnect-failed`, `join-rejected`, `nonce-exhausted`, `encoder-error`, `audio-encoder-error`, `audio-share-unavailable`, `send-failed`, `preview-failed`. |
 
@@ -204,7 +204,7 @@ Behaviour that matches the native sender:
 | native (`client/src/presets.rs`) | browser |
 | --- | --- |
 | tune `LowLatency` / `BestQuality` | `latencyMode: "realtime"` / `"quality"` |
-| rate control CQP / QVBR | `bitrateMode: "constant"` / `"variable"` (CQP needs per-frame quantizers and Chromium 153 reports `bitrateMode: "quantizer"` unsupported for H.264; CBR is the closest predictable mode) |
+| rate control Static (CQP) / Dynamic (QVBR) | `bitrateMode: "constant"` / `"variable"`; every preset uses `"variable"` since #87 (CQP needs per-frame quantizers and Chromium 153 reports `bitrateMode: "quantizer"` unsupported for H.264; CBR is the closest predictable mode) |
 | GOP / keyframe interval (2 s, Gaming 0.75 s) | forced keyframes every `gopMs` (WebCodecs has no GOP knob) |
 | quality level (x264 speed-preset, VA target-usage) | **native-only**: no WebCodecs equivalent |
 | H.264 profile/level | chosen from size and fps (High, falling back to Main, then Baseline), `probeEncoders()` shows what works |
