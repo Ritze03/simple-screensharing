@@ -32,14 +32,14 @@ One capture is **one screen grab, one GStreamer pipeline, N destinations**:
 GPU domain (Linux portal + VA stack, the normal case; 2026-10-14, #39):
 pipewiresrc(DMA-BUF) ! vapostproc(video-direction=auto) ! VAMemory NV12 ! tee
     ├─ queue ! videorate(1fps)  ! vapostproc ! BGRx ! videoconvert ! RGB ! appsink   (JPEG thumbnails, fixed)
-    ├─ valve[closed unless the window is focused] ! queue ! videorate(30fps) ! vapostproc(<=640x360) ! RGBA ! appsink(async=false)   (own-tile live preview, #78)
+    ├─ valve[RateCap 30fps; closed unless the window is focused] ! queue ! vapostproc(<=640x360) ! RGBA ! appsink(async=false)   (own-tile live preview, #78)
     ├─ queue ! valve[RateCap] ! vapostproc ! VAMemory NV12 ! capssetter(fps) ! va*enc ! appsink   ← destination A (room 1)
     └─ queue ! valve[RateCap] ! vapostproc ! VAMemory NV12 ! capssetter(fps) ! va*enc ! appsink   ← destination B (room 2)
 
 System domain (Windows, x264enc machines, tests):
 <platform source> ! videoconvert ! capsfilter(format=BGRx) ! tee
     ├─ queue ! videorate(1fps)  ! RGB ! appsink   (JPEG thumbnails, fixed)
-    ├─ valve[closed unless the window is focused] ! queue ! videorate(30fps) ! videoscale ! videoconvert ! RGBA(<=640x360) ! appsink(async=false)   (own-tile live preview, #78)
+    ├─ valve[RateCap 30fps; closed unless the window is focused] ! queue ! videoscale ! videoconvert ! RGBA(<=640x360) ! appsink(async=false)   (own-tile live preview, #78)
     ├─ queue ! valve[RateCap] ! videoconvert ! videoscale ! capssetter(fps) ! encoder ! appsink   ← destination A (room 1)
     └─ queue ! valve[RateCap] ! videoconvert ! videoscale ! capssetter(fps) ! encoder ! appsink   ← destination B (room 2)
 ```
@@ -103,13 +103,36 @@ placeholder).
   `self-preview.md`.
 - *`videorate drop-only` does not cap a variable-rate portal source:* with the portal's `framerate=0/1` the branch
   delivered 240 fps through `videorate ! framerate=30/1` (counter at the sink). The live branch therefore uses a
-  `branch::RateCap` probe on its valve instead (30.1 fps measured). **Not fixed here, flagged:** the existing 1 fps
-  room-preview branch (`preview_sink`, `videorate drop-only ! ... framerate=1/1`) has the same shape and is probably
-  also running at the full source rate through its GPU download (`vapostproc ! BGRx ! videoconvert`); check its
-  buffer rate before trusting its "1 fps" cost.
+  `branch::RateCap` probe on its valve instead (30.1 fps measured). The fixed 1 fps room-preview branch
+  (`preview_sink`) was suspected of the same (#78's worker) and checked in #79, see below: it is **not**
+  affected.
 - *`vapostproc ! video/x-raw,format=RGBA` writes A,B,G,R bytes on this stack* (solid-colour test: RGBA gave
   `ff 35 2c f9`, BGRA the correct `35 2c f9 ff`): the whole preview was red. The branch asks for BGRA and
   `sample_to_live_frame` swizzles to RGBA.
+
+### Room-preview branch rate check (task #79, 2026-10-15): already ~1 fps, unchanged
+
+Question (from #78): does the fixed `queue ! videorate drop-only ! framerate=1/1 ! ... ! preview_sink` branch run at
+the full source rate, as the live branch's `videorate` did? **No.** Measured in the rig (GPU domain, stock xdpw,
+sharer 240 fps H.265, viewer decoding 234 fps / shown 233, 0 dropped), GStreamer stats tracer on the sharer:
+
+| pad | buffers/s |
+| --- | --- |
+| `queue0:src` (the branch's queue, i.e. what reaches its `videorate`) | 239.2 |
+| `videorate0:src` | **1.0** |
+| `vapostproc0:src` (the GPU download, BGRx 8100 KiB) | **1.0** |
+| `videoconvert1:src` (RGB) | **1.0** |
+
+So the expensive download/convert runs once a second; the 239 fps only pays a `videorate` pad call plus a
+discarded buffer. Sharer process CPU in that state: 5-9.5 % of one core (`top`, with the tracer on).
+System domain: `capture::branch::tests::room_preview_branch_stays_near_one_fps_on_a_variable_rate_source` feeds a
+240 fps source relabelled `framerate=0/1` (what the portal advertises) and counts 1-8 buffers at `preview_sink`
+in 4 s (passes), so no `RateCap` was added to either domain.
+
+`Why the live branch needed RateCap but this one does not:` not pinned down (untested guess: the 1/1 caps behind this
+branch's `videorate` renegotiate differently from the live branch's late-set RGBA capsfilter). If this branch is ever
+restructured, re-run the check (pad probe on `preview_sink`'s sink pad, or the tracer's `videorate*:src` row).
+
 
 **Testing note (rig):** a headless sway seat without a keyboard never sends `wl_keyboard.enter`, so egui never sees
 focus (`viewport().focused` stays false, preview never opens). Give the seat a keyboard for the whole run with a held
