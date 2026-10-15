@@ -213,8 +213,8 @@ impl App {
                 if matches!(self.nav.modal, Some(Modal::StreamSettings { capture: c, .. }) if c == capture) {
                     self.nav.modal = None;
                 }
-                let name = self.room_name(room);
-                self.toast(tr_with("ui.toast.live_in", "Live in %{room}", &[("room", &name.to_string())]), "cast");
+                // No "Live in" toast here: it fires from `poll` once a
+                // destination is really on air.
             }
             UiAction::Discard(capture) => {
                 self.state.stop_share(capture);
@@ -357,7 +357,7 @@ impl App {
         }
     }
 
-    fn room_name(&self, room: session::RoomHandle) -> String {
+    pub(super) fn room_name(&self, room: session::RoomHandle) -> String {
         match self.state.rooms.get(&room) {
             Some(r) => session::room_label(&self.state.room_store, &r.join_string),
             None => tr("ui.room.unknown", "Unknown room").to_string(),

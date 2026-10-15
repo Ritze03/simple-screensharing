@@ -4,6 +4,7 @@
 #
 # plugin             elements the client uses from it
 coreelements         # queue, tee, valve, capsfilter, identity, fakesink, taginject
+debug                # capssetter (every encode branch has one; its absence broke every Windows share, #73)
 app                  # appsrc, appsink
 videoconvertscale    # videoconvert, videoscale
 videorate            # videorate

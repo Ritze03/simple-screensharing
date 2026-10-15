@@ -616,3 +616,17 @@ async fn saving_a_name_closes_the_modal_and_it_never_comes_back() {
     app.prompt_for_name();
     assert!(app.nav.modal.is_none());
 }
+
+/// #73: "Live in <room>" is announced once per on-air spell, never for a
+/// share that is only starting or has failed (those are not in `on_air`).
+#[test]
+fn live_in_toast_fires_once_per_on_air_spell() {
+    use super::newly_on_air;
+    use simple_screensharing_client::session::RoomHandle;
+    let mut announced = Vec::new();
+    assert!(newly_on_air(&mut announced, &[]).is_empty(), "starting or failed share: nothing on air");
+    assert_eq!(newly_on_air(&mut announced, &[RoomHandle(7)]), vec![RoomHandle(7)]);
+    assert!(newly_on_air(&mut announced, &[RoomHandle(7)]).is_empty(), "no repeat while it stays on air");
+    assert!(newly_on_air(&mut announced, &[]).is_empty());
+    assert_eq!(newly_on_air(&mut announced, &[RoomHandle(7)]), vec![RoomHandle(7)], "announced again after leaving air");
+}

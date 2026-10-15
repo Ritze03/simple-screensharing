@@ -56,7 +56,7 @@ powershell -ExecutionPolicy Bypass -File client\packaging\windows\package.ps1
 # -> dist\simple-screensharing-windows\ (63 MB) and dist\simple-screensharing-windows.zip (25 MB)
 ```
 
-The folder holds the exe, 36 GStreamer/GLib/codec DLLs, `gst-plugins\` (the 23 plugins of
+The folder holds the exe, 36 GStreamer/GLib/codec DLLs, `gst-plugins\` (the 24 plugins of
 `windows-plugins.txt`) and `gst-plugin-scanner.exe`. The exe finds `gst-plugins\` itself
 (`main.rs` `use_bundled_gstreamer`), so no launcher script is needed, and it then ignores any GStreamer
 on the machine. `package.ps1` computes the DLL closure with `dumpbin /dependents` and finishes by running
@@ -87,6 +87,17 @@ the window. A shipped GUI app must not show a console.
 Where the output lands for the user: after `package.ps1`, the folder and the zip are also copied to the VM user's
 Desktop (`C:\Users\mo\Desktop\simple-screensharing-windows\` and `...\simple-screensharing-windows.zip`) so it can be
 started by double-click; the zip is also copied back to the Linux repo's `dist\` (gitignored).
+
+**A missing GStreamer element breaks every share (2026-10-15, task #73).** The first real share in the VM
+failed with `failed to construct encode branch bin: ... no element "capssetter"`: the `debug` plugin was not in
+`windows-plugins.txt` (the Linux list has it) and `capssetter` was not in `windows-elements.txt`, so
+`package.ps1`'s self-check could not catch it. Both are listed now (24 plugins). The codec was never the
+problem: `x264enc` (H.264, the only software encoder the client uses) was packaged and the `vah264enc` probe
+falls back to it as designed. Lesson: every element `capture.rs`/`decode/` puts in a pipeline string must be in
+`windows-elements.txt`; the headless `test_sender` run against the packaged folder (below) exercises the encode
+branch and is the check that would have shown it. Why: the user hit it on 2026-10-15 double-clicking the packaged exe.
+
+The window icon is set from `client/assets/icon.png` (see `ui/APP-SHELL.md`); the exe itself has no icon resource.
 
 What an installer would take (not done): wrap that folder with Inno Setup or WiX (Start Menu shortcut,
 per-user install under `%LOCALAPPDATA%\Programs`, uninstaller), and Authenticode-sign the exe and the
@@ -195,6 +206,7 @@ host; the relay runs in the VM.
 | **Windows sender** (`x264enc`, 1080p30 smpte, 8 Mbit/s) -> relay in VM -> **Linux viewer** | `decoder=vah264dec hw=true`, 30.0 decoded fps, 8.0 Mbit/s received, correct SMPTE bars in the dumped frame (needs `uso=disabled`) |
 | the packaged folder alone (PATH without GStreamer) | viewer decodes at 34 to 35 fps through `avdec_h264` |
 | Windows loopback (sender and viewer both in the VM) | 30 fps at 6 Mbit/s, 720p |
+| packaged folder, `test_sender` (1080p60 smpte, 8 Mbit/s, software `x264enc`) + `test_viewer`, relay all in the VM, 2026-10-15 (#73) | encode branch builds (`capture started in the System domain`), viewer `avdec_h264` 37 to 76 decoded fps (sender and viewer share 4 vCPUs, `speed-preset=veryslow`), 5 to 11 Mbit/s. Procedure: copy the package folder, drop `test_sender.exe`/`test_viewer.exe` (built with `--features test-source --example ...`) into it, run with `PATH` = that folder + System32 and `GST_PLUGIN_SYSTEM_PATH_1_0`/`GST_PLUGIN_PATH_1_0`/`GST_PLUGIN_SCANNER_1_0` pointing into it |
 | the egui window | **not verified** (no interactive session, see below). In session 0 the client starts, initialises D3D12 and fails only at swapchain creation (`0x887A0022`, no display), as expected |
 | `d3d11screencapturesrc` capture, d3d11 decoders, `mfh264enc` | **not verified**: need a desktop session / a GPU. `d3d11screencapturesrc`, `d3d11convert`, `mfh264enc` exist in the plugin set |
 

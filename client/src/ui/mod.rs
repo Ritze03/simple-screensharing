@@ -399,6 +399,9 @@ pub struct Shell {
     /// it is for.
     pub staged: indexmap::IndexMap<RoomHandle, StagedShare>,
     pub toasts: Vec<Toast>,
+    /// Rooms whose "Live in <room>" toast was already shown for the current
+    /// on-air spell ([`newly_on_air`]).
+    announced_live: Vec<RoomHandle>,
     /// Result of the last [`UiAction::CreateRoom`]; the create/join modal
     /// shows the minted link from here.
     pub create_result: Option<Result<JoinLink, String>>,
@@ -428,6 +431,27 @@ impl Shell {
     pub fn clear_connect_error(&mut self, key: &str) {
         self.connect_errors.retain(|(k, _)| !same_room(k, key));
     }
+}
+
+/// The window icon (the docs/ favicon rasterised once to 256 px,
+/// `assets/icon.png`). `Why:` on Windows (and X11) eframe's default "e" showed
+/// in the title bar and taskbar (user report 2026-10-15); Wayland takes the
+/// icon from `app_id` + the .desktop file instead, so this is harmless there.
+pub fn app_icon() -> Option<std::sync::Arc<egui::IconData>> {
+    // Cached: the pop-out builder asks every frame.
+    static ICON: std::sync::OnceLock<Option<std::sync::Arc<egui::IconData>>> = std::sync::OnceLock::new();
+    ICON.get_or_init(|| eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon.png")).ok().map(Into::into)).clone()
+}
+
+/// Rooms in `on_air` that were not already announced; `announced` becomes
+/// exactly `on_air` (a room that left air is announced again next time).
+/// `Why:` the "Live in <room>" toast used to fire when Go live was pressed, so
+/// a share that then failed to start (task #73: no `capssetter` in the
+/// Windows package) showed "Live in Test" above the error.
+fn newly_on_air(announced: &mut Vec<RoomHandle>, on_air: &[RoomHandle]) -> Vec<RoomHandle> {
+    let fresh = on_air.iter().copied().filter(|h| !announced.contains(h)).collect();
+    *announced = on_air.to_vec();
+    fresh
 }
 
 /// The first non-empty line of an error, at most 90 characters: what a toast
@@ -980,6 +1004,17 @@ impl App {
             self.now = ctx.input(|i| i.time);
             // One line: a toast is a single-line pill.
             self.toast(tr_with("share.error", "Share error: %{error}", &[("error", &short_error(&e))]), "error");
+        }
+        // "Live in <room>" when a destination actually goes on air, not when
+        // Go live is pressed (the share can still fail to start).
+        let on_air = {
+            let mut unused = Vec::new();
+            Cx::new(&self.state, &self.nav, &self.shell, &self.videos, &mut unused).on_air_rooms()
+        };
+        for room in newly_on_air(&mut self.shell.announced_live, &on_air) {
+            self.now = ctx.input(|i| i.time);
+            let name = self.room_name(room);
+            self.toast(tr_with("ui.toast.live_in", "Live in %{room}", &[("room", &name.to_string())]), "cast");
         }
         self.videos.sync(&self.state);
         self.poll_staged();
