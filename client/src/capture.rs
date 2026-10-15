@@ -8222,6 +8222,36 @@ pub mod branch {
             built
         }
 
+        /// Task #79: the fixed room-preview branch (`preview_sink`, one JPEG per
+        /// 30 s) must stay at ~1 fps even from a variable-rate (`framerate=0/1`)
+        /// source like the portal's, in the System domain. Measured: its
+        /// `videorate drop-only ! framerate=1/1` does cap there (the GPU twin
+        /// measures `videorate0:src` 1.0 fps at a 239 fps source in the rig), so
+        /// no `RateCap` is needed; this pins that, because the same shape
+        /// failed to cap the live-preview branch.
+        #[test]
+        fn room_preview_branch_stays_near_one_fps_on_a_variable_rate_source() {
+            gst::init().unwrap();
+            let built = super::super::build_pipeline(
+                "videotestsrc is-live=true pattern=smpte \
+                 ! video/x-raw,width=640,height=360,framerate=240/1 \
+                 ! capssetter caps=video/x-raw,framerate=0/1",
+            )
+            .unwrap();
+            let frames = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let counter = frames.clone();
+            built.preview_sink.static_pad("sink").unwrap().add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                gst::PadProbeReturn::Ok
+            });
+            built.pipeline.set_state(gst::State::Playing).unwrap();
+            assert!(wait_until_playing(&built.pipeline, Duration::from_secs(30)), "pipeline never reached PLAYING");
+            std::thread::sleep(Duration::from_secs(4));
+            let n = frames.load(std::sync::atomic::Ordering::Relaxed);
+            built.pipeline.set_state(gst::State::Null).unwrap();
+            assert!((1..=8).contains(&n), "a 1 fps room-preview branch on a 240 fps source passed {n} buffers in ~4 s");
+        }
+
         /// Task #78: the live preview branch is silent while its valve is closed,
         /// delivers scaled RGBA at <= 30 fps when opened, and is silent again
         /// (frame counter frozen) once closed.

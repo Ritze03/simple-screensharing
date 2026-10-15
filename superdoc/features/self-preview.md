@@ -15,7 +15,7 @@
   `CaptureHandle::set_live_preview(bool)`, `live_preview_frame()` (newest RGBA frame, never blocks),
   `live_preview_frames()` (buffers that reached the sink, for verification). UI: `ui/mod.rs`
   `App::poll_live_previews` + `Shell::live_previews`, own tile `ui/room.rs` `my_card`.
-- **Branch:** `tee ! valve(drop, forward-sticky-events) ! queue(leaky, 1) ! videorate(drop-only, 30 fps)
+- **Branch:** `tee ! valve(drop, forward-sticky-events) + RateCap probe (30 fps) ! queue(leaky, 1)
   ! vapostproc | videoscale ! videoconvert ! capsfilter(RGBA, fitted size, 30/1) ! appsink`. Size: the source
   fitted into 640x360, aspect kept, never upscaled, even sides (`fit_live_size`), written into the capsfilter
   when the branch opens. The branch is the same in both [`CaptureDomain`]s except for the scaler: in the GPU
@@ -44,7 +44,7 @@
   (`paint_cover`), a `PREVIEW` chip in the top-right corner and the usual `LIVE`/`STARTING` chip left.
   Audio-only shares have no video handle and no preview.
 - **Not the room-preview thumbnails:** those are the ~30 s JPEGs other members see (`preview.rs`); a
-  separate fixed 1 fps branch feeds them and is unchanged.
+  separate fixed 1 fps branch feeds them and is unchanged (verified at 1.0 fps behind its `videorate` while the source ran 239 fps, #79: `stream-control.md`).
 
 Measured numbers (headless rig, H.265 240 fps): `superdoc/features/stream-control.md`
 "Own-tile live preview".
