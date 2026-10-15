@@ -1,4 +1,8 @@
-# Linux AppImage
+# Linux packaging: AppImage and Flatpak
+
+The AppImage is described first; the Flatpak is the last section (`## Flatpak`).
+
+## Linux AppImage
 
 `./build-appimage.sh` (repo root) builds `dist/simple-screensharing-client-x86_64.AppImage`
 (about 23 MB): the egui client plus its own GStreamer. It also tars the relay
@@ -107,3 +111,77 @@ Debian copyright files of the bundled libraries into `usr/share/doc/` inside the
 - The decoder in use is shown in a tile's tooltip (`vah265dec` = hardware, `avdec_h265` =
   software).
 - To exercise the software path on a machine with a GPU: `LIBVA_DRIVER_NAME=bogus`.
+
+## Flatpak
+
+Added 2026-10-15 (user request: "Also add a flatpak release"), next to the AppImage, not instead of it.
+
+```bash
+./build-flatpak.sh                                        # -> dist/simple-screensharing-client.flatpak
+flatpak install --user ./dist/simple-screensharing-client.flatpak
+flatpak run io.github.ritze03.SimpleScreensharing
+```
+
+Client only (the relay has no sandbox story to tell: it is a server binary, the AppImage build
+already tars it). Build dir, flatpak-builder state and the OSTree repo live under
+`target/flatpak-{build,state,repo}` (on disk); `dist/` is gitignored.
+
+| File (`client/packaging/flatpak/`) | Role |
+| --- | --- |
+| `io.github.ritze03.SimpleScreensharing.yml` | the manifest: Freedesktop 25.08 runtime + SDK + `rust-stable` extension, one `simple` module that runs `cargo build --release --locked -p simple-screensharing-client` |
+| `...desktop`, `...metainfo.xml`, `...svg` | desktop entry, AppStream metadata, the brand icon (copy of `docs/assets/icon.svg`); all named after the app id as Flatpak requires |
+
+**Build prerequisites** (no root): `flatpak install --user flathub org.flatpak.Builder
+org.freedesktop.Sdk.Extension.rust-stable//25.08` plus the `org.freedesktop.Platform` and `Sdk`
+`//25.08` runtimes. `build-flatpak.sh` uses a host `flatpak-builder` if there is one, else
+`flatpak run org.flatpak.Builder`.
+
+**Decision: app id `io.github.ritze03.SimpleScreensharing`** (matches the GitHub Pages domain
+ritze03.github.io, which is what Flathub would verify later). The binary's Wayland app_id
+/ X11 class is `simple-screensharing` (the AppImage's `StartupWMClass`); inside the sandbox
+`main.rs` `app_id()` switches it to `$FLATPAK_ID`, so a shell can match the window to the
+installed desktop file. Outside Flatpak nothing changes.
+
+**Decision: GStreamer comes from the runtime, not a bundle.** The Freedesktop runtime ships
+GStreamer 1.26 with `pipewiresrc`, the `va` plugin, `pulsesink`, libav and opus; the only
+non-runtime piece is `x264enc` (the software H.264 encode fallback, GPL), which lives in the
+`org.freedesktop.Platform.codecs-extra` extension that Flathub installs with the runtime
+(`autodelete`: it is pulled in when the runtime is). Without that extension the client still
+has hardware encode (`vah264enc`, `vah265enc`, `vaav1enc`) but loses the x264 software encoder.
+Every element the AppImage's `gst-elements.txt` lists, plus the VA ones, resolves inside the
+sandbox (checked with `gst-inspect-1.0` under `--device=dri`). *Why not bundle like the AppImage:*
+the AppImage must carry GStreamer because distros split the plugins differently; the Flatpak
+runtime is one fixed set for every distro, which is the point of the format.
+
+**Permissions** (`finish-args`): `--share=network` (relay), `--socket=wayland`,
+`--socket=fallback-x11`, `--share=ipc`, `--device=dri` (Vulkan for wgpu, VA-API for the hardware
+codecs), `--socket=pulseaudio` (playback through `pulsesink`), and
+`--filesystem=xdg-run/pipewire-0` (per-app audio sharing spawns the runtime's `pw-dump`,
+`pw-link`, `pw-loopback`, `client/src/audio.rs`; all three exist in the runtime, but audio
+sharing is NOT tested in the Flatpak: no audio tests, see `testing-and-verification.md`).
+Screen capture needs no permission: it goes through the xdg-desktop-portal ScreenCast API.
+No `--filesystem=home`. Config and data land in `~/.var/app/io.github.ritze03.SimpleScreensharing/`
+(`config/simple-screensharing/` is the `$XDG_CONFIG_HOME` the app already uses), so a
+Flatpak install starts with its own empty room list, separate from an AppImage's.
+
+**Decision: network at build time.** The module builds with `--share=network` so cargo fetches
+the crates; fine for a local bundle, forbidden on Flathub. Upgrade path (a `ponytail:` note in
+the manifest): generate `cargo-sources.json` with `flatpak-cargo-generator.py Cargo.lock`, list
+it under `sources:` and build `--offline`. The metainfo has `LicenseRef-proprietary` because the
+repo has no LICENSE file yet, and no screenshots; both are needed before a Flathub submission.
+
+**Verified 2026-10-15** (headless rig, `client/scripts/hs-rig.sh`): the bundle (6.6 MB) installed
+`--user`, then the rig's two native clients were replaced by Flatpak instances: the window opens
+(wgpu/Vulkan works under `--device=dri`; its app_id is the Flatpak id), auto-connects to the
+rig's relay room, a share goes live through the rig's xdg-desktop-portal ScreenCast
+(`capture started in the Gpu domain`, VA hardware encode, H.265 @ 240 fps requested), and a
+second Flatpak instance watched it: "Decoded 236 fps / shown 235, H.265 via vah265dec, 0
+dropped" (a native viewer got 204 fps on the same share while the machine was also compiling).
+Audio sharing, the software encoder (`x264enc` from codecs-extra) and a non-sway compositor are
+untested.
+
+Testing notes: flatpak ignores `--env=XDG_CONFIG_HOME=...` (the sandbox always sets
+`XDG_CONFIG_HOME`/`XDG_DATA_HOME` to `~/.var/app/<id>/`), so a scratch config is redirected with
+`--env=SSS_CONFIG_HOME=<dir>` (`rooms.rs` `config_base_dir`) plus `--filesystem=<dir>`. The sandbox
+`/tmp` is private. `flatpak run` must only ever be given the rig's environment
+(`hs-rig.sh run -- ...`): without it the app would open on the real desktop.

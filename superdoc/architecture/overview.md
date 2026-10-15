@@ -56,12 +56,14 @@ The Electron shell, the HTML frontend and the Tauri sidecar (`client/src-tauri`)
   per watched stream (`decode/video.rs`).
 - **Browser client** (`docs/`): the same protocol in JS, no build step; see `features/website.md`.
 
-## Packaging (Linux AppImage)
+## Packaging (Linux AppImage, Flatpak)
 
 `./build-appimage.sh` at the repo root builds the client AppImage (and a relay tarball) inside
 a Debian 13 container into `dist/`; it bundles GStreamer 1.26 and takes Mesa/libva/PipeWire/the
 portal from the host. Files, supported hosts and the *why* (distros split GStreamer plugins
-differently, so the client carries its own): `client/packaging/README.md`. Windows (MSVC build, `client/packaging/windows/package.ps1` -> self-contained folder/zip):
+differently, so the client carries its own): `client/packaging/README.md`. `./build-flatpak.sh`
+builds the client as a Flatpak bundle (`dist/simple-screensharing-client.flatpak`, runtime GStreamer,
+manifest in `client/packaging/flatpak/`, section "Flatpak" of the same README). Windows (MSVC build, `client/packaging/windows/package.ps1` -> self-contained folder/zip):
 `superdoc/features/windows.md`.
 
 ## Data flow
@@ -512,7 +514,7 @@ frontend and is kept as history.
   suspended room that retries and restores its watches and shares (`session.rs`).
 - Relay admin TUI (ratatui), WebTransport for browsers, rotating self-signed cert.
 - **Browser client** (`docs/`, `features/website.md`).
-- **Linux AppImage** (`client/packaging/README.md`).
+- **Linux AppImage** and **Flatpak** (`client/packaging/README.md`).
 
 **Still pending:**
 
@@ -549,6 +551,6 @@ frontend and is kept as history.
 - Video delivery to the screen — native decode, the wgpu renderer, how encoder-tuning changes interact with an in-flight watch → `superdoc/features/video-pipeline.md`
 - The per-stream pop-out window (F11 fullscreen, multi-window) → `superdoc/features/viewer-window.md`, `client/src/ui/popout.rs`
 - The process model (one native client process, relay threads) → "Process model" above; the removed Electron + sidecar split → "History" above
-- Linux AppImage packaging (container build, bundled GStreamer, supported hosts) → `client/packaging/README.md`; Windows (MSVC build, `package.ps1`, verified headless; GUI/capture unverified) → `superdoc/features/windows.md`
+- Linux AppImage / Flatpak packaging (container build, bundled GStreamer, supported hosts) → `client/packaging/README.md`; Windows (MSVC build, `package.ps1`, verified headless; GUI/capture unverified) → `superdoc/features/windows.md`
 - The browser client (core, UI, dev harness) → `superdoc/features/website.md`, `docs/js/core/README.md`, `docs/js/ui/README.md`, `docs/dev/README.md`
 - Scripted real-app test helpers and how to launch the client safely → `client/scripts/README.md`, `client/.claude/skills/run/SKILL.md`, `superdoc/claude-instructions/testing-and-verification.md`
