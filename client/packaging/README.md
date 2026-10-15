@@ -22,7 +22,8 @@ with a source-built FFmpeg, crates, release compile), later ones ~2.
 
 | File | Role |
 | --- | --- |
-| `Dockerfile` | builder image: Debian 13, GStreamer 1.26 dev + plugins, pinned Rust, a minimal FFmpeg + gst-libav built from source, pinned linuxdeploy / appimagetool / type2 runtime |
+| `Dockerfile` | builder image: Debian 13, GStreamer 1.26 dev + plugins, pinned Rust, a minimal FFmpeg + gst-libav built from source, a patched `gst-plugin-pipewire` built from Debian's PipeWire source, pinned linuxdeploy / appimagetool / type2 runtime |
+| `patches/pipewire-gst-keep-possible-caps.patch` | the one fix applied to PipeWire 1.4.2's `pipewiresrc` (see "Decision: the bundled `pipewiresrc` is a patched build") |
 | `build-in-container.sh` | runs inside the image: `cargo build --release`, assemble the AppDir, linuxdeploy, self-checks, appimagetool |
 | `AppRun` | launcher inside the AppImage: points GStreamer at the bundled plugins, warns about missing/too-old host pieces, execs the client |
 | `gst-plugins.txt` | the curated list of bundled GStreamer plugins |
@@ -67,6 +68,85 @@ with); `AppRun` ranks the native `pipewiresink` just below it as a fallback for 
 host without a pulse server. Upstream `pipewiresink` has rank NONE, so without that
 `autoaudiosink` finds no usable sink.
 
+## Decision: the bundled `pipewiresrc` is a patched build (2026-10-15, #76)
+
+**Symptom (user, Hyprland 0.56 + xdg-desktop-portal-hyprland 1.4.1, PipeWire 1.6.9):** every
+share from the AppImage ended with the toast `Share error: failed to bring up the encode
+branch for stream 0: software fallback encode branch produced no IDR either`, and the
+terminal said `capture pipeline error from .../GstPipeWireSrc:pipewiresrcN: stream error:
+unhandled format (../src/gst/gstpipewiresrc.c(748): on_state_changed ())`. The same share
+from the source build (host GStreamer 1.28, host `gst-plugin-pipewire` 1.6.9) ran at 120+ fps.
+
+**Root cause (reproduced, not inferred):** Debian 13's `pipewiresrc` (PipeWire 1.4.2) clears
+`pwsrc->possible_caps` (what the pipeline downstream accepts) right after the *first*
+format negotiation (`gst_pipewire_src_negotiate`). `handle_format_change` needs it to turn
+a format into caps; a second `SPA_PARAM_Format` finds it NULL, leaves `pwsrc->caps` NULL
+and calls `pw_stream_set_error(-EINVAL, "unhandled format")`. A second format change
+happens with every producer that picks the DMA-BUF modifier itself: it offers a modifier
+list marked `DONT_FIXATE`, the consumer's list overlaps in two or more modifiers,
+libpipewire hands the unfixed format to the producer, the producer fixates one (xdph:
+`gbm_bo_create_with_modifiers2`) and PipeWire then delivers the fixed format as a second
+`param_changed`. `xdg-desktop-portal-wlr` never hit it (its offer reduces to one modifier,
+no handshake): the rig's sway share worked with the old AppImage. PipeWire 1.6 keeps
+`possible_caps` for the stream's life (`gst_caps_replace`, cleared in `stop()`), which is
+why the host plugin works.
+
+Evidence: `client/scripts/xdph-emu.c` (a small C producer copying xdph 1.4.1's
+`build_format`/`fixate_format` verbatim, run inside the headless rig, consumed by
+`gst-launch-1.0 pipewiresrc ! ...`; the AppImage's GStreamer was exercised by running the
+builder image's `gst-launch-1.0` with `LD_LIBRARY_PATH` and `GST_PLUGIN_SYSTEM_PATH_1_0`
+pointing into the extracted AppImage): the AppImage's GStreamer 1.26.2 + plugin
+1.4.2 against the rig's PipeWire 1.6.9 daemon fails with exactly
+`gstpipewiresrc.c:748:on_state_changed ... stream error: unhandled format` once the
+producer's modifier list has two entries in common with the consumer; the host's 1.6.9
+plugin and the patched 1.4.2 plugin both go to `streaming`. It is a race (does the second
+`param_changed` land before `negotiate` returns?): the emulator fixates instantly and the
+old plugin failed 7 of 10 runs, the rebuilt AppImage 0 of 10 (xdph needs a `gbm` allocation
+before it answers, hence the user's failures every time). With a single common modifier, or
+an 8-bit/10-bit SHM-only offer, there is no handshake and the old plugin works too.
+A 10-bit-only offer (the user's Hyprland has `bitdepth = 10`) fails in *every* plugin version
+with `no more input formats`: `gstpipewireformat.c` has no mapping for the `xRGB_210LE`
+family; it works for the user because xdph also offers an 8-bit format.
+
+**Verified 2026-10-15 (headless rig, stock xdpw):** the rebuilt AppImage as the sharer
+(extracted, `AppRun`), second client (source build) as viewer: capture in the Gpu domain,
+H.265 240 fps requested, viewer tooltip "Decoded 235 fps / shown 234 fps, H.265 via
+vah265dec, 0 dropped". The rig cannot run xdph itself (Hyprland-only protocols), so the
+Hyprland negotiation is covered by the emulator above, not by a real xdph.
+
+**Fix: bundle a `libgstpipewire` built from Debian's own PipeWire 1.4.2 source plus a
+6-line patch** (`patches/pipewire-gst-keep-possible-caps.patch`, the 1.6 behaviour). The
+Dockerfile builds only that plugin (`ninja src/gst/libgstpipewire.so`) into
+`/opt/pipewire-gst`; `build-in-container.sh` prefers it over the distro plugin and fails the
+build if the bundled file is not that one. Runtime linking is unchanged: the plugin still
+links the **host** `libpipewire-0.3.so.0` (built against the same 1.4.2 headers, same
+symbol floor as before).
+
+`Why not the alternatives:`
+
+- *Use the host's plugin.* A host `libgstpipewire.so` is built against the host's GStreamer
+  core (1.24 to 1.28 across distros), the process runs the bundled 1.26 one; GStreamer
+  refuses or crashes on that mix (see above), and its path differs per distro. Taking
+  `libpipewire` from the host is safe because the PipeWire client library is
+  ABI-stable towards the daemon; a GStreamer plugin is not stable towards a foreign core.
+- *Bundle libpipewire too.* Tried before (see the host table): per-app audio list came back
+  empty against a newer daemon.
+- *Constrain the caps the client offers* (so exactly one modifier is common). The common
+  set depends on the GPU, driver and compositor; the client cannot know it. Dropping
+  DMA-BUF entirely would cost the 240 fps GPU path (SHM readback halves the portal's rate).
+- *Catch the error and retry.* Deterministic: the retry negotiates the same way and fails
+  the same way.
+- *A newer PipeWire source (1.6.x).* More build dependencies and a risk that the plugin
+  needs libpipewire symbols newer than the 1.4 floor; the 6-line backport keeps the plugin
+  identical to what Debian ships otherwise. Drop the patch when the builder image moves to
+  a base with PipeWire >= 1.6 (check `gst_caps_replace (&pwsrc->possible_caps` in
+  `gstpipewiresrc.c` of that release).
+
+The client side of the same report: a capture source that errors during branch bring-up now
+leads the share error (`screen capture failed: pipewiresrcN: stream error: unhandled
+format`) instead of being blamed on the encoder; see `superdoc/features/stream-control.md`
+"Capture source errors lead the share error".
+
 ## Decision: build in a Debian 13 container, supported hosts
 
 An AppImage with bundled glib / GStreamer needs a host glibc at least as new as the one it
@@ -106,6 +186,10 @@ Debian copyright files of the bundled libraries into `usr/share/doc/` inside the
 ## Debugging a user's report
 
 - `SSS_NO_HOST_CHECK=1` silences the startup warnings.
+- `stream error: unhandled format` from `pipewiresrc` in the log: the unpatched plugin
+  (see "Decision: the bundled `pipewiresrc` is a patched build"); a current AppImage should
+  never print it. Other portal-side failures: `GST_DEBUG=pipewiresrc:6` shows the formats
+  the portal offers (`peer caps`) against what the pipeline accepts (`possible caps`).
 - `GST_DEBUG=2 ./...AppImage` shows plugin load failures. `--appimage-extract` unpacks it,
   `--appimage-extract-and-run` runs it without FUSE.
 - The decoder in use is shown in a tile's tooltip (`vah265dec` = hardware, `avdec_h265` =

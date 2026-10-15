@@ -501,6 +501,39 @@ restarted on resume-from-pause and after a swap so those gaps don't count.
 
 ---
 
+## Capture source errors lead the share error (2026-10-15, #76)
+
+**Symptom (user, AppImage on Hyprland):** `Share error: failed to bring up the encode branch
+for stream 0: software fallback encode branch produced no IDR either`, while the terminal
+had the real cause: `capture pipeline error from .../GstPipeWireSrc:pipewiresrcN: stream
+error: unhandled format`. The root cause of *that* error is packaging, see
+`client/packaging/README.md` "the bundled `pipewiresrc` is a patched build".
+
+**Why the message was wrong:** a source that dies right after its first frame(s) leaves the
+encode branch without input, and `branch::add_branch_live_waiting` can only observe "no IDR
+within 5 s" (twice: hardware, then the software retry). The capture pipeline's bus error was
+consumed by `capture_loop` and only logged, so the user-facing error blamed the encoder.
+
+**Fix (smallest one):** `capture_loop` now also records the *first* bus error in the
+capture's `CaptureErrors` (`CaptureHandle::capture_errors`, shared with the loop through an
+`Arc<Mutex<Option<String>>>`; later errors are consequences, so they are dropped).
+`spawn_destination` passes a failed bring-up through `blame_the_source`: with a recorded
+error the result reads `screen capture failed: pipewiresrc17: stream error: unhandled
+format: failed to bring up the encode branch for stream 0: software fallback encode branch
+produced no IDR either: encode branch produced no IDR within 5s` (the encoder's own chain
+stays at the end for diagnosis); without one it is unchanged. Covered by
+`capture::tests::a_source_error_on_the_bus_is_blamed_when_the_branch_fails`.
+
+`Why post-hoc and not cancel the wait on a source error:` `add_branch_live_waiting` may be
+mid-way through building a branch; dropping its future there could leave an orphan branch
+on the tee (its failure arms do the cleanup explicitly). The 5 s IDR deadline bounds the
+delay.
+
+**Known gap:** a source that errors *before its very first frame* never reaches the IDR
+stage: `wait_for_source_frame(Indefinite)` keeps waiting (the destination stays `Starting`)
+and the recorded error is not surfaced until something fails. A source that dies that early
+is normally caught by `start_pipeline_bounded` (its bus poll), so it has not been seen.
+
 ## Resuming a paused destination
 
 A destination with zero subscribers pauses its own encoder by closing that branch's

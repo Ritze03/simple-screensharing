@@ -24,7 +24,7 @@ level                # level (capture level meter)
 jpeg                 # jpegdec
 videoparsersbad      # h264parse, h265parse, av1parse
 typefindfunctions    # caps detection for the parsers
-pipewire             # pipewiresrc, pipewiresink (links the HOST libpipewire)
+pipewire             # pipewiresrc, pipewiresink (links the HOST libpipewire; the PATCHED build from /opt/pipewire-gst, see Dockerfile)
 autodetect           # autoaudiosink (watch-side audio playback)
 pulseaudio           # pulsesink, what autoaudiosink picks (via pipewire-pulse on PipeWire hosts); bundled libpulse
 va                   # vah264/vah265/vaav1 enc+dec, vapostproc (links the HOST libva)

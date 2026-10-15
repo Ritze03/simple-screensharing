@@ -91,3 +91,38 @@ RUN set -e; mkdir -p /opt/tools && cd /opt/tools \
     && ln -s /opt/tools/linuxdeploy/AppRun /usr/local/bin/linuxdeploy \
     && ln -s /opt/tools/appimagetool/AppRun /usr/local/bin/appimagetool \
     && chmod -R a+rX /opt/tools
+
+# gst-plugin-pipewire (pipewiresrc/pipewiresink) rebuilt from Debian's PipeWire 1.4.2 source with
+# one fix (patches/pipewire-gst-keep-possible-caps.patch), instead of using gstreamer1.0-pipewire.
+# Why: 1.4.2's pipewiresrc forgets the caps downstream accepts after the first format negotiation,
+# so a SECOND format change (every producer that fixates a DMA-BUF modifier itself, e.g.
+# xdg-desktop-portal-hyprland, does that) ends the stream with "stream error: unhandled format":
+# no screen sharing at all on Hyprland. PipeWire 1.6 has the fix; Debian 13 does not. Only the
+# plugin is built (its libpipewire stays the HOST's at runtime, see README.md); the RUNPATH into
+# the build tree is removed so the loader uses the normal search path. Appended last so the
+# Rust/tool layers above stay cached. /opt/pipewire-gst wins over the distro plugin in
+# build-in-container.sh.
+COPY patches/pipewire-gst-keep-possible-caps.patch /tmp/pipewire-gst.patch
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libdrm-dev libdbus-1-dev libudev-dev \
+    && mkdir /tmp/pw-src && cd /tmp/pw-src \
+    && apt-get source --download-only pipewire \
+    && dpkg-source -x --skip-patches pipewire_*.dsc pw \
+    && cd pw \
+    && patch -p1 < /tmp/pipewire-gst.patch \
+    && meson setup build --buildtype=release \
+        -Dgstreamer=enabled -Dgstreamer-device-provider=disabled \
+        -Dtests=disabled -Dexamples=disabled -Ddocs=disabled -Dman=disabled \
+        -Dpipewire-alsa=disabled -Dpipewire-jack=disabled -Dpipewire-v4l2=disabled -Djack=disabled -Dalsa=disabled \
+        -Dbluez5=disabled -Dv4l2=disabled -Dlibcamera=disabled -Dvulkan=disabled -Dlibusb=disabled \
+        '-Dsession-managers=[]' -Dsystemd=disabled -Dlogind=disabled -Dselinux=disabled \
+        -Dx11=disabled -Dx11-xfixes=disabled -Dlibcanberra=disabled -Dsdl2=disabled -Dsndfile=disabled -Davahi=disabled \
+        -Decho-cancel-webrtc=disabled -Dlibffado=disabled -Dflatpak=disabled -Dgsettings=disabled -Dreadline=disabled \
+        -Dlv2=disabled -Dpw-cat=disabled -Dpw-cat-ffmpeg=disabled -Dffmpeg=disabled -Dbluez5-codec-aac=disabled \
+        -Dsnap=disabled -Dcompress-offload=disabled -Dlibmysofa=disabled -Droc=disabled -Dopus=disabled -Dlibpulse=disabled \
+    && ninja -C build src/gst/libgstpipewire.so \
+    && mkdir -p /opt/pipewire-gst/lib/gstreamer-1.0 \
+    && install -m755 build/src/gst/libgstpipewire.so /opt/pipewire-gst/lib/gstreamer-1.0/ \
+    && patchelf --remove-rpath /opt/pipewire-gst/lib/gstreamer-1.0/libgstpipewire.so \
+    && cd / && rm -rf /tmp/pw-src /tmp/pipewire-gst.patch /var/lib/apt/lists/* \
+    && ls -la /opt/pipewire-gst/lib/gstreamer-1.0/

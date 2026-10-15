@@ -2173,6 +2173,9 @@ pub struct CaptureHandle {
     /// Bus watcher (see [`capture_loop`]). Per capture, not per
     /// destination: the bus is not destination-scoped.
     capture_task: tokio::task::JoinHandle<()>,
+    /// The first error the capture pipeline's bus reported (written by
+    /// [`capture_loop`]); see [`CaptureErrors`].
+    capture_errors: CaptureErrors,
     // `Option` (rather than a bare `PreviewHandle`) solely so `stop` can
     // `.take()` it out of `&mut self` to call `PreviewHandle::stop(self)`,
     // which consumes by value — required now that `CaptureHandle: Drop`
@@ -2423,7 +2426,7 @@ async fn start_sharing_with_source(
     // of the process's life**, with no affordance to stop it: the user's
     // screen went on being captured after they were told the share had
     // failed.
-    let started = spawn_destination(&handle.pipeline, &handle.tee, client, stream_id, key, params).await;
+    let started = spawn_destination(&handle.pipeline, &handle.tee, &handle.capture_errors, client, stream_id, key, params).await;
     match started {
         Ok(destination) => {
             handle.ensure_preview_task(client, stream_id);
@@ -2513,7 +2516,8 @@ async fn start_capture_with_source(framerate: u32, capture_source: CaptureSource
         Some(bus) => bus,
         None => return Err(abandon_capture(pipeline, capture_source, anyhow!("pipeline has no bus")).await),
     };
-    let capture_task = tokio::spawn(capture_loop(bus.stream()));
+    let capture_errors = CaptureErrors::default();
+    let capture_task = tokio::spawn(capture_loop(bus.stream(), capture_errors.clone()));
 
     Ok(CaptureHandle {
         frame_seen,
@@ -2521,6 +2525,7 @@ async fn start_capture_with_source(framerate: u32, capture_source: CaptureSource
         tee,
         capture_source,
         capture_task,
+        capture_errors,
         preview_handle: None,
         preview_client: None,
         preview_sink: Some(preview_sink),
@@ -2576,6 +2581,7 @@ async fn abandon_capture(pipeline: gst::Pipeline, capture_source: CaptureSource,
 async fn spawn_destination(
     pipeline: &gst::Pipeline,
     tee: &gst::Element,
+    capture_errors: &CaptureErrors,
     client: &ScreenshareClient,
     stream_id: u8,
     key: DestKey,
@@ -2602,7 +2608,7 @@ async fn spawn_destination(
             branch::SourceWait::Indefinite,
         )
         .await
-            .with_context(|| format!("failed to bring up the encode branch for stream {stream_id}"))?;
+        .map_err(|e| blame_the_source(e.context(format!("failed to bring up the encode branch for stream {stream_id}")), capture_errors))?;
 
     // Feed the branch's proving IDR through the normal accounting so it is
     // cached for the stall protocol and drives `Starting` → `Live` exactly
@@ -2883,8 +2889,9 @@ impl CaptureHandle {
         let tee = self.tee.clone();
         let client = client.clone();
         let params = destination::clamp_to_source(params, self.source_caps());
+        let capture_errors = self.capture_errors.clone();
         tokio::spawn(async move {
-            let result = spawn_destination(&pipeline, &tee, &client, stream_id, key, params)
+            let result = spawn_destination(&pipeline, &tee, &capture_errors, &client, stream_id, key, params)
                 .await
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
@@ -3291,18 +3298,52 @@ enum DestCmd {
     Stop { reply: tokio::sync::oneshot::Sender<Result<(), String>> },
 }
 
+/// The first error a capture pipeline's bus reported, kept so a destination
+/// that fails to come up afterwards can say *why* ([`blame_the_source`]).
+///
+/// `Why (task #76):` a source that dies right after its first frames (measured:
+/// the bundled `pipewiresrc` 1.4.2 against `xdg-desktop-portal-hyprland` ends
+/// with `stream error: unhandled format` after the first buffer) leaves the
+/// encode branch with no input. The only symptom `add_branch_live_waiting`
+/// can see is "produced no IDR", i.e. it blames the encoder, and the real
+/// reason went to the log alone. [`capture_loop`] is the one consumer of the
+/// bus, so it records the error here and the destination reads it back.
+#[derive(Clone, Default)]
+struct CaptureErrors(Arc<Mutex<Option<String>>>);
+
+impl CaptureErrors {
+    /// Keeps the first error only: later ones are usually its consequences.
+    fn record(&self, text: String) {
+        self.0.lock().unwrap().get_or_insert(text);
+    }
+
+    fn first(&self) -> Option<String> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// `error` (a destination that failed to come up), led by the capture
+/// pipeline's own recorded error when it has one: the source failing is the
+/// cause, whatever the encoder then reported about starving.
+fn blame_the_source(error: anyhow::Error, errors: &CaptureErrors) -> anyhow::Error {
+    match errors.first() {
+        Some(source) => error.context(format!("screen capture failed: {source}")),
+        None => error,
+    }
+}
+
 /// Per-**capture** background loop: watches the pipeline bus for error/EOS.
 ///
 /// Deliberately holds nothing destination-scoped: with fan-out there are N
 /// destinations per capture but still exactly one bus, so this loop exists
 /// once per capture and every send/encode concern lives in
 /// [`destination_pump`] instead.
-async fn capture_loop(mut bus_stream: gst::bus::BusStream) {
+async fn capture_loop(mut bus_stream: gst::bus::BusStream, errors: CaptureErrors) {
     let mut bus_done = false;
 
     while !bus_done {
         match bus_stream.next().await {
-            Some(msg) => handle_bus_message(&msg, &mut bus_done),
+            Some(msg) => handle_bus_message(&msg, &mut bus_done, &errors),
             None => bus_done = true,
         }
     }
@@ -3562,7 +3603,7 @@ async fn destination_pump(
     }
 }
 
-fn handle_bus_message(msg: &gst::Message, bus_done: &mut bool) {
+fn handle_bus_message(msg: &gst::Message, bus_done: &mut bool, errors: &CaptureErrors) {
     match msg.view() {
         gst::MessageView::Error(err) => {
             tracing::error!(
@@ -3571,6 +3612,11 @@ fn handle_bus_message(msg: &gst::Message, bus_done: &mut bool) {
                 err.error(),
                 err.debug().unwrap_or_default(),
             );
+            errors.record(format!(
+                "{}: {}",
+                msg.src().map(|s| s.name().to_string()).unwrap_or_else(|| "unknown".into()),
+                err.error()
+            ));
             *bus_done = true;
         }
         gst::MessageView::Eos(_) => {
@@ -8259,6 +8305,42 @@ mod tests {
         let other = start_failure("failed to start".to_string(), Some("vapostproc0: not-negotiated".to_string()));
         assert!(!start_is_hopeless(&other), "{other:#}");
         assert!(!start_is_hopeless(&start_failure("failed to start".to_string(), None)));
+    }
+
+    /// Task #76: an error the capture pipeline's bus reported is recorded by
+    /// [`capture_loop`] and leads the message of a destination that then fails
+    /// to come up ("produced no IDR") instead of being blamed on the encoder.
+    #[tokio::test]
+    async fn a_source_error_on_the_bus_is_blamed_when_the_branch_fails() {
+        if gst::init().is_err() {
+            eprintln!("skipping: gstreamer not available in this environment");
+            return;
+        }
+        let pipeline = gst::Pipeline::new();
+        let errors = CaptureErrors::default();
+        let task = tokio::spawn(capture_loop(pipeline.bus().unwrap().stream(), errors.clone()));
+        let encoder_symptom = || anyhow!("encode branch produced no IDR within 5s").context("software fallback encode branch produced no IDR either");
+
+        // Nothing recorded: the error is returned untouched.
+        let plain = blame_the_source(encoder_symptom(), &errors);
+        assert!(format!("{plain:#}").starts_with("software fallback"), "{plain:#}");
+
+        // What pipewiresrc 1.4.2 reports against xdg-desktop-portal-hyprland.
+        let source = gst::ElementFactory::make("identity").name("pipewiresrc17").build().unwrap();
+        pipeline.add(&source).unwrap();
+        let _ = pipeline.post_message(
+            gst::message::Error::builder(gst::StreamError::Failed, "stream error: unhandled format").src(&source).build(),
+        );
+        // The bus ends the loop on its first error, so waiting for the task is the sync point.
+        tokio::time::timeout(Duration::from_secs(5), task).await.expect("capture_loop ends on a bus error").unwrap();
+
+        let blamed = blame_the_source(encoder_symptom(), &errors);
+        let text = format!("{blamed:#}");
+        assert!(text.starts_with("screen capture failed: pipewiresrc17: stream error: unhandled format"), "{text}");
+        assert!(text.contains("produced no IDR"), "the encoder's own message stays in the chain: {text}");
+        // Only the first error is kept: later ones are consequences of it.
+        errors.record("second".to_string());
+        assert_eq!(errors.first().as_deref(), Some("pipewiresrc17: stream error: unhandled format"));
     }
 
     /// Task #59: a start that errors on the bus ends promptly with that error

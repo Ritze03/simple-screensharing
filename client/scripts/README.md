@@ -64,6 +64,7 @@ tile x) are constants at the top of `hs-drive.sh`, measured on the 1920x1080 ful
 | `hs-scenario.sh` | one measured share (screenshots + per-stage rates) |
 | `hs-probe.sh` | `portal-probe.py` against the rig's portal (no picker) |
 | `hs-vptr.c`, `hs-vptr-protocol.xml` | the virtual-pointer keepalive (protocol XML from wlroots, MIT) |
+| `xdph-emu.c` | a PipeWire producer that offers formats exactly like xdg-desktop-portal-hyprland 1.4.1 (DMA-BUF modifier list with `DONT_FIXATE` + fixation handshake); the rig's sway/xdpw cannot show xdph-only negotiation bugs (task #76, `packaging/README.md`). Build and usage in its header; rig only |
 
 ## Shared helpers (work in both worlds)
 
