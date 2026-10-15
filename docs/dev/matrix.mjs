@@ -45,10 +45,10 @@ export async function runPair({ relay, hash, codec, fps, size, bitrate, duration
       nativeProc.stdout.on("data", (d) => (nativeOut += d));
       nativeProc.stderr.on("data", (d) => process.env.VERBOSE && process.stderr.write(`[native] ${d}`));
     } else {
-      procs.push(launchChromium(url(0, "view", "viewer"), { flags }));
+      procs.push(launchChromium(url(0, "view", "viewer"), { flags, browser: process.env.VIEWER_BROWSER }));
     }
     await new Promise((r) => setTimeout(r, 800));
-    procs.push(launchChromium(url(1, "share", "sharer"), { flags }));
+    procs.push(launchChromium(url(1, "share", "sharer"), { flags, browser: "chromium" })); // a Firefox sharer is impossible (no MediaStreamTrackProcessor)
     const sharerIdx = nativeViewer ? 0 : 1;
     await new Promise((ok, fail) => {
       const t = setTimeout(() => fail(new Error(`timeout; have results for [${[...results.keys()]}]`)), timeout);

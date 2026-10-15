@@ -129,8 +129,18 @@ picks the first unwatched match); a renamed member or a changed label is a diffe
 The core hands you decoded `VideoFrame`s; two ways to consume them:
 
 * `watch(key, { canvas })` / `handle.attachToCanvas(canvas)`: a `CanvasRenderer` draws **the newest decoded frame once per
-  `requestAnimationFrame`** (`drawImage`, `alpha:false`, `desynchronized:true`) and closes every frame it supersedes, so a
-  240 fps stream on a 60 Hz screen costs 60 draws, and on a 280 Hz screen every frame is shown. Decoding is never tied to the display.
+  `requestAnimationFrame`** and closes every frame it supersedes, so a 240 fps stream on a 60 Hz screen costs 60 draws, and
+  on a 280 Hz screen every frame is shown. Decoding is never tied to the display. The draw is a WebGL2 texture upload
+  (`renderer.js`) when that is measurably cheaper than 2D `drawImage` on the first frame, else 2D (`alpha:false`,
+  `desynchronized:true`); either way draws are spaced so they use at most half of the main thread.
+  *Why (user report 2026-10-15, "hangs and skips above 60 fps" in Firefox/Floorp):* Firefox's 2D `drawImage(VideoFrame)` is a
+  CPU read-back + convert on the main thread (13 ms at 1440p), which starved the decoder's callbacks. See
+  `superdoc/features/website.md` "Rendering above 60 fps". Pass `new CanvasRenderer(canvas, { webgl: false })` to force 2D,
+  `{ preserveDrawingBuffer: true }` if you need `canvas.toDataURL()`. Moving the canvas into another document (pop-out) is fine.
+* **Decoder latency mode (Gecko only):** `VideoReceiver` starts with `optimizeForLatency: true` and, the first time the
+  decode-queue backstop drops frames (the decoder is slower than the stream), re-configures without it (Firefox's low-latency
+  software decode is single-threaded, 3.5-5x slower). Emits media event `decoder-mode { lowLatency: false }`; watch stat
+  `throughputMode`. Constructor options `lowLatency`, `adaptiveLatency` (default: true only on Gecko).
 * `watch(key, { onFrame })` / `handle.setFrameCallback(fn)`: you receive each `VideoFrame` and **must `close()` it** (hardware
   decoders have a small surface pool; holding frames stalls decoding).
 
@@ -208,7 +218,8 @@ Behaviour that matches the native sender:
 | `fragment.js` | `fragmentFrame` (encrypt once, then split to <= 1000 bytes including the header) and `Reassembler` (drops a frame on any missing fragment, in-flight cap 2, 200 ms staleness, straggler floor, reports drops) |
 | `codec.js` | codec sniffing (H.264/H.265/AV1) and WebCodecs codec strings from the SPS / sequence header (`avc1.PPCCLL`, `hev1…`, `av01…`) |
 | `jitter.js` | adaptive jitter buffer (RFC 3550 EWMA, growth cap, `catchUpSpeedPercent` shrink cap, decode-queue backstop) ported from the desktop client's former WebCodecs `tile-video.js` (replaced by the native decoder), one timer drains all due chunks |
-| `video-rx.js` | per-stream receive pipeline (`VideoReceiver`: loss gate -> jitter buffer -> `VideoDecoder`, reconfigures on codec change, recovers from decoder errors) and `CanvasRenderer` |
+| `video-rx.js` | per-stream receive pipeline (`VideoReceiver`: loss gate -> jitter buffer -> `VideoDecoder`, reconfigures on codec change, recovers from decoder errors, Gecko decoder-latency fallback); re-exports `CanvasRenderer` |
+| `renderer.js` | `CanvasRenderer`: newest frame per `requestAnimationFrame`, WebGL2 or 2D backend picked by a first-frame timing, draw spacing |
 | `video-tx.js` | `VideoSender` (track -> `VideoEncoder`, keyframe policy, static-source keepalive, AV1 shaping), `probeEncoders`, `ENCODER_PRESETS`, `MediaClock` |
 | `audio.js` | `AudioReceiver` (Opus `AudioDecoder` -> WebAudio, PTS-placed playback, gain 0..2) and `AudioSender` (`AudioEncoder`) |
 | `preview.js` | preview sampler (downscale + JPEG) and cadence constants |

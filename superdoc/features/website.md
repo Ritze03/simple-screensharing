@@ -84,6 +84,38 @@ Watch and share both work. Differences from native, all platform limits:
   control stream first and `connect()` rejects with `JoinRejectedError`. The UI shows "This room is
   full (8 people at most)".
 
+## Rendering above 60 fps (task #67, 2026-10-15)
+
+User report: in the browser viewer (Floorp 157 = Firefox/Gecko on Linux) "anything above 60 fps hangs and skips, up to 60 is
+flawless", H.264 and AV1 alike, while the native client takes 240 fps fine.
+
+- **Root cause: the 2D canvas, not the network or the decoder.** `drawImage(VideoFrame)` into a 2D canvas is a software path in
+  Firefox: it reads the hardware-decoded surface back to the CPU and converts it on the **main thread**. Measured in headed
+  Firefox 157 inside the rig (VAAPI decode): **13 ms per 1440p frame** (7 ms headless). That alone is 80 % of the main thread at
+  60 draws/s, and the `VideoDecoder` output/`decode()` callbacks run on that same thread, so decoding collapsed to the draw
+  rate and the decode-queue backstop (`jitter.js`) then dropped whole GOPs to the next keyframe: stalls and skips. A monitor
+  faster than 60 Hz makes it worse (more draws per second).
+- **Fix 1, `js/core/renderer.js`:** `CanvasRenderer` draws through **WebGL2** (`texImage2D(videoFrame)` + one triangle: 0.2 ms
+  per 1440p frame in the same browser, no CPU read-back) when a first-frame timing on scratch canvases says it is clearly
+  cheaper than 2D (otherwise 2D, ties go to 2D). It also spaces draws so drawing never takes more than about half of the main
+  thread (`minIntervalMs`), so a slow backend lowers the *picture* rate instead of starving decode.
+  *Why measure instead of "always WebGL":* where WebGL is itself software (Chromium headless / SwiftShader, VMs) it is slower
+  than 2D (18 ms vs 5 ms at 1440p) and made things worse in the first version. *Why the choice is made before touching the real
+  canvas:* a canvas that got a `webgl2` context can never get a `2d` one.
+- **Fix 2, `VideoReceiver` (Gecko only):** `optimizeForLatency: true` makes Firefox's software decoder single-threaded
+  (3.5-5x slower: 1080p 336 vs 1188 fps, 1440p 206 vs 957, 4K 95 vs 440; Chromium no difference). The first time the decode-queue
+  backstop has to drop frames, the receiver re-configures the decoder with `optimizeForLatency: false` (at the keyframe the
+  backstop skipped to) and stays there; event `decoder-mode`, stat `throughputMode`. It is not the default because frame
+  threading adds a few frames of latency.
+- **Numbers** (headed Firefox 157 in the rig, VAAPI, `docs/dev/xbench.mjs --mode pipeline`: recorded H.264 chunks through the real
+  `VideoReceiver` + `CanvasRenderer` at a fixed feed rate; window on a 60 Hz output): decoded fps before -> after, 1080p@120
+  119 -> 119.5, 1080p@240 239 -> 239 (2D was still cheap enough), **1440p@120 67 -> 119.5, 1440p@240 69 -> 239, 4K@120 42 -> 119.4**;
+  catch-up drops 519/1699/772 -> 0. Software decode, headless 4K@144 (no drawing): 92 -> 138.5 fps with fix 2.
+- **Not verified:** a real monitor above 60 Hz (the rig's windows sit on 60 Hz outputs, so `drawn` stayed ~60; draws now cost
+  ~0.2 ms so 280 draws/s is cheap, but it was not run), the Document PiP pop-out (a unit test moves the canvas into an iframe
+  document and keeps drawing; PiP itself needs a real window), H.265 (Firefox has no HEVC decoder here), hardware decode on
+  the user's GPU.
+
 ## Measured (this machine, Chromium 153, local relay; full tables in `docs/dev/README.md`)
 
 - Native sender to browser viewer: **H.264 and AV1 at 60 and 120 fps** received at full rate
@@ -105,6 +137,7 @@ Watch and share both work. Differences from native, all platform limits:
   scenarios: reconnect, room full, loss, nonce exhaustion...). **Matrix/native interop:**
   `docs/dev/matrix.mjs`, `docs/dev/native.mjs`. **Real UI end to end:** `docs/dev/cdp.mjs` (a
   zero-dependency DevTools driver) + `e2e-lib.mjs` + `e2e/`.
+- **Firefox:** `BROWSER=firefox` runs the same harness in the system Firefox (the user's Floorp is Gecko); `docs/dev/xbench.mjs` benches decode/render per browser. See `docs/dev/README.md` "Firefox (Gecko)".
 - **Do not** pass `--use-fake-ui-for-media-stream` for `getDisplayMedia` tests (it picks a
   `screen:0:0` source that yields no frames); use `canvas.captureStream()` or the harness runner.
 - Headed runs only inside the headless sway rig (`hs-rig.sh run -- env SSS_GUI_LOCKED=1 HEADED=1 ...`, see `docs/dev/README.md`), never on the user's desktop (user request 2026-10-14); `SSS_GUI_LOCKED=1` is the

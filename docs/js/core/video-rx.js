@@ -10,6 +10,8 @@ import { JitterBuffer } from "./jitter.js";
 
 const FPS_WINDOW_MS = 1500;
 const MAX_PADDING = 64; // same constant as client/src/decode/frame.rs
+// Gecko (Firefox, Floorp ...) only: see VideoReceiver#run.
+const IS_GECKO = typeof navigator !== "undefined" && /\bFirefox\/\d/.test(navigator.userAgent);
 
 /**
  * The visible rectangle of a decoded frame, or null when the whole frame is visible. Mirrors the native viewer's
@@ -43,12 +45,14 @@ export class VideoReceiver {
    * @param {number} [o.catchUpSpeedPercent]
    * @param {"no-preference"|"prefer-hardware"|"prefer-software"} [o.hardwareAcceleration]
    */
-  constructor({ onFrame, announcedSize = () => null, onEvent = () => {}, maxJitterBufferMs, catchUpSpeedPercent, hardwareAcceleration = "no-preference", now = () => performance.now(), DecoderClass = null }) {
+  constructor({ onFrame, announcedSize = () => null, onEvent = () => {}, maxJitterBufferMs, catchUpSpeedPercent, hardwareAcceleration = "no-preference", lowLatency = true, adaptiveLatency = IS_GECKO, now = () => performance.now(), DecoderClass = null }) {
     this.DecoderClass = DecoderClass; // tests inject a fake decoder; default is the global VideoDecoder
     this.onFrame = onFrame;
     this.announcedSize = announcedSize; // () => {width,height}|null: the size the sender announced for this stream
     this.onEvent = onEvent;
     this.hardwareAcceleration = hardwareAcceleration;
+    this.lowLatency = lowLatency; // VideoDecoder `optimizeForLatency`; see #run for why it can be switched off once
+    this.adaptiveLatency = adaptiveLatency;
     this.now = now;
     this.jb = new JitterBuffer({ maxJitterBufferMs, catchUpSpeedPercent });
     this.decoder = null;
@@ -62,7 +66,7 @@ export class VideoReceiver {
     this.outTimes = [];
     this.inTimes = [];
     this.stats = {
-      rxFrames: 0, rxBytes: 0, decoded: 0, skippedDeltas: 0, lossEvents: 0, decoderErrors: 0,
+      rxFrames: 0, rxBytes: 0, decoded: 0, skippedDeltas: 0, lossEvents: 0, decoderErrors: 0, throughputMode: false,
       width: 0, height: 0, codec: null, codecString: null, lastPtsUs: 0,
     };
     this.rxBytesWindow = [];
@@ -157,7 +161,7 @@ export class VideoReceiver {
   #decoderConfig() {
     return {
       codec: this.config.string,
-      optimizeForLatency: true,
+      optimizeForLatency: this.lowLatency,
       hardwareAcceleration: this.hardwareAcceleration,
     };
   }
@@ -230,7 +234,24 @@ export class VideoReceiver {
     const d = this.decoder;
     if (!d || d.state !== "configured") return;
     const t = this.now();
-    const { items } = this.jb.drain(t, d.decodeQueueSize);
+    const { items, dropped } = this.jb.drain(t, d.decodeQueueSize);
+    // The decode-queue backstop just had to skip frames: this decoder is slower than the stream. In Gecko `optimizeForLatency`
+    // makes the software H.264/AV1 decoder (ffmpeg / dav1d) single-threaded: measured 2026-10-15, Firefox 157, 1080p
+    // 336 vs 1188 fps, 1440p 206 vs 957, 4K 95 vs 440 (Chromium: no difference). So after the first overload switch it off,
+    // trading the few frames of reorder/thread latency for 3-5x the decode rate. The backstop only ever drops up to a keyframe,
+    // so the chunks about to be submitted start with one, which is what a re-`configure` needs. One-way: a stream that
+    // overloaded once will do so again, and the receiver lives only as long as the watch.
+    if (dropped > 0 && this.lowLatency && this.adaptiveLatency) {
+      this.lowLatency = false;
+      this.stats.throughputMode = true;
+      try {
+        d.configure(this.#decoderConfig());
+      } catch (e) {
+        this.#decoderFailed(e);
+        return;
+      }
+      this.onEvent("decoder-mode", { lowLatency: false });
+    }
     // The decoder cannot keep up and the backlog has no keyframe to skip to: ask for one (the room client re-requests,
     // rate limited), otherwise latency would climb to a whole GOP before the backstop can drop anything.
     if (this.jb.size) {
@@ -300,59 +321,5 @@ export class VideoReceiver {
   }
 }
 
-/**
- * Draws the most recent decoded frame on a canvas once per display refresh (requestAnimationFrame),
- * closing every frame it supersedes. At 240 fps on a 60 Hz display that is 1 draw instead of 4, and on
- * a 280 Hz display every frame is shown; either way the picture is the freshest one available.
- * Keeps no frame alive longer than one refresh, which matters because hardware decoders have a small
- * surface pool.
- */
-export class CanvasRenderer {
-  /** @param {HTMLCanvasElement|OffscreenCanvas} canvas */
-  constructor(canvas, { onDraw = null } = {}) {
-    this.canvas = canvas;
-    this.ctx = canvas.getContext("2d", { alpha: false, desynchronized: true });
-    this.latest = null;
-    this.raf = 0;
-    this.drawn = 0;
-    this.onDraw = onDraw;
-    this.stopped = false;
-    this.tick = this.tick.bind(this);
-  }
-
-  /** Hand a frame over (takes ownership). */
-  present(frame) {
-    if (this.stopped) {
-      frame.close();
-      return;
-    }
-    if (this.latest) this.latest.close();
-    this.latest = frame;
-    if (!this.raf) this.raf = requestAnimationFrame(this.tick);
-  }
-
-  tick() {
-    this.raf = 0;
-    const f = this.latest;
-    if (!f) return;
-    this.latest = null;
-    const w = f.displayWidth;
-    const h = f.displayHeight;
-    if (this.canvas.width !== w || this.canvas.height !== h) {
-      this.canvas.width = w;
-      this.canvas.height = h;
-    }
-    this.ctx.drawImage(f, 0, 0, w, h);
-    f.close();
-    this.drawn++;
-    if (this.onDraw) this.onDraw();
-  }
-
-  stop() {
-    this.stopped = true;
-    if (this.raf) cancelAnimationFrame(this.raf);
-    this.raf = 0;
-    if (this.latest) this.latest.close();
-    this.latest = null;
-  }
-}
+// The renderer lives in renderer.js (WebGL first, 2D fallback); re-exported so existing imports keep working.
+export { CanvasRenderer } from "./renderer.js";

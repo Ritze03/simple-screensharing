@@ -140,7 +140,7 @@ async function runView(client, result) {
   const counters = [];
   let sampleBusy = false;
   let n = 0;
-  const renderer = new CanvasRenderer(canvas);
+  const renderer = new CanvasRenderer(canvas, { preserveDrawingBuffer: true }); // toDataURL snapshot below
   // tee: sample the pattern from a clone, then render
   const watch = client.watch(info.key, {
     audio: wantAudio,
