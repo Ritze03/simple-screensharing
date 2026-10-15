@@ -35,7 +35,8 @@
 //! See [`CaptureDomain`] for why the GPU domain exists (it is what makes
 //! 120-240 fps of *unique* frames possible at all).
 //!
-//! That branch is the pipeline's only *fixed* one. **There is no
+//! That branch, plus the valve-gated own-tile live preview branch ([`live_branch`], task #78),
+//! are the pipeline's only *fixed* ones. **There is no
 //! fixed encoder branch**: every outgoing destination — including the first
 //! — is a dynamic branch added to the same `tee` at runtime by
 //! [`branch::add_branch`]:
@@ -1264,6 +1265,56 @@ async fn open_portal_capture() -> Result<PortalCapture> {
 /// wasted `videoconvert`/appsink work.
 const PREVIEW_BRANCH_FRAMERATE: u32 = 1;
 
+/// The sharer's own live preview (task #78, user request 2026-10-15): its frame
+/// rate, and the box its size is fitted into (aspect kept, never upscaled).
+/// 640x360 at 30 fps is ~28 MB/s of RGBA and one small GPU scale; the full
+/// 240 fps / 1080p+ capture is never touched.
+const LIVE_PREVIEW_FPS: u32 = 30;
+const LIVE_PREVIEW_MAX_W: u32 = 640;
+const LIVE_PREVIEW_MAX_H: u32 = 360;
+/// The branch's pixel format. `Why BGRA and not RGBA:` `vapostproc` on this stack
+/// labels its "RGBA" output but writes the bytes as A,B,G,R (measured with a solid
+/// 0xff2040 NV12 frame: RGBA gave `ff 35 2c f9`, BGRA gave the right `35 2c f9 ff`),
+/// which showed the whole preview red. BGRA is correct on both domains' scalers;
+/// [`sample_to_live_frame`] swizzles it to RGBA for egui.
+const LIVE_FORMAT: &str = "BGRA";
+const LIVE_VALVE_NAME: &str = "live_valve";
+const LIVE_CAPS_NAME: &str = "live_caps";
+const LIVE_SINK_NAME: &str = "live_sink";
+
+/// The live-preview tee branch, appended to both capture descriptions. The
+/// `valve` sits **directly on the tee** (before the queue and every converter)
+/// and starts closed (`drop=true`, sticky events still forwarded so caps are
+/// negotiated and the first open needs no renegotiation of the elements behind
+/// it): closed, a tee push costs one pad call and a buffer unref, no thread
+/// hop, no scale, no download. `scale` is the domain's scaler chain
+/// (`vapostproc` for GPU memory, `videoscale ! videoconvert` for system
+/// memory); the size is set on `live_caps` when the branch is opened
+/// ([`CaptureHandle::set_live_preview`]).
+///
+/// The frame rate is capped by a [`branch::RateCap`] probe on the valve's src pad
+/// (installed in [`LivePreview::from_pipeline`]), not by `videorate drop-only`:
+/// the portal source is variable-rate (`framerate=0/1`) and `videorate` then
+/// passes every frame (measured: 240 fps reached this sink with `drop-only` and
+/// a 30/1 caps filter), while `RateCap` paces by timestamp (see its doc).
+///
+/// `Why the appsink is` `async=false`: a sink wants a preroll buffer before the
+/// pipeline may finish its PAUSED->PLAYING change, and a closed valve never
+/// delivers one. Without it the **whole capture stalls**: the state change
+/// hangs (5 s to "capture started", then "produced no IDR"), and the other
+/// branches get one frame or none. Reproduced with `videotestsrc ! vapostproc
+/// ! tee` plus this branch behind a closed valve (0 fps on the other branch;
+/// 240 fps with `async=false`).
+fn live_branch(scale: &str) -> String {
+    format!(
+        "{TEE_NAME}. ! valve name={LIVE_VALVE_NAME} drop=true drop-mode=forward-sticky-events \
+            ! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 \
+            ! {scale} \
+            ! capsfilter name={LIVE_CAPS_NAME} caps=video/x-raw,format={LIVE_FORMAT} \
+            ! appsink name={LIVE_SINK_NAME} async=false emit-signals=false sync=false max-buffers=1 drop=true"
+    )
+}
+
 /// `max-size-buffers` for each encode branch's `queue leaky=downstream`
 /// right after the tee (see [`branch::add_branch`]'s doc comment for the
 /// full "why" — briefly: without a small bounded/leaky config there, a real
@@ -1530,6 +1581,8 @@ struct CapturePipeline {
     tee: gst::Element,
     /// ~1fps RGB branch feeding [`preview::spawn_preview_task`].
     preview_sink: gst_app::AppSink,
+    /// The sharer's own live preview branch (valve closed until asked).
+    live: LivePreview,
     /// Flipped by the first buffer to reach the `tee`; see
     /// [`CaptureHandle::awaiting_first_frame`].
     frame_seen: Arc<std::sync::atomic::AtomicBool>,
@@ -1665,7 +1718,9 @@ fn build_pipeline_with_orientation(source_fragment: &str, orientation: &str) -> 
             ! video/x-raw,framerate={PREVIEW_BRANCH_FRAMERATE}/1 \
             ! videoconvert \
             ! video/x-raw,format=RGB \
-            ! appsink name=preview_sink emit-signals=false sync=false max-buffers=1 drop=true"
+            ! appsink name=preview_sink emit-signals=false sync=false max-buffers=1 drop=true \
+         {live}",
+        live = live_branch("videoscale ! videoconvert"),
     );
     build_pipeline_from_description(&description, CaptureDomain::System, orientation)
 }
@@ -1686,7 +1741,9 @@ fn gpu_pipeline_description(source_fragment: &str) -> String {
             ! video/x-raw,format={SOURCE_RAW_FORMAT},framerate={PREVIEW_BRANCH_FRAMERATE}/1 \
             ! videoconvert \
             ! video/x-raw,format=RGB \
-            ! appsink name=preview_sink emit-signals=false sync=false max-buffers=1 drop=true"
+            ! appsink name=preview_sink emit-signals=false sync=false max-buffers=1 drop=true \
+         {live}",
+        live = live_branch("vapostproc"),
     )
 }
 
@@ -1707,6 +1764,8 @@ fn build_pipeline_from_description(description: &str, domain: CaptureDomain, ori
         .by_name(TEE_NAME)
         .ok_or_else(|| anyhow!("pipeline has no element named '{TEE_NAME}'"))?;
 
+    let live = LivePreview::from_pipeline(&pipeline)?;
+
     isolate_source_from_branch_renegotiation(&tee, domain)?;
     if domain == CaptureDomain::System {
         arm_orientation_stage(&pipeline, orientation)?;
@@ -1724,7 +1783,7 @@ fn build_pipeline_from_description(description: &str, domain: CaptureDomain, ori
         });
     }
 
-    Ok(CapturePipeline { pipeline, tee, preview_sink, frame_seen })
+    Ok(CapturePipeline { pipeline, tee, preview_sink, live, frame_seen })
 }
 
 /// Stops a branch being added to the live `tee` from asking everything
@@ -2212,6 +2271,8 @@ pub struct CaptureHandle {
     /// applies backpressure upstream. `None` once the preview task has
     /// started (or, for a not-yet-staged legacy build, never populated).
     preview_sink: Option<gst_app::AppSink>,
+    /// The sharer's own live preview branch, see [`LivePreview`].
+    live: LivePreview,
     /// See [`CaptureHandle::awaiting_first_frame`].
     frame_seen: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -2502,7 +2563,7 @@ async fn start_capture_with_source(framerate: u32, capture_source: CaptureSource
         }
     };
     tracing::info!("capture started in the {domain:?} domain");
-    let CapturePipeline { pipeline, tee, preview_sink, frame_seen } = built;
+    let CapturePipeline { pipeline, tee, preview_sink, live, frame_seen } = built;
 
     // Size for the never-upscale clamp ([`destination::clamp_to_source`]) and
     // for whatever destination is added first: read off the tee's negotiated
@@ -2529,6 +2590,7 @@ async fn start_capture_with_source(framerate: u32, capture_source: CaptureSource
         preview_handle: None,
         preview_client: None,
         preview_sink: Some(preview_sink),
+        live,
         source_state: Mutex::new(source),
         destinations: Vec::new(),
     })
@@ -2682,6 +2744,31 @@ fn preview_frame_stream(preview_sink: gst_app::AppSink) -> FrameStream {
     }))
 }
 
+fn sample_to_live_frame(sample: &gst::Sample) -> Result<LiveFrame> {
+    let buffer = sample.buffer().ok_or_else(|| anyhow!("live preview sample had no buffer"))?;
+    let caps = sample.caps().ok_or_else(|| anyhow!("live preview sample had no caps"))?;
+    let info = gst_video::VideoInfo::from_caps(caps).context("failed to parse live preview caps")?;
+    let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info)
+        .map_err(|_| anyhow!("failed to map the live preview buffer readable"))?;
+    let (width, height) = (frame.width() as usize, frame.height() as usize);
+    let stride = frame.plane_stride()[0] as usize;
+    let plane = frame.plane_data(0).map_err(|_| anyhow!("live preview frame had no plane 0"))?;
+    let row_bytes = width * 4;
+    let mut rgba = Vec::with_capacity(row_bytes * height);
+    for row in 0..height {
+        let Some(r) = plane.get(row * stride..row * stride + row_bytes) else {
+            anyhow::bail!("live preview plane shorter than expected (stride/height mismatch)");
+        };
+        rgba.extend_from_slice(r);
+    }
+    // BGRA -> RGBA; the screen is opaque, so do not trust a converter's alpha byte.
+    for px in rgba.chunks_exact_mut(4) {
+        px.swap(0, 2);
+        px[3] = 255;
+    }
+    Ok(LiveFrame { width: width as u32, height: height as u32, rgba })
+}
+
 fn sample_to_raw_frame(sample: &gst::Sample) -> Result<RawFrame> {
     let buffer = sample.buffer().ok_or_else(|| anyhow!("preview sample had no buffer"))?;
     let caps = sample.caps().ok_or_else(|| anyhow!("preview sample had no caps"))?;
@@ -2716,6 +2803,102 @@ fn sample_to_raw_frame(sample: &gst::Sample) -> Result<RawFrame> {
         height: height as u32,
         rgb: packed,
     })
+}
+
+/// One decoded frame of the sharer's own live preview: tightly packed,
+/// opaque RGBA (swizzled from the branch's BGRA, see [`LIVE_FORMAT`]).
+pub struct LiveFrame {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// The sharer's own live preview (task #78): the `valve[RateCap] ! queue !
+/// scale ! BGRA ! appsink` tee branch built by [`live_branch`]. Closed unless the
+/// UI asks ([`CaptureHandle::set_live_preview`]); the UI asks only while the
+/// app window is focused and the own tile is on screen.
+///
+/// `Why a valve and not add/remove of the branch:` the valve sits right behind
+/// the tee, so a closed branch costs one pad call per frame and nothing else,
+/// while avoiding pad surgery on the live tee (which is where `RECONFIGURE`
+/// storms came from, see [`isolate_source_from_branch_renegotiation`]).
+struct LivePreview {
+    valve: gst::Element,
+    caps: gst::Element,
+    sink: gst_app::AppSink,
+    /// Buffers that reached the sink (counted by a pad probe, so it is the
+    /// branch's real throughput whether or not the UI pulled them).
+    frames: Arc<AtomicU64>,
+    /// `(open, size the caps were last set to)`.
+    state: Mutex<(bool, (u32, u32))>,
+}
+
+impl LivePreview {
+    fn from_pipeline(pipeline: &gst::Pipeline) -> Result<Self> {
+        let get = |name: &str| pipeline.by_name(name).ok_or_else(|| anyhow!("pipeline has no element named '{name}'"));
+        let sink = get(LIVE_SINK_NAME)?
+            .downcast::<gst_app::AppSink>()
+            .map_err(|_| anyhow!("'{LIVE_SINK_NAME}' element is not an AppSink"))?;
+        let frames = Arc::new(AtomicU64::new(0));
+        if let Some(pad) = sink.static_pad("sink") {
+            let frames = frames.clone();
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                frames.fetch_add(1, Ordering::Relaxed);
+                gst::PadProbeReturn::Ok
+            });
+        }
+        let valve = get(LIVE_VALVE_NAME)?;
+        let cap = Mutex::new(branch::RateCap::new(LIVE_PREVIEW_FPS));
+        valve
+            .static_pad("src")
+            .ok_or_else(|| anyhow!("live preview valve has no src pad"))?
+            .add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+                let Some(gst::PadProbeData::Buffer(buffer)) = &info.data else { return gst::PadProbeReturn::Ok };
+                let Some(pts) = buffer.pts() else { return gst::PadProbeReturn::Ok };
+                if cap.lock().unwrap().admit(pts.nseconds()) { gst::PadProbeReturn::Ok } else { gst::PadProbeReturn::Drop }
+            })
+            .ok_or_else(|| anyhow!("failed to install the live preview frame-rate cap"))?;
+        Ok(Self { valve, caps: get(LIVE_CAPS_NAME)?, sink, frames, state: Mutex::new((false, (0, 0))) })
+    }
+
+    fn set(&self, tee: &gst::Element, on: bool) {
+        let mut st = self.state.lock().unwrap();
+        if st.0 == on {
+            return;
+        }
+        if on {
+            let Some((w, h)) = negotiated_size(tee) else { return };
+            let size = fit_live_size(w as u32, h as u32, LIVE_PREVIEW_MAX_W, LIVE_PREVIEW_MAX_H);
+            if st.1 != size {
+                let caps = gst::Caps::builder("video/x-raw")
+                    .field("format", LIVE_FORMAT)
+                    .field("width", size.0 as i32)
+                    .field("height", size.1 as i32)
+                    .build();
+                self.caps.set_property("caps", &caps);
+                st.1 = size;
+            }
+            // Drop whatever a previous open left behind: it is stale.
+            while self.sink.try_pull_sample(gst::ClockTime::ZERO).is_some() {}
+            self.valve.set_property("drop", false);
+        } else {
+            self.valve.set_property("drop", true);
+        }
+        st.0 = on;
+        tracing::debug!(on, frames = self.frames.load(Ordering::Relaxed), "live preview branch");
+    }
+}
+
+/// `src` fitted into `max_w` x `max_h`, aspect kept, never upscaled, both sides
+/// even and at least 2 (scalers and RGBA want that, and it keeps the picture
+/// from drifting by a pixel between reopen cycles).
+fn fit_live_size(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> (u32, u32) {
+    if src_w == 0 || src_h == 0 {
+        return (max_w, max_h);
+    }
+    let k = (max_w as f64 / src_w as f64).min(max_h as f64 / src_h as f64).min(1.0);
+    let even = |v: f64| ((v.round() as u32).max(2)) & !1;
+    (even(src_w as f64 * k), even(src_h as f64 * k))
 }
 
 /// Negotiated frame size on `element`'s sink pad. Used against the `tee` to
@@ -3078,6 +3261,30 @@ impl CaptureHandle {
     /// showing an unexplained spinner.
     pub fn awaiting_first_frame(&self) -> bool {
         !self.frame_seen.load(Ordering::Acquire)
+    }
+
+    /// Opens or closes the sharer's own live preview branch (task #78).
+    /// Idempotent and cheap to call every frame: GStreamer is only touched
+    /// when the state changes. Opening needs the source size (to size the
+    /// preview); until the first frame has negotiated it, the call is a no-op
+    /// and the caller simply asks again next frame.
+    pub fn set_live_preview(&self, on: bool) {
+        self.live.set(&self.tee, on);
+    }
+
+    /// Buffers that reached the live preview's sink so far. Stops increasing
+    /// the moment [`Self::set_live_preview`]`(false)` lands.
+    pub fn live_preview_frames(&self) -> u64 {
+        self.live.frames.load(Ordering::Relaxed)
+    }
+
+    /// The newest live-preview frame since the last call, if any (never blocks).
+    pub fn live_preview_frame(&self) -> Option<LiveFrame> {
+        if !self.live.state.lock().unwrap().0 {
+            return None;
+        }
+        let sample = self.live.sink.try_pull_sample(gst::ClockTime::ZERO)?;
+        sample_to_live_frame(&sample).map_err(|e| tracing::warn!("dropping a malformed live preview frame: {e:#}")).ok()
     }
 
     pub fn source_caps(&self) -> destination::SourceCaps {
@@ -8013,6 +8220,68 @@ pub mod branch {
             built.pipeline.set_state(gst::State::Playing).expect("pipeline should reach PLAYING");
             assert!(wait_until_playing(&built.pipeline, Duration::from_secs(30)), "pipeline never reached PLAYING");
             built
+        }
+
+        /// Task #78: the live preview branch is silent while its valve is closed,
+        /// delivers scaled RGBA at <= 30 fps when opened, and is silent again
+        /// (frame counter frozen) once closed.
+        #[test]
+        fn live_preview_branch_is_gated_by_its_valve() {
+            gst::init().unwrap();
+            let built = super::super::build_pipeline("videotestsrc is-live=true pattern=smpte ! video/x-raw,width=1280,height=720,framerate=120/1").unwrap();
+            built.pipeline.set_state(gst::State::Playing).unwrap();
+            let (live, tee) = (&built.live, &built.tee);
+            let frames = || live.frames.load(std::sync::atomic::Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(500));
+            assert_eq!(frames(), 0, "closed valve: nothing may reach the sink");
+            // The closed branch must not stall the others (a sink that waits for preroll did).
+            assert!(
+                built.preview_sink.try_pull_sample(gst::ClockTime::from_seconds(3)).is_some(),
+                "the room-preview branch must keep flowing while the live preview is closed"
+            );
+
+            live.set(tee, true);
+            std::thread::sleep(Duration::from_secs(2));
+            let opened = frames();
+            assert!((20..=75).contains(&opened), "2 s open should give ~60 frames at 30 fps, got {opened}");
+            let sample = live.sink.try_pull_sample(gst::ClockTime::from_mseconds(500)).expect("a frame");
+            let f = super::super::sample_to_live_frame(&sample).unwrap();
+            assert_eq!((f.width, f.height), (640, 360), "720p fits 640x360");
+            assert_eq!(f.rgba.len(), 640 * 360 * 4);
+            assert!(f.rgba.chunks_exact(4).all(|p| p[3] == 255));
+
+            live.set(tee, false);
+            std::thread::sleep(Duration::from_millis(200));
+            let closed = frames();
+            std::thread::sleep(Duration::from_secs(1));
+            assert_eq!(frames(), closed, "closed again: the counter must not move");
+
+            live.set(tee, true);
+            std::thread::sleep(Duration::from_secs(1));
+            assert!(frames() > closed + 10, "reopening resumes the flow");
+            built.pipeline.set_state(gst::State::Null).unwrap();
+        }
+
+        #[test]
+        fn live_frame_is_swizzled_from_bgra_to_rgba_and_opaque() {
+            gst::init().unwrap();
+            // 2x1: pixel 0 = B 1, G 2, R 3, A 0; pixel 1 = B 10, G 20, R 30, A 7.
+            let info = gst_video::VideoInfo::builder(gst_video::VideoFormat::Bgra, 2, 1).build().unwrap();
+            let mut buffer = gst::Buffer::with_size(info.size()).unwrap();
+            buffer.get_mut().unwrap().map_writable().unwrap().copy_from_slice(&[1, 2, 3, 0, 10, 20, 30, 7]);
+            let sample = gst::Sample::builder().buffer(&buffer).caps(&info.to_caps().unwrap()).build();
+            let f = super::super::sample_to_live_frame(&sample).unwrap();
+            assert_eq!((f.width, f.height), (2, 1));
+            assert_eq!(f.rgba, vec![3, 2, 1, 255, 30, 20, 10, 255]);
+        }
+
+        #[test]
+        fn live_preview_size_fits_the_box_keeps_aspect_and_never_upscales() {
+            assert_eq!(super::super::fit_live_size(1920, 1080, 640, 360), (640, 360));
+            assert_eq!(super::super::fit_live_size(3840, 1080, 640, 360), (640, 180));
+            assert_eq!(super::super::fit_live_size(1080, 1920, 640, 360), (202, 360));
+            assert_eq!(super::super::fit_live_size(320, 200, 640, 360), (320, 200));
+            assert_eq!(super::super::fit_live_size(0, 0, 640, 360), (640, 360));
         }
 
         fn set_gate_closed(built: &super::super::CapturePipeline, closed: bool) {

@@ -17,7 +17,7 @@ import {
 } from "./rooms.js";
 import {
   capById, capInRoom, stagedFor, liveRoomIds, allDests, allocated, applyBandwidth, captureName, captureRes, stage, discard, goLive, addDest,
-  moveDest, stopDest, stopAll, editDest, setAudioMuted, captureLevel,
+  moveDest, stopDest, stopAll, editDest, setAudioMuted, captureLevel, previewFor,
 } from "./capture.js";
 import { popOut, closePopout, popoutMode } from "./popout.js";
 
@@ -335,8 +335,10 @@ function myCard(c, r) {
   const d = c.dests.get(r.id);
   return V({ cls: "scard", g: 0 },
     h("div", { class: "thumb mine" },
+      previewFor(c),
       V({ cls: "ovl", g: 0 },
-        H({ g: 2 }, d.state === "live" ? liveChip() : h("span", { class: "chip-dark", text: t("ui.room.starting_chip") }), FILL(null)),
+        H({ g: 2 }, d.state === "live" ? liveChip() : h("span", { class: "chip-dark", text: t("ui.room.starting_chip") }), FILL(null),
+          h("span", { class: "chip-dark pv", title: t("ui.room.preview_tip"), text: t("ui.room.preview_chip") })),
         FILL(V({ cls: "mine-label", g: 1, style: "align-items:center;padding:8px" }, ic("cast"), T(t("ui.room.your_screen"))), { v: true, style: "align-items:center" }))),
     V({ cls: "card-pad", g: 2 },
       H({ cls: "who", g: 2, style: "height:22px" }, SL(22, h("span", { class: "avatar sm", style: avatarBg(me()), text: initial(me()) })), h("b", { text: t("ui.sidebar.you") }), FILL(T(captureName(c), "t"))),

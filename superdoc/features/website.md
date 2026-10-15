@@ -134,6 +134,20 @@ Both user requests, mirrored from the native client (`superdoc/ui/APP-SHELL.md`,
   through CDP `Page.dblclick`, avatar hexes, fullscreen survives a re-render, second double-click and `exitFullscreen()` return the
   canvas). Headless Chromium's Fullscreen API works (`document.fullscreenElement` is set).
 
+## Own-tile live preview (task #78, 2026-10-15)
+
+User request 2026-10-15: "For the sharer, it should show a stream preview, while he is tabbed into the program. Otherwise, its
+fine to hide it." The sharer's own card in "Sharing in this room" (`app.js` `myCard`) holds a persistent muted `<video
+class="live-preview">` (`capture.js` `previewFor`) playing `new MediaStream([c.video])` (video only, never audio; audio-only
+captures get none). It is attached only while `document.visibilityState === "visible" && document.hasFocus()`; `visibilitychange`
+/ `focus` / `blur` pause it and drop `srcObject`, and the element is `hidden`, so the placeholder shows and nothing is composited
+(the track itself keeps feeding the encoder). *Why a persistent element:* `render()` rebuilds the tree on every state change, so
+`myCard()` re-inserts the same element and playback never restarts. A `PREVIEW` chip (CSS `:has()` on the thumb) replaces the "Your
+screen" label while it plays. Native counterpart and shared rationale: `superdoc/features/self-preview.md`.
+E2E: `docs/dev/e2e/live-preview.mjs <relay host:port> <certhash>` (headless Chromium: headless reports `document.hasFocus() ===
+false` by default, so the run switches focus with CDP `Emulation.setFocusEmulationEnabled`, and hides the page with a second tab +
+`Page.bringToFront`; checks attached/playing/video-only, survives `render()`, detached when unfocused or hidden, resumes).
+
 ## Rendering above 60 fps (task #67, 2026-10-15)
 
 User report: in the browser viewer (Floorp 157 = Firefox/Gecko on Linux) "anything above 60 fps hangs and skips, up to 60 is

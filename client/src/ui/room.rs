@@ -950,6 +950,20 @@ fn card_info(ui: &mut Ui, info: Rect, who: (&str, &str), title: &str, specs: &st
     widgets::btn_row(&mut c, btns)
 }
 
+/// Cover-fit a preview texture into the thumb (crop, never letterbox).
+fn paint_cover(p: &egui::Painter, thumb: Rect, tex: &egui::TextureHandle) {
+    let [tw, th] = tex.size();
+    let (ta, ra) = (tw as f32 / th.max(1) as f32, thumb.width() / thumb.height());
+    let uv = if ta > ra {
+        let k = ra / ta;
+        Rect::from_min_max(pos2(0.5 - k / 2.0, 0.0), pos2(0.5 + k / 2.0, 1.0))
+    } else {
+        let k = ta / ra;
+        Rect::from_min_max(pos2(0.0, 0.5 - k / 2.0), pos2(1.0, 0.5 + k / 2.0))
+    };
+    p.add(RectShape::filled(thumb, thumb_radius(), Color32::WHITE).with_texture(tex.id(), uv));
+}
+
 /// Someone else's share: preview thumbnail (latest decoded preview JPEG),
 /// owner, specs, `[Watch][Pop out]` (audio-only: `[Listen]`).
 fn share_card(ui: &mut Ui, cx: &Cx, h: RoomHandle, info: &StreamInfo, acts: &mut Vec<UiAction>) {
@@ -960,17 +974,7 @@ fn share_card(ui: &mut Ui, cx: &Cx, h: RoomHandle, info: &StreamInfo, acts: &mut
     p.rect_filled(thumb, thumb_radius(), theme::TILE_BG);
     let audio_only = info.kind == StreamKind::Audio;
     if let Some(tex) = s.preview_textures.get(&(info.owner, info.stream_id)) {
-        // Cover-fit the preview into the thumb (crop, never letterbox).
-        let [tw, th] = tex.size();
-        let (ta, ra) = (tw as f32 / th.max(1) as f32, thumb.width() / thumb.height());
-        let uv = if ta > ra {
-            let k = ra / ta;
-            Rect::from_min_max(pos2(0.5 - k / 2.0, 0.0), pos2(0.5 + k / 2.0, 1.0))
-        } else {
-            let k = ta / ra;
-            Rect::from_min_max(pos2(0.0, 0.5 - k / 2.0), pos2(1.0, 0.5 + k / 2.0))
-        };
-        p.add(RectShape::filled(thumb, thumb_radius(), Color32::WHITE).with_texture(tex.id(), uv));
+        paint_cover(p, thumb, tex);
     } else {
         let (icon, label) = if audio_only {
             ("music_note", tr("ui.room.audio_only", "Audio only"))
@@ -1020,15 +1024,27 @@ fn thumb_placeholder(ui: &Ui, thumb: Rect, icon: &str, icon_col: Color32, label:
     paint_text(ui, line(cy + 6.0, 16.0), label, font(Weight::Regular, theme::FS_TINY), theme::TEXT_FAINT, Align::Center);
 }
 
-/// Our own share in this room: no preview (self-preview was removed on
-/// purpose), screen-hatch thumb, specs of what we send, one full-width
-/// "Stream settings" button.
+/// Our own share in this room: a live preview of what we capture while this
+/// window is focused (task #78; a screen-hatch placeholder otherwise), specs
+/// of what we send, one full-width "Stream settings" button.
 fn my_card(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSourceId, destination: DestinationId, acts: &mut Vec<UiAction>) {
     let Some(c) = cx.capture(capture) else { return };
     let Some(d) = c.destinations.get(&destination) else { return };
     let (thumb, info_r) = card_frame(ui);
-    widgets::paint_hatch(ui.painter(), thumb, thumb_radius(), 8.0, theme::ELEV_19, theme::ELEV_14);
-    thumb_placeholder(ui, thumb, "cast", theme::SUCCESS, &tr("ui.room.my_screen", "Your screen (no self-preview)"));
+    let is_video = c.kind == StreamKind::Video;
+    // Asking for the preview is what keeps it running: only a focused window
+    // paints this (see `App::poll_live_previews`).
+    if is_video && ui.ctx().input(|i| i.viewport().focused.unwrap_or(true) && !i.viewport().minimized.unwrap_or(false)) {
+        acts.push(UiAction::LivePreviewSeen(capture));
+    }
+    let live_tex = cx.shell.live_previews.get(&capture).and_then(|t| t.tex.as_ref());
+    if let Some(tex) = live_tex {
+        ui.painter().rect_filled(thumb, thumb_radius(), theme::TILE_BG);
+        paint_cover(ui.painter(), thumb, tex);
+    } else {
+        widgets::paint_hatch(ui.painter(), thumb, thumb_radius(), 8.0, theme::ELEV_19, theme::ELEV_14);
+        thumb_placeholder(ui, thumb, "cast", theme::SUCCESS, &tr("ui.room.my_screen", "Your screen"));
+    }
     let chip = match cx.destination_state(c, d) {
         DestinationState::Live | DestinationState::Rebuilding { .. } => "LIVE".to_owned(),
         DestinationState::Starting => tr("ui.room.chip_starting", "STARTING"),
@@ -1036,6 +1052,13 @@ fn my_card(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSourceId, destin
         DestinationState::Failed(_) => tr("ui.room.chip_failed", "FAILED"),
     };
     thumb_corners(ui, thumb, Some(&chip), false);
+    if live_tex.is_some() {
+        // Right corner: says the picture is a local preview, not what viewers get.
+        let row = Rect::from_min_size(thumb.min + vec2(theme::S2, theme::S2), vec2(thumb.width() - 2.0 * theme::S2, 22.0));
+        let mut r = ui.new_child(UiBuilder::new().max_rect(row).layout(Layout::right_to_left(Align::Center)));
+        widgets::chip_dark(&mut r, None, false, &tr("ui.room.preview_chip", "PREVIEW"))
+            .on_hover_text(tr("ui.room.preview_tip", "A live preview of your screen, shown while this window is focused. Viewers get the full quality stream."));
+    }
     if cx.destination_state(c, d) == DestinationState::Starting && cx.state.capture_awaiting_first_frame(capture) {
         ui.interact(thumb, Id::new(("my_card_thumb", capture, destination)), Sense::hover())
             .on_hover_text(tr("ui.waiting_frame_hint", "An idle screen sends no picture until something on it changes. Move the mouse over the shared screen and the stream starts."));

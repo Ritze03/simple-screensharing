@@ -13,6 +13,10 @@ impl App {
     /// Apply one action. `ctx` is only used for the clipboard.
     pub(super) fn apply(&mut self, ctx: &egui::Context, action: UiAction) {
         match action {
+            UiAction::LivePreviewSeen(id) => {
+                self.shell.live_previews.entry(id).or_default().seen = ctx.input(|i| i.time);
+                ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            }
             // --- navigation ---------------------------------------------
             UiAction::SelectRoom(key) => {
                 self.state.active_room = self.state.rooms.iter().find(|(_, r)| same_room(&r.join_string, &key)).map(|(h, _)| *h);

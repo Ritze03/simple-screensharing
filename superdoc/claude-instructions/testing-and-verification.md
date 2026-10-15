@@ -167,6 +167,15 @@ the default; `HS_PIPEWIRE=shared` is available but you should not need it.) See
 - Debug builds panic on icon names missing from `theme::ICONS` (`unknown icon "..."`);
   report it. A release build only shows a blank glyph.
 
+### Tests and the global locale
+
+`rust_i18n`'s locale is process-global and `cargo test` runs tests in parallel. A test that calls
+`rust_i18n::set_locale("de")` makes unrelated tests fail at random (`left: "Bildschirmfreigabe", right: "Screen share"`,
+task #78). Tests that need another locale either pass it explicitly (`t!(key, locale = "de")`, as
+`pill_slots_fit_every_label_in_every_locale` does) or run in a child process with their own locale
+(`ui::stream_settings::tests::every_locale_fits_two_columns_at_full_modal_width` re-runs itself per locale with
+`SSS_TEST_LOCALE`). Never switch the global locale in-process in a test.
+
 ### Scratch config
 
 The rig launches every client with its own `XDG_CONFIG_HOME`/`XDG_DATA_HOME` in the scratch

@@ -12,8 +12,9 @@
 > layout, sidebar tree, audio-card button audits) were dropped from this page; the *why* that
 > outlived them is in "History: the Electron UI" at the end, the full text in version control
 > (`git log -- superdoc/features/stream-control.md`).
-> The 320x180 "self-preview" branch drawn in the diagrams still exists but nothing consumes it
-> (`superdoc/features/self-preview.md`).
+> The old always-on 320x180 "self-preview" branch is gone; since #78 a valve-gated live preview branch
+> feeds the sharer's own tile while the window is focused (`superdoc/features/self-preview.md`, and "Own-tile
+> live preview" below).
 
 **Added 2026-07-26.** The feature set built in the second stage of the original three-stage UI
 plan (`superdoc/ui/APP-SHELL.md`): starting and editing outgoing streams, **multi-destination
@@ -31,14 +32,14 @@ One capture is **one screen grab, one GStreamer pipeline, N destinations**:
 GPU domain (Linux portal + VA stack, the normal case; 2026-10-14, #39):
 pipewiresrc(DMA-BUF) ! vapostproc(video-direction=auto) ! VAMemory NV12 ! tee
     ├─ queue ! videorate(1fps)  ! vapostproc ! BGRx ! videoconvert ! RGB ! appsink   (JPEG thumbnails, fixed)
-    ├─ queue ! videorate(12fps) ! vapostproc(320x180) ! BGRx ! videoconvert ! RGB ! appsink   (self-preview, fixed; UNUSED, see self-preview.md)
+    ├─ valve[closed unless the window is focused] ! queue ! videorate(30fps) ! vapostproc(<=640x360) ! RGBA ! appsink(async=false)   (own-tile live preview, #78)
     ├─ queue ! valve[RateCap] ! vapostproc ! VAMemory NV12 ! capssetter(fps) ! va*enc ! appsink   ← destination A (room 1)
     └─ queue ! valve[RateCap] ! vapostproc ! VAMemory NV12 ! capssetter(fps) ! va*enc ! appsink   ← destination B (room 2)
 
 System domain (Windows, x264enc machines, tests):
 <platform source> ! videoconvert ! capsfilter(format=BGRx) ! tee
     ├─ queue ! videorate(1fps)  ! RGB ! appsink   (JPEG thumbnails, fixed)
-    ├─ queue ! videorate(12fps) ! videoscale(320x180) ! RGB ! appsink   (sender self-preview, fixed; UNUSED, see self-preview.md)
+    ├─ valve[closed unless the window is focused] ! queue ! videorate(30fps) ! videoscale ! videoconvert ! RGBA(<=640x360) ! appsink(async=false)   (own-tile live preview, #78)
     ├─ queue ! valve[RateCap] ! videoconvert ! videoscale ! capssetter(fps) ! encoder ! appsink   ← destination A (room 1)
     └─ queue ! valve[RateCap] ! videoconvert ! videoscale ! capssetter(fps) ! encoder ! appsink   ← destination B (room 2)
 ```
@@ -70,6 +71,51 @@ per destination gives each branch exactly one owner and lets a swap be `await`ed
 the UI thread ever blocking. The capture keeps one task of its own
 (`capture_loop`) for the two things that genuinely are per capture: the pipeline bus and
 the self-preview branch.
+
+---
+
+## Own-tile live preview (task #78, 2026-10-15)
+
+*Why (user request 2026-10-15):* "For the sharer, it should show a stream preview, while he is tabbed into
+the program. Otherwise, its fine to hide it." Design, code map and the appsink `async=false` trap:
+`superdoc/features/self-preview.md`. In short: one valve-gated tee branch per capture
+(`capture.rs` `live_branch`, `LivePreview`, `CaptureHandle::set_live_preview`), <= 640x360 at <= 30 fps RGBA,
+open only while the egui window is focused and the own tile was painted within 0.6 s; closed it is a pad call
+and an unref per frame. The encode branches are not touched.
+
+**Measured cost (2026-10-15, headless rig, stock xdpw, GPU domain, H.265 240 fps balanced, `vkcube` at 240 Hz; the
+sharer window focused or not by `swaymsg '[pid=..] focus'` with a held `wtype` giving the seat a keyboard, see below):**
+
+| state | viewer tooltip, 3 samples (decoded / shown fps, dropped) | sharer process CPU (`top`, 3 s) | live branch sink counter |
+| --- | --- | --- | --- |
+| sharer unfocused (valve closed) | 234/233, 240/240, 234/234; 0 dropped | 9 % | frozen (126 -> 126 over 12.7 s) |
+| sharer focused (preview on) | 236/235, 234/233, 234/233; 0 dropped | 14 % | 30 fps (331 frames in 11.0 s) |
+| unfocused again | 233/232, 238/238, 234/233; 0 dropped | 9 % | frozen (457 -> 457 over 10.1 s) |
+
+The preview does not move the share's numbers (about 234 fps H.265 at 240 in all three states); it costs about 5
+points of one core while it runs (30 fps scale + download + RGBA upload + 30 fps egui repaint), nothing when closed.
+Refocus to a picture on screen: under 0.3 s (the screenshot 0.3 s after `focus` already shows the preview). Screenshots:
+the #78 worker's scratchpad (`t78_B_sharer_1.png` / `_2.png` one second apart show the cube moved, `t78_C_...` the
+placeholder).
+
+**Three traps found building it (covered by `capture::branch::tests::live_*` where a test can see them):**
+- *A sink behind a closed valve stalls the whole capture* unless it is `async=false` (preroll), see
+  `self-preview.md`.
+- *`videorate drop-only` does not cap a variable-rate portal source:* with the portal's `framerate=0/1` the branch
+  delivered 240 fps through `videorate ! framerate=30/1` (counter at the sink). The live branch therefore uses a
+  `branch::RateCap` probe on its valve instead (30.1 fps measured). **Not fixed here, flagged:** the existing 1 fps
+  room-preview branch (`preview_sink`, `videorate drop-only ! ... framerate=1/1`) has the same shape and is probably
+  also running at the full source rate through its GPU download (`vapostproc ! BGRx ! videoconvert`); check its
+  buffer rate before trusting its "1 fps" cost.
+- *`vapostproc ! video/x-raw,format=RGBA` writes A,B,G,R bytes on this stack* (solid-colour test: RGBA gave
+  `ff 35 2c f9`, BGRA the correct `35 2c f9 ff`): the whole preview was red. The branch asks for BGRA and
+  `sample_to_live_frame` swizzles to RGBA.
+
+**Testing note (rig):** a headless sway seat without a keyboard never sends `wl_keyboard.enter`, so egui never sees
+focus (`viewport().focused` stays false, preview never opens). Give the seat a keyboard for the whole run with a held
+`hs-rig.sh run -- wtype -P Shift_L -s <ms> -p Shift_L` (record its PID, stop only that), then move focus with
+`swaymsg '[pid=<client pid>] focus'`.
+
 
 ---
 
