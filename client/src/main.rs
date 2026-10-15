@@ -188,12 +188,16 @@ fn run() -> anyhow::Result<()> {
     } else {
         simple_screensharing_client::rooms::AppSettings::load().presentation_mode
     };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([1280.0, 800.0])
+        .with_min_inner_size([960.0, 600.0])
+        .with_title("Simple Screensharing")
+        .with_app_id(app_id());
+    if let Some(icon) = ui::app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1280.0, 800.0])
-            .with_min_inner_size([960.0, 600.0])
-            .with_title("Simple Screensharing")
-            .with_app_id(app_id()),
+        viewport,
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: wgpu_configuration(presentation_mode),
         ..Default::default()

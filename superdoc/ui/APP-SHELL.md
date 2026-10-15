@@ -123,6 +123,20 @@ At most one popover (`Nav.popover`, anchored to the button's rect) and one modal
 modal; Escape, x and a backdrop click close every modal. Toasts are painted last by
 `mod.rs` (2.6 s).
 
+**"Live in <room>" toast fires when a room goes on air, not on Go live** (2026-10-15, task #73).
+`App::poll` compares `Cx::on_air_rooms()` with `Shell.announced_live` (`newly_on_air`): a room
+that is only Starting, or whose start failed (the destination is forgotten and the error toast
+shown), never gets it. *Why:* it used to fire inside `UiAction::GoLive`, so a share that failed to
+start showed "Live in Test" above the "Share error" toast (the user's WinBoat run, a missing
+GStreamer element). Test: `live_in_toast_fires_once_per_on_air_spell`.
+
+**Window icon** (2026-10-15): `ui::app_icon()` (`client/assets/icon.png`, the `docs/assets/icon.svg`
+favicon rasterised once to 256 px with `rsvg-convert`) is set with `with_icon` on the main and the
+pop-out viewports. *Why:* on Windows (and X11) eframe's default "e" showed in the title bar and
+taskbar. Wayland takes the icon from `app_id` + the .desktop file, so it is harmless there. The
+exe file itself (Explorer, shortcuts) has no embedded icon resource: that needs a build-time
+resource compiler (`winresource`/`embed-resource` + an `.ico`), not added.
+
 **The stream-settings modal keeps one height whether "Advanced tuning" is open or closed**
 (2026-10-15). While collapsed, `encoder_card` reserves the rows' height as empty space *below*
 the Encoder card (`adv_rows_height`: the rows laid out once in an invisible, non-advancing child

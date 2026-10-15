@@ -9,6 +9,7 @@ queue
 tee
 valve
 capsfilter
+capssetter
 videoconvert
 videoscale
 videorate

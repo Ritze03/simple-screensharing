@@ -130,13 +130,17 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut PopoutState) {
         }
         let title = format!("{} · {}", cx.member_name(key.0, key.1), cx.room_name(key.0));
         let shared = win.shared.clone();
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title(title)
+            .with_inner_size(win.size)
+            .with_min_inner_size([320.0, 180.0])
+            .with_app_id("simple-screensharing-popout");
+        if let Some(icon) = super::app_icon() {
+            builder = builder.with_icon(icon);
+        }
         ctx.show_viewport_deferred(
             id,
-            egui::ViewportBuilder::default()
-                .with_title(title)
-                .with_inner_size(win.size)
-                .with_min_inner_size([320.0, 180.0])
-                .with_app_id("simple-screensharing-popout"),
+            builder,
             move |ctx, _class| viewport(ctx, &shared),
         );
     }
