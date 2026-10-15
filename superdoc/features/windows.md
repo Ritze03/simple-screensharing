@@ -66,6 +66,28 @@ the build fails if one is missing.
 Why curated: GStreamer's `bin\` is 620 MB and its plugins 1 GB; the client needs about 20 plugins.
 Same decision as the Linux AppImage.
 
+**No console window (2026-10-15).** The release exe is a Windows GUI-subsystem binary
+(`client/src/main.rs`: `#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]`;
+check: `dumpbin /headers <exe> | findstr subsystem` says `Windows GUI`). Debug builds stay console
+binaries for `cargo run`. Consequences, all handled in `main.rs`:
+
+- stderr no longer exists, so `init_logging` appends the `tracing` log to
+  `%LOCALAPPDATA%\simple-screensharing\client.log` (truncated when over 1 MB; stderr if the file cannot be opened).
+  A panic hook and an `Err` returned from `main` are written to the same file, since their default output also
+  goes to stderr. **A startup failure on a user's machine: read that file.** (Not a logging system: just where
+  the existing output lands.)
+- `--help` / bad-argument output: `attach_parent_console` attaches to the launching terminal's console when the
+  process has no stdout handle (a plain cmd/PowerShell prompt). With stdout redirected (`> file`, a pipe, ssh) the
+  inherited handle is used; attaching in that case replaced the handles and lost the output (seen over SSH).
+  Exit codes are unchanged (`--help` 0, bad argument 2). `--gallery` is unaffected.
+
+Why: the user double-clicked the exe in the WinBoat VM on 2026-10-15 and a black Windows Terminal tab opened next to
+the window. A shipped GUI app must not show a console.
+
+Where the output lands for the user: after `package.ps1`, the folder and the zip are also copied to the VM user's
+Desktop (`C:\Users\mo\Desktop\simple-screensharing-windows\` and `...\simple-screensharing-windows.zip`) so it can be
+started by double-click; the zip is also copied back to the Linux repo's `dist\` (gitignored).
+
 What an installer would take (not done): wrap that folder with Inno Setup or WiX (Start Menu shortcut,
 per-user install under `%LOCALAPPDATA%\Programs`, uninstaller), and Authenticode-sign the exe and the
 installer, otherwise SmartScreen warns on first start. The zip is the "friends" distribution until then.
@@ -101,6 +123,24 @@ cargo run --release -p simple-screensharing-client --example test_viewer -- \
 The viewer prints one line per second (decoder element, codec, decoded fps, received kbit/s). `--from` filters by the
 sender's display name: a killed sender leaves a stale stream in the room until the relay times it out, and the
 viewer would otherwise pick that one.
+
+## Reaching the VM and syncing the sources (agents; SSH only, never the WinBoat window)
+
+- **SSH**: `ssh -i ~/.ssh/winboat mo@172.18.0.2` (the WinBoat container's address; it NATs port 22 on to the guest;
+  `172.30.0.2` refuses). The user/password are in `~/.winboat/docker-compose.yml` (`USERNAME`). The login shell is
+  **cmd.exe**; the host key changes with the VM, so use `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null`.
+  `scp` works the same (`scp -i ~/.ssh/winboat file mo@172.18.0.2:C:/Users/mo/tmp/file`). `tar`, `git` and `scp`
+  are on the VM.
+- **Sources**: `C:\sss-src` is a plain copy of the workspace, **not a git checkout**. Refresh it with
+  `tar -cf src.tar client protocol server Cargo.toml Cargo.lock` on Linux (from the repo/worktree root), `scp` it,
+  then `rmdir /s /q C:\sss-src & mkdir C:\sss-src & tar -xf <tar> -C C:\sss-src`. A single changed file can just be
+  `scp`-ed over its twin.
+- **Build and package**: `cd /d C:\sss-src` then `build.ps1 -TargetDir C:\sss-target`, `package.ps1` (output
+  `C:\sss-src\dist\`). Long commands are easiest as a `.cmd` file `scp`-ed over and run in one `ssh` call (quoting
+  through two shells is fragile). Check `tasklist` first: do not overwrite an exe the user is running
+  (`C:\sss-target`); build into another `-TargetDir` then.
+- Do not start the GUI over SSH expecting a window (session 0, no display): it logs to `client.log` and exits 101 at
+  swapchain creation (`0x887A0022`), which is also the quickest way to check that logging works.
 
 ## Running a relay for a Windows VM (WinBoat network facts)
 
