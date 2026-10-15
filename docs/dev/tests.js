@@ -10,7 +10,7 @@ import { NonceSequence, NonceSpaceExhausted, buildAad, buildNonce, decryptFrame,
 import { Reassembler, fragmentFrame } from "../js/core/fragment.js";
 import { deriveCodecString, sniffCodec } from "../js/core/codec.js";
 import { DECODE_QUEUE_CATCHUP_THRESHOLD, JitterBuffer, MAX_DECODE_QUEUE, clampCatchUpSpeedPercent, clampMaxJitterBufferMs } from "../js/core/jitter.js";
-import { VideoReceiver } from "../js/core/video-rx.js";
+import { CanvasRenderer, VideoReceiver } from "../js/core/video-rx.js";
 import { ENCODER_PRESETS } from "../js/core/video-tx.js";
 
 const tests = [];
@@ -639,6 +639,68 @@ test("video receiver: a decoder slower than the stream keeps bounded latency (dr
   ok(rx.jb.catchUpDropped > 100, `catch-up dropped delta runs to keyframes (${rx.jb.catchUpDropped})`);
 });
 
+test("video receiver: on the first decoder overload a Gecko-style receiver re-configures the decoder without optimizeForLatency (once, at a keyframe)", async () => {
+  const { codec } = await vec();
+  const keyAu = hexToBytes(codec.find((c) => c.name === "vah264enc").auHex);
+  const delta = new Uint8Array([0, 0, 0, 1, 0x41, 1, 2, 3, 4, 5, 6, 7, 8]);
+  const configs = []; // { optimizeForLatency, nextIsKey }
+  const make = () =>
+    class SlowDecoder {
+      static async isConfigSupported() {
+        return { supported: true };
+      }
+      constructor({ output }) {
+        this.output = output;
+        this.state = "unconfigured";
+        this.decodeQueueSize = 0;
+        this.q = [];
+        this.timer = setInterval(() => {
+          const c = this.q.shift(); // ~100 fps decoder
+          if (!c) return;
+          this.decodeQueueSize--;
+          this.output({ displayWidth: 1, displayHeight: 1, close() {} });
+          if (this.ondequeue) this.ondequeue();
+        }, 10);
+      }
+      configure(cfg) {
+        this.state = "configured";
+        configs.push({ optimizeForLatency: cfg.optimizeForLatency });
+        this.sinceConfigure = 0;
+      }
+      decode(chunk) {
+        if (this.sinceConfigure === 0 && chunk.type !== "key" && configs.length > 1) fail("first chunk after a re-configure was not a keyframe");
+        this.sinceConfigure++;
+        this.q.push(chunk);
+        this.decodeQueueSize++;
+      }
+      close() {
+        this.state = "closed";
+        clearInterval(this.timer);
+      }
+    };
+  const feed = async (rx) => {
+    const periodMs = 4;
+    const t0 = performance.now();
+    let n = 0;
+    while (performance.now() - t0 < 2000) {
+      const due = Math.floor((performance.now() - t0) / periodMs);
+      while (n <= due) {
+        rx.pushFrame({ ptsUs: n * periodMs * 1000, keyframe: n % 50 === 0, payload: n % 50 === 0 ? keyAu : delta });
+        n++;
+      }
+      await new Promise((r) => setTimeout(r, 2));
+    }
+    rx.close();
+  };
+  const events = [];
+  await feed(new VideoReceiver({ onFrame: (f) => f.close(), onEvent: (t) => events.push(t), DecoderClass: make(), maxJitterBufferMs: 0, adaptiveLatency: true }));
+  eq(configs.map((c) => c.optimizeForLatency), [true, false], "decoder configs: low-latency first, then once without");
+  ok(events.includes("decoder-mode"), "decoder-mode event emitted");
+  configs.length = 0;
+  await feed(new VideoReceiver({ onFrame: (f) => f.close(), DecoderClass: make(), maxJitterBufferMs: 0, adaptiveLatency: false }));
+  eq(configs.map((c) => c.optimizeForLatency), [true], "non-adaptive receivers never change the decoder config");
+});
+
 test("jitter: reset() clears queue and pacing anchor", () => {
   const jb = new JitterBuffer();
   jb.push("x", { ptsUs: 5_000_000, keyframe: true }, 10);
@@ -722,6 +784,64 @@ test("reverse vectors: JS-made frames/previews/control messages/links for Rust t
   reverse.links.push({ link: room.link, roomIdHex: bytesToHex(room.roomId), roomKeyHex: bytesToHex(room.roomKey) });
   window.__reverse = reverse;
   ok(reverse.frames.length === sizes.length);
+});
+
+test("canvas renderer: WebGL and 2D backends draw the same upright picture; a cropped frame draws only its visible rect", async () => {
+  if (typeof VideoFrame === "undefined") return; // no WebCodecs in this browser: nothing to render
+  const src = new OffscreenCanvas(64, 48);
+  const c = src.getContext("2d");
+  c.fillStyle = "#ff0000"; c.fillRect(0, 0, 32, 24); //   top-left red
+  c.fillStyle = "#00ff00"; c.fillRect(32, 0, 32, 24); //  top-right green
+  c.fillStyle = "#0000ff"; c.fillRect(0, 24, 32, 24); //  bottom-left blue
+  c.fillStyle = "#ffffff"; c.fillRect(32, 24, 32, 24); // bottom-right white
+  const render = async (opts, mk) => {
+    const canvas = document.createElement("canvas");
+    const r = new CanvasRenderer(canvas, { preserveDrawingBuffer: true, ...opts });
+    r.present(mk());
+    for (let i = 0; i < 100 && !r.drawn; i++) await new Promise((res) => setTimeout(res, 20));
+    ok(r.drawn === 1, `${JSON.stringify(opts)} drew ${r.drawn} frames`);
+    const probe = document.createElement("canvas");
+    probe.width = canvas.width;
+    probe.height = canvas.height;
+    const pc = probe.getContext("2d");
+    pc.drawImage(canvas, 0, 0);
+    const at = (x, y) => Array.from(pc.getImageData(x, y, 1, 1).data.slice(0, 3));
+    const out = { backend: r.backend, w: canvas.width, h: canvas.height, at };
+    r.stop();
+    return out;
+  };
+  const near = (a, b) => a.every((v, i) => Math.abs(v - b[i]) <= 6);
+  {
+    // The pop-out moves the tile's canvas into another document (Document PiP / fullscreen stage): the renderer must keep drawing there.
+    const iframe = document.body.appendChild(document.createElement("iframe"));
+    const canvas = document.createElement("canvas");
+    const r = new CanvasRenderer(canvas, { preserveDrawingBuffer: true, webgl: "force" });
+    r.present(new VideoFrame(src, { timestamp: 0 }));
+    for (let i = 0; i < 100 && !r.drawn; i++) await new Promise((res) => setTimeout(res, 20));
+    iframe.contentDocument.body.appendChild(iframe.contentDocument.adoptNode(canvas));
+    r.present(new VideoFrame(src, { timestamp: 1 }));
+    for (let i = 0; i < 100 && r.drawn < 2; i++) await new Promise((res) => setTimeout(res, 20));
+    const probe = document.createElement("canvas").getContext("2d");
+    probe.canvas.width = 64;
+    probe.canvas.height = 48;
+    probe.drawImage(canvas, 0, 0);
+    ok(r.drawn === 2 && near(Array.from(probe.getImageData(8, 6, 1, 1).data.slice(0, 3)), [255, 0, 0]), `${r.backend}: drawing continues after the canvas moved to another document (drawn ${r.drawn})`);
+    r.stop();
+    iframe.remove();
+  }
+  for (const opts of [{ webgl: "force" }, { webgl: false }]) {
+    const o = await render(opts, () => new VideoFrame(src, { timestamp: 0 }));
+    if (opts.webgl === "force" && document.createElement("canvas").getContext("webgl2")) eq(o.backend, "webgl", "forced WebGL backend");
+    eq([o.w, o.h], [64, 48], `${o.backend} size`);
+    ok(near(o.at(8, 6), [255, 0, 0]), `${o.backend}: top-left should be red, got ${o.at(8, 6)}`);
+    ok(near(o.at(56, 6), [0, 255, 0]), `${o.backend}: top-right should be green, got ${o.at(56, 6)}`);
+    ok(near(o.at(8, 42), [0, 0, 255]), `${o.backend}: bottom-left should be blue, got ${o.at(8, 42)}`);
+    ok(near(o.at(56, 42), [255, 255, 255]), `${o.backend}: bottom-right should be white, got ${o.at(56, 42)}`);
+    const cropped = await render(opts, () => new VideoFrame(new VideoFrame(src, { timestamp: 0 }), { visibleRect: { x: 32, y: 0, width: 32, height: 48 } }));
+    eq([cropped.w, cropped.h], [32, 48], `${cropped.backend} cropped size`);
+    ok(near(cropped.at(8, 6), [0, 255, 0]), `${cropped.backend}: cropped top-left should be green, got ${cropped.at(8, 6)}`);
+    ok(near(cropped.at(8, 42), [255, 255, 255]), `${cropped.backend}: cropped bottom-left should be white, got ${cropped.at(8, 42)}`);
+  }
 });
 
 // ------------------------------------------------------------------------------------------------ runner

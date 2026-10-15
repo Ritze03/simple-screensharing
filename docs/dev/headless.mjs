@@ -15,7 +15,7 @@
 
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -100,7 +100,67 @@ const DEFAULT_FLAGS = [
   "--enable-features=WebCodecs,WebTransport",
 ];
 
-export function launchChromium(url, { flags = [], userDataDir, bin = "/usr/bin/chromium" } = {}) {
+// BROWSER=firefox runs the same pages in the system Firefox (Gecko engine, same one as Floorp), always headless, with a throwaway
+// profile under <repo>/target/ff-profiles (never /tmp: tmpfs; never the user's profile). `--flag` values are `pref=value` lines
+// for the profile's user.js (e.g. `--flag layout.frame_rate=240`). Added 2026-10-15 (task #67: Firefox stalls above 60 fps).
+const FIREFOX_PREFS = {
+  "browser.shell.checkDefaultBrowser": false,
+  "datareporting.policy.dataSubmissionEnabled": false,
+  "toolkit.telemetry.reportingpolicy.firstRun": false,
+  "app.update.auto": false,
+  "app.update.enabled": false,
+  "browser.tabs.warnOnClose": false,
+  "dom.webtransport.enabled": true,
+  "dom.media.webcodecs.enabled": true,
+  "media.autoplay.default": 0,
+  "dom.min_background_timeout_value": 4,
+  "dom.timeout.background_throttling_max_budget": -1,
+};
+function launchFirefox(url, { flags = [], userDataDir, bin = process.env.FIREFOX_BIN || "/usr/bin/firefox" } = {}) {
+  const root = join(HERE, "..", "..", "target", "ff-profiles");
+  mkdirSync(root, { recursive: true });
+  const dir = userDataDir || mkdtempSync(join(root, "p-"));
+  const prefs = { ...FIREFOX_PREFS };
+  for (const f of flags) {
+    const i = f.indexOf("=");
+    if (i < 0 || f.startsWith("--")) continue; // Chromium switches are ignored
+    const v = f.slice(i + 1);
+    prefs[f.slice(0, i)] = v === "true" ? true : v === "false" ? false : /^-?\d+$/.test(v) ? Number(v) : v;
+  }
+  writeFileSync(join(dir, "user.js"), Object.entries(prefs).map(([k, v]) => `user_pref(${JSON.stringify(k)}, ${JSON.stringify(v)});`).join("\n") + "\n");
+  // HEADED=1 (rig only, like Chromium below): a real window on the rig's sway, needed for the GPU/VAAPI decode path.
+  if (process.env.HEADED && !process.env.SSS_GUI_LOCKED) throw new Error("HEADED=1 runs only inside the headless sway rig (see launchChromiumBin)");
+  const env = { ...process.env };
+  if (process.env.HEADED) env.MOZ_ENABLE_WAYLAND = "1";
+  else env.MOZ_HEADLESS = "1";
+  const proc = spawn(bin, [...(process.env.HEADED ? [] : ["--headless"]), "-no-remote", "-profile", dir, url], { stdio: ["ignore", "ignore", "pipe"], env });
+  let stderr = "";
+  proc.stderr.on("data", (d) => (stderr += d));
+  return {
+    proc,
+    get stderr() {
+      return stderr;
+    },
+    kill() {
+      try {
+        proc.kill("SIGKILL");
+      } catch {}
+      if (!userDataDir) {
+        try {
+          rmSync(dir, { recursive: true, force: true });
+        } catch {}
+      }
+    },
+  };
+}
+
+export function launchChromium(url, opts = {}) {
+  const browser = opts.browser || process.env.BROWSER;
+  if (browser === "firefox") return launchFirefox(url, opts);
+  return launchChromiumBin(url, opts);
+}
+
+function launchChromiumBin(url, { flags = [], userDataDir, bin = "/usr/bin/chromium" } = {}) {
   const dir = userDataDir || mkdtempSync(join(tmpdir(), "ssshare-chromium-"));
   // HEADED=1 drops --headless (real window; only ever do this on a monitor you own, see the testing notes) - needed for GPU video paths.
   if (process.env.HEADED && !process.env.SSS_GUI_LOCKED) {
