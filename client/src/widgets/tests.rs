@@ -113,7 +113,7 @@ fn rows_of_a_type_align_and_share_height() {
                     &RoomRow { lead: RoomLead::Dot(DotState::Joined), name, live: LiveSlot::Off, num, unit: Unit::None, selected: false },
                 );
                 sharer_row(ui, &SharerRow { icon: "cast", tone: IconTone::Live, name, num: Some(240), unit: "fps" });
-                person_row(ui, &PersonRow { name, color: theme::avatar_color(name), you: None, live: true, live_label: "Live", watching: true, idle: false, stale: false });
+                person_row(ui, &PersonRow { name, colors: theme::avatar_colors(name), you: None, live: true, live_label: "Live", watching: true, idle: false, stale: false });
                 dest_row(ui, &DestRow { current: false, name, note: "this room", remove_tip: "Stop", pill: Pill::live("Live"), kbps: "6000 kbps", removable: true });
                 pop_item(ui, &PopItem::new("speaker", name).meter(2));
             }
@@ -170,4 +170,71 @@ fn grid_rows_pad_short_rows() {
     assert!(rs.iter().all(|r| r.len() == 3));
     let w = rs[0][0].rect.width();
     assert!(rs.iter().flatten().all(|s| (s.rect.width() - w).abs() < 1e-3));
+}
+
+/// Offset (physical px) of the tessellated initial's glyph quad centre from the
+/// tessellated disc's centre, for an avatar of `size` whose rect starts at a
+/// fractional position `frac`, at `ppp` pixels per point.
+fn avatar_ink_offset(ppp: f32, size: f32, frac: f32, initial: &str, old: bool) -> (f32, f32) {
+    use egui::epaint::{Primitive, WHITE_UV};
+    let ctx = egui::Context::default();
+    theme::apply(&ctx);
+    ctx.set_pixels_per_point(ppp);
+    let mut out = None;
+    for _ in 0..2 {
+        let input = RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(200.0, 200.0))), ..Default::default() };
+        out = Some(ctx.run(input, |ctx| {
+            CentralPanel::default().frame(Frame::NONE).show(ctx, |ui| {
+                let r = Rect::from_min_size(egui::pos2(10.0 + frac, 20.0 + frac), vec2(size, size));
+                if old {
+                    // The pre-#83 placement: line box centred by `paint_text`.
+                    ui.painter().rect_filled(r, egui::CornerRadius::same((size / 2.0) as u8), egui::Color32::RED);
+                    let fs = if size <= theme::AVATAR_SM { 10.5 } else { 13.0 };
+                    paint_text(ui, r, initial, theme::font(theme::Weight::Bold, fs), egui::Color32::WHITE, egui::Align::Center);
+                } else {
+                    paint_avatar(ui, r, initial, theme::avatar_colors("Ritze"), false);
+                }
+            });
+        }));
+    }
+    let out = out.unwrap();
+    let (mut disc, mut ink) = (Rect::NOTHING, Rect::NOTHING);
+    for p in ctx.tessellate(out.shapes, out.pixels_per_point) {
+        if let Primitive::Mesh(m) = p.primitive {
+            for v in &m.vertices {
+                if v.uv == WHITE_UV { disc.extend_with(v.pos) } else { ink.extend_with(v.pos) }
+            }
+        }
+    }
+    assert!(disc.is_positive() && ink.is_positive());
+    let d = (ink.center() - disc.center()) * ppp;
+    (d.x, d.y)
+}
+
+/// Task #83: the initial sits on the disc's centre, within the pixel that
+/// whole-pixel text forces (vertically resolved upwards, never low), wherever
+/// the avatar lands between pixels and at every scale factor. The old placement
+/// (`paint_text` centring the line box, disc and text snapped independently)
+/// moved by 1 px with the sub-pixel position (2.5 px for "Ä" at 1.25x).
+#[test]
+fn avatar_initial_is_centred_on_the_disc_at_any_position_and_scale() {
+    let mut worst_old_spread: f32 = 0.0;
+    for ppp in [1.0, 1.25, 1.5, 2.0] {
+        for size in [theme::AVATAR, theme::AVATAR_SM] {
+            for initial in ["R", "M", "W", "Ä", "G"] {
+                let (mut lo, mut hi, mut olo, mut ohi) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+                for frac in [0.0, 0.25, 0.5, 0.75] {
+                    let (dx, dy) = avatar_ink_offset(ppp, size, frac, initial, false);
+                    assert!(dx.abs() <= 1.01 && dy <= 0.01 && dy > -1.01, "ppp {ppp} size {size} {initial:?} frac {frac}: ({dx},{dy})");
+                    (lo, hi) = (lo.min(dy), hi.max(dy));
+                    let (_, ody) = avatar_ink_offset(ppp, size, frac, initial, true);
+                    (olo, ohi) = (olo.min(ody), ohi.max(ody));
+                }
+                assert!(hi - lo <= 0.51, "ppp {ppp} size {size} {initial:?}: dy spread {lo}..{hi}");
+                worst_old_spread = worst_old_spread.max(ohi - olo);
+            }
+        }
+    }
+    // Guard the measurement itself: it does see the old drift.
+    assert!(worst_old_spread >= 0.99, "old spread {worst_old_spread}");
 }

@@ -133,12 +133,20 @@ pub const OV_HBOX: Color32 = rgba(232, 163, 61, 0.85);
 pub const OV_SLOT: Color32 = rgba(80, 200, 120, 0.9);
 pub const OV_FILL: Color32 = rgba(200, 200, 210, 0.45);
 
-/// Avatar saturation / lightness (HSL). `Why` L = 34 %: white initials need >= 3:1
-/// at every hue, and the worst hue is yellow (60 deg, contrast 3.6:1 here; at
-/// L = 45 % it would be 2.3:1). One S/L for all hues keeps the whole circle
-/// equally calm. Cross-client contract, see `superdoc/ui/STYLING-GUIDE.md`.
+/// Avatar gradient (HSL), a 140 deg fade like the pre-#77 avatars: stop A
+/// (top-left) = `HSL(hue, 60 %, 36 %)`, stop B (bottom-right) =
+/// `HSL(hue - 10, 60 %, 24 %)`. `Why` L_A = 36 %: white initials need >= 3:1
+/// against the *lighter* stop at every hue; the worst hue is yellow (60 deg,
+/// 3.26:1 here; 37 % would give 3.10:1, 40 % 2.68:1). The darker stop and the
+/// small hue shift give the fade its depth (the old gradients went light to
+/// dark with a few degrees of hue drift). Cross-client contract, see
+/// `superdoc/ui/STYLING-GUIDE.md`.
 const AVATAR_SAT: f64 = 0.60;
-const AVATAR_LIGHT: f64 = 0.34;
+const AVATAR_LIGHT_A: f64 = 0.36;
+const AVATAR_LIGHT_B: f64 = 0.24;
+const AVATAR_HUE_SHIFT_B: u32 = 350; // i.e. -10 deg
+/// CSS angle of the avatar gradient (`linear-gradient(140deg, A, B)`).
+pub const AVATAR_GRADIENT_DEG: f32 = 140.0;
 
 /// Hue (0..360 degrees) of a person's avatar: FNV-1a 32-bit over the
 /// UTF-8 bytes of the trimmed, lowercased display name, modulo 360. A pure
@@ -152,16 +160,23 @@ pub fn avatar_hue(name: &str) -> u32 {
     h % 360
 }
 
-/// Avatar background (flat) for `name`: `HSL(avatar_hue, 60 %, 34 %)`.
-pub fn avatar_color(name: &str) -> Color32 {
-    let h = f64::from(avatar_hue(name));
-    let a = AVATAR_SAT * AVATAR_LIGHT.min(1.0 - AVATAR_LIGHT);
+/// CSS `hsl()` to 8-bit sRGB, each channel `round(255 * v)` (same as `dom.js` `hslHex`).
+fn hsl_rgb(hue: u32, s: f64, l: f64) -> Color32 {
+    let h = f64::from(hue);
+    let a = s * l.min(1.0 - l);
     let f = |n: f64| {
         let k = (n + h / 30.0) % 12.0;
-        let v = AVATAR_LIGHT - a * (-1.0_f64).max((k - 3.0).min(9.0 - k).min(1.0));
+        let v = l - a * (-1.0_f64).max((k - 3.0).min(9.0 - k).min(1.0));
         (255.0 * v).round() as u8
     };
     Color32::from_rgb(f(0.0), f(8.0), f(4.0))
+}
+
+/// Avatar gradient stops `[A, B]` for `name` (A lighter, top-left; B darker,
+/// bottom-right), painted at [`AVATAR_GRADIENT_DEG`].
+pub fn avatar_colors(name: &str) -> [Color32; 2] {
+    let h = avatar_hue(name);
+    [hsl_rgb(h, AVATAR_SAT, AVATAR_LIGHT_A), hsl_rgb((h + AVATAR_HUE_SHIFT_B) % 360, AVATAR_SAT, AVATAR_LIGHT_B)]
 }
 
 // ---------------------------------------------------------------------------
@@ -697,36 +712,46 @@ mod tests {
     /// Cross-client contract: `docs/dev/tests.js` asserts the same table.
     #[test]
     fn avatar_colour_vectors_match_the_browser() {
-        let v: [(&str, u32, [u8; 3]); 9] = [
-            ("Ritze", 177, [0x23, 0x8b, 0x86]),
-            ("mo", 245, [0x2b, 0x23, 0x8b]),
-            ("client-1", 144, [0x23, 0x8b, 0x4c]),
-            ("client-2", 321, [0x8b, 0x23, 0x66]),
-            ("Zed", 4, [0x8b, 0x2a, 0x23]),
-            ("user-d740", 328, [0x8b, 0x23, 0x5a]),
-            ("Größe", 314, [0x8b, 0x23, 0x72]),
-            ("", 61, [0x89, 0x8b, 0x23]),
-            ("  Mo ", 245, [0x2b, 0x23, 0x8b]),
+        let v: [(&str, u32, u32, u32); 9] = [
+            ("Ritze", 177, 0x25938d, 0x186252),
+            ("mo", 245, 0x2e2593, 0x181f62),
+            ("client-1", 144, 0x259351, 0x18622a),
+            ("client-2", 321, 0x93256c, 0x621854),
+            ("Zed", 4, 0x932c25, 0x621820),
+            ("user-d740", 328, 0x93255f, 0x62184c),
+            ("Größe", 314, 0x932579, 0x62185d),
+            ("", 61, 0x919325, 0x625718),
+            ("  Mo ", 245, 0x2e2593, 0x181f62),
         ];
-        for (name, hue, rgb) in v {
+        let rgb = |x: u32| Color32::from_rgb((x >> 16) as u8, (x >> 8) as u8, x as u8);
+        for (name, hue, a, b) in v {
             assert_eq!(avatar_hue(name), hue, "hue of {name:?}");
-            assert_eq!(avatar_color(name), Color32::from_rgb(rgb[0], rgb[1], rgb[2]), "colour of {name:?}");
+            assert_eq!(avatar_colors(name), [rgb(a), rgb(b)], "gradient of {name:?}");
         }
     }
 
-    /// White initials stay readable (>= 3:1, WCAG large/bold text) on every hue.
+    /// White initials stay readable (>= 3:1, WCAG large/bold text) on every hue,
+    /// against both gradient stops (the lighter stop A is the binding one).
     #[test]
     fn avatar_colour_keeps_white_text_readable_on_every_hue() {
         let lin = |c: u8| {
             let c = f64::from(c) / 255.0;
             if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
         };
+        let mut worst = f64::MAX;
         for hue in 0..360u32 {
-            // Any name that hashes to this hue (the colour only depends on the hue).
+            // Any name that hashes to this hue (the colours only depend on the hue).
             let name = (0u32..).map(|i| format!("n{i}")).find(|n| avatar_hue(n) == hue).unwrap();
-            let c = avatar_color(&name);
-            let y = 0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b());
-            assert!(1.05 / (y + 0.05) >= 3.0, "hue {hue}: contrast {}", 1.05 / (y + 0.05));
+            let [a, b] = avatar_colors(&name);
+            for c in [a, b] {
+                let y = 0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b());
+                let k = 1.05 / (y + 0.05);
+                worst = worst.min(k);
+                assert!(k >= 3.0, "hue {hue}: contrast {k}");
+            }
+            // A is the lighter stop (top-left), as in the old gradients.
+            assert!(a.r() as u32 + a.g() as u32 + a.b() as u32 > b.r() as u32 + b.g() as u32 + b.b() as u32, "hue {hue}");
         }
+        assert!(worst >= 3.25, "worst contrast {worst}");
     }
 }

@@ -223,7 +223,7 @@ impl Gallery {
         });
         band(ui, theme::ELEV_14, BandEdge::Top, theme::S3, |ui| {
             let r = HBox::new("user_band", theme::AVATAR).slots(&[fixed(theme::AVATAR), FILL, fixed(theme::CTL_H)]).show(ui);
-            paint_avatar(ui, r.cell(0), "m", theme::avatar_color("mo"), true);
+            paint_avatar(ui, r.cell(0), "m", theme::avatar_colors("mo"), true);
             let c = r.cell(1);
             let top = Rect::from_x_y_ranges(c.x_range(), c.center().y - 15.0..=c.center().y + 1.0);
             let bot = Rect::from_x_y_ranges(c.x_range(), c.center().y + 1.0..=c.center().y + 15.0);
@@ -269,11 +269,11 @@ impl Gallery {
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             let people = [
-                PersonRow { name: "mo", color: theme::avatar_color("mo"), you: Some("you"), live: true, live_label: "Live", watching: false, idle: false, stale: false },
-                PersonRow { name: "Ana", color: theme::avatar_color("Ana"), you: None, live: true, live_label: "Live", watching: true, idle: false, stale: false },
-                PersonRow { name: "Jonas", color: theme::avatar_color("Jonas"), you: None, live: true, live_label: "Live", watching: false, idle: false, stale: false },
-                PersonRow { name: "Mia", color: theme::avatar_color("Mia"), you: None, live: false, live_label: "Live", watching: false, idle: true, stale: false },
-                PersonRow { name: "Maximilian-Alexander", color: theme::avatar_color("Maximilian-Alexander"), you: None, live: true, live_label: "Live", watching: true, idle: false, stale: false },
+                PersonRow { name: "mo", colors: theme::avatar_colors("mo"), you: Some("you"), live: true, live_label: "Live", watching: false, idle: false, stale: false },
+                PersonRow { name: "Ana", colors: theme::avatar_colors("Ana"), you: None, live: true, live_label: "Live", watching: true, idle: false, stale: false },
+                PersonRow { name: "Jonas", colors: theme::avatar_colors("Jonas"), you: None, live: true, live_label: "Live", watching: false, idle: false, stale: false },
+                PersonRow { name: "Mia", colors: theme::avatar_colors("Mia"), you: None, live: false, live_label: "Live", watching: false, idle: true, stale: false },
+                PersonRow { name: "Maximilian-Alexander", colors: theme::avatar_colors("Maximilian-Alexander"), you: None, live: true, live_label: "Live", watching: true, idle: false, stale: false },
             ];
             for p in &people {
                 person_row(ui, p);
@@ -282,8 +282,8 @@ impl Gallery {
         heading(ui, "People (last known)", Some("2"), false);
         ui.vertical(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            person_row(ui, &PersonRow { name: "Noah", color: theme::avatar_color("Noah"), you: None, live: true, live_label: "Live", watching: false, idle: false, stale: true });
-            person_row(ui, &PersonRow { name: "Ivy", color: theme::avatar_color("Ivy"), you: None, live: false, live_label: "Live", watching: false, idle: true, stale: true });
+            person_row(ui, &PersonRow { name: "Noah", colors: theme::avatar_colors("Noah"), you: None, live: true, live_label: "Live", watching: false, idle: false, stale: true });
+            person_row(ui, &PersonRow { name: "Ivy", colors: theme::avatar_colors("Ivy"), you: None, live: false, live_label: "Live", watching: false, idle: true, stale: true });
         });
         heading(ui, "Popup", None, false);
         popup_frame(ui, |ui| {
@@ -452,9 +452,9 @@ impl Gallery {
             status_dot(ui, DotState::Disconnected);
             vsep(ui);
             for n in ["Ritze", "mo", "client-1", "client-2", "Zed"] {
-                avatar(ui, &n[..1], theme::AVATAR_SM, theme::avatar_color(n), false);
+                avatar(ui, &n[..1], theme::AVATAR_SM, theme::avatar_colors(n), false);
             }
-            avatar(ui, "M", theme::AVATAR, theme::avatar_color("mo"), true);
+            avatar(ui, "M", theme::AVATAR, theme::avatar_colors("mo"), true);
             vsep(ui);
             for lit in [0, 2, 4, 5] {
                 meter(ui, lit);
@@ -588,7 +588,7 @@ fn share_card(ui: &mut Ui, who: &str, title: &str, specs: &str) {
                 let row = HBox::new("who", 22.0)
                     .slots(&[fixed(theme::AVATAR_SM), fixed(text_width(ui, who, font(Weight::Bold, 13.5), 0.0)), FILL])
                     .show(ui);
-                paint_avatar(ui, row.cell(0), &who[..1], theme::avatar_color(who), false);
+                paint_avatar(ui, row.cell(0), &who[..1], theme::avatar_colors(who), false);
                 row.text(ui, 1, who, font(Weight::Bold, 13.5), theme::TEXT, Align::Min);
                 row.text(ui, 2, title, font(Weight::Regular, theme::FS_SMALL), theme::TEXT_DIM, Align::Min);
                 let (sr, _) = ui.allocate_exact_size(vec2(ui.available_width(), 16.0), egui::Sense::hover());

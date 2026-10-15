@@ -942,7 +942,7 @@ fn card_info(ui: &mut Ui, info: Rect, who: (&str, &str), title: &str, specs: &st
     let nf = font(Weight::Bold, 13.5);
     let nw = text_width(&c, who.0, nf.clone(), 0.0).ceil().min(inner.width() * 0.6);
     let row = HBox::new("hbox·who", theme::AVATAR_SM).slots(&[fixed(theme::AVATAR_SM), fixed(nw), FILL]).show(&mut c);
-    widgets::paint_avatar(&c, row.cell(0), &initial(who.1), theme::avatar_color(who.1), false);
+    widgets::paint_avatar(&c, row.cell(0), &initial(who.1), theme::avatar_colors(who.1), false);
     row.text(&c, 1, who.0, nf, theme::TEXT, Align::Min);
     row.text(&c, 2, title, font(Weight::Regular, theme::FS_SMALL), theme::TEXT_DIM, Align::Min);
     let row = HBox::new("hbox·specs", 16.0).slots(&[FILL]).show(&mut c);
@@ -1114,11 +1114,11 @@ pub fn show_people(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
             let stale_tip = tr("ui.room.people_stale_tip", "As it was before the connection dropped");
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                let me = PersonRow { name: &cx.state.display_name, color: theme::avatar_color(&cx.state.display_name), you: Some(&you_tag), live: false, live_label: &live_l, watching: false, idle: true, stale: true };
+                let me = PersonRow { name: &cx.state.display_name, colors: theme::avatar_colors(&cx.state.display_name), you: Some(&you_tag), live: false, live_label: &live_l, watching: false, idle: true, stale: true };
                 widgets::person_row(ui, &me).on_hover_text(&stale_tip);
                 for m in &info.members {
                     let live = info.streams.iter().any(|i| i.owner == m.conn_id);
-                    let row = PersonRow { name: &m.display_name, color: theme::avatar_color(&m.display_name), you: None, live, live_label: &live_l, watching: false, idle: !live, stale: true };
+                    let row = PersonRow { name: &m.display_name, colors: theme::avatar_colors(&m.display_name), you: None, live, live_label: &live_l, watching: false, idle: !live, stale: true };
                     widgets::person_row(ui, &row).on_hover_text(&stale_tip);
                 }
             });
@@ -1167,7 +1167,7 @@ pub fn show_people(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
                 ui,
                 &PersonRow {
                     name: &m.display_name,
-                    color: theme::avatar_color(&m.display_name),
+                    colors: theme::avatar_colors(&m.display_name),
                     you: you.then_some(you_tag.as_str()),
                     live,
                     live_label: &live_l,

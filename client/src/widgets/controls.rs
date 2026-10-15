@@ -444,20 +444,44 @@ pub fn paint_status_dot(ui: &Ui, c: egui::Pos2, state: DotState) {
     }
 }
 
-/// A round avatar with `initial`, `size` = `AVATAR` or `AVATAR_SM`, flat
-/// `color` (always `theme::avatar_color(name)`), and an optional green presence dot.
-pub fn avatar(ui: &mut Ui, initial: &str, size: f32, color: Color32, presence: bool) -> Response {
+/// A round avatar with `initial`, `size` = `AVATAR` or `AVATAR_SM`,
+/// `colors` (always `theme::avatar_colors(name)`, a 140 deg gradient), and an
+/// optional green presence dot.
+pub fn avatar(ui: &mut Ui, initial: &str, size: f32, colors: [Color32; 2], presence: bool) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
-    paint_avatar(ui, rect, initial, color, presence);
+    paint_avatar(ui, rect, initial, colors, presence);
     resp
 }
 
-/// Paint an avatar into a square `rect`.
-pub fn paint_avatar(ui: &Ui, rect: Rect, initial: &str, color: Color32, presence: bool) {
+/// Paint an avatar into a square `rect`: the name's gradient and its initial,
+/// centred on the glyph's *ink* (task #83). `Why` not `paint_text`: that
+/// centres the line box (ascent + descent, advance width), not the letter,
+/// and the pixel rounding of that position then put a capital up to 1 px high
+/// or low depending on where the row landed (1 px low in the user's band).
+pub fn paint_avatar(ui: &Ui, rect: Rect, initial: &str, colors: [Color32; 2], presence: bool) {
     let p = ui.painter();
-    p.rect_filled(rect, pill_radius(rect.height()), color);
+    let ppp = ui.ctx().pixels_per_point();
+    // Snap the disc to whole pixels so it and the glyph share one grid.
+    let rect = egui::emath::GuiRounding::round_to_pixels(rect, ppp);
+    paint_gradient(p, rect, pill_radius(rect.height()), theme::AVATAR_GRADIENT_DEG, colors[0], colors[1]);
     let fs = if rect.height() <= theme::AVATAR_SM { 10.5 } else { 13.0 };
-    paint_text(ui, rect, &initial.to_uppercase(), font(Weight::Bold, fs), Color32::WHITE, Align::Center);
+    let g = p.layout_no_wrap(initial.to_uppercase(), font(Weight::Bold, fs), Color32::WHITE);
+    // Vertically: `mesh_bounds` = the glyph quads (the rasterised ink rows, cap
+    // top to baseline for a capital, umlaut dots and descenders included), not
+    // the line box with its descent. Horizontally: the advance box; a capital's
+    // side bearings are balanced, while the quad carries a faint AA column on
+    // one side (measured: +0.5 px, rounding to a visible +1 px). Text is drawn
+    // on whole pixels (the tessellator rounds the galley position), so both are
+    // snapped here against the snapped disc; an odd leftover pixel goes *up*
+    // (floor; the optical centre sits slightly high) instead of wherever the
+    // independent rounding of disc and text happened to land.
+    let ink = g.mesh_bounds;
+    if ink.is_positive() {
+        let x = rect.center().x - g.rect.center().x;
+        let y = rect.center().y - ink.center().y;
+        let pos = pos2((x * ppp).round() / ppp, (y * ppp + 1e-3).floor() / ppp);
+        p.galley(pos, g, Color32::WHITE);
+    }
     if presence {
         // Mockup `.avatar .pres`: a 10 px green dot with a 2 px ring in the user
         // band's `ELEV_14` (content-box, so 14 px outer) at right/bottom -2, i.e.

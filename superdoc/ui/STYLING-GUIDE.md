@@ -159,39 +159,58 @@ number at a call site; if a role is missing, add a named `pub const` to `theme.r
   Stream settings is a modal (not a side panel) because the user found the side panel too
   squished.
 
-## Avatar colour (cross-client contract, task #77, 2026-10-15)
+## Avatar colour (cross-client contract, tasks #77 and #83, 2026-10-15)
 
-An avatar's background is a **pure function of the person's display name**, so one person has the same colour
+An avatar's background is a **pure function of the person's display name**, so one person has the same colours
 in every room, for every viewer, on both clients, across restarts (the old scheme picked one of five gradients
 by connection id, so the colours changed every reconnect). *Why:* user request 2026-10-15 ("fixed, generated
-based on the name ... go through the whole hue"). The native and browser clients must compute **exactly**:
+based on the name ... go through the whole hue"). It is a **140deg gradient** (light top-left to dark bottom-right),
+like the old avatars: *Why (#83, user 2026-10-15):* #77 had made it flat and the user wanted the fade back ("you weren't
+supposed to remove the fade ... there should still be a fade in the background"), with the colours still from the name.
+The native and browser clients must compute **exactly**:
 
 1. key = display name, `trim()`med, Unicode-lowercased (`str::to_lowercase` / `toLowerCase()`), as UTF-8 bytes;
 2. `h` = FNV-1a 32-bit over the bytes (offset 2166136261, prime 16777619, wrapping u32 / `Math.imul(..) >>> 0`);
-3. `hue = h % 360`; colour = HSL(hue, **60 %**, **34 %**), converted with the CSS Color 4 formula
-   (`a = S*min(L,1-L)`, `f(n) = L - a*max(-1, min(k-3, 9-k, 1))`, `k = (n + hue/30) % 12`, channels `round(255*f)`),
-   a flat circle (no gradient), white bold initial.
+3. `hue = h % 360`; stop **A** = HSL(hue, **60 %**, **36 %**), stop **B** = HSL((hue + 350) % 360, **60 %**, **24 %**)
+   (i.e. 10 degrees back, darker), each converted with the CSS Color 4 formula
+   (`a = S*min(L,1-L)`, `f(n) = L - a*max(-1, min(k-3, 9-k, 1))`, `k = (n + hue/30) % 12`, channels `round(255*f)`);
+4. painted as `linear-gradient(140deg, A, B)` (CSS gradient-line length, sRGB interpolation), white bold initial.
 
-*Why S/L 60/34:* the white initial needs >= 3:1 (WCAG, bold text) on every hue and yellow (60 degrees) is the worst;
-at L = 45 % it is 2.3:1, at 34 % it is 3.6:1 (a test checks all 360 hues). A single S/L for all hues keeps the palette
-even. *Consequences:* a person who renames gets a new colour; two names can share a hue (1 in 360); an empty name
-hashes to hue 61. Vectors, asserted by **both** test suites (`client/src/theme.rs`, `docs/dev/tests.js`):
+*Why S/L 60 / 36 / 24 and -10 degrees:* the white initial needs >= 3:1 (WCAG, bold text) against the **lighter** stop on
+every hue, and yellow (60 degrees) is the worst: L_A = 36 % gives 3.26:1 (37 % would give 3.10, 40 % 2.68). B at 24 %
+(>= 6.4:1) gives a clearly visible fade; the small hue drift copies the old gradients (green 140 -> 150, orange 15 -> 0,
+purple 272 -> 265, yellow 47 -> 41). A single S/L for all hues keeps the palette even. Both test suites check both stops
+on all 360 hues (and that A is the lighter one). *Consequences:* a person who renames gets new colours; two names can share
+a hue (1 in 360); an empty name hashes to hue 61. Vectors, asserted by **both** test suites (`client/src/theme.rs`,
+`docs/dev/tests.js`):
 
-| name | hue | colour |
-| --- | --- | --- |
-| `Ritze` | 177 | `#238b86` |
-| `mo` (also `  Mo `) | 245 | `#2b238b` |
-| `client-1` | 144 | `#238b4c` |
-| `client-2` | 321 | `#8b2366` |
-| `Zed` | 4 | `#8b2a23` |
-| `user-d740` | 328 | `#8b235a` |
-| `Größe` | 314 | `#8b2372` |
-| `` (empty) | 61 | `#898b23` |
+| name | hue | stop A | stop B |
+| --- | --- | --- | --- |
+| `Ritze` | 177 | `#25938d` | `#186252` |
+| `mo` (also `  Mo `) | 245 | `#2e2593` | `#181f62` |
+| `client-1` | 144 | `#259351` | `#18622a` |
+| `client-2` | 321 | `#93256c` | `#621854` |
+| `Zed` | 4 | `#932c25` | `#621820` |
+| `user-d740` | 328 | `#93255f` | `#62184c` |
+| `Größe` | 314 | `#932579` | `#62185d` |
+| `` (empty) | 61 | `#919325` | `#625718` |
 
-Code: native `theme::avatar_color(name)` / `avatar_hue`, drawn by `widgets::paint_avatar(.., color: Color32, ..)`;
-browser `docs/js/ui/dom.js` `avatarColor` / `avatarBg` (computed to the 8-bit hex and set inline, not left to CSS `hsl()`,
-so both clients are pixel-identical: checked from screenshots of the native rig and headless Chromium). Every avatar
+Code: native `theme::avatar_colors(name) -> [A, B]` / `avatar_hue`, `theme::AVATAR_GRADIENT_DEG`, drawn by
+`widgets::paint_avatar(.., colors: [Color32; 2], ..)` with `paint_gradient` (a tessellated rounded rect with per-vertex
+colours, egui has no gradient fill); browser `docs/js/ui/dom.js` `avatarColors` / `avatarBg` (stops computed to the 8-bit
+hex and set inline as `background:linear-gradient(140deg, A, B)`, not left to CSS `hsl()`). Checked 2026-10-15 from the
+rig and headless Chromium: sampled pixels of both match the analytic gradient within 1/255 per channel. Every avatar
 (user band, People rows, share cards, "you" card) passes the owner's display name, never a connection id.
+
+**Initial centring (native, #83).** `paint_avatar` does not use `paint_text`: that centres the *line box* (ascent +
+descent) and egui then snaps the text to whole pixels independently of the disc, so the letter drifted by 1 px with the
+avatar's sub-pixel position (up to 2.5 px for "Ä" at 1.25x; the user saw "R" 1 px low in the user band). Now the disc
+rect is snapped first, the initial is centred horizontally on its advance box (a capital's side bearings are balanced;
+the glyph quad has a faint AA column on one side and centring it put the letter +1 px right) and vertically on the
+glyph quad (`Galley::mesh_bounds`: cap top to baseline, umlaut dots and descenders included), with an odd leftover
+pixel going **up** (optical centre). `widgets::tests::avatar_initial_is_centred_on_the_disc_at_any_position_and_scale`
+tessellates the avatar at fractional origins and 1/1.25/1.5/2x and asserts it. The browser centres with flexbox on
+sub-pixel positions and measured centred (no change).
 
 ## i18n
 

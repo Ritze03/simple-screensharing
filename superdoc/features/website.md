@@ -127,11 +127,12 @@ Both user requests, mirrored from the native client (`superdoc/ui/APP-SHELL.md`,
   stage lives outside `root`; the e2e checks a re-render while fullscreen. Double-click on the stage calls
   `closePopout` (Esc leaves fullscreen natively and `fullscreenchange` brings the canvas back). The Document-PiP pop-out is
   unchanged (a PiP window cannot go fullscreen, so no dblclick there). Needs the click's user activation: `dblclick` is one.
-- **Avatar colour from the name** (`dom.js` `avatarHue` / `avatarColor` / `avatarBg`): same algorithm and vectors as native,
+- **Avatar colour from the name** (`dom.js` `avatarHue` / `avatarColors` / `avatarBg`): same algorithm and vectors as native,
   the contract is in `STYLING-GUIDE.md` "Avatar colour"; `tests.js` asserts the vector table and >= 3:1 contrast on all 360 hues.
+  Since #83 (2026-10-15, user: keep the fade) it is a `linear-gradient(140deg, A, B)` of two name-derived stops, set inline.
   The old `.avatar.c1..c4` classes (connection-id gradients) are gone; the "you" avatars use the same function.
 - E2E: `docs/dev/e2e/avatar-fullscreen.mjs <relay host:port> <certhash>` (two pages named `client-1` / `client-2`, real double-clicks
-  through CDP `Page.dblclick`, avatar hexes, fullscreen survives a re-render, second double-click and `exitFullscreen()` return the
+  through CDP `Page.dblclick`, avatar gradient stops (every `.avatar` on the page is a gradient), fullscreen survives a re-render, second double-click and `exitFullscreen()` return the
   canvas). Headless Chromium's Fullscreen API works (`document.fullscreenElement` is set).
 
 ## Own-tile live preview (task #78, 2026-10-15)

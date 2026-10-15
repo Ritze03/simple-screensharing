@@ -47,7 +47,7 @@ Env knobs (all optional): `SCRATCH` (one rig per scratch dir; default per worktr
 `PROFILE` (`release` default; use release for fps), `HS_NO_BUILD=1`, `HS_FPS` (capture output
 refresh, default 240), `HS_PATTERN`, `HS_XDPW`, `HS_PIPEWIRE`, `RUST_LOG`,
 `START_CODEC/START_FPS/START_KBPS` (pre-fill the stream form; the reliable way to set kbps),
-`SSS_LANGUAGE`, `CLIENT_ENV_<n>` (extra env for client n, e.g. a `GST_DEBUG` for the sharer).
+`SSS_LANGUAGE`, `CLIENT_ENV_<n>` (extra env for client n, e.g. a `GST_DEBUG` for the sharer), `HS_NAME_<n>` (display name of client n, default `client-<n>`).
 
 Input details: pointer = `swaymsg seat - cursor ...` (needs `hs-vptr`). Keys = `wtype`, which
 creates a virtual keyboard only while it runs (`hs-drive.sh key N ...` focuses client N first).

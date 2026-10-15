@@ -1,5 +1,6 @@
 // Task #77 through the REAL site UI: (a) double-click a watched tile -> fullscreen stage, double-click again -> back;
-// (b) avatar colours are a pure function of the display name (same hex as the native client, see dev/tests.js vectors).
+// (b) avatar gradients are a pure function of the display name (same hex stops as the native client, see dev/tests.js
+// vectors; task #83 brought the 140deg fade back).
 // Page "client-1" shares the synthetic pattern, page "client-2" watches it; the names are the ones the native rig uses, so
 // the screenshots can be compared pixel for pixel with `hs-drive.sh shot`.
 //
@@ -19,7 +20,8 @@ const check = (cond, what, extra = "") => {
   console.log(`${cond ? "PASS" : "FAIL"} ${what}${extra ? "  " + extra : ""}`);
   if (!cond) failed++;
 };
-const hex = (rgb) => "#" + (rgb.match(/\d+/g) || []).slice(0, 3).map((n) => Number(n).toString(16).padStart(2, "0")).join("");
+// "linear-gradient(140deg, rgb(37, 147, 81), rgb(24, 98, 42))" -> "#259351 #18622a"
+const hex = (img) => (img.match(/rgb\(\d+, \d+, \d+\)/g) || []).map((c) => "#" + c.match(/\d+/g).map((n) => Number(n).toString(16).padStart(2, "0")).join("")).join(" ");
 
 const site = await L.serveSite(0);
 const A = await L.openApp(site.url, { name: "client-1" });
@@ -34,18 +36,22 @@ try {
   await L.watchFirst(B.page);
   await B.page.waitFor("__sss.S.rooms.some((r) => [...r.watches.values()].some((w) => w.firstFrame))", { timeout: 30000, what: "first frame" });
 
-  // (b) avatar colours: user band + People rows, in both pages
+  // (b) avatar gradients: user band + People rows + share card, in both pages
+  const C1 = "#259351 #18622a", C2 = "#93256c #621854";
   const colours = (page) => page.eval(`(() => ({
-    band: getComputedStyle(document.querySelector(".p-user .avatar")).backgroundColor,
-    people: [...document.querySelectorAll(".p-right .avatar")].map((a) => [a.textContent, getComputedStyle(a).backgroundColor]),
+    band: getComputedStyle(document.querySelector(".p-user .avatar")).backgroundImage,
+    people: [...document.querySelectorAll(".p-right .avatar")].map((a) => [a.textContent, getComputedStyle(a).backgroundImage]),
+    all: [...document.querySelectorAll(".avatar")].map((a) => { const r = a.getBoundingClientRect(); return [a.firstChild && a.firstChild.textContent, getComputedStyle(a).backgroundImage, r.x, r.y, r.width]; }),
   }))()`);
   const cb = await colours(B.page);
-  check(hex(cb.band) === "#8b2366", "viewer user band avatar = client-2 colour", hex(cb.band));
+  check(cb.band.startsWith("linear-gradient(140deg") && hex(cb.band) === C2, "viewer user band avatar = client-2 gradient", cb.band);
   check(cb.people.length === 2, "two People avatars", JSON.stringify(cb.people.map(([n, c]) => [n, hex(c)])));
   const hexes = cb.people.map(([, c]) => hex(c)).sort();
-  check(JSON.stringify(hexes) === JSON.stringify(["#238b4c", "#8b2366"]), "People avatars = client-1 #238b4c and client-2 #8b2366", hexes.join(" "));
+  check(JSON.stringify(hexes) === JSON.stringify([C1, C2]), `People avatars = client-1 ${C1} and client-2 ${C2}`, hexes.join(" | "));
+  check(cb.all.every(([, img]) => img.startsWith("linear-gradient(140deg")), "every avatar on the page is a gradient", JSON.stringify(cb.all));
+  console.log("AVATARS " + JSON.stringify(cb.all));
   const ca = await colours(A.page);
-  check(hex(ca.band) === "#238b4c", "sharer user band avatar = client-1 colour (same person, same colour in every viewer)", hex(ca.band));
+  check(hex(ca.band) === C1, "sharer user band avatar = client-1 gradient (same person, same colours in every viewer)", hex(ca.band));
   await B.page.screenshot(OUT + PFX + "browser_viewer_watching.png");
 
   // (a) double-click the tile -> fullscreen stage

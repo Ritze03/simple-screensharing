@@ -252,8 +252,8 @@ pub fn sharer_row(ui: &mut Ui, row: &SharerRow) -> Response {
 #[derive(Clone, Copy, Debug)]
 pub struct PersonRow<'a> {
     pub name: &'a str,
-    /// Avatar colour: `theme::avatar_color(name)`.
-    pub color: Color32,
+    /// Avatar gradient stops: `theme::avatar_colors(name)`.
+    pub colors: [Color32; 2],
     /// The faint "you" tag after the name (the caller's translation), or `None`.
     pub you: Option<&'a str>,
     /// Sharing: green "LIVE" pill in the 44 slot.
@@ -279,7 +279,7 @@ pub fn person_row(ui: &mut Ui, row: &PersonRow) -> Response {
         row_bg(ui, r.rect, &r.response, false, theme::ROUNDING_SM, theme::WASH_HOVER_1);
         let initial: String = row.name.chars().next().map(|c| c.to_string()).unwrap_or_default();
         let av = Rect::from_center_size(r.cell(0).center(), vec2(theme::AVATAR_SM, theme::AVATAR_SM));
-        paint_avatar(ui, av, &initial, row.color, false);
+        paint_avatar(ui, av, &initial, row.colors, false);
         let name_col = if row.idle { theme::TEXT_DIM } else { theme::TEXT };
         let cell = r.cell(1);
         let you_w = row.you.map_or(0.0, |y| 6.0 + super::text_width(ui, y, font(Weight::Regular, theme::FS_TINY), 0.0));

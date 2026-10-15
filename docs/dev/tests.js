@@ -12,7 +12,7 @@ import { deriveCodecString, sniffCodec } from "../js/core/codec.js";
 import { DECODE_QUEUE_CATCHUP_THRESHOLD, JitterBuffer, MAX_DECODE_QUEUE, clampCatchUpSpeedPercent, clampMaxJitterBufferMs } from "../js/core/jitter.js";
 import { CanvasRenderer, VideoReceiver } from "../js/core/video-rx.js";
 import { ENCODER_PRESETS } from "../js/core/video-tx.js";
-import { avatarColor, avatarHue } from "../js/ui/dom.js";
+import { avatarBg, avatarColors, avatarHue } from "../js/ui/dom.js";
 
 const tests = [];
 export const test = (name, fn) => tests.push({ name, fn });
@@ -916,20 +916,22 @@ test("canvas renderer: WebGL and 2D backends draw the same upright picture; a cr
 
 // ------------------------------------------------------------------------------------------------ avatar colour
 
-// Same table as client/src/theme.rs `avatar_colour_vectors_match_the_browser` (cross-client contract, task #77).
-test("avatar colour: vectors match the native client; trimmed and case-insensitive", () => {
+// Same table as client/src/theme.rs `avatar_colour_vectors_match_the_browser` (cross-client contract, tasks #77, #83).
+test("avatar colour: gradient vectors match the native client; trimmed and case-insensitive", () => {
   const v = [
-    ["Ritze", 177, "#238b86"], ["mo", 245, "#2b238b"], ["client-1", 144, "#238b4c"], ["client-2", 321, "#8b2366"],
-    ["Zed", 4, "#8b2a23"], ["user-d740", 328, "#8b235a"], ["Größe", 314, "#8b2372"], ["", 61, "#898b23"], ["  Mo ", 245, "#2b238b"],
+    ["Ritze", 177, "#25938d", "#186252"], ["mo", 245, "#2e2593", "#181f62"], ["client-1", 144, "#259351", "#18622a"],
+    ["client-2", 321, "#93256c", "#621854"], ["Zed", 4, "#932c25", "#621820"], ["user-d740", 328, "#93255f", "#62184c"],
+    ["Größe", 314, "#932579", "#62185d"], ["", 61, "#919325", "#625718"], ["  Mo ", 245, "#2e2593", "#181f62"],
   ];
-  for (const [name, hue, hex] of v) {
+  for (const [name, hue, a, b] of v) {
     eq(avatarHue(name), hue, `hue of ${JSON.stringify(name)}`);
-    eq(avatarColor(name), hex, `colour of ${JSON.stringify(name)}`);
+    eq(avatarColors(name), [a, b], `gradient of ${JSON.stringify(name)}`);
   }
-  eq(avatarColor("RITZE"), avatarColor("ritze"), "case");
+  eq(avatarColors("RITZE"), avatarColors("ritze"), "case");
+  eq(avatarBg("Ritze"), "background:linear-gradient(140deg, #25938d, #186252)", "inline style");
 });
 
-test("avatar colour: white initials keep >= 3:1 contrast on every hue", () => {
+test("avatar colour: white initials keep >= 3:1 contrast against both stops on every hue", () => {
   const lin = (c) => (c / 255 <= 0.04045 ? c / 255 / 12.92 : ((c / 255 + 0.055) / 1.055) ** 2.4);
   const seen = new Set();
   for (let i = 0; seen.size < 360 && i < 100000; i++) {
@@ -937,10 +939,14 @@ test("avatar colour: white initials keep >= 3:1 contrast on every hue", () => {
     const hue = avatarHue(name);
     if (seen.has(hue)) continue;
     seen.add(hue);
-    const hex = avatarColor(name);
-    const [r, g, b] = [1, 3, 5].map((k) => parseInt(hex.slice(k, k + 2), 16));
-    const y = 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
-    ok(1.05 / (y + 0.05) >= 3, `hue ${hue} ${hex}: contrast ${(1.05 / (y + 0.05)).toFixed(2)}`);
+    const lum = [];
+    for (const hex of avatarColors(name)) {
+      const [r, g, b] = [1, 3, 5].map((k) => parseInt(hex.slice(k, k + 2), 16));
+      const y = 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+      lum.push(y);
+      ok(1.05 / (y + 0.05) >= 3, `hue ${hue} ${hex}: contrast ${(1.05 / (y + 0.05)).toFixed(2)}`);
+    }
+    ok(lum[0] > lum[1], `hue ${hue}: stop A should be the lighter one`);
   }
   eq(seen.size, 360, "hues covered");
 });
