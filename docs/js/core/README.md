@@ -26,15 +26,20 @@ this browser can do (`canWatch`, `canShare`, and the individual features) so the
 
 ## Join links
 
-`server|room-id|key[|certhash]`, exactly like the native client (`client/src/net.rs`):
+`server|room-id|key[|certhash[|name]]`, exactly like the native client (`client/src/net.rs`, spec `protocol-spec.md` §11.4):
 `room-id` = 32 hex chars, `key` = 32 bytes base64url without padding, `certhash` = SHA-256 of the relay's leaf certificate
-DER, base64url without padding (needed by browsers for a self-signed relay; omit for a CA certificate).
+DER, base64url without padding (needed by browsers for a self-signed relay; omit for a CA certificate, or leave empty when
+only a name follows: `server|id|key||name`), `name` = the room's display name, UTF-8 percent-encoded (task #69, user request
+2026-10-15). The name is cosmetic and not part of the room's identity: a malformed `%`, invalid UTF-8 or a blank name means
+"no name" and the link still parses; the decoded name is trimmed, stripped of control characters and cut at 64 characters.
 
 | function | |
 | --- | --- |
-| `parseJoinLink(str)` | `{ server, host, port, roomId, roomIdHex, roomKey, certHash }`; throws `JoinLinkError` with the native wording. Accepts 3 and 4 fields, trims, strict base64url (rejects padding/non-canonical like Rust). |
-| `formatJoinLink(server, roomId, roomKey, certHash?)` | the inverse |
-| `createRoom(server, { name?, certHash? })` | random id + key from `crypto.getRandomValues`; returns `{ link, name, server, roomId, roomKey }`. The name is a local label only, never on the wire. |
+| `parseJoinLink(str)` | `{ server, host, port, roomId, roomIdHex, roomKey, certHash, name }` (`name` is `null` when absent or undecodable); throws `JoinLinkError` with the native wording. Accepts 3, 4 and 5 fields (the 5th keeps any further `\|`, like Rust `splitn(5)`), trims, strict base64url (rejects padding/non-canonical like Rust). |
+| `formatJoinLink(server, roomId, roomKey, certHash?, name?)` | the inverse. The name is encoded like the native encoder: only `A-Za-z0-9-._~` stay raw (`encodeURIComponent` plus `!'()*` escaped), so a link formatted by either client is byte-identical. |
+| `encodeLinkName(name)`, `decodeLinkName(field)`, `MAX_LINK_ROOM_NAME_CHARS` | the name codec on its own (native `encode_link_name` / `decode_link_name`) |
+| `stripLinkName(link)` | the link without its 5th field: what a saved room stores |
+| `createRoom(server, { name?, certHash? })` | random id + key from `crypto.getRandomValues`; returns `{ link, name, server, roomId, roomKey }`. The name is a local label, never on the wire to the relay; the returned `link` carries it as the 5th field. |
 
 **Link expiry vs relay down (what the browser can and cannot tell).** The relay rotates its self-signed certificate about
 every 11 days, which makes the hash in older links stale. **Chromium 153 reports every handshake failure identically**: a

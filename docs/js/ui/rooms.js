@@ -1,9 +1,9 @@
 // One RoomEntry per saved room: its RoomClient (one WebTransport connection), connection state, roster, streams,
 // previews and the streams we watch there. Turns core events into UI state and asks for a re-render.
 
-import { RoomClient, parseJoinLink, ConnectError, JoinRejectedError, JoinLinkError } from "../core/index.js";
-import { S, invalidate, toast, persistRooms } from "./store.js";
-import { t } from "./i18n.js";
+import { RoomClient, parseJoinLink, formatJoinLink, stripLinkName, ConnectError, JoinRejectedError, JoinLinkError } from "../core/index.js";
+import { S, invalidate, toast, persistRooms, displayName } from "./store.js";
+import { t, DICT } from "./i18n.js";
 import { onShareEvent, onShareStats, stopDestsInRoom } from "./capture.js";
 import { closePopout } from "./popout.js";
 
@@ -12,7 +12,8 @@ export class RoomEntry {
     const p = parseJoinLink(link);
     this.id = id || `${p.roomIdHex}@${p.server}`;
     this.name = name || t("ui.room.unnamed", { id: p.roomIdHex.slice(0, 8) });
-    this.link = link.trim();
+    // The name is a local label, never part of the stored link (like native's saved join string).
+    this.link = stripLinkName(link);
     this.server = p.server;
     this.auto = auto;
     this.client = null;
@@ -25,6 +26,12 @@ export class RoomEntry {
     this.previews = new Map(); // key -> object URL
     this.watches = new Map(); // key -> Watch
     this.resume = []; // watches that ended recently, resumed when the same sharer's stream reappears
+  }
+  /** The link to send to friends: the stored link plus this room's name (5th field), unless it is only the "Room abcd1234" placeholder. */
+  inviteLink() {
+    const p = parseJoinLink(this.link);
+    const placeholder = Object.values(DICT).some((d) => d["ui.room.unnamed"].replace("%{id}", p.roomIdHex.slice(0, 8)) === this.name);
+    return formatJoinLink(p.server, p.roomId, p.roomKey, p.certHash, placeholder ? null : this.name);
   }
   get selfId() {
     return this.client ? this.client.selfId : null;
@@ -60,7 +67,7 @@ export function connectErrorText(e) {
 export async function connectRoom(r, { quiet = false } = {}) {
   if (r.client && r.state !== "disconnected") return;
   const st = S.settings;
-  const client = new RoomClient({ displayName: st.name || t("ui.default_name"), maxJitterBufferMs: st.jitter, catchUpSpeedPercent: st.catchup });
+  const client = new RoomClient({ displayName: displayName(), maxJitterBufferMs: st.jitter, catchUpSpeedPercent: st.catchup });
   r.client = client;
   r.state = "connecting";
   r.error = null;

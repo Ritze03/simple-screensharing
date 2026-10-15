@@ -52,8 +52,8 @@ export async function waitJoined(page, i = 0, timeout = 20000) {
   await page.waitFor(`${roomState(i)} === "joined"`, { timeout, what: `room ${i} joined` });
 }
 
-/** The invite link the UI would copy (the link the room was joined with, including the cert hash). */
-export const inviteLink = (page, i = 0) => page.eval(`__sss.S.rooms[${i}].link`);
+/** The invite link the UI would copy (the stored link with the cert hash, plus the room name as 5th field when it has one). */
+export const inviteLink = (page, i = 0) => page.eval(`__sss.S.rooms[${i}].inviteLink()`);
 
 /**
  * Replace getDisplayMedia with the harness pattern source (noisy rectangles + frame/clock strip + optional 440 Hz tone),

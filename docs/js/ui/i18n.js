@@ -9,7 +9,6 @@
 
 const en = {
   "app.title": "Simple Screensharing",
-  "ui.default_name": "friend",
   "ui.close": "Close",
 
   "settings.header": "Settings",
@@ -248,6 +247,8 @@ const en = {
   "ui.modal.rename_title": "Rename room",
   "ui.modal.name": "Name",
   "ui.modal.save": "Save",
+  "ui.modal.choose_name_title": "Choose your name",
+  "ui.modal.choose_name_body": "Friends see this name in rooms.",
 
   "ui.settings.profile": "Profile",
   "ui.settings.name_tip": "One name for every room",
@@ -296,7 +297,6 @@ const en = {
 
 const de = {
   "app.title": "Simple Screensharing",
-  "ui.default_name": "Freund",
   "ui.close": "Schließen",
 
   "settings.header": "Einstellungen",
@@ -535,6 +535,8 @@ const de = {
   "ui.modal.rename_title": "Raum umbenennen",
   "ui.modal.name": "Name",
   "ui.modal.save": "Speichern",
+  "ui.modal.choose_name_title": "Wähle deinen Namen",
+  "ui.modal.choose_name_body": "Freunde sehen diesen Namen in Räumen.",
 
   "ui.settings.profile": "Profil",
   "ui.settings.name_tip": "Ein Name für alle Räume",

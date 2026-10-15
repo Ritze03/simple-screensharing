@@ -462,9 +462,13 @@
         "ok": false
       },
       {
-        "error": "join string has an invalid cert hash: cert hash is not valid base64url (no padding): Invalid symbol 124, offset 43.",
+        "certHashHex": "fffefdfcfbfaf9f8f7f6f5f4f3f2f1f0efeeedecebeae9e8e7e6e5e4e3e2e1e0",
         "link": "relay.example.com:4433|00112233445566778899aabbccddeeff|AwoRGB8mLTQ7QklQV15lbHN6gYiPlp2kq7K5wMfO1dw|__79_Pv6-fj39vX08_Lx8O_u7ezr6uno5-bl5OPi4eA|extra",
-        "ok": false
+        "name": "extra",
+        "ok": true,
+        "roomIdHex": "00112233445566778899aabbccddeeff",
+        "roomKeyHex": "030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dc",
+        "server": "relay.example.com:4433"
       },
       {
         "error": "join string has an invalid cert hash: cert hash is not valid base64url (no padding): Invalid padding",

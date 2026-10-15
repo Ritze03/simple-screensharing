@@ -5,6 +5,7 @@ import { DEFAULT_MAX_JITTER_BUFFER_MS, DEFAULT_CATCH_UP_SPEED_PERCENT, clampMaxJ
 
 const K_SETTINGS = "sss.settings.v1";
 const K_ROOMS = "sss.rooms.v1";
+const K_AUTONAME = "sss.autoname.v1";
 
 function read(key) {
   try {
@@ -23,12 +24,41 @@ function write(key, value) {
   }
 }
 
+/**
+ * The automatic default display name, `user-` + 4 random characters of [a-z0-9]. Generated once and persisted under its
+ * own key so it is stable across reloads, and kept apart from `settings.name`, which stays "" until the user chooses a
+ * name themselves (native does the same: `display_name` unset, name derived from a fallback). Without working storage it
+ * is stable for the page's lifetime only.
+ */
+let autoNameCache = null;
+export function autoName() {
+  if (autoNameCache) return autoNameCache;
+  const stored = read(K_AUTONAME);
+  if (typeof stored === "string" && /^user-[a-z0-9]{4}$/.test(stored)) return (autoNameCache = stored);
+  const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789";
+  let id = "";
+  const buf = new Uint8Array(16);
+  while (id.length < 4) {
+    crypto.getRandomValues(buf);
+    for (const b of buf) if (b < 252 && id.length < 4) id += alphabet[b % 36]; // 252 = 7 * 36: no modulo bias
+  }
+  autoNameCache = "user-" + id;
+  write(K_AUTONAME, autoNameCache);
+  return autoNameCache;
+}
+
+/** The name sent to rooms and shown as "you": the chosen name, else the automatic default. */
+export const displayName = () => (S.settings.name || "").trim() || autoName();
+
 const browserLang = () => (String(navigator.language || "en").toLowerCase().startsWith("de") ? "de" : "en");
 
 export function loadSettings() {
   const s = read(K_SETTINGS) || {};
   const out = {
     name: typeof s.name === "string" ? s.name : "",
+    // Set once the user has chosen a name (the "Choose your name" modal or the settings field): never ask again,
+    // even if they later empty the settings field.
+    nameSet: s.nameSet === true || (typeof s.name === "string" && s.name.trim() !== ""),
     lang: s.lang === "de" || s.lang === "en" ? s.lang : browserLang(),
     jitter: clampMaxJitterBufferMs(Number.isFinite(s.jitter) ? s.jitter : DEFAULT_MAX_JITTER_BUFFER_MS),
     catchup: clampCatchUpSpeedPercent(Number.isFinite(s.catchup) ? s.catchup : DEFAULT_CATCH_UP_SPEED_PERCENT),
