@@ -98,7 +98,7 @@ re-derive the split every frame and silently break when content height changes.
 | `room.rs` | `show_header`, `show_body` (reconnect banner, "On screen" tiles, "Sharing in this room" cards, empty states), `show_people` |
 | `action_bar.rs` | bottom band, one layout per `ShareState`: Idle / Picking / Staged / Live / Paused; owns the share-menu, rooms and audio-source popovers |
 | `stream_settings.rs` | the stream-settings modal (staged "Set up your stream", live "Stream settings"), width 1120 |
-| `modals.rs` | create/join, app settings, leave / forget confirm, rename |
+| `modals.rs` | create/join, app settings, leave / forget confirm, rename, choose-your-name |
 | `popout.rs` | pop-out viewer windows: one deferred viewport per popped stream |
 | `tests.rs` | session-model lookups, bandwidth wiring, shell geometry (`shell_regions_match_the_spec_sizes`), nav/action behaviour |
 
@@ -182,6 +182,17 @@ These were decided in the earlier UIs and are still the rules.
 - **Display name is one global setting** (Settings modal, Profile card), not asked per
   room. *Why:* the wire protocol sends the name once at connect, so a per-room value was
   only ever the same string typed again.
+- **"Choose your name" modal** (`Modal::ChooseName`, `MODAL_W`, `modals::choose_name`): while
+  the user never saved a name (`AppState::display_name_set == false`, i.e. empty
+  `AppSettings::display_name`; the shown name is then the `whoami_fallback()` OS username),
+  `App::prompt_for_name` opens it once per run as soon as no other modal is open
+  (`Shell::name_prompt_shown`). Field prefilled with the fallback and selected, Enter/Save
+  = `SetDisplayName` + close (saving the prefilled name counts), Later/Escape/x = close until
+  the next start; Save is disabled for an empty field. Saved once, it never shows again.
+  Rig/launch clients are seeded with `display_name = "client-N"`, so scripted flows never see it.
+  *Why:* user request 2026-10-15, encourage setting a name instead of silently using the
+  default. Caveat: a room joined before the name is saved (auto-connect) keeps the old name
+  for its peers until the next connect, the wire sends the name only once.
 - **Create/join modal:** server field pre-filled from the most recently saved room (the lib
   keeps no "last server" setting). A freshly minted link is shown masked (it carries the
   room key) and has no relay cert hash, so browsers can't use it; "Copy invite link" copies

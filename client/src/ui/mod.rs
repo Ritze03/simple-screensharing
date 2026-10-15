@@ -170,6 +170,10 @@ pub enum Modal {
     ForgetConfirm { room: RoomKey },
     /// "Rename room" — confirm with [`UiAction::Rename`].
     Rename { room: RoomKey },
+    /// "Choose your name": opened by [`App::prompt_for_name`] while the user
+    /// never saved a display name. Save pushes [`UiAction::SetDisplayName`];
+    /// Later / Escape / × just close it.
+    ChooseName,
 }
 
 /// Which popover is open. Drawn by the screen that owns its anchor button.
@@ -387,6 +391,9 @@ pub struct Toast {
 /// UI-level state that more than one screen reads, owned by the shell.
 #[derive(Default)]
 pub struct Shell {
+    /// The "Choose your name" modal was already offered this run (Later /
+    /// Escape / × keeps it away until the next start).
+    pub name_prompt_shown: bool,
     /// Staged captures by room. `Why` here and not in the lib: a staged
     /// capture has no destination, so nothing in `AppState` says which room
     /// it is for.
@@ -977,6 +984,7 @@ impl App {
         self.videos.sync(&self.state);
         self.poll_staged();
         self.poll_level_taps();
+        self.prompt_for_name();
         let now = ctx.input(|i| i.time);
         self.shell.toasts.retain(|t| t.until > now);
         // A modal or view pointing at something that's gone falls back.
@@ -990,6 +998,18 @@ impl App {
         {
             self.nav.modal = None;
         }
+    }
+
+    /// Offer the "Choose your name" modal once per run while no display name
+    /// was ever saved, as soon as no other modal is open. `Why:` user request
+    /// 2026-10-15, encourage the user to set their own name instead of
+    /// silently using the OS username.
+    fn prompt_for_name(&mut self) {
+        if self.state.display_name_set || self.shell.name_prompt_shown || self.nav.modal.is_some() {
+            return;
+        }
+        self.shell.name_prompt_shown = true;
+        self.nav.modal = Some(Modal::ChooseName);
     }
 
     fn on_joined(&mut self, handle: RoomHandle) {

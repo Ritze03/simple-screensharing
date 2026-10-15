@@ -77,6 +77,10 @@ pub struct ModalsState {
     catch_up: u32,
     // rename
     rename: String,
+    // choose name
+    choose_name: String,
+    /// Focus + select-all the name field on its first frame.
+    choose_name_focus: bool,
 }
 
 impl ModalsState {
@@ -104,6 +108,10 @@ impl ModalsState {
                 self.display_name = cx.state.display_name.clone();
                 self.jitter_s = cx.state.max_jitter_buffer_ms as f32 / 1000.0;
                 self.catch_up = cx.state.catch_up_speed_percent;
+            }
+            Modal::ChooseName => {
+                self.choose_name = cx.state.display_name.clone();
+                self.choose_name_focus = true;
             }
             Modal::Rename { room } => {
                 self.rename = cx.room(room).map(|r| r.name).unwrap_or_default();
@@ -190,6 +198,7 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState, modal: &Moda
             );
         }
         Modal::Rename { room } => rename(ctx, cx, st, room),
+        Modal::ChooseName => choose_name(ctx, cx, st),
         Modal::StreamSettings { .. } => {}
     }
 }
@@ -747,6 +756,52 @@ fn rename(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState, room: &str) {
             room: room.to_string(),
             name: st.rename.trim().to_string(),
         });
+    } else if click == FooterClick::Trailing(0) || a.close {
+        cx.act(UiAction::CloseModal);
+    }
+}
+
+/// "Choose your name" (`MODAL_W`): one line of text and a prefilled, selected
+/// name field. Enter or Save sets the name, Later / Escape / × closes.
+fn choose_name(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
+    let title = tr("ui.modal.choose_name_title", "Choose your name");
+    let spec = ModalSpec {
+        id: "choose_name",
+        title: &title,
+        sub: None,
+        width: theme::MODAL_W,
+        head_pill: None,
+    };
+    let later = tr("ui.stream.later", "Later");
+    let save = tr("ui.modal.save", "Save");
+    let can_save = !st.choose_name.trim().is_empty();
+    let mut submit = false;
+    let mut click = FooterClick::None;
+    let a = widgets::modal_shell(
+        ctx,
+        &spec,
+        |ui| {
+            paragraph(ui, &tr("ui.modal.choose_name_body", "Friends see this name in rooms."));
+            plain_card(ui, |ui| {
+                let r = widgets::ctrl_row(ui, &tr("ui.modal.name", "Name"), None, |ui| {
+                    widgets::text_field(ui, &mut st.choose_name, "")
+                });
+                if std::mem::take(&mut st.choose_name_focus) {
+                    let id = r.id;
+                    r.request_focus();
+                    let all = egui::text::CCursorRange::two(egui::text::CCursor::new(0), egui::text::CCursor::new(st.choose_name.chars().count()));
+                    let mut state = egui::TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
+                    state.cursor.set_char_range(Some(all));
+                    state.store(ui.ctx(), id);
+                }
+                submit = entered(ui, &r);
+            });
+        },
+        |ui| click = widgets::modal_footer(ui, &[], None, &[Btn::secondary(&later), Btn::primary(&save).enabled(can_save)]),
+    );
+    if (click == FooterClick::Trailing(1) || submit) && can_save {
+        cx.act(UiAction::SetDisplayName(st.choose_name.trim().to_string()));
+        cx.act(UiAction::CloseModal);
     } else if click == FooterClick::Trailing(0) || a.close {
         cx.act(UiAction::CloseModal);
     }

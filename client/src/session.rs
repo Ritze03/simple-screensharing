@@ -1527,6 +1527,10 @@ pub struct PendingDestination {
 /// docs.
 pub struct AppState {
     pub display_name: String,
+    /// Whether `display_name` was chosen by the user (a non-empty
+    /// `AppSettings::display_name` is saved) rather than the `whoami_fallback`
+    /// default. `false` makes the UI offer the "Choose your name" modal.
+    pub display_name_set: bool,
     pub status: Status,
     pub pending_connect: Option<PendingConnect>,
 
@@ -1685,13 +1689,15 @@ impl Default for AppState {
         // set; empty (never set, or explicitly cleared) falls back to the
         // OS-username default, same as this app's behavior before the
         // setting existed — see `rooms::AppSettings::display_name`.
-        let display_name = if settings.display_name.trim().is_empty() {
-            whoami_fallback()
-        } else {
+        let display_name_set = !settings.display_name.trim().is_empty();
+        let display_name = if display_name_set {
             settings.display_name.clone()
+        } else {
+            whoami_fallback()
         };
         Self {
             display_name,
+            display_name_set,
             status: Status::Idle,
             pending_connect: None,
             endpoint: crate::net::build_client_endpoint().map_err(|e| format!("{e:#}")),
@@ -4488,6 +4494,7 @@ impl AppState {
     pub fn set_display_name(&mut self, display_name: &str) {
         let display_name = display_name.trim().to_string();
         save_display_name(&display_name);
+        self.display_name_set = !display_name.is_empty();
         self.display_name = display_name;
     }
 

@@ -563,3 +563,56 @@ fn connect_errors_are_per_room_and_cleared_by_a_new_attempt() {
     assert_eq!(short_error("\n  first line\nsecond"), "first line");
     assert_eq!(short_error(&"x".repeat(200)).chars().count(), 90);
 }
+
+// ---------------------------------------------------------------------------
+// "Choose your name" modal
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn choose_name_modal_opens_once_while_the_name_is_unset() {
+    let _home = isolated_home();
+    let mut app = app_with_rooms(&[]);
+    let ctx = ctx();
+    assert!(!app.state.display_name_set, "a fresh config has no saved name");
+    app.prompt_for_name();
+    assert_eq!(app.nav.modal, Some(Modal::ChooseName));
+    // Later (CloseModal): not offered again this run.
+    app.apply(&ctx, UiAction::CloseModal);
+    app.prompt_for_name();
+    assert!(app.nav.modal.is_none());
+    // A new start (fresh App, still nothing saved): offered again.
+    let mut app = app_with_rooms(&[]);
+    app.prompt_for_name();
+    assert_eq!(app.nav.modal, Some(Modal::ChooseName));
+}
+
+#[tokio::test]
+async fn choose_name_modal_waits_for_another_open_modal() {
+    let _home = isolated_home();
+    let mut app = app_with_rooms(&[]);
+    app.nav.modal = Some(Modal::Settings);
+    app.prompt_for_name();
+    assert_eq!(app.nav.modal, Some(Modal::Settings));
+    app.nav.modal = None;
+    app.prompt_for_name();
+    assert_eq!(app.nav.modal, Some(Modal::ChooseName));
+}
+
+#[tokio::test]
+async fn saving_a_name_closes_the_modal_and_it_never_comes_back() {
+    let _home = isolated_home();
+    let mut app = app_with_rooms(&[]);
+    let ctx = ctx();
+    app.prompt_for_name();
+    // What the modal's Save pushes.
+    app.apply(&ctx, UiAction::SetDisplayName("Mo".into()));
+    app.apply(&ctx, UiAction::CloseModal);
+    assert!(app.state.display_name_set);
+    assert_eq!(app.state.display_name, "Mo");
+    assert!(app.nav.modal.is_none());
+    // Restart: the name is saved, so no prompt even on a fresh App.
+    let mut app = app_with_rooms(&[]);
+    assert!(app.state.display_name_set);
+    app.prompt_for_name();
+    assert!(app.nav.modal.is_none());
+}
