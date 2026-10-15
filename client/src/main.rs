@@ -135,7 +135,7 @@ fn main() -> anyhow::Result<()> {
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([960.0, 600.0])
             .with_title("Simple Screensharing")
-            .with_app_id("simple-screensharing"),
+            .with_app_id(app_id()),
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: wgpu_configuration(presentation_mode),
         ..Default::default()
@@ -234,6 +234,15 @@ fn wgpu_configuration(mode: PresentationMode) -> eframe::egui_wgpu::WgpuConfigur
     }));
     config.wgpu_setup = WgpuSetup::CreateNew(setup);
     config
+}
+
+/// Wayland app_id / X11 class of the main window. Inside a Flatpak it is the Flatpak
+/// application id (`FLATPAK_ID`, set by the sandbox): shells match the window to the
+/// installed `<id>.desktop` by app_id, and the Flatpak's desktop file must be named after
+/// the id. Everywhere else (AppImage, `cargo run`) it stays `simple-screensharing`, which
+/// the AppImage's `StartupWMClass` names.
+fn app_id() -> String {
+    std::env::var("FLATPAK_ID").unwrap_or_else(|_| "simple-screensharing".to_owned())
 }
 
 #[cfg(test)]

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.ritze03.SimpleScreensharing</id>
+  <name>Simple Screensharing</name>
+  <summary>Share your screen and audio with friends, or watch theirs</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <!-- ponytail: no LICENSE file in the repo yet; set the real SPDX id before any Flathub submission. -->
+  <project_license>LicenseRef-proprietary</project_license>
+  <url type="homepage">https://github.com/Ritze03/simple-screensharing</url>
+  <url type="bugtracker">https://github.com/Ritze03/simple-screensharing/issues</url>
+  <developer id="io.github.ritze03">
+    <name>Ritze03</name>
+  </developer>
+  <description>
+    <p>A private screensharing app for friends. Create a room, send the join link, and share a monitor or window with hardware-accelerated video encoding. Everything is end-to-end encrypted with a key that never reaches the relay server.</p>
+  </description>
+  <launchable type="desktop-id">io.github.ritze03.SimpleScreensharing.desktop</launchable>
+  <categories>
+    <category>AudioVideo</category>
+  </categories>
+  <provides>
+    <binary>simple-screensharing-client</binary>
+  </provides>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-10-15"/>
+  </releases>
+</component>

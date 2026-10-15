@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Simple Screensharing
+GenericName=Screen sharing
+Comment=Share your screen and audio with friends, or watch theirs
+Exec=simple-screensharing-client
+Icon=io.github.ritze03.SimpleScreensharing
+Terminal=false
+Categories=AudioVideo;
+# No StartupWMClass: inside the sandbox the app sets its Wayland app_id / X11 class to
+# FLATPAK_ID (client/src/main.rs `app_id()`), which is this file's name.

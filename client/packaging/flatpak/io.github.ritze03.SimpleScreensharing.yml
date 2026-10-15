@@ -1,0 +1,42 @@
+# Flatpak manifest of the egui client. Built by ../../../build-flatpak.sh (repo root);
+# notes and the *why*: superdoc/features/flatpak.md.
+app-id: io.github.ritze03.SimpleScreensharing
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: simple-screensharing-client
+
+finish-args:
+  - --share=network          # QUIC/WebTransport to the relay
+  - --share=ipc              # X11 shared memory (fallback-x11 only)
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri             # Vulkan (wgpu) + VA-API encode/decode
+  - --socket=pulseaudio      # playback (pulsesink); pipewire-pulse speaks it
+  - --filesystem=xdg-run/pipewire-0   # pw-dump / pw-link / pw-loopback (per-app audio sharing)
+  # Screen capture goes through the xdg-desktop-portal ScreenCast API: no permission needed.
+
+modules:
+  - name: simple-screensharing
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/simple-screensharing/cargo
+      # ponytail: network during the build is for local bundles only; Flathub forbids it.
+      # Upgrade path: `flatpak-cargo-generator.py Cargo.lock -o cargo-sources.json`, list that
+      # file under `sources:` and build with `cargo build --offline`.
+      build-args:
+        - --share=network
+    build-commands:
+      - cargo build --release --locked -p simple-screensharing-client
+      - install -Dm755 target/release/simple-screensharing-client /app/bin/simple-screensharing-client
+      - install -Dm644 client/packaging/flatpak/io.github.ritze03.SimpleScreensharing.desktop /app/share/applications/io.github.ritze03.SimpleScreensharing.desktop
+      - install -Dm644 client/packaging/flatpak/io.github.ritze03.SimpleScreensharing.metainfo.xml /app/share/metainfo/io.github.ritze03.SimpleScreensharing.metainfo.xml
+      - install -Dm644 client/packaging/flatpak/io.github.ritze03.SimpleScreensharing.svg /app/share/icons/hicolor/scalable/apps/io.github.ritze03.SimpleScreensharing.svg
+    sources:
+      - type: dir
+        path: ../../..
+        skip: [.git, .claude, target, dist, docs, superdoc]
