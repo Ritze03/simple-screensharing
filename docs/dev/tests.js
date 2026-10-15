@@ -5,7 +5,7 @@
 
 import { PostcardReader, PostcardWriter } from "../js/core/postcard.js";
 import * as P from "../js/core/protocol.js";
-import { base64urlDecode, bytesToHex, createRoom, formatJoinLink, hexToBytes, JoinLinkError, parseJoinLink, splitHostPort } from "../js/core/joinlink.js";
+import { MAX_LINK_ROOM_NAME_CHARS, base64urlDecode, bytesToHex, createRoom, encodeLinkName, formatJoinLink, hexToBytes, JoinLinkError, parseJoinLink, splitHostPort, stripLinkName } from "../js/core/joinlink.js";
 import { NonceSequence, NonceSpaceExhausted, buildAad, buildNonce, decryptFrame, decryptPreview, encryptFrame, encryptPreview, importRoomKey } from "../js/core/crypto.js";
 import { Reassembler, fragmentFrame } from "../js/core/fragment.js";
 import { deriveCodecString, sniffCodec } from "../js/core/codec.js";
@@ -205,6 +205,7 @@ test("join links: every Rust-classified case parses (or fails) identically", asy
       eq(bytesToHex(p.roomId), c.roomIdHex);
       eq(bytesToHex(p.roomKey), c.roomKeyHex);
       eq(p.certHash ? bytesToHex(p.certHash) : null, c.certHashHex);
+      eq(p.name, c.name ?? null, `name of ${c.link}`);
       accepted++;
     } else {
       throws(() => parseJoinLink(c.link), `reject ${JSON.stringify(c.link)} (rust: ${c.error})`, JoinLinkError);
@@ -230,6 +231,74 @@ test("join links: format matches Rust, round-trips, hosts/ports split", async ()
   eq(base64urlDecode("AAAA").length, 3);
   throws(() => base64urlDecode("AAA="), "padding rejected");
   throws(() => base64urlDecode("AB"), "non-canonical trailing bits rejected");
+});
+
+// Task #69: the 5th field (room name). Vectors mirror the native unit tests in client/src/net.rs
+// (join_string_name_round_trip_all_forms / _special_characters / join_string_bad_name_is_dropped_not_rejected); the encoded
+// strings were computed independently with Python `quote(name, safe="-._~")`, which is what the native encoder writes.
+const NAME_ID = new Uint8Array(16).fill(3);
+const NAME_KEY = new Uint8Array(32).fill(7);
+const NAME_HASH = new Uint8Array(32).fill(9);
+const NAME_BASE = `h:1|${bytesToHex(NAME_ID)}|${"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"}`;
+
+test("join link names: formatted exactly like native, in all forms", () => {
+  ok(NAME_BASE === formatJoinLink("h:1", NAME_ID, NAME_KEY), "base link");
+  const hashS = NAME_BASE.length && formatJoinLink("h:1", NAME_ID, NAME_KEY, NAME_HASH).split("|")[3];
+  eq(formatJoinLink("h:1", NAME_ID, NAME_KEY, NAME_HASH, "Friday Films"), `${NAME_BASE}|${hashS}|Friday%20Films`);
+  eq(formatJoinLink("h:1", NAME_ID, NAME_KEY, null, "Movies"), `${NAME_BASE}||Movies`, "no hash: empty 4th field");
+  eq(formatJoinLink("h:1", NAME_ID, NAME_KEY, null, "  "), NAME_BASE, "blank name = 3-field form");
+  eq(formatJoinLink("h:1", NAME_ID, NAME_KEY, NAME_HASH, null), formatJoinLink("h:1", NAME_ID, NAME_KEY, NAME_HASH));
+  const withName = parseJoinLink(`${NAME_BASE}|${hashS}|Friday%20Films`);
+  eq([withName.name, withName.certHash.length], ["Friday Films", 32]);
+  eq(parseJoinLink(`${NAME_BASE}||Movies`).certHash, null);
+  eq(parseJoinLink(`${NAME_BASE}||Movies`).name, "Movies");
+  for (const l of [NAME_BASE, `${NAME_BASE}|${hashS}`, `${NAME_BASE}||`, `${NAME_BASE}|${hashS}|`]) eq(parseJoinLink(l).name, null, `no name in ${l}`);
+});
+
+test("join link names: special characters round-trip and match native bytes", () => {
+  const cases = [
+    ["a|b", "a%7Cb"], ["100%", "100%25"], ["%41", "%2541"], ["with space", "with%20space"],
+    ["Größe Ünï", "Gr%C3%B6%C3%9Fe%20%C3%9Cn%C3%AF"], ["Movie \u{1F3AC} night", "Movie%20%F0%9F%8E%AC%20night"],
+    ["~-._ok", "~-._ok"], ["a|b|c|d", "a%7Cb%7Cc%7Cd"], ["Hi! (x)*'", "Hi%21%20%28x%29%2A%27"],
+  ];
+  for (const [name, enc] of cases) {
+    const l = formatJoinLink("h:1", NAME_ID, NAME_KEY, null, name);
+    eq(l, `${NAME_BASE}||${enc}`, `encoding of ${JSON.stringify(name)}`);
+    eq(l.split("|").length, 5, "name must not add separators");
+    ok(/^[\x20-\x7e]*$/.test(l), `ascii: ${l}`);
+    const p = parseJoinLink(l);
+    eq(p.name, name, `round trip ${l}`);
+    eq(bytesToHex(p.roomId), bytesToHex(NAME_ID));
+  }
+  // encodeURIComponent output (leaves !'()* raw) decodes too
+  eq(parseJoinLink(`${NAME_BASE}||Hi!%20(x)`).name, "Hi! (x)");
+  // a raw `|` inside the 5th field stays part of the name (splitn(5))
+  eq(parseJoinLink(`${NAME_BASE}||a|b`).name, "a|b");
+});
+
+test("join link names: a bad name is dropped, never rejects the link", () => {
+  for (const bad of ["100%", "%4", "%zz", "%FF%FE", "%0A", "   ", "%20%20"]) {
+    const p = parseJoinLink(`${NAME_BASE}||${bad}`);
+    eq(p.name, null, `name of ${bad}`);
+    eq(bytesToHex(p.roomKey), bytesToHex(NAME_KEY));
+  }
+  eq(parseJoinLink(`${NAME_BASE}||%20%20Hi%0A%20`).name, "Hi", "trimmed, control chars dropped");
+  eq(parseJoinLink(`${NAME_BASE}||${"x".repeat(200)}`).name.length, MAX_LINK_ROOM_NAME_CHARS, "capped");
+  eq(Array.from(parseJoinLink(`${NAME_BASE}||${"%F0%9F%8E%AC".repeat(100)}`).name).length, MAX_LINK_ROOM_NAME_CHARS, "capped in characters, not UTF-16 units");
+  // a bad cert hash still rejects, with or without a name
+  throws(() => parseJoinLink(`${NAME_BASE}|AAAA|Name`), "bad hash + name", JoinLinkError);
+  eq(encodeLinkName("\ud800"), "", "lone surrogate: name left off, no throw");
+});
+
+test("join link names: stripLinkName keeps the stored form and createRoom carries the name", () => {
+  const hashS = formatJoinLink("h:1", NAME_ID, NAME_KEY, NAME_HASH).split("|")[3];
+  eq(stripLinkName(`${NAME_BASE}|${hashS}|Friday%20Films`), `${NAME_BASE}|${hashS}`);
+  eq(stripLinkName(`${NAME_BASE}||Movies`), NAME_BASE);
+  eq(stripLinkName(`  ${NAME_BASE}|${hashS}  `), `${NAME_BASE}|${hashS}`);
+  eq(stripLinkName(NAME_BASE), NAME_BASE);
+  const r = createRoom("h:1", { name: "Movie Night", certHash: NAME_HASH });
+  eq(parseJoinLink(r.link).name, "Movie Night");
+  eq(stripLinkName(r.link), formatJoinLink("h:1", r.roomId, r.roomKey, NAME_HASH));
 });
 
 test("createRoom: fresh random id + key, valid link", () => {

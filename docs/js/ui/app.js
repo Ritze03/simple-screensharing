@@ -5,7 +5,7 @@
 // place instead of re-rendering, so sliders and hovers are never interrupted.
 
 import { capabilities, createRoom, parseJoinLink, base64urlDecode, ENCODER_PRESETS, probeEncoders } from "../core/index.js";
-import { S, onInvalidate, invalidate, toast, persistSettings, persistRooms, loadRooms } from "./store.js";
+import { S, onInvalidate, invalidate, toast, persistSettings, persistRooms, loadRooms, autoName, displayName } from "./store.js";
 import { t, setLang, getLang } from "./i18n.js";
 import {
   h, ic, T, V, H, SL, FILL, pct, fmtKbps, ctrlRow, valBox, sliderRow, seg, cbx, card, secHead, roomRow, sharerRow, personRow, destRow,
@@ -35,12 +35,24 @@ let live = []; // [{ el, fn }] text patched every stats tick
 let meters = []; // [{ el, fn }] level meters, patched ~7x/s
 
 const codecLabel = (c) => (CODECS.find(([v]) => v === c) || [c, String(c || "").toUpperCase()])[1];
-const me = () => S.settings.name || t("ui.default_name");
+const me = displayName;
 const sel = () => roomById(S.selected);
 
 /* ============================== render ============================== */
 
+let namePromptShown = false;
+/**
+ * Offer the "Choose your name" modal once per page load while the user never chose a name, as soon as no other modal is
+ * open (native `prompt_for_name`). Later / Escape / x / backdrop only close it; Save (or the settings field) ends it for good.
+ */
+function promptForName() {
+  if (namePromptShown || S.modal || S.settings.nameSet) return;
+  namePromptShown = true;
+  S.modal = { kind: "choose-name", value: displayName(), focus: true };
+}
+
 function render() {
+  promptForName();
   const keep = SCROLLERS.map((s) => {
     const n = root.querySelector(s);
     return n ? n.scrollTop : null;
@@ -71,6 +83,15 @@ function render() {
     if (f) {
       f.focus();
       if (caret && typeof f.setSelectionRange === "function") try { f.setSelectionRange(caret[0], caret[1]); } catch {}
+    }
+  }
+  if (S.modal && S.modal.focus) {
+    // A modal that wants its field focused with the text selected (once, when it opens).
+    S.modal.focus = false;
+    const f = root.querySelector(".modal input.field");
+    if (f) {
+      f.focus();
+      f.select();
     }
   }
   root.querySelectorAll('input[type="range"]').forEach(pct);
@@ -756,6 +777,22 @@ function renderModal() {
       }
       render();
     }, null, false, "btn-confirm")], null, t("ui.close"));
+  } else if (M.kind === "choose-name") {
+    const save = () => {
+      const v = (M.value || "").trim();
+      if (!v) return;
+      S.settings.name = v;
+      S.settings.nameSet = true;
+      persistSettings();
+      S.modal = null;
+      render();
+    };
+    const inp = h("input", { class: "field", id: "choose-name-in", value: M.value, maxlength: "64", autocomplete: "off", spellcheck: "false", "aria-label": t("ui.modal.name") });
+    const saveBtn = lgBtn("btn-primary", t("ui.modal.save"), save, null, !(M.value || "").trim(), "btn-choose-name-save");
+    inp.addEventListener("input", () => { M.value = inp.value; saveBtn.disabled = !inp.value.trim(); });
+    inp.addEventListener("keydown", (e) => e.key === "Enter" && save());
+    modal = modalShell("", t("ui.modal.choose_name_title"), null, close, [h("p", { text: t("ui.modal.choose_name_body") }), card(null, null, ctrlRow(t("ui.modal.name"), inp, undefined, undefined, "choose-name-in"))],
+      [spacer(), lgBtn("btn-secondary", t("ui.stream.later"), close, null, false, "btn-choose-name-later"), saveBtn], null, t("ui.close"));
   } else if (M.kind === "rename") {
     const r = roomById(M.room);
     if (!r) { S.modal = null; return h("div"); }
@@ -772,8 +809,8 @@ function renderModal() {
 
 function renderSettings(close, lgBtn, spacer) {
   const st = S.settings;
-  const nameIn = h("input", { class: "field", id: "set-name", value: st.name, placeholder: t("ui.default_name"), maxlength: "64", "aria-label": t("join.display_name_label") });
-  nameIn.addEventListener("input", () => { st.name = nameIn.value; persistSettings(); });
+  const nameIn = h("input", { class: "field", id: "set-name", value: st.name, placeholder: autoName(), maxlength: "64", "aria-label": t("join.display_name_label") });
+  nameIn.addEventListener("input", () => { st.name = nameIn.value; if (st.name.trim()) st.nameSet = true; persistSettings(); });
   nameIn.addEventListener("change", () => render());
   const commit = () => { persistSettings(); applyJitterSettings(); };
   return modalShell("wide", t("settings.header"), null, close, [
@@ -792,7 +829,13 @@ function renderAdd(M, close, lgBtn, spacer) {
   const err = M.error ? h("span", { class: "hint err", text: M.error }) : null;
   const field = (id, key, placeholder, label, cls, tip) => {
     const inp = h("input", { class: "field" + (cls ? " " + cls : ""), id, placeholder, value: M[key] || "", "aria-label": label, spellcheck: "false", autocomplete: "off" });
-    inp.addEventListener("input", () => { M[key] = inp.value; });
+    inp.addEventListener("input", () => {
+      M[key] = inp.value;
+      if (key === "link" && prefillName(M)) {
+        const n = document.getElementById("add-name");
+        if (n) n.value = M.name;
+      }
+    });
     inp.addEventListener("keydown", (e) => e.key === "Enter" && submit());
     return ctrlRow(label, inp, undefined, tip, id);
   };
@@ -818,6 +861,27 @@ function renderAdd(M, close, lgBtn, spacer) {
     foot = [spacer(), lgBtn("btn-primary", t("ui.modal.open_room"), () => openMinted(M), null, false, "btn-open-room")];
   }
   return modalShell("", t("ui.sidebar.create_or_join"), null, close, body, foot, null, t("ui.close"));
+}
+
+/**
+ * When the join-link field changed to a link carrying a room name (5th field), fill the name field with it, unless the
+ * user typed a name of their own: the field is empty or still holds the previous prefill (native `prefill_name`). Clearing
+ * the field lets the next paste prefill again. Returns whether the name field changed.
+ * Why: user request 2026-10-15, a pasted link pre-fills the name but it stays editable and what is in the field on "Join" is saved.
+ */
+function prefillName(M) {
+  if (M.link === M.seenLink) return false;
+  M.seenLink = M.link;
+  let name = null;
+  try {
+    name = parseJoinLink(M.link || "").name;
+  } catch {}
+  if (!name) return false;
+  const untouched = !(M.name || "").trim() || M.prefilledName === M.name;
+  if (!untouched) return false;
+  M.name = name;
+  M.prefilledName = name;
+  return true;
 }
 
 function doJoin(M) {
@@ -889,7 +953,7 @@ async function clip(text) {
     toast(t("ui.toast.copy_failed", { error: e.message }), "error", { err: true });
   }
 }
-const copyLink = (r) => clip(r.link);
+const copyLink = (r) => clip(r.inviteLink());
 
 /* ============================== boot ============================== */
 
@@ -900,6 +964,7 @@ for (const saved of loadRooms()) {
   } catch {}
 }
 S.selected = S.rooms[0] ? S.rooms[0].id : null;
+joinFromHash(); // before the first render: an open join dialog holds back the "Choose your name" modal
 render();
 if (caps.canWatch) for (const r of S.rooms) if (r.auto) connectRoom(r, { quiet: true });
 if (caps.webCodecsEncode) {
@@ -914,9 +979,9 @@ function joinFromHash() {
   if (!m) return;
   openAdd("join");
   S.modal.link = decodeURIComponent(m[1]);
+  prefillName(S.modal);
   history.replaceState(null, "", location.pathname + location.search);
   render();
 }
-joinFromHash();
 window.addEventListener("hashchange", joinFromHash);
 window.__sss = { S, render }; // debugging handle (also used by the local verification scripts)

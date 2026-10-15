@@ -1,10 +1,14 @@
-// Join links: `server|room-id|key[|certhash]`, mirroring `client/src/net.rs`
-// (`parse_join_string` / `format_join_string_with_hash`).
+// Join links: `server|room-id|key[|certhash[|name]]`, mirroring `client/src/net.rs`
+// (`parse_join_string` / `format_join_string_full`); protocol-spec.md section 11.4.
 //
 //   server    host:port of the relay
 //   room-id   16 bytes, 32 lowercase hex chars
 //   key       32-byte AES-256-GCM room key, base64url, no padding (43 chars)
-//   certhash  optional, SHA-256 of the relay's leaf cert DER, base64url, no padding (43 chars)
+//   certhash  optional, SHA-256 of the relay's leaf cert DER, base64url, no padding (43 chars);
+//             empty when only a name follows (`server|id|key||name`, a CA-certificate relay)
+//   name      optional, the room's display name, UTF-8 percent-encoded (task #69, user request 2026-10-15).
+//             Cosmetic and not part of the room's identity: a name that does not decode (malformed `%`, invalid
+//             UTF-8, empty after trimming) is dropped, the link stays valid.
 
 export class JoinLinkError extends Error {
   constructor(message) {
@@ -46,19 +50,55 @@ export function hexToBytes(hex) {
   return out;
 }
 
+/** Longest room name (chars) a link's 5th field may carry; longer names are cut (native `MAX_LINK_ROOM_NAME_CHARS`). */
+export const MAX_LINK_ROOM_NAME_CHARS = 64;
+
+/**
+ * Percent-encode a room name as UTF-8 exactly like the native encoder: only `A-Za-z0-9-._~` stay raw, so `|` and `%`
+ * can never appear and the output is plain ASCII. `encodeURIComponent` additionally leaves `! ' ( ) *` raw; they are
+ * escaped here so a link formatted by either client is byte-identical. Returns "" for a blank name or one that is
+ * not valid UTF-16 (a lone surrogate): the name is optional, so it is simply left off.
+ */
+export function encodeLinkName(name) {
+  const n = String(name ?? "").trim();
+  if (!n) return "";
+  try {
+    return encodeURIComponent(n).replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Lenient inverse of {@link encodeLinkName} (native `decode_link_name`): null for a malformed `%` sequence, invalid
+ * UTF-8, or a name that is empty after trimming. Control characters are dropped and the result is capped at
+ * {@link MAX_LINK_ROOM_NAME_CHARS} characters (code points). Accepts `! ' ( ) *` raw, as `encodeURIComponent` emits.
+ */
+export function decodeLinkName(field) {
+  let decoded;
+  try {
+    decoded = decodeURIComponent(String(field ?? "").trim());
+  } catch {
+    return null;
+  }
+  const chars = Array.from(decoded.replace(/\p{Cc}/gu, "")).slice(0, MAX_LINK_ROOM_NAME_CHARS);
+  const name = chars.join("").trim();
+  return name || null;
+}
+
 const EXPECTED = "expected server|room-id|key or server|room-id|key|certhash";
 
 /**
  * Parse a join link. Throws JoinLinkError with the same wording as the native client.
  * @returns {{server:string, host:string, port:number|null, roomId:Uint8Array, roomIdHex:string,
- *            roomKey:Uint8Array, certHash:Uint8Array|null}}
+ *            roomKey:Uint8Array, certHash:Uint8Array|null, name:string|null}}
  */
 export function parseJoinLink(link) {
   const s = String(link).trim();
-  // Rust: splitn(4, '|') — the 4th field keeps any further '|' (and then fails to decode).
+  // Rust: splitn(5, '|') — the 5th field (the name) keeps any further '|'.
   const parts = [];
   let rest = s;
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; i < 4; i++) {
     const at = rest.indexOf("|");
     if (at < 0) {
       parts.push(rest);
@@ -100,8 +140,10 @@ export function parseJoinLink(link) {
     if (certHash.length !== 32) throw new JoinLinkError(`join string has an invalid cert hash (must decode to 32 bytes, got ${certHash.length})`);
   }
 
+  const name = parts[4] === undefined ? null : decodeLinkName(parts[4]);
+
   const { host, port } = splitHostPort(server);
-  return { server, host, port, roomId, roomIdHex: roomIdHex.toLowerCase(), roomKey, certHash };
+  return { server, host, port, roomId, roomIdHex: roomIdHex.toLowerCase(), roomKey, certHash, name };
 }
 
 /** Split `host:port`, `[v6]:port` or a bare host. */
@@ -115,16 +157,33 @@ export function splitHostPort(server) {
   return { host: server, port: null };
 }
 
-/** `server|room-id|key[|certhash]`. */
-export function formatJoinLink(server, roomId, roomKey, certHash = null) {
+/**
+ * `server|room-id|key[|certhash[|name]]`. A blank `name` yields the 3/4-field form; a name without a hash leaves the
+ * 4th field empty (`server|id|key||name`), like native `format_join_string_full`.
+ */
+export function formatJoinLink(server, roomId, roomKey, certHash = null, name = null) {
   let out = `${server}|${bytesToHex(roomId)}|${base64urlEncode(roomKey)}`;
-  if (certHash) out += `|${base64urlEncode(certHash)}`;
+  const enc = encodeLinkName(name);
+  if (certHash || enc) out += "|";
+  if (certHash) out += base64urlEncode(certHash);
+  if (enc) out += `|${enc}`;
   return out;
 }
 
 /**
+ * The link as a saved room stores it: without the name (a local, editable label; native also keeps the name out of the
+ * saved join string). A link with at most four fields is returned unchanged (trimmed).
+ */
+export function stripLinkName(link) {
+  const parts = String(link).trim().split("|");
+  if (parts.length < 5) return parts.join("|");
+  return parts.slice(0, 4).join("|").replace(/\|$/, "");
+}
+
+/**
  * Mint a brand-new room (random id + key, like native `create_room`).
- * The room name is not part of the link: it is a local label, so it is only echoed back.
+ * The room name is local (echoed back as `name`); the returned `link` carries it as the 5th field, like native
+ * `invite_link`, so a link shared from here pre-fills the receiver's join dialog.
  * Nothing touches the network; joining the room is what creates it on the relay.
  */
 export function createRoom(server, { name = "", certHash = null } = {}) {
@@ -132,5 +191,5 @@ export function createRoom(server, { name = "", certHash = null } = {}) {
   if (!server) throw new JoinLinkError("server address must not be empty");
   const roomId = crypto.getRandomValues(new Uint8Array(16));
   const roomKey = crypto.getRandomValues(new Uint8Array(32));
-  return { name: String(name).trim(), server, roomId, roomKey, link: formatJoinLink(server, roomId, roomKey, certHash) };
+  return { name: String(name).trim(), server, roomId, roomKey, link: formatJoinLink(server, roomId, roomKey, certHash, name) };
 }

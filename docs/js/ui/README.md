@@ -43,5 +43,14 @@ all paths relative so GitHub Pages can serve `docs/` under `/simple-screensharin
 * **Pop-out.** `documentPictureInPicture.requestWindow()` (Chromium 116+) is a real always-on-top window; the tile's canvas
   moves into it (no second decode). One such window per page, so popping out another stream brings the first back.
   Without it, the canvas moves into a fullscreen stage instead.
-* **Join links in the URL.** `index.html#join=<link>` opens the join dialog prefilled.
+* **Join links in the URL.** `index.html#join=<link>` opens the join dialog prefilled (name field too, when the link has one).
+* **Display name and room name in links (task #69, user requests 2026-10-15).** The default display name is `user-` + 4 random
+  `[a-z0-9]` (`store.js` `autoName()`, own localStorage key `sss.autoname.v1`, so it is stable across reloads) while
+  `settings.name` stays `""` until the user chooses one; `displayName()` is the chosen name or the auto one. `settings.nameSet`
+  records that a name was chosen. While it is false, one "Choose your name" modal opens per page load as soon as no other
+  modal is open (`app.js` `promptForName`): prefilled and selected, Save (Enter) / Later (Escape, x, backdrop), mirroring native
+  `Modal::ChooseName`. Copy-invite (`RoomEntry.inviteLink()`) appends the room's saved name; a pasted link with a name prefills
+  the join dialog's name field (`prefillName`, same rule as native: only when the field is empty or still holds the previous
+  prefill); a saved room keeps its plain link (`stripLinkName`). The name is sent at connect, so rooms that auto-connected
+  before the user saved keep the old name for their peers until the next reconnect (same as native; the settings note says so).
 * `window.__sss` exposes the state for debugging and local verification scripts.

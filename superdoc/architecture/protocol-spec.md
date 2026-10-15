@@ -638,7 +638,7 @@ server|room-id|key||name               (CA relay: empty certhash field, name pre
 ```
 
 All forms are valid everywhere; a parser that knows only 3/4 fields rejects the 5-field forms
-(the browser parser still does, see below; task #69).
+(both shipped clients, native and browser, parse all forms; browser: task #69, 2026-10-15).
 
 `certhash` = SHA-256 of the relay's **leaf certificate DER**, **base64url, no padding** (43
 characters), same encoding as `key`. An **empty** `certhash` field means "no hash" (that is how a
@@ -668,11 +668,11 @@ the add-room dialog should fill the name field (still editable before adding). `
 and not base64url:` the link stays human-readable, and the browser mirrors it with stdlib
 (`encodeURIComponent` / `decodeURIComponent`).
 
-`Browser compatibility (as of this change):` `docs/js/core/joinlink.js` `parseJoinLink` splits at
-the first three `|` and treats the remainder as the cert hash, so `hash|name` (and `|name`)
-fails the base64url check and is **rejected** with `join string has an invalid cert hash`. The
-browser must learn the 5th field (task #69) before it can open a link copied from a native client
-that has a named room.
+`Browser:` `docs/js/core/joinlink.js` (`parseJoinLink`, `formatJoinLink`, `encodeLinkName`,
+`decodeLinkName`) implements the same rules, with `!'()*` escaped on encode so both clients produce
+byte-identical links; `docs/dev/tests.js` checks the native vectors (`a|b`, `100%`, `%41`, umlauts,
+emoji, `a|b|c|d`, bad `%4`/`%zz`/`%FF%FE`/`%0A`). Before task #69 the browser split at the first three
+`|` and rejected `hash|name` as an invalid cert hash.
 
 `Why links go stale:` a pinned hash is only valid while the relay presents that exact
 certificate, i.e. until its next rotation (a link made right after a rotation is good for ~11
