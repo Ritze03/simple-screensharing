@@ -6,14 +6,17 @@
 //!   [`PopoverKind::ShareMenu`] (add here / move here / share a different
 //!   screen) only appear while another capture is live elsewhere; "Share
 //!   audio" is disabled (audio rides along with a screen).
-//! - Picking / Staged: `[84 pill][fill status][audio][Stream settings][sep][Discard][Go live]`
+//! - Picking / Staged: `[pill][fill status][audio][Stream settings][sep][Discard][Go live]`
 //!   (Picking disables audio, Stream settings and Go live).
-//! - Live: `[84 pill][fill status][audio control][Stream settings][N rooms ▾][sep][Stop sharing]`
+//! - Live: `[pill][fill status][audio control][Stream settings][N rooms ▾][sep][Stop sharing]`
 //!   (`N rooms ▾` = [`PopoverKind::Rooms`]: Also send to + Move to). While
 //!   the pill says Starting only because the capture has no first frame yet
 //!   (an idle monitor), the status reads "Waiting for the screen to change /
 //!   Move the mouse over it to start" (+ tooltip) instead of screen · fps.
-//! - Paused (room reconnecting): `[84 pill][fill status]`.
+//! - Paused (room reconnecting) / Connecting: `[pill][fill status]`.
+//!
+//! `[pill]` is one width in every layout: 84 px or the widest label any bar
+//! pill can show in the current language ([`bar_pill_w`]).
 //!
 //! "audio" is either a `Share audio ▾` button or, once a source is chosen, the
 //! audio control `[36 mute][source name · meter · ▾]` (mockup `.audio-ctl`);
@@ -118,7 +121,7 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, st: &mut ActionBarState) {
 /// `connecting`: a first connect is in flight (nothing was ever shared here,
 /// so "paused until the room is back" would be wrong).
 fn paused(ui: &mut Ui, connecting: bool) {
-    let row = HBox::new("action_bar", theme::CTL_H_LG).gap(theme::S2).slots(&[fixed(84.0), FILL]).show(ui);
+    let row = HBox::new("action_bar", theme::CTL_H_LG).gap(theme::S2).slots(&[fixed(bar_pill_w(ui)), FILL]).show(ui);
     if connecting {
         let text = tr("ui.room.connecting_pill", "Connecting");
         paint_pill(ui, row.cell(0), Pill::progress(&text).large());
@@ -180,12 +183,13 @@ fn staged(ui: &mut Ui, cx: &mut Cx, room: RoomHandle, capture: CaptureSourceId, 
     let audio_at = |l: usize| AudioSlot::new(ui, staged_name.clone(), false, None, !picking, l >= 2);
     let discard_at = |l: usize| if l >= 3 { Btn::secondary("").icon("close").large().tip(&discard_l) } else { Btn::secondary(&discard_l).large() };
     let go_at = |l: usize| icon_only(Btn::primary(&go_l).icon("cast").large().enabled(!picking), l >= 4, &go_l);
+    let pill_w = bar_pill_w(ui);
     let level = fit_level(ui.available_width(), 6, 4, |l| {
-        84.0 + audio_at(l).width + settings_at(l).width(ui) + 1.0 + discard_at(l).width(ui) + go_at(l).width(ui)
+        pill_w + audio_at(l).width + settings_at(l).width(ui) + 1.0 + discard_at(l).width(ui) + go_at(l).width(ui)
     });
     let (settings, audio, discard, go) = (settings_at(level), audio_at(level), discard_at(level), go_at(level));
     let slots = [
-        fixed(84.0),
+        fixed(pill_w),
         FILL,
         fixed(audio.width),
         fixed(settings.width(ui)),
@@ -257,12 +261,13 @@ fn live(ui: &mut Ui, cx: &mut Cx, room: RoomHandle, capture: CaptureSourceId, de
     };
     let audio_at = |l: usize| AudioSlot::new(ui, audio_name.clone(), muted, Some(lit), true, l >= 3);
     let stop_at = |l: usize| icon_only(Btn::danger_solid(&stop_l).icon("stop_screen_share").large(), l >= 4, &stop_l);
+    let pill_w = bar_pill_w(ui);
     let level = fit_level(ui.available_width(), 6, 4, |l| {
-        84.0 + audio_at(l).width + settings_at(l).width(ui) + rooms_at(l).width(ui) + 1.0 + stop_at(l).width(ui)
+        pill_w + audio_at(l).width + settings_at(l).width(ui) + rooms_at(l).width(ui) + 1.0 + stop_at(l).width(ui)
     });
     let (settings, rooms, audio, stop) = (settings_at(level), rooms_at(level), audio_at(level), stop_at(level));
     let slots = [
-        fixed(84.0),
+        fixed(pill_w),
         FILL,
         fixed(audio.width),
         fixed(settings.width(ui)),
@@ -816,8 +821,40 @@ pub(super) fn video_destination_count(cx: &Cx) -> usize {
 }
 
 /// A pill left-aligned and vertically centred in `cell`.
+/// Every pill the bar's pill slot can show: (lead, locale key, English).
+/// Width depends only on lead and text, so the tone is left out. Keep in
+/// sync with `paused`, `staged` and [`dest_pill`] (a debug build asserts in
+/// [`paint_pill`] that nothing is clipped).
+pub(super) const BAR_PILLS: [(PillLead<'static>, &str, &str); 10] = [
+    (PillLead::Bar, "ui.room.connecting_pill", "Connecting"),
+    (PillLead::Icon("pause"), "ui.bar.paused", "Paused"),
+    (PillLead::Bar, "ui.bar.picking", "Picking"),
+    (PillLead::None, "ui.bar.ready", "Ready"),
+    (PillLead::Bar, "ui.pill.moving", "Moving"),
+    (PillLead::Dot, "ui.pill.live", "Live"),
+    (PillLead::Bar, "ui.pill.starting", "Starting"),
+    (PillLead::Bar, "ui.pill.applying", "Applying"),
+    (PillLead::Icon("sync"), "ui.pill.stalled", "Stalled"),
+    (PillLead::Icon("sync"), "ui.pill.failed", "Failed"),
+];
+
+/// The bar's pill slot: the mockup's 84 px, or the widest [`BAR_PILLS`]
+/// label in the current language if that is wider. `Why` one width for all
+/// of them, not the shown pill's: the status text next to it must not jump
+/// when Starting turns Live. `Why` measured at all: a fixed 84 clipped
+/// "CONNECTING" to "CONNECTI" (user report 2026-10-15).
+pub(super) fn bar_pill_w(ui: &Ui) -> f32 {
+    bar_pill_w_with(ui, |k, en| tr(k, en))
+}
+
+/// [`bar_pill_w`] with the label lookup injected (tests measure each locale).
+pub(super) fn bar_pill_w_with(ui: &Ui, text: impl Fn(&str, &'static str) -> String) -> f32 {
+    BAR_PILLS.iter().map(|(lead, k, en)| Pill::muted(&text(k, en)).lead(*lead).large().width(ui)).fold(84.0, f32::max)
+}
+
 fn paint_pill(ui: &Ui, cell: Rect, pill: Pill) {
     let h = if pill.large { theme::PILL_H_LG } else { theme::PILL_H };
+    debug_assert!(pill.width(ui) <= cell.width() + 0.5, "bar pill {:?} clipped: add it to BAR_PILLS", pill.text);
     let w = pill.width(ui).min(cell.width());
     pill.paint(ui, Rect::from_min_size(pos2(cell.left(), cell.center().y - h / 2.0), vec2(w, h)));
 }

@@ -630,3 +630,41 @@ fn live_in_toast_fires_once_per_on_air_spell() {
     assert!(newly_on_air(&mut announced, &[]).is_empty());
     assert_eq!(newly_on_air(&mut announced, &[RoomHandle(7)]), vec![RoomHandle(7)], "announced again after leaving air");
 }
+
+/// #75: the user saw the bar's pill clipped to "CONNECTI" (fixed 84 px slot).
+/// The bar's pill slot fits every label it can show, in every locale, and the
+/// small LIVE pill fits `person_row`'s 44 px live slot.
+#[test]
+fn pill_slots_fit_every_label_in_every_locale() {
+    use super::action_bar::{BAR_PILLS, bar_pill_w_with};
+    use crate::widgets::{Pill, PillLead};
+    let ctx = ctx();
+    let mut checked = 0;
+    for _ in 0..2 {
+        checked = 0;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                for loc in ["en", "de"] {
+                    let text = |k: &str, en: &'static str| {
+                        let s = t!(k, locale = loc);
+                        if s.as_ref() == k || s.ends_with(k) { en.to_string() } else { s.into_owned() }
+                    };
+                    let slot = bar_pill_w_with(ui, text);
+                    for (lead, k, en) in BAR_PILLS {
+                        let label = text(k, en);
+                        let w = Pill::muted(&label).lead(lead).large().width(ui);
+                        assert!(w <= slot, "{loc}: bar pill {label:?} is {w} px, slot {slot}");
+                        checked += 1;
+                    }
+                    let live = text("ui.pill.live", "Live");
+                    let w = Pill::live(&live).lead(PillLead::None).width(ui);
+                    assert!(w <= 44.0, "{loc}: people-row LIVE pill is {w} px, slot 44");
+                }
+                let connecting = Pill::progress("Connecting").large().width(ui);
+                assert!(bar_pill_w_with(ui, |_, en| en.to_string()) >= connecting, "regression: CONNECTING must fit");
+                assert!(connecting > 84.0, "the old 84 px slot really was too narrow ({connecting})");
+            });
+        });
+    }
+    assert_eq!(checked, 2 * BAR_PILLS.len());
+}

@@ -7,7 +7,7 @@
 //!
 //! Body: two equal columns (gap 12), each a vbox of cards (gap 12):
 //! - where it goes: Source (Screen / Audio + meter / Mute), Sending to (dest
-//!   rows `[18][fill][84 pill][76 kbps][32 ×]` + an Info banner "an idle screen
+//!   rows `[18][fill][≥84 pill][76 kbps][32 ×]` + an Info banner "an idle screen
 //!   sends nothing until it changes" while a Starting row waits for the
 //!   capture's first frame + equal `[Also send to…][Move to…]`),
 //!   Upload bandwidth (Mode / Total / Floor / Per stream or over-budget banner);

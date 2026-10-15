@@ -127,7 +127,7 @@ pub struct ModalSpec<'a> {
     pub sub: Option<&'a str>,
     /// `theme::MODAL_W` / `MODAL_W_WIDE` / `MODAL_W_XWIDE`; capped at window − 48.
     pub width: f32,
-    /// Optional 96-slot pill in the head band (e.g. "Applying").
+    /// Optional pill in the head band (e.g. "Applying"), in a slot of max(96, its width).
     pub head_pill: Option<super::Pill<'a>>,
 }
 
@@ -139,7 +139,7 @@ pub struct ModalAction {
 }
 
 /// The modal's chrome drawn into `ui` (no backdrop / window): head band
-/// `[fill vbox(title, sub)][96 pill?][32 ×]` 56 px, a vertical `ScrollArea` body
+/// `[fill vbox(title, sub)][pill? max(96, its width)][32 ×]` 56 px, a vertical `ScrollArea` body
 /// (padding 16/20, 12 px between items), and a 64 px footer band (padding 20) in which
 /// `footer` runs — use [`modal_footer`] there. `max_h` caps the total height.
 pub fn modal_frame(ui: &mut Ui, spec: &ModalSpec, max_h: f32, body: impl FnOnce(&mut Ui), footer: impl FnOnce(&mut Ui)) -> ModalAction {
@@ -153,7 +153,10 @@ pub fn modal_frame(ui: &mut Ui, spec: &ModalSpec, max_h: f32, body: impl FnOnce(
             ui.set_width(w - 2.0);
             ui.spacing_mut().item_spacing.y = 0.0;
             // Head band.
-            let slots_pill = [FILL, fixed(96.0), fixed(theme::CTL_H)];
+            // `Why` measured: a fixed 96 slot clips a pill wider than that
+            // (the bar's 84 clipped "CONNECTING", 2026-10-15).
+            let pill_w = spec.head_pill.map_or(96.0, |p| p.width(ui).max(96.0));
+            let slots_pill = [FILL, fixed(pill_w), fixed(theme::CTL_H)];
             let slots_plain = [FILL, fixed(theme::CTL_H)];
             let slots: &[Slot] = if spec.head_pill.is_some() { &slots_pill } else { &slots_plain };
             let head = HBox::new("modal_head", theme::BAND_H).pad(20.0, theme::S3).gap(theme::S3).slots(slots).show(ui);

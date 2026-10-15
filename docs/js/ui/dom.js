@@ -31,9 +31,13 @@ function box(kind, o, kids) {
 }
 export const V = (o, ...kids) => box("vb", o, kids);
 export const H = (o, ...kids) => box("hb", o, kids);
+// `o.min`: `w` is a minimum and the slot grows to its content (a pill slot:
+// a fixed 84 overflowed "ÜBERNIMMT"/"STARTING"; the native bar clipped
+// "CONNECTING", user report 2026-10-15).
 export const SL = (w, kids, o) => {
   o = o || {};
-  return h(o.tag || "div", Object.assign({}, o.attrs || {}, { class: "sl" + (o.al ? " " + o.al : "") + (o.cls ? " " + o.cls : ""), style: `width:${w}px;flex-basis:${w}px` + (o.style ? ";" + o.style : "") }), kids);
+  const size = o.min ? `min-width:${w}px;flex-basis:auto` : `width:${w}px;flex-basis:${w}px`;
+  return h(o.tag || "div", Object.assign({}, o.attrs || {}, { class: "sl" + (o.al ? " " + o.al : "") + (o.cls ? " " + o.cls : ""), style: size + (o.style ? ";" + o.style : "") }), kids);
 };
 export const FILL = (kids, o) => {
   o = o || {};
@@ -116,12 +120,12 @@ export function personRow({ avatar, name, you, youLabel, pill, eye, idle, stale 
   return H({ cls: "member" + (idle ? " idle" : "") + (stale ? " stale" : "") },
     SL(22, avatar), FILL(h("span", { class: "txt name" }, name, you ? h("span", { class: "you", text: youLabel }) : null)), SL(44, pill, { al: "r" }), SL(18, eye));
 }
-/** Destination row: hbox [slot 18 icon][fill name][slot 84 pill][slot 76 kbps][slot 32 action] */
+/** Destination row: hbox [slot 18 icon][fill name][slot min 84 pill][slot 76 kbps][slot 32 action] */
 export function destRow({ cur, name, curLabel, pill, kbps, action }) {
   return H({ cls: "destrow" + (cur ? " cur" : "") },
     SL(18, ic(cur ? "radio_button_checked" : "meeting_room", "ico")),
     FILL(h("span", { class: "txt name" }, name, cur ? h("small", { text: curLabel }) : null)),
-    SL(84, pill, { al: "l" }), SL(76, h("span", { class: "kbps", text: kbps }), { al: "r" }), SL(32, action));
+    SL(84, pill, { al: "l", min: true }), SL(76, h("span", { class: "kbps", text: kbps }), { al: "r" }), SL(32, action));
 }
 /** Popup item: hbox [slot 18 icon][fill vbox(label, sub)][slot 23 trailing?] */
 export function popItem({ icon, iconEl, label, sub, onclick, cls, disabled, trailing, role }) {

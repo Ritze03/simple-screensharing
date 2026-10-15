@@ -429,7 +429,7 @@ function renderPeople(r) {
 /* ---------- bottom action bar ---------- */
 
 function barStatus(pill, t1, t2) {
-  return [SL(84, pill, { al: "l" }), FILL(V({ g: 0 }, t1 ? T(t1, "t1") : null, t2 ? T(t2, "t2") : null), { v: true })];
+  return [SL(84, pill, { al: "l", min: true }), FILL(V({ g: 0 }, t1 ? T(t1, "t1") : null, t2 ? T(t2, "t2") : null), { v: true })];
 }
 function renderBar(r) {
   const liveCap = capInRoom(r.id);
@@ -446,7 +446,7 @@ function renderBar(r) {
       const subs = st ? t("ui.bar.viewers", { count: st.subscribers }) : "";
       return `${codecLabel(d.codec)} · ${fmtKbps(allocated(d))}${subs ? " · " + subs : ""}`;
     });
-    return bar(SL(84, pill, { al: "l" }), FILL(V({ g: 0 }, T(`${captureName(liveCap)} · ${d.fps} fps`, "t1"), t2), { v: true }),
+    return bar(SL(84, pill, { al: "l", min: true }), FILL(V({ g: 0 }, T(`${captureName(liveCap)} · ${d.fps} fps`, "t1"), t2), { v: true }),
       audioControl(liveCap),
       h("button", { class: "btn btn-secondary btn-lg", type: "button", id: "btn-stream-settings", onclick: () => openStreamModal(liveCap.id, r.id) }, ic("tune"), t("ui.bar.stream_settings")),
       h("button", { class: "btn btn-secondary btn-lg", type: "button", title: t("ui.bar.rooms_tip"), onclick: (e) => openPopup("rooms", e.currentTarget) }, ic("cast"),
@@ -604,7 +604,7 @@ function renderStreamModal(M, close) {
       h("button", { class: "btn btn-primary btn-lg", type: "button", onclick: close }, t("ui.stream.done"))];
   return modalShell("xwide", staged ? t("ui.stream.title_staged") : t("ui.stream.title_live"),
     staged ? t("ui.stream.sub_staged", { screen: captureName(c), room: r.name }) : t("ui.stream.sub_live", { room: r.name }), close, body, foot,
-    SL(96, applying ? h("span", { class: "badge badge-progress lg" }, h("span", { class: "bar" }), t("ui.bar.applying")) : null, { al: "r" }), t("ui.close"));
+    SL(96, applying ? h("span", { class: "badge badge-progress lg" }, h("span", { class: "bar" }), t("ui.bar.applying")) : null, { al: "r", min: true }), t("ui.close"));
 }
 
 async function repick(c, r) {
