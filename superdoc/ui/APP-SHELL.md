@@ -74,8 +74,13 @@ its "Proposed" tab).
   width either stacks English for nothing or still truncates German. *Why the banner
   keeps its words:* Retry now is its whole point. Details in `stream_settings.rs`
   (`column_need`) and `room::reconnect_banner`.
-- **No self-preview** of your own share. *Why:* matches the former Electron app's deliberate
-  removal (see `superdoc/features/self-preview.md`).
+- **Own-tile live preview** (#78, user request 2026-10-15): the own card in "Sharing in this room"
+  shows a live <= 640x360 / <= 30 fps picture of what is captured **while the window is focused**
+  (`LIVE`/`STARTING` chip left, `PREVIEW` chip right); unfocused, minimized or with the tile not
+  painted it is the hatched "Your screen" placeholder and the capture's preview branch is closed.
+  *Why:* "show a stream preview while tabbed into the program; otherwise fine to hide it". It replaces
+  the earlier deliberate "no self-preview". Code: `room::my_card`, `App::poll_live_previews`,
+  `UiAction::LivePreviewSeen`; design in `superdoc/features/self-preview.md`.
 
 ### Layout implementation rule
 

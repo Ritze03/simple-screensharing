@@ -1081,12 +1081,19 @@ mod tests {
     /// #47: at the modal's full width (1120 − 2 × 20 frame padding, gap 12)
     /// every shipped locale must get two columns, even with the Screen
     /// readout at its cap and the staged "Change" slot.
+    ///
+    /// `Why each locale runs in a child process (task #78, flaky tests):` the
+    /// locale is process-global (`rust_i18n::set_locale`) and the other tests
+    /// run in parallel reading it, so switching to `de` here made
+    /// `share_label_translates_known_defaults_only` and others fail at random
+    /// (`left: "Bildschirmfreigabe", right: "Screen share"`). In its own
+    /// process the switch touches nobody.
     #[test]
     fn every_locale_fits_two_columns_at_full_modal_width() {
-        let col = (theme::MODAL_W_XWIDE - 40.0 - theme::S3) / 2.0;
-        let prev = rust_i18n::locale().to_string();
-        for loc in ["en", "de"] {
-            rust_i18n::set_locale(loc);
+        const NAME: &str = "ui::stream_settings::tests::every_locale_fits_two_columns_at_full_modal_width";
+        if let Ok(loc) = std::env::var("SSS_TEST_LOCALE") {
+            rust_i18n::set_locale(&loc);
+            let col = (theme::MODAL_W_XWIDE - 40.0 - theme::S3) / 2.0;
             let ctx = egui::Context::default();
             theme::apply(&ctx);
             let mut need = 0.0;
@@ -1097,8 +1104,18 @@ mod tests {
                 });
             }
             assert!(need <= col, "{loc}: a column needs {need} px, the full-width modal gives {col}");
+            return;
         }
-        rust_i18n::set_locale(&prev);
+        for loc in ["en", "de"] {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--test-threads=1"])
+                .env("SSS_TEST_LOCALE", loc)
+                .output()
+                .expect("spawn the test binary");
+            let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            assert!(out.status.success() && text.contains("1 passed"), "{loc}: child run failed:
+{text}");
+        }
     }
 
     /// The Encoder card plus its reserved space is as tall closed as open, so

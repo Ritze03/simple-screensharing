@@ -11,7 +11,7 @@ all paths relative so GitHub Pages can serve `docs/` under `/simple-screensharin
 | `dom.js` | `h()` plus the layout primitives (`V`/`H`/`SL`/`FILL` = vbox/hbox/slot/fill) and the row patterns shared with the egui port (`ctrlRow`, `roomRow`, `sharerRow`, `personRow`, `destRow`, `popItem`, `btnRow`, `gridRows`, `modalShell`) |
 | `store.js` | the UI state object `S`, `localStorage` (settings, saved rooms), coalesced `invalidate()`, toasts |
 | `rooms.js` | one `RoomEntry` per saved room: its `RoomClient`, state, roster, streams, previews, watches; core events -> state |
-| `capture.js` | outgoing streams: a capture (one `getDisplayMedia` pick) and its destinations (one `startShare` per room), bandwidth split, live edits |
+| `capture.js` | outgoing streams: a capture (one `getDisplayMedia` pick) and its destinations (one `startShare` per room), bandwidth split, live edits, the own-tile live preview element (`previewFor`, attached only while the page is visible and focused) |
 | `popout.js` | pop-out viewer: Document Picture-in-Picture, fallback Fullscreen; the fullscreen stage is also the tile double-click |
 | `i18n.js` | en/de dictionary, `t(key, vars)` with the native `%{var}` placeholders. German is the informal "du" form with the native terms (identical strings where key and English text match `client/locales/de.yml`) |
 

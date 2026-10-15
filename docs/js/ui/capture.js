@@ -12,6 +12,51 @@ import { t } from "./i18n.js";
 
 let seq = 1;
 
+/* ---------- own-tile live preview (task #78) ----------
+ * The sharer already holds the captured MediaStream, so the own tile shows it in a muted <video>. `Why`
+ * only while the page is visible AND focused: user request 2026-10-15 ("show a preview while tabbed into the
+ * program, otherwise hide it"). Otherwise srcObject is detached so nothing renders or composites at all (the
+ * track itself keeps feeding the encoder). `Why a persistent element per capture:` render() rebuilds the
+ * whole tree on every state change; myCard() re-attaches the same element, so playback never restarts. */
+export const previewActive = () => document.visibilityState === "visible" && (typeof document.hasFocus !== "function" || document.hasFocus());
+
+function syncPreview(c) {
+  const el = c.previewEl;
+  if (!el) return;
+  const on = previewActive() && c.video && c.video.readyState === "live";
+  if (on) {
+    if (!el.srcObject) el.srcObject = new MediaStream([c.video]); // video only: a preview never plays audio
+    el.hidden = false;
+    el.play().catch(() => {});
+  } else {
+    el.pause();
+    el.srcObject = null;
+    el.hidden = true;
+  }
+}
+
+/** The capture's persistent preview element for myCard(), or null for a capture without video (audio-only). */
+export function previewFor(c) {
+  if (!c.video) return null;
+  if (!c.previewEl) {
+    const el = document.createElement("video");
+    el.className = "live-preview";
+    el.muted = true;
+    el.autoplay = true;
+    el.playsInline = true;
+    el.disablePictureInPicture = true;
+    el.setAttribute("aria-hidden", "true");
+    c.previewEl = el;
+  }
+  syncPreview(c);
+  return c.previewEl;
+}
+
+const syncAllPreviews = () => S.captures.forEach(syncPreview);
+document.addEventListener("visibilitychange", syncAllPreviews);
+window.addEventListener("focus", syncAllPreviews);
+window.addEventListener("blur", syncAllPreviews);
+
 export const capById = (id) => S.captures.find((c) => c.id === id) || null;
 export const capInRoom = (roomId) => S.captures.find((c) => c.dests.has(roomId)) || null;
 export const stagedFor = (roomId) => S.captures.find((c) => c.state !== "live" && c.stagedRoom === roomId) || null;
@@ -112,6 +157,12 @@ export function discard(c) {
 }
 
 function endCapture(c) {
+  if (c.previewEl) {
+    c.previewEl.pause();
+    c.previewEl.srcObject = null;
+    c.previewEl.remove();
+    c.previewEl = null;
+  }
   for (const roomId of [...c.dests.keys()]) stopDest(c, roomId, { keepCapture: true });
   if (c.stream) c.stream.getTracks().forEach((tr) => tr.stop());
   stopMeter(c);

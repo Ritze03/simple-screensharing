@@ -263,6 +263,9 @@ impl NextStream {
 /// see `apply.rs` for exactly what each does.
 #[derive(Debug, Clone)]
 pub enum UiAction {
+    /// The own tile of a video share was painted with the window focused
+    /// (every pass it is): keeps the live preview running ([`LIVE_PREVIEW_GRACE`]).
+    LivePreviewSeen(simple_screensharing_client::session::CaptureSourceId),
     // --- navigation -------------------------------------------------------
     /// Show a room (any connection state). Also sets `AppState::active_room`.
     SelectRoom(RoomKey),
@@ -437,7 +440,28 @@ pub struct Shell {
     /// build after `StopLevelTaps` is discarded.
     pending_taps: Vec<PendingTap>,
     tap_generation: u64,
+    /// The sharer's own live preview per capture (task #78): when its tile
+    /// was last painted and the texture of the newest frame. See
+    /// [`App::poll_live_previews`].
+    pub live_previews: HashMap<simple_screensharing_client::session::CaptureSourceId, LiveTile>,
 }
+
+/// One capture's own-tile live preview state ([`Shell::live_previews`]).
+#[derive(Default)]
+pub struct LiveTile {
+    /// `ctx.input(|i| i.time)` of the last pass that painted the tile with
+    /// the window focused ([`UiAction::LivePreviewSeen`]).
+    pub seen: f64,
+    /// The newest frame; `None` until the first one arrives, and dropped when
+    /// the preview stops so a frozen picture never passes for live.
+    pub tex: Option<egui::TextureHandle>,
+}
+
+/// How long after the own tile was last painted the live preview keeps
+/// running. A hidden tile (other room, other view) stops it within this.
+const LIVE_PREVIEW_GRACE: f64 = 0.6;
+/// Repaint interval while a live preview runs (~30 fps, the branch's rate).
+const LIVE_PREVIEW_REPAINT: std::time::Duration = std::time::Duration::from_millis(33);
 
 impl Shell {
     /// The last connect failure of `key`'s room ([`Shell::connect_errors`]).
@@ -1035,6 +1059,7 @@ impl App {
             self.toast(tr_with("ui.toast.live_in", "Live in %{room}", &[("room", &name.to_string())]), "cast");
         }
         self.videos.sync(&self.state);
+        self.poll_live_previews(ctx);
         self.poll_staged();
         self.poll_level_taps();
         self.prompt_for_name();
@@ -1050,6 +1075,43 @@ impl App {
             && !self.state.rooms.contains_key(room)
         {
             self.nav.modal = None;
+        }
+    }
+
+    /// The sharer's own live preview (task #78, user request 2026-10-15: show
+    /// a preview while tabbed into the program, otherwise hide it). A video
+    /// capture's preview branch is open only while the window is focused and
+    /// its own tile was painted a moment ago; otherwise the valve is closed
+    /// (no scale, no download, no texture upload, no repaint) and the texture
+    /// is dropped. Also uploads the newest frame.
+    fn poll_live_previews(&mut self, ctx: &egui::Context) {
+        use simple_screensharing_client::session::{ShareHandle, ShareStatus};
+        let (focused, minimized) = ctx.input(|i| (i.viewport().focused.unwrap_or(true), i.viewport().minimized.unwrap_or(false)));
+        let now = ctx.input(|i| i.time);
+        let live = &mut self.shell.live_previews;
+        live.retain(|id, _| self.state.captures.contains_key(id));
+        let mut running = false;
+        for (id, cap) in &self.state.captures {
+            let ShareStatus::Active(ShareHandle::Video(h)) = &cap.status else { continue };
+            let tile = live.get_mut(id);
+            let wanted = focused && !minimized && tile.as_ref().is_some_and(|t| now - t.seen < LIVE_PREVIEW_GRACE);
+            h.set_live_preview(wanted);
+            let Some(tile) = tile else { continue };
+            if !wanted {
+                tile.tex = None;
+                continue;
+            }
+            running = true;
+            if let Some(f) = h.live_preview_frame() {
+                let img = egui::ColorImage::from_rgba_unmultiplied([f.width as usize, f.height as usize], &f.rgba);
+                match &mut tile.tex {
+                    Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                    None => tile.tex = Some(ctx.load_texture(format!("live-preview-{id:?}"), img, egui::TextureOptions::LINEAR)),
+                }
+            }
+        }
+        if running {
+            ctx.request_repaint_after(LIVE_PREVIEW_REPAINT);
         }
     }
 

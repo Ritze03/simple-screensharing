@@ -274,6 +274,12 @@ select.field { cursor: pointer; padding-right: 6px; }
 .thumb .noprev .ms { font-size: 28px; }
 .thumb.mine { background-image: var(--screen-hatch); }
 .mine-label { color: var(--text-faint); font-size: 11px; }
+/* Own-tile live preview (task #78): capture.js attaches/detaches the stream with page focus; hidden = placeholder shows. */
+.thumb.mine > video.live-preview { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: block; background: var(--tile-bg); }
+.thumb.mine > video.live-preview[hidden] { display: none; }
+.thumb.mine .pv { display: none; }
+.thumb.mine:has(> video.live-preview:not([hidden])) .pv { display: inline-flex; }
+.thumb.mine:has(> video.live-preview:not([hidden])) .mine-label { display: none; }
 .mine-label .ms { font-size: 24px; color: var(--success); }
 .card-pad { padding: var(--s3); }
 .who b { font-size: 13.5px; flex: 0 0 auto; white-space: nowrap; }
