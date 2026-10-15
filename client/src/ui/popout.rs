@@ -20,7 +20,7 @@
 //!   Pushes [`UiAction::SetVolume`] through the main window.
 //! - **Waiting / stalled**: a centred chip before the first frame and while
 //!   the decoder reports a stall (always shown, not hover-gated).
-//! - **F11** toggles fullscreen, **Escape** only leaves fullscreen (never
+//! - **F11** or a **double-click** toggles fullscreen, **Escape** only leaves fullscreen (never
 //!   closes).
 //! - Title "sharer · room"; first size from the stream's aspect ratio.
 //!
@@ -211,12 +211,16 @@ fn refresh_info(cx: &Cx, key: StreamKey, shared: &Shared) -> bool {
 
 fn viewport(ctx: &egui::Context, shared: &Shared) {
     let hovered = ctx.input(|i| i.pointer.has_pointer());
+    let mut double_clicked = false;
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE.fill(Color32::BLACK))
         .show(ctx, |ui| {
             let rect = ui.max_rect();
             let pic = shared.view.lock().unwrap().paint(ui, rect, Fit::Contain);
             let first_frame = pic.width() > 0.0;
+            // Double-click toggles fullscreen. Registered before the chrome,
+            // whose buttons then take their own clicks.
+            double_clicked = ui.interact(rect, ui.id().with("popout_dbl"), Sense::click()).double_clicked();
             if !first_frame || shared.stalled.load(Ordering::Relaxed) {
                 let text = if first_frame {
                     tr("stream_control.state_stalled", "Waiting for capture…")
@@ -236,7 +240,7 @@ fn viewport(ctx: &egui::Context, shared: &Shared) {
             i.viewport().fullscreen.unwrap_or(false),
         )
     });
-    if f11 {
+    if f11 || double_clicked {
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
     } else if esc && fullscreen {
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));

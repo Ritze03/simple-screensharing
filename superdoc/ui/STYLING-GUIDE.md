@@ -159,6 +159,40 @@ number at a call site; if a role is missing, add a named `pub const` to `theme.r
   Stream settings is a modal (not a side panel) because the user found the side panel too
   squished.
 
+## Avatar colour (cross-client contract, task #77, 2026-10-15)
+
+An avatar's background is a **pure function of the person's display name**, so one person has the same colour
+in every room, for every viewer, on both clients, across restarts (the old scheme picked one of five gradients
+by connection id, so the colours changed every reconnect). *Why:* user request 2026-10-15 ("fixed, generated
+based on the name ... go through the whole hue"). The native and browser clients must compute **exactly**:
+
+1. key = display name, `trim()`med, Unicode-lowercased (`str::to_lowercase` / `toLowerCase()`), as UTF-8 bytes;
+2. `h` = FNV-1a 32-bit over the bytes (offset 2166136261, prime 16777619, wrapping u32 / `Math.imul(..) >>> 0`);
+3. `hue = h % 360`; colour = HSL(hue, **60 %**, **34 %**), converted with the CSS Color 4 formula
+   (`a = S*min(L,1-L)`, `f(n) = L - a*max(-1, min(k-3, 9-k, 1))`, `k = (n + hue/30) % 12`, channels `round(255*f)`),
+   a flat circle (no gradient), white bold initial.
+
+*Why S/L 60/34:* the white initial needs >= 3:1 (WCAG, bold text) on every hue and yellow (60 degrees) is the worst;
+at L = 45 % it is 2.3:1, at 34 % it is 3.6:1 (a test checks all 360 hues). A single S/L for all hues keeps the palette
+even. *Consequences:* a person who renames gets a new colour; two names can share a hue (1 in 360); an empty name
+hashes to hue 61. Vectors, asserted by **both** test suites (`client/src/theme.rs`, `docs/dev/tests.js`):
+
+| name | hue | colour |
+| --- | --- | --- |
+| `Ritze` | 177 | `#238b86` |
+| `mo` (also `  Mo `) | 245 | `#2b238b` |
+| `client-1` | 144 | `#238b4c` |
+| `client-2` | 321 | `#8b2366` |
+| `Zed` | 4 | `#8b2a23` |
+| `user-d740` | 328 | `#8b235a` |
+| `Größe` | 314 | `#8b2372` |
+| `` (empty) | 61 | `#898b23` |
+
+Code: native `theme::avatar_color(name)` / `avatar_hue`, drawn by `widgets::paint_avatar(.., color: Color32, ..)`;
+browser `docs/js/ui/dom.js` `avatarColor` / `avatarBg` (computed to the 8-bit hex and set inline, not left to CSS `hsl()`,
+so both clients are pixel-identical: checked from screenshots of the native rig and headless Chromium). Every avatar
+(user band, People rows, share cards, "you" card) passes the owner's display name, never a connection id.
+
 ## i18n
 
 Every user-visible string goes through `ui::tr(key, "English fallback")` /

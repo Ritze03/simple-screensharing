@@ -12,6 +12,7 @@ import { deriveCodecString, sniffCodec } from "../js/core/codec.js";
 import { DECODE_QUEUE_CATCHUP_THRESHOLD, JitterBuffer, MAX_DECODE_QUEUE, clampCatchUpSpeedPercent, clampMaxJitterBufferMs } from "../js/core/jitter.js";
 import { CanvasRenderer, VideoReceiver } from "../js/core/video-rx.js";
 import { ENCODER_PRESETS } from "../js/core/video-tx.js";
+import { avatarColor, avatarHue } from "../js/ui/dom.js";
 
 const tests = [];
 export const test = (name, fn) => tests.push({ name, fn });
@@ -911,6 +912,37 @@ test("canvas renderer: WebGL and 2D backends draw the same upright picture; a cr
     ok(near(cropped.at(8, 6), [0, 255, 0]), `${cropped.backend}: cropped top-left should be green, got ${cropped.at(8, 6)}`);
     ok(near(cropped.at(8, 42), [255, 255, 255]), `${cropped.backend}: cropped bottom-left should be white, got ${cropped.at(8, 42)}`);
   }
+});
+
+// ------------------------------------------------------------------------------------------------ avatar colour
+
+// Same table as client/src/theme.rs `avatar_colour_vectors_match_the_browser` (cross-client contract, task #77).
+test("avatar colour: vectors match the native client; trimmed and case-insensitive", () => {
+  const v = [
+    ["Ritze", 177, "#238b86"], ["mo", 245, "#2b238b"], ["client-1", 144, "#238b4c"], ["client-2", 321, "#8b2366"],
+    ["Zed", 4, "#8b2a23"], ["user-d740", 328, "#8b235a"], ["Größe", 314, "#8b2372"], ["", 61, "#898b23"], ["  Mo ", 245, "#2b238b"],
+  ];
+  for (const [name, hue, hex] of v) {
+    eq(avatarHue(name), hue, `hue of ${JSON.stringify(name)}`);
+    eq(avatarColor(name), hex, `colour of ${JSON.stringify(name)}`);
+  }
+  eq(avatarColor("RITZE"), avatarColor("ritze"), "case");
+});
+
+test("avatar colour: white initials keep >= 3:1 contrast on every hue", () => {
+  const lin = (c) => (c / 255 <= 0.04045 ? c / 255 / 12.92 : ((c / 255 + 0.055) / 1.055) ** 2.4);
+  const seen = new Set();
+  for (let i = 0; seen.size < 360 && i < 100000; i++) {
+    const name = "n" + i;
+    const hue = avatarHue(name);
+    if (seen.has(hue)) continue;
+    seen.add(hue);
+    const hex = avatarColor(name);
+    const [r, g, b] = [1, 3, 5].map((k) => parseInt(hex.slice(k, k + 2), 16));
+    const y = 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b);
+    ok(1.05 / (y + 0.05) >= 3, `hue ${hue} ${hex}: contrast ${(1.05 / (y + 0.05)).toFixed(2)}`);
+  }
+  eq(seen.size, 360, "hues covered");
 });
 
 // ------------------------------------------------------------------------------------------------ runner

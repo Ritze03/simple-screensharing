@@ -171,10 +171,28 @@ export function modalShell(cls, title, sub, close, body, foot, extraHead, closeL
     V({ cls: "modal-body", g: 3 }, body),
     foot ? H({ cls: "modal-foot", g: 2 }, foot) : null);
 }
-export const avatarClass = (id) => {
-  if (!id) return "";
-  let n = 0;
-  for (const ch of String(id)) n = (n * 31 + ch.charCodeAt(0)) >>> 0;
-  return "c" + ((n % 4) + 1);
-};
+/**
+ * Avatar colour, a pure function of the display name (cross-client contract: the native client implements the same,
+ * `client/src/theme.rs` `avatar_color`, and both test suites assert the same vectors).
+ * hue = FNV-1a 32-bit over the UTF-8 bytes of trim().toLowerCase(), mod 360; colour = HSL(hue, 60 %, 34 %).
+ * L = 34 % keeps white initials >= 3:1 on every hue (worst case yellow, 3.6:1).
+ */
+export function avatarHue(name) {
+  let x = 2166136261;
+  for (const b of new TextEncoder().encode(String(name == null ? "" : name).trim().toLowerCase())) x = Math.imul(x ^ b, 16777619) >>> 0;
+  return x % 360;
+}
+const AVATAR_S = 0.6, AVATAR_L = 0.34;
+export function avatarColor(name) {
+  const hue = avatarHue(name);
+  const a = AVATAR_S * Math.min(AVATAR_L, 1 - AVATAR_L);
+  const f = (n) => {
+    const k = (n + hue / 30) % 12;
+    const v = Math.round(255 * (AVATAR_L - a * Math.max(-1, Math.min(k - 3, 9 - k, 1))));
+    return v.toString(16).padStart(2, "0");
+  };
+  return "#" + f(0) + f(8) + f(4);
+}
+/** Inline style for an `.avatar` element showing `name`'s colour (computed to the exact 8-bit hex, not left to CSS hsl()). */
+export const avatarBg = (name) => "background:" + avatarColor(name);
 export const initial = (name) => (String(name || "?").trim()[0] || "?").toUpperCase();

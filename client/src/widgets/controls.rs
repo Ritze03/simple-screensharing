@@ -444,19 +444,18 @@ pub fn paint_status_dot(ui: &Ui, c: egui::Pos2, state: DotState) {
     }
 }
 
-/// A round avatar with `initial`, `size` = `AVATAR` or `AVATAR_SM`, gradient
-/// `theme::AVATAR_GRADIENTS[color % 5]`, and an optional green presence dot.
-pub fn avatar(ui: &mut Ui, initial: &str, size: f32, color: usize, presence: bool) -> Response {
+/// A round avatar with `initial`, `size` = `AVATAR` or `AVATAR_SM`, flat
+/// `color` (always `theme::avatar_color(name)`), and an optional green presence dot.
+pub fn avatar(ui: &mut Ui, initial: &str, size: f32, color: Color32, presence: bool) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
     paint_avatar(ui, rect, initial, color, presence);
     resp
 }
 
 /// Paint an avatar into a square `rect`.
-pub fn paint_avatar(ui: &Ui, rect: Rect, initial: &str, color: usize, presence: bool) {
-    let [a, b] = theme::AVATAR_GRADIENTS[color % theme::AVATAR_GRADIENTS.len()];
+pub fn paint_avatar(ui: &Ui, rect: Rect, initial: &str, color: Color32, presence: bool) {
     let p = ui.painter();
-    paint_gradient(p, rect, pill_radius(rect.height()), 140.0, a, b);
+    p.rect_filled(rect, pill_radius(rect.height()), color);
     let fs = if rect.height() <= theme::AVATAR_SM { 10.5 } else { 13.0 };
     paint_text(ui, rect, &initial.to_uppercase(), font(Weight::Bold, fs), Color32::WHITE, Align::Center);
     if presence {

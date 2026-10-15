@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use simple_screensharing_client::net::{format_join_string_with_hash, parse_join_string};
 use simple_screensharing_client::session::{self, PendingRole};
 
-use super::{App, Modal, StagedShare, UiAction, View, paired_audio, room_entries, same_room, tr, tr_with, view_is_room};
+use super::{App, FullscreenStream, Modal, StagedShare, UiAction, View, paired_audio, room_entries, same_room, tr, tr_with, view_is_room};
 
 impl App {
     /// Apply one action. `ctx` is only used for the clipboard.
@@ -174,6 +174,21 @@ impl App {
                 if let Some(e) = self.videos.get_mut(key) {
                     e.close_requested.store(false, Ordering::Relaxed);
                     e.popped = true;
+                }
+            }
+            UiAction::EnterStreamFullscreen(key) => {
+                // Only from the normal layout, and not for a popped-out stream
+                // (its tile is a placeholder; the pop-out has its own F11).
+                if self.nav.fullscreen.is_none() && self.videos.get(key).is_some_and(|e| !e.popped) {
+                    let was_fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+                    self.nav.fullscreen = Some(FullscreenStream { key, was_fullscreen });
+                    self.nav.popover = None;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                }
+            }
+            UiAction::ExitStreamFullscreen => {
+                if let Some(fs) = self.nav.fullscreen.take() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(fs.was_fullscreen));
                 }
             }
             UiAction::BringBack(key) => {

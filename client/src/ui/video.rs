@@ -109,6 +109,13 @@ impl VideoViews {
     }
 
 
+    /// Draw `key`'s video letterboxed into `rect` without allocating layout
+    /// space (black before the first frame). `None` if `key` isn't watched.
+    pub fn paint(&self, key: StreamKey, ui: &Ui, rect: egui::Rect, fit: Fit) -> Option<egui::Rect> {
+        let entry = self.entries.get(&key)?;
+        Some(entry.view.lock().unwrap().paint(ui, rect, fit))
+    }
+
     /// Newest frame size in pixels (`None` before the first frame).
     pub fn frame_size(&self, key: StreamKey) -> Option<(u32, u32)> {
         self.entries.get(&key)?.view.lock().unwrap().frame_size()

@@ -12,7 +12,7 @@ all paths relative so GitHub Pages can serve `docs/` under `/simple-screensharin
 | `store.js` | the UI state object `S`, `localStorage` (settings, saved rooms), coalesced `invalidate()`, toasts |
 | `rooms.js` | one `RoomEntry` per saved room: its `RoomClient`, state, roster, streams, previews, watches; core events -> state |
 | `capture.js` | outgoing streams: a capture (one `getDisplayMedia` pick) and its destinations (one `startShare` per room), bandwidth split, live edits |
-| `popout.js` | pop-out viewer: Document Picture-in-Picture, fallback Fullscreen |
+| `popout.js` | pop-out viewer: Document Picture-in-Picture, fallback Fullscreen; the fullscreen stage is also the tile double-click |
 | `i18n.js` | en/de dictionary, `t(key, vars)` with the native `%{var}` placeholders. German is the informal "du" form with the native terms (identical strings where key and English text match `client/locales/de.yml`) |
 
 ## Design notes (the why)
@@ -42,7 +42,7 @@ all paths relative so GitHub Pages can serve `docs/` under `/simple-screensharin
   only; changing the source means picking again.
 * **Pop-out.** `documentPictureInPicture.requestWindow()` (Chromium 116+) is a real always-on-top window; the tile's canvas
   moves into it (no second decode). One such window per page, so popping out another stream brings the first back.
-  Without it, the canvas moves into a fullscreen stage instead.
+  Without it, the canvas moves into a fullscreen stage instead. A tile double-click always uses that stage (`popOut(w, onBack, "fullscreen")`).
 * **Join links in the URL.** `index.html#join=<link>` opens the join dialog prefilled (name field too, when the link has one).
 * **Display name and room name in links (task #69, user requests 2026-10-15).** The default display name is `user-` + 4 random
   `[a-z0-9]` (`store.js` `autoName()`, own localStorage key `sss.autoname.v1`, so it is stable across reloads) while

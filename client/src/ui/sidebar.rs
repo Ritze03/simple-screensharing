@@ -229,7 +229,7 @@ pub fn show_user_band(ui: &mut Ui, cx: &mut Cx, _st: &mut SidebarState) {
     let starting = n_live == 0 && cx.live_rooms().iter().any(|h| cx.my_phase(*h) == Some(super::MyPhase::Starting));
     let online = cx.rooms().iter().any(|r| r.conn == ConnState::Joined);
     let av = Rect::from_center_size(row.cell(0).center(), vec2(theme::AVATAR, theme::AVATAR));
-    widgets::paint_avatar(ui, av, &initial, 0, online);
+    widgets::paint_avatar(ui, av, &initial, theme::avatar_color(&name), online);
 
     // "who": vbox(name 13 bold / 16 line, status 11 / 14 line); the hover
     // wash is padded 3/6 around it (mockup `.p-user .who`, margin 0 −6).

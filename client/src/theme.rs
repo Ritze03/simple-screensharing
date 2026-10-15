@@ -133,15 +133,36 @@ pub const OV_HBOX: Color32 = rgba(232, 163, 61, 0.85);
 pub const OV_SLOT: Color32 = rgba(80, 200, 120, 0.9);
 pub const OV_FILL: Color32 = rgba(200, 200, 210, 0.45);
 
-/// Avatar gradients (`.avatar`, `.avatar.c1`…`.c4`, all `140deg`): `[from, to]`.
-/// Index 0 is the accent mark gradient (used for "you").
-pub const AVATAR_GRADIENTS: [[Color32; 2]; 5] = [
-    [ACCENT_LIGHT, ACCENT_DEEP],
-    [Color32::from_rgb(0xE0, 0x7B, 0x5A), Color32::from_rgb(0xA3, 0x3F, 0x3F)],
-    [Color32::from_rgb(0x50, 0xC8, 0x78), Color32::from_rgb(0x2F, 0x7A, 0x55)],
-    [Color32::from_rgb(0xC5, 0x8A, 0xF9), Color32::from_rgb(0x6B, 0x3F, 0xA8)],
-    [Color32::from_rgb(0xE8, 0xC3, 0x3D), Color32::from_rgb(0x9A, 0x74, 0x20)],
-];
+/// Avatar saturation / lightness (HSL). `Why` L = 34 %: white initials need >= 3:1
+/// at every hue, and the worst hue is yellow (60 deg, contrast 3.6:1 here; at
+/// L = 45 % it would be 2.3:1). One S/L for all hues keeps the whole circle
+/// equally calm. Cross-client contract, see `superdoc/ui/STYLING-GUIDE.md`.
+const AVATAR_SAT: f64 = 0.60;
+const AVATAR_LIGHT: f64 = 0.34;
+
+/// Hue (0..360 degrees) of a person's avatar: FNV-1a 32-bit over the
+/// UTF-8 bytes of the trimmed, lowercased display name, modulo 360. A pure
+/// function of the name so every viewer, client and restart agrees (the
+/// browser client implements the same, `docs/js/ui/dom.js` `avatarHue`).
+pub fn avatar_hue(name: &str) -> u32 {
+    let mut h: u32 = 2_166_136_261;
+    for b in name.trim().to_lowercase().bytes() {
+        h = (h ^ u32::from(b)).wrapping_mul(16_777_619);
+    }
+    h % 360
+}
+
+/// Avatar background (flat) for `name`: `HSL(avatar_hue, 60 %, 34 %)`.
+pub fn avatar_color(name: &str) -> Color32 {
+    let h = f64::from(avatar_hue(name));
+    let a = AVATAR_SAT * AVATAR_LIGHT.min(1.0 - AVATAR_LIGHT);
+    let f = |n: f64| {
+        let k = (n + h / 30.0) % 12.0;
+        let v = AVATAR_LIGHT - a * (-1.0_f64).max((k - 3.0).min(9.0 - k).min(1.0));
+        (255.0 * v).round() as u8
+    };
+    Color32::from_rgb(f(0.0), f(8.0), f(4.0))
+}
 
 // ---------------------------------------------------------------------------
 // Size / spacing / radius tokens (mockup `--s*`, `--*-h`, `--rounding*`)
@@ -671,5 +692,41 @@ mod tests {
                 assert!(f.has_glyph(&font(Weight::Bold, 12.0), '…'));
             });
         });
+    }
+
+    /// Cross-client contract: `docs/dev/tests.js` asserts the same table.
+    #[test]
+    fn avatar_colour_vectors_match_the_browser() {
+        let v: [(&str, u32, [u8; 3]); 9] = [
+            ("Ritze", 177, [0x23, 0x8b, 0x86]),
+            ("mo", 245, [0x2b, 0x23, 0x8b]),
+            ("client-1", 144, [0x23, 0x8b, 0x4c]),
+            ("client-2", 321, [0x8b, 0x23, 0x66]),
+            ("Zed", 4, [0x8b, 0x2a, 0x23]),
+            ("user-d740", 328, [0x8b, 0x23, 0x5a]),
+            ("Größe", 314, [0x8b, 0x23, 0x72]),
+            ("", 61, [0x89, 0x8b, 0x23]),
+            ("  Mo ", 245, [0x2b, 0x23, 0x8b]),
+        ];
+        for (name, hue, rgb) in v {
+            assert_eq!(avatar_hue(name), hue, "hue of {name:?}");
+            assert_eq!(avatar_color(name), Color32::from_rgb(rgb[0], rgb[1], rgb[2]), "colour of {name:?}");
+        }
+    }
+
+    /// White initials stay readable (>= 3:1, WCAG large/bold text) on every hue.
+    #[test]
+    fn avatar_colour_keeps_white_text_readable_on_every_hue() {
+        let lin = |c: u8| {
+            let c = f64::from(c) / 255.0;
+            if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+        };
+        for hue in 0..360u32 {
+            // Any name that hashes to this hue (the colour only depends on the hue).
+            let name = (0u32..).map(|i| format!("n{i}")).find(|n| avatar_hue(n) == hue).unwrap();
+            let c = avatar_color(&name);
+            let y = 0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b());
+            assert!(1.05 / (y + 0.05) >= 3.0, "hue {hue}: contrast {}", 1.05 / (y + 0.05));
+        }
     }
 }
