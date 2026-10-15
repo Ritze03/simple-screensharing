@@ -135,6 +135,17 @@ number at a call site; if a role is missing, add a named `pub const` to `theme.r
   don't add `add_space` above the first card, the panel margin is the top gap).
 - **Reserved value width.** The value box is always the fixed `VALUE_W` slot, sized for the
   widest value, so a row never shifts as a number gains a digit.
+- **A pill slot is never narrower than its pill** (2026-10-15). Size a pill's slot from
+  `Pill::width(ui)`, with the mockup width (84 / 96) only as the minimum: the action bar
+  uses `action_bar::bar_pill_w` (widest of every label it can show, `BAR_PILLS`, in the
+  current language, so the status text does not jump when Starting turns Live), the modal
+  head and `dest_row` use `max(minimum, pill width)`, the room header sizes the slot to the
+  pill. The browser mirrors this with `SL(84, pill, { min: true })` (`docs/js/ui/dom.js`).
+  Clipping a pill is a bug, not a fallback; `ui::tests::pill_slots_fit_every_label_in_every_locale`
+  checks every bar label in en and de. *Why:* the user saw the bar's fixed 84 px slot clip
+  "CONNECTING" to "CONNECTI" (2026-10-15); German labels ("ÜBERNEHME", "WECHSELT") were
+  wider still. Exception: the people row's 44 px live slot only ever shows "LIVE" (and a
+  text-less Starting bar).
 - **`StrokeKind::Outside` for hand-painted rect strokes** (egui >= 0.31 requires an
   explicit kind; Outside matches what older egui drew). Built-in widgets use Inside and
   can't be changed.

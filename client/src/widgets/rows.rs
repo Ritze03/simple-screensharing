@@ -8,7 +8,7 @@
 //! | [`room_row`]      | 32     | pad 8 · `[18 lead][fill name][18 live?][28 num][22 unit]`  |
 //! | [`sharer_row`]    | 24     | pad 8 · `[18 indent][18 icon][fill name][28 num][22 unit]` |
 //! | [`person_row`]    | 32     | pad 4 · `[22 avatar][fill name][44 pill][18 eye]`          |
-//! | [`dest_row`]      | 40     | pad 12/4 · `[18 icon][fill name][84 pill][76 kbps][32 ×]`  |
+//! | [`dest_row`]      | 40     | pad 12/4 · `[18 icon][fill name][≥84 pill][76 kbps][32 ×]`  |
 //! | [`pop_item`]      | 32/44  | pad 8 · `[18 icon][fill label/sub][23 meter?]`             |
 //! | [`btn_row`]       | 32/36  | `[fill btn][fill btn]…`                                    |
 
@@ -337,7 +337,7 @@ pub enum DestAction {
 }
 
 /// Destination row (40 px) in the "Sending to" card:
-/// `[18 icon][fill name note][84 pill][76 kbps][32 ×]`.
+/// `[18 icon][fill name note][pill: max(84, its width)][76 kbps][32 ×]`.
 ///
 /// Too narrow for that plus [`DEST_NAME_MIN`] of name (the real stream-settings
 /// modal never is: at the 960 px minimum window its column is ~400 px; a
@@ -345,13 +345,17 @@ pub enum DestAction {
 /// with the pill slot only as wide as the pill, no note, and the name + rate
 /// in the row's tooltip, so the name keeps some room and the × is never clipped.
 pub fn dest_row(ui: &mut Ui, row: &DestRow) -> DestAction {
-    const SLOTS: [Slot; 5] = [fixed(18.0), FILL, fixed(84.0), fixed(76.0), fixed(32.0)];
-    let full_w = 18.0 + 84.0 + 76.0 + 32.0 + 4.0 * theme::S2 + theme::S3 + theme::S1 + DEST_NAME_MIN;
+    // The pill slot is 84 or the pill's own width if wider. `Why`: a fixed 84
+    // clipped longer labels ("ÜBERNEHME" in German; the action bar's 84 slot
+    // clipped "CONNECTING", user report 2026-10-15).
+    let pill_w = row.pill.width(ui);
+    let full_slots = [fixed(18.0), FILL, fixed(pill_w.max(84.0)), fixed(76.0), fixed(32.0)];
+    let full_w = 18.0 + pill_w.max(84.0) + 76.0 + 32.0 + 4.0 * theme::S2 + theme::S3 + theme::S1 + DEST_NAME_MIN;
     let compact = ui.available_width() < full_w;
     // Compact: the pill slot shrinks to the pill itself, the note goes and
     // the row's tooltip carries the full name and the rate.
-    let compact_slots = [fixed(18.0), FILL, fixed(row.pill.width(ui).min(84.0)), fixed(32.0)];
-    let r = HBox::new("dest_row", theme::DEST_ROW_H).pad(theme::S3, theme::S1).slots(if compact { &compact_slots } else { &SLOTS }).show(ui);
+    let compact_slots = [fixed(18.0), FILL, fixed(pill_w), fixed(32.0)];
+    let r = HBox::new("dest_row", theme::DEST_ROW_H).pad(theme::S3, theme::S1).slots(if compact { &compact_slots } else { &full_slots }).show(ui);
     let x_slot = if compact { 3 } else { 4 };
     let (bg, border, icon, icon_col) = if row.current {
         (theme::ACCENT_CHIP_BG, theme::ACCENT_CHIP_BORDER, "radio_button_checked", theme::ACCENT_LIGHTER)
