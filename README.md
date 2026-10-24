@@ -28,6 +28,11 @@ a second client or the browser client. Details: [`client/README.md`](client/READ
 
 ## Downloads and platforms
 
+- **Linux (recommended):** run `ritz-get install simple-screensharing` (or, without ritz-get, clone this repo and
+  run `./install.sh --install`; `./install.sh --remove` uninstalls it again), then start `simple-screensharing`.
+  It builds the native client from source and needs PipeWire (incl. `pw-loopback`) and the GStreamer
+  pipewire/good/bad/libav plugins at runtime. You also need a relay (self-host one from this repo, or use a
+  friend's); the app takes a join link.
 - **Linux AppImage:** `./build-appimage.sh` builds `dist/simple-screensharing-client-x86_64.AppImage`
   (and a relay tarball) in a Debian 13 container; it bundles GStreamer and uses the host's GPU
   stack, PipeWire and portal. Supported: Fedora 42+, Ubuntu 25.10 / 26.04, Debian 13, Arch
