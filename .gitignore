@@ -10,3 +10,6 @@ client/.playwright-mcp/
 
 # AppImage / relay tarball output of build-appimage.sh
 /dist/
+
+# ritz-get build output (install.sh)
+/build/
