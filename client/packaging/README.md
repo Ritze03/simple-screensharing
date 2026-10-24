@@ -28,7 +28,7 @@ with a source-built FFmpeg, crates, release compile), later ones ~2.
 | `AppRun` | launcher inside the AppImage: points GStreamer at the bundled plugins, warns about missing/too-old host pieces, execs the client |
 | `gst-plugins.txt` | the curated list of bundled GStreamer plugins |
 | `gst-elements.txt` | elements the build verifies resolve from the bundled set alone |
-| `simple-screensharing.desktop` | desktop entry (icon: `docs/assets/icon.svg`, rendered at build time) |
+| `../../simple-screensharing.desktop` | desktop entry (repo root; ritz-get also installs it as the start-menu shortcut; AppImage icon: `docs/assets/icon.svg`, rendered at build time) |
 
 ## Decision: bundle GStreamer, take GPU / PipeWire from the host
 

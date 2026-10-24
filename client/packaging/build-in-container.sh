@@ -98,7 +98,7 @@ linuxdeploy --appdir "$APPDIR" \
     --executable "$APPDIR/usr/bin/simple-screensharing-client" \
     --deploy-deps-only "$APPDIR/usr/lib/gstreamer-1.0" \
     --deploy-deps-only "$APPDIR/usr/libexec/gstreamer-1.0" \
-    --desktop-file "$HERE/simple-screensharing.desktop" \
+    --desktop-file "$REPO_ROOT/simple-screensharing.desktop" \
     --icon-file "$BUILD_DIR/simple-screensharing.png" --icon-filename simple-screensharing \
     --custom-apprun "$HERE/AppRun" \
     "${exclude_args[@]}"
