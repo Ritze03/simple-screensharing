@@ -16,9 +16,12 @@ This is a monorepo.
 | [`docs/`](docs/) | browser client (watch and share), static site for GitHub Pages; `docs/js/core` protocol and media core, `docs/js/ui` UI, `docs/dev` local test harness |
 | [`superdoc/`](superdoc/architecture/overview.md) | design docs, protocol spec, feature notes |
 
-## Dependencies (Arch Linux)
+## Dependencies
 
 Only for building and running from source; the AppImage and Flatpak bundle GStreamer.
+
+<details>
+<summary><b>Arch Linux</b></summary>
 
 ```bash
 sudo pacman -S --needed rust base-devel pkgconf \
@@ -35,6 +38,8 @@ sudo pacman -S --needed rust base-devel pkgconf \
   VA-API driver for hardware encode/decode: `mesa` (AMD, already includes it) or `intel-media-driver` (Intel).
   Without VA-API the client falls back to software x264/libav, which is too slow for high fps.
 - `pw-loopback`/`pw-link`/`pw-dump` (per-app audio) come with `pipewire-pulse` / `pipewire`.
+
+</details>
 
 ## Run it
 
