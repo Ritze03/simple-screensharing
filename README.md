@@ -16,6 +16,26 @@ This is a monorepo.
 | [`docs/`](docs/) | browser client (watch and share), static site for GitHub Pages; `docs/js/core` protocol and media core, `docs/js/ui` UI, `docs/dev` local test harness |
 | [`superdoc/`](superdoc/architecture/overview.md) | design docs, protocol spec, feature notes |
 
+## Dependencies (Arch Linux)
+
+Only for building and running from source; the AppImage and Flatpak bundle GStreamer.
+
+```bash
+sudo pacman -S --needed rust base-devel pkgconf \
+  gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-libav \
+  gst-plugin-pipewire gst-plugin-va libva \
+  pipewire pipewire-pulse wireplumber xdg-desktop-portal \
+  vulkan-icd-loader libxkbcommon wayland libx11
+```
+
+- **Relay only** (`server/`): just `rust` and `base-devel`.
+- **Portal backend** matching your compositor (screen capture needs one): `xdg-desktop-portal-wlr` (sway,
+  river, ...), `-hyprland`, `-gnome` or `-kde`.
+- **GPU drivers**: a Vulkan driver (`vulkan-radeon`, `vulkan-intel` or `nvidia-utils`) for rendering, and a
+  VA-API driver for hardware encode/decode: `mesa` (AMD, already includes it) or `intel-media-driver` (Intel).
+  Without VA-API the client falls back to software x264/libav, which is too slow for high fps.
+- `pw-loopback`/`pw-link`/`pw-dump` (per-app audio) come with `pipewire-pulse` / `pipewire`.
+
 ## Run it
 
 ```bash
