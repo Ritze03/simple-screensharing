@@ -258,6 +258,87 @@ pub enum EncoderBackend {
     Vaapi,
 }
 
+/// `true` when the VA driver behind `vah264enc` is Mesa's AMD one (radeonsi
+/// VCN/VCE/UVD encoders), the one driver that does not read `target-usage` as
+/// the VA spec's 1 = best ... 7 = fastest ordinal (see
+/// [`vaapi_target_usage`]). Detected once from the kernel driver of the
+/// element's own `device-path` (`/dev/dri/renderD128` ->
+/// `/sys/class/drm/renderD128/device/driver` -> `amdgpu`): Mesa's VA frontend
+/// is the only VA driver on an `amdgpu` device, `i915`/`xe` mean Intel (iHD,
+/// spec order). *Why not the VA vendor string:* GStreamer's VA plugin has no
+/// public accessor for it from Rust and `libva` would be a new dependency;
+/// the sysfs link is one `readlink`. Anything undetectable (no element, no
+/// sysfs, a different render node layout) reads as "not AMD" and keeps the
+/// spec-order mapping.
+fn va_driver_is_mesa_amd() -> bool {
+    use std::sync::OnceLock;
+    static IS_AMD: OnceLock<bool> = OnceLock::new();
+    *IS_AMD.get_or_init(|| {
+        let detect = || -> Option<String> {
+            gst::init().ok()?;
+            let enc = gst::ElementFactory::make(VAAPI_ENCODER_ELEMENT).build().ok()?;
+            // `property` panics on a missing or mistyped property: check first.
+            enc.find_property("device-path")?;
+            let path = enc.property::<String>("device-path");
+            let node = std::path::Path::new(&path).file_name()?.to_str()?.to_owned();
+            let link = std::fs::read_link(format!("/sys/class/drm/{node}/device/driver")).ok()?;
+            Some(link.file_name()?.to_str()?.to_owned())
+        };
+        let driver = detect();
+        tracing::info!("VA encoder kernel driver: {}", driver.as_deref().unwrap_or("unknown"));
+        driver.as_deref() == Some("amdgpu")
+    })
+}
+
+/// The `target-usage` a [`QualityLevel`] maps to for the VA encoders, for a
+/// Mesa AMD driver (`mesa_amd`) or any other (VA spec order).
+///
+/// `Why Mesa AMD differs (#46, #92):` its VA frontend does not treat the value
+/// as an ordinal. `vlVaQualityBits` (`src/gallium/frontends/va/va_private.h:445-456`)
+/// is the bitfield `{ valid_setting:1, preset_mode:2, pre_encode_mode:1,
+/// vbaq_mode:1 }` and `vlVaHandleVAEncMiscParameterTypeQualityLevel`
+/// (`encode.c:32-55`) reinterprets GStreamer's `target-usage` (sent unchanged
+/// as `VAEncMiscParameterBufferQualityLevel.quality_level`,
+/// `gstvabaseenc.c:1175-1186`) through it: 1 is special-cased to the
+/// "suggested" combination, everything else is read bit by bit. With 1..=7
+/// only bits 0-2 can be set, so pre-encode (bit 3) and VBAQ (bit 4) are
+/// reachable *only* through 1:
+///
+/// | value | preset | pre-encode | VBAQ |
+/// | --- | --- | --- | --- |
+/// | 1 | balance | on | on |
+/// | 2, 3 | balance | off | off |
+/// | 4, 5 | quality | off | off |
+/// | 6, 7 | high quality | off | off |
+///
+/// (`radeon_vcn_enc.c:15-60` maps these onto the VCN encoder modes; high
+/// quality needs VCN 4.0+, older parts clamp it to quality.) Pairs of
+/// values give bit-identical output (same bytes, same PSNR). Measured on the
+/// RX 7900 XTX, table in `superdoc/features/stream-control.md`: the balance
+/// preset (2/3) is the fast band on all codecs (AV1 ~300 fps on a busy box),
+/// the quality preset (4/5) halves AV1 and costs H.264 a third for +0.0-0.3 dB,
+/// the high-quality preset (6/7) halves AV1 again for ~0 dB more, and 1
+/// (pre-encode + VBAQ) is slower than 2 on H.264 *and* lower in PSNR and VMAF
+/// (H.264 at 3 Mbit/s: VMAF 77 vs 86) on screen content, so it is not the
+/// "Quality" setting its spec position suggests.
+///
+/// Mapping on Mesa AMD: Performance 2 (fast band), Balanced 3 (the same band;
+/// the encode is identical to Performance, there is no cheaper or better
+/// point between balance and quality that 1..=7 can reach), Quality 4 (the
+/// quality preset: nearly all of the gain of 6 at twice its AV1 speed).
+/// Other drivers follow the VA order and keep Balanced 4 / Quality 1;
+/// Performance stays 2 there too (unmeasured, an Intel box has not been
+/// available; the spec's fastest would be 7).
+fn vaapi_target_usage(level: QualityLevel, mesa_amd: bool) -> u32 {
+    match (level, mesa_amd) {
+        (QualityLevel::Performance, _) => 2,
+        (QualityLevel::Balanced, true) => 3,
+        (QualityLevel::Quality, true) => 4,
+        (QualityLevel::Balanced, false) => 4,
+        (QualityLevel::Quality, false) => 1,
+    }
+}
+
 impl EncoderBackend {
     /// The `gst-launch`-syntax fragment for this backend's encoder element,
     /// including its bitrate/GOP properties. Deliberately returns just the
@@ -339,37 +420,31 @@ impl EncoderBackend {
             // active branch is VAAPI.
             EncoderBackend::Vaapi => {
                 let _ = tune;
-                // `Why Performance is 2, not 7 (#46):` the VA spec reads
-                // target-usage as 1 = best quality … 7 = fastest, but Mesa's
-                // radeonsi driver does not follow that order. Measured on the
-                // dev machine (RX 7900 XTX, Mesa 26.2.4, GStreamer 1.28.8,
-                // `client/scripts/enc-bench.sh`, 1080p NV12, 8 Mbit/s CBR and
-                // VBR alike, fps of raw encoder throughput):
+                // `Why the mapping depends on the driver (#46, #92):` Mesa's
+                // radeonsi reads `target-usage` as a preset/pre-encode/VBAQ
+                // bitfield, not the VA spec's 1..7 ordinal; the decoded table
+                // and the source citations are on [`vaapi_target_usage`].
+                // Measured on the dev machine (RX 7900 XTX, Mesa 26.2.5,
+                // GStreamer 1.28.8, `client/scripts/enc-bench.sh`, 1080p NV12
+                // screen recording, VBR 8 Mbit/s, fps of raw encoder
+                // throughput on a loaded machine, median of 3):
                 //
                 //   target-usage    1     2     3     4     5     6     7
-                //   vah264enc     246   307   307   172   172   172   172
-                //   vah265enc     482   536   536   476   476   476   476
-                //   vaav1enc      526   535   532   217   217   117   117
+                //   vah264enc     161   191   182   128   126   127   129
+                //   vah265enc     238   265   267   229   240   239   242
+                //   vaav1enc      268   297   305   152   152    95    96
                 //
-                // The driver groups the values into bands (2-3 / 4-5 / 6-7,
-                // with 1 its own), and 7 was the *slowest* AV1 band: the Gaming
-                // and Low-latency presets (both Performance) encoded AV1 at
-                // 117 fps and H.264 at 172. 2 is the fastest band for all three
-                // codecs. Its quality cost is noise: PSNR on a 1080p60
-                // `testsrc2` clip at 8 Mbit/s, H.265: 40.83 dB at 2, 40.84 at
-                // 4, 40.90 at 7. 1 is not used for Performance: it is slower
-                // than 2 and its rate control overshoots (H.264 wrote 65 %
-                // more bytes than 2 at the same bitrate setting).
-                // Balanced (4) and Quality (1) are unchanged. A driver that
-                // does follow the VA order (Intel iHD) gets a slower,
-                // higher-quality encode for Performance from this; the
-                // encoder-limit hint (`destination::EncoderLimit`) still
-                // tells the user when the encoder caps the framerate.
-                let target_usage = match quality_level {
-                    QualityLevel::Performance => 2,
-                    QualityLevel::Balanced => 4,
-                    QualityLevel::Quality => 1,
-                };
+                // (Idle machine, synthetic source, 2026-10-14: AV1 526 / 535 /
+                // 532 / 217 / 217 / 117 / 117, H.264 246 / 307 / 307 / 172.)
+                // Quality at 3 Mbit/s, VMAF / PSNR dB (H.264 | H.265 | AV1):
+                //   tu 1:  77.2/38.2 | 88.5/41.1 | 89.9/41.3
+                //   tu 2:  85.7/39.8 | 91.0/41.7 | 90.2/41.4
+                //   tu 4:  85.7/39.8 | 91.1/41.7 | 90.8/41.7
+                //   tu 6:  85.7/39.8 | 91.4/41.8 | 90.8/41.7
+                // Balanced used to be 4, the AV1 half-speed band: under full
+                // GPU load AV1 shares lagged because Balanced had less than
+                // half the headroom of the fast band for +0.5 VMAF.
+                let target_usage = vaapi_target_usage(quality_level, va_driver_is_mesa_amd());
                 // `rate-control=vbr`, not the literal `qvbr`: a measured Mesa
                 // radeonsi driver bug means `qvbr` silently ignores the
                 // bitrate ceiling, `vbr`'s is genuinely honored (see
@@ -573,16 +648,19 @@ pub enum QualityLevel {
     /// `7`: Mesa radeonsi is fastest at 2-3 and slowest at 6-7 (measured
     /// table in [`EncoderBackend::launch_fragment`], #46).
     Performance,
-    /// x264enc `speed-preset=medium` / vah264enc `target-usage=4` — the
-    /// midpoint of both scales (x264's own upstream default preset is
+    /// x264enc `speed-preset=medium` / vah264enc `target-usage=4` (`3` on
+    /// Mesa AMD, where 4 is the half-speed AV1 band, [`vaapi_target_usage`],
+    /// #92) — the midpoint of both scales (x264's own upstream default preset is
     /// `medium`). The default: per the "good mix" product requirement (see
     /// [`TuneMode`]'s doc comment), neither speed nor quality extreme should
     /// be the out-of-the-box behavior — this sits between [`Self::Performance`]
     /// and [`Self::Quality`].
     #[default]
     Balanced,
-    /// x264enc `speed-preset=veryslow` / vah264enc `target-usage=1` — the
-    /// slowest, best-quality end of both scales.
+    /// x264enc `speed-preset=veryslow` / vah264enc `target-usage=1` (`4` on
+    /// Mesa AMD, where 1 is pre-encode + VBAQ and measured worse,
+    /// [`vaapi_target_usage`], #92) — the slowest, best-quality end of both
+    /// scales.
     Quality,
 }
 
@@ -8680,6 +8758,21 @@ mod tests {
         );
     }
 
+    /// The per-driver `target-usage` table ([`vaapi_target_usage`], #92) is
+    /// pure, so it is checked everywhere: Mesa AMD keeps Performance and
+    /// Balanced in the fast bands (2, 3: Mesa's balance preset) and Quality in
+    /// the quality preset (4), never 1 (pre-encode + VBAQ, slower and worse on
+    /// screen content) or 6-7 (AV1 at ~95 fps); other drivers keep 2 / 4 / 1.
+    #[test]
+    fn vaapi_target_usage_per_driver() {
+        use QualityLevel::*;
+        let amd = [Performance, Balanced, Quality].map(|l| vaapi_target_usage(l, true));
+        assert_eq!(amd, [2, 3, 4]);
+        let spec = [Performance, Balanced, Quality].map(|l| vaapi_target_usage(l, false));
+        assert_eq!(spec, [2, 4, 1]);
+        assert!(amd.iter().chain(spec.iter()).all(|v| (1..=7).contains(v)));
+    }
+
     /// [`QualityLevel`] has a real, direct analogue on both backends:
     /// x264enc's `speed-preset` and vah264enc's `target-usage`.
     #[test]
@@ -8717,26 +8810,27 @@ mod tests {
             return;
         }
 
+        let amd = va_driver_is_mesa_amd();
         let vaapi_performance = build_encoder_element(
             EncoderBackend::Vaapi,
             TuneMode::default(),
             QualityLevel::Performance,
         );
-        assert_eq!(vaapi_performance.property::<u32>("target-usage"), 2);
+        assert_eq!(vaapi_performance.property::<u32>("target-usage"), vaapi_target_usage(QualityLevel::Performance, amd));
 
         let vaapi_balanced = build_encoder_element(
             EncoderBackend::Vaapi,
             TuneMode::default(),
             QualityLevel::Balanced,
         );
-        assert_eq!(vaapi_balanced.property::<u32>("target-usage"), 4);
+        assert_eq!(vaapi_balanced.property::<u32>("target-usage"), vaapi_target_usage(QualityLevel::Balanced, amd));
 
         let vaapi_quality = build_encoder_element(
             EncoderBackend::Vaapi,
             TuneMode::default(),
             QualityLevel::Quality,
         );
-        assert_eq!(vaapi_quality.property::<u32>("target-usage"), 1);
+        assert_eq!(vaapi_quality.property::<u32>("target-usage"), vaapi_target_usage(QualityLevel::Quality, amd));
     }
 
     /// Rate control is always Dynamic: vah264enc gets `rate-control=vbr` (not
@@ -9565,7 +9659,10 @@ mod tests {
                 QualityLevel::Quality,
                 VideoCodec::H265,
             );
-            assert_eq!(h265_quality.property::<u32>("target-usage"), 1);
+            assert_eq!(
+                h265_quality.property::<u32>("target-usage"),
+                vaapi_target_usage(QualityLevel::Quality, va_driver_is_mesa_amd())
+            );
         } else {
             eprintln!("skipping H.265 half: '{VAAPI_H265_ENCODER_ELEMENT}' is not available in this environment");
         }
@@ -9577,7 +9674,10 @@ mod tests {
                 QualityLevel::Performance,
                 VideoCodec::Av1,
             );
-            assert_eq!(av1_performance.property::<u32>("target-usage"), 2);
+            assert_eq!(
+                av1_performance.property::<u32>("target-usage"),
+                vaapi_target_usage(QualityLevel::Performance, va_driver_is_mesa_amd())
+            );
         } else {
             eprintln!("skipping AV1 half: '{VAAPI_AV1_ENCODER_ELEMENT}' is not available in this environment");
         }
