@@ -2548,7 +2548,7 @@ async fn spawn_destination(
     // [`destination::DestinationRuntime`]'s doc comment for why that split is
     // what makes a later source restart look like low framerate rather than a
     // glitch.
-    let runtime = destination::DestinationRuntime::shared(Instant::now(), params);
+    let runtime = destination::DestinationRuntime::shared(crate::decode::sender_clock_epoch(), params);
     {
         let running_time_us = pipeline.current_running_time().map(|t| t.useconds()).unwrap_or(0);
         runtime.lock().unwrap().on_pipeline_start(running_time_us, Instant::now());

@@ -206,6 +206,15 @@
 //! timestamp onto this pipeline's running time before it reaches `appsrc`,
 //! preserving the sender's *intervals* while replacing its origin.
 //!
+//! ## A/V sync: the same re-base carries an extra delay
+//!
+//! Re-basing puts the first packet `AUDIO_TARGET_LEAD_US` ahead of now, which is unrelated to how
+//! late the *picture* is (x264 lookahead alone is 0.7 to 1 s). `avsync.rs` measures that
+//! difference from the two streams' capture PTS (one sender clock, `sender_clock_epoch`), and the
+//! result is added to the lead: [`AudioTimeline`] re-bases once whenever the smoothed delay
+//! changes. Audio-only listening has no video peer and gets no extra delay. Why and limits:
+//! `superdoc/features/audio-sharing.md`.
+//!
 //! ## Pipeline
 //!
 //! ```text
@@ -277,9 +286,12 @@ use gstreamer::{Bus, Buffer, Caps, ClockTime, Element, ElementFactory, Message, 
 use gstreamer_app::AppSink;
 use gstreamer_app::AppSrc;
 
+pub use avsync::{sender_clock_epoch, sender_clock_us};
+use avsync::{AvSync, DelayController};
 use crate::net::{DecryptedMediaFrame, DecryptedPreview};
 use crate::protocol::{ConnId, StreamId};
 
+mod avsync;
 mod codec;
 mod frame;
 pub mod render;
@@ -745,6 +757,9 @@ pub struct StreamDecoder {
     /// Whether the most recent frame carried the sender's advisory
     /// [`crate::protocol::MEDIA_FLAG_STALLED`] bit.
     last_frame_stalled: bool,
+    /// This sender's A/V sync state, joined on the first frame (the `ConnId` is only known
+    /// then). Feeds the audio delay; see `decode/avsync.rs`.
+    av_sync: Option<Arc<AvSync>>,
 }
 
 /// How long without any frame at all before [`StreamDecoder::is_stalled`]
@@ -811,6 +826,7 @@ impl StreamDecoder {
             created_at: Instant::now(),
             last_frame_at: None,
             last_frame_stalled: false,
+            av_sync: None,
         })
     }
 
@@ -843,8 +859,17 @@ impl StreamDecoder {
         // decoder can't use it yet. Gating this behind `seen_keyframe` would
         // make a freshly-subscribed stream report "stalled" for up to a full
         // GOP purely because it hasn't hit its first keyframe.
-        self.last_frame_at = Some(Instant::now());
+        let now = Instant::now();
+        self.last_frame_at = Some(now);
         self.last_frame_stalled = frame.stalled;
+        // A/V sync: every arriving frame, including ones the keyframe gate below drops, tells
+        // the audio how late this sender's picture is (capture pts vs arrival).
+        let sync = self.av_sync.get_or_insert_with(|| {
+            let s = AvSync::for_peer(frame.conn_id);
+            s.video_decoder_started();
+            s
+        });
+        sync.note_video(now, frame.pts, frame.stalled);
         // Counted here, ahead of the pre-keyframe gate below, so the bitrate
         // readout reflects real received network throughput even during the
         // brief pre-keyframe window where frames are being dropped rather
@@ -1000,6 +1025,9 @@ impl StreamDecoder {
 
 impl Drop for StreamDecoder {
     fn drop(&mut self) {
+        if let Some(sync) = &self.av_sync {
+            sync.video_decoder_gone();
+        }
         let _ = self.tx.send(PipelineMsg::Shutdown);
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
@@ -1038,7 +1066,9 @@ fn log_bus_message(msg: &Message) {
 /// `SetVolume` since audio has a live-adjustable playback parameter video
 /// doesn't.
 enum AudioPipelineMsg {
-    Packet { pts_us: u64, data: Vec<u8> },
+    /// `target_delay_us` is the A/V-sync delay audio currently wants on top of its normal
+    /// lead (`decode/avsync.rs`); the pipeline thread smooths it ([`DelayController`]).
+    Packet { pts_us: u64, data: Vec<u8>, target_delay_us: i64 },
     SetVolume(f64),
     Shutdown,
 }
@@ -1399,6 +1429,9 @@ pub struct AudioDecoder {
     /// and the viewer heard nothing at all. This is the cheapest signal that
     /// says "audio is really crossing the wire", so a test can assert it.
     packets_received: Arc<AtomicU64>,
+    /// Joined to the sender's video decoder through the first packet's `ConnId`; supplies the
+    /// delay that keeps this audio aligned with the picture. See `decode/avsync.rs`.
+    av_sync: Option<Arc<AvSync>>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -1432,7 +1465,7 @@ impl AudioDecoder {
             })
             .context("failed to spawn audio decode pipeline thread")?;
 
-        Ok(Self { stream_id, tx, alive, packets_received: Arc::new(AtomicU64::new(0)), thread: Some(thread) })
+        Ok(Self { stream_id, tx, alive, packets_received: Arc::new(AtomicU64::new(0)), av_sync: None, thread: Some(thread) })
     }
 
     pub fn stream_id(&self) -> StreamId {
@@ -1494,7 +1527,10 @@ impl AudioDecoder {
             return;
         }
         self.packets_received.fetch_add(1, Ordering::Relaxed);
-        let msg = AudioPipelineMsg::Packet { pts_us: frame.pts, data: frame.payload.clone() };
+        let sync = self.av_sync.get_or_insert_with(|| AvSync::for_peer(frame.conn_id));
+        sync.note_audio(Instant::now(), frame.pts);
+        let target_delay_us = sync.target_audio_delay_us();
+        let msg = AudioPipelineMsg::Packet { pts_us: frame.pts, data: frame.payload.clone(), target_delay_us };
         if self.tx.send(msg).is_err() {
             tracing::warn!(
                 "audio decode pipeline thread for stream {} is gone; dropping packet",
@@ -1637,6 +1673,8 @@ fn pump_audio_loop(rx: &std_mpsc::Receiver<AudioPipelineMsg>, appsrc: &AppSrc, v
     // "Threading" note for why they need no lock.
     let mut jitter = AudioJitterBuffer::new();
     let mut timeline = AudioTimeline::new();
+    let mut delay = DelayController::new();
+    let clock = Instant::now();
 
     loop {
         while let Some(msg) = bus.pop() {
@@ -1650,7 +1688,8 @@ fn pump_audio_loop(rx: &std_mpsc::Receiver<AudioPipelineMsg>, appsrc: &AppSrc, v
         };
 
         match rx.recv_timeout(timeout) {
-            Ok(AudioPipelineMsg::Packet { pts_us, data }) => {
+            Ok(AudioPipelineMsg::Packet { pts_us, data, target_delay_us }) => {
+                timeline.set_delay_us(delay.update(target_delay_us, clock.elapsed().as_micros() as i64));
                 let actions = jitter.insert(pts_us, data, Instant::now());
                 apply_audio_actions(appsrc, &mut timeline, actions);
             }
@@ -1754,11 +1793,21 @@ struct AudioTimeline {
     /// a sender that started before this viewer subscribed needs a
     /// negative offset. `None` until the first packet establishes it.
     offset_us: Option<i64>,
+    /// The A/V-sync delay (on top of [`AUDIO_TARGET_LEAD_US`]) the current `offset_us` was built
+    /// with. A change of `want_delay_us` forces a re-base, which is how the delay is applied: the
+    /// next packet is scheduled `lead + delay` ahead of now, later packets keep their spacing.
+    delay_us: i64,
+    /// The delay audio wants now ([`DelayController`]'s output, set by the pump thread).
+    want_delay_us: i64,
 }
 
 impl AudioTimeline {
     fn new() -> Self {
-        Self { offset_us: None }
+        Self { offset_us: None, delay_us: 0, want_delay_us: 0 }
+    }
+
+    fn set_delay_us(&mut self, delay_us: i64) {
+        self.want_delay_us = delay_us;
     }
 
     /// Map one packet's PTS, (re-)establishing the offset if there isn't a
@@ -1766,22 +1815,28 @@ impl AudioTimeline {
     /// GStreamer — so it's unit-testable on its own; see
     /// `tests::timeline_*`.
     fn map_push(&mut self, sender_pts_us: u64, running_now_us: u64) -> u64 {
-        if let Some(offset) = self.offset_us {
+        let delay = self.want_delay_us;
+        if let Some(offset) = self.offset_us
+            && self.delay_us == delay
+        {
             let target = sender_pts_us as i64 + offset;
             let lead = target - running_now_us as i64;
-            if (-AUDIO_MAX_LATE_US..=AUDIO_MAX_EARLY_US).contains(&lead) {
+            if (delay - AUDIO_MAX_LATE_US..=AUDIO_MAX_EARLY_US + delay).contains(&lead) {
                 return target.max(0) as u64;
             }
             tracing::debug!(
                 "re-basing audio timeline: sender pts={sender_pts_us} mapped to {lead} us from now, \
                  outside [{}, {}]",
-                -AUDIO_MAX_LATE_US,
-                AUDIO_MAX_EARLY_US
+                delay - AUDIO_MAX_LATE_US,
+                AUDIO_MAX_EARLY_US + delay
             );
+        } else if self.offset_us.is_some() {
+            tracing::debug!("re-basing audio timeline for A/V sync: delay {} -> {delay} us", self.delay_us);
         }
 
-        let target = running_now_us as i64 + AUDIO_TARGET_LEAD_US;
+        let target = running_now_us as i64 + AUDIO_TARGET_LEAD_US + delay;
         self.offset_us = Some(target - sender_pts_us as i64);
+        self.delay_us = delay;
         target as u64
     }
 
@@ -3337,6 +3392,34 @@ mod tests {
         // 5 ms ago. Without re-basing this packet would be scheduled ~30 s
         // into the receiver's future and never play.
         assert_eq!(t.map_push(30_000_000, 5_000), 5_000 + AUDIO_TARGET_LEAD_US as u64);
+    }
+
+    #[test]
+    fn timeline_adds_the_av_sync_delay_to_the_lead() {
+        let mut t = AudioTimeline::new();
+        t.set_delay_us(700_000);
+        let first = t.map_push(30_000_000, 5_000);
+        assert_eq!(first, 5_000 + (AUDIO_TARGET_LEAD_US + 700_000) as u64);
+        // Spacing is kept and a 700 ms-ahead schedule is *not* mistaken for drift.
+        assert_eq!(t.map_push(30_020_000, 25_000), first + 20_000);
+        assert_eq!(t.map_push(31_000_000, 1_000_000), first + 1_000_000);
+    }
+
+    #[test]
+    fn timeline_rebases_exactly_once_when_the_delay_changes() {
+        let mut t = AudioTimeline::new();
+        let first = t.map_push(1_000_000, 0);
+        assert_eq!(first, AUDIO_TARGET_LEAD_US as u64);
+        // Video latency rose: next packet lands 500 ms further out, then spacing resumes.
+        t.set_delay_us(500_000);
+        let moved = t.map_push(1_020_000, 20_000);
+        assert_eq!(moved, 20_000 + (AUDIO_TARGET_LEAD_US + 500_000) as u64);
+        assert_eq!(t.map_push(1_040_000, 40_000), moved + 20_000);
+        // And back down.
+        t.set_delay_us(0);
+        let back = t.map_push(1_060_000, 60_000);
+        assert_eq!(back, 60_000 + AUDIO_TARGET_LEAD_US as u64);
+        assert_eq!(t.map_push(1_080_000, 80_000), back + 20_000);
     }
 
     #[test]

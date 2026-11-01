@@ -157,6 +157,8 @@ a decode-side reader will meet:
 
 ## Audio follows video (current rule; the playback path is native)
 
+*A/V sync (audio delayed to match video latency, 2026-11-01): `features/audio-sharing.md`.*
+
 Product requirement, from the project owner: "the shared audio should be connected to the
 screenshare ... The streamer should be able to enable audio on his share and the viewer should
 automatically hear that. No (visual) separate 'stream' for Audio."

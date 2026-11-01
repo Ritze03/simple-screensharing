@@ -404,6 +404,15 @@ hidden from the content-blind relay. Being inside the encrypted region, it costs
 cleartext-header bytes. Receivers MAY ignore it (the accepted "glitches are fine"
 tolerance) but SHOULD use it to align audio to video when both are present.
 
+**One clock per sender (2026-11-01).** A sender MUST stamp the PTS of *all* its streams (video and
+audio, every destination) as capture time on a single clock, so a receiver can compare an audio
+PTS with a video PTS of the same sender. The native client uses microseconds since a process-wide
+epoch (`decode::sender_clock_epoch`); the browser client uses its shared `MediaClock`. The
+receiver does not need the clock's absolute offset: it compares per-stream `arrival - pts`
+minima (`features/audio-sharing.md`). Before this date native audio PTS counted from the audio
+pipeline start and video PTS from the destination's creation, so they were not comparable.
+No wire change, no version bump.
+
 ### 6.5 Receiver reassembly
 
 Per `(conn_id, stream_id)` the receiver keeps a small reassembly map keyed by

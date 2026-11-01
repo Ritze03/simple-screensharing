@@ -75,6 +75,7 @@ use gstreamer_app as gst_app;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+use crate::decode::sender_clock_us;
 use crate::fragment::fragment_frame;
 use crate::net::{encrypt_frame, ScreenshareClient};
 use crate::protocol::StreamKind;
@@ -778,7 +779,13 @@ pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, sour
 
     let level = AudioLevel::default();
     let pump_client = client.clone();
-    let pump_task = tokio::spawn(pump_loop(pump_client, stream_id, stream, bus_stream, level.clone()));
+    // Anchor this pipeline's running time onto the process-wide sender clock that video's wire PTS
+    // also uses, so a viewer can line audio up with the picture (`decode/avsync.rs`).
+    let pts_offset_us = sender_clock_offset_us(
+        pipeline.current_running_time().map(|t| t.useconds()).unwrap_or(0),
+        Instant::now(),
+    );
+    let pump_task = tokio::spawn(pump_loop(pump_client, stream_id, stream, bus_stream, level.clone(), pts_offset_us));
 
     // No width/height for audio (spec's AnnounceStream fields exist for
     // video streams' benefit); 0x0 signals "not applicable".
@@ -1066,8 +1073,8 @@ async fn pump_loop(
     mut appsink_stream: gst_app::app_sink::AppSinkStream,
     mut bus_stream: gst::bus::BusStream,
     level: AudioLevel,
+    pts_offset_us: u64,
 ) {
-    let start = Instant::now();
     let mut appsink_done = false;
     let mut bus_done = false;
 
@@ -1079,7 +1086,7 @@ async fn pump_loop(
             sample = appsink_stream.next(), if !appsink_done => {
                 match sample {
                     Some(sample) => {
-                        if let Err(e) = send_encoded_sample(&client, stream_id, &sample, start) {
+                        if let Err(e) = send_encoded_sample(&client, stream_id, &sample, pts_offset_us) {
                             tracing::warn!("dropping encoded audio packet for stream {stream_id}: {e:#}");
                         }
                     }
@@ -1124,16 +1131,33 @@ fn handle_bus_message(msg: &gst::Message, bus_done: &mut bool, level: &AudioLeve
     }
 }
 
+/// Offset that maps this audio pipeline's running time onto the sender clock
+/// ([`crate::decode::sender_clock_epoch`]): `(now - epoch) - running_time`, read at one instant.
+///
+/// `Why:` audio PTS used to be the pipeline's own running time (0 at share start) while video PTS
+/// counted from its destination's creation, so a viewer could not tell which audio packet belongs
+/// to which frame. Both now count from the process-wide epoch, as capture time. Saturates to 0 if
+/// the running time somehow exceeds the process age (clock reads are not atomic).
+fn sender_clock_offset_us(running_time_us: u64, now: Instant) -> u64 {
+    sender_clock_us(now).saturating_sub(running_time_us)
+}
+
+/// Wire PTS of one Opus packet: its capture time on the sender clock. A buffer without a PTS gets
+/// the send time (`now_clock_us`), which is late by the encode latency but never wrong by more.
+fn audio_wire_pts_us(buffer_pts_us: Option<u64>, pts_offset_us: u64, now_clock_us: u64) -> u64 {
+    match buffer_pts_us {
+        Some(p) => p.saturating_add(pts_offset_us),
+        None => now_clock_us,
+    }
+}
+
 /// Encrypts, fragments, and sends one encoded Opus packet as media
 /// datagrams — same encrypt/fragment/send path as
 /// `capture.rs::send_encoded_sample`.
-fn send_encoded_sample(client: &ScreenshareClient, stream_id: u8, sample: &gst::Sample, start: Instant) -> Result<()> {
+fn send_encoded_sample(client: &ScreenshareClient, stream_id: u8, sample: &gst::Sample, pts_offset_us: u64) -> Result<()> {
     let buffer = sample.buffer().ok_or_else(|| anyhow!("sample had no buffer"))?;
 
-    let pts_us = buffer
-        .pts()
-        .map(|t| t.useconds())
-        .unwrap_or_else(|| start.elapsed().as_micros() as u64);
+    let pts_us = audio_wire_pts_us(buffer.pts().map(|t| t.useconds()), pts_offset_us, sender_clock_us(Instant::now()));
 
     // Unlike H.264's GOP structure, every Opus packet is independently
     // decodable — there's no delta/keyframe distinction for audio. Mark
@@ -1173,6 +1197,23 @@ fn send_encoded_sample(client: &ScreenshareClient, stream_id: u8, sample: &gst::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_wire_pts_is_capture_time_on_the_sender_clock() {
+        // Pipeline started when the process was 90 s old, so offset = 90 s; a packet captured
+        // 1.5 s into the pipeline is at 91.5 s on the sender clock, the same axis video uses.
+        assert_eq!(audio_wire_pts_us(Some(1_500_000), 90_000_000, 0), 91_500_000);
+        // No buffer PTS: fall back to the send time.
+        assert_eq!(audio_wire_pts_us(None, 90_000_000, 123_456), 123_456);
+    }
+
+    #[test]
+    fn sender_clock_offset_never_underflows() {
+        // A running time larger than the process age (non-atomic clock reads) saturates to 0.
+        assert_eq!(sender_clock_offset_us(u64::MAX / 2, Instant::now()), 0);
+        let off = sender_clock_offset_us(0, Instant::now());
+        assert!(off < 3_600_000_000, "offset is the process age in us, got {off}");
+    }
 
     /// A trimmed-down but structurally real `pw-dump` fixture (shapes
     /// copied from actual output captured on this dev machine — PipeWire

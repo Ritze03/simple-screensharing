@@ -1,6 +1,7 @@
 // RoomClient: one connection to one room. See README.md for the full API and event list.
 
 import { AudioReceiver, AudioSender, MAX_VOLUME } from "./audio.js";
+import { AvSync } from "./avsync.js";
 import { NonceSpaceExhausted, decryptFrame, decryptPreview, encryptFrame, encryptPreview, importRoomKey } from "./crypto.js";
 import { Reassembler, fragmentFrame } from "./fragment.js";
 import { JoinLinkError, parseJoinLink } from "./joinlink.js";
@@ -81,7 +82,7 @@ class RxStream {
         try {
           const { ptsUs, payload } = await decryptFrame(this.client._key, this.info.ownerId, op.frameId, this.info.streamId, op.ciphertext);
           this.stalled = op.stalled;
-          if (this.info.kind === "video") this.impl.pushFrame({ ptsUs, keyframe: op.keyframe, payload });
+          if (this.info.kind === "video") this.impl.pushFrame({ ptsUs, keyframe: op.keyframe, payload, stalled: op.stalled });
           else this.impl.pushPacket({ ptsUs, payload });
         } catch (e) {
           this.decryptFailures++;
@@ -224,6 +225,7 @@ export class RoomClient extends EventTarget {
     this.previews = new Map(); // key -> { blob, receivedAt }
     this.watches = new Map(); // key -> WatchHandle
     this.subs = new Map(); // key -> RxStream (every subscribed concrete stream)
+    this.avSyncs = new Map(); // owner hex -> AvSync (shared by that owner's video and audio receivers)
     this.subRefs = new Map(); // key -> Set of reasons ("watch:<key>", "follow:<key>")
     this.volumes = new Map(); // audio key -> 0..2
     this.muted = new Map(); // audio key -> bool
@@ -648,6 +650,7 @@ export class RoomClient extends EventTarget {
         maxJitterBufferMs: this.maxJitterBufferMs,
         catchUpSpeedPercent: this.catchUpSpeedPercent,
         hardwareAcceleration: this.hardwareAcceleration,
+        avSync: this.#avSyncFor(info.owner),
       });
     } else {
       const ctx = this.#audioContext();
@@ -656,12 +659,20 @@ export class RoomClient extends EventTarget {
         latencyMs: this.audioLatencyMs,
         volume: this.volumes.get(key) ?? 1,
         muted: this.muted.get(key) ?? false,
+        avSync: this.#avSyncFor(info.owner),
         onEvent: (type, detail) => this.dispatchEvent(new CustomEvent("media", { detail: { key, type, ...detail } })),
       });
     }
     const rx = new RxStream(this, key, info, impl);
     this.subs.set(key, rx);
     this.#sendSubscribe(key);
+  }
+
+  /** The owner's shared A/V sync state; one per owner, so their video and audio receivers find each other. */
+  #avSyncFor(owner) {
+    let s = this.avSyncs.get(owner);
+    if (!s) this.avSyncs.set(owner, (s = new AvSync()));
+    return s;
   }
 
   #dropSub(key) {

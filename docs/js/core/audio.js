@@ -1,5 +1,6 @@
 // Opus audio, matching the native sender (client/src/audio.rs): raw Opus packets (no Ogg), 48 kHz
-// stereo, 20 ms frames (opusenc defaults), 64 kbit/s; wire PTS in µs advancing 20 ms per packet.
+// stereo, 20 ms frames (opusenc defaults), 64 kbit/s; wire PTS in µs advancing 20 ms per packet, stamped with the
+// capture time on the sender's one clock (shared with its video, see avsync.js) so the receiver can delay audio to match the picture.
 //
 //   AudioReceiver  decrypted packets -> WebCodecs AudioDecoder -> WebAudio (gain: volume 0..2, mute)
 //   AudioSender    MediaStreamTrack -> WebCodecs AudioEncoder -> packets
@@ -10,6 +11,8 @@ export const OPUS_FRAME_US = 20000;
 export const OPUS_BITRATE = 64000;
 
 export const MAX_VOLUME = 2; // 200 %
+
+import { DelayController } from "./avsync.js";
 
 export function opusSupported() {
   return typeof AudioDecoder !== "undefined" && typeof AudioEncoder !== "undefined";
@@ -23,8 +26,14 @@ export class AudioReceiver {
    * @param {number} [o.latencyMs=80]     playout delay used to absorb network jitter
    * @param {number} [o.volume=1]         0..2
    * @param {boolean} [o.muted=false]
+   * @param {import("./avsync.js").AvSync} [o.avSync]  this sender's A/V sync state: audio is delayed to line up with its video
+   * @param {() => number} [o.now]  local clock in ms for the sync floors (tests inject one)
    */
-  constructor({ context, destination = context.destination, latencyMs = 80, volume = 1, muted = false, onEvent = () => {} }) {
+  constructor({ context, destination = context.destination, latencyMs = 80, volume = 1, muted = false, onEvent = () => {}, avSync = null, now = () => performance.now() }) {
+    this.avSync = avSync;
+    this.now = now;
+    this.delay = new DelayController();
+    this.syncDelayS = 0; // the A/V-sync delay currently applied on top of `latency`, seconds
     this.ctx = context;
     this.latency = latencyMs / 1000;
     this.onEvent = onEvent;
@@ -38,9 +47,9 @@ export class AudioReceiver {
     this.anchorCtxTime = 0;
     this.lastEnd = 0;
     this.level = 0;
-    this.stats = { packets: 0, decodedFrames: 0, underruns: 0, resyncs: 0, errors: 0 };
+    this.stats = { packets: 0, decodedFrames: 0, underruns: 0, resyncs: 0, syncSteps: 0, errors: 0 };
     this.closed = false;
-    this.sources = new Set();
+    this.sources = new Map(); // scheduled source -> its start time on the context clock
   }
 
   setVolume(v) {
@@ -74,6 +83,7 @@ export class AudioReceiver {
   pushPacket({ ptsUs, payload }) {
     if (this.closed) return;
     this.stats.packets++;
+    if (this.avSync) this.avSync.noteAudio(this.now(), ptsUs);
     try {
       this.#ensureDecoder().decode(new EncodedAudioChunk({ type: "key", timestamp: ptsUs, data: payload }));
     } catch (e) {
@@ -99,29 +109,50 @@ export class AudioReceiver {
       const now = this.ctx.currentTime;
       const ptsUs = data.timestamp;
       let when;
+      // A/V sync: the delay that lines audio up with this sender's picture (0 for audio-only), stepped past a deadband.
+      let wantDelayS = this.syncDelayS;
+      if (this.avSync) wantDelayS = this.delay.update(this.avSync.targetDelayMs(this.latency * 1000), this.now()) / 1000;
+      const delayChanged = this.anchorPtsUs != null && Math.abs(wantDelayS - this.syncDelayS) > 1e-6;
+      this.syncDelayS = wantDelayS;
+      const lead = this.latency + this.syncDelayS;
       if (this.anchorPtsUs == null) {
         this.anchorPtsUs = ptsUs;
-        this.anchorCtxTime = now + this.latency;
+        this.anchorCtxTime = now + lead;
       }
       when = this.anchorCtxTime + (ptsUs - this.anchorPtsUs) / 1e6;
-      if (when < now) {
+      if (delayChanged) {
+        // The video's latency moved: re-time audio once. Later = a gap of silence; earlier = drop what is already
+        // queued past the new start, or it would play on top of the new audio.
+        this.stats.syncSteps++;
+        this.anchorPtsUs = ptsUs;
+        this.anchorCtxTime = now + lead;
+        when = this.anchorCtxTime;
+        for (const [s, at] of this.sources) {
+          if (at >= when - 0.001) {
+            try {
+              s.stop();
+            } catch {}
+            this.sources.delete(s);
+          }
+        }
+      } else if (when < now) {
         // Underrun (or the context was suspended): re-anchor with a fresh latency budget.
         this.stats.underruns++;
         this.anchorPtsUs = ptsUs;
-        this.anchorCtxTime = now + this.latency;
+        this.anchorCtxTime = now + lead;
         when = this.anchorCtxTime;
-      } else if (when > now + this.latency * 4 + 0.2) {
+      } else if (when > now + lead + this.latency * 3 + 0.2) {
         // Far in the future (burst, or sender clock ran ahead): pull back.
         this.stats.resyncs++;
         this.anchorPtsUs = ptsUs;
-        this.anchorCtxTime = now + this.latency;
+        this.anchorCtxTime = now + lead;
         when = this.anchorCtxTime;
       }
       const src = this.ctx.createBufferSource();
       src.buffer = buf;
       src.connect(this.gain);
       src.onended = () => this.sources.delete(src);
-      this.sources.add(src);
+      this.sources.set(src, when);
       src.start(when);
       this.stats.decodedFrames++;
     } finally {
@@ -134,7 +165,7 @@ export class AudioReceiver {
     try {
       if (this.decoder && this.decoder.state !== "closed") this.decoder.close();
     } catch {}
-    for (const s of this.sources) {
+    for (const s of this.sources.keys()) {
       try {
         s.stop();
       } catch {}
