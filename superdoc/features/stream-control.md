@@ -442,6 +442,18 @@ instead of `I`/`R`. Found by task #48; not fixable from the client.
 
 ## `target-usage` is a bitfield on Mesa AMD; Balanced = 3, Quality = 4 (2026-11-01, #92)
 
+**2026-11-01 (#95): the UI hides what the mapping makes a twin, per running backend.** On Mesa AMD,
+Performance (2) and Balanced (3) are the same encode (table below), so the stream-settings modal no longer
+offers a Balanced quality level there, and Low-Latency (Performance, 2000 ms) is the same encode as Balanced
+(Tune is dropped on VA) so that preset is hidden too (user rule: "If a setting doesn't do anything, hide it").
+`capture::EncoderProfile` derives this from `vaapi_target_usage` (`quality_effect`: Mesa AMD folds
+{2,3}/{4,5}/{6,7}; Intel and x264 have no twins), so changing the mapping changes what is hidden with no UI edit.
+Stored values are never rewritten. Also new here: `EncoderBackend::tune_applies` (moved from `presets`),
+`EncodeBranch::backend()` (the backend a branch was *actually* built with, after a per-branch fallback to x264)
+and `DestinationRuntime::actual_backend()` (recorded when a branch becomes authoritative; `params.backend` stays
+the preferred one so the next swap tries VA first). `supported_codecs(Vaapi)` now probes for `vah265enc` /
+`vaav1enc` instead of listing all three. UI side and rationale: `ui/APP-SHELL.md` (2026-11-01, #95).
+
 **2026-11-01 (#94): Performance is 7 on every non-Mesa-AMD driver.** Spec-order drivers
 (Intel iHD) follow the VA order, 1 = best quality ... 7 = fastest, so `vaapi_target_usage`
 now gives them Performance 7 (Balanced 4 and Quality 1 unchanged). Mesa AMD keeps 2 / 3 / 4.

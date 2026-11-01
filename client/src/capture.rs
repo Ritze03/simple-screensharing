@@ -345,7 +345,98 @@ fn vaapi_target_usage(level: QualityLevel, mesa_amd: bool) -> u32 {
     }
 }
 
+/// What one encoder backend *actually does* with the Stream settings, as far as
+/// the UI needs to know it: whether Tune is read at all, and which
+/// [`QualityLevel`]s give bit-identical encodes ("twins"). The stream-settings
+/// screen hides a control that does nothing and a choice that duplicates
+/// another one (user rule 2026-11-01: "If a setting doesn't do anything, hide
+/// it ... so other platforms can still use it"); it never drops the stored
+/// value, so a settings file moved to another driver or platform keeps working.
+///
+/// `Why a struct and not `EncoderBackend` alone (#95):` on [`EncoderBackend::Vaapi`]
+/// the answer depends on the VA *driver* (Mesa AMD vs spec order, see
+/// [`vaapi_target_usage`]), which is a process-wide probe. Carrying `mesa_amd`
+/// as data lets the unit tests cover both mappings on any machine.
+///
+/// Twin-ness is derived from [`vaapi_target_usage`] itself, never hard-coded
+/// per driver: it stays correct if the mapping changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncoderProfile {
+    pub backend: EncoderBackend,
+    /// Only ever true for [`EncoderBackend::Vaapi`].
+    pub mesa_amd: bool,
+}
+
+impl EncoderProfile {
+    pub const fn new(backend: EncoderBackend, mesa_amd: bool) -> Self {
+        Self { backend, mesa_amd: mesa_amd && matches!(backend, EncoderBackend::Vaapi) }
+    }
+
+    /// The profile of `backend` on this machine (probes the VA driver once).
+    pub fn of(backend: EncoderBackend) -> Self {
+        Self::new(backend, backend == EncoderBackend::Vaapi && va_driver_is_mesa_amd())
+    }
+
+    /// See [`EncoderBackend::tune_applies`].
+    pub const fn tune_applies(self) -> bool {
+        self.backend.tune_applies()
+    }
+
+    /// An opaque value that is equal for two levels exactly when they give the
+    /// same encode on this backend. x264: the three distinct speed presets.
+    /// VA: the `target-usage` the level maps to, folded the way the driver
+    /// folds it: Mesa AMD reads it as a bitfield where 1 is its own
+    /// combination and 2/3, 4/5, 6/7 are bit-identical pairs (table on
+    /// [`vaapi_target_usage`]); spec-order drivers treat every value as
+    /// distinct.
+    pub fn quality_effect(self, level: QualityLevel) -> u32 {
+        match self.backend {
+            EncoderBackend::Software => match level {
+                QualityLevel::Performance => 0,
+                QualityLevel::Balanced => 1,
+                QualityLevel::Quality => 2,
+            },
+            EncoderBackend::Vaapi => {
+                let tu = vaapi_target_usage(level, self.mesa_amd);
+                if self.mesa_amd && tu >= 2 { 1000 + tu / 2 } else { tu }
+            }
+        }
+    }
+
+    /// Quality levels the picker shows, in display order. Where levels are
+    /// twins the *Balanced* one is left out (Performance and Quality win: they
+    /// are the ends of the range, Balanced is the in-between that has collapsed
+    /// onto one of them).
+    pub fn visible_quality_levels(self) -> Vec<QualityLevel> {
+        const PRIORITY: [QualityLevel; 3] = [QualityLevel::Performance, QualityLevel::Quality, QualityLevel::Balanced];
+        let mut shown: Vec<QualityLevel> = Vec::new();
+        for l in PRIORITY {
+            if !shown.iter().any(|s| self.quality_effect(*s) == self.quality_effect(l)) {
+                shown.push(l);
+            }
+        }
+        QualityLevel::ALL.into_iter().filter(|l| shown.contains(l)).collect()
+    }
+
+    /// The visible level that gives the same encode as `level` (itself when it
+    /// is visible): what the picker highlights for a stored twin.
+    pub fn display_quality_level(self, level: QualityLevel) -> QualityLevel {
+        let e = self.quality_effect(level);
+        self.visible_quality_levels().into_iter().find(|l| self.quality_effect(*l) == e).unwrap_or(level)
+    }
+}
+
 impl EncoderBackend {
+    /// Whether [`TuneMode`] changes the encode on this backend. Only
+    /// [`EncoderBackend::Software`] reads it (x264enc `tune=zerolatency` or
+    /// not); the VA encoders have no equivalent property and
+    /// [`Self::launch_fragment`] drops it (`let _ = tune;`). The stream-settings
+    /// UI hides the Tune row where this is false. Keep it in step with
+    /// `launch_fragment` if a backend ever starts honouring tune.
+    pub const fn tune_applies(self) -> bool {
+        matches!(self, EncoderBackend::Software)
+    }
+
     /// The `gst-launch`-syntax fragment for this backend's encoder element,
     /// including its bitrate/GOP properties. Deliberately returns just the
     /// element description (not surrounding `!`s) so [`build_pipeline`] stays
@@ -585,22 +676,33 @@ const ALL_CODECS: [VideoCodec; 3] = [VideoCodec::H264, VideoCodec::H265, VideoCo
 /// downgrades, which is exactly the surprise this function lets a caller
 /// avoid).
 ///
-/// Deliberately backend-only, not a live per-machine capability probe of
-/// `vah265enc`/`vaav1enc` specifically (unlike [`detect_encoder_backend`]'s
-/// own `vah264enc`-availability probe): every machine with a working
-/// [`EncoderBackend::Vaapi`] this session has been tested on has both
-/// (they're both part of the same `va` GStreamer plugin as `vah264enc`), and
-/// a static, no-I/O function is simpler and enough for Stage 2 to gate the
-/// UI correctly. A machine where `vah264enc` works but `vah265enc`/
-/// `vaav1enc` mysteriously don't would still fail at
-/// [`branch::add_branch_with_fallback`]'s per-branch fallback (silently
-/// dropping to software/H.264) rather than crash — a real gap, but a narrow
-/// and already-handled one, not worth a second runtime probe pipeline for
-/// this stage.
+/// On [`EncoderBackend::Vaapi`] H.264 is what [`detect_encoder_backend`]'s probe
+/// proved; H.265 and AV1 are offered when their encoder element exists
+/// (`vah265enc` / `vaav1enc`, [`VAAPI_H265_ENCODER_ELEMENT`] /
+/// [`VAAPI_AV1_ENCODER_ELEMENT`]), probed once. `Why (#95):` GStreamer's VA
+/// plugin registers an encoder element only for a codec the GPU's driver
+/// advertises an encode entrypoint for, so the factory's presence is the
+/// capability check (an older iGPU or dGPU without AV1 encode has no
+/// `vaav1enc`). Before, the list was a static "all three", so such a machine
+/// offered an AV1 button that silently downgraded the branch to x264 H.264
+/// ([`branch::add_branch_with_fallback`]): a control that does nothing, which the
+/// UI now hides (user rule 2026-11-01).
 pub fn supported_codecs(backend: EncoderBackend) -> &'static [VideoCodec] {
+    use std::sync::OnceLock;
+    static VAAPI_CODECS: OnceLock<Vec<VideoCodec>> = OnceLock::new();
     match backend {
         EncoderBackend::Software => &ALL_CODECS[0..1],
-        EncoderBackend::Vaapi => &ALL_CODECS,
+        EncoderBackend::Vaapi => VAAPI_CODECS.get_or_init(|| {
+            let has = |element: &str| ensure_gstreamer_initialized().is_ok() && gst::ElementFactory::find(element).is_some();
+            ALL_CODECS
+                .into_iter()
+                .filter(|c| match c {
+                    VideoCodec::H264 => true,
+                    VideoCodec::H265 => has(VAAPI_H265_ENCODER_ELEMENT),
+                    VideoCodec::Av1 => has(VAAPI_AV1_ENCODER_ELEMENT),
+                })
+                .collect()
+        }),
     }
 }
 
@@ -669,6 +771,11 @@ pub enum QualityLevel {
     /// [`vaapi_target_usage`], #92) — the slowest, best-quality end of both
     /// scales.
     Quality,
+}
+
+impl QualityLevel {
+    /// Every level, in the order the picker shows them.
+    pub const ALL: [QualityLevel; 3] = [Self::Performance, Self::Balanced, Self::Quality];
 }
 
 // Rate control is not a setting (#88, 2026-10-15): every VA encoder runs Dynamic
@@ -2650,6 +2757,8 @@ async fn spawn_destination(
         .await
         .map_err(|e| blame_the_source(e.context(format!("failed to bring up the encode branch for stream {stream_id}")), capture_errors))?;
 
+    runtime.lock().unwrap().set_actual_backend(encode_branch.backend());
+
     // Feed the branch's proving IDR through the normal accounting so it is
     // cached for the stall protocol and drives `Starting` → `Live` exactly
     // once, in one place — and, critically, so it actually reaches the
@@ -4349,6 +4458,11 @@ pub mod destination {
         /// input to [`Self::stall_if_silent`].
         last_frame_at: Option<Instant>,
         params: VideoParams,
+        /// The backend the authoritative branch is really running on (#95),
+        /// `None` until the first branch is up. [`Self::params`]`.backend` stays
+        /// the *preferred* one: the next branch swap tries it first again, so a
+        /// transient VA failure does not pin the destination to x264 for good.
+        actual_backend: Option<EncoderBackend>,
         /// Fed by [`super::destination_pump`]; read by the UI (#46).
         encoder_limit: EncoderLimit,
     }
@@ -4366,8 +4480,20 @@ pub mod destination {
                 last_stall_resend: None,
                 last_frame_at: None,
                 params,
+                actual_backend: None,
                 encoder_limit: EncoderLimit::default(),
             }
+        }
+
+        /// The backend the live branch actually encodes with, if a branch is up
+        /// yet. See the field.
+        pub fn actual_backend(&self) -> Option<EncoderBackend> {
+            self.actual_backend
+        }
+
+        /// Record the backend of the branch that just became authoritative.
+        pub fn set_actual_backend(&mut self, backend: EncoderBackend) {
+            self.actual_backend = Some(backend);
         }
 
         /// `Some` while this `Live` destination's encoder has been the
@@ -4707,6 +4833,24 @@ pub mod destination {
                 gop_millis: DEFAULT_GOP_MILLIS,
                 codec: VideoCodec::default(),
             }
+        }
+
+        /// #95: the backend a destination's live branch really runs on is recorded
+        /// apart from the preferred one in `params`, so a per-branch VA->x264
+        /// fallback is visible to the UI but the next swap still tries VA first.
+        #[test]
+        fn actual_backend_is_recorded_apart_from_the_preferred_one() {
+            let mut runtime = DestinationRuntime::new(Instant::now(), VideoParams { backend: EncoderBackend::Vaapi, ..params(30) });
+            assert_eq!(runtime.actual_backend(), None, "no branch yet");
+            runtime.set_actual_backend(EncoderBackend::Software);
+            assert_eq!(runtime.actual_backend(), Some(EncoderBackend::Software));
+            // A completed swap records its params (preferred backend VA again) ...
+            runtime.set_params(VideoParams { backend: EncoderBackend::Vaapi, ..params(60) });
+            assert_eq!(runtime.params().backend, EncoderBackend::Vaapi);
+            assert_eq!(runtime.actual_backend(), Some(EncoderBackend::Software), "set_params must not rewrite it");
+            // ... and the branch that came up reports its own.
+            runtime.set_actual_backend(EncoderBackend::Vaapi);
+            assert_eq!(runtime.actual_backend(), Some(EncoderBackend::Vaapi));
         }
 
         // -------------------------------------------------------------
@@ -5411,9 +5555,21 @@ pub mod branch {
         /// the leaky queue): the "offered" side of
         /// [`super::destination::EncoderLimit`].
         offered: Arc<AtomicU64>,
+        /// The backend this branch was *actually* built with: differs from the
+        /// requested [`EncodeSettings::backend`] when
+        /// [`add_branch_with_fallback`] / [`add_branch_live_waiting`] fell back
+        /// from VA to x264 for this branch.
+        backend: EncoderBackend,
     }
 
     impl EncodeBranch {
+        /// See the `backend` field. The destination runtime records it
+        /// ([`super::destination::DestinationRuntime::actual_backend`]) so the
+        /// UI can show the settings that apply to what is really encoding.
+        pub fn backend(&self) -> EncoderBackend {
+            self.backend
+        }
+
         /// Tier-1 change: write this branch's encoder bitrate live. Both
         /// `x264enc` and `vah264enc` take `bitrate` in kbit/s and accept the
         /// write while `Playing` (see [`super::EncoderBackend::launch_fragment`]).
@@ -5834,7 +5990,7 @@ pub mod branch {
             return Err(anyhow!("failed to link tee's new request pad to the encode branch: {e:?}"));
         }
 
-        Ok(EncodeBranch { id, appsink, bin, tee_pad, encoder: encoder_element, valve, stream: None, offered })
+        Ok(EncodeBranch { id, appsink, bin, tee_pad, encoder: encoder_element, valve, stream: None, offered, backend: settings.backend })
     }
 
     /// [`add_branch`] with the same per-branch VAAPI→software fallback
@@ -6201,7 +6357,7 @@ pub mod branch {
         // value is what makes this safe by construction: the production reader
         // cannot still be holding it.
         let _ = branch.sample_stream();
-        let EncodeBranch { id: _, appsink: _, bin, tee_pad, encoder: _, valve: _, stream, offered: _ } = branch;
+        let EncodeBranch { id: _, appsink: _, bin, tee_pad, encoder: _, valve: _, stream, offered: _, backend: _ } = branch;
         let mut appsink_stream = stream.expect("sample_stream() populated it immediately above");
 
         let branch_sink_pad = bin
@@ -6470,6 +6626,7 @@ pub mod branch {
             let first_pts_us = first_idr.buffer().and_then(|b| b.pts()).map(|t| t.useconds()).unwrap_or(0);
             let mut runtime = runtime.lock().unwrap();
             runtime.set_params(new_params);
+            runtime.set_actual_backend(new_branch.backend());
             runtime.on_branch_swapped(first_pts_us);
             runtime.finish_rebuild();
         }
@@ -6542,6 +6699,7 @@ pub mod branch {
         // The first IDR is what actually ends the stall — feed it through the
         // same accounting a normal frame takes, so the cached IDR and the
         // `Stalled` → `Live` transition happen exactly once, in one place.
+        runtime.lock().unwrap().set_actual_backend(branch.backend());
         // If that one sample happens to be unmappable, the destination simply
         // stays `Stalled` until the pump sees the branch's next IDR (at most a
         // GOP away) — degraded, never wedged.
@@ -9747,10 +9905,10 @@ mod tests {
     #[test]
     fn supported_codecs_gates_h265_and_av1_to_vaapi_only() {
         assert_eq!(supported_codecs(EncoderBackend::Software), &[VideoCodec::H264]);
-        assert_eq!(
-            supported_codecs(EncoderBackend::Vaapi),
-            &[VideoCodec::H264, VideoCodec::H265, VideoCodec::Av1]
-        );
+        // VA: H.264 always, H.265/AV1 only with their encoder element (a probe, #95).
+        let va = supported_codecs(EncoderBackend::Vaapi);
+        assert_eq!(va.first(), Some(&VideoCodec::H264));
+        assert!(va.len() <= ALL_CODECS.len());
     }
 
     /// [`detect_encoder_backend`] must never panic and must always return

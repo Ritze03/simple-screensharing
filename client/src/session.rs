@@ -539,6 +539,18 @@ impl Destination {
         }
     }
 
+    /// The encoder backend this destination is *really* encoding with: what its
+    /// live branch was built on (VA, or x264 after a per-branch fallback,
+    /// `capture::branch::add_branch_with_fallback`), else — no branch up yet —
+    /// the process-wide probe. The stream-settings screen decides which
+    /// controls do anything from this, not from the probe alone (#95).
+    pub fn encoder_backend(&self) -> capture::EncoderBackend {
+        self.runtime
+            .as_ref()
+            .and_then(|r| r.lock().unwrap().actual_backend())
+            .unwrap_or_else(capture::detect_encoder_backend)
+    }
+
     /// A fresh edit buffer matching this destination's current settings — the
     /// state a row shows before the user changes anything.
     pub fn edit_from(params: capture::destination::VideoParams) -> DestEdit {

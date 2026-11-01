@@ -48,7 +48,7 @@
 //!   `Why:` user 2026-10-15, Dynamic "just works", so the choice went away.
 //!   See `superdoc/features/stream-control.md` "Rate control".
 
-use crate::capture::{DEFAULT_GOP_MILLIS, EncoderBackend, QualityLevel, TuneMode, VideoCodec};
+use crate::capture::{DEFAULT_GOP_MILLIS, EncoderProfile, QualityLevel, TuneMode, VideoCodec};
 use crate::session::{AppState, DestEdit, DestinationId};
 
 /// GOP/keyframe interval of the Gaming preset, ms. Every other preset keeps
@@ -73,27 +73,19 @@ impl EncoderTuning {
         EncoderPreset::detect(self)
     }
 
-    /// [`Self::preset`] as the user sees it on `backend`: where the Tune
-    /// setting does nothing ([`tune_applies`]) it is left out of the
-    /// comparison, see [`EncoderPreset::detect_for`].
-    pub fn preset_for(self, backend: EncoderBackend) -> Option<EncoderPreset> {
-        EncoderPreset::detect_for(self, backend)
+    /// [`Self::preset`] as the user sees it on `profile`: only what changes the
+    /// encode there is compared, see [`EncoderPreset::detect_for`].
+    pub fn preset_for(self, profile: EncoderProfile) -> Option<EncoderPreset> {
+        EncoderPreset::detect_for(self, profile)
     }
-}
 
-/// Whether the Tune setting changes the encode on `backend`. Only
-/// [`EncoderBackend::Software`] reads it (x264enc `tune=zerolatency` or not);
-/// the VA encoders (`vah264enc`/`vah265enc`/`vaav1enc`) have no equivalent
-/// property and `EncoderBackend::launch_fragment` drops it (`let _ = tune;`).
-/// The stream-settings UI uses this to hide the Tune row instead of showing a
-/// control that does nothing (user request 2026-11-01: "make sure to not show
-/// settings, if they wouldn't do anything").
-///
-/// `Why here and not a method on `EncoderBackend`:` `capture.rs` belonged to
-/// another task when this was written. Keep it in step with
-/// `launch_fragment` if a backend ever starts honouring tune.
-pub const fn tune_applies(backend: EncoderBackend) -> bool {
-    matches!(backend, EncoderBackend::Software)
+    /// What these three fields *effectively* encode on `profile`: Tune counts
+    /// only where the backend reads it, the quality level only as its
+    /// [`EncoderProfile::quality_effect`] (twin levels are equal), the GOP
+    /// always. Two tunings with an equal `effect` give the same encode.
+    pub fn effect(self, profile: EncoderProfile) -> (Option<TuneMode>, u32, u32) {
+        (profile.tune_applies().then_some(self.tune), profile.quality_effect(self.quality_level), self.gop_millis)
+    }
 }
 
 /// Whether the Codec row offers a choice at all. With a single producible
@@ -192,26 +184,52 @@ impl EncoderPreset {
         Self::ALL.into_iter().find(|p| p.tuning() == tuning)
     }
 
-    /// [`Self::detect`] for what `backend` actually encodes with. Where Tune
-    /// does nothing ([`tune_applies`] is false: the VA encoders) the stored
-    /// tune is ignored, so the highlighted preset follows the two fields the
-    /// user can still see and change (quality level, keyframe interval).
+    /// The presets the picker shows on `profile`, in display order. A preset
+    /// is hidden when another one gives the identical *effective* encode
+    /// ([`EncoderTuning::effect`]); the default, Balanced, always wins, the
+    /// others then win in display order. Hidden, never deleted: picking any
+    /// visible preset still writes all three fields, and a stored value that
+    /// belongs to a hidden twin is highlighted as its visible twin
+    /// ([`Self::detect_for`]).
     ///
-    /// `Why:` Tune is hidden there but still stored: picking a preset still
-    /// writes all three fields, so a software fallback, or a settings file
-    /// shared with a machine without VA, encodes as the preset says. A stale
-    /// hidden tune (Low-latency left over from an older run, with Balanced's
-    /// level and GOP) must not leave every preset button un-highlighted for a
-    /// reason the user can neither see nor fix. The four presets all differ in
-    /// (quality level, GOP), so ignoring tune never matches two at once.
-    pub fn detect_for(tuning: EncoderTuning, backend: EncoderBackend) -> Option<Self> {
-        if tune_applies(backend) {
-            return Self::detect(tuning);
+    /// `Why (#95, user rule 2026-11-01 "if a setting doesn't do anything, hide it"):`
+    /// on Mesa AMD VA, Tune does nothing and Performance = Balanced
+    /// ([`EncoderProfile::quality_effect`]), so Low-Latency (low-latency,
+    /// Performance, 2000 ms) is the same encode as Balanced (best-quality,
+    /// Balanced, 2000 ms): two buttons for one result. The browser hides the
+    /// same one (`PRESET_TWIN` in `docs/js/ui`). Derived from the effective
+    /// settings rather than hard-coded, so it follows a changed mapping, a
+    /// different driver, or a destination that fell back to x264, where all
+    /// four differ.
+    pub fn visible_for(profile: EncoderProfile) -> Vec<Self> {
+        let mut shown: Vec<Self> = Vec::new();
+        for p in Self::priority_order() {
+            if !shown.iter().any(|s| s.tuning().effect(profile) == p.tuning().effect(profile)) {
+                shown.push(p);
+            }
         }
-        Self::ALL.into_iter().find(|p| {
-            let t = p.tuning();
-            t.quality_level == tuning.quality_level && t.gop_millis == tuning.gop_millis
-        })
+        Self::ALL.into_iter().filter(|p| shown.contains(p)).collect()
+    }
+
+    /// Balanced first (the default wins ties), then the display order.
+    fn priority_order() -> [Self; 4] {
+        [Self::Balanced, Self::LowLatency, Self::Quality, Self::Gaming]
+    }
+
+    /// [`Self::detect`] for what `profile` actually encodes with: the preset
+    /// (always a *visible* one, [`Self::visible_for`]) whose effective
+    /// settings equal `tuning`'s. Where Tune does nothing the stored tune is
+    /// ignored; a stored quality level or preset that is a twin of a visible
+    /// one highlights that one.
+    ///
+    /// `Why:` the hidden things are still stored (a settings file moved to a
+    /// machine where they matter keeps working), so the screen must not read
+    /// "custom" for a value the user can neither see nor fix. A stored
+    /// Low-Latency on Mesa AMD highlights Balanced; its stored fields are left
+    /// alone until the user picks something else.
+    pub fn detect_for(tuning: EncoderTuning, profile: EncoderProfile) -> Option<Self> {
+        let want = tuning.effect(profile);
+        Self::priority_order().into_iter().find(|p| p.tuning().effect(profile) == want)
     }
 }
 
@@ -354,6 +372,7 @@ fn localized(key: &'static str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture::EncoderBackend;
 
     /// The former JS `ENCODER_PRESETS` table (the Electron frontend's `components.js`, removed
     /// ~:994), copied as `(value, label, title, tune, qualityLevel,
@@ -446,42 +465,117 @@ mod tests {
         assert_eq!(balanced.preset(), None);
     }
 
+    const AMD: EncoderProfile = EncoderProfile::new(EncoderBackend::Vaapi, true);
+    const SPEC: EncoderProfile = EncoderProfile::new(EncoderBackend::Vaapi, false);
+    const X264: EncoderProfile = EncoderProfile::new(EncoderBackend::Software, false);
+
     #[test]
     fn only_software_reads_tune() {
-        assert!(tune_applies(EncoderBackend::Software));
-        assert!(!tune_applies(EncoderBackend::Vaapi));
+        assert!(X264.tune_applies());
+        assert!(!AMD.tune_applies());
+        assert!(!SPEC.tune_applies());
+        assert!(EncoderBackend::Software.tune_applies());
+        assert!(!EncoderBackend::Vaapi.tune_applies());
     }
 
-    /// Every preset is found again on both backends, and on VA a preset is
-    /// recognised whatever the (hidden, ignored) tune is.
+    /// Mesa AMD: Performance = Balanced (target-usage 2/3), Tune does nothing,
+    /// so Low-Latency is Balanced's twin and is the only preset hidden.
     #[test]
-    fn detect_for_ignores_tune_only_where_it_does_nothing() {
-        for backend in [EncoderBackend::Software, EncoderBackend::Vaapi] {
+    fn mesa_amd_hides_the_low_latency_twin() {
+        use EncoderPreset::*;
+        assert_eq!(EncoderPreset::visible_for(AMD), vec![Balanced, Quality, Gaming]);
+    }
+
+    /// Spec-order VA (Intel): Performance 7 / Balanced 4 / Quality 1 are all
+    /// different encodes, so every preset is shown even though Tune is a no-op.
+    #[test]
+    fn spec_order_va_shows_every_preset() {
+        assert_eq!(EncoderPreset::visible_for(SPEC), EncoderPreset::ALL.to_vec());
+    }
+
+    /// x264 reads Tune and has three distinct speed presets: nothing hidden.
+    #[test]
+    fn software_shows_every_preset() {
+        assert_eq!(EncoderPreset::visible_for(X264), EncoderPreset::ALL.to_vec());
+    }
+
+    /// Every preset is found again as itself wherever it is visible; a hidden one
+    /// is found as its visible twin, whatever the (ignored) tune is.
+    #[test]
+    fn detect_for_follows_effective_settings() {
+        for profile in [AMD, SPEC, X264] {
+            let visible = EncoderPreset::visible_for(profile);
             for preset in EncoderPreset::ALL {
-                assert_eq!(preset.tuning().preset_for(backend), Some(preset), "{backend:?} {preset:?}");
+                let found = preset.tuning().preset_for(profile).unwrap();
+                assert!(visible.contains(&found), "{profile:?}: {preset:?} highlights hidden {found:?}");
+                if visible.contains(&preset) {
+                    assert_eq!(found, preset, "{profile:?}");
+                }
             }
         }
+        // The stored hidden twin lights up Balanced on AMD ...
+        assert_eq!(EncoderPreset::LowLatency.tuning().preset_for(AMD), Some(EncoderPreset::Balanced));
+        // ... and stays Low-Latency where it differs.
+        assert_eq!(EncoderPreset::LowLatency.tuning().preset_for(SPEC), Some(EncoderPreset::LowLatency));
+        assert_eq!(EncoderPreset::LowLatency.tuning().preset_for(X264), Some(EncoderPreset::LowLatency));
+        // Tune is ignored on VA, counted on x264.
         for preset in EncoderPreset::ALL {
             let mut t = preset.tuning();
             t.tune = match t.tune {
                 TuneMode::LowLatency => TuneMode::BestQuality,
                 TuneMode::BestQuality => TuneMode::LowLatency,
             };
-            assert_eq!(t.preset_for(EncoderBackend::Vaapi), Some(preset), "stale tune must not unselect {preset:?} on VA");
+            for va in [AMD, SPEC] {
+                assert_eq!(t.preset_for(va), preset.tuning().preset_for(va), "stale tune must not change the highlight on VA ({preset:?})");
+            }
         }
-        // x264 still compares tune: Balanced's level and GOP with the low-latency tune is hand-tuned.
         let mut t = EncoderPreset::Balanced.tuning();
         t.tune = TuneMode::LowLatency;
-        assert_eq!(t.preset_for(EncoderBackend::Software), None);
+        assert_eq!(t.preset_for(X264), None);
     }
 
-    /// No two presets share (quality level, GOP), which `detect_for` relies on.
+    /// A stored Balanced level is Performance's twin on AMD: the Balanced button is
+    /// hidden and a stored Balanced highlights Performance; stored value untouched.
     #[test]
-    fn presets_are_distinct_without_tune() {
-        for (i, a) in EncoderPreset::ALL.iter().enumerate() {
-            for b in &EncoderPreset::ALL[i + 1..] {
-                let (a, b) = (a.tuning(), b.tuning());
-                assert!(a.quality_level != b.quality_level || a.gop_millis != b.gop_millis);
+    fn quality_levels_hide_the_balanced_twin_on_mesa_amd() {
+        use QualityLevel::*;
+        assert_eq!(AMD.visible_quality_levels(), vec![Performance, Quality]);
+        assert_eq!(AMD.display_quality_level(Balanced), Performance);
+        assert_eq!(AMD.display_quality_level(Performance), Performance);
+        assert_eq!(AMD.display_quality_level(Quality), Quality);
+        for p in [SPEC, X264] {
+            assert_eq!(p.visible_quality_levels(), QualityLevel::ALL.to_vec(), "{p:?}");
+            for l in QualityLevel::ALL {
+                assert_eq!(p.display_quality_level(l), l);
+            }
+        }
+    }
+
+    /// Twin-ness is derived from the mapping, not named per driver: levels are
+    /// twins exactly when the driver folds their target-usage together.
+    #[test]
+    fn spec_order_mapping_has_no_twins_and_amd_mapping_has_one_pair() {
+        let twins = |p: EncoderProfile| {
+            let mut n = 0;
+            for (i, a) in QualityLevel::ALL.iter().enumerate() {
+                for b in &QualityLevel::ALL[i + 1..] {
+                    n += usize::from(p.quality_effect(*a) == p.quality_effect(*b));
+                }
+            }
+            n
+        };
+        assert_eq!(twins(AMD), 1);
+        assert_eq!(twins(SPEC), 0);
+        assert_eq!(twins(X264), 0);
+    }
+
+    #[test]
+    fn presets_are_distinct_without_tune_on_x264_and_spec_order() {
+        for profile in [X264, SPEC] {
+            for (i, a) in EncoderPreset::ALL.iter().enumerate() {
+                for b in &EncoderPreset::ALL[i + 1..] {
+                    assert_ne!(a.tuning().effect(profile), b.tuning().effect(profile), "{profile:?} {a:?}/{b:?}");
+                }
             }
         }
     }

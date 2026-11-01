@@ -147,7 +147,7 @@ resource compiler (`winresource`/`embed-resource` + an `.ico`), not added.
 The backend that will encode is `capture::detect_encoder_backend()` (probed once per process: VA-API if
 `vah264enc` reaches PAUSED, else software x264; a destination's `VideoParams::backend` is that same value, so
 staged and live agree). Against it:
-- **Tune** is drawn only on x264 (`presets::tune_applies`): `launch_fragment` maps it to `tune=zerolatency`
+- **Tune** is drawn only on x264 (`EncoderBackend::tune_applies`, was `presets::tune_applies` until #95): `launch_fragment` maps it to `tune=zerolatency`
   there, and on every VA encoder (`vah264enc`/`vah265enc`/`vaav1enc`) it is dropped (`let _ = tune;`).
   On VA-API the Advanced rows are Quality level + Keyframe interval.
 - **Codec** is drawn only when `supported_codecs` offers more than one (`presets::codec_choice_offered`).
@@ -166,9 +166,9 @@ or a settings file used on another machine encodes as the preset says; but `Enco
 ignores the stored tune where it does nothing, otherwise a stale hidden tune (e.g. Low-latency from an older
 run, with Balanced's level and GOP) would leave every preset un-highlighted for a reason the user cannot see
 or fix. The four presets differ in (quality level, GOP), so the comparison stays unambiguous. On VA-API
-Low-Latency and Gaming differ only in the keyframe interval; the preset set is left as is. Known edge: a
-live VA branch that failed to build and fell back to x264 for that branch only (`add_branch_with_fallback`)
-still reports the VA backend, so Tune stays hidden for it. Tests: `presets::tests::detect_for_*`,
+Low-Latency and Gaming differ only in the keyframe interval; the preset set was left as is (until #95, below,
+which hides the twin presets). The known edge of #90, a live VA branch that fell back to x264 still hiding
+Tune, is fixed by #95 (the backend is now per destination). Tests: `presets::tests::detect_for_*`,
 `stream_settings::tests::tune_row_is_only_drawn_where_it_does_something`.
 
 **Hide anything that does nothing, even when it is only a browser limitation** (2026-11-01, task #93).
@@ -198,6 +198,63 @@ Applied to the browser share modal (`docs/js/ui/app.js`):
 - Kept on purpose (information, not settings, and they act in the browser): the Screen and Audio source
   rows with the level meter, the Bitrate "set by budget" value in absolute-bandwidth mode, the framerate
   select (the encoder is told the rate and excess frames are skipped), the bandwidth rows, jitter/catch-up.
+
+**Native client: hide twin choices and per-destination backend** (2026-11-01, task #95, same user rule as #93:
+"If a setting doesn't do anything, hide it (Yes, even when its just a browser limitation). Just hide it, so
+other platforms can still use it." then "Make sure to fix all according to spec."). Hide, never grey out and never
+delete: every stored value round-trips unchanged, so a settings file moved to another driver or platform still
+works. What "does nothing" means is now computed from the *effective encode* of the backend that is running,
+`capture::EncoderProfile { backend, mesa_amd }` (`EncoderProfile::of(backend)` probes the VA driver once; the
+unit tests build either mapping by hand):
+- **Quality level: Balanced hidden on Mesa AMD.** `vaapi_target_usage` gives Performance 2 / Balanced 3 / Quality 4
+  there and Mesa reads target-usage as a bitfield where 2 and 3 are bit-identical ("balance" preset, #92), so the
+  Balanced button was a second Performance. `EncoderProfile::quality_effect` folds the value the way the driver does
+  (Mesa AMD: 1 alone, {2,3}, {4,5}, {6,7}; spec-order drivers and x264: every level distinct), derived from
+  `vaapi_target_usage` itself, not from a hard-coded "AMD hides Balanced", so it follows a changed mapping.
+  `visible_quality_levels()` keeps Performance and Quality ahead of Balanced when levels are twins. A stored
+  Balanced is *displayed* as its twin (`display_quality_level`, Performance) and stays stored as Balanced until the
+  user picks another level (clicking the shown, already-selected one is no change). Intel (7/4/1) and x264
+  (ultrafast/medium/veryslow): nothing hidden.
+- **Presets: Low-Latency hidden when it equals Balanced.** `EncoderPreset::visible_for(profile)` hides a preset
+  whose *effective* tuning (`EncoderTuning::effect`: tune only where `tune_applies`, `quality_effect`, GOP) equals
+  one already shown; Balanced (the default) wins, the rest win in display order. On Mesa AMD Tune is a no-op and
+  Performance = Balanced, so Low-Latency (low-latency, Performance, 2000 ms) = Balanced (best-quality, Balanced,
+  2000 ms): hidden, matching the browser (#93 `PRESET_TWIN`). Gaming (750 ms GOP) stays. `detect_for(tuning, profile)`
+  compares effective settings, so a stored Low-Latency highlights Balanced on AMD, stays Low-Latency on Intel and x264,
+  and the stored fields are untouched until a preset is picked (picking one still writes all three fields).
+  Why derived and not a table: the answer differs per driver and per destination (below).
+- **Tune and the twins follow the destination's running backend.** `Destination::encoder_backend()` is the backend
+  its live branch was built on (`DestinationRuntime::actual_backend`, recorded by `spawn_destination`,
+  `swap_to_new_branch` and `rebuild_after_source_restart` from `EncodeBranch::backend()`), the process-wide probe
+  while no branch is up, and the probe for the staged modal. So a destination whose VA branch fell back to x264
+  (`add_branch_with_fallback` or the no-IDR retry) shows Tune and every level and preset that differs on x264.
+  *Why `params.backend` is untouched:* it is the *preferred* backend, tried first again on the next branch swap; a
+  transient VA failure must not pin the destination to x264 for good, so the actual one is a separate field.
+- **Codec buttons the machine cannot encode are hidden, not greyed out.** `capture::supported_codecs(Vaapi)` was a
+  static "H.264, H.265, AV1"; it now offers H.265/AV1 only when GStreamer has `vah265enc`/`vaav1enc` (the VA plugin
+  registers an encoder only for a profile the GPU's driver advertises), so a GPU without AV1 encode no longer shows
+  an AV1 button that silently produced x264 H.264. A stored codec that is not encodable here is shown as H.264, the
+  stream's real codec, and stays stored. (The `ui.stream.codec_unsupported` locale key is now unused.)
+- **Settings > Presentation, fallback run.** When the surface lacks the stored present mode, `main` relaunches on Vsync
+  for that run (`SSS_PRESENT_MODE_FALLBACK`). In that run the stored mode (`launch_presentation_mode`) does nothing,
+  so it is hidden and Vsync is shown as selected; the stored value is kept and re-picking Vsync is no change
+  (`ui::modals::presentation_choices`). Normal runs show all three.
+- **Audit result (native, per backend/codec/driver):** Framerate (RateCap, every backend), Bitrate (every backend), Keyframe
+  interval (`key-int-max`, every VA codec and x264), bandwidth mode/total/floor (floor and total only drawn in Absolute
+  mode, where they act), the Codec row (hidden with one codec), Settings: display name, language, jitter buffer and
+  catch-up speed (playback, act on every decoder) were checked and all do something; the Advanced disclosure stays
+  because Quality level and Keyframe interval are always in it. Not changed on purpose: the Source card's audio
+  controls (they act on every platform). Known remaining: Gaming vs Low-Latency on VA differ only by GOP (a real
+  difference, kept); the modal's two-column width still reserves room for the longest label set (`column_need_for`
+  measures all options, so hiding some never makes the layout jump).
+- Removed the now unused `.collapser` rule from `docs/css/app.css` (the browser stopped drawing it in #93; the egui
+  `widgets::collapser` is unrelated and stays).
+Tests: `presets::tests::{mesa_amd_hides_the_low_latency_twin, spec_order_va_shows_every_preset, software_shows_every_preset,
+detect_for_follows_effective_settings, quality_levels_hide_the_balanced_twin_on_mesa_amd,
+spec_order_mapping_has_no_twins_and_amd_mapping_has_one_pair}`, `capture::destination::tests::actual_backend_is_recorded_apart_from_the_preferred_one`,
+`ui::tests::session_model::a_destination_reports_the_backend_its_branch_runs_on`,
+`ui::modals::tests::presentation_choices_hide_the_mode_the_surface_lacked`, and the rig runs in
+`superdoc/features/stream-control.md` (2026-11-01, #95).
 
 **The stream-settings modal keeps one height whether "Advanced tuning" is open or closed**
 (2026-10-15). While collapsed, `encoder_card` reserves the rows' height as empty space *below*

@@ -121,6 +121,21 @@ mod session_model {
         assert_eq!(dest.state(), capture::destination::DestinationState::Live);
     }
 
+    /// #95: a live destination reports the backend its branch really runs on (x264 after
+    /// a per-branch VA fallback), the probed one before any branch is up.
+    #[test]
+    fn a_destination_reports_the_backend_its_branch_runs_on() {
+        let mut dest = destination(RoomHandle(0), 0);
+        assert_eq!(dest.encoder_backend(), capture::detect_encoder_backend(), "no runtime: the probe");
+        let runtime = capture::destination::DestinationRuntime::shared(std::time::Instant::now(), dest.params);
+        dest.runtime = Some(runtime.clone());
+        assert_eq!(dest.encoder_backend(), capture::detect_encoder_backend(), "runtime without a branch: the probe");
+        for backend in [capture::EncoderBackend::Software, capture::EncoderBackend::Vaapi] {
+            runtime.lock().unwrap().set_actual_backend(backend);
+            assert_eq!(dest.encoder_backend(), backend);
+        }
+    }
+
     #[test]
     fn capture_feeding_disambiguates_the_same_stream_id_in_two_rooms() {
         let (captures, room_a, room_b) = two_rooms_same_stream_id();

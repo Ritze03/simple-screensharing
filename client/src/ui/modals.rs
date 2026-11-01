@@ -477,6 +477,26 @@ const PRESENTATION_MODES: [PresentationMode; 3] = [
     PresentationMode::Immediate,
 ];
 
+/// `main.rs`'s `PRESENT_FALLBACK_ENV`: set for the run that relaunched itself on Vsync
+/// because the surface lacks the stored presentation mode.
+const PRESENT_FALLBACK_ENV: &str = "SSS_PRESENT_MODE_FALLBACK";
+
+/// The presentation modes the Settings select draws (indices into
+/// [`PRESENTATION_MODES`]) and the position within them shown as selected.
+///
+/// In the run that fell back to Vsync because the surface does not offer the stored
+/// mode (`launch`), that mode does nothing this run and is not drawn; Vsync, the mode
+/// really in use, is shown as selected. The stored value is left alone (a settings
+/// file shared with another machine or GPU keeps working there): picking the shown
+/// Vsync is no change. User rule 2026-11-01: hide what does nothing.
+fn presentation_choices(stored: PresentationMode, launch: PresentationMode, fallback_run: bool) -> (Vec<usize>, usize) {
+    let hidden = (fallback_run && launch != PresentationMode::AutoVsync).then_some(launch);
+    let shown: Vec<usize> = (0..PRESENTATION_MODES.len()).filter(|i| Some(PRESENTATION_MODES[*i]) != hidden).collect();
+    let current = if Some(stored) == hidden { PresentationMode::AutoVsync } else { stored };
+    let sel = shown.iter().position(|i| PRESENTATION_MODES[*i] == current).unwrap_or(0);
+    (shown, sel)
+}
+
 fn settings(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
     let title = tr("ui.sidebar.settings", "Settings");
     let spec = ModalSpec {
@@ -493,17 +513,20 @@ fn settings(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
         "en"
     };
     let mut lang = lang_now;
-    let mut mode_i = PRESENTATION_MODES
-        .iter()
-        .position(|m| *m == cx.state.presentation_mode)
-        .unwrap_or(0);
     let restart = cx.state.presentation_mode != cx.state.launch_presentation_mode;
     let mode_labels = [
         tr("ui.settings.mode_mailbox", "Mailbox (default)"),
         tr("ui.settings.mode_vsync", "Vsync"),
         tr("ui.settings.mode_immediate", "Immediate"),
     ];
-    let mode_refs: Vec<&str> = mode_labels.iter().map(|s| s.as_ref()).collect();
+    // The modes drawn (indices into PRESENTATION_MODES) and which one is shown as selected.
+    let (shown, shown_i) = presentation_choices(
+        cx.state.presentation_mode,
+        cx.state.launch_presentation_mode,
+        std::env::var_os(PRESENT_FALLBACK_ENV).is_some(),
+    );
+    let mut mode_i = shown_i;
+    let mode_refs: Vec<&str> = shown.iter().map(|i| mode_labels[*i].as_ref()).collect();
 
     let mut name_done = false;
     let mut click = FooterClick::None;
@@ -599,8 +622,10 @@ fn settings(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
     if lang != lang_now {
         cx.act(UiAction::SetLanguage(lang.to_string()));
     }
-    if PRESENTATION_MODES[mode_i] != cx.state.presentation_mode {
-        cx.act(UiAction::SetPresentationMode(PRESENTATION_MODES[mode_i]));
+    // Only a pick that differs from what was shown is a change (a stored mode shown as
+    // its fallback twin stays stored until another one is picked).
+    if mode_i != shown_i {
+        cx.act(UiAction::SetPresentationMode(PRESENTATION_MODES[shown[mode_i]]));
     }
     if (name_done || closing)
         && st.display_name.trim() != cx.state.display_name
@@ -964,6 +989,24 @@ mod tests {
         st.join_name = "typed".into();
         st.prefill_name();
         assert_eq!(st.join_name, "typed");
+    }
+
+    /// Normal run: all three modes drawn, the stored one selected. Fallback run (the
+    /// surface lacked the stored mode): that mode is hidden, Vsync is shown for it.
+    #[test]
+    fn presentation_choices_hide_the_mode_the_surface_lacked() {
+        use PresentationMode::*;
+        let names = |shown: &[usize]| shown.iter().map(|i| PRESENTATION_MODES[*i]).collect::<Vec<_>>();
+        let (shown, sel) = presentation_choices(Mailbox, Mailbox, false);
+        assert_eq!((names(&shown), PRESENTATION_MODES[shown[sel]]), (vec![Mailbox, AutoVsync, Immediate], Mailbox));
+        let (shown, sel) = presentation_choices(Mailbox, Mailbox, true);
+        assert_eq!((names(&shown), PRESENTATION_MODES[shown[sel]]), (vec![AutoVsync, Immediate], AutoVsync));
+        // A stored Vsync never fell back: nothing hidden.
+        let (shown, _) = presentation_choices(AutoVsync, AutoVsync, true);
+        assert_eq!(shown.len(), 3);
+        // The user picked Immediate during the fallback run: it shows as selected.
+        let (shown, sel) = presentation_choices(Immediate, Mailbox, true);
+        assert_eq!(PRESENTATION_MODES[shown[sel]], Immediate);
     }
 
     #[test]
