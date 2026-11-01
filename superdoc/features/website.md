@@ -67,9 +67,14 @@ Watch and share both work. Differences from native, all platform limits:
 - **No H.265 encode** (Chromium here has no encoder for it); H.265 *decode* only with a hardware
   decoder, i.e. a **headed** run with VAAPI. Headless Chromium has no software HEVC decoder.
 - **No GOP / quality-level / CQP knobs** (WebCodecs has none): GOP is emulated by forced keyframes
-  every `gopMs`; the preset table is in `docs/js/core/README.md`. The share modal therefore has no
-  Quality level row (it used to show "desktop app only"; #90), and hides the Codec row when only one
-  codec is encodable.
+  every `gopMs`; the preset table is in `docs/js/core/README.md`. **The share modal hides what does
+  nothing in the browser** (user rule 2026-11-01, #93: "If a setting doesn't do anything, hide it (Yes,
+  even when its just a browser limitation). Just hide it, so other platforms can still use it."): no
+  Quality level, Tune or Keyframe interval rows (and no "Advanced tuning" disclosure, nothing is left in
+  it), no Low-Latency preset button (identical to Balanced here; a stored `low_latency` shows as
+  Balanced and is kept as is), no greyed-out codecs (an unencodable codec has no button, the Codec row
+  goes when at most one is left). Hidden only in the UI: the core's `ENCODER_PRESETS`, the persisted
+  settings and the native app keep the setting. Details and the "why": `ui/APP-SHELL.md` (2026-11-01).
 - **No audio source choice:** only what `getDisplayMedia({audio})` returns; the audio control is
   mute only. Native has the per-application picker (`pw-loopback`).
 - **Capture is damage-driven:** a static screen delivers no frames; the core re-encodes the newest

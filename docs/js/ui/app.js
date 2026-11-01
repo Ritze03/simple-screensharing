@@ -4,7 +4,7 @@
 // images) by moving them into the new tree. Numbers that change every second (fps, kbps, meters) are patched in
 // place instead of re-rendering, so sliders and hovers are never interrupted.
 
-import { capabilities, createRoom, parseJoinLink, parseServerAddr, base64urlDecode, ENCODER_PRESETS, probeEncoders } from "../core/index.js";
+import { capabilities, createRoom, parseJoinLink, parseServerAddr, base64urlDecode, probeEncoders } from "../core/index.js";
 import { S, onInvalidate, invalidate, toast, persistSettings, persistRooms, loadRooms, autoName, displayName } from "./store.js";
 import { t, setLang, getLang } from "./i18n.js";
 import {
@@ -24,7 +24,11 @@ import { popOut, closePopout, popoutMode } from "./popout.js";
 const caps = capabilities();
 const FPS = [15, 30, 60, 90, 120, 144, 165, 240];
 const CODECS = [["h264", "H.264"], ["av1", "AV1"], ["h265", "H.265"]];
-const PRESETS = [["low_latency", "ui.preset.low_latency"], ["balanced", "ui.preset.balanced"], ["quality", "ui.preset.quality"], ["gaming", "ui.preset.gaming"]];
+// "Hide what does nothing" (user rule 2026-11-01, #93): in the browser Low-Latency is identical to Balanced
+// (ENCODER_PRESETS: same latencyMode and keyframe interval), so its button is not offered. A stored "low_latency"
+// stays stored and is shown as its twin (PRESET_TWIN), so the value round-trips for the other platforms that read it.
+const PRESETS = [["balanced", "ui.preset.balanced"], ["quality", "ui.preset.quality"], ["gaming", "ui.preset.gaming"]];
+const PRESET_TWIN = { low_latency: "balanced" };
 let encoders = null; // Set of codecs this browser can encode (probeEncoders), null until probed
 
 const root = document.getElementById("app");
@@ -577,30 +581,25 @@ function renderStreamModal(M, close) {
   const fpsSel = h("select", { class: "field", id: "st-fps", "aria-label": t("share.framerate_label"), onchange: (e) => edit({ fps: Number(e.target.value) }) },
     FPS.map((f) => h("option", { value: String(f), selected: f === d.fps ? true : null, text: f + " fps" })));
   fpsSel.value = String(d.fps);
-  const codecOpts = CODECS.map(([v, l]) => {
-    const ok = !encoders || encoders.has(v);
-    return [v, l, !ok, ok ? l : t("ui.stream.codec_unavailable", { codec: l })];
-  });
+  // A codec this browser cannot encode does nothing when picked: its button is not drawn (#93, was greyed out). Not
+  // before the probe. A staged config whose codec is not encodable (an old or edited stored default) starts with the
+  // first encodable one instead, on the staged copy only: the stored default in S.settings.stream is never rewritten.
+  const codecOpts = CODECS.filter(([v]) => !encoders || encoders.has(v));
+  if (staged && encoders && encoders.size && !encoders.has(d.codec)) d.codec = codecOpts[0][0];
   const video = card(t("ui.stream.video"), null,
     ctrlRow(t("share.framerate_label"), fpsSel, undefined, null, "st-fps"),
     bw.mode === "per_stream"
       ? sliderRow(t("ui.stream.bitrate"), "st-kbps", 500, 20000, 250, () => d.kbps, (v) => { d.kbps = v; }, String, t("ui.stream.bitrate_tip"), () => edit({ kbps: d.kbps }))
       : ctrlRow(t("ui.stream.bitrate"), h("span", { class: "ro txt", style: "width:100%;text-align:right", text: t("ui.stream.set_by_budget") }), valBox(String(staged ? Math.max(bw.floor, Math.round(bw.total / Math.max(1, n) / 100) * 100) : allocated(d))), t("ui.stream.budget_tip")),
-    // A single encodable codec leaves nothing to choose (the rest are greyed out): no row. Not before the probe.
-    encoders && encoders.size <= 1 ? null : ctrlRow(t("ui.stream.codec"), seg(codecOpts, d.codec, (v) => edit({ codec: v }))));
+    // A single encodable codec leaves nothing to choose: no row.
+    codecOpts.length <= 1 && encoders ? null : ctrlRow(t("ui.stream.codec"), seg(codecOpts, d.codec, (v) => edit({ codec: v }))));
 
-  // Encoder
-  const p = ENCODER_PRESETS[d.preset] || ENCODER_PRESETS.balanced;
+  // Encoder: the preset row only. Tune and Keyframe interval used to be read-only readouts of what the preset sets
+  // (latencyMode, forced keyframes); a row the user cannot change is a setting that does nothing, so they are hidden
+  // (#93), and the "Advanced tuning" disclosure with them (nothing is left in it).
   const encRows = [
-    ctrlRow(t("ui.stream.preset"), seg(PRESETS.map(([v, k]) => [v, t(k)]), d.preset, (v) => edit({ preset: v }))),
-    H({ g: 2 }, h("button", { class: "collapser" + (S.advOpen ? " open" : ""), type: "button", "aria-expanded": String(S.advOpen), onclick: () => { S.advOpen = !S.advOpen; render(); } }, ic("chevron_right"), t("ui.stream.advanced"))),
+    ctrlRow(t("ui.stream.preset"), seg(PRESETS.map(([v, k]) => [v, t(k)]), PRESET_TWIN[d.preset] || d.preset, (v) => edit({ preset: v }))),
   ];
-  if (S.advOpen) {
-    encRows.push(V({ g: 2 },
-      ctrlRow(t("ui.stream.tune"), T(p.latencyMode === "realtime" ? t("ui.stream.tune_low_latency") : t("ui.stream.tune_best_quality"), "ro")),
-      ctrlRow(t("ui.stream.keyframe_interval"), T(`${p.gopMs} ms`, "ro")),
-      h("span", { class: "hint", text: t("ui.stream.advanced_browser_note") })));
-  }
   const enc = card(t("ui.stream.encoder"), null, encRows);
 
   const body = H({ g: 3, cls: "st", style: "align-items:flex-start" },

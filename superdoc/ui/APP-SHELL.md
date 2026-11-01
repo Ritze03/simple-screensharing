@@ -156,9 +156,8 @@ staged and live agree). Against it:
 - Everything else was audited and is effective on both backends: Framerate (`RateCap`), Bitrate, Quality
   level (`speed-preset` / `target-usage`), Keyframe interval (`key-int-max`), the bandwidth rows, the presets.
 - The browser share modal (`docs/js/ui/app.js`) lost its "Quality level: desktop app only" row (WebCodecs has
-  no such knob), and hides the Codec row when the probe finds a single encodable codec. Its Tune and
-  Keyframe interval rows stay: they are read-only readouts of what the preset really sets (`latencyMode`,
-  forced keyframes).
+  no such knob), and hides the Codec row when the probe finds a single encodable codec. (Its Tune and
+  Keyframe interval readouts stayed at first; #93 hid them, see the next block.)
 *Why Tune stays at all instead of being hard-wired to zerolatency:* the user judged x264's ~0.7-1 s lookahead
 latency on "Best quality" acceptable ("It's screensharing, not remote gaming"), so the choice stays with the
 user on the one backend where it matters. *Why hide, not grey out:* the user said "not show".
@@ -171,6 +170,34 @@ Low-Latency and Gaming differ only in the keyframe interval; the preset set is l
 live VA branch that failed to build and fell back to x264 for that branch only (`add_branch_with_fallback`)
 still reports the VA backend, so Tune stays hidden for it. Tests: `presets::tests::detect_for_*`,
 `stream_settings::tests::tune_row_is_only_drawn_where_it_does_something`.
+
+**Hide anything that does nothing, even when it is only a browser limitation** (2026-11-01, task #93).
+User rule, verbatim: "If a setting doesn't do anything, hide it (Yes, even when its just a browser
+limitation). Just hide it, so other platforms can still use it." So the rule is: *hide in the UI of the
+platform where it is a no-op; never delete the setting from the shared data, persistence, protocol or
+the other platforms' UI*, and a stored value this platform cannot honour must round-trip unchanged.
+*Why hide, not delete:* the same settings file / join flow is used by the native app and the browser;
+the setting still means something elsewhere. *Why hide, not grey out or show read-only:* a greyed or
+read-only control still looks like a setting and invites the question what it is for (#90 said "not
+show"; #93 extended it to the readouts and the disabled buttons).
+Applied to the browser share modal (`docs/js/ui/app.js`):
+- **Low-Latency preset button hidden.** In the browser `ENCODER_PRESETS.low_latency` equals `balanced`
+  (`latencyMode: "realtime"`, 2000 ms keyframes), so the button did nothing different. Balanced is the
+  default and Gaming (750 ms) is the low-latency choice. A stored `"low_latency"` is *displayed* as
+  Balanced (`PRESET_TWIN`) and is not rewritten unless the user picks another preset; the core's
+  `ENCODER_PRESETS` and `startShare({ preset: "low_latency" })` are unchanged.
+- **Tune and Keyframe interval rows hidden, and the "Advanced tuning" disclosure with them** (nothing
+  was left in it). They were read-only readouts of what the preset sets; the preset row already shows
+  that choice. The "follows the preset" hint went too.
+- **Unencodable codec buttons hidden** instead of greyed out ("This browser can't encode ..."); the Codec
+  row is still dropped when one or none is left. If the stored default codec is not encodable the
+  staged modal starts on the first encodable one (staged copy only; the stored default is untouched).
+- Unused i18n keys removed in en and de: `ui.stream.advanced`, `tune`, `tune_low_latency`,
+  `tune_best_quality`, `keyframe_interval`, `advanced_browser_note`, `codec_unavailable`,
+  `ui.preset.low_latency`. (The native client's own `ui.preset.*` keys are in `client/locales`, untouched.)
+- Kept on purpose (information, not settings, and they act in the browser): the Screen and Audio source
+  rows with the level meter, the Bitrate "set by budget" value in absolute-bandwidth mode, the framerate
+  select (the encoder is told the rate and excess frames are skipped), the bandwidth rows, jitter/catch-up.
 
 **The stream-settings modal keeps one height whether "Advanced tuning" is open or closed**
 (2026-10-15). While collapsed, `encoder_card` reserves the rows' height as empty space *below*
