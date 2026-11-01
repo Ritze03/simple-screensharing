@@ -48,7 +48,7 @@
 //!   `Why:` user 2026-10-15, Dynamic "just works", so the choice went away.
 //!   See `superdoc/features/stream-control.md` "Rate control".
 
-use crate::capture::{DEFAULT_GOP_MILLIS, QualityLevel, TuneMode, VideoCodec};
+use crate::capture::{DEFAULT_GOP_MILLIS, EncoderBackend, QualityLevel, TuneMode, VideoCodec};
 use crate::session::{AppState, DestEdit, DestinationId};
 
 /// GOP/keyframe interval of the Gaming preset, ms. Every other preset keeps
@@ -72,6 +72,36 @@ impl EncoderTuning {
     pub fn preset(self) -> Option<EncoderPreset> {
         EncoderPreset::detect(self)
     }
+
+    /// [`Self::preset`] as the user sees it on `backend`: where the Tune
+    /// setting does nothing ([`tune_applies`]) it is left out of the
+    /// comparison, see [`EncoderPreset::detect_for`].
+    pub fn preset_for(self, backend: EncoderBackend) -> Option<EncoderPreset> {
+        EncoderPreset::detect_for(self, backend)
+    }
+}
+
+/// Whether the Tune setting changes the encode on `backend`. Only
+/// [`EncoderBackend::Software`] reads it (x264enc `tune=zerolatency` or not);
+/// the VA encoders (`vah264enc`/`vah265enc`/`vaav1enc`) have no equivalent
+/// property and `EncoderBackend::launch_fragment` drops it (`let _ = tune;`).
+/// The stream-settings UI uses this to hide the Tune row instead of showing a
+/// control that does nothing (user request 2026-11-01: "make sure to not show
+/// settings, if they wouldn't do anything").
+///
+/// `Why here and not a method on `EncoderBackend`:` `capture.rs` belonged to
+/// another task when this was written. Keep it in step with
+/// `launch_fragment` if a backend ever starts honouring tune.
+pub const fn tune_applies(backend: EncoderBackend) -> bool {
+    matches!(backend, EncoderBackend::Software)
+}
+
+/// Whether the Codec row offers a choice at all. With a single producible
+/// codec (software x264 is H.264 only, `capture::supported_codecs`) every
+/// other option would be greyed out and nothing the user clicks changes the
+/// encode, so the UI hides the row.
+pub fn codec_choice_offered(supported: &[VideoCodec]) -> bool {
+    supported.len() > 1
 }
 
 impl Default for EncoderTuning {
@@ -160,6 +190,28 @@ impl EncoderPreset {
     /// none does (an allowed, unhighlighted state).
     pub fn detect(tuning: EncoderTuning) -> Option<Self> {
         Self::ALL.into_iter().find(|p| p.tuning() == tuning)
+    }
+
+    /// [`Self::detect`] for what `backend` actually encodes with. Where Tune
+    /// does nothing ([`tune_applies`] is false: the VA encoders) the stored
+    /// tune is ignored, so the highlighted preset follows the two fields the
+    /// user can still see and change (quality level, keyframe interval).
+    ///
+    /// `Why:` Tune is hidden there but still stored: picking a preset still
+    /// writes all three fields, so a software fallback, or a settings file
+    /// shared with a machine without VA, encodes as the preset says. A stale
+    /// hidden tune (Low-latency left over from an older run, with Balanced's
+    /// level and GOP) must not leave every preset button un-highlighted for a
+    /// reason the user can neither see nor fix. The four presets all differ in
+    /// (quality level, GOP), so ignoring tune never matches two at once.
+    pub fn detect_for(tuning: EncoderTuning, backend: EncoderBackend) -> Option<Self> {
+        if tune_applies(backend) {
+            return Self::detect(tuning);
+        }
+        Self::ALL.into_iter().find(|p| {
+            let t = p.tuning();
+            t.quality_level == tuning.quality_level && t.gop_millis == tuning.gop_millis
+        })
     }
 }
 
@@ -392,6 +444,52 @@ mod tests {
         let mut balanced = EncoderPreset::Balanced.tuning();
         balanced.gop_millis = 1234;
         assert_eq!(balanced.preset(), None);
+    }
+
+    #[test]
+    fn only_software_reads_tune() {
+        assert!(tune_applies(EncoderBackend::Software));
+        assert!(!tune_applies(EncoderBackend::Vaapi));
+    }
+
+    /// Every preset is found again on both backends, and on VA a preset is
+    /// recognised whatever the (hidden, ignored) tune is.
+    #[test]
+    fn detect_for_ignores_tune_only_where_it_does_nothing() {
+        for backend in [EncoderBackend::Software, EncoderBackend::Vaapi] {
+            for preset in EncoderPreset::ALL {
+                assert_eq!(preset.tuning().preset_for(backend), Some(preset), "{backend:?} {preset:?}");
+            }
+        }
+        for preset in EncoderPreset::ALL {
+            let mut t = preset.tuning();
+            t.tune = match t.tune {
+                TuneMode::LowLatency => TuneMode::BestQuality,
+                TuneMode::BestQuality => TuneMode::LowLatency,
+            };
+            assert_eq!(t.preset_for(EncoderBackend::Vaapi), Some(preset), "stale tune must not unselect {preset:?} on VA");
+        }
+        // x264 still compares tune: Balanced's level and GOP with the low-latency tune is hand-tuned.
+        let mut t = EncoderPreset::Balanced.tuning();
+        t.tune = TuneMode::LowLatency;
+        assert_eq!(t.preset_for(EncoderBackend::Software), None);
+    }
+
+    /// No two presets share (quality level, GOP), which `detect_for` relies on.
+    #[test]
+    fn presets_are_distinct_without_tune() {
+        for (i, a) in EncoderPreset::ALL.iter().enumerate() {
+            for b in &EncoderPreset::ALL[i + 1..] {
+                let (a, b) = (a.tuning(), b.tuning());
+                assert!(a.quality_level != b.quality_level || a.gop_millis != b.gop_millis);
+            }
+        }
+    }
+
+    #[test]
+    fn codec_row_needs_a_choice() {
+        assert!(!codec_choice_offered(&[VideoCodec::H264]));
+        assert!(codec_choice_offered(&[VideoCodec::H264, VideoCodec::H265, VideoCodec::Av1]));
     }
 
     #[test]

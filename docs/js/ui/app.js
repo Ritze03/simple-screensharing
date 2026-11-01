@@ -586,7 +586,8 @@ function renderStreamModal(M, close) {
     bw.mode === "per_stream"
       ? sliderRow(t("ui.stream.bitrate"), "st-kbps", 500, 20000, 250, () => d.kbps, (v) => { d.kbps = v; }, String, t("ui.stream.bitrate_tip"), () => edit({ kbps: d.kbps }))
       : ctrlRow(t("ui.stream.bitrate"), h("span", { class: "ro txt", style: "width:100%;text-align:right", text: t("ui.stream.set_by_budget") }), valBox(String(staged ? Math.max(bw.floor, Math.round(bw.total / Math.max(1, n) / 100) * 100) : allocated(d))), t("ui.stream.budget_tip")),
-    ctrlRow(t("ui.stream.codec"), seg(codecOpts, d.codec, (v) => edit({ codec: v }))));
+    // A single encodable codec leaves nothing to choose (the rest are greyed out): no row. Not before the probe.
+    encoders && encoders.size <= 1 ? null : ctrlRow(t("ui.stream.codec"), seg(codecOpts, d.codec, (v) => edit({ codec: v }))));
 
   // Encoder
   const p = ENCODER_PRESETS[d.preset] || ENCODER_PRESETS.balanced;
@@ -598,7 +599,6 @@ function renderStreamModal(M, close) {
     encRows.push(V({ g: 2 },
       ctrlRow(t("ui.stream.tune"), T(p.latencyMode === "realtime" ? t("ui.stream.tune_low_latency") : t("ui.stream.tune_best_quality"), "ro")),
       ctrlRow(t("ui.stream.keyframe_interval"), T(`${p.gopMs} ms`, "ro")),
-      ctrlRow(t("ui.stream.quality_level"), T(t("ui.stream.native_only"), "ro")),
       h("span", { class: "hint", text: t("ui.stream.advanced_browser_note") })));
   }
   const enc = card(t("ui.stream.encoder"), null, encRows);

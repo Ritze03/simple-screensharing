@@ -67,7 +67,9 @@ Watch and share both work. Differences from native, all platform limits:
 - **No H.265 encode** (Chromium here has no encoder for it); H.265 *decode* only with a hardware
   decoder, i.e. a **headed** run with VAAPI. Headless Chromium has no software HEVC decoder.
 - **No GOP / quality-level / CQP knobs** (WebCodecs has none): GOP is emulated by forced keyframes
-  every `gopMs`; the preset table is in `docs/js/core/README.md`.
+  every `gopMs`; the preset table is in `docs/js/core/README.md`. The share modal therefore has no
+  Quality level row (it used to show "desktop app only"; #90), and hides the Codec row when only one
+  codec is encodable.
 - **No audio source choice:** only what `getDisplayMedia({audio})` returns; the audio control is
   mute only. Native has the per-application picker (`pw-loopback`).
 - **Capture is damage-driven:** a static screen delivers no frames; the core re-encodes the newest

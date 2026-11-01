@@ -916,7 +916,7 @@ were re-run and still pass; this fix touches only `decode.rs`, nothing sender-si
 
 | Control | `x264enc` (Software) | `vah264enc` (Vaapi) |
 | --- | --- | --- |
-| Tune | `tune=zerolatency` (LowLatency) / unset (**BestQuality, default** — x264enc has no explicit "best quality" value, only the *absence* of the low-latency one) | **No equivalent control.** The field is still accepted on any destination — it simply has no effect until/unless that destination's live branch is `Software` |
+| Tune | `tune=zerolatency` (LowLatency) / unset (**BestQuality, default** — x264enc has no explicit "best quality" value, only the *absence* of the low-latency one) | **No equivalent control.** The field is still accepted and stored, but has no effect while the branch is VA-API, so the stream-settings modal does not show the Tune row there (#90, `ui/APP-SHELL.md`) |
 | Quality Level | `speed-preset`: `ultrafast` (Performance) / `medium` (**Balanced, default** — x264's own upstream default preset) / `veryslow` (Quality) | `target-usage`: `2` (Performance; `7` until #46, which is slower on Mesa radeonsi — see "Encoder limits made visible") / `4` (**Balanced, default**) / `1` (Quality) |
 | Rate Control | No native enum — `Constant` (default)/`Adaptive` are both plain `bitrate=` (**`Adaptive` is a deliberate no-op relative to `Constant`** — x264enc's CBR is already frame-adaptive within its budget, so there's no meaningfully different x264enc setting to reach for); `Quality` switches to `pass=qual quantizer=21` (bitrate-target `bitrate=` is then ignored) | `rate-control=cbr`/`vbr`/`cqp` — a genuine three-way native enum, no asymmetry |
 

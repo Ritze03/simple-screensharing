@@ -142,6 +142,36 @@ taskbar. Wayland takes the icon from `app_id` + the .desktop file, so it is harm
 exe file itself (Explorer, shortcuts) has no embedded icon resource: that needs a build-time
 resource compiler (`winresource`/`embed-resource` + an `.ico`), not added.
 
+**The stream-settings modal shows only controls that change the encode** (2026-11-01, task #90, user:
+"Keep the [Tune] setting. But make sure to not show settings, if they wouldn't do anything!").
+The backend that will encode is `capture::detect_encoder_backend()` (probed once per process: VA-API if
+`vah264enc` reaches PAUSED, else software x264; a destination's `VideoParams::backend` is that same value, so
+staged and live agree). Against it:
+- **Tune** is drawn only on x264 (`presets::tune_applies`): `launch_fragment` maps it to `tune=zerolatency`
+  there, and on every VA encoder (`vah264enc`/`vah265enc`/`vaav1enc`) it is dropped (`let _ = tune;`).
+  On VA-API the Advanced rows are Quality level + Keyframe interval.
+- **Codec** is drawn only when `supported_codecs` offers more than one (`presets::codec_choice_offered`).
+  Software x264 is H.264 only, so the row used to be H.264 plus two greyed-out buttons; it is gone there
+  (VA-API keeps all three, unsupported ones are not a thing on that backend).
+- Everything else was audited and is effective on both backends: Framerate (`RateCap`), Bitrate, Quality
+  level (`speed-preset` / `target-usage`), Keyframe interval (`key-int-max`), the bandwidth rows, the presets.
+- The browser share modal (`docs/js/ui/app.js`) lost its "Quality level: desktop app only" row (WebCodecs has
+  no such knob), and hides the Codec row when the probe finds a single encodable codec. Its Tune and
+  Keyframe interval rows stay: they are read-only readouts of what the preset really sets (`latencyMode`,
+  forced keyframes).
+*Why Tune stays at all instead of being hard-wired to zerolatency:* the user judged x264's ~0.7-1 s lookahead
+latency on "Best quality" acceptable ("It's screensharing, not remote gaming"), so the choice stays with the
+user on the one backend where it matters. *Why hide, not grey out:* the user said "not show".
+*Preset highlighting:* picking a preset still writes all three fields (tune included), so an x264 fallback
+or a settings file used on another machine encodes as the preset says; but `EncoderPreset::detect_for`
+ignores the stored tune where it does nothing, otherwise a stale hidden tune (e.g. Low-latency from an older
+run, with Balanced's level and GOP) would leave every preset un-highlighted for a reason the user cannot see
+or fix. The four presets differ in (quality level, GOP), so the comparison stays unambiguous. On VA-API
+Low-Latency and Gaming differ only in the keyframe interval; the preset set is left as is. Known edge: a
+live VA branch that failed to build and fell back to x264 for that branch only (`add_branch_with_fallback`)
+still reports the VA backend, so Tune stays hidden for it. Tests: `presets::tests::detect_for_*`,
+`stream_settings::tests::tune_row_is_only_drawn_where_it_does_something`.
+
 **The stream-settings modal keeps one height whether "Advanced tuning" is open or closed**
 (2026-10-15). While collapsed, `encoder_card` reserves the rows' height as empty space *below*
 the Encoder card (`adv_rows_height`: the rows laid out once in an invisible, non-advancing child
