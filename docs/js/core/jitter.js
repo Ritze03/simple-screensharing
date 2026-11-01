@@ -51,6 +51,7 @@ export class JitterBuffer {
     this.lastArrivalMs = null;
     this.lastPtsUs = null;
     this.catchUpDropped = 0;
+    this.lastDecodeAtMs = null; // when the newest pushed chunk will be released (the video's presentation clock; A/V sync reads it)
   }
 
   setMaxJitterBufferMs(ms) {
@@ -101,6 +102,7 @@ export class JitterBuffer {
       this.anchorPtsUs = ptsUs;
     }
     const decodeAtMs = this.anchorArrivalMs + (ptsUs - this.anchorPtsUs) / 1000 + this.appliedBufferMs;
+    this.lastDecodeAtMs = decodeAtMs;
     this.pending.push({ decodeAtMs, keyframe, item });
   }
 

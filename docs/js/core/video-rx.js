@@ -44,8 +44,11 @@ export class VideoReceiver {
    * @param {number} [o.maxJitterBufferMs]
    * @param {number} [o.catchUpSpeedPercent]
    * @param {"no-preference"|"prefer-hardware"|"prefer-software"} [o.hardwareAcceleration]
+   * @param {import("./avsync.js").AvSync} [o.avSync]  this sender's A/V sync state (audio follows this video)
    */
-  constructor({ onFrame, announcedSize = () => null, onEvent = () => {}, maxJitterBufferMs, catchUpSpeedPercent, hardwareAcceleration = "no-preference", lowLatency = true, adaptiveLatency = IS_GECKO, now = () => performance.now(), DecoderClass = null }) {
+  constructor({ onFrame, announcedSize = () => null, onEvent = () => {}, maxJitterBufferMs, catchUpSpeedPercent, hardwareAcceleration = "no-preference", lowLatency = true, adaptiveLatency = IS_GECKO, now = () => performance.now(), DecoderClass = null, avSync = null }) {
+    this.avSync = avSync; // shared with this sender's audio receiver (avsync.js); null = no A/V sync
+    if (avSync) avSync.videoStarted();
     this.DecoderClass = DecoderClass; // tests inject a fake decoder; default is the global VideoDecoder
     this.onFrame = onFrame;
     this.announcedSize = announcedSize; // () => {width,height}|null: the size the sender announced for this stream
@@ -92,7 +95,7 @@ export class VideoReceiver {
   }
 
   /** Feed one decrypted access unit, in wire order. */
-  pushFrame({ ptsUs, keyframe, payload }) {
+  pushFrame({ ptsUs, keyframe, payload, stalled = false }) {
     if (this.closed) return;
     const t = this.now();
     this.stats.rxFrames++;
@@ -122,6 +125,7 @@ export class VideoReceiver {
     }
     const chunk = new EncodedVideoChunk({ type: keyframe ? "key" : "delta", timestamp: ptsUs, data: payload });
     this.jb.push(chunk, { ptsUs, keyframe }, t);
+    if (this.avSync) this.avSync.noteVideo(this.jb.lastDecodeAtMs, ptsUs, stalled);
     this.#run();
     this.#schedule();
   }
@@ -309,6 +313,7 @@ export class VideoReceiver {
   }
 
   close() {
+    if (!this.closed && this.avSync) this.avSync.videoGone();
     this.closed = true;
     if (this.timer != null) clearTimeout(this.timer);
     this.timer = null;
