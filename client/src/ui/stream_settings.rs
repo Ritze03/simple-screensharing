@@ -46,7 +46,7 @@
 //! the bar's "N rooms ▾", see `action_bar::RoomTargets`).
 
 use egui::{Align, CornerRadius, Rect, Response, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
-use simple_screensharing_client::capture::{QualityLevel, TuneMode, VideoCodec};
+use simple_screensharing_client::capture::{self, EncoderBackend, QualityLevel, TuneMode, VideoCodec};
 use simple_screensharing_client::presets::{
     self, BITRATE_STEP_KBPS, CODEC_DISPLAY_ORDER, EncoderPreset, EncoderTuning, MIN_BITRATE_KBPS, codec_description, codec_label,
 };
@@ -777,21 +777,31 @@ fn video_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, c: &LocalCaptu
                 out.push(target.action(NextStream { bitrate_kbps: k, ..v }));
             }
         }
-        let opts: Vec<(VideoCodec, &str, bool, &str)> =
-            CODEC_DISPLAY_ORDER.iter().map(|c| (*c, codec_label(*c), supported.contains(c), codec_description(*c))).collect();
-        let mut codec = v.codec;
-        let unsupported = tr("ui.stream.codec_unsupported", "This machine's encoder can't produce this codec.");
-        let changed = widgets::ctrl_row(ui, &tr("ui.stream.codec", "Codec"), None, |ui| seg_gated(ui, "codec", &mut codec, &opts, &unsupported));
-        if changed {
-            out.push(target.action(NextStream { codec, ..v }));
+        // With one producible codec (software x264: H.264 only) there is nothing to choose: no row.
+        if presets::codec_choice_offered(supported) {
+            let opts: Vec<(VideoCodec, &str, bool, &str)> =
+                CODEC_DISPLAY_ORDER.iter().map(|c| (*c, codec_label(*c), supported.contains(c), codec_description(*c))).collect();
+            let mut codec = v.codec;
+            let unsupported = tr("ui.stream.codec_unsupported", "This machine's encoder can't produce this codec.");
+            let changed = widgets::ctrl_row(ui, &tr("ui.stream.codec", "Codec"), None, |ui| seg_gated(ui, "codec", &mut codec, &opts, &unsupported));
+            if changed {
+                out.push(target.action(NextStream { codec, ..v }));
+            }
         }
     });
 }
 
 fn encoder_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, target: Target, out: &mut Vec<UiAction>) {
+    encoder_card_for(ui, cx, st, target, capture::detect_encoder_backend(), out);
+}
+
+/// [`encoder_card`] for a given encoder backend (in the app always the probed one,
+/// `capture::detect_encoder_backend`). A control that does nothing on that backend
+/// is not drawn: [`presets::tune_applies`].
+fn encoder_card_for(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, target: Target, backend: EncoderBackend, out: &mut Vec<UiAction>) {
     let v = target.values(cx.state);
     let tuning = EncoderTuning { tune: v.tune, quality_level: v.quality_level, gop_millis: v.gop_millis };
-    let mut preset = EncoderPreset::detect(tuning);
+    let mut preset = EncoderPreset::detect_for(tuning, backend);
     drive_dump::line(|| {
         let order = EncoderPreset::ALL.iter().map(|p| p.value()).collect::<Vec<_>>().join(" ");
         format!("preset {}\npreset_order {order}\nadvanced {}", preset.map_or("custom", EncoderPreset::value), u8::from(st.adv_open))
@@ -807,11 +817,11 @@ fn encoder_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, target: Targ
         let r = widgets::collapser(ui, &mut st.adv_open, &adv);
         drive_dump::rect(|| "advanced".into(), r.rect);
         if st.adv_open {
-            adv_rows(ui, st, target, v, out);
+            adv_rows(ui, st, target, v, backend, out);
             0.0
         } else {
             // What the rows would add to the card: their height + the gap above them.
-            adv_rows_height(ui, target, v) + ui.spacing().item_spacing.y
+            adv_rows_height(ui, target, v, backend) + ui.spacing().item_spacing.y
         }
     });
     // Reserve it below the card instead (see `adv_rows_height`). `add_space` only moves
@@ -823,19 +833,23 @@ fn encoder_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, target: Targ
     }
 }
 
-/// The Advanced tuning rows (Tune, Quality level, Keyframe interval).
-fn adv_rows(ui: &mut Ui, st: &mut StreamSettingsState, target: Target, v: NextStream, out: &mut Vec<UiAction>) {
+/// The Advanced tuning rows (Tune, Quality level, Keyframe interval). Tune is left out
+/// on backends that ignore it ([`presets::tune_applies`]).
+fn adv_rows(ui: &mut Ui, st: &mut StreamSettingsState, target: Target, v: NextStream, backend: EncoderBackend, out: &mut Vec<UiAction>) {
     let (low, best) = (tr("ui.stream.tune_low", "Low latency"), tr("ui.stream.tune_best", "Best quality"));
     let (perf, bal, qual) = (
         tr("ui.stream.ql_performance", "Performance"),
         tr("ui.stream.ql_balanced", "Balanced"),
         tr("ui.stream.ql_quality", "Quality"),
     );
-    let mut tune = v.tune;
-    if widgets::ctrl_row(ui, &tr("ui.stream.tune", "Tune"), None, |ui| {
-        widgets::segmented(ui, &mut tune, &[(TuneMode::LowLatency, low.as_str()), (TuneMode::BestQuality, best.as_str())])
-    }) {
-        out.push(target.action(NextStream { tune, ..v }));
+    // Tune only exists in x264; the VA encoders ignore it, so there the row is not shown.
+    if presets::tune_applies(backend) {
+        let mut tune = v.tune;
+        if widgets::ctrl_row(ui, &tr("ui.stream.tune", "Tune"), None, |ui| {
+            widgets::segmented(ui, &mut tune, &[(TuneMode::LowLatency, low.as_str()), (TuneMode::BestQuality, best.as_str())])
+        }) {
+            out.push(target.action(NextStream { tune, ..v }));
+        }
     }
     let mut ql = v.quality_level;
     if widgets::ctrl_row(ui, &tr("ui.stream.quality_level", "Quality level"), None, |ui| {
@@ -873,11 +887,11 @@ fn adv_rows(ui: &mut Ui, st: &mut StreamSettingsState, target: Target, v: NextSt
 /// deterministic (no one-frame resize on first open) and follows font and language;
 /// the space sits outside the card (empty body space, not an oversized card). In the
 /// two-column layout it only matters when the right column is the taller one.
-fn adv_rows_height(ui: &mut Ui, target: Target, v: NextStream) -> f32 {
+fn adv_rows_height(ui: &mut Ui, target: Target, v: NextStream, backend: EncoderBackend) -> f32 {
     let rect = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), f32::INFINITY));
     let mut ghost = ui.new_child(egui::UiBuilder::new().max_rect(rect).invisible().sizing_pass());
     // Scratch drag buffers and action sink: the ghost must not touch the real ones.
-    adv_rows(&mut ghost, &mut StreamSettingsState::default(), target, v, &mut Vec::new());
+    adv_rows(&mut ghost, &mut StreamSettingsState::default(), target, v, backend, &mut Vec::new());
     ghost.min_rect().height()
 }
 
@@ -1091,7 +1105,7 @@ mod tests {
     fn encoder_card_height_does_not_depend_on_advanced() {
         let state = AppState::default();
         let (nav, shell, videos) = (super::super::Nav::default(), super::super::Shell::default(), super::super::VideoViews::default());
-        let height = |adv_open: bool| {
+        let height = |adv_open: bool, backend: EncoderBackend| {
             let ctx = egui::Context::default();
             theme::apply(&ctx);
             let mut st = StreamSettingsState { adv_open, ..Default::default() };
@@ -1103,13 +1117,43 @@ mod tests {
                         let mut actions = Vec::new();
                         let cx = Cx::new(&state, &nav, &shell, &videos, &mut actions);
                         // A scope's rect is its content, like a body column's.
-                        h = ui.scope(|ui| encoder_card(ui, &cx, &mut st, Target::Staged, &mut Vec::new())).response.rect.height();
+                        h = ui.scope(|ui| encoder_card_for(ui, &cx, &mut st, Target::Staged, backend, &mut Vec::new())).response.rect.height();
                     });
                 });
             }
             h
         };
-        let (open, closed) = (height(true), height(false));
-        assert!((open - closed).abs() < 0.5, "open {open} px vs closed {closed} px");
+        for backend in [EncoderBackend::Software, EncoderBackend::Vaapi] {
+            let (open, closed) = (height(true, backend), height(false, backend));
+            assert!((open - closed).abs() < 0.5, "{backend:?}: open {open} px vs closed {closed} px");
+        }
+    }
+
+    /// The Tune row is drawn on x264 and gone on the VA encoders, which ignore it:
+    /// the Encoder card is one control row shorter there (the row's height is the
+    /// only difference, so any larger gap means something else changed too).
+    #[test]
+    fn tune_row_is_only_drawn_where_it_does_something() {
+        let state = AppState::default();
+        let (nav, shell, videos) = (super::super::Nav::default(), super::super::Shell::default(), super::super::VideoViews::default());
+        let open_height = |backend: EncoderBackend| {
+            let ctx = egui::Context::default();
+            theme::apply(&ctx);
+            let mut st = StreamSettingsState { adv_open: true, ..Default::default() };
+            let mut h = 0.0;
+            for _ in 0..2 {
+                let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        let mut actions = Vec::new();
+                        let cx = Cx::new(&state, &nav, &shell, &videos, &mut actions);
+                        h = ui.scope(|ui| encoder_card_for(ui, &cx, &mut st, Target::Staged, backend, &mut Vec::new())).response.rect.height();
+                    });
+                });
+            }
+            h
+        };
+        let (x264, va) = (open_height(EncoderBackend::Software), open_height(EncoderBackend::Vaapi));
+        let row = theme::CTL_H + theme::S2;
+        assert!(x264 - va >= row - 4.0, "x264 card {x264} px, VA card {va} px: Tune row (~{row} px) missing on x264 or still there on VA");
     }
 }
