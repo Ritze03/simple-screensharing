@@ -326,12 +326,18 @@ fn va_driver_is_mesa_amd() -> bool {
 /// the encode is identical to Performance, there is no cheaper or better
 /// point between balance and quality that 1..=7 can reach), Quality 4 (the
 /// quality preset: nearly all of the gain of 6 at twice its AV1 speed).
-/// Other drivers follow the VA order and keep Balanced 4 / Quality 1;
-/// Performance stays 2 there too (unmeasured, an Intel box has not been
-/// available; the spec's fastest would be 7).
+/// Other drivers follow the VA order: Performance 7 (the spec's fastest),
+/// Balanced 4, Quality 1.
+///
+/// `Why Performance is 7 off Mesa AMD (#94, 2026-11-01):` 2 was picked in #46
+/// because 7 was the slowest band on radeonsi; since #92 radeonsi has its own
+/// arm, so the spec-order drivers (Intel iHD) get the spec's fastest value.
+/// Untested on Intel hardware (none available): the fastest-is-7 claim rests
+/// on the VA spec, not on a measurement.
 fn vaapi_target_usage(level: QualityLevel, mesa_amd: bool) -> u32 {
     match (level, mesa_amd) {
-        (QualityLevel::Performance, _) => 2,
+        (QualityLevel::Performance, true) => 2,
+        (QualityLevel::Performance, false) => 7,
         (QualityLevel::Balanced, true) => 3,
         (QualityLevel::Quality, true) => 4,
         (QualityLevel::Balanced, false) => 4,
@@ -642,11 +648,12 @@ pub enum TuneMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QualityLevel {
-    /// x264enc `speed-preset=ultrafast` / VA `target-usage=2` — the fastest
-    /// setting of both backends. An explicit opt-in for callers that need to
-    /// minimize encode cost above all else. `2`, not the VA spec's "fastest"
-    /// `7`: Mesa radeonsi is fastest at 2-3 and slowest at 6-7 (measured
-    /// table in [`EncoderBackend::launch_fragment`], #46).
+    /// x264enc `speed-preset=ultrafast` / VA `target-usage=7` (`2` on Mesa
+    /// AMD) — the fastest setting of both backends. An explicit opt-in for
+    /// callers that need to minimize encode cost above all else. `7` is the VA
+    /// spec's "fastest"; Mesa radeonsi is fastest at 2-3 and slowest at 6-7
+    /// (measured table in [`EncoderBackend::launch_fragment`], #46), hence its
+    /// own arm in [`vaapi_target_usage`] (#92, #94).
     Performance,
     /// x264enc `speed-preset=medium` / vah264enc `target-usage=4` (`3` on
     /// Mesa AMD, where 4 is the half-speed AV1 band, [`vaapi_target_usage`],
@@ -8762,14 +8769,15 @@ mod tests {
     /// pure, so it is checked everywhere: Mesa AMD keeps Performance and
     /// Balanced in the fast bands (2, 3: Mesa's balance preset) and Quality in
     /// the quality preset (4), never 1 (pre-encode + VBAQ, slower and worse on
-    /// screen content) or 6-7 (AV1 at ~95 fps); other drivers keep 2 / 4 / 1.
+    /// screen content) or 6-7 (AV1 at ~95 fps); other drivers follow the VA spec
+    /// order: 7 / 4 / 1 (Performance 7 since #94).
     #[test]
     fn vaapi_target_usage_per_driver() {
         use QualityLevel::*;
         let amd = [Performance, Balanced, Quality].map(|l| vaapi_target_usage(l, true));
         assert_eq!(amd, [2, 3, 4]);
         let spec = [Performance, Balanced, Quality].map(|l| vaapi_target_usage(l, false));
-        assert_eq!(spec, [2, 4, 1]);
+        assert_eq!(spec, [7, 4, 1]);
         assert!(amd.iter().chain(spec.iter()).all(|v| (1..=7).contains(v)));
     }
 

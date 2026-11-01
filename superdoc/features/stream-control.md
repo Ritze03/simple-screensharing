@@ -442,6 +442,15 @@ instead of `I`/`R`. Found by task #48; not fixable from the client.
 
 ## `target-usage` is a bitfield on Mesa AMD; Balanced = 3, Quality = 4 (2026-11-01, #92)
 
+**2026-11-01 (#94): Performance is 7 on every non-Mesa-AMD driver.** Spec-order drivers
+(Intel iHD) follow the VA order, 1 = best quality ... 7 = fastest, so `vaapi_target_usage`
+now gives them Performance 7 (Balanced 4 and Quality 1 unchanged). Mesa AMD keeps 2 / 3 / 4.
+*Why:* Performance = 2 was chosen in #46 because 7 was the slowest band on radeonsi; since #92
+radeonsi has its own mapping, so the 2 only ever protected a driver it no longer applies to.
+**Untested on Intel hardware** (none available, and the headless rig is AMD, so the changed
+branch cannot be exercised there); the value rests on the VA spec. Pinned by the
+`vaapi_target_usage_per_driver` unit test. The #46 note below keeps its history.
+
 User report: Balanced is very slow with AV1 on the RX 7900 XTX, and AV1 shares lag when the
 GPU is fully loaded. Balanced was `target-usage=4`, the half-speed AV1 band of the #46
 table below. Cause and fix, from the Mesa 26.2.5 and GStreamer 1.28.8 sources (the installed
@@ -561,7 +570,8 @@ The driver groups the values into bands, and 7 (the spec's "fastest") was the sl
 band and no faster than 4 for H.264. `QualityLevel::Performance` (Gaming and Low-latency
 presets) now maps to **2**, the fastest band for all three codecs; Balanced (4) and Quality
 (1) were unchanged then (moved on Mesa AMD by #92, section above, which also explains the
-bands). **Why 2 and not 1:** 1 is slower and its rate control overshoots (H.264
+bands). **Why Performance is 2 (2026-11-01 update, #94):** that holds for Mesa AMD only; other
+drivers get the spec's fastest, 7, since #92 gave radeonsi its own mapping (untested on Intel). **Why 2 and not 1:** 1 is slower and its rate control overshoots (H.264
 wrote 65 % more bytes than at 2 for the same bitrate). Quality cost of 2 is noise (H.265
 PSNR 40.83 dB at 2, 40.84 at 4, 40.90 at 7 on a `testsrc2` clip). Trade-off: a driver that
 follows the VA order (Intel iHD) gets a slower encode for Performance; the hint below still
@@ -1023,7 +1033,7 @@ were re-run and still pass; this fix touches only `decode.rs`, nothing sender-si
 | Control | `x264enc` (Software) | `vah264enc` (Vaapi) |
 | --- | --- | --- |
 | Tune | `tune=zerolatency` (LowLatency) / unset (**BestQuality, default** — x264enc has no explicit "best quality" value, only the *absence* of the low-latency one) | **No equivalent control.** The field is still accepted and stored, but has no effect while the branch is VA-API, so the stream-settings modal does not show the Tune row there (#90, `ui/APP-SHELL.md`) |
-| Quality Level | `speed-preset`: `ultrafast` (Performance) / `medium` (**Balanced, default** — x264's own upstream default preset) / `veryslow` (Quality) | `target-usage`, VA spec order (Intel): `2` (Performance; `7` until #46) / `4` (**Balanced, default**) / `1` (Quality). **Mesa AMD (radeonsi), since #92:** `2` / `3` (**Balanced, default**) / `4` — `target-usage` is a bitfield there, see "`target-usage` is a bitfield on Mesa AMD" |
+| Quality Level | `speed-preset`: `ultrafast` (Performance) / `medium` (**Balanced, default** — x264's own upstream default preset) / `veryslow` (Quality) | `target-usage`, VA spec order (Intel): `7` (Performance; `2` between #46 and #94, 2026-11-01; untested on Intel) / `4` (**Balanced, default**) / `1` (Quality). **Mesa AMD (radeonsi), since #92:** `2` / `3` (**Balanced, default**) / `4` — `target-usage` is a bitfield there, see "`target-usage` is a bitfield on Mesa AMD" |
 | Rate Control | No native enum — `Constant` (default)/`Adaptive` are both plain `bitrate=` (**`Adaptive` is a deliberate no-op relative to `Constant`** — x264enc's CBR is already frame-adaptive within its budget, so there's no meaningfully different x264enc setting to reach for); `Quality` switches to `pass=qual quantizer=21` (bitrate-target `bitrate=` is then ignored) | `rate-control=cbr`/`vbr`/`cqp` — a genuine three-way native enum, no asymmetry |
 
 `Why the `Adaptive`/`Software` no-op is documented rather than faked with some invented
