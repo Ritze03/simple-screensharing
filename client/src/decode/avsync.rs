@@ -86,6 +86,7 @@ pub struct LatencyFloor {
 }
 
 impl LatencyFloor {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new() -> Self {
         Self::default()
     }
