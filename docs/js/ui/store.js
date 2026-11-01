@@ -91,7 +91,6 @@ export const S = {
   popup: null,
   toasts: [],
   flash: null,
-  advOpen: false,
 };
 
 let renderFn = null;

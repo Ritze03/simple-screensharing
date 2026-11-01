@@ -16,6 +16,8 @@ export const KEYFRAME_COALESCE_MS = 100; // spec §9: ignore a KeyframeRequest w
  *    (CQP) mode was removed after it froze streams on motion; WebCodecs has no per-frame-QP path here anyway.
  *  - GOP               -> forced keyframe interval (WebCodecs has no GOP knob; we call encode({keyFrame}))
  *  - quality level (x264 speed-preset / VA target-usage): NATIVE-ONLY, no WebCodecs equivalent.
+ * `low_latency` is kept so a stored/native value stays valid, but here it is identical to `balanced`: the UI
+ * (ui/app.js) does not offer it and shows it as Balanced (user rule 2026-11-01, #93: hide what does nothing).
  */
 export const ENCODER_PRESETS = Object.freeze({
   low_latency: { latencyMode: "realtime", gopMs: DEFAULT_GOP_MS },
