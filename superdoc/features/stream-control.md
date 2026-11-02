@@ -829,8 +829,16 @@ pump sends the forced IDR plus two more at +300 ms and +1 s
 (`destination::keyframe_repeat_schedule`). The same two repeats follow a viewer-asked IDR (a
 relay-forwarded `KeyframeRequest`, a resume from pause): a viewer asking means it lost one.
 Rate cap: one such burst per `KEYFRAME_BURST_MIN_GAP` = 2 s per destination
-(`schedule_requested_repeats`); a request inside it is served by the burst under way. Not done:
-sending the *same* IDR's datagrams several times back to back. It would need the viewer's
+(`schedule_requested_repeats`); a request inside it is served by the burst under way. **Keyframe pacing:** a keyframe of 24+ datagrams is no longer sent back to back: the pump
+spreads it over min(60 ms, 4 frame periods) in chunks every 2 ms (`pace_plan`,
+`PreparedMedia::send`; delta frames and small keyframes still go out at once, the stall keepalive
+and a branch's proving IDR are unpaced). *Why:* #86's lab: quinn lets a ~256-packet burst out at
+once and a shallow bottleneck queue (50 ms at 8 Mbit/s) drops the tail of every IDR sent that way,
+and an IDR with a missing fragment is not decodable; spreading it over ~60 ms took that link from
+0 to 58 decodable fps (BBR). The cost is that the pump (which also serves `Stop`) is held for up to
+60 ms per keyframe, and the following frames queue behind it in the encoder's appsink (8 buffers).
+Only checked for "still decodes" in the rig (no lossy link); the loss benefit is #86's measurement.
+Not done: sending the *same* IDR's datagrams several times back to back. It would need the viewer's
 reassembler (`fragment.rs`) to drop duplicate fragments of an already completed `frame_id`
 (the repeats above are separate frames with fresh nonces, so they need nothing there); a repeated
 fragment must also not be re-encrypted (a nonce is never reused), only re-sent. On a lossy link the one forced IDR is often lost and

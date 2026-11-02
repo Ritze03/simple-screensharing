@@ -3948,13 +3948,18 @@ async fn destination_pump(
                             // decodable to apply it to) — so ask for an IDR now
                             // instead of waiting out the rest of the GOP.
                             let was_stalled = runtime.lock().unwrap().is_stalled();
-                            let result = send_encoded_sample(&client, stream_id, &sample, start, &runtime);
+                            let prepared = send_encoded_sample(&client, stream_id, &sample, start, &runtime);
                             if was_stalled
                                 && runtime.lock().unwrap().is_stalled()
                                 && let Some(pad) = branch.as_ref().and_then(|b| b.keyframe_pad())
                             {
                                 force_keyframe(&pad);
                             }
+                            let framerate = runtime.lock().unwrap().params().framerate;
+                            let result = match prepared {
+                                Ok(prepared) => prepared.send(framerate).await,
+                                Err(e) => Err(e),
+                            };
                             match result {
                                 Ok(()) => record_sent_frame(&mut sent_frame_times, &sent_fps),
                                 Err(e) => tracing::warn!("dropping encoded frame for stream {stream_id}: {e:#}"),
@@ -4363,6 +4368,88 @@ fn send_media_payload(
     keyframe: bool,
     stalled: bool,
 ) -> Result<()> {
+    prepare_media_payload(client, stream_id, payload, wire_pts_us, keyframe, stalled)?.send_now()
+}
+
+/// A frame already encrypted and cut into datagrams (nonce drawn, so the order
+/// of preparation is the order of `frame_id`s), not yet on the wire. Split from
+/// the send so a large frame can be paced ([`PreparedMedia::send`]) without
+/// holding a mapped GStreamer buffer across an `await`.
+struct PreparedMedia {
+    connection: quinn::Connection,
+    datagrams: Vec<Vec<u8>>,
+    keyframe: bool,
+}
+
+/// Datagram count from which a keyframe is paced (about 28 KB at 1.2 kB per
+/// datagram); smaller frames go out at once, pacing them gains nothing.
+const PACE_MIN_DATAGRAMS: usize = 24;
+/// Longest a keyframe's datagrams are spread over.
+const PACE_MAX_WINDOW: Duration = Duration::from_millis(60);
+/// Gap between two paced chunks.
+const PACE_STEP: Duration = Duration::from_millis(2);
+
+/// How to spread `count` datagrams of a frame: `Some((per_chunk, gap))`, or
+/// `None` to send them back to back.
+///
+/// `Why (#86's lab):` quinn lets a ~256-packet burst out at once; a shallow
+/// bottleneck queue (50 ms at 8 Mbit/s) drops the tail of an IDR sent that way
+/// every time, and an IDR missing a fragment is not decodable at all. Spreading
+/// it over ~60 ms took 8 Mbit/s on a 50 ms queue from 0 to 58 decodable fps
+/// (BBR). Only keyframes are paced: delta frames are small, and the pump is
+/// held for as long as the pacing takes, so the window is also capped at
+/// four frame periods (60 fps: 60 ms, 240 fps: 16 ms).
+fn pace_plan(count: usize, keyframe: bool, framerate: u32) -> Option<(usize, Duration)> {
+    if !keyframe || count < PACE_MIN_DATAGRAMS {
+        return None;
+    }
+    let frame_period = Duration::from_micros(1_000_000 / u64::from(framerate.clamp(MIN_FRAMERATE, MAX_FRAMERATE)));
+    let window = PACE_MAX_WINDOW.min(frame_period * 4);
+    let steps = (window.as_micros() / PACE_STEP.as_micros()).max(1) as usize;
+    if steps < 2 {
+        return None;
+    }
+    Some((count.div_ceil(steps), PACE_STEP))
+}
+
+impl PreparedMedia {
+    fn send_now(self) -> Result<()> {
+        for datagram in self.datagrams {
+            self.connection
+                .send_datagram(datagram.into())
+                .map_err(|e| anyhow!("failed to send media datagram: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Sends the frame, spreading a keyframe over up to [`PACE_MAX_WINDOW`]
+    /// ([`pace_plan`]).
+    async fn send(self, framerate: u32) -> Result<()> {
+        let Some((per_chunk, gap)) = pace_plan(self.datagrams.len(), self.keyframe, framerate) else {
+            return self.send_now();
+        };
+        for (i, chunk) in self.datagrams.chunks(per_chunk).enumerate() {
+            if i > 0 {
+                tokio::time::sleep(gap).await;
+            }
+            for datagram in chunk {
+                self.connection
+                    .send_datagram(datagram.clone().into())
+                    .map_err(|e| anyhow!("failed to send media datagram: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn prepare_media_payload(
+    client: &ScreenshareClient,
+    stream_id: u8,
+    payload: &[u8],
+    wire_pts_us: u64,
+    keyframe: bool,
+    stalled: bool,
+) -> Result<PreparedMedia> {
     let nonce_seq = client.nonce_sequence();
     let (nonce, counter) = nonce_seq
         .next_nonce(stream_id)
@@ -4401,13 +4488,7 @@ fn send_media_payload(
         fragment_frame_with_flags(client.conn_id(), stream_id, counter, flags, &ciphertext, max_datagram_size)
             .context("failed to fragment encrypted frame")?;
 
-    for datagram in datagrams {
-        connection
-            .send_datagram(datagram.into())
-            .map_err(|e| anyhow!("failed to send media datagram: {e}"))?;
-    }
-
-    Ok(())
+    Ok(PreparedMedia { connection, datagrams, keyframe })
 }
 
 /// Takes one encoded access unit off the appsink, maps it onto this
@@ -4420,7 +4501,7 @@ fn send_encoded_sample(
     sample: &gst::Sample,
     start: Instant,
     runtime: &destination::SharedDestination,
-) -> Result<()> {
+) -> Result<PreparedMedia> {
     let buffer = sample.buffer().ok_or_else(|| anyhow!("sample had no buffer"))?;
 
     // Presentation timestamp in microseconds, per protocol-spec §6.1's
@@ -4446,7 +4527,7 @@ fn send_encoded_sample(
         (runtime.wire_pts_from_buffer(buffer_pts_us), runtime.is_stalled())
     };
 
-    send_media_payload(client, stream_id, payload, wire_pts_us, keyframe, stalled)
+    prepare_media_payload(client, stream_id, payload, wire_pts_us, keyframe, stalled)
 }
 
 /// The stall protocol's send half: while a destination is
@@ -5460,6 +5541,25 @@ pub mod destination {
             assert!(!schedule_requested_repeats(&mut pending, &mut last, now + Duration::from_millis(1900)));
             assert_eq!(pending, before, "a request inside the cap is served by the burst under way");
             assert!(schedule_requested_repeats(&mut pending, &mut last, now + Duration::from_secs(2)));
+        }
+
+        #[test]
+        fn only_big_keyframes_are_paced_and_never_over_sixty_milliseconds() {
+            // Delta frames and small keyframes go out at once.
+            assert_eq!(pace_plan(300, false, 60), None);
+            assert_eq!(pace_plan(10, true, 60), None);
+            // A 240-datagram IDR at 60 fps: 30 chunks of 8 every 2 ms = 58 ms.
+            let (per_chunk, gap) = pace_plan(240, true, 60).unwrap();
+            assert_eq!((per_chunk, gap), (8, Duration::from_millis(2)));
+            // The window shrinks with the frame period (240 fps: 4 x 4.1 ms).
+            let (per_chunk, gap) = pace_plan(240, true, 240).unwrap();
+            let chunks = 240usize.div_ceil(per_chunk);
+            assert!(gap * (chunks as u32 - 1) <= Duration::from_millis(17), "{chunks} chunks");
+            // Every datagram is covered: chunking never drops one.
+            for count in [24, 25, 100, 301] {
+                let (per_chunk, _) = pace_plan(count, true, 30).unwrap();
+                assert!(per_chunk * count.div_ceil(per_chunk) >= count);
+            }
         }
 
         #[test]
