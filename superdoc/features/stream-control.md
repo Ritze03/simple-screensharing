@@ -701,6 +701,126 @@ restarted on resume-from-pause and after a swap so those gaps don't count.
 
 ---
 
+## Stop is instant; a lost capture source is restarted (2026-11-02, #97 #98 #99)
+
+Three user reports from real use over the internet: (1) after Stop the share "stays open" and
+a new one cannot be started for ~15 s, (2) screen shares "stall out of nowhere" and have to be
+restarted by hand, (3) the viewer hangs after fps/codec changes. Investigated in the rig; this
+is what changed on the sharer side (the viewer side is #101).
+
+### Stop (#98)
+
+**What the user saw:** `share_state()` (ui/mod.rs) said Live for any capture that still had a
+destination in the room, and `stop_share_one` only swapped the status to `Stopping`; the
+capture was reaped when `CaptureHandle::stop()` finished. So the whole teardown, and any hang
+in it, showed as LIVE / "Stop sharing" / no "Share screen" button.
+
+**Now**, in order of what the user and the viewers feel:
+
+1. `AppState::stop_share_one` releases the capture's destinations **at the click**
+   (`release_stopping_destinations`: `forget_destination_map` + clearing the map, and ending a
+   pending recovery). The `LocalCapture` stays in `Stopping` only to own the stop's result.
+   `share_state` also never reports a `Stopping` capture as a staged share. "Share screen" is
+   back at once and a new share started now is independent of the old teardown.
+2. The destination pump's `Stop` arm calls `client.stop_stream()` **before** removing the
+   branch (viewers drop the tile in milliseconds, not after the 1-10 s the EOS drain and a
+   hardware encoder's `Null` take).
+3. `CaptureHandle::stop`: destinations stop **concurrently** under one 3 s deadline
+   (`DESTINATIONS_STOP_DEADLINE`), `DestinationHandle::stop` waits 4 s instead of 7 s + 7 s, the
+   branch removal uses `RemoveBounds::FAST` (EOS drain 1 s, teardown 3 s; swaps keep 5 s / 10 s),
+   the pipeline EOS wait is 1 s (it was 5 s), the pipeline's `Null` runs on a blocking thread
+   (3 s bound) concurrently with the preview-task join and the portal session close (3 s each).
+   `Drop` skips `set_state(Null)` after a `stop()` so a stuck teardown cannot block an async worker.
+4. The live and room-preview appsinks are `wait-on-eos=false`: an unpulled sample (the UI stops
+   pulling when the capture leaves Active) used to hold the pipeline EOS back for the full 5 s.
+5. The `ApplyParams` branch swap runs as its own task (`PendingSwap`) joined from the pump's
+   `select!`, so `Stop` is served immediately during a settings change. Other commands that
+   arrive mid-swap are deferred, not dropped; the swap's branches are cleaned up by a background
+   task after a Stop.
+6. Info-level timings: `capture stopped in N ms: destinations, EOS, pipeline Null, preview,
+   portal close`, `encode branch removed: drain N ms, teardown N ms`, `stream N stopped: relay
+   notified in N ms, branch removed N ms later`. A real slow stop now says which step hung.
+
+`Why the bounds are what they are:` the old worst case was 7 s reply + 7 s join per destination,
+in sequence, plus 5 s EOS, plus unbounded `Null`/preview/portal (a hung `vaDestroyContext`
+reproduced 10 s branch teardown + 5 s EOS ≈ 15 s). The new worst case is ~3 s destinations +
+1 s EOS + 3 s steps, and none of it is visible to the user or the viewers any more.
+
+### A lost capture source is restarted (#99)
+
+**The reproduced "stall out of nowhere":** kill xdpw mid-share, or `swaymsg output HEADLESS-1
+mode 1280x720` / `transform 90` while sharing. `pipewiresrc` reports `stream error: target not
+found`; the old `capture_loop` logged the first bus error, stopped reading, and the destination
+sat `Stalled` forever re-sending its cached IDR. Real-world triggers: portal restart, monitor
+hotplug or mode change on Hyprland.
+
+**Detection.** `capture_loop` now reads the bus until it ends. A bus error whose element is not
+inside an encode branch (`/branch_N` bin, see `is_source_side_error`) or whose text is
+`SOURCE_GONE_TEXT` marks the source lost (`CaptureErrors::lost`, read through
+`CaptureHandle::source_lost()`). `Why branch errors don't:` one encoder failing is that
+destination's problem (below), not a reason to restart the screen grab. The silence watchdog
+adds a second path: a `Stalled` destination's pump compares frames *offered to the branch* with
+frames *encoded* (`destination::stall_verdict`): offered > 0 and no output for 6 s is an
+**encoder wedge**, offered == 0 for 8 s is a **dead source** (`mark_lost`). The bus path is
+normally faster (immediate).
+
+**Encoder wedge (per destination, in the pump).** Rebuild the branch with identical params via
+`swap_to_new_branch_with(.., SwapMode::Recovery)`: the destination stays `Stalled` (keepalive
+keeps the viewer's stream alive; `begin_rebuild` still refuses from `Stalled`), the old, stuck
+branch is removed in the background, the new one may fall back VA -> x264 (`add_branch_live`).
+Rebuilds at +0, +5 s, +15 s after the stall passes 6 s (`wedge_rebuild_backoff`); after
+`MAX_WEDGE_REBUILDS` = 3 and 10 s more, the destination is `Failed` (one-click Retry). Verified
+with an `LD_PRELOAD` fault on `vaEndPicture`.
+
+**Dead source (per capture, in the session): Option 1.** `AppState::poll_capture_recovery`
+(once per frame) sees `source_lost()` and starts a `CaptureRecovery` (`AppState::recoveries`):
+`begin_stall` (every destination `Stalled`, cached IDR keepalive; the old pipeline stays in
+place so viewers keep their frozen tile), then restart attempts on the schedule
+`CAPTURE_RESTART_DELAYS` = +0, +2, +5, +10, +30 s. An attempt is `capture::start_capture_restoring`
+(the portal restore token of the dead capture, `PersistMode::ExplicitlyRevoked`: portals that
+persist - xdph, GNOME, KDE - re-grant silently; stock xdpw ignores it, a picker may appear).
+When the new capture is up (`finish_recovery`): the old capture is stopped **in a spawned task**
+(it may hang; nothing waits for it), `ShareStatus::Active` points at the new handle (same
+`CaptureSourceId`), and every destination is re-added with its own params (rescaled to the new
+source by `rescale_for_new_source`: same share of the source, so a rotated or resized monitor
+keeps its aspect) as a *new* stream. The viewers see `StopStream` for the old stream id and a new
+announce with the same owner/kind/label, which their wanted-stream logic re-watches (30 s
+window, `RESUME_AFTER_STOP`). Destinations requested while recovering (a reconnected room,
+"Go live") are parked in `CaptureRecovery::deferred`.
+After the last attempt: every destination `Failed("capture lost: ...")`, its stream is stopped,
+the user gets a share error, and **Retry** (`retry_destination`) starts a fresh recovery
+(`recovery_gave_up` stops the per-frame loop from restarting it by itself). A **dismissed
+picker ends the recovery at once** (`SHARE_START_CANCELLED`): a picker is never looped blindly.
+A capture that dies again < 30 s after a recovery continues the backoff (`RECOVERY_RESET_AFTER`).
+
+`Why Option 1 and not an in-place source restart (Option 2):` the pipeline, the tee and each
+destination's `StreamId` would survive and viewers would not even re-watch, but swapping the
+source element of a live tee without renegotiation hangs is the hard part (the measured
+"rewriting a pre-tee capsfilter stalls the capture dead", see "Tier 3 turned out to need no
+pipeline surgery"). Option 1 is exactly what the user does by hand, with the proven start path.
+Option 2 is a later improvement.
+
+**UI (sharer).** The pill reads *Recovering* (`PillKind::Progress`, `ui.pill.recovering`) and
+the action bar title *Screen capture lost - Restarting the screen capture*; the tooltip has the
+attempt number, the countdown to the next attempt and the last error. The room tile chip reads
+RECOVERING. `ui/APP-SHELL.md`.
+
+### Sender keyframe redundancy (#97)
+
+After a branch swap (settings change or recovery rebuild) and when a destination starts, the
+pump sends the forced IDR plus two more at +300 ms and +1 s
+(`destination::keyframe_repeat_schedule`). On a lossy link the one forced IDR is often lost and
+the viewer waited for the next GOP boundary (2 s) with a frozen picture.
+
+### Audio watch teardown no longer holds the video lock (#97, latent)
+
+`RoomSession::teardown_audio_watch` dropped the `AudioWatch` (it joins the audio thread) while
+the `audio_watches` mutex was held; the video ingestion task locks the same mutex per frame, so
+a slow audio sink teardown stalled video. The watch is now taken out under the lock and dropped
+after it.
+
+---
+
 ## Capture source errors lead the share error (2026-10-15, #76)
 
 **Symptom (user, AppImage on Hyprland):** `Share error: failed to bring up the encode branch
@@ -1607,7 +1727,8 @@ destination's last-configured bitrate/tune/quality (a new destination copies par
 from a *sibling* on the capture, and the common case has none, so it silently reset to defaults).
 Worse, `stop_destination` tears down the *whole capture* once its destination count hits one, so
 `start_destination` bailed silently and retry failed outright for the single-destination case.
-`retry_destination` reads the failed destination's params first, removes just that branch without
+When the *capture* is what died (the recovery schedule ran out, see "A lost capture source is
+restarted"), Retry starts a fresh recovery of the capture instead. `retry_destination` reads the failed destination's params first, removes just that branch without
 touching `ShareStatus`, and re-adds a replacement in the same room with the same params.
 Coverage: `end_to_end_test::retry_destination_preserves_prior_encoder_tuning` (real relay + real
 capture).

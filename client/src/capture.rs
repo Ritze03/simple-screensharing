@@ -1070,6 +1070,15 @@ impl CaptureSource {
     /// the only place in the pipeline that can plug the *upstream* half of
     /// the "static screen ⇒ frames stop entirely" bug (see
     /// [`build_pipeline`]'s doc comment for the downstream half).
+    fn restore_token(&self) -> Option<String> {
+        match self {
+            #[cfg(unix)]
+            CaptureSource::Portal(portal) => portal.restore_token.clone(),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
     fn launch_fragment(&self, framerate: u32) -> String {
         match self {
             #[cfg(unix)]
@@ -1172,11 +1181,24 @@ impl CaptureSource {
 /// whatever the app's own UI already asked for.
 #[cfg(unix)]
 async fn acquire_capture_source() -> Result<CaptureSource> {
-    Ok(CaptureSource::Portal(open_portal_capture().await?))
+    acquire_capture_source_restoring(None).await
+}
+
+/// [`acquire_capture_source`], asking the portal to restore a previous
+/// selection (`restore_token`, from [`CaptureHandle::restore_token`]) so a
+/// restart after a lost source needs no picker where the portal supports it.
+#[cfg(unix)]
+async fn acquire_capture_source_restoring(restore_token: Option<String>) -> Result<CaptureSource> {
+    Ok(CaptureSource::Portal(open_portal_capture_restoring(restore_token.as_deref()).await?))
 }
 
 #[cfg(windows)]
 async fn acquire_capture_source() -> Result<CaptureSource> {
+    Ok(CaptureSource::Windows)
+}
+
+#[cfg(windows)]
+async fn acquire_capture_source_restoring(_restore_token: Option<String>) -> Result<CaptureSource> {
     Ok(CaptureSource::Windows)
 }
 
@@ -1196,6 +1218,9 @@ struct PortalCapture {
     /// `examples/screen_cast_gstreamer.rs`.
     _pipewire_fd: OwnedFd,
     session: Session<Screencast>,
+    /// Token the portal issued for this selection, if it persists them (see
+    /// [`CaptureHandle::restore_token`]).
+    restore_token: Option<String>,
 }
 
 /// The user dismissed the OS screen picker. Carried as the root cause of the
@@ -1272,8 +1297,23 @@ fn is_invalid_session_denial(e: &ashpd::zbus::Error) -> bool {
 ///
 /// Returns a clear `Err` (never panics) if the portal is unavailable or the
 /// user denies/cancels the permission dialog.
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 async fn open_portal_capture() -> Result<PortalCapture> {
+    open_portal_capture_restoring(None).await
+}
+
+/// [`open_portal_capture`] with an optional token to restore.
+///
+/// `Why `PersistMode::ExplicitlyRevoked` and the token (#99):` when the
+/// capture source dies (portal restarted, monitor hotplug, mode change) the
+/// session restarts the capture by itself, and an unattended restart must not
+/// pop a picker if the portal can avoid it. A portal that persists (xdph, GNOME,
+/// KDE) re-grants the selection from the token; one that does not (stock
+/// xdpw) ignores both and behaves as before, so the worst case is a picker,
+/// which the session handles by never retrying past a dismissal. A first,
+/// user-initiated share passes no token and always gets the picker.
+#[cfg(unix)]
+async fn open_portal_capture_restoring(restore_token: Option<&str>) -> Result<PortalCapture> {
     let proxy = Screencast::new()
         .await
         .context("could not reach the xdg-desktop-portal ScreenCast interface (is a portal backend, e.g. xdg-desktop-portal-gnome/-kde/-wlr, running?)")?;
@@ -1290,7 +1330,8 @@ async fn open_portal_capture() -> Result<PortalCapture> {
                 .set_cursor_mode(CursorMode::Embedded)
                 .set_sources(ashpd::enumflags2::BitFlags::from(SourceType::Monitor))
                 .set_multiple(false)
-                .set_persist_mode(PersistMode::DoNot),
+                .set_persist_mode(PersistMode::ExplicitlyRevoked)
+                .set_restore_token(restore_token),
         )
         .await
         .context("portal rejected screencast source selection")?;
@@ -1324,6 +1365,7 @@ async fn open_portal_capture() -> Result<PortalCapture> {
         .cloned()
         .ok_or_else(|| anyhow!("portal returned no capturable monitor (permission denied or nothing selected)"))?;
 
+    let issued_token = response.restore_token().map(str::to_owned);
     let node_id = stream.pipe_wire_node_id();
     let position = stream.position();
     tracing::info!("portal granted node {node_id} (position {position:?}, size {:?})", stream.size());
@@ -1338,6 +1380,7 @@ async fn open_portal_capture() -> Result<PortalCapture> {
         position,
         _pipewire_fd: pipewire_fd,
         session,
+        restore_token: issued_token,
     })
 }
 
@@ -1397,7 +1440,7 @@ fn live_branch(scale: &str) -> String {
             ! queue leaky=downstream max-size-buffers=1 max-size-bytes=0 max-size-time=0 \
             ! {scale} \
             ! capsfilter name={LIVE_CAPS_NAME} caps=video/x-raw,format={LIVE_FORMAT} \
-            ! appsink name={LIVE_SINK_NAME} async=false emit-signals=false sync=false max-buffers=1 drop=true"
+            ! appsink name={LIVE_SINK_NAME} async=false emit-signals=false sync=false max-buffers=1 drop=true wait-on-eos=false"
     )
 }
 
@@ -1804,7 +1847,7 @@ fn build_pipeline_with_orientation(source_fragment: &str, orientation: &str) -> 
             ! video/x-raw,framerate={PREVIEW_BRANCH_FRAMERATE}/1 \
             ! videoconvert \
             ! video/x-raw,format=RGB \
-            ! appsink name=preview_sink emit-signals=false sync=false max-buffers=1 drop=true \
+            ! appsink name=preview_sink emit-signals=false sync=false max-buffers=1 drop=true wait-on-eos=false \
          {live}",
         live = live_branch("videoscale ! videoconvert"),
     );
@@ -1827,7 +1870,7 @@ fn gpu_pipeline_description(source_fragment: &str) -> String {
             ! video/x-raw,format={SOURCE_RAW_FORMAT},framerate={PREVIEW_BRANCH_FRAMERATE}/1 \
             ! videoconvert \
             ! video/x-raw,format=RGB \
-            ! appsink name=preview_sink emit-signals=false sync=false max-buffers=1 drop=true \
+            ! appsink name=preview_sink emit-signals=false sync=false max-buffers=1 drop=true wait-on-eos=false \
          {live}",
         live = live_branch("vapostproc"),
     )
@@ -2289,15 +2332,31 @@ impl DestinationHandle {
         // The pump returns right after replying; joining it is what
         // guarantees no task is still holding a branch when the pipeline goes
         // `Null` underneath it.
-        let _ = tokio::time::timeout(DESTINATION_STOP_TIMEOUT, self.task).await;
+        // It exits right after replying, so this is near-instant; the bound
+        // only keeps a wedged task from holding the stop up (#98).
+        let _ = tokio::time::timeout(DESTINATION_JOIN_TIMEOUT, self.task).await;
         result
     }
 }
 
 /// How long [`DestinationHandle::stop`] waits for a destination's pump to
-/// drain its branch. Comfortably above [`branch::remove_branch`]'s own 5s
-/// internal drain bound, so this only ever fires if that one already gave up.
-const DESTINATION_STOP_TIMEOUT: Duration = Duration::from_secs(7);
+/// finish stopping: the relay notification (at most [`STOP_NOTIFY_TIMEOUT`])
+/// plus a fast branch removal ([`branch::RemoveBounds::FAST`]). It was 7 s
+/// plus a 7 s join, which with the branch's own 15 s of worst-case bounds is
+/// how a stuck hardware teardown turned into a ~15 s stop (#98).
+const DESTINATION_STOP_TIMEOUT: Duration = Duration::from_secs(4);
+/// Join of an already-replied pump task.
+const DESTINATION_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
+/// Overall budget [`CaptureHandle::stop`] gives all its destinations together
+/// (they stop concurrently). A destination still stopping after it is left to
+/// finish on its own task; its room was already told.
+const DESTINATIONS_STOP_DEADLINE: Duration = Duration::from_secs(3);
+/// How long [`CaptureHandle::stop`] waits for the pipeline's EOS to reach the
+/// bus watcher. A healthy pipeline takes milliseconds.
+const CAPTURE_EOS_TIMEOUT: Duration = Duration::from_secs(1);
+/// Bound on each blocking or external step at the end of a stop: the
+/// pipeline's `Null`, the preview task's join and the portal session close.
+const CAPTURE_STOP_STEP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// A running screen-share capture started by [`start_sharing`]: one real
 /// screen grab, one GStreamer pipeline, and N [`DestinationHandle`]s hanging
@@ -2361,6 +2420,14 @@ pub struct CaptureHandle {
     live: LivePreview,
     /// See [`CaptureHandle::awaiting_first_frame`].
     frame_seen: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by [`CaptureHandle::stop`] once the pipeline was taken to `Null`
+    /// (see `Drop`).
+    stopped: bool,
+    /// The portal's restore token for this capture's source, when the portal
+    /// issued one (it did not on stock `xdg-desktop-portal-wlr`). Handed to the
+    /// replacement capture of a restart so a portal that persists permission
+    /// re-grants the same source without a picker (#99).
+    restore_token: Option<String>,
 }
 
 impl Drop for CaptureHandle {
@@ -2384,7 +2451,12 @@ impl Drop for CaptureHandle {
     /// again is a harmless no-op (same established pattern as
     /// `AudioCaptureHandle`'s `Drop`).
     fn drop(&mut self) {
-        let _ = self.pipeline.set_state(gst::State::Null);
+        // Not after `stop()`: its `Null` may still be running on a blocking
+        // thread (a stuck driver teardown), and a second `set_state` here
+        // would block whichever async worker drops the handle.
+        if !self.stopped {
+            let _ = self.pipeline.set_state(gst::State::Null);
+        }
     }
 }
 
@@ -2447,8 +2519,15 @@ pub async fn start_sharing(
 /// is the same primitive, just used for the first branch instead of the
 /// second.
 pub async fn start_capture(framerate: u32) -> Result<CaptureHandle> {
+    start_capture_restoring(framerate, None).await
+}
+
+/// [`start_capture`] for the **restart** of a capture whose source died
+/// (#99): passes the dead capture's [`CaptureHandle::restore_token`] to the
+/// portal so a persisting portal re-grants the same monitor without a picker.
+pub async fn start_capture_restoring(framerate: u32, restore_token: Option<String>) -> Result<CaptureHandle> {
     ensure_gstreamer_initialized()?;
-    let capture_source = acquire_capture_source().await?;
+    let capture_source = acquire_capture_source_restoring(restore_token.clone()).await?;
     match start_capture_with_source(framerate, capture_source).await {
         // `Why one retry on a new portal session (task #59):` stock
         // xdg-desktop-portal-wlr exits when the `pipewiresrc` start flap lands
@@ -2464,7 +2543,7 @@ pub async fn start_capture(framerate: u32) -> Result<CaptureHandle> {
             // Lets a restarting backend (systemd `Restart=`, a compositor
             // autostart script) take its bus name again first.
             tokio::time::sleep(Duration::from_millis(500)).await;
-            let capture_source = acquire_capture_source().await.map_err(|retry| {
+            let capture_source = acquire_capture_source_restoring(restore_token).await.map_err(|retry| {
                 if is_picker_cancelled(&retry) {
                     retry
                 } else {
@@ -2608,6 +2687,7 @@ async fn start_capture_with_source(framerate: u32, capture_source: CaptureSource
     let framerate = framerate.clamp(MIN_FRAMERATE, MAX_FRAMERATE);
 
     let source_fragment = capture_source.launch_fragment(framerate);
+    let restore_token = capture_source.restore_token();
     // `Why spawn_blocking (inside `start_pipeline_bounded`):` the start synchronously blocks on
     // `Element::state()`, whose timeout argument is not reliable under real
     // contention (a capture started immediately after the previous one's
@@ -2678,6 +2758,8 @@ async fn start_capture_with_source(framerate: u32, capture_source: CaptureSource
         live,
         source_state: Mutex::new(source),
         destinations: Vec::new(),
+        stopped: false,
+        restore_token,
     })
 }
 
@@ -2805,6 +2887,7 @@ async fn spawn_destination(
         runtime.clone(),
         encoder_fps.clone(),
         sent_fps.clone(),
+        capture_errors.clone(),
         cmd_rx,
     ));
 
@@ -3023,87 +3106,129 @@ impl CaptureHandle {
     /// has no session to close, see [`CaptureSource`]), and waits for the
     /// background tasks to finish draining.
     pub async fn stop(mut self) -> Result<()> {
-        // Destinations first: each one drains and removes its own branch off
-        // the still-live tee and sends its room a `StopStream`. Doing this
+        let began = Instant::now();
+        self.capture_errors.stopping.store(true, Ordering::Relaxed);
+        // Destinations first: each one tells its room the stream is gone, then
+        // drains and removes its own branch off the still-live tee. Doing this
         // before the pipeline's EOS keeps every removal on the well-tested
         // live-pipeline path (`branch::remove_branch`) rather than racing a
         // pipeline that is already tearing down.
-        for destination in std::mem::take(&mut self.destinations) {
+        //
+        // `Why concurrently, under one deadline (#98):` they used to stop one
+        // after the other with up to 14 s each, so a hung hardware teardown in
+        // one branch delayed every other stream's `StopStream` and the whole
+        // stop. Each pump notifies its room first thing, so after this
+        // returns (or times out) every room has been told.
+        let destinations = std::mem::take(&mut self.destinations);
+        let count = destinations.len();
+        let stops = futures_util::future::join_all(destinations.into_iter().map(|destination| async move {
             let stream_id = destination.stream_id;
             if let Err(e) = destination.stop().await {
                 tracing::warn!("stopping destination (stream {stream_id}) did not finish cleanly: {e:#}");
             }
+        }));
+        if tokio::time::timeout(DESTINATIONS_STOP_DEADLINE, stops).await.is_err() {
+            tracing::warn!("{count} destination(s) were still stopping after {DESTINATIONS_STOP_DEADLINE:?}; going on without them");
         }
+        let destinations_took = began.elapsed();
 
         // Ask the pipeline to end gracefully by sending it a real EOS event
-        // *before* forcing it to `Null`, and wait for the capture task to
-        // notice.
+        // *before* forcing it to `Null`, and wait for the bus watcher to see
+        // it.
         //
         // This isn't just tidiness: `gstreamer_app::AppSinkStream` (what
-        // [`capture_loop`] awaits) only ever yields its terminal `None` once
+        // the destinations read) only ever yields its terminal `None` once
         // the appsink's `is_eos()` flag is actually set, which only happens
         // once a real EOS event has flowed all the way through the pipeline
-        // into it (see that type's `poll_next`). Jumping straight to
-        // `set_state(Null)` never sends that event — it just tears the
-        // elements down — so the appsink's stream would sit `Pending` forever
-        // and the capture task would never complete, hanging this whole
-        // function indefinitely. `Pipeline::send_event` on a
-        // downstream/serialized event like EOS delegates to the bin's source
-        // element(s), so it originates upstream of the `tee` exactly like a
-        // natural end-of-stream would.
+        // into it. Jumping straight to `set_state(Null)` never sends that
+        // event. `Pipeline::send_event` on a downstream/serialized event
+        // like EOS delegates to the bin's source element(s), so it
+        // originates upstream of the `tee` exactly like a natural
+        // end-of-stream would.
         //
-        // The `timeout` is a backstop, not the expected path: a healthy
-        // pipeline should drain and reach EOS in well under a second, but
-        // this guarantees `stop()` itself can never hang the caller forever
-        // if a source somehow never honors EOS (e.g. an unresponsive
-        // hardware capture device).
+        // The wait is a backstop, not the expected path: a healthy
+        // pipeline reaches EOS in well under a second. Since #98 the live and
+        // preview appsinks are `wait-on-eos=false`, so an unpulled sample no
+        // longer holds the EOS back (that used to burn the whole 5 s here
+        // whenever the UI had stopped pulling the live preview).
+        let eos_began = Instant::now();
         if !self.pipeline.send_event(gst::event::Eos::new()) {
             tracing::warn!("capture pipeline did not accept the EOS event; forcing a hard stop");
         }
-
-        // `&mut` rather than moving `self.capture_task` out: `CaptureHandle`
-        // implements `Drop` (see above), which forbids moving individual
-        // fields out of `self` by value — `JoinHandle` is `Unpin`, so
-        // awaiting through `&mut` works identically.
-        match tokio::time::timeout(Duration::from_secs(5), &mut self.capture_task).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!("capture task did not shut down cleanly: {e}"),
-            Err(_) => tracing::warn!("capture task did not observe EOS within 5s; forcing pipeline to Null anyway"),
+        if tokio::time::timeout(CAPTURE_EOS_TIMEOUT, self.capture_errors.eos.notified()).await.is_err() {
+            tracing::warn!("capture pipeline did not reach EOS within {CAPTURE_EOS_TIMEOUT:?}; forcing it to Null anyway");
         }
+        let eos_took = eos_began.elapsed();
 
-        if let Err(e) = self.pipeline.set_state(gst::State::Null) {
-            tracing::warn!("error stopping capture pipeline: {e}");
-        }
-
-        // `.take()` rather than moving `self.preview_handle` out directly,
-        // for the same reason as `capture_task` above: `PreviewHandle::stop`
-        // consumes `self` by value, so it can't be called through a
-        // reference.
-        if let Some(preview_handle) = self.preview_handle.take() {
-            preview_handle.stop().await;
-        }
-
-        #[cfg(unix)]
-        {
-            // Borrow rather than move `self.capture_source` — also required
-            // now that `CaptureHandle: Drop`, though `Session::close` takes
-            // `&self` anyway, so a borrow is all this needs regardless.
+        // `Why these three run together and are each bounded (#98):` the
+        // pipeline's `Null` is a blocking native call that a hung driver can
+        // hold for 10+ s (reproduced with a delayed `vaDestroyContext`); it
+        // used to run directly on the async worker, and the preview join and
+        // portal close, both unbounded, waited behind it. Now the `Null`
+        // runs on a blocking thread and the three proceed independently, so
+        // the recording indicator goes off and the stop reports done
+        // within `CAPTURE_STOP_STEP_TIMEOUT` whatever the driver does.
+        let pipeline = self.pipeline.clone();
+        let preview_handle = self.preview_handle.take();
+        let null_step = async {
+            let began = Instant::now();
+            let blocking = tokio::task::spawn_blocking(move || pipeline.set_state(gst::State::Null));
+            match tokio::time::timeout(CAPTURE_STOP_STEP_TIMEOUT, blocking).await {
+                Ok(Ok(Ok(_))) => {}
+                Ok(Ok(Err(e))) => tracing::warn!("error stopping capture pipeline: {e}"),
+                Ok(Err(e)) => tracing::warn!("stopping the capture pipeline panicked: {e}"),
+                Err(_) => tracing::error!(
+                    "capture pipeline did not reach Null within {CAPTURE_STOP_STEP_TIMEOUT:?} (a driver teardown appears stuck); \
+                     leaving it to finish on its own thread"
+                ),
+            }
+            began.elapsed()
+        };
+        let preview_step = async {
+            let began = Instant::now();
+            if let Some(preview_handle) = preview_handle
+                && tokio::time::timeout(CAPTURE_STOP_STEP_TIMEOUT, preview_handle.stop()).await.is_err()
+            {
+                tracing::warn!("stopping the preview task took longer than {CAPTURE_STOP_STEP_TIMEOUT:?}");
+            }
+            began.elapsed()
+        };
+        let source = &self.capture_source;
+        let portal_step = async {
+            let began = Instant::now();
             // `CaptureSource` has exactly one variant on this platform in a
-            // non-test build (see its `#[cfg(unix)]`/`#[cfg(windows)]`
-            // split); a `match` is what lets the `#[cfg(test)]`-only
-            // `TestSource` variant coexist here without an exhaustiveness
-            // error in test builds.
-            match &self.capture_source {
-                CaptureSource::Portal(portal) => {
-                    if let Err(e) = portal.session.close().await {
-                        tracing::warn!("error closing screencast portal session: {e}");
-                    }
-                }
+            // non-test build; a `match` is what lets the test-only
+            // `TestSource` variant coexist without an exhaustiveness error.
+            #[cfg(unix)]
+            match source {
+                CaptureSource::Portal(portal) => match tokio::time::timeout(CAPTURE_STOP_STEP_TIMEOUT, portal.session.close()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!("error closing screencast portal session: {e}"),
+                    Err(_) => tracing::warn!("closing the screencast portal session took longer than {CAPTURE_STOP_STEP_TIMEOUT:?}"),
+                },
                 #[cfg(any(test, feature = "test-source"))]
                 CaptureSource::TestSource(_) => {}
             }
-        }
+            #[cfg(not(unix))]
+            let _ = source;
+            began.elapsed()
+        };
+        let (null_took, preview_took, portal_took) = tokio::join!(null_step, preview_step, portal_step);
 
+        // The pipeline is `Null` (or its stuck teardown is running on a
+        // thread of its own): `Drop` must not call `set_state` again on the
+        // async worker.
+        self.stopped = true;
+        self.capture_task.abort();
+        tracing::info!(
+            "capture stopped in {} ms: destinations {} ms, EOS {} ms, pipeline Null {} ms, preview {} ms, portal close {} ms",
+            began.elapsed().as_millis(),
+            destinations_took.as_millis(),
+            eos_took.as_millis(),
+            null_took.as_millis(),
+            preview_took.as_millis(),
+            portal_took.as_millis(),
+        );
         Ok(())
     }
 
@@ -3348,6 +3473,28 @@ impl CaptureHandle {
     /// showing an unexplained spinner.
     pub fn awaiting_first_frame(&self) -> bool {
         !self.frame_seen.load(Ordering::Acquire)
+    }
+
+    /// `Some(reason)` once the capture source is known dead (#99): the
+    /// pipeline's source side reported a bus error (`pipewiresrc: stream
+    /// error: target not found` after a portal restart, a monitor mode change
+    /// or hotplug), or a destination's pump saw no frame reach its branch for
+    /// seconds. Nothing in this capture recovers from that: the session starts
+    /// a replacement ([`start_capture_restoring`]) and moves the destinations
+    /// over. Never reset.
+    pub fn source_lost(&self) -> Option<String> {
+        self.capture_errors.lost()
+    }
+
+    /// The portal's restore token for this capture's source, if it issued one.
+    pub fn restore_token(&self) -> Option<String> {
+        self.restore_token.clone()
+    }
+
+    /// TEST-ONLY: pretend the source died, as a bus error would.
+    #[cfg(any(test, feature = "test-source"))]
+    pub fn inject_source_lost(&self, reason: &str) {
+        self.capture_errors.mark_lost(reason.to_string());
     }
 
     /// Opens or closes the sharer's own live preview branch (task #78).
@@ -3603,17 +3750,60 @@ enum DestCmd {
 /// reason went to the log alone. [`capture_loop`] is the one consumer of the
 /// bus, so it records the error here and the destination reads it back.
 #[derive(Clone, Default)]
-struct CaptureErrors(Arc<Mutex<Option<String>>>);
+struct CaptureErrors {
+    first: Arc<Mutex<Option<String>>>,
+    /// Set once the capture *source* is known dead (#99): a bus error from the
+    /// source side of the pipeline (not from a destination's encode branch),
+    /// or a silence the destination pumps diagnosed as "nothing arrives from
+    /// the source". The session polls it ([`CaptureHandle::source_lost`]) and
+    /// restarts the capture. Never cleared: a lost capture is replaced, not
+    /// revived.
+    lost: Arc<Mutex<Option<String>>>,
+    /// Set by [`CaptureHandle::stop`] before it sends the pipeline its own
+    /// EOS, so the bus watcher does not mistake the requested end for a loss.
+    stopping: Arc<std::sync::atomic::AtomicBool>,
+    /// Notified when the pipeline's EOS reached the bus after a requested stop.
+    eos: Arc<tokio::sync::Notify>,
+}
 
 impl CaptureErrors {
     /// Keeps the first error only: later ones are usually its consequences.
     fn record(&self, text: String) {
-        self.0.lock().unwrap().get_or_insert(text);
+        self.first.lock().unwrap().get_or_insert(text);
     }
 
     fn first(&self) -> Option<String> {
-        self.0.lock().unwrap().clone()
+        self.first.lock().unwrap().clone()
     }
+
+    /// Declares the source dead (first reason wins).
+    fn mark_lost(&self, reason: String) {
+        self.lost.lock().unwrap().get_or_insert(reason);
+    }
+
+    fn lost(&self) -> Option<String> {
+        self.lost.lock().unwrap().clone()
+    }
+
+    fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::Relaxed)
+    }
+}
+
+/// Whether a bus error came from the **source side** of the capture pipeline
+/// (the portal `pipewiresrc`, the shared pre-tee stages, the sharer's own
+/// preview taps) rather than from one destination's encode branch (a bin
+/// named `branch_N`, so its path has `:branch_N`, see [`branch::add_branch`]).
+///
+/// `Why this split (#99):` a source error (`pipewiresrc: stream error: target
+/// not found` after a portal restart, a monitor mode change, a hotplug) ends
+/// the whole capture for every destination, and only a new capture can fix
+/// it. A branch error is one encoder's problem; the destination's silence
+/// watchdog and a branch rebuild deal with that, and must not tear down the
+/// capture. The text of [`SOURCE_GONE_TEXT`] counts as the source whatever
+/// element reported it.
+fn is_source_side_error(src_path: &str, text: &str) -> bool {
+    text.contains(SOURCE_GONE_TEXT) || !src_path.contains(":branch_")
 }
 
 /// `error` (a destination that failed to come up), led by the capture
@@ -3633,13 +3823,12 @@ fn blame_the_source(error: anyhow::Error, errors: &CaptureErrors) -> anyhow::Err
 /// once per capture and every send/encode concern lives in
 /// [`destination_pump`] instead.
 async fn capture_loop(mut bus_stream: gst::bus::BusStream, errors: CaptureErrors) {
-    let mut bus_done = false;
-
-    while !bus_done {
-        match bus_stream.next().await {
-            Some(msg) => handle_bus_message(&msg, &mut bus_done, &errors),
-            None => bus_done = true,
-        }
+    // `Why it keeps reading after the first error (#99):` it used to stop at
+    // the first `Error`, so later errors were not even logged and nothing
+    // else ever watched the bus. It now runs until the bus ends (the pipeline
+    // goes `Null` and the stream with it, or the handle is dropped).
+    while let Some(msg) = bus_stream.next().await {
+        handle_bus_message(&msg, &errors);
     }
 }
 
@@ -3665,6 +3854,7 @@ async fn destination_pump(
     runtime: destination::SharedDestination,
     encoder_fps: Arc<AtomicU32>,
     sent_fps: Arc<AtomicU32>,
+    capture_errors: CaptureErrors,
     mut cmd_rx: mpsc::UnboundedReceiver<DestCmd>,
 ) {
     let start = Instant::now();
@@ -3694,8 +3884,8 @@ async fn destination_pump(
     let mut paused = false;
     // `Option` purely so a swap can take the branch by value (that ownership
     // transfer *is* the appsink-reader handoff — see `branch::EncodeBranch`'s
-    // doc comment) and put its replacement back. Never `None` across a
-    // `select!` poll except inside the swap arm itself.
+    // doc comment) and put its replacement back. `None` exactly while a swap
+    // is in flight (`swapping`).
     let mut branch = Some(branch);
     // Set once this branch's appsink has yielded its terminal `None`, so the
     // sample arm stops being scheduled instead of spinning on a stream that
@@ -3703,219 +3893,423 @@ async fn destination_pump(
     let mut branch_ended = false;
     // Distinct `BranchId`s per swap, purely for greppable element names.
     let mut next_branch_id: u32 = 1;
+    // The branch swap in flight, if any (see [`PendingSwap`]).
+    let mut swapping: Option<PendingSwap> = None;
+    // Commands that arrived mid-swap, replayed in order once it is done: they
+    // all act on the branch, which the swap has taken. `Stop` is the one
+    // command that is never deferred.
+    let mut deferred: VecDeque<DestCmd> = VecDeque::new();
+    // Extra keyframes still to send after a swap, a recovery rebuild or the
+    // start (#97): see [`destination::keyframe_repeat_schedule`].
+    let mut keyframe_repeats: VecDeque<Instant> = destination::keyframe_repeat_schedule(Instant::now()).into_iter().collect();
+    // Encoder-wedge recovery bookkeeping (#99): how many rebuilds of this
+    // branch have been tried since the destination was last Live, and when
+    // the last one started.
+    let mut wedge_rebuilds: u32 = 0;
+    let mut last_wedge_rebuild: Option<Instant> = None;
+    // Set once this pump declared the capture source dead, to log it once.
+    let mut declared_source_lost = false;
 
     loop {
-        tokio::select! {
-            sample = async { branch.as_mut().expect("guarded by branch.is_some()").next_sample().await },
-                if branch.is_some() && !branch_ended =>
-            {
-                match sample {
-                    Some(sample) => {
-                        record_encoder_frame(&mut encoded_frame_times, &encoder_fps);
-                        // A frame arriving while stalled is only a delta
-                        // unless it happens to be a GOP boundary, and a delta
-                        // cannot end the stall (the viewer has nothing
-                        // decodable to apply it to) — so ask for an IDR now
-                        // instead of waiting out the rest of the GOP.
-                        let was_stalled = runtime.lock().unwrap().is_stalled();
-                        let result = send_encoded_sample(&client, stream_id, &sample, start, &runtime);
-                        if was_stalled
-                            && runtime.lock().unwrap().is_stalled()
-                            && let Some(pad) = branch.as_ref().and_then(|b| b.keyframe_pad())
-                        {
-                            force_keyframe(&pad);
+        // A command deferred by a swap is replayed first, as soon as there is
+        // no swap in flight; otherwise wait for whatever happens next.
+        let command: DestCmd = if swapping.is_none() && let Some(deferred_cmd) = deferred.pop_front() {
+            deferred_cmd
+        } else {
+            tokio::select! {
+                sample = async { branch.as_mut().expect("guarded by branch.is_some()").next_sample().await },
+                    if branch.is_some() && !branch_ended =>
+                {
+                    match sample {
+                        Some(sample) => {
+                            record_encoder_frame(&mut encoded_frame_times, &encoder_fps);
+                            // A frame arriving while stalled is only a delta
+                            // unless it happens to be a GOP boundary, and a delta
+                            // cannot end the stall (the viewer has nothing
+                            // decodable to apply it to) — so ask for an IDR now
+                            // instead of waiting out the rest of the GOP.
+                            let was_stalled = runtime.lock().unwrap().is_stalled();
+                            let result = send_encoded_sample(&client, stream_id, &sample, start, &runtime);
+                            if was_stalled
+                                && runtime.lock().unwrap().is_stalled()
+                                && let Some(pad) = branch.as_ref().and_then(|b| b.keyframe_pad())
+                            {
+                                force_keyframe(&pad);
+                            }
+                            match result {
+                                Ok(()) => record_sent_frame(&mut sent_frame_times, &sent_fps),
+                                Err(e) => tracing::warn!("dropping encoded frame for stream {stream_id}: {e:#}"),
+                            }
                         }
-                        match result {
-                            Ok(()) => record_sent_frame(&mut sent_frame_times, &sent_fps),
-                            Err(e) => tracing::warn!("dropping encoded frame for stream {stream_id}: {e:#}"),
-                        }
+                        None => branch_ended = true,
                     }
-                    None => branch_ended = true,
+                    continue;
                 }
-            }
-            _ = stall_ticker.tick() => {
-                let now = Instant::now();
-                match branch.as_ref().filter(|_| !paused && !branch_ended) {
-                    Some(b) => {
-                        if offered_branch != Some(b.id) {
-                            offered_branch = Some(b.id);
+                _ = stall_ticker.tick() => {
+                    let now = Instant::now();
+                    let mut offered_recently: Option<u64> = None;
+                    match branch.as_ref().filter(|_| !paused && !branch_ended) {
+                        Some(b) => {
+                            if offered_branch != Some(b.id) {
+                                offered_branch = Some(b.id);
+                                offered_samples.clear();
+                            }
+                            let offered_now = b.offered_frames();
+                            offered_samples.push_back((now, offered_now));
+                            while offered_samples.len() > 2
+                                && offered_samples.front().is_some_and(|(t, _)| now.duration_since(*t) > ENCODER_FPS_WINDOW)
+                            {
+                                offered_samples.pop_front();
+                            }
+                            let (t0, n0) = offered_samples.front().copied().expect("just pushed");
+                            let secs = now.duration_since(t0).as_secs_f64();
+                            if secs >= 1.0 {
+                                offered_recently = Some(offered_now - n0);
+                                let offered_fps = ((offered_now - n0) as f64 / secs).round() as u32;
+                                runtime.lock().unwrap().observe_encoder_rate(now, encoder_fps.load(Ordering::Relaxed), offered_fps);
+                            }
+                        }
+                        None => {
                             offered_samples.clear();
+                            runtime.lock().unwrap().reset_encoder_limit();
                         }
-                        let offered_now = b.offered_frames();
-                        offered_samples.push_back((now, offered_now));
-                        while offered_samples.len() > 2
-                            && offered_samples.front().is_some_and(|(t, _)| now.duration_since(*t) > ENCODER_FPS_WINDOW)
+                    }
+                    if !paused && branch.is_some() && !branch_ended {
+                        let mut runtime = runtime.lock().unwrap();
+                        let silence = destination::silence_threshold(runtime.params().framerate);
+                        if runtime.stall_if_silent(Instant::now(), silence) {
+                            tracing::warn!(
+                                "stream {stream_id}: no encoded frame for {silence:?}; re-sending the cached IDR until the capture produces again"
+                            );
+                        }
+                    }
+                    send_stall_keepalive(&client, stream_id, &runtime);
+
+                    // The stall is never open-ended (#99): diagnose what is
+                    // silent and act, on a schedule that ends in either a
+                    // recovered stream or a Failed one the user can retry.
+                    let (state, params) = {
+                        let r = runtime.lock().unwrap();
+                        (r.state(), r.params())
+                    };
+                    match state {
+                        destination::DestinationState::Live => {
+                            wedge_rebuilds = 0;
+                            last_wedge_rebuild = None;
+                        }
+                        destination::DestinationState::Stalled { since, .. }
+                            if swapping.is_none() && !paused && branch.is_some() && capture_errors.lost().is_none() =>
                         {
-                            offered_samples.pop_front();
-                        }
-                        let (t0, n0) = offered_samples.front().copied().expect("just pushed");
-                        let secs = now.duration_since(t0).as_secs_f64();
-                        if secs >= 1.0 {
-                            let offered_fps = ((offered_now - n0) as f64 / secs).round() as u32;
-                            runtime.lock().unwrap().observe_encoder_rate(now, encoder_fps.load(Ordering::Relaxed), offered_fps);
-                        }
-                    }
-                    None => {
-                        offered_samples.clear();
-                        runtime.lock().unwrap().reset_encoder_limit();
-                    }
-                }
-                if !paused && branch.is_some() && !branch_ended {
-                    let mut runtime = runtime.lock().unwrap();
-                    let silence = destination::silence_threshold(runtime.params().framerate);
-                    if runtime.stall_if_silent(Instant::now(), silence) {
-                        tracing::warn!(
-                            "stream {stream_id}: no encoded frame for {silence:?}; re-sending the cached IDR until the capture produces again"
-                        );
-                    }
-                }
-                send_stall_keepalive(&client, stream_id, &runtime);
-            }
-            cmd = cmd_rx.recv() => {
-                match cmd {
-                    // Every sender is gone: the `CaptureHandle` was dropped
-                    // without `stop()` (the bare-drop backstop path), so the
-                    // pipeline is being torn down under us. Nothing useful is
-                    // left to drain.
-                    None => return,
-                    Some(DestCmd::SubscriberCount(0)) => {
-                        if !paused && let Some(branch) = branch.as_ref() {
-                            tracing::info!("stream {stream_id} has 0 subscribers; pausing its encoder to save CPU/bandwidth");
-                            branch.set_paused(true, stream_id);
-                            paused = true;
-                            // No more encoded frames will arrive while
-                            // paused, so `record_encoder_frame`'s window
-                            // won't naturally decay on its own — reset the
-                            // published rate to 0 immediately rather than
-                            // leaving it stuck reporting its last pre-pause
-                            // value.
-                            encoded_frame_times.clear();
-                            encoder_fps.store(0, Ordering::Relaxed);
-                            sent_frame_times.clear();
-                            sent_fps.store(0, Ordering::Relaxed);
-                        }
-                    }
-                    Some(DestCmd::SubscriberCount(_)) => {
-                        if paused && let Some(branch) = branch.as_ref() {
-                            tracing::info!("stream {stream_id} has a subscriber again; resuming its encoder");
-                            branch.set_paused(false, stream_id);
-                            paused = false;
-                            runtime.lock().unwrap().restart_silence_clock(Instant::now());
-                            // Resuming after a pause means the first frame
-                            // back out of the encoder must be a keyframe —
-                            // nothing decodable was produced while paused.
-                            if let Some(pad) = branch.keyframe_pad() {
-                                force_keyframe(&pad);
+                            let verdict = destination::stall_verdict(
+                                now.saturating_duration_since(since),
+                                offered_recently,
+                                wedge_rebuilds,
+                                last_wedge_rebuild.map(|t| now.saturating_duration_since(t)),
+                            );
+                            match verdict {
+                                destination::StallVerdict::Wait => {}
+                                destination::StallVerdict::SourceDead => {
+                                    if !declared_source_lost {
+                                        declared_source_lost = true;
+                                        tracing::warn!(
+                                            "stream {stream_id}: the capture source delivers nothing to this branch; declaring it lost"
+                                        );
+                                        capture_errors.mark_lost("the capture source stopped delivering frames".to_string());
+                                    }
+                                }
+                                destination::StallVerdict::RebuildBranch => {
+                                    wedge_rebuilds += 1;
+                                    last_wedge_rebuild = Some(now);
+                                    tracing::warn!(
+                                        "stream {stream_id}: the source delivers frames but the encoder emits none; rebuilding the encode branch (attempt {wedge_rebuilds}/{})",
+                                        destination::MAX_WEDGE_REBUILDS
+                                    );
+                                    let old = branch.take().expect("guarded by branch.is_some()");
+                                    let id = branch::BranchId(next_branch_id);
+                                    next_branch_id = next_branch_id.wrapping_add(1);
+                                    swapping = Some(PendingSwap::spawn(
+                                        &pipeline, &tee, &runtime, old, id, params, branch::SwapMode::Recovery, None,
+                                    ));
+                                }
+                                destination::StallVerdict::GiveUp => {
+                                    tracing::error!("stream {stream_id}: the encoder stayed silent through {wedge_rebuilds} rebuilds; giving up");
+                                    runtime.lock().unwrap().fail("the encoder stopped producing frames and could not be restarted");
+                                }
                             }
                         }
+                        _ => {}
                     }
-                    Some(DestCmd::KeyframeRequest) => {
-                        if let Some(branch) = branch.as_ref() {
+                    continue;
+                }
+                _ = async { tokio::time::sleep_until((*keyframe_repeats.front().expect("guarded")).into()).await },
+                    if !keyframe_repeats.is_empty() =>
+                {
+                    keyframe_repeats.pop_front();
+                    if !paused && let Some(pad) = branch.as_ref().and_then(|b| b.keyframe_pad()) {
+                        force_keyframe(&pad);
+                    }
+                    continue;
+                }
+                joined = async { swapping.as_mut().expect("guarded by swapping.is_some()").join().await },
+                    if swapping.is_some() =>
+                {
+                    let swap = swapping.take().expect("guarded by swapping.is_some()");
+                    match joined {
+                        Ok(branch::SwapOutcome::Swapped(new_branch)) => {
+                            // The new branch's own first IDR was consumed
+                            // by the swap's readiness check, so ask for
+                            // another one rather than leaving the viewer
+                            // decoding deltas against a GOP it never got,
+                            // and twice more later in case that one is lost
+                            // on the way (#97).
+                            if let Some(pad) = new_branch.keyframe_pad() {
+                                force_keyframe(&pad);
+                            }
+                            keyframe_repeats = destination::keyframe_repeat_schedule(Instant::now()).into_iter().collect();
                             if paused {
-                                // A subscribe implies at least one subscriber
-                                // exists even if the paired `SubscriberCount`
-                                // update hasn't arrived yet — don't leave the
-                                // encoder paused (and the new subscriber with
-                                // nothing to decode) waiting on message order.
-                                tracing::info!("stream {stream_id} got a keyframe request while paused; resuming its encoder");
-                                branch.set_paused(false, stream_id);
-                                paused = false;
-                                runtime.lock().unwrap().restart_silence_clock(Instant::now());
+                                // A replacement branch is born open; carry
+                                // the destination's paused state across.
+                                new_branch.set_paused(true, stream_id);
                             }
-                            if let Some(pad) = branch.keyframe_pad() {
-                                force_keyframe(&pad);
-                            }
-                        }
-                    }
-                    Some(DestCmd::SetBitrate(bitrate_kbps)) => {
-                        if let Some(branch) = branch.as_ref() {
-                            branch.set_bitrate_kbps(bitrate_kbps);
-                            runtime.lock().unwrap().set_bitrate(bitrate_kbps);
-                        }
-                    }
-                    Some(DestCmd::ApplyParams { params, reply }) => {
-                        let Some(old) = branch.take() else {
-                            let _ = reply.send(Err("destination has no live encode branch".to_string()));
-                            continue;
-                        };
-                        let id = branch::BranchId(next_branch_id);
-                        next_branch_id = next_branch_id.wrapping_add(1);
-                        // `Why the whole swap is awaited here, inside the
-                        // pump's own loop:` the branch must be owned by
-                        // exactly one place, and this is it. The cost is that
-                        // this destination's already-encoded samples aren't
-                        // drained while the replacement branch is coming up
-                        // (its appsink is `drop=true`, so they're discarded,
-                        // not queued) — normally a few hundred milliseconds,
-                        // bounded by `branch::FIRST_IDR_TIMEOUT`. The
-                        // destination reports `Rebuilding` throughout, which
-                        // is exactly what that state is for. Every *other*
-                        // destination on this capture keeps sending
-                        // untouched, since each has its own pump.
-                        match branch::swap_to_new_branch(&pipeline, &tee, &runtime, old, id, params).await {
-                            branch::SwapOutcome::Swapped(new_branch) => {
-                                // The new branch's own first IDR was consumed
-                                // by the swap's readiness check, so ask for
-                                // another one rather than leaving the viewer
-                                // decoding deltas against a GOP it never got.
-                                if let Some(pad) = new_branch.keyframe_pad() {
-                                    force_keyframe(&pad);
-                                }
-                                if paused {
-                                    // A replacement branch is born open; carry
-                                    // the destination's paused state across.
-                                    new_branch.set_paused(true, stream_id);
-                                }
-                                branch = Some(new_branch);
-                                branch_ended = false;
-                                runtime.lock().unwrap().restart_silence_clock(Instant::now());
+                            branch = Some(new_branch);
+                            branch_ended = false;
+                            runtime.lock().unwrap().restart_silence_clock(Instant::now());
+                            if let Some(reply) = swap.reply {
                                 let _ = reply.send(Ok(()));
                             }
-                            branch::SwapOutcome::KeptOld(old, e) => {
-                                branch = Some(old);
-                                runtime.lock().unwrap().restart_silence_clock(Instant::now());
+                        }
+                        Ok(branch::SwapOutcome::KeptOld(old, e)) => {
+                            branch = Some(old);
+                            runtime.lock().unwrap().restart_silence_clock(Instant::now());
+                            if swap.recovery {
+                                tracing::warn!("stream {stream_id}: the branch rebuild failed: {e:#}");
+                            }
+                            if let Some(reply) = swap.reply {
                                 let _ = reply.send(Err(format!("{e:#}")));
                             }
                         }
+                        Err(join_error) => {
+                            tracing::error!("stream {stream_id}: the branch swap task died: {join_error}");
+                            runtime.lock().unwrap().fail("the encode branch swap failed unexpectedly");
+                            if let Some(reply) = swap.reply {
+                                let _ = reply.send(Err(format!("branch swap task died: {join_error}")));
+                            }
+                        }
                     }
-                    Some(DestCmd::Stop { reply }) => {
-                        let mut result = Ok(());
-                        if let Some(branch) = branch.take()
-                            && let Err(e) = branch::remove_branch(&pipeline, &tee, branch).await
-                        {
-                            result = Err(format!("{e:#}"));
+                    continue;
+                }
+                cmd = cmd_rx.recv() => {
+                    match cmd {
+                        // Every sender is gone: the `CaptureHandle` was dropped
+                        // without `stop()` (the bare-drop backstop path), so the
+                        // pipeline is being torn down under us. Nothing useful is
+                        // left to drain.
+                        None => return,
+                        Some(cmd @ DestCmd::Stop { .. }) => cmd,
+                        Some(other) if swapping.is_some() => {
+                            deferred.push_back(other);
+                            continue;
                         }
-                        if let Err(e) = client.stop_stream(stream_id).await {
-                            tracing::warn!("error notifying relay that stream {stream_id} stopped: {e:#}");
-                        }
-                        let _ = reply.send(result);
-                        return;
+                        Some(other) => other,
                     }
                 }
+            }
+        };
+
+        match command {
+            DestCmd::SubscriberCount(0) => {
+                if !paused && let Some(branch) = branch.as_ref() {
+                    tracing::info!("stream {stream_id} has 0 subscribers; pausing its encoder to save CPU/bandwidth");
+                    branch.set_paused(true, stream_id);
+                    paused = true;
+                    // No more encoded frames will arrive while
+                    // paused, so `record_encoder_frame`'s window
+                    // won't naturally decay on its own — reset the
+                    // published rate to 0 immediately rather than
+                    // leaving it stuck reporting its last pre-pause
+                    // value.
+                    encoded_frame_times.clear();
+                    encoder_fps.store(0, Ordering::Relaxed);
+                    sent_frame_times.clear();
+                    sent_fps.store(0, Ordering::Relaxed);
+                }
+            }
+            DestCmd::SubscriberCount(_) => {
+                if paused && let Some(branch) = branch.as_ref() {
+                    tracing::info!("stream {stream_id} has a subscriber again; resuming its encoder");
+                    branch.set_paused(false, stream_id);
+                    paused = false;
+                    runtime.lock().unwrap().restart_silence_clock(Instant::now());
+                    // Resuming after a pause means the first frame
+                    // back out of the encoder must be a keyframe —
+                    // nothing decodable was produced while paused.
+                    if let Some(pad) = branch.keyframe_pad() {
+                        force_keyframe(&pad);
+                    }
+                }
+            }
+            DestCmd::KeyframeRequest => {
+                if let Some(branch) = branch.as_ref() {
+                    if paused {
+                        // A subscribe implies at least one subscriber
+                        // exists even if the paired `SubscriberCount`
+                        // update hasn't arrived yet — don't leave the
+                        // encoder paused (and the new subscriber with
+                        // nothing to decode) waiting on message order.
+                        tracing::info!("stream {stream_id} got a keyframe request while paused; resuming its encoder");
+                        branch.set_paused(false, stream_id);
+                        paused = false;
+                        runtime.lock().unwrap().restart_silence_clock(Instant::now());
+                    }
+                    if let Some(pad) = branch.keyframe_pad() {
+                        force_keyframe(&pad);
+                    }
+                }
+            }
+            DestCmd::SetBitrate(bitrate_kbps) => {
+                if let Some(branch) = branch.as_ref() {
+                    branch.set_bitrate_kbps(bitrate_kbps);
+                    runtime.lock().unwrap().set_bitrate(bitrate_kbps);
+                }
+            }
+            DestCmd::ApplyParams { params, reply } => {
+                let Some(old) = branch.take() else {
+                    let _ = reply.send(Err("destination has no live encode branch".to_string()));
+                    continue;
+                };
+                let id = branch::BranchId(next_branch_id);
+                next_branch_id = next_branch_id.wrapping_add(1);
+                // `Why the swap runs as its own task, awaited from this
+                // loop's `select!` (#98):` the branch must be owned by
+                // exactly one place, and that is still this pump (it holds
+                // the swap's `JoinHandle`, and the branch comes back
+                // through it). But awaiting the swap *inline* meant a `Stop`
+                // arriving mid-swap sat unread for as long as the swap took
+                // (construction up to 20 s, first IDR 5 s, old-branch
+                // teardown up to 15 s). Now `Stop` is served at once, and
+                // other commands are deferred, not lost. While the swap
+                // runs this destination's already-encoded samples aren't
+                // drained (its appsink is `drop=true`, so they are
+                // discarded, not queued), and it reports `Rebuilding`.
+                // Every *other* destination on this capture keeps sending
+                // untouched, since each has its own pump.
+                swapping = Some(PendingSwap::spawn(
+                    &pipeline, &tee, &runtime, old, id, params, branch::SwapMode::Normal, Some(reply),
+                ));
+            }
+            DestCmd::Stop { reply } => {
+                let began = Instant::now();
+                // `Why the relay is told BEFORE the branch is torn down
+                // (#98):` the branch teardown (EOS drain, a hardware
+                // encoder's `Null`) is the slow, occasionally stuck part,
+                // and it used to run first, so viewers kept the tile of a
+                // stream that was already over for as long as it took. The
+                // relay does not need the branch gone to drop the stream.
+                match tokio::time::timeout(STOP_NOTIFY_TIMEOUT, client.stop_stream(stream_id)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::warn!("error notifying relay that stream {stream_id} stopped: {e:#}"),
+                    Err(_) => tracing::warn!("notifying the relay that stream {stream_id} stopped took longer than {STOP_NOTIFY_TIMEOUT:?}"),
+                }
+                let notified = began.elapsed();
+                let mut result = Ok(());
+                if let Some(swap) = swapping.take() {
+                    // A swap is mid-flight and owns both branches: let it
+                    // finish in the background and remove whatever it ends
+                    // up holding, without making this stop wait for it.
+                    if let Some(reply) = swap.reply {
+                        let _ = reply.send(Err("the destination was stopped".to_string()));
+                    }
+                    let (pipeline, tee) = (pipeline.clone(), tee.clone());
+                    tokio::spawn(async move {
+                        let leftover = match swap.handle.await {
+                            Ok(branch::SwapOutcome::Swapped(b)) | Ok(branch::SwapOutcome::KeptOld(b, _)) => Some(b),
+                            Err(_) => None,
+                        };
+                        if let Some(b) = leftover {
+                            let _ = branch::remove_branch_with(&pipeline, &tee, b, branch::RemoveBounds::FAST).await;
+                        }
+                    });
+                } else if let Some(branch) = branch.take()
+                    && let Err(e) = branch::remove_branch_with(&pipeline, &tee, branch, branch::RemoveBounds::FAST).await
+                {
+                    result = Err(format!("{e:#}"));
+                }
+                tracing::info!(
+                    "stream {stream_id} stopped: relay notified in {} ms, branch removed {} ms later",
+                    notified.as_millis(),
+                    began.elapsed().saturating_sub(notified).as_millis()
+                );
+                let _ = reply.send(result);
+                return;
             }
         }
     }
 }
 
-fn handle_bus_message(msg: &gst::Message, bus_done: &mut bool, errors: &CaptureErrors) {
+/// How long [`destination_pump`]'s `Stop` waits for the relay to accept the
+/// `StopStream` before moving on to the branch teardown regardless.
+const STOP_NOTIFY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// A branch swap running as its own task (see the pump's `ApplyParams` arm).
+/// Both a user's settings change and the encoder-wedge recovery rebuild use
+/// it; `reply` is the settings change's answer channel (`None` for a
+/// recovery rebuild, which nobody is waiting on).
+struct PendingSwap {
+    handle: tokio::task::JoinHandle<branch::SwapOutcome>,
+    reply: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    recovery: bool,
+}
+
+impl PendingSwap {
+    #[allow(clippy::too_many_arguments)]
+    fn spawn(
+        pipeline: &gst::Pipeline,
+        tee: &gst::Element,
+        runtime: &destination::SharedDestination,
+        old: branch::EncodeBranch,
+        id: branch::BranchId,
+        params: destination::VideoParams,
+        mode: branch::SwapMode,
+        reply: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    ) -> Self {
+        let (pipeline, tee, runtime) = (pipeline.clone(), tee.clone(), runtime.clone());
+        let handle = tokio::spawn(async move { branch::swap_to_new_branch_with(&pipeline, &tee, &runtime, old, id, params, mode).await });
+        Self { handle, reply, recovery: mode == branch::SwapMode::Recovery }
+    }
+
+    /// Awaits the swap. Cancel-safe in a `select!` (a `JoinHandle` is).
+    async fn join(&mut self) -> Result<branch::SwapOutcome, tokio::task::JoinError> {
+        (&mut self.handle).await
+    }
+}
+
+fn handle_bus_message(msg: &gst::Message, errors: &CaptureErrors) {
     match msg.view() {
         gst::MessageView::Error(err) => {
-            tracing::error!(
-                "capture pipeline error from {}: {} ({})",
-                msg.src().map(|s| s.path_string().to_string()).unwrap_or_else(|| "unknown".into()),
-                err.error(),
-                err.debug().unwrap_or_default(),
-            );
-            errors.record(format!(
+            let path = msg.src().map(|s| s.path_string().to_string()).unwrap_or_else(|| "unknown".into());
+            let detail = err.debug().map(|d| d.to_string()).unwrap_or_default();
+            tracing::error!("capture pipeline error from {path}: {} ({detail})", err.error());
+            let text = format!(
                 "{}: {}",
                 msg.src().map(|s| s.name().to_string()).unwrap_or_else(|| "unknown".into()),
                 err.error()
-            ));
-            *bus_done = true;
+            );
+            errors.record(text.clone());
+            if !errors.is_stopping() && is_source_side_error(&path, &format!("{} {detail}", err.error())) {
+                tracing::warn!("capture source lost ({text}); the session will restart the capture");
+                errors.mark_lost(text);
+            }
         }
         gst::MessageView::Eos(_) => {
-            tracing::info!("capture pipeline reached EOS");
-            *bus_done = true;
+            if errors.is_stopping() {
+                tracing::info!("capture pipeline reached EOS");
+                errors.eos.notify_one();
+            } else {
+                // Not acted on: a dynamic branch's own EOS must never be read
+                // as the source ending. A source that really ended goes
+                // silent, which the silence watchdog diagnoses.
+                tracing::warn!("capture pipeline reached EOS without being asked to");
+            }
         }
         _ => {}
     }
@@ -4095,6 +4489,85 @@ pub mod destination {
     pub fn silence_threshold(framerate: u32) -> Duration {
         let three_frames = Duration::from_millis(3000 / u64::from(framerate.max(1)));
         three_frames.max(Duration::from_secs(3))
+    }
+
+    /// When, after a branch swap / recovery rebuild / new destination, the two
+    /// extra keyframes go out (#97). `Why:` the swap's one forced IDR is a
+    /// handful of datagrams; on a lossy link it is often lost, and the viewer
+    /// then waits for the next GOP boundary (2 s by default) with a frozen
+    /// picture. Two more, at +300 ms and +1 s, cost two keyframes and make
+    /// "all three lost" rare.
+    pub const KEYFRAME_REPEAT_OFFSETS: [Duration; 2] = [Duration::from_millis(300), Duration::from_millis(1000)];
+
+    /// The instants of the repeat keyframes for an event at `now`.
+    pub fn keyframe_repeat_schedule(now: Instant) -> [Instant; 2] {
+        KEYFRAME_REPEAT_OFFSETS.map(|offset| now + offset)
+    }
+
+    /// A destination counts as an encoder wedge (frames reach the branch, none
+    /// come out) once it has been `Stalled` this long, i.e. after about twice
+    /// [`silence_threshold`]'s 3 s of silence: 6 s without an encoded frame.
+    pub const WEDGE_REBUILD_AFTER_STALLED: Duration = Duration::from_secs(3);
+    /// A stalled branch that is offered no frames at all (the source delivers
+    /// nothing) is declared a lost source this long into the stall (8 s of
+    /// silence). The bus error path usually gets there first and faster.
+    pub const SOURCE_LOST_AFTER_STALLED: Duration = Duration::from_secs(5);
+    /// Branch rebuilds tried for a wedged encoder before the destination is
+    /// marked Failed (and offers the one-click retry).
+    pub const MAX_WEDGE_REBUILDS: u32 = 3;
+
+    /// Wait before wedge rebuild number `done + 1` (so the first is at once).
+    pub fn wedge_rebuild_backoff(done: u32) -> Duration {
+        match done {
+            0 => Duration::ZERO,
+            1 => Duration::from_secs(5),
+            _ => Duration::from_secs(15),
+        }
+    }
+
+    /// What a stalled destination's pump should do next ([`stall_verdict`]).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum StallVerdict {
+        /// Nothing yet: keep re-sending the cached IDR.
+        Wait,
+        /// The source is alive and the encoder is not: rebuild the branch.
+        RebuildBranch,
+        /// No frames reach the branch: the capture source is dead; the
+        /// session restarts the capture.
+        SourceDead,
+        /// Rebuilding did not help [`MAX_WEDGE_REBUILDS`] times: fail the
+        /// destination.
+        GiveUp,
+    }
+
+    /// The silence diagnosis (#99), pure so it is testable with injected
+    /// times. `offered_recently` is how many frames reached the branch over
+    /// the last ~2 s (`None` while the window is too short to know);
+    /// `since_last_rebuild` is `None` before the first rebuild.
+    ///
+    /// `Why offered-vs-encoded tells source from encoder apart:` the branch
+    /// counts frames at its entry, before the encoder. Frames arriving while
+    /// nothing comes out means the encoder (or its driver) is stuck and only
+    /// a new branch helps; no frames arriving means nothing a branch rebuild
+    /// can change.
+    pub fn stall_verdict(
+        stalled_for: Duration,
+        offered_recently: Option<u64>,
+        rebuilds_done: u32,
+        since_last_rebuild: Option<Duration>,
+    ) -> StallVerdict {
+        match offered_recently {
+            None => StallVerdict::Wait,
+            Some(0) if stalled_for >= SOURCE_LOST_AFTER_STALLED => StallVerdict::SourceDead,
+            Some(0) => StallVerdict::Wait,
+            Some(_) if stalled_for < WEDGE_REBUILD_AFTER_STALLED => StallVerdict::Wait,
+            Some(_) if rebuilds_done >= MAX_WEDGE_REBUILDS => {
+                // Give the last rebuild its own chance to start producing.
+                if since_last_rebuild.is_none_or(|d| d >= Duration::from_secs(10)) { StallVerdict::GiveUp } else { StallVerdict::Wait }
+            }
+            Some(_) if since_last_rebuild.is_none_or(|d| d >= wedge_rebuild_backoff(rebuilds_done)) => StallVerdict::RebuildBranch,
+            Some(_) => StallVerdict::Wait,
+        }
     }
 
     /// Why a destination is in [`DestinationState::Stalled`]. Only ever a
@@ -4920,6 +5393,53 @@ pub mod destination {
         // -------------------------------------------------------------
         // State machine
         // -------------------------------------------------------------
+
+        #[test]
+        fn keyframe_repeats_follow_the_swap_at_300_ms_and_1_s() {
+            let now = t0();
+            let [a, b] = keyframe_repeat_schedule(now);
+            assert_eq!(a.duration_since(now), Duration::from_millis(300));
+            assert_eq!(b.duration_since(now), Duration::from_millis(1000));
+        }
+
+        #[test]
+        fn a_silent_branch_that_is_offered_frames_is_an_encoder_wedge_after_six_seconds_of_silence() {
+            let s = |n| Duration::from_secs(n);
+            // Frames arrive, nothing comes out: wait out the stall's first 3 s, then rebuild at once.
+            assert_eq!(stall_verdict(s(1), Some(60), 0, None), StallVerdict::Wait);
+            assert_eq!(stall_verdict(s(3), Some(60), 0, None), StallVerdict::RebuildBranch);
+            // The second rebuild waits 5 s after the first, the third 15 s.
+            assert_eq!(stall_verdict(s(9), Some(60), 1, Some(s(4))), StallVerdict::Wait);
+            assert_eq!(stall_verdict(s(9), Some(60), 1, Some(s(5))), StallVerdict::RebuildBranch);
+            assert_eq!(stall_verdict(s(30), Some(60), 2, Some(s(14))), StallVerdict::Wait);
+            assert_eq!(stall_verdict(s(30), Some(60), 2, Some(s(15))), StallVerdict::RebuildBranch);
+            // Three rebuilds did not help: the last one gets 10 s, then the destination fails.
+            assert_eq!(stall_verdict(s(60), Some(60), MAX_WEDGE_REBUILDS, Some(s(9))), StallVerdict::Wait);
+            assert_eq!(stall_verdict(s(60), Some(60), MAX_WEDGE_REBUILDS, Some(s(10))), StallVerdict::GiveUp);
+        }
+
+        #[test]
+        fn a_branch_offered_nothing_means_a_dead_source_not_a_branch_rebuild() {
+            let s = |n| Duration::from_secs(n);
+            assert_eq!(stall_verdict(s(4), Some(0), 0, None), StallVerdict::Wait);
+            assert_eq!(stall_verdict(s(5), Some(0), 0, None), StallVerdict::SourceDead);
+            // Not known yet (window too short): never act on a guess.
+            assert_eq!(stall_verdict(s(60), None, 0, None), StallVerdict::Wait);
+        }
+
+        #[test]
+        fn a_stalled_destination_recovers_on_the_first_idr_after_a_rebuild_without_ever_rebuilding_state() {
+            // A wedge rebuild leaves the destination Stalled (its keepalive keeps running)
+            // and the new branch's first IDR is what ends the stall.
+            let (mut r, t) = live(30);
+            assert!(r.stall_if_silent(t + Duration::from_secs(10), Duration::from_secs(3)));
+            r.begin_rebuild(t + Duration::from_secs(11));
+            assert!(r.state().is_stalled(), "begin_rebuild must not hide an outage");
+            r.note_encoded_frame(false, b"delta", t + Duration::from_secs(12));
+            assert!(r.state().is_stalled(), "a delta cannot end a stall");
+            r.note_encoded_frame(true, b"idr", t + Duration::from_secs(13));
+            assert_eq!(r.state(), DestinationState::Live);
+        }
 
         #[test]
         fn a_new_destination_starts_in_starting_and_goes_live_on_its_first_idr() {
@@ -6347,7 +6867,39 @@ pub mod branch {
     /// (`repeated_add_remove_cycles_do_not_stall_the_pipeline`) for the
     /// guarantee this buys: dozens of add/remove cycles against a live
     /// pipeline with no stall and no leaked elements.
-    pub async fn remove_branch(pipeline: &gst::Pipeline, tee: &gst::Element, mut branch: EncodeBranch) -> Result<()> {
+    pub async fn remove_branch(pipeline: &gst::Pipeline, tee: &gst::Element, branch: EncodeBranch) -> Result<()> {
+        remove_branch_with(pipeline, tee, branch, RemoveBounds::DEFAULT).await
+    }
+
+    /// How long [`remove_branch_with`] gives its two blocking phases.
+    #[derive(Debug, Clone, Copy)]
+    pub struct RemoveBounds {
+        /// Waiting for the injected EOS to reach the branch's appsink.
+        pub drain: Duration,
+        /// `pipeline.remove` + `bin.set_state(Null)` + pad release.
+        pub teardown: Duration,
+    }
+
+    impl RemoveBounds {
+        /// For a branch that is replaced while the stream goes on (a swap):
+        /// the encoder gets to flush, nothing is waiting on the answer.
+        pub const DEFAULT: Self = Self { drain: Duration::from_secs(5), teardown: BRANCH_TEARDOWN_TIMEOUT };
+        /// For a stop (#98): the user already clicked, nobody wants the last
+        /// frames, and the capture's own stop has a short overall deadline.
+        /// A teardown that outlives it keeps running on its blocking thread.
+        pub const FAST: Self = Self { drain: Duration::from_secs(1), teardown: Duration::from_secs(3) };
+    }
+
+    /// [`remove_branch`] with explicit phase bounds (see [`RemoveBounds`]).
+    /// Logs, at info level, how long each phase took, so a real slow stop
+    /// shows which step hung (#98).
+    pub async fn remove_branch_with(
+        pipeline: &gst::Pipeline,
+        tee: &gst::Element,
+        mut branch: EncodeBranch,
+        bounds: RemoveBounds,
+    ) -> Result<()> {
+        let began = Instant::now();
         // Take over the branch's *existing* reader rather than installing a
         // second one — see [`EncodeBranch`]'s doc comment for why calling
         // `appsink.stream()` here would silently break whatever was already
@@ -6466,13 +7018,14 @@ pub mod branch {
         // structure gets torn down regardless of whether this actually
         // observed EOS, matching `CaptureHandle::stop`'s established
         // "best-effort wait, then force it anyway" shape.
-        let drained = tokio::time::timeout(Duration::from_secs(5), async {
+        let drained = tokio::time::timeout(bounds.drain, async {
             while appsink_stream.next().await.is_some() {}
         })
         .await
         .is_ok();
+        let drain_took = began.elapsed();
         if !drained {
-            tracing::warn!("encode branch did not drain to EOS within 5s; removing it anyway");
+            tracing::warn!("encode branch did not drain to EOS within {:?}; removing it anyway", bounds.drain);
         }
 
         let _ = tee_pad.unlink(&branch_sink_pad);
@@ -6517,13 +7070,23 @@ pub mod branch {
             }
             tee.release_request_pad(&tee_pad);
         });
-        if tokio::time::timeout(BRANCH_TEARDOWN_TIMEOUT, teardown).await.is_err() {
+        let teardown_began = Instant::now();
+        let teardown_done = tokio::time::timeout(bounds.teardown, teardown).await.is_ok();
+        if !teardown_done {
             tracing::error!(
                 "encode branch teardown (pipeline.remove/bin.set_state(Null)/release_request_pad) did not \
-                 complete within {BRANCH_TEARDOWN_TIMEOUT:?} — a GStreamer element's teardown appears stuck; \
-                 giving up on it rather than hanging this destination's pump task forever"
+                 complete within {:?} — a GStreamer element's teardown appears stuck; \
+                 giving up on it rather than hanging this destination's pump task forever",
+                bounds.teardown
             );
         }
+        tracing::info!(
+            "encode branch removed: drain {} ms{}, teardown {} ms{}",
+            drain_took.as_millis(),
+            if drained { "" } else { " (timed out)" },
+            teardown_began.elapsed().as_millis(),
+            if teardown_done { "" } else { " (timed out, still running)" },
+        );
 
         Ok(())
     }
@@ -6602,7 +7165,35 @@ pub mod branch {
         new_id: BranchId,
         new_params: destination::VideoParams,
     ) -> SwapOutcome {
-        runtime.lock().unwrap().begin_rebuild(Instant::now());
+        swap_to_new_branch_with(pipeline, tee, runtime, old, new_id, new_params, SwapMode::Normal).await
+    }
+
+    /// Why a branch is being swapped, see [`swap_to_new_branch_with`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SwapMode {
+        /// A settings change: invisible, the destination reports `Rebuilding`.
+        Normal,
+        /// Recovery from a wedged encoder (#99): same params, the destination
+        /// stays `Stalled` (its cached-IDR keepalive keeps the viewer's
+        /// stream alive, and `begin_rebuild` would refuse it anyway), and the
+        /// old branch, which is stuck by definition, is removed in the
+        /// background instead of being waited for.
+        Recovery,
+    }
+
+    /// [`swap_to_new_branch`] with an explicit [`SwapMode`].
+    pub async fn swap_to_new_branch_with(
+        pipeline: &gst::Pipeline,
+        tee: &gst::Element,
+        runtime: &destination::SharedDestination,
+        old: EncodeBranch,
+        new_id: BranchId,
+        new_params: destination::VideoParams,
+        mode: SwapMode,
+    ) -> SwapOutcome {
+        if mode == SwapMode::Normal {
+            runtime.lock().unwrap().begin_rebuild(Instant::now());
+        }
 
         let built = add_branch_live(pipeline, tee, new_id, new_params.to_encode_settings()).await;
         let (new_branch, first_idr) = match built {
@@ -6631,7 +7222,12 @@ pub mod branch {
             runtime.finish_rebuild();
         }
 
-        if let Err(e) = remove_branch(pipeline, tee, old).await {
+        if mode == SwapMode::Recovery {
+            let (pipeline, tee) = (pipeline.clone(), tee.clone());
+            tokio::spawn(async move {
+                let _ = remove_branch(&pipeline, &tee, old).await;
+            });
+        } else if let Err(e) = remove_branch(pipeline, tee, old).await {
             // The swap already succeeded; a messy teardown of the *old* branch
             // is a leak to log, not a reason to fail the destination.
             tracing::warn!("encode branch swap completed but removing the old branch failed: {e:#}");
@@ -8745,8 +9341,14 @@ mod tests {
         let _ = pipeline.post_message(
             gst::message::Error::builder(gst::StreamError::Failed, "stream error: unhandled format").src(&source).build(),
         );
-        // The bus ends the loop on its first error, so waiting for the task is the sync point.
-        tokio::time::timeout(Duration::from_secs(5), task).await.expect("capture_loop ends on a bus error").unwrap();
+        // The loop keeps reading after an error (#99), so poll for the record.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while errors.first().is_none() {
+            assert!(Instant::now() < deadline, "capture_loop never recorded the bus error");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(errors.lost().is_some(), "an error from a source-side element marks the source lost");
+        task.abort();
 
         let blamed = blame_the_source(encoder_symptom(), &errors);
         let text = format!("{blamed:#}");
@@ -8755,6 +9357,17 @@ mod tests {
         // Only the first error is kept: later ones are consequences of it.
         errors.record("second".to_string());
         assert_eq!(errors.first().as_deref(), Some("pipewiresrc17: stream error: unhandled format"));
+    }
+
+    /// #99: which bus errors mean the capture source is gone.
+    #[test]
+    fn only_source_side_errors_mark_the_source_lost() {
+        assert!(is_source_side_error("/GstPipeline:pipeline0/GstPipeWireSrc:pipewiresrc0", "stream error: target not found"));
+        assert!(is_source_side_error("/GstPipeline:pipeline0/GstVaPostProc:gpu_in", "not-negotiated"));
+        // The text alone is enough, whichever element carries it.
+        assert!(is_source_side_error("/GstPipeline:pipeline0/GstBin:branch_3/GstQueue:q", "x: target not found"));
+        // One destination's encoder failing is not the source.
+        assert!(!is_source_side_error("/GstPipeline:pipeline0/GstBin:branch_3/GstVaH264Enc:vah264enc0", "encode error"));
     }
 
     /// Task #59: a start that errors on the bus ends promptly with that error
@@ -9203,7 +9816,7 @@ mod tests {
                 ! video/x-raw,framerate={PREVIEW_BRANCH_FRAMERATE}/1 \
                 ! videoconvert \
                 ! video/x-raw,format=RGB \
-                ! appsink name=preview_sink emit-signals=false sync=false max-buffers=1 drop=true"
+                ! appsink name=preview_sink emit-signals=false sync=false max-buffers=1 drop=true wait-on-eos=false"
         );
 
         let element = gst::parse::launch(&description).expect("tee pipeline should parse and link");
