@@ -238,3 +238,19 @@ fn avatar_initial_is_centred_on_the_disc_at_any_position_and_scale() {
     // Guard the measurement itself: it does see the old drift.
     assert!(worst_old_spread >= 0.99, "old spread {worst_old_spread}");
 }
+
+/// The volume slider's 100 % detent (0-500 %, snap +-10): values near it land
+/// on it, values outside the snap distance and every other value are untouched,
+/// and no detent changes nothing.
+#[test]
+fn slider_detent_snaps_only_within_its_distance() {
+    let d = Some((100.0, 10.0));
+    assert_eq!(snap_to_detent(100.0, d), 100.0);
+    assert_eq!(snap_to_detent(90.0, d), 100.0);
+    assert_eq!(snap_to_detent(110.0, d), 100.0);
+    assert_eq!(snap_to_detent(85.0, d), 85.0);
+    assert_eq!(snap_to_detent(115.0, d), 115.0);
+    assert_eq!(snap_to_detent(500.0, d), 500.0);
+    assert_eq!(snap_to_detent(0.0, d), 0.0);
+    assert_eq!(snap_to_detent(97.0, None), 97.0);
+}

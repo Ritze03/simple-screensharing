@@ -831,7 +831,7 @@ fn round_btn(ui: &mut Ui, rect: Rect, id: Id, icon: &str, tip: &str, stop: bool)
     resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip)
 }
 
-/// `hbox·audio-pill` (29 px, pad 2/10, gap 4): `[25 mute][110 volume 0–200 %][34 pct]`,
+/// `hbox·audio-pill` (29 px, pad 2/10, gap 4): `[25 mute][110 volume 0–500 %][34 pct]`,
 /// or `[25 mute][Muted]` while muted. The slider pushes `SetVolume` on release.
 fn audio_pill(ui: &mut Ui, cx: &Cx, st: &mut RoomState, key: StreamKey, bottom: Rect, acts: &mut Vec<UiAction>) {
     let Some(s) = cx.session(key.0) else { return };
@@ -876,7 +876,7 @@ fn audio_pill(ui: &mut Ui, cx: &Cx, st: &mut RoomState, key: StreamKey, bottom: 
     let sr = Rect::from_center_size(sc.center(), vec2(sc.width(), theme::CTL_H));
     let mut sl = child.new_child(UiBuilder::new().id_salt(("tile_vol", key)).max_rect(sr).layout(Layout::left_to_right(Align::Center)));
     let mut v = shown;
-    let r = widgets::slider(&mut sl, &mut v, 0..=200, 5.0).on_hover_text(tr("ui.room.volume", "Volume"));
+    let r = super::volume_slider(&mut sl, &mut v).on_hover_text(tr("ui.room.volume", "Volume"));
     if r.dragged() || r.changed() {
         st.vol_drag = Some((key, v));
     }

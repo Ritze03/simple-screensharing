@@ -654,6 +654,20 @@ pub fn radio<T: PartialEq>(ui: &mut Ui, current: &mut T, value: T, label: &str) 
 /// A slider filling the available width (32 px tall hit area): 5 px track with the
 /// accent-gradient fill up to the value and a 14 px light thumb. Snaps to `step`.
 pub fn slider<N: egui::emath::Numeric>(ui: &mut Ui, value: &mut N, range: std::ops::RangeInclusive<N>, step: f64) -> Response {
+    slider_detent(ui, value, range, step, None)
+}
+
+/// [`slider`] with a detent: `detent = Some((at, snap))` draws a small tick on the
+/// track at `at` and pulls any value within `snap` of it onto `at` (so the volume
+/// slider's 0-500 % range still hits 100 % easily; at ~5 %/px a plain drag would
+/// otherwise have to land on one exact pixel).
+pub fn slider_detent<N: egui::emath::Numeric>(
+    ui: &mut Ui,
+    value: &mut N,
+    range: std::ops::RangeInclusive<N>,
+    step: f64,
+    detent: Option<(f64, f64)>,
+) -> Response {
     let w = ui.available_width();
     let (rect, mut resp) = ui.allocate_exact_size(vec2(w, theme::CTL_H), Sense::click_and_drag());
     let (lo, hi) = (range.start().to_f64(), range.end().to_f64());
@@ -671,6 +685,7 @@ pub fn slider<N: egui::emath::Numeric>(ui: &mut Ui, value: &mut N, range: std::o
         if step > 0.0 {
             v = lo + ((v - lo) / step).round() * step;
         }
+        v = snap_to_detent(v, detent);
         let v = N::from_f64(v.clamp(lo, hi));
         if v.to_f64() != value.to_f64() {
             *value = v;
@@ -685,11 +700,26 @@ pub fn slider<N: egui::emath::Numeric>(ui: &mut Ui, value: &mut N, range: std::o
     if t > 0.0 {
         paint_gradient(p, fill, cr(3), 90.0, theme::ACCENT_DEEP, theme::ACCENT);
     }
+    if let Some((at, _)) = detent
+        && hi > lo
+        && (lo..=hi).contains(&at)
+    {
+        let x = travel.min + travel.span() * ((at - lo) / (hi - lo)) as f32;
+        p.line_segment([pos2(x, track.center().y - 5.0), pos2(x, track.center().y + 5.0)], Stroke::new(1.5_f32, Color32::from_white_alpha(110)));
+    }
     let c = pos2(thumb_x, track.center().y);
     p.circle_filled(c + vec2(0.0, 1.0), THUMB / 2.0 + 1.5, Color32::from_black_alpha(90));
     let thumb = if resp.hovered() || resp.dragged() { Color32::WHITE } else { theme::TEXT };
     p.circle_filled(c, THUMB / 2.0, thumb);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// `v`, or the detent's value when `v` is within its snap distance.
+pub(crate) fn snap_to_detent(v: f64, detent: Option<(f64, f64)>) -> f64 {
+    match detent {
+        Some((at, snap)) if (v - at).abs() <= snap => at,
+        _ => v,
+    }
 }
 
 fn value_frame(ui: &Ui, rect: Rect, focused: bool) {

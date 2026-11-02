@@ -56,6 +56,7 @@ pub struct Gallery {
     total: u32,
     floor: u32,
     gop: u32,
+    vol: [u32; 3],
     fps_idx: usize,
     audio_idx: usize,
     codec: Codec,
@@ -80,6 +81,7 @@ impl Default for Gallery {
             total: 12000,
             floor: 3000,
             gop: 1000,
+            vol: [40, 100, 500],
             fps_idx: 2,
             audio_idx: 1,
             codec: Codec::H264,
@@ -380,6 +382,24 @@ impl Gallery {
                         |ui| readout(ui, "2 streams share the budget", Align::Max),
                         |ui| value_box(ui, &per),
                     );
+                }
+            });
+            card(r, "Viewer volume", Some("0-500 %, tick + snap at 100 %"), |ui| {
+                for (label, v) in ["Quiet", "Default", "Maximum"].into_iter().zip(self.vol.iter_mut()) {
+                    let cell = std::cell::Cell::new(*v);
+                    ctrl_row_value(
+                        ui,
+                        label,
+                        None,
+                        |ui| {
+                            let mut x = cell.get();
+                            let r = crate::ui::volume_slider(ui, &mut x);
+                            cell.set(x);
+                            r
+                        },
+                        |ui| value_box(ui, &format!("{}%", cell.get())),
+                    );
+                    *v = cell.get();
                 }
             });
             card(r, "Video", None, |ui| self.video_rows(ui));

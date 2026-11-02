@@ -8,7 +8,7 @@ import { capabilities, createRoom, parseJoinLink, parseServerAddr, base64urlDeco
 import { S, onInvalidate, invalidate, toast, persistSettings, persistRooms, loadRooms, autoName, displayName } from "./store.js";
 import { t, setLang, getLang } from "./i18n.js";
 import {
-  h, ic, T, V, H, SL, FILL, pct, fmtKbps, ctrlRow, valBox, sliderRow, seg, cbx, card, secHead, roomRow, sharerRow, personRow, destRow,
+  h, ic, T, V, H, SL, FILL, pct, fmtKbps, snapVolumePct, VOLUME_MAX_PCT, ctrlRow, valBox, sliderRow, seg, cbx, card, secHead, roomRow, sharerRow, personRow, destRow,
   popItem, btnRow, gridRows, cols, emptyState, banner, meter, modalShell, avatarBg, initial,
 } from "./dom.js";
 import {
@@ -388,8 +388,9 @@ function renderTile(r, w, crossRoom) {
 
 function audioPill(r, w) {
   const pctEl = h("span", { class: "pct", text: Math.round(w.vol * 100) + "%" });
-  const slider = h("input", { type: "range", min: "0", max: "200", step: "5", value: String(Math.round(w.vol * 100)), "aria-label": t("ui.tile.volume"), id: "vol-" + w.key.replace(":", "-") });
+  const slider = h("input", { type: "range", class: "vol", min: "0", max: String(VOLUME_MAX_PCT), step: "5", value: String(Math.round(w.vol * 100)), "aria-label": t("ui.tile.volume"), id: "vol-" + w.key.replace(":", "-") });
   slider.addEventListener("input", () => {
+    slider.value = String(snapVolumePct(Number(slider.value)));
     setWatchVolume(r, w, Number(slider.value) / 100);
     pctEl.textContent = slider.value + "%";
     pct(slider);

@@ -236,10 +236,11 @@
 //!
 //! `volume` (GStreamer's `volume` element) sits just before the sink so
 //! [`AudioDecoder::set_volume`] can adjust playback level live without
-//! rebuilding the pipeline; its `volume` property is already a 0.0-2.0
-//! linear scale (`gst-inspect-1.0 volume`: "Double. Range: 0 - 10 Default:
-//! 1"), so the UI's 0-200% slider maps onto it by dividing by 100.0 with no
-//! further conversion.
+//! rebuilding the pipeline; its `volume` property is a linear scale
+//! (`gst-inspect-1.0 volume`: "Double. Range: 0 - 10 Default: 1"), so the
+//! UI's 0-500% slider (up to [`MAX_AUDIO_GAIN`]) maps onto it by dividing by
+//! 100.0 with no further conversion. Above 100 % loud material clips at full
+//! scale (see [`MAX_AUDIO_GAIN`] for why that is left alone).
 //!
 //! ## Threading
 //!
@@ -1403,6 +1404,18 @@ impl AudioJitterBuffer {
     }
 }
 
+/// Highest playback gain, linear (5.0 = 500 %): the GStreamer `volume`
+/// element's own range is 0-10, so no extra stage is needed.
+///
+/// Why 500 % with no limiter (2026-11-02): the decode chain's `volume` works
+/// on the decoded S16 samples and *saturates* (clips at full scale, no
+/// integer wrap; `volume_boost_saturates_instead_of_wrapping` pins it), the
+/// same as the browser's gain node into the device. A boost of a quiet
+/// source is the point of the feature; a soft clip or limiter would add a
+/// stage, latency and a tuning knob for a user-chosen, deliberately loud
+/// setting. Revisit if clipped loud sources turn out to be a complaint.
+pub const MAX_AUDIO_GAIN: f64 = 5.0;
+
 /// Decodes and plays one subscribed audio stream's incoming Opus packets.
 /// See the module docs "Audio" section for the pipeline shape and
 /// threading rationale. Unlike [`StreamDecoder`], there is nothing to poll
@@ -1539,14 +1552,14 @@ impl AudioDecoder {
         }
     }
 
-    /// Set playback volume as a 0.0-2.0 linear factor (matching the
-    /// project's 0-200% requirement 1:1 — see the module docs "Audio"
+    /// Set playback volume as a 0.0-[`MAX_AUDIO_GAIN`] linear factor (the
+    /// project's 0-500% requirement 1:1 — see the module docs "Audio"
     /// section for why no further conversion is needed). Values outside
     /// that range are clamped rather than rejected, since a UI slider
-    /// bounded to 0..=200% can never actually produce one, but a defensive
+    /// bounded to 0..=500% can never actually produce one, but a defensive
     /// clamp costs nothing. Never blocks.
     pub fn set_volume(&mut self, volume: f64) {
-        let clamped = volume.clamp(0.0, 2.0);
+        let clamped = volume.clamp(0.0, MAX_AUDIO_GAIN);
         if self.tx.send(AudioPipelineMsg::SetVolume(clamped)).is_err() {
             tracing::warn!(
                 "audio decode pipeline thread for stream {} is gone; dropping volume change",
@@ -2902,8 +2915,9 @@ mod tests {
 
         decoder.set_volume(0.0);
         decoder.set_volume(2.0);
+        decoder.set_volume(MAX_AUDIO_GAIN);
         decoder.set_volume(1.0);
-        decoder.set_volume(5.0); // out of range: must clamp, not panic.
+        decoder.set_volume(50.0); // out of range: must clamp, not panic.
 
         for (i, packet) in packets.iter().enumerate() {
             let frame = DecryptedMediaFrame {
@@ -3588,6 +3602,44 @@ mod tests {
 
         let _ = pipeline.set_state(State::Null);
         played
+    }
+
+    /// The claim [`MAX_AUDIO_GAIN`] makes: at the top boost a loud S16 sample
+    /// clips at full scale instead of wrapping (a wrap would be a loud crack).
+    /// Pure GStreamer `appsrc ! volume ! appsink`, no Opus, no audio device,
+    /// no PipeWire stream.
+    #[test]
+    fn volume_boost_saturates_instead_of_wrapping() {
+        gstreamer::init().expect("gstreamer init");
+        let pipeline = Pipeline::new();
+        let src = ElementFactory::make("appsrc").build().expect("appsrc unavailable");
+        let volume = ElementFactory::make("volume").build().expect("volume unavailable");
+        let sink = ElementFactory::make("appsink").build().expect("appsink unavailable");
+        sink.set_property("sync", false);
+        volume.set_property("volume", MAX_AUDIO_GAIN);
+        pipeline.add_many([&src, &volume, &sink]).unwrap();
+        Element::link_many([&src, &volume, &sink]).unwrap();
+        let appsrc = src.dynamic_cast::<AppSrc>().unwrap();
+        appsrc.set_caps(Some(
+            &Caps::builder("audio/x-raw")
+                .field("format", "S16LE")
+                .field("layout", "interleaved")
+                .field("rate", 48_000i32)
+                .field("channels", 1i32)
+                .build(),
+        ));
+        appsrc.set_format(gstreamer::Format::Time);
+        let appsink = sink.dynamic_cast::<AppSink>().unwrap();
+        pipeline.set_state(State::Playing).expect("start pipeline");
+
+        let input: [i16; 5] = [10_000, -10_000, 1_000, 0, 20_000];
+        let bytes: Vec<u8> = input.iter().flat_map(|s| s.to_le_bytes()).collect();
+        appsrc.push_buffer(Buffer::from_slice(bytes)).expect("push");
+        let sample = appsink.try_pull_sample(ClockTime::from_seconds(5)).expect("no output sample");
+        let _ = pipeline.set_state(State::Null);
+        let map = sample.buffer().unwrap().map_readable().unwrap();
+        let out: Vec<i16> = map.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]])).collect();
+        assert_eq!(out, vec![i16::MAX, i16::MIN, 5_000, 0, i16::MAX]);
     }
 
     struct OpusLossOutcome {

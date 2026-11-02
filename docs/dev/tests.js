@@ -12,7 +12,8 @@ import { deriveCodecString, sniffCodec } from "../js/core/codec.js";
 import { DECODE_QUEUE_CATCHUP_THRESHOLD, JitterBuffer, MAX_DECODE_QUEUE, clampCatchUpSpeedPercent, clampMaxJitterBufferMs } from "../js/core/jitter.js";
 import { CanvasRenderer, VideoReceiver } from "../js/core/video-rx.js";
 import { ENCODER_PRESETS } from "../js/core/video-tx.js";
-import { avatarBg, avatarColors, avatarHue } from "../js/ui/dom.js";
+import { avatarBg, avatarColors, avatarHue, snapVolumePct, VOLUME_MAX_PCT } from "../js/ui/dom.js";
+import { AudioReceiver, MAX_VOLUME } from "../js/core/audio.js";
 
 const tests = [];
 export const test = (name, fn) => tests.push({ name, fn });
@@ -978,6 +979,31 @@ test("avatar colour: white initials keep >= 3:1 contrast against both stops on e
     ok(lum[0] > lum[1], `hue ${hue}: stop A should be the lighter one`);
   }
   eq(seen.size, 360, "hues covered");
+});
+
+// ------------------------------------------------------------------------------------------------ viewer volume
+
+test("volume: gain goes up to 500 %, the UI cap matches the core cap, 100 % stays the default", () => {
+  const gains = [];
+  const ctx = { currentTime: 0, destination: {}, createGain: () => ({ connect() {}, gain: { setTargetAtTime: (v) => gains.push(v) } }) };
+  const rx = new AudioReceiver({ context: ctx });
+  eq(gains.at(-1), 1, "default 100 %");
+  eq(VOLUME_MAX_PCT, MAX_VOLUME * 100);
+  rx.setVolume(5);
+  eq(gains.at(-1), 5);
+  rx.setVolume(2); // a pre-raise stored value stays valid
+  eq(gains.at(-1), 2);
+  rx.setVolume(9);
+  eq(gains.at(-1), 5, "clamped at the cap");
+  rx.setMuted(true);
+  eq(gains.at(-1), 0);
+  rx.setMuted(false);
+  eq(gains.at(-1), 5, "unmute restores the chosen volume");
+});
+
+test("volume: the slider's 100 % detent snaps within 10 and leaves everything else alone", () => {
+  for (const v of [90, 95, 100, 105, 110]) eq(snapVolumePct(v), 100);
+  for (const v of [0, 85, 115, 200, 500]) eq(snapVolumePct(v), v);
 });
 
 // ------------------------------------------------------------------------------------------------ runner

@@ -323,7 +323,7 @@ pub enum UiAction {
     BringBack(StreamKey),
     /// Toggle a standalone listen on an audio-only sender.
     ToggleListen(StreamKey),
-    /// Viewer volume 0-200 % + mute for a stream (video or audio stream id).
+    /// Viewer volume 0-500 % + mute for a stream (video or audio stream id).
     SetVolume { stream: StreamKey, volume_percent: u32, muted: bool },
 
     // --- sharing ----------------------------------------------------------
@@ -841,6 +841,18 @@ pub fn paired_audio(state: &AppState, capture: CaptureSourceId) -> Option<Captur
 // ---------------------------------------------------------------------------
 // Strings
 // ---------------------------------------------------------------------------
+
+/// Snap distance of the volume slider's 100 % detent, percent. The slider is
+/// 110 px wide for 0-500 % (~5.2 %/px), so +-10 % is a ~4 px wide target.
+const VOLUME_DETENT_SNAP: f64 = 10.0;
+
+/// The viewer volume slider shared by the tile pill and the pop-out window:
+/// 0-500 % in steps of 5, with a tick and a snap at 100 % (the default).
+pub fn volume_slider(ui: &mut Ui, percent: &mut u32) -> egui::Response {
+    let at = f64::from(simple_screensharing_client::session::DEFAULT_VOLUME_PERCENT);
+    let max = simple_screensharing_client::session::MAX_VOLUME_PERCENT;
+    widgets::slider_detent(ui, percent, 0..=max, 5.0, Some((at, VOLUME_DETENT_SNAP)))
+}
 
 /// `t!(key)` in the current locale, or `en` when the locale files have no
 /// entry for `key` (rust-i18n then returns the key itself, or

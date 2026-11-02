@@ -91,7 +91,7 @@ new RoomClient({
 | `watch(key, { canvas?, onFrame?, audio = true })` | Subscribe. Returns a `WatchHandle`. Watching a video stream also subscribes the owner's audio stream ("audio follows video", re-evaluated when that audio stream appears or disappears). |
 | *(A/V sync)* | The followed audio is delayed to line up with the owner's video (`avsync.js`: per-stream latency floors, deadband steps, 0-2 s; none for audio-only). Needs the sender to stamp audio and video PTS from one clock (native: since 2026-11-01; browser sender: always). `features/audio-sharing.md`. |
 | `unwatch(key)` | Unsubscribes the stream and its followed audio. |
-| `setVolume(key, 0..2)`, `setMuted(key, bool)` | Per-stream playback gain (0-200 %) and mute. `key` may be the video key (applies to its audio) or an audio key. Persists across re-watch. |
+| `setVolume(key, 0..5)`, `setMuted(key, bool)` | Per-stream playback gain (0-500 %) and mute. `key` may be the video key (applies to its audio) or an audio key. Persists across re-watch. |
 | `resumeAudio()` | Call from a user gesture if the autoplay policy left the `AudioContext` suspended. |
 | `startShare(opts)` | Share a screen/window/tab (+ audio). Returns a `ShareHandle`. See below. |
 | `stopShare(handle?)` | Stop one share, or all. |
@@ -228,7 +228,7 @@ Behaviour that matches the native sender:
 | `video-rx.js` | per-stream receive pipeline (`VideoReceiver`: loss gate -> jitter buffer -> `VideoDecoder`, reconfigures on codec change, recovers from decoder errors, Gecko decoder-latency fallback); re-exports `CanvasRenderer` |
 | `renderer.js` | `CanvasRenderer`: newest frame per `requestAnimationFrame`, WebGL2 or 2D backend picked by a first-frame timing, draw spacing |
 | `video-tx.js` | `VideoSender` (track -> `VideoEncoder`, keyframe policy, static-source keepalive, AV1 shaping), `probeEncoders`, `ENCODER_PRESETS`, `MediaClock` |
-| `audio.js` | `AudioReceiver` (Opus `AudioDecoder` -> WebAudio, PTS-placed playback, gain 0..2) and `AudioSender` (`AudioEncoder`) |
+| `audio.js` | `AudioReceiver` (Opus `AudioDecoder` -> WebAudio, PTS-placed playback, gain 0..5) and `AudioSender` (`AudioEncoder`) |
 | `preview.js` | preview sampler (downscale + JPEG) and cadence constants |
 | `joinlink.js` | link parse/format/mint, base64url |
 

@@ -470,7 +470,7 @@ fn audio_pill(ui: &mut Ui, info: &mut Info) -> Option<(u32, bool)> {
         let mut v = info.volume;
         if row
             .show(ui, 1, Align::Min, |ui| {
-                widgets::slider(ui, &mut v, 0..=200, 5.0)
+                super::volume_slider(ui, &mut v)
             })
             .changed()
         {

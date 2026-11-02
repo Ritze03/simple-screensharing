@@ -45,6 +45,11 @@ export const FILL = (kids, o) => {
 };
 
 export const pct = (inp) => inp.style.setProperty("--pct", ((inp.value - inp.min) / (inp.max - inp.min)) * 100 + "%");
+// The tile volume slider is 0-500 % in steps of 5 (core/audio.js MAX_VOLUME); 100 % is the default and gets a detent:
+// anything within VOLUME_SNAP_PCT of it lands exactly on it (about 5 %/px at the 110 px slider).
+export const VOLUME_MAX_PCT = 500;
+export const VOLUME_SNAP_PCT = 10;
+export const snapVolumePct = (v) => (Math.abs(v - 100) <= VOLUME_SNAP_PCT ? 100 : v);
 export const fmtKbps = (k) => (k >= 1000 ? (k / 1000).toFixed(1) + " Mbps" : Math.round(k) + " kbps");
 
 export const LABEL_W = 120;

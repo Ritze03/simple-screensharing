@@ -5,6 +5,43 @@ Audio capture/encode/playback is described where it grew up: `features/stream-co
 video") and the module docs of `client/src/audio.rs` and `client/src/decode.rs`. This page covers
 **keeping the audio aligned with the picture** (task #91, 2026-11-01).
 
+## 2026-11-02: viewer volume goes up to 500 % (task #96)
+
+User request: *"Let users adjust up to 500% volume when watching."* The per-tile volume control
+(native tile pill and pop-out pill, browser tile pill) was 0-200 %; it is now **0-500 %**, default
+still 100 %.
+
+- **Native.** `session::MAX_VOLUME_PERCENT = 500` (clamped in `RoomSession::set_volume` and
+  `effective_gain`), `decode::MAX_AUDIO_GAIN = 5.0` (clamp in `AudioDecoder::set_volume`; a test
+  pins the two equal). The decode chain's GStreamer `volume` element already takes 0-10, so the
+  only change is the cap: gain stays `percent / 100`, mute is still gain 0.
+- **Browser.** `core/audio.js` `MAX_VOLUME = 5`. Playback already runs through a WebAudio
+  `GainNode` (`HTMLMediaElement.volume` would have capped at 1), so again just the cap.
+- **Persistence unchanged.** `RoomSession::audio_volume_by_owner` (survives the sender restarting
+  its audio, `volume_survives_sender_audio_restart_or_switch`) and `WantedStream::volume_percent`
+  (survives a reconnect) store the percent as before; browser: `w.vol` and the 60 s resume list.
+  Nothing is written to disk, so there is no migration; any 0-200 value is still valid.
+- **Clipping: left as a hard clip, on purpose.** Above 100 % a loud source runs into full scale.
+  Native: the `volume` element works on the decoded 16-bit samples and *saturates* (no integer
+  wrap; `decode::tests::volume_boost_saturates_instead_of_wrapping` feeds 10000/-10000/20000
+  through `volume=5.0` and expects 5 x / full scale). Browser: the gain is a float, the device
+  clips at +-1.0. `Why` no limiter or soft clip: the feature exists to lift *quiet* sharers; a
+  limiter adds a stage, latency and a threshold to tune for a level the viewer picked on purpose.
+  If clipped loud sources become a complaint, the place for a limiter is a `GainNode` ->
+  `DynamicsCompressorNode` (browser) / `audiodynamic` or `rglimiter` after `volume` (native).
+- **Slider: 100 % detent.** The 110 px pill slider covers 500 % in about 96 px of travel (~5 %/px),
+  so hitting 100 % exactly would need pixel precision. The slider draws a 1.5 px tick at 100 % and
+  snaps anything within +-10 % onto it while dragging or clicking (native
+  `widgets::slider_detent` + `ui::volume_slider`, `VOLUME_DETENT_SNAP`; browser `ui/dom.js`
+  `snapVolumePct` + a `.vol` track gradient in `app.css`). Consequence: 91-109 % are not
+  selectable; 90 and 110 are. Everything else keeps the 5 % step. Shown as `NNN%` right of the slider
+  (the 34 px slot fits `500%`).
+- **Verified.** Unit tests (`effective_gain...`, `slider_detent_snaps_only_within_its_distance`,
+  `volume_boost_saturates...`, browser `volume: ...` x2); the slider itself in the widget gallery
+  inside the headless rig (new "Viewer volume" card: 40 % / 100 % / 500 %, a click at ~107 % lands on 100 %).
+  The real tile pill could not be shown: it only exists for a sharer with audio and the rig's
+  clients share none (no audio tests, `claude-instructions/testing-and-verification.md`).
+
 ## 2026-11-01: audio is delayed to match the video, dynamically
 
 User request: *"Make sure that the audio is delayed, to stay in sync with the video (dynamic as

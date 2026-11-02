@@ -234,7 +234,7 @@ unit tests build either mapping by hand):
   static "H.264, H.265, AV1"; it now offers H.265/AV1 only when GStreamer has `vah265enc`/`vaav1enc` (the VA plugin
   registers an encoder only for a profile the GPU's driver advertises), so a GPU without AV1 encode no longer shows
   an AV1 button that silently produced x264 H.264. A stored codec that is not encodable here is shown as H.264, the
-  stream's real codec, and stays stored. (The `ui.stream.codec_unsupported` locale key is now unused.)
+  stream's real codec, and stays stored.
 - **Settings > Presentation, fallback run.** When the surface lacks the stored present mode, `main` relaunches on Vsync
   for that run (`SSS_PRESENT_MODE_FALLBACK`). In that run the stored mode (`launch_presentation_mode`) does nothing,
   so it is hidden and Vsync is shown as selected; the stored value is kept and re-picking Vsync is no change
@@ -284,7 +284,7 @@ the next launch (`superdoc/features/presentation-modes.md`).
 
 Pop-out: the view sits in an `Arc<Mutex<VideoView>>` so the deferred viewport closure
 (`Send + Sync + 'static`) can paint the same view the tile would; while `popped` the tile
-shows a placeholder. The pop-out has hover-gated chrome (statbar, audio pill), F11
+shows a placeholder. The pop-out has hover-gated chrome (statbar, audio pill; volume 0-500 % with a snap at 100 %, task #96, `features/audio-sharing.md`), F11
 fullscreen, and Escape only *leaves* fullscreen, never closes (the former Electron viewer's
 rules, carried over; `superdoc/features/viewer-window.md`).
 

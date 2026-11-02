@@ -717,6 +717,12 @@ pub struct AudioWatch {
 /// yet".
 pub const DEFAULT_VOLUME_PERCENT: u32 = 100;
 
+/// Highest playback volume a viewer can set, percent (2026-11-02: raised
+/// from 200 to 500 on user request, to lift quiet sharers). Must equal
+/// [`decode::MAX_AUDIO_GAIN`] x 100 (a unit test pins it). Values stored
+/// before the raise (0-200) stay valid; anything above this is clamped.
+pub const MAX_VOLUME_PERCENT: u32 = 500;
+
 /// A viewer's volume/mute state for one sender's audio — what a tile's volume
 /// slider shows. See [`RoomSession::volume`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -736,7 +742,7 @@ impl Default for VolumeState {
 /// The gain actually handed to the audio decoder: `0.0` while muted,
 /// otherwise `volume_percent / 100`.
 pub fn effective_gain(volume_percent: u32, muted: bool) -> f64 {
-    if muted { 0.0 } else { volume_percent as f64 / 100.0 }
+    if muted { 0.0 } else { volume_percent.min(MAX_VOLUME_PERCENT) as f64 / 100.0 }
 }
 
 /// The `stream_id` of `owner`'s announced audio stream in `streams`, if any.
@@ -1061,7 +1067,7 @@ impl RoomSession {
         sibling_audio_stream_in(&self.streams, owner)
     }
 
-    /// Set playback volume (0-200%) and mute state for `owner`'s audio.
+    /// Set playback volume (0-500%, [`MAX_VOLUME_PERCENT`]) and mute state for `owner`'s audio.
     ///
     /// `stream_id` may be either the audio stream's own id *or* the id of the
     /// video stream the UI is showing for that sender. `Why accept both:`
@@ -1082,6 +1088,7 @@ impl RoomSession {
     /// flattened 0. The decoder itself still gets muted immediately
     /// ([`effective_gain`]).
     pub fn set_volume(&mut self, owner: ConnId, stream_id: StreamId, volume_percent: u32, muted: bool) {
+        let volume_percent = volume_percent.min(MAX_VOLUME_PERCENT);
         {
             let mut watches = self.audio_watches.lock().unwrap();
             let audio_stream_id =
@@ -4681,7 +4688,7 @@ impl AppState {
 
 /// Viewer-side audio.
 impl AppState {
-    /// Set `owner`'s playback volume (0-200%) and mute state in `room`.
+    /// Set `owner`'s playback volume (0-500%) and mute state in `room`.
     /// `stream_id` may be the audio stream's id or the video stream's — see
     /// [`RoomSession::set_volume`]. No-op for an unknown room.
     pub fn set_volume(&mut self, room: RoomHandle, owner: ConnId, stream_id: StreamId, volume_percent: u32, muted: bool) {
@@ -5424,7 +5431,10 @@ mod ui_ops_tests {
     #[test]
     fn effective_gain_is_zero_while_muted_otherwise_percent_over_100() {
         assert_eq!(effective_gain(100, false), 1.0);
-        assert_eq!(effective_gain(200, false), 2.0);
+        assert_eq!(effective_gain(200, false), 2.0, "pre-raise stored values stay valid");
+        assert_eq!(effective_gain(500, false), 5.0);
+        assert_eq!(effective_gain(9999, false), 5.0, "above the cap is clamped, never passed through");
+        assert_eq!(effective_gain(500, false), decode::MAX_AUDIO_GAIN, "UI cap and decoder cap agree");
         assert_eq!(effective_gain(40, false), 0.4);
         assert_eq!(effective_gain(40, true), 0.0, "muted silences the decoder regardless of the slider value");
     }

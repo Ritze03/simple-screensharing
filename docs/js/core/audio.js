@@ -2,7 +2,7 @@
 // stereo, 20 ms frames (opusenc defaults), 64 kbit/s; wire PTS in µs advancing 20 ms per packet, stamped with the
 // capture time on the sender's one clock (shared with its video, see avsync.js) so the receiver can delay audio to match the picture.
 //
-//   AudioReceiver  decrypted packets -> WebCodecs AudioDecoder -> WebAudio (gain: volume 0..2, mute)
+//   AudioReceiver  decrypted packets -> WebCodecs AudioDecoder -> WebAudio (gain: volume 0..5, mute)
 //   AudioSender    MediaStreamTrack -> WebCodecs AudioEncoder -> packets
 
 export const OPUS_SAMPLE_RATE = 48000;
@@ -10,7 +10,8 @@ export const OPUS_CHANNELS = 2;
 export const OPUS_FRAME_US = 20000;
 export const OPUS_BITRATE = 64000;
 
-export const MAX_VOLUME = 2; // 200 %
+// 500 %. A GainNode (HTMLMediaElement.volume would cap at 1). Above 1.0 loud audio clips at the device, the same hard clip as the native client; no limiter.
+export const MAX_VOLUME = 5;
 
 import { DelayController } from "./avsync.js";
 
@@ -24,7 +25,7 @@ export class AudioReceiver {
    * @param {AudioContext} o.context
    * @param {AudioNode} [o.destination]   defaults to context.destination
    * @param {number} [o.latencyMs=80]     playout delay used to absorb network jitter
-   * @param {number} [o.volume=1]         0..2
+   * @param {number} [o.volume=1]         0..5
    * @param {boolean} [o.muted=false]
    * @param {import("./avsync.js").AvSync} [o.avSync]  this sender's A/V sync state: audio is delayed to line up with its video
    * @param {() => number} [o.now]  local clock in ms for the sync floors (tests inject one)

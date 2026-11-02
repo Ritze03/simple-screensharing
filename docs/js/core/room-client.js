@@ -227,7 +227,7 @@ export class RoomClient extends EventTarget {
     this.subs = new Map(); // key -> RxStream (every subscribed concrete stream)
     this.avSyncs = new Map(); // owner hex -> AvSync (shared by that owner's video and audio receivers)
     this.subRefs = new Map(); // key -> Set of reasons ("watch:<key>", "follow:<key>")
-    this.volumes = new Map(); // audio key -> 0..2
+    this.volumes = new Map(); // audio key -> 0..5
     this.muted = new Map(); // audio key -> bool
     this.shares = [];
     this.reassembler = new Reassembler({ onDrop: (c, s) => this.#onFrameDropped(c, s) });
@@ -732,7 +732,7 @@ export class RoomClient extends EventTarget {
     return key;
   }
 
-  /** Playback volume, 0..2 (0-200 %). `key` may be a video stream (applies to its audio) or an audio stream. */
+  /** Playback volume, 0..5 (0-500 %). `key` may be a video stream (applies to its audio) or an audio stream. */
   setVolume(key, volume) {
     const a = this.#audioTarget(key);
     if (!a) return;
