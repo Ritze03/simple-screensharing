@@ -144,6 +144,10 @@ the viewer is the only one (a valve pause/resume), and one IDR goes to everybody
 | L2 | two silent L1 requests in one episode, or fed-but-nothing-decoded >= 3 s although keyframes arrive | reset the decoder pipeline (once per episode, >= 5 s apart) + L1 request |
 | L3 | a stream that was flowing (>= 10 frames, mean gap < 0.5 s, not flagged stalled) delivers nothing for 8 s *and* no other watched stream of the room did | reconnect the room now |
 
+- **A requested IDR can itself be the problem** (field case 2026-11-03, #102): a VA encoder under motion emits
+  IDRs of ~1 s of bitrate (~1000 fragments, almost never intact), each failure triggers the next request.
+  The sharer now squeezes and rate-paces such IDRs and skips their repeats: `features/stream-control.md`
+  "Big keyframes".
 - **Min 1.5 s between requests** (browser parity): a request cannot be answered faster than ~1.2 s, so
   asking sooner only multiplies keyframes. Silent failures back off 1.5 / 3 / 6 / 10 s so a dead sharer or
   path is not hammered. A request answered by an *incomplete* IDR is proof of life and restarts the

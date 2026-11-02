@@ -830,7 +830,8 @@ pump sends the forced IDR plus two more at +300 ms and +1 s
 relay-forwarded `KeyframeRequest`, a resume from pause): a viewer asking means it lost one.
 Rate cap: one such burst per `KEYFRAME_BURST_MIN_GAP` = 2 s per destination
 (`schedule_requested_repeats`); a request inside it is served by the burst under way. **Keyframe pacing:** a keyframe of 24+ datagrams is no longer sent back to back: the pump
-spreads it over min(60 ms, 4 frame periods) in chunks every 2 ms (`pace_plan`,
+spreads it over min(60 ms, 4 frame periods) in chunks every 2 ms (`pace_plan`; **since #102 by rate,
+see below**,
 `PreparedMedia::send`; delta frames and small keyframes still go out at once, the stall keepalive
 and a branch's proving IDR are unpaced). *Why:* #86's lab: quinn lets a ~256-packet burst out at
 once and a shallow bottleneck queue (50 ms at 8 Mbit/s) drops the tail of every IDR sent that way,
@@ -843,6 +844,100 @@ reassembler (`fragment.rs`) to drop duplicate fragments of an already completed 
 (the repeats above are separate frames with fresh nonces, so they need nothing there); a repeated
 fragment must also not be re-encrypted (a nonce is never reused), only re-sent. On a lossy link the one forced IDR is often lost and
 the viewer waited for the next GOP boundary (2 s) with a frozen picture.
+
+### Big keyframes: rate pacing, a squeezed IDR, no repeats (2026-11-03, #102)
+
+**Field case.** Sharer on Fedora + GNOME, RX 9070 XT (radeonsi), `vah264enc`, 1080p, 120 fps, 8300 kbps,
+H.264, Quality, 40 Mbit/s uplink; native viewer at 16-30 ms RTT. On big screen movement the viewer sat on
+"Recovering..." for 4.8 s, 30.6 s and 100 s. Its log: `a keyframe never completed (981/984 fragments
+arrived)` 295 times (IDRs of 400-985 datagrams, 0.5-1.2 MB, ~1 s of bitrate; a calm screen's IDR is 40 kB),
+`recovery L1` every ~1.5 s; relay -> viewer loss ~0.03 %, no relay eviction warnings, so the loss is on
+the sharer side.
+
+**Root cause (confirmed).** A frame is lost if *any* fragment is, so the survival chance falls with the
+fragment count: at 0.1 % loss only ~37 % of 984-fragment frames arrive, at 0.3 % ~5 % (and the relay ->
+viewer leg alone, 0.03 %, costs another ~26 %). Three things made it a loop instead of a hiccup:
+(1) the VA encoder, whose VBR does not honor its own limits (below), emits an IDR of ~1 s of bitrate whenever
+the picture is detailed and moving; (2) `pace_plan` spread any keyframe over at most 60 ms (33 ms at
+120 fps), i.e. 130-280 Mbit/s for such an IDR into a ~40 Mbit/s uplink, and a 1.18 MB IDR does not even fit
+quinn's 1 MiB datagram send buffer (which silently evicts the *oldest* queued datagrams, the front of the
+IDR); (3) every failed IDR made the viewer ask again (L1, Unsubscribe+Subscribe), and `schedule_requested_repeats`
+answered each ask with the IDR plus two repeats at +300 ms / +1 s, so ~3 MB of IDRs per request, each
+as unlikely to arrive whole as the last.
+
+**Encoder side: what radeonsi honors (measured on the dev machine's RX 7900 XTX, Mesa 26.2, GStreamer
+1.28.8, the client's exact `vah264enc` config, 1080p120, 8300 kbps).** Content: a 1920x1080 colored-noise
+texture scrolling 3 px/frame (P frames predict it, an IDR cannot: big IDR, tiny P, like game/video
+content) and a calm-then-moving clip (120 static frames, then 120 noisy ones).
+
+| setting | IDR sizes (kB) | verdict |
+|---|---|---|
+| VBR as shipped (`cpb-size` 3112) | 1004, 662, 236, 183 (scroll); 620 at the calm -> moving cut | no cap; the first IDR of a stream and the first frames after a calm stretch are the worst (the rate control has banked its budget) |
+| VBR, `cpb-size` 800 / 400 + `target-percentage` 70 | byte-identical / 295-620 | `cpb-size` is ignored under VBR |
+| VBR, `min-qp` 18-26 | 620 -> 421 (needs 30, which would soften every static screen) | not usable |
+| **CBR** | 54-240 (scroll), max delta frame 19 kB instead of 1.9 MB | caps frame size, but pads a static screen to ~4 Mbit/s (424 kbps under VBR): the "wastes bandwidth" the owner rejected in #88 |
+| VBR + any write of `bitrate` right before the forced IDR | 27-57 (even `bitrate * 0.99`), PSNR of that IDR -4..-6 dB on noisy detail, -2 dB on a static picture, no refinement within 12 frames on noise | what #102 uses |
+
+A write of the `bitrate` property restarts radeonsi's rate control (the encoder also emits one more IDR two
+frames later), and the IDR coded right after is 5-10x smaller. It is a driver quirk, not a documented
+contract; the squeeze is only armed on `EncoderBackend::Vaapi` and only when needed (below), and measured on
+radeonsi only (Intel iHD untested).
+
+**What changed (`client/src/capture.rs`).**
+
+- **`pace_plan` by rate.** A keyframe's window is `max(old window, bytes / (2.5 x configured bitrate))`, cap
+  `PACE_MAX_RATE_WINDOW` = 600 ms (1.18 MB at 8.3 Mbit/s: ~390 ms as chunked, 455 ms exactly). A *delta* frame is paced only when that
+  time exceeds two frame periods (> 5x an average frame; the 1.9 MB delta after a calm screen starts moving),
+  so ordinary deltas still go out at once. *Why:* the pump is held while pacing (the raw queue drops the
+  oldest raw frames meanwhile and `Stop` waits behind it, up to 600 ms), which is a price worth paying: a
+  screen share tolerates a keyframe that arrives 0.4 s late, not one that never arrives. The log line
+  `sending a keyframe of N datagrams (~X kB), paced over ~Y ms` (info, only >= 24 datagrams) is the field
+  diagnostic that was missing.
+- **`IdrControl`.** Natural keyframes (the encoder's own GOP ones) that exceed 1/4 s of bitrate (259 kB at
+  8.3 Mbit/s) mark the content *big* for 10 s. While big, every forced IDR (viewer request, resume, swap,
+  stalled-branch) is preceded by a write of 90 % of the real bitrate, written back when that keyframe leaves
+  the encoder (the write-back's own IDR two frames later is a free repeat, and is ignored for the "big"
+  decision for 1 s). A calm screen (IDR < 1/4 s) is never squeezed, so it keeps its quality. Log:
+  `the last keyframes were big; squeezing the encoder's bitrate for the forced one`.
+- **No explicit repeats while big.** The +300 ms / +1 s repeat IDRs (#97) are skipped (they tripled the burst);
+  small keyframes keep them (#101's numbers: a ~100-datagram IDR is lost often enough on a lossy path).
+- Not changed: the client's 1 MiB quinn datagram send buffer. With rate pacing the backlog stays below it
+  (the buffer drains at the congestion controller's rate; a 455 ms window at 2.5x bitrate adds < 0.7 MB);
+  the rig's IDRs (<= 700 kB) never came near it, the field's 1.18 MB would have.
+
+**Rig results** (headless rig, UDP impairment proxy between the sharer and the relay, H.264
+120 fps 8300 kbps Quality, the scrolling-noise pattern, random loss on the sharer -> relay leg, 100 s per run,
+"frozen" = the `grim` crop of the viewer tile did not change for 0.8 s; baseline = this commit without the
+change except for the log line):
+
+| sharer -> relay loss | build | `never completed` | L1 | frozen total / longest | keyframe size kB (median / max) | datagrams through the proxy (100 s) |
+|---|---|---|---|---|---|---|
+| 0.4 % | before | 80 | 47 | 39.0 s / 5.5 s | 275 / 709 | 109.8k |
+| 0.4 % | after (A) | 44 | 48 | 4.1 s / 1.7 s | 102 / 608 | 79.0k |
+| 0.4 % | after | 39 | 44 | 6.8 s / 2.3 s | 102 / 667 | 77.0k |
+| 0.4 % | after | 46 | 45 | 9.1 s / 3.6 s | 102 / 455 | 77.2k |
+| 0.2 % | before | 43 | 33 | 8.0 s / 1.7 s | 276 / 667 | 109.2k |
+| 0.2 % | after (A) | 26 | 33 | 3.8 s / 1.4 s | 135 / 668 | 87.4k |
+| 0.2 % | after | 22 | 29 | 0.0 s / 0.0 s | 179 / 455 | 83.5k |
+
+(A) = the first variant, where only the *last* natural keyframe decided "big" (no 10 s memory): with
+natural IDRs of 100-600 kB it switched the squeeze off right when a request needed it. One run per row;
+the loss is random, so single runs vary by a few seconds. Recovery times (`recovered, keyframe ... arrived N
+ms after the problem began`): 0.4 % median 1.2 s / max 6.8 s before, median 1.1-1.2 s / max 3.3-5.1 s after.
+
+A 40 Mbit/s / 20 Mbit/s tail-drop uplink (50-60 ms queue) showed no loss at all before or after: quinn's
+BBR already spreads the IDR at its bandwidth estimate, so the field loss is random loss times fragment
+count, not a bottleneck queue. The remaining `never completed` are the *natural* (unsqueezed) GOP IDRs,
+up to 600 kB here; the viewer recovers from them in ~1.2 s with a squeezed IDR. Making the natural ones
+small too would mean taking over the GOP (`key-int-max` large, the pump forcing every IDR through
+`IdrControl`); not done. The rig's IDRs (275 kB median) are smaller than the field's (1.18 MB), so the
+absolute numbers understate the field problem; the 30-100 s recoveries were not reproduced.
+
+**Browser sharer** (`docs/js/core`): no pacing and no repeats at all; `#sendMedia` writes every datagram of a
+frame into the WebTransport writer at once and drops *later* frames while more than `MAX_PENDING_DATAGRAMS`
+(400) are queued. Its IDR size is whatever the browser's WebCodecs encoder (`bitrateMode: "variable"`) emits;
+the same large-IDR / many-fragments arithmetic applies, but nothing here is as aggressive as the native
+60 ms burst + repeats, and there is no encoder knob equivalent to the `bitrate` write. Not changed.
 
 ### Audio watch teardown no longer holds the video lock (#97, latent)
 

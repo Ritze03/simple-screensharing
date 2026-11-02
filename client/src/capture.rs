@@ -3638,6 +3638,78 @@ fn force_keyframe(encoder_sink_pad: &gst::Pad) {
     }
 }
 
+/// A keyframe bigger than this many seconds of the configured bitrate counts
+/// as big ([`IdrControl`]): 1/4 s, i.e. ~260 kB (~215 datagrams) at 8.3 Mbit/s.
+const BIG_KEYFRAME_DIVISOR: u64 = 4;
+/// How long one big natural keyframe keeps [`IdrControl::big`] true. Natural
+/// IDRs vary a lot under motion (100-600 kB in the rig), so the latest one alone
+/// would switch the squeeze off right when the next request needs it.
+const BIG_KEYFRAME_MEMORY: Duration = Duration::from_secs(10);
+
+/// Size control for the IDRs a destination forces (#102): a viewer's request, a
+/// resume, a branch swap, the repeats.
+///
+/// `Why:` field case (Fedora/GNOME, RX 9070 XT, `vah264enc`, 1080p 120 fps
+/// 8300 kbps, 40 Mbit/s uplink): under motion the encoder emitted IDRs of
+/// 0.5-1.2 MB (400-985 datagrams, ~1 s of bitrate), the viewer almost never
+/// received all of them (`a keyframe never completed (981/984 fragments
+/// arrived)`, 295 times; each lost fragment loses the frame, and at 0.1 % loss
+/// only ~37 % of 984-fragment frames survive), and every failed one made it
+/// ask for another, so recoveries took 30-100 s. radeonsi's VBR ignores
+/// `cpb-size`, `target-percentage` and `min-qp` for an IDR (measured, table in
+/// `superdoc/features/stream-control.md` "Big keyframes": 620 kB IDR with
+/// `cpb-size` 800 or 3112, `min-qp=20`; CBR does cap it but pads a static
+/// screen to ~4 Mbit/s, which the owner rejected in #88). What does shrink it: *any* write of the
+/// `bitrate` property restarts the rate control, and the IDR coded right after
+/// is 5-10x smaller (27-57 kB instead of 105-650 kB; even `bitrate * 0.99`),
+/// at a lower quality (PSNR -4..-6 dB on noisy detail) until the next natural
+/// IDR. So: when the last natural keyframe was big, a forced IDR is preceded by
+/// a bitrate write of 90 % and the real bitrate is written back once that IDR
+/// came out ("big" = one natural keyframe in the last 10 s was). The write-back restarts the rate control again, which emits one
+/// more small IDR two frames later, i.e. a free repeat; the explicit repeats
+/// are skipped meanwhile ([`IdrControl::big`]). A calm screen (40 kB IDRs)
+/// never gets the quality hit.
+#[derive(Default)]
+struct IdrControl {
+    /// A natural keyframe was big until this instant.
+    big_until: Option<Instant>,
+    /// The encoder's `bitrate` is currently the squeezed value.
+    squeezed: bool,
+    /// Keyframes before this are the write-back's own, not natural ones.
+    settle_until: Option<Instant>,
+}
+
+impl IdrControl {
+    fn big(&self) -> bool {
+        self.big_until.is_some_and(|t| Instant::now() < t)
+    }
+
+    /// Forces an IDR on `branch`, squeezing the bitrate first when it is big.
+    fn force(&mut self, branch: &branch::EncodeBranch, runtime: &destination::SharedDestination) {
+        if self.big() && !self.squeezed && branch.backend() == EncoderBackend::Vaapi {
+            let kbps = runtime.lock().unwrap().params().bitrate_kbps;
+            tracing::info!("the last keyframes were big; squeezing the encoder's bitrate for the forced one");
+            branch.set_bitrate_kbps(kbps / 10 * 9);
+            self.squeezed = true;
+        }
+        if let Some(pad) = branch.keyframe_pad() {
+            force_keyframe(&pad);
+        }
+    }
+
+    /// A keyframe of `bytes` left the encoder: undo the squeeze, or learn
+    /// whether the natural ones are big.
+    fn on_keyframe(&mut self, branch: &branch::EncodeBranch, kbps: u32, bytes: usize, now: Instant) {
+        if self.squeezed {
+            branch.set_bitrate_kbps(kbps);
+            self.squeezed = false;
+            self.settle_until = Some(now + Duration::from_secs(1));
+        } else if self.settle_until.is_none_or(|t| now >= t) && bytes as u64 * 8 * BIG_KEYFRAME_DIVISOR > u64::from(kbps) * 1000 {
+            self.big_until = Some(now + BIG_KEYFRAME_MEMORY);
+        }
+    }
+}
+
 /// Sets [`ENCODER_VALVE_NAME`]'s `drop` property and immediately reads it
 /// back, warning loudly if it didn't actually take — a `GObject` property
 /// write is normally infallible/synchronous for a simple boolean like this,
@@ -3919,6 +3991,8 @@ async fn destination_pump(
     // Extra keyframes still to send after a swap, a recovery rebuild or the
     // start (#97): see [`destination::keyframe_repeat_schedule`].
     let mut keyframe_repeats: VecDeque<Instant> = destination::keyframe_repeat_schedule(Instant::now()).into_iter().collect();
+    // Size control of the IDRs this pump forces (#102).
+    let mut idr = IdrControl::default();
     // When the last repeat burst started, to rate-cap the ones viewers ask for.
     let mut last_keyframe_burst: Option<Instant> = Some(Instant::now());
     // Encoder-wedge recovery bookkeeping (#99): how many rebuilds of this
@@ -3949,15 +4023,21 @@ async fn destination_pump(
                             // instead of waiting out the rest of the GOP.
                             let was_stalled = runtime.lock().unwrap().is_stalled();
                             let prepared = send_encoded_sample(&client, stream_id, &sample, start, &runtime);
+                            let params = runtime.lock().unwrap().params();
+                            if let Ok(p) = &prepared
+                                && p.keyframe
+                                && let Some(b) = branch.as_ref()
+                            {
+                                idr.on_keyframe(b, params.bitrate_kbps, p.bytes(), Instant::now());
+                            }
                             if was_stalled
                                 && runtime.lock().unwrap().is_stalled()
-                                && let Some(pad) = branch.as_ref().and_then(|b| b.keyframe_pad())
+                                && let Some(b) = branch.as_ref()
                             {
-                                force_keyframe(&pad);
+                                idr.force(b, &runtime);
                             }
-                            let framerate = runtime.lock().unwrap().params().framerate;
                             let result = match prepared {
-                                Ok(prepared) => prepared.send(framerate).await,
+                                Ok(prepared) => prepared.send(params.framerate, params.bitrate_kbps).await,
                                 Err(e) => Err(e),
                             };
                             match result {
@@ -4071,8 +4151,9 @@ async fn destination_pump(
                     if !keyframe_repeats.is_empty() =>
                 {
                     keyframe_repeats.pop_front();
-                    if !paused && let Some(pad) = branch.as_ref().and_then(|b| b.keyframe_pad()) {
-                        force_keyframe(&pad);
+                    // Not for big keyframes (#102): repeats of a 1 MB IDR triple the burst.
+                    if !paused && !idr.big() && let Some(b) = branch.as_ref() {
+                        idr.force(b, &runtime);
                     }
                     continue;
                 }
@@ -4088,9 +4169,8 @@ async fn destination_pump(
                             // decoding deltas against a GOP it never got,
                             // and twice more later in case that one is lost
                             // on the way (#97).
-                            if let Some(pad) = new_branch.keyframe_pad() {
-                                force_keyframe(&pad);
-                            }
+                            idr.squeezed = false;
+                            idr.force(&new_branch, &runtime);
                             keyframe_repeats = destination::keyframe_repeat_schedule(Instant::now()).into_iter().collect();
                             last_keyframe_burst = Some(Instant::now());
                             if paused {
@@ -4170,9 +4250,7 @@ async fn destination_pump(
                     // Resuming after a pause means the first frame
                     // back out of the encoder must be a keyframe —
                     // nothing decodable was produced while paused.
-                    if let Some(pad) = branch.keyframe_pad() {
-                        force_keyframe(&pad);
-                    }
+                    idr.force(branch, &runtime);
                     destination::schedule_requested_repeats(&mut keyframe_repeats, &mut last_keyframe_burst, Instant::now());
                 }
             }
@@ -4189,9 +4267,7 @@ async fn destination_pump(
                         paused = false;
                         runtime.lock().unwrap().restart_silence_clock(Instant::now());
                     }
-                    if let Some(pad) = branch.keyframe_pad() {
-                        force_keyframe(&pad);
-                    }
+                    idr.force(branch, &runtime);
                     // A viewer asking for a keyframe means it lost one (an IDR
                     // is 100-300 datagrams and often arrives incomplete on a
                     // lossy link): two more at +300 ms / +1 s, rate-capped.
@@ -4201,6 +4277,7 @@ async fn destination_pump(
             DestCmd::SetBitrate(bitrate_kbps) => {
                 if let Some(branch) = branch.as_ref() {
                     branch.set_bitrate_kbps(bitrate_kbps);
+                    idr.squeezed = false;
                     runtime.lock().unwrap().set_bitrate(bitrate_kbps);
                 }
             }
@@ -4381,31 +4458,51 @@ struct PreparedMedia {
     keyframe: bool,
 }
 
-/// Datagram count from which a keyframe is paced (about 28 KB at 1.2 kB per
+/// Datagram count from which a frame is paced (about 28 KB at 1.2 kB per
 /// datagram); smaller frames go out at once, pacing them gains nothing.
 const PACE_MIN_DATAGRAMS: usize = 24;
-/// Longest a keyframe's datagrams are spread over.
+/// Least time a keyframe's datagrams are spread over (see [`pace_plan`]).
 const PACE_MAX_WINDOW: Duration = Duration::from_millis(60);
+/// Longest any frame is spread over: the pump is held that long and the
+/// capture drops frames meanwhile, and `Stop` waits behind it.
+const PACE_MAX_RATE_WINDOW: Duration = Duration::from_millis(600);
 /// Gap between two paced chunks.
 const PACE_STEP: Duration = Duration::from_millis(2);
 
-/// How to spread `count` datagrams of a frame: `Some((per_chunk, gap))`, or
-/// `None` to send them back to back.
+/// How to spread a frame of `count` datagrams / `bytes`: `Some((per_chunk, gap))`,
+/// or `None` to send them back to back.
 ///
 /// `Why (#86's lab):` quinn lets a ~256-packet burst out at once; a shallow
 /// bottleneck queue (50 ms at 8 Mbit/s) drops the tail of an IDR sent that way
 /// every time, and an IDR missing a fragment is not decodable at all. Spreading
 /// it over ~60 ms took 8 Mbit/s on a 50 ms queue from 0 to 58 decodable fps
-/// (BBR). Only keyframes are paced: delta frames are small, and the pump is
-/// held for as long as the pacing takes, so the window is also capped at
-/// four frame periods (60 fps: 60 ms, 240 fps: 16 ms).
-fn pace_plan(count: usize, keyframe: bool, framerate: u32) -> Option<(usize, Duration)> {
-    if !keyframe || count < PACE_MIN_DATAGRAMS {
+/// (BBR). That window is capped at four frame periods (60 fps: 60 ms, 240 fps:
+/// 16 ms).
+///
+/// `Why by rate too (#102):` a fixed 60 ms is 130 Mbit/s for the 1 MB IDR a VA
+/// encoder emits under motion at 8.3 Mbit/s (field case: 40 Mbit/s uplink, the
+/// IDR never arrived whole). The window is therefore at least the time `bytes`
+/// take at 2.5x the destination's configured bitrate, up to
+/// [`PACE_MAX_RATE_WINDOW`]; a delta frame is paced only when that time is over
+/// two frame periods, i.e. it is >5x the average frame (the 1.9 MB delta frame
+/// after a calm screen starts moving), so ordinary deltas still go out at once.
+/// The keyframe is merely delayed (~0.4 s for 1 MB at 8.3 Mbit/s), which a screen
+/// share tolerates; a lost one costs a 1.5 s recovery round.
+fn pace_plan(count: usize, bytes: usize, keyframe: bool, framerate: u32, bitrate_kbps: u32) -> Option<(usize, Duration)> {
+    if count < PACE_MIN_DATAGRAMS {
         return None;
     }
     let frame_period = Duration::from_micros(1_000_000 / u64::from(framerate.clamp(MIN_FRAMERATE, MAX_FRAMERATE)));
-    let window = PACE_MAX_WINDOW.min(frame_period * 4);
-    let steps = (window.as_micros() / PACE_STEP.as_micros()).max(1) as usize;
+    // bytes * 8 bit / (2.5 * kbps * 1000 bit/s), in microseconds.
+    let by_rate = Duration::from_micros(bytes as u64 * 3200 / u64::from(bitrate_kbps.max(1)));
+    let window = if keyframe {
+        PACE_MAX_WINDOW.min(frame_period * 4).max(by_rate)
+    } else if by_rate > frame_period * 2 {
+        by_rate
+    } else {
+        return None;
+    };
+    let steps = (window.min(PACE_MAX_RATE_WINDOW).as_micros() / PACE_STEP.as_micros()).max(1) as usize;
     if steps < 2 {
         return None;
     }
@@ -4422,10 +4519,25 @@ impl PreparedMedia {
         Ok(())
     }
 
-    /// Sends the frame, spreading a keyframe over up to [`PACE_MAX_WINDOW`]
-    /// ([`pace_plan`]).
-    async fn send(self, framerate: u32) -> Result<()> {
-        let Some((per_chunk, gap)) = pace_plan(self.datagrams.len(), self.keyframe, framerate) else {
+    fn bytes(&self) -> usize {
+        self.datagrams.iter().map(Vec::len).sum()
+    }
+
+    /// Sends the frame, spread out if [`pace_plan`] says so.
+    async fn send(self, framerate: u32, bitrate_kbps: u32) -> Result<()> {
+        let plan = pace_plan(self.datagrams.len(), self.bytes(), self.keyframe, framerate, bitrate_kbps);
+        if self.keyframe && self.datagrams.len() >= PACE_MIN_DATAGRAMS {
+            tracing::info!(
+                "sending a keyframe of {} datagrams (~{} kB), {}",
+                self.datagrams.len(),
+                self.bytes() / 1000,
+                plan.map_or("unpaced".to_string(), |(per_chunk, gap)| format!(
+                    "paced over ~{} ms",
+                    (self.datagrams.len().div_ceil(per_chunk) as u128 * gap.as_millis())
+                ))
+            );
+        }
+        let Some((per_chunk, gap)) = plan else {
             return self.send_now();
         };
         for (i, chunk) in self.datagrams.chunks(per_chunk).enumerate() {
@@ -5543,23 +5655,46 @@ pub mod destination {
             assert!(schedule_requested_repeats(&mut pending, &mut last, now + Duration::from_secs(2)));
         }
 
+        /// Time the chunks of a plan take on the wire (the last chunk goes out at once).
+        fn plan_window(count: usize, plan: (usize, Duration)) -> Duration {
+            plan.1 * (count.div_ceil(plan.0) as u32 - 1)
+        }
+
         #[test]
-        fn only_big_keyframes_are_paced_and_never_over_sixty_milliseconds() {
-            // Delta frames and small keyframes go out at once.
-            assert_eq!(pace_plan(300, false, 60), None);
-            assert_eq!(pace_plan(10, true, 60), None);
+        fn small_frames_and_ordinary_deltas_are_not_paced_and_small_keyframes_never_over_sixty_milliseconds() {
+            // Fewer than 24 datagrams, and ordinary deltas, go out at once.
+            assert_eq!(pace_plan(10, 12_000, true, 60, 8300), None);
+            assert_eq!(pace_plan(30, 36_000, false, 120, 8300), None);
+            // 100 Mbit/s: the rate window is negligible, so the old window rules.
             // A 240-datagram IDR at 60 fps: 30 chunks of 8 every 2 ms = 58 ms.
-            let (per_chunk, gap) = pace_plan(240, true, 60).unwrap();
+            let (per_chunk, gap) = pace_plan(240, 288_000, true, 60, 100_000).unwrap();
             assert_eq!((per_chunk, gap), (8, Duration::from_millis(2)));
             // The window shrinks with the frame period (240 fps: 4 x 4.1 ms).
-            let (per_chunk, gap) = pace_plan(240, true, 240).unwrap();
-            let chunks = 240usize.div_ceil(per_chunk);
-            assert!(gap * (chunks as u32 - 1) <= Duration::from_millis(17), "{chunks} chunks");
+            let plan = pace_plan(240, 288_000, true, 240, 100_000).unwrap();
+            assert!(plan_window(240, plan) <= Duration::from_millis(17), "{plan:?}");
             // Every datagram is covered: chunking never drops one.
             for count in [24, 25, 100, 301] {
-                let (per_chunk, _) = pace_plan(count, true, 30).unwrap();
+                let (per_chunk, _) = pace_plan(count, count * 1200, true, 30, 100_000).unwrap();
                 assert!(per_chunk * count.div_ceil(per_chunk) >= count);
             }
+        }
+
+        /// #102's field case: a 984-datagram (1.18 MB) IDR at 8300 kbps / 120 fps.
+        #[test]
+        fn a_big_keyframe_is_spread_by_rate_up_to_the_cap_and_a_huge_delta_frame_is_paced_too() {
+            // 1.18 MB at 2.5 x 8.3 Mbit/s = 455 ms (chunks of whole datagrams round the rate up: ~390 ms); the old fixed window was 33 ms = 280 Mbit/s.
+            let plan = pace_plan(984, 1_180_000, true, 120, 8300).unwrap();
+            let window = plan_window(984, plan);
+            assert!((Duration::from_millis(350)..=Duration::from_millis(500)).contains(&window), "{window:?}");
+            // Never longer than the cap, however big the frame or low the bitrate.
+            let plan = pace_plan(5000, 6_000_000, true, 120, 1000).unwrap();
+            assert!(plan_window(5000, plan) <= PACE_MAX_RATE_WINDOW, "{plan:?}");
+            // The 1.9 MB delta frame after a calm screen starts moving: paced; a 40 kB one is not.
+            assert!(pace_plan(1600, 1_900_000, false, 120, 8300).is_some());
+            assert_eq!(pace_plan(34, 40_000, false, 120, 8300), None);
+            // A keyframe whose rate window is shorter than the old one keeps the old one.
+            let plan = pace_plan(100, 100_000, true, 60, 8300).unwrap();
+            assert!(plan_window(100, plan) >= Duration::from_millis(45), "{plan:?}");
         }
 
         #[test]
