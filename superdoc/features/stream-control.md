@@ -761,16 +761,25 @@ inside an encode branch (`/branch_N` bin, see `is_source_side_error`) or whose t
 destination's problem (below), not a reason to restart the screen grab. The silence watchdog
 adds a second path: a `Stalled` destination's pump compares frames *offered to the branch* with
 frames *encoded* (`destination::stall_verdict`): offered > 0 and no output for 6 s is an
-**encoder wedge**, offered == 0 for 8 s is a **dead source** (`mark_lost`). The bus path is
-normally faster (immediate).
+**encoder wedge**, offered == 0 for 5 s is a **dead source** (`mark_lost`), but only for a source
+that keeps resending on a static screen (`CaptureErrors::silence_is_loss`: the portal's
+`pipewiresrc keepalive-time`); a source that is silent on a static screen by design (Windows)
+never restarts the capture from silence alone. The bus path is faster (immediate). Measured in the
+rig: `output transform 90` / `mode 1280x720` gave no bus error at all, only silence, so the silence
+path is the one that matters there; killing xdpw gave `target not found` on the bus at once.
 
 **Encoder wedge (per destination, in the pump).** Rebuild the branch with identical params via
 `swap_to_new_branch_with(.., SwapMode::Recovery)`: the destination stays `Stalled` (keepalive
 keeps the viewer's stream alive; `begin_rebuild` still refuses from `Stalled`), the old, stuck
 branch is removed in the background, the new one may fall back VA -> x264 (`add_branch_live`).
 Rebuilds at +0, +5 s, +15 s after the stall passes 6 s (`wedge_rebuild_backoff`); after
-`MAX_WEDGE_REBUILDS` = 3 and 10 s more, the destination is `Failed` (one-click Retry). Verified
-with an `LD_PRELOAD` fault on `vaEndPicture`.
+`MAX_WEDGE_REBUILDS` = 3 and 10 s more, the destination is `Failed`. The VA-to-x264 fallback no
+longer waits for the stuck dud branch to be removed (that was 5 s drain + up to 10 s teardown
+before the software branch even started): `add_branch_live_waiting` removes it in a spawned task.
+Verified with an `LD_PRELOAD` fault that hangs `vaEndPicture` on encode contexts only
+(`vaCreateConfig` entrypoint tracking, so the shared pre-tee `vapostproc` keeps working; a hang
+on every VA call kills the capture and shows up as a dead source instead): picture back about 14 s
+after the hang (3 s silence + 3 s stalled + 5 s for the VA dud to miss its IDR + the x264 branch).
 
 **Dead source (per capture, in the session): Option 1.** `AppState::poll_capture_recovery`
 (once per frame) sees `source_lost()` and starts a `CaptureRecovery` (`AppState::recoveries`):
@@ -788,10 +797,18 @@ announce with the same owner/kind/label, which their wanted-stream logic re-watc
 window, `RESUME_AFTER_STOP`). Destinations requested while recovering (a reconnected room,
 "Go live") are parked in `CaptureRecovery::deferred`.
 After the last attempt: every destination `Failed("capture lost: ...")`, its stream is stopped,
-the user gets a share error, and **Retry** (`retry_destination`) starts a fresh recovery
-(`recovery_gave_up` stops the per-frame loop from restarting it by itself). A **dismissed
+the user gets a share error, and `retry_destination` starts a fresh recovery
+(`recovery_gave_up` stops the per-frame loop from restarting it by itself). **The egui UI has no
+Retry button** (`retry_destination` is lib-only): the user stops sharing and shares again. A
+button would need a `UiAction` arm in `ui/apply.rs`. A **dismissed
 picker ends the recovery at once** (`SHARE_START_CANCELLED`): a picker is never looped blindly.
-A capture that dies again < 30 s after a recovery continues the backoff (`RECOVERY_RESET_AFTER`).
+A capture that dies again < 30 s after a recovery starts one schedule position later
+(`RECOVERY_RESET_AFTER`, `CaptureRecovery::start_pos`): a flapping source is slowed down, while a
+recovery that needed five tries is a long outage, not a flap, and does not count against the next.
+Measured in the rig (`output transform 90`, 60 fps H.265): the source is declared lost 5 s after
+the change, the restart takes ~0.1 s, and the viewer's picture moves again ~0.7 s later (wanted-stream
+re-watch worked every time), ~6 s of freeze in total. Killing xdpw: attempts at +0/+2/+5/+10/+30 s
+while the portal is down, recovered on the 5th when xdpw was started again (47 s).
 
 `Why Option 1 and not an in-place source restart (Option 2):` the pipeline, the tee and each
 destination's `StreamId` would survive and viewers would not even re-watch, but swapping the
@@ -809,7 +826,14 @@ RECOVERING. `ui/APP-SHELL.md`.
 
 After a branch swap (settings change or recovery rebuild) and when a destination starts, the
 pump sends the forced IDR plus two more at +300 ms and +1 s
-(`destination::keyframe_repeat_schedule`). On a lossy link the one forced IDR is often lost and
+(`destination::keyframe_repeat_schedule`). The same two repeats follow a viewer-asked IDR (a
+relay-forwarded `KeyframeRequest`, a resume from pause): a viewer asking means it lost one.
+Rate cap: one such burst per `KEYFRAME_BURST_MIN_GAP` = 2 s per destination
+(`schedule_requested_repeats`); a request inside it is served by the burst under way. Not done:
+sending the *same* IDR's datagrams several times back to back. It would need the viewer's
+reassembler (`fragment.rs`) to drop duplicate fragments of an already completed `frame_id`
+(the repeats above are separate frames with fresh nonces, so they need nothing there); a repeated
+fragment must also not be re-encrypted (a nonce is never reused), only re-sent. On a lossy link the one forced IDR is often lost and
 the viewer waited for the next GOP boundary (2 s) with a frozen picture.
 
 ### Audio watch teardown no longer holds the video lock (#97, latent)

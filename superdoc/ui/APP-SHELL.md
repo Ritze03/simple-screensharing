@@ -388,8 +388,9 @@ These were decided in the earlier UIs and are still the rules.
   (`recovering_tip`) carries the attempt number ("Attempt 2 of 5"), the countdown to the next
   attempt and the last error. Only a capture that actually has a recovery shows it: a plain
   `Stalled` destination (a few seconds of silence that heals itself) keeps the *Stalled* pill.
-  When the schedule is exhausted the destinations turn *Failed* with a share-error toast and the
-  existing Retry button restarts the recovery. The stream-settings modal's per-room rows still
+  When the schedule is exhausted the destinations turn *Failed* with a share-error toast; there
+  is no Retry button in the egui UI (`retry_destination` is lib-only), so the user stops sharing
+  and shares again. The stream-settings modal's per-room rows still
   use `dest_pill` (Stalled / Failed), not the recovering override.
 
 ## Saved-room identity (2026-10-14)

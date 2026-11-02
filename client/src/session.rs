@@ -1740,6 +1740,9 @@ pub struct CaptureRecovery {
     deferred: Vec<(RoomHandle, PendingRole, capture::destination::VideoParams)>,
     framerate: u32,
     restore_token: Option<String>,
+    /// The schedule position this recovery started at (0 unless the capture
+    /// died again soon after the previous recovery).
+    start_pos: u32,
 }
 
 enum RecoveryPhase {
@@ -3435,6 +3438,7 @@ impl AppState {
                     deferred: Vec::new(),
                     framerate,
                     restore_token,
+                    start_pos: attempt,
                 },
             );
             self.give_up_recovery(capture_id, reason);
@@ -3450,6 +3454,7 @@ impl AppState {
                 deferred: Vec::new(),
                 framerate,
                 restore_token,
+                start_pos: attempt,
             },
         );
     }
@@ -3572,7 +3577,10 @@ impl AppState {
             self.add_destination_with_params(capture_id, room, role, params);
         }
         tracing::info!("capture {capture_id:?}: recovered after {} attempt(s), {} ms", recovery.attempt, now.saturating_duration_since(recovery.since).as_millis());
-        self.recovery_history.insert(capture_id, (now, recovery.attempt));
+        // `Why `start_pos + 1` and not the attempts used (a recovery that needed
+        // five tries is a long outage, not a flapping source): only a capture
+        // that keeps dying right after a successful restart walks down the schedule.
+        self.recovery_history.insert(capture_id, (now, recovery.start_pos + 1));
     }
 
     /// Stop tracking a recovery (the capture is being stopped or dropped); a
@@ -5812,6 +5820,7 @@ mod ui_ops_tests {
                 deferred: Vec::new(),
                 framerate: 30,
                 restore_token: None,
+                start_pos: 0,
             },
         );
 
@@ -5856,6 +5865,7 @@ mod ui_ops_tests {
                 deferred: Vec::new(),
                 framerate: 30,
                 restore_token: None,
+                start_pos: 0,
             },
         );
         state.attempt_failed(capture_id, "picker dismissed".to_string(), true, t0);
@@ -5881,6 +5891,7 @@ mod ui_ops_tests {
                 deferred: Vec::new(),
                 framerate: 30,
                 restore_token: None,
+                start_pos: 0,
             },
         );
         state.add_destination_with_params(capture_id, RoomHandle(3), PendingRole::GoingLive, video_params());
@@ -5905,6 +5916,7 @@ mod ui_ops_tests {
                 deferred: Vec::new(),
                 framerate: 30,
                 restore_token: None,
+                start_pos: 0,
             },
         );
         let (_tx, rx) = oneshot::channel();

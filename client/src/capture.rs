@@ -1070,6 +1070,16 @@ impl CaptureSource {
     /// the only place in the pipeline that can plug the *upstream* half of
     /// the "static screen ⇒ frames stop entirely" bug (see
     /// [`build_pipeline`]'s doc comment for the downstream half).
+    /// See [`CaptureErrors::silence_is_loss`].
+    fn silence_means_lost(&self) -> bool {
+        match self {
+            #[cfg(unix)]
+            CaptureSource::Portal(_) => true,
+            #[allow(unreachable_patterns)]
+            _ => false,
+        }
+    }
+
     fn restore_token(&self) -> Option<String> {
         match self {
             #[cfg(unix)]
@@ -2742,7 +2752,7 @@ async fn start_capture_with_source(framerate: u32, capture_source: CaptureSource
         Some(bus) => bus,
         None => return Err(abandon_capture(pipeline, capture_source, anyhow!("pipeline has no bus")).await),
     };
-    let capture_errors = CaptureErrors::default();
+    let capture_errors = CaptureErrors { silence_is_loss: capture_source.silence_means_lost(), ..Default::default() };
     let capture_task = tokio::spawn(capture_loop(bus.stream(), capture_errors.clone()));
 
     Ok(CaptureHandle {
@@ -3764,6 +3774,13 @@ struct CaptureErrors {
     stopping: Arc<std::sync::atomic::AtomicBool>,
     /// Notified when the pipeline's EOS reached the bus after a requested stop.
     eos: Arc<tokio::sync::Notify>,
+    /// `true` when this capture's source resends its last frame while the
+    /// screen is static (`pipewiresrc keepalive-time`), so a branch that is
+    /// offered nothing for seconds means the source is dead, not idle. `false`
+    /// for sources that go silent on a static screen (Windows' DXGI duplication
+    /// delivers only on change): silence there is normal and must never restart
+    /// the capture.
+    silence_is_loss: bool,
 }
 
 impl CaptureErrors {
@@ -3902,6 +3919,8 @@ async fn destination_pump(
     // Extra keyframes still to send after a swap, a recovery rebuild or the
     // start (#97): see [`destination::keyframe_repeat_schedule`].
     let mut keyframe_repeats: VecDeque<Instant> = destination::keyframe_repeat_schedule(Instant::now()).into_iter().collect();
+    // When the last repeat burst started, to rate-cap the ones viewers ask for.
+    let mut last_keyframe_burst: Option<Instant> = Some(Instant::now());
     // Encoder-wedge recovery bookkeeping (#99): how many rebuilds of this
     // branch have been tried since the destination was last Live, and when
     // the last one started.
@@ -4008,6 +4027,8 @@ async fn destination_pump(
                             );
                             match verdict {
                                 destination::StallVerdict::Wait => {}
+                                // A source that is silent on a static screen by design (Windows): not a loss.
+                                destination::StallVerdict::SourceDead if !capture_errors.silence_is_loss => {}
                                 destination::StallVerdict::SourceDead => {
                                     if !declared_source_lost {
                                         declared_source_lost = true;
@@ -4066,6 +4087,7 @@ async fn destination_pump(
                                 force_keyframe(&pad);
                             }
                             keyframe_repeats = destination::keyframe_repeat_schedule(Instant::now()).into_iter().collect();
+                            last_keyframe_burst = Some(Instant::now());
                             if paused {
                                 // A replacement branch is born open; carry
                                 // the destination's paused state across.
@@ -4146,6 +4168,7 @@ async fn destination_pump(
                     if let Some(pad) = branch.keyframe_pad() {
                         force_keyframe(&pad);
                     }
+                    destination::schedule_requested_repeats(&mut keyframe_repeats, &mut last_keyframe_burst, Instant::now());
                 }
             }
             DestCmd::KeyframeRequest => {
@@ -4164,6 +4187,10 @@ async fn destination_pump(
                     if let Some(pad) = branch.keyframe_pad() {
                         force_keyframe(&pad);
                     }
+                    // A viewer asking for a keyframe means it lost one (an IDR
+                    // is 100-300 datagrams and often arrives incomplete on a
+                    // lossy link): two more at +300 ms / +1 s, rate-capped.
+                    destination::schedule_requested_repeats(&mut keyframe_repeats, &mut last_keyframe_burst, Instant::now());
                 }
             }
             DestCmd::SetBitrate(bitrate_kbps) => {
@@ -4504,14 +4531,35 @@ pub mod destination {
         KEYFRAME_REPEAT_OFFSETS.map(|offset| now + offset)
     }
 
+    /// Least time between two repeat bursts that were *asked for* by a viewer
+    /// (a relay-forwarded keyframe request, a resume from pause). Each repeat
+    /// is a whole IDR (100-300 datagrams), so a viewer that keeps asking, or
+    /// several viewers asking at once, must not turn recovery into a flood on
+    /// an already lossy or congested uplink. A swap or recovery rebuild always
+    /// gets its burst.
+    pub const KEYFRAME_BURST_MIN_GAP: Duration = Duration::from_secs(2);
+
+    /// Schedules the repeat keyframes for a viewer-requested IDR at `now`
+    /// unless a burst started less than [`KEYFRAME_BURST_MIN_GAP`] ago; returns
+    /// whether it did. `pending` is replaced, not extended: a second request
+    /// inside a burst's lifetime is served by the burst already under way.
+    pub fn schedule_requested_repeats(pending: &mut VecDeque<Instant>, last_burst: &mut Option<Instant>, now: Instant) -> bool {
+        if last_burst.is_some_and(|t| now.saturating_duration_since(t) < KEYFRAME_BURST_MIN_GAP) {
+            return false;
+        }
+        *pending = keyframe_repeat_schedule(now).into_iter().collect();
+        *last_burst = Some(now);
+        true
+    }
+
     /// A destination counts as an encoder wedge (frames reach the branch, none
     /// come out) once it has been `Stalled` this long, i.e. after about twice
     /// [`silence_threshold`]'s 3 s of silence: 6 s without an encoded frame.
     pub const WEDGE_REBUILD_AFTER_STALLED: Duration = Duration::from_secs(3);
     /// A stalled branch that is offered no frames at all (the source delivers
-    /// nothing) is declared a lost source this long into the stall (8 s of
+    /// nothing) is declared a lost source this long into the stall (5 s of
     /// silence). The bus error path usually gets there first and faster.
-    pub const SOURCE_LOST_AFTER_STALLED: Duration = Duration::from_secs(5);
+    pub const SOURCE_LOST_AFTER_STALLED: Duration = Duration::from_secs(2);
     /// Branch rebuilds tried for a wedged encoder before the destination is
     /// marked Failed (and offers the one-click retry).
     pub const MAX_WEDGE_REBUILDS: u32 = 3;
@@ -5403,6 +5451,18 @@ pub mod destination {
         }
 
         #[test]
+        fn requested_keyframe_repeats_are_rate_capped_to_one_burst_per_two_seconds() {
+            let now = t0();
+            let (mut pending, mut last) = (VecDeque::new(), None);
+            assert!(schedule_requested_repeats(&mut pending, &mut last, now), "the first request gets its burst");
+            assert_eq!(pending.len(), 2);
+            let before = pending.clone();
+            assert!(!schedule_requested_repeats(&mut pending, &mut last, now + Duration::from_millis(1900)));
+            assert_eq!(pending, before, "a request inside the cap is served by the burst under way");
+            assert!(schedule_requested_repeats(&mut pending, &mut last, now + Duration::from_secs(2)));
+        }
+
+        #[test]
         fn a_silent_branch_that_is_offered_frames_is_an_encoder_wedge_after_six_seconds_of_silence() {
             let s = |n| Duration::from_secs(n);
             // Frames arrive, nothing comes out: wait out the stall's first 3 s, then rebuild at once.
@@ -5421,8 +5481,8 @@ pub mod destination {
         #[test]
         fn a_branch_offered_nothing_means_a_dead_source_not_a_branch_rebuild() {
             let s = |n| Duration::from_secs(n);
-            assert_eq!(stall_verdict(s(4), Some(0), 0, None), StallVerdict::Wait);
-            assert_eq!(stall_verdict(s(5), Some(0), 0, None), StallVerdict::SourceDead);
+            assert_eq!(stall_verdict(s(1), Some(0), 0, None), StallVerdict::Wait);
+            assert_eq!(stall_verdict(s(2), Some(0), 0, None), StallVerdict::SourceDead);
             // Not known yet (window too short): never act on a guess.
             assert_eq!(stall_verdict(s(60), None, 0, None), StallVerdict::Wait);
         }
@@ -6795,9 +6855,19 @@ pub mod branch {
             Ok(sample) => Ok((branch, sample)),
             Err(e) if settings.backend == EncoderBackend::Vaapi => {
                 tracing::warn!("VAAPI encode branch {id:?} produced no IDR ({e:#}); retrying on software");
-                // Drain/remove the dud before building its replacement, so a
-                // failed attempt never leaves an orphan branch on the tee.
-                let _ = remove_branch(pipeline, tee, branch).await;
+                // Remove the dud so a failed attempt never leaves an orphan
+                // branch on the tee, but do not wait for it: a dud whose encoder
+                // is stuck in the driver takes the whole drain (5 s) plus the
+                // teardown bound (10 s) to remove, and the replacement does not
+                // depend on it (its own tee pad, its own bin). Waiting made a
+                // wedged hardware encoder cost ~15 s before the software
+                // fallback even started (#99).
+                {
+                    let (pipeline, tee) = (pipeline.clone(), tee.clone());
+                    tokio::spawn(async move {
+                        let _ = remove_branch(&pipeline, &tee, branch).await;
+                    });
+                }
                 let mut fallback =
                     construct_branch_bounded(pipeline, tee, id, EncodeSettings { backend: EncoderBackend::Software, ..settings })
                         .await
