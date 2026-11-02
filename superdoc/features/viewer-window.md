@@ -15,7 +15,7 @@ stream** (`StreamKey = (RoomHandle, ConnId, StreamId)`), re-declared every frame
   (`paint(ui, ui.max_rect(), Fit::Contain)`), so GPU textures and the decoder are shared and the tile
   shows a placeholder while popped (`VideoViews`' `popped` flag, `ui/video.rs`).
 - **Hover chrome** (the former Electron `body:hover` rule, no idle timeout): while the pointer is anywhere in
-  the window a vignette, a top row `[statbar][x]` and a bottom audio pill (`[mute][slider 0-200 %][%]`,
+  the window a vignette, a top row `[statbar][x]` and a bottom audio pill (`[mute][slider 0-500 %, snaps at 100 %][%]`,
   or "No audio shared") appear. Statbar = `[dot][name . room][WxH][decoded/presented fps][bitrate]`
   in fixed tabular-width fields. A "waiting"/"stalled" chip is always shown (not hover-gated). The
   chrome data is refreshed by the main window at most 4x a second into a `Shared` struct, and
