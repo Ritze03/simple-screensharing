@@ -219,6 +219,7 @@ fn feed(mut decoders: Vec<StreamDecoder>, aus: Vec<AccessUnit>, fps: u32, stop: 
                     pts: au.pts_us + round * loop_us,
                     keyframe: au.keyframe,
                     stalled: false,
+                    loss: Default::default(),
                     payload: au.data.clone(),
                 });
             }

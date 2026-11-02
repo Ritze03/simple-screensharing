@@ -191,6 +191,7 @@ fn run_pass(dec: &mut StreamDecoder, aus: &[AccessUnit]) -> Result<PassResult> {
             pts: au.pts_us,
             keyframe: au.keyframe,
             stalled: false,
+            loss: Default::default(),
             payload: au.data.clone(),
         });
         fed += 1;

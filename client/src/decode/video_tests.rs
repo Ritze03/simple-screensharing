@@ -414,3 +414,60 @@ fn visible_rect_prefers_the_decoder_crop_then_the_announced_size() {
     assert_eq!(visible_rect(None, Some((1280, 720)), 1920, 1080), (0, 0, 1920, 1080));
     assert_eq!(visible_rect(None, Some((0, 0)), 1920, 1082), (0, 0, 1920, 1082));
 }
+
+/// Viewer recovery L2 (`Worker::reset`): the pipeline is torn down, deltas are held until a
+/// keyframe, and the keyframe builds a fresh pipeline that decodes again. The flag the
+/// recovery state machine reads (`Shared::needs_keyframe`) follows along.
+#[test]
+fn reset_waits_for_a_keyframe_and_then_decodes_again() {
+    let Some(aus) = clip(VideoCodec::H264, 40, 10) else { return };
+    gstreamer::init().unwrap();
+    let shared = Shared::new();
+    let mut worker = Worker::new(shared.clone(), true);
+    for au in aus.iter().take(5) {
+        worker.handle_access_unit(au.pts_us, au.keyframe, au.data.clone());
+    }
+    assert!(wait_for(10, || shared.decoded_total() >= 3), "nothing decoded before the reset");
+    assert!(!shared.needs_keyframe());
+
+    worker.reset();
+    assert!(shared.needs_keyframe(), "after a reset the decoder cannot continue without an IDR");
+    assert!(worker.backend().is_none(), "the pipeline is rebuilt by the next keyframe, not at reset time");
+    let base = shared.decoded_total();
+    for au in aus.iter().skip(5).take(4) {
+        assert!(!au.keyframe);
+        worker.handle_access_unit(au.pts_us, au.keyframe, au.data.clone());
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(shared.decoded_total(), base, "deltas must be held while a keyframe is missing");
+
+    let key = aus.iter().position(|a| a.keyframe && a.pts_us > aus[5].pts_us).expect("a later keyframe");
+    for au in aus.iter().skip(key).take(6) {
+        worker.handle_access_unit(au.pts_us, au.keyframe, au.data.clone());
+    }
+    assert!(!shared.needs_keyframe());
+    assert!(wait_for(10, || shared.decoded_total() >= base + 4), "the keyframe did not restart decoding");
+}
+
+/// The other bitstream family (Annex-B vs OBU) is never fed to a running decoder: after a codec
+/// switch to/from AV1 whose keyframe was lost, deltas are held and the recovery asks for a keyframe.
+#[test]
+fn deltas_of_the_other_bitstream_family_are_held_until_a_keyframe() {
+    let Some(h264) = clip(VideoCodec::H264, 12, 10) else { return };
+    gstreamer::init().unwrap();
+    let shared = Shared::new();
+    let mut worker = Worker::new(shared.clone(), true);
+    for au in h264.iter().take(4) {
+        worker.handle_access_unit(au.pts_us, au.keyframe, au.data.clone());
+    }
+    assert!(wait_for(10, || shared.decoded_total() >= 2));
+    assert!(!shared.needs_keyframe());
+    // An AV1-looking delta (a temporal delimiter OBU, first byte non-zero).
+    worker.handle_access_unit(1_000_000, false, vec![0x12, 0x00, 0x32, 0x01, 0x00]);
+    assert!(shared.needs_keyframe(), "the wrong family must not reach the decoder");
+    // Even this decoder's own deltas are held now, until its next keyframe.
+    let base = shared.decoded_total();
+    worker.handle_access_unit(h264[4].pts_us, false, h264[4].data.clone());
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(shared.decoded_total(), base);
+}

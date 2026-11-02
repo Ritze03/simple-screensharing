@@ -140,7 +140,7 @@ the viewer is the only one (a valve pause/resume), and one IDR goes to everybody
 
 | Level | Trigger | Action |
 |---|---|---|
-| L1 | a keyframe arrived incomplete or was dropped at the ingest channel; a lost delta early enough in the GOP; an arrival gap >= 0.5 s on a flowing stream (>= 1 s: always); fed-but-nothing-decoded >= 1 s; the decoder thread wants a keyframe | Unsubscribe+Subscribe |
+| L1 | a keyframe arrived incomplete or was dropped at the ingest channel; a burst of >= 3 incomplete delta frames within 1 s, early enough in the GOP for the request to beat the scheduled IDR; an arrival gap >= 0.5 s on a flowing stream (>= 1 s: always); fed-but-nothing-decoded >= 1 s; the decoder thread wants a keyframe | Unsubscribe+Subscribe |
 | L2 | two silent L1 requests in one episode, or fed-but-nothing-decoded >= 3 s although keyframes arrive | reset the decoder pipeline (once per episode, >= 5 s apart) + L1 request |
 | L3 | a stream that was flowing (>= 10 frames, mean gap < 0.5 s, not flagged stalled) delivers nothing for 8 s *and* no other watched stream of the room did | reconnect the room now |
 
@@ -148,7 +148,7 @@ the viewer is the only one (a valve pause/resume), and one IDR goes to everybody
   asking sooner only multiplies keyframes. Silent failures back off 1.5 / 3 / 6 / 10 s so a dead sharer or
   path is not hammered. A request answered by an *incomplete* IDR is proof of life and restarts the
   backoff (a ~100-fragment IDR is intact only ~37 % of the time at 1 % loss).
-- **A lost delta asks only if the request beats the scheduled IDR**: it costs ~1.3 s, the observed keyframe
+- **Delta loss asks only for a burst (>= 3 incomplete frames within 1 s) and only if the request beats the scheduled IDR**: a single lost delta is a local artifact and asking for each one only multiplied keyframes in the A/B runs; a request costs ~1.3 s, the observed keyframe
   interval is ~2 s, so a delta lost 1.5 s into the GOP is healed sooner by waiting. These asks use a
   backoff that is *not* reset by each recovery (only by 10 s without evidence): the first rig run, which
   asked at the maximum rate, became a permanent keyframe storm on a link that keeps losing frames (the
@@ -180,9 +180,35 @@ displayed, never acted on). The tile shows an always-visible centred chip ("Reco
 stalled", amber dot) and the hover statbar's dot turns amber; the pop-out shows the same chip and wording.
 Keys `video.recovering`, `video.sharer_stalled`.
 
-**Measurements** (headless rig, lossy proxy between each client and the relay, H.265 60 fps 6 Mbit, loss 0.5 %
-per leg = ~1 % media path, +20 ms each way, 12 random live fps/codec edits, same seed): see "Rig results" below
-(filled in with the numbers of the final run).
+**Rig results** (headless rig, a UDP impairment proxy between each client and the relay, H.265 60 fps 6 Mbit to
+start, +20 ms each way, 12 random live fps/codec edits 12 s apart; "freeze" = the `grim` crop of the viewer tile
+did not change for 0.8 s, so it counts corrupt-but-moving as moving; A/B = the same binary with and without
+`SSS_DISABLE_VIEWER_RECOVERY=1`, same seed; evidence in the task scratchpad `evidence-101/`):
+
+| link / transport | recovery | total freeze | freezes | longest | transitions >= 4 s | L1 requests |
+|---|---|---|---|---|---|---|
+| 1 % path loss, Cubic (before #86/#100) | on | 62.6 s | 21 | 7.7 s | 4 of 12 | 85 (max-rate asking) |
+| same | off | 43.2 s | 18 | 5.7 s | 3 of 12 | - |
+| 0.5 % path loss, Cubic | on / off | 35.6 s / 34.2 s | 20 / 16 | 3.9 s / 3.8 s | 0 / 0 | 38 |
+| 1 % path loss, BBR + IDR repeats/pacing (#86/#100) | on | 18.2 s | 10 | 1.9 s | 0 of 12 | 23 |
+| same | off | 27.3 s | 14 | 3.4 s | 0 of 12 | - |
+| 0.5 % path loss, BBR + IDR repeats/pacing | on / off | 24.8 s / 30.4 s | 14 / 18 | 2.4 s / 2.2 s | 0 / 0 | 22 |
+
+What the numbers say: (1) **under Cubic recovery changed nothing measurable** (and the first, gating design was
+much worse, see above), because the keyframes it asked for were themselves being destroyed: the new log line
+`a keyframe never completed (N/M fragments arrived)` showed IDRs of only 6-19 fragments missing 15-30 % of their
+fragments (random loss would miss <0.2): the congestion controller, reacting to random loss, paced/queued the IDR
+burst and the datagram send buffer dropped part of it. (2) **With BBR and the IDR repeats the remaining lost IDRs
+miss exactly one fragment** (`17/18, 7/8, 10/11, 25/26 ...`, i.e. plain random loss), a request is usually answered
+(median ~1.2 s, 1.5 s minimum between requests, measured min gap 1.5 s), and recovery now helps (-33 % total
+freeze at 1 %, longest 3.4 -> 1.9 s; at 0.5 % -17 %, within noise of one run each). (3) Clean link, 5 min H.265
+144 fps 6 Mbit: **0** requests, 0 incomplete keyframes, 0 freezes. (4) 5 s blackout of the viewer's leg: the picture
+is back ~2.0 s after the path returns with or without recovery (that is QUIC probe backoff, a transport matter).
+(5) 10 s black hole: L3 fired **8.05 s** after the path died (`recovery L3`), the room reconnected and the tile
+was moving 1.4 s after the path returned; without L3 the viewer waits for the QUIC idle timeout (20 s after #86).
+(6) The sharer's branch sees the unsubscribe+subscribe as `0 subscribers` / `has a subscriber again` 60 µs apart:
+no measurable stall; with a second viewer the count never reaches 0 (relay `Subscribe`: `newly_added` still
+sends the `KeyframeRequest`), and the requested IDR is delivered to everybody watching.
 
 ## Native display (`client/src/decode/render.rs` + `render.wgsl`)
 
