@@ -1081,11 +1081,18 @@ fn my_card(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSourceId, destin
         widgets::paint_hatch(ui.painter(), thumb, thumb_radius(), 8.0, theme::ELEV_19, theme::ELEV_14);
         thumb_placeholder(ui, thumb, "cast", theme::SUCCESS, &tr("ui.room.my_screen", "Your screen"));
     }
-    let chip = match cx.destination_state(c, d) {
-        DestinationState::Live | DestinationState::Rebuilding { .. } => "LIVE".to_owned(),
-        DestinationState::Starting => tr("ui.room.chip_starting", "STARTING"),
-        DestinationState::Stalled { .. } => tr("ui.room.chip_stalled", "STALLED"),
-        DestinationState::Failed(_) => tr("ui.room.chip_failed", "FAILED"),
+    // The capture's source died and is being restarted (#99).
+    let recovering = cx.state.recovery(capture).is_some()
+        && matches!(cx.destination_state(c, d), DestinationState::Live | DestinationState::Stalled { .. } | DestinationState::Failed(_));
+    let chip = if recovering {
+        tr("ui.room.chip_recovering", "RECOVERING")
+    } else {
+        match cx.destination_state(c, d) {
+            DestinationState::Live | DestinationState::Rebuilding { .. } => "LIVE".to_owned(),
+            DestinationState::Starting => tr("ui.room.chip_starting", "STARTING"),
+            DestinationState::Stalled { .. } => tr("ui.room.chip_stalled", "STALLED"),
+            DestinationState::Failed(_) => tr("ui.room.chip_failed", "FAILED"),
+        }
     };
     thumb_corners(ui, thumb, Some(&chip), false);
     if live_tex.is_some() {

@@ -50,6 +50,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -64,7 +65,9 @@ use crate::protocol::{
     MediaHeader, Member, PresenceEvent, PreviewHeader, RejectReason, RelayToClient, RoomId,
     STREAM_TYPE_PREVIEW, StreamId, StreamInfo, clamp_utf8, decode_payload, encode_frame,
 };
-use crate::room::{ConnState, Registry, RoomState, StreamRoute, StreamState, TransportKind};
+use crate::room::{
+    ConnState, Registry, RoomState, RouteTarget, StreamRoute, StreamState, TransportKind,
+};
 
 /// ALPN of the native transport (raw QUIC). Browsers negotiate `h3` instead
 /// ([`crate::protocol::WEBTRANSPORT_ALPN`]).
@@ -140,6 +143,7 @@ async fn media_forward_task(
     mut media_rx: mpsc::Receiver<MediaFragment>,
 ) {
     let mut routes: HashMap<StreamId, Arc<StreamRoute>> = HashMap::new();
+    let mut evictions: HashMap<ConnId, EvictionLog> = HashMap::new();
     loop {
         // `biased` so route updates are applied ahead of queued media:
         // a stream must be registered before its fragments can route, and
@@ -171,8 +175,20 @@ async fn media_forward_task(
                     .bytes_received
                     .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 for target in route.targets().iter() {
+                    // quinn's `send_datagram` never fails when the queue is
+                    // full: it silently discards the oldest unsent datagrams.
+                    // Check the free space first so those losses are counted
+                    // (and logged, rate-limited) instead of invisible.
+                    let evicts = target.connection.datagram_send_buffer_space() < data.len();
                     match target.connection.send_datagram(data.clone()) {
-                        Ok(()) => registry.bandwidth.add_tx(data.len() as u64),
+                        Ok(()) => {
+                            registry.bandwidth.add_tx(data.len() as u64);
+                            registry.datagrams_forwarded.fetch_add(1, Ordering::Relaxed);
+                            if evicts {
+                                registry.datagrams_evicting.fetch_add(1, Ordering::Relaxed);
+                                note_eviction(&mut evictions, target);
+                            }
+                        }
                         Err(e) => tracing::trace!(
                             "dropping forwarded datagram to {:016x}: {e}",
                             target.conn_id
@@ -182,6 +198,71 @@ async fn media_forward_task(
             }
         }
     }
+}
+
+/// How often, per viewer, the relay logs that its send queue is evicting
+/// datagrams (see [`note_eviction`]).
+const EVICTION_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Per-viewer tally of datagrams forwarded into a full quinn send queue.
+struct EvictionLog {
+    since: Instant,
+    count: u64,
+}
+
+/// Record that forwarding to `target` evicted older unsent datagrams, and
+/// log a summary at most every [`EVICTION_LOG_INTERVAL`] per viewer.
+///
+/// Why this exists: quinn's datagram queue (`datagram_send_buffer_size`)
+/// fills when the path to a viewer cannot carry the stream (congestion
+/// window shrunk after loss, viewer link slower than the stream). The oldest
+/// queued datagrams are then dropped silently, which looks like packet loss
+/// to the viewer but never shows up in any socket or NIC counter. The line
+/// carries the path stats that tell the two causes apart: `lost_packets` and
+/// `congestion_events` rising means real path loss; a small `cwnd` next to a
+/// high rtt means the congestion controller is the bottleneck.
+fn note_eviction(log: &mut HashMap<ConnId, EvictionLog>, target: &RouteTarget) {
+    let entry = log.entry(target.conn_id).or_insert_with(|| EvictionLog {
+        since: Instant::now(),
+        count: 0,
+    });
+    entry.count += 1;
+    if entry.since.elapsed() < EVICTION_LOG_INTERVAL {
+        return;
+    }
+    let quic: &quinn::Connection = &target.connection;
+    let s = quic.stats();
+    let rtt = quic.rtt();
+    tracing::info!(
+        viewer = format!("{:016x}", target.conn_id),
+        evicted_in_window = entry.count,
+        window_ms = entry.since.elapsed().as_millis() as u64,
+        rtt_ms = rtt.as_millis() as u64,
+        cwnd = s.path.cwnd,
+        lost_packets = s.path.lost_packets,
+        sent_packets = s.path.sent_packets,
+        congestion_events = s.path.congestion_events,
+        "viewer send queue full: evicting queued media datagrams"
+    );
+    entry.since = Instant::now();
+    entry.count = 0;
+}
+
+/// One summary line per connection when it ends: what the path to that
+/// peer looked like over the whole session (lost vs. sent packets).
+fn log_connection_summary(conn_id: ConnId, connection: &Session) {
+    let quic: &quinn::Connection = connection;
+    let s = quic.stats();
+    let rtt = quic.rtt();
+    tracing::info!(
+        conn_id = format!("{conn_id:016x}"),
+        sent_packets = s.path.sent_packets,
+        lost_packets = s.path.lost_packets,
+        congestion_events = s.path.congestion_events,
+        rtt_ms = rtt.as_millis() as u64,
+        mtu = s.path.current_mtu,
+        "connection path stats"
+    );
 }
 
 /// Bind a QUIC endpoint on `listen_addr` with a throwaway in-memory
@@ -254,6 +335,14 @@ pub fn start(
         .local_addr()
         .context("reading bound local address")?;
     registry.set_cert_info(certs.info());
+    let tuning = certs.tuning();
+    tracing::info!(
+        cc = ?tuning.cc,
+        datagram_send_buffer = tuning.datagram_send_buffer,
+        max_idle_s = tuning.max_idle.as_secs(),
+        keep_alive_s = tuning.keep_alive.as_secs(),
+        "QUIC transport tuning (SSSHARE_CC / SSSHARE_DGRAM_BUF_KB override)"
+    );
     tracing::info!(
         %local_addr,
         cert_hash = %crate::protocol::encode_cert_hash(&certs.info().hash),
@@ -664,6 +753,7 @@ async fn handle_connection(registry: Arc<Registry>, incoming: quinn::Incoming) -
     drop(media_tx);
     drop(route_tx);
     let _ = forwarder.await;
+    log_connection_summary(conn_id, &connection);
 
     // Cleanup: remove from room, drop owned streams, unregister
     // subscriptions elsewhere, broadcast MemberLeft.
@@ -1165,6 +1255,12 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn insecure_client_endpoint() -> Endpoint {
+        insecure_client_endpoint_with(None)
+    }
+
+    /// [`insecure_client_endpoint`] with an optional transport config (the
+    /// transport lab mirrors the native client's `net.rs` settings this way).
+    pub(crate) fn insecure_client_endpoint_with(transport: Option<quinn::TransportConfig>) -> Endpoint {
         let mut endpoint = Endpoint::client((IpAddr::V4(Ipv4Addr::LOCALHOST), 0).into())
             .expect("bind client endpoint");
         let mut crypto = rustls::ClientConfig::builder()
@@ -1174,7 +1270,11 @@ pub(crate) mod tests {
         crypto.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
         let quic_crypto =
             quinn::crypto::rustls::QuicClientConfig::try_from(crypto).expect("adapt client crypto");
-        endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic_crypto)));
+        let mut config = quinn::ClientConfig::new(Arc::new(quic_crypto));
+        if let Some(t) = transport {
+            config.transport_config(Arc::new(t));
+        }
+        endpoint.set_default_client_config(config);
         endpoint
     }
 
