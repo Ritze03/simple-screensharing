@@ -343,6 +343,13 @@ impl RoomState {
 pub struct Registry {
     pub rooms: RwLock<HashMap<RoomId, Arc<Mutex<RoomState>>>>,
     pub bandwidth: ByteCounters,
+    /// Media datagrams that were forwarded into a subscriber's quinn send
+    /// queue, and how many of those had to evict older, still-unsent
+    /// datagrams to fit (queue full because the path to that viewer is
+    /// congested or slower than the stream). Process-wide; per-viewer detail
+    /// goes to the log (`relay::note_eviction`).
+    pub datagrams_forwarded: AtomicU64,
+    pub datagrams_evicting: AtomicU64,
     pub started_at: std::time::Instant,
     pub listen_addr: std::net::SocketAddr,
     /// Currently open connections that finished the QUIC handshake, by
@@ -359,6 +366,8 @@ impl Registry {
         Self {
             rooms: RwLock::new(HashMap::new()),
             bandwidth: ByteCounters::default(),
+            datagrams_forwarded: AtomicU64::new(0),
+            datagrams_evicting: AtomicU64::new(0),
             started_at: std::time::Instant::now(),
             listen_addr,
             native_connections: Default::default(),

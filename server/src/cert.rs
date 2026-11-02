@@ -41,6 +41,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 use crate::protocol::{CertHash, NATIVE_ALPN, WEBTRANSPORT_ALPN, cert_hash_of_der};
 use crate::room::Registry;
+use crate::transport::TransportTuning;
 
 /// Validity of a generated cert. Browsers refuse anything over 14 days; 13
 /// leaves a day of slack (the cert is also back-dated, see [`CLOCK_SKEW`]).
@@ -112,6 +113,9 @@ struct Material {
 pub struct CertManager {
     source: CertSource,
     current: std::sync::Mutex<Material>,
+    /// Transport settings baked into every `quinn::ServerConfig` this manager
+    /// builds (also the rotated ones), see `transport.rs`.
+    tuning: std::sync::Mutex<TransportTuning>,
 }
 
 impl CertManager {
@@ -120,6 +124,7 @@ impl CertManager {
         Ok(Arc::new(Self {
             source,
             current: std::sync::Mutex::new(material),
+            tuning: std::sync::Mutex::new(TransportTuning::from_env()),
         }))
     }
 
@@ -131,7 +136,20 @@ impl CertManager {
     /// (browsers) and `ssshare/1` (native), see `relay::handle_connection`.
     pub fn server_config(&self) -> Result<quinn::ServerConfig> {
         let m = self.current.lock().unwrap();
-        build_server_config(m.chain.clone(), m.key.clone_key())
+        let tuning = self.tuning.lock().unwrap().clone();
+        build_server_config(m.chain.clone(), m.key.clone_key(), &tuning)
+    }
+
+    /// Replace the transport settings. Takes effect for the next
+    /// `server_config()` (build the endpoint after this call; a cert rotation
+    /// also rebuilds the config and so picks it up).
+    pub fn tuning(&self) -> TransportTuning {
+        self.tuning.lock().unwrap().clone()
+    }
+
+    #[cfg(test)]
+    pub fn set_tuning(&self, tuning: TransportTuning) {
+        *self.tuning.lock().unwrap() = tuning;
     }
 
     fn load(source: &CertSource) -> Result<Material> {
@@ -457,6 +475,7 @@ fn load_provided(cert: &Path, key: &Path) -> Result<Material> {
 pub fn build_server_config(
     chain: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
+    tuning: &TransportTuning,
 ) -> Result<quinn::ServerConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let mut server_crypto = rustls::ServerConfig::builder_with_provider(provider)
@@ -472,19 +491,9 @@ pub fn build_server_config(
         .context("adapting rustls config for QUIC")?;
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
 
-    // Keep idle connections alive across manual-testing pauses (dialogs,
-    // UI clicking, etc). Without this, quinn's default ~30s idle timeout
-    // drops clients that briefly go quiet. keep_alive_interval must stay
-    // comfortably below max_idle_timeout on at least one peer so pings
-    // keep the connection from ever reaching the idle deadline, while a
-    // truly dead peer still gets reaped in a reasonable time.
-    let mut transport_config = quinn::TransportConfig::default();
-    transport_config
-        .max_idle_timeout(Some(
-            quinn::IdleTimeout::try_from(Duration::from_secs(60)).expect("60s fits in IdleTimeout"),
-        ))
-        .keep_alive_interval(Some(Duration::from_secs(15)));
-    server_config.transport_config(Arc::new(transport_config));
+    // Congestion controller, datagram buffer, idle timeout, keep-alive: see
+    // `transport.rs` and superdoc/features/relay-transport.md.
+    server_config.transport_config(Arc::new(tuning.build()));
 
     Ok(server_config)
 }

@@ -40,6 +40,25 @@ current directory, so start it from a directory you own.
 | `--cert-rotate-before-secs N` | test hook: rotation lead time (default 2 days) |
 | `-h`, `--help` | usage |
 
+## Transport tuning
+
+Every QUIC connection (native and WebTransport) runs **BBR** congestion control, quinn's default
+1 MiB datagram send buffer, a **20 s idle timeout** and a **5 s keep-alive** (`src/transport.rs`;
+measurements and the why in `superdoc/features/relay-transport.md`). Two environment variables
+override the defaults without a rebuild:
+
+| Variable | Meaning |
+| --- | --- |
+| `SSSHARE_CC` | `bbr` (default), `cubic` (the pre-2026-11-02 behaviour, rollback) or `newreno` |
+| `SSSHARE_DGRAM_BUF_KB` | per-connection datagram send buffer in KiB (default 1024); smaller values break keyframes at higher bitrates, see the doc |
+
+The effective values are logged once at start (`QUIC transport tuning ...`), and the relay logs a
+`viewer send queue full` line (per viewer, at most every 5 s) when a viewer's send queue is
+evicting media datagrams, plus a `connection path stats` line when a connection ends.
+
+Lab: `cargo test --release -p simple-screensharing-server transport_lab -- --ignored --nocapture`
+(see the header of `src/transport_lab.rs`).
+
 ## Windows
 
 It builds and runs as is (`cargo build --release -p simple-screensharing-server`): the UDP socket

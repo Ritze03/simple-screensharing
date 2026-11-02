@@ -10,10 +10,14 @@ mod cert;
 mod protocol;
 mod relay;
 mod room;
+mod transport;
 mod tui;
 
 #[cfg(test)]
 mod browser_smoke;
+
+#[cfg(test)]
+mod transport_lab;
 
 #[cfg(test)]
 mod transport_tests;
