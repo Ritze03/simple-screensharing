@@ -1062,18 +1062,31 @@ pub fn build_client_endpoint() -> Result<quinn::Endpoint> {
         .context("failed to build QUIC TLS config")?;
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_crypto));
 
-    // Match the server's idle-timeout/keep-alive settings (net.rs). quinn
-    // uses the minimum of both peers' max_idle_timeout, and keep-alives
-    // only prevent idle disconnects if configured on at least one side,
-    // so both client and server set the same values here to avoid drops
-    // during manual-testing pauses (dialogs, UI clicking, etc).
+    // Mirror of the relay's `server/src/transport.rs` defaults; keep the two in
+    // step. Why each value (measured, `superdoc/features/relay-transport.md`):
+    // - BBR instead of quinn's Cubic: this connection's congestion controller
+    //   governs the sharer's uplink. Cubic reads ~1 % random loss as
+    //   congestion, shrinks the window below the stream bitrate and the send
+    //   queue then silently evicts its oldest datagrams, breaking most frames;
+    //   BBR keeps the rate up. `SSSHARE_CC=cubic` goes back (lab/rollback).
+    // - 20 s idle timeout, 5 s keep-alive (was 60 s / 15 s): a black-holed
+    //   path froze the viewer for up to 60 s before the reconnect logic ran.
+    //   quinn takes the minimum of both peers' timeouts, so against an older
+    //   relay (60 s) this client's 20 s still wins, and against a newer relay
+    //   with an older client the relay's does; keep-alives from either side
+    //   keep a quiet connection (dialogs, UI pauses) well inside it.
     let mut transport_config = quinn::TransportConfig::default();
     transport_config
         .max_idle_timeout(Some(
-            quinn::IdleTimeout::try_from(std::time::Duration::from_secs(60))
-                .expect("60s fits in IdleTimeout"),
+            quinn::IdleTimeout::try_from(std::time::Duration::from_secs(20))
+                .expect("20s fits in IdleTimeout"),
         ))
-        .keep_alive_interval(Some(std::time::Duration::from_secs(15)));
+        .keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+    if std::env::var("SSSHARE_CC").is_ok_and(|v| v.trim().eq_ignore_ascii_case("cubic")) {
+        // lab/rollback only: quinn's default controller
+    } else {
+        transport_config.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+    }
     client_config.transport_config(Arc::new(transport_config));
 
     let mut endpoint = quinn::Endpoint::client("[::]:0".parse().unwrap()).context("failed to bind local UDP socket")?;
