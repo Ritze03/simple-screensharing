@@ -187,6 +187,28 @@ mod session_model {
         assert_eq!(state.alloc_capture_id(), CaptureSourceId(2));
         assert_eq!(state.alloc_destination_id(), DestinationId(1));
     }
+
+    /// #98: the room is free the moment Stop is clicked, not when the
+    /// teardown ends ("Share screen" back at once, no LIVE / "Stop sharing"
+    /// left over while a hung driver teardown runs).
+    #[tokio::test]
+    async fn share_state_is_idle_right_after_stop_share() {
+        let _home = super::isolated_home();
+        let mut state = AppState::default();
+        let room = RoomHandle(0);
+        let capture = CaptureSourceId(7);
+        let (_tx, rx) = oneshot::channel();
+        let mut cap = capture_with(IndexMap::from([(DestinationId(70), destination(room, 0))]));
+        cap.status = ShareStatus::Starting(rx);
+        state.captures.insert(capture, cap);
+        let shell = crate::ui::Shell::default();
+        assert!(matches!(crate::ui::share_state(&state, &shell, room), crate::ui::ShareState::Live { .. }));
+
+        state.stop_share(capture);
+
+        assert!(matches!(state.captures[&capture].status, ShareStatus::Stopping(_)), "the teardown is still running");
+        assert!(matches!(crate::ui::share_state(&state, &shell, room), crate::ui::ShareState::Idle));
+    }
 }
 
 // ---------------------------------------------------------------------------

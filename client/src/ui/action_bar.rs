@@ -276,11 +276,23 @@ fn live(ui: &mut Ui, cx: &mut Cx, room: RoomHandle, capture: CaptureSourceId, de
         fixed(stop.width(ui)),
     ];
     let row = HBox::new("action_bar", theme::CTL_H_LG).gap(theme::S2).slots(&slots).show(ui);
-    let (kind, text) = dest_pill(c, d);
+    // The capture's source died and the session is restarting it (#99): say
+    // so, whatever the destination's own state still reads (Live for the first
+    // moments, Stalled, or Failed while a retry restarts it).
+    let recovery = state.recovery(capture).filter(|_| {
+        matches!(c.destination_state(d), DestinationState::Live | DestinationState::Stalled { .. } | DestinationState::Failed(_))
+    });
+    let (kind, text) = if recovery.is_some() { recovering_pill() } else { dest_pill(c, d) };
     paint_pill(ui, row.cell(0), kind.pill(&text).large());
     let params = d.live_params();
     let kbps = dest_kbps(cx, destination, d);
-    if awaiting_first_frame(cx, capture, c, d) {
+    if let Some(recovery) = recovery {
+        let t1 = tr("ui.bar.recovering_title", "Screen capture lost");
+        let t2 = tr("ui.bar.recovering_sub", "Restarting the screen capture");
+        status_text(ui, row.cell(1), &t1, Some((&t2, false)));
+        ui.interact(row.cell(1), ui.id().with("recovering_tip"), Sense::hover()).on_hover_text(recovering_tip(recovery));
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+    } else if awaiting_first_frame(cx, capture, c, d) {
         // An idle monitor sends no first frame until something on it repaints
         // (portal `copy_with_damage`); say so instead of a silent "Starting".
         let t1 = tr("ui.bar.waiting_title", "Waiting for the screen to change");
@@ -780,6 +792,27 @@ pub(super) fn dest_pill(c: &LocalCapture, d: &Destination) -> (PillKind, String)
     }
 }
 
+/// The pill of a destination whose capture is being restarted (#99).
+pub(super) fn recovering_pill() -> (PillKind, String) {
+    (PillKind::Progress, tr("ui.pill.recovering", "Recovering"))
+}
+
+/// Tooltip of the recovering bar and pill: attempt number, countdown to the
+/// next attempt, and the last error.
+pub(super) fn recovering_tip(recovery: &simple_screensharing_client::session::CaptureRecovery) -> String {
+    let mut lines = vec![tr("ui.bar.recovering_title", "Screen capture lost")];
+    lines.push(tr_with(
+        "ui.bar.recovering_attempt",
+        "Attempt %{n} of %{total}",
+        &[("n", &recovery.attempt_number().to_string()), ("total", &recovery.attempts_total().to_string())],
+    ));
+    if let Some(wait) = recovery.retry_in(std::time::Instant::now()).filter(|w| !w.is_zero()) {
+        lines.push(tr_with("ui.bar.recovering_next", "Next attempt in %{secs} s", &[("secs", &wait.as_secs().max(1).to_string())]));
+    }
+    lines.push(tr_with("ui.bar.recovering_cause", "Cause: %{reason}", &[("reason", recovery.last_error())]));
+    lines.join("\n")
+}
+
 /// `true` while `d` is still Starting because its capture has not produced a
 /// first frame yet: an idle monitor (the portal only sends on repaint) until
 /// something on it changes. See `AppState::capture_awaiting_first_frame`.
@@ -825,7 +858,7 @@ pub(super) fn video_destination_count(cx: &Cx) -> usize {
 /// Width depends only on lead and text, so the tone is left out. Keep in
 /// sync with `paused`, `staged` and [`dest_pill`] (a debug build asserts in
 /// [`paint_pill`] that nothing is clipped).
-pub(super) const BAR_PILLS: [(PillLead<'static>, &str, &str); 10] = [
+pub(super) const BAR_PILLS: [(PillLead<'static>, &str, &str); 11] = [
     (PillLead::Bar, "ui.room.connecting_pill", "Connecting"),
     (PillLead::Icon("pause"), "ui.bar.paused", "Paused"),
     (PillLead::Bar, "ui.bar.picking", "Picking"),
@@ -834,6 +867,7 @@ pub(super) const BAR_PILLS: [(PillLead<'static>, &str, &str); 10] = [
     (PillLead::Dot, "ui.pill.live", "Live"),
     (PillLead::Bar, "ui.pill.starting", "Starting"),
     (PillLead::Bar, "ui.pill.applying", "Applying"),
+    (PillLead::Bar, "ui.pill.recovering", "Recovering"),
     (PillLead::Icon("sync"), "ui.pill.stalled", "Stalled"),
     (PillLead::Icon("sync"), "ui.pill.failed", "Failed"),
 ];

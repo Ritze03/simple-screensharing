@@ -820,8 +820,11 @@ pub fn share_state(state: &AppState, shell: &Shell, room: RoomHandle) -> ShareSt
             return ShareState::Live { capture: *id, destination: *dest_id };
         }
     }
+    // A capture being stopped is not a staged share any more (#98): its
+    // destinations were released at the click, so the room is free at once.
     if let Some(staged) = shell.staged.get(&room)
         && let Some(c) = state.captures.get(&staged.capture)
+        && !matches!(c.status, ShareStatus::Stopping(_))
     {
         return match c.status {
             ShareStatus::Starting(_) => ShareState::Picking { capture: staged.capture },
@@ -1044,6 +1047,7 @@ impl App {
         }
         self.state.drain_events(ctx);
         self.state.poll_capture_states();
+        self.state.poll_capture_recovery();
         self.state.poll_pending_destinations();
         self.state.poll_destination_edits();
         self.state.poll_audio_sources();
@@ -1376,7 +1380,11 @@ impl eframe::App for App {
         // Keep polling the connect future / event channels with no input;
         // coarser while unfocused. `None` (backend can't tell) = focused.
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
-        if matches!(self.state.status, Status::Connecting) || !self.state.rooms.is_empty() || !self.shell.toasts.is_empty() {
+        if matches!(self.state.status, Status::Connecting)
+            || !self.state.rooms.is_empty()
+            || !self.shell.toasts.is_empty()
+            || !self.state.recoveries.is_empty()
+        {
             ctx.request_repaint_after(if focused { IDLE_REPAINT_INTERVAL } else { UNFOCUSED_REPAINT_INTERVAL });
         }
     }

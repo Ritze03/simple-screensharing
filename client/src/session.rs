@@ -1244,7 +1244,16 @@ impl RoomSession {
     /// `AudioDecoder`, which synchronously shuts down its pipeline thread
     /// (see `AudioDecoder`'s `Drop` impl).
     pub fn teardown_audio_watch(&mut self, owner: ConnId, stream_id: StreamId) {
-        if self.audio_watches.lock().unwrap().remove(&(owner, stream_id)).is_some() {
+        // `Why the watch is taken out under the lock and dropped after it
+        // (#97):` dropping an `AudioWatch` joins its audio thread, which can
+        // take a while on a slow sink. As a temporary of this `if`'s condition
+        // it used to be dropped while the guard was still held, and the video
+        // ingestion task locks this same map for every frame, so a slow audio
+        // teardown stalled video.
+        let removed = self.audio_watches.lock().unwrap().remove(&(owner, stream_id));
+        let was_active = removed.is_some();
+        drop(removed);
+        if was_active {
             let client = self.client.clone();
             tokio::spawn(async move {
                 if let Err(e) = client.unsubscribe(owner, stream_id).await {
@@ -1620,6 +1629,18 @@ pub struct AppState {
     /// `poll_pending_destinations`.
     pub pending_destinations: Vec<PendingDestination>,
 
+    /// Video captures whose source died and that are being restarted (#99),
+    /// driven by [`AppState::poll_capture_recovery`]. The capture keeps its id
+    /// and its (stalled) destinations the whole time.
+    pub recoveries: IndexMap<CaptureSourceId, CaptureRecovery>,
+    /// When a capture last finished a recovery, and the schedule position it
+    /// used, for [`RECOVERY_RESET_AFTER`].
+    recovery_history: HashMap<CaptureSourceId, (Instant, u32)>,
+    /// Captures whose recovery ran out of attempts: their source stays dead,
+    /// so they must not be picked up for recovery again every frame. Only the
+    /// user's retry ([`Self::retry_destination`]) clears an entry.
+    recovery_gave_up: std::collections::HashSet<CaptureSourceId>,
+
     /// Audio sources discovered by the last `list_audio_sources()` call.
     pub audio_sources: Vec<AudioSource>,
     pub audio_sources_error: Option<String>,
@@ -1684,6 +1705,109 @@ pub struct AppState {
     pub(crate) reconnect_attempt_timeout: Duration,
 }
 
+/// Delay before restart attempt number `n` (0-based) of a capture whose
+/// source died (#99): at once, then +2 s, +5 s, +10 s, +30 s, then none left.
+/// The first attempt is immediate because a portal restart or a mode change
+/// is usually over within a second or two and every second counts to the
+/// viewer; the growing gaps stop a source that keeps dying from being hammered
+/// (and a picker-based portal from being asked in a loop).
+pub const CAPTURE_RESTART_DELAYS: [Duration; 5] =
+    [Duration::ZERO, Duration::from_secs(2), Duration::from_secs(5), Duration::from_secs(10), Duration::from_secs(30)];
+
+/// See [`CAPTURE_RESTART_DELAYS`]; `None` once the schedule is used up.
+pub fn capture_restart_delay(attempt: u32) -> Option<Duration> {
+    CAPTURE_RESTART_DELAYS.get(attempt as usize).copied()
+}
+
+/// A capture that dies again within this long of a successful restart carries
+/// on with the backoff schedule where it left off instead of starting again at
+/// attempt 0 (a source that flaps would otherwise be restarted forever at full
+/// speed).
+pub const RECOVERY_RESET_AFTER: Duration = Duration::from_secs(30);
+
+/// A video capture whose source died, being restarted ([`AppState::recoveries`]).
+/// The read side is for the UI ("Recovering", attempt number and last error in
+/// a tooltip); the rest is the driver's.
+pub struct CaptureRecovery {
+    /// Restart attempts started so far.
+    attempt: u32,
+    last_error: String,
+    since: Instant,
+    phase: RecoveryPhase,
+    /// Destinations asked for while recovering (a reconnected room's share, a
+    /// "Go live" on a staged capture): they cannot attach to the dead
+    /// pipeline, so they are added to the replacement.
+    deferred: Vec<(RoomHandle, PendingRole, capture::destination::VideoParams)>,
+    framerate: u32,
+    restore_token: Option<String>,
+    /// The schedule position this recovery started at (0 unless the capture
+    /// died again soon after the previous recovery).
+    start_pos: u32,
+}
+
+enum RecoveryPhase {
+    /// Waiting for the next attempt's slot.
+    Waiting { until: Instant },
+    /// A replacement capture is starting (the portal may be asking).
+    Starting(oneshot::Receiver<Result<CaptureHandle, String>>),
+}
+
+impl CaptureRecovery {
+    /// The attempt in progress, or the one that is next while waiting
+    /// (1-based, at most [`Self::attempts_total`]).
+    pub fn attempt_number(&self) -> u32 {
+        match self.phase {
+            RecoveryPhase::Waiting { .. } => (self.attempt + 1).min(self.attempts_total()),
+            RecoveryPhase::Starting(_) => self.attempt.max(1),
+        }
+    }
+
+    pub fn attempts_total(&self) -> u32 {
+        CAPTURE_RESTART_DELAYS.len() as u32
+    }
+
+    /// Why the source was lost, or why the last attempt failed.
+    pub fn last_error(&self) -> &str {
+        &self.last_error
+    }
+
+    pub fn since(&self) -> Instant {
+        self.since
+    }
+
+    /// Time until the next attempt starts; `None` while one is running.
+    pub fn retry_in(&self, now: Instant) -> Option<Duration> {
+        match self.phase {
+            RecoveryPhase::Waiting { until } => Some(until.saturating_duration_since(now)),
+            RecoveryPhase::Starting(_) => None,
+        }
+    }
+}
+
+/// `params` (a destination's settings on the old source) carried over to a
+/// replacement source of a different size, keeping the destination's scale
+/// (its size as a share of the source) rather than its pixel size.
+///
+/// `Why:` after a monitor mode change or rotation the replacement source has
+/// other dimensions. Re-adding the old pixel size would let `clamp_to_source`
+/// squash it into the wrong aspect ratio (a 1920x1080 destination on a
+/// rotated 1080x1920 source) or keep a stale smaller size on a larger source.
+/// A destination that followed the source (width/height 0), or any size that
+/// is unknown, is passed through unchanged.
+pub fn rescale_for_new_source(
+    params: capture::destination::VideoParams,
+    old: capture::destination::SourceCaps,
+    new: capture::destination::SourceCaps,
+) -> capture::destination::VideoParams {
+    if params.width == 0 || params.height == 0 || old.width == 0 || old.height == 0 || new.width == 0 || new.height == 0 {
+        return params;
+    }
+    // Share of the source in per mille, from the width; the height follows the new source's aspect.
+    let permille = (u64::from(params.width) * 1000 / u64::from(old.width)).clamp(1, 1000);
+    let scale = |v: u32| ((u64::from(v) * permille / 1000) as u32).max(2) & !1;
+    capture::destination::VideoParams { width: scale(new.width), height: scale(new.height), ..params }
+}
+
 /// Default value of [`AppState::connect_timeout`] — the feature request's
 /// "connecting should time out after 15 seconds".
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -1733,6 +1857,9 @@ impl Default for AppState {
             catch_up_speed_percent: settings.catch_up_speed_percent,
             bandwidth: BandwidthController::new(),
             pending_destinations: Vec::new(),
+            recoveries: IndexMap::new(),
+            recovery_history: HashMap::new(),
+            recovery_gave_up: std::collections::HashSet::new(),
             audio_sources: Vec::new(),
             audio_sources_error: None,
             audio_sources_requested: false,
@@ -2234,6 +2361,12 @@ impl AppState {
         role: PendingRole,
         params: capture::destination::VideoParams,
     ) {
+        // The capture's source is dead and being restarted (#99): the dead
+        // pipeline cannot take a branch, so wait for the replacement.
+        if let Some(recovery) = self.recoveries.get_mut(&capture_id) {
+            recovery.deferred.push((room_handle, role, params));
+            return;
+        }
         let destination_id = self.alloc_destination_id();
 
         let Some(capture) = self.captures.get(&capture_id) else { return };
@@ -2562,6 +2695,22 @@ impl AppState {
     /// throughout.
     pub fn retry_destination(&mut self, destination_id: DestinationId) {
         let Some((capture_id, _, dest)) = find_destination(&self.captures, destination_id) else { return };
+        // A recovery is already running for this capture.
+        if self.recoveries.contains_key(&capture_id) {
+            return;
+        }
+        // The capture itself is what died (the recovery schedule ran out):
+        // "Retry" starts a fresh recovery, not a branch on the dead pipeline.
+        if let Some(capture) = self.captures.get(&capture_id)
+            && let ShareStatus::Active(ShareHandle::Video(handle)) = &capture.status
+            && let Some(reason) = handle.source_lost()
+        {
+            let (framerate, token) = (handle.source_caps().framerate, handle.restore_token());
+            self.recovery_history.remove(&capture_id);
+            self.recovery_gave_up.remove(&capture_id);
+            self.begin_recovery(capture_id, reason, framerate, token, Instant::now());
+            return;
+        }
         let room_handle = dest.room;
         let params = dest.params;
         let role = dest.pending;
@@ -2993,6 +3142,7 @@ impl AppState {
                 };
                 let _ = tx.send(result);
             });
+            self.release_stopping_destinations(capture_id);
             return;
         }
         if !matches!(capture.status, ShareStatus::Active(_)) {
@@ -3011,6 +3161,26 @@ impl AppState {
             .map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
         });
+        self.release_stopping_destinations(capture_id);
+    }
+
+    /// At the click on Stop (#98): take `capture_id`'s destinations out of the
+    /// model *now*, not when the teardown finishes.
+    ///
+    /// `Why:` the teardown (branch drains, the pipeline's `Null`, the portal
+    /// session) is where all the time goes, and it can hang on a driver for
+    /// seconds. While the capture sat in `Stopping` with its destinations the
+    /// sharer still saw LIVE and "Stop sharing", and had no "Share screen"
+    /// button until it was reaped: the "stays open for 15 seconds" report. The
+    /// stop itself keeps running in its own task and owns the handle; nothing
+    /// in the UI needs the destinations again, and a new share started now is
+    /// independent of the old teardown. A pending recovery of the capture
+    /// ends here too.
+    fn release_stopping_destinations(&mut self, capture_id: CaptureSourceId) {
+        self.cancel_recovery(capture_id);
+        let Some(capture) = self.captures.get_mut(&capture_id) else { return };
+        let gone = std::mem::take(&mut capture.destinations);
+        self.forget_destination_map(&gone);
     }
 
     /// Abrupt teardown (relay/control connection lost, or the app quitting
@@ -3019,6 +3189,7 @@ impl AppState {
     /// stop-stream notification, instead of just letting the handle drop
     /// synchronously when `AppState` goes away right after this call.
     pub fn drop_capture_fire_and_forget(&mut self, capture_id: CaptureSourceId) {
+        self.cancel_recovery(capture_id);
         let Some(capture) = self.captures.shift_remove(&capture_id) else { return };
         self.audio_share_sources.remove(&capture_id);
         self.forget_destinations_of(&capture);
@@ -3045,7 +3216,11 @@ impl AppState {
     /// `self.captures`, so no room is left advertising an outgoing stream
     /// that no longer exists.
     pub fn forget_destinations_of(&mut self, capture: &LocalCapture) {
-        for (destination_id, dest) in capture.destinations.iter() {
+        self.forget_destination_map(&capture.destinations);
+    }
+
+    fn forget_destination_map(&mut self, destinations: &IndexMap<DestinationId, Destination>) {
+        for (destination_id, dest) in destinations.iter() {
             if let Some(room) = self.rooms.get_mut(&dest.room) {
                 room.destinations.retain(|d| d != destination_id);
                 // Mirror `StreamStopped` for our own stream — same
@@ -3165,6 +3340,260 @@ impl AppState {
             if let Some(capture) = self.captures.shift_remove(&capture_id) {
                 self.forget_destinations_of(&capture);
             }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Capture recovery (#99)
+    // -----------------------------------------------------------------
+
+    /// The recovery in progress for `capture_id`, if its source died and the
+    /// capture is being restarted. The UI shows "Recovering" for it.
+    pub fn recovery(&self, capture_id: CaptureSourceId) -> Option<&CaptureRecovery> {
+        self.recoveries.get(&capture_id)
+    }
+
+    /// Per-frame driver of capture recovery: notice sources that died, run the
+    /// restart schedule, and swap a restarted capture in. Call once per frame
+    /// next to [`Self::poll_capture_states`].
+    pub fn poll_capture_recovery(&mut self) {
+        self.poll_capture_recovery_at(Instant::now());
+    }
+
+    /// [`Self::poll_capture_recovery`] with the clock injected (tests).
+    pub fn poll_capture_recovery_at(&mut self, now: Instant) {
+        // 1. Captures whose source just died.
+        let lost: Vec<(CaptureSourceId, String, u32, Option<String>)> = self
+            .captures
+            .iter()
+            .filter(|(id, _)| !self.recoveries.contains_key(*id) && !self.recovery_gave_up.contains(*id))
+            .filter_map(|(id, c)| match &c.status {
+                ShareStatus::Active(ShareHandle::Video(h)) => {
+                    h.source_lost().map(|reason| (*id, reason, h.source_caps().framerate, h.restore_token()))
+                }
+                _ => None,
+            })
+            .collect();
+        for (capture_id, reason, framerate, restore_token) in lost {
+            self.begin_recovery(capture_id, reason, framerate, restore_token, now);
+        }
+
+        // 2. Advance every recovery.
+        for capture_id in self.recoveries.keys().copied().collect::<Vec<_>>() {
+            let Some(recovery) = self.recoveries.get_mut(&capture_id) else { continue };
+            match &mut recovery.phase {
+                RecoveryPhase::Waiting { until } if now >= *until => {
+                    recovery.attempt += 1;
+                    let (framerate, token) = (recovery.framerate, recovery.restore_token.clone());
+                    tracing::info!("capture {capture_id:?}: restart attempt {} (portal restore token: {})", recovery.attempt, token.is_some());
+                    let (tx, rx) = oneshot::channel();
+                    tokio::spawn(async move {
+                        let result = capture::start_capture_restoring(framerate, token).await.map_err(|e| start_error_string(&e));
+                        let _ = tx.send(result);
+                    });
+                    recovery.phase = RecoveryPhase::Starting(rx);
+                }
+                RecoveryPhase::Waiting { .. } => {}
+                RecoveryPhase::Starting(rx) => match rx.try_recv() {
+                    Ok(Ok(handle)) => self.finish_recovery(capture_id, handle, now),
+                    Ok(Err(e)) => {
+                        // A dismissed picker is the user's answer, not a
+                        // transient failure: never ask again on their behalf.
+                        let cancelled = e == SHARE_START_CANCELLED;
+                        let text = if cancelled { t!("errors.capture_restart_cancelled").to_string() } else { e };
+                        self.attempt_failed(capture_id, text, cancelled, now);
+                    }
+                    Err(oneshot::error::TryRecvError::Empty) => {}
+                    Err(oneshot::error::TryRecvError::Closed) => {
+                        self.attempt_failed(capture_id, t!("errors.share_start_task_ended").to_string(), false, now);
+                    }
+                },
+            }
+        }
+    }
+
+    /// The source of `capture_id` died: stall every destination (viewers keep
+    /// their tile and the cached frame) and start the restart schedule.
+    fn begin_recovery(&mut self, capture_id: CaptureSourceId, reason: String, framerate: u32, restore_token: Option<String>, now: Instant) {
+        if let Some(capture) = self.captures.get(&capture_id)
+            && let ShareStatus::Active(ShareHandle::Video(handle)) = &capture.status
+        {
+            handle.begin_stall(capture::destination::StallReason::SourceLost);
+        }
+        // A capture that dies again soon after a restart continues the
+        // backoff where it stopped instead of starting over at "now".
+        let attempt = match self.recovery_history.get(&capture_id) {
+            Some((at, used)) if now.saturating_duration_since(*at) < RECOVERY_RESET_AFTER => *used,
+            _ => 0,
+        };
+        tracing::warn!("capture {capture_id:?}: source lost ({reason}); restarting the capture (schedule position {attempt})");
+        let Some(delay) = capture_restart_delay(attempt) else {
+            self.recoveries.insert(
+                capture_id,
+                CaptureRecovery {
+                    attempt,
+                    last_error: reason.clone(),
+                    since: now,
+                    phase: RecoveryPhase::Waiting { until: now },
+                    deferred: Vec::new(),
+                    framerate,
+                    restore_token,
+                    start_pos: attempt,
+                },
+            );
+            self.give_up_recovery(capture_id, reason);
+            return;
+        };
+        self.recoveries.insert(
+            capture_id,
+            CaptureRecovery {
+                attempt,
+                last_error: reason,
+                since: now,
+                phase: RecoveryPhase::Waiting { until: now + delay },
+                deferred: Vec::new(),
+                framerate,
+                restore_token,
+                start_pos: attempt,
+            },
+        );
+    }
+
+    /// A restart attempt failed: wait for the next slot of the schedule, or
+    /// give up when it is used up or retrying is pointless.
+    fn attempt_failed(&mut self, capture_id: CaptureSourceId, error: String, final_failure: bool, now: Instant) {
+        let Some(recovery) = self.recoveries.get_mut(&capture_id) else { return };
+        tracing::warn!("capture {capture_id:?}: restart attempt {} failed: {error}", recovery.attempt);
+        recovery.last_error = error.clone();
+        match capture_restart_delay(recovery.attempt).filter(|_| !final_failure) {
+            Some(delay) => recovery.phase = RecoveryPhase::Waiting { until: now + delay },
+            None => self.give_up_recovery(capture_id, error),
+        }
+    }
+
+    /// The schedule is exhausted: every destination of the capture becomes
+    /// Failed ("capture lost: ..."), its stream is stopped so viewers are not
+    /// left with a frozen tile, and the user's one-click retry
+    /// ([`Self::retry_destination`]) starts a fresh recovery.
+    fn give_up_recovery(&mut self, capture_id: CaptureSourceId, error: String) {
+        let Some(recovery) = self.recoveries.shift_remove(&capture_id) else { return };
+        let message = format!("capture lost: {error}");
+        tracing::error!("capture {capture_id:?}: giving up after {} restart attempt(s): {message}", recovery.attempt);
+        self.recovery_history.remove(&capture_id);
+        self.recovery_gave_up.insert(capture_id);
+        let Some(capture) = self.captures.get_mut(&capture_id) else { return };
+        let mut stopped_streams = Vec::new();
+        for (destination_id, dest) in capture.destinations.iter() {
+            if let Some(runtime) = &dest.runtime {
+                runtime.lock().unwrap().fail(message.clone());
+            }
+            stopped_streams.push((dest.room, dest.stream_id, *destination_id));
+        }
+        if let ShareStatus::Active(ShareHandle::Video(handle)) = &mut capture.status {
+            for (_, _, destination_id) in &stopped_streams {
+                let rx = handle.spawn_remove_destination(DestKey(destination_id.0));
+                tokio::spawn(async move {
+                    let _ = rx.await;
+                });
+            }
+        }
+        for (room_handle, stream_id, _) in stopped_streams {
+            if let Some(room) = self.rooms.get_mut(&room_handle) {
+                let owner = room.client.conn_id();
+                room.note_stream_stopped(owner, stream_id);
+            }
+        }
+        note_share_error(&mut self.share_error, t!("errors.capture_lost", reason = error).to_string());
+    }
+
+    /// A replacement capture is up: move the destinations onto it. The old
+    /// capture is stopped in the background (it may well hang; nothing waits
+    /// for it), and each destination is re-added with its own settings on the
+    /// new one, so the viewers' streams come back as new streams that their
+    /// "wanted stream" logic re-watches.
+    fn finish_recovery(&mut self, capture_id: CaptureSourceId, new_handle: CaptureHandle, now: Instant) {
+        let Some(recovery) = self.recoveries.shift_remove(&capture_id) else {
+            tokio::spawn(async move {
+                let _ = new_handle.stop().await;
+            });
+            return;
+        };
+        let Some(capture) = self.captures.get_mut(&capture_id) else {
+            tokio::spawn(async move {
+                let _ = new_handle.stop().await;
+            });
+            return;
+        };
+        let new_source = new_handle.source_caps();
+        let old_source = match &capture.status {
+            ShareStatus::Active(ShareHandle::Video(h)) => h.source_caps(),
+            _ => new_source,
+        };
+        let old_status = std::mem::replace(&mut capture.status, ShareStatus::Active(ShareHandle::Video(new_handle)));
+        if let ShareStatus::Active(ShareHandle::Video(old)) = old_status {
+            tokio::spawn(async move {
+                if let Err(e) = old.stop().await {
+                    tracing::warn!("stopping the lost capture did not finish cleanly: {e:#}");
+                }
+            });
+        }
+        // What to put back: every destination that was a finished stream.
+        let mut readd: Vec<(DestinationId, RoomHandle, capture::destination::VideoParams)> = Vec::new();
+        let mut transfer_markers = Vec::new();
+        for (destination_id, dest) in capture.destinations.iter() {
+            match dest.pending {
+                Some(role @ PendingRole::TransferTarget(_)) => transfer_markers.push(role),
+                Some(PendingRole::TransferSource(_)) => {
+                    // The transfer cannot finish; its source half stays as a plain destination.
+                    readd.push((*destination_id, dest.room, dest.live_params()));
+                }
+                _ => readd.push((*destination_id, dest.room, dest.live_params())),
+            }
+        }
+        // Destinations still being built on the old pipeline: tear down what
+        // arrives, and re-add the ones that were wanted for their own sake.
+        let mut orphaned = Vec::new();
+        let (mine, others): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending_destinations).into_iter().partition(|p| p.capture_id == capture_id);
+        self.pending_destinations = others;
+        for pending in mine {
+            orphaned.push(pending.rx);
+        }
+        for rx in orphaned {
+            tokio::spawn(async move {
+                if let Ok(Ok(handle)) = rx.await {
+                    let _ = handle.stop().await;
+                }
+            });
+        }
+        for role in transfer_markers {
+            self.clear_transfer_marker(capture_id, role);
+        }
+        for (old_id, room, params) in readd {
+            self.forget_destination(capture_id, old_id);
+            let params = rescale_for_new_source(params, old_source, new_source);
+            self.add_destination_with_params(capture_id, room, PendingRole::GoingLive, params);
+        }
+        for (room, role, params) in recovery.deferred {
+            self.add_destination_with_params(capture_id, room, role, params);
+        }
+        tracing::info!("capture {capture_id:?}: recovered after {} attempt(s), {} ms", recovery.attempt, now.saturating_duration_since(recovery.since).as_millis());
+        // `Why `start_pos + 1` and not the attempts used (a recovery that needed
+        // five tries is a long outage, not a flapping source): only a capture
+        // that keeps dying right after a successful restart walks down the schedule.
+        self.recovery_history.insert(capture_id, (now, recovery.start_pos + 1));
+    }
+
+    /// Stop tracking a recovery (the capture is being stopped or dropped); a
+    /// replacement capture that is mid-start is torn down when it arrives.
+    fn cancel_recovery(&mut self, capture_id: CaptureSourceId) {
+        self.recovery_history.remove(&capture_id);
+        self.recovery_gave_up.remove(&capture_id);
+        if let Some(CaptureRecovery { phase: RecoveryPhase::Starting(rx), .. }) = self.recoveries.shift_remove(&capture_id) {
+            tokio::spawn(async move {
+                if let Ok(Ok(handle)) = rx.await {
+                    let _ = handle.stop().await;
+                }
+            });
         }
     }
 
@@ -5314,6 +5743,186 @@ mod ui_ops_tests {
 
         assert!(!state.captures.contains_key(&capture_id), "a cancelled capture must be removed");
         assert!(state.share_error.is_none(), "dismissing the picker is not an error: {:?}", state.share_error);
+    }
+
+    // ---- stop frees the room at the click (#98) ----
+
+    #[tokio::test]
+    async fn stop_share_releases_the_destinations_at_the_click_not_when_the_teardown_ends() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        let (capture_id, _dest) = insert_destination(&mut state);
+        // An Active-like capture is not constructible without a real handle;
+        // a Starting one takes the same release path.
+        let (_tx, rx) = oneshot::channel();
+        state.captures.get_mut(&capture_id).unwrap().status = ShareStatus::Starting(rx);
+        state.rooms.clear();
+
+        state.stop_share(capture_id);
+
+        let capture = &state.captures[&capture_id];
+        assert!(matches!(capture.status, ShareStatus::Stopping(_)), "the capture itself stays until its stop lands");
+        assert!(capture.destinations.is_empty(), "but nothing in the model may still claim to be sending");
+    }
+
+    // ---- capture recovery (#99) ----
+
+    #[test]
+    fn restart_schedule_is_now_then_2_5_10_30_seconds_then_exhausted() {
+        let secs: Vec<Option<u64>> = (0..7).map(|n| capture_restart_delay(n).map(|d| d.as_secs())).collect();
+        assert_eq!(secs, vec![Some(0), Some(2), Some(5), Some(10), Some(30), None, None]);
+    }
+
+    #[test]
+    fn a_new_source_keeps_the_destinations_share_of_it_not_its_pixel_size() {
+        use capture::destination::SourceCaps;
+        let src = |w, h| SourceCaps { width: w, height: h, framerate: 60 };
+        let mut params = video_params();
+        // Full size, then half size, on a rotated source.
+        params.width = 1920;
+        params.height = 1080;
+        let rotated = rescale_for_new_source(params, src(1920, 1080), src(1080, 1920));
+        assert_eq!((rotated.width, rotated.height), (1080, 1920));
+        params.width = 960;
+        params.height = 540;
+        let half = rescale_for_new_source(params, src(1920, 1080), src(1080, 1920));
+        assert_eq!((half.width, half.height), (540, 960));
+        // A smaller mode keeps the share.
+        let smaller = rescale_for_new_source(params, src(1920, 1080), src(1280, 720));
+        assert_eq!((smaller.width, smaller.height), (640, 360));
+        // "Follow the source" and unknown sizes pass through.
+        params.width = 0;
+        params.height = 0;
+        assert_eq!(rescale_for_new_source(params, src(1920, 1080), src(1280, 720)), params);
+        params.width = 960;
+        params.height = 540;
+        assert_eq!(rescale_for_new_source(params, src(0, 0), src(1280, 720)), params);
+    }
+
+    /// A restart that keeps failing walks the schedule and ends with the
+    /// destinations Failed ("capture lost: ..."), the user told, and no more
+    /// attempts until the user retries.
+    #[tokio::test]
+    async fn failed_restart_attempts_follow_the_schedule_and_end_in_failed() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        let (capture_id, dest_id) = insert_destination(&mut state);
+        let runtime = capture::destination::DestinationRuntime::shared(Instant::now(), video_params());
+        state.captures.get_mut(&capture_id).unwrap().destinations[&dest_id].runtime = Some(runtime.clone());
+        let t0 = Instant::now();
+        state.recoveries.insert(
+            capture_id,
+            CaptureRecovery {
+                attempt: 1,
+                last_error: "boom".to_string(),
+                since: t0,
+                phase: RecoveryPhase::Waiting { until: t0 },
+                deferred: Vec::new(),
+                framerate: 30,
+                restore_token: None,
+                start_pos: 0,
+            },
+        );
+
+        // Attempt 1 failed: the next one is 2 s away, attempt number 2 of 5.
+        state.attempt_failed(capture_id, "no portal".to_string(), false, t0);
+        let recovery = state.recovery(capture_id).expect("still recovering");
+        assert_eq!(recovery.retry_in(t0), Some(Duration::from_secs(2)));
+        assert_eq!((recovery.attempt_number(), recovery.attempts_total()), (2, 5));
+        assert_eq!(recovery.last_error(), "no portal");
+
+        // Attempts 2..=4 failed (as the driver would count them), then the fifth.
+        for (done, wait) in [(2u32, 5u64), (3, 10), (4, 30)] {
+            state.recoveries.get_mut(&capture_id).unwrap().attempt = done;
+            state.attempt_failed(capture_id, "no portal".to_string(), false, t0);
+            assert_eq!(state.recovery(capture_id).unwrap().retry_in(t0), Some(Duration::from_secs(wait)));
+        }
+        state.recoveries.get_mut(&capture_id).unwrap().attempt = 5;
+        state.attempt_failed(capture_id, "no portal".to_string(), false, t0);
+        assert!(state.recovery(capture_id).is_none(), "the schedule is used up");
+        assert!(state.recovery_gave_up.contains(&capture_id), "and it must not be picked up again every frame");
+        match runtime.lock().unwrap().state() {
+            capture::destination::DestinationState::Failed(m) => assert!(m.starts_with("capture lost: no portal"), "{m}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert!(state.share_error.is_some(), "the user is told");
+    }
+
+    /// A dismissed picker is the user's answer: no further attempts.
+    #[tokio::test]
+    async fn a_dismissed_picker_ends_the_recovery_at_once() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        let (capture_id, _dest) = insert_destination(&mut state);
+        let t0 = Instant::now();
+        state.recoveries.insert(
+            capture_id,
+            CaptureRecovery {
+                attempt: 1,
+                last_error: String::new(),
+                since: t0,
+                phase: RecoveryPhase::Waiting { until: t0 },
+                deferred: Vec::new(),
+                framerate: 30,
+                restore_token: None,
+                start_pos: 0,
+            },
+        );
+        state.attempt_failed(capture_id, "picker dismissed".to_string(), true, t0);
+        assert!(state.recovery(capture_id).is_none());
+    }
+
+    /// While a capture is recovering, a destination asked for (a reconnected
+    /// room) is parked for the replacement instead of attaching to the dead
+    /// pipeline.
+    #[tokio::test]
+    async fn destinations_added_while_recovering_are_deferred() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        let (capture_id, _dest) = insert_destination(&mut state);
+        let t0 = Instant::now();
+        state.recoveries.insert(
+            capture_id,
+            CaptureRecovery {
+                attempt: 1,
+                last_error: String::new(),
+                since: t0,
+                phase: RecoveryPhase::Waiting { until: t0 },
+                deferred: Vec::new(),
+                framerate: 30,
+                restore_token: None,
+                start_pos: 0,
+            },
+        );
+        state.add_destination_with_params(capture_id, RoomHandle(3), PendingRole::GoingLive, video_params());
+        assert_eq!(state.recoveries[&capture_id].deferred.len(), 1);
+        assert_eq!(state.captures[&capture_id].destinations.len(), 1, "nothing was attached to the dead capture");
+    }
+
+    /// Stopping a recovering capture ends the recovery.
+    #[tokio::test]
+    async fn stopping_a_capture_cancels_its_recovery() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        let (capture_id, _dest) = insert_destination(&mut state);
+        let t0 = Instant::now();
+        state.recoveries.insert(
+            capture_id,
+            CaptureRecovery {
+                attempt: 1,
+                last_error: String::new(),
+                since: t0,
+                phase: RecoveryPhase::Waiting { until: t0 },
+                deferred: Vec::new(),
+                framerate: 30,
+                restore_token: None,
+                start_pos: 0,
+            },
+        );
+        let (_tx, rx) = oneshot::channel();
+        state.captures.get_mut(&capture_id).unwrap().status = ShareStatus::Starting(rx);
+        state.stop_share(capture_id);
+        assert!(state.recovery(capture_id).is_none());
     }
 
     /// …while a real failure still reaches the user, wrapped in context or not.

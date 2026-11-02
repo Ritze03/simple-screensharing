@@ -373,6 +373,25 @@ These were decided in the earlier UIs and are still the rules.
 - **Share-state drives the action bar** (`ShareState`: Idle / Picking / Staged / Live /
   Paused). Starting a share opens the OS picker first (capture `Starting` = Picking); the
   stream-settings modal then opens by itself.
+- **Stop frees the room at the click (2026-11-02, #98).** `AppState::stop_share` removes the
+  capture's destinations from the model immediately (the capture stays in `Stopping` only to own
+  the teardown), so `share_state` is `Idle`, the bar shows "Share screen" and the sidebar/tile
+  stop claiming a live share while a slow driver teardown is still running. *Why:* the old
+  behaviour (LIVE and "Stop sharing" for the whole teardown, up to ~15 s on a stuck VA branch)
+  was reported by a user as "it just stays open". No separate "Stopping..." indicator: the
+  teardown is invisible by design, and the info-level `capture stopped in N ms` log line is how
+  a slow one is found. `features/stream-control.md` "Stop is instant".
+- **Recovering (2026-11-02, #99).** While `AppState::recovery(capture)` is `Some`, the sharer's
+  pill for that capture's destinations is *Recovering* (`PillKind::Progress`, in `BAR_PILLS` so
+  the pill slot is wide enough in every language), the bar's title reads "Screen capture lost" /
+  "Restarting the screen capture", and the room tile chip reads RECOVERING. The bar tooltip
+  (`recovering_tip`) carries the attempt number ("Attempt 2 of 5"), the countdown to the next
+  attempt and the last error. Only a capture that actually has a recovery shows it: a plain
+  `Stalled` destination (a few seconds of silence that heals itself) keeps the *Stalled* pill.
+  When the schedule is exhausted the destinations turn *Failed* with a share-error toast; there
+  is no Retry button in the egui UI (`retry_destination` is lib-only), so the user stops sharing
+  and shares again. The stream-settings modal's per-room rows still
+  use `dest_pill` (Stalled / Failed), not the recovering override.
 
 ## Saved-room identity (2026-10-14)
 
