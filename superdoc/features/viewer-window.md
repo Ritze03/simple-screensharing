@@ -17,7 +17,7 @@ stream** (`StreamKey = (RoomHandle, ConnId, StreamId)`), re-declared every frame
 - **Hover chrome** (the former Electron `body:hover` rule, no idle timeout): while the pointer is anywhere in
   the window a vignette, a top row `[statbar][x]` and a bottom audio pill (`[mute][slider 0-500 %, snaps at 100 %][%]`,
   or "No audio shared") appear. Statbar = `[dot][name . room][WxH][decoded/presented fps][bitrate]`
-  in fixed tabular-width fields. A "waiting"/"stalled" chip is always shown (not hover-gated). The
+  in fixed tabular-width fields. A centred chip is always shown while waiting for the first frame, "Recovering…" (viewer recovery, `features/video-pipeline.md`) or "Sharer's capture stalled" (not hover-gated; same wording as the in-app tile). The
   chrome data is refreshed by the main window at most 4x a second into a `Shared` struct, and
   volume changes go back through `Shared::pending_volume`: `Why:` the viewport closure must be
   `Send + Sync + 'static` and cannot hold `Cx`, and screens never mutate `AppState` themselves. When

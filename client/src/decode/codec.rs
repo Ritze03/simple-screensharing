@@ -90,6 +90,19 @@ pub fn sniff(access_unit: &[u8]) -> Option<VideoCodec> {
     }
 }
 
+/// Whether a *delta* access unit is plausibly of `codec`'s bitstream family:
+/// Annex-B (H.264/H.265) vs OBU stream (AV1), the one distinction that is
+/// structural on any access unit (see the module docs, step 1). H.264 vs H.265
+/// cannot be told on a delta frame (slice NAL types collide), so those two are
+/// not distinguished here. Used to stop a decoder being fed the other family's
+/// deltas after a codec switch whose keyframe was lost.
+pub fn family_matches(codec: VideoCodec, access_unit: &[u8]) -> bool {
+    match access_unit.first() {
+        None => false,
+        Some(&b) => (b == 0) == (codec != VideoCodec::Av1),
+    }
+}
+
 /// Walk the Annex-B NAL units in `au` and return the codec of the first
 /// parameter-set NAL that identifies one.
 fn sniff_annex_b(au: &[u8]) -> Option<VideoCodec> {

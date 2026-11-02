@@ -64,6 +64,9 @@ use super::frame::{DecodedFrame, DecoderInfo, Shared};
 /// Message sent from `feed()`/`Drop` to the pipeline-owning thread.
 pub(super) enum PipelineMsg {
     AccessUnit { pts_us: u64, keyframe: bool, data: Vec<u8> },
+    /// Viewer recovery (L2, `decode/recovery.rs`): drop everything queued, rebuild the
+    /// pipeline of the current codec and drop deltas until the next keyframe.
+    Reset,
     Shutdown,
 }
 
@@ -380,6 +383,12 @@ pub(super) struct Worker {
     /// After a mid-stream HW failure the software decoder must start on a
     /// keyframe; delta frames are dropped until one arrives.
     need_keyframe: bool,
+    /// `Shared::decoded_total` at the last [`Self::reset`]: a second reset with
+    /// no output in between means the hardware decoder itself is the problem.
+    decoded_at_last_reset: Option<u64>,
+    /// The codec of the last pipeline that ran, so a reset (which tears the pipeline down) can
+    /// still rebuild for it if its keyframe carries no parameter sets to sniff.
+    last_codec: Option<VideoCodec>,
 }
 
 impl Worker {
@@ -390,13 +399,51 @@ impl Worker {
         } else {
             [VideoCodec::H264, VideoCodec::H265, VideoCodec::Av1].into_iter().collect()
         };
-        Self { shared, active: None, hw_failed, need_keyframe: false }
+        Self { shared, active: None, hw_failed, need_keyframe: false, decoded_at_last_reset: None, last_codec: None }
+    }
+
+    /// Set [`Self::need_keyframe`] and mirror it to `Shared`, where viewer recovery
+    /// reads it as "this decoder cannot continue without a keyframe".
+    fn set_need_keyframe(&mut self, v: bool) {
+        self.need_keyframe = v;
+        self.shared.set_needs_keyframe(v);
+    }
+
+    /// L2 recovery: tear the pipeline down and wait for a keyframe, which builds a fresh
+    /// one (the keyframe branch of [`Self::handle_access_unit`] starts a pipeline whenever
+    /// none is active).
+    ///
+    /// `Why the rebuild waits for the keyframe:` the hardware probation window
+    /// ([`HW_PROBATION`]) is measured from the pipeline's creation; building at reset time
+    /// would start that clock with no keyframe coming for another second or two (the request
+    /// is still in flight) and demote a perfectly good VA decoder to software for "no frame"
+    /// (seen in the first rig run).
+    ///
+    /// A hardware decoder that was reset after it *had* been given a keyframe, and produced
+    /// nothing since the previous reset either, is the problem itself: demoted to software
+    /// (the existing fallback) so a wedged VA decoder cannot keep eating resets.
+    pub(super) fn reset(&mut self) {
+        let codec = self.active.as_ref().map(|a| a.codec).or(self.last_codec);
+        let decoded = self.shared.decoded_total();
+        let keyframe_was_fed = !self.need_keyframe;
+        let repeated = self.decoded_at_last_reset == Some(decoded);
+        self.decoded_at_last_reset = Some(decoded);
+        if let Some(codec) = codec {
+            tracing::info!("{} decoder reset (viewer recovery)", codec.name());
+            if keyframe_was_fed && repeated && !self.hw_failed.contains(&codec) {
+                tracing::warn!("{} decoder produced nothing across two resets; using software", codec.name());
+                self.hw_failed.insert(codec);
+            }
+        }
+        self.active = None; // tears the old pipeline down
+        self.set_need_keyframe(true);
     }
 
     /// (Re)build the pipeline for `codec`, hardware first unless it has
     /// already failed for this codec.
     fn start(&mut self, codec: VideoCodec) {
         self.active = None; // tears the old pipeline down
+        self.last_codec = Some(codec);
         if !self.hw_failed.contains(&codec) {
             match build(codec, Backend::Hardware, &self.shared) {
                 Ok(active) => return self.adopt(active),
@@ -463,7 +510,7 @@ impl Worker {
                     active.push(pts, key, data);
                 }
             }
-            _ => self.need_keyframe = true,
+            _ => self.set_need_keyframe(true),
         }
     }
 
@@ -519,7 +566,10 @@ impl Worker {
         self.poll_bus();
 
         if keyframe {
-            if let Some(found) = codec::sniff(&data) {
+            // After a reset there is no pipeline: a keyframe whose parameter sets cannot be sniffed
+            // rebuilds for the codec that ran before.
+            let sniffed = codec::sniff(&data).or_else(|| self.active.is_none().then_some(self.last_codec).flatten());
+            if let Some(found) = sniffed {
                 if self.active.as_ref().map(|a| a.codec) != Some(found) {
                     if let Some(a) = &self.active {
                         tracing::info!("codec changed {} -> {}; rebuilding decoder", a.codec.name(), found.name());
@@ -527,8 +577,17 @@ impl Worker {
                     self.start(found);
                 }
             }
-            self.need_keyframe = false;
+            self.set_need_keyframe(false);
         } else if self.need_keyframe {
+            return;
+        } else if let Some(a) = &self.active
+            && !codec::family_matches(a.codec, &data)
+        {
+            // The other bitstream family (Annex-B vs OBU): the sender switched codec and the
+            // keyframe that announces it was lost. Feeding the old decoder this is pure garbage;
+            // wait for the keyframe (viewer recovery asks for one).
+            tracing::info!("{} decoder is being fed a different codec family; waiting for a keyframe", a.codec.name());
+            self.set_need_keyframe(true);
             return;
         }
 
@@ -563,6 +622,11 @@ pub(super) fn run(rx: std_mpsc::Receiver<PipelineMsg>, shared: Arc<Shared>, allo
         loop {
             match next {
                 Ok(PipelineMsg::AccessUnit { pts_us, keyframe, data }) => backlog.push_back((pts_us, keyframe, data)),
+                Ok(PipelineMsg::Reset) => {
+                    // Everything queued before the reset is pre-reset input.
+                    backlog.clear();
+                    worker.reset();
+                }
                 Ok(PipelineMsg::Shutdown) | Err(std_mpsc::RecvTimeoutError::Disconnected) => break 'run,
                 Err(std_mpsc::RecvTimeoutError::Timeout) => {
                     worker.poll_bus();

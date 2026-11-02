@@ -1927,6 +1927,75 @@ pub fn room_id_prefix(join_string: &str) -> String {
     }
 }
 
+/// How often the media-ingestion task runs viewer recovery. 100 ms keeps the
+/// detection-to-request latency small (the first picture after a keyframe request
+/// already takes ~1.2 s) at the cost of a handful of mutex locks and comparisons.
+const RECOVERY_TICK: Duration = Duration::from_millis(100);
+
+/// A flowing stream may go silent for this long before the room is reconnected
+/// (`decode/recovery.rs` `L3_SILENCE`), unless some *other* watched stream still delivers.
+const RECONNECT_IF_ALL_SILENT_FOR: Duration = Duration::from_secs(8);
+
+/// One recovery pass over the watched video streams. Keyframe requests go out as
+/// Unsubscribe + Subscribe (spec §9: the relay asks the owner for an IDR when a
+/// subscriber is *newly added*, so a plain re-Subscribe does nothing). Returns
+/// `true` when it asked for a reconnect: a synthetic `ControlClosed` is forwarded,
+/// which `drain_events` handles exactly like a dropped connection (`suspend_room`).
+fn run_recovery_tick(
+    client: &ScreenshareClient,
+    watches: &Arc<Mutex<HashMap<(ConnId, StreamId), WatchEntry>>>,
+    forward_tx: &mpsc::UnboundedSender<ClientEvent>,
+) -> bool {
+    // Debug/A-B switch for measuring what recovery buys (`SSS_DISABLE_VIEWER_RECOVERY=1`);
+    // decoders still keep their state, nothing acts on it.
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DISABLED.get_or_init(|| std::env::var_os("SSS_DISABLE_VIEWER_RECOVERY").is_some()) {
+        return false;
+    }
+    let now = Instant::now();
+    let mut requests: Vec<(ConnId, StreamId)> = Vec::new();
+    let mut reconnect = false;
+    {
+        let map = watches.lock().unwrap();
+        for (key, entry) in map.iter() {
+            match entry.decoder.lock().unwrap().tick(now) {
+                Some(decode::RecoveryAction::RequestKeyframe | decode::RecoveryAction::ResetDecoder) => requests.push(*key),
+                Some(decode::RecoveryAction::Reconnect) => reconnect = true,
+                None => {}
+            }
+        }
+        // One silent sharer is that sharer's problem; only when nothing else of the room
+        // delivered either is it our path.
+        if reconnect
+            && map.values().any(|e| e.decoder.lock().unwrap().has_flowed_recently(now, RECONNECT_IF_ALL_SILENT_FOR))
+        {
+            reconnect = false;
+        }
+    }
+    for (owner, stream_id) in requests {
+        let client = client.clone();
+        let watches = watches.clone();
+        tokio::spawn(async move {
+            if let Err(e) = client.unsubscribe(owner, stream_id).await {
+                tracing::warn!("recovery: unsubscribe({owner:016x}, {stream_id}) failed: {e:#}");
+                return;
+            }
+            // The user may have stopped watching in the meantime: do not resurrect it.
+            if watches.lock().unwrap().contains_key(&(owner, stream_id))
+                && let Err(e) = client.subscribe(owner, stream_id).await
+            {
+                tracing::warn!("recovery: subscribe({owner:016x}, {stream_id}) failed: {e:#}");
+            }
+        });
+    }
+    if reconnect {
+        let _ = forward_tx.send(ClientEvent::ControlClosed(
+            "no media received for 8 s on a stream that was flowing (dead path)".to_string(),
+        ));
+    }
+    reconnect
+}
+
 /// Always-on per-connection task that reads `raw_events` — the exact
 /// `mpsc::UnboundedReceiver<ClientEvent>` `ScreenshareClient::connect`
 /// returns — as fast as events arrive, independent of the UI's repaint-driven
@@ -1935,12 +2004,20 @@ pub fn room_id_prefix(join_string: &str) -> String {
 /// keep handling exactly as before, at its normal throttled pace. See
 /// `ui.rs`'s original module docs (preserved in git history) for the full
 /// "fast-forward catch-up" root-cause writeup this task fixes.
+///
+/// It is also the viewer-recovery driver (`run_recovery_tick`, every [`RECOVERY_TICK`]).
 pub async fn spawn_media_ingestion_task(
     mut raw_events: mpsc::UnboundedReceiver<ClientEvent>,
     forward_tx: mpsc::UnboundedSender<ClientEvent>,
     watches: Arc<Mutex<HashMap<(ConnId, StreamId), WatchEntry>>>,
     audio_watches: Arc<Mutex<HashMap<(ConnId, StreamId), AudioWatch>>>,
+    client: ScreenshareClient,
 ) {
+    // Viewer recovery driver (`decode/recovery.rs`): every `RECOVERY_TICK` each watched
+    // stream's decoder decides whether it needs a keyframe request, a reset or a reconnect.
+    let mut recovery_tick = tokio::time::interval(RECOVERY_TICK);
+    recovery_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut reconnect_requested = false;
     loop {
         // Racing `raw_events.recv()` against `forward_tx.closed()` (rather
         // than only detecting a dropped `RoomSession` via a failed
@@ -1951,6 +2028,12 @@ pub async fn spawn_media_ingestion_task(
         let event = tokio::select! {
             event = raw_events.recv() => event,
             _ = forward_tx.closed() => return,
+            _ = recovery_tick.tick() => {
+                if !reconnect_requested && run_recovery_tick(&client, &watches, &forward_tx) {
+                    reconnect_requested = true;
+                }
+                continue;
+            }
         };
         let Some(event) = event else { return };
         match event {
@@ -3434,6 +3517,7 @@ impl AppState {
             forward_tx,
             watches.clone(),
             audio_watches.clone(),
+            client.clone(),
         ));
 
         self.rooms.insert(

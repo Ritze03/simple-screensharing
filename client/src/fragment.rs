@@ -119,14 +119,18 @@ struct FrameBuf {
     fragments: Vec<Option<Vec<u8>>>,
     received: usize,
     last_touched: Instant,
+    /// The header's keyframe bit (same on every fragment), so a discarded
+    /// frame can be reported as "an IDR was lost".
+    keyframe: bool,
 }
 
 impl FrameBuf {
-    fn new(fragment_count: usize) -> Self {
+    fn new(fragment_count: usize, keyframe: bool) -> Self {
         Self {
             fragments: vec![None; fragment_count],
             received: 0,
             last_touched: Instant::now(),
+            keyframe,
         }
     }
 
@@ -148,6 +152,47 @@ struct StreamReassembly {
     /// Keyed by frame_id; BTreeMap keeps them ordered so "oldest" is cheap.
     /// frame_id is monotonically increasing per spec §5.1/§6.5.
     frames: BTreeMap<u32, FrameBuf>,
+    /// Incomplete frames discarded since the last frame this stream delivered;
+    /// handed out (and cleared) with the next delivered frame.
+    pending_loss: FrameLoss,
+}
+
+/// Frames the receiver gave up on: an incomplete frame was evicted by a newer
+/// one or aged out (spec §6.5), i.e. some of its fragments never arrived.
+///
+/// `Why this exists:` the wire is lossy and has no retransmission, but the
+/// reassembler used to discard such frames silently, so the viewer could not
+/// tell "a reference frame is missing, the picture is corrupt, ask for a
+/// keyframe" from "all fine". Deliberately *only* this: a frame whose every
+/// fragment was lost leaves no trace here (the connection-wide `frame_id`
+/// counter is shared by every stream and the previews, so gaps in it are not
+/// evidence). The browser has the same blind spot (`fragment.js`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FrameLoss {
+    /// Incomplete frames discarded.
+    pub frames: u32,
+    /// At least one of them was a keyframe: everything after it (up to the
+    /// next keyframe) references a picture the viewer never got.
+    pub keyframe: bool,
+    /// For the last lost keyframe: fragments it was split into / how many arrived (diagnostics:
+    /// how large the keyframes that do not make it are).
+    pub keyframe_fragments: u16,
+    pub keyframe_received: u16,
+}
+
+impl FrameLoss {
+    pub fn is_none(&self) -> bool {
+        self.frames == 0
+    }
+
+    fn note(&mut self, buf: &FrameBuf) {
+        self.frames = self.frames.saturating_add(1);
+        if buf.keyframe {
+            self.keyframe = true;
+            self.keyframe_fragments = buf.fragments.len().min(u16::MAX as usize) as u16;
+            self.keyframe_received = buf.received.min(u16::MAX as usize) as u16;
+        }
+    }
 }
 
 /// How many incomplete frames to keep in flight per stream before evicting
@@ -176,16 +221,35 @@ impl Reassembler {
     /// Returns `Some(ciphertext_with_tag)` once the frame is fully
     /// reassembled (caller then AEAD-decrypts it), otherwise `None`.
     pub fn insert(&mut self, header: &MediaHeader, fragment_payload: &[u8]) -> Option<Vec<u8>> {
+        self.insert_with_loss(header, fragment_payload).0
+    }
+
+    /// [`Self::insert`] that also reports the frames discarded since the
+    /// previous frame this stream delivered. The report is only non-default
+    /// alongside a delivered frame; losses seen while nothing is delivered
+    /// accumulate until the next delivery.
+    pub fn insert_with_loss(&mut self, header: &MediaHeader, fragment_payload: &[u8]) -> (Option<Vec<u8>>, FrameLoss) {
         let key = (header.conn_id, header.stream_id);
         let stream = self.streams.entry(key).or_insert_with(|| StreamReassembly {
             frames: BTreeMap::new(),
+            pending_loss: FrameLoss::default(),
         });
+        let frame = Self::insert_into(stream, header, fragment_payload);
+        let loss = if frame.is_some() { std::mem::take(&mut stream.pending_loss) } else { FrameLoss::default() };
+        (frame, loss)
+    }
 
+    fn insert_into(stream: &mut StreamReassembly, header: &MediaHeader, fragment_payload: &[u8]) -> Option<Vec<u8>> {
         // Stale-timeout backstop: drop any buffer untouched for too long.
         let now = Instant::now();
-        stream
-            .frames
-            .retain(|_, buf| now.duration_since(buf.last_touched) < STALE_TIMEOUT);
+        let pending = &mut stream.pending_loss;
+        stream.frames.retain(|_, buf| {
+            let fresh = now.duration_since(buf.last_touched) < STALE_TIMEOUT;
+            if !fresh {
+                pending.note(buf);
+            }
+            fresh
+        });
 
         if header.fragment_count == 0 {
             return None; // malformed, nothing to reassemble
@@ -194,7 +258,7 @@ impl Reassembler {
         let buf = stream
             .frames
             .entry(header.frame_id)
-            .or_insert_with(|| FrameBuf::new(header.fragment_count as usize));
+            .or_insert_with(|| FrameBuf::new(header.fragment_count as usize, header.is_keyframe()));
 
         let idx = header.fragment_index as usize;
         if idx >= buf.fragments.len() {
@@ -218,7 +282,9 @@ impl Reassembler {
             if oldest_id == header.frame_id {
                 break; // never evict the frame we just touched
             }
-            stream.frames.remove(&oldest_id);
+            if let Some(dropped) = stream.frames.remove(&oldest_id) {
+                stream.pending_loss.note(&dropped);
+            }
         }
 
         if complete {
@@ -392,5 +458,64 @@ mod tests {
             ..first_fragment(2)
         };
         assert_eq!(reassembler.insert(&h2_second, b"b").unwrap(), b"ab");
+    }
+
+    fn hdr(frame_id: u32, flags: u8, index: u16, count: u16) -> MediaHeader {
+        MediaHeader { version: 1, flags, conn_id: 1, stream_id: 0, frame_id, fragment_index: index, fragment_count: count }
+    }
+
+    #[test]
+    fn an_evicted_incomplete_frame_is_reported_with_the_next_delivered_frame() {
+        let mut r = Reassembler::new();
+        let (done, loss) = r.insert_with_loss(&hdr(1, 0, 0, 2), b"a");
+        assert!(done.is_none() && loss.is_none());
+        r.insert_with_loss(&hdr(2, 0, 0, 2), b"a");
+        // Frame 3 pushes the in-flight set over the cap: frame 1 is evicted. Nothing is
+        // delivered yet, so the loss waits for the next delivery.
+        let (done, loss) = r.insert_with_loss(&hdr(3, 0, 0, 2), b"a");
+        assert!(done.is_none());
+        assert!(loss.is_none(), "reported only alongside a delivered frame");
+        let (done, loss) = r.insert_with_loss(&hdr(3, 0, 1, 2), b"b");
+        assert_eq!(done.unwrap(), b"ab");
+        assert_eq!((loss.frames, loss.keyframe), (1, false));
+        // ... and is cleared once reported.
+        let (done, loss) = r.insert_with_loss(&hdr(4, 0, 0, 1), b"x");
+        assert!(done.is_some());
+        assert!(loss.is_none());
+    }
+
+    #[test]
+    fn a_lost_keyframe_is_flagged_as_such() {
+        use crate::protocol::MEDIA_FLAG_KEYFRAME;
+        let mut r = Reassembler::new();
+        r.insert_with_loss(&hdr(1, MEDIA_FLAG_KEYFRAME, 0, 3), b"a"); // IDR, 2 of 3 fragments never arrive
+        r.insert_with_loss(&hdr(2, 0, 0, 2), b"a");
+        r.insert_with_loss(&hdr(3, 0, 0, 2), b"a"); // evicts frame 1
+        let (done, loss) = r.insert_with_loss(&hdr(3, 0, 1, 2), b"b");
+        assert!(done.is_some());
+        assert_eq!((loss.frames, loss.keyframe, loss.keyframe_fragments, loss.keyframe_received), (1, true, 3, 1));
+    }
+
+    #[test]
+    fn an_aged_out_incomplete_frame_is_reported() {
+        let mut r = Reassembler::new();
+        r.insert_with_loss(&hdr(1, 0, 0, 2), b"a");
+        std::thread::sleep(STALE_TIMEOUT + Duration::from_millis(30));
+        let (done, loss) = r.insert_with_loss(&hdr(2, 0, 0, 1), b"x");
+        assert!(done.is_some());
+        assert_eq!(loss.frames, 1);
+    }
+
+    #[test]
+    fn clean_delivery_reports_no_loss() {
+        let mut r = Reassembler::new();
+        let ciphertext: Vec<u8> = (0..5000u32).map(|i| i as u8).collect();
+        for id in 0..20u32 {
+            for d in fragment_frame(1, 0, id, id == 0, &ciphertext, 1200).unwrap() {
+                let (h, p) = MediaHeader::unpack(&d).unwrap();
+                let (_, loss) = r.insert_with_loss(&h, p);
+                assert!(loss.is_none());
+            }
+        }
     }
 }

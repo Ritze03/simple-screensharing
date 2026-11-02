@@ -85,6 +85,8 @@ view.empty: "Gerade ist niemand zu sehen — wählen Sie in der Seitenleiste jem
 video.fps_label: "%{fps} fps"
 video.popped_out_note: "(losgelöst — im eigenen Fenster geöffnet; dieses Fenster schließen, um zurückzukehren)"
 video.waiting_frame: "Warte auf das erste dekodierte Bild…"
+video.recovering: "Stelle das Bild wieder her…"
+video.sharer_stalled: "Aufnahme des Teilenden hängt"
 
 audio.volume_label: "Lautstärke"
 

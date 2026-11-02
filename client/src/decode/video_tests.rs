@@ -55,6 +55,7 @@ fn media(au: &Au) -> DecryptedMediaFrame {
         pts: au.pts_us,
         keyframe: au.keyframe,
         stalled: false,
+        loss: Default::default(),
         payload: au.data.clone(),
     }
 }
@@ -239,6 +240,7 @@ fn unrecognised_or_non_key_access_units_are_dropped_until_a_codec_is_known() {
         pts: 0,
         keyframe: true,
         stalled: false,
+        loss: Default::default(),
         payload: vec![0x55; 4096],
     });
     std::thread::sleep(Duration::from_millis(300));

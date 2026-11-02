@@ -295,6 +295,9 @@ use crate::protocol::{ConnId, StreamId};
 mod avsync;
 mod codec;
 mod frame;
+mod recovery;
+#[cfg(test)]
+mod recovery_tests;
 pub mod render;
 #[cfg(test)]
 mod test_util;
@@ -303,6 +306,8 @@ mod video;
 mod video_tests;
 
 pub use codec::{sniff, VideoCodec};
+pub use recovery::{RecoveryAction, ViewState};
+use recovery::{FrameObs, Recovery};
 pub use frame::{DecodedFrame, DecoderInfo, DecoderStats, FrameSource, YuvMatrix};
 use video::PipelineMsg;
 
@@ -739,11 +744,13 @@ pub struct StreamDecoder {
     /// `seq` of the last frame [`Self::latest_frame`] handed out, so it
     /// yields each frame at most once.
     legacy_seen_seq: u64,
-    /// A decoder can't produce anything from a mid-GOP delta frame alone, so
-    /// frames are dropped until the first keyframe is seen — otherwise every
-    /// frame between subscribing and the next keyframe (up to the spec's
-    /// 2-second GOP) would just be decode-error log spam.
-    seen_keyframe: bool,
+    /// Viewer recovery state machine (`decode/recovery.rs`). Besides driving
+    /// keyframe requests / decoder resets / reconnects it owns the keyframe gate:
+    /// a decoder can't produce anything from a mid-GOP delta frame alone, so
+    /// deltas are dropped until the first keyframe (otherwise every frame between
+    /// subscribing and the next keyframe, up to the spec's 2-second GOP, is just
+    /// decode-error log spam) and again whenever a keyframe is known to be missing.
+    recovery: Recovery,
     thread: Option<thread::JoinHandle<()>>,
     /// Live viewer-side received-bitrate tracker — see [`ByteRateCounter`]/
     /// [`Self::received_bitrate_kbps`].
@@ -821,7 +828,7 @@ impl StreamDecoder {
             tx,
             frames: FrameSource(shared),
             legacy_seen_seq: 0,
-            seen_keyframe: false,
+            recovery: Recovery::new(Instant::now()),
             thread: Some(thread),
             byte_counter: ByteRateCounter::new(),
             created_at: Instant::now(),
@@ -877,11 +884,28 @@ impl StreamDecoder {
         // than decoded (matches `last_frame_at`'s same "arrival, not decode
         // success" reasoning just above).
         self.byte_counter.record(frame.payload.len());
-        if !self.seen_keyframe {
-            if !frame.keyframe {
-                return;
-            }
-            self.seen_keyframe = true;
+        // Loss bookkeeping and the keyframe gate (before first keyframe, after a lost IDR, a
+        // blackout, a reset): `false` means hold the last picture and drop this delta.
+        let obs = FrameObs { keyframe: frame.keyframe, stalled: frame.stalled, loss: frame.loss };
+        if frame.loss.keyframe {
+            tracing::info!(
+                "stream {}: a keyframe never completed ({}/{} fragments arrived)",
+                self.stream_id,
+                frame.loss.keyframe_received,
+                frame.loss.keyframe_fragments
+            );
+        }
+        let deliver = self.recovery.on_frame(now, obs);
+        if let Some((took, asks)) = self.recovery.take_recovered() {
+            tracing::info!(
+                "stream {}: recovered, keyframe ({} kB) arrived {} ms after the problem began ({asks} request(s))",
+                self.stream_id,
+                frame.payload.len() / 1000,
+                took.as_millis()
+            );
+        }
+        if !deliver {
+            return;
         }
         let msg = PipelineMsg::AccessUnit {
             pts_us: frame.pts,
@@ -889,8 +913,9 @@ impl StreamDecoder {
             data: frame.payload.clone(),
         };
         match self.tx.try_send(msg) {
-            Ok(()) => {}
+            Ok(()) => self.recovery.on_fed(now),
             Err(std_mpsc::TrySendError::Full(_)) => {
+                self.recovery.on_ingest_drop(now, frame.keyframe);
                 // Decode can't keep up with the incoming rate right now;
                 // drop this access unit rather than growing an unbounded
                 // backlog. Matches the "drop and continue" policy the
@@ -1021,6 +1046,69 @@ impl StreamDecoder {
         }
         let reference = self.last_frame_at.unwrap_or(self.created_at);
         now.saturating_duration_since(reference) > NO_FRAME_STALL_TIMEOUT
+    }
+
+    /// Periodic recovery driver (call every ~100 ms; the media-ingestion task does).
+    /// Decides whether the stream needs help and says what the *caller* must do:
+    /// [`RecoveryAction::RequestKeyframe`] / [`RecoveryAction::ResetDecoder`] mean
+    /// "Unsubscribe + Subscribe this stream" (the relay then asks the sharer for an
+    /// IDR, spec §9; the decoder rebuild for `ResetDecoder` has already been
+    /// started here), [`RecoveryAction::Reconnect`] "the path is dead, reconnect
+    /// the room". See `decode/recovery.rs` for the levels and thresholds.
+    pub fn tick(&mut self, now: Instant) -> Option<RecoveryAction> {
+        let action = self.recovery.tick(now, self.frames.frames_decoded(), self.frames.0.needs_keyframe());
+        match action {
+            Some(RecoveryAction::ResetDecoder) => {
+                match self.tx.try_send(PipelineMsg::Reset) {
+                    Ok(()) => {}
+                    // The ingest channel is full (decoder far behind): do not block the caller's
+                    // thread, hand the reset over from a throwaway thread instead.
+                    Err(std_mpsc::TrySendError::Full(_)) => {
+                        let tx = self.tx.clone();
+                        thread::spawn(move || {
+                            let _ = tx.send(PipelineMsg::Reset);
+                        });
+                    }
+                    Err(std_mpsc::TrySendError::Disconnected(_)) => {}
+                }
+                tracing::info!(
+                    "stream {}: recovery L2, decoder reset + keyframe request ({} request(s), {} reset(s) so far)",
+                    self.stream_id,
+                    self.recovery.asks_total,
+                    self.recovery.resets_total
+                );
+            }
+            Some(RecoveryAction::RequestKeyframe) => {
+                tracing::info!("stream {}: recovery L1, requesting a keyframe ({:?}, {} so far)", self.stream_id, self.recovery.episode_reason(), self.recovery.asks_total);
+            }
+            Some(RecoveryAction::Reconnect) => {
+                tracing::warn!("stream {}: recovery L3, nothing received for 8 s on a flowing stream", self.stream_id);
+            }
+            None => {}
+        }
+        action
+    }
+
+    /// What a tile should say about this stream's health (never acts on it).
+    pub fn view_state(&self, now: Instant) -> ViewState {
+        self.recovery.view_state(now)
+    }
+
+    /// When the last media frame of this stream arrived (any frame).
+    pub fn last_arrival(&self) -> Option<Instant> {
+        self.recovery.last_arrival()
+    }
+
+    /// Whether this stream looks healthy as of its last arrival: used by the
+    /// driver to tell "our path is dead" (every stream silent) from "this one
+    /// sharer is silent".
+    pub fn has_flowed_recently(&self, now: Instant, within: Duration) -> bool {
+        self.recovery.last_arrival().is_some_and(|t| now.saturating_duration_since(t) < within)
+    }
+
+    #[cfg(test)]
+    fn recovery_gate_closed(&self) -> bool {
+        self.recovery.gate_closed()
     }
 }
 
@@ -2508,6 +2596,7 @@ mod tests {
             pts: 0,
             keyframe: true,
             stalled,
+            loss: Default::default(),
             // Not decodable, and deliberately so: `is_stalled` is about frame
             // *arrival*, not decode success, and must not depend on the
             // pipeline managing to make a picture out of anything.
@@ -2619,7 +2708,7 @@ mod tests {
         for _ in 0..5 {
             decoder.feed(&delta);
         }
-        assert!(!decoder.seen_keyframe, "the test's premise: nothing was actually accepted for decode");
+        assert!(decoder.recovery_gate_closed(), "the test's premise: nothing was actually accepted for decode");
         assert!(
             !decoder.is_stalled_at(Instant::now()),
             "pre-keyframe frames are still evidence the sender is alive"
@@ -2673,6 +2762,7 @@ mod tests {
         for (i, au) in access_units.iter().enumerate() {
             let frame = DecryptedMediaFrame {
                 stalled: false,
+                loss: Default::default(),
                 conn_id: 1,
                 stream_id: 7,
                 pts: (i as u64) * 33_333,
@@ -2922,6 +3012,7 @@ mod tests {
         for (i, packet) in packets.iter().enumerate() {
             let frame = DecryptedMediaFrame {
                 stalled: false,
+                loss: Default::default(),
                 conn_id: 1,
                 stream_id: 9,
                 pts: (i as u64) * 20_000,
@@ -2939,6 +3030,7 @@ mod tests {
             pts: 0,
             keyframe: true,
             stalled: false,
+            loss: Default::default(),
             payload: vec![1, 2, 3],
         });
 
@@ -3765,6 +3857,7 @@ mod tests {
         for &i in &order {
             decoder.feed(&DecryptedMediaFrame {
                 stalled: false,
+                loss: Default::default(),
                 conn_id: 1,
                 stream_id: 11,
                 // PTS follows the packet's true position, not its arrival

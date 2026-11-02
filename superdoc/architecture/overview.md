@@ -400,7 +400,11 @@ covers a graceful restart (the sender is still sending, so silence never fires),
 covers a sender that died without being able to signal anything. `is_stalled_at(now)` takes
 an injected `Instant` so the timing half is testable without sleeping. This stage builds
 only the *signal*; the placeholder UI that consumes it (pulsing bar → spinner →
-"still waiting" tiers) is a later UI stage.
+"still waiting" tiers) is a later UI stage. **Update 2026-11-02 (#101):** the tile and pop-out
+now show a centred chip from `StreamDecoder::view_state` ("Recovering…" / "Sharer's capture
+stalled", the latter driven by this flag, display only) and the viewer acts on *local* evidence
+(loss, silence, a decoder that outputs nothing) with keyframe requests, a decoder reset and a
+reconnect: `features/video-pipeline.md` "Viewer recovery". The flag itself still drives nothing.
 
 ### The wire-PTS continuity invariant
 

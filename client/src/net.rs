@@ -554,6 +554,9 @@ pub struct DecryptedMediaFrame {
     /// capture placeholder" hint; nothing may branch on it that has a security
     /// or protocol consequence (no teardown, no unsubscribe, no key handling).
     pub stalled: bool,
+    /// Incomplete frames of this stream the reassembler discarded since the previous frame it
+    /// delivered (loss evidence for viewer recovery, `decode/recovery.rs`).
+    pub loss: crate::fragment::FrameLoss,
     /// Raw codec bytes (one H.264 access unit, or one Opus packet).
     pub payload: Vec<u8>,
 }
@@ -899,7 +902,8 @@ async fn datagram_reader_loop(connection: quinn::Connection, room_key: [u8; 32],
                 continue;
             }
         };
-        let Some(ciphertext) = reassembler.insert(&header, fragment_payload) else {
+        let (done, loss) = reassembler.insert_with_loss(&header, fragment_payload);
+        let Some(ciphertext) = done else {
             continue;
         };
         let nonce = build_nonce(header.conn_id, header.frame_id);
@@ -911,6 +915,7 @@ async fn datagram_reader_loop(connection: quinn::Connection, room_key: [u8; 32],
                     pts,
                     keyframe: header.is_keyframe(),
                     stalled: header.is_stalled(),
+                    loss,
                     payload,
                 };
                 if tx.send(ClientEvent::MediaFrame(frame)).is_err() {

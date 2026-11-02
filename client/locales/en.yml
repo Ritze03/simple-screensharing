@@ -85,6 +85,8 @@ view.empty: "Nobody's on screen right now — pick someone from a room in the si
 video.fps_label: "%{fps} fps"
 video.popped_out_note: "(popped out — see its separate window; close that window to bring it back here)"
 video.waiting_frame: "Waiting for first decoded frame…"
+video.recovering: "Recovering…"
+video.sharer_stalled: "Sharer's capture stalled"
 
 audio.volume_label: "Volume"
 

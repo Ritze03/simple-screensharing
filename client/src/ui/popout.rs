@@ -18,8 +18,9 @@
 //! - **Audio pill** `[25 mute][110 slider 0–200 %][34 %]` (or `[mute]Muted`),
 //!   only when the sender shares audio; otherwise a "No audio shared" chip.
 //!   Pushes [`UiAction::SetVolume`] through the main window.
-//! - **Waiting / stalled**: a centred chip before the first frame and while
-//!   the decoder reports a stall (always shown, not hover-gated).
+//! - **Waiting / recovering / stalled**: a centred chip before the first frame, while the
+//!   viewer recovers a lost keyframe ("Recovering…") and while the sharer flags its capture
+//!   as stalled (always shown, not hover-gated; same wording as the in-app tile).
 //! - **F11** or a **double-click** toggles fullscreen, **Escape** only leaves fullscreen (never
 //!   closes).
 //! - Title "sharer · room"; first size from the stream's aspect ratio.
@@ -33,13 +34,14 @@
 //! and can't hold `Cx`, and screens never mutate `AppState` themselves.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use egui::{
     Align, Color32, CornerRadius, Layout, Rect, Sense, Stroke, StrokeKind, Ui, UiBuilder, Vec2,
     pos2, vec2,
 };
+use simple_screensharing_client::decode::ViewState;
 use simple_screensharing_client::decode::render::{Fit, VideoView};
 
 use super::{Cx, StreamKey, UiAction, tr};
@@ -70,7 +72,8 @@ struct Win {
 struct Shared {
     view: Arc<Mutex<VideoView>>,
     close: Arc<AtomicBool>,
-    stalled: AtomicBool,
+    /// [`ViewState`] of the stream as a number (0 healthy, 1 recovering, 2 sharer stalled).
+    health: AtomicU8,
     info: Mutex<Info>,
     /// Volume edit from the viewport, applied by the main window.
     pending_volume: Mutex<Option<(u32, bool)>>,
@@ -108,7 +111,7 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut PopoutState) {
             shared: Arc::new(Shared {
                 view: entry.view.clone(),
                 close: entry.close_requested.clone(),
-                stalled: AtomicBool::new(false),
+                health: AtomicU8::new(0),
                 info: Mutex::new(Info::default()),
                 pending_volume: Mutex::new(None),
             }),
@@ -181,14 +184,18 @@ fn refresh_info(cx: &Cx, key: StreamKey, shared: &Shared) -> bool {
         .map(|(w, h)| format!("{w}x{h}"))
         .unwrap_or_default();
     let vol = cx.state.volume(room, owner, stream);
-    let (mut has_audio, mut kbps, mut stalled) = (false, 0.0, false);
+    let (mut has_audio, mut kbps, mut health) = (false, 0.0, 0u8);
     if let Some(s) = cx.session(room)
         && let Some(w) = s.watches.lock().unwrap().get(&(owner, stream))
     {
         has_audio = w.audio_stream_id.is_some();
         let mut d = w.decoder.lock().unwrap();
         kbps = d.received_bitrate_kbps();
-        stalled = d.is_stalled();
+        health = match d.view_state(std::time::Instant::now()) {
+            ViewState::Healthy => 0,
+            ViewState::Recovering => 1,
+            ViewState::SharerStalled => 2,
+        };
     }
     {
         let mut info = shared.info.lock().unwrap();
@@ -202,7 +209,7 @@ fn refresh_info(cx: &Cx, key: StreamKey, shared: &Shared) -> bool {
             info.muted = vol.muted;
         }
     }
-    shared.stalled.swap(stalled, Ordering::Relaxed) != stalled
+    shared.health.swap(health, Ordering::Relaxed) != health
 }
 
 // ---------------------------------------------------------------------------
@@ -221,11 +228,12 @@ fn viewport(ctx: &egui::Context, shared: &Shared) {
             // Double-click toggles fullscreen. Registered before the chrome,
             // whose buttons then take their own clicks.
             double_clicked = ui.interact(rect, ui.id().with("popout_dbl"), Sense::click()).double_clicked();
-            if !first_frame || shared.stalled.load(Ordering::Relaxed) {
-                let text = if first_frame {
-                    tr("stream_control.state_stalled", "Waiting for capture…")
-                } else {
-                    tr("video.waiting_frame", "Waiting for first decoded frame…")
+            let health = shared.health.load(Ordering::Relaxed);
+            if !first_frame || health != 0 {
+                let text = match (first_frame, health) {
+                    (false, _) => tr("video.waiting_frame", "Waiting for first decoded frame…"),
+                    (true, 2) => tr("video.sharer_stalled", "Sharer's capture stalled"),
+                    (true, _) => tr("video.recovering", "Recovering…"),
                 };
                 centre_chip(ui, rect, &text);
             }

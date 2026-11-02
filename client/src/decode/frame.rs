@@ -24,7 +24,7 @@
 //!   repaint — the render side pulls on its own cadence.
 
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -365,6 +365,10 @@ pub(super) struct Shared {
     /// The sender's announced picture size, packed `width << 32 | height`
     /// (`0` = unknown). See [`visible_rect`].
     display_hint: AtomicU64,
+    /// Set by the pipeline thread while it is discarding deltas until a keyframe
+    /// (after a decoder failure or a reset); read by viewer recovery
+    /// (`decode/recovery.rs`) as "the decoder cannot continue without an IDR".
+    needs_keyframe: AtomicBool,
     decoded_fps: Mutex<FpsCounter>,
     presented_fps: Mutex<FpsCounter>,
     info: Mutex<DecoderInfo>,
@@ -380,6 +384,7 @@ impl Shared {
             presented_total: AtomicU64::new(0),
             dropped_total: AtomicU64::new(0),
             display_hint: AtomicU64::new(0),
+            needs_keyframe: AtomicBool::new(false),
             decoded_fps: Mutex::new(FpsCounter::new()),
             presented_fps: Mutex::new(FpsCounter::new()),
             info: Mutex::new(DecoderInfo::default()),
@@ -425,6 +430,14 @@ impl Shared {
 
     pub(super) fn decoded_total(&self) -> u64 {
         self.decoded_total.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn set_needs_keyframe(&self, v: bool) {
+        self.needs_keyframe.store(v, Ordering::Relaxed);
+    }
+
+    pub(super) fn needs_keyframe(&self) -> bool {
+        self.needs_keyframe.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]

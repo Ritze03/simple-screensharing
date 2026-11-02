@@ -41,6 +41,7 @@ use egui::epaint::{Mesh, RectShape, Vertex, WHITE_UV};
 use egui::{Align, Color32, CornerRadius, Id, Layout, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, UiBuilder, pos2, vec2};
 use simple_screensharing_client::capture::VideoCodec;
 use simple_screensharing_client::capture::destination::DestinationState;
+use simple_screensharing_client::decode::ViewState;
 use simple_screensharing_client::decode::render::Fit;
 use simple_screensharing_client::protocol::{StreamInfo, StreamKind};
 use simple_screensharing_client::session::{CaptureSourceId, DestinationId, ReconnectState, RoomHandle};
@@ -638,6 +639,7 @@ fn tiles(ui: &mut Ui, cx: &mut Cx, st: &mut RoomState, keys: &[StreamKey], cross
             popped_tile(ui, cxr, key, size, cross_room, &mut acts);
         } else if let Some(resp) = cxr.videos.show(key, ui, size, Fit::Contain) {
             tile_chrome(ui, resp.rect);
+            health_chip(ui, resp.rect, stream_health(cxr, key));
             // Double-click = fullscreen. Registered before the overlay, whose
             // buttons then take their own clicks. Single click does nothing.
             if ui.interact(resp.rect, Id::new(("tile_dbl", key)), Sense::click()).double_clicked() {
@@ -649,6 +651,34 @@ fn tiles(ui: &mut Ui, cx: &mut Cx, st: &mut RoomState, keys: &[StreamKey], cross
     for a in acts {
         cx.act(a);
     }
+}
+
+/// What the viewer's decoder says about a watched stream (recovering from loss,
+/// or the sharer's capture is stalled). `Healthy` when unknown.
+fn stream_health(cx: &Cx, key: StreamKey) -> ViewState {
+    cx.session(key.0)
+        .and_then(|s| s.watches.lock().unwrap().get(&(key.1, key.2)).map(|w| w.decoder.lock().unwrap().view_state(std::time::Instant::now())))
+        .unwrap_or(ViewState::Healthy)
+}
+
+/// A centred chip over a tile whose stream is not healthy, so a frozen picture is never
+/// mistaken for a live one: amber dot + "Recovering…" (a keyframe was lost or the link
+/// is down; the viewer is already asking for a new one) or "Sharer's capture stalled"
+/// (the sender flagged it; advisory, nothing acts on it). Nothing is drawn when healthy.
+fn health_chip(ui: &Ui, rect: Rect, state: ViewState) {
+    let text = match state {
+        ViewState::Healthy => return,
+        ViewState::Recovering => tr("video.recovering", "Recovering…"),
+        ViewState::SharerStalled => tr("video.sharer_stalled", "Sharer's capture stalled"),
+    };
+    let f = font(Weight::Bold, theme::FS_SMALL);
+    let dot = 7.0;
+    let w = (text_width(ui, &text, f.clone(), 0.0) + dot + theme::S2 + 2.0 * theme::S3).min(rect.width() - 2.0 * theme::S2);
+    let r = Rect::from_center_size(rect.center(), vec2(w, OVL_H));
+    ui.painter().rect_filled(r, CornerRadius::same(15), theme::CHIP_DARK);
+    ui.painter().circle_filled(pos2(r.left() + theme::S3 + dot / 2.0, r.center().y), dot / 2.0, theme::WARNING);
+    let tr_ = Rect::from_x_y_ranges(r.left() + theme::S3 + dot + theme::S2..=r.right() - theme::S3, r.y_range());
+    paint_text(ui, tr_, &text, f, theme::TEXT, Align::Min);
 }
 
 /// Rounded corners + the faint green ring around a tile's video. `Why` the
@@ -794,8 +824,14 @@ fn statbar(ui: &mut Ui, cx: &Cx, key: StreamKey, cell: Rect, cross_room: bool) {
     let slots = [fixed(7.0), fixed(name_w), fixed(res_w), fixed(fps_w), fixed(rate_w)];
     let row = HBox::new("hbox·statbar", OVL_H).pad(10.0, 10.0).slots(&slots).show(&mut child);
     let c = row.cell(0).center();
-    child.painter().circle_filled(c, 5.0, theme::SUCCESS_GLOW.gamma_multiply(0.25));
-    child.painter().circle_filled(c, 3.5, theme::SUCCESS);
+    // Amber instead of green while the stream is recovering or the sharer's capture is stalled.
+    let (dot, glow) = if stream_health(cx, key) == ViewState::Healthy {
+        (theme::SUCCESS, theme::SUCCESS_GLOW)
+    } else {
+        (theme::WARNING, theme::WARNING)
+    };
+    child.painter().circle_filled(c, 5.0, glow.gamma_multiply(0.25));
+    child.painter().circle_filled(c, 3.5, dot);
     let num = Color32::from_rgba_unmultiplied(232, 233, 236, 217);
     row.text(&child, 1, &name, nf, theme::TEXT, Align::Min);
     row.text(&child, 2, &res, mf.clone(), num, Align::Min);
