@@ -99,6 +99,72 @@ time) from before the GPU renderer; the UI no longer uses it (display goes throu
 Every codec clears the 240 fps target in hardware; in software only H.264 does, which is why
 the hardware path is first and the fallback is a safety net, not a plan.
 
+### Decoder falling behind: slow motion, then fast-forward (2026-11-03, #133)
+
+**User report (live, 2026-11-03):** "ale is streaming and his screenshare is constantly going
+faster and slower again", a *smooth* slowdown and speedup, ale shares no audio.
+
+**Mechanism (code):** the native viewer has no playout pacing (above: frames are shown the moment
+they are decoded; `PacingState` is not wired, and the Settings values `max_jitter_buffer_ms` /
+`catch_up_speed_percent` are stored but read by nothing on the native path). So when the decoder
+is slower than the stream nothing is dropped at first: access units queue in the pipeline
+thread's backlog (`decode/video.rs` `run`, up to `BACKLOG_MAX_AUS` = 64, 0.7 s at 90 fps), the
+picture runs late more and more (slow motion at decoder speed / stream rate), and when the decoder
+recovers the backlog plays out at full decoder speed (fast-forward). At the cap `trim_backlog`
+jumps to the newest keyframe or drops the oldest deltas.
+
+**Measured on the user's machine** (read-only, from `/proc` of the running client, which logs to
+`/dev/null`; build `cd91ebc`, so no log was available). Decoder output is a proxy: wakeups of the
+`video-repaint` thread, one per decoded frame.
+
+- Output alternated between ~90 fps and **35-45 fps** in stretches of 1-15 s and more, most of
+  23:01-23:05 and again 23:16:40-23:19:34, rarely in between. Leaving a slow stretch showed
+  110-190 fps for up to a second, the backlog draining.
+- In slow stretches the decoder's streaming thread was ~90 % in `drm_syncobj_array_wait_timeout`
+  (GPU fence waits), ~8 % runnable, and the pipeline thread spun on a full `appsrc`. So it was
+  waiting on the GPU, not short of CPU. The bytes received stayed near 820 kB/s (1 s resolution,
+  all room traffic); the arriving *frame* rate was not measured.
+- A few windows at 73-77 fps had the decoder idle ~60 % of the time: there less was arriving, which
+  this mechanism does not explain.
+
+**Cause of the slow stretches: not established.** Why a fence wait took ~22 ms per frame is open.
+The leading suspect is the video engine, shared with the user's own share: the saved defaults are
+AV1, Quality, 120 fps (the running share's settings and ale's codec and resolution were not read),
+and on Navi31 (VCN 4.0) the kernel moves every AV1 encode and decode job to instance 0
+(`drivers/gpu/drm/amd/amdgpu/vcn_v4_0.c`, `vcn_v4_0_limit_sched`; H.264/H.265/VP9 may use either).
+Quality is AV1's half-speed band (~152 fps raw, `stream-control.md` "`target-usage` is a bitfield
+on Mesa AMD"), so 120 fps would be ~80 % of that instance.
+
+- For: the encoder thread was ~95 % in GPU waits in the same stretches, and slow stretches happened
+  with no other process on the video engine.
+- Against: `vcn_busy_percent` was often only 55-60 % in slow stretches (whether that averages both
+  instances is unknown); a test AV1 decode next to an in-process 120 fps AV1 encode still reached
+  ~228 fps (1080p; ~192 fps at 4K), far above 90; and a rig share of AV1 240 fps Quality on the same
+  GPU from 23:19:46 did **not** slow the user's decoder (it held ~88-90 fps).
+- Confound: the 23:16:40-23:19:34 stretch overlapped this investigation's own release builds, and
+  one 44 fps window at ~23:12 followed its GPU load tests, so neither is a clean natural sample.
+
+Ruled out by the code: a playout or catch-up controller and clock drift (the native viewer has
+neither), A/V alignment (ale shares no audio). NACK hold-and-release and recovery loops were **not**
+ruled out by measurement, the client's log being unavailable.
+
+**What changed (#133): it is now in the log.** `decode/video.rs` `LagWatch` watches the backlog
+(PTS span of the queued access units) and logs a WARN when the decoder was >= 250 ms behind for
+>= 0.5 s or had to drop access units, at most once per 30 s, folding episodes in between, and
+reports an episode still running after 5 s: `video decoder fell behind the stream N time(s) since
+the last report (longest X s): up to Y ms late, Z access units dropped, decoder vaav1dec`.
+Exercised in the rig with the viewer forced to software AV1 (`LIBVA_DRIVER_NAME` pointed at a
+missing driver, private `GST_REGISTRY`): one line at start-up, then `19 time(s) ... 188 access
+units dropped, decoder av1dec` 30 s later. That proves the line, not the hardware case.
+`Why a log line and not a policy change:` the user's own log showed nothing of this, so the evidence
+existed only while someone watched `/proc`. A decoder that cannot keep up can only choose between
+slow motion (now), freezing until the next keyframe, or corrupt pictures; none is a fix, and the
+cause has to be known first. The line deliberately names no cause.
+
+**Next test (untested suggestion):** during a slow stretch stop the own share, or switch it to
+Balanced or H.265, and see whether the viewer recovers. That separates the video-engine suspect from
+the rest.
+
 ## Viewer recovery (`client/src/decode/recovery.rs`, 2026-11-02, #101)
 
 **The problem.** The wire is lossy and has no retransmission, so every codec/fps transition and every
