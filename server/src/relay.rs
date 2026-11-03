@@ -174,6 +174,7 @@ async fn media_forward_task(
                 route
                     .bytes_received
                     .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                route.diag.on_fragment(&data);
                 for target in route.targets().iter() {
                     // quinn's `send_datagram` never fails when the queue is
                     // full: it silently discards the oldest unsent datagrams.
@@ -186,6 +187,8 @@ async fn media_forward_task(
                             registry.datagrams_forwarded.fetch_add(1, Ordering::Relaxed);
                             if evicts {
                                 registry.datagrams_evicting.fetch_add(1, Ordering::Relaxed);
+                                route.diag.on_eviction();
+                                target.diag.evicted.fetch_add(1, Ordering::Relaxed);
                                 note_eviction(&mut evictions, target);
                             }
                         }
@@ -349,6 +352,10 @@ pub fn start(
         "QUIC endpoint listening (ALPN h3 + ssshare/1)"
     );
     tokio::spawn(certs.maintain(endpoint.clone(), registry.clone()));
+    tokio::spawn(crate::diag::run(
+        Arc::downgrade(&registry),
+        crate::diag::DEFAULT_WINDOW,
+    ));
     let serving = endpoint.clone();
     tokio::spawn(async move {
         if let Err(e) = serve(registry, serving).await {
@@ -541,6 +548,7 @@ async fn perform_join(
                 connection: connection.clone(),
                 transport,
                 subscriptions: HashSet::new(),
+                diag: Default::default(),
                 stream_count: 0,
             },
         );
@@ -932,6 +940,9 @@ async fn handle_client_message(
                 return;
             };
             let newly_added = stream.subscribers.insert(conn_id);
+            if newly_added {
+                stream.route.diag.on_subscribe(conn_id);
+            }
             let count = stream.subscribers.len() as u32;
             let send_keyframe = if newly_added {
                 let now = Instant::now();
@@ -967,7 +978,9 @@ async fn handle_client_message(
                 c.subscriptions.remove(&(target, stream_id));
             }
             if let Some(stream) = guard.streams.get_mut(&(target, stream_id)) {
-                stream.subscribers.remove(&conn_id);
+                if stream.subscribers.remove(&conn_id) {
+                    stream.route.diag.on_unsubscribe(conn_id);
+                }
                 let count = stream.subscribers.len() as u32;
                 guard.refresh_route((target, stream_id));
                 guard.log.push(format!(
