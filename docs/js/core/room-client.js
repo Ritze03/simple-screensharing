@@ -4,11 +4,12 @@ import { AudioReceiver, AudioSender, MAX_VOLUME } from "./audio.js";
 import { AvSync } from "./avsync.js";
 import { NonceSpaceExhausted, decryptFrame, decryptPreview, encryptFrame, encryptPreview, importRoomKey } from "./crypto.js";
 import { Reassembler, fragmentFrame, pacePlan } from "./fragment.js";
+import { HELLO_DATAGRAM, HELLO_INTERVAL_MS, HELLO_MAX_TRIES, SendRing, nackEnabledByDefault } from "./nack.js";
 import { JoinLinkError, parseJoinLink } from "./joinlink.js";
 import { PREVIEW_FIRST_DELAY_MS, PREVIEW_INTERVAL_MS, PreviewSampler } from "./preview.js";
 import {
   STREAM_TYPE_PREVIEW, WIRE_VERSION, clampUtf8, connIdFromHex, connIdToHex, packPreviewHeader, unpackMediaHeader, unpackPreviewHeader,
-  MEDIA_FLAG_KEYFRAME, MEDIA_FLAG_STALLED,
+  MEDIA_FLAG_KEYFRAME, MEDIA_FLAG_STALLED, NACK_TAG_HELLO_ACK, NACK_TAG_MISS, NACK_TAG_REQUEST, isNackDatagram, packNackRange, unpackNackRange,
 } from "./protocol.js";
 import { ConnectError, JoinRejectedError, RelaySession, classifyClose, supportsWebTransport } from "./session.js";
 import { CanvasRenderer, VideoReceiver } from "./video-rx.js";
@@ -27,6 +28,8 @@ const VIEWERS_TAG_HELLO = 0xe6;
 const VIEWERS_TAG_ACK = 0xe7;
 const VIEWERS_TAG_LIST = 0xe8;
 const VIEWERS_STALE_MS = 7000; // the relay repeats a non-empty list every 2 s
+const NACK_TICK_MS = 5; // poll the reassembler this often while a frame is incomplete (native: 5 ms too)
+const NACK_DEFAULT_RTT_MS = 150; // when the browser does not report a smoothed RTT (WebTransport getStats)
 
 export const streamKey = (ownerHex, streamId) => `${ownerHex}:${streamId}`;
 const parseKey = (key) => {
@@ -211,10 +214,11 @@ export class RoomClient extends EventTarget {
    * @param {"no-preference"|"prefer-hardware"|"prefer-software"} [o.hardwareAcceleration]
    * @param {number} [o.audioLatencyMs=80]
    * @param {AudioContext} [o.audioContext]
+   * @param {boolean} [o.nack]  selective retransmission (spec §6.6); default on unless `?nack=0` / `localStorage["sss-nack"]="0"`
    */
   constructor({
     displayName = "Browser", maxJitterBufferMs = 2000, catchUpSpeedPercent = 5, autoReconnect = true, lossRecovery = "resubscribe",
-    hardwareAcceleration = "no-preference", audioLatencyMs = 80, audioContext = null,
+    hardwareAcceleration = "no-preference", audioLatencyMs = 80, audioContext = null, nack = nackEnabledByDefault(),
   } = {}) {
     super();
     this.displayName = displayName;
@@ -223,6 +227,10 @@ export class RoomClient extends EventTarget {
     this.autoReconnect = autoReconnect;
     this.lossRecovery = lossRecovery;
     this.hardwareAcceleration = hardwareAcceleration;
+    this.nackEnabled = !!nack;
+    this.nackAcked = false; // the relay answered our Hello on this session: it caches fragments and serves requests
+    this.nackTimer = null;
+    this.sendRing = new SendRing();
     this.audioLatencyMs = audioLatencyMs;
     this._audioContext = audioContext;
 
@@ -323,7 +331,11 @@ export class RoomClient extends EventTarget {
     this.session = sess;
     this.selfId = connIdToHex(sess.connId);
     this.reassembler.clear();
+    this.reassembler.setNack(false);
+    this.nackAcked = false;
+    this.sendRing.clear();
     this.tx.clear();
+    this.#startHello(sess);
     sess.onControl = (m) => sess === this.session && this.#onControl(m);
     sess.onDatagram = (d) => sess === this.session && this.#onDatagram(d);
     sess.onPreviewStream = (b) => sess === this.session && this.#onPreviewStream(b);
@@ -344,6 +356,19 @@ export class RoomClient extends EventTarget {
     }
     for (const share of this.shares) this.#announceShare(share);
     this.#startPreviewTimers();
+  }
+
+  /** Say Hello once per second (at most 10 times) until the relay acknowledges (spec §6.6). An old relay drops the 1-byte datagram. */
+  #startHello(sess) {
+    if (!this.nackEnabled) return;
+    let tries = 0;
+    const tick = () => {
+      if (sess !== this.session || sess.closedFlag || this.nackAcked || tries >= HELLO_MAX_TRIES) return;
+      tries++;
+      sess.sendDatagram(HELLO_DATAGRAM);
+      setTimeout(tick, HELLO_INTERVAL_MS);
+    };
+    tick();
   }
 
   #onSessionClosed(sess, info) {
@@ -778,9 +803,17 @@ export class RoomClient extends EventTarget {
     const rx = this.subs.get(key);
     if (!rx) return null;
     if (rx.info.kind === "video") {
-      return { kind: "video", ...rx.impl.getStats(), decryptFailures: rx.decryptFailures, stalled: rx.stalled, droppedFrames: this.reassembler.droppedFrames };
+      return { kind: "video", ...rx.impl.getStats(), decryptFailures: rx.decryptFailures, stalled: rx.stalled, droppedFrames: this.reassembler.droppedFrames, nack: this.nackStats() };
     }
     return { kind: "audio", ...rx.impl.stats, level: rx.impl.level, volume: rx.impl.volume, muted: rx.impl.muted, decryptFailures: rx.decryptFailures };
+  }
+
+  /** Selective retransmission counters (spec §6.6): viewer side (requests, repairs) and sender side (re-sends). */
+  nackStats() {
+    return {
+      enabled: this.nackEnabled, active: this.nackAcked, rttMs: this.#rttMs(), rttReported: Number.isFinite(this.lastTransportStats?.smoothedRtt), ...this.reassembler.nackStats,
+      served: { requests: this.sendRing.requests, resent: this.sendRing.resent, missed: this.sendRing.missed },
+    };
   }
 
   // -------------------------------------------------------------------------------- receive path
@@ -829,7 +862,16 @@ export class RoomClient extends EventTarget {
   }
 
   #onDatagram(bytes) {
-    if (bytes[0] >= 0xe0) return this.#onViewersDatagram(bytes);
+    // Viewer lists (spec 9.1) first: ViewersAck is 1 byte and ViewersList can be >= 19 bytes, so neither is told apart from
+    // NACK-family or media datagrams by length. Then NACK-family (< 19 bytes, tag >= 0xE0), then media, untouched.
+    if ((bytes[0] === VIEWERS_TAG_ACK && bytes.length === 1) || bytes[0] === VIEWERS_TAG_LIST) {
+      this.#onViewersDatagram(bytes);
+      return;
+    }
+    if (isNackDatagram(bytes)) {
+      this.#onNackDatagram(bytes);
+      return;
+    }
     let parsed;
     try {
       parsed = unpackMediaHeader(bytes);
@@ -841,8 +883,73 @@ export class RoomClient extends EventTarget {
     const key = streamKey(connIdToHex(header.connId), header.streamId);
     const rx = this.subs.get(key);
     if (!rx) return;
-    const done = this.reassembler.insert(header, payload);
-    if (done) rx.enqueue({ type: "frame", frameId: header.frameId, ciphertext: done.ciphertext, keyframe: done.keyframe, stalled: done.stalled });
+    const done = this.reassembler.ingest(header, payload);
+    if (done.length) this.#deliver(done);
+    if (this.reassembler.nack) this.#scheduleNackPoll();
+  }
+
+  /** Hand completed frames, in order, to their receivers. */
+  #deliver(frames) {
+    for (const f of frames) {
+      const rx = this.subs.get(streamKey(connIdToHex(f.connId), f.streamId));
+      if (rx) rx.enqueue({ type: "frame", frameId: f.frameId, ciphertext: f.ciphertext, keyframe: f.keyframe, stalled: f.stalled });
+    }
+  }
+
+  /** One NACK-family datagram (spec §6.6): the relay's HelloAck switches the reassembler to NACK mode, a Miss ends a repair, a Request asks us to re-send. */
+  #onNackDatagram(bytes) {
+    if (!this.nackEnabled) return;
+    const sess = this.session;
+    switch (bytes[0]) {
+      case NACK_TAG_HELLO_ACK:
+        this.nackAcked = true;
+        this.reassembler.setNack(true);
+        break;
+      case NACK_TAG_MISS: {
+        const r = unpackNackRange(bytes);
+        if (r) {
+          this.reassembler.nackMiss(r);
+          this.#scheduleNackPoll(0);
+        }
+        break;
+      }
+      case NACK_TAG_REQUEST: {
+        const r = unpackNackRange(bytes);
+        // only requests for our own streams; the relay forwards them only after our Hello was acknowledged
+        if (!r || !sess || !sess.joined || r.connId !== sess.connId) break;
+        if (sess.pendingDatagrams > MAX_PENDING_DATAGRAMS) break; // backed up: a re-send would arrive too late to matter
+        for (const d of this.sendRing.resends(r)) {
+          sess.sendDatagram(d);
+          this.sendRing.resent++;
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  }
+
+  #scheduleNackPoll(delay = NACK_TICK_MS) {
+    if (this.nackTimer != null) return;
+    this.nackTimer = setTimeout(() => {
+      this.nackTimer = null;
+      this.#nackPoll();
+    }, delay);
+  }
+
+  /** The viewer's connection RTT: WebTransport `getStats().smoothedRtt` where the browser has it, else a fixed allowance. */
+  #rttMs() {
+    const r = this.lastTransportStats?.smoothedRtt;
+    return Number.isFinite(r) && r > 0 ? r : NACK_DEFAULT_RTT_MS;
+  }
+
+  #nackPoll() {
+    const sess = this.session;
+    if (!sess || !this.reassembler.nack) return;
+    const { frames, requests } = this.reassembler.poll(this.#rttMs());
+    if (frames.length) this.#deliver(frames);
+    for (const r of requests) sess.sendDatagram(packNackRange(NACK_TAG_REQUEST, r));
+    if (this.reassembler.hasPending()) this.#scheduleNackPoll();
   }
 
   async #onPreviewStream(bytes) {
@@ -873,7 +980,7 @@ export class RoomClient extends EventTarget {
    * Encrypt (one counter value per frame), fragment to <= 1000 bytes and send as datagrams, strictly in order per stream.
    * Returns false when the frame was dropped (not connected / backlog), so the caller can ask for a keyframe.
    */
-  #sendMedia(streamId, { ptsUs, keyframe, payload, stalled = false }, fps = 60, bitrateKbps = 8000) {
+  #sendMedia(streamId, { ptsUs, keyframe, payload, stalled = false }, fps = 60, bitrateKbps = 8000, video = true) {
     const sess = this.session;
     if (!sess || !sess.joined) return false;
     const st = this.#txState(streamId);
@@ -891,6 +998,8 @@ export class RoomClient extends EventTarget {
           connId: sess.connId, streamId, frameId: counter, ciphertext: ct, maxDatagramSize: sess.maxDatagramSize,
           flags: (keyframe ? MEDIA_FLAG_KEYFRAME : 0) | (stalled ? MEDIA_FLAG_STALLED : 0),
         });
+        // Video only (audio is never NACKed): keep the datagrams so a relay-forwarded Request can be answered (spec §6.6).
+        if (video && this.nackEnabled) this.sendRing.record(streamId, counter, datagrams);
         const t0 = performance.now();
         const plan = pacePlan(datagrams.length, ct.length, keyframe, fps, bitrateKbps);
         if (!plan) {
@@ -1054,7 +1163,7 @@ export class RoomClient extends EventTarget {
       share.audioSender = new AudioSender({
         track: audioTrack, clock,
         onPacket: (p) => {
-          if (share.audioSubscribers > 0) this.#sendMedia(share.audioStreamId, { ...p, keyframe: true });
+          if (share.audioSubscribers > 0) this.#sendMedia(share.audioStreamId, { ...p, keyframe: true }, undefined, undefined, false);
         },
         onError: (e) => emitError(this, "audio-encoder-error", e),
       });
@@ -1122,6 +1231,7 @@ export class RoomClient extends EventTarget {
       if (share.audioStreamId != null) s.send({ type: "StopStream", streamId: share.audioStreamId }).catch(() => {});
     }
     this.tx.delete(share.videoStreamId);
+    this.sendRing.forget(share.videoStreamId);
     if (share.audioStreamId != null) this.tx.delete(share.audioStreamId);
     this.dispatchEvent(new CustomEvent("share", { detail: { state: "stopped", share } }));
   }

@@ -7,12 +7,13 @@ import { PostcardReader, PostcardWriter } from "../js/core/postcard.js";
 import * as P from "../js/core/protocol.js";
 import { MAX_LINK_ROOM_NAME_CHARS, base64urlDecode, bytesToHex, createRoom, encodeLinkName, formatJoinLink, hexToBytes, JoinLinkError, parseJoinLink, parseServerAddr, splitHostPort, stripLinkName } from "../js/core/joinlink.js";
 import { NonceSequence, NonceSpaceExhausted, buildAad, buildNonce, decryptFrame, decryptPreview, encryptFrame, encryptPreview, importRoomKey } from "../js/core/crypto.js";
-import { Reassembler, fragmentFrame, pacePlan } from "../js/core/fragment.js";
+import { NACK_HARD_LIMIT_MS, Reassembler, fragmentFrame, nackRetryInterval, pacePlan } from "../js/core/fragment.js";
+import { SEND_RING_BYTES, SendRing, nackEnabledByDefault } from "../js/core/nack.js";
 import { deriveCodecString, sniffCodec } from "../js/core/codec.js";
 import { DECODE_QUEUE_CATCHUP_THRESHOLD, JitterBuffer, MAX_DECODE_QUEUE, clampCatchUpSpeedPercent, clampMaxJitterBufferMs } from "../js/core/jitter.js";
 import { CanvasRenderer, VideoReceiver } from "../js/core/video-rx.js";
 import { ENCODER_PRESETS } from "../js/core/video-tx.js";
-import { avatarBg, avatarColors, avatarHue, snapVolumePct, VOLUME_MAX_PCT } from "../js/ui/dom.js";
+import { avatarBg, avatarColors, avatarHue, snapVolumePct, wheelStepVolumePct, volumeWheel, VOLUME_MAX_PCT } from "../js/ui/dom.js";
 import { AudioReceiver, MAX_VOLUME } from "../js/core/audio.js";
 
 const tests = [];
@@ -1028,6 +1029,317 @@ test("volume: gain goes up to 500 %, the UI cap matches the core cap, 100 % stay
 test("volume: the slider's 100 % detent snaps within 10 and leaves everything else alone", () => {
   for (const v of [90, 95, 100, 105, 110]) eq(snapVolumePct(v), 100);
   for (const v of [0, 85, 115, 200, 500]) eq(snapVolumePct(v), v);
+});
+
+test("volume: wheel step is 5 up to 200 %, 10 above, symmetric at the boundary, clamped (#113)", () => {
+  for (const [from, up, to] of [[0, true, 5], [95, true, 100], [100, true, 105], [195, true, 200], [200, true, 210], [205, true, 210],
+    [490, true, 500], [500, true, 500], [500, false, 490], [220, false, 210], [210, false, 200], [205, false, 200], [200, false, 195],
+    [105, false, 100], [5, false, 0], [0, false, 0]]) eq(wheelStepVolumePct(from, up), to, `${from} ${up ? "up" : "down"}`);
+  for (let p = 0; p < 500; p += 5) if (p <= 195 || p % 10 === 0) eq(wheelStepVolumePct(wheelStepVolumePct(p, true), false), p, "up then down at " + p);
+});
+
+test("volume: wheel events on the slider step it, fire input, are consumed and do not snap to 100 (#113)", () => {
+  const s = document.createElement("input");
+  Object.assign(s, { type: "range", min: "0", max: "500", step: "5", value: "195" });
+  document.body.appendChild(s);
+  const seen = [];
+  s.addEventListener("input", (ev) => seen.push([s.value, !!ev.fromWheel]));
+  volumeWheel(s);
+  const wheel = (deltaY, deltaMode = 0) => {
+    const e = new WheelEvent("wheel", { deltaY, deltaMode, bubbles: true, cancelable: true });
+    s.dispatchEvent(e);
+    return e.defaultPrevented;
+  };
+  try {
+    eq(wheel(-100), true, "wheel is consumed (no page scroll)");
+    eq(s.value, "200");
+    wheel(-120);
+    eq(s.value, "210");
+    wheel(100);
+    eq(s.value, "200");
+    wheel(100);
+    eq(s.value, "195");
+    wheel(3, 1); // Firefox line mode: one notch = 3 lines
+    eq(s.value, "190");
+    wheel(-20);
+    eq(s.value, "190", "a small touchpad delta accumulates first");
+    wheel(-40);
+    eq(s.value, "195", "...until it adds up to half a notch");
+    s.value = "95";
+    wheel(-100);
+    wheel(-100);
+    eq(s.value, "105", "95 -> 100 -> 105 passes through the detent");
+    eq(seen.every(([, fromWheel]) => fromWheel), true, "input events carry the wheel flag");
+    s.value = "500";
+    wheel(-100);
+    eq(s.value, "500", "clamped at the top");
+  } finally {
+    s.remove();
+  }
+});
+
+
+// ------------------------------------------------------------------------------------------------ NACK (spec §6.6, #111)
+// Ports of the native tests in client/src/fragment.rs / client/src/nack.rs (same cases, same numbers).
+
+const RTT = 25;
+
+/** A reassembler in NACK mode with a clock the test moves. */
+function nackReassembler() {
+  const clock = { t: 0 };
+  const drops = [];
+  const r = new Reassembler({ now: () => clock.t, onDrop: (c, s, f) => drops.push(f) });
+  r.setNack(true);
+  return { r, clock, drops };
+}
+
+/** Frame `id` as `count` fragments of 3 bytes labelled with their index. */
+function nackFrame(id, count, { keyframe = false, streamId = 0, connId = 1n } = {}) {
+  return Array.from({ length: count }, (_, i) => ({
+    h: { version: 1, flags: keyframe ? 1 : 0, connId, streamId, frameId: id, fragmentIndex: i, fragmentCount: count, keyframe, stalled: false },
+    p: new Uint8Array(3).fill(i),
+  }));
+}
+/** Feed fragments (skipping the listed indices) at time `t`; returns every frame delivered. */
+function nackFeed(ctx, t, frags, skip = []) {
+  ctx.clock.t = t;
+  const out = [];
+  for (const { h, p } of frags) if (!skip.includes(h.fragmentIndex)) out.push(...ctx.r.ingest(h, p));
+  return out;
+}
+function nackPoll(ctx, t, rtt = RTT) {
+  ctx.clock.t = t;
+  return ctx.r.poll(rtt);
+}
+const runs = (reqs) => reqs.map((q) => [q.first, q.count]);
+
+test("nack: a gap is requested after two later fragments and the repair completes the frame", () => {
+  const c = nackReassembler();
+  const f = nackFrame(5, 10);
+  eq(nackFeed(c, 0, f, [3, 4]).length, 0);
+  const { frames, requests } = nackPoll(c, 1);
+  eq(frames.length, 0);
+  eq(requests, [{ connId: 1n, streamId: 0, frameId: 5, first: 3, count: 2 }]);
+  const out = nackFeed(c, 30, f.slice(3, 5)); // the retransmits arrive
+  eq(out.length, 1);
+  eq(out[0].frameId, 5);
+  eq(Array.from(out[0].ciphertext), f.flatMap(({ p }) => Array.from(p)));
+  eq(c.drops, []);
+  const s = c.r.nackStats;
+  eq([s.requests, s.fragmentsRequested, s.fragmentsRecovered, s.framesRecovered, s.framesAbandoned], [1, 2, 2, 1, 0]);
+  ok(!c.r.hasPending());
+});
+
+test("nack: a hole right behind the newest fragment is not asked for yet, but a quiet frame has lost its tail", () => {
+  const c = nackReassembler();
+  nackFeed(c, 0, nackFrame(1, 10), [8]); // 8 missing, 9 arrived: one fragment behind it could be reordering
+  eq(nackPoll(c, 1).requests.length, 0);
+  eq(runs(nackPoll(c, 21).requests), [[8, 1]]); // 20 ms of silence
+});
+
+test("nack: a lost tail is requested when the frame goes quiet", () => {
+  const c = nackReassembler();
+  nackFeed(c, 0, nackFrame(1, 10), [7, 8, 9]);
+  eq(nackPoll(c, 5).requests.length, 0, "still arriving as far as we know");
+  eq(runs(nackPoll(c, 25).requests), [[7, 3]]);
+});
+
+test("nack: later complete frames wait for the repair and come out in order", () => {
+  const c = nackReassembler();
+  const f1 = nackFrame(1, 6, { keyframe: true });
+  eq(nackFeed(c, 0, f1, [2]).length, 0);
+  eq(nackFeed(c, 2, nackFrame(2, 3)).length, 0, "held behind frame 1");
+  eq(nackFeed(c, 3, nackFrame(3, 1)).length, 0);
+  const p = nackPoll(c, 4);
+  eq([p.frames.length, p.requests.length], [0, 1]);
+  const out = nackFeed(c, 40, f1.slice(2, 3));
+  eq(out.map((f) => f.frameId), [1, 2, 3]);
+  eq(out.map((f) => f.keyframe), [true, false, false]);
+  ok(out.every((f) => f.connId === 1n && f.streamId === 0));
+  eq(c.drops, []);
+});
+
+test("nack: retries are spaced by the interval, then the frame is abandoned and reported as loss before the held frame is released", () => {
+  const c = nackReassembler();
+  eq(nackFeed(c, 0, nackFrame(1, 8, { keyframe: true }), [2]).length, 0);
+  const iv = nackRetryInterval(RTT);
+  eq(iv, 110);
+  eq(nackPoll(c, 1).requests.length, 1); // round 1
+  eq(nackPoll(c, 1 + iv - 1).requests.length, 0, "not before the interval");
+  eq(nackPoll(c, 1 + iv).requests.length, 1); // round 2
+  eq(nackPoll(c, 1 + iv * 2).requests.length, 1); // round 3
+  eq(nackFeed(c, 1 + iv * 2 + 5, nackFrame(2, 1)).length, 0, "a later frame is held while we wait");
+  const { frames, requests } = nackPoll(c, 1 + iv * 3);
+  eq(requests.length, 0);
+  eq(c.drops, [1], "onDrop fired (the room client turns it into a loss marker) before the held frame is returned");
+  eq(frames.map((f) => f.frameId), [2]);
+  eq(c.r.nackStats.framesAbandoned, 1);
+  eq(c.r.droppedFrames, 1);
+  ok(!c.r.hasPending());
+});
+
+test("nack: a Miss from the relay gives the frame up at the next poll", () => {
+  const c = nackReassembler();
+  nackFeed(c, 0, nackFrame(1, 6), [1]);
+  const { requests } = nackPoll(c, 1);
+  nackFeed(c, 2, nackFrame(2, 1));
+  c.r.nackMiss(requests[0]);
+  const { frames } = nackPoll(c, 3);
+  eq(frames.map((f) => f.frameId), [2]);
+  eq(c.drops, [1]);
+});
+
+test("nack: a frame with too many holes is abandoned without asking", () => {
+  const c = nackReassembler();
+  nackFeed(c, 0, nackFrame(1, 400), Array.from({ length: 200 }, (_, i) => 100 + i));
+  const { requests } = nackPoll(c, 1);
+  eq(requests.length, 0);
+  eq(c.drops, [1]);
+  ok(!c.r.hasPending());
+});
+
+test("nack: duplicates of finished or abandoned frames never open a ghost frame (the 256-id memory)", () => {
+  const c = nackReassembler();
+  const f1 = nackFrame(1, 4);
+  eq(nackFeed(c, 0, f1).length, 1);
+  eq(nackFeed(c, 5, f1).length, 0, "the whole frame again: a retransmit that raced the original");
+  ok(!c.r.hasPending(), "no ghost incomplete frame");
+  const f2 = nackFrame(2, 4);
+  nackFeed(c, 0, f2, [0]);
+  const iv = nackRetryInterval(RTT);
+  for (let k = 0; k < 4; k++) nackPoll(c, 1 + iv * k);
+  ok(!c.r.hasPending());
+  eq(nackFeed(c, 900, f2.slice(0, 1)).length, 0, "an abandoned frame's late fragment is ignored");
+  ok(!c.r.hasPending());
+  eq(c.drops, [2], "the abandoned frame is reported once");
+  // the memory is bounded: after 300 more frames the first id is forgotten, the recent ones are not
+  for (let id = 10; id < 310; id++) nackFeed(c, 1000 + id, nackFrame(id, 1));
+  eq(nackFeed(c, 2000, nackFrame(309, 1)).length, 0, "a recent id is still remembered");
+  eq(nackFeed(c, 2001, nackFrame(1, 1)).length, 1, "the oldest one has aged out of the 256-id memory");
+});
+
+test("nack: nothing is held without NACK mode (legacy untouched)", () => {
+  const t = 0;
+  const r = new Reassembler({ now: () => t });
+  const feedAll = (frags, skip = []) => frags.filter(({ h }) => !skip.includes(h.fragmentIndex)).flatMap(({ h, p }) => r.ingest(h, p));
+  eq(feedAll(nackFrame(1, 4), [1]).length, 0);
+  eq(feedAll(nackFrame(2, 1)).length, 1, "a later complete frame is delivered at once, the older incomplete one is not waited for");
+  eq(r.poll(RTT).requests.length, 0);
+  eq(r.poll(RTT).frames.length, 0);
+  ok(!r.hasPending());
+  eq(r.droppedFrames, 1);
+});
+
+test("nack: the retry interval follows the RTT within 100..300 ms", () => {
+  eq([5, 25, 100, 400].map(nackRetryInterval), [100, 110, 260, 300]);
+});
+
+test("nack: nothing waits longer than the 1 s hard limit, whatever the RTT", () => {
+  const c = nackReassembler();
+  nackFeed(c, 0, nackFrame(1, 6), [1]);
+  nackPoll(c, NACK_HARD_LIMIT_MS + 1, 5000);
+  ok(!c.r.hasPending());
+  eq(c.drops, [1]);
+});
+
+test("nack: a hole that shows up late in a long frame gets its own rounds", () => {
+  const c = nackReassembler();
+  const f = nackFrame(1, 100, { keyframe: true });
+  nackFeed(c, 0, f.slice(0, 30), [3]);
+  eq(runs(nackPoll(c, 1).requests), [[3, 1]]);
+  nackFeed(c, 50, f.slice(30, 60), [40]); // the paced keyframe is still arriving; another hole behind the newest fragments
+  eq(runs(nackPoll(c, 55).requests), [[40, 1]], "3 is not due yet");
+  const iv = nackRetryInterval(RTT);
+  ok(nackPoll(c, 1 + iv).requests.some((q) => q.first === 3));
+  ok(nackPoll(c, 55 + iv).requests.some((q) => q.first === 40));
+  ok(c.r.hasPending());
+});
+
+test("nack: streams are independent (a hold on one never delays another)", () => {
+  const c = nackReassembler();
+  nackFeed(c, 0, nackFrame(1, 6, { streamId: 1 }), [1]);
+  eq(nackFeed(c, 1, nackFrame(2, 2, { streamId: 2 })).length, 1);
+  eq(runs(nackPoll(c, 25).requests), [[1, 1]]);
+  eq(nackPoll(c, 26).requests.length, 0, "not asked twice within the interval");
+});
+
+test("nack: Request/Miss datagrams match the native bytes; a Hello or a media datagram is not a range", () => {
+  const r = { connId: 0x0102030405060708n, streamId: 3, frameId: 99, first: 7, count: 4 };
+  for (const tag of [P.NACK_TAG_REQUEST, P.NACK_TAG_MISS]) {
+    const b = P.packNackRange(tag, r);
+    eq(b.length, 18);
+    ok(P.isNackDatagram(b));
+    eq(P.unpackNackRange(b), { tag, ...r });
+  }
+  // the hex asserted by the Rust test `nack_datagrams_round_trip_and_never_look_like_media`
+  eq(bytesToHex(P.packNackRange(P.NACK_TAG_REQUEST, r)), "e2010203040506070803000000630007" + "0004");
+  ok(P.isNackDatagram(Uint8Array.of(P.NACK_TAG_HELLO)) && P.isNackDatagram(Uint8Array.of(P.NACK_TAG_HELLO_ACK)));
+  eq(P.unpackNackRange(Uint8Array.of(P.NACK_TAG_HELLO)), null);
+  eq(P.unpackNackRange(P.packNackRange(P.NACK_TAG_REQUEST, { ...r, count: 0 })), null);
+  ok(!P.isNackDatagram(makeFrame(1, 100)[0]), "a media datagram is never a NACK");
+  ok(!P.isNackDatagram(new Uint8Array(0)));
+  eq(P.MEDIA_FLAG_RETRANSMIT, 4);
+});
+
+test("nack send ring: a re-send is the original datagram plus the retransmit flag; unknown or evicted frames give nothing", () => {
+  let t = 0;
+  const ring = new SendRing({ now: () => t });
+  const sent = makeFrame(40, 5000, { streamId: 2, connId: 7n, keyframe: true });
+  eq(sent.length, 6);
+  ring.record(2, 40, sent);
+  const got = ring.resends({ streamId: 2, frameId: 40, first: 1, count: 3 });
+  eq(got.length, 3);
+  got.forEach((d, i) => {
+    const { header: h, payload } = P.unpackMediaHeader(d);
+    const { header: o, payload: op } = P.unpackMediaHeader(sent[i + 1]);
+    eq(h.flags, o.flags | P.MEDIA_FLAG_RETRANSMIT);
+    ok(h.keyframe);
+    eq([h.frameId, h.fragmentIndex, h.fragmentCount, h.connId], [o.frameId, o.fragmentIndex, o.fragmentCount, o.connId]);
+    eq(payload, op, "same ciphertext slice: nothing is re-encrypted");
+    ok(d !== sent[i + 1] && sent[i + 1][1] === o.flags, "the cached original is not modified");
+  });
+  eq(ring.resends({ streamId: 2, frameId: 41, first: 0, count: 2 }).length, 0);
+  eq(ring.resends({ streamId: 3, frameId: 40, first: 0, count: 2 }).length, 0);
+  eq(ring.resends({ streamId: 2, frameId: 40, first: 4, count: 10 }).length, 2, "a range past the end is clipped");
+  // eviction by age: 2 s
+  t = 2001;
+  ring.record(2, 41, makeFrame(41, 100, { streamId: 2, connId: 7n }));
+  eq(ring.resends({ streamId: 2, frameId: 40, first: 0, count: 2 }).length, 0, "older than 2 s is gone");
+  eq(ring.resends({ streamId: 2, frameId: 41, first: 0, count: 1 }).length, 1);
+  ring.forget(2);
+  eq(ring.resends({ streamId: 2, frameId: 41, first: 0, count: 1 }).length, 0);
+});
+
+test("nack send ring: capped at 8 MiB per stream, oldest frame first; one request gets at most 256 fragments", () => {
+  const ring = new SendRing({ now: () => 0 });
+  const big = (id) => makeFrame(id, 1_000_000, { streamId: 1, connId: 7n });
+  for (let id = 1; id <= 12; id++) ring.record(1, id, big(id)); // ~12 MB
+  eq(ring.resends({ streamId: 1, frameId: 1, first: 0, count: 1 }).length, 0, "the oldest was evicted by the byte cap");
+  eq(ring.resends({ streamId: 1, frameId: 12, first: 0, count: 1 }).length, 1);
+  ok(ring.streams.get(1).bytes <= SEND_RING_BYTES);
+  eq(ring.resends({ streamId: 1, frameId: 12, first: 0, count: 5000 }).length, 256);
+});
+
+test("nack kill switch: ?nack=0 / off, localStorage sss-nack=0; default on", () => {
+  const url = location.href;
+  try {
+    eq(nackEnabledByDefault(), true);
+    history.replaceState(null, "", "?nack=0");
+    eq(nackEnabledByDefault(), false);
+    history.replaceState(null, "", "?nack=off");
+    eq(nackEnabledByDefault(), false);
+    history.replaceState(null, "", "?nack=1");
+    eq(nackEnabledByDefault(), true);
+    history.replaceState(null, "", url);
+    localStorage.setItem("sss-nack", "0");
+    eq(nackEnabledByDefault(), false);
+  } finally {
+    try {
+      localStorage.removeItem("sss-nack");
+    } catch {}
+    history.replaceState(null, "", url);
+  }
+  eq(nackEnabledByDefault(), true);
 });
 
 // ------------------------------------------------------------------------------------------------ runner

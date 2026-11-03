@@ -714,6 +714,29 @@ pub fn slider_detent<N: egui::emath::Numeric>(
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
+/// Wheel points that make one step: egui's own line speed, i.e. one notch of a mouse
+/// wheel; a touchpad's pixel deltas accumulate until they add up to a notch.
+const WHEEL_NOTCH: f32 = 40.0;
+
+/// Whole wheel notches over `resp` this frame (positive = wheel up / forward), and
+/// the wheel is *consumed* while the pointer is on the widget: egui's `ScrollArea`
+/// reads `smooth_scroll_delta` in its `end()`, after its content ran, so zeroing it
+/// here keeps the panel under a slider from scrolling too. Why `raw_scroll_delta`
+/// for counting: the smoothed value spreads one notch over several frames.
+pub fn wheel_notches(ui: &Ui, resp: &Response) -> i32 {
+    let id = resp.id.with("wheel_acc");
+    if !ui.is_enabled() || !resp.contains_pointer() {
+        ui.data_mut(|d| d.remove_temp::<f32>(id));
+        return 0;
+    }
+    let raw = ui.input(|i| i.raw_scroll_delta.y);
+    ui.input_mut(|i| i.smooth_scroll_delta.y = 0.0);
+    let acc = ui.data(|d| d.get_temp::<f32>(id)).unwrap_or(0.0) + raw;
+    let n = (acc / WHEEL_NOTCH).trunc();
+    ui.data_mut(|d| d.insert_temp(id, acc - n * WHEEL_NOTCH));
+    n as i32
+}
+
 /// `v`, or the detent's value when `v` is within its snap distance.
 pub(crate) fn snap_to_detent(v: f64, detent: Option<(f64, f64)>) -> f64 {
     match detent {
