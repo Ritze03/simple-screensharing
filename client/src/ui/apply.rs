@@ -366,6 +366,11 @@ impl App {
                 self.state.set_catch_up_speed_percent(p);
             }
             UiAction::SetSendDiagnostics(on) => self.state.set_send_diagnostics(on),
+            UiAction::SetAudioGain(g) => {
+                self.state.set_audio_gain(g);
+            }
+            UiAction::CalibrateAudio(source) => self.state.start_audio_calibration(source),
+            UiAction::CancelAudioCalibration => self.state.cancel_audio_calibration(),
             UiAction::CopyLogs => {
                 ctx.copy_text(simple_screensharing_client::logbuf::dump());
                 self.toast(tr("ui.toast.logs_copied", "Logs copied"), "content_copy");

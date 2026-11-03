@@ -24,7 +24,7 @@
 //!   recently saved room. `Why:` the lib keeps no "last server" setting, and
 //!   the newest saved room is the last server the user created or joined on.
 //! - **Settings** (`Modal::Settings`, 640): cards Profile / Language / Display /
-//!   Playback / Diagnostics (copy or save the in-memory log, `logbuf`; opt-in upload to the relay). Text and
+//!   Playback / Shared audio (boost slider + calibration, task #114) / Diagnostics (copy or save the in-memory log, `logbuf`; opt-in upload to the relay). Text and
 //!   sliders are buffered and pushed when the edit settles
 //!   (focus lost, pointer released), not every frame of a drag, since each
 //!   setter writes `settings.toml`.
@@ -34,6 +34,7 @@
 
 
 use egui::{Align, Ui};
+use simple_screensharing_client::audio_gain::{self, CalibrationOutcome, GainLimit};
 use simple_screensharing_client::net::{ServerAddrError, parse_join_string, parse_server_addr};
 use simple_screensharing_client::rooms::{AppSettings, PresentationMode};
 use simple_screensharing_client::session::RoomHandle;
@@ -76,6 +77,17 @@ pub struct ModalsState {
     display_name: String,
     jitter_s: f32,
     catch_up: u32,
+    /// Audio boost slider, in dB (task #114; `audio_gain::gain_to_db` of the setting).
+    gain_db: f32,
+    /// The setting `gain_db` was last in step with: when the state moves away from it by
+    /// something other than our own push (a calibration), the slider follows.
+    gain_seen: f64,
+    /// The slider was edited and not pushed yet (pushed once the pointer is released).
+    gain_dirty: bool,
+    /// The audio source picked for the calibration (by name; `None` = the default).
+    cal_source: Option<String>,
+    /// `ctx.input(|i| i.time)` of the last source re-list while Settings is open.
+    sources_asked: f64,
     // rename
     rename: String,
     // choose name
@@ -109,6 +121,11 @@ impl ModalsState {
                 self.display_name = cx.state.display_name.clone();
                 self.jitter_s = cx.state.max_jitter_buffer_ms as f32 / 1000.0;
                 self.catch_up = cx.state.catch_up_speed_percent;
+                self.gain_db = audio_gain::gain_to_db(cx.state.audio_gain) as f32;
+                self.gain_seen = cx.state.audio_gain;
+                self.gain_dirty = false;
+                self.cal_source = None;
+                self.sources_asked = f64::NEG_INFINITY;
             }
             Modal::ChooseName => {
                 self.choose_name = cx.state.display_name.clone();
@@ -615,6 +632,7 @@ fn settings(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
                     "%",
                 );
             });
+            audio_card(ui, cx, st);
             widgets::card(ui, &tr("ui.settings.logs_card", "Diagnostics"), None, |ui| {
                 let copy = tr("ui.settings.logs_copy", "Copy to clipboard");
                 let save = tr("ui.settings.logs_save", "Save to file…");
@@ -684,8 +702,179 @@ fn settings(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
     if settled && st.catch_up != cx.state.catch_up_speed_percent {
         cx.act(UiAction::SetCatchUpSpeed(st.catch_up));
     }
+    // The boost slider: like the other sliders, pushed once the pointer is released.
+    if st.gain_dirty && settled {
+        st.gain_dirty = false;
+        let gain = audio_gain::clamp_gain(audio_gain::db_to_gain(st.gain_db as f64));
+        st.gain_seen = gain;
+        if (gain - cx.state.audio_gain).abs() > 1e-9 {
+            cx.act(UiAction::SetAudioGain(gain));
+        }
+    }
     if closing {
+        // Also stops a running calibration and forgets its result.
+        cx.act(UiAction::CancelAudioCalibration);
         cx.act(UiAction::CloseModal);
+    }
+}
+
+/// How often Settings re-lists the audio sources while open (the user starts playing
+/// something after opening it), seconds.
+const SOURCES_REFRESH_SECS: f64 = 2.0;
+
+/// The "Shared audio" card (task #114): the boost slider and the calibration.
+///
+/// `Why the slider is in dB:` the range is 50-800 %; on a linear percent track 100 % would sit
+/// 7 % from the left end and everything useful (100-300 %) would be a few pixels. In dB each
+/// doubling is the same distance. The value shown is still the percent, because that is what
+/// the viewers' volume sliders and the user's own words ("a volume multiplier") use.
+fn audio_card(ui: &mut Ui, cx: &mut Cx, st: &mut ModalsState) {
+    let now = ui.ctx().input(|i| i.time);
+    let state = cx.state;
+    let calibrating = state.audio_calibration.is_some();
+
+    // Follow the state when something else changed it (a finished calibration).
+    if !st.gain_dirty && (state.audio_gain - st.gain_seen).abs() > 1e-9 {
+        st.gain_db = audio_gain::gain_to_db(state.audio_gain) as f32;
+        st.gain_seen = state.audio_gain;
+    }
+    // The sources: re-list now and then (not while measuring, the tap holds its own node).
+    if !calibrating && now - st.sources_asked >= SOURCES_REFRESH_SECS {
+        st.sources_asked = now;
+        cx.act(UiAction::RefreshAudioSources);
+    }
+    ui.ctx().request_repaint_after(std::time::Duration::from_millis(if calibrating { 100 } else { 1000 }));
+
+    let mut names: Vec<String> = Vec::new();
+    for s in &state.audio_sources {
+        if !names.contains(&s.name) {
+            names.push(s.name.clone());
+        }
+    }
+    // Default: the app being shared right now, else the first one playing.
+    let shared = state.audio_share_sources.values().map(|s| s.name.clone()).find(|n| names.contains(n));
+    let picked = st.cal_source.clone().filter(|n| names.contains(n)).or(shared).or_else(|| names.first().cloned());
+    let mut pick_i = picked.as_ref().and_then(|p| names.iter().position(|n| n == p)).unwrap_or(0);
+
+    widgets::card(ui, &tr("ui.settings.audio_card", "Shared audio"), None, |ui| {
+        let percent = format!("{}%", (audio_gain::db_to_gain(st.gain_db as f64) * 100.0).round());
+        let (r, _) = widgets::ctrl_row_value(
+            ui,
+            &tr("ui.settings.audio_boost", "Boost"),
+            Some(&tr(
+                "ui.settings.audio_boost_tip",
+                "Makes the audio you share louder (or quieter) before it is sent, so everyone watching hears it at that level. A limiter keeps the loud peaks from distorting. 100% leaves it as it is. Applies to a share that is already running.",
+            )),
+            |ui| widgets::slider(ui, &mut st.gain_db, audio_gain::gain_db_range(), 0.5),
+            |ui| widgets::value_box(ui, &percent),
+        );
+        st.gain_dirty |= r.changed();
+
+        let label = tr("ui.settings.audio_calibrate", "Calibrate");
+        let cancel = tr("ui.modal.cancel", "Cancel");
+        let mut start = false;
+        let mut stop = false;
+        widgets::ctrl_row(
+            ui,
+            &label,
+            Some(&tr(
+                "ui.settings.audio_calibrate_tip",
+                "Pick the app, start playing something in it, then press Calibrate. The app listens for 10 seconds and sets the boost so the sound reaches a comfortable level. Silent stretches are ignored.",
+            )),
+            |ui| {
+                let slots = [widgets::FILL, widgets::fixed(104.0)];
+                let row = widgets::HBox::new("calibrate", theme::CTL_H).slots(&slots).show(ui);
+                let w = row.cell(1).width();
+                if let Some(c) = &state.audio_calibration {
+                    let text = match c.remaining_secs(std::time::Instant::now()) {
+                        None => tr_with("ui.settings.audio_starting", "Connecting to %{app}…", &[("app", &c.source)]),
+                        Some(secs) => tr_with(
+                            "ui.settings.audio_listening",
+                            "Listening to %{app}… %{secs} s",
+                            &[("app", &c.source), ("secs", &secs.to_string())],
+                        ),
+                    };
+                    row.show(ui, 0, Align::Min, |ui| widgets::readout(ui, &text, Align::Min));
+                    stop = row.show(ui, 1, Align::Min, |ui| Btn::secondary(&cancel).show_sized(ui, w)).clicked();
+                } else if names.is_empty() {
+                    let none = tr("ui.settings.audio_none", "No app is playing audio");
+                    row.show(ui, 0, Align::Min, |ui| widgets::readout(ui, &none, Align::Min));
+                    row.show(ui, 1, Align::Min, |ui| Btn::secondary(&label).enabled(false).show_sized(ui, w));
+                } else {
+                    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                    row.show(ui, 0, Align::Min, |ui| widgets::select(ui, "audio_calibrate_source", &mut pick_i, &refs));
+                    start = row.show(ui, 1, Align::Min, |ui| Btn::secondary(&label).show_sized(ui, w)).clicked();
+                }
+            },
+        );
+        if let Some(outcome) = &state.audio_calibration_result {
+            let app = st.cal_source.clone().unwrap_or_default();
+            calibration_banner(ui, &app, outcome);
+        }
+        if start && let Some(name) = names.get(pick_i) {
+            cx.act(UiAction::CalibrateAudio(name.clone()));
+        }
+        if stop {
+            cx.act(UiAction::CancelAudioCalibration);
+        }
+    });
+    // Remember the pick by name, so a re-list that reorders the names does not move it.
+    if !calibrating {
+        st.cal_source = names.get(pick_i).cloned();
+    }
+}
+
+/// The line under the Calibrate row saying how the last calibration ended.
+fn calibration_banner(ui: &mut Ui, app: &str, outcome: &CalibrationOutcome) {
+    let percent = |g: f64| format!("{}", (g * 100.0).round());
+    match outcome {
+        CalibrationOutcome::Set { gain, limit, measurement } => {
+            let db = format!("{:.0}", measurement.rms_db);
+            let args = [("percent", percent(*gain)), ("db", db)];
+            let args: Vec<(&str, &str)> = args.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let (kind, icon, text) = match limit {
+                GainLimit::None => (
+                    BannerKind::Info,
+                    "check_circle",
+                    tr_with("ui.settings.audio_done", "Boost set to %{percent}%. The sound was at %{db} dBFS.", &args),
+                ),
+                GainLimit::Max => (
+                    BannerKind::Warn,
+                    "warning",
+                    tr_with(
+                        "ui.settings.audio_done_max",
+                        "Boost set to the maximum, %{percent}%. The sound (%{db} dBFS) is still quieter than the target.",
+                        &args,
+                    ),
+                ),
+                GainLimit::Min => (
+                    BannerKind::Info,
+                    "check_circle",
+                    tr_with(
+                        "ui.settings.audio_done_min",
+                        "This sound is already loud (%{db} dBFS): boost lowered to %{percent}%.",
+                        &args,
+                    ),
+                ),
+            };
+            widgets::banner(ui, kind, icon, &text, None);
+        }
+        CalibrationOutcome::Silent => {
+            let text = tr_with(
+                "ui.settings.audio_silent",
+                "Heard nothing from %{app}. Start playing something there and calibrate again; the boost is unchanged.",
+                &[("app", app)],
+            );
+            widgets::banner(ui, BannerKind::Warn, "warning", &text, None);
+        }
+        CalibrationOutcome::Failed(e) => {
+            let text = tr_with(
+                "ui.settings.audio_failed",
+                "Couldn't listen to %{app}: %{error}",
+                &[("app", app), ("error", e)],
+            );
+            widgets::banner(ui, BannerKind::Warn, "error", &text, None);
+        }
     }
 }
 

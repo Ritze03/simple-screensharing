@@ -2020,6 +2020,10 @@ its *presentation* is bundled.)
   while muted would answer wrongly). *Why mute with `volume` and not by pausing the send:* a
   continuous Opus stream keeps the viewer's jitter buffer from seeing a mute as a multi-second
   dropout.
+- **Boost (#114):** `volume name=gain` + `rglimiter name=limiter` in F32 *before* the mute and the meter
+  (`audio::GAIN_STAGE`), set live by `AudioCaptureHandle::set_gain` from Settings > Shared audio; an
+  `audioconvert` after the meter takes it back to S16 for `opusenc`. `features/audio-sharing.md` (2026-11-03,
+  task #114): why sender-side, why the limiter is bypassed at 100 %, the calibration.
 - **Stop:** plain `stop_destination(<audio destination id>)`; an audio capture always has exactly
   one destination, so it stops that capture only and the screen share is untouched.
 - **Pairing:** `LocalCapture::audio_for_capture: Option<CaptureSourceId>`, set from
