@@ -498,7 +498,7 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 .cb.dim { color: var(--text-dim); min-width: 40px; padding: 0 8px; }
 .cb.dim:hover { color: var(--text); }
 .cb.sel { color: var(--accent-lighter); background: var(--accent-chip-bg); }
-.cb.leave { background: var(--danger); color: var(--primary-text); min-width: 64px; }
+.cb.leave { background: var(--danger); color: var(--primary-text); min-width: 64px; height: calc(var(--stage-btn-h) + 10px); border-radius: 12px; } /* = a .cgroup: button + 2x4px padding + 2x1px border */
 .cb.leave:hover { filter: brightness(1.1); background: var(--danger); }
 .cb .lbl2 { font-size: var(--fs-small); font-weight: 700; }
 .splitb { display: flex; border-radius: 9px; }
