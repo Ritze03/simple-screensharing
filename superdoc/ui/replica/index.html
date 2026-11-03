@@ -565,6 +565,9 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 .ust .l3 { font-size: var(--fs-tiny); color: var(--text-faint); display: flex; align-items: center; gap: 5px; }
 .ust .l3 .ms { font-size: 14px; }
 .ust .back { flex: 0 0 auto; height: 22px; padding: 0 8px 0 6px; border-radius: 999px; border: 1px solid var(--accent-chip-border); background: var(--accent-chip-bg); color: var(--accent-lighter); font-size: var(--fs-tiny); font-weight: 700; display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+.ust .au { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 4px; font-size: var(--fs-tiny); font-weight: 400; color: var(--text-faint); }
+.ust .au .ms { font-size: 14px; }
+.ust .au.on { color: var(--success); }
 .ust .back:hover { background: var(--accent-ghost-bg-hover); }
 .ust .back .ms { font-size: 13px; }
 
@@ -1179,23 +1182,15 @@ function toast(msg, icon = "check_circle") {
 function userTip(name) {
   const its = viewItems().filter((i) => i.s.owner === name), combined = isCombined();
   if (!its.length) return `<div class="utip"><div class="hd">${avatar(name)}<div><b>${esc(name)}</b><small>Not sharing anything</small></div></div></div>`;
-  if (its.length > 1) {
-    const rows = its.map((it) => {
-      const { s, key } = it, popped = S.popped.has(key);
-      const status = popped ? ic("open_in_new") + "Popped out" : isWatched(it) ? ic("visibility") + "On the stage" : ic("visibility_off") + "Not watching";
-      return `<div class="ust"><div class="l1"><span class="txt">${esc(s.label)}</span>${FILL("")}${popped ? `<button type="button" class="back" data-act="popin:${esc(key)}" title="Bring this stream back to the stage">${ic("open_in_new")}Bring back</button>` : ""}</div>
-        <div class="l2 txt">${s.w}×${s.h} · ${s.fps} fps · ${esc(s.codec)} · ${fmtKbps(s.kbps)}</div>
-        <div class="l3">${status}${combined ? ` · ${esc(it.r.name)}` : ""} · ${s.viewers} watching</div></div>`;
-    }).join("");
-    return `<div class="utip multi"><div class="hd">${avatar(name)}<div><b>${esc(name)}</b><small>Sharing ${its.length} streams</small></div>${FILL("")}${pillLive()}</div>${rows}</div>`;
-  }
-  const it = its[0], s = it.s, w = isWatched(it), popped = S.popped.has(it.key);
-  const status = it.mine ? [ic("cast"), "Your stream"] : popped ? [ic("open_in_new"), "Popped out · click to bring it back"]
-    : w ? [ic("visibility"), "Watching on the stage"] : [ic("visibility_off"), "Not watching"];
-  return `<div class="utip"><div class="hd">${avatar(name)}<div><b>${esc(name)}</b><small>Sharing ${esc(s.label)}${combined ? ` · ${esc(it.r.name)}` : ""}</small></div>${FILL("")}${pillLive()}</div>
-    <dl><dt>Resolution</dt><dd>${s.w}×${s.h}</dd><dt>Framerate</dt><dd>${s.fps} fps</dd><dt>Codec</dt><dd>${esc(s.codec)}</dd>
-      <dt>Bitrate</dt><dd>${fmtKbps(s.kbps)}</dd><dt>Viewers</dt><dd>${s.viewers}</dd><dt>Audio</dt><dd>${s.audio ? (it.mine ? esc(S.audioSrc) : "Shared") : "None"}</dd></dl>
-    ${popped ? `<button type="button" class="st" data-act="popin:${esc(it.key)}">${status.join("")}</button>` : `<div class="st">${status.join("")}</div>`}</div>`;
+  const rows = its.map((it) => {
+    const { s, key, mine } = it, popped = S.popped.has(key);
+    const status = mine ? ic("cast") + "Your stream" : popped ? ic("open_in_new") + "Popped out" : isWatched(it) ? ic("visibility") + "On the stage" : ic("visibility_off") + "Not watching";
+    const audio = s.audio ? `<span class="au on">${ic("volume_up")}${mine ? esc(S.audioSrc) : "Audio"}</span>` : `<span class="au">${ic("volume_off")}No audio</span>`;
+    return `<div class="ust"><div class="l1"><span class="txt">${esc(s.label)}</span>${FILL("")}${audio}${popped ? `<button type="button" class="back" data-act="popin:${esc(key)}" title="Bring this stream back to the stage">${ic("open_in_new")}Bring back</button>` : ""}</div>
+      <div class="l2 txt">${s.w}×${s.h} · ${s.fps} fps · ${esc(s.codec)} · ${fmtKbps(s.kbps)}</div>
+      <div class="l3">${status}${combined ? ` · ${esc(it.r.name)}` : ""} · ${s.viewers} watching</div></div>`;
+  }).join("");
+  return `<div class="utip multi"><div class="hd">${avatar(name)}<div><b>${esc(name)}</b><small>Sharing ${its.length} stream${its.length === 1 ? "" : "s"}</small></div>${FILL("")}${pillLive()}</div>${rows}</div>`;
 }
 
 /* ---------- arena layout: Split / Crop grid with splitters, Floating windows ---------- */
