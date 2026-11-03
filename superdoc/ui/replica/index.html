@@ -87,6 +87,7 @@
   --font-sans: "Geist", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "Geist Mono", ui-monospace, "JetBrains Mono", Consolas, monospace;
   --font-icons: "Material Symbols Outlined";
+  --font-emoji: "Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji", "Twemoji Mozilla", emoji, sans-serif; /* emoji avatars (#136): system colour fonts, no theme.rs constant yet */
   --fs-h2: 18px;      /* FS_H2  room title */
   --fs-h3: 15px;      /* FS_H3  modal title, brand */
   --fs-body: 14px;    /* FS_BODY */
@@ -220,7 +221,7 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 @keyframes march { from { background-position: 0 0; } to { background-position: 14px 0; } }
 @keyframes pulse { 50% { opacity: .35; } }
 
-.section-label { display: flex; align-items: center; gap: var(--s2); margin: 0; height: 16px; font-size: var(--fs-section); font-weight: 700; letter-spacing: 0.11em; text-transform: uppercase; color: var(--accent); white-space: nowrap; }
+.section-label { min-width: 0; display: flex; align-items: center; gap: var(--s2); margin: 0; height: 16px; font-size: var(--fs-section); font-weight: 700; letter-spacing: 0.11em; text-transform: uppercase; color: var(--accent); white-space: nowrap; }
 .section-label .count { color: var(--text-faint); letter-spacing: 0; font-family: var(--font-mono); font-weight: 400; font-size: var(--fs-unit); }
 .rule { flex: 1 1 auto; height: 1px; background: var(--well-border); }
 
@@ -264,8 +265,9 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 .collapser:hover { color: var(--text); }
 
 /* avatar (widgets::paint_avatar), status dot */
-.avatar { width: 32px; height: 32px; border-radius: 50%; color: #fff; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; font-size: 13px; flex: 0 0 auto; position: relative; }
-.avatar.sm { width: 22px; height: 22px; font-size: 10.5px; }
+.avatar { --av: 32px; width: var(--av); height: var(--av); border-radius: 50%; color: #fff; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; font-size: 13px; flex: 0 0 auto; position: relative; }
+.avatar.sm { --av: 22px; font-size: 10.5px; }
+.avatar .emo { font-family: var(--font-emoji); font-weight: 400; font-size: calc(var(--av) * .62); line-height: 1; } /* an emoji avatar sits on the same name-derived gradient */
 .avatar .pres { position: absolute; right: -2px; bottom: -2px; width: 10px; height: 10px; border-radius: 50%; border: 2px solid var(--elev-14); background: var(--success); }
 .sdot { width: 9px; height: 9px; border-radius: 50%; box-sizing: border-box; }
 .sdot.joined { background: var(--success); box-shadow: var(--success-glow); }
@@ -464,13 +466,16 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 .stripwrap { position: relative; flex: 0 0 auto; }
 .strip { display: flex; justify-content: safe center; gap: 14px; padding: 22px var(--s4) 2px; overflow-x: auto; }
 .pv { display: flex; flex-direction: column; align-items: center; gap: 7px; width: 64px; flex: 0 0 64px; border: 0; background: none; color: inherit; padding: 0; cursor: default; }
-.pv .avatar { width: var(--strip-avatar); height: var(--strip-avatar); font-size: 17px; }
-.pv.audible .avatar { box-shadow: 0 0 0 2px var(--stage-bg), 0 0 0 4px var(--success); }
-.pv .nm { font-size: var(--fs-tiny); color: var(--text-dim); max-width: 64px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pv .avatar { --av: var(--strip-avatar); font-size: 17px; }
+/* one bordered shape, not two stacked spread shadows: there the ring was the difference of two shapes, and in a user screenshot of a scaled frame the outer one sat .5px off, so one side was 1px thick and the other 2px */
+.pv.audible .avatar::before { content: ""; position: absolute; inset: -4px; border: 2px solid var(--success); border-radius: 50%; }
+.pv .nm { font-size: var(--fs-tiny); color: var(--text-dim); width: 64px; text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pv.streaming .nm { color: var(--text); }
-.pv .lv { position: absolute; left: 50%; bottom: -6px; transform: translateX(-50%); height: 14px; padding: 0 5px; border-radius: 4px; background: var(--success); color: var(--primary-text); font-size: 8.5px; font-weight: 800; letter-spacing: .06em; display: flex; align-items: center; border: 2px solid var(--stage-bg); }
+/* a fixed width centres the badge on the avatar without a transform; text-indent balances the letter-spacing after the last letter */
+.pv .lv { position: absolute; left: calc((var(--av) - 34px) / 2); width: 34px; box-sizing: border-box; bottom: -6px; height: 18px; border-radius: 4px; background: var(--success); color: var(--primary-text); font-size: 8.5px; font-weight: 800; letter-spacing: .06em; text-indent: .06em; display: flex; align-items: center; justify-content: center; border: 2px solid var(--stage-bg); }
 .pv .pop { position: absolute; right: -6px; top: -5px; width: 20px; height: 20px; border-radius: 50%; background: var(--accent); color: var(--primary-text); display: flex; align-items: center; justify-content: center; border: 2px solid var(--stage-bg); box-sizing: border-box; }
 .pv .pop .ms { font-size: 12px; font-weight: 700; }
+.pv .cnt { position: absolute; left: -6px; top: -5px; min-width: 20px; height: 20px; padding: 0 4px; border-radius: 10px; background: var(--panel-raised); color: var(--text); font: 700 10.5px var(--font-mono); display: flex; align-items: center; justify-content: center; border: 2px solid var(--stage-bg); box-sizing: border-box; }
 .pv.popped { cursor: pointer; }
 .pv.popped .avatar { outline: 2px dashed var(--accent-ghost-border); outline-offset: 3px; }
 .pv:hover .avatar { filter: brightness(1.12); }
@@ -538,7 +543,9 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 .menu .pct { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: var(--fs-tiny); color: var(--text-dim); width: 38px; text-align: right; flex: 0 0 38px; }
 
 /* hover card on a person in the strip */
-.utip { position: absolute; z-index: 45; width: 260px; box-sizing: border-box; background: var(--panel-base); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--popup-shadow); padding: var(--s3); pointer-events: none; display: flex; flex-direction: column; gap: 10px; }
+.utip { position: absolute; z-index: 45; width: 260px; box-sizing: border-box; background: var(--panel-base); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--popup-shadow); padding: var(--s3); display: flex; flex-direction: column; gap: 10px; }
+.utip::after { content: ""; position: absolute; left: 0; right: 0; top: 100%; height: 14px; } /* bridge over the gap to the avatar: the pointer can reach the card's buttons */
+.utip.multi { width: 320px; }
 .utip .hd { display: flex; align-items: center; gap: 10px; }
 .utip .hd b { font-size: 13.5px; display: block; }
 .utip .hd small { font-size: var(--fs-tiny); color: var(--text-dim); display: block; }
@@ -547,12 +554,41 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 .utip dd { margin: 0; text-align: right; font-family: var(--font-mono); font-variant-numeric: tabular-nums; color: var(--text); }
 .utip .st { font-size: var(--fs-tiny); color: var(--text-dim); border-top: 1px solid var(--divider); padding-top: 8px; display: flex; align-items: center; gap: 6px; }
 .utip .st .ms { font-size: 14px; color: var(--accent-lighter); }
+.utip button.st { border-width: 1px 0 0; border-style: solid; border-color: var(--divider); background: none; padding: 8px 0 0; width: 100%; cursor: pointer; text-align: left; }
+.utip button.st:hover { color: var(--text); }
+.ust { display: flex; flex-direction: column; gap: 3px; border-top: 1px solid var(--divider); padding-top: 8px; min-width: 0; }
+.ust .l1 { display: flex; align-items: center; gap: 8px; font-size: var(--fs-small); font-weight: 700; min-height: 22px; }
+.ust .l2 { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: var(--fs-tiny); color: var(--text-dim); white-space: nowrap; }
+.ust .l3 { font-size: var(--fs-tiny); color: var(--text-faint); display: flex; align-items: center; gap: 5px; }
+.ust .l3 .ms { font-size: 14px; }
+.ust .back { flex: 0 0 auto; height: 22px; padding: 0 8px 0 6px; border-radius: 999px; border: 1px solid var(--accent-chip-border); background: var(--accent-chip-bg); color: var(--accent-lighter); font-size: var(--fs-tiny); font-weight: 700; display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+.ust .back:hover { background: var(--accent-ghost-bg-hover); }
+.ust .back .ms { font-size: 13px; }
+
+/* emoji avatar picker (Settings > Profile) */
+.menu.m-emoji { width: 320px; }
+.emoji-grid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 2px; padding: 0 4px 6px; }
+.emoji-grid button { aspect-ratio: 1; border: 0; background: transparent; border-radius: 7px; padding: 0; cursor: pointer; font-family: var(--font-emoji); font-size: 20px; line-height: 1; }
+.emoji-grid button:hover { background: var(--wash-hover-1); }
+.emoji-grid button.on { background: var(--accent-chip-bg); box-shadow: inset 0 0 0 1px var(--accent-chip-border); }
+.emoji-hint { font-size: var(--fs-tiny); color: var(--warning); padding: 0 10px 4px; }
+.emoji-hint:empty { display: none; }
 
 .toast { position: absolute; left: 50%; bottom: 96px; transform: translateX(-50%); z-index: 70; background: var(--panel-raised); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--popup-shadow); padding: 9px 14px; font-size: var(--fs-row); display: flex; align-items: center; gap: 8px; white-space: nowrap; }
 .toast .ms { font-size: 17px; color: var(--success); }
 .stagefs { position: absolute; inset: 0; z-index: 20; display: flex; }
+/* Fullscreen: the streams keep the whole stage and the strip and bar lie over it, so nothing jumps when they fade. */
+.stagefs .stg { justify-content: flex-end; }
+.stagefs .arena { position: absolute; inset: var(--s2); margin: 0; }
+.stagefs .stripwrap, .stagefs .ctlrow { position: relative; z-index: 30; pointer-events: none; transition: opacity .25s; }
+.stagefs .stripwrap { background: linear-gradient(180deg, transparent, rgba(6, 7, 9, .72)); }
+.stagefs .ctlrow { background: rgba(6, 7, 9, .72); }
+.stagefs :is(.strip-tg, .pv, .cb, .cgroup) { pointer-events: auto; }
+.fs .hover-ui, .stagefs .hover-ui { transition: opacity .25s; }
+.chrome-off :is(.stagefs .stripwrap, .stagefs .ctlrow, .stagefs .hover-ui, .fs .hover-ui) { opacity: 0; }
+.chrome-off :is(.stagefs .stripwrap, .stagefs .ctlrow, .stagefs .hover-ui, .fs .hover-ui), .chrome-off :is(.stagefs .stripwrap, .stagefs .ctlrow, .stagefs .hover-ui, .fs .hover-ui) * { pointer-events: none !important; }
 
-@media (prefers-reduced-motion: reduce) { .badge-progress .bar, .sdot.connecting, .spin .cube { animation: none; } .st-tile { transition: none; } }
+@media (prefers-reduced-motion: reduce) { .badge-progress .bar, .sdot.connecting, .spin .cube { animation: none; } .st-tile, .stagefs .stripwrap, .stagefs .ctlrow, .fs .hover-ui, .stagefs .hover-ui { transition: none; } }
 </style>
 
 <div class="page">
@@ -576,7 +612,7 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
       <label><input type="checkbox" id="nav-ovl" checked> Pin hover overlays</label>
       <label><input type="checkbox" id="nav-spin"> Animate picture</label>
     </div>
-    <div class="note">Replica of the native egui client with fake data. <b>Stage</b> is the proposed room view (#134): drag a stream to reorder it (Split, Crop) or move it (Floating), drag the gaps between streams to resize, right-click a stream or a room for its menu, hover an avatar for stream stats, the arrows in the bottom bar open the share, audio and layout menus. <b>Classic</b> is the current app. Double-click a stream for fullscreen; Esc leaves. Colours, type and sizes are the CSS tokens at the top of the file, named after <code>client/src/theme.rs</code>.</div>
+    <div class="note">Replica of the native egui client with fake data. <b>Stage</b> is the proposed room view (#134), and <b>Watched</b> the same stage with everything you watch from every room (#136): drag a stream to reorder it (Split, Crop) or move it (Floating), drag the gaps between streams to resize, right-click a stream or a room for its menu, hover an avatar for stream stats, Settings &gt; Profile sets an emoji avatar, the arrows in the bottom bar open the share, audio and layout menus. <b>Classic</b> is the current app. Double-click a stream for fullscreen; Esc leaves. Colours, type and sizes are the CSS tokens at the top of the file, named after <code>client/src/theme.rs</code>.</div>
   </div>
   <div class="stage" id="stage"><div class="frame" id="frame"></div></div>
 </div>
@@ -586,39 +622,46 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 /* ============================== fake data ==============================
    Two data sets: "demo" (richer, shows the audio pill) and "rig" (the headless rig's names, for side-by-side
    comparison with screenshots of the real app). Edit freely. */
+const K_RITZE = "films/Ritze/Screen", K_KRITA = "films/Ritze/Window · Krita", K_ANA = "films/Ana/Display 2", K_JONAS = "films/Jonas/Window · mpv"; /* stream keys, see skey() */
 const DATA = {
   demo: {
     rooms: [
       { id: "films", name: "Friday Films", state: "joined", members: ["mo", "Ritze", "Ana", "Jonas", "Lea"], auto: true,
         streams: [{ owner: "Ritze", label: "Screen", w: 2560, h: 1440, fps: 60, kbps: 9400, codec: "H.265", viewers: 3, audio: true, preview: true, pic: "cube" },
+                  { owner: "Ritze", label: "Window · Krita", w: 1600, h: 1000, fps: 30, kbps: 3800, codec: "H.265", viewers: 1, audio: false, preview: true, pic: "desk" },
                   { owner: "Ana", label: "Display 2", w: 1920, h: 1200, fps: 30, kbps: 5200, codec: "AV1", viewers: 2, audio: false, preview: true, pic: "desk" },
                   { owner: "Jonas", label: "Window · mpv", w: 1920, h: 800, fps: 24, kbps: 4100, codec: "H.264", viewers: 1, audio: true, preview: true, pic: "film" }] },
-      { id: "games", name: "Gaming Night", state: "joined", members: ["mo", "Ben", "Cleo"], auto: true,
-        streams: [{ owner: "Ben", label: "Screen", w: 1920, h: 1080, fps: 144, kbps: 12000, codec: "H.264", viewers: 1, audio: true, preview: true, pic: "cube" }] },
+      { id: "games", name: "Gaming Night", state: "joined", members: ["mo", "Ben", "Cleo", "Ana"], auto: true,
+        streams: [{ owner: "Ben", label: "Screen", w: 1920, h: 1080, fps: 144, kbps: 12000, codec: "H.264", viewers: 1, audio: true, preview: true, pic: "cube" },
+                  { owner: "Ana", label: "Window · Factorio", w: 1920, h: 1080, fps: 60, kbps: 6000, codec: "AV1", viewers: 2, audio: true, preview: true, pic: "film" }] },
       { id: "study", name: "Study Group", state: "disconnected", members: [], auto: false, streams: [] },
     ],
-    me: "mo", meRoom: "films", watchOwner: "Ritze", stageWatch: ["Ritze", "Ana"],
+    me: "mo", meRoom: "films", watchKey: K_RITZE,
+    stageWatch: [K_RITZE, K_KRITA, K_ANA], allWatch: [K_RITZE, K_KRITA, K_ANA, "games/Ben/Screen", "games/Ana/Window · Factorio"],
+    emoji: { Ana: "🦊", Ben: "🐙" }, /* name -> avatar emoji; your own is S.myEmoji (Settings > Profile) */
   },
   rig: {
     rooms: [
       { id: "lt", name: "launch-test", state: "joined", members: ["client-1", "client-2"], auto: true,
         streams: [{ owner: "client-1", label: "Screen", w: 1920, h: 1080, fps: 30, kbps: 7600, codec: "H.264", viewers: 1, audio: false, preview: false, pic: "cube" }] },
     ],
-    me: "client-2", meRoom: "lt", watchOwner: "client-1",
+    me: "client-2", meRoom: "lt", watchKey: "lt/client-1/Screen",
   },
 };
 const PRISTINE = JSON.stringify(DATA); /* rename / forget / leave change the fake rooms; picking a preset restores them */
+const EMOJI = [..."😀😎🤓🥳🤖👻👽🎃💀🤡🐶🐱🦊🐻🐼🐸🐙🦄🐧🦉🍕🍔🍩🍣🍉☕🌮🍺🎮🎧🎬🎸⚽🚀🌈⭐🔥⚡🌙🌵"];
 const AUDIO_SRCS = [["No audio", "volume_off", "Only the picture"], ["Desktop audio", "desktop_windows", "Everything you hear"], ["Spotify", "music_note", "App"], ["Floorp", "public", "App · browser"], ["mpv", "movie", "App · video player"]];
 
 /* ============================== presets (the nav's views) ============================== */
 const STAGE = [
   ["stage", "Split", {}],
   ["stage-crop", "Crop", { layout: "crop" }],
-  ["stage-float", "Floating", { layout: "float", float: { Ritze: { x: .02, y: .03, w: .56 }, Ana: { x: .52, y: .22, w: .44 }, Jonas: { x: .06, y: .64, w: .36 } }, z: ["Ritze", "Jonas", "Ana"] }],
+  ["stage-float", "Floating", { layout: "float", float: { [K_RITZE]: { x: .02, y: .03, w: .5 }, [K_KRITA]: { x: .55, y: .02, w: .3 }, [K_ANA]: { x: .52, y: .4, w: .44 }, [K_JONAS]: { x: .06, y: .64, w: .36 } }, z: [K_RITZE, K_KRITA, K_JONAS, K_ANA] }],
   ["stage-live", "Sharing · menu", { sharing: "live", sharerSelf: true, audioOn: true, audioSrc: "Spotify", menu: "share" }],
-  ["stage-popped", "Popped out", { popped: ["Ana"] }],
+  ["stage-popped", "Popped out", { popped: [K_ANA] }],
   ["stage-focus", "No sidebar + people", { side: false, peoplePanel: true }],
   ["stage-room", "Room menu", { menu: "room" }],
+  ["stage-watched", "Watched", { view: "watched", watchAll: true }],
 ];
 const PRESETS = [
   ["room-watch", "Watching", { classic: true, view: "room", watching: true, sharing: "none" }],
@@ -635,14 +678,17 @@ const MODALS = [
   ["add-room", "Create or join", { modal: "add", view: "watched", watching: true }],
 ];
 
-const STAGE_DEFAULTS = () => ({ classic: false, layout: "split", side: true, peoplePanel: false, strip: true, menu: null, ctx: null, roomCtx: null, roomEdit: null,
-  forgetAsk: false, popped: new Set(), viewPopped: false, stageFs: false, float: {}, gridSig: "", rowFr: null, colFr: null, z: [], order: [],
-  vols: {}, mutes: {}, levels: {}, stats: {}, audioOn: false, audioSrc: "No audio", fsKey: null, watchSet: new Set() });
+/* Everything keyed by stream (popped, watchSet, vols, mutes, levels, stats) is shared by the views: it is the same stream.
+   What a view arranges (V()) is not: every room and Watched keep their own layout, order, sizes and positions. */
+const STAGE_DEFAULTS = () => ({ classic: false, side: true, peoplePanel: false, strip: true, menu: null, ctx: null, roomCtx: null, roomEdit: null,
+  forgetAsk: false, popped: new Set(), stageFs: false, views: {},
+  vols: {}, mutes: {}, levels: {}, stats: {}, audioOn: false, audioSrc: "No audio", fsKey: null, fsBack: "room", watchSet: new Set() });
+const newView = () => ({ layout: "split", order: [], float: {}, z: [], gridSig: "", rowFr: null, colFr: null, stagePopped: false });
 const S = Object.assign({
   data: "demo", view: "room", room: null, sharing: "none", sharerSelf: false, modal: null,
   addTab: "join", vol: 100, muted: false, level: true, fps: 60, kbps: 8000, codec: "H.264", preset: "Balanced",
   bwMode: "per", lang: "English", presentation: "Mailbox (default)", jitter: 2000, catchup: 5, boost: 100,
-  diag: false, muteShared: false, advanced: false, size: "1920x1080", pin: true, spin: false,
+  diag: false, muteShared: false, advanced: false, size: "1920x1080", pin: true, spin: false, myEmoji: "",
 }, STAGE_DEFAULTS());
 const D = () => DATA[S.data];
 /* "sharerSelf": the presets that show your own share (rig: you are client-1, the only sharer). */
@@ -650,9 +696,16 @@ const me = () => (S.data === "rig" && S.sharerSelf ? "client-1" : D().me);
 const roomById = (id) => D().rooms.find((r) => r.id === id);
 const curRoom = () => roomById(S.room) || D().rooms[0];
 const othersStreams = (r) => r.streams.filter((s) => s.owner !== me());
-const watched = (r) => (r.state === "joined" ? othersStreams(r).filter((s) => S.watchSet.has(s.owner)) : []);
+/* A stream's key: room-qualified (one person can be in two rooms) and per stream (one person can share several).
+   Your own share is "<room>/me". "/" and not ":" because data-act strings split on the first ":". */
+const skey = (r, s) => `${r.id}/${s.owner}/${s.label}`;
+const myKey = () => D().meRoom + "/me";
+const watched = (r) => (r.state === "joined" ? othersStreams(r).filter((s) => S.watchSet.has(skey(r, s))) : []);
 const myShareIn = (r) => S.sharing !== "none" && r.id === D().meRoom;
 const myLive = (r) => S.sharing === "live" && r.id === D().meRoom;
+/* The combined stage (Watched): also while one of its streams is fullscreen. */
+const isCombined = () => (S.view === "fullscreen" ? S.fsBack : S.view) === "watched";
+const V = () => (S.views[isCombined() ? "watched" : "room:" + curRoom()?.id] ??= newView());
 
 /* ============================== helpers ============================== */
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
@@ -673,7 +726,13 @@ function avatarBg(name) {
   return `background:linear-gradient(140deg, ${hsl(hue, .6, .36)}, ${hsl((hue + 350) % 360, .6, .24)})`;
 }
 const initial = (n) => esc((String(n).trim()[0] || "?").toUpperCase());
-const avatar = (n, sm, pres) => `<span class="avatar${sm ? " sm" : ""}" style="${avatarBg(n)}">${initial(n)}${pres ? '<span class="pres"></span>' : ""}</span>`;
+const emojiOf = (n) => (n === me() ? S.myEmoji : D().emoji?.[n]) || "";
+/* The one avatar helper: the person's emoji, or else their initial, on their name-derived gradient. `extra` is badges. */
+const avatar = (n, sm, pres, extra = "") => { const e = emojiOf(n);
+  return `<span class="avatar${sm ? " sm" : ""}" style="${avatarBg(n)}">${e ? `<span class="emo">${esc(e)}</span>` : initial(n)}${pres ? '<span class="pres"></span>' : ""}${extra}</span>`; };
+/* The last emoji in a text as one grapheme (a flag or a ZWJ family stays whole); pasting over or after the old one both work. */
+const isEmoji = (g) => /\p{Extended_Pictographic}|\p{Regional_Indicator}|\u20E3/u.test(g);
+const pickEmoji = (text) => [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text)].map((x) => x.segment).filter(isEmoji).at(-1) || "";
 const SL = (w, inner, al = "", min) => `<div class="sl ${al}" style="${min ? `min-width:${w}px` : `width:${w}px;flex-basis:${w}px`}">${inner || ""}</div>`;
 const FILL = (inner, cls = "") => `<div class="fl ${cls}">${inner || ""}</div>`;
 const secHead = (t, n) => `<div class="hb g2"><h3 class="section-label">${t}${n != null ? `<span class="count">${n}</span>` : ""}</h3></div>`;
@@ -709,8 +768,8 @@ function renderSide() {
     if (!joined) continue;
     if (myLive(r)) rows += subRow(ic("cast", "ico live"), "You", S.fps, "fps", "room:" + r.id);
     for (const s of others) {
-      const w = watched(r).includes(s);
-      rows += subRow(ic(w ? "visibility" : "screen_share", "ico" + (w ? " watch" : "")), s.owner, w ? s.fps : "", w ? "fps" : "", "room:" + r.id);
+      const w = watched(r).includes(s), several = others.filter((o) => o.owner === s.owner).length > 1;
+      rows += subRow(ic(w ? "visibility" : "screen_share", "ico" + (w ? " watch" : "")), several ? `${s.owner} · ${s.label}` : s.owner, w ? s.fps : "", w ? "fps" : "", "room:" + r.id);
     }
   }
   const nLive = rooms.filter(myLive).length;
@@ -735,7 +794,7 @@ function renderHead(r) {
   if (r.state !== "joined") {
     return `<header class="hb g2 band top p-head"><div class="hb g3 eq"><h2>${esc(r.name)}</h2><span class="badge badge-muted">Not connected</span></div></header>`;
   }
-  const nShare = othersStreams(r).length + (myLive(r) ? 1 : 0);
+  const nShare = new Set(othersStreams(r).map((s) => s.owner)).size + (myLive(r) ? 1 : 0);
   return `<header class="hb g2 band top p-head">
     <div class="hb g3 eq"><h2 title="${esc(r.name)}">${esc(r.name)}</h2><span class="badge badge-live"><span class="dot"></span>Connected</span>
       <span class="txt meta">${r.members.length} people · ${nShare} sharing</span></div>
@@ -764,11 +823,12 @@ function audioPill() {
 }
 const audioOrChip = (s) => (s.audio ? audioPill() : `<span class="chip-dark">${ic("volume_off")}No audio shared</span>`);
 function tile(r, s, cross) {
-  return `<div class="tile" data-dbl="fs:${esc(s.owner)}" tabindex="0" aria-label="${esc(s.owner)}'s stream">${screenPic(s.pic)}<div class="vig hover-ui"></div>
+  const k = esc(skey(r, s));
+  return `<div class="tile" data-dbl="fs:${k}" tabindex="0" aria-label="${esc(s.owner)}'s stream">${screenPic(s.pic)}<div class="vig hover-ui"></div>
     <div class="vb g0 ovl hover-ui">
       <div class="hb g2">${FILL(statbar(s, s.owner, cross ? r.name : null))}<div class="hb g1">
         <button type="button" class="round-btn" title="Pop out to its own window">${ic("open_in_new")}</button>
-        <button type="button" class="round-btn stop" title="Stop watching" data-act="unwatch:${esc(s.owner)}">${ic("close")}</button></div></div>
+        <button type="button" class="round-btn stop" title="Stop watching" data-act="unwatch:${k}">${ic("close")}</button></div></div>
       <div class="fl v"></div>
       <div class="hb g2">${audioOrChip(s)}</div>
     </div></div>`;
@@ -781,7 +841,7 @@ function shareCard(r, s) {
     <div class="vb g2 card-pad">
       <div class="hb g2 who" style="height:22px">${SL(22, avatar(s.owner, true))}<b>${esc(s.owner)}</b>${FILL(`<span class="txt t">${esc(s.label)}</span>`)}</div>
       <div class="hb g0"><span class="txt specs">${s.w}×${s.h}</span></div>
-      <div class="hb g2">${FILL(`<button type="button" class="btn btn-primary wide" data-act="watch:${esc(s.owner)}">${ic("play_arrow")}Watch</button>`)}${FILL(`<button type="button" class="btn btn-secondary wide" title="Watch in its own window" data-act="pop:${esc(s.owner)}">${ic("open_in_new")}Pop out</button>`)}</div>
+      <div class="hb g2">${FILL(`<button type="button" class="btn btn-primary wide" data-act="watch:${esc(skey(r, s))}">${ic("play_arrow")}Watch</button>`)}${FILL(`<button type="button" class="btn btn-secondary wide" title="Watch in its own window" data-act="pop:${esc(skey(r, s))}">${ic("open_in_new")}Pop out</button>`)}</div>
     </div></div>`;
 }
 function myCard() {
@@ -843,14 +903,17 @@ function renderCenter(r, fw, fh) {
   return `<div class="vb g4 p-center eq">${html}</div>`;
 }
 
-function renderPeople(r) {
+function peopleRows(r) {
   const ms = [...r.members].sort((a, b) => (b === me()) - (a === me()));
-  return `<aside class="vb g3 p-right">${secHead("People", ms.length)}<div class="vb g0">${ms.map((m) => {
+  return `<div class="vb g0">${ms.map((m) => {
     const sharing = m === me() ? myLive(r) : r.streams.some((s) => s.owner === m);
     const eye = watched(r).some((s) => s.owner === m);
     return `<div class="hb g2 member${sharing ? "" : " idle"}">${SL(22, avatar(m, true))}${FILL(`<span class="txt name">${esc(m)}${m === me() ? '<span class="you">you</span>' : ""}</span>`)}${SL(44, sharing ? `<span class="badge badge-live">Live</span>` : "", "r")}${SL(18, eye ? ic("visibility", "ico watch") : "")}</div>`;
-  }).join("")}</div></aside>`;
+  }).join("")}</div>`;
 }
+const renderPeople = (r) => `<aside class="vb g3 p-right">${secHead("People", r.members.length)}${peopleRows(r)}</aside>`;
+/* Watched spans the rooms, so its list is grouped by them. */
+const renderPeopleAll = () => `<aside class="vb g4 p-right">${D().rooms.filter((r) => r.state === "joined").map((r) => `<div class="vb g2">${secHead(`<span class="txt">${esc(r.name)}</span>`, r.members.length)}${peopleRows(r)}</div>`).join("")}</aside>`;
 
 function renderBar(r) {
   const bar = (kids) => `<footer class="hb g2 band bottom p-bar">${kids}</footer>`;
@@ -874,6 +937,12 @@ function renderBar(r) {
 }
 
 function renderMain(fw, fh) {
+  if (S.view === "watched" && !S.classic) {
+    const list = watchedItems(), nr = new Set(list.map((i) => i.r.id)).size;
+    const meta = list.length ? `${list.length} stream${list.length === 1 ? "" : "s"} from ${nr} room${nr === 1 ? "" : "s"}` : "Every stream you're watching, from every room";
+    return `<main class="vb g0 eq"><header class="hb g2 band top p-head"><h2>Watched streams</h2><span class="txt meta">${meta}</span></header>
+      <div class="hb g0 eq st minh0">${renderStage(null)}${S.peoplePanel ? renderPeopleAll() : ""}</div></main>`;
+  }
   if (S.view === "watched") {
     const list = D().rooms.flatMap((r) => watched(r).map((s) => [r, s]));
     const body = list.length ? grid(list.map(([r, s]) => tile(r, s, true)), list.length === 1 ? 1 : 2, list.length === 1 ? `${Math.floor((fh - 56 - 32) * 16 / 9)}px` : null)
@@ -889,14 +958,13 @@ function renderMain(fw, fh) {
 }
 
 function renderFullscreen() {
-  const r = S.classic ? roomById(D().meRoom) : curRoom();
-  const items = stageItems(r);
-  const it = items.find((i) => i.key === (S.fsKey || D().watchOwner)) || items[0];
+  const items = allItems();
+  const it = items.find((i) => i.key === (S.fsKey || D().watchKey)) || items[0];
   if (!it) return "";
-  const s = it.s;
+  const s = it.s, r = it.r;
   const pic = it.mine ? `<div class="mine-pic">${ic("cast")}<span>Your screen · live</span></div>` : screenPic(s.pic);
   return `<div class="fs" data-dbl="exitfs"><div class="st-tile" data-key="${esc(it.key)}" style="left:0;top:0;width:100%;height:100%;border-radius:0;cursor:default;--ar:${(s.w / s.h).toFixed(4)}"><div class="vid">${pic}</div></div><div class="vig hover-ui"></div>
-    <div class="vb g0 ovl hover-ui"><div class="hb g2">${FILL(statbar(s, it.mine ? "You" : s.owner, r.name, true))}
+    <div class="vb g0 ovl hover-ui"><div class="hb g2">${FILL(statbar(s, it.mine ? "You" : s.owner, `${s.label} · ${r.name}`, true))}
       ${S.classic ? "" : `<button type="button" class="round-btn" title="More" data-ctx="${esc(it.key)}">${ic("more_horiz")}</button>`}
       <button type="button" class="round-btn" title="Exit fullscreen" data-act="exitfs">${ic("fullscreen_exit")}</button></div>
       <div class="fl v"></div><div class="hb g2">${S.classic ? audioOrChip(s) : ""}</div></div></div>`;
@@ -909,83 +977,94 @@ const LAYOUTS = [["split", "grid_view", "Split", "Even grid, every picture whole
   ["float", "filter_none", "Floating", "Move and resize each stream yourself"]];
 function stageItems(r) {
   if (!r || r.state !== "joined") return [];
-  const list = othersStreams(r).map((s) => ({ key: s.owner, s, mine: false }));
-  if (myLive(r)) list.push({ key: "me", mine: true, s: { owner: me(), label: "Screen", w: 1920, h: 1080, fps: S.fps, kbps: S.kbps, codec: S.codec, viewers: 2, audio: S.audioOn } });
+  const list = othersStreams(r).map((s) => ({ key: skey(r, s), r, s, mine: false }));
+  if (myLive(r)) list.push({ key: r.id + "/me", r, mine: true, s: { owner: me(), label: "Screen", w: 1920, h: 1080, fps: S.fps, kbps: S.kbps, codec: S.codec, viewers: 2, audio: S.audioOn } });
   return list;
 }
+const allItems = () => D().rooms.flatMap((r) => stageItems(r));
+/* Watched shows what you watch and nothing else: no Watch tiles, and not your own share. */
+const watchedItems = () => allItems().filter((i) => !i.mine && S.watchSet.has(i.key));
+const viewItems = () => (isCombined() ? watchedItems() : stageItems(curRoom()));
 function syncOrder(items) {
   const keys = items.map((i) => i.key);
-  S.order = S.order.filter((k) => keys.includes(k)).concat(keys.filter((k) => !S.order.includes(k)));
+  V().order = V().order.filter((k) => keys.includes(k)).concat(keys.filter((k) => !V().order.includes(k)));
 }
-const isWatched = (it) => it.mine || S.watchSet.has(it.s.owner);
+const isWatched = (it) => it.mine || S.watchSet.has(it.key);
 const stNote = (icon, t, sub, extra = "") => `<div class="arena-note">${ic(icon, "big")}<b>${t}</b>${sub ? `<span>${sub}</span>` : ""}${extra}</div>`;
 
-function stTile(it) {
-  const { key, s, mine } = it;
+function stTile(it, combined) {
+  const { key, s, mine, r } = it;
   const w = isWatched(it), muted = !!S.mutes[key], k = esc(key);
   const audible = !mine && w && s.audio && !muted;
   const pic = mine ? `<div class="mine-pic">${ic("cast")}<span>Your screen · live</span></div>` : screenPic(s.pic);
   const tagIc = mine ? ic("cast", "live") : !s.audio ? ic("volume_off") : muted ? ic("volume_off", "off") : ic("volume_up");
-  const tag = `<span class="tag" title="${mine ? "You" : esc(s.owner)} · ${esc(s.label)}">${tagIc}<span>${esc(mine ? "You" : s.owner)}</span><span class="lb">· ${esc(s.label)}</span></span>`;
+  const lb = esc(combined ? `${s.label} · ${r.name}` : s.label);
+  const tag = `<span class="tag" title="${mine ? "You" : esc(s.owner)} · ${lb}">${tagIc}<span>${esc(mine ? "You" : s.owner)}</span><span class="lb">· ${lb}</span></span>`;
   const tools = `<div class="tools hover-ui">${w ? `<button type="button" class="round-btn" title="Pop out to its own window" aria-label="Pop out" data-act="pop:${k}">${ic("open_in_new")}</button>
     <button type="button" class="round-btn" title="Fullscreen" aria-label="Fullscreen" data-act="fs:${k}">${ic("fullscreen")}</button>` : ""}
     <button type="button" class="round-btn" title="Volume and more" aria-label="Stream menu" data-ctx="${k}">${ic("more_horiz")}</button></div>`;
-  const stats = w && S.stats[key] ? `<div class="ovl stats">${statbar(s, mine ? "You" : s.owner)}</div>` : "";
+  const stats = w && S.stats[key] ? `<div class="ovl stats">${statbar(s, mine ? "You" : s.owner, combined ? r.name : null)}</div>` : "";
   const invite = w ? "" : `<div class="invite">${avatar(s.owner)}<b>${esc(s.owner)} is sharing ${esc(s.label)}</b><span>${s.w}×${s.h} · ${s.fps} fps</span>
     <button type="button" class="btn btn-primary" data-act="watch:${k}">${ic("play_arrow")}Watch stream</button></div>`;
   return `<div class="st-tile${w ? "" : " idle"}${audible ? " audible" : ""}" data-key="${k}"${w ? ` data-dbl="fs:${k}"` : ""} style="--ar:${(s.w / s.h).toFixed(4)}" tabindex="0" aria-label="${mine ? "Your" : esc(s.owner) + "'s"} stream">
     <div class="vid">${pic}</div>${invite}${stats}${tag}${tools}<span class="rz" title="Drag to resize"></span></div>`;
 }
 
+/* r: the room, or null for the combined stage of Watched. */
 function renderStage(r) {
-  const items = stageItems(r);
+  const items = r ? stageItems(r) : watchedItems();
   syncOrder(items);
-  const vis = S.order.map((k) => items.find((i) => i.key === k)).filter((i) => i && !S.popped.has(i.key));
+  const vis = V().order.map((k) => items.find((i) => i.key === k)).filter((i) => i && !S.popped.has(i.key));
   let inner;
-  if (S.viewPopped) inner = stNote("open_in_new", "The stage is open in its own window", "Your streams keep playing there.", `<button type="button" class="btn btn-secondary" data-act="popview">${ic("close_fullscreen")}Bring it back</button>`);
-  else if (!items.length) inner = stNote("tv_off", "Nobody is sharing yet", "Share your screen with the button below.");
+  if (V().stagePopped) inner = stNote("open_in_new", "The stage is open in its own window", "Your streams keep playing there.", `<button type="button" class="btn btn-secondary" data-act="popview">${ic("close_fullscreen")}Bring it back</button>`);
+  else if (!items.length) inner = r ? stNote("tv_off", "Nobody is sharing yet", "Share your screen with the button below.")
+    : stNote("visibility_off", "You're not watching anything", "Open a room in the sidebar and pick a stream to watch.");
   else if (!vis.length) inner = stNote("open_in_new", "Every stream is popped out", "Click a person below to bring their stream back.");
-  else inner = vis.map(stTile).join("");
-  return `<section class="vb g0 eq stg minh0"><div class="arena ${S.layout}" id="arena">${inner}</div>${renderStrip(r, items)}${renderControls(r)}</section>`;
+  else inner = vis.map((it) => stTile(it, !r)).join("");
+  return `<section class="vb g0 eq stg minh0"><div class="arena ${V().layout}" id="arena">${inner}</div>${renderStrip(r, items)}${renderControls(r)}</section>`;
 }
 
 function renderStrip(r, items) {
-  const ms = r.members;
+  const ms = r ? r.members : [...new Set(items.map((i) => i.s.owner))]; /* Watched: the owners, one avatar per person */
+  if (!ms.length) return `<div class="stripwrap"></div>`;
   const tg = `<button type="button" class="strip-tg" data-act="strip" title="${S.strip ? "Hide the people strip" : "Show the people strip"}" aria-label="${S.strip ? "Hide" : "Show"} the people strip">${ic(S.strip ? "expand_more" : "expand_less")}${S.strip ? "" : `<span>${ms.length}</span>`}</button>`;
   if (!S.strip) return `<div class="stripwrap">${tg}</div>`;
   const pv = ms.map((m) => {
-    const isMe = m === me(), key = isMe ? "me" : m;
-    const it = items.find((i) => i.key === key);
-    const popped = !!it && S.popped.has(key);
-    const audible = !!it && (it.mine ? S.audioOn : isWatched(it) && it.s.audio && !S.mutes[key]);
-    const cls = `pv${it ? " streaming" : ""}${popped ? " popped" : ""}${audible ? " audible" : ""}`;
+    const isMe = m === me(), its = items.filter((i) => i.s.owner === m);
+    const popped = its.some((i) => S.popped.has(i.key));
+    const audible = its.some((i) => (i.mine ? S.audioOn : isWatched(i) && i.s.audio && !S.mutes[i.key]));
+    const cls = `pv${its.length ? " streaming" : ""}${popped ? " popped" : ""}${audible ? " audible" : ""}`;
     const tagN = popped ? "button" : "div";
-    return `<${tagN} ${popped ? `type="button" data-act="popin:${esc(key)}" aria-label="Bring ${esc(m)}'s stream back to the stage"` : 'role="listitem"'} class="${cls}" data-user="${esc(m)}">
-      <span class="avatar" style="${avatarBg(m)}">${initial(m)}${it ? `<span class="lv">LIVE</span>` : ""}${popped ? `<span class="pop">${ic("open_in_new")}</span>` : ""}</span>
+    const badges = `${its.length ? `<span class="lv">LIVE</span>` : ""}${its.length > 1 ? `<span class="cnt" title="${its.length} streams">${its.length}</span>` : ""}${popped ? `<span class="pop">${ic("open_in_new")}</span>` : ""}`;
+    return `<${tagN} ${popped ? `type="button" data-act="popinall:${esc(m)}" aria-label="Bring ${esc(m)}'s streams back to the stage"` : 'role="listitem"'} class="${cls}" data-user="${esc(m)}">
+      ${avatar(m, false, false, badges)}
       <span class="nm">${isMe ? "You" : esc(m)}</span></${tagN}>`;
   }).join("");
   return `<div class="stripwrap">${tg}<div class="strip" role="list">${pv}</div></div>`;
 }
 
+/* Watched has no room of its own: Invite, Room settings and Leave go. Share and audio stay only while there is something
+   of yours to act on, and then they act on the room you share in. A new share starts from a room. */
 function renderControls(r) {
-  const mine = myShareIn(r) ? S.sharing : "none";
+  const shareRoom = r || roomById(D().meRoom);
+  const mine = shareRoom && myShareIn(shareRoom) ? S.sharing : "none";
   const open = (m) => (S.menu === m && !S.roomCtx ? " open" : "");
-  const shareTitle = mine === "none" ? "Share your screen" : mine === "staged" ? "Set up your stream" : "Stream settings";
+  const shareTitle = (mine === "none" ? "Share your screen" : mine === "staged" ? "Set up your stream" : "Stream settings") + (r ? "" : ` (${esc(shareRoom?.name)})`);
   const caret = (m, t) => `<button type="button" class="cb caret" data-menu="${m}" title="${t}" aria-label="${t}">${ic("expand_more")}</button>`;
-  const share = `<div class="splitb${mine === "live" ? " on" : mine === "staged" ? " ready" : ""}${open("share")}" data-anchor="share">
+  const share = !r && mine === "none" ? "" : `<div class="splitb${mine === "live" ? " on" : mine === "staged" ? " ready" : ""}${open("share")}" data-anchor="share">
     <button type="button" class="cb" data-act="share" title="${shareTitle}" aria-label="${shareTitle}">${ic("screen_share")}</button>${mine !== "none" ? caret("share", "Framerate, source and preset") : ""}</div>`;
   const aT = S.audioOn ? `Stop sharing audio (${S.audioSrc})` : S.audioSrc === "No audio" ? "Share audio" : `Share audio (${S.audioSrc})`;
-  const audio = `<div class="splitb${S.audioOn ? " on" : ""}${open("audio")}" data-anchor="audio">
+  const audio = !r && mine === "none" && !S.audioOn ? "" : `<div class="splitb${S.audioOn ? " on" : ""}${open("audio")}" data-anchor="audio">
     <button type="button" class="cb" data-act="audio" title="${esc(aT)}" aria-label="${esc(aT)}">${ic(S.audioOn ? "music_note" : "music_off")}</button>${caret("audio", "Pick an audio source")}</div>`;
-  const L = LAYOUTS.find((l) => l[0] === S.layout);
+  const L = LAYOUTS.find((l) => l[0] === V().layout);
   const layout = `<div class="splitb${open("layout")}" data-anchor="layout"><button type="button" class="cb" data-menu="layout" title="Layout: ${L[2]}" aria-label="Layout: ${L[2]}">${ic(L[1])}</button>${caret("layout", "Choose a layout")}</div>`;
-  const room = `<div class="splitb${open("room")}" data-anchor="room"><button type="button" class="cb" data-menu="room" title="Room settings" aria-label="Room settings">${ic("tune")}</button>${caret("room", "Room settings")}</div>`;
+  const room = !r ? "" : `<div class="splitb${open("room")}" data-anchor="room"><button type="button" class="cb" data-menu="room" title="Room settings" aria-label="Room settings">${ic("tune")}</button>${caret("room", "Room settings")}</div>`;
   const people = `<button type="button" class="cb${S.peoplePanel ? " sel" : ""}" data-act="people" title="${S.peoplePanel ? "Hide" : "Show"} the people list" aria-pressed="${S.peoplePanel}">${ic("group")}</button>`;
   return `<div class="ctlrow">
-    <div class="side"><button type="button" class="cb dim" data-act="side" title="${S.side ? "Hide the sidebar" : "Show the sidebar"}" aria-label="${S.side ? "Hide" : "Show"} the sidebar">${ic(S.side ? "left_panel_close" : "left_panel_open")}</button>
-      <button type="button" class="cb dim" data-act="invite" title="Copy the room's invite link">${ic("person_add")}<span class="lbl2">Copy invite link</span></button></div>
-    <div class="mid"><div class="cgroup">${share}${audio}</div><div class="cgroup">${layout}${room}${people}</div>
-      <button type="button" class="cb leave" data-act="leave:${r.id}" title="Leave ${esc(r.name)}" aria-label="Leave room">${ic("call_end")}</button></div>
+    <div class="side">${S.stageFs ? "" : `<button type="button" class="cb dim" data-act="side" title="${S.side ? "Hide the sidebar" : "Show the sidebar"}" aria-label="${S.side ? "Hide" : "Show"} the sidebar">${ic(S.side ? "left_panel_close" : "left_panel_open")}</button>`}
+      ${r ? `<button type="button" class="cb dim" data-act="invite" title="Copy the room's invite link">${ic("person_add")}<span class="lbl2">Copy invite link</span></button>` : ""}</div>
+    <div class="mid">${share || audio ? `<div class="cgroup">${share}${audio}</div>` : ""}<div class="cgroup">${layout}${room}${people}</div>
+      ${r ? `<button type="button" class="cb leave" data-act="leave:${r.id}" title="Leave ${esc(r.name)}" aria-label="Leave room">${ic("call_end")}</button>` : ""}</div>
     <div class="side r"><button type="button" class="cb dim" data-act="popview" title="Pop the stage out to its own window" aria-label="Pop out the stage">${ic("open_in_new")}</button>
       <button type="button" class="cb dim" data-act="stagefs" title="${S.stageFs ? "Exit fullscreen" : "Fullscreen"}" aria-label="${S.stageFs ? "Exit fullscreen" : "Fullscreen"}">${ic(S.stageFs ? "fullscreen_exit" : "fullscreen")}</button></div>
   </div>`;
@@ -1009,7 +1088,7 @@ function audioMenu() {
   return `<div class="ml">Audio source</div>${AUDIO_SRCS.map(([n, icon, sub]) => `<button type="button" class="mi two${cur === n ? " on" : ""}" data-act="asrc:${esc(n)}">${ic(icon)}<span class="t">${esc(n)}<small>${sub}</small></span>${cur === n ? ic("check", "chk") : ""}</button>`).join("")}`;
 }
 function layoutMenu() {
-  return `<div class="ml">Layout</div>${LAYOUTS.map(([k, icon, n, sub]) => `<button type="button" class="mi two${S.layout === k ? " on" : ""}" data-act="layout:${k}">${ic(icon)}<span class="t">${n}<small>${sub}</small></span>${S.layout === k ? ic("check", "chk") : ""}</button>`).join("")}
+  return `<div class="ml">Layout</div>${LAYOUTS.map(([k, icon, n, sub]) => `<button type="button" class="mi two${V().layout === k ? " on" : ""}" data-act="layout:${k}">${ic(icon)}<span class="t">${n}<small>${sub}</small></span>${V().layout === k ? ic("check", "chk") : ""}</button>`).join("")}
     <div class="msep"></div>${mi("restart_alt", "Reset sizes and positions", "resetlayout")}`;
 }
 function roomMenu() {
@@ -1032,15 +1111,14 @@ function roomMenu() {
     <div class="msep"></div>${mi("delete", "Forget room…", "forgetask:" + id, "", "danger")}`;
 }
 function ctxMenu() {
-  const r = S.classic ? roomById(D().meRoom) : curRoom();
-  const it = stageItems(r).find((i) => i.key === S.ctx?.key);
+  const it = allItems().find((i) => i.key === S.ctx?.key);
   if (!it) return "";
-  const { key, s, mine } = it, w = isWatched(it), k = esc(key), muted = !!S.mutes[key];
+  const { key, s, mine, r } = it, w = isWatched(it), k = esc(key), muted = !!S.mutes[key];
   const v = S.vols[key] ?? 100, lvl = S.levels[key] ?? S.level;
-  let out = `<div class="mh">${avatar(s.owner, true)}<div><b>${mine ? "Your stream" : esc(s.owner)}</b><small>${esc(s.label)} · ${s.w}×${s.h}</small></div></div>`;
+  let out = `<div class="mh">${avatar(s.owner, true)}<div><b>${mine ? "Your stream" : esc(s.owner)}</b><small>${esc(s.label)} · ${isCombined() ? esc(r.name) : `${s.w}×${s.h}`}</small></div></div>`;
   if (!mine && w && s.audio) {
     out += `<div class="ml">Volume</div><div class="mrow"><button type="button" class="icon-btn sm" data-act="mute:${k}" title="${muted ? "Unmute" : "Mute"}" aria-label="${muted ? "Unmute" : "Mute"}">${ic(muted ? "volume_off" : "volume_up")}</button>
-      <input type="range" class="vol" min="0" max="500" step="5" value="${v}" data-range="vol:${k}" aria-label="Volume of ${k}"${muted ? " disabled" : ""}><span class="pct" id="ctx-pct">${muted ? "Muted" : v + "%"}</span></div>
+      <input type="range" class="vol" min="0" max="500" step="5" value="${v}" data-range="vol:${k}" aria-label="Volume of ${esc(s.owner)}'s ${esc(s.label)}"${muted ? " disabled" : ""}><span class="pct" id="ctx-pct">${muted ? "Muted" : v + "%"}</span></div>
       <button type="button" class="mi" data-act="level:${k}" role="menuitemcheckbox" aria-checked="${lvl}">${ic("graphic_eq")}<span class="t">Level loudness</span>${sw(lvl)}</button>`;
   } else if (!mine && w) out += `<div class="mrow" style="font-size:var(--fs-small);color:var(--text-dim)">${ic("volume_off")}No audio in this stream</div>`;
   if (w) out += `<button type="button" class="mi" data-act="stats:${k}" role="menuitemcheckbox" aria-checked="${!!S.stats[key]}">${ic("monitoring")}<span class="t">Show stats on the stream</span>${sw(S.stats[key])}</button>`;
@@ -1050,10 +1128,18 @@ function ctxMenu() {
   else out += w ? mi("visibility_off", "Stop watching", "unwatch:" + k, "", "danger") : mi("play_arrow", "Watch stream", "watch:" + k);
   return out;
 }
+function emojiMenu() {
+  const cur = emojiOf(me());
+  return `<div class="mh">${avatar(me())}<div><b>Your avatar</b><small>Friends see it instead of your initial</small></div></div>
+    <div class="emoji-grid">${EMOJI.map((e) => `<button type="button" class="${e === cur ? "on" : ""}" data-act="emoji:${e}" aria-label="${e}">${e}</button>`).join("")}</div>
+    <div class="mrow"><input class="field" id="emoji-in" value="${esc(cur)}" placeholder="Paste any emoji" aria-label="Paste any emoji" autocomplete="off"></div>
+    <div class="emoji-hint" id="emoji-hint"></div>
+    ${mi("text_fields", "Use my initial", "emoji:")}`;
+}
 function renderMenu() {
-  const f = { share: shareMenu, audio: audioMenu, layout: layoutMenu, room: roomMenu, ctx: ctxMenu }[S.menu];
+  const f = { share: shareMenu, audio: audioMenu, layout: layoutMenu, room: roomMenu, ctx: ctxMenu, emoji: emojiMenu }[S.menu];
   const body = f ? f() : "";
-  return body ? `<div class="menu" id="menu" role="menu">${body}</div>` : "";
+  return body ? `<div class="menu m-${S.menu}" id="menu" role="menu">${body}</div>` : "";
 }
 function placeMenu() {
   const m = document.getElementById("menu");
@@ -1086,18 +1172,27 @@ function toast(msg, icon = "check_circle") {
   setTimeout(() => t.remove(), 2400);
 }
 
-/* hover card on a person in the strip */
+/* hover card on a person in the strip: one stream gets the full table, several get a row each */
 function userTip(name) {
-  const r = curRoom(), key = name === me() ? "me" : name;
-  const it = stageItems(r).find((i) => i.key === key);
-  if (!it) return `<div class="utip"><div class="hd">${avatar(name)}<div><b>${esc(name)}</b><small>Not sharing anything</small></div></div></div>`;
-  const s = it.s, w = isWatched(it);
-  const status = it.mine ? [ic("cast"), "Your stream"] : S.popped.has(key) ? [ic("open_in_new"), "Popped out · click to bring it back"]
+  const its = viewItems().filter((i) => i.s.owner === name), combined = isCombined();
+  if (!its.length) return `<div class="utip"><div class="hd">${avatar(name)}<div><b>${esc(name)}</b><small>Not sharing anything</small></div></div></div>`;
+  if (its.length > 1) {
+    const rows = its.map((it) => {
+      const { s, key } = it, popped = S.popped.has(key);
+      const status = popped ? ic("open_in_new") + "Popped out" : isWatched(it) ? ic("visibility") + "On the stage" : ic("visibility_off") + "Not watching";
+      return `<div class="ust"><div class="l1"><span class="txt">${esc(s.label)}</span>${FILL("")}${popped ? `<button type="button" class="back" data-act="popin:${esc(key)}" title="Bring this stream back to the stage">${ic("open_in_new")}Bring back</button>` : ""}</div>
+        <div class="l2 txt">${s.w}×${s.h} · ${s.fps} fps · ${esc(s.codec)} · ${fmtKbps(s.kbps)}</div>
+        <div class="l3">${status}${combined ? ` · ${esc(it.r.name)}` : ""} · ${s.viewers} watching</div></div>`;
+    }).join("");
+    return `<div class="utip multi"><div class="hd">${avatar(name)}<div><b>${esc(name)}</b><small>Sharing ${its.length} streams</small></div>${FILL("")}${pillLive()}</div>${rows}</div>`;
+  }
+  const it = its[0], s = it.s, w = isWatched(it), popped = S.popped.has(it.key);
+  const status = it.mine ? [ic("cast"), "Your stream"] : popped ? [ic("open_in_new"), "Popped out · click to bring it back"]
     : w ? [ic("visibility"), "Watching on the stage"] : [ic("visibility_off"), "Not watching"];
-  return `<div class="utip"><div class="hd">${avatar(name)}<div><b>${esc(name)}</b><small>Sharing ${esc(s.label)}</small></div>${FILL("")}${pillLive()}</div>
+  return `<div class="utip"><div class="hd">${avatar(name)}<div><b>${esc(name)}</b><small>Sharing ${esc(s.label)}${combined ? ` · ${esc(it.r.name)}` : ""}</small></div>${FILL("")}${pillLive()}</div>
     <dl><dt>Resolution</dt><dd>${s.w}×${s.h}</dd><dt>Framerate</dt><dd>${s.fps} fps</dd><dt>Codec</dt><dd>${esc(s.codec)}</dd>
       <dt>Bitrate</dt><dd>${fmtKbps(s.kbps)}</dd><dt>Viewers</dt><dd>${s.viewers}</dd><dt>Audio</dt><dd>${s.audio ? (it.mine ? esc(S.audioSrc) : "Shared") : "None"}</dd></dl>
-    <div class="st">${status.join("")}</div></div>`;
+    ${popped ? `<button type="button" class="st" data-act="popin:${esc(it.key)}">${status.join("")}</button>` : `<div class="st">${status.join("")}</div>`}</div>`;
 }
 
 /* ---------- arena layout: Split / Crop grid with splitters, Floating windows ---------- */
@@ -1126,14 +1221,14 @@ function bestRows(ars, W, H) {
 }
 function gridRects(n, ars, W, H) {
   const counts = bestRows(ars, W, H), sig = n + "|" + counts.join(",");
-  if (S.gridSig !== sig || !S.rowFr) { S.gridSig = sig; S.rowFr = counts.map(() => 1 / counts.length); S.colFr = counts.map((c) => Array(c).fill(1 / c)); }
+  if (V().gridSig !== sig || !V().rowFr) { V().gridSig = sig; V().rowFr = counts.map(() => 1 / counts.length); V().colFr = counts.map((c) => Array(c).fill(1 / c)); }
   const cells = [], guts = [], availH = H - GAP * (counts.length - 1);
   let y = 0;
   counts.forEach((c, i) => {
-    const rh = S.rowFr[i] * availH, availW = W - GAP * (c - 1);
+    const rh = V().rowFr[i] * availH, availW = W - GAP * (c - 1);
     let x = 0;
     for (let j = 0; j < c; j++) {
-      const cw = S.colFr[i][j] * availW;
+      const cw = V().colFr[i][j] * availW;
       cells.push({ x, y, w: cw, h: rh });
       x += cw;
       if (j < c - 1) { guts.push({ t: "v", i, j, x: x - 3, y, w: GAP + 6, h: rh, avail: availW }); x += GAP; }
@@ -1148,7 +1243,7 @@ function layoutArena() {
   if (!ar) return;
   ar.querySelectorAll(".gut").forEach((g) => g.remove());
   const tiles = new Map([...ar.querySelectorAll(".st-tile")].map((t) => [t.dataset.key, t]));
-  const keys = S.order.filter((k) => tiles.has(k));
+  const keys = V().order.filter((k) => tiles.has(k));
   if (!keys.length) return;
   const W = ar.clientWidth, H = ar.clientHeight;
   const ars = keys.map((k) => parseFloat(tiles.get(k).style.getPropertyValue("--ar")) || 16 / 9);
@@ -1156,23 +1251,23 @@ function layoutArena() {
   keys.forEach((k, i) => {
     const t = tiles.get(k), c = cells[i];
     let q;
-    if (S.layout === "float") {
-      let f = S.float[k];
-      if (!f) { const b = containRect(c.x, c.y, c.w, c.h, ars[i]); f = S.float[k] = { x: b.x / W, y: b.y / H, w: b.w / W, h: b.h / H }; }
+    if (V().layout === "float") {
+      let f = V().float[k];
+      if (!f) { const b = containRect(c.x, c.y, c.w, c.h, ars[i]); f = V().float[k] = { x: b.x / W, y: b.y / H, w: b.w / W, h: b.h / H }; }
       /* a window always has its stream's aspect ratio, whatever layout or frame size it came from */
       f.w = Math.min(f.w, 1, (H * ars[i]) / W);
       f.h = (f.w * W) / ars[i] / H;
       f.x = Math.max(0, Math.min(f.x, 1 - f.w));
       f.y = Math.max(0, Math.min(f.y, 1 - f.h));
       q = { x: f.x * W, y: f.y * H, w: f.w * W, h: f.h * H };
-      t.style.zIndex = 1 + Math.max(0, S.z.indexOf(k));
+      t.style.zIndex = 1 + Math.max(0, V().z.indexOf(k));
     } else {
-      q = S.layout === "crop" ? c : containRect(c.x, c.y, c.w, c.h, ars[i]);
+      q = V().layout === "crop" ? c : containRect(c.x, c.y, c.w, c.h, ars[i]);
       t.style.zIndex = "";
     }
     Object.assign(t.style, { left: q.x + "px", top: q.y + "px", width: q.w + "px", height: q.h + "px" });
   });
-  if (S.layout === "float") return;
+  if (V().layout === "float") return;
   for (const g of guts) {
     const d = document.createElement("div");
     d.className = "gut " + g.t;
@@ -1189,7 +1284,7 @@ function captureFloat() {
   const W = ar.clientWidth, H = ar.clientHeight;
   ar.querySelectorAll(".st-tile").forEach((t) => {
     const k = t.dataset.key;
-    if (!S.float[k]) S.float[k] = { x: t.offsetLeft / W, y: t.offsetTop / H, w: t.offsetWidth / W, h: t.offsetHeight / H };
+    if (!V().float[k]) V().float[k] = { x: t.offsetLeft / W, y: t.offsetTop / H, w: t.offsetWidth / W, h: t.offsetHeight / H };
   });
 }
 
@@ -1227,7 +1322,8 @@ function streamModal() {
   return shell("xwide", staged ? "Set up your stream" : "Stream settings", staged ? `Screen share · goes live in ${esc(r.name)}` : `Live in ${esc(r.name)} · changes apply right away`, body, foot);
 }
 function settingsModal() {
-  const body = card("Profile", null, ctrlRow("Display name", `<input class="field" id="set-name" value="${esc(me())}" aria-label="Display name">`, undefined, "What friends see in rooms")) +
+  const body = card("Profile", null, ctrlRow("Display name", `<input class="field" id="set-name" value="${esc(me())}" aria-label="Display name">`, undefined, "What friends see in rooms") +
+      ctrlRow("Avatar", `<button type="button" class="btn btn-secondary" data-menu="emoji" data-anchor="emoji" title="Pick an emoji for your avatar">${avatar(me(), true)}${emojiOf(me()) ? "Change" : "Pick an emoji"}</button>`, undefined, "An emoji instead of your initial, on the same colour")) +
     card("Language", null, ctrlRow("Language", seg("lang", ["English", "Deutsch"]))) +
     card("Display", null, ctrlRow("Presentation", select("presentation", ["Mailbox (default)", "Vsync", "Immediate"]), undefined, "How video frames reach the screen")) +
     card("Playback", null, ctrlRow("Jitter buffer", slider("jitter", 0, 5000, 100), `<span class="val" id="jitter-val">${(S.jitter / 1000).toFixed(1)} s</span>`, "How much delay smooths out the network") +
@@ -1264,12 +1360,13 @@ function render() {
   const r = curRoom();
   let html;
   if (S.view === "fullscreen") html = renderFullscreen();
-  else if (S.stageFs && !S.classic && r && r.state === "joined") html = `<div class="stagefs">${renderStage(r)}</div>`;
+  else if (S.stageFs && !S.classic && S.view === "watched") html = `<div class="stagefs">${renderStage(null)}${S.peoplePanel ? renderPeopleAll() : ""}</div>`;
+  else if (S.stageFs && !S.classic && r && r.state === "joined") html = `<div class="stagefs">${renderStage(r)}${S.peoplePanel ? renderPeople(r) : ""}</div>`;
   else html = `<div class="hb g0 st p-app">${S.side || S.classic ? renderSide() : ""}${renderMain(fw, fh)}</div>`;
   if (S.modal === "stream") html += streamModal();
   else if (S.modal === "settings") html += settingsModal();
   else if (S.modal === "add") html += addModal();
-  if (!S.modal) html += renderMenu();
+  if (!S.modal || S.menu === "emoji") html += renderMenu();
   frame.innerHTML = html;
   tipUser = null;
   frame.querySelectorAll('input[type="range"]').forEach(setPct);
@@ -1277,6 +1374,7 @@ function render() {
   layoutArena();
   placeMenu();
   renderNav();
+  chromeSync();
 }
 function setPct(el) { el.style.setProperty("--pct", ((el.value - el.min) / (el.max - el.min)) * 100 + "%"); }
 function fit() {
@@ -1298,18 +1396,20 @@ function applyPreset(key) {
   if (!p) return;
   const fresh = JSON.parse(PRISTINE);
   DATA.demo = fresh.demo; DATA.rig = fresh.rig;
-  const o = p[2];
+  const { layout, float, z, popped, ...o } = p[2];
   Object.assign(S, STAGE_DEFAULTS(), { modal: null, sharing: "none", sharerSelf: false, view: "room", room: D().meRoom }, o, { preset0: key });
-  const r = roomById(D().meRoom);
-  S.watchSet = new Set("watching" in o ? (o.watching ? [D().watchOwner] : []) : (D().stageWatch || othersStreams(r).map((s) => s.owner)));
-  S.popped = new Set(o.popped || []);
-  S.float = JSON.parse(JSON.stringify(o.float || {}));
-  S.z = [...(o.z || [])];
+  const r = roomById(D().meRoom), keys = (x) => othersStreams(x).map((s) => skey(x, s));
+  S.watchSet = new Set("watching" in o ? (o.watching ? [D().watchKey] : [])
+    : o.watchAll ? (D().allWatch || D().rooms.flatMap(keys)) : (D().stageWatch || keys(r)));
+  S.popped = new Set(popped || []);
+  Object.assign(V(), { layout: layout || "split", float: JSON.parse(JSON.stringify(float || {})), z: [...(z || [])] });
   render();
 }
 
 /* ============================== interaction ============================== */
 const framePt = (cx, cy) => { const fr = frame.getBoundingClientRect(); return { x: (cx - fr.left) / SCALE, y: (cy - fr.top) / SCALE }; };
+const exitFs = () => { S.view = S.fsBack; };
+const enterFs = (key) => { if (S.view !== "fullscreen") S.fsBack = S.view; Object.assign(S, { fsKey: key, view: "fullscreen" }); };
 const STAY = new Set(["fps", "auto", "rename", "cancel", "forgetask", "mute", "level", "stats"]); /* menu actions that keep the menu open */
 document.addEventListener("click", (e) => {
   const pre = e.target.closest("[data-preset]");
@@ -1319,7 +1419,7 @@ document.addEventListener("click", (e) => {
   const prev = { menu: S.menu, pos: S.roomCtx || (S.menu === "ctx" ? S.ctx : null), key: S.ctx?.key };
   let dirty = false;
   if (S.menu && !inMenu) { closeMenu(); dirty = true; }
-  if (e.target.matches("[data-scrim]")) { S.modal = null; return render(); }
+  if (e.target.matches("[data-scrim]")) { if (!prev.menu) S.modal = null; return render(); } /* a menu over a modal closes first */
   const set = e.target.closest("[data-set]");
   if (set) { S[set.dataset.set] = set.dataset.val; return render(); }
   const tog = e.target.closest("[data-toggle]");
@@ -1351,17 +1451,17 @@ document.addEventListener("click", (e) => {
     case "modal": S.modal = arg; break;
     case "close": S.modal = null; break;
     case "watch": S.watchSet.add(arg); break;
-    case "unwatch": S.watchSet.delete(arg); S.popped.delete(arg); break;
+    case "unwatch": S.watchSet.delete(arg); S.popped.delete(arg); if (S.view === "fullscreen" && S.fsKey === arg) exitFs(); break;
     case "share":
       if (S.sharing === "none") { D().meRoom = curRoom().id; Object.assign(S, { sharing: "staged", sharerSelf: true }); }
       S.modal = "stream"; break;
     case "golive": Object.assign(S, { sharing: "live", modal: null }); break;
-    case "discard": case "stop": Object.assign(S, { sharing: "none", modal: null }); S.popped.delete("me"); break;
-    case "exitfs": S.view = "room"; break;
+    case "discard": case "stop": Object.assign(S, { sharing: "none", modal: null }); S.popped.delete(myKey()); break;
+    case "exitfs": exitFs(); break;
     case "side": S.side = !S.side; break;
     case "people": S.peoplePanel = !S.peoplePanel; break;
     case "strip": S.strip = !S.strip; break;
-    case "popview": S.viewPopped = !S.viewPopped; break;
+    case "popview": V().stagePopped = !V().stagePopped; break;
     case "stagefs": S.stageFs = !S.stageFs; break;
     case "invite": render(); return toast("Invite link copied");
     case "leave":
@@ -1391,17 +1491,19 @@ document.addEventListener("click", (e) => {
         closeMenu(); render(); return toast(`Forgot ${room.name}`, "delete");
       }
       break;
-    case "pop": S.popped.add(arg); if (arg !== "me") S.watchSet.add(arg); if (S.view === "fullscreen") S.view = "room"; break;
+    case "pop": S.popped.add(arg); if (arg !== myKey()) S.watchSet.add(arg); if (S.view === "fullscreen") exitFs(); break;
     case "popin": S.popped.delete(arg); break;
-    case "fs": Object.assign(S, { fsKey: arg, view: "fullscreen" }); break;
+    case "popinall": viewItems().forEach((i) => { if (i.s.owner === arg) S.popped.delete(i.key); }); break;
+    case "fs": enterFs(arg); break;
+    case "emoji": S.myEmoji = arg; break;
     case "fps": S.fps = Number(arg); S.fpsSel = arg + " fps"; break;
     case "chsrc": render(); return toast("The system's screen and window picker opens here", "swap_horiz");
     case "audio":
       if (S.audioSrc === "No audio") S.menu = "audio"; else S.audioOn = !S.audioOn;
       break;
     case "asrc": S.audioSrc = arg; S.audioOn = arg !== "No audio"; break;
-    case "layout": if (arg === "float") captureFloat(); S.layout = arg; break;
-    case "resetlayout": Object.assign(S, { gridSig: "", float: {}, z: [] }); break;
+    case "layout": if (arg === "float") captureFloat(); V().layout = arg; break;
+    case "resetlayout": Object.assign(V(), { gridSig: "", float: {}, z: [] }); break;
     case "mute": S.mutes[arg] = !S.mutes[arg]; break;
     case "level": S.levels[arg] = !(S.levels[arg] ?? S.level); break;
     case "stats": S.stats[arg] = !S.stats[arg]; break;
@@ -1421,18 +1523,20 @@ document.addEventListener("contextmenu", (e) => {
 });
 document.addEventListener("dblclick", (e) => {
   const g = e.target.closest(".gut");
-  if (g) { S.gridSig = ""; layoutArena(); return; }
+  if (g) { V().gridSig = ""; layoutArena(); return; }
   const d = e.target.closest("[data-dbl]");
   if (!d || e.target.closest("button, input")) return;
   const v = d.dataset.dbl;
-  if (v.startsWith("fs:")) Object.assign(S, { fsKey: v.slice(3), view: "fullscreen" });
-  else S.view = "room";
+  if (v.startsWith("fs:")) enterFs(v.slice(3));
+  else exitFs();
   render();
 });
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
-    if (S.menu) closeMenu(); else if (S.modal) S.modal = null; else if (S.view === "fullscreen") S.view = "room"; else if (S.stageFs) S.stageFs = false; else return;
+    if (S.menu) closeMenu(); else if (S.modal) S.modal = null; else if (S.view === "fullscreen") exitFs(); else if (S.stageFs) S.stageFs = false; else return;
     render();
+  } else if (e.key === "Enter" && e.target.id === "emoji-in") {
+    e.preventDefault(); closeMenu(); render();
   } else if (e.key === "Enter" && e.target.id === "room-rename") {
     e.preventDefault(); frame.querySelector('[data-act^="renamesave:"]')?.click();
   } else if ((e.key === " " || e.key === "Enter") && e.target.matches?.(".cbx[data-toggle], .cbx[data-act]")) {
@@ -1447,7 +1551,7 @@ frame.addEventListener("pointerdown", (e) => {
   const g = e.target.closest(".gut");
   if (g) {
     const d = JSON.parse(g.dataset.gut);
-    drag = { kind: "gut", d, sx: e.clientX, sy: e.clientY, arr: d.t === "v" ? [...S.colFr[d.i]] : [...S.rowFr] };
+    drag = { kind: "gut", d, sx: e.clientX, sy: e.clientY, arr: d.t === "v" ? [...V().colFr[d.i]] : [...V().rowFr] };
     document.getElementById("arena").classList.add("nofx");
     e.preventDefault();
     return;
@@ -1455,8 +1559,8 @@ frame.addEventListener("pointerdown", (e) => {
   const t = e.target.closest(".arena .st-tile");
   if (!t || e.target.closest("button, input, .menu")) return;
   const key = t.dataset.key, rz = !!e.target.closest(".rz");
-  if (S.layout === "float") { S.z = S.z.filter((k) => k !== key).concat(key); layoutArena(); }
-  drag = { kind: rz ? "rz" : "tile", key, t, sx: e.clientX, sy: e.clientY, moved: false, f: S.float[key] ? { ...S.float[key] } : null };
+  if (V().layout === "float") { V().z = V().z.filter((k) => k !== key).concat(key); layoutArena(); }
+  drag = { kind: rz ? "rz" : "tile", key, t, sx: e.clientX, sy: e.clientY, moved: false, f: V().float[key] ? { ...V().float[key] } : null };
   e.preventDefault();
 });
 window.addEventListener("pointermove", (e) => {
@@ -1468,14 +1572,14 @@ window.addEventListener("pointermove", (e) => {
     const d = drag.d, arr = drag.arr.slice(), j = d.j, tot = arr[j] + arr[j + 1], MIN = 0.12;
     arr[j] = Math.max(MIN, Math.min(tot - MIN, arr[j] + (d.t === "v" ? dx : dy) / d.avail));
     arr[j + 1] = tot - arr[j];
-    if (d.t === "v") S.colFr[d.i] = arr; else S.rowFr = arr;
+    if (d.t === "v") V().colFr[d.i] = arr; else V().rowFr = arr;
     layoutArena();
     return;
   }
   if (!drag.moved && Math.hypot(dx, dy) < 4) return;
   drag.moved = true;
-  if (S.layout === "float") {
-    const f = S.float[drag.key], o = drag.f;
+  if (V().layout === "float") {
+    const f = V().float[drag.key], o = drag.f;
     if (!f || !o) return;
     if (drag.kind === "rz") {
       const a = parseFloat(drag.t.style.getPropertyValue("--ar")) || 16 / 9;
@@ -1502,7 +1606,7 @@ window.addEventListener("pointerup", () => {
   const d = drag, ar = document.getElementById("arena");
   drag = null;
   if (!ar) return;
-  if (d.kind === "gut" || S.layout === "float") { ar.classList.remove("nofx"); return; }
+  if (d.kind === "gut" || V().layout === "float") { ar.classList.remove("nofx"); return; }
   if (!d.moved) return;
   /* land the dragged tile where it was dropped, then let both tiles glide to their new cells */
   d.t.style.transition = "none";
@@ -1514,14 +1618,15 @@ window.addEventListener("pointerup", () => {
   d.t.style.transition = "";
   if (d.over) {
     d.over.classList.remove("drop");
-    const a = S.order.indexOf(d.key), b = S.order.indexOf(d.over.dataset.key);
-    [S.order[a], S.order[b]] = [S.order[b], S.order[a]];
+    const a = V().order.indexOf(d.key), b = V().order.indexOf(d.over.dataset.key);
+    [V().order[a], V().order[b]] = [V().order[b], V().order[a]];
   }
   layoutArena();
 });
 
 /* hover card on the people strip */
 document.addEventListener("mouseover", (e) => {
+  if (e.target.closest?.(".utip")) return; /* the card stays while the pointer is on it */
   const u = e.target.closest?.("[data-user]");
   const name = u && frame.contains(u) && !drag ? u.dataset.user : null;
   if (name === tipUser) return;
@@ -1535,7 +1640,51 @@ document.addEventListener("mouseover", (e) => {
   tip.style.top = Math.max(8, p.y - tip.offsetHeight - 12) + "px";
 });
 
+/* Fullscreen chrome (user request, #136; native popout.rs OVERLAY_IDLE, #124). The strip, the bar and the hover overlays
+   show only while the pointer is over the stage, and go after 3 s without movement. An open menu or modal or a drag holds
+   them up, wherever the pointer is, and cancels the timer; when the hold ends they get a full 3 s again (the grace), as
+   they do on entering fullscreen. Outside fullscreen they always show. */
+const OVERLAY_IDLE = 3000;
+let idleT = 0, grace = false, held = false, wasFs = false;
+function chromeOff(on) {
+  frame.classList.toggle("chrome-off", on);
+  if (on) { frame.querySelectorAll(".utip").forEach((x) => x.remove()); tipUser = null; }
+}
+function chromeTimer(isGrace) {
+  clearTimeout(idleT);
+  grace = isGrace;
+  chromeOff(false);
+  idleT = setTimeout(() => { idleT = 0; grace = false; chromeOff(true); }, OVERLAY_IDLE);
+}
+function chromeSync() {
+  const fs = S.view === "fullscreen" || (S.stageFs && !S.classic);
+  const hold = fs && !!(S.menu || S.modal || drag);
+  if (!fs || hold) { clearTimeout(idleT); idleT = 0; grace = false; chromeOff(false); }
+  else if (held || !wasFs) chromeTimer(true);
+  held = hold; wasFs = fs;
+}
+function chromePointer(x, y) {
+  if (!wasFs || held) return;
+  const r = frame.querySelector(".stagefs .stg, .fs")?.getBoundingClientRect();
+  if (r && x >= r.left && x < r.right && y >= r.top && y < r.bottom) chromeTimer(false);
+  else if (!grace) { clearTimeout(idleT); idleT = 0; chromeOff(true); }
+}
+window.addEventListener("pointermove", (e) => chromePointer(e.clientX, e.clientY));
+window.addEventListener("pointerdown", (e) => { chromeSync(); chromePointer(e.clientX, e.clientY); });
+window.addEventListener("pointerup", () => chromeSync());
+document.documentElement.addEventListener("mouseleave", () => chromePointer(-1, -1));
+document.addEventListener("keydown", () => { if (wasFs && !held) chromeTimer(false); });
+
 document.addEventListener("input", (e) => {
+  if (e.target.id === "emoji-in") {
+    const g = pickEmoji(e.target.value);
+    if (!g) { document.getElementById("emoji-hint").textContent = e.target.value.trim() ? "That isn't an emoji" : ""; return; }
+    S.myEmoji = g;
+    render();
+    const f = document.getElementById("emoji-in");
+    f.focus(); f.select();
+    return;
+  }
   const k = e.target.dataset?.range;
   if (!k) return;
   let v = Number(e.target.value);
@@ -1552,7 +1701,7 @@ document.addEventListener("input", (e) => {
 });
 document.addEventListener("change", (e) => {
   const t = e.target;
-  if (t.id === "nav-size") { S.size = t.value; S.gridSig = ""; return render(); }
+  if (t.id === "nav-size") { S.size = t.value; V().gridSig = ""; return render(); }
   if (t.id === "nav-data") { S.data = t.value; return applyPreset(S.preset0 || "stage"); }
   if (t.id === "nav-ovl") { S.pin = t.checked; return render(); }
   if (t.id === "nav-spin") { S.spin = t.checked; return render(); }

@@ -244,6 +244,21 @@ ring means audible shared audio, because the app has no voice chat; Split and Cr
 shows the most picture area), Crop only fills the cells; resizing in those two is by splitters, so an even grid stays
 one double-click away.
 
+**Watched** (Stage group, #136, 2026-11-03) is the same stage for every stream you watch, from all rooms. *Why (user
+request):* "the same view should be on the watched streams section ... everything combined". A stream's key is
+`room/owner/label` (your own share `room/me`), because one person can be in two rooms and share several streams; each
+room and Watched keep their own layout state (`V()`), while watch, pop-out, volume and stats belong to the stream and
+are shared. Watched has no Invite, Room settings or Leave, and shows Share and audio only while you have a share to act
+on (a new share starts from a room, so no room picker). Several streams of one person are one avatar with a count.
+
+**Emoji avatars** (#136): a person can pick an emoji (Settings > Profile) that replaces the initial on the same
+name-derived gradient; `avatar()` is the one helper. No wire field exists yet, so in the app this needs a protocol change.
+
+**Fullscreen chrome** (#136, native `popout.rs` `OVERLAY_IDLE`): in fullscreen the strip and bar lie over the stage, so
+the streams do not jump. *Why (user request):* they should be out of the way: shown only while the pointer is over the
+stage, gone after 3 s without movement. An open menu or a drag cancels the timer and keeps them up even off the stage;
+when it ends they get a full 3 s again, so closing a menu never hides the bar at once. Outside fullscreen they always show.
+
 ## Verifying a style change
 
 `--gallery` is the quick QC screen for widgets and tokens; it is **not** proof that a
