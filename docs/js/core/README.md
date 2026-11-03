@@ -222,7 +222,8 @@ Behaviour that matches the native sender:
 | `protocol.js` | port of `protocol/src/lib.rs`: every `ClientToRelay`/`RelayToClient` encode+decode, control framing (`ControlFrameReader`, 64 KiB cap), 19-byte media header, 15-byte preview header, constants |
 | `postcard.js` | the postcard subset used (varints, strings, fixed arrays) |
 | `crypto.js` | AES-256-GCM via WebCrypto; `NonceSequence` (ONE u32 counter per connection shared by video, audio and previews, never wraps: the last legal value is `0xFFFFFFFF`, then `NonceSpaceExhausted` and the room client reconnects with a fresh ConnId); AAD `[version, stream_id]` |
-| `fragment.js` | `fragmentFrame` (encrypt once, then split to <= 1000 bytes including the header) `pacePlan` (how to spread a big frame over time on send, port of native `pace_plan`, #103) and `Reassembler` (drops a frame on any missing fragment, in-flight cap 2, 200 ms staleness, straggler floor, reports drops) |
+| `fragment.js` | `fragmentFrame` (encrypt once, then split to <= 1000 bytes including the header) `pacePlan` (how to spread a big frame over time on send, port of native `pace_plan`, #103) and `Reassembler` (two modes: legacy = drops a frame on any missing fragment, in-flight cap 2, 200 ms staleness, straggler floor, reports drops; NACK mode = repairs holes by asking, holds later frames in order, 256-id duplicate memory, #111) |
+| `nack.js` | selective retransmission, browser side of spec §6.6 (#111): `SendRing` (last 2 s / 8 MiB of sent video datagrams per stream, `resends()` = original + retransmit flag), the Hello datagram, the `?nack=0` kill switch (`nackEnabledByDefault`). The viewer half is `Reassembler`; `RoomClient` wires both to the wire |
 | `codec.js` | codec sniffing (H.264/H.265/AV1) and WebCodecs codec strings from the SPS / sequence header (`avc1.PPCCLL`, `hev1…`, `av01…`) |
 | `jitter.js` | adaptive jitter buffer (RFC 3550 EWMA, growth cap, `catchUpSpeedPercent` shrink cap, decode-queue backstop) ported from the desktop client's former WebCodecs `tile-video.js` (replaced by the native decoder), one timer drains all due chunks |
 | `video-rx.js` | per-stream receive pipeline (`VideoReceiver`: loss gate -> jitter buffer -> `VideoDecoder`, reconfigures on codec change, recovers from decoder errors, Gecko decoder-latency fallback); re-exports `CanvasRenderer` |
@@ -245,6 +246,24 @@ Behaviour that matches the native sender:
 * **Loss recovery** (`lossRecovery: "resubscribe"`): a lost frame breaks the reference chain, so the receiver stops feeding
   deltas, and asks for a keyframe the only way a viewer can: `Unsubscribe` + `Subscribe` (the relay then sends the sender a
   `KeyframeRequest`), at most every 1.5 s and again while still waiting. `"wait"` just waits for the next scheduled keyframe.
+
+* **Selective retransmission (NACK, #111, spec §6.6; `RoomClient({ nack })`, default on).** After joining, the client sends the
+  1-byte Hello datagram (`0xE0`) once per second, at most 10 times, until the relay's HelloAck (`0xE1`) arrives
+  (`client.nackAcked`); an old relay never answers, and then nothing changes (no NACK is ever sent, legacy reassembly). Once
+  acked, the `Reassembler` switches to NACK mode: a missing fragment is requested (`[0xE2, owner conn_id, stream_id, frame_id,
+  first, count]`, 18 bytes, per contiguous run) when >= 2 later fragments of its frame arrived or the frame was quiet for
+  20 ms, again every `clamp(2 x rtt + 60, 100, 300 ms)` (at most 3 asks per fragment; rtt = `WebTransport.getStats().smoothedRtt`
+  from the 1 s stats timer where the browser has `getStats()` (Chromium 153 here does not), else 150 ms), a frame with > 128 suspect fragments is abandoned at once, a `Miss` (`0xE3`) or 1 s
+  ends the wait. Giving up goes through `onDrop` = the same `loss` marker as before, so the keyframe recovery above is unchanged.
+  While a frame is being repaired the later complete frames of that stream wait and are released in order. A **sender** keeps
+  the video datagrams it sent for 2 s / 8 MiB per stream (`SendRing`), and answers a relay-forwarded Request whose owner is
+  its own ConnId with the same datagrams plus `flags` bit2 (retransmit), sent directly (not through the pacing loop: a repair
+  is a few datagrams, and the sender skips it when `MAX_PENDING_DATAGRAMS` are already queued). Audio is never NACKed or kept.
+  The poll runs on a 5 ms timer only while a frame is incomplete (`#scheduleNackPoll`). Kill switch (mirrors native
+  `SSS_DISABLE_NACK=1`): `?nack=0` in the page URL, `localStorage["sss-nack"]="0"`, or `new RoomClient({ nack: false })`: the client
+  then never says Hello, so the relay neither forwards requests to it nor does it ever ask. `client.nackStats()` =
+  `{ enabled, active, requests, fragmentsRequested, fragmentsRecovered, framesRecovered, framesAbandoned, served: { requests,
+  resent, missed } }` (also `nack` in the video `watchStats`).
 
 ## Known relay issues
 

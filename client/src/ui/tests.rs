@@ -890,3 +890,109 @@ mod audio_boost {
         assert_eq!(app.state.audio_gain, 1.0);
     }
 }
+
+/// Task #113: the mouse-wheel step of the viewer volume slider.
+#[test]
+fn wheel_step_is_5_up_to_200_and_10_above_and_symmetric_at_the_boundary() {
+    // Up: 5 steps below 200, 10 from 200 on.
+    assert_eq!(wheel_step(0, true), 5);
+    assert_eq!(wheel_step(95, true), 100);
+    assert_eq!(wheel_step(100, true), 105, "passes through the 100 % detent");
+    assert_eq!(wheel_step(195, true), 200);
+    assert_eq!(wheel_step(200, true), 210);
+    assert_eq!(wheel_step(205, true), 210, "an off-grid 205 lands on the 10 grid");
+    assert_eq!(wheel_step(490, true), 500);
+    assert_eq!(wheel_step(500, true), 500, "clamped");
+    // Down: the mirror image.
+    assert_eq!(wheel_step(500, false), 490);
+    assert_eq!(wheel_step(220, false), 210);
+    assert_eq!(wheel_step(210, false), 200);
+    assert_eq!(wheel_step(205, false), 200);
+    assert_eq!(wheel_step(200, false), 195);
+    assert_eq!(wheel_step(105, false), 100);
+    assert_eq!(wheel_step(5, false), 0);
+    assert_eq!(wheel_step(0, false), 0, "clamped");
+    // Up then down is the identity everywhere on the grid.
+    for p in (0..500).step_by(5).filter(|p| *p <= 195 || p % 10 == 0) {
+        assert_eq!(wheel_step(wheel_step(p, true), false), p, "p={p}");
+    }
+}
+
+/// Task #113: real egui events. A wheel notch over the slider steps the value and
+/// is consumed (the `ScrollArea` around it does not move); a notch beside it
+/// scrolls the area and leaves the value alone.
+#[test]
+fn wheel_over_the_volume_slider_steps_it_and_does_not_scroll_the_panel() {
+    let ctx = ctx();
+    let size = egui::vec2(300.0, 200.0);
+    let mut percent = 195u32;
+    let mut changed = false;
+    let mut offset = 0.0f32;
+    let mut slider_rect = Rect::NOTHING;
+    let run = |events: Vec<egui::Event>, percent: &mut u32, changed: &mut bool, offset: &mut f32, slider_rect: &mut Rect| {
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)), events, ..Default::default() };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let out = egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    ui.set_width(200.0);
+                    let r = volume_slider(ui, percent);
+                    *slider_rect = r.rect;
+                    *changed = r.changed();
+                    ui.allocate_space(egui::vec2(10.0, 2000.0));
+                });
+                *offset = out.state.offset.y;
+            });
+        });
+    };
+    let wheel = |y: f32| egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Line, delta: egui::vec2(0.0, y), modifiers: egui::Modifiers::NONE };
+    run(vec![], &mut percent, &mut changed, &mut offset, &mut slider_rect);
+    let on = slider_rect.center();
+    run(vec![egui::Event::PointerMoved(on)], &mut percent, &mut changed, &mut offset, &mut slider_rect);
+    // Wheel forward over the slider: 195 -> 200 -> 210, then back 210 -> 200 -> 195.
+    for want in [200, 210] {
+        run(vec![wheel(1.0)], &mut percent, &mut changed, &mut offset, &mut slider_rect);
+        assert_eq!(percent, want);
+        assert!(changed);
+    }
+    for want in [200, 195] {
+        run(vec![wheel(-1.0)], &mut percent, &mut changed, &mut offset, &mut slider_rect);
+        assert_eq!(percent, want);
+    }
+    // Let the smoothing tail drain; the area never moved.
+    for _ in 0..5 {
+        run(vec![], &mut percent, &mut changed, &mut offset, &mut slider_rect);
+    }
+    assert_eq!(offset, 0.0, "the wheel was consumed by the slider");
+    // Beside the slider the wheel scrolls the area and leaves the value alone.
+    let off = egui::pos2(slider_rect.center().x, 150.0);
+    run(vec![egui::Event::PointerMoved(off)], &mut percent, &mut changed, &mut offset, &mut slider_rect);
+    run(vec![wheel(-1.0)], &mut percent, &mut changed, &mut offset, &mut slider_rect);
+    for _ in 0..5 {
+        run(vec![], &mut percent, &mut changed, &mut offset, &mut slider_rect);
+    }
+    assert_eq!(percent, 195);
+    assert!(offset > 0.0, "the panel scrolls when the pointer is not on the slider");
+}
+
+/// #115: after an audio source switch the old share is `Stopping` for a second
+/// or more, and both audio captures point at the video capture. The bar must
+/// follow the new one (its level, its mute), not the dying one.
+#[test]
+fn the_bar_follows_the_live_audio_share_not_the_stopping_one() {
+    use simple_screensharing_client::session::{LocalCapture, ShareStatus};
+    let audio = |status: ShareStatus, label: &str| LocalCapture {
+        kind: StreamKind::Audio,
+        label: label.to_string(),
+        status,
+        audio_for_capture: Some(CaptureSourceId(10)),
+        destinations: Default::default(),
+    };
+    let (_tx_old, rx_old) = tokio::sync::oneshot::channel();
+    let (_tx_new, rx_new) = tokio::sync::oneshot::channel();
+    let mut state = AppState::default();
+    state.captures.insert(CaptureSourceId(20), audio(ShareStatus::Stopping(rx_old), "old"));
+    assert_eq!(paired_audio(&state, CaptureSourceId(10)), Some(CaptureSourceId(20)), "a lone stopping share is still shown");
+    state.captures.insert(CaptureSourceId(21), audio(ShareStatus::Starting(rx_new), "new"));
+    assert_eq!(paired_audio(&state, CaptureSourceId(10)), Some(CaptureSourceId(21)));
+    assert_eq!(paired_audio(&state, CaptureSourceId(99)), None);
+}

@@ -50,7 +50,9 @@ refresh, default 240), `HS_PATTERN`, `HS_XDPW`, `HS_PIPEWIRE`, `RUST_LOG`,
 `SSS_LANGUAGE`, `CLIENT_ENV_<n>` (extra env for client n, e.g. a `GST_DEBUG` for the sharer), `HS_NAME_<n>` (display name of client n, default `client-<n>`), `HS_SEND_DIAG_<n>=1` (client n starts with Settings > Diagnostics > "Send diagnostics to the relay" ticked, #110),
 `HS_RELAY_ENV` (`"A=1 B=2"` for the relay process, e.g. `SSSHARE_NACK=0` for a relay that behaves like one without NACK), `HS_RELAY_BIN` / `HS_CLIENT_BIN_<n>` (run another binary for the relay / client n, e.g. an older build for mixed-version checks, #104).
 
-Input details: pointer = `swaymsg seat - cursor ...` (needs `hs-vptr`). Keys = `wtype`, which
+Input details: pointer = `swaymsg seat - cursor ...` (needs `hs-vptr`); mouse wheel = `$SCRATCH/bin/hs-vptr scroll N`
+(one-shot: N notches at the cursor, N > 0 wheel down, N < 0 up; a second virtual pointer on the same seat, run inside
+`hs-rig.sh run --`; task #113). Keys = `wtype`, which
 creates a virtual keyboard only while it runs (`hs-drive.sh key N ...` focuses client N first).
 Never `ydotool`: it is a uinput device and injects into the user's REAL session. Click
 coordinates: the stream-settings modal is driven from `SSS_UI_DUMP` rects (`$SCRATCH/ui1.txt`) plus

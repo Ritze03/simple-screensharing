@@ -973,3 +973,56 @@ pub(super) fn pop_check_item(ui: &mut Ui, checked: bool, label: &str, sub: &str)
 pub(super) fn find_source(cx: &Cx, name: &str) -> Option<AudioSource> {
     cx.state.audio_sources.iter().find(|s| s.name == name).cloned()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Number of bars painted in the "lit" colours when the bar's audio slot is
+    /// drawn with `lit` bars (the live share's level meter).
+    fn lit_bars_painted(lit: u8) -> usize {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(800.0, 200.0))),
+            ..Default::default()
+        };
+        let mut count = 0;
+        // Two passes: the first lays fonts out, the second is the settled frame.
+        for _ in 0..2 {
+            let out = ctx.run(input.clone(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let slot = AudioSlot::new(ui, Some("Firefox".into()), false, Some(lit), true, false);
+                    let cell = Rect::from_min_size(pos2(20.0, 20.0), vec2(slot.width, theme::CTL_H_LG));
+                    slot.show(ui, cell);
+                });
+            });
+            count = out
+                .shapes
+                .iter()
+                .filter(|s| matches!(&s.shape, egui::Shape::Rect(r) if r.fill == theme::SUCCESS || r.fill == theme::WARNING))
+                .inspect(|s| {
+                    // Inside the slot (the cell is 36 px tall at y 20), not clipped away.
+                    assert!(s.clip_rect.contains_rect(s.shape.visual_bounding_rect()), "lit bar is clipped: {s:?}");
+                    assert!(s.shape.visual_bounding_rect().top() >= 20.0 && s.shape.visual_bounding_rect().bottom() <= 56.0);
+                })
+                .count();
+        }
+        count
+    }
+
+    #[test]
+    fn the_bars_audio_slot_paints_as_many_lit_bars_as_the_level_says() {
+        assert_eq!(lit_bars_painted(0), 0);
+        assert_eq!(lit_bars_painted(3), 3);
+        assert_eq!(lit_bars_painted(5), 5);
+    }
+
+    #[test]
+    fn level_lit_maps_the_meter_fraction_onto_five_bars() {
+        assert_eq!(level_lit(0.0), 0);
+        assert_eq!(level_lit(0.25), 2);
+        assert_eq!(level_lit(0.7), 4);
+        assert_eq!(level_lit(1.0), 5);
+    }
+}

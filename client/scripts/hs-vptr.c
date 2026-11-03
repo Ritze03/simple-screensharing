@@ -13,6 +13,7 @@
  * only (hs-lib.sh always sets it to the ABSOLUTE socket path of the private sway).
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <wayland-client.h>
 #include "hs-vptr-protocol.h"
@@ -30,14 +31,29 @@ static void on_global(void *d, struct wl_registry *r, uint32_t name, const char 
 static void on_remove(void *d, struct wl_registry *r, uint32_t name) { (void)d; (void)r; (void)name; }
 static const struct wl_registry_listener rl = { on_global, on_remove };
 
-int main(void) {
+int main(int argc, char **argv) {
   struct wl_display *dpy = wl_display_connect(NULL);
   if (!dpy) { fprintf(stderr, "hs-vptr: cannot connect to $WAYLAND_DISPLAY\n"); return 1; }
   struct wl_registry *reg = wl_display_get_registry(dpy);
   wl_registry_add_listener(reg, &rl, NULL);
   wl_display_roundtrip(dpy);
   if (!mgr || !seat) { fprintf(stderr, "hs-vptr: compositor lacks zwlr_virtual_pointer_manager_v1 or wl_seat\n"); return 1; }
-  zwlr_virtual_pointer_manager_v1_create_virtual_pointer(mgr, seat);
+  struct zwlr_virtual_pointer_v1 *vp = zwlr_virtual_pointer_manager_v1_create_virtual_pointer(mgr, seat);
+  if (argc == 3 && !strcmp(argv[1], "scroll")) {
+    /* One-shot: `hs-vptr scroll N` sends N wheel notches (N > 0 = wheel down, < 0 = up) at the seat's
+     * current cursor position (put it there with `swaymsg seat - cursor set X Y`), then exits. The
+     * long-running instance keeps the seat's pointer capability meanwhile. Task #113. */
+    int n = atoi(argv[2]), dir = n < 0 ? -1 : 1;
+    for (int i = 0; i < abs(n); i++) {
+      zwlr_virtual_pointer_v1_axis_source(vp, 0 /* wheel */);
+      zwlr_virtual_pointer_v1_axis_discrete(vp, 1000 * (i + 1), 0 /* vertical */, wl_fixed_from_int(15 * dir), dir);
+      zwlr_virtual_pointer_v1_frame(vp);
+      wl_display_roundtrip(dpy);
+    }
+    zwlr_virtual_pointer_v1_destroy(vp);
+    wl_display_roundtrip(dpy);
+    return 0;
+  }
   wl_display_roundtrip(dpy);
   fprintf(stderr, "hs-vptr: virtual pointer up\n");
   while (wl_display_dispatch(dpy) != -1) {}

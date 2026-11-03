@@ -691,7 +691,17 @@ fn feed_loudness(msg: &gst::Message, loudness: &SharedLoudness) {
 /// `volume name=gain` + `rglimiter` ([`GAIN_STAGE`]) sit before the mute and the meter: the
 /// sender-side boost of Settings (task #114, `audio_gain.rs`), so the meter shows what is sent.
 fn build_pipeline(loopback_output_node_serial: u64, capture_node_name: &str, gain: f64) -> Result<BuiltPipeline> {
-    let description = pipeline_description(loopback_output_node_serial, capture_node_name);
+    build_pipeline_from_source(
+        &format!("pipewiresrc target-object={loopback_output_node_serial} client-name={capture_node_name} do-timestamp=true"),
+        gain,
+    )
+}
+
+/// [`build_pipeline`] with the source element(s) given as a description
+/// fragment, so a test can put `audiotestsrc` in front of the *real* chain
+/// (no PipeWire involved).
+fn build_pipeline_from_source(source: &str, gain: f64) -> Result<BuiltPipeline> {
+    let description = pipeline_description(source);
 
     let element = gst::parse::launch(&description)
         .with_context(|| format!("failed to construct audio capture pipeline: {description}"))?;
@@ -754,10 +764,10 @@ fn gain_stage_description() -> &'static str {
 
 /// The sender pipeline's description (everything of [`build_pipeline`] but the element lookups),
 /// split out so a test can check the order of the elements.
-fn pipeline_description(loopback_output_node_serial: u64, capture_node_name: &str) -> String {
+fn pipeline_description(source: &str) -> String {
     let gain_stage = gain_stage_description();
     format!(
-        "pipewiresrc target-object={loopback_output_node_serial} client-name={capture_node_name} do-timestamp=true \
+        "{source} \
          ! audio/x-raw,channels=2 \
          ! audioconvert \
          ! audioresample \
@@ -1343,7 +1353,10 @@ async fn pump_loop(
                             tracing::warn!("dropping encoded audio packet for stream {stream_id}: {e:#}");
                         }
                     }
-                    None => appsink_done = true,
+                    None => {
+                        tracing::info!("audio capture stream {stream_id}: appsink ended (no more packets; the level meter stops with it)");
+                        appsink_done = true;
+                    }
                 }
             }
             msg = bus_stream.next(), if !bus_done => {
@@ -1613,7 +1626,7 @@ mod tests {
     #[test]
     fn the_sender_pipeline_boosts_then_limits_before_mute_meter_and_encoder() {
         ensure_gstreamer_initialized().unwrap();
-        let d = pipeline_description(42, "cap");
+        let d = pipeline_description("pipewiresrc target-object=42 client-name=cap do-timestamp=true");
         let at = |needle: &str| d.find(needle).unwrap_or_else(|| panic!("{needle:?} missing from {d}"));
         assert!(at("format=F32LE") < at("volume name=gain"), "{d}");
         assert!(at("volume name=gain") < at("rglimiter name=limiter"), "{d}");
@@ -1630,13 +1643,9 @@ mod tests {
     #[test]
     fn the_sender_chain_negotiates_and_encodes_opus() {
         ensure_gstreamer_initialized().unwrap();
-        let d = pipeline_description(42, "cap");
-        let (_source, rest) = d.split_once(" ! ").unwrap();
-        assert!(_source.starts_with("pipewiresrc"));
-        let description = format!("audiotestsrc num-buffers=20 samplesperbuffer=960 ! {rest}");
-        let pipeline = gst::parse::launch(&description).unwrap().downcast::<gst::Pipeline>().unwrap();
-        let sink = pipeline.by_name("sink").unwrap().downcast::<gst_app::AppSink>().unwrap();
-        GainStage::from_pipeline(&pipeline).unwrap().set(3.0);
+        let BuiltPipeline { pipeline, sink, gain_stage, .. } =
+            build_pipeline_from_source("audiotestsrc num-buffers=20 samplesperbuffer=960", 3.0).expect("chain builds");
+        assert_eq!(gain_stage.gain(), 3.0);
         pipeline.set_state(gst::State::Playing).unwrap();
         let sample = sink.try_pull_sample(gst::ClockTime::from_seconds(5)).expect("no Opus packet");
         let caps = sample.caps().unwrap().to_string();
@@ -2011,6 +2020,43 @@ mod tests {
 
         pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
         assert!(got_buffer, "expected at least one encoded Opus packet from the test pipeline");
+    }
+
+    /// The share's real capture chain (`build_pipeline_from_source`, here with
+    /// `audiotestsrc` for `pipewiresrc`) delivers `level` messages through the
+    /// same bus stream + `handle_bus_message` the live share's `pump_loop`
+    /// uses, so [`AudioCaptureHandle::level`] moves off zero. No PipeWire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capture_chain_level_messages_reach_the_level_value() {
+        if gst::init().is_err() {
+            eprintln!("skipping: gstreamer not available in this environment");
+            return;
+        }
+        let BuiltPipeline { pipeline, sink, .. } =
+            build_pipeline_from_source("audiotestsrc is-live=true do-timestamp=true", 1.0).expect("chain builds");
+        let level = AudioLevel::default();
+        assert_eq!(level.get(), 0.0);
+        // Same order as `start_audio_sharing`: PLAYING first, the bus and appsink
+        // streams only later (after the link check), so messages are already queued.
+        pipeline.set_state(gst::State::Playing).expect("playing");
+        let _ = pipeline.state(gst::ClockTime::from_seconds(5));
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let mut bus_stream = pipeline.bus().expect("bus").stream();
+        let mut appsink_stream = sink.stream();
+        let mut bus_done = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut packets = 0;
+        while level.get() == 0.0 && tokio::time::Instant::now() < deadline {
+            tokio::select! {
+                s = appsink_stream.next() => { if s.is_some() { packets += 1; } }
+                m = bus_stream.next() => { if let Some(m) = m { handle_bus_message(&m, &mut bus_done, &level); } }
+                _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+            }
+        }
+        let got = level.get();
+        let _ = pipeline.set_state(gst::State::Null);
+        assert!(packets > 0, "no opus packets");
+        assert!(got > 0.5, "audiotestsrc (~-5 dBFS RMS) should read well above half scale, got {got}");
     }
 
     /// Exercises the real PipeWire flow end to end: spawns a synthetic
