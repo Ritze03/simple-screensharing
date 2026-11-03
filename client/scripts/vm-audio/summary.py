@@ -25,6 +25,8 @@ for k, t in enumerate(resumes):
     first = seg.find("C" * 30)
     after = seg[first:] if first >= 0 else ""
     print("resume %d @%.1fs: clean(3s) after %s s; windows after that: %d bad / %d" % (k + 1, t, "%.1f" % (first / 10) if first >= 0 else "NEVER", after.count("B"), len(after)))
+    steady = seg[30:]  # from 3 s after the resume to the next pause
+    print("    steady state (3 s after the resume to the next pause): %d bad / %d windows of 0.1 s" % (steady.count("B"), len(steady)))
     print("   ", seg[:int(min(len(seg), 400))])
 # the very first seconds: startup
 print("startup 0-8s:", "".join(cls[:int(min(ev[0][0], 8) * 10)]))

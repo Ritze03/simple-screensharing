@@ -192,6 +192,12 @@ Both are GNOME/Wayland desktops with PipeWire + WirePlumber, user `mo`, no sound
   clean 440 Hz sine is 440 Hz / 0.058, a click or dropout is far above, a rate error moves the frequency) and
   `summary.py` (seconds until clean after each resume). `watch.py` logs every node/link change every 0.3 s, which
   is how the lost links and the re-created ports were found.
+- **A source that keeps its node and ports (task #125):** Firefox in the VMs re-creates its ports on resume; the host's
+  Floorp does not. `emu_src.py NAME` (a GStreamer `pulsesink`, SIGUSR1 pause / SIGUSR2 play) behaves like the host
+  one: `EMU=1 APP=Floorp host-run.sh PORT LABEL pause|flap`. `VM_SSS=<dir in the VM>` runs a baseline build kept in
+  another checkout (`VM_SSS='$HOME/sss-base'`). Make the fake hardware suspend when idle (`node.pause-on-idle = true`,
+  `node.always-process = false` in the fakehw drop-in) to get the Dummy-Driver switch a real ALSA sink gives. A healthy
+  share delivers ~50 packets/s to the viewer (`pps.py test.log`); fewer means the capture stream is not being scheduled.
 - **Also capture, before/after a change:** `pw-dump`, `pw-top -b -n 2`, `pw-metadata -n settings`, and the
   WirePlumber side (`WIREPLUMBER_DEBUG=s-linking.mpris:5`) when a player is paused unexpectedly.
 - **Leave the VMs as found:** remove `~/.config/pipewire/pipewire.conf.d/50-fakehw.conf` (and restart

@@ -10,8 +10,8 @@ OUT=~/out/$LABEL; rm -rf $OUT; mkdir -p $OUT ~/relaycwd
 pkill -f live_audio_share_soak; pkill -x pw-record; pkill -x simple-screensharing-server
 pactl list short sinks | grep -q viewer-out || pactl load-module module-null-sink sink_name=viewer-out sink_properties=node.description=viewer-out >/dev/null
 ff_play >/dev/null 2>&1; sleep 1
-TB=$(ls -t ~/sss/target/release/deps/simple_screensharing_client-* | grep -v '\.d$' | head -1)
-export SSSHARE_SERVER_BIN=~/sss/target/release/simple-screensharing-server SSSHARE_SERVER_CWD=~/relaycwd PULSE_SINK=viewer-out SSS_LIVE_APP=Firefox SSS_LIVE_SECONDS=${SECS:-60}
+TB=$(ls -t ${SSS:-$HOME/sss}/target/release/deps/simple_screensharing_client-* | grep -v '\.d$' | head -1)
+export SSSHARE_SERVER_BIN=${SSS:-$HOME/sss}/target/release/simple-screensharing-server SSSHARE_SERVER_CWD=~/relaycwd PULSE_SINK=viewer-out SSS_LIVE_APP=${APP:-Firefox} SSS_LIVE_SECONDS=${SECS:-60}
 export SSS_LIVE_DEBUG=1
 while true; do echo "$(date +%s.%N) $(status)" >> $OUT/status.txt; sleep 0.5; done 2>/dev/null &
 ST=$!
@@ -29,8 +29,8 @@ sleep 8
 case $SCEN in
  pause)
   for k in 1 2 3; do
-    ev "PAUSE $k"; ff_pause >/dev/null; sleep 1; echo "paused-graph:"; nodes | grep -E "Firefox|ssshare|fakehw"; links | grep -A3 "^Firefox"; sleep 5
-    ev "RESUME $k"; ff_play >/dev/null; sleep 1; nodes | grep -E "Firefox|ssshare|fakehw"; links | grep -A3 "^Firefox"; sleep 8
+    ev "PAUSE $k"; ff_pause >/dev/null; sleep 1; echo "paused-graph:"; nodes | grep -E "${APP:-Firefox}|ssshare|fakehw"; links | grep -A3 "^${APP:-Firefox}"; sleep 5
+    ev "RESUME $k"; ff_play >/dev/null; sleep 1; nodes | grep -E "${APP:-Firefox}|ssshare|fakehw"; links | grep -A3 "^${APP:-Firefox}"; sleep 8
   done;;
  pause1)
   pw-dump > $OUT/dump-before.json; pw-top -b -n 2 | tail -12 > $OUT/top-before.txt
@@ -38,6 +38,9 @@ case $SCEN in
   ev "RESUME 1"; ff_play >/dev/null; sleep 8
   pw-dump > $OUT/dump-after.json; pw-top -b -n 2 | tail -12 > $OUT/top-after.txt
   sleep 17;;
+ flap)  # a source that flaps: 10 x (2.2 s paused, 2.2 s playing), then 20 s playing (rebuild count must stay bounded)
+  for k in 1 2 3 4 5 6 7 8 9 10; do ev "PAUSE $k"; ff_pause >/dev/null; sleep 2.2; ev "RESUME $k"; ff_play >/dev/null; sleep 2.2; done
+  sleep 20;;
  idle) sleep 30;;
 esac
 echo "--- graph at end"; nodes; links | grep -v Midi; pw-metadata -n settings | grep -E "quantum|rate"

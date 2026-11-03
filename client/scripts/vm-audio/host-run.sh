@@ -6,8 +6,8 @@
 port=$1; label=$2; scen=$3; secs=${4:-60}
 D=$(cd "$(dirname "$0")" && pwd); O=${OUT_DIR:-$PWD/.tl-scratch/vm-audio}/$label
 mkdir -p "$O"
-scp -q -P "$port" "$D/soak.sh" "$D/watch.py" "$D/lib.sh" mo@127.0.0.1:
-ssh -o BatchMode=yes -p "$port" mo@127.0.0.1 "SECS=$secs bash ~/soak.sh $label $scen" > "$O/stdout.txt" 2>&1
+scp -q -P "$port" "$D/soak.sh" "$D/watch.py" "$D/lib.sh" "$D/emu_src.py" mo@127.0.0.1:
+ssh -o BatchMode=yes -p "$port" mo@127.0.0.1 "SSS=${VM_SSS:-\$HOME/sss} EMU=${EMU:-} APP=${APP:-Firefox} SECS=$secs bash ~/soak.sh $label $scen" > "$O/stdout.txt" 2>&1
 for f in viewer.wav sinkmon.wav events.txt status.txt watch.txt test.log dump-before.json dump-after.json; do
   scp -q -P "$port" "mo@127.0.0.1:out/$label/$f" "$O/$f" 2>/dev/null
 done

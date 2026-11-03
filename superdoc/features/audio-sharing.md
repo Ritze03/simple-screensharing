@@ -3,7 +3,91 @@
 Audio capture/encode/playback is described where it grew up: `features/stream-control.md`
 ("Sharing audio ...", "The 2026-07-28 audio bugs"), `features/video-pipeline.md` ("Audio follows
 video") and the module docs of `client/src/audio.rs` and `client/src/decode.rs`. This page covers
-**keeping the audio aligned with the picture** (task #91, 2026-11-01), the **shared audio is a name** (#105), the viewer volume (#96), the **sender-side boost** (#114, capped at 200 % and calibration-free since #119) and the **viewer-side loudness levelling** (#119); for the share sink's lifecycle (WirePlumber pauses a player when its sink goes away, a resuming stream loses its links) see the #123 block.
+**keeping the audio aligned with the picture** (task #91, 2026-11-01), the **shared audio is a name** (#105), the viewer volume (#96), the **sender-side boost** (#114, capped at 200 % and calibration-free since #119) and the **viewer-side loudness levelling** (#119); for the share sink's lifecycle (WirePlumber pauses a player when its sink goes away, a resuming stream loses its links) see the #123 block; for a source that pauses and resumes while keeping its node and links (the share garbled, rebuilt on resume) see the #125 block.
+
+## 2026-11-03: garbled audio after a pause/resume that keeps the node and its links (task #125)
+
+User report on master `d39e70d` (with #123): pausing and resuming a YouTube video in Floorp still garbles the shared
+audio until the source is re-selected. **Host evidence** (read-only `pw-dump` every 0.3 s over 4 pause/resume cycles,
+then a re-select): the share sink `ssshare-sink-5-...` (sink 296 + capture stream 340), Floorp node 365 (0 in / 2 out
+ports), `easyeffects_sink` 317 running, the ALSA sink 88 running as driver. On every pause Floorp goes
+`running` -> `idle`, on resume `idle` -> `running`, **same node id, same ports, the links into our sink stay `active`**
+(no link loss, so #123's lost-links trigger never fired and the log shows no rebuild). Re-selecting (new sink,
+linked first, capture started after) fixes it. Separately a destroyed/re-created Floorp node (365 -> 342) triggered the
+#117 rebuild correctly.
+
+### 1. Fix: an idle -> running source rebuilds the chain (`audio.rs`, `IdleWatch`, `poll_decision`, `node_is_running`)
+
+The poll now also reads each node's `info.state` (`PwInfo::state`) and counts the streams carrying the shared name and
+how many are `running`. **Every stream of the name not running for 2 polls in a row** (`IDLE_TICKS`) sets the sticky
+`IdleWatch::idled` (the chain is stale, exactly like a vanished stream, #117); **as soon as one runs again** the
+decision is `rebuild_chain` (same path as a re-select: new sink, links, then capture pipeline, old sink unlinked and
+removed), logged as `audio share '<name>': source resumed after idle; rebuilding the loopback`. It goes through
+`gap_decision` (the `linkable` input is `new_linkable || lost || resumed`), so #117, #123 (lost links) and the
+mute carry-over are unchanged.
+- *Several linked sources:* one idle while another runs is not "every stream idle": no rebuild.
+- *Debounce / no loops:* 2 idle polls before a pause counts (a new stream is `idle` for a moment before it runs, an
+  app that buffers blips); after any rebuild `REBUILD_COOLDOWN_TICKS` (5 polls) must pass before the next
+  idle-triggered one. A resume inside the cooldown is remembered and rebuilt for when it ends (the flag is sticky),
+  so a source that flaps costs at most one ~1 s rebuild per 5 s (measured: 10 flaps of 2.2 s -> 9 rebuilds, then clean).
+- A node without a reported state, or not in the snapshot, counts as running (no conclusion drawn).
+- Start with the source already paused: the share starts stale, and the resume rebuilds (same reasoning).
+*Why a rebuild and not just re-linking:* see "Root cause" and the #123 block (anything done to the running capture
+chain is non-deterministic, a fresh chain built in the order sink, links, capture stream is clean).
+
+### 2. Root cause (reproduced and measured in the Fedora VM, PipeWire 1.6.2, EasyEffects)
+
+**Topology:** EasyEffects running and set as default sink (`easyeffects_sink` -> fake ALSA sink `alsa_output.fakehw`,
+the #123 drop-in), the source linked into both `easyeffects_sink` and our share sink. **Source that keeps its node
+and ports:** Firefox in the VMs re-creates its ports on resume (already handled by #123), the host Floorp does not, so
+the VM harness got `client/scripts/vm-audio/emu_src.py`: a GStreamer `pulsesink` (pulse client of pipewire-pulse like
+Firefox's cubeb) that is set PAUSED/PLAYING; the pulse sink corks the stream, which is exactly the host picture
+(`running` -> `idle`, links `active` -> `paused`, same node and ports). Run it as app `Floorp`
+(`EMU=1 APP=Floorp host-run.sh PORT LABEL pause`).
+
+**Result:** reproduced on the unchanged `d39e70d` code, no rebuild in the log, the share garbled for the rest of each
+cycle: viewer 31 / 48 / 47 bad 0.1 s windows of 60 (3 s after each resume to the next pause; a clean run is 0-7 of 60,
+the VM's own noise), clicks (`step/pk` 0.5-1.0) and a flat tone. The **sink's own monitor** recorded in parallel is
+clean (0-3 of 60), so the damage is on the capture side of the chain. `watch.py` shows why: while the source runs, the
+share group (sink + capture stream) is driven by the hardware sink (`drv=32`); on pause the links go `paused`, the
+group is left alone and **the driver changes** (the sink becomes its own driver `drv=118`, or the Dummy-Driver `30` when
+the hardware sink suspends when idle: fakehw with `node.pause-on-idle=true`, like a real ALSA device); on resume the
+groups merge again (`drv=59`, then `32`) **under the running capture stream**. The packets/s the in-process viewer
+receives fall from 50 to 15-38 from the first driver change on (`pps.py`): the capture stream is no longer scheduled
+regularly, hence the missing samples, the clicks and the wrong pitch.
+
+**Proof that the driver change is the cause:** the sink created with `node.driver=true priority.driver=3000` (our sink is
+always the driver, the driver never changes) stays at 50 packets/s and is clean without any rebuild (viewer 1/1/1 of 60).
+Also tested, no help: dropping `node.driver` (`node.driver=false`) is clean only while the hardware sink never goes idle
+(fakehw `always-process`: 5/6/3 and 0/1/1 of 60), and garbled (53/47/26 of 60, `drv` 32 -> 30 -> 32) as soon as the hardware
+suspends when idle, i.e. the realistic case. So `node.driver` is not the lever; **the driver of the group must not change
+under a running capture stream.**
+
+**Not shipped: `priority.driver` high.** It would make the *user's* playback (the source, EasyEffects, the ALSA device)
+follow our sink's timer clock for as long as the share exists (the ALSA sink becomes a resampled follower), a change to
+their primary audio path that a VM without real hardware cannot judge. The rebuild fixes the share without touching their
+playback; the cost is ~1 s of silence after each resume. If that is ever too much, `priority.driver` is the lever to
+evaluate on real hardware. Not tried: `node.group`/`node.link-group` (the group of the source is not known when the sink is
+created), `node.lock-quantum`, `node.force-rate`: none addresses a driver change.
+
+### 3. Measured with the fix (same VM, same harness, 3 cycles of 5 s paused / 8 s playing, 0.1 s windows 3 s after the resume)
+
+| | before (`d39e70d`) | after (#125) |
+| --- | --- | --- |
+| emulated Floorp, EE, always-on fake hw | viewer 31 / 48 / 47 bad of 60 | 4 / 5 / 2 |
+| emulated Floorp, EE, hw that suspends when idle | 43 / 46 / 47 | 7 / 4 / 6 (another run 2 / 1 / 33, see below) |
+| real Firefox, EE, hw that suspends when idle | (#123 rebuild on lost links) | 0 / 0 / 0, exactly one rebuild per resume |
+| 10 flaps of 2.2 s | - | 9 rebuilds, final state clean (1 bad of 187) |
+Viewer packets/s after the rebuild: 49-51 (before: 15-38). One of three fix runs had a bad stretch of ~5 s after the third
+resume in the sink's own monitor too (so in the source/sink part, not the capture chain); not reproduced in two repeats,
+treated as VM noise but not explained. The first ~1 s of the resumed sound is lost (poll interval + rebuild).
+
+**Tests (no audio):** `node_is_running_reads_the_pw_dump_state`, `a_source_that_goes_idle_and_runs_again_rebuilds_the_chain_once`,
+`only_all_sources_idle_for_a_while_counts_as_a_pause` (one of two idle, a single idle poll, no streams),
+`a_flapping_source_rebuilds_a_bounded_number_of_times` (also the deferred rebuild after the cooldown),
+`the_idle_rule_leaves_the_other_triggers_alone`. **Harness additions:** `emu_src.py`, `soak.sh ... flap`, `VM_SSS`
+(binary dir, to compare a baseline build), `EMU`/`APP` passthrough in `host-run.sh`, `pps.py` (packets/s the viewer received, from the soak log; 50/s is healthy), and a
+"steady state" line in `summary.py`. **Not done:** the Arch VM (only Fedora/EasyEffects was used), a real hardware sink.
 
 ## 2026-11-03: stopping or switching a share paused the player, and a pause/resume left the chain dead (task #123)
 

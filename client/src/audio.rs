@@ -119,6 +119,9 @@ struct PwObject {
 
 #[derive(Debug, Deserialize)]
 struct PwInfo {
+    /// A node's `info.state` (`"running"`, `"idle"`, `"suspended"`, ...); absent on other objects.
+    #[serde(default)]
+    state: Option<String>,
     /// Present (as `"output"`/`"input"`) on `PipeWire:Interface:Port`
     /// objects; absent on nodes.
     #[serde(default)]
@@ -590,6 +593,71 @@ fn gap_decision(gap: bool, stale: bool, linkable: bool) -> (bool, bool) {
     (gap, gap && linkable)
 }
 
+/// Whether node `id` is `running` in this snapshot. A node without a reported state counts as
+/// running (nothing to conclude from it), as does one that is not in the snapshot.
+fn node_is_running(objects: &[PwObject], id: u32) -> bool {
+    objects
+        .iter()
+        .find(|o| o.id == id && o.obj_type.as_deref() == Some("PipeWire:Interface:Node"))
+        .and_then(|o| o.info.as_ref()?.state.as_deref())
+        .is_none_or(|s| s == "running")
+}
+
+/// Polls with every matching stream not running before the stretch counts as a pause (task #125).
+/// A new stream is `idle` for a moment before it runs, and a stream flaps between the two when an
+/// app buffers; one tick of that must not cost a rebuild.
+const IDLE_TICKS: u32 = 2;
+/// Polls after a rebuild during which a source that resumed does not trigger another one (a
+/// rebuild costs ~1 s of silence; a source that flaps idle/running every few seconds would
+/// otherwise rebuild forever). The wish stays pending and fires when the cooldown is over.
+const REBUILD_COOLDOWN_TICKS: u32 = 5;
+
+/// Tracks whether the shared source went idle and came back (task #125). Pure; one `tick` per poll.
+#[derive(Debug, Default)]
+struct IdleWatch {
+    idle_ticks: u32,
+    /// Sticky: every stream of the share was idle for [`IDLE_TICKS`] polls; cleared by a rebuild.
+    idled: bool,
+    cooldown: u32,
+}
+
+impl IdleWatch {
+    /// `streams`: how many streams carry the shared name, `running`: how many of those are
+    /// `running`. Returns whether a source that went idle is running again and may be rebuilt for.
+    fn tick(&mut self, streams: usize, running: usize) -> bool {
+        self.cooldown = self.cooldown.saturating_sub(1);
+        if streams > 0 && running == 0 {
+            self.idle_ticks += 1;
+            self.idled |= self.idle_ticks >= IDLE_TICKS;
+        } else {
+            self.idle_ticks = 0;
+        }
+        self.idled && running > 0 && self.cooldown == 0
+    }
+
+    /// A rebuild happened (for any reason): the new chain starts clean.
+    fn rebuilt(&mut self) {
+        self.idled = false;
+        self.idle_ticks = 0;
+        self.cooldown = REBUILD_COOLDOWN_TICKS;
+    }
+}
+
+/// One poll's decision `(gap, rebuild)`: [`gap_decision`] fed with everything that makes the chain
+/// stale. `matching` / `running`: the same-named streams in this snapshot and how many run.
+fn poll_decision(
+    idle: &mut IdleWatch,
+    gap: bool,
+    kept_empty: bool,
+    lost: bool,
+    new_linkable: bool,
+    matching: usize,
+    running: usize,
+) -> (bool, bool) {
+    let resumed = idle.tick(matching, running);
+    gap_decision(gap, kept_empty || lost || idle.idled, new_linkable || lost || resumed)
+}
+
 /// Kills its child on drop, so a rebuild cancelled by `abort()` (stop) cannot leak a `pw-loopback`.
 struct ChildGuard(Option<SinkProc>);
 
@@ -651,6 +719,7 @@ async fn link_poll_loop(name: String, mut loopback_input_node_id: u32, mut linke
     tick.tick().await; // the first tick is immediate; start_audio_sharing just synced
     // Started with the app absent: the loopback has never had input, same situation as a gap.
     let mut gap = linked.is_empty();
+    let mut idle = IdleWatch::default();
     loop {
         tick.tick().await;
         let objects = match tokio::task::spawn_blocking(run_pw_dump).await {
@@ -671,14 +740,23 @@ async fn link_poll_loop(name: String, mut loopback_input_node_id: u32, mut linke
         // node id): the chain is stale, rebuilt like after a gap. Re-linking the running chain
         // instead left the audio silent or garbled for good on a real PipeWire (#123).
         let lost = kept.iter().any(|&id| missing_links(&objects, id, loopback_input_node_id).is_some_and(|n| n > 0));
-        let (g, rebuild) = gap_decision(gap, kept.is_empty() || lost, new_linkable || lost);
+        // The source went idle (paused) and runs again with its node and links untouched (Floorp /
+        // YouTube): the capture chain garbles when the source is merged back into its driver group
+        // under the running pipeline (host evidence, #125). A rebuild is what a re-select does.
+        let matching = node_ids_named(&objects, &name);
+        let running = matching.iter().filter(|&&id| node_is_running(&objects, id)).count();
+        let (g, rebuild) = poll_decision(&mut idle, gap, kept.is_empty(), lost, new_linkable, matching.len(), running);
         gap = g;
         if rebuild {
+            if idle.idled {
+                tracing::info!("audio share '{name}': source resumed after idle; rebuilding the loopback");
+            }
             match rebuild_chain(&chain, &name).await {
                 Ok((input, l)) => {
                     loopback_input_node_id = input;
                     linked = l;
                     gap = false;
+                    idle.rebuilt();
                 }
                 Err(e) => tracing::warn!("audio share '{name}': rebuilding the loopback failed, will retry: {e:#}"),
             }
@@ -1876,6 +1954,144 @@ mod tests {
         assert_eq!(gap_decision(false, false, false), (false, false), "healthy: nothing to do");
         assert_eq!(gap_decision(false, true, true), (true, true), "lost links, ports are back: rebuild");
         assert_eq!(gap_decision(false, true, false), (true, false), "lost links, no ports yet: wait, stay stale");
+    }
+
+    /// A pw-dump with the fixture's node 262 in `state` (and no state at all for `None`).
+    fn fixture_with_state(state: Option<&str>) -> Vec<PwObject> {
+        let mut objects = fixture_objects();
+        let node = objects.iter_mut().find(|o| o.id == 262).unwrap();
+        node.info.as_mut().unwrap().state = state.map(str::to_string);
+        objects
+    }
+
+    #[test]
+    fn node_is_running_reads_the_pw_dump_state() {
+        assert!(node_is_running(&fixture_with_state(Some("running")), 262));
+        assert!(!node_is_running(&fixture_with_state(Some("idle")), 262));
+        assert!(!node_is_running(&fixture_with_state(Some("suspended")), 262));
+        // No state reported, or the node is not in the snapshot: nothing to conclude, counts as running.
+        assert!(node_is_running(&fixture_with_state(None), 262));
+        assert!(node_is_running(&fixture_with_state(Some("idle")), 4242));
+        let parsed: Vec<PwObject> = serde_json::from_str(
+            r#"[{"id":365,"type":"PipeWire:Interface:Node","info":{"state":"idle","props":{"node.name":"Floorp"}}}]"#,
+        )
+        .unwrap();
+        assert!(!node_is_running(&parsed, 365), "info.state is parsed from the real pw-dump shape");
+    }
+
+    /// Task #125: Floorp keeps its node, ports and links when it pauses (`running` -> `idle`) and
+    /// resumes. Driven with the same `poll_decision` the poll uses, one call per 1 s tick:
+    /// `(streams, running)` of the share's name, a healthy linked set, no lost links.
+    #[test]
+    fn a_source_that_goes_idle_and_runs_again_rebuilds_the_chain_once() {
+        let mut idle = IdleWatch::default();
+        let mut gap = false;
+        // One poll tick; returns whether it rebuilt (and applies the rebuild like the loop does).
+        let mut tick = |streams: usize, running: usize| {
+            let (g, rebuild) = poll_decision(&mut idle, gap, false, false, false, streams, running);
+            gap = g;
+            if rebuild {
+                gap = false;
+                idle.rebuilt();
+            }
+            rebuild
+        };
+        for _ in 0..5 {
+            assert!(!tick(1, 1), "playing: nothing to do");
+        }
+        // Paused: idle for several polls, no rebuild while it stays idle.
+        for _ in 0..4 {
+            assert!(!tick(1, 0), "idle: nothing to rebuild for yet");
+        }
+        // Resumed: exactly one rebuild, then quiet.
+        assert!(tick(1, 1), "running again after an idle stretch: rebuild");
+        for _ in 0..10 {
+            assert!(!tick(1, 1), "no second rebuild");
+        }
+    }
+
+    /// One of several linked sources going idle while another keeps running is not a pause (a
+    /// second tab paused while a first plays), and neither is a stream that is `idle` for a single
+    /// poll (a new stream before it runs, an app that buffers).
+    #[test]
+    fn only_all_sources_idle_for_a_while_counts_as_a_pause() {
+        let mut idle = IdleWatch::default();
+        let mut gap = false;
+        let mut tick = |streams: usize, running: usize| {
+            let (g, rebuild) = poll_decision(&mut idle, gap, false, false, false, streams, running);
+            gap = g;
+            if rebuild {
+                gap = false;
+                idle.rebuilt();
+            }
+            usize::from(rebuild)
+        };
+        let mut rebuilds = 0;
+        // Two tabs, one pauses and resumes while the other plays all along.
+        for running in [2, 1, 1, 1, 1, 2, 2, 2] {
+            rebuilds += tick(2, running);
+        }
+        // A single idle poll (buffering blip, or a node on its way to running).
+        for running in [1, 0, 1, 1, 1] {
+            rebuilds += tick(1, running);
+        }
+        // No stream at all (the #117 path owns that, not the idle rule).
+        for _ in 0..3 {
+            rebuilds += tick(0, 0);
+        }
+        assert_eq!(rebuilds, 0);
+        // A real pause of both tabs, then one resumes: rebuild.
+        for (streams, running) in [(2, 0), (2, 0), (2, 0), (2, 1)] {
+            rebuilds += tick(streams, running);
+        }
+        assert_eq!(rebuilds, 1);
+    }
+
+    /// A source that flaps idle/running every few seconds costs at most one rebuild per cooldown,
+    /// and the wish is not lost: it fires once the cooldown is over.
+    #[test]
+    fn a_flapping_source_rebuilds_a_bounded_number_of_times() {
+        let mut idle = IdleWatch::default();
+        let mut gap = false;
+        let mut rebuilds = 0u32;
+        let ticks = 120u32;
+        for t in 0..ticks {
+            // 2 s idle, 1 s running, repeat.
+            let running = usize::from(t % 3 == 2);
+            let (g, rebuild) = poll_decision(&mut idle, gap, false, false, false, 1, running);
+            gap = g;
+            if rebuild {
+                gap = false;
+                idle.rebuilt();
+                rebuilds += 1;
+            }
+        }
+        // Every flap would be 40 rebuilds; the cooldown bounds it to one per cooldown window.
+        assert!(rebuilds >= 1, "still rebuilds");
+        assert!(rebuilds <= ticks / REBUILD_COOLDOWN_TICKS, "bounded: {rebuilds}");
+        // A resume inside the cooldown is remembered and rebuilt for when it ends.
+        let mut idle = IdleWatch::default();
+        idle.rebuilt();
+        let mut fired_at = None;
+        for t in 0..20u32 {
+            // idle for 2 polls, then running for good
+            let running = usize::from(t >= 2);
+            if idle.tick(1, running) && fired_at.is_none() {
+                fired_at = Some(t);
+            }
+        }
+        assert_eq!(fired_at, Some(REBUILD_COOLDOWN_TICKS - 1), "deferred to the end of the cooldown");
+    }
+
+    /// The other triggers still work next to the idle rule: a lost link or a vanished stream
+    /// rebuilds with every stream running, and the idle rule never rebuilds with nothing to link.
+    #[test]
+    fn the_idle_rule_leaves_the_other_triggers_alone() {
+        let mut idle = IdleWatch::default();
+        assert_eq!(poll_decision(&mut idle, false, false, true, false, 1, 1), (true, true), "lost links (#123)");
+        assert_eq!(poll_decision(&mut idle, false, true, false, true, 1, 1), (true, true), "vanished + new stream (#117)");
+        let mut idle = IdleWatch::default();
+        assert_eq!(poll_decision(&mut idle, true, true, false, false, 0, 0), (true, false), "gap, nothing to link yet");
     }
 
     /// `links_into_node` finds the links that feed the sink and ignores the monitor link out of it

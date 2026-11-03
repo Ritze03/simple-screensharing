@@ -2,8 +2,8 @@
 export XDG_RUNTIME_DIR=/run/user/1000 WAYLAND_DISPLAY=wayland-0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
 mpris() { busctl --user list --no-legend | awk '/org.mpris.MediaPlayer2.firefox/{print $1; exit}'; }
 status() { busctl --user get-property "$(mpris)" /org/mpris/MediaPlayer2 org.mpris.MediaPlayer2.Player PlaybackStatus; }
-ff_pause() { busctl --user call "$(mpris)" /org/mpris/MediaPlayer2 org.mpris.MediaPlayer2.Player Pause; }
-ff_play() { busctl --user call "$(mpris)" /org/mpris/MediaPlayer2 org.mpris.MediaPlayer2.Player Play; }
+ff_pause() { if [ -n "$EMU" ]; then pkill -USR1 -f emu_src.py; else busctl --user call "$(mpris)" /org/mpris/MediaPlayer2 org.mpris.MediaPlayer2.Player Pause; fi; }
+ff_play() { if [ -n "$EMU" ]; then pkill -USR2 -f emu_src.py; else busctl --user call "$(mpris)" /org/mpris/MediaPlayer2 org.mpris.MediaPlayer2.Player Play; fi; }
 nodes() { pw-dump | python3 -c '
 import json,sys
 d=json.load(sys.stdin)
