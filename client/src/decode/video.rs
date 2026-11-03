@@ -122,6 +122,118 @@ fn trim_backlog(backlog: &mut VecDeque<Au>, cap: usize) -> usize {
     before - backlog.len()
 }
 
+/// Stream time (sender PTS span) that must be waiting in the backlog before the decoder counts as
+/// *behind* (task #133).
+const BEHIND_START: Duration = Duration::from_millis(250);
+/// The episode ends once the backlog holds no more than this.
+const BEHIND_END: Duration = Duration::from_millis(40);
+/// A larger span is a PTS discontinuity (sharer restart, codec switch), not lag.
+const BEHIND_IMPLAUSIBLE: Duration = Duration::from_secs(10);
+/// Shorter episodes are not reported: a decoder warming up at 240 fps briefly holds a quarter
+/// second (seen in the rig), which nobody notices as slow motion.
+const BEHIND_MIN: Duration = Duration::from_millis(500);
+/// An episode still running after this long is reported without waiting for its end.
+const BEHIND_LONG: Duration = Duration::from_secs(5);
+/// At most one report per this long; episodes in between are folded into the next one.
+const BEHIND_REPORT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// What one "decoder fell behind" log line says (task #133).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct LagSummary {
+    /// Episodes that ended since the last report.
+    pub episodes: u32,
+    /// The longest of them.
+    pub longest: Duration,
+    /// Most stream time that was waiting in the backlog (how late the picture was).
+    pub max_lag: Duration,
+    /// Access units `trim_backlog` dropped during them.
+    pub dropped: u64,
+    /// How long the episode still running at report time has lasted (only past [`BEHIND_LONG`]).
+    pub ongoing: Option<Duration>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LagEpisode {
+    since: Instant,
+    max_lag: Duration,
+    dropped: u64,
+    reported_ongoing: bool,
+}
+
+/// Notices when the decoder output falls behind the stream and says so in the log (task #133).
+///
+/// `Why:` the native viewer shows each frame the moment it is decoded (no playout pacing), so a
+/// decoder slower than the stream does not drop frames, it queues them: the picture lags more and
+/// more (slow motion, up to [`BACKLOG_MAX_AUS`]) and then plays the queue out at decoder speed when
+/// it catches up (fast-forward). The user reported exactly that ("the share keeps going faster and
+/// slower", 2026-11-03), and nothing in the log showed it: the only trace was a `debug!` on a
+/// trim. Why the decoder slowed down there is still open (`features/video-pipeline.md` "Decoder
+/// falling behind"); this line is what the next report needs. Pure (`now` injected) so the rules
+/// are unit-tested without sleeping.
+#[derive(Debug, Default)]
+pub(super) struct LagWatch {
+    episode: Option<LagEpisode>,
+    pending: LagSummary,
+    last_report: Option<Instant>,
+}
+
+impl LagWatch {
+    /// One look at the backlog: `lag` is the stream time waiting in it, `dropped` what
+    /// `trim_backlog` dropped this round. Returns a summary when one is due.
+    pub(super) fn observe(&mut self, now: Instant, lag: Duration, dropped: u64) -> Option<LagSummary> {
+        let lag = if lag > BEHIND_IMPLAUSIBLE { Duration::ZERO } else { lag };
+        match &mut self.episode {
+            None => {
+                // A trim is proof of falling behind even when the capped backlog spans less than
+                // BEHIND_START (64 access units are 180 ms at 360 fps).
+                if lag >= BEHIND_START || dropped > 0 {
+                    self.episode = Some(LagEpisode { since: now, max_lag: lag, dropped, reported_ongoing: false });
+                }
+            }
+            Some(ep) => {
+                ep.max_lag = ep.max_lag.max(lag);
+                ep.dropped += dropped;
+                if lag <= BEHIND_END {
+                    let lasted = now.saturating_duration_since(ep.since);
+                    // Dropped access units always count: a decoder that never keeps up has its
+                    // episodes cut short by every jump to a keyframe (rig, software AV1 at 240 fps).
+                    if lasted >= BEHIND_MIN || ep.dropped > 0 || ep.reported_ongoing {
+                        let p = &mut self.pending;
+                        p.episodes += 1;
+                        p.longest = p.longest.max(lasted);
+                        p.max_lag = p.max_lag.max(ep.max_lag);
+                        p.dropped += ep.dropped;
+                    }
+                    self.episode = None;
+                }
+            }
+        }
+        let long = self
+            .episode
+            .filter(|ep| !ep.reported_ongoing && now.saturating_duration_since(ep.since) >= BEHIND_LONG);
+        let due = self.last_report.is_none_or(|t| now.saturating_duration_since(t) >= BEHIND_REPORT_INTERVAL);
+        if !due || (self.pending.episodes == 0 && long.is_none()) {
+            return None;
+        }
+        let mut summary = std::mem::take(&mut self.pending);
+        if let (Some(ep), Some(cur)) = (long, self.episode.as_mut()) {
+            summary.ongoing = Some(now.saturating_duration_since(ep.since));
+            summary.max_lag = summary.max_lag.max(ep.max_lag);
+            cur.reported_ongoing = true;
+        }
+        self.last_report = Some(now);
+        Some(summary)
+    }
+}
+
+/// Stream time waiting in the backlog: newest minus oldest PTS.
+fn backlog_lag(backlog: &VecDeque<Au>) -> Duration {
+    match (backlog.front(), backlog.back()) {
+        (Some(front), Some(back)) => Duration::from_micros(back.0.saturating_sub(front.0)),
+        _ => Duration::ZERO,
+    }
+}
+
 /// How long a hardware decoder may take to emit its first frame, measured from
 /// the first keyframe being pushed, before it is declared broken and replaced
 /// by software. VA decoders emit within tens of milliseconds when they work.
@@ -638,6 +750,7 @@ impl Worker {
 pub(super) fn run(rx: std_mpsc::Receiver<PipelineMsg>, shared: Arc<Shared>, allow_hardware: bool) -> Result<()> {
     let mut worker = Worker::new(shared.clone(), allow_hardware);
     let mut backlog: VecDeque<Au> = VecDeque::new();
+    let mut lag_watch = LagWatch::default();
     'run: loop {
         // Idle: block (briefly, so bus/probation housekeeping still runs).
         // Backed up: just a short nap until the decoder has room again.
@@ -674,6 +787,18 @@ pub(super) fn run(rx: std_mpsc::Receiver<PipelineMsg>, shared: Arc<Shared>, allo
         while !backlog.is_empty() && worker.can_accept() {
             let (pts_us, keyframe, data) = backlog.pop_front().expect("checked non-empty");
             worker.handle_access_unit(pts_us, keyframe, data);
+        }
+        if let Some(s) = lag_watch.observe(Instant::now(), backlog_lag(&backlog), dropped as u64) {
+            let decoder = worker.active.as_ref().map_or("none", |a| a.decoder_name);
+            let ongoing = s.ongoing.map(|d| format!(", one still running for {:.1} s", d.as_secs_f32())).unwrap_or_default();
+            tracing::warn!(
+                "video decoder fell behind the stream {} time(s) since the last report (longest {:.1} s{ongoing}): \
+                 up to {} ms late, {} access units dropped, decoder {decoder}",
+                s.episodes,
+                s.longest.as_secs_f32(),
+                s.max_lag.as_millis(),
+                s.dropped,
+            );
         }
     }
     if let Some(active) = &worker.active {
@@ -725,6 +850,138 @@ mod tests {
         assert_eq!(trim_backlog(&mut b, 64), 16);
         assert_eq!(ids(&b)[..3], [0, 17, 18], "keyframe kept, oldest deltas after it dropped");
         assert_eq!(b.len(), 64);
+    }
+
+    fn ms(v: u64) -> Duration {
+        Duration::from_millis(v)
+    }
+
+    /// Feeds `lags` (ms) one per 20 ms tick (the idle loop's period) and returns every report.
+    fn run_lags(w: &mut LagWatch, t0: Instant, start_ms: u64, lags: &[u64]) -> Vec<(u64, LagSummary)> {
+        lags.iter()
+            .enumerate()
+            .filter_map(|(i, &lag)| {
+                let at = start_ms + 20 * i as u64;
+                w.observe(t0 + ms(at), ms(lag), 0).map(|s| (at, s))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn backlog_lag_is_the_pts_span() {
+        let b: VecDeque<Au> = [(1_000_000, true, vec![]), (1_011_111, false, vec![]), (1_700_000, false, vec![])].into();
+        assert_eq!(backlog_lag(&b), ms(700));
+        assert_eq!(backlog_lag(&VecDeque::new()), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_decoder_that_keeps_up_is_never_reported() {
+        let mut w = LagWatch::default();
+        // Normal jitter: a few frames queued now and then, never 250 ms.
+        let lags: Vec<u64> = (0..3000).map(|i| [0, 11, 33, 0, 200, 0][i % 6]).collect();
+        assert!(run_lags(&mut w, Instant::now(), 0, &lags).is_empty());
+    }
+
+    #[test]
+    fn the_133_slow_motion_episode_is_reported_when_it_ends() {
+        // #133 shape: the backlog grows ~50 frames/s at 90 fps (0 -> 700 ms in 1.3 s), sits at the
+        // cap, then drains when the decoder catches up.
+        let mut w = LagWatch::default();
+        let t0 = Instant::now();
+        let mut lags: Vec<u64> = (0..65).map(|i| i * 11).collect(); // 1.3 s of growth to 704 ms
+        lags.extend(std::iter::repeat_n(700, 100)); // 2 s at the cap
+        lags.extend([500, 300, 100, 30, 0]); // drain
+        let reports = run_lags(&mut w, t0, 0, &lags);
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        let (at, s) = reports[0];
+        assert_eq!(at, 20 * (lags.len() as u64 - 2), "reported on the tick the backlog emptied");
+        assert_eq!(s.episodes, 1);
+        assert_eq!(s.max_lag, ms(704));
+        assert!(s.longest >= ms(2900) && s.longest <= ms(3100), "{:?}", s.longest);
+        assert_eq!(s.ongoing, None);
+    }
+
+    #[test]
+    fn dropped_access_units_are_counted_into_the_episode() {
+        let mut w = LagWatch::default();
+        let t0 = Instant::now();
+        assert_eq!(w.observe(t0, ms(300), 0), None);
+        assert_eq!(w.observe(t0 + ms(20), ms(700), 16), None);
+        assert_eq!(w.observe(t0 + ms(40), ms(700), 4), None);
+        let s = w.observe(t0 + ms(60), ms(0), 0).expect("episode ended");
+        assert_eq!(s.dropped, 20);
+    }
+
+    #[test]
+    fn episodes_closer_than_the_report_interval_are_folded_into_one_line() {
+        let mut w = LagWatch::default();
+        let t0 = Instant::now();
+        let mut episode = vec![300u64; 30]; // 0.6 s behind
+        episode.extend([400, 0]);
+        // First episode: reported at once.
+        assert_eq!(run_lags(&mut w, t0, 0, &episode).len(), 1);
+        // Three more within the next 30 s: nothing...
+        for start in [5_000, 10_000, 15_000] {
+            assert!(run_lags(&mut w, t0, start, &episode).is_empty());
+        }
+        // ...until the interval has passed, then all three in one summary.
+        // (The first report went out when that episode ended, at 620 ms.)
+        assert!(w.observe(t0 + ms(30_600), ms(0), 0).is_none());
+        let s = w.observe(t0 + ms(30_620), ms(0), 0).expect("due");
+        assert_eq!(s.episodes, 3);
+        assert_eq!(s.max_lag, ms(400));
+    }
+
+    #[test]
+    fn a_decoder_that_never_catches_up_is_reported_while_it_lasts() {
+        let mut w = LagWatch::default();
+        let t0 = Instant::now();
+        let lags = vec![700u64; 400]; // 8 s at the cap
+        let reports = run_lags(&mut w, t0, 0, &lags);
+        assert_eq!(reports.len(), 1, "once, not on every tick: {reports:?}");
+        let (at, s) = reports[0];
+        assert_eq!(at, 5_000);
+        assert_eq!(s.ongoing, Some(ms(5_000)));
+        assert_eq!(s.episodes, 0);
+        // When it finally ends (after the interval), the whole episode is reported.
+        let end = w.observe(t0 + ms(40_000), ms(0), 0).expect("ended and due");
+        assert_eq!((end.episodes, end.ongoing), (1, None));
+        assert_eq!(end.longest, ms(40_000));
+    }
+
+    #[test]
+    fn a_short_blip_without_drops_is_not_reported_but_one_with_drops_is() {
+        let mut w = LagWatch::default();
+        let t0 = Instant::now();
+        // 0.3 s at 300 ms, nothing dropped (a decoder warming up): not worth a line.
+        let mut blip = vec![300u64; 15];
+        blip.push(0);
+        assert!(run_lags(&mut w, t0, 0, &blip).is_empty());
+        // The same length, but the backlog hit its cap and was trimmed: reported.
+        assert_eq!(w.observe(t0 + ms(1_000), ms(300), 0), None);
+        assert_eq!(w.observe(t0 + ms(1_020), ms(266), 18), None);
+        let s = w.observe(t0 + ms(1_300), ms(0), 0).expect("dropped access units count");
+        assert_eq!((s.episodes, s.dropped), (1, 18));
+    }
+
+    #[test]
+    fn a_trim_alone_starts_an_episode() {
+        // 64 access units at 360 fps span only 178 ms: the cap is hit below BEHIND_START.
+        let mut w = LagWatch::default();
+        let t0 = Instant::now();
+        assert_eq!(w.observe(t0, ms(178), 3), None);
+        assert_eq!(w.observe(t0 + ms(20), ms(178), 2), None);
+        let s = w.observe(t0 + ms(40), ms(0), 0).expect("episode with drops ended");
+        assert_eq!((s.episodes, s.dropped, s.max_lag), (1, 5, ms(178)));
+    }
+
+    #[test]
+    fn a_pts_discontinuity_is_not_lag() {
+        let mut w = LagWatch::default();
+        let t0 = Instant::now();
+        // A sharer restart puts a 20 s PTS jump between two queued access units.
+        let lags = vec![20_000u64; 500];
+        assert!(run_lags(&mut w, t0, 0, &lags).is_empty());
     }
 
     #[test]
