@@ -697,7 +697,7 @@ const AUDIO_SRCS = [["No audio", "volume_off", "Only the picture"], ["Desktop au
 
 /* ============================== presets (the nav's views) ============================== */
 const STAGE = [
-  ["stage", "Split", {}],
+  ["stage", "Split", { pip: true, alsoWatch: [K_JONAS] }], /* the default view shows a webcam in picture: Jonas's, inside his share */
   ["stage-crop", "Crop", { layout: "crop" }],
   ["stage-float", "Floating", { layout: "float", float: { [K_RITZE]: { x: .02, y: .03, w: .5 }, [K_KRITA]: { x: .55, y: .02, w: .3 }, [K_ANA]: { x: .52, y: .4, w: .44 }, [K_JONAS]: { x: .06, y: .64, w: .36 }, [K_JCAM]: { x: .44, y: .76, w: .16 } }, z: [K_RITZE, K_KRITA, K_JONAS, K_ANA, K_JCAM] }],
   ["stage-live", "Sharing · menu", { sharing: "live", sharerSelf: true, audioOn: true, audioSrc: "Spotify", menu: "share" }],
