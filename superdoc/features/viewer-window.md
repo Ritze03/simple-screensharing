@@ -25,6 +25,7 @@ stream** (`StreamKey = (RoomHandle, ConnId, StreamId)`), re-declared every frame
 - **F11** or a **double-click** on the video toggles fullscreen (double-click added 2026-10-15, task #77; the chrome's
   buttons keep their own clicks); **Esc** only *leaves* fullscreen and never closes (the former Electron rule,
   kept on purpose: a stray Esc must not kill someone's stream window).
+  The same overlay is drawn over the main window's own fullscreen stream (task #106, `ui/APP-SHELL.md`), with an exit-fullscreen button in place of the ×.
 - **Closing brings the stream back.** The x button or an OS close sets `close_requested`, which the
   next main-window frame turns into `UiAction::BringBack`: the stream returns to its tile.
 - **Performance:** pop-outs hold 240/240 fps (decoded/presented) when the presentation mode is

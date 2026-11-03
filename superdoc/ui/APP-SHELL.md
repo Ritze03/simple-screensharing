@@ -299,6 +299,18 @@ no sidebar, bands, modals or toasts; pop-out viewports are still declared). A do
 that was already fullscreen stays fullscreen. If the stream disappears (unwatched, ended, popped out) the next
 `draw` leaves the mode by itself. A popped-out tile is a placeholder and is not eligible. Inside a pop-out
 viewport a double-click toggles that window's fullscreen like F11 (`popout.rs`, registered before the chrome).
+
+**The fullscreen stream carries the pop-out's overlay** (2026-11-03, task #106): `App::draw` calls
+`popout::fullscreen_overlay` after the double-click `interact`, which runs the *same* `popout::chrome`
+(hover-gated vignette, statbar `[dot][sharer · room][WxH][dec/pres fps][bitrate]`, audio pill or "No audio
+shared" chip) and the same always-visible centre chip (waiting / recovering / sharer stalled), and shows
+it while the pointer is anywhere in the window. Differences: the top-right round button is
+`fullscreen_exit` ("Exit fullscreen", pushes `ExitStreamFullscreen`) instead of the pop-out's `close`
+("bring back to its tile"; pop-out-only), and volume edits go straight out as `UiAction::SetVolume`
+instead of through `Shared::pending_volume` (the data is collected per frame with `collect_info`, no 4x/s
+refresh). *Why:* user request 2026-11-03: "the same overlay, that a fullscreened pop-out has, should be
+there when i fullscreen a screenshare inside of the main window". One `chrome` function serves both so
+the two cannot drift apart.
 *Why:* user request 2026-10-15 ("double clicking a share should actually full-screen it"). *Why a mode of
 the main window and not a new viewport:* the pop-out already exists for "own window"; this is the quick
 "fill my screen" gesture and must restore the layout (scroll, selection) untouched. Test:

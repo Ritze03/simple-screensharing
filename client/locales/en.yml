@@ -231,6 +231,7 @@ ui.pill.starting: "Starting"
 
 #popout
 ui.popout.close_tip: "Close and bring it back to its tile"
+ui.popout.exit_fullscreen_tip: "Exit fullscreen"
 ui.popout.mute: "Mute this stream"
 ui.popout.muted: "Muted"
 ui.popout.no_audio: "No audio shared"
