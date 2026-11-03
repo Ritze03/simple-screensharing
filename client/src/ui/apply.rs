@@ -365,6 +365,17 @@ impl App {
             UiAction::SetCatchUpSpeed(p) => {
                 self.state.set_catch_up_speed_percent(p);
             }
+            UiAction::CopyLogs => {
+                ctx.copy_text(simple_screensharing_client::logbuf::dump());
+                self.toast(tr("ui.toast.logs_copied", "Logs copied"), "content_copy");
+            }
+            UiAction::SaveLogs => match simple_screensharing_client::logbuf::save_to_downloads() {
+                Ok(path) => {
+                    self.shell.saved_logs = Some(path.display().to_string());
+                    self.toast(tr("ui.toast.logs_saved", "Logs saved"), "check_circle");
+                }
+                Err(e) => self.toast(tr_with("ui.toast.logs_save_failed", "Couldn't save the logs: %{error}", &[("error", &format!("{e:#}"))]), "error"),
+            },
         }
     }
 

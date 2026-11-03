@@ -24,7 +24,8 @@
 //!   recently saved room. `Why:` the lib keeps no "last server" setting, and
 //!   the newest saved room is the last server the user created or joined on.
 //! - **Settings** (`Modal::Settings`, 640): cards Profile / Language / Display /
-//!   Playback. Text and sliders are buffered and pushed when the edit settles
+//!   Playback / Diagnostics (copy or save the in-memory log, `logbuf`). Text and
+//!   sliders are buffered and pushed when the edit settles
 //!   (focus lost, pointer released), not every frame of a drag, since each
 //!   setter writes `settings.toml`.
 //! - **Leave / forget confirm** (520): explanation + hatched warnings when we
@@ -613,6 +614,33 @@ fn settings(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
                     0,
                     "%",
                 );
+            });
+            widgets::card(ui, &tr("ui.settings.logs_card", "Diagnostics"), None, |ui| {
+                let copy = tr("ui.settings.logs_copy", "Copy to clipboard");
+                let save = tr("ui.settings.logs_save", "Save to file…");
+                let clicked = widgets::ctrl_row(
+                    ui,
+                    &tr("ui.settings.logs", "Logs"),
+                    Some(&tr(
+                        "ui.settings.logs_tip",
+                        "The app's recent log (up to the last 5,000 lines) with version and system info, for bug reports. It contains no room keys.",
+                    )),
+                    |ui| widgets::btn_row(ui, &[Btn::secondary(&copy), Btn::secondary(&save)]),
+                );
+                match clicked {
+                    Some(0) => cx.act(UiAction::CopyLogs),
+                    Some(_) => cx.act(UiAction::SaveLogs),
+                    None => {}
+                }
+                if let Some(path) = &cx.shell.saved_logs {
+                    widgets::banner(
+                        ui,
+                        BannerKind::Info,
+                        "check_circle",
+                        &tr_with("ui.settings.logs_saved", "Saved to %{path}", &[("path", path)]),
+                        None,
+                    );
+                }
             });
         },
         |ui| click = widgets::modal_footer(ui, &[], None, &[Btn::primary(&done)]),
