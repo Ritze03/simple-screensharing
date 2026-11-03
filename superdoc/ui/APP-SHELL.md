@@ -53,7 +53,15 @@ its "Proposed" tab).
   panel was too squished for the number of controls.
 - **Leave sits in the room header.** *Why:* user's call; it is a room-level action, not
   a sharing one, so it is not in the (sharing) action bar.
-- **Narrow windows (960 px minimum → ~656 px header / action band):** nothing clips;
+- **Narrow windows (800 px minimum → ~496 px header / action band, ~296 px centre column
+  between sidebar and People):** *Why 800 (PR #4, 2026-11-03; 960 before):* so the window
+  half-tiles on a 1920 px screen. Checked on the real app in en and de (#127): at 800 the
+  header sits at level 3 in en (Copy/Leave icons, no meta line) and 4 in de (bare checkbox),
+  the live bar collapses fully (status truncated, Stop sharing icon-only; staged: Go live
+  icon-only in de), one share card / tile per row, the stream-settings modal one column
+  (752 px). The only thing that clipped was the tile's hover statbar (`1920x1080 30fps 7.6…`
+  cut mid-number in a ~178 px cell): it now drops the resolution, then the bitrate, into
+  its tooltip (`room::statbar_fields`). Nothing clips;
   controls degrade in a fixed order instead. Action bar: the status text truncates down
   to 72 px first, then buttons go icon-only (label in the tooltip): Live = Stream
   settings → `N rooms ▾` to `N ▾` → audio compact → Stop sharing; Staged/Picking =
@@ -64,7 +72,7 @@ its "Proposed" tab).
   Details in the `action_bar.rs` module doc and `room::show_header`.
   Body and modal: the stream-settings modal stacks its two columns into one when a
   column would be narrower than its widest segmented control / Screen readout needs
-  (measured from the current locale's labels, so it is one column at 960 and two at
+  (measured from the current locale's labels, so it is one column at 800 and 960 and two at
   1280+ in en and de). The Preset and Codec rows size their segments to their labels
   when equal segments would truncate, so German's "Niedrige Latenz" no longer forces
   one column at every width (#47: four equal Preset segments needed a 585 px column,
