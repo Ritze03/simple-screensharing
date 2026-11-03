@@ -482,6 +482,9 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 .strip-tg { position: absolute; left: 50%; top: -12px; transform: translateX(-50%); z-index: 25; height: 24px; padding: 0 8px; border-radius: 999px; border: 1px solid var(--stage-group-border); background: var(--stage-group); color: var(--text-dim); display: inline-flex; align-items: center; gap: 4px; cursor: pointer; font-size: var(--fs-tiny); font-family: var(--font-mono); }
 .strip-tg:hover { color: var(--text); background: var(--stage-btn-hover); }
 .strip-tg .ms { font-size: 16px; }
+/* collapsed: the button gets its own band above the bar, clear of both the bar and the streams */
+.stripwrap:not(:has(.strip)) { height: 34px; }
+.stripwrap:not(:has(.strip)) .strip-tg { top: 6px; }
 
 /* control row + bar */
 .ctlrow { height: 72px; flex: 0 0 72px; display: flex; align-items: center; gap: var(--s2); padding: 0 var(--s4); box-sizing: border-box; }
