@@ -3,7 +3,49 @@
 Audio capture/encode/playback is described where it grew up: `features/stream-control.md`
 ("Sharing audio ...", "The 2026-07-28 audio bugs"), `features/video-pipeline.md` ("Audio follows
 video") and the module docs of `client/src/audio.rs` and `client/src/decode.rs`. This page covers
-**keeping the audio aligned with the picture** (task #91, 2026-11-01), the **shared audio is a name** (#105), the viewer volume (#96), the **sender-side boost** (#114, capped at 200 % and calibration-free since #119) and the **viewer-side loudness levelling** (#119); for the share sink's lifecycle (WirePlumber pauses a player when its sink goes away, a resuming stream loses its links) see the #123 block. **Why shared audio broke after a pause/resume** (the capture ran on `pipewiresrc`'s clock; the native viewer's jitter buffer guessed the frame size from PTS steps) is the #128 block, which also corrects the explanations of #117, #121, #123 and #125.
+**keeping the audio aligned with the picture** (task #91, 2026-11-01), the **shared audio is a name** (#105), the viewer volume (#96), the **sender-side boost** (#114, capped at 200 % and calibration-free since #119) and the **viewer-side loudness levelling** (#119); for the share sink's lifecycle (WirePlumber pauses a player when its sink goes away, a resuming stream loses its links) see the #123 block. **Why shared audio broke after a pause/resume** (the capture ran on `pipewiresrc`'s clock; the native viewer's jitter buffer guessed the frame size from PTS steps) is the #128 block, which also corrects the explanations of #117, #121, #123 and #125. **Static in silence** (the sender's dither made `opusenc` code noise at 64 kbps) is the #129 block.
+
+## 2026-11-03: "static when nothing is playing" was the sender's dither (task #129)
+
+User report after #128 ("Nice now it's really fixed", but "there's some static when nothing is playing"). Measured
+in the Arch VM (PipeWire 1.6.10, `allowed-rates [44100 48000]`, emulated 44.1 kHz Floorp paused for 6 s three times,
+the viewer's `viewer-out` monitor recorded as **float** so the viewer's own conversion adds no noise;
+`VFMT=f32 ... host-run.sh`, `noise.py`).
+
+**Cause: `audioconvert` before `opusenc` dithers.** The sender's tail is `... ! audioconvert ! opusenc`; `opusenc` only
+takes S16, and the F32 -> S16 `audioconvert` defaults to **TPDF dither**. A paused source gives the share sink's monitor
+digital zero (`sinkmon.wav`: -99 dB, nothing), but the dither turned it into +-2 LSB white noise (-97.2 dBFS RMS, peak
+2 LSB; the decoded `sent-*.pkt`) which Opus then coded for real: **161-byte packets (64.4 kbps) of noise during a
+silence**, exactly as large as with a tone. The viewer played it as hiss.
+
+| paused stretch (viewer output, float) | before | #129 |
+| --- | --- | --- |
+| sender packet size while paused | 161 B (64 kbps), PTS fine, 0 `GAP` | **3 B** (silence frames, ~1.2 kbps) |
+| sent audio decoded (dBFS RMS / peak) | -97.2 / 2 LSB | exact zero |
+| viewer output, 1.5 s after the pause to the resume | **-93.5 dBFS RMS, peak 3.8 LSB** | **exactly 0 (-inf)**, all three pauses |
+
+**Secondary (not changed): the leveller lifts that noise by up to ~+5 dB.** In the "before" run the viewer's noise
+*rose* over 4 s after the tone stopped (-101.5, -97.6, -93.6, -91.7 dBFS): the 400 ms slow detector decays through
+-50...-18 dBFS in about 3 s, the gate (`GATE_DB`) only looks at it, so the gain climbs at <= 4 dB/s during that tail
+(-9 dB -> about +5.5 dB here) and then holds (a held gain never decays). With digital silence in, the gain is
+irrelevant (0 x gain = 0), so #129 does not touch `leveller.rs`/`leveller.js`; but a real source with its own
+noise floor still gets that lift after any sound ends. If that turns out audible, gate the rise on the *fast* detector
+too (it falls below the gate within ~0.6 s of a stop) in both ports.
+
+**Ruled out** (the brief's suspects): (c) gaps/PLC on SystemClock: 49-52 packets/s through the pause, 0 `GAP`
+in `play-*.log`; (d) the jitter buffer: same; (b) `opusenc`/DTX: no DTX is needed, Opus codes an all-zero frame as a
+3-byte silence frame by itself, it only coded 161 bytes because the input was not zero.
+
+**Fix:** `audioconvert dithering=none` on the last `audioconvert` (`pipeline_description`). *Why not keep the dither:*
+dither exists to decorrelate quantisation error of 16-bit *output*; this is an intermediate step into a lossy codec
+(Opus' own noise is far above 1 LSB), and the dithered LSB noise is what the encoder was spending 64 kbps on. Side
+effect: a quiet or silent share costs ~1 kbps instead of 64. The level tap's `audioconvert` only feeds `level`
+(not audible) and is unchanged; the browser sender encodes float directly and never dithered.
+**Test:** `audio::tests::a_silent_source_encodes_to_tiny_silence_packets` (a -140 dBFS sine through the real chain:
+161-byte packets with the dither, 3-byte without; `wave=silence`/`volume=0` do not reproduce it, those buffers are
+GAP-flagged and `audioconvert` passes them undithered).
+Harness additions: `VFMT=f32` (soak.sh/host-run.sh) records the viewer as float, `vm-audio/noise.py FILE.wav [events.txt]`
+prints per-second RMS/peak and the RMS of every paused stretch.
 
 ## 2026-11-03: the real cause of "broken after a pause/resume": two clocks (task #128)
 

@@ -209,6 +209,8 @@ Both are GNOME/Wayland desktops with PipeWire + WirePlumber, user `mo`, no sound
   events.txt` counts bad 0.5 s windows per phase. Always compare with the share sink's own monitor (`sinkmon.wav`):
   that is the VM's noise floor (0-3 bad windows per phase). In the VM, kill with patterns that cannot match your own
   ssh command line (`pkill -f "[p]robe.py"`), or the ssh session kills itself.
+- **Noise floor of a silent stretch (#129):** `VFMT=f32 host-run.sh ...` records the viewer as float (an s16 recording adds
+  its own dither and hides what the viewer produced), `noise.py viewer.wav events.txt` prints the RMS of every paused stretch.
 - **Also capture, before/after a change:** `pw-dump`, `pw-top -b -n 2`, `pw-metadata -n settings`, and the
   WirePlumber side (`WIREPLUMBER_DEBUG=s-linking.mpris:5`) when a player is paused unexpectedly.
 - **Leave the VMs as found:** remove `~/.config/pipewire/pipewire.conf.d/50-fakehw.conf` (and restart

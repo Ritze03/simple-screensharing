@@ -38,7 +38,7 @@
 //!    show both the original link and the new one simultaneously.
 //! 4. The sink's monitor is then captured: `pipewiresrc
 //!    target-object=<sink's object.serial> stream-properties=props,stream.capture.sink=true
-//!    ! audioconvert ! audioresample ! volume ! level ! opusenc ! appsink`
+//!    ! audioconvert ! audioresample ! volume ! level ! audioconvert dithering=none ! opusenc ! appsink`
 //!    ([`sink_monitor_source`]), and the
 //!    resulting link is then *verified* against `pw-dump` before the stream
 //!    is announced ([`wait_for_capture_link`]). **`target-object` and the
@@ -921,6 +921,8 @@ fn gain_stage_description() -> &'static str {
 /// split out so a test can check the order of the elements.
 fn pipeline_description(source: &str) -> String {
     let gain_stage = gain_stage_description();
+    // `dithering=none` on the S16 conversion before `opusenc` (task #129): the default TPDF dither turns a
+    // silent source into -97 dBFS noise that Opus codes at the full bitrate and the viewer plays as static.
     format!(
         "{source} \
          ! audio/x-raw,channels=2 \
@@ -929,7 +931,7 @@ fn pipeline_description(source: &str) -> String {
          ! {gain_stage} \
          ! volume name=mute \
          ! level name=level post-messages=true interval={LEVEL_INTERVAL_NS} \
-         ! audioconvert \
+         ! audioconvert dithering=none \
          ! opusenc \
          ! appsink name=sink emit-signals=false sync=false max-buffers=32 drop=true"
     )
@@ -1778,6 +1780,27 @@ mod tests {
         let caps = sample.caps().unwrap().to_string();
         let _ = pipeline.set_state(gst::State::Null);
         assert!(caps.starts_with("audio/x-opus"), "{caps}");
+    }
+
+    /// Task #129: a silent source must reach `opusenc` as digital zero. `audioconvert`'s default
+    /// TPDF dither turned it into +-2 LSB white noise (-97 dBFS) that Opus then coded at the full
+    /// 64 kbps (161-byte packets) and the viewer played as static; undithered, Opus sees silence
+    /// and sends 3-byte packets that decode to exact zeros. The source is a -140 dBFS sine, not
+    /// `wave=silence`/`volume=0` (those are GAP-flagged, which `audioconvert` passes without dithering).
+    #[test]
+    fn a_silent_source_encodes_to_tiny_silence_packets() {
+        ensure_gstreamer_initialized().unwrap();
+        let BuiltPipeline { pipeline, sink, .. } =
+            build_pipeline_from_source("audiotestsrc wave=sine volume=0.0000001 num-buffers=50 samplesperbuffer=960", 1.0, false).expect("chain builds");
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let mut sizes = Vec::new();
+        while let Some(sample) = sink.try_pull_sample(gst::ClockTime::from_seconds(2)) {
+            sizes.push(sample.buffer().unwrap().size());
+        }
+        let _ = pipeline.set_state(gst::State::Null);
+        assert!(sizes.len() > 20, "too few packets: {}", sizes.len());
+        // The first packet may carry the encoder's start-up; every later one is silence.
+        assert!(sizes[2..].iter().all(|&n| n < 20), "silence encoded as {sizes:?}");
     }
 
     /// Task #128, the root cause: the capture pipeline must not run on the clock its `pipewiresrc`
