@@ -13,7 +13,7 @@ import { deriveCodecString, sniffCodec } from "../js/core/codec.js";
 import { DECODE_QUEUE_CATCHUP_THRESHOLD, JitterBuffer, MAX_DECODE_QUEUE, clampCatchUpSpeedPercent, clampMaxJitterBufferMs } from "../js/core/jitter.js";
 import { CanvasRenderer, VideoReceiver } from "../js/core/video-rx.js";
 import { ENCODER_PRESETS } from "../js/core/video-tx.js";
-import { avatarBg, avatarColors, avatarHue, cardShape, snapVolumePct, wheelStepVolumePct, volumeWheel, VOLUME_MAX_PCT } from "../js/ui/dom.js";
+import { avatarBg, avatarColors, avatarHue, cardShape, sliderCtl, snapVolumePct, wheelStepVolumePct, volumeWheel, VOLUME_MAX_PCT } from "../js/ui/dom.js";
 import { AudioReceiver, MAX_VOLUME } from "../js/core/audio.js";
 import { CEILING_DB, GATE_DB, Leveller, MAX_GAIN_DB, RISE_DB_PER_S, TARGET_DB } from "../js/core/leveller.js";
 
@@ -1056,6 +1056,34 @@ test("volume: wheel step is 5 up to 200 %, 10 above, symmetric at the boundary, 
     [490, true, 500], [500, true, 500], [500, false, 490], [220, false, 210], [210, false, 200], [205, false, 200], [200, false, 195],
     [105, false, 100], [5, false, 0], [0, false, 0]]) eq(wheelStepVolumePct(from, up), to, `${from} ${up ? "up" : "down"}`);
   for (let p = 0; p < 500; p += 5) if (p <= 195 || p % 10 === 0) eq(wheelStepVolumePct(wheelStepVolumePct(p, true), false), p, "up then down at " + p);
+});
+
+test("volume: sliders apply on the input event, while the thumb is still being dragged (#135)", async () => {
+  // The generic slider: `put` on every input, `onCommit` only on the release-time change event.
+  const puts = [];
+  let commits = 0;
+  let value = 100;
+  const [sl] = sliderCtl("t-vol", "Volume", 0, 500, 5, () => value, (v) => { value = v; puts.push(v); }, String, () => { commits++; });
+  document.body.appendChild(sl);
+  try {
+    for (const v of ["120", "150", "180"]) {
+      sl.value = v;
+      sl.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+    eq(puts, [120, 150, 180], "every input event reached put with no change event yet");
+    eq(commits, 0, "nothing committed before release");
+    sl.dispatchEvent(new Event("change", { bubbles: true }));
+    eq(commits, 1, "the release commits once");
+    eq(puts.length, 3, "and applies nothing more");
+  } finally {
+    sl.remove();
+  }
+  // The viewer volume slider (app.js audioPill) is not importable without booting the app: guard its wiring by source.
+  // It must listen to `input` (fires per drag step) and never to `change` (fires on release only).
+  const src = await (await fetch(new URL("../js/ui/app.js", import.meta.url))).text();
+  const pill = src.slice(src.indexOf("function audioPill("), src.indexOf("async function doPopOut"));
+  ok(pill.includes('slider.addEventListener("input"') && pill.includes("setWatchVolume(r, w,"), "audioPill applies the gain on input");
+  ok(!/slider\.addEventListener\("change"|onchange/.test(pill), "audioPill has no change-only path");
 });
 
 test("volume: wheel events on the slider step it, fire input, are consumed and do not snap to 100 (#113)", () => {

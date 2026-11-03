@@ -54,7 +54,7 @@ use crate::widgets::{self, Btn, FILL, HBox, IconBtnKind, PersonRow, Pill, fixed,
 #[derive(Default)]
 pub struct RoomState {
     /// A tile volume slider being dragged: the value shown until the
-    /// `SetVolume` pushed on release has landed in the session.
+    /// `SetVolume` pushed by the last change has landed in the session.
     vol_drag: Option<(StreamKey, u32)>,
 }
 
@@ -948,9 +948,30 @@ fn round_btn(ui: &mut Ui, rect: Rect, id: Id, icon: &str, tip: &str, stop: bool)
     resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip)
 }
 
+/// The tile's volume slider. Pushes `SetVolume` on **every** change, mid-drag included (#135, user:
+/// "make sure that when the volume slider is moved it instantly sets the volume even while moving and
+/// not only when the user actually lifts his mouse button"). `Why:` the user wants to hear the level
+/// while choosing it. `SetVolume` only sets the decoder's `volume` element and the in-memory
+/// session value (nothing is written to disk), so one per changed frame is cheap. `st.vol_drag` keeps
+/// the shown value one frame ahead of the session until the pushed value has landed.
+pub(super) fn tile_volume_slider(ui: &mut Ui, st: &mut RoomState, key: StreamKey, shown: u32, applied: u32, acts: &mut Vec<UiAction>) -> Response {
+    let mut v = shown;
+    let r = super::volume_slider(ui, &mut v);
+    if r.dragged() || r.changed() {
+        st.vol_drag = Some((key, v));
+    }
+    if r.changed() {
+        acts.push(UiAction::SetVolume { stream: key, volume_percent: v, muted: false });
+    } else if !r.dragged() && st.vol_drag.is_some_and(|(k, d)| k == key && d == applied) {
+        // The pushed value has landed: stop overriding it.
+        st.vol_drag = None;
+    }
+    r
+}
+
 /// `hbox·audio-pill` (29 px, pad 2/2, gap 4): `[25 mute][110 volume 0–500 %][34 pct][25 level]`,
 /// or `[25 mute][Muted]` (pad 2/10) while muted. Both end buttons sit concentric in the pill's
-/// half-circle ends, 2 px in (#130). `level` is the global loudness-levelling toggle (#126). The slider pushes `SetVolume` on release.
+/// half-circle ends, 2 px in (#130). `level` is the global loudness-levelling toggle (#126). The slider pushes `SetVolume` on every change, mid-drag too (#135).
 fn audio_pill(ui: &mut Ui, cx: &Cx, st: &mut RoomState, key: StreamKey, bottom: Rect, acts: &mut Vec<UiAction>) {
     let Some(s) = cx.session(key.0) else { return };
     let vol = s.volume(key.1, key.2);
@@ -995,17 +1016,7 @@ fn audio_pill(ui: &mut Ui, cx: &Cx, st: &mut RoomState, key: StreamKey, bottom: 
     let sc = row.cell(1);
     let sr = Rect::from_center_size(sc.center(), vec2(sc.width(), theme::CTL_H));
     let mut sl = child.new_child(UiBuilder::new().id_salt(("tile_vol", key)).max_rect(sr).layout(Layout::left_to_right(Align::Center)));
-    let mut v = shown;
-    let r = super::volume_slider(&mut sl, &mut v).on_hover_text(tr("ui.room.volume", "Volume"));
-    if r.dragged() || r.changed() {
-        st.vol_drag = Some((key, v));
-    }
-    if r.drag_stopped() || (r.changed() && !r.dragged()) {
-        acts.push(UiAction::SetVolume { stream: key, volume_percent: v, muted: false });
-    } else if !r.dragged() && st.vol_drag.is_some_and(|(k, d)| k == key && d == vol.volume_percent) {
-        // The pushed value has landed: stop overriding it.
-        st.vol_drag = None;
-    }
+    tile_volume_slider(&mut sl, st, key, shown, vol.volume_percent, acts).on_hover_text(tr("ui.room.volume", "Volume"));
     row.text(&child, 2, &pct, tf, num, Align::Max);
     let lr = Rect::from_center_size(row.cell(3).center(), vec2(25.0, 25.0));
     if super::level_toggle(&child, lr, Id::new(("tile_level", key)), cx.state.level_loudness) {

@@ -381,6 +381,8 @@ pub enum UiAction {
     /// Settings > Audio boost: the sender-side multiplier (slider; persisted, pushed to running
     /// audio shares). Task #114.
     SetAudioGain(f64),
+    /// The Boost slider mid-drag (#135): applied to the running shares, not saved; the release sends `SetAudioGain`.
+    PreviewAudioGain(f64),
     /// Settings > Playback > Level loudness: viewer-side loudness levelling on/off (task #119).
     SetLevelLoudness(bool),
     /// Settings > Diagnostics: copy the in-memory log (`logbuf`) to the clipboard + toast.

@@ -5,6 +5,30 @@ Audio capture/encode/playback is described where it grew up: `features/stream-co
 video") and the module docs of `client/src/audio.rs` and `client/src/decode.rs`. This page covers
 **keeping the audio aligned with the picture** (task #91, 2026-11-01), the **shared audio is a name** (#105), the viewer volume (#96), the **sender-side boost** (#114, capped at 200 % and calibration-free since #119) and the **viewer-side loudness levelling** (#119); for the share sink's lifecycle (WirePlumber pauses a player when its sink goes away, a resuming stream loses its links) see the #123 block. **Why shared audio broke after a pause/resume** (the capture ran on `pipewiresrc`'s clock; the native viewer's jitter buffer guessed the frame size from PTS steps) is the #128 block, which also corrects the explanations of #117, #121, #123 and #125. **Static in silence** (the sender's dither made `opusenc` code noise at 64 kbps) is the #129 block.
 
+## 2026-11-03: volume sliders apply while dragging, not on release (task #135)
+
+User request: *"make sure that when the volume slider is moved it instantly sets the volume even while moving and not
+only when the user actually lifts his mouse button."* **Why:** the user wants to hear the level while choosing it.
+Audit of every volume-type slider:
+
+- **Native tile pill** (`ui/room.rs` `tile_volume_slider`) was the bug: it pushed `UiAction::SetVolume` only on
+  `drag_stopped()` (or a change that was not a drag), so the decoder's `volume` element moved on release only. It now pushes
+  on every `changed()` frame. `SetVolume` writes only the in-memory `AudioWatch` and the decoder's `volume` property
+  (nothing on disk), so one per frame is cheap. `RoomState::vol_drag` still keeps the shown value one frame ahead of the session.
+- **Native Boost slider** (Settings > Shared audio, `modals.rs` `boost_action`) was the bug: pushed on pointer release because
+  `set_audio_gain` saves `settings.toml`. Split into `AppState::apply_audio_gain` (live to every running audio share, no write)
+  behind the new `UiAction::PreviewAudioGain` on every changed frame, and `set_audio_gain` (= apply + save) behind
+  `SetAudioGain` once on release. The jitter and catch-up sliders are not volume and keep push-on-release.
+- **Native pop-out / fullscreen pill** (`ui/popout.rs` `audio_pill`) was already live: `.changed()` of the same `volume_slider`
+  fires on every dragged frame and goes through `Shared::pending_volume` (pop-out) or straight out (fullscreen).
+- **Browser viewer slider** (`docs/js/ui/app.js` `audioPill`) was already live: `input` listener calling `setWatchVolume`
+  (the `change` event is not used). The browser has no Boost slider; the other `sliderCtl` sliders (bitrate, jitter, ...) are not volume.
+
+Tests: `ui::tests::the_tile_volume_slider_pushes_set_volume_while_the_button_is_still_down` (real egui press + drag events,
+no release; fails on the old code), `the_boost_slider_previews_while_the_pointer_is_down_and_saves_on_release`,
+`audio_boost::previewing_the_boost_applies_it_without_saving_until_set`; browser `volume: sliders apply on the input event`.
+Not verified in the rig: it has no audio (host audio tests are banned), so the audible effect is covered by the unit tests only.
+
 ## 2026-11-03: "static when nothing is playing" was the sender's dither (task #129)
 
 User report after #128 ("Nice now it's really fixed", but "there's some static when nothing is playing"). Measured
@@ -642,8 +666,8 @@ pipewiresrc ! audio/x-raw,channels=2 ! audioconvert ! audioresample
 
 **The slider is in dB, shown as a percent.** The range is 4 octaves; on a linear percent track 100 % would be
 7 % from the left end and everything useful (100-300 %) a handful of pixels. In dB each doubling is the same
-distance (`audio_gain::gain_db_range`, knob steps of 0.5 dB, the box reads e.g. `223%`). The value is pushed
-when the pointer is released, like the other sliders (each setter writes `settings.toml`).
+distance (`audio_gain::gain_db_range`, knob steps of 0.5 dB, the box reads e.g. `223%`). The value is applied
+live while the thumb moves and saved on release (#135, below); the other Settings sliders still push on release.
 
 **Calibration** (`audio_gain.rs` pure logic; `session::AppState::start_audio_calibration`, `poll_audio_calibration`):
 
