@@ -75,7 +75,8 @@ binaries for `cargo run`. Consequences, all handled in `main.rs`:
   `%LOCALAPPDATA%\simple-screensharing\client.log` (truncated when over 1 MB; stderr if the file cannot be opened).
   A panic hook and an `Err` returned from `main` are written to the same file, since their default output also
   goes to stderr. **A startup failure on a user's machine: read that file.** (Not a logging system: just where
-  the existing output lands.)
+  the existing output lands.) Independently of that file, Settings > Diagnostics > Logs copies/saves the in-memory
+  ring (`logbuf.rs`, `ui/APP-SHELL.md`), the easier thing to ask a friend for.
 - `--help` / bad-argument output: `attach_parent_console` attaches to the launching terminal's console when the
   process has no stdout handle (a plain cmd/PowerShell prompt). With stdout redirected (`> file`, a pipe, ssh) the
   inherited handle is used; attaching in that case replaced the handles and lost the output (seen over SSH).

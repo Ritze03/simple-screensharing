@@ -118,11 +118,11 @@ export class VideoSender {
    * @param {(frame:VideoFrame)=>void} [o.onCapturedFrame]  called for EVERY captured frame before it is encoded or dropped
    */
   constructor({
-    track, codec, fps, bitrateKbps, onUnit, isActive = () => true, onCapturedFrame = null, onError = () => {},
+    track, codec, fps, bitrateKbps, onUnit, isActive = () => true, isBackedUp = () => false, onCapturedFrame = null, onError = () => {},
     clock = new MediaClock(), gopMs = DEFAULT_GOP_MS, latencyMode = "realtime",
     hardwareAcceleration = "no-preference", maxEncodeQueue = 4, now = () => performance.now(),
   }) {
-    Object.assign(this, { track, codec, fps, bitrateKbps, onUnit, isActive, onCapturedFrame, onError, clock, gopMs, latencyMode, hardwareAcceleration, maxEncodeQueue, now });
+    Object.assign(this, { track, codec, fps, bitrateKbps, onUnit, isActive, isBackedUp, onCapturedFrame, onError, clock, gopMs, latencyMode, hardwareAcceleration, maxEncodeQueue, now });
     this.encoder = null;
     this.reader = null;
     this.stopped = false;
@@ -310,8 +310,8 @@ export class VideoSender {
           }
           const enc = this.encoder;
           if (!enc || enc.state !== "configured") continue;
-          if (enc.encodeQueueSize > this.maxEncodeQueue) {
-            // Encoder can't keep up: drop this INPUT frame. Nothing was encoded, so no reference chain is broken
+          if (enc.encodeQueueSize > this.maxEncodeQueue || this.isBackedUp()) {
+            // Encoder can't keep up (or the sender is spreading a big frame out): drop this INPUT frame. Nothing was encoded, so no reference chain is broken
             // (a keyframe is only needed when an already-encoded frame is lost, see RoomClient#sendMedia).
             this.stats.droppedBackpressure++;
             continue;

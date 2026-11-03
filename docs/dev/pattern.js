@@ -5,7 +5,7 @@
 // ---- test pattern: 16-bit frame counter + 24-bit wall clock ms as 40 black/white blocks, plus noisy rectangles ----
 const BLOCK = 12;
 const BITS = 40;
-export function makePatternSource(width, height, targetFps, { audio = false, speaker = false } = {}) {
+export function makePatternSource(width, height, targetFps, { audio = false, speaker = false, detail = 0 } = {}) {
   const canvas = document.createElement("canvas");
   canvas.width = width;
   canvas.height = height;
@@ -34,10 +34,27 @@ export function makePatternSource(width, height, targetFps, { audio = false, spe
   const period = 1000 / targetFps;
   let next = performance.now();
   const stats = { generated: 0, firstAt: 0, lastAt: 0 };
+  // detail: a fullscreen colour-noise texture, big IDR (1: scrolls 3 px/frame, 2: static, only 3 rects move = small deltas)
+  let noise = null;
+  if (detail) {
+    noise = document.createElement("canvas");
+    noise.width = width + 512;
+    noise.height = height;
+    const nctx = noise.getContext("2d");
+    const img = nctx.createImageData(noise.width, noise.height);
+    for (let i = 0; i < img.data.length; i += 4) {
+      img.data[i] = Math.random() * 255;
+      img.data[i + 1] = Math.random() * 255;
+      img.data[i + 2] = Math.random() * 255;
+      img.data[i + 3] = 255;
+    }
+    nctx.putImageData(img, 0, 0);
+  }
   const draw = () => {
     ctx.fillStyle = `hsl(${(n * 3) % 360} 40% 25%)`;
     ctx.fillRect(0, 0, width, height);
-    for (let i = 0; i < 40; i++) {
+    if (noise) ctx.drawImage(noise, detail === 1 ? -((n * 3) % 512) : 0, 0);
+    for (let i = 0; i < (detail === 2 ? 3 : 40); i++) {
       ctx.fillStyle = `rgb(${(Math.random() * 255) | 0} ${(Math.random() * 255) | 0} ${(Math.random() * 255) | 0})`;
       const w = 40 + Math.random() * 300;
       const h = 40 + Math.random() * 200;

@@ -122,3 +122,27 @@ export class Reassembler {
     if (this.onDrop) this.onDrop(h.connId, h.streamId, frameId);
   }
 }
+
+// ---- send pacing: mirrors `pace_plan` in client/src/capture.rs (#102) ----
+const PACE_MIN_DATAGRAMS = 24; // below ~24 kB a frame goes out at once
+const PACE_MAX_WINDOW_MS = 60; // a keyframe is spread over at least min(60 ms, 4 frame periods)
+const PACE_MAX_RATE_WINDOW_MS = 600; // no frame is held longer than this
+const PACE_STEP_MS = 2;
+
+/**
+ * How to spread a frame of `count` datagrams / `bytes`: `{ perChunk, gapMs }`, or null to send them back to back.
+ * A keyframe takes at least max(min(60 ms, 4 frame periods), bytes / (2.5 x configured bitrate)), capped at 600 ms; a delta
+ * frame is paced only when that rate time exceeds 2 frame periods. A frame is lost if any fragment is, so a 1 MB IDR sent
+ * as one burst into a shallow queue (or at 0.1 % random loss) rarely arrives whole.
+ */
+export function pacePlan(count, bytes, keyframe, fps, bitrateKbps) {
+  if (count < PACE_MIN_DATAGRAMS) return null;
+  const period = 1000 / Math.min(280, Math.max(1, fps));
+  const byRate = (bytes * 3.2) / Math.max(1, bitrateKbps); // bytes * 8 bit / (2.5 * kbps) in ms
+  let window;
+  if (keyframe) window = Math.max(Math.min(PACE_MAX_WINDOW_MS, period * 4), byRate);
+  else if (byRate > period * 2) window = byRate;
+  else return null;
+  const steps = Math.max(1, Math.floor(Math.min(window, PACE_MAX_RATE_WINDOW_MS) / PACE_STEP_MS));
+  return steps < 2 ? null : { perChunk: Math.ceil(count / steps), gapMs: PACE_STEP_MS };
+}

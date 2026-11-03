@@ -7,6 +7,7 @@
 //! the TUI quits ('q') or the process receives Ctrl-C.
 
 mod cert;
+mod diag;
 mod protocol;
 mod relay;
 mod room;

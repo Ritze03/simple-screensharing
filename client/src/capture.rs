@@ -286,6 +286,7 @@ fn va_driver_is_mesa_amd() -> bool {
         };
         let driver = detect();
         tracing::info!("VA encoder kernel driver: {}", driver.as_deref().unwrap_or("unknown"));
+        crate::logbuf::fact("va_driver", driver.as_deref().unwrap_or("unknown"));
         driver.as_deref() == Some("amdgpu")
     })
 }

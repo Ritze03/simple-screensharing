@@ -217,3 +217,73 @@ requests. Wire format, capability probe, compatibility matrix and the *why* of e
 - Browsers keep their own QUIC stack (Chromium: BBR already): the relay's BBR governs relay ->
   browser, the browser's own governs browser -> relay; WebTransport peers also pick up the
   20 s/5 s via the minimum rule (not verified with a real browser in this task).
+
+## Diagnostics log (task #109, 2026-11-03)
+
+Code: `server/src/diag.rs`. Why: a friend's stall used to mean "relaunch from a terminal and send me
+the client log". The relay sees both legs of every stream, so a periodic summary in its own log is
+usually enough (the field case that motivated it was read off the TUI: a viewer doing
+unsubscribe -> subscribe every ~1.5 s, the L1 keyframe request of `features/video-pipeline.md`
+"Viewer recovery", while the stream rate swung 1 KB/s <-> 1 MB/s). Server only: no protocol or client
+change.
+
+**Cadence.** One background task ticks every second, takes each room mutex briefly, and prints a line
+when a stream's / connection's 60 s window is due (`DEFAULT_WINDOW`; a window is "at least 60 s", so
+`win_s` reads 60-61), and a final partial-window line (`end=1`) when the stream stops, is re-announced
+or the connection leaves (the sampler keeps its own `Arc`s, so there is no hook in the stop/leave
+paths). Nothing is printed when there is nothing to say: no rooms or no streams = no lines; a stream
+line is skipped only if no bytes arrived, nobody watches and nobody (un)subscribed (a stream with
+viewers but 0 bytes **is** printed, that is the stall); a connection line is skipped below 16 KiB of
+UDP traffic per window (keep-alives are ~1 KB) unless it evicted datagrams. INFO level, in the normal
+relay log. The owner's display name is logged (friends-only test system, the owner agreed); it stays in
+the relay log and is never sent anywhere.
+
+**Stream line**, one per announced stream:
+
+```
+diag stream room=7aa8249c owner=45917ef453d85c50 owner_name="client-1" stream=0 kind=Video label="Screen" win_s=61 end=0 viewers=1 bytes_s_avg=961627 bytes_s_max=983575 dgrams=60498 frames=3693 keyframes=35 stalled_frames=0 kf_max_dgrams=34 kf_max_bytes=33746 subs=2 unsubs=1 resubs=1 evicted=0
+```
+
+| field | meaning |
+| --- | --- |
+| `room` | first 4 bytes of the room id, hex |
+| `owner`, `owner_name`, `stream`, `kind`, `label` | the sharer's conn id and display name (from the join), stream id, kind, label |
+| `win_s`, `end` | window length in seconds; `end=1` = final partial window |
+| `viewers` | subscriber count at the last tick (an `end=1` line shows the last seen value) |
+| `bytes_s_avg`, `bytes_s_max` | media bytes/s that **arrived from the sharer** over the window; max = highest per-tick (1 s) rate. Header bytes included, so about the encoder bitrate plus 19 B per datagram |
+| `dgrams`, `frames` | datagrams, and distinct `frame_id`s (a new frame starts when `frame_id` changes), so `frames / win_s` = the sharer's delivered fps |
+| `keyframes`, `kf_max_dgrams`, `kf_max_bytes` | frames with header flag bit0; the largest one as the fragment count its header declares and as bytes that actually arrived (a big gap = fragments lost on the sharer's uplink) |
+| `stalled_frames` | frames flagged `MEDIA_FLAG_STALLED` (sharer re-sending its cached IDR while its capture source is down) |
+| `subs`, `unsubs`, `resubs` | subscribes / unsubscribes in the window, and unsubscribe -> subscribe of the same viewer within 5 s (`RESUB_WITHIN`) = a native viewer's keyframe request. Dozens of `resubs` per window = a viewer that cannot decode |
+| `evicted` | forwards toward this stream's viewers that evicted older queued datagrams (the viewer's send queue was full) |
+
+**Connection line**, one per joined connection with traffic:
+
+```
+diag conn room=7aa8249c conn=8aa89bb5723cfbcd name="client-2" transport=native win_s=61 end=0 shares=0 watching=1 tx_bytes_s=990926 rx_bytes_s=3170 sent=60255 lost=0 congestion=0 rtt_ms=0 cwnd=13392 mtu=1452 evicted=0
+```
+
+`shares` / `watching` = streams it owns / subscribes to. `tx_bytes_s` (relay -> peer, a viewer's
+downlink) and `rx_bytes_s` (peer -> relay, a sharer's uplink) are quinn UDP byte deltas, so they
+include keep-alives and control traffic. `sent`, `lost`, `congestion` are deltas of quinn's path stats
+over the window; `rtt_ms`, `cwnd`, `mtu` are the values at the end of the window; `evicted` = datagrams
+the relay queued toward this connection into a full send queue (the same event as the rate-limited
+`viewer send queue full` line, counted per window instead of sampled).
+
+**Reading them.** Sharer-side problem: `frames` below the configured fps or `bytes_s_avg` low while the
+sharer's conn line shows `lost` > 0, or `stalled_frames` > 0, or `kf_max_bytes` far below
+`kf_max_dgrams` x ~1000 (keyframes arriving incomplete). Relay -> viewer problem: the viewer's conn line
+has `lost` / `congestion` / `evicted` > 0 while the stream line is healthy. Viewer cannot decode:
+`resubs` high. Everything healthy but the viewer still sees stutter: the problem is in the viewer's
+decode/render (ask for that client's log).
+
+**On vogelnest.** `grep -h 'diag ' /var/lib/sss/logs/relay.log.*`; narrow with `diag stream` / `diag conn`,
+`owner_name="Name"` / `name="Name"`, `end=1`, `evicted=[1-9]`, or e.g.
+`grep -h 'diag stream' /var/lib/sss/logs/relay.log.2026-11-03 | grep -v 'resubs=0'`.
+
+**Cost.** Per media datagram the forwarder takes one uncontended `std::sync::Mutex` (the stream's
+counters) and parses the 19 B header a second time; no allocation, plus one relaxed `fetch_add` per
+*evicting* forward. The 1 s tick allocates a few small `String`s per stream / connection and does nothing
+with no rooms. Verified in the headless rig (60 fps H.264, one sharer, one viewer, ~1 MB/s): one stream
+and two conn lines per minute, `frames=3693` over 61 s (60 fps), the viewer's `unwatch` + `watch` shows
+as `subs=2 unsubs=1 resubs=1`, and `stopshare` produced the `end=1` line.

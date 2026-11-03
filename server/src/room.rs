@@ -158,6 +158,8 @@ pub struct ConnState {
     /// Streams (owned by *other* connections) that this connection is
     /// currently subscribed to.
     pub subscriptions: HashSet<(ConnId, StreamId)>,
+    /// Relay-side counters for the diagnostics log (`diag.rs`).
+    pub diag: Arc<crate::diag::ConnDiag>,
     /// Number of streams this connection currently owns (mirrors
     /// `Member.stream_count` sent to clients).
     pub stream_count: u8,
@@ -173,6 +175,8 @@ pub struct ConnState {
 pub struct RouteTarget {
     pub conn_id: ConnId,
     pub connection: Session,
+    /// The target's diagnostics counters (eviction attribution, `diag.rs`).
+    pub diag: Arc<crate::diag::ConnDiag>,
 }
 
 /// Which transport a member arrived on. Only used for display; nothing in the
@@ -218,6 +222,9 @@ pub struct StreamRoute {
     /// Viewers that recently asked the owner for a re-send (a cache miss forwarded upstream): the
     /// only receivers of the owner's retransmit-flagged datagrams.
     nackers: SyncMutex<Vec<(RouteTarget, Instant)>>,
+    /// Per-window counters for the diagnostics log (`diag.rs`): frames,
+    /// keyframes, subscribes, evictions. One uncontended mutex per datagram.
+    pub diag: crate::diag::StreamDiag,
 }
 
 /// How long after a forwarded request a viewer still gets the owner's retransmits.
@@ -231,6 +238,7 @@ impl StreamRoute {
             bytes_received: AtomicU64::new(0),
             cache: video.then(|| SyncMutex::new(FragmentCache::default())),
             nackers: SyncMutex::new(Vec::new()),
+            diag: Default::default(),
         }
     }
 
@@ -353,6 +361,7 @@ impl RoomState {
             .map(|c| RouteTarget {
                 conn_id: c.conn_id,
                 connection: c.connection.clone(),
+                diag: c.diag.clone(),
             })
             .collect();
         stream.route.publish(targets);

@@ -114,27 +114,49 @@ fn attach_parent_console() {
     }
 }
 
-/// Logging. Console builds log to stderr. A Windows release build has no console (see the
+/// Logging. Console builds log to stderr (filtered by `RUST_LOG`, default INFO, as
+/// `tracing_subscriber::fmt::init` did). A Windows release build has no console (see the
 /// `windows_subsystem` attribute at the top), so it appends to
-/// `%LOCALAPPDATA%\simple-screensharing\client.log` instead (truncated once it passes 1 MB).
-/// Falls back to stderr if the file cannot be opened.
+/// `%LOCALAPPDATA%\simple-screensharing\client.log` instead (truncated once it passes 1 MB);
+/// falls back to stderr if the file cannot be opened. Either way the in-memory ring behind
+/// Settings' "Copy/Save logs" (`logbuf`) gets its own, independent copy.
 fn init_logging() {
+    use std::str::FromStr;
+    use tracing_subscriber::filter::{LevelFilter, Targets};
+    use tracing_subscriber::fmt::writer::BoxMakeWriter;
+    use tracing_subscriber::prelude::*;
+
+    #[allow(unused_mut)]
+    let mut writer = BoxMakeWriter::new(std::io::stderr);
     #[cfg(all(windows, not(debug_assertions)))]
-    {
-        if let Some(dir) = dirs::cache_dir().map(|d| d.join("simple-screensharing")) {
-            let _ = std::fs::create_dir_all(&dir);
-            let path = dir.join("client.log");
-            let big = std::fs::metadata(&path).map(|m| m.len() > 1 << 20).unwrap_or(false);
-            let file = std::fs::OpenOptions::new().create(true).append(!big).write(true).truncate(big).open(&path);
-            if let Ok(file) = file {
-                tracing_subscriber::fmt().with_ansi(false).with_writer(std::sync::Mutex::new(file)).init();
-                // The default panic message goes to the (absent) stderr; keep it in the log.
-                std::panic::set_hook(Box::new(|info| tracing::error!("panic: {info}")));
-                return;
-            }
+    if let Some(dir) = dirs::cache_dir().map(|d| d.join("simple-screensharing")) {
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("client.log");
+        let big = std::fs::metadata(&path).map(|m| m.len() > 1 << 20).unwrap_or(false);
+        let file = std::fs::OpenOptions::new().create(true).append(!big).write(true).truncate(big).open(&path);
+        if let Ok(file) = file {
+            writer = BoxMakeWriter::new(std::sync::Mutex::new(file));
         }
     }
-    tracing_subscriber::fmt::init();
+    let ansi = cfg!(not(all(windows, not(debug_assertions))));
+    let filter = match std::env::var("RUST_LOG") {
+        Ok(v) => Targets::from_str(&v).unwrap_or_else(|e| {
+            eprintln!("Ignoring `RUST_LOG={v:?}`: {e}");
+            Targets::new().with_default(LevelFilter::INFO)
+        }),
+        Err(_) => Targets::new().with_default(LevelFilter::INFO),
+    };
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_ansi(ansi).with_writer(writer).with_filter(filter))
+        .with(simple_screensharing_client::logbuf::layer())
+        .init();
+    // The default hook prints to stderr only (absent in a Windows release build, and not in the
+    // ring): log the panic, then let the default hook do its usual job.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!("panic: {info}");
+        default_hook(info);
+    }));
 }
 
 fn main() -> anyhow::Result<()> {

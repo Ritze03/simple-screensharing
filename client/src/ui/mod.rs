@@ -376,6 +376,11 @@ pub enum UiAction {
     SetPresentationMode(PresentationMode),
     SetJitterBuffer(u32),
     SetCatchUpSpeed(u32),
+    /// Settings > Diagnostics: copy the in-memory log (`logbuf`) to the clipboard + toast.
+    CopyLogs,
+    /// Settings > Diagnostics: write the log to a file in the Downloads folder, toast and
+    /// remember the path in `Shell::saved_logs`.
+    SaveLogs,
 
     // --- misc -------------------------------------------------------------
 }
@@ -426,6 +431,8 @@ pub struct Shell {
     pub create_result: Option<Result<JoinLink, String>>,
     /// Last failure of a [`UiAction::JoinRoom`].
     pub join_error: Option<String>,
+    /// Where the last [`UiAction::SaveLogs`] wrote the log (shown in Settings).
+    pub saved_logs: Option<String>,
     /// Why the last Connect of a room (saved or auto-connect) failed, by
     /// join string; shown under "Not connected" in that room's view until
     /// the next attempt starts or it joins. See [`Shell::connect_error`].
@@ -986,7 +993,14 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::apply(&cc.egui_ctx);
         match cc.wgpu_render_state.as_ref() {
-            Some(rs) => simple_screensharing_client::decode::render::VideoRenderer::register(rs),
+            Some(rs) => {
+                let info = rs.adapter.get_info();
+                simple_screensharing_client::logbuf::fact(
+                    "gpu",
+                    format!("{} ({:?}, {:?}, driver {} {})", info.name, info.device_type, info.backend, info.driver, info.driver_info),
+                );
+                simple_screensharing_client::decode::render::VideoRenderer::register(rs)
+            }
             None => tracing::error!("no wgpu render state: video tiles will stay black"),
         }
         // SIGTERM/SIGINT/SIGHUP close the window, so `on_exit` leaves every
@@ -1243,8 +1257,13 @@ impl App {
                 // (`popout.rs` `viewport`), so the letterboxing is identical.
                 egui::CentralPanel::default().frame(Frame::NONE.fill(Color32::BLACK)).show(ctx, |ui| {
                     let rect = ui.max_rect();
-                    cx.videos.paint(fs.key, ui, rect, simple_screensharing_client::decode::render::Fit::Contain);
-                    if ui.interact(rect, Id::new("stream_fullscreen"), Sense::click()).double_clicked() {
+                    let pic = cx.videos.paint(fs.key, ui, rect, simple_screensharing_client::decode::render::Fit::Contain);
+                    // Registered before the overlay, whose button then takes its own clicks.
+                    let dbl = ui.interact(rect, Id::new("stream_fullscreen"), Sense::click()).double_clicked();
+                    // `Why` the pop-out's overlay (`popout::fullscreen_overlay`): user request
+                    // 2026-11-03, the same overlay as a fullscreened pop-out.
+                    let first_frame = pic.is_some_and(|r| r.width() > 0.0);
+                    if popout::fullscreen_overlay(ui, &mut cx, fs.key, rect, first_frame) || dbl {
                         cx.act(UiAction::ExitStreamFullscreen);
                     }
                 });

@@ -174,9 +174,8 @@ fn initial_size(frame: Option<(u32, u32)>) -> Vec2 {
     }
 }
 
-/// Refresh `shared`'s chrome data. Returns true when the stall state flipped
-/// (the viewport then needs a repaint even with no new frames).
-fn refresh_info(cx: &Cx, key: StreamKey, shared: &Shared) -> bool {
+/// The chrome data of one stream, plus its health number (see [`Shared::health`]).
+fn collect_info(cx: &Cx, key: StreamKey) -> (Info, u8) {
     let (room, owner, stream) = key;
     let label = format!("{} · {}", cx.member_name(room, owner), cx.room_name(room));
     let res = stream_size(cx, key)
@@ -197,19 +196,57 @@ fn refresh_info(cx: &Cx, key: StreamKey, shared: &Shared) -> bool {
             ViewState::SharerStalled => 2,
         };
     }
+    let info = Info { label, res, has_audio, volume: vol.volume_percent, muted: vol.muted, kbps };
+    (info, health)
+}
+
+/// Refresh `shared`'s chrome data. Returns true when the stall state flipped
+/// (the viewport then needs a repaint even with no new frames).
+fn refresh_info(cx: &Cx, key: StreamKey, shared: &Shared) -> bool {
+    let (new, health) = collect_info(cx, key);
     {
         let mut info = shared.info.lock().unwrap();
-        info.label = label;
-        info.res = res;
-        info.has_audio = has_audio;
-        info.kbps = kbps;
+        let (volume, muted) = (info.volume, info.muted);
+        *info = new;
         // Keep the viewport's own just-made edit until it has been applied.
-        if shared.pending_volume.lock().unwrap().is_none() {
-            info.volume = vol.volume_percent;
-            info.muted = vol.muted;
+        if shared.pending_volume.lock().unwrap().is_some() {
+            info.volume = volume;
+            info.muted = muted;
         }
     }
     shared.health.swap(health, Ordering::Relaxed) != health
+}
+
+/// The pop-out's overlay (centre chip, hover chrome) over the main window's own
+/// fullscreen stream (`Nav::fullscreen`), same code as the pop-out viewport.
+/// Its top-right button leaves fullscreen instead of closing a window.
+/// Returns true when that button was clicked.
+pub fn fullscreen_overlay(ui: &mut Ui, cx: &mut Cx, key: StreamKey, rect: Rect, first_frame: bool) -> bool {
+    let (mut info, health) = collect_info(cx, key);
+    if !first_frame || health != 0 {
+        centre_chip(ui, rect, &chip_text(first_frame, health));
+    }
+    if !ui.ctx().input(|i| i.pointer.has_pointer()) {
+        return false;
+    }
+    let Some(entry) = cx.videos.get(key) else {
+        return false;
+    };
+    let stats = entry.view.lock().unwrap().source().stats();
+    let tip = tr("ui.popout.exit_fullscreen_tip", "Exit fullscreen");
+    let out = chrome(ui, rect, &mut info, (stats.decoded_fps, stats.presented_fps), ("fullscreen_exit", &tip));
+    if let Some((volume_percent, muted)) = out.volume {
+        cx.act(UiAction::SetVolume { stream: key, volume_percent, muted });
+    }
+    out.button
+}
+
+fn chip_text(first_frame: bool, health: u8) -> String {
+    match (first_frame, health) {
+        (false, _) => tr("video.waiting_frame", "Waiting for first decoded frame…"),
+        (true, 2) => tr("video.sharer_stalled", "Sharer's capture stalled"),
+        (true, _) => tr("video.recovering", "Recovering…"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -230,15 +267,26 @@ fn viewport(ctx: &egui::Context, shared: &Shared) {
             double_clicked = ui.interact(rect, ui.id().with("popout_dbl"), Sense::click()).double_clicked();
             let health = shared.health.load(Ordering::Relaxed);
             if !first_frame || health != 0 {
-                let text = match (first_frame, health) {
-                    (false, _) => tr("video.waiting_frame", "Waiting for first decoded frame…"),
-                    (true, 2) => tr("video.sharer_stalled", "Sharer's capture stalled"),
-                    (true, _) => tr("video.recovering", "Recovering…"),
-                };
-                centre_chip(ui, rect, &text);
+                centre_chip(ui, rect, &chip_text(first_frame, health));
             }
             if hovered {
-                chrome(ui, rect, shared);
+                let stats = shared.view.lock().unwrap().source().stats();
+                let tip = tr("ui.popout.close_tip", "Close and bring it back to its tile");
+                let out = chrome(
+                    ui,
+                    rect,
+                    &mut shared.info.lock().unwrap(),
+                    (stats.decoded_fps, stats.presented_fps),
+                    ("close", &tip),
+                );
+                if out.button {
+                    shared.close.store(true, Ordering::Relaxed);
+                    ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                }
+                if out.volume.is_some() {
+                    *shared.pending_volume.lock().unwrap() = out.volume;
+                    ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                }
             }
         });
     let (f11, esc, fullscreen) = ctx.input(|i| {
@@ -268,8 +316,17 @@ fn centre_chip(ui: &Ui, rect: Rect, text: &str) {
     paint_text(ui, r, text, f, theme::TEXT, Align::Center);
 }
 
-/// Vignette + top row (statbar, ×) + bottom row (audio pill).
-fn chrome(ui: &mut Ui, rect: Rect, shared: &Shared) {
+/// What the user did in [`chrome`] this frame.
+struct ChromeOut {
+    /// The top-right round button was clicked.
+    button: bool,
+    /// New (volume, muted) when the audio pill was edited.
+    volume: Option<(u32, bool)>,
+}
+
+/// Vignette + top row (statbar, round button `(icon, tip)`) + bottom row
+/// (audio pill). `fps` is (decoded, presented).
+fn chrome(ui: &mut Ui, rect: Rect, info: &mut Info, fps: (f64, f64), button: (&str, &str)) -> ChromeOut {
     let p = ui.painter();
     let shade = |a: f32| Color32::from_rgba_unmultiplied(10, 11, 13, (a * 255.0) as u8);
     let split = rect.top() + rect.height() * 0.4;
@@ -297,30 +354,16 @@ fn chrome(ui: &mut Ui, rect: Rect, shared: &Shared) {
             .layout(Layout::top_down(Align::Min)),
     );
     ov.spacing_mut().item_spacing = Vec2::ZERO;
-    let mut info = shared.info.lock().unwrap();
 
     // Top: [fill statbar][29 ×].
     let top = HBox::new("popout_top", CHROME_H)
         .gap(theme::S2)
         .slots(&[FILL, fixed(CHROME_H)])
         .show(&mut ov);
-    let stats = shared.view.lock().unwrap().source().stats();
-    top.show(&mut ov, 0, Align::Min, |ui| {
-        statbar(ui, &info, stats.decoded_fps, stats.presented_fps)
-    });
-    if top
-        .show(&mut ov, 1, Align::Min, |ui| {
-            round_btn(
-                ui,
-                "close",
-                &tr("ui.popout.close_tip", "Close and bring it back to its tile"),
-            )
-        })
-        .clicked()
-    {
-        shared.close.store(true, Ordering::Relaxed);
-        ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
-    }
+    top.show(&mut ov, 0, Align::Min, |ui| statbar(ui, info, fps.0, fps.1));
+    let button = top
+        .show(&mut ov, 1, Align::Min, |ui| round_btn(ui, button.0, button.1))
+        .clicked();
 
     // Bottom: [audio pill | no-audio chip].
     let mut bottom = ov.new_child(
@@ -331,11 +374,9 @@ fn chrome(ui: &mut Ui, rect: Rect, shared: &Shared) {
             ))
             .layout(Layout::left_to_right(Align::Center)),
     );
+    let mut volume = None;
     if info.has_audio {
-        if let Some(v) = audio_pill(&mut bottom, &mut info) {
-            *shared.pending_volume.lock().unwrap() = Some(v);
-            ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
-        }
+        volume = audio_pill(&mut bottom, info);
     } else {
         widgets::chip_dark(
             &mut bottom,
@@ -344,6 +385,7 @@ fn chrome(ui: &mut Ui, rect: Rect, shared: &Shared) {
             &tr("ui.popout.no_audio", "No audio shared"),
         );
     }
+    ChromeOut { button, volume }
 }
 
 /// `.statbar`: dark pill, `[dot][fill name][res][fps][bitrate]`, content-sized

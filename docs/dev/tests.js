@@ -7,7 +7,7 @@ import { PostcardReader, PostcardWriter } from "../js/core/postcard.js";
 import * as P from "../js/core/protocol.js";
 import { MAX_LINK_ROOM_NAME_CHARS, base64urlDecode, bytesToHex, createRoom, encodeLinkName, formatJoinLink, hexToBytes, JoinLinkError, parseJoinLink, parseServerAddr, splitHostPort, stripLinkName } from "../js/core/joinlink.js";
 import { NonceSequence, NonceSpaceExhausted, buildAad, buildNonce, decryptFrame, decryptPreview, encryptFrame, encryptPreview, importRoomKey } from "../js/core/crypto.js";
-import { Reassembler, fragmentFrame } from "../js/core/fragment.js";
+import { Reassembler, fragmentFrame, pacePlan } from "../js/core/fragment.js";
 import { deriveCodecString, sniffCodec } from "../js/core/codec.js";
 import { DECODE_QUEUE_CATCHUP_THRESHOLD, JitterBuffer, MAX_DECODE_QUEUE, clampCatchUpSpeedPercent, clampMaxJitterBufferMs } from "../js/core/jitter.js";
 import { CanvasRenderer, VideoReceiver } from "../js/core/video-rx.js";
@@ -520,6 +520,30 @@ test("reassembly: keyframe flag survives when only a later fragment carries it",
   const out = feed(r, dgs);
   eq(out.keyframe, true);
   eq(feed(r, makeFrame(6, 100)).keyframe, false);
+});
+
+// Same cases as the native `pace_plan` tests in client/src/capture.rs (#102): both sharers must pace alike.
+const planWindow = (count, p) => p.gapMs * (Math.ceil(count / p.perChunk) - 1);
+
+test("pacing: small frames and ordinary deltas go out at once; a small keyframe is spread over at most ~60 ms", () => {
+  eq(pacePlan(10, 12_000, true, 60, 8300), null);
+  eq(pacePlan(30, 36_000, false, 120, 8300), null);
+  eq(pacePlan(240, 288_000, true, 60, 100_000), { perChunk: 8, gapMs: 2 }, "240 datagrams at 60 fps: 30 chunks of 8 every 2 ms");
+  ok(planWindow(240, pacePlan(240, 288_000, true, 240, 100_000)) <= 17, "window shrinks with the frame period");
+  for (const count of [24, 25, 100, 301]) {
+    const p = pacePlan(count, count * 1200, true, 30, 100_000);
+    ok(p.perChunk * Math.ceil(count / p.perChunk) >= count, `every datagram of ${count} is covered`);
+  }
+});
+
+test("pacing: a big keyframe is spread by rate up to the 600 ms cap; a huge delta frame is paced too", () => {
+  // the #102 field case: 984 datagrams (1.18 MB) at 8300 kbps / 120 fps
+  const w = planWindow(984, pacePlan(984, 1_180_000, true, 120, 8300));
+  ok(w >= 350 && w <= 500, `1.18 MB IDR window ${w} ms`);
+  ok(planWindow(5000, pacePlan(5000, 6_000_000, true, 120, 1000)) <= 600, "capped");
+  ok(pacePlan(1600, 1_900_000, false, 120, 8300) !== null, "1.9 MB delta is paced");
+  eq(pacePlan(34, 40_000, false, 120, 8300), null, "40 kB delta is not");
+  ok(planWindow(100, pacePlan(100, 100_000, true, 60, 8300)) >= 45, "short rate window keeps the 60 ms one");
 });
 
 // ------------------------------------------------------------------------------------------------ codec

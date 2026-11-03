@@ -16,7 +16,9 @@
 //!    and returns every node with `media.class = "Stream/Output/Audio"` —
 //!    i.e. every application currently producing audio — confirmed against
 //!    this machine's actual `pw-dump` output (GStreamer 1.28.5 / PipeWire
-//!    1.6.8), not assumed from documentation.
+//!    1.6.8), not assumed from documentation. The list is deduplicated by
+//!    name: the UI choice is a *name*, and every stream with that name is
+//!    mixed into the share (task #105, see step 3).
 //! 2. [`start_audio_sharing`] spawns a `pw-loopback` process. Undecorated,
 //!    `pw-loopback --name X` creates *two* stream nodes: `input.X`
 //!    (`Stream/Input/Audio`, i.e. something other nodes can send audio
@@ -32,7 +34,10 @@
 //!    `input.X`'s *input* ports (by numeric port id — `pw-link <id> <id>`
 //!    works directly, verified live, and sidesteps channel-name/count
 //!    mismatches that string-pattern port names could hit). This is
-//!    additive: the application's original routing (e.g. to real speakers)
+//!    additive. *Every* stream named like the chosen source is linked into the
+//!    same `input.X` (the loopback mixes them), and [`link_poll_loop`] re-checks
+//!    once a second to link streams that appear later and forget ones that
+//!    vanished. The application's original routing (e.g. to real speakers)
 //!    is completely untouched — confirmed live by watching `pw-link -l`
 //!    show both the original link and the new one simultaneously.
 //! 4. `output.X` is then captured like any normal PipeWire audio source:
@@ -157,9 +162,10 @@ fn run_pw_dump() -> Result<Vec<PwObject>> {
 /// [`list_audio_sources`] and passed to [`start_audio_sharing`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioSource {
-    /// The PipeWire node id (as of the moment it was listed — nodes can
-    /// disappear if the application stops producing audio; a stale id just
-    /// makes [`start_audio_sharing`] fail with a clear error).
+    /// The PipeWire node id (as of the moment it was listed). In the
+    /// dropdown list ([`list_audio_sources`]) this is only the *representative*
+    /// stream of `name` (the level meter taps it); [`start_audio_sharing`]
+    /// ignores it and mixes every stream called `name`.
     pub id: u32,
     /// Best-effort human-readable label: `node.description`, falling back
     /// to `application.name`, then `media.name`, then the raw `node.name`.
@@ -179,9 +185,36 @@ pub struct AudioSource {
 /// real `pw-dump` output — see module docs), excluding this module's own
 /// loopback nodes (see [`LOOPBACK_NAME_PREFIX`]) so an in-progress audio
 /// share doesn't list itself as a shareable source.
+///
+/// **One entry per name** (task #105): an app often has several streams with
+/// the same name (browser tabs, a game plus its launcher); the choice in the
+/// UI is the *name*, and [`start_audio_sharing`] mixes every stream that has
+/// it. The entry returned is the first such node, a representative for the
+/// level meter.
 pub fn list_audio_sources() -> Result<Vec<AudioSource>> {
     let objects = run_pw_dump()?;
-    Ok(extract_audio_sources(&objects))
+    Ok(dedup_by_name(extract_audio_sources(&objects)))
+}
+
+/// Keeps the first node of each name, in listing order.
+fn dedup_by_name(sources: Vec<AudioSource>) -> Vec<AudioSource> {
+    let mut seen = std::collections::HashSet::new();
+    sources.into_iter().filter(|s| seen.insert(s.name.clone())).collect()
+}
+
+/// Registry ids of every stream named `name` in this snapshot.
+fn node_ids_named(objects: &[PwObject], name: &str) -> Vec<u32> {
+    extract_audio_sources(objects).into_iter().filter(|s| s.name == name).map(|s| s.id).collect()
+}
+
+/// What the 1 s poll does with a fresh snapshot: the matching nodes not
+/// linked yet (to link), and `linked` with the vanished ones dropped (PipeWire
+/// removes a node's links itself when the node goes, so forgetting is all
+/// that is left to do).
+fn link_diff(matching: &[u32], linked: &std::collections::HashSet<u32>) -> (Vec<u32>, std::collections::HashSet<u32>) {
+    let to_add = matching.iter().copied().filter(|id| !linked.contains(id)).collect();
+    let kept = linked.iter().copied().filter(|id| matching.contains(id)).collect();
+    (to_add, kept)
 }
 
 fn extract_audio_sources(objects: &[PwObject]) -> Vec<AudioSource> {
@@ -460,6 +493,57 @@ fn link_source_into_loopback(objects: &[PwObject], source_node_id: u32, loopback
     Ok(())
 }
 
+/// Links every not-yet-linked stream named `name` in `objects` into the
+/// loopback input and records it in `linked`; forgets nodes that vanished.
+/// A node that cannot be linked yet (no ports, `pw-link` error) is not
+/// recorded, so the next tick retries it. Never links a node of another name.
+fn sync_links(objects: &[PwObject], name: &str, loopback_input_node_id: u32, linked: &mut std::collections::HashSet<u32>) {
+    let matching = node_ids_named(objects, name);
+    let (to_add, kept) = link_diff(&matching, linked);
+    *linked = kept;
+    for id in to_add {
+        match link_source_into_loopback(objects, id, loopback_input_node_id) {
+            Ok(()) => {
+                tracing::info!("audio share '{name}': mixed in stream node {id}");
+                linked.insert(id);
+            }
+            Err(e) => tracing::debug!("audio share '{name}': stream node {id} not linked yet: {e:#}"),
+        }
+    }
+}
+
+/// Once a second, re-lists the graph and links streams that now carry the
+/// shared name (new browser tab, restarted app). Runs without touching the
+/// pipeline or encoder.
+async fn link_poll_loop(name: String, loopback_input_node_id: u32, mut linked: std::collections::HashSet<u32>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tick.tick().await; // the first tick is immediate; start_audio_sharing just synced
+    loop {
+        tick.tick().await;
+        let n = name.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            let r = run_pw_dump().map(|objects| {
+                // Only link while our loopback input is still in the graph.
+                if !node_port_ids(&objects, loopback_input_node_id as u64, "input").is_empty() {
+                    sync_links(&objects, &n, loopback_input_node_id, &mut linked);
+                }
+            });
+            (linked, r)
+        })
+        .await;
+        match res {
+            Ok((l, r)) => {
+                linked = l;
+                if let Err(e) = r {
+                    tracing::debug!("audio link poll: {e:#}");
+                }
+            }
+            Err(_) => return,
+        }
+    }
+}
+
 fn kill_and_wait(child: &mut Child) {
     if let Err(e) = child.kill() {
         tracing::warn!("error killing pw-loopback process: {e}");
@@ -688,6 +772,9 @@ pub struct AudioCaptureHandle {
     pipeline: gst::Pipeline,
     loopback_child: Child,
     pump_task: tokio::task::JoinHandle<()>,
+    /// The 1 s poll that links streams of the chosen name as they appear
+    /// ([`link_poll_loop`]); aborted on stop/drop.
+    link_task: tokio::task::JoinHandle<()>,
     level: AudioLevel,
     /// The pipeline's `volume name=mute` element — see
     /// [`AudioCaptureHandle::set_muted`].
@@ -728,10 +815,12 @@ pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, sour
         }
     };
 
-    if let Err(e) = link_source_into_loopback(&objects, source.id, loopback.input_node_id) {
-        kill_and_wait(&mut loopback_child);
-        return Err(e);
-    }
+    // Mix in every stream that has the chosen name right now. Zero matches is
+    // fine: the share starts silent and the poll below links the app when it
+    // (re)appears. The capture pipeline reads only the loopback's output, so
+    // an unlinked loopback is silence, never the microphone.
+    let mut linked = std::collections::HashSet::new();
+    sync_links(&objects, &source.name, loopback.input_node_id, &mut linked);
 
     let capture_node_name = format!("{loopback_name}-cap");
     let (pipeline, appsink, mute_element) = match build_pipeline(loopback.output_node_serial, &capture_node_name) {
@@ -786,6 +875,7 @@ pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, sour
         Instant::now(),
     );
     let pump_task = tokio::spawn(pump_loop(pump_client, stream_id, stream, bus_stream, level.clone(), pts_offset_us));
+    let link_task = tokio::spawn(link_poll_loop(source.name.clone(), loopback.input_node_id, linked));
 
     // No width/height for audio (spec's AnnounceStream fields exist for
     // video streams' benefit); 0x0 signals "not applicable".
@@ -796,6 +886,7 @@ pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, sour
     {
         let _ = pipeline.set_state(gst::State::Null);
         pump_task.abort();
+        link_task.abort();
         kill_and_wait(&mut loopback_child);
         return Err(e);
     }
@@ -806,6 +897,7 @@ pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, sour
         pipeline,
         loopback_child,
         pump_task,
+        link_task,
         level,
         mute_element,
         source_name: source.name.clone(),
@@ -827,6 +919,7 @@ impl Drop for AudioCaptureHandle {
     /// time this runs, so setting an already-`Null` pipeline to `Null` again
     /// and killing an already-exited child are both harmless no-ops.
     fn drop(&mut self) {
+        self.link_task.abort();
         let _ = self.pipeline.set_state(gst::State::Null);
         let _ = self.loopback_child.kill();
         let _ = self.loopback_child.wait(); // reap, avoid a zombie
@@ -869,6 +962,7 @@ impl AudioCaptureHandle {
     /// error here is logged, not returned, since capture has already
     /// stopped either way).
     pub async fn stop(mut self) -> Result<()> {
+        self.link_task.abort();
         // Ask the pipeline to end gracefully by sending it a real EOS event
         // *before* forcing it to `Null`, and wait for the pump task to
         // notice — same fix, same rationale, as `capture.rs::CaptureHandle::stop`:
@@ -1326,6 +1420,59 @@ mod tests {
         let objects = fixture_objects();
         let sources = extract_audio_sources(&objects);
         assert_eq!(sources, vec![AudioSource { id: 262, name: "TestApp".to_string(), serial: Some(90210) }]);
+    }
+
+    /// Three app streams: two named "Firefox" (ids 10, 11), one "Spotify" (20),
+    /// plus a `Stream/Input/Audio` that is also called "Firefox" (wrong class).
+    fn duplicate_name_objects() -> Vec<PwObject> {
+        let node = |id: u32, class: &str, desc: &str| {
+            format!(
+                r#"{{"id":{id},"type":"PipeWire:Interface:Node","info":{{"props":{{"media.class":"{class}","node.name":"n{id}","node.description":"{desc}","object.serial":{}}}}}}}"#,
+                id + 1000
+            )
+        };
+        let json = format!(
+            "[{},{},{},{}]",
+            node(10, "Stream/Output/Audio", "Firefox"),
+            node(20, "Stream/Output/Audio", "Spotify"),
+            node(11, "Stream/Output/Audio", "Firefox"),
+            node(30, "Stream/Input/Audio", "Firefox"),
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn dropdown_lists_each_name_once_with_the_first_node_as_representative() {
+        let objects = duplicate_name_objects();
+        let all = extract_audio_sources(&objects);
+        assert_eq!(all.len(), 3, "extraction keeps every stream");
+        let listed = dedup_by_name(all);
+        let names: Vec<_> = listed.iter().map(|s| (s.name.as_str(), s.id)).collect();
+        assert_eq!(names, vec![("Firefox", 10), ("Spotify", 20)]);
+    }
+
+    #[test]
+    fn a_name_matches_all_its_output_streams_and_nothing_else() {
+        let objects = duplicate_name_objects();
+        assert_eq!(node_ids_named(&objects, "Firefox"), vec![10, 11]);
+        assert_eq!(node_ids_named(&objects, "Spotify"), vec![20]);
+        assert!(node_ids_named(&objects, "Discord").is_empty());
+        // The real fixture's own loopback output is never matched, whatever the name.
+        assert!(node_ids_named(&fixture_objects(), "output.ssshare-loopback-3-abc123").is_empty());
+    }
+
+    #[test]
+    fn link_diff_adds_new_matches_and_forgets_vanished_ones() {
+        use std::collections::HashSet;
+        let set = |v: &[u32]| v.iter().copied().collect::<HashSet<u32>>();
+        // Nothing linked yet: link everything that matches.
+        assert_eq!(link_diff(&[10, 11], &set(&[])), (vec![10, 11], set(&[])));
+        // Steady state: nothing to do.
+        assert_eq!(link_diff(&[10, 11], &set(&[10, 11])), (vec![], set(&[10, 11])));
+        // A new tab appears (12), tab 10 closes.
+        assert_eq!(link_diff(&[11, 12], &set(&[10, 11])), (vec![12], set(&[11])));
+        // The app is gone entirely: the share stays up with nothing linked.
+        assert_eq!(link_diff(&[], &set(&[10, 11])), (vec![], set(&[])));
     }
 
     #[test]

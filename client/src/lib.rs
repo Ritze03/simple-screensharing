@@ -29,6 +29,7 @@ pub mod decode;
 #[cfg(test)]
 mod end_to_end_test;
 pub mod fragment;
+pub mod logbuf;
 pub mod net;
 pub mod nack;
 pub mod presets;

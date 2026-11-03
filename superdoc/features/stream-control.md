@@ -933,11 +933,8 @@ small too would mean taking over the GOP (`key-int-max` large, the pump forcing 
 `IdrControl`); not done. The rig's IDRs (275 kB median) are smaller than the field's (1.18 MB), so the
 absolute numbers understate the field problem; the 30-100 s recoveries were not reproduced.
 
-**Browser sharer** (`docs/js/core`): no pacing and no repeats at all; `#sendMedia` writes every datagram of a
-frame into the WebTransport writer at once and drops *later* frames while more than `MAX_PENDING_DATAGRAMS`
-(400) are queued. Its IDR size is whatever the browser's WebCodecs encoder (`bitrateMode: "variable"`) emits;
-the same large-IDR / many-fragments arithmetic applies, but nothing here is as aggressive as the native
-60 ms burst + repeats, and there is no encoder knob equivalent to the `bitrate` write. Not changed.
+**Browser sharer** (`docs/js/core`): ported in #103 (rate pacing only; no repeats exist there, and WebCodecs
+has no equivalent of the `bitrate` write): `features/website.md` "Big keyframes in the browser sharer".
 
 ### Audio watch teardown no longer holds the video lock (#97, latent)
 
@@ -2036,6 +2033,14 @@ its *presentation* is bundled.)
   cache) and filters to real `PipeWire:Interface:Node` objects (PipeWire `Client` objects carry
   lookalike `media.class` props); the UI re-lists on open and while the picker stays open. Per-option
   level meters use real per-candidate taps (`start_audio_level_tap`/`poll_audio_level_tap`).
+- **The choice is a name; same-name streams are mixed (#105, 2026-11-03).** `list_audio_sources`
+  returns one entry per display name (first node, used for the meter); `start_audio_sharing` links
+  *every* `Stream/Output/Audio` node with that name into the one loopback input and
+  `audio::link_poll_loop` re-checks every second (links new matches, forgets vanished ones; pure
+  logic in `link_diff`). One loopback, one pipeline, one encoder: nothing restarts. Zero matching
+  streams = a silent share (the capture only ever reads the loopback output, so never the
+  microphone). The choice is not persisted anywhere (`AppState::selected_audio_source` is
+  in-memory), so there is no settings back-compat. Details and *Why*: `features/audio-sharing.md`.
 - **Real playback measurement** (viewer volume 0/100/200 % gave +0.0/+2.7/+6.5 dB at the speakers)
   is recorded with its decorrelated-noise rationale in `superdoc/features/video-pipeline.md`
   ("Audio follows video").

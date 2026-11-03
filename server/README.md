@@ -56,6 +56,15 @@ The effective values are logged once at start (`QUIC transport tuning ...`), and
 `viewer send queue full` line (per viewer, at most every 5 s) when a viewer's send queue is
 evicting media datagrams, plus a `connection path stats` line when a connection ends.
 
+## Diagnostics log
+
+Every 60 s the relay logs one `diag stream ...` line per active stream (bytes/s avg and max,
+frames, keyframes and their size, viewers, viewer re-subscribes, send-queue evictions) and one
+`diag conn ...` line per busy connection (quinn path-stat deltas, rtt, cwnd, evictions), plus a
+final `end=1` line when a stream or connection ends. All `key=value`, INFO, nothing for idle rooms.
+Fields and how to read them: `superdoc/features/relay-transport.md` "Diagnostics log". Quick look:
+`grep -h 'diag ' logs/relay.log.*`.
+
 Lab: `cargo test --release -p simple-screensharing-server transport_lab -- --ignored --nocapture`
 (see the header of `src/transport_lab.rs`).
 

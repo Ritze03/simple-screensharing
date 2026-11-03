@@ -128,6 +128,27 @@ At most one popover (`Nav.popover`, anchored to the button's rect) and one modal
 modal; Escape, x and a backdrop click close every modal. Toasts are painted last by
 `mod.rs` (2.6 s).
 
+**Settings > Diagnostics > Logs: copy or save the app's recent log** (2026-11-03, task #107, user: "The GUI should
+have an option in the settings to dump logs to the clipboard or a file, so investigation is easier."). Two
+secondary buttons in an own "Diagnostics" card (`ui::modals::settings`): **Copy to clipboard**
+(`UiAction::CopyLogs`: `ctx.copy_text(logbuf::dump())` + "Logs copied" toast) and **Save to file...**
+(`UiAction::SaveLogs`: `logbuf::save_to_downloads()` writes `simple-screensharing-<UTC stamp>.log` into the user's
+Downloads folder, home folder if there is none; a toast plus an info banner in the card with the full path,
+`Shell::saved_logs`). The dump is a short header (version + commit hash from `client/build.rs`, OS, GPU from the
+wgpu adapter, VA kernel driver once a share has probed it, time, line count) and then the ring's lines, oldest
+first. The ring (`client/src/logbuf.rs`) is a second `fmt` layer next to the stderr one (`main.rs` `init_logging`):
+last 5,000 events / 2 MB, **INFO+ from `simple_screensharing_client`/`..._protocol`, WARN+ from everything else**,
+independent of `RUST_LOG` (which still only filters stderr / the Windows `client.log`). Same UTC timestamps as
+stderr. A panic hook now logs `panic: ...` on every platform (it used to be Windows release only) and then runs the
+default hook. *Why in memory, always on:* the old advice ("restart from a terminal with `RUST_LOG=info ... 2>
+sss.log`") lost the first occurrence of a stall. *Why Downloads and no file dialog:* no dialog crate is a dependency
+and a native one would pull a portal client / GTK in for one button. *No secrets:* no log line prints a room key or
+join link (grepped 2026-11-03); `logbuf::redact` still turns any `server|room|key...` token into
+`server|room|<redacted>` before a line enters the ring. Rig note: `wl-paste` only sees the copy when the headless
+sway seat has a keyboard (hold one open with `wtype -P Shift_L -s 30000 -p Shift_L` while clicking; the existing
+"Copy invite link" behaves the same). Tests: `logbuf::tests::*`,
+`ui::tests::copy_logs_puts_the_dump_on_the_clipboard_and_toasts`.
+
 **"Live in <room>" toast fires when a room goes on air, not on Go live** (2026-10-15, task #73).
 `App::poll` compares `Cx::on_air_rooms()` with `Shell.announced_live` (`newly_on_air`): a room
 that is only Starting, or whose start failed (the destination is forgotten and the error toast
@@ -299,6 +320,18 @@ no sidebar, bands, modals or toasts; pop-out viewports are still declared). A do
 that was already fullscreen stays fullscreen. If the stream disappears (unwatched, ended, popped out) the next
 `draw` leaves the mode by itself. A popped-out tile is a placeholder and is not eligible. Inside a pop-out
 viewport a double-click toggles that window's fullscreen like F11 (`popout.rs`, registered before the chrome).
+
+**The fullscreen stream carries the pop-out's overlay** (2026-11-03, task #106): `App::draw` calls
+`popout::fullscreen_overlay` after the double-click `interact`, which runs the *same* `popout::chrome`
+(hover-gated vignette, statbar `[dot][sharer · room][WxH][dec/pres fps][bitrate]`, audio pill or "No audio
+shared" chip) and the same always-visible centre chip (waiting / recovering / sharer stalled), and shows
+it while the pointer is anywhere in the window. Differences: the top-right round button is
+`fullscreen_exit` ("Exit fullscreen", pushes `ExitStreamFullscreen`) instead of the pop-out's `close`
+("bring back to its tile"; pop-out-only), and volume edits go straight out as `UiAction::SetVolume`
+instead of through `Shared::pending_volume` (the data is collected per frame with `collect_info`, no 4x/s
+refresh). *Why:* user request 2026-11-03: "the same overlay, that a fullscreened pop-out has, should be
+there when i fullscreen a screenshare inside of the main window". One `chrome` function serves both so
+the two cannot drift apart.
 *Why:* user request 2026-10-15 ("double clicking a share should actually full-screen it"). *Why a mode of
 the main window and not a new viewport:* the pop-out already exists for "own window"; this is the quick
 "fill my screen" gesture and must restore the layout (scroll, selection) untouched. Test:
