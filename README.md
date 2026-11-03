@@ -37,7 +37,7 @@ sudo pacman -S --needed rust base-devel pkgconf \
 - **GPU drivers**: a Vulkan driver (`vulkan-radeon`, `vulkan-intel` or `nvidia-utils`) for rendering, and a
   VA-API driver for hardware encode/decode: `mesa` (AMD, already includes it) or `intel-media-driver` (Intel).
   Without VA-API the client falls back to software x264/libav, which is too slow for high fps.
-- `pw-loopback`/`pw-link`/`pw-dump` (per-app audio) come with `pipewire-pulse` / `pipewire`.
+- `pw-cli`/`pw-link`/`pw-dump` (per-app audio) come with `pipewire-pulse` / `pipewire`.
 
 </details>
 
@@ -55,7 +55,7 @@ a second client or the browser client. Details: [`client/README.md`](client/READ
 
 - **Linux (recommended):** run `ritz-get install simple-screensharing` (or, without ritz-get, clone this repo and
   run `./install.sh --install`; `./install.sh --remove` uninstalls it again), then start `simple-screensharing`.
-  It builds the native client from source and needs PipeWire (incl. `pw-loopback`) and the GStreamer
+  It builds the native client from source and needs PipeWire (incl. `pw-cli`) and the GStreamer
   pipewire/good/bad/libav plugins at runtime. You also need a relay (self-host one from this repo, or use a
   friend's); the app takes a join link.
 - **Linux AppImage:** `./build-appimage.sh` builds `dist/simple-screensharing-client-x86_64.AppImage`

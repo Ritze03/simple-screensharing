@@ -90,6 +90,62 @@ tests). If a sink refuses the chain the symptom is a pipeline error in the log (
 **Tuning knobs if it sounds wrong** (all constants at the top of `leveller.rs` / `leveller.js`, keep them in step):
 `TARGET_DB`, `RISE_DB_PER_S`, `GATE_DB`, `HEADROOM_DB`, `CEILING_DB`.
 
+## 2026-11-03: the share captures a private, self-clocked null sink instead of a `pw-loopback` (task #121)
+
+User report after #117: muting and unmuting works now, but *pausing* the video and playing it again is
+"broken the same way" (garbled audio until the source is selected again).
+
+**Evidence (user's read-only `pw-dump` filtered to `ssshare|Floorp`, `{id,state}`):** working and broken-after-pause
+are identical: the same four node ids (271, 277, 379, 314), all `running`. So on pause Firefox neither destroys its
+stream node (the #117 path) nor does it go `idle`/`suspended`; the first idea of this task (treat a linked node
+that goes idle as a gap) was written, then dropped on this data. Graph settings read at the same time:
+`clock.rate 48000`, `allowed-rates [44100 48000]`, `quantum 1024`, `min-quantum 1024`, `max-quantum 2048`.
+Something upstream changes on pause/resume while every node keeps running (the working guess: the stream's
+latency/rate request, hence the quantum or rate the group runs at), and a `pw-loopback`'s capture side, a stream
+with no rate, no latency and no clock of its own (`dsp`/F32P, `resample.disable=true`), did not survive it. That
+is still a hypothesis: it was not measured (no audio tests may be run), only the consequences are known.
+
+**Change (`audio.rs`): own the clock.** `spawn_sink` replaces `spawn_loopback`. A `pw-cli` child is kept alive on a
+stdin pipe and told `create-node adapter { factory.name=support.null-audio-sink ... }` (`sink_create_command`):
+`media.class=Audio/Sink`, `audio.rate=48000`, stereo `[ FL FR ]`, `node.driver=true` (its own timer clock),
+`node.always-process=true` (scheduled even with nothing linked), `node.pause-on-idle=false` and
+`session.suspend-timeout-seconds=0` (never suspended while the source is quiet), `node.virtual=true` and
+`priority.session=0` (never the default sink next to real devices at 1000+), `object.linger=false`. The app's
+output ports are `pw-link`ed into the sink's *input* ports exactly as they were into the loopback input
+(`link_poll_loop`, `sync_links`, `gap_decision`, `rebuild_chain` are unchanged apart from spawning the sink), and
+the capture pipeline reads the sink's *monitor*: `pipewiresrc target-object=<sink serial>
+stream-properties="props,stream.capture.sink=true"` (`sink_monitor_source`; the way a PulseAudio client reads
+`<sink>.monitor`; `wait_for_capture_link` still proves the capture stream is linked from the sink node, so the
+microphone trap stays shut). Whatever the source then does (pause, vanish, a different latency or rate), PipeWire
+adapts each input to the sink, and the capture side sees one steady 48 kHz stereo stream from a node that does not
+depend on the source being alive.
+
+*Why `pw-cli` on a pipe:* the node must die with the app, including a crash. A node created by a `pw-cli`
+connection with `object.linger=false` is destroyed when the connection ends; `pw-cli` has no tty check
+(`main`: interactive iff no command arguments; it reads stdin lines and quits on EOF), so keeping its stdin pipe
+open keeps the sink; `PR_SET_PDEATHSIG` (`die_with_parent`) and the pipe closing cover SIGKILL. The alternative,
+`pactl load-module module-null-sink`, persists in the daemon until unloaded and would need a stale-sink sweep at
+every start. *Why not stay with a tuned `pw-loopback`:* its capture side is a stream whose clock is someone
+else's; the properties that would help (`node.always-process`, `node.passive`) cannot be validated without
+creating an audio stream, whereas the null-sink factory is the documented way to get a node with its own clock.
+
+Kept as the safety net: the #117 gap/rebuild (it now rebuilds a sink + pipeline). Kept: #118 mute.
+
+**Side effects to know:** the sink is a real `Audio/Sink` named `ssshare-sink-<stream>-<uuid>` (description
+`simple-screensharing-audio-capture`), so it is listed by `pw-link`/`pw-dump` and by pavucontrol while a share
+runs. It is not hideable (the monitor needs the class); it never becomes the default sink and disappears when the
+share stops or the app dies. The client now needs `pw-cli` instead of `pw-loopback` (`check-deps.sh`, AppRun,
+packaging notes updated).
+
+**NOT verified live (hard rule: no audio nodes):** the `create-node` line, that the sink gets its input and
+monitor ports, that `stream.capture.sink=true` links the monitor to the capture stream, and above all that
+pause/resume no longer garbles. Unit tests cover the property set (`the_sink_create_command_describes_a_self_clocked_owned_virtual_sink`),
+the source description and that it parses into a `pipewiresrc` carrying the property
+(`the_capture_source_reads_the_sinks_monitor`), and the fixture-based sink lookup / readiness / capture-link
+checks on an `Audio/Sink` node. If it still breaks, run *while paused* and again after resuming:
+`pw-dump | jq '.[] | select((.info.props["node.name"]? // "") | test("ssshare|Floorp"; "i")) | {id, type, state: .info.state, name: .info.props["node.name"], driver: .info.props["node.driver-id"], lat: .info.props["node.latency"]}'`,
+`pw-link -l`, `pw-top -b -n 2`, and `pw-metadata -n settings`.
+
 ## 2026-11-03: audio broken after the source's stream disappears and comes back (task #117)
 
 User report: sharing Floorp (YouTube) audio, muting the tab for a moment and unmuting (also: closing and

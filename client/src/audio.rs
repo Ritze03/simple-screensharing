@@ -1,9 +1,9 @@
-//! Per-application audio capture: a PipeWire virtual loopback (`pw-loopback`)
-//! + non-destructive port linking (`pw-link`) taps a specific application's
-//! *existing* audio output, without touching its normal routing, and the
-//! resulting virtual source is Opus-encoded (GStreamer) → AEAD-encrypted →
-//! fragmented → sent, over the same QUIC media-datagram plane `capture.rs`
-//! uses for video (see `net.rs` / `fragment.rs`).
+//! Per-application audio capture: a private PipeWire null sink owned by a
+//! `pw-cli` process + non-destructive port linking (`pw-link`) taps a
+//! specific application's *existing* audio output, without touching its
+//! normal routing, and the sink's monitor is Opus-encoded (GStreamer) →
+//! AEAD-encrypted → fragmented → sent, over the same QUIC media-datagram
+//! plane `capture.rs` uses for video (see `net.rs` / `fragment.rs`).
 //!
 //! # Approach
 //!
@@ -19,30 +19,26 @@
 //!    1.6.8), not assumed from documentation. The list is deduplicated by
 //!    name: the UI choice is a *name*, and every stream with that name is
 //!    mixed into the share (task #105, see step 3).
-//! 2. [`start_audio_sharing`] spawns a `pw-loopback` process. Undecorated,
-//!    `pw-loopback --name X` creates *two* stream nodes: `input.X`
-//!    (`Stream/Input/Audio`, i.e. something other nodes can send audio
-//!    *into*) and `output.X` (`Stream/Output/Audio`, i.e. something that can
-//!    be captured *from*) — verified live on this machine via `pw-dump`.
-//!    Both default to `node.autoconnect=true`, which would otherwise route
-//!    `input.X` from the system's default mic and `output.X` out to the
-//!    system's default speakers; both are disabled here
-//!    (`-i node.autoconnect=false -o node.autoconnect=false`) since this
-//!    loopback exists purely as a private tap, not a real playback/capture
-//!    device.
+//! 2. [`start_audio_sharing`] spawns a `pw-cli` process that creates a
+//!    `support.null-audio-sink` (`Audio/Sink`, [`sink_create_command`]) and
+//!    keeps it alive (task #121; until then a `pw-loopback`, whose capture
+//!    side had no clock of its own and came out broken after the source
+//!    paused). The sink is self-clocked, fixed at 48 kHz stereo, never the
+//!    default sink, and dies with the `pw-cli` connection.
 //! 3. The target application's existing *output* ports are `pw-link`ed into
-//!    `input.X`'s *input* ports (by numeric port id — `pw-link <id> <id>`
+//!    the sink's *input* ports (by numeric port id — `pw-link <id> <id>`
 //!    works directly, verified live, and sidesteps channel-name/count
 //!    mismatches that string-pattern port names could hit). This is
 //!    additive. *Every* stream named like the chosen source is linked into the
-//!    same `input.X` (the loopback mixes them), and [`link_poll_loop`] re-checks
+//!    same sink (it mixes them), and [`link_poll_loop`] re-checks
 //!    once a second to link streams that appear later and forget ones that
 //!    vanished. The application's original routing (e.g. to real speakers)
 //!    is completely untouched — confirmed live by watching `pw-link -l`
 //!    show both the original link and the new one simultaneously.
-//! 4. `output.X` is then captured like any normal PipeWire audio source:
-//!    `pipewiresrc target-object=<output.X's object.serial> ! audioconvert
-//!    ! audioresample ! volume ! level ! opusenc ! appsink`, and the
+//! 4. The sink's monitor is then captured: `pipewiresrc
+//!    target-object=<sink's object.serial> stream-properties=props,stream.capture.sink=true
+//!    ! audioconvert ! audioresample ! volume ! level ! opusenc ! appsink`
+//!    ([`sink_monitor_source`]), and the
 //!    resulting link is then *verified* against `pw-dump` before the stream
 //!    is announced ([`wait_for_capture_link`]). **`target-object` and the
 //!    `object.serial`, not `path` and the registry node id** — see
@@ -85,10 +81,10 @@ use crate::fragment::fragment_frame;
 use crate::net::{encrypt_frame, ScreenshareClient};
 use crate::protocol::StreamKind;
 
-/// Prefix every `pw-loopback --name` this module creates uses, so
-/// [`list_audio_sources`] can recognize and exclude our own loopback nodes
+/// Prefix every sink / capture-stream name this module creates uses, so
+/// [`list_audio_sources`] can recognize and exclude our own nodes
 /// (they otherwise show up as `Stream/Output/Audio` too, once running).
-const LOOPBACK_NAME_PREFIX: &str = "ssshare-loopback-";
+const SINK_NAME_PREFIX: &str = "ssshare-sink-";
 
 /// Ensures `gst::init()` runs exactly once no matter how many times
 /// [`start_audio_sharing`] is called — same pattern as `capture.rs`'s
@@ -183,7 +179,7 @@ pub struct AudioSource {
 /// Lists every application currently producing audio: PipeWire nodes with
 /// `media.class = "Stream/Output/Audio"` (confirmed against this machine's
 /// real `pw-dump` output — see module docs), excluding this module's own
-/// loopback nodes (see [`LOOPBACK_NAME_PREFIX`]) so an in-progress audio
+/// loopback nodes (see [`SINK_NAME_PREFIX`]) so an in-progress audio
 /// share doesn't list itself as a shareable source.
 ///
 /// **One entry per name** (task #105): an app often has several streams with
@@ -218,7 +214,7 @@ fn link_diff(matching: &[u32], linked: &std::collections::HashSet<u32>) -> (Vec<
 }
 
 fn extract_audio_sources(objects: &[PwObject]) -> Vec<AudioSource> {
-    let loopback_output_prefix = format!("output.{LOOPBACK_NAME_PREFIX}");
+    let loopback_output_prefix = format!("output.{SINK_NAME_PREFIX}");
     let mut sources = Vec::new();
     for obj in objects {
         if obj.obj_type.as_deref() != Some("PipeWire:Interface:Node") {
@@ -270,43 +266,27 @@ fn node_port_ids(objects: &[PwObject], node_id: u64, direction: &str) -> Vec<u32
     ports.into_iter().map(|(_, id)| id).collect()
 }
 
-/// The two stream nodes one `pw-loopback --name <loopback_name>` process
-/// creates (see module docs for what each end is for).
-struct LoopbackNodes {
-    /// `output.<loopback_name>`, `Stream/Output/Audio` — what we capture
-    /// from via `pipewiresrc`. This is the *registry object id* (`pw-dump`'s
-    /// top-level `id`), which is what `pw-link` takes.
-    output_node_id: u32,
-    /// The same node's `object.serial`. A **different number** from
-    /// `output_node_id`, and the only one `pipewiresrc`'s `target-object`
-    /// understands — see [`build_pipeline`]'s doc comment for why getting
-    /// this wrong silently captured the microphone instead.
-    output_node_serial: u64,
-    /// `input.<loopback_name>`, `Stream/Input/Audio` — what we `pw-link`
-    /// the target application's output ports into.
-    input_node_id: u32,
+/// The private null sink one [`spawn_sink`] process creates (see module docs): the app's output
+/// ports are linked into its input ports and the capture pipeline reads its monitor.
+struct SinkNode {
+    /// The sink's *registry object id* (`pw-dump`'s top-level `id`), which is what `pw-link` and
+    /// the links in the graph (`link.output.node` of the monitor link) use.
+    node_id: u32,
+    /// The same node's `object.serial`. A **different number** from `node_id`, and the only one
+    /// `pipewiresrc`'s `target-object` understands — see [`build_pipeline`]'s doc comment for why
+    /// getting this wrong silently captured the microphone instead.
+    serial: u64,
 }
 
-fn find_loopback_nodes(objects: &[PwObject], loopback_name: &str) -> Option<LoopbackNodes> {
-    let output_name = format!("output.{loopback_name}");
-    let input_name = format!("input.{loopback_name}");
-    let mut output: Option<(u32, u64)> = None;
-    let mut input: Option<u32> = None;
-    for obj in objects {
+fn find_sink_node(objects: &[PwObject], sink_name: &str) -> Option<SinkNode> {
+    objects.iter().find_map(|obj| {
         if obj.obj_type.as_deref() != Some("PipeWire:Interface:Node") {
-            continue;
+            return None;
         }
-        let Some(info) = &obj.info else { continue };
-        let Some(props) = &info.props else { continue };
-        let Some(name) = prop_str(props, "node.name") else { continue };
-        if name == output_name {
-            output = Some((obj.id, prop_u64(props, "object.serial")?));
-        } else if name == input_name {
-            input = Some(obj.id);
-        }
-    }
-    let (output_node_id, output_node_serial) = output?;
-    Some(LoopbackNodes { output_node_id, output_node_serial, input_node_id: input? })
+        let props = obj.info.as_ref()?.props.as_ref()?;
+        (prop_str(props, "node.name")? == sink_name).then_some(())?;
+        Some(SinkNode { node_id: obj.id, serial: prop_u64(props, "object.serial")? })
+    })
 }
 
 /// The registry object id of the `pipewiresrc` capture stream node named
@@ -337,37 +317,70 @@ fn nodes_are_linked(objects: &[PwObject], output_node_id: u32, input_node_id: u3
 }
 
 // ---------------------------------------------------------------------
-// pw-loopback / pw-link process management
+// private null sink (pw-cli) / pw-link process management
 // ---------------------------------------------------------------------
 
-/// Spawns `pw-loopback --name <loopback_name> -i node.autoconnect=false -o
-/// node.autoconnect=false` as a long-lived background process — it must
-/// keep running for the duration of the capture; killing it (see
-/// [`AudioCaptureHandle::stop`]) is what tears the loopback (and its
-/// `pw-link` connections) down.
+/// The `pw-cli` line that creates the share's private sink (task #121). Pure, so the property
+/// set is unit-tested. `pw-cli` hands everything after the factory name to PipeWire's property
+/// parser, so values must not contain whitespace or `#`.
 ///
-/// The child is set to die with this process (see [`die_with_parent`]), so a
-/// SIGKILLed or crashed client cannot leave an orphaned `ssshare-loopback-…`
-/// node behind in the PipeWire graph.
-fn spawn_loopback(loopback_name: &str) -> Result<Child> {
-    let mut cmd = Command::new("pw-loopback");
-    cmd.args(["--name", loopback_name, "-i", "node.autoconnect=false", "-o", "node.autoconnect=false"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+/// Why a null sink the app owns instead of the `pw-loopback` of #105: a loopback's capture side
+/// has no clock of its own. It runs only while something drives it, so it fell to the dummy driver
+/// whenever the source stopped feeding it, and the chain came out broken after the source's pause
+/// (#121) or mute (#117). A `support.null-audio-sink` with `node.driver=true` is its own timer
+/// clock, `node.always-process` keeps it scheduled with nothing linked, and its `audio.rate` is
+/// fixed, so whatever the source does (pause, vanish, other latency or rate) PipeWire adapts each
+/// input to the sink and the capture side sees one steady 48 kHz stereo stream.
+///
+/// The sink must not attract anything else: `priority.session=0` keeps it from becoming the
+/// default sink next to a real device (real devices are 1000+), `node.virtual` marks it, and
+/// `session.suspend-timeout-seconds=0` / `node.pause-on-idle=false` stop the session manager
+/// from suspending it while the source is quiet.
+fn sink_create_command(sink_name: &str) -> String {
+    format!(
+        "create-node adapter {{ factory.name=support.null-audio-sink node.name={sink_name} \
+         node.description=simple-screensharing-audio-capture media.class=Audio/Sink \
+         audio.rate=48000 audio.channels=2 audio.position=[ FL FR ] \
+         node.virtual=true node.driver=true node.always-process=true node.pause-on-idle=false \
+         session.suspend-timeout-seconds=0 priority.session=0 object.linger=false }}"
+    )
+}
+
+/// Spawns a `pw-cli` that creates the share's private sink ([`sink_create_command`]) and stays
+/// alive: `pw-cli` reads commands from the stdin pipe we keep open (it does not check for a tty,
+/// and quits on EOF), and the node belongs to its connection and is destroyed when that
+/// connection ends (`object.linger=false`). Killing the child (see [`AudioCaptureHandle::stop`])
+/// therefore removes the sink and, with it, every `pw-link` into it.
+///
+/// The child is set to die with this process (see [`die_with_parent`]), and the stdin pipe also
+/// closes when this process dies, so a SIGKILLed or crashed client cannot leave an orphaned
+/// `ssshare-sink-…` node behind in the PipeWire graph.
+fn spawn_sink(sink_name: &str) -> Result<Child> {
+    use std::io::Write;
+    let mut cmd = Command::new("pw-cli");
+    cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
     die_with_parent(&mut cmd);
-    cmd.spawn().context("failed to spawn pw-loopback (is PipeWire's pw-loopback tool installed?)")
+    let mut child = cmd.spawn().context("failed to spawn pw-cli (is PipeWire's pw-cli tool installed?)")?;
+    let line = format!("{}\n", sink_create_command(sink_name));
+    let written = child.stdin.as_mut().ok_or_else(|| anyhow!("pw-cli has no stdin")).and_then(|s| {
+        s.write_all(line.as_bytes()).and_then(|()| s.flush()).context("failed to send create-node to pw-cli")
+    });
+    if let Err(e) = written {
+        kill_and_wait(&mut child);
+        return Err(e);
+    }
+    Ok(child)
 }
 
 /// Makes `cmd`'s child receive SIGTERM when its parent dies, however the
 /// parent dies (including SIGKILL, which no `Drop` or signal handler of ours
 /// can intercept). Linux only (`PR_SET_PDEATHSIG`); a no-op elsewhere.
 ///
-/// `Why:` `pw-loopback` is a long-lived helper process. Before this, killing
+/// `Why:` the `pw-cli` (formerly `pw-loopback`) that owns the sink is a long-lived helper. Killing
 /// the client with SIGKILL (or a crash) left it running as an orphan
-/// (ppid 1) with its `ssshare-loopback-…` nodes still in the PipeWire graph;
+/// (ppid 1) with its `ssshare-sink-…` nodes still in the PipeWire graph;
 /// it happened twice overnight and the orphans held other sessions' locks.
-/// `pw-loopback` quits cleanly on SIGTERM.
+/// `pw-cli` quits cleanly on SIGTERM.
 ///
 /// Caveat: the kernel ties the signal to the *thread* that spawned the child,
 /// not the process. That is fine for the callers here (tokio runtime worker
@@ -419,9 +432,9 @@ fn die_with_parent(_cmd: &mut Command) {}
 /// used to) let `start_audio_sharing` race ahead into linking before the
 /// ports existed, intermittently failing right after a freshly-spawned
 /// loopback.
-fn loopback_readiness(objects: &[PwObject], loopback_name: &str) -> Option<LoopbackNodes> {
-    let nodes = find_loopback_nodes(objects, loopback_name)?;
-    let input_ports = node_port_ids(objects, nodes.input_node_id as u64, "input");
+fn loopback_readiness(objects: &[PwObject], loopback_name: &str) -> Option<SinkNode> {
+    let nodes = find_sink_node(objects, loopback_name)?;
+    let input_ports = node_port_ids(objects, nodes.node_id as u64, "input");
     if input_ports.is_empty() {
         return None;
     }
@@ -441,7 +454,7 @@ fn loopback_readiness(objects: &[PwObject], loopback_name: &str) -> Option<Loopb
 /// Returns the snapshot the readiness check last succeeded against
 /// alongside the resolved node ids, so the caller can link straight from it
 /// without an extra `pw-dump` round trip.
-async fn wait_for_loopback_ready(loopback_name: &str, timeout: Duration) -> Result<(Vec<PwObject>, LoopbackNodes)> {
+async fn wait_for_loopback_ready(loopback_name: &str, timeout: Duration) -> Result<(Vec<PwObject>, SinkNode)> {
     let deadline = Instant::now() + timeout;
     loop {
         let objects = run_pw_dump()?;
@@ -449,7 +462,7 @@ async fn wait_for_loopback_ready(loopback_name: &str, timeout: Duration) -> Resu
             return Ok((objects, nodes));
         }
         if Instant::now() >= deadline {
-            bail!("timed out waiting for pw-loopback '{loopback_name}' to appear in the PipeWire graph");
+            bail!("timed out waiting for the null sink '{loopback_name}' to appear in the PipeWire graph");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -475,7 +488,7 @@ fn link_source_into_loopback(objects: &[PwObject], source_node_id: u32, loopback
         bail!("audio source node {source_node_id} has no output ports to link (it may have stopped producing audio)");
     }
     if sink_ports.is_empty() {
-        bail!("loopback sink node {loopback_input_node_id} has no input ports");
+        bail!("sink node {loopback_input_node_id} has no input ports");
     }
 
     let pair_count = source_ports.len().min(sink_ports.len());
@@ -549,16 +562,16 @@ struct Chain {
 /// does). Returns the new loopback input node id and the linked set. On error the old loopback
 /// process is still held by the handle; the poll retries next tick.
 async fn rebuild_chain(chain: &Chain, name: &str) -> Result<(u32, std::collections::HashSet<u32>)> {
-    let loopback_name = format!("{LOOPBACK_NAME_PREFIX}{}-{}", chain.stream_id, uuid::Uuid::new_v4().simple());
-    let mut new_child = ChildGuard(Some(spawn_loopback(&loopback_name)?));
+    let loopback_name = format!("{SINK_NAME_PREFIX}{}-{}", chain.stream_id, uuid::Uuid::new_v4().simple());
+    let mut new_child = ChildGuard(Some(spawn_sink(&loopback_name)?));
     let (objects, lb) = wait_for_loopback_ready(&loopback_name, Duration::from_secs(5)).await?;
     let mut linked = std::collections::HashSet::new();
-    sync_links(&objects, name, lb.input_node_id, &mut linked);
+    sync_links(&objects, name, lb.node_id, &mut linked);
 
     let capture_node_name = format!("{loopback_name}-cap");
     let src = chain.pipeline.by_name("src").ok_or_else(|| anyhow!("pipeline has no element named 'src'"))?;
     chain.pipeline.set_state(gst::State::Null).context("failed to stop the audio pipeline for a rebuild")?;
-    src.set_property("target-object", lb.output_node_serial.to_string());
+    src.set_property("target-object", lb.serial.to_string());
     src.set_property("client-name", capture_node_name.as_str());
     chain.pipeline.set_state(gst::State::Playing).context("failed to restart the audio pipeline")?;
     let (state, _, _) = chain.pipeline.state(gst::ClockTime::from_seconds(5));
@@ -568,12 +581,12 @@ async fn rebuild_chain(chain: &Chain, name: &str) -> Result<(u32, std::collectio
         sender_clock_offset_us(chain.pipeline.current_running_time().map(|t| t.useconds()).unwrap_or(0), Instant::now()),
         Ordering::Relaxed,
     );
-    wait_for_capture_link(&capture_node_name, lb.output_node_id, Duration::from_secs(5)).await?;
+    wait_for_capture_link(&capture_node_name, lb.node_id, Duration::from_secs(5)).await?;
 
     let mut old = std::mem::replace(&mut *chain.loopback_child.lock().unwrap_or_else(|p| p.into_inner()), new_child.0.take().expect("set above"));
     kill_and_wait(&mut old);
     tracing::info!("audio share '{name}': rebuilt the loopback ({loopback_name}) after the source reappeared");
-    Ok((lb.input_node_id, linked))
+    Ok((lb.node_id, linked))
 }
 
 /// Once a second, re-lists the graph and links streams that now carry the
@@ -620,7 +633,7 @@ async fn link_poll_loop(name: String, mut loopback_input_node_id: u32, mut linke
 
 fn kill_and_wait(child: &mut Child) {
     if let Err(e) = child.kill() {
-        tracing::warn!("error killing pw-loopback process: {e}");
+        tracing::warn!("error killing the sink-owning pw-cli process: {e}");
     }
     let _ = child.wait();
 }
@@ -693,7 +706,9 @@ fn level_db_array(structure: &gst::StructureRef, field: &str) -> Option<Vec<f64>
 // GStreamer pipeline construction
 // ---------------------------------------------------------------------
 
-/// Builds the Opus capture pipeline that taps `output.<loopback_name>`.
+/// Builds the Opus capture pipeline that taps the monitor of the share's null sink
+/// ([`sink_monitor_source`]). (Before #121 it tapped a `pw-loopback`'s `output.<name>`; the
+/// numbers below were measured on that node, the serial-vs-id point is the same.)
 ///
 /// # Why `target-object=<object.serial>`, and not `path=<node id>`
 ///
@@ -727,8 +742,8 @@ fn level_db_array(structure: &gst::StructureRef, field: &str) -> Option<Vec<f64>
 /// it, `audioconvert`'s wide-open sink caps let PipeWire negotiate **mono**
 /// and link only `output_FL` — verified live (`ssshare-cap2:input_MONO`),
 /// i.e. music shared through this path silently lost its right channel.
-/// The loopback is always created with `pw-loopback`'s default `[FL, FR]`
-/// channel map, so requesting 2 channels here can't over-ask.
+/// The sink is always created with a `[FL FR]` channel map ([`sink_create_command`]), so
+/// requesting 2 channels here can't over-ask.
 ///
 /// The `level` element sits on the decoded-PCM side (it only understands
 /// `audio/x-raw`, so it has to be before `opusenc`) and posts an element
@@ -749,11 +764,19 @@ fn level_db_array(structure: &gst::StructureRef, field: &str) -> Option<Vec<f64>
 ///
 /// `volume name=gain` + `rglimiter` ([`GAIN_STAGE`]) sit before the mute and the meter: the
 /// sender-side boost of Settings (task #114, `audio_gain.rs`), so the meter shows what is sent.
-fn build_pipeline(loopback_output_node_serial: u64, capture_node_name: &str, gain: f64, muted: bool) -> Result<BuiltPipeline> {
-    build_pipeline_from_source(
-        &format!("pipewiresrc name=src target-object={loopback_output_node_serial} client-name={capture_node_name} do-timestamp=true"),
-        gain,
-        muted,
+fn build_pipeline(sink_serial: u64, capture_node_name: &str, gain: f64, muted: bool) -> Result<BuiltPipeline> {
+    build_pipeline_from_source(&sink_monitor_source(sink_serial, capture_node_name), gain, muted)
+}
+
+/// The `pipewiresrc` that reads the monitor of the share's null sink (task #121).
+/// `stream.capture.sink=true` is what makes a capture stream whose target is a *sink* read that
+/// sink's monitor ports (without it PipeWire would look for a source of that name and the stream
+/// would fall to the default source, the microphone; [`wait_for_capture_link`] guards against
+/// that either way). Same mechanism PulseAudio clients use for `<sink>.monitor`.
+fn sink_monitor_source(sink_serial: u64, capture_node_name: &str) -> String {
+    format!(
+        "pipewiresrc name=src target-object={sink_serial} client-name={capture_node_name} \
+         stream-properties=\"props,stream.capture.sink=true\" do-timestamp=true"
     )
 }
 
@@ -911,7 +934,7 @@ async fn wait_for_capture_link(
             last_capture_node = Some(capture_node_id);
             if nodes_are_linked(&objects, loopback_output_node_id, capture_node_id) {
                 tracing::info!(
-                    "audio capture stream '{capture_node_name}' (node {capture_node_id}) is linked to loopback output node {loopback_output_node_id}"
+                    "audio capture stream '{capture_node_name}' (node {capture_node_id}) is linked to sink monitor node {loopback_output_node_id}"
                 );
                 return Ok(());
             }
@@ -919,7 +942,7 @@ async fn wait_for_capture_link(
         if Instant::now() >= deadline {
             match last_capture_node {
                 Some(id) => bail!(
-                    "audio capture stream '{capture_node_name}' (node {id}) never linked to the loopback \
+                    "audio capture stream '{capture_node_name}' (node {id}) never linked to the sink \
                      output node {loopback_output_node_id} — refusing to share, because a pipewiresrc that \
                      misses its target silently captures the default source (the microphone) instead"
                 ),
@@ -982,9 +1005,9 @@ pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, sour
 
     // stream_id + a random suffix: unique even if two audio shares started
     // in quick succession reuse a stream_id across reconnects.
-    let loopback_name = format!("{LOOPBACK_NAME_PREFIX}{stream_id}-{}", uuid::Uuid::new_v4().simple());
+    let loopback_name = format!("{SINK_NAME_PREFIX}{stream_id}-{}", uuid::Uuid::new_v4().simple());
 
-    let mut loopback_child = spawn_loopback(&loopback_name)?;
+    let mut loopback_child = spawn_sink(&loopback_name)?;
 
     let (objects, loopback) = match wait_for_loopback_ready(&loopback_name, Duration::from_secs(5)).await {
         Ok(v) => v,
@@ -999,11 +1022,11 @@ pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, sour
     // (re)appears. The capture pipeline reads only the loopback's output, so
     // an unlinked loopback is silence, never the microphone.
     let mut linked = std::collections::HashSet::new();
-    sync_links(&objects, &source.name, loopback.input_node_id, &mut linked);
+    sync_links(&objects, &source.name, loopback.node_id, &mut linked);
 
     let capture_node_name = format!("{loopback_name}-cap");
     let BuiltPipeline { pipeline, sink: appsink, mute: mute_element, gain_stage } =
-        match build_pipeline(loopback.output_node_serial, &capture_node_name, gain, muted) {
+        match build_pipeline(loopback.serial, &capture_node_name, gain, muted) {
         Ok(v) => v,
         Err(e) => {
             kill_and_wait(&mut loopback_child);
@@ -1029,7 +1052,7 @@ pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, sour
     // ...and then confirm it is capturing *the loopback* and not whatever
     // the session manager felt like connecting it to. See
     // `wait_for_capture_link` for why reaching PLAYING is not enough.
-    if let Err(e) = wait_for_capture_link(&capture_node_name, loopback.output_node_id, Duration::from_secs(5)).await {
+    if let Err(e) = wait_for_capture_link(&capture_node_name, loopback.node_id, Duration::from_secs(5)).await {
         let _ = pipeline.set_state(gst::State::Null);
         kill_and_wait(&mut loopback_child);
         return Err(e);
@@ -1057,7 +1080,7 @@ pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, sour
     let pump_task = tokio::spawn(pump_loop(pump_client, stream_id, stream, bus_stream, level.clone(), pts_offset_us.clone()));
     let loopback_child = Arc::new(Mutex::new(loopback_child));
     let chain = Chain { stream_id, pipeline: pipeline.clone(), loopback_child: loopback_child.clone(), pts_offset_us };
-    let link_task = tokio::spawn(link_poll_loop(source.name.clone(), loopback.input_node_id, linked, chain));
+    let link_task = tokio::spawn(link_poll_loop(source.name.clone(), loopback.node_id, linked, chain));
 
     // No width/height for audio (spec's AnnounceStream fields exist for
     // video streams' benefit); 0x0 signals "not applicable".
@@ -1763,15 +1786,13 @@ mod tests {
     /// A trimmed-down but structurally real `pw-dump` fixture (shapes
     /// copied from actual output captured on this dev machine — PipeWire
     /// 1.6.8 — via `gst-launch-1.0 audiotestsrc ! pipewiresink` plus a
-    /// `pw-loopback` instance) exercising:
+    /// `pw-loopback` instance; the sink node mirrors a `support.null-audio-sink`,
+    /// shaped from the loopback nodes, not captured live: #121 forbids creating one) exercising:
     ///   - a real application's `Stream/Output/Audio` node + its 2 output
     ///     ports (`test-audio-app`, node id 262, ports 284/279),
-    ///   - a `Stream/Input/Audio` node that must NOT be listed (wrong
-    ///     class),
-    ///   - this module's own loopback output node (`output.ssshare-loopback-…`)
-    ///     that must NOT be listed (self-filtering),
-    ///   - the loopback's `input.ssshare-loopback-…` node + its 2 input
-    ///     ports, for [`find_loopback_nodes`]/[`node_port_ids`].
+    ///   - the share's null sink (`Audio/Sink`, node 319, serial 18643) with its 2 input
+    ///     ports and a monitor output port, which must NOT be listed as a source,
+    ///   - the capture stream (`Stream/Input/Audio`, 700) linked to the sink's monitor.
     fn fixture_objects() -> Vec<PwObject> {
         let json = r#"[
             {
@@ -1807,8 +1828,9 @@ mod tests {
                 "type": "PipeWire:Interface:Node",
                 "info": {
                     "props": {
-                        "media.class": "Stream/Input/Audio",
-                        "node.name": "input.ssshare-loopback-3-abc123"
+                        "media.class": "Audio/Sink",
+                        "node.name": "ssshare-sink-3-abc123",
+                        "object.serial": 18643
                     }
                 }
             },
@@ -1829,14 +1851,11 @@ mod tests {
                 }
             },
             {
-                "id": 262,
-                "type": "PipeWire:Interface:Node",
+                "id": 321,
+                "type": "PipeWire:Interface:Port",
                 "info": {
-                    "props": {
-                        "media.class": "Stream/Output/Audio",
-                        "node.name": "output.ssshare-loopback-3-abc123",
-                        "object.serial": 18643
-                    }
+                    "direction": "output",
+                    "props": { "node.id": 319, "port.id": 2, "port.name": "monitor_FL", "port.monitor": true }
                 }
             },
             {
@@ -1845,7 +1864,7 @@ mod tests {
                 "info": {
                     "props": {
                         "media.class": "Stream/Input/Audio",
-                        "node.name": "ssshare-loopback-3-abc123-cap",
+                        "node.name": "ssshare-sink-3-abc123-cap",
                         "object.serial": 18700
                     }
                 }
@@ -1855,8 +1874,8 @@ mod tests {
                 "type": "PipeWire:Interface:Link",
                 "info": {
                     "props": {
-                        "link.output.node": 262,
-                        "link.output.port": 284,
+                        "link.output.node": 319,
+                        "link.output.port": 321,
                         "link.input.node": 700,
                         "link.input.port": 699
                     }
@@ -1908,8 +1927,8 @@ mod tests {
         assert_eq!(node_ids_named(&objects, "Firefox"), vec![10, 11]);
         assert_eq!(node_ids_named(&objects, "Spotify"), vec![20]);
         assert!(node_ids_named(&objects, "Discord").is_empty());
-        // The real fixture's own loopback output is never matched, whatever the name.
-        assert!(node_ids_named(&fixture_objects(), "output.ssshare-loopback-3-abc123").is_empty());
+        // The real fixture's own sink is never matched, whatever the name.
+        assert!(node_ids_named(&fixture_objects(), "ssshare-sink-3-abc123").is_empty());
     }
 
     #[test]
@@ -1949,11 +1968,11 @@ mod tests {
     fn loopback_readiness_requires_both_node_and_ports() {
         let ready = fixture_objects();
         assert!(
-            loopback_readiness(&ready, "ssshare-loopback-3-abc123").is_some(),
+            loopback_readiness(&ready, "ssshare-sink-3-abc123").is_some(),
             "fixture has both loopback nodes and the input node's ports — should be ready"
         );
 
-        // Both loopback nodes are present, but neither has any ports yet —
+        // The sink node is present, but has no ports yet —
         // the exact shape of a `pw-dump` snapshot caught mid-race, per the
         // module docs' root-cause note (node and port globals are separate
         // registry events).
@@ -1962,20 +1981,13 @@ mod tests {
                 "id": 500,
                 "type": "PipeWire:Interface:Node",
                 "info": {
-                    "props": { "media.class": "Stream/Input/Audio", "node.name": "input.ssshare-loopback-9-xyz" }
-                }
-            },
-            {
-                "id": 501,
-                "type": "PipeWire:Interface:Node",
-                "info": {
-                    "props": { "media.class": "Stream/Output/Audio", "node.name": "output.ssshare-loopback-9-xyz" }
+                    "props": { "media.class": "Audio/Sink", "node.name": "ssshare-sink-9-xyz", "object.serial": 5000 }
                 }
             }
         ]"#;
         let node_only: Vec<PwObject> = serde_json::from_str(node_only_json).expect("fixture JSON should parse");
         assert!(
-            loopback_readiness(&node_only, "ssshare-loopback-9-xyz").is_none(),
+            loopback_readiness(&node_only, "ssshare-sink-9-xyz").is_none(),
             "nodes exist but have no ports yet — must not be considered ready"
         );
 
@@ -1985,12 +1997,13 @@ mod tests {
     }
 
     #[test]
-    fn find_loopback_nodes_matches_output_and_input_prefixed_names() {
+    fn find_sink_node_matches_the_sink_by_node_name() {
         let objects = fixture_objects();
-        let nodes = find_loopback_nodes(&objects, "ssshare-loopback-3-abc123").expect("both nodes present in fixture");
-        assert_eq!(nodes.output_node_id, 262);
-        assert_eq!(nodes.input_node_id, 319);
-        assert!(find_loopback_nodes(&objects, "no-such-loopback").is_none());
+        let nodes = find_sink_node(&objects, "ssshare-sink-3-abc123").expect("sink present in fixture");
+        assert_eq!(nodes.node_id, 319);
+        // The capture stream `<name>-cap` is not the sink.
+        assert!(find_sink_node(&objects, "ssshare-sink-3-abc12").is_none());
+        assert!(find_sink_node(&objects, "no-such-loopback").is_none());
     }
 
     /// The registry object id and `object.serial` of the same node are
@@ -1999,11 +2012,11 @@ mod tests {
     /// shared instead of the chosen application). Pinning both here keeps
     /// the two from being quietly conflated again.
     #[test]
-    fn find_loopback_nodes_reports_the_object_serial_not_the_registry_id() {
+    fn find_sink_node_reports_the_object_serial_not_the_registry_id() {
         let objects = fixture_objects();
-        let nodes = find_loopback_nodes(&objects, "ssshare-loopback-3-abc123").expect("both nodes present in fixture");
-        assert_eq!(nodes.output_node_serial, 18643);
-        assert_ne!(nodes.output_node_serial, nodes.output_node_id as u64);
+        let nodes = find_sink_node(&objects, "ssshare-sink-3-abc123").expect("sink present in fixture");
+        assert_eq!(nodes.serial, 18643);
+        assert_ne!(nodes.serial, nodes.node_id as u64);
     }
 
     /// The guard that catches "`pipewiresrc` connected to something, but not
@@ -2011,14 +2024,62 @@ mod tests {
     #[test]
     fn capture_link_check_accepts_the_real_link_and_rejects_a_missing_one() {
         let objects = fixture_objects();
-        let capture_node = find_capture_node(&objects, "ssshare-loopback-3-abc123-cap").expect("capture node in fixture");
+        let capture_node = find_capture_node(&objects, "ssshare-sink-3-abc123-cap").expect("capture node in fixture");
         assert_eq!(capture_node, 700);
-        assert!(find_capture_node(&objects, "ssshare-loopback-9-nope-cap").is_none());
+        assert!(find_capture_node(&objects, "ssshare-sink-9-nope-cap").is_none());
 
-        assert!(nodes_are_linked(&objects, 262, capture_node), "the fixture's loopback->capture link should be found");
+        assert!(nodes_are_linked(&objects, 319, capture_node), "the fixture's sink-monitor->capture link should be found");
         // Same nodes, wrong direction, and a node pair with no link at all.
-        assert!(!nodes_are_linked(&objects, capture_node, 262));
-        assert!(!nodes_are_linked(&objects, 319, capture_node));
+        assert!(!nodes_are_linked(&objects, capture_node, 319));
+        assert!(!nodes_are_linked(&objects, 262, capture_node));
+    }
+
+    /// Task #121: the `pw-cli` line that creates the share's sink (never executed in tests: that
+    /// would create an audio node). It must be one line, name the null-sink factory and our node
+    /// name, make the sink self-clocked, fixed-rate, stereo, never the default and owned by the
+    /// `pw-cli` connection (no linger), and carry nothing `pw-cli` would mis-split (a `#` starts a
+    /// comment there, and the description must stay one token).
+    #[test]
+    fn the_sink_create_command_describes_a_self_clocked_owned_virtual_sink() {
+        let c = sink_create_command("ssshare-sink-3-abc123");
+        assert!(!c.contains('\n') && !c.contains('#'), "{c}");
+        assert!(c.starts_with("create-node adapter { ") && c.ends_with(" }"), "{c}");
+        let body = c.trim_start_matches("create-node adapter { ").trim_end_matches(" }").replace("[ FL FR ]", "[FL,FR]");
+        let props: std::collections::HashMap<&str, &str> = body
+            .split_whitespace()
+            .map(|kv| kv.split_once('=').unwrap_or_else(|| panic!("not key=value: {kv}")))
+            .collect();
+        let expect = [
+            ("factory.name", "support.null-audio-sink"),
+            ("node.name", "ssshare-sink-3-abc123"),
+            ("media.class", "Audio/Sink"),
+            ("audio.rate", "48000"),
+            ("audio.channels", "2"),
+            ("audio.position", "[FL,FR]"),
+            ("node.driver", "true"),
+            ("node.always-process", "true"),
+            ("node.virtual", "true"),
+            ("priority.session", "0"),
+            ("object.linger", "false"),
+            ("session.suspend-timeout-seconds", "0"),
+            ("node.pause-on-idle", "false"),
+        ];
+        for (k, v) in expect {
+            assert_eq!(props.get(k), Some(&v), "{k} in {c}");
+        }
+    }
+
+    /// Task #121: the capture element reads the sink's monitor (`stream.capture.sink`), by serial,
+    /// and its description parses into a real `pipewiresrc` whose `stream-properties` carry it.
+    /// Only constructed (state Null): no PipeWire stream is created.
+    #[test]
+    fn the_capture_source_reads_the_sinks_monitor() {
+        ensure_gstreamer_initialized().unwrap();
+        let d = sink_monitor_source(18643, "ssshare-sink-3-abc123-cap");
+        assert!(d.contains("target-object=18643") && d.contains("client-name=ssshare-sink-3-abc123-cap"), "{d}");
+        let el = gst::parse::launch(&d).expect("pipewiresrc description parses");
+        let props = el.property::<Option<gst::Structure>>("stream-properties").expect("stream-properties set");
+        assert!(props.to_string().contains("stream.capture.sink=(boolean)true"), "{props}");
     }
 
     /// Sanity-checks that the pipeline description this module builds is
@@ -2144,15 +2205,15 @@ mod tests {
             .find(|s| s.name.contains("ssshare-audio-test-live") || s.name == "audiotestsrc-live")
             .cloned();
 
-        let loopback_name = "ssshare-loopback-live-test";
-        let mut loopback_child = spawn_loopback(loopback_name).expect("failed to spawn pw-loopback");
+        let loopback_name = "ssshare-sink-live-test";
+        let mut loopback_child = spawn_sink(loopback_name).expect("failed to spawn pw-loopback");
         let (objects, nodes) = wait_for_loopback_ready(loopback_name, Duration::from_secs(5))
             .await
             .expect("loopback nodes and ports should appear");
 
         if let Some(source) = source {
-            link_source_into_loopback(&objects, source.id, nodes.input_node_id).expect("linking should succeed");
-            eprintln!("linked live source id={} name={:?} into loopback input node {}", source.id, source.name, nodes.input_node_id);
+            link_source_into_loopback(&objects, source.id, nodes.node_id).expect("linking should succeed");
+            eprintln!("linked live source id={} name={:?} into loopback input node {}", source.id, source.name, nodes.node_id);
         } else {
             eprintln!("did not find the synthetic test app by name; listed sources: {sources:?} — link step skipped");
         }

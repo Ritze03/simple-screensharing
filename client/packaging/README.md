@@ -49,7 +49,7 @@ cover the few host-tied pieces below. A curated plugin list (not linuxdeploy-plu
 | --- | --- |
 | GPU stack: Mesa / driver, Vulkan loader + ICD, libdrm, libGL/EGL | tied to the host's kernel driver and GPU; wgpu `dlopen`s `libvulkan.so.1` |
 | `libva` + the VA driver (`radeonsi`, `iHD`, ...) | the host's libva matches the host's drivers; a bundled one would look in the wrong directory / ABI. Missing libva = the VA elements do not load, the client falls back to x264 / libav |
-| PipeWire: daemon, `libpipewire-0.3.so.0`, and the tools `pw-loopback` / `pw-link` / `pw-dump` | the tools are executables the client spawns (`client/src/audio.rs`) and parses; a bundled copy of the whole client stack (libpipewire + modules + SPA + tools, tried) made the per-app audio list come back empty against a newer daemon, the host's own tools are what the client is tested with. Packages: `pipewire` (Arch), `pipewire-utils` (Fedora), `pipewire-bin` (Debian/Ubuntu) |
+| PipeWire: daemon, `libpipewire-0.3.so.0`, and the tools `pw-cli` / `pw-link` / `pw-dump` | the tools are executables the client spawns (`client/src/audio.rs`) and parses; a bundled copy of the whole client stack (libpipewire + modules + SPA + tools, tried) made the per-app audio list come back empty against a newer daemon, the host's own tools are what the client is tested with. Packages: `pipewire` (Arch), `pipewire-utils` (Fedora), `pipewire-bin` (Debian/Ubuntu) |
 | `xdg-desktop-portal` + a backend | the screen picker, a desktop component |
 | Wayland / X11 client libs, libxkbcommon, libudev, libdbus, libsystemd | tied to the compositor / session; winit loads them at runtime |
 | `libstdc++`, `libgcc_s`, glibc | host Mesa / Vulkan drivers loaded into our process need the host's (newer) ones; a bundled older libstdc++ would break them |
@@ -241,7 +241,7 @@ runtime is one fixed set for every distro, which is the point of the format.
 `--socket=fallback-x11`, `--share=ipc`, `--device=dri` (Vulkan for wgpu, VA-API for the hardware
 codecs), `--socket=pulseaudio` (playback through `pulsesink`), and
 `--filesystem=xdg-run/pipewire-0` (per-app audio sharing spawns the runtime's `pw-dump`,
-`pw-link`, `pw-loopback`, `client/src/audio.rs`; all three exist in the runtime, but audio
+`pw-link`, `pw-cli`, `client/src/audio.rs`; all three exist in the runtime, but audio
 sharing is NOT tested in the Flatpak: no audio tests, see `testing-and-verification.md`).
 Screen capture needs no permission: it goes through the xdg-desktop-portal ScreenCast API.
 No `--filesystem=home`. Config and data land in `~/.var/app/io.github.ritze03.SimpleScreensharing/`
