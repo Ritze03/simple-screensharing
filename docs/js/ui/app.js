@@ -73,6 +73,11 @@ function render() {
   if (S.modal) app.appendChild(renderModal());
   const layer = h("div", { class: "layer" });
   if (S.popup) layer.appendChild(renderPopup());
+  if (vpop) {
+    const vp = renderViewersPop();
+    if (vp) layer.appendChild(vp);
+    else vpop = null;
+  }
   app.appendChild(layer);
   app.appendChild(V({ cls: "toasts", g: 1, attrs: { role: "status", "aria-live": "polite" } },
     S.toasts.map((x) => H({ cls: "toast" + (x.err ? " err" : ""), g: 2 }, ic(x.icon), T(x.text)))));
@@ -100,6 +105,7 @@ function render() {
   }
   root.querySelectorAll('input[type="range"]').forEach(pct);
   if (S.popup) positionPopup();
+  if (vpop) positionViewersPop();
   patchLive();
   const c = root.querySelector(".p-center");
   if (c && !reflowing) {
@@ -335,6 +341,53 @@ function shareCard(r, s) {
         h("button", { class: "btn btn-secondary", type: "button", disabled: !canWatch || !popoutMode(), title: t("ui.room.pop_out_tip"), onclick: () => watchAndPop(r, s.key) }, ic("open_in_new"), t("ui.room.pop_out")))));
 }
 
+/* ---------- who watches my share: eye + count, a dropdown with avatar and name on hover (task #116) ---------- */
+
+let vpop = null; // { cap, room }: the open dropdown; it is rebuilt by every render, so it follows live changes
+const VIEWER_ROWS_MAX = 8;
+const viewerNames = (c, r) => c.dests.get(r.id)?.share?.viewers?.() ?? null;
+const closeViewersPop = () => { if (vpop) { vpop = null; render(); } };
+
+/** The viewer count chip of my own card; `null` when the relay does not report viewers (an older relay): no count rather than a wrong "0". */
+function viewersChip(c, r) {
+  const names = viewerNames(c, r);
+  if (!names) return null;
+  const chip = h("span", { class: "chip-dark viewers", "data-cap": c.id, "data-room": r.id }, ic("visibility"), String(names.length));
+  if (!names.length) {
+    chip.title = t("ui.room.viewers_none");
+    return chip;
+  }
+  chip.addEventListener("mouseenter", () => { if (!vpop || vpop.cap !== c.id || vpop.room !== r.id) { vpop = { cap: c.id, room: r.id }; render(); } });
+  return chip;
+}
+
+// Closes the dropdown as soon as the pointer is over neither the chip nor the dropdown. A document-level check, not
+// mouseleave on the elements: every render() replaces both, and a replaced element never gets its mouseleave.
+document.addEventListener("mousemove", (e) => { if (vpop && !e.target.closest?.(".vpop, .viewers")) closeViewersPop(); });
+
+function renderViewersPop() {
+  const c = S.captures.find((x) => x.id === vpop.cap);
+  const r = roomById(vpop.room);
+  const names = c && r ? viewerNames(c, r) : null;
+  if (!names || !names.length) return null;
+  const rows = names.slice(0, VIEWER_ROWS_MAX).map((n) => H({ cls: "vrow", g: 2 }, SL(22, h("span", { class: "avatar sm", style: avatarBg(n), text: initial(n) })), FILL(T(n))));
+  if (names.length > VIEWER_ROWS_MAX) rows.push(H({ cls: "vrow more", g: 0 }, T(`+${names.length - VIEWER_ROWS_MAX}`)));
+  const el = V({ cls: "vpop", g: 0 }, H({ cls: "ph", g: 0 }, T(`${t("ui.room.viewers_title").toUpperCase()} · ${names.length}`)), ...rows);
+  return el;
+}
+
+function positionViewersPop() {
+  const p = root.querySelector(".vpop");
+  const chip = vpop && root.querySelector(`.viewers[data-cap="${vpop.cap}"][data-room="${vpop.room}"]`);
+  if (!p) return;
+  if (!chip) { vpop = null; p.remove(); return; }
+  const cr = chip.getBoundingClientRect();
+  const pr = p.getBoundingClientRect();
+  p.style.left = Math.max(8, Math.min(cr.right - pr.width, window.innerWidth - pr.width - 8)) + "px";
+  const below = cr.bottom - 2; // overlaps the chip by 2 px so the pointer never crosses a gap
+  p.style.top = (below + pr.height > window.innerHeight - 8 ? cr.top + 2 - pr.height : below) + "px";
+}
+
 function myCard(c, r) {
   const d = c.dests.get(r.id);
   return V({ cls: "scard", g: 0 },
@@ -342,6 +395,7 @@ function myCard(c, r) {
       previewFor(c),
       V({ cls: "ovl", g: 0 },
         H({ g: 2 }, d.state === "live" ? liveChip() : h("span", { class: "chip-dark", text: t("ui.room.starting_chip") }), FILL(null),
+          viewersChip(c, r),
           h("span", { class: "chip-dark pv", title: t("ui.room.preview_tip"), text: t("ui.room.preview_chip") })),
         FILL(V({ cls: "mine-label", g: 1, style: "align-items:center;padding:8px" }, ic("cast"), T(t("ui.room.your_screen"))), { v: true, style: "align-items:center" }))),
     V({ cls: "card-pad", g: 2 },

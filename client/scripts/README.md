@@ -18,6 +18,7 @@ cd client/scripts                         # SCRATCH defaults to <target>/hs-scra
 ./hs-drive.sh watch                       # viewer: click Watch
 ./hs-drive.sh hover                       # viewer: tooltip "Decoded X fps / shown Y fps, H.265 via vah265dec"
 ./hs-drive.sh shot /path/viewer.png       # grim -o HEADLESS-3 (viewer);  `shot f.png HEADLESS-2` = sharer
+./hs-extra-client.sh 3 Alice 4            # a third (fourth, ...) client on HEADLESS-3, workspace 4: more viewers of one share
 ./hs-rig.sh down                          # stop everything, remove the private runtime dir
 ```
 

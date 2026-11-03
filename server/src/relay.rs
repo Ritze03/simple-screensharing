@@ -64,7 +64,7 @@ use crate::protocol::{
     ClientToRelay, ConnId, MAX_CONTROL_FRAME_LEN, MAX_NAME_LEN, MAX_ROOM_MEMBERS,
     MEDIA_FLAG_RETRANSMIT, MediaHeader, Member, NACK_TAG_HELLO, NACK_TAG_HELLO_ACK, NACK_TAG_MISS,
     NACK_TAG_REQUEST, NackRange, StreamKind, is_nack_datagram, PresenceEvent, PreviewHeader, RejectReason, RelayToClient, RoomId,
-    DIAG_TAG_ACK, DIAG_TAG_HELLO, DIAG_UPLOAD_VERSION, MAX_DIAG_BATCH_BYTES, STREAM_TYPE_DIAG,
+    DIAG_TAG_ACK, DIAG_TAG_HELLO, VIEWERS_TAG_ACK, VIEWERS_TAG_HELLO, DIAG_UPLOAD_VERSION, MAX_DIAG_BATCH_BYTES, STREAM_TYPE_DIAG,
     STREAM_TYPE_PREVIEW, StreamId, StreamInfo, clamp_utf8, decode_payload, encode_frame,
 };
 use crate::room::{
@@ -397,6 +397,9 @@ pub fn start(
         Arc::downgrade(&registry),
         crate::diag::DEFAULT_WINDOW,
     ));
+    if registry.viewers_enabled {
+        tokio::spawn(refresh_viewers(Arc::downgrade(&registry)));
+    }
     let serving = endpoint.clone();
     tokio::spawn(async move {
         if let Err(e) = serve(registry, serving).await {
@@ -404,6 +407,30 @@ pub fn start(
         }
     });
     Ok(endpoint)
+}
+
+/// How often a watched stream's viewer list is re-sent to its owner (spec §9.1). The list is a
+/// datagram and can be lost; the client forgets a list that is 3.5 x this old.
+pub const VIEWERS_REFRESH: Duration = Duration::from_secs(2);
+
+/// Re-send the viewer list of every watched stream to its owner every [`VIEWERS_REFRESH`]
+/// (`notify_viewers` is a no-op for owners that never asked). A list that went empty is not
+/// repeated: the client expires what it has not heard of, so a lost "now empty" heals itself.
+pub(crate) async fn refresh_viewers(registry: std::sync::Weak<Registry>) {
+    let mut tick = tokio::time::interval(VIEWERS_REFRESH);
+    loop {
+        tick.tick().await;
+        let Some(registry) = registry.upgrade() else { return };
+        let rooms: Vec<_> = registry.rooms.read().await.values().cloned().collect();
+        for room in rooms {
+            let guard = room.lock().await;
+            let watched: Vec<(ConnId, StreamId)> =
+                guard.streams.iter().filter(|(_, s)| !s.subscribers.is_empty()).map(|(k, _)| *k).collect();
+            for (owner, sid) in watched {
+                guard.notify_viewers(owner, sid);
+            }
+        }
+    }
 }
 
 /// One line every 10 s while the NACK counters move (spec §6.6): requests received, fragments
@@ -618,6 +645,7 @@ async fn perform_join(
                 diag: Default::default(),
                 stream_count: 0,
                 nack: false,
+                viewers: false,
             },
         );
 
@@ -883,6 +911,20 @@ async fn connection_loop(
                             let _ = connection.send_datagram(Bytes::from_static(&[DIAG_TAG_ACK]));
                         }
                     }
+                    Ok(bytes) if bytes.as_ref() == [VIEWERS_TAG_HELLO] && registry.viewers_enabled => {
+                        // Spec §9.1: this sharer wants to know who watches. The ack doubles as
+                        // the capability probe (an older relay never answers).
+                        let mut guard = room.lock().await;
+                        if let Some(c) = guard.connections.get_mut(&conn_id) {
+                            c.viewers = true;
+                            let _ = connection.send_datagram(Bytes::from_static(&[VIEWERS_TAG_ACK]));
+                            let owned: Vec<StreamId> =
+                                guard.streams.keys().filter(|(o, _)| *o == conn_id).map(|(_, s)| *s).collect();
+                            for sid in owned {
+                                guard.notify_viewers(conn_id, sid);
+                            }
+                        }
+                    }
                     Ok(bytes) if is_nack_datagram(&bytes) => {
                         handle_nack_datagram(registry, room, conn_id, connection, &bytes).await
                     }
@@ -963,6 +1005,8 @@ async fn handle_client_message(
             // stale set.
             if let Some(replaced) = replaced {
                 replaced.route.publish(Vec::new());
+                // Its viewers are gone with it (the new stream starts with no subscribers).
+                guard.notify_viewers(conn_id, stream_id);
             }
             // Register the (empty) route with this connection's forwarder.
             // Synchronous send on an unbounded channel: never awaits under
@@ -1052,6 +1096,7 @@ async fn handle_client_message(
                 "{conn_id:016x} subscribed to ({target:016x}, {stream_id}) -> count={count}"
             ));
             guard.send_to(target, RelayToClient::SubscriberCount { stream_id, count });
+            guard.notify_viewers(target, stream_id);
             if send_keyframe {
                 guard.send_to(target, RelayToClient::KeyframeRequest { stream_id });
             }
@@ -1071,6 +1116,7 @@ async fn handle_client_message(
                     "{conn_id:016x} unsubscribed from ({target:016x}, {stream_id}) -> count={count}"
                 ));
                 guard.send_to(target, RelayToClient::SubscriberCount { stream_id, count });
+                guard.notify_viewers(target, stream_id);
             }
         }
     }
@@ -1414,6 +1460,7 @@ async fn cleanup_connection(
     }
     for (owner, stream_id, count) in owner_notifications {
         guard.send_to(owner, RelayToClient::SubscriberCount { stream_id, count });
+        guard.notify_viewers(owner, stream_id);
     }
 
     guard.connections.remove(&conn_id);

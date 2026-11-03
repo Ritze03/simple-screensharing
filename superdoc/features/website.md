@@ -177,6 +177,23 @@ E2E: `docs/dev/e2e/live-preview.mjs <relay host:port> <certhash>` (headless Chro
 false` by default, so the run switches focus with CDP `Emulation.setFocusEmulationEnabled`, and hides the page with a second tab +
 `Page.bringToFront`; checks attached/playing/video-only, survives `render()`, detached when unfocused or hidden, resumes).
 
+## Who watches my share (task #116, 2026-11-03)
+
+User request: the sharer sees who watches, as a viewer number with a hover dropdown of avatar and name. Same wire
+feature as native (`protocol-spec.md` §9.1: `ViewersHello` datagram `0xE6`, relay `ViewersAck` `0xE7`, `ViewersList` `0xE8`).
+Core: `room-client.js` `#startViewersHello` (once a second, at most 10, after every (re)join), `#onViewersDatagram` (a datagram
+whose first byte is >= `0xE0` never goes down the media path), `ShareHandle.viewers()` (display names from the roster, sorted;
+`null` while the relay has not acked, so the UI draws nothing on an older relay), a 7 s expiry per share. UI: `app.js` `viewersChip`
+in the own card's thumb (`[viewers][PREVIEW]`) and `renderViewersPop` for the dropdown (`.vpop` in `app.css`, the same
+`.avatar.sm` as the People list). *Why a body-level `.layer` popup and not CSS `:hover`:* the thumb clips its content (rounded
+corners) and a list of 7 rows is taller than the thumb. The dropdown is rebuilt by every `render()` like the other popups, so it
+follows live changes; its position is recomputed from the chip after each render, and it closes when the pointer leaves chip
+and popup. Verified end to end by `docs/dev/e2e/viewers.mjs <relay host:port> <certhash> [--old]` (headless Chromium: Alice shares, Bob and
+Zoë watch; chip 0 -> 2, dropdown rows and avatars, pointer into the dropdown keeps it open, a viewer leaving updates it live, 0
+viewers no dropdown; `--old` against a pre-#116 relay asserts that no chip is drawn). The dropdown closes through a document-level
+`mousemove` check, not `mouseleave` on the elements, because every `render()` replaces both and a replaced element never gets its
+`mouseleave`.
+
 ## Rendering above 60 fps (task #67, 2026-10-15)
 
 User report: in the browser viewer (Floorp 157 = Firefox/Gecko on Linux) "anything above 60 fps hangs and skips, up to 60 is

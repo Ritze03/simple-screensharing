@@ -81,6 +81,25 @@ its "Proposed" tab).
   *Why:* "show a stream preview while tabbed into the program; otherwise fine to hide it". It replaces
   the earlier deliberate "no self-preview". Code: `room::my_card`, `App::poll_live_previews`,
   `UiAction::LivePreviewSeen`; design in `superdoc/features/self-preview.md`.
+- **Viewers chip and hover dropdown on the own card** (#116, 2026-11-03): the own card in "Sharing in
+  this room" shows an eye chip with the number of people watching that share in that room, in the
+  thumb's top-right corner (`[viewers][PREVIEW]`, `room::viewers_dropdown`). Hovering it opens a
+  dropdown (not a text tooltip): a `WATCHING NOW · N` heading, then one row per viewer, the same
+  initial-letter avatar the People list and the cards use (`widgets::paint_avatar`, a 22 px disc)
+  and the display name, sorted case-insensitively. It stays open while the pointer is on the chip,
+  the dropdown or the gap between them, so the pointer can travel into it, and closes when it leaves;
+  more than 8 viewers collapse into a `+N` row (a room holds 8 members, so this never shows today).
+  0 viewers: the chip shows `0` and a plain tooltip says nobody watches yet; no dropdown. **On a relay
+  that does not report viewers (an older relay) the chip is not drawn at all**, since a `0` would be
+  wrong. Per room: a share in two rooms has two cards with their own lists. Data: the relay's
+  `ViewersList` datagrams (`protocol-spec.md` §9.1) -> `ClientEvent::Viewers` ->
+  `RoomSession::viewers` (pruned after `VIEWERS_STALE`), names from the roster. *Why the own card and
+  not the bottom bar:* the card is per room and per stream (the bar shows one share and rolls rooms
+  into an "N rooms" popover), it already carries the LIVE/PREVIEW chips, and a hover list needs room that
+  the bar's one-line status does not have. *Why a dropdown with avatars:* the user's request ("a
+  viewer number ... when he hovers over it, a drop-down thingy ... the profile picture and the
+  username"); "profile picture" is the app's existing avatar. Browser twin: `docs/js/ui/app.js`
+  `viewersChip`, `features/website.md`.
 
 ### Layout implementation rule
 

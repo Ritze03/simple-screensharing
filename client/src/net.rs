@@ -113,7 +113,7 @@ use crate::nack::{hello_loop, SendRing};
 use crate::protocol::{
     cert_hash_of_der, decode_cert_hash, decode_control_payload, encode_cert_hash, encode_control_frame, ClientToRelay, ConnId, CertHash, MediaHeader, Member,
     PresenceEvent, PreviewHeader, RejectReason, RelayToClient, RoomId, StreamId, StreamInfo,
-    StreamKind, is_nack_datagram, NackRange, DIAG_TAG_ACK, MAX_CONTROL_FRAME_LEN, NACK_TAG_HELLO_ACK, NACK_TAG_MISS, NACK_TAG_REQUEST,
+    StreamKind, is_nack_datagram, unpack_viewers, NackRange, DIAG_TAG_ACK, VIEWERS_TAG_ACK, VIEWERS_TAG_HELLO, VIEWERS_TAG_LIST, MAX_CONTROL_FRAME_LEN, NACK_TAG_HELLO_ACK, NACK_TAG_MISS, NACK_TAG_REQUEST,
     PROTOCOL_VERSION, STREAM_TYPE_PREVIEW,
 };
 
@@ -583,6 +583,11 @@ pub enum ClientEvent {
     SubscriberCount { stream_id: StreamId, count: u32 },
     /// Sent only to the connection that owns `stream_id` (spec §9).
     KeyframeRequest { stream_id: StreamId },
+    /// The relay acknowledged our viewers-hello: it reports who watches our streams (spec §9.1).
+    ViewersSupported,
+    /// Who watches our stream `stream_id` right now (spec §9.1): the complete set, as ConnIds.
+    /// Only ever arrives from a relay that understands the viewers-hello.
+    Viewers { stream_id: StreamId, viewers: Vec<ConnId> },
     MediaFrame(DecryptedMediaFrame),
     Preview(DecryptedPreview),
     /// The control stream ended (relay closed it, connection dropped, or we
@@ -719,6 +724,7 @@ impl ScreenshareClient {
         let send_ring = Arc::new(SendRing::default());
         let nack_acked = Arc::new(AtomicBool::new(false));
         let diag_acked = Arc::new(AtomicBool::new(false));
+        let viewers_acked = Arc::new(AtomicBool::new(false));
         tokio::spawn(datagram_reader_loop(
             connection.clone(),
             parsed.room_key,
@@ -727,8 +733,10 @@ impl ScreenshareClient {
             send_ring.clone(),
             nack_acked.clone(),
             diag_acked.clone(),
+            viewers_acked.clone(),
         ));
         tokio::spawn(hello_loop(connection.clone(), nack_acked));
+        tokio::spawn(viewers_hello_loop(connection.clone(), viewers_acked));
         tokio::spawn(crate::diag_upload::upload_loop(connection.clone(), diag_acked.clone()));
         tokio::spawn(preview_uni_loop(connection.clone(), parsed.room_key, event_tx));
 
@@ -911,6 +919,18 @@ async fn control_reader_loop(mut recv: quinn::RecvStream, tx: mpsc::UnboundedSen
     }
 }
 
+/// Ask the relay to report who watches our streams (spec §9.1): one 1-byte datagram per second,
+/// at most 10, until it acknowledges. An older relay drops it as undersized and never answers,
+/// which is how the UI knows to show no viewer count at all.
+async fn viewers_hello_loop(connection: quinn::Connection, acked: Arc<AtomicBool>) {
+    for _ in 0..10 {
+        if acked.load(Ordering::Relaxed) || connection.send_datagram(Bytes::from_static(&[VIEWERS_TAG_HELLO])).is_err() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
 /// How often the datagram loop polls the reassembler while a frame is being repaired.
 const NACK_TICK: Duration = Duration::from_millis(5);
 
@@ -922,6 +942,7 @@ async fn datagram_reader_loop(
     send_ring: Arc<SendRing>,
     nack_acked: Arc<AtomicBool>,
     diag_acked: Arc<AtomicBool>,
+    viewers_acked: Arc<AtomicBool>,
 ) {
     let mut reassembler = Reassembler::new();
     let mut last_poll = Instant::now();
@@ -941,7 +962,20 @@ async fn datagram_reader_loop(
         let now = Instant::now();
         let mut frames = Vec::new();
         if let Some(datagram) = datagram {
-            if is_nack_datagram(&datagram) && datagram[0] == DIAG_TAG_ACK {
+            if datagram.first() == Some(&VIEWERS_TAG_LIST) {
+                // Who watches one of our streams (spec §9.1). A media datagram never starts with
+                // this byte (its version byte is 0x01), whatever its length.
+                if let Some((stream_id, viewers)) = unpack_viewers(&datagram)
+                    && tx.send(ClientEvent::Viewers { stream_id, viewers }).is_err()
+                {
+                    return;
+                }
+            } else if datagram.as_ref() == [VIEWERS_TAG_ACK] {
+                if !viewers_acked.swap(true, Ordering::Relaxed) {
+                    tracing::debug!("the relay reports who watches our streams");
+                    let _ = tx.send(ClientEvent::ViewersSupported);
+                }
+            } else if is_nack_datagram(&datagram) && datagram[0] == DIAG_TAG_ACK {
                 // The relay stores diagnostics uploads (spec §6.7); independent of NACK.
                 if !diag_acked.swap(true, Ordering::Relaxed) {
                     tracing::info!("the relay accepts diagnostics uploads");

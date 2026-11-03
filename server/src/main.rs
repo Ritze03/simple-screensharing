@@ -23,6 +23,8 @@ mod transport_lab;
 
 #[cfg(test)]
 mod nack_tests;
+#[cfg(test)]
+mod viewers_tests;
 
 #[cfg(test)]
 mod diag_upload_tests;

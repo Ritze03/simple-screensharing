@@ -22,6 +22,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const RESUBSCRIBE_MIN_INTERVAL_MS = 1500;
 const FIRST_RECONNECT_MS = 50;
 const BACKOFF_MS = [500, 1000, 2000, 4000, 8000, 10000];
+// Viewer lists (spec section 9.1): 1-byte hello datagram to the relay, its 1-byte ack and the per-stream list it sends our way.
+const VIEWERS_TAG_HELLO = 0xe6;
+const VIEWERS_TAG_ACK = 0xe7;
+const VIEWERS_TAG_LIST = 0xe8;
+const VIEWERS_STALE_MS = 7000; // the relay repeats a non-empty list every 2 s
 
 export const streamKey = (ownerHex, streamId) => `${ownerHex}:${streamId}`;
 const parseKey = (key) => {
@@ -170,7 +175,12 @@ export class ShareHandle {
     Object.assign(this, init);
     this.subscribers = 0; // video stream's viewer count (from the relay); encoding pauses at 0
     this.audioSubscribers = 0;
+    this.viewerIds = []; // hex ConnIds of the video stream's viewers (relay list); expires after VIEWERS_STALE_MS
     this.ended = false;
+  }
+  /** Display names of the people watching this share right now, or `null` when the relay does not report viewers (an older relay). */
+  viewers() {
+    return this.client.viewersSupported ? this.client._viewerNames(this) : null;
   }
   muteAudio(muted) {
     if (this.audioTrack) this.audioTrack.enabled = !muted;
@@ -222,6 +232,7 @@ export class RoomClient extends EventTarget {
     this.session = null;
     this.selfId = null;
     this.members = new Map(); // hex -> { id, name, streamCount, self }
+    this.viewersSupported = false; // the relay acked our viewers hello (reset per connection)
     this.streams = new Map(); // key -> info
     this.previews = new Map(); // key -> { blob, receivedAt }
     this.watches = new Map(); // key -> WatchHandle
@@ -319,6 +330,7 @@ export class RoomClient extends EventTarget {
     sess.onClosed = (info) => this.#onSessionClosed(sess, info);
     const before = new Map(this.streams); // infos of the streams we knew, for watch-ended after a reconnect
     this.#applySnapshot(snapshot);
+    this.#startViewersHello(sess);
     // Re-establish what we had before a reconnect: subscriptions to streams that still exist (the receivers
     // restart from the next keyframe: datagrams were lost meanwhile), and forget the ones that are gone.
     for (const [key, reasons] of [...this.subRefs]) {
@@ -773,7 +785,51 @@ export class RoomClient extends EventTarget {
 
   // -------------------------------------------------------------------------------- receive path
 
+  /** Ask the relay once a second (at most 10 times) to report who watches our streams; an older relay drops it and never answers. */
+  #startViewersHello(sess) {
+    this.viewersSupported = false;
+    let n = 0;
+    const tick = () => {
+      if (sess !== this.session || this.viewersSupported || n++ >= 10) return;
+      sess.sendDatagram(new Uint8Array([VIEWERS_TAG_HELLO]));
+      setTimeout(tick, 1000);
+    };
+    tick();
+  }
+
+  #onViewersDatagram(bytes) {
+    if (bytes.length === 1 && bytes[0] === VIEWERS_TAG_ACK) {
+      this.viewersSupported = true;
+      this.dispatchEvent(new CustomEvent("viewers", { detail: {} }));
+      return;
+    }
+    if (bytes[0] !== VIEWERS_TAG_LIST || bytes.length < 3 || bytes.length !== 3 + 8 * bytes[2]) return;
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const ids = [];
+    for (let i = 0; i < bytes[2]; i++) ids.push(connIdToHex(dv.getBigUint64(3 + 8 * i, false)));
+    const share = this.shares.find((s) => s.videoStreamId === bytes[1]);
+    if (!share) return;
+    this.viewersSupported = true;
+    share.viewerIds = ids;
+    clearTimeout(share._viewersTimer);
+    if (ids.length) {
+      share._viewersTimer = setTimeout(() => {
+        share.viewerIds = [];
+        this.dispatchEvent(new CustomEvent("viewers", { detail: {} }));
+      }, VIEWERS_STALE_MS);
+    }
+    this.dispatchEvent(new CustomEvent("viewers", { detail: { streamId: bytes[1], ids } }));
+  }
+
+  _viewerNames(share) {
+    return share.viewerIds
+      .map((id) => this.members.get(id)?.name)
+      .filter((n) => n != null)
+      .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+  }
+
   #onDatagram(bytes) {
+    if (bytes[0] >= 0xe0) return this.#onViewersDatagram(bytes);
     let parsed;
     try {
       parsed = unpackMediaHeader(bytes);
@@ -903,6 +959,7 @@ export class RoomClient extends EventTarget {
     if (!s) return;
     share.subscribers = 0;
     share.audioSubscribers = 0;
+    share.viewerIds = [];
     s.send({ type: "AnnounceStream", streamId: share.videoStreamId, kind: "video", label: clampUtf8(share.label), width: share.width, height: share.height }).catch(() => {});
     if (share.audioStreamId != null) {
       s.send({ type: "AnnounceStream", streamId: share.audioStreamId, kind: "audio", label: clampUtf8(share.audioLabel), width: 0, height: 0 }).catch(() => {});

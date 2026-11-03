@@ -340,6 +340,10 @@ pub struct CaptureSourceId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DestinationId(pub u32);
 
+/// How long a viewer list from the relay stays valid without being refreshed (the relay re-sends
+/// every 2 s, spec 9.1).
+pub const VIEWERS_STALE: Duration = Duration::from_millis(7000);
+
 /// Identifies one live [`audio::AudioLevelTapHandle`] — a candidate source's
 /// dropdown-entry meter, not a real share (see that type's doc comment).
 /// Scoped tightly to however long one dropdown is open on the frontend: see
@@ -917,6 +921,15 @@ pub struct RoomSession {
     /// `AppState::drain_events`), purely so this map doesn't grow forever
     /// across a long-lived room with many join/leave cycles.
     pub audio_volume_by_owner: HashMap<ConnId, u32>,
+
+    /// The relay reports who watches our streams (spec 9.1): it answered our viewers-hello.
+    /// `false` on an older relay, and then the UI shows no viewer count at all (a "0" there would
+    /// be a lie).
+    pub viewers_supported: bool,
+    /// Who watches each of *our* streams here, by `stream_id`: the relay's last list and when it
+    /// arrived. The relay repeats a non-empty list every 2 s, so an entry older than
+    /// [`VIEWERS_STALE`] is dropped (a lost "now nobody" heals itself). Pruned in `drain_events`.
+    pub viewers: HashMap<StreamId, (Vec<ConnId>, Instant)>,
 
     /// Watches carried over from before a reconnect that are still waiting for
     /// their stream to be announced again (the owner may be reconnecting too,
@@ -3984,6 +3997,8 @@ impl AppState {
                 preview_cache: PreviewCache::new(),
                 preview_textures: HashMap::new(),
                 audio_volume_by_owner: HashMap::new(),
+                viewers_supported: false,
+                viewers: HashMap::new(),
                 rewatch: Vec::new(),
                 rewatch_deadline: None,
                 resume_after_stop: Vec::new(),
@@ -4198,6 +4213,11 @@ impl AppState {
                             h.notify_subscriber_count(DestKey(dest.0), count);
                         }
                     }
+                    ClientEvent::ViewersSupported => room.viewers_supported = true,
+                    ClientEvent::Viewers { stream_id, viewers } => {
+                        room.viewers_supported = true;
+                        room.viewers.insert(stream_id, (viewers, Instant::now()));
+                    }
                     ClientEvent::KeyframeRequest { stream_id } => {
                         if let Some((LocalCapture { status: ShareStatus::Active(ShareHandle::Video(h)), .. }, dest)) =
                             capture_feeding(captures, handle, stream_id)
@@ -4247,6 +4267,14 @@ impl AppState {
                         break;
                     }
                 }
+            }
+
+            // Viewer lists the relay stopped refreshing are forgotten; keep repainting while one
+            // is shown so the expiry shows up without any other input.
+            let now = Instant::now();
+            room.viewers.retain(|_, (v, at)| !v.is_empty() && now.duration_since(*at) < VIEWERS_STALE);
+            if !room.viewers.is_empty() {
+                ctx.request_repaint_after(Duration::from_secs(1));
             }
 
             // Right after this room's `StreamStarted`/`StreamStopped` events

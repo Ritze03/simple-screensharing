@@ -309,6 +309,47 @@ pub const DIAG_UPLOAD_VERSION: u8 = 0x01;
 /// more than this, the client never sends more.
 pub const MAX_DIAG_BATCH_BYTES: usize = 256 * 1024;
 
+// ---------------------------------------------------------------------
+// §9.1 Viewer lists (#116): who watches my streams
+// ---------------------------------------------------------------------
+
+/// Client -> relay, 1 byte: "tell me who watches my streams" (a sharer's client sends it so its
+/// UI can name the viewers). Repeated until [`VIEWERS_TAG_ACK`] arrives. Shorter than a media
+/// header and >= 0xE0, so every older relay drops it as undersized ([`is_nack_datagram`]).
+pub const VIEWERS_TAG_HELLO: u8 = 0xE6;
+/// Relay -> client, 1 byte: this relay sends viewer lists. Followed at once by one
+/// [`VIEWERS_TAG_LIST`] per stream the client owns.
+pub const VIEWERS_TAG_ACK: u8 = 0xE7;
+/// Relay -> stream owner (only one that said [`VIEWERS_TAG_HELLO`]): the complete current viewer
+/// set of one of its streams. `tag u8 | stream_id u8 | count u8 | conn_id u64 BE x count`.
+/// With 3 or more viewers it is longer than a media header, which is safe because only a
+/// client that opted in ever receives one; a receiver tests the tag byte, not the length.
+pub const VIEWERS_TAG_LIST: u8 = 0xE8;
+
+/// Encode a viewer list datagram (at most 100 ids, far above the 8-member room cap).
+pub fn pack_viewers(stream_id: StreamId, viewers: &[ConnId]) -> Vec<u8> {
+    let viewers = &viewers[..viewers.len().min(100)];
+    let mut b = Vec::with_capacity(3 + 8 * viewers.len());
+    b.extend_from_slice(&[VIEWERS_TAG_LIST, stream_id, viewers.len() as u8]);
+    for v in viewers {
+        b.extend_from_slice(&v.to_be_bytes());
+    }
+    b
+}
+
+/// Decode a [`VIEWERS_TAG_LIST`] datagram; `None` if it is anything else or truncated.
+pub fn unpack_viewers(bytes: &[u8]) -> Option<(StreamId, Vec<ConnId>)> {
+    if bytes.len() < 3 || bytes[0] != VIEWERS_TAG_LIST {
+        return None;
+    }
+    let n = bytes[2] as usize;
+    if bytes.len() != 3 + 8 * n {
+        return None;
+    }
+    let ids = bytes[3..].chunks_exact(8).map(|c| u64::from_be_bytes(c.try_into().unwrap())).collect();
+    Some((bytes[1], ids))
+}
+
 /// Whether `bytes` is a NACK-family datagram rather than a media fragment: shorter than a media
 /// header (so every older peer, relay or browser drops it as undersized instead of mistaking it
 /// for media) and led by a tag no media `version` byte will use.
@@ -566,6 +607,22 @@ mod tests {
         // a media datagram, even a tiny one, is not a NACK
         let media = MediaHeader { version: PROTOCOL_VERSION, flags: 0, conn_id: 1, stream_id: 0, frame_id: 0, fragment_index: 0, fragment_count: 1 }.pack();
         assert!(!is_nack_datagram(&media));
+    }
+
+    #[test]
+    fn viewer_list_round_trips_and_rejects_garbage() {
+        let b = pack_viewers(3, &[1, 0x0102_0304_0506_0708]);
+        assert_eq!(hex(&b), "e8030200000000000000010102030405060708");
+        assert_eq!(unpack_viewers(&b), Some((3, vec![1, 0x0102_0304_0506_0708])));
+        assert_eq!(unpack_viewers(&pack_viewers(9, &[])), Some((9, vec![])));
+        assert_eq!(unpack_viewers(&b[..b.len() - 1]), None);
+        assert_eq!(unpack_viewers(&[VIEWERS_TAG_ACK]), None);
+        // Hello and Ack are undersized for every older relay; no tag collides with another family.
+        assert!(is_nack_datagram(&[VIEWERS_TAG_HELLO]) && is_nack_datagram(&[VIEWERS_TAG_ACK]));
+        let others = [NACK_TAG_HELLO, NACK_TAG_HELLO_ACK, NACK_TAG_REQUEST, NACK_TAG_MISS, DIAG_TAG_HELLO, DIAG_TAG_ACK];
+        for t in [VIEWERS_TAG_HELLO, VIEWERS_TAG_ACK, VIEWERS_TAG_LIST] {
+            assert!(!others.contains(&t) && t >= NACK_TAG_HELLO);
+        }
     }
 
     fn hex(b: &[u8]) -> String {

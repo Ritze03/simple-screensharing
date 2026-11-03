@@ -749,6 +749,62 @@ triggers resume-from-idle before the forced IDR.
 The relay sends both messages only to the stream's owner; other members never receive
 another stream's subscriber count.
 
+### 9.1 Viewer lists: who watches my stream (task #116, 2026-11-03)
+
+**Why.** The owner asked: "someone that's streaming should actually see who is watching his
+livestream", shown as a viewer number that opens a list of avatar and name on hover. Neither
+presence (§8: roster and streams, no watch state) nor `SubscriberCount` (a bare number) says *who*.
+The relay is the only party that knows the subscriber set (`StreamState.subscribers`), and every
+member's `ConnId` is already known to every client from presence, so the relay only has to send
+the ConnIds and the client resolves names from its roster.
+
+**Hard constraint, as for §6.6 / §6.7: nothing existing may change.** Old relays, old clients and
+browsers must behave exactly as before, so this is a capability handshake of datagrams, not a new
+enum variant (§6.6 explains why a variant breaks old peers).
+
+| Tag | Name | Direction | Length | Meaning |
+| --- | --- | --- | --- | --- |
+| `0xE6` | ViewersHello | client -> relay | 1 | "tell me who watches my streams" |
+| `0xE7` | ViewersAck | relay -> client | 1 | this relay sends viewer lists |
+| `0xE8` | ViewersList | relay -> owner | 3 + 8 x n | the complete viewer set of one of the owner's streams |
+
+ViewersList layout (big-endian): `tag u8 | stream_id u8 | count u8 | conn_id u64 x count`. It is the
+**whole current set**, not a delta, so a lost datagram never leaves the client wrong for longer than
+one refresh. With 3 or more viewers it is >= 19 bytes, i.e. it would parse as a media header, which
+is safe only because **the relay sends it solely to a connection that said `ViewersHello`**; such a
+client tests the tag byte before the media path (a media datagram starts with `0x01`).
+
+- **Hello / Ack.** A client sends `ViewersHello` once per second after joining (at most 10 times)
+  until `ViewersAck` arrives. An older relay drops the 1-byte datagram as undersized (§6.6) and never
+  answers, so the client knows the relay cannot report viewers and shows no count at all (a "0" would
+  be a lie). The relay, on Hello, marks the connection, answers `ViewersAck`, then sends the current
+  list of every stream the connection owns. `SSSHARE_VIEWERS=0` is the kill switch (no ack, nothing
+  sent: exactly an older relay).
+- **When a list is sent.** Immediately after every change of a stream's subscriber set (Subscribe,
+  Unsubscribe, a subscriber's connection leaving, the owner re-announcing the same `stream_id`), and
+  **every 2 s while the set is non-empty** (`VIEWERS_REFRESH`). A list that went empty is sent once and
+  not repeated. A client forgets a stream's list **7 s** after the last one (`VIEWERS_STALE`, 3.5 x the
+  refresh), so a lost "now nobody watches" self-heals. *Why datagrams and refresh and not a reliable
+  stream:* a uni stream per update would need ordering on top (two updates racing on two streams), the
+  state is tiny and idempotent, and the refresh needs no sequence numbers.
+- **Privacy: only the owner learns it.** Other members never receive another stream's viewer list, the
+  same rule as `SubscriberCount` (§9). The roster (§8) is unchanged and shares no watch state.
+  *Why only the owner:* nobody else needs to know who watches whom, and a roster that exposed
+  watch lists would show every member's viewing to everyone.
+- **Per room.** A sharer in several rooms (one capture sent to several relays) has one connection,
+  one Hello and one list per room, so each room's card shows that room's viewers.
+- **Audio.** Viewers subscribe to a sharer's audio stream alongside the video (§4.1 client
+  convention); the UI shows the list of the **video** stream (an audio-only share uses its own).
+
+Compatibility matrix:
+
+| client | relay | result |
+| --- | --- | --- |
+| new | old | Hello dropped, no Ack: the client shows no viewer count (checked in the rig with a relay built from `167e44e`) |
+| new | new | Ack, then lists on every change and every 2 s |
+| new | new, `SSSHARE_VIEWERS=0` | like an old relay |
+| old / browser without #116 | new | never says Hello: nothing is sent to it, behaviour unchanged |
+
 ---
 
 ## 10. Relay bookkeeping data model
@@ -773,6 +829,7 @@ ConnState {
     connection: <quinn::Connection handle, for opening uni streams / datagrams>,
     subscriptions: HashSet<(ConnId, StreamId)>, // streams THIS conn watches
     nack: bool,                                 // sent Hello (§6.6)
+    viewers: bool,                              // sent ViewersHello (§9.1): gets viewer lists of its own streams
 }
 
 StreamState {
@@ -801,7 +858,8 @@ Key operations:
 - **AnnounceStream / StopStream:** insert/remove `StreamState`; update the owner's
   `Member.stream_count`; broadcast `StreamStarted` / `StreamStopped`.
 - **Subscribe / Unsubscribe:** update `subscribers` and the subscriber's `subscriptions`;
-  send `SubscriberCount` to the owner (and `KeyframeRequest` on a new subscriber, §9).
+  send `SubscriberCount` to the owner (and `KeyframeRequest` on a new subscriber, §9) and, if the owner
+  said `ViewersHello`, its `ViewersList` (§9.1).
 - **Media datagram in:** parse the 19-byte header, validate source `conn_id`, forward
   verbatim to `streams[(conn_id, stream_id)].subscribers` (§6.2). Drop if no subscribers
   or unknown stream.

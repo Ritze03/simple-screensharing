@@ -184,6 +184,7 @@ function wire(r, client) {
   });
   on("share", (d) => onShareEvent(r, d));
   on("subscribers", () => invalidate());
+  on("viewers", () => invalidate());
   on("error", (d) => {
     if (d.code === "link-expired" || d.code === "relay-unreachable") {
       r.issue = "unreachable";

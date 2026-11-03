@@ -166,6 +166,9 @@ pub struct ConnState {
     /// The connection sent a NACK `Hello` (spec §6.6): it may be sent retransmit requests (as a
     /// stream owner) and it sends them (as a viewer).
     pub nack: bool,
+    /// The connection sent a `VIEWERS_TAG_HELLO` (spec §9.1): it is sent the viewer list of each
+    /// stream it owns, and nobody else ever is.
+    pub viewers: bool,
 }
 
 /// One resolved fan-out destination for a stream's media datagrams: the
@@ -367,6 +370,21 @@ impl RoomState {
         stream.route.publish(targets);
     }
 
+    /// Tell the owner of `(owner, stream_id)` who watches it now (spec §9.1), if it asked to know.
+    /// Call under the room lock after any change of that stream's subscriber set; also used by the
+    /// periodic refresh. A stream that no longer exists sends nothing.
+    pub fn notify_viewers(&self, owner: ConnId, stream_id: StreamId) {
+        let (Some(conn), Some(stream)) = (self.connections.get(&owner), self.streams.get(&(owner, stream_id))) else {
+            return;
+        };
+        if !conn.viewers {
+            return;
+        }
+        let mut ids: Vec<ConnId> = stream.subscribers.iter().copied().filter(|c| self.connections.contains_key(c)).collect();
+        ids.sort_unstable();
+        let _ = conn.connection.send_datagram(Bytes::from(crate::protocol::pack_viewers(stream_id, &ids)));
+    }
+
     /// Send a `RelayToClient` message to exactly one connection, if it's
     /// still present in the room.
     pub fn send_to(&self, target: ConnId, msg: RelayToClient) {
@@ -425,6 +443,9 @@ pub struct Registry {
     pub datagrams_evicting: AtomicU64,
     /// NACK counters and the kill switch (spec §6.6).
     pub nack: NackStats,
+    /// Whether viewer lists are sent to sharers (spec §9.1); `SSSHARE_VIEWERS=0` turns it off,
+    /// which makes this relay behave like one that predates #116.
+    pub viewers_enabled: bool,
     /// Where opt-in client diagnostics uploads are stored (spec §6.7).
     pub client_logs: crate::client_logs::ClientLogs,
     pub started_at: std::time::Instant,
@@ -446,6 +467,7 @@ impl Registry {
             datagrams_forwarded: AtomicU64::new(0),
             datagrams_evicting: AtomicU64::new(0),
             nack: NackStats::from_env(),
+            viewers_enabled: std::env::var("SSSHARE_VIEWERS").map(|v| v != "0").unwrap_or(true),
             client_logs: crate::client_logs::ClientLogs::from_env(),
             started_at: std::time::Instant::now(),
             listen_addr,

@@ -1060,6 +1060,81 @@ fn thumb_placeholder(ui: &Ui, thumb: Rect, icon: &str, icon_col: Color32, label:
     paint_text(ui, line(cy + 6.0, 16.0), label, font(Weight::Regular, theme::FS_TINY), theme::TEXT_FAINT, Align::Center);
 }
 
+/// Display names of the people watching our stream `stream_id` in room `h` (the relay's list,
+/// spec 9.1, resolved through the roster, sorted). `None` when the relay does not report viewers
+/// (an older relay): the card then shows no count at all, since "0" would be a lie.
+fn viewer_names(cx: &Cx, h: RoomHandle, stream_id: u8) -> Option<Vec<String>> {
+    let s = cx.session(h)?;
+    if !s.viewers_supported {
+        return None;
+    }
+    let ids = s.viewers.get(&stream_id).map(|(v, _)| v.as_slice()).unwrap_or(&[]);
+    let mut names: Vec<String> = ids.iter().filter_map(|c| s.members.iter().find(|m| m.conn_id == *c)).map(|m| m.display_name.clone()).collect();
+    names.sort_by_key(|n| n.to_lowercase());
+    Some(names)
+}
+
+/// Most viewer rows the dropdown lists; the rest collapse into one "+N" row.
+const VIEWER_ROWS_MAX: usize = 8;
+/// Width of the viewers dropdown.
+const VIEWERS_POP_W: f32 = 200.0;
+
+/// The hover dropdown under the viewer chip (user request, task #116: "hovers something like a
+/// viewer number ... a drop-down thingy ... the profile picture and the username"): one row per
+/// viewer, avatar then name, the same avatar the People list uses. Open while the pointer is on the
+/// chip or, once open, anywhere on the chip, the dropdown or the gap between them, so the pointer
+/// can travel into it. Nobody watching: no dropdown, a plain tooltip says so.
+fn viewers_dropdown(ui: &Ui, chip: &Response, names: &[String]) {
+    if names.is_empty() {
+        chip.clone().on_hover_text(tr("ui.room.viewers_none", "Nobody is watching this yet."));
+        return;
+    }
+    let ctx = ui.ctx();
+    let id = chip.id.with("viewers_dropdown");
+    // The dropdown's rect from the previous frame, kept only while it is open.
+    let shown: Option<Rect> = ctx.data(|d| d.get_temp(id));
+    let hovering = |r: Rect| ctx.pointer_hover_pos().is_some_and(|p| r.expand(3.0).contains(p));
+    if !(chip.hovered() || shown.is_some_and(|r| hovering(r.union(chip.rect)))) {
+        ctx.data_mut(|d| d.remove::<Rect>(id));
+        return;
+    }
+    let rows = names.len().min(VIEWER_ROWS_MAX);
+    let extra = names.len() - rows;
+    let height = 24.0 + (rows + usize::from(extra > 0)) as f32 * 28.0 + 12.0;
+    let screen = ctx.content_rect();
+    // Hangs off the chip's right edge, 4 px below (above if the window ends first).
+    let x = (chip.rect.right() - VIEWERS_POP_W).max(screen.left() + 8.0);
+    let below = chip.rect.bottom() + 4.0;
+    let y = if below + height > screen.bottom() - 8.0 { chip.rect.top() - 4.0 - height } else { below };
+    let frame = egui::Frame::new()
+        .fill(theme::PANEL_RAISED)
+        .stroke(Stroke::new(1.0_f32, theme::BORDER))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(egui::Margin::same(6))
+        .shadow(egui::Shadow { offset: [0, 14], blur: 40, spread: 0, color: Color32::from_black_alpha(153) });
+    let area = egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(pos2(x, y)).show(ctx, |ui| {
+        frame.show(ui, |ui| {
+            ui.set_width(VIEWERS_POP_W - 12.0);
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let (hr, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
+            let title = format!("{} · {}", tr("ui.room.viewers_title", "Watching now").to_uppercase(), names.len());
+            paint_text(ui, hr.shrink2(vec2(theme::S2, 0.0)), &title, font(Weight::Bold, theme::FS_SECTION), theme::ACCENT, Align::Min);
+            for name in &names[..rows] {
+                let row = HBox::new("viewer_row", 28.0).pad(theme::S2, theme::S2).slots(&[fixed(theme::AVATAR_SM), FILL]).show(ui);
+                // The slot is as tall as the row; the avatar is a 22 px disc in its middle.
+                let disc = Rect::from_center_size(row.cell(0).center(), vec2(theme::AVATAR_SM, theme::AVATAR_SM));
+                widgets::paint_avatar(ui, disc, &initial(name), theme::avatar_colors(name), false);
+                row.text(ui, 1, name, font(Weight::Regular, theme::FS_LABEL), theme::TEXT, Align::Min);
+            }
+            if extra > 0 {
+                let row = HBox::new("viewer_more", 28.0).pad(theme::S2, theme::S2).slots(&[FILL]).show(ui);
+                row.text(ui, 0, &format!("+{extra}"), font(Weight::Regular, theme::FS_LABEL), theme::TEXT_DIM, Align::Min);
+            }
+        });
+    });
+    ctx.data_mut(|d| d.insert_temp(id, area.response.rect));
+}
+
 /// Our own share in this room: a live preview of what we capture while this
 /// window is focused (task #78; a screen-hatch placeholder otherwise), specs
 /// of what we send, one full-width "Stream settings" button.
@@ -1095,16 +1170,24 @@ fn my_card(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSourceId, destin
         }
     };
     thumb_corners(ui, thumb, Some(&chip), false);
-    if live_tex.is_some() {
-        // Right corner: says the picture is a local preview, not what viewers get.
-        let row = Rect::from_min_size(thumb.min + vec2(theme::S2, theme::S2), vec2(thumb.width() - 2.0 * theme::S2, 22.0));
-        let mut r = ui.new_child(UiBuilder::new().max_rect(row).layout(Layout::right_to_left(Align::Center)));
-        widgets::chip_dark(&mut r, None, false, &tr("ui.room.preview_chip", "PREVIEW"))
-            .on_hover_text(tr("ui.room.preview_tip", "A live preview of your screen, shown while this window is focused. Viewers get the full quality stream."));
-    }
     if cx.destination_state(c, d) == DestinationState::Starting && cx.state.capture_awaiting_first_frame(capture) {
         ui.interact(thumb, Id::new(("my_card_thumb", capture, destination)), Sense::hover())
             .on_hover_text(tr("ui.waiting_frame_hint", "An idle screen sends no picture until something on it changes. Move the mouse over the shared screen and the stream starts."));
+    }
+    // Right corner, added after the thumb's own hover area so it sits above it: [viewers][PREVIEW].
+    let viewers = viewer_names(cx, h, d.stream_id);
+    if viewers.is_some() || live_tex.is_some() {
+        let row = Rect::from_min_size(thumb.min + vec2(theme::S2, theme::S2), vec2(thumb.width() - 2.0 * theme::S2, 22.0));
+        let mut r = ui.new_child(UiBuilder::new().max_rect(row).layout(Layout::right_to_left(Align::Center)));
+        if live_tex.is_some() {
+            // Says the picture is a local preview, not what viewers get.
+            widgets::chip_dark(&mut r, None, false, &tr("ui.room.preview_chip", "PREVIEW"))
+                .on_hover_text(tr("ui.room.preview_tip", "A live preview of your screen, shown while this window is focused. Viewers get the full quality stream."));
+        }
+        if let Some(names) = &viewers {
+            let chip = widgets::chip_dark(&mut r, Some("visibility"), false, &names.len().to_string());
+            viewers_dropdown(ui, &chip, names);
+        }
     }
 
     let params = match &d.runtime {
