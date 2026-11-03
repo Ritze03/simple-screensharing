@@ -3159,6 +3159,7 @@ mod session_logic {
             WatchEntry {
                 decoder: Arc::new(Mutex::new(decoder)),
                 audio_stream_id: None,
+                resumed: false,
             },
         );
 

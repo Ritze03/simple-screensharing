@@ -167,6 +167,10 @@ impl App {
                 self.apply(ctx, UiAction::PopOut(key));
             }
             UiAction::Unwatch((room, owner, stream)) => {
+                // The user ended it: not a watch to carry the pop-out over (`VideoViews::sync`).
+                if let Some(e) = self.videos.get_mut((room, owner, stream)) {
+                    e.popped = false;
+                }
                 if let Some(r) = self.state.rooms.get_mut(&room)
                     && r.watches.lock().unwrap().contains_key(&(owner, stream))
                 {

@@ -394,6 +394,22 @@ shows a placeholder. The pop-out has hover-gated chrome (statbar, audio pill; vo
 fullscreen, and Escape only *leaves* fullscreen, never closes (the former Electron viewer's
 rules, carried over; `superdoc/features/viewer-window.md`).
 
+**A pop-out survives its watch being re-created** (2026-11-03, task #132; user report "the pop-out sometimes just
+closes all by itself"). Cause: `popped` lives on the `VideoEntry`, which is keyed by `(RoomHandle, ConnId, StreamId)`;
+a reconnect (connection drop, relay restart, viewer recovery L3), or the sharer stopping and re-sharing, ends the watch
+and the wanted-stream logic (`session::apply_rewatch`) starts a new one under a *new* `ConnId`/`StreamId`, whose entry
+started with `popped = false`: the window vanished and the stream reappeared inline in its tile. Reproduced in the
+headless rig by popping out and restarting the relay (pre-fix binary: only the main window left, stream inline; fixed:
+the pop-out window comes back). Not the cause (checked): viewer recovery L1 (Unsubscribe+Subscribe keeps the watch) and L2
+(resets the pipeline in place, same `FrameSource`), `OVERLAY_IDLE`, Esc (never closes), modals/room switching
+(`popout::show` runs on every path of `App::draw`, both fullscreen and normal). Fix: `VideoViews::sync_with` remembers a
+vanished popped entry by owner name + stream label (`PendingPop`, only while its room is joined or suspended, for
+`REWATCH_GRACE`) and hands the flag to the entry of a watch with `WatchEntry::resumed` (set by `rewatch_one`) that
+matches. *Why only `resumed` watches:* a watch the user starts by hand (or after the 30 s resume window) must not pop
+out by surprise; an explicit `Unwatch` clears `popped` first. The window itself is re-created (same position rules as
+any new pop-out, windowed): it is closed while the room is suspended. Test:
+`ui::tests::popout_survives_resume`.
+
 **Double-click a watched tile = fullscreen** (2026-10-15, task #77). `room::tiles` registers a
 `Sense::click` over the tile's video (before the hover overlay, so the overlay's buttons keep their own
 clicks; a single click still does nothing) and a double-click pushes `UiAction::EnterStreamFullscreen(key)`.

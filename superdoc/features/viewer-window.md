@@ -26,6 +26,9 @@ stream** (`StreamKey = (RoomHandle, ConnId, StreamId)`), re-declared every frame
   buttons keep their own clicks); **Esc** only *leaves* fullscreen and never closes (the former Electron rule,
   kept on purpose: a stray Esc must not kill someone's stream window).
   The same overlay is drawn over the main window's own fullscreen stream (task #106, `ui/APP-SHELL.md`), with an exit-fullscreen button in place of the ×.
+- **A reconnect or a re-share keeps the window** (task #132): the pop-out is carried over to the resumed watch of the same
+  owner name + label, see `ui/APP-SHELL.md` "A pop-out survives its watch being re-created". Before, such an event closed
+  the window by itself and the stream came back inline.
 - **Closing brings the stream back.** The x button or an OS close sets `close_requested`, which the
   next main-window frame turns into `UiAction::BringBack`: the stream returns to its tile.
 - **Performance:** pop-outs hold 240/240 fps (decoded/presented) when the presentation mode is
