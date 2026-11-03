@@ -391,6 +391,24 @@ instead of through `Shared::pending_volume` (the data is collected per frame wit
 refresh). *Why:* user request 2026-11-03: "the same overlay, that a fullscreened pop-out has, should be
 there when i fullscreen a screenshare inside of the main window". One `chrome` function serves both so
 the two cannot drift apart.
+
+**The fullscreen overlay auto-hides after 3 s idle** (2026-11-03, task #124): in fullscreen (the main
+window's stream fullscreen *and* a fullscreened pop-out; a windowed pop-out keeps "visible while the pointer
+is inside") `popout::overlay_visible` hides the chrome (vignette, statbar, round button, audio pill / chip)
+and sets the cursor to `CursorIcon::None` once `OVERLAY_IDLE` (3 s) passes without a pointer move, press,
+scroll or key; any of those brings both back. Resting the pointer on the statbar, the round button or the
+audio pill/chip keeps it (`ChromeOut::over`, remembered one frame in egui temp memory, per viewport), so a
+control never vanishes under the cursor. The chrome has no dropdown/menu, so there is no menu-open case yet.
+The centre chip (waiting / recovering / stalled) stays regardless. The rule is the pure
+`overlay_shown(now, last_active, over_control)` (test `overlay_hides_after_the_idle_time_unless_a_control_is_hovered`);
+`request_repaint_after` is asked only while the overlay is up and not held by a control, so an idle hidden
+overlay causes no repaint loop. No fade (the native chrome paints with raw painters; a hard cut, no flicker).
+The browser twin is `popout.js` `autoHide` + `.pip-stage.idle` in `app.css` (fullscreen stage only, 3 s,
+keeps while `.statbar`/`.round-btn` is hovered; the existing 120 ms opacity transition is the fade; e2e check in
+`docs/dev/e2e/avatar-fullscreen.mjs`). *Why:* user request 2026-11-03: "The overlay in full screen should go
+away when the mouse cursor isn't moved for like 2, 3, 4, 5 seconds" (3 s picked from that range). Verified in
+the headless rig: overlay up after a move, gone after ~4 s idle (and the cursor, `grim -c`), back on a move,
+kept while resting on the statbar, both for the in-window fullscreen and a fullscreened pop-out.
 *Why:* user request 2026-10-15 ("double clicking a share should actually full-screen it"). *Why a mode of
 the main window and not a new viewport:* the pop-out already exists for "own window"; this is the quick
 "fill my screen" gesture and must restore the layout (scroll, selection) untouched. Test:

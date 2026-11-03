@@ -14,7 +14,7 @@ stream** (`StreamKey = (RoomHandle, ConnId, StreamId)`), re-declared every frame
 - **Shared view, no second decode.** The viewport paints the same `Arc<Mutex<VideoView>>` as the tile
   (`paint(ui, ui.max_rect(), Fit::Contain)`), so GPU textures and the decoder are shared and the tile
   shows a placeholder while popped (`VideoViews`' `popped` flag, `ui/video.rs`).
-- **Hover chrome** (the former Electron `body:hover` rule, no idle timeout): while the pointer is anywhere in
+- **Hover chrome** (the former Electron `body:hover` rule, no idle timeout in a window; in fullscreen it auto-hides after 3 s idle, task #124, `ui/APP-SHELL.md`): while the pointer is anywhere in
   the window a vignette, a top row `[statbar][x]` and a bottom audio pill (`[mute][slider 0-500 %, snaps at 100 %][%]`,
   or "No audio shared") appear. Statbar = `[dot][name . room][WxH][decoded/presented fps][bitrate]`
   in fixed tabular-width fields. A centred chip is always shown while waiting for the first frame, "Recovering…" (viewer recovery, `features/video-pipeline.md`) or "Sharer's capture stalled" (not hover-gated; same wording as the in-app tile). The

@@ -353,6 +353,8 @@ select.field { cursor: pointer; padding-right: 6px; }
 .pip-stage > canvas { width: 100%; height: 100%; object-fit: contain; display: block; }
 .pip-stage .ovl { opacity: 0; transition: opacity .12s; }
 .pip-stage:hover .ovl { opacity: 1; }
+.pip-stage.idle, .pip-stage.idle * { cursor: none; }
+.pip-stage.idle:hover .ovl { opacity: 0; }
 .tile:fullscreen { border-radius: 0; box-shadow: none; aspect-ratio: auto; }
 
 @media (prefers-reduced-motion: reduce) { .badge-progress .bar, .sdot.reconnecting, .sdot.connecting { animation: none; } }

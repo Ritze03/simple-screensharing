@@ -11,7 +11,7 @@
 //! for the behaviour spec and its history), drawn like the mockup's tile
 //! overlay:
 //! - **Hover-gated chrome**: while the pointer is anywhere in the window
-//!   (no idle timeout) a vignette, a top
+//!   (no idle timeout, except in fullscreen: `OVERLAY_IDLE`, #124) a vignette, a top
 //!   row `[fill statbar][29 ×]` and a bottom audio pill. The statbar is
 //!   `[dot][name · room][WxH][dec/pres fps][bitrate]`, mono values in fixed
 //!   tabular-width fields so they don't jitter.
@@ -52,6 +52,68 @@ use crate::widgets::{self, FILL, HBox, fixed, paint_icon, paint_text, text_width
 const INFO_INTERVAL: f64 = 0.25;
 /// Height of the statbar, round buttons and audio pill (mockup 29 px).
 const CHROME_H: f32 = 29.0;
+/// Fullscreen overlay auto-hide: seconds without pointer movement, click, scroll
+/// or key press before the overlay (and the mouse cursor) goes away (#124).
+const OVERLAY_IDLE: f64 = 3.0;
+
+/// Idle bookkeeping of one fullscreen overlay, kept in egui's temp memory per viewport
+/// (the pop-out viewport closure cannot hold `Cx`; both callers share this).
+#[derive(Clone, Copy, Default)]
+struct Idle {
+    /// `ctx` time of the last pointer move / press / scroll / key; None before the first frame.
+    last_active: Option<f64>,
+    pos: Option<egui::Pos2>,
+    /// The pointer was over a control (statbar, button, audio pill) last frame.
+    over: bool,
+}
+
+/// The auto-hide rule (pure): shown while the pointer rests on a control or the last
+/// activity is younger than [`OVERLAY_IDLE`].
+fn overlay_shown(now: f64, last_active: f64, over_control: bool) -> bool {
+    over_control || now - last_active < OVERLAY_IDLE
+}
+
+/// Update the idle state from this frame's input and say whether the overlay shows.
+/// While idle-hidden it also sets the cursor to none; while shown it schedules the
+/// repaint at the deadline (no repaint loop otherwise).
+fn overlay_visible(ctx: &egui::Context) -> bool {
+    let id = egui::Id::new("overlay_idle").with(ctx.viewport_id());
+    let mut st: Idle = ctx.data(|d| d.get_temp(id)).unwrap_or_default();
+    let (now, pos, active) = ctx.input(|i| {
+        let key = i.events.iter().any(|e| matches!(e, egui::Event::Key { .. } | egui::Event::Text(_)));
+        let active = i.pointer.any_down()
+            || i.raw_scroll_delta != Vec2::ZERO
+            || key
+            || i.pointer.latest_pos() != st.pos;
+        (i.time, i.pointer.latest_pos(), active)
+    });
+    st.pos = pos;
+    let last = match st.last_active {
+        Some(t) if !(active || st.over) => t,
+        _ => now,
+    };
+    st.last_active = Some(last);
+    ctx.data_mut(|d| d.insert_temp(id, st));
+    let shown = overlay_shown(now, last, st.over);
+    if shown {
+        if !st.over {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64((OVERLAY_IDLE - (now - last)).max(0.0) + 0.02));
+        }
+    } else {
+        ctx.set_cursor_icon(egui::CursorIcon::None);
+    }
+    shown
+}
+
+/// Remember whether the pointer is over a control, so the next frame keeps the overlay.
+fn overlay_note_over(ctx: &egui::Context, over: bool) {
+    let id = egui::Id::new("overlay_idle").with(ctx.viewport_id());
+    ctx.data_mut(|d| {
+        let mut st: Idle = d.get_temp(id).unwrap_or_default();
+        st.over = over;
+        d.insert_temp(id, st);
+    });
+}
 
 /// Pop-out UI state: one entry per open window.
 #[derive(Default)]
@@ -226,7 +288,7 @@ pub fn fullscreen_overlay(ui: &mut Ui, cx: &mut Cx, key: StreamKey, rect: Rect, 
     if !first_frame || health != 0 {
         centre_chip(ui, rect, &chip_text(first_frame, health));
     }
-    if !ui.ctx().input(|i| i.pointer.has_pointer()) {
+    if !ui.ctx().input(|i| i.pointer.has_pointer()) || !overlay_visible(ui.ctx()) {
         return false;
     }
     let Some(entry) = cx.videos.get(key) else {
@@ -235,6 +297,7 @@ pub fn fullscreen_overlay(ui: &mut Ui, cx: &mut Cx, key: StreamKey, rect: Rect, 
     let stats = entry.view.lock().unwrap().source().stats();
     let tip = tr("ui.popout.exit_fullscreen_tip", "Exit fullscreen");
     let out = chrome(ui, rect, &mut info, (stats.decoded_fps, stats.presented_fps), ("fullscreen_exit", &tip));
+    overlay_note_over(ui.ctx(), out.over);
     if let Some((volume_percent, muted)) = out.volume {
         cx.act(UiAction::SetVolume { stream: key, volume_percent, muted });
     }
@@ -254,7 +317,10 @@ fn chip_text(first_frame: bool, health: u8) -> String {
 // ---------------------------------------------------------------------------
 
 fn viewport(ctx: &egui::Context, shared: &Shared) {
-    let hovered = ctx.input(|i| i.pointer.has_pointer());
+    let fullscreen_now = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+    // Windowed pop-outs keep the chrome for as long as the pointer is inside; only
+    // fullscreen auto-hides it (#124).
+    let hovered = ctx.input(|i| i.pointer.has_pointer()) && (!fullscreen_now || overlay_visible(ctx));
     let mut double_clicked = false;
     egui::CentralPanel::default()
         .frame(egui::Frame::NONE.fill(Color32::BLACK))
@@ -279,6 +345,9 @@ fn viewport(ctx: &egui::Context, shared: &Shared) {
                     (stats.decoded_fps, stats.presented_fps),
                     ("close", &tip),
                 );
+                if fullscreen_now {
+                    overlay_note_over(ui.ctx(), out.over);
+                }
                 if out.button {
                     shared.close.store(true, Ordering::Relaxed);
                     ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
@@ -322,11 +391,14 @@ struct ChromeOut {
     button: bool,
     /// New (volume, muted) when the audio pill was edited.
     volume: Option<(u32, bool)>,
+    /// The pointer is over the statbar, the button or the audio pill / chip.
+    over: bool,
 }
 
 /// Vignette + top row (statbar, round button `(icon, tip)`) + bottom row
 /// (audio pill). `fps` is (decoded, presented).
 fn chrome(ui: &mut Ui, rect: Rect, info: &mut Info, fps: (f64, f64), button: (&str, &str)) -> ChromeOut {
+    let pointer = ui.input(|i| i.pointer.latest_pos()).unwrap_or(pos2(f32::NAN, f32::NAN));
     let p = ui.painter();
     let shade = |a: f32| Color32::from_rgba_unmultiplied(10, 11, 13, (a * 255.0) as u8);
     let split = rect.top() + rect.height() * 0.4;
@@ -360,10 +432,13 @@ fn chrome(ui: &mut Ui, rect: Rect, info: &mut Info, fps: (f64, f64), button: (&s
         .gap(theme::S2)
         .slots(&[FILL, fixed(CHROME_H)])
         .show(&mut ov);
-    top.show(&mut ov, 0, Align::Min, |ui| statbar(ui, info, fps.0, fps.1));
-    let button = top
-        .show(&mut ov, 1, Align::Min, |ui| round_btn(ui, button.0, button.1))
-        .clicked();
+    let bar = top.show(&mut ov, 0, Align::Min, |ui| {
+        statbar(ui, info, fps.0, fps.1);
+        ui.min_rect()
+    });
+    let button = top.show(&mut ov, 1, Align::Min, |ui| round_btn(ui, button.0, button.1));
+    let mut over = bar.contains(pointer) || button.rect.contains(pointer);
+    let button = button.clicked();
 
     // Bottom: [audio pill | no-audio chip].
     let mut bottom = ov.new_child(
@@ -385,7 +460,8 @@ fn chrome(ui: &mut Ui, rect: Rect, info: &mut Info, fps: (f64, f64), button: (&s
             &tr("ui.popout.no_audio", "No audio shared"),
         );
     }
-    ChromeOut { button, volume }
+    over |= bottom.min_rect().contains(pointer);
+    ChromeOut { button, volume, over }
 }
 
 /// `.statbar`: dark pill, `[dot][fill name][res][fps][bitrate]`, content-sized
@@ -555,6 +631,14 @@ mod tests {
         );
         assert_eq!(initial_size(None), vec2(960.0, 540.0));
         assert_eq!(initial_size(Some((0, 0))), vec2(960.0, 540.0));
+    }
+
+    #[test]
+    fn overlay_hides_after_the_idle_time_unless_a_control_is_hovered() {
+        assert!(overlay_shown(10.0, 10.0, false));
+        assert!(overlay_shown(10.0 + OVERLAY_IDLE - 0.01, 10.0, false));
+        assert!(!overlay_shown(10.0 + OVERLAY_IDLE, 10.0, false));
+        assert!(overlay_shown(100.0, 10.0, true), "resting on a control keeps it");
     }
 
     #[test]
