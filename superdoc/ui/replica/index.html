@@ -1479,7 +1479,8 @@ window.addEventListener("pointermove", (e) => {
     if (!f || !o) return;
     if (drag.kind === "rz") {
       const a = parseFloat(drag.t.style.getPropertyValue("--ar")) || 16 / 9;
-      const want = Math.max(o.w * W + dx, (o.h * H + dy) * a); /* the corner follows whichever axis moved further */
+      /* the corner goes to the point of the window's diagonal nearest the pointer, so width and height both count, growing and shrinking */
+      const want = (o.w * W + dx + (o.h * H + dy) / a) / (1 + 1 / (a * a));
       f.w = Math.max(160, Math.min(want, (1 - o.x) * W, (1 - o.y) * H * a)) / W;
     }
     else { f.x = Math.max(0, Math.min(1 - o.w, o.x + dx / W)); f.y = Math.max(0, Math.min(1 - o.h, o.y + dy / H)); }
