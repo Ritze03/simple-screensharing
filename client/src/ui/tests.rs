@@ -943,3 +943,82 @@ fn the_bar_follows_the_live_audio_share_not_the_stopping_one() {
     assert_eq!(paired_audio(&state, CaptureSourceId(10)), Some(CaptureSourceId(21)));
     assert_eq!(paired_audio(&state, CaptureSourceId(99)), None);
 }
+
+// ---------------------------------------------------------------------------
+// Task #132: "the pop-out sometimes just closes all by itself". A re-created watch (reconnect,
+// L3, relay restart, the sharer stopping and re-sharing) is a new (ConnId, StreamId) key, and the
+// `popped` flag lived on the old key's entry: the window vanished and the stream reappeared in its
+// tile. `VideoViews::sync_with` now carries the pop-out over to a *resumed* watch.
+// ---------------------------------------------------------------------------
+
+mod popout_survives_resume {
+    use std::time::{Duration, Instant};
+
+    use simple_screensharing_client::decode::StreamDecoder;
+    use simple_screensharing_client::session::{REWATCH_GRACE, RoomHandle};
+
+    use super::super::video::{LiveWatch, StreamKey, VideoViews};
+
+    const ROOM: RoomHandle = RoomHandle(1);
+
+    fn watch(key: StreamKey, label: &str, resumed: bool) -> LiveWatch {
+        let source = StreamDecoder::new(key.2).expect("decoder").frames();
+        LiveWatch { key, source, identity: Some(("bob".into(), label.into())), resumed }
+    }
+
+    /// bob's "Screen" popped out under `(ROOM, 10, 1)`, then its watch ends.
+    fn popped_then_ended(now: Instant) -> VideoViews {
+        let mut v = VideoViews::default();
+        let old = (ROOM, 10, 1);
+        v.sync_with(vec![watch(old, "Screen", false)], &[ROOM], now);
+        v.get_mut(old).unwrap().popped = true;
+        // The next frame refreshes the remembered identity of a popped entry.
+        let source = v.get(old).unwrap().view.lock().unwrap().source().clone();
+        v.sync_with(vec![LiveWatch { key: old, source, identity: Some(("bob".into(), "Screen".into())), resumed: false }], &[ROOM], now);
+        assert_eq!(v.popped(), vec![old]);
+        v.sync_with(vec![], &[ROOM], now);
+        assert!(v.keys().is_empty() && v.popped().is_empty(), "the ended watch's entry is gone");
+        v
+    }
+
+    #[tokio::test]
+    async fn a_resumed_watch_of_the_same_stream_is_popped_out_again() {
+        let now = Instant::now();
+        let mut v = popped_then_ended(now);
+        // After a reconnect the owner has a new ConnId and the stream a new StreamId.
+        let new = (ROOM, 77, 3);
+        v.sync_with(vec![watch(new, "Screen", true)], &[ROOM], now + Duration::from_secs(5));
+        assert_eq!(v.popped(), vec![new], "the pop-out window must come back with the stream");
+    }
+
+    #[tokio::test]
+    async fn only_the_same_stream_resumed_in_time_inherits_the_pop_out() {
+        let now = Instant::now();
+        let new = (ROOM, 77, 3);
+        // A watch the user started by hand never inherits one.
+        let mut v = popped_then_ended(now);
+        v.sync_with(vec![watch(new, "Screen", false)], &[ROOM], now);
+        assert!(v.popped().is_empty());
+        // Another stream of the owner does not either.
+        let mut v = popped_then_ended(now);
+        v.sync_with(vec![watch(new, "Window", true)], &[ROOM], now);
+        assert!(v.popped().is_empty());
+        // Too late.
+        let mut v = popped_then_ended(now);
+        v.sync_with(vec![], &[ROOM], now + REWATCH_GRACE + Duration::from_secs(1));
+        v.sync_with(vec![watch(new, "Screen", true)], &[ROOM], now + REWATCH_GRACE + Duration::from_secs(2));
+        assert!(v.popped().is_empty());
+        // The room was left meanwhile (neither joined nor reconnecting).
+        let mut v = popped_then_ended(now);
+        v.sync_with(vec![], &[], now);
+        v.sync_with(vec![watch(new, "Screen", true)], &[ROOM], now);
+        assert!(v.popped().is_empty());
+        // One pending pop-out is used up by one resumed watch.
+        let mut v = popped_then_ended(now);
+        v.sync_with(vec![watch(new, "Screen", true)], &[ROOM], now);
+        v.get_mut(new).unwrap().popped = false;
+        v.sync_with(vec![], &[ROOM], now);
+        v.sync_with(vec![watch((ROOM, 78, 4), "Screen", true)], &[ROOM], now);
+        assert!(v.popped().is_empty(), "a tile the user brought back is not popped again");
+    }
+}

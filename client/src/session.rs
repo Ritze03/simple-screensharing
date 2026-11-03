@@ -680,6 +680,10 @@ pub struct WatchEntry {
     /// `toggle_watch`, meant every viewer who was already watching stayed
     /// permanently silent — see `sync_audio_watches`' doc comment.
     pub audio_stream_id: Option<StreamId>,
+    /// This watch was started by the wanted-stream logic ([`RoomSession::apply_rewatch`]: a
+    /// reconnect or the sharer's re-share), not by the user. The UI carries a pop-out over to
+    /// such a watch (`ui/video.rs`); a watch the user starts by hand never inherits one.
+    pub resumed: bool,
 }
 
 /// One audio stream currently being decoded/played, whether auto-subscribed
@@ -1033,7 +1037,12 @@ impl RoomSession {
             self.audio_volume_by_owner.insert(owner, volume);
         }
         match wanted.kind {
-            StreamKind::Video => self.toggle_watch(owner, stream_id),
+            StreamKind::Video => {
+                self.toggle_watch(owner, stream_id);
+                if let Some(entry) = self.watches.lock().unwrap().get_mut(&(owner, stream_id)) {
+                    entry.resumed = true;
+                }
+            }
             // Audio rides along with its owner's video watch
             // (`sync_audio_watches`); only a sender with no video needs an
             // explicit Listen.
@@ -1394,6 +1403,7 @@ impl RoomSession {
                         WatchEntry {
                             decoder: Arc::new(Mutex::new(decoder)),
                             audio_stream_id: None,
+                            resumed: false,
                         },
                     );
                     self.watch_error = None;
