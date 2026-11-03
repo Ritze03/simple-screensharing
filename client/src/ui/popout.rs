@@ -139,6 +139,8 @@ struct Shared {
     info: Mutex<Info>,
     /// Volume edit from the viewport, applied by the main window.
     pending_volume: Mutex<Option<(u32, bool)>>,
+    /// Level-loudness toggle from the viewport, applied by the main window.
+    pending_level: Mutex<Option<bool>>,
 }
 
 /// Chrome data, refreshed by the main window.
@@ -151,6 +153,8 @@ struct Info {
     has_audio: bool,
     volume: u32,
     muted: bool,
+    /// The global loudness-levelling switch (`AppState::level_loudness`).
+    level: bool,
     kbps: f64,
 }
 
@@ -176,6 +180,7 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut PopoutState) {
                 health: AtomicU8::new(0),
                 info: Mutex::new(Info::default()),
                 pending_volume: Mutex::new(None),
+                pending_level: Mutex::new(None),
             }),
             size: initial_size(cx.videos.frame_size(key).or_else(|| stream_size(cx, key))),
             next_info: 0.0,
@@ -186,6 +191,9 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut PopoutState) {
                 volume_percent,
                 muted,
             });
+        }
+        if let Some(on) = win.shared.pending_level.lock().unwrap().take() {
+            cx.act(UiAction::SetLevelLoudness(on));
         }
         if now >= win.next_info {
             win.next_info = now + INFO_INTERVAL;
@@ -258,7 +266,7 @@ fn collect_info(cx: &Cx, key: StreamKey) -> (Info, u8) {
             ViewState::SharerStalled => 2,
         };
     }
-    let info = Info { label, res, has_audio, volume: vol.volume_percent, muted: vol.muted, kbps };
+    let info = Info { label, res, has_audio, volume: vol.volume_percent, muted: vol.muted, level: cx.state.level_loudness, kbps };
     (info, health)
 }
 
@@ -268,8 +276,11 @@ fn refresh_info(cx: &Cx, key: StreamKey, shared: &Shared) -> bool {
     let (new, health) = collect_info(cx, key);
     {
         let mut info = shared.info.lock().unwrap();
-        let (volume, muted) = (info.volume, info.muted);
+        let (volume, muted, level) = (info.volume, info.muted, info.level);
         *info = new;
+        if shared.pending_level.lock().unwrap().is_some() {
+            info.level = level;
+        }
         // Keep the viewport's own just-made edit until it has been applied.
         if shared.pending_volume.lock().unwrap().is_some() {
             info.volume = volume;
@@ -300,6 +311,9 @@ pub fn fullscreen_overlay(ui: &mut Ui, cx: &mut Cx, key: StreamKey, rect: Rect, 
     overlay_note_over(ui.ctx(), out.over);
     if let Some((volume_percent, muted)) = out.volume {
         cx.act(UiAction::SetVolume { stream: key, volume_percent, muted });
+    }
+    if let Some(on) = out.level {
+        cx.act(UiAction::SetLevelLoudness(on));
     }
     out.button
 }
@@ -356,6 +370,10 @@ fn viewport(ctx: &egui::Context, shared: &Shared) {
                     *shared.pending_volume.lock().unwrap() = out.volume;
                     ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
                 }
+                if out.level.is_some() {
+                    *shared.pending_level.lock().unwrap() = out.level;
+                    ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                }
             }
         });
     let (f11, esc, fullscreen) = ctx.input(|i| {
@@ -391,6 +409,8 @@ struct ChromeOut {
     button: bool,
     /// New (volume, muted) when the audio pill was edited.
     volume: Option<(u32, bool)>,
+    /// New level-loudness switch when its button in the audio pill was clicked.
+    level: Option<bool>,
     /// The pointer is over the statbar, the button or the audio pill / chip.
     over: bool,
 }
@@ -449,9 +469,9 @@ fn chrome(ui: &mut Ui, rect: Rect, info: &mut Info, fps: (f64, f64), button: (&s
             ))
             .layout(Layout::left_to_right(Align::Center)),
     );
-    let mut volume = None;
+    let (mut volume, mut level) = (None, None);
     if info.has_audio {
-        volume = audio_pill(&mut bottom, info);
+        (volume, level) = audio_pill(&mut bottom, info);
     } else {
         widgets::chip_dark(
             &mut bottom,
@@ -461,7 +481,7 @@ fn chrome(ui: &mut Ui, rect: Rect, info: &mut Info, fps: (f64, f64), button: (&s
         );
     }
     over |= bottom.min_rect().contains(pointer);
-    ChromeOut { button, volume, over }
+    ChromeOut { button, volume, level, over }
 }
 
 /// `.statbar`: dark pill, `[dot][fill name][res][fps][bitrate]`, content-sized
@@ -535,12 +555,13 @@ fn round_btn(ui: &mut Ui, icon: &str, tip: &str) -> egui::Response {
         .on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// `.audio-pill`: `[25 mute][110 slider][34 %]`, or `[25 mute][Muted]`.
-/// Returns the new (volume, muted) when the user changed it.
-fn audio_pill(ui: &mut Ui, info: &mut Info) -> Option<(u32, bool)> {
+/// `.audio-pill`: `[25 mute][110 slider][34 %][25 level]`, or `[25 mute][Muted]`.
+/// Returns the new (volume, muted) when the user changed it, and the new level-loudness
+/// switch when its button was clicked (#126).
+fn audio_pill(ui: &mut Ui, info: &mut Info) -> (Option<(u32, bool)>, Option<bool>) {
     let pct_f = font(Weight::Mono, theme::FS_TINY);
     let muted_txt = tr("ui.popout.muted", "Muted");
-    let slots_on = [fixed(25.0), fixed(110.0), fixed(34.0)];
+    let slots_on = [fixed(25.0), fixed(110.0), fixed(34.0), fixed(25.0)];
     let muted_w = text_width(ui, &muted_txt, pct_f.clone(), 0.0).ceil();
     let slots_off = [fixed(25.0), fixed(muted_w)];
     // The row shape is fixed by the state it was laid out for; a click on
@@ -549,7 +570,7 @@ fn audio_pill(ui: &mut Ui, info: &mut Info) -> Option<(u32, bool)> {
     let (slots, w): (&[_], f32) = if was_muted {
         (&slots_off, 2.0 + 25.0 + 4.0 + muted_w + 10.0)
     } else {
-        (&slots_on, 2.0 + 25.0 + 4.0 + 110.0 + 4.0 + 34.0 + 10.0)
+        (&slots_on, 2.0 + 25.0 + 4.0 + 110.0 + 4.0 + 34.0 + 4.0 + 25.0 + 10.0)
     };
     let row = HBox::new("popout_audio", CHROME_H)
         .width(w)
@@ -564,7 +585,7 @@ fn audio_pill(ui: &mut Ui, info: &mut Info) -> Option<(u32, bool)> {
         Stroke::new(1.0_f32, Color32::from_white_alpha(46)),
         StrokeKind::Inside,
     );
-    let mut out = None;
+    let (mut out, mut level) = (None, None::<bool>);
     let tip = if info.muted {
         tr("ui.popout.unmute", "Unmute")
     } else {
@@ -612,8 +633,14 @@ fn audio_pill(ui: &mut Ui, info: &mut Info) -> Option<(u32, bool)> {
             Color32::from_rgba_unmultiplied(232, 233, 236, 217),
             Align::Max,
         );
+        let lr = Rect::from_center_size(row.cell(3).center(), Vec2::splat(25.0));
+        if super::level_toggle(ui, lr, ui.id().with("popout_level"), info.level) {
+            info.level = !info.level;
+            level = Some(info.level);
+            ui.ctx().request_repaint();
+        }
     }
-    out
+    (out, level)
 }
 
 #[cfg(test)]

@@ -57,6 +57,7 @@ pub struct Gallery {
     floor: u32,
     gop: u32,
     vol: [u32; 3],
+    level: bool,
     fps_idx: usize,
     audio_idx: usize,
     codec: Codec,
@@ -82,6 +83,7 @@ impl Default for Gallery {
             floor: 3000,
             gop: 1000,
             vol: [40, 100, 500],
+            level: true,
             fps_idx: 2,
             audio_idx: 1,
             codec: Codec::H264,
@@ -401,6 +403,25 @@ impl Gallery {
                     );
                     *v = cell.get();
                 }
+                // The level-loudness button that follows every volume slider (#126).
+                let level = std::cell::Cell::new(self.level);
+                ctrl_row_value(
+                    ui,
+                    "Level button (on / off)",
+                    None,
+                    |ui| {
+                        let (r, _) = ui.allocate_exact_size(vec2(60.0, 25.0), egui::Sense::hover());
+                        let on = Rect::from_min_size(r.min, vec2(25.0, 25.0));
+                        let off = on.translate(vec2(32.0, 0.0));
+                        crate::ui::level_toggle(ui, on, egui::Id::new("gal_level_on"), true);
+                        if crate::ui::level_toggle(ui, off, egui::Id::new("gal_level_off"), false) {
+                            level.set(!level.get());
+                        }
+                        r
+                    },
+                    |ui| value_box(ui, if level.get() { "on" } else { "off" }),
+                );
+                self.level = level.get();
             });
             card(r, "Video", None, |ui| self.video_rows(ui));
             card(r, "Encoder", None, |ui| {

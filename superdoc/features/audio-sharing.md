@@ -195,6 +195,9 @@ viewer slider is a linear amplitude (500 % = +14 dB, loud sources clip above ~20
   levelling, the sender boost is only a manual trim; more only lifts the noise floor.
 - **New: viewer-side "Level loudness"** (Settings > Playback, default **on**, persisted as
   `AppSettings::level_loudness`, live, native and browser). The viewer's volume slider and mute act after it.
+  *Follow-up #126 (2026-11-03):* the same global switch also has a small toggle button right after every volume slider
+  (native tile / pop-out / fullscreen pill, browser tile pill), so the viewer sees the state and can change it where they
+  adjust the volume. Still one global setting, not per stream. Details: `ui/APP-SHELL.md`.
 
 **Why viewer-side.** Every viewer has a different output chain and listening level, and watches several sharers
 with different levels at once: the level that sounds right is a property of the *listener*, so it is the listener's

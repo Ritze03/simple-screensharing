@@ -77,7 +77,7 @@ Watch and share both work. Differences from native, all platform limits:
   settings and the native app keep the setting. Details and the "why": `ui/APP-SHELL.md` (2026-11-01).
 - **Viewer volume is 0-500 %** (task #96, 2026-11-02): a WebAudio `GainNode` (`core/audio.js` `MAX_VOLUME = 5`), tile slider
   with a tick and a snap at 100 % (`ui/dom.js` `snapVolumePct`, `.vol` in `app.css`). Loud audio hard-clips at the device, no
-  limiter. The mouse wheel over the slider steps it (`volumeWheel`, `wheelStepVolumePct`, #113). Watched audio is levelled before the slider (`core/leveller.js`, Settings > Playback > Level loudness, default on, #119). Details and the why: `features/audio-sharing.md` (2026-11-02, 2026-11-03). In Firefox the tick only shows on the unfilled part of the track.
+  limiter. The mouse wheel over the slider steps it (`volumeWheel`, `wheelStepVolumePct`, #113). Watched audio is levelled before the slider (`core/leveller.js`, Settings > Playback > Level loudness, default on, #119); a small `graphic_eq` toggle button after the percentage in the tile's audio pill (`levelToggle`, `.audio-pill button.level`, #126) flips the same global `levelLoudness` setting as the Settings checkbox (accent ring = on). Details and the why: `features/audio-sharing.md` (2026-11-02, 2026-11-03). In Firefox the tick only shows on the unfilled part of the track.
 - **No audio source choice:** only what `getDisplayMedia({audio})` returns; the audio control is
   mute only. Native has the per-application picker (`pw-loopback`).
 - **Capture is damage-driven:** a static screen delivers no frames; the core re-encodes the newest
