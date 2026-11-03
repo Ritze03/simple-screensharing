@@ -72,6 +72,11 @@ const CARD_INFO_H: f32 = 12.0 + 22.0 + 8.0 + 16.0 + 8.0 + 32.0 + 12.0;
 const SINGLE_TILE_VH: f32 = 0.46;
 /// Smallest tile width the layouts aim for (a grid column's minimum).
 const MIN_TILE_W: f32 = theme::GRID_PITCH - theme::GRID_GAP;
+/// Widest a share card gets (see [`card_grid_shape`]). `Why 640:` the card's
+/// picture is a 320 px preview JPEG (`preview::PREVIEW_MAX_WIDTH`) or the own
+/// live preview (<= 640x360); wider only upscales a thumbnail, and Watch puts
+/// the real video in "On screen", which has no such cap.
+const CARD_MAX_W: f32 = 640.0;
 /// Room-name width the header keeps before it collapses its controls (a
 /// longer name truncates with "…" once every control is collapsed).
 const TITLE_NAME_MIN: f32 = 140.0;
@@ -139,6 +144,34 @@ pub fn grid_shape(n: usize, w: f32, h: f32, gap: f32) -> (usize, f32) {
     }
 }
 
+/// Columns and card width for the "Sharing in this room" cards (task #120, user
+/// report 2026-11-03: the old `grid_cols` grid added columns by width alone, so
+/// one card shrank to a quarter of the area as the window grew). Like a
+/// video-call gallery: try every column count from 1 to `min(n, columns of at
+/// least MIN_TILE_W that fit)` (never an empty column), size the card by the
+/// width *and* the viewport height `h` (16:9 thumb + `CARD_INFO_H` + 2 px border
+/// per row), cap at [`CARD_MAX_W`], and keep the largest card; on a tie (both
+/// at the cap) more columns win, so fewer rows. Never below `MIN_TILE_W` (unless
+/// the area is narrower): a short viewport scrolls instead. Every candidate's
+/// width only grows with `w` and the candidate set only grows, so a wider
+/// window never gives smaller cards.
+pub fn card_grid_shape(n: usize, w: f32, h: f32, gap: f32) -> (usize, f32) {
+    let w = w.max(0.0);
+    let n = n.max(1);
+    let fit = (((w + gap) / (MIN_TILE_W + gap)).floor() as usize).clamp(1, n);
+    let mut best = (1, 0.0_f32);
+    for cols in 1..=fit {
+        let rows = n.div_ceil(cols);
+        let cell_w = (w - gap * (cols as f32 - 1.0)) / cols as f32;
+        let cell_h = (h - gap * (rows as f32 - 1.0)) / rows as f32;
+        let by_h = (cell_h - CARD_INFO_H - 2.0) * 16.0 / 9.0 + 2.0;
+        let cw = cell_w.min(by_h).min(CARD_MAX_W).max(MIN_TILE_W.min(cell_w));
+        if cw >= best.1 {
+            best = (cols, cw);
+        }
+    }
+    best
+}
 
 fn initial(name: &str) -> String {
     name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default()
@@ -448,9 +481,18 @@ fn joined_body(ui: &mut Ui, cx: &mut Cx, st: &mut RoomState, r: &RoomEntry, h: R
             return;
         }
         let cxr: &Cx = cx;
-        widgets::grid_rows(ui, "room_cards", items.len(), |ui, i| match &items[i] {
-            CardItem::Share(info) => share_card(ui, cxr, h, info, &mut acts),
-            CardItem::Mine { capture, destination } => my_card(ui, cxr, h, *capture, *destination, &mut acts),
+        // Viewport minus the body padding and this section's heading (the clip rect
+        // is the ScrollArea's viewport), so a lone section's rows fit without scrolling.
+        let vh = ui.clip_rect().height() - 2.0 * theme::S4 - theme::HEADING_H - theme::S3;
+        let (cols, cw) = card_grid_shape(items.len(), ui.available_width(), vh, theme::GRID_GAP);
+        // A left-aligned block exactly `cols` cards wide, so the gaps stay 12.
+        let grid_w = cols as f32 * cw + (cols as f32 - 1.0) * theme::GRID_GAP;
+        ui.allocate_ui(vec2(grid_w, 0.0), |ui| {
+            ui.set_width(grid_w);
+            widgets::grid_rows_with(ui, cols, items.len(), |ui, i| match &items[i] {
+                CardItem::Share(info) => share_card(ui, cxr, h, info, &mut acts),
+                CardItem::Mine { capture, destination } => my_card(ui, cxr, h, *capture, *destination, &mut acts),
+            });
         });
     });
     for a in acts {
@@ -1333,6 +1375,39 @@ mod tests {
         assert_eq!(room_tile_cols(5, 1000.0), 2);
         // Two columns would be under 260 each.
         assert_eq!(room_tile_cols(2, 2.0 * MIN_TILE_W + theme::GRID_GAP - 1.0), 1);
+    }
+
+    #[test]
+    fn card_grid_never_adds_empty_columns_and_never_shrinks() {
+        let g = theme::GRID_GAP;
+        // One card never gets a second column, however wide; capped at CARD_MAX_W.
+        for w in [300.0, 1200.0, 2600.0, 5000.0] {
+            assert_eq!(card_grid_shape(1, w, 1000.0, g).0, 1, "{w}");
+        }
+        assert_eq!(card_grid_shape(1, 5000.0, 1000.0, g).1, CARD_MAX_W);
+        // A short viewport limits the card by its height (16:9 thumb + info block).
+        let (_, cw) = card_grid_shape(1, 2000.0, 400.0, g);
+        assert!((cw - ((400.0 - CARD_INFO_H - 2.0) * 16.0 / 9.0 + 2.0)).abs() < 0.01, "{cw}");
+        // Four cards: wide and short -> one row; wide and tall -> 2x2 or 4x1, whichever is bigger.
+        assert_eq!(card_grid_shape(4, 2400.0, 500.0, g).0, 4);
+        let (c, cw) = card_grid_shape(4, 1400.0, 1000.0, g);
+        assert!(c == 2 || c == 4, "{c}");
+        assert!(cw > 330.0, "{cw}");
+        // Growing the width never shrinks the cards, for any count and height; never overflows.
+        for n in 1..=6 {
+            for h in [300.0, 700.0, 1100.0] {
+                let mut prev = 0.0;
+                let mut w = 200.0;
+                while w < 4000.0 {
+                    let (c, cw) = card_grid_shape(n, w, h, g);
+                    assert!(c >= 1 && c <= n, "n={n} w={w} c={c}");
+                    assert!(cw + 0.001 >= prev, "n={n} h={h} w={w}: {cw} < {prev}");
+                    assert!(c as f32 * cw + (c as f32 - 1.0) * g <= w + 0.01, "n={n} w={w} overflows");
+                    prev = cw;
+                    w += 7.0;
+                }
+            }
+        }
     }
 
     #[test]

@@ -226,7 +226,7 @@ select.field { cursor: pointer; padding-right: 6px; }
 .p-user .who .b { font-size: 13px; line-height: 16px; color: var(--text); }
 .p-head h2 { margin: 0; font-size: 18px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .meta { color: var(--text-dim); font-size: 12px; white-space: nowrap; }
-.p-center { overflow-y: auto; padding: var(--s4); }
+.p-center { overflow-y: auto; scrollbar-gutter: stable; padding: var(--s4); }
 .p-right { width: 232px; flex: 0 0 232px; border-left: 1px solid var(--divider); background: var(--panel-sunken); overflow-y: auto; padding: var(--s4) var(--s3); }
 .member { height: var(--row-h); flex: 0 0 var(--row-h); padding: 0 var(--s1); border-radius: var(--rounding-sm); font-size: 13px; }
 .member:hover { background: var(--wash-hover-1); }

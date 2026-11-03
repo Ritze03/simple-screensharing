@@ -74,6 +74,19 @@ its "Proposed" tab).
   width either stacks English for nothing or still truncates German. *Why the banner
   keeps its words:* Retry now is its whole point. Details in `stream_settings.rs`
   (`column_need`) and `room::reconnect_banner`.
+- **"Sharing in this room" card grid** (#120, user report 2026-11-03): `room::card_grid_shape` picks the
+  columns and card width like a video-call gallery: column counts 1..`min(cards, columns >= 260 wide)`
+  (never an empty column), each card limited by its column width, by the viewport height (16:9 thumb +
+  the 112 px info block/border per row) and by `CARD_MAX_W` = 640; the biggest card wins, a tie (both at
+  640) goes to more columns (fewer rows). Never below 260 (a short viewport scrolls). The block is
+  exactly `cols` cards wide and **left-aligned** like the section heading. *Why:* the old grid took
+  `clamp(floor((w+12)/272), 1, 4)` columns by width alone, so one card grew with the window until a
+  new (empty) column appeared and halved it; the user: "it doesn't have to do that since the space
+  isn't required". A wider window now never gives smaller cards (each candidate only grows with the
+  width and the candidate set only grows; tested). *Why 640:* the card's picture is a 320 px preview
+  JPEG or the <= 640x360 own live preview; the real video goes to "On screen" via Watch. The browser
+  mirrors it (`dom.js` `cardShape`, `features/website.md`). The "On screen" tiles (1 capped / 2
+  columns) and "Watched streams" (`grid_shape`, cols <= tiles) already had no empty columns.
 - **Own-tile live preview** (#78, user request 2026-10-15): the own card in "Sharing in this room"
   shows a live <= 640x360 / <= 30 fps picture of what is captured **while the window is focused**
   (`LIVE`/`STARTING` chip left, `PREVIEW` chip right); unfocused, minimized or with the tile not
