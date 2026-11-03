@@ -222,6 +222,19 @@ Check with `python3 -I client/locales/check_keys.py`: every key used in `client/
 exists in both locales and the `%{placeholder}` sets match. Long German labels are why the
 label slot truncates and why a `ctrl_row` can move its tip onto the label.
 
+## HTML replica (design sandbox, 2026-11-03, task #131)
+
+`superdoc/ui/replica/index.html` is a static, single-file HTML replica of the native client (fake data, no
+backend) for trying redesigns before touching egui. *Why (user request 2026-11-03):* "build an artifact that is
+exactly like the current GUI, so we can do modifications to it and actually make it nice". Its CSS tokens at the
+top are named after the `theme.rs` constants (Rust name in a comment), so a change there maps back one line at a
+time. Views: room watching / cards / sharing live / nobody sharing, Watched streams, fullscreen stream; modals:
+Set up your stream, Stream settings, Settings, Create or join. It was matched against rig screenshots at
+1920x1080 (the "Rig data" set uses the rig's names for side-by-side). It is authored as a claude.ai artifact
+fragment (no `<!doctype>`/`<html>`, the publisher wraps it); open it locally inside a doctype wrapper or the
+browser uses quirks mode. It is a copy, not a source of truth: when the egui look changes, the replica drifts
+until someone updates it.
+
 ## Verifying a style change
 
 `--gallery` is the quick QC screen for widgets and tokens; it is **not** proof that a

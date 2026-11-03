@@ -556,6 +556,7 @@ frontend and is kept as history.
 - Documentation discipline for this workspace → `superdoc/claude-instructions/documentation.md`
 - Project vocabulary → `superdoc/meta/TERMINOLOGY.md`
 - Desktop client's egui theme/widget conventions, the slot layout model, `--gallery` → `superdoc/ui/STYLING-GUIDE.md`, `client/src/widgets/mod.rs`, `client/src/theme.rs`
+- An HTML replica of the native UI to sketch redesigns in (fake data, tokens named after `theme.rs`) → `superdoc/ui/replica/index.html` (STYLING-GUIDE "HTML replica")
 - Desktop client's window layout — behavioral rules (sidebar, ROOMS/Outgoing sections, room-row states, empty states) → `superdoc/ui/APP-SHELL.md`; code map → the `ui/` row of the module map above and `client/src/ui/mod.rs`'s module doc. (`superdoc/ui/FRONTEND-SHELL.md` documents the removed HTML frontend: history only.)
 - Desktop client's render presentation-mode (vsync/Immediate/Mailbox) setting → `superdoc/features/presentation-modes.md`
 - Sharer's own-tile live preview (native + browser, focus-gated) → `superdoc/features/self-preview.md`
