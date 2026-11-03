@@ -30,7 +30,7 @@ ST=$!
 for i in $(seq 1 60); do grep -q "viewer listening" $OUT/test.log 2>/dev/null && break; sleep 0.5; done
 grep -q "viewer listening" $OUT/test.log || { echo "viewer never listened"; tail -20 $OUT/test.log; exit 1; }
 echo "--- graph after start"; nodes; links | grep -v Midi
-( pw-record --target viewer-out -P stream.capture.sink=true --rate 48000 --channels 1 --format s16 $OUT/viewer.wav > $OUT/rec.log 2>&1 & ) 2>/dev/null
+( pw-record --target viewer-out -P stream.capture.sink=true --rate 48000 --channels 1 --format ${VFMT:-s16} $OUT/viewer.wav > $OUT/rec.log 2>&1 & ) 2>/dev/null
 SINKNAME=$(pw-link -o | grep "ssshare-sink" | grep -v -- "-cap" | head -1 | cut -d: -f1)
 ( pw-record --target "$SINKNAME" -P stream.capture.sink=true --rate 48000 --channels 1 --format s16 $OUT/sinkmon.wav > $OUT/rec2.log 2>&1 & ) 2>/dev/null
 T0=$(date +%s.%N)
