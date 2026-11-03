@@ -133,7 +133,7 @@ Rules for working in it:
   `Stream/Input/Unknown` -> WirePlumber 0.5 "target not found"): use `video/x-raw ! fakesink`
   (`hs-probe.sh`).
 
-## No audio tests (hard rule, user request 2026-10-14)
+## No audio tests on the host (hard rule, user request 2026-10-14; the test VMs are the exception, next section)
 
 Do not test audio sharing, level meters or tones; do not create any PipeWire *audio* stream.
 Spotify keeps playing on the user's machine (their own session, not part of the rig): never
@@ -150,6 +150,53 @@ corked/paused stream does not trigger it. **Never create such a stream**; on the
 PipeWire it also breaks their other apps. (The rig's private PipeWire is immune, one reason it is
 the default; `HS_PIPEWIRE=shared` is available but you should not need it.) See
 `features/stream-control.md` "Capture/encode performance".
+
+## Audio tests in the VMs (user offer, 2026-11-03)
+
+The no-audio rule above is for the **host**. The user offered two qemu VMs where real audio testing is
+allowed (task #123): libvirt `qemu:///system` domains **`arch-ssd`** and **`fedora-ssd`** (shut off by default).
+Inside them you may create audio streams, play a tone in Firefox, use `pw-cli`/`pw-link`/`pactl` and install
+packages with the VM's own passwordless `sudo`. On the host nothing changes: no audio streams, never Spotify.
+Both are GNOME/Wayland desktops with PipeWire + WirePlumber, user `mo`, no sound card (only `auto_null`).
+
+- **Start / reach:** `virsh -c qemu:///system start arch-ssd` (and/or `fedora-ssd`). The NIC is user-mode
+  (`passt`), so `virsh domifaddr` is empty; libvirt forwards **`127.0.0.1:2224` -> arch, `127.0.0.1:2223` ->
+  fedora** to the guest's sshd: `ssh -p 2224 mo@127.0.0.1` (key login works). `virsh qemu-agent-command <dom>
+  '{"execute":"guest-ping"}'` also works. A guest sees `/run/user/1000` with `wayland-0`; scripts source
+  `client/scripts/vm-audio/lib.sh` for `XDG_RUNTIME_DIR`/`WAYLAND_DISPLAY`/`DBUS_SESSION_BUS_ADDRESS`. Shut down
+  with `virsh -c qemu:///system shutdown <dom>` when done.
+- **Build in the VM** (glibc differs per distro): `client/scripts/vm-audio/vm-sync.sh <port>` tars the worktree
+  into `~/sss` (no rsync in the VMs), then in the VM `cargo test -p simple-screensharing-client --release --lib
+  --no-run` and `cargo build --release -p simple-screensharing-server` (about 4 min cold, 35 s incremental).
+  Arch had every dependency already; Fedora needed `gstreamer1-devel gstreamer1-plugins-base-devel
+  gstreamer1-plugins-bad-free-devel` (`client/check-deps.sh` says what is missing).
+- **Make it look like a desktop:** `fakehw.sh` (in the VM) adds a driver-clocked null sink
+  `alsa_output.fakehw` at priority 1000 as a PipeWire drop-in. Without it the only sink is the fallback
+  `auto_null`, which WirePlumber removes the moment another sink appears, and the share sink becomes the default
+  one: a different situation from a desktop with a real output device. EasyEffects (`dnf install easyeffects`,
+  `QT_QPA_PLATFORM=wayland easyeffects -w`) was run on the Fedora VM to match the user's host; it changed nothing.
+- **Source of sound:** `ff-setup.sh [firefox]` makes a 440 Hz `tone.wav` with ffmpeg, a page with
+  `<audio loop autoplay>` and a Firefox profile with autoplay allowed, and starts Firefox on it (Arch has no
+  Firefox package in the image; an unpacked `download.mozilla.org` tarball in `~/ffox` works). Pause/resume it
+  without any GUI driving through MPRIS (`busctl --user call org.mpris.MediaPlayer2.firefox.instance_* /org/mpris/MediaPlayer2
+  org.mpris.MediaPlayer2.Player Pause|Play`); no `ydotool` needed. Firefox's own `PlaybackStatus` property is the
+  way to see who paused it.
+- **Run a share:** the ignored `end_to_end_test::live_audio_share_soak` shares the node named `SSS_LIVE_APP`
+  (default `Firefox`) from an in-process sharer to an in-process viewer through a real relay
+  (`SSSHARE_SERVER_BIN`, `SSSHARE_SERVER_CWD`) for `SSS_LIVE_SECONDS`. The viewer's real `autoaudiosink` plays to
+  the null sink `viewer-out` (`PULSE_SINK=viewer-out`), whose monitor `pw-record` writes to a WAV: that is *what
+  a viewer hears*. A second `pw-record` on the share sink's monitor shows whether the graph or the app's pipeline
+  is at fault. `client/scripts/vm-audio/soak.sh LABEL pause|pause1|idle` (in the VM) drives one run
+  (pause/resume cycles, or a plain stop) and `host-run.sh PORT LABEL SCENARIO [SECS]` runs it from the host and
+  analyzes it: `analyze.py` (per 0.5 s: level, zero-crossing frequency, largest sample step relative to the peak; a
+  clean 440 Hz sine is 440 Hz / 0.058, a click or dropout is far above, a rate error moves the frequency) and
+  `summary.py` (seconds until clean after each resume). `watch.py` logs every node/link change every 0.3 s, which
+  is how the lost links and the re-created ports were found.
+- **Also capture, before/after a change:** `pw-dump`, `pw-top -b -n 2`, `pw-metadata -n settings`, and the
+  WirePlumber side (`WIREPLUMBER_DEBUG=s-linking.mpris:5`) when a player is paused unexpectedly.
+- **Leave the VMs as found:** remove `~/.config/pipewire/pipewire.conf.d/50-fakehw.conf` (and restart
+  `pipewire pipewire-pulse wireplumber`) if you added it; installed build dependencies may stay (say which in
+  the report).
 
 ## Machine safety
 

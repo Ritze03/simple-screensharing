@@ -3369,3 +3369,68 @@ mod session_logic {
         let _ = std::fs::remove_dir_all(&config_home);
     }
 }
+
+/// Live soak for the shared-audio chain against a real application (tasks #121/#123). Not a
+/// pass/fail test: it shares the audio of the PipeWire node named `SSS_LIVE_APP` (default
+/// `Firefox`) to an in-process viewer for `SSS_LIVE_SECONDS` (default 90) and prints the sender
+/// level and the viewer's packet count once a second, so a script that pauses/resumes/mutes the
+/// application meanwhile (MPRIS) can line the events up with what was sent. The viewer's real
+/// `autoaudiosink` plays to whatever sink `PULSE_SINK` / `PIPEWIRE_NODE` names; recording that
+/// sink's monitor is how the *heard* result is measured (`testing-and-verification.md`, VM audio
+/// tests). Run it only in a VM (audio streams are not allowed on the dev host).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live audio soak against a real application; VM only, see testing-and-verification.md"]
+async fn live_audio_share_soak() {
+    let level = if std::env::var_os("SSS_LIVE_DEBUG").is_some() { tracing::Level::DEBUG } else { tracing::Level::INFO };
+    let _ = tracing_subscriber::fmt().with_max_level(level).with_test_writer().try_init();
+    const AUDIO_STREAM_ID: u8 = 9;
+    let app = std::env::var("SSS_LIVE_APP").unwrap_or_else(|_| "Firefox".into());
+    let seconds: u64 = std::env::var("SSS_LIVE_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(90);
+
+    let port = pick_free_udp_port().expect("free udp port");
+    let _server = spawn_relay_server(port).expect("spawn relay");
+    let server_addr = format!("127.0.0.1:{port}");
+    let room_id: RoomId = rand::random();
+    let room_key: [u8; 32] = rand::random();
+    let join_string = crate::net::format_join_string(&server_addr, &room_id, &room_key);
+
+    let (client_a, _snapshot_a, events_a) = connect_with_retry(&join_string, "sharer").await.expect("client A");
+    let _events_a_keepalive = events_a;
+    let owner = client_a.conn_id();
+    let (client_b, snapshot_b, events_b) = connect_with_retry(&join_string, "viewer").await.expect("client B");
+    let mut viewer = crate::session::AppState::default();
+    let room_handle = viewer.insert_room(client_b, snapshot_b, events_b, join_string.clone());
+    let ctx = egui::Context::default();
+
+    let sources = crate::audio::list_audio_sources().expect("list_audio_sources");
+    let source = sources.iter().find(|s| s.name == app).cloned().unwrap_or_else(|| panic!("no audio source named {app}: {sources:?}"));
+    let audio_handle = crate::audio::start_audio_sharing(&client_a, AUDIO_STREAM_ID, &source, 1.0, false)
+        .await
+        .expect("start_audio_sharing");
+    eprintln!("[soak] sharing '{app}'");
+
+    for _ in 0..80 {
+        viewer.drain_events(&ctx);
+        if viewer.rooms[&room_handle].streams.iter().any(|s| s.owner == owner && s.stream_id == AUDIO_STREAM_ID) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    viewer.rooms.get_mut(&room_handle).unwrap().toggle_listen(owner, AUDIO_STREAM_ID);
+    eprintln!("[soak] viewer listening");
+
+    for t in 0..seconds {
+        viewer.drain_events(&ctx);
+        let packets = viewer.rooms[&room_handle]
+            .audio_watches
+            .lock()
+            .unwrap()
+            .get(&(owner, AUDIO_STREAM_ID))
+            .map(|w| w.decoder.packets_received())
+            .unwrap_or(0);
+        eprintln!("[soak] t={t:3}s sender level {:.3} viewer packets {packets}", audio_handle.level());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let _ = audio_handle.stop().await;
+    eprintln!("[soak] done");
+}

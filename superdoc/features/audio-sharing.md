@@ -3,7 +3,95 @@
 Audio capture/encode/playback is described where it grew up: `features/stream-control.md`
 ("Sharing audio ...", "The 2026-07-28 audio bugs"), `features/video-pipeline.md` ("Audio follows
 video") and the module docs of `client/src/audio.rs` and `client/src/decode.rs`. This page covers
-**keeping the audio aligned with the picture** (task #91, 2026-11-01), the **shared audio is a name** (#105), the viewer volume (#96), the **sender-side boost** (#114, capped at 200 % and calibration-free since #119) and the **viewer-side loudness levelling** (#119).
+**keeping the audio aligned with the picture** (task #91, 2026-11-01), the **shared audio is a name** (#105), the viewer volume (#96), the **sender-side boost** (#114, capped at 200 % and calibration-free since #119) and the **viewer-side loudness levelling** (#119); for the share sink's lifecycle (WirePlumber pauses a player when its sink goes away, a resuming stream loses its links) see the #123 block.
+
+## 2026-11-03: stopping or switching a share paused the player, and a pause/resume left the chain dead (task #123)
+
+Two user reports on master with #121: *"selecting my browser as an audio source immediately pauses the video"*
+and *"pausing and unpausing still breaks"* the shared audio (viewers hear broken audio until the source is
+re-selected). Both were reproduced and measured for real, in the two test VMs (Arch: PipeWire 1.6.10 /
+WirePlumber 0.5.18; Fedora 44: PipeWire 1.6.2 / WirePlumber 0.5.13; both GNOME/Wayland, Firefox 159, EasyEffects
+8.2.8 on the Fedora one), see `claude-instructions/testing-and-verification.md` "Audio tests in the VMs".
+
+### 1. The video paused because WirePlumber pauses players when a sink goes away
+
+**Cause (proven).** WirePlumber's `linking/mpris-pause.lua` (setting `linking.pause-playback`, on by default;
+present in 0.5.13 and 0.5.18) pauses the MPRIS media players whose streams are linked to a sink at the moment
+that sink is removed, the way a browser stops when headphones are unplugged. Since #121 the share sink is a real
+`Audio/Sink` with the shared app linked into it, so every removal of it paused the app being shared. (The old
+`pw-loopback` was two stream nodes, not a sink, so the script never saw it.) Evidence: a D-Bus monitor on the
+VM's session bus caught `org.mpris.MediaPlayer2.Player.Pause` sent **by `wireplumber`** (bus name resolved to its
+pid) to Firefox at the instant a sink disappeared; and with the real client sharing Firefox, Firefox's
+`PlaybackStatus` went `Playing` -> `Paused` exactly when the share stopped, on both distros. Nothing else is
+needed to trigger it: no EasyEffects, no default-sink change.
+
+**Fix (`audio.rs`, `kill_and_wait` / `unlink_sink_inputs`).** Every removal of the sink now first deletes the
+links that feed it (`pw-link -d <link id>` for every link whose `link.input.node` is the sink; the monitor link
+to our own capture stream stays) and waits 250 ms (`UNLINK_SETTLE`) so WirePlumber has handled the link removals
+before the node removal; the script reads the links that exist when the sink goes, finds no player, and does
+nothing. The sink's owner became `SinkProc { child, name }` (derefs to the `pw-cli` `Child`) so the removal
+knows which sink to unlink; `kill_and_wait(&mut SinkProc)` is used by `stop()`, `Drop`, the rebuild's old sink
+and every failed-start path. After: Firefox stays `Playing` through the stop (both distros).
+
+*Why unlink first and not change the sink:* the script keys on "an `Audio/Sink` session item is removed", which
+the capture by `pipewiresrc ... stream.capture.sink=true` needs the sink class for; unlinking first keeps the
+#121 design (own clock) and costs 250 ms once per removal. *Which path paused it "immediately on selecting"* is
+not proven: picking a source while one is already shared stops the old share first (`ShareAudio` in
+`ui/apply.rs` -> `stop_share`), and a failed start kills its sink too; both are covered. If the report persists
+in a form that is neither, run `journalctl --user -u wireplumber | grep mpris` (or `WIREPLUMBER_DEBUG=s-linking.mpris:5`)
+while selecting: it logs `node N removed: pausing linked media player ...` with the node that went away.
+
+### 2. After a pause/resume the share is silent (or garbled) for good
+
+**Cause (proven).** On resume Firefox **re-creates the ports of its stream node** (same node id, new port ids;
+`pw-dump` watched at 0.3 s: the node goes `running` -> `idle` on pause, and on resume its old
+`output_FL`/`output_FR` ports vanish and new ones appear). PipeWire removes every link on the old ports, so the
+links into our sink are gone while the node, its id and its `running` state look unchanged (the user's
+`pw-dump` showed exactly that: the same four ids, all running). The poll tracked linked streams by node id, so
+it saw nothing to do, and the share carried silence until the user re-selected the source. That is the
+"silent" outcome measured on both distros (`viewer.wav` after the resume: digital silence for the rest of the
+run). Re-creating just the links was tried first (`pw-link` the missing pairs into the running chain) and is
+worse: the sink monitor stayed perfectly clean, but the capture side came out **garbled** on the viewer (about
+2.7 % low, steady clicks; in one run `pw-top` showed the share's group with no cycles at all and the capture was silent),
+while the sender-side PCM and PTS were clean in some runs and garbled in others. Linking a source into a sink
+whose capture stream is already running makes PipeWire merge the source's driver group (the hardware sink) into
+the share's own group (sink + capture stream) under a running pipeline, and the result is not deterministic. A
+chain built in the order sink, links, then capture stream (what a re-select does, and what #117's rebuild does)
+was clean in every run. That is also the likely source of the garbled sound the user hears.
+
+**Fix (`audio.rs`, `link_poll_loop`, `missing_links`, `gap_decision`).** A linked stream that has lost links
+(`missing_links(objects, node, sink) > 0`: ports exist on both sides, a channel pair has no link) makes the chain
+stale exactly like a vanished stream does (#117): sticky `gap`, and as soon as the stream has ports again
+`rebuild_chain` builds a fresh sink, links first, restarts the capture pipeline, proves the capture link and only
+then removes the old sink (now unlinking it first, part 1). Viewers get about 1 s of silence (the poll interval
+plus the rebuild) and then clean audio; encoder, appsink, pump and the relay announcement are untouched.
+`link_source_into_loopback` became idempotent (`ports_are_linked`: a pair that is already linked is skipped), which
+also lets a half-linked stream (FL linked, FR's `pw-link` failed) complete on the next tick instead of failing on
+"File exists" forever (the open #105/#117 note).
+
+### Measured (VMs; 440 Hz tone in Firefox, in-process sharer + viewer through a real relay, the viewer's output recorded)
+
+| | Arch (before) | Arch (after) | Fedora (before) | Fedora (after) |
+| --- | --- | --- | --- | --- |
+| audio after a pause/resume | silent for the rest of the run | clean after 0.9-1.4 s, 0 bad 0.1 s windows after that, 3 of 3 cycles | silent for the rest of the run | clean after 0.8-1.8 s, 0 bad windows after that, 3 of 3 cycles |
+| Firefox when the share stops | `Playing` -> `Paused` | stays `Playing` | `Playing` -> `Paused` | stays `Playing` |
+
+(Windows judged by zero-crossing frequency within 60 Hz of 440 Hz and a maximum sample step under 0.12 of the
+peak; a clean 440 Hz sine has 0.058. Occasional single bad windows occur in the VM even before any pause
+(starting transients of the in-process viewer on 4 vCPUs); they are not related to this task.) Also verified:
+Firefox's `PlaybackStatus` shows only the test's own pauses during the cycles, so the rebuild's removal of the
+old sink does not pause it either.
+
+**Tests (no audio):** `a_source_that_lost_its_links_into_the_sink_is_noticed` (`missing_links` pairs channels,
+crossed links do not count, the stale/rebuild decision), `only_the_links_feeding_the_sink_are_unlinked_before_it_goes`
+(`links_into_node` ignores the monitor link). The live soak itself is the ignored
+`end_to_end_test::live_audio_share_soak` (VM only).
+
+**Still open / not covered:** the first ~1 s of the resumed sound is lost (poll interval + rebuild); polling faster
+costs a `pw-dump` per tick. Not reproduced: the user's EasyEffects-on-the-host setup (the Fedora VM runs EasyEffects
+and shows the same behaviour as without it). The 250 ms settle also runs in `Drop` (the abrupt-disconnect backstop)
+on whatever thread drops the handle. A different WirePlumber without `mpris-pause.lua` is unaffected by part 1 and
+only pays the 250 ms.
 
 ## 2026-11-03: viewer-side loudness levelling, calibration removed, boost capped at 200 % (task #119)
 
@@ -137,7 +225,7 @@ runs. It is not hideable (the monitor needs the class); it never becomes the def
 share stops or the app dies. The client now needs `pw-cli` instead of `pw-loopback` (`check-deps.sh`, AppRun,
 packaging notes updated).
 
-**NOT verified live (hard rule: no audio nodes):** the `create-node` line, that the sink gets its input and
+**Verified live in the VMs later (task #123, see the block above); the sentence below is the state at the time of #121.** **NOT verified live (hard rule: no audio nodes):** the `create-node` line, that the sink gets its input and
 monitor ports, that `stream.capture.sink=true` links the monitor to the capture stream, and above all that
 pause/resume no longer garbles. Unit tests cover the property set (`the_sink_create_command_describes_a_self_clocked_owned_virtual_sink`),
 the source description and that it parses into a `pipewiresrc` carrying the property

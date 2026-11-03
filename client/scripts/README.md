@@ -113,3 +113,7 @@ and `drive.sh`, still use `mmsg` and only work on MangoWC.
 Rules baked in: every run owns uniquely named resources (runtime dir, tmux session, scratch);
 never `pkill` by name (it matches other workers' processes), only recorded process groups
 (`$SCRATCH/hs.pids`); every child is started with `setsid` so its whole group can be killed.
+
+## vm-audio/ (real audio tests, inside the test VMs only)
+
+Scripts for the shared-audio soak in the `arch-ssd` / `fedora-ssd` VMs (`host-run.sh`, `vm-sync.sh` on the host; `soak.sh`, `ff-setup.sh`, `fakehw.sh`, `watch.py`, `analyze.py`, `summary.py` in the VM or on its recordings). Never run on the host (no audio streams there). Method: `superdoc/claude-instructions/testing-and-verification.md` "Audio tests in the VMs".
