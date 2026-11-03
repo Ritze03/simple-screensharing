@@ -102,7 +102,7 @@ instead of, the rig run for anything user-visible. For video checks without the 
 ## If it breaks
 
 `$SCRATCH/{sway,xdpw,xdp,wireplumber,pipewire,client1,client2,relay.err}.log` (default
-`<target>/hs-scratch/rig/`). Known traps (details in `client/scripts/README.md`): `session already has a frame object` in `xdpw.log` / `xdpw-crashed.log` is stock xdpw dying on the start-up stream flap (#52, #112 defuse it; the rig's bus restarts xdpw and the client retries once, so a rare occurrence is harmless; many of them means the mitigation regressed; the rig runs the stock
+`<target>/hs-scratch/rig/`). Known traps (details in `client/scripts/README.md`): `session already has a frame object` in `xdpw.log` / `xdpw-crashed.log` is stock xdpw dying on the start-up stream flap (#52, #112 defuse it; the rig's bus restarts xdpw and the client retries once, so a rare occurrence is harmless; many of them means the mitigation regressed; a share stuck STARTING with `out of buffers` in `xdpw.log` is the same flap's other face (#122): the client restarts the stream once (`portal stream stalled by the start-up flap` in `client1.log`), more than one attempt per start or a `no frame` warning means that repair regressed; the rig runs the stock
 xdg-desktop-portal-wlr, `HS_XDPW=patched` picks the user's build); a bare `fakesink` probe tail
 cannot link (`target not found`); the legacy real-desktop scripts (`drive.sh`, `ui-click.sh`,
 `picker-answer.sh`, `animate.sh`, `session.sh`, `rig.sh`, `run-audio.sh`) are off limits.

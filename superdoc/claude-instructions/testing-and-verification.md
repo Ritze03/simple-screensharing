@@ -119,6 +119,16 @@ Rules for working in it:
   (the client's single retry on a fresh portal session, #59, succeeds); `$SCRATCH/xdpw-crashed.log` counts them
   (`grep -c 'restarted by bus activation'`). `hs-drive.sh share` failing to open the modal (the old "1 in 10") was
   always this crash, not a script race.
+  **The other failure of the same flap (#122)**: a share that stays STARTING with no frame ("capture started in
+  the Gpu domain", then `the capture source has produced no frame in 3.01s`) and an `xdpw.log` full of
+  `pipewire: out of buffers` / `unable to export buffer, dropping frame` is stock xdpw stuck after a *visible*
+  pause (`no buffer to queue`, `not streaming` right after a `paused` in the log). #112's pause made it about
+  as common as the crash had been (task #120 saw it in 2 of 2 starts; it was not a load flake and not the rig);
+  since #122 `capture::repair_portal_start` restarts such a stream once and the client log says
+  `portal stream stalled by the start-up flap (first buffer corrupted); restarting it, attempt 1` (expected in
+  a large share of starts, harmless; attempt 3 or a `StartFailed` is not). To count starts that really get frames
+  (a staged capture looks healthy without them) loop Share -> `golive` -> wait for `sending a keyframe` in
+  `client1.log` -> `stopshare`; `ready` in the modal dump only means "capture started".
 - A bare `fakesink` as the tail of a `pipewiresrc` probe cannot link (caps ANY -> node class
   `Stream/Input/Unknown` -> WirePlumber 0.5 "target not found"): use `video/x-raw ! fakesink`
   (`hs-probe.sh`).

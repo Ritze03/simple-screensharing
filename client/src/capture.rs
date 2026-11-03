@@ -2080,9 +2080,116 @@ fn start_pipeline(source_fragment: &str, domain: CaptureDomain) -> Result<Captur
 /// the crash still hit 17-28 % of starts in the headless rig (A/B inside one rig, 30-40 starts per
 /// value: 11/39 and 7/40 crashes at 240 and 60 Hz with no pause, 1/40 at 10 ms and 60 Hz, 0/30 at
 /// 10 ms and 240 Hz, 0/110 at 30 ms or more). Holding the stream paused for 30 ms lets the compositor
-/// deliver the outstanding frame (4-17 ms for a 240-60 Hz output) before the resume. 100 ms also
-/// started fine at 120 fps in the rig (an earlier note feared an "out of buffers" stall there).
+/// deliver the outstanding frame (4-17 ms for a 240-60 Hz output) before the resume. Task #122:
+/// the same pause is what makes xdpw's `paused` visible more often (roughly half of the starts), and
+/// a visible one leaves the stream stuck in "out of buffers" (the #52 observation, which #112 wrongly
+/// called not reproducible: it only looked at starts that did not hit it); [`repair_portal_start`]
+/// takes those starts through one more pause/resume. A shorter pause does not avoid it: 0 ms crashed
+/// xdpw instead (20-50 % of starts), 10 ms was stuck as often as 30 ms.
 const PORTAL_START_SETTLE: Duration = Duration::from_millis(30);
+
+/// What the portal stream's first buffer looked like, see [`watch_first_buffer`].
+struct FirstBuffer {
+    /// Set when the buffer passed the probe.
+    seen: Arc<std::sync::atomic::AtomicBool>,
+    /// Set when that buffer carried `GST_BUFFER_FLAG_CORRUPTED`.
+    corrupt: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl FirstBuffer {
+    /// Waits up to `limit` for the buffer; true when it arrived.
+    fn wait(&self, limit: Duration) -> bool {
+        let started = Instant::now();
+        while !self.seen.load(Ordering::Acquire) && started.elapsed() < limit {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        self.seen.load(Ordering::Acquire)
+    }
+
+    fn is_corrupt(&self) -> bool {
+        self.corrupt.load(Ordering::Acquire)
+    }
+}
+
+/// A one-shot probe on `pad` that records whether the next buffer is flagged corrupted
+/// ([`repair_portal_start`]).
+fn watch_first_buffer(pad: &gst::Pad) -> FirstBuffer {
+    let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let corrupt = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (s, c) = (seen.clone(), corrupt.clone());
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_pad, info| {
+        if let Some(gst::PadProbeData::Buffer(buffer)) = &info.data
+            && buffer.flags().contains(gst::BufferFlags::CORRUPTED)
+        {
+            c.store(true, Ordering::Release);
+        }
+        s.store(true, Ordering::Release);
+        gst::PadProbeReturn::Remove
+    });
+    FirstBuffer { seen, corrupt }
+}
+
+/// The source pad of the portal pipeline's `pipewiresrc`, `None` for any other source.
+fn portal_source_pad(pipeline: &gst::Pipeline) -> Option<gst::Pad> {
+    pipeline.by_name(PORTAL_QUEUE_NAME)?;
+    pipeline
+        .iterate_elements()
+        .into_iter()
+        .flatten()
+        .find(|e| e.factory().is_some_and(|f| f.name() == "pipewiresrc"))?
+        .static_pad("src")
+}
+
+/// How many times a portal start whose first buffer is flagged corrupted is re-flapped before it is
+/// given up (see [`repair_portal_start`]). One repair always worked in the rig; two more are the
+/// margin.
+const PORTAL_FLAP_REPAIRS: usize = 3;
+
+/// How long to wait for the portal stream's first buffer after `PLAYING`. It arrived 2-10 ms after
+/// `PLAYING` in every rig start; the limit only bounds the wait on a portal that delivers nothing
+/// before the first change on screen.
+const PORTAL_FIRST_BUFFER_WAIT: Duration = Duration::from_millis(200);
+
+/// Task #122: takes a portal capture whose first buffer arrived corrupted through
+/// pause -> [`PORTAL_START_SETTLE`] -> `PLAYING` again until it does not.
+///
+/// `Why:` stock xdg-desktop-portal-wlr (a driver stream) dequeues a buffer and asks the compositor
+/// for a frame the moment the stream first goes `streaming`. When `pipewiresrc`'s start-up
+/// deactivation ([`decoupled_source`]) reaches xdpw as a visible `paused` (roughly half of the
+/// starts with the [`PORTAL_START_SETTLE`] pause, more under load), xdpw queues that half-written
+/// buffer to a consumer that is not running, so it arrives flagged `CORRUPTED` as the first buffer;
+/// from there xdpw dequeues all 16 buffers, the consumer takes two, and xdpw is stuck in
+/// `out of buffers` for good: the share stays "starting", no frame ever reaches the tee. A corrupted
+/// *first* buffer is a reliable sign of that (every start in the rig: corrupted first buffer <=>
+/// stuck, clean <=> fine). A second pause/resume, with xdpw idle this time, unsticks it.
+fn repair_portal_start(pipeline: &gst::Pipeline, pad: &gst::Pad, first: FirstBuffer) -> Result<()> {
+    let mut first = first;
+    let mut repairs = 0;
+    while first.wait(PORTAL_FIRST_BUFFER_WAIT) && first.is_corrupt() {
+        if repairs == PORTAL_FLAP_REPAIRS {
+            let _ = pipeline.set_state(gst::State::Null);
+            return Err(anyhow::Error::new(StartFailed(format!(
+                "the portal stream was still corrupt after {PORTAL_FLAP_REPAIRS} restarts; the portal backend is stuck"
+            ))));
+        }
+        repairs += 1;
+        tracing::info!("portal stream stalled by the start-up flap (first buffer corrupted); restarting it, attempt {repairs}");
+        if let Err(e) = pipeline.set_state(gst::State::Paused) {
+            let detail = take_bus_error(pipeline);
+            let _ = pipeline.set_state(gst::State::Null);
+            return Err(start_failure(format!("failed to pause capture pipeline: {e}"), detail));
+        }
+        let _ = pipeline.state(gst::ClockTime::from_seconds(5));
+        std::thread::sleep(PORTAL_START_SETTLE);
+        first = watch_first_buffer(pad);
+        if let Err(e) = pipeline.set_state(gst::State::Playing) {
+            let detail = take_bus_error(pipeline);
+            let _ = pipeline.set_state(gst::State::Null);
+            return Err(start_failure(format!("failed to restart capture pipeline: {e}"), detail));
+        }
+    }
+    Ok(())
+}
 
 /// The blocking half of [`start_pipeline`]: `Playing`, then wait for the state
 /// change to settle. On failure the pipeline is back at `Null` and the error
@@ -2090,8 +2197,9 @@ const PORTAL_START_SETTLE: Duration = Duration::from_millis(30);
 fn play_and_wait(pipeline: &gst::Pipeline) -> Result<()> {
     // The portal's `pipewiresrc` is taken through PAUSED first and held there long enough for the
     // portal to finish the frame it asked for when the stream first went `streaming`
-    // ([`PORTAL_START_SETTLE`]).
-    if pipeline.by_name(PORTAL_QUEUE_NAME).is_some() {
+    // ([`PORTAL_START_SETTLE`]); its first buffer is then checked ([`repair_portal_start`]).
+    let portal_pad = portal_source_pad(pipeline);
+    if portal_pad.is_some() {
         if let Err(e) = pipeline.set_state(gst::State::Paused) {
             let detail = take_bus_error(pipeline);
             let _ = pipeline.set_state(gst::State::Null);
@@ -2100,10 +2208,14 @@ fn play_and_wait(pipeline: &gst::Pipeline) -> Result<()> {
         let _ = pipeline.state(gst::ClockTime::from_seconds(5));
         std::thread::sleep(PORTAL_START_SETTLE);
     }
+    let first = portal_pad.as_ref().map(watch_first_buffer);
     if let Err(e) = pipeline.set_state(gst::State::Playing) {
         let detail = take_bus_error(pipeline);
         let _ = pipeline.set_state(gst::State::Null);
         return Err(start_failure(format!("failed to start capture pipeline: {e}"), detail));
+    }
+    if let (Some(pad), Some(first)) = (portal_pad, first) {
+        repair_portal_start(pipeline, &pad, first)?;
     }
 
     // Wait for the pipeline to actually get moving (or fail) before telling
@@ -9637,6 +9749,36 @@ mod tests {
         let desc = gpu_pipeline_description(portal);
         let q = desc.find(PORTAL_QUEUE_NAME).unwrap();
         assert!(q < desc.find("vapostproc").unwrap());
+    }
+
+    /// Task #122: the first-buffer probe of a portal start reports a corrupted first buffer (what
+    /// xdpw sends after the start-up flap was visible to it) and a clean one, once each.
+    #[test]
+    fn the_first_buffer_probe_sees_the_corrupted_flag() {
+        ensure_gstreamer_initialized().unwrap();
+        for (flag, expect_corrupt) in [(true, true), (false, false)] {
+            let pipeline = gst::parse::launch("appsrc name=src format=time ! fakesink").unwrap().downcast::<gst::Pipeline>().unwrap();
+            let src = pipeline.by_name("src").unwrap().downcast::<gst_app::AppSrc>().unwrap();
+            let first = watch_first_buffer(&src.static_pad("src").unwrap());
+            assert!(!first.wait(Duration::from_millis(20)), "nothing was pushed yet");
+            pipeline.set_state(gst::State::Playing).unwrap();
+            let mut buffer = gst::Buffer::with_size(4).unwrap();
+            if flag {
+                buffer.get_mut().unwrap().set_flags(gst::BufferFlags::CORRUPTED);
+            }
+            src.push_buffer(buffer).unwrap();
+            assert!(first.wait(Duration::from_secs(2)), "the buffer must reach the probe");
+            assert_eq!(first.is_corrupt(), expect_corrupt);
+            pipeline.set_state(gst::State::Null).unwrap();
+        }
+    }
+
+    /// Only the portal pipeline has a source pad to watch; a test-source pipeline is left alone.
+    #[test]
+    fn only_a_portal_pipeline_has_a_source_pad_to_watch() {
+        ensure_gstreamer_initialized().unwrap();
+        let pipeline = gst::parse::launch("videotestsrc ! fakesink").unwrap().downcast::<gst::Pipeline>().unwrap();
+        assert!(portal_source_pad(&pipeline).is_none());
     }
 
     /// Task #59: a bus error naming a vanished portal node is a [`StartFailed`]
