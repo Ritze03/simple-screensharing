@@ -26,6 +26,7 @@ const pattern = q("pattern", "counter");
 const wantAudio = q("audio", "0") === "1";
 const hw = q("hw", "no-preference");
 const preset = q("preset", "balanced");
+const detail = Number(q("detail", 0)); // makePatternSource: colour-noise texture (big IDRs), 1 scrolling, 2 static
 const source = q("source", "pattern"); // pattern = share the synthetic MediaStream; tab = real getDisplayMedia of this tab
 const out = document.getElementById("out");
 const show = (o) => (out.textContent = JSON.stringify(o, (_, v) => (typeof v === "bigint" ? `${v}n` : v), 2));
@@ -71,7 +72,7 @@ async function main() {
 }
 
 async function runShare(client, result) {
-  const src = makePatternSource(W, H, fps, { audio: wantAudio, speaker: source === "tab" });
+  const src = makePatternSource(W, H, fps, { audio: wantAudio, speaker: source === "tab", detail });
   const probes = await probeEncoders({ width: W, height: H, fps, bitrateKbps: bitrate });
   result.encoderProbe = probes;
   log("encoder probe", probes);

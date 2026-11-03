@@ -209,6 +209,42 @@ flawless", H.264 and AV1 alike, while the native client takes 240 fps fine.
   document and keeps drawing; PiP itself needs a real window), H.265 (Firefox has no HEVC decoder here), hardware decode on
   the user's GPU.
 
+## Big keyframes in the browser sharer (task #103, 2026-11-03)
+
+The native sharer's #102 (`features/stream-control.md` "Big keyframes") applies here too: a frame is lost if any
+fragment is, and a 1 MB IDR is ~1000 datagrams. `docs/js/core/fragment.js` `pacePlan` is a line-for-line port of
+native `pace_plan` (same constants and tests: keyframe window `max(min(60 ms, 4 frame periods), bytes / (2.5 x
+configured bitrate))`, deltas paced only above 2 frame periods, cap 600 ms, chunks every 2 ms); `RoomClient#sendMedia`
+sends a frame's datagrams chunk by chunk and `st.pacing` is set meanwhile.
+
+- **Why the browser had a worse failure than the native one:** a 1000-datagram IDR written at once pushed
+  `pendingDatagrams` over `MAX_PENDING_DATAGRAMS` (400); `#sendMedia` then dropped the next frames, and every drop
+  called `forceKeyframe()`: *another* ~1 MB IDR, again in one burst. A self-sustaining IDR storm (measured below), not just
+  random loss. The pending limit is only checked *before* a frame, so an accepted frame was never truncated by it; the loss
+  was the storm.
+- **Input frames are dropped while a paced frame goes out** (`VideoSender` option `isBackedUp`, set from `st.pacing`):
+  like native's capture dropping frames while the pump is held. Dropping *before* encode breaks no reference chain; letting
+  the encoded frames pile into the 8-frame tx queue would drop encoded ones and force yet another IDR.
+- **Chunks are due by the clock, not by tick count** (`due = floor(elapsed / 2 ms) + 1`): a hidden tab's timers are
+  throttled to ~1 s, and a plain "sleep 2 ms per chunk" would stretch a frame over minutes; this sends what is due in one go
+  instead (the old behaviour, never worse). Inside a paced frame the loop also waits (never skips a fragment) while more than
+  `MAX_PENDING_DATAGRAMS` are queued, so the browser's own datagram queue cannot age out the tail of an IDR.
+- **Stop stays prompt:** the loop checks `sess === this.session && this.tx.get(streamId) === st && !sess.closedFlag`
+  every tick (<= 2 ms); `stopShare` deletes the tx entry, so a paced frame ends at once.
+- `share.stats().bigKeyframes` (last 20 keyframes of >= 24 datagrams: `{datagrams, bytes, spreadMs}`) is the diagnostic,
+  like native's `sending a keyframe of N datagrams ... paced over ~Y ms` log line.
+
+Measured (headless Chromium 153 sharer -> real relay -> browser viewer, 1080p, `live.html?detail=2` = a static colour-noise
+texture, so a ~1 MB IDR and small deltas like the field case; Chromium software H.264, 8000 kbps, 60 fps, 8 s + 6 s):
+
+| | keyframes encoded | IDR datagrams / spread | tx drops | sent | viewer |
+|---|---|---|---|---|---|
+| before | 499 | 1078 / 1 ms (burst) | 501 | 345 Mbit/s | 12 fps |
+| after | 8 (the 2 s GOP) | 1075 / 360 ms median, 484 max | 0 | 12.6 Mbit/s | 49 fps (p50 latency 720 ms vs 270 ms: the 0.4 s IDR delay, then the jitter buffer grows) |
+
+Not verified: loss on a real path (the loopback relay never drops; the win shown is the end of the storm and the burst
+size, not survival odds), a hidden-tab sender, other browsers (Chromium only can share).
+
 ## Measured (this machine, Chromium 153, local relay; full tables in `docs/dev/README.md`)
 
 - Native sender to browser viewer: **H.264 and AV1 at 60 and 120 fps** received at full rate

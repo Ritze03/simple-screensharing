@@ -3,7 +3,7 @@
 import { AudioReceiver, AudioSender, MAX_VOLUME } from "./audio.js";
 import { AvSync } from "./avsync.js";
 import { NonceSpaceExhausted, decryptFrame, decryptPreview, encryptFrame, encryptPreview, importRoomKey } from "./crypto.js";
-import { Reassembler, fragmentFrame } from "./fragment.js";
+import { Reassembler, fragmentFrame, pacePlan } from "./fragment.js";
 import { JoinLinkError, parseJoinLink } from "./joinlink.js";
 import { PREVIEW_FIRST_DELAY_MS, PREVIEW_INTERVAL_MS, PreviewSampler } from "./preview.js";
 import {
@@ -18,6 +18,7 @@ const STATS_INTERVAL_MS = 1000;
 const MAX_TX_QUEUE = 8; // frames waiting for encrypt+send per stream before we drop
 const MAX_PENDING_DATAGRAMS = 400; // ~400 KB queued inside WebTransport; more than that is latency, not throughput
 const MAX_RX_QUEUE = 64;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const RESUBSCRIBE_MIN_INTERVAL_MS = 1500;
 const FIRST_RECONNECT_MS = 50;
 const BACKOFF_MS = [500, 1000, 2000, 4000, 8000, 10000];
@@ -816,7 +817,7 @@ export class RoomClient extends EventTarget {
    * Encrypt (one counter value per frame), fragment to <= 1000 bytes and send as datagrams, strictly in order per stream.
    * Returns false when the frame was dropped (not connected / backlog), so the caller can ask for a keyframe.
    */
-  #sendMedia(streamId, { ptsUs, keyframe, payload, stalled = false }) {
+  #sendMedia(streamId, { ptsUs, keyframe, payload, stalled = false }, fps = 60, bitrateKbps = 8000) {
     const sess = this.session;
     if (!sess || !sess.joined) return false;
     const st = this.#txState(streamId);
@@ -834,9 +835,35 @@ export class RoomClient extends EventTarget {
           connId: sess.connId, streamId, frameId: counter, ciphertext: ct, maxDatagramSize: sess.maxDatagramSize,
           flags: (keyframe ? MEDIA_FLAG_KEYFRAME : 0) | (stalled ? MEDIA_FLAG_STALLED : 0),
         });
-        for (const d of datagrams) sess.sendDatagram(d);
+        const t0 = performance.now();
+        const plan = pacePlan(datagrams.length, ct.length, keyframe, fps, bitrateKbps);
+        if (!plan) {
+          for (const d of datagrams) sess.sendDatagram(d);
+        } else {
+          // Spread the frame over time (see pacePlan). Chunks are due by the clock, so a throttled timer (background tab)
+          // sends what is due in one go instead of stretching the frame. A frame that has started is sent whole: the
+          // pending-datagram limit is only checked before a frame, and here by waiting, never by skipping a fragment.
+          // Stop/reconnect end the loop at the next tick (tx entry gone / session replaced / closed).
+          const alive = () => sess === this.session && this.tx.get(streamId) === st && !sess.closedFlag;
+          st.pacing = true;
+          try {
+            for (let i = 0; i < datagrams.length && alive(); ) {
+              while (sess.pendingDatagrams > MAX_PENDING_DATAGRAMS && alive()) await sleep(plan.gapMs);
+              const due = Math.floor((performance.now() - t0) / plan.gapMs) + 1;
+              for (const end = Math.min(datagrams.length, due * plan.perChunk); i < end; i++) sess.sendDatagram(datagrams[i]);
+              if (i < datagrams.length) await sleep(plan.gapMs);
+            }
+          } finally {
+            st.pacing = false;
+          }
+        }
         st.sentFrames++;
         st.sentBytes += ct.length;
+        if (keyframe && datagrams.length >= 24) {
+          // diagnostics (like native's "sending a keyframe of N datagrams ... paced over ~Y ms"): the last 20 big keyframes
+          const log = (st.bigKeyframes ??= []);
+          if (log.push({ datagrams: datagrams.length, bytes: ct.length, spreadMs: Math.round(performance.now() - t0) }) > 20) log.shift();
+        }
       } catch (e) {
         if (e instanceof NonceSpaceExhausted) {
           emitError(this, "nonce-exhausted", e);
@@ -938,6 +965,9 @@ export class RoomClient extends EventTarget {
       gopMs: o.gopMs ?? preset.gopMs, latencyMode: o.latencyMode ?? preset.latencyMode,
       hardwareAcceleration: o.hardwareAcceleration ?? this.hardwareAcceleration,
       isActive: () => share.subscribers > 0,
+      // a paced frame is on its way: drop INPUT frames meanwhile (nothing encoded, no reference chain broken) instead of
+      // encoding frames that would overflow the tx queue and force yet another keyframe
+      isBackedUp: () => !!this.tx.get(share.videoStreamId)?.pacing,
       onCapturedFrame: (frame) => {
         if (share.previewDue && share.previewEnabled) {
           share.previewDue = false;
@@ -947,7 +977,7 @@ export class RoomClient extends EventTarget {
         }
       },
       onUnit: (u) => {
-        if (!this.#sendMedia(share.videoStreamId, u)) share.sender.forceKeyframe();
+        if (!this.#sendMedia(share.videoStreamId, u, share.fps, share.bitrateKbps)) share.sender.forceKeyframe();
       },
       onError: (e) => {
         emitError(this, "encoder-error", e);
@@ -1050,6 +1080,7 @@ export class RoomClient extends EventTarget {
       sentFrames: tx ? tx.sentFrames : 0,
       sentBytes: tx ? tx.sentBytes : 0,
       txDropped: tx ? tx.dropped : 0,
+      bigKeyframes: tx?.bigKeyframes ?? [],
       audioPackets: share.audioSender ? share.audioSender.packets : 0,
       audioSubscribers: share.audioSubscribers,
     };
