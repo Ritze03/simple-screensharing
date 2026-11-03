@@ -389,6 +389,11 @@ pub(super) struct Worker {
     /// The codec of the last pipeline that ran, so a reset (which tears the pipeline down) can
     /// still rebuild for it if its keyframe carries no parameter sets to sniff.
     last_codec: Option<VideoCodec>,
+    /// Access units handed to a pipeline so far. Lets a test assert what the gate let through
+    /// synchronously, instead of watching `Shared::decoded_total`, which also counts frames
+    /// that were already in flight inside the decoder (a race under load).
+    #[cfg(test)]
+    pushed: u64,
 }
 
 impl Worker {
@@ -399,7 +404,16 @@ impl Worker {
         } else {
             [VideoCodec::H264, VideoCodec::H265, VideoCodec::Av1].into_iter().collect()
         };
-        Self { shared, active: None, hw_failed, need_keyframe: false, decoded_at_last_reset: None, last_codec: None }
+        Self {
+            shared,
+            active: None,
+            hw_failed,
+            need_keyframe: false,
+            decoded_at_last_reset: None,
+            last_codec: None,
+            #[cfg(test)]
+            pushed: 0,
+        }
     }
 
     /// Set [`Self::need_keyframe`] and mirror it to `Shared`, where viewer recovery
@@ -604,6 +618,16 @@ impl Worker {
             }
         }
         active.push(pts_us, keyframe, data);
+        #[cfg(test)]
+        {
+            self.pushed += 1;
+        }
+    }
+
+    /// Access units handed to a pipeline so far (tests).
+    #[cfg(test)]
+    pub(super) fn pushed(&self) -> u64 {
+        self.pushed
     }
 }
 

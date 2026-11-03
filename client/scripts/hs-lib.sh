@@ -213,7 +213,8 @@ EOF
   <type>session</type>
   <listen>unix:path=$RT/bus</listen>
   <auth>EXTERNAL</auth>
-  <!-- no <servicedir>: nothing is ever bus-activated, every service is started by hs-rig.sh -->
+  <!-- only xdpw is bus-activatable (see hs_write_xdpw_activation); everything else is started by hs-rig.sh -->
+  <servicedir>$SCRATCH/dbus-services</servicedir>
   <policy context="default">
     <allow send_destination="*" eavesdrop="true"/>
     <allow eavesdrop="true"/>
@@ -281,7 +282,8 @@ hs_start_pipewire() {
 #   "ext_image_copy_capture_session_v1#18: error 1: session already has a frame object"
 # (wl_display_dispatch failed: Protocol error), the portal node is gone ("target not found",
 # "GPU capture path failed to start ... StateChangeError"). Since #52 the client puts a queue behind
-# pipewiresrc (capture::decoupled_source), the flap lands before any frame request and xdpw survives.
+# pipewiresrc (capture::decoupled_source) and since #112 holds the stream paused for 30 ms before
+# PLAYING (capture::PORTAL_START_SETTLE); before #112 a flap still killed xdpw in 13-20 % of starts.
 # portal-probe.py never flapped because its tail is cheap (no heavy chain to delay the caps push).
 hs_xdpw_bin() {
   local alt="$HOME/.local/bin/xdg-desktop-portal-wlr-patched"
@@ -292,8 +294,35 @@ hs_xdpw_bin() {
   esac
 }
 
+# Bus activation for xdpw, as on a real session: when xdpw exits (stock 0.8.4 does, "session already
+# has a frame object", see the comment above hs_xdpw_bin) the next ScreenCast request makes the bus
+# start it again. Without this a single xdpw crash left the rig dead: every later share failed with
+# "Portal request didn't succeed" and the client's own retry on a fresh portal session (#59) could
+# not work. The wrapper keeps the dead instance's log in xdpw-crashed.log and writes the new one to
+# xdpw.log. The first start is still hs_spawn (so it is in hs.pids); an activated xdpw lives in the
+# bus's process group and dies with it in `down`.
+hs_write_xdpw_activation() {
+  mkdir -p "$SCRATCH/dbus-services" "$SCRATCH/bin"
+  cat >"$SCRATCH/bin/xdpw-activate" <<EOF
+#!/usr/bin/env bash
+export XDG_RUNTIME_DIR='$RT' SWAYSOCK='$RT/sway.sock' DBUS_SESSION_BUS_ADDRESS='unix:path=$RT/bus' XDG_CURRENT_DESKTOP=sway
+export WAYLAND_DISPLAY="\$(compgen -G '$RT/wayland-[0-9]' | head -1)"
+export XDG_CONFIG_HOME='$SCRATCH/xdgcfg' XDG_STATE_HOME='$SCRATCH/xdgstate'
+unset DISPLAY WAYLAND_SOCKET HYPRLAND_INSTANCE_SIGNATURE NIRI_SOCKET I3SOCK
+{ echo "=== \$(date '+%F %T') xdpw was restarted by bus activation; the previous log:"; cat '$SCRATCH/xdpw.log'; } >>'$SCRATCH/xdpw-crashed.log' 2>/dev/null
+exec '$(hs_xdpw_bin)' -c '$SCRATCH/xdpw.conf' -l INFO >'$SCRATCH/xdpw.log' 2>&1
+EOF
+  chmod +x "$SCRATCH/bin/xdpw-activate"
+  cat >"$SCRATCH/dbus-services/org.freedesktop.impl.portal.desktop.wlr.service" <<EOF
+[D-BUS Service]
+Name=org.freedesktop.impl.portal.desktop.wlr
+Exec=$SCRATCH/bin/xdpw-activate
+EOF
+}
+
 hs_start_portal() {
   log "starting $(hs_xdpw_bin) (chooser_type=none) and xdg-desktop-portal on the private bus"
+  hs_write_xdpw_activation
   hs_spawn xdpw env XDG_CONFIG_HOME="$SCRATCH/xdgcfg" XDG_STATE_HOME="$SCRATCH/xdgstate" \
     "$(hs_xdpw_bin)" -c "$SCRATCH/xdpw.conf" -l INFO
   hs_wait 10 "xdpw on the bus" bash -c "busctl --address='unix:path=$RT/bus' list | grep -q '^org.freedesktop.impl.portal.desktop.wlr '"
