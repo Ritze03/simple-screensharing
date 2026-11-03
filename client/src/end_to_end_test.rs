@@ -1901,7 +1901,7 @@ async fn watching_video_automatically_delivers_the_sharers_audio_too() {
         .find(|s| s.name.contains(PW_CLIENT_NAME))
         .cloned()
         .expect("did not find the synthetic test app among live audio sources");
-    let audio_handle = crate::audio::start_audio_sharing(&client_a, AUDIO_STREAM_ID, &source, 1.0)
+    let audio_handle = crate::audio::start_audio_sharing(&client_a, AUDIO_STREAM_ID, &source, 1.0, false)
         .await
         .expect("start_audio_sharing failed");
     eprintln!("[audio-follows-video] step 2 OK: sharer enabled audio AFTER the viewer was already watching");
@@ -2103,7 +2103,7 @@ async fn volume_survives_sender_audio_restart_or_switch() {
         .find(|s| s.name.contains(PW_CLIENT_NAME_A))
         .cloned()
         .expect("did not find the first synthetic test app among live audio sources");
-    let audio_handle_a = crate::audio::start_audio_sharing(&client_a, AUDIO_STREAM_ID_A, &source_a, 1.0)
+    let audio_handle_a = crate::audio::start_audio_sharing(&client_a, AUDIO_STREAM_ID_A, &source_a, 1.0, false)
         .await
         .expect("start_audio_sharing (first) failed");
 
@@ -2181,7 +2181,7 @@ async fn volume_survives_sender_audio_restart_or_switch() {
         .find(|s| s.name.contains(PW_CLIENT_NAME_B))
         .cloned()
         .expect("did not find the second synthetic test app among live audio sources");
-    let audio_handle_b = crate::audio::start_audio_sharing(&client_a, AUDIO_STREAM_ID_B, &source_b, 1.0)
+    let audio_handle_b = crate::audio::start_audio_sharing(&client_a, AUDIO_STREAM_ID_B, &source_b, 1.0, false)
         .await
         .expect("start_audio_sharing (second) failed");
 
@@ -2645,7 +2645,7 @@ async fn start_audio_share_rejects_a_merely_staged_video_capture() {
     // would be a room lookup against a handle that doesn't exist.
     let bogus_room_handle = crate::session::RoomHandle(0);
 
-    let result = state.start_audio_share(bogus_room_handle, capture_id);
+    let result = state.start_audio_share(bogus_room_handle, capture_id, false);
     assert!(
         result.is_err(),
         "BUG REPRODUCED: start_audio_share must reject a for_capture that is only staged \
@@ -2738,7 +2738,7 @@ async fn start_audio_share_succeeds_once_the_video_capture_is_live() {
     assert_eq!(state.captures[&video_capture_id].destinations.len(), 1, "test setup: video capture must be live");
 
     state.selected_audio_source = Some(crate::audio::AudioSource { id: 0, name: "Test app".to_string(), serial: None });
-    let result = state.start_audio_share(room_handle, video_capture_id);
+    let result = state.start_audio_share(room_handle, video_capture_id, false);
     assert!(result.is_ok(), "start_audio_share must succeed against a live for_capture, got {result:?}");
 
     let audio_capture_id = state

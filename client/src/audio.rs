@@ -749,17 +749,18 @@ fn level_db_array(structure: &gst::StructureRef, field: &str) -> Option<Vec<f64>
 ///
 /// `volume name=gain` + `rglimiter` ([`GAIN_STAGE`]) sit before the mute and the meter: the
 /// sender-side boost of Settings (task #114, `audio_gain.rs`), so the meter shows what is sent.
-fn build_pipeline(loopback_output_node_serial: u64, capture_node_name: &str, gain: f64) -> Result<BuiltPipeline> {
+fn build_pipeline(loopback_output_node_serial: u64, capture_node_name: &str, gain: f64, muted: bool) -> Result<BuiltPipeline> {
     build_pipeline_from_source(
         &format!("pipewiresrc name=src target-object={loopback_output_node_serial} client-name={capture_node_name} do-timestamp=true"),
         gain,
+        muted,
     )
 }
 
 /// [`build_pipeline`] with the source element(s) given as a description
 /// fragment, so a test can put `audiotestsrc` in front of the *real* chain
 /// (no PipeWire involved).
-fn build_pipeline_from_source(source: &str, gain: f64) -> Result<BuiltPipeline> {
+fn build_pipeline_from_source(source: &str, gain: f64, muted: bool) -> Result<BuiltPipeline> {
     let description = pipeline_description(source);
 
     let element = gst::parse::launch(&description)
@@ -780,6 +781,9 @@ fn build_pipeline_from_source(source: &str, gain: f64) -> Result<BuiltPipeline> 
 
     let gain_stage = GainStage::from_pipeline(&pipeline)?;
     gain_stage.set(gain);
+    // Set before PLAYING so a share that replaces a muted one (source switch, reconnect) never
+    // sends a single unmuted buffer.
+    mute.set_property("mute", muted);
 
     Ok(BuiltPipeline { pipeline, sink, mute, gain_stage })
 }
@@ -973,7 +977,7 @@ pub struct AudioCaptureHandle {
 /// unavailable or fail, the source's ports have disappeared, or the
 /// GStreamer pipeline fails to construct/start. Any partially-created
 /// loopback process is cleaned up before returning an error.
-pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, source: &AudioSource, gain: f64) -> Result<AudioCaptureHandle> {
+pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, source: &AudioSource, gain: f64, muted: bool) -> Result<AudioCaptureHandle> {
     ensure_gstreamer_initialized()?;
 
     // stream_id + a random suffix: unique even if two audio shares started
@@ -999,7 +1003,7 @@ pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, sour
 
     let capture_node_name = format!("{loopback_name}-cap");
     let BuiltPipeline { pipeline, sink: appsink, mute: mute_element, gain_stage } =
-        match build_pipeline(loopback.output_node_serial, &capture_node_name, gain) {
+        match build_pipeline(loopback.output_node_serial, &capture_node_name, gain, muted) {
         Ok(v) => v,
         Err(e) => {
             kill_and_wait(&mut loopback_child);
@@ -1667,7 +1671,7 @@ mod tests {
     fn the_sender_chain_negotiates_and_encodes_opus() {
         ensure_gstreamer_initialized().unwrap();
         let BuiltPipeline { pipeline, sink, gain_stage, .. } =
-            build_pipeline_from_source("audiotestsrc num-buffers=20 samplesperbuffer=960", 3.0).expect("chain builds");
+            build_pipeline_from_source("audiotestsrc num-buffers=20 samplesperbuffer=960", 3.0, false).expect("chain builds");
         assert_eq!(gain_stage.gain(), 3.0);
         pipeline.set_state(gst::State::Playing).unwrap();
         let sample = sink.try_pull_sample(gst::ClockTime::from_seconds(5)).expect("no Opus packet");
@@ -1713,7 +1717,7 @@ mod tests {
     fn the_pipeline_delivers_again_after_a_null_playing_restart() {
         ensure_gstreamer_initialized().unwrap();
         let BuiltPipeline { pipeline, sink, .. } =
-            build_pipeline_from_source("audiotestsrc name=src is-live=true samplesperbuffer=960", 1.0).expect("chain builds");
+            build_pipeline_from_source("audiotestsrc name=src is-live=true samplesperbuffer=960", 1.0, false).expect("chain builds");
         let pull = || sink.try_pull_sample(gst::ClockTime::from_seconds(5)).expect("no Opus packet");
         pipeline.set_state(gst::State::Playing).unwrap();
         for _ in 0..30 {
@@ -1726,6 +1730,17 @@ mod tests {
         let first = pull().buffer().unwrap().pts().unwrap();
         let _ = pipeline.set_state(gst::State::Null);
         assert!(first < late_pts, "running time restarts at 0 after Null: {first} vs {late_pts}");
+    }
+
+    /// A share that replaces a muted one (source switch, reconnect) starts muted, and the mute is
+    /// the same `volume name=mute` element the toggle drives (task #118).
+    #[test]
+    fn a_pipeline_can_be_built_muted() {
+        ensure_gstreamer_initialized().unwrap();
+        for muted in [true, false] {
+            let built = build_pipeline_from_source("audiotestsrc", 1.0, muted).expect("chain builds");
+            assert_eq!(built.mute.property::<bool>("mute"), muted);
+        }
     }
 
     #[test]
@@ -2068,7 +2083,7 @@ mod tests {
             return;
         }
         let BuiltPipeline { pipeline, sink, .. } =
-            build_pipeline_from_source("audiotestsrc is-live=true do-timestamp=true", 1.0).expect("chain builds");
+            build_pipeline_from_source("audiotestsrc is-live=true do-timestamp=true", 1.0, false).expect("chain builds");
         let level = AudioLevel::default();
         assert_eq!(level.get(), 0.0);
         // Same order as `start_audio_sharing`: PLAYING first, the bus and appsink
@@ -2340,7 +2355,7 @@ mod tests {
             .expect("did not find the synthetic test app among live audio sources");
 
         eprintln!("[audio-stop-test] starting real audio share for source {source:?}");
-        let handle = start_audio_sharing(&client, 7, &source, 1.0)
+        let handle = start_audio_sharing(&client, 7, &source, 1.0, false)
             .await
             .expect("start_audio_sharing failed");
 
