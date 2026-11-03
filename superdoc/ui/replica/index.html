@@ -1121,7 +1121,7 @@ function renderControls(r) {
   const shareTitle = (mine === "none" ? "Share your screen" : mine === "staged" ? "Set up your stream" : "Stream settings") + (r ? "" : ` (${esc(shareRoom?.name)})`);
   const caret = (m, t) => `<button type="button" class="cb caret" data-menu="${m}" title="${t}" aria-label="${t}">${ic("expand_more")}</button>`;
   const share = !r && mine === "none" ? "" : `<div class="splitb${mine === "live" ? " on" : mine === "staged" ? " ready" : ""}${open("share")}" data-anchor="share">
-    <button type="button" class="cb" data-act="share" title="${shareTitle}" aria-label="${shareTitle}">${ic("screen_share")}</button>${mine !== "none" ? caret("share", "Framerate, source and preset") : ""}</div>`;
+    <button type="button" class="cb" data-act="share" title="${shareTitle}" aria-label="${shareTitle}">${ic("screen_share")}</button>${caret("share", "Framerate, source and preset")}</div>`;
   const aT = S.audioOn ? `Stop sharing audio (${S.audioSrc})` : S.audioSrc === "No audio" ? "Share audio" : `Share audio (${S.audioSrc})`;
   const audio = !r && mine === "none" && !S.audioOn ? "" : `<div class="splitb${S.audioOn ? " on" : ""}${open("audio")}" data-anchor="audio">
     <button type="button" class="cb" data-act="audio" title="${esc(aT)}" aria-label="${esc(aT)}">${ic(S.audioOn ? "music_note" : "music_off")}</button>${caret("audio", "Pick an audio source")}</div>`;
@@ -1147,15 +1147,15 @@ function renderControls(r) {
 const mi = (icon, text, act, extra = "", cls = "") => `<button type="button" class="mi ${cls}" data-act="${act}">${ic(icon)}<span class="t">${text}</span>${extra}</button>`;
 const sw = (on) => `<span class="sw${on ? " on" : ""}"></span>`;
 function shareMenu() {
-  const live = S.sharing === "live", r = roomById(D().meRoom);
-  return `<div class="mh">${live ? pillLive() : `<span class="badge badge-muted">Ready</span>`}<div><b>Screen share</b><small class="mono">1920×1080 · ${S.codec} · ${fmtKbps(S.kbps)}</small></div></div>
+  const live = S.sharing === "live", off = S.sharing === "none", r = roomById(D().meRoom);
+  return `<div class="mh">${live ? pillLive() : `<span class="badge badge-muted">${off ? "Off" : "Ready"}</span>`}<div><b>Screen share</b><small class="mono">${off ? "" : "1920×1080 · "}${S.codec} · ${fmtKbps(S.kbps)}</small></div></div>
     <div class="ml">FPS</div><div class="mrow">${segAct("fps", FPS_LIST, S.fps, "dense")}</div>
     <div class="ml">Preset</div><div class="mrow">${segAct("preset", Object.keys(ENC_PRESETS), S.preset)}</div>
     <div class="mrow"><span class="cap">${presetCap()}</span></div>
     <div class="msep"></div>
-    ${mi("swap_horiz", "Change source", "chsrc", `<span class="unit">screen, window</span>`)}
+    ${off ? mi("screen_share", "Share your screen…", "share") : `${mi("swap_horiz", "Change source", "chsrc", `<span class="unit">screen, window</span>`)}
     ${mi("tune", "All stream settings…", "modal:stream")}
-    ${live ? mi("stop_screen_share", "Stop sharing", "stop", "", "danger") : mi("cast", `Go live in ${esc(r.name)}`, "golive")}`;
+    ${live ? mi("stop_screen_share", "Stop sharing", "stop", "", "danger") : mi("cast", `Go live in ${esc(r.name)}`, "golive")}`}`;
 }
 function camMenu() {
   const on = S.camOn && S.camRoom === camTarget(), m = camMode(), cur = CAMS.find((c) => c.name === S.camName);
