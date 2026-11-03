@@ -25,8 +25,11 @@
 #                             (wtype) and is the least reliable part; prefer START_KBPS at `up`.
 #   golive                    sharer: "Go live in <room>" (waits until enabled; exit 1 unless
 #                             the modal closes)
+#   discard                   sharer: click "Discard" (leftmost footer button of the staged modal): drops
+#                             the staged capture and closes its portal session (repeatable share starts)
 #   modal                     print the sharer's modal dump
-#   mclick NAME [DX [DY]]     click a control of the open modal by its dumped rect
+#   mclick NAME [DX [DY]]     click a control of the open modal by its dumped rect (DX<0: from the right
+#                             edge, `L60`: 60 pt from the left edge)
 #   watch                     viewer: click "Watch" on the sharer's card
 #   hover                     viewer: park the pointer on the tile's stats bar (tooltip shows
 #                             "Decoded X fps / shown Y fps")
@@ -89,7 +92,8 @@ mclick() {
   o="$(sharer_origin)"
   read -r gx gy < <(awk -v r="$r" -v o="$o" -v dx="${2:-0}" -v dy="${3:-0}" 'BEGIN {
     split(r, a, " "); split(o, b, " ");
-    x = (a[1] + a[3]) / 2 + dx; if (dx < 0) x = a[3] + dx;
+    if (dx ~ /^L/) { dx = substr(dx, 2) + 0; x = a[1] + dx }   # "L60": 60 pt from the left edge
+    else { x = (a[1] + a[3]) / 2 + dx; if (dx < 0) x = a[3] + dx }
     y = (a[2] + a[4]) / 2 + dy;
     printf "%d %d\n", b[1] + x * b[3], b[2] + y * b[3] }')
   gclick "$gx" "$gy"
@@ -155,6 +159,11 @@ case "$STEP" in
     dump_wait ready 1 30 || die "golive: Go live never became enabled (the capture is not active)"
     mclick footer -48                                      # rightmost footer button = Go live
     dump_wait open 0 5 || die "golive: the modal did not close (click missed?)"
+    ;;
+  discard)
+    modal_open
+    [[ "$(dump_get mode)" == staged ]] || die "discard: the modal is not the staged one (mode $(dump_get mode))"
+    mclick footer L70
     ;;
   modal) cat "$UI_DUMP" ;;
   mclick) modal_open; mclick "$@" ;;

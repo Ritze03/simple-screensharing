@@ -107,11 +107,18 @@ Rules for working in it:
   the real picker UI (`wlr-share-picker`) is not exercised.
 - Portal binary: the rig runs the stock `/usr/lib/xdg-desktop-portal-wlr` (0.8.4, ext-image-copy-capture; what
   ordinary sway users run). `HS_XDPW=patched` runs the user's `~/.local/bin/xdg-desktop-portal-wlr-patched`
-  (wlr-screencopy only), `HS_XDPW=<path>` any binary. **Why stock**: it used to crash the share
-  (`ext_image_copy_capture_session_v1#18: error 1: session already has a frame object`) when the
-  client's GPU pipeline flapped the stream at start; #52 fixed that in the client (queue behind
-  `pipewiresrc`, see `features/stream-control.md`), so the default now covers the common setup. If that
-  error shows up in `xdpw.log` again, the fix regressed.
+  (wlr-screencopy only), `HS_XDPW=<path>` any binary. **Why stock**: it is what most sway users have, and it dies
+  (`ext_image_copy_capture_session_v1#18: error 1: session already has a frame object`) when `pipewiresrc`'s
+  start-up streaming -> paused -> streaming flap resumes while the portal's first frame is still outstanding.
+  The client defuses that (#52 queue behind `pipewiresrc`, #112 a 30 ms pause between PAUSED and PLAYING,
+  `capture::PORTAL_START_SETTLE`; see `features/stream-control.md`). **How to read the error** (#112 measured it
+  across commits, 20-90 starts each, same rig, stock xdpw): that line in `xdpw.log`/`xdpw-crashed.log` does NOT by
+  itself mean a regression of a recent commit. Before #112 it hit 13-20 % of starts at *every* commit from `a5433cf` (#52)
+  to `HEAD` (and 4 of 5 before #52), the rate moving with whatever else ran on the machine; since #112 it is 0 of
+  60 (mixed codecs, 60/120 fps). The rig emulates dbus activation for xdpw, so a crash is invisible to scripts
+  (the client's single retry on a fresh portal session, #59, succeeds); `$SCRATCH/xdpw-crashed.log` counts them
+  (`grep -c 'restarted by bus activation'`). `hs-drive.sh share` failing to open the modal (the old "1 in 10") was
+  always this crash, not a script race.
 - A bare `fakesink` as the tail of a `pipewiresrc` probe cannot link (caps ANY -> node class
   `Stream/Input/Unknown` -> WirePlumber 0.5 "target not found"): use `video/x-raw ! fakesink`
   (`hs-probe.sh`).
@@ -175,6 +182,17 @@ task #78). Tests that need another locale either pass it explicitly (`t!(key, lo
 `pill_slots_fit_every_label_in_every_locale` does) or run in a child process with their own locale
 (`ui::stream_settings::tests::every_locale_fits_two_columns_at_full_modal_width` re-runs itself per locale with
 `SSS_TEST_LOCALE`). Never switch the global locale in-process in a test.
+
+### Tests of "nothing reached the decoder"
+
+Do not prove a negative with `sleep(150 ms)` plus "`decoded_total` did not change" (task #112): frames
+already inside a GStreamer decoder keep arriving after the call you are testing, so the counter moves a
+little later on a loaded machine (`left: 3, right: 2` in
+`deltas_of_the_other_bitstream_family_are_held_until_a_keyframe`, 31 of 100 runs failed under a 40-thread
+`stress-ng`, 0 of 200 after the fix). Assert on what the code under test did synchronously instead:
+`decode::video::Worker::pushed()` (test-only) counts the access units handed to a pipeline. To hunt such a
+flake, run the single test binary 100-200 times with `xargs -P 20` under `stress-ng --cpu 40` (start it yourself,
+stop it afterwards).
 
 ### Scratch config
 

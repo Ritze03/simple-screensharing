@@ -2070,10 +2070,36 @@ fn start_pipeline(source_fragment: &str, domain: CaptureDomain) -> Result<Captur
     Ok(built)
 }
 
+/// Pause between a portal capture's `PAUSED` and `PLAYING` (task #112).
+///
+/// `Why:` `pipewiresrc` takes its stream streaming -> paused -> streaming at every start (see
+/// [`decoupled_source`]); stock xdg-desktop-portal-wlr 0.8.4 asks the compositor for a frame on every
+/// `streaming` and dies with `session already has a frame object` when the resume arrives while the
+/// previous frame is still outstanding. The queue of [`decoupled_source`] only shortens the first
+/// `streaming` -> paused gap; with the pause and the resume ~100 us apart (one `set_state(Playing)`)
+/// the crash still hit 17-28 % of starts in the headless rig (A/B inside one rig, 30-40 starts per
+/// value: 11/39 and 7/40 crashes at 240 and 60 Hz with no pause, 1/40 at 10 ms and 60 Hz, 0/30 at
+/// 10 ms and 240 Hz, 0/110 at 30 ms or more). Holding the stream paused for 30 ms lets the compositor
+/// deliver the outstanding frame (4-17 ms for a 240-60 Hz output) before the resume. 100 ms also
+/// started fine at 120 fps in the rig (an earlier note feared an "out of buffers" stall there).
+const PORTAL_START_SETTLE: Duration = Duration::from_millis(30);
+
 /// The blocking half of [`start_pipeline`]: `Playing`, then wait for the state
 /// change to settle. On failure the pipeline is back at `Null` and the error
 /// carries the text of the bus error that explains it (see [`start_failure`]).
 fn play_and_wait(pipeline: &gst::Pipeline) -> Result<()> {
+    // The portal's `pipewiresrc` is taken through PAUSED first and held there long enough for the
+    // portal to finish the frame it asked for when the stream first went `streaming`
+    // ([`PORTAL_START_SETTLE`]).
+    if pipeline.by_name(PORTAL_QUEUE_NAME).is_some() {
+        if let Err(e) = pipeline.set_state(gst::State::Paused) {
+            let detail = take_bus_error(pipeline);
+            let _ = pipeline.set_state(gst::State::Null);
+            return Err(start_failure(format!("failed to pause capture pipeline: {e}"), detail));
+        }
+        let _ = pipeline.state(gst::ClockTime::from_seconds(5));
+        std::thread::sleep(PORTAL_START_SETTLE);
+    }
     if let Err(e) = pipeline.set_state(gst::State::Playing) {
         let detail = take_bus_error(pipeline);
         let _ = pipeline.set_state(gst::State::Null);
