@@ -5,6 +5,36 @@ Audio capture/encode/playback is described where it grew up: `features/stream-co
 video") and the module docs of `client/src/audio.rs` and `client/src/decode.rs`. This page covers
 **keeping the audio aligned with the picture** (task #91, 2026-11-01).
 
+## 2026-11-03: the bar's audio meter stayed flat (task #115)
+
+User report: *"in the bottom bar when streaming audio, it doesn't do the visualizer thingy"*.
+No audio test was possible (hard rule), so the whole path was audited and pinned with tests that
+need no PipeWire:
+
+- **Path (all intact):** `level` element in `audio::build_pipeline` (after `volume name=mute`) ->
+  bus -> `pump_loop` -> `handle_bus_message` -> `AudioLevel` (atomic) ->
+  `AudioCaptureHandle::level` -> `AppState::audio_share_level` (only while the audio capture is
+  `Active`) -> `action_bar::live` (`level_lit`) -> `AudioSlot` -> `widgets::meter`, repainted every
+  100 ms (`request_repaint_after` in `live`; the app repaints every 50 ms anyway). The chain has not
+  changed since the July audio fix (`af5b8a6`); #105 did not touch it (it only changed which nodes
+  are linked and which node the *dropdown* taps).
+- **Tests:** `audio::tests::capture_chain_level_messages_reach_the_level_value` runs the real
+  capture chain (`build_pipeline_from_source`, `audiotestsrc` for `pipewiresrc`, bus and appsink
+  streams created late as in `start_audio_sharing`) and asserts the level moves; 
+  `ui::action_bar::tests::the_bars_audio_slot_paints_as_many_lit_bars_as_the_level_says` renders
+  the slot and counts lit bars.
+- **One real defect found: the bar could show the dying share.** `ui::paired_audio` took the first
+  audio capture pointing at the video capture. After switching the audio source (or a reconnect
+  restart) the old one sits in `Stopping` next to the new one until its teardown lands, so the bar
+  showed the old name with a flat meter (a stopping share has no level) and Mute hit the wrong
+  capture. It now prefers any non-`Stopping` capture
+  (`ui::tests::the_bar_follows_the_live_audio_share_not_the_stopping_one`).
+- **Logging:** `pump_loop` logs when the appsink ends (the meter and the audio stop together; copy
+  from Settings > Diagnostics > Logs).
+- **Not proven:** a flat meter while audio really flows cannot come from this code; if it still
+  happens on a real PipeWire, the logs above plus `pw-link -l` (is the app linked into the
+  `ssshare-loopback-*` input?) are the next thing to look at.
+
 ## 2026-11-03: the shared audio is a name; all streams with that name are mixed (task #105)
 
 User request: *"Concise audio streams into streams with the same name only. So we are essentially
