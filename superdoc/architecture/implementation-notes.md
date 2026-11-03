@@ -216,6 +216,15 @@ Spec: `protocol-spec.md` §11. What was decided while building it, and why:
   `--cert-validity-secs` / `--cert-rotate-before-secs`, and `CertSource::SelfSigned`'s fields.
 - **Hash encoding: base64url, no padding** — shortest, and the same codec as the key field,
   so the website decodes both with one helper. 4th, optional join-link field.
+- **Provided-cert reload and the browser's plain fallback (2026-11-03).** `CertManager::poll_provided`
+  advances its remembered mtime only after a *successful* reload, and `reload_provided` proves the new
+  material builds a `quinn::ServerConfig` before it replaces `current`. *Why:* the mtime used to be
+  remembered first, so a reload that failed once (cert and key briefly out of sync while being
+  distributed) was never retried until the files changed again, and `current` could hold a cert/key pair
+  that does not match while the endpoint kept serving the old config. Browser side: `RelaySession.open`
+  retries without `serverCertificateHashes` after a failed pinned attempt, because a CA relay's
+  certificate can never match a pin (see `protocol-spec.md` §11.4, `docs/js/core/README.md`).
+  Native `client/src/net.rs` was deliberately left untouched.
 - **Native client does not enforce the link's hash.** Rotation every ~11 days would turn every
   saved link into a connect failure. It logs the mismatch and records the presented hash for
   `current_cert_hash()`. Known limitation: a native connection that outlives a rotation keeps

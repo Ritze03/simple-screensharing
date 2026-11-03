@@ -15,8 +15,8 @@ import { parseServerAddr } from "./joinlink.js";
  * not resolve, or the pinned certificate hash does not match (measured, see README), so the core infers from history:
  *  - `"unreachable"`: this server+hash pair completed a handshake earlier in this page, so the hash is known good and
  *    the relay is simply not answering (down, restarting, network). `mayBeExpiredLink` is false.
- *  - `"unreachable-or-expired-link"`: the link carries a hash that has never been seen to work here; the relay may be down
- *    or the hash may be stale. `mayBeExpiredLink` is true (only then).
+ *  - `"unreachable-or-expired-link"`: the link carries a hash that has never been seen to work here and the attempt
+ *    without it (normal WebPKI) failed too; the relay may be down or the hash may be stale. `mayBeExpiredLink` is true.
  *  - `"no-hash"`: the link has no hash (CA-certificate relay or native-only link).
  */
 export class ConnectError extends Error {
@@ -50,6 +50,12 @@ export function classifyClose(info) {
 const verifiedHashes = new Set();
 const hashKey = (server, certHash) => `${server}|${Array.from(certHash, (b) => b.toString(16).padStart(2, "0")).join("")}`;
 export const isHashVerified = (server, certHash) => !!certHash && verifiedHashes.has(hashKey(server, certHash));
+/**
+ * server+hash pairs whose link hash did NOT work but a normal WebPKI connection (no `serverCertificateHashes`) did: the relay
+ * serves a CA certificate (`--cert/--key`, whose validity exceeds the 14 days a pin allows, so a pin can never match) and
+ * the link's hash is just ignored. Kept apart from `verifiedHashes`: that set only ever holds hashes that were verified.
+ */
+const webPkiRelays = new Set();
 
 export class JoinRejectedError extends Error {
   constructor(reason) {
@@ -67,7 +73,7 @@ export class JoinRejectedError extends Error {
 }
 
 export const EXPIRED_LINK_HINT =
-  "Could not connect to the relay. It may be offline, or this invite link may have expired: the relay rotates its certificate about every 11 days, which invalidates the certificate hash inside older links. Ask for a fresh invite link.";
+  "Could not connect to the relay. It may be offline, or this invite link may be outdated: a relay with a self-signed certificate rotates it about every 11 days, which invalidates the certificate hash inside older links. Ask for a fresh invite link.";
 
 export function supportsWebTransport() {
   return typeof WebTransport !== "undefined";
@@ -100,12 +106,45 @@ async function readAll(readable, limit) {
   return out;
 }
 
+/**
+ * One WebTransport handshake. Resolves with the ready transport; on failure, abort or timeout the transport is closed and
+ * the original error is thrown (the caller decides what it means). A handshake still pending after `timeoutMs` is given up
+ * on (Chromium would otherwise keep retransmitting its Initial packet for many seconds).
+ */
+async function connectOnce(url, opts, signal, timeoutMs) {
+  let wt;
+  let timer = null;
+  const onAbort = () => {
+    try {
+      wt && wt.close();
+    } catch {}
+  };
+  try {
+    if (signal && signal.aborted) throw new Error("aborted");
+    wt = new WebTransport(url, opts);
+    wt.closed.catch(() => {});
+    if (signal) signal.addEventListener("abort", onAbort, { once: true });
+    if (timeoutMs) timer = setTimeout(() => wt.close(), timeoutMs);
+    await wt.ready;
+    return wt;
+  } catch (e) {
+    try {
+      wt && wt.close();
+    } catch {}
+    throw e;
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener("abort", onAbort);
+  }
+}
+
 export class RelaySession {
   /**
    * Open the WebTransport session. Rejects with ConnectError.
    * @param {{server:string, certHash:Uint8Array|null, signal?:AbortSignal, timeoutMs?:number}} o   server = host:port.
    *   `signal` aborts a handshake in flight (ConnectError code "aborted"); a handshake still pending after `timeoutMs`
-   *   is given up on (Chromium would otherwise keep retransmitting its Initial packet for many seconds).
+   *   is given up on. With a `certHash` that fails, a second handshake without it is tried (see below), each with its own
+   *   timeout, so a dead relay takes up to 2 x `timeoutMs` to report.
    */
   static async open({ server, certHash, signal = null, timeoutMs = HANDSHAKE_TIMEOUT_MS }) {
     if (!supportsWebTransport()) {
@@ -117,35 +156,29 @@ export class RelaySession {
       throw new ConnectError(e.message, { code: e.code === "no-port" ? "server-no-port" : "server-bad-port", cause: e });
     }
     const url = `https://${server}${WEBTRANSPORT_PATH}`;
-    const opts = {};
-    if (certHash) opts.serverCertificateHashes = [{ algorithm: "sha-256", value: certHash }];
+    // With a hash, try it first: a self-signed relay only works that way. A relay with a CA certificate (Let's Encrypt)
+    // never matches a pin (the spec caps a pinnable certificate at two weeks and, if a pin is given, trusts ONLY a matching
+    // one), so then a second attempt without it lets the browser verify normally (WebPKI). Sequential, not racing: a hash
+    // that matches must not cost a second connection. A relay already seen to need WebPKI goes first on reconnects.
+    // Nothing is weakened: the attempt without a pin is the browser's ordinary certificate check.
+    const pinned = certHash ? { serverCertificateHashes: [{ algorithm: "sha-256", value: certHash }] } : null;
+    const attempts = !pinned ? [{}] : webPkiRelays.has(hashKey(server, certHash)) ? [{}, pinned] : [pinned, {}];
     let wt;
-    let aborted = false;
-    let timer = null;
-    const onAbort = () => {
-      aborted = true;
+    let lastError;
+    for (const opts of attempts) {
       try {
-        wt && wt.close();
-      } catch {}
-    };
-    const cleanup = () => {
-      clearTimeout(timer);
-      if (signal) signal.removeEventListener("abort", onAbort);
-    };
-    try {
-      if (signal && signal.aborted) throw new Error("aborted");
-      wt = new WebTransport(url, opts);
-      wt.closed.catch(() => {});
-      if (signal) signal.addEventListener("abort", onAbort, { once: true });
-      if (timeoutMs) timer = setTimeout(() => wt.close(), timeoutMs);
-      await wt.ready;
-    } catch (e) {
-      cleanup();
-      if (aborted || (signal && signal.aborted)) throw new ConnectError("The connection attempt was cancelled.", { code: "aborted", cause: e });
-      try {
-        wt && wt.close();
-      } catch {}
-      if (certHash && isHashVerified(server, certHash)) {
+        wt = await connectOnce(url, opts, signal, timeoutMs);
+        if (certHash) (opts === pinned ? verifiedHashes : webPkiRelays).add(hashKey(server, certHash));
+        break;
+      } catch (e) {
+        lastError = e;
+        // A cancelled attempt (reconnectNow(), session close) ends here; it never starts the second one.
+        if (signal && signal.aborted) throw new ConnectError("The connection attempt was cancelled.", { code: "aborted", cause: e });
+      }
+    }
+    if (!wt) {
+      const e = lastError;
+      if (certHash && (isHashVerified(server, certHash) || webPkiRelays.has(hashKey(server, certHash)))) {
         throw new ConnectError(`The relay at ${server} is not answering (it may be down or restarting).`, { code: "handshake-failed", reason: "unreachable", cause: e });
       }
       throw new ConnectError(certHash ? EXPIRED_LINK_HINT : `Could not connect to the relay at ${server}. If it uses a self-signed certificate, the invite link must contain its certificate hash (4th field).`, {
@@ -155,8 +188,6 @@ export class RelaySession {
         mayBeExpiredLink: !!certHash,
       });
     }
-    cleanup();
-    if (certHash) verifiedHashes.add(hashKey(server, certHash));
     const max = wt.datagrams.maxDatagramSize;
     if (max < MAX_MEDIA_DATAGRAM_LEN) {
       wt.close();

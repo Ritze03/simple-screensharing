@@ -901,7 +901,8 @@ equal in rooms and forwarding.
 
 1. `new WebTransport("https://host:port/ssshare", { serverCertificateHashes: [{ algorithm:
    "sha-256", value: <32 bytes> }] })` — the hash comes from the join link (§11.4); omit
-   `serverCertificateHashes` when the relay uses a CA certificate.
+   `serverCertificateHashes` when the relay uses a CA certificate. A link *with* a hash is tried
+   pinned first and, if that handshake fails, once more without `serverCertificateHashes` (§11.4).
 2. **Ordering assumption:** open the control stream with `createBidirectionalStream()` and
    write `Join` to it immediately. The relay treats the **first bidi stream** as control and
    its first message must be `Join`. (A bidi stream only becomes visible to the relay once the
@@ -925,7 +926,10 @@ than 2 days remain** by swapping the endpoint's server config. Existing connecti
 certificate they were set up with and are never dropped by a rotation; only *new* handshakes see
 the new certificate. With `--cert <pem> --key <pem>` the relay serves a CA-issued chain
 instead (e.g. Let's Encrypt): browsers verify it normally, no hash is needed, nothing is rotated
-(the files are re-read hourly if their mtime changed). Implementation: `server/src/cert.rs`.
+(the files are re-read hourly if their mtime changed; a reload that fails, e.g. because cert and
+key do not match yet mid-deployment, keeps serving the old certificate and is retried at the next
+check, because the mtime is only remembered after a successful reload). Implementation:
+`server/src/cert.rs`.
 
 ### 11.4 Join link: 4th field (certhash) and 5th field (name)
 
@@ -990,6 +994,16 @@ certificate, i.e. until its next rotation (a link made right after a rotation is
 days; one made just before is good for days less). A browser whose pinned hash no longer
 matches fails the handshake and should ask for a fresh link. A CA certificate avoids this
 entirely.
+
+`Why a browser retries without the hash (2026-11-03):` the WebTransport spec makes a non-empty
+`serverCertificateHashes` the *only* trust path (a matching hash and a validity of at most two
+weeks), so against a relay with a CA certificate (`--cert/--key`, validity far above two weeks) a
+link's hash can never work, however correct it is; the native client writes the hash of whatever
+leaf the relay presented into the links it creates, CA relay included. The browser therefore
+tries the hash first (one connection against a self-signed relay) and on failure once without it,
+i.e. with the browser's normal certificate check. If both fail the relay is down or, for a
+self-signed relay, the link is stale. The browser remembers per page that a server+hash needs the
+plain attempt and tries that first on reconnects.
 
 ### 11.5 Constants, in one place
 

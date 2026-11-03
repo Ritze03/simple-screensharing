@@ -257,7 +257,7 @@ const en = {
   "ui.settings.level_loudness_on": "Even out the volume of what I watch",
   "ui.settings.level_loudness_tip": "Raises quiet audio slowly and lowers loud audio quickly, and never lets a sudden loud sound blast past a safe level, so every stream sounds about equally loud at 100%. Your volume slider on each stream works on top of it. Applies right away.",
 
-  "ui.err.unreachable_or_expired": "Could not reach the relay. It may be offline, or this invite link expired (the relay's certificate changed): ask for a fresh invite link.",
+  "ui.err.unreachable_or_expired": "Could not reach the relay. It may be offline, or this invite link may be outdated (a relay with a self-signed certificate changes it about every 11 days): ask for a fresh invite link.",
   "ui.err.unreachable": "The relay is not answering. It may be down or restarting.",
   "ui.err.server_no_port": "The server address needs a port, e.g. host:4433.",
   "ui.err.server_bad_port": "The server address has an invalid port (use 1-65535), e.g. host:4433.",
@@ -545,7 +545,7 @@ const de = {
   "ui.settings.level_loudness_on": "Lautstärke von dem, was ich schaue, angleichen",
   "ui.settings.level_loudness_tip": "Hebt leisen Ton langsam an und senkt lauten Ton schnell ab und lässt plötzliche laute Geräusche nie über eine sichere Grenze hinaus. So klingt jeder Stream bei 100% etwa gleich laut. Dein Lautstärkeregler pro Stream wirkt zusätzlich. Gilt sofort.",
 
-  "ui.err.unreachable_or_expired": "Das Relay ist nicht erreichbar. Es ist vielleicht aus, oder dieser Einladungslink ist abgelaufen (das Zertifikat des Relays hat sich geändert): bitte um einen neuen Einladungslink.",
+  "ui.err.unreachable_or_expired": "Das Relay ist nicht erreichbar. Es ist vielleicht aus, oder dieser Einladungslink ist veraltet (ein Relay mit selbstsigniertem Zertifikat wechselt es etwa alle 11 Tage): bitte um einen neuen Einladungslink.",
   "ui.err.unreachable": "Das Relay antwortet nicht. Es ist vielleicht aus oder startet neu.",
   "ui.err.server_no_port": "Der Serveradresse fehlt der Port, z. B. host:4433.",
   "ui.err.server_bad_port": "Die Serveradresse hat einen ungültigen Port (erlaubt: 1-65535), z. B. host:4433.",

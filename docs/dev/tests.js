@@ -1492,6 +1492,151 @@ test("leveller: AudioReceiver levels decoded frames before scheduling, and 'Leve
   }
 });
 
+// ------------------------------------------------------------------------------------------------ RelaySession.open fallback
+
+// A scripted WebTransport: `plan(opts, n)` says how the n-th handshake ends ("ok" | "fail" | "hang": pending until closed).
+async function withFakeWebTransport(plan, fn) {
+  const real = globalThis.WebTransport;
+  const made = [];
+  globalThis.WebTransport = class {
+    constructor(url, opts) {
+      this.url = url;
+      this.opts = opts;
+      this.closeCalls = 0;
+      made.push(this);
+      const how = plan(opts, made.length - 1);
+      this.datagrams = { maxDatagramSize: 1200 };
+      this.closed = new Promise((res) => (this._closed = res));
+      this.ready = new Promise((res, rej) => {
+        this._reject = rej;
+        if (how === "ok") res();
+        else if (how === "fail") setTimeout(() => rej(new Error("Opening handshake failed.")), 1);
+      });
+    }
+    close() {
+      this.closeCalls++;
+      this._reject(new Error("closed"));
+      this._closed({});
+    }
+  };
+  try {
+    await fn(made);
+  } finally {
+    globalThis.WebTransport = real;
+  }
+}
+const pinnedOf = (wt) => !!(wt.opts && wt.opts.serverCertificateHashes);
+
+test("relay session: no hash in the link = one plain attempt (no fallback to try)", async () => {
+  const { RelaySession, isHashVerified } = await import("../js/core/session.js");
+  await withFakeWebTransport(() => "fail", async (made) => {
+    let err;
+    await RelaySession.open({ server: "fb-nohash.test:4433", certHash: null }).catch((e) => (err = e));
+    eq(made.length, 1, "attempts");
+    ok(!pinnedOf(made[0]), "no pin");
+    eq(err.reason, "no-hash");
+    ok(!err.mayBeExpiredLink);
+  });
+  await withFakeWebTransport(() => "ok", async (made) => {
+    const s = await RelaySession.open({ server: "fb-nohash.test:4433", certHash: null });
+    eq(made.length, 1, "attempts");
+    ok(!isHashVerified("fb-nohash.test:4433", new Uint8Array(32)));
+    s.close({ graceful: false });
+  });
+});
+
+test("relay session: a matching hash connects on the first attempt and is marked verified", async () => {
+  const { RelaySession, isHashVerified } = await import("../js/core/session.js");
+  const hash = new Uint8Array(32).fill(1);
+  await withFakeWebTransport(() => "ok", async (made) => {
+    const s = await RelaySession.open({ server: "fb-selfsigned.test:4433", certHash: hash });
+    eq(made.length, 1, "attempts");
+    ok(pinnedOf(made[0]), "pinned");
+    ok(isHashVerified("fb-selfsigned.test:4433", hash));
+    s.close({ graceful: false });
+  });
+});
+
+test("relay session: a hash that fails falls back to a plain (WebPKI) attempt, remembered without faking a verified hash", async () => {
+  const { RelaySession, isHashVerified } = await import("../js/core/session.js");
+  const server = "fb-ca.test:4433";
+  const hash = new Uint8Array(32).fill(2);
+  // CA relay: only a handshake without a pin succeeds.
+  const plan = (opts) => (opts && opts.serverCertificateHashes ? "fail" : "ok");
+  await withFakeWebTransport(plan, async (made) => {
+    const s = await RelaySession.open({ server, certHash: hash });
+    eq(made.length, 2, "attempts");
+    ok(pinnedOf(made[0]) && !pinnedOf(made[1]), "pinned first, plain second");
+    ok(made[0].closeCalls >= 1, "the failed first transport was closed");
+    ok(!isHashVerified(server, hash), "a WebPKI success must not mark the hash as verified");
+    s.close({ graceful: false });
+  });
+  // A reconnect to the same relay skips the pointless pinned attempt.
+  await withFakeWebTransport(plan, async (made) => {
+    const s = await RelaySession.open({ server, certHash: hash });
+    eq(made.length, 1, "attempts on reconnect");
+    ok(!pinnedOf(made[0]), "plain first");
+    s.close({ graceful: false });
+  });
+  // The relay goes down: both fail, and it is reported as not answering (it was reachable before), not as an expired link.
+  await withFakeWebTransport(() => "fail", async (made) => {
+    let err;
+    await RelaySession.open({ server, certHash: hash }).catch((e) => (err = e));
+    eq(made.length, 2, "attempts");
+    eq(err.reason, "unreachable");
+    ok(!err.mayBeExpiredLink);
+  });
+  // The relay went back to a self-signed cert with this very hash: the pinned attempt (now second) still works.
+  await withFakeWebTransport((opts) => (opts && opts.serverCertificateHashes ? "ok" : "fail"), async (made) => {
+    const s = await RelaySession.open({ server, certHash: hash });
+    eq(made.length, 2, "attempts");
+    ok(isHashVerified(server, hash));
+    s.close({ graceful: false });
+  });
+});
+
+test("relay session: both attempts failing gives the fresh-link hint, each attempt with its own timeout", async () => {
+  const { RelaySession, EXPIRED_LINK_HINT } = await import("../js/core/session.js");
+  await withFakeWebTransport(() => "hang", async (made) => {
+    let err;
+    const t0 = performance.now();
+    await RelaySession.open({ server: "fb-dead.test:4433", certHash: new Uint8Array(32).fill(3), timeoutMs: 60 }).catch((e) => (err = e));
+    const ms = performance.now() - t0;
+    eq(made.length, 2, "attempts");
+    ok(pinnedOf(made[0]) && !pinnedOf(made[1]));
+    ok(made.every((w) => w.closeCalls >= 1), "both transports closed");
+    ok(ms >= 110, `two timeouts back to back (${Math.round(ms)} ms)`);
+    eq(err.reason, "unreachable-or-expired-link");
+    ok(err.mayBeExpiredLink);
+    eq(err.message, EXPIRED_LINK_HINT);
+    ok(/fresh invite link/.test(err.message));
+  });
+});
+
+test("relay session: cancelling (abort signal) never starts the second attempt", async () => {
+  const { RelaySession } = await import("../js/core/session.js");
+  const hash = new Uint8Array(32).fill(4);
+  await withFakeWebTransport(() => "hang", async (made) => {
+    const ac = new AbortController();
+    let err;
+    const p = RelaySession.open({ server: "fb-abort.test:4433", certHash: hash, signal: ac.signal }).catch((e) => (err = e));
+    await new Promise((r) => setTimeout(r, 20));
+    ac.abort();
+    await p;
+    eq(made.length, 1, "attempts");
+    eq(err.code, "aborted");
+    ok(made[0].closeCalls >= 1);
+  });
+  await withFakeWebTransport(() => "ok", async (made) => {
+    const ac = new AbortController();
+    ac.abort();
+    let err;
+    await RelaySession.open({ server: "fb-abort.test:4433", certHash: hash, signal: ac.signal }).catch((e) => (err = e));
+    eq(made.length, 0, "attempts");
+    eq(err.code, "aborted");
+  });
+});
+
 // ------------------------------------------------------------------------------------------------ runner
 
 export async function runAll({ onResult = () => {} } = {}) {

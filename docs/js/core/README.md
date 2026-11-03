@@ -28,7 +28,8 @@ this browser can do (`canWatch`, `canShare`, and the individual features) so the
 
 `server|room-id|key[|certhash[|name]]`, exactly like the native client (`client/src/net.rs`, spec `protocol-spec.md` §11.4):
 `room-id` = 32 hex chars, `key` = 32 bytes base64url without padding, `certhash` = SHA-256 of the relay's leaf certificate
-DER, base64url without padding (needed by browsers for a self-signed relay; omit for a CA certificate, or leave empty when
+DER, base64url without padding (needed by browsers for a self-signed relay; for a CA certificate it is not needed and, if present,
+is ignored after one failed pinned attempt, see below; omit it, or leave empty when
 only a name follows: `server|id|key||name`), `name` = the room's display name, UTF-8 percent-encoded (task #69, user request
 2026-10-15). The name is cosmetic and not part of the room's identity: a malformed `%`, invalid UTF-8 or a blank name means
 "no name" and the link still parses; the decoded name is trimmed, stripped of control characters and cut at 64 characters.
@@ -46,15 +47,29 @@ only a name follows: `server|id|key||name`), `name` = the room's display name, U
 every 11 days, which makes the hash in older links stale. **Chromium 153 reports every handshake failure identically**: a
 wrong hash, a closed port, an unresolvable host and a self-signed certificate without a hash all reject `ready` and `closed`
 with `WebTransportError: Opening handshake failed.` (`source: "session"`, no `streamErrorCode`, and the durations overlap, so
-timing does not separate them either; measured in `dev/` runs). So the core infers from history, per page:
-a server+hash pair that has completed a handshake once is *verified*. After that a failed handshake is `ConnectError{code:
+timing does not separate them either; measured in `dev/` runs). So the core infers from history, per page.
+
+**Pinned hash first, plain WebPKI second (2026-11-03).** A link with a hash is tried with `serverCertificateHashes` first; if that
+handshake fails, `RelaySession.open` makes a second attempt **without** it, so the browser verifies the certificate normally. Why: per
+the WebTransport spec a non-empty `serverCertificateHashes` makes the browser trust *only* a certificate that matches a hash and is
+valid for at most two weeks, so a CA certificate (relay `--cert/--key`, e.g. Let's Encrypt) can never match a pin, not even the
+"right" hash of its leaf that the native client writes into links; only dropping the pin works. Sequential, never racing (a matching
+hash costs one connection), each attempt with its own 8 s timeout (a dead relay reports after up to 16 s), and a cancel
+(`reconnectNow()`, `disconnect()`) ends the whole `open` without starting the second attempt. A link without a hash makes one plain
+attempt, as before. Nothing is weakened: the second attempt is the browser's ordinary certificate check. When it succeeds the
+server+hash pair is remembered as a WebPKI relay (kept apart from the verified hashes: a plain success must never mark a hash as
+verified), and later reconnects try it plain first (the pinned attempt then runs second, so a relay that went back to a self-signed
+certificate still works). (Test note: with a private test CA, Chromium refused plain WebTransport until `--origin-to-force-quic-on=host:port` was passed; a publicly trusted CA such as Let's Encrypt needs no flag.)
+
+A server+hash pair that has completed a handshake once (pinned, or plain after the pin failed) is *verified*. After that a failed handshake is `ConnectError{code:
 "handshake-failed", reason: "unreachable"}` (`mayBeExpiredLink` false; reconnect `error` code `relay-unreachable`): the relay
-is not answering. Only a hash that has **never** worked here gives `reason: "unreachable-or-expired-link"` with
-`mayBeExpiredLink: true` and the hedged message `EXPIRED_LINK_HINT` ("may be offline, or this invite link may have expired").
+is not answering. Only a hash that has **never** worked here, with the plain attempt failing too, gives `reason:
+"unreachable-or-expired-link"` with `mayBeExpiredLink: true` and the hedged message `EXPIRED_LINK_HINT` ("may be offline, or this
+invite link may be outdated: a relay with a self-signed certificate rotates it about every 11 days ...").
 Consequence: the `link-expired` reconnect error can only fire for a client that never connected with that hash, i.e. in practice
 never during auto-reconnect; the narrow case it no longer catches is a certificate rotated while the page stayed open and the
 connection then dropped (the reconnect then reports `relay-unreachable` until the page is reloaded and the link is replaced).
-`handshake-failed` attempts that hang are cut off after 8 s (`HANDSHAKE_TIMEOUT_MS`) and can be cancelled (see `reconnectNow()`).
+`handshake-failed` attempts that hang are cut off after 8 s each (`HANDSHAKE_TIMEOUT_MS`) and can be cancelled (see `reconnectNow()`).
 
 **Relay close codes (task #29).** The relay now writes `JoinRejected{RoomFull|Malformed}`, `finish()`es the control stream and
 waits (up to 2 s) for the peer before closing with `0x102` / `0x101`, and closes the endpoint with `0x200` "relay shutting down".

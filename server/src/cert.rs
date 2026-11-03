@@ -211,11 +211,37 @@ impl CertManager {
             bail!("only a provided certificate is reloaded");
         };
         let mut m = Self::load(&self.source)?;
+        // Prove the new material is usable (e.g. cert and key belong together)
+        // *before* it replaces `current`, so a failed reload leaves the old,
+        // working cert in place instead of a half state `server_config()`
+        // would then fail on.
+        let tuning = self.tuning.lock().unwrap().clone();
+        build_server_config(m.chain.clone(), m.key.clone_key(), &tuning)?;
         let mut cur = self.current.lock().unwrap();
         m.info.rotations = cur.info.rotations + 1;
         let info = m.info.clone();
         *cur = m;
         Ok(info)
+    }
+
+    /// One poll of a provided cert: `None` if the files' mtime still equals
+    /// `*seen`, else the reload result. `*seen` advances only after a
+    /// *successful* reload, so a failed one (cert and key briefly out of sync
+    /// while being deployed, a half-written file) is retried on the next poll
+    /// instead of being skipped until the files change again.
+    fn poll_provided(
+        &self,
+        seen: &mut Option<(SystemTime, SystemTime)>,
+    ) -> Option<Result<CertInfo>> {
+        let mtime = self.provided_mtime();
+        if mtime == *seen {
+            return None;
+        }
+        let reloaded = self.reload_provided();
+        if reloaded.is_ok() {
+            *seen = mtime;
+        }
+        Some(reloaded)
     }
 
     /// Long-running task: keep `endpoint` serving a valid cert. Publishes the
@@ -248,14 +274,10 @@ impl CertManager {
                     }
                     self.rotate_now()
                 }
-                CertSource::Provided { .. } => {
-                    let mtime = self.provided_mtime();
-                    if mtime == provided_mtime {
-                        continue;
-                    }
-                    provided_mtime = mtime;
-                    self.reload_provided()
-                }
+                CertSource::Provided { .. } => match self.poll_provided(&mut provided_mtime) {
+                    Some(reloaded) => reloaded,
+                    None => continue,
+                },
             };
             match renewed.and_then(|info| self.server_config().map(|cfg| (info, cfg))) {
                 Ok((info, cfg)) => {
@@ -562,6 +584,60 @@ mod tests {
         assert_ne!(before.hash, after.hash);
         assert_eq!(after.rotations, 1);
         assert_eq!(mgr.info().hash, after.hash);
+    }
+
+    /// A reload that fails (cert and key out of sync mid-deployment) keeps
+    /// serving the old cert and is retried on the next poll, without the files
+    /// having to change again; once they match, the new cert is picked up.
+    #[test]
+    fn failed_provided_reload_keeps_old_cert_and_is_retried() {
+        let dir = std::env::temp_dir().join(format!("ssshare-reload-retry-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (cert_path, key_path) = (dir.join("fullchain.pem"), dir.join("privkey.pem"));
+        // (cert pem, key pem, cert hash)
+        let gen_pair = || {
+            let k = rcgen::generate_simple_self_signed(vec!["relay.example.com".to_string()]).unwrap();
+            (k.cert.pem(), k.signing_key.serialize_pem(), cert_hash_of_der(k.cert.der()))
+        };
+        // mtimes are bumped by hand: two writes can land in the same
+        // filesystem timestamp tick and would look unchanged.
+        let mut tick = 0u64;
+        let mut write = |cert: &str, key: &str| {
+            std::fs::write(&cert_path, cert).unwrap();
+            std::fs::write(&key_path, key).unwrap();
+            tick += 10;
+            let t = SystemTime::now() + Duration::from_secs(tick);
+            for p in [&cert_path, &key_path] {
+                std::fs::File::options().write(true).open(p).unwrap().set_modified(t).unwrap();
+            }
+        };
+        let (a, b) = (gen_pair(), gen_pair());
+        write(&a.0, &a.1);
+        let mgr = CertManager::new(CertSource::Provided { cert: cert_path.clone(), key: key_path.clone() }).unwrap();
+        assert_eq!(mgr.info().hash, a.2);
+        let mut seen = mgr.provided_mtime();
+        assert!(mgr.poll_provided(&mut seen).is_none(), "unchanged files: nothing to do");
+
+        // New cert B arrived, its key (still A's) has not: reload must fail.
+        write(&b.0, &a.1);
+        let seen_before = seen;
+        assert!(mgr.poll_provided(&mut seen).unwrap().is_err());
+        assert_eq!(seen, seen_before, "a failed reload must not be remembered as done");
+        assert_eq!(mgr.info().hash, a.2, "the old cert stays current");
+        mgr.server_config().expect("the old config is still buildable");
+        // Same files, next poll: tried again (this is the regression).
+        assert!(mgr.poll_provided(&mut seen).unwrap().is_err());
+
+        // Key B lands: the retry succeeds and the new cert is served.
+        write(&b.0, &b.1);
+        let reloaded = mgr.poll_provided(&mut seen).unwrap().unwrap();
+        assert_eq!(reloaded.hash, b.2);
+        assert_eq!(mgr.info().hash, reloaded.hash);
+        assert_eq!(mgr.info().rotations, 1, "failed attempts do not count as rotations");
+        mgr.server_config().expect("the new config is buildable");
+        assert!(mgr.poll_provided(&mut seen).is_none(), "now remembered");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `--cert/--key` (what certbot / Let's Encrypt produce): served as-is,
