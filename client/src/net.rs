@@ -94,8 +94,9 @@
 //! reconnect) refreshes it.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use aes_gcm::{
     aead::{Aead, Payload},
@@ -104,13 +105,16 @@ use aes_gcm::{
 };
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use bytes::Bytes;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::fragment::Reassembler;
+use crate::nack::{hello_loop, SendRing};
 use crate::protocol::{
     cert_hash_of_der, decode_cert_hash, decode_control_payload, encode_cert_hash, encode_control_frame, ClientToRelay, ConnId, CertHash, MediaHeader, Member,
     PresenceEvent, PreviewHeader, RejectReason, RelayToClient, RoomId, StreamId, StreamInfo,
-    StreamKind, MAX_CONTROL_FRAME_LEN, PROTOCOL_VERSION, STREAM_TYPE_PREVIEW,
+    StreamKind, is_nack_datagram, NackRange, MAX_CONTROL_FRAME_LEN, NACK_TAG_HELLO_ACK, NACK_TAG_MISS, NACK_TAG_REQUEST,
+    PROTOCOL_VERSION, STREAM_TYPE_PREVIEW,
 };
 
 /// ALPN protocol identifier for this project's native QUIC transport.
@@ -607,6 +611,8 @@ pub struct ScreenshareClient {
     control_send: Arc<Mutex<quinn::SendStream>>,
     room_id: RoomId,
     cert_hash: Option<CertHash>,
+    /// Recently sent video datagrams, for NACK retransmits (spec §6.6).
+    send_ring: Arc<SendRing>,
 }
 
 /// SHA-256 of the leaf certificate the relay presented on `connection`, or
@@ -710,7 +716,17 @@ impl ScreenshareClient {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         tokio::spawn(control_reader_loop(recv, event_tx.clone()));
-        tokio::spawn(datagram_reader_loop(connection.clone(), parsed.room_key, event_tx.clone()));
+        let send_ring = Arc::new(SendRing::default());
+        let nack_acked = Arc::new(AtomicBool::new(false));
+        tokio::spawn(datagram_reader_loop(
+            connection.clone(),
+            parsed.room_key,
+            event_tx.clone(),
+            conn_id,
+            send_ring.clone(),
+            nack_acked.clone(),
+        ));
+        tokio::spawn(hello_loop(connection.clone(), nack_acked));
         tokio::spawn(preview_uni_loop(connection.clone(), parsed.room_key, event_tx));
 
         let client = Self {
@@ -721,6 +737,7 @@ impl ScreenshareClient {
             control_send: Arc::new(Mutex::new(send)),
             room_id: parsed.room_id,
             cert_hash,
+            send_ring,
         };
 
         Ok((client, snapshot, event_rx))
@@ -767,6 +784,11 @@ impl ScreenshareClient {
         self.connection.clone()
     }
 
+    /// The ring `capture.rs` records every video frame's datagrams in (spec §6.6).
+    pub fn send_ring(&self) -> &SendRing {
+        &self.send_ring
+    }
+
     pub async fn announce_stream(
         &self,
         stream_id: StreamId,
@@ -786,6 +808,7 @@ impl ScreenshareClient {
     }
 
     pub async fn stop_stream(&self, stream_id: StreamId) -> Result<()> {
+        self.send_ring.forget(stream_id);
         self.send_control(&ClientToRelay::StopStream { stream_id }).await
     }
 
@@ -885,46 +908,136 @@ async fn control_reader_loop(mut recv: quinn::RecvStream, tx: mpsc::UnboundedSen
     }
 }
 
-async fn datagram_reader_loop(connection: quinn::Connection, room_key: [u8; 32], tx: mpsc::UnboundedSender<ClientEvent>) {
+/// How often the datagram loop polls the reassembler while a frame is being repaired.
+const NACK_TICK: Duration = Duration::from_millis(5);
+
+async fn datagram_reader_loop(
+    connection: quinn::Connection,
+    room_key: [u8; 32],
+    tx: mpsc::UnboundedSender<ClientEvent>,
+    own_id: ConnId,
+    send_ring: Arc<SendRing>,
+    nack_acked: Arc<AtomicBool>,
+) {
     let mut reassembler = Reassembler::new();
+    let mut last_poll = Instant::now();
+    let mut logged = (crate::fragment::NackStats::default(), 0u64, Instant::now());
     loop {
-        let datagram = match connection.read_datagram().await {
-            Ok(d) => d,
-            Err(e) => {
-                tracing::debug!("media datagram loop ending: {e}");
-                return;
-            }
-        };
-        let (header, fragment_payload) = match MediaHeader::unpack(&datagram) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("dropping malformed media datagram: {e}");
-                continue;
-            }
-        };
-        let (done, loss) = reassembler.insert_with_loss(&header, fragment_payload);
-        let Some(ciphertext) = done else {
-            continue;
-        };
-        let nonce = build_nonce(header.conn_id, header.frame_id);
-        match decrypt_frame(&room_key, header.stream_id, nonce, &ciphertext) {
-            Ok((pts, payload)) => {
-                let frame = DecryptedMediaFrame {
-                    conn_id: header.conn_id,
-                    stream_id: header.stream_id,
-                    pts,
-                    keyframe: header.is_keyframe(),
-                    stalled: header.is_stalled(),
-                    loss,
-                    payload,
-                };
-                if tx.send(ClientEvent::MediaFrame(frame)).is_err() {
+        let tick = reassembler.has_pending();
+        let datagram = tokio::select! {
+            d = connection.read_datagram() => match d {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    tracing::debug!("media datagram loop ending: {e}");
                     return;
                 }
+            },
+            _ = async { if tick { tokio::time::sleep(NACK_TICK).await } else { std::future::pending().await } } => None,
+        };
+        let now = Instant::now();
+        let mut frames = Vec::new();
+        if let Some(datagram) = datagram {
+            if is_nack_datagram(&datagram) {
+                handle_nack_datagram(&datagram, &connection, own_id, &send_ring, &nack_acked, &mut reassembler);
+            } else {
+                match MediaHeader::unpack(&datagram) {
+                    Ok((header, fragment_payload)) => frames.extend(reassembler.ingest(now, &header, fragment_payload)),
+                    Err(e) => tracing::warn!("dropping malformed media datagram: {e}"),
+                }
             }
-            Err(e) => tracing::warn!("dropping media frame that failed to decrypt: {e}"),
+        }
+        if reassembler.has_pending() && now.duration_since(last_poll) >= NACK_TICK {
+            last_poll = now;
+            let (released, requests) = reassembler.poll(now, connection.rtt());
+            frames.extend(released);
+            for range in requests {
+                let _ = connection.send_datagram(Bytes::copy_from_slice(&range.pack(NACK_TAG_REQUEST)));
+            }
+        }
+        log_nack_activity(&reassembler, &send_ring, &connection, &mut logged);
+        for done in frames {
+            let nonce = build_nonce(done.conn_id, done.frame_id);
+            match decrypt_frame(&room_key, done.stream_id, nonce, &done.ciphertext) {
+                Ok((pts, payload)) => {
+                    let frame = DecryptedMediaFrame {
+                        conn_id: done.conn_id,
+                        stream_id: done.stream_id,
+                        pts,
+                        keyframe: done.is_keyframe(),
+                        stalled: done.is_stalled(),
+                        loss: done.loss,
+                        payload,
+                    };
+                    if tx.send(ClientEvent::MediaFrame(frame)).is_err() {
+                        return;
+                    }
+                }
+                Err(e) => tracing::warn!("dropping media frame that failed to decrypt: {e}"),
+            }
         }
     }
+}
+
+/// One NACK-family datagram (spec §6.6): the relay's `HelloAck` switches the reassembler to NACK
+/// mode, a `Miss` ends the wait for a frame, a forwarded `Request` (we are the stream owner) makes
+/// the send ring re-send. Everything is ignored when the feature is off.
+fn handle_nack_datagram(
+    datagram: &[u8],
+    connection: &quinn::Connection,
+    own_id: ConnId,
+    send_ring: &SendRing,
+    nack_acked: &AtomicBool,
+    reassembler: &mut Reassembler,
+) {
+    if !crate::nack::enabled() {
+        return;
+    }
+    match datagram[0] {
+        NACK_TAG_HELLO_ACK => {
+            nack_acked.store(true, Ordering::Relaxed);
+            reassembler.set_nack(true);
+        }
+        NACK_TAG_MISS => {
+            if let Some((_, range)) = NackRange::unpack(datagram) {
+                reassembler.nack_miss(&range);
+            }
+        }
+        NACK_TAG_REQUEST => {
+            if let Some((_, range)) = NackRange::unpack(datagram)
+                && range.conn_id == own_id
+            {
+                send_ring.resend(connection, &range);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Log the NACK counters at most every 5 s, and only when something moved.
+fn log_nack_activity(
+    reassembler: &Reassembler,
+    send_ring: &SendRing,
+    connection: &quinn::Connection,
+    logged: &mut (crate::fragment::NackStats, u64, Instant),
+) {
+    if logged.2.elapsed() < Duration::from_secs(5) {
+        return;
+    }
+    let stats = reassembler.stats();
+    let resent = send_ring.resent.load(Ordering::Relaxed);
+    if stats != logged.0 || resent != logged.1 {
+        tracing::info!(
+            requests = stats.requests - logged.0.requests,
+            fragments_requested = stats.fragments_requested - logged.0.fragments_requested,
+            fragments_recovered = stats.fragments_recovered - logged.0.fragments_recovered,
+            frames_recovered = stats.frames_recovered - logged.0.frames_recovered,
+            frames_abandoned = stats.frames_abandoned - logged.0.frames_abandoned,
+            fragments_resent_for_others = resent - logged.1,
+            rtt_ms = connection.rtt().as_millis() as u64,
+            "NACK activity in the last 5 s"
+        );
+    }
+    *logged = (stats, resent, Instant::now());
 }
 
 async fn preview_uni_loop(connection: quinn::Connection, room_key: [u8; 32], tx: mpsc::UnboundedSender<ClientEvent>) {

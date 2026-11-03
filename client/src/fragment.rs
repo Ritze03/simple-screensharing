@@ -7,11 +7,13 @@
 //! functions/structs — no I/O, no async — so `net.rs` just wires them to the
 //! actual QUIC datagram send/recv calls.
 
-use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use crate::protocol::{ConnId, MediaHeader, StreamId, MAX_MEDIA_DATAGRAM_LEN, MEDIA_HEADER_LEN};
+use crate::protocol::{
+    ConnId, MediaHeader, NackRange, StreamId, MAX_MEDIA_DATAGRAM_LEN, MEDIA_FLAG_KEYFRAME, MEDIA_FLAG_STALLED,
+    MEDIA_HEADER_LEN,
+};
 
 /// Split one already-AEAD-encrypted frame (`ciphertext_with_tag`) into
 /// wire-ready datagrams (header + this fragment's slice), per spec §6.3.
@@ -118,20 +120,39 @@ pub fn fragment_frame_with_flags(
 struct FrameBuf {
     fragments: Vec<Option<Vec<u8>>>,
     received: usize,
+    first_seen: Instant,
     last_touched: Instant,
-    /// The header's keyframe bit (same on every fragment), so a discarded
-    /// frame can be reported as "an IDR was lost".
-    keyframe: bool,
+    /// The header's `flags` byte (same on every fragment), so a discarded frame can be reported as
+    /// "an IDR was lost" and a released one carries its keyframe / stalled bits.
+    flags: u8,
+    /// Highest fragment index received so far (a hole below it with data behind it is a gap).
+    max_index: usize,
+    /// Requests sent for this frame, over all fragments (stats: "completed after asking").
+    attempts: u32,
+    /// Per fragment: how often it was asked for and when last (allocated on the first request);
+    /// also tells which arrivals were retransmits.
+    requested: Vec<(u8, Instant)>,
+    /// The relay said it cannot supply what is missing: stop waiting.
+    give_up: bool,
 }
 
 impl FrameBuf {
-    fn new(fragment_count: usize, keyframe: bool) -> Self {
+    fn new(fragment_count: usize, flags: u8, now: Instant) -> Self {
         Self {
             fragments: vec![None; fragment_count],
             received: 0,
-            last_touched: Instant::now(),
-            keyframe,
+            first_seen: now,
+            last_touched: now,
+            flags,
+            max_index: 0,
+            attempts: 0,
+            requested: Vec::new(),
+            give_up: false,
         }
+    }
+
+    fn keyframe(&self) -> bool {
+        self.flags & MEDIA_FLAG_KEYFRAME != 0
     }
 
     fn is_complete(&self) -> bool {
@@ -145,6 +166,33 @@ impl FrameBuf {
         }
         out
     }
+
+    /// Missing fragments worth asking for now: a hole with at least [`REORDER_DEPTH`] later
+    /// fragments behind it, or every hole once the frame has been quiet for [`IDLE_NACK`] (the
+    /// lost tail has no later fragment to expose it).
+    fn suspects(&self, now: Instant) -> Vec<usize> {
+        let idle = now.duration_since(self.last_touched) >= IDLE_NACK;
+        (0..self.fragments.len())
+            .filter(|&i| self.fragments[i].is_none() && (idle || i + REORDER_DEPTH <= self.max_index))
+            .collect()
+    }
+
+    /// `(times asked, when last)` for fragment `i`.
+    fn asked(&self, i: usize) -> (u8, Option<Instant>) {
+        self.requested.get(i).map_or((0, None), |&(n, at)| (n, (n > 0).then_some(at)))
+    }
+}
+
+/// Contiguous runs `(first, count)` of ascending indices.
+fn runs_of(indices: &[usize]) -> Vec<(u16, u16)> {
+    let mut runs: Vec<(u16, u16)> = Vec::new();
+    for &i in indices {
+        match runs.last_mut() {
+            Some((start, n)) if *start as usize + *n as usize == i => *n += 1,
+            _ => runs.push((i as u16, 1)),
+        }
+    }
+    runs
 }
 
 /// Reassembly state for a single `(conn_id, stream_id)` media stream.
@@ -155,6 +203,35 @@ struct StreamReassembly {
     /// Incomplete frames discarded since the last frame this stream delivered;
     /// handed out (and cleared) with the next delivered frame.
     pending_loss: FrameLoss,
+    /// NACK mode: the last few hundred frame ids delivered or given up on, so a late duplicate
+    /// (a retransmit racing the original) never opens a ghost frame.
+    done: DoneIds,
+}
+
+/// A bounded set of recent frame ids.
+#[derive(Default)]
+struct DoneIds {
+    set: HashSet<u32>,
+    order: VecDeque<u32>,
+}
+
+impl DoneIds {
+    const CAP: usize = 256;
+
+    fn insert(&mut self, id: u32) {
+        if self.set.insert(id) {
+            self.order.push_back(id);
+            if self.order.len() > Self::CAP
+                && let Some(old) = self.order.pop_front()
+            {
+                self.set.remove(&old);
+            }
+        }
+    }
+
+    fn contains(&self, id: u32) -> bool {
+        self.set.contains(&id)
+    }
 }
 
 /// Frames the receiver gave up on: an incomplete frame was evicted by a newer
@@ -187,7 +264,7 @@ impl FrameLoss {
 
     fn note(&mut self, buf: &FrameBuf) {
         self.frames = self.frames.saturating_add(1);
-        if buf.keyframe {
+        if buf.keyframe() {
             self.keyframe = true;
             self.keyframe_fragments = buf.fragments.len().min(u16::MAX as usize) as u16;
             self.keyframe_received = buf.received.min(u16::MAX as usize) as u16;
@@ -195,21 +272,89 @@ impl FrameLoss {
     }
 }
 
+/// One fully received frame, still encrypted.
+#[derive(Debug)]
+pub struct Completed {
+    pub conn_id: ConnId,
+    pub stream_id: StreamId,
+    pub frame_id: u32,
+    pub flags: u8,
+    pub ciphertext: Vec<u8>,
+    /// Incomplete frames of this stream given up on since the previous frame it delivered.
+    pub loss: FrameLoss,
+}
+
+impl Completed {
+    pub fn is_keyframe(&self) -> bool {
+        self.flags & MEDIA_FLAG_KEYFRAME != 0
+    }
+
+    pub fn is_stalled(&self) -> bool {
+        self.flags & MEDIA_FLAG_STALLED != 0
+    }
+}
+
+/// What the NACK machinery did (spec §6.6), for the periodic log and the measurements.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NackStats {
+    /// Request datagrams sent (one per contiguous run per round).
+    pub requests: u64,
+    /// Fragments asked for, counted per round (a fragment asked twice counts twice).
+    pub fragments_requested: u64,
+    /// Fragments that arrived after having been asked for.
+    pub fragments_recovered: u64,
+    /// Frames that completed after at least one request.
+    pub frames_recovered: u64,
+    /// Frames given up on after asking (rounds exhausted, `Miss`, too many holes, or the time limit).
+    pub frames_abandoned: u64,
+}
+
 /// How many incomplete frames to keep in flight per stream before evicting
 /// the oldest (spec §6.5: "keep at most the newest 1-2 in-progress
-/// frame_ids per stream").
+/// frame_ids per stream"). Legacy mode only.
 const MAX_INFLIGHT_FRAMES_PER_STREAM: usize = 2;
 
-/// Backstop: drop any buffer untouched for this long (spec §6.5).
+/// Backstop: drop any buffer untouched for this long (spec §6.5). Legacy mode only.
 const STALE_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// A hole counts as a gap once this many fragment positions later have arrived.
+const REORDER_DEPTH: usize = 2;
+/// A frame quiet this long has lost its tail. (A paced keyframe sends a chunk every 2 ms.)
+const IDLE_NACK: Duration = Duration::from_millis(20);
+/// Times one fragment is asked for; the frame is abandoned one retry interval after the last ask
+/// if it is still missing.
+const MAX_NACK_ROUNDS: u8 = 3;
+/// A frame with more suspect fragments than this is congestion, not loss: more traffic would
+/// only hurt, so it is abandoned without asking.
+const MAX_REPAIR_FRAGMENTS: usize = 128;
+/// Nothing waits longer than this for a frame, whatever else happens.
+const NACK_HARD_LIMIT: Duration = Duration::from_secs(1);
+/// Memory guard: frames held per stream in NACK mode.
+const MAX_FRAMES_NACK: usize = 256;
+
+/// Time between two NACK rounds for one frame: long enough for the answer to come back even when
+/// it has to go on to the sharer (viewer RTT + sharer RTT + processing). The viewer only knows its
+/// own RTT; the 60 ms and the 100 ms floor are the allowance for the sharer's leg (a first rig run
+/// with floor 60 ms lost a keyframe whose repair had to cross a sharer link at ~90 ms RTT).
+pub fn nack_retry_interval(rtt: Duration) -> Duration {
+    (rtt * 2 + Duration::from_millis(60)).clamp(Duration::from_millis(100), Duration::from_millis(300))
+}
 
 /// Reassembles fragmented media datagrams for potentially many concurrent
 /// `(conn_id, stream_id)` streams (e.g. multiple room members, multi-monitor
 /// senders). Not `Sync` — intended to be owned and driven by a single
 /// receiver task per connection.
+///
+/// Two modes. **Legacy** (default): the spec §6.5 drop-and-continue policy, a frame is delivered the
+/// moment its last fragment lands, and an incomplete one is dropped when two newer ones are in
+/// flight or after 200 ms. **NACK** ([`Self::set_nack`], spec §6.6): an incomplete frame is repaired
+/// by [`Self::poll`] asking for its missing fragments, and later complete frames of the stream wait
+/// for it so the decoder still sees the frames in order.
 #[derive(Default)]
 pub struct Reassembler {
     streams: HashMap<(ConnId, StreamId), StreamReassembly>,
+    nack: bool,
+    stats: NackStats,
 }
 
 impl Reassembler {
@@ -217,58 +362,77 @@ impl Reassembler {
         Self::default()
     }
 
-    /// Feed one received datagram's cleartext header + fragment payload.
-    /// Returns `Some(ciphertext_with_tag)` once the frame is fully
-    /// reassembled (caller then AEAD-decrypts it), otherwise `None`.
-    pub fn insert(&mut self, header: &MediaHeader, fragment_payload: &[u8]) -> Option<Vec<u8>> {
-        self.insert_with_loss(header, fragment_payload).0
+    /// Switch the NACK mode on (the relay acknowledged our Hello). Frames already in flight carry on
+    /// under the new rules.
+    pub fn set_nack(&mut self, on: bool) {
+        self.nack = on;
     }
 
-    /// [`Self::insert`] that also reports the frames discarded since the
-    /// previous frame this stream delivered. The report is only non-default
-    /// alongside a delivered frame; losses seen while nothing is delivered
-    /// accumulate until the next delivery.
-    pub fn insert_with_loss(&mut self, header: &MediaHeader, fragment_payload: &[u8]) -> (Option<Vec<u8>>, FrameLoss) {
+    pub fn stats(&self) -> NackStats {
+        self.stats
+    }
+
+    /// True while a NACK-mode frame is incomplete, i.e. [`Self::poll`] has work to do.
+    pub fn has_pending(&self) -> bool {
+        self.nack && self.streams.values().any(|s| s.frames.values().any(|f| !f.is_complete()))
+    }
+
+    /// Feed one received datagram's cleartext header + fragment payload. Returns the frames that
+    /// became deliverable: at most one in legacy mode, possibly several in NACK mode (a repaired
+    /// frame releases the ones held behind it).
+    pub fn ingest(&mut self, now: Instant, header: &MediaHeader, fragment_payload: &[u8]) -> Vec<Completed> {
         let key = (header.conn_id, header.stream_id);
+        let nack = self.nack;
         let stream = self.streams.entry(key).or_insert_with(|| StreamReassembly {
             frames: BTreeMap::new(),
             pending_loss: FrameLoss::default(),
+            done: DoneIds::default(),
         });
-        let frame = Self::insert_into(stream, header, fragment_payload);
-        let loss = if frame.is_some() { std::mem::take(&mut stream.pending_loss) } else { FrameLoss::default() };
-        (frame, loss)
-    }
-
-    fn insert_into(stream: &mut StreamReassembly, header: &MediaHeader, fragment_payload: &[u8]) -> Option<Vec<u8>> {
-        // Stale-timeout backstop: drop any buffer untouched for too long.
-        let now = Instant::now();
-        let pending = &mut stream.pending_loss;
-        stream.frames.retain(|_, buf| {
-            let fresh = now.duration_since(buf.last_touched) < STALE_TIMEOUT;
-            if !fresh {
-                pending.note(buf);
+        let mut out = Vec::new();
+        if nack {
+            if stream.done.contains(header.frame_id) {
+                return out;
             }
-            fresh
-        });
+        } else {
+            // Stale-timeout backstop: drop any buffer untouched for too long.
+            let pending = &mut stream.pending_loss;
+            stream.frames.retain(|_, buf| {
+                let fresh = now.duration_since(buf.last_touched) < STALE_TIMEOUT;
+                if !fresh {
+                    pending.note(buf);
+                }
+                fresh
+            });
+        }
 
         if header.fragment_count == 0 {
-            return None; // malformed, nothing to reassemble
+            return out; // malformed, nothing to reassemble
         }
 
         let buf = stream
             .frames
             .entry(header.frame_id)
-            .or_insert_with(|| FrameBuf::new(header.fragment_count as usize, header.is_keyframe()));
+            .or_insert_with(|| FrameBuf::new(header.fragment_count as usize, header.flags, now));
 
         let idx = header.fragment_index as usize;
         if idx >= buf.fragments.len() {
-            return None; // malformed: index outside the declared count
+            return out; // malformed: index outside the declared count
         }
         if buf.fragments[idx].is_none() {
             buf.fragments[idx] = Some(fragment_payload.to_vec());
             buf.received += 1;
+            buf.max_index = buf.max_index.max(idx);
+            if buf.asked(idx).0 > 0 {
+                self.stats.fragments_recovered += 1;
+            }
         }
         buf.last_touched = now;
+
+        if nack {
+            Self::release(stream, header.conn_id, header.stream_id, &mut out, &mut self.stats);
+            Self::attach_loss(stream, &mut out);
+            return out;
+        }
 
         let complete = buf.is_complete();
 
@@ -287,11 +451,143 @@ impl Reassembler {
             }
         }
 
-        if complete {
-            stream.frames.remove(&header.frame_id).map(FrameBuf::concat)
-        } else {
-            None
+        if complete && let Some(done) = stream.frames.remove(&header.frame_id) {
+            out.push(Completed {
+                conn_id: header.conn_id,
+                stream_id: header.stream_id,
+                frame_id: header.frame_id,
+                flags: done.flags,
+                ciphertext: done.concat(),
+                loss: FrameLoss::default(),
+            });
+            Self::attach_loss(stream, &mut out);
         }
+        out
+    }
+
+    /// Hand the stream's pending loss to the first frame delivered by this call.
+    fn attach_loss(stream: &mut StreamReassembly, out: &mut [Completed]) {
+        if let Some(first) = out.first_mut() {
+            first.loss = std::mem::take(&mut stream.pending_loss);
+        }
+    }
+
+    /// NACK mode: deliver every complete frame older than the oldest incomplete one, in order.
+    fn release(
+        stream: &mut StreamReassembly,
+        conn_id: ConnId,
+        stream_id: StreamId,
+        out: &mut Vec<Completed>,
+        stats: &mut NackStats,
+    ) {
+        let blocker = stream.frames.iter().find(|(_, f)| !f.is_complete()).map(|(id, _)| *id);
+        let ready: Vec<u32> = stream
+            .frames
+            .iter()
+            .filter(|(id, f)| f.is_complete() && blocker.is_none_or(|b| **id < b))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ready {
+            let Some(frame) = stream.frames.remove(&id) else { continue };
+            if frame.attempts > 0 {
+                stats.frames_recovered += 1;
+            }
+            stream.done.insert(id);
+            out.push(Completed { conn_id, stream_id, frame_id: id, flags: frame.flags, ciphertext: frame.concat(), loss: FrameLoss::default() });
+        }
+    }
+
+    /// NACK mode: the relay cannot supply (part of) `range`'s frame. Give it up at the next poll.
+    pub fn nack_miss(&mut self, range: &NackRange) {
+        if let Some(f) = self
+            .streams
+            .get_mut(&(range.conn_id, range.stream_id))
+            .and_then(|s| s.frames.get_mut(&range.frame_id))
+        {
+            f.give_up = true;
+        }
+    }
+
+    /// NACK mode, call every few milliseconds while [`Self::has_pending`]: decides which frames need
+    /// a (further) round of Requests, gives up on the ones that are past saving, and returns the
+    /// frames that became deliverable by that plus the Requests to send. `rtt` is the viewer's
+    /// connection RTT (sets the retry interval, [`nack_retry_interval`]).
+    pub fn poll(&mut self, now: Instant, rtt: Duration) -> (Vec<Completed>, Vec<NackRange>) {
+        let mut released = Vec::new();
+        let mut requests = Vec::new();
+        if !self.nack {
+            return (released, requests);
+        }
+        let interval = nack_retry_interval(rtt);
+        for (&(conn_id, stream_id), stream) in &mut self.streams {
+            let mut abandon = Vec::new();
+            for (&frame_id, f) in stream.frames.iter_mut().filter(|(_, f)| !f.is_complete()) {
+                if f.give_up || now.duration_since(f.first_seen) >= NACK_HARD_LIMIT {
+                    abandon.push(frame_id);
+                    continue;
+                }
+                let suspects = f.suspects(now);
+                if suspects.is_empty() {
+                    continue;
+                }
+                // Too many holes (congestion), or a fragment asked for as often as allowed and
+                // still missing a whole interval after the last ask: past saving.
+                let exhausted = suspects.iter().any(|&i| {
+                    let (n, at) = f.asked(i);
+                    n >= MAX_NACK_ROUNDS && at.is_some_and(|at| now >= at + interval)
+                });
+                if suspects.len() > MAX_REPAIR_FRAGMENTS || exhausted {
+                    abandon.push(frame_id);
+                    continue;
+                }
+                // Ask for the fragments never asked for, and again for those whose last ask is
+                // older than the interval (a hole that shows up late in a paced keyframe starts
+                // its own rounds).
+                let due: Vec<usize> = suspects
+                    .into_iter()
+                    .filter(|&i| {
+                        let (n, at) = f.asked(i);
+                        n < MAX_NACK_ROUNDS && at.is_none_or(|at| now >= at + interval)
+                    })
+                    .collect();
+                if due.is_empty() {
+                    continue;
+                }
+                if f.requested.is_empty() {
+                    f.requested = vec![(0, now); f.fragments.len()];
+                }
+                for &i in &due {
+                    f.requested[i] = (f.requested[i].0 + 1, now);
+                }
+                f.attempts += 1;
+                for (first, count) in runs_of(&due) {
+                    requests.push(NackRange { conn_id, stream_id, frame_id, first, count });
+                    self.stats.requests += 1;
+                    self.stats.fragments_requested += u64::from(count);
+                }
+            }
+            for id in abandon {
+                if let Some(dropped) = stream.frames.remove(&id) {
+                    if dropped.attempts > 0 {
+                        self.stats.frames_abandoned += 1;
+                    }
+                    stream.pending_loss.note(&dropped);
+                    stream.done.insert(id);
+                }
+            }
+            // Memory guard: a stream that never settles must not grow without bound.
+            while stream.frames.len() > MAX_FRAMES_NACK {
+                let Some((&id, _)) = stream.frames.first_key_value() else { break };
+                if let Some(dropped) = stream.frames.remove(&id) {
+                    stream.pending_loss.note(&dropped);
+                    stream.done.insert(id);
+                }
+            }
+            let before = released.len();
+            Self::release(stream, conn_id, stream_id, &mut released, &mut self.stats);
+            Self::attach_loss(stream, &mut released[before..]);
+        }
+        (released, requests)
     }
 }
 
@@ -299,6 +595,22 @@ impl Reassembler {
 mod tests {
     use super::*;
     use crate::protocol::MediaHeader;
+
+    /// The pre-NACK entry points, kept as test helpers (the legacy-mode tests use them).
+    impl Reassembler {
+        fn insert(&mut self, header: &MediaHeader, payload: &[u8]) -> Option<Vec<u8>> {
+            self.insert_with_loss(header, payload).0
+        }
+
+        fn insert_with_loss(&mut self, header: &MediaHeader, payload: &[u8]) -> (Option<Vec<u8>>, FrameLoss) {
+            let mut out = self.ingest(Instant::now(), header, payload);
+            assert!(out.len() <= 1);
+            match out.pop() {
+                Some(c) => (Some(c.ciphertext), c.loss),
+                None => (None, FrameLoss::default()),
+            }
+        }
+    }
 
     #[test]
     fn split_and_reassemble_round_trip_large_payload() {
@@ -517,5 +829,219 @@ mod tests {
                 assert!(loss.is_none());
             }
         }
+    }
+
+    // ---- NACK mode (spec §6.6) ----
+
+    const RTT: Duration = Duration::from_millis(25);
+
+    fn nack_reassembler() -> Reassembler {
+        let mut r = Reassembler::new();
+        r.set_nack(true);
+        r
+    }
+
+    /// Frame `id` as `count` one-byte-labelled fragments.
+    fn frame_datagrams(id: u32, flags: u8, count: u16) -> Vec<(MediaHeader, Vec<u8>)> {
+        (0..count).map(|i| (hdr(id, flags, i, count), vec![i as u8; 3])).collect()
+    }
+
+    fn feed(r: &mut Reassembler, now: Instant, frags: &[(MediaHeader, Vec<u8>)], skip: &[u16]) -> Vec<Completed> {
+        let mut out = Vec::new();
+        for (h, p) in frags {
+            if !skip.contains(&h.fragment_index) {
+                out.extend(r.ingest(now, h, p));
+            }
+        }
+        out
+    }
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    #[test]
+    fn a_gap_is_requested_after_two_later_fragments_and_repair_completes_the_frame() {
+        let mut r = nack_reassembler();
+        let t0 = Instant::now();
+        let f = frame_datagrams(5, 0, 10);
+        assert!(feed(&mut r, t0, &f, &[3, 4]).is_empty());
+        let (done, reqs) = r.poll(t0 + ms(1), RTT);
+        assert!(done.is_empty());
+        assert_eq!(reqs, vec![NackRange { conn_id: 1, stream_id: 0, frame_id: 5, first: 3, count: 2 }]);
+        // the retransmits arrive
+        let out = feed(&mut r, t0 + ms(30), &f[3..5], &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].frame_id, 5);
+        assert_eq!(out[0].ciphertext, f.iter().flat_map(|(_, p)| p.clone()).collect::<Vec<_>>());
+        assert!(out[0].loss.is_none());
+        let s = r.stats();
+        assert_eq!((s.requests, s.fragments_requested, s.fragments_recovered, s.frames_recovered, s.frames_abandoned), (1, 2, 2, 1, 0));
+        assert!(!r.has_pending());
+    }
+
+    #[test]
+    fn a_hole_right_behind_the_newest_fragment_is_not_asked_for_yet() {
+        let mut r = nack_reassembler();
+        let t0 = Instant::now();
+        // fragment 8 missing, 9 arrived: only one fragment behind it, could be reordering
+        feed(&mut r, t0, &frame_datagrams(1, 0, 10), &[8]);
+        assert!(r.poll(t0 + ms(1), RTT).1.is_empty());
+        // ... but a quiet frame has lost its tail
+        let (_, reqs) = r.poll(t0 + IDLE_NACK + ms(1), RTT);
+        assert_eq!(reqs.len(), 1);
+        assert_eq!((reqs[0].first, reqs[0].count), (8, 1));
+    }
+
+    #[test]
+    fn a_lost_tail_is_requested_when_the_frame_goes_quiet() {
+        let mut r = nack_reassembler();
+        let t0 = Instant::now();
+        feed(&mut r, t0, &frame_datagrams(1, 0, 10), &[7, 8, 9]);
+        assert!(r.poll(t0 + ms(5), RTT).1.is_empty(), "still arriving as far as we know");
+        let (_, reqs) = r.poll(t0 + ms(25), RTT);
+        assert_eq!((reqs[0].first, reqs[0].count), (7, 3));
+    }
+
+    #[test]
+    fn later_complete_frames_wait_for_the_repair_and_come_out_in_order() {
+        let mut r = nack_reassembler();
+        let t0 = Instant::now();
+        let f1 = frame_datagrams(1, MEDIA_FLAG_KEYFRAME, 6);
+        let f2 = frame_datagrams(2, 0, 3);
+        let f3 = frame_datagrams(3, 0, 1);
+        assert!(feed(&mut r, t0, &f1, &[2]).is_empty());
+        assert!(feed(&mut r, t0 + ms(2), &f2, &[]).is_empty(), "held behind frame 1");
+        assert!(feed(&mut r, t0 + ms(3), &f3, &[]).is_empty());
+        let (done, reqs) = r.poll(t0 + ms(4), RTT);
+        assert!(done.is_empty() && reqs.len() == 1);
+        let out = feed(&mut r, t0 + ms(40), &f1[2..3], &[]);
+        assert_eq!(out.iter().map(|c| c.frame_id).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert!(out[0].is_keyframe() && !out[1].is_keyframe());
+        assert!(out.iter().all(|c| c.conn_id == 1 && c.stream_id == 0));
+    }
+
+    #[test]
+    fn retries_are_spaced_by_the_interval_then_the_frame_is_abandoned_with_loss_reported() {
+        let mut r = nack_reassembler();
+        let t0 = Instant::now();
+        let f1 = frame_datagrams(1, MEDIA_FLAG_KEYFRAME, 8);
+        feed(&mut r, t0, &f1, &[2]);
+        let iv = nack_retry_interval(RTT);
+        assert_eq!(iv, ms(110));
+        assert_eq!(r.poll(t0 + ms(1), RTT).1.len(), 1); // round 1
+        assert!(r.poll(t0 + ms(1) + iv - ms(1), RTT).1.is_empty(), "not before the interval");
+        assert_eq!(r.poll(t0 + ms(1) + iv, RTT).1.len(), 1); // round 2
+        assert_eq!(r.poll(t0 + ms(1) + iv * 2, RTT).1.len(), 1); // round 3
+        // a later frame arrives complete while we wait
+        let f2 = frame_datagrams(2, 0, 1);
+        assert!(feed(&mut r, t0 + ms(1) + iv * 2 + ms(5), &f2, &[]).is_empty());
+        let (done, reqs) = r.poll(t0 + ms(1) + iv * 3, RTT);
+        assert!(reqs.is_empty());
+        assert_eq!(done.len(), 1);
+        assert_eq!(done[0].frame_id, 2);
+        assert_eq!((done[0].loss.frames, done[0].loss.keyframe), (1, true));
+        assert_eq!(r.stats().frames_abandoned, 1);
+        assert!(!r.has_pending());
+    }
+
+    #[test]
+    fn a_miss_from_the_relay_gives_the_frame_up_at_once() {
+        let mut r = nack_reassembler();
+        let t0 = Instant::now();
+        let f1 = frame_datagrams(1, 0, 6);
+        feed(&mut r, t0, &f1, &[1]);
+        let (_, reqs) = r.poll(t0 + ms(1), RTT);
+        feed(&mut r, t0 + ms(2), &frame_datagrams(2, 0, 1), &[]);
+        r.nack_miss(&reqs[0]);
+        let (done, _) = r.poll(t0 + ms(3), RTT);
+        assert_eq!(done.len(), 1);
+        assert_eq!((done[0].frame_id, done[0].loss.frames), (2, 1));
+    }
+
+    #[test]
+    fn a_frame_with_too_many_holes_is_abandoned_without_asking() {
+        let mut r = nack_reassembler();
+        let t0 = Instant::now();
+        let f1 = frame_datagrams(1, 0, 400);
+        let skip: Vec<u16> = (100..300).collect();
+        feed(&mut r, t0, &f1, &skip);
+        let (_, reqs) = r.poll(t0 + ms(1), RTT);
+        assert!(reqs.is_empty());
+        assert!(!r.has_pending());
+    }
+
+    #[test]
+    fn duplicates_of_finished_or_abandoned_frames_never_open_a_ghost_frame() {
+        let mut r = nack_reassembler();
+        let t0 = Instant::now();
+        let f1 = frame_datagrams(1, 0, 4);
+        assert_eq!(feed(&mut r, t0, &f1, &[]).len(), 1);
+        // the whole frame again (a retransmit that raced the original)
+        assert!(feed(&mut r, t0 + ms(5), &f1, &[]).is_empty());
+        assert!(!r.has_pending(), "no ghost incomplete frame");
+        // an abandoned frame's late fragments are ignored too
+        let f2 = frame_datagrams(2, 0, 4);
+        feed(&mut r, t0, &f2, &[0]);
+        let iv = nack_retry_interval(RTT);
+        for k in 0..4u32 {
+            r.poll(t0 + ms(1) + iv * k, RTT);
+        }
+        assert!(!r.has_pending());
+        assert!(feed(&mut r, t0 + ms(900), &f2[..1], &[]).is_empty());
+        assert!(!r.has_pending());
+        let out = feed(&mut r, t0 + ms(901), &frame_datagrams(3, 0, 1), &[]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].loss.frames, 1, "the abandoned frame is reported once");
+    }
+
+    #[test]
+    fn nothing_is_held_without_nack_mode() {
+        // legacy: a later complete frame is delivered at once, an older incomplete one is not waited for
+        let mut r = Reassembler::new();
+        let t0 = Instant::now();
+        feed(&mut r, t0, &frame_datagrams(1, 0, 4), &[1]);
+        assert_eq!(feed(&mut r, t0, &frame_datagrams(2, 0, 1), &[]).len(), 1);
+        assert!(r.poll(t0 + ms(100), RTT).1.is_empty());
+        assert!(!r.has_pending());
+    }
+
+    #[test]
+    fn retry_interval_follows_the_rtt_within_bounds() {
+        assert_eq!(nack_retry_interval(ms(5)), ms(100));
+        assert_eq!(nack_retry_interval(ms(25)), ms(110));
+        assert_eq!(nack_retry_interval(ms(100)), ms(260));
+        assert_eq!(nack_retry_interval(ms(400)), ms(300));
+    }
+
+    #[test]
+    fn a_hole_counts_only_while_the_hard_limit_has_not_passed() {
+        let mut r = nack_reassembler();
+        let t0 = Instant::now();
+        feed(&mut r, t0, &frame_datagrams(1, 0, 6), &[1]);
+        // a huge RTT would space rounds beyond the hard limit; the limit still ends the wait
+        let (done, _) = r.poll(t0 + NACK_HARD_LIMIT + ms(1), Duration::from_secs(5));
+        assert!(done.is_empty());
+        assert!(!r.has_pending());
+    }
+
+    #[test]
+    fn a_hole_that_shows_up_late_in_a_long_frame_gets_its_own_rounds() {
+        let mut r = nack_reassembler();
+        let t0 = Instant::now();
+        let f = frame_datagrams(1, MEDIA_FLAG_KEYFRAME, 100);
+        feed(&mut r, t0, &f[..30], &[3]);
+        let (_, reqs) = r.poll(t0 + ms(1), RTT);
+        assert_eq!(reqs.iter().map(|q| (q.first, q.count)).collect::<Vec<_>>(), vec![(3, 1)]);
+        // the paced keyframe is still arriving; another hole appears behind the newest fragments
+        feed(&mut r, t0 + ms(50), &f[30..60], &[40]);
+        let (_, reqs) = r.poll(t0 + ms(55), RTT);
+        assert_eq!(reqs.iter().map(|q| (q.first, q.count)).collect::<Vec<_>>(), vec![(40, 1)], "3 is not due yet");
+        // both are asked again when their own interval is over
+        let (_, reqs) = r.poll(t0 + ms(1) + nack_retry_interval(RTT), RTT);
+        assert!(reqs.iter().any(|q| q.first == 3), "{reqs:?}"); // (the quiet frame's tail is asked for too)
+        let (_, reqs) = r.poll(t0 + ms(55) + nack_retry_interval(RTT), RTT);
+        assert!(reqs.iter().any(|q| q.first == 40), "{reqs:?}");
+        assert!(r.has_pending());
     }
 }

@@ -62,7 +62,8 @@ use web_transport_quinn::{ReadExactError, RecvStream, SendStream, Session};
 use crate::cert::{CertManager, CertSource};
 use crate::protocol::{
     ClientToRelay, ConnId, MAX_CONTROL_FRAME_LEN, MAX_NAME_LEN, MAX_ROOM_MEMBERS,
-    MediaHeader, Member, PresenceEvent, PreviewHeader, RejectReason, RelayToClient, RoomId,
+    MEDIA_FLAG_RETRANSMIT, MediaHeader, Member, NACK_TAG_HELLO, NACK_TAG_HELLO_ACK, NACK_TAG_MISS,
+    NACK_TAG_REQUEST, NackRange, StreamKind, is_nack_datagram, PresenceEvent, PreviewHeader, RejectReason, RelayToClient, RoomId,
     STREAM_TYPE_PREVIEW, StreamId, StreamInfo, clamp_utf8, decode_payload, encode_frame,
 };
 use crate::room::{
@@ -174,7 +175,39 @@ async fn media_forward_task(
                 route
                     .bytes_received
                     .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
-                for target in route.targets().iter() {
+                let header = route.cache.as_ref().and_then(|_| MediaHeader::unpack(&data).ok()).map(|(h, _)| h);
+                if header.is_some_and(|h| h.flags & MEDIA_FLAG_RETRANSMIT != 0) {
+                    // The owner re-sent a fragment because a viewer asked (spec §6.6): only the
+                    // viewers that asked get it, everybody else would see a duplicate.
+                    if let (Some(h), Some(cache)) = (header, &route.cache) {
+                        cache.lock().unwrap_or_else(|p| p.into_inner()).insert(
+                            Instant::now(),
+                            h.frame_id,
+                            h.fragment_index,
+                            h.fragment_count,
+                            data.clone(),
+                        );
+                    }
+                    for target in route.nackers() {
+                        if target.connection.send_datagram(data.clone()).is_ok() {
+                            registry.nack.owner_resends.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    continue;
+                }
+                let targets = route.targets();
+                if let (Some(h), Some(cache), false) = (header, &route.cache, targets.is_empty())
+                    && registry.nack.enabled
+                {
+                    cache.lock().unwrap_or_else(|p| p.into_inner()).insert(
+                        Instant::now(),
+                        h.frame_id,
+                        h.fragment_index,
+                        h.fragment_count,
+                        data.clone(),
+                    );
+                }
+                for target in targets.iter() {
                     // quinn's `send_datagram` never fails when the queue is
                     // full: it silently discards the oldest unsent datagrams.
                     // Check the free space first so those losses are counted
@@ -349,6 +382,7 @@ pub fn start(
         "QUIC endpoint listening (ALPN h3 + ssshare/1)"
     );
     tokio::spawn(certs.maintain(endpoint.clone(), registry.clone()));
+    tokio::spawn(log_nack_stats(registry.clone()));
     let serving = endpoint.clone();
     tokio::spawn(async move {
         if let Err(e) = serve(registry, serving).await {
@@ -356,6 +390,32 @@ pub fn start(
         }
     });
     Ok(endpoint)
+}
+
+/// One line every 10 s while the NACK counters move (spec §6.6): requests received, fragments
+/// answered from the cache, ranges forwarded to owners, ranges answered Miss, owner re-sends relayed.
+async fn log_nack_stats(registry: Arc<Registry>) {
+    if !registry.nack.enabled {
+        tracing::info!("NACK disabled (SSSHARE_NACK=0): no retransmit cache, no HelloAck");
+        return;
+    }
+    let mut last = registry.nack.snapshot();
+    loop {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let now = registry.nack.snapshot();
+        if now != last {
+            let d = |i: usize| now[i] - last[i];
+            tracing::info!(
+                requests = d(0),
+                from_cache = d(1),
+                forwarded_to_owner = d(2),
+                miss_replies = d(3),
+                owner_resends_relayed = d(4),
+                "NACK activity in the last 10 s"
+            );
+            last = now;
+        }
+    }
 }
 
 /// Read one length-prefixed control frame (spec §2). Returns `Ok(None)`
@@ -542,6 +602,7 @@ async fn perform_join(
                 transport,
                 subscriptions: HashSet::new(),
                 stream_count: 0,
+                nack: false,
             },
         );
 
@@ -795,6 +856,9 @@ async fn connection_loop(
             }
             dgram = connection.read_datagram() => {
                 match dgram {
+                    Ok(bytes) if is_nack_datagram(&bytes) => {
+                        handle_nack_datagram(registry, room, conn_id, connection, &bytes).await
+                    }
                     Ok(bytes) => enqueue_media_datagram(
                         registry,
                         media_tx,
@@ -848,7 +912,7 @@ async fn handle_client_message(
             height,
         } => {
             let label = clamp_utf8(&label, MAX_NAME_LEN);
-            let route = Arc::new(StreamRoute::new());
+            let route = Arc::new(StreamRoute::new(kind == StreamKind::Video));
             let mut guard = room.lock().await;
             let replaced = guard.streams.insert(
                 (conn_id, stream_id),
@@ -976,6 +1040,79 @@ async fn handle_client_message(
                 guard.send_to(target, RelayToClient::SubscriberCount { stream_id, count });
             }
         }
+    }
+}
+
+/// Longest range of fragments one Request may ask for (a frame can have up to 65535; a viewer
+/// gives up on a frame missing more than 128, so anything longer is not a real request).
+const MAX_NACK_FRAGMENTS: u16 = 256;
+
+/// The NACK family (spec §6.6), received on `conn_id`'s connection: `Hello` marks the connection
+/// and is acknowledged; a `Request` is answered from the stream's cache, and whatever the cache
+/// lacks is forwarded to the stream owner (which re-sends with the retransmit flag) or, when the
+/// owner never said `Hello`, answered with `Miss` so the viewer stops waiting. Anything else
+/// (including everything while `SSSHARE_NACK=0`) is dropped like any undersized datagram.
+async fn handle_nack_datagram(
+    registry: &Arc<Registry>,
+    room: &Arc<Mutex<RoomState>>,
+    conn_id: ConnId,
+    connection: &Session,
+    bytes: &Bytes,
+) {
+    let stats = &registry.nack;
+    if !stats.enabled {
+        return;
+    }
+    match bytes[0] {
+        NACK_TAG_HELLO => {
+            if let Some(c) = room.lock().await.connections.get_mut(&conn_id) {
+                c.nack = true;
+            }
+            let _ = connection.send_datagram(Bytes::from_static(&[NACK_TAG_HELLO_ACK]));
+        }
+        NACK_TAG_REQUEST => {
+            let Some((_, req)) = NackRange::unpack(bytes) else {
+                return;
+            };
+            stats.requests.fetch_add(1, Ordering::Relaxed);
+            let key = (req.conn_id, req.stream_id);
+            let (route, owner) = {
+                let guard = room.lock().await;
+                let subscribed = guard.connections.get(&conn_id).is_some_and(|c| c.subscriptions.contains(&key));
+                let Some(stream) = guard.streams.get(&key).filter(|_| subscribed) else {
+                    return;
+                };
+                let owner = guard.connections.get(&req.conn_id).filter(|c| c.nack).map(|c| c.connection.clone());
+                (stream.route.clone(), owner)
+            };
+            let Some(cache) = &route.cache else {
+                return;
+            };
+            let (hits, missing) = cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .lookup(req.frame_id, req.first, req.count.min(MAX_NACK_FRAGMENTS));
+            for datagram in hits {
+                if connection.send_datagram(datagram).is_ok() {
+                    stats.from_cache.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            for (first, count) in missing {
+                let range = NackRange { first, count, ..req };
+                match &owner {
+                    Some(owner) => {
+                        route.note_nacker(RouteTarget { conn_id, connection: connection.clone() });
+                        let _ = owner.send_datagram(Bytes::copy_from_slice(&range.pack(NACK_TAG_REQUEST)));
+                        stats.forwarded.fetch_add(1, Ordering::Relaxed);
+                    }
+                    None => {
+                        let _ = connection.send_datagram(Bytes::copy_from_slice(&range.pack(NACK_TAG_MISS)));
+                        stats.misses.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+        _ => {}
     }
 }
 

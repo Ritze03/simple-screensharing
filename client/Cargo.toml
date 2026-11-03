@@ -31,6 +31,7 @@ required-features = ["test-source"]
 aes-gcm = "0.11.0"
 anyhow = "1.0.104"
 base64 = "0.23.0"
+bytes = "1.12.1"
 dirs = "6.0.0"
 futures-util = "0.3.33"
 eframe = { version = "0.33.3", default-features = false, features = ["wgpu", "default_fonts", "x11", "wayland", "persistence", "serde"] }

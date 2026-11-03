@@ -28,7 +28,8 @@
 # group started with setsid), logs $SCRATCH/<name>.log.
 #
 # Env (all optional): SCRATCH, HS_PORT (relay UDP port, default a random free one), PROFILE (release|debug, default release), CARGO_TARGET_DIR,
-#   HS_NO_BUILD=1, HS_PIPEWIRE=private|shared, HS_XDPW=stock|patched|<path> (see hs_xdpw_bin), HS_PATTERN=vkcube|gst|none, HS_FPS (capture
+#   HS_NO_BUILD=1, HS_RELAY_ENV ("A=1 B=2" for the relay), HS_RELAY_BIN / HS_CLIENT_BIN_1 / HS_CLIENT_BIN_2
+#   (another binary for the relay / one client, e.g. an older build for mixed-version checks), HS_PIPEWIRE=private|shared, HS_XDPW=stock|patched|<path> (see hs_xdpw_bin), HS_PATTERN=vkcube|gst|none, HS_FPS (capture
 #   output refresh, default 240), HS_MAX_FPS (xdpw max_fps, default = HS_FPS), RUST_LOG,
 #   START_CODEC/START_FPS/START_KBPS (pre-fill the stream form), SSS_LANGUAGE, HS_TRACE=0 (no
 #   GStreamer stats tracer on the sharer).
@@ -332,7 +333,7 @@ hs_start_relay() {
   TMUX_SESSION="$(basename "$RT")-$$"
   echo "$TMUX_SESSION" >"$SCRATCH/tmux.session"
   log "starting the relay on UDP $PORT in tmux session $TMUX_SESSION"
-  tmux new-session -d -s "$TMUX_SESSION" -c "$SCRATCH/relay" "exec '$RELAY_BIN' $PORT 2>>'$SCRATCH/relay.err'"
+  tmux new-session -d -s "$TMUX_SESSION" -c "$SCRATCH/relay" "exec env ${HS_RELAY_ENV:-} '${HS_RELAY_BIN:-$RELAY_BIN}' $PORT 2>>'$SCRATCH/relay.err'"
   sss_wait_for_cert || die "the relay wrote no certificate in 10 s (see $SCRATCH/relay.err)"
   sss_make_join_string
 }
@@ -349,8 +350,8 @@ hs_free_port() {
 
 # hs_start_client N WORKSPACE OUTPUT
 hs_start_client() {
-  local n="$1" ws="$2" out="$3" cfg extra_var name_var extra=() pid i
-  cfg="$SCRATCH/cfg$n"; extra_var="CLIENT_ENV_$n"; name_var="HS_NAME_$n"
+  local n="$1" ws="$2" out="$3" cfg extra_var name_var bin_var extra=() pid i
+  cfg="$SCRATCH/cfg$n"; extra_var="CLIENT_ENV_$n"; name_var="HS_NAME_$n"; bin_var="HS_CLIENT_BIN_$n"
   sss_seed_config "$cfg" "${!name_var:-client-$n}"   # HS_NAME_1/HS_NAME_2 override the display name
   mkdir -p "$SCRATCH/data$n"
   rm -f "$SCRATCH/ui$n.txt"
@@ -359,7 +360,7 @@ hs_start_client() {
   log "starting client #$n on $out (config $cfg, log $SCRATCH/client$n.log)"
   hs_spawn "client$n" env XDG_CONFIG_HOME="$cfg" XDG_DATA_HOME="$SCRATCH/data$n" \
     RUST_LOG="${RUST_LOG:-info}" SSS_UI_DUMP="$SCRATCH/ui$n.txt" \
-    PULSE_SERVER="unix:$RT/no-pulse" "${extra[@]}" "$CLIENT_BIN"
+    PULSE_SERVER="unix:$RT/no-pulse" "${extra[@]}" "${!bin_var:-$CLIENT_BIN}"
   pid="$(hs_pid_of "client$n")"
   for ((i = 0; i < 150; i++)); do
     [[ -n "$(hs_win_json "$pid")" ]] && break

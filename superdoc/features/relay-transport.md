@@ -182,6 +182,32 @@ frozen). A = this change (BBR on relay and both clients), B = the same binaries 
 holes. Concealing or re-requesting those is the viewer-side work of #101.) Settings-change
 transitions (the 12-transition test of the investigators) were not re-run here.
 
+## Selective retransmission (NACK, #104, 2026-11-03)
+
+BBR (above) makes the transport keep delivering under random loss, but a frame still dies with any
+one of its fragments (a 1 MB IDR is ~1000 of them). The relay therefore also answers retransmit
+requests. Wire format, capability probe, compatibility matrix and the *why* of every choice:
+`architecture/protocol-spec.md` section 6.6. Relay side, in short:
+
+- **Cache.** Per *video* stream, `StreamRoute::cache` (`protocol::FragmentCache<Bytes>`) holds the
+  datagrams the forwarder sent in the last 2 s, at most 8 MiB, only while the stream has
+  subscribers. `Bytes` clones: the cache costs the refcount of buffers quinn already holds, not a copy.
+- **Request** (viewer, subscribed to that stream, datagram `0xE2`): hits go back to that viewer only,
+  byte for byte; the missing runs go to the owner as a Request if the owner said Hello (and the
+  viewer is remembered in `StreamRoute::nackers` for 1 s), else back to the viewer as `Miss`.
+- **Owner re-send** (media datagram with `flags` bit2): inserted in the cache and sent only to the
+  `nackers`, never to every subscriber (duplicates would open ghost frames in old reassemblers).
+- **Hello** marks `ConnState::nack` and is acked. A relay with `SSSHARE_NACK=0` ignores all of it
+  (no cache, no HelloAck): behaves exactly like a relay that predates #104, which is how the
+  mixed-version checks get an "old relay" from one binary.
+- Counters (`Registry::nack`) are logged every 10 s while they move:
+  `NACK activity in the last 10 s requests=.. from_cache=.. forwarded_to_owner=.. miss_replies=..
+  owner_resends_relayed=..`.
+- Tests: `server/src/nack_tests.rs`.
+- **Deploy note:** an old relay (the vogelnest one until redeployed) simply drops Hello as an
+  undersized datagram, so new clients never NACK against it. The relay must be redeployed for the
+  feature to do anything.
+
 ## Risks
 
 - BBR in quinn is labelled experimental. It ran clean for every lab cell and the rig run; the

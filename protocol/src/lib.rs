@@ -16,6 +16,9 @@
 
 use serde::{Deserialize, Serialize};
 
+mod cache;
+pub use cache::{CACHE_MAX_BYTES, CACHE_TTL, FragmentCache};
+
 /// Wire protocol version. Appears as AAD byte 0 for every AEAD operation and
 /// as the `version` field in both fixed binary headers.
 pub const PROTOCOL_VERSION: u8 = WIRE_VERSION;
@@ -203,6 +206,13 @@ pub const MEDIA_FLAG_KEYFRAME: u8 = 0b0000_0001;
 /// costs a failed decode).
 pub const MEDIA_FLAG_STALLED: u8 = 0b0000_0010;
 
+/// bit2 of the `flags` byte: **retransmit** (#104). Set by a sender that re-sends a fragment because
+/// a NACK (below) asked for it; the datagram is otherwise byte-identical to the original. The relay
+/// routes such a datagram only to the viewers that recently NACKed that stream (never to every
+/// subscriber, who would see a duplicate), and receivers otherwise ignore the bit. Unauthenticated
+/// like the other flags and with the same standing: nothing may depend on it being truthful.
+pub const MEDIA_FLAG_RETRANSMIT: u8 = 0b0000_0100;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MediaHeader {
     pub version: u8,
@@ -257,6 +267,72 @@ impl MediaHeader {
             fragment_count: u16::from_be_bytes(bytes[17..19].try_into().unwrap()),
         };
         Ok((header, &bytes[MEDIA_HEADER_LEN..]))
+    }
+}
+
+// ---------------------------------------------------------------------
+// §6.6 NACK datagrams (selective retransmission, #104)
+// ---------------------------------------------------------------------
+
+/// Client -> relay, 1 byte: "I speak NACK" (I send NACKs for streams I watch and re-send fragments
+/// of my own streams when asked). Repeated until [`NACK_TAG_HELLO_ACK`] arrives.
+pub const NACK_TAG_HELLO: u8 = 0xE0;
+/// Relay -> client, 1 byte: the relay speaks NACK too (it caches fragments and answers requests).
+pub const NACK_TAG_HELLO_ACK: u8 = 0xE1;
+/// Viewer -> relay, and relay -> stream owner: please (re-)send fragments `first .. first+count`
+/// of one frame. 18 bytes, see [`NackRange`].
+pub const NACK_TAG_REQUEST: u8 = 0xE2;
+/// Relay -> viewer: the relay can not supply that range (not cached and the owner does not
+/// re-send), stop waiting for it. Same 18-byte layout as a request.
+pub const NACK_TAG_MISS: u8 = 0xE3;
+/// Length of a request / miss datagram.
+pub const NACK_DATAGRAM_LEN: usize = 18;
+
+/// Whether `bytes` is a NACK-family datagram rather than a media fragment: shorter than a media
+/// header (so every older peer, relay or browser drops it as undersized instead of mistaking it
+/// for media) and led by a tag no media `version` byte will use.
+pub fn is_nack_datagram(bytes: &[u8]) -> bool {
+    bytes.len() < MEDIA_HEADER_LEN && bytes.first().is_some_and(|t| *t >= NACK_TAG_HELLO)
+}
+
+/// The fragments of one frame a NACK asks for. `count` >= 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NackRange {
+    /// The stream owner (the sender of the frame).
+    pub conn_id: ConnId,
+    pub stream_id: StreamId,
+    pub frame_id: u32,
+    pub first: u16,
+    pub count: u16,
+}
+
+impl NackRange {
+    /// `tag` is [`NACK_TAG_REQUEST`] or [`NACK_TAG_MISS`].
+    pub fn pack(&self, tag: u8) -> [u8; NACK_DATAGRAM_LEN] {
+        let mut b = [0u8; NACK_DATAGRAM_LEN];
+        b[0] = tag;
+        b[1..9].copy_from_slice(&self.conn_id.to_be_bytes());
+        b[9] = self.stream_id;
+        b[10..14].copy_from_slice(&self.frame_id.to_be_bytes());
+        b[14..16].copy_from_slice(&self.first.to_be_bytes());
+        b[16..18].copy_from_slice(&self.count.to_be_bytes());
+        b
+    }
+
+    /// `(tag, range)` of a request / miss datagram; `None` for anything else (a hello, a
+    /// malformed length, a zero count).
+    pub fn unpack(bytes: &[u8]) -> Option<(u8, Self)> {
+        if bytes.len() != NACK_DATAGRAM_LEN || !matches!(bytes[0], NACK_TAG_REQUEST | NACK_TAG_MISS) {
+            return None;
+        }
+        let range = Self {
+            conn_id: u64::from_be_bytes(bytes[1..9].try_into().ok()?),
+            stream_id: bytes[9],
+            frame_id: u32::from_be_bytes(bytes[10..14].try_into().ok()?),
+            first: u16::from_be_bytes(bytes[14..16].try_into().ok()?),
+            count: u16::from_be_bytes(bytes[16..18].try_into().ok()?),
+        };
+        (range.count > 0).then_some((bytes[0], range))
     }
 }
 
@@ -446,6 +522,25 @@ mod tests {
         assert_eq!(parsed, header);
         assert!(rest.is_empty());
         assert_eq!(parsed.stream_type, STREAM_TYPE_PREVIEW);
+    }
+
+    #[test]
+    fn nack_datagrams_round_trip_and_never_look_like_media() {
+        let r = NackRange { conn_id: 0x0102_0304_0506_0708, stream_id: 3, frame_id: 99, first: 7, count: 4 };
+        for tag in [NACK_TAG_REQUEST, NACK_TAG_MISS] {
+            let b = r.pack(tag);
+            assert!(is_nack_datagram(&b));
+            assert!(MediaHeader::unpack(&b).is_err(), "older peers must drop it as undersized");
+            assert_eq!(NackRange::unpack(&b), Some((tag, r)));
+        }
+        assert_eq!(hex(&r.pack(NACK_TAG_REQUEST)), "e2010203040506070803000000630007 0004".replace(' ', ""));
+        assert!(is_nack_datagram(&[NACK_TAG_HELLO]) && is_nack_datagram(&[NACK_TAG_HELLO_ACK]));
+        assert_eq!(NackRange::unpack(&[NACK_TAG_HELLO]), None);
+        let zero = NackRange { count: 0, ..r }.pack(NACK_TAG_REQUEST);
+        assert_eq!(NackRange::unpack(&zero), None);
+        // a media datagram, even a tiny one, is not a NACK
+        let media = MediaHeader { version: PROTOCOL_VERSION, flags: 0, conn_id: 1, stream_id: 0, frame_id: 0, fragment_index: 0, fragment_count: 1 }.pack();
+        assert!(!is_nack_datagram(&media));
     }
 
     fn hex(b: &[u8]) -> String {

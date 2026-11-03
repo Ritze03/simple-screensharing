@@ -78,7 +78,10 @@ use tokio::sync::{Mutex, RwLock, mpsc};
 /// would be a real bug, holding a blocking lock across an `.await`.
 use std::sync::RwLock as SyncRwLock;
 
-use crate::protocol::{ConnId, RelayToClient, RoomId, StreamId, StreamKind};
+use std::sync::Mutex as SyncMutex;
+use std::time::{Duration, Instant};
+
+use crate::protocol::{ConnId, FragmentCache, RelayToClient, RoomId, StreamId, StreamKind};
 
 /// A recent event string for a room's admin-log ring buffer (TUI Room
 /// Detail tab).
@@ -158,6 +161,9 @@ pub struct ConnState {
     /// Number of streams this connection currently owns (mirrors
     /// `Member.stream_count` sent to clients).
     pub stream_count: u8,
+    /// The connection sent a NACK `Hello` (spec §6.6): it may be sent retransmit requests (as a
+    /// stream owner) and it sends them (as a viewer).
+    pub nack: bool,
 }
 
 /// One resolved fan-out destination for a stream's media datagrams: the
@@ -204,14 +210,43 @@ pub struct StreamRoute {
     /// the per-stream readout is meant to reflect what the relay is
     /// really moving.
     pub bytes_received: AtomicU64,
+    /// Video streams only (spec §6.6): the datagrams forwarded in the last
+    /// [`crate::protocol::CACHE_TTL`], capped at [`crate::protocol::CACHE_MAX_BYTES`], the source of
+    /// NACK retransmits. A leaf std mutex like `targets`: held for one map operation, never across
+    /// an `.await`.
+    pub cache: Option<SyncMutex<FragmentCache<Bytes>>>,
+    /// Viewers that recently asked the owner for a re-send (a cache miss forwarded upstream): the
+    /// only receivers of the owner's retransmit-flagged datagrams.
+    nackers: SyncMutex<Vec<(RouteTarget, Instant)>>,
 }
 
+/// How long after a forwarded request a viewer still gets the owner's retransmits.
+const NACKER_TTL: Duration = Duration::from_secs(1);
+
 impl StreamRoute {
-    pub fn new() -> Self {
+    /// `video`: keep a retransmit cache (audio is one fragment per frame and is never repaired).
+    pub fn new(video: bool) -> Self {
         Self {
             targets: SyncRwLock::new(Arc::from(Vec::new())),
             bytes_received: AtomicU64::new(0),
+            cache: video.then(|| SyncMutex::new(FragmentCache::default())),
+            nackers: SyncMutex::new(Vec::new()),
         }
+    }
+
+    /// Remember that `viewer` asked for a re-send (refreshes an existing entry).
+    pub fn note_nacker(&self, viewer: RouteTarget) {
+        let now = Instant::now();
+        let mut list = self.nackers.lock().unwrap_or_else(|p| p.into_inner());
+        list.retain(|(t, at)| t.conn_id != viewer.conn_id && now.duration_since(*at) < NACKER_TTL);
+        list.push((viewer, now));
+    }
+
+    /// The viewers a retransmit-flagged datagram goes to.
+    pub fn nackers(&self) -> Vec<RouteTarget> {
+        let now = Instant::now();
+        let list = self.nackers.lock().unwrap_or_else(|p| p.into_inner());
+        list.iter().filter(|(_, at)| now.duration_since(*at) < NACKER_TTL).map(|(t, _)| t.clone()).collect()
     }
 
     /// Take a cheap handle on the current target set. Hot path: called
@@ -238,12 +273,6 @@ impl StreamRoute {
             .targets
             .write()
             .unwrap_or_else(|poison| poison.into_inner()) = Arc::from(targets);
-    }
-}
-
-impl Default for StreamRoute {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -338,6 +367,41 @@ impl RoomState {
     }
 }
 
+/// Relay-wide retransmission counters (spec §6.6), logged every 10 s while they move, plus the
+/// kill switch: `SSSHARE_NACK=0` makes the relay behave like one that predates NACK (no cache, no
+/// HelloAck), which is also how the mixed-version tests get an "old relay" from the same binary.
+pub struct NackStats {
+    pub enabled: bool,
+    /// Request datagrams received from viewers.
+    pub requests: AtomicU64,
+    /// Fragments answered from the cache.
+    pub from_cache: AtomicU64,
+    /// Missing ranges forwarded to the stream owner.
+    pub forwarded: AtomicU64,
+    /// Missing ranges answered with Miss (the owner cannot re-send).
+    pub misses: AtomicU64,
+    /// Retransmit-flagged datagrams from owners relayed to the viewers that asked.
+    pub owner_resends: AtomicU64,
+}
+
+impl NackStats {
+    fn from_env() -> Self {
+        Self {
+            enabled: std::env::var("SSSHARE_NACK").map(|v| v != "0").unwrap_or(true),
+            requests: AtomicU64::new(0),
+            from_cache: AtomicU64::new(0),
+            forwarded: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            owner_resends: AtomicU64::new(0),
+        }
+    }
+
+    pub fn snapshot(&self) -> [u64; 5] {
+        [&self.requests, &self.from_cache, &self.forwarded, &self.misses, &self.owner_resends]
+            .map(|c| c.load(Ordering::Relaxed))
+    }
+}
+
 /// The shared registry of all live rooms, plus process-wide bandwidth
 /// counters and startup metadata used by the TUI.
 pub struct Registry {
@@ -350,6 +414,8 @@ pub struct Registry {
     /// goes to the log (`relay::note_eviction`).
     pub datagrams_forwarded: AtomicU64,
     pub datagrams_evicting: AtomicU64,
+    /// NACK counters and the kill switch (spec §6.6).
+    pub nack: NackStats,
     pub started_at: std::time::Instant,
     pub listen_addr: std::net::SocketAddr,
     /// Currently open connections that finished the QUIC handshake, by
@@ -368,6 +434,7 @@ impl Registry {
             bandwidth: ByteCounters::default(),
             datagrams_forwarded: AtomicU64::new(0),
             datagrams_evicting: AtomicU64::new(0),
+            nack: NackStats::from_env(),
             started_at: std::time::Instant::now(),
             listen_addr,
             native_connections: Default::default(),

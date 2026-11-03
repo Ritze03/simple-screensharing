@@ -20,6 +20,9 @@ mod browser_smoke;
 mod transport_lab;
 
 #[cfg(test)]
+mod nack_tests;
+
+#[cfg(test)]
 mod transport_tests;
 
 use std::net::SocketAddr;

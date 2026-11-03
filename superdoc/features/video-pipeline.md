@@ -214,6 +214,66 @@ was moving 1.4 s after the path returned; without L3 the viewer waits for the QU
 no measurable stall; with a second viewer the count never reaches 0 (relay `Subscribe`: `newly_added` still
 sends the `KeyframeRequest`), and the requested IDR is delivered to everybody watching.
 
+## Selective retransmission (NACK, #104, 2026-11-03)
+
+**The problem it fixes.** Under #101 a frame missing any fragment is thrown away and the only cure is
+an L1 keyframe request (~1.2-1.5 s, and the requested IDR is itself ~1000 fragments that die the same
+way). Field case 2026-11-02: 1080p120 8.3 Mbit/s H.264 on AMD, IDRs of ~1 MB, at 0.1 % loss an IDR arrives
+whole 37 % of the time, `a keyframe never completed (981/984 fragments arrived)` 295 times, recoveries of
+30-100 s. #102 made IDRs smaller and rarer; the encoder's natural GOP IDRs are still big. Paths are short
+(16-30 ms), so re-sending the three missing fragments beats a new keyframe by an order of magnitude.
+
+**Design, with the why of every choice: `architecture/protocol-spec.md` section 6.6.** In one paragraph:
+NACKs are < 19 byte datagrams (every older relay, client and browser drops them as undersized, so
+nothing can break; a control-stream variant would have killed old connections), a Hello/HelloAck
+datagram handshake with the relay switches the viewer's NACK mode on (so a new client on an old relay
+behaves exactly as before), the relay answers from a 2 s / 8 MiB per-stream cache of the datagrams it
+forwarded and forwards only what it lacks to the sender, whose 2 s ring re-sends it with the retransmit flag
+(media `flags` bit2; the relay delivers those only to the viewers that asked). Retransmits are the original
+datagrams, byte for byte: nothing is re-encrypted, no nonce is used twice. Audio is not repaired.
+
+**Viewer side (`fragment::Reassembler`, NACK mode; driven by `net.rs::datagram_reader_loop`).**
+
+- *Detect*: a missing fragment with >= 2 later fragments of its frame behind it, or any missing fragment
+  once the frame has been quiet 20 ms (a lost tail). *Ask*: one Request per contiguous run; a fragment is
+  asked again after `R = clamp(2 x rtt + 60 ms, 100, 300 ms)`, at most 3 times; a frame with > 128 suspect
+  fragments is abandoned without asking (congestion, not loss).
+- *Order*: while a frame is being repaired, later *complete* frames of that stream are held and released in
+  order once it completes or is abandoned. Delivering N+1..N+5 and then N would corrupt the picture
+  (and a late IDR after its deltas is worse than a short delay). The cost is up to ~4R (440 ms at 25 ms RTT)
+  of added latency on the stream, only around a frame that cannot be repaired; a repaired frame costs
+  about one RTT.
+- *Give up* (rounds exhausted, `Miss`, 1 s hard limit): the frame is discarded and reported as `FrameLoss`
+  exactly as before, so the L1 recovery above takes over unchanged. The two compose: NACK makes the
+  `FrameLoss` evidence rare, L1 stays the safety net.
+- *Duplicates* of delivered/abandoned frames are ignored (last 256 frame ids per stream), so a retransmit
+  that races the original cannot open a ghost frame (an old reassembler would report that as loss).
+- `SSS_DISABLE_NACK=1` (native) turns the whole thing off for that client: no Hello, no NACKs, no re-sends
+  (A/B measurements, field rollback). The relay's own switch is `SSSHARE_NACK=0`.
+- Logs: viewer and sharer log `NACK activity in the last 5 s requests=.. fragments_requested=..
+  fragments_recovered=.. frames_recovered=.. frames_abandoned=.. fragments_resent_for_others=..`, the relay
+  `NACK activity in the last 10 s requests=.. from_cache=.. forwarded_to_owner=.. miss_replies=..
+  owner_resends_relayed=..`.
+
+**Rig results** (headless rig, UDP impairment proxies: random loss on **both** legs at once, sharer -> relay
+and relay -> viewer; H.264 1080p120 8300 kbps Quality, a detailed scrolling pattern (IDRs 100-500 kB, median
+~300 kB = 100-500 fragments), 100 s per cell; NACK off = the same binaries with `SSS_DISABLE_NACK=1` on both
+clients; evidence `evidence/` in the task scratchpad):
+
+RESULTS_TABLE
+
+Extra bandwidth is the retransmitted fragments: at 1 % loss ~1800 fragments in 100 s = ~1.8 MB = ~0.15
+Mbit/s (~2 % of the 7 Mbit/s stream, i.e. about the loss rate), plus 18-byte requests (~1800, negligible).
+Of the repairs about half came from the relay cache (relay -> viewer loss) and half from the sender
+(sharer -> relay loss), as expected from loss on both legs.
+
+MIXED_TABLE
+
+**Not verified**: the browser (no NACK support yet: it neither says Hello nor re-sends, so it is exactly the
+old behaviour on a new relay; a browser sharer's lost fragments get a `Miss` at once), a real internet path
+(burst loss, reordering beyond 2 fragments, RTT jitter), more than one viewer of the same stream (unit tests
+only), audio.
+
 ## Native display (`client/src/decode/render.rs` + `render.wgsl`)
 
 **Added 2026-10-14 (I9).** Replaces "HTTP relay + WebCodecs in a `<canvas>`" (see History). The

@@ -4454,7 +4454,7 @@ fn send_media_payload(
 /// holding a mapped GStreamer buffer across an `await`.
 struct PreparedMedia {
     connection: quinn::Connection,
-    datagrams: Vec<Vec<u8>>,
+    datagrams: Vec<bytes::Bytes>,
     keyframe: bool,
 }
 
@@ -4513,14 +4513,14 @@ impl PreparedMedia {
     fn send_now(self) -> Result<()> {
         for datagram in self.datagrams {
             self.connection
-                .send_datagram(datagram.into())
+                .send_datagram(datagram)
                 .map_err(|e| anyhow!("failed to send media datagram: {e}"))?;
         }
         Ok(())
     }
 
     fn bytes(&self) -> usize {
-        self.datagrams.iter().map(Vec::len).sum()
+        self.datagrams.iter().map(bytes::Bytes::len).sum()
     }
 
     /// Sends the frame, spread out if [`pace_plan`] says so.
@@ -4546,7 +4546,7 @@ impl PreparedMedia {
             }
             for datagram in chunk {
                 self.connection
-                    .send_datagram(datagram.clone().into())
+                    .send_datagram(datagram.clone())
                     .map_err(|e| anyhow!("failed to send media datagram: {e}"))?;
             }
         }
@@ -4599,6 +4599,11 @@ fn prepare_media_payload(
     let datagrams =
         fragment_frame_with_flags(client.conn_id(), stream_id, counter, flags, &ciphertext, max_datagram_size)
             .context("failed to fragment encrypted frame")?;
+
+    // Spec §6.6: keep the datagrams (refcounted, no copy) so a NACK for a fragment the relay never
+    // got can be answered. Recorded before sending: the request can only arrive after the send.
+    let datagrams: Vec<bytes::Bytes> = datagrams.into_iter().map(bytes::Bytes::from).collect();
+    client.send_ring().record(stream_id, counter, &datagrams);
 
     Ok(PreparedMedia { connection, datagrams, keyframe })
 }

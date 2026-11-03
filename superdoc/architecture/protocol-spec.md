@@ -42,7 +42,7 @@ primitives:
 | --- | --- | --- | --- | --- |
 | **Control** | one **bidirectional** stream (opened by client on connect) | reliable, ordered | both | JOIN/LEAVE/SUBSCRIBE/presence/subscriber-count/keyframe-request (§4) |
 | **Preview** | short-lived **unidirectional** streams (one per preview blob) | reliable, ordered | sender→relay, relay→member | ~30 s encrypted JPEG snapshots (§7) |
-| **Media** | **datagrams** (unreliable) | drop-and-continue, no retransmit | sender→relay, relay→subscriber | fragmented encrypted video (H.264 / H.265 / AV1) and Opus frames (§6) |
+| **Media** | **datagrams** (unreliable) | drop-and-continue; video fragments may be re-requested by NACK (§6.6) | sender→relay, relay→subscriber | fragmented encrypted video (H.264 / H.265 / AV1) and Opus frames (§6), plus the short NACK datagrams (§6.6) |
 
 **Stream-type discriminator.** Every *unidirectional* stream begins with a 1-byte
 `StreamType` so the receiver knows what it is:
@@ -316,7 +316,7 @@ big-endian.
  ------  ----  --------------  -----   -----------------------------------------
    0      1    version         u8     = 0x01 for this spec (also AAD byte 0)
    1      1    flags           u8     bit0 = keyframe (IDR/IRAP, or AV1 key frame); bit1 = stalled (advisory,
-                                      see below); bits2-7 reserved=0
+                                      see below); bit2 = retransmit (§6.6); bits3-7 reserved=0
    2      8    conn_id         u64    source ConnId = nonce prefix (bytes 0..8 of nonce)
   10      1    stream_id       u8     which of the sender's streams (also AAD byte 1)
   11      4    frame_id        u32    = the frame's counter value (nonce bytes 8..12)
@@ -421,14 +421,133 @@ each fragment by `fragment_index`. When all `fragment_count` slots are filled it
 concatenates them, AEAD-decrypts with `nonce = conn_id ‖ frame_id` and `aad = [version,
 stream_id]`, strips the PTS, and hands the codec bytes to the decoder.
 
-**Stale-frame discard (matches the accepted drop-and-continue media policy — no
-retransmission):** because counters increase monotonically, `frame_id` values observed on
+**Stale-frame discard (the drop-and-continue policy; with NACK, §6.6, an incomplete video frame
+is given a short retransmit window first, and this discard is what happens when that fails or the
+peer does not speak NACK):** because counters increase monotonically, `frame_id` values observed on
 a given `(conn_id, stream_id)` are strictly increasing. When a fragment arrives whose
 `frame_id` is **newer** than an incomplete buffered frame for the same stream, the older
 incomplete frame is **discarded** (a fragment was lost and will never arrive). Concretely,
 keep at most the newest 1–2 in-progress frame_ids per stream and evict older incomplete
 ones; also drop any buffer untouched for a short timeout (e.g. 200 ms) as a backstop
 against a stream that stops entirely. Never block waiting for a missing fragment.
+
+### 6.6 Selective retransmission (NACK, task #104, 2026-11-03)
+
+**Why.** A frame is lost if *any* fragment is lost. A 1 MB IDR is ~1000 fragments, so at 0.1 %
+random loss it arrives whole only ~37 % of the time (field case 2026-11-02: `a keyframe never
+completed (981/984 fragments arrived)` 295 times, each followed by an L1 keyframe request that
+produced another huge IDR). #102 made IDRs smaller and rarer, but the encoder's natural GOP IDRs
+are still big. Paths are short (viewer-relay 16-30 ms, sharer-relay ~25 ms), so re-sending the
+three missing fragments costs ~1 RTT and 3 kB instead of a 1.5 s recovery and another megabyte.
+
+**Hard constraint: nothing existing may change.** Browser clients, older native clients and the
+older relay exist in the field; they must behave exactly as before. Everything below is
+therefore additive and **only ever sent between peers that proved they speak it**.
+
+#### Datagrams, not control messages
+
+A NACK is a datagram, not a `ClientToRelay`/`RelayToClient` variant. *Why:* an unknown postcard
+variant makes `read_control_frame` / `control_reader_loop` fail, which closes the connection
+(old relay) or ends the control stream (old client); a new variant would need negotiation before
+it could be sent at all. A datagram that is **shorter than a media header (< 19 bytes)** and whose
+first byte is a tag >= `0xE0` is dropped as "undersized" by every older peer: the old relay
+(`MediaHeader::unpack` fails), the old native client (same) and the browser
+(`unpackMediaHeader` throws). That is the whole compatibility story, and it needs no capability
+negotiation to be *safe*. Loss of a NACK datagram is harmless: the retry schedule below covers it.
+Media `version` bytes are 0x01; a future media version must stay below `0xE0`.
+
+| Tag | Name | Direction | Length | Meaning |
+| --- | --- | --- | --- | --- |
+| `0xE0` | Hello | client → relay | 1 | "I speak NACK" (viewer: I send them; sender: I answer them) |
+| `0xE1` | HelloAck | relay → client | 1 | the relay speaks NACK (cache + serving) |
+| `0xE2` | Request | viewer → relay, relay → owner | 18 | send fragments `first..first+count` of one frame |
+| `0xE3` | Miss | relay → viewer | 18 | the relay cannot supply that range; stop waiting |
+
+Request / Miss layout (big-endian): `tag u8 | conn_id u64 (the stream owner) | stream_id u8 |
+frame_id u32 | first u16 | count u16`. One contiguous run per datagram (several runs = several
+datagrams), `count >= 1`. *Why one range and 18 bytes:* a longer datagram would parse as a media
+header on old peers (`conn_id` = bytes 2..10) and an old relay would forward it or log a spoofed
+`conn_id`. 18 is the most a single range can use below the 19-byte boundary.
+
+#### Capability (Hello / HelloAck)
+
+A new client sends `Hello` once per second after joining (at most 10 times) until `HelloAck`
+arrives; the relay records the connection as NACK-capable and answers. A **viewer sends NACKs only
+after `HelloAck`**: with an old relay they would be silently dropped and every lossy frame would
+wait out the whole retry schedule for nothing. A **sender's Hello** tells the relay it may forward
+Requests to it; for an owner that never said Hello (a browser, an older native client) the relay
+answers a cache miss with `Miss` at once, so the viewer gives up immediately (exactly today's
+behaviour) instead of holding for retries nobody will answer. `Why datagrams for this too:` same
+reason as above, a probe that older peers drop is the only negotiation that cannot break them.
+
+#### Where retransmits come from
+
+1. **Relay cache (first answer).** The relay keeps, per *video* stream, the datagrams it forwarded
+   in the last **2 s**, capped at **8 MiB**, oldest evicted first (`protocol::FragmentCache`,
+   `Bytes` clones, no copy; only streams that have subscribers fill it, audio is never cached).
+   A Request that hits is answered with the **original datagram, byte for byte**, to the
+   requesting viewer only. This serves relay → viewer loss at one viewer RTT.
+2. **Sender ring (second answer).** The sender keeps the datagrams of its own video frames for the
+   same 2 s / 8 MiB. On a cache miss (the fragment never reached the relay: sharer → relay loss)
+   the relay forwards the Request to the owner (only if it said Hello), remembers the requesting
+   viewer, and the owner re-sends the original datagram with `flags` bit2 (retransmit) set.
+   The relay sends a retransmit-flagged datagram **only to the viewers that NACKed that stream in
+   the last second**, and also stores it in the cache (so a second viewer's NACK hits).
+   *Why the flag:* a re-sent fragment broadcast to every subscriber is a duplicate for everyone
+   who did not need it. A duplicate fragment of a finished frame makes an old reassembler open a
+   ghost incomplete frame, which it later reports as loss and which can trigger a keyframe
+   request: a viewer that does not speak NACK must never see one.
+   *Why both and not only one:* the cache alone cannot repair loss before the relay (the relay
+   never saw the fragment); the sender ring alone doubles every repair's latency (viewer RTT +
+   sharer RTT) and puts the repair load on the sharer's uplink. The cache is the cheap common case
+   (relay → viewer loss is the viewer's own link), the ring the rare one. Memory: the relay box is
+   a 2-core 2 GB LXC; 8 MiB x (streams being watched) is small at friend scale (8 members), and a
+   stream nobody watches caches nothing.
+
+#### Encryption (§5) is untouched
+
+A retransmit is the **same datagram** that was sent before: the frame was encrypted once
+(§6.1) with one counter value, the fragments are slices of that one ciphertext, and a re-sent
+slice is the same slice. No encryption happens at retransmit time, so no nonce is ever consumed
+or reused, `frame_id` is unchanged, the AAD is unchanged. The only byte that differs is the
+cleartext, unauthenticated `flags` byte (bit2), which §6.2 already says carries nothing
+security-relevant. The relay never decrypts anything for this either.
+
+#### Viewer behaviour (native client, `fragment.rs`; the browser follows the same rules)
+
+* **Detect.** A missing fragment of an incomplete frame is *suspect* once at least 2 later
+  fragments of the frame have arrived (a hole behind data, short reorder margin), or, for the
+  tail, once the frame has been quiet for 20 ms. (A paced IDR, `features/stream-control.md`
+  "Big keyframes", sends a chunk every 2 ms, so 20 ms of silence is not pacing.)
+* **Ask.** Send a Request per contiguous run of suspect fragments, then again every
+  `R = clamp(2 x rtt + 60 ms, 100, 300 ms)` for the fragments still missing, at most **3 times**. (*Why the generous floor:* the viewer only knows its own RTT, but a repair of sharer → relay loss also crosses the sharer's link; a first rig run with a 60 ms floor abandoned a keyframe whose repair had to cross a sharer link measured at ~90 ms RTT.)
+  A frame missing more than 128 fragments is not worth repairing (that is congestion, more
+  traffic would only hurt): it is abandoned at once.
+* **Give up.** After the third round plus one interval, on `Miss`, or after 1 s whatever
+  happens: the frame is discarded exactly as in §6.5 and reported as loss, so the existing
+  recovery (L1 keyframe request, `decode/recovery.rs`) takes over unchanged.
+* **Order.** While a frame is being repaired, **later complete frames of the same stream are
+  held back and released in order** once it completes or is abandoned. *Why:* the decoder must
+  see frame N before N+1; a late-completing N fed after N+5 corrupts the picture, and an IDR
+  delivered after the deltas that reference it is worse than a short delay. Without NACK
+  (legacy) complete frames are released at once, as before. The price is latency only on a lossy
+  frame (at most ~4R, 440 ms at 25 ms RTT), a trade the user accepted for screensharing.
+* **Duplicates.** A fragment of a frame already delivered or abandoned is ignored (the receiver
+  keeps the last few hundred frame ids), so a retransmit racing the original is harmless.
+* **Audio is not NACKed.** An Opus packet is one fragment: there is no "hole" to detect (a lost
+  single-fragment frame leaves no trace, §6.5), and a repair would arrive after its 20 ms
+  playout slot; PLC conceals it.
+* Kill switch: `SSS_DISABLE_NACK=1` (native): the client never says Hello, so it neither NACKs
+  nor is asked to re-send.
+
+#### Compatibility matrix
+
+| viewer | relay | sender | result |
+| --- | --- | --- | --- |
+| old / browser | any | any | unchanged: it never sends Hello, so it never gets a retransmit or a duplicate |
+| new | old | any | Hello is dropped, no HelloAck, viewer never NACKs: unchanged |
+| new | new | old / browser | relay cache repairs relay → viewer loss; sharer → relay loss gets `Miss` immediately: unchanged |
+| new | new | new | both repairs |
 
 ---
 
@@ -551,6 +670,7 @@ ConnState {
     control_tx: <handle to write RelayToClient on this conn's control stream>,
     connection: <quinn::Connection handle, for opening uni streams / datagrams>,
     subscriptions: HashSet<(ConnId, StreamId)>, // streams THIS conn watches
+    nack: bool,                                 // sent Hello (§6.6)
 }
 
 StreamState {
@@ -562,6 +682,8 @@ StreamState {
     height: u16,
     subscribers: HashSet<ConnId>,               // count = subscribers.len()
     last_preview: Option<Bytes>,                // opaque cached ciphertext (§7.2)
+    cache: Option<FragmentCache>,               // video only: last 2 s / 8 MiB of forwarded datagrams (§6.6)
+    nackers: Vec<(ConnId, Instant)>,            // viewers that NACKed recently (§6.6)
 }
 ```
 
@@ -581,6 +703,9 @@ Key operations:
 - **Media datagram in:** parse the 19-byte header, validate source `conn_id`, forward
   verbatim to `streams[(conn_id, stream_id)].subscribers` (§6.2). Drop if no subscribers
   or unknown stream.
+- **NACK-family datagram in** (< 19 bytes, tag >= 0xE0, §6.6): Hello → mark the connection, reply
+  HelloAck; Request → answer from `cache`, forward the rest to the owner (if it said Hello,
+  remembering the requester in `nackers`) or reply Miss.
 - **Preview uni stream in:** parse the 15-byte header, cache bytes in `last_preview`,
   broadcast to all room members (§7.2).
 
