@@ -10,7 +10,7 @@
 #   4. execs the client.
 # Shared libraries are found through the RPATH linuxdeploy writes into the
 # binaries and the bundled libs ($ORIGIN-relative); LD_LIBRARY_PATH is NOT used,
-# so host tools the client spawns (pw-loopback, pw-link, pw-dump) never pick up
+# so host tools the client spawns (pw-cli, pw-link, pw-dump) never pick up
 # bundled libs.
 HERE="$(dirname "$(readlink -f "$0")")"
 APPDIR="${APPDIR:-$HERE}"
@@ -59,7 +59,7 @@ lib_ver() {
 # The bundled libgstpipewire / libgstva were built against PipeWire 1.4 / libva 2.22;
 # on an older host they fail to load (undefined symbols): capture / VA would be gone.
 if [ -z "$SSS_NO_HOST_CHECK" ]; then
-    for tool in pw-loopback pw-link pw-dump; do
+    for tool in pw-cli pw-link pw-dump; do
         command -v "$tool" >/dev/null 2>&1 || {
             warn "'$tool' not found: per-app audio capture needs the PipeWire tools" \
                  "(Debian/Ubuntu: pipewire-bin, Fedora: pipewire-utils, Arch: pipewire)."
