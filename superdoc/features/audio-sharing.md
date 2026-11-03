@@ -5,6 +5,39 @@ Audio capture/encode/playback is described where it grew up: `features/stream-co
 video") and the module docs of `client/src/audio.rs` and `client/src/decode.rs`. This page covers
 **keeping the audio aligned with the picture** (task #91, 2026-11-01).
 
+## 2026-11-03: the viewer volume slider scrolls with the mouse wheel (task #113)
+
+User request: *"make sure to make the volume slider scrollable (5% steps, above 200% it should be 10%."*
+Every viewer volume slider (native tile pill, pop-out / fullscreen pill, browser tile pill) steps with the wheel.
+
+- **Rule.** One notch = one step, wheel up/forward = louder. 5 % while the value is below 200 %, 10 % from 200 %
+  up; clamped 0-500 %. The step is the one of the segment being *entered*, so the boundary is symmetric:
+  195 -> 200 -> 210 going up, 210 -> 200 -> 195 going down; an off-grid value (205 from a drag) lands on the
+  next multiple of the step in the direction of travel (205 -> 210 up, 205 -> 200 down). Native `ui::wheel_step`
+  (pure, `ui/tests.rs`), browser `ui/dom.js` `wheelStepVolumePct` (`docs/dev/tests.js`).
+- **Native wiring.** `ui::volume_slider` (the one function both pills call) asks `widgets::wheel_notches` for whole
+  notches over its `Response` and applies `wheel_step` per notch; it marks the response `changed`, so the tile and
+  pop-out code paths that already handle a click (`changed && !dragged` -> `SetVolume`) need no change.
+  Notches come from `raw_scroll_delta` (40 points = one notch, egui's line speed; touchpad pixel deltas accumulate).
+  **The wheel is consumed:** egui's `ScrollArea` reads `smooth_scroll_delta` in its `end()`, i.e. after the content
+  ran, so `wheel_notches` zeroes `smooth_scroll_delta.y` while the pointer is on the slider and the room panel under it
+  does not scroll. (`ui::tests::wheel_over_the_volume_slider...` runs real `MouseWheel` events through a
+  `ScrollArea` and fails without that line.)
+- **Browser wiring.** `volumeWheel(slider)` (`ui/dom.js`, called from `audioPill`): a non-passive `wheel` listener that
+  `preventDefault()`s (no page scroll), sums `deltaY` (lines x 33), steps once it reaches half a notch
+  (|deltaY| ~100 = one notch; a big flick = several), sets `slider.value` and dispatches an `input` event.
+- **Detent vs wheel.** The 100 % detent is for pointing (drag/click). A wheel step goes through 100 normally
+  (95 -> 100 -> 105). Native: the wheel path simply does not call the snap. Browser: the dispatched `input` event carries
+  `fromWheel = true` and the handler skips `snapVolumePct` for it. **Why** a flag: without it 100 -> 105 snapped
+  straight back to 100 (|105 - 100| <= 10) and the wheel got stuck at 100 %.
+- **Persistence unchanged** (`RoomSession::set_volume`, `WantedStream::volume_percent`, `w.vol`).
+- **Verified.** Unit tests (native `wheel_step_is_5_up_to_200...`, `wheel_over_the_volume_slider...`; browser two
+  `volume: wheel ...` tests in `docs/dev/tests.js`, 53/53 in headless Chromium). In the headless rig, in the widget
+  gallery's "Viewer volume" card, with real wheel events (new `hs-vptr scroll N`, a virtual-pointer axis event through
+  sway -> winit): 100 -> 105 (1 notch), 105 -> 210 (20 notches), 210 -> 200 -> 195 (down 2); the gallery column did not scroll
+  while the pointer was on the slider and scrolled 120 px for 3 notches beside it. **Not verified:** the real tile and
+  pop-out pills and the browser pill in the real site (a pill only exists for a sharer with audio; no audio tests).
+
 ## 2026-11-03: the shared audio is a name; all streams with that name are mixed (task #105)
 
 User request: *"Concise audio streams into streams with the same name only. So we are essentially
