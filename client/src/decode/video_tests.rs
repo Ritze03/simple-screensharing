@@ -462,12 +462,19 @@ fn deltas_of_the_other_bitstream_family_are_held_until_a_keyframe() {
     }
     assert!(wait_for(10, || shared.decoded_total() >= 2));
     assert!(!shared.needs_keyframe());
+    // Four access units went in; whatever the decoder still has in flight is not the gate's
+    // business, so the gate is asserted on what it handed over (`pushed`), not on decoded_total
+    // (which a slow machine advances for a while after this point).
+    assert_eq!(worker.pushed(), 4);
     // An AV1-looking delta (a temporal delimiter OBU, first byte non-zero).
     worker.handle_access_unit(1_000_000, false, vec![0x12, 0x00, 0x32, 0x01, 0x00]);
     assert!(shared.needs_keyframe(), "the wrong family must not reach the decoder");
     // Even this decoder's own deltas are held now, until its next keyframe.
-    let base = shared.decoded_total();
     worker.handle_access_unit(h264[4].pts_us, false, h264[4].data.clone());
-    std::thread::sleep(Duration::from_millis(150));
-    assert_eq!(shared.decoded_total(), base);
+    assert_eq!(worker.pushed(), 4, "no delta may reach the decoder while a keyframe is missing");
+    // The next keyframe lifts the hold.
+    let key = h264.iter().position(|a| a.keyframe && a.pts_us > h264[4].pts_us).expect("a later keyframe");
+    worker.handle_access_unit(h264[key].pts_us, true, h264[key].data.clone());
+    assert!(!shared.needs_keyframe());
+    assert_eq!(worker.pushed(), 5);
 }
