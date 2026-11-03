@@ -570,11 +570,13 @@ fn audio_pill(ui: &mut Ui, info: &mut Info) -> (Option<(u32, bool)>, Option<bool
     let (slots, w): (&[_], f32) = if was_muted {
         (&slots_off, 2.0 + 25.0 + 4.0 + muted_w + 10.0)
     } else {
-        (&slots_on, 2.0 + 25.0 + 4.0 + 110.0 + 4.0 + 34.0 + 4.0 + 25.0 + 10.0)
+        (&slots_on, 2.0 + 25.0 + 4.0 + 110.0 + 4.0 + 34.0 + 4.0 + 25.0 + 2.0)
     };
+    // Right pad 2 like the left one: the level button fills the right end cap (#130).
+    let pad_r = if was_muted { 10.0 } else { 2.0 };
     let row = HBox::new("popout_audio", CHROME_H)
         .width(w)
-        .pad(2.0, 10.0)
+        .pad(2.0, pad_r)
         .gap(theme::S1)
         .slots(slots)
         .show(ui);
@@ -672,5 +674,33 @@ mod tests {
     fn bitrate_formats_like_the_tile() {
         assert_eq!(fmt_kbps(950.4), "950 kbps");
         assert_eq!(fmt_kbps(8120.0), "8.1 Mbps");
+    }
+
+    /// #130, user: "The dynamic volume button should be all the way in the right half-circle":
+    /// the level button's disc is concentric with the pill's right end cap (and the mute
+    /// button's hover disc with the left one).
+    #[test]
+    fn level_button_sits_concentric_in_the_right_end_cap() {
+        let ctx = egui::Context::default();
+        crate::theme::apply(&ctx);
+        let mut info = Info { label: String::new(), res: String::new(), has_audio: true, volume: 100, muted: false, level: true, kbps: 0.0 };
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, vec2(600.0, 100.0))), ..Default::default() };
+        let out = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                audio_pill(ui, &mut info);
+            });
+        });
+        let mut pill = None;
+        let mut disc = None;
+        for cs in &out.shapes {
+            match &cs.shape {
+                egui::Shape::Rect(r) if r.corner_radius == CornerRadius::same(15) => pill = Some(r.rect),
+                egui::Shape::Circle(c) if c.fill == theme::ACCENT_CHIP_BG => disc = Some(*c),
+                _ => {}
+            }
+        }
+        let (pill, disc) = (pill.expect("pill painted"), disc.expect("level disc painted"));
+        let cap = egui::pos2(pill.right() - pill.height() / 2.0, pill.center().y);
+        assert!((disc.center - cap).length() < 0.01, "disc {:?} vs end-cap centre {cap:?} (pill {pill:?})", disc.center);
     }
 }

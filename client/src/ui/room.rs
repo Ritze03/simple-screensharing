@@ -948,8 +948,9 @@ fn round_btn(ui: &mut Ui, rect: Rect, id: Id, icon: &str, tip: &str, stop: bool)
     resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip)
 }
 
-/// `hbox·audio-pill` (29 px, pad 2/10, gap 4): `[25 mute][110 volume 0–500 %][34 pct][25 level]`,
-/// or `[25 mute][Muted]` while muted. `level` is the global loudness-levelling toggle (#126). The slider pushes `SetVolume` on release.
+/// `hbox·audio-pill` (29 px, pad 2/2, gap 4): `[25 mute][110 volume 0–500 %][34 pct][25 level]`,
+/// or `[25 mute][Muted]` (pad 2/10) while muted. Both end buttons sit concentric in the pill's
+/// half-circle ends, 2 px in (#130). `level` is the global loudness-levelling toggle (#126). The slider pushes `SetVolume` on release.
 fn audio_pill(ui: &mut Ui, cx: &Cx, st: &mut RoomState, key: StreamKey, bottom: Rect, acts: &mut Vec<UiAction>) {
     let Some(s) = cx.session(key.0) else { return };
     let vol = s.volume(key.1, key.2);
@@ -958,7 +959,9 @@ fn audio_pill(ui: &mut Ui, cx: &Cx, st: &mut RoomState, key: StreamKey, bottom: 
     let pct = format!("{shown}%");
     let tf = font(Weight::Mono, theme::FS_TINY);
     let tail = if vol.muted { text_width(ui, &muted_l, tf.clone(), 0.0).ceil() } else { 110.0 + theme::S1 + 34.0 + theme::S1 + 25.0 };
-    let w = 2.0 + 25.0 + theme::S1 + tail + 10.0;
+    // Right pad 2 like the left one, so the level button fills the right end cap (#130); 10 after the "Muted" text.
+    let pad_r = if vol.muted { 10.0 } else { 2.0 };
+    let w = 2.0 + 25.0 + theme::S1 + tail + pad_r;
     let pill = Rect::from_min_size(bottom.min, vec2(w.min(bottom.width()), OVL_H));
     ui.painter().rect(pill, CornerRadius::same(15), Color32::from_black_alpha(184), Stroke::new(1.0_f32, Color32::from_white_alpha(46)), StrokeKind::Inside);
 
@@ -966,7 +969,7 @@ fn audio_pill(ui: &mut Ui, cx: &Cx, st: &mut RoomState, key: StreamKey, bottom: 
     child.shrink_clip_rect(pill);
     let slots_muted = [fixed(25.0), fixed(tail)];
     let slots = [fixed(25.0), fixed(110.0), fixed(34.0), fixed(25.0)];
-    let row = HBox::new("hbox·audio-pill", OVL_H).gap(theme::S1).pad(2.0, 10.0).slots(if vol.muted { &slots_muted } else { &slots }).show(&mut child);
+    let row = HBox::new("hbox·audio-pill", OVL_H).gap(theme::S1).pad(2.0, pad_r).slots(if vol.muted { &slots_muted } else { &slots }).show(&mut child);
 
     // Mute toggle: 25 px round, red icon while muted.
     let mr = Rect::from_center_size(row.cell(0).center(), vec2(25.0, 25.0));

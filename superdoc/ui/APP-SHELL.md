@@ -216,6 +216,10 @@ per-stream mode; per-stream state (storage per owner like `audio_volume_by_owner
 it is ever wanted. The browser tile pill has the same button (`levelToggle` in `docs/js/ui/app.js`, `.audio-pill button.level`).
 The viewer volume maximum stays 500 % (the same request first asked to cap it at 200 %, then the user said "leave it at 500%").
 Tests: `ui::tests::level_toggle_reports_a_click_only_on_the_button`; gallery card "Viewer volume" shows both states.
+*Geometry (2026-11-03, #130; user: "The dynamic volume button should be all the way in the right half-circle"):* the pill
+pads 2 px on both ends while the slider shows (10 px on the right only after the "Muted" text), so the 25 px mute and level
+buttons are concentric with the 29 px pill's half-circle ends, 2 px in all round. Browser: 1 px border + 1 px padding
+(`.audio-pill`, `.audio-pill:not(.muted)`).
 
 **Settings > Diagnostics > Relay: "Send diagnostics to the relay"** (2026-11-03, task #110; user: "he or all of my
 friends could just tick the checkbox while we are still in heavy development, and then I can just see it.
