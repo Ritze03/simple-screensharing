@@ -42,6 +42,7 @@ primitives:
 | --- | --- | --- | --- | --- |
 | **Control** | one **bidirectional** stream (opened by client on connect) | reliable, ordered | both | JOIN/LEAVE/SUBSCRIBE/presence/subscriber-count/keyframe-request (§4) |
 | **Preview** | short-lived **unidirectional** streams (one per preview blob) | reliable, ordered | sender→relay, relay→member | ~30 s encrypted JPEG snapshots (§7) |
+| **Diagnostics** | short-lived client-opened **unidirectional** streams (one per batch), only after a capability ack | reliable, ordered | client→relay | opt-in client log lines, stored by the relay (§6.7) |
 | **Media** | **datagrams** (unreliable) | drop-and-continue; video fragments may be re-requested by NACK (§6.6) | sender→relay, relay→subscriber | fragmented encrypted video (H.264 / H.265 / AV1) and Opus frames (§6), plus the short NACK datagrams (§6.6) |
 
 **Stream-type discriminator.** Every *unidirectional* stream begins with a 1-byte
@@ -50,7 +51,8 @@ primitives:
 | Value | Meaning |
 | --- | --- |
 | `0x01` | Preview stream (§7) |
-| `0x02`–`0xFF` | Reserved for future reliable uni-stream uses (do not send) |
+| `0x02` | Client diagnostics upload, client → relay only, opt-in (§6.7) |
+| `0x03`–`0xFF` | Reserved for future reliable uni-stream uses (do not send) |
 
 The single control **bidi** stream needs no type byte (there is exactly one, opened
 first; its role is implicit). Reserved value `0x00` is conceptually "control" for
@@ -548,6 +550,106 @@ security-relevant. The relay never decrypts anything for this either.
 | new | old | any | Hello is dropped, no HelloAck, viewer never NACKs: unchanged |
 | new | new | old / browser | relay cache repairs relay → viewer loss; sharer → relay loss gets `Miss` immediately: unchanged |
 | new | new | new | both repairs |
+
+### 6.7 Client diagnostics upload (opt-in, task #110, 2026-11-03)
+
+**Why.** The owner and friends are in heavy testing. Investigating a friend's stall used to mean
+"launch it like this and send me the file". With the client's in-memory log ring (#107) and the
+relay's own summaries (#109) the missing piece was getting the client's lines to the relay. User
+request: "It would be way better if he or all of my friends could just tick the checkbox while we are
+still in heavy development, and then I can just see it. Everyone knows this data is being collected."
+So: **opt-in, off by default** (Settings > Diagnostics > "Send diagnostics to the relay"), stored per
+person and session on the relay. Decided with the owner: stored **with the display name** (opt-in, everyone
+knows), **never room keys or join links** (the client strips join-link-shaped tokens before a line even
+enters the ring, `logbuf::redact`).
+
+**Hard constraint, as for §6.6: nothing existing may change.** Older relays, older clients and browsers
+must neither break nor see anything new; a mixed pair must carry on exactly as before.
+
+#### Capability (datagrams, same trick as §6.6)
+
+| Tag | Name | Direction | Length | Meaning |
+| --- | --- | --- | --- | --- |
+| `0xE4` | DiagHello | client -> relay | 1 | "I would like to upload my log" |
+| `0xE5` | DiagAck | relay -> client | 1 | "this relay stores uploads" |
+
+A client with the box ticked sends `DiagHello` once per second after joining (at most 10 times per
+ticking) until `DiagAck` arrives, and **opens no stream before it**. Every older relay drops the 1-byte
+datagram as undersized (`< 19` bytes, tag `>= 0xE0`, the same rule as §6.6), so it never answers and the
+client never uploads: no stream, no error, no log noise beyond one `debug` line on the old relay. The relay
+only answers while uploads are enabled (`SSSHARE_DIAG_UPLOAD=0` is the kill switch: no ack, nothing stored,
+exactly like an older relay). A client that never says Hello (browser, older native client) is never
+acked and its streams, if it ever opened one, are refused.
+
+*Why not a `ClientToRelay` variant:* an unknown postcard variant makes an older relay fail
+`read_control_frame` and close the connection (§6.6). *Why a uni stream and not datagrams:* a batch is
+tens of KB, which wants reliability and flow control, not 1200-byte unreliable fragments. *Why not reuse
+the NACK Hello:* a relay that has NACK but predates uploads would ack it, and the client would upload to
+a relay that ignores it; the upload needs its own handshake.
+
+#### Upload stream
+
+One client-opened **unidirectional stream per batch** (§1: `StreamType` byte `0x02`):
+
+```
+ offset  size  field
+   0      1    StreamType  = 0x02 (diagnostics)
+   1      1    version     = 0x01 (DIAG_UPLOAD_VERSION)
+   2    ...    UTF-8 text, until FIN
+```
+
+At most **256 KiB** (`MAX_DIAG_BATCH_BYTES`, type and version included); the relay reads no more
+and drops a longer stream whole. The text is the client's log lines, newline-terminated, in the same
+layout as Settings > Logs > Copy. The first batch of a connection starts with the client's header
+(`Simple Screensharing client log`, version + commit, OS, GPU, VA driver, session start); a batch whose
+lines the ring already dropped, or which had to be cut to the size limit (newest lines win), carries a
+`[N log lines not uploaded (...)]` line. The text is untrusted: the relay replaces invalid UTF-8 and every
+control character other than newline and tab (the owner reads these in a terminal).
+
+The relay accepts a stream only from a **joined connection that said `DiagHello` and got an ack**
+(uploads from a connection that never joined cannot happen: the connection loop that reads uni streams
+starts at the join), **one stream at a time per connection** (a second concurrent one is refused with
+STOP_SENDING), and only while enabled. Anything else is refused silently; the client simply tries again
+with the next batch.
+
+**Client cadence.** Every second the loop checks the ring: the first batch goes out as soon as the ack
+arrives; after that one batch per **30 s** if there are new lines, or **3 s** after the previous one when
+a WARN/ERROR line is waiting (recovery, stalls and errors are WARN, so the interesting moments reach the
+relay promptly). *Only new lines:* every ring line has a sequence number; the connection keeps a cursor and
+a batch is everything at or after it. The cursor moves only once the relay has the whole batch (the
+sender waits for the stream to be read to completion, `SendStream::stopped`), so a slow or failed upload
+repeats the same lines and the relay never gets a half batch (a failed stream is reset). A batch not
+accepted within 10 s is abandoned until the next tick. **It never blocks media or the UI**: it is its own
+task, shares only the ring's mutex (held for a copy of the new lines), keeps nothing beyond the bounded
+ring, and a batch is capped at 256 KiB (a rig run with a 60 fps share produced ~2-4 KB per 30 s batch, tens of
+KB/min is typical, against 8 Mbit/s of video).
+
+*What goes out when:* with the setting stored as on, the whole ring (startup lines included) is eligible;
+when the box is ticked while the app runs, only lines logged **from that moment** are (so lines from
+before the user agreed are never sent). Turning it off stops uploading at once; the connection keeps its
+file on the relay. The ring is process-wide, so a client in two rooms on two relays sends the same log
+(its lines about the other room included) to both.
+
+#### Storage on the relay (`server/src/client_logs.rs`)
+
+`logs/clients/<YYYY-MM-DD>/<display-name>-<conn_id>.log` relative to the relay's working directory
+(`/var/lib/sss` on vogelnest): one file per connection, appended to, `# relay:` lines for start and end.
+The day is the UTC day of the connection's first batch. The display name is reduced to letters, digits,
+`-` and `_` (everything else, path separators and dots included, becomes `_`; 32 characters at most; empty
+becomes `anon`), the connection id keeps two people called "mo" apart. Caps, because anyone in a room can
+open the stream: **20 MiB per file**, **500 MiB per day directory** (a batch that does not fit is dropped
+whole, with one `# relay:` note per file; a restarted relay re-counts the day from disk), and **day
+directories older than 14 days are deleted** (at start, then hourly).
+
+#### Compatibility matrix
+
+| client | relay | result |
+| --- | --- | --- |
+| new, box off | any | nothing is sent (no Hello either) |
+| new, box on | older than #110 | Hello dropped as undersized, never acked, no stream: everything else unchanged (checked in the rig and by `ticked_diagnostics_are_harmless_with_an_old_relay`, relay built from `facc373`) |
+| new, box on | new | acked, batches stored |
+| new, box on | new, `SSSHARE_DIAG_UPLOAD=0` | like an older relay |
+| old / browser | new | never says Hello: no ack, no stream, relay unchanged |
 
 ---
 

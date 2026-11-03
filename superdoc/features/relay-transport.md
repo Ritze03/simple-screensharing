@@ -287,3 +287,45 @@ counters) and parses the 19 B header a second time; no allocation, plus one rela
 with no rooms. Verified in the headless rig (60 fps H.264, one sharer, one viewer, ~1 MB/s): one stream
 and two conn lines per minute, `frames=3693` over 61 s (60 fps), the viewer's `unwatch` + `watch` shows
 as `subs=2 unsubs=1 resubs=1`, and `stopshare` produced the `end=1` line.
+
+## Client diagnostics upload (task #110, 2026-11-03)
+
+Code: relay `server/src/client_logs.rs` + `relay.rs` (`handle_uni`, `handle_diag_uni`); client
+`client/src/diag_upload.rs`. Wire format, capability handshake, cadence and the *why*:
+`architecture/protocol-spec.md` §6.7. This page is the operator's view.
+
+**What it is.** A friend ticks Settings > Diagnostics > "Send diagnostics to the relay" (off by default,
+persisted as `send_diagnostics` in `settings.toml`); from then on their client sends its log ring to the
+relay it is connected to, and the relay writes it to `logs/clients/<YYYY-MM-DD>/<display-name>-<conn_id>.log`
+in its working directory, one file per connection (a restart of the app or a reconnect is a new file).
+The first lines of a file are a `# relay:` line (name, connection id, start time) and the client's
+header (version + commit, OS, GPU, VA driver); then the client's INFO+ lines (WARN+ for libraries) exactly as
+Settings > Logs > Copy shows them, UTC timestamps; a `# relay: connection closed` line ends a clean session.
+The same connection id appears in the relay's own `diag conn ... conn=<id>` lines (#109), so one grep joins
+the two views. A tick while the app runs only uploads lines logged from then on.
+
+**Switches.** Relay: `SSSHARE_DIAG_UPLOAD=0` (no ack, nothing stored; clients behave as with an older relay).
+Client: untick the box. There is no client env switch (the setting is the switch).
+
+**Limits.** 256 KiB per batch (one in flight per connection), 20 MiB per file, 500 MiB per day directory
+(over-cap batches are dropped whole; one `# relay:` note in the file says so), directories older than 14 days
+deleted at start and then hourly (`client_logs::prune_at`; only directories named `YYYY-MM-DD`, nothing else
+under `logs/clients` is touched). The relay logs `dropping client diagnostics: limit reached` (WARN) and
+`client diagnostics uploads (...) enabled=... dir=...` at start.
+
+**On vogelnest.** `ls /var/lib/sss/logs/clients/$(date -u +%F)/`, then e.g.
+`less -R /var/lib/sss/logs/clients/2026-11-03/Name-<conn id>.log`,
+`grep -h 'WARN\|recover' /var/lib/sss/logs/clients/2026-11-03/Name-*.log`, or follow a live session with
+`tail -f`. The relay has to be redeployed for any of this to work (an older relay never acks).
+
+**Cost.** Relay: a 1-byte datagram compare per datagram (`bytes == [0xE4]`, before the NACK check), one
+`spawn_blocking` file append per batch (<= 256 KiB, every 30 s per ticked client), a 1 h prune task. Client:
+a 1 s timer per connection that does nothing while the box is off; with it on, one mutex lock on the log ring
+per tick that has something to send. Nothing sits in the media path.
+
+**Verified** in the headless rig (2026-11-03, 60 fps H.265 share + watch, ~3 min): the sharer ticked via
+`HS_SEND_DIAG_1=1` (settings seeded on), the viewer ticked in the real Settings modal while the stream ran;
+the relay's rig cwd held `Rig_Sharer-<id>.log` with header, startup WARNs, `capture started in the Gpu domain`,
+the keyframe-pacing lines and `Rig_Viewer-<id>.log` with `H.265 decoding via vah265dec (hardware)`; no `|` (join
+link) anywhere in either; a relay built from `facc373` with both clients ticked: share and watch worked
+(`Decoded 60 fps / shown 60 fps, 0 dropped`), no file written, no client error.

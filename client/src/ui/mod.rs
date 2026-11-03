@@ -376,6 +376,8 @@ pub enum UiAction {
     SetPresentationMode(PresentationMode),
     SetJitterBuffer(u32),
     SetCatchUpSpeed(u32),
+    /// Settings > Diagnostics: the "Send diagnostics to the relay" checkbox (task #110).
+    SetSendDiagnostics(bool),
     /// Settings > Diagnostics: copy the in-memory log (`logbuf`) to the clipboard + toast.
     CopyLogs,
     /// Settings > Diagnostics: write the log to a file in the Downloads folder, toast and

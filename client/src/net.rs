@@ -113,7 +113,7 @@ use crate::nack::{hello_loop, SendRing};
 use crate::protocol::{
     cert_hash_of_der, decode_cert_hash, decode_control_payload, encode_cert_hash, encode_control_frame, ClientToRelay, ConnId, CertHash, MediaHeader, Member,
     PresenceEvent, PreviewHeader, RejectReason, RelayToClient, RoomId, StreamId, StreamInfo,
-    StreamKind, is_nack_datagram, NackRange, MAX_CONTROL_FRAME_LEN, NACK_TAG_HELLO_ACK, NACK_TAG_MISS, NACK_TAG_REQUEST,
+    StreamKind, is_nack_datagram, NackRange, DIAG_TAG_ACK, MAX_CONTROL_FRAME_LEN, NACK_TAG_HELLO_ACK, NACK_TAG_MISS, NACK_TAG_REQUEST,
     PROTOCOL_VERSION, STREAM_TYPE_PREVIEW,
 };
 
@@ -718,6 +718,7 @@ impl ScreenshareClient {
         tokio::spawn(control_reader_loop(recv, event_tx.clone()));
         let send_ring = Arc::new(SendRing::default());
         let nack_acked = Arc::new(AtomicBool::new(false));
+        let diag_acked = Arc::new(AtomicBool::new(false));
         tokio::spawn(datagram_reader_loop(
             connection.clone(),
             parsed.room_key,
@@ -725,8 +726,10 @@ impl ScreenshareClient {
             conn_id,
             send_ring.clone(),
             nack_acked.clone(),
+            diag_acked.clone(),
         ));
         tokio::spawn(hello_loop(connection.clone(), nack_acked));
+        tokio::spawn(crate::diag_upload::upload_loop(connection.clone(), diag_acked.clone()));
         tokio::spawn(preview_uni_loop(connection.clone(), parsed.room_key, event_tx));
 
         let client = Self {
@@ -918,6 +921,7 @@ async fn datagram_reader_loop(
     own_id: ConnId,
     send_ring: Arc<SendRing>,
     nack_acked: Arc<AtomicBool>,
+    diag_acked: Arc<AtomicBool>,
 ) {
     let mut reassembler = Reassembler::new();
     let mut last_poll = Instant::now();
@@ -937,7 +941,12 @@ async fn datagram_reader_loop(
         let now = Instant::now();
         let mut frames = Vec::new();
         if let Some(datagram) = datagram {
-            if is_nack_datagram(&datagram) {
+            if is_nack_datagram(&datagram) && datagram[0] == DIAG_TAG_ACK {
+                // The relay stores diagnostics uploads (spec §6.7); independent of NACK.
+                if !diag_acked.swap(true, Ordering::Relaxed) {
+                    tracing::info!("the relay accepts diagnostics uploads");
+                }
+            } else if is_nack_datagram(&datagram) {
                 handle_nack_datagram(&datagram, &connection, own_id, &send_ring, &nack_acked, &mut reassembler);
             } else {
                 match MediaHeader::unpack(&datagram) {

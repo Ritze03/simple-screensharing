@@ -2929,6 +2929,93 @@ async fn native_client_learns_the_relay_cert_hash_and_tolerates_a_stale_one() {
     assert_eq!(c.current_cert_hash(), Some(hash), "reports what the relay really presented, not what the link said");
 }
 
+/// The relay's `logs/clients` directory for the relay [`spawn_relay_server`] started on `port`.
+fn relay_client_log_dir(port: u16) -> PathBuf {
+    let cwd = match std::env::var_os("SSSHARE_SERVER_CWD") {
+        Some(dir) => PathBuf::from(dir),
+        None => std::env::temp_dir().join(format!("sss-relay-{}-{port}", std::process::id())),
+    };
+    cwd.join("logs/clients")
+}
+
+/// Every file under `dir/<day>/`.
+fn stored_client_logs(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for day in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        found.extend(std::fs::read_dir(day.path()).into_iter().flatten().flatten().map(|f| f.path()));
+    }
+    found
+}
+
+/// Opt-in diagnostics (spec §6.7, task #110) against the relay named by `SSSHARE_SERVER_BIN`
+/// (default: the newest built one): with the box ticked, the relay stores the log under
+/// `logs/clients/<day>/<name>-<conn id>.log`, header first, and no join link. Run with
+/// `cargo test -p simple-screensharing-client --lib -- --ignored ticked_diagnostics_are_stored`.
+#[tokio::test]
+#[ignore = "spawns a real relay server child process (current version, SSSHARE_SERVER_BIN)"]
+#[allow(clippy::await_holding_lock)] // the lock serialises the process-wide upload switch
+async fn ticked_diagnostics_are_stored_by_a_new_relay() {
+    use tracing_subscriber::prelude::*;
+    let _lock = crate::logbuf::TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry().with(crate::logbuf::layer()));
+    let port = pick_free_udp_port().expect("free UDP port");
+    let _server = spawn_relay_server(port).expect("spawn relay");
+    let server_addr = format!("127.0.0.1:{port}");
+    let room_id: RoomId = rand::random();
+    let room_key: [u8; 32] = rand::random();
+    let link = crate::net::format_join_string(&server_addr, &room_id, &room_key);
+
+    crate::diag_upload::set_enabled(true, true);
+    tracing::info!("diag-e2e-marker joining {link} now");
+    let (_a, _s, _ev) = connect_with_retry(&link, "Dia g/Name").await.expect("connect");
+
+    let dir = relay_client_log_dir(port);
+    let mut text = String::new();
+    for _ in 0..100 {
+        if let Some(p) = stored_client_logs(&dir).first() {
+            text = std::fs::read_to_string(p).unwrap_or_default();
+            if text.contains("diag-e2e-marker") {
+                assert!(p.file_name().unwrap().to_string_lossy().starts_with("Dia_g_Name-"), "{p:?}");
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    crate::diag_upload::set_enabled(false, true);
+    assert!(text.contains("diag-e2e-marker"), "nothing stored under {}: {text:?}", dir.display());
+    assert!(text.starts_with("# relay: client diagnostics from \"Dia g/Name\""), "{text}");
+    assert!(text.contains("Simple Screensharing client log\nversion: "), "header missing: {text}");
+    assert!(text.contains("the relay accepts diagnostics uploads"), "{text}");
+    let key_text = link.split('|').nth(2).expect("link has a key field");
+    assert!(!text.contains(key_text), "the room key must not be stored");
+    assert!(text.contains(&format!("{server_addr}|")) && text.contains("|<redacted>"), "link redacted in the stored line: {text}");
+}
+
+/// Mixed versions: a client with the box ticked against a relay that predates the upload (point
+/// `SSSHARE_SERVER_BIN` at one built from commit facc373) connects, works and sends nothing
+/// that bothers it: no file, connection stays up, presence works.
+#[tokio::test]
+#[ignore = "needs SSSHARE_SERVER_BIN pointing at a relay older than #110"]
+#[allow(clippy::await_holding_lock)] // the lock serialises the process-wide upload switch
+async fn ticked_diagnostics_are_harmless_with_an_old_relay() {
+    let _lock = crate::logbuf::TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let port = pick_free_udp_port().expect("free UDP port");
+    let _server = spawn_relay_server(port).expect("spawn relay");
+    let server_addr = format!("127.0.0.1:{port}");
+    let room_id: RoomId = rand::random();
+    let room_key: [u8; 32] = rand::random();
+    let link = crate::net::format_join_string(&server_addr, &room_id, &room_key);
+
+    crate::diag_upload::set_enabled(true, true);
+    let (a, _s, _ev_a) = connect_with_retry(&link, "old-relay-a").await.expect("connect");
+    tokio::time::sleep(Duration::from_secs(14)).await; // longer than 10 hellos
+    assert!(a.close_cause().is_none(), "the relay did not drop the client");
+    let (_b, snapshot, _ev_b) = connect_with_retry(&link, "old-relay-b").await.expect("a second client joins normally");
+    crate::diag_upload::set_enabled(false, true);
+    assert!(snapshot.members.iter().any(|m| m.display_name == "old-relay-a"), "presence works");
+    assert!(stored_client_logs(&relay_client_log_dir(port)).is_empty(), "an old relay stores nothing");
+}
+
 // ---------------------------------------------------------------------------
 // Session-logic tests driving `session::AppState` directly (no UI).
 //

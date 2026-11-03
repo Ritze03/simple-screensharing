@@ -428,6 +428,11 @@ pub struct AppSettings {
     /// `whoami_fallback()` in that case, same as before this setting existed.
     #[serde(default)]
     pub display_name: String,
+    /// Settings > Diagnostics > "Send diagnostics to the relay" (task #110): while on, the
+    /// client uploads its recent log lines to the relay of every room it is connected to
+    /// (`diag_upload.rs`). Opt-in: off unless the user ticks it.
+    #[serde(default)]
+    pub send_diagnostics: bool,
 }
 
 /// See [`AppSettings::start_stream_defaults`].
@@ -483,6 +488,7 @@ impl Default for AppSettings {
             catch_up_speed_percent: Self::default_catch_up_speed_percent(),
             start_stream_defaults: StartStreamDefaults::default(),
             display_name: String::new(),
+            send_diagnostics: false,
         }
     }
 }
@@ -844,6 +850,7 @@ mod tests {
             catch_up_speed_percent: 8,
             start_stream_defaults: StartStreamDefaults::default(),
             display_name: "mo".to_string(),
+            send_diagnostics: true,
         };
         let toml_str = toml::to_string_pretty(&settings).unwrap();
         let parsed: AppSettings = toml::from_str(&toml_str).unwrap();
@@ -855,6 +862,15 @@ mod tests {
         assert_eq!(parsed.max_jitter_buffer_ms, 3_500);
         assert_eq!(parsed.catch_up_speed_percent, 8);
         assert_eq!(parsed.display_name, "mo");
+        assert!(parsed.send_diagnostics);
+    }
+
+    /// Opt-in (#110): a settings file without the key, and the default, mean "do not upload".
+    #[test]
+    fn send_diagnostics_is_off_by_default() {
+        assert!(!AppSettings::default().send_diagnostics);
+        let parsed: AppSettings = toml::from_str("language = \"de\"\n").unwrap();
+        assert!(!parsed.send_diagnostics);
     }
 
     /// A settings file written before `display_name` existed must still

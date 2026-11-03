@@ -486,6 +486,23 @@ async fn copy_logs_puts_the_dump_on_the_clipboard_and_toasts() {
 }
 
 #[tokio::test]
+async fn the_send_diagnostics_checkbox_is_off_by_default_and_persists() {
+    // The upload switch is process-wide; the diag_upload tests assert on it under this lock.
+    let _lock = simple_screensharing_client::logbuf::TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let _home = isolated_home();
+    let mut app = app_with_rooms(&[]);
+    let ctx = ctx();
+    assert!(!app.state.send_diagnostics, "opt-in: off until ticked");
+    assert!(!simple_screensharing_client::diag_upload::enabled());
+    app.apply(&ctx, UiAction::SetSendDiagnostics(true));
+    assert!(app.state.send_diagnostics && simple_screensharing_client::diag_upload::enabled());
+    assert!(simple_screensharing_client::rooms::AppSettings::load().send_diagnostics, "saved to settings.toml");
+    app.apply(&ctx, UiAction::SetSendDiagnostics(false));
+    assert!(!app.state.send_diagnostics && !simple_screensharing_client::diag_upload::enabled());
+    assert!(!simple_screensharing_client::rooms::AppSettings::load().send_diagnostics);
+}
+
+#[tokio::test]
 async fn toggle_popover_opens_then_closes_the_same_kind() {
     let _home = isolated_home();
     let app = app_with_rooms(&[]);

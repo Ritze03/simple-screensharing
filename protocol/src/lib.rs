@@ -168,8 +168,11 @@ pub fn decode_control_payload<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> anyhow
 // §1 Stream-type discriminator for unidirectional streams
 // ---------------------------------------------------------------------
 
-/// The only currently-defined unidirectional stream type: a preview blob.
+/// Unidirectional stream type: a preview blob (spec §7).
 pub const STREAM_TYPE_PREVIEW: u8 = 0x01;
+/// Unidirectional stream type: one batch of client log lines for the relay to store (spec §6.7).
+/// Sent only after the relay answered [`DIAG_TAG_ACK`].
+pub const STREAM_TYPE_DIAG: u8 = 0x02;
 
 // ---------------------------------------------------------------------
 // §6.2 Media datagram header (19 bytes, fixed binary, cleartext)
@@ -287,6 +290,24 @@ pub const NACK_TAG_REQUEST: u8 = 0xE2;
 pub const NACK_TAG_MISS: u8 = 0xE3;
 /// Length of a request / miss datagram.
 pub const NACK_DATAGRAM_LEN: usize = 18;
+
+// ---------------------------------------------------------------------
+// §6.7 Client diagnostics upload (#110): opt-in log lines to the relay
+// ---------------------------------------------------------------------
+
+/// Client -> relay, 1 byte: "I would like to upload my log to you" (the user ticked
+/// Settings > Diagnostics > Send diagnostics). Repeated until [`DIAG_TAG_ACK`] arrives. Like the
+/// NACK tags it is shorter than a media header and >= 0xE0, so every older relay drops it as
+/// undersized ([`is_nack_datagram`] is true for it too).
+pub const DIAG_TAG_HELLO: u8 = 0xE4;
+/// Relay -> client, 1 byte: this relay stores uploads. Without it the client never opens a
+/// diagnostics stream.
+pub const DIAG_TAG_ACK: u8 = 0xE5;
+/// First byte after the stream type of a [`STREAM_TYPE_DIAG`] stream: the batch format version.
+pub const DIAG_UPLOAD_VERSION: u8 = 0x01;
+/// Most bytes (type and version included) one diagnostics stream may carry; the relay reads no
+/// more than this, the client never sends more.
+pub const MAX_DIAG_BATCH_BYTES: usize = 256 * 1024;
 
 /// Whether `bytes` is a NACK-family datagram rather than a media fragment: shorter than a media
 /// header (so every older peer, relay or browser drops it as undersized instead of mistaking it
@@ -535,6 +556,10 @@ mod tests {
         }
         assert_eq!(hex(&r.pack(NACK_TAG_REQUEST)), "e2010203040506070803000000630007 0004".replace(' ', ""));
         assert!(is_nack_datagram(&[NACK_TAG_HELLO]) && is_nack_datagram(&[NACK_TAG_HELLO_ACK]));
+        // The diagnostics tags must look like "undersized, not media" to every older peer too.
+        assert!(is_nack_datagram(&[DIAG_TAG_HELLO]) && is_nack_datagram(&[DIAG_TAG_ACK]));
+        assert!(![NACK_TAG_HELLO, NACK_TAG_HELLO_ACK, NACK_TAG_REQUEST, NACK_TAG_MISS].contains(&DIAG_TAG_HELLO));
+        assert!(![NACK_TAG_HELLO, NACK_TAG_HELLO_ACK, NACK_TAG_REQUEST, NACK_TAG_MISS].contains(&DIAG_TAG_ACK));
         assert_eq!(NackRange::unpack(&[NACK_TAG_HELLO]), None);
         let zero = NackRange { count: 0, ..r }.pack(NACK_TAG_REQUEST);
         assert_eq!(NackRange::unpack(&zero), None);

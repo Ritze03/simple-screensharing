@@ -149,6 +149,19 @@ sway seat has a keyboard (hold one open with `wtype -P Shift_L -s 30000 -p Shift
 "Copy invite link" behaves the same). Tests: `logbuf::tests::*`,
 `ui::tests::copy_logs_puts_the_dump_on_the_clipboard_and_toasts`.
 
+**Settings > Diagnostics > Relay: "Send diagnostics to the relay"** (2026-11-03, task #110; user: "he or all of my
+friends could just tick the checkbox while we are still in heavy development, and then I can just see it.
+Everyone knows this data is being collected."). A checkbox row (`ctrl_row` with the label "Relay", `widgets::checkbox`)
+under the Logs row in the same card; `UiAction::SetSendDiagnostics(bool)` -> `AppState::set_send_diagnostics`
+(persists `AppSettings::send_diagnostics`, default **false**, opt-in; flips `diag_upload::set_enabled`). The
+explanation is the row's tooltip (the styling guide forbids helper text under options): off by default, sends the
+same log text as "Logs" with your display name and no room keys, to the relay of each room you are in, and only a
+relay that supports it receives anything. No UI for the state beyond the checkbox (no "uploading" indicator: the
+upload is a background courtesy, not something to watch). What goes where, cadence and the wire format:
+`architecture/protocol-spec.md` §6.7; the operator's side: `features/relay-transport.md` "Client diagnostics upload".
+Tests: `ui::tests::the_send_diagnostics_checkbox_is_off_by_default_and_persists`, `rooms::tests::send_diagnostics_is_off_by_default`;
+rig: `HS_SEND_DIAG_<n>=1` seeds the setting (`client/scripts/README.md`).
+
 **"Live in <room>" toast fires when a room goes on air, not on Go live** (2026-10-15, task #73).
 `App::poll` compares `Cx::on_air_rooms()` with `Shell.announced_live` (`newly_on_air`): a room
 that is only Starting, or whose start failed (the destination is forgotten and the error toast

@@ -350,9 +350,11 @@ hs_free_port() {
 
 # hs_start_client N WORKSPACE OUTPUT
 hs_start_client() {
-  local n="$1" ws="$2" out="$3" cfg extra_var name_var bin_var extra=() pid i
+  local n="$1" ws="$2" out="$3" cfg extra_var name_var bin_var diag_var extra=() pid i
   cfg="$SCRATCH/cfg$n"; extra_var="CLIENT_ENV_$n"; name_var="HS_NAME_$n"; bin_var="HS_CLIENT_BIN_$n"
-  sss_seed_config "$cfg" "${!name_var:-client-$n}"   # HS_NAME_1/HS_NAME_2 override the display name
+  diag_var="HS_SEND_DIAG_$n"
+  # HS_NAME_1/HS_NAME_2 override the display name; HS_SEND_DIAG_<n>=1 ticks "Send diagnostics to the relay" (#110)
+  SSS_SEND_DIAGNOSTICS="${!diag_var:-}" sss_seed_config "$cfg" "${!name_var:-client-$n}"
   mkdir -p "$SCRATCH/data$n"
   rm -f "$SCRATCH/ui$n.txt"
   [[ -n "${!extra_var:-}" ]] && read -r -a extra <<<"${!extra_var}"

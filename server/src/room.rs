@@ -425,6 +425,8 @@ pub struct Registry {
     pub datagrams_evicting: AtomicU64,
     /// NACK counters and the kill switch (spec §6.6).
     pub nack: NackStats,
+    /// Where opt-in client diagnostics uploads are stored (spec §6.7).
+    pub client_logs: crate::client_logs::ClientLogs,
     pub started_at: std::time::Instant,
     pub listen_addr: std::net::SocketAddr,
     /// Currently open connections that finished the QUIC handshake, by
@@ -444,6 +446,7 @@ impl Registry {
             datagrams_forwarded: AtomicU64::new(0),
             datagrams_evicting: AtomicU64::new(0),
             nack: NackStats::from_env(),
+            client_logs: crate::client_logs::ClientLogs::from_env(),
             started_at: std::time::Instant::now(),
             listen_addr,
             native_connections: Default::default(),

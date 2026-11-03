@@ -47,7 +47,7 @@ Env knobs (all optional): `SCRATCH` (one rig per scratch dir; default per worktr
 `PROFILE` (`release` default; use release for fps), `HS_NO_BUILD=1`, `HS_FPS` (capture output
 refresh, default 240), `HS_PATTERN`, `HS_XDPW`, `HS_PIPEWIRE`, `RUST_LOG`,
 `START_CODEC/START_FPS/START_KBPS` (pre-fill the stream form; the reliable way to set kbps),
-`SSS_LANGUAGE`, `CLIENT_ENV_<n>` (extra env for client n, e.g. a `GST_DEBUG` for the sharer), `HS_NAME_<n>` (display name of client n, default `client-<n>`),
+`SSS_LANGUAGE`, `CLIENT_ENV_<n>` (extra env for client n, e.g. a `GST_DEBUG` for the sharer), `HS_NAME_<n>` (display name of client n, default `client-<n>`), `HS_SEND_DIAG_<n>=1` (client n starts with Settings > Diagnostics > "Send diagnostics to the relay" ticked, #110),
 `HS_RELAY_ENV` (`"A=1 B=2"` for the relay process, e.g. `SSSHARE_NACK=0` for a relay that behaves like one without NACK), `HS_RELAY_BIN` / `HS_CLIENT_BIN_<n>` (run another binary for the relay / client n, e.g. an older build for mixed-version checks, #104).
 
 Input details: pointer = `swaymsg seat - cursor ...` (needs `hs-vptr`). Keys = `wtype`, which

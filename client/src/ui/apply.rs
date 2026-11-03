@@ -365,6 +365,7 @@ impl App {
             UiAction::SetCatchUpSpeed(p) => {
                 self.state.set_catch_up_speed_percent(p);
             }
+            UiAction::SetSendDiagnostics(on) => self.state.set_send_diagnostics(on),
             UiAction::CopyLogs => {
                 ctx.copy_text(simple_screensharing_client::logbuf::dump());
                 self.toast(tr("ui.toast.logs_copied", "Logs copied"), "content_copy");

@@ -26,6 +26,7 @@ pub mod audio;
 pub mod bandwidth;
 pub mod capture;
 pub mod decode;
+pub mod diag_upload;
 #[cfg(test)]
 mod end_to_end_test;
 pub mod fragment;

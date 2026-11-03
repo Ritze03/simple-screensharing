@@ -1619,6 +1619,9 @@ pub struct AppState {
     /// catch-up playback speed (persisted). See
     /// `rooms::AppSettings::catch_up_speed_percent`.
     pub catch_up_speed_percent: u32,
+    /// Settings > Diagnostics > "Send diagnostics to the relay" (persisted, off by default).
+    /// See `rooms::AppSettings::send_diagnostics`, `diag_upload.rs`.
+    pub send_diagnostics: bool,
     /// Rate limiting, hysteresis and last-allocation bookkeeping for
     /// Absolute-Maximum mode. Never persisted: it describes this session's
     /// live encoders.
@@ -1830,6 +1833,10 @@ impl Default for AppState {
         } else {
             whoami_fallback()
         };
+        // The upload loops of every connection read this; a value from the settings file is
+        // "on since startup" (everything the ring holds may go), a later tick only sends what
+        // is logged from then on.
+        crate::diag_upload::set_enabled(settings.send_diagnostics, false);
         Self {
             display_name,
             display_name_set,
@@ -1855,6 +1862,7 @@ impl Default for AppState {
             destination_floor_kbps: settings.destination_floor_kbps,
             max_jitter_buffer_ms: settings.max_jitter_buffer_ms,
             catch_up_speed_percent: settings.catch_up_speed_percent,
+            send_diagnostics: settings.send_diagnostics,
             bandwidth: BandwidthController::new(),
             pending_destinations: Vec::new(),
             recoveries: IndexMap::new(),
@@ -1940,6 +1948,15 @@ pub fn save_max_jitter_buffer_ms(ms: u32) {
     settings.max_jitter_buffer_ms = AppSettings::clamp_max_jitter_buffer_ms(ms);
     if let Err(e) = settings.save() {
         tracing::warn!("failed to save jitter buffer preference: {e:#}");
+    }
+}
+
+/// Persist the "send diagnostics" opt-in (task #110).
+pub fn save_send_diagnostics(on: bool) {
+    let mut settings = AppSettings::load();
+    settings.send_diagnostics = on;
+    if let Err(e) = settings.save() {
+        tracing::warn!("failed to save the send-diagnostics preference: {e:#}");
     }
 }
 
@@ -5045,6 +5062,13 @@ impl AppState {
         self.catch_up_speed_percent = percent;
         save_catch_up_speed_percent(percent);
         percent
+    }
+
+    /// Settings > Diagnostics: start or stop uploading the log to the relays (persisted).
+    pub fn set_send_diagnostics(&mut self, on: bool) {
+        self.send_diagnostics = on;
+        crate::diag_upload::set_enabled(on, true);
+        save_send_diagnostics(on);
     }
 
     /// Absolute-Maximum mode's per-client total, kbit/s (persisted along with

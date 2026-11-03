@@ -7,6 +7,7 @@
 //! the TUI quits ('q') or the process receives Ctrl-C.
 
 mod cert;
+mod client_logs;
 mod diag;
 mod protocol;
 mod relay;
@@ -22,6 +23,9 @@ mod transport_lab;
 
 #[cfg(test)]
 mod nack_tests;
+
+#[cfg(test)]
+mod diag_upload_tests;
 
 #[cfg(test)]
 mod transport_tests;

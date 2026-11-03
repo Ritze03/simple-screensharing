@@ -50,7 +50,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -64,6 +64,7 @@ use crate::protocol::{
     ClientToRelay, ConnId, MAX_CONTROL_FRAME_LEN, MAX_NAME_LEN, MAX_ROOM_MEMBERS,
     MEDIA_FLAG_RETRANSMIT, MediaHeader, Member, NACK_TAG_HELLO, NACK_TAG_HELLO_ACK, NACK_TAG_MISS,
     NACK_TAG_REQUEST, NackRange, StreamKind, is_nack_datagram, PresenceEvent, PreviewHeader, RejectReason, RelayToClient, RoomId,
+    DIAG_TAG_ACK, DIAG_TAG_HELLO, DIAG_UPLOAD_VERSION, MAX_DIAG_BATCH_BYTES, STREAM_TYPE_DIAG,
     STREAM_TYPE_PREVIEW, StreamId, StreamInfo, clamp_utf8, decode_payload, encode_frame,
 };
 use crate::room::{
@@ -386,6 +387,12 @@ pub fn start(
     );
     tokio::spawn(certs.maintain(endpoint.clone(), registry.clone()));
     tokio::spawn(log_nack_stats(registry.clone()));
+    tracing::info!(
+        enabled = registry.client_logs.enabled,
+        dir = crate::client_logs::CLIENT_LOG_DIR,
+        "client diagnostics uploads (SSSHARE_DIAG_UPLOAD=0 turns them off)"
+    );
+    tokio::spawn(crate::client_logs::maintain(registry.clone()));
     tokio::spawn(crate::diag::run(
         Arc::downgrade(&registry),
         crate::diag::DEFAULT_WINDOW,
@@ -847,6 +854,10 @@ async fn connection_loop(
     route_tx: &mpsc::UnboundedSender<RouteUpdate>,
 ) -> Result<()> {
     let mut dropped_datagrams: u64 = 0;
+    // Diagnostics upload (spec §6.7): accepted only from a connection that said DiagHello, one
+    // stream at a time.
+    let mut diag_hello = false;
+    let diag_busy = Arc::new(AtomicBool::new(false));
     loop {
         tokio::select! {
             frame = read_control_frame(ctrl_recv) => {
@@ -864,6 +875,14 @@ async fn connection_loop(
             }
             dgram = connection.read_datagram() => {
                 match dgram {
+                    Ok(bytes) if bytes.as_ref() == [DIAG_TAG_HELLO] => {
+                        // Answered only while uploads are on; an older relay never answers,
+                        // which is how the client knows not to send anything.
+                        if registry.client_logs.enabled {
+                            diag_hello = true;
+                            let _ = connection.send_datagram(Bytes::from_static(&[DIAG_TAG_ACK]));
+                        }
+                    }
                     Ok(bytes) if is_nack_datagram(&bytes) => {
                         handle_nack_datagram(registry, room, conn_id, connection, &bytes).await
                     }
@@ -883,8 +902,9 @@ async fn connection_loop(
             uni = connection.accept_uni() => {
                 match uni {
                     Ok(recv) => {
-                        let room = room.clone();
-                        tokio::spawn(handle_preview_uni(room, conn_id, recv));
+                        let (registry, room) = (registry.clone(), room.clone());
+                        let diag = DiagGate { accepted: diag_hello, busy: diag_busy.clone() };
+                        tokio::spawn(handle_uni(registry, room, conn_id, recv, diag));
                     }
                     Err(e) => {
                         tracing::debug!(conn_id = format!("{conn_id:016x}"), "uni accept error: {e}");
@@ -1189,6 +1209,84 @@ fn enqueue_media_datagram(
     }
 }
 
+/// Whether a diagnostics upload stream may be taken from this connection right now.
+struct DiagGate {
+    /// The connection said `DiagHello` and uploads are on.
+    accepted: bool,
+    /// An upload from this connection is being read; a second one is refused.
+    busy: Arc<AtomicBool>,
+}
+
+/// Clears [`DiagGate::busy`] when the upload is done, however it ends.
+struct BusyGuard(Arc<AtomicBool>);
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Dispatch one client-opened uni stream on its type byte (spec §1): a preview (§7) or a
+/// diagnostics upload (§6.7). Anything else is refused, which is also what an older relay does
+/// with a stream type it does not know.
+async fn handle_uni(
+    registry: Arc<Registry>,
+    room: Arc<Mutex<RoomState>>,
+    conn_id: ConnId,
+    mut recv: RecvStream,
+    diag: DiagGate,
+) {
+    let mut first = [0u8; 1];
+    if recv.read_exact(&mut first).await.is_err() {
+        return;
+    }
+    match first[0] {
+        STREAM_TYPE_PREVIEW => handle_preview_uni(room, conn_id, recv, first[0]).await,
+        STREAM_TYPE_DIAG => handle_diag_uni(registry, room, conn_id, recv, diag).await,
+        other => {
+            tracing::debug!("dropping uni stream with unknown stream type {other:#x}");
+            let _ = recv.stop(0);
+        }
+    }
+}
+
+/// Read one diagnostics batch (spec §6.7) and append it to the connection's file in
+/// `logs/clients`. Silent on refusal: the client simply retries with the next batch.
+async fn handle_diag_uni(
+    registry: Arc<Registry>,
+    room: Arc<Mutex<RoomState>>,
+    conn_id: ConnId,
+    mut recv: RecvStream,
+    diag: DiagGate,
+) {
+    let store = &registry.client_logs;
+    if !store.enabled || !diag.accepted || diag.busy.swap(true, Ordering::AcqRel) {
+        tracing::debug!(conn_id = format!("{conn_id:016x}"), "refusing a diagnostics stream");
+        let _ = recv.stop(0);
+        return;
+    }
+    let _busy = BusyGuard(diag.busy);
+    // The type byte is already consumed: the cap leaves room for it.
+    let data = match recv.read_to_end(MAX_DIAG_BATCH_BYTES - 1).await {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::debug!(conn_id = format!("{conn_id:016x}"), "diagnostics stream read failed: {e}");
+            return;
+        }
+    };
+    let Some((&version, text)) = data.split_first() else { return };
+    if version != DIAG_UPLOAD_VERSION {
+        tracing::debug!("dropping diagnostics batch with unknown version {version}");
+        return;
+    }
+    let name = room.lock().await.connections.get(&conn_id).map(|c| c.display_name.clone()).unwrap_or_default();
+    match store.append(conn_id, &name, text.to_vec()).await {
+        Ok(Ok(path)) => tracing::debug!(conn_id = format!("{conn_id:016x}"), bytes = text.len(), path = %path.display(), "stored client diagnostics"),
+        Ok(Err(why)) => tracing::warn!(conn_id = format!("{conn_id:016x}"), ?why, "dropping client diagnostics: limit reached"),
+        Err(e) => tracing::warn!(conn_id = format!("{conn_id:016x}"), "could not store client diagnostics: {e}"),
+    }
+}
+
 /// Read one preview uni-stream to completion (spec §7.1), cache it as
 /// opaque ciphertext on the stream state, and fan it out to every other
 /// room member (broadcast, no subscription required — previews are the
@@ -1197,9 +1295,11 @@ async fn handle_preview_uni(
     room: Arc<Mutex<RoomState>>,
     sender_conn_id: ConnId,
     mut recv: RecvStream,
+    stream_type: u8,
 ) {
-    let data = match recv.read_to_end(MAX_PREVIEW_BYTES).await {
-        Ok(d) => d,
+    // `handle_uni` already consumed the type byte; the header parse below wants it back.
+    let data = match recv.read_to_end(MAX_PREVIEW_BYTES - 1).await {
+        Ok(rest) => [&[stream_type][..], &rest].concat(),
         Err(e) => {
             tracing::debug!(
                 conn_id = format!("{sender_conn_id:016x}"),
@@ -1327,6 +1427,7 @@ async fn cleanup_connection(
 
     drop(guard);
     registry.drop_room_if_empty(room_id, room).await;
+    registry.client_logs.end(conn_id).await;
     tracing::info!(
         conn_id = format!("{conn_id:016x}"),
         "member left, cleaned up"

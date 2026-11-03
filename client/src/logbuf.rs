@@ -40,24 +40,75 @@ struct Ring {
     bytes: usize,
     max_lines: usize,
     max_bytes: usize,
+    /// Sequence number of `lines[0]`: every line ever pushed gets the next number, so an
+    /// uploader can remember "everything below N is sent" across evictions (task #110).
+    first_seq: u64,
+    /// Sequence number of the newest WARN/ERROR line (the uploader sends early after one).
+    last_warn_seq: Option<u64>,
+}
+
+/// What of the ring a reader that has seen everything below some cursor still has to send.
+#[derive(Debug, PartialEq, Eq)]
+struct Pending {
+    /// Index into the ring's lines of the first line to send.
+    start: usize,
+    /// Wanted lines that are gone (evicted from the ring, or dropped to fit the byte budget).
+    skipped: u64,
+    /// The cursor to continue from once these lines are sent.
+    next: u64,
 }
 
 impl Ring {
     const fn new(max_lines: usize, max_bytes: usize) -> Self {
-        Self { lines: VecDeque::new(), bytes: 0, max_lines, max_bytes }
+        Self { lines: VecDeque::new(), bytes: 0, max_lines, max_bytes, first_seq: 0, last_warn_seq: None }
+    }
+
+    fn next_seq(&self) -> u64 {
+        self.first_seq + self.lines.len() as u64
     }
 
     fn push(&mut self, line: String) {
+        if is_warn_or_error(&line) {
+            self.last_warn_seq = Some(self.next_seq());
+        }
         self.bytes += line.len();
         self.lines.push_back(line);
         // Always keeps the newest line, even one larger than `max_bytes`.
         while self.lines.len() > self.max_lines || (self.bytes > self.max_bytes && self.lines.len() > 1) {
             if let Some(old) = self.lines.pop_front() {
                 self.bytes -= old.len();
+                self.first_seq += 1;
             }
         }
     }
+
+    /// The lines at or after `cursor` that fit `budget` bytes (each counted with its newline),
+    /// newest preferred: when they do not all fit the oldest are skipped. The newest line is
+    /// always kept.
+    fn pending(&self, cursor: u64, budget: usize) -> Pending {
+        let next = self.next_seq();
+        let from = cursor.clamp(self.first_seq, next);
+        let mut start = (from - self.first_seq) as usize;
+        let mut size: usize = self.lines.iter().skip(start).map(|l| l.len() + 1).sum();
+        while size > budget && start + 1 < self.lines.len() {
+            size -= self.lines[start].len() + 1;
+            start += 1;
+        }
+        let kept_from = self.first_seq + start as u64;
+        Pending { start, skipped: kept_from.saturating_sub(cursor.min(next)), next }
+    }
 }
+
+/// Whether a formatted line is at WARN or ERROR level (`<time> WARN target: message`).
+fn is_warn_or_error(line: &str) -> bool {
+    matches!(line.split_whitespace().nth(1), Some("WARN" | "ERROR"))
+}
+
+/// Tests that touch the process-wide ring or the upload switch and then reason about them take
+/// this, so they do not see each other's changes (the `diag_upload` tests here, and a settings
+/// test in the binary crate, hence `pub`).
+#[doc(hidden)]
+pub static TEST_LOCK: Mutex<()> = Mutex::new(());
 
 static RING: Mutex<Ring> = Mutex::new(Ring::new(MAX_LINES, MAX_BYTES));
 /// "key: value" facts for the dump header that only some code knows (GPU, VA driver).
@@ -179,8 +230,8 @@ fn os_description() -> String {
     format!("{} ({})", std::env::consts::OS, std::env::consts::ARCH)
 }
 
-/// What a dump starts with.
-fn header(lines: usize) -> String {
+/// The version / OS / facts block both a dump and an upload start with.
+fn header_top() -> String {
     let commit = env!("SSS_GIT_COMMIT");
     let mut h = format!("Simple Screensharing client log\nversion: {}", env!("CARGO_PKG_VERSION"));
     if !commit.is_empty() {
@@ -192,12 +243,71 @@ fn header(lines: usize) -> String {
             h.push_str(&format!("{k}: {v}\n"));
         }
     }
+    h
+}
+
+const HEADER_RULE: &str = "----------------------------------------\n";
+
+/// What a dump starts with.
+fn header(lines: usize) -> String {
+    let mut h = header_top();
     h.push_str(&format!(
-        "dumped: {}\nlines: {lines} (the most recent; INFO+ from the app, WARN+ from libraries; times are UTC)\n\
-         ----------------------------------------\n",
+        "dumped: {}\nlines: {lines} (the most recent; INFO+ from the app, WARN+ from libraries; times are UTC)\n{HEADER_RULE}",
         now_utc()
     ));
     h
+}
+
+// -------------------------------------------------------------------------------------------
+// Upload to the relay (task #110, `diag_upload.rs`)
+// -------------------------------------------------------------------------------------------
+
+/// Where the next line to be logged will be numbered: the cursor an uploader starts from to
+/// send only what is logged from now on.
+pub fn next_seq() -> u64 {
+    RING.lock().map(|r| r.next_seq()).unwrap_or(0)
+}
+
+/// Whether a WARN/ERROR line at or after `cursor` is waiting.
+pub fn warn_since(cursor: u64) -> bool {
+    RING.lock().is_ok_and(|r| r.last_warn_seq.is_some_and(|s| s >= cursor))
+}
+
+/// The header of an upload session: like a dump's, minus the line count that does not apply.
+pub fn upload_header() -> String {
+    let mut h = header_top();
+    h.push_str(&format!(
+        "session started: {}\ntimes are UTC; INFO+ from the app, WARN+ from libraries\n{HEADER_RULE}",
+        now_utc()
+    ));
+    h
+}
+
+/// Result of [`lines_since`].
+#[derive(Debug, Default)]
+pub struct LineBatch {
+    /// The lines, each newline-terminated.
+    pub text: String,
+    pub lines: usize,
+    /// Wanted lines that are missing (evicted from the ring, or over the byte budget).
+    pub skipped: u64,
+    /// The cursor to continue from after sending this batch.
+    pub next: u64,
+}
+
+/// The log lines with sequence number >= `cursor`, at most `budget` bytes of them (the newest
+/// win).
+pub fn lines_since(cursor: u64, budget: usize) -> LineBatch {
+    let Ok(ring) = RING.lock() else { return LineBatch::default() };
+    let p = ring.pending(cursor, budget);
+    let mut text = String::new();
+    let mut lines = 0;
+    for l in ring.lines.iter().skip(p.start) {
+        text.push_str(l);
+        text.push('\n');
+        lines += 1;
+    }
+    LineBatch { text, lines, skipped: p.skipped, next: p.next }
 }
 
 /// The header and the kept log lines, oldest first.
@@ -257,6 +367,47 @@ mod tests {
     }
 
     #[test]
+    fn pending_lines_follow_the_cursor_across_evictions_and_budgets() {
+        let mut r = Ring::new(4, 1000);
+        for i in 0..3 {
+            r.push(format!("line {i}")); // 6 bytes + newline
+        }
+        assert_eq!(r.next_seq(), 3);
+        // Nothing sent yet: everything, nothing skipped.
+        assert_eq!(r.pending(0, 1000), Pending { start: 0, skipped: 0, next: 3 });
+        // Sent up to 2: only line 2 is new.
+        assert_eq!(r.pending(2, 1000), Pending { start: 2, skipped: 0, next: 3 });
+        // Caught up: nothing.
+        assert_eq!(r.pending(3, 1000), Pending { start: 3, skipped: 0, next: 3 });
+        // The ring wraps (4 lines kept: seq 4..=7): lines 0..=3 are gone.
+        for i in 3..8 {
+            r.push(format!("line {i}"));
+        }
+        assert_eq!((r.first_seq, r.next_seq()), (4, 8));
+        assert_eq!(r.pending(1, 1000), Pending { start: 0, skipped: 3, next: 8 });
+        assert_eq!(r.pending(6, 1000), Pending { start: 2, skipped: 0, next: 8 });
+        // A cursor ahead of the ring (a stale value) is clamped.
+        assert_eq!(r.pending(99, 1000), Pending { start: 4, skipped: 0, next: 8 });
+        // Byte budget: 4 lines x 7 bytes = 28; a budget of 15 keeps the newest two.
+        assert_eq!(r.pending(4, 15), Pending { start: 2, skipped: 2, next: 8 });
+        // Always at least the newest line, however small the budget.
+        assert_eq!(r.pending(4, 1), Pending { start: 3, skipped: 3, next: 8 });
+    }
+
+    #[test]
+    fn warn_and_error_lines_are_noticed() {
+        assert!(is_warn_or_error("2026-11-03T12:00:00.000000Z  WARN simple_screensharing_client::net: x"));
+        assert!(is_warn_or_error("2026-11-03T12:00:00.000000Z ERROR some_lib: x"));
+        assert!(!is_warn_or_error("2026-11-03T12:00:00.000000Z  INFO simple_screensharing_client::net: WARN x"));
+        let mut r = Ring::new(10, 1000);
+        r.push("t  INFO a: b".into());
+        assert_eq!(r.last_warn_seq, None);
+        r.push("t  WARN a: b".into());
+        r.push("t  INFO a: c".into());
+        assert_eq!(r.last_warn_seq, Some(1));
+    }
+
+    #[test]
     fn join_links_lose_their_key() {
         assert_eq!(
             redact("joining relay.example:4433|room1|SECRETKEY|certhash|My%20Room now (ok)"),
@@ -280,6 +431,7 @@ mod tests {
 
     #[test]
     fn the_layer_files_whole_events_redacted_and_filtered() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         use tracing_subscriber::prelude::*;
         let sub = tracing_subscriber::registry().with(layer());
         tracing::subscriber::with_default(sub, || {

@@ -65,6 +65,19 @@ final `end=1` line when a stream or connection ends. All `key=value`, INFO, noth
 Fields and how to read them: `superdoc/features/relay-transport.md` "Diagnostics log". Quick look:
 `grep -h 'diag ' logs/relay.log.*`.
 
+## Client diagnostics uploads
+
+Clients whose user ticked Settings > Diagnostics > "Send diagnostics to the relay" (off by default) upload their
+own log lines here. They land in `logs/clients/<YYYY-MM-DD>/<display-name>-<conn_id>.log` (relative to the working
+directory, so `/var/lib/sss/logs/clients/...` on vogelnest), one file per connection, UTC day of the first batch;
+the connection id is the `conn=` of that client's `diag conn` lines in `logs/relay.log.*`. Caps: 20 MiB per file,
+500 MiB per day directory, directories older than 14 days are deleted (start, then hourly). `SSSHARE_DIAG_UPLOAD=0`
+turns it off (the relay then behaves like one that predates it). Read on the box:
+`ls /var/lib/sss/logs/clients/$(date -u +%F)/` and `less -R` / `tail -f` / `grep` the file. The relay must be
+redeployed for it to work; older relays are unaffected and so are old clients. Wire format and why:
+`superdoc/architecture/protocol-spec.md` §6.7, operator view: `superdoc/features/relay-transport.md`
+"Client diagnostics upload".
+
 Lab: `cargo test --release -p simple-screensharing-server transport_lab -- --ignored --nocapture`
 (see the header of `src/transport_lab.rs`).
 

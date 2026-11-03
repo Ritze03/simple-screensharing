@@ -24,7 +24,7 @@
 //!   recently saved room. `Why:` the lib keeps no "last server" setting, and
 //!   the newest saved room is the last server the user created or joined on.
 //! - **Settings** (`Modal::Settings`, 640): cards Profile / Language / Display /
-//!   Playback / Diagnostics (copy or save the in-memory log, `logbuf`). Text and
+//!   Playback / Diagnostics (copy or save the in-memory log, `logbuf`; opt-in upload to the relay). Text and
 //!   sliders are buffered and pushed when the edit settles
 //!   (focus lost, pointer released), not every frame of a drag, since each
 //!   setter writes `settings.toml`.
@@ -640,6 +640,20 @@ fn settings(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
                         &tr_with("ui.settings.logs_saved", "Saved to %{path}", &[("path", path)]),
                         None,
                     );
+                }
+                let mut send = cx.state.send_diagnostics;
+                let send_label = tr("ui.settings.diag_send", "Send diagnostics to the relay");
+                let r = widgets::ctrl_row(
+                    ui,
+                    &tr("ui.settings.diag_row", "Relay"),
+                    Some(&tr(
+                        "ui.settings.diag_send_tip",
+                        "Off by default. While ticked, the app sends its log lines (the same text as \"Logs\", with your display name, no room keys) to the relay of each room you are in, where the relay owner can read them. Only a relay that supports it receives anything.",
+                    )),
+                    |ui| widgets::checkbox(ui, &mut send, &send_label),
+                );
+                if r.changed() {
+                    cx.act(UiAction::SetSendDiagnostics(send));
                 }
             });
         },

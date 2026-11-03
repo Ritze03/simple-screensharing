@@ -221,6 +221,7 @@ TOML
   {
     echo "language = \"${SSS_LANGUAGE:-en}\""
     echo "display_name = \"$name\""
+    [[ "${SSS_SEND_DIAGNOSTICS:-}" == 1 ]] && echo "send_diagnostics = true"
     if [[ -n "${START_CODEC:-}${START_FPS:-}${START_KBPS:-}" ]]; then
       echo "[start_stream_defaults]"
       [[ -n "${START_FPS:-}" ]] && echo "framerate = $START_FPS"
