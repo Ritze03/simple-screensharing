@@ -2033,6 +2033,14 @@ its *presentation* is bundled.)
   cache) and filters to real `PipeWire:Interface:Node` objects (PipeWire `Client` objects carry
   lookalike `media.class` props); the UI re-lists on open and while the picker stays open. Per-option
   level meters use real per-candidate taps (`start_audio_level_tap`/`poll_audio_level_tap`).
+- **The choice is a name; same-name streams are mixed (#105, 2026-11-03).** `list_audio_sources`
+  returns one entry per display name (first node, used for the meter); `start_audio_sharing` links
+  *every* `Stream/Output/Audio` node with that name into the one loopback input and
+  `audio::link_poll_loop` re-checks every second (links new matches, forgets vanished ones; pure
+  logic in `link_diff`). One loopback, one pipeline, one encoder: nothing restarts. Zero matching
+  streams = a silent share (the capture only ever reads the loopback output, so never the
+  microphone). The choice is not persisted anywhere (`AppState::selected_audio_source` is
+  in-memory), so there is no settings back-compat. Details and *Why*: `features/audio-sharing.md`.
 - **Real playback measurement** (viewer volume 0/100/200 % gave +0.0/+2.7/+6.5 dB at the speakers)
   is recorded with its decorrelated-noise rationale in `superdoc/features/video-pipeline.md`
   ("Audio follows video").

@@ -5,6 +5,42 @@ Audio capture/encode/playback is described where it grew up: `features/stream-co
 video") and the module docs of `client/src/audio.rs` and `client/src/decode.rs`. This page covers
 **keeping the audio aligned with the picture** (task #91, 2026-11-01).
 
+## 2026-11-03: the shared audio is a name; all streams with that name are mixed (task #105)
+
+User request: *"Concise audio streams into streams with the same name only. So we are essentially
+only selecting a string in the UI. Check every second for new streams with the same name, if they
+have the same name, include them in the share (Combining multiple streams)."*
+
+- **Dropdown:** `audio::list_audio_sources` deduplicates by display name (`dedup_by_name`, first
+  node wins, listing order). The `AudioSource` the UI carries is therefore "a name plus a
+  representative node"; only `name` matters to the share. The level meter taps the representative
+  node only (so a name whose first stream is silent but a later one plays shows a quiet meter; the
+  share itself is unaffected).
+- **Start:** `start_audio_sharing` links every node named `source.name` (`node_ids_named`, which
+  uses the same name derivation and the same self-exclusion as the list) into the loopback input.
+  The loopback already sums what is linked into its input, so mixing costs nothing extra.
+- **Every second:** `link_poll_loop` (a tokio task owned by `AudioCaptureHandle`, aborted on
+  stop/drop; `pw-dump` + `pw-link` run on the blocking pool) calls `sync_links`: link matching
+  nodes not yet linked, forget linked ids that vanished (PipeWire removes their links itself). A
+  node that cannot be linked yet (no ports) is simply retried next tick. Nothing but nodes with
+  the chosen name is ever linked.
+- **Zero matches:** the share stays up and silent, and picks the app up when it appears (also
+  after a reconnect restores the share by name). Before, a vanished source failed the start.
+  Safe because the capture pipeline targets only the loopback's output serial and
+  `wait_for_capture_link` still proves that link, so silence can never turn into the microphone
+  (the 2026-07-28 trap in `stream-control.md`).
+- **Why a name and not ids:** apps (browsers, games, Spotify, Discord) come and go and often hold
+  several streams under one name; a node id is gone with the track or tab.
+- **Not covered:** a half-linked node (FL linked, FR `pw-link` failed) is retried and then fails
+  forever on the duplicate FL link; rare, logged at debug level. Two *different* apps that share a
+  display name are mixed too (that is the requested definition of "same name").
+- **Persistence:** none to migrate. The selection lives in `AppState::selected_audio_source` /
+  `StagedShare::audio` and was never written to a settings file.
+- **Tests:** unit only (the no-audio rule): `audio::tests::dropdown_lists_each_name_once_*`,
+  `a_name_matches_all_its_output_streams_and_nothing_else`, `link_diff_adds_new_matches_*`. The
+  real mixing (several live streams, a stream appearing/vanishing during a share) was not tested
+  here and has to be checked by the user on a real PipeWire.
+
 ## 2026-11-02: viewer volume goes up to 500 % (task #96)
 
 User request: *"Let users adjust up to 500% volume when watching."* The per-tile volume control
