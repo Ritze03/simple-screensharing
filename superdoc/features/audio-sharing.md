@@ -111,6 +111,11 @@ Bad 0.5 s windows per phase (`phases.py`, `analyze.py`'s criteria: within 15 Hz 
 | `vanish` (node destroyed and re-created, #117) | 3/15, 4/15, 2/15 (rebuilds) | 0/15, 3/15, 2/15 (plain link) |
 | `flap` 10 x 2.2 s at 44.1k, then 20 s | - | last 20 s 5/43 (sink monitor 4/43), 0 `GAP` |
 
+**Arch VM, PipeWire 1.6.10 / GStreamer 1.28.8 (exactly the host's versions):** `probe.py` with `pipewireclock0`:
+quantum 1024 -> 256 drops the capture to ~24 000 samples/s for good, rate 44100 -> 48000 to ~6 100/s for good; with
+the system clock 47 800-48 100 throughout. The #128 build: `graph` 1/15, 1/15, 1/15, 1/23 (3 `GAP`s), `pause` at
+44.1 kHz 2/17, 1/17, 1/17 (0 `GAP`s), 48-52 pkt/s; the sink monitor 0-1 per phase.
+
 Sent audio (`pktdump.py` of `sent-*.pkt`, decoded back to back) with #128: at the sink monitor's level in every
 scenario (0-3 per phase; the last phase also holds the end of the stream).
 
@@ -135,8 +140,9 @@ use a stub with a real 20 ms TOC byte (`0xF8`).
   change fine; the GStreamer clock did not. Its `priority.driver=3000` experiment worked because with our sink always
   the driver the capture's clock never stepped. The idle -> running rebuild is removed.
 
-**Not verified:** the user's own host (real ALSA at 44.1 kHz, EasyEffects, Floorp, a viewer elsewhere); the Arch VM;
-the browser viewer against the fixed sender. **Same pattern elsewhere, not changed:** the video capture pipelines
+**Not verified:** the user's own host (real ALSA at 44.1 kHz, EasyEffects, Floorp, a viewer elsewhere); the browser
+viewer against the fixed sender. If it still breaks there: run sharer and viewer with `SSS_AUDIO_DUMP=<dir>` and
+compare `pktdump.py sent-*.pkt` (what was sent), `recv-*.pkt` and `play-*.log` (how many `gap` lines). **Same pattern elsewhere, not changed:** the video capture pipelines
 (`capture.rs`) also run on their `pipewiresrc`'s clock; a screencast's driver is the portal node and does not switch
 rate, but if a video stream ever starves after a portal renegotiation, try the same one-liner first (whether #122's
 "out of buffers" has anything to do with it was not checked).
