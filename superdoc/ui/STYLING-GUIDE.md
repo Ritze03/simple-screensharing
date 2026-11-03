@@ -71,7 +71,7 @@ Vocabulary: **vbox** = `ui.vertical` / a card or well frame (frames only paint a
   (card/tile grid), `modal_shell` / `modal_frame` / `modal_footer`.
 - Controls (`controls.rs`): `Btn` (primary/secondary/danger/danger_solid/ghost, icons,
   `large`), `icon_btn`, `Pill`, `status_dot`, `avatar`, `meter`, `segmented`, `checkbox`,
-  `radio`, `slider` (`slider_detent` adds a tick + snap, used by the volume slider), `value_box`, `num_box`, `readout`, `select`, `text_field`,
+  `radio`, `slider` (`slider_detent` adds a tick + snap, used by the volume slider; `wheel_notches` counts and consumes the mouse wheel over a response, the volume slider steps with it), `value_box`, `num_box`, `readout`, `select`, `text_field`,
   `collapser`, `heading`, `banner`, `info_tip`, `chip_dark`, `vsep`.
 - Painting (`paint.rs`): text/icon/gradient/hatch/dashed/glow primitives.
 - **Debugging**: `widgets::set_debug_slots(ctx, true)` outlines every vbox/hbox/slot and

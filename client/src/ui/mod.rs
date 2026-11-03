@@ -858,12 +858,39 @@ pub fn paired_audio(state: &AppState, capture: CaptureSourceId) -> Option<Captur
 /// 110 px wide for 0-500 % (~5.2 %/px), so +-10 % is a ~4 px wide target.
 const VOLUME_DETENT_SNAP: f64 = 10.0;
 
+/// One mouse-wheel step of the viewer volume: 5 % up to 200 %, 10 % above it, always
+/// landing on a multiple of the step and clamped to 0-500 %. The step is the one of
+/// the segment being *entered*: 195 -> 200 -> 210 up, 210 -> 200 -> 195 down.
+/// Passes through the 100 % detent like any other value (95 -> 100 -> 105).
+pub fn wheel_step(percent: u32, up: bool) -> u32 {
+    let max = simple_screensharing_client::session::MAX_VOLUME_PERCENT;
+    if up {
+        let step = if percent >= 200 { 10 } else { 5 };
+        ((percent / step + 1) * step).min(max)
+    } else {
+        let step = if percent > 200 { 10 } else { 5 };
+        (percent.saturating_sub(1) / step) * step
+    }
+}
+
 /// The viewer volume slider shared by the tile pill and the pop-out window:
-/// 0-500 % in steps of 5, with a tick and a snap at 100 % (the default).
+/// 0-500 % in steps of 5, with a tick and a snap at 100 % (the default), and the
+/// mouse wheel over it steps the value ([`wheel_step`]; the wheel does not also
+/// scroll the panel underneath). Task #113, user: "make sure to make the volume
+/// slider scrollable (5% steps, above 200% it should be 10%."
 pub fn volume_slider(ui: &mut Ui, percent: &mut u32) -> egui::Response {
     let at = f64::from(simple_screensharing_client::session::DEFAULT_VOLUME_PERCENT);
     let max = simple_screensharing_client::session::MAX_VOLUME_PERCENT;
-    widgets::slider_detent(ui, percent, 0..=max, 5.0, Some((at, VOLUME_DETENT_SNAP)))
+    let mut resp = widgets::slider_detent(ui, percent, 0..=max, 5.0, Some((at, VOLUME_DETENT_SNAP)));
+    let notches = widgets::wheel_notches(ui, &resp);
+    let before = *percent;
+    for _ in 0..notches.unsigned_abs() {
+        *percent = wheel_step(*percent, notches > 0);
+    }
+    if *percent != before {
+        resp.mark_changed();
+    }
+    resp
 }
 
 /// `t!(key)` in the current locale, or `en` when the locale files have no

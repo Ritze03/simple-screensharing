@@ -50,6 +50,36 @@ export const pct = (inp) => inp.style.setProperty("--pct", ((inp.value - inp.min
 export const VOLUME_MAX_PCT = 500;
 export const VOLUME_SNAP_PCT = 10;
 export const snapVolumePct = (v) => (Math.abs(v - 100) <= VOLUME_SNAP_PCT ? 100 : v);
+/** One mouse-wheel step of the tile volume (task #113): 5 % up to 200 %, 10 % above it, landing on a multiple of the
+ *  step and clamped to 0-500 %. The step is the one of the segment being entered: 195 -> 200 -> 210 up, 210 -> 200 -> 195
+ *  down. Mirrors the native `ui::wheel_step`; no detent (95 -> 100 -> 105). */
+export const wheelStepVolumePct = (v, up) => {
+  if (up) {
+    const s = v >= 200 ? 10 : 5;
+    return Math.min(VOLUME_MAX_PCT, (Math.floor(v / s) + 1) * s);
+  }
+  const s = v > 200 ? 10 : 5;
+  return Math.floor(Math.max(v - 1, 0) / s) * s;
+};
+/** Make the mouse wheel step a volume range input and fire its `input` event (so the normal handler runs). The wheel is
+ *  consumed (preventDefault, needs a non-passive listener) so the page under the slider does not scroll. One notch
+ *  (|deltaY| ~100, or deltaMode lines) is one step; smaller touchpad deltas accumulate to half a notch first. */
+export function volumeWheel(slider) {
+  let acc = 0;
+  slider.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    acc += e.deltaMode === 0 ? e.deltaY : e.deltaY * 33;
+    if (Math.abs(acc) < 50) return;
+    let n = Math.max(1, Math.round(Math.abs(acc) / 100));
+    const up = acc < 0; // wheel up / away from the user = negative deltaY = louder
+    acc = 0;
+    while (n-- > 0) slider.value = String(wheelStepVolumePct(Number(slider.value), up));
+    const ev = new Event("input", { bubbles: true });
+    ev.fromWheel = true; // the handler skips the 100 % detent for these: 100 -> 105 must not snap back to 100
+    slider.dispatchEvent(ev);
+  }, { passive: false });
+  return slider;
+}
 export const fmtKbps = (k) => (k >= 1000 ? (k / 1000).toFixed(1) + " Mbps" : Math.round(k) + " kbps");
 
 export const LABEL_W = 120;

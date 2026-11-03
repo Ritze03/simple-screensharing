@@ -12,7 +12,7 @@ import { deriveCodecString, sniffCodec } from "../js/core/codec.js";
 import { DECODE_QUEUE_CATCHUP_THRESHOLD, JitterBuffer, MAX_DECODE_QUEUE, clampCatchUpSpeedPercent, clampMaxJitterBufferMs } from "../js/core/jitter.js";
 import { CanvasRenderer, VideoReceiver } from "../js/core/video-rx.js";
 import { ENCODER_PRESETS } from "../js/core/video-tx.js";
-import { avatarBg, avatarColors, avatarHue, snapVolumePct, VOLUME_MAX_PCT } from "../js/ui/dom.js";
+import { avatarBg, avatarColors, avatarHue, snapVolumePct, wheelStepVolumePct, volumeWheel, VOLUME_MAX_PCT } from "../js/ui/dom.js";
 import { AudioReceiver, MAX_VOLUME } from "../js/core/audio.js";
 
 const tests = [];
@@ -1028,6 +1028,53 @@ test("volume: gain goes up to 500 %, the UI cap matches the core cap, 100 % stay
 test("volume: the slider's 100 % detent snaps within 10 and leaves everything else alone", () => {
   for (const v of [90, 95, 100, 105, 110]) eq(snapVolumePct(v), 100);
   for (const v of [0, 85, 115, 200, 500]) eq(snapVolumePct(v), v);
+});
+
+test("volume: wheel step is 5 up to 200 %, 10 above, symmetric at the boundary, clamped (#113)", () => {
+  for (const [from, up, to] of [[0, true, 5], [95, true, 100], [100, true, 105], [195, true, 200], [200, true, 210], [205, true, 210],
+    [490, true, 500], [500, true, 500], [500, false, 490], [220, false, 210], [210, false, 200], [205, false, 200], [200, false, 195],
+    [105, false, 100], [5, false, 0], [0, false, 0]]) eq(wheelStepVolumePct(from, up), to, `${from} ${up ? "up" : "down"}`);
+  for (let p = 0; p < 500; p += 5) if (p <= 195 || p % 10 === 0) eq(wheelStepVolumePct(wheelStepVolumePct(p, true), false), p, "up then down at " + p);
+});
+
+test("volume: wheel events on the slider step it, fire input, are consumed and do not snap to 100 (#113)", () => {
+  const s = document.createElement("input");
+  Object.assign(s, { type: "range", min: "0", max: "500", step: "5", value: "195" });
+  document.body.appendChild(s);
+  const seen = [];
+  s.addEventListener("input", (ev) => seen.push([s.value, !!ev.fromWheel]));
+  volumeWheel(s);
+  const wheel = (deltaY, deltaMode = 0) => {
+    const e = new WheelEvent("wheel", { deltaY, deltaMode, bubbles: true, cancelable: true });
+    s.dispatchEvent(e);
+    return e.defaultPrevented;
+  };
+  try {
+    eq(wheel(-100), true, "wheel is consumed (no page scroll)");
+    eq(s.value, "200");
+    wheel(-120);
+    eq(s.value, "210");
+    wheel(100);
+    eq(s.value, "200");
+    wheel(100);
+    eq(s.value, "195");
+    wheel(3, 1); // Firefox line mode: one notch = 3 lines
+    eq(s.value, "190");
+    wheel(-20);
+    eq(s.value, "190", "a small touchpad delta accumulates first");
+    wheel(-40);
+    eq(s.value, "195", "...until it adds up to half a notch");
+    s.value = "95";
+    wheel(-100);
+    wheel(-100);
+    eq(s.value, "105", "95 -> 100 -> 105 passes through the detent");
+    eq(seen.every(([, fromWheel]) => fromWheel), true, "input events carry the wheel flag");
+    s.value = "500";
+    wheel(-100);
+    eq(s.value, "500", "clamped at the top");
+  } finally {
+    s.remove();
+  }
 });
 
 // ------------------------------------------------------------------------------------------------ runner
