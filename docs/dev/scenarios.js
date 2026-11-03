@@ -262,7 +262,7 @@ scenario("static screen (no new frames at all): a new viewer still gets a keyfra
   return { timeToFirstFrameMs: ttfMs, keepaliveKeyframes: share.stats().keepaliveKeyframes };
 });
 
-scenario("audio follows video; volume 0-200 % and mute", async () => {
+scenario("audio follows video; volume 0-500 % and mute", async () => {
   const room = newRoom();
   const a = await client(room.link, "sharer");
   const b = await client(room.link, "viewer");
@@ -280,8 +280,8 @@ scenario("audio follows video; volume 0-200 % and mute", async () => {
   ok(share.audioSubscribers === 1, "sender sees audio subscriber");
   b.setVolume(v.key, 0.5);
   ok(b.watchStats(au.key).volume === 0.5, "volume applies via the video key");
-  b.setVolume(au.key, 3);
-  ok(b.watchStats(au.key).volume === 2, "clamped to 200 %");
+  b.setVolume(au.key, 9);
+  ok(b.watchStats(au.key).volume === 5, "clamped to 500 %");
   b.setMuted(v.key, true);
   ok(b.watchStats(au.key).muted === true, "mute");
   b.setVolume(au.key, 1.5);
@@ -344,8 +344,8 @@ scenario("peer with the wrong room key: nothing decodes, nothing crashes", async
 
 scenario("packet loss: viewer waits for a keyframe, asks for one (resubscribe), and recovers", async () => {
   const room = newRoom();
-  const a = await client(room.link, "sharer");
-  const b = await client(room.link, "viewer");
+  const a = await client(room.link, "sharer", { nack: false }); // the legacy path: drop and recover by keyframe (NACK has its own scenarios below)
+  const b = await client(room.link, "viewer", { nack: false });
   const src = makePatternSource(640, 360, 30);
   const share = await a.startShare({ stream: src.stream, fps: 30, bitrateKbps: 2000, gopMs: 30_000 });
   const st = await waitFor(() => streamOf(b, a), 5000, "stream");
@@ -370,6 +370,96 @@ scenario("packet loss: viewer waits for a keyframe, asks for one (resubscribe), 
   ok(b.watchStats(st.key).decoderErrors === 0, "no fatal decoder errors");
   src.stop();
   return { lossEvents: lossy.lossEvents, skippedDeltas: b.watchStats(st.key).skippedDeltas };
+});
+
+// ---- NACK (spec §6.6, #111): needs a relay that speaks it (any build from #104 on) ----
+
+/** Share a 640x360 stream at ~1 big IDR + deltas, return what a NACK scenario needs. */
+async function nackPair() {
+  const room = newRoom();
+  const a = await client(room.link, "sharer");
+  const b = await client(room.link, "viewer");
+  await waitFor(() => a.nackAcked && b.nackAcked, 4000, "HelloAck on both clients (the relay speaks NACK)");
+  ok(b.reassembler.nack, "the viewer's reassembler is in NACK mode after the ack");
+  const src = makePatternSource(1280, 720, 30, { detail: 2 }); // static noise texture: ~100 kB IDRs, i.e. many fragments
+  const share = await a.startShare({ stream: src.stream, fps: 30, bitrateKbps: 4000, gopMs: 1000 });
+  const st = await waitFor(() => streamOf(b, a), 5000, "stream");
+  b.watch(st.key, { canvas: document.body.appendChild(document.createElement("canvas")) });
+  await waitFor(() => (b.watchStats(st.key) || {}).decoded > 20, 8000, "decoding");
+  return { a, b, st, src, share };
+}
+
+scenario("nack: Hello is acknowledged, a client with NACK off never is", async () => {
+  const room = newRoom();
+  const on = await client(room.link, "on");
+  const off = await client(room.link, "off", { nack: false });
+  await waitFor(() => on.nackAcked, 4000, "HelloAck");
+  await sleep(1500);
+  ok(!off.nackAcked && !off.reassembler.nack, "no Hello, no ack, legacy reassembly");
+  ok(on.nackStats().active && !off.nackStats().active);
+});
+
+scenario("nack: relay -> viewer loss is repaired from the relay's cache, with no loss event", async () => {
+  const { b, st, src } = await nackPair();
+  const lossBefore = b.watchStats(st.key).lossEvents;
+  const sess = b.session;
+  const orig = sess.onDatagram;
+  let dropped = 0;
+  sess.onDatagram = (d) => {
+    if (d.length > 19 && Math.random() < 0.03) dropped++;
+    else orig(d);
+  };
+  await sleep(5000);
+  sess.onDatagram = orig;
+  const n = b.nackStats();
+  const lost = b.watchStats(st.key).lossEvents - lossBefore;
+  ok(dropped > 20, `datagrams were dropped (${dropped})`);
+  ok(n.requests > 0 && n.fragmentsRecovered > 0 && n.framesRecovered > 0, `fragments were requested and repaired ${JSON.stringify(n)}`);
+  ok(n.framesRecovered > 3 * lost, `most lossy frames were repaired (${n.framesRecovered} repaired, ${lost} loss events)`);
+  ok(b.watchStats(st.key).decoderErrors === 0, "no decoder errors");
+  src.stop();
+  return { dropped, nack: n, lossEvents: lost };
+});
+
+scenario("nack: sharer -> relay loss is repaired from the sharer's send ring (relay cache miss, request forwarded)", async () => {
+  const { a, b, st, src } = await nackPair();
+  const lossBefore = b.watchStats(st.key).lossEvents;
+  const sess = a.session;
+  const orig = sess.sendDatagram.bind(sess);
+  let dropped = 0;
+  sess.sendDatagram = (d) => {
+    if (d.length > 19 && !(d[1] & 4) && Math.random() < 0.03) dropped++; // first transmissions only; re-sends carry the retransmit flag
+    else orig(d);
+  };
+  await sleep(5000);
+  sess.sendDatagram = orig;
+  const n = b.nackStats();
+  const served = a.nackStats().served;
+  const lost = b.watchStats(st.key).lossEvents - lossBefore;
+  ok(dropped > 20, `datagrams were dropped before the relay (${dropped})`);
+  ok(served.requests > 0 && served.resent > 0, `the sharer was asked and re-sent ${JSON.stringify(served)}`);
+  ok(n.framesRecovered > 0, `the viewer completed frames after asking ${JSON.stringify(n)}`);
+  ok(n.framesRecovered > 3 * lost, `most lossy frames were repaired (${n.framesRecovered} repaired, ${lost} loss events)`);
+  src.stop();
+  return { dropped, viewer: n, served, lossEvents: lost };
+});
+
+scenario("nack: a total blackout towards the viewer gives up after the retries and recovers by keyframe", async () => {
+  const { a, b, st, src, share } = await nackPair();
+  const sess = b.session;
+  const orig = sess.onDatagram;
+  sess.onDatagram = (d) => {
+    if (d.length < 19) orig(d); // NACK answers still arrive (they will be Misses or useless), media does not
+  };
+  await sleep(700);
+  sess.onDatagram = orig;
+  const keysBefore = share.stats().keyframes;
+  const decodedBefore = b.watchStats(st.key).decoded;
+  await waitFor(() => !b.watchStats(st.key).needKeyframe && b.watchStats(st.key).decoded > decodedBefore + 15, 8000, "decoder healthy again");
+  ok(b.reassembler.nack && !b.reassembler.hasPending() || (await waitFor(() => !b.reassembler.hasPending(), 3000, "no frame left waiting")), "nothing stays pending");
+  ok(b.watchStats(st.key).decoderErrors === 0, "no fatal decoder errors");
+  src.stop();
+  return { extraKeyframes: share.stats().keyframes - keysBefore };
 });
 
 scenario("stream stopping under a viewer cleans up (watch-ended, no leaked subscriptions)", async () => {

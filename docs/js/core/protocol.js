@@ -15,6 +15,8 @@ export const STREAM_TYPE_PREVIEW = 0x01;
 export const MEDIA_HEADER_LEN = 19;
 export const MEDIA_FLAG_KEYFRAME = 0b01;
 export const MEDIA_FLAG_STALLED = 0b10;
+/** A re-send answering a NACK (spec §6.6): the datagram is otherwise byte-identical to the original. */
+export const MEDIA_FLAG_RETRANSMIT = 0b100;
 export const PREVIEW_HEADER_LEN = 15;
 export const MAX_MEDIA_DATAGRAM_LEN = 1000;
 export const WEBTRANSPORT_PATH = "/ssshare";
@@ -305,6 +307,44 @@ export function unpackMediaHeader(bytes) {
     },
     payload: bytes.subarray(MEDIA_HEADER_LEN),
   };
+}
+
+// ---------------------------------------------------------------------
+// NACK datagrams (spec §6.6, task #104/#111): shorter than a media header and tagged >= 0xE0, so every
+// older peer drops them as "undersized".
+// ---------------------------------------------------------------------
+
+export const NACK_TAG_HELLO = 0xe0; // client -> relay, 1 byte: "I speak NACK"
+export const NACK_TAG_HELLO_ACK = 0xe1; // relay -> client, 1 byte
+export const NACK_TAG_REQUEST = 0xe2; // viewer -> relay, relay -> owner, 18 bytes
+export const NACK_TAG_MISS = 0xe3; // relay -> viewer, 18 bytes
+export const NACK_DATAGRAM_LEN = 18;
+
+/** A NACK-family datagram rather than a media fragment (mirrors `protocol::is_nack_datagram`). */
+export function isNackDatagram(bytes) {
+  return bytes.length < MEDIA_HEADER_LEN && bytes.length > 0 && bytes[0] >= NACK_TAG_HELLO;
+}
+
+/** Request / Miss: `tag u8 | conn_id u64 | stream_id u8 | frame_id u32 | first u16 | count u16`, big-endian. */
+export function packNackRange(tag, { connId, streamId, frameId, first, count }) {
+  const out = new Uint8Array(NACK_DATAGRAM_LEN);
+  const dv = new DataView(out.buffer);
+  out[0] = tag;
+  dv.setBigUint64(1, connId, false);
+  out[9] = streamId;
+  dv.setUint32(10, frameId, false);
+  dv.setUint16(14, first, false);
+  dv.setUint16(16, count, false);
+  return out;
+}
+
+/** Parse a Request or Miss; null for anything else (wrong tag/length, count 0). */
+export function unpackNackRange(bytes) {
+  if (bytes.length !== NACK_DATAGRAM_LEN || (bytes[0] !== NACK_TAG_REQUEST && bytes[0] !== NACK_TAG_MISS)) return null;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const count = dv.getUint16(16, false);
+  if (count === 0) return null;
+  return { tag: bytes[0], connId: dv.getBigUint64(1, false), streamId: bytes[9], frameId: dv.getUint32(10, false), first: dv.getUint16(14, false), count };
 }
 
 export function packPreviewHeader({ connId, streamId, counter }) {

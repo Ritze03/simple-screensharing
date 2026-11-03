@@ -553,7 +553,7 @@ frontend and is kept as history.
 - Desktop client's window layout — behavioral rules (sidebar, ROOMS/Outgoing sections, room-row states, empty states) → `superdoc/ui/APP-SHELL.md`; code map → the `ui/` row of the module map above and `client/src/ui/mod.rs`'s module doc. (`superdoc/ui/FRONTEND-SHELL.md` documents the removed HTML frontend: history only.)
 - Desktop client's render presentation-mode (vsync/Immediate/Mailbox) setting → `superdoc/features/presentation-modes.md`
 - Sharer's own-tile live preview (native + browser, focus-gated) → `superdoc/features/self-preview.md`
-- Selective retransmission (NACK) of lost media fragments, relay cache, sender ring, compatibility → `protocol-spec.md` §6.6, `superdoc/features/video-pipeline.md` "Selective retransmission"
+- Selective retransmission (NACK) of lost media fragments, relay cache, sender ring, compatibility → `protocol-spec.md` §6.6, `superdoc/features/video-pipeline.md` "Selective retransmission" ; browser side (`docs/js/core/nack.js`, `Reassembler` NACK mode, #111) → `superdoc/features/website.md` "Selective retransmission in the browser"
 - QUIC congestion control / datagram eviction / idle timeout of relay and native client, loss and narrow-link behaviour → `superdoc/features/relay-transport.md`
 - Per-destination state machine, wire-PTS continuity, stall protocol, three-tier change model → "Per-destination lifecycle" above, and `capture.rs`'s `destination`/`branch` submodules
 - Multi-destination fan-out, stream transfer between rooms, the two bandwidth modes, the allocator's live wiring, and the live encoder-tuning controls (Tune/Quality Level/Rate Control) → `superdoc/features/stream-control.md`
