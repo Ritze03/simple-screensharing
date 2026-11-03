@@ -340,7 +340,7 @@ pub enum DestAction {
 /// `[18 icon][fill name note][pill: max(84, its width)][76 kbps][32 ×]`.
 ///
 /// Too narrow for that plus [`DEST_NAME_MIN`] of name (the real stream-settings
-/// modal never is: at the 960 px minimum window its column is ~400 px; a
+/// modal never is: at the 800 px minimum window its single column is ~700 px; a
 /// sidebar-width card is), the row goes compact: `[18][fill name][pill][32 ×]`
 /// with the pill slot only as wide as the pill, no note, and the name + rate
 /// in the row's tooltip, so the name keeps some room and the × is never clipped.

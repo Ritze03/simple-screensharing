@@ -221,7 +221,7 @@ pub fn show_header(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
     };
     let copy_tip_on = if joined.is_none() { format!("{copy_lbl}\n{copy_tip}") } else { copy_lbl.clone() };
     let leave_tip_on = format!("{leave_lbl}\n{leave_tip}");
-    // Narrow windows (960 px minimum: the band is ~656 px): the lowest level
+    // Narrow windows (800 px minimum: the band is ~496 px): the lowest level
     // whose controls leave the title its name (≥ TITLE_NAME_MIN), pill and,
     // below level 2, the whole meta line. Each level keeps the ones before:
     // 1 Copy invite link → icon (it is also in the ⋯ menu), 2 meta line
@@ -838,6 +838,8 @@ fn tile_overlay(ui: &mut Ui, cx: &Cx, st: &mut RoomState, key: StreamKey, rect: 
 /// content-sized up to `cell`'s width (the name truncates). The numbers sit in
 /// fixed tabular-width slots so the bar doesn't jitter as they change. Hover
 /// shows decoded vs presented fps (presentation must keep up with decode).
+/// In a narrow tile ([`statbar_fields`]) the resolution and then the bitrate
+/// leave the bar for the tooltip instead of being cut off mid-number.
 fn statbar(ui: &mut Ui, cx: &Cx, key: StreamKey, cell: Rect, cross_room: bool) {
     let Some(entry) = cx.videos.get(key) else { return };
     let stats = entry.view.lock().unwrap().source().stats();
@@ -855,7 +857,9 @@ fn statbar(ui: &mut Ui, cx: &Cx, key: StreamKey, cell: Rect, cross_room: bool) {
     let mf = font(Weight::Mono, theme::FS_SMALL);
     let ch = text_width(ui, "0", mf.clone(), 0.0);
     let (res_w, fps_w, rate_w) = (text_width(ui, &res, mf.clone(), 0.0).ceil(), (6.0 * ch).ceil(), (8.0 * ch).ceil());
-    let fixed_w = 10.0 + 7.0 + theme::S2 + theme::S2 + res_w + theme::S2 + fps_w + theme::S2 + rate_w + 10.0;
+    let (show_res, show_rate) = statbar_fields(cell.width(), res_w, fps_w, rate_w);
+    let (res_w, rate_w) = (if show_res { res_w } else { 0.0 }, if show_rate { rate_w } else { 0.0 });
+    let fixed_w = statbar_fixed_w(res_w, fps_w, rate_w);
     let name_w = text_width(ui, &name, nf.clone(), 0.0).ceil().min((cell.width() - fixed_w).max(0.0));
     let w = (fixed_w + name_w).min(cell.width());
     let bar = Rect::from_min_size(cell.min, vec2(w, OVL_H));
@@ -876,10 +880,23 @@ fn statbar(ui: &mut Ui, cx: &Cx, key: StreamKey, cell: Rect, cross_room: bool) {
     child.painter().circle_filled(c, 3.5, dot);
     let num = Color32::from_rgba_unmultiplied(232, 233, 236, 217);
     row.text(&child, 1, &name, nf, theme::TEXT, Align::Min);
-    row.text(&child, 2, &res, mf.clone(), num, Align::Min);
+    if show_res {
+        row.text(&child, 2, &res, mf.clone(), num, Align::Min);
+    }
     row.text(&child, 3, &fps, mf.clone(), num, Align::Max);
-    row.text(&child, 4, &rate, mf, num, Align::Max);
+    if show_rate {
+        row.text(&child, 4, &rate, mf, num, Align::Max);
+    }
     row.response.on_hover_ui(|ui| {
+        // What a narrow bar left out, so it is still one hover away.
+        let hidden: Vec<&str> = [(!show_res).then_some(res.as_str()), (!show_rate).then_some(rate.as_str())]
+            .into_iter()
+            .flatten()
+            .filter(|t| !t.is_empty())
+            .collect();
+        if !hidden.is_empty() {
+            ui.label(hidden.join(" · "));
+        }
         let codec = stats.info.codec.map(|c| c.name()).unwrap_or("—");
         let dec = stats.info.decoder_name.as_deref().unwrap_or("—");
         ui.label(tr_with(
@@ -894,6 +911,28 @@ fn statbar(ui: &mut Ui, cx: &Cx, key: StreamKey, cell: Rect, cross_room: bool) {
             ],
         ));
     });
+}
+
+/// Width of the statbar without its name: pads 10+10, the 7 px dot and a gap
+/// 8 before every following slot (a 0-wide slot keeps its gap; harmless).
+fn statbar_fixed_w(res_w: f32, fps_w: f32, rate_w: f32) -> f32 {
+    10.0 + 7.0 + theme::S2 + theme::S2 + res_w + theme::S2 + fps_w + theme::S2 + rate_w + 10.0
+}
+
+/// Which optional statbar numbers fit `cell_w`, as `(resolution, bitrate)`;
+/// fps always stays. `Why` this order: at the 800 px minimum window (PR #4)
+/// a room tile is ~264 px and its statbar cell ~178 px, too narrow for
+/// `1920x1080 30fps 7.6 Mbps`, which was cut mid-number. The resolution
+/// changes least (the share card shows it too), the received bitrate is
+/// next, fps is the health signal. Hidden values move into the tooltip.
+fn statbar_fields(cell_w: f32, res_w: f32, fps_w: f32, rate_w: f32) -> (bool, bool) {
+    if statbar_fixed_w(res_w, fps_w, rate_w) <= cell_w {
+        (true, true)
+    } else if statbar_fixed_w(0.0, fps_w, rate_w) <= cell_w {
+        (false, true)
+    } else {
+        (false, false)
+    }
 }
 
 /// `.round-btn`: 29 px circle, translucent dark fill, faint white ring,
@@ -1431,6 +1470,17 @@ mod tests {
         // Columns never get narrower than a grid column; no fit → scroll.
         let (c, w) = grid_shape(9, 800.0, 100.0, 12.0);
         assert!(w >= MIN_TILE_W && c >= 1, "{c} {w}");
+    }
+
+    #[test]
+    fn statbar_drops_resolution_then_bitrate_when_narrow() {
+        // Roughly the real widths: res "1920x1080" 80, fps 6ch 42, rate 8ch 56.
+        let full = statbar_fixed_w(80.0, 42.0, 56.0);
+        assert_eq!(statbar_fields(full + 40.0, 80.0, 42.0, 56.0), (true, true));
+        assert_eq!(statbar_fields(full - 1.0, 80.0, 42.0, 56.0), (false, true));
+        // The 800 px window's room tile (~178 px statbar cell) keeps fps + bitrate.
+        assert_eq!(statbar_fields(178.0, 80.0, 42.0, 56.0), (false, true));
+        assert_eq!(statbar_fields(120.0, 80.0, 42.0, 56.0), (false, false));
     }
 
     #[test]

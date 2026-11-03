@@ -553,7 +553,8 @@ async fn joining_a_bad_link_reports_inline_and_starts_nothing() {
 }
 
 /// The shell geometry the spec pins: sidebar 272, people 232, every band 56,
-/// the user band and the action band on one line, at three window sizes.
+/// the user band and the action band on one line, at the 800x600 minimum
+/// window (PR #4) and three common sizes.
 #[tokio::test]
 async fn shell_regions_match_the_spec_sizes() {
     let _home = isolated_home();
@@ -563,7 +564,7 @@ async fn shell_regions_match_the_spec_sizes() {
     // panel and action bar are shown (Paused, with connecting wording).
     app.state.start_connect(a.clone(), false).unwrap();
     let ctx = ctx();
-    for (w, h) in [(1280.0, 800.0), (1600.0, 900.0), (1920.0, 1080.0)] {
+    for (w, h) in [(800.0, 600.0), (1280.0, 800.0), (1600.0, 900.0), (1920.0, 1080.0)] {
         frame(&mut app, &ctx, egui::vec2(w, h));
         frame(&mut app, &ctx, egui::vec2(w, h));
         let regions: HashMap<&str, Rect> = shell_regions(&ctx).into_iter().collect();

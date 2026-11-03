@@ -26,7 +26,8 @@
 //! labels when equal segments would truncate (German's four presets), so they
 //! never force the stack on their own (#47: they did, at every width).
 //! In practice (checked on the real app, #47): two columns at 1280 and up in
-//! en and de, one column at the 960 minimum (912 px modal). Nothing truncates
+//! en and de, one column at 960 (912 px modal) and at the 800 minimum (752 px
+//! modal, checked on the real app in en and de, #127). Nothing truncates
 //! either way, except a window title longer than the cap (full text on hover).
 //!
 //! `SSS_UI_DUMP=<file>` (set by `client/scripts/launch-lib.sh`) makes the

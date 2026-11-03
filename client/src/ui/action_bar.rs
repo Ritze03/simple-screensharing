@@ -26,7 +26,7 @@
 //! Leave is not here: it lives in the room header (user request).
 //!
 //! # Narrow windows
-//! At the 960 px minimum window the bar is ~656 px wide, too narrow for every
+//! At the 800 px minimum window (960 before PR #4, 2026-11-03) the bar is ~496 px wide, too narrow for every
 //! label (German most of all). Each layout picks the lowest degradation
 //! level ([`fit_level`]) that leaves the status fill [`STATUS_MIN_W`]:
 //! first the status text shrinks (it truncates with "…"), then buttons
@@ -64,7 +64,8 @@ pub(super) const POPOVER_W: f32 = 340.0;
 /// Narrowest the status fill gets before the bar starts collapsing buttons
 /// (still room for "Screen…" / "H.264 · 6…"). `Why` this small: the status
 /// repeats what the own share card shows, while a German "Teilen beenden"
-/// at 960 px only keeps its label if the status gives up ~90 px first.
+/// at 960 px only kept its label if the status gave up ~90 px first (at 800
+/// it is icon-only while live, like Go live while staged).
 const STATUS_MIN_W: f32 = 72.0;
 
 /// The bar's degradation level (see "Narrow windows" above): the lowest
