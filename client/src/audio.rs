@@ -355,7 +355,7 @@ fn sink_create_command(sink_name: &str) -> String {
 /// The child is set to die with this process (see [`die_with_parent`]), and the stdin pipe also
 /// closes when this process dies, so a SIGKILLed or crashed client cannot leave an orphaned
 /// `ssshare-sink-…` node behind in the PipeWire graph.
-fn spawn_sink(sink_name: &str) -> Result<Child> {
+fn spawn_sink(sink_name: &str) -> Result<SinkProc> {
     use std::io::Write;
     let mut cmd = Command::new("pw-cli");
     cmd.stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null());
@@ -366,10 +366,30 @@ fn spawn_sink(sink_name: &str) -> Result<Child> {
         s.write_all(line.as_bytes()).and_then(|()| s.flush()).context("failed to send create-node to pw-cli")
     });
     if let Err(e) = written {
-        kill_and_wait(&mut child);
+        kill_child(&mut child);
         return Err(e);
     }
-    Ok(child)
+    Ok(SinkProc { child, name: sink_name.to_string() })
+}
+
+/// The `pw-cli` process that owns the share's sink, and the sink's node name (which is how
+/// [`kill_and_wait`] finds the sink's links before it removes it).
+struct SinkProc {
+    child: Child,
+    name: String,
+}
+
+impl std::ops::Deref for SinkProc {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for SinkProc {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
 }
 
 /// Makes `cmd`'s child receive SIGTERM when its parent dies, however the
@@ -468,11 +488,38 @@ async fn wait_for_loopback_ready(loopback_name: &str, timeout: Duration) -> Resu
     }
 }
 
+/// Whether `objects` contains a link from port `out_port` to port `in_port` (registry port ids).
+fn ports_are_linked(objects: &[PwObject], out_port: u32, in_port: u32) -> bool {
+    objects.iter().any(|obj| {
+        if obj.obj_type.as_deref() != Some("PipeWire:Interface:Link") {
+            return false;
+        }
+        let Some(props) = obj.info.as_ref().and_then(|i| i.props.as_ref()) else { return false };
+        prop_u64(props, "link.output.port") == Some(out_port as u64) && prop_u64(props, "link.input.port") == Some(in_port as u64)
+    })
+}
+
+/// How many of the links from `source_node_id`'s output ports to `sink_node_id`'s input ports
+/// (paired in port-id order, channel 0 -> channel 0, ...) do not exist in `objects`. `None` while
+/// either side has no ports (not linkable yet).
+fn missing_links(objects: &[PwObject], source_node_id: u32, sink_node_id: u32) -> Option<usize> {
+    let source_ports = node_port_ids(objects, source_node_id as u64, "output");
+    let sink_ports = node_port_ids(objects, sink_node_id as u64, "input");
+    if source_ports.is_empty() || sink_ports.is_empty() {
+        return None;
+    }
+    Some(source_ports.iter().zip(&sink_ports).filter(|&(&out, &inp)| !ports_are_linked(objects, out, inp)).count())
+}
+
 /// Links `source_node_id`'s output ports into `loopback_input_node_id`'s
 /// input ports, pairing them in port-id order (channel 0 → channel 0, ...),
 /// up to however many pairs exist on the shorter side. Non-destructive: this
 /// only adds a link, it never touches the source's existing routing (spec'd
 /// approach — verified live, see module docs).
+///
+/// Idempotent (task #123): a pair that already has a link is skipped, so a half-linked stream
+/// (FL linked, FR's `pw-link` failed) is completed on the next tick instead of failing forever
+/// on the duplicate FL link ("File exists").
 ///
 /// `objects` is a `pw-dump` snapshot already known (via
 /// [`wait_for_loopback_ready`]) to contain `loopback_input_node_id`'s input
@@ -494,6 +541,9 @@ fn link_source_into_loopback(objects: &[PwObject], source_node_id: u32, loopback
     let pair_count = source_ports.len().min(sink_ports.len());
     for i in 0..pair_count {
         let (out_port, in_port) = (source_ports[i], sink_ports[i]);
+        if ports_are_linked(objects, out_port, in_port) {
+            continue;
+        }
         let status = Command::new("pw-link")
             .arg(out_port.to_string())
             .arg(in_port.to_string())
@@ -526,20 +576,22 @@ fn sync_links(objects: &[PwObject], name: &str, loopback_input_node_id: u32, lin
 }
 
 /// Whether the poll must rebuild the loopback + capture pipeline before linking a stream (task
-/// #117). `gap` is sticky: it is set when nothing is linked into the loopback any more (the app
-/// closed, or muted and Firefox destroyed its stream) and is only cleared by a rebuild. Returns
-/// `(gap, rebuild)`: rebuild when there was a gap and a stream is ready to be linked again.
+/// #117, #123). `gap` is sticky: it is set when the chain is *stale*, i.e. nothing is linked into
+/// the loopback any more (the app closed, or muted and Firefox destroyed its stream) or a linked
+/// stream lost its links (it re-created its ports, as Firefox does on pause/resume, #123), and is
+/// only cleared by a rebuild. Returns `(gap, rebuild)`: rebuild when the chain is stale and a
+/// stream is ready to be linked again.
 ///
 /// `Why:` a loopback that has been through a stretch with no input and then gets a new stream
 /// linked in sounded "really broken" until the user re-selected the source (which spawns a fresh
 /// loopback and pipeline with the stream already linked). The poll now does that same reset itself.
-fn gap_decision(gap: bool, nothing_linked: bool, linkable_new: bool) -> (bool, bool) {
-    let gap = gap || nothing_linked;
-    (gap, gap && linkable_new)
+fn gap_decision(gap: bool, stale: bool, linkable: bool) -> (bool, bool) {
+    let gap = gap || stale;
+    (gap, gap && linkable)
 }
 
 /// Kills its child on drop, so a rebuild cancelled by `abort()` (stop) cannot leak a `pw-loopback`.
-struct ChildGuard(Option<Child>);
+struct ChildGuard(Option<SinkProc>);
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
@@ -553,7 +605,7 @@ impl Drop for ChildGuard {
 struct Chain {
     stream_id: u8,
     pipeline: gst::Pipeline,
-    loopback_child: Arc<Mutex<Child>>,
+    loopback_child: Arc<Mutex<SinkProc>>,
     pts_offset_us: Arc<AtomicU64>,
 }
 
@@ -591,7 +643,8 @@ async fn rebuild_chain(chain: &Chain, name: &str) -> Result<(u32, std::collectio
 
 /// Once a second, re-lists the graph and links streams that now carry the
 /// shared name (new browser tab, restarted app). A stream that reappears after
-/// a stretch with none is linked into a rebuilt loopback ([`gap_decision`]).
+/// a stretch with none, or one we linked that lost its links (it re-created its
+/// ports on a pause/resume, #123), is linked into a rebuilt chain ([`gap_decision`]).
 async fn link_poll_loop(name: String, mut loopback_input_node_id: u32, mut linked: std::collections::HashSet<u32>, chain: Chain) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -613,8 +666,12 @@ async fn link_poll_loop(name: String, mut loopback_input_node_id: u32, mut linke
             continue;
         }
         let (to_add, kept) = link_diff(&node_ids_named(&objects, &name), &linked);
-        let linkable = to_add.iter().any(|&id| !node_port_ids(&objects, id as u64, "output").is_empty());
-        let (g, rebuild) = gap_decision(gap, kept.is_empty(), linkable);
+        let new_linkable = to_add.iter().any(|&id| !node_port_ids(&objects, id as u64, "output").is_empty());
+        // A stream we linked that lost its links (it re-created its ports on a pause/resume, same
+        // node id): the chain is stale, rebuilt like after a gap. Re-linking the running chain
+        // instead left the audio silent or garbled for good on a real PipeWire (#123).
+        let lost = kept.iter().any(|&id| missing_links(&objects, id, loopback_input_node_id).is_some_and(|n| n > 0));
+        let (g, rebuild) = gap_decision(gap, kept.is_empty() || lost, new_linkable || lost);
         gap = g;
         if rebuild {
             match rebuild_chain(&chain, &name).await {
@@ -631,7 +688,55 @@ async fn link_poll_loop(name: String, mut loopback_input_node_id: u32, mut linke
     }
 }
 
-fn kill_and_wait(child: &mut Child) {
+/// How long [`kill_and_wait`] waits after unlinking a sink before it removes it, so WirePlumber
+/// has handled the link removals first (it handles them asynchronously, in the next few ms).
+const UNLINK_SETTLE: Duration = Duration::from_millis(250);
+
+/// Registry ids of the links that feed `sink_node_id` (the apps' links into its input ports; not
+/// the monitor links out of it).
+fn links_into_node(objects: &[PwObject], sink_node_id: u32) -> Vec<u32> {
+    objects
+        .iter()
+        .filter(|obj| obj.obj_type.as_deref() == Some("PipeWire:Interface:Link"))
+        .filter(|obj| {
+            obj.info.as_ref().and_then(|i| i.props.as_ref()).and_then(|props| prop_u64(props, "link.input.node"))
+                == Some(sink_node_id as u64)
+        })
+        .map(|obj| obj.id)
+        .collect()
+}
+
+/// Removes every link that feeds the sink named `sink_name`, then waits [`UNLINK_SETTLE`].
+///
+/// `Why (task #123):` WirePlumber (0.5.17+, `linking/mpris-pause.lua`, setting
+/// `linking.pause-playback`, on by default) **pauses the MPRIS media players whose streams are
+/// linked to a sink when that sink is removed**, the way a browser stops when headphones are
+/// unplugged. Our share sink is a real `Audio/Sink` with the shared app linked into it, so every
+/// removal of it (stopping the share, picking another source, a failed start) paused the video the
+/// user was sharing. The script looks at the links that exist when the sink goes away; with the
+/// links gone first it finds no player. Measured in a VM: Firefox went `Playing` -> `Paused` the
+/// moment the share stopped, and stayed `Playing` with this unlink.
+fn unlink_sink_inputs(sink_name: &str) {
+    let Ok(objects) = run_pw_dump() else { return };
+    let Some(sink) = find_sink_node(&objects, sink_name) else { return };
+    let links = links_into_node(&objects, sink.node_id);
+    if links.is_empty() {
+        return;
+    }
+    for id in links {
+        let _ = Command::new("pw-link").arg("-d").arg(id.to_string()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    }
+    std::thread::sleep(UNLINK_SETTLE);
+}
+
+/// Unlinks the sink's inputs ([`unlink_sink_inputs`]), then kills the `pw-cli` that owns it (which
+/// removes the sink) and reaps it.
+fn kill_and_wait(sink: &mut SinkProc) {
+    unlink_sink_inputs(&sink.name);
+    kill_child(&mut sink.child);
+}
+
+fn kill_child(child: &mut Child) {
     if let Err(e) = child.kill() {
         tracing::warn!("error killing the sink-owning pw-cli process: {e}");
     }
@@ -970,7 +1075,7 @@ pub struct AudioCaptureHandle {
     stream_id: u8,
     client: ScreenshareClient,
     pipeline: gst::Pipeline,
-    loopback_child: Arc<Mutex<Child>>,
+    loopback_child: Arc<Mutex<SinkProc>>,
     pump_task: tokio::task::JoinHandle<()>,
     /// The 1 s poll that links streams of the chosen name as they appear
     /// ([`link_poll_loop`]); aborted on stop/drop.
@@ -1127,9 +1232,9 @@ impl Drop for AudioCaptureHandle {
     fn drop(&mut self) {
         self.link_task.abort();
         let _ = self.pipeline.set_state(gst::State::Null);
-        let mut child = self.loopback_child.lock().unwrap_or_else(|p| p.into_inner());
-        let _ = child.kill();
-        let _ = child.wait(); // reap, avoid a zombie
+        // Unlinks the sink first (so WirePlumber does not pause the shared app, #123), then kills
+        // and reaps the child (no zombie).
+        kill_and_wait(&mut self.loopback_child.lock().unwrap_or_else(|p| p.into_inner()));
     }
 }
 
@@ -1474,7 +1579,6 @@ fn send_encoded_sample(client: &ScreenshareClient, stream_id: u8, sample: &gst::
     let buffer = sample.buffer().ok_or_else(|| anyhow!("sample had no buffer"))?;
 
     let pts_us = audio_wire_pts_us(buffer.pts().map(|t| t.useconds()), pts_offset_us, sender_clock_us(Instant::now()));
-
     // Unlike H.264's GOP structure, every Opus packet is independently
     // decodable — there's no delta/keyframe distinction for audio. Mark
     // every packet "keyframe" so a newly-subscribing receiver can start
@@ -1730,6 +1834,59 @@ mod tests {
         assert_eq!(tick(false, &[11, 12], &set(&[10, 11]), &[11, 12]), (false, false));
         // Started with the app absent (gap from the start): rebuild when it shows up.
         assert_eq!(tick(true, &[5], &set(&[]), &[5]), (true, true));
+    }
+
+    /// The fixture plus links `(registry id, output node, output port, input node, input port)`.
+    fn fixture_with_links(links: &[(u32, u32, u32, u32, u32)]) -> Vec<PwObject> {
+        let mut objects = fixture_objects();
+        for &(id, out_node, out_port, in_node, in_port) in links {
+            objects.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": id,
+                    "type": "PipeWire:Interface:Link",
+                    "info": { "props": {
+                        "link.output.node": out_node, "link.output.port": out_port,
+                        "link.input.node": in_node, "link.input.port": in_port,
+                    } }
+                }))
+                .unwrap(),
+            );
+        }
+        objects
+    }
+
+    /// Task #123: a stream that re-creates its ports on a pause/resume (same node id) loses its
+    /// links into the sink. `missing_links` is what the poll uses to see that; it must count the
+    /// channel pairs (port-id order: source 284 = FL / 279 = FR, sink 318 = FL / 280 = FR) that
+    /// have no link, and say `None` while either side has no ports yet.
+    #[test]
+    fn a_source_that_lost_its_links_into_the_sink_is_noticed() {
+        // The app's node 262 (ports 284 FL, 279 FR) and the sink's node 319 (inputs 318 FL, 280 FR).
+        assert_eq!(missing_links(&fixture_objects(), 262, 319), Some(2), "nothing linked yet");
+        let one = fixture_with_links(&[(900, 262, 284, 319, 318)]);
+        assert_eq!(missing_links(&one, 262, 319), Some(1), "only FL is linked");
+        let both = fixture_with_links(&[(900, 262, 284, 319, 318), (901, 262, 279, 319, 280)]);
+        assert_eq!(missing_links(&both, 262, 319), Some(0));
+        // FL linked to the *wrong* sink port (FR) is not the FL pair: channels stay paired.
+        let crossed = fixture_with_links(&[(900, 262, 284, 319, 280), (901, 262, 279, 319, 318)]);
+        assert_eq!(missing_links(&crossed, 262, 319), Some(2), "a crossed link is not the channel pair");
+        assert_eq!(missing_links(&fixture_objects(), 12345, 319), None, "a node without ports is not linkable yet");
+        // Poll decision: a linked stream that lost its links makes the chain stale and rebuilds
+        // (the stream is in `kept`, so only `lost` can trigger it).
+        assert_eq!(gap_decision(false, false, false), (false, false), "healthy: nothing to do");
+        assert_eq!(gap_decision(false, true, true), (true, true), "lost links, ports are back: rebuild");
+        assert_eq!(gap_decision(false, true, false), (true, false), "lost links, no ports yet: wait, stay stale");
+    }
+
+    /// `links_into_node` finds the links that feed the sink and ignores the monitor link out of it
+    /// (the capture stream's), which is ours and stays until the pipeline stops.
+    #[test]
+    fn only_the_links_feeding_the_sink_are_unlinked_before_it_goes() {
+        let objects = fixture_with_links(&[(900, 262, 284, 319, 318), (901, 262, 279, 319, 280)]);
+        // The fixture's own link 701 is sink 319 -> capture stream 700 (the monitor): not listed.
+        assert_eq!(links_into_node(&objects, 319), vec![900, 901]);
+        assert_eq!(links_into_node(&objects, 700), vec![701]);
+        assert!(links_into_node(&fixture_objects(), 319).is_empty());
     }
 
     /// The rebuild stops the capture pipeline, changes the source's properties and starts it again
