@@ -1243,8 +1243,13 @@ impl App {
                 // (`popout.rs` `viewport`), so the letterboxing is identical.
                 egui::CentralPanel::default().frame(Frame::NONE.fill(Color32::BLACK)).show(ctx, |ui| {
                     let rect = ui.max_rect();
-                    cx.videos.paint(fs.key, ui, rect, simple_screensharing_client::decode::render::Fit::Contain);
-                    if ui.interact(rect, Id::new("stream_fullscreen"), Sense::click()).double_clicked() {
+                    let pic = cx.videos.paint(fs.key, ui, rect, simple_screensharing_client::decode::render::Fit::Contain);
+                    // Registered before the overlay, whose button then takes its own clicks.
+                    let dbl = ui.interact(rect, Id::new("stream_fullscreen"), Sense::click()).double_clicked();
+                    // `Why` the pop-out's overlay (`popout::fullscreen_overlay`): user request
+                    // 2026-11-03, the same overlay as a fullscreened pop-out.
+                    let first_frame = pic.is_some_and(|r| r.width() > 0.0);
+                    if popout::fullscreen_overlay(ui, &mut cx, fs.key, rect, first_frame) || dbl {
                         cx.act(UiAction::ExitStreamFullscreen);
                     }
                 });

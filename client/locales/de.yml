@@ -231,6 +231,7 @@ ui.pill.starting: "Startet"
 
 #popout
 ui.popout.close_tip: "Schließen und zurück in die Kachel holen"
+ui.popout.exit_fullscreen_tip: "Vollbild beenden"
 ui.popout.mute: "Diesen Stream stummschalten"
 ui.popout.muted: "Stumm"
 ui.popout.no_audio: "Kein Audio geteilt"
