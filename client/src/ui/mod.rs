@@ -844,8 +844,18 @@ pub fn share_state(state: &AppState, shell: &Shell, room: RoomHandle) -> ShareSt
 }
 
 /// The audio capture riding on video capture `capture`.
+///
+/// `Why a stopping one loses:` switching the audio source, or a room reconnect,
+/// leaves the old audio capture in `Stopping` (reaped when its teardown lands,
+/// a second or more) next to the new one, and both point at `capture`. The
+/// first match used to win, so for that long the bar showed the dying share:
+/// its name, a flat meter (a stopping share has no level), and a Mute click
+/// that hit the wrong capture (#115).
 pub fn paired_audio(state: &AppState, capture: CaptureSourceId) -> Option<CaptureSourceId> {
-    state.captures.iter().find(|(_, c)| c.audio_for_capture == Some(capture)).map(|(id, _)| *id)
+    let mut riders = state.captures.iter().filter(|(_, c)| c.audio_for_capture == Some(capture));
+    let first = riders.next()?;
+    let live = std::iter::once(first).chain(riders).find(|(_, c)| !matches!(c.status, ShareStatus::Stopping(_)));
+    Some(*live.unwrap_or(first).0)
 }
 
 

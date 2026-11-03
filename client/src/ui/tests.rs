@@ -837,3 +837,26 @@ fn wheel_over_the_volume_slider_steps_it_and_does_not_scroll_the_panel() {
     assert_eq!(percent, 195);
     assert!(offset > 0.0, "the panel scrolls when the pointer is not on the slider");
 }
+
+/// #115: after an audio source switch the old share is `Stopping` for a second
+/// or more, and both audio captures point at the video capture. The bar must
+/// follow the new one (its level, its mute), not the dying one.
+#[test]
+fn the_bar_follows_the_live_audio_share_not_the_stopping_one() {
+    use simple_screensharing_client::session::{LocalCapture, ShareStatus};
+    let audio = |status: ShareStatus, label: &str| LocalCapture {
+        kind: StreamKind::Audio,
+        label: label.to_string(),
+        status,
+        audio_for_capture: Some(CaptureSourceId(10)),
+        destinations: Default::default(),
+    };
+    let (_tx_old, rx_old) = tokio::sync::oneshot::channel();
+    let (_tx_new, rx_new) = tokio::sync::oneshot::channel();
+    let mut state = AppState::default();
+    state.captures.insert(CaptureSourceId(20), audio(ShareStatus::Stopping(rx_old), "old"));
+    assert_eq!(paired_audio(&state, CaptureSourceId(10)), Some(CaptureSourceId(20)), "a lone stopping share is still shown");
+    state.captures.insert(CaptureSourceId(21), audio(ShareStatus::Starting(rx_new), "new"));
+    assert_eq!(paired_audio(&state, CaptureSourceId(10)), Some(CaptureSourceId(21)));
+    assert_eq!(paired_audio(&state, CaptureSourceId(99)), None);
+}
