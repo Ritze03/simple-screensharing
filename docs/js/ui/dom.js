@@ -182,8 +182,25 @@ export function gridRows(items, cols, renderItem, maxW) {
   }
   return V({ g: 3 }, rows);
 }
-/** Card/tile column count from the central width (egui: available_width / 272). */
-export const cols = (w) => Math.max(1, Math.min(4, Math.floor((w + 12) / 272)));
+/** Share-card grid shape `{ cols, w }` for `n` cards in a `aw` x `ah` area (task #120; native `room::card_grid_shape`):
+ *  1..min(n, columns >= 260 wide) columns (never an empty one), card width limited by the width, by the height (16:9
+ *  thumb + 112 px info/border per row) and by 640; the biggest card wins, a tie goes to more columns. Never below 260
+ *  (unless the area is narrower); a wider area never gives smaller cards. */
+export function cardShape(n, aw, ah, gap = 12) {
+  const MIN = 260, MAX = 640, INFO = 112;
+  aw = Math.max(0, aw);
+  n = Math.max(1, n);
+  const fit = Math.max(1, Math.min(n, Math.floor((aw + gap) / (MIN + gap))));
+  let best = { cols: 1, w: 0 };
+  for (let c = 1; c <= fit; c++) {
+    const rows = Math.ceil(n / c);
+    const cellW = (aw - gap * (c - 1)) / c;
+    const cellH = (ah - gap * (rows - 1)) / rows;
+    const w = Math.max(Math.min(cellW, ((cellH - INFO) * 16) / 9 + 2, MAX), Math.min(MIN, cellW));
+    if (w >= best.w) best = { cols: c, w };
+  }
+  return best;
+}
 
 export function emptyState(icon, title, text, actions, { err = false, errText = null } = {}) {
   return V({ cls: "empty", g: 2 }, ic(icon, "big" + (err ? " err" : "")), T(title, "b"), text ? h("span", { text }) : null,

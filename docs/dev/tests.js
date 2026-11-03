@@ -13,7 +13,7 @@ import { deriveCodecString, sniffCodec } from "../js/core/codec.js";
 import { DECODE_QUEUE_CATCHUP_THRESHOLD, JitterBuffer, MAX_DECODE_QUEUE, clampCatchUpSpeedPercent, clampMaxJitterBufferMs } from "../js/core/jitter.js";
 import { CanvasRenderer, VideoReceiver } from "../js/core/video-rx.js";
 import { ENCODER_PRESETS } from "../js/core/video-tx.js";
-import { avatarBg, avatarColors, avatarHue, snapVolumePct, wheelStepVolumePct, volumeWheel, VOLUME_MAX_PCT } from "../js/ui/dom.js";
+import { avatarBg, avatarColors, avatarHue, cardShape, snapVolumePct, wheelStepVolumePct, volumeWheel, VOLUME_MAX_PCT } from "../js/ui/dom.js";
 import { AudioReceiver, MAX_VOLUME } from "../js/core/audio.js";
 
 const tests = [];
@@ -1024,6 +1024,25 @@ test("volume: gain goes up to 500 %, the UI cap matches the core cap, 100 % stay
   eq(gains.at(-1), 0);
   rx.setMuted(false);
   eq(gains.at(-1), 5, "unmute restores the chosen volume");
+});
+
+test("card grid: no empty columns, never shrinks as the area grows, best of 2x2/4x1 (#120)", () => {
+  for (const w of [300, 1200, 2600, 5000]) eq(cardShape(1, w, 1000).cols, 1, `1 card at ${w}`);
+  eq(cardShape(1, 5000, 1000).w, 640, "capped");
+  ok(Math.abs(cardShape(1, 2000, 400).w - (((400 - 112) * 16) / 9 + 2)) < 0.01, "height-limited");
+  eq(cardShape(4, 2400, 500).cols, 4, "wide and short: one row");
+  const t = cardShape(4, 1400, 1000);
+  ok((t.cols === 2 || t.cols === 4) && t.w > 330, `wide and tall: ${show(t)}`);
+  for (let n = 1; n <= 6; n++) for (const h of [300, 700, 1100]) {
+    let prev = 0;
+    for (let w = 200; w < 4000; w += 7) {
+      const s = cardShape(n, w, h);
+      ok(s.cols >= 1 && s.cols <= n, `n=${n} w=${w} cols=${s.cols}`);
+      ok(s.w + 0.001 >= prev, `n=${n} h=${h} w=${w}: ${s.w} < ${prev}`);
+      ok(s.cols * s.w + (s.cols - 1) * 12 <= w + 0.01, `n=${n} w=${w} overflows`);
+      prev = s.w;
+    }
+  }
 });
 
 test("volume: the slider's 100 % detent snaps within 10 and leaves everything else alone", () => {

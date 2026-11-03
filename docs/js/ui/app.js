@@ -9,7 +9,7 @@ import { S, onInvalidate, invalidate, toast, persistSettings, persistRooms, load
 import { t, setLang, getLang } from "./i18n.js";
 import {
   h, ic, T, V, H, SL, FILL, pct, fmtKbps, snapVolumePct, volumeWheel, VOLUME_MAX_PCT, ctrlRow, valBox, sliderRow, seg, cbx, card, secHead, roomRow, sharerRow, personRow, destRow,
-  popItem, btnRow, gridRows, cols, emptyState, banner, meter, modalShell, avatarBg, initial,
+  popItem, btnRow, gridRows, cardShape, emptyState, banner, meter, modalShell, avatarBg, initial,
 } from "./dom.js";
 import {
   RoomEntry, roomById, connectRoom, disconnectRoom, retryNow, watchStream, unwatchStream, setWatchVolume, setWatchMuted, allWatches,
@@ -34,6 +34,7 @@ let encoders = null; // Set of codecs this browser can encode (probeEncoders), n
 const root = document.getElementById("app");
 const SCROLLERS = [".p-center", ".p-side-scroll", ".p-right", ".modal-body"];
 let centerW = 700;
+let centerH = 700;
 let reflowing = false;
 let live = []; // [{ el, fn }] text patched every stats tick
 let meters = []; // [{ el, fn }] level meters, patched ~7x/s
@@ -109,15 +110,15 @@ function render() {
   patchLive();
   const c = root.querySelector(".p-center");
   if (c && !reflowing) {
+    // The share-card size follows the centre's width and height (cardShape): re-render once when either moved.
     const w = c.clientWidth - 32;
-    if (Math.abs(w - centerW) > 4) {
-      const before = cols(centerW);
+    const hh = c.clientHeight - 32;
+    if (Math.abs(w - centerW) > 4 || Math.abs(hh - centerH) > 4) {
       centerW = w;
-      if (cols(w) !== before) {
-        reflowing = true;
-        render();
-        reflowing = false;
-      }
+      centerH = hh;
+      reflowing = true;
+      render();
+      reflowing = false;
     }
   }
 }
@@ -318,7 +319,8 @@ function renderRoomContent(r, center) {
       watched.length ? null : r.state === "reconnecting" ? t("ui.room.shares_come_back") : t("ui.room.start_own")));
   } else {
     const items = notWatched.map((s) => ({ s })).concat(mine ? [{ mine }] : []);
-    sec.appendChild(gridRows(items, cols(centerW), (it) => (it.s ? shareCard(r, it.s) : myCard(it.mine, r))));
+    const g = cardShape(items.length, centerW, centerH - 28); // minus the 16 px heading + 12 gap (native HEADING_H + S3)
+    sec.appendChild(gridRows(items, g.cols, (it) => (it.s ? shareCard(r, it.s) : myCard(it.mine, r)), `${g.cols * g.w + (g.cols - 1) * 12}px`));
   }
   center.appendChild(sec);
 }

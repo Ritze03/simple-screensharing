@@ -382,3 +382,13 @@ sharer), a browser that does report `smoothedRtt` (no such browser was available
 The repo is **private**; the project owner enables GitHub Pages later, so there is no public URL yet
 (the site will live under `/simple-screensharing/`). Until then test only locally as above. Nothing
 in `docs/` may rely on a CDN or a server-side route.
+
+## Share-card grid (task #120, 2026-11-03)
+
+Same rule as native (`superdoc/ui/APP-SHELL.md` "Sharing in this room" card grid; user report: the grid added empty columns, so
+one card shrank as the window grew). `dom.js` `cardShape(n, w, h)` mirrors `room::card_grid_shape`: 1..min(n, columns >= 260)
+columns, card width limited by column width, viewport height (16:9 thumb + 112 px per row) and 640, biggest wins, ties to more
+columns; `app.js` passes the `.p-center` width/height and caps the rows at `cols * w + gaps` (left-aligned). After every render
+`app.js` re-renders once if the centre's width or height moved > 4 px (the card size is continuous now, not a column count).
+`.p-center` has `scrollbar-gutter: stable` so a scrollbar appearing cannot narrow the area and flip the shape back and forth.
+Test: `docs/dev/tests.js` "card grid".
