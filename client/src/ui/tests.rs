@@ -756,138 +756,58 @@ async fn stream_fullscreen_needs_a_watched_stream_and_exit_restores_the_window_s
 }
 
 // ---------------------------------------------------------------------------
-// Audio boost + calibration (task #114). No PipeWire stream is ever created: the calibration is
-// driven with a synthetic meter and a fake clock (`Calibration::listening`).
+// Audio boost (task #114, capped at 200 % and calibration-free since #119) and the viewer's
+// "Level loudness" switch (#119). No PipeWire stream is ever created.
 // ---------------------------------------------------------------------------
 
 mod audio_boost {
     use super::*;
-    use simple_screensharing_client::audio_gain::{self, Calibration, CalibrationOutcome, GainLimit, LoudnessMeter, SharedLoudness};
+    use simple_screensharing_client::audio_gain;
     use simple_screensharing_client::rooms::AppSettings;
-    use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
-
-    fn meter_with(rms: f64, peak: f64, windows: usize) -> LoudnessMeter {
-        let mut m = LoudnessMeter::default();
-        for _ in 0..windows {
-            m.push(rms, peak);
-        }
-        m
-    }
-
-    /// Start a (synthetic) calibration at `t0` the way `start_audio_calibration` would, but
-    /// without a tap: `heard` is what the tap would have collected while listening.
-    fn listen(app: &mut App, source: &str, heard: LoudnessMeter, t0: Instant) {
-        let meter: SharedLoudness = Arc::new(Mutex::new(LoudnessMeter::default()));
-        app.state.audio_calibration = Some(Calibration::listening(source.to_string(), None, meter.clone(), t0));
-        // `listening` resets the meter (counting starts with the listening), so push afterwards.
-        *meter.lock().unwrap() = heard;
-    }
 
     #[tokio::test]
-    async fn the_boost_defaults_to_one_persists_and_is_clamped() {
+    async fn the_boost_defaults_to_one_persists_and_is_clamped_to_200_percent() {
         let _home = isolated_home();
         let mut app = app_with_rooms(&[]);
         let ctx = ctx();
         assert_eq!(app.state.audio_gain, 1.0, "no boost until the user sets one");
-        app.apply(&ctx, UiAction::SetAudioGain(3.2));
-        assert_eq!(app.state.audio_gain, 3.2);
-        assert_eq!(AppSettings::load().audio_gain(), 3.2, "saved to settings.toml");
+        app.apply(&ctx, UiAction::SetAudioGain(1.5));
+        assert_eq!(app.state.audio_gain, 1.5);
+        assert_eq!(AppSettings::load().audio_gain(), 1.5, "saved to settings.toml");
         app.apply(&ctx, UiAction::SetAudioGain(100.0));
         assert_eq!(app.state.audio_gain, audio_gain::MAX_GAIN);
+        assert_eq!(audio_gain::MAX_GAIN, 2.0);
         app.apply(&ctx, UiAction::SetAudioGain(0.0));
         assert_eq!(app.state.audio_gain, audio_gain::MIN_GAIN);
         // A new start picks the saved value up (the next audio share starts with it).
-        app.apply(&ctx, UiAction::SetAudioGain(2.5));
+        app.apply(&ctx, UiAction::SetAudioGain(1.8));
         let again = AppState::default();
-        assert_eq!(again.audio_gain, 2.5);
+        assert_eq!(again.audio_gain, 1.8);
     }
 
+    /// Levelling is on by default, the switch is persisted and drives the process-wide flag
+    /// every audio pipeline reads, and Settings draws with it on and off.
     #[tokio::test]
-    async fn a_finished_calibration_sets_and_saves_the_boost() {
-        let _home = isolated_home();
-        let mut app = app_with_rooms(&[]);
-        let t0 = Instant::now();
-        listen(&mut app, "Spotify", meter_with(-30.0, -18.0, 100), t0);
-        app.state.poll_audio_calibration(t0 + Duration::from_secs(5));
-        assert!(app.state.audio_calibration.is_some(), "still listening after 5 s");
-        assert_eq!(app.state.audio_gain, 1.0, "nothing changes before it is over");
-        app.state.poll_audio_calibration(t0 + Duration::from_secs(10));
-        assert!(app.state.audio_calibration.is_none());
-        assert_eq!(app.state.audio_gain, 3.98);
-        assert_eq!(AppSettings::load().audio_gain(), 3.98);
-        match &app.state.audio_calibration_result {
-            Some(CalibrationOutcome::Set { gain, limit: GainLimit::None, .. }) => assert_eq!(*gain, 3.98),
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn a_calibration_that_heard_nothing_leaves_the_boost_alone() {
-        let _home = isolated_home();
-        let mut app = app_with_rooms(&[]);
-        let ctx = ctx();
-        app.apply(&ctx, UiAction::SetAudioGain(2.0));
-        let t0 = Instant::now();
-        listen(&mut app, "Spotify", meter_with(-700.0, -700.0, 100), t0);
-        app.state.poll_audio_calibration(t0 + Duration::from_secs(10));
-        assert_eq!(app.state.audio_gain, 2.0);
-        assert_eq!(AppSettings::load().audio_gain(), 2.0);
-        assert_eq!(app.state.audio_calibration_result, Some(CalibrationOutcome::Silent));
-    }
-
-    #[tokio::test]
-    async fn cancel_stops_a_calibration_and_forgets_its_result() {
-        let _home = isolated_home();
-        let mut app = app_with_rooms(&[]);
-        let ctx = ctx();
-        let t0 = Instant::now();
-        listen(&mut app, "Spotify", meter_with(-30.0, -18.0, 100), t0);
-        app.apply(&ctx, UiAction::CancelAudioCalibration);
-        assert!(app.state.audio_calibration.is_none());
-        app.state.poll_audio_calibration(t0 + Duration::from_secs(20));
-        assert_eq!(app.state.audio_gain, 1.0, "a cancelled calibration never applies");
-        app.state.audio_calibration_result = Some(CalibrationOutcome::Silent);
-        app.apply(&ctx, UiAction::CancelAudioCalibration);
-        assert!(app.state.audio_calibration_result.is_none());
-    }
-
-    /// The Settings modal draws in every calibration state (idle, listening with a countdown and
-    /// every kind of result) without panicking, and closing it cancels a running calibration.
-    #[tokio::test]
-    async fn the_settings_modal_draws_every_calibration_state_and_closing_cancels() {
+    async fn level_loudness_defaults_on_persists_and_drives_the_leveller_switch() {
+        use std::sync::atomic::Ordering;
         let _home = isolated_home();
         let mut app = app_with_rooms(&[]);
         let ctx = ctx();
         let size = egui::vec2(1000.0, 900.0);
+        assert!(app.state.level_loudness, "on by default");
         app.apply(&ctx, UiAction::OpenModal(Modal::Settings));
-        app.state.audio_sources =
-            vec![simple_screensharing_client::audio::AudioSource { id: 1, name: "Spotify".into(), serial: Some(11) }];
         frame(&mut app, &ctx, size);
-        let t0 = Instant::now();
-        listen(&mut app, "Spotify", meter_with(-30.0, -18.0, 10), t0);
+        app.apply(&ctx, UiAction::SetLevelLoudness(false));
+        assert!(!app.state.level_loudness);
+        assert!(!simple_screensharing_client::leveller::ENABLED.load(Ordering::Relaxed));
+        assert!(!AppSettings::load().level_loudness, "saved to settings.toml");
         frame(&mut app, &ctx, size);
-        assert!(app.state.audio_calibration.is_some());
-        let measurement = meter_with(-30.0, -18.0, 50).measurement().unwrap();
-        for result in [
-            CalibrationOutcome::Set { gain: 3.98, limit: GainLimit::None, measurement },
-            CalibrationOutcome::Set { gain: 8.0, limit: GainLimit::Max, measurement },
-            CalibrationOutcome::Set { gain: 0.5, limit: GainLimit::Min, measurement },
-            CalibrationOutcome::Silent,
-            CalibrationOutcome::Failed("never linked".into()),
-        ] {
-            app.state.audio_calibration = None;
-            app.state.audio_calibration_result = Some(result);
-            frame(&mut app, &ctx, size);
-        }
+        assert!(!AppState::default().level_loudness, "the next start remembers it");
+        app.apply(&ctx, UiAction::SetLevelLoudness(true));
+        assert!(simple_screensharing_client::leveller::ENABLED.load(Ordering::Relaxed));
+        assert!(AppSettings::load().level_loudness);
+        frame(&mut app, &ctx, size);
         assert_eq!(app.nav.modal, Some(Modal::Settings));
-        // Closing cancels a calibration and clears the result.
-        listen(&mut app, "Spotify", meter_with(-30.0, -18.0, 10), t0);
-        app.state.audio_calibration_result = Some(CalibrationOutcome::Silent);
-        app.apply(&ctx, UiAction::CancelAudioCalibration);
-        app.apply(&ctx, UiAction::CloseModal);
-        assert!(app.state.audio_calibration.is_none() && app.state.audio_calibration_result.is_none());
-        assert_eq!(app.state.audio_gain, 1.0);
     }
 }
 

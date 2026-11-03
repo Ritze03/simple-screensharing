@@ -181,18 +181,19 @@ sway seat has a keyboard (hold one open with `wtype -P Shift_L -s 30000 -p Shift
 "Copy invite link" behaves the same). Tests: `logbuf::tests::*`,
 `ui::tests::copy_logs_puts_the_dump_on_the_clipboard_and_toasts`.
 
-**Settings > Shared audio: Boost slider and Calibrate** (2026-11-03, task #114; user: "a volume multiplier ... a
-calibration ... it just listens to it for 10 seconds and according to that it adjusts the multiplier"). A card
-between Playback and Diagnostics (`modals.rs` `audio_card`): a `ctrl_row_value` (Boost: `widgets::slider` in dB,
-50-800 %, 0.5 dB knob steps, a `value_box` reading `223%`; pushed on pointer release as `UiAction::SetAudioGain`)
-and a `ctrl_row` Calibrate whose fill cell is a nested `HBox [FILL, 104]`: idle = `select` of the audio sources
-(re-listed every 2 s while Settings is open, default the app being shared) + Calibrate button (disabled with "No app
-is playing audio" when nothing is listed); calibrating = "Listening to <app>... N s" + Cancel
-(`UiAction::CalibrateAudio` / `CancelAudioCalibration`, state in `AppState::audio_calibration`). The result is a
-banner under the row (Info "Boost set to N%", Warn at the maximum or when nothing was audible / the tap failed);
-closing Settings cancels a running calibration and clears the result. The slider follows the state when a
-calibration changes it. How it all works, and why: `features/audio-sharing.md` "sender-side audio boost".
-Tests: `ui::tests::audio_boost::*`.
+**Settings > Shared audio: Boost slider** (2026-11-03, task #114; since #119 without the Calibrate row and capped at
+200 %). A card between Playback and Diagnostics (`modals.rs` `audio_card`): a `ctrl_row_value` (Boost: `widgets::slider`
+in dB, 50-200 %, 100 % mid-track, 0.5 dB knob steps, a `value_box` reading `150%`; pushed on pointer release as
+`UiAction::SetAudioGain`). The calibration (a nested `HBox [FILL, 104]` row with an app picker, a 10 s listen and a
+banner) was removed in #119 together with `UiAction::CalibrateAudio` / `CancelAudioCalibration`.
+How it works, and why: `features/audio-sharing.md` "sender-side audio boost" and the #119 block. Tests: `ui::tests::audio_boost::*`.
+
+**Settings > Playback > Level loudness** (2026-11-03, task #119; user: "the auto levelling should happen on the viewers
+side"). A `ctrl_row` with a checkbox ("Even out the volume of what I watch", tooltip on the label) as the third row of
+the Playback card, **on by default**; `UiAction::SetLevelLoudness` -> `AppState::set_level_loudness` (persists
+`level_loudness`, flips the process-wide `leveller::ENABLED`, live for every watched stream). The browser has the same row
+(`#set-level-loudness`). Design and numbers: `features/audio-sharing.md` (2026-11-03, #119). Tests:
+`ui::tests::audio_boost::level_loudness_defaults_on_persists_and_drives_the_leveller_switch`.
 
 **Settings > Diagnostics > Relay: "Send diagnostics to the relay"** (2026-11-03, task #110; user: "he or all of my
 friends could just tick the checkbox while we are still in heavy development, and then I can just see it.

@@ -251,6 +251,9 @@ const en = {
   "ui.settings.jitter_tip": "Max jitter buffer. Smooths network hiccups; grows only when needed, up to this ceiling.",
   "ui.settings.catchup": "Catch-up speed",
   "ui.settings.catchup_tip": "How much faster than live playback runs while shrinking the buffer after a spike.",
+  "ui.settings.level_loudness": "Level loudness",
+  "ui.settings.level_loudness_on": "Even out the volume of what I watch",
+  "ui.settings.level_loudness_tip": "Raises quiet audio slowly and lowers loud audio quickly, and never lets a sudden loud sound blast past a safe level, so every stream sounds about equally loud at 100%. Your volume slider on each stream works on top of it. Applies right away.",
 
   "ui.err.unreachable_or_expired": "Could not reach the relay. It may be offline, or this invite link expired (the relay's certificate changed): ask for a fresh invite link.",
   "ui.err.unreachable": "The relay is not answering. It may be down or restarting.",
@@ -534,6 +537,9 @@ const de = {
   "ui.settings.jitter_tip": "Maximaler Jitter-Puffer. Glättet Netzwerkaussetzer; wächst nur bei Bedarf, bis zu dieser Obergrenze.",
   "ui.settings.catchup": "Aufholtempo",
   "ui.settings.catchup_tip": "Wie viel schneller als live die Wiedergabe läuft, während der Puffer nach einer Spitze schrumpft.",
+  "ui.settings.level_loudness": "Lautstärke angleichen",
+  "ui.settings.level_loudness_on": "Lautstärke von dem, was ich schaue, angleichen",
+  "ui.settings.level_loudness_tip": "Hebt leisen Ton langsam an und senkt lauten Ton schnell ab und lässt plötzliche laute Geräusche nie über eine sichere Grenze hinaus. So klingt jeder Stream bei 100% etwa gleich laut. Dein Lautstärkeregler pro Stream wirkt zusätzlich. Gilt sofort.",
 
   "ui.err.unreachable_or_expired": "Das Relay ist nicht erreichbar. Es ist vielleicht aus, oder dieser Einladungslink ist abgelaufen (das Zertifikat des Relays hat sich geändert): bitte um einen neuen Einladungslink.",
   "ui.err.unreachable": "Das Relay antwortet nicht. Es ist vielleicht aus oder startet neu.",

@@ -381,11 +381,8 @@ pub enum UiAction {
     /// Settings > Audio boost: the sender-side multiplier (slider; persisted, pushed to running
     /// audio shares). Task #114.
     SetAudioGain(f64),
-    /// Settings > Audio boost > Calibrate: listen to the audio source with this name for 10 s
-    /// and set the boost from it.
-    CalibrateAudio(String),
-    /// Cancel a running calibration / dismiss its result.
-    CancelAudioCalibration,
+    /// Settings > Playback > Level loudness: viewer-side loudness levelling on/off (task #119).
+    SetLevelLoudness(bool),
     /// Settings > Diagnostics: copy the in-memory log (`logbuf`) to the clipboard + toast.
     CopyLogs,
     /// Settings > Diagnostics: write the log to a file in the Downloads folder, toast and
@@ -1112,7 +1109,6 @@ impl App {
         self.state.poll_pending_destinations();
         self.state.poll_destination_edits();
         self.state.poll_audio_sources();
-        self.state.poll_audio_calibration(std::time::Instant::now());
         // Rate-limited + hysteresis-filtered internally; cheap most frames.
         self.state.apply_bandwidth_allocation();
 

@@ -435,10 +435,16 @@ pub struct AppSettings {
     pub send_diagnostics: bool,
     /// Settings > Audio boost (task #114): the multiplier applied to the audio this client
     /// *shares*, before it is encoded (`audio::build_pipeline`'s `volume` + limiter). 1.0 = no
-    /// change; range `audio_gain::MIN_GAIN..=MAX_GAIN`; the calibration writes it too. A float so
-    /// the file reads `audio_gain = 3.2`; `AppSettings::audio_gain()` clamps whatever is on disk.
+    /// change; range `audio_gain::MIN_GAIN..=MAX_GAIN` (50-200 %, #119; a larger value on disk is
+    /// clamped to 2.0 when read). A float so the file reads `audio_gain = 1.5`;
+    /// `AppSettings::audio_gain()` clamps whatever is on disk.
     #[serde(default = "AppSettings::default_audio_gain")]
     pub audio_gain: f64,
+    /// Settings > Playback > "Level loudness" (task #119): the viewer-side automatic loudness
+    /// levelling of watched audio (`leveller.rs`). On by default; an old settings file without the
+    /// key gets it on.
+    #[serde(default = "AppSettings::default_level_loudness")]
+    pub level_loudness: bool,
 }
 
 /// See [`AppSettings::start_stream_defaults`].
@@ -496,11 +502,16 @@ impl Default for AppSettings {
             display_name: String::new(),
             send_diagnostics: false,
             audio_gain: Self::default_audio_gain(),
+            level_loudness: true,
         }
     }
 }
 
 impl AppSettings {
+    fn default_level_loudness() -> bool {
+        true
+    }
+
     fn default_audio_gain() -> f64 {
         crate::audio_gain::DEFAULT_GAIN
     }
@@ -867,7 +878,8 @@ mod tests {
             start_stream_defaults: StartStreamDefaults::default(),
             display_name: "mo".to_string(),
             send_diagnostics: true,
-            audio_gain: 3.2,
+            audio_gain: 1.5,
+            level_loudness: false,
         };
         let toml_str = toml::to_string_pretty(&settings).unwrap();
         let parsed: AppSettings = toml::from_str(&toml_str).unwrap();
@@ -880,8 +892,9 @@ mod tests {
         assert_eq!(parsed.catch_up_speed_percent, 8);
         assert_eq!(parsed.display_name, "mo");
         assert!(parsed.send_diagnostics);
-        assert_eq!(parsed.audio_gain, 3.2);
-        assert!(toml_str.contains("audio_gain = 3.2\n"), "stored readably: {toml_str}");
+        assert_eq!(parsed.audio_gain, 1.5);
+        assert!(!parsed.level_loudness);
+        assert!(toml_str.contains("audio_gain = 1.5\n"), "stored readably: {toml_str}");
     }
 
     /// Task #114: no boost unless set; a file from before the setting, or a corrupt value, is safe.
@@ -896,6 +909,19 @@ mod tests {
         assert_eq!(neg.audio_gain(), crate::audio_gain::MIN_GAIN);
         let nan: AppSettings = toml::from_str("audio_gain = nan\n").unwrap();
         assert_eq!(nan.audio_gain(), 1.0);
+        // #119: the cap is 200 %; a boost saved by the old 800 % range is clamped to 2.0.
+        let old_boost: AppSettings = toml::from_str("audio_gain = 3.2\n").unwrap();
+        assert_eq!(old_boost.audio_gain(), 2.0);
+    }
+
+    /// #119: levelling is on unless the user switched it off; a file from before the setting has it on.
+    #[test]
+    fn level_loudness_defaults_to_on() {
+        assert!(AppSettings::default().level_loudness);
+        let old: AppSettings = toml::from_str("language = \"de\"\n").unwrap();
+        assert!(old.level_loudness);
+        let off: AppSettings = toml::from_str("level_loudness = false\n").unwrap();
+        assert!(!off.level_loudness);
     }
 
     /// Opt-in (#110): a settings file without the key, and the default, mean "do not upload".

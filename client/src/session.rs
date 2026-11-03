@@ -1638,11 +1638,10 @@ pub struct AppState {
     /// shares. Pushed to every running audio share when it changes and used by the next one.
     /// See `rooms::AppSettings::audio_gain`, `audio_gain.rs`.
     pub audio_gain: f64,
-    /// The Settings calibration in flight, if any (`start_audio_calibration`). Never persisted.
-    pub audio_calibration: Option<crate::audio_gain::Calibration>,
-    /// How the last calibration ended, for the Settings row to show. Cleared when a new one
-    /// starts or the modal reopens.
-    pub audio_calibration_result: Option<crate::audio_gain::CalibrationOutcome>,
+    /// Settings > Playback > "Level loudness" (persisted, task #119): the viewer-side automatic
+    /// levelling of every watched audio stream (`leveller.rs`). On by default. Applied live through
+    /// the process-wide `leveller::ENABLED` switch. See `rooms::AppSettings::level_loudness`.
+    pub level_loudness: bool,
     /// Rate limiting, hysteresis and last-allocation bookkeeping for
     /// Absolute-Maximum mode. Never persisted: it describes this session's
     /// live encoders.
@@ -1858,6 +1857,7 @@ impl Default for AppState {
         // "on since startup" (everything the ring holds may go), a later tick only sends what
         // is logged from then on.
         crate::diag_upload::set_enabled(settings.send_diagnostics, false);
+        crate::leveller::set_enabled(settings.level_loudness);
         Self {
             display_name,
             display_name_set,
@@ -1885,8 +1885,7 @@ impl Default for AppState {
             catch_up_speed_percent: settings.catch_up_speed_percent,
             send_diagnostics: settings.send_diagnostics,
             audio_gain: settings.audio_gain(),
-            audio_calibration: None,
-            audio_calibration_result: None,
+            level_loudness: settings.level_loudness,
             bandwidth: BandwidthController::new(),
             pending_destinations: Vec::new(),
             recoveries: IndexMap::new(),
@@ -1981,6 +1980,15 @@ pub fn save_send_diagnostics(on: bool) {
     settings.send_diagnostics = on;
     if let Err(e) = settings.save() {
         tracing::warn!("failed to save the send-diagnostics preference: {e:#}");
+    }
+}
+
+/// Persist the viewer-side loudness levelling switch (task #119).
+pub fn save_level_loudness(on: bool) {
+    let mut settings = AppSettings::load();
+    settings.level_loudness = on;
+    if let Err(e) = settings.save() {
+        tracing::warn!("failed to save the level-loudness preference: {e:#}");
     }
 }
 
@@ -4938,20 +4946,6 @@ pub async fn build_audio_level_tap(source_id: u32) -> Result<audio::AudioLevelTa
         .map_err(|e| format!("{e:#}"))
 }
 
-/// The tap the Settings calibration listens with: re-lists the sources and takes the one called
-/// `name` (the list is deduplicated by name, so the first stream of that name; the same node the
-/// source dropdown's meter taps), then [`audio::start_calibration_tap`] (which proves the tap is
-/// linked to it). `Err` is a display string; the source having gone quiet and vanished from the
-/// list since the user picked it is the usual one.
-pub async fn build_calibration_tap(name: &str) -> Result<audio::AudioLevelTapHandle, String> {
-    let sources = list_audio_sources_async().await?;
-    let source = sources
-        .into_iter()
-        .find(|s| s.name == name)
-        .ok_or_else(|| format!("'{name}' is not playing audio any more"))?;
-    audio::start_calibration_tap(&source).await.map_err(|e| format!("{e:#}"))
-}
-
 /// Room management: join / create / forget.
 impl AppState {
     /// `Ok(())` unless a `RoomStore` save has failed (sticky — the error is
@@ -5138,6 +5132,14 @@ impl AppState {
         save_send_diagnostics(on);
     }
 
+    /// Settings > Playback > Level loudness: switch the viewer-side levelling on or off (live, for
+    /// every watched stream) and persist it.
+    pub fn set_level_loudness(&mut self, on: bool) {
+        self.level_loudness = on;
+        crate::leveller::set_enabled(on);
+        save_level_loudness(on);
+    }
+
     /// Settings > Audio boost: set (and persist) the sender-side multiplier, and apply it to
     /// every audio share that is running right now, live and without a restart. Returns the
     /// value stored (clamped).
@@ -5151,39 +5153,6 @@ impl AppState {
         }
         save_audio_gain(gain);
         gain
-    }
-
-    /// Settings > Audio boost > Calibrate: listen to the audio source called `source` for
-    /// `audio_gain::CALIBRATION_DURATION` and set the boost from what was heard. Replaces a
-    /// calibration already running. The tap is built off the UI thread (`pw-dump`,
-    /// `pipewiresrc` start-up, link check) and the countdown starts when it is up.
-    pub fn start_audio_calibration(&mut self, source: String) {
-        self.audio_calibration_result = None;
-        let (tx, rx) = oneshot::channel();
-        let name = source.clone();
-        tokio::spawn(async move {
-            let _ = tx.send(build_calibration_tap(&name).await);
-        });
-        self.audio_calibration = Some(crate::audio_gain::Calibration::starting(source, rx));
-    }
-
-    /// Abandon a running calibration (its tap stops when dropped) and forget the last result.
-    pub fn cancel_audio_calibration(&mut self) {
-        self.audio_calibration = None;
-        self.audio_calibration_result = None;
-    }
-
-    /// Advance the calibration; call once per frame. When it finishes, a measured result is
-    /// applied with [`Self::set_audio_gain`]; silence or a failure leaves the boost alone. The
-    /// outcome stays in `audio_calibration_result` for the UI.
-    pub fn poll_audio_calibration(&mut self, now: std::time::Instant) {
-        let Some(calibration) = &mut self.audio_calibration else { return };
-        let Some(outcome) = calibration.poll(now) else { return };
-        self.audio_calibration = None;
-        if let crate::audio_gain::CalibrationOutcome::Set { gain, .. } = &outcome {
-            self.set_audio_gain(*gain);
-        }
-        self.audio_calibration_result = Some(outcome);
     }
 
     /// Absolute-Maximum mode's per-client total, kbit/s (persisted along with

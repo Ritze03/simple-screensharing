@@ -218,7 +218,7 @@
 //! ## Pipeline
 //!
 //! ```text
-//! appsrc ! opusdec ! audioconvert ! audioresample ! volume name=vol ! autoaudiosink
+//! appsrc ! opusdec ! audioconvert ! audioresample ! capsfilter(F32LE) ! volume name=vol ! audioconvert ! autoaudiosink
 //! ```
 //!
 //! `appsrc` is configured with fixed caps `audio/x-opus,
@@ -233,6 +233,12 @@
 //! separate "audio format" side-channel (`StreamInfo` only has `width`/
 //! `height`, meaningful for video only), so the decoder can't know the
 //! sender's channel count up front any other way.
+//!
+//! The `capsfilter(F32LE)` carries the viewer-side loudness leveller (task #119): a buffer probe on
+//! its src pad (`leveller::install`, switch `leveller::ENABLED`) runs a slow AGC plus an instant
+//! peak limiter on the float samples in place, with no lookahead and so no added latency. The
+//! viewer's own volume (below) acts after it. The trailing `audioconvert` is a pass-through when
+//! the sink takes F32 and a safety net when it does not (viewer-side loudness leveller).
 //!
 //! `volume` (GStreamer's `volume` element) sits just before the sink so
 //! [`AudioDecoder::set_volume`] can adjust playback level live without
@@ -1713,19 +1719,34 @@ fn run_audio_pipeline(
     let resample = ElementFactory::make("audioresample")
         .build()
         .context("audioresample element unavailable")?;
+    // Float samples for the viewer-side leveller (task #119, `leveller.rs`): `levelled` pins the
+    // format, a buffer probe on its src pad edits the samples in place (zero added latency), then
+    // the viewer's own `volume` acts on the levelled signal. `to_sink` lets the sink take whatever
+    // format it prefers (it is a pass-through when the sink takes F32).
+    let levelled = ElementFactory::make("capsfilter")
+        .property("caps", Caps::builder("audio/x-raw").field("format", "F32LE").field("layout", "interleaved").build())
+        .build()
+        .context("capsfilter element unavailable")?;
+    if let Some(pad) = levelled.static_pad("src") {
+        crate::leveller::install(&pad, &crate::leveller::ENABLED);
+    }
     let volume = ElementFactory::make("volume")
         .name("vol")
         .build()
         .context("volume element unavailable")?;
+    let to_sink = ElementFactory::make("audioconvert")
+        .build()
+        .context("audioconvert element unavailable")?;
     let sink = ElementFactory::make(sink_factory)
         .build()
         .with_context(|| format!("{sink_factory} element unavailable"))?;
     sink.set_property("sync", sink_sync);
 
     pipeline
-        .add_many([&src, &decoder, &convert, &resample, &volume, &sink])
+        .add_many([&src, &decoder, &convert, &resample, &levelled, &volume, &to_sink, &sink])
         .context("failed to add elements to pipeline")?;
-    Element::link_many([&src, &decoder, &convert, &resample, &volume, &sink]).context("failed to link decode chain")?;
+    Element::link_many([&src, &decoder, &convert, &resample, &levelled, &volume, &to_sink, &sink])
+        .context("failed to link decode chain")?;
 
     let appsrc = src
         .dynamic_cast::<AppSrc>()
