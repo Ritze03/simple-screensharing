@@ -1159,7 +1159,11 @@ function layoutArena() {
     if (S.layout === "float") {
       let f = S.float[k];
       if (!f) { const b = containRect(c.x, c.y, c.w, c.h, ars[i]); f = S.float[k] = { x: b.x / W, y: b.y / H, w: b.w / W, h: b.h / H }; }
-      if (f.h == null) f.h = Math.min(1 - f.y, (f.w * W) / ars[i] / H);
+      /* a window always has its stream's aspect ratio, whatever layout or frame size it came from */
+      f.w = Math.min(f.w, 1, (H * ars[i]) / W);
+      f.h = (f.w * W) / ars[i] / H;
+      f.x = Math.max(0, Math.min(f.x, 1 - f.w));
+      f.y = Math.max(0, Math.min(f.y, 1 - f.h));
       q = { x: f.x * W, y: f.y * H, w: f.w * W, h: f.h * H };
       t.style.zIndex = 1 + Math.max(0, S.z.indexOf(k));
     } else {
@@ -1473,7 +1477,11 @@ window.addEventListener("pointermove", (e) => {
   if (S.layout === "float") {
     const f = S.float[drag.key], o = drag.f;
     if (!f || !o) return;
-    if (drag.kind === "rz") { f.w = Math.max(160 / W, Math.min(1 - o.x, o.w + dx / W)); f.h = Math.max(90 / H, Math.min(1 - o.y, o.h + dy / H)); }
+    if (drag.kind === "rz") {
+      const a = parseFloat(drag.t.style.getPropertyValue("--ar")) || 16 / 9;
+      const want = Math.max(o.w * W + dx, (o.h * H + dy) * a); /* the corner follows whichever axis moved further */
+      f.w = Math.max(160, Math.min(want, (1 - o.x) * W, (1 - o.y) * H * a)) / W;
+    }
     else { f.x = Math.max(0, Math.min(1 - o.w, o.x + dx / W)); f.y = Math.max(0, Math.min(1 - o.h, o.y + dy / H)); }
     ar.classList.add("nofx");
     layoutArena();
