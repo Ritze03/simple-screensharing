@@ -155,6 +155,8 @@ pub struct ConnState {
     /// Streams (owned by *other* connections) that this connection is
     /// currently subscribed to.
     pub subscriptions: HashSet<(ConnId, StreamId)>,
+    /// Relay-side counters for the diagnostics log (`diag.rs`).
+    pub diag: Arc<crate::diag::ConnDiag>,
     /// Number of streams this connection currently owns (mirrors
     /// `Member.stream_count` sent to clients).
     pub stream_count: u8,
@@ -167,6 +169,8 @@ pub struct ConnState {
 pub struct RouteTarget {
     pub conn_id: ConnId,
     pub connection: Session,
+    /// The target's diagnostics counters (eviction attribution, `diag.rs`).
+    pub diag: Arc<crate::diag::ConnDiag>,
 }
 
 /// Which transport a member arrived on. Only used for display; nothing in the
@@ -204,6 +208,9 @@ pub struct StreamRoute {
     /// the per-stream readout is meant to reflect what the relay is
     /// really moving.
     pub bytes_received: AtomicU64,
+    /// Per-window counters for the diagnostics log (`diag.rs`): frames,
+    /// keyframes, subscribes, evictions. One uncontended mutex per datagram.
+    pub diag: crate::diag::StreamDiag,
 }
 
 impl StreamRoute {
@@ -211,6 +218,7 @@ impl StreamRoute {
         Self {
             targets: SyncRwLock::new(Arc::from(Vec::new())),
             bytes_received: AtomicU64::new(0),
+            diag: Default::default(),
         }
     }
 
@@ -324,6 +332,7 @@ impl RoomState {
             .map(|c| RouteTarget {
                 conn_id: c.conn_id,
                 connection: c.connection.clone(),
+                diag: c.diag.clone(),
             })
             .collect();
         stream.route.publish(targets);
