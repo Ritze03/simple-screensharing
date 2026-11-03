@@ -1,0 +1,879 @@
+<title>Screensharing UI Replica</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400;600;700&family=Geist+Mono:wght@400;600&family=Material+Symbols+Outlined&display=block">
+<style>
+/* =====================================================================================================
+   Simple Screensharing — UI replica of the native egui desktop client (task #131, 2026-11-03).
+   A design sandbox: static fake data, no backend. Redesign by editing the TOKENS below; every token is
+   named after its constant in client/src/theme.rs (Rust name in the comment), so a change here can be
+   carried back into theme.rs (and docs/css/app.css, the browser client) one line at a time.
+   Layout concept: a fixed-size app frame (default 1920x1080, the rig's window) scaled to fit the page,
+   built from the same four primitives as egui's widgets/layout.rs: vbox .vb, hbox .hb, slot .sl, fill .fl.
+   The app is dark only (the former Electron app and egui never had a light theme), so this page commits
+   to that one look on purpose and sets every colour explicitly.
+   ===================================================================================================== */
+:root {
+  color-scheme: dark;
+
+  /* ---------- colours (theme.rs) ---------- */
+  --accent: #4c6ef5;              /* ACCENT */
+  --accent-light: #5c7bf7;        /* ACCENT_LIGHT */
+  --accent-deep: #2b3ea8;         /* ACCENT_DEEP */
+  --accent-lighter: #8ea3f9;      /* ACCENT_LIGHTER (pill text, watch eye, level button on) */
+  --sidebar-rail: #101114;        /* SIDEBAR_RAIL */
+  --panel-sunken: #16171a;        /* PANEL_SUNKEN (People panel, action bar) */
+  --panel-base: #1b1c1f;          /* PANEL_BASE (room body, modal) */
+  --panel-raised: #24252a;        /* PANEL_RAISED (cards) */
+  --tile-bg: #101114;             /* TILE_BG */
+  --elev-1b: #1b1c1f;             /* ELEV_1B (segmented track, row hover) */
+  --elev-16: #16171a;             /* ELEV_16 (sidebar wells) */
+  --elev-14: #141518;             /* ELEV_14 (user band) */
+  --wash-hover-1: #24252a;        /* WASH_HOVER_1 */
+  --wash-hover-2: #26272c;        /* WASH_HOVER_2 */
+  --border: #34353b;              /* BORDER */
+  --divider: #2a2b30;             /* DIVIDER */
+  --inset-border: #26272c;        /* INSET_BORDER */
+  --well-border: #1f2024;         /* WELL_BORDER */
+  --text: #e8e9ec;                /* TEXT */
+  --text-dim: #a8aab2;            /* TEXT_DIM */
+  --text-faint: #6e7078;          /* TEXT_FAINT */
+  --primary-text: #0b0c10;        /* PRIMARY_TEXT (text on accent/danger fills) */
+  --field: #28292d;               /* FIELD */
+  --btn: #2c2d32;                 /* BTN */
+  --btn-border: #44454c;          /* BTN_BORDER */
+  --danger: #e05a5a;              /* DANGER */
+  --success: #50c878;             /* SUCCESS */
+  --warning: #e8a33d;             /* WARNING */
+  /* translucent tokens (theme::rgba) */
+  --pill-live-bg: rgba(80, 200, 120, 0.12);        /* PILL_LIVE_BG */
+  --pill-live-border: rgba(80, 200, 120, 0.3);     /* PILL_LIVE_BORDER */
+  --pill-progress-bg: rgba(76, 110, 245, 0.14);    /* PILL_PROGRESS_BG */
+  --pill-progress-border: rgba(76, 110, 245, 0.4); /* PILL_PROGRESS_BORDER */
+  --hatch-amber-border: rgba(232, 163, 61, 0.4);   /* HATCH_AMBER_BORDER */
+  --hatch-amber: repeating-linear-gradient(45deg, rgba(232,163,61,.16) 0 4px, rgba(232,163,61,.05) 4px 8px); /* HATCH_AMBER_STRONG/WEAK */
+  --hatch-amber-soft: repeating-linear-gradient(45deg, rgba(232,163,61,.1) 0 6px, rgba(232,163,61,.04) 6px 12px); /* HATCH_AMBER_SOFT_A/B */
+  --accent-row-selected: rgba(76, 110, 245, 0.16); /* ACCENT_ROW_SELECTED */
+  --accent-ring: rgba(76, 110, 245, 0.28);         /* ACCENT_RING */
+  --accent-ghost-bg: rgba(76, 110, 245, 0.07);     /* ACCENT_GHOST_BG */
+  --accent-ghost-bg-hover: rgba(76, 110, 245, 0.14); /* ACCENT_GHOST_BG_HOVER */
+  --accent-ghost-border: rgba(76, 110, 245, 0.4);  /* ACCENT_GHOST_BORDER */
+  --accent-chip-bg: rgba(76, 110, 245, 0.1);       /* ACCENT_CHIP_BG */
+  --accent-chip-border: rgba(76, 110, 245, 0.45);  /* ACCENT_CHIP_BORDER */
+  --danger-tint: rgba(224, 90, 90, 0.12);          /* DANGER_TINT */
+  --danger-border: rgba(224, 90, 90, 0.5);         /* DANGER_BORDER */
+  --scrim: rgba(6, 7, 9, 0.66);                    /* SCRIM */
+  --accent-glow: 0 3px 14px rgba(76, 110, 245, 0.35); /* ACCENT_GLOW */
+  --success-glow: 0 0 6px rgba(80, 200, 120, 0.8);    /* SUCCESS_GLOW */
+  --chip-dark: rgba(0, 0, 0, 0.66);                /* CHIP_DARK */
+  --accent-gradient: linear-gradient(180deg, var(--accent-light) 0%, var(--accent) 100%);
+  --mark-gradient: linear-gradient(140deg, var(--accent-light) 0%, var(--accent-deep) 100%);
+  --screen-hatch: repeating-linear-gradient(115deg, #191a1e 0 8px, #141518 8px 16px); /* ELEV_19 / ELEV_14 */
+  /* video overlay (room.rs: statbar, round_btn, audio_pill; literal alphas there) */
+  --ovl-statbar: rgba(0, 0, 0, .62);        /* from_black_alpha(158) */
+  --ovl-audio-pill: rgba(0, 0, 0, .72);     /* from_black_alpha(184) */
+  --ovl-audio-ring: rgba(255, 255, 255, .18); /* from_white_alpha(46) */
+  --ovl-round: rgba(16, 17, 20, .55);       /* (16,17,20,140) */
+  --ovl-round-hover: rgba(16, 17, 20, .8);  /* (16,17,20,204) */
+  --ovl-round-ring: rgba(255, 255, 255, .16); /* from_white_alpha(41) */
+  --ovl-num: rgba(232, 233, 236, .85);      /* (232,233,236,217) */
+  --ovl-hover: rgba(255, 255, 255, .08);    /* from_white_alpha(20) */
+  --modal-shadow: 0 26px 70px rgba(0, 0, 0, 0.7);
+  --popup-shadow: 0 14px 40px rgba(0, 0, 0, 0.6);  /* Shadow{0,14,40, black 153} */
+  --card-shadow: 0 1px 2px rgba(0,0,0,.25), 0 6px 18px rgba(0,0,0,.18);
+
+  /* ---------- type (theme.rs FS_*, Geist / GeistMono / Material Symbols Outlined) ---------- */
+  --font-sans: "Geist", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, "JetBrains Mono", Consolas, monospace;
+  --font-icons: "Material Symbols Outlined";
+  --fs-h2: 18px;      /* FS_H2  room title */
+  --fs-h3: 15px;      /* FS_H3  modal title, brand */
+  --fs-body: 14px;    /* FS_BODY */
+  --fs-row: 13px;     /* FS_ROW  rows, names */
+  --fs-label: 12.5px; /* FS_LABEL control labels */
+  --fs-small: 12px;   /* FS_SMALL buttons, meta */
+  --fs-tiny: 11px;    /* FS_TINY */
+  --fs-unit: 10.5px;  /* FS_UNIT */
+  --fs-section: 10px; /* FS_SECTION uppercase card/section titles */
+  --fs-pill: 9.5px;   /* FS_PILL */
+
+  /* ---------- sizes (theme.rs) ---------- */
+  --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; /* S1..S4 */
+  --band-h: 56px;     /* BAND_H every header/footer band */
+  --ctl-h: 32px;      /* CTL_H buttons, fields, segmented, value boxes */
+  --ctl-h-lg: 36px;   /* CTL_H_LG bottom bar + modal footer buttons */
+  --pill-h: 18px;     /* PILL_H */
+  --pill-h-lg: 22px;  /* PILL_H_LG */
+  --row-h: 32px;      /* ROW_H */
+  --subrow-h: 24px;   /* SUBROW_H */
+  --dest-row-h: 40px; /* DEST_ROW_H */
+  --label-w: 120px;   /* LABEL_W */
+  --value-w: 72px;    /* VALUE_W */
+  --sidebar-w: 272px; /* SIDEBAR_W */
+  --people-w: 232px;  /* PEOPLE_W */
+  --ovl-h: 29px;      /* room.rs OVL_H (statbar, round buttons, audio pill) */
+  --modal-w: 520px; --modal-w-wide: 640px; --modal-w-xwide: 1120px; /* MODAL_W* */
+  --rounding: 14px;      /* ROUNDING (modal) */
+  --rounding-well: 12px; /* ROUNDING_WELL (wells, cards) */
+  --rounding-md: 9px;    /* ROUNDING_MD (buttons, segmented) */
+  --rounding-sm: 8px;    /* ROUNDING_SM (rows, fields) */
+  --rounding-xs: 6px;    /* ROUNDING_XS (tiles, value boxes) */
+
+  /* ---------- this page only (not part of the app) ---------- */
+  --page-bg: #0b0c0e;
+  --page-line: #22232a;
+}
+
+/* ===================================== page chrome ===================================== */
+html { background: var(--page-bg); }
+body { background: var(--page-bg); color: var(--text); font-family: var(--font-sans); font-size: 14px; -webkit-font-smoothing: antialiased; margin: 0; }
+.page { padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 12px 24px; display: flex; flex-direction: column; gap: 12px; }
+.nav { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; }
+.nav h1 { margin: 0; font-size: 15px; font-weight: 700; display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+.nav .grp { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.nav .grp > b { font-size: 10px; letter-spacing: .11em; text-transform: uppercase; color: var(--accent); margin-right: 4px; }
+.nav button, .nav select { height: 28px; border-radius: 7px; border: 1px solid var(--border); background: var(--panel-raised); color: var(--text-dim); font: 600 12px var(--font-sans); padding: 0 10px; cursor: pointer; }
+.nav button:hover { color: var(--text); background: var(--btn); }
+.nav button.on { background: var(--accent-gradient); color: var(--primary-text); border-color: transparent; }
+.nav label { font-size: 12px; color: var(--text-dim); display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.nav .note { font-size: 11.5px; color: var(--text-faint); flex-basis: 100%; line-height: 1.5; max-width: 110ch; }
+.stage { position: relative; width: 100%; overflow: hidden; border: 1px solid var(--page-line); border-radius: 6px; background: #000; }
+.frame { position: absolute; left: 0; top: 0; transform-origin: 0 0; overflow: hidden; }
+
+/* ===================================== app (from docs/css/app.css, matched to native) ===================================== */
+.frame { background: var(--panel-base); color: var(--text); font-family: var(--font-sans); font-size: var(--fs-body); }
+:where(.frame) :where(button, input, select) { font-family: inherit; font-size: inherit; color: inherit; }
+.frame * { scrollbar-width: thin; scrollbar-color: #3a3b42 transparent; }
+.ms { font-family: var(--font-icons); font-weight: normal; font-style: normal; font-size: 18px; line-height: 1; letter-spacing: normal; text-transform: none; display: inline-block; white-space: nowrap; direction: ltr; font-feature-settings: "liga"; flex: 0 0 auto; user-select: none; }
+.frame :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+
+/* layout primitives (egui widgets/layout.rs: vbox, HBox, fixed slot, FILL) */
+.vb { display: flex; flex-direction: column; min-width: 0; box-sizing: border-box; }
+.hb { display: flex; flex-direction: row; align-items: center; min-width: 0; box-sizing: border-box; }
+.minh0 { min-height: 0; }
+.hb.st { align-items: stretch; }
+.hb > .sl, .hb > .fl { align-self: stretch; }
+.sl { flex: 0 0 auto; display: flex; align-items: center; justify-content: center; min-width: 0; box-sizing: border-box; }
+.sl.l { justify-content: flex-start; } .sl.r { justify-content: flex-end; }
+.fl { flex: 1 1 0; min-width: 0; display: flex; align-items: center; box-sizing: border-box; }
+.fl.v { flex-direction: column; align-items: stretch; justify-content: center; }
+.g0 { gap: 0; } .g1 { gap: var(--s1); } .g2 { gap: var(--s2); } .g3 { gap: var(--s3); } .g4 { gap: var(--s4); }
+.eq { flex: 1 1 0; min-width: 0; }
+.txt { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* brand mark */
+.mark { width: 30px; height: 22px; position: relative; flex: 0 0 auto; }
+.mark::before, .mark::after { content: ""; position: absolute; border-radius: 5px; border: 2.5px solid; }
+.mark::before { left: 0; top: 0; width: 19px; height: 13px; border-color: var(--accent-light); }
+.mark::after { right: 0; bottom: 0; width: 15px; height: 11px; border-color: var(--success); background: var(--sidebar-rail); }
+
+/* segmented control (widgets::segmented) */
+.seg { display: flex; gap: 3px; padding: 3px; height: var(--ctl-h); width: 100%; box-sizing: border-box; background: var(--elev-1b); border: 1px solid var(--inset-border); border-radius: var(--rounding-md); }
+.seg > button { flex: 1 1 0; min-width: 0; border: none; background: transparent; color: var(--text-dim); border-radius: 6px; padding: 0 4px; height: 100%; font-size: var(--fs-small); line-height: 1; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.seg > button:hover { background: var(--wash-hover-1); color: var(--text); }
+.seg > button.on, .seg > button.on:hover { background: var(--accent-gradient); color: var(--primary-text); font-weight: 700; }
+
+/* buttons (widgets::Btn) */
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: var(--ctl-h); box-sizing: border-box; border-radius: var(--rounding-md); border: 1px solid transparent; padding: 0 12px; cursor: pointer; font-weight: 700; font-size: var(--fs-small); white-space: nowrap; line-height: 1; min-width: 0; flex: 0 0 auto; }
+.btn .ms { font-size: 17px; }
+.btn:disabled { cursor: default; opacity: 0.45; }
+.btn-lg { height: var(--ctl-h-lg); padding: 0 14px; font-size: var(--fs-label); }
+.btn.wide { width: 100%; }
+.btn-primary { background: var(--accent-gradient); box-shadow: var(--accent-glow); color: var(--primary-text); }
+.btn-primary:hover:not(:disabled) { filter: brightness(1.08); }
+.btn-primary:disabled { box-shadow: none; }
+.btn-secondary { background: var(--btn); color: var(--text); border-color: var(--btn-border); }
+.btn-secondary:hover:not(:disabled) { background: var(--wash-hover-1); }
+.btn-danger { background: transparent; color: var(--danger); border-color: var(--danger-border); }
+.btn-danger:hover:not(:disabled) { background: var(--danger-tint); }
+.btn-danger-solid { background: var(--danger); color: var(--primary-text); border-color: var(--danger); }
+.btn-ghost { background: var(--accent-ghost-bg); color: var(--accent); border: 1px dashed var(--accent-ghost-border); justify-content: flex-start; }
+.btn-ghost:hover { background: var(--accent-ghost-bg-hover); }
+.icon-btn { width: var(--ctl-h); height: var(--ctl-h); flex: 0 0 var(--ctl-h); box-sizing: border-box; display: inline-flex; align-items: center; justify-content: center; border-radius: var(--rounding-sm); border: 1px solid transparent; background: transparent; color: var(--text-dim); cursor: pointer; padding: 0; }
+.icon-btn:hover { background: var(--wash-hover-1); color: var(--text); }
+.icon-btn.bordered { border-color: var(--btn-border); background: var(--btn); color: var(--text); }
+.icon-btn.sm { width: 26px; height: 26px; flex-basis: 26px; }
+.icon-btn.sm .ms { font-size: 16px; }
+
+/* pills (widgets::Pill) */
+.badge { display: inline-flex; align-items: center; gap: 5px; height: var(--pill-h); box-sizing: border-box; padding: 0 8px 0 7px; border-radius: 999px; border: 1px solid transparent; font-size: var(--fs-pill); font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; line-height: 1; white-space: nowrap; flex: 0 0 auto; }
+.badge .ms { font-size: 12px; }
+.badge-live { background: var(--pill-live-bg); border-color: var(--pill-live-border); color: var(--success); }
+.badge-live .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--success); box-shadow: var(--success-glow); }
+.badge-progress { background: var(--pill-progress-bg); border-color: var(--pill-progress-border); color: var(--accent-lighter); }
+.badge-progress .bar { width: 14px; height: 4px; border-radius: 2px; background-image: repeating-linear-gradient(90deg, var(--accent-lighter) 0 4px, transparent 4px 7px); background-size: 14px 4px; animation: march .65s linear infinite; }
+.badge-degraded { color: var(--warning); border-color: var(--hatch-amber-border); background-image: var(--hatch-amber); }
+.badge-muted { color: var(--text-dim); border-color: var(--border); background: var(--panel-sunken); }
+.badge.lg { height: var(--pill-h-lg); padding: 0 10px 0 8px; font-size: 10px; }
+@keyframes march { from { background-position: 0 0; } to { background-position: 14px 0; } }
+@keyframes pulse { 50% { opacity: .35; } }
+
+.section-label { display: flex; align-items: center; gap: var(--s2); margin: 0; height: 16px; font-size: var(--fs-section); font-weight: 700; letter-spacing: 0.11em; text-transform: uppercase; color: var(--accent); white-space: nowrap; }
+.section-label .count { color: var(--text-faint); letter-spacing: 0; font-family: var(--font-mono); font-weight: 400; font-size: var(--fs-unit); }
+.rule { flex: 1 1 auto; height: 1px; background: var(--well-border); }
+
+/* slider (widgets::slider) */
+.frame input[type="range"] { -webkit-appearance: none; appearance: none; width: 100%; height: 18px; background: transparent; cursor: pointer; margin: 0; min-width: 0; }
+.frame input[type="range"]::-webkit-slider-runnable-track { height: 5px; border-radius: 3px; background-color: var(--elev-1b); background-image: linear-gradient(90deg, var(--accent-deep) 0%, var(--accent) var(--pct, 0%), transparent var(--pct, 0%)); border: 1px solid var(--inset-border); }
+.frame input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 14px; height: 14px; margin-top: -5px; border-radius: 50%; background: var(--text); box-shadow: 0 1px 4px rgba(0,0,0,.6); }
+.frame input[type="range"]::-moz-range-track { height: 5px; border-radius: 3px; background: var(--elev-1b); border: 1px solid var(--inset-border); }
+.frame input[type="range"]::-moz-range-progress { height: 5px; border-radius: 3px; background: linear-gradient(90deg, var(--accent-deep), var(--accent)); }
+.frame input[type="range"]::-moz-range-thumb { width: 14px; height: 14px; border: none; border-radius: 50%; background: var(--text); }
+/* volume slider 0-500 %: tick at 100 % (20 % along) */
+.frame input[type="range"].vol { --mark: calc(7px + (100% - 14px) * 0.2); }
+.frame input[type="range"].vol::-webkit-slider-runnable-track { background-image: linear-gradient(90deg, transparent calc(var(--mark) - 1px), rgba(255,255,255,.5) calc(var(--mark) - 1px), rgba(255,255,255,.5) calc(var(--mark) + 1px), transparent calc(var(--mark) + 1px)), linear-gradient(90deg, var(--accent-deep) 0%, var(--accent) var(--pct, 0%), transparent var(--pct, 0%)); }
+
+/* fields, select, checkbox, value box (widgets::text_field, select, checkbox, value_box) */
+.field { background: var(--field); border: 1px solid var(--border); border-radius: var(--rounding-sm); color: var(--text); height: var(--ctl-h); padding: 0 10px; outline: none; width: 100%; box-sizing: border-box; min-width: 0; font-size: var(--fs-row); }
+.field::placeholder { color: var(--text-faint); }
+.field:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-chip-bg); }
+.selwrap { position: relative; width: 100%; }
+.selwrap select { appearance: none; -webkit-appearance: none; cursor: pointer; padding-right: 30px; font-size: var(--fs-row); }
+.selwrap .ms { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); font-size: 18px; color: var(--text-dim); pointer-events: none; }
+.cbx { display: inline-flex; align-items: center; gap: 10px; height: var(--ctl-h); cursor: pointer; user-select: none; padding: 0 var(--s2); margin: 0 calc(-1 * var(--s2)); border-radius: 6px; font-size: var(--fs-label); color: var(--text); white-space: nowrap; }
+.cbx:hover { background: var(--wash-hover-1); }
+.cbx .box { width: 18px; height: 18px; box-sizing: border-box; border-radius: 5px; border: 1px solid var(--btn-border); display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; }
+.cbx .box .ms { font-size: 15px; color: #fff; visibility: hidden; font-weight: 700; }
+.cbx.on .box { background: var(--accent); border-color: var(--accent); }
+.cbx.on .box .ms { visibility: visible; }
+.cbx.disabled { opacity: .45; cursor: default; }
+.cbx.disabled:hover { background: none; }
+.val { width: 100%; height: var(--ctl-h); box-sizing: border-box; display: flex; align-items: center; justify-content: flex-end; font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: var(--fs-small); background: var(--field); border: 1px solid var(--border); border-radius: var(--rounding-xs); padding: 0 8px; white-space: nowrap; }
+.val.center { justify-content: center; }
+.ro { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: var(--fs-small); color: var(--text-dim); }
+.lbl { font-size: var(--fs-label); color: var(--text); display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.tip { color: var(--text-faint); font-size: 15px !important; cursor: help; }
+.meter { display: inline-flex; align-items: flex-end; gap: 2px; height: 14px; width: 23px; flex: 0 0 23px; }
+.meter i { width: 3px; border-radius: 1px; background: var(--btn-border); display: block; }
+.meter i:nth-child(1) { height: 5px; } .meter i:nth-child(2) { height: 8px; } .meter i:nth-child(3) { height: 11px; } .meter i:nth-child(4) { height: 14px; } .meter i:nth-child(5) { height: 14px; }
+.meter i.lit { background: var(--success); }
+.collapser { height: var(--ctl-h); font-size: var(--fs-label); color: var(--text-dim); cursor: pointer; gap: 6px; }
+.collapser .ms { font-size: 16px; }
+.collapser:hover { color: var(--text); }
+
+/* avatar (widgets::paint_avatar), status dot */
+.avatar { width: 32px; height: 32px; border-radius: 50%; color: #fff; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; font-size: 13px; flex: 0 0 auto; position: relative; }
+.avatar.sm { width: 22px; height: 22px; font-size: 10.5px; }
+.avatar .pres { position: absolute; right: -2px; bottom: -2px; width: 10px; height: 10px; border-radius: 50%; border: 2px solid var(--elev-14); background: var(--success); }
+.sdot { width: 9px; height: 9px; border-radius: 50%; box-sizing: border-box; }
+.sdot.joined { background: var(--success); box-shadow: var(--success-glow); }
+.sdot.connecting { background: var(--warning); animation: pulse 1.2s ease-in-out infinite; }
+.sdot.disconnected { border: 1.5px solid var(--text-faint); }
+.chip-dark { display: inline-flex; align-items: center; gap: var(--s1); height: 22px; box-sizing: border-box; padding: 0 8px; border-radius: 999px; background: var(--chip-dark); font-size: 10.5px; font-weight: 700; letter-spacing: .03em; color: var(--text); white-space: nowrap; }
+.chip-dark .ms { font-size: 13px; }
+.chip-dark .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--success); box-shadow: var(--success-glow); }
+
+/* ---------- shell frames ---------- */
+.p-app { height: 100%; background: var(--panel-base); position: relative; }
+.p-side { width: var(--sidebar-w); flex: 0 0 var(--sidebar-w); background: var(--sidebar-rail); border-right: 1px solid var(--panel-raised); }
+.band { height: var(--band-h); flex: 0 0 var(--band-h); box-sizing: border-box; padding: 0 var(--s4); }
+.band.top { border-bottom: 1px solid var(--divider); }
+.band.bottom { border-top: 1px solid var(--divider); }
+.p-brand { font-weight: 700; font-size: var(--fs-h3); }
+.p-side-scroll { flex: 1 1 auto; overflow-y: auto; padding: 0 var(--s3) var(--s3); }
+.well { padding: var(--s1); background: var(--elev-16); border: 1px solid var(--well-border); border-radius: var(--rounding-well); }
+.p-row { height: var(--row-h); flex: 0 0 var(--row-h); padding: 0 var(--s2); border-radius: var(--rounding-sm); cursor: pointer; border: 0; background: transparent; color: var(--text); width: 100%; text-align: left; font-size: var(--fs-row); }
+.p-row:hover { background: var(--elev-1b); }
+.p-row.sel { background: var(--accent-row-selected); box-shadow: inset 0 0 0 1px var(--accent-ring); }
+.p-row .name { font-weight: 700; }
+.p-sub { height: var(--subrow-h); flex: 0 0 var(--subrow-h); padding: 0 var(--s2); font-size: var(--fs-small); color: var(--text-dim); border-radius: 6px; cursor: pointer; }
+.p-sub:hover { background: var(--elev-1b); color: var(--text); }
+.ico { font-size: 16px; color: var(--text-dim); }
+.p-sub .ico { font-size: 14px; }
+.ico.live { color: var(--success); }
+.ico.watch { color: var(--accent-lighter); }
+.num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: var(--fs-tiny); color: var(--text-dim); }
+.unit { font-family: var(--font-mono); font-size: var(--fs-unit); color: var(--text-faint); }
+.unit-ico { font-size: 15px; color: var(--text-faint); }
+.p-user { background: var(--elev-14); border-top-color: var(--well-border); padding: 0 var(--s3); }
+.p-user .who { cursor: pointer; border-radius: 6px; padding: 3px 6px; margin: 0 -6px; }
+.p-user .who:hover { background: var(--wash-hover-1); }
+.p-user .who span { font-size: var(--fs-tiny); line-height: 14px; color: var(--text-dim); }
+.p-user .who span.live { color: var(--success); }
+.p-user .who b { font-size: var(--fs-row); line-height: 16px; color: var(--text); }
+.p-head h2 { margin: 0; font-size: var(--fs-h2); font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.meta { color: var(--text-dim); font-size: var(--fs-small); white-space: nowrap; }
+.p-center { overflow-y: auto; padding: var(--s4); }
+.p-right { width: var(--people-w); flex: 0 0 var(--people-w); border-left: 1px solid var(--divider); background: var(--panel-sunken); overflow-y: auto; padding: var(--s4) var(--s3); box-sizing: border-box; }
+.member { height: var(--row-h); flex: 0 0 var(--row-h); padding: 0 var(--s1); border-radius: var(--rounding-sm); font-size: var(--fs-row); }
+.member:hover { background: var(--wash-hover-1); }
+.member .you { color: var(--text-faint); font-size: var(--fs-tiny); margin-left: 6px; }
+.member.idle .name { color: var(--text-dim); }
+
+/* ---------- watched-stream tile + its hover overlay (room.rs tile, statbar, round_btn, audio_pill) ---------- */
+.tile { position: relative; aspect-ratio: 16/9; width: 100%; background: var(--tile-bg); box-shadow: 0 0 0 1px rgba(80, 200, 120, 0.2); overflow: hidden; border-radius: var(--rounding-xs); }
+.ovl { position: absolute; inset: 0; padding: var(--s2); }
+.hover-ui { opacity: 0; transition: opacity .12s; }
+.tile:hover .hover-ui, .fs:hover .hover-ui, .pin-ovl .hover-ui { opacity: 1; }
+.vig { position: absolute; inset: 0; background: linear-gradient(180deg, rgba(10,11,13,.55) 0%, rgba(10,11,13,.1) 40%, rgba(10,11,13,.82) 100%); pointer-events: none; }
+.statbar { height: var(--ovl-h); box-sizing: border-box; padding: 0 10px; border-radius: 999px; background: var(--ovl-statbar); max-width: 100%; }
+.statbar .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--success); box-shadow: 0 0 0 1.5px rgba(80,200,120,.2); flex: 0 0 auto; }
+.statbar .nm { font-size: var(--fs-row); font-weight: 700; flex: 0 1 auto; }
+.statbar .v { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: var(--fs-small); color: var(--ovl-num); white-space: nowrap; flex: 0 0 auto; }
+.statbar .v.fps { min-width: 6ch; text-align: right; }
+.statbar .v.kbps { min-width: 8ch; text-align: right; }
+.round-btn { width: var(--ovl-h); height: var(--ovl-h); border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; background: var(--ovl-round); border: 1px solid var(--ovl-round-ring); color: var(--text); cursor: pointer; padding: 0; box-sizing: border-box; flex: 0 0 auto; }
+.round-btn .ms { font-size: 16px; }
+.round-btn:hover { background: var(--ovl-round-hover); }
+.round-btn.stop:hover { color: var(--danger); }
+/* audio pill [25 mute][110 volume 0-500 %][34 %][25 level]; the level button is concentric in the right end cap (#130) */
+.audio-pill { height: var(--ovl-h); box-sizing: border-box; padding: 0 10px 0 1px; border-radius: 999px; background: var(--ovl-audio-pill); border: 1px solid var(--ovl-audio-ring); }
+.audio-pill:not(.muted) { padding-right: 1px; }
+.audio-pill button { width: 25px; height: 25px; border-radius: 50%; border: 0; background: transparent; color: var(--text); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; padding: 0; }
+.audio-pill button:hover { background: var(--ovl-hover); }
+.audio-pill button .ms { font-size: 16px; }
+.audio-pill .pct { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: var(--fs-tiny); color: var(--ovl-num); }
+.audio-pill.muted button { color: var(--danger); }
+.audio-pill button.level { color: var(--text-faint); }
+.audio-pill button.level.on { color: var(--accent-lighter); background: var(--accent-chip-bg); box-shadow: inset 0 0 0 1px var(--accent-chip-border); }
+
+/* ---------- fake video picture (stand-in for the rig's vkcube test pattern) ---------- */
+.screen { position: absolute; inset: 0; container-type: size; background: radial-gradient(ellipse at 50% 35%, #3b3c3d 0%, #262728 55%, #18191a 100%); overflow: hidden; perspective: 260cqh; }
+.cube { position: absolute; left: 50%; top: 50%; width: 44cqh; height: 44cqh; margin: -22cqh 0 0 -22cqh; transform-style: preserve-3d; transform: rotateX(-24deg) rotateY(var(--ry, 28deg)); }
+.cube i { position: absolute; inset: 0; background: linear-gradient(160deg, #6b6c6e, #4a4b4d); display: flex; align-items: center; justify-content: center; backface-visibility: hidden; }
+.cube i::after { content: ""; width: 78%; height: 40%; border-radius: 4cqh; background: radial-gradient(circle at 72% 50%, #8aa 0 18%, transparent 19%), linear-gradient(100deg, #0d4f58, #126a74 60%, #0a3a41); }
+.cube i:nth-child(1) { transform: translateZ(22cqh); }
+.cube i:nth-child(2) { transform: rotateY(90deg) translateZ(22cqh); filter: brightness(.7); }
+.cube i:nth-child(3) { transform: rotateX(90deg) translateZ(22cqh); filter: brightness(1.15); }
+.cube i:nth-child(4) { transform: rotateY(-90deg) translateZ(22cqh); }
+.spin .cube { animation: spin 14s linear infinite; }
+@keyframes spin { to { transform: rotateX(-24deg) rotateY(388deg); } }
+
+/* ---------- share cards (room.rs card_frame, share_card, my_card) ---------- */
+.scard { background: var(--panel-raised); border: 1px solid var(--border); border-radius: var(--rounding-well); overflow: hidden; width: 100%; box-sizing: border-box; box-shadow: var(--card-shadow); }
+.thumb { position: relative; aspect-ratio: 16/9; width: 100%; background: var(--tile-bg); }
+.thumb .noprev { position: absolute; inset: 0; display: flex; flex-direction: column; gap: 8px; align-items: center; justify-content: center; color: var(--text-faint); font-size: var(--fs-tiny); }
+.thumb .noprev .ms { font-size: 22px; }
+.thumb.mine { background-image: var(--screen-hatch); }
+.mine-label { color: var(--text-faint); font-size: var(--fs-tiny); }
+.mine-label .ms { font-size: 22px; color: var(--success); }
+.card-pad { padding: var(--s3); }
+.who b { font-size: 13.5px; flex: 0 0 auto; white-space: nowrap; }
+.who .t { color: var(--text-dim); font-size: var(--fs-small); }
+.specs { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: var(--fs-tiny); line-height: 16px; height: 16px; color: var(--text-dim); }
+.empty { border: 1px dashed var(--border); border-radius: var(--rounding-well); padding: 24px; color: var(--text-dim); font-size: var(--fs-label); text-align: center; align-items: center; }
+.empty .big { font-size: 26px; color: var(--text-faint); }
+.empty b { color: var(--text); font-size: 13.5px; }
+
+/* ---------- action bar (action_bar.rs) ---------- */
+.p-bar { background: var(--panel-sunken); }
+.p-bar .t1 { font-size: var(--fs-label); line-height: 16px; font-weight: 700; }
+.p-bar .t2 { font-size: var(--fs-tiny); line-height: 14px; color: var(--text-dim); }
+.vsep { width: 1px; height: 28px; background: var(--divider); flex: 0 0 auto; }
+
+/* ---------- cards, rows, modals (widgets::card, ctrl_row, dest_row, modal_shell) ---------- */
+.gcard { background: var(--panel-raised); border: 1px solid var(--border); border-radius: var(--rounding-well); padding: var(--s3); }
+.crow { height: var(--ctl-h); flex: 0 0 var(--ctl-h); }
+.destrow { height: var(--dest-row-h); flex: 0 0 var(--dest-row-h); padding: 0 var(--s1) 0 var(--s3); border-radius: var(--rounding-sm); background: var(--panel-sunken); border: 1px solid var(--inset-border); font-size: var(--fs-label); }
+.destrow.cur { border-color: var(--accent-chip-border); background: var(--accent-chip-bg); }
+.destrow.cur .ico { color: var(--accent-lighter); }
+.destrow .name { font-weight: 700; }
+.destrow small { font-weight: 400; color: var(--text-faint); margin-left: 6px; font-size: var(--fs-tiny); }
+.kbps { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: 11.5px; color: var(--text-dim); white-space: nowrap; }
+.scrim { position: absolute; inset: 0; background: var(--scrim); z-index: 30; display: flex; align-items: center; justify-content: center; }
+.modal { width: min(var(--modal-w), calc(100% - 48px)); max-height: calc(100% - 48px); background: var(--panel-base); border: 1px solid var(--border); border-radius: var(--rounding); box-shadow: var(--modal-shadow); }
+.modal.wide { width: min(var(--modal-w-wide), calc(100% - 48px)); }
+.modal.xwide { width: min(var(--modal-w-xwide), calc(100% - 48px)); }
+.modal-head { padding: 0 var(--s3) 0 20px; border-bottom: 1px solid var(--divider); }
+.modal-head h3 { margin: 0; font-size: var(--fs-h3); line-height: 20px; }
+.modal-head .sub { font-size: var(--fs-small); color: var(--text-dim); }
+.modal-body { padding: var(--s4) 20px; overflow-y: auto; flex: 1 1 auto; }
+.modal.xwide .modal-body { padding-bottom: 26px; } /* native: the stream-settings body keeps ~10 px more below its columns */
+.modal-foot { height: 64px; flex: 0 0 64px; padding: 0 20px; border-top: 1px solid var(--divider); }
+.modal-foot .btn { min-width: 96px; }
+.note { font-size: var(--fs-small); color: var(--text-dim); }
+.note .ms { font-size: 16px; color: var(--success); }
+
+/* ---------- fullscreen stream (popout::fullscreen_overlay) ---------- */
+.fs { position: absolute; inset: 0; background: #000; z-index: 20; }
+.fs .ovl { padding: var(--s2); }
+
+@media (prefers-reduced-motion: reduce) { .badge-progress .bar, .sdot.connecting, .spin .cube { animation: none; } }
+</style>
+
+<div class="page">
+  <div class="nav" id="nav">
+    <h1><span class="mark" aria-hidden="true"></span>Screensharing UI Replica</h1>
+    <div class="grp" id="nav-views"><b>View</b></div>
+    <div class="grp" id="nav-modals"><b>Modal</b></div>
+    <div class="grp">
+      <b>Frame</b>
+      <select id="nav-size" aria-label="Window size">
+        <option value="1920x1080">1920 × 1080</option>
+        <option value="1600x900">1600 × 900</option>
+        <option value="1280x800">1280 × 800</option>
+        <option value="800x700">800 × 700 (minimum)</option>
+      </select>
+      <select id="nav-data" aria-label="Fake data">
+        <option value="demo">Demo data</option>
+        <option value="rig">Rig data (side-by-side)</option>
+      </select>
+      <label><input type="checkbox" id="nav-ovl" checked> Pin hover overlays</label>
+      <label><input type="checkbox" id="nav-spin"> Animate picture</label>
+    </div>
+    <div class="note">Static replica of the native egui client with fake data. Most controls work: open rooms, Watch, Share screen, Go live, the gear, double-click a tile for fullscreen (Esc leaves), the audio pill. Colours, type and sizes are the CSS tokens at the top of the file, named after <code>client/src/theme.rs</code>.</div>
+  </div>
+  <div class="stage" id="stage"><div class="frame" id="frame"></div></div>
+</div>
+
+<script>
+"use strict";
+/* ============================== fake data ==============================
+   Two data sets: "demo" (richer, shows the audio pill) and "rig" (the headless rig's names, for side-by-side
+   comparison with screenshots of the real app). Edit freely. */
+const DATA = {
+  demo: {
+    rooms: [
+      { id: "films", name: "Friday Films", state: "joined", members: ["mo", "Ritze", "Ana", "Jonas"], auto: true,
+        streams: [{ owner: "Ritze", label: "Screen", w: 2560, h: 1440, fps: 60, kbps: 9400, audio: true, preview: true },
+                  { owner: "Ana", label: "Display 2", w: 1920, h: 1080, fps: 30, kbps: 5200, audio: false, preview: true }] },
+      { id: "games", name: "Gaming Night", state: "joined", members: ["mo", "Ben", "Cleo"], auto: true,
+        streams: [{ owner: "Ben", label: "Screen", w: 1920, h: 1080, fps: 144, kbps: 12000, audio: true, preview: true }] },
+      { id: "study", name: "Study Group", state: "disconnected", members: [], auto: false, streams: [] },
+    ],
+    me: "mo", meRoom: "films", watchOwner: "Ritze",
+  },
+  rig: {
+    rooms: [
+      { id: "lt", name: "launch-test", state: "joined", members: ["client-1", "client-2"], auto: true,
+        streams: [{ owner: "client-1", label: "Screen", w: 1920, h: 1080, fps: 30, kbps: 7600, audio: false, preview: false }] },
+    ],
+    me: "client-2", meRoom: "lt", watchOwner: "client-1",
+  },
+};
+
+/* ============================== presets (the nav's views) ============================== */
+const PRESETS = [
+  ["room-watch", "Room · watching", { view: "room", watching: true, sharing: "none" }],
+  ["room-cards", "Room · cards", { view: "room", watching: false, sharing: "none" }],
+  ["room-live", "Room · sharing live", { view: "room", watching: false, sharing: "live", sharerSelf: true }],
+  ["room-empty", "Room · nobody sharing", { view: "room", watching: false, sharing: "none", sharerSelf: true }],
+  ["watched", "Watched streams", { view: "watched", watching: true, sharing: "none" }],
+  ["fullscreen", "Fullscreen stream", { view: "fullscreen", watching: true, sharing: "none" }],
+];
+const MODALS = [
+  ["stream-staged", "Set up your stream", { modal: "stream", sharing: "staged", sharerSelf: true, view: "room", watching: false }],
+  ["stream-live", "Stream settings", { modal: "stream", sharing: "live", sharerSelf: true, view: "room", watching: false }],
+  ["settings", "Settings", { modal: "settings", view: "watched", watching: true }],
+  ["add-room", "Create or join", { modal: "add", view: "watched", watching: true }],
+];
+
+const S = {
+  data: "demo", view: "room", room: null, watching: true, sharing: "none", sharerSelf: false, modal: null,
+  addTab: "join", vol: 100, muted: false, level: true, fps: 60, kbps: 8000, codec: "H.264", preset: "Balanced",
+  bwMode: "per", auto: true, lang: "English", presentation: "Mailbox (default)", jitter: 2000, catchup: 5, boost: 100,
+  diag: false, muteShared: false, advanced: false, size: "1920x1080", pin: true, spin: false,
+};
+const D = () => DATA[S.data];
+/* "sharerSelf": the presets that show your own share (rig: you are client-1, the only sharer). */
+const me = () => (S.data === "rig" && S.sharerSelf ? "client-1" : D().me);
+const roomById = (id) => D().rooms.find((r) => r.id === id);
+const curRoom = () => roomById(S.room) || D().rooms[0];
+const othersStreams = (r) => r.streams.filter((s) => s.owner !== me());
+const watched = (r) => (S.watching && r.id === D().meRoom ? othersStreams(r).filter((s) => s.owner === D().watchOwner) : []);
+const myShareIn = (r) => S.sharing !== "none" && r.id === D().meRoom;
+const myLive = (r) => S.sharing === "live" && r.id === D().meRoom;
+
+/* ============================== helpers ============================== */
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const ic = (n, cls = "") => `<span class="ms ${cls}" aria-hidden="true">${n}</span>`;
+const fmtKbps = (k) => (k >= 1000 ? (k / 1000).toFixed(1) + " Mbps" : Math.round(k) + " kbps");
+
+/* Avatar colours: the cross-client contract (STYLING-GUIDE "Avatar colour"): FNV-1a of the trimmed, lowercased
+   name -> hue; stops HSL(hue,60%,36%) and HSL(hue-10,60%,24%) at 140deg. */
+function hsl(h, s, l) {
+  const a = s * Math.min(l, 1 - l);
+  const f = (n) => { const k = (n + h / 30) % 12; return Math.round(255 * (l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1)))); };
+  return "#" + [f(0), f(8), f(4)].map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+function avatarBg(name) {
+  let h = 2166136261;
+  for (const b of new TextEncoder().encode(String(name).trim().toLowerCase())) h = Math.imul(h ^ b, 16777619) >>> 0;
+  const hue = h % 360;
+  return `background:linear-gradient(140deg, ${hsl(hue, .6, .36)}, ${hsl((hue + 350) % 360, .6, .24)})`;
+}
+const initial = (n) => esc((String(n).trim()[0] || "?").toUpperCase());
+const avatar = (n, sm, pres) => `<span class="avatar${sm ? " sm" : ""}" style="${avatarBg(n)}">${initial(n)}${pres ? '<span class="pres"></span>' : ""}</span>`;
+const SL = (w, inner, al = "", min) => `<div class="sl ${al}" style="${min ? `min-width:${w}px` : `width:${w}px;flex-basis:${w}px`}">${inner || ""}</div>`;
+const FILL = (inner, cls = "") => `<div class="fl ${cls}">${inner || ""}</div>`;
+const secHead = (t, n) => `<div class="hb g2"><h3 class="section-label">${t}${n != null ? `<span class="count">${n}</span>` : ""}</h3></div>`;
+const card = (title, count, rows) => `<div class="vb g2 gcard">${title ? `<div class="hb g2"><h4 class="section-label">${title}${count != null ? `<span class="count">${count}</span>` : ""}</h4></div>` : ""}${rows}</div>`;
+const tipIc = (t) => `<span class="ms tip" title="${esc(t)}">info</span>`;
+const ctrlRow = (label, control, value, tip) => `<div class="hb g2 crow">${SL(120, label == null ? "" : `<span class="lbl">${label}${tip ? tipIc(tip) : ""}</span>`, "l")}${FILL(control)}${value === undefined ? "" : SL(72, value, "r")}</div>`;
+const seg = (key, opts) => `<div class="seg" role="radiogroup">${opts.map((o) => `<button type="button" class="${S[key] === o ? "on" : ""}" data-set="${key}" data-val="${esc(o)}">${esc(o)}</button>`).join("")}</div>`;
+const cbx = (key, label, disabled) => `<span class="cbx${S[key] ? " on" : ""}${disabled ? " disabled" : ""}" role="checkbox" tabindex="0" aria-checked="${!!S[key]}" data-toggle="${disabled ? "" : key}"><span class="box">${ic("check")}</span>${label}</span>`;
+const select = (key, opts) => `<div class="selwrap"><select class="field" data-sel="${key}">${opts.map((o) => `<option${S[key] === o ? " selected" : ""}>${esc(o)}</option>`).join("")}</select>${ic("expand_more")}</div>`;
+const slider = (key, min, max, step, cls = "") => `<input type="range" class="${cls}" min="${min}" max="${max}" step="${step}" value="${S[key]}" data-range="${key}" aria-label="${key}">`;
+const meter = (lit = 0) => `<span class="meter">${[0, 1, 2, 3, 4].map((i) => `<i class="${i < lit ? "lit" : ""}"></i>`).join("")}</span>`;
+const pillLive = (lg) => `<span class="badge badge-live${lg ? " lg" : ""}"><span class="dot"></span>Live</span>`;
+const screenPic = () => `<div class="screen"><div class="cube"><i></i><i></i><i></i><i></i></div></div>`;
+
+/* ============================== sidebar ============================== */
+function roomRow({ lead, name, me: mine, num, unit, sel, act, title }) {
+  return `<button type="button" class="hb g2 p-row${sel ? " sel" : ""}" data-act="${act}" title="${esc(title || "")}">${SL(18, lead)}${FILL(`<span class="txt name">${esc(name)}</span>`)}${mine === false ? "" : SL(18, mine || "")}${SL(28, `<span class="num">${num ?? ""}</span>`, "r")}${SL(22, unit || "", "l")}</button>`;
+}
+const subRow = (icon, name, num, unit, act) => `<div class="hb g2 p-sub" data-act="${act}">${SL(18, "")}${SL(18, icon)}${FILL(`<span class="txt">${esc(name)}</span>`)}${SL(28, `<span class="num">${num ?? ""}</span>`, "r")}${SL(22, `<span class="unit">${unit || ""}</span>`, "l")}</div>`;
+function renderSide() {
+  const rooms = D().rooms;
+  const nWatch = rooms.reduce((n, r) => n + watched(r).length, 0);
+  let rows = "";
+  for (const r of rooms) {
+    const joined = r.state === "joined";
+    const others = othersStreams(r);
+    const n = joined ? others.length + (myShareIn(r) && S.sharing === "live" ? 1 : 0) : null;
+    rows += roomRow({ lead: `<span class="sdot ${r.state}"></span>`, name: r.name, me: myLive(r) ? ic("cast", "ico live") : null,
+      num: n || "", unit: n ? ic("screen_share", "unit-ico") : "", sel: S.view === "room" && curRoom().id === r.id, act: "room:" + r.id,
+      title: joined ? "Connected" : "Not connected" });
+    if (!joined) continue;
+    if (myLive(r)) rows += subRow(ic("cast", "ico live"), "You", S.fps, "fps", "room:" + r.id);
+    for (const s of others) {
+      const w = watched(r).includes(s);
+      rows += subRow(ic(w ? "visibility" : "screen_share", "ico" + (w ? " watch" : "")), s.owner, w ? s.fps : "", w ? "fps" : "", "room:" + r.id);
+    }
+  }
+  const nLive = rooms.filter(myLive).length;
+  return `<aside class="vb g0 p-side">
+    <div class="hb g2 band p-brand"><span class="mark" aria-hidden="true"></span><span class="txt">Simple Screensharing</span></div>
+    <div class="vb g2 p-side-scroll">
+      <div class="vb g0 well">${roomRow({ lead: ic("grid_view", "ico"), name: "Watched streams", me: false, num: nWatch, unit: ic("visibility", "unit-ico"), sel: S.view === "watched", act: "watched", title: "Every stream you're watching, from every room" })}</div>
+      <div class="hb g2" style="margin-top:var(--s1)"><h2 class="section-label">Rooms<span class="count">${rooms.length}</span></h2><span class="rule"></span></div>
+      <div class="vb g0 well" role="list">${rows}</div>
+      <div class="hb g0">${FILL(`<button type="button" class="btn btn-ghost wide" data-act="modal:add">${ic("add")}Create or join a room</button>`)}</div>
+    </div>
+    <div class="hb g2 band bottom p-user">
+      ${SL(32, avatar(me(), false, true))}
+      ${FILL(`<div class="vb g0 who" title="What you're sharing"><b class="txt">${esc(me())}</b><span class="txt${nLive ? " live" : ""}">${nLive ? "Live in 1 room" : "Not sharing"}</span></div>`)}
+      ${SL(32, `<button type="button" class="icon-btn" title="Settings" aria-label="Settings" data-act="modal:settings">${ic("settings")}</button>`)}
+    </div>
+  </aside>`;
+}
+
+/* ============================== room ============================== */
+function renderHead(r) {
+  if (r.state !== "joined") {
+    return `<header class="hb g2 band top p-head"><div class="hb g3 eq"><h2>${esc(r.name)}</h2><span class="badge badge-muted">Not connected</span></div></header>`;
+  }
+  const nShare = othersStreams(r).length + (myLive(r) ? 1 : 0);
+  return `<header class="hb g2 band top p-head">
+    <div class="hb g3 eq"><h2 title="${esc(r.name)}">${esc(r.name)}</h2><span class="badge badge-live"><span class="dot"></span>Connected</span>
+      <span class="txt meta">${r.members.length} people · ${nShare} sharing</span></div>
+    <div class="hb g2">
+      <span style="margin-right:var(--s1)">${cbx("auto", "Auto-connect")}</span>
+      <button type="button" class="btn btn-secondary" title="Copy the room's join link">${ic("link")}Copy invite link</button>
+      <button type="button" class="btn btn-danger" title="Leave room">${ic("logout")}Leave</button>
+      <button type="button" class="icon-btn bordered" title="Room options" aria-label="Room options">${ic("more_horiz")}</button>
+    </div>
+  </header>`;
+}
+
+function statbar(s, name, cross, fsMode) {
+  return `<div class="hb g2 statbar"><span class="dot"></span><span class="txt nm">${esc(cross ? `${name} · ${cross}` : name)}</span>
+    <span class="v">${s.w}x${s.h}</span><span class="v fps">${fsMode ? `${s.fps}/${s.fps}fps` : `${s.fps}fps`}</span><span class="v kbps">${fmtKbps(s.kbps)}</span></div>`;
+}
+function audioPill() {
+  const pct = `--pct:${(S.vol / 500) * 100}%`;
+  if (S.muted) {
+    return `<div class="hb g1 audio-pill muted">${SL(25, `<button type="button" data-toggle="muted" title="Listen">${ic("volume_off")}</button>`)}<span class="pct">Muted</span></div>`;
+  }
+  return `<div class="hb g1 audio-pill">${SL(25, `<button type="button" data-toggle="muted" title="Mute this stream">${ic("volume_up")}</button>`)}
+    ${SL(110, `<input type="range" class="vol" min="0" max="500" step="5" value="${S.vol}" data-range="vol" style="${pct}" aria-label="Volume">`)}
+    ${SL(34, `<span class="pct" id="vol-pct">${S.vol}%</span>`, "r")}
+    ${SL(25, `<button type="button" class="level${S.level ? " on" : ""}" data-toggle="level" title="Level loudness: ${S.level ? "on" : "off"}" aria-pressed="${S.level}">${ic("graphic_eq")}</button>`)}</div>`;
+}
+const audioOrChip = (s) => (s.audio ? audioPill() : `<span class="chip-dark">${ic("volume_off")}No audio shared</span>`);
+function tile(r, s, cross) {
+  return `<div class="tile" data-dbl="fullscreen" tabindex="0" aria-label="${esc(s.owner)}'s stream">${screenPic()}<div class="vig hover-ui"></div>
+    <div class="vb g0 ovl hover-ui">
+      <div class="hb g2">${FILL(statbar(s, s.owner, cross ? r.name : null))}<div class="hb g1">
+        <button type="button" class="round-btn" title="Pop out to its own window">${ic("open_in_new")}</button>
+        <button type="button" class="round-btn stop" title="Stop watching" data-act="unwatch">${ic("close")}</button></div></div>
+      <div class="fl v"></div>
+      <div class="hb g2">${audioOrChip(s)}</div>
+    </div></div>`;
+}
+
+function shareCard(r, s) {
+  const pic = s.preview ? screenPic() : `<div class="noprev">${ic("screen_share")}<span>Preview arrives shortly</span></div>`;
+  return `<div class="vb g0 scard"><div class="thumb">${pic}
+      <div class="vb g0 ovl"><div class="hb g2"><span class="chip-dark"><span class="dot"></span>LIVE</span>${FILL("")}${s.audio ? `<span class="chip-dark" title="Shares audio">${ic("volume_up")}</span>` : ""}</div></div></div>
+    <div class="vb g2 card-pad">
+      <div class="hb g2 who" style="height:22px">${SL(22, avatar(s.owner, true))}<b>${esc(s.owner)}</b>${FILL(`<span class="txt t">${esc(s.label)}</span>`)}</div>
+      <div class="hb g0"><span class="txt specs">${s.w}×${s.h}</span></div>
+      <div class="hb g2">${FILL(`<button type="button" class="btn btn-primary wide" data-act="watch">${ic("play_arrow")}Watch</button>`)}${FILL(`<button type="button" class="btn btn-secondary wide" title="Watch in its own window">${ic("open_in_new")}Pop out</button>`)}</div>
+    </div></div>`;
+}
+function myCard() {
+  const live = S.sharing === "live";
+  return `<div class="vb g0 scard"><div class="thumb mine">
+      <div class="vb g0 ovl"><div class="hb g2">${live ? `<span class="chip-dark"><span class="dot"></span>LIVE</span>` : `<span class="chip-dark">STARTING</span>`}${FILL("")}
+        <span class="chip-dark" title="Watching now">${ic("visibility")}1</span></div>
+        <div class="fl v" style="align-items:center"><div class="vb g1 mine-label" style="align-items:center">${ic("cast")}<span>Your screen</span></div></div></div></div>
+    <div class="vb g2 card-pad">
+      <div class="hb g2 who" style="height:22px">${SL(22, avatar(me(), true))}<b>You</b>${FILL(`<span class="txt t">Screen share</span>`)}</div>
+      <div class="hb g0"><span class="txt specs">1920×1080 · ${S.fps} fps · ${S.codec}</span></div>
+      <div class="hb g2">${FILL(`<button type="button" class="btn btn-secondary wide" data-act="modal:stream">${ic("tune")}Stream settings</button>`)}</div>
+    </div></div>`;
+}
+
+/* Card grid shape (room::card_grid_shape, dom.js cardShape): biggest card wins, never wider than 640. */
+function cardShape(n, aw, ah, gap = 12) {
+  const MIN = 260, MAX = 640, INFO = 112;
+  const fit = Math.max(1, Math.min(n, Math.floor((aw + gap) / (MIN + gap))));
+  let best = { cols: 1, w: 0 };
+  for (let c = 1; c <= fit; c++) {
+    const rows = Math.ceil(n / c);
+    const cellW = (aw - gap * (c - 1)) / c, cellH = (ah - gap * (rows - 1)) / rows;
+    const w = Math.max(Math.min(cellW, ((cellH - INFO) * 16) / 9 + 2, MAX), Math.min(MIN, cellW));
+    if (w >= best.w) best = { cols: c, w };
+  }
+  return best;
+}
+function grid(items, cols, maxW) {
+  let out = "";
+  for (let i = 0; i < items.length; i += cols) {
+    const cells = items.slice(i, i + cols).map((x) => `<div class="fl v">${x}</div>`);
+    while (cells.length < cols) cells.push(`<div class="fl"></div>`);
+    out += `<div class="hb g3 st" style="${maxW ? `max-width:${maxW}` : ""}">${cells.join("")}</div>`;
+  }
+  return `<div class="vb g3">${out}</div>`;
+}
+const emptyState = (icon, title, text, extra = "") => `<div class="vb g2 empty">${ic(icon, "big")}<b class="txt">${title}</b>${text ? `<span>${text}</span>` : ""}${extra}</div>`;
+
+function renderCenter(r, fw, fh) {
+  if (r.state !== "joined") {
+    return `<div class="vb g4 p-center eq">${emptyState("cloud_off", `You're not connected to ${esc(r.name)}`, "It stays in your list so you can come back with one click.",
+      `<div class="hb g2" style="width:320px;margin-top:var(--s2)">${FILL(`<button type="button" class="btn btn-primary btn-lg wide">${ic("login")}Connect</button>`)}${FILL(`<button type="button" class="btn btn-danger btn-lg wide">${ic("delete")}Forget room</button>`)}</div>`)}</div>`;
+  }
+  const w = watched(r);
+  const rest = othersStreams(r).filter((s) => !w.includes(s));
+  let html = "";
+  if (w.length) html += `<div class="vb g3">${secHead("On screen", w.length)}${grid(w.map((s) => tile(r, s)), w.length === 1 ? 1 : 2, w.length === 1 ? `${Math.round(fh * 0.46 * 16 / 9)}px` : null)}</div>`;
+  const mine = myShareIn(r) && S.sharing === "live";
+  const items = rest.map((s) => shareCard(r, s)).concat(mine ? [myCard()] : []);
+  let sec = secHead(w.length ? "Also sharing in this room" : "Sharing in this room", items.length);
+  if (!items.length) sec += emptyState("tv_off", w.length ? "You're watching everything shared here" : "Nobody is sharing yet", w.length ? null : "Start your own share with the bar below.");
+  else {
+    const aw = fw - 272 - 232 - 32, ah = fh - 56 - 56 - 32 - 28;
+    const g = cardShape(items.length, aw, ah);
+    sec += grid(items, g.cols, `${Math.floor(g.cols * g.w + (g.cols - 1) * 12)}px`);
+  }
+  html += `<div class="vb g3">${sec}</div>`;
+  return `<div class="vb g4 p-center eq">${html}</div>`;
+}
+
+function renderPeople(r) {
+  const ms = [...r.members].sort((a, b) => (b === me()) - (a === me()));
+  return `<aside class="vb g3 p-right">${secHead("People", ms.length)}<div class="vb g0">${ms.map((m) => {
+    const sharing = m === me() ? myLive(r) : r.streams.some((s) => s.owner === m);
+    const eye = watched(r).some((s) => s.owner === m);
+    return `<div class="hb g2 member${sharing ? "" : " idle"}">${SL(22, avatar(m, true))}${FILL(`<span class="txt name">${esc(m)}${m === me() ? '<span class="you">you</span>' : ""}</span>`)}${SL(44, sharing ? `<span class="badge badge-live">Live</span>` : "", "r")}${SL(18, eye ? ic("visibility", "ico watch") : "")}</div>`;
+  }).join("")}</div></aside>`;
+}
+
+function renderBar(r) {
+  const bar = (kids) => `<footer class="hb g2 band bottom p-bar">${kids}</footer>`;
+  const audioBtn = `<button type="button" class="btn btn-secondary btn-lg" title="Pick an audio source">${ic("volume_up")}Share audio${ic("expand_more")}</button>`;
+  if (myShareIn(r) && S.sharing === "live") {
+    return bar(`${SL(84, pillLive(true), "l", true)}${FILL(`<div class="vb g0"><span class="txt t1">Screen share · ${S.fps} fps</span><span class="txt t2 mono">${S.codec} · ${fmtKbps(S.kbps)}</span></div>`, "v")}
+      ${audioBtn}<button type="button" class="btn btn-secondary btn-lg" data-act="modal:stream">${ic("tune")}Stream settings</button>
+      <button type="button" class="btn btn-secondary btn-lg" title="Rooms this share goes to">${ic("cast")}1 room${ic("expand_more")}</button>
+      <span class="vsep"></span>
+      <button type="button" class="btn btn-danger-solid btn-lg" data-act="stop">${ic("stop_screen_share")}Stop sharing</button>`);
+  }
+  if (myShareIn(r) && S.sharing === "staged") {
+    return bar(`${SL(84, `<span class="badge badge-muted lg">Ready</span>`, "l", true)}${FILL(`<div class="vb g0"><span class="txt t1">Screen share · not live yet</span><span class="txt t2">Goes live in ${esc(r.name)}</span></div>`, "v")}
+      ${audioBtn}<button type="button" class="btn btn-secondary btn-lg" data-act="modal:stream">${ic("tune")}Stream settings</button>
+      <span class="vsep"></span>
+      <button type="button" class="btn btn-secondary btn-lg" data-act="discard">Discard</button>
+      <button type="button" class="btn btn-primary btn-lg" data-act="golive">${ic("cast")}Go live</button>`);
+  }
+  return bar(`<button type="button" class="btn btn-primary btn-lg" data-act="share">${ic("screen_share")}Share screen</button>
+    <button type="button" class="btn btn-secondary btn-lg" disabled title="Share audio without a screen">${ic("volume_up")}Share audio</button>${FILL("")}`);
+}
+
+function renderMain(fw, fh) {
+  if (S.view === "watched") {
+    const list = D().rooms.flatMap((r) => watched(r).map((s) => [r, s]));
+    const body = list.length ? grid(list.map(([r, s]) => tile(r, s, true)), list.length === 1 ? 1 : 2, list.length === 1 ? `${Math.floor((fh - 56 - 32) * 16 / 9)}px` : null)
+      : emptyState("visibility_off", "You're not watching anything", "Open a room and click Watch on a share.");
+    return `<main class="vb g0 eq"><header class="hb g2 band top p-head"><h2>Watched streams</h2><span class="txt meta">Every stream you're watching, from every room</span></header>
+      <div class="hb g0 eq st minh0"><div class="vb g3 p-center eq">${body}</div></div></main>`;
+  }
+  const r = curRoom();
+  const panels = r.state === "joined";
+  return `<main class="vb g0 eq">${renderHead(r)}<div class="hb g0 eq st minh0">${renderCenter(r, fw, fh)}${panels ? renderPeople(r) : ""}</div>${panels ? renderBar(r) : ""}</main>`;
+}
+
+function renderFullscreen() {
+  const r = roomById(D().meRoom), s = othersStreams(r).find((x) => x.owner === D().watchOwner);
+  return `<div class="fs" data-dbl="exitfs">${screenPic()}<div class="vig hover-ui"></div>
+    <div class="vb g0 ovl hover-ui"><div class="hb g2">${FILL(statbar(s, s.owner, r.name, true))}
+      <button type="button" class="round-btn" title="Exit fullscreen" data-act="exitfs">${ic("fullscreen_exit")}</button></div>
+      <div class="fl v"></div><div class="hb g2">${audioOrChip(s)}</div></div></div>`;
+}
+
+/* ============================== modals ============================== */
+function shell(cls, title, sub, body, foot, extraHead = "") {
+  return `<div class="scrim" data-scrim="1"><div class="vb g0 modal ${cls}" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+    <div class="hb g3 band modal-head">${FILL(`<div class="vb g0"><h3 class="txt">${title}</h3>${sub ? `<span class="txt sub">${sub}</span>` : ""}</div>`, "v")}${extraHead}
+      ${SL(32, `<button type="button" class="icon-btn" aria-label="Close" title="Close" data-act="close">${ic("close")}</button>`)}</div>
+    <div class="vb g3 modal-body">${body}</div>${foot ? `<div class="hb g2 modal-foot">${foot}</div>` : ""}</div></div>`;
+}
+function streamModal() {
+  const staged = S.sharing !== "live";
+  const r = roomById(D().meRoom);
+  const source = card("Source", null,
+    ctrlRow("Screen", `<span class="txt ro">Screen share · 1920×1080</span>`, staged ? `<button type="button" class="btn btn-secondary wide">Change</button>` : "") +
+    ctrlRow("Audio", select("audioSrc", ["No audio", "Desktop audio", "Spotify"]), `<span class="val center">${meter(0)}</span>`) +
+    ctrlRow(null, cbx("muteShared", "Mute shared audio", true)));
+  const dest = `<div class="hb g2 destrow cur">${SL(18, ic("radio_button_checked", "ico"))}${FILL(`<span class="txt name">${esc(r.name)}<small>this room</small></span>`)}
+    ${SL(84, staged ? `<span class="badge badge-muted">Not live</span>` : pillLive(false), "l", true)}${SL(76, `<span class="kbps">${staged ? "—" : S.kbps + " kbps"}</span>`, "r")}
+    ${SL(32, staged ? "" : `<button type="button" class="icon-btn sm" title="Stop sending to ${esc(r.name)}">${ic("close")}</button>`)}</div>`;
+  const dests = card(staged ? "Goes live in" : "Sending to", "1 room", `<div class="vb g1">${dest}</div>` +
+    (staged ? "" : `<div class="hb g2">${FILL(`<button type="button" class="btn btn-secondary wide">${ic("add")}Also send to…</button>`)}${FILL(`<button type="button" class="btn btn-secondary wide">${ic("swap_horiz")}Move to…</button>`)}</div>`));
+  const bw = card("Upload bandwidth", "all your streams", ctrlRow("Mode", `<div class="seg"><button type="button" class="${S.bwMode === "per" ? "on" : ""}" data-set="bwMode" data-val="per">Per-stream maximum</button><button type="button" class="${S.bwMode === "abs" ? "on" : ""}" data-set="bwMode" data-val="abs">Absolute maximum</button></div>`));
+  const video = card("Video", null,
+    ctrlRow("Framerate", select("fpsSel", ["15 fps", "30 fps", "60 fps", "90 fps", "120 fps", "144 fps", "165 fps", "240 fps"])) +
+    ctrlRow("Bitrate", slider("kbps", 200, 40000, 100), `<span class="val" id="kbps-val">${S.kbps}</span>`, "kbps for this room. Per-stream mode: this is the stream's maximum.") +
+    ctrlRow("Codec", seg("codec", ["H.264", "AV1", "H.265"])));
+  const enc = card("Encoder", null, ctrlRow("Preset", seg("preset", ["Balanced", "Quality", "Gaming"])) +
+    `<div class="hb collapser" data-toggle="advanced">${ic(S.advanced ? "expand_more" : "chevron_right")}<span>Advanced tuning</span></div>` +
+    (S.advanced ? ctrlRow("Tune", `<span class="txt ro">Low latency</span>`) + ctrlRow("Keyframe interval", `<span class="txt ro">2 s</span>`, undefined, "GOP length. Shorter recovers faster from fast motion, costs more bitrate.") : ""));
+  const body = `<div class="hb g3 st" style="align-items:flex-start"><div class="vb g3 eq">${source}${dests}${bw}</div><div class="vb g3 eq">${video}${enc}</div></div>`;
+  const foot = staged
+    ? `<button type="button" class="btn btn-secondary btn-lg" data-act="discard">Discard</button>${FILL("")}<button type="button" class="btn btn-secondary btn-lg" data-act="close">Later</button><button type="button" class="btn btn-primary btn-lg" data-act="golive">${ic("cast")}Go live in ${esc(r.name)}</button>`
+    : `<button type="button" class="btn btn-danger btn-lg" data-act="stop">${ic("stop_screen_share")}Stop sharing in ${esc(r.name)}</button>${FILL("")}<span class="hb g1 note">${ic("check_circle")}Saved</span><button type="button" class="btn btn-primary btn-lg" data-act="close">Done</button>`;
+  return shell("xwide", staged ? "Set up your stream" : "Stream settings", staged ? `Screen share · goes live in ${esc(r.name)}` : `Live in ${esc(r.name)} · changes apply right away`, body, foot);
+}
+function settingsModal() {
+  const body = card("Profile", null, ctrlRow("Display name", `<input class="field" id="set-name" value="${esc(me())}" aria-label="Display name">`, undefined, "What friends see in rooms")) +
+    card("Language", null, ctrlRow("Language", seg("lang", ["English", "Deutsch"]))) +
+    card("Display", null, ctrlRow("Presentation", select("presentation", ["Mailbox (default)", "Vsync", "Immediate"]), undefined, "How video frames reach the screen")) +
+    card("Playback", null, ctrlRow("Jitter buffer", slider("jitter", 0, 5000, 100), `<span class="val" id="jitter-val">${(S.jitter / 1000).toFixed(1)} s</span>`, "How much delay smooths out the network") +
+      ctrlRow("Catch-up speed", slider("catchup", 5, 10, 1), `<span class="val" id="catchup-val">${S.catchup}%</span>`, "How fast playback catches up after a hiccup") +
+      ctrlRow("Level loudness", cbx("level", "Even out the volume of what I watch"), undefined, "Viewer-side automatic gain on every watched stream")) +
+    card("Shared audio", null, ctrlRow("Boost", slider("boost", 0, 200, 5), `<span class="val" id="boost-val">${S.boost}%</span>`, "Trim the shared audio before it is sent")) +
+    card("Diagnostics", null, ctrlRow("Logs", `<div class="hb g2" style="width:100%">${FILL(`<button type="button" class="btn btn-secondary wide">Copy to clipboard</button>`)}${FILL(`<button type="button" class="btn btn-secondary wide">Save to file…</button>`)}</div>`, undefined, "Recent log lines of this app") +
+      ctrlRow("Relay", cbx("diag", "Send diagnostics to the relay"), undefined, "Off by default. Sends the same log text as Logs to the relay of each room you are in"));
+  return shell("wide", "Settings", null, body, `${FILL("")}<button type="button" class="btn btn-primary btn-lg" data-act="close">Done</button>`);
+}
+function addModal() {
+  const tabs = `<div class="hb g0">${FILL(`<div class="seg"><button type="button" class="${S.addTab === "join" ? "on" : ""}" data-set="addTab" data-val="join">Join with a link</button><button type="button" class="${S.addTab === "create" ? "on" : ""}" data-set="addTab" data-val="create">Create a new room</button></div>`)}</div>`;
+  const body = S.addTab === "join"
+    ? card(null, null, ctrlRow("Join link", `<input class="field" id="add-link" placeholder="server|room-id|key" aria-label="Join link" autocomplete="off">`) +
+        ctrlRow("Room name", `<input class="field" id="add-name" placeholder="Friday Films" aria-label="Room name">`, undefined, "Only shown in your own list"))
+    : card(null, null, ctrlRow("Server", `<input class="field" id="add-server" placeholder="relay.example.com:4433" aria-label="Server">`, undefined, "host:port of a relay") +
+        ctrlRow("Room name", `<input class="field" id="add-cname" placeholder="Friday Films" aria-label="Room name">`, undefined, "Only shown in your own list"));
+  const foot = `${FILL("")}<button type="button" class="btn btn-secondary btn-lg" data-act="close">Cancel</button>` +
+    (S.addTab === "join" ? `<button type="button" class="btn btn-primary btn-lg" disabled>${ic("login")}Join</button>` : `<button type="button" class="btn btn-primary btn-lg" disabled>${ic("add")}Create</button>`);
+  return shell("", "Create or join a room", null, tabs + body, foot);
+}
+
+/* ============================== render ============================== */
+const frame = document.getElementById("frame");
+const stage = document.getElementById("stage");
+function render() {
+  const [fw, fh] = S.size.split("x").map(Number);
+  frame.style.width = fw + "px";
+  frame.style.height = fh + "px";
+  frame.classList.toggle("pin-ovl", S.pin && !S.modal); /* a modal takes the pointer: no hover chrome behind it */
+  frame.classList.toggle("spin", S.spin);
+  let html = S.view === "fullscreen" ? renderFullscreen() : `<div class="hb g0 st p-app">${renderSide()}${renderMain(fw, fh)}</div>`;
+  if (S.modal === "stream") html += streamModal();
+  else if (S.modal === "settings") html += settingsModal();
+  else if (S.modal === "add") html += addModal();
+  frame.innerHTML = html;
+  frame.querySelectorAll('input[type="range"]').forEach(setPct);
+  fit();
+  renderNav();
+}
+function setPct(el) { el.style.setProperty("--pct", ((el.value - el.min) / (el.max - el.min)) * 100 + "%"); }
+function fit() {
+  const [fw, fh] = S.size.split("x").map(Number);
+  const s = Math.min(1, stage.clientWidth / fw);
+  frame.style.transform = `scale(${s})`;
+  stage.style.height = Math.round(fh * s) + "px";
+}
+window.addEventListener("resize", fit);
+
+function renderNav() {
+  const v = document.getElementById("nav-views"), m = document.getElementById("nav-modals");
+  v.innerHTML = "<b>View</b>" + PRESETS.map(([k, l]) => `<button type="button" data-preset="${k}" class="${S.preset0 === k ? "on" : ""}">${l}</button>`).join("");
+  m.innerHTML = "<b>Modal</b>" + MODALS.map(([k, l]) => `<button type="button" data-preset="${k}" class="${S.preset0 === k ? "on" : ""}">${l}</button>`).join("");
+}
+function applyPreset(key) {
+  const p = PRESETS.concat(MODALS).find((x) => x[0] === key);
+  if (!p) return;
+  Object.assign(S, { modal: null, sharerSelf: false, view: "room", room: D().meRoom }, p[2], { preset0: key });
+  render();
+}
+
+/* ============================== interaction ============================== */
+document.addEventListener("click", (e) => {
+  const pre = e.target.closest("[data-preset]");
+  if (pre) return applyPreset(pre.dataset.preset);
+  if (!frame.contains(e.target)) return;
+  if (e.target.matches("[data-scrim]")) { S.modal = null; return render(); }
+  const set = e.target.closest("[data-set]");
+  if (set) { S[set.dataset.set] = set.dataset.val; return render(); }
+  const tog = e.target.closest("[data-toggle]");
+  if (tog && tog.dataset.toggle) { S[tog.dataset.toggle] = !S[tog.dataset.toggle]; return render(); }
+  const a = e.target.closest("[data-act]");
+  if (!a) return;
+  const act = a.dataset.act;
+  S.preset0 = null;
+  if (act.startsWith("room:")) Object.assign(S, { view: "room", room: act.slice(5) });
+  else if (act === "watched") S.view = "watched";
+  else if (act.startsWith("modal:")) S.modal = act.slice(6);
+  else if (act === "close") S.modal = null;
+  else if (act === "watch") S.watching = true;
+  else if (act === "unwatch") S.watching = false;
+  else if (act === "share") Object.assign(S, { sharing: "staged", sharerSelf: true, modal: "stream", room: D().meRoom });
+  else if (act === "golive") Object.assign(S, { sharing: "live", modal: null });
+  else if (act === "discard" || act === "stop") Object.assign(S, { sharing: "none", modal: null });
+  else if (act === "exitfs") S.view = "room";
+  render();
+});
+document.addEventListener("dblclick", (e) => {
+  const d = e.target.closest("[data-dbl]");
+  if (!d || e.target.closest("button, input")) return;
+  S.view = d.dataset.dbl === "fullscreen" ? "fullscreen" : "room";
+  render();
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    if (S.modal) S.modal = null; else if (S.view === "fullscreen") S.view = "room"; else return;
+    render();
+  } else if ((e.key === " " || e.key === "Enter") && e.target.matches?.(".cbx[data-toggle]")) {
+    e.preventDefault(); e.target.click();
+  }
+});
+document.addEventListener("input", (e) => {
+  const k = e.target.dataset?.range;
+  if (!k) return;
+  let v = Number(e.target.value);
+  if (k === "vol" && Math.abs(v - 100) <= 10) { v = 100; e.target.value = "100"; } /* detent at 100 % (room.rs volume_slider) */
+  S[k] = v;
+  setPct(e.target);
+  const out = { vol: ["vol-pct", v + "%"], kbps: ["kbps-val", v], jitter: ["jitter-val", (v / 1000).toFixed(1) + " s"], catchup: ["catchup-val", v + "%"], boost: ["boost-val", v + "%"] }[k];
+  if (out) { const n = document.getElementById(out[0]); if (n) n.textContent = out[1]; }
+});
+document.addEventListener("change", (e) => {
+  const t = e.target;
+  if (t.id === "nav-size") { S.size = t.value; return render(); }
+  if (t.id === "nav-data") { S.data = t.value; S.room = D().meRoom; return render(); }
+  if (t.id === "nav-ovl") { S.pin = t.checked; return render(); }
+  if (t.id === "nav-spin") { S.spin = t.checked; return render(); }
+  if (t.dataset?.sel) { S[t.dataset.sel] = t.value; if (t.dataset.sel === "fpsSel") S.fps = parseInt(t.value, 10); render(); }
+});
+
+/* Initial state; `#rig` in the address loads the rig data, `#<preset>` (e.g. #settings) a view. */
+S.fpsSel = "60 fps"; S.audioSrc = "No audio";
+(function boot() {
+  const h = location.hash.slice(1).split("-rig");
+  if (location.hash.includes("rig")) { S.data = "rig"; document.getElementById("nav-data").value = "rig"; S.fps = 30; S.fpsSel = "30 fps"; S.pin = !location.hash.includes("nopin"); }
+  applyPreset(PRESETS.concat(MODALS).some((p) => p[0] === h[0]) ? h[0] : "room-watch");
+})();
+</script>
