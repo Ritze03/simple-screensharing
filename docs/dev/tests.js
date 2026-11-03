@@ -15,6 +15,7 @@ import { CanvasRenderer, VideoReceiver } from "../js/core/video-rx.js";
 import { ENCODER_PRESETS } from "../js/core/video-tx.js";
 import { avatarBg, avatarColors, avatarHue, snapVolumePct, wheelStepVolumePct, volumeWheel, VOLUME_MAX_PCT } from "../js/ui/dom.js";
 import { AudioReceiver, MAX_VOLUME } from "../js/core/audio.js";
+import { CEILING_DB, GATE_DB, Leveller, MAX_GAIN_DB, RISE_DB_PER_S, TARGET_DB } from "../js/core/leveller.js";
 
 const tests = [];
 export const test = (name, fn) => tests.push({ name, fn });
@@ -1340,6 +1341,136 @@ test("nack kill switch: ?nack=0 / off, localStorage sss-nack=0; default on", () 
     history.replaceState(null, "", url);
   }
   eq(nackEnabledByDefault(), true);
+});
+
+// ------------------------------------------------------------------------------------------------ loudness leveller (#119)
+
+// Same scenarios and thresholds as the native tests in client/src/leveller.rs (the port must behave identically).
+const levRate = 48000;
+const levLin = (db) => Math.pow(10, db / 20);
+/** Stereo planar sine of `secs` at `rmsDb` dBFS RMS (peak = RMS + 3 dB), continuing phase `ph.v`. */
+function levSine(secs, rmsDb, ph) {
+  const n = Math.round(secs * levRate);
+  const amp = levLin(rmsDb) * Math.SQRT2;
+  const a = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    a[i] = amp * Math.sin(ph.v * 2 * Math.PI);
+    ph.v = (ph.v + 440 / levRate) % 1;
+  }
+  return [a, Float32Array.from(a)];
+}
+const levCat = (parts) => [0, 1].map((c) => {
+  const out = new Float32Array(parts.reduce((n, p) => n + p[0].length, 0));
+  let o = 0;
+  for (const p of parts) { out.set(p[c], o); o += p[0].length; }
+  return out;
+});
+const levPeak = (a) => a.reduce((m, x) => Math.max(m, Math.abs(x)), 0);
+const levRms = (a) => 10 * Math.log10(a.reduce((s, x) => s + x * x, 0) / a.length + 1e-20);
+/** Run planes through `l` in chunks of `chunk` frames; returns the levelled copy. */
+function levRun(l, planes, chunk) {
+  const out = planes.map((p) => Float32Array.from(p));
+  for (let o = 0; o < out[0].length; o += chunk) l.process(out.map((p) => p.subarray(o, Math.min(o + chunk, p.length))));
+  return out;
+}
+
+test("leveller: a sudden -40 dBFS -> 0 dBFS step never exceeds the ceiling, even in the first samples, then settles near the target", () => {
+  const l = new Leveller(levRate);
+  const ph = { v: 0 };
+  const quiet = levSine(8, -40, ph); // long enough for the gain to reach its maximum
+  const loud = levSine(3, -3, ph); // a full-scale (0 dBFS peak) sine
+  const out = levRun(l, levCat([quiet, loud]), 960);
+  ok(l.gainDb < MAX_GAIN_DB, "the step pulled the gain down: " + l.gainDb);
+  const ceil = levLin(CEILING_DB);
+  const q = quiet[0].length;
+  for (const ch of out) {
+    ok(levPeak(ch.subarray(q)) <= ceil + 1e-6, "peak after the step " + levPeak(ch.subarray(q)));
+    ok(levPeak(ch.subarray(q, q + 96)) <= ceil + 1e-6, "first 2 ms already under the ceiling");
+  }
+  const r = levRms(out[0].subarray(out[0].length - levRate));
+  ok(Math.abs(r - TARGET_DB) < 3, `settled at ${r.toFixed(1)} dBFS RMS`);
+});
+
+test("leveller: a quiet signal is raised slowly (a few dB per second), up to +12 dB, never instantly", () => {
+  const l = new Leveller(levRate);
+  const ph = { v: 0 };
+  levRun(l, levSine(0.5, -35, ph), 480);
+  ok(l.gainDb > 0 && l.gainDb <= RISE_DB_PER_S * 0.5 + 0.2, "after 0.5 s: " + l.gainDb);
+  levRun(l, levSine(1.5, -35, ph), 480);
+  ok(l.gainDb <= RISE_DB_PER_S * 2 + 0.3, "after 2 s: " + l.gainDb);
+  levRun(l, levSine(20, -35, ph), 480);
+  ok(Math.abs(l.gainDb - MAX_GAIN_DB) < 0.05, "settled at " + l.gainDb);
+});
+
+test("leveller: silence and a noise floor below the gate are not boosted", () => {
+  const l = new Leveller(levRate);
+  const out = levRun(l, [new Float32Array(levRate * 10), new Float32Array(levRate * 10)], 480);
+  eq(l.gainDb, 0);
+  ok(out[0].every((x) => x === 0));
+  levRun(l, levSine(10, GATE_DB - 15, { v: 0 }), 480);
+  eq(l.gainDb, 0, "a -65 dBFS floor stays a floor");
+});
+
+test("leveller: loud material is pulled down fast; any input, incl. NaN/Infinity, stays under the ceiling; chunking is irrelevant", () => {
+  const l = new Leveller(levRate);
+  const ph = { v: 0 };
+  const out = levRun(l, levSine(0.1, -3, ph), 480);
+  ok(l.gainDb < -5, "after 100 ms: " + l.gainDb);
+  ok(levPeak(out[0]) <= levLin(CEILING_DB) + 1e-6);
+  const settled = levRun(l, levSine(3, -3, ph), 480);
+  ok(Math.abs(levRms(settled[0].subarray(settled[0].length - levRate)) - TARGET_DB) < 2, "settles at the target");
+
+  let seed = 0x2545f491;
+  const rnd = () => { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; return ((seed >>> 0) / 0xffffffff) * 2 - 1; };
+  const w = new Leveller(levRate);
+  for (let b = 0; b < 60; b++) {
+    const lvl = [0.001, 0.05, 1, 40][b % 4];
+    const n = 200 + ((b * 37) % 3000);
+    const p = [0, 1].map(() => Float32Array.from({ length: n }, () => rnd() * lvl));
+    if (b === 7) { p[0][3] = NaN; p[0][4] = Infinity; p[1][5] = -Infinity; }
+    w.process(p);
+    for (const ch of p) ok(ch.every((x) => Number.isFinite(x) && Math.abs(x) <= levLin(CEILING_DB) + 1e-6), "burst " + b);
+  }
+
+  const input = levCat([levSine(1, -30, { v: 0 }), levSine(1, -6, { v: 0 })]);
+  const a = levRun(new Leveller(levRate), input, 960);
+  const c = levRun(new Leveller(levRate), input, 7);
+  ok(a[0].every((x, i) => x === c[0][i]) && a[1].every((x, i) => x === c[1][i]), "same result for any chunking");
+});
+
+test("leveller: AudioReceiver levels decoded frames before scheduling, and 'Level loudness' off passes them untouched", async () => {
+  const realDecoder = globalThis.AudioDecoder;
+  const realChunk = globalThis.EncodedAudioChunk;
+  globalThis.AudioDecoder = class { constructor({ output }) { this.output = output; this.state = "configured"; } configure() {} decode(chunk) { this.output(chunk.frame); } close() {} };
+  globalThis.EncodedAudioChunk = class { constructor(init) { this.frame = init.data; } };
+  try {
+    const run = async (level) => {
+      const ctx = new OfflineAudioContext(2, levRate, levRate);
+      const bufs = [];
+      const cb = ctx.createBuffer.bind(ctx);
+      ctx.createBuffer = (...a) => { const b = cb(...a); bufs.push(b); return b; };
+      const rx = new AudioReceiver({ context: ctx, level });
+      const ph = { v: 0 };
+      const frames = [...Array.from({ length: 100 }, () => levSine(0.02, -40, ph)), ...Array.from({ length: 50 }, () => levSine(0.02, -3, ph))];
+      frames.forEach((f, i) => {
+        const data = { numberOfFrames: f[0].length, numberOfChannels: 2, sampleRate: levRate, timestamp: i * 20000, copyTo: (dst, o) => dst.set(f[o.planeIndex]), close() {} };
+        rx.pushPacket({ ptsUs: i * 20000, payload: data });
+      });
+      rx.close();
+      return bufs;
+    };
+    const on = await run(true);
+    eq(on.length, 150);
+    const ceil = levLin(CEILING_DB);
+    ok(on.every((b) => levPeak(b.getChannelData(0)) <= ceil + 1e-6 && levPeak(b.getChannelData(1)) <= ceil + 1e-6), "every scheduled frame is under the ceiling");
+    ok(levPeak(on[100].getChannelData(0)) < 0.9, "the loud step is already pulled down in its first frame");
+    const off = await run(false);
+    ok(levPeak(off[149].getChannelData(0)) > 0.99, "off: the full-scale frame is untouched (" + levPeak(off[149].getChannelData(0)) + ")");
+    ok(Math.abs(levPeak(off[0].getChannelData(0)) - levLin(-37)) < 1e-4, "off: the quiet frame is untouched");
+  } finally {
+    globalThis.AudioDecoder = realDecoder;
+    globalThis.EncodedAudioChunk = realChunk;
+  }
 });
 
 // ------------------------------------------------------------------------------------------------ runner

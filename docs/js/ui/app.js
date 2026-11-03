@@ -13,7 +13,7 @@ import {
 } from "./dom.js";
 import {
   RoomEntry, roomById, connectRoom, disconnectRoom, retryNow, watchStream, unwatchStream, setWatchVolume, setWatchMuted, allWatches,
-  addRoom, forgetRoom, applyJitterSettings, connectErrorText,
+  addRoom, forgetRoom, applyJitterSettings, applyLevelLoudness, connectErrorText,
 } from "./rooms.js";
 import {
   capById, capInRoom, stagedFor, liveRoomIds, allDests, allocated, applyBandwidth, captureName, captureRes, stage, discard, goLive, addDest,
@@ -886,7 +886,8 @@ function renderSettings(close, lgBtn, spacer) {
     card(t("settings.language_label"), null, ctrlRow(t("settings.language_label"), seg([["en", "English"], ["de", "Deutsch"]], st.lang, (v) => { st.lang = v; setLang(v); persistSettings(); render(); }))),
     card(t("ui.settings.playback"), null,
       sliderRow(t("ui.settings.jitter"), "set-jitter", 0, 5000, 100, () => st.jitter, (v) => { st.jitter = v; }, (v) => (v / 1000).toFixed(1) + " s", t("ui.settings.jitter_tip"), commit),
-      sliderRow(t("ui.settings.catchup"), "set-catchup", 5, 10, 1, () => st.catchup, (v) => { st.catchup = v; }, (v) => v + "%", t("ui.settings.catchup_tip"), commit)),
+      sliderRow(t("ui.settings.catchup"), "set-catchup", 5, 10, 1, () => st.catchup, (v) => { st.catchup = v; }, (v) => v + "%", t("ui.settings.catchup_tip"), commit),
+      ctrlRow(t("ui.settings.level_loudness"), cbx(t("ui.settings.level_loudness_on"), st.levelLoudness, () => { st.levelLoudness = !st.levelLoudness; persistSettings(); applyLevelLoudness(); render(); }, { id: "set-level-loudness" }), undefined, t("ui.settings.level_loudness_tip"), "set-level-loudness")),
   ], [spacer(), lgBtn("btn-primary", t("ui.stream.done"), close, null, false, "btn-settings-done")], null, t("ui.close"));
 }
 

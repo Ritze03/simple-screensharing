@@ -62,6 +62,8 @@ export function loadSettings() {
     lang: s.lang === "de" || s.lang === "en" ? s.lang : browserLang(),
     jitter: clampMaxJitterBufferMs(Number.isFinite(s.jitter) ? s.jitter : DEFAULT_MAX_JITTER_BUFFER_MS),
     catchup: clampCatchUpSpeedPercent(Number.isFinite(s.catchup) ? s.catchup : DEFAULT_CATCH_UP_SPEED_PERCENT),
+    // Viewer-side loudness levelling of watched audio (#119); on unless the user switched it off.
+    levelLoudness: s.levelLoudness !== false,
     // Upload bandwidth, same two modes as native: per-stream maximum, or one absolute total split across every stream.
     bw: Object.assign({ mode: "absolute", total: 12000, floor: 3000 }, s.bw || {}),
     // Defaults for the next stream (the staged stream-settings modal starts from these).

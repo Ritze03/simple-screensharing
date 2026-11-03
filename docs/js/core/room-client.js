@@ -208,6 +208,7 @@ export class RoomClient extends EventTarget {
    * @param {object} [o]
    * @param {string} [o.displayName]
    * @param {number} [o.maxJitterBufferMs=2000]  0..5000 (native setting `max_jitter_buffer_ms`)
+   * @param {boolean} [o.levelLoudness=true]  viewer-side loudness levelling of watched audio (leveller.js)
    * @param {number} [o.catchUpSpeedPercent=5]   5..10  (native setting `catch_up_speed_percent`)
    * @param {boolean} [o.autoReconnect=true]
    * @param {"resubscribe"|"wait"} [o.lossRecovery="resubscribe"]
@@ -217,13 +218,14 @@ export class RoomClient extends EventTarget {
    * @param {boolean} [o.nack]  selective retransmission (spec §6.6); default on unless `?nack=0` / `localStorage["sss-nack"]="0"`
    */
   constructor({
-    displayName = "Browser", maxJitterBufferMs = 2000, catchUpSpeedPercent = 5, autoReconnect = true, lossRecovery = "resubscribe",
+    displayName = "Browser", maxJitterBufferMs = 2000, catchUpSpeedPercent = 5, levelLoudness = true, autoReconnect = true, lossRecovery = "resubscribe",
     hardwareAcceleration = "no-preference", audioLatencyMs = 80, audioContext = null, nack = nackEnabledByDefault(),
   } = {}) {
     super();
     this.displayName = displayName;
     this.maxJitterBufferMs = maxJitterBufferMs;
     this.catchUpSpeedPercent = catchUpSpeedPercent;
+    this.levelLoudness = levelLoudness;
     this.autoReconnect = autoReconnect;
     this.lossRecovery = lossRecovery;
     this.hardwareAcceleration = hardwareAcceleration;
@@ -697,6 +699,7 @@ export class RoomClient extends EventTarget {
         latencyMs: this.audioLatencyMs,
         volume: this.volumes.get(key) ?? 1,
         muted: this.muted.get(key) ?? false,
+        level: this.levelLoudness,
         avSync: this.#avSyncFor(info.owner),
         onEvent: (type, detail) => this.dispatchEvent(new CustomEvent("media", { detail: { key, type, ...detail } })),
       });
@@ -789,6 +792,12 @@ export class RoomClient extends EventTarget {
   }
 
   /** Live settings (the native app's Settings > Jitter buffer). */
+  /** "Level loudness" (#119): slow AGC + instant peak limiter on every watched audio stream, live. On by default. */
+  setLevelLoudness(on) {
+    this.levelLoudness = !!on;
+    for (const rx of this.subs.values()) if (rx.impl.setLevelLoudness) rx.impl.setLevelLoudness(this.levelLoudness);
+  }
+
   setJitterSettings({ maxJitterBufferMs, catchUpSpeedPercent } = {}) {
     if (maxJitterBufferMs != null) this.maxJitterBufferMs = maxJitterBufferMs;
     if (catchUpSpeedPercent != null) this.catchUpSpeedPercent = catchUpSpeedPercent;

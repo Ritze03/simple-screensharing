@@ -3,7 +3,92 @@
 Audio capture/encode/playback is described where it grew up: `features/stream-control.md`
 ("Sharing audio ...", "The 2026-07-28 audio bugs"), `features/video-pipeline.md` ("Audio follows
 video") and the module docs of `client/src/audio.rs` and `client/src/decode.rs`. This page covers
-**keeping the audio aligned with the picture** (task #91, 2026-11-01), the **shared audio is a name** (#105), the viewer volume (#96) and the **sender-side boost** (#114).
+**keeping the audio aligned with the picture** (task #91, 2026-11-01), the **shared audio is a name** (#105), the viewer volume (#96), the **sender-side boost** (#114, capped at 200 % and calibration-free since #119) and the **viewer-side loudness levelling** (#119).
+
+## 2026-11-03: viewer-side loudness levelling, calibration removed, boost capped at 200 % (task #119)
+
+User request: *"Do the loudness levelling. Remove the calibration, cap volume boost to 200%. The auto levelling
+should happen on the viewers side. Make sure that it is protected against sudden audio increases."* Context: the
+viewer slider is a linear amplitude (500 % = +14 dB, loud sources clip above ~200-300 %), and the 10 s calibration
+(#114) was disliked.
+
+**What changed.**
+- **Removed (sender, #114):** the Calibrate row and its banner, `LoudnessMeter`, `gain_for`, `Calibration`,
+  `audio::start_calibration_tap` and the loudness path of the level tap, `AppState::audio_calibration*`, the
+  `CalibrateAudio` / `CancelAudioCalibration` actions and their strings and tests. The level tap itself stays (the
+  source dropdown meters). `audio_gain.rs` is now only the range and conversions.
+- **Boost capped at 200 %** (`audio_gain::MAX_GAIN = 2.0`, slider 50-200 %, still in dB so 100 % is mid-track).
+  `AppSettings::audio_gain()` clamps a bigger stored value (the old range went to 800 %) to 2.0 on load. The
+  `volume name=gain ! rglimiter` sender stage is unchanged (limiter bypassed at <= 1x). *Why 200 %:* with the viewer
+  levelling, the sender boost is only a manual trim; more only lifts the noise floor.
+- **New: viewer-side "Level loudness"** (Settings > Playback, default **on**, persisted as
+  `AppSettings::level_loudness`, live, native and browser). The viewer's volume slider and mute act after it.
+
+**Why viewer-side.** Every viewer has a different output chain and listening level, and watches several sharers
+with different levels at once: the level that sounds right is a property of the *listener*, so it is the listener's
+client that has to even it out. A sender-side normaliser would also change what every other viewer gets, and cannot
+protect a viewer from a sudden loud passage on *their* device.
+
+**Why no `audioloudnorm` / lookahead normaliser.** gst-plugins-rs `audioloudnorm` is an EBU R128 normaliser that
+works with a ~3 s lookahead buffer: it would add that much delay to a live stream with a picture (and break A/V
+sync, #91), and it is not installed everywhere. `rglimiter` is a soft-knee waveshaper from -6 dBFS (colours
+everything loud, no hard ceiling for large overshoots) and `audiodynamic` is a static compressor with no target
+loudness: neither levels. So the leveller is ~60 lines of DSP we own (`client/src/leveller.rs`, no new dependency).
+
+**Where (native).** `decode::run_audio_pipeline`:
+`appsrc ! opusdec ! audioconvert ! audioresample ! capsfilter(F32LE) ! volume name=vol ! audioconvert ! sink`, with
+a **buffer pad probe on the capsfilter's src pad** (`leveller::install`) that edits the float samples in place. No
+element, no queue, no lookahead: **zero added latency** (it processes the buffer that is passing). The trailing
+`audioconvert` is a pass-through for an F32 sink and a safety net otherwise. The switch is the process-wide
+`leveller::ENABLED` (an `AtomicBool` read per buffer, like `diag_upload::set_enabled`), so toggling applies to every
+running stream at once; switching off resets the DSP state.
+
+**The DSP (`leveller::Leveller`, per stream, any chunking gives the same result).**
+1. *AGC*, feed-forward (detectors see the input, not the output). Mean power over the channels feeds a **slow**
+   detector (one pole, 400 ms) and a **fast** one (5 ms attack / 80 ms release, a peak-ish RMS without ripple on
+   low tones). Gain is recomputed once per 1 ms block and ramped linearly across it.
+   - *Target* -18 dBFS short-term RMS (about -16 LUFS for typical stereo content), gain clamped to **-20 .. +12 dB**.
+   - *Slow up:* rises at most **4 dB/s** (tapering into the target), and **not at all while the slow level is below
+     -50 dBFS** (the gate: room noise, the gap between two tracks, silence stay a floor).
+   - *Down:* falls at up to 12 dB/s while the slow level is above target; and **fast down:** when the fast detector
+     says the output would be more than **4 dB above the target** (headroom: a drum hit or plosive passes without
+     pumping) the gain is pulled to the level that fixes it with a **5 ms** time constant.
+   - It starts at 0 dB, so a stream is never boosted before it has been heard.
+2. *Peak limiter*, per sample, **zero attack**: the sample's gain is `min(released memory, ceiling / |peak|)`; the
+   memory releases over 100 ms. Ceiling **-1 dBFS**. The output therefore **cannot** exceed the ceiling, even for the
+   first sample of a sudden transient, before the AGC reacted (a final clamp removes float rounding; NaN/Inf input
+   is zeroed). Cost: for the few ms the AGC needs, a big transient is flattened (the intended trade for the
+   viewer's ears).
+
+Measured on synthetic signals (unit tests + a trace): -40 dBFS sine for 6 s: gain 3.6 dB after 1 s, 7.6 dB after
+2 s, 11.9 dB after 5 s (4 dB/s, stops at +12). A 0 dBFS step on top of that (gain +12 dB): output peak never
+above -1 dBFS from the first sample, gain -7.8 dB after 10 ms, -13 dB after 50 ms, output settles near -17 dBFS RMS.
+
+**Browser (`docs/js/core/leveller.js`).** A line-for-line port of the native DSP, applied to each decoded 20 ms
+Opus frame **before it is scheduled** (`AudioReceiver.#play`: planar f32 planes -> `Leveller.process` ->
+`copyToChannel`); the viewer `GainNode` after it is unchanged. *Why not WebAudio nodes (an `AnalyserNode`-driven
+gain + `DynamicsCompressorNode`):* the compressor has a ~6 ms lookahead and no hard ceiling (a guarantee is what
+was asked for); a `setInterval`-driven AGC is throttled to 1 Hz in a background tab while the decoder callback is
+not; and the port is exactly testable with plain arrays, with the same scenarios and thresholds as the Rust tests.
+Same switch ("Level loudness", `S.settings.levelLoudness`, default on, Settings > Playback; `RoomClient.setLevelLoudness`
+applies live to all running audio receivers; i18n en + de).
+
+**Tests (no audio streams):** native `leveller::tests::*` (a -40 -> 0 dBFS step never exceeds the ceiling, also in the
+first 2 ms, and settles within 3 dB of the target; a quiet signal is raised <= 4 dB/s and stops at +12; silence and a
+-65 dBFS floor are not boosted (gain exactly 0); loud material is pulled down within 100 ms; random bursts at
+0.001..40 amplitude plus NaN/Inf stay under the ceiling; chunking-independent; mono; the real pad probe on an
+`audiotestsrc ! F32LE ! identity ! appsink` pipeline levels with the switch on and leaves the buffers byte-identical
+off), `rooms::tests::level_loudness_defaults_to_on`, `audio_gain_*` (clamp to 2.0, old 3.2 -> 2.0),
+`ui::tests::audio_boost::*`; browser (`docs/dev/tests.js`, 75/75) five `leveller:` tests incl. the real
+`AudioReceiver` driven through a stubbed `AudioDecoder` with a real `OfflineAudioContext`.
+**Verified in the headless rig:** Settings shows "Level loudness" (checked by default) in Playback and a Shared audio
+card with only the Boost slider (100 % mid-track, the end reads 199-200 %, no Calibrate); clicking the checkbox wrote
+`level_loudness = false` to `settings.toml`; headless Chromium: the browser checkbox defaults on and toggles + persists.
+**Not verified:** how it sounds, and the real `autoaudiosink` negotiation of the `F32LE` + `audioconvert` tail (no audio
+tests). If a sink refuses the chain the symptom is a pipeline error in the log (`audio decode pipeline`); the switch
+(Level loudness off) does not remove the F32 stage, only the processing.
+**Tuning knobs if it sounds wrong** (all constants at the top of `leveller.rs` / `leveller.js`, keep them in step):
+`TARGET_DB`, `RISE_DB_PER_S`, `GATE_DB`, `HEADROOM_DB`, `CEILING_DB`.
 
 ## 2026-11-03: audio broken after the source's stream disappears and comes back (task #117)
 
@@ -75,6 +160,9 @@ replaces the whole share / watch):
   unit-tested (no audio tests are allowed here, see `testing-and-verification.md`).
 
 ## 2026-11-03: sender-side audio boost and calibration (task #114)
+
+> **Superseded in part by #119 (above):** the calibration described here, the 800 % maximum and the "Calibrate" row
+> are gone; the boost now ends at 200 %. The pipeline and limiter sections still hold. Kept as history.
 
 User request: *"Also on the like client settings like the general settings there should be something like
 a volume boost because for example on my system it's really quiet for some reason so others barely hear

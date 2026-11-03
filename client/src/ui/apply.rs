@@ -371,8 +371,7 @@ impl App {
             UiAction::SetAudioGain(g) => {
                 self.state.set_audio_gain(g);
             }
-            UiAction::CalibrateAudio(source) => self.state.start_audio_calibration(source),
-            UiAction::CancelAudioCalibration => self.state.cancel_audio_calibration(),
+            UiAction::SetLevelLoudness(on) => self.state.set_level_loudness(on),
             UiAction::CopyLogs => {
                 ctx.copy_text(simple_screensharing_client::logbuf::dump());
                 self.toast(tr("ui.toast.logs_copied", "Logs copied"), "content_copy");

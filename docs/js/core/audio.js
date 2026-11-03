@@ -2,7 +2,7 @@
 // stereo, 20 ms frames (opusenc defaults), 64 kbit/s; wire PTS in µs advancing 20 ms per packet, stamped with the
 // capture time on the sender's one clock (shared with its video, see avsync.js) so the receiver can delay audio to match the picture.
 //
-//   AudioReceiver  decrypted packets -> WebCodecs AudioDecoder -> WebAudio (gain: volume 0..5, mute)
+//   AudioReceiver  decrypted packets -> WebCodecs AudioDecoder -> loudness leveller (leveller.js, #119) -> WebAudio (gain: volume 0..5, mute)
 //   AudioSender    MediaStreamTrack -> WebCodecs AudioEncoder -> packets
 
 export const OPUS_SAMPLE_RATE = 48000;
@@ -10,10 +10,11 @@ export const OPUS_CHANNELS = 2;
 export const OPUS_FRAME_US = 20000;
 export const OPUS_BITRATE = 64000;
 
-// 500 %. A GainNode (HTMLMediaElement.volume would cap at 1). Above 1.0 loud audio clips at the device, the same hard clip as the native client; no limiter.
+// 500 %. A GainNode (HTMLMediaElement.volume would cap at 1). The volume acts after the leveller; above 1.0 loud audio clips at the device, the same hard clip as the native client.
 export const MAX_VOLUME = 5;
 
 import { DelayController } from "./avsync.js";
+import { Leveller } from "./leveller.js";
 
 export function opusSupported() {
   return typeof AudioDecoder !== "undefined" && typeof AudioEncoder !== "undefined";
@@ -27,10 +28,11 @@ export class AudioReceiver {
    * @param {number} [o.latencyMs=80]     playout delay used to absorb network jitter
    * @param {number} [o.volume=1]         0..5
    * @param {boolean} [o.muted=false]
+   * @param {boolean} [o.level=true]      level the loudness of what is played (slow AGC + instant peak limiter, leveller.js); the volume acts after it
    * @param {import("./avsync.js").AvSync} [o.avSync]  this sender's A/V sync state: audio is delayed to line up with its video
    * @param {() => number} [o.now]  local clock in ms for the sync floors (tests inject one)
    */
-  constructor({ context, destination = context.destination, latencyMs = 80, volume = 1, muted = false, onEvent = () => {}, avSync = null, now = () => performance.now() }) {
+  constructor({ context, destination = context.destination, latencyMs = 80, volume = 1, muted = false, level = true, onEvent = () => {}, avSync = null, now = () => performance.now() }) {
     this.avSync = avSync;
     this.now = now;
     this.delay = new DelayController();
@@ -42,6 +44,8 @@ export class AudioReceiver {
     this.gain.connect(destination);
     this.volume = volume;
     this.muted = muted;
+    this.level_ = !!level; // "Level loudness" switch (the `level` field is the peak meter)
+    this.leveller = null;
     this.#applyGain();
     this.decoder = null;
     this.anchorPtsUs = null;
@@ -56,6 +60,11 @@ export class AudioReceiver {
   setVolume(v) {
     this.volume = Math.max(0, Math.min(MAX_VOLUME, Number(v) || 0));
     this.#applyGain();
+  }
+  /** Switch the loudness levelling on/off, live. Off passes the audio untouched and forgets the AGC state. */
+  setLevelLoudness(on) {
+    this.level_ = !!on;
+    if (!this.level_ && this.leveller) this.leveller.reset();
   }
   setMuted(m) {
     this.muted = !!m;
@@ -100,9 +109,21 @@ export class AudioReceiver {
       const ch = Math.min(data.numberOfChannels, 2);
       const buf = this.ctx.createBuffer(ch, frames, data.sampleRate);
       let peak = 0;
+      const planes = [];
       for (let c = 0; c < ch; c++) {
         const plane = new Float32Array(frames);
         data.copyTo(plane, { planeIndex: c, format: "f32-planar" });
+        planes.push(plane);
+      }
+      if (this.level_) {
+        if (!this.leveller || this.leveller.rate !== data.sampleRate) {
+          this.leveller = new Leveller(data.sampleRate);
+          this.leveller.rate = data.sampleRate;
+        }
+        this.leveller.process(planes);
+      }
+      for (let c = 0; c < ch; c++) {
+        const plane = planes[c];
         buf.copyToChannel(plane, c);
         for (let i = 0; i < frames; i += 16) peak = Math.max(peak, Math.abs(plane[i]));
       }

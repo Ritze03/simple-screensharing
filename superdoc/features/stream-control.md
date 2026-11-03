@@ -2025,7 +2025,7 @@ its *presentation* is bundled.)
 - **Boost (#114):** `volume name=gain` + `rglimiter name=limiter` in F32 *before* the mute and the meter
   (`audio::GAIN_STAGE`), set live by `AudioCaptureHandle::set_gain` from Settings > Shared audio; an
   `audioconvert` after the meter takes it back to S16 for `opusenc`. `features/audio-sharing.md` (2026-11-03,
-  task #114): why sender-side, why the limiter is bypassed at 100 %, the calibration.
+  task #114): why sender-side, why the limiter is bypassed at 100 %. The calibration was removed and the boost capped at 200 % in #119; viewers level loudness themselves (`leveller.rs`).
 - **Stop:** plain `stop_destination(<audio destination id>)`; an audio capture always has exactly
   one destination, so it stops that capture only and the screen share is untouched.
 - **Pairing:** `LocalCapture::audio_for_capture: Option<CaptureSourceId>`, set from

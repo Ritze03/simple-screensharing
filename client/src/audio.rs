@@ -1582,7 +1582,7 @@ mod tests {
     }
 
     /// A quiet source boosted so its peak stays below the limiter's knee is only multiplied:
-    /// +12 dB on -20 dBFS is -8 dBFS (the soft knee starts at -6).
+    /// +6 dB (2x, the top of the range) on -20 dBFS is -14 dBFS (the soft knee starts at -6).
     #[test]
     fn a_boost_below_the_knee_is_a_plain_multiplication() {
         let (pipeline, sink, stage) = gain_test_pipeline(0.1, false);
@@ -1593,12 +1593,12 @@ mod tests {
             p
         };
         let (pipeline, sink, _stage) = gain_test_pipeline(0.1, false);
-        _stage.set(3.98);
+        _stage.set(2.0);
         pipeline.set_state(gst::State::Playing).unwrap();
         let boosted = peak_of_first(&sink, 2);
         let _ = pipeline.set_state(gst::State::Null);
         drop(stage);
-        assert!((db(boosted) - db(plain) - 12.0).abs() < 0.2, "{} dB -> {} dB", db(plain), db(boosted));
+        assert!((db(boosted) - db(plain) - 6.02).abs() < 0.2, "{} dB -> {} dB", db(plain), db(boosted));
     }
 
     /// The default (1.0x) must leave the audio exactly alone, even a full-scale signal: the limiter
@@ -1671,8 +1671,8 @@ mod tests {
     fn the_sender_chain_negotiates_and_encodes_opus() {
         ensure_gstreamer_initialized().unwrap();
         let BuiltPipeline { pipeline, sink, gain_stage, .. } =
-            build_pipeline_from_source("audiotestsrc num-buffers=20 samplesperbuffer=960", 3.0, false).expect("chain builds");
-        assert_eq!(gain_stage.gain(), 3.0);
+            build_pipeline_from_source("audiotestsrc num-buffers=20 samplesperbuffer=960", 1.5, false).expect("chain builds");
+        assert_eq!(gain_stage.gain(), 1.5);
         pipeline.set_state(gst::State::Playing).unwrap();
         let sample = sink.try_pull_sample(gst::ClockTime::from_seconds(5)).expect("no Opus packet");
         let caps = sample.caps().unwrap().to_string();

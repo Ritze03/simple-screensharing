@@ -37,6 +37,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use gstreamer as gst;
+use gstreamer::prelude::*;
 
 /// Short-term RMS the AGC aims at, dBFS. -18 dBFS RMS is roughly -16 LUFS for typical stereo
 /// content (the usual streaming level) and leaves 17 dB for peaks below the ceiling.
@@ -444,7 +445,6 @@ mod tests {
     /// A full-scale sine comes out under the ceiling with levelling on, and untouched with it off.
     #[test]
     fn the_probe_levels_buffers_in_a_pipeline_and_the_switch_turns_it_off() {
-        use gstreamer::prelude::*;
         use gstreamer_app as gst_app;
         gst::init().unwrap();
         static ON: AtomicBool = AtomicBool::new(true);

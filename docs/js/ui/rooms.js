@@ -70,7 +70,7 @@ export function connectErrorText(e) {
 export async function connectRoom(r, { quiet = false } = {}) {
   if (r.client && r.state !== "disconnected") return;
   const st = S.settings;
-  const client = new RoomClient({ displayName: displayName(), maxJitterBufferMs: st.jitter, catchUpSpeedPercent: st.catchup });
+  const client = new RoomClient({ displayName: displayName(), maxJitterBufferMs: st.jitter, catchUpSpeedPercent: st.catchup, levelLoudness: st.levelLoudness });
   r.client = client;
   r.state = "connecting";
   r.error = null;
@@ -300,6 +300,10 @@ export async function forgetRoom(r) {
   await disconnectRoom(r);
   S.rooms = S.rooms.filter((x) => x !== r);
   persistRooms();
+}
+
+export function applyLevelLoudness() {
+  for (const r of S.rooms) if (r.client) r.client.setLevelLoudness(S.settings.levelLoudness);
 }
 
 export function applyJitterSettings() {

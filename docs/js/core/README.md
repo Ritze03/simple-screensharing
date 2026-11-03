@@ -229,7 +229,8 @@ Behaviour that matches the native sender:
 | `video-rx.js` | per-stream receive pipeline (`VideoReceiver`: loss gate -> jitter buffer -> `VideoDecoder`, reconfigures on codec change, recovers from decoder errors, Gecko decoder-latency fallback); re-exports `CanvasRenderer` |
 | `renderer.js` | `CanvasRenderer`: newest frame per `requestAnimationFrame`, WebGL2 or 2D backend picked by a first-frame timing, draw spacing |
 | `video-tx.js` | `VideoSender` (track -> `VideoEncoder`, keyframe policy, static-source keepalive, AV1 shaping), `probeEncoders`, `ENCODER_PRESETS`, `MediaClock` |
-| `audio.js` | `AudioReceiver` (Opus `AudioDecoder` -> WebAudio, PTS-placed playback, gain 0..5) and `AudioSender` (`AudioEncoder`) |
+| `audio.js` | `AudioReceiver` (Opus `AudioDecoder` -> loudness leveller -> WebAudio, PTS-placed playback, gain 0..5) and `AudioSender` (`AudioEncoder`) |
+| `leveller.js` | viewer-side loudness levelling (#119): slow AGC to -18 dBFS RMS + zero-attack -1 dBFS peak limiter on each decoded frame, a port of the native `client/src/leveller.rs`; `RoomClient.setLevelLoudness(on)` / option `levelLoudness` (default on) |
 | `preview.js` | preview sampler (downscale + JPEG) and cadence constants |
 | `joinlink.js` | link parse/format/mint, base64url |
 
