@@ -259,6 +259,23 @@ the streams do not jump. *Why (user request):* they should be out of the way: sh
 stage, gone after 3 s without movement. An open menu or a drag cancels the timer and keeps them up even off the stage;
 when it ends they get a full 3 s again, so closing a menu never hides the bar at once. Outside fullscreen they always show.
 
+**Stream settings and webcam** (#137, 2026-11-04), a proposal like the Stage. *Why (user request):* simpler stream
+settings and a webcam next to the screen share. The modal's two right-hand cards keep their widgets and are renamed and
+reordered: **Compression** (Codec, Bitrate; the user wanted something other than "Codec" as the title) and **Video** (FPS
+dropdown, Preset). The presets replace Balanced and Advanced tuning: Text = 15 FPS, Quality encoding, keyframe 250 ms;
+Quality = 60 FPS, Quality, 1000 ms; Gaming = 120 FPS, Performance, 250 ms. A preset sets the FPS once; changing the FPS by
+hand keeps its encoder mode and keyframe and the caption says "(custom)". The share dropdown shows the same state. The
+Source card's Change button is there while live too.
+
+The webcam is a stream of its own (`<room>/me/cam`, `cam: true`) with a split button in the control bar: camera, its v4l2
+modes (changing camera resets the mode), codec and bitrate; the encoder is fixed to Performance, keyframe 2000 ms. It does
+not need a screen share and has its own room (`S.camRoom`). **Webcam in picture** (Layout menu, per view) moves a person's
+webcam into their first playing screen share. It stays a tile while they have none, and also while you do not watch the
+webcam, because that tile holds its Watch button. Position and size are fractions of the parent's picture, per webcam and
+per view (`V().pipPos`), and `layoutPip` clamps only what is shown to the visible picture, so Crop does not lose the Split
+position. *Why the handle sits on the corner facing the picture's middle:* a PIP pushed into a corner could otherwise only
+shrink, and in Floating its handle would land on the window's own. Classic hides webcams: the current app has none.
+
 ## Verifying a style change
 
 `--gallery` is the quick QC screen for widgets and tokens; it is **not** proof that a

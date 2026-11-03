@@ -185,6 +185,8 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 .seg > button { flex: 1 1 0; min-width: 0; border: none; background: transparent; color: var(--text-dim); border-radius: 6px; padding: 0 4px; height: 100%; font-size: var(--fs-small); line-height: 1; cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .seg > button:hover { background: var(--wash-hover-1); color: var(--text); }
 .seg > button.on, .seg > button.on:hover { background: var(--accent-gradient); color: var(--primary-text); font-weight: 700; }
+.seg.dense { gap: 1px; } /* many short options: the share menu's 8 FPS values */
+.seg.dense > button { padding: 0; font-variant-numeric: tabular-nums; }
 
 /* buttons (widgets::Btn) */
 .btn { display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: var(--ctl-h); box-sizing: border-box; border-radius: var(--rounding-md); border: 1px solid transparent; padding: 0 12px; cursor: pointer; font-weight: 700; font-size: var(--fs-small); white-space: nowrap; line-height: 1; min-width: 0; flex: 0 0 auto; }
@@ -260,9 +262,7 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 .meter i { width: 3px; border-radius: 1px; background: var(--btn-border); display: block; }
 .meter i:nth-child(1) { height: 5px; } .meter i:nth-child(2) { height: 8px; } .meter i:nth-child(3) { height: 11px; } .meter i:nth-child(4) { height: 14px; } .meter i:nth-child(5) { height: 14px; }
 .meter i.lit { background: var(--success); }
-.collapser { height: var(--ctl-h); font-size: var(--fs-label); color: var(--text-dim); cursor: pointer; gap: 6px; }
-.collapser .ms { font-size: 16px; }
-.collapser:hover { color: var(--text); }
+.cap { font-size: var(--fs-tiny); line-height: 16px; color: var(--text-dim); min-width: 0; } /* one line under a control: what it sets */
 
 /* avatar (widgets::paint_avatar), status dot */
 .avatar { --av: 32px; width: var(--av); height: var(--av); border-radius: 50%; color: #fff; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; font-size: 13px; flex: 0 0 auto; position: relative; }
@@ -401,6 +401,8 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 /* ---------- fullscreen stream (popout::fullscreen_overlay) ---------- */
 .fs { position: absolute; inset: 0; background: #000; z-index: 20; }
 .fs .ovl { padding: var(--s2); }
+.fs > .ovl { pointer-events: none; } /* lies over the picture: a PIP in there stays grabbable */
+.fs > .ovl :is(button, input) { pointer-events: auto; }
 
 /* ---------- more fake pictures: a desktop and a film (so Crop visibly cuts the edges) ---------- */
 .screen.desk { background: linear-gradient(135deg, #2a3442 0%, #3c4a5c 55%, #222a35 100%); perspective: none; }
@@ -418,6 +420,15 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 .film .h1 { left: -10cqw; right: -10cqw; bottom: 0; height: 46cqh; background: #3a2131; clip-path: polygon(0 40%, 18% 20%, 35% 46%, 52% 18%, 70% 44%, 86% 26%, 100% 38%, 100% 100%, 0 100%); }
 .film .h2 { left: -10cqw; right: -10cqw; bottom: 0; height: 30cqh; background: #1c1119; clip-path: polygon(0 50%, 22% 30%, 45% 60%, 66% 34%, 100% 56%, 100% 100%, 0 100%); }
 .film .sub { left: 50%; bottom: 7cqh; transform: translateX(-50%); padding: .6cqh 1.6cqw; background: rgba(0,0,0,.55); color: #fff; font: 600 4.2cqh var(--font-sans); white-space: nowrap; font-style: normal; }
+/* a webcam: a person in a room, sized in cqh so it survives 16:9 and 4:3 modes (no real camera is touched) */
+.screen.cam { background: linear-gradient(180deg, #414a50 0%, #333a40 62%, #23272c 100%); perspective: none; }
+.cam i { position: absolute; display: block; }
+.cam .win { left: 7cqw; top: 9cqh; width: 22cqw; height: 44cqh; border-radius: 1cqh; background: linear-gradient(170deg, #c9dfea, #7fa6bc); opacity: .55; box-shadow: 0 0 10cqh rgba(190, 220, 235, .35); }
+.cam .shelf { right: 6cqw; top: 24cqh; width: 24cqw; height: 2cqh; background: #2a2017; box-shadow: 3cqw -7cqh 0 -.4cqh #8c5a3c, 8cqw -6cqh 0 -.5cqh #4f7a5c, 14cqw -8cqh 0 -.2cqh #6a6f96; }
+.cam .bd { left: 50%; bottom: -14cqh; width: 84cqh; height: 54cqh; margin-left: -42cqh; border-radius: 40cqh 40cqh 0 0; background: linear-gradient(180deg, #4d6c92, #2f4258); }
+.cam .nk { left: 50%; bottom: 30cqh; width: 15cqh; height: 15cqh; margin-left: -7.5cqh; background: #b98a6e; }
+.cam .hd { left: 50%; top: 17cqh; width: 33cqh; height: 41cqh; margin-left: -16.5cqh; border-radius: 48% 48% 46% 46%; background: linear-gradient(170deg, #e4b998, #c99a7d); }
+.cam .hd::before { content: ""; position: absolute; left: -2cqh; right: -2cqh; top: -3cqh; height: 17cqh; border-radius: 20cqh 20cqh 6cqh 6cqh; background: #3a2a22; }
 
 /* ===================================== stage redesign (task #134) =====================================
    The room's middle part: a black stage with the streams (Split / Crop / Floating), a people strip with avatars,
@@ -455,6 +466,15 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 .rz { position: absolute; right: 0; bottom: 0; width: 20px; height: 20px; z-index: 11; cursor: nwse-resize; display: none;
   background: linear-gradient(135deg, transparent 0 55%, var(--text-dim) 55% 61%, transparent 61% 72%, var(--text-dim) 72% 78%, transparent 78%); }
 .arena.float .rz { display: block; }
+/* a webcam inside its owner's screen share (#137). layoutPip() places it; the handle sits on the corner facing the middle of the picture, so a PIP pushed into a corner can still grow */
+.pip { position: absolute; z-index: 9; overflow: hidden; border-radius: 6px; background: #000; box-shadow: 0 0 0 1px rgba(255, 255, 255, .22), 0 6px 18px rgba(0, 0, 0, .55); cursor: grab; touch-action: none; }
+.pip:active { cursor: grabbing; }
+.prz { position: absolute; z-index: 1; width: 20px; height: 20px; }
+.prz::after { content: ""; position: absolute; inset: 4px; box-sizing: border-box; border: solid var(--text); border-width: 0 2px 2px 0; border-radius: 0 0 4px 0; filter: drop-shadow(0 0 2px #000); }
+.pip[data-c="rb"] .prz { right: 0; bottom: 0; cursor: nwse-resize; }
+.pip[data-c="lt"] .prz { left: 0; top: 0; cursor: nwse-resize; transform: rotate(180deg); }
+.pip[data-c="rt"] .prz { right: 0; top: 0; cursor: nesw-resize; transform: rotate(-90deg); }
+.pip[data-c="lb"] .prz { left: 0; bottom: 0; cursor: nesw-resize; transform: rotate(90deg); }
 .gut { position: absolute; z-index: 20; }
 .gut.v { cursor: col-resize; } .gut.h { cursor: row-resize; }
 .gut::after { content: ""; position: absolute; border-radius: 2px; background: transparent; transition: background .12s; }
@@ -565,6 +585,7 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 .ust .l3 { font-size: var(--fs-tiny); color: var(--text-faint); display: flex; align-items: center; gap: 5px; }
 .ust .l3 .ms { font-size: 14px; }
 .ust .back { flex: 0 0 auto; height: 22px; padding: 0 8px 0 6px; border-radius: 999px; border: 1px solid var(--accent-chip-border); background: var(--accent-chip-bg); color: var(--accent-lighter); font-size: var(--fs-tiny); font-weight: 700; display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+.ust .l1 > .ms { font-size: 15px; color: var(--accent-lighter); }
 .ust .au { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 4px; font-size: var(--fs-tiny); font-weight: 400; color: var(--text-faint); }
 .ust .au .ms { font-size: 14px; }
 .ust .au.on { color: var(--success); }
@@ -572,7 +593,7 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 .ust .back .ms { font-size: 13px; }
 
 /* emoji avatar picker (Settings > Profile) */
-.menu.m-emoji { width: 320px; }
+.menu.m-emoji, .menu.m-share, .menu.m-cam { width: 320px; }
 .emoji-grid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 2px; padding: 0 4px 6px; }
 .emoji-grid button { aspect-ratio: 1; border: 0; background: transparent; border-radius: 7px; padding: 0; cursor: pointer; font-family: var(--font-emoji); font-size: 20px; line-height: 1; }
 .emoji-grid button:hover { background: var(--wash-hover-1); }
@@ -618,7 +639,7 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
       <label><input type="checkbox" id="nav-ovl" checked> Pin hover overlays</label>
       <label><input type="checkbox" id="nav-spin"> Animate picture</label>
     </div>
-    <div class="note">Replica of the native egui client with fake data. <b>Stage</b> is the proposed room view (#134), and <b>Watched</b> the same stage with everything you watch from every room (#136): drag a stream to reorder it (Split, Crop) or move it (Floating), drag the gaps between streams to resize, right-click a stream or a room for its menu, hover an avatar for stream stats, Settings &gt; Profile sets an emoji avatar, the arrows in the bottom bar open the share, audio and layout menus. <b>Classic</b> is the current app. Double-click a stream for fullscreen; Esc leaves. Colours, type and sizes are the CSS tokens at the top of the file, named after <code>client/src/theme.rs</code>.</div>
+    <div class="note">Replica of the native egui client with fake data. <b>Stage</b> is the proposed room view (#134), and <b>Watched</b> the same stage with everything you watch from every room (#136): drag a stream to reorder it (Split, Crop) or move it (Floating), drag the gaps between streams to resize, right-click a stream or a room for its menu, hover an avatar for stream stats, Settings &gt; Profile sets an emoji avatar, the arrows in the bottom bar open the share, audio, webcam and layout menus, and the layout menu's "Webcam in picture" puts a webcam inside its owner's screen share (drag it, resize it by its corner handle). <b>Classic</b> is the current app. Double-click a stream for fullscreen; Esc leaves. Colours, type and sizes are the CSS tokens at the top of the file, named after <code>client/src/theme.rs</code>.</div>
   </div>
   <div class="stage" id="stage"><div class="frame" id="frame"></div></div>
 </div>
@@ -628,7 +649,7 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 /* ============================== fake data ==============================
    Two data sets: "demo" (richer, shows the audio pill) and "rig" (the headless rig's names, for side-by-side
    comparison with screenshots of the real app). Edit freely. */
-const K_RITZE = "films/Ritze/Screen", K_KRITA = "films/Ritze/Window · Krita", K_ANA = "films/Ana/Display 2", K_JONAS = "films/Jonas/Window · mpv"; /* stream keys, see skey() */
+const K_RITZE = "films/Ritze/Screen", K_KRITA = "films/Ritze/Window · Krita", K_ANA = "films/Ana/Display 2", K_JONAS = "films/Jonas/Window · mpv", K_JCAM = "films/Jonas/Webcam"; /* stream keys, see skey() */
 const DATA = {
   demo: {
     rooms: [
@@ -636,14 +657,15 @@ const DATA = {
         streams: [{ owner: "Ritze", label: "Screen", w: 2560, h: 1440, fps: 60, kbps: 9400, codec: "H.265", viewers: 3, audio: true, preview: true, pic: "cube" },
                   { owner: "Ritze", label: "Window · Krita", w: 1600, h: 1000, fps: 30, kbps: 3800, codec: "H.265", viewers: 1, audio: false, preview: true, pic: "desk" },
                   { owner: "Ana", label: "Display 2", w: 1920, h: 1200, fps: 30, kbps: 5200, codec: "AV1", viewers: 2, audio: false, preview: true, pic: "desk" },
-                  { owner: "Jonas", label: "Window · mpv", w: 1920, h: 800, fps: 24, kbps: 4100, codec: "H.264", viewers: 1, audio: true, preview: true, pic: "film" }] },
+                  { owner: "Jonas", label: "Window · mpv", w: 1920, h: 800, fps: 24, kbps: 4100, codec: "H.264", viewers: 1, audio: true, preview: true, pic: "film" },
+                  { owner: "Jonas", label: "Webcam", w: 1280, h: 720, fps: 30, kbps: 1800, codec: "H.264", viewers: 2, audio: false, preview: true, pic: "cam", cam: true }] },
       { id: "games", name: "Gaming Night", state: "joined", members: ["mo", "Ben", "Cleo", "Ana"], auto: true,
         streams: [{ owner: "Ben", label: "Screen", w: 1920, h: 1080, fps: 144, kbps: 12000, codec: "H.264", viewers: 1, audio: true, preview: true, pic: "cube" },
                   { owner: "Ana", label: "Window · Factorio", w: 1920, h: 1080, fps: 60, kbps: 6000, codec: "AV1", viewers: 2, audio: true, preview: true, pic: "film" }] },
       { id: "study", name: "Study Group", state: "disconnected", members: [], auto: false, streams: [] },
     ],
     me: "mo", meRoom: "films", watchKey: K_RITZE,
-    stageWatch: [K_RITZE, K_KRITA, K_ANA], allWatch: [K_RITZE, K_KRITA, K_ANA, "games/Ben/Screen", "games/Ana/Window · Factorio"],
+    stageWatch: [K_RITZE, K_KRITA, K_ANA, K_JCAM], allWatch: [K_RITZE, K_KRITA, K_ANA, K_JONAS, K_JCAM, "games/Ben/Screen", "games/Ana/Window · Factorio"],
     emoji: { Ana: "🦊", Ben: "🐙" }, /* name -> avatar emoji; your own is S.myEmoji (Settings > Profile) */
   },
   rig: {
@@ -656,14 +678,23 @@ const DATA = {
 };
 const PRISTINE = JSON.stringify(DATA); /* rename / forget / leave change the fake rooms; picking a preset restores them */
 const EMOJI = [..."😀😎🤓🥳🤖👻👽🎃💀🤡🐶🐱🦊🐻🐼🐸🐙🦄🐧🦉🍕🍔🍩🍣🍉☕🌮🍺🎮🎧🎬🎸⚽🚀🌈⭐🔥⚡🌙🌵"];
+/* Stream settings (#137). A preset sets the FPS, its encoder mode and its keyframe interval; changing the FPS afterwards keeps the other two. */
+const FPS_LIST = [15, 30, 60, 90, 120, 144, 165, 240];
+const ENC_PRESETS = { Text: { fps: 15, mode: "Quality", key: 250 }, Quality: { fps: 60, mode: "Quality", key: 1000 }, Gaming: { fps: 120, mode: "Performance", key: 250 } };
+const CODECS = ["H.264", "AV1", "H.265"];
+/* Webcams: fake devices with what v4l2 would list for them. The encoder is fixed for webcams. */
+const CAMS = [{ name: "Logitech C920", dev: "/dev/video0", modes: ["MJPG 1920x1080@30", "MJPG 1280x720@60", "YUYV 1280x720@10", "YUYV 640x480@30"] },
+  { name: "Integrated Camera", dev: "/dev/video2", modes: ["MJPG 1280x720@30", "MJPG 640x480@30", "YUYV 640x480@30", "YUYV 320x240@30"] }];
+const CAM_ENCODER = "Encoder: Performance · Keyframe 2000 ms";
 const AUDIO_SRCS = [["No audio", "volume_off", "Only the picture"], ["Desktop audio", "desktop_windows", "Everything you hear"], ["Spotify", "music_note", "App"], ["Floorp", "public", "App · browser"], ["mpv", "movie", "App · video player"]];
 
 /* ============================== presets (the nav's views) ============================== */
 const STAGE = [
   ["stage", "Split", {}],
   ["stage-crop", "Crop", { layout: "crop" }],
-  ["stage-float", "Floating", { layout: "float", float: { [K_RITZE]: { x: .02, y: .03, w: .5 }, [K_KRITA]: { x: .55, y: .02, w: .3 }, [K_ANA]: { x: .52, y: .4, w: .44 }, [K_JONAS]: { x: .06, y: .64, w: .36 } }, z: [K_RITZE, K_KRITA, K_JONAS, K_ANA] }],
+  ["stage-float", "Floating", { layout: "float", float: { [K_RITZE]: { x: .02, y: .03, w: .5 }, [K_KRITA]: { x: .55, y: .02, w: .3 }, [K_ANA]: { x: .52, y: .4, w: .44 }, [K_JONAS]: { x: .06, y: .64, w: .36 }, [K_JCAM]: { x: .44, y: .76, w: .16 } }, z: [K_RITZE, K_KRITA, K_JONAS, K_ANA, K_JCAM] }],
   ["stage-live", "Sharing · menu", { sharing: "live", sharerSelf: true, audioOn: true, audioSrc: "Spotify", menu: "share" }],
+  ["stage-pip", "Webcam + PIP", { pip: true, camOn: true, sharing: "live", sharerSelf: true, alsoWatch: [K_JONAS] }],
   ["stage-popped", "Popped out", { popped: [K_ANA] }],
   ["stage-focus", "No sidebar + people", { side: false, peoplePanel: true }],
   ["stage-room", "Room menu", { menu: "room" }],
@@ -688,27 +719,34 @@ const MODALS = [
    What a view arranges (V()) is not: every room and Watched keep their own layout, order, sizes and positions. */
 const STAGE_DEFAULTS = () => ({ classic: false, side: true, peoplePanel: false, strip: true, menu: null, ctx: null, roomCtx: null, roomEdit: null,
   forgetAsk: false, popped: new Set(), stageFs: false, views: {},
-  vols: {}, mutes: {}, levels: {}, stats: {}, audioOn: false, audioSrc: "No audio", fsKey: null, fsBack: "room", watchSet: new Set() });
-const newView = () => ({ layout: "split", order: [], float: {}, z: [], gridSig: "", rowFr: null, colFr: null, stagePopped: false });
+  vols: {}, mutes: {}, levels: {}, stats: {}, audioOn: false, audioSrc: "No audio", camOn: false, fsKey: null, fsBack: "room", watchSet: new Set() });
+const newView = () => ({ layout: "split", order: [], float: {}, z: [], gridSig: "", rowFr: null, colFr: null, stagePopped: false, pip: false, pipPos: {} });
 const S = Object.assign({
   data: "demo", view: "room", room: null, sharing: "none", sharerSelf: false, modal: null,
-  addTab: "join", vol: 100, muted: false, level: true, fps: 60, kbps: 8000, codec: "H.264", preset: "Balanced",
+  addTab: "join", vol: 100, muted: false, level: true, fps: 60, kbps: 8000, codec: "H.264", preset: "Quality",
+  camRoom: null, camName: CAMS[0].name, camMode: CAMS[0].modes[0], camCodec: "H.264", camKbps: 2500,
   bwMode: "per", lang: "English", presentation: "Mailbox (default)", jitter: 2000, catchup: 5, boost: 100,
-  diag: false, muteShared: false, advanced: false, size: "1920x1080", pin: true, spin: false, myEmoji: "",
+  diag: false, muteShared: false, size: "1920x1080", pin: true, spin: false, myEmoji: "",
 }, STAGE_DEFAULTS());
 const D = () => DATA[S.data];
 /* "sharerSelf": the presets that show your own share (rig: you are client-1, the only sharer). */
 const me = () => (S.data === "rig" && S.sharerSelf ? "client-1" : D().me);
 const roomById = (id) => D().rooms.find((r) => r.id === id);
 const curRoom = () => roomById(S.room) || D().rooms[0];
-const othersStreams = (r) => r.streams.filter((s) => s.owner !== me());
+/* Classic is the current app, which has no webcams. */
+const othersStreams = (r) => r.streams.filter((s) => s.owner !== me() && !(S.classic && s.cam));
 /* A stream's key: room-qualified (one person can be in two rooms) and per stream (one person can share several).
-   Your own share is "<room>/me". "/" and not ":" because data-act strings split on the first ":". */
+   Your own share is "<room>/me", your webcam "<room>/me/cam". "/" and not ":" because data-act strings split on the first ":". */
 const skey = (r, s) => `${r.id}/${s.owner}/${s.label}`;
 const myKey = () => D().meRoom + "/me";
+const camKey = () => S.camRoom + "/me/cam";
 const watched = (r) => (r.state === "joined" ? othersStreams(r).filter((s) => S.watchSet.has(skey(r, s))) : []);
 const myShareIn = (r) => S.sharing !== "none" && r.id === D().meRoom;
 const myLive = (r) => S.sharing === "live" && r.id === D().meRoom;
+/* The webcam has its own room: it works without a screen share and goes to the room it was started in. */
+const myCam = (r) => S.camOn && r.id === S.camRoom;
+const camTarget = () => (isCombined() ? (S.camOn ? S.camRoom : D().meRoom) : curRoom()?.id); /* the room the webcam button acts on */
+const camMode = () => { const [, fmt, w, h, fps] = S.camMode.match(/(\w+) (\d+)x(\d+)@(\d+)/); return { fmt, w: +w, h: +h, fps: +fps }; };
 /* The combined stage (Watched): also while one of its streams is fullscreen. */
 const isCombined = () => (S.view === "fullscreen" ? S.fsBack : S.view) === "watched";
 const V = () => (S.views[isCombined() ? "watched" : "room:" + curRoom()?.id] ??= newView());
@@ -746,12 +784,16 @@ const card = (title, count, rows) => `<div class="vb g2 gcard">${title ? `<div c
 const tipIc = (t) => `<span class="ms tip" title="${esc(t)}">info</span>`;
 const ctrlRow = (label, control, value, tip) => `<div class="hb g2 crow">${SL(120, label == null ? "" : `<span class="lbl">${label}${tip ? tipIc(tip) : ""}</span>`, "l")}${FILL(control)}${value === undefined ? "" : SL(72, value, "r")}</div>`;
 const seg = (key, opts) => `<div class="seg" role="radiogroup">${opts.map((o) => `<button type="button" class="${S[key] === o ? "on" : ""}" data-set="${key}" data-val="${esc(o)}">${esc(o)}</button>`).join("")}</div>`;
+const segAct = (verb, opts, cur, cls = "") => `<div class="seg ${cls}" role="radiogroup">${opts.map((o) => `<button type="button" class="${cur === o ? "on" : ""}" data-act="${verb}:${esc(o)}">${esc(o)}</button>`).join("")}</div>`;
+const presetCap = () => { const p = ENC_PRESETS[S.preset]; return `${S.fps} FPS${S.fps === p.fps ? "" : " (custom)"} · ${p.mode} encoding · Keyframe ${p.key} ms`; };
 const cbx = (key, label, disabled) => `<span class="cbx${S[key] ? " on" : ""}${disabled ? " disabled" : ""}" role="checkbox" tabindex="0" aria-checked="${!!S[key]}" data-toggle="${disabled ? "" : key}"><span class="box">${ic("check")}</span>${label}</span>`;
 const select = (key, opts) => `<div class="selwrap"><select class="field" data-sel="${key}">${opts.map((o) => `<option${S[key] === o ? " selected" : ""}>${esc(o)}</option>`).join("")}</select>${ic("expand_more")}</div>`;
-const slider = (key, min, max, step, cls = "") => `<input type="range" class="${cls}" min="${min}" max="${max}" step="${step}" value="${S[key]}" data-range="${key}" aria-label="${key}">`;
+const fpsSelect = () => `<div class="selwrap"><select class="field" data-sel="fps" aria-label="FPS">${FPS_LIST.map((f) => `<option value="${f}"${S.fps === f ? " selected" : ""}>${f} fps</option>`).join("")}</select>${ic("expand_more")}</div>`;
+const slider = (key, min, max, step, cls = "", label = key) => `<input type="range" class="${cls}" min="${min}" max="${max}" step="${step}" value="${S[key]}" data-range="${key}" aria-label="${label}">`;
 const meter = (lit = 0) => `<span class="meter">${[0, 1, 2, 3, 4].map((i) => `<i class="${i < lit ? "lit" : ""}"></i>`).join("")}</span>`;
 const pillLive = (lg) => `<span class="badge badge-live${lg ? " lg" : ""}"><span class="dot"></span>Live</span>`;
 const screenPic = (v = "cube") => v === "desk" ? `<div class="screen desk"><i class="tb"></i><i class="w1"></i><i class="w2"></i><i class="dock"></i></div>`
+  : v === "cam" ? `<div class="screen cam"><i class="win"></i><i class="shelf"></i><i class="bd"></i><i class="nk"></i><i class="hd"></i></div>`
   : v === "film" ? `<div class="screen film"><i class="sun"></i><i class="h1"></i><i class="h2"></i><i class="sub">Where are you going?</i></div>`
   : `<div class="screen"><div class="cube"><i></i><i></i><i></i><i></i></div></div>`;
 
@@ -767,18 +809,19 @@ function renderSide() {
   for (const r of rooms) {
     const joined = r.state === "joined";
     const others = othersStreams(r);
-    const n = joined ? others.length + (myShareIn(r) && S.sharing === "live" ? 1 : 0) : null;
-    rows += roomRow({ lead: `<span class="sdot ${r.state}"></span>`, name: r.name, me: myLive(r) ? ic("cast", "ico live") : null,
+    const n = joined ? others.length + (myShareIn(r) && S.sharing === "live" ? 1 : 0) + (myCam(r) ? 1 : 0) : null;
+    rows += roomRow({ lead: `<span class="sdot ${r.state}"></span>`, name: r.name, me: myLive(r) || myCam(r) ? ic("cast", "ico live") : null,
       num: n || "", unit: n ? ic("screen_share", "unit-ico") : "", sel: S.view === "room" && curRoom().id === r.id, act: "room:" + r.id, rid: r.id,
       title: joined ? "Connected" : "Not connected" });
     if (!joined) continue;
     if (myLive(r)) rows += subRow(ic("cast", "ico live"), "You", S.fps, "fps", "room:" + r.id);
+    if (myCam(r)) rows += subRow(ic("videocam", "ico live"), "You · Webcam", camMode().fps, "fps", "room:" + r.id);
     for (const s of others) {
       const w = watched(r).includes(s), several = others.filter((o) => o.owner === s.owner).length > 1;
-      rows += subRow(ic(w ? "visibility" : "screen_share", "ico" + (w ? " watch" : "")), several ? `${s.owner} · ${s.label}` : s.owner, w ? s.fps : "", w ? "fps" : "", "room:" + r.id);
+      rows += subRow(ic(w ? "visibility" : s.cam ? "videocam" : "screen_share", "ico" + (w ? " watch" : "")), several ? `${s.owner} · ${s.label}` : s.owner, w ? s.fps : "", w ? "fps" : "", "room:" + r.id);
     }
   }
-  const nLive = rooms.filter(myLive).length;
+  const nLive = rooms.filter((r) => myLive(r) || myCam(r)).length;
   return `<aside class="vb g0 p-side">
     <div class="hb g2 band p-brand"><span class="mark" aria-hidden="true"></span><span class="txt">Simple Screensharing</span></div>
     <div class="vb g2 p-side-scroll">
@@ -800,7 +843,7 @@ function renderHead(r) {
   if (r.state !== "joined") {
     return `<header class="hb g2 band top p-head"><div class="hb g3 eq"><h2>${esc(r.name)}</h2><span class="badge badge-muted">Not connected</span></div></header>`;
   }
-  const nShare = new Set(othersStreams(r).map((s) => s.owner)).size + (myLive(r) ? 1 : 0);
+  const nShare = new Set(othersStreams(r).map((s) => s.owner)).size + (myLive(r) || myCam(r) ? 1 : 0);
   return `<header class="hb g2 band top p-head">
     <div class="hb g3 eq"><h2 title="${esc(r.name)}">${esc(r.name)}</h2><span class="badge badge-live"><span class="dot"></span>Connected</span>
       <span class="txt meta">${r.members.length} people · ${nShare} sharing</span></div>
@@ -912,7 +955,7 @@ function renderCenter(r, fw, fh) {
 function peopleRows(r) {
   const ms = [...r.members].sort((a, b) => (b === me()) - (a === me()));
   return `<div class="vb g0">${ms.map((m) => {
-    const sharing = m === me() ? myLive(r) : r.streams.some((s) => s.owner === m);
+    const sharing = m === me() ? myLive(r) || myCam(r) : othersStreams(r).some((s) => s.owner === m);
     const eye = watched(r).some((s) => s.owner === m);
     return `<div class="hb g2 member${sharing ? "" : " idle"}">${SL(22, avatar(m, true))}${FILL(`<span class="txt name">${esc(m)}${m === me() ? '<span class="you">you</span>' : ""}</span>`)}${SL(44, sharing ? `<span class="badge badge-live">Live</span>` : "", "r")}${SL(18, eye ? ic("visibility", "ico watch") : "")}</div>`;
   }).join("")}</div>`;
@@ -968,8 +1011,9 @@ function renderFullscreen() {
   const it = items.find((i) => i.key === (S.fsKey || D().watchKey)) || items[0];
   if (!it) return "";
   const s = it.s, r = it.r;
-  const pic = it.mine ? `<div class="mine-pic">${ic("cast")}<span>Your screen · live</span></div>` : screenPic(s.pic);
-  return `<div class="fs" data-dbl="exitfs"><div class="st-tile" data-key="${esc(it.key)}" style="left:0;top:0;width:100%;height:100%;border-radius:0;cursor:default;--ar:${(s.w / s.h).toFixed(4)}"><div class="vid">${pic}</div></div><div class="vig hover-ui"></div>
+  const pic = it.mine && !s.cam ? `<div class="mine-pic">${ic("cast")}<span>Your screen · live</span></div>` : screenPic(s.pic);
+  const cam = pipPairs(viewItems()).get(it.key);
+  return `<div class="fs" data-dbl="exitfs"><div class="st-tile" data-key="${esc(it.key)}" style="left:0;top:0;width:100%;height:100%;border-radius:0;cursor:default;--ar:${(s.w / s.h).toFixed(4)}"><div class="vid">${pic}</div>${cam ? pipEl(cam) : ""}</div><div class="vig hover-ui"></div>
     <div class="vb g0 ovl hover-ui"><div class="hb g2">${FILL(statbar(s, it.mine ? "You" : s.owner, `${s.label} · ${r.name}`, true))}
       ${S.classic ? "" : `<button type="button" class="round-btn" title="More" data-ctx="${esc(it.key)}">${ic("more_horiz")}</button>`}
       <button type="button" class="round-btn" title="Exit fullscreen" data-act="exitfs">${ic("fullscreen_exit")}</button></div>
@@ -985,6 +1029,7 @@ function stageItems(r) {
   if (!r || r.state !== "joined") return [];
   const list = othersStreams(r).map((s) => ({ key: skey(r, s), r, s, mine: false }));
   if (myLive(r)) list.push({ key: r.id + "/me", r, mine: true, s: { owner: me(), label: "Screen", w: 1920, h: 1080, fps: S.fps, kbps: S.kbps, codec: S.codec, viewers: 2, audio: S.audioOn } });
+  if (myCam(r)) { const m = camMode(); list.push({ key: r.id + "/me/cam", r, mine: true, s: { owner: me(), label: "Webcam", w: m.w, h: m.h, fps: m.fps, kbps: S.camKbps, codec: S.camCodec, viewers: 2, audio: false, pic: "cam", cam: true } }); }
   return list;
 }
 const allItems = () => D().rooms.flatMap((r) => stageItems(r));
@@ -996,14 +1041,29 @@ function syncOrder(items) {
   V().order = V().order.filter((k) => keys.includes(k)).concat(keys.filter((k) => !V().order.includes(k)));
 }
 const isWatched = (it) => it.mine || S.watchSet.has(it.key);
+/* "Webcam in picture" (V().pip): parent stream key -> the webcam item that sits inside it. The parent is its owner's first
+   screen share playing in this view. With none (not sharing, not watched, popped out) the webcam stays a tile of its own,
+   and so does a webcam you don't watch yet, because that tile is where its Watch button is. */
+function pipPairs(items) {
+  const m = new Map();
+  if (!V().pip || S.classic) return m;
+  const list = V().order.map((k) => items.find((i) => i.key === k)).filter((i) => i && !S.popped.has(i.key) && isWatched(i));
+  for (const c of list) {
+    if (!c.s.cam) continue;
+    const p = list.find((i) => !i.s.cam && i.r === c.r && i.s.owner === c.s.owner);
+    if (p) m.set(p.key, c);
+  }
+  return m;
+}
+const pipEl = (c) => `<div class="pip" data-key="${esc(c.key)}" data-dbl="fs:${esc(c.key)}" data-ar="${(c.s.w / c.s.h).toFixed(4)}" title="${esc(c.mine ? "Your webcam" : c.s.owner + "'s webcam")}: drag to move, right-click for its menu">${screenPic(c.s.pic)}<span class="prz hover-ui" title="Drag to resize"></span></div>`;
 const stNote = (icon, t, sub, extra = "") => `<div class="arena-note">${ic(icon, "big")}<b>${t}</b>${sub ? `<span>${sub}</span>` : ""}${extra}</div>`;
 
-function stTile(it, combined) {
+function stTile(it, combined, cam) {
   const { key, s, mine, r } = it;
   const w = isWatched(it), muted = !!S.mutes[key], k = esc(key);
   const audible = !mine && w && s.audio && !muted;
-  const pic = mine ? `<div class="mine-pic">${ic("cast")}<span>Your screen · live</span></div>` : screenPic(s.pic);
-  const tagIc = mine ? ic("cast", "live") : !s.audio ? ic("volume_off") : muted ? ic("volume_off", "off") : ic("volume_up");
+  const pic = mine && !s.cam ? `<div class="mine-pic">${ic("cast")}<span>Your screen · live</span></div>` : screenPic(s.pic);
+  const tagIc = s.cam ? ic("videocam", mine ? "live" : "") : mine ? ic("cast", "live") : !s.audio ? ic("volume_off") : muted ? ic("volume_off", "off") : ic("volume_up");
   const lb = esc(combined ? `${s.label} · ${r.name}` : s.label);
   const tag = `<span class="tag" title="${mine ? "You" : esc(s.owner)} · ${lb}">${tagIc}<span>${esc(mine ? "You" : s.owner)}</span><span class="lb">· ${lb}</span></span>`;
   const tools = `<div class="tools hover-ui">${w ? `<button type="button" class="round-btn" title="Pop out to its own window" aria-label="Pop out" data-act="pop:${k}">${ic("open_in_new")}</button>
@@ -1013,7 +1073,7 @@ function stTile(it, combined) {
   const invite = w ? "" : `<div class="invite">${avatar(s.owner)}<b>${esc(s.owner)} is sharing ${esc(s.label)}</b><span>${s.w}×${s.h} · ${s.fps} fps</span>
     <button type="button" class="btn btn-primary" data-act="watch:${k}">${ic("play_arrow")}Watch stream</button></div>`;
   return `<div class="st-tile${w ? "" : " idle"}${audible ? " audible" : ""}" data-key="${k}"${w ? ` data-dbl="fs:${k}"` : ""} style="--ar:${(s.w / s.h).toFixed(4)}" tabindex="0" aria-label="${mine ? "Your" : esc(s.owner) + "'s"} stream">
-    <div class="vid">${pic}</div>${invite}${stats}${tag}${tools}<span class="rz" title="Drag to resize"></span></div>`;
+    <div class="vid">${pic}</div>${cam ? pipEl(cam) : ""}${invite}${stats}${tag}${tools}<span class="rz" title="Drag to resize"></span></div>`;
 }
 
 /* r: the room, or null for the combined stage of Watched. */
@@ -1026,7 +1086,10 @@ function renderStage(r) {
   else if (!items.length) inner = r ? stNote("tv_off", "Nobody is sharing yet", "Share your screen with the button below.")
     : stNote("visibility_off", "You're not watching anything", "Open a room in the sidebar and pick a stream to watch.");
   else if (!vis.length) inner = stNote("open_in_new", "Every stream is popped out", "Click a person below to bring their stream back.");
-  else inner = vis.map((it) => stTile(it, !r)).join("");
+  else {
+    const pairs = pipPairs(items), inPip = new Set([...pairs.values()].map((c) => c.key));
+    inner = vis.filter((it) => !inPip.has(it.key)).map((it) => stTile(it, !r, pairs.get(it.key))).join("");
+  }
   return `<section class="vb g0 eq stg minh0"><div class="arena ${V().layout}" id="arena">${inner}</div>${renderStrip(r, items)}${renderControls(r)}</section>`;
 }
 
@@ -1062,6 +1125,10 @@ function renderControls(r) {
   const aT = S.audioOn ? `Stop sharing audio (${S.audioSrc})` : S.audioSrc === "No audio" ? "Share audio" : `Share audio (${S.audioSrc})`;
   const audio = !r && mine === "none" && !S.audioOn ? "" : `<div class="splitb${S.audioOn ? " on" : ""}${open("audio")}" data-anchor="audio">
     <button type="button" class="cb" data-act="audio" title="${esc(aT)}" aria-label="${esc(aT)}">${ic(S.audioOn ? "music_note" : "music_off")}</button>${caret("audio", "Pick an audio source")}</div>`;
+  const camHere = S.camOn && S.camRoom === camTarget();
+  const cT = `${camHere ? "Stop sharing your webcam" : "Share your webcam"} (${S.camName})`;
+  const cam = !r && mine === "none" && !S.camOn ? "" : `<div class="splitb${camHere ? " on" : ""}${open("cam")}" data-anchor="cam">
+    <button type="button" class="cb" data-act="cam" title="${esc(cT)}" aria-label="${esc(cT)}" aria-pressed="${camHere}">${ic(camHere ? "videocam" : "videocam_off")}</button>${caret("cam", "Camera, mode and quality")}</div>`;
   const L = LAYOUTS.find((l) => l[0] === V().layout);
   const layout = `<div class="splitb${open("layout")}" data-anchor="layout"><button type="button" class="cb" data-menu="layout" title="Layout: ${L[2]}" aria-label="Layout: ${L[2]}">${ic(L[1])}</button>${caret("layout", "Choose a layout")}</div>`;
   const room = !r ? "" : `<div class="splitb${open("room")}" data-anchor="room"><button type="button" class="cb" data-menu="room" title="Room settings" aria-label="Room settings">${ic("tune")}</button>${caret("room", "Room settings")}</div>`;
@@ -1069,7 +1136,7 @@ function renderControls(r) {
   return `<div class="ctlrow">
     <div class="side">${S.stageFs ? "" : `<button type="button" class="cb dim" data-act="side" title="${S.side ? "Hide the sidebar" : "Show the sidebar"}" aria-label="${S.side ? "Hide" : "Show"} the sidebar">${ic(S.side ? "left_panel_close" : "left_panel_open")}</button>`}
       ${r ? `<button type="button" class="cb dim" data-act="invite" title="Copy the room's invite link">${ic("person_add")}<span class="lbl2">Copy invite link</span></button>` : ""}</div>
-    <div class="mid">${share || audio ? `<div class="cgroup">${share}${audio}</div>` : ""}<div class="cgroup">${layout}${room}${people}</div>
+    <div class="mid">${share || audio || cam ? `<div class="cgroup">${share}${audio}${cam}</div>` : ""}<div class="cgroup">${layout}${room}${people}</div>
       ${r ? `<button type="button" class="cb leave" data-act="leave:${r.id}" title="Leave ${esc(r.name)}" aria-label="Leave room">${ic("call_end")}</button>` : ""}</div>
     <div class="side r"><button type="button" class="cb dim" data-act="popview" title="Pop the stage out to its own window" aria-label="Pop out the stage">${ic("open_in_new")}</button>
       <button type="button" class="cb dim" data-act="stagefs" title="${S.stageFs ? "Exit fullscreen" : "Fullscreen"}" aria-label="${S.stageFs ? "Exit fullscreen" : "Fullscreen"}">${ic(S.stageFs ? "fullscreen_exit" : "fullscreen")}</button></div>
@@ -1082,12 +1149,24 @@ const sw = (on) => `<span class="sw${on ? " on" : ""}"></span>`;
 function shareMenu() {
   const live = S.sharing === "live", r = roomById(D().meRoom);
   return `<div class="mh">${live ? pillLive() : `<span class="badge badge-muted">Ready</span>`}<div><b>Screen share</b><small class="mono">1920×1080 · ${S.codec} · ${fmtKbps(S.kbps)}</small></div></div>
-    <div class="ml">Framerate</div><div class="mrow"><div class="seg">${[30, 60, 120, 144, 240].map((f) => `<button type="button" class="${S.fps === f ? "on" : ""}" data-act="fps:${f}">${f}</button>`).join("")}</div></div>
-    <div class="ml">Encoder preset</div><div class="mrow">${seg("preset", ["Balanced", "Quality", "Gaming"])}</div>
+    <div class="ml">FPS</div><div class="mrow">${segAct("fps", FPS_LIST, S.fps, "dense")}</div>
+    <div class="ml">Preset</div><div class="mrow">${segAct("preset", Object.keys(ENC_PRESETS), S.preset)}</div>
+    <div class="mrow"><span class="cap">${presetCap()}</span></div>
     <div class="msep"></div>
     ${mi("swap_horiz", "Change source", "chsrc", `<span class="unit">screen, window</span>`)}
     ${mi("tune", "All stream settings…", "modal:stream")}
     ${live ? mi("stop_screen_share", "Stop sharing", "stop", "", "danger") : mi("cast", `Go live in ${esc(r.name)}`, "golive")}`;
+}
+function camMenu() {
+  const on = S.camOn && S.camRoom === camTarget(), m = camMode(), cur = CAMS.find((c) => c.name === S.camName);
+  const row = (act, text, extra, sel, icon = "") => `<button type="button" class="mi${sel ? " on" : ""}" data-act="${esc(act)}">${icon && ic(icon)}<span class="t">${esc(text)}</span>${extra}${sel ? ic("check", "chk") : ""}</button>`;
+  return `<div class="mh">${on ? pillLive() : `<span class="badge badge-muted">Off</span>`}<div><b>Webcam</b><small class="mono">${m.w}×${m.h} · ${m.fps} fps · ${esc(S.camCodec)}</small></div></div>
+    <div class="ml">Camera</div>${CAMS.map((c) => row("campick:" + c.name, c.name, `<span class="unit">${c.dev}</span>`, c === cur, "videocam")).join("")}
+    <div class="ml">Mode</div>${cur.modes.map((x) => { const [f, res] = x.split(" "), [wh, fps] = res.split("@");
+      return row("cammode:" + x, `${wh.replace("x", "×")} · ${fps} fps`, `<span class="unit">${f}</span>`, x === S.camMode); }).join("")}
+    <div class="ml">Codec</div><div class="mrow">${segAct("camcodec", CODECS, S.camCodec)}</div>
+    <div class="ml">Bitrate</div><div class="mrow">${FILL(slider("camKbps", 200, 12000, 100, "", "Webcam bitrate"))}${SL(72, `<span class="val" id="camkbps-val">${S.camKbps}</span>`, "r")}</div>
+    <div class="mrow"><span class="cap">${CAM_ENCODER}</span></div>`;
 }
 function audioMenu() {
   const cur = S.audioOn ? S.audioSrc : "No audio";
@@ -1095,6 +1174,8 @@ function audioMenu() {
 }
 function layoutMenu() {
   return `<div class="ml">Layout</div>${LAYOUTS.map(([k, icon, n, sub]) => `<button type="button" class="mi two${V().layout === k ? " on" : ""}" data-act="layout:${k}">${ic(icon)}<span class="t">${n}<small>${sub}</small></span>${V().layout === k ? ic("check", "chk") : ""}</button>`).join("")}
+    <div class="msep"></div>
+    <div class="mrow"><span class="cbx${V().pip ? " on" : ""}" role="checkbox" tabindex="0" aria-checked="${V().pip}" data-act="pip" title="A webcam sits inside its owner's screen share, if they have one running"><span class="box">${ic("check")}</span>Webcam in picture</span></div>
     <div class="msep"></div>${mi("restart_alt", "Reset sizes and positions", "resetlayout")}`;
 }
 function roomMenu() {
@@ -1121,7 +1202,7 @@ function ctxMenu() {
   if (!it) return "";
   const { key, s, mine, r } = it, w = isWatched(it), k = esc(key), muted = !!S.mutes[key];
   const v = S.vols[key] ?? 100, lvl = S.levels[key] ?? S.level;
-  let out = `<div class="mh">${avatar(s.owner, true)}<div><b>${mine ? "Your stream" : esc(s.owner)}</b><small>${esc(s.label)} · ${isCombined() ? esc(r.name) : `${s.w}×${s.h}`}</small></div></div>`;
+  let out = `<div class="mh">${avatar(s.owner, true)}<div><b>${mine ? (s.cam ? "Your webcam" : "Your stream") : esc(s.owner)}</b><small>${esc(s.label)} · ${isCombined() ? esc(r.name) : `${s.w}×${s.h}`}</small></div></div>`;
   if (!mine && w && s.audio) {
     out += `<div class="ml">Volume</div><div class="mrow"><button type="button" class="icon-btn sm" data-act="mute:${k}" title="${muted ? "Unmute" : "Mute"}" aria-label="${muted ? "Unmute" : "Mute"}">${ic(muted ? "volume_off" : "volume_up")}</button>
       <input type="range" class="vol" min="0" max="500" step="5" value="${v}" data-range="vol:${k}" aria-label="Volume of ${esc(s.owner)}'s ${esc(s.label)}"${muted ? " disabled" : ""}><span class="pct" id="ctx-pct">${muted ? "Muted" : v + "%"}</span></div>
@@ -1130,7 +1211,8 @@ function ctxMenu() {
   if (w) out += `<button type="button" class="mi" data-act="stats:${k}" role="menuitemcheckbox" aria-checked="${!!S.stats[key]}">${ic("monitoring")}<span class="t">Show stats on the stream</span>${sw(S.stats[key])}</button>`;
   out += `<div class="msep"></div>`;
   if (w && S.view !== "fullscreen") out += mi("open_in_new", "Pop out", "pop:" + k) + mi("fullscreen", "Fullscreen", "fs:" + k);
-  if (mine) out += mi("tune", "Stream settings…", "modal:stream") + mi("stop_screen_share", "Stop sharing", "stop", "", "danger");
+  if (mine && s.cam) out += mi("tune", "Webcam settings…", "camset") + mi("videocam_off", "Stop webcam", "cam", "", "danger");
+  else if (mine) out += mi("tune", "Stream settings…", "modal:stream") + mi("stop_screen_share", "Stop sharing", "stop", "", "danger");
   else out += w ? mi("visibility_off", "Stop watching", "unwatch:" + k, "", "danger") : mi("play_arrow", "Watch stream", "watch:" + k);
   return out;
 }
@@ -1143,7 +1225,7 @@ function emojiMenu() {
     ${mi("text_fields", "Use my initial", "emoji:")}`;
 }
 function renderMenu() {
-  const f = { share: shareMenu, audio: audioMenu, layout: layoutMenu, room: roomMenu, ctx: ctxMenu, emoji: emojiMenu }[S.menu];
+  const f = { share: shareMenu, audio: audioMenu, cam: camMenu, layout: layoutMenu, room: roomMenu, ctx: ctxMenu, emoji: emojiMenu }[S.menu];
   const body = f ? f() : "";
   return body ? `<div class="menu m-${S.menu}" id="menu" role="menu">${body}</div>` : "";
 }
@@ -1181,12 +1263,13 @@ function toast(msg, icon = "check_circle") {
 /* hover card on a person in the strip: one stream gets the full table, several get a row each */
 function userTip(name) {
   const its = viewItems().filter((i) => i.s.owner === name), combined = isCombined();
+  const inPip = new Set([...pipPairs(viewItems()).values()].map((c) => c.key));
   if (!its.length) return `<div class="utip"><div class="hd">${avatar(name)}<div><b>${esc(name)}</b><small>Not sharing anything</small></div></div></div>`;
   const rows = its.map((it) => {
     const { s, key, mine } = it, popped = S.popped.has(key);
-    const status = mine ? ic("cast") + "Your stream" : popped ? ic("open_in_new") + "Popped out" : isWatched(it) ? ic("visibility") + "On the stage" : ic("visibility_off") + "Not watching";
+    const status = inPip.has(key) ? ic("picture_in_picture") + "In picture" : mine ? ic("cast") + "Your stream" : popped ? ic("open_in_new") + "Popped out" : isWatched(it) ? ic("visibility") + "On the stage" : ic("visibility_off") + "Not watching";
     const audio = s.audio ? `<span class="au on">${ic("volume_up")}${mine ? esc(S.audioSrc) : "Audio"}</span>` : `<span class="au">${ic("volume_off")}No audio</span>`;
-    return `<div class="ust"><div class="l1"><span class="txt">${esc(s.label)}</span>${FILL("")}${audio}${popped ? `<button type="button" class="back" data-act="popin:${esc(key)}" title="Bring this stream back to the stage">${ic("open_in_new")}Bring back</button>` : ""}</div>
+    return `<div class="ust"><div class="l1">${s.cam ? ic("videocam") : ""}<span class="txt">${esc(s.label)}</span>${FILL("")}${audio}${popped ? `<button type="button" class="back" data-act="popin:${esc(key)}" title="Bring this stream back to the stage">${ic("open_in_new")}Bring back</button>` : ""}</div>
       <div class="l2 txt">${s.w}×${s.h} · ${s.fps} fps · ${esc(s.codec)} · ${fmtKbps(s.kbps)}</div>
       <div class="l3">${status}${combined ? ` · ${esc(it.r.name)}` : ""} · ${s.viewers} watching</div></div>`;
   }).join("");
@@ -1194,7 +1277,7 @@ function userTip(name) {
 }
 
 /* ---------- arena layout: Split / Crop grid with splitters, Floating windows ---------- */
-const GAP = 8;
+const GAP = 8, PIP_MIN = 72;
 function containRect(x, y, w, h, ar) {
   let cw = w, ch = w / ar;
   if (ch > h) { ch = h; cw = h * ar; }
@@ -1264,6 +1347,8 @@ function layoutArena() {
       t.style.zIndex = "";
     }
     Object.assign(t.style, { left: q.x + "px", top: q.y + "px", width: q.w + "px", height: q.h + "px" });
+    const pip = t.querySelector(":scope > .pip");
+    if (pip) layoutPip(pip, q.w, q.h, V().layout === "crop");
   });
   if (V().layout === "float") return;
   for (const g of guts) {
@@ -1274,6 +1359,22 @@ function layoutArena() {
     d.title = "Drag to resize, double-click to even out";
     ar.appendChild(d);
   }
+}
+/* Places a PIP in its parent tile of tw x th. Its size and position are fractions of the parent's picture (V().pipPos, per
+   webcam, so per person and per view), which is why they survive layout changes. What is shown is clamped to the part of
+   the picture you can see: all of it in Split and Floating, the centre in Crop; the stored value stays, so Split gets the
+   old spot back. Percentages of the tile, so the PIP follows the tile's own size transition. */
+function layoutPip(el, tw, th, crop) {
+  const ar = parseFloat(el.parentElement.style.getPropertyValue("--ar")) || 16 / 9, a = parseFloat(el.dataset.ar);
+  const pw = crop ? Math.max(tw, th * ar) : Math.min(tw, th * ar), ph = pw / ar;
+  const pic = { x: (tw - pw) / 2, y: (th - ph) / 2, w: pw, h: ph };
+  const vis = { x: Math.max(0, pic.x), y: Math.max(0, pic.y), w: Math.min(tw, pw), h: Math.min(th, ph) };
+  const p = V().pipPos[el.dataset.key] ??= { x: .74, y: 1 - .03 - (.24 * ar) / a, w: .24 };
+  const w = Math.min(Math.max(p.w * pw, PIP_MIN), vis.w, vis.h * a), h = w / a;
+  const x = Math.max(vis.x, Math.min(pic.x + p.x * pw, vis.x + vis.w - w)), y = Math.max(vis.y, Math.min(pic.y + p.y * ph, vis.y + vis.h - h));
+  Object.assign(el.style, { left: (x / tw) * 100 + "%", top: (y / th) * 100 + "%", width: (w / tw) * 100 + "%", height: (h / th) * 100 + "%" });
+  if (drag?.kind !== "piprz" || drag.el !== el) el.dataset.c = (x + w / 2 > vis.x + vis.w / 2 ? "l" : "r") + (y + h / 2 > vis.y + vis.h / 2 ? "t" : "b");
+  el.geo = { tw, th, crop, a, pic, vis, x, y, w, h };
 }
 /* Floating starts every window where Split showed it. */
 function captureFloat() {
@@ -1297,7 +1398,7 @@ function streamModal() {
   const staged = S.sharing !== "live";
   const r = roomById(D().meRoom);
   const source = card("Source", null,
-    ctrlRow("Screen", `<span class="txt ro">Screen share · 1920×1080</span>`, staged ? `<button type="button" class="btn btn-secondary wide">Change</button>` : "") +
+    ctrlRow("Screen", `<span class="txt ro">Screen share · 1920×1080</span>`, `<button type="button" class="btn btn-secondary wide" data-act="chsrc">Change</button>`) +
     ctrlRow("Audio", select("audioSrc", AUDIO_SRCS.map((a) => a[0])), `<span class="val center">${meter(0)}</span>`) +
     ctrlRow(null, cbx("muteShared", "Mute shared audio", true)));
   const dest = `<div class="hb g2 destrow cur">${SL(18, ic("radio_button_checked", "ico"))}${FILL(`<span class="txt name">${esc(r.name)}<small>this room</small></span>`)}
@@ -1306,14 +1407,14 @@ function streamModal() {
   const dests = card(staged ? "Goes live in" : "Sending to", "1 room", `<div class="vb g1">${dest}</div>` +
     (staged ? "" : `<div class="hb g2">${FILL(`<button type="button" class="btn btn-secondary wide">${ic("add")}Also send to…</button>`)}${FILL(`<button type="button" class="btn btn-secondary wide">${ic("swap_horiz")}Move to…</button>`)}</div>`));
   const bw = card("Upload bandwidth", "all your streams", ctrlRow("Mode", `<div class="seg"><button type="button" class="${S.bwMode === "per" ? "on" : ""}" data-set="bwMode" data-val="per">Per-stream maximum</button><button type="button" class="${S.bwMode === "abs" ? "on" : ""}" data-set="bwMode" data-val="abs">Absolute maximum</button></div>`));
+  const compression = card("Compression", null,
+    ctrlRow("Codec", seg("codec", CODECS)) +
+    ctrlRow("Bitrate", slider("kbps", 200, 40000, 100, "", "Bitrate"), `<span class="val" id="kbps-val">${S.kbps}</span>`, "kbps for this room. Per-stream mode: this is the stream's maximum."));
   const video = card("Video", null,
-    ctrlRow("Framerate", select("fpsSel", ["15 fps", "30 fps", "60 fps", "90 fps", "120 fps", "144 fps", "165 fps", "240 fps"])) +
-    ctrlRow("Bitrate", slider("kbps", 200, 40000, 100), `<span class="val" id="kbps-val">${S.kbps}</span>`, "kbps for this room. Per-stream mode: this is the stream's maximum.") +
-    ctrlRow("Codec", seg("codec", ["H.264", "AV1", "H.265"])));
-  const enc = card("Encoder", null, ctrlRow("Preset", seg("preset", ["Balanced", "Quality", "Gaming"])) +
-    `<div class="hb collapser" data-toggle="advanced">${ic(S.advanced ? "expand_more" : "chevron_right")}<span>Advanced tuning</span></div>` +
-    (S.advanced ? ctrlRow("Tune", `<span class="txt ro">Low latency</span>`) + ctrlRow("Keyframe interval", `<span class="txt ro">2 s</span>`, undefined, "GOP length. Shorter recovers faster from fast motion, costs more bitrate.") : ""));
-  const body = `<div class="hb g3 st" style="align-items:flex-start"><div class="vb g3 eq">${source}${dests}${bw}</div><div class="vb g3 eq">${video}${enc}</div></div>`;
+    ctrlRow("FPS", fpsSelect()) +
+    ctrlRow("Preset", segAct("preset", Object.keys(ENC_PRESETS), S.preset)) +
+    `<div class="hb g2">${SL(120, "")}${FILL(`<span class="cap" id="preset-cap">${presetCap()}</span>`)}</div>`);
+  const body = `<div class="hb g3 st" style="align-items:flex-start"><div class="vb g3 eq">${source}${dests}${bw}</div><div class="vb g3 eq">${compression}${video}</div></div>`;
   const foot = staged
     ? `<button type="button" class="btn btn-secondary btn-lg" data-act="discard">Discard</button>${FILL("")}<button type="button" class="btn btn-secondary btn-lg" data-act="close">Later</button><button type="button" class="btn btn-primary btn-lg" data-act="golive">${ic("cast")}Go live in ${esc(r.name)}</button>`
     : `<button type="button" class="btn btn-danger btn-lg" data-act="stop">${ic("stop_screen_share")}Stop sharing in ${esc(r.name)}</button>${FILL("")}<span class="hb g1 note">${ic("check_circle")}Saved</span><button type="button" class="btn btn-primary btn-lg" data-act="close">Done</button>`;
@@ -1370,6 +1471,7 @@ function render() {
   frame.querySelectorAll('input[type="range"]').forEach(setPct);
   fit();
   layoutArena();
+  frame.querySelectorAll(".fs .pip").forEach((el) => layoutPip(el, fw, fh, false));
   placeMenu();
   renderNav();
   chromeSync();
@@ -1394,13 +1496,14 @@ function applyPreset(key) {
   if (!p) return;
   const fresh = JSON.parse(PRISTINE);
   DATA.demo = fresh.demo; DATA.rig = fresh.rig;
-  const { layout, float, z, popped, ...o } = p[2];
-  Object.assign(S, STAGE_DEFAULTS(), { modal: null, sharing: "none", sharerSelf: false, view: "room", room: D().meRoom }, o, { preset0: key });
+  const { layout, float, z, popped, pip, alsoWatch, ...o } = p[2];
+  Object.assign(S, STAGE_DEFAULTS(), { modal: null, sharing: "none", sharerSelf: false, view: "room", room: D().meRoom, camRoom: D().meRoom }, o, { preset0: key });
   const r = roomById(D().meRoom), keys = (x) => othersStreams(x).map((s) => skey(x, s));
   S.watchSet = new Set("watching" in o ? (o.watching ? [D().watchKey] : [])
     : o.watchAll ? (D().allWatch || D().rooms.flatMap(keys)) : (D().stageWatch || keys(r)));
+  (alsoWatch || []).forEach((k) => S.watchSet.add(k));
   S.popped = new Set(popped || []);
-  Object.assign(V(), { layout: layout || "split", float: JSON.parse(JSON.stringify(float || {})), z: [...(z || [])] });
+  Object.assign(V(), { pip: !!pip, layout: layout || "split", float: JSON.parse(JSON.stringify(float || {})), z: [...(z || [])] });
   render();
 }
 
@@ -1408,7 +1511,7 @@ function applyPreset(key) {
 const framePt = (cx, cy) => { const fr = frame.getBoundingClientRect(); return { x: (cx - fr.left) / SCALE, y: (cy - fr.top) / SCALE }; };
 const exitFs = () => { S.view = S.fsBack; };
 const enterFs = (key) => { if (S.view !== "fullscreen") S.fsBack = S.view; Object.assign(S, { fsKey: key, view: "fullscreen" }); };
-const STAY = new Set(["fps", "auto", "rename", "cancel", "forgetask", "mute", "level", "stats"]); /* menu actions that keep the menu open */
+const STAY = new Set(["fps", "preset", "pip", "campick", "cammode", "camcodec", "auto", "rename", "cancel", "forgetask", "mute", "level", "stats"]); /* menu actions that keep the menu open */
 document.addEventListener("click", (e) => {
   const pre = e.target.closest("[data-preset]");
   if (pre) return applyPreset(pre.dataset.preset);
@@ -1463,7 +1566,7 @@ document.addEventListener("click", (e) => {
     case "stagefs": S.stageFs = !S.stageFs; break;
     case "invite": render(); return toast("Invite link copied");
     case "leave":
-      if (room) { room.state = "disconnected"; if (D().meRoom === arg) Object.assign(S, { sharing: "none", audioOn: false }); render(); return toast(`You left ${room.name}`, "logout"); }
+      if (room) { room.state = "disconnected"; if (D().meRoom === arg) Object.assign(S, { sharing: "none", audioOn: false }); if (S.camRoom === arg) S.camOn = false; render(); return toast(`You left ${room.name}`, "logout"); }
       break;
     case "connect":
       if (room) { room.state = "joined"; if (!room.members.length) room.members = [me()]; }
@@ -1485,23 +1588,37 @@ document.addEventListener("click", (e) => {
       if (room) {
         D().rooms = D().rooms.filter((x) => x !== room);
         if (D().meRoom === arg) S.sharing = "none";
+        if (S.camRoom === arg) S.camOn = false;
         if (S.room === arg) S.room = D().rooms[0]?.id || null;
         closeMenu(); render(); return toast(`Forgot ${room.name}`, "delete");
       }
       break;
-    case "pop": S.popped.add(arg); if (arg !== myKey()) S.watchSet.add(arg); if (S.view === "fullscreen") exitFs(); break;
+    case "pop": S.popped.add(arg); if (!allItems().find((i) => i.key === arg)?.mine) S.watchSet.add(arg); if (S.view === "fullscreen") exitFs(); break;
     case "popin": S.popped.delete(arg); break;
     case "popinall": viewItems().forEach((i) => { if (i.s.owner === arg) S.popped.delete(i.key); }); break;
     case "fs": enterFs(arg); break;
     case "emoji": S.myEmoji = arg; break;
-    case "fps": S.fps = Number(arg); S.fpsSel = arg + " fps"; break;
+    case "fps": S.fps = Number(arg); break;
+    case "preset": S.preset = arg; S.fps = ENC_PRESETS[arg].fps; break;
+    case "cam": {
+      const id = camTarget(), was = S.camOn && S.camRoom === id;
+      if (S.view === "fullscreen" && S.fsKey === camKey()) exitFs();
+      S.popped.delete(camKey());
+      Object.assign(S, { camRoom: id, camOn: !was });
+      break;
+    }
+    case "campick": S.camName = arg; S.camMode = CAMS.find((c) => c.name === arg).modes[0]; break;
+    case "cammode": S.camMode = arg; break;
+    case "camcodec": S.camCodec = arg; break;
+    case "camset": if (S.view === "fullscreen") exitFs(); S.menu = "cam"; break;
+    case "pip": V().pip = !V().pip; break;
     case "chsrc": render(); return toast("The system's screen and window picker opens here", "swap_horiz");
     case "audio":
       if (S.audioSrc === "No audio") S.menu = "audio"; else S.audioOn = !S.audioOn;
       break;
     case "asrc": S.audioSrc = arg; S.audioOn = arg !== "No audio"; break;
     case "layout": if (arg === "float") captureFloat(); V().layout = arg; break;
-    case "resetlayout": Object.assign(V(), { gridSig: "", float: {}, z: [] }); break;
+    case "resetlayout": Object.assign(V(), { gridSig: "", float: {}, z: [], pipPos: {} }); break;
     case "mute": S.mutes[arg] = !S.mutes[arg]; break;
     case "level": S.levels[arg] = !(S.levels[arg] ?? S.level); break;
     case "stats": S.stats[arg] = !S.stats[arg]; break;
@@ -1510,7 +1627,7 @@ document.addEventListener("click", (e) => {
 });
 document.addEventListener("contextmenu", (e) => {
   if (!frame.contains(e.target)) return;
-  const t = e.target.closest(".st-tile[data-key]"), rr = e.target.closest("[data-roomctx]");
+  const t = e.target.closest(".pip, .st-tile[data-key]"), rr = e.target.closest("[data-roomctx]");
   if (!t && !rr) return;
   e.preventDefault();
   const p = framePt(e.clientX, e.clientY);
@@ -1544,6 +1661,26 @@ document.addEventListener("keydown", (e) => {
 
 /* drag: reorder (Split, Crop), move and resize (Floating), splitters between tiles */
 let drag = null;
+/* Drag or resize a PIP from where it was at pointerdown, inside the visible picture. Resizing keeps the corner opposite the
+   handle fixed and the aspect ratio locked; as in Floating, the handle follows the pointer along the diagonal. */
+function movePip(e) {
+  const { el, g, c } = drag, dx = (e.clientX - drag.sx) / SCALE, dy = (e.clientY - drag.sy) / SCALE;
+  const { pic, vis, a } = g, vr = vis.x + vis.w, vb = vis.y + vis.h, p = V().pipPos[el.dataset.key];
+  let { x, y, w } = g;
+  if (drag.kind === "pipmove") {
+    x = Math.max(vis.x, Math.min(x + dx, vr - w));
+    y = Math.max(vis.y, Math.min(y + dy, vb - g.h));
+  } else {
+    const sx = c[0] === "r" ? 1 : -1, sy = c[1] === "b" ? 1 : -1;
+    const fx = sx > 0 ? x : x + w, fy = sy > 0 ? y : y + g.h; /* the fixed corner */
+    const want = (g.w + sx * dx + (g.h + sy * dy) / a) / (1 + 1 / (a * a));
+    w = Math.max(Math.min(PIP_MIN, vis.w, vis.h * a), Math.min(want, sx > 0 ? vr - fx : fx - vis.x, (sy > 0 ? vb - fy : fy - vis.y) * a));
+    x = sx > 0 ? fx : fx - w;
+    y = sy > 0 ? fy : fy - w / a;
+  }
+  Object.assign(p, { x: (x - pic.x) / pic.w, y: (y - pic.y) / pic.h, w: w / pic.w });
+  layoutPip(el, g.tw, g.th, g.crop);
+}
 frame.addEventListener("pointerdown", (e) => {
   if (e.button !== 0) return;
   const g = e.target.closest(".gut");
@@ -1551,6 +1688,14 @@ frame.addEventListener("pointerdown", (e) => {
     const d = JSON.parse(g.dataset.gut);
     drag = { kind: "gut", d, sx: e.clientX, sy: e.clientY, arr: d.t === "v" ? [...V().colFr[d.i]] : [...V().rowFr] };
     document.getElementById("arena").classList.add("nofx");
+    e.preventDefault();
+    return;
+  }
+  const pe = e.target.closest(".pip");
+  if (pe) {
+    const parent = pe.parentElement.dataset.key;
+    if (V().layout === "float" && pe.closest(".arena")) { V().z = V().z.filter((k) => k !== parent).concat(parent); layoutArena(); }
+    drag = { kind: e.target.closest(".prz") ? "piprz" : "pipmove", el: pe, sx: e.clientX, sy: e.clientY, g: pe.geo, c: pe.dataset.c };
     e.preventDefault();
     return;
   }
@@ -1563,6 +1708,7 @@ frame.addEventListener("pointerdown", (e) => {
 });
 window.addEventListener("pointermove", (e) => {
   if (!drag) return;
+  if (drag.kind === "pipmove" || drag.kind === "piprz") return movePip(e);
   const ar = document.getElementById("arena");
   if (!ar) { drag = null; return; }
   const dx = (e.clientX - drag.sx) / SCALE, dy = (e.clientY - drag.sy) / SCALE, W = ar.clientWidth, H = ar.clientHeight;
@@ -1603,6 +1749,7 @@ window.addEventListener("pointerup", () => {
   if (!drag) return;
   const d = drag, ar = document.getElementById("arena");
   drag = null;
+  if (d.kind === "pipmove" || d.kind === "piprz") return layoutPip(d.el, d.g.tw, d.g.th, d.g.crop); /* the handle goes back to the inner corner */
   if (!ar) return;
   if (d.kind === "gut" || V().layout === "float") { ar.classList.remove("nofx"); return; }
   if (!d.moved) return;
@@ -1694,7 +1841,7 @@ document.addEventListener("input", (e) => {
     return;
   }
   S[k] = v;
-  const out = { vol: ["vol-pct", v + "%"], kbps: ["kbps-val", v], jitter: ["jitter-val", (v / 1000).toFixed(1) + " s"], catchup: ["catchup-val", v + "%"], boost: ["boost-val", v + "%"] }[k];
+  const out = { vol: ["vol-pct", v + "%"], kbps: ["kbps-val", v], camKbps: ["camkbps-val", v], jitter: ["jitter-val", (v / 1000).toFixed(1) + " s"], catchup: ["catchup-val", v + "%"], boost: ["boost-val", v + "%"] }[k];
   if (out) { const n = document.getElementById(out[0]); if (n) n.textContent = out[1]; }
 });
 document.addEventListener("change", (e) => {
@@ -1705,17 +1852,16 @@ document.addEventListener("change", (e) => {
   if (t.id === "nav-spin") { S.spin = t.checked; return render(); }
   if (t.dataset?.sel) {
     S[t.dataset.sel] = t.value;
-    if (t.dataset.sel === "fpsSel") S.fps = parseInt(t.value, 10);
+    if (t.dataset.sel === "fps") S.fps = Number(t.value);
     if (t.dataset.sel === "audioSrc") S.audioOn = t.value !== "No audio";
     render();
   }
 });
 
 /* Initial state; `#rig` in the address loads the rig data, `#<preset>` (e.g. #settings, #stage-float) a view. */
-S.fpsSel = "60 fps";
 (function boot() {
   const h = location.hash.slice(1).split("-rig");
-  if (location.hash.includes("rig")) { S.data = "rig"; document.getElementById("nav-data").value = "rig"; S.fps = 30; S.fpsSel = "30 fps"; S.pin = !location.hash.includes("nopin"); }
+  if (location.hash.includes("rig")) { S.data = "rig"; document.getElementById("nav-data").value = "rig"; S.fps = 30; S.pin = !location.hash.includes("nopin"); }
   document.getElementById("nav-ovl").checked = S.pin;
   applyPreset(STAGE.concat(PRESETS, MODALS).some((p) => p[0] === h[0]) ? h[0] : "stage");
 })();
