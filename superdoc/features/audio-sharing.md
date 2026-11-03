@@ -5,6 +5,54 @@ Audio capture/encode/playback is described where it grew up: `features/stream-co
 video") and the module docs of `client/src/audio.rs` and `client/src/decode.rs`. This page covers
 **keeping the audio aligned with the picture** (task #91, 2026-11-01), the **shared audio is a name** (#105), the viewer volume (#96) and the **sender-side boost** (#114).
 
+## 2026-11-03: audio broken after the source's stream disappears and comes back (task #117)
+
+User report: sharing Floorp (YouTube) audio, muting the tab for a moment and unmuting (also: closing and
+reopening the browser; sometimes the first selection) gives *"really broken audio"* until the source is selected
+again. Firefox destroys its PipeWire stream node when nothing plays and creates a new one (new id, same name) on
+resume, so mute/unmute is the #105 node-replacement path.
+
+**What was ruled out (read-only `pw-dump`, `pw-link -l`, `pw-top` on the user's live share, plus the user's own
+`pw-link -l` while broken):** the links are correct (one Floorp node, FL->FL and FR->FR into
+`input.ssshare-loopback-*`, the loopback output 1:1 into the `-cap` stream, no stale or duplicate link). So it is
+not the link diff, not channel mapping and not a stale `linked` id.
+
+**Cause: not proven.** What differs between the broken state and the working one (a manual re-select) is only that
+the long-running loopback and `pipewiresrc` stream sat through a stretch with *no input* and then got a new stream
+linked into the already-running graph; a re-select spawns a fresh loopback, links the source *before* the capture
+stream connects, and starts a fresh pipeline. Graph facts that make the gap suspect: the loopback nodes are
+`dsp`/`F32P` streams with no rate and `resample.disable=true`, with no `node.latency` of their own; with nothing
+linked upstream the loopback output + `-cap` group has no real driver (it falls to `Dummy-Driver`) and only rejoins
+the sink's driver (`alsa_output...`, via `easyeffects_sink`) when the new Floorp node is linked. A driver, clock or
+quantum change under a pipeline that was started against the old one is the likely mechanism; it could not be
+measured (no audio tests). Loopback settings (`node.always-process`, `node.passive`, a fixed `node.latency`) were
+not tried: they cannot be validated without creating an audio stream.
+
+**Fix (`audio.rs`): do automatically what the re-select does.** `link_poll_loop` tracks a sticky `gap`
+(`gap_decision`): set when nothing is linked into the loopback (also at start with the app absent). The next time a
+stream with the name has ports and is ready to be linked, `rebuild_chain` spawns a fresh `pw-loopback`, links the
+streams into it, sets the pipeline to Null, retargets `pipewiresrc name=src` (`target-object`, `client-name`),
+starts it again, re-anchors the wire PTS offset (running time restarts at 0; the offset is now an
+`Arc<AtomicU64>` shared with `pump_loop`), proves the capture link (`wait_for_capture_link`, so the microphone
+trap cannot come back) and only then kills the old loopback (`AudioCaptureHandle::loopback_child` is an
+`Arc<Mutex<Child>>`; a `ChildGuard` kills a half-built one if `stop()` aborts the task). Encoder, appsink, pump and
+the relay announcement are untouched: viewers see a short silence, not a new stream. A failed rebuild keeps the gap
+flag and retries every second. One of several streams closing does *not* rebuild (the loopback never went empty).
+*Why not just tune the loopback:* the symptom is a property of a graph state we cannot observe without creating
+audio streams, and the rebuild reproduces exactly the sequence the user showed to work. Cost: the first ~0.5 s of
+the resumed sound can be lost while the chain rebuilds.
+
+**Tests (no audio):** `a_stream_reappearing_after_a_gap_rebuilds_the_loopback_once` (mute/unmute, two-tab churn,
+start with the app absent), `the_pipeline_delivers_again_after_a_null_playing_restart` (the appsink delivers after
+Null -> Playing with a changed source property; running time restarts). **Not verified:** the rebuild against a
+real PipeWire and whether it cures the broken sound. If it still happens: with the share broken, send
+`pw-top -b -n 2`, `pw-dump` filtered to the `ssshare`/Floorp nodes (state, `node.driver-id`) and the client log
+(`audio share ... rebuilt the loopback`).
+**First selection sometimes not taking:** not explained by this; the start path links the source before the
+pipeline connects. Candidates left: the picked name had no stream with ports at that instant (now covered, the poll
+rebuilds when it shows up) and a half-linked node (FL linked, FR `pw-link` failed, retried forever on the duplicate
+FL; still open, see #105 "Not covered").
+
 ## 2026-11-03: sender-side audio boost and calibration (task #114)
 
 User request: *"Also on the like client settings like the general settings there should be something like

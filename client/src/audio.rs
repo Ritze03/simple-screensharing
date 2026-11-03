@@ -68,8 +68,8 @@
 //! `superdoc/features/stream-control.md`).
 
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -513,34 +513,108 @@ fn sync_links(objects: &[PwObject], name: &str, loopback_input_node_id: u32, lin
     }
 }
 
+/// Whether the poll must rebuild the loopback + capture pipeline before linking a stream (task
+/// #117). `gap` is sticky: it is set when nothing is linked into the loopback any more (the app
+/// closed, or muted and Firefox destroyed its stream) and is only cleared by a rebuild. Returns
+/// `(gap, rebuild)`: rebuild when there was a gap and a stream is ready to be linked again.
+///
+/// `Why:` a loopback that has been through a stretch with no input and then gets a new stream
+/// linked in sounded "really broken" until the user re-selected the source (which spawns a fresh
+/// loopback and pipeline with the stream already linked). The poll now does that same reset itself.
+fn gap_decision(gap: bool, nothing_linked: bool, linkable_new: bool) -> (bool, bool) {
+    let gap = gap || nothing_linked;
+    (gap, gap && linkable_new)
+}
+
+/// Kills its child on drop, so a rebuild cancelled by `abort()` (stop) cannot leak a `pw-loopback`.
+struct ChildGuard(Option<Child>);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(c) = self.0.as_mut() {
+            kill_and_wait(c);
+        }
+    }
+}
+
+/// What [`link_poll_loop`] needs to replace the loopback + pipeline source of a running share.
+struct Chain {
+    stream_id: u8,
+    pipeline: gst::Pipeline,
+    loopback_child: Arc<Mutex<Child>>,
+    pts_offset_us: Arc<AtomicU64>,
+}
+
+/// Replaces the loopback with a fresh one, links the streams named `name` into it and restarts the
+/// capture pipeline on it, exactly the order of [`start_audio_sharing`] (what a manual re-select
+/// does). Returns the new loopback input node id and the linked set. On error the old loopback
+/// process is still held by the handle; the poll retries next tick.
+async fn rebuild_chain(chain: &Chain, name: &str) -> Result<(u32, std::collections::HashSet<u32>)> {
+    let loopback_name = format!("{LOOPBACK_NAME_PREFIX}{}-{}", chain.stream_id, uuid::Uuid::new_v4().simple());
+    let mut new_child = ChildGuard(Some(spawn_loopback(&loopback_name)?));
+    let (objects, lb) = wait_for_loopback_ready(&loopback_name, Duration::from_secs(5)).await?;
+    let mut linked = std::collections::HashSet::new();
+    sync_links(&objects, name, lb.input_node_id, &mut linked);
+
+    let capture_node_name = format!("{loopback_name}-cap");
+    let src = chain.pipeline.by_name("src").ok_or_else(|| anyhow!("pipeline has no element named 'src'"))?;
+    chain.pipeline.set_state(gst::State::Null).context("failed to stop the audio pipeline for a rebuild")?;
+    src.set_property("target-object", lb.output_node_serial.to_string());
+    src.set_property("client-name", capture_node_name.as_str());
+    chain.pipeline.set_state(gst::State::Playing).context("failed to restart the audio pipeline")?;
+    let (state, _, _) = chain.pipeline.state(gst::ClockTime::from_seconds(5));
+    state.map_err(|e| anyhow!("audio pipeline failed to reach PLAYING after a rebuild: {e:?}"))?;
+    // Running time restarted at 0 with the pipeline: re-anchor the wire PTS (same as at start).
+    chain.pts_offset_us.store(
+        sender_clock_offset_us(chain.pipeline.current_running_time().map(|t| t.useconds()).unwrap_or(0), Instant::now()),
+        Ordering::Relaxed,
+    );
+    wait_for_capture_link(&capture_node_name, lb.output_node_id, Duration::from_secs(5)).await?;
+
+    let mut old = std::mem::replace(&mut *chain.loopback_child.lock().unwrap_or_else(|p| p.into_inner()), new_child.0.take().expect("set above"));
+    kill_and_wait(&mut old);
+    tracing::info!("audio share '{name}': rebuilt the loopback ({loopback_name}) after the source reappeared");
+    Ok((lb.input_node_id, linked))
+}
+
 /// Once a second, re-lists the graph and links streams that now carry the
-/// shared name (new browser tab, restarted app). Runs without touching the
-/// pipeline or encoder.
-async fn link_poll_loop(name: String, loopback_input_node_id: u32, mut linked: std::collections::HashSet<u32>) {
+/// shared name (new browser tab, restarted app). A stream that reappears after
+/// a stretch with none is linked into a rebuilt loopback ([`gap_decision`]).
+async fn link_poll_loop(name: String, mut loopback_input_node_id: u32, mut linked: std::collections::HashSet<u32>, chain: Chain) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tick.tick().await; // the first tick is immediate; start_audio_sharing just synced
+    // Started with the app absent: the loopback has never had input, same situation as a gap.
+    let mut gap = linked.is_empty();
     loop {
         tick.tick().await;
-        let n = name.clone();
-        let res = tokio::task::spawn_blocking(move || {
-            let r = run_pw_dump().map(|objects| {
-                // Only link while our loopback input is still in the graph.
-                if !node_port_ids(&objects, loopback_input_node_id as u64, "input").is_empty() {
-                    sync_links(&objects, &n, loopback_input_node_id, &mut linked);
-                }
-            });
-            (linked, r)
-        })
-        .await;
-        match res {
-            Ok((l, r)) => {
-                linked = l;
-                if let Err(e) = r {
-                    tracing::debug!("audio link poll: {e:#}");
-                }
+        let objects = match tokio::task::spawn_blocking(run_pw_dump).await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                tracing::debug!("audio link poll: {e:#}");
+                continue;
             }
             Err(_) => return,
+        };
+        // Only link while our loopback input is still in the graph.
+        if node_port_ids(&objects, loopback_input_node_id as u64, "input").is_empty() {
+            continue;
+        }
+        let (to_add, kept) = link_diff(&node_ids_named(&objects, &name), &linked);
+        let linkable = to_add.iter().any(|&id| !node_port_ids(&objects, id as u64, "output").is_empty());
+        let (g, rebuild) = gap_decision(gap, kept.is_empty(), linkable);
+        gap = g;
+        if rebuild {
+            match rebuild_chain(&chain, &name).await {
+                Ok((input, l)) => {
+                    loopback_input_node_id = input;
+                    linked = l;
+                    gap = false;
+                }
+                Err(e) => tracing::warn!("audio share '{name}': rebuilding the loopback failed, will retry: {e:#}"),
+            }
+        } else {
+            sync_links(&objects, &name, loopback_input_node_id, &mut linked);
         }
     }
 }
@@ -692,7 +766,7 @@ fn feed_loudness(msg: &gst::Message, loudness: &SharedLoudness) {
 /// sender-side boost of Settings (task #114, `audio_gain.rs`), so the meter shows what is sent.
 fn build_pipeline(loopback_output_node_serial: u64, capture_node_name: &str, gain: f64) -> Result<BuiltPipeline> {
     build_pipeline_from_source(
-        &format!("pipewiresrc target-object={loopback_output_node_serial} client-name={capture_node_name} do-timestamp=true"),
+        &format!("pipewiresrc name=src target-object={loopback_output_node_serial} client-name={capture_node_name} do-timestamp=true"),
         gain,
     )
 }
@@ -884,7 +958,7 @@ pub struct AudioCaptureHandle {
     stream_id: u8,
     client: ScreenshareClient,
     pipeline: gst::Pipeline,
-    loopback_child: Child,
+    loopback_child: Arc<Mutex<Child>>,
     pump_task: tokio::task::JoinHandle<()>,
     /// The 1 s poll that links streams of the chosen name as they appear
     /// ([`link_poll_loop`]); aborted on stop/drop.
@@ -987,12 +1061,14 @@ pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, sour
     let pump_client = client.clone();
     // Anchor this pipeline's running time onto the process-wide sender clock that video's wire PTS
     // also uses, so a viewer can line audio up with the picture (`decode/avsync.rs`).
-    let pts_offset_us = sender_clock_offset_us(
+    let pts_offset_us = Arc::new(AtomicU64::new(sender_clock_offset_us(
         pipeline.current_running_time().map(|t| t.useconds()).unwrap_or(0),
         Instant::now(),
-    );
-    let pump_task = tokio::spawn(pump_loop(pump_client, stream_id, stream, bus_stream, level.clone(), pts_offset_us));
-    let link_task = tokio::spawn(link_poll_loop(source.name.clone(), loopback.input_node_id, linked));
+    )));
+    let pump_task = tokio::spawn(pump_loop(pump_client, stream_id, stream, bus_stream, level.clone(), pts_offset_us.clone()));
+    let loopback_child = Arc::new(Mutex::new(loopback_child));
+    let chain = Chain { stream_id, pipeline: pipeline.clone(), loopback_child: loopback_child.clone(), pts_offset_us };
+    let link_task = tokio::spawn(link_poll_loop(source.name.clone(), loopback.input_node_id, linked, chain));
 
     // No width/height for audio (spec's AnnounceStream fields exist for
     // video streams' benefit); 0x0 signals "not applicable".
@@ -1004,7 +1080,7 @@ pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, sour
         let _ = pipeline.set_state(gst::State::Null);
         pump_task.abort();
         link_task.abort();
-        kill_and_wait(&mut loopback_child);
+        kill_and_wait(&mut loopback_child.lock().unwrap_or_else(|p| p.into_inner()));
         return Err(e);
     }
 
@@ -1039,8 +1115,9 @@ impl Drop for AudioCaptureHandle {
     fn drop(&mut self) {
         self.link_task.abort();
         let _ = self.pipeline.set_state(gst::State::Null);
-        let _ = self.loopback_child.kill();
-        let _ = self.loopback_child.wait(); // reap, avoid a zombie
+        let mut child = self.loopback_child.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = child.kill();
+        let _ = child.wait(); // reap, avoid a zombie
     }
 }
 
@@ -1135,7 +1212,7 @@ impl AudioCaptureHandle {
         // Unconditional regardless of whether EOS was observed cleanly or
         // the timeout fallback fired above — "Stop Sharing Audio" must
         // never leave `pw-loopback` orphaned.
-        kill_and_wait(&mut self.loopback_child);
+        kill_and_wait(&mut self.loopback_child.lock().unwrap_or_else(|p| p.into_inner()));
 
         if let Err(e) = self.client.stop_stream(self.stream_id).await {
             tracing::warn!("error notifying relay that audio stream {} stopped: {e:#}", self.stream_id);
@@ -1336,7 +1413,7 @@ async fn pump_loop(
     mut appsink_stream: gst_app::app_sink::AppSinkStream,
     mut bus_stream: gst::bus::BusStream,
     level: AudioLevel,
-    pts_offset_us: u64,
+    pts_offset_us: Arc<AtomicU64>,
 ) {
     let mut appsink_done = false;
     let mut bus_done = false;
@@ -1349,7 +1426,7 @@ async fn pump_loop(
             sample = appsink_stream.next(), if !appsink_done => {
                 match sample {
                     Some(sample) => {
-                        if let Err(e) = send_encoded_sample(&client, stream_id, &sample, pts_offset_us) {
+                        if let Err(e) = send_encoded_sample(&client, stream_id, &sample, pts_offset_us.load(Ordering::Relaxed)) {
                             tracing::warn!("dropping encoded audio packet for stream {stream_id}: {e:#}");
                         }
                     }
@@ -1626,7 +1703,7 @@ mod tests {
     #[test]
     fn the_sender_pipeline_boosts_then_limits_before_mute_meter_and_encoder() {
         ensure_gstreamer_initialized().unwrap();
-        let d = pipeline_description("pipewiresrc target-object=42 client-name=cap do-timestamp=true");
+        let d = pipeline_description("pipewiresrc name=src target-object=42 client-name=cap do-timestamp=true");
         let at = |needle: &str| d.find(needle).unwrap_or_else(|| panic!("{needle:?} missing from {d}"));
         assert!(at("format=F32LE") < at("volume name=gain"), "{d}");
         assert!(at("volume name=gain") < at("rglimiter name=limiter"), "{d}");
@@ -1651,6 +1728,58 @@ mod tests {
         let caps = sample.caps().unwrap().to_string();
         let _ = pipeline.set_state(gst::State::Null);
         assert!(caps.starts_with("audio/x-opus"), "{caps}");
+    }
+
+    /// Task #117: a stream that comes back after a gap is linked into a rebuilt loopback, once; a
+    /// stream that merely replaces another one (another stays linked) and a failed link do not
+    /// rebuild. Driven with the same `link_diff` the poll uses.
+    #[test]
+    fn a_stream_reappearing_after_a_gap_rebuilds_the_loopback_once() {
+        use std::collections::HashSet;
+        let set = |v: &[u32]| v.iter().copied().collect::<HashSet<u32>>();
+        // One poll tick: (gap, linked) in, (gap, rebuild) out, `ports` = nodes whose ports exist.
+        let tick = |gap: bool, matching: &[u32], linked: &HashSet<u32>, ports: &[u32]| {
+            let (to_add, kept) = link_diff(matching, linked);
+            let linkable = to_add.iter().any(|id| ports.contains(id));
+            gap_decision(gap, kept.is_empty(), linkable)
+        };
+        // Floorp playing and linked: nothing to do.
+        assert_eq!(tick(false, &[82], &set(&[82]), &[82]), (false, false));
+        // Muted: the node is gone, nothing linked. Gap noted, no node to link yet.
+        assert_eq!(tick(false, &[], &set(&[82]), &[]), (true, false));
+        assert_eq!(tick(true, &[], &set(&[]), &[]), (true, false));
+        // Unmuted: a new node, not linkable until it has ports...
+        assert_eq!(tick(true, &[90], &set(&[]), &[]), (true, false));
+        // ...then rebuild (the caller clears the gap and starts from the rebuilt linked set).
+        assert_eq!(tick(true, &[90], &set(&[]), &[90]), (true, true));
+        assert_eq!(tick(false, &[90], &set(&[90]), &[90]), (false, false));
+        // One of two tabs closes and a third opens: the loopback never went empty, no rebuild.
+        assert_eq!(tick(false, &[11, 12], &set(&[10, 11]), &[11, 12]), (false, false));
+        // Started with the app absent (gap from the start): rebuild when it shows up.
+        assert_eq!(tick(true, &[5], &set(&[]), &[5]), (true, true));
+    }
+
+    /// The rebuild stops the capture pipeline, changes the source's properties and starts it again
+    /// (task #117). The appsink must keep delivering and the running time restarts at 0, which is
+    /// why `rebuild_chain` re-anchors the wire PTS offset. `audiotestsrc` stands in for
+    /// `pipewiresrc`, which `pipeline_description` callers also name `src`.
+    #[test]
+    fn the_pipeline_delivers_again_after_a_null_playing_restart() {
+        ensure_gstreamer_initialized().unwrap();
+        let BuiltPipeline { pipeline, sink, .. } =
+            build_pipeline_from_source("audiotestsrc name=src is-live=true samplesperbuffer=960", 1.0).expect("chain builds");
+        let pull = || sink.try_pull_sample(gst::ClockTime::from_seconds(5)).expect("no Opus packet");
+        pipeline.set_state(gst::State::Playing).unwrap();
+        for _ in 0..30 {
+            pull();
+        }
+        let late_pts = pull().buffer().unwrap().pts().unwrap();
+        pipeline.set_state(gst::State::Null).unwrap();
+        pipeline.by_name("src").unwrap().set_property("freq", 880.0f64);
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let first = pull().buffer().unwrap().pts().unwrap();
+        let _ = pipeline.set_state(gst::State::Null);
+        assert!(first < late_pts, "running time restarts at 0 after Null: {first} vs {late_pts}");
     }
 
     /// The calibration tap's loudness path, with the real `level` element's real messages (read off
@@ -2313,7 +2442,7 @@ mod tests {
         // like a real share would.
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        let loopback_pid = handle.loopback_child.id();
+        let loopback_pid = handle.loopback_child.lock().unwrap().id();
         eprintln!("[audio-stop-test] pw-loopback pid={loopback_pid}; calling stop()");
 
         let stop_started = Instant::now();
