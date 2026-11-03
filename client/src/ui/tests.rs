@@ -786,6 +786,21 @@ mod audio_boost {
         assert_eq!(again.audio_gain, 1.8);
     }
 
+    /// #135: a drag previews the boost (state only, nothing written), the release persists it.
+    #[tokio::test]
+    async fn previewing_the_boost_applies_it_without_saving_until_set() {
+        let _home = isolated_home();
+        let mut app = app_with_rooms(&[]);
+        let ctx = ctx();
+        app.apply(&ctx, UiAction::PreviewAudioGain(1.7));
+        assert_eq!(app.state.audio_gain, 1.7, "applied at once");
+        assert_eq!(AppSettings::load().audio_gain(), 1.0, "not written mid-drag");
+        app.apply(&ctx, UiAction::PreviewAudioGain(100.0));
+        assert_eq!(app.state.audio_gain, audio_gain::MAX_GAIN, "clamped like the saved one");
+        app.apply(&ctx, UiAction::SetAudioGain(1.7));
+        assert_eq!(AppSettings::load().audio_gain(), 1.7, "saved on release");
+    }
+
     /// Levelling is on by default, the switch is persisted and drives the process-wide flag
     /// every audio pipeline reads, and Settings draws with it on and off.
     #[tokio::test]
@@ -893,6 +908,60 @@ fn wheel_over_the_volume_slider_steps_it_and_does_not_scroll_the_panel() {
     }
     assert_eq!(percent, 195);
     assert!(offset > 0.0, "the panel scrolls when the pointer is not on the slider");
+}
+
+/// #135, user: "make sure that when the volume slider is moved it instantly sets the volume even
+/// while moving and not only when the user actually lifts his mouse button". Real egui events: press
+/// on the tile's volume slider and drag, never release; every moved frame must already push a
+/// `SetVolume` (which is what reaches the decoder's `volume` element).
+#[test]
+fn the_tile_volume_slider_pushes_set_volume_while_the_button_is_still_down() {
+    let ctx = ctx();
+    let size = egui::vec2(300.0, 100.0);
+    let key: StreamKey = (RoomHandle(1), 7, 2);
+    let mut st = room::RoomState::default();
+    let mut applied = 100u32;
+    let mut slider = Rect::NOTHING;
+    let run = |events: Vec<egui::Event>, st: &mut room::RoomState, applied: u32, slider: &mut Rect| -> Vec<UiAction> {
+        let mut acts = Vec::new();
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)), events, ..Default::default() };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.set_width(200.0);
+                *slider = room::tile_volume_slider(ui, st, key, applied, applied, &mut acts).rect;
+            });
+        });
+        acts
+    };
+    run(vec![], &mut st, applied, &mut slider);
+    let rect = slider;
+    let at = |t: f32| egui::pos2(rect.left() + 7.0 + (rect.width() - 14.0) * t, rect.center().y);
+    let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+    run(vec![egui::Event::PointerMoved(at(0.2))], &mut st, applied, &mut slider);
+    run(vec![button(at(0.2), true)], &mut st, applied, &mut slider);
+    let mut pushed = Vec::new();
+    for t in [0.3, 0.4, 0.5, 0.6] {
+        for a in run(vec![egui::Event::PointerMoved(at(t))], &mut st, applied, &mut slider) {
+            if let UiAction::SetVolume { stream, volume_percent, muted } = a {
+                assert_eq!(stream, key);
+                assert!(!muted);
+                pushed.push(volume_percent);
+                applied = volume_percent; // the session applied it
+            }
+        }
+    }
+    assert!(ctx.input(|i| i.pointer.any_down()), "the button was never released");
+    assert!(pushed.len() >= 3, "a SetVolume per moved frame while dragging, got {pushed:?}");
+    assert!(pushed.windows(2).all(|w| w[0] < w[1]), "following the pointer to the right: {pushed:?}");
+}
+
+/// #135: the Boost slider's mid-drag action is live and unsaved, the release saves.
+#[test]
+fn the_boost_slider_previews_while_the_pointer_is_down_and_saves_on_release() {
+    use super::modals::boost_action;
+    assert!(boost_action(1.5, 1.0, false).is_some_and(|a| matches!(a, UiAction::PreviewAudioGain(g) if g == 1.5)));
+    assert!(boost_action(1.5, 1.5, false).is_none(), "nothing new to apply");
+    assert!(boost_action(1.5, 1.5, true).is_some_and(|a| matches!(a, UiAction::SetAudioGain(g) if g == 1.5)), "saved even though already applied");
 }
 
 /// #126: the loudness-levelling button next to the volume slider reports a click (the

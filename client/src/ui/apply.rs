@@ -371,6 +371,9 @@ impl App {
             UiAction::SetAudioGain(g) => {
                 self.state.set_audio_gain(g);
             }
+            UiAction::PreviewAudioGain(g) => {
+                self.state.apply_audio_gain(g);
+            }
             UiAction::SetLevelLoudness(on) => self.state.set_level_loudness(on),
             UiAction::CopyLogs => {
                 ctx.copy_text(simple_screensharing_client::logbuf::dump());

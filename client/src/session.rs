@@ -5144,6 +5144,16 @@ impl AppState {
     /// every audio share that is running right now, live and without a restart. Returns the
     /// value stored (clamped).
     pub fn set_audio_gain(&mut self, gain: f64) -> f64 {
+        let gain = self.apply_audio_gain(gain);
+        save_audio_gain(gain);
+        gain
+    }
+
+    /// The live half of [`Self::set_audio_gain`]: the value reaches every running audio share
+    /// (and the next share's start) but is **not** written to settings.toml. The Boost slider
+    /// calls it on every changed frame of a drag so the level is audible while it is chosen
+    /// (#135); the release then calls `set_audio_gain` once to persist. Returns the clamped value.
+    pub fn apply_audio_gain(&mut self, gain: f64) -> f64 {
         let gain = crate::audio_gain::clamp_gain(gain);
         self.audio_gain = gain;
         for capture in self.captures.values() {
@@ -5151,7 +5161,6 @@ impl AppState {
                 handle.set_gain(gain);
             }
         }
-        save_audio_gain(gain);
         gain
     }
 

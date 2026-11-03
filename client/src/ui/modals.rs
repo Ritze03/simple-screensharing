@@ -710,17 +710,33 @@ fn settings(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
     if settled && st.catch_up != cx.state.catch_up_speed_percent {
         cx.act(UiAction::SetCatchUpSpeed(st.catch_up));
     }
-    // The boost slider: like the other sliders, pushed once the pointer is released.
-    if st.gain_dirty && settled {
-        st.gain_dirty = false;
+    // The boost slider (#135): applied to the running shares on every changed frame of the drag
+    // (the user wants to hear the level while choosing it), saved once the pointer is released.
+    if st.gain_dirty {
         let gain = audio_gain::clamp_gain(audio_gain::db_to_gain(st.gain_db as f64));
-        st.gain_seen = gain;
-        if (gain - cx.state.audio_gain).abs() > 1e-9 {
-            cx.act(UiAction::SetAudioGain(gain));
+        if let Some(a) = boost_action(gain, cx.state.audio_gain, settled) {
+            cx.act(a);
+        }
+        if settled {
+            st.gain_dirty = false;
+            st.gain_seen = gain;
         }
     }
     if closing {
         cx.act(UiAction::CloseModal);
+    }
+}
+
+/// What the Boost slider pushes this frame (#135): while the pointer is down a live, unsaved
+/// [`UiAction::PreviewAudioGain`] whenever the value moved; once settled one [`UiAction::SetAudioGain`]
+/// that saves it (always, because the previews already made `applied` equal to `gain`).
+pub(super) fn boost_action(gain: f64, applied: f64, settled: bool) -> Option<UiAction> {
+    if settled {
+        Some(UiAction::SetAudioGain(gain))
+    } else if (gain - applied).abs() > 1e-9 {
+        Some(UiAction::PreviewAudioGain(gain))
+    } else {
+        None
     }
 }
 

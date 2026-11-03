@@ -191,8 +191,8 @@ sway seat has a keyboard (hold one open with `wtype -P Shift_L -s 30000 -p Shift
 
 **Settings > Shared audio: Boost slider** (2026-11-03, task #114; since #119 without the Calibrate row and capped at
 200 %). A card between Playback and Diagnostics (`modals.rs` `audio_card`): a `ctrl_row_value` (Boost: `widgets::slider`
-in dB, 50-200 %, 100 % mid-track, 0.5 dB knob steps, a `value_box` reading `150%`; pushed on pointer release as
-`UiAction::SetAudioGain`). The calibration (a nested `HBox [FILL, 104]` row with an app picker, a 10 s listen and a
+in dB, 50-200 %, 100 % mid-track, 0.5 dB knob steps, a `value_box` reading `150%`; applied live on every changed frame of a drag as
+`UiAction::PreviewAudioGain`, saved on pointer release as `UiAction::SetAudioGain`, #135). The calibration (a nested `HBox [FILL, 104]` row with an app picker, a 10 s listen and a
 banner) was removed in #119 together with `UiAction::CalibrateAudio` / `CancelAudioCalibration`.
 How it works, and why: `features/audio-sharing.md` "sender-side audio boost" and the #119 block. Tests: `ui::tests::audio_boost::*`.
 
