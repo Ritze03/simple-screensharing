@@ -21,6 +21,7 @@ volume               # volume
 opus                 # opusenc, opusdec
 debug                # capssetter
 level                # level (capture level meter)
+replaygain           # rglimiter (limiter after the sender-side audio boost, #114; optional: the share runs without it)
 jpeg                 # jpegdec
 videoparsersbad      # h264parse, h265parse, av1parse
 typefindfunctions    # caps detection for the parsers

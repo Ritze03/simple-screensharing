@@ -433,6 +433,12 @@ pub struct AppSettings {
     /// (`diag_upload.rs`). Opt-in: off unless the user ticks it.
     #[serde(default)]
     pub send_diagnostics: bool,
+    /// Settings > Audio boost (task #114): the multiplier applied to the audio this client
+    /// *shares*, before it is encoded (`audio::build_pipeline`'s `volume` + limiter). 1.0 = no
+    /// change; range `audio_gain::MIN_GAIN..=MAX_GAIN`; the calibration writes it too. A float so
+    /// the file reads `audio_gain = 3.2`; `AppSettings::audio_gain()` clamps whatever is on disk.
+    #[serde(default = "AppSettings::default_audio_gain")]
+    pub audio_gain: f64,
 }
 
 /// See [`AppSettings::start_stream_defaults`].
@@ -489,11 +495,21 @@ impl Default for AppSettings {
             start_stream_defaults: StartStreamDefaults::default(),
             display_name: String::new(),
             send_diagnostics: false,
+            audio_gain: Self::default_audio_gain(),
         }
     }
 }
 
 impl AppSettings {
+    fn default_audio_gain() -> f64 {
+        crate::audio_gain::DEFAULT_GAIN
+    }
+
+    /// The stored boost, clamped (a hand-edited file may hold anything, `NaN` included).
+    pub fn audio_gain(&self) -> f64 {
+        crate::audio_gain::clamp_gain(self.audio_gain)
+    }
+
     fn default_language() -> String {
         "en".to_string()
     }
@@ -851,6 +867,7 @@ mod tests {
             start_stream_defaults: StartStreamDefaults::default(),
             display_name: "mo".to_string(),
             send_diagnostics: true,
+            audio_gain: 3.2,
         };
         let toml_str = toml::to_string_pretty(&settings).unwrap();
         let parsed: AppSettings = toml::from_str(&toml_str).unwrap();
@@ -863,6 +880,22 @@ mod tests {
         assert_eq!(parsed.catch_up_speed_percent, 8);
         assert_eq!(parsed.display_name, "mo");
         assert!(parsed.send_diagnostics);
+        assert_eq!(parsed.audio_gain, 3.2);
+        assert!(toml_str.contains("audio_gain = 3.2\n"), "stored readably: {toml_str}");
+    }
+
+    /// Task #114: no boost unless set; a file from before the setting, or a corrupt value, is safe.
+    #[test]
+    fn audio_gain_defaults_to_no_boost_and_is_clamped_on_load() {
+        assert_eq!(AppSettings::default().audio_gain(), 1.0);
+        let old: AppSettings = toml::from_str("language = \"de\"\n").unwrap();
+        assert_eq!(old.audio_gain(), 1.0);
+        let wild: AppSettings = toml::from_str("audio_gain = 99.0\n").unwrap();
+        assert_eq!(wild.audio_gain(), crate::audio_gain::MAX_GAIN);
+        let neg: AppSettings = toml::from_str("audio_gain = -2.0\n").unwrap();
+        assert_eq!(neg.audio_gain(), crate::audio_gain::MIN_GAIN);
+        let nan: AppSettings = toml::from_str("audio_gain = nan\n").unwrap();
+        assert_eq!(nan.audio_gain(), 1.0);
     }
 
     /// Opt-in (#110): a settings file without the key, and the default, mean "do not upload".

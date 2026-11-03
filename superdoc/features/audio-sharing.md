@@ -3,7 +3,111 @@
 Audio capture/encode/playback is described where it grew up: `features/stream-control.md`
 ("Sharing audio ...", "The 2026-07-28 audio bugs"), `features/video-pipeline.md` ("Audio follows
 video") and the module docs of `client/src/audio.rs` and `client/src/decode.rs`. This page covers
-**keeping the audio aligned with the picture** (task #91, 2026-11-01).
+**keeping the audio aligned with the picture** (task #91, 2026-11-01), the **shared audio is a name** (#105), the viewer volume (#96) and the **sender-side boost** (#114).
+
+## 2026-11-03: sender-side audio boost and calibration (task #114)
+
+User request: *"Also on the like client settings like the general settings there should be something like
+a volume boost because for example on my system it's really quiet for some reason so others barely hear
+what I'm streaming and there I should be able to yeah just set a volume multiplier and you could even
+include something like a calibration for it so the user can play something on the desktop it then you hit
+like calibrate and it just listens to it for 10 seconds and according to that it adjusts the multiplier so
+it's on a proper volume that would be really nice"*
+
+**What it is.** Settings > **Shared audio** (a card between Playback and Diagnostics): a **Boost** slider
+(50 % to 800 %, default 100 %, persisted as `AppSettings::audio_gain`, a float multiplier, e.g. `audio_gain = 3.2`)
+and a **Calibrate** row (an app picker plus a button). The boost is applied to the audio this client *shares*,
+before it is encoded; it changes the picture of the sound every viewer gets, not what any one viewer's slider
+does.
+
+**Why sender-side, with a limiter (and not more viewer boost).** A viewer can already boost a sharer to 500 %
+(#96, below), but that gain runs on the viewer's decoded 16-bit samples, so a source that is quiet *because of
+its level at the sharer* ends up hitting full scale on its peaks long before it sounds loud: above about 300 %
+it only clips. Every viewer would also have to find and set it per stream. Fixing the level at the source,
+before Opus, fixes it once for everyone, and the boost can be done in float where nothing clips until the
+limiter says so. A boost without a limiter would just move the clipping to the sender.
+
+**Pipeline** (`audio::build_pipeline`, `audio::GAIN_STAGE`):
+
+```
+pipewiresrc ! audio/x-raw,channels=2 ! audioconvert ! audioresample
+  ! audio/x-raw,format=F32LE ! volume name=gain ! rglimiter name=limiter
+  ! volume name=mute ! level ! audioconvert ! opusenc ! appsink
+```
+
+- **F32LE** because `rglimiter` only takes 32-bit float and a boost on 16-bit samples would clip before the
+  limiter could see it. `opusenc` (1.28 here) only takes **S16LE**, hence the `audioconvert` after the meter
+  (found when the first test pipeline failed to link: `could not link level to opusenc0`).
+- **`rglimiter`** (gst-plugins-good, plugin `replaygain`) is a zero-latency waveshaper: soft knee from -6 dBFS,
+  output never above full scale. `audiodynamic` was the alternative (also gst-plugins-good, F32 ok); not used:
+  it is a per-sample compressor whose ratio-0 setting is a hard clip and whose soft knee only softens the
+  ratio, not the ceiling. A real look-ahead limiter would need a plugin the project does not ship; for peaks
+  that the calibration keeps within +3 dB of full scale a waveshaper is enough.
+- **The limiter is bypassed at 100 % or below** (`rglimiter enabled=false`, `audio_gain::limiter_needed`): it
+  would otherwise colour even an unboosted loud signal from -6 dBFS up, and the default must stay exactly what
+  sharing audio was before this setting. Boost at or below 1x cannot exceed full scale, so nothing is lost.
+- **Live change:** `AudioCaptureHandle::set_gain` sets `volume`'s property and the limiter's `enabled`, no
+  restart; `AppState::set_audio_gain` pushes it to every running audio share, saves it, and the next share
+  (also a reconnect-restored one) starts with it. The mute `volume` sits after the gain, so mute still wins.
+  The VU meter sits after the gain too: it shows what is sent.
+- **No `rglimiter` on the system** (the `replaygain` plugin is a separate file): `gain_stage_description`
+  leaves the limiter out and logs a warning, so the share still works, just without clip protection. The
+  AppImage bundle lists the plugin (`client/packaging/gst-plugins.txt`), `check-deps.sh` warns.
+
+**The slider is in dB, shown as a percent.** The range is 4 octaves; on a linear percent track 100 % would be
+7 % from the left end and everything useful (100-300 %) a handful of pixels. In dB each doubling is the same
+distance (`audio_gain::gain_db_range`, knob steps of 0.5 dB, the box reads e.g. `223%`). The value is pushed
+when the pointer is released, like the other sliders (each setter writes `settings.toml`).
+
+**Calibration** (`audio_gain.rs` pure logic; `session::AppState::start_audio_calibration`, `poll_audio_calibration`):
+
+1. The user plays something, opens Settings, picks the app in the **Calibrate** row (the list is the #105
+   deduplicated-by-name source list, re-listed every 2 s while Settings is open; default = the app being shared
+   right now, else the first one) and presses Calibrate.
+2. `session::build_calibration_tap` re-lists the sources, takes the one with that name and calls
+   `audio::start_calibration_tap`: the existing private **level tap** (`pipewiresrc target-object=<serial> !
+   audioconvert ! level ! fakesink`, never anything that leaves the process) with a unique `client-name`, then
+   `wait_for_capture_link` proves the PipeWire graph really links that node to the tap. *Why the extra proof:* a
+   mistargeted meter is a wrong bar, a mistargeted calibration writes a wrong setting (and `pipewiresrc` falls
+   back to the microphone when its target misses, `build_pipeline`'s doc). If it never links, the row says
+   "Couldn't listen to ...".
+3. For **10 s** the tap's bus pump feeds every 100 ms `level` message (loudest channel's RMS and peak, dBFS)
+   into a `LoudnessMeter`: a sum of audible windows' power, the peak and counters (O(1) state). The row shows
+   "Listening to Spotify... 7 s" and a Cancel button; closing Settings cancels too.
+4. **Result:** windows below -60 dBFS are *silence and ignored* (not averaged in), loud windows count by power;
+   fewer than 10 audible windows (1 s) is "nothing audible": the row says so and **the boost is left alone**.
+   Otherwise `gain_for`: the boost that puts the RMS at **-18 dBFS**, limited so the **peaks stay under +3 dBFS**
+   after the boost (`min` of the two in dB), clamped to 50-800 %. It is absolute, not relative to the current
+   setting, because the tap measures the source before the gain. It writes the slider (and the file) and the
+   row says "Boost set to 398 %. The sound was at -30 dBFS."; if the clamp hit the maximum, or the source was
+   already louder than the target and went down to the minimum, it says so.
+   *Why -18 / +3:* -18 dBFS RMS is the usual "loud enough with headroom" level; music peaks 10-14 dB above its
+   RMS so they land around -4..-8 dBFS where the limiter only rounds them. The peak guard stops a very peaky
+   source (speech with the odd loud pop, -35 dBFS RMS with peaks at -10) from being driven by its quiet RMS into a
+   wall of limiting: it gets +13 dB (peaks at +3) rather than +17 dB.
+5. Mixed shares (one name, several streams, #105): the tap measures the representative node only, like the
+   source meter, so the number is that stream's loudness.
+
+**Browser sharer: out of scope.** The browser client shares tab/screen audio through `getDisplayMedia`, which has
+no such setting; a boost there would be a separate task (`GainNode` + `DynamicsCompressorNode` in
+`docs/js/core/capture.js`).
+
+**Tests** (unit only, the no-audio rule; nothing creates a PipeWire stream):
+`audio_gain::tests::*` (clamp/dB/range, silence and blip handling, silent stretches ignored, power vs dB
+averaging, gain for quiet / peaky / very quiet / loud sources and the limit flags, the whole calibration flow
+with synthetic levels and a fake clock incl. "heard nothing" and "tap failed"), `audio::tests::the_limiter_keeps_a_boosted_full_scale_sine_under_full_scale`
+(an `audiotestsrc` full-scale sine at +18 dB peaks at exactly 1.0 through the real gain stage into an
+`appsink`; `without_the_limiter_...` is the control, peak 7.9), `no_boost_in_the_range_clips_past_full_scale`,
+`a_boost_below_the_knee_is_a_plain_multiplication`, `the_default_gain_leaves_a_full_scale_signal_untouched`,
+`the_gain_changes_live_without_restarting_the_pipeline`, `the_sender_pipeline_boosts_then_limits_before_mute_meter_and_encoder`
+(element order in the real description), `the_sender_chain_negotiates_and_encodes_opus` (the whole sender chain
+with `audiotestsrc` for `pipewiresrc`), `level_messages_feed_the_loudness_meter` (real `level` messages from an
+`audiotestsrc ! level` bus), `rooms::tests::audio_gain_defaults_to_no_boost_and_is_clamped_on_load`,
+`ui::tests::audio_boost::*` (persistence, calibration via `Calibration::listening` with a synthetic meter, cancel,
+the modal drawing every state). Seen in the headless rig: the Settings card in English and German (fits), a click on
+the slider writes `audio_gain = 2.23` to `settings.toml` and the box reads `223%`.
+**Not verified:** a real calibration against a real playing app, the live gain change on a real share, and how it
+sounds; those need the user's PipeWire (steps in the task report).
 
 ## 2026-11-03: the viewer volume slider scrolls with the mouse wheel (task #113)
 
@@ -128,6 +232,7 @@ still 100 %.
   limiter adds a stage, latency and a threshold to tune for a level the viewer picked on purpose.
   If clipped loud sources become a complaint, the place for a limiter is a `GainNode` ->
   `DynamicsCompressorNode` (browser) / `audiodynamic` or `rglimiter` after `volume` (native).
+  (A quiet *sharer* is fixed at the source instead, by the sender-side boost with a limiter, #114, above.)
 - **Slider: 100 % detent.** The 110 px pill slider covers 500 % in about 96 px of travel (~5 %/px),
   so hitting 100 % exactly would need pixel precision. The slider draws a 1.5 px tick at 100 % and
   snaps anything within +-10 % onto it while dragging or clicking (native

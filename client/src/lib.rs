@@ -23,6 +23,7 @@ extern crate rust_i18n;
 i18n!("locales", fallback = "en");
 
 pub mod audio;
+pub mod audio_gain;
 pub mod bandwidth;
 pub mod capture;
 pub mod decode;

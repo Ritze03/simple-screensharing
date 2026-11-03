@@ -80,6 +80,7 @@ use gstreamer_app as gst_app;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
+use crate::audio_gain::SharedLoudness;
 use crate::decode::sender_clock_us;
 use crate::fragment::fragment_frame;
 use crate::net::{encrypt_frame, ScreenshareClient};
@@ -603,11 +604,30 @@ fn level_fraction_from_rms_db(rms_db: impl IntoIterator<Item = f64>) -> Option<f
 
 /// Reads the per-channel RMS values out of a `level` element message.
 fn rms_db_from_level_message(structure: &gst::StructureRef) -> Option<Vec<f64>> {
+    level_db_array(structure, "rms")
+}
+
+/// Reads one per-channel dB array (`rms`, `peak`, `decay`) out of a `level` element message.
+fn level_db_array(structure: &gst::StructureRef, field: &str) -> Option<Vec<f64>> {
     // `glib` is not a direct dependency of this crate; `gstreamer` re-exports
     // the exact version it was built against, which is the one that matters
     // for a `GValue` handed over by a GStreamer element.
-    let rms = structure.get::<gst::glib::ValueArray>("rms").ok()?;
-    Some(rms.iter().filter_map(|v| v.get::<f64>().ok()).collect())
+    let values = structure.get::<gst::glib::ValueArray>(field).ok()?;
+    Some(values.iter().filter_map(|v| v.get::<f64>().ok()).collect())
+}
+
+/// Feeds one `level` message into a calibration meter: the loudest channel's RMS and peak
+/// (the same "loudest channel" rule as the meters, [`level_fraction_from_rms_db`]).
+fn feed_loudness(msg: &gst::Message, loudness: &SharedLoudness) {
+    let gst::MessageView::Element(element) = msg.view() else { return };
+    let Some(s) = element.structure() else { return };
+    if s.name() != "level" {
+        return;
+    }
+    let loudest = |field: &str| level_db_array(s, field).map(|v| v.into_iter().fold(f64::NEG_INFINITY, f64::max));
+    if let (Some(rms), Some(peak)) = (loudest("rms"), loudest("peak")) {
+        loudness.lock().unwrap_or_else(|p| p.into_inner()).push(rms, peak);
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -667,26 +687,21 @@ fn rms_db_from_level_message(structure: &gst::StructureRef) -> Option<Vec<f64>> 
 /// pausing the send keeps a continuous Opus stream flowing, so the viewer's
 /// jitter buffer and packet-loss concealment never see a mute as a
 /// multi-second dropout to conceal.
-fn build_pipeline(loopback_output_node_serial: u64, capture_node_name: &str) -> Result<(gst::Pipeline, gst_app::AppSink, gst::Element)> {
-    build_pipeline_from_source(&format!(
-        "pipewiresrc target-object={loopback_output_node_serial} client-name={capture_node_name} do-timestamp=true"
-    ))
+///
+/// `volume name=gain` + `rglimiter` ([`GAIN_STAGE`]) sit before the mute and the meter: the
+/// sender-side boost of Settings (task #114, `audio_gain.rs`), so the meter shows what is sent.
+fn build_pipeline(loopback_output_node_serial: u64, capture_node_name: &str, gain: f64) -> Result<BuiltPipeline> {
+    build_pipeline_from_source(
+        &format!("pipewiresrc target-object={loopback_output_node_serial} client-name={capture_node_name} do-timestamp=true"),
+        gain,
+    )
 }
 
 /// [`build_pipeline`] with the source element(s) given as a description
 /// fragment, so a test can put `audiotestsrc` in front of the *real* chain
 /// (no PipeWire involved).
-fn build_pipeline_from_source(source: &str) -> Result<(gst::Pipeline, gst_app::AppSink, gst::Element)> {
-    let description = format!(
-        "{source} \
-         ! audio/x-raw,channels=2 \
-         ! audioconvert \
-         ! audioresample \
-         ! volume name=mute \
-         ! level name=level post-messages=true interval={LEVEL_INTERVAL_NS} \
-         ! opusenc \
-         ! appsink name=sink emit-signals=false sync=false max-buffers=32 drop=true"
-    );
+fn build_pipeline_from_source(source: &str, gain: f64) -> Result<BuiltPipeline> {
+    let description = pipeline_description(source);
 
     let element = gst::parse::launch(&description)
         .with_context(|| format!("failed to construct audio capture pipeline: {description}"))?;
@@ -704,7 +719,97 @@ fn build_pipeline_from_source(source: &str) -> Result<(gst::Pipeline, gst_app::A
         .by_name("mute")
         .ok_or_else(|| anyhow!("pipeline has no element named 'mute'"))?;
 
-    Ok((pipeline, sink, mute))
+    let gain_stage = GainStage::from_pipeline(&pipeline)?;
+    gain_stage.set(gain);
+
+    Ok(BuiltPipeline { pipeline, sink, mute, gain_stage })
+}
+
+/// What [`build_pipeline`] hands back.
+struct BuiltPipeline {
+    pipeline: gst::Pipeline,
+    sink: gst_app::AppSink,
+    mute: gst::Element,
+    gain_stage: GainStage,
+}
+
+/// The gain stage of the sender pipeline: F32 samples, a `volume` for the boost and an
+/// `rglimiter` after it (task #114). See [`GainStage`].
+///
+/// `Why F32LE:` `rglimiter` only takes 32-bit float, and a boost above 1 on 16-bit samples
+/// would clip before the limiter could see it; float carries the overshoot to the limiter.
+/// `opusenc` (1.28) only takes S16LE, so an `audioconvert` after the meter ([`pipeline_description`])
+/// converts back; the float stage is what lets the limiter, not a 16-bit wrap or clip, see the
+/// overshoot. `Why rglimiter and not audiodynamic:` it is a zero-latency waveshaper (soft knee
+/// from -6 dBFS up, output never above full scale), which is what "catch the peaks the boost
+/// made" needs; `audiodynamic` is a per-sample compressor whose ratio-0 setting is a hard clip
+/// and whose soft knee only softens the ratio, not the ceiling. Checked in
+/// `audio::tests::the_limiter_keeps_a_boosted_full_scale_sine_under_full_scale`.
+///
+/// `rglimiter` lives in gst-plugins-good's `replaygain` plugin, a plugin file of its own. A system
+/// without it still shares audio: [`gain_stage_description`] leaves the limiter out (a boost
+/// above 1x can then clip, a logged warning says so) instead of failing the whole share.
+const GAIN_STAGE: &str = "audio/x-raw,format=F32LE ! volume name=gain ! rglimiter name=limiter";
+const GAIN_STAGE_NO_LIMITER: &str = "audio/x-raw,format=F32LE ! volume name=gain";
+
+/// [`GAIN_STAGE`], or [`GAIN_STAGE_NO_LIMITER`] when this GStreamer has no `rglimiter`.
+fn gain_stage_description() -> &'static str {
+    if gst::ElementFactory::find("rglimiter").is_some() {
+        GAIN_STAGE
+    } else {
+        tracing::warn!("GStreamer element rglimiter (gst-plugins-good, replaygain) is missing: a boosted audio share can clip");
+        GAIN_STAGE_NO_LIMITER
+    }
+}
+
+/// The sender pipeline's description (everything of [`build_pipeline`] but the element lookups),
+/// split out so a test can check the order of the elements.
+fn pipeline_description(source: &str) -> String {
+    let gain_stage = gain_stage_description();
+    format!(
+        "{source} \
+         ! audio/x-raw,channels=2 \
+         ! audioconvert \
+         ! audioresample \
+         ! {gain_stage} \
+         ! volume name=mute \
+         ! level name=level post-messages=true interval={LEVEL_INTERVAL_NS} \
+         ! audioconvert \
+         ! opusenc \
+         ! appsink name=sink emit-signals=false sync=false max-buffers=32 drop=true"
+    )
+}
+
+/// The two live elements of the boost: `volume name=gain` and `rglimiter name=limiter`.
+///
+/// [`GainStage::set`] changes both at once and is what a Settings change during a live share
+/// calls (no pipeline restart: both are plain element properties). The limiter is only enabled
+/// above 1x ([`crate::audio_gain::limiter_needed`]); disabled, `rglimiter` is a pass-through,
+/// so at the default 100 % the audio is exactly what it was before the setting existed.
+#[derive(Clone)]
+struct GainStage {
+    volume: gst::Element,
+    /// `None` on a system without `rglimiter` ([`gain_stage_description`]).
+    limiter: Option<gst::Element>,
+}
+
+impl GainStage {
+    fn from_pipeline(pipeline: &gst::Pipeline) -> Result<Self> {
+        let volume = pipeline.by_name("gain").ok_or_else(|| anyhow!("pipeline has no element named 'gain'"))?;
+        Ok(Self { volume, limiter: pipeline.by_name("limiter") })
+    }
+
+    fn set(&self, gain: f64) {
+        let gain = crate::audio_gain::clamp_gain(gain);
+        self.volume.set_property("volume", gain);
+        if let Some(limiter) = &self.limiter {
+            limiter.set_property("enabled", crate::audio_gain::limiter_needed(gain));
+        }
+    }
+
+    fn gain(&self) -> f64 {
+        self.volume.property::<f64>("volume")
+    }
 }
 
 /// Polls `pw-dump` until the `pipewiresrc` stream node called
@@ -788,6 +893,8 @@ pub struct AudioCaptureHandle {
     /// The pipeline's `volume name=mute` element — see
     /// [`AudioCaptureHandle::set_muted`].
     mute_element: gst::Element,
+    /// The sender-side boost ([`AudioCaptureHandle::set_gain`]).
+    gain_stage: GainStage,
     /// The application whose audio this share is capturing — the name the
     /// user picked in the source list. Surfaced next to the share's level
     /// meter in Stream Control, so the row can say *what* is being shared
@@ -807,7 +914,7 @@ pub struct AudioCaptureHandle {
 /// unavailable or fail, the source's ports have disappeared, or the
 /// GStreamer pipeline fails to construct/start. Any partially-created
 /// loopback process is cleaned up before returning an error.
-pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, source: &AudioSource) -> Result<AudioCaptureHandle> {
+pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, source: &AudioSource, gain: f64) -> Result<AudioCaptureHandle> {
     ensure_gstreamer_initialized()?;
 
     // stream_id + a random suffix: unique even if two audio shares started
@@ -832,7 +939,8 @@ pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, sour
     sync_links(&objects, &source.name, loopback.input_node_id, &mut linked);
 
     let capture_node_name = format!("{loopback_name}-cap");
-    let (pipeline, appsink, mute_element) = match build_pipeline(loopback.output_node_serial, &capture_node_name) {
+    let BuiltPipeline { pipeline, sink: appsink, mute: mute_element, gain_stage } =
+        match build_pipeline(loopback.output_node_serial, &capture_node_name, gain) {
         Ok(v) => v,
         Err(e) => {
             kill_and_wait(&mut loopback_child);
@@ -909,6 +1017,7 @@ pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, sour
         link_task,
         level,
         mute_element,
+        gain_stage,
         source_name: source.name.clone(),
     })
 }
@@ -960,6 +1069,17 @@ impl AudioCaptureHandle {
     /// Whether this share is currently muted.
     pub fn is_muted(&self) -> bool {
         self.mute_element.property::<bool>("mute")
+    }
+
+    /// Set the sender-side boost of this running share (Settings > Audio boost, task #114):
+    /// takes effect on the next buffer, no restart. Clamped to the setting's range.
+    pub fn set_gain(&self, gain: f64) {
+        self.gain_stage.set(gain);
+    }
+
+    /// The boost this share is applying now.
+    pub fn gain(&self) -> f64 {
+        self.gain_stage.gain()
     }
 
     /// Tears the audio share down cleanly: stops the GStreamer pipeline,
@@ -1073,6 +1193,8 @@ impl AudioCaptureHandle {
 pub struct AudioLevelTapHandle {
     pipeline: gst::Pipeline,
     level: AudioLevel,
+    /// RMS/peak statistics of everything this tap heard (the calibration reads it, task #114).
+    loudness: SharedLoudness,
     pump_task: tokio::task::JoinHandle<()>,
 }
 
@@ -1085,10 +1207,17 @@ pub struct AudioLevelTapHandle {
 /// producing `level` messages, which is a fine "not making sound yet"
 /// starting state for a UI meter to show.
 pub fn start_level_tap(node_serial: u64) -> Result<AudioLevelTapHandle> {
+    start_level_tap_named(node_serial, None)
+}
+
+/// [`start_level_tap`] with an optional `client-name`, which makes the tap's own stream node
+/// findable in `pw-dump` (what [`start_calibration_tap`] checks the link with).
+fn start_level_tap_named(node_serial: u64, client_name: Option<&str>) -> Result<AudioLevelTapHandle> {
     ensure_gstreamer_initialized()?;
 
+    let client_name = client_name.map(|n| format!("client-name={n} ")).unwrap_or_default();
     let description = format!(
-        "pipewiresrc target-object={node_serial} do-timestamp=true \
+        "pipewiresrc target-object={node_serial} {client_name}do-timestamp=true \
          ! audio/x-raw \
          ! audioconvert \
          ! level name=level post-messages=true interval={LEVEL_INTERVAL_NS} \
@@ -1114,9 +1243,33 @@ pub fn start_level_tap(node_serial: u64) -> Result<AudioLevelTapHandle> {
     };
 
     let level = AudioLevel::default();
-    let pump_task = tokio::spawn(level_tap_pump_loop(bus.stream(), level.clone()));
+    let loudness = SharedLoudness::default();
+    let pump_task = tokio::spawn(level_tap_pump_loop(bus.stream(), level.clone(), loudness.clone()));
 
-    Ok(AudioLevelTapHandle { pipeline, level, pump_task })
+    Ok(AudioLevelTapHandle { pipeline, level, loudness, pump_task })
+}
+
+/// A level tap for the Settings calibration (task #114): [`start_level_tap`] on `source`'s
+/// representative node, **plus a proof that it is tapping that node**.
+///
+/// `Why the proof:` a meter that is mistargeted is a wrong-looking bar (see
+/// [`AudioLevelTapHandle`]); a calibration that measures the wrong thing writes a wrong setting.
+/// `pipewiresrc` whose `target-object` misses falls back to the default source (the microphone),
+/// so the tap gets a unique `client-name` and [`wait_for_capture_link`] confirms the PipeWire
+/// graph really links the source node to it, exactly as the real share does for its loopback.
+/// The tap is torn down if it never links (the source went away between listing and now).
+pub async fn start_calibration_tap(source: &AudioSource) -> Result<AudioLevelTapHandle> {
+    let serial = source.serial.ok_or_else(|| anyhow!("'{}' has no PipeWire object.serial to tap yet", source.name))?;
+    let client_name = format!("{LOOPBACK_NAME_PREFIX}cal-{}", uuid::Uuid::new_v4().simple());
+    let name = client_name.clone();
+    let tap = tokio::task::spawn_blocking(move || start_level_tap_named(serial, Some(&name)))
+        .await
+        .map_err(|e| anyhow!("audio calibration tap task panicked: {e}"))??;
+    if let Err(e) = wait_for_capture_link(&client_name, source.id, Duration::from_secs(5)).await {
+        tap.stop().await;
+        return Err(e.context(format!("could not listen to '{}'", source.name)));
+    }
+    Ok(tap)
 }
 
 impl AudioLevelTapHandle {
@@ -1126,6 +1279,11 @@ impl AudioLevelTapHandle {
     /// always-visible share meter read consistently.
     pub fn level(&self) -> f32 {
         self.level.get()
+    }
+
+    /// The loudness statistics of everything this tap heard ([`LoudnessMeter`]).
+    pub fn loudness(&self) -> SharedLoudness {
+        self.loudness.clone()
     }
 
     /// Tears the tap down: stops the pipeline and aborts the bus-pump task.
@@ -1146,15 +1304,17 @@ impl Drop for AudioLevelTapHandle {
     /// left running.
     fn drop(&mut self) {
         let _ = self.pipeline.set_state(gst::State::Null);
+        self.pump_task.abort();
     }
 }
 
 /// Bus-only pump for a level tap: no appsink/encode/send side at all, just
 /// folding `level` element messages into `level` (mirrors [`pump_loop`]'s
 /// bus half, minus the `appsink_stream` side pump_loop also has to drive).
-async fn level_tap_pump_loop(mut bus_stream: gst::bus::BusStream, level: AudioLevel) {
+async fn level_tap_pump_loop(mut bus_stream: gst::bus::BusStream, level: AudioLevel, loudness: SharedLoudness) {
     let mut bus_done = false;
     while let Some(msg) = bus_stream.next().await {
+        feed_loudness(&msg, &loudness);
         handle_bus_message(&msg, &mut bus_done, &level);
         if bus_done {
             return;
@@ -1303,6 +1463,235 @@ fn send_encoded_sample(client: &ScreenshareClient, stream_id: u8, sample: &gst::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- the sender-side boost (task #114) --------------------------------------------------
+    // No test here touches PipeWire (hard rule: no audio tests): the chain is built around
+    // `audiotestsrc` and read out of an `appsink`, which is plain memory.
+
+    /// `audiotestsrc` (a full-scale sine unless `amplitude` says otherwise) through the real gain
+    /// stage into an appsink that keeps the newest two buffers.
+    fn gain_test_pipeline(amplitude: f64, is_live: bool) -> (gst::Pipeline, gst_app::AppSink, GainStage) {
+        ensure_gstreamer_initialized().unwrap();
+        let description = format!(
+            "audiotestsrc is-live={is_live} wave=sine freq=440 volume={amplitude} samplesperbuffer=480 \
+             ! audio/x-raw,rate=48000,channels=2 ! audioconvert ! audioresample ! {} \
+             ! appsink name=sink sync=false max-buffers=2 drop=true",
+            gain_stage_description()
+        );
+        let pipeline = gst::parse::launch(&description).unwrap().downcast::<gst::Pipeline>().unwrap();
+        let sink = pipeline.by_name("sink").unwrap().downcast::<gst_app::AppSink>().unwrap();
+        let stage = GainStage::from_pipeline(&pipeline).unwrap();
+        (pipeline, sink, stage)
+    }
+
+    /// The largest absolute sample of a buffer of interleaved F32LE samples.
+    fn peak_of(sample: &gst::Sample) -> f32 {
+        let buffer = sample.buffer().unwrap();
+        let map = buffer.map_readable().unwrap();
+        map.as_slice().chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]).abs()).fold(0.0, f32::max)
+    }
+
+    /// Peak over the first `n` buffers `sink` yields.
+    fn peak_of_first(sink: &gst_app::AppSink, n: usize) -> f32 {
+        (0..n)
+            .map(|_| peak_of(&sink.try_pull_sample(gst::ClockTime::from_seconds(5)).expect("no sample from the test pipeline")))
+            .fold(0.0, f32::max)
+    }
+
+    fn db(x: f32) -> f64 {
+        20.0 * (x as f64).log10()
+    }
+
+    /// The point of the limiter: +18 dB (8x) on a full-scale sine would be a peak of 8.0; the
+    /// output must stay under full scale, and still be loud (not a muted or collapsed signal).
+    #[test]
+    fn the_limiter_keeps_a_boosted_full_scale_sine_under_full_scale() {
+        let (pipeline, sink, stage) = gain_test_pipeline(1.0, false);
+        stage.set(crate::audio_gain::MAX_GAIN);
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let peak = peak_of_first(&sink, 2);
+        let _ = pipeline.set_state(gst::State::Null);
+        // The limiter's ceiling is full scale itself: a float 1.0 is exactly 0 dBFS (and 32767 in
+        // 16 bit), never above it. Without the limiter this peak would be 7.9 (+18 dBFS).
+        assert!(peak <= 1.0, "boosted sine peaked at {} ({:.1} dBFS), the limiter let it past full scale", peak, db(peak));
+        assert!(peak > 0.9, "the limiter flattened the signal: peak {peak}");
+    }
+
+    /// The control for the test above: the same chain without the limiter does go far past full
+    /// scale, so the limiter is what holds the peak (and the fallback without `rglimiter` is
+    /// really the unprotected one).
+    #[test]
+    fn without_the_limiter_the_same_boost_peaks_far_past_full_scale() {
+        ensure_gstreamer_initialized().unwrap();
+        let description = format!(
+            "audiotestsrc wave=sine freq=440 volume=1.0 samplesperbuffer=480 \
+             ! audio/x-raw,rate=48000,channels=2 ! audioconvert ! {GAIN_STAGE_NO_LIMITER} \
+             ! appsink name=sink sync=false max-buffers=2 drop=true"
+        );
+        let pipeline = gst::parse::launch(&description).unwrap().downcast::<gst::Pipeline>().unwrap();
+        let sink = pipeline.by_name("sink").unwrap().downcast::<gst_app::AppSink>().unwrap();
+        let stage = GainStage::from_pipeline(&pipeline).unwrap();
+        assert!(stage.limiter.is_none());
+        stage.set(crate::audio_gain::MAX_GAIN);
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let peak = peak_of_first(&sink, 2);
+        let _ = pipeline.set_state(gst::State::Null);
+        assert!(peak > 7.0, "peak {peak}");
+    }
+
+    /// Everything from 1.0x to 8.0x, a loud (-1 dBFS) and a quiet (-20 dBFS) source: never past full scale.
+    #[test]
+    fn no_boost_in_the_range_clips_past_full_scale() {
+        for amplitude in [0.9, 0.1] {
+            for gain in [1.01, 1.5, 2.0, 4.0, 8.0] {
+                let (pipeline, sink, stage) = gain_test_pipeline(amplitude, false);
+                stage.set(gain);
+                pipeline.set_state(gst::State::Playing).unwrap();
+                let peak = peak_of_first(&sink, 2);
+                let _ = pipeline.set_state(gst::State::Null);
+                assert!(peak <= 1.0, "amplitude {amplitude} x{gain}: peak {peak}");
+            }
+        }
+    }
+
+    /// A quiet source boosted so its peak stays below the limiter's knee is only multiplied:
+    /// +12 dB on -20 dBFS is -8 dBFS (the soft knee starts at -6).
+    #[test]
+    fn a_boost_below_the_knee_is_a_plain_multiplication() {
+        let (pipeline, sink, stage) = gain_test_pipeline(0.1, false);
+        let plain = {
+            pipeline.set_state(gst::State::Playing).unwrap();
+            let p = peak_of_first(&sink, 2);
+            let _ = pipeline.set_state(gst::State::Null);
+            p
+        };
+        let (pipeline, sink, _stage) = gain_test_pipeline(0.1, false);
+        _stage.set(3.98);
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let boosted = peak_of_first(&sink, 2);
+        let _ = pipeline.set_state(gst::State::Null);
+        drop(stage);
+        assert!((db(boosted) - db(plain) - 12.0).abs() < 0.2, "{} dB -> {} dB", db(plain), db(boosted));
+    }
+
+    /// The default (1.0x) must leave the audio exactly alone, even a full-scale signal: the limiter
+    /// is bypassed (it is a waveshaper from -6 dBFS up and would otherwise colour loud audio).
+    #[test]
+    fn the_default_gain_leaves_a_full_scale_signal_untouched() {
+        let (pipeline, sink, stage) = gain_test_pipeline(1.0, false);
+        stage.set(1.0);
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let peak = peak_of_first(&sink, 2);
+        let _ = pipeline.set_state(gst::State::Null);
+        assert!(peak > 0.999, "default gain changed a full-scale sine: peak {peak}");
+        // And below 1x it is a plain attenuation.
+        let (pipeline, sink, stage) = gain_test_pipeline(1.0, false);
+        stage.set(0.5);
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let peak = peak_of_first(&sink, 2);
+        let _ = pipeline.set_state(gst::State::Null);
+        assert!((peak - 0.5).abs() < 0.01, "peak {peak}");
+    }
+
+    /// A change while the pipeline runs takes effect without a restart.
+    #[test]
+    fn the_gain_changes_live_without_restarting_the_pipeline() {
+        let (pipeline, sink, stage) = gain_test_pipeline(0.1, true);
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let before = peak_of_first(&sink, 2);
+        stage.set(2.0);
+        assert_eq!(stage.gain(), 2.0);
+        // The appsink holds at most two buffers (10 ms each): after 200 ms they are post-change.
+        std::thread::sleep(Duration::from_millis(200));
+        let after = peak_of_first(&sink, 2);
+        let state = pipeline.state(gst::ClockTime::ZERO).1;
+        let _ = pipeline.set_state(gst::State::Null);
+        assert_eq!(state, gst::State::Playing, "the pipeline kept running");
+        assert!((db(after) - db(before) - 6.02).abs() < 0.3, "{} dB -> {} dB", db(before), db(after));
+    }
+
+    /// The setter clamps (a bad caller cannot push 100x into the encoder).
+    #[test]
+    fn the_stage_clamps_what_it_is_given() {
+        let (_pipeline, _sink, stage) = gain_test_pipeline(1.0, false);
+        stage.set(100.0);
+        assert_eq!(stage.gain(), crate::audio_gain::MAX_GAIN);
+        stage.set(0.0);
+        assert_eq!(stage.gain(), crate::audio_gain::MIN_GAIN);
+        stage.set(f64::NAN);
+        assert_eq!(stage.gain(), 1.0);
+    }
+
+    /// The real sender description: gain, then limiter, then mute, then meter, then the encoder.
+    #[test]
+    fn the_sender_pipeline_boosts_then_limits_before_mute_meter_and_encoder() {
+        ensure_gstreamer_initialized().unwrap();
+        let d = pipeline_description("pipewiresrc target-object=42 client-name=cap do-timestamp=true");
+        let at = |needle: &str| d.find(needle).unwrap_or_else(|| panic!("{needle:?} missing from {d}"));
+        assert!(at("format=F32LE") < at("volume name=gain"), "{d}");
+        assert!(at("volume name=gain") < at("rglimiter name=limiter"), "{d}");
+        assert!(at("rglimiter name=limiter") < at("volume name=mute"), "{d}");
+        assert!(at("volume name=mute") < at("level name=level"), "{d}");
+        assert!(at("level name=level") < at("opusenc"), "{d}");
+        assert!(d.rfind("audioconvert").unwrap() > at("level name=level"), "opusenc needs S16 back: {d}");
+        assert!(d.rfind("audioconvert").unwrap() < at("opusenc"), "{d}");
+        assert!(at("audioresample") < at("format=F32LE"), "{d}");
+    }
+
+    /// The whole sender chain, with `audiotestsrc` in place of `pipewiresrc`, links, negotiates F32
+    /// all the way into `level` and `opusenc`, and produces Opus packets.
+    #[test]
+    fn the_sender_chain_negotiates_and_encodes_opus() {
+        ensure_gstreamer_initialized().unwrap();
+        let BuiltPipeline { pipeline, sink, gain_stage, .. } =
+            build_pipeline_from_source("audiotestsrc num-buffers=20 samplesperbuffer=960", 3.0).expect("chain builds");
+        assert_eq!(gain_stage.gain(), 3.0);
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let sample = sink.try_pull_sample(gst::ClockTime::from_seconds(5)).expect("no Opus packet");
+        let caps = sample.caps().unwrap().to_string();
+        let _ = pipeline.set_state(gst::State::Null);
+        assert!(caps.starts_with("audio/x-opus"), "{caps}");
+    }
+
+    /// The calibration tap's loudness path, with the real `level` element's real messages (read off
+    /// an `audiotestsrc ! level ! fakesink` bus: no PipeWire): a sine at 0.5 amplitude has its peak at
+    /// -6.0 dBFS and its RMS 3 dB below that, and the meter gets exactly that, ignoring other
+    /// messages. A stereo signal with silence on one channel counts as its loud channel.
+    #[test]
+    fn level_messages_feed_the_loudness_meter() {
+        ensure_gstreamer_initialized().unwrap();
+        // 44.1 kHz, 4410 samples per buffer = one 100 ms `level` window per buffer, 30 buffers.
+        let description = format!(
+            "audiotestsrc num-buffers=30 samplesperbuffer=4410 wave=sine freq=440 volume=0.5 \
+             ! audio/x-raw,rate=44100,channels=2 ! audioconvert \
+             ! level name=level post-messages=true interval={LEVEL_INTERVAL_NS} ! fakesink sync=false"
+        );
+        let pipeline = gst::parse::launch(&description).unwrap().downcast::<gst::Pipeline>().unwrap();
+        let bus = pipeline.bus().unwrap();
+        let meter = SharedLoudness::default();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        loop {
+            let msg = bus
+                .timed_pop_filtered(gst::ClockTime::from_seconds(10), &[gst::MessageType::Element, gst::MessageType::Eos, gst::MessageType::Error])
+                .expect("the level pipeline stalled");
+            if matches!(msg.view(), gst::MessageView::Eos(_) | gst::MessageView::Error(_)) {
+                break;
+            }
+            feed_loudness(&msg, &meter);
+        }
+        let _ = pipeline.set_state(gst::State::Null);
+        let m = meter.lock().unwrap().measurement().expect("30 audible windows");
+        assert!((m.peak_db + 6.02).abs() < 0.2, "peak {} dBFS", m.peak_db);
+        assert!((m.rms_db + 9.03).abs() < 0.3, "rms {} dBFS", m.rms_db);
+        assert!((28..=31).contains(&m.total_windows), "{m:?}");
+        // The calibration of that signal: -9 dBFS RMS is louder than the -18 target, so it asks for
+        // -9 dB (0.35x), below the range's floor: lowered to the minimum.
+        assert_eq!(crate::audio_gain::gain_for(&m), (crate::audio_gain::MIN_GAIN, crate::audio_gain::GainLimit::Min));
+        // A message that is not a `level` one is ignored.
+        let before = meter.lock().unwrap().measurement().unwrap();
+        feed_loudness(&gst::message::Element::new(gst::Structure::new_empty("other")), &meter);
+        assert_eq!(meter.lock().unwrap().measurement().unwrap(), before);
+    }
 
     #[test]
     fn audio_wire_pts_is_capture_time_on_the_sender_clock() {
@@ -1643,7 +2032,8 @@ mod tests {
             eprintln!("skipping: gstreamer not available in this environment");
             return;
         }
-        let (pipeline, sink, _mute) = build_pipeline_from_source("audiotestsrc is-live=true do-timestamp=true").expect("chain builds");
+        let BuiltPipeline { pipeline, sink, .. } =
+            build_pipeline_from_source("audiotestsrc is-live=true do-timestamp=true", 1.0).expect("chain builds");
         let level = AudioLevel::default();
         assert_eq!(level.get(), 0.0);
         // Same order as `start_audio_sharing`: PLAYING first, the bus and appsink
@@ -1915,7 +2305,7 @@ mod tests {
             .expect("did not find the synthetic test app among live audio sources");
 
         eprintln!("[audio-stop-test] starting real audio share for source {source:?}");
-        let handle = start_audio_sharing(&client, 7, &source)
+        let handle = start_audio_sharing(&client, 7, &source, 1.0)
             .await
             .expect("start_audio_sharing failed");
 

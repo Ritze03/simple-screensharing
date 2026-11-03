@@ -1901,7 +1901,7 @@ async fn watching_video_automatically_delivers_the_sharers_audio_too() {
         .find(|s| s.name.contains(PW_CLIENT_NAME))
         .cloned()
         .expect("did not find the synthetic test app among live audio sources");
-    let audio_handle = crate::audio::start_audio_sharing(&client_a, AUDIO_STREAM_ID, &source)
+    let audio_handle = crate::audio::start_audio_sharing(&client_a, AUDIO_STREAM_ID, &source, 1.0)
         .await
         .expect("start_audio_sharing failed");
     eprintln!("[audio-follows-video] step 2 OK: sharer enabled audio AFTER the viewer was already watching");
@@ -2103,7 +2103,7 @@ async fn volume_survives_sender_audio_restart_or_switch() {
         .find(|s| s.name.contains(PW_CLIENT_NAME_A))
         .cloned()
         .expect("did not find the first synthetic test app among live audio sources");
-    let audio_handle_a = crate::audio::start_audio_sharing(&client_a, AUDIO_STREAM_ID_A, &source_a)
+    let audio_handle_a = crate::audio::start_audio_sharing(&client_a, AUDIO_STREAM_ID_A, &source_a, 1.0)
         .await
         .expect("start_audio_sharing (first) failed");
 
@@ -2181,7 +2181,7 @@ async fn volume_survives_sender_audio_restart_or_switch() {
         .find(|s| s.name.contains(PW_CLIENT_NAME_B))
         .cloned()
         .expect("did not find the second synthetic test app among live audio sources");
-    let audio_handle_b = crate::audio::start_audio_sharing(&client_a, AUDIO_STREAM_ID_B, &source_b)
+    let audio_handle_b = crate::audio::start_audio_sharing(&client_a, AUDIO_STREAM_ID_B, &source_b, 1.0)
         .await
         .expect("start_audio_sharing (second) failed");
 
