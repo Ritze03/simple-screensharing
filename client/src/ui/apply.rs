@@ -225,7 +225,7 @@ impl App {
                 if let Some(source) = staged.and_then(|s| s.audio) {
                     // Audio rides on a live capture only; it's live now.
                     self.state.selected_audio_source = Some(source);
-                    if let Err(e) = self.state.start_audio_share(room, capture) {
+                    if let Err(e) = self.state.start_audio_share(room, capture, false) {
                         self.toast(tr_with("ui.toast.audio_failed", "Couldn't share audio: %{error}", &[("error", &e.to_string())]), "error");
                     }
                 }
@@ -316,13 +316,15 @@ impl App {
                     self.nav.popover = None;
                     return;
                 }
+                // Switching source replaces the share; keep it muted if it was (#118).
+                let muted = paired_audio(&self.state, capture).is_some_and(|old| self.state.is_audio_share_muted(old));
                 if let Some(old) = paired_audio(&self.state, capture) {
                     self.state.stop_share(old);
                 }
                 let room = self.state.captures.get(&capture).and_then(|c| c.destinations.values().next()).map(|d| d.room);
                 if let Some(room) = room {
                     self.state.selected_audio_source = Some(source);
-                    if let Err(e) = self.state.start_audio_share(room, capture) {
+                    if let Err(e) = self.state.start_audio_share(room, capture, muted) {
                         self.toast(tr_with("ui.toast.audio_failed", "Couldn't share audio: %{error}", &[("error", &e.to_string())]), "error");
                     }
                 }

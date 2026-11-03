@@ -50,7 +50,7 @@
 //!
 //! See `ui.rs`'s module docs for the app-shell/nav-tab layer this sits under.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -921,6 +921,10 @@ pub struct RoomSession {
     /// `AppState::drain_events`), purely so this map doesn't grow forever
     /// across a long-lived room with many join/leave cycles.
     pub audio_volume_by_owner: HashMap<ConnId, u32>,
+    /// Owners whose audio this viewer muted: the mute counterpart of [`Self::audio_volume_by_owner`],
+    /// for the same reason (the `AudioWatch` is recreated under a new `stream_id` when the sender
+    /// switches audio source, and a fresh watch must not un-mute, #118).
+    pub audio_muted_by_owner: HashSet<ConnId>,
 
     /// The relay reports who watches our streams (spec 9.1): it answered our viewers-hello.
     /// `false` on an older relay, and then the UI shows no viewer count at all (a "0" there would
@@ -1120,6 +1124,11 @@ impl RoomSession {
         // `AudioWatch` under a fresh `stream_id` — see
         // `RoomSession::audio_volume_by_owner`'s doc comment).
         self.audio_volume_by_owner.insert(owner, volume_percent);
+        if muted {
+            self.audio_muted_by_owner.insert(owner);
+        } else {
+            self.audio_muted_by_owner.remove(&owner);
+        }
     }
 
     /// Read back `owner`'s current volume/mute state — the counterpart query
@@ -1220,23 +1229,13 @@ impl RoomSession {
                 // doc comment) — default to 100 only if this owner has no
                 // recorded preference yet.
                 //
-                // `muted` always starts `false` here: `audio_volume_by_owner`
-                // only remembers the numeric slider value, not mute — a
-                // known, narrow gap (a viewer who muted a sender, then has
-                // that sender restart/switch their audio source before
-                // unmuting, hears audio resume rather than staying silent).
-                // Not the bug this field was added to fix (that's the
-                // cross-window View-tab/pop-out sync — see `muted`'s doc
-                // comment on `AudioWatch`), and out of scope to close here;
-                // closing it would mean widening `audio_volume_by_owner` to
-                // remember mute too, which touches `ui.rs`'s egui slider and
-                // `end_to_end_test.rs`'s existing regression test for this
-                // map's original purpose.
+                // The owner's mute is restored the same way (`audio_muted_by_owner`, #118).
                 let volume_percent = self.audio_volume_by_owner.get(&owner).copied().unwrap_or(DEFAULT_VOLUME_PERCENT);
-                if volume_percent != 100 {
-                    decoder.set_volume(volume_percent as f64 / 100.0);
+                let muted = self.audio_muted_by_owner.contains(&owner);
+                if volume_percent != 100 || muted {
+                    decoder.set_volume(effective_gain(volume_percent, muted));
                 }
-                self.audio_watches.lock().unwrap().insert(key, AudioWatch { decoder, volume_percent, muted: false, auto });
+                self.audio_watches.lock().unwrap().insert(key, AudioWatch { decoder, volume_percent, muted, auto });
                 self.watch_error = None;
 
                 let client = self.client.clone();
@@ -1471,7 +1470,7 @@ pub enum SuspendedShare {
     Video { capture: CaptureSourceId, params: capture::destination::VideoParams, role: PendingRole },
     /// An audio share paired with `for_capture`. Its capture is bound to the
     /// dead connection as a whole, so it was stopped; this restarts it.
-    Audio { for_capture: CaptureSourceId, source: AudioSource },
+    Audio { for_capture: CaptureSourceId, source: AudioSource, muted: bool },
 }
 
 /// One room that dropped unexpectedly and is being reconnected. Lives in
@@ -3084,7 +3083,7 @@ impl AppState {
     /// (`add_destination_with_params`/`go_live` are the only things that ever
     /// push one), so `!destinations.is_empty()` is the same staged-vs-live
     /// test the rest of this module already relies on — no new flag needed.
-    pub fn start_audio_share(&mut self, room_handle: RoomHandle, for_capture: CaptureSourceId) -> Result<(), String> {
+    pub fn start_audio_share(&mut self, room_handle: RoomHandle, for_capture: CaptureSourceId, muted: bool) -> Result<(), String> {
         let is_live = self.captures.get(&for_capture).is_some_and(|c| !c.destinations.is_empty());
         if !is_live {
             return Err(
@@ -3095,7 +3094,7 @@ impl AppState {
         let Some(source) = self.selected_audio_source.clone() else {
             return Ok(());
         };
-        self.start_audio_share_with(room_handle, for_capture, source)
+        self.start_audio_share_with(room_handle, for_capture, source, muted)
     }
 
     /// [`Self::start_audio_share`] with the source given explicitly: what a
@@ -3106,6 +3105,7 @@ impl AppState {
         room_handle: RoomHandle,
         for_capture: CaptureSourceId,
         source: AudioSource,
+        muted: bool,
     ) -> Result<(), String> {
         let capture_id = self.alloc_capture_id();
         let destination_id = self.alloc_destination_id();
@@ -3148,7 +3148,7 @@ impl AppState {
 
         let gain = self.audio_gain;
         tokio::spawn(async move {
-            let result = audio::start_audio_sharing(&client, stream_id, &source, gain)
+            let result = audio::start_audio_sharing(&client, stream_id, &source, gain, muted)
                 .await
                 .map(ShareHandle::Audio)
                 .map_err(|e| format!("{e:#}"));
@@ -4019,6 +4019,7 @@ impl AppState {
                 preview_cache: PreviewCache::new(),
                 preview_textures: HashMap::new(),
                 audio_volume_by_owner: HashMap::new(),
+                audio_muted_by_owner: HashSet::new(),
                 viewers_supported: false,
                 viewers: HashMap::new(),
                 rewatch: Vec::new(),
@@ -4205,6 +4206,7 @@ impl AppState {
                         // forever across a long-lived room with many
                         // join/leave cycles. See that field's doc comment.
                         room.audio_volume_by_owner.remove(&conn_id);
+                        room.audio_muted_by_owner.remove(&conn_id);
                     }
                     ClientEvent::PresenceDelta(PresenceEvent::StreamStarted(info)) => {
                         room.note_stream_started(info);
@@ -4490,10 +4492,11 @@ impl AppState {
                     .cloned()
                     .or_else(|| self.audio_sources.iter().find(|s| s.name == label).cloned());
                 // The whole audio capture is bound to the dead connection;
-                // stop it and start a fresh one later.
+                // stop it and start a fresh one later (still muted if it was).
+                let muted = self.is_audio_share_muted(capture_id);
                 self.stop_share_one(capture_id);
                 match (audio_for, source) {
-                    (Some(for_capture), Some(source)) => Some(SuspendedShare::Audio { for_capture, source }),
+                    (Some(for_capture), Some(source)) => Some(SuspendedShare::Audio { for_capture, source, muted }),
                     _ => None,
                 }
             }
@@ -4668,9 +4671,9 @@ impl AppState {
             }
         }
         for share in entry.shares {
-            if let SuspendedShare::Audio { for_capture, source } = share
+            if let SuspendedShare::Audio { for_capture, source, muted } = share
                 && self.captures.get(&for_capture).is_some_and(|c| !c.destinations.is_empty())
-                && let Err(e) = self.start_audio_share_with(handle, for_capture, source)
+                && let Err(e) = self.start_audio_share_with(handle, for_capture, source, muted)
             {
                 note_share_error(&mut self.share_error, e);
             }
