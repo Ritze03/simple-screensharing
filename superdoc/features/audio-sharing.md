@@ -3,9 +3,149 @@
 Audio capture/encode/playback is described where it grew up: `features/stream-control.md`
 ("Sharing audio ...", "The 2026-07-28 audio bugs"), `features/video-pipeline.md` ("Audio follows
 video") and the module docs of `client/src/audio.rs` and `client/src/decode.rs`. This page covers
-**keeping the audio aligned with the picture** (task #91, 2026-11-01), the **shared audio is a name** (#105), the viewer volume (#96), the **sender-side boost** (#114, capped at 200 % and calibration-free since #119) and the **viewer-side loudness levelling** (#119); for the share sink's lifecycle (WirePlumber pauses a player when its sink goes away, a resuming stream loses its links) see the #123 block; for a source that pauses and resumes while keeping its node and links (the share garbled, rebuilt on resume) see the #125 block.
+**keeping the audio aligned with the picture** (task #91, 2026-11-01), the **shared audio is a name** (#105), the viewer volume (#96), the **sender-side boost** (#114, capped at 200 % and calibration-free since #119) and the **viewer-side loudness levelling** (#119); for the share sink's lifecycle (WirePlumber pauses a player when its sink goes away, a resuming stream loses its links) see the #123 block. **Why shared audio broke after a pause/resume** (the capture ran on `pipewiresrc`'s clock; the native viewer's jitter buffer guessed the frame size from PTS steps) is the #128 block, which also corrects the explanations of #117, #121, #123 and #125.
+
+## 2026-11-03: the real cause of "broken after a pause/resume": two clocks (task #128)
+
+User report on master `eec2124` (with #117, #121, #123, #125): pausing and playing a YouTube video in Floorp still
+leaves viewers with "really broken" audio until the sharer re-selects the source. Two observations ruled out the
+graph-state explanations of the earlier blocks: a host monitor over 2-3 pause/play cycles showed the Floorp node
+`running` the whole time with no node or link change at all (no trigger of #117/#123/#125 fired, still broken), and
+in the client log an automatic #125 rebuild did not cure it while a manual re-select 3 s later did. What a re-select
+renews that a rebuild does not: a new stream end to end, i.e. a **new viewer-side decoder**. Both ends turned out to
+be broken, by the same kind of bug: a clock or frame size taken from the wrong place.
+
+**The host's graph** (read-only `pw-top`/`pw-dump`, same session): the hardware sink
+`alsa_output.pci-0000_00_1f.3.analog-stereo` drives at **44100 Hz**, quantum 512 (`clock.allowed-rates = [44100,
+48000]`; Spotify, the game and gamescope run 44.1 kHz streams), while our share sink, alone, is its own driver at
+48000 Hz. Every time the shared app is linked in, pauses, resumes, or another stream of it appears, the share's
+capture stream changes driver, quantum and **rate**. The VMs run `allowed-rates = [48000]` only, so no earlier VM
+test ever saw a rate switch (the harness can now set it, `ALLOWED`).
+
+### 1. Sender: the capture pipeline ran on `pipewiresrc`'s clock (`audio.rs` `use_monotonic_clock`)
+
+`pipewiresrc` provides a `GstPipeWireClock` and the pipeline picks it. Its time is the graph driver's sample position
+(`pw_stream_get_time_n`: ticks / rate, plus interpolation), while the buffer PTS are `CLOCK_MONOTONIC` cycle times
+(`b->time - delay`). `pipewiresrc` is a pseudo-live `GstBaseSrc` (it implements `get_times`), so basesrc fixes a
+`ts_offset` at the first buffer and then **waits on the pipeline clock until each buffer's PTS** (source:
+`gstpipewiresrc.c` / `gstpipewireclock.c` of PipeWire 1.6.10, `gstbasesrc.c` `gst_base_src_do_sync` of GStreamer
+1.28). On a driver change the stream keeps its tick count continuous but loses the switch gap; on a rate change the
+accumulated ticks are re-read at the new rate. Either way the clock **steps against the PTS**, and after a step back
+the source is held back on every buffer, runs out of buffers and drops cycles, **for good**. Only a pipeline restart
+(Null -> Playing: new clock, new `ts_offset`) clears it, which is all a re-select or the #117/#123/#125 rebuild did.
+`pipewiresrc` even says so in its source ("We may see a driver/quantum/clock rate change on switching audio sources
+... Application must handle the clock lost message ... by pausing the pipeline and then setting it back to
+playing"), but posts that message only when the stream goes PAUSED, not on a driver/rate/quantum change.
+
+Measured with `client/scripts/vm-audio/probe.py` (the exact sink + capture chain, instrumented; `probe-run.sh`),
+samples per second leaving `pipewiresrc` (48000 is healthy):
+
+| change under a running capture | `pipewireclock0` (until #128) | system clock (#128) |
+| --- | --- | --- |
+| quantum 1024 -> 256 (same driver, same rate) | clock -0.4 ms, **~28 600/s for good** | 48 000 |
+| quantum 256 -> 2048 | clock +36 ms, back to 48 000 | 48 000 |
+| graph rate 48000 -> 44100 | clock +542 ms, 47 900 | 47 900 |
+| graph rate 44100 -> 48000 | clock -766 ms, **~6 100/s for good** | 48 000 |
+| 44.1 kHz source paused/resumed 3x (allowed 44.1/48 kHz) | clock -20 ms per switch; 48k for one cycle, then 20-37k | 48 000 throughout |
+
+**Fix:** `use_monotonic_clock(&pipeline)` = `pipeline.use_clock(Some(&gst::SystemClock::obtain()))` in
+`build_pipeline_from_source` (the share) and in `start_level_tap` (the dropdown meter, same bug). `CLOCK_MONOTONIC`
+is the axis of the buffer PTS, so basesrc's waits are now consistent whatever PipeWire does; PipeWire rate-matches the
+stream to its driver itself. Nothing else needs the PipeWire clock (the appsink does not sync). Side effect: the
+audio wire PTS are now on a monotonic running time, the same axis as video's (`decode/avsync.rs`), instead of a
+device clock that drifts by its ppm. *Why not `provide-clock=false`:* the property exists in 1.6.10, but a fixed
+pipeline clock does not depend on what a given `pipewiresrc` version offers. *Why not handle `clock-lost`:* it is not
+posted for these changes, and restarting the pipeline loses audio each time.
+
+### 2. Native viewer: one short PTS step poisoned the jitter buffer for good (`decode.rs` `opus_packet_duration_us`)
+
+`AudioJitterBuffer` inferred the Opus frame duration as the **minimum of the last 16 PTS steps** and treated a packet
+as contiguous if it came within 1.5 frames. A sender re-times its PTS by a few ms when its graph changes (the fixed
+sender too: a 5.1 ms step at a quantum change and a 0.9 ms step at a rate change were measured with `SSS_AUDIO_DUMP`).
+From that one step on, the "frame" was 5.1 ms, every normal 20 ms packet looked like 3 lost frames, so each one was
+held 40 ms and preceded by 2 `GAP`s of PLC (5 after the 0.9 ms step, the 2.5 ms clamp); concealed steps are never
+recorded, so the 16-step window **never recovered**. Measured in one 50 s run: **6797 `GAP` events**, 100-250 a
+second, the viewer heard **428 Hz instead of 440 (2.7 % low) with clicks**, while the packets it received decoded
+back to back were clean. A re-select gives the viewer a new `AudioDecoder` (that cured it); the #125 rebuild kept
+the viewer's decoder (that did not). This is also #123's "about 2.7 % low, steady clicks", which was blamed on
+re-linking into the running chain.
+
+**Fix:** the packet says how long it is. `opus_packet_duration_us` reads the TOC byte (RFC 6716 3.1: config ->
+frame size, code -> frame count; `None` for empty/malformed, then 20 ms), each held packet carries its duration, and
+`drain` judges a packet against where the last released one **ends** (`pts <= end + slot/2` is contiguous, which
+also accepts a packet that starts a few ms early; a hole is `(pts - end) / slot` missing slots of the last packet's
+duration, still capped at 5). The estimator (`recent_deltas`, `frame_duration_us`, the bootstrap hold) is gone; a
+40 ms-frame sender is on its grid from its first packet.
+**The browser viewer** (`docs/js/core/audio.js`) has no such estimator (it schedules decoded frames by PTS): it had
+only cause 1.
+
+### 3. The rebuilds are gone (`audio.rs` `link_poll_loop`, `sync_links`, `lost_links`)
+
+With both causes fixed, linking into the running chain is clean, so the poll just links: new streams of the name
+(#105, #117's re-created node) and streams we linked that lost their links (`lost_links`: Firefox re-creates its
+ports on pause/resume, #123; `link_source_into_loopback` is idempotent). Removed: `rebuild_chain`, `Chain`,
+`ChildGuard`, `gap_decision`, `IdleWatch`, `poll_decision`, `node_is_running` (and `PwInfo::state`), and their tests;
+the sink handle and the PTS offset are plain values again. A resume no longer loses its first ~1 s. Unchanged: #118
+mute carry-over, the microphone guard (`wait_for_capture_link` at start), #123's unlink-before-removal, #121's sink.
+
+### 4. Debug dumps (`audio_dump.rs`, `SSS_AUDIO_DUMP=<dir>`)
+
+Off unless set. The sender writes every Opus packet it sends (`sent-<stream>-<ms>.pkt`), the native viewer every
+packet it receives (`recv-*.pkt`) and what its jitter buffer/timeline did (`play-*.log`: `push pts= mapped= now=`,
+`gap pts= dur=`). `client/scripts/vm-audio/pktdump.py FILE.pkt [OUT.wav]` prints PTS steps per second and decodes
+the packets back to back into a WAV: "was it sent broken or played broken" in one step. This is what found cause 2.
+
+### Measured (Fedora VM, PipeWire 1.6.2, in-process sharer and viewer through a real relay, `soak.sh`)
+
+Bad 0.5 s windows per phase (`phases.py`, `analyze.py`'s criteria: within 15 Hz of 440 and a sample step under
+0.12 of the peak). The share sink's own monitor, recorded in parallel, is the VM's noise floor (0-3 per phase).
+"Packets/s" is what the viewer received (`pps.py`, 50 is healthy).
+
+| scenario | master `eec2124` | #128 |
+| --- | --- | --- |
+| `graph` (source plays on; quantum 256 / back / rate 44.1k / back) | 9/15, 2/15, 7/15, **21/23** | 0/15, 1/15, 2/15, 3/23; 1 `GAP` |
+| same, sender fix only (viewer estimator still in) | - | 7/15, 7/15, 6/15, 21/23; 6797 `GAP`s |
+| `pause`, emulated 44.1 kHz Floorp, allowed 44.1/48k (3 resumes) | 3/17, 2/17, **13/17**; 24-44 pkt/s while paused | 2/17, 3/17, 4/17; 48-51 pkt/s |
+| same, EasyEffects as default sink | 3/17, **7/17, 6/17**; 22-43 pkt/s while paused | 2/17, 1/17, 3/17; 48-51 pkt/s |
+| `pause`, real Firefox (re-creates its ports; #128 re-links) | 2/17, 3/17, 1/17, a rebuild + ~1 s lost per resume | 1/17, 2/17, 1/18, no rebuild, nothing lost |
+| `vanish` (node destroyed and re-created, #117) | 3/15, 4/15, 2/15 (rebuilds) | 0/15, 3/15, 2/15 (plain link) |
+| `flap` 10 x 2.2 s at 44.1k, then 20 s | - | last 20 s 5/43 (sink monitor 4/43), 0 `GAP` |
+
+Sent audio (`pktdump.py` of `sent-*.pkt`, decoded back to back) with #128: at the sink monitor's level in every
+scenario (0-3 per phase; the last phase also holds the end of the stream).
+
+**Tests (no audio):** `audio::tests::the_capture_pipeline_runs_on_the_monotonic_system_clock` (the real `pipewiresrc`
+description in Null: fixed clock, `GstSystemClock`, monotonic; and the running chain keeps it),
+`a_source_that_lost_its_links_into_the_sink_is_noticed` (now `lost_links`), `decode::tests::jitter_is_not_poisoned_by_a_short_pts_step`,
+`jitter_reads_a_frame_duration_other_than_20ms_from_the_packets`, `opus_packet_duration_reads_the_toc_byte` (RFC table
+and real `opusenc` packets), `audio_dump::tests::packets_are_written_in_the_documented_layout`; the other jitter tests
+use a stub with a real 20 ms TOC byte (`0xF8`).
+
+### What the earlier blocks got wrong (kept below as history)
+
+- **#117** ("a driver, clock or quantum change under a pipeline that was started against the old one is the likely
+  mechanism"): right instinct, wrong clock. It was the *GStreamer* pipeline clock (`pipewiresrc`'s), not the graph;
+  the rebuild helped only because it restarted that clock.
+- **#121** ("a `pw-loopback`'s capture side has no clock of its own"): not the cause. The null sink is kept (it is a
+  fine design and #123's unlink-before-removal builds on it), but it never fixed anything about this.
+- **#123** ("re-linking into the running chain garbled, about 2.7 % low, steady clicks; PipeWire merges the driver
+  groups non-deterministically"): the silence/garble was cause 1, the 2.7 % and the clicks were cause 2 (the viewer).
+  Re-linking is exactly what the poll does now, measured clean.
+- **#125** ("the driver of the group must not change under a running capture stream"): PipeWire handles a driver
+  change fine; the GStreamer clock did not. Its `priority.driver=3000` experiment worked because with our sink always
+  the driver the capture's clock never stepped. The idle -> running rebuild is removed.
+
+**Not verified:** the user's own host (real ALSA at 44.1 kHz, EasyEffects, Floorp, a viewer elsewhere); the Arch VM;
+the browser viewer against the fixed sender. **Same pattern elsewhere, not changed:** the video capture pipelines
+(`capture.rs`) also run on their `pipewiresrc`'s clock; a screencast's driver is the portal node and does not switch
+rate, but if a video stream ever starves after a portal renegotiation, try the same one-liner first (whether #122's
+"out of buffers" has anything to do with it was not checked).
 
 ## 2026-11-03: garbled audio after a pause/resume that keeps the node and its links (task #125)
+
+> **Corrected by #128 (above):** the cause was not the driver change of the share group but the capture pipeline
+> running on `pipewiresrc`'s clock (plus the viewer's frame-size estimator); the idle -> running rebuild described
+> here is removed. The measurements stay valid as measurements.
 
 User report on master `d39e70d` (with #123): pausing and resuming a YouTube video in Floorp still garbles the shared
 audio until the source is re-selected. **Host evidence** (read-only `pw-dump` every 0.3 s over 4 pause/resume cycles,
@@ -90,6 +230,10 @@ treated as VM noise but not explained. The first ~1 s of the resumed sound is lo
 "steady state" line in `summary.py`. **Not done:** the Arch VM (only Fedora/EasyEffects was used), a real hardware sink.
 
 ## 2026-11-03: stopping or switching a share paused the player, and a pause/resume left the chain dead (task #123)
+
+> **Corrected by #128 (above):** part 1 (WirePlumber pausing the player) stands. In part 2 the lost links are real,
+> but "re-linking into the running chain garbles" was wrong: that garble was the `pipewiresrc` clock and the
+> "2.7 % low, steady clicks" the native viewer's jitter buffer. The poll now re-links instead of rebuilding.
 
 Two user reports on master with #121: *"selecting my browser as an audio source immediately pauses the video"*
 and *"pausing and unpausing still breaks"* the shared audio (viewers hear broken audio until the source is
@@ -267,6 +411,9 @@ tests). If a sink refuses the chain the symptom is a pipeline error in the log (
 
 ## 2026-11-03: the share captures a private, self-clocked null sink instead of a `pw-loopback` (task #121)
 
+> **Corrected by #128 (above):** the loopback's missing clock was not why the share broke; the null sink stays, but
+> for its own merits.
+
 User report after #117: muting and unmuting works now, but *pausing* the video and playing it again is
 "broken the same way" (garbled audio until the source is selected again).
 
@@ -322,6 +469,9 @@ checks on an `Audio/Sink` node. If it still breaks, run *while paused* and again
 `pw-link -l`, `pw-top -b -n 2`, and `pw-metadata -n settings`.
 
 ## 2026-11-03: audio broken after the source's stream disappears and comes back (task #117)
+
+> **Corrected by #128 (above):** the mechanism was the GStreamer pipeline clock (`pipewiresrc`'s), not the graph; the
+> rebuild described here is removed, a re-appearing stream is simply linked.
 
 User report: sharing Floorp (YouTube) audio, muting the tab for a moment and unmuting (also: closing and
 reopening the browser; sometimes the first selection) gives *"really broken audio"* until the source is selected

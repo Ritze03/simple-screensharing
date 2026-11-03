@@ -3,7 +3,7 @@
 # node goes running -> idle and on resume idle -> running, with the SAME node and the SAME ports (Firefox in
 # the VMs re-creates its ports instead, which the poll already handles). A GStreamer pulsesink (a pulse client of
 # pipewire-pulse, like Firefox's cubeb) that is set PAUSED / PLAYING corks the stream: node idle, ports kept.
-# usage: emu_src.py [NAME] [FREQ]   SIGUSR1 = pause, SIGUSR2 = play, SIGTERM = quit. Runs as app NAME (default Floorp).
+# usage: emu_src.py [NAME] [FREQ] [RATE]   SIGUSR1 = pause, SIGUSR2 = play, SIGTERM = quit. Runs as app NAME (default Floorp).
 import signal, sys
 import gi
 gi.require_version("Gst", "1.0")
@@ -11,9 +11,10 @@ from gi.repository import Gst, GLib, GLibUnix
 
 name = sys.argv[1] if len(sys.argv) > 1 else "Floorp"
 freq = sys.argv[2] if len(sys.argv) > 2 else "440"
+rate = sys.argv[3] if len(sys.argv) > 3 else "48000"  # 44100: a source like a 44.1 kHz track (#128 rate switch)
 Gst.init(None)
 p = Gst.parse_launch(
-    f'audiotestsrc is-live=true wave=sine freq={freq} volume=0.5 ! audio/x-raw,format=F32LE,rate=48000,channels=2 ! '
+    f'audiotestsrc is-live=true wave=sine freq={freq} volume=0.5 ! audio/x-raw,format=F32LE,rate={rate},channels=2 ! '
     f'pulsesink client-name={name} '
     f'stream-properties="props,application.name={name},media.role=Music"')
 loop = GLib.MainLoop()

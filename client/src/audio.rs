@@ -21,9 +21,7 @@
 //!    mixed into the share (task #105, see step 3).
 //! 2. [`start_audio_sharing`] spawns a `pw-cli` process that creates a
 //!    `support.null-audio-sink` (`Audio/Sink`, [`sink_create_command`]) and
-//!    keeps it alive (task #121; until then a `pw-loopback`, whose capture
-//!    side had no clock of its own and came out broken after the source
-//!    paused). The sink is self-clocked, fixed at 48 kHz stereo, never the
+//!    keeps it alive (task #121; until then a `pw-loopback`). The sink is self-clocked, fixed at 48 kHz stereo, never the
 //!    default sink, and dies with the `pw-cli` connection.
 //! 3. The target application's existing *output* ports are `pw-link`ed into
 //!    the sink's *input* ports (by numeric port id — `pw-link <id> <id>`
@@ -31,8 +29,11 @@
 //!    mismatches that string-pattern port names could hit). This is
 //!    additive. *Every* stream named like the chosen source is linked into the
 //!    same sink (it mixes them), and [`link_poll_loop`] re-checks
-//!    once a second to link streams that appear later and forget ones that
-//!    vanished. The application's original routing (e.g. to real speakers)
+//!    once a second to link streams that appear later, re-link ones that
+//!    lost their links (#123) and forget ones that vanished. Linking into the
+//!    running chain is safe because the capture pipeline runs on the
+//!    monotonic system clock, not `pipewiresrc`'s ([`use_monotonic_clock`],
+//!    task #128). The application's original routing (e.g. to real speakers)
 //!    is completely untouched — confirmed live by watching `pw-link -l`
 //!    show both the original link and the new one simultaneously.
 //! 4. The sink's monitor is then captured: `pipewiresrc
@@ -64,8 +65,8 @@
 //! `superdoc/features/stream-control.md`).
 
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -119,9 +120,6 @@ struct PwObject {
 
 #[derive(Debug, Deserialize)]
 struct PwInfo {
-    /// A node's `info.state` (`"running"`, `"idle"`, `"suspended"`, ...); absent on other objects.
-    #[serde(default)]
-    state: Option<String>,
     /// Present (as `"output"`/`"input"`) on `PipeWire:Interface:Port`
     /// objects; absent on nodes.
     #[serde(default)]
@@ -327,13 +325,13 @@ fn nodes_are_linked(objects: &[PwObject], output_node_id: u32, input_node_id: u3
 /// set is unit-tested. `pw-cli` hands everything after the factory name to PipeWire's property
 /// parser, so values must not contain whitespace or `#`.
 ///
-/// Why a null sink the app owns instead of the `pw-loopback` of #105: a loopback's capture side
-/// has no clock of its own. It runs only while something drives it, so it fell to the dummy driver
-/// whenever the source stopped feeding it, and the chain came out broken after the source's pause
-/// (#121) or mute (#117). A `support.null-audio-sink` with `node.driver=true` is its own timer
-/// clock, `node.always-process` keeps it scheduled with nothing linked, and its `audio.rate` is
-/// fixed, so whatever the source does (pause, vanish, other latency or rate) PipeWire adapts each
-/// input to the sink and the capture side sees one steady 48 kHz stereo stream.
+/// Why a null sink the app owns instead of the `pw-loopback` of #105: a `support.null-audio-sink`
+/// with `node.driver=true` is its own timer clock, `node.always-process` keeps it scheduled with
+/// nothing linked, and its `audio.rate` is fixed, so the capture side always has a driver and sees
+/// one 48 kHz stereo stream whatever the source does. (#121 believed the loopback's missing clock
+/// was why the share broke after a pause; it was not. The cause was the GStreamer pipeline running
+/// on `pipewiresrc`'s clock, which steps whenever the capture stream's driver, rate or quantum
+/// changes, and such changes happen with any sink: see [`use_monotonic_clock`], task #128.)
 ///
 /// The sink must not attract anything else: `priority.session=0` keeps it from becoming the
 /// default sink next to a real device (real devices are 1000+), `node.virtual` marks it, and
@@ -563,9 +561,16 @@ fn link_source_into_loopback(objects: &[PwObject], source_node_id: u32, loopback
 /// loopback input and records it in `linked`; forgets nodes that vanished.
 /// A node that cannot be linked yet (no ports, `pw-link` error) is not
 /// recorded, so the next tick retries it. Never links a node of another name.
+/// A stream already linked that lost links ([`lost_links`]) is linked again.
 fn sync_links(objects: &[PwObject], name: &str, loopback_input_node_id: u32, linked: &mut std::collections::HashSet<u32>) {
     let matching = node_ids_named(objects, name);
     let (to_add, kept) = link_diff(&matching, linked);
+    for id in lost_links(objects, &kept, loopback_input_node_id) {
+        match link_source_into_loopback(objects, id, loopback_input_node_id) {
+            Ok(()) => tracing::info!("audio share '{name}': re-linked stream node {id} (it re-created its ports)"),
+            Err(e) => tracing::debug!("audio share '{name}': stream node {id} not re-linked yet: {e:#}"),
+        }
+    }
     *linked = kept;
     for id in to_add {
         match link_source_into_loopback(objects, id, loopback_input_node_id) {
@@ -578,148 +583,33 @@ fn sync_links(objects: &[PwObject], name: &str, loopback_input_node_id: u32, lin
     }
 }
 
-/// Whether the poll must rebuild the loopback + capture pipeline before linking a stream (task
-/// #117, #123). `gap` is sticky: it is set when the chain is *stale*, i.e. nothing is linked into
-/// the loopback any more (the app closed, or muted and Firefox destroyed its stream) or a linked
-/// stream lost its links (it re-created its ports, as Firefox does on pause/resume, #123), and is
-/// only cleared by a rebuild. Returns `(gap, rebuild)`: rebuild when the chain is stale and a
-/// stream is ready to be linked again.
+/// The streams of `linked` that have ports again but are missing a link into the sink: Firefox
+/// re-creates the ports of its stream node on a pause/resume (same node id), and PipeWire drops
+/// every link on the old ports (task #123). Sorted, for a stable log and test.
+fn lost_links(objects: &[PwObject], linked: &std::collections::HashSet<u32>, sink_node_id: u32) -> Vec<u32> {
+    let mut lost: Vec<u32> =
+        linked.iter().copied().filter(|&id| missing_links(objects, id, sink_node_id).is_some_and(|n| n > 0)).collect();
+    lost.sort_unstable();
+    lost
+}
+
+/// Once a second, re-lists the graph and links every stream that carries the shared name into the
+/// sink: streams that appeared (a new tab, a restarted app, Firefox re-creating its stream after a
+/// mute, #117) and streams we linked that lost their links (Firefox re-creates its ports on a
+/// pause/resume, #123). Both are plain (re)links into the running chain ([`sync_links`]).
 ///
-/// `Why:` a loopback that has been through a stretch with no input and then gets a new stream
-/// linked in sounded "really broken" until the user re-selected the source (which spawns a fresh
-/// loopback and pipeline with the stream already linked). The poll now does that same reset itself.
-fn gap_decision(gap: bool, stale: bool, linkable: bool) -> (bool, bool) {
-    let gap = gap || stale;
-    (gap, gap && linkable)
-}
-
-/// Whether node `id` is `running` in this snapshot. A node without a reported state counts as
-/// running (nothing to conclude from it), as does one that is not in the snapshot.
-fn node_is_running(objects: &[PwObject], id: u32) -> bool {
-    objects
-        .iter()
-        .find(|o| o.id == id && o.obj_type.as_deref() == Some("PipeWire:Interface:Node"))
-        .and_then(|o| o.info.as_ref()?.state.as_deref())
-        .is_none_or(|s| s == "running")
-}
-
-/// Polls with every matching stream not running before the stretch counts as a pause (task #125).
-/// A new stream is `idle` for a moment before it runs, and a stream flaps between the two when an
-/// app buffers; one tick of that must not cost a rebuild.
-const IDLE_TICKS: u32 = 2;
-/// Polls after a rebuild during which a source that resumed does not trigger another one (a
-/// rebuild costs ~1 s of silence; a source that flaps idle/running every few seconds would
-/// otherwise rebuild forever). The wish stays pending and fires when the cooldown is over.
-const REBUILD_COOLDOWN_TICKS: u32 = 5;
-
-/// Tracks whether the shared source went idle and came back (task #125). Pure; one `tick` per poll.
-#[derive(Debug, Default)]
-struct IdleWatch {
-    idle_ticks: u32,
-    /// Sticky: every stream of the share was idle for [`IDLE_TICKS`] polls; cleared by a rebuild.
-    idled: bool,
-    cooldown: u32,
-}
-
-impl IdleWatch {
-    /// `streams`: how many streams carry the shared name, `running`: how many of those are
-    /// `running`. Returns whether a source that went idle is running again and may be rebuilt for.
-    fn tick(&mut self, streams: usize, running: usize) -> bool {
-        self.cooldown = self.cooldown.saturating_sub(1);
-        if streams > 0 && running == 0 {
-            self.idle_ticks += 1;
-            self.idled |= self.idle_ticks >= IDLE_TICKS;
-        } else {
-            self.idle_ticks = 0;
-        }
-        self.idled && running > 0 && self.cooldown == 0
-    }
-
-    /// A rebuild happened (for any reason): the new chain starts clean.
-    fn rebuilt(&mut self) {
-        self.idled = false;
-        self.idle_ticks = 0;
-        self.cooldown = REBUILD_COOLDOWN_TICKS;
-    }
-}
-
-/// One poll's decision `(gap, rebuild)`: [`gap_decision`] fed with everything that makes the chain
-/// stale. `matching` / `running`: the same-named streams in this snapshot and how many run.
-fn poll_decision(
-    idle: &mut IdleWatch,
-    gap: bool,
-    kept_empty: bool,
-    lost: bool,
-    new_linkable: bool,
-    matching: usize,
-    running: usize,
-) -> (bool, bool) {
-    let resumed = idle.tick(matching, running);
-    gap_decision(gap, kept_empty || lost || idle.idled, new_linkable || lost || resumed)
-}
-
-/// Kills its child on drop, so a rebuild cancelled by `abort()` (stop) cannot leak a `pw-loopback`.
-struct ChildGuard(Option<SinkProc>);
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        if let Some(c) = self.0.as_mut() {
-            kill_and_wait(c);
-        }
-    }
-}
-
-/// What [`link_poll_loop`] needs to replace the loopback + pipeline source of a running share.
-struct Chain {
-    stream_id: u8,
-    pipeline: gst::Pipeline,
-    loopback_child: Arc<Mutex<SinkProc>>,
-    pts_offset_us: Arc<AtomicU64>,
-}
-
-/// Replaces the loopback with a fresh one, links the streams named `name` into it and restarts the
-/// capture pipeline on it, exactly the order of [`start_audio_sharing`] (what a manual re-select
-/// does). Returns the new loopback input node id and the linked set. On error the old loopback
-/// process is still held by the handle; the poll retries next tick.
-async fn rebuild_chain(chain: &Chain, name: &str) -> Result<(u32, std::collections::HashSet<u32>)> {
-    let loopback_name = format!("{SINK_NAME_PREFIX}{}-{}", chain.stream_id, uuid::Uuid::new_v4().simple());
-    let mut new_child = ChildGuard(Some(spawn_sink(&loopback_name)?));
-    let (objects, lb) = wait_for_loopback_ready(&loopback_name, Duration::from_secs(5)).await?;
-    let mut linked = std::collections::HashSet::new();
-    sync_links(&objects, name, lb.node_id, &mut linked);
-
-    let capture_node_name = format!("{loopback_name}-cap");
-    let src = chain.pipeline.by_name("src").ok_or_else(|| anyhow!("pipeline has no element named 'src'"))?;
-    chain.pipeline.set_state(gst::State::Null).context("failed to stop the audio pipeline for a rebuild")?;
-    src.set_property("target-object", lb.serial.to_string());
-    src.set_property("client-name", capture_node_name.as_str());
-    chain.pipeline.set_state(gst::State::Playing).context("failed to restart the audio pipeline")?;
-    let (state, _, _) = chain.pipeline.state(gst::ClockTime::from_seconds(5));
-    state.map_err(|e| anyhow!("audio pipeline failed to reach PLAYING after a rebuild: {e:?}"))?;
-    // Running time restarted at 0 with the pipeline: re-anchor the wire PTS (same as at start).
-    chain.pts_offset_us.store(
-        sender_clock_offset_us(chain.pipeline.current_running_time().map(|t| t.useconds()).unwrap_or(0), Instant::now()),
-        Ordering::Relaxed,
-    );
-    wait_for_capture_link(&capture_node_name, lb.node_id, Duration::from_secs(5)).await?;
-
-    let mut old = std::mem::replace(&mut *chain.loopback_child.lock().unwrap_or_else(|p| p.into_inner()), new_child.0.take().expect("set above"));
-    kill_and_wait(&mut old);
-    tracing::info!("audio share '{name}': rebuilt the loopback ({loopback_name}) after the source reappeared");
-    Ok((lb.node_id, linked))
-}
-
-/// Once a second, re-lists the graph and links streams that now carry the
-/// shared name (new browser tab, restarted app). A stream that reappears after
-/// a stretch with none, or one we linked that lost its links (it re-created its
-/// ports on a pause/resume, #123), is linked into a rebuilt chain ([`gap_decision`]).
-async fn link_poll_loop(name: String, mut loopback_input_node_id: u32, mut linked: std::collections::HashSet<u32>, chain: Chain) {
+/// `Why no rebuild (task #128):` #117, #123 and #125 rebuilt the whole chain (new sink, capture
+/// pipeline Null -> Playing) whenever a stream came back, lost its links or resumed from idle,
+/// because re-linking into the running chain garbled the share. That garble was not the graph: the
+/// capture pipeline ran on `pipewiresrc`'s clock, which steps whenever the stream's driver, rate
+/// or quantum changes (linking a source in, or a source pausing, changes exactly those), and the
+/// capture then starved for good; a rebuild only helped because it restarted that clock. Since
+/// the pipeline runs on the monotonic system clock ([`build_pipeline_from_source`]) a graph change
+/// costs nothing, so the poll just links, and a resume no longer loses its first second.
+async fn link_poll_loop(name: String, sink_input_node_id: u32, mut linked: std::collections::HashSet<u32>) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tick.tick().await; // the first tick is immediate; start_audio_sharing just synced
-    // Started with the app absent: the loopback has never had input, same situation as a gap.
-    let mut gap = linked.is_empty();
-    let mut idle = IdleWatch::default();
     loop {
         tick.tick().await;
         let objects = match tokio::task::spawn_blocking(run_pw_dump).await {
@@ -730,39 +620,11 @@ async fn link_poll_loop(name: String, mut loopback_input_node_id: u32, mut linke
             }
             Err(_) => return,
         };
-        // Only link while our loopback input is still in the graph.
-        if node_port_ids(&objects, loopback_input_node_id as u64, "input").is_empty() {
+        // Only link while our sink is still in the graph.
+        if node_port_ids(&objects, sink_input_node_id as u64, "input").is_empty() {
             continue;
         }
-        let (to_add, kept) = link_diff(&node_ids_named(&objects, &name), &linked);
-        let new_linkable = to_add.iter().any(|&id| !node_port_ids(&objects, id as u64, "output").is_empty());
-        // A stream we linked that lost its links (it re-created its ports on a pause/resume, same
-        // node id): the chain is stale, rebuilt like after a gap. Re-linking the running chain
-        // instead left the audio silent or garbled for good on a real PipeWire (#123).
-        let lost = kept.iter().any(|&id| missing_links(&objects, id, loopback_input_node_id).is_some_and(|n| n > 0));
-        // The source went idle (paused) and runs again with its node and links untouched (Floorp /
-        // YouTube): the capture chain garbles when the source is merged back into its driver group
-        // under the running pipeline (host evidence, #125). A rebuild is what a re-select does.
-        let matching = node_ids_named(&objects, &name);
-        let running = matching.iter().filter(|&&id| node_is_running(&objects, id)).count();
-        let (g, rebuild) = poll_decision(&mut idle, gap, kept.is_empty(), lost, new_linkable, matching.len(), running);
-        gap = g;
-        if rebuild {
-            if idle.idled {
-                tracing::info!("audio share '{name}': source resumed after idle; rebuilding the loopback");
-            }
-            match rebuild_chain(&chain, &name).await {
-                Ok((input, l)) => {
-                    loopback_input_node_id = input;
-                    linked = l;
-                    gap = false;
-                    idle.rebuilt();
-                }
-                Err(e) => tracing::warn!("audio share '{name}': rebuilding the loopback failed, will retry: {e:#}"),
-            }
-        } else {
-            sync_links(&objects, &name, loopback_input_node_id, &mut linked);
-        }
+        sync_links(&objects, &name, sink_input_node_id, &mut linked);
     }
 }
 
@@ -963,6 +825,29 @@ fn sink_monitor_source(sink_serial: u64, capture_node_name: &str) -> String {
     )
 }
 
+/// Runs `pipeline` on GStreamer's system clock (`CLOCK_MONOTONIC`) instead of the clock its
+/// `pipewiresrc` would provide. **The root cause of task #128.**
+///
+/// `pipewiresrc` offers a `GstPipeWireClock` and a pipeline picks it automatically. Its time is
+/// derived from the *graph driver's* sample position (`pw_stream_get_time_n`: ticks / rate), while
+/// the buffers' PTS are `CLOCK_MONOTONIC` cycle times; `pipewiresrc` is a pseudo-live `GstBaseSrc`,
+/// so it holds every buffer until that clock reaches the buffer's PTS. Whenever the capture stream's
+/// driver, rate or quantum changes, that clock steps against the PTS: a different driver (the share
+/// sink joins or leaves the hardware's group when the shared app pauses, resumes, or a new stream of
+/// it is linked), a rate switch (44.1 <-> 48 kHz with `clock.allowed-rates`), even a quantum change
+/// at the same rate and driver (an app asking for a different latency). After a backward step the
+/// source never catches up: measured in a VM (`client/scripts/vm-audio/probe.py`), a quantum change
+/// 1024 -> 256 dropped the capture from 48000 to ~28600 samples/s and a rate switch 44100 -> 48000 to
+/// ~6100, permanently, until the pipeline was restarted (which is all a re-select or the old
+/// #117/#123/#125 rebuild did). With the system clock the same changes leave it at 48000 samples/s.
+///
+/// Nothing else in the chain needs the PipeWire clock: the appsink does not sync, the buffer PTS stay
+/// capture times on this pipeline's running time (now monotonic, the same axis as video's wire PTS,
+/// [`sender_clock_offset_us`]), and PipeWire itself rate-matches the stream to its driver.
+fn use_monotonic_clock(pipeline: &gst::Pipeline) {
+    pipeline.use_clock(Some(&gst::SystemClock::obtain()));
+}
+
 /// [`build_pipeline`] with the source element(s) given as a description
 /// fragment, so a test can put `audiotestsrc` in front of the *real* chain
 /// (no PipeWire involved).
@@ -974,6 +859,7 @@ fn build_pipeline_from_source(source: &str, gain: f64, muted: bool) -> Result<Bu
     let pipeline = element
         .downcast::<gst::Pipeline>()
         .map_err(|_| anyhow!("gst::parse::launch did not return a top-level Pipeline"))?;
+    use_monotonic_clock(&pipeline);
 
     let sink = pipeline
         .by_name("sink")
@@ -1153,7 +1039,7 @@ pub struct AudioCaptureHandle {
     stream_id: u8,
     client: ScreenshareClient,
     pipeline: gst::Pipeline,
-    loopback_child: Arc<Mutex<SinkProc>>,
+    loopback_child: SinkProc,
     pump_task: tokio::task::JoinHandle<()>,
     /// The 1 s poll that links streams of the chosen name as they appear
     /// ([`link_poll_loop`]); aborted on stop/drop.
@@ -1256,14 +1142,10 @@ pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, sour
     let pump_client = client.clone();
     // Anchor this pipeline's running time onto the process-wide sender clock that video's wire PTS
     // also uses, so a viewer can line audio up with the picture (`decode/avsync.rs`).
-    let pts_offset_us = Arc::new(AtomicU64::new(sender_clock_offset_us(
-        pipeline.current_running_time().map(|t| t.useconds()).unwrap_or(0),
-        Instant::now(),
-    )));
-    let pump_task = tokio::spawn(pump_loop(pump_client, stream_id, stream, bus_stream, level.clone(), pts_offset_us.clone()));
-    let loopback_child = Arc::new(Mutex::new(loopback_child));
-    let chain = Chain { stream_id, pipeline: pipeline.clone(), loopback_child: loopback_child.clone(), pts_offset_us };
-    let link_task = tokio::spawn(link_poll_loop(source.name.clone(), loopback.node_id, linked, chain));
+    let pts_offset_us =
+        sender_clock_offset_us(pipeline.current_running_time().map(|t| t.useconds()).unwrap_or(0), Instant::now());
+    let pump_task = tokio::spawn(pump_loop(pump_client, stream_id, stream, bus_stream, level.clone(), pts_offset_us));
+    let link_task = tokio::spawn(link_poll_loop(source.name.clone(), loopback.node_id, linked));
 
     // No width/height for audio (spec's AnnounceStream fields exist for
     // video streams' benefit); 0x0 signals "not applicable".
@@ -1275,7 +1157,7 @@ pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, sour
         let _ = pipeline.set_state(gst::State::Null);
         pump_task.abort();
         link_task.abort();
-        kill_and_wait(&mut loopback_child.lock().unwrap_or_else(|p| p.into_inner()));
+        kill_and_wait(&mut loopback_child);
         return Err(e);
     }
 
@@ -1312,7 +1194,7 @@ impl Drop for AudioCaptureHandle {
         let _ = self.pipeline.set_state(gst::State::Null);
         // Unlinks the sink first (so WirePlumber does not pause the shared app, #123), then kills
         // and reaps the child (no zombie).
-        kill_and_wait(&mut self.loopback_child.lock().unwrap_or_else(|p| p.into_inner()));
+        kill_and_wait(&mut self.loopback_child);
     }
 }
 
@@ -1407,7 +1289,7 @@ impl AudioCaptureHandle {
         // Unconditional regardless of whether EOS was observed cleanly or
         // the timeout fallback fired above — "Stop Sharing Audio" must
         // never leave `pw-loopback` orphaned.
-        kill_and_wait(&mut self.loopback_child.lock().unwrap_or_else(|p| p.into_inner()));
+        kill_and_wait(&mut self.loopback_child);
 
         if let Err(e) = self.client.stop_stream(self.stream_id).await {
             tracing::warn!("error notifying relay that audio stream {} stopped: {e:#}", self.stream_id);
@@ -1491,6 +1373,9 @@ pub fn start_level_tap(node_serial: u64) -> Result<AudioLevelTapHandle> {
     let pipeline = element
         .downcast::<gst::Pipeline>()
         .map_err(|_| anyhow!("gst::parse::launch did not return a top-level Pipeline"))?;
+    // Same reason as the share (#128): on the PipeWire clock a graph change starves the tap and the
+    // dropdown meter would sag while the app is perfectly loud.
+    use_monotonic_clock(&pipeline);
 
     if let Err(e) = pipeline.set_state(gst::State::Playing).context("failed to start audio level-tap pipeline") {
         let _ = pipeline.set_state(gst::State::Null);
@@ -1569,10 +1454,11 @@ async fn pump_loop(
     mut appsink_stream: gst_app::app_sink::AppSinkStream,
     mut bus_stream: gst::bus::BusStream,
     level: AudioLevel,
-    pts_offset_us: Arc<AtomicU64>,
+    pts_offset_us: u64,
 ) {
     let mut appsink_done = false;
     let mut bus_done = false;
+    let mut dump = crate::audio_dump::Dump::open("sent", stream_id, "pkt");
 
     loop {
         if appsink_done && bus_done {
@@ -1582,7 +1468,7 @@ async fn pump_loop(
             sample = appsink_stream.next(), if !appsink_done => {
                 match sample {
                     Some(sample) => {
-                        if let Err(e) = send_encoded_sample(&client, stream_id, &sample, pts_offset_us.load(Ordering::Relaxed)) {
+                        if let Err(e) = send_encoded_sample(&client, stream_id, &sample, pts_offset_us, dump.as_mut()) {
                             tracing::warn!("dropping encoded audio packet for stream {stream_id}: {e:#}");
                         }
                     }
@@ -1653,7 +1539,13 @@ fn audio_wire_pts_us(buffer_pts_us: Option<u64>, pts_offset_us: u64, now_clock_u
 /// Encrypts, fragments, and sends one encoded Opus packet as media
 /// datagrams — same encrypt/fragment/send path as
 /// `capture.rs::send_encoded_sample`.
-fn send_encoded_sample(client: &ScreenshareClient, stream_id: u8, sample: &gst::Sample, pts_offset_us: u64) -> Result<()> {
+fn send_encoded_sample(
+    client: &ScreenshareClient,
+    stream_id: u8,
+    sample: &gst::Sample,
+    pts_offset_us: u64,
+    dump: Option<&mut crate::audio_dump::Dump>,
+) -> Result<()> {
     let buffer = sample.buffer().ok_or_else(|| anyhow!("sample had no buffer"))?;
 
     let pts_us = audio_wire_pts_us(buffer.pts().map(|t| t.useconds()), pts_offset_us, sender_clock_us(Instant::now()));
@@ -1665,6 +1557,9 @@ fn send_encoded_sample(client: &ScreenshareClient, stream_id: u8, sample: &gst::
 
     let map = buffer.map_readable().context("failed to map encoded Opus packet")?;
     let payload = map.as_slice();
+    if let Some(d) = dump {
+        d.packet(pts_us, payload);
+    }
 
     let nonce_seq = client.nonce_sequence();
     let (nonce, counter) = nonce_seq
@@ -1885,33 +1780,25 @@ mod tests {
         assert!(caps.starts_with("audio/x-opus"), "{caps}");
     }
 
-    /// Task #117: a stream that comes back after a gap is linked into a rebuilt loopback, once; a
-    /// stream that merely replaces another one (another stays linked) and a failed link do not
-    /// rebuild. Driven with the same `link_diff` the poll uses.
+    /// Task #128, the root cause: the capture pipeline must not run on the clock its `pipewiresrc`
+    /// provides (it steps on every driver/rate/quantum change and starves the capture for good).
+    /// Built with the real `pipewiresrc` description; in `Null` nothing connects to PipeWire.
     #[test]
-    fn a_stream_reappearing_after_a_gap_rebuilds_the_loopback_once() {
-        use std::collections::HashSet;
-        let set = |v: &[u32]| v.iter().copied().collect::<HashSet<u32>>();
-        // One poll tick: (gap, linked) in, (gap, rebuild) out, `ports` = nodes whose ports exist.
-        let tick = |gap: bool, matching: &[u32], linked: &HashSet<u32>, ports: &[u32]| {
-            let (to_add, kept) = link_diff(matching, linked);
-            let linkable = to_add.iter().any(|id| ports.contains(id));
-            gap_decision(gap, kept.is_empty(), linkable)
-        };
-        // Floorp playing and linked: nothing to do.
-        assert_eq!(tick(false, &[82], &set(&[82]), &[82]), (false, false));
-        // Muted: the node is gone, nothing linked. Gap noted, no node to link yet.
-        assert_eq!(tick(false, &[], &set(&[82]), &[]), (true, false));
-        assert_eq!(tick(true, &[], &set(&[]), &[]), (true, false));
-        // Unmuted: a new node, not linkable until it has ports...
-        assert_eq!(tick(true, &[90], &set(&[]), &[]), (true, false));
-        // ...then rebuild (the caller clears the gap and starts from the rebuilt linked set).
-        assert_eq!(tick(true, &[90], &set(&[]), &[90]), (true, true));
-        assert_eq!(tick(false, &[90], &set(&[90]), &[90]), (false, false));
-        // One of two tabs closes and a third opens: the loopback never went empty, no rebuild.
-        assert_eq!(tick(false, &[11, 12], &set(&[10, 11]), &[11, 12]), (false, false));
-        // Started with the app absent (gap from the start): rebuild when it shows up.
-        assert_eq!(tick(true, &[5], &set(&[]), &[5]), (true, true));
+    fn the_capture_pipeline_runs_on_the_monotonic_system_clock() {
+        ensure_gstreamer_initialized().unwrap();
+        let BuiltPipeline { pipeline, .. } = build_pipeline(42, "ssshare-sink-test-cap", 1.0, false).expect("chain builds");
+        assert!(pipeline.pipeline_flags().contains(gst::PipelineFlags::FIXED_CLOCK), "a fixed clock, not whatever an element offers");
+        let clock = pipeline.pipeline_clock();
+        assert!(clock.is::<gst::SystemClock>(), "pipeline clock is {}", clock.name());
+        assert_eq!(clock.property::<gst::ClockType>("clock-type"), gst::ClockType::Monotonic);
+        // And it stays that clock through PLAYING (with a stand-in source).
+        let BuiltPipeline { pipeline, sink, .. } =
+            build_pipeline_from_source("audiotestsrc is-live=true", 1.0, false).expect("chain builds");
+        pipeline.set_state(gst::State::Playing).unwrap();
+        sink.try_pull_sample(gst::ClockTime::from_seconds(5)).expect("no Opus packet");
+        let clock = pipeline.clock().expect("a running pipeline has a clock");
+        let _ = pipeline.set_state(gst::State::Null);
+        assert!(clock.is::<gst::SystemClock>(), "running on {}", clock.name());
     }
 
     /// The fixture plus links `(registry id, output node, output port, input node, input port)`.
@@ -1934,11 +1821,12 @@ mod tests {
     }
 
     /// Task #123: a stream that re-creates its ports on a pause/resume (same node id) loses its
-    /// links into the sink. `missing_links` is what the poll uses to see that; it must count the
-    /// channel pairs (port-id order: source 284 = FL / 279 = FR, sink 318 = FL / 280 = FR) that
-    /// have no link, and say `None` while either side has no ports yet.
+    /// links into the sink. `missing_links` counts the channel pairs (port-id order: source 284 = FL
+    /// / 279 = FR, sink 318 = FL / 280 = FR) that have no link, `None` while either side has no
+    /// ports yet; `lost_links` is what the poll re-links (since #128 into the running chain).
     #[test]
     fn a_source_that_lost_its_links_into_the_sink_is_noticed() {
+        use std::collections::HashSet;
         // The app's node 262 (ports 284 FL, 279 FR) and the sink's node 319 (inputs 318 FL, 280 FR).
         assert_eq!(missing_links(&fixture_objects(), 262, 319), Some(2), "nothing linked yet");
         let one = fixture_with_links(&[(900, 262, 284, 319, 318)]);
@@ -1949,149 +1837,12 @@ mod tests {
         let crossed = fixture_with_links(&[(900, 262, 284, 319, 280), (901, 262, 279, 319, 318)]);
         assert_eq!(missing_links(&crossed, 262, 319), Some(2), "a crossed link is not the channel pair");
         assert_eq!(missing_links(&fixture_objects(), 12345, 319), None, "a node without ports is not linkable yet");
-        // Poll decision: a linked stream that lost its links makes the chain stale and rebuilds
-        // (the stream is in `kept`, so only `lost` can trigger it).
-        assert_eq!(gap_decision(false, false, false), (false, false), "healthy: nothing to do");
-        assert_eq!(gap_decision(false, true, true), (true, true), "lost links, ports are back: rebuild");
-        assert_eq!(gap_decision(false, true, false), (true, false), "lost links, no ports yet: wait, stay stale");
-    }
-
-    /// A pw-dump with the fixture's node 262 in `state` (and no state at all for `None`).
-    fn fixture_with_state(state: Option<&str>) -> Vec<PwObject> {
-        let mut objects = fixture_objects();
-        let node = objects.iter_mut().find(|o| o.id == 262).unwrap();
-        node.info.as_mut().unwrap().state = state.map(str::to_string);
-        objects
-    }
-
-    #[test]
-    fn node_is_running_reads_the_pw_dump_state() {
-        assert!(node_is_running(&fixture_with_state(Some("running")), 262));
-        assert!(!node_is_running(&fixture_with_state(Some("idle")), 262));
-        assert!(!node_is_running(&fixture_with_state(Some("suspended")), 262));
-        // No state reported, or the node is not in the snapshot: nothing to conclude, counts as running.
-        assert!(node_is_running(&fixture_with_state(None), 262));
-        assert!(node_is_running(&fixture_with_state(Some("idle")), 4242));
-        let parsed: Vec<PwObject> = serde_json::from_str(
-            r#"[{"id":365,"type":"PipeWire:Interface:Node","info":{"state":"idle","props":{"node.name":"Floorp"}}}]"#,
-        )
-        .unwrap();
-        assert!(!node_is_running(&parsed, 365), "info.state is parsed from the real pw-dump shape");
-    }
-
-    /// Task #125: Floorp keeps its node, ports and links when it pauses (`running` -> `idle`) and
-    /// resumes. Driven with the same `poll_decision` the poll uses, one call per 1 s tick:
-    /// `(streams, running)` of the share's name, a healthy linked set, no lost links.
-    #[test]
-    fn a_source_that_goes_idle_and_runs_again_rebuilds_the_chain_once() {
-        let mut idle = IdleWatch::default();
-        let mut gap = false;
-        // One poll tick; returns whether it rebuilt (and applies the rebuild like the loop does).
-        let mut tick = |streams: usize, running: usize| {
-            let (g, rebuild) = poll_decision(&mut idle, gap, false, false, false, streams, running);
-            gap = g;
-            if rebuild {
-                gap = false;
-                idle.rebuilt();
-            }
-            rebuild
-        };
-        for _ in 0..5 {
-            assert!(!tick(1, 1), "playing: nothing to do");
-        }
-        // Paused: idle for several polls, no rebuild while it stays idle.
-        for _ in 0..4 {
-            assert!(!tick(1, 0), "idle: nothing to rebuild for yet");
-        }
-        // Resumed: exactly one rebuild, then quiet.
-        assert!(tick(1, 1), "running again after an idle stretch: rebuild");
-        for _ in 0..10 {
-            assert!(!tick(1, 1), "no second rebuild");
-        }
-    }
-
-    /// One of several linked sources going idle while another keeps running is not a pause (a
-    /// second tab paused while a first plays), and neither is a stream that is `idle` for a single
-    /// poll (a new stream before it runs, an app that buffers).
-    #[test]
-    fn only_all_sources_idle_for_a_while_counts_as_a_pause() {
-        let mut idle = IdleWatch::default();
-        let mut gap = false;
-        let mut tick = |streams: usize, running: usize| {
-            let (g, rebuild) = poll_decision(&mut idle, gap, false, false, false, streams, running);
-            gap = g;
-            if rebuild {
-                gap = false;
-                idle.rebuilt();
-            }
-            usize::from(rebuild)
-        };
-        let mut rebuilds = 0;
-        // Two tabs, one pauses and resumes while the other plays all along.
-        for running in [2, 1, 1, 1, 1, 2, 2, 2] {
-            rebuilds += tick(2, running);
-        }
-        // A single idle poll (buffering blip, or a node on its way to running).
-        for running in [1, 0, 1, 1, 1] {
-            rebuilds += tick(1, running);
-        }
-        // No stream at all (the #117 path owns that, not the idle rule).
-        for _ in 0..3 {
-            rebuilds += tick(0, 0);
-        }
-        assert_eq!(rebuilds, 0);
-        // A real pause of both tabs, then one resumes: rebuild.
-        for (streams, running) in [(2, 0), (2, 0), (2, 0), (2, 1)] {
-            rebuilds += tick(streams, running);
-        }
-        assert_eq!(rebuilds, 1);
-    }
-
-    /// A source that flaps idle/running every few seconds costs at most one rebuild per cooldown,
-    /// and the wish is not lost: it fires once the cooldown is over.
-    #[test]
-    fn a_flapping_source_rebuilds_a_bounded_number_of_times() {
-        let mut idle = IdleWatch::default();
-        let mut gap = false;
-        let mut rebuilds = 0u32;
-        let ticks = 120u32;
-        for t in 0..ticks {
-            // 2 s idle, 1 s running, repeat.
-            let running = usize::from(t % 3 == 2);
-            let (g, rebuild) = poll_decision(&mut idle, gap, false, false, false, 1, running);
-            gap = g;
-            if rebuild {
-                gap = false;
-                idle.rebuilt();
-                rebuilds += 1;
-            }
-        }
-        // Every flap would be 40 rebuilds; the cooldown bounds it to one per cooldown window.
-        assert!(rebuilds >= 1, "still rebuilds");
-        assert!(rebuilds <= ticks / REBUILD_COOLDOWN_TICKS, "bounded: {rebuilds}");
-        // A resume inside the cooldown is remembered and rebuilt for when it ends.
-        let mut idle = IdleWatch::default();
-        idle.rebuilt();
-        let mut fired_at = None;
-        for t in 0..20u32 {
-            // idle for 2 polls, then running for good
-            let running = usize::from(t >= 2);
-            if idle.tick(1, running) && fired_at.is_none() {
-                fired_at = Some(t);
-            }
-        }
-        assert_eq!(fired_at, Some(REBUILD_COOLDOWN_TICKS - 1), "deferred to the end of the cooldown");
-    }
-
-    /// The other triggers still work next to the idle rule: a lost link or a vanished stream
-    /// rebuilds with every stream running, and the idle rule never rebuilds with nothing to link.
-    #[test]
-    fn the_idle_rule_leaves_the_other_triggers_alone() {
-        let mut idle = IdleWatch::default();
-        assert_eq!(poll_decision(&mut idle, false, false, true, false, 1, 1), (true, true), "lost links (#123)");
-        assert_eq!(poll_decision(&mut idle, false, true, false, true, 1, 1), (true, true), "vanished + new stream (#117)");
-        let mut idle = IdleWatch::default();
-        assert_eq!(poll_decision(&mut idle, true, true, false, false, 0, 0), (true, false), "gap, nothing to link yet");
+        // What the poll re-links: linked streams with ports and a missing pair, nothing else.
+        let linked: HashSet<u32> = [262, 12345].into_iter().collect();
+        assert_eq!(lost_links(&fixture_objects(), &linked, 319), vec![262], "lost both links");
+        assert_eq!(lost_links(&one, &linked, 319), vec![262], "half linked: completed");
+        assert!(lost_links(&both, &linked, 319).is_empty(), "healthy: nothing to do");
+        assert!(lost_links(&both, &HashSet::new(), 319).is_empty(), "only streams we linked");
     }
 
     /// `links_into_node` finds the links that feed the sink and ignores the monitor link out of it
@@ -2103,29 +1854,6 @@ mod tests {
         assert_eq!(links_into_node(&objects, 319), vec![900, 901]);
         assert_eq!(links_into_node(&objects, 700), vec![701]);
         assert!(links_into_node(&fixture_objects(), 319).is_empty());
-    }
-
-    /// The rebuild stops the capture pipeline, changes the source's properties and starts it again
-    /// (task #117). The appsink must keep delivering and the running time restarts at 0, which is
-    /// why `rebuild_chain` re-anchors the wire PTS offset. `audiotestsrc` stands in for
-    /// `pipewiresrc`, which `pipeline_description` callers also name `src`.
-    #[test]
-    fn the_pipeline_delivers_again_after_a_null_playing_restart() {
-        ensure_gstreamer_initialized().unwrap();
-        let BuiltPipeline { pipeline, sink, .. } =
-            build_pipeline_from_source("audiotestsrc name=src is-live=true samplesperbuffer=960", 1.0, false).expect("chain builds");
-        let pull = || sink.try_pull_sample(gst::ClockTime::from_seconds(5)).expect("no Opus packet");
-        pipeline.set_state(gst::State::Playing).unwrap();
-        for _ in 0..30 {
-            pull();
-        }
-        let late_pts = pull().buffer().unwrap().pts().unwrap();
-        pipeline.set_state(gst::State::Null).unwrap();
-        pipeline.by_name("src").unwrap().set_property("freq", 880.0f64);
-        pipeline.set_state(gst::State::Playing).unwrap();
-        let first = pull().buffer().unwrap().pts().unwrap();
-        let _ = pipeline.set_state(gst::State::Null);
-        assert!(first < late_pts, "running time restarts at 0 after Null: {first} vs {late_pts}");
     }
 
     /// A share that replaces a muted one (source switch, reconnect) starts muted, and the mute is
@@ -2797,7 +2525,7 @@ mod tests {
         // like a real share would.
         tokio::time::sleep(Duration::from_secs(1)).await;
 
-        let loopback_pid = handle.loopback_child.lock().unwrap().id();
+        let loopback_pid = handle.loopback_child.id();
         eprintln!("[audio-stop-test] pw-loopback pid={loopback_pid}; calling stop()");
 
         let stop_started = Instant::now();

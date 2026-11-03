@@ -116,4 +116,4 @@ never `pkill` by name (it matches other workers' processes), only recorded proce
 
 ## vm-audio/ (real audio tests, inside the test VMs only)
 
-Scripts for the shared-audio soak in the `arch-ssd` / `fedora-ssd` VMs (`host-run.sh`, `vm-sync.sh` on the host; `soak.sh`, `ff-setup.sh`, `fakehw.sh`, `watch.py`, `analyze.py`, `summary.py` in the VM or on its recordings). Never run on the host (no audio streams there). Method: `superdoc/claude-instructions/testing-and-verification.md` "Audio tests in the VMs".
+Scripts for the shared-audio soak in the `arch-ssd` / `fedora-ssd` VMs (`host-run.sh`, `vm-sync.sh` on the host; `soak.sh`, `ff-setup.sh`, `fakehw.sh`, `emu_src.py`, `watch.py`, `probe.py` + `probe-run.sh` (the capture chain alone under graph changes, #128), `probe-view.py` + `probe-view-run.sh` (the viewer's playback tail) in the VM; `analyze.py`, `summary.py`, `phases.py`, `pps.py`, `pktdump.py` (decodes an `SSS_AUDIO_DUMP` packet file) on the recordings). Never run on the host (no audio streams there). Method: `superdoc/claude-instructions/testing-and-verification.md` "Audio tests in the VMs".

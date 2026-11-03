@@ -185,10 +185,13 @@
 //! `frame_id`s whenever anything else is also being sent, which makes
 //! `frame_id` useless for telling a real gap apart from "video sent three
 //! frames in between". `pts` has none of that problem: it comes from
-//! `opusenc`'s own output buffers, so it is per-stream, monotonic, and
-//! advances by exactly one Opus frame duration per packet. It gives
+//! `opusenc`'s own output buffers, so it is per-stream and monotonic, and
+//! advances by about one Opus frame duration per packet. It gives
 //! ordering *and* gap detection from one field `DecryptedMediaFrame`
 //! already carries — which is why no `net.rs` change was needed here.
+//! "About": a sender's PTS can step short by a few ms when its capture
+//! re-times itself, so the *length* of each packet is taken from the packet
+//! (its Opus TOC byte), never inferred from PTS steps (task #128).
 //!
 //! The jitter buffer's own sizing/latency rationale lives on
 //! [`AudioJitterBuffer`], next to the constants it uses.
@@ -1191,17 +1194,40 @@ const AUDIO_JITTER_MAX_DEPTH: usize = 8;
 /// remaining hole is simply left in the timeline for the sink to handle.
 const AUDIO_MAX_CONCEAL_SLOTS: u64 = 5;
 
-/// Assumed Opus frame duration until a real one has been observed. This is
-/// what `audio.rs`'s sender actually produces: it builds `opusenc` with no
-/// `frame-size` override, and `gst-inspect-1.0 opusenc` reports that
-/// property's default as `20` (ms).
+/// Duration assumed for a packet whose TOC byte cannot be read (empty or malformed). This is what
+/// `audio.rs`'s sender actually produces: it builds `opusenc` with no `frame-size` override, and
+/// `gst-inspect-1.0 opusenc` reports that property's default as `20` (ms); the browser sender
+/// encodes 20 ms frames too.
 const AUDIO_DEFAULT_FRAME_DURATION_US: u64 = 20_000;
 
-/// How many recent PTS deltas [`AudioJitterBuffer`] keeps to infer the
-/// sender's Opus frame duration from. Bounded (rather than an all-time
-/// minimum) so one anomalous small delta can't poison gap detection
-/// forever — it ages out after this many packets.
-const AUDIO_FRAME_DURATION_WINDOW: usize = 16;
+/// The audio duration of one Opus packet in microseconds, read from its TOC byte (RFC 6716 section
+/// 3.1: the configuration gives the frame size, the code the number of frames). `None` for an empty
+/// or malformed packet (no frames, or more than the 120 ms a packet may hold).
+///
+/// `Why (task #128):` the jitter buffer used to *infer* the frame duration as the minimum of the
+/// last 16 PTS steps. One short step from the sender (a timestamp correction when its PipeWire graph
+/// changed quantum or rate: 5.1 ms and 0.9 ms were measured) set it to a few ms; from then on every
+/// normal 20 ms step looked like a hole of three or more lost frames, so each packet was held 40 ms
+/// and 2 to 5 `GAP`s of concealment were inserted per packet (100-250 a second, measured), and since
+/// concealed steps are never recorded the estimate never recovered: garbled audio about 2.7 % low
+/// with clicks, for good, until a new stream (a re-select) replaced the decoder. The packet itself
+/// says how long it is, so nothing has to be guessed.
+fn opus_packet_duration_us(packet: &[u8]) -> Option<u64> {
+    let toc = *packet.first()?;
+    let config = toc >> 3;
+    let frame_us: u64 = match config {
+        0..=11 => [10_000, 20_000, 40_000, 60_000][usize::from(config % 4)], // SILK
+        12..=15 => [10_000, 20_000][usize::from(config % 2)],                // Hybrid
+        _ => [2_500, 5_000, 10_000, 20_000][usize::from(config % 4)],        // CELT
+    };
+    let frames: u64 = match toc & 0b11 {
+        0 => 1,
+        1 | 2 => 2,
+        _ => u64::from(*packet.get(1)? & 0x3F),
+    };
+    let total = frame_us * frames;
+    (1..=120_000).contains(&total).then_some(total)
+}
 
 /// A backwards PTS jump larger than this is read as the sender having
 /// restarted its capture session (a new `audio.rs` `start` origin), not as
@@ -1212,6 +1238,8 @@ const AUDIO_PTS_DISCONTINUITY_US: u64 = 1_000_000;
 /// One Opus packet waiting its turn in [`AudioJitterBuffer`].
 struct PendingAudioPacket {
     data: Vec<u8>,
+    /// Audio duration of the packet ([`opus_packet_duration_us`]).
+    duration_us: u64,
     /// When this packet entered the buffer — the reference point for its
     /// [`AUDIO_JITTER_MAX_HOLD`] deadline. Deliberately per-packet rather
     /// than a single buffer-wide deadline, so a packet that arrives while
@@ -1276,9 +1304,16 @@ enum AudioAction {
 /// Every input is bounded: at most [`AUDIO_JITTER_MAX_DEPTH`] packets held
 /// (the head is force-released past that, see [`Self::drain`]), at most
 /// [`AUDIO_JITTER_MAX_HOLD`] of delay per packet, at most
-/// [`AUDIO_MAX_CONCEAL_SLOTS`] concealment events per hole, and at most
-/// [`AUDIO_FRAME_DURATION_WINDOW`] remembered deltas. Nothing here grows
+/// [`AUDIO_MAX_CONCEAL_SLOTS`] concealment events per hole. Nothing here grows
 /// with stream length or with how badly the network is behaving.
+///
+/// # Slots come from the packets, not from the timestamps
+///
+/// Whether a packet follows the last one or leaves a hole is judged against where the last one
+/// *ends*: its PTS plus its own audio duration, read from its Opus TOC byte
+/// ([`opus_packet_duration_us`]). Until task #128 the duration was inferred as the smallest of
+/// the last 16 PTS steps, and one short step from the sender poisoned it for good (see that
+/// function's doc for the measurement).
 struct AudioJitterBuffer {
     /// Held packets keyed by `pts_us`. `BTreeMap` (not a ring/`VecDeque`)
     /// because the whole job is "release in PTS order regardless of
@@ -1289,62 +1324,20 @@ struct AudioJitterBuffer {
     /// `pts_us` of the last packet handed to `appsrc`; `None` before the
     /// first one (and again after a discontinuity reset).
     last_released_pts: Option<u64>,
-    /// Sliding window of recent *contiguous* release-to-release PTS
-    /// deltas. The minimum of these is the inferred Opus frame duration —
-    /// see [`Self::frame_duration_us`].
-    recent_deltas: VecDeque<u64>,
+    /// Audio duration of that packet: where it ends, and the slot size a hole after it is counted in.
+    last_released_duration_us: u64,
 }
 
 impl AudioJitterBuffer {
     fn new() -> Self {
-        Self {
-            pending: BTreeMap::new(),
-            last_released_pts: None,
-            recent_deltas: VecDeque::new(),
-        }
+        Self { pending: BTreeMap::new(), last_released_pts: None, last_released_duration_us: AUDIO_DEFAULT_FRAME_DURATION_US }
     }
 
     fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }
 
-    /// The sender's Opus frame duration, inferred as the smallest delta
-    /// seen between consecutive released packets in the recent past.
-    ///
-    /// Inferred rather than hardcoded to [`AUDIO_DEFAULT_FRAME_DURATION_US`]
-    /// because the whole gap-detection scheme is "how many frame-sized
-    /// slots fit in this hole", which silently produces nonsense if the
-    /// assumed slot size is wrong — and `opusenc`'s `frame-size` is a
-    /// property `audio.rs` could plausibly start setting one day (2.5, 5,
-    /// 10, 20, 40 or 60 ms are all legal). Taking the *minimum* is what
-    /// makes this work at all under loss: a hole inflates a delta to a
-    /// multiple of the frame duration, never to less than it, so lossy
-    /// deltas can only ever be ignored by a `min`, not mistaken for the
-    /// truth.
-    fn frame_duration_us(&self) -> u64 {
-        self.recent_deltas
-            .iter()
-            .copied()
-            .min()
-            .unwrap_or(AUDIO_DEFAULT_FRAME_DURATION_US)
-    }
-
-    fn record_delta(&mut self, delta_us: u64) {
-        // Clamp to the range of legal Opus frame sizes (2.5 ms .. 60 ms):
-        // a delta outside it is measurement noise or a discontinuity, and
-        // letting it into the window would skew every later gap count.
-        let delta = delta_us.clamp(2_500, 60_000);
-        self.recent_deltas.push_back(delta);
-        while self.recent_deltas.len() > AUDIO_FRAME_DURATION_WINDOW {
-            self.recent_deltas.pop_front();
-        }
-    }
-
-    /// Forget the current timeline (used on a PTS discontinuity). The
-    /// learned frame duration is deliberately *kept*: it is a property of
-    /// the sender's encoder configuration, not of the timeline, so a
-    /// capture restart is no reason to re-enter the bootstrap window
-    /// during which gaps go undetected.
+    /// Forget the current timeline (used on a PTS discontinuity).
     fn reset_timeline(&mut self) {
         self.pending.clear();
         self.last_released_pts = None;
@@ -1383,7 +1376,8 @@ impl AudioJitterBuffer {
             return self.drain(now);
         }
 
-        self.pending.insert(pts_us, PendingAudioPacket { data, arrived: now });
+        let duration_us = opus_packet_duration_us(&data).unwrap_or(AUDIO_DEFAULT_FRAME_DURATION_US);
+        self.pending.insert(pts_us, PendingAudioPacket { data, duration_us, arrived: now });
         self.drain(now)
     }
 
@@ -1402,6 +1396,7 @@ impl AudioJitterBuffer {
         let mut out = Vec::with_capacity(self.pending.len());
         while let Some((pts_us, packet)) = self.pending.pop_first() {
             self.last_released_pts = Some(pts_us);
+            self.last_released_duration_us = packet.duration_us;
             out.push(AudioAction::Push { pts_us, data: packet.data });
         }
         out
@@ -1426,17 +1421,18 @@ impl AudioJitterBuffer {
                 continue;
             };
 
-            let frame = self.frame_duration_us();
-            // `pts > last` is guaranteed: `insert` drops anything at or
-            // below `last_released_pts` before it can be queued.
-            let delta = pts - last;
+            // The slot size is the last released packet's own duration (its TOC byte, task #128),
+            // so nothing about the grid is guessed; `end` is where that packet's audio stops.
+            let slot = self.last_released_duration_us;
+            let end = last + slot;
 
-            // Treat the packet as contiguous if it lands within one and a
-            // half frame durations of the last release — half a frame of
-            // slack absorbs any non-exact timestamping without ever
-            // reaching the next real slot.
-            if delta <= frame + frame / 2 {
-                self.record_delta(delta);
+            // Treat the packet as contiguous if it starts within half a slot of where the last
+            // one ended. Half a slot of slack absorbs non-exact timestamping without ever reaching
+            // the next real slot; a packet that starts *before* `end` (the sender corrected its
+            // timestamps backwards by a few ms) is contiguous too: the decoder plays the samples
+            // back to back. (`pts > last` is guaranteed: `insert` drops anything at or below
+            // `last_released_pts` before it can be queued.)
+            if pts <= end + slot / 2 {
                 self.release(pts, &mut out);
                 continue;
             }
@@ -1450,37 +1446,12 @@ impl AudioJitterBuffer {
                 break;
             }
 
-            // Bootstrap: with no delta observed yet, `frame` is still only
-            // [`AUDIO_DEFAULT_FRAME_DURATION_US`], a guess — and this
-            // branch is precisely the case where the guess disagrees with
-            // reality. Converting a guess into a slot count would be
-            // circular (a legitimate 40 ms-frame stream would look like an
-            // unbroken run of 20 ms losses, and, because concealed deltas
-            // are never recorded, it would never learn otherwise). So the
-            // first delta of a timeline is *defined* to be the frame
-            // duration and is never concealed. The cost is one hold
-            // (≤ 40 ms) at stream start, and only when the very first
-            // delta isn't the assumed 20 ms; note the packet was still
-            // held first, so a merely-reordered second packet is repaired
-            // normally rather than mislearned.
-            if self.recent_deltas.is_empty() {
-                self.record_delta(delta);
-                self.release(pts, &mut out);
-                continue;
-            }
-
             // Give up on the missing packet(s) and tell `opusdec`, so the
             // hole is filled with concealment rather than with nothing.
-            let missing = (delta / frame).saturating_sub(1).min(AUDIO_MAX_CONCEAL_SLOTS);
-            for slot in 0..missing {
-                out.push(AudioAction::Conceal {
-                    pts_us: last + (slot + 1) * frame,
-                    duration_us: frame,
-                });
+            let missing = ((pts - end) / slot).min(AUDIO_MAX_CONCEAL_SLOTS);
+            for k in 0..missing {
+                out.push(AudioAction::Conceal { pts_us: end + k * slot, duration_us: slot });
             }
-            // Deliberately *not* `record_delta(delta)`: this delta is
-            // inflated by the hole, so feeding it to the frame-duration
-            // estimator would only ever make the estimate worse.
             self.release(pts, &mut out);
         }
 
@@ -1494,6 +1465,7 @@ impl AudioJitterBuffer {
             .remove(&pts)
             .expect("release is only ever called for a pts just observed in `pending`");
         self.last_released_pts = Some(pts);
+        self.last_released_duration_us = packet.duration_us;
         out.push(AudioAction::Push { pts_us: pts, data: packet.data });
     }
 }
@@ -1539,6 +1511,8 @@ pub struct AudioDecoder {
     /// Joined to the sender's video decoder through the first packet's `ConnId`; supplies the
     /// delay that keeps this audio aligned with the picture. See `decode/avsync.rs`.
     av_sync: Option<Arc<AvSync>>,
+    /// `SSS_AUDIO_DUMP` debug dump of every received packet (`audio_dump.rs`); `None` normally.
+    dump: Option<crate::audio_dump::Dump>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -1566,13 +1540,22 @@ impl AudioDecoder {
         let thread = thread::Builder::new()
             .name(format!("audio-decode-stream-{stream_id}"))
             .spawn(move || {
-                if let Err(e) = run_audio_pipeline(rx, &sink_factory, sink_sync, pipeline_alive) {
+                let log = crate::audio_dump::Dump::open("play", stream_id, "log");
+                if let Err(e) = run_audio_pipeline(rx, &sink_factory, sink_sync, pipeline_alive, log) {
                     tracing::error!("audio decode pipeline for stream {stream_id} exited with error: {e:#}");
                 }
             })
             .context("failed to spawn audio decode pipeline thread")?;
 
-        Ok(Self { stream_id, tx, alive, packets_received: Arc::new(AtomicU64::new(0)), av_sync: None, thread: Some(thread) })
+        Ok(Self {
+            stream_id,
+            tx,
+            alive,
+            packets_received: Arc::new(AtomicU64::new(0)),
+            av_sync: None,
+            dump: crate::audio_dump::Dump::open("recv", stream_id, "pkt"),
+            thread: Some(thread),
+        })
     }
 
     pub fn stream_id(&self) -> StreamId {
@@ -1634,6 +1617,9 @@ impl AudioDecoder {
             return;
         }
         self.packets_received.fetch_add(1, Ordering::Relaxed);
+        if let Some(d) = self.dump.as_mut() {
+            d.packet(frame.pts, &frame.payload);
+        }
         let sync = self.av_sync.get_or_insert_with(|| AvSync::for_peer(frame.conn_id));
         sync.note_audio(Instant::now(), frame.pts);
         let target_delay_us = sync.target_audio_delay_us();
@@ -1705,6 +1691,7 @@ fn run_audio_pipeline(
     sink_factory: &str,
     sink_sync: bool,
     alive: Arc<AtomicBool>,
+    log: Option<crate::audio_dump::Dump>,
 ) -> Result<()> {
     let pipeline = Pipeline::new();
 
@@ -1766,7 +1753,7 @@ fn run_audio_pipeline(
     alive.store(true, Ordering::Relaxed);
 
     let volume_element = volume;
-    let result = pump_audio_loop(&rx, &appsrc, &volume_element, &bus);
+    let result = pump_audio_loop(&rx, &appsrc, &volume_element, &bus, log);
 
     alive.store(false, Ordering::Relaxed);
     let _ = appsrc.end_of_stream();
@@ -1790,7 +1777,13 @@ const AUDIO_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// `volume` element, and drains the bus for error/warning logging in
 /// between, until told to shut down. Mirrors the video pipeline thread's feed loop (`video::run`), plus the
 /// jitter buffer (which video does not need — see the module docs).
-fn pump_audio_loop(rx: &std_mpsc::Receiver<AudioPipelineMsg>, appsrc: &AppSrc, volume: &Element, bus: &Bus) -> Result<()> {
+fn pump_audio_loop(
+    rx: &std_mpsc::Receiver<AudioPipelineMsg>,
+    appsrc: &AppSrc,
+    volume: &Element,
+    bus: &Bus,
+    mut log: Option<crate::audio_dump::Dump>,
+) -> Result<()> {
     // Both owned outright by this thread — see the module docs' audio
     // "Threading" note for why they need no lock.
     let mut jitter = AudioJitterBuffer::new();
@@ -1813,13 +1806,13 @@ fn pump_audio_loop(rx: &std_mpsc::Receiver<AudioPipelineMsg>, appsrc: &AppSrc, v
             Ok(AudioPipelineMsg::Packet { pts_us, data, target_delay_us }) => {
                 timeline.set_delay_us(delay.update(target_delay_us, clock.elapsed().as_micros() as i64));
                 let actions = jitter.insert(pts_us, data, Instant::now());
-                apply_audio_actions(appsrc, &mut timeline, actions);
+                apply_audio_actions(appsrc, &mut timeline, actions, &mut log);
             }
             Ok(AudioPipelineMsg::SetVolume(v)) => {
                 volume.set_property("volume", v);
             }
             Ok(AudioPipelineMsg::Shutdown) => {
-                apply_audio_actions(appsrc, &mut timeline, jitter.flush());
+                apply_audio_actions(appsrc, &mut timeline, jitter.flush(), &mut log);
                 return Ok(());
             }
             Err(std_mpsc::RecvTimeoutError::Timeout) => {
@@ -1827,10 +1820,10 @@ fn pump_audio_loop(rx: &std_mpsc::Receiver<AudioPipelineMsg>, appsrc: &AppSrc, v
                 // stream be noticed at all, since no packet arrives to
                 // drive `insert`.
                 let actions = jitter.tick(Instant::now());
-                apply_audio_actions(appsrc, &mut timeline, actions);
+                apply_audio_actions(appsrc, &mut timeline, actions, &mut log);
             }
             Err(std_mpsc::RecvTimeoutError::Disconnected) => {
-                apply_audio_actions(appsrc, &mut timeline, jitter.flush());
+                apply_audio_actions(appsrc, &mut timeline, jitter.flush(), &mut log);
                 return Ok(());
             }
         }
@@ -1988,7 +1981,12 @@ fn running_time_us(element: &AppSrc) -> u64 {
 /// optional). Kept as thin as possible so essentially all of the logic
 /// stays in the pipeline-free, unit-tested [`AudioJitterBuffer`] and
 /// [`AudioTimeline`].
-fn apply_audio_actions(appsrc: &AppSrc, timeline: &mut AudioTimeline, actions: Vec<AudioAction>) {
+fn apply_audio_actions(
+    appsrc: &AppSrc,
+    timeline: &mut AudioTimeline,
+    actions: Vec<AudioAction>,
+    log: &mut Option<crate::audio_dump::Dump>,
+) {
     if actions.is_empty() {
         return;
     }
@@ -2001,6 +1999,9 @@ fn apply_audio_actions(appsrc: &AppSrc, timeline: &mut AudioTimeline, actions: V
         match action {
             AudioAction::Push { pts_us, data } => {
                 let mapped_pts_us = timeline.map_push(pts_us, now_us);
+                if let Some(l) = log.as_mut() {
+                    l.line(format_args!("push pts={pts_us} mapped={mapped_pts_us} now={now_us} len={}", data.len()));
+                }
                 let mut buffer = Buffer::from_slice(data);
                 if let Some(buffer_mut) = buffer.get_mut() {
                     buffer_mut.set_pts(ClockTime::from_useconds(mapped_pts_us));
@@ -2017,6 +2018,9 @@ fn apply_audio_actions(appsrc: &AppSrc, timeline: &mut AudioTimeline, actions: V
                 }
             }
             AudioAction::Conceal { pts_us, duration_us } => {
+                if let Some(l) = log.as_mut() {
+                    l.line(format_args!("gap pts={pts_us} dur={duration_us} now={now_us}"));
+                }
                 let Some(mapped_pts_us) = timeline.map_gap(pts_us) else {
                     tracing::debug!("skipping GAP at pts={pts_us}: no audio timeline established yet");
                     continue;
@@ -3125,9 +3129,10 @@ mod tests {
     // separately by `gap_event_makes_opusdec_conceal_a_missing_packet`.
     // -----------------------------------------------------------------
 
-    /// Distinguishable stand-in payload; the buffer never looks inside it.
+    /// Distinguishable stand-in payload. The buffer reads only its first byte, the Opus TOC: 0xF8
+    /// is a 20 ms CELT fullband packet (what `opusenc` sends by default).
     fn opus_stub(tag: u8) -> Vec<u8> {
-        vec![tag; 4]
+        vec![0xF8, tag, tag, tag]
     }
 
     fn pushed(actions: &[AudioAction]) -> Vec<u64> {
@@ -3330,55 +3335,90 @@ mod tests {
             "a restart is a discontinuity, not a 500-second hole to conceal"
         );
 
-        // And the new timeline continues normally, with the frame duration
-        // learned from the old one carried over (no second bootstrap).
+        // And the new timeline continues normally.
         let actions = buffer.insert(20_000, opus_stub(1), t0 + Duration::from_millis(520));
         assert_eq!(pushed(&actions), vec![20_000]);
         assert!(concealed(&actions).is_empty());
     }
 
-    /// The frame duration is inferred, not hardcoded: a sender configured
-    /// with `opusenc frame-size=40` must not have every one of its packets
-    /// read as a 20ms loss. Costs one bootstrap hold at stream start, then
-    /// gap detection works on the real 40ms grid.
+    /// A sender with another frame size (`opusenc frame-size=40`, or two 20 ms frames per packet)
+    /// is on its own grid from the first packet: the duration is in each packet's TOC byte, so
+    /// there is no bootstrap and no guessing (task #128).
     #[test]
-    fn jitter_learns_a_frame_duration_other_than_the_20ms_default() {
+    fn jitter_reads_a_frame_duration_other_than_20ms_from_the_packets() {
         let mut buffer = AudioJitterBuffer::new();
         let t0 = Instant::now();
+        // TOC 0xF9: CELT fullband 20 ms, code 1 = two frames, 40 ms per packet.
+        let p40 = |tag: u8| vec![0xF9, tag, tag];
 
-        assert_eq!(pushed(&buffer.insert(0, opus_stub(0), t0)), vec![0]);
-
-        // 40ms delta doesn't match the assumed 20ms grid, so it's held
-        // first (it could be a reorder) and then accepted as the real frame
-        // duration — never concealed, since nothing has been learned yet.
-        assert!(buffer.insert(40_000, opus_stub(1), t0).is_empty());
-        let actions = buffer.tick(t0 + AUDIO_JITTER_MAX_HOLD);
+        assert_eq!(pushed(&buffer.insert(0, p40(0), t0)), vec![0]);
+        // A 40ms step is contiguous at once (no hold, no bootstrap).
+        let actions = buffer.insert(40_000, p40(1), t0);
         assert_eq!(pushed(&actions), vec![40_000]);
-        assert!(
-            concealed(&actions).is_empty(),
-            "the first delta of a stream defines the frame duration; it must not be mistaken for a loss"
-        );
-        assert_eq!(buffer.frame_duration_us(), 40_000, "the 40ms frame duration should now be learned");
-
-        // On the learned grid, a further 40ms step is contiguous...
-        let t1 = t0 + AUDIO_JITTER_MAX_HOLD;
-        let actions = buffer.insert(80_000, opus_stub(2), t1);
-        assert_eq!(pushed(&actions), vec![80_000]);
         assert!(concealed(&actions).is_empty());
 
-        // ...and an 80ms step is exactly one missing 40ms slot, not two
-        // missing 20ms ones.
-        assert!(buffer.insert(160_000, opus_stub(4), t1).is_empty());
-        let actions = buffer.tick(t1 + AUDIO_JITTER_MAX_HOLD);
+        // An 80 ms step is exactly one missing 40 ms slot, not three missing 20 ms ones.
+        assert!(buffer.insert(120_000, p40(3), t0).is_empty());
+        let actions = buffer.tick(t0 + AUDIO_JITTER_MAX_HOLD);
         assert_eq!(
             actions,
             vec![
-                AudioAction::Conceal { pts_us: 120_000, duration_us: 40_000 },
-                AudioAction::Push { pts_us: 160_000, data: opus_stub(4) },
+                AudioAction::Conceal { pts_us: 80_000, duration_us: 40_000 },
+                AudioAction::Push { pts_us: 120_000, data: p40(3) },
             ]
         );
     }
 
+    /// Task #128, the viewer half: one short PTS step from the sender (its capture re-timed itself
+    /// when the PipeWire graph changed quantum or rate; 5.1 ms was measured) must not change how
+    /// every later packet is judged. Before, the inferred frame duration dropped to 5.1 ms and every
+    /// following 20 ms packet was held and preceded by two `GAP`s, for good.
+    #[test]
+    fn jitter_is_not_poisoned_by_a_short_pts_step() {
+        let mut buffer = AudioJitterBuffer::new();
+        let t0 = Instant::now();
+        let mut pts = 0;
+        for i in 0..20u8 {
+            assert_eq!(pushed(&buffer.insert(pts, opus_stub(i), t0)), vec![pts]);
+            pts += 20_000;
+        }
+        // The short step: this packet starts 14.9 ms before the last one ended.
+        pts -= 14_900;
+        for i in 0..200u32 {
+            let actions = buffer.insert(pts, opus_stub(i as u8), t0 + Duration::from_millis(u64::from(i) * 20));
+            assert_eq!(pushed(&actions), vec![pts], "packet {i} must be released at once");
+            assert!(concealed(&actions).is_empty(), "packet {i}: nothing was lost");
+            pts += 20_000;
+        }
+        assert!(buffer.is_empty());
+        // And a real loss after it is still one 20 ms slot.
+        assert!(buffer.insert(pts + 20_000, opus_stub(1), t0).is_empty());
+        let actions = buffer.tick(t0 + AUDIO_JITTER_MAX_HOLD);
+        assert_eq!(concealed(&actions), vec![pts]);
+    }
+
+    /// The TOC table of RFC 6716 section 3.1, and real packets from this machine's `opusenc`.
+    #[test]
+    fn opus_packet_duration_reads_the_toc_byte() {
+        assert_eq!(opus_packet_duration_us(&[0xF8, 0]), Some(20_000), "CELT FB 20 ms, one frame");
+        assert_eq!(opus_packet_duration_us(&[0xF9]), Some(40_000), "code 1: two frames");
+        assert_eq!(opus_packet_duration_us(&[0xFA]), Some(40_000), "code 2: two frames");
+        assert_eq!(opus_packet_duration_us(&[0xFB, 3]), Some(60_000), "code 3: frame count in byte 1");
+        assert_eq!(opus_packet_duration_us(&[0x80]), Some(2_500), "CELT NB 2.5 ms");
+        assert_eq!(opus_packet_duration_us(&[0x10]), Some(40_000), "SILK NB 40 ms");
+        assert_eq!(opus_packet_duration_us(&[0x18]), Some(60_000), "SILK NB 60 ms");
+        assert_eq!(opus_packet_duration_us(&[0x60]), Some(10_000), "Hybrid SWB 10 ms");
+        assert_eq!(opus_packet_duration_us(&[0x78]), Some(20_000), "Hybrid FB 20 ms");
+        assert_eq!(opus_packet_duration_us(&[]), None, "empty");
+        assert_eq!(opus_packet_duration_us(&[0xFB]), None, "code 3 without its count byte");
+        assert_eq!(opus_packet_duration_us(&[0xFB, 0]), None, "no frames");
+        assert_eq!(opus_packet_duration_us(&[0xFB, 7]), None, "140 ms is more than a packet may hold");
+        let real = encode_test_opus_clip(10);
+        assert!(!real.is_empty());
+        for p in &real {
+            assert_eq!(opus_packet_duration_us(p), Some(20_000), "opusenc defaults to 20 ms frames");
+        }
+    }
     /// A long outage must not turn into an unbounded burst of concealment
     /// events. Beyond [`AUDIO_MAX_CONCEAL_SLOTS`] the buffer accepts the
     /// discontinuity and moves on — Opus PLC has decayed to near-silence

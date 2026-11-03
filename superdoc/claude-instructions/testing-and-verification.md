@@ -198,6 +198,17 @@ Both are GNOME/Wayland desktops with PipeWire + WirePlumber, user `mo`, no sound
   another checkout (`VM_SSS='$HOME/sss-base'`). Make the fake hardware suspend when idle (`node.pause-on-idle = true`,
   `node.always-process = false` in the fakehw drop-in) to get the Dummy-Driver switch a real ALSA sink gives. A healthy
   share delivers ~50 packets/s to the viewer (`pps.py test.log`); fewer means the capture stream is not being scheduled.
+- **Graph changes, rates, dumps (task #128):** the VMs default to `clock.allowed-rates = [48000]`, the user's host to
+  `[44100, 48000]` (its hardware runs at 44.1 kHz): pass `ALLOWED="44100 48000" SRATE=44100` (emulated source at
+  44.1 kHz) or the VM never switches rate. `soak.sh ... graph` changes quantum and rate under a playing source,
+  `... vanish` destroys and re-creates the source node (EMU only). `probe.py`/`probe-run.sh MODE forcerate|pause|quantum`
+  run the share's capture chain without the app and print samples/s, PTS steps and the pipeline clock against
+  `CLOCK_MONOTONIC` (`pwclock` vs `sysclock`); `probe-view.py`/`probe-view-run.sh` do the same for the viewer's playback
+  tail. `soak.sh` sets `SSS_AUDIO_DUMP` (client/src/audio_dump.rs): `pktdump.py sent-*.pkt out.wav` decodes what the
+  sender sent, `recv-*.pkt` what the viewer received, `play-*.log` lists its `push`/`gap` actions; `phases.py viewer.wav
+  events.txt` counts bad 0.5 s windows per phase. Always compare with the share sink's own monitor (`sinkmon.wav`):
+  that is the VM's noise floor (0-3 bad windows per phase). In the VM, kill with patterns that cannot match your own
+  ssh command line (`pkill -f "[p]robe.py"`), or the ssh session kills itself.
 - **Also capture, before/after a change:** `pw-dump`, `pw-top -b -n 2`, `pw-metadata -n settings`, and the
   WirePlumber side (`WIREPLUMBER_DEBUG=s-linking.mpris:5`) when a player is paused unexpectedly.
 - **Leave the VMs as found:** remove `~/.config/pipewire/pipewire.conf.d/50-fakehw.conf` (and restart
