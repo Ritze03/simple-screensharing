@@ -781,7 +781,7 @@ mod tests {
     #[test]
     fn sampler_emits_per_window_and_a_final_line_when_the_stream_disappears() {
         let key = ([7; 16], 9, 0);
-        let route = Arc::new(crate::room::StreamRoute::new());
+        let route = Arc::new(crate::room::StreamRoute::new(true));
         let t0 = Instant::now();
         let mut s = Sampler::new(Duration::from_secs(60), t0);
 
@@ -811,8 +811,8 @@ mod tests {
     #[test]
     fn sampler_ends_the_old_window_when_a_stream_id_is_reannounced() {
         let key = ([7; 16], 9, 0);
-        let old = Arc::new(crate::room::StreamRoute::new());
-        let new = Arc::new(crate::room::StreamRoute::new());
+        let old = Arc::new(crate::room::StreamRoute::new(true));
+        let new = Arc::new(crate::room::StreamRoute::new(true));
         let t0 = Instant::now();
         let mut s = Sampler::new(Duration::from_secs(60), t0);
         old.diag.on_fragment(&dgram(0, 1, 0, 1, 100));

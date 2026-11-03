@@ -260,14 +260,38 @@ and relay -> viewer; H.264 1080p120 8300 kbps Quality, a detailed scrolling patt
 ~300 kB = 100-500 fragments), 100 s per cell; NACK off = the same binaries with `SSS_DISABLE_NACK=1` on both
 clients; evidence `evidence/` in the task scratchpad):
 
-RESULTS_TABLE
+| random loss, both legs | NACK | `never completed` | L1 requests | frozen total (longest) | fragments asked / recovered | repaired from relay cache / from sharer |
+|---|---|---|---|---|---|---|
+| 0.2 % | off | 38 | 42 | 1.4 s (1.4 s) | - | - |
+| 0.2 % | **on** | **0** | **0** | **0 s** | 335 / 335 | 161 / 174 |
+| 0.4 % | off | 31 | 37 | 4.0 s (1.7 s) | - | - |
+| 0.4 % | **on** | **0** | **0** | **0 s** | 759 / 755 | 391 / 367 |
+| 1 % | off | 57 | 55 | 19.7 s (5.3 s) | - | - |
+| 1 % | **on** | **0** | **0** | **0 s** | 1818 / 1792 | 892 / 915 |
+
+(Frozen = the viewer tile's pixels unchanged for 0.8 s. `frames_abandoned` was 0 in every "on" cell: every frame
+that lost fragments was repaired. A first "on" run with a 60 ms floor on the retry interval had one
+incident at 0.4 % (2 L1, 3.9 s frozen): a keyframe repair that had to cross the sharer's link at ~90 ms RTT
+was abandoned; the floor is now 100 ms and the rerun was clean. After merging master a 60 s run at 1 % was clean
+too: 0 / 0 / 0 s, 1185 asked, 1165 recovered.)
 
 Extra bandwidth is the retransmitted fragments: at 1 % loss ~1800 fragments in 100 s = ~1.8 MB = ~0.15
 Mbit/s (~2 % of the 7 Mbit/s stream, i.e. about the loss rate), plus 18-byte requests (~1800, negligible).
 Of the repairs about half came from the relay cache (relay -> viewer loss) and half from the sender
 (sharer -> relay loss), as expected from loss on both legs.
 
-MIXED_TABLE
+**Mixed versions** ("old" = the pre-#104 binaries built from `facc373`; 60 s, 1 % loss on both legs; frozen total,
+`never completed`):
+
+| viewer | relay | sharer | result |
+|---|---|---|---|
+| old | new | new | unchanged from old/old: 10.5 s frozen, 30 never completed; relay saw 0 requests, sent 0 duplicates |
+| new | old | new | unchanged: no HelloAck, no NACK traffic at all, 24.7 s frozen, 40 never completed (the loss run varies) |
+| new | new | old | relay cache repaired the viewer leg (347 fragments from cache), sharer-leg losses answered `Miss` at once (330) and fell back to L1: 1.8 s frozen, 25 never completed (vs ~10 s for old/old) |
+| old | old | old | baseline: 10.7 s frozen, 34 never completed |
+
+The old peers need no change and see no NACK traffic (undersized datagrams are dropped), which is the point
+of the datagram design.
 
 **Not verified**: the browser (no NACK support yet: it neither says Hello nor re-sends, so it is exactly the
 old behaviour on a new relay; a browser sharer's lost fragments get a `Miss` at once), a real internet path
