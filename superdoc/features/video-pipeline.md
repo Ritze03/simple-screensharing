@@ -289,12 +289,22 @@ Of the repairs about half came from the relay cache (relay -> viewer loss) and h
 | new | old | new | unchanged: no HelloAck, no NACK traffic at all, 24.7 s frozen, 40 never completed (the loss run varies) |
 | new | new | old | relay cache repaired the viewer leg (347 fragments from cache), sharer-leg losses answered `Miss` at once (330) and fell back to L1: 1.8 s frozen, 25 never completed (vs ~10 s for old/old) |
 | old | old | old | baseline: 10.7 s frozen, 34 never completed |
+| **browser** new | old (`facc373`) | browser new | #111, 0.3 % both legs, 30 s, ~1 MB IDRs: no HelloAck (`nackStats().active` false on both), 0 requests, **0 fps / 246 loss events: identical to `?nack=0`** (a browser viewer never recovers at this loss without NACK); nothing got worse |
+| **browser** new viewer | new | browser sharer with `?nack=0` (never says Hello) | #111, 0.5 % sharer leg: the relay answers `Miss` at once (219 fragments asked, 201 frames abandoned, 0 repaired), L1 as before, 0 fps / 190 loss events: same as NACK off |
+| **browser** viewer with `?nack=0` | new | browser sharer new | #111, 0.5 % viewer leg: never says Hello, so never gets a retransmit or a duplicate: 0 fps / 199 loss events, same as NACK off |
+| browser viewer new | new | native sharer (new) | #111 rig, 1 % on the browser's leg: 60 fps, 0 loss events (off: 2.7 fps, 306 loss events); relay cache repairs |
+| native viewer (new) | new | browser sharer new | #111 rig, 0.5 % on the browser's leg: 0 `never completed`, ~300 fragments repaired by the browser's ring; with the browser sharer on `?nack=0`: 24 `never completed`, 23 L1 recoveries, "Recovering..." at 0 fps |
 
 The old peers need no change and see no NACK traffic (undersized datagrams are dropped), which is the point
 of the datagram design.
 
-**Not verified**: the browser (no NACK support yet: it neither says Hello nor re-sends, so it is exactly the
-old behaviour on a new relay; a browser sharer's lost fragments get a `Miss` at once), a real internet path
+**The browser** (#111, 2026-11-03) now speaks it too, both as viewer and as sharer: `features/website.md` "Selective
+retransmission in the browser" (design differences are mechanical: no `connection.rtt` in Chromium 153, so a fixed 150 ms
+RTT; re-sends bypass the #103 pacing loop) with its own loss tables and the mixed rows above. Without NACK a browser
+viewer decoded **0 fps** at 0.1 % random loss with ~1 MB IDRs (no keyframe ever completes); with it 49.4 fps and 0 loss events up
+to 1 %.
+
+**Not verified**: a real internet path
 (burst loss, reordering beyond 2 fragments, RTT jitter), more than one viewer of the same stream (unit tests
 only), audio.
 

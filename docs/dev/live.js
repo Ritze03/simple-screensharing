@@ -110,6 +110,7 @@ async function runShare(client, result) {
   result.source = { generatedFps: +((src.stats.generated - srcBase.generated) / elapsed).toFixed(1) };
   result.sender = {
     ...end,
+    nack: client.nackStats(),
     capturedFps: +((end.captured - base.captured) / elapsed).toFixed(1),
     // averaged over the seconds in which a viewer was subscribed (the encoder idles before/after)
     avgEncodedFps: +(avg(samples.filter((x) => x.encodedFps > 1).map((x) => x.encodedFps)) ?? 0).toFixed(1),
@@ -141,12 +142,21 @@ async function runView(client, result) {
   const counters = [];
   let sampleBusy = false;
   let n = 0;
+  // frozen time: gaps between shown frames longer than 150 ms (only counted while measuring)
+  let lastShown = performance.now();
+  let measuring = false;
+  const stalls = [];
   const renderer = new CanvasRenderer(canvas, { preserveDrawingBuffer: true }); // toDataURL snapshot below
   // tee: sample the pattern from a clone, then render
   const watch = client.watch(info.key, {
     audio: wantAudio,
     onFrame: (frame) => {
       n++;
+      {
+        const nowT = performance.now();
+        if (measuring && nowT - lastShown > 150) stalls.push(Math.round(nowT - lastShown));
+        lastShown = nowT;
+      }
       if (pattern === "counter" && !sampleBusy && n % 4 === 0) {
         sampleBusy = true;
         const c = frame.clone();
@@ -177,12 +187,16 @@ async function runView(client, result) {
   counters.length = 0;
   const samples = [];
   const start = performance.now();
+  measuring = true;
+  lastShown = start;
   while (performance.now() - start < duration * 1000) {
     await sleep(1000);
     const s = watch.stats();
     if (!s) throw new Error("stream ended while measuring");
     samples.push({ t: Math.round(performance.now() - start), decodedFps: +s.decodedFps.toFixed(1), receivedFps: +s.receivedFps.toFixed(1), kbps: Math.round(s.bitrateKbps), bufferMs: Math.round(s.bufferMs), jitterMs: +s.jitterMs.toFixed(1) });
   }
+  measuring = false;
+  if (performance.now() - lastShown > 150) stalls.push(Math.round(performance.now() - lastShown)); // frozen right up to the end (or all along)
   const end = watch.stats();
   const elapsed = (performance.now() - start) / 1000;
   // sequence continuity from sampled counters (every 4th decoded frame): gaps = frames the sender produced that never showed up
@@ -198,6 +212,8 @@ async function runView(client, result) {
     avgKbps: +(((end.rxBytes - statsBase.rxBytes) * 8) / elapsed / 1000).toFixed(0),
     lossEvents: end.lossEvents - statsBase.lossEvents,
     droppedFramesReassembly: end.droppedFrames,
+    frozen: { stalls: stalls.length, totalMs: stalls.reduce((a, b) => a + b, 0), maxMs: Math.max(0, ...stalls), pctOfTime: +((stalls.reduce((a, b) => a + b, 0) / (elapsed * 10)).toFixed(2)) },
+    nack: client.nackStats(),
     decoderErrors: end.decoderErrors,
     decryptFailures: end.decryptFailures,
     skippedDeltas: end.skippedDeltas,

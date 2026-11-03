@@ -28,12 +28,15 @@ function parseArgs(argv) {
 
 const b64url = (b) => b.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 
-export async function runPair({ relay, hash, codec, fps, size, bitrate, duration, hw, flags, preset, extra = "", timeoutS, nativeViewer = null }) {
+export async function runPair({ relay, hash, codec, fps, size, bitrate, duration, hw, flags, preset, extra = "", timeoutS, nativeViewer = null, viewerRelay = null, sharerExtra = "", viewerExtra = "" }) {
   const [w, h] = size.split("x").map(Number);
-  const link = `${relay}|${randomBytes(16).toString("hex")}|${b64url(randomBytes(32))}${hash ? `|${hash}` : ""}`;
+  const room = `${randomBytes(16).toString("hex")}|${b64url(randomBytes(32))}${hash ? `|${hash}` : ""}`;
+  const link = `${relay}|${room}`;
+  // `viewerRelay`: the viewer joins the same room through another address (e.g. its own loss proxy, so each leg is impaired separately)
+  const viewerLink = viewerRelay ? `${viewerRelay}|${room}` : link;
   const { server, port, results, waitersResult } = await startServer({ onLog: (id, m) => process.env.VERBOSE && console.log(`[${id}] ${m}`) });
-  const common = `link=${encodeURIComponent(link)}&codec=${codec}&fps=${fps}&w=${w}&h=${h}&bitrate=${bitrate}&duration=${duration}&hw=${hw}&preset=${preset}${extra}`;
-  const url = (id, role, name) => `http://127.0.0.1:${port}${BASE}dev/live.html?id=${id}&role=${role}&name=${name}&${common}`;
+  const common = (l) => `link=${encodeURIComponent(l)}&codec=${codec}&fps=${fps}&w=${w}&h=${h}&bitrate=${bitrate}&duration=${duration}&hw=${hw}&preset=${preset}${extra}`;
+  const url = (id, role, name) => `http://127.0.0.1:${port}${BASE}dev/live.html?id=${id}&role=${role}&name=${name}&${common(role === "view" ? viewerLink : link)}${role === "view" ? viewerExtra : sharerExtra}`;
   const procs = [];
   const timeout = (timeoutS ?? Number(duration) + 70) * 1000;
   try {
@@ -41,7 +44,7 @@ export async function runPair({ relay, hash, codec, fps, size, bitrate, duration
     let nativeProc = null;
     if (nativeViewer) {
       // The native viewer (real client lib + real StreamDecoder) replaces the browser viewer: browser -> native direction.
-      nativeProc = spawn(nativeViewer, [link, "--seconds", String(Number(duration) + 8), "--owner", "sharer"], { stdio: ["ignore", "pipe", "pipe"] });
+      nativeProc = spawn(nativeViewer, [viewerLink, "--seconds", String(Number(duration) + 8), "--owner", "sharer"], { stdio: ["ignore", "pipe", "pipe"] });
       nativeProc.stdout.on("data", (d) => (nativeOut += d));
       nativeProc.stderr.on("data", (d) => process.env.VERBOSE && process.stderr.write(`[native] ${d}`));
     } else {

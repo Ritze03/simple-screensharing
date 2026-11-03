@@ -539,8 +539,13 @@ security-relevant. The relay never decrypts anything for this either.
 * **Audio is not NACKed.** An Opus packet is one fragment: there is no "hole" to detect (a lost
   single-fragment frame leaves no trace, §6.5), and a repair would arrive after its 20 ms
   playout slot; PLC conceals it.
-* Kill switch: `SSS_DISABLE_NACK=1` (native): the client never says Hello, so it neither NACKs
-  nor is asked to re-send.
+* Kill switch: `SSS_DISABLE_NACK=1` (native), `?nack=0` / `localStorage["sss-nack"]="0"` (browser, #111): the client
+  never says Hello, so it neither NACKs nor is asked to re-send.
+* **Browser (`docs/js/core/fragment.js` `Reassembler`, `nack.js` `SendRing`, #111)** follows the same rules with the same
+  constants. The only differences are mechanical: the browser has no `connection.rtt`, so the retry interval uses
+  `WebTransport.getStats().smoothedRtt` where the browser offers `getStats()` (Chromium 153 does not) and 150 ms otherwise; a browser sender answers a Request
+  directly (not through its pacing loop) and skips it while its datagram queue is backed up; WebTransport datagrams are
+  also dropped by the browser after `outgoingMaxAge` (250 ms), so a late re-send simply disappears.
 
 #### Compatibility matrix
 
