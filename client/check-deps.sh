@@ -62,7 +62,7 @@ need_gst opusdec      "gst-plugins-base (opus)"
 have_gst rglimiter "gst-plugins-good (replaygain): the limiter after the sender-side audio boost; without it a boosted share can clip"
 need_cmd pw-dump      "install pipewire"
 need_cmd pw-link      "install pipewire"
-need_cmd pw-loopback  "install pipewire (pw-loopback tool)"
+need_cmd pw-cli       "install pipewire (pw-cli tool; it owns the audio share's private sink)"
 
 echo "== VA-API hardware codecs (gst-plugins-bad 'va' + a VA driver) =="
 # Optional in the sense that software x264enc / avdec_* are used when missing,

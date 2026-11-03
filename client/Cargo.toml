@@ -83,7 +83,7 @@ wgpu = { version = "27.0.1", default-features = false, features = ["std", "dx12"
 # `AttachConsole`: `--help` output of the GUI-subsystem exe (main.rs `attach_parent_console`).
 windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
 
-# `PR_SET_PDEATHSIG` for the `pw-loopback` helper (src/audio.rs
+# `PR_SET_PDEATHSIG` for the `pw-cli` helper that owns the audio sink (src/audio.rs
 # `die_with_parent`): the child must die with the client even on SIGKILL.
 # `libc` was already in the dependency tree; this pins no new version.
 [target.'cfg(target_os = "linux")'.dependencies]
