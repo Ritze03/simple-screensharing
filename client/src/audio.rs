@@ -80,7 +80,6 @@ use gstreamer_app as gst_app;
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::audio_gain::SharedLoudness;
 use crate::decode::sender_clock_us;
 use crate::fragment::fragment_frame;
 use crate::net::{encrypt_frame, ScreenshareClient};
@@ -690,20 +689,6 @@ fn level_db_array(structure: &gst::StructureRef, field: &str) -> Option<Vec<f64>
     Some(values.iter().filter_map(|v| v.get::<f64>().ok()).collect())
 }
 
-/// Feeds one `level` message into a calibration meter: the loudest channel's RMS and peak
-/// (the same "loudest channel" rule as the meters, [`level_fraction_from_rms_db`]).
-fn feed_loudness(msg: &gst::Message, loudness: &SharedLoudness) {
-    let gst::MessageView::Element(element) = msg.view() else { return };
-    let Some(s) = element.structure() else { return };
-    if s.name() != "level" {
-        return;
-    }
-    let loudest = |field: &str| level_db_array(s, field).map(|v| v.into_iter().fold(f64::NEG_INFINITY, f64::max));
-    if let (Some(rms), Some(peak)) = (loudest("rms"), loudest("peak")) {
-        loudness.lock().unwrap_or_else(|p| p.into_inner()).push(rms, peak);
-    }
-}
-
 // ---------------------------------------------------------------------
 // GStreamer pipeline construction
 // ---------------------------------------------------------------------
@@ -1270,8 +1255,6 @@ impl AudioCaptureHandle {
 pub struct AudioLevelTapHandle {
     pipeline: gst::Pipeline,
     level: AudioLevel,
-    /// RMS/peak statistics of everything this tap heard (the calibration reads it, task #114).
-    loudness: SharedLoudness,
     pump_task: tokio::task::JoinHandle<()>,
 }
 
@@ -1284,17 +1267,10 @@ pub struct AudioLevelTapHandle {
 /// producing `level` messages, which is a fine "not making sound yet"
 /// starting state for a UI meter to show.
 pub fn start_level_tap(node_serial: u64) -> Result<AudioLevelTapHandle> {
-    start_level_tap_named(node_serial, None)
-}
-
-/// [`start_level_tap`] with an optional `client-name`, which makes the tap's own stream node
-/// findable in `pw-dump` (what [`start_calibration_tap`] checks the link with).
-fn start_level_tap_named(node_serial: u64, client_name: Option<&str>) -> Result<AudioLevelTapHandle> {
     ensure_gstreamer_initialized()?;
 
-    let client_name = client_name.map(|n| format!("client-name={n} ")).unwrap_or_default();
     let description = format!(
-        "pipewiresrc target-object={node_serial} {client_name}do-timestamp=true \
+        "pipewiresrc target-object={node_serial} do-timestamp=true \
          ! audio/x-raw \
          ! audioconvert \
          ! level name=level post-messages=true interval={LEVEL_INTERVAL_NS} \
@@ -1320,33 +1296,9 @@ fn start_level_tap_named(node_serial: u64, client_name: Option<&str>) -> Result<
     };
 
     let level = AudioLevel::default();
-    let loudness = SharedLoudness::default();
-    let pump_task = tokio::spawn(level_tap_pump_loop(bus.stream(), level.clone(), loudness.clone()));
+    let pump_task = tokio::spawn(level_tap_pump_loop(bus.stream(), level.clone()));
 
-    Ok(AudioLevelTapHandle { pipeline, level, loudness, pump_task })
-}
-
-/// A level tap for the Settings calibration (task #114): [`start_level_tap`] on `source`'s
-/// representative node, **plus a proof that it is tapping that node**.
-///
-/// `Why the proof:` a meter that is mistargeted is a wrong-looking bar (see
-/// [`AudioLevelTapHandle`]); a calibration that measures the wrong thing writes a wrong setting.
-/// `pipewiresrc` whose `target-object` misses falls back to the default source (the microphone),
-/// so the tap gets a unique `client-name` and [`wait_for_capture_link`] confirms the PipeWire
-/// graph really links the source node to it, exactly as the real share does for its loopback.
-/// The tap is torn down if it never links (the source went away between listing and now).
-pub async fn start_calibration_tap(source: &AudioSource) -> Result<AudioLevelTapHandle> {
-    let serial = source.serial.ok_or_else(|| anyhow!("'{}' has no PipeWire object.serial to tap yet", source.name))?;
-    let client_name = format!("{LOOPBACK_NAME_PREFIX}cal-{}", uuid::Uuid::new_v4().simple());
-    let name = client_name.clone();
-    let tap = tokio::task::spawn_blocking(move || start_level_tap_named(serial, Some(&name)))
-        .await
-        .map_err(|e| anyhow!("audio calibration tap task panicked: {e}"))??;
-    if let Err(e) = wait_for_capture_link(&client_name, source.id, Duration::from_secs(5)).await {
-        tap.stop().await;
-        return Err(e.context(format!("could not listen to '{}'", source.name)));
-    }
-    Ok(tap)
+    Ok(AudioLevelTapHandle { pipeline, level, pump_task })
 }
 
 impl AudioLevelTapHandle {
@@ -1356,11 +1308,6 @@ impl AudioLevelTapHandle {
     /// always-visible share meter read consistently.
     pub fn level(&self) -> f32 {
         self.level.get()
-    }
-
-    /// The loudness statistics of everything this tap heard ([`LoudnessMeter`]).
-    pub fn loudness(&self) -> SharedLoudness {
-        self.loudness.clone()
     }
 
     /// Tears the tap down: stops the pipeline and aborts the bus-pump task.
@@ -1388,10 +1335,9 @@ impl Drop for AudioLevelTapHandle {
 /// Bus-only pump for a level tap: no appsink/encode/send side at all, just
 /// folding `level` element messages into `level` (mirrors [`pump_loop`]'s
 /// bus half, minus the `appsink_stream` side pump_loop also has to drive).
-async fn level_tap_pump_loop(mut bus_stream: gst::bus::BusStream, level: AudioLevel, loudness: SharedLoudness) {
+async fn level_tap_pump_loop(mut bus_stream: gst::bus::BusStream, level: AudioLevel) {
     let mut bus_done = false;
     while let Some(msg) = bus_stream.next().await {
-        feed_loudness(&msg, &loudness);
         handle_bus_message(&msg, &mut bus_done, &level);
         if bus_done {
             return;
@@ -1579,7 +1525,7 @@ mod tests {
         20.0 * (x as f64).log10()
     }
 
-    /// The point of the limiter: +18 dB (8x) on a full-scale sine would be a peak of 8.0; the
+    /// The point of the limiter: +6 dB (2x, the range top) on a full-scale sine would be a peak of 2.0; the
     /// output must stay under full scale, and still be loud (not a muted or collapsed signal).
     #[test]
     fn the_limiter_keeps_a_boosted_full_scale_sine_under_full_scale() {
@@ -1589,7 +1535,7 @@ mod tests {
         let peak = peak_of_first(&sink, 2);
         let _ = pipeline.set_state(gst::State::Null);
         // The limiter's ceiling is full scale itself: a float 1.0 is exactly 0 dBFS (and 32767 in
-        // 16 bit), never above it. Without the limiter this peak would be 7.9 (+18 dBFS).
+        // 16 bit), never above it. Without the limiter this peak would be 2.0 (+6 dBFS).
         assert!(peak <= 1.0, "boosted sine peaked at {} ({:.1} dBFS), the limiter let it past full scale", peak, db(peak));
         assert!(peak > 0.9, "the limiter flattened the signal: peak {peak}");
     }
@@ -1613,14 +1559,14 @@ mod tests {
         pipeline.set_state(gst::State::Playing).unwrap();
         let peak = peak_of_first(&sink, 2);
         let _ = pipeline.set_state(gst::State::Null);
-        assert!(peak > 7.0, "peak {peak}");
+        assert!(peak > 1.9, "peak {peak}");
     }
 
-    /// Everything from 1.0x to 8.0x, a loud (-1 dBFS) and a quiet (-20 dBFS) source: never past full scale.
+    /// Everything from 1.0x to 2.0x, a loud (-1 dBFS) and a quiet (-20 dBFS) source: never past full scale.
     #[test]
     fn no_boost_in_the_range_clips_past_full_scale() {
         for amplitude in [0.9, 0.1] {
-            for gain in [1.01, 1.5, 2.0, 4.0, 8.0] {
+            for gain in [1.01, 1.25, 1.5, 2.0] {
                 let (pipeline, sink, stage) = gain_test_pipeline(amplitude, false);
                 stage.set(gain);
                 pipeline.set_state(gst::State::Playing).unwrap();
@@ -1780,46 +1726,6 @@ mod tests {
         let first = pull().buffer().unwrap().pts().unwrap();
         let _ = pipeline.set_state(gst::State::Null);
         assert!(first < late_pts, "running time restarts at 0 after Null: {first} vs {late_pts}");
-    }
-
-    /// The calibration tap's loudness path, with the real `level` element's real messages (read off
-    /// an `audiotestsrc ! level ! fakesink` bus: no PipeWire): a sine at 0.5 amplitude has its peak at
-    /// -6.0 dBFS and its RMS 3 dB below that, and the meter gets exactly that, ignoring other
-    /// messages. A stereo signal with silence on one channel counts as its loud channel.
-    #[test]
-    fn level_messages_feed_the_loudness_meter() {
-        ensure_gstreamer_initialized().unwrap();
-        // 44.1 kHz, 4410 samples per buffer = one 100 ms `level` window per buffer, 30 buffers.
-        let description = format!(
-            "audiotestsrc num-buffers=30 samplesperbuffer=4410 wave=sine freq=440 volume=0.5 \
-             ! audio/x-raw,rate=44100,channels=2 ! audioconvert \
-             ! level name=level post-messages=true interval={LEVEL_INTERVAL_NS} ! fakesink sync=false"
-        );
-        let pipeline = gst::parse::launch(&description).unwrap().downcast::<gst::Pipeline>().unwrap();
-        let bus = pipeline.bus().unwrap();
-        let meter = SharedLoudness::default();
-        pipeline.set_state(gst::State::Playing).unwrap();
-        loop {
-            let msg = bus
-                .timed_pop_filtered(gst::ClockTime::from_seconds(10), &[gst::MessageType::Element, gst::MessageType::Eos, gst::MessageType::Error])
-                .expect("the level pipeline stalled");
-            if matches!(msg.view(), gst::MessageView::Eos(_) | gst::MessageView::Error(_)) {
-                break;
-            }
-            feed_loudness(&msg, &meter);
-        }
-        let _ = pipeline.set_state(gst::State::Null);
-        let m = meter.lock().unwrap().measurement().expect("30 audible windows");
-        assert!((m.peak_db + 6.02).abs() < 0.2, "peak {} dBFS", m.peak_db);
-        assert!((m.rms_db + 9.03).abs() < 0.3, "rms {} dBFS", m.rms_db);
-        assert!((28..=31).contains(&m.total_windows), "{m:?}");
-        // The calibration of that signal: -9 dBFS RMS is louder than the -18 target, so it asks for
-        // -9 dB (0.35x), below the range's floor: lowered to the minimum.
-        assert_eq!(crate::audio_gain::gain_for(&m), (crate::audio_gain::MIN_GAIN, crate::audio_gain::GainLimit::Min));
-        // A message that is not a `level` one is ignored.
-        let before = meter.lock().unwrap().measurement().unwrap();
-        feed_loudness(&gst::message::Element::new(gst::Structure::new_empty("other")), &meter);
-        assert_eq!(meter.lock().unwrap().measurement().unwrap(), before);
     }
 
     #[test]
