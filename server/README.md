@@ -17,7 +17,10 @@ By default the relay generates a self-signed **ECDSA P-256** certificate (valid 
 when fewer than 2 days remain, without dropping existing connections) and keeps it in the state
 dir so its hash survives restarts. Browsers pin it with `serverCertificateHashes`, so the SHA-256
 hash goes into the join link (`server|room-id|key|certhash`). With `--cert`/`--key` (e.g. Let's
-Encrypt) no hash is needed and nothing is rotated.
+Encrypt) no hash is needed and nothing is rotated; the files are re-checked hourly and a changed
+pair is reloaded (a failed reload keeps the old certificate and is retried at the next check).
+Browsers retry a link's hash without the pin against such a relay, so links that still carry a hash
+keep working.
 
 ## Build and run
 

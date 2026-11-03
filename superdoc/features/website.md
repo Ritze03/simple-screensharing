@@ -32,7 +32,8 @@ docs/dev/        harness, tests, scenarios, e2e        (README.md)  not linked f
 - **Transport:** WebTransport to the relay, ALPN `h3`, path `/ssshare`
   (`WEBTRANSPORT_PATH` in `protocol.js`). A self-signed relay is trusted by **cert-hash pinning**:
   the join link's fourth field (`certhash`) goes into `serverCertificateHashes` (`session.js`);
-  omit it for a CA certificate. See `superdoc/meta/TERMINOLOGY.md` ("Join link", "Cert hash").
+  omit it for a CA certificate (a failed pinned attempt is retried once without the hash, so a link
+  carrying a hash also works against a CA relay). See `superdoc/meta/TERMINOLOGY.md` ("Join link", "Cert hash").
 - **Protocol:** `postcard.js` + `protocol.js` are a hand port of `protocol/src/lib.rs`; correctness
   is pinned by cross-language vectors (`docs/dev/vectors.json`, Rust to JS and JS to Rust).
 - **Crypto:** WebCrypto AES-256-GCM. `NonceSequence` is **one u32 counter per connection shared by
@@ -50,8 +51,8 @@ docs/dev/        harness, tests, scenarios, e2e        (README.md)  not linked f
   `docs/js/ui/rooms.js`, same window as the native `REWATCH_GRACE`).
 - **`reconnectNow()`** ("Retry now"): skips the backoff and cancels a stuck handshake; while
   connected it re-joins. **Link-expiry vs unreachable heuristics:** Chromium cannot say why a
-  handshake failed, so only a hash that has *never* worked in this page yields the hedged "offline or
-  invite link expired" message; once it has worked, a failing reconnect says "relay not answering"
+  handshake failed, so only a hash that has *never* worked in this page (pinned or, after the retry
+  without the hash, plain) yields the hedged "offline or invite link outdated" message; once it has worked, a failing reconnect says "relay not answering"
   and never blames the link.
 
 `docs/js/ui/`: `app.js` (render + modals), `dom.js` (`V`/`H`/`SL`/`FILL` = the same vbox/hbox/slot/fill

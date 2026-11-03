@@ -32,8 +32,8 @@ all paths relative so GitHub Pages can serve `docs/` under `/simple-screensharin
   restart the viewer is back on the stream within about a second. The 60 s policy is UI-side on purpose (see the core README).
 * **Retry now** calls the core's `reconnectNow()`: no backoff wait, nothing dropped (shares are re-announced, watches
   re-subscribed). It used to disconnect and rejoin, which dropped and restored shares by hand.
-* **Why a room is unreachable.** First connect with a certificate hash that never worked in this page says "could not reach the
-  relay, it may be offline or this invite link expired" (Chromium cannot tell those apart, see the core README). Once the hash
+* **Why a room is unreachable.** First connect with a certificate hash that never worked in this page (neither pinned nor, as the retry, without the hash) says "could not reach the
+  relay, it may be offline or this invite link may be outdated (a relay with a self-signed certificate changes it about every 11 days)" (Chromium cannot tell those apart, see the core README). Once the hash
   has worked, a failing reconnect says "the relay is not answering, it may be down or restarting" and never blames the link.
   A full room on reconnect gets its own banner and the page keeps trying.
 * **Room full** shows `JoinRejectedError{RoomFull}`, which now arrives properly on the control stream (relay task #29);
