@@ -470,6 +470,22 @@ async fn opening_a_modal_closes_the_popover_and_escape_like_close_actions_apply(
 }
 
 #[tokio::test]
+async fn copy_logs_puts_the_dump_on_the_clipboard_and_toasts() {
+    let _home = isolated_home();
+    let mut app = app_with_rooms(&[]);
+    let ctx = ctx();
+    app.apply(&ctx, UiAction::CopyLogs);
+    let copied = ctx.output(|o| {
+        o.commands.iter().find_map(|c| match c {
+            egui::OutputCommand::CopyText(t) => Some(t.clone()),
+            _ => None,
+        })
+    });
+    assert!(copied.is_some_and(|t| t.starts_with("Simple Screensharing client log\n")));
+    assert_eq!(app.shell.toasts.len(), 1);
+}
+
+#[tokio::test]
 async fn toggle_popover_opens_then_closes_the_same_kind() {
     let _home = isolated_home();
     let app = app_with_rooms(&[]);
