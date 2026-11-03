@@ -212,7 +212,7 @@ fn run() -> anyhow::Result<()> {
     };
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([1280.0, 800.0])
-        .with_min_inner_size([960.0, 600.0])
+        .with_min_inner_size([800.0, 600.0])
         .with_title("Simple Screensharing")
         .with_app_id(app_id());
     if let Some(icon) = ui::app_icon() {
