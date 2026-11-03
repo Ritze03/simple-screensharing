@@ -63,6 +63,16 @@ try {
   check(f1 && f1.cls.includes("pip-stage") && f1.hasCanvas, "double-click: the stage with the canvas is fullscreen", JSON.stringify(f1));
   check(f1 && f1.w >= 1000, "stage fills the viewport", `${f1 && f1.w}x${f1 && f1.h}`);
   await B.page.screenshot(OUT + PFX + "browser_fullscreen.png");
+  // #124: the overlay and the cursor go away after 3 s without input, and come back on a mouse move
+  const ovl = () => B.page.eval(`(() => { const s = document.querySelector(".pip-stage"); return { idle: s.classList.contains("idle"), opacity: getComputedStyle(s.querySelector(".ovl")).opacity, cursor: getComputedStyle(s).cursor }; })()`);
+  check(!(await ovl()).idle, "overlay not idle right after entering fullscreen");
+  await L.sleep(3500);
+  const o1 = await ovl();
+  check(o1.idle && o1.opacity === "0" && o1.cursor === "none", "3.5 s idle: overlay hidden, cursor none", JSON.stringify(o1));
+  await B.page.eval(`document.querySelector(".pip-stage").dispatchEvent(new MouseEvent("mousemove", { bubbles: true }))`);
+  await L.sleep(300);
+  const o2 = await ovl();
+  check(!o2.idle && o2.cursor !== "none", "mouse move: idle class and cursor none removed", JSON.stringify(o2));
   // a re-render while fullscreen must not drop it (the whole tree is rebuilt on each state change)
   await B.page.eval(`__sss.render()`);
   await L.sleep(300);

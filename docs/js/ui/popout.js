@@ -21,6 +21,26 @@ function stageFor(w, doc, onClose) {
       h("button", { class: "round-btn", type: "button", title: t("ui.room.bring_back"), "aria-label": t("ui.room.bring_back"), onclick: onClose }, ic("move_down"))));
 }
 
+const IDLE_MS = 3000; // fullscreen overlay auto-hide, same as native `popout.rs` OVERLAY_IDLE (#124)
+
+/** Fullscreen stage: after IDLE_MS without mouse move / click / wheel / key, hide the overlay and the cursor
+ *  (`.pip-stage.idle`); the overlay stays while the pointer rests on a control. */
+function autoHide(stage) {
+  let timer = 0;
+  const arm = () => {
+    stage.classList.remove("idle");
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      if (!stage.isConnected) return document.removeEventListener("keydown", arm);
+      if (stage.querySelector(".statbar:hover, .round-btn:hover")) return arm();
+      stage.classList.add("idle");
+    }, IDLE_MS);
+  };
+  for (const ev of ["mousemove", "mousedown", "wheel"]) stage.addEventListener(ev, arm, { passive: true });
+  document.addEventListener("keydown", arm);
+  arm();
+}
+
 /**
  * @param w       the watch ({ canvas, ownerName, ... })
  * @param onBack  called once the stream is back in the main window (window closed / fullscreen left)
@@ -48,6 +68,7 @@ export async function popOut(w, onBack, want) {
   }
   const stage = stageFor(w, document, () => document.exitFullscreen().catch(() => {}));
   stage.style.zIndex = "200";
+  autoHide(stage);
   stage.addEventListener("dblclick", () => closePopout(w)); // double-click again = back (Esc does the same natively)
   document.body.appendChild(stage);
   current = { w, stage, kind: "fullscreen", onBack };
