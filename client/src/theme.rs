@@ -386,6 +386,7 @@ pub const ICONS: &[(&str, char)] = &[
     ("forum", '\u{e0bf}'),
     ("fullscreen", '\u{e5d0}'),
     ("fullscreen_exit", '\u{e5d1}'),
+    ("graphic_eq", '\u{e1b8}'),
     ("grid_view", '\u{e9b0}'),
     ("info", '\u{e88e}'),
     ("link", '\u{e157}'),

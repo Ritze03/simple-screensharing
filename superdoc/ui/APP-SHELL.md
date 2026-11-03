@@ -195,6 +195,20 @@ the Playback card, **on by default**; `UiAction::SetLevelLoudness` -> `AppState:
 (`#set-level-loudness`). Design and numbers: `features/audio-sharing.md` (2026-11-03, #119). Tests:
 `ui::tests::audio_boost::level_loudness_defaults_on_persists_and_drives_the_leveller_switch`.
 
+**Level-loudness button next to every viewer volume slider** (2026-11-03, task #126; user: "make sure the dynamic volume is
+something the viewer can actually select, whether he wants it or not ... next to the volume slider, have a little button
+that indicates the dynamic volume setting"). The audio pill is now `[25 mute][110 slider][34 %][25 level]` (tile pill in
+`room.rs`, pop-out / fullscreen pill in `popout.rs`; hidden with the slider while muted). The button is
+`ui::level_toggle` (25 px round, `graphic_eq` icon): **on** = accent ring + tinted disc + light-blue icon, **off** = faint
+icon; tooltip "Level loudness: on/off" (`ui.room.level_on/off`). A click sends `UiAction::SetLevelLoudness(!on)`, the same
+action and the same persisted global `level_loudness` setting as the Settings checkbox, so both stay in sync and it is live.
+In a pop-out viewport the click goes through `Shared::pending_level` (like `pending_volume`) to the main window. *Why one
+global switch, not per stream:* the user asked for the *setting* to be visible and reachable where the volume is, not for a
+per-stream mode; per-stream state (storage per owner like `audio_volume_by_owner`, a flag on each decoder) is possible if
+it is ever wanted. The browser tile pill has the same button (`levelToggle` in `docs/js/ui/app.js`, `.audio-pill button.level`).
+The viewer volume maximum stays 500 % (the same request first asked to cap it at 200 %, then the user said "leave it at 500%").
+Tests: `ui::tests::level_toggle_reports_a_click_only_on_the_button`; gallery card "Viewer volume" shows both states.
+
 **Settings > Diagnostics > Relay: "Send diagnostics to the relay"** (2026-11-03, task #110; user: "he or all of my
 friends could just tick the checkbox while we are still in heavy development, and then I can just see it.
 Everyone knows this data is being collected."). A checkbox row (`ctrl_row` with the label "Relay", `widgets::checkbox`)

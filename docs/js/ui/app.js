@@ -442,6 +442,15 @@ function renderTile(r, w, crossRoom) {
       H({ g: 2 }, hasAudio ? audioPill(r, w) : h("span", { class: "chip-dark" }, ic("volume_off"), t("ui.tile.no_audio")))));
 }
 
+/** The "Level loudness" button after every volume slider (#126): the one global `levelLoudness` setting, the same
+ *  switch as Settings > Playback (`#set-level-loudness`), not per-stream state. On = accent ring + light-blue icon. */
+function levelToggle() {
+  const on = S.settings.levelLoudness;
+  const tip = t(on ? "ui.tile.level_on" : "ui.tile.level_off");
+  return h("button", { type: "button", class: "level" + (on ? " on" : ""), title: tip, "aria-label": tip, "aria-pressed": String(on),
+    onclick: () => { S.settings.levelLoudness = !on; persistSettings(); applyLevelLoudness(); render(); } }, ic("graphic_eq"));
+}
+
 function audioPill(r, w) {
   const pctEl = h("span", { class: "pct", text: Math.round(w.vol * 100) + "%" });
   const slider = h("input", { type: "range", class: "vol", min: "0", max: String(VOLUME_MAX_PCT), step: "5", value: String(Math.round(w.vol * 100)), "aria-label": t("ui.tile.volume"), id: "vol-" + w.key.replace(":", "-") });
@@ -455,7 +464,7 @@ function audioPill(r, w) {
   return H({ cls: "audio-pill" + (w.muted ? " muted" : ""), g: 1 },
     SL(25, h("button", { type: "button", title: w.muted ? t("ui.room.listen") : t("ui.tile.mute"), "aria-label": w.muted ? t("ui.room.listen") : t("ui.tile.mute"),
       onclick: () => { r.client && r.client.resumeAudio(); setWatchMuted(r, w, !w.muted); render(); } }, ic(w.muted ? "volume_off" : "volume_up"))),
-    w.muted ? T(t("ui.tile.muted"), "pct") : [SL(110, slider), SL(34, pctEl, { al: "r" })]);
+    w.muted ? T(t("ui.tile.muted"), "pct") : [SL(110, slider), SL(34, pctEl, { al: "r" }), SL(25, levelToggle())]);
 }
 
 async function doPopOut(r, w) {

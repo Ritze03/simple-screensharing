@@ -908,6 +908,35 @@ pub fn volume_slider(ui: &mut Ui, percent: &mut u32) -> egui::Response {
     resp
 }
 
+/// The "Level loudness" toggle that sits right after every viewer volume slider (the tile
+/// pill, the pop-out / fullscreen pill): a 25 px round button painting `rect`. On = accent
+/// ring and tinted disc, light-blue `graphic_eq`; off = a faint icon. Returns true when it
+/// was clicked; the caller sends [`UiAction::SetLevelLoudness`]`(!on)`. It is the one global
+/// `level_loudness` setting, the same switch as Settings > Playback, not per-stream state.
+/// Task #126, user: "next to the volume slider, have a little button that indicates the
+/// dynamic volume setting".
+pub fn level_toggle(ui: &Ui, rect: Rect, id: Id, on: bool) -> bool {
+    let resp = ui.interact(rect, id, Sense::click());
+    let p = ui.painter();
+    let c = rect.center();
+    let col = if on {
+        p.circle(c, 12.0, theme::ACCENT_CHIP_BG, Stroke::new(1.0_f32, theme::ACCENT_CHIP_BORDER));
+        theme::ACCENT_LIGHTER
+    } else {
+        if resp.hovered() {
+            p.circle_filled(c, 12.5, Color32::from_white_alpha(20));
+        }
+        theme::TEXT_FAINT
+    };
+    widgets::paint_icon(ui, rect, "graphic_eq", 16.0, col);
+    let tip = if on {
+        tr("ui.room.level_on", "Level loudness: on")
+    } else {
+        tr("ui.room.level_off", "Level loudness: off")
+    };
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip).clicked()
+}
+
 /// `t!(key)` in the current locale, or `en` when the locale files have no
 /// entry for `key` (rust-i18n then returns the key itself, or
 /// `<locale>.<key>`). Every UI string goes through this or [`tr_with`].

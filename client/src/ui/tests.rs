@@ -894,6 +894,32 @@ fn wheel_over_the_volume_slider_steps_it_and_does_not_scroll_the_panel() {
     assert!(offset > 0.0, "the panel scrolls when the pointer is not on the slider");
 }
 
+/// #126: the loudness-levelling button next to the volume slider reports a click (the
+/// caller then sends `SetLevelLoudness(!on)`) and nothing else.
+#[test]
+fn level_toggle_reports_a_click_only_on_the_button() {
+    let ctx = ctx();
+    let rect = Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(25.0, 25.0));
+    let run = |events: Vec<egui::Event>, on: bool| {
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 100.0))), events, ..Default::default() };
+        let mut clicked = false;
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| clicked = level_toggle(ui, rect, egui::Id::new("lt"), on));
+        });
+        clicked
+    };
+    let btn = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+    for on in [true, false] {
+        run(vec![egui::Event::PointerMoved(rect.center())], on);
+        run(vec![btn(rect.center(), true)], on);
+        assert!(run(vec![btn(rect.center(), false)], on), "click on the button, on={on}");
+        let away = egui::pos2(150.0, 80.0);
+        run(vec![egui::Event::PointerMoved(away)], on);
+        run(vec![btn(away, true)], on);
+        assert!(!run(vec![btn(away, false)], on), "click beside it, on={on}");
+    }
+}
+
 /// #115: after an audio source switch the old share is `Stopping` for a second
 /// or more, and both audio captures point at the video capture. The bar must
 /// follow the new one (its level, its mute), not the dying one.
