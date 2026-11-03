@@ -392,7 +392,7 @@ automatically hear that. No (visual) separate 'stream' for Audio."
   the *video* stream id, so the tile and the pop-out show the same value. The last chosen volume is
   remembered per owner (`RoomSession::audio_volume_by_owner`, keyed by `ConnId` alone) because the
   audio `StreamId` changes every time a sender restarts or switches the shared app, which used to
-  reset the viewer to 100 %.
+  reset the viewer to 100 %. Mute is remembered the same way (`audio_muted_by_owner`, #118).
 - **Tests must tell "flowing" from "not flowing".** The end-to-end audio test
   (`end_to_end_test::watching_video_automatically_delivers_the_sharers_audio_too`) drives a quiet
   (`volume=0.02`) synthetic source and asserts the sharer's capture level and the viewer's

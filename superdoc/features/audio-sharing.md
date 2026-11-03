@@ -5,6 +5,28 @@ Audio capture/encode/playback is described where it grew up: `features/stream-co
 video") and the module docs of `client/src/audio.rs` and `client/src/decode.rs`. This page covers
 **keeping the audio aligned with the picture** (task #91, 2026-11-01), the **shared audio is a name** (#105), the viewer volume (#96) and the **sender-side boost** (#114).
 
+## 2026-11-03: switching the shared audio source kept un-muting (task #118)
+
+User report: *"Selecting a new audio stream as the sharer unmutes it for viewers. Fix that. It doesn't reset
+the set volume, which is good."* Two mutes were lost on a source switch, both for the same reason (a switch
+replaces the whole share / watch):
+
+- **Sharer mute** (the card's Mute, `volume name=mute`): `UiAction::ShareAudio` (`ui/apply.rs`) stops the old
+  audio capture and starts a new one with a new pipeline, which starts unmuted. Now the old share's
+  `is_audio_share_muted` is read first and passed down (`start_audio_share(.., muted)` ->
+  `start_audio_share_with` -> `audio::start_audio_sharing(.., muted)` -> `build_pipeline*(.., muted)`), where the
+  element's `mute` is set **before PLAYING**: the replacement never sends one unmuted buffer. The reconnect path
+  carries it the same way (`SuspendedShare::Audio { muted }`, read in `suspend_destination`). The #114 boost
+  needed no such care: it is an `AppState` setting, not per-share. A staged share (no Go Live yet) has no mute
+  to carry, so `GoLive` starts unmuted. The browser sharer has no source switch (one `getDisplayMedia` track per
+  capture) and already re-applies `c.audioMuted` to every new destination (`capture.js`).
+- **Viewer mute**: `RoomSession::audio_volume_by_owner` remembered only the slider value, so a viewer who had
+  muted a sender heard audio resume when that sender switched source (new `StreamId`, fresh `AudioWatch`, the
+  old code comment called it a "known, narrow gap"). `audio_muted_by_owner` (a `HashSet<ConnId>`) now does for
+  mute what the map does for volume; `start_audio_watch` restores both.
+- Test: `audio::tests::a_pipeline_can_be_built_muted`. The UI/session wiring and the PipeWire path are not
+  unit-tested (no audio tests are allowed here, see `testing-and-verification.md`).
+
 ## 2026-11-03: sender-side audio boost and calibration (task #114)
 
 User request: *"Also on the like client settings like the general settings there should be something like
