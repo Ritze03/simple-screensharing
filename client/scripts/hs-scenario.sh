@@ -9,7 +9,7 @@
 # no stale tile on the viewer.
 #
 # Usage: SCRATCH=<rig scratch> hs-scenario.sh LABEL CODEC FPS PRESET [KBPS]
-#   CODEC h264|av1|h265; FPS 15..240 as in the dropdown; PRESET lowlat|balanced|quality|gaming
+#   CODEC h264|av1|h265; FPS 15..240 as in the dropdown; PRESET text|quality|gaming
 # Env: OUT (results dir, default <target>/hs-results), SAMPLES (default 7), INTERVAL (secs, 5)
 # Output: $OUT/LABEL/{montage.png,tip-*.png,final-viewer.png,final-sharer.png,rates.txt,
 #         summary.txt,notes.txt}. Ends with the share stopped and the viewer's tile closed.

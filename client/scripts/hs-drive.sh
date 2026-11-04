@@ -10,18 +10,16 @@
 # Layout (hs-lib.sh): sharer = client 1 fullscreen on HEADLESS-2 (global x 1920..3839), viewer =
 # client 2 fullscreen on HEADLESS-3 (x 3840..5759), the captured test pattern on HEADLESS-1.
 #
-# The stream-settings modal (setup, golive) is driven from the rects the sharer writes to
-# SSS_UI_DUMP ($SCRATCH/ui1.txt, stream_settings.rs `drive_dump`), mapped to global pixels with
-# the window origin from `swaymsg -t get_tree`; every value is read back and the step FAILS if
-# it did not take. The other steps (share, watch, hover, stopshare, unwatch) use fixed window
-# coordinates read off screenshots of the 1920x1080 fullscreen windows (below).
+# Every step is driven from the rects the clients write to SSS_UI_DUMP ($SCRATCH/ui<n>.txt,
+# client/src/ui/drive_dump.rs; names in README.md), mapped to global pixels with the window origin
+# from `swaymsg -t get_tree`; every value is read back and the step FAILS if it did not take.
 #
 # Usage: SCRATCH=<rig scratch> hs-drive.sh STEP [ARGS...]
 #   share                     sharer: click "Share screen" (portal auto-grants, no picker; SHARER=3 drives client 3 instead of 1, for steps share/setup/golive/stopshare);
 #                             waits for the "Set up your stream" modal
 #   setup FPS CODEC PRESET [KBPS]
 #                             FPS one of 15 30 60 90 120 144 165 240; CODEC h264|av1|h265;
-#                             PRESET lowlat|balanced|quality|gaming. KBPS needs keyboard input
+#                             PRESET text|quality|gaming. KBPS needs keyboard input
 #                             (wtype) and is the least reliable part; prefer START_KBPS at `up`.
 #   golive                    sharer: "Go live in <room>" (waits until enabled; exit 1 unless
 #                             the modal closes)
@@ -30,17 +28,29 @@
 #   modal                     print the sharer's modal dump
 #   mclick NAME [DX [DY]]     click a control of the open modal by its dumped rect (DX<0: from the right
 #                             edge, `L60`: 60 pt from the left edge)
-#   watch                     viewer: click "Watch stream" on the sharer's stage tile (a lone tile; with several, click/move at their tile coordinates)
-#   hover                     viewer: park the pointer on the tile's stats bar (tooltip shows
-#                             "Decoded X fps / shown Y fps")
+#   watch [T]                 viewer (VIEWER=N, default 2): click "Watch stream" on stage tile T (default 0)
+#   hover [T]                 viewer: switch "Show stats on the stream" on for tile T and park the pointer on its
+#                             name tag (tooltip shows "Decoded X fps / shown Y fps")
 #   sample OUTDIR N SECS      viewer: N screenshots of the tooltip region every SECS s ->
 #                             OUTDIR/tip-<i>.png (+ montage.png when ImageMagick is there)
-#   stopshare                 sharer: stop sharing
-#   unwatch                   viewer: close the watched tile
+#   stopshare                 sharer: stop sharing (Stream settings, leading footer button)
+#   unwatch [T]               viewer: "Stop watching" in tile T's stream menu
 #   shot FILE [OUTPUT]        grim -o OUTPUT (default HEADLESS-3 = the viewer)
 #   crop FILE OUTPUT X Y W H  grim -g on OUTPUT-relative coordinates
 #   click N X Y | move N X Y  pointer in client N's window coordinates (debugging)
+#   rect N NAME               the dumped rect NAME of client N: x0 y0 x1 y1 (points, window-relative)
+#   val N KEY                 the dumped value KEY of client N
+#   await N KEY VALUE [SECS]  wait until the dumped KEY is VALUE (exit 1 if not within SECS, default 5)
+#   uclick N NAME [DX [DY]]   click a dumped rect of client N (DX as for mclick); a `pw.` name is in the popped-out
+#   udclick N NAME [DX [DY]]  stage window. udclick double-clicks, umove only moves the pointer there
+#   uscroll N NAME NOTCHES    wheel notches over a dumped rect (> 0 wheel down, < 0 up)
+#   drag N X1 Y1 X2 Y2 [HOLD_MS] [STEPS]
+#                             a real pointer drag in client N's window coordinates (hs-vptr drag), staying pressed
+#                             at the end for HOLD_MS; run it with & to look at the drag meanwhile
+#   udrag N NAME DX DY [HOLD_MS] [STEPS]
+#                             the same, from the centre of a dumped rect by (DX, DY) points
 #   key N KEYS...             wtype to client N (focuses it first), e.g. `key 1 -M ctrl a -m ctrl`
+#   relay-restart [DOWN_SECS] kill the relay and start it again DOWN_SECS later (default 0), same port and cert
 #   tree                      sway window list
 
 set -uo pipefail
@@ -65,9 +75,18 @@ client_origin() {
   [[ -n "$pid" ]] || die "no client$1 in $HS_PIDS"
   hs_win_rect "$pid" | awk '{print $1, $2}'
 }
+# The same for client N's popped-out stage window (app id simple-screensharing-popout; the newest one).
+popout_origin() {
+  local pid; pid="$(hs_pid_of "client$1")"
+  swaymsg -t get_tree | jq -r --argjson p "$pid" '[.. | objects | select((.type? == "con" or .type? == "floating_con") and .pid? == $p and .app_id? == "simple-screensharing-popout")] | last // empty | "\(.rect.x + .window_rect.x) \(.rect.y + .window_rect.y)"'
+}
 # click/move at window-relative coordinates of client N.
 wclick() { local o; o="$(client_origin "$1")"; gclick $((${o% *} + $2)) $((${o#* } + $3)); }
 wmove()  { local o; o="$(client_origin "$1")"; gmove  $((${o% *} + $2)) $((${o#* } + $3)); }
+# The whole output layout "W H" (hs-vptr's absolute motion is a fraction of it).
+layout_size() { swaymsg -t get_outputs | jq -r '[.[] | select(.active)] | "\(map(.rect.x + .rect.width) | max) \(map(.rect.y + .rect.height) | max)"'; }
+# vdrag X1 Y1 X2 Y2 [HOLD_MS] [STEPS] in global pixels.
+vdrag() { "$SCRATCH/bin/hs-vptr" drag $(layout_size) "$1" "$2" "$3" "$4" "${6:-20}" "${5:-0}"; }
 
 # --- modal dump (same helpers as drive.sh) --------------------------------------------------
 dump_get()  { awk -v k="$1" '$1==k { $1=""; sub(/^ /, ""); print; exit }' "$UI_DUMP" 2>/dev/null; }
@@ -80,56 +99,56 @@ dump_wait() {
   done
   return 1
 }
-# "OX OY PPP" of the sharer window (points -> global pixels).
-sharer_origin() {
-  local o; o="$(client_origin "${SHARER:-1}")" || return 1
-  echo "$o $(dump_get ppp)"
-}
-mclick() {
-  local r o gx gy
-  r="$(dump_rect "$1")"
-  [[ -n "$r" ]] || die "the modal dump has no rect '$1' ($UI_DUMP)"
-  o="$(sharer_origin)"
-  read -r gx gy < <(awk -v r="$r" -v o="$o" -v dx="${2:-0}" -v dy="${3:-0}" 'BEGIN {
+# Global pixels of a point of client N's dumped rect NAME: `gpos N NAME [DX [DY]]` prints "X Y". DX: 0 = centre, `L60` =
+# 60 pt from the left edge, < 0 = from the right edge, > 0 = centre + DX; DY: centre + DY. The dump file of client N;
+# a `pw.` name is in the popped-out stage window.
+gpos() {
+  local n="$1" name="$2" dx="${3:-0}" dy="${4:-0}" r o ppp
+  UI_DUMP="$SCRATCH/ui$n.txt"
+  r="$(dump_rect "$name")"
+  [[ -n "$r" ]] || die "the dump has no rect '$name' ($UI_DUMP)"
+  if [[ "$name" == pw.* ]]; then o="$(popout_origin "$n")"; else o="$(client_origin "$n")"; fi
+  [[ -n "$o" ]] || die "no window for '$name'"
+  ppp="$(dump_get ppp)"
+  awk -v r="$r" -v o="$o $ppp" -v dx="$dx" -v dy="$dy" 'BEGIN {
     split(r, a, " "); split(o, b, " ");
     if (dx ~ /^L/) { dx = substr(dx, 2) + 0; x = a[1] + dx }   # "L60": 60 pt from the left edge
     else { x = (a[1] + a[3]) / 2 + dx; if (dx < 0) x = a[3] + dx }
     y = (a[2] + a[4]) / 2 + dy;
-    printf "%d %d\n", b[1] + x * b[3], b[2] + y * b[3] }')
-  gclick "$gx" "$gy"
+    printf "%d %d\n", b[1] + x * b[3], b[2] + y * b[3] }'
 }
+uclick() { local p; p="$(gpos "$@")" && gclick $p; }
+udclick() {
+  local p; p="$(gpos "$@")" || return 1
+  gclick $p; sleep 0.04
+  swaymsg "seat - cursor press button1" >/dev/null; sleep 0.04; swaymsg "seat - cursor release button1" >/dev/null
+}
+umove()  { local p; p="$(gpos "$@")" && gmove $p; }
+mclick() { uclick "${SHARER:-1}" "$@"; }
 index_of() {
   local w="$1" i=0 x; shift
   for x in "$@"; do [[ "$x" == "$w" ]] && { echo "$i"; return; }; i=$((i + 1)); done
 }
 modal_open() { dump_wait open 1 15 || die "the sharer's stream-settings modal is not open (dump: $UI_DUMP)"; }
 
-# Fixed window coordinates (1920x1080 fullscreen clients, ppp 1), read off screenshots:
-# (measured 2026-10-14 on the 1920x1080 fullscreen windows; override with the env vars if the UI moves)
-SHARE_BTN="${SHARE_BTN:-354 1052}"     # sharer: "Share screen" in the bottom bar
-STOP_BTN="${STOP_BTN:-1838 1052}"      # sharer: red "Stop sharing" in the bottom bar
-WATCH_BTN="${WATCH_BTN:-900 595}"      # viewer: "Watch stream" on the sharer's idle stage tile (a lone 16:9 tile, button row at y 595)
-HOVER_XY="${HOVER_XY:-430 173}"        # viewer: the tile's "client-1 1920x1080 60fps 8.1 Mbps" pill (top left of a lone 16:9 stage tile)
-UNWATCH_XY="${UNWATCH_XY:-1650 173}"   # viewer: the x on the tile (pop out 1584, fullscreen 1617, x 1650)
-TIP_GEOM="${TIP_GEOM:-280 140 560 260}" # viewer: region holding the pill and its tooltip (X Y W H)
+VIEWER="${VIEWER:-2}"
+# The name tag and its tooltip below it, for `sample` (X Y W H in the viewer's window).
+tip_geom() { UI_DUMP="$SCRATCH/ui$VIEWER.txt"; dump_rect "tag.${1:-0}" | awk '{ printf "%d %d 560 260\n", $1, $2 }'; }
 
 case "$STEP" in
   share)
-    wclick "${SHARER:-1}" $SHARE_BTN
+    uclick "${SHARER:-1}" ctl.share
     modal_open
     ;;
   setup)
     fps="${1:?FPS}"; codec="${2:?CODEC}"; preset="${3:?PRESET}"; kbps="${4:-}"
-    case "$preset" in lowlat) preset=low_latency;; balanced|quality|gaming) ;; *) die "preset $preset?";; esac
+    case "$preset" in text|quality|gaming) ;; *) die "preset $preset? (text|quality|gaming)";; esac
     modal_open
     if [[ "$(dump_get fps)" != "$fps" ]]; then
       i="$(index_of "$fps" $(dump_get fps_options))"
       [[ -n "$i" ]] || die "fps $fps not in the dropdown ($(dump_get fps_options))"
-      # The list opens under the select: first row centre 22 pt below the select's bottom edge,
-      # then one row per 40 pt (32 pt row + 8 spacing).
-      read -r _ y0 _ y1 <<<"$(dump_rect fps)"
       mclick fps; sleep 0.6
-      mclick fps 1 $(( y1 + 22 + 40 * i - (y0 + y1) / 2 ))
+      mclick "opt.$i"
       dump_wait fps "$fps" 3 || die "setup: framerate is $(dump_get fps), wanted $fps"
     fi
     if [[ "$(dump_get codec)" != "$codec" ]]; then
@@ -167,28 +186,58 @@ case "$STEP" in
     ;;
   modal) cat "$UI_DUMP" ;;
   mclick) modal_open; mclick "$@" ;;
-  watch) wclick 2 $WATCH_BTN ;;
+  watch) uclick "$VIEWER" "watch.${1:-0}" L40 ;;
   hover)
-    wmove 2 900 500; sleep 0.4; wmove 2 $HOVER_XY; sleep 0.8 ;;
+    t="${1:-0}"
+    umove "$VIEWER" "tile.$t"; sleep 0.5
+    if [[ "$(UI_DUMP="$SCRATCH/ui$VIEWER.txt" dump_get "stats.$t")" != 1 ]]; then
+      uclick "$VIEWER" "tool.$t.more"; sleep 0.4
+      uclick "$VIEWER" menu.Show_stats_on_the_stream; sleep 0.3
+      "$SELF_DIR/hs-drive.sh" key "$VIEWER" -k Escape; sleep 0.3
+      umove "$VIEWER" "tile.$t"; sleep 0.5
+    fi
+    umove "$VIEWER" "tag.$t"; sleep 0.8 ;;
   sample)
     out="${1:?OUTDIR}"; n="${2:?N}"; secs="${3:?SECS}"
     mkdir -p "$out"
     for i in $(seq 1 "$n"); do
-      read -r tx ty tw th <<<"$TIP_GEOM"
+      read -r tx ty tw th <<<"$(tip_geom)"
       grim -g "$((HS_VIEWER_X + tx)),$((HS_VIEWER_Y + ty)) ${tw}x${th}" "$out/tip-$(printf %02d "$i").png"
       [[ "$i" -lt "$n" ]] && sleep "$secs"
     done
     command -v montage >/dev/null && montage "$out"/tip-*.png -tile 3x -geometry +4+4 -background '#222' "$out/montage.png" 2>/dev/null
     ;;
-  stopshare) wclick "${SHARER:-1}" $STOP_BTN ;;
-  unwatch)   wmove 2 900 500; sleep 0.5; wclick 2 $UNWATCH_XY ;;
+  stopshare)
+    uclick "${SHARER:-1}" ctl.share; modal_open; sleep 0.3
+    [[ "$(dump_get mode)" == live ]] || die "stopshare: the modal is not the live one (mode $(dump_get mode))"
+    mclick footer L70
+    dump_wait open 0 5 || die "stopshare: the modal did not close" ;;
+  unwatch)
+    t="${1:-0}"
+    umove "$VIEWER" "tile.$t"; sleep 0.5; uclick "$VIEWER" "tool.$t.more"; sleep 0.4; uclick "$VIEWER" menu.Stop_watching ;;
   shot)      grim -o "${2:-$HS_OUT_VIEWER}" "${1:?FILE}" ;;
   crop)      # crop FILE OUTPUT X Y W H
     o="${2:?OUTPUT}"; read -r ox oy < <(swaymsg -t get_outputs | jq -r --arg o "$o" '.[] | select(.name==$o) | "\(.rect.x) \(.rect.y)"')
     grim -g "$((ox + $3)),$((oy + $4)) ${5}x${6}" "${1:?FILE}" ;;
+  rect)      UI_DUMP="$SCRATCH/ui${1:?N}.txt"; dump_rect "${2:?NAME}" ;;
+  val)       UI_DUMP="$SCRATCH/ui${1:?N}.txt"; dump_get "${2:?KEY}" ;;
+  await)     UI_DUMP="$SCRATCH/ui${1:?N}.txt"; dump_wait "${2:?KEY}" "${3?VALUE}" "${4:-5}" || die "await: $2 is '$(dump_get "$2")', wanted '$3'" ;;
+  uclick)    uclick "$@" ;;
+  udclick)   udclick "$@" ;;
+  umove)     umove "$@" ;;
+  uscroll)   umove "$1" "$2"; sleep 0.2; "$SCRATCH/bin/hs-vptr" scroll "${3:?NOTCHES}" ;;
+  drag)
+    o="$(client_origin "${1:?N}")"; ox="${o% *}"; oy="${o#* }"
+    vdrag $((ox + $2)) $((oy + $3)) $((ox + $4)) $((oy + $5)) "${6:-0}" "${7:-20}" ;;
+  udrag)
+    p="$(gpos "${1:?N}" "${2:?NAME}")" || exit 1
+    read -r x y <<<"$p"; ppp="$(dump_get ppp)"
+    vdrag "$x" "$y" "$(awk -v a="$x" -v d="${3:?DX}" -v p="$ppp" 'BEGIN { printf "%d", a + d * p }')" "$(awk -v a="$y" -v d="${4:?DY}" -v p="$ppp" 'BEGIN { printf "%d", a + d * p }')" "${5:-0}" "${6:-20}" ;;
   click)     wclick "$1" "$2" "$3" ;;
   move)      wmove "$1" "$2" "$3" ;;
   key)       n="${1:?N}"; shift; swaymsg "[pid=$(hs_pid_of "client$n")] focus" >/dev/null; hs_type "$@" ;;
+  relay-restart)
+    tmux respawn-pane -k -t "=$TMUX_SESSION:" -c "$SCRATCH/relay" "sleep ${1:-0}; exec '$RELAY_BIN' $PORT 2>>'$SCRATCH/relay.err'" ;;
   tree)      swaymsg -t get_tree | jq -r '.nodes[] | select(.type=="output") | .name as $o | [.. | objects | select(.type? == "con" and .pid? != null)] | .[] | "\($o)\t\(.name)\tpid \(.pid)\t\(.rect)"' ;;
   *) die "unknown step $STEP" ;;
 esac

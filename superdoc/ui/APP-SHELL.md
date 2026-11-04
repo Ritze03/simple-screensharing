@@ -222,21 +222,26 @@ applied in `apply.rs` through `AppState::set_emoji` (saved, announced to every c
 field (the replica has one):* only the 40 bundled emoji can be drawn (no colour-emoji font is guaranteed on every build).
 
 **Menus and dropdowns** (task I3, `ui/menu.rs`): every dropdown is the app's own popover style (`ui::popover` frame:
-`PANEL_RAISED`, radius 10, padding 6, shadow; `pop_item` rows with an icon and a faint second line, a highlighted current
-row). The bar's menus and the stream menu are `Nav::popover` (`PopoverKind::Bar(BarMenu)`, `PopoverKind::Tile(ItemId)`), drawn
+`PANEL_RAISED`, radius 10, padding 6, shadow; `pop_item` rows with an icon and a faint second line; the current row has a lit
+icon and a check at its end, the replica's `.mi.on`). The bar's menus and the stream menu are `Nav::popover` (`PopoverKind::Bar(BarMenu)`, `PopoverKind::Tile(ItemId)`), drawn
 by `stage/menus.rs` *before* the bar so a click outside one that lands on another bar button closes it first. **Dropdown fields**
 (`menu::select`) open the same menu **under the field, as wide as it**; the Stream settings modal's FPS and Audio dropdowns and
 Settings > Presentation use it instead of `egui::ComboBox` (`widgets::select`, no longer called). *Why:* the user: every dropdown
-looks like the app's menus, icons and sub-lines where they exist.
+looks like the app's menus, icons and sub-lines where they exist. Escape with a dropdown open closes the dropdown alone
+(`App::update` takes the key first, 2026-11-04). *Why:* otherwise the modal under it closes on the same press, like a popover
+would without its own rule.
 
 **The whole stage can pop out** (task I3, `stage::show_windows`): the bar's pop-out button moves the stage (streams, strip and
 bar) into its own OS window, an **immediate viewport** that runs the same `stage::show` with `Host::Window`, while the main window
 shows "The stage is open in its own window" and **Bring it back**; the window's button, its close button or a vanished room bring
 it back. Fullscreen there is the window's own (`ViewportCommand::Fullscreen`, F11 / Escape). *Why immediate, not deferred like the
 per-stream pop-outs:* a deferred closure is `Send + Sync + 'static` and cannot hold `Cx` and the video views; an immediate one runs
-inside our own frame, so there is no `Shared` round trip. *Left out:* the window is keyed by the room's `RoomHandle` (minted per
-connection), so a reconnect closes it and the stage returns to the main window; a modal opened from it (Stream settings…)
-appears in the main window. Per-stream pop-outs are unchanged (`popout.rs`, `popout_survives_resume`).
+inside our own frame, so there is no `Shared` round trip. **A reconnect** (2026-11-04, I5): while a room is suspended the window
+is away and the stage stays popped (`AppState::reconnects` holds the same `RoomHandle`); it opens again with the room. *Why:* D1,
+"a pop-out comes back after a reconnect or relay restart", the same as a stream's pop-out; only a room that is really gone (left,
+cancelled) brings the stage home. *Left out:* a modal opened from it (Rename, Stream settings…) appears in the main window and
+wants its input there (a click on it works; Escape in the popped window does not reach it). Per-stream pop-outs are unchanged
+(`popout.rs`, `popout_survives_resume`).
 
 **Fullscreen chrome** (task I3, `stage/chrome.rs`, the pure rule; the replica's behaviour and the user's request #136): the bar's
 fullscreen button makes the main window fullscreen with **only the stage** drawn (`Nav::stage_fullscreen`; no sidebar, header or

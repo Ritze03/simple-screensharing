@@ -12,7 +12,7 @@ use super::tile;
 use super::{Item, Kind, StageLayout, StageState, StageView};
 use crate::theme::{self, Weight, font};
 use crate::ui::share::{self, MENU_W};
-use crate::ui::{ConnState, Cx, Modal, Popover, PopoverKind, UiAction, menu, popover, share_label, tr, tr_with};
+use crate::ui::{ConnState, Cx, Modal, Popover, PopoverKind, UiAction, drive_dump, menu, popover, share_label, tr, tr_with};
 use crate::widgets::{self, PopItem};
 
 /// Draw the open menu of this stage, if it is one of ours; also runs the audio list's level meters.
@@ -110,15 +110,17 @@ fn layout_menu(ui: &mut Ui, cx: &Cx, view: &StageView, out: &mut Vec<UiAction>, 
         widgets::checkbox_enabled(ui, &mut off, &tr("ui.stage.pip", "Webcam in picture"), false)
             .on_hover_text(tr("ui.bar.webcam_soon", "Webcam sharing is not available yet"));
         let mut names = cx.shell.stage.always_names;
-        if widgets::checkbox(ui, &mut names, &tr("ui.stage.always_names", "Always show names"))
-            .on_hover_text(tr("ui.stage.always_names_tip", "Off: name and audio status only show while you hover a stream"))
+        let r = widgets::checkbox(ui, &mut names, &tr("ui.stage.always_names", "Always show names"));
+        drive_dump::rect(|| "menu.always_names".into(), r.rect);
+        if r.on_hover_text(tr("ui.stage.always_names_tip", "Off: name and audio status only show while you hover a stream"))
             .changed()
         {
             out.push(UiAction::SetAlwaysShowNames(names));
         }
         let mut hide = cx.shell.stage.hide_own;
-        if widgets::checkbox(ui, &mut hide, &tr("ui.stage.hide_own", "Hide my own streams"))
-            .on_hover_text(tr("ui.stage.hide_own_tip", "Your screen and webcam leave the stage here; others still see them"))
+        let r = widgets::checkbox(ui, &mut hide, &tr("ui.stage.hide_own", "Hide my own streams"));
+        drive_dump::rect(|| "menu.hide_own".into(), r.rect);
+        if r.on_hover_text(tr("ui.stage.hide_own_tip", "Your screen and webcam leave the stage here; others still see them"))
             .changed()
         {
             out.push(UiAction::SetHideOwnStreams(hide));
@@ -229,7 +231,7 @@ fn tile_menu_body(
     };
     match &it.kind {
         Kind::Video(key) => {
-            if cx.session(key.0).is_some_and(|s| s.sibling_audio_stream(key.1).is_some()) {
+            if cx.stream_has_audio(*key) {
                 volume(ui, *key, out);
             } else {
                 share::pop_note(ui, &tr("ui.stage.no_audio_stream", "No audio in this stream"));

@@ -115,7 +115,7 @@ pub(super) fn share_menu(ui: &mut Ui, cx: &Cx, room: RoomHandle, state: ShareSta
             out.push(target.preset_action(p));
         }
     });
-    let row = HBox::new("share_menu_caption", 18.0).pad(theme::S2 + theme::S2, theme::S2).slots(&[FILL]).show(ui);
+    let row = HBox::new("share_menu_caption", 18.0).pad(theme::S2, theme::S2).slots(&[FILL]).show(ui);
     row.text(ui, 0, &preset_caption(&v), font(Weight::Regular, theme::FS_TINY), theme::TEXT_DIM, Align::Min);
     // What went wrong under a live share: the capture is being restarted, or the encoder cannot keep up.
     if let (ShareState::Live { capture: id, .. }, Some((_, d))) = (state, here) {

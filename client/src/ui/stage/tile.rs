@@ -21,11 +21,13 @@ use simple_screensharing_client::session::{CaptureSourceId, DestinationId, RoomH
 
 use super::{ItemId, VolDrag};
 use crate::theme::{self, Weight, font};
-use crate::ui::{Cx, Modal, Popover, PopoverKind, StreamKey, UiAction, share_label, tr, tr_with};
+use crate::ui::{Cx, Modal, Popover, PopoverKind, StreamKey, UiAction, drive_dump, share_label, tr, tr_with};
 use crate::widgets::{self, Btn, FILL, HBox, fixed, paint_text, text_width};
 
 /// Where and how a tile is drawn this frame.
 pub(super) struct Spot {
+    /// The tile's index on the stage (`drive_dump` names).
+    pub n: usize,
     pub rect: Rect,
     /// Fill the rect (Crop) instead of fitting the picture whole.
     pub crop: bool,
@@ -145,16 +147,17 @@ pub(super) fn name_tag(ui: &Ui, rect: Rect, max_w: f32, icon: &str, icon_col: Co
 pub(super) fn video_tile(ui: &mut Ui, cx: &Cx, key: StreamKey, s: &Spot, acts: &mut Vec<UiAction>) {
     cx.videos.paint(key, ui, s.rect, if s.crop { Fit::Cover } else { Fit::Contain });
     corner_masks(ui, s.rect, s.round);
-    let audible = cx.session(key.0).is_some_and(|x| x.sibling_audio_stream(key.1).is_some() && !x.volume(key.1, key.2).muted);
+    let has_audio = cx.stream_has_audio(key);
+    let audible = has_audio && cx.session(key.0).is_some_and(|x| !x.volume(key.1, key.2).muted);
     if audible {
         ui.painter().rect_stroke(s.rect, CornerRadius::same(s.round), Stroke::new(2.0_f32, theme::SUCCESS), StrokeKind::Inside);
     }
     health_chip(ui, s.rect, stream_health(cx, key));
+    drive_dump::line(|| format!("stats.{} {}", s.n, u8::from(s.stats)));
     if s.always_names || s.hovered {
         let owner = cx.member_name(key.0, key.1);
         let name = if s.cross_room { format!("{owner} · {}", cx.room_name(key.0)) } else { owner };
         let label = cx.session(key.0).and_then(|x| x.streams.iter().find(|i| i.owner == key.1 && i.stream_id == key.2)).map(|i| share_label(&i.label)).unwrap_or_default();
-        let has_audio = cx.session(key.0).is_some_and(|x| x.sibling_audio_stream(key.1).is_some());
         let (icon, col) = match (has_audio, audible) {
             (false, _) => ("volume_off", theme::TEXT_DIM),
             (true, false) => ("volume_off", theme::DANGER),
@@ -163,6 +166,7 @@ pub(super) fn video_tile(ui: &mut Ui, cx: &Cx, key: StreamKey, s: &Spot, acts: &
         let nums = (s.stats && s.hovered).then(|| stream_nums(cx, key));
         let max_w = s.rect.width() - 2.0 * theme::S2 - if s.hovered { TOOLS_RESERVE } else { 0.0 };
         let tag = name_tag(ui, s.rect, max_w, icon, col, &name, &label, nums.as_ref().map(|n| &n.0));
+        drive_dump::rect(|| format!("tag.{}", s.n), tag);
         if let Some((_, tip)) = nums {
             ui.interact(tag, Id::new(("tag_tip", key)), Sense::hover()).on_hover_text(tip);
         }
@@ -210,6 +214,11 @@ fn tools(ui: &mut Ui, s: &Spot, key: Option<StreamKey>, acts: &mut Vec<UiAction>
     let inner = s.rect.shrink(theme::S2);
     let btn = |i: f32| Rect::from_min_size(pos2(inner.right() - OVL_H - i * (OVL_H + theme::S1), inner.top()), vec2(OVL_H, OVL_H));
     let more = btn(0.0);
+    drive_dump::rect(|| format!("tool.{}.more", s.n), more);
+    if key.is_some() {
+        drive_dump::rect(|| format!("tool.{}.fs", s.n), btn(1.0));
+        drive_dump::rect(|| format!("tool.{}.pop", s.n), btn(2.0));
+    }
     if round_btn(&mut ov, more, id.with("more"), "more_horiz", &tr("ui.stage.stream_menu", "Volume and more"), false).clicked() {
         acts.push(UiAction::OpenPopover(Popover { kind: PopoverKind::Tile(s.id.clone()), anchor: more }));
     }
@@ -270,6 +279,7 @@ pub(super) fn idle_tile(ui: &mut Ui, cx: &Cx, key: StreamKey, info: &StreamInfo,
     let two = !audio_only && rect.width() >= 340.0;
     let bw = if two { 320.0 } else { 160.0_f32 }.min(rect.width() - 2.0 * theme::S3).max(0.0);
     let br = Rect::from_min_size(pos2(rect.center().x - bw / 2.0, y), vec2(bw, btns_h));
+    drive_dump::rect(|| format!("watch.{}", s.n), br);
     let mut child = ui.new_child(UiBuilder::new().max_rect(br).layout(Layout::left_to_right(Align::Center)));
     let btns: Vec<Btn> = if audio_only {
         vec![if listening { Btn::secondary(&unlisten).icon("volume_off") } else { Btn::primary(&listen).icon("volume_up") }]
@@ -317,7 +327,7 @@ pub(super) fn mine_tile(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSou
         paint_cover(ui.painter(), rect, tex, radius, Color32::WHITE);
     } else {
         widgets::paint_hatch(ui.painter(), rect, radius, 8.0, theme::ELEV_19, theme::ELEV_14);
-        thumb_placeholder(ui, rect, "cast", theme::SUCCESS, &format!("{} · {chip}", tr("ui.room.my_screen", "Your screen")));
+        thumb_placeholder(ui, rect, "cast", theme::SUCCESS, &format!("{} · {}", tr("ui.room.my_screen", "Your screen"), chip.to_lowercase()));
     }
     if state == DestinationState::Starting && cx.state.capture_awaiting_first_frame(capture) {
         ui.interact(rect, Id::new(("stage_mine_hint", capture, destination)), Sense::hover())
@@ -328,7 +338,8 @@ pub(super) fn mine_tile(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSou
     // starting, stalled or failed share must say so, whatever the placeholder under it shows).
     if s.hovered || s.always_names || !on_air {
         let max_w = rect.width() - 2.0 * theme::S2 - if s.hovered { 2.0 * OVL_H + 3.0 * theme::S1 + 120.0 } else { 0.0 };
-        name_tag(ui, rect, max_w, "cast", if on_air { theme::SUCCESS } else { theme::WARNING }, &tr("ui.room.you", "You"), &label, None);
+        let tag = name_tag(ui, rect, max_w, "cast", if on_air { theme::SUCCESS } else { theme::WARNING }, &tr("ui.room.you", "You"), &label, None);
+        drive_dump::rect(|| format!("tag.{}", s.n), tag);
     }
     if !s.hovered {
         return;
@@ -337,6 +348,8 @@ pub(super) fn mine_tile(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSou
     let inner = rect.shrink(theme::S2);
     let more = Rect::from_min_size(pos2(inner.right() - OVL_H, inner.top()), vec2(OVL_H, OVL_H));
     let btn = more.translate(vec2(-(OVL_H + theme::S1), 0.0));
+    drive_dump::rect(|| format!("tool.{}.more", s.n), more);
+    drive_dump::rect(|| format!("tool.{}.settings", s.n), btn);
     let row = Rect::from_min_max(pos2(inner.left(), inner.top()), pos2(btn.left() - theme::S1, inner.top() + OVL_H));
     let mut r = ui.new_child(UiBuilder::new().max_rect(row).layout(Layout::right_to_left(Align::Center)));
     if let Some(names) = viewer_names(cx, h, d.stream_id) {
@@ -462,6 +475,9 @@ pub(super) fn menu_volume_row(ui: &mut Ui, cx: &Cx, drag: &mut VolDrag, key: Str
         acts.push(UiAction::SetVolume { stream: key, volume_percent: vol.volume_percent, muted: !vol.muted });
     }
     let applied = vol.volume_percent;
+    drive_dump::rect(|| "menu.volume".into(), row.cell(1));
+    drive_dump::rect(|| "menu.mute".into(), mr);
+    drive_dump::line(|| format!("volume {shown}"));
     row.show(ui, 1, Align::Min, |ui| {
         ui.add_enabled_ui(!vol.muted, |ui| tile_volume_slider(ui, drag, key, shown, applied, acts).on_hover_text(tr("ui.room.volume", "Volume")));
     });

@@ -257,7 +257,7 @@ fn collect_info(cx: &Cx, key: StreamKey) -> (Info, u8) {
     if let Some(s) = cx.session(room)
         && let Some(w) = s.watches.lock().unwrap().get(&(owner, stream))
     {
-        has_audio = w.audio_stream_id.is_some();
+        has_audio = w.audio_stream_id.is_some() || super::drive_dump::fake_audio();
         let mut d = w.decoder.lock().unwrap();
         kbps = d.received_bitrate_kbps();
         health = match d.view_state(std::time::Instant::now()) {

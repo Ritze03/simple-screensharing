@@ -39,7 +39,7 @@ use simple_screensharing_client::net::{ServerAddrError, parse_join_string, parse
 use simple_screensharing_client::rooms::{AppSettings, PresentationMode};
 use simple_screensharing_client::session::RoomHandle;
 
-use super::{Cx, Modal, ShareState, UiAction, menu, tr, tr_with};
+use super::{Cx, Modal, ShareState, UiAction, drive_dump, menu, tr, tr_with};
 use crate::theme::{self, Weight, font};
 use crate::widgets::{self, BannerKind, Btn, FooterClick, ModalSpec};
 
@@ -765,6 +765,8 @@ fn audio_card(ui: &mut Ui, cx: &mut Cx, st: &mut ModalsState) {
             |ui| widgets::slider(ui, &mut st.gain_db, audio_gain::gain_db_range(), 0.5),
             |ui| widgets::value_box(ui, &percent),
         );
+        drive_dump::rect(|| "settings.boost".into(), r.rect);
+        drive_dump::line(|| format!("boost {percent}"));
         st.gain_dirty |= r.changed();
     });
 }

@@ -441,21 +441,33 @@ impl<'a> PopItem<'a> {
 pub fn pop_item(ui: &mut Ui, item: &PopItem) -> Response {
     const WITH_METER: [Slot; 3] = [fixed(18.0), FILL, fixed(23.0)];
     const PLAIN: [Slot; 2] = [fixed(18.0), FILL];
+    const METER_CHECK: [Slot; 4] = [fixed(18.0), FILL, fixed(23.0), fixed(18.0)];
+    const CHECK: [Slot; 3] = [fixed(18.0), FILL, fixed(18.0)];
     let h = if item.sub.is_some() { theme::POP_ITEM_TWO_H } else { theme::ROW_H };
-    let slots: &[Slot] = if item.meter.is_some() { &WITH_METER } else { &PLAIN };
+    let slots: &[Slot] = match (item.meter.is_some(), item.selected) {
+        (true, true) => &METER_CHECK,
+        (true, false) => &WITH_METER,
+        (false, true) => &CHECK,
+        (false, false) => &PLAIN,
+    };
     let sense = if item.enabled { Sense::click() } else { Sense::hover() };
     ui.scope(|ui| {
         if !item.enabled {
             ui.multiply_opacity(super::DISABLED_OPACITY);
         }
         let r = HBox::new("pop_item", h).pad(theme::S2, theme::S2).slots(slots).sense(sense).show(ui);
+        crate::ui::drive_dump::rect(|| format!("menu.{}", item.label), r.rect);
         let r7 = CornerRadius::same(7);
-        if item.selected {
-            ui.painter().rect_filled(r.rect, r7, theme::ACCENT_ROW_SELECTED);
-        } else if item.enabled && r.response.hovered() {
+        if item.enabled && r.response.hovered() {
             ui.painter().rect_filled(r.rect, r7, theme::WASH_HOVER_2);
         }
-        let (fg, ic) = if item.danger { (theme::DANGER, theme::DANGER) } else { (theme::TEXT, theme::TEXT_DIM) };
+        let (fg, ic) = if item.danger {
+            (theme::DANGER, theme::DANGER)
+        } else if item.selected {
+            (theme::TEXT, theme::ACCENT_LIGHTER)
+        } else {
+            (theme::TEXT, theme::TEXT_DIM)
+        };
         r.icon(ui, 0, item.icon, 16.0, ic);
         let cell = r.cell(1);
         match item.sub {
@@ -469,6 +481,10 @@ pub fn pop_item(ui: &mut Ui, item: &PopItem) -> Response {
         }
         if let Some(lit) = item.meter {
             r.show(ui, 2, Align::Center, |ui| super::meter(ui, lit));
+        }
+        // The current choice, the replica's `.mi.on`: a lit icon and a check at the end.
+        if item.selected {
+            r.icon(ui, slots.len() - 1, "check", 18.0, theme::ACCENT_LIGHTER);
         }
         if item.enabled { r.response.on_hover_cursor(egui::CursorIcon::PointingHand) } else { r.response }
     })

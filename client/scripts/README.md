@@ -13,12 +13,15 @@ as **legacy** (bottom of this page) and carry a banner. The rule and the machine
 cd client/scripts                         # SCRATCH defaults to <target>/hs-scratch/rig
 ./hs-rig.sh up                            # build (release) + everything below, ~15 s warm
 ./hs-drive.sh share                       # click "Share screen": portal grants, no picker; modal opens
-./hs-drive.sh setup 240 h265 balanced     # fps codec preset [kbps]; every value is read back
+./hs-drive.sh setup 240 h265 quality      # fps codec preset [kbps]; every value is read back
 ./hs-drive.sh golive                      # "Go live in <room>"
 ./hs-drive.sh watch                       # viewer: click Watch
 ./hs-drive.sh hover                       # viewer: tooltip "Decoded X fps / shown Y fps, H.265 via vah265dec"
 ./hs-drive.sh shot /path/viewer.png       # grim -o HEADLESS-3 (viewer);  `shot f.png HEADLESS-2` = sharer
-./hs-extra-client.sh 3 Alice 4            # a third (fourth, ...) client on HEADLESS-3, workspace 4: more viewers of one share
+./hs-extra-client.sh 3 Alice 4            # a third (fourth, ...) client on HEADLESS-3, workspace 4: more viewers, or a second stream (SHARER=3 ./hs-drive.sh share|setup|golive)
+./hs-drive.sh uclick 2 ctl.layout         # by dumped name: any control of client 2 (names below)
+./hs-drive.sh udrag 2 bar.v0.0 60 0 1500 & # a real drag, held 1.5 s at the end; meanwhile:
+./hs-drive.sh val 2 chrome                # read a dumped value
 ./hs-rig.sh down                          # stop everything, remove the private runtime dir
 ```
 
@@ -26,7 +29,7 @@ cd client/scripts                         # SCRATCH defaults to <target>/hs-scra
 screenshots + sender per-stage rates (`gst-rate.py` on the tracer log) -> stop, in one call.
 `hs-rig.sh status` lists processes/outputs/windows, `hs-rig.sh run -- CMD...` runs CMD inside
 the rig's environment (`grim`, `swaymsg`, `wtype`, `busctl`, ...).
-Headless sway's `wtype` drops the first key of each run: type through `hs_type` (`hs-lib.sh`, prepends a dummy Shift_L), never bare `wtype`.
+Headless sway's `wtype` loses the first key of each run: type through `hs_type` (`hs-lib.sh`), never bare `wtype`. It starts with a shift modifier and a pause, no key. *Why not a dummy key:* wtype numbers its keys from evdev code 1, which is Escape in the keymap the client still has when the first key arrives. A dummy Shift_L (the old `hs_type`) reached the client as an Escape in about 1 of 3 runs, so one `key N -k Escape` could close a menu and then leave fullscreen (2026-11-04, the "Escape left fullscreen" of I3).
 
 What `up` starts, all under one private `XDG_RUNTIME_DIR` (`/run/user/<uid>/sss-hs-<hash>`, short
 because unix socket paths are limited to 108 bytes; `WAYLAND_DISPLAY` is always the absolute
@@ -48,26 +51,43 @@ Env knobs (all optional): `SCRATCH` (one rig per scratch dir; default per worktr
 `PROFILE` (`release` default; use release for fps), `HS_NO_BUILD=1`, `HS_FPS` (capture output
 refresh, default 240), `HS_PATTERN`, `HS_XDPW`, `HS_PIPEWIRE`, `RUST_LOG`,
 `START_CODEC/START_FPS/START_KBPS` (pre-fill the stream form; the reliable way to set kbps),
-`SSS_LANGUAGE`, `CLIENT_ENV_<n>` (extra env for client n, e.g. a `GST_DEBUG` for the sharer), `HS_NAME_<n>` (display name of client n, default `client-<n>`), `HS_SEND_DIAG_<n>=1` (client n starts with Settings > Diagnostics > "Send diagnostics to the relay" ticked, #110),
+`SSS_LANGUAGE`, `CLIENT_ENV_<n>` (extra env for client n, e.g. a `GST_DEBUG` for the sharer; `CLIENT_ENV_2="SSS_UI_FAKE_AUDIO=1"` makes every stream that client watches act as if it had audio: volume row, ring, pop-out pill, nothing played), `HS_NAME_<n>` (display name of client n, default `client-<n>`), `HS_EMOJI_<n>` (emoji avatar of client n, one of the picker's), `HS_SEND_DIAG_<n>=1` (client n starts with Settings > Diagnostics > "Send diagnostics to the relay" ticked, #110),
 `HS_RELAY_ENV` (`"A=1 B=2"` for the relay process, e.g. `SSSHARE_NACK=0` for a relay that behaves like one without NACK), `HS_RELAY_BIN` / `HS_CLIENT_BIN_<n>` (run another binary for the relay / client n, e.g. an older build for mixed-version checks, #104).
 
 Input details: pointer = `swaymsg seat - cursor ...` (needs `hs-vptr`); mouse wheel = `$SCRATCH/bin/hs-vptr scroll N`
 (one-shot: N notches at the cursor, N > 0 wheel down, N < 0 up; a second virtual pointer on the same seat, run inside
-`hs-rig.sh run --`; task #113). Keys = `wtype`, which
-creates a virtual keyboard only while it runs (`hs-drive.sh key N ...` focuses client N first).
+`hs-rig.sh run --`; task #113). **Drags** = `$SCRATCH/bin/hs-vptr drag W H X1 Y1 X2 Y2 [STEPS [HOLD_MS]]` (`hs-drive.sh drag|udrag`), a real press, motion and release: `swaymsg seat - cursor set` sends the client no motion while a button is down. `HOLD_MS` keeps it pressed at the end; run the step with `&` to read the dump or take a screenshot mid-drag. Keys = `wtype`, which
+creates a virtual keyboard only while it runs (`hs-drive.sh key N ...` focuses client N first; to reach a popped-out window, focus it yourself and call `wtype` through `hs-rig.sh run`).
 Never `ydotool`: it is a uinput device and injects into the user's REAL session. Click
-coordinates: the stream-settings modal is driven from `SSS_UI_DUMP` rects (`$SCRATCH/ui1.txt`) plus
-the window origin from `swaymsg -t get_tree`; the few fixed ones (Share, Stop, Watch, tile pill,
-tile x) are constants at the top of `hs-drive.sh`, measured on the 1920x1080 fullscreen windows.
+coordinates all come from the `SSS_UI_DUMP` rects (`$SCRATCH/ui<n>.txt`) plus the window origin from `swaymsg -t get_tree`.
+
+### `SSS_UI_DUMP` (`client/src/ui/drive_dump.rs`)
+
+Every frame, when it changed, each client rewrites `$SCRATCH/ui<n>.txt`: `rect NAME x0 y0 x1 y1` (points, window-relative) and `key value...` lines, ending in `ppp` and `screen W H`. `$SCRATCH/ui<n>.actions` logs every dispatched `UiAction`. What the popped-out stage window draws has `pw.` in front of its name or key (`pw.ctl.pop`, `pw.chrome`). A stream's own pop-out window (a deferred viewport) is not dumped.
+
+| Names | What |
+| --- | --- |
+| `tile.N`, `cell.N`; `tileinfo N KIND ar R who=.. label=..`; `tiles`, `layout` | stage tile N: the picture and its grid cell, in stage order |
+| `bar.v0.0`, `bar.h0`; `barstate v0.0 hidden\|grey\|blue` | resize bars (hit rect) and how they show |
+| `win.N`, `grip.N` | floating window and its corner handle |
+| `tool.N.more\|fs\|pop\|settings`, `tag.N`, `watch.N` (`uclick .. watch.0 L40` = Watch stream); `stats.N` | a tile's hover buttons (only while shown), name tag, idle button row |
+| `ctl.share\|audio\|webcam\|layout\|room` and `.arrow`, `ctl.people\|leave\|sidebar\|invite\|pop\|fs`, `ctl.group.X` | the control bar |
+| `menu`, `menu.LABEL` (spaces become `_`), `menu.always_names`, `menu.hide_own`, `menu.volume`, `menu.mute`; `volume` | the open menu and its rows; the volume row and its value |
+| `opt.I` | row I of an open dropdown (`menu::select`) |
+| `strip.NAME` (`strip.you`), `strip.NAME.live`; `person NAME streams N popped N ring 0\|1` | avatars and LIVE badges |
+| `card`, `card.row.I`, `card.back.I`; `cardrow I audio 0\|1 label=..` | the hover card |
+| `stage.bring_back`, `settings.boost`; `boost` | "Bring it back" while the stage is popped out; Settings > Boost |
+| `chrome`, `chrome_alpha`, `stage_full W H`, `popover`, `modal`, `stage_fs`, `stream_fs`, `open` | state: fullscreen chrome, open menu / modal, fullscreen, the stream settings modal |
+| `fps`, `fps_options`, `codec.I`, `preset.I`, `change`, `footer`, `bitrate`, `mode`, `ready`, ... | the stream settings modal (`stream_settings.rs`) |
 
 | Script | Purpose |
 | --- | --- |
 | `hs-rig.sh up\|status\|run\|down` | the rig |
 | `hs-lib.sh` | shared functions (sourced; sources `launch-lib.sh` for build/config/join-link helpers) |
-| `hs-drive.sh STEP` | share, setup, golive, discard, watch, hover, sample, stopshare, unwatch, shot, crop, click, move, key, modal, mclick (`mclick NAME L60` = 60 pt from the rect's left edge), tree |
+| `hs-drive.sh STEP` | share, setup, golive, discard, watch, hover, sample, stopshare, unwatch, shot, crop, click, move, key, modal, mclick (`mclick NAME L60` = 60 pt from the rect's left edge), tree; by dumped name for any client: rect, val, await, uclick, udclick, umove, uscroll, udrag; drag (window coordinates); relay-restart [DOWN_SECS] |
 | `hs-scenario.sh` | one measured share (screenshots + per-stage rates) |
 | `hs-probe.sh` | `portal-probe.py` against the rig's portal (no picker) |
-| `hs-vptr.c`, `hs-vptr-protocol.xml` | the virtual-pointer keepalive (protocol XML from wlroots, MIT) |
+| `hs-vptr.c`, `hs-vptr-protocol.xml` | the virtual-pointer keepalive, one-shot `scroll` and `drag` (protocol XML from wlroots, MIT) |
 | `xdph-emu.c` | a PipeWire producer that offers formats exactly like xdg-desktop-portal-hyprland 1.4.1 (DMA-BUF modifier list with `DONT_FIXATE` + fixation handshake); the rig's sway/xdpw cannot show xdph-only negotiation bugs (task #76, `packaging/README.md`). Build and usage in its header; rig only |
 
 ## Shared helpers (work in both worlds)

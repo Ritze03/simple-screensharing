@@ -36,7 +36,7 @@ pub fn frame() -> Frame {
 
 /// A dropdown field (`select.field`): fills the available width, 32 px, `FIELD` fill. Click opens the app's
 /// menu under it, as wide as the field, one `pop_item` row per option (icon and sub-line when the option has
-/// them, the current one highlighted). Sets `*selected` to the picked index and marks the response changed.
+/// them, the current one lit with a check). Sets `*selected` to the picked index and marks the response changed.
 /// `id_salt` must be unique among selects in the same parent `Ui`.
 pub fn select(ui: &mut Ui, id_salt: impl std::hash::Hash, selected: &mut usize, opts: &[Opt]) -> egui::Response {
     let id = ui.make_persistent_id(id_salt);
@@ -77,11 +77,14 @@ pub fn select(ui: &mut Ui, id_salt: impl std::hash::Hash, selected: &mut usize, 
         .width(w)
         .frame(frame())
         .show(|ui| {
-            ui.set_width(w - 12.0);
+            // The frame's 6 px padding and 1 px border each side: the list is as wide as the field, not 2 px more.
+            ui.set_width(w - 14.0);
             ui.spacing_mut().item_spacing.y = 0.0;
             egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, true]).show(ui, |ui| {
                 for (i, o) in opts.iter().enumerate() {
-                    if option_row(ui, o, i == *selected).clicked() {
+                    let r = option_row(ui, o, i == *selected);
+                    super::drive_dump::rect(|| format!("opt.{i}"), r.rect);
+                    if r.clicked() {
                         picked = Some(i);
                     }
                 }
@@ -96,21 +99,25 @@ pub fn select(ui: &mut Ui, id_salt: impl std::hash::Hash, selected: &mut usize, 
     resp
 }
 
-/// One option of a [`select`]: a `widgets::pop_item` row (32 px, 44 with a sub-line, the current one highlighted)
+/// One option of a [`select`]: a `widgets::pop_item` row (32 px, 44 with a sub-line, the current one lit with a check)
 /// whose icon is optional (`pop_item` insists on one).
 fn option_row(ui: &mut Ui, o: &Opt, selected: bool) -> egui::Response {
     let h = if o.sub.is_some() { theme::POP_ITEM_TWO_H } else { theme::ROW_H };
-    let slots = if o.icon.is_some() { vec![fixed(18.0), FILL] } else { vec![FILL] };
-    let row = HBox::new("select_option", h).pad(theme::S2, theme::S2).slots(&slots).sense(Sense::click()).show(ui);
+    let mut slots = if o.icon.is_some() { vec![fixed(18.0), FILL] } else { vec![FILL] };
     if selected {
-        ui.painter().rect_filled(row.rect, CornerRadius::same(7), theme::ACCENT_ROW_SELECTED);
-    } else if row.response.hovered() {
+        slots.push(fixed(18.0));
+    }
+    let row = HBox::new("select_option", h).pad(theme::S2, theme::S2).slots(&slots).sense(Sense::click()).show(ui);
+    if row.response.hovered() {
         ui.painter().rect_filled(row.rect, CornerRadius::same(7), theme::WASH_HOVER_2);
     }
     if let Some(icon) = o.icon {
-        row.icon(ui, 0, icon, 16.0, theme::TEXT_DIM);
+        row.icon(ui, 0, icon, 16.0, if selected { theme::ACCENT_LIGHTER } else { theme::TEXT_DIM });
     }
-    let last = slots.len() - 1;
+    let last = usize::from(o.icon.is_some());
+    if selected {
+        row.icon(ui, last + 1, "check", 18.0, theme::ACCENT_LIGHTER);
+    }
     let cell = row.cell(last);
     match o.sub {
         None => row.text(ui, last, o.label, font(Weight::Regular, theme::FS_LABEL), theme::TEXT, Align::Min),
@@ -130,6 +137,7 @@ pub fn switch_row(ui: &mut Ui, icon: &str, label: &str, on: &mut bool) -> bool {
     if row.response.hovered() {
         ui.painter().rect_filled(row.rect, CornerRadius::same(7), theme::WASH_HOVER_2);
     }
+    super::drive_dump::rect(|| format!("menu.{label}"), row.rect);
     row.icon(ui, 0, icon, 16.0, theme::TEXT_DIM);
     row.text(ui, 1, label, font(Weight::Regular, theme::FS_LABEL), theme::TEXT, Align::Min);
     let sw = egui::Rect::from_center_size(row.cell(2).center(), vec2(30.0, 18.0));

@@ -8,7 +8,8 @@
 //!
 //! Hovering a person opens the same card for everyone: a header and, per stream, a row saying Audio or No
 //! audio, its numbers and its state (on the stage, popped out with a Bring back button, not watched). The
-//! card stays open while the pointer is on the avatar, the gap or the card, so its button can be reached.
+//! card stays open while the pointer is on the avatar, the gap straight above it or the card, so its button
+//! can be reached ([`card_keeps`]).
 
 use egui::emath::GuiRounding;
 use egui::{Align, Color32, CornerRadius, Id, Order, Rect, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
@@ -16,7 +17,7 @@ use simple_screensharing_client::session::RoomHandle;
 
 use super::{Item, Kind, StageView};
 use crate::theme::{self, Weight, font};
-use crate::ui::{Cx, UiAction, tr, tr_with};
+use crate::ui::{Cx, UiAction, drive_dump, tr, tr_with};
 use crate::widgets::{self, FILL, HBox, fixed, paint_galley, paint_icon, paint_text, text_galley, text_width};
 
 /// A person in the strip: their name and the stage items that are theirs (indices into the stage's items).
@@ -62,7 +63,7 @@ const TOP_PAD: f32 = 22.0;
 /// Whether `it` carries audio you can hear now (the ring).
 fn audible(cx: &Cx, it: &Item) -> bool {
     match &it.kind {
-        Kind::Video(key) => cx.session(key.0).is_some_and(|s| s.sibling_audio_stream(key.1).is_some() && !s.volume(key.1, key.2).muted),
+        Kind::Video(key) => cx.stream_has_audio(*key) && cx.session(key.0).is_some_and(|s| !s.volume(key.1, key.2).muted),
         Kind::Audio(key, _) => cx.is_watching(*key) && cx.session(key.0).is_some_and(|s| !s.volume(key.1, key.2).muted),
         Kind::Mine(capture, _) => cx.paired_audio(*capture).is_some_and(|(id, _)| !cx.state.is_audio_share_muted(id)),
         Kind::Idle(..) => false,
@@ -72,7 +73,7 @@ fn audible(cx: &Cx, it: &Item) -> bool {
 /// Whether the stream the item shows has audio at all (the hover card's "Audio" / "No audio").
 fn has_audio(cx: &Cx, it: &Item) -> bool {
     match &it.kind {
-        Kind::Video(key) | Kind::Idle(key, _) => cx.session(key.0).is_some_and(|s| s.sibling_audio_stream(key.1).is_some()),
+        Kind::Video(key) | Kind::Idle(key, _) => cx.stream_has_audio(*key),
         Kind::Audio(..) => true,
         Kind::Mine(capture, _) => cx.paired_audio(*capture).is_some(),
     }
@@ -104,6 +105,9 @@ fn person(ui: &mut Ui, cx: &Cx, cell: Rect, view: &StageView, p: &Person, items:
     // One centre line for everything: the avatar rect snapped to whole pixels.
     let av = Rect::from_min_size(pos2(cell.center().x - a / 2.0, cell.top() + TOP_PAD), vec2(a, a)).round_to_pixels(ui.pixels_per_point());
     let hit = Rect::from_min_max(pos2(cell.left(), av.top() - 6.0), pos2(cell.right(), av.bottom() + 7.0 + 14.0));
+    let tag = if p.you { "you" } else { &p.name };
+    drive_dump::rect(|| format!("strip.{tag}"), av);
+    drive_dump::line(|| format!("person {tag} streams {} popped {} ring {}", its.len(), popped.len(), u8::from(ring)));
     let resp = ui.interact(hit, Id::new(("strip_person", &p.name)), if popped.is_empty() { Sense::hover() } else { Sense::click() });
     crate::ui::paint_person(ui, av, &p.name, &p.emoji, false);
     let c = av.center();
@@ -121,6 +125,7 @@ fn person(ui: &mut Ui, cx: &Cx, cell: Rect, view: &StageView, p: &Person, items:
     let border = Stroke::new(2.0_f32, theme::STAGE_BG);
     if !its.is_empty() {
         let live = Rect::from_center_size(pos2(c.x, av.bottom() + 6.0 - 9.0), vec2(34.0, 18.0));
+        drive_dump::rect(|| format!("strip.{tag}.live"), live);
         painter.rect(live, CornerRadius::same(4), theme::SUCCESS, border, egui::StrokeKind::Inside);
         let g = text_galley(ui, &tr("ui.strip.live", "LIVE"), font(Weight::Bold, 8.5), theme::PRIMARY_TEXT, 30.0, 0.5);
         paint_galley(ui, live, g, Align::Center);
@@ -166,9 +171,7 @@ fn hover_card(ui: &Ui, cx: &Cx, resp: &egui::Response, av: Rect, view: &StageVie
     let ctx = ui.ctx();
     let id = Id::new(("strip_card", &p.name));
     let shown: Option<Rect> = ctx.data(|d| d.get_temp(id));
-    // The avatar, the card and the gap between them keep it open.
-    let near = |r: Rect| ctx.pointer_hover_pos().is_some_and(|q| r.expand(3.0).contains(q));
-    let keep = shown.is_some_and(|r| near(r.union(av).union(Rect::from_min_max(pos2(r.left(), r.bottom()), pos2(r.right(), av.top())))));
+    let keep = shown.is_some_and(|r| ctx.pointer_hover_pos().is_some_and(|q| card_keeps(r, av, q)));
     if !(resp.hovered() || keep) {
         ctx.data_mut(|d| d.remove::<Rect>(id));
         return;
@@ -187,7 +190,16 @@ fn hover_card(ui: &Ui, cx: &Cx, resp: &egui::Response, av: Rect, view: &StageVie
                 card_body(ui, cx, view, p, its, acts);
             });
         });
+    drive_dump::rect(|| "card".into(), area.response.rect);
     ctx.data_mut(|d| d.insert_temp(id, area.response.rect));
+}
+
+/// Whether the pointer at `q` keeps the card `card` of the avatar `av` open: on the card, on the avatar or in the
+/// gap straight between them. `Why` not the whole gap: a card is wider than a person's cell, so the union of card and
+/// avatar covers the neighbours' avatars and every card you pass stayed open under the next one (found in the rig).
+fn card_keeps(card: Rect, av: Rect, q: egui::Pos2) -> bool {
+    let gap = Rect::from_x_y_ranges(av.x_range(), card.bottom()..=av.top());
+    [card, av, gap].iter().any(|r| r.expand(3.0).contains(q))
 }
 
 fn card_body(ui: &mut Ui, cx: &Cx, view: &StageView, p: &Person, its: &[&Item], acts: &mut Vec<UiAction>) {
@@ -210,13 +222,17 @@ fn card_body(ui: &mut Ui, cx: &Cx, view: &StageView, p: &Person, its: &[&Item], 
         pill.paint(ui, Rect::from_center_size(head.cell(2).center(), vec2(pw, theme::PILL_H)));
     }
     ui.spacing_mut().item_spacing.y = 0.0;
-    for it in its {
-        stream_row(ui, cx, view, it, acts);
+    for (i, it) in its.iter().enumerate() {
+        if i > 0 {
+            ui.add_space(10.0); // the replica's rows stand apart: the gap sits above the next row's line
+        }
+        drive_dump::rect(|| format!("card.row.{i}"), Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), ROW_H)));
+        stream_row(ui, cx, view, i, it, acts);
     }
 }
 
 /// One stream of the card: `[label][audio][Bring back]`, the numbers, the state.
-fn stream_row(ui: &mut Ui, cx: &Cx, view: &StageView, it: &Item, acts: &mut Vec<UiAction>) {
+fn stream_row(ui: &mut Ui, cx: &Cx, view: &StageView, n: usize, it: &Item, acts: &mut Vec<UiAction>) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::hover());
     ui.painter().hline(rect.x_range(), rect.top() + 0.5, Stroke::new(1.0_f32, theme::DIVIDER));
     let l1 = Rect::from_min_size(pos2(rect.left(), rect.top() + 8.0), vec2(rect.width(), 22.0));
@@ -225,6 +241,7 @@ fn stream_row(ui: &mut Ui, cx: &Cx, view: &StageView, it: &Item, acts: &mut Vec<
         Kind::Video(key) | Kind::Idle(key, _) | Kind::Audio(key, _) => stream_label(cx, *key),
     };
     let audio = has_audio(cx, it);
+    drive_dump::line(|| format!("cardrow {n} audio {} label={label}", u8::from(audio)));
     let (aicon, atext, acol) = if audio {
         ("volume_up", tr("ui.strip.audio", "Audio"), theme::SUCCESS)
     } else {
@@ -244,6 +261,7 @@ fn stream_row(ui: &mut Ui, cx: &Cx, view: &StageView, it: &Item, acts: &mut Vec<
     paint_text(ui, Rect::from_x_y_ranges(ac.left() + 18.0..=ac.right(), ac.y_range()), &atext, af, acol, Align::Min);
     if back && let Kind::Video(key) = &it.kind {
         let br = Rect::from_center_size(row.cell(2).center(), vec2(bw, 22.0));
+        drive_dump::rect(|| format!("card.back.{n}"), br);
         let r = ui.interact(br, Id::new(("card_back", key)), Sense::click());
         let fill = if r.hovered() { theme::ACCENT_GHOST_BG_HOVER } else { theme::ACCENT_CHIP_BG };
         ui.painter().rect(br, CornerRadius::same(11), fill, Stroke::new(1.0_f32, theme::ACCENT_CHIP_BORDER), egui::StrokeKind::Inside);
@@ -325,4 +343,20 @@ fn state_line(cx: &Cx, view: &StageView, it: &Item) -> (&'static str, String) {
 fn viewers(cx: &Cx, room: RoomHandle, dest: simple_screensharing_client::session::DestinationId) -> Option<usize> {
     let stream_id = cx.state.captures.values().find_map(|c| c.destinations.get(&dest).map(|d| d.stream_id))?;
     super::tile::viewer_names(cx, room, stream_id).map(|v| v.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_card_stays_open_over_itself_its_avatar_and_the_gap_but_not_over_the_next_avatar() {
+        let av = Rect::from_min_size(pos2(1113.0, 941.0), vec2(44.0, 44.0));
+        let card = Rect::from_min_max(pos2(936.0, 797.0), pos2(1258.0, 929.0));
+        for q in [pos2(1000.0, 850.0), av.center(), pos2(av.center().x, 935.0)] {
+            assert!(card_keeps(card, av, q), "{q:?}");
+        }
+        assert!(!card_keeps(card, av, pos2(1174.0, 963.0)), "the next person's avatar");
+        assert!(!card_keeps(card, av, pos2(1018.0, 963.0)), "the previous person's avatar");
+    }
 }

@@ -97,6 +97,7 @@ use crate::theme::{self, Weight, font};
 use crate::widgets::{self, BandEdge};
 
 mod apply;
+pub mod drive_dump;
 pub mod menu;
 pub mod modals;
 pub mod popout;
@@ -1034,7 +1035,8 @@ pub fn popover(ctx: &egui::Context, pop: &Popover, width: f32, body: impl FnOnce
         .show(|ui| {
             ui.set_width(width - 12.0);
             ui.spacing_mut().item_spacing.y = 0.0;
-            body(ui)
+            body(ui);
+            drive_dump::rect(|| "menu".into(), ui.min_rect());
         });
     open
 }
@@ -1463,6 +1465,11 @@ impl eframe::App for App {
             self.nav.popover = None;
         }
 
+        // An open dropdown takes Escape the same way: it closes alone, the modal it is in stays.
+        if menu::any_select_open(ctx) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            egui::Popup::close_all(ctx);
+        }
+
         // Escape leaves stream fullscreen (no popover or modal is open then).
         if self.nav.fullscreen.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.apply(ctx, UiAction::ExitStreamFullscreen);
@@ -1479,8 +1486,12 @@ impl eframe::App for App {
             self.apply(ctx, UiAction::ExitStageFullscreen);
         }
 
+        drive_dump::begin();
         let actions = self.draw(ctx);
+        drive_dump::line(|| format!("popover {}\nmodal {}\nstage_fs {}\nstream_fs {}", u8::from(self.nav.popover.is_some()), u8::from(self.nav.modal.is_some()), u8::from(self.nav.stage_fullscreen.is_some()), u8::from(self.nav.fullscreen.is_some())));
+        drive_dump::flush(ctx);
         for action in actions {
+            drive_dump::action(&action);
             self.apply(ctx, action);
         }
 

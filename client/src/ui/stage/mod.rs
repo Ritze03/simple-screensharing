@@ -17,9 +17,9 @@
 //! - **The whole stage can pop out** into its own window ([`show_windows`]): an immediate viewport that draws
 //!   this same stage ([`Host::Window`]), while the main window shows a note and "Bring it back". *Why an
 //!   immediate viewport:* the stage needs `Cx` and the video views, which a deferred viewport's closure
-//!   (`Send + Sync + 'static`, `viewer-window.md`) cannot hold; immediate runs inside our own frame. What is
-//!   left out: the window is keyed by the room's `RoomHandle`, so it closes when the room reconnects (the stage
-//!   comes back in the main window), and modals opened from it appear in the main window.
+//!   (`Send + Sync + 'static`, `viewer-window.md`) cannot hold; immediate runs inside our own frame. During a
+//!   reconnect the window is gone and comes back with the room (a suspended room keeps its handle). What is
+//!   left out: modals opened from it appear in the main window.
 //! - **Per-view state** (`StageState`, UI-private, per session, not persisted): each room and "Watched" keep
 //!   their own order, grid, window rects and z-order. Streams are keyed by [`ItemId`] (room handle + owner
 //!   name + label), not by `ConnId`/`StreamId`, so a reconnect keeps the layout. The layout choice and the
@@ -56,7 +56,7 @@ use geom::{Bar, FRect, Grid};
 pub(super) use tile::tile_volume_slider;
 
 pub use bar::BarMenu;
-use super::{Cx, Popover, PopoverKind, RoomEntry, ShareState, StreamKey, UiAction, View, tr};
+use super::{Cx, Popover, PopoverKind, RoomEntry, ShareState, StreamKey, UiAction, View, drive_dump, tr};
 use crate::theme::{self, Weight, font};
 use crate::widgets::{self, paint_text};
 
@@ -105,6 +105,11 @@ impl Cx<'_> {
             View::Room(_) => self.selected_room().and_then(|r| r.handle).map(StageView::Room),
             View::Welcome => None,
         }
+    }
+
+    /// Whether the sender of `key` shares audio with it.
+    fn stream_has_audio(&self, key: StreamKey) -> bool {
+        drive_dump::fake_audio() || self.session(key.0).is_some_and(|s| s.sibling_audio_stream(key.1).is_some())
     }
 
     /// The joined room a stage shows (the open room, or the one a pop-out window was made for).
@@ -351,6 +356,23 @@ fn draw_arena(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, view: &StageView, i
     } else {
         placed.pics.iter().map(|r| r.translate(off)).collect()
     };
+    drive_dump::line(|| format!("layout {layout:?}\ntiles {}", vis.len()));
+    let cells = grid.cells(w, h);
+    for (i, it) in vis.iter().enumerate() {
+        drive_dump::rect(|| format!("tile.{i}"), rects[i]);
+        if let Some(c) = cells.get(i) {
+            drive_dump::rect(|| format!("cell.{i}"), c.translate(off));
+        }
+        drive_dump::line(|| {
+            let kind = match it.kind {
+                Kind::Video(_) => "video",
+                Kind::Idle(..) => "idle",
+                Kind::Audio(..) => "audio",
+                Kind::Mine(..) => "mine",
+            };
+            format!("tileinfo {i} {kind} ar {:.3} who={} label={}", it.ar, it.id.who, it.id.label)
+        });
+    }
     let mut paint_order: Vec<usize> = (0..vis.len()).collect();
     if float {
         paint_order.sort_by_key(|&i| geom.z.iter().position(|z| *z == vis[i].id).map_or(-1, |p| p as i32));
@@ -379,6 +401,7 @@ fn draw_arena(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, view: &StageView, i
         let (it, rect) = (vis[i], shown[i]);
         let resp = ui.interact(live(rect), Id::new(("stage_tile", &it.id)), Sense::click_and_drag());
         let spot = tile::Spot {
+            n: i,
             rect,
             crop,
             round: if float { 0 } else { 8 },
@@ -396,10 +419,13 @@ fn draw_arena(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, view: &StageView, i
         if float {
             ui.painter().rect_stroke(rect, 0.0, Stroke::new(1.0_f32, theme::BORDER), egui::StrokeKind::Outside);
             let handle = Rect::from_min_size(rect.max - vec2(20.0, 20.0), vec2(20.0, 20.0));
+            drive_dump::rect(|| format!("win.{i}"), rect);
+            drive_dump::rect(|| format!("grip.{i}"), handle);
             let rz = ui.interact(live(handle), Id::new(("stage_resize", &it.id)), Sense::drag());
-            let grip = Stroke::new(1.5_f32, theme::TEXT_DIM);
-            for k in [4.0, 10.0] {
-                ui.painter().line_segment([pos2(handle.right() - 2.0, handle.bottom() - k), pos2(handle.right() - k, handle.bottom() - 2.0)], grip);
+            let grip = Stroke::new(1.7_f32, theme::TEXT_DIM);
+            // The replica's `.rz`: two stripes across the corner, 10 and 16.8 px from it.
+            for k in [10.0, 16.8] {
+                ui.painter().line_segment([pos2(handle.right(), handle.bottom() - k), pos2(handle.right() - k, handle.bottom())], grip);
             }
             if rz.hovered() || rz.dragged() {
                 ui.ctx().set_cursor_icon(CursorIcon::ResizeNwSe);
@@ -456,6 +482,12 @@ fn draw_arena(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, view: &StageView, i
         } else {
             None
         };
+        let name = match bar {
+            Bar::V { row, col } => format!("v{row}.{col}"),
+            Bar::H { row } => format!("h{row}"),
+        };
+        drive_dump::rect(|| format!("bar.{name}"), *rect);
+        drive_dump::line(|| format!("barstate {name} {}", if color == Some(theme::ACCENT) { "blue" } else if color.is_some() { "grey" } else { "hidden" }));
         if let Some(c) = color {
             let line = if vertical {
                 Rect::from_center_size(rect.center(), vec2(3.0, rect.height() * 0.6))
@@ -537,6 +569,7 @@ pub fn show_main(ui: &mut Ui, cx: &mut Cx, st: &mut StageState) {
     note(ui, full, "open_in_new", &tr("ui.stage.popped_title", "The stage is open in its own window"), Some(&tr("ui.stage.popped_text", "Your streams keep playing there.")));
     let c = full.center();
     let br = Rect::from_center_size(pos2(c.x, c.y + 58.0), vec2(180.0, theme::CTL_H));
+    drive_dump::rect(|| "stage.bring_back".into(), br);
     let mut child = ui.new_child(UiBuilder::new().max_rect(br));
     let label = tr("ui.stage.bring_back", "Bring it back");
     if widgets::Btn::secondary(&label).icon("close_fullscreen").show_sized(&mut child, br.width()).clicked() {
@@ -545,7 +578,8 @@ pub fn show_main(ui: &mut Ui, cx: &mut Cx, st: &mut StageState) {
 }
 
 /// The popped-out stages: one immediate viewport each, drawing the same stage ([`Host::Window`]). Closing the
-/// window brings the stage back; so does a room that is gone.
+/// window brings the stage back; so does a room that is gone. A suspended room is not gone: its window is away for
+/// the outage and comes back with the room, like a stream's pop-out (D1).
 pub fn show_windows(ctx: &egui::Context, cx: &mut Cx, st: &mut StageState) {
     let views: Vec<StageView> = st.popped.iter().cloned().collect();
     for view in views {
@@ -553,8 +587,12 @@ pub fn show_windows(ctx: &egui::Context, cx: &mut Cx, st: &mut StageState) {
             StageView::Room(h) => cx.room_name(*h),
             StageView::Watched => tr("ui.room.watched_title", "Watched streams"),
         };
-        if matches!(&view, StageView::Room(h) if cx.stage_room(*h).is_none()) {
-            st.popped.remove(&view);
+        if let StageView::Room(h) = &view
+            && cx.stage_room(*h).is_none()
+        {
+            if !cx.state.reconnects.contains_key(h) {
+                st.popped.remove(&view);
+            }
             continue;
         }
         let mut builder = egui::ViewportBuilder::default()
@@ -568,7 +606,9 @@ pub fn show_windows(ctx: &egui::Context, cx: &mut Cx, st: &mut StageState) {
         let mut closed = false;
         ctx.show_viewport_immediate(egui::ViewportId::from_hash_of(("stage_window", &view)), builder, |ctx, _class| {
             closed = ctx.input(|i| i.viewport().close_requested());
+            drive_dump::in_window(true);
             egui::CentralPanel::default().frame(egui::Frame::NONE.fill(theme::STAGE_BG)).show(ctx, |ui| show(ui, cx, st, Host::Window, &view));
+            drive_dump::in_window(false);
         });
         if closed {
             st.popped.remove(&view);
@@ -620,6 +660,7 @@ fn show(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, host: Host, view: &StageV
         true
     };
     let alpha = ctx.animate_bool_with_time(Id::new(("stage_chrome", host)), shown, 0.25);
+    drive_dump::line(|| format!("chrome {}\nchrome_alpha {alpha:.2}\nstage_full {:.0} {:.0}", u8::from(shown), full.width(), full.height()));
 
     let bar = bar::Bar::new(cx, st, view, host, fullscreen);
     let arr = bar.arrange(ui, full.width());

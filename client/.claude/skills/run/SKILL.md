@@ -44,7 +44,7 @@ for the sharer. A fresh build proves itself: `grep -c '<new string>' target/rele
 
 ```bash
 ./hs-drive.sh share                      # click "Share screen": the portal grants at once; modal opens
-./hs-drive.sh setup 240 h265 balanced    # FPS CODEC PRESET [KBPS]; reads every value back, exits 1 on a miss
+./hs-drive.sh setup 240 h265 quality     # FPS CODEC PRESET (text|quality|gaming) [KBPS]; reads every value back, exits 1 on a miss
 ./hs-drive.sh golive                     # "Go live in <room>"
 ./hs-drive.sh watch                      # viewer clicks Watch
 ./hs-drive.sh hover                      # tooltip: "Decoded X fps / shown Y fps, H.265 via vah265dec"
@@ -53,14 +53,15 @@ for the sharer. A fresh build proves itself: `grep -c '<new string>' target/rele
 ```
 
 One call for a measured run (7 tooltip screenshots over 30 s + the sender's per-stage rates from
-the GStreamer stats tracer): `./hs-scenario.sh LABEL h265 240 balanced` -> `<target>/hs-results/LABEL/`
+the GStreamer stats tracer): `./hs-scenario.sh LABEL h265 240 quality` -> `<target>/hs-results/LABEL/`
 (set `OUT=` to put it elsewhere; read `montage.png` and `summary.txt`).
 
-Other steps: `modal` (the sharer's `SSS_UI_DUMP`), `mclick NAME` (click a dumped control),
-`click|move N X Y` (client N window coordinates), `key N <wtype args>`, `crop FILE OUTPUT X Y W H`,
-`tree`. Click targets: the stream-settings modal uses the rects in `$SCRATCH/ui1.txt`; a few fixed
-constants at the top of `hs-drive.sh` (Share/Stop/Watch buttons, tile pill) were measured on the
-1920x1080 windows, so re-measure them if you move the UI. Run anything else inside the rig with
+Other steps: `modal` (the sharer's `SSS_UI_DUMP`), `mclick NAME` (click a dumped control of the modal),
+`rect|val|await N ...`, `uclick|udclick|umove|uscroll N NAME ...` and `udrag N NAME DX DY [HOLD_MS]`
+(any dumped control of client N), `drag N X1 Y1 X2 Y2 [HOLD_MS]` (a real pointer drag),
+`relay-restart [DOWN_SECS]`, `click|move N X Y` (client N window coordinates), `key N <wtype args>`,
+`crop FILE OUTPUT X Y W H`, `tree`. Click targets all come from the rects in `$SCRATCH/ui<n>.txt`
+(names: `client/scripts/README.md` "`SSS_UI_DUMP`"). Run anything else inside the rig with
 `./hs-rig.sh run -- CMD...` (it sets `XDG_RUNTIME_DIR`, the absolute `WAYLAND_DISPLAY`, `SWAYSOCK`,
 `DBUS_SESSION_BUS_ADDRESS`).
 

@@ -62,7 +62,7 @@ use super::share::{
     PillKind, RoomTargets, awaiting_first_frame, dest_kbps, dest_pill, find_source, level_lit, pop_heading, rooms_count, screen_name,
     source_size, video_destination_count, waiting_hint,
 };
-use super::{Cx, NextStream, Popover, PopoverKind, UiAction, menu, tr, tr_with};
+use super::{Cx, NextStream, Popover, PopoverKind, UiAction, drive_dump, menu, tr, tr_with};
 use crate::theme::{self, Weight, font};
 use crate::widgets::{
     self, BannerKind, Btn, DestAction, DestRow, FILL, FooterClick, HBox, ModalSpec, Pill, fade, fixed, paint_galley, paint_gradient, paint_text,
@@ -208,7 +208,6 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut StreamSettingsState, capt
     let mut anchors = Anchors::default();
     let mut click = FooterClick::None;
     let cxr: &Cx = cx;
-    drive_dump::begin();
     let action = widgets::modal_shell(
         ctx,
         &spec,
@@ -259,7 +258,6 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut StreamSettingsState, capt
     }
     let closing = !matches!(click, FooterClick::None) || (action.close && cx.nav.popover.is_none());
     drive_dump::line(|| format!("mode {}\nready {}\nopen {}", if staged { "staged" } else { "live" }, u8::from(ready), u8::from(!closing)));
-    drive_dump::flush(ctx);
 
     // The open list first, then the buttons: a click outside the list that
     // lands on the other button must close the list before that button's
@@ -274,73 +272,6 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut StreamSettingsState, capt
     // Audio meter in the Source card.
     if cx.paired_audio(capture).is_some() || st.taps.is_some() {
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
-    }
-}
-
-/// Test hook for `client/scripts/drive.sh` (#47): with `SSS_UI_DUMP=<file>`
-/// set, the modal writes where its driven controls are and what they hold,
-/// one `key value…` per line, whenever that changes:
-/// `rect NAME x0 y0 x1 y1` (logical points, window-relative; NAME `fps`,
-/// `codec.I` / `preset.I` indexing `codec_order` / `preset_order`,
-/// `change`, `footer`), `fps` / `fps_options` / `codec` / `preset` / `gop` /
-/// `quality` / `tune` / `mode` / `ready` / `open`, plus `ppp` and `screen W H` so the
-/// script can map points to pixels. Unset (always, outside the scripts):
-/// nothing is recorded.
-///
-/// `Why` (#47): `drive.sh` clicked fixed pixel positions read off old
-/// screenshots; the modal grew (the encoder-limit banner) and `setup` silently
-/// kept 30 fps while `golive` missed. Positions from the live layout, and the
-/// values read back, make a miss impossible to overlook.
-mod drive_dump {
-    use std::cell::RefCell;
-    use std::fmt::Write as _;
-    use std::path::PathBuf;
-    use std::sync::OnceLock;
-
-    use egui::Rect;
-
-    fn path() -> Option<&'static PathBuf> {
-        static P: OnceLock<Option<PathBuf>> = OnceLock::new();
-        P.get_or_init(|| std::env::var_os("SSS_UI_DUMP").map(PathBuf::from)).as_ref()
-    }
-
-    thread_local! {
-        static BUF: RefCell<String> = const { RefCell::new(String::new()) };
-        static LAST: RefCell<String> = const { RefCell::new(String::new()) };
-    }
-
-    pub fn begin() {
-        if path().is_some() {
-            BUF.with_borrow_mut(String::clear);
-        }
-    }
-
-    pub fn line(text: impl FnOnce() -> String) {
-        if path().is_some() {
-            BUF.with_borrow_mut(|b| {
-                b.push_str(&text());
-                b.push('\n');
-            });
-        }
-    }
-
-    pub fn rect(name: impl FnOnce() -> String, r: Rect) {
-        line(|| format!("rect {} {:.0} {:.0} {:.0} {:.0}", name(), r.min.x, r.min.y, r.max.x, r.max.y));
-    }
-
-    /// Write the frame's lines if they differ from the last write (atomic rename).
-    pub fn flush(ctx: &egui::Context) {
-        let Some(p) = path() else { return };
-        let screen = ctx.content_rect();
-        let mut text = BUF.with_borrow(Clone::clone);
-        let _ = write!(text, "ppp {}\nscreen {:.0} {:.0}\n", ctx.pixels_per_point(), screen.width(), screen.height());
-        if LAST.with_borrow(|l| *l == text) {
-            return;
-        }
-        let tmp = p.with_extension("tmp");
-        if std::fs::write(&tmp, &text).and_then(|()| std::fs::rename(&tmp, p)).is_ok() {
-            LAST.set(text);
-        }
     }
 }
 

@@ -491,7 +491,13 @@ pub fn paint_avatar_emoji(ui: &Ui, rect: Rect, emoji: &str, initial: &str, color
         }
         p.image(g.tex.id(), img, uv, Color32::WHITE);
     } else {
-        let fs = if rect.height() <= theme::AVATAR_SM { 10.5 } else { 13.0 };
+        // The replica's sizes: `.avatar.sm`, `.avatar`, the strip's `.pv .avatar`, the idle tile's `.invite .avatar`.
+        let fs = match rect.height() {
+            h if h <= theme::AVATAR_SM => 10.5,
+            h if h <= theme::AVATAR => 13.0,
+            h if h <= theme::STRIP_AVATAR => 17.0,
+            _ => 20.0,
+        };
         let g = p.layout_no_wrap(initial.to_uppercase(), font(Weight::Bold, fs), Color32::WHITE);
         // Vertically: `mesh_bounds` = the glyph quads (the rasterised ink rows, cap
         // top to baseline for a capital, umlaut dots and descenders included), not

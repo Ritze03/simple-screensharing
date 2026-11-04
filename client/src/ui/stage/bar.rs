@@ -22,7 +22,7 @@ use simple_screensharing_client::session::RoomHandle;
 use super::{Host, StageLayout, StageState, StageView};
 use crate::theme::{self, Weight, font};
 use crate::ui::share::{self, capture_of, live_elsewhere};
-use crate::ui::{ConnState, Cx, PopoverKind, RoomEntry, ShareState, UiAction, tr, tr_with};
+use crate::ui::{ConnState, Cx, PopoverKind, RoomEntry, ShareState, UiAction, drive_dump, tr, tr_with};
 use crate::widgets::{self, DISABLED_OPACITY, paint_icon, paint_text, text_width};
 
 /// A dropdown of the bar (`PopoverKind::Bar`). Webcam gets its own in I8.
@@ -168,7 +168,7 @@ impl Bar {
             let hidden = self.sidebar_hidden;
             let tip = if hidden { tr("ui.bar.show_sidebar", "Show the sidebar") } else { tr("ui.bar.hide_sidebar", "Hide the sidebar") };
             let icon = if hidden { "left_panel_open" } else { "left_panel_close" };
-            if dim_btn(ui, Rect::from_min_size(pos2(x, y), vec2(DIM_W, BTN_H)), "bar_sidebar", icon, None, &tip) {
+            if dim_btn(ui, Rect::from_min_size(pos2(x, y), vec2(DIM_W, BTN_H)), "sidebar", icon, None, &tip) {
                 cx.act(UiAction::ToggleSidebar);
             }
             x += DIM_W + GROUP_GAP;
@@ -178,7 +178,7 @@ impl Bar {
             let w = if label { 8.0 + 22.0 + 6.0 + self.invite_label_w(ui) + 8.0 } else { DIM_W };
             let r = Rect::from_min_size(pos2(x, y), vec2(w, BTN_H));
             let tip = if self.joined.is_none() { tr("ui.room.copy_invite_offline_tip", "Connect first: the link includes the relay's certificate") } else { text.clone() };
-            if dim_btn(ui, r, "bar_invite", "person_add", label.then_some(text.as_str()), &tip) && let Some(h) = self.joined {
+            if dim_btn(ui, r, "invite", "person_add", label.then_some(text.as_str()), &tip) && let Some(h) = self.joined {
                 cx.act(UiAction::CopyInviteLink(h));
             }
         }
@@ -193,7 +193,7 @@ impl Bar {
         } else {
             ("open_in_new", tr("ui.bar.pop_stage", "Pop the stage out to its own window"))
         };
-        if dim_btn(ui, pop, "bar_pop", pop_icon, None, &pop_tip) {
+        if dim_btn(ui, pop, "pop", pop_icon, None, &pop_tip) {
             if self.popped {
                 st.popped.remove(&self.view);
             } else {
@@ -205,7 +205,7 @@ impl Bar {
         } else {
             ("fullscreen", tr("ui.stage.fullscreen", "Fullscreen"))
         };
-        if dim_btn(ui, fs, "bar_fs", fs_icon, None, &fs_tip) {
+        if dim_btn(ui, fs, "fs", fs_icon, None, &fs_tip) {
             match self.host {
                 Host::Main if self.fullscreen => cx.act(UiAction::ExitStageFullscreen),
                 Host::Main => cx.act(UiAction::EnterStageFullscreen),
@@ -249,7 +249,7 @@ impl Bar {
         }
         let pr = Rect::from_min_size(pos2(bx, by), vec2(PEOPLE_W, BTN_H));
         let tip = if self.strip_on { tr("ui.bar.hide_people", "Hide the people") } else { tr("ui.bar.show_people", "Show the people") };
-        if group_btn(ui, pr, "bar_people", "group", self.strip_on, &tip) {
+        if group_btn(ui, pr, "people", "group", self.strip_on, &tip) {
             // The strip is UI state of the stage, not shared (`StageState::strip_hidden`).
             st.strip_hidden = !st.strip_hidden;
         }
@@ -339,6 +339,7 @@ pub(super) fn layout_name(l: StageLayout) -> String {
 
 /// `.cgroup`: the pill behind grouped buttons.
 fn group_frame(ui: &Ui, r: Rect) {
+    drive_dump::rect(|| format!("ctl.group.{:.0}", r.min.x), r);
     ui.painter().rect(r, CornerRadius::same(12), theme::STAGE_GROUP, Stroke::new(1.0_f32, theme::STAGE_GROUP_BORDER), StrokeKind::Inside);
 }
 
@@ -370,6 +371,8 @@ fn split(ui: &mut Ui, rect: Rect, s: &Split) -> (bool, bool) {
     let caret = Rect::from_min_max(pos2(rect.right() - CARET_W, rect.top()), rect.max);
     let sense = if s.enabled { Sense::click() } else { Sense::hover() };
     let id = Id::new(("bar_split", s.name));
+    drive_dump::rect(|| format!("ctl.{}", s.name), main);
+    drive_dump::rect(|| format!("ctl.{}.arrow", s.name), caret);
     let (rm, rc) = (ui.interact(main, id.with("main"), sense), ui.interact(caret, id.with("caret"), sense));
     let alpha = if s.enabled { 1.0 } else { DISABLED_OPACITY };
     let (fill, line, ink, wash) = match s.tone {
@@ -412,6 +415,7 @@ fn fade(c: Color32, alpha: f32) -> Color32 {
 /// A freestanding bar button (no backdrop, dim icon): hide sidebar, Copy invite link, pop out, fullscreen.
 /// With `label` it is `[icon][label]`, 8 px padding and 6 between.
 fn dim_btn(ui: &mut Ui, rect: Rect, id: &str, icon: &str, label: Option<&str>, tip: &str) -> bool {
+    drive_dump::rect(|| format!("ctl.{id}"), rect);
     let resp = ui.interact(rect, Id::new(("bar_dim", id)), Sense::click());
     let hov = resp.hovered();
     let col = if hov { theme::TEXT } else { theme::TEXT_DIM };
@@ -430,6 +434,7 @@ fn dim_btn(ui: &mut Ui, rect: Rect, id: &str, icon: &str, label: Option<&str>, t
 
 /// A single button in a group (the people button): backdrop, accent when `on`.
 fn group_btn(ui: &mut Ui, rect: Rect, id: &str, icon: &str, on: bool, tip: &str) -> bool {
+    drive_dump::rect(|| format!("ctl.{id}"), rect);
     let resp = ui.interact(rect, Id::new(("bar_group_btn", id)), Sense::click());
     let (fill, ink) = if on { (theme::ACCENT_CHIP_BG, theme::ACCENT_LIGHTER) } else if resp.hovered() { (theme::STAGE_BTN_HOVER, theme::TEXT) } else { (theme::STAGE_BTN, theme::TEXT) };
     ui.painter().rect_filled(rect, CornerRadius::same(9), fill);
@@ -439,6 +444,7 @@ fn group_btn(ui: &mut Ui, rect: Rect, id: &str, icon: &str, on: bool, tip: &str)
 
 /// Leave: a red 64 x 50 button (a group's height), `call_end`.
 fn leave_btn(ui: &mut Ui, rect: Rect, tip: &str, enabled: bool) -> bool {
+    drive_dump::rect(|| "ctl.leave".into(), rect);
     let resp = ui.interact(rect, Id::new("bar_leave"), if enabled { Sense::click() } else { Sense::hover() });
     let fill = if resp.hovered() && enabled { widgets::lerp_color(theme::DANGER, Color32::WHITE, 0.12) } else { theme::DANGER };
     let a = if enabled { 1.0 } else { DISABLED_OPACITY };
