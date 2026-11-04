@@ -23,6 +23,7 @@ use crate::widgets::{self, FILL, HBox, fixed, paint_galley, paint_icon, paint_te
 pub(super) struct Person {
     pub name: String,
     pub you: bool,
+    pub emoji: String,
     pub items: Vec<usize>,
 }
 
@@ -35,15 +36,15 @@ pub(super) fn people(cx: &Cx, view: &StageView, items: &[Item]) -> Vec<Person> {
             let me = s.client.conn_id();
             let you_name = cx.state.display_name.clone();
             let own: Vec<usize> = items.iter().enumerate().filter(|(_, i)| i.mine).map(|(k, _)| k).collect();
-            let others = s.members.iter().filter(|m| m.conn_id != me).map(|m| Person { name: m.display_name.clone(), you: false, items: mine(&m.display_name) });
-            std::iter::once(Person { name: you_name, you: true, items: own }).chain(others).collect()
+            let others = s.members.iter().filter(|m| m.conn_id != me).map(|m| Person { name: m.display_name.clone(), you: false, emoji: s.emoji_of(m.conn_id), items: mine(&m.display_name) });
+            std::iter::once(Person { name: you_name, you: true, emoji: cx.state.emoji.clone(), items: own }).chain(others).collect()
         }
         StageView::Watched => {
             let mut out: Vec<Person> = Vec::new();
             for (k, it) in items.iter().enumerate() {
                 match out.iter_mut().find(|p| p.name == it.id.who) {
                     Some(p) => p.items.push(k),
-                    None => out.push(Person { name: it.id.who.clone(), you: false, items: vec![k] }),
+                    None => out.push(Person { name: it.id.who.clone(), you: false, emoji: cx.emoji_of_name(it.id.room, &it.id.who), items: vec![k] }),
                 }
             }
             out
@@ -104,7 +105,7 @@ fn person(ui: &mut Ui, cx: &Cx, cell: Rect, view: &StageView, p: &Person, items:
     let av = Rect::from_min_size(pos2(cell.center().x - a / 2.0, cell.top() + TOP_PAD), vec2(a, a)).round_to_pixels(ui.pixels_per_point());
     let hit = Rect::from_min_max(pos2(cell.left(), av.top() - 6.0), pos2(cell.right(), av.bottom() + 7.0 + 14.0));
     let resp = ui.interact(hit, Id::new(("strip_person", &p.name)), if popped.is_empty() { Sense::hover() } else { Sense::click() });
-    crate::ui::paint_person(ui, av, &p.name, false);
+    crate::ui::paint_person(ui, av, &p.name, &p.emoji, false);
     let c = av.center();
     let painter = ui.painter();
     if resp.hovered() {
@@ -201,7 +202,7 @@ fn card_body(ui: &mut Ui, cx: &Cx, view: &StageView, p: &Person, its: &[&Item], 
     let pw = pill.width(ui);
     let slots = if its.is_empty() { vec![fixed(32.0), FILL] } else { vec![fixed(32.0), FILL, fixed(pw)] };
     let head = HBox::new("card_head", 32.0).gap(10.0).slots(&slots).show(ui);
-    crate::ui::paint_person(ui, Rect::from_center_size(head.cell(0).center(), vec2(32.0, 32.0)), &p.name, false);
+    crate::ui::paint_person(ui, Rect::from_center_size(head.cell(0).center(), vec2(32.0, 32.0)), &p.name, &p.emoji, false);
     let c = head.cell(1);
     paint_text(ui, Rect::from_x_y_ranges(c.x_range(), c.center().y - 16.0..=c.center().y), &name, font(Weight::Bold, 13.5), theme::TEXT, Align::Min);
     paint_text(ui, Rect::from_x_y_ranges(c.x_range(), c.center().y..=c.center().y + 14.0), &sub, font(Weight::Regular, theme::FS_TINY), theme::TEXT_DIM, Align::Min);

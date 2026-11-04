@@ -372,6 +372,8 @@ pub enum UiAction {
 
     // --- settings ---------------------------------------------------------
     SetDisplayName(String),
+    /// Settings > Profile: my emoji avatar ("" = none, show the initial); announced to every room.
+    SetEmoji(String),
     SetLanguage(String),
     SetPresentationMode(PresentationMode),
     SetJitterBuffer(u32),
@@ -636,6 +638,15 @@ impl<'a> Cx<'a> {
             Some(room) => room_label(&self.state.room_store, &room.join_string),
             None => tr("ui.room.unknown", "Unknown room").to_string(),
         }
+    }
+
+    /// The emoji avatar of the member called `name` in `room` ("" for none or an unknown member). Your own
+    /// entry comes from your setting (`RoomSession::emoji_of`), so a change shows at once. Names, not
+    /// `ConnId`s, because stage items and the strip identify people by display name.
+    pub fn emoji_of_name(&self, room: RoomHandle, name: &str) -> String {
+        self.session(room)
+            .and_then(|s| s.members.iter().find(|m| m.display_name == name).map(|m| s.emoji_of(m.conn_id)))
+            .unwrap_or_default()
     }
 
     /// Display name of `owner` in `room` ("?" if unknown).
@@ -917,11 +928,12 @@ pub fn volume_slider(ui: &mut Ui, percent: &mut u32) -> egui::Response {
 
 /// The one place a person's avatar is drawn (task I3): the name's gradient and its initial, in `rect`, with
 /// the green presence dot when `presence`. The strip, the hover card, tiles, menus and the user band all call
-/// this, so the emoji avatars (I4) change one function. The colours are a pure function of the display name
+/// this. `emoji` ("" = none; look it up with [`Cx::emoji_of_name`]) replaces the initial and sets the
+/// background from its own colour; otherwise the colours are a pure function of the display name
 /// (`theme::avatar_colors`, `APP-SHELL.md` "Avatar colour").
-pub fn paint_person(ui: &Ui, rect: Rect, name: &str, presence: bool) {
+pub fn paint_person(ui: &Ui, rect: Rect, name: &str, emoji: &str, presence: bool) {
     let initial: String = name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
-    widgets::paint_avatar(ui, rect, &initial, theme::avatar_colors(name), presence);
+    widgets::paint_avatar_emoji(ui, rect, emoji, &initial, theme::avatar_colors(name), presence);
 }
 
 /// The "Level loudness" toggle that sits right after every viewer volume slider (the tile

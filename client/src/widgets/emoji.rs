@@ -132,25 +132,14 @@ fn strongest_hue(src: &image::RgbaImage) -> Option<u32> {
     Some(best as u32 * 10 + 5)
 }
 
-/// CSS `hsl()` to sRGB, each channel `round(255 * v)`; the same formula as `theme::avatar_colors`
-/// (that one is private to the theme, and this takes a fractional saturation).
-fn hsl(h: u32, s: f32, l: f32) -> Color32 {
-    let a = s * l.min(1.0 - l);
-    let f = |n: f32| {
-        let k = (n + h as f32 / 30.0) % 12.0;
-        (255.0 * (l - a * (-1.0_f32).max((k - 3.0).min(9.0 - k).min(1.0)))).round() as u8
-    };
-    Color32::from_rgb(f(0.0), f(8.0), f(4.0))
-}
-
 /// The avatar gradient (140 degrees, lighter stop first) of an emoji with this strongest hue:
 /// the name gradient's saturation and lightness (60 %, 36 % to 24 %, the second stop 10 degrees
 /// back) on the emoji's hue, or the neutral slate `hsl(222, 14 %, 36 %)` to `hsl(222, 14 %, 24 %)`
 /// for a colourless one like the skull.
 pub fn emoji_colors(hue: Option<u32>) -> [Color32; 2] {
     match hue {
-        Some(h) => [hsl(h, 0.6, 0.36), hsl((h + 350) % 360, 0.6, 0.24)],
-        None => [hsl(222, 0.14, 0.36), hsl(222, 0.14, 0.24)],
+        Some(h) => [theme::hsl_rgb(h, 0.6, 0.36), theme::hsl_rgb((h + 350) % 360, 0.6, 0.24)],
+        None => [theme::hsl_rgb(222, 0.14, 0.36), theme::hsl_rgb(222, 0.14, 0.24)],
     }
 }
 
@@ -235,7 +224,7 @@ fn picker_rows(ui: &mut Ui, current: &str, clear_label: &str) -> Option<EmojiCho
         }
     }
     ui.add_space(theme::S1);
-    let clear = PopItem { icon: "close", label: clear_label, sub: None, danger: false, selected: current.is_empty(), enabled: true, meter: None };
+    let clear = PopItem { icon: "text_fields", label: clear_label, sub: None, danger: false, selected: current.is_empty(), enabled: true, meter: None };
     if pop_item(ui, &clear).clicked() {
         choice = Some(EmojiChoice::Clear);
     }

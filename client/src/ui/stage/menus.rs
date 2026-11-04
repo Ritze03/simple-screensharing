@@ -213,7 +213,7 @@ fn tile_menu_body(
 ) {
     let (who, sub) = header_text(cx, it, combined);
     let row = widgets::HBox::new("tile_menu_head", 40.0).pad(theme::S2, theme::S2).slots(&[widgets::fixed(28.0), widgets::FILL]).show(ui);
-    crate::ui::paint_person(ui, Rect::from_center_size(row.cell(0).center(), vec2(28.0, 28.0)), &(if it.mine { cx.state.display_name.clone() } else { it.id.who.clone() }), false);
+    crate::ui::paint_person(ui, Rect::from_center_size(row.cell(0).center(), vec2(28.0, 28.0)), &(if it.mine { cx.state.display_name.clone() } else { it.id.who.clone() }), &(if it.mine { cx.state.emoji.clone() } else { cx.emoji_of_name(it.id.room, &it.id.who) }), false);
     let c = row.cell(1);
     let top = c.center().y - 15.0;
     widgets::paint_text(ui, Rect::from_x_y_ranges(c.x_range(), top..=top + 16.0), &who, font(Weight::Bold, theme::FS_ROW), theme::TEXT, Align::Min);

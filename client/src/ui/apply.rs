@@ -363,6 +363,7 @@ impl App {
 
             // --- settings ------------------------------------------------
             UiAction::SetDisplayName(n) => self.state.set_display_name(&n),
+            UiAction::SetEmoji(e) => self.state.set_emoji(&e),
             UiAction::SetLanguage(l) => self.state.set_language(&l),
             UiAction::SetPresentationMode(m) => self.state.set_presentation_mode(m),
             UiAction::SetJitterBuffer(ms) => {

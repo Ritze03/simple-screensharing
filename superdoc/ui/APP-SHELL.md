@@ -203,10 +203,23 @@ avatar, name, "Sharing N streams", and per stream a row `label · Audio / No aud
 only the announced size for an unwatched stream), the state (`On the stage`, `Popped out` with a **Bring back** button, `Not
 watching`, `Your stream · N watching`, + the room in Watched). The card stays open over the avatar, the gap and itself. Audio
 is per owner on the wire (`sibling_audio_stream`), so two streams of one person both say Audio when the person shares audio.
-**Avatars are drawn by one function, `ui::paint_person(ui, rect, name, presence)`** (initial on the name's gradient today); its
-call sites: the strip, the hover card (head), the stream menu (head), the idle tile's big avatar, the viewers dropdown and the
-sidebar's user band. The emoji avatars (I4) change that function (and `Settings > Profile` in `modals.rs`, the "Profile" card
-of `settings`, gets the picker button).
+**Avatars are drawn by one function, `ui::paint_person(ui, rect, name, emoji, presence)`** (2026-11-04, task #114): `emoji`
+("" = none) goes to `widgets::paint_avatar_emoji`: a bundled emoji replaces the initial, on a background from its strongest
+colour (neutral slate for a colourless one), with a thin black outline and its visible-pixel crop centred; "" or an emoji
+the client has no picture of (a peer's, outside the 40) draws the initial on the name's gradient. Call sites: the strip, the
+hover card (head), the stream menu (head), the idle tile's big avatar, the viewers dropdown and the sidebar's user band.
+*Where the emoji comes from:* `Cx::emoji_of_name(room, name)` (member by display name in that room's session, then
+`RoomSession::emoji_of(conn_id)`; my own entry is my setting, so a change shows at once); the strip's `Person` carries it
+(`you` = `cx.state.emoji`, Watched uses each item's own room), the viewers dropdown and idle tile look it up with the room
+they already have, the stream menu uses `cx.state.emoji` for my own item. *Why by name:* stage items and the strip identify
+people by display name (`ItemId.who`), as `ConnId` changes on reconnect.
+
+**Settings > Profile > Avatar** (2026-11-04, task #114): a row under Display name with my avatar as a button; clicking it
+opens the picker as a popover in the menu style (`modals.rs` `avatar_row`, `menu::frame()`, closes on a pick or an outside
+click): header (my avatar, "Your avatar", "Friends see it instead of your initial"), the 8x5 grid of the 40 emoji
+(`widgets::emoji_picker`), then "Use my initial" (`text_fields` icon). A choice is `UiAction::SetEmoji(String)` ("" = clear),
+applied in `apply.rs` through `AppState::set_emoji` (saved, announced to every connected room). *Why no "Paste any emoji"
+field (the replica has one):* only the 40 bundled emoji can be drawn (no colour-emoji font is guaranteed on every build).
 
 **Menus and dropdowns** (task I3, `ui/menu.rs`): every dropdown is the app's own popover style (`ui::popover` frame:
 `PANEL_RAISED`, radius 10, padding 6, shadow; `pop_item` rows with an icon and a faint second line, a highlighted current

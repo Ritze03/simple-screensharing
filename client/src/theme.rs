@@ -190,7 +190,7 @@ pub fn avatar_hue(name: &str) -> u32 {
 }
 
 /// CSS `hsl()` to 8-bit sRGB, each channel `round(255 * v)` (same as `dom.js` `hslHex`).
-fn hsl_rgb(hue: u32, s: f64, l: f64) -> Color32 {
+pub(crate) fn hsl_rgb(hue: u32, s: f64, l: f64) -> Color32 {
     let h = f64::from(hue);
     let a = s * l.min(1.0 - l);
     let f = |n: f64| {
@@ -453,6 +453,7 @@ pub const ICONS: &[(&str, char)] = &[
     ("swap_horiz", '\u{e8d4}'),
     ("sync", '\u{e627}'),
     ("sync_problem", '\u{e629}'),
+    ("text_fields", '\u{e262}'),
     ("tune", '\u{e429}'),
     ("tv_off", '\u{e647}'),
     ("videocam_off", '\u{e04c}'),

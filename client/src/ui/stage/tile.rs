@@ -244,7 +244,7 @@ pub(super) fn idle_tile(ui: &mut Ui, cx: &Cx, key: StreamKey, info: &StreamInfo,
     let mut y = top;
     if full {
         let disc = Rect::from_center_size(pos2(rect.center().x, y + 26.0), vec2(52.0, 52.0));
-        crate::ui::paint_person(ui, disc, &name, false);
+        crate::ui::paint_person(ui, disc, &name, &cx.emoji_of_name(key.0, &name), false);
         y += 52.0 + theme::S2;
         let text = if audio_only {
             tr_with("ui.stage.sharing_audio", "%{name} is sharing audio", &[("name", &name)])
@@ -341,7 +341,7 @@ pub(super) fn mine_tile(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSou
     let mut r = ui.new_child(UiBuilder::new().max_rect(row).layout(Layout::right_to_left(Align::Center)));
     if let Some(names) = viewer_names(cx, h, d.stream_id) {
         let chip = widgets::chip_dark(&mut r, Some("visibility"), false, &names.len().to_string());
-        viewers_dropdown(ui, &chip, &names);
+        viewers_dropdown(ui, cx, h, &chip, &names);
     }
     if live_tex.is_some() {
         // Says the picture is a local preview, not what viewers get.
@@ -505,7 +505,7 @@ const VIEWERS_POP_W: f32 = 200.0;
 /// viewer, avatar then name, the same avatar the people strip uses. Open while the pointer is on the
 /// chip or, once open, anywhere on the chip, the dropdown or the gap between them, so the pointer
 /// can travel into it. Nobody watching: no dropdown, a plain tooltip says so.
-fn viewers_dropdown(ui: &Ui, chip: &Response, names: &[String]) {
+fn viewers_dropdown(ui: &Ui, cx: &Cx, room: RoomHandle, chip: &Response, names: &[String]) {
     if names.is_empty() {
         chip.clone().on_hover_text(tr("ui.room.viewers_none", "Nobody is watching this yet."));
         return;
@@ -538,7 +538,7 @@ fn viewers_dropdown(ui: &Ui, chip: &Response, names: &[String]) {
                 let row = HBox::new("viewer_row", 28.0).pad(theme::S2, theme::S2).slots(&[fixed(theme::AVATAR_SM), FILL]).show(ui);
                 // The slot is as tall as the row; the avatar is a 22 px disc in its middle.
                 let disc = Rect::from_center_size(row.cell(0).center(), vec2(theme::AVATAR_SM, theme::AVATAR_SM));
-                crate::ui::paint_person(ui, disc, name, false);
+                crate::ui::paint_person(ui, disc, name, &cx.emoji_of_name(room, name), false);
                 row.text(ui, 1, name, font(Weight::Regular, theme::FS_LABEL), theme::TEXT, Align::Min);
             }
             if extra > 0 {

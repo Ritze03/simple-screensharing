@@ -33,7 +33,7 @@
 //! - **Rename** (520): one Name row, Enter or Save pushes [`UiAction::Rename`].
 
 
-use egui::{Align, Ui};
+use egui::{Align, Rect, Sense, Stroke, Ui, vec2};
 use simple_screensharing_client::audio_gain;
 use simple_screensharing_client::net::{ServerAddrError, parse_join_string, parse_server_addr};
 use simple_screensharing_client::rooms::{AppSettings, PresentationMode};
@@ -557,6 +557,7 @@ fn settings(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
                     |ui| widgets::text_field(ui, &mut st.display_name, "e.g. mo"),
                 );
                 name_done = r.lost_focus();
+                avatar_row(ui, cx);
             });
             widgets::card(
                 ui,
@@ -1136,5 +1137,55 @@ mod tests {
             tr("ui.modal.definitely_missing_key", "Fallback"),
             "Fallback"
         );
+    }
+}
+
+/// Popover width of the avatar picker: 8 cells of 32 px, 2 px gaps and the frame's padding (replica `.emoji-grid`).
+const EMOJI_POP_W: f32 = 8.0 * 32.0 + 7.0 * 2.0 + 12.0;
+
+/// Settings > Profile "Avatar" row: my avatar as a button that opens the emoji picker as a popover in the
+/// app's menu style (header with the avatar, "Your avatar" and its hint, the grid, then "Use my initial").
+/// A choice becomes [`UiAction::SetEmoji`] and closes the popover. The replica's "Paste any emoji" field is
+/// not built: only the bundled emoji can be drawn (`widgets/emoji.rs`).
+fn avatar_row(ui: &mut Ui, cx: &mut Cx) {
+    let emoji = cx.state.emoji.clone();
+    let name = cx.state.display_name.clone();
+    let mut choice = None;
+    widgets::ctrl_row(ui, &tr("ui.settings.avatar", "Avatar"), None, |ui| {
+        let (rect, _) = ui.allocate_exact_size(vec2(theme::AVATAR, theme::AVATAR), Sense::hover());
+        let resp = ui.interact(rect, ui.make_persistent_id("avatar_btn"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+        let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp));
+        if open || resp.hovered() {
+            ui.painter().circle_stroke(rect.center(), theme::AVATAR / 2.0 + 2.0, Stroke::new(1.5_f32, if open { theme::ACCENT } else { theme::BTN_BORDER }));
+        }
+        super::paint_person(ui, rect, &name, &emoji, false);
+        egui::Popup::from_toggle_button_response(&resp)
+            .kind(egui::PopupKind::Menu)
+            .layout(egui::Layout::top_down_justified(egui::Align::Min))
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .align(egui::RectAlign::BOTTOM_START)
+            .gap(4.0)
+            .width(EMOJI_POP_W)
+            .frame(menu::frame())
+            .show(|ui| {
+                ui.set_width(EMOJI_POP_W - 12.0);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let head = widgets::HBox::new("avatar_pop_head", 44.0).pad(theme::S2, theme::S2).gap(10.0).slots(&[widgets::fixed(32.0), widgets::FILL]).show(ui);
+                super::paint_person(ui, Rect::from_center_size(head.cell(0).center(), vec2(32.0, 32.0)), &name, &emoji, false);
+                let c = head.cell(1);
+                let top = c.center().y - 15.0;
+                widgets::paint_text(ui, Rect::from_x_y_ranges(c.x_range(), top..=top + 16.0), &tr("ui.settings.avatar_title", "Your avatar"), font(Weight::Bold, theme::FS_ROW), theme::TEXT, Align::Min);
+                widgets::paint_text(ui, Rect::from_x_y_ranges(c.x_range(), top + 16.0..=top + 30.0), &tr("ui.settings.avatar_hint", "Friends see it instead of your initial"), font(Weight::Regular, theme::FS_TINY), theme::TEXT_DIM, Align::Min);
+                ui.add_space(theme::S1);
+                choice = widgets::emoji_picker(ui, &emoji, &tr("ui.settings.avatar_clear", "Use my initial"));
+                if choice.is_some() {
+                    ui.close();
+                }
+            });
+    });
+    match choice {
+        Some(widgets::EmojiChoice::Pick(e)) => cx.act(UiAction::SetEmoji(e.to_string())),
+        Some(widgets::EmojiChoice::Clear) => cx.act(UiAction::SetEmoji(String::new())),
+        None => {}
     }
 }
