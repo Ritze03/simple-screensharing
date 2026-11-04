@@ -55,6 +55,8 @@ case $SCEN in
     emu SteamThing 700 0.001 "media.role=Production" SteamAppId=480
     emu PlainApp 800 0.001 "media.role=Production"
     fake_bluez
+    # another instance of this client (#117 task, 2026-11-04): must never be linked nor listed, whatever the list says
+    emu simple-screensharing-client 1000 0.5 "media.role=Production"
   else
     emu Floorp 440 0.5 "media.role=Music"
   fi

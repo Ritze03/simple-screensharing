@@ -238,6 +238,11 @@ impl AudioChoice {
     }
 }
 
+/// Names of this app's own audio streams (binary `simple-screensharing-client`, cargo test binaries
+/// `simple_screensharing_client-<hash>`): hidden everywhere and never captured, without being in the user's
+/// exclusion list (user request 2026-11-04). Matched as a case-insensitive substring of any [`Stream::aliases`].
+const OWN_APP_NAMES: [&str; 2] = ["simple-screensharing", "simple_screensharing"];
+
 /// Whether `name` is excluded by `list`: some non-blank entry is contained in it, ignoring case
 /// (task I7, D1). A blank entry would match everything and is ignored.
 pub fn name_is_excluded(name: &str, list: &[String]) -> bool {
@@ -466,7 +471,7 @@ fn streams(objects: &[PwObject]) -> Vec<Stream> {
             .to_string();
         let name = if name.is_empty() { format!("(unnamed stream {})", obj.id) } else { name };
         let own = |k: &str| prop_str(props, k).filter(|s| !s.is_empty()).map(str::to_string);
-        out.push(Stream {
+        let stream = Stream {
             id: obj.id,
             serial: prop_u64(props, "object.serial"),
             name,
@@ -478,7 +483,12 @@ fn streams(objects: &[PwObject]) -> Vec<Stream> {
             device: node_name.starts_with("bluez_")
                 || prop_str(props, "device.api") == Some("bluez5")
                 || props.keys().any(|k| k.starts_with("api.bluez5.")),
-        });
+        };
+        // Any other stream of this app (a second instance, a pop-out, an older build) is never listed or captured.
+        if stream.is_excluded(&OWN_APP_NAMES.map(String::from)) {
+            continue;
+        }
+        out.push(stream);
     }
     out
 }
@@ -2463,6 +2473,21 @@ mod tests {
         assert!(named(&objects, "Discord").is_empty());
         // The real fixture's own sink is never matched, whatever the name.
         assert!(named(&fixture_objects(), "ssshare-sink-3-abc123").is_empty());
+    }
+
+    #[test]
+    fn streams_of_other_instances_of_this_app_are_never_listed_or_captured() {
+        let json = r#"[
+            {"id":40,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Stream/Output/Audio","node.name":"other","application.name":"x","application.process.binary":"simple-screensharing-client","application.process.id":1,"object.serial":140}}},
+            {"id":41,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Stream/Output/Audio","node.name":"Simple-Screensharing","object.serial":141}}},
+            {"id":42,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Stream/Output/Audio","node.name":"mpv","application.name":"mpv","object.serial":142}}}
+        ]"#;
+        let objects: Vec<PwObject> = serde_json::from_str(json).unwrap();
+        let sources = extract_audio_sources(&objects, &|_, _| false);
+        assert_eq!(sources.iter().map(|s| s.id).collect::<Vec<_>>(), vec![42]);
+        let exclusions = vec!["Discord".to_string()];
+        assert_eq!(wanted_ids(&streams(&objects), &AudioChoice::Desktop, &exclusions), vec![42]);
+        assert_eq!(exclusions, vec!["Discord".to_string()], "the user's list is untouched");
     }
 
     #[test]
