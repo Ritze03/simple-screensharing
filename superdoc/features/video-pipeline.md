@@ -57,7 +57,7 @@ SW: appsrc ! {h264,h265,av1}parse ! {avdec_h264,avdec_h265,av1dec} ! videoconver
   they come out; pacing belongs where the display refresh is known (the presenter).
   `PacingState` stays as a `pub` building block for that.
 
-**A keyframe is a freeze, not a latency step (row 129, 2026-11-04).** The viewer cannot show a keyframe's picture before its last fragment arrives and the presenter is latest-only, so the sharer's keyframe pacing window shows up 1:1 as a freeze of the picture (decoder-output gap = pump hold + ~13 ms IDR decode; relay, upload and the rest measured at 1-2 ms on loopback). Numbers and the fix (adaptive pacing rate): `features/stream-control.md` "The lagspike on every keyframe".
+**A keyframe is a freeze, not a latency step (row 129, 2026-11-04).** The viewer cannot show a keyframe's picture before its last fragment arrives and the presenter is latest-only, so the sharer's keyframe pacing window shows up 1:1 as a freeze of the picture (decoder-output gap = pump hold + ~13 ms IDR decode; relay, upload and the rest measured at 1-2 ms on loopback). On a real line the sender's uplink sets that window, not the pump (row 133): `features/stream-control.md` "Keyframe stutter on the real machine".
 
 **Output:** zero-copy `Arc<DecodedFrame>` (Y and UV slices of the mapped buffer, strides,
 `pts_us`, `YuvMatrix`, `full_range`) published into a latest-only slot. Consumers hold a

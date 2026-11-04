@@ -24,29 +24,78 @@ fan-out**, **transfer** between rooms, and the two **bandwidth modes** with
 
 ---
 
-## Keyframe stutter on the real machine: what the logs prove so far (2026-11-04, row 133)
+## Keyframe stutter on the real machine: the keyframe is bigger than the uplink (2026-11-04, row 133)
 
-**User report (2026-11-04, verbatim), after row 129 below:** "the stutter on keyframes is still there." So the section
-below is unproven on the real machine: it measured the rig (loopback, one pattern, decoder output, not the screen).
+**User report (2026-11-04, verbatim), after row 129 below:** "the stutter on keyframes is still there." Then: "It is only like
+a short stutter (maybe 100ms), but it perfectly lines up with the keyframe interval setting. No matter the framerate/preset."
+and "Moving the mouse stutters, moving windows stutters and playing back video stutters". And: "The only time where i cant
+observe any stutter is at 240fps, but that may be due to the encoder only receiving 180fps?"
 
-**What their uploaded logs and the relay's show** (session 10:24-10:29 UTC, both clients on one machine, build `8d92373`,
-AV1, 120 fps, ~10 Mbit/s, keyframe interval 250 ms; the fps and bitrate are worked out from `paced over` and the 30 ms floor):
+**Cause: a keyframe takes its size divided by the sender's uplink to get through, and every later frame waits behind it.**
+The viewer cannot show the keyframe before its last fragment, so the picture stops for that long and the waiting frames then
+arrive in a clump. Row 129 shortened the time the *pump* spends on a keyframe to ~14 ms, which only moved the queue from the
+pump into the modem: the user's line takes about 37 Mbit/s up, 12x of 10 Mbit/s is 120 Mbit/s, and anything above about 3.7x
+buys nothing there. The loopback rig has no such limit, so it could not show this.
 
-- **The keyframe interval is a frame count, not a time.** `key-int-max` = 30 frames, and the relay counted 5326 frames /
-  181 keyframes, 5822 / 196, 5746 / 191, 4098 / 137, 1218 / 41: always 29.4-30 frames per keyframe, while the frame rate
-  moved between 61 and 95 fps (capture is damage-driven). That is the 0.3-0.75 s spacing in the log. Nothing forces them:
-  `IdrControl` logs its squeezes and there are none.
-- **Keyframes are most of the stream.** The relay saw 0.63-0.97 MB/s; 3 keyframes/s of ~200 kB are about 0.6 MB/s of that.
-- **Loss and the NACK hold do not explain "every keyframe":** 703 keyframes against 13 repair events in 250 s, relay ->
-  viewer 64 of 232 152 packets lost. `RcvbufErrors` on the relay is 3782 in 138 M datagrams since its last boot.
-- **quinn does not hold the burst back:** the BBR window only grows (`cwnd=225188566` on the relay's viewer connection;
-  `bbr/mod.rs` adds every acked byte while `cwnd_gain < target_window`), so its pacer never binds after the start.
-- **Encode and decode of an IDR are not slow** on this GPU, measured outside the app with the client's exact element
-  lines (AV1, 1080p120, a 180-190 kB IDR, one at a time, not both at once): encode 4.0 ms against 3.4 for a delta, no
-  reordering in `vaav1enc` (its `gf-group-size` default did not delay anything), decode 8.7 / 11.5 ms (median / max)
-  against 3.3 for a delta, so about one frame of extra gap at 120 fps.
+Measured on the user's own line (this machine is the client: public IP 92.117.193.182, RTT to the relay 19 ms):
 
-So none of the row 129 candidates is proven. **The cause is not known yet**, which is why the timing report below exists.
+| probe | result |
+|---|---|
+| 230 x 1200 B ICMP in 12 ms (a keyframe at 12x) to `1.1.1.1` | all 230 back, first 12.8 ms, **last 61 ms: 37 Mbit/s** |
+| the same to the relay's public IP | first 19.6 ms, last 58-59 ms, 38 Mbit/s (only ~200 replies: its router stops answering, the app sees no such loss) |
+| 24 MB over ssh to / from the relay's host | 31 Mbit/s up, 52 Mbit/s down (with ssh's start-up) |
+
+So 230 kB takes ~50 ms and the 438-datagram keyframes of their 1000 ms sessions ~95 ms, which is the "maybe 100ms". There is
+no loss to see: the queue absorbs the burst, which is why NACK stayed quiet (13 repairs in 703 keyframes).
+
+**Reproduced** in the rig behind `udpproxy` set to the same path (38 Mbit/s up, 150 ms queue, 10 ms each way), a detailed desktop
+with a detailed 480x360 window moving in circles (`pat.py`, source 240 fps, 10 Mbit/s). Gap = `shown_gap_ms[key` median:
+
+| codec, fps, keyframe | keyframe kB | `span_ms` key | gap at the keyframe | frame period |
+|---|---|---|---|---|
+| no bottleneck, AV1 120, 250 ms | 257 | 15 | 27 | 8.3 |
+| 20 ms RTT only, AV1 120, 250 ms | 256 | 15 | 27 | 8.3 |
+| AV1 60, 250 ms | 275 | 61 | 83 | 16.7 |
+| AV1 120, 250 ms | 259 | 57 | 69 | 8.3 |
+| H.264 120, 250 ms | 271 | 59 | 68 | 8.3 |
+| H.264 165, 250 ms | 241 | 53 | 61 | 6.1 |
+| H.264 240, 250 ms | 241 | 53 | 57 | 4.2 |
+| AV1 240, 250 ms, source 176 fps (the user's "180") | 230 | 51 | 60 | 5.7 |
+| AV1 120, 1000 ms | 607 | 134 | ~140 (one window) | 8.3 |
+| H.264 60, 1000 ms | 708 | 157 | 181 | 16.7 |
+
+AV1 165 and AV1 240 from a 240 fps source produced no report behind the bottleneck (the share did not run; see the side finding). The gap follows the keyframe's size at every frame rate, codec and preset that ran, as the user said. The frames behind it then arrive
+2.3 ms apart (`shown_gap_ms after`). Sender side in all of them: `pump_hold_ms` 14-17, `quinn_queue_max_kB` 33-59, `enc_late_ms` key
+about 1: encoder and pump are not it.
+
+**Why 240 fps looks clean: not explained.** The numbers say it stalls the same (AV1 240 at 176 fps: 60 ms, H.264 240: 57 ms), and
+the user's own 240 session sent the same 230-datagram keyframes (4583 frames, 76 keyframes: 60 frames each, 176 fps). `RateCap` and
+the tee are not involved: nothing differs at the keyframe. A guess, not a measurement: at 240 fps the catch-up after the stall shows
+about twice as many intermediate pictures, so it reads as a quick speed-up, not a jump.
+
+**Ruled out, measured:** encoder skipping or starving frames after an IDR (`motion.py`: a marker in the picture tracked through
+vaav1enc + vaav1dec at 120 fps stays within 5 ms of where it should be across every keyframe, no frozen run; deltas behind the IDR 1.5-2 kB, as
+elsewhere); IDR encode (4.0 ms against 3.4) and decode (8.7 against 3.3); `vaav1enc` reordering (none); quinn: at 20 ms RTT `cwnd_kB` is 0.5-36 MB and it
+holds nothing back (on loopback it is ~37 kB, harmless at RTT 0); loss and the NACK hold (`held=0`); forced IDRs: the interval is `key-int-max` *frames*
+(relay: 29.4-30 frames per keyframe while the rate moved 61-95 fps), which is why it read 0.3-0.75 s at damage-driven rates.
+
+**What can be done, each measured on that path unless said. Nothing is changed yet: every line costs something, it is the user's choice.**
+
+| option | keyframe | stall | how often | cost |
+|---|---|---|---|---|
+| today, Gaming 10 Mbit/s | 259 kB | 69 ms | 4/s | |
+| bitrate 5 Mbit/s | 135 kB | 39 ms | 4/s | half the picture quality budget |
+| Keyframe 1000 ms | 600-700 kB | 140-180 ms | 1/s | a longer stall: the size grows with the interval |
+| Keyframe 8 s (H.264, temporary override, 0.1 % loss) | 0.9-1.5 MB | 291 ms | every 8 s | much longer stall; fall-back to 2.5x makes it worse |
+| squeeze every IDR (#102's `bitrate` write) | 27-57 kB (#102) | about 10-20 ms, estimated | 4/s | -2 dB static, -4..-6 dB detail on each keyframe: a visible pulse; radeonsi quirk, not measured here |
+| playout buffer on the viewer (native has none) | unchanged | hidden | | fixed latency of about the stall on everything: ~70 ms at Gaming on this line, ~180 ms at 1000 ms; not built |
+
+A faster uplink fixes it too: at 100 Mbit/s the same keyframe costs ~20 ms plus decode.
+
+**Side finding, not fixed:** in the rig, AV1 with 8 s keyframes died at the first squeezed forced IDR (`the last keyframes were big; squeezing`,
+23 ms later `pipewiresrc0: Internal data stream error ... reason error (-5)`, then a capture restart every few seconds), and `av1 60 quality` ran
+at 69 frames in 10 s. `vaav1enc` also fails with -5 on its very first frame of `videotestsrc pattern=snow` while `vah264enc` takes it,
+so an AV1 frame too big for the encoder looks like the trigger; a `bitrate` write on easy content survives. None of the user's logs has `capture source lost`.
 
 **`video timing` log lines (permanent, info, one per 10 s and stream, near-zero cost).** Sender (`SendTiming`,
 `capture.rs`): the settings in use, keyframe interval, sizes of keyframes / the 3 frames behind them / other deltas,
@@ -58,9 +107,12 @@ machine their difference is the shortest capture-to-complete time.
 *Why:* "the stutter on keyframes is still there": only the user's machine can show which stage hitches, and their
 uploaded log comes back with no effort from them.
 
+The user's sessions up to 12:10 UTC ran `8d923739b`, older than these lines, so none has reached the relay yet (the upload's filter keeps
+`simple_screensharing_client` at INFO, which covers them). On a build with them, `span_ms[key=` is the proof: about 50 ms on their line.
+
 ## The lagspike on every keyframe: the pacing hold, deadline pacing and an adaptive rate (2026-11-04, row 129)
 
-*(Row 133 above: the user still sees the stutter with this in place; the conclusion below holds for the rig only.)*
+*(Row 133 above corrects this: on a real line the keyframe's time is set by the uplink, not the pump. The conclusion below holds for the loopback rig only; the 12x rate does nothing past the uplink's speed.)*
 
 **User report (2026-11-04, verbatim):** "On every keyframe, there is a lagspike in the screenshare." Their uploaded
 client log had 1846 `sending a keyframe of ~300-360 datagrams (~300-360 kB), paced over ~80-100 ms` lines in one session
@@ -893,29 +945,13 @@ tells the user when that caps the framerate. Full table and reasoning:
 Real app, vkcube on DP-1 (280 Hz), 240 fps target, sender stats tracer: AV1 Gaming 107.8 fps
 encoder output before, 240.1 after; H.264 Gaming 239.9 after.
 
-### The encoder-limit hint
+### The encoder-limit hint (removed)
 
-`capture::destination::EncoderLimit` (on `DestinationRuntime`, so the UI reads it through
-`Destination::runtime` with no `session.rs` change): every 500 ms the destination pump
-compares the encoder's output fps against `min(frames offered to the branch, target fps)`.
-Offered frames are counted by a probe on the branch bin's sink pad, *before* its leaky
-queue. Below 90 % for more than 3 s → limited; at or above 90 % for more than 3 s →
-cleared; any non-Live state (a rebuild for a codec switch, a pause) resets it.
-**Why against the offered rate, not the target alone:** the portal sends a frame only when
-the screen changes, so an idle or slower monitor under a 240 target would otherwise read as
-an encoder limit. No per-GPU tables: everything is measured at run time.
-
-**Removed 2026-11-04 (user, row 135): every UI surface of the hint** (the "Encoding N of M fps" /
-"Your encoder can't keep up" note in the Share menu; keys `ui.bar.encoding_n_of_m`,
-`ui.bar.encoder_limit_why`). The user: "framerate is dynamic, so remove the warning. It always pops
-up, when nothing is moving." The measurement itself (`EncoderLimit`, `DestinationRuntime::encoder_limited`)
-is now unused by the UI and still in `capture.rs`.
-
-**Removed 2026-10-15 (user, #87): the stream-settings banner.** The Video card used to show an
-Info banner under Framerate, "Your encoder reaches about N fps with H.264 on this machine.",
-with a "Use H.265" button. The user: "it's just annoying". Both strings
-(`ui.stream.encoder_limit`, `ui.stream.use_h265`) and the card code are gone; the measurement
-(`EncoderLimit`) stayed for the bar until 2026-11-04 (see above).
+Every 500 ms the pump compared the encoder's output fps with `min(frames offered to the branch, target fps)` and the UI
+showed "Encoding N of M fps". **Removed 2026-11-04 (user, row 135):** "framerate is dynamic, so remove the warning. It
+always pops up, when nothing is moving." The UI went first, the measurement (`EncoderLimit`) with row 133. The
+offered-frames probe on the branch stays: `stall_verdict` uses it to tell a dead source from a wedged encoder.
+The older stream-settings banner ("Your encoder reaches about N fps", "Use H.265") went on 2026-10-15 (user, #87: "it's just annoying").
 
 ## Cancelling the screen picker is silent (2026-10-14)
 

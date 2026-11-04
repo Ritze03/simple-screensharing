@@ -4088,9 +4088,9 @@ async fn destination_pump(
     // successfully handed off to the QUIC connection — see [`SENT_FPS_WINDOW`].
     let mut sent_frame_times: VecDeque<Instant> = VecDeque::new();
     // (when, `offered_frames()`) samples of the current branch over
-    // [`ENCODER_FPS_WINDOW`], for the offered rate the encoder-limit hint
-    // compares against (#46, [`destination::EncoderLimit`]). Keyed by branch
-    // id: a swapped-in branch's counter starts again at 0.
+    // [`ENCODER_FPS_WINDOW`]: tells a dead source from a wedged encoder in a
+    // stall ([`destination::stall_verdict`]). Keyed by branch id: a swapped-in
+    // branch's counter starts again at 0.
     let mut offered_samples: VecDeque<(Instant, u64)> = VecDeque::new();
     let mut offered_branch: Option<branch::BranchId> = None;
     // Mirrors this branch's valve so a `SubscriberCount` transition from one
@@ -4232,14 +4232,9 @@ async fn destination_pump(
                             let secs = now.duration_since(t0).as_secs_f64();
                             if secs >= 1.0 {
                                 offered_recently = Some(offered_now - n0);
-                                let offered_fps = ((offered_now - n0) as f64 / secs).round() as u32;
-                                runtime.lock().unwrap().observe_encoder_rate(now, encoder_fps.load(Ordering::Relaxed), offered_fps);
                             }
                         }
-                        None => {
-                            offered_samples.clear();
-                            runtime.lock().unwrap().reset_encoder_limit();
-                        }
+                        None => offered_samples.clear(),
                     }
                     if !paused && branch.is_some() && !branch_ended {
                         let mut runtime = runtime.lock().unwrap();
@@ -5494,74 +5489,6 @@ pub mod destination {
             .clamp(MIN_FRAMERATE, MAX_FRAMERATE)
     }
 
-    /// How long the encoder must stay below (or back above) the bar before
-    /// [`EncoderLimit`] changes its verdict (#46: "for more than 3 s").
-    pub const ENCODER_LIMIT_HOLD: Duration = Duration::from_secs(3);
-
-    /// The encoder counts as limiting when it produces less than this
-    /// percentage of the frames it is offered (#46: "more than 10% below").
-    pub const ENCODER_LIMIT_PERCENT: u32 = 90;
-
-    /// A destination's encoder is the bottleneck: it encodes `encoding_fps`
-    /// of the `target_fps` the destination asks for. See [`EncoderLimit`].
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct EncoderLimited {
-        pub encoding_fps: u32,
-        pub target_fps: u32,
-    }
-
-    /// Sustained "the encoder can't keep up" detector (#46), measured at run
-    /// time, no per-GPU tables.
-    ///
-    /// Compares the encoder's output rate against what it was *offered*:
-    /// `min(frames reaching the branch, target fps)`. `Why` not the target
-    /// alone: the portal only sends a frame when the screen changes, so an
-    /// idle or 60 Hz screen under a 240 fps target would read as an encoder
-    /// limit. Frames reaching the branch are counted before its leaky queue,
-    /// i.e. before an overloaded encoder makes that queue drop them.
-    ///
-    /// The verdict flips only after [`ENCODER_LIMIT_HOLD`] of continuous
-    /// evidence in either direction, so a rate hovering at the 90 % line
-    /// doesn't flicker the hint.
-    #[derive(Debug, Clone, Default)]
-    pub struct EncoderLimit {
-        limited: bool,
-        /// Since when the evidence has contradicted `limited`.
-        flip_since: Option<Instant>,
-        encoding_fps: u32,
-        target_fps: u32,
-    }
-
-    impl EncoderLimit {
-        /// One observation: the encoder produced `encoder_fps` while
-        /// `offered_fps` frames/s reached the branch, against `target_fps`.
-        pub fn observe(&mut self, now: Instant, encoder_fps: u32, offered_fps: u32, target_fps: u32) {
-            let expected = offered_fps.min(target_fps);
-            let below = expected > 0 && u64::from(encoder_fps) * 100 < u64::from(expected) * u64::from(ENCODER_LIMIT_PERCENT);
-            self.encoding_fps = encoder_fps;
-            self.target_fps = target_fps;
-            if below == self.limited {
-                self.flip_since = None;
-                return;
-            }
-            let since = *self.flip_since.get_or_insert(now);
-            if now.duration_since(since) >= ENCODER_LIMIT_HOLD {
-                self.limited = below;
-                self.flip_since = None;
-            }
-        }
-
-        /// Forget everything (paused, rebuilt, not Live): a new encoder or a
-        /// paused one says nothing about the old one's speed.
-        pub fn reset(&mut self) {
-            *self = Self::default();
-        }
-
-        pub fn verdict(&self) -> Option<EncoderLimited> {
-            self.limited.then_some(EncoderLimited { encoding_fps: self.encoding_fps, target_fps: self.target_fps })
-        }
-    }
-
     /// Shared handle onto one destination's [`DestinationRuntime`]. The pump
     /// task ([`super::pump_loop`]) writes it as frames flow; `ui.rs` reads the
     /// state to render; the swap/restart orchestrators in [`branch`] drive its
@@ -5617,8 +5544,6 @@ pub mod destination {
         /// the *preferred* one: the next branch swap tries it first again, so a
         /// transient VA failure does not pin the destination to x264 for good.
         actual_backend: Option<EncoderBackend>,
-        /// Fed by [`super::destination_pump`]; read by the UI (#46).
-        encoder_limit: EncoderLimit,
     }
 
     impl DestinationRuntime {
@@ -5635,7 +5560,6 @@ pub mod destination {
                 last_frame_at: None,
                 params,
                 actual_backend: None,
-                encoder_limit: EncoderLimit::default(),
             }
         }
 
@@ -5648,32 +5572,6 @@ pub mod destination {
         /// Record the backend of the branch that just became authoritative.
         pub fn set_actual_backend(&mut self, backend: EncoderBackend) {
             self.actual_backend = Some(backend);
-        }
-
-        /// `Some` while this `Live` destination's encoder has been the
-        /// bottleneck for a while — see [`EncoderLimit`]. The UI's
-        /// "Encoding N of M fps" hint.
-        pub fn encoder_limited(&self) -> Option<EncoderLimited> {
-            if self.state != DestinationState::Live {
-                return None;
-            }
-            self.encoder_limit.verdict()
-        }
-
-        /// Feed [`EncoderLimit`] one rate observation (the pump does, every
-        /// [`STALL_RESEND_INTERVAL`]). Outside `Live` the tracker resets.
-        pub fn observe_encoder_rate(&mut self, now: Instant, encoder_fps: u32, offered_fps: u32) {
-            if self.state != DestinationState::Live {
-                self.encoder_limit.reset();
-                return;
-            }
-            let target = self.params.framerate;
-            self.encoder_limit.observe(now, encoder_fps, offered_fps, target);
-        }
-
-        /// See [`EncoderLimit::reset`].
-        pub fn reset_encoder_limit(&mut self) {
-            self.encoder_limit.reset();
         }
 
         pub fn shared(now: Instant, params: VideoParams) -> SharedDestination {
@@ -6007,68 +5905,12 @@ pub mod destination {
             assert_eq!(runtime.actual_backend(), Some(EncoderBackend::Vaapi));
         }
 
-        // -------------------------------------------------------------
-        // Encoder limit (#46)
-        // -------------------------------------------------------------
-
-        /// Feeds `runtime` one observation every 500 ms for `secs` seconds,
-        /// starting at `from`; returns the time after the last one.
-        fn feed(runtime: &mut DestinationRuntime, from: Instant, secs: u64, enc: u32, offered: u32) -> Instant {
-            let mut t = from;
-            for _ in 0..secs * 2 {
-                t += Duration::from_millis(500);
-                runtime.observe_encoder_rate(t, enc, offered);
-            }
-            t
-        }
-
         fn live(framerate: u32) -> (DestinationRuntime, Instant) {
             let now = t0();
             let mut runtime = DestinationRuntime::new(now, params(framerate));
             runtime.note_encoded_frame(true, b"idr", now);
             assert_eq!(runtime.state(), DestinationState::Live);
             (runtime, now)
-        }
-
-        #[test]
-        fn encoder_limit_needs_more_than_three_seconds_below_ninety_percent() {
-            let (mut runtime, now) = live(240);
-            // 168 of 240 offered: below 90 %, but not for long enough yet.
-            let t = feed(&mut runtime, now, 2, 168, 280);
-            assert_eq!(runtime.encoder_limited(), None);
-            feed(&mut runtime, t, 2, 168, 280);
-            assert_eq!(runtime.encoder_limited(), Some(EncoderLimited { encoding_fps: 168, target_fps: 240 }));
-        }
-
-        #[test]
-        fn a_source_that_offers_few_frames_is_not_an_encoder_limit() {
-            // Idle screen: the portal offers 20 fps, the encoder makes all 20.
-            let (mut runtime, now) = live(240);
-            feed(&mut runtime, now, 10, 20, 20);
-            assert_eq!(runtime.encoder_limited(), None);
-            // 230 of 240 is within 10 %.
-            feed(&mut runtime, now, 10, 230, 280);
-            assert_eq!(runtime.encoder_limited(), None);
-        }
-
-        #[test]
-        fn encoder_limit_clears_only_after_three_seconds_of_keeping_up_and_outside_live() {
-            let (mut runtime, now) = live(240);
-            let t = feed(&mut runtime, now, 4, 168, 280);
-            assert!(runtime.encoder_limited().is_some());
-            let t = feed(&mut runtime, t, 2, 240, 280);
-            assert!(runtime.encoder_limited().is_some(), "one good second doesn't clear it");
-            let t = feed(&mut runtime, t, 2, 240, 280);
-            assert_eq!(runtime.encoder_limited(), None);
-
-            let t = feed(&mut runtime, t, 4, 168, 280);
-            assert!(runtime.encoder_limited().is_some());
-            // A rebuild (e.g. "Use H.265") forgets the old encoder's verdict.
-            runtime.begin_rebuild(t);
-            assert_eq!(runtime.encoder_limited(), None);
-            runtime.observe_encoder_rate(t, 168, 280);
-            runtime.finish_rebuild();
-            assert_eq!(runtime.encoder_limited(), None);
         }
 
         // -------------------------------------------------------------
@@ -6896,8 +6738,7 @@ pub mod branch {
         /// See the type's doc comment — created at most once per branch.
         stream: Option<gst_app::app_sink::AppSinkStream>,
         /// Frames that reached this branch (counted on its sink pad, before
-        /// the leaky queue): the "offered" side of
-        /// [`super::destination::EncoderLimit`].
+        /// the leaky queue): what [`super::destination::stall_verdict`] reads.
         offered: Arc<AtomicU64>,
         /// The backend this branch was *actually* built with: differs from the
         /// requested [`EncodeSettings::backend`] when
