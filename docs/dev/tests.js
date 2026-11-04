@@ -1949,7 +1949,14 @@ test("Watched: several streams of one person are one avatar with a count, per ro
   const r1 = { id: "r1", emojiOf: (id) => id }, r2 = { id: "r2", emojiOf: (id) => id };
   const it = (r, conn, id) => ({ id, r, conn, owner: "Ritze" });
   const people = peopleOf({ kind: "watched" }, [it(r1, "c2", "a"), it(r1, "c3", "b"), it(r1, "c2", "c"), it(r2, "c2", "d")]);
-  eq(people.map((p) => [p.key, p.emoji, p.items.map((i) => i.id)]), [["r1/c2", "c2", ["a", "c"]], ["r1/c3", "c3", ["b"]], ["r2/c2", "c2", ["d"]]]);
+  // the same name in two rooms is one person (first connection's emoji); the two of r1 stay two
+  eq(people.map((p) => [p.key, p.conns, p.emoji, p.items.map((i) => i.id)]), [["r1/c2", ["r1/c2", "r2/c2"], "c2", ["a", "c", "d"]], ["r1/c3", ["r1/c3"], "c3", ["b"]]]);
+  // a name never takes a second connection of a room it has; other names stay apart; yours are one "You" across rooms
+  const r3 = { id: "r3", emojiOf: (id) => id };
+  const mine = (r, id) => ({ id, r, conn: "me", owner: "Me", mine: true });
+  const p2 = peopleOf({ kind: "watched" }, [it(r1, "c2", "a"), it(r1, "c3", "b"), it(r3, "c7", "c"), { id: "d", r: r2, conn: "c5", owner: "Mo" }, mine(r1, "m1"), it(r3, "c8", "e"), mine(r2, "m2")]);
+  eq(p2.map((p) => [p.you, p.conns, p.items.map((i) => i.id)]), [
+    [false, ["r1/c2", "r3/c7"], ["a", "c"]], [false, ["r1/c3", "r3/c8"], ["b", "e"]], [false, ["r2/c5"], ["d"]], [true, ["r1/me", "r2/me"], ["m1", "m2"]]]);
 });
 
 test("item ids: two same-named owners sharing one label are two tiles, in stream key order whatever the list's order; a reconnect keeps the same two ids", () => {

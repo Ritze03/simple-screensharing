@@ -145,7 +145,7 @@ export function numberIdentical(items) {
 }
 
 /** Who the strip shows: a room's members (you first), or the owners of the watched streams (Watched). A person is a connection, so `key` is room + ConnId
- *  and a person's `items` are the ones with their `conn`: never compare names here. `{ key, name, you, emoji, items, r }`. */
+ *  and a person's `items` are the ones with their `conn`: never compare names here. `{ key, conns, name, you, emoji, items, r }` (`r`: the first connection's room). */
 export function peopleOf(view, items) {
   const personKey = (r, conn) => `${r.id}/${conn}`;
   if (view.kind === "room") {
@@ -153,13 +153,20 @@ export function peopleOf(view, items) {
     const members = [...r.members].sort((a, b) => (b.self ? 1 : 0) - (a.self ? 1 : 0));
     return members.map((m) => ({ key: personKey(r, m.id), name: m.name || "?", you: !!m.self, emoji: r.emojiOf(m.id), items: items.filter((i) => (m.self ? i.mine : !i.mine && i.conn === m.id)), r }));
   }
-  const people = new Map();
+  // Watched: group by connection (room + ConnId), then merge connections of one NAME across DIFFERENT rooms into one person; yours (`mine`) are all one
+  // "You". `Why:` the name is the only identity across rooms, but two connections of one name in the SAME room are provably two (the user's report above),
+  // so a person never takes a second connection of a room it already has; with several candidates the first person wins. The merged emoji is the first
+  // connection's (the others may differ; nothing better to pick). `conns`: the person's `room/ConnId` keys; `key` is the first.
+  const people = [];
   for (const it of items) {
-    const key = personKey(it.r, it.conn);
-    if (!people.has(key)) people.set(key, { key, name: it.owner, you: false, emoji: it.r.emojiOf(it.conn), items: [], r: it.r });
-    people.get(key).items.push(it);
+    const at = personKey(it.r, it.conn);
+    let p = people.find((x) => x.conns.includes(at));
+    if (!p) p = people.find((x) => (it.mine ? x.you : !x.you && x.name === it.owner) && x.conns.every((c) => !c.startsWith(`${it.r.id}/`)));
+    if (p) { if (!p.conns.includes(at)) p.conns.push(at); }
+    else people.push((p = { key: at, conns: [at], name: it.mine ? "" : it.owner, you: !!it.mine, emoji: it.r.emojiOf(it.conn), items: [], r: it.r }));
+    p.items.push(it);
   }
-  return [...people.values()];
+  return people;
 }
 
 /** A label that is a known default in any language shows in the current one (native `share_label`): the webcam's wire label is `Webcam` everywhere, a Desktop

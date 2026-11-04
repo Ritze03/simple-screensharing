@@ -6,8 +6,8 @@
 //! voice chat. Several streams of one person are one avatar with a count; a popped-out stream shows only as a
 //! badge on its owner's avatar (dashed outline, a pop badge) and a click brings it back from there.
 //!
-//! **A person is a connection** ([`Person::room`] + [`Person::conn`]), not a name: everything here, the egui ids
-//! included, keys on that. `Why`: the user runs two clients in one room under one name, "Both are technically me, but
+//! **A person is a connection** ([`Person::conns`]), not a name: everything here, the egui ids included, keys on
+//! that. Only "Watched" merges, across rooms ([`owners`]). `Why`: the user runs two clients in one room under one name, "Both are technically me, but
 //! that should be properly handled!"; by name the two shared one hover and one card and claimed each other's streams.
 //!
 //! Hovering a person opens the same card for everyone: a header and, per stream, a row saying Audio or No
@@ -25,11 +25,13 @@ use crate::theme::{self, Weight, font};
 use crate::ui::{Cx, UiAction, drive_dump, tr, tr_with};
 use crate::widgets::{self, FILL, HBox, fixed, paint_galley, paint_icon, paint_text, text_galley, text_width};
 
-/// A person in the strip: a connection in a room ("Watched" mixes rooms), their name and the stage items that are
-/// theirs (indices into the stage's items).
+/// A person in the strip: one connection of a room, or in "Watched" every connection of one name across rooms
+/// ([`owners`]), their name and the stage items that are theirs (indices into the stage's items). Each item
+/// carries its own room and connection, so a merged person's per-stream actions still hit the right one.
 pub(super) struct Person {
-    pub room: RoomHandle,
-    pub conn: ConnId,
+    /// The connections this person is, in order of appearance, never two of one room in "Watched"; the first one
+    /// keys the egui ids ([`Person::key`]).
+    pub conns: Vec<(RoomHandle, ConnId)>,
     pub name: String,
     pub you: bool,
     pub emoji: String,
@@ -52,8 +54,7 @@ pub(super) fn people(cx: &Cx, view: &StageView, items: &[Item]) -> Vec<Person> {
 /// A room's people, `you` first: `(conn, name, emoji)` each, with the items of that connection.
 fn room_people(room: RoomHandle, you: (ConnId, String, String), others: impl Iterator<Item = (ConnId, String, String)>, items: &[Item]) -> Vec<Person> {
     let person = |(conn, name, emoji): (ConnId, String, String), is_you: bool| Person {
-        room,
-        conn,
+        conns: vec![(room, conn)],
         name,
         you: is_you,
         emoji,
@@ -62,16 +63,43 @@ fn room_people(room: RoomHandle, you: (ConnId, String, String), others: impl Ite
     std::iter::once(person(you, true)).chain(others.map(|o| person(o, false))).collect()
 }
 
-/// The owners of `items` in order of appearance: one person per room and connection, with a count of their streams.
+/// The owners of `items` ("Watched") in order of appearance, with their streams. Connections are grouped first
+/// (a room and a `ConnId`), then connections of the same name in DIFFERENT rooms merge into one person; yours
+/// (`mine`) are all one "You". `Why`: the name is the only identity across rooms, but two connections of one name
+/// in the SAME room are provably two (row 127: one hover, one card and claimed streams when merged), so a person
+/// never takes a second connection of a room it already has. With several candidates the first person wins. A
+/// merged person's emoji is the first connection's (the others may differ; nothing better to pick).
 fn owners(items: &[Item], emoji_of: impl Fn(RoomHandle, ConnId) -> String) -> Vec<Person> {
     let mut out: Vec<Person> = Vec::new();
     for (k, it) in items.iter().enumerate() {
-        match out.iter_mut().find(|p| (p.room, p.conn) == (it.id.room, it.conn)) {
-            Some(p) => p.items.push(k),
-            None => out.push(Person { room: it.id.room, conn: it.conn, name: it.id.who.clone(), you: false, emoji: emoji_of(it.id.room, it.conn), items: vec![k] }),
+        let at = (it.id.room, it.conn);
+        if it.mine {
+            match out.iter_mut().find(|p| p.you) {
+                Some(p) => {
+                    if !p.conns.contains(&at) {
+                        p.conns.push(at);
+                    }
+                    p.items.push(k);
+                }
+                None => out.push(Person { conns: vec![at], name: String::new(), you: true, emoji: emoji_of(at.0, at.1), items: vec![k] }),
+            }
+        } else if let Some(p) = out.iter_mut().find(|p| p.conns.contains(&at)) {
+            p.items.push(k);
+        } else if let Some(p) = out.iter_mut().find(|p| !p.you && p.name == it.id.who && p.conns.iter().all(|c| c.0 != at.0)) {
+            p.conns.push(at);
+            p.items.push(k);
+        } else {
+            out.push(Person { conns: vec![at], name: it.id.who.clone(), you: false, emoji: emoji_of(at.0, at.1), items: vec![k] });
         }
     }
     out
+}
+
+impl Person {
+    /// The first connection: what the egui ids key on (stable while the person has that connection).
+    fn key(&self) -> (RoomHandle, ConnId) {
+        self.conns[0]
+    }
 }
 
 /// Cell width, gap and side padding of the strip.
@@ -141,7 +169,7 @@ fn person(ui: &mut Ui, cx: &Cx, cell: Rect, view: &StageView, p: &Person, tag: &
     let hit = Rect::from_min_max(pos2(cell.left(), av.top() - 6.0), pos2(cell.right(), av.bottom() + 7.0 + 14.0));
     drive_dump::rect(|| format!("strip.{tag}"), av);
     drive_dump::line(|| format!("person {tag} streams {} popped {} ring {}", its.len(), popped.len(), u8::from(ring)));
-    let resp = ui.interact(hit, Id::new(("strip_person", p.room, p.conn)), if popped.is_empty() { Sense::hover() } else { Sense::click() });
+    let resp = ui.interact(hit, Id::new(("strip_person", p.key())), if popped.is_empty() { Sense::hover() } else { Sense::click() });
     crate::ui::paint_person(ui, av, &p.name, &p.emoji, false);
     let c = av.center();
     let painter = ui.painter();
@@ -202,7 +230,7 @@ const ROW_H: f32 = 8.0 + 22.0 + 3.0 + 14.0 + 3.0 + 14.0;
 #[allow(clippy::too_many_arguments)]
 fn hover_card(ui: &Ui, cx: &Cx, resp: &egui::Response, av: Rect, view: &StageView, p: &Person, tag: &str, its: &[&Item], acts: &mut Vec<UiAction>) {
     let ctx = ui.ctx();
-    let id = Id::new(("strip_card", p.room, p.conn));
+    let id = Id::new(("strip_card", p.key()));
     let shown: Option<Rect> = ctx.data(|d| d.get_temp(id));
     let keep = shown.is_some_and(|r| ctx.pointer_hover_pos().is_some_and(|q| card_keeps(r, av, q)));
     if !(resp.hovered() || keep) {
@@ -402,7 +430,7 @@ mod tests {
     fn two_members_with_one_name_are_two_people_each_with_their_own_streams() {
         let items = [stream(ROOM, 2, "Ritze", 0), stream(ROOM, 3, "Ritze", 0), stream(ROOM, 3, "Ritze", 1)];
         let people = room_people(ROOM, who(1, "Ritze"), [who(2, "Ritze"), who(3, "Ritze")].into_iter(), &items);
-        assert_eq!(people.iter().map(|p| (p.conn, p.you, p.items.clone())).collect::<Vec<_>>(), [(1, true, vec![]), (2, false, vec![0]), (3, false, vec![1, 2])]);
+        assert_eq!(people.iter().map(|p| (p.key().1, p.you, p.items.clone())).collect::<Vec<_>>(), [(1, true, vec![]), (2, false, vec![0]), (3, false, vec![1, 2])]);
         // Your own share is yours by connection, not by name.
         let mut mine = stream(ROOM, 1, "", 0);
         mine.mine = true;
@@ -418,10 +446,24 @@ mod tests {
         let other = RoomHandle(2);
         let items = [stream(ROOM, 2, "Ritze", 0), stream(ROOM, 3, "Ritze", 0), stream(ROOM, 2, "Ritze", 1), stream(other, 2, "Ritze", 0)];
         let people = owners(&items, |room, conn| format!("{}/{conn}", room.0));
-        assert_eq!(people.iter().map(|p| (p.room, p.conn, p.emoji.as_str(), p.items.clone())).collect::<Vec<_>>(), [
-            (ROOM, 2, "1/2", vec![0, 2]),
-            (ROOM, 3, "1/3", vec![1]),
-            (other, 2, "2/2", vec![3]),
+        // Same name in two rooms is one person (emoji of the first connection); the two of `ROOM` stay two.
+        assert_eq!(people.iter().map(|p| (p.conns.clone(), p.emoji.as_str(), p.items.clone())).collect::<Vec<_>>(), [
+            (vec![(ROOM, 2), (other, 2)], "1/2", vec![0, 2, 3]),
+            (vec![(ROOM, 3)], "1/3", vec![1]),
+        ]);
+        // A name never takes a second connection of a room it has; other names stay apart; yours are one "You".
+        let third = RoomHandle(3);
+        let mut mine = stream(ROOM, 1, "", 0);
+        mine.mine = true;
+        let mut mine2 = stream(other, 9, "", 0);
+        mine2.mine = true;
+        let items = [stream(ROOM, 2, "Ritze", 0), stream(ROOM, 3, "Ritze", 0), stream(third, 7, "Ritze", 0), stream(other, 5, "Mo", 0), mine, stream(third, 8, "Ritze", 0), mine2];
+        let people = owners(&items, |_, _| String::new());
+        assert_eq!(people.iter().map(|p| (p.you, p.conns.clone(), p.items.clone())).collect::<Vec<_>>(), [
+            (false, vec![(ROOM, 2), (third, 7)], vec![0, 2]),
+            (false, vec![(ROOM, 3), (third, 8)], vec![1, 5]),
+            (false, vec![(other, 5)], vec![3]),
+            (true, vec![(ROOM, 1), (other, 9)], vec![4, 6]),
         ]);
     }
 

@@ -1378,6 +1378,57 @@ try {
     for (const X of [T1, T2, TV]) await X.close();
   }
 
+  section("Watched: one person in two rooms is one avatar (a name is the only identity across rooms; two of one name in one room stay two)");
+  {
+    const D1 = await L.openApp(site.url, { name: "Dana", settings: { emoji: "🦊" } });
+    const D2 = await L.openApp(site.url, { name: "Dana", settings: { emoji: "🐻" } });
+    const D3 = await L.openApp(site.url, { name: "Dana", settings: { emoji: "🐼" } });
+    const WV = await L.openApp(site.url, { name: "Wim" });
+    const Q = WV.page;
+    await L.createRoom(D1.page, { name: "dana-one", server: RELAY, hash: HASH });
+    await L.waitJoined(D1.page);
+    const l1 = await L.inviteLink(D1.page);
+    await L.addRoomByLink(D3.page, l1, "dana-one");
+    await L.waitJoined(D3.page);
+    await L.createRoom(D2.page, { name: "dana-two", server: RELAY, hash: HASH });
+    await L.waitJoined(D2.page);
+    const l2 = await L.inviteLink(D2.page);
+    await L.addRoomByLink(WV.page, l1, "dana-one");
+    await L.waitJoined(Q, 0);
+    await L.addRoomByLink(WV.page, l2, "dana-two");
+    await L.waitJoined(Q, 1);
+    await startSharer(D1, "Dana", 960, 540);
+    await startSharer(D3, "Dana", 960, 540);
+    await startSharer(D2, "Dana", 960, 540);
+    for (const [i, name, n] of [[0, "dana-one", 2], [1, "dana-two", 1]]) {
+      await Q.click({ text: name, sel: ".p-row" });
+      await Q.waitFor(`document.querySelectorAll('.st-tile.idle').length === ${n}`, { timeout: 30000, what: `${n} idle tiles in ${name}` });
+      for (let k = 1; k <= n; k++) {
+        for (let t = 0; t < 6 && (await Q.eval(`__sss.S.rooms[${i}].watches.size`)) < k; t++) {
+          await Q.click("[data-watch]");
+          await sleep(700);
+        }
+        await Q.waitFor(`__sss.S.rooms[${i}].watches.size === ${k}`, { what: `watch ${k} in ${name}` });
+      }
+    }
+    await Q.click({ text: "Watched streams", sel: ".p-row" });
+    await Q.waitFor("document.querySelectorAll('.arena > .st-tile').length === 3", { what: "three watched tiles" });
+    const pvs = await Q.eval(`[...document.querySelectorAll('.strip .pv')].map((e) => ({ user: e.dataset.user, person: e.dataset.person, n: e.querySelector('.cnt')?.innerText ?? "1", live: !!e.querySelector('.lv') }))`);
+    check(pvs.length === 2 && pvs.every((x) => x.user === "Dana" && x.live) && pvs.map((x) => x.n).sort().join() === "1,2", "Watched: three Dana streams in two rooms are two avatars, 2 + 1 (the two Danas of one room stay apart)", JSON.stringify(pvs));
+    const merged = pvs.find((x) => x.n === "2");
+    await move(Q, 3, 3);
+    const av = await Q.eval(`(() => { const r = [...document.querySelectorAll('.strip .pv')].find((e) => e.dataset.person === ${JSON.stringify(merged.person)}).querySelector('.avatar').getBoundingClientRect(); return { cx: r.x + r.width / 2, cy: r.y + r.height / 2 }; })()`);
+    await move(Q, av.cx, av.cy);
+    await Q.waitFor("document.querySelector('.utip')", { what: "the merged person's card" });
+    await sleep(150);
+    const card = await Q.eval(`({ n: document.querySelectorAll('.utip').length, rows: [...document.querySelectorAll('.utip .ust')].map((e) => e.querySelector('.l3').innerText.replace(/\\s+/g, ' ')), sub: document.querySelector('.utip .hd small').innerText })`);
+    check(card.n === 1 && card.rows.length === 2 && card.rows.some((r) => /dana-one/.test(r)) && card.rows.some((r) => /dana-two/.test(r)) && /2 streams/.test(card.sub), "the merged person's card lists both streams, each naming its room", JSON.stringify(card));
+    await shot(Q, "watched_merged_card");
+    await move(Q, 3, 3);
+    check([D1, D2, D3, WV].every((x) => x.consoleErrors.length === 0), "no console errors on the Dana pages", [D1, D2, D3, WV].flatMap((x) => x.consoleErrors).join(" | "));
+    for (const X of [D1, D2, D3, WV]) await X.close();
+  }
+
   if (OLD_RELAY && OLD_HASH) {
     section("a relay without avatars (an older relay): nobody else's emoji shows, my own still does");
     const X = await open("Olga", site.url);

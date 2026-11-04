@@ -97,7 +97,14 @@ call, not in side panels.
     (`Item::conn`, `strip::Person { room, conn }`), never by display name: strip, hover card and its keep zone, avatars,
     emoji (`Cx::emoji_of(room, conn)`), stream counts, the viewers dropdown, the stream menu head, the popped badge, webcam
     in picture. "You" is your own connection, so a second client of yours under your name is someone else and stays on
-    your stage with Hide my own streams. In Watched a person is room + conn, so a friend in two rooms is two avatars.
+    your stage with Hide my own streams. In Watched (2026-11-04, user: "the list of participants should be filtered/condensed, so every person is only shown once")
+    the strip merges: connections of one name in DIFFERENT rooms are one person (`strip.rs` `owners`: one avatar, the count of
+    all their streams, one hover card with a row per stream that names its room, ring and LIVE if any of theirs is; each
+    row's actions use the item's own room + conn; a click brings every popped stream back; the emoji is the first
+    connection's, ids key on `Person::key`, the first connection); yours would be one "You". Two connections of one name in
+    the SAME room stay two. *Why:* the name is the only identity across rooms, but inside one room two connections of a name
+    are provably two (the #127 report), so a person never takes a second connection of a room it already has. A single
+    room's strip is unchanged.
     *Why:* the user, from two clients of their own in one room under one name: "When i hover "You", it doesnt show
     anything and hovering "Ritze" shows both at once. (Both are technically me, but that should be properly handled!)".
     By name the two shared one egui id (one hover, one card), claimed each other's streams, and the first member of that
