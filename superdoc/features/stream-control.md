@@ -1,6 +1,6 @@
 # Stream Control (desktop client)
 
-> **Status (2026-10-14; the webcam section added 2026-11-04).** The client is one native egui binary and this page is its
+> **Status (2026-10-14; the webcam section and "The lagspike on every keyframe" added 2026-11-04).** The client is one native egui binary and this page is its
 > **backend** reference: `client/src/capture.rs` (with its inline `destination` and `branch`
 > modules), `session.rs`, `bandwidth.rs`, `presets.rs`, `rooms.rs`. It covers "The shape of a
 > capture", staging and "Go live", fan-out, transfer, the three tiers, "Capture/encode
@@ -21,6 +21,96 @@ plan (`superdoc/ui/APP-SHELL.md`): starting and editing outgoing streams, **mult
 fan-out**, **transfer** between rooms, and the two **bandwidth modes** with
 `bandwidth::allocate` wired into live encoders. The plan it implemented is
 `superdoc/brainstorm/ui-redesign-multiroom-streaming.md` (final plan items 4, 5 and 7).
+
+---
+
+## The lagspike on every keyframe: the pacing hold, deadline pacing and an adaptive rate (2026-11-04, row 129)
+
+**User report (2026-11-04, verbatim):** "On every keyframe, there is a lagspike in the screenshare." Their uploaded
+client log had 1846 `sending a keyframe of ~300-360 datagrams (~300-360 kB), paced over ~80-100 ms` lines in one session
+(Quality, one keyframe per second, about 10-11 Mbit/s; local machine, both clients through the relay).
+
+**Cause (measured; it is the keyframe pacing of #97/#102, made 2-4x more frequent by the D8 intervals).** The pump
+spreads a big keyframe over `bytes / (2.5 x bitrate)` and does nothing else meanwhile: the next frames wait in the
+encoder's appsink. The viewer cannot show the keyframe's picture before its last fragment arrives, so on every keyframe
+the picture freezes for the whole pacing window and then jumps (the queued frames arrive back to back; the latest-only
+presenter shows the newest). No other stage contributes.
+
+Method: the rig, a trace line per frame and stage (encoder output, pump pull, send done, viewer complete frame, decoder
+output, upload to the GPU; wall clock µs, joined by the wire PTS; temporary patch, not committed), H.264 1080p VA,
+10 000 kbps, a full-screen static detailed texture plus a moving ball (keyframes 370 kB at 60 fps / 158-253 kB at 120 fps:
+the VA rate control gives an IDR a generous budget whatever the content, so these are the user's size or a bit more; the
+deltas are small), `hs-rig.sh`'s viewer on a 60 Hz virtual output (so the *decoder-output* gaps are the proof, not the
+present gaps, which are quantised to 16.7 ms). "Gap" = the largest interval between decoded frames within -50 ... +350 ms
+of a keyframe's encoder output.
+
+| build, settings | keyframe | pump hold (send) | viewer gap at the keyframe (median / max) | how often |
+|---|---|---|---|---|
+| master `77e2c9c`, Quality 60 fps, 2000 ms | 372 kB | 163 ms | **180 / 186 ms** | every 2.1 s (8 % of the time frozen) |
+| master, Gaming 120 fps, 750 ms | 253 kB | 110 ms | **119 / 139 ms** | every 0.77 s (15 %) |
+| head before, Quality 60 fps, 1000 ms | 371 kB | **173 ms** (planned 119) | **197 / 208 ms** | every 1.0 s (20 %) |
+| head before, Gaming 120 fps, 250 ms | 158 kB | 69 ms | **77 / 85 ms** | 4 per second (31 %) |
+| head before, Text 15 fps, 250 ms | 349 kB | 101 ms (deadline pacing only) | 155 / 172 ms (period 67) | 4 per second |
+| **head after**, Quality 60 fps, 1000 ms | 378 kB | **23 ms** | **38 / 51 ms** (period 16.7) | every 1.0 s |
+| **head after**, Gaming 120 fps, 250 ms | 158 kB | **9 ms** | **18 / 27 ms** (period 8.3) | 4 per second |
+| **head after**, Text 15 fps, 250 ms | 349 kB | 21 ms | 83 / 98 ms (period 67) | 4 per second |
+
+So the spike's **size is the same on master** (a keyframe's pacing window, 110-180 ms): the D8 intervals only made it
+2-4x as frequent, plus the real pacing was ~45 % longer than planned (below). Stages for the "head before" Quality row
+(medians): encoder output gaps 16.6 ms (p99 24: no encoder stall), pump wait behind the previous frame 0.1 ms, **send
+173 ms**, relay + loopback 1.1 ms, decode of the IDR 13 ms (a delta 4 ms), upload 1.7 ms. The loopback cannot show a
+real network or a loaded relay host.
+
+**What changed (`client/src/capture.rs`, one accessor in `client/src/net.rs`).**
+
+1. **Deadline pacing.** `PreparedMedia::send` slept `PACE_STEP` = 2 ms per chunk; every `sleep` overshoots ~0.9 ms, so a
+   119 ms plan took 173 ms. It now sleeps until `start + i x 2 ms`. Alone: Quality 60 fps 197 -> 119 ms.
+2. **An adaptive rate, `destination::PacePolicy`.** The window is the freeze, so a faster rate is the lever, but a
+   fixed faster rate is wrong on a tight link (table below). The factor (x the destination's bitrate) starts at #102's 2.5,
+   grows x1.5 per clean keyframe of >= 100 datagrams up to 12, and halves (not below 2.5) and holds 10 s when (a) the relay
+   forwarded at least `max(4, 1 % of the keyframe's datagrams)` retransmit requests for what we sent since the last
+   keyframe (`SendRing::resent`: our burst overflowed a queue, or the path loses), or (b) a viewer that was not just joining
+   asked for a keyframe (`DestCmd::KeyframeRequest`, > 2 s after a subscriber-count change). It only moves while the relay
+   speaks NACK (`ScreenshareClient::nack_active()`, new in `net.rs`, the HelloAck flag): without NACK a lost fragment is
+   never repaired and nothing would tell us, so it stays at 2.5. The 60 ms floor of the keyframe window (#86) scales with
+   the factor (`60 ms x 2.5 / factor`). `SSS_PACE_MULT=<f>` pins a fixed factor (A/B, field rollback). Log: the existing
+   `sending a keyframe ...` line now says `paced over ~N ms at F x the bitrate`; changes are `debug`.
+   Ramp on a clean path: 2.5, 3.75, 5.6, 8.4, 12 over five big keyframes (5 s at 1 s intervals, 1.3 s at 250 ms).
+
+*Why a rate and not "pace less"/"don't wait":* the keyframe's picture exists only when its last fragment is there; sending
+the following deltas meanwhile does not help (the viewer must hold them, and the reassembler would deliver them out of order
+otherwise); a smaller keyframe means a lower-quality IDR (#102's squeeze: -2 dB on a static picture, -4..-6 dB on detail,
+every 250 ms: a visible pulse, worst for Text); the keyframe interval is the user's table (D8). Intra refresh is not
+available (`vah264enc` has no such property). So the time on the wire is the only thing left, and it is bounded by the
+path.
+
+**Lossy paths** (rig, relay behind an ordered UDP impairment proxy with a tail-drop queue and random loss, only datagrams
+>= 600 B impaired, 60 fps 10 000 kbps H.264 Quality; "drops" = the proxy queue's; one run per row unless said, runs vary):
+
+| path | pinned 2.5x (#102) | pinned 8x | adaptive (this change) |
+|---|---|---|---|
+| clean | gap 119 | - | gap 38; 0 never completed in 36 keyframes |
+| sharer link 20 Mbit/s, 50 ms queue | 1505 drops, 1 keyframe never completed | 0 drops, 0 abandoned (bottleneck-bound: gap 162) | not run |
+| sharer link 14 Mbit/s, 50 ms queue | 326 / 372 drops, 2 / 2 frames abandoned | **7338** drops, **111** abandoned, 4 never completed | 393 drops, 5 abandoned; another run 3029 drops, 29 abandoned (the factor never left 2.5: that run was just worse, runs vary 10x here) |
+| 0.4 % random loss, both legs, 60 s | 600 fragments asked / 597 recovered, 0 never completed | - | stays at 2.5x (about 5 resent per second trips the threshold): 588 / 587, 0 never completed, gap 120 |
+| 0.1 % both legs + 15 ms each way, 150 s | gap 99 (median), 381 / 380 asked/recovered, 0 never completed, 0 abandoned | - | gap **67**, 520 / 494, 0 never completed, 1 abandoned |
+
+A 12x pinned run with no loss and 15 ms delay: gap 35, 0 steady-state keyframe losses in 53 keyframes. In the 60 s runs
+of the 0.1 % case one keyframe arrived with 212/379 fragments (a long contiguous hole at 12x, repaired by an L1 request
+in 138 ms): the cost of the faster burst is a rare burst loss, which the policy answers by halving. A viewer that
+subscribes *during* a keyframe sees `a keyframe never completed (92/380 fragments arrived)` at the join (seen in both
+fast and slow runs; harmless, L1 follows): it is not counted above.
+
+**What the user should see on their machine:** on a clean path the freeze at each keyframe drops from ~100-200 ms to one
+or two frame periods within a few seconds of going live (60 fps: 38 ms; 120 fps Gaming: 18 ms). Their own log shows a
+NACK repair of 1-54 fragments every ~10-20 s: each such event backs the rate off for at least 10 s, so expect the old
+hitch to come back for a short while after a loss event and then go away again. `SSS_PACE_MULT=2.5` restores the old
+behaviour exactly (apart from deadline pacing).
+
+**Not covered:** a real internet path (burst loss, a loaded relay host: the relay's UDP receive buffer is the kernel
+default, ~100 packets, and a 12x burst is ~15 000 datagrams/s), H.265 and AV1 were only checked for "it ramps and plays"
+(AV1: 461 kB IDR paced in 30 ms at 12x), only the sharer's leg was impaired with a queue (the viewer's leg only with
+random loss), several viewers of one stream, the browser sharer (`docs/js/core`, still a fixed 2.5x pacing).
 
 ---
 
@@ -151,6 +241,7 @@ documents and code: sharp at a low frame rate, a keyframe is cheap at 15 fps so 
   figure is only a self-heal ceiling, a shorter interval stays conformant, it costs bitrate and buys a
   faster join/recovery). The webcam (task I8) is fixed to Performance and 2000 ms (`EncodeChoice::webcam`, see
   "Webcam capture" above).
+- **Encoding and Keyframe are editable again (2026-11-04):** the modal shows Encoding (quality level) and Keyframe (`gop_millis`) as editable fields next to the Preset; reasoning in `ui/APP-SHELL.md` "Video card: Encoding and Keyframe".
 - **Removed:** `EncoderProfile` (and `EncoderBackend::tune_applies`, `quality_effect`,
   `visible_quality_levels`, `display_quality_level`, `EncoderPreset::visible_for/detect_for`): the twin hiding
   they drove (#95) is moot with three presets that are distinct on every backend. The "hide a setting that
@@ -165,6 +256,8 @@ documents and code: sharp at a low frame rate, a keyframe is cheap at 15 fps so 
   250 ms; `IdrControl`'s "big" test is by size (> 1/4 s of bitrate), independent of the interval, and a
   natural IDR that large at 250 ms would eat the whole interval's budget, which the VBR does not produce on
   these contents. Not stress-tested with a big-IDR scene at 250 ms (the rig's vkcube IDRs are 30-60 kB).
+  **It was not harmless for the picture:** with a big-IDR scene every keyframe is a pacing freeze, 4 per second at
+  250 ms; see "The lagspike on every keyframe" at the top of this page (row 129), which fixes it.
 - **Measured** (headless rig, release build, H.264 VA, 1080p vkcube, 8000 kbps, GStreamer tracer on the
   encoder output pad, `DELTA_UNIT` clear = keyframe; the client log's `sending a keyframe` line only covers
   keyframes of 24+ datagrams, vkcube's are smaller at 60/120 fps, so it cannot be used for this):
@@ -1000,7 +1093,7 @@ pump sends the forced IDR plus two more at +300 ms and +1 s
 (`destination::keyframe_repeat_schedule`). The same two repeats follow a viewer-asked IDR (a
 relay-forwarded `KeyframeRequest`, a resume from pause): a viewer asking means it lost one.
 Rate cap: one such burst per `KEYFRAME_BURST_MIN_GAP` = 2 s per destination
-(`schedule_requested_repeats`); a request inside it is served by the burst under way. **Keyframe pacing:** a keyframe of 24+ datagrams is no longer sent back to back: the pump
+(`schedule_requested_repeats`); a request inside it is served by the burst under way. **Keyframe pacing (the rate is adaptive since row 129, "The lagspike on every keyframe"):** a keyframe of 24+ datagrams is no longer sent back to back: the pump
 spreads it over min(60 ms, 4 frame periods) in chunks every 2 ms (`pace_plan`; **since #102 by rate,
 see below**,
 `PreparedMedia::send`; delta frames and small keyframes still go out at once, the stall keepalive

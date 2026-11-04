@@ -4114,6 +4114,10 @@ async fn destination_pump(
     let mut keyframe_repeats: VecDeque<Instant> = destination::keyframe_repeat_schedule(Instant::now()).into_iter().collect();
     // Size control of the IDRs this pump forces (#102).
     let mut idr = IdrControl::default();
+    // How fast keyframes are paced out; adapts to the path (row 129).
+    let mut pace = destination::PacePolicy::new(destination::PacePolicy::pinned_from_env(), client.send_ring().resent.load(Ordering::Relaxed));
+    // When the subscriber count last changed: a keyframe request right after is a join, not a loss.
+    let mut last_subscriber_change: Option<Instant> = None;
     // When the last repeat burst started, to rate-cap the ones viewers ask for.
     let mut last_keyframe_burst: Option<Instant> = Some(Instant::now());
     // Encoder-wedge recovery bookkeeping (#99): how many rebuilds of this
@@ -4158,7 +4162,19 @@ async fn destination_pump(
                                 idr.force(b, &runtime);
                             }
                             let result = match prepared {
-                                Ok(prepared) => prepared.send(params.framerate, params.bitrate_kbps).await,
+                                Ok(prepared) => {
+                                    if prepared.keyframe
+                                        && let Some(f) = pace.on_keyframe(
+                                            Instant::now(),
+                                            client.send_ring().resent.load(Ordering::Relaxed),
+                                            prepared.datagrams.len(),
+                                            client.nack_active(),
+                                        )
+                                    {
+                                        tracing::debug!("stream {stream_id}: keyframe pacing rate is now {f:.1}x the bitrate");
+                                    }
+                                    prepared.send(params.framerate, params.bitrate_kbps, pace.factor()).await
+                                }
                                 Err(e) => Err(e),
                             };
                             match result {
@@ -4374,6 +4390,7 @@ async fn destination_pump(
                 }
             }
             DestCmd::SubscriberCount(_) => {
+                last_subscriber_change = Some(Instant::now());
                 if paused && let Some(branch) = branch.as_ref() {
                     tracing::info!("stream {stream_id} has a subscriber again; resuming its encoder");
                     branch.set_paused(false, stream_id);
@@ -4387,6 +4404,9 @@ async fn destination_pump(
                 }
             }
             DestCmd::KeyframeRequest => {
+                if !paused && last_subscriber_change.is_none_or(|t| t.elapsed() > Duration::from_secs(2)) {
+                    pace.on_viewer_trouble(Instant::now());
+                }
                 if let Some(branch) = branch.as_ref() {
                     if paused {
                         // A subscribe implies at least one subscriber
@@ -4598,6 +4618,9 @@ const PACE_MAX_WINDOW: Duration = Duration::from_millis(60);
 /// Longest any frame is spread over: the pump is held that long and the
 /// capture drops frames meanwhile, and `Stop` waits behind it.
 const PACE_MAX_RATE_WINDOW: Duration = Duration::from_millis(600);
+/// Pacing rate as a multiple of the configured bitrate (#102: 2.5): the starting and the lowest value of
+/// [`destination::PacePolicy`], which raises it while the path stays clean.
+const PACE_RATE_FACTOR: f64 = 2.5;
 /// Gap between two paced chunks.
 const PACE_STEP: Duration = Duration::from_millis(2);
 
@@ -4620,15 +4643,20 @@ const PACE_STEP: Duration = Duration::from_millis(2);
 /// after a calm screen starts moving), so ordinary deltas still go out at once.
 /// The keyframe is merely delayed (~0.4 s for 1 MB at 8.3 Mbit/s), which a screen
 /// share tolerates; a lost one costs a 1.5 s recovery round.
-fn pace_plan(count: usize, bytes: usize, keyframe: bool, framerate: u32, bitrate_kbps: u32) -> Option<(usize, Duration)> {
+///
+/// `factor` is [`destination::PacePolicy::factor`]: 2.5 until the path has proven clean, then up to
+/// 12 (row 129: the window is the freeze the viewer sees on every keyframe, 119 ms for 372 kB at 10 Mbit/s
+/// and 2.5x, ~25 ms at 12x). The 60 ms floor shrinks with it.
+fn pace_plan(count: usize, bytes: usize, keyframe: bool, framerate: u32, bitrate_kbps: u32, factor: f64) -> Option<(usize, Duration)> {
     if count < PACE_MIN_DATAGRAMS {
         return None;
     }
     let frame_period = Duration::from_micros(1_000_000 / u64::from(framerate.clamp(MIN_FRAMERATE, MAX_FRAMERATE)));
-    // bytes * 8 bit / (2.5 * kbps * 1000 bit/s), in microseconds.
-    let by_rate = Duration::from_micros(bytes as u64 * 3200 / u64::from(bitrate_kbps.max(1)));
+    // bytes * 8 bit / (factor * kbps * 1000 bit/s), in microseconds.
+    let by_rate = Duration::from_micros((bytes as f64 * 8000.0 / (factor * f64::from(bitrate_kbps.max(1)))) as u64);
     let window = if keyframe {
-        PACE_MAX_WINDOW.min(frame_period * 4).max(by_rate)
+        // The floor (#86's 60 ms) is a *rate* assumption too: it shrinks in step with a raised factor.
+        PACE_MAX_WINDOW.min(frame_period * 4).mul_f64(PACE_RATE_FACTOR / factor.max(PACE_RATE_FACTOR)).max(by_rate)
     } else if by_rate > frame_period * 2 {
         by_rate
     } else {
@@ -4656,15 +4684,15 @@ impl PreparedMedia {
     }
 
     /// Sends the frame, spread out if [`pace_plan`] says so.
-    async fn send(self, framerate: u32, bitrate_kbps: u32) -> Result<()> {
-        let plan = pace_plan(self.datagrams.len(), self.bytes(), self.keyframe, framerate, bitrate_kbps);
+    async fn send(self, framerate: u32, bitrate_kbps: u32, factor: f64) -> Result<()> {
+        let plan = pace_plan(self.datagrams.len(), self.bytes(), self.keyframe, framerate, bitrate_kbps, factor);
         if self.keyframe && self.datagrams.len() >= PACE_MIN_DATAGRAMS {
             tracing::info!(
                 "sending a keyframe of {} datagrams (~{} kB), {}",
                 self.datagrams.len(),
                 self.bytes() / 1000,
                 plan.map_or("unpaced".to_string(), |(per_chunk, gap)| format!(
-                    "paced over ~{} ms",
+                    "paced over ~{} ms at {factor:.1}x the bitrate",
                     (self.datagrams.len().div_ceil(per_chunk) as u128 * gap.as_millis())
                 ))
             );
@@ -4672,9 +4700,12 @@ impl PreparedMedia {
         let Some((per_chunk, gap)) = plan else {
             return self.send_now();
         };
+        // Deadlines from one start instant, not a `sleep(gap)` per chunk: every sleep overshoots by
+        // ~0.9 ms (timer slack), which made a 2 ms step take 2.9 ms and a "119 ms" keyframe 173 ms.
+        let start = tokio::time::Instant::now();
         for (i, chunk) in self.datagrams.chunks(per_chunk).enumerate() {
             if i > 0 {
-                tokio::time::sleep(gap).await;
+                tokio::time::sleep_until(start + gap * i as u32).await;
             }
             for datagram in chunk {
                 self.connection
@@ -4855,6 +4886,87 @@ pub mod destination {
     /// picture. Two more, at +300 ms and +1 s, cost two keyframes and make
     /// "all three lost" rare.
     pub const KEYFRAME_REPEAT_OFFSETS: [Duration; 2] = [Duration::from_millis(300), Duration::from_millis(1000)];
+
+    /// How fast a keyframe is paced out, as a multiple of the destination's bitrate (row 129).
+    ///
+    /// `Why adaptive:` the pacing window *is* the hitch the viewer sees on every keyframe (the pump holds
+    /// the following frames behind a paced IDR, and the viewer cannot show the IDR's picture before its last
+    /// fragment arrives): a 372 kB IDR at 2.5 x 10 Mbit/s is a 119 ms freeze, once per keyframe interval
+    /// (4 times a second at 250 ms). A fixed faster rate removes it but is wrong on a tight link (rig:
+    /// 14 Mbit/s with a 50 ms queue, 8x pacing: 22x the drops and 111 abandoned frames; 2.5x: 326 drops,
+    /// 2 abandoned). So the rate starts at the safe 2.5x and grows 1.5x per clean big keyframe up to
+    /// [`PacePolicy::MAX`], and falls back (halves, then holds for 10 s) when the relay forwarded
+    /// retransmit requests for what we sent (`SendRing::resent` moved by more than a few fragments: our
+    /// burst overflowed a queue, or the path is lossy) or a viewer that was not just joining asked for a
+    /// keyframe. Only while the relay speaks NACK: without it a lost fragment is never repaired and
+    /// nothing would tell us.
+    #[derive(Debug, Clone)]
+    pub struct PacePolicy {
+        factor: f64,
+        hold_until: Option<Instant>,
+        resent_seen: u64,
+        /// `SSS_PACE_MULT`: a fixed factor, no adaptation (A/B measurements, field rollback).
+        pinned: Option<f64>,
+    }
+
+    impl PacePolicy {
+        /// Starting and lowest factor: #102's 2.5 x bitrate.
+        pub const BASE: f64 = super::PACE_RATE_FACTOR;
+        /// Fastest factor. 12 x 10 Mbit/s = 120 Mbit/s: a 372 kB IDR in 25 ms, close to unpaced.
+        pub const MAX: f64 = 12.0;
+        /// Growth per clean big keyframe.
+        pub const GROWTH: f64 = 1.5;
+        /// After a back-off the factor stays put this long.
+        pub const HOLD: Duration = Duration::from_secs(10);
+        /// Only a keyframe at least this big (about 120 kB) says anything about a burst: a small one
+        /// fits any queue.
+        pub const EVIDENCE_DATAGRAMS: usize = 100;
+
+        /// Resent fragments since the last keyframe that count as "the burst lost something": at least
+        /// 4 and 1 % of the keyframe (random loss of 0.4 % alone does not trip it).
+        pub fn loss_threshold(datagrams: usize) -> u64 {
+            (datagrams as u64 / 100).max(4)
+        }
+
+        pub fn new(pinned: Option<f64>, resent_now: u64) -> Self {
+            Self { factor: Self::BASE, hold_until: None, resent_seen: resent_now, pinned }
+        }
+
+        /// The factor from `SSS_PACE_MULT`, if set.
+        pub fn pinned_from_env() -> Option<f64> {
+            std::env::var("SSS_PACE_MULT").ok().and_then(|v| v.parse::<f64>().ok()).filter(|f| *f > 0.0)
+        }
+
+        pub fn factor(&self) -> f64 {
+            self.pinned.unwrap_or(self.factor)
+        }
+
+        /// A keyframe of `datagrams` is about to be sent; `resent_now` is `SendRing::resent`. Returns
+        /// the new factor when it changed.
+        pub fn on_keyframe(&mut self, now: Instant, resent_now: u64, datagrams: usize, nack_active: bool) -> Option<f64> {
+            let lost = resent_now.saturating_sub(self.resent_seen);
+            self.resent_seen = resent_now;
+            let before = self.factor;
+            if !nack_active {
+                self.factor = Self::BASE;
+            } else if lost >= Self::loss_threshold(datagrams) {
+                self.back_off(now);
+            } else if datagrams >= Self::EVIDENCE_DATAGRAMS && self.hold_until.is_none_or(|t| now >= t) {
+                self.factor = (self.factor * Self::GROWTH).min(Self::MAX);
+            }
+            (self.factor != before && self.pinned.is_none()).then_some(self.factor)
+        }
+
+        /// A viewer that was not just joining asked for a keyframe: it lost one.
+        pub fn on_viewer_trouble(&mut self, now: Instant) {
+            self.back_off(now);
+        }
+
+        fn back_off(&mut self, now: Instant) {
+            self.factor = (self.factor / 2.0).max(Self::BASE);
+            self.hold_until = Some(now + Self::HOLD);
+        }
+    }
 
     /// The instants of the repeat keyframes for an event at `now`.
     pub fn keyframe_repeat_schedule(now: Instant) -> [Instant; 2] {
@@ -5816,18 +5928,18 @@ pub mod destination {
         #[test]
         fn small_frames_and_ordinary_deltas_are_not_paced_and_small_keyframes_never_over_sixty_milliseconds() {
             // Fewer than 24 datagrams, and ordinary deltas, go out at once.
-            assert_eq!(pace_plan(10, 12_000, true, 60, 8300), None);
-            assert_eq!(pace_plan(30, 36_000, false, 120, 8300), None);
+            assert_eq!(pace_plan(10, 12_000, true, 60, 8300, PACE_RATE_FACTOR), None);
+            assert_eq!(pace_plan(30, 36_000, false, 120, 8300, PACE_RATE_FACTOR), None);
             // 100 Mbit/s: the rate window is negligible, so the old window rules.
             // A 240-datagram IDR at 60 fps: 30 chunks of 8 every 2 ms = 58 ms.
-            let (per_chunk, gap) = pace_plan(240, 288_000, true, 60, 100_000).unwrap();
+            let (per_chunk, gap) = pace_plan(240, 288_000, true, 60, 100_000, PACE_RATE_FACTOR).unwrap();
             assert_eq!((per_chunk, gap), (8, Duration::from_millis(2)));
             // The window shrinks with the frame period (240 fps: 4 x 4.1 ms).
-            let plan = pace_plan(240, 288_000, true, 240, 100_000).unwrap();
+            let plan = pace_plan(240, 288_000, true, 240, 100_000, PACE_RATE_FACTOR).unwrap();
             assert!(plan_window(240, plan) <= Duration::from_millis(17), "{plan:?}");
             // Every datagram is covered: chunking never drops one.
             for count in [24, 25, 100, 301] {
-                let (per_chunk, _) = pace_plan(count, count * 1200, true, 30, 100_000).unwrap();
+                let (per_chunk, _) = pace_plan(count, count * 1200, true, 30, 100_000, PACE_RATE_FACTOR).unwrap();
                 assert!(per_chunk * count.div_ceil(per_chunk) >= count);
             }
         }
@@ -5836,18 +5948,98 @@ pub mod destination {
         #[test]
         fn a_big_keyframe_is_spread_by_rate_up_to_the_cap_and_a_huge_delta_frame_is_paced_too() {
             // 1.18 MB at 2.5 x 8.3 Mbit/s = 455 ms (chunks of whole datagrams round the rate up: ~390 ms); the old fixed window was 33 ms = 280 Mbit/s.
-            let plan = pace_plan(984, 1_180_000, true, 120, 8300).unwrap();
+            let plan = pace_plan(984, 1_180_000, true, 120, 8300, PACE_RATE_FACTOR).unwrap();
             let window = plan_window(984, plan);
             assert!((Duration::from_millis(350)..=Duration::from_millis(500)).contains(&window), "{window:?}");
             // Never longer than the cap, however big the frame or low the bitrate.
-            let plan = pace_plan(5000, 6_000_000, true, 120, 1000).unwrap();
+            let plan = pace_plan(5000, 6_000_000, true, 120, 1000, PACE_RATE_FACTOR).unwrap();
             assert!(plan_window(5000, plan) <= PACE_MAX_RATE_WINDOW, "{plan:?}");
             // The 1.9 MB delta frame after a calm screen starts moving: paced; a 40 kB one is not.
-            assert!(pace_plan(1600, 1_900_000, false, 120, 8300).is_some());
-            assert_eq!(pace_plan(34, 40_000, false, 120, 8300), None);
+            assert!(pace_plan(1600, 1_900_000, false, 120, 8300, PACE_RATE_FACTOR).is_some());
+            assert_eq!(pace_plan(34, 40_000, false, 120, 8300, PACE_RATE_FACTOR), None);
             // A keyframe whose rate window is shorter than the old one keeps the old one.
-            let plan = pace_plan(100, 100_000, true, 60, 8300).unwrap();
+            let plan = pace_plan(100, 100_000, true, 60, 8300, PACE_RATE_FACTOR).unwrap();
             assert!(plan_window(100, plan) >= Duration::from_millis(45), "{plan:?}");
+        }
+
+
+        /// Row 129: the pacing rate adapts to the path (see [`destination::PacePolicy`]).
+        #[test]
+        fn the_pacing_rate_grows_on_a_clean_path_and_falls_back_on_loss() {
+            use destination::PacePolicy;
+            let t = Instant::now();
+            let s = Duration::from_secs;
+            let mut p = PacePolicy::new(None, 0);
+            assert_eq!(p.factor(), 2.5);
+            // Clean big keyframes: x1.5 each, up to the cap.
+            assert_eq!(p.on_keyframe(t, 0, 372, true), Some(3.75));
+            assert_eq!(p.on_keyframe(t + s(1), 0, 372, true), Some(5.625));
+            for i in 2..10 {
+                p.on_keyframe(t + s(i), 0, 372, true);
+            }
+            assert_eq!(p.factor(), PacePolicy::MAX);
+            assert_eq!(p.on_keyframe(t + s(11), 0, 372, true), None, "at the cap nothing changes");
+            // The relay forwarded 40 retransmit requests since the last keyframe: halve and hold.
+            assert_eq!(p.on_keyframe(t + s(12), 40, 372, true), Some(6.0));
+            assert_eq!(p.on_keyframe(t + s(13), 40, 372, true), None, "held for 10 s");
+            assert_eq!(p.on_keyframe(t + s(21), 40, 372, true), None, "still held");
+            assert_eq!(p.on_keyframe(t + s(23), 40, 372, true), Some(9.0), "growth resumes after the hold");
+            // Losses never take it below the base.
+            let mut p = PacePolicy::new(None, 0);
+            p.on_keyframe(t, 100, 372, true);
+            assert_eq!(p.factor(), 2.5);
+        }
+
+        #[test]
+        fn small_keyframes_prove_nothing_and_random_loss_does_not_trip_the_back_off() {
+            use destination::PacePolicy;
+            let t = Instant::now();
+            let mut p = PacePolicy::new(None, 0);
+            // A 30-datagram IDR fits any queue: no growth on its evidence.
+            assert_eq!(p.on_keyframe(t, 0, 30, true), None);
+            assert_eq!(p.factor(), 2.5);
+            let mut p = PacePolicy::new(None, 0);
+            p.on_keyframe(t, 0, 372, true);
+            // 3 resent fragments (about 0.4 % random loss on a 372-datagram IDR is ~1.5) are below the threshold of 4.
+            assert_eq!(p.on_keyframe(t + Duration::from_secs(1), 3, 372, true), Some(5.625));
+            assert_eq!(PacePolicy::loss_threshold(1000), 10);
+            assert_eq!(PacePolicy::loss_threshold(100), 4);
+        }
+
+        #[test]
+        fn without_nack_or_with_a_pinned_factor_the_rate_never_moves() {
+            use destination::PacePolicy;
+            let t = Instant::now();
+            let mut p = PacePolicy::new(None, 0);
+            assert_eq!(p.on_keyframe(t, 0, 372, false), None);
+            assert_eq!(p.factor(), 2.5);
+            let mut pinned = PacePolicy::new(Some(8.0), 0);
+            assert_eq!(pinned.on_keyframe(t, 0, 372, true), None);
+            assert_eq!(pinned.factor(), 8.0);
+            // A viewer in trouble (not a join) halves and holds.
+            let mut p = PacePolicy::new(None, 0);
+            for i in 0..4 {
+                p.on_keyframe(t + Duration::from_secs(i), 0, 372, true);
+            }
+            let before = p.factor();
+            p.on_viewer_trouble(t + Duration::from_secs(5));
+            assert_eq!(p.factor(), (before / 2.0).max(2.5));
+            assert_eq!(p.on_keyframe(t + Duration::from_secs(6), 0, 372, true), None, "held");
+        }
+
+        #[test]
+        fn a_faster_factor_shortens_the_keyframe_window_floor_too() {
+            // 240 datagrams at 60 fps, 100 Mbit/s: the 60 ms floor of #86 (8 per 2 ms chunk).
+            let base = plan_window(240, pace_plan(240, 288_000, true, 60, 100_000, PACE_RATE_FACTOR).unwrap());
+            // At 12x the floor is 12.5 ms.
+            let fast = plan_window(240, pace_plan(240, 288_000, true, 60, 100_000, 12.0).unwrap());
+            assert!(base >= Duration::from_millis(55), "{base:?}");
+            assert!(fast <= Duration::from_millis(20), "{fast:?}");
+            // 372 kB at 10 Mbit/s: 119 ms at 2.5x, ~25 ms at 12x.
+            let w25 = plan_window(379, pace_plan(379, 372_000, true, 60, 10_000, 2.5).unwrap());
+            let w12 = plan_window(379, pace_plan(379, 372_000, true, 60, 10_000, 12.0).unwrap());
+            assert!((Duration::from_millis(100)..=Duration::from_millis(130)).contains(&w25), "{w25:?}");
+            assert!(w12 <= Duration::from_millis(35), "{w12:?}");
         }
 
         #[test]
@@ -6905,7 +7097,6 @@ pub mod branch {
             .ok_or_else(|| anyhow!("branch bin has no element named '{appsink_name}'"))?
             .downcast::<gst_app::AppSink>()
             .map_err(|_| anyhow!("'{appsink_name}' element is not an AppSink"))?;
-
         let encoder_element = bin
             .by_name(&encoder_name)
             .ok_or_else(|| anyhow!("branch bin has no element named '{encoder_name}'"))?;

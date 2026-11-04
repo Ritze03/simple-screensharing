@@ -623,6 +623,8 @@ pub struct ScreenshareClient {
     cert_hash: Option<CertHash>,
     /// Recently sent video datagrams, for NACK retransmits (spec §6.6).
     send_ring: Arc<SendRing>,
+    /// The relay answered our NACK Hello (spec §6.6), i.e. it forwards retransmit requests to us.
+    nack_acked: Arc<AtomicBool>,
     /// Our emoji avatar and whether the relay has it (spec §9.2).
     avatar: Arc<AvatarSync>,
 }
@@ -744,7 +746,7 @@ impl ScreenshareClient {
             viewers_acked.clone(),
             avatar.clone(),
         ));
-        tokio::spawn(hello_loop(connection.clone(), nack_acked));
+        tokio::spawn(hello_loop(connection.clone(), nack_acked.clone()));
         tokio::spawn(viewers_hello_loop(connection.clone(), viewers_acked));
         tokio::spawn(avatar_loop(connection.clone(), avatar.clone()));
         tokio::spawn(crate::diag_upload::upload_loop(connection.clone(), diag_acked.clone()));
@@ -759,6 +761,7 @@ impl ScreenshareClient {
             room_id: parsed.room_id,
             cert_hash,
             send_ring,
+            nack_acked,
             avatar,
         };
 
@@ -826,6 +829,12 @@ impl ScreenshareClient {
     /// The ring `capture.rs` records every video frame's datagrams in (spec §6.6).
     pub fn send_ring(&self) -> &SendRing {
         &self.send_ring
+    }
+
+    /// Whether the relay speaks NACK (it acked our Hello): only then are lost fragments of what we
+    /// send repaired, and only then do requests reach `send_ring`.
+    pub fn nack_active(&self) -> bool {
+        self.nack_acked.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub async fn announce_stream(
