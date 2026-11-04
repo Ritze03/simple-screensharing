@@ -56,6 +56,7 @@ call, not in side panels.
 - **Settings is a modal with four tabs**, Profile | Interface (Language, Display, Sounds) | Playback | Diagnostics (a
   `widgets::segmented` row, `ModalsState::settings_tab`, opens on Profile and keeps the choice while the app runs); the
   body has one height on every tab (`SETTINGS_BODY_H`). The browser has Profile | Interface (Language, Sounds) | Playback.
+  Native Playback holds one control, Level loudness (the Jitter buffer and Catch-up speed sliders are gone, #125 below).
   *Why:* the user's request, 2026-11-04.
 - **Stream settings open in a modal**, not a side panel. *Why:* the user said the side
   panel was too squished for the number of controls.
@@ -522,7 +523,7 @@ Applied to the browser share modal (`docs/js/ui/app.js`):
   `ui.preset.low_latency`. (The native client's own `ui.preset.*` keys are in `client/locales`, untouched.)
 - Kept on purpose (information, not settings, and they act in the browser): the Screen and Audio source
   rows with the level meter, the Bitrate "set by budget" value in absolute-bandwidth mode, the framerate
-  select (the encoder is told the rate and excess frames are skipped), the bandwidth rows, jitter/catch-up.
+  select (the encoder is told the rate and excess frames are skipped), the bandwidth rows, jitter/catch-up (browser only, they act there).
 
 **Native client: hide twin choices and per-destination backend** (2026-11-01, task #95, same user rule as #93:
 "If a setting doesn't do anything, hide it (Yes, even when its just a browser limitation). Just hide it, so
@@ -567,7 +568,7 @@ unit tests build either mapping by hand):
 - **Audit result (native, per backend/codec/driver):** Framerate (RateCap, every backend), Bitrate (every backend), Keyframe
   interval (`key-int-max`, every VA codec and x264), bandwidth mode/total/floor (floor and total only drawn in Absolute
   mode, where they act), the Codec row (hidden with one codec), Settings: display name, language, jitter buffer and
-  catch-up speed (playback, act on every decoder) were checked and all do something; the Advanced disclosure stays
+  catch-up speed were checked and all did something (this claim was wrong for those two: native never read them, removed in #125, below); the Advanced disclosure stays
   because Quality level and Keyframe interval are always in it. Not changed on purpose: the Source card's audio
   controls (they act on every platform). Known remaining: Gaming vs Low-Latency on VA differ only by GOP (a real
   difference, kept); the modal's two-column width still reserves room for the longest label set (`column_need_for`
@@ -787,6 +788,16 @@ a rotated cert must update the entry, not add a second one.
   name-only upserts and re-saves of the identical string; it changes only when a different
   spelling of the same room (new cert hash) replaces it. `RoomStore::same_room(a, b)`
   compares two join strings by identity, for UI code matching a live session to a key.
+
+## Native Playback: jitter buffer and catch-up sliders removed (2026-11-04, #125)
+
+The native viewer has no playout pacing (frames are shown as decoded, `features/video-pipeline.md`), so the Settings >
+Playback sliders "Jitter buffer" and "Catch-up speed" did nothing. **Why:** the user was told so and said "Remove them",
+under their rule "If a setting doesn't do anything, hide it". Gone: both sliders, `UiAction::SetJitterBuffer` /
+`SetCatchUpSpeed`, `AppState::set_max_jitter_buffer_ms` / `set_catch_up_speed_percent`, `AppSettings.max_jitter_buffer_ms`
+/ `catch_up_speed_percent` with defaults and clamps, the locale keys. An old `settings.toml` with those keys still loads
+(serde ignores unknown keys; there is no `deny_unknown_fields`, keep it so); the next save drops them. The browser keeps
+its own working sliders (`docs/js/ui/`, `client.setJitterSettings`). Playback keeps Level loudness; the tab row is unchanged.
 
 ## Strings
 

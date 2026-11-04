@@ -402,8 +402,6 @@ pub enum UiAction {
     SetEmoji(String),
     SetLanguage(String),
     SetPresentationMode(PresentationMode),
-    SetJitterBuffer(u32),
-    SetCatchUpSpeed(u32),
     /// Settings > Diagnostics: the "Send diagnostics to the relay" checkbox (task #110).
     SetSendDiagnostics(bool),
     /// Settings > Audio boost: the sender-side multiplier (slider; persisted, pushed to running

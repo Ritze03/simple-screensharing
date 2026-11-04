@@ -97,8 +97,6 @@ pub struct ModalsState {
     /// Tallest Settings body drawn so far (see [`SETTINGS_BODY_H`]).
     settings_body_h: f32,
     display_name: String,
-    jitter_s: f32,
-    catch_up: u32,
     /// Sounds > Volume as dragged, and whether it moved since it was last saved (the drag acts live,
     /// the release saves once).
     sound_vol: u32,
@@ -134,8 +132,6 @@ impl ModalsState {
             }
             Modal::Settings => {
                 self.display_name = cx.state.display_name.clone();
-                self.jitter_s = cx.state.max_jitter_buffer_ms as f32 / 1000.0;
-                self.catch_up = cx.state.catch_up_speed_percent;
                 self.sound_vol = cx.state.sound_volume;
                 self.sound_dirty = false;
             }
@@ -637,35 +633,6 @@ fn settings(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
             }
             if st.settings_tab == SettingsTab::Playback {
                 widgets::card(ui, &tr("ui.settings.playback", "Playback"), None, |ui| {
-                    let max_ms = AppSettings::clamp_max_jitter_buffer_ms(u32::MAX) as f32 / 1000.0;
-                    widgets::slider_row(
-                        ui,
-                        &tr("ui.settings.jitter", "Jitter buffer"),
-                        Some(&tr(
-                            "ui.settings.jitter_tip",
-                            "Max jitter buffer. Smooths network hiccups; grows only when needed, up to this ceiling.",
-                        )),
-                        &mut st.jitter_s,
-                        0.0..=max_ms,
-                        0.1,
-                        1,
-                        " s",
-                    );
-                    let lo = AppSettings::clamp_catch_up_speed_percent(0);
-                    let hi = AppSettings::clamp_catch_up_speed_percent(u32::MAX);
-                    widgets::slider_row(
-                        ui,
-                        &tr("ui.settings.catch_up", "Catch-up speed"),
-                        Some(&tr(
-                            "ui.settings.catch_up_tip",
-                            "How much faster than live playback runs while shrinking the buffer after a spike.",
-                        )),
-                        &mut st.catch_up,
-                        lo..=hi,
-                        1.0,
-                        0,
-                        "%",
-                    );
                     let mut level = cx.state.level_loudness;
                     let level_label = tr("ui.settings.level_loudness_on", "Even out the volume of what I watch");
                     let r = widgets::ctrl_row(
@@ -780,15 +747,8 @@ fn settings(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
     {
         cx.act(UiAction::SetDisplayName(st.display_name.trim().to_string()));
     }
-    // Sliders: push once the pointer is released (each setter saves to disk).
+    // Slider: push once the pointer is released (each setter saves to disk).
     let settled = closing || !ctx.input(|i| i.pointer.any_down());
-    let jitter_ms = (st.jitter_s * 1000.0).round() as u32;
-    if settled && jitter_ms != cx.state.max_jitter_buffer_ms {
-        cx.act(UiAction::SetJitterBuffer(jitter_ms));
-    }
-    if settled && st.catch_up != cx.state.catch_up_speed_percent {
-        cx.act(UiAction::SetCatchUpSpeed(st.catch_up));
-    }
     if settled && std::mem::take(&mut st.sound_dirty) {
         cx.act(UiAction::SetSoundVolume(st.sound_vol));
     }

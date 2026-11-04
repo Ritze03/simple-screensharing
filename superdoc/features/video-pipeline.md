@@ -105,8 +105,8 @@ the hardware path is first and the fallback is a safety net, not a plan.
 faster and slower again", a *smooth* slowdown and speedup, ale shares no audio.
 
 **Mechanism (code):** the native viewer has no playout pacing (above: frames are shown the moment
-they are decoded; `PacingState` is not wired, and the Settings values `max_jitter_buffer_ms` /
-`catch_up_speed_percent` are stored but read by nothing on the native path). So when the decoder
+they are decoded; `PacingState` is not wired; the two Settings sliders for it, `max_jitter_buffer_ms` /
+`catch_up_speed_percent`, were read by nothing native and were removed, #125, 2026-11-04). So when the decoder
 is slower than the stream nothing is dropped at first: access units queue in the pipeline
 thread's backlog (`decode/video.rs` `run`, up to `BACKLOG_MAX_AUS` = 64, 0.7 s at 90 fps), the
 picture runs late more and more (slow motion at decoder speed / stream rate), and when the decoder
@@ -486,7 +486,7 @@ that outlived the code:
   `superdoc/meta/TERMINOLOGY.md` "Sniffing"); the browser's is `docs/js/core/codec.js`.
 - **Jitter buffer:** buffer *encoded* chunks and delay `decode()`, not decoded frames (a 1080p
   `VideoFrame` is ~3 MB). Playout delay eased toward `jitterEwma * 4 + 40 ms` (RFC 3550 EWMA, alpha
-  1/16, ease step 20 ms), capped by the user's `max_jitter_buffer_ms` (default 2000, 0-5000). The
+  1/16, ease step 20 ms), capped by the user's `max_jitter_buffer_ms` (default 2000, 0-5000; browser only, the native setting is gone, #125). The
   browser viewer keeps this design in `docs/js/core/jitter.js`.
 - **Sustained sender-faster-than-decoder overload** drifted without bound because the
   browser decoder was still fed every chunk. A frame cannot be skipped singly (delta frames
