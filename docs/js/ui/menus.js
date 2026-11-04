@@ -314,7 +314,7 @@ function targetsMenu(kind) {
   return out;
 }
 
-/** Settings > Profile > Avatar: the picker. The 40 emoji of the replica's grid plus a "Paste any emoji" field (a browser has system emoji fonts; native draws only its 40). */
+/** Settings > Profile > Avatar: the picker. The 40 emoji of the replica's grid plus a "Paste any emoji" field (a browser has system emoji fonts; native draws any one-glyph emoji from its embedded Noto font). */
 function emojiMenu() {
   const cur = S.settings.emoji;
   const set = (e) => { A.setEmoji(e); };

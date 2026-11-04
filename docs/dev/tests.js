@@ -13,7 +13,7 @@ import { deriveCodecString, sniffCodec } from "../js/core/codec.js";
 import { DECODE_QUEUE_CATCHUP_THRESHOLD, JitterBuffer, MAX_DECODE_QUEUE, clampCatchUpSpeedPercent, clampMaxJitterBufferMs } from "../js/core/jitter.js";
 import { CanvasRenderer, VideoReceiver } from "../js/core/video-rx.js";
 import { ENCODER_PRESETS } from "../js/core/video-tx.js";
-import { avatarBg, avatarColors, avatarHue, pickEmoji, sliderCtl, snapVolumePct, wheelStepVolumePct, volumeWheel, VOLUME_MAX_PCT } from "../js/ui/dom.js";
+import { avatarBg, avatarColors, avatarHue, balancePoint, pickEmoji, sliderCtl, snapVolumePct, wheelStepVolumePct, volumeWheel, VOLUME_MAX_PCT } from "../js/ui/dom.js";
 import * as G from "../js/ui/stage-geom.js";
 import { pipPairs, shareLabel } from "../js/ui/stage-state.js";
 import { isWebcamLabel } from "../js/core/room-client.js";
@@ -2203,3 +2203,23 @@ export async function runAll({ onResult = () => {} } = {}) {
   }
   return results;
 }
+
+test("emoji: balancePoint is the midpoint of the mass centre and the enclosing circle's centre, and follows a shift", () => {
+  // a solid 4 x 4 block with a 1-px spike out of row 2 (asymmetric); a stray alpha-127 pixel is not solid
+  const mk = (ox, oy, w = 24, h = 16) => {
+    const a = new Uint8Array(w * h);
+    for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++) a[(oy + y) * w + ox + x] = 255;
+    for (let x = 4; x < 14; x++) a[(oy + 2) * w + ox + x] = 255;
+    a[(oy + 8) * w + ox] = 127;
+    return a;
+  };
+  const [bx, by] = balancePoint(mk(2, 1), 24, 16);
+  // mass centre (2 + 122/26, 1 + 2.0 + ...): see the expected numbers below; the circle's centre is right of the block's centre, the mass left of it
+  const mass = [2 + (16 * 2 + 90) / 26, 1 + (16 * 2 + 10 * 2.5) / 26];
+  ok(bx > mass[0] && bx < 2 + 7.5, `x ${bx} between the mass centre ${mass[0]} and the circle centre (about 2+7)`);
+  ok(Math.abs(by - mass[1]) < 0.7, `y ${by} near the mass centre ${mass[1]}`);
+  const [cx, cy] = balancePoint(mk(5, 4), 24, 16);
+  near(cx - bx, 3, 0.01, "shifted by 3 in x");
+  near(cy - by, 3, 0.01, "shifted by 3 in y");
+  eq(balancePoint(new Uint8Array(16).fill(127), 4, 4), null, "nothing solid: no point");
+});

@@ -259,15 +259,13 @@ UI: Settings > Profile > Avatar opens the picker (`menus.js` `emojiMenu`: the re
 closes the picker); the choice is `settings.emoji` in `localStorage` (`store.js`), announced to every room at connect and on change (`app.js` `setEmoji`). **Rendering** is
 `dom.js` `avatarEl`, the one builder (strip, hover card, stream menu header, idle tile, viewers dropdown, sidebar user band): the background comes from the emoji's strongest hue
 (`emojiInfo`: the emoji drawn on a 48 px canvas, 10-degree bins weighted by saturation, `null` for a colourless one like 💀 which gets a neutral slate), a thin black outline follows
-its shape (four 1 px `drop-shadow`s), and **the visible pixels are centred** (the same canvas pass measures the bounding box of the opaque pixels, `translate` moves the glyph
-by the difference to its em box; D1's "crop and centre"). *Why the replica's system-font approach and not native's 40 bundled pictures:* a browser has system emoji fonts; the
-native client draws only its 40 and shows the initial for any other emoji, which is fine for it. Without an emoji the avatar is the name's gradient as before.
+its shape (four 1 px `drop-shadow`s), and **the emoji is centred on its balance point** (the same canvas pass reads the alpha map, `dom.js` `balancePoint`, a port of native `balance_point`: the midpoint of the solid pixels' (alpha >= 128) mass centre and the centre of their smallest enclosing circle, measured once per emoji and cached; `translate` moves the glyph by the difference to its em box; D1's "crop and centre"). *Why that and not the bounding box:* a box centre does not balance asymmetric shapes (a pizza looked off-centre); mass alone overshoots the moon and the guitar, the circle alone lifts the gamepad by 2 px, the midpoint suits all. *Why the replica's system-font approach and not native's embedded font:* a browser has system emoji fonts; native draws any one-grapheme emoji (<= 16 bytes, one bitmap glyph) from its embedded Noto font and shows the initial otherwise. Without an emoji the avatar is the name's gradient as before.
 
 Checked 2026-11-04 (`docs/dev/e2e/stage.mjs`, headless Chromium, own relay): Alice picks 🦊, Vera sees it on her avatar over the datagrams, the orange background, the four-shadow
 outline, 💀 on slate, a pasted 🐻, text refused with a hint, Use my initial, the setting in `localStorage`, the hover card carries it, it is announced again after a relay
 restart. With `SSSHARE_AVATARS=0` (acts like an older relay) the owner sees her own, the other sees the initial. **Browser and native in one room** (headless rig,
 `HS_EMOJI_1=🦊`, a headless Chromium joining the rig's room by its join link): the native client's 🦊 shows on its avatar in the browser, and the browser's 🐻 (picked in Settings)
-shows on the native viewer's strip; native draws any of its 40, the browser any emoji.
+shows on the native viewer's strip; native draws any emoji its embedded font has as one glyph, the browser any emoji its system fonts have.
 
 ## What the stage tests cover (D1, task I6)
 

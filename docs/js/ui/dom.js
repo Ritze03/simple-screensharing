@@ -207,18 +207,53 @@ const AVATAR_S = 0.6, AVATAR_LA = 0.36, AVATAR_LB = 0.24, AVATAR_SHIFT_B = 350;
 export function avatarColors(name, hue = avatarHue(name)) {
   return [hslHex(hue, AVATAR_S, AVATAR_LA), hslHex((hue + AVATAR_SHIFT_B) % 360, AVATAR_S, AVATAR_LB)];
 }
-/** The picker's emoji (the replica's `EMOJI`, the native client draws these 40 and the initial for any other). */
+/** The picker's emoji grid (the replica's `EMOJI`). Any emoji can be pasted; native draws any one grapheme of at most 16 bytes that shapes to a single bitmap glyph in its embedded Noto font. */
 export const EMOJI = [..."😀😎🤓🥳🤖👻👽🎃💀🤡🐶🐱🦊🐻🐼🐸🐙🦄🐧🦉🍕🍔🍩🍣🍉☕🌮🍺🎮🎧🎬🎸⚽🚀🌈⭐🔥⚡🌙🌵"];
 const EMOJI_FONT = '"Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji", "Twemoji Mozilla", sans-serif';
 /** Greyish background of a colourless emoji (like 💀): the replica's `hsl(222, .14, .36 / .24)` slate, not a hue at all. */
 const SLATE = [hslHex(222, 0.14, 0.36), hslHex(222, 0.14, 0.24)];
 const emojiCache = new Map();
 /**
- * What an emoji looks like, measured once by drawing it on a 32 px canvas (a browser has system emoji fonts, so this is the
- * replica's approach, the native client does the same on its bundled pictures): `hue` = its strongest hue in 10-degree bins (so a
- * mix of colours cannot average to mud), `null` when it has almost no colour; `dx`/`dy` = how far the centre of its visible pixels
- * is from the centre of its em box, in em, so the avatar can centre the VISIBLE emoji (D1: "crop and centre", native
- * `paint_avatar_emoji`). Without a canvas (a test page without a DOM) or on a failure: no hue, no shift.
+ * The point an emoji balances on, in pixel coordinates of `alpha` (`w` x `h`, one alpha byte per pixel, solid = >= 128): the
+ * midpoint of the solid pixels' mass centre and the centre of their smallest enclosing circle. Port of native
+ * `widgets/emoji.rs` `balance_point` (a box centre does not balance asymmetric shapes; mass alone overshoots the moon and the
+ * guitar, the circle alone lifts the gamepad). `null` when nothing is solid. Pure: no canvas.
+ */
+export function balancePoint(alpha, w, h) {
+  let sx = 0, sy = 0, n = 0;
+  const edge = [];
+  for (let y = 0; y < h; y++) {
+    const cy = y + 0.5;
+    let l = -1, r = -1;
+    for (let x = 0; x < w; x++) {
+      if (alpha[y * w + x] < 128) continue;
+      if (l < 0) l = x;
+      r = x;
+      sx += x + 0.5; sy += cy; n++;
+    }
+    if (l >= 0) edge.push([l, cy], [r + 1, cy]);
+  }
+  if (!n) return null;
+  const mass = [sx / n, sy / n];
+  // Badoiu-Clarkson: step towards the farthest point by a shrinking fraction
+  let c = mass;
+  for (let i = 1; i <= 400; i++) {
+    let far = edge[0], best = -1;
+    for (const p of edge) {
+      const d = (p[0] - c[0]) ** 2 + (p[1] - c[1]) ** 2;
+      if (d > best) { best = d; far = p; }
+    }
+    const k = 1 / (i + 1);
+    c = [c[0] + (far[0] - c[0]) * k, c[1] + (far[1] - c[1]) * k];
+  }
+  return [(mass[0] + c[0]) / 2, (mass[1] + c[1]) / 2];
+}
+/**
+ * What an emoji looks like, measured once by drawing it on a 48 px canvas (a browser has system emoji fonts, so this is the
+ * replica's approach; native does the same on its embedded Noto bitmaps): `hue` = its strongest hue in 10-degree bins (so a
+ * mix of colours cannot average to mud), `null` when it has almost no colour; `dx`/`dy` = how far its balance point
+ * (`balancePoint`, the same rule as native) is from the centre of its em box, in em, so the avatar can centre the emoji
+ * (D1: "crop and centre", native `paint_avatar_emoji`). Without a canvas (a test page without a DOM) or on a failure: no hue, no shift.
  */
 export function emojiInfo(e) {
   if (emojiCache.has(e)) return emojiCache.get(e);
@@ -233,11 +268,11 @@ export function emojiInfo(e) {
     x.fillText(e, 24, 24);
     const d = x.getImageData(0, 0, 48, 48).data;
     const bins = new Array(36).fill(0);
-    let coloured = 0, x0 = 48, x1 = -1, y0 = 48, y1 = -1;
+    let coloured = 0;
+    const alpha = new Uint8Array(48 * 48);
     for (let i = 0; i < d.length; i += 4) {
+      alpha[i / 4] = d[i + 3];
       if (d[i + 3] < 128) continue;
-      const px = (i / 4) % 48, py = Math.floor(i / 4 / 48);
-      x0 = Math.min(x0, px); x1 = Math.max(x1, px); y0 = Math.min(y0, py); y1 = Math.max(y1, py);
       const r = d[i], g = d[i + 1], b = d[i + 2], hi = Math.max(r, g, b), lo = Math.min(r, g, b), sat = hi ? (hi - lo) / hi : 0;
       if (sat < 0.25 || hi < 40) continue;
       const dl = hi - lo, hue = (60 * (hi === r ? (g - b) / dl + 6 : hi === g ? (b - r) / dl + 2 : (r - g) / dl + 4)) % 360;
@@ -245,7 +280,8 @@ export function emojiInfo(e) {
       coloured++;
     }
     info = { hue: coloured < 40 ? null : bins.indexOf(Math.max(...bins)) * 10 + 5, dx: 0, dy: 0 };
-    if (x1 >= 0) info.dx = ((x0 + x1 + 1) / 2 - 24) / 32, info.dy = ((y0 + y1 + 1) / 2 - 24) / 32;
+    const bp = balancePoint(alpha, 48, 48);
+    if (bp) info.dx = (bp[0] - 24) / 32, info.dy = (bp[1] - 24) / 32;
   } catch {}
   emojiCache.set(e, info);
   return info;

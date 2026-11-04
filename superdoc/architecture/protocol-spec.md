@@ -855,7 +855,7 @@ Members without an emoji are left out, so a list with `count = 0` means "nobody 
 - **Receiver behaviour (trust boundary).** The client replaces its whole per-room map with each list (an
   absent member has none) and drops a member's entry when `MemberLeft` arrives. A list that is truncated,
   has trailing bytes, or any entry that is empty, longer than 16 bytes or not UTF-8, is discarded whole. The
-  UI draws an emoji only if it is one of the picker's 40 (it has a bundled picture of each); anything else
+  native UI draws any emoji that is one grapheme and shapes to a single bitmap glyph in its embedded Noto font (the browser: any emoji its system fonts have); anything else
   shows the initial, like no emoji. Keyed by `ConnId` within one live session.
 - **Why 16 bytes and why cleartext.** 16 covers a keycap, a flag or a four-codepoint ZWJ sequence and keeps
   `AvatarSet` below the media-header length, which is what makes it safe to send to an old relay without

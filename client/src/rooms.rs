@@ -451,7 +451,7 @@ pub struct AppSettings {
     #[serde(default = "AppSettings::default_sound_volume")]
     pub sound_volume: u32,
     /// Settings > Profile: the emoji shown as this person's avatar instead of their initial, one of
-    /// `widgets::EMOJI` ("" = none; any other value is shown as none). Sent to every room's relay
+    /// `widgets::EMOJI` or any other emoji the embedded font draws as one glyph ("" = none; a value that does not draw shows the initial). Sent to every room's relay
     /// (spec §9.2). An old settings file without the key gets none.
     #[serde(default)]
     pub emoji: String,
