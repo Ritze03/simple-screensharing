@@ -2985,6 +2985,33 @@ async fn emoji_avatars_travel_through_the_relay() {
     avatars_until(&mut ev_b, "the reconnected octopus", |l| l.contains(&(ana2, "🐙".to_string()))).await;
 }
 
+/// Two members with the SAME display name (row 128: the same person on two machines): the relay and
+/// the net layer key avatars by `ConnId`, so each one's changes reach the other under its own id,
+/// however many times they change. (The UI once looked emoji up by name and showed the viewer's own
+/// emoji for the other; this pins down that nothing below the UI does.) Run with
+/// `cargo test -p simple-screensharing-client --release --lib -- --ignored same_name_members`.
+#[tokio::test]
+#[ignore = "spawns a real relay server child process (current version, SSSHARE_SERVER_BIN)"]
+async fn same_name_members_keep_their_own_emoji_avatars() {
+    let port = pick_free_udp_port().expect("free UDP port");
+    let _server = spawn_relay_server(port).expect("spawn relay");
+    let link = crate::net::format_join_string(&format!("127.0.0.1:{port}"), &rand::random(), &rand::random());
+
+    let (a, _s, mut ev_a) = connect_with_retry(&link, "Ritze").await.expect("connect a");
+    let (b, _s, mut ev_b) = connect_with_retry(&link, "Ritze").await.expect("connect b");
+    let (ida, idb) = (a.conn_id(), b.conn_id());
+    assert_ne!(ida, idb);
+    a.set_avatar("🦊");
+    b.set_avatar("🐙");
+    avatars_until(&mut ev_b, "both emoji", |l| l.contains(&(ida, "🦊".into())) && l.contains(&(idb, "🐙".into()))).await;
+    for emoji in ["🎃", "💀", "🐙", "🐸", "🦊"] {
+        a.set_avatar(emoji);
+        avatars_until(&mut ev_b, "a's change", |l| l.contains(&(ida, emoji.to_string())) && l.contains(&(idb, "🐙".into()))).await;
+    }
+    b.set_avatar("🌵");
+    avatars_until(&mut ev_a, "b's change", |l| l.contains(&(idb, "🌵".into())) && l.contains(&(ida, "🦊".into()))).await;
+}
+
 /// The relay's `logs/clients` directory for the relay [`spawn_relay_server`] started on `port`.
 fn relay_client_log_dir(port: u16) -> PathBuf {
     let cwd = match std::env::var_os("SSSHARE_SERVER_CWD") {
