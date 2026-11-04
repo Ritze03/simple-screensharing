@@ -223,6 +223,15 @@ first; native's map keeps the last, its doc comment says the second keeps its ti
 removes your screen and, with it, your in-picture webcam from your stage (a webcam you share while hiding is hidden too); others still see both. The strip's hover card says `In picture` (`ui.strip.in_picture`) on a
 webcam inside a picture. Differences from native: rounded corners and the glide (the browser can; native cannot clip a video callback); `Escape` and the browser's own fullscreen as before.
 
+**Checked 2026-11-04.** Host (headless Chromium, `--use-fake-device-for-media-stream`, own relay, never any audio): `dev/tests.html` 119 checks (the PIP geometry and pairing tests are ports of the Rust ones; no
+shared vector file, the numbers are the same); `e2e/stage.mjs` 190 checks (the webcam, all 8 spots with real drags, Crop, Floating, both fullscreens, Hide my own streams, pop-out, ...); `e2e/native-webcam.mjs` in the headless rig
+(`SSS_FAKE_CAMERA=1`): a native webcam shows in the browser and sits in the native screen's picture, the browser's webcam shows on the native viewer and sits in the browser's screen there (native `pipinfo` spot=2,2). Audio, in the
+arch-ssd VM only (`e2e/audio-only.mjs`, a headless Chromium 156 there, a native audio-only sender built from this tree, the emulated Floorp tone source, a fake hardware sink): a **native audio-only sender is heard by a browser** (tile, Listen,
+107 packets decoded in about 4 s, the meter sees the tone, Stop listening, the tile goes when the sender stops), a **browser audio-only share** (the real `#btn-audio` click, video track stopped) **is heard by a second browser and by a
+native viewer** (`owner_has_video=false`, 350-400 packets), and a webcam-plus-audio sender gets a webcam tile and an audio tile with no audio subscribed by the webcam watch. *Not tested:* a real `getDisplayMedia` audio-only pick (the harness
+stubs the picker, and Chromium's own refusal of `video: false` is documented, not exercised), Firefox (no `getDisplayMedia` encode path, no MediaStreamTrackProcessor), a real USB camera (the fake device delivers 1280x720 at 20 fps and reports
+no capability list worth a mode menu), a real GPU, Windows.
+
 ## Emoji avatars (task I6, 2026-11-04)
 
 The wire format is `protocol-spec.md` §9.2 (`AvatarHello 0xE9`, `AvatarAck 0xEA`, `AvatarSet 0xEB`, `AvatarList 0xEC`). Core: `protocol.js` `packAvatarSet` / `unpackAvatarSet` /

@@ -239,5 +239,23 @@ release on one element and the UI re-renders on every state change, so the harne
 The Document Picture-in-Picture window (stream and stage pop-out) works in headless Chromium on a secure origin (`http://127.0.0.1`), so those paths are tested too. Not simulated:
 the pointer leaving the window (CDP cannot move it out; a synthetic `mouseleave` on `<html>` is dispatched instead), a real frame-size change of a stream.
 
+**Task I10 (2026-11-04) added to the same run** (the pages now start with `--use-fake-device-for-media-stream`, the camera permission is granted through CDP `Browser.grantPermissions`, and no
+audio is ever requested: the camera is `audio: false`, the screens are the silent pattern): the webcam through the real bar (click starts it, the second click stops it; label exactly `Webcam`, video only,
+reaches a second page and decodes there, tag icon, no volume in its menu), **Webcam in picture** (off by default, per view, the `<canvas>` re-adopted not recreated, a new PIP .24 wide bottom right with its handle
+on the corner facing the middle, 6 px corners and the glide rule), **real drags to all 8 spots** (free while held, 12 px inset or centred on release, the tile under the PIP never moves), a click changes nothing, resize
+(aspect locked, opposite corner fixed, minimum 72 px, capped by the picture, spot kept), **the same spot across Split / Crop / Floating, a smaller window, a resize bar drag, the stage's fullscreen and the stream's own
+fullscreen** (the PIP goes into it and can be dragged there), Crop in a narrow window (all 8 spots inside the visible picture, drags far past the edges stop at the edge), Floating (the parent window never moves),
+a viewer who has not watched the screen sees a tile, a popped-out parent leaves a webcam tile, the hover card's `In picture`, your own webcam inside your own screen, **Hide my own streams** (both gone from your stage, others
+still see them), PIP off gives the tiles back, a webcam alone is a tile, and the Listen tile logic (an audio stream injected into the page state: with no screen it is an audio-only tile, with only a webcam too, with a screen
+none; no sound is played). 190 checks on 2026-11-04 (~30 min with the relay restarts; the pop-out and relay-restart parts dominate). The real audio paths are **not** run here: `e2e/audio-only.mjs` (VM only, below).
+
+`e2e/native-webcam.mjs '<join link>'` (host, in the headless rig, `CLIENT_ENV_1="SSS_FAKE_CAMERA=1 SSS_SOUND_SINK=fakesink"`): a headless Chromium joins the rig's room by its join link; the native screen and native webcam
+show up, decode, and with Webcam in picture the native webcam sits in the native screen's tile; then the browser shares a silent screen and its own (fake) webcam and holds them so the native viewer can watch both and show the
+browser's webcam in picture (`hs-drive.sh uclick 2 ctl.layout` + `menu.pip`). Run 2026-11-04: PASS both directions, screenshots in `E2E_OUT`.
+
+`e2e/audio-only.mjs <relay> <hash> --sender <audio-only-sender> --source <name>` **plays audio, so it runs only in a test VM** (arch-ssd, with `client/scripts/vm-audio/fakehw.sh` and `emu_src.py`; `testing-and-verification.md` "Audio
+tests in the VMs"). It covers a native audio-only sender (a throwaway `audio-only-sender` package outside `client/`: `AppState::start_audio_share(room, None, ..)`, like the bar's audio button) heard by a browser (the tile, Listen,
+packets decoded, Stop listening), a browser audio-only share (`#btn-audio` with the harness' stubbed `getDisplayMedia`, only the audio kept) heard by a browser and by the native viewer (`listen` mode), and the webcam-plus-audio case.
+
 The older runs that depended on the old tiles and cards were updated: `viewers.mjs` (the viewers chip is on the own tile), `live-preview.mjs`, `avatar-fullscreen.mjs`, `e2e-lib.mjs`
 (`goLive` picks the FPS in the app's own dropdown: `pickFps`). `live.js` and `matrix.mjs` default to the new preset name (`quality`).
