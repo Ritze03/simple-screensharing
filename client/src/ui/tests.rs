@@ -1125,15 +1125,51 @@ async fn the_webcam_menu_and_modal_draw_and_picks_are_saved_and_the_pip_option_i
     assert_eq!(app.state.webcam.camera, "Cam B");
     draw(&mut app);
 
-    // "Webcam in picture" belongs to a view: switching it on in one stage leaves the other alone.
+    // "Webcam in picture" belongs to a view: switching it off in one stage leaves the other alone.
     let room = StageView::Room(RoomHandle(1));
-    assert!(!app.shell.stage.pip(&StageView::Watched), "off until switched on");
-    app.apply(&ctx, UiAction::SetStagePip { view: StageView::Watched, on: true });
-    assert!(app.shell.stage.pip(&StageView::Watched) && !app.shell.stage.pip(&room));
-    app.apply(&ctx, UiAction::SetStagePip { view: room.clone(), on: true });
+    assert!(app.shell.stage.pip(&StageView::Watched) && app.shell.stage.pip(&room), "on until switched off (#131)");
     app.apply(&ctx, UiAction::SetStagePip { view: StageView::Watched, on: false });
     assert!(!app.shell.stage.pip(&StageView::Watched) && app.shell.stage.pip(&room));
+    app.apply(&ctx, UiAction::SetStagePip { view: room.clone(), on: false });
+    app.apply(&ctx, UiAction::SetStagePip { view: StageView::Watched, on: true });
+    assert!(app.shell.stage.pip(&StageView::Watched) && !app.shell.stage.pip(&room));
     draw(&mut app);
+}
+
+/// #131: the Layout menu's choices survive a restart: written by the actions, read back by a new
+/// `StageSettings`, a room found again by its identity (a new handle, a join string with a cert hash added).
+#[tokio::test]
+async fn the_layout_menu_choices_are_saved_and_loaded() {
+    use simple_screensharing_client::rooms::AppSettings;
+    let _home = isolated_home();
+    let mut app = app_with_rooms(&[]);
+    let ctx = ctx();
+    let s = &app.shell.stage;
+    assert_eq!((s.hide_own, s.always_names, s.show_stats), (false, false, false), "fresh install defaults");
+    assert_eq!((s.layout(&StageView::Watched), s.pip(&StageView::Watched)), (StageLayout::Split, true));
+    let js = unreachable_join_string(7);
+    app.shell.stage.sync_rooms([(RoomHandle(1), js.as_str())].into_iter());
+    let room = StageView::Room(RoomHandle(1));
+    app.apply(&ctx, UiAction::SetStageLayout { view: room.clone(), layout: StageLayout::Crop });
+    app.apply(&ctx, UiAction::SetStagePip { view: room.clone(), on: false });
+    app.apply(&ctx, UiAction::SetStageLayout { view: StageView::Watched, layout: StageLayout::Floating });
+    app.apply(&ctx, UiAction::SetHideOwnStreams(true));
+    app.apply(&ctx, UiAction::SetShowStats(true));
+
+    let mut restarted = StageSettings::from_saved(AppSettings::load().stage);
+    assert_eq!((restarted.hide_own, restarted.always_names, restarted.show_stats), (true, false, true));
+    assert_eq!(restarted.layout(&StageView::Watched), StageLayout::Floating);
+    assert!(restarted.pip(&StageView::Watched));
+    let other = unreachable_join_string(8);
+    restarted.sync_rooms([(RoomHandle(9), js.as_str()), (RoomHandle(10), other.as_str())].into_iter());
+    let (r9, r10) = (StageView::Room(RoomHandle(9)), StageView::Room(RoomHandle(10)));
+    assert_eq!((restarted.layout(&r9), restarted.pip(&r9)), (StageLayout::Crop, false));
+    assert_eq!((restarted.layout(&r10), restarted.pip(&r10)), (StageLayout::Split, true), "another room keeps the defaults");
+
+    // Back to the defaults leaves no entry behind.
+    app.apply(&ctx, UiAction::SetStageLayout { view: room.clone(), layout: StageLayout::Split });
+    app.apply(&ctx, UiAction::SetStagePip { view: room, on: true });
+    assert_eq!(AppSettings::load().stage.views.len(), 1, "only Watched differs");
 }
 
 /// "Watched streams" is the stage even with nothing watched, and a frame of it draws (the note) without

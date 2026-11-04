@@ -448,7 +448,61 @@ pub struct AppSettings {
     /// The webcam menu's choices (task I8). A file from before the setting gets the defaults.
     #[serde(default)]
     pub webcam: WebcamSettings,
+    /// The Layout menu's choices (2026-11-04, #131). A file from before the setting gets the defaults.
+    #[serde(default)]
+    pub stage: StagePrefs,
 }
+
+/// A stage layout (the Layout menu's three choices). Lives here so [`StagePrefs`] can save it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StageLayout {
+    #[default]
+    Split,
+    Crop,
+    Floating,
+}
+
+/// One stage's saved choices ([`StagePrefs::views`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ViewPrefs {
+    #[serde(default)]
+    pub layout: StageLayout,
+    /// "Webcam in picture"; on by default.
+    #[serde(default = "ViewPrefs::default_pip")]
+    pub pip: bool,
+}
+
+impl ViewPrefs {
+    fn default_pip() -> bool {
+        true
+    }
+}
+
+impl Default for ViewPrefs {
+    fn default() -> Self {
+        Self { layout: StageLayout::default(), pip: true }
+    }
+}
+
+/// What the Layout menu remembers ([`AppSettings::stage`]). The three switches are global; layout and webcam in
+/// picture are per stage: `views` maps `"watched"` (the Watched view) or a room's `room_identity` to its choices,
+/// and holds only stages that differ from the defaults (Split, webcam in picture on). Sizes, positions and order
+/// are not saved.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StagePrefs {
+    #[serde(default)]
+    pub hide_own: bool,
+    #[serde(default)]
+    pub always_names: bool,
+    #[serde(default)]
+    pub show_stats: bool,
+    #[serde(default)]
+    pub views: std::collections::BTreeMap<String, ViewPrefs>,
+}
+
+/// The `StagePrefs::views` key of the Watched view.
+pub const WATCHED_KEY: &str = "watched";
 
 /// What the webcam menu remembers (task I8, [`AppSettings::webcam`]): which camera, which of its modes, and how it
 /// is compressed. The encoder's tune and keyframe interval are fixed (`capture::EncodeChoice::webcam`), so they
@@ -557,6 +611,7 @@ impl Default for AppSettings {
             emoji: String::new(),
             audio_exclusions: Self::default_audio_exclusions(),
             webcam: WebcamSettings::default(),
+            stage: StagePrefs::default(),
         }
     }
 }
@@ -917,10 +972,12 @@ mod tests {
             emoji: "🦊".to_string(),
             audio_exclusions: vec!["Teams".to_string()],
             webcam: WebcamSettings { camera: "C920".into(), mode: "MJPG 1280x720@30".into(), codec: VideoCodec::H265, bitrate_kbps: 1800 },
+            stage: StagePrefs { show_stats: true, ..Default::default() },
         };
         let toml_str = toml::to_string_pretty(&settings).unwrap();
         let parsed: AppSettings = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.webcam, settings.webcam);
+        assert_eq!(parsed.stage, settings.stage);
         assert_eq!(parsed.language, "de");
         assert_eq!(parsed.presentation_mode, PresentationMode::Mailbox);
         assert_eq!(parsed.bandwidth_mode, BandwidthMode::Absolute);
@@ -999,6 +1056,23 @@ mod tests {
         assert!(!AppSettings::default().send_diagnostics);
         let parsed: AppSettings = toml::from_str("language = \"de\"\n").unwrap();
         assert!(!parsed.send_diagnostics);
+    }
+
+    /// #131: an old file gets the Layout menu defaults; a saved one round-trips.
+    #[test]
+    fn stage_prefs_default_load_and_round_trip() {
+        let old: AppSettings = toml::from_str("language = \"en\"\n").unwrap();
+        assert_eq!(old.stage, StagePrefs::default());
+        assert!(!old.stage.hide_own && !old.stage.always_names && !old.stage.show_stats);
+        assert_eq!(ViewPrefs::default(), ViewPrefs { layout: StageLayout::Split, pip: true });
+        let mut s = AppSettings::default();
+        s.stage.show_stats = true;
+        s.stage.views.insert(link("relay:4433", 1, None), ViewPrefs { layout: StageLayout::Crop, pip: false });
+        s.stage.views.insert(WATCHED_KEY.into(), ViewPrefs { layout: StageLayout::Floating, pip: true });
+        let back: AppSettings = toml::from_str(&toml::to_string_pretty(&s).unwrap()).unwrap();
+        assert_eq!(back.stage, s.stage);
+        let part: AppSettings = toml::from_str("[stage.views.watched]\nlayout = \"crop\"\n").unwrap();
+        assert_eq!(part.stage.views[WATCHED_KEY], ViewPrefs { layout: StageLayout::Crop, pip: true });
     }
 
     /// Task I8: a file from before the webcam menu loads with the defaults, and a file that names only a camera

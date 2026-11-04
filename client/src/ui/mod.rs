@@ -1154,7 +1154,7 @@ impl App {
         Self {
             state,
             nav: Nav { view, ..Default::default() },
-            shell: Shell::default(),
+            shell: Shell { stage: StageSettings::from_saved(simple_screensharing_client::rooms::AppSettings::load().stage), ..Shell::default() },
             videos: VideoViews::default(),
             sidebar: Default::default(),
             room: Default::default(),
@@ -1165,6 +1165,11 @@ impl App {
             popout: Default::default(),
             now: 0.0,
         }
+    }
+
+    /// Let the stage settings learn each joined room's saved key (and seed a new room from the file, #131).
+    fn sync_stage_keys(&mut self) {
+        self.shell.stage.sync_rooms(self.state.rooms.iter().map(|(h, r)| (*h, r.join_string.as_str())));
     }
 
     /// Per-frame session polling, revived from the old `ui.rs` `update()`:
@@ -1225,6 +1230,7 @@ impl App {
             self.toast(tr_with("ui.toast.live_in", "Live in %{room}", &[("room", &name.to_string())]), "cast");
         }
         self.videos.sync(&self.state);
+        self.sync_stage_keys();
         self.poll_live_previews(ctx);
         self.poll_staged();
         self.poll_level_taps();

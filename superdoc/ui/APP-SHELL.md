@@ -151,8 +151,8 @@ call, not in side panels.
   Then: the **name tag** at the top left (`[icon][name][· label]`, the icon is the audio status: `volume_up` audible,
   `volume_off` muted or none) and three round buttons at the top right, **Pop out**, **Fullscreen** and `⋯`.
   **"Always show names"** (Layout menu) keeps the tag without hovering; the buttons and the stats never stay. **Show
-  stats** (Layout menu, ONE switch for every watched stream, `StageSettings::show_stats`, off until switched on, not
-  persisted, `UiAction::SetShowStats`; dump rect `menu.show_stats`) adds `res · fps · rate` to the tag **while hovered**
+  stats** (Layout menu, ONE switch for every watched stream, `StageSettings::show_stats`, off until switched on, saved,
+  `UiAction::SetShowStats`; dump rect `menu.show_stats`) adds `res · fps · rate` to the tag **while hovered**
   (it does not ride on "Always show names"), in slots reserved
   for `9999×9999`, `999 fps` and `99.9 Mbps` (`tile::RESERVE`), so the pill is exactly as wide as its content and never
   jitters as a number gains a digit; its tooltip keeps what the old statbar's had (decoded vs shown fps, codec and decoder,
@@ -216,7 +216,7 @@ camera in its saved mode, into the room the bar acts on; from another room it **
 arrow opens **only** the camera list (name and `/dev/video0` under it, the current one ticked; a new camera resets the
 mode) and "All webcam settings…" (`share::webcam_menu`, `BarMenu::Webcam`). It is disabled with the reason as its tooltip
 when there is no `v4l2src` plugin, no camera ("Looking for cameras…" while the first listing runs) or off Linux, and a
-running webcam lights it green. Layout menu: Split / Crop / Floating (two-line items), **Webcam in picture** (per view),
+running webcam lights it green. Layout menu: Split / Crop / Floating (two-line items), **Webcam in picture** (per view, on by default),
 Always show names, **Show stats** (numbers on every stream's name tag while hovered), Hide my own streams (removes your screen and webcam, in-picture webcam included, from your stage only,
 others still see them), Reset sizes and positions (also forgets the PIP spots and sizes). Room settings menu: header, Auto-connect, Rename, Copy invite link, Leave room, Forget room (the modals
 the old header used). Bar layout and narrow windows: see "Narrow windows".
@@ -335,11 +335,12 @@ re-derive the split every frame and silently break when content height changes.
   `Set by upload budget` in Absolute bandwidth mode), the fixed-encoder note, footer `[Start webcam | Stop webcam][fill][Done]`.
   Everything acts at once; camera and mode restart a running webcam, codec and bitrate change it live.
   Opened from the arrow's item, the tile's gear and `⋯`, and the sidebar's Outgoing popover (`Modal::WebcamSettings`).
-- **Webcam in picture** (Layout menu checkbox, **per view** and off until switched on: `StageSettings::pip`,
+- **Webcam in picture** (Layout menu checkbox, **per view** and **on until switched off** since 2026-11-04 (#131): `StageSettings::pip`,
   `UiAction::SetStagePip`) moves a person's webcam into their first screen share that is **playing on this stage**
   (`pip_pairs`: yours, or one you watch, not popped out; one parent holds one webcam). With none, with a share you do
   not watch (its tile holds the Watch button), with the share popped out, or while you do not watch the webcam itself,
   the webcam stays a tile. Your own webcam goes into your own screen the same way. Hide my own streams hides both.
+  A person with a webcam and a screen share therefore gets the webcam in the picture by default (the rules above still apply).
   *Why a tile again in those cases:* a webcam you cannot see playing in a picture would have no Watch button anywhere.
 - **Position and size** (`geom::PipPos`, per webcam and per view in `ViewGeom::pip`; replica `layoutPip`): the size is a
   fraction of the **picture's** width (default .24, minimum 72 px, never more than what shows) and the place is one of
@@ -823,6 +824,32 @@ a rotated cert must update the entry, not add a second one.
   name-only upserts and re-saves of the identical string; it changes only when a different
   spelling of the same room (new cert hash) replaces it. `RoomStore::same_room(a, b)`
   compares two join strings by identity, for UI code matching a live session to a key.
+
+## Layout menu settings are saved (2026-11-04, #131)
+
+Everything the Layout menu sets survives a restart, in both clients: the layout (Split / Crop / Floating), Webcam in
+picture, Always show names, Hide my own streams, Show stats. Defaults for a fresh install, or a view with no saved value:
+**Split, Webcam in picture on, the other three off.** *Why:* the user: "Layout settings should save, with these being the
+defaults." (with a screenshot of the menu: Split, Webcam in picture checked, the rest unchecked).
+
+- **Native** (`AppSettings::stage: StagePrefs` in `settings.toml`, `#[serde(default)]`, so an older file loads with the
+  defaults). The three switches are global booleans `hide_own`, `always_names`, `show_stats`. Layout and Webcam in
+  picture are **per view** ("each room and Watched keep their own"): `[stage.views."<key>"]` with `layout =
+  "split"|"crop"|"floating"` and `pip = true|false`, the key being `"watched"` or the room's `room_identity` (server +
+  room id + key, no cert hash: "Saved-room identity" below), because a `RoomHandle` does not survive a restart. Only
+  views that differ from the defaults have an entry (so `pip` defaulting to on costs nothing in the file). A room
+  joined by a link that is not saved is saved here by its identity too (nothing extra to do, harmless).
+- `StageSettings` (`ui/stage/mod.rs`) keeps the session's choices by `StageView` as before and learns each joined
+  room's key (`sync_rooms`, every frame and before a change); a room's saved values are seeded when its key is first
+  learnt, Watched at start (`StageSettings::from_saved`, `Shell` built in `App::with_state`). The actions `SetStageLayout`,
+  `SetHideOwnStreams`, `SetAlwaysShowNames`, `SetShowStats` and `SetStagePip` write the file (`ui/apply.rs`).
+- **Not saved** (per session, as before): tile order, grid sizes, floating window rects and z-order, the webcam's
+  spot and size, the strip, the sidebar, pop-outs.
+- **Browser** (`docs/js/ui/store.js`): `settings.stage = { hideOwn, alwaysNames, showStats, views: { "room:<id>" |
+  "watched": { layout, pip } } }` in the `sss.settings.v1` localStorage entry, normalized on load, only non-default views
+  stored; `S.stage` is built from it and `persistStage()` writes it after every Layout-menu change (`menus.js`,
+  `setLayout`). The room id is the saved room's (`<roomIdHex>@<server>`), stable across reloads. `S.stage.pip` (the set of
+  views with it on) became `S.stage.pipOff`.
 
 ## Native Playback: jitter buffer and catch-up sliders removed (2026-11-04, #125)
 

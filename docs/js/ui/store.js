@@ -81,6 +81,20 @@ function normalizeWebcam(w) {
   };
 }
 
+const STAGE_LAYOUTS = ["split", "crop", "float"];
+/** The Layout menu's saved choices (native `rooms::StagePrefs`): three global switches, and per view key ("room:<id>" | "watched") its layout
+ *  and "Webcam in picture" (on by default). `views` holds only views that differ from the defaults (Split, picture on). */
+function normalizeStage(st) {
+  st = st && typeof st === "object" ? st : {};
+  const views = {};
+  for (const [k, v] of Object.entries(st.views && typeof st.views === "object" ? st.views : {})) {
+    const layout = v && STAGE_LAYOUTS.includes(v.layout) ? v.layout : "split";
+    const pip = !(v && v.pip === false);
+    if (layout !== "split" || !pip) views[k] = { layout, pip };
+  }
+  return { hideOwn: st.hideOwn === true, alwaysNames: st.alwaysNames === true, showStats: st.showStats === true, views };
+}
+
 export function loadSettings() {
   const s = read(K_SETTINGS) || {};
   const out = {
@@ -106,6 +120,8 @@ export function loadSettings() {
     webcam: normalizeWebcam(s.webcam),
     // Settings > Profile: my emoji avatar ("" = none), announced to every room's relay (core `setAvatar`).
     emoji: typeof s.emoji === "string" ? s.emoji.trim() : "",
+    // The Layout menu (#131): see `normalizeStage`.
+    stage: normalizeStage(s.stage),
     lastServer: typeof s.lastServer === "string" ? s.lastServer : "",
     lastCertHash: typeof s.lastCertHash === "string" ? s.lastCertHash : "",
   };
@@ -121,8 +137,11 @@ export function loadRooms() {
 export const saveRoomList = (rooms) => write(K_ROOMS, rooms.map((r) => ({ id: r.id, name: r.name, link: r.link, auto: !!r.auto })));
 
 /* ---- shared UI state ---- */
+const initialSettings = loadSettings();
+const stageLayouts = () => Object.fromEntries(Object.entries(initialSettings.stage.views).filter(([, v]) => v.layout !== "split").map(([k, v]) => [k, v.layout]));
+const stagePipOff = () => new Set(Object.entries(initialSettings.stage.views).filter(([, v]) => !v.pip).map(([k]) => k));
 export const S = {
-  settings: loadSettings(),
+  settings: initialSettings,
   rooms: [], // RoomEntry (rooms.js)
   captures: [], // Capture (capture.js)
   view: "room", // "room" | "watching"
@@ -132,16 +151,16 @@ export const S = {
   toasts: [],
   flash: null,
   menu: null, // the open dropdown / context menu (menus.js): { kind, mk, ... }
-  // The stage (stage.js). Layout state per view lives there (UI-private, per session, not persisted, like native `StageState`); these are the
-  // choices the Layout menu and the bar set.
+  // The stage (stage.js). Layout geometry per view (order, sizes, spots) lives there, UI-private and per session like native `StageState`. These are
+  // the choices the Layout menu and the bar set; they are saved (`persistStage`, `settings.stage`, keyed by saved room: #131) and loaded here.
   stage: {
-    layouts: {}, // view key ("room:<id>" | "watched") -> "split" | "crop" | "float"
-    hideOwn: false,
-    pip: new Set(), // view keys with "Webcam in picture" on (per view, off until switched on: native `StageSettings::pip`)
-    alwaysNames: false,
+    layouts: stageLayouts(), // view key ("room:<id>" | "watched") -> "split" | "crop" | "float"
+    hideOwn: initialSettings.stage.hideOwn,
+    pipOff: stagePipOff(), // view keys with "Webcam in picture" switched off (on until then: native `StageSettings::pip`)
+    alwaysNames: initialSettings.stage.alwaysNames,
     stripHidden: false, // the people button hid the strip
     sidebarHidden: false,
-    showStats: false, // Layout menu "Show stats": the numbers on every watched stream's name tag (native `StageSettings::show_stats`)
+    showStats: initialSettings.stage.showStats, // Layout menu "Show stats": the numbers on every watched stream's name tag (native `StageSettings::show_stats`)
     popped: new Set(), // view keys whose whole stage is in its own (Document PiP) window
     fullscreen: false,
   },
@@ -177,4 +196,11 @@ export function toast(text, icon = "check_circle", { err = false } = {}) {
 }
 
 export const persistSettings = () => saveSettings(S.settings);
+/** Save the Layout menu's choices (`S.stage`) into `settings.stage`. */
+export function persistStage() {
+  const st = S.stage;
+  const keys = new Set([...Object.keys(st.layouts), ...st.pipOff]);
+  S.settings.stage = normalizeStage({ hideOwn: st.hideOwn, alwaysNames: st.alwaysNames, showStats: st.showStats, views: Object.fromEntries([...keys].map((k) => [k, { layout: st.layouts[k] || "split", pip: !st.pipOff.has(k) }])) });
+  persistSettings();
+}
 export const persistRooms = () => saveRoomList(S.rooms);

@@ -406,11 +406,28 @@ impl App {
             },
 
             // --- stage ----------------------------------------------------
-            UiAction::SetStageLayout { view, layout } => self.shell.stage.set_layout(view, layout),
-            UiAction::SetHideOwnStreams(on) => self.shell.stage.hide_own = on,
-            UiAction::SetAlwaysShowNames(on) => self.shell.stage.always_names = on,
-            UiAction::SetShowStats(on) => self.shell.stage.show_stats = on,
-            UiAction::SetStagePip { view, on } => self.shell.stage.set_pip(view, on),
+            UiAction::SetStageLayout { view, layout } => {
+                self.sync_stage_keys();
+                self.shell.stage.set_layout(view, layout);
+                self.shell.stage.save();
+            }
+            UiAction::SetHideOwnStreams(on) => {
+                self.shell.stage.hide_own = on;
+                self.shell.stage.save();
+            }
+            UiAction::SetAlwaysShowNames(on) => {
+                self.shell.stage.always_names = on;
+                self.shell.stage.save();
+            }
+            UiAction::SetShowStats(on) => {
+                self.shell.stage.show_stats = on;
+                self.shell.stage.save();
+            }
+            UiAction::SetStagePip { view, on } => {
+                self.sync_stage_keys();
+                self.shell.stage.set_pip(view, on);
+                self.shell.stage.save();
+            }
             UiAction::ToggleSidebar => self.nav.sidebar_hidden = !self.nav.sidebar_hidden,
             UiAction::EnterStageFullscreen => {
                 if self.nav.stage_fullscreen.is_none() {

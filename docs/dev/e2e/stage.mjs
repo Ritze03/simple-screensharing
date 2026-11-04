@@ -944,6 +944,16 @@ try {
 
   /* ============================== webcam, webcam in picture, audio-only tiles (task I10) ============================== */
   section("webcam: getUserMedia, reaches a second page, a tile of its own");
+  // #131: Webcam in picture is ON by default (a view with no saved value). The tile-based checks of this section need it off, so switch it off
+  // on Vera's and Alice's pages through the real Layout menu first; the picture sections below switch it on again.
+  check((await P.eval("__sss.S.stage.pipOff.size === 0")) && (await A.page.eval("__sss.S.stage.pipOff.size === 0")), "Webcam in picture is on by default (no view is switched off)");
+  for (const X of [P, A.page]) {
+    await X.click("#btn-layout");
+    await X.waitFor("document.querySelector('.menu.m-layout')", { what: "layout menu" });
+    await X.click({ js: "[...document.querySelectorAll('.menu .cbx')].find((e) => /Webcam in picture/.test(e.innerText))" });
+    await key(X, "Escape");
+  }
+  check((await P.eval("__sss.S.stage.pipOff.size === 1")) && (await A.page.eval("__sss.S.stage.pipOff.size === 1")), "…and the Layout menu switches it off per view");
   // where a PIP of `size` starts along an axis of `len` on column/row i (an independent restatement of the rule: 12 px in, centred in the middle; the inset shrinks in tiny pictures)
   const Gm = { pipAt: (origin, len, size, i) => { const m = Math.max(Math.min(12, (len - size) / 2), 0); return i === 0 ? origin + m : i === 1 ? origin + (len - size) / 2 : origin + len - size - m; } };
   await setLayout("split");
@@ -980,10 +990,10 @@ try {
   await closeMenu();
   await shot(P, "40_cam_tile");
 
-  section("webcam in picture: off by default, on per view");
+  section("webcam in picture: on per view");
   await viewKey();
   const tileCount = () => P.eval("document.querySelectorAll('.arena > .st-tile').length");
-  check((await tileCount()) === 5 && (await P.eval("!document.querySelector('.pip')")), "Webcam in picture is off until switched on: the webcam is a tile of its own");
+  check((await tileCount()) === 5 && (await P.eval("!document.querySelector('.pip')")), "with Webcam in picture switched off the webcam is a tile of its own");
   await openLayoutMenu();
   check(await P.eval("(() => { const c = [...document.querySelectorAll('.menu .cbx')].find((e) => /Webcam in picture/.test(e.innerText)); return !!c && !c.classList.contains('on') && !c.classList.contains('disabled') && c.getAttribute('aria-checked') === 'false'; })()"), "the Layout menu's `Webcam in picture` is a live checkbox, unchecked");
   await closeMenu();
@@ -1175,12 +1185,8 @@ try {
   await dragTo([2, 2]);
 
   section("webcam in picture: stays a tile when it cannot be a picture; pop-out; off");
-  // Bob has watched nothing: switch it on there; neither stream is playing
+  // Bob has watched nothing and keeps the default (Webcam in picture on, #131); neither stream is playing
   await B.page.waitFor("document.querySelectorAll('.st-tile').length >= 3", { timeout: 20000, what: "Bob's stage" });
-  await B.page.click("#btn-layout");
-  await B.page.waitFor("document.querySelector('.menu.m-layout')", { what: "Bob's layout menu" });
-  await B.page.click({ js: "[...document.querySelectorAll('.menu .cbx')].find((e) => /Webcam in picture/.test(e.innerText))" });
-  await key(B.page, "Escape");
   const bobTiles = () => B.page.eval(`[...document.querySelectorAll('.arena > .st-tile')].map((t) => ({ id: t.dataset.id, idle: t.classList.contains('idle') }))`);
   const bob0 = await bobTiles();
   check(!(await B.page.eval("!!document.querySelector('.pip')")) && bob0.some((t) => /Webcam$/.test(t.id) && t.idle) && bob0.some((t) => /\/Alice\/video\/Screen$/.test(t.id) && t.idle), "a viewer who has watched neither stream sees both as tiles (a webcam you cannot see playing in a picture would have no Watch button)", JSON.stringify(bob0.map((t) => t.id.split("/").pop())));
@@ -1383,6 +1389,38 @@ try {
     check(own === "🦊" && theirs.startsWith("O") && (await X.page.eval("__sss.S.rooms[0].client.avatarsSupported")) === false, "an older relay never acks: Olga sees her own 🦊, Ben sees her initial", JSON.stringify({ own, theirs }));
     await X.close();
     await Y.close();
+  }
+
+  section("Layout menu settings are saved (#131): a reload keeps them, per saved room");
+  {
+    const T = await open("Saver", site.url);
+    await L.createRoom(T.page, { name: "keep", server: RELAY, hash: HASH });
+    await L.waitJoined(T.page);
+    const menuState = () => T.page.eval(`(() => { const on = [...document.querySelectorAll('.menu.m-layout .mi.on')].map((e) => (e.innerText.match(/Split|Crop|Floating/) || [''])[0]); const cbx = Object.fromEntries([...document.querySelectorAll('.menu.m-layout .cbx')].map((e) => [e.innerText.replace(/^check\\s*/, '').trim(), e.getAttribute('aria-checked') === 'true'])); return { on, cbx }; })()`);
+    const openMenu = async () => {
+      await T.page.click("#btn-layout");
+      await T.page.waitFor("document.querySelector('.menu.m-layout')", { what: "layout menu" });
+    };
+    await openMenu();
+    const d = await menuState();
+    check(d.on.join() === "Split" && d.cbx["Webcam in picture"] === true && d.cbx["Always show names"] === false && d.cbx["Hide my own streams"] === false && d.cbx["Show stats"] === false, "a fresh browser starts with Split, Webcam in picture on, the other three off", JSON.stringify(d));
+    await T.page.click({ js: "[...document.querySelectorAll('.menu .mi')].find((e) => /Crop/.test(e.innerText))" });
+    await openMenu();
+    for (const re of ["Webcam in picture", "Always show names", "Hide my own streams", "Show stats"]) {
+      await T.page.click({ js: `[...document.querySelectorAll('.menu .cbx')].find((e) => /${re}/.test(e.innerText))` });
+      await sleep(100);
+    }
+    await key(T.page, "Escape");
+    await T.page.eval("location.reload()");
+    await sleep(1500);
+    await L.waitJoined(T.page);
+    await openMenu();
+    const r = await menuState();
+    check(r.on.join() === "Crop" && r.cbx["Webcam in picture"] === false && r.cbx["Always show names"] === true && r.cbx["Hide my own streams"] === true && r.cbx["Show stats"] === true, "after a reload the room keeps Crop, Webcam in picture off, Always show names, Hide my own streams and Show stats", JSON.stringify(r));
+    const saved = await T.page.eval(`JSON.parse(localStorage.getItem("sss.settings.v1")).stage`);
+    check(Object.keys(saved.views).length === 1 && /^room:/.test(Object.keys(saved.views)[0]) && Object.values(saved.views)[0].layout === "crop" && Object.values(saved.views)[0].pip === false, "settings.stage holds the room's view by its saved room id", JSON.stringify(saved));
+    await key(T.page, "Escape");
+    await T.close();
   }
 
   check(V.consoleErrors.length === 0, "no console errors on Vera's page", V.consoleErrors.join(" | "));

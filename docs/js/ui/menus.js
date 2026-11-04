@@ -7,7 +7,7 @@
 // overlays; `mk` pairs it with the element that opened it (`data-mk`), so a second click on that element closes it again.
 
 import { ENCODER_PRESETS } from "../core/index.js";
-import { S, persistSettings, persistRooms, toast, displayName, encoderOf, presetOf, GOP_OPTIONS } from "./store.js";
+import { S, persistSettings, persistStage, persistRooms, toast, displayName, encoderOf, presetOf, GOP_OPTIONS } from "./store.js";
 import { t } from "./i18n.js";
 import { h, ic, pct, cbx, seg, avatarEl, EMOJI, pickEmoji, snapVolumePct, volumeWheel, VOLUME_MAX_PCT, fmtKbps, meter } from "./dom.js";
 import { roomById, setWatchVolume, setWatchMuted, unwatchStream, watchStream, connectRoom, applyLevelLoudness } from "./rooms.js";
@@ -196,10 +196,10 @@ function layoutMenu() {
     label(t("ui.stage.layout_heading")),
     ...LAYOUTS.map(([k, icon, name, sub]) => menuItem({ icon, label: t(name), sub: t(sub), on: cur === k, onclick: done(() => setLayout(key, k)) })),
     sep(),
-    checkRow(t("ui.stage.pip"), pipOn(key), stay(() => (pipOn(key) ? S.stage.pip.delete(key) : S.stage.pip.add(key))), t("ui.stage.pip_tip_menu")),
-    checkRow(t("ui.stage.always_names"), S.stage.alwaysNames, stay(() => (S.stage.alwaysNames = !S.stage.alwaysNames)), t("ui.stage.always_names_tip")),
-    checkRow(t("ui.stage.show_stats"), S.stage.showStats, stay(() => (S.stage.showStats = !S.stage.showStats)), t("ui.stage.show_stats_tip")),
-    checkRow(t("ui.stage.hide_own"), S.stage.hideOwn, stay(() => (S.stage.hideOwn = !S.stage.hideOwn)), t("ui.stage.hide_own_tip")),
+    checkRow(t("ui.stage.pip"), pipOn(key), stay(() => { pipOn(key) ? S.stage.pipOff.add(key) : S.stage.pipOff.delete(key); persistStage(); }), t("ui.stage.pip_tip_menu")),
+    checkRow(t("ui.stage.always_names"), S.stage.alwaysNames, stay(() => { S.stage.alwaysNames = !S.stage.alwaysNames; persistStage(); }), t("ui.stage.always_names_tip")),
+    checkRow(t("ui.stage.show_stats"), S.stage.showStats, stay(() => { S.stage.showStats = !S.stage.showStats; persistStage(); }), t("ui.stage.show_stats_tip")),
+    checkRow(t("ui.stage.hide_own"), S.stage.hideOwn, stay(() => { S.stage.hideOwn = !S.stage.hideOwn; persistStage(); }), t("ui.stage.hide_own_tip")),
     sep(),
     menuItem({ icon: "restart_alt", label: t("ui.stage.reset_layout"), onclick: done(() => resetView(key)) }),
   ];

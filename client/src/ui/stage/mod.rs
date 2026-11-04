@@ -20,7 +20,7 @@
 //!   (`Send + Sync + 'static`, `viewer-window.md`) cannot hold; immediate runs inside our own frame. During a
 //!   reconnect the window is gone and comes back with the room (a suspended room keeps its handle). What is
 //!   left out: modals opened from it appear in the main window.
-//! - **Per-view state** (`StageState`, UI-private, per session, not persisted): each room and "Watched" keep
+//! - **Per-view state** (`StageState`, UI-private, per session; only the layout, webcam in picture and the Layout switches are saved, see [`StageSettings`]): each room and "Watched" keep
 //!   their own order, grid, window rects and z-order. Streams are keyed by [`ItemId`] (room handle + owner
 //!   name + label), not by `ConnId`/`StreamId`, so a reconnect keeps the layout. **A person is a connection**
 //!   (room + `ConnId`, [`Item::conn`]): whose a stream is never goes by the name, see [`ItemId`]. The layout choice and the
@@ -64,6 +64,7 @@ use std::collections::{HashMap, HashSet};
 use egui::{Align, CursorIcon, Id, Pos2, Rect, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
 use simple_screensharing_client::capture::webcam;
 use simple_screensharing_client::protocol::{ConnId, StreamInfo, StreamKind};
+use simple_screensharing_client::rooms::{AppSettings, StagePrefs, ViewPrefs, WATCHED_KEY, room_identity};
 use simple_screensharing_client::session::{CaptureSourceId, DestinationId, RoomHandle};
 
 use geom::{Bar, FRect, Grid, PipGeo, PipPos};
@@ -82,51 +83,105 @@ pub enum StageView {
     Watched,
 }
 
-/// A stage layout (the Layout menu's three choices).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum StageLayout {
-    #[default]
-    Split,
-    Crop,
-    Floating,
-}
+pub use simple_screensharing_client::rooms::StageLayout;
 
-/// The stage choices the Layout menu sets (`Shell::stage`; changed only through `UiAction`s).
+/// The stage choices the Layout menu sets (`Shell::stage`; changed only through `UiAction`s). Saved in
+/// `settings.toml` (`AppSettings::stage`, #131): per stage the layout and webcam in picture, keyed by the room's
+/// `room_identity` (a [`RoomHandle`] does not survive a restart) or `"watched"`; the three switches are global.
+/// A room joined by a link that is not saved is saved here too, by its identity.
 #[derive(Default)]
 pub struct StageSettings {
-    layouts: HashMap<StageView, StageLayout>,
+    /// This session's choices per stage; a stage without an entry has the defaults ([`ViewPrefs::default`]).
+    views: HashMap<StageView, ViewPrefs>,
     /// "Hide my own streams": your own share gets no tile.
     pub hide_own: bool,
     /// "Always show names": the name tag of a watched stream shows without hovering.
     pub always_names: bool,
     /// "Show stats": every watched stream's name tag carries its numbers while it is hovered (D1). Off until switched on.
     pub show_stats: bool,
-    /// "Webcam in picture" is on for these stages (per view, off until switched on): a webcam sits inside its
-    /// owner's screen share ([`pip_pairs`]).
-    pip: HashSet<StageView>,
+    /// What the file holds (what [`save`](Self::save) writes back, `views` kept in step by `update`).
+    saved: StagePrefs,
+    /// Each joined room's saved key, learnt by [`sync_rooms`](Self::sync_rooms); never pruned (a suspended room keeps its handle).
+    keys: HashMap<RoomHandle, String>,
 }
 
 impl StageSettings {
+    /// The settings a start begins with: the saved ones (Watched is seeded now, a room when it joins).
+    pub fn from_saved(saved: StagePrefs) -> Self {
+        let mut views = HashMap::new();
+        if let Some(p) = saved.views.get(WATCHED_KEY) {
+            views.insert(StageView::Watched, *p);
+        }
+        Self { views, hide_own: saved.hide_own, always_names: saved.always_names, show_stats: saved.show_stats, saved, keys: HashMap::new() }
+    }
+
+    /// Learn the key of every joined room and seed a new one from the file. Cheap; called every frame and
+    /// before a change is stored.
+    pub fn sync_rooms<'a>(&mut self, rooms: impl Iterator<Item = (RoomHandle, &'a str)>) {
+        for (h, join_string) in rooms {
+            if self.keys.contains_key(&h) {
+                continue;
+            }
+            let key = room_identity(join_string);
+            if let Some(p) = self.saved.views.get(&key) {
+                self.views.entry(StageView::Room(h)).or_insert(*p);
+            }
+            self.keys.insert(h, key);
+        }
+    }
+
+    fn prefs(&self, view: &StageView) -> ViewPrefs {
+        self.views.get(view).copied().unwrap_or_default()
+    }
+
+    fn key(&self, view: &StageView) -> Option<String> {
+        match view {
+            StageView::Watched => Some(WATCHED_KEY.to_string()),
+            StageView::Room(h) => self.keys.get(h).cloned(),
+        }
+    }
+
+    fn update(&mut self, view: StageView, f: impl FnOnce(&mut ViewPrefs)) {
+        let mut p = self.prefs(&view);
+        f(&mut p);
+        if let Some(key) = self.key(&view) {
+            if p == ViewPrefs::default() {
+                self.saved.views.remove(&key);
+            } else {
+                self.saved.views.insert(key, p);
+            }
+        }
+        self.views.insert(view, p);
+    }
+
+    /// Write the settings to `settings.toml`.
+    pub(super) fn save(&mut self) {
+        self.saved.hide_own = self.hide_own;
+        self.saved.always_names = self.always_names;
+        self.saved.show_stats = self.show_stats;
+        let mut settings = AppSettings::load();
+        settings.stage = self.saved.clone();
+        if let Err(e) = settings.save() {
+            tracing::warn!("failed to save the layout settings: {e:#}");
+        }
+    }
+
     /// The layout of `view` (Split until it is changed).
     pub fn layout(&self, view: &StageView) -> StageLayout {
-        self.layouts.get(view).copied().unwrap_or_default()
+        self.prefs(view).layout
     }
 
     pub(super) fn set_layout(&mut self, view: StageView, layout: StageLayout) {
-        self.layouts.insert(view, layout);
+        self.update(view, |p| p.layout = layout);
     }
 
-    /// Whether `view` puts webcams in their owner's picture.
+    /// Whether `view` puts webcams in their owner's picture (on until switched off).
     pub fn pip(&self, view: &StageView) -> bool {
-        self.pip.contains(view)
+        self.prefs(view).pip
     }
 
     pub(super) fn set_pip(&mut self, view: StageView, on: bool) {
-        if on {
-            self.pip.insert(view);
-        } else {
-            self.pip.remove(&view);
-        }
+        self.update(view, |p| p.pip = on);
     }
 }
 

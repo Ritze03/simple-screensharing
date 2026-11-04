@@ -2,7 +2,7 @@
 // bar) and menus.js. Native twin: `client/src/ui/stage/mod.rs` (`StageView`, `ItemId`, `collect`, `ViewGeom`).
 //
 // A VIEW is one room's stage or the combined "Watched streams" stage: `{ kind: "room", r }` or `{ kind: "watched" }`. Each view keeps
-// its own order, grid, window rects and z-order (`vg`), UI-private and not persisted. Streams are keyed by an item id built from the
+// its own order, grid, window rects and z-order (`vg`), UI-private and not persisted (the layout choice, Webcam in picture and the Layout switches are, see `store.js` `persistStage`). Streams are keyed by an item id built from the
 // core's `stableKey` (room + sharer name + kind + label), never by the stream key whose ConnId changes with every reconnect, so a
 // reconnect keeps the layout (the browser twin of native `ItemId`). Your own share is `<room>/me`.
 //
@@ -12,7 +12,7 @@
 // name-based, because it must outlive the ConnId: `numberIdentical` keeps two same-named owners' same-labelled streams apart.
 
 import { isWebcamLabel, WEBCAM_LABEL } from "../core/index.js";
-import { S, displayName } from "./store.js";
+import { S, displayName, persistStage } from "./store.js";
 import { roomById, allWatches } from "./rooms.js";
 import { allocated, capInRoom, webcamInRoom, captureName, captureRes } from "./capture.js";
 import { defaultPip } from "./stage-geom.js";
@@ -33,8 +33,8 @@ const VG = {}; // view key -> { order: [ids], z: [ids] back to front, float: { i
 export const vg = (key) => (VG[key] ??= { order: [], z: [], float: {}, grid: null, pip: {} });
 /** The size and spot of the webcam `camId` in its parent's picture in view `key` (a new one starts bottom right, .24 wide). */
 export const pipPos = (key, camId) => (vg(key).pip[camId] ??= defaultPip());
-/** "Webcam in picture" is on for this view (per view, off until switched on: native `StageSettings::pip`). */
-export const pipOn = (key) => S.stage.pip.has(key);
+/** "Webcam in picture" is on for this view (per view, on until switched off: native `StageSettings::pip`). */
+export const pipOn = (key) => !S.stage.pipOff.has(key);
 export const layoutOf = (key) => S.stage.layouts[key] || "split";
 export const LAYOUTS = [
   ["split", "grid_view", "ui.stage.layout_split", "ui.stage.layout_split_sub"],
@@ -45,6 +45,7 @@ export const LAYOUTS = [
  *  Split picture. */
 export function setLayout(key, layout) {
   S.stage.layouts[key] = layout;
+  persistStage();
 }
 /** "Reset sizes and positions": forget the view's grid, floating windows and their order. */
 export function resetView(key) {
