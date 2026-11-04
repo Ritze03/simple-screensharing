@@ -236,7 +236,7 @@ function renderSide() {
       SL(32, avatarEl(me(), S.settings.emoji, { pres: S.rooms.some((r) => r.state === "joined") })),
       FILL(V({ cls: "who", g: 0, attrs: { role: "button", tabindex: "0", title: t("ui.sidebar.outgoing_tip"), ...opener("outgoing") } },
         T(me(), "b"), h("span", { class: "txt" + (nLive ? " live" : ""), text: nLive ? (nLive === 1 ? t("ui.sidebar.live_in_one_room") : t("ui.sidebar.live_in_rooms", { count: nLive })) : t("ui.sidebar.not_sharing") }))),
-      SL(32, h("button", { class: "icon-btn", type: "button", id: "btn-settings", title: t("ui.sidebar.settings"), "aria-label": t("ui.sidebar.settings"), onclick: () => { S.modal = { kind: "settings" }; render(); } }, ic("settings")))));
+      SL(32, h("button", { class: "icon-btn", type: "button", id: "btn-settings", title: t("ui.sidebar.settings"), "aria-label": t("ui.sidebar.settings"), onclick: () => { S.modal = { kind: "settings", tab: settingsTab }; render(); } }, ic("settings")))));
 }
 
 function select(r, rerender = true) {
@@ -613,25 +613,33 @@ function renderWebcamModal(M, close, lgBtn, spacer) {
     [lead, spacer(), lgBtn("btn-primary", t("ui.stream.done"), close, null, false, "btn-webcam-done")], null, t("ui.close"));
 }
 
+/** The Settings tab last shown: kept while the page lives, so the modal reopens on it (the native `ModalsState::settings_tab`). */
+let settingsTab = "profile";
 function renderSettings(close, lgBtn, spacer) {
   const st = S.settings;
+  const M = S.modal;
+  const tab = M.tab || "profile";
+  // Native has a fourth tab, Diagnostics (log export, relay diagnostics); a browser has neither, so it is not offered here.
+  const tabs = H({ g: 0 }, FILL(seg([["profile", t("ui.settings.profile")], ["interface", t("ui.settings.tab_interface")], ["playback", t("ui.settings.playback")]], tab,
+    (v) => { M.tab = settingsTab = v; render(); })));
   const nameIn = h("input", { class: "field", id: "set-name", value: st.name, placeholder: autoName(), maxlength: "64", "aria-label": t("join.display_name_label") });
   nameIn.addEventListener("input", () => { st.name = nameIn.value; if (st.name.trim()) st.nameSet = true; persistSettings(); });
   nameIn.addEventListener("change", () => render());
   const commit = () => { persistSettings(); applyJitterSettings(); };
-  return modalShell("wide", t("settings.header"), null, close, [
-    card(t("ui.settings.profile"), null, ctrlRow(t("join.display_name_label"), nameIn, undefined, t("ui.settings.name_tip"), "set-name"),
+  return modalShell("wide settings-modal", t("settings.header"), null, close, [
+    tabs,
+    tab === "profile" && card(t("ui.settings.profile"), null, ctrlRow(t("join.display_name_label"), nameIn, undefined, t("ui.settings.name_tip"), "set-name"),
       h("span", { class: "hint", text: t("ui.settings.name_note") }),
       // The avatar: an emoji instead of the initial, on a colour taken from the emoji. A browser has system emoji fonts, so any emoji can be pasted.
       ctrlRow(t("ui.settings.avatar"), h("button", { class: "btn btn-secondary", type: "button", id: "btn-avatar", title: t("ui.settings.avatar_tip"), ...opener("emoji", "emoji") },
         avatarEl(displayName(), st.emoji, { sm: true }), st.emoji ? t("ui.settings.avatar_change") : t("ui.settings.avatar_pick")), undefined, t("ui.settings.avatar_tip"))),
-    card(t("settings.language_label"), null, ctrlRow(t("settings.language_label"), seg([["en", "English"], ["de", "Deutsch"]], st.lang, (v) => { st.lang = v; setLang(v); persistSettings(); render(); }))),
-    card(t("ui.settings.playback"), null,
+    tab === "interface" && card(t("settings.language_label"), null, ctrlRow(t("settings.language_label"), seg([["en", "English"], ["de", "Deutsch"]], st.lang, (v) => { st.lang = v; setLang(v); persistSettings(); render(); }))),
+    tab === "playback" && card(t("ui.settings.playback"), null,
       sliderRow(t("ui.settings.jitter"), "set-jitter", 0, 5000, 100, () => st.jitter, (v) => { st.jitter = v; }, (v) => (v / 1000).toFixed(1) + " s", t("ui.settings.jitter_tip"), commit),
       sliderRow(t("ui.settings.catchup"), "set-catchup", 5, 10, 1, () => st.catchup, (v) => { st.catchup = v; }, (v) => v + "%", t("ui.settings.catchup_tip"), commit),
       ctrlRow(t("ui.settings.level_loudness"), cbx(t("ui.settings.level_loudness_on"), st.levelLoudness, () => { st.levelLoudness = !st.levelLoudness; persistSettings(); applyLevelLoudness(); render(); }, { id: "set-level-loudness" }), undefined, t("ui.settings.level_loudness_tip"), "set-level-loudness")),
     // Notification sounds (I9): one volume, separate from every stream's, applied live while dragged; a Test button per sound.
-    card(t("ui.settings.sounds_card"), null,
+    tab === "interface" && card(t("ui.settings.sounds_card"), null,
       sliderRow(t("ui.settings.sound_volume"), "set-sound-vol", 0, 100, 5, () => st.soundVol, (v) => { st.soundVol = v; }, (v) => v + "%", t("ui.settings.sound_volume_tip"), persistSettings),
       SOUND_NAMES.map((n) => H({ g: 2, cls: "crow" }, FILL(h("span", { class: "lbl", text: t("ui.settings.sound_" + n) })),
         h("button", { type: "button", class: "btn btn-secondary", id: "btn-sound-" + n, onclick: () => SoundOut.play(n, { test: true }) }, ic("play_arrow"), t("ui.settings.sound_test"))))),

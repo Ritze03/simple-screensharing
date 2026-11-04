@@ -244,7 +244,7 @@ node docs/dev/e2e/stage.mjs 127.0.0.1:14433 <HASH> --relay-bin /tmp/relay-bin --
 ```
 
 `--relay-bin/--relay-dir` let it restart the relay (a popped-out stream and the stage window must come back, avatars are announced again); `--old-relay` is a second relay started with
-`SSSHARE_AVATARS=0` (acts like an older relay: owner sees her own emoji, others the initial). 191 checks on 2026-11-04 (I11, all pass, with the relay restart and the old-relay part). Real pointer input has one catch: a click is press and
+`SSSHARE_AVATARS=0` (acts like an older relay: owner sees her own emoji, others the initial). 191 checks on 2026-11-04 (I11 + Settings tabs + tile glide, all pass, with the relay restart and the old-relay part). Real pointer input has one catch: a click is press and
 release on one element and the UI re-renders on every state change, so the harness retries a click whose target was replaced in between (`Watch`, the stage pop-out button).
 The Document Picture-in-Picture window (stream and stage pop-out) works in headless Chromium on a secure origin (`http://127.0.0.1`), so those paths are tested too. Not simulated:
 the pointer leaving the window (CDP cannot move it out; a synthetic `mouseleave` on `<html>` is dispatched instead), a real frame-size change of a stream.

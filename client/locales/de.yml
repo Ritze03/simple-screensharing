@@ -430,6 +430,7 @@ ui.settings.playback: "Wiedergabe"
 ui.settings.presentation: "Darstellung"
 ui.settings.presentation_tip: "Wie Bilder auf den Monitor kommen.\nMailbox (Standard): keine Bildratenbegrenzung und kein Tearing; ideal für hohe Bildwiederholraten und ausgelagerte Fenster.\nVsync: an die Bildwiederholrate des Monitors gebunden, kein Tearing; ein ausgelagertes Fenster kann das Hauptfenster ausbremsen.\nSofort: keine Begrenzung, geringste Latenz, kann Tearing zeigen.\nGilt erst nach einem Neustart."
 ui.settings.profile: "Profil"
+ui.settings.tab_interface: "Oberfläche"
 ui.settings.restart_banner: "Starte die App neu, um den neuen Darstellungsmodus zu übernehmen."
 
 #share menu

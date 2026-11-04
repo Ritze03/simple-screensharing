@@ -1299,3 +1299,24 @@ mod popout_survives_resume {
         assert!(v.popped().is_empty(), "a tile the user brought back is not popped again");
     }
 }
+
+/// Settings tabs (2026-11-04): opens on Profile, every tab draws, and the chosen tab survives a close/reopen.
+#[tokio::test]
+async fn settings_tabs_open_on_profile_draw_each_and_stay_selected() {
+    use modals::SettingsTab;
+    let _home = isolated_home();
+    let mut app = app_with_rooms(&[]);
+    let ctx = ctx();
+    let size = egui::vec2(1000.0, 900.0);
+    assert_eq!(app.modals.settings_tab, SettingsTab::Profile);
+    app.apply(&ctx, UiAction::OpenModal(Modal::Settings));
+    for tab in [SettingsTab::Profile, SettingsTab::Interface, SettingsTab::Playback, SettingsTab::Diagnostics] {
+        app.modals.settings_tab = tab;
+        frame(&mut app, &ctx, size);
+        assert_eq!(app.nav.modal, Some(Modal::Settings));
+    }
+    app.apply(&ctx, UiAction::CloseModal);
+    app.apply(&ctx, UiAction::OpenModal(Modal::Settings));
+    frame(&mut app, &ctx, size);
+    assert_eq!(app.modals.settings_tab, SettingsTab::Diagnostics, "kept while the app runs");
+}

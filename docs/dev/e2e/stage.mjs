@@ -311,6 +311,7 @@ try {
   await drag(P, t0.cx, t0.cy, t1.cx - t0.cx, t1.cy - t0.cy, { steps: 14, mid: async () => {} });
   const ord1 = await P.eval(`__sss.vg(${JSON.stringify(await viewKey())}).order`);
   check(ord1[0] === ord0[1] && ord1[1] === ord0[0], "dragging a tile onto another swaps them on release", JSON.stringify(ord1));
+  await sleep(350); // the tiles glide to their cells (.2s)
   const t0b = (await tiles(P))[0];
   near(t0b.cx, t1.cx, 1, "the dragged tile took the other's place");
   await drag(P, t0b.cx, t0b.cy, t0.cx - t1.cx, t0.cy - t1.cy); // and back
@@ -800,6 +801,35 @@ try {
   await P.waitFor(`document.querySelector('.pv[data-user="Alice"] .avatar .emo')?.innerText === "🦊"`, { timeout: 15000, what: "fox again" });
   check((await A.page.eval(`JSON.parse(localStorage.getItem("sss.settings.v1")).emoji`)) === "🦊", "the emoji is saved in localStorage");
   await shot(P, "19_emoji_fox");
+  // tile glide (the replica's .st-tile transition): on in a plain arena, off while a bar or a window is dragged
+  check(await P.eval(`(() => { const t = document.querySelector('.arena > .st-tile'), a = t.parentElement; const g = () => getComputedStyle(t).transitionProperty + "|" + getComputedStyle(t).transitionDuration; const on = g(); a.classList.add("dragging"); const off = g(); a.classList.remove("dragging"); return /left/.test(on) && /0\.2s/.test(on) && /^all\|0s|^none|0s$/.test(off); })()`), "tiles glide (left/top/width/height .2s) and do not while the arena is dragging");
+  // Settings tabs: Profile | Interface (Language, Sounds) | Playback; one stable modal height
+  const tabBtn = (name) => A.page.click({ text: name, sel: ".modal .seg button" });
+  const modalSize = () => A.page.eval(`(() => { const r = document.querySelector('.modal').getBoundingClientRect(); return Math.round(r.width) + "x" + Math.round(r.height); })()`);
+  const has = (sel) => A.page.eval(`!!document.querySelector(${JSON.stringify(sel)})`);
+  await A.page.key("Escape"); // the picker menu, if still open
+  if (!(await has(".modal"))) { await A.page.click("#btn-settings"); await A.page.waitFor("document.querySelector('.modal')", { what: "settings reopened" }); }
+  check((await has("#btn-avatar")) && !(await has("#set-jitter")) && !(await has("#btn-sound-join")), "Settings opens on Profile: the avatar row shows, Playback and Sounds do not");
+  const sizes = [await modalSize()];
+  await tabBtn("Interface");
+  check((await has("#btn-sound-join")) && (await has("#set-sound-vol")) && (await A.page.eval("!!document.querySelector('.modal .seg button.on') && document.querySelectorAll('.modal .gcard').length === 2")) && !(await has("#btn-avatar")), "Interface tab: Language and Sounds cards, no Profile card");
+  sizes.push(await modalSize());
+  await shot(A.page, "20_settings_interface");
+  await tabBtn("Playback");
+  check((await has("#set-jitter")) && (await has("#set-catchup")) && (await has("#set-level-loudness")) && !(await has("#btn-sound-join")), "Playback tab: jitter, catch-up and level loudness");
+  sizes.push(await modalSize());
+  await A.page.click("#set-level-loudness");
+  check(await A.page.eval("!!document.querySelector('#set-jitter')"), "a render (level loudness toggled) keeps the Playback tab");
+  await A.page.click("#set-level-loudness");
+  await tabBtn("Profile");
+  sizes.push(await modalSize());
+  check(new Set(sizes).size === 1, "the modal keeps one size on every tab", sizes.join(" "));
+  await tabBtn("Interface");
+  await A.page.key("Escape");
+  await A.page.click("#btn-settings");
+  await A.page.waitFor("document.querySelector('.modal')", { what: "settings reopened" });
+  check(await has("#btn-sound-join"), "Settings reopens on the tab last used");
+  await tabBtn("Profile");
   await A.page.key("Escape");
   check(await A.page.eval("!document.querySelector('.modal')"), "Escape closes the settings modal");
   // the hover card and the stream menu carry it too

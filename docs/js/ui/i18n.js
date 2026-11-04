@@ -200,6 +200,7 @@ const en = {
   "ui.modal.choose_name_body": "Friends see this name in rooms.",
 
   "ui.settings.profile": "Profile",
+  "ui.settings.tab_interface": "Interface",
   "ui.settings.name_tip": "One name for every room",
   "ui.settings.name_note": "Rooms you're already in see the new name after you reconnect.",
   "ui.settings.playback": "Playback",
@@ -604,6 +605,7 @@ const de = {
   "ui.modal.choose_name_body": "Freunde sehen diesen Namen in Räumen.",
 
   "ui.settings.profile": "Profil",
+  "ui.settings.tab_interface": "Oberfläche",
   "ui.settings.name_tip": "Ein Name für alle Räume",
   "ui.settings.name_note": "Räume, in denen du schon bist, sehen den neuen Namen nach dem nächsten Verbinden.",
   "ui.settings.playback": "Wiedergabe",

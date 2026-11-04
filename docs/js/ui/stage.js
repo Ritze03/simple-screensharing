@@ -483,6 +483,7 @@ function tilePointerDown(e, tile, ar) {
   const float = layoutOf(key) === "float";
   if (float) {
     raise(g, id);
+    ar.classList.add("dragging"); // the windows follow the pointer: no glide (the replica's .nofx)
     layoutArena(ar);
   }
   drag = { kind: e.target.closest(".rz") ? "rz" : "tile", id, tile, arena: ar, sx: e.clientX, sy: e.clientY, moved: false, f: g.float[id] ? { ...g.float[id] } : null, over: null };

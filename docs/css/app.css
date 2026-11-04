@@ -286,6 +286,8 @@ select.field { cursor: pointer; padding-right: 6px; }
 .modal-head h3 { margin: 0; font-size: 15px; line-height: 20px; }
 .modal-head .sub { font-size: 12px; color: var(--text-dim); }
 .modal-body { padding: var(--s4) 20px; overflow-y: auto; flex: 1 1 auto; }
+/* Settings keeps one height on every tab (the tallest, Interface); a short window scrolls the body as for every modal. */
+.modal.settings-modal .modal-body { min-height: 412px; }
 .modal-foot { height: 64px; flex: 0 0 64px; padding: 0 20px; border-top: 1px solid var(--divider); }
 .modal-foot .btn { min-width: 96px; }
 .note { font-size: 12px; color: var(--text-dim); }
@@ -323,7 +325,9 @@ select.field { cursor: pointer; padding-right: 6px; }
 .arena-note { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; color: var(--text-dim); font-size: 12.5px; text-align: center; padding: 0 var(--s4); }
 .arena-note .big { font-size: 34px; color: var(--text-faint); }
 .arena-note b { color: var(--text); font-size: 15px; }
-.st-tile { position: absolute; container-type: size; overflow: hidden; border-radius: 8px; background: #000; cursor: grab; touch-action: none; }
+.st-tile { position: absolute; container-type: size; overflow: hidden; border-radius: 8px; background: #000; cursor: grab; touch-action: none;
+  transition: left .2s ease, top .2s ease, width .2s ease, height .2s ease; }
+.arena.dragging .st-tile, .st-tile.dragging { transition: none; }
 .st-tile.dragging { z-index: 60 !important; opacity: .88; box-shadow: 0 16px 48px rgba(0,0,0,.7); cursor: grabbing; }
 .st-tile.drop::before { content: ""; position: absolute; inset: 0; z-index: 9; border: 2px solid var(--accent); border-radius: 8px; background: var(--accent-ghost-bg-hover); pointer-events: none; }
 .st-tile.audible::after { content: ""; position: absolute; inset: 0; z-index: 8; border: 2px solid var(--success); border-radius: 8px; pointer-events: none; }

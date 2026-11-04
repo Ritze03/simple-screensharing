@@ -430,6 +430,7 @@ ui.settings.playback: "Playback"
 ui.settings.presentation: "Presentation"
 ui.settings.presentation_tip: "How frames reach the monitor.\nMailbox (default): no frame-rate cap and no tearing; best for high-refresh viewing and pop-out windows.\nVsync: locked to the monitor's refresh rate, no tearing; a pop-out window can slow the main window down.\nImmediate: no cap, lowest latency, may tear.\nTakes effect after a restart."
 ui.settings.profile: "Profile"
+ui.settings.tab_interface: "Interface"
 ui.settings.restart_banner: "Restart the app to apply the new presentation mode."
 
 #share menu

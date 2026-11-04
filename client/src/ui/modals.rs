@@ -54,6 +54,22 @@ pub enum AddTab {
     Create,
 }
 
+/// The Settings modal's tabs (user request 2026-11-04). Interface = Language, Display, Sounds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SettingsTab {
+    #[default]
+    Profile,
+    Interface,
+    Playback,
+    Diagnostics,
+}
+
+/// Height of the Settings body's content (tab row + cards), the same on every tab so the modal does
+/// not jump when switching: the Interface tab (the tallest), no banner. Measured in the rig. A taller
+/// state (the restart banner) raises the floor to what was drawn (`ModalsState::settings_body_h`), so
+/// at most the first visit of such a tab jumps; a window too small for it scrolls as before.
+const SETTINGS_BODY_H: f32 = 474.0;
+
 /// Modals UI state: form buffers, re-seeded whenever a modal (re)opens.
 #[derive(Default)]
 pub struct ModalsState {
@@ -76,6 +92,10 @@ pub struct ModalsState {
     /// keeps it until the modal reopens).
     result_dismissed: bool,
     // settings
+    /// Selected tab; kept when the modal closes (opens on Profile at app start).
+    pub(super) settings_tab: SettingsTab,
+    /// Tallest Settings body drawn so far (see [`SETTINGS_BODY_H`]).
+    settings_body_h: f32,
     display_name: String,
     jitter_s: f32,
     catch_up: u32,
@@ -544,175 +564,203 @@ fn settings(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
         ctx,
         &spec,
         |ui: &mut Ui| {
-            widgets::card(ui, &tr("ui.settings.profile", "Profile"), None, |ui| {
-                let r = widgets::ctrl_row(
-                    ui,
-                    &tr("ui.settings.display_name", "Display name"),
-                    Some(&tr(
-                        "ui.settings.display_name_tip",
-                        "One name for every room. Rooms you're already in keep the old name until you reconnect.",
-                    )),
-                    |ui| widgets::text_field(ui, &mut st.display_name, "e.g. mo"),
-                );
-                name_done = r.lost_focus();
-                avatar_row(ui, cx);
-            });
-            widgets::card(
-                ui,
-                &tr("ui.settings.language_card", "Language"),
-                None,
-                |ui| {
-                    widgets::ctrl_row(ui, &tr("ui.settings.language", "Language"), None, |ui| {
-                        widgets::segmented(ui, &mut lang, &[("en", "English"), ("de", "Deutsch")])
-                    });
-                },
-            );
-            widgets::card(ui, &tr("ui.settings.display", "Display"), None, |ui| {
-                widgets::ctrl_row(
-                    ui,
-                    &tr("ui.settings.presentation", "Presentation"),
-                    Some(&tr(
-                        "ui.settings.presentation_tip",
-                        "How frames reach the monitor.\n\
-                         Mailbox (default): no frame-rate cap and no tearing; best for high-refresh viewing and pop-out windows.\n\
-                         Vsync: locked to the monitor's refresh rate, no tearing; a pop-out window can slow the main window down.\n\
-                         Immediate: no cap, lowest latency, may tear.\n\
-                         Takes effect after a restart.",
-                    )),
-                    |ui| menu::select(ui, "presentation_mode", &mut mode_i, &mode_refs),
-                );
-                if restart {
-                    widgets::banner(
+            let body_top = ui.cursor().min.y;
+            ui.set_min_height(SETTINGS_BODY_H.max(st.settings_body_h));
+            let tab_labels = [
+                tr("ui.settings.profile", "Profile"),
+                tr("ui.settings.tab_interface", "Interface"),
+                tr("ui.settings.playback", "Playback"),
+                tr("ui.settings.logs_card", "Diagnostics"),
+            ];
+            let tabs = [SettingsTab::Profile, SettingsTab::Interface, SettingsTab::Playback, SettingsTab::Diagnostics];
+            let opts: Vec<(SettingsTab, &str)> = tabs.iter().zip(&tab_labels).map(|(t, l)| (*t, l.as_ref())).collect();
+            let top = ui.cursor().min;
+            let spans = widgets::slot_spans(ui.available_width() - 6.0, 3.0, &[FILL; 4]);
+            widgets::segmented(ui, &mut st.settings_tab, &opts);
+            for (t, (x, w)) in tabs.iter().zip(spans) {
+                let r = egui::Rect::from_min_size(top + egui::vec2(3.0 + x, 3.0), egui::vec2(w, theme::CTL_H - 6.0));
+                drive_dump::rect(|| format!("settings.tab.{}", format!("{t:?}").to_lowercase()), r);
+            }
+            if st.settings_tab == SettingsTab::Profile {
+                widgets::card(ui, &tr("ui.settings.profile", "Profile"), None, |ui| {
+                    let r = widgets::ctrl_row(
                         ui,
-                        BannerKind::Hatched,
-                        "restart_alt",
-                        &tr(
-                            "ui.settings.restart_banner",
-                            "Restart the app to apply the new presentation mode.",
-                        ),
-                        None,
+                        &tr("ui.settings.display_name", "Display name"),
+                        Some(&tr(
+                            "ui.settings.display_name_tip",
+                            "One name for every room. Rooms you're already in keep the old name until you reconnect.",
+                        )),
+                        |ui| widgets::text_field(ui, &mut st.display_name, "e.g. mo"),
                     );
-                }
-            });
-            widgets::card(ui, &tr("ui.settings.playback", "Playback"), None, |ui| {
-                let max_ms = AppSettings::clamp_max_jitter_buffer_ms(u32::MAX) as f32 / 1000.0;
-                widgets::slider_row(
+                    name_done = r.lost_focus();
+                    avatar_row(ui, cx);
+                });
+            }
+            if st.settings_tab == SettingsTab::Interface {
+                widgets::card(
                     ui,
-                    &tr("ui.settings.jitter", "Jitter buffer"),
-                    Some(&tr(
-                        "ui.settings.jitter_tip",
-                        "Max jitter buffer. Smooths network hiccups; grows only when needed, up to this ceiling.",
-                    )),
-                    &mut st.jitter_s,
-                    0.0..=max_ms,
-                    0.1,
-                    1,
-                    " s",
+                    &tr("ui.settings.language_card", "Language"),
+                    None,
+                    |ui| {
+                        widgets::ctrl_row(ui, &tr("ui.settings.language", "Language"), None, |ui| {
+                            widgets::segmented(ui, &mut lang, &[("en", "English"), ("de", "Deutsch")])
+                        });
+                    },
                 );
-                let lo = AppSettings::clamp_catch_up_speed_percent(0);
-                let hi = AppSettings::clamp_catch_up_speed_percent(u32::MAX);
-                widgets::slider_row(
-                    ui,
-                    &tr("ui.settings.catch_up", "Catch-up speed"),
-                    Some(&tr(
-                        "ui.settings.catch_up_tip",
-                        "How much faster than live playback runs while shrinking the buffer after a spike.",
-                    )),
-                    &mut st.catch_up,
-                    lo..=hi,
-                    1.0,
-                    0,
-                    "%",
-                );
-                let mut level = cx.state.level_loudness;
-                let level_label = tr("ui.settings.level_loudness_on", "Even out the volume of what I watch");
-                let r = widgets::ctrl_row(
-                    ui,
-                    &tr("ui.settings.level_loudness", "Level loudness"),
-                    Some(&tr(
-                        "ui.settings.level_loudness_tip",
-                        "Raises quiet audio slowly and lowers loud audio quickly, and never lets a sudden loud sound blast past a safe level, so every stream sounds about equally loud at 100%. Your volume slider on each stream works on top of it. Applies right away.",
-                    )),
-                    |ui| widgets::checkbox(ui, &mut level, &level_label),
-                );
-                if r.changed() {
-                    cx.act(UiAction::SetLevelLoudness(level));
-                }
-            });
-            widgets::card(ui, &tr("ui.settings.sounds_card", "Sounds"), None, |ui| {
-                let percent = format!("{}%", st.sound_vol);
-                let (r, _) = widgets::ctrl_row_value(
-                    ui,
-                    &tr("ui.settings.sound_volume", "Volume"),
-                    Some(&tr("ui.settings.sound_volume_tip", "How loud these sounds are, separate from any stream")),
-                    |ui| widgets::slider(ui, &mut st.sound_vol, 0..=sounds::MAX_VOLUME, 5.0),
-                    |ui| widgets::value_box(ui, &percent),
-                );
-                drive_dump::rect(|| "sound.volume".into(), r.rect);
-                drive_dump::line(|| format!("sound_volume {percent}"));
-                if r.changed() {
-                    st.sound_dirty = true;
-                    cx.act(UiAction::PreviewSoundVolume(st.sound_vol));
-                }
-                let test = tr("ui.settings.sound_test", "Test");
-                for (sound, name, label) in [
-                    (Sound::Join, "join", tr("ui.settings.sound_join", "Someone joins my stream")),
-                    (Sound::Leave, "leave", tr("ui.settings.sound_leave", "Someone leaves my stream")),
-                    (Sound::Start, "start", tr("ui.settings.sound_start", "Someone starts a stream")),
-                    (Sound::Stop, "stop", tr("ui.settings.sound_stop", "Someone stops a stream")),
-                ] {
-                    let btn = Btn::secondary(&test).icon("play_arrow");
-                    let w = btn.width(ui);
-                    let row = HBox::new("sound_row", theme::CTL_H).slots(&[FILL, fixed(w)]).show(ui);
-                    row.text(ui, 0, &label, font(Weight::Regular, theme::FS_LABEL), theme::TEXT, Align::Min);
-                    let r = row.show(ui, 1, Align::Max, |ui| btn.show_sized(ui, w));
-                    drive_dump::rect(|| format!("sound.test.{name}"), r.rect);
-                    if r.clicked() {
-                        cx.act(UiAction::TestSound(sound));
+                widgets::card(ui, &tr("ui.settings.display", "Display"), None, |ui| {
+                    widgets::ctrl_row(
+                        ui,
+                        &tr("ui.settings.presentation", "Presentation"),
+                        Some(&tr(
+                            "ui.settings.presentation_tip",
+                            "How frames reach the monitor.\n\
+                             Mailbox (default): no frame-rate cap and no tearing; best for high-refresh viewing and pop-out windows.\n\
+                             Vsync: locked to the monitor's refresh rate, no tearing; a pop-out window can slow the main window down.\n\
+                             Immediate: no cap, lowest latency, may tear.\n\
+                             Takes effect after a restart.",
+                        )),
+                        |ui| menu::select(ui, "presentation_mode", &mut mode_i, &mode_refs),
+                    );
+                    if restart {
+                        widgets::banner(
+                            ui,
+                            BannerKind::Hatched,
+                            "restart_alt",
+                            &tr(
+                                "ui.settings.restart_banner",
+                                "Restart the app to apply the new presentation mode.",
+                            ),
+                            None,
+                        );
                     }
-                }
-            });
-            widgets::card(ui, &tr("ui.settings.logs_card", "Diagnostics"), None, |ui| {
-                let copy = tr("ui.settings.logs_copy", "Copy to clipboard");
-                let save = tr("ui.settings.logs_save", "Save to file…");
-                let clicked = widgets::ctrl_row(
-                    ui,
-                    &tr("ui.settings.logs", "Logs"),
-                    Some(&tr(
-                        "ui.settings.logs_tip",
-                        "The app's recent log (up to the last 5,000 lines) with version and system info, for bug reports. It contains no room keys.",
-                    )),
-                    |ui| widgets::btn_row(ui, &[Btn::secondary(&copy), Btn::secondary(&save)]),
-                );
-                match clicked {
-                    Some(0) => cx.act(UiAction::CopyLogs),
-                    Some(_) => cx.act(UiAction::SaveLogs),
-                    None => {}
-                }
-                if let Some(path) = &cx.shell.saved_logs {
-                    widgets::banner(
+                });
+            }
+            if st.settings_tab == SettingsTab::Playback {
+                widgets::card(ui, &tr("ui.settings.playback", "Playback"), None, |ui| {
+                    let max_ms = AppSettings::clamp_max_jitter_buffer_ms(u32::MAX) as f32 / 1000.0;
+                    widgets::slider_row(
                         ui,
-                        BannerKind::Info,
-                        "check_circle",
-                        &tr_with("ui.settings.logs_saved", "Saved to %{path}", &[("path", path)]),
-                        None,
+                        &tr("ui.settings.jitter", "Jitter buffer"),
+                        Some(&tr(
+                            "ui.settings.jitter_tip",
+                            "Max jitter buffer. Smooths network hiccups; grows only when needed, up to this ceiling.",
+                        )),
+                        &mut st.jitter_s,
+                        0.0..=max_ms,
+                        0.1,
+                        1,
+                        " s",
                     );
-                }
-                let mut send = cx.state.send_diagnostics;
-                let send_label = tr("ui.settings.diag_send", "Send diagnostics to the relay");
-                let r = widgets::ctrl_row(
-                    ui,
-                    &tr("ui.settings.diag_row", "Relay"),
-                    Some(&tr(
-                        "ui.settings.diag_send_tip",
-                        "Off by default. While ticked, the app sends its log lines (the same text as \"Logs\", with your display name, no room keys) to the relay of each room you are in, where the relay owner can read them. Only a relay that supports it receives anything.",
-                    )),
-                    |ui| widgets::checkbox(ui, &mut send, &send_label),
-                );
-                if r.changed() {
-                    cx.act(UiAction::SetSendDiagnostics(send));
-                }
-            });
+                    let lo = AppSettings::clamp_catch_up_speed_percent(0);
+                    let hi = AppSettings::clamp_catch_up_speed_percent(u32::MAX);
+                    widgets::slider_row(
+                        ui,
+                        &tr("ui.settings.catch_up", "Catch-up speed"),
+                        Some(&tr(
+                            "ui.settings.catch_up_tip",
+                            "How much faster than live playback runs while shrinking the buffer after a spike.",
+                        )),
+                        &mut st.catch_up,
+                        lo..=hi,
+                        1.0,
+                        0,
+                        "%",
+                    );
+                    let mut level = cx.state.level_loudness;
+                    let level_label = tr("ui.settings.level_loudness_on", "Even out the volume of what I watch");
+                    let r = widgets::ctrl_row(
+                        ui,
+                        &tr("ui.settings.level_loudness", "Level loudness"),
+                        Some(&tr(
+                            "ui.settings.level_loudness_tip",
+                            "Raises quiet audio slowly and lowers loud audio quickly, and never lets a sudden loud sound blast past a safe level, so every stream sounds about equally loud at 100%. Your volume slider on each stream works on top of it. Applies right away.",
+                        )),
+                        |ui| widgets::checkbox(ui, &mut level, &level_label),
+                    );
+                    if r.changed() {
+                        cx.act(UiAction::SetLevelLoudness(level));
+                    }
+                });
+            }
+            if st.settings_tab == SettingsTab::Interface {
+                widgets::card(ui, &tr("ui.settings.sounds_card", "Sounds"), None, |ui| {
+                    let percent = format!("{}%", st.sound_vol);
+                    let (r, _) = widgets::ctrl_row_value(
+                        ui,
+                        &tr("ui.settings.sound_volume", "Volume"),
+                        Some(&tr("ui.settings.sound_volume_tip", "How loud these sounds are, separate from any stream")),
+                        |ui| widgets::slider(ui, &mut st.sound_vol, 0..=sounds::MAX_VOLUME, 5.0),
+                        |ui| widgets::value_box(ui, &percent),
+                    );
+                    drive_dump::rect(|| "sound.volume".into(), r.rect);
+                    drive_dump::line(|| format!("sound_volume {percent}"));
+                    if r.changed() {
+                        st.sound_dirty = true;
+                        cx.act(UiAction::PreviewSoundVolume(st.sound_vol));
+                    }
+                    let test = tr("ui.settings.sound_test", "Test");
+                    for (sound, name, label) in [
+                        (Sound::Join, "join", tr("ui.settings.sound_join", "Someone joins my stream")),
+                        (Sound::Leave, "leave", tr("ui.settings.sound_leave", "Someone leaves my stream")),
+                        (Sound::Start, "start", tr("ui.settings.sound_start", "Someone starts a stream")),
+                        (Sound::Stop, "stop", tr("ui.settings.sound_stop", "Someone stops a stream")),
+                    ] {
+                        let btn = Btn::secondary(&test).icon("play_arrow");
+                        let w = btn.width(ui);
+                        let row = HBox::new("sound_row", theme::CTL_H).slots(&[FILL, fixed(w)]).show(ui);
+                        row.text(ui, 0, &label, font(Weight::Regular, theme::FS_LABEL), theme::TEXT, Align::Min);
+                        let r = row.show(ui, 1, Align::Max, |ui| btn.show_sized(ui, w));
+                        drive_dump::rect(|| format!("sound.test.{name}"), r.rect);
+                        if r.clicked() {
+                            cx.act(UiAction::TestSound(sound));
+                        }
+                    }
+                });
+            }
+            if st.settings_tab == SettingsTab::Diagnostics {
+                widgets::card(ui, &tr("ui.settings.logs_card", "Diagnostics"), None, |ui| {
+                    let copy = tr("ui.settings.logs_copy", "Copy to clipboard");
+                    let save = tr("ui.settings.logs_save", "Save to file…");
+                    let clicked = widgets::ctrl_row(
+                        ui,
+                        &tr("ui.settings.logs", "Logs"),
+                        Some(&tr(
+                            "ui.settings.logs_tip",
+                            "The app's recent log (up to the last 5,000 lines) with version and system info, for bug reports. It contains no room keys.",
+                        )),
+                        |ui| widgets::btn_row(ui, &[Btn::secondary(&copy), Btn::secondary(&save)]),
+                    );
+                    match clicked {
+                        Some(0) => cx.act(UiAction::CopyLogs),
+                        Some(_) => cx.act(UiAction::SaveLogs),
+                        None => {}
+                    }
+                    if let Some(path) = &cx.shell.saved_logs {
+                        widgets::banner(
+                            ui,
+                            BannerKind::Info,
+                            "check_circle",
+                            &tr_with("ui.settings.logs_saved", "Saved to %{path}", &[("path", path)]),
+                            None,
+                        );
+                    }
+                    let mut send = cx.state.send_diagnostics;
+                    let send_label = tr("ui.settings.diag_send", "Send diagnostics to the relay");
+                    let r = widgets::ctrl_row(
+                        ui,
+                        &tr("ui.settings.diag_row", "Relay"),
+                        Some(&tr(
+                            "ui.settings.diag_send_tip",
+                            "Off by default. While ticked, the app sends its log lines (the same text as \"Logs\", with your display name, no room keys) to the relay of each room you are in, where the relay owner can read them. Only a relay that supports it receives anything.",
+                        )),
+                        |ui| widgets::checkbox(ui, &mut send, &send_label),
+                    );
+                    if r.changed() {
+                        cx.act(UiAction::SetSendDiagnostics(send));
+                    }
+                });
+            }
+            st.settings_body_h = st.settings_body_h.max(ui.min_rect().bottom() - body_top);
         },
         |ui| click = widgets::modal_footer(ui, &[], None, &[Btn::primary(&done)]),
     );
