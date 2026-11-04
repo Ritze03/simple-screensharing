@@ -1348,7 +1348,7 @@ async fn settings_tabs_open_on_profile_draw_each_and_stay_selected() {
     let size = egui::vec2(1000.0, 900.0);
     assert_eq!(app.modals.settings_tab, SettingsTab::Profile);
     app.apply(&ctx, UiAction::OpenModal(Modal::Settings));
-    for tab in [SettingsTab::Profile, SettingsTab::Interface, SettingsTab::Playback, SettingsTab::Diagnostics] {
+    for tab in [SettingsTab::Profile, SettingsTab::Interface, SettingsTab::Diagnostics] {
         app.modals.settings_tab = tab;
         frame(&mut app, &ctx, size);
         assert_eq!(app.nav.modal, Some(Modal::Settings));

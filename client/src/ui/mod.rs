@@ -409,7 +409,7 @@ pub enum UiAction {
     SetAudioGain(f64),
     /// The Boost slider mid-drag (#135): applied to the running shares, not saved; the release sends `SetAudioGain`.
     PreviewAudioGain(f64),
-    /// Settings > Playback > Level loudness: viewer-side loudness levelling on/off (task #119).
+    /// The control bar's Level loudness button: viewer-side loudness levelling on/off (task #119).
     SetLevelLoudness(bool),
     /// Settings > Sounds > Volume released (or the modal closed): persist the notification-sound volume (task I9).
     SetSoundVolume(u32),
@@ -970,7 +970,7 @@ pub fn paint_person(ui: &Ui, rect: Rect, name: &str, emoji: &str, presence: bool
 /// pill, the pop-out / fullscreen pill): a 25 px round button painting `rect`. On = accent
 /// ring and tinted disc, light-blue `graphic_eq`; off = a faint icon. Returns true when it
 /// was clicked; the caller sends [`UiAction::SetLevelLoudness`]`(!on)`. It is the one global
-/// `level_loudness` setting, the same switch as Settings > Playback, not per-stream state.
+/// `level_loudness` setting, the same switch as the control bar button, not per-stream state.
 /// Task #126, user: "next to the volume slider, have a little button that indicates the
 /// dynamic volume setting".
 pub fn level_toggle(ui: &Ui, rect: Rect, id: Id, on: bool) -> bool {

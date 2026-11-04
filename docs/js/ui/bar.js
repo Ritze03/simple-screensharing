@@ -11,7 +11,8 @@
 // Narrow windows degrade by CSS container queries on the stage: the Copy-invite label goes first, then the bar takes two rows.
 
 import { capabilities } from "../core/index.js";
-import { S } from "./store.js";
+import { S, persistSettings } from "./store.js";
+import { applyLevelLoudness } from "./rooms.js";
 import { t } from "./i18n.js";
 import { h, ic } from "./dom.js";
 import { A } from "./actions.js";
@@ -103,6 +104,12 @@ export function renderBar(view, host, { fullscreen = false } = {}) {
   const peopleBtn = h("button", { type: "button", class: "cb" + (strip ? " sel" : ""), id: "btn-people", title: strip ? t("ui.bar.hide_people") : t("ui.bar.show_people"), "aria-label": strip ? t("ui.bar.hide_people") : t("ui.bar.show_people"), "aria-pressed": String(strip),
     onclick: () => { S.stage.stripHidden = !S.stage.stripHidden; A.render(); } }, ic("group"));
 
+  // Level loudness is a global viewer setting, so it sits left of the people button in a room and in Watched alike.
+  const lvl = !!S.settings.levelLoudness;
+  const lvlTitle = t(lvl ? "ui.bar.level_loudness_on" : "ui.bar.level_loudness_off") + "\n" + t("ui.settings.level_loudness_tip");
+  const levelBtn = h("button", { type: "button", class: "cb" + (lvl ? " sel" : ""), id: "btn-level", title: lvlTitle, "aria-label": lvlTitle, "aria-pressed": String(lvl),
+    onclick: () => { S.settings.levelLoudness = !S.settings.levelLoudness; persistSettings(); applyLevelLoudness(); A.render(); } }, ic("graphic_eq"));
+
   const side = host === "main" && !fullscreen
     ? h("button", { type: "button", class: "cb dim", id: "btn-sidebar", title: S.stage.sidebarHidden ? t("ui.bar.show_sidebar") : t("ui.bar.hide_sidebar"), "aria-label": S.stage.sidebarHidden ? t("ui.bar.show_sidebar") : t("ui.bar.hide_sidebar"),
       onclick: () => { S.stage.sidebarHidden = !S.stage.sidebarHidden; A.render(); } }, ic(S.stage.sidebarHidden ? "left_panel_open" : "left_panel_close"))
@@ -119,6 +126,6 @@ export function renderBar(view, host, { fullscreen = false } = {}) {
   const g1 = [shareBtn, audioBtn, camBtn].filter(Boolean);
   return h("div", { class: "ctlrow" },
     h("div", { class: "side" }, side, invite),
-    h("div", { class: "mid" }, g1.length ? h("div", { class: "cgroup" }, g1) : null, h("div", { class: "cgroup" }, layoutBtn, roomBtn, peopleBtn), leave),
+    h("div", { class: "mid" }, g1.length ? h("div", { class: "cgroup" }, g1) : null, h("div", { class: "cgroup" }, layoutBtn, roomBtn, levelBtn, peopleBtn), leave),
     h("div", { class: "side r" }, pop, fs));
 }

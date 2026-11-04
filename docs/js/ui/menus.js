@@ -225,7 +225,7 @@ function roomMenu() {
 
 /* ---------- the stream menu ---------- */
 
-/** The stream menu's volume block: mute button, slider (0-500 %, acting during the drag, snapping at 100 %), the % and the Level loudness switch. */
+/** The stream menu's volume block: mute button, slider (0-500 %, acting during the drag, snapping at 100 %), the %. */
 function volumeRows(r, w) {
   const pctEl = h("span", { class: "pct", text: w.muted ? t("ui.tile.muted") : Math.round(w.vol * 100) + "%" });
   const slider = h("input", { type: "range", class: "vol", min: "0", max: String(VOLUME_MAX_PCT), step: "5", value: String(Math.round(w.vol * 100)), disabled: w.muted, "aria-label": t("ui.stage.volume") });
@@ -242,7 +242,6 @@ function volumeRows(r, w) {
     h("div", { class: "mrow" },
       h("button", { type: "button", class: "icon-btn sm", title: w.muted ? t("ui.room.unmute") : t("ui.tile.mute"), "aria-label": w.muted ? t("ui.room.unmute") : t("ui.tile.mute"), onclick: stay(() => { r.client && r.client.resumeAudio(); setWatchMuted(r, w, !w.muted); }) }, ic(w.muted ? "volume_off" : "volume_up")),
       slider, pctEl),
-    switchRow("graphic_eq", t("ui.room.level_label"), S.settings.levelLoudness, stay(() => { S.settings.levelLoudness = !S.settings.levelLoudness; persistSettings(); applyLevelLoudness(); })),
   ];
 }
 

@@ -7,13 +7,13 @@ all paths relative so GitHub Pages can serve `docs/` under `/simple-screensharin
 
 | module | |
 | --- | --- |
-| `app.js` | entry point: render (sidebar, room header, the stage region or the scrolling body), modals (create/join, stream settings, settings (tabs Profile, Interface = Language + Sounds, Playback; `S.modal.tab`, kept in module `settingsTab` so it reopens on the last one; a fixed body height so the modal does not jump; no Display or Diagnostics tab, the browser has neither), leave/forget, rename, choose name), the stage pop-out window, boot |
+| `app.js` | entry point: render (sidebar, room header, the stage region or the scrolling body), modals (create/join, stream settings, settings (tabs Profile, Interface = Language + Sounds, Playback = jitter + catch-up (no Level loudness row: it is the bar button); `S.modal.tab`, kept in module `settingsTab` so it reopens on the last one; a fixed body height so the modal does not jump; no Display or Diagnostics tab, the browser has neither), leave/forget, rename, choose name), the stage pop-out window, boot |
 | `stage.js` | the stage (task I6): tiles, the arena layout (Split / Crop / Floating), resize bars and drags, the people strip and its hover card, the viewers dropdown, fullscreen and its auto-hiding chrome, the document-level listeners (`bindWindow`) |
 | `stage-state.js` | what a view shows (`collect`: watched video, idle, own share) and each view's layout state (`vg`: order, z, floating rects, grid), keyed by the core's `stableKey` |
 | `stage-geom.js` | the pure stage maths, a port of native `stage/geom.rs` (grid, bars, `dragBar`, floating windows, `cardKeeps`, and since I10 the webcam-in-picture maths `layoutPip`, `pipAt`, `snapPip`, `movePip`, `resizePip`) with the same tests |
 | `pip.js` | one webcam in picture (task I10): the element (persistent canvas / preview re-adopted), `placePip`, its pointer drag (move, resize, snap on release), the PIP inside a stream's fullscreen stage |
 | `chrome.js` | the pure fullscreen auto-hide rule, a port of native `stage/chrome.rs` |
-| `bar.js` | the control bar: split buttons (Share screen, Share audio, Webcam, Layout, Room settings), people, Leave, pop out, fullscreen |
+| `bar.js` | the control bar: split buttons (Share screen, Share audio, Webcam, Layout, Room settings), Level loudness (`#btn-level`), people, Leave, pop out, fullscreen |
 | `menus.js` | every dropdown and context menu in one style: the bar's menus, the stream menu, the avatar picker, dropdown fields (`selectField`), "Also send to / Move to" |
 | `actions.js` | the hooks `app.js` hands the stage modules (`A.render`, `A.openStreamModal`, ...): they cannot import it |
 | `dom.js` | `h()` plus the layout primitives (`V`/`H`/`SL`/`FILL` = vbox/hbox/slot/fill) and the row patterns shared with the egui port (`ctrlRow`, `roomRow`, `sharerRow`, `destRow`, `btnRow`, `modalShell`), the avatar builder (`avatarEl`, `avatarBg`, `emojiInfo`, `pickEmoji`) |

@@ -53,10 +53,11 @@ call, not in side panels.
 - **The Stream Control / View / Settings nav rail is gone.** Settings is a modal opened
   from the user band's gear; sharing lives in the stage's control bar; watching is the
   the room's stage.
-- **Settings is a modal with four tabs**, Profile | Interface (Language, Display, Sounds) | Playback | Diagnostics (a
+- **Settings is a modal with three tabs**, Profile | Interface (Language, Display, Sounds) | Diagnostics (a
   `widgets::segmented` row, `ModalsState::settings_tab`, opens on Profile and keeps the choice while the app runs); the
   body has one height on every tab (`SETTINGS_BODY_H`). The browser has Profile | Interface (Language, Sounds) | Playback.
-  Native Playback holds one control, Level loudness (the Jitter buffer and Catch-up speed sliders are gone, #125 below).
+  The native Playback tab is gone (2026-11-04, row 134): its one control, Level loudness, moved to the control bar
+  (below), and the sliders it once held did nothing (#125 below).
   *Why:* the user's request, 2026-11-04.
 - **Stream settings open in a modal**, not a side panel. *Why:* the user said the side
   panel was too squished for the number of controls.
@@ -165,8 +166,8 @@ call, not in side panels.
   names and own streams, not a property of one stream; the per-stream set (`StageState::stats`) is gone.
 - **The stream menu** (`stage/menus.rs::tile_menu`, `PopoverKind::Tile(ItemId)`): the `⋯` button or a **right click on any
   tile** opens it (anchored to the button or the pointer). Header (avatar, who, `label · size`, or `label · room` in
-  Watched); for a watched stream with audio a Volume row `[mute][slider 0-500 %][pct]` and the **Level loudness** switch
-  (the global setting, same action as Settings), else "No audio in this stream"; Pop out,
+  Watched); for a watched stream with audio a Volume row `[mute][slider 0-500 %][pct]` (no Level loudness switch any
+  more: it is global, a bar button now), else "No audio in this stream"; Pop out,
   Fullscreen, Stop watching (no stats row: it is the Layout menu's). An unwatched tile's menu is Watch stream / Pop out; an audio-only sender's Listen and,
   while listening, the volume row; your own tile's Stream settings… / Stop sharing. **Volume acts during the drag**
   (`tile_volume_slider` pushes `SetVolume` on every change, #135; D1) and **scrolling on the slider** moves it 5 % a notch
@@ -434,11 +435,10 @@ in dB, 50-200 %, 100 % mid-track, 0.5 dB knob steps, a `value_box` reading `150%
 `UiAction::PreviewAudioGain`, saved on pointer release as `UiAction::SetAudioGain`, #135). The calibration was removed in #119 together with `UiAction::CalibrateAudio` / `CancelAudioCalibration`.
 How it works, and why: `features/audio-sharing.md` "sender-side audio boost" and the #119 block. Tests: `ui::tests::audio_boost::*`. Rig dump: `audio.boost`, `boost N`.
 
-**Settings > Playback > Level loudness** (2026-11-03, task #119; user: "the auto levelling should happen on the viewers
-side"). A `ctrl_row` with a checkbox ("Even out the volume of what I watch", tooltip on the label) as the third row of
-the Playback card, **on by default**; `UiAction::SetLevelLoudness` -> `AppState::set_level_loudness` (persists
-`level_loudness`, flips the process-wide `leveller::ENABLED`, live for every watched stream). The browser has the same row
-(`#set-level-loudness`). Design and numbers: `features/audio-sharing.md` (2026-11-03, #119). Tests:
+**Level loudness** (2026-11-03, task #119; user: "the auto levelling should happen on the viewers
+side"). Since 2026-11-04 (row 134) a **control-bar button** (below); it was a checkbox on the Playback tab. **On by default**; `UiAction::SetLevelLoudness` -> `AppState::set_level_loudness` (persists
+`level_loudness`, flips the process-wide `leveller::ENABLED`, live for every watched stream). The browser has the same
+bar button (`#btn-level`). Design and numbers: `features/audio-sharing.md` (2026-11-03, #119). Tests:
 `ui::tests::audio_boost::level_loudness_defaults_on_persists_and_drives_the_leveller_switch`.
 
 **Settings > Sounds** (2026-11-04, task I9; `modals.rs`): a card with one **Volume** row (slider 0-100 %, default 50, applied live while dragged, saved on release; `UiAction::PreviewSoundVolume` / `SetSoundVolume`) and one **Test** button per notification sound (join / leave my stream, someone starts / stops a stream; `UiAction::TestSound`). Separate from every stream's volume. Design, edge rules and why: `features/audio-sharing.md` "Notification sounds". Rig dump: `sound.volume`, `sound.test.*`, `sound_volume N`.
@@ -851,6 +851,22 @@ defaults." (with a screenshot of the menu: Split, Webcam in picture checked, the
   `setLayout`). The room id is the saved room's (`<roomIdHex>@<server>`), stable across reloads. `S.stage.pip` (the set of
   views with it on) became `S.stage.pipOff`.
 
+## Level loudness: a control-bar button, the native Playback tab removed (2026-11-04, row 134)
+
+User: "Maybe remove the playback tab and move level loudness (since its global) to the left of the "Hide the people"
+button?" **What:** the native Settings modal has three tabs (Profile, Interface, Diagnostics; `SETTINGS_BODY_H` unchanged);
+Level loudness is a `graphic_eq` `group_btn` (rig rect `ctl.level`) in the Layout / Room settings / People group,
+directly left of the people button, in a room and in Watched (it is global like the people toggle). Accent when on;
+click sends `UiAction::SetLevelLoudness(!on)`; the tooltip says "Level loudness: on/off" plus the explanation
+(`ui.bar.level_loudness_on/off`, `ui.settings.level_loudness_tip`). The stream menu's Level loudness row is gone (global,
+not per stream: the same reasoning as Show stats moving to the Layout menu). **Why:** a global setting does not belong on
+a tab of its own, nor in a per-stream menu; the bar is where a viewer reaches it at any time.
+**Narrow windows:** the extra 48 px makes the middle part 548 px, wider than the 800 px window's 528 px stage minus
+padding. `arrange` then sets `Arrange::leave_down`: still two rows, but Leave moves to the second row, between the side
+buttons (40 px high there, not group height). Test: `bar::tests::the_label_goes_first_then_the_bar_takes_two_rows`.
+The browser keeps its Playback tab (the jitter and catch-up sliders work there) minus the Level loudness row; its bar
+wraps by CSS so it needed no rule.
+
 ## Native Playback: jitter buffer and catch-up sliders removed (2026-11-04, #125)
 
 The native viewer has no playout pacing (frames are shown as decoded, `features/video-pipeline.md`), so the Settings >
@@ -859,7 +875,7 @@ under their rule "If a setting doesn't do anything, hide it". Gone: both sliders
 `SetCatchUpSpeed`, `AppState::set_max_jitter_buffer_ms` / `set_catch_up_speed_percent`, `AppSettings.max_jitter_buffer_ms`
 / `catch_up_speed_percent` with defaults and clamps, the locale keys. An old `settings.toml` with those keys still loads
 (serde ignores unknown keys; there is no `deny_unknown_fields`, keep it so); the next save drops them. The browser keeps
-its own working sliders (`docs/js/ui/`, `client.setJitterSettings`). Playback keeps Level loudness; the tab row is unchanged.
+its own working sliders (`docs/js/ui/`, `client.setJitterSettings`). Playback kept Level loudness until row 134 moved it to the bar and removed the tab (above).
 
 ## Strings
 

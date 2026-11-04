@@ -85,7 +85,7 @@ Watch and share both work. Differences from native, all platform limits:
   settings and the native app keep the setting. Details and the "why": `ui/APP-SHELL.md` (2026-11-01).
 - **Viewer volume is 0-500 %** (task #96, 2026-11-02): a WebAudio `GainNode` (`core/audio.js` `MAX_VOLUME = 5`), the slider in the stream menu (since I6; before
   that on the tile's audio pill) with a tick and a snap at 100 % (`ui/dom.js` `snapVolumePct`, `.vol` in `app.css`). Loud audio hard-clips at the device, no
-  limiter. The mouse wheel over the slider steps it (`volumeWheel`, `wheelStepVolumePct`, #113). Watched audio is levelled before the slider (`core/leveller.js`, Settings > Playback > Level loudness, default on, #119); since I6 the stream menu's "Level loudness" switch flips the same global `levelLoudness` setting as the Settings checkbox (the tile's audio pill with its `graphic_eq` button, #126, is gone: the pill moved into the menu, like native). Details and the why: `features/audio-sharing.md` (2026-11-02, 2026-11-03). In Firefox the tick only shows on the unfilled part of the track.
+  limiter. The mouse wheel over the slider steps it (`volumeWheel`, `wheelStepVolumePct`, #113). Watched audio is levelled before the slider (`core/leveller.js`, the control bar's Level loudness button (`#btn-level`, left of the people button; was Settings > Playback and, from I6 to 2026-11-04, a stream-menu row), default on, #119; user 2026-11-04: "move level loudness (since its global) to the left of the \"Hide the people\" button"). Details and the why: `features/audio-sharing.md` (2026-11-02, 2026-11-03). In Firefox the tick only shows on the unfilled part of the track.
 - **No audio source choice:** only what `getDisplayMedia({audio})` returns (a tab's audio, or the system's where the browser offers it); the audio control is
   mute plus an audio-only share (I10, below). Native has the per-application picker, Desktop audio, source groups and the exclusion list (D9: *"native Linux only: a
   browser can't list apps"*).
@@ -158,7 +158,7 @@ A 400 ms poll re-lays-out an arena when a stream's picture changes shape, so a f
 - *Streams don't jump* and *a tall bar swallows no clicks:* in fullscreen the chrome has `z-index: 30` over the bars' 20.
 
 **The stream menu** (`⋯` or a right click on a tile): header, Volume (mute, slider 0-500 % acting **during the drag**, scrolling on it 5 % a notch up to 200 %, 10 % above,
-`volumeWheel`), Level loudness (the global setting), Pop out, Fullscreen, Stop watching (no stats row); an unwatched tile: Watch stream / Pop out; your own
+`volumeWheel`), Pop out, Fullscreen, Stop watching (no stats row); an unwatched tile: Watch stream / Pop out; your own
 tile: Stream settings / Stop sharing. **Share menu** (the Share button's arrow): state header, FPS and Preset (for the live destination, the staged stream or the next one),
 Change source, All stream settings, Go live / Stop sharing; when your share is live in another room, Add here / Move here stay reachable. **Stream settings modal**: Source (with
 **Change** while setting up and while live: `capture.js` `changeSource` picks again and restarts every destination on the new tracks, the new share first, like a live FPS
@@ -195,7 +195,7 @@ The browser caught up with native I7 (audio-only shares), I8 (webcam, webcam in 
 **Listening to audio-only senders.** A native client can share audio with no screen. `stage-state.js` `collect` adds a `kind: "audio"` item for every audio stream whose owner
 shares **no screen** (`RoomEntry.ownerHasVideo`: a webcam is not a screen; native `owner_has_video`) and a Listen tile for it: avatar, `X is sharing audio`, `Audio only`,
 `Listen` / `Stop listening` (`ui.room.listen`, native keys and German). Listen is `watchStream` of the audio key: the same watch object with `audioOnly: true` and no canvas,
-`client.watch(audioKey)` (the core always could), so volume, mute and Level loudness work through the stream menu. With a screen share the audio rides along with the screen's
+`client.watch(audioKey)` (the core always could), so volume and mute work through the stream menu (Level loudness is the bar button). With a screen share the audio rides along with the screen's
 watch and has no tile, as before; a webcam watch never subscribes audio (`WatchHandle.followAudio` is false for a `Webcam*` label), so a sender with only a webcam and audio has
 that audio as an audio-only tile. "Watched streams" lists pictures only (audio watches are left out of `allWatches`). The label `Desktop audio` arrives in English on the wire and
 is shown through `share.desktop_audio_label` (en "Desktop audio", de "Desktop-Audio"; `stage-state.js` `shareLabel`, native `share_label`, which also translates `Webcam`).

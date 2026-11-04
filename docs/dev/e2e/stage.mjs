@@ -195,6 +195,14 @@ try {
   check(await P.eval("!document.querySelector('.strip')"), "the people button hides the strip");
   await P.click("#btn-people");
   check(await P.eval("!!document.querySelector('.strip') && document.querySelectorAll('.strip .pv').length === 4"), "and shows it again (4 people)");
+  // Level loudness: a global bar button directly left of the people button, in the same group; accent when on
+  check(await P.eval("(() => { const l = document.querySelector('#btn-level'), p = document.querySelector('#btn-people'); return !!l && l.nextElementSibling === p && l.parentElement === p.parentElement && l.getBoundingClientRect().right <= p.getBoundingClientRect().left; })()"), "the Level loudness button sits directly left of the people button");
+  const lvlOn = () => P.eval("document.querySelector('#btn-level').getAttribute('aria-pressed') + '|' + JSON.parse(localStorage.getItem('sss.settings.v1')).levelLoudness");
+  const lvl0 = await lvlOn();
+  await P.click("#btn-level");
+  const lvl1 = await lvlOn();
+  check(lvl0.split("|")[0] !== lvl1.split("|")[0] && lvl1.split("|")[0] === lvl1.split("|")[1], "the Level loudness button toggles and persists the setting", lvl0 + " -> " + lvl1);
+  await P.click("#btn-level");
   await P.click("#btn-sidebar");
   check(await P.eval("!document.querySelector('.p-side')"), "the bar's sidebar button hides the sidebar");
   await P.click("#btn-sidebar");
@@ -412,7 +420,7 @@ try {
   await P.click({ js: `document.querySelectorAll('.arena > .st-tile')[0].querySelector('.tools .round-btn:last-child')` });
   await P.waitFor("document.querySelector('.menu.m-tile')", { what: "stream menu" });
   const menuItems = await P.eval(`[...document.querySelectorAll('.menu.m-tile .mi')].map((e) => e.innerText.replace(/\\s+/g, ' ').trim())`);
-  check(["Pop out", "Fullscreen", "Stop watching"].every((x) => menuItems.some((m) => m.includes(x))) && menuItems.some((m) => /Level loudness/.test(m)) && !menuItems.some((m) => /stats/i.test(m)), "the stream menu: volume, level loudness, pop out, fullscreen, stop watching, and no stats switch any more", JSON.stringify(menuItems));
+  check(["Pop out", "Fullscreen", "Stop watching"].every((x) => menuItems.some((m) => m.includes(x))) && !menuItems.some((m) => /Level loudness/.test(m)) && !menuItems.some((m) => /stats/i.test(m)), "the stream menu: volume, pop out, fullscreen, stop watching, and no stats or level loudness switch (global, in the bar)", JSON.stringify(menuItems));
   await closeMenu();
   check((await P.eval(`document.querySelectorAll('.arena > .st-tile .tag .v').length`)) === 0, "stats are off by default: no numbers in any tag");
   await openLayoutMenu();
@@ -845,11 +853,8 @@ try {
   sizes.push(await modalSize());
   await shot(A.page, "20_settings_interface");
   await tabBtn("Playback");
-  check((await has("#set-jitter")) && (await has("#set-catchup")) && (await has("#set-level-loudness")) && !(await has("#btn-sound-join")), "Playback tab: jitter, catch-up and level loudness");
+  check((await has("#set-jitter")) && (await has("#set-catchup")) && !(await has("#set-level-loudness")) && !(await has("#btn-sound-join")), "Playback tab: jitter and catch-up, and no Level loudness row any more (it is a bar button)");
   sizes.push(await modalSize());
-  await A.page.click("#set-level-loudness");
-  check(await A.page.eval("!!document.querySelector('#set-jitter')"), "a render (level loudness toggled) keeps the Playback tab");
-  await A.page.click("#set-level-loudness");
   await tabBtn("Profile");
   sizes.push(await modalSize());
   check(new Set(sizes).size === 1, "the modal keeps one size on every tab", sizes.join(" "));

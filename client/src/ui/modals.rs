@@ -23,8 +23,8 @@
 //!   The server field is pre-filled with the server of the most
 //!   recently saved room. `Why:` the lib keeps no "last server" setting, and
 //!   the newest saved room is the last server the user created or joined on.
-//! - **Settings** (`Modal::Settings`, 640): cards Profile / Language / Display /
-//!   Playback / Sounds (task I9: notification volume, live while dragged and saved on release, and a Test button per
+//! - **Settings** (`Modal::Settings`, 640): tabs Profile / Interface / Diagnostics, cards Profile / Language / Display /
+//!   Sounds (task I9: notification volume, live while dragged and saved on release, and a Test button per
 //!   sound) / Diagnostics (copy or save the in-memory log, `logbuf`; opt-in upload to the relay). The Boost
 //!   slider (task #114) left for the audio settings menu (`audio_settings.rs`, task I7). Text and
 //!   sliders are buffered and pushed when the edit settles
@@ -37,7 +37,7 @@
 
 use egui::{Align, Rect, Sense, Stroke, Ui, vec2};
 use simple_screensharing_client::net::{ServerAddrError, parse_join_string, parse_server_addr};
-use simple_screensharing_client::rooms::{AppSettings, PresentationMode};
+use simple_screensharing_client::rooms::PresentationMode;
 use simple_screensharing_client::session::RoomHandle;
 
 use super::{Cx, Modal, ShareState, UiAction, drive_dump, menu, tr, tr_with};
@@ -60,7 +60,6 @@ pub enum SettingsTab {
     #[default]
     Profile,
     Interface,
-    Playback,
     Diagnostics,
 }
 
@@ -565,13 +564,12 @@ fn settings(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
             let tab_labels = [
                 tr("ui.settings.profile", "Profile"),
                 tr("ui.settings.tab_interface", "Interface"),
-                tr("ui.settings.playback", "Playback"),
                 tr("ui.settings.logs_card", "Diagnostics"),
             ];
-            let tabs = [SettingsTab::Profile, SettingsTab::Interface, SettingsTab::Playback, SettingsTab::Diagnostics];
+            let tabs = [SettingsTab::Profile, SettingsTab::Interface, SettingsTab::Diagnostics];
             let opts: Vec<(SettingsTab, &str)> = tabs.iter().zip(&tab_labels).map(|(t, l)| (*t, l.as_ref())).collect();
             let top = ui.cursor().min;
-            let spans = widgets::slot_spans(ui.available_width() - 6.0, 3.0, &[FILL; 4]);
+            let spans = widgets::slot_spans(ui.available_width() - 6.0, 3.0, &[FILL; 3]);
             widgets::segmented(ui, &mut st.settings_tab, &opts);
             for (t, (x, w)) in tabs.iter().zip(spans) {
                 let r = egui::Rect::from_min_size(top + egui::vec2(3.0 + x, 3.0), egui::vec2(w, theme::CTL_H - 6.0));
@@ -628,24 +626,6 @@ fn settings(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
                             ),
                             None,
                         );
-                    }
-                });
-            }
-            if st.settings_tab == SettingsTab::Playback {
-                widgets::card(ui, &tr("ui.settings.playback", "Playback"), None, |ui| {
-                    let mut level = cx.state.level_loudness;
-                    let level_label = tr("ui.settings.level_loudness_on", "Even out the volume of what I watch");
-                    let r = widgets::ctrl_row(
-                        ui,
-                        &tr("ui.settings.level_loudness", "Level loudness"),
-                        Some(&tr(
-                            "ui.settings.level_loudness_tip",
-                            "Raises quiet audio slowly and lowers loud audio quickly, and never lets a sudden loud sound blast past a safe level, so every stream sounds about equally loud at 100%. Your volume slider on each stream works on top of it. Applies right away.",
-                        )),
-                        |ui| widgets::checkbox(ui, &mut level, &level_label),
-                    );
-                    if r.changed() {
-                        cx.act(UiAction::SetLevelLoudness(level));
                     }
                 });
             }

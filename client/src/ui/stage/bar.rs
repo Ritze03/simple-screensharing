@@ -13,7 +13,8 @@
 //!   offers the cameras and "All webcam settings…" (`share::webcam_menu`, the modal is `webcam_settings.rs`). It is
 //!   disabled, with the reason as its tooltip, while there is no `v4l2src`, no camera, or off Linux.
 //! - **Narrow windows** (800 px minimum, a ~528 px stage): the label of Copy invite link goes first, then the
-//!   bar takes two rows (the middle part on top, the side buttons under it). Icons never move into a menu.
+//!   bar takes two rows (the middle part on top, the side buttons under it); with the Level loudness button the
+//!   middle part no longer fits 528 px (548 + 16), so Leave moves to the second row between the side buttons. Icons never move into a menu.
 //!   Pure rule: [`arrange`]. Check en and de.
 //! - **Menus** are drawn by `menus.rs` from `Nav::popover` (`PopoverKind::Bar`); this file only anchors them.
 
@@ -44,6 +45,8 @@ const BTN_H: f32 = theme::STAGE_BTN_H;
 const SPLIT_W: f32 = 68.0;
 const CARET_W: f32 = 24.0;
 const PEOPLE_W: f32 = 44.0;
+/// Level loudness button, the same width as the people button it sits left of.
+const LEVEL_W: f32 = 44.0;
 const DIM_W: f32 = 40.0;
 const LEAVE_W: f32 = 64.0;
 /// A group: 4 px padding and a 1 px border around the buttons, 4 px between them.
@@ -62,6 +65,8 @@ fn group_w(parts: &[f32]) -> f32 {
 /// The widths [`arrange`] decides from.
 pub(super) struct Sizes {
     pub mid: f32,
+    /// Leave plus its gap, the part of `mid` that drops under the groups when even the middle part is too wide.
+    pub leave: f32,
     /// Left side without / with the Copy invite link label.
     pub left_icons: f32,
     pub left_label: f32,
@@ -74,16 +79,21 @@ pub(super) struct Arrange {
     pub two_rows: bool,
     pub label: bool,
     pub pad: f32,
+    /// Two rows and the middle part still too wide (the 800 px window with the Level loudness button): Leave moves
+    /// to the second row, between the side buttons.
+    pub leave_down: bool,
 }
 
 pub(super) fn arrange(w: f32, s: &Sizes) -> Arrange {
     let fits = |left: f32| 2.0 * left.max(s.right) + s.mid + 2.0 * BAR_GAP + 2.0 * theme::S4 <= w;
     if fits(s.left_label) {
-        Arrange { two_rows: false, label: true, pad: theme::S4 }
+        Arrange { two_rows: false, label: true, pad: theme::S4, leave_down: false }
     } else if fits(s.left_icons) {
-        Arrange { two_rows: false, label: false, pad: theme::S4 }
+        Arrange { two_rows: false, label: false, pad: theme::S4, leave_down: false }
     } else {
-        Arrange { two_rows: true, label: false, pad: if s.mid + 2.0 * theme::S4 <= w { theme::S4 } else { theme::S2 } }
+        let leave_down = s.mid + 2.0 * theme::S2 > w;
+        let mid = if leave_down { s.mid - s.leave } else { s.mid };
+        Arrange { two_rows: true, label: false, pad: if mid + 2.0 * theme::S4 <= w { theme::S4 } else { theme::S2 }, leave_down }
     }
 }
 
@@ -131,10 +141,10 @@ impl Bar {
         self.host == Host::Main && !self.fullscreen
     }
 
-    fn mid_w(&self) -> f32 {
+    fn mid_w(&self, leave_down: bool) -> f32 {
         let g1 = if self.share.is_some() { group_w(&[SPLIT_W; 3]) } else { 0.0 };
-        let g2 = if self.room.is_some() { group_w(&[SPLIT_W, SPLIT_W, PEOPLE_W]) } else { group_w(&[SPLIT_W, PEOPLE_W]) };
-        let leave = if self.room.is_some() { LEAVE_W } else { 0.0 };
+        let g2 = if self.room.is_some() { group_w(&[SPLIT_W, SPLIT_W, LEVEL_W, PEOPLE_W]) } else { group_w(&[SPLIT_W, LEVEL_W, PEOPLE_W]) };
+        let leave = if self.room.is_some() && !leave_down { LEAVE_W } else { 0.0 };
         let parts: Vec<f32> = [g1, g2, leave].into_iter().filter(|w| *w > 0.0).collect();
         parts.iter().sum::<f32>() + BAR_GAP * parts.len().saturating_sub(1) as f32
     }
@@ -148,12 +158,12 @@ impl Bar {
         let invite = f32::from(u8::from(self.room.is_some()));
         let icons = (n + invite) * DIM_W + GROUP_GAP * (n + invite - 1.0).max(0.0);
         let label = icons + if invite > 0.0 { 6.0 + self.invite_label_w(ui) } else { 0.0 };
-        arrange(w, &Sizes { mid: self.mid_w(), left_icons: icons, left_label: label, right: 2.0 * DIM_W + GROUP_GAP })
+        arrange(w, &Sizes { mid: self.mid_w(false), leave: if self.room.is_some() { LEAVE_W + BAR_GAP } else { 0.0 }, left_icons: icons, left_label: label, right: 2.0 * DIM_W + GROUP_GAP })
     }
 
     /// Draw the bar into `rect` (its height is `arrange(..).height()`). Menus are not drawn here.
     pub fn show(&self, ui: &mut Ui, cx: &mut Cx, st: &mut StageState, rect: Rect, a: &Arrange) {
-        let mid_w = self.mid_w();
+        let mid_w = self.mid_w(a.leave_down);
         let (mid_rect, side_rect) = if a.two_rows {
             let mid = Rect::from_min_size(pos2(rect.center().x - mid_w / 2.0, rect.top() + 6.0), vec2(mid_w, GROUP_H));
             (mid, Rect::from_min_max(pos2(rect.left() + a.pad, mid.bottom() + 2.0), pos2(rect.right() - a.pad, rect.bottom() - 6.0)))
@@ -161,7 +171,7 @@ impl Bar {
             let mid = Rect::from_center_size(pos2(rect.center().x, rect.center().y), vec2(mid_w, GROUP_H));
             (mid, Rect::from_x_y_ranges(rect.left() + a.pad..=rect.right() - a.pad, rect.y_range()))
         };
-        self.mid(ui, cx, st, mid_rect);
+        self.mid(ui, cx, st, mid_rect, a.leave_down.then(|| Rect::from_center_size(side_rect.center(), vec2(LEAVE_W, BTN_H))));
         self.left(ui, cx, side_rect, a.label);
         self.right(ui, cx, st, side_rect);
     }
@@ -219,7 +229,7 @@ impl Bar {
         }
     }
 
-    fn mid(&self, ui: &mut Ui, cx: &mut Cx, st: &mut StageState, mid: Rect) {
+    fn mid(&self, ui: &mut Ui, cx: &mut Cx, st: &mut StageState, mid: Rect, leave_at: Option<Rect>) {
         let mut x = mid.left();
         let y = mid.top();
         // Group 1: Share screen, Share audio, Webcam.
@@ -230,7 +240,7 @@ impl Bar {
             x = r.right() + BAR_GAP;
         }
         // Group 2: Layout, Room settings, People.
-        let parts: &[f32] = if self.room.is_some() { &[SPLIT_W, SPLIT_W, PEOPLE_W] } else { &[SPLIT_W, PEOPLE_W] };
+        let parts: &[f32] = if self.room.is_some() { &[SPLIT_W, SPLIT_W, LEVEL_W, PEOPLE_W] } else { &[SPLIT_W, LEVEL_W, PEOPLE_W] };
         let r = Rect::from_min_size(pos2(x, y), vec2(group_w(parts), GROUP_H));
         group_frame(ui, r);
         let mut bx = r.left() + GROUP_PAD;
@@ -252,6 +262,19 @@ impl Bar {
             }
             bx += SPLIT_W + GROUP_GAP;
         }
+        // Level loudness is a global viewer setting (`AppState::level_loudness`), so it shows wherever the people
+        // button does, in a room and in Watched.
+        let lvl_on = cx.state.level_loudness;
+        let lvr = Rect::from_min_size(pos2(bx, by), vec2(LEVEL_W, BTN_H));
+        let lvl_tip = format!(
+            "{}\n{}",
+            if lvl_on { tr("ui.bar.level_loudness_on", "Level loudness: on") } else { tr("ui.bar.level_loudness_off", "Level loudness: off") },
+            tr("ui.settings.level_loudness_tip", "Raises quiet audio slowly and lowers loud audio quickly, and never lets a sudden loud sound blast past a safe level, so every stream sounds about equally loud at 100%. Your volume slider on each stream works on top of it. Applies right away.")
+        );
+        if group_btn(ui, lvr, "level", "graphic_eq", lvl_on, &lvl_tip) {
+            cx.act(UiAction::SetLevelLoudness(!lvl_on));
+        }
+        bx += LEVEL_W + GROUP_GAP;
         let pr = Rect::from_min_size(pos2(bx, by), vec2(PEOPLE_W, BTN_H));
         let tip = if self.strip_on { tr("ui.bar.hide_people", "Hide the people") } else { tr("ui.bar.show_people", "Show the people") };
         if group_btn(ui, pr, "people", "group", self.strip_on, &tip) {
@@ -260,7 +283,7 @@ impl Bar {
         }
         // Leave, as tall as a group.
         if let Some(room) = &self.room {
-            let lr = Rect::from_min_size(pos2(r.right() + BAR_GAP, y), vec2(LEAVE_W, GROUP_H));
+            let lr = leave_at.unwrap_or_else(|| Rect::from_min_size(pos2(r.right() + BAR_GAP, y), vec2(LEAVE_W, GROUP_H)));
             let tip = tr_with("ui.bar.leave_room", "Leave %{room}", &[("room", &room.name)]);
             if leave_btn(ui, lr, &tip, room.conn != ConnState::Disconnected) {
                 match (room.conn, room.handle) {
@@ -489,7 +512,7 @@ mod tests {
     use super::*;
 
     fn sizes() -> Sizes {
-        Sizes { mid: group_w(&[SPLIT_W; 3]) + group_w(&[SPLIT_W; 2].iter().copied().chain([PEOPLE_W]).collect::<Vec<_>>()) + LEAVE_W + 2.0 * BAR_GAP, left_icons: 2.0 * DIM_W + GROUP_GAP, left_label: 2.0 * DIM_W + GROUP_GAP + 6.0 + 110.0, right: 2.0 * DIM_W + GROUP_GAP }
+        Sizes { leave: LEAVE_W + BAR_GAP, mid: group_w(&[SPLIT_W; 3]) + group_w(&[SPLIT_W, SPLIT_W, LEVEL_W, PEOPLE_W]) + LEAVE_W + 2.0 * BAR_GAP, left_icons: 2.0 * DIM_W + GROUP_GAP, left_label: 2.0 * DIM_W + GROUP_GAP + 6.0 + 110.0, right: 2.0 * DIM_W + GROUP_GAP }
     }
 
     #[test]
@@ -504,7 +527,9 @@ mod tests {
         // The 800 px window's 528 px stage: the middle part alone, two rows, and it still fits.
         let narrow = arrange(528.0, &s);
         assert!(narrow.two_rows && !narrow.label);
-        assert!(s.mid + 2.0 * narrow.pad <= 528.0, "the middle part fits the 800 px window: {} + 2 x {}", s.mid, narrow.pad);
+        assert!(narrow.leave_down, "with Level loudness the middle part alone is too wide ({}), Leave goes under", s.mid);
+        assert!(s.mid - s.leave + 2.0 * narrow.pad <= 528.0, "the rest fits the 800 px window: {} + 2 x {}", s.mid - s.leave, narrow.pad);
+        assert!(!wide.leave_down);
         assert_eq!(narrow.height(), BAR_H_TWO);
         assert_eq!(wide.height(), BAR_H);
     }

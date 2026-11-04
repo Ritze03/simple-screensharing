@@ -234,10 +234,6 @@ fn tile_menu_body(
     let mut volume = |ui: &mut Ui, key: crate::ui::StreamKey, out: &mut Vec<UiAction>| {
         share::pop_heading(ui, &tr("ui.stage.volume", "Volume"));
         tile::menu_volume_row(ui, cx, vol_drag, key, out);
-        let mut on = cx.state.level_loudness;
-        if menu::switch_row(ui, "graphic_eq", &tr("ui.room.level_label", "Level loudness"), &mut on) {
-            out.push(UiAction::SetLevelLoudness(on));
-        }
     };
     match &it.kind {
         Kind::Video(key) => {

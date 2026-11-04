@@ -13,7 +13,6 @@ import {
 } from "./dom.js";
 import {
   RoomEntry, roomById, connectRoom, disconnectRoom, retryNow, watchStream, allWatches, addRoom, forgetRoom, applyJitterSettings,
-  applyLevelLoudness,
 } from "./rooms.js";
 import {
   capById, capInRoom, capsInRoom, webcamInRoom, webcamCap, liveRoomIds, allDests, allocated, applyBandwidth, captureName, captureRes, stage, discard, goLive,
@@ -641,8 +640,7 @@ function renderSettings(close, lgBtn, spacer) {
     tab === "interface" && card(t("settings.language_label"), null, ctrlRow(t("settings.language_label"), seg([["en", "English"], ["de", "Deutsch"]], st.lang, (v) => { st.lang = v; setLang(v); persistSettings(); render(); }))),
     tab === "playback" && card(t("ui.settings.playback"), null,
       sliderRow(t("ui.settings.jitter"), "set-jitter", 0, 5000, 100, () => st.jitter, (v) => { st.jitter = v; }, (v) => (v / 1000).toFixed(1) + " s", t("ui.settings.jitter_tip"), commit),
-      sliderRow(t("ui.settings.catchup"), "set-catchup", 5, 10, 1, () => st.catchup, (v) => { st.catchup = v; }, (v) => v + "%", t("ui.settings.catchup_tip"), commit),
-      ctrlRow(t("ui.settings.level_loudness"), cbx(t("ui.settings.level_loudness_on"), st.levelLoudness, () => { st.levelLoudness = !st.levelLoudness; persistSettings(); applyLevelLoudness(); render(); }, { id: "set-level-loudness" }), undefined, t("ui.settings.level_loudness_tip"), "set-level-loudness")),
+      sliderRow(t("ui.settings.catchup"), "set-catchup", 5, 10, 1, () => st.catchup, (v) => { st.catchup = v; }, (v) => v + "%", t("ui.settings.catchup_tip"), commit)),
     // Notification sounds (I9): one volume, separate from every stream's, applied live while dragged; a Test button per sound.
     tab === "interface" && card(t("ui.settings.sounds_card"), null,
       sliderRow(t("ui.settings.sound_volume"), "set-sound-vol", 0, 100, 5, () => st.soundVol, (v) => { st.soundVol = v; }, (v) => v + "%", t("ui.settings.sound_volume_tip"), persistSettings),
