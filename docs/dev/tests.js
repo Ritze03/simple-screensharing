@@ -13,7 +13,11 @@ import { deriveCodecString, sniffCodec } from "../js/core/codec.js";
 import { DECODE_QUEUE_CATCHUP_THRESHOLD, JitterBuffer, MAX_DECODE_QUEUE, clampCatchUpSpeedPercent, clampMaxJitterBufferMs } from "../js/core/jitter.js";
 import { CanvasRenderer, VideoReceiver } from "../js/core/video-rx.js";
 import { ENCODER_PRESETS } from "../js/core/video-tx.js";
-import { avatarBg, avatarColors, avatarHue, cardShape, sliderCtl, snapVolumePct, wheelStepVolumePct, volumeWheel, VOLUME_MAX_PCT } from "../js/ui/dom.js";
+import { avatarBg, avatarColors, avatarHue, pickEmoji, sliderCtl, snapVolumePct, wheelStepVolumePct, volumeWheel, VOLUME_MAX_PCT } from "../js/ui/dom.js";
+import * as G from "../js/ui/stage-geom.js";
+import { CHROME_IDLE_MS, chromeRemaining, chromeStart, chromeStep } from "../js/ui/chrome.js";
+import { loadSettings } from "../js/ui/store.js";
+import { DICT } from "../js/ui/i18n.js";
 import { AudioReceiver, MAX_VOLUME } from "../js/core/audio.js";
 import { CEILING_DB, GATE_DB, Leveller, MAX_GAIN_DB, RISE_DB_PER_S, TARGET_DB } from "../js/core/leveller.js";
 
@@ -1031,25 +1035,6 @@ test("volume: gain goes up to 500 %, the UI cap matches the core cap, 100 % stay
   eq(gains.at(-1), 5, "unmute restores the chosen volume");
 });
 
-test("card grid: no empty columns, never shrinks as the area grows, best of 2x2/4x1 (#120)", () => {
-  for (const w of [300, 1200, 2600, 5000]) eq(cardShape(1, w, 1000).cols, 1, `1 card at ${w}`);
-  eq(cardShape(1, 5000, 1000).w, 640, "capped");
-  ok(Math.abs(cardShape(1, 2000, 400).w - (((400 - 112) * 16) / 9 + 2)) < 0.01, "height-limited");
-  eq(cardShape(4, 2400, 500).cols, 4, "wide and short: one row");
-  const t = cardShape(4, 1400, 1000);
-  ok((t.cols === 2 || t.cols === 4) && t.w > 330, `wide and tall: ${show(t)}`);
-  for (let n = 1; n <= 6; n++) for (const h of [300, 700, 1100]) {
-    let prev = 0;
-    for (let w = 200; w < 4000; w += 7) {
-      const s = cardShape(n, w, h);
-      ok(s.cols >= 1 && s.cols <= n, `n=${n} w=${w} cols=${s.cols}`);
-      ok(s.w + 0.001 >= prev, `n=${n} h=${h} w=${w}: ${s.w} < ${prev}`);
-      ok(s.cols * s.w + (s.cols - 1) * 12 <= w + 0.01, `n=${n} w=${w} overflows`);
-      prev = s.w;
-    }
-  }
-});
-
 test("volume: the slider's 100 % detent snaps within 10 and leaves everything else alone", () => {
   for (const v of [90, 95, 100, 105, 110]) eq(snapVolumePct(v), 100);
   for (const v of [0, 85, 115, 200, 500]) eq(snapVolumePct(v), v);
@@ -1082,12 +1067,13 @@ test("volume: sliders apply on the input event, while the thumb is still being d
   } finally {
     sl.remove();
   }
-  // The viewer volume slider (app.js audioPill) is not importable without booting the app: guard its wiring by source.
+  // The viewer volume slider (menus.js tileMenu, the stream menu) is not importable without a stage: guard its wiring by source.
   // It must listen to `input` (fires per drag step) and never to `change` (fires on release only).
-  const src = await (await fetch(new URL("../js/ui/app.js", import.meta.url))).text();
-  const pill = src.slice(src.indexOf("function audioPill("), src.indexOf("async function doPopOut"));
-  ok(pill.includes('slider.addEventListener("input"') && pill.includes("setWatchVolume(r, w,"), "audioPill applies the gain on input");
-  ok(!/slider\.addEventListener\("change"|onchange/.test(pill), "audioPill has no change-only path");
+  const src = await (await fetch(new URL("../js/ui/menus.js", import.meta.url))).text();
+  const menu = src.slice(src.indexOf("function tileMenu("), src.indexOf("/* ---------- other menus"));
+  ok(menu.includes('slider.addEventListener("input"') && menu.includes("setWatchVolume(r, w,"), "the stream menu applies the gain on input");
+  ok(!/slider\.addEventListener\("change"|onchange/.test(menu), "the stream menu has no change-only path");
+  ok(menu.includes("volumeWheel(slider)"), "the stream menu's slider takes the wheel");
 });
 
 test("volume: wheel events on the slider step it, fire input, are consumed and do not snap to 100 (#113)", () => {
@@ -1667,6 +1653,216 @@ test("relay session: cancelling (abort signal) never starts the second attempt",
     eq(made.length, 0, "attempts");
     eq(err.code, "aborted");
   });
+});
+
+// ------------------------------------------------------------------------------------------------ stage geometry (port of client/src/ui/stage/geom.rs tests)
+
+const AR = 16 / 9;
+const R = (x, y, w, h) => ({ x, y, w, h });
+const near = (a, b, eps = 1e-3, what = "") => ok(Math.abs(a - b) < eps, `${what} ${a} vs ${b}`);
+const centerOf = (p, bar) => {
+  const b = p.bars.find((x) => G.sameBar(x.bar, bar));
+  return G.barCenter(bar, b.rect);
+};
+
+test("stage geometry: best_rows picks the row count with the most picture", () => {
+  eq(G.bestRows([AR, AR], 1600, 500), [2]);
+  eq(G.bestRows([AR, AR], 600, 1000), [1, 1]);
+  eq(G.bestRows([AR, AR, AR], 1000, 700), [2, 1], "three: two rows, the first with 2");
+  eq(G.bestRows([AR, AR, AR, AR], 1600, 900), [2, 2]);
+  eq(G.bestRows([AR], 800, 300), [1]);
+  eq(G.bestRows([], 800, 300), []);
+});
+
+test("stage geometry: contain letterboxes and centres; cells tile the arena with gaps", () => {
+  let r = G.contain(R(10, 20, 400, 400), AR);
+  near(r.w, 400); near(r.h, 225); near(r.x + r.w / 2, 210); near(r.y + r.h / 2, 220);
+  r = G.contain(R(0, 0, 1000, 200), AR);
+  near(r.h, 200); near(r.w, 200 * AR);
+  const c = G.gridCells(G.evenGrid([2, 1]), 1000, 500);
+  eq(c.length, 3);
+  near(c[0].w, 496); near(c[1].x, 504); near(c[0].h, 246); near(c[2].y, 254); near(c[2].w, 1000);
+});
+
+test("stage geometry: bars sit midway between the VISIBLE pictures, not on the cell edge", () => {
+  // two 16:9 in a 1800x400 arena: height-limited pictures (711 wide) in 896 wide cells
+  const g = G.evenGrid([2]);
+  let p = G.place(g, [AR, AR], 1800, 400, false);
+  const [a, b] = p.pics;
+  ok(a.w < G.gridCells(g, 1800, 400)[0].w - 1, "letterboxed");
+  const bar = { t: "v", row: 0, col: 0 };
+  near(centerOf(p, bar), (a.x + a.w + b.x) / 2);
+  // Crop: the pictures are the cells, the bar is the middle of the gap
+  p = G.place(g, [AR, AR], 1800, 400, true);
+  near(centerOf(p, bar), 900);
+  // a horizontal bar between rows of differing picture height uses the pictures too
+  p = G.place(G.evenGrid([1, 1]), [AR, AR], 400, 1000, false);
+  near(centerOf(p, { t: "h", row: 0 }), (p.pics[0].y + p.pics[0].h + p.pics[1].y) / 2);
+});
+
+test("stage geometry: a dragged bar follows the pointer one to one until the limit (60 px = 60 px)", () => {
+  const ars = [AR, AR];
+  for (const [w, h, crop] of [[1800, 400, false], [1000, 500, false], [1800, 400, true], [1000, 500, true]]) {
+    const g = G.evenGrid([2]);
+    const bar = { t: "v", row: 0, col: 0 };
+    const c0 = centerOf(G.place(g, ars, w, h, crop), bar);
+    for (const d of [60, -60, 25]) {
+      const c = centerOf(G.place(G.dragBar(g, bar, c0 + d, ars, w, h, crop), ars, w, h, crop), bar);
+      near(c, c0 + d, 0.5, `${w}x${h} crop=${crop} d=${d}`);
+    }
+    const g2 = G.dragBar(g, bar, w * 3, ars, w, h, crop);
+    ok(g2.colFr[0][0] <= 1 - G.MIN_FR + 1e-4 && g2.colFr[0][1] >= G.MIN_FR - 1e-4, "stops at the limit");
+    ok(G.dragBar(g, bar, -w, ars, w, h, crop).colFr[0][0] >= G.MIN_FR - 1e-4, "stops at the other limit");
+  }
+  const g = G.evenGrid([1, 1]);
+  const bar = { t: "h", row: 0 };
+  const c0 = centerOf(G.place(g, ars, 600, 900, true), bar);
+  near(centerOf(G.place(G.dragBar(g, bar, c0 + 60, ars, 600, 900, true), ars, 600, 900, true), bar), c0 + 60, 0.5);
+  // dragging a bar keeps the other columns
+  const g3 = G.dragBar(G.evenGrid([3]), { t: "v", row: 0, col: 0 }, 200, [AR, AR, AR], 1500, 500, true);
+  near(g3.colFr[0][2], 1 / 3, 1e-6);
+  near(g3.colFr[0].reduce((x, y) => x + y, 0), 1, 1e-5);
+});
+
+test("stage geometry: a floating window always has its stream's aspect ratio, also coming from Crop or after a frame size change", () => {
+  const [w, h] = [1200, 600];
+  const from = (r) => ({ x: r.x / w, y: r.y / h, w: r.w / w, h: r.h / h });
+  const f = G.fitFloat(from(R(0, 0, 600, 600)), AR, w, h); // a Crop cell (wider than the picture) turned into a window
+  near((f.w * w) / (f.h * h), AR, 1e-3, "ratio restored");
+  const f2 = G.fitFloat(f, 4 / 3, w, h); // the stream's ratio changes: the width stays, the height follows
+  near((f2.w * w) / (f2.h * h), 4 / 3);
+  const big = G.fitFloat({ x: 0.9, y: 0.9, w: 3, h: 3 }, AR, w, h);
+  ok((big.x + big.w) * w <= w + 1e-2 && (big.y + big.h) * h <= h + 1e-2 && big.x >= -1e-3 && big.y >= -1e-3, "inside the arena");
+  near((big.w * w) / (big.h * h), AR);
+});
+
+test("stage geometry: corner resize uses width and height together (also moving only left or only up shrinks)", () => {
+  const [w, h] = [1600, 900];
+  const o = G.fitFloat({ x: 0.1, y: 0.1, w: 0.4, h: 0 }, AR, w, h);
+  const ow = o.w * w;
+  ok(G.resizeFloat(o, 100, 56.25, AR, w, h).w * w > ow + 90, "right and down grows");
+  ok(G.resizeFloat(o, -100, -56.25, AR, w, h).w * w < ow - 90, "left and up shrinks");
+  ok(G.resizeFloat(o, -80, 0, AR, w, h).w * w < ow - 10, "only left shrinks");
+  ok(G.resizeFloat(o, 0, -80, AR, w, h).w * w < ow - 10, "only up shrinks");
+  ok(G.resizeFloat(o, 0, 80, AR, w, h).w * w > ow + 10, "only down grows");
+  const r = G.resizeFloat(o, 5000, 5000, AR, w, h);
+  near(r.x, o.x, 1e-6); near(r.y, o.y, 1e-6);
+  ok((r.x + r.w) * w <= w + 1e-2 && (r.y + r.h) * h <= h + 1e-2, "inside the arena");
+  near((r.w * w) / (r.h * h), AR);
+  near(G.resizeFloat(o, -5000, -5000, AR, w, h).w * w, G.FLOAT_MIN_W, 1e-2);
+  const m = G.moveFloat({ x: 0.2, y: 0.2, w: 0.3, h: 0.3 }, 60, -30, 1000, 500);
+  near(m.x * 1000, 0.2 * 1000 + 60); near(m.y * 500, 0.2 * 500 - 30);
+  const far = G.moveFloat({ x: 0.2, y: 0.2, w: 0.3, h: 0.3 }, 9999, -9999, 1000, 500);
+  near(far.x + far.w, 1, 1e-6); near(far.y, 0, 1e-6);
+});
+
+test("stage: the hover card stays open over the card, the avatar and the gap straight above it, NOT over the neighbours' avatars", () => {
+  // the numbers of the native test (found in the rig: a card is wider than a person's cell)
+  const av = { left: 1113, top: 941, right: 1157, bottom: 985 };
+  const card = { left: 936, top: 797, right: 1258, bottom: 929 };
+  for (const q of [{ x: 1000, y: 850 }, { x: 1135, y: 963 }, { x: 1135, y: 935 }]) ok(G.cardKeeps(card, av, q), show(q));
+  ok(!G.cardKeeps(card, av, { x: 1174, y: 963 }), "the next person's avatar");
+  ok(!G.cardKeeps(card, av, { x: 1018, y: 963 }), "the previous person's avatar");
+});
+
+// ------------------------------------------------------------------------------------------------ fullscreen chrome (port of stage/chrome.rs tests)
+
+function runChrome(s, frames) {
+  const out = [];
+  for (const [t, inside, active, held] of frames) {
+    const [n, shown] = chromeStep(s, t, inside, active, held);
+    s = n;
+    out.push(shown);
+  }
+  return [s, out];
+}
+const SEC = 1000;
+test("fullscreen chrome: hides after 3 s without movement, movement brings it back and restarts the 3 s", () => {
+  eq(CHROME_IDLE_MS, 3000);
+  let [s, shown] = runChrome(chromeStart(0), [[100, true, true, false], [2900, true, false, false], [3200, true, false, false]]);
+  eq(shown, [true, true, false]);
+  [s, shown] = runChrome(s, [[10 * SEC, true, true, false], [12.9 * SEC, true, false, false], [13.2 * SEC, true, false, false]]);
+  eq(shown, [true, true, false], "movement restarts the three seconds");
+});
+test("fullscreen chrome: leaving the stage hides it at once, a grace period survives it", () => {
+  eq(runChrome(chromeStart(0), [[1000, true, true, false], [1100, false, false, false]])[1], [true, false]);
+  eq(runChrome(chromeStart(0), [[100, false, false, false], [2900, false, false, false], [3100, false, false, false]])[1], [true, true, false], "entering fullscreen with the pointer elsewhere");
+  eq(runChrome(chromeStart(0), [[5000, true, true, false], [5500, false, false, false]])[1], [true, false], "a move on the stage ended the grace");
+});
+test("fullscreen chrome: a menu stops the timer, and after it closes the bar gets a full 3 s", () => {
+  let [s, shown] = runChrome(chromeStart(0), [[500, true, true, false], [30 * SEC, false, false, true], [60 * SEC, false, false, true]]);
+  eq(shown, [true, true, true], "held up for as long as the menu is open, off the stage too");
+  eq(chromeRemaining(s, 60 * SEC), null, "no timer runs while held");
+  [, shown] = runChrome(s, [[60.1 * SEC, false, false, false], [62.9 * SEC, false, false, false], [63.2 * SEC, false, false, false]]);
+  eq(shown, [true, true, false], "a full 3 s after the close, not hidden at once");
+});
+
+// ------------------------------------------------------------------------------------------------ emoji avatars (spec 9.2)
+
+const hexOf = (b) => bytesToHex(b);
+test("avatars: AvatarSet bytes, round trip, limits (the vectors of protocol/src/lib.rs avatar_datagrams_round_trip_and_reject_garbage)", () => {
+  const set = P.packAvatarSet("🦊");
+  eq(hexOf(set), "ebf09fa68a");
+  eq(P.unpackAvatarSet(set), "🦊");
+  eq(P.unpackAvatarSet(P.packAvatarSet("")), "", "no bytes after the tag = no emoji");
+  const longest = P.packAvatarSet("x".repeat(P.MAX_AVATAR_BYTES));
+  ok(longest.length < P.MEDIA_HEADER_LEN && P.isNackDatagram(longest), "short enough that an older relay drops it as undersized");
+  eq(P.packAvatarSet("x".repeat(P.MAX_AVATAR_BYTES + 1)), null);
+  eq(P.unpackAvatarSet(Uint8Array.from([P.AVATAR_TAG_SET, ...new Array(17).fill(0x78)])), null, "too long");
+  eq(P.unpackAvatarSet(Uint8Array.from([P.AVATAR_TAG_SET, 0xff, 0xfe])), null, "not UTF-8");
+  eq(P.unpackAvatarSet(Uint8Array.from([P.AVATAR_TAG_ACK])), null);
+  eq([P.AVATAR_TAG_HELLO, P.AVATAR_TAG_ACK, P.AVATAR_TAG_SET, P.AVATAR_TAG_LIST], [0xe9, 0xea, 0xeb, 0xec]);
+});
+test("avatars: AvatarList bytes, round trip, and the whole list is discarded for any bad entry", () => {
+  const l = P.packAvatars([[1n, "🦊"], [2n, ""], [0x0102030405060708n, "💀"]]);
+  eq(hexOf(l), "ec02000000000000000104f09fa68a010203040506070804f09f9280");
+  eq(P.unpackAvatars(l), [[1n, "🦊"], [0x0102030405060708n, "💀"]]);
+  eq(P.unpackAvatars(P.packAvatars([])), []);
+  eq(P.unpackAvatars(l.subarray(0, l.length - 1)), null, "truncated");
+  eq(P.unpackAvatars(Uint8Array.from([...l, 0])), null, "trailing byte");
+  eq(P.unpackAvatars(Uint8Array.from([P.AVATAR_TAG_LIST, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0])), null, "empty emoji entry");
+  eq(P.unpackAvatars(Uint8Array.from([P.AVATAR_TAG_LIST, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0xff])), null, "not UTF-8");
+  eq(P.unpackAvatars(Uint8Array.from([P.AVATAR_TAG_LIST, 1, 0, 0, 0, 0, 0, 0, 0, 1, 17, ...new Array(17).fill(0x78)])), null, "entry over 16 bytes");
+  eq(P.unpackAvatars(P.packAvatars(Array.from({ length: 100 }, (_, i) => [BigInt(i), "🦊"]))).length, P.MAX_AVATAR_ENTRIES);
+  const widest = P.packAvatars(Array.from({ length: 100 }, (_, i) => [BigInt(i), "xxxxxxxxxxxxxxxx"]));
+  ok(widest.length <= 1200, `a full list fits one datagram: ${widest.length}`);
+  ok(l.length >= P.MEDIA_HEADER_LEN, "a list can be longer than a media header: the receiver must test tag 0xEC BEFORE the media path");
+});
+test("avatars: the picker takes the last emoji of a text as one grapheme (a flag or a ZWJ family stays whole), nothing else", () => {
+  eq(pickEmoji("🦊"), "🦊");
+  eq(pickEmoji("🦊🐻"), "🐻", "pasting after the old one");
+  eq(pickEmoji("abc 🇩🇪"), "🇩🇪", "a flag is one grapheme");
+  eq(pickEmoji("👨‍👩‍👧"), "👨‍👩‍👧", "a ZWJ family is one grapheme");
+  eq(pickEmoji("hello"), "");
+  eq(pickEmoji(""), "");
+});
+
+// ------------------------------------------------------------------------------------------------ presets in the UI settings (I6)
+
+test("settings: a stored balanced or low_latency preset loads as quality, quality/text/gaming are kept", () => {
+  const key = "sss.settings.v1";
+  const before = localStorage.getItem(key);
+  try {
+    for (const [stored, want] of [["balanced", "quality"], ["low_latency", "quality"], ["quality", "quality"], ["text", "text"], ["gaming", "gaming"], ["bogus", "quality"]]) {
+      localStorage.setItem(key, JSON.stringify({ stream: { preset: stored } }));
+      eq(loadSettings().stream.preset, want, stored);
+    }
+    localStorage.removeItem(key);
+    eq(loadSettings().stream.preset, "quality", "the default");
+    eq(loadSettings().emoji, "", "no emoji by default");
+    localStorage.setItem(key, JSON.stringify({ emoji: " 🦊 " }));
+    eq(loadSettings().emoji, "🦊", "the saved emoji");
+  } finally {
+    if (before == null) localStorage.removeItem(key);
+    else localStorage.setItem(key, before);
+  }
+});
+test("i18n: every stage string has an English and a German text and the same placeholders", () => {
+  for (const k of Object.keys(DICT.en)) {
+    ok(k in DICT.de, `de is missing ${k}`);
+    eq((DICT.de[k].match(/%\{\w+\}/g) || []).sort(), (DICT.en[k].match(/%\{\w+\}/g) || []).sort(), `placeholders of ${k}`);
+  }
+  for (const k of ["ui.preset.text", "ui.stage.layout_split", "ui.strip.sharing_n", "ui.settings.avatar_paste"]) ok(DICT.en[k] && DICT.de[k], k);
 });
 
 // ------------------------------------------------------------------------------------------------ runner

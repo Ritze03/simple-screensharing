@@ -40,7 +40,7 @@ try {
   const C1 = "#259351 #18622a", C2 = "#93256c #621854";
   const colours = (page) => page.eval(`(() => ({
     band: getComputedStyle(document.querySelector(".p-user .avatar")).backgroundImage,
-    people: [...document.querySelectorAll(".p-right .avatar")].map((a) => [a.textContent, getComputedStyle(a).backgroundImage]),
+    people: [...document.querySelectorAll(".strip .avatar")].map((a) => [a.textContent, getComputedStyle(a).backgroundImage]),
     all: [...document.querySelectorAll(".avatar")].map((a) => { const r = a.getBoundingClientRect(); return [a.firstChild && a.firstChild.textContent, getComputedStyle(a).backgroundImage, r.x, r.y, r.width]; }),
   }))()`);
   const cb = await colours(B.page);
@@ -57,7 +57,7 @@ try {
   // (a) double-click the tile -> fullscreen stage
   const fsInfo = () => B.page.eval(`(() => { const e = document.fullscreenElement; return e ? { cls: e.className, hasCanvas: !!e.querySelector("canvas"), w: e.getBoundingClientRect().width, h: e.getBoundingClientRect().height } : null; })()`);
   check((await fsInfo()) === null, "not fullscreen before");
-  await B.page.dblclick(".tile");
+  await B.page.dblclick(".st-tile");
   await B.page.waitFor("document.fullscreenElement", { what: "fullscreenElement after dblclick" });
   const f1 = await fsInfo();
   check(f1 && f1.cls.includes("pip-stage") && f1.hasCanvas, "double-click: the stage with the canvas is fullscreen", JSON.stringify(f1));
@@ -80,13 +80,13 @@ try {
   // double-click on the stage -> back
   await B.page.dblclick(".pip-stage canvas");
   await B.page.waitFor("!document.fullscreenElement", { what: "fullscreen left after second dblclick" });
-  await B.page.waitFor("document.querySelector('.tile canvas')", { what: "canvas back in its tile" });
+  await B.page.waitFor("document.querySelector('.st-tile canvas')", { what: "canvas back in its tile" });
   check(true, "second double-click: fullscreen left, canvas back in the tile");
   // fullscreen -> exitFullscreen() (what Esc does natively) -> back
-  await B.page.dblclick(".tile");
+  await B.page.dblclick(".st-tile");
   await B.page.waitFor("document.fullscreenElement", { what: "fullscreen again" });
   await B.page.eval(`document.exitFullscreen()`);
-  await B.page.waitFor("!document.fullscreenElement && document.querySelector('.tile canvas')", { what: "exitFullscreen (Esc) returns the canvas" });
+  await B.page.waitFor("!document.fullscreenElement && document.querySelector('.st-tile canvas')", { what: "exitFullscreen (Esc) returns the canvas" });
   check(true, "exitFullscreen() (= Esc) returns the canvas to its tile");
   const errs = [...A.consoleErrors, ...B.consoleErrors];
   check(errs.length === 0, "no console errors", errs.join(" | "));

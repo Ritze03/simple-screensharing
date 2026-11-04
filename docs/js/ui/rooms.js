@@ -5,8 +5,18 @@ import { RoomClient, parseJoinLink, formatJoinLink, stripLinkName, ConnectError,
 import { S, invalidate, toast, persistRooms, displayName } from "./store.js";
 import { t, DICT } from "./i18n.js";
 import { onShareEvent, onShareStats, stopDestsInRoom } from "./capture.js";
-import { closePopout } from "./popout.js";
+import { closePopout, rebind } from "./popout.js";
 import { applyMediaEvent } from "./media-event.js";
+
+// `?fakeaudio=1` (dev harness only, like the native rig's SSS_UI_FAKE_AUDIO): every stream acts as if its sender shared audio (the ring, the
+// volume row, the card's "Audio"), so the audio UI can be tested without creating an audio stream on the host.
+const FAKE_AUDIO = (() => {
+  try {
+    return new URLSearchParams(location.search).get("fakeaudio") === "1";
+  } catch {
+    return false;
+  }
+})();
 
 export class RoomEntry {
   constructor({ id, name, link, auto = true }) {
@@ -41,11 +51,20 @@ export class RoomEntry {
     return this.streams.filter((s) => s.kind === "video" && !s.self);
   }
   hasAudio(ownerId) {
-    return this.streams.some((s) => s.owner === ownerId && s.kind === "audio");
+    return FAKE_AUDIO || this.streams.some((s) => s.owner === ownerId && s.kind === "audio");
   }
   memberName(id) {
     const m = this.members.find((x) => x.id === id);
     return m ? m.name || "?" : "?";
+  }
+  /** The emoji avatar of member `id` in this room ("" = none): mine from my setting, the others' from the relay's list (core `emojiOf`). */
+  emojiOf(id) {
+    return this.client ? this.client.emojiOf(id) : "";
+  }
+  /** The emoji of the member called `name` here (stage items and the strip identify people by display name: a ConnId changes on reconnect). */
+  emojiByName(name) {
+    const m = this.members.find((x) => x.name === name);
+    return m ? this.emojiOf(m.id) : "";
   }
 }
 
@@ -71,6 +90,7 @@ export async function connectRoom(r, { quiet = false } = {}) {
   if (r.client && r.state !== "disconnected") return;
   const st = S.settings;
   const client = new RoomClient({ displayName: displayName(), maxJitterBufferMs: st.jitter, catchUpSpeedPercent: st.catchup, levelLoudness: st.levelLoudness });
+  client.setAvatar(st.emoji); // announced once the relay acks (and again after every reconnect)
   r.client = client;
   r.state = "connecting";
   r.error = null;
@@ -165,12 +185,21 @@ function wire(r, client) {
   on("watch-ended", (d) => {
     const w = r.watches.get(d.key);
     if (!w) return;
-    endWatch(r, w);
+    const popped = w.popped; // a pop-out window stays open meanwhile (D1: a pop-out comes back after a reconnect or relay restart)
+    endWatch(r, w, { keepPop: !!popped });
     // A reconnect (theirs or ours, e.g. a relay restart) gives the sharer a fresh ConnId, so the same share comes back
     // under a new stream key. The core cannot tell that from a stop + restart, so remember the stream's stableKey for
     // a minute and resume watching when the same one reappears (the policy lives here, the identity comes from the core).
-    const entry = { stableKey: d.stableKey, ownerName: w.ownerName, label: w.label, vol: w.vol, muted: w.muted, until: Date.now() + RESUME_MS };
+    const entry = { stableKey: d.stableKey, ownerName: w.ownerName, label: w.label, vol: w.vol, muted: w.muted, popped: popped ? w : null, until: Date.now() + RESUME_MS };
     r.resume.push(entry);
+    if (popped) {
+      // Not resumed in time (the sharer is really gone): the window goes.
+      setTimeout(() => {
+        if (r.resume.includes(entry)) r.resume.splice(r.resume.indexOf(entry), 1);
+        if (w.popped && !entry.rebound) closePopout(w, { silent: true });
+        invalidate();
+      }, RESUME_MS + 200);
+    }
     setTimeout(() => {
       if (r.resume.includes(entry)) toast(t("ui.toast.watch_ended", { name: w.ownerName }), "tv_off");
     }, 4000);
@@ -185,6 +214,7 @@ function wire(r, client) {
   on("share", (d) => onShareEvent(r, d));
   on("subscribers", () => invalidate());
   on("viewers", () => invalidate());
+  on("avatars", () => invalidate());
   on("error", (d) => {
     if (d.code === "link-expired" || d.code === "relay-unreachable") {
       r.issue = "unreachable";
@@ -219,7 +249,8 @@ function resumeWatches(r) {
     if (w) {
       if (e.vol !== 1) setWatchVolume(r, w, e.vol);
       if (e.muted) setWatchMuted(r, w, true);
-    }
+      if (e.popped && e.popped.popped && rebind(e.popped, w)) e.rebound = true; // the new canvas takes the old one's window
+    } else if (e.popped) closePopout(e.popped, { silent: true });
   }
 }
 
@@ -255,10 +286,10 @@ export function watchStream(r, key) {
   return w;
 }
 
-function endWatch(r, w) {
+function endWatch(r, w, { keepPop = false } = {}) {
   r.watches.delete(w.key);
-  if (w.popped) closePopout(w, { silent: true });
-  w.popped = null;
+  if (w.popped && !keepPop) closePopout(w, { silent: true });
+  if (!keepPop) w.popped = null;
 }
 
 export function unwatchStream(r, key, { silent = false } = {}) {

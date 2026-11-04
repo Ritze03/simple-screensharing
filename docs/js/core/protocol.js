@@ -347,6 +347,87 @@ export function unpackNackRange(bytes) {
   return { tag: bytes[0], connId: dv.getBigUint64(1, false), streamId: bytes[9], frameId: dv.getUint32(10, false), first: dv.getUint16(14, false), count };
 }
 
+// ---------------------------------------------------------------------
+// Emoji avatars (spec §9.2, task #106/I6): one emoji per member, relayed as short tagged datagrams. A twin of
+// `protocol::{pack_,unpack_}avatar_set` / `{pack_,unpack_}avatars`.
+// ---------------------------------------------------------------------
+
+export const AVATAR_TAG_HELLO = 0xe9; // client -> relay, 1 byte: "send me everyone's emoji"
+export const AVATAR_TAG_ACK = 0xea; // relay -> client, 1 byte
+export const AVATAR_TAG_SET = 0xeb; // client -> relay: tag + 0..16 bytes emoji UTF-8 (none = no emoji)
+export const AVATAR_TAG_LIST = 0xec; // relay -> client: tag, count u8, (conn_id u64 BE, len u8, emoji) x count
+export const MAX_AVATAR_BYTES = 16;
+export const MAX_AVATAR_ENTRIES = 32;
+
+const strictUtf8 = new TextDecoder("utf-8", { fatal: true });
+/** Strict UTF-8 text of `bytes`, or null when it is not valid UTF-8. */
+function utf8OrNull(bytes) {
+  try {
+    return strictUtf8.decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+/** The AvatarSet datagram for `emoji` ("" clears); null when it is longer than 16 UTF-8 bytes. */
+export function packAvatarSet(emoji) {
+  const e = new TextEncoder().encode(emoji || "");
+  if (e.length > MAX_AVATAR_BYTES) return null;
+  const out = new Uint8Array(1 + e.length);
+  out[0] = AVATAR_TAG_SET;
+  out.set(e, 1);
+  return out;
+}
+
+/** The emoji of an AvatarSet datagram ("" = clear); null if it is anything else, too long or not UTF-8. */
+export function unpackAvatarSet(bytes) {
+  if (bytes.length < 1 || bytes[0] !== AVATAR_TAG_SET || bytes.length - 1 > MAX_AVATAR_BYTES) return null;
+  return utf8OrNull(bytes.subarray(1));
+}
+
+/** An AvatarList of `[[connId (BigInt), emoji]]`: empty or oversized emoji are skipped, at most 32 entries written. */
+export function packAvatars(entries) {
+  const enc = new TextEncoder();
+  const parts = [];
+  for (const [id, emoji] of entries) {
+    const e = enc.encode(emoji || "");
+    if (!e.length || e.length > MAX_AVATAR_BYTES) continue;
+    if (parts.length >= MAX_AVATAR_ENTRIES) break;
+    parts.push([id, e]);
+  }
+  const out = new Uint8Array(2 + parts.reduce((n, [, e]) => n + 9 + e.length, 0));
+  const dv = new DataView(out.buffer);
+  out[0] = AVATAR_TAG_LIST;
+  out[1] = parts.length;
+  let at = 2;
+  for (const [id, e] of parts) {
+    dv.setBigUint64(at, BigInt.asUintN(64, id), false);
+    out[at + 8] = e.length;
+    out.set(e, at + 9);
+    at += 9 + e.length;
+  }
+  return out;
+}
+
+/** Parse an AvatarList into `[[connId (BigInt), emoji]]`; null if it is anything else, truncated, has trailing bytes, or any
+ *  entry is empty, over 16 bytes or not UTF-8 (the whole list is distrusted then). */
+export function unpackAvatars(bytes) {
+  if (bytes.length < 2 || bytes[0] !== AVATAR_TAG_LIST) return null;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const out = [];
+  let at = 2;
+  for (let i = 0; i < bytes[1]; i++) {
+    if (at + 9 > bytes.length) return null;
+    const len = bytes[at + 8];
+    if (len === 0 || len > MAX_AVATAR_BYTES || at + 9 + len > bytes.length) return null;
+    const emoji = utf8OrNull(bytes.subarray(at + 9, at + 9 + len));
+    if (emoji === null) return null;
+    out.push([dv.getBigUint64(at, false), emoji]);
+    at += 9 + len;
+  }
+  return at === bytes.length ? out : null;
+}
+
 export function packPreviewHeader({ connId, streamId, counter }) {
   const out = new Uint8Array(PREVIEW_HEADER_LEN);
   const dv = new DataView(out.buffer);

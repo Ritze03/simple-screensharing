@@ -15,7 +15,7 @@ import { launchChromium, startServer } from "./headless.mjs";
 const BASE = "/simple-screensharing/";
 
 function parseArgs(argv) {
-  const o = { codecs: "h264", fps: "60", size: "1920x1080", bitrate: "8000", duration: "10", hw: "no-preference", flags: [], preset: "balanced" };
+  const o = { codecs: "h264", fps: "60", size: "1920x1080", bitrate: "8000", duration: "10", hw: "no-preference", flags: [], preset: "quality" };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (!a.startsWith("--")) continue;

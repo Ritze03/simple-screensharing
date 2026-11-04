@@ -199,6 +199,31 @@ scenario("roster + streams events as peers join, share, stop, leave", async () =
   src.stop();
 });
 
+scenario("emoji avatars: Ack, the relay's list, my own entry acknowledges a Set, a change / a clear reach the others, a leaver's entry goes, an oversize emoji is refused (spec 9.2)", async () => {
+  const room = newRoom();
+  const a = await client(room.link, "Ava");
+  const b = await client(room.link, "Bo");
+  await waitFor(() => a.avatarsSupported && b.avatarsSupported, 8000, "both AvatarAcks");
+  ok(a.emojiOf(a.selfId) === "" && b.emojiOf(a.selfId) === "", "nobody has an emoji yet");
+  a.setAvatar("\u{1F98A}");
+  ok(a.emojiOf(a.selfId) === "\u{1F98A}", "my own emoji shows at once, before the relay's list");
+  await waitFor(() => b.emojiOf(a.selfId) === "\u{1F98A}" && a.avatars.get(a.selfId) === "\u{1F98A}", 6000, "the fox at Bo, and Ava's own entry in the list (the Set's ack)");
+  b.setAvatar("\u{1F480}");
+  await waitFor(() => a.emojiOf(b.selfId) === "\u{1F480}" && b.avatars.get(b.selfId) === "\u{1F480}", 6000, "the skull at Ava");
+  a.setAvatar("");
+  await waitFor(() => !b.avatars.has(a.selfId), 6000, "Ava's emoji cleared at Bo");
+  ok(b.emojiOf(a.selfId) === "", "cleared means none");
+  a.setAvatar("x".repeat(17));
+  ok(a.emojiOf(a.selfId) === "", "an emoji over 16 bytes is refused client-side");
+  // a late joiner gets the whole list with its Ack
+  const c = await client(room.link, "Cy");
+  await waitFor(() => c.avatarsSupported && c.emojiOf(b.selfId) === "\u{1F480}", 6000, "the list for a late joiner");
+  const bId = b.selfId;
+  await b.disconnect();
+  await waitFor(() => !a.avatars.has(bId) && !c.avatars.has(bId), 8000, "a leaver's entry goes");
+  return { late: c.avatars.size };
+});
+
 scenario("encoder idles with no viewers; subscribe resumes it with a keyframe; unsubscribe idles again", async () => {
   const room = newRoom();
   const a = await client(room.link, "sharer");

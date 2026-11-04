@@ -25,7 +25,7 @@ const ownerFilter = q("owner", "");
 const pattern = q("pattern", "counter");
 const wantAudio = q("audio", "0") === "1";
 const hw = q("hw", "no-preference");
-const preset = q("preset", "balanced");
+const preset = q("preset", "quality");
 const detail = Number(q("detail", 0)); // makePatternSource: colour-noise texture (big IDRs), 1 scrolling, 2 static
 const source = q("source", "pattern"); // pattern = share the synthetic MediaStream; tab = real getDisplayMedia of this tab
 const out = document.getElementById("out");

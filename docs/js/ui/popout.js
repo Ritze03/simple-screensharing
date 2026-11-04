@@ -1,14 +1,20 @@
-// Pop-out viewer. A browser page cannot open a free OS window like native does, so:
-//   1. Document Picture-in-Picture (`documentPictureInPicture.requestWindow`, Chromium 116+): a real always-on-top
-//      window. The tile's own <canvas> is moved into it, so the CanvasRenderer keeps drawing (no second decode).
-//      Only one such window per page exists: popping out another stream brings the previous one back first.
-//   2. Otherwise Fullscreen: the canvas moves into a fullscreen stage; leaving fullscreen brings it back.
-// Both need the click's user activation, so call popOut() straight from a click handler.
+// Pop-outs. A browser page cannot open a free OS window like native does, so:
+//   1. Document Picture-in-Picture (`documentPictureInPicture.requestWindow`, Chromium 116+): a real always-on-top window.
+//      A STREAM's own <canvas> is moved into it (no second decode); the whole STAGE can be moved into one too (`popStage`).
+//      Only one such window per page exists: popping out another stream (or the stage) brings the previous one back first.
+//   2. Otherwise Fullscreen: the canvas moves into a fullscreen stage; leaving fullscreen brings it back. (The stage has no such
+//      fallback: its fullscreen button is the whole-stage fullscreen, so its pop-out button is hidden without Document PiP.)
+// Both need the click's user activation, so call popOut()/popStage() straight from a click handler.
+//
+// A stream's pop-out survives a reconnect or a relay restart (D1, native `popout_survives_resume`): the watch ends and the same
+// stream comes back as a NEW watch with a new canvas, so `rebind()` moves the new canvas into the window that is still open (a
+// window cannot be re-opened without a user gesture, so it is simply kept open while the 60 s resume window runs).
 
 import { h, ic } from "./dom.js";
 import { t } from "./i18n.js";
 
 let current = null; // { w, win?, stage, kind, onBack }
+let stageWin = null; // { win, root, key, onBack }
 
 export const pipSupported = () => typeof window.documentPictureInPicture !== "undefined" && !!window.documentPictureInPicture.requestWindow;
 export const popoutMode = () => (pipSupported() ? "pip" : document.fullscreenEnabled ? "fullscreen" : null);
@@ -41,6 +47,10 @@ function autoHide(stage) {
   arm();
 }
 
+const copyStyles = (win) => {
+  for (const link of document.querySelectorAll('link[rel="stylesheet"]')) win.document.head.appendChild(h("link", { rel: "stylesheet", href: link.href }));
+};
+
 /**
  * @param w       the watch ({ canvas, ownerName, ... })
  * @param onBack  called once the stream is back in the main window (window closed / fullscreen left)
@@ -49,33 +59,32 @@ function autoHide(stage) {
  */
 export async function popOut(w, onBack, want) {
   if (current) closePopout(current.w);
+  if (stageWin) closeStage();
   const mode = want === "fullscreen" ? (document.fullscreenEnabled ? "fullscreen" : null) : popoutMode();
   if (!mode) throw new Error(t("ui.err.no_popout"));
   if (mode === "pip") {
     const win = await window.documentPictureInPicture.requestWindow({ width: 960, height: 540 });
-    for (const link of document.querySelectorAll('link[rel="stylesheet"]')) {
-      win.document.head.appendChild(h("link", { rel: "stylesheet", href: link.href }));
-    }
+    copyStyles(win);
     win.document.title = `${w.ownerName} — ${t("app.title")}`;
     win.document.documentElement.style.background = "#000";
     win.document.body.className = "pip-body";
     const stage = stageFor(w, win.document, () => win.close());
     win.document.body.appendChild(stage);
     current = { w, win, stage, kind: "pip", onBack };
-    win.addEventListener("pagehide", () => back(w));
+    win.addEventListener("pagehide", () => current && current.win === win && back(current.w)); // current.w: a rebind swaps the watch
     w.popped = "pip";
     return "pip";
   }
   const stage = stageFor(w, document, () => document.exitFullscreen().catch(() => {}));
   stage.style.zIndex = "200";
   autoHide(stage);
-  stage.addEventListener("dblclick", () => closePopout(w)); // double-click again = back (Esc does the same natively)
+  stage.addEventListener("dblclick", () => current && closePopout(current.w)); // double-click again = back (Esc does the same natively)
   document.body.appendChild(stage);
   current = { w, stage, kind: "fullscreen", onBack };
   const onFs = () => {
     if (document.fullscreenElement !== stage) {
       document.removeEventListener("fullscreenchange", onFs);
-      back(w);
+      if (current && current.stage === stage) back(current.w);
     }
   };
   document.addEventListener("fullscreenchange", onFs);
@@ -89,6 +98,22 @@ export async function popOut(w, onBack, want) {
   }
   return "fullscreen";
 }
+
+/** The watch `oldW` ended (a reconnect) and `newW` took its place: move the new canvas into the still-open window. */
+export function rebind(oldW, newW) {
+  if (!current || current.w !== oldW) return false;
+  const old = oldW.canvas;
+  if (old && old.parentNode === current.stage) old.replaceWith(newW.canvas);
+  else current.stage.prepend(newW.canvas);
+  const nm = current.stage.querySelector(".nm");
+  if (nm) nm.textContent = newW.ownerName;
+  newW.popped = oldW.popped;
+  oldW.popped = null;
+  current.w = newW;
+  return true;
+}
+/** Whether `w` has a pop-out window (or fullscreen stage) open. */
+export const isPopped = (w) => !!current && current.w === w;
 
 function back(w, { silent = false } = {}) {
   if (!current || current.w !== w) return;
@@ -113,3 +138,39 @@ export function closePopout(w, { silent = false } = {}) {
     if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
   }
 }
+
+/* ---------------- the whole stage in its own window ---------------- */
+
+/** Open the stage window (Document PiP only). Resolves `{ win, root }`: render the stage into `root`; `onBack(key)` runs once the window is gone. */
+export async function popStage(key, onBack) {
+  if (!pipSupported()) throw new Error(t("ui.err.no_popout"));
+  if (current) closePopout(current.w);
+  if (stageWin) closeStage();
+  const win = await window.documentPictureInPicture.requestWindow({ width: 1280, height: 760 });
+  copyStyles(win);
+  win.document.title = t("app.title");
+  win.document.documentElement.style.background = "#060708";
+  win.document.body.className = "pip-body stage-body";
+  const root = win.document.createElement("div");
+  root.id = "app";
+  root.className = "stage-win";
+  win.document.body.appendChild(root);
+  const sw = (stageWin = { win, root, key, onBack });
+  win.addEventListener("pagehide", () => {
+    if (stageWin !== sw) return;
+    stageWin = null;
+    onBack(key);
+  });
+  return sw;
+}
+/** Bring the stage back to the main window. */
+export function closeStage() {
+  const sw = stageWin;
+  if (!sw) return;
+  stageWin = null;
+  try {
+    sw.win.close();
+  } catch {}
+  sw.onBack(sw.key);
+}
+export const stageWindow = () => stageWin;

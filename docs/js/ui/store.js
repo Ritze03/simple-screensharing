@@ -52,6 +52,12 @@ export const displayName = () => (S.settings.name || "").trim() || autoName();
 
 const browserLang = () => (String(navigator.language || "en").toLowerCase().startsWith("de") ? "de" : "en");
 
+const PRESET_NAMES = ["text", "quality", "gaming"];
+function normalizeStream(st) {
+  if (!PRESET_NAMES.includes(st.preset)) st.preset = "quality";
+  return st;
+}
+
 export function loadSettings() {
   const s = read(K_SETTINGS) || {};
   const out = {
@@ -67,7 +73,11 @@ export function loadSettings() {
     // Upload bandwidth, same two modes as native: per-stream maximum, or one absolute total split across every stream.
     bw: Object.assign({ mode: "absolute", total: 12000, floor: 3000 }, s.bw || {}),
     // Defaults for the next stream (the staged stream-settings modal starts from these).
-    stream: Object.assign({ fps: 60, codec: "h264", preset: "balanced", kbps: 6000, audio: true }, s.stream || {}),
+    // The presets are Text, Quality and Gaming (I2); a stored "balanced" or "low_latency" (and anything unknown) is Quality, like the
+    // native settings file (`rooms::StartStreamDefaults`).
+    stream: normalizeStream(Object.assign({ fps: 60, codec: "h264", preset: "quality", kbps: 6000, audio: true }, s.stream || {})),
+    // Settings > Profile: my emoji avatar ("" = none), announced to every room's relay (core `setAvatar`).
+    emoji: typeof s.emoji === "string" ? s.emoji.trim() : "",
     lastServer: typeof s.lastServer === "string" ? s.lastServer : "",
     lastCertHash: typeof s.lastCertHash === "string" ? s.lastCertHash : "",
   };
@@ -93,6 +103,20 @@ export const S = {
   popup: null,
   toasts: [],
   flash: null,
+  menu: null, // the open dropdown / context menu (menus.js): { kind, mk, ... }
+  // The stage (stage.js). Layout state per view lives there (UI-private, per session, not persisted, like native `StageState`); these are the
+  // choices the Layout menu and the bar set. `stats`: ids of the streams that show "Show stats on the stream".
+  stage: {
+    layouts: {}, // view key ("room:<id>" | "watched") -> "split" | "crop" | "float"
+    hideOwn: false,
+    alwaysNames: false,
+    stripHidden: false, // the people button hid the strip
+    sidebarHidden: false,
+    stats: new Set(),
+    popped: new Set(), // view keys whose whole stage is in its own (Document PiP) window
+    fullscreen: false,
+  },
+  card: null, // the open hover card in the people strip: { name, view }
 };
 
 let renderFn = null;

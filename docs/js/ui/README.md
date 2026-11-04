@@ -7,12 +7,19 @@ all paths relative so GitHub Pages can serve `docs/` under `/simple-screensharin
 
 | module | |
 | --- | --- |
-| `app.js` | entry point: render (sidebar, room header, tiles, share cards, People, action bar), modals (create/join, stream settings, settings, leave/forget, rename), popups, boot |
-| `dom.js` | `h()` plus the layout primitives (`V`/`H`/`SL`/`FILL` = vbox/hbox/slot/fill) and the row patterns shared with the egui port (`ctrlRow`, `roomRow`, `sharerRow`, `personRow`, `destRow`, `popItem`, `btnRow`, `gridRows`, `modalShell`) |
-| `store.js` | the UI state object `S`, `localStorage` (settings, saved rooms), coalesced `invalidate()`, toasts |
+| `app.js` | entry point: render (sidebar, room header, the stage region or the scrolling body), modals (create/join, stream settings, settings, leave/forget, rename, choose name), the stage pop-out window, boot |
+| `stage.js` | the stage (task I6): tiles, the arena layout (Split / Crop / Floating), resize bars and drags, the people strip and its hover card, the viewers dropdown, fullscreen and its auto-hiding chrome, the document-level listeners (`bindWindow`) |
+| `stage-state.js` | what a view shows (`collect`: watched video, idle, own share) and each view's layout state (`vg`: order, z, floating rects, grid), keyed by the core's `stableKey` |
+| `stage-geom.js` | the pure stage maths, a port of native `stage/geom.rs` (grid, bars, `dragBar`, floating windows, `cardKeeps`) with the same tests |
+| `chrome.js` | the pure fullscreen auto-hide rule, a port of native `stage/chrome.rs` |
+| `bar.js` | the control bar: split buttons (Share screen, Share audio, Webcam, Layout, Room settings), people, Leave, pop out, fullscreen |
+| `menus.js` | every dropdown and context menu in one style: the bar's menus, the stream menu, the avatar picker, dropdown fields (`selectField`), "Also send to / Move to" |
+| `actions.js` | the hooks `app.js` hands the stage modules (`A.render`, `A.openStreamModal`, ...): they cannot import it |
+| `dom.js` | `h()` plus the layout primitives (`V`/`H`/`SL`/`FILL` = vbox/hbox/slot/fill) and the row patterns shared with the egui port (`ctrlRow`, `roomRow`, `sharerRow`, `destRow`, `btnRow`, `modalShell`), the avatar builder (`avatarEl`, `avatarBg`, `emojiInfo`, `pickEmoji`) |
+| `store.js` | the UI state object `S` (incl. `S.stage` and `S.menu`), `localStorage` (settings incl. the emoji avatar, saved rooms), coalesced `invalidate()`, toasts |
 | `rooms.js` | one `RoomEntry` per saved room: its `RoomClient`, state, roster, streams, previews, watches; core events -> state |
 | `capture.js` | outgoing streams: a capture (one `getDisplayMedia` pick) and its destinations (one `startShare` per room), bandwidth split, live edits, the own-tile live preview element (`previewFor`, attached only while the page is visible and focused) |
-| `popout.js` | pop-out viewer: Document Picture-in-Picture, fallback Fullscreen; the fullscreen stage is also the tile double-click |
+| `popout.js` | pop-outs: a stream in Document Picture-in-Picture (fallback Fullscreen; the fullscreen stage is also the tile double-click; it survives a reconnect, `rebind`), and the whole stage in a PiP window (`popStage`) |
 | `i18n.js` | en/de dictionary, `t(key, vars)` with the native `%{var}` placeholders. German is the informal "du" form with the native terms (identical strings where key and English text match `client/locales/de.yml`) |
 
 ## Design notes (the why)
@@ -54,3 +61,21 @@ all paths relative so GitHub Pages can serve `docs/` under `/simple-screensharin
   prefill); a saved room keeps its plain link (`stripLinkName`). The name is sent at connect, so rooms that auto-connected
   before the user saved keep the old name for their peers until the next reconnect (same as native; the settings note says so).
 * `window.__sss` exposes the state for debugging and local verification scripts.
+
+## The stage (task I6, 2026-11-04)
+
+The room's centre and the Watched view are the native client's stage: Split / Crop / Floating, resize bars, a people strip with a hover card, a control bar with split
+buttons, one menu style, stage pop-out, fullscreen auto-hide, emoji avatars. The detail, the D1 behaviours and the *why* of every call are in
+`superdoc/features/website.md` "The stage" and "Emoji avatars"; the short rules for working on it:
+
+* **Port, do not re-derive.** The geometry (`stage-geom.js`) and the fullscreen rule (`chrome.js`) are line-for-line ports of `client/src/ui/stage/{geom,chrome}.rs`; change
+  both together and keep the ported tests (`dev/tests.js` "stage geometry", "fullscreen chrome") green. The CSS is the replica's (`superdoc/ui/replica/index.html`).
+* **A drag must survive the re-render.** `render()` returns early while `isDragging()` (stage drags) or a slider is held; a drag updates element styles directly and calls
+  `A.flush()` when it ends. Anything new that tracks the pointer across several events must do the same, or the full re-render replaces the element under the pointer.
+* **Pointer-driven overlays decide by geometry, not by `mouseleave`.** Every render replaces both the trigger and the overlay, and a replaced element never gets its
+  `mouseleave`: the hover card (`cardKeeps`) and the viewers dropdown test the pointer position on `pointermove` of the document.
+* **Item ids are `room id + stableKey`** (your own share `<room>/me`), never the stream key: a reconnect gives the sharer a new ConnId and must keep the layout.
+* **Menus:** open one with `opener(mk, kind, extra)` (a control) or `openMenu`; add a body to `menus.js` `BODIES`. `S.menu.hostId` says which window draws it (main or the stage window).
+* **No `<select>`.** A dropdown is `selectField`.
+* Dev flags: `?fakeaudio=1` makes every stream act as if its sender shared audio (ring, volume row, "Audio" in the card) without creating an audio stream; `window.__sss` also
+  exposes `vg` and `stageWindow` for the harness.

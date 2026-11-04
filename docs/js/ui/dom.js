@@ -1,5 +1,5 @@
 // DOM helpers and the reusable row patterns of the room-centric layout (same names as the mockup and as the egui
-// widgets: ctrlRow, roomRow, sharerRow, personRow, destRow, popItem, btnRow, card, gridRows, modalShell).
+// widgets: ctrlRow, roomRow, sharerRow, destRow, btnRow, card, modalShell).
 // Each pattern is the ONLY way its row type is built, so rows of a type cannot drift apart.
 
 export function h(tag, attrs, ...kids) {
@@ -150,11 +150,6 @@ export function sharerRow({ icon, name, num, unit, onclick, title, numAttrs }) {
     SL(28, h("span", Object.assign({ class: "num", text: num == null ? "" : String(num) }, numAttrs || {})), { al: "r" }),
     SL(22, h("span", { class: "unit", text: unit || "" }), { al: "l" }));
 }
-/** People row: hbox [slot 22 avatar][fill name][slot 44 pill][slot 18 eye] */
-export function personRow({ avatar, name, you, youLabel, pill, eye, idle, stale }) {
-  return H({ cls: "member" + (idle ? " idle" : "") + (stale ? " stale" : "") },
-    SL(22, avatar), FILL(h("span", { class: "txt name" }, name, you ? h("span", { class: "you", text: youLabel }) : null)), SL(44, pill, { al: "r" }), SL(18, eye));
-}
 /** Destination row: hbox [slot 18 icon][fill name][slot min 84 pill][slot 76 kbps][slot 32 action] */
 export function destRow({ cur, name, curLabel, pill, kbps, action }) {
   return H({ cls: "destrow" + (cur ? " cur" : "") },
@@ -162,46 +157,8 @@ export function destRow({ cur, name, curLabel, pill, kbps, action }) {
     FILL(h("span", { class: "txt name" }, name, cur ? h("small", { text: curLabel }) : null)),
     SL(84, pill, { al: "l", min: true }), SL(76, h("span", { class: "kbps", text: kbps }), { al: "r" }), SL(32, action));
 }
-/** Popup item: hbox [slot 18 icon][fill vbox(label, sub)][slot 23 trailing?] */
-export function popItem({ icon, iconEl, label, sub, onclick, cls, disabled, trailing, role }) {
-  return H({ tag: "button", cls: "pi" + (sub ? " two" : "") + (cls ? " " + cls : ""), attrs: { type: "button", role: role || "menuitem", disabled: !!disabled, onclick } },
-    SL(18, iconEl || ic(icon, "ico")),
-    FILL([T(label), sub ? h("small", { class: "txt", text: sub }) : null], { v: true }),
-    trailing ? SL(23, trailing) : null);
-}
 /** Equal-width button row: hbox [fill btn][fill btn]... */
 export const btnRow = (...btns) => H({ g: 2 }, btns.filter(Boolean).map((b) => { b.classList.add("wide"); return FILL(b); }));
-/** Grid of equal columns built from nested boxes: vbox [hbox row [fill col]...]... */
-export function gridRows(items, cols, renderItem, maxW) {
-  const rows = [];
-  for (let i = 0; i < items.length; i += cols) {
-    const chunk = items.slice(i, i + cols);
-    const cells = chunk.map((it) => FILL(renderItem(it), { v: true }));
-    while (cells.length < cols) cells.push(FILL(null));
-    rows.push(H({ g: 3, cls: "st", style: maxW ? `max-width:${maxW}` : null }, cells));
-  }
-  return V({ g: 3 }, rows);
-}
-/** Share-card grid shape `{ cols, w }` for `n` cards in a `aw` x `ah` area (task #120; native `room::card_grid_shape`):
- *  1..min(n, columns >= 260 wide) columns (never an empty one), card width limited by the width, by the height (16:9
- *  thumb + 112 px info/border per row) and by 640; the biggest card wins, a tie goes to more columns. Never below 260
- *  (unless the area is narrower); a wider area never gives smaller cards. */
-export function cardShape(n, aw, ah, gap = 12) {
-  const MIN = 260, MAX = 640, INFO = 112;
-  aw = Math.max(0, aw);
-  n = Math.max(1, n);
-  const fit = Math.max(1, Math.min(n, Math.floor((aw + gap) / (MIN + gap))));
-  let best = { cols: 1, w: 0 };
-  for (let c = 1; c <= fit; c++) {
-    const rows = Math.ceil(n / c);
-    const cellW = (aw - gap * (c - 1)) / c;
-    const cellH = (ah - gap * (rows - 1)) / rows;
-    const w = Math.max(Math.min(cellW, ((cellH - INFO) * 16) / 9 + 2, MAX), Math.min(MIN, cellW));
-    if (w >= best.w) best = { cols: c, w };
-  }
-  return best;
-}
-
 export function emptyState(icon, title, text, actions, { err = false, errText = null } = {}) {
   return V({ cls: "empty", g: 2 }, ic(icon, "big" + (err ? " err" : "")), T(title, "b"), text ? h("span", { text }) : null,
     errText ? h("span", { class: "errtext", text: errText }) : null,
@@ -246,11 +203,76 @@ function hslHex(hue, s, l) {
   return "#" + f(0) + f(8) + f(4);
 }
 const AVATAR_S = 0.6, AVATAR_LA = 0.36, AVATAR_LB = 0.24, AVATAR_SHIFT_B = 350;
-/** `[stopA, stopB]` hex colours of `name`'s avatar gradient (A lighter, top-left). */
-export function avatarColors(name) {
-  const hue = avatarHue(name);
+/** `[stopA, stopB]` hex colours of `name`'s avatar gradient (A lighter, top-left). `hue` overrides the name's hue (an emoji's). */
+export function avatarColors(name, hue = avatarHue(name)) {
   return [hslHex(hue, AVATAR_S, AVATAR_LA), hslHex((hue + AVATAR_SHIFT_B) % 360, AVATAR_S, AVATAR_LB)];
 }
-/** Inline style for an `.avatar` element showing `name`'s gradient (exact 8-bit hex stops, not left to CSS hsl()). */
-export const avatarBg = (name) => { const [a, b] = avatarColors(name); return `background:linear-gradient(140deg, ${a}, ${b})`; };
+/** The picker's emoji (the replica's `EMOJI`, the native client draws these 40 and the initial for any other). */
+export const EMOJI = [..."😀😎🤓🥳🤖👻👽🎃💀🤡🐶🐱🦊🐻🐼🐸🐙🦄🐧🦉🍕🍔🍩🍣🍉☕🌮🍺🎮🎧🎬🎸⚽🚀🌈⭐🔥⚡🌙🌵"];
+const EMOJI_FONT = '"Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji", "Twemoji Mozilla", sans-serif';
+/** Greyish background of a colourless emoji (like 💀): the replica's `hsl(222, .14, .36 / .24)` slate, not a hue at all. */
+const SLATE = [hslHex(222, 0.14, 0.36), hslHex(222, 0.14, 0.24)];
+const emojiCache = new Map();
+/**
+ * What an emoji looks like, measured once by drawing it on a 32 px canvas (a browser has system emoji fonts, so this is the
+ * replica's approach, the native client does the same on its bundled pictures): `hue` = its strongest hue in 10-degree bins (so a
+ * mix of colours cannot average to mud), `null` when it has almost no colour; `dx`/`dy` = how far the centre of its visible pixels
+ * is from the centre of its em box, in em, so the avatar can centre the VISIBLE emoji (D1: "crop and centre", native
+ * `paint_avatar_emoji`). Without a canvas (a test page without a DOM) or on a failure: no hue, no shift.
+ */
+export function emojiInfo(e) {
+  if (emojiCache.has(e)) return emojiCache.get(e);
+  let info = { hue: null, dx: 0, dy: 0 };
+  try {
+    const c = document.createElement("canvas");
+    c.width = c.height = 48;
+    const x = c.getContext("2d", { willReadFrequently: true });
+    x.font = `32px ${EMOJI_FONT}`;
+    x.textAlign = "center";
+    x.textBaseline = "middle";
+    x.fillText(e, 24, 24);
+    const d = x.getImageData(0, 0, 48, 48).data;
+    const bins = new Array(36).fill(0);
+    let coloured = 0, x0 = 48, x1 = -1, y0 = 48, y1 = -1;
+    for (let i = 0; i < d.length; i += 4) {
+      if (d[i + 3] < 128) continue;
+      const px = (i / 4) % 48, py = Math.floor(i / 4 / 48);
+      x0 = Math.min(x0, px); x1 = Math.max(x1, px); y0 = Math.min(y0, py); y1 = Math.max(y1, py);
+      const r = d[i], g = d[i + 1], b = d[i + 2], hi = Math.max(r, g, b), lo = Math.min(r, g, b), sat = hi ? (hi - lo) / hi : 0;
+      if (sat < 0.25 || hi < 40) continue;
+      const dl = hi - lo, hue = (60 * (hi === r ? (g - b) / dl + 6 : hi === g ? (b - r) / dl + 2 : (r - g) / dl + 4)) % 360;
+      bins[Math.floor(hue / 10)] += sat;
+      coloured++;
+    }
+    info = { hue: coloured < 40 ? null : bins.indexOf(Math.max(...bins)) * 10 + 5, dx: 0, dy: 0 };
+    if (x1 >= 0) info.dx = ((x0 + x1 + 1) / 2 - 24) / 32, info.dy = ((y0 + y1 + 1) / 2 - 24) / 32;
+  } catch {}
+  emojiCache.set(e, info);
+  return info;
+}
+/** Inline style for an `.avatar` element showing `name`'s gradient (exact 8-bit hex stops, not left to CSS hsl()); with an
+ *  `emoji` the background comes from the emoji instead (a colourless one gets a neutral slate). */
+export const avatarBg = (name, emoji = "") => {
+  let [a, b] = [null, null];
+  if (emoji) {
+    const { hue } = emojiInfo(emoji);
+    [a, b] = hue === null ? SLATE : avatarColors(name, hue);
+  } else [a, b] = avatarColors(name);
+  return `background:linear-gradient(140deg, ${a}, ${b})`;
+};
 export const initial = (name) => (String(name || "?").trim()[0] || "?").toUpperCase();
+/** The one avatar builder: a round gradient with the person's emoji (a thin black outline that follows its shape, centred by
+ *  its visible pixels) or else their initial. `opts`: `sm` (22 px; the default 32, the strip sets its own size in CSS), `pres`
+ *  (presence dot), `cls`, `kids` (badges). */
+export function avatarEl(name, emoji, { sm = false, pres = null, cls = "", kids = [] } = {}) {
+  const e = emoji || "";
+  let face;
+  if (e) {
+    const { dx, dy } = emojiInfo(e);
+    face = h("span", { class: "emo", style: `translate:${(-dx).toFixed(3)}em ${(-dy).toFixed(3)}em`, text: e });
+  } else face = initial(name);
+  return h("span", { class: "avatar" + (sm ? " sm" : "") + (cls ? " " + cls : ""), style: avatarBg(name, e) }, face, pres == null ? null : h("span", { class: "pres" + (pres ? "" : " off") }), kids);
+}
+/** The last emoji of a text as one grapheme (a flag or a ZWJ family stays whole); "" when there is none. Pasting over or after the old one both work. */
+const isEmoji = (g) => /\p{Extended_Pictographic}|\p{Regional_Indicator}|⃣/u.test(g);
+export const pickEmoji = (text) => [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(String(text || ""))].map((x) => x.segment).filter(isEmoji).at(-1) || "";

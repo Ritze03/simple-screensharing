@@ -70,12 +70,21 @@ export async function stubCapture(page, { width = 1920, height = 1080, fps = 60,
   })()`);
 }
 
-/** Click through the real share flow: Share screen -> stream settings (codec, fps) -> Go live. */
+/** Pick `fps` in the stream modal's FPS dropdown (the app's own menu, opened by clicking the field; no native <select>). */
+export async function pickFps(page, fps) {
+  const want = `${fps} fps`;
+  if ((await page.eval(`document.querySelector("#st-fps .txt")?.innerText.trim()`)) === want) return;
+  await page.click("#st-fps");
+  await page.waitFor("document.querySelector('.menu.m-dd')", { what: "fps dropdown" });
+  await page.click({ js: `[...document.querySelectorAll('.menu.m-dd .mi')].find((e) => e.innerText.trim() === ${JSON.stringify(want)})` });
+  await page.waitFor(`document.querySelector("#st-fps .txt")?.innerText.trim() === ${JSON.stringify(want)}`, { what: "fps picked" });
+}
+
+/** Click through the real share flow: the bar's Share screen -> stream settings (codec, fps) -> Go live. */
 export async function goLive(page, { codec = "h264", fps = 60, kbps = null } = {}) {
   await page.click("#btn-share");
   await page.waitFor("document.querySelector('#st-fps')", { what: "stream modal" });
-  await page.eval(`(() => { const s = document.querySelector("#st-fps"); s.value = "${fps}"; s.dispatchEvent(new Event("change", { bubbles: true })); })()`);
-  await sleep(150);
+  await pickFps(page, fps);
   const label = { h264: "H.264", h265: "H.265", av1: "AV1" }[codec];
   await page.click({ text: label, sel: ".seg button" });
   if (kbps) {
@@ -87,7 +96,7 @@ export async function goLive(page, { codec = "h264", fps = 60, kbps = null } = {
   await page.waitFor("__sss.S.captures.some((c) => c.state === 'live' && [...c.dests.values()].some((d) => d.state === 'live'))", { timeout: 20000, what: "live" });
 }
 
-/** Click Watch (the play_arrow icon button, any language) on the first video stream card in the selected room. */
+/** Click Watch (the play_arrow icon button, any language) on the first idle stream tile of the selected room's stage. */
 export async function watchFirst(page) {
   await page.waitFor("[...document.querySelectorAll('button')].some((b) => /^play_arrow/.test(b.innerText.trim()))", { timeout: 30000, what: "a Watch button" });
   await page.click({ js: "[...document.querySelectorAll('button')].find((b) => /^play_arrow/.test(b.innerText.trim()))" });

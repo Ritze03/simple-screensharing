@@ -1,0 +1,883 @@
+// Task I6 through the REAL site UI: the browser client's stage (Split / Crop / Floating, resize bars, the control bar, the people strip with its
+// hover card, the Layout / Room / Share / stream menus, the stage pop-out, fullscreen auto-hide, the new stream settings, emoji avatars) and
+// every D1 item the native client passed ("D1 items" in superdoc/features/website.md). Real pointer input through CDP Input.dispatchMouseEvent,
+// headless Chromium, a throwaway relay. Four pages: Alice, Bob and Carol share a synthetic screen each (video only: no audio stream is ever
+// created, `?fakeaudio=1` on the viewer makes every stream act as if it had audio for the ring / volume / card rows), Vera watches all three and
+// shares too, so her stage holds four tiles.
+//
+//   usage: node docs/dev/e2e/stage.mjs <relay host:port> <certhash> [--relay-bin <bin> --relay-dir <dir>]   (relay: docs/dev/relay.sh start ...)
+//          the relay binary/dir let the run restart the relay (pop-out and avatars must survive it); without them that part is skipped
+//   env:   E2E_OUT = where the screenshots go (default /tmp/sss-e2e), SHOT_PREFIX (default "i6_")
+import { mkdirSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+const W = new URL("../", import.meta.url).pathname;
+const L = await import(W + "e2e-lib.mjs");
+const args = process.argv.slice(2);
+const opt = (n) => (args.includes(n) ? args[args.indexOf(n) + 1] : null);
+const [RELAY, HASH] = args.filter((a, i) => !a.startsWith("--") && !(i > 0 && args[i - 1].startsWith("--")));
+const RELAY_BIN = opt("--relay-bin");
+const RELAY_DIR = opt("--relay-dir");
+const OLD_RELAY = opt("--old-relay"); // host:port of a relay that carries no avatars (SSSHARE_AVATARS=0 acts exactly like an older relay)
+const OLD_HASH = opt("--old-hash");
+if (!RELAY || !HASH) throw new Error("usage: stage.mjs <relay host:port> <certhash> [--relay-bin <bin> --relay-dir <dir>]");
+const OUT = (process.env.E2E_OUT || "/tmp/sss-e2e") + "/";
+const PFX = process.env.SHOT_PREFIX || "i6_";
+mkdirSync(OUT, { recursive: true });
+
+let failed = 0;
+const results = [];
+const check = (cond, what, extra = "") => {
+  console.log(`${cond ? "PASS" : "FAIL"} ${what}${extra ? "  " + extra : ""}`);
+  results.push({ ok: !!cond, what, extra });
+  if (!cond) failed++;
+};
+const near = (a, b, eps, what) => check(Math.abs(a - b) <= eps, what, `${(+a).toFixed(2)} vs ${(+b).toFixed(2)} (+-${eps})`);
+const sleep = L.sleep;
+const section = (s) => console.log(`\n== ${s}`);
+
+const site = await L.serveSite(0);
+const open = (name, url = site.url) => L.openApp(url, { name });
+const A = await open("Alice");
+const B = await open("Bob");
+const C = await open("Carol");
+const V = await open("Vera", site.url + "?fakeaudio=1");
+const P = V.page;
+const shot = (page, n) => page.screenshot(OUT + PFX + n + ".png");
+
+/* ---------- helpers ---------- */
+const rect = (p, sel, i = 0) => p.eval(`(() => { const e = document.querySelectorAll(${JSON.stringify(sel)})[${i}]; if (!e) return null; const r = e.getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height, r: r.right, b: r.bottom, cx: r.x + r.width / 2, cy: r.y + r.height / 2 }; })()`);
+const rects = (p, sel) => p.eval(`[...document.querySelectorAll(${JSON.stringify(sel)})].map((e) => { const r = e.getBoundingClientRect(); return { x: r.x, y: r.y, w: r.width, h: r.height, r: r.right, b: r.bottom, cx: r.x + r.width / 2, cy: r.y + r.height / 2, id: e.dataset.id || e.dataset.bar || e.dataset.user || null }; })`);
+const css = (p, sel, prop, pseudo = null, i = 0) => p.eval(`(() => { const e = document.querySelectorAll(${JSON.stringify(sel)})[${i}]; return e ? getComputedStyle(e${pseudo ? `, ${JSON.stringify(pseudo)}` : ""}).getPropertyValue(${JSON.stringify(prop)}) : null; })()`);
+const mouse = (p, type, x, y, extra = {}) => p.send("Input.dispatchMouseEvent", { type, x, y, button: "none", buttons: 0, ...extra });
+const move = (p, x, y) => mouse(p, "mouseMoved", x, y);
+const press = (p, x, y, button = "left") => mouse(p, "mousePressed", x, y, { button, buttons: button === "left" ? 1 : 2, clickCount: 1 });
+const release = (p, x, y, button = "left") => mouse(p, "mouseReleased", x, y, { button, buttons: 0, clickCount: 1 });
+const rightClick = async (p, x, y) => {
+  await move(p, x, y);
+  await press(p, x, y, "right");
+  await release(p, x, y, "right");
+  await sleep(150);
+};
+/** Drag from (x, y) by (dx, dy) in `steps` moves with the button held; `mid` runs once half way (while still pressed). */
+async function drag(p, x, y, dx, dy, { steps = 12, mid = null } = {}) {
+  await move(p, x, y);
+  await press(p, x, y);
+  for (let i = 1; i <= steps; i++) {
+    await mouse(p, "mouseMoved", x + (dx * i) / steps, y + (dy * i) / steps, { button: "left", buttons: 1 });
+    if (mid && i === Math.floor(steps / 2)) await mid();
+    await sleep(8);
+  }
+  await sleep(60);
+  await release(p, x + dx, y + dy);
+  await sleep(150);
+}
+const wheel = (p, x, y, deltaY) => p.send("Input.dispatchMouseEvent", { type: "mouseWheel", x, y, deltaX: 0, deltaY });
+const key = async (p, k) => {
+  await p.key(k);
+  await sleep(120);
+};
+const tiles = (p) => rects(p, ".arena > .st-tile");
+const guts = (p) => rects(p, ".arena > .gut");
+const gutColor = (p, i) => css(p, ".arena > .gut", "background-color", "::after", i);
+const GREY = "rgb(52, 53, 59)", BLUE = "rgb(76, 110, 245)", CLEAR = "rgba(0, 0, 0, 0)";
+const viewKey = () => P.eval(`"room:" + __sss.S.rooms[0].id`);
+const grid = async () => P.eval(`JSON.parse(JSON.stringify(__sss.vg("room:" + __sss.S.rooms[0].id).grid))`);
+const openLayoutMenu = async () => {
+  await P.click("#btn-layout");
+  await P.waitFor("document.querySelector('.menu.m-layout')", { what: "layout menu" });
+};
+const layoutItem = async (re) => {
+  await P.click({ js: `[...document.querySelectorAll('.menu .mi, .menu .cbx')].find((e) => ${re}.test(e.innerText))` });
+  await sleep(150);
+};
+const setLayout = async (name) => {
+  await openLayoutMenu();
+  await layoutItem(name === "split" ? "/Split/" : name === "crop" ? "/Crop/" : "/Floating/");
+  await sleep(150);
+};
+const closeMenu = async () => {
+  await key(P, "Escape");
+  await sleep(100);
+};
+
+async function startSharer(X, name, w, h) {
+  await L.stubCapture(X.page, { width: w, height: h, fps: 15, audio: false });
+  await L.goLive(X.page, { codec: "h264", fps: 15 });
+}
+let ok0 = false;
+try {
+  /* ============================== setup ============================== */
+  section("setup: Alice, Bob, Carol share, Vera watches all three and shares");
+  await L.createRoom(A.page, { name: "stage", server: RELAY, hash: HASH });
+  await L.waitJoined(A.page);
+  const link = await L.inviteLink(A.page);
+  for (const X of [B, C, V]) {
+    await L.addRoomByLink(X.page, link, "stage");
+    await L.waitJoined(X.page);
+  }
+  await startSharer(A, "Alice", 960, 540);
+  await startSharer(B, "Bob", 800, 600);
+  await startSharer(C, "Carol", 540, 960);
+  await P.waitFor("document.querySelectorAll('.st-tile.idle').length === 3", { timeout: 30000, what: "three idle tiles on Vera's stage" });
+  await shot(P, "01_idle");
+  // idle tile: avatar, "X is sharing Y", Watch + Pop out
+  check(await P.eval("[...document.querySelectorAll('.st-tile.idle')].every((t) => t.querySelector('.invite .avatar') && t.querySelector('[data-watch]') && /is sharing/.test(t.innerText))"), "an unwatched stream is a dimmed tile with 'X is sharing Y' and Watch stream");
+  for (let n = 1; n <= 3; n++) {
+    // a click is press + release on one element and the UI re-renders on every state change: retry if one landed in between
+    for (let i = 0; i < 6 && (await P.eval("__sss.S.rooms[0].watches.size")) < n; i++) {
+      await P.click("[data-watch]");
+      await sleep(700);
+    }
+    await P.waitFor(`__sss.S.rooms[0].watches.size === ${n}`, { what: `watch ${n}` });
+  }
+  await P.waitFor("[...__sss.S.rooms[0].watches.values()].every((w) => w.firstFrame)", { timeout: 40000, what: "first frames" });
+  // Vera shares as well: her own tile
+  await L.stubCapture(P, { width: 960, height: 540, fps: 15, audio: false });
+  await L.goLive(P, { codec: "h264", fps: 15 });
+  await P.waitFor("document.querySelectorAll('.arena > .st-tile').length === 4", { what: "four tiles" });
+  await sleep(600);
+  await shot(P, "02_split");
+  const order0 = await P.eval(`__sss.vg("room:" + __sss.S.rooms[0].id).order`);
+  check(order0.length === 4 && order0.every((id) => id.startsWith(order0[0].split("/")[0] + "/")), "the stage keys its tiles by room + stableKey (not by ConnId)", JSON.stringify(order0));
+
+  /* ============================== control bar ============================== */
+  section("control bar");
+  for (const [id, name] of [["btn-share", "Share screen"], ["btn-audio", "Share audio"], ["btn-webcam", "Webcam"], ["btn-layout", "Layout"], ["btn-room", "Room settings"]]) {
+    const r = await rect(P, `#${id}`);
+    const c = await P.eval(`(() => { const car = document.querySelector("#${id}").parentElement.querySelector(".caret"); if (!car) return null; const r = car.getBoundingClientRect(); return { w: r.width, shadow: getComputedStyle(car).boxShadow }; })()`);
+    check(r && c && c.w > 10 && /inset/.test(c.shadow) && /1px/.test(c.shadow), `${name} always shows its dropdown arrow with a separator line`, c ? c.shadow : "no arrow");
+  }
+  const sepOf = (id) => css(P, `#${id}`, "box-shadow");
+  check((await css(P, ".splitb .caret", "box-shadow")) !== "none", "the arrow is cut off by an inset 1px line");
+  const grp = await rect(P, ".cgroup");
+  const leave = await rect(P, "#btn-leave");
+  near(leave.h, grp.h, 0.6, "Leave is as tall as the button groups");
+  const bg = await css(P, ".cgroup > .splitb", "background-color");
+  check(bg !== CLEAR && bg !== "rgba(0, 0, 0, 0)", "grouped buttons have a backdrop", bg);
+  for (const id of ["btn-sidebar", "btn-invite", "btn-popstage", "btn-stagefs"]) {
+    check((await css(P, `#${id}`, "background-color")) === CLEAR, `freestanding #${id} has no backdrop`);
+  }
+  check(await P.eval("!document.querySelector('.p-right') && !document.querySelector('.member') && ![...document.querySelectorAll('h3')].some((h) => /people/i.test(h.innerText))"), "no people list on the right, no heading above the avatars");
+  check(await P.eval("!document.querySelector('.stripwrap .ms.caret') && ![...document.querySelectorAll('.stripwrap .ms')].some((e) => /expand|arrow/.test(e.innerText))"), "no arrow above the avatars");
+  await P.click("#btn-people");
+  check(await P.eval("!document.querySelector('.strip')"), "the people button hides the strip");
+  await P.click("#btn-people");
+  check(await P.eval("!!document.querySelector('.strip') && document.querySelectorAll('.strip .pv').length === 4"), "and shows it again (4 people)");
+  await P.click("#btn-sidebar");
+  check(await P.eval("!document.querySelector('.p-side')"), "the bar's sidebar button hides the sidebar");
+  await P.click("#btn-sidebar");
+  check(await P.eval("!!document.querySelector('.p-side')"), "and shows it again");
+  check(await P.eval("document.querySelector('#btn-webcam').disabled && !!document.querySelector('#btn-webcam').title"), "Webcam is a present, disabled split button with a tooltip (task I10 enables it)");
+  check(await P.eval("document.querySelector('#btn-audio').disabled && /./.test(document.querySelector('#btn-audio').title)"), "Share audio is disabled while the shared source has no audio (today's behaviour)");
+
+  /* ============================== resize bars: Split ============================== */
+  section("resize bars (Split)");
+  const T0 = await tiles(P);
+  const G0 = await guts(P);
+  check(G0.length === 3, "four tiles: three bars (two vertical, one horizontal)", `${G0.length}`);
+  await move(P, T0[0].cx, T0[0].cy);
+  await sleep(200);
+  const over = [];
+  for (let i = 0; i < G0.length; i++) over.push(await gutColor(P, i));
+  check(over.every((c) => c === CLEAR), "pointer over a stream: every bar is hidden", over.join(" | "));
+  // a point inside the arena that is on no picture and no bar: the black space around a picture
+  const arena = await rect(P, ".arena");
+  let spot = null;
+  const inside = (r, x, y, pad = 0) => x >= r.x - pad && x <= r.r + pad && y >= r.y - pad && y <= r.b + pad;
+  for (let y = arena.y + 4; y < arena.b && !spot; y += 6) for (let x = arena.x + 4; x < arena.r && !spot; x += 6) if (![...T0, ...G0].some((r) => inside(r, x, y, 2))) spot = { x, y };
+  check(!!spot, "there is black space around the pictures in this layout", JSON.stringify(spot));
+  await move(P, spot.x, spot.y);
+  await sleep(200);
+  const grey = [];
+  for (let i = 0; i < G0.length; i++) grey.push(await gutColor(P, i));
+  check(grey.every((c) => c === GREY), "pointer in the black space around a picture: all bars show in dark grey", grey.join(" | "));
+  await shot(P, "03_bars_grey");
+  // the bar under the pointer is blue, the others stay grey
+  await move(P, G0[0].cx, G0[0].cy);
+  await sleep(200);
+  const hov = [];
+  for (let i = 0; i < G0.length; i++) hov.push(await gutColor(P, i));
+  check(hov[0] === BLUE && hov.slice(1).every((c) => c === GREY), "the bar under the pointer is blue, the others dark grey", hov.join(" | "));
+  // midway between the two visible pictures, never on the hidden cell edge
+  const midOk = async () => {
+    const ts = await tiles(P);
+    const gs = await guts(P);
+    const g = await grid();
+    let ok = true;
+    let detail = [];
+    let first = 0;
+    g.counts.forEach((c, i) => {
+      for (let j = 0; j < c - 1; j++) {
+        const a = ts[first + j];
+        const b = ts[first + j + 1];
+        const want = (a.r + b.x) / 2;
+        const gut = gs.find((x) => x.id === `v${i}.${j}`);
+        const err = Math.abs(gut.cx - want);
+        detail.push(`v${i}.${j} ${err.toFixed(2)}`);
+        if (err > 1) ok = false;
+      }
+      const next = first + c;
+      if (g.counts[i + 1] != null) {
+        const bottom = Math.max(...ts.slice(first, next).map((t) => t.b));
+        const top = Math.min(...ts.slice(next, next + g.counts[i + 1]).map((t) => t.y));
+        const gut = gs.find((x) => x.id === `h${i}`);
+        const err = Math.abs(gut.cy - (bottom + top) / 2);
+        detail.push(`h${i} ${err.toFixed(2)}`);
+        if (err > 1) ok = false;
+      }
+      first = next;
+    });
+    return { ok, detail: detail.join(" ") };
+  };
+  let mid = await midOk();
+  check(mid.ok, "every bar sits midway between the two visible pictures (letterboxed pictures included)", mid.detail);
+  // drag the first vertical bar 60 px: it follows the pointer 1:1 and stays blue for the whole drag
+  const gA = G0.find((x) => x.id === "v0.0");
+  let during = null;
+  await drag(P, gA.cx, gA.cy, 60, 0, {
+    steps: 12,
+    mid: async () => {
+      await sleep(300); // past the 120 ms fade of the other bars
+      during = [];
+      const all = await guts(P);
+      for (let i = 0; i < all.length; i++) during.push(`${all[i].id}:${await gutColor(P, i)}`);
+    },
+  });
+  const gB = (await guts(P)).find((x) => x.id === "v0.0");
+  near(gB.cx - gA.cx, 60, 1.5, "a dragged bar moves with the pointer (drag 60 px, the bar moves 60 px)");
+  check(during && during.find((s) => s.startsWith("v0.0")).endsWith(BLUE) && during.filter((s) => !s.startsWith("v0.0")).every((s) => s.endsWith(CLEAR)), "during the drag the dragged bar is blue and the others are hidden", (during || []).join(" | "));
+  await shot(P, "04_bar_dragged");
+  mid = await midOk();
+  check(mid.ok, "after the drag the bars are still midway between the pictures", mid.detail);
+  await drag(P, gB.cx, gB.cy, -60, 0);
+  near(((await guts(P)).find((x) => x.id === "v0.0")).cx, gA.cx, 1.5, "and -60 px moves it back");
+  // far past the limit: it stops at the limit (12 % of the pair), it never crosses
+  const gC = (await guts(P)).find((x) => x.id === "v0.0");
+  await drag(P, gC.cx, gC.cy, 4000, 0, { steps: 6 });
+  const gl = await grid();
+  near(Math.min(...gl.colFr[0]), 0.12, 0.01, "dragged far past the end, the bar stops at the limit");
+  const mid2 = await midOk();
+  check(mid2.ok, "at the limit the bars are still midway", mid2.detail);
+  // double-click a bar: an even grid again
+  const gD = (await guts(P)).find((x) => x.id === "v0.0");
+  await move(P, gD.cx, gD.cy);
+  await P.dblclick({ js: `document.querySelector('.arena > .gut[data-bar="v0.0"]')` });
+  await sleep(200);
+  const ge = await grid();
+  near(ge.colFr[0][0], 1 / ge.counts[0], 0.001, "a double-click on a bar evens the grid out");
+  // horizontal bar drag
+  const hbar = (await guts(P)).find((x) => x.id === "h0");
+  await drag(P, hbar.cx + 40, hbar.cy, 0, 40);
+  near(((await guts(P)).find((x) => x.id === "h0")).cy - hbar.cy, 40, 1.5, "a horizontal bar follows the pointer 1:1 too");
+  await drag(P, hbar.cx + 40, hbar.cy + 40, 0, -40);
+  // reorder: drag a tile onto another, they swap on release
+  const ord0 = await P.eval(`__sss.vg(${JSON.stringify(await viewKey())}).order`);
+  const t0 = (await tiles(P))[0];
+  const t1 = (await tiles(P))[1];
+  let dropSeen = false;
+  await drag(P, t0.cx, t0.cy, t1.cx - t0.cx, t1.cy - t0.cy, { steps: 14, mid: async () => {} });
+  const ord1 = await P.eval(`__sss.vg(${JSON.stringify(await viewKey())}).order`);
+  check(ord1[0] === ord0[1] && ord1[1] === ord0[0], "dragging a tile onto another swaps them on release", JSON.stringify(ord1));
+  const t0b = (await tiles(P))[0];
+  near(t0b.cx, t1.cx, 1, "the dragged tile took the other's place");
+  await drag(P, t0b.cx, t0b.cy, t0.cx - t1.cx, t0.cy - t1.cy); // and back
+  await sleep(100);
+
+  /* ============================== Crop ============================== */
+  section("Crop");
+  await setLayout("crop");
+  await sleep(200);
+  await shot(P, "05_crop");
+  const cropOk = await P.eval(`[...document.querySelectorAll('.arena.crop > .st-tile')].every((t) => { const v = t.querySelector('.vid').getBoundingClientRect(); const r = t.getBoundingClientRect(); return v.width >= r.width - 1 && v.height >= r.height - 1; })`);
+  check(cropOk, "Crop fills every cell: the picture is at least as big as its cell (edges cropped around the centre)");
+  const cg = await guts(P);
+  const ct = await tiles(P);
+  const cgrid = await grid();
+  let cmid = true;
+  let first = 0;
+  cgrid.counts.forEach((c, i) => {
+    for (let j = 0; j < c - 1; j++) {
+      const gut = cg.find((x) => x.id === `v${i}.${j}`);
+      if (Math.abs(gut.cx - (ct[first + j].r + ct[first + j + 1].x) / 2) > 1) cmid = false;
+    }
+    first += c;
+  });
+  check(cmid, "in Crop the bars are in the middle of the gap between the cells");
+  const cv = cg.find((x) => x.id === "v0.0");
+  await drag(P, cv.cx, cv.cy, 60, 0);
+  near(((await guts(P)).find((x) => x.id === "v0.0")).cx - cv.cx, 60, 1.5, "a dragged bar follows the pointer 1:1 in Crop too");
+  await P.dblclick({ js: `document.querySelector('.arena > .gut[data-bar="v0.0"]')` });
+
+  /* ============================== Floating ============================== */
+  section("Floating");
+  await setLayout("float");
+  await sleep(200);
+  await shot(P, "06_float");
+  const ratios = await P.eval(`[...document.querySelectorAll('.arena.float > .st-tile')].map((t) => { const r = t.getBoundingClientRect(); const c = t._it && (t._it.kind === "video" ? t._it.w.canvas : null); return { ratio: r.width / r.height, want: c ? c.width / c.height : null, ar: parseFloat(t.style.getPropertyValue("--ar")) }; })`);
+  check(ratios.every((x) => Math.abs(x.ratio - x.ar) < 0.01) && ratios.some((x) => x.want && Math.abs(x.ratio - x.want) < 0.01), "a window has the aspect ratio of its content, also coming from Crop: no black bars", JSON.stringify(ratios.map((x) => +x.ratio.toFixed(3))));
+  check(await P.eval("!document.querySelector('.arena.float > .gut')"), "no resize bars in Floating");
+  const f0 = (await tiles(P))[0];
+  const ar0 = f0.w / f0.h;
+  await drag(P, f0.cx, f0.cy, 120, 90);
+  const f1 = (await tiles(P))[0];
+  near(f1.x - f0.x, 120, 1.5, "a floating window moves exactly with the pointer (x)");
+  near(f1.y - f0.y, 90, 1.5, "a floating window moves exactly with the pointer (y)");
+  // a window whose corner grip is free (the others overlap): the element under the grip's centre is its own .rz
+  const freeGrip = async () => {
+    const n = (await tiles(P)).length;
+    for (let i = 0; i < n; i++) {
+      const g = await P.eval(`(() => { const t = document.querySelectorAll('.arena.float > .st-tile')[${i}]; const r = t.getBoundingClientRect(); const x = r.right - 6, y = r.bottom - 6; const e = document.elementFromPoint(x, y); return e && e.classList.contains('rz') && t.contains(e) ? { x, y, i: ${i}, w: r.width, h: r.height } : null; })()`);
+      if (g) return g;
+    }
+    return null;
+  };
+  let g1 = await freeGrip();
+  check(!!g1, "a floating window has a free corner grip", JSON.stringify(g1));
+  const ar0b = g1.w / g1.h;
+  await drag(P, g1.x, g1.y, -100, 0);
+  let t2 = (await tiles(P))[g1.i];
+  check(t2.w < g1.w - 10, "corner resize: moving only left shrinks the window", `${g1.w.toFixed(0)} -> ${t2.w.toFixed(0)}`);
+  near(t2.w / t2.h, ar0b, 0.01, "the window keeps its ratio");
+  g1 = await freeGrip();
+  const w2 = (await tiles(P))[g1.i].w;
+  await drag(P, g1.x, g1.y, 0, -80);
+  let t3 = (await tiles(P))[g1.i];
+  check(t3.w < w2 - 10, "moving only up shrinks it too", `${w2.toFixed(0)} -> ${t3.w.toFixed(0)}`);
+  g1 = await freeGrip();
+  const w3 = (await tiles(P))[g1.i].w;
+  await drag(P, g1.x, g1.y, 80, 80);
+  let t4 = (await tiles(P))[g1.i];
+  check(t4.w > w3 + 30, "pulling the corner right and down grows it", `${w3.toFixed(0)} -> ${t4.w.toFixed(0)}`);
+  near(t4.w / t4.h, ar0b, 0.01, "still the same ratio after growing");
+  const ar2 = await rect(P, ".arena");
+  const t5 = (await tiles(P))[1];
+  await drag(P, t5.cx, t5.cy, 5000, 5000, { steps: 8 });
+  const t5b = (await tiles(P))[1];
+  check(t5b.r <= ar2.r + 1 && t5b.b <= ar2.b + 1, "a window stops at the stage edge", `${t5b.r.toFixed(0)}/${ar2.r.toFixed(0)}`);
+  // press raises: the pressed window ends up on top
+  const t6 = (await tiles(P))[0];
+  await move(P, t6.cx, t6.cy);
+  await press(P, t6.cx, t6.cy);
+  await release(P, t6.cx, t6.cy);
+  const zs = await P.eval(`[...document.querySelectorAll('.arena.float > .st-tile')].map((t) => Number(t.style.zIndex))`);
+  check(zs[0] === Math.max(...zs), "pressing a window raises it", JSON.stringify(zs));
+  await setLayout("split");
+  await sleep(200);
+
+  /* ============================== overlays ============================== */
+  section("tile overlays: buttons, stats, names");
+  const vt = (await tiles(P))[0];
+  await move(P, 4, 4);
+  await sleep(250);
+  check((await css(P, ".arena > .st-tile .tools", "opacity", null, 0)) === "0" && (await css(P, ".arena > .st-tile .tag", "opacity", null, 0)) === "0", "not hovered: no buttons and no name tag");
+  await move(P, vt.cx, vt.cy);
+  await sleep(300);
+  check((await css(P, ".arena > .st-tile .tools", "opacity", null, 0)) === "1" && (await css(P, ".arena > .st-tile .tag", "opacity", null, 0)) === "1", "hovered: the buttons and the name tag show");
+  await shot(P, "07_hover");
+  // Show stats on the stream (the tile menu's switch): numbers only while hovered, in reserved slots, no jitter
+  await P.click({ js: `document.querySelectorAll('.arena > .st-tile')[0].querySelector('.tools .round-btn:last-child')` });
+  await P.waitFor("document.querySelector('.menu.m-tile')", { what: "stream menu" });
+  const menuItems = await P.eval(`[...document.querySelectorAll('.menu.m-tile .mi')].map((e) => e.innerText.replace(/\\s+/g, ' ').trim())`);
+  check(["Show stats", "Pop out", "Fullscreen", "Stop watching"].every((x) => menuItems.some((m) => m.includes(x))) && menuItems.some((m) => /Level loudness/.test(m)), "the stream menu: volume, level loudness, stats, pop out, fullscreen, stop watching", JSON.stringify(menuItems));
+  await P.click({ js: `[...document.querySelectorAll('.menu.m-tile .mi')].find((e) => /Show stats/.test(e.innerText))` });
+  await sleep(150);
+  await closeMenu();
+  const vt2 = (await tiles(P))[0];
+  await move(P, 4, 4);
+  await sleep(250);
+  check((await P.eval(`document.querySelectorAll('.arena > .st-tile')[0].querySelectorAll('.tag .v').length`)) === 3 && (await css(P, ".arena > .st-tile .tag .v.fps", "display", null, 0)) === "none", "Show stats: the numbers are in the tag, hidden while the tile is not hovered");
+  await move(P, vt2.cx, vt2.cy);
+  await sleep(300);
+  check((await css(P, ".arena > .st-tile .tag .v.fps", "display", null, 0)) !== "none", "and shown while it is hovered");
+  const tagW = [];
+  const texts = [];
+  for (const st of [{ decodedFps: 5, width: 640, height: 480, bitrateKbps: 95 }, { decodedFps: 59, width: 1920, height: 1080, bitrateKbps: 6200 }, { decodedFps: 144, width: 3840, height: 2160, bitrateKbps: 10500 }, { decodedFps: 240, width: 9999, height: 9999, bitrateKbps: 99900 }]) {
+    await P.eval(`(() => { const w = [...__sss.S.rooms[0].watches.values()].find((x) => x.canvas === document.querySelectorAll('.arena > .st-tile')[0]._it.w.canvas); w.stats = Object.assign({}, w.stats, ${JSON.stringify(st)}); window.dispatchEvent(new CustomEvent("sss-stats")); })()`);
+    await sleep(60);
+    tagW.push((await rect(P, ".arena > .st-tile:nth-child(1) .tag")).w);
+    texts.push(await P.eval(`document.querySelectorAll('.arena > .st-tile')[0].querySelector('.tag').innerText.replace(/\\s+/g, ' ')`));
+  }
+  check(tagW.every((w) => Math.abs(w - tagW[0]) < 0.6), "the stats pill is exactly as wide for 5 fps / 59 fps / 144 fps / 240 fps and 640x480 ... 9999x9999 (no jitter)", tagW.map((w) => w.toFixed(1)).join(" "));
+  check(await P.eval(`(() => { const tg = document.querySelectorAll('.arena > .st-tile')[0].querySelector('.tag'); return tg.scrollWidth <= tg.clientWidth + 1; })()`), "the pill's background is as wide as its content (nothing overflows it)", texts[3]);
+  await shot(P, "08_stats");
+  await move(P, 4, 4);
+  await sleep(300);
+  check((await css(P, ".arena > .st-tile .tag .v.fps", "display", null, 0)) === "none", "unhovered again: the stats are gone");
+  // a narrow tile drops what does not fit, the resolution first, then the rate (native stats_fields); a wide one shows all three
+  const wide = await P.eval(`document.querySelectorAll('.arena > .st-tile')[0].querySelector('.tag').dataset.fit`);
+  const narrowI = await P.eval(`(() => { const w = [...document.querySelectorAll('.arena > .st-tile')].map((t) => t.getBoundingClientRect().width); return w.indexOf(Math.min(...w)); })()`);
+  await P.eval(`(() => { const it = document.querySelectorAll('.arena > .st-tile')[${narrowI}]._it; __sss.S.stage.stats.add(it.id); __sss.render(); })()`);
+  await sleep(300);
+  const narrow = await P.eval(`(() => { const t = document.querySelectorAll('.arena > .st-tile')[${narrowI}]; const tg = t.querySelector('.tag'); return { fit: tg.dataset.fit, w: t.getBoundingClientRect().width, tag: tg.getBoundingClientRect().width }; })()`);
+  check(wide === "all" && narrow.fit !== "all" && narrow.tag <= narrow.w, "a wide tile shows resolution, fps and rate; a narrow one drops numbers (resolution first) and its pill still fits", `wide ${wide}, ${narrow.w.toFixed(0)} px wide -> ${narrow.fit}, pill ${narrow.tag.toFixed(0)} px`);
+  await P.eval(`(() => { const it = document.querySelectorAll('.arena > .st-tile')[${narrowI}]._it; __sss.S.stage.stats.delete(it.id); __sss.render(); })()`);
+  // Always show names (Layout menu): the name tag stays without hovering, the buttons and stats never do
+  await openLayoutMenu();
+  await layoutItem("/Always show names/");
+  await closeMenu();
+  await move(P, 4, 4);
+  await sleep(300);
+  check((await css(P, ".arena > .st-tile .tag", "opacity", null, 2)) === "1" && (await css(P, ".arena > .st-tile .tools", "opacity", null, 2)) === "0", "Always show names: the tag stays, the buttons do not");
+  check((await css(P, ".arena > .st-tile .tag .v.fps", "display", null, 0)) === "none", "and the stats still need a hover");
+  await openLayoutMenu();
+  await layoutItem("/Always show names/");
+  await closeMenu();
+  // Hide my own streams: your own screen leaves your stage, others still see it
+  check((await P.eval("document.querySelectorAll('.st-tile.mine').length")) === 1, "Vera's own tile is on her stage");
+  await openLayoutMenu();
+  await layoutItem("/Hide my own streams/");
+  await closeMenu();
+  check((await P.eval("document.querySelectorAll('.st-tile.mine').length")) === 0 && (await P.eval("document.querySelectorAll('.arena > .st-tile').length")) === 3, "Hide my own streams: her screen is gone from her stage");
+  await L.sleep(500);
+  await A.page.eval("1");
+  await L.watchFirst(A.page).catch(() => {});
+  check((await A.page.eval(`!!__sss.S.rooms[0].streams.find((s) => s.ownerName === "Vera")`)), "others still see her stream (Alice's roster holds it)");
+  await openLayoutMenu();
+  await layoutItem("/Hide my own streams/");
+  await closeMenu();
+  check((await P.eval("document.querySelectorAll('.st-tile.mine').length")) === 1, "turned off again, her tile is back");
+
+  /* ============================== strip + hover card ============================== */
+  section("people strip and hover card");
+  await P.eval(`(() => { const r = __sss.S.rooms[0]; const bob = [...r.watches.values()].find((w) => w.ownerName === "Bob"); window.__setMuted = (m) => { bob.muted = m; r.client.setMuted(bob.key, m); __sss.render(); }; window.__setMuted(true); })()`);
+  await sleep(200);
+  const pvs = await rects(P, ".strip .pv");
+  const lines = await P.eval(`[...document.querySelectorAll('.strip .pv')].map((p) => { const a = p.querySelector('.avatar').getBoundingClientRect(); const n = p.querySelector('.nm').getBoundingClientRect(); const l = p.querySelector('.lv'); const lr = l && l.getBoundingClientRect(); return { user: p.dataset.user, ax: a.x + a.width / 2, nx: n.x + n.width / 2, lx: lr ? lr.x + lr.width / 2 : null, audible: p.classList.contains('audible'), w: a.width, h: a.height }; })`);
+  check(lines.length === 4 && lines.every((l) => Math.abs(l.ax - l.nx) < 0.6 && (l.lx == null || Math.abs(l.ax - l.lx) < 0.6)), "ring, avatar, LIVE badge and name share one centre line", lines.map((l) => `${l.user}:${(l.ax - l.nx).toFixed(2)}/${l.lx == null ? "-" : (l.ax - l.lx).toFixed(2)}`).join(" "));
+  check(lines.some((l) => l.audible) && lines.some((l) => !l.audible && l.user === "Bob"), "with and without audio: Alice and Carol have the ring, muted Bob has none", lines.map((l) => `${l.user}:${l.audible}`).join(" "));
+  const ring = await P.eval(`(() => { const a = document.querySelector('.pv.audible .avatar'); const cs = getComputedStyle(a, '::before'); return { top: cs.top, left: cs.left, right: cs.right, bottom: cs.bottom, bw: cs.borderTopWidth, br: cs.borderRadius, w: cs.width, h: cs.height }; })()`);
+  check(ring.top === "-4px" && ring.left === "-4px" && ring.right === "-4px" && ring.bottom === "-4px" && ring.bw === "2px" && ring.w === ring.h, "the ring is one even 2 px circle, 4 px outside the avatar all round", JSON.stringify(ring));
+  await shot(P, "09_strip");
+  // the hover card: the same for everyone who shares, one row per stream, each saying Audio / No audio
+  const cardOf = async (user) => {
+    const pv = (await rects(P, ".strip .pv")).find((r) => r.id === user);
+    const av = await P.eval(`(() => { const r = [...document.querySelectorAll('.strip .pv')].find((p) => p.dataset.user === ${JSON.stringify(user)}).querySelector('.avatar').getBoundingClientRect(); return { x: r.x, y: r.y, r: r.right, b: r.bottom, cx: r.x + r.width / 2, cy: r.y + r.height / 2 }; })()`);
+    await move(P, 3, 3);
+    await sleep(120);
+    await move(P, av.cx, av.cy);
+    await P.waitFor(`[...document.querySelectorAll('.utip .hd b')].some((b) => b.innerText === ${JSON.stringify(user === "Vera" ? "You" : user)})`, { what: `card of ${user}` });
+    return { av, pv, card: await P.eval(`(() => { const c = document.querySelector('.utip'); return { n: document.querySelectorAll('.utip').length, rows: [...c.querySelectorAll('.ust')].map((r) => ({ label: r.querySelector('.l1 .txt').innerText, audio: [...r.querySelector('.au').childNodes].filter((n) => n.nodeType === 3).map((n) => n.textContent).join('').trim(), l2: r.querySelector('.l2').innerText, l3: r.querySelector('.l3').innerText.trim() })), badge: !!c.querySelector('.badge-live'), sub: c.querySelector('.hd small').innerText }; })()` ) };
+  };
+  const cards = {};
+  for (const u of ["Alice", "Bob", "Vera"]) cards[u] = await cardOf(u);
+  check(["Alice", "Bob", "Vera"].every((u) => cards[u].card.n === 1 && cards[u].card.rows.length === 1 && cards[u].card.badge), "everyone who shares gets the same hover card: a LIVE badge and one row per stream", JSON.stringify(Object.values(cards).map((c) => c.card.rows.length)));
+  check(cards.Alice.card.rows[0].audio === "Audio" && cards.Bob.card.rows[0].audio === "Audio", "a stream whose sender shares audio says Audio (Alice, Bob: the muted viewer does not change what the sender shares)", JSON.stringify([cards.Alice.card.rows[0].audio, cards.Bob.card.rows[0].audio]));
+  check(cards.Vera.card.rows[0].audio === "No audio", "her own stream, which has no audio, says No audio: every row says one of the two", cards.Vera.card.rows[0].audio);
+  check(/1920|960×540|×/.test(cards.Alice.card.rows[0].l2) && /On the stage/.test(cards.Alice.card.rows[0].l3) && /Your stream/.test(cards.Vera.card.rows[0].l3), "the numbers and the state per row (On the stage / Your stream)", JSON.stringify([cards.Alice.card.rows[0].l2, cards.Alice.card.rows[0].l3, cards.Vera.card.rows[0].l3]));
+  await shot(P, "10_card");
+  // the keep zone: the card, the avatar and the gap straight above it keep it open; the neighbours' avatars do not
+  const al = await cardOf("Alice");
+  const cardRect = await rect(P, ".utip");
+  await move(P, al.av.cx, (cardRect.b + al.av.y) / 2);
+  await sleep(150);
+  check(await P.eval(`document.querySelectorAll('.utip').length === 1 && document.querySelector('.utip .hd b').innerText === "Alice"`), "the gap straight above the avatar keeps the card open");
+  await move(P, cardRect.cx, cardRect.cy);
+  await sleep(150);
+  check(await P.eval(`document.querySelectorAll('.utip').length === 1 && document.querySelector('.utip .hd b').innerText === "Alice"`), "the card itself keeps it open");
+  const pvAll = await rects(P, ".strip .pv");
+  const idx = pvAll.findIndex((r) => r.id === "Alice");
+  const nbI = idx + 1 < pvAll.length ? idx + 1 : idx - 1;
+  const nbAv = await P.eval(`(() => { const r = document.querySelectorAll('.strip .pv')[${nbI}].querySelector('.avatar').getBoundingClientRect(); return { cx: r.x + r.width / 2, cy: r.y + r.height / 2 }; })()`);
+  await move(P, nbAv.cx, nbAv.cy);
+  await sleep(250);
+  const stacked = await P.eval(`({ n: document.querySelectorAll('.utip').length, who: document.querySelector('.utip .hd b')?.innerText })`);
+  check(stacked.n === 1 && stacked.who !== "Alice", "moving onto the neighbour's avatar swaps the card: exactly one card, never stacked", JSON.stringify(stacked));
+  await move(P, 4, 4);
+  await sleep(250);
+  check((await P.eval("document.querySelectorAll('.utip').length")) === 0, "pointer away: the card closes");
+  // a popped-out stream shows only on its owner's avatar and comes back from there
+  await move(P, 4, 4);
+  const aliceTile = (await P.eval(`(() => { const ts = [...document.querySelectorAll('.arena > .st-tile')]; const i = ts.findIndex((t) => t._it && t._it.owner === "Alice"); return i; })()`));
+  const at = (await tiles(P))[aliceTile];
+  await move(P, at.cx, at.cy);
+  await sleep(250);
+  await P.click({ js: `document.querySelectorAll('.arena > .st-tile')[${aliceTile}].querySelector('.tools .round-btn')` });
+  await P.waitFor(`[...__sss.S.rooms[0].watches.values()].some((w) => w.ownerName === "Alice" && w.popped)`, { timeout: 10000, what: "Alice popped out" });
+  await sleep(300);
+  const popState = await P.eval(`({ tiles: document.querySelectorAll('.arena > .st-tile').length, popped: [...document.querySelectorAll('.pv.popped')].map((p) => p.dataset.user), badges: [...document.querySelectorAll('.pv .pop')].length })`);
+  check(popState.tiles === 3 && JSON.stringify(popState.popped) === '["Alice"]' && popState.badges === 1, "a popped-out stream is off the stage and shows only on its owner's avatar", JSON.stringify(popState));
+  const alAv = await P.eval(`(() => { const r = document.querySelector('.pv.popped .avatar').getBoundingClientRect(); return { cx: r.x + r.width / 2, cy: r.y + r.height / 2 }; })()`);
+  await move(P, alAv.cx, alAv.cy);
+  await P.waitFor("document.querySelector('.utip .back')", { what: "Bring back in the card" });
+  check(/Popped out/.test(await P.eval("document.querySelector('.utip').innerText")), "its hover card says Popped out and offers Bring back");
+  await shot(P, "11_popped");
+  await P.click(".utip .back");
+  await P.waitFor(`![...__sss.S.rooms[0].watches.values()].some((w) => w.popped) && document.querySelectorAll('.arena > .st-tile').length === 4`, { what: "brought back from the card" });
+  check(true, "Bring back in the card returns the stream to the stage");
+  // and again, back by clicking the avatar
+  const at2 = (await tiles(P))[aliceTile];
+  await move(P, at2.cx, at2.cy);
+  await sleep(250);
+  await P.click({ js: `document.querySelectorAll('.arena > .st-tile')[${aliceTile}].querySelector('.tools .round-btn')` });
+  await P.waitFor(`[...__sss.S.rooms[0].watches.values()].some((w) => w.ownerName === "Alice" && w.popped)`, { what: "popped again" });
+  await sleep(300);
+  await P.click(".pv.popped");
+  await P.waitFor(`![...__sss.S.rooms[0].watches.values()].some((w) => w.popped) && document.querySelectorAll('.arena > .st-tile').length === 4`, { what: "brought back from the avatar" });
+  check(true, "clicking its owner's avatar brings it back too");
+  await move(P, 4, 4);
+
+  /* ============================== stream menu: volume ============================== */
+  section("stream menu: volume, wheel");
+  await P.eval("window.__setMuted(false)");
+  const bt = (await tiles(P))[1];
+  await rightClick(P, bt.cx, bt.cy);
+  await P.waitFor("document.querySelector('.menu.m-tile input.vol')", { what: "volume row via right click" });
+  check(true, "a right click on a tile opens the stream menu");
+  const sl = await rect(P, ".menu.m-tile input.vol");
+  const volOf = () => P.eval(`Math.round([...__sss.S.rooms[0].watches.values()].find((w) => w.ownerName === "Bob").vol * 100)`);
+  const v0 = await volOf();
+  // pointer down on the slider thumb area, drag right, read the volume BEFORE the release
+  const thumbX = sl.x + 7 + (sl.w - 14) * (v0 / 500);
+  await move(P, thumbX, sl.cy);
+  await press(P, thumbX, sl.cy);
+  await mouse(P, "mouseMoved", thumbX + 40, sl.cy, { button: "left", buttons: 1 });
+  await mouse(P, "mouseMoved", thumbX + 80, sl.cy, { button: "left", buttons: 1 });
+  await sleep(120);
+  const vDuring = await volOf();
+  await release(P, thumbX + 80, sl.cy);
+  check(vDuring > v0, "the volume slider acts during the drag, not on release", `${v0} -> ${vDuring} while the button is still down`);
+  // the wheel: 5 % a notch up to 200 %, 10 % above
+  const setVol = async (v) => {
+    await P.eval(`(() => { const s = document.querySelector('.menu.m-tile input.vol'); s.value = "${v}"; s.dispatchEvent(new Event("input", { bubbles: true })); })()`);
+  };
+  const seen = [];
+  const slr = await rect(P, ".menu.m-tile input.vol");
+  await move(P, slr.cx, slr.cy);
+  for (const [from, dir] of [[190, -100], [195, -100], [200, -100], [210, 100], [100, -100]]) {
+    await setVol(from);
+    await sleep(40);
+    await wheel(P, slr.cx, slr.cy, dir);
+    await sleep(80);
+    seen.push([from, dir < 0 ? "up" : "down", await volOf()]);
+  }
+  check(JSON.stringify(seen.map((s) => s[2])) === JSON.stringify([195, 200, 210, 200, 105]), "scrolling on a volume slider: 5 % a notch up to 200 %, 10 % above, symmetric downwards", JSON.stringify(seen));
+  await closeMenu();
+
+  /* ============================== menus and dropdowns ============================== */
+  section("menus: the app's own style, no native select");
+  await openLayoutMenu();
+  const lay = await P.eval(`({ items: [...document.querySelectorAll('.menu.m-layout .mi')].map((e) => ({ t: e.innerText.replace(/\\s+/g, ' ').trim(), icon: !!e.querySelector('.ms'), two: e.classList.contains('two'), sub: !!e.querySelector('small') })), on: [...document.querySelectorAll('.menu.m-layout .mi.on')].map((e) => e.innerText.trim().split(/\\s+/).slice(-3).join(' ')), pip: (() => { const c = [...document.querySelectorAll('.menu.m-layout .cbx')].find((e) => /Webcam in picture/.test(e.innerText)); return c ? c.classList.contains('disabled') : null; })() })`);
+  check(lay.items.slice(0, 3).every((i) => i.icon && i.two && i.sub) && lay.items.length === 4 && lay.pip === true, "Layout menu: Split / Crop / Floating with icons and sub-lines, a disabled Webcam in picture, Always show names, Hide my own streams, Reset", JSON.stringify(lay.items.map((i) => i.t)));
+  await shot(P, "12_layout_menu");
+  await closeMenu();
+  await P.click("#btn-share");
+  await P.waitFor("document.querySelector('.modal')", { what: "stream settings (live)" });
+  const modal = await P.eval(`({ titles: [...document.querySelectorAll('.modal .section-label')].map((e) => e.innerText.replace(/\\d+$/, '').trim()), selects: document.querySelectorAll('select').length, change: !!document.querySelector('#btn-change-source'), dd: document.querySelector('#st-fps')?.className })`);
+  check(["SOURCE", "COMPRESSION", "VIDEO"].every((x) => modal.titles.some((t) => t.toUpperCase().startsWith(x))) && modal.change, "stream settings (live): Source with Change source, Compression (Codec, Bitrate), Video (FPS, Preset)", JSON.stringify(modal.titles));
+  check(modal.selects === 0 && /field dd/.test(modal.dd), "no native <select> anywhere: the FPS field is the app's own dropdown", `${modal.selects} selects`);
+  await P.click("#st-fps");
+  await P.waitFor("document.querySelector('.menu.m-dd')", { what: "fps dropdown" });
+  const dd = await P.eval(`(() => { const f = document.querySelector('#st-fps').getBoundingClientRect(); const m = document.querySelector('.menu.m-dd').getBoundingClientRect(); return { fw: f.width, mw: m.width, below: m.top - f.bottom, left: m.left - f.left, items: document.querySelectorAll('.menu.m-dd .mi').length, checked: document.querySelectorAll('.menu.m-dd .mi.on').length }; })()`);
+  check(Math.abs(dd.fw - dd.mw) < 1.5 && dd.below >= 0 && dd.below < 12 && Math.abs(dd.left) < 1.5 && dd.items === 8 && dd.checked === 1, "a dropdown opens under its field, as wide as it, current value checked", JSON.stringify(dd));
+  await shot(P, "13_dropdown");
+  await key(P, "Escape");
+  check(await P.eval("!document.querySelector('.menu.m-dd') && !!document.querySelector('.modal')"), "Escape in a dropdown closes the dropdown, not the modal under it");
+  // presets: Text / Quality / Gaming set the FPS once; changing the FPS keeps the preset's mode and keyframe
+  const cap = () => P.eval(`document.querySelector('#preset-cap').innerText`);
+  await P.click({ text: "Text", sel: ".modal .seg button" });
+  await sleep(500);
+  check((await cap()) === "15 FPS · Quality encoding · Keyframe 250 ms" && (await P.eval(`document.querySelector('#st-fps .txt').innerText`)) === "15 fps", "Text: 15 fps, Quality encoding, keyframe 250 ms", await cap());
+  await P.click("#st-fps");
+  await P.click({ js: `[...document.querySelectorAll('.menu.m-dd .mi')].find((e) => e.innerText.trim() === "30 fps")` });
+  await sleep(500);
+  check((await cap()) === "30 FPS · Quality encoding · Keyframe 250 ms" && (await P.eval(`document.querySelector('.modal .seg button.on')?.innerText`)) !== undefined, "changing the FPS by hand keeps the preset's mode and keyframe", await cap());
+  await P.click({ text: "Gaming", sel: ".modal .seg button" });
+  await sleep(500);
+  check((await cap()) === "120 FPS · Performance encoding · Keyframe 250 ms", "Gaming: 120 fps, Performance encoding, keyframe 250 ms", await cap());
+  check(!/custom/i.test(await cap()), "the caption never says (custom)");
+  await P.click({ text: "Quality", sel: ".modal .seg button" });
+  await sleep(400);
+  check((await cap()) === "60 FPS · Quality encoding · Keyframe 1000 ms", "Quality: 60 fps, Quality encoding, keyframe 1000 ms", await cap());
+  await P.click({ text: "Done", sel: ".modal-foot button" });
+  await sleep(300);
+  await P.waitFor("__sss.S.captures.every((c) => c.dests.size && [...c.dests.values()].every((d) => d.state === 'live'))", { timeout: 20000, what: "live again after restarts" });
+
+  /* ============================== change source while live ============================== */
+  section("Change source while live");
+  const idBefore = await P.eval("__sss.S.captures[0].video.id");
+  await P.eval(`(async () => { const { makePatternSource } = await import("${L.BASE}dev/pattern.js"); const src = makePatternSource(640, 360, 15, { audio: false }); document.body.lastElementChild.style.cssText = "position:fixed;left:-9999px;width:8px;height:8px"; window.__nextSrc = src; navigator.mediaDevices.getDisplayMedia = async () => src.stream; })()`);
+  await P.click("#btn-share");
+  await P.waitFor("document.querySelector('#btn-change-source')", { what: "modal" });
+  await P.click("#btn-change-source");
+  await P.waitFor(`__sss.S.captures[0].video.id !== ${JSON.stringify(idBefore)}`, { timeout: 15000, what: "new source" });
+  await P.waitFor("__sss.S.captures.every((c) => c.dests.size && [...c.dests.values()].every((d) => d.state === 'live'))", { timeout: 20000, what: "live on the new source" });
+  check(true, "Change source while live: the share carries on with the new source", `${idBefore} -> ${await P.eval("__sss.S.captures[0].video.id")}`);
+  await P.click({ text: "Done", sel: ".modal-foot button" });
+  await sleep(300);
+  // the Share menu: FPS and preset for the live destination
+  await P.click("#btn-share ~ .caret");
+  await P.waitFor("document.querySelector('.menu.m-share')", { what: "share menu" });
+  const sm = await P.eval(`({ head: document.querySelector('.menu.m-share .mh').innerText.replace(/\\s+/g, ' '), fps: document.querySelectorAll('.menu.m-share .seg.dense button').length, presets: [...document.querySelectorAll('.menu.m-share .seg:not(.dense) button')].map((b) => b.innerText), items: [...document.querySelectorAll('.menu.m-share .mi')].map((e) => e.innerText.replace(/\\s+/g, ' ').trim()) })`);
+  check(sm.fps === 8 && JSON.stringify(sm.presets) === '["Text","Quality","Gaming"]' && sm.items.some((i) => /Change source/.test(i)) && sm.items.some((i) => /Stop sharing/.test(i)) && /Live/i.test(sm.head), "the Share menu: header, FPS, Preset, Change source, All stream settings, Stop sharing", JSON.stringify(sm));
+  await shot(P, "14_share_menu");
+  await closeMenu();
+  await P.click("#btn-room");
+  await P.waitFor("document.querySelector('.menu.m-room')", { what: "room menu" });
+  const rm = await P.eval(`[...document.querySelectorAll('.menu.m-room .mi')].map((e) => e.innerText.replace(/\\s+/g, ' ').trim())`);
+  check(["Auto-connect", "Rename", "Copy invite link", "Leave room", "Forget room"].every((x) => rm.some((m) => m.includes(x))), "the Room settings menu: Auto-connect, Rename, Copy invite link, Leave room, Forget room", JSON.stringify(rm));
+  // a second click on the opener closes it again
+  await P.click("#btn-room");
+  await sleep(150);
+  check(await P.eval("!document.querySelector('.menu')"), "a second click on the button that opened a menu closes it");
+
+  /* ============================== Watched view ============================== */
+  section("Watched streams");
+  await P.click({ text: "Watched streams", sel: ".p-row" });
+  await sleep(300);
+  const wv = await P.eval(`({ tiles: document.querySelectorAll('.arena > .st-tile').length, mine: document.querySelectorAll('.st-tile.mine').length, invite: !!document.querySelector('#btn-invite'), room: !!document.querySelector('#btn-room'), leave: !!document.querySelector('#btn-leave'), share: !!document.querySelector('#btn-share'), layout: !!document.querySelector('#btn-layout'), title: document.querySelector('#btn-share')?.title })`);
+  check(wv.tiles === 3 && wv.mine === 0 && !wv.invite && !wv.room && !wv.leave && wv.share && wv.layout, "Watched shows what you watch and nothing else: no Invite, Room settings or Leave, Share only while you share", JSON.stringify(wv));
+  await shot(P, "15_watched");
+  await P.click(".p-row.sel ~ .p-row, .p-row:not(.sel)");
+  await sleep(200);
+  await P.eval("__sss.S.view = 'room'; __sss.render()");
+
+  /* ============================== fullscreen auto-hide ============================== */
+  section("fullscreen: the bar and strip auto-hide");
+  await P.click("#btn-stagefs");
+  await P.waitFor("document.fullscreenElement === document.getElementById('app') && document.querySelector('.stagefs')", { what: "stage fullscreen" });
+  check(await P.eval("!document.querySelector('.p-side') && !document.querySelector('.p-head')"), "fullscreen draws only the stage (no sidebar, no header)");
+  await move(P, 600, 300);
+  await sleep(400);
+  const shown = async () => ({ bar: await css(P, ".ctlrow", "opacity"), strip: await css(P, ".stripwrap", "opacity"), tools: await css(P, ".arena > .st-tile .tools", "opacity") });
+  const tilesBefore = await tiles(P);
+  let s0 = await shown();
+  check(s0.bar === "1" && s0.strip === "1", "fullscreen: the bar and the strip show", JSON.stringify(s0));
+  await shot(P, "16_fullscreen");
+  // streams do not jump when the chrome fades
+  await sleep(3600);
+  s0 = await shown();
+  const tilesAfter = await tiles(P);
+  check(s0.bar === "0" && s0.strip === "0" && s0.tools === "0", "after 3 s without movement the bar, the strip and the tile buttons are gone", JSON.stringify(s0));
+  check(tilesBefore.length === tilesAfter.length && tilesBefore.every((t, i) => Math.abs(t.x - tilesAfter[i].x) < 0.5 && Math.abs(t.y - tilesAfter[i].y) < 0.5 && Math.abs(t.w - tilesAfter[i].w) < 0.5), "streams don't jump when the bar fades");
+  check((await css(P, ".stagefs", "cursor")) === "none", "the cursor goes with them");
+  await shot(P, "17_fullscreen_hidden");
+  await move(P, 640, 320);
+  await sleep(450);
+  s0 = await shown();
+  check(s0.bar === "1" && s0.strip === "1", "movement brings them back", JSON.stringify(s0));
+  await sleep(1500);
+  await move(P, 700, 330);
+  await sleep(1800);
+  s0 = await shown();
+  check(s0.bar === "1", "movement restarts the 3 s (still shown 1.8 s after the second move)", JSON.stringify(s0));
+  // the pointer leaves the stage: gone at once
+  await P.eval(`document.documentElement.dispatchEvent(new MouseEvent("mouseleave"))`);
+  await sleep(450);
+  s0 = await shown();
+  check(s0.bar === "0" && s0.strip === "0", "the pointer leaving the stage hides them at once", JSON.stringify(s0));
+  await move(P, 640, 320);
+  await sleep(450);
+  // a key press brings it back
+  await sleep(3500);
+  await key(P, "Shift");
+  await sleep(450);
+  check((await shown()).bar === "1", "a key press brings the bar back");
+  // a menu stops the timer; after it closes the bar gets a full 3 s
+  const lb = await rect(P, "#btn-layout");
+  await move(P, lb.cx, lb.cy);
+  await P.click("#btn-layout");
+  await P.waitFor("document.querySelector('.menu.m-layout')", { what: "menu in fullscreen" });
+  await sleep(4200);
+  s0 = await shown();
+  check(s0.bar === "1" && s0.strip === "1", "an open menu stops the timer (still shown after 4 s)", JSON.stringify(s0));
+  await key(P, "Escape");
+  await sleep(2000);
+  s0 = await shown();
+  check(s0.bar === "1", "2 s after the menu closed the bar is still there", JSON.stringify(s0));
+  await sleep(1700);
+  s0 = await shown();
+  check(s0.bar === "0", "and gone after a full 3 s", JSON.stringify(s0));
+  // a bar button over a resize bar keeps its clicks (found in the native client: the tall bar swallowed them)
+  await move(P, 640, 320);
+  await sleep(450);
+  const fg = await guts(P);
+  const cbs = await rects(P, ".ctlrow .cb");
+  const hit = [];
+  for (const g of fg) for (const b of cbs) {
+    const x0 = Math.max(g.x, b.x), x1 = Math.min(g.r, b.r), y0 = Math.max(g.y, b.y), y1 = Math.min(g.b, b.b);
+    if (x1 - x0 > 4 && y1 - y0 > 4) hit.push({ g: g.id, x: (x0 + x1) / 2, y: (y0 + y1) / 2 });
+  }
+  check(hit.length > 0, "in fullscreen a resize bar lies under bar buttons (the situation of the native bug)", `${hit.length} overlaps`);
+  const swallowed = await Promise.all(hit.map((p) => P.eval(`(() => { const e = document.elementFromPoint(${p.x}, ${p.y}); return !!(e && e.closest('.cb, .cgroup, .ctlrow')); })()`)));
+  check(swallowed.every(Boolean), "the buttons on top get the pointer, not the tall bar", JSON.stringify(swallowed));
+  if (hit.length) {
+    const lbx = await rect(P, "#btn-layout");
+    await move(P, lbx.cx, lbx.cy);
+    await P.click("#btn-layout");
+    check(await P.eval("!!document.querySelector('.menu.m-layout')"), "and a click on such a button works (Layout menu opens)");
+    await key(P, "Escape");
+  }
+  await P.eval("document.exitFullscreen()");
+  await P.waitFor("!document.fullscreenElement && document.querySelector('.p-side') && !__sss.S.stage.fullscreen", { what: "left fullscreen" });
+  check(true, "leaving fullscreen (Escape) brings the sidebar and header back");
+  await move(P, 700, 400);
+
+  /* ============================== emoji avatars ============================== */
+  section("emoji avatars");
+  const emojiOf = (page, user) => page.eval(`[...document.querySelectorAll('.strip .pv')].find((p) => p.dataset.user === ${JSON.stringify(user)})?.querySelector('.avatar .emo')?.innerText ?? null`);
+  const avBg = (page, user) => page.eval(`getComputedStyle([...document.querySelectorAll('.strip .pv')].find((p) => p.dataset.user === ${JSON.stringify(user)}).querySelector('.avatar')).backgroundImage`);
+  const hueOfBg = (bg) => {
+    const m = [...bg.matchAll(/rgb\((\d+), (\d+), (\d+)\)/g)][0];
+    const [r, g, b] = [+m[1], +m[2], +m[3]].map((x) => x / 255);
+    const hi = Math.max(r, g, b), lo = Math.min(r, g, b), d = hi - lo;
+    if (!d) return null;
+    const h = hi === r ? ((g - b) / d + 6) % 6 : hi === g ? (b - r) / d + 2 : (r - g) / d + 4;
+    return { h: h * 60, s: d / (1 - Math.abs(hi + lo - 1)) };
+  };
+  // Alice picks an emoji in Settings > Profile
+  await A.page.click("#btn-settings");
+  await A.page.waitFor("document.querySelector('#btn-avatar')", { what: "settings" });
+  const openPicker = async () => {
+    if (await A.page.eval("!!document.querySelector('.menu.m-emoji')")) return;
+    await A.page.click("#btn-avatar");
+    await A.page.waitFor("document.querySelector('.menu.m-emoji .emoji-grid')", { what: "picker" });
+  };
+  const pickGrid = async (e) => {
+    await openPicker();
+    await A.page.click({ js: `[...document.querySelectorAll('.menu.m-emoji .emoji-grid button')].find((b) => b.innerText === ${JSON.stringify(e)})` });
+  };
+  await openPicker();
+  const grid40 = await A.page.eval("document.querySelectorAll('.menu.m-emoji .emoji-grid button').length");
+  check(grid40 === 40 && (await A.page.eval("!!document.querySelector('#emoji-in')")), "Settings > Profile: the picker offers 40 emoji and a Paste any emoji field");
+  await pickGrid("🦊");
+  check(await A.page.eval("!document.querySelector('.menu.m-emoji')"), "a pick closes the picker (the modal under it stays)");
+  await P.waitFor(`document.querySelector('.pv[data-user="Alice"] .avatar .emo')?.innerText === "🦊"`, { timeout: 15000, what: "Vera sees Alice's emoji over the datagrams" });
+  check(true, "Alice picks 🦊: Vera sees it on Alice's avatar (AvatarSet -> relay list -> AvatarList)");
+  const foxBg = hueOfBg(await avBg(P, "Alice"));
+  check(foxBg && foxBg.h >= 10 && foxBg.h <= 50, "the background comes from the emoji's strongest colour (an orange fox)", JSON.stringify(foxBg));
+  const emoCss = await P.eval(`getComputedStyle(document.querySelector('.pv[data-user="Alice"] .avatar .emo')).filter`);
+  check((emoCss.match(/drop-shadow/g) || []).length === 4, "a thin black outline follows the emoji's shape (four 1 px drop-shadows)", emoCss);
+  await pickGrid("💀");
+  await P.waitFor(`document.querySelector('.pv[data-user="Alice"] .avatar .emo')?.innerText === "💀"`, { timeout: 15000, what: "skull" });
+  const sk = await avBg(P, "Alice");
+  const skHue = hueOfBg(sk);
+  check(skHue && skHue.s < 0.3, "a colourless emoji (the skull) gets a neutral slate, not a hue", sk);
+  await shot(P, "18_emoji_skull");
+  await openPicker();
+  await A.page.type("#emoji-in", "🐻");
+  await P.waitFor(`document.querySelector('.pv[data-user="Alice"] .avatar .emo')?.innerText === "🐻"`, { timeout: 15000, what: "pasted bear" });
+  check(true, "Paste any emoji: the field takes the last emoji of what is typed");
+  await A.page.type("#emoji-in", "hello");
+  await sleep(150);
+  check(/isn't an emoji/.test(await A.page.eval("document.querySelector('#emoji-hint').innerText")), "text that is no emoji is refused with a hint");
+  await A.page.click({ text: "Use my initial", sel: ".menu.m-emoji .mi" });
+  await P.waitFor(`document.querySelector('.pv[data-user="Alice"] .avatar .emo') == null`, { timeout: 15000, what: "emoji cleared" });
+  check((await P.eval(`[...document.querySelectorAll('.strip .pv')].find((p) => p.dataset.user === "Alice").querySelector('.avatar').innerText.trim()`)).startsWith("A"), "Use my initial: the initial is back");
+  await pickGrid("🦊");
+  await P.waitFor(`document.querySelector('.pv[data-user="Alice"] .avatar .emo')?.innerText === "🦊"`, { timeout: 15000, what: "fox again" });
+  check((await A.page.eval(`JSON.parse(localStorage.getItem("sss.settings.v1")).emoji`)) === "🦊", "the emoji is saved in localStorage");
+  await shot(P, "19_emoji_fox");
+  await A.page.key("Escape");
+  check(await A.page.eval("!document.querySelector('.modal')"), "Escape closes the settings modal");
+  // the hover card and the stream menu carry it too
+  const ha = await P.eval(`(() => { const r = document.querySelector('.pv[data-user="Alice"] .avatar').getBoundingClientRect(); return { cx: r.x + r.width / 2, cy: r.y + r.height / 2 }; })()`);
+  await move(P, ha.cx, ha.cy);
+  await P.waitFor("document.querySelector('.utip .avatar .emo')", { what: "emoji in the hover card" });
+  check(true, "the hover card shows the emoji avatar as well");
+  await move(P, 4, 4);
+
+  /* ============================== reconnect: pop-outs and avatars survive a relay restart ============================== */
+  if (RELAY_BIN && RELAY_DIR) {
+    section("relay restart: a pop-out comes back, the stage window stays, avatars re-announce");
+    const port = RELAY.split(":").pop();
+    const bi = await P.eval(`(() => { const ts = [...document.querySelectorAll('.arena > .st-tile')]; return ts.findIndex((t) => t._it && t._it.owner === "Carol"); })()`);
+    const ct2 = (await tiles(P))[bi];
+    await move(P, ct2.cx, ct2.cy);
+    await sleep(250);
+    await P.click({ js: `document.querySelectorAll('.arena > .st-tile')[${bi}].querySelector('.tools .round-btn')` });
+    await P.waitFor(`[...__sss.S.rooms[0].watches.values()].some((w) => w.ownerName === "Carol" && w.popped === "pip")`, { timeout: 10000, what: "Carol popped out (PiP)" });
+    const oldKey = await P.eval(`[...__sss.S.rooms[0].watches.values()].find((w) => w.ownerName === "Carol").key`);
+    spawnSync("bash", [W + "relay.sh", "restart", RELAY_BIN, RELAY_DIR, port], { stdio: "inherit" });
+    await P.waitFor(`__sss.S.rooms[0].state === "reconnecting" || __sss.S.rooms[0].state === "joined"`, { what: "reconnect starts" });
+    await P.waitFor(`__sss.S.rooms[0].state === "joined" && [...__sss.S.rooms[0].watches.values()].some((w) => w.ownerName === "Carol" && w.key !== ${JSON.stringify(oldKey)})`, { timeout: 60000, what: "Carol's stream resumed under a new key" });
+    const after = await P.eval(`(() => { const w = [...__sss.S.rooms[0].watches.values()].find((x) => x.ownerName === "Carol"); return { popped: w.popped, inPip: !!w.canvas.closest('.pip-stage'), ownDoc: w.canvas.ownerDocument !== document }; })()`);
+    check(after.popped === "pip" && after.inPip && after.ownDoc, "a stream popped out before the relay restarted is popped out again after it (its window stayed open, the new canvas moved in)", JSON.stringify(after));
+    await P.waitFor("document.querySelectorAll('.pv.popped').length === 1", { what: "badge back on Carol's avatar" });
+    for (let i = 0; i < 5 && (await P.eval("[...__sss.S.rooms[0].watches.values()].some((w) => w.popped)")); i++) {
+      await P.click(".pv.popped").catch(() => {}); // retry: a render between press and release swallows a click
+      await sleep(700);
+    }
+    await P.waitFor("![...__sss.S.rooms[0].watches.values()].some((w) => w.popped)", { what: "brought back" });
+    await P.waitFor(`document.querySelector('.pv[data-user="Alice"] .avatar .emo')?.innerText === "🦊"`, { timeout: 30000, what: "Alice's emoji after the relay restart" });
+    check(true, "after the relay restart Alice's emoji is announced again (a reconnect has a new ConnId)");
+
+    // the whole stage in its own window, across a restart
+    if (await P.eval("!!window.documentPictureInPicture")) {
+      // a click is press + release on the same element, and the UI re-renders on every state change: retry if one landed in between
+      for (let i = 0; i < 4 && !(await P.eval("!!__sss.stageWindow()")); i++) {
+        await P.click("#btn-popstage");
+        await sleep(600);
+      }
+      await P.waitFor("!!__sss.stageWindow()", { what: "stage window" });
+      await sleep(500);
+      const sw = await P.eval(`(() => { const w = __sss.stageWindow(); const d = w.win.document; return { tiles: d.querySelectorAll('.arena > .st-tile').length, bar: !!d.querySelector('.ctlrow'), strip: d.querySelectorAll('.pv').length, back: !!document.querySelector('#btn-stage-back'), mainTiles: document.querySelectorAll('.arena > .st-tile').length, fs: !!d.querySelector('#btn-stagefs'), side: !!d.querySelector('#btn-sidebar'), canvasInPop: [...__sss.S.rooms[0].watches.values()].every((w) => w.canvas.ownerDocument === d) }; })()`);
+      check(sw.tiles === 4 && sw.bar && sw.strip === 4 && sw.back && sw.mainTiles === 0 && sw.canvasInPop && !sw.fs && !sw.side, "the stage pops out: the tiles, strip and bar are in its own window, the main window says so and offers Bring it back", JSON.stringify(sw));
+      await shot(P, "20_stage_popped");
+      // headless Chromium opens the window at about 450x270 (strip and bar take all of it) and cannot resize it: give its target a 1000x700 viewport through CDP
+      let pipSession = null;
+      try {
+        const { targetInfos } = await V.conn.send("Target.getTargets");
+        const mainId = (await V.conn.send("Target.getTargetInfo", {}, V.page.sid)).targetInfo.targetId;
+        const pip = targetInfos.find((t) => t.type === "page" && t.targetId !== mainId);
+        if (pip) {
+          pipSession = (await V.conn.send("Target.attachToTarget", { targetId: pip.targetId, flatten: true })).sessionId;
+          await V.conn.send("Emulation.setDeviceMetricsOverride", { width: 1000, height: 700, deviceScaleFactor: 1, mobile: false }, pipSession);
+        }
+      } catch (e) {
+        console.log("(the stage window could not be sized through CDP:", e.message + ")");
+      }
+      await P.waitFor("__sss.stageWindow().win.innerWidth >= 900", { timeout: 5000, what: "stage window sized" }).catch(() => console.log("(the stage window stayed small)"));
+      await sleep(800);
+      // the stage window itself: everything laid out inside it (tiles, strip and bar within its bounds), and a screenshot of its own target
+      const fit = await P.eval(`(() => { const w = __sss.stageWindow().win; const d = w.document; const W = w.innerWidth, H = w.innerHeight; const inside = (e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.left >= -1 && r.top >= -1 && r.right <= W + 1 && r.bottom <= H + 1; }; return { W, H, tiles: [...d.querySelectorAll('.arena > .st-tile')].every(inside), bar: inside(d.querySelector('.ctlrow')), strip: inside(d.querySelector('.stripwrap')), ctlBottom: d.querySelector('.ctlrow').getBoundingClientRect().bottom }; })()`);
+      check(fit.tiles && fit.bar && fit.strip, "in the stage window the tiles, the strip and the bar are laid out inside its bounds", JSON.stringify(fit));
+      try {
+        if (pipSession) {
+          const r = await V.conn.send("Page.captureScreenshot", { format: "png" }, pipSession);
+          (await import("node:fs")).writeFileSync(OUT + PFX + "20b_stage_window.png", Buffer.from(r.data, "base64"));
+        }
+      } catch (e) {
+        console.log("(no screenshot of the stage window:", e.message + ")");
+      }
+      spawnSync("bash", [W + "relay.sh", "restart", RELAY_BIN, RELAY_DIR, port], { stdio: "inherit" });
+      await P.waitFor(`__sss.S.rooms[0].state === "joined" && [...__sss.S.rooms[0].watches.values()].length === 3 && [...__sss.S.rooms[0].watches.values()].every((w) => w.firstFrame)`, { timeout: 60000, what: "back after the restart" });
+      await sleep(1500);
+      const sw2 = await P.eval(`(() => { const w = __sss.stageWindow(); if (!w) return null; const d = w.win.document; return { tiles: d.querySelectorAll('.arena > .st-tile').length, popped: __sss.S.stage.popped.size }; })()`);
+      check(sw2 && sw2.tiles === 4 && sw2.popped === 1, "the stage window survives a relay restart and shows the stage again", JSON.stringify(sw2));
+      await P.eval(`__sss.stageWindow().win.document.querySelector('#btn-popstage').click()`);
+      await P.waitFor("!__sss.stageWindow() && document.querySelectorAll('.arena > .st-tile').length === 4", { what: "brought back from its own window's button" });
+      check(true, "Bring the stage back (the button in its window) returns it to the main window");
+    } else check(true, "the browser has no Document Picture-in-Picture: the stage pop-out button is hidden");
+  } else console.log("\n(no --relay-bin/--relay-dir: the relay-restart checks are skipped)");
+
+  if (OLD_RELAY && OLD_HASH) {
+    section("a relay without avatars (an older relay): nobody else's emoji shows, my own still does");
+    const X = await open("Olga", site.url);
+    await X.page.eval(`(() => { const s = JSON.parse(localStorage.getItem("sss.settings.v1")); s.emoji = "🦊"; localStorage.setItem("sss.settings.v1", JSON.stringify(s)); location.reload(); })()`);
+    await sleep(800);
+    await L.createRoom(X.page, { name: "old", server: OLD_RELAY, hash: OLD_HASH });
+    await L.waitJoined(X.page);
+    const Y = await open("Ben", site.url);
+    await L.addRoomByLink(Y.page, await L.inviteLink(X.page), "old");
+    await L.waitJoined(Y.page);
+    await sleep(3500);
+    const own = await X.page.eval(`[...document.querySelectorAll('.pv')].find((p) => p.dataset.user === "Olga")?.querySelector('.emo')?.innerText ?? null`);
+    const theirs = await Y.page.eval(`[...document.querySelectorAll('.pv')].find((p) => p.dataset.user === "Olga")?.querySelector('.avatar').innerText.trim()`);
+    check(own === "🦊" && theirs.startsWith("O") && (await X.page.eval("__sss.S.rooms[0].client.avatarsSupported")) === false, "an older relay never acks: Olga sees her own 🦊, Ben sees her initial", JSON.stringify({ own, theirs }));
+    await X.close();
+    await Y.close();
+  }
+
+  check(V.consoleErrors.length === 0, "no console errors on Vera's page", V.consoleErrors.join(" | "));
+  check([A, B, C].every((x) => x.consoleErrors.length === 0), "no console errors on the sharers' pages", [A, B, C].flatMap((x) => x.consoleErrors).join(" | "));
+  ok0 = true;
+} catch (e) {
+  failed++;
+  console.log("FAIL", e.stack || e.message);
+  await P.screenshot(OUT + PFX + "fail.png").catch(() => {});
+} finally {
+  for (const X of [A, B, C, V]) await X.close().catch(() => {});
+  site.close();
+}
+console.log(failed ? `${failed} FAILED of ${results.length}` : `ALL ${results.length} PASSED`);
+process.exit(failed ? 1 : 0);

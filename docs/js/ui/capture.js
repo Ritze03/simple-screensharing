@@ -100,6 +100,15 @@ export function captureRes(c) {
   return st.width && st.height ? `${st.width}×${st.height}` : "";
 }
 
+const pickDisplay = (fps) =>
+  navigator.mediaDevices.getDisplayMedia({
+    video: { frameRate: { ideal: Math.max(60, fps) } },
+    // Ask for audio so the browser shows its "share audio" option; what it offers depends on browser, OS and source.
+    audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+    systemAudio: "include",
+    selfBrowserSurface: "exclude",
+  });
+
 /**
  * Pick a screen for `room` (must run inside a click handler: getDisplayMedia needs the user gesture).
  * Resolves the staged capture, or null when the user cancelled the picker.
@@ -114,13 +123,7 @@ export async function stage(room) {
   invalidate();
   let stream;
   try {
-    stream = await navigator.mediaDevices.getDisplayMedia({
-      video: { frameRate: { ideal: Math.max(60, def.fps) } },
-      // Ask for audio so the browser shows its "share audio" option; what it offers depends on browser, OS and source.
-      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
-      systemAudio: "include",
-      selfBrowserSurface: "exclude",
-    });
+    stream = await pickDisplay(def.fps);
   } catch (e) {
     discard(c);
     if (e && e.name !== "NotAllowedError" && e.name !== "AbortError") toast(t("ui.toast.pick_failed", { error: e.message }), "error", { err: true });
@@ -142,14 +145,58 @@ function adopt(c, stream) {
   c.audio = stream.getAudioTracks()[0] || null;
   c.label = c.video ? surfaceName(c.video) : t("ui.capture.screen");
   if (c.video) {
-    c.video.addEventListener("ended", () => {
-      // The browser's own "Stop sharing" (or the source window closed) ends every clone too.
-      if (!S.captures.includes(c)) return;
+    const track = c.video;
+    track.addEventListener("ended", () => {
+      // The browser's own "Stop sharing" (or the source window closed) ends every clone too. Not a track that "Change source" replaced.
+      if (!S.captures.includes(c) || c.video !== track) return;
       endCapture(c);
       toast(t("ui.toast.ended_by_browser"), "stop_circle");
     });
   }
   startMeter(c);
+}
+
+/**
+ * "Change source" (the Source card's Change button, staged and live; needs the click's user gesture): pick another screen, window or
+ * tab and carry on with it. A staged capture just swaps its tracks; a live one restarts every destination on the new tracks (the new
+ * share starts first, then the old one retires, like a live FPS change), so viewers see the stream end and start again. Cancelling the
+ * picker changes nothing. Resolves whether the source changed.
+ */
+export async function changeSource(c) {
+  let stream;
+  try {
+    stream = await pickDisplay([...c.dests.values()][0]?.fps ?? c.staged.fps);
+  } catch (e) {
+    if (e && e.name !== "NotAllowedError" && e.name !== "AbortError") toast(t("ui.toast.pick_failed", { error: e.message }), "error", { err: true });
+    return false;
+  }
+  if (!S.captures.includes(c)) {
+    stream.getTracks().forEach((tr) => tr.stop());
+    return false;
+  }
+  const old = c.stream;
+  stopMeter(c);
+  adopt(c, stream);
+  if (c.previewEl) {
+    c.previewEl.srcObject = null;
+    syncPreview(c);
+  }
+  invalidate();
+  for (const [roomId, d] of [...c.dests]) {
+    const room = S.rooms.find((r) => r.id === roomId);
+    if (!room) continue;
+    d.state = "restarting";
+    invalidate();
+    try {
+      await startDest(c, room, { fps: d.fps, codec: d.codec, preset: d.preset, kbps: d.kbps }, { state: "restarting" });
+    } catch (e) {
+      d.state = "live";
+      toast(t("ui.toast.share_failed", { error: e.message }), "error", { err: true });
+    }
+  }
+  if (old) old.getTracks().forEach((tr) => tr.stop());
+  invalidate();
+  return true;
 }
 
 export function discard(c) {

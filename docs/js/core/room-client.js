@@ -10,6 +10,7 @@ import { PREVIEW_FIRST_DELAY_MS, PREVIEW_INTERVAL_MS, PreviewSampler } from "./p
 import {
   STREAM_TYPE_PREVIEW, WIRE_VERSION, clampUtf8, connIdFromHex, connIdToHex, packPreviewHeader, unpackMediaHeader, unpackPreviewHeader,
   MEDIA_FLAG_KEYFRAME, MEDIA_FLAG_STALLED, NACK_TAG_HELLO_ACK, NACK_TAG_MISS, NACK_TAG_REQUEST, isNackDatagram, packNackRange, unpackNackRange,
+  AVATAR_TAG_ACK, AVATAR_TAG_HELLO, AVATAR_TAG_LIST, packAvatarSet, unpackAvatars,
 } from "./protocol.js";
 import { ConnectError, JoinRejectedError, RelaySession, classifyClose, supportsWebTransport } from "./session.js";
 import { CanvasRenderer, VideoReceiver } from "./video-rx.js";
@@ -28,6 +29,8 @@ const VIEWERS_TAG_HELLO = 0xe6;
 const VIEWERS_TAG_ACK = 0xe7;
 const VIEWERS_TAG_LIST = 0xe8;
 const VIEWERS_STALE_MS = 7000; // the relay repeats a non-empty list every 2 s
+const AVATAR_HELLO_MS = 1000; // emoji avatars (spec 9.2): Hello once a second, at most 10 times, until the relay's Ack
+const AVATAR_SET_MS = 250; // after the Ack: re-send Set until the relay's list shows our own entry (the Set's only ack)
 const NACK_TICK_MS = 5; // poll the reassembler this often while a frame is incomplete (native: 5 ms too)
 const NACK_DEFAULT_RTT_MS = 150; // when the browser does not report a smoothed RTT (WebTransport getStats)
 
@@ -243,6 +246,10 @@ export class RoomClient extends EventTarget {
     this.selfId = null;
     this.members = new Map(); // hex -> { id, name, streamCount, self }
     this.viewersSupported = false; // the relay acked our viewers hello (reset per connection)
+    this.avatarsSupported = false; // the relay acked our avatar hello (reset per connection)
+    this.avatars = new Map(); // hex ConnId -> emoji: the relay's last whole list (spec 9.2), replaced by every list
+    this._avatar = ""; // the emoji we want to show ("" = none), set by setAvatar() and kept across reconnects
+    this._avatarTimer = null;
     this.streams = new Map(); // key -> info
     this.previews = new Map(); // key -> { blob, receivedAt }
     this.watches = new Map(); // key -> WatchHandle
@@ -291,6 +298,8 @@ export class RoomClient extends EventTarget {
     for (const s of [...this.shares]) this.stopShare(s);
     for (const key of [...this.watches.keys()]) this.unwatch(key);
     this.#stopStats();
+    clearInterval(this._avatarTimer);
+    this._avatarTimer = null;
     const sess = this.session;
     this.session = null;
     if (sess) await sess.close({ graceful: true });
@@ -345,6 +354,7 @@ export class RoomClient extends EventTarget {
     const before = new Map(this.streams); // infos of the streams we knew, for watch-ended after a reconnect
     this.#applySnapshot(snapshot);
     this.#startViewersHello(sess);
+    this.#startAvatars(sess);
     // Re-establish what we had before a reconnect: subscriptions to streams that still exist (the receivers
     // restart from the next keyframe: datagrams were lost meanwhile), and forget the ones that are gone.
     for (const [key, reasons] of [...this.subRefs]) {
@@ -528,6 +538,7 @@ export class RoomClient extends EventTarget {
           const id = connIdToHex(e.connId);
           for (const [key, s] of [...this.streams]) if (s.owner === id) this.#streamGone(key);
           this.members.delete(id);
+          this.avatars.delete(id);
           this.#emitRoster();
           this.#emitStreams();
         } else if (e.type === "StreamStarted") {
@@ -863,6 +874,73 @@ export class RoomClient extends EventTarget {
     this.dispatchEvent(new CustomEvent("viewers", { detail: { streamId: bytes[1], ids } }));
   }
 
+  // -------------------------------------------------------------------------------- emoji avatars (spec 9.2)
+
+  /** Hello once a second (at most 10 times) until the relay acks; an older relay never answers and nobody else's emoji shows. */
+  #startAvatars(sess) {
+    this.avatarsSupported = false;
+    this.avatars = new Map();
+    clearInterval(this._avatarTimer);
+    this._avatarTimer = null;
+    let n = 0;
+    const tick = () => {
+      if (sess !== this.session || sess.closedFlag || this.avatarsSupported || n++ >= 10) return;
+      sess.sendDatagram(new Uint8Array([AVATAR_TAG_HELLO]));
+      setTimeout(tick, AVATAR_HELLO_MS);
+    };
+    tick();
+  }
+
+  #onAvatarDatagram(bytes) {
+    if (bytes.length === 1) {
+      this.avatarsSupported = true; // a list follows at once
+      this.dispatchEvent(new CustomEvent("avatars", { detail: {} }));
+      this.#syncAvatar();
+      return;
+    }
+    const list = unpackAvatars(bytes);
+    if (!list) return; // truncated / trailing bytes / a bad entry: the whole list is distrusted
+    this.avatarsSupported = true;
+    const next = new Map(list.map(([id, emoji]) => [connIdToHex(id), emoji]));
+    // the relay repeats the list every 3 s: tell the UI only when something changed (a re-render per repeat would be churn)
+    const changed = next.size !== this.avatars.size || [...next].some(([id, e]) => this.avatars.get(id) !== e);
+    this.avatars = next;
+    if (changed) this.dispatchEvent(new CustomEvent("avatars", { detail: {} }));
+    this.#syncAvatar();
+  }
+
+  /** Keep sending AvatarSet every 250 ms until the relay's list shows our entry as we want it (that entry is the Set's ack). */
+  #syncAvatar() {
+    const sess = this.session;
+    const done = () => !sess || sess !== this.session || sess.closedFlag || !this.avatarsSupported || (this.avatars.get(this.selfId) || "") === this._avatar;
+    if (done()) {
+      clearInterval(this._avatarTimer);
+      this._avatarTimer = null;
+      return;
+    }
+    if (this._avatarTimer) return;
+    const send = () => {
+      if (done()) return this.#syncAvatar();
+      const d = packAvatarSet(this._avatar);
+      if (d) sess.sendDatagram(d);
+    };
+    send();
+    this._avatarTimer = setInterval(send, AVATAR_SET_MS);
+  }
+
+  /** Our emoji avatar ("" = none; at most 16 UTF-8 bytes, anything longer is ignored). Sent to the relay once it acked, and again after every reconnect. */
+  setAvatar(emoji) {
+    const e = String(emoji || "").trim();
+    if (!packAvatarSet(e)) return;
+    this._avatar = e;
+    this.#syncAvatar();
+  }
+
+  /** The emoji shown for member `idHex` ("" = none): ours from our own setting (at once, also on an older relay), the others' from the relay's list. */
+  emojiOf(idHex) {
+    return idHex === this.selfId ? this._avatar : this.avatars.get(idHex) || "";
+  }
+
   _viewerNames(share) {
     return share.viewerIds
       .map((id) => this.members.get(id)?.name)
@@ -875,6 +953,11 @@ export class RoomClient extends EventTarget {
     // NACK-family or media datagrams by length. Then NACK-family (< 19 bytes, tag >= 0xE0), then media, untouched.
     if ((bytes[0] === VIEWERS_TAG_ACK && bytes.length === 1) || bytes[0] === VIEWERS_TAG_LIST) {
       this.#onViewersDatagram(bytes);
+      return;
+    }
+    // Avatar lists (spec 9.2) the same way: AvatarAck is 1 byte, AvatarList can be >= 19 bytes.
+    if ((bytes[0] === AVATAR_TAG_ACK && bytes.length === 1) || bytes[0] === AVATAR_TAG_LIST) {
+      this.#onAvatarDatagram(bytes);
       return;
     }
     if (isNackDatagram(bytes)) {
@@ -1092,7 +1175,7 @@ export class RoomClient extends EventTarget {
    * @param {"auto"|"h264"|"h265"|"av1"} [o.codec="auto"]  "auto" = H.264 (hardware-decodable everywhere)
    * @param {number} [o.fps=60]
    * @param {number} [o.bitrateKbps=8000]
-   * @param {"low_latency"|"balanced"|"quality"|"gaming"} [o.preset="balanced"]
+   * @param {"text"|"quality"|"gaming"} [o.preset="quality"] ("balanced" and "low_latency" are aliases of quality)
    * @param {string} [o.label="Screen"]
    * @param {MediaStream} [o.stream]          use this stream instead of calling getDisplayMedia (tests, custom pickers)
    * @param {object} [o.displayMediaOptions]  merged into the getDisplayMedia() argument
@@ -1105,7 +1188,7 @@ export class RoomClient extends EventTarget {
     if (!caps.canShare && !o.stream) throw new Error("Sharing needs WebCodecs, MediaStreamTrackProcessor and getDisplayMedia (a current Chromium-based browser).");
     const fps = o.fps ?? 60;
     const bitrateKbps = o.bitrateKbps ?? 8000;
-    const preset = ENCODER_PRESETS[o.preset ?? "balanced"] ?? ENCODER_PRESETS.balanced;
+    const preset = ENCODER_PRESETS[o.preset ?? "quality"] ?? ENCODER_PRESETS.quality;
     let stream = o.stream;
     let ownsStream = false;
     if (!stream) {

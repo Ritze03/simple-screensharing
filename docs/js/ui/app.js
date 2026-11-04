@@ -4,42 +4,38 @@
 // images) by moving them into the new tree. Numbers that change every second (fps, kbps, meters) are patched in
 // place instead of re-rendering, so sliders and hovers are never interrupted.
 
-import { capabilities, createRoom, parseJoinLink, parseServerAddr, base64urlDecode, probeEncoders } from "../core/index.js";
+import { capabilities, createRoom, parseJoinLink, parseServerAddr, base64urlDecode, probeEncoders, ENCODER_PRESETS } from "../core/index.js";
 import { S, onInvalidate, invalidate, toast, persistSettings, persistRooms, loadRooms, autoName, displayName } from "./store.js";
 import { t, setLang, getLang } from "./i18n.js";
 import {
-  h, ic, T, V, H, SL, FILL, pct, fmtKbps, snapVolumePct, volumeWheel, VOLUME_MAX_PCT, ctrlRow, valBox, sliderRow, seg, cbx, card, secHead, roomRow, sharerRow, personRow, destRow,
-  popItem, btnRow, gridRows, cardShape, emptyState, banner, meter, modalShell, avatarBg, initial,
+  h, ic, T, V, H, SL, FILL, pct, ctrlRow, valBox, sliderRow, seg, cbx, card, roomRow, sharerRow, destRow, btnRow, emptyState,
+  banner, meter, modalShell, avatarEl, LABEL_W,
 } from "./dom.js";
 import {
-  RoomEntry, roomById, connectRoom, disconnectRoom, retryNow, watchStream, unwatchStream, setWatchVolume, setWatchMuted, allWatches,
-  addRoom, forgetRoom, applyJitterSettings, applyLevelLoudness, connectErrorText,
+  RoomEntry, roomById, connectRoom, disconnectRoom, retryNow, watchStream, allWatches, addRoom, forgetRoom, applyJitterSettings,
+  applyLevelLoudness,
 } from "./rooms.js";
 import {
-  capById, capInRoom, stagedFor, liveRoomIds, allDests, allocated, applyBandwidth, captureName, captureRes, stage, discard, goLive, addDest,
-  moveDest, stopDest, stopAll, editDest, setAudioMuted, captureLevel, previewFor,
+  capById, capInRoom, liveRoomIds, allDests, allocated, applyBandwidth, captureName, captureRes, stage, discard, goLive,
+  stopDest, editDest, captureLevel, changeSource, setAudioMuted,
 } from "./capture.js";
-import { popOut, closePopout, popoutMode } from "./popout.js";
+import { popOut, closePopout, popStage as popoutStage, closeStage, stageWindow } from "./popout.js";
+import { A } from "./actions.js";
+import { WATCHED, roomView, viewKey, viewOf, vg, watchFps } from "./stage-state.js";
+import { renderStage, renderPoppedNote, afterRender, isDragging, bindWindow, overlays, toggleStageFullscreen } from "./stage.js";
+import { opener, selectField, FPS_LIST, PRESET_ORDER, presetLabel, presetCaption } from "./menus.js";
 
 const caps = capabilities();
-const FPS = [15, 30, 60, 90, 120, 144, 165, 240];
 const CODECS = [["h264", "H.264"], ["av1", "AV1"], ["h265", "H.265"]];
-// "Hide what does nothing" (user rule 2026-11-01, #93): in the browser Low-Latency is identical to Balanced
-// (ENCODER_PRESETS: same latencyMode and keyframe interval), so its button is not offered. A stored "low_latency"
-// stays stored and is shown as its twin (PRESET_TWIN), so the value round-trips for the other platforms that read it.
-const PRESETS = [["balanced", "ui.preset.balanced"], ["quality", "ui.preset.quality"], ["gaming", "ui.preset.gaming"]];
-const PRESET_TWIN = { low_latency: "balanced" };
 let encoders = null; // Set of codecs this browser can encode (probeEncoders), null until probed
 
 const root = document.getElementById("app");
-const SCROLLERS = [".p-center", ".p-side-scroll", ".p-right", ".modal-body"];
-let centerW = 700;
-let centerH = 700;
-let reflowing = false;
+const SCROLLERS = [".p-center", ".p-side-scroll", ".modal-body"];
+let renderQueued = false; // a render asked for while a stage drag was in progress (drags update styles directly and hold renders back)
+const HOST_MAIN = { id: "main", win: window, doc: document };
 let live = []; // [{ el, fn }] text patched every stats tick
 let meters = []; // [{ el, fn }] level meters, patched ~7x/s
 
-const codecLabel = (c) => (CODECS.find(([v]) => v === c) || [c, String(c || "").toUpperCase()])[1];
 const me = displayName;
 const sel = () => roomById(S.selected);
 
@@ -56,7 +52,28 @@ function promptForName() {
   S.modal = { kind: "choose-name", value: displayName(), focus: true };
 }
 
+/** The view the central area shows as a stage: Watched streams, or the selected room while it is joined (else the scrolling body). */
+function stageViewNow() {
+  if (S.view === "watching") return WATCHED;
+  const r = sel();
+  return r && r.state === "joined" ? roomView(r) : null;
+}
+
+// A slider being dragged must not be replaced under the pointer: renders wait until the pointer is up (like a stage drag).
+let sliderHeld = false;
+document.addEventListener("pointerdown", (e) => { if (e.target.matches && e.target.matches('input[type="range"]')) sliderHeld = true; }, true);
+window.addEventListener("pointerup", () => {
+  if (!sliderHeld) return;
+  sliderHeld = false;
+  A.flush();
+}, true);
+
 function render() {
+  if (isDragging() || sliderHeld) {
+    renderQueued = true;
+    return;
+  }
+  renderQueued = false;
   promptForName();
   const keep = SCROLLERS.map((s) => {
     const n = root.querySelector(s);
@@ -70,19 +87,23 @@ function render() {
   document.documentElement.lang = getLang();
   document.title = S.view === "room" && sel() ? `${sel().name} — ${t("app.title")}` : t("app.title");
 
-  const app = H({ cls: "p-app st", g: 0 }, renderSide(), renderMain());
-  if (S.modal) app.appendChild(renderModal());
-  const layer = h("div", { class: "layer" });
-  if (S.popup) layer.appendChild(renderPopup());
-  if (vpop) {
-    const vp = renderViewersPop();
-    if (vp) layer.appendChild(vp);
-    else vpop = null;
+  const sv = stageViewNow();
+  if (S.stage.fullscreen && !sv) {
+    S.stage.fullscreen = false; // the room went away under a fullscreen stage
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
   }
-  app.appendChild(layer);
+  // Fullscreen: only the stage, its strip and bar lying over the streams (they hide by themselves, chrome.js). Modals, menus and toasts stay.
+  const fsStage = S.stage.fullscreen && sv && !S.stage.popped.has(viewKey(sv));
+  const app = fsStage
+    ? V({ cls: "p-app fs-root", g: 0 }, renderStage(sv, HOST_MAIN, { fullscreen: true }))
+    : H({ cls: "p-app st", g: 0 }, S.stage.sidebarHidden && sv ? null : renderSide(), renderMain(sv));
+  if (S.modal) app.appendChild(renderModal());
+  app.appendChild(h("div", { class: "layer" }, overlays("main")));
   app.appendChild(V({ cls: "toasts", g: 1, attrs: { role: "status", "aria-live": "polite" } },
     S.toasts.map((x) => H({ cls: "toast" + (x.err ? " err" : ""), g: 2 }, ic(x.icon), T(x.text)))));
+  app.classList.toggle("has-menu", !!(S.menu || S.modal));
   root.replaceChildren(app);
+  root.classList.toggle("stage-fs", !!fsStage);
 
   SCROLLERS.forEach((s, i) => {
     const n = root.querySelector(s);
@@ -105,23 +126,31 @@ function render() {
     }
   }
   root.querySelectorAll('input[type="range"]').forEach(pct);
-  if (S.popup) positionPopup();
-  if (vpop) positionViewersPop();
+  renderPop();
   patchLive();
-  const c = root.querySelector(".p-center");
-  if (c && !reflowing) {
-    // The share-card size follows the centre's width and height (cardShape): re-render once when either moved.
-    const w = c.clientWidth - 32;
-    const hh = c.clientHeight - 32;
-    if (Math.abs(w - centerW) > 4 || Math.abs(hh - centerH) > 4) {
-      centerW = w;
-      centerH = hh;
-      reflowing = true;
-      render();
-      reflowing = false;
-    }
-  }
+  const sw = stageWindow();
+  afterRender(sw ? [window, sw.win] : [window]);
 }
+/** The whole stage in its own (Document PiP) window: the same stage tree rendered into that window's document. */
+function renderPop() {
+  const sw = stageWindow();
+  if (!sw) return;
+  const view = viewOf(sw.key);
+  if (!view || (view.kind === "room" && view.r.state === "disconnected")) {
+    setTimeout(closeStage, 0); // the room is gone (left, forgotten): the stage comes home
+    return;
+  }
+  const host = { id: "pop", win: sw.win, doc: sw.win.document };
+  const away = view.kind === "room" && view.r.state !== "joined"; // suspended: the window stays, the stage is back with the room
+  const body = away
+    ? V({ cls: "stg eq minh0", g: 0 }, h("div", { class: "arena" }, h("div", { class: "arena-note" }, ic("sync", "big"), h("b", { text: t("ui.sidebar.status_reconnecting") }))))
+    : renderStage(view, host);
+  sw.root.replaceChildren(body, h("div", { class: "layer" }, overlays("pop")));
+}
+/** Run a render that was held back by a drag. */
+A.flush = () => {
+  if (renderQueued) render();
+};
 onInvalidate(render);
 window.addEventListener("resize", () => invalidate());
 
@@ -153,14 +182,6 @@ function liveMeter(fn) {
   return el;
 }
 
-/* ---------- small formatters ---------- */
-const watchFps = (w) => (w && w.stats && Number.isFinite(w.stats.decodedFps) ? String(Math.round(w.stats.decodedFps)) : "");
-const watchKbps = (w) => (w && w.stats && Number.isFinite(w.stats.bitrateKbps) ? fmtKbps(w.stats.bitrateKbps) : "");
-const watchRes = (w, info) => {
-  const st = w && w.stats;
-  if (st && st.width && st.height) return `${st.width}x${st.height}`;
-  return info && info.width ? `${info.width}x${info.height}` : "";
-};
 function roomStatusTitle(r) {
   return { joined: t("ui.sidebar.status_connected"), reconnecting: t("ui.sidebar.status_reconnecting"), connecting: t("ui.room.connecting"), disconnected: t("ui.sidebar.status_disconnected") }[r.state];
 }
@@ -209,8 +230,8 @@ function renderSide() {
       S.rooms.length ? V({ cls: "well", g: 0, attrs: { role: "list" } }, rows) : h("div", { class: "side-empty", text: t("ui.sidebar.no_rooms") }),
       H({ g: 0 }, FILL(h("button", { class: "btn btn-ghost wide", type: "button", id: "btn-create-join", onclick: () => openAdd() }, ic("add"), t("ui.sidebar.create_or_join"))))),
     H({ cls: "band bottom p-user", g: 2 },
-      SL(32, h("span", { class: "avatar", style: avatarBg(me()) }, initial(me()), h("span", { class: "pres" + (S.rooms.some((r) => r.state === "joined") ? "" : " off") }))),
-      FILL(V({ cls: "who", g: 0, attrs: { role: "button", tabindex: "0", title: t("ui.sidebar.outgoing_tip"), onclick: (e) => openPopup("outgoing", e.currentTarget) } },
+      SL(32, avatarEl(me(), S.settings.emoji, { pres: S.rooms.some((r) => r.state === "joined") })),
+      FILL(V({ cls: "who", g: 0, attrs: { role: "button", tabindex: "0", title: t("ui.sidebar.outgoing_tip"), ...opener("outgoing") } },
         T(me(), "b"), h("span", { class: "txt" + (nLive ? " live" : ""), text: nLive ? (nLive === 1 ? t("ui.sidebar.live_in_one_room") : t("ui.sidebar.live_in_rooms", { count: nLive })) : t("ui.sidebar.not_sharing") }))),
       SL(32, h("button", { class: "icon-btn", type: "button", id: "btn-settings", title: t("ui.sidebar.settings"), "aria-label": t("ui.sidebar.settings"), onclick: () => { S.modal = { kind: "settings" }; render(); } }, ic("settings")))));
 }
@@ -218,7 +239,7 @@ function renderSide() {
 function select(r, rerender = true) {
   S.view = "room";
   S.selected = r.id;
-  S.popup = null;
+  S.menu = null;
   if (rerender) render();
 }
 function flash(key) {
@@ -239,232 +260,63 @@ function capsBanner() {
   return banner("block", t("ui.err.browser_unsupported"), null, { error: true });
 }
 
-function renderMain() {
+/** The stage region: the stage itself, or a note with "Bring it back" while it is open in its own window. */
+function stageRegion(view) {
+  return S.stage.popped.has(viewKey(view)) ? renderPoppedNote(view) : renderStage(view, HOST_MAIN);
+}
+
+function renderMain(sv) {
+  const cb = capsBanner();
+  const cbRow = cb ? H({ cls: "p-banner", g: 0 }, FILL(cb)) : null;
   if (S.view === "watching") {
-    const ws = allWatches();
     return V({ tag: "main", cls: "eq", g: 0 },
-      H({ tag: "header", cls: "band top p-head", g: 2 }, h("h2", { text: t("ui.sidebar.watched_streams") }), T(t("ui.sidebar.watched_streams_tip"), "meta")),
-      H({ cls: "eq st minh0", g: 0 },
-        V({ cls: "p-center eq", g: 3 }, capsBanner(),
-          ws.length ? renderTiles(ws, true) : emptyState("visibility_off", t("ui.watching.empty_title"), t("ui.watching.empty_text")))));
+      H({ tag: "header", cls: "band top p-head", g: 2 }, h("h2", { text: t("ui.sidebar.watched_streams") }), T(t("ui.sidebar.watched_streams_tip"), "meta")), cbRow, stageRegion(sv));
   }
   const r = sel();
   if (!r) {
     return V({ tag: "main", cls: "eq", g: 0 },
       H({ tag: "header", cls: "band top p-head", g: 2 }, h("h2", { text: t("app.title") })),
       H({ cls: "eq st minh0", g: 0 },
-        V({ cls: "p-center eq", g: 4 }, capsBanner(),
+        V({ cls: "p-center eq", g: 4 }, cb,
           emptyState("meeting_room", t("ui.home.title"), t("ui.home.text"),
             h("button", { class: "btn btn-primary btn-lg wide", type: "button", id: "btn-home-add", onclick: () => openAdd() }, ic("add"), t("ui.sidebar.create_or_join"))))));
   }
+  if (sv) return V({ tag: "main", cls: "eq", g: 0 }, renderHead(r), cbRow, stageRegion(sv));
+  // a room with no stage (not connected, connecting, reconnecting): the scrolling body
   const center = V({ cls: "p-center eq", g: 4 });
-  const cb = capsBanner();
   if (cb) center.appendChild(cb);
   if (r.state === "disconnected") {
-    center.appendChild(emptyState(r.error ? "cloud_off" : "cloud_off", t("ui.room.not_connected_title", { room: r.name }), r.error ? null : t("ui.room.not_connected_text"),
+    center.appendChild(emptyState("cloud_off", t("ui.room.not_connected_title", { room: r.name }), r.error ? null : t("ui.room.not_connected_text"),
       btnRow(h("button", { class: "btn btn-primary btn-lg", type: "button", id: "btn-connect", onclick: () => connectRoom(r) }, ic("login"), t("ui.room.connect")),
         h("button", { class: "btn btn-danger btn-lg", type: "button", onclick: () => { S.modal = { kind: "forget", room: r.id }; render(); } }, ic("delete"), t("ui.room.forget"))),
       { err: !!r.error, errText: r.error }));
   } else if (r.state === "connecting") {
     center.appendChild(emptyState("sync", t("ui.room.connecting_title", { room: r.name }), t("ui.room.connecting_text")));
   } else {
-    if (r.state === "reconnecting") {
-      // The browser cannot tell a stale certificate hash from a relay that is down, so the expiry hint only shows
-      // once a few attempts have failed (a relay restart is back within one or two).
-      const issue = r.issue; // "unreachable" | "full" | null (null: a connection was just lost)
-      const attempt = Math.max(1, r.attempt);
-      center.appendChild(banner(issue ? "link_off" : "sync_problem",
-        issue === "unreachable" ? t("ui.room.reconnect_unreachable", { attempt }) : issue === "full" ? t("ui.room.reconnect_full", { attempt }) : t("ui.room.reconnecting_banner", { attempt }),
-        h("button", { class: "btn btn-secondary", type: "button", onclick: () => retryNow(r) }, t("ui.room.retry_now")), { error: !!issue }));
-    }
-    renderRoomContent(r, center);
+    // The browser cannot tell a stale certificate hash from a relay that is down, so the expiry hint only shows
+    // once a few attempts have failed (a relay restart is back within one or two).
+    const issue = r.issue; // "unreachable" | "full" | null (null: a connection was just lost)
+    const attempt = Math.max(1, r.attempt);
+    center.appendChild(banner(issue ? "link_off" : "sync_problem",
+      issue === "unreachable" ? t("ui.room.reconnect_unreachable", { attempt }) : issue === "full" ? t("ui.room.reconnect_full", { attempt }) : t("ui.room.reconnecting_banner", { attempt }),
+      h("button", { class: "btn btn-secondary", type: "button", onclick: () => retryNow(r) }, t("ui.room.retry_now")), { error: !!issue }));
+    center.appendChild(emptyState("tv_off", t("ui.room.no_shares_now"), t("ui.room.shares_come_back")));
   }
-  const showSides = r.state === "joined" || r.state === "reconnecting";
-  return V({ tag: "main", cls: "eq", g: 0 },
-    renderHead(r),
-    H({ cls: "eq st minh0", g: 0 }, center, showSides ? renderPeople(r) : null),
-    showSides ? renderBar(r) : null);
+  return V({ tag: "main", cls: "eq", g: 0 }, renderHead(r), H({ cls: "eq st minh0", g: 0 }, center));
 }
 
+/** The room's header band: title, status pill, meta. Since the stage the controls live in its bar; a room with no stage keeps a `⋯` for the Room settings menu. */
 function renderHead(r) {
   const status = r.state === "joined" ? h("span", { class: "badge badge-live" }, h("span", { class: "dot" }), t("ui.sidebar.status_connected"))
     : r.state === "reconnecting" ? h("span", { class: "badge badge-degraded" }, ic("sync"), t("ui.sidebar.status_reconnecting"))
       : r.state === "connecting" ? h("span", { class: "badge badge-progress" }, h("span", { class: "bar" }), t("ui.room.connecting"))
         : h("span", { class: "badge badge-muted" }, t("ui.sidebar.status_disconnected"));
   const nSharing = r.videoStreams().length + (capInRoom(r.id) ? 1 : 0);
-  const connected = r.state !== "disconnected";
   return H({ tag: "header", cls: "band top p-head", g: 2 },
     H({ g: 3, cls: "eq" }, h("h2", { text: r.name, title: r.name }), status,
       r.members.length ? T(t("ui.room.meta", { people: r.members.length, sharing: nSharing }), "meta") : null),
-    H({ g: 2 },
-      cbx(t("ui.room.auto_connect"), r.auto, () => { r.auto = !r.auto; persistRooms(); render(); }, { title: t("ui.room.auto_connect_tip"), style: "margin-right:var(--s1)" }),
-      h("button", { class: "btn btn-secondary", type: "button", title: t("ui.room.copy_invite_tip"), onclick: () => copyLink(r) }, ic("link"), t("ui.room.copy_invite")),
-      h("button", { class: "btn btn-danger", type: "button", id: "btn-leave", disabled: !connected, title: connected ? t("ui.room.leave_tip") : t("ui.room.leave_disabled_tip"),
-        onclick: () => { S.modal = { kind: "leave", room: r.id }; render(); } }, ic("logout"), t("ui.room.leave")),
-      h("button", { class: "icon-btn bordered", type: "button", title: t("ui.room.options"), "aria-label": t("ui.room.options"), onclick: (e) => openPopup("roommenu", e.currentTarget) }, ic("more_horiz"))));
-}
-
-function renderRoomContent(r, center) {
-  const vids = r.videoStreams();
-  const watched = vids.filter((s) => r.watches.has(s.key));
-  const notWatched = vids.filter((s) => !r.watches.has(s.key));
-  if (watched.length) {
-    center.appendChild(V({ g: 3 }, secHead(t("ui.room.on_screen"), watched.length), renderTiles(watched.map((s) => ({ r, w: r.watches.get(s.key) })), false)));
-  }
-  const mine = capInRoom(r.id);
-  const sec = V({ g: 3 }, secHead(watched.length ? t("ui.room.also_sharing") : t("ui.room.sharing"), notWatched.length + (mine ? 1 : 0)));
-  if (!notWatched.length && !mine) {
-    sec.appendChild(emptyState("tv_off",
-      watched.length ? t("ui.room.watching_everything") : r.state === "reconnecting" ? t("ui.room.no_shares_now") : t("ui.room.nobody_sharing"),
-      watched.length ? null : r.state === "reconnecting" ? t("ui.room.shares_come_back") : t("ui.room.start_own")));
-  } else {
-    const items = notWatched.map((s) => ({ s })).concat(mine ? [{ mine }] : []);
-    const g = cardShape(items.length, centerW, centerH - 28); // minus the 16 px heading + 12 gap (native HEADING_H + S3)
-    sec.appendChild(gridRows(items, g.cols, (it) => (it.s ? shareCard(r, it.s) : myCard(it.mine, r)), `${g.cols * g.w + (g.cols - 1) * 12}px`));
-  }
-  center.appendChild(sec);
-}
-
-const liveChip = () => h("span", { class: "chip-dark" }, h("span", { class: "dot" }), t("ui.room.live_chip"));
-
-function shareCard(r, s) {
-  const prev = r.previews.get(s.key);
-  const owner = s.ownerName || r.memberName(s.owner);
-  const canWatch = caps.canWatch && r.state === "joined";
-  return V({ cls: "scard" + (S.flash === s.key ? " flash" : ""), g: 0, attrs: { "data-key": s.key } },
-    h("div", { class: "thumb" },
-      prev ? h("img", { src: prev, alt: "" }) : h("div", { class: "noprev" }, ic("screen_share")),
-      V({ cls: "ovl", g: 0 }, H({ g: 2 }, liveChip(), FILL(null), r.hasAudio(s.owner) ? h("span", { class: "chip-dark", title: t("ui.room.shares_audio") }, ic("volume_up")) : null))),
-    V({ cls: "card-pad", g: 2 },
-      H({ cls: "who", g: 2, style: "height:22px" }, SL(22, h("span", { class: "avatar sm", style: avatarBg(owner), text: initial(owner) })), h("b", { text: owner }), FILL(T(s.label || "", "t"))),
-      H({ g: 0 }, T(s.width ? `${s.width}×${s.height}` : t("ui.room.size_unknown"), "specs")),
-      btnRow(
-        h("button", { class: "btn btn-primary", type: "button", "data-watch": s.key, disabled: !canWatch, onclick: () => { watchStream(r, s.key); } }, ic("play_arrow"), t("ui.room.watch")),
-        h("button", { class: "btn btn-secondary", type: "button", disabled: !canWatch || !popoutMode(), title: t("ui.room.pop_out_tip"), onclick: () => watchAndPop(r, s.key) }, ic("open_in_new"), t("ui.room.pop_out")))));
-}
-
-/* ---------- who watches my share: eye + count, a dropdown with avatar and name on hover (task #116) ---------- */
-
-let vpop = null; // { cap, room }: the open dropdown; it is rebuilt by every render, so it follows live changes
-const VIEWER_ROWS_MAX = 8;
-const viewerNames = (c, r) => c.dests.get(r.id)?.share?.viewers?.() ?? null;
-const closeViewersPop = () => { if (vpop) { vpop = null; render(); } };
-
-/** The viewer count chip of my own card; `null` when the relay does not report viewers (an older relay): no count rather than a wrong "0". */
-function viewersChip(c, r) {
-  const names = viewerNames(c, r);
-  if (!names) return null;
-  const chip = h("span", { class: "chip-dark viewers", "data-cap": c.id, "data-room": r.id }, ic("visibility"), String(names.length));
-  if (!names.length) {
-    chip.title = t("ui.room.viewers_none");
-    return chip;
-  }
-  chip.addEventListener("mouseenter", () => { if (!vpop || vpop.cap !== c.id || vpop.room !== r.id) { vpop = { cap: c.id, room: r.id }; render(); } });
-  return chip;
-}
-
-// Closes the dropdown as soon as the pointer is over neither the chip nor the dropdown. A document-level check, not
-// mouseleave on the elements: every render() replaces both, and a replaced element never gets its mouseleave.
-document.addEventListener("mousemove", (e) => { if (vpop && !e.target.closest?.(".vpop, .viewers")) closeViewersPop(); });
-
-function renderViewersPop() {
-  const c = S.captures.find((x) => x.id === vpop.cap);
-  const r = roomById(vpop.room);
-  const names = c && r ? viewerNames(c, r) : null;
-  if (!names || !names.length) return null;
-  const rows = names.slice(0, VIEWER_ROWS_MAX).map((n) => H({ cls: "vrow", g: 2 }, SL(22, h("span", { class: "avatar sm", style: avatarBg(n), text: initial(n) })), FILL(T(n))));
-  if (names.length > VIEWER_ROWS_MAX) rows.push(H({ cls: "vrow more", g: 0 }, T(`+${names.length - VIEWER_ROWS_MAX}`)));
-  const el = V({ cls: "vpop", g: 0 }, H({ cls: "ph", g: 0 }, T(`${t("ui.room.viewers_title").toUpperCase()} · ${names.length}`)), ...rows);
-  return el;
-}
-
-function positionViewersPop() {
-  const p = root.querySelector(".vpop");
-  const chip = vpop && root.querySelector(`.viewers[data-cap="${vpop.cap}"][data-room="${vpop.room}"]`);
-  if (!p) return;
-  if (!chip) { vpop = null; p.remove(); return; }
-  const cr = chip.getBoundingClientRect();
-  const pr = p.getBoundingClientRect();
-  p.style.left = Math.max(8, Math.min(cr.right - pr.width, window.innerWidth - pr.width - 8)) + "px";
-  const below = cr.bottom - 2; // overlaps the chip by 2 px so the pointer never crosses a gap
-  p.style.top = (below + pr.height > window.innerHeight - 8 ? cr.top + 2 - pr.height : below) + "px";
-}
-
-function myCard(c, r) {
-  const d = c.dests.get(r.id);
-  return V({ cls: "scard", g: 0 },
-    h("div", { class: "thumb mine" },
-      previewFor(c),
-      V({ cls: "ovl", g: 0 },
-        H({ g: 2 }, d.state === "live" ? liveChip() : h("span", { class: "chip-dark", text: t("ui.room.starting_chip") }), FILL(null),
-          viewersChip(c, r),
-          h("span", { class: "chip-dark pv", title: t("ui.room.preview_tip"), text: t("ui.room.preview_chip") })),
-        FILL(V({ cls: "mine-label", g: 1, style: "align-items:center;padding:8px" }, ic("cast"), T(t("ui.room.your_screen"))), { v: true, style: "align-items:center" }))),
-    V({ cls: "card-pad", g: 2 },
-      H({ cls: "who", g: 2, style: "height:22px" }, SL(22, h("span", { class: "avatar sm", style: avatarBg(me()), text: initial(me()) })), h("b", { text: t("ui.sidebar.you") }), FILL(T(captureName(c), "t"))),
-      H({ g: 0 }, T(`${captureRes(c)} · ${d.fps} fps · ${codecLabel(d.codec)}`, "specs")),
-      btnRow(h("button", { class: "btn btn-secondary", type: "button", onclick: () => openStreamModal(c.id, r.id) }, ic("tune"), t("ui.bar.stream_settings")))));
-}
-
-/* ---------- tiles ---------- */
-
-function renderTiles(list, crossRoom) {
-  const n = list.length === 1 ? 1 : 2;
-  return gridRows(list, n, ({ r, w }) => renderTile(r, w, crossRoom), list.length === 1 ? "calc(46vh * 16 / 9)" : null);
-}
-
-function renderTile(r, w, crossRoom) {
-  const info = r.streams.find((s) => s.key === w.key);
-  const name = crossRoom ? `${w.ownerName} · ${r.name}` : w.ownerName;
-  if (w.popped) {
-    return V({ cls: "popped", g: 3, style: "align-items:center;justify-content:center" }, ic("open_in_new", "big-ico"),
-      h("span", {}, h("b", { text: w.ownerName }), crossRoom ? ` · ${r.name}` : "", " ", t(w.popped === "pip" ? "ui.tile.popped_pip" : "ui.tile.popped_fs")),
-      H({ g: 0, style: "width:300px" }, FILL(btnRow(
-        h("button", { class: "btn btn-secondary", type: "button", onclick: () => { closePopout(w); render(); } }, ic("move_down"), t("ui.room.bring_back")),
-        h("button", { class: "btn btn-danger", type: "button", onclick: () => unwatchStream(r, w.key) }, ic("close"), t("ui.room.stop_watching"))))));
-  }
-  const kids = [w.canvas];
-  if (w.error) kids.push(h("div", { class: "wait err" }, ic("error"), h("span", { text: w.error })));
-  else if (!w.firstFrame) kids.push(h("div", { class: "wait" }, ic("hourglass_empty"), h("span", { text: t("ui.tile.waiting") })));
-  const fpsEl = liveText(h("span", { class: "v fps" }), () => (watchFps(w) ? watchFps(w) + "fps" : ""));
-  const kbpsEl = liveText(h("span", { class: "v kbps" }), () => watchKbps(w));
-  const resEl = liveText(h("span", { class: "v" }), () => watchRes(w, info));
-  const hasAudio = r.hasAudio(w.owner);
-  return h("div", { class: "tile", tabindex: "0", "aria-label": t("ui.tile.aria", { name: w.ownerName }), "data-key": w.key, ondblclick: () => doFullscreen(r, w) },
-    kids, h("div", { class: "vig hover-ui" }),
-    V({ cls: "ovl hover-ui", g: 0 },
-      H({ g: 2 },
-        FILL(H({ cls: "statbar", g: 2 }, h("span", { class: "dot" + (w.stats && w.stats.stalled ? " warn" : "") }), T(name, "nm"), resEl, fpsEl, kbpsEl)),
-        H({ g: 1 },
-          popoutMode() ? h("button", { class: "round-btn", type: "button", title: t("ui.room.pop_out_tip"), "aria-label": t("ui.room.pop_out"), onclick: () => doPopOut(r, w) }, ic("open_in_new")) : null,
-          h("button", { class: "round-btn stop", type: "button", title: t("ui.room.stop_watching"), "aria-label": t("ui.room.stop_watching"), onclick: () => unwatchStream(r, w.key) }, ic("close")))),
-      FILL(null, { v: true }),
-      H({ g: 2 }, hasAudio ? audioPill(r, w) : h("span", { class: "chip-dark" }, ic("volume_off"), t("ui.tile.no_audio")))));
-}
-
-/** The "Level loudness" button after every volume slider (#126): the one global `levelLoudness` setting, the same
- *  switch as Settings > Playback (`#set-level-loudness`), not per-stream state. On = accent ring + light-blue icon. */
-function levelToggle() {
-  const on = S.settings.levelLoudness;
-  const tip = t(on ? "ui.tile.level_on" : "ui.tile.level_off");
-  return h("button", { type: "button", class: "level" + (on ? " on" : ""), title: tip, "aria-label": tip, "aria-pressed": String(on),
-    onclick: () => { S.settings.levelLoudness = !on; persistSettings(); applyLevelLoudness(); render(); } }, ic("graphic_eq"));
-}
-
-function audioPill(r, w) {
-  const pctEl = h("span", { class: "pct", text: Math.round(w.vol * 100) + "%" });
-  const slider = h("input", { type: "range", class: "vol", min: "0", max: String(VOLUME_MAX_PCT), step: "5", value: String(Math.round(w.vol * 100)), "aria-label": t("ui.tile.volume"), id: "vol-" + w.key.replace(":", "-") });
-  slider.addEventListener("input", (ev) => {
-    if (!ev.fromWheel) slider.value = String(snapVolumePct(Number(slider.value)));
-    setWatchVolume(r, w, Number(slider.value) / 100);
-    pctEl.textContent = slider.value + "%";
-    pct(slider);
-  });
-  volumeWheel(slider);
-  return H({ cls: "audio-pill" + (w.muted ? " muted" : ""), g: 1 },
-    SL(25, h("button", { type: "button", title: w.muted ? t("ui.room.listen") : t("ui.tile.mute"), "aria-label": w.muted ? t("ui.room.listen") : t("ui.tile.mute"),
-      onclick: () => { r.client && r.client.resumeAudio(); setWatchMuted(r, w, !w.muted); render(); } }, ic(w.muted ? "volume_off" : "volume_up"))),
-    w.muted ? T(t("ui.tile.muted"), "pct") : [SL(110, slider), SL(34, pctEl, { al: "r" }), SL(25, levelToggle())]);
+    r.state === "joined" ? null
+      : H({ g: 2 }, h("button", { class: "icon-btn bordered", type: "button", id: "btn-room-menu", title: t("ui.room.options"), "aria-label": t("ui.room.options"), ...opener("room", "room", { roomId: r.id }) }, ic("more_horiz"))));
 }
 
 async function doPopOut(r, w) {
@@ -490,96 +342,47 @@ function watchAndPop(r, key) {
   const w = watchStream(r, key);
   if (w) doPopOut(r, w);
 }
-
-/* ---------- People ---------- */
-
-function renderPeople(r) {
-  const stale = r.state === "reconnecting";
-  const members = [...r.members].sort((a, b) => (b.self ? 1 : 0) - (a.self ? 1 : 0));
-  return V({ tag: "aside", cls: "p-right", g: 3 },
-    secHead(stale ? t("ui.room.people_last_known") : t("ui.room.people"), members.length),
-    V({ g: 0 }, members.map((m) => {
-      const sharing = m.self ? !!capInRoom(r.id) : r.streams.some((s) => s.owner === m.id && s.kind === "video");
-      const watching = !m.self && [...r.watches.values()].some((w) => w.owner === m.id);
-      return personRow({
-        avatar: h("span", { class: "avatar sm", style: avatarBg(m.name), text: initial(m.name) }),
-        name: m.name || "?", you: m.self, youLabel: t("ui.room.you_suffix"), idle: !sharing, stale,
-        pill: sharing ? h("span", { class: "badge badge-live" }, t("ui.room.live_pill")) : null,
-        eye: watching ? ic("visibility", "ico watch") : null,
-      });
-    })));
-}
-
-/* ---------- bottom action bar ---------- */
-
-function barStatus(pill, t1, t2) {
-  return [SL(84, pill, { al: "l", min: true }), FILL(V({ g: 0 }, t1 ? T(t1, "t1") : null, t2 ? T(t2, "t2") : null), { v: true })];
-}
-function renderBar(r) {
-  const liveCap = capInRoom(r.id);
-  const staged = stagedFor(r.id);
-  const bar = (...kids) => H({ tag: "footer", cls: "band bottom p-bar", g: 2 }, kids);
-  if (r.state === "reconnecting") return bar(barStatus(h("span", { class: "badge badge-muted lg" }, ic("pause"), t("ui.bar.paused")), t("ui.bar.paused_text"), null));
-  if (liveCap) {
-    const d = liveCap.dests.get(r.id);
-    const nRooms = liveCap.dests.size;
-    const pill = d.state === "live" ? h("span", { class: "badge badge-live lg" }, h("span", { class: "dot" }), t("ui.room.live_pill"))
-      : h("span", { class: "badge badge-progress lg" }, h("span", { class: "bar" }), d.state === "moving" ? t("ui.bar.moving") : d.state === "restarting" ? t("ui.bar.applying") : t("ui.bar.starting"));
-    const t2 = liveText(T("", "t2 mono"), () => {
-      const st = d.stats;
-      const subs = st ? t("ui.bar.viewers", { count: st.subscribers }) : "";
-      return `${codecLabel(d.codec)} · ${fmtKbps(allocated(d))}${subs ? " · " + subs : ""}`;
+/** The whole stage into its own window (Document PiP), or, with `back`, home again. Needs the click's user activation. */
+async function popStage(key, back) {
+  if (back) return closeStage();
+  try {
+    const sw = await popoutStage(key, () => {
+      S.stage.popped.delete(key);
+      if (S.menu && S.menu.hostId === "pop") S.menu = null;
+      S.card = null;
+      invalidate();
     });
-    return bar(SL(84, pill, { al: "l", min: true }), FILL(V({ g: 0 }, T(`${captureName(liveCap)} · ${d.fps} fps`, "t1"), t2), { v: true }),
-      audioControl(liveCap),
-      h("button", { class: "btn btn-secondary btn-lg", type: "button", id: "btn-stream-settings", onclick: () => openStreamModal(liveCap.id, r.id) }, ic("tune"), t("ui.bar.stream_settings")),
-      h("button", { class: "btn btn-secondary btn-lg", type: "button", title: t("ui.bar.rooms_tip"), onclick: (e) => openPopup("rooms", e.currentTarget) }, ic("cast"),
-        nRooms === 1 ? t("ui.bar.one_room") : t("ui.bar.n_rooms", { count: nRooms }), ic("expand_more")),
-      h("span", { class: "vsep" }),
-      h("button", { class: "btn btn-danger-solid btn-lg", type: "button", id: "btn-stop-sharing", onclick: () => { stopDest(liveCap, r.id); toast(t("ui.toast.stopped_in", { room: r.name }), "stop_circle"); } },
-        ic("stop_screen_share"), t("ui.bar.stop_sharing")));
+    bindWindow(sw.win, "pop");
+    S.stage.popped.add(key);
+    if (S.stage.fullscreen) toggleStageFullscreen(); // its own window cannot share the fullscreen of the main one
+  } catch (e) {
+    console.error("stage pop-out failed:", e);
+    toast(t("ui.toast.popout_failed", { error: e.message }), "error", { err: true });
   }
-  if (staged) {
-    const picking = staged.state === "picking";
-    return bar(barStatus(picking ? h("span", { class: "badge badge-progress lg" }, h("span", { class: "bar" }), t("ui.bar.picking")) : h("span", { class: "badge badge-muted lg" }, t("ui.bar.ready")),
-      picking ? t("ui.bar.picking_text") : t("ui.bar.not_live_yet", { screen: captureName(staged) }), picking ? t("ui.bar.picking_sub") : t("ui.bar.goes_live_in", { room: r.name })),
-    audioControl(staged, picking),
-    h("button", { class: "btn btn-secondary btn-lg", type: "button", disabled: picking, onclick: () => openStreamModal(staged.id, r.id) }, ic("tune"), t("ui.bar.stream_settings")),
-    h("span", { class: "vsep" }),
-    h("button", { class: "btn btn-secondary btn-lg", type: "button", onclick: () => discard(staged) }, t("ui.bar.discard")),
-    h("button", { class: "btn btn-primary btn-lg", type: "button", id: "btn-go-live", disabled: picking, onclick: () => goLive(staged, r) }, ic("cast"), t("ui.bar.go_live")));
+  render();
+}
+/** Leave a room: the confirm modal when something would be lost (an outgoing share or a live watch, native rule), else at once. */
+async function leaveRoom(r) {
+  if (capInRoom(r.id) || r.watches.size) {
+    S.menu = null;
+    S.modal = { kind: "leave", room: r.id };
+    return render();
   }
-  const others = S.captures.filter((c) => c.state === "live");
-  const canShare = caps.canShare && r.state === "joined";
-  return bar(
-    h("button", { class: "btn btn-primary btn-lg", type: "button", id: "btn-share", disabled: !canShare, title: caps.canShare ? null : t("ui.err.cannot_share"),
-      onclick: (e) => (others.length ? openPopup("share", e.currentTarget) : startStage(r)) }, ic("screen_share"), t("ui.bar.share_screen"), others.length ? ic("expand_more") : null),
-    h("button", { class: "btn btn-secondary btn-lg", type: "button", disabled: true, title: t("ui.bar.share_audio_tip") }, ic("volume_up"), t("ui.bar.share_audio")),
-    FILL(others.length ? T(t("ui.bar.live_elsewhere", { rooms: others.flatMap((c) => [...c.dests.keys()]).map((x) => (roomById(x) || { name: "?" }).name).join(", ") }), "t2") : null, { style: "padding-left:var(--s2)" }));
+  await disconnectRoom(r);
+  toast(t("ui.toast.left", { room: r.name }), "logout");
+  render();
 }
 
 async function startStage(r) {
-  S.popup = null;
+  S.menu = null;
   const c = await stage(r);
   if (c && S.view === "room" && S.selected === r.id && !S.modal) openStreamModal(c.id, r.id);
-}
-
-/** Audio control: hbox [slot 36 mute][source button]. The browser decides the audio source at pick time. */
-function audioControl(c, disabled) {
-  if (!c.audio) {
-    return h("button", { class: "btn btn-secondary btn-lg", type: "button", disabled: true, title: c.state === "picking" ? null : t("ui.bar.no_audio_tip") }, ic("volume_off"), t("ui.bar.no_audio"));
-  }
-  return H({ cls: "audio-ctl" + (c.audioMuted ? " muted" : ""), g: 0 },
-    SL(36, h("button", { class: "mute", type: "button", disabled: !!disabled, title: c.audioMuted ? t("ui.bar.unmute_audio") : t("ui.bar.mute_audio"), "aria-label": c.audioMuted ? t("ui.bar.unmute_audio") : t("ui.bar.mute_audio"),
-      onclick: () => setAudioMuted(c, !c.audioMuted) }, ic(c.audioMuted ? "volume_off" : "volume_up")), { style: "height:100%" }),
-    h("button", { type: "button", disabled: !!disabled, title: t("ui.bar.audio_source_tip"), onclick: (e) => openPopup("audio", e.currentTarget, { cap: c.id }) },
-      h("span", { text: t("ui.capture.audio_with", { screen: captureName(c) }) }), liveMeter(() => captureLevel(c)), ic("expand_more")));
 }
 
 /* ============================== stream settings modal ============================== */
 
 function openStreamModal(capId, roomId) {
-  S.popup = null;
+  S.menu = null;
   S.modal = { kind: "stream", cap: capId, room: roomId };
   render();
 }
@@ -604,11 +407,11 @@ function renderStreamModal(M, close) {
     } else editDest(c, r, patch);
   };
 
-  // Source
+  // Source: the Change button is there while setting up and while live (a live change restarts the share on the new source)
   const audioCell = h("span", { class: "val center" }, liveMeter(() => captureLevel(c)));
   const source = card(t("ui.stream.source"), null,
     ctrlRow(t("ui.stream.screen"), T(`${captureName(c)}${captureRes(c) ? " · " + captureRes(c) : ""}`, "ro"),
-      staged ? h("button", { class: "btn btn-secondary wide", type: "button", onclick: () => repick(c, r) }, t("ui.stream.change")) : undefined),
+      h("button", { class: "btn btn-secondary wide", type: "button", id: "btn-change-source", onclick: () => changeSource(c) }, t("ui.stream.change"))),
     ctrlRow(t("ui.stream.audio"), T(c.audio ? t("ui.stream.audio_from_source") : t("ui.stream.audio_none"), "ro"), audioCell, t("ui.stream.audio_tip")),
     ctrlRow(null, cbx(t("ui.stream.mute_audio"), c.audioMuted, () => setAudioMuted(c, !c.audioMuted), { disabled: !c.audio })));
 
@@ -627,8 +430,8 @@ function renderStreamModal(M, close) {
           onclick: () => { const last = c.dests.size === 1; stopDest(c, rid); if (last) S.modal = null; else if (rid === M.room) S.modal.room = [...c.dests.keys()][0]; render(); } }, ic("close")) : null,
       });
     })),
-    staged ? null : btnRow(h("button", { class: "btn btn-secondary", type: "button", onclick: (e) => openPopup("alsosend", e.currentTarget) }, ic("add"), t("ui.stream.also_send")),
-      h("button", { class: "btn btn-secondary", type: "button", onclick: (e) => openPopup("move", e.currentTarget) }, ic("swap_horiz"), t("ui.stream.move_to"))));
+    staged ? null : btnRow(h("button", { class: "btn btn-secondary", type: "button", ...opener("alsosend", "alsosend", { roomId: r.id, cap: c.id }) }, ic("add"), t("ui.stream.also_send")),
+      h("button", { class: "btn btn-secondary", type: "button", ...opener("move", "move", { roomId: r.id, cap: c.id }) }, ic("swap_horiz"), t("ui.stream.move_to"))));
 
   // Upload bandwidth
   const bw = S.settings.bw;
@@ -644,34 +447,29 @@ function renderStreamModal(M, close) {
   }
   const bwCard = card(t("ui.stream.upload_bandwidth"), t("ui.stream.all_streams"), bwRows);
 
-  // Video
-  const fpsSel = h("select", { class: "field", id: "st-fps", "aria-label": t("share.framerate_label"), onchange: (e) => edit({ fps: Number(e.target.value) }) },
-    FPS.map((f) => h("option", { value: String(f), selected: f === d.fps ? true : null, text: f + " fps" })));
-  fpsSel.value = String(d.fps);
-  // A codec this browser cannot encode does nothing when picked: its button is not drawn (#93, was greyed out). Not
-  // before the probe. A staged config whose codec is not encodable (an old or edited stored default) starts with the
-  // first encodable one instead, on the staged copy only: the stored default in S.settings.stream is never rewritten.
+  // Compression: codec and bitrate. A codec this browser cannot encode does nothing when picked: its button is not drawn (#93, was greyed
+  // out). Not before the probe. A staged config whose codec is not encodable (an old or edited stored default) starts with the first
+  // encodable one instead, on the staged copy only: the stored default in S.settings.stream is never rewritten.
   const codecOpts = CODECS.filter(([v]) => !encoders || encoders.has(v));
   if (staged && encoders && encoders.size && !encoders.has(d.codec)) d.codec = codecOpts[0][0];
-  const video = card(t("ui.stream.video"), null,
-    ctrlRow(t("share.framerate_label"), fpsSel, undefined, null, "st-fps"),
+  const compression = card(t("ui.stream.compression"), null,
+    // A single encodable codec leaves nothing to choose: no row.
+    codecOpts.length <= 1 && encoders ? null : ctrlRow(t("ui.stream.codec"), seg(codecOpts, d.codec, (v) => edit({ codec: v }))),
     bw.mode === "per_stream"
       ? sliderRow(t("ui.stream.bitrate"), "st-kbps", 500, 20000, 250, () => d.kbps, (v) => { d.kbps = v; }, String, t("ui.stream.bitrate_tip"), () => edit({ kbps: d.kbps }))
-      : ctrlRow(t("ui.stream.bitrate"), h("span", { class: "ro txt", style: "width:100%;text-align:right", text: t("ui.stream.set_by_budget") }), valBox(String(staged ? Math.max(bw.floor, Math.round(bw.total / Math.max(1, n) / 100) * 100) : allocated(d))), t("ui.stream.budget_tip")),
-    // A single encodable codec leaves nothing to choose: no row.
-    codecOpts.length <= 1 && encoders ? null : ctrlRow(t("ui.stream.codec"), seg(codecOpts, d.codec, (v) => edit({ codec: v }))));
+      : ctrlRow(t("ui.stream.bitrate"), h("span", { class: "ro txt", style: "width:100%;text-align:right", text: t("ui.stream.set_by_budget") }), valBox(String(staged ? Math.max(bw.floor, Math.round(bw.total / Math.max(1, n) / 100) * 100) : allocated(d))), t("ui.stream.budget_tip")));
 
-  // Encoder: the preset row only. Tune and Keyframe interval used to be read-only readouts of what the preset sets
-  // (latencyMode, forced keyframes); a row the user cannot change is a setting that does nothing, so they are hidden
-  // (#93), and the "Advanced tuning" disclosure with them (nothing is left in it).
-  const encRows = [
-    ctrlRow(t("ui.stream.preset"), seg(PRESETS.map(([v, k]) => [v, t(k)]), PRESET_TWIN[d.preset] || d.preset, (v) => edit({ preset: v }))),
-  ];
-  const enc = card(t("ui.stream.encoder"), null, encRows);
+  // Video: FPS (a dropdown in the app's own menu style), the preset and what it sets. A preset sets the FPS once; changing the FPS afterwards
+  // keeps its encoding mode and keyframe interval, so the caption is always "fps · mode · keyframe", never "(custom)".
+  const fpsSel = selectField({ id: "st-fps", opts: FPS_LIST.map((f) => [f, t("ui.stream.fps", { fps: f })]), cur: d.fps, onPick: (v) => edit({ fps: Number(v) }), title: t("share.framerate_label") });
+  const video = card(t("ui.stream.video"), null,
+    ctrlRow(t("ui.stream.fps_label"), fpsSel, undefined, null, "st-fps"),
+    ctrlRow(t("ui.stream.preset"), seg(PRESET_ORDER.map((p) => [p, presetLabel(p)]), d.preset, (v) => edit({ preset: v, fps: ENCODER_PRESETS[v].fps }))),
+    H({ g: 2 }, SL(LABEL_W, null), FILL(h("span", { class: "cap", id: "preset-cap", text: presetCaption(d.preset, d.fps) }))));
 
   const body = H({ g: 3, cls: "st", style: "align-items:flex-start" },
     V({ cls: "eq", g: 3 }, source, dests, bwCard),
-    V({ cls: "eq", g: 3 }, video, enc, staged ? null : h("span", { class: "hint", text: t("ui.stream.restart_note") })));
+    V({ cls: "eq", g: 3 }, compression, video, staged ? null : h("span", { class: "hint", text: t("ui.stream.restart_note") })));
   const applying = !staged && d.state === "restarting";
   const foot = staged
     ? [h("button", { class: "btn btn-secondary btn-lg", type: "button", onclick: () => discard(c) }, t("ui.bar.discard")), FILL(null),
@@ -685,140 +483,10 @@ function renderStreamModal(M, close) {
     SL(96, applying ? h("span", { class: "badge badge-progress lg" }, h("span", { class: "bar" }), t("ui.bar.applying")) : null, { al: "r", min: true }), t("ui.close"));
 }
 
-async function repick(c, r) {
-  const cfg = { ...c.staged };
-  discard(c);
-  S.modal = null;
-  const nc = await stage(r);
-  if (nc) {
-    Object.assign(nc.staged, cfg);
-    openStreamModal(nc.id, r.id);
-  }
-}
-
-/* ============================== popups ============================== */
-
-let popupAnchor = null;
-function openPopup(kind, anchor, extra) {
-  popupAnchor = anchor.getBoundingClientRect();
-  S.popup = Object.assign({ kind }, extra || {});
-  render();
-}
-function positionPopup() {
-  const p = root.querySelector(".popup");
-  if (!p || !popupAnchor) return;
-  const pr = p.getBoundingClientRect();
-  const W = window.innerWidth;
-  const Hh = window.innerHeight;
-  let left = popupAnchor.left;
-  if (left + pr.width > W - 8) left = W - pr.width - 8;
-  let top = popupAnchor.bottom + 6;
-  if (top + pr.height > Hh - 8) top = popupAnchor.top - pr.height - 6;
-  p.style.left = Math.max(8, left) + "px";
-  p.style.top = Math.max(8, top) + "px";
-}
-function closePopup() {
-  S.popup = null;
-  render();
-}
-
-function renderPopup() {
-  const P = S.popup;
-  const r = S.modal && S.modal.kind === "stream" ? roomById(S.modal.room) : sel();
-  const items = [];
-  const ph = (x) => H({ cls: "ph", g: 0 }, T(x));
-  const none = (x) => items.push(H({ cls: "pi none", g: 0 }, T(x)));
-  const c = r && (capInRoom(r.id) || (S.modal && S.modal.cap ? capById(S.modal.cap) : null));
-  const targets = () => S.rooms.filter((x) => r && x.id !== r.id && x.state === "joined");
-  const alsoItems = () => {
-    if (!targets().length) none(t("ui.popup.no_other_rooms"));
-    targets().forEach((x) => {
-      const has = c.dests.has(x.id);
-      items.push(popItem({
-        iconEl: h("span", { class: "cbx bare" + (has ? " on" : "") }, h("span", { class: "box" }, ic("check"))), label: x.name,
-        sub: has ? t("ui.popup.live_there") : t("ui.popup.people", { count: x.members.length }), role: "menuitemcheckbox",
-        onclick: () => { S.popup = null; if (has) stopDest(c, x.id); else addDest(c, x); render(); },
-      }));
-    });
-  };
-  const moveItems = () => {
-    if (!targets().length) none(t("ui.popup.no_other_rooms"));
-    targets().forEach((x) => items.push(popItem({
-      icon: "meeting_room", label: x.name, sub: c.dests.has(x.id) ? t("ui.popup.already_live") : t("ui.popup.move_sub"), disabled: c.dests.has(x.id),
-      onclick: () => { S.popup = null; moveDest(c, r, x); render(); },
-    })));
-  };
-  if (P.kind === "roommenu" && r) {
-    items.push(popItem({ icon: "edit", label: t("ui.room.rename"), onclick: () => { S.popup = null; S.modal = { kind: "rename", room: r.id, value: r.name }; render(); } }));
-    items.push(popItem({ icon: "content_copy", label: t("ui.room.copy_invite"), onclick: () => { S.popup = null; copyLink(r); render(); } }));
-    items.push(h("hr"));
-    items.push(popItem({ icon: "delete", label: t("ui.room.forget"), sub: t("ui.popup.forget_sub"), cls: "danger", onclick: () => { S.popup = null; S.modal = { kind: "forget", room: r.id }; render(); } }));
-  } else if (P.kind === "audio") {
-    const cap = capById(P.cap);
-    if (!cap) return h("div");
-    items.push(ph(t("ui.popup.audio_source")));
-    items.push(popItem({ icon: "speaker", label: t("ui.capture.audio_with", { screen: captureName(cap) }), sub: (cap.audio && cap.audio.label) || t("ui.popup.audio_from_browser"), cls: "sel", role: "menuitemradio", trailing: liveMeter(() => captureLevel(cap)), onclick: closePopup }));
-    items.push(h("hr"));
-    items.push(popItem({ icon: cap.audioMuted ? "volume_up" : "volume_off", label: cap.audioMuted ? t("ui.bar.unmute_audio") : t("ui.bar.mute_audio"), cls: cap.audioMuted ? "" : "danger", onclick: () => { S.popup = null; setAudioMuted(cap, !cap.audioMuted); } }));
-    none(t("ui.popup.audio_browser_note"));
-  } else if (P.kind === "alsosend" && c) {
-    items.push(ph(t("ui.popup.also_send_heading")));
-    alsoItems();
-  } else if (P.kind === "move" && c) {
-    items.push(ph(t("ui.popup.move_heading")));
-    moveItems();
-  } else if (P.kind === "rooms" && c) {
-    items.push(ph(t("ui.popup.also_send_short")));
-    alsoItems();
-    items.push(h("hr"));
-    items.push(ph(t("ui.stream.move_to")));
-    moveItems();
-  } else if (P.kind === "share" && r) {
-    items.push(ph(t("ui.popup.share_in", { room: r.name })));
-    S.captures.filter((x) => x.state === "live").forEach((x) => {
-      items.push(popItem({ icon: "add_to_queue", label: t("ui.popup.add_here", { screen: captureName(x) }), sub: t("ui.popup.add_here_sub"), onclick: () => { S.popup = null; addDest(x, r); render(); } }));
-      const from = [...x.dests.keys()].map((y) => roomById(y)).filter(Boolean);
-      items.push(popItem({ icon: "swap_horiz", label: t("ui.popup.move_here", { screen: captureName(x) }), sub: t("ui.popup.move_here_sub", { rooms: from.map((y) => y.name).join(", ") }),
-        onclick: async () => { S.popup = null; render(); for (const f of from) await moveDest(x, f, r); } }));
-    });
-    items.push(h("hr"));
-    items.push(popItem({ icon: "screen_share", label: t("ui.popup.share_different"), sub: t("ui.popup.share_different_sub"), onclick: () => startStage(r) }));
-  } else if (P.kind === "outgoing") {
-    items.push(ph(t("ui.sidebar.outgoing.heading")));
-    const ds = allDests();
-    if (!ds.length) none(t("ui.sidebar.outgoing.none"));
-    ds.forEach(({ cap, d }) => {
-      const rr = roomById(d.roomId);
-      items.push(popItem({ icon: "cast", label: rr ? rr.name : "?", sub: t("ui.sidebar.outgoing.sub", { screen: captureName(cap), fps: d.fps, kbps: allocated(d) }),
-        onclick: () => { if (rr) { select(rr, false); openStreamModal(cap.id, rr.id); } } }));
-    });
-    if (ds.length) {
-      items.push(h("hr"));
-      items.push(popItem({ icon: "stop_screen_share", label: t("ui.sidebar.outgoing.stop_all"), cls: "danger", onclick: () => { S.popup = null; stopAll(); toast(t("ui.toast.stopped_all"), "stop_circle"); } }));
-    }
-  }
-  return V({ cls: "popup", g: 0, attrs: { role: "menu" } }, items);
-}
-
-document.addEventListener("mousedown", (e) => {
-  if (!S.popup) return;
-  if (e.target.closest(".popup")) return;
-  S.popup = null;
-  setTimeout(render, 0);
-}, true);
-document.addEventListener("keydown", (e) => {
-  if (e.key !== "Escape") return;
-  if (S.popup) closePopup();
-  else if (S.modal) {
-    S.modal = null;
-    render();
-  }
-});
-
 /* ============================== modals ============================== */
 
 function openAdd(tab = "join") {
-  S.popup = null;
+  S.menu = null;
   S.modal = { kind: "add", tab, name: "", link: "", server: S.settings.lastServer, hash: S.settings.lastCertHash, error: null, minted: null };
   render();
 }
@@ -826,7 +494,7 @@ function openAdd(tab = "join") {
 function renderModal() {
   const M = S.modal;
   const close = () => { S.modal = null; render(); };
-  const scrim = V({ cls: "scrim", g: 0, attrs: { onmousedown: (e) => { if (e.target === scrim) close(); } } });
+  const scrim = V({ cls: "scrim", g: 0, attrs: { onmousedown: (e) => { if (e.target === scrim && !S.menu) close(); } } });
   let modal;
   const lgBtn = (cls, label, onclick, icon, disabled, id) => h("button", { class: "btn btn-lg " + cls, type: "button", disabled: !!disabled, onclick, id: id || null }, icon ? ic(icon) : null, label);
   const spacer = () => FILL(null);
@@ -893,7 +561,10 @@ function renderSettings(close, lgBtn, spacer) {
   const commit = () => { persistSettings(); applyJitterSettings(); };
   return modalShell("wide", t("settings.header"), null, close, [
     card(t("ui.settings.profile"), null, ctrlRow(t("join.display_name_label"), nameIn, undefined, t("ui.settings.name_tip"), "set-name"),
-      h("span", { class: "hint", text: t("ui.settings.name_note") })),
+      h("span", { class: "hint", text: t("ui.settings.name_note") }),
+      // The avatar: an emoji instead of the initial, on a colour taken from the emoji. A browser has system emoji fonts, so any emoji can be pasted.
+      ctrlRow(t("ui.settings.avatar"), h("button", { class: "btn btn-secondary", type: "button", id: "btn-avatar", title: t("ui.settings.avatar_tip"), ...opener("emoji", "emoji") },
+        avatarEl(displayName(), st.emoji, { sm: true }), st.emoji ? t("ui.settings.avatar_change") : t("ui.settings.avatar_pick")), undefined, t("ui.settings.avatar_tip"))),
     card(t("settings.language_label"), null, ctrlRow(t("settings.language_label"), seg([["en", "English"], ["de", "Deutsch"]], st.lang, (v) => { st.lang = v; setLang(v); persistSettings(); render(); }))),
     card(t("ui.settings.playback"), null,
       sliderRow(t("ui.settings.jitter"), "set-jitter", 0, 5000, 100, () => st.jitter, (v) => { st.jitter = v; }, (v) => (v / 1000).toFixed(1) + " s", t("ui.settings.jitter_tip"), commit),
@@ -1065,6 +736,22 @@ async function clip(text) {
 }
 const copyLink = (r) => clip(r.inviteLink());
 
+// Escape closes the modal (an open menu takes the key first, in stage.js: Escape in a dropdown closes the dropdown alone).
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && S.modal) {
+    S.modal = null;
+    render();
+  }
+});
+
+/** My emoji avatar (Settings > Profile): saved, and announced to every connected room's relay. */
+function setEmoji(e) {
+  S.settings.emoji = e;
+  persistSettings();
+  for (const r of S.rooms) if (r.client) r.client.setAvatar(e);
+  render();
+}
+
 /* ============================== boot ============================== */
 
 setLang(S.settings.lang);
@@ -1094,4 +781,11 @@ function joinFromHash() {
   render();
 }
 window.addEventListener("hashchange", joinFromHash);
-window.__sss = { S, render }; // debugging handle (also used by the local verification scripts)
+Object.assign(A, {
+  render, liveText, liveMeter, openStreamModal, startStage, copyLink, leaveRoom, doPopOut, doFullscreen, watchAndPop, popStage, setEmoji,
+  toggleStageFullscreen,
+  openModal: (m) => { S.menu = null; S.modal = m; render(); },
+  selectRoom: (r, then) => { select(r, false); if (then) then(); },
+});
+bindWindow(window, "main");
+window.__sss = { S, render, vg, stageWindow }; // vg / stageWindow: for the dev harness (docs/dev/e2e/stage.mjs) // debugging handle (also used by the local verification scripts)

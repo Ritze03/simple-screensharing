@@ -185,7 +185,7 @@ const share = await client.startShare({
   audio: false,                 // also capture + share audio (only if the browser offers it for the chosen source)
   codec: "auto",                // "h264" | "h265" | "av1"; auto = h264
   fps: 60, bitrateKbps: 8000,
-  preset: "balanced",           // low_latency | balanced | quality | gaming  (see below)
+  preset: "quality",            // text | quality | gaming (balanced and low_latency are aliases of quality; see below)
   label: "Screen", previews: true,
   stream,                       // a MediaStream to share instead of calling getDisplayMedia (tests, custom pickers)
   displayMediaOptions,          // merged into the getDisplayMedia() argument
@@ -219,9 +219,9 @@ Behaviour that matches the native sender:
 
 | native (`client/src/presets.rs`) | browser |
 | --- | --- |
-| tune `LowLatency` / `BestQuality` | `latencyMode: "realtime"` / `"quality"` |
+| encoding mode `Performance` / `Quality` (Gaming is Performance, Text and Quality are Quality; `ENCODER_PRESETS` also carries each preset's `fps`: 15, 60, 120) | `latencyMode: "realtime"` / `"quality"` |
 | rate control (not a setting since #88; was Static/Dynamic) | always `bitrateMode: "variable"` (native: always VA `vbr`). CQP needs per-frame quantizers and Chromium 153 reports `bitrateMode: "quantizer"` unsupported for H.264 |
-| GOP / keyframe interval (2 s, Gaming 0.75 s) | forced keyframes every `gopMs` (WebCodecs has no GOP knob) |
+| GOP / keyframe interval (Text 250 ms, Quality 1000 ms, Gaming 250 ms; `DEFAULT_GOP_MS` 1000) | forced keyframes every `gopMs` (WebCodecs has no GOP knob) |
 | quality level (x264 speed-preset, VA target-usage) | **native-only**: no WebCodecs equivalent |
 | H.264 profile/level | chosen from size and fps (High, falling back to Main, then Baseline), `probeEncoders()` shows what works |
 
@@ -287,3 +287,22 @@ Both issues found while building the core (JoinRejected lost to a connection dro
 by relay task #29 and verified in `dev/scenarios.js` ("room is full", "relay restart", "close codes"). What remains: the relay's
 application close codes are invisible to Chromium (see "Relay close codes"), and an undecodable first control frame is dropped
 without any reply (`read_control_frame(...)?` in `perform_join`), so a browser with a protocol bug sees `join-no-reply`.
+
+## Emoji avatars (spec §9.2, task I6)
+
+`protocol.js`: `AVATAR_TAG_HELLO/ACK/SET/LIST` (`0xE9`-`0xEC`), `packAvatarSet` / `unpackAvatarSet`, `packAvatars` / `unpackAvatars` (twins of `protocol::{pack_,unpack_}avatar_set`
+and `{pack_,unpack_}avatars`; `unpack*` return `null` for anything malformed, truncated, with trailing bytes, an empty or over-16-byte entry or invalid UTF-8).
+
+`RoomClient`:
+
+```js
+client.setAvatar("🦊");        // "" = none; at most 16 UTF-8 bytes (a longer one is ignored); kept across reconnects
+client.emojiOf(memberId);     // "" = none: mine from my own setting (shows at once and on an older relay), the others' from the relay's list
+client.avatarsSupported;      // the relay acked our AvatarHello on this connection (false on an older relay: nobody else's emoji ever shows)
+client.avatars;               // Map(hex ConnId -> emoji): the relay's last whole list
+client.addEventListener("avatars", () => ...);   // the Ack arrived or the list CHANGED (the relay repeats it every 3 s; repeats do not fire)
+```
+
+Behaviour: after joining, AvatarHello once a second (at most 10 times) until the Ack; after the Ack AvatarSet every 250 ms until the relay's list shows our own ConnId with
+the wanted emoji (that entry is the Set's only acknowledgement; a change while connected is the same loop; a reconnect has a new ConnId and starts again). A list is tested by its tag
+byte `0xEC` **before** the media path (it can be longer than a media header), the whole per-room map is replaced by each valid list, a member's entry goes with `MemberLeft`.

@@ -55,8 +55,9 @@ docs/dev/        harness, tests, scenarios, e2e        (README.md)  not linked f
   without the hash, plain) yields the hedged "offline or invite link outdated" message; once it has worked, a failing reconnect says "relay not answering"
   and never blames the link.
 
-`docs/js/ui/`: `app.js` (render + modals), `dom.js` (`V`/`H`/`SL`/`FILL` = the same vbox/hbox/slot/fill
-layout model as native, see `superdoc/meta/TERMINOLOGY.md`, plus shared row patterns), `store.js`, `rooms.js`
+`docs/js/ui/`: `app.js` (render, sidebar, modals), the stage (`stage.js`, `stage-state.js`, `stage-geom.js`, `bar.js`, `menus.js`, `chrome.js`,
+see "The stage" below), `dom.js` (`V`/`H`/`SL`/`FILL` = the same vbox/hbox/slot/fill
+layout model as native, see `superdoc/meta/TERMINOLOGY.md`, plus shared row patterns and the avatar builder), `store.js`, `rooms.js`
 (one `RoomEntry` per saved room), `capture.js` (captures and destinations), `popout.js`, `i18n.js`
 (en/de, native `%{var}` placeholders; German strings match `client/locales/de.yml`). The UI is a full
 re-render from state with persistent media nodes (the `<canvas>` per watch survives re-renders).
@@ -72,13 +73,12 @@ Watch and share both work. Differences from native, all platform limits:
   nothing in the browser** (user rule 2026-11-01, #93: "If a setting doesn't do anything, hide it (Yes,
   even when its just a browser limitation). Just hide it, so other platforms can still use it."): no
   Quality level, Tune or Keyframe interval rows (and no "Advanced tuning" disclosure, nothing is left in
-  it), no Low-Latency preset button (identical to Balanced here; a stored `low_latency` shows as
-  Balanced and is kept as is), no greyed-out codecs (an unencodable codec has no button, the Codec row
+  it; since I2/I6 the presets are Text, Quality and Gaming like native, a stored `balanced` or `low_latency` loads as Quality), no greyed-out codecs (an unencodable codec has no button, the Codec row
   goes when at most one is left). Hidden only in the UI: the core's `ENCODER_PRESETS`, the persisted
   settings and the native app keep the setting. Details and the "why": `ui/APP-SHELL.md` (2026-11-01).
-- **Viewer volume is 0-500 %** (task #96, 2026-11-02): a WebAudio `GainNode` (`core/audio.js` `MAX_VOLUME = 5`), tile slider
-  with a tick and a snap at 100 % (`ui/dom.js` `snapVolumePct`, `.vol` in `app.css`). Loud audio hard-clips at the device, no
-  limiter. The mouse wheel over the slider steps it (`volumeWheel`, `wheelStepVolumePct`, #113). Watched audio is levelled before the slider (`core/leveller.js`, Settings > Playback > Level loudness, default on, #119); a small `graphic_eq` toggle button after the percentage in the tile's audio pill (`levelToggle`, `.audio-pill button.level`, #126) flips the same global `levelLoudness` setting as the Settings checkbox (accent ring = on). Details and the why: `features/audio-sharing.md` (2026-11-02, 2026-11-03). In Firefox the tick only shows on the unfilled part of the track.
+- **Viewer volume is 0-500 %** (task #96, 2026-11-02): a WebAudio `GainNode` (`core/audio.js` `MAX_VOLUME = 5`), the slider in the stream menu (since I6; before
+  that on the tile's audio pill) with a tick and a snap at 100 % (`ui/dom.js` `snapVolumePct`, `.vol` in `app.css`). Loud audio hard-clips at the device, no
+  limiter. The mouse wheel over the slider steps it (`volumeWheel`, `wheelStepVolumePct`, #113). Watched audio is levelled before the slider (`core/leveller.js`, Settings > Playback > Level loudness, default on, #119); since I6 the stream menu's "Level loudness" switch flips the same global `levelLoudness` setting as the Settings checkbox (the tile's audio pill with its `graphic_eq` button, #126, is gone: the pill moved into the menu, like native). Details and the why: `features/audio-sharing.md` (2026-11-02, 2026-11-03). In Firefox the tick only shows on the unfilled part of the track.
 - **No audio source choice:** only what `getDisplayMedia({audio})` returns; the audio control is
   mute only. Native has the per-application picker (`pw-loopback`).
 - **Capture is damage-driven:** a static screen delivers no frames; the core re-encodes the newest
@@ -94,6 +94,122 @@ Watch and share both work. Differences from native, all platform limits:
   Connection lost.`, no `closeCode`), so the relay writes `JoinRejected{RoomFull|Malformed}` on the
   control stream first and `connect()` rejects with `JoinRejectedError`. The UI shows "This room is
   full (8 people at most)".
+
+## The stage (task I6, 2026-11-04)
+
+The browser client got the stage of the native client (`superdoc/ui/APP-SHELL.md` "The stage", design approved in the replica
+`superdoc/ui/replica/index.html`, `ui/STYLING-GUIDE.md` "HTML replica"). It replaces the room's "On screen" tiles and "Sharing in this room" cards, the
+People list on the right, the bottom action bar and the old popups, and the Watched view. Classic views were not built. A joined room and the whole
+"Watched streams" view are one black stage with the streams, the people strip and the control bar; a room that is not joined (connecting,
+reconnecting, not connected) keeps the scrolling body with its banner and a `⋯` in the header for the Room settings menu (native
+`room::shows_stage`).
+
+| module | |
+| --- | --- |
+| `stage.js` | the stage: tiles (watched video, idle "X is sharing Y", own share), arena layout, resize bars and drags, the people strip and hover card, the viewers dropdown, fullscreen + its auto-hiding chrome, the window listeners |
+| `stage-state.js` | what a view shows (`collect`) and the per-view layout (`vg`: order, z, floating rects, grid; UI-private, per session, not persisted), keyed by `stableKey` |
+| `stage-geom.js` | the pure maths, a line-for-line port of native `stage/geom.rs` (`bestRows`, `place`, `dragBar`, `fitFloat`, `resizeFloat`, `cardKeeps`), same tests |
+| `chrome.js` | the pure fullscreen auto-hide rule, a port of native `stage/chrome.rs`, same tests |
+| `bar.js` | the control bar (split buttons, groups, Leave, pop out, fullscreen) |
+| `menus.js` | every dropdown and context menu: Share, Audio, Layout, Room, the stream menu, the avatar picker, "Also send to / Move to", and the dropdown *field* (`selectField`) |
+| `actions.js` | the hooks app.js hands the stage modules (they cannot import it: app.js imports them) |
+
+**Layouts** (per view; each room and Watched keep their own): **Split** every picture whole in a grid (the row count that shows the most picture area,
+rows filled evenly from the top), **Crop** the same cells filled (the picture is `max(100cqw, 100cqh * ar)` and the tile clips it), **Floating**
+one window per stream. A drag on a resize bar, a floating window or a reorder updates styles directly and holds `render()` back until the pointer is up
+(`isDragging`; a slider being dragged does the same, `sliderHeld` in app.js): the full re-render would replace the element under the pointer.
+Positions are applied after the new tree is inserted (`afterRender` -> `layoutArena`), the video `<canvas>` of a watch is re-adopted by the new tree as before.
+A 400 ms poll re-lays-out an arena when a stream's picture changes shape, so a floating window keeps its stream's aspect ratio without black bars.
+
+**Behaviour that follows native, not the replica** (the native code carries the fixes found in testing; D1 in the plan):
+- *Resize bars:* with the pointer between streams, including the black space around a picture, every bar shows dark grey (CSS
+  `.arena:hover:not(:has(.st-tile:hover))`); over a stream they hide; the bar under the pointer is blue and stays blue for the whole drag while the others hide
+  (`.gut.on`, `.arena.dragging`). A bar sits midway between the two *visible* pictures (`place`), and a dragged bar stays under the pointer (`dragBar` bisects
+  the split, 24 steps, limit 12 % of the pair). Double-click a bar: even grid.
+- *Floating:* `fitFloat` re-applies the stream's aspect every layout (width wins); the corner handle moves the corner to the nearest point of the diagonal
+  (`resizeFloat`), so moving only left or only up shrinks too; press raises.
+- *Tile overlays:* buttons and stats only while hovered; the name tag too unless "Always show names". The stats pill reserves `9999x9999`, `999 fps` and
+  `99.9 Mbps` slots (`.tag .v`), so it is as wide as its content and never jitters; a narrow tile drops the resolution, then the rate (`fitTags`, native `stats_fields`).
+  "Hide my own streams" removes your screen from your stage only.
+- *People strip and hover card:* ring, avatar, LIVE badge and name share one centre line (the badge is positioned from the avatar's size, no transform); the ring is one
+  2 px circle border 4 px outside the avatar (`::before { inset: -4px }`), even all round. Everyone who shares gets the same card, one row per stream with Audio / No
+  audio, numbers and state. **The card is kept open by pointer geometry** (`cardKeeps`: the card, the avatar and the gap straight above it, 3 px grown), not by the
+  replica's `::after` bridge under the card: a card is wider than a person's cell, so a bridge or the union of card and avatar covered the neighbours' avatars
+  and cards stacked (the native bug of D1). A popped-out stream is off the stage, shows only on its owner's avatar (dashed outline + badge) and comes back from the
+  avatar or the card's "Bring back".
+- *Dropdowns:* every dropdown is the app's `.menu` (icons, sub-lines, a lit current row), no native `<select>` anywhere; a dropdown field opens under itself, as wide as it.
+  Escape with a menu open closes the menu alone (stage.js handles the key in the capture phase and stops it, so the modal under a dropdown stays). A menu closes on any
+  click outside it, and a second click on the control that opened it closes it too (`data-mk` pairs menu and opener). *Why click and not mousedown:* closing on mousedown
+  re-rendered between press and release, so the release never made a click on the button under the pointer.
+- *Fullscreen:* the bar's button makes `#app` fullscreen (not the stage: `render()` rebuilds the stage, and a fullscreen element removed from the DOM drops fullscreen,
+  `#app` persists) and renders only the stage; the strip and bar lie over the streams (`.stagefs`, the arena keeps the whole window minus 8 px, so streams don't jump
+  when they fade). They hide after 3 s without movement while the pointer is on the stage and at once when it leaves the window (`mouseleave` on `<html>`); movement, a
+  press, the wheel or a key bring them back; an open menu, modal or drag holds them up and stops the timer, and when it ends they get a full 3 s (`chrome.js`, tested like
+  native). The hover buttons and the cursor go with them (`.chrome-off`, `!important` because `.st-tile:hover .hover-ui` is more specific). In the browser "the middle part"
+  of native is the whole window, since the stage is the window.
+- *Streams don't jump* and *a tall bar swallows no clicks:* in fullscreen the chrome has `z-index: 30` over the bars' 20.
+
+**The stream menu** (`⋯` or a right click on a tile): header, Volume (mute, slider 0-500 % acting **during the drag**, scrolling on it 5 % a notch up to 200 %, 10 % above,
+`volumeWheel`), Level loudness (the global setting), Show stats on the stream, Pop out, Fullscreen, Stop watching; an unwatched tile: Watch stream / Pop out; your own
+tile: Stream settings / Stop sharing. **Share menu** (the Share button's arrow): state header, FPS and Preset (for the live destination, the staged stream or the next one),
+Change source, All stream settings, Go live / Stop sharing; when your share is live in another room, Add here / Move here stay reachable. **Stream settings modal**: Source (with
+**Change** while setting up and while live: `capture.js` `changeSource` picks again and restarts every destination on the new tracks, the new share first, like a live FPS
+change), Compression (Codec, Bitrate), Video (FPS dropdown, Preset Text / Quality / Gaming and its caption `fps · mode · keyframe`, never "(custom)"). A preset sets the FPS
+once (`ENCODER_PRESETS[p].fps`); changing the FPS by hand keeps the preset's encoder mode and keyframe because the preset name stays and `startShare` takes `fps` separately.
+`store.js` loads a stored `balanced` / `low_latency` as `quality`.
+
+**Pop-outs.** A stream's pop-out is unchanged (Document PiP, fallback fullscreen) but **survives a reconnect or a relay restart**: `endWatch` keeps the window open while the 60 s
+resume entry lives, `resumeWatches` moves the new watch's canvas into it (`popout.js` `rebind`), and after 60 s without the stream the window closes. *Why keep it open and
+not re-open it:* a Document PiP window needs a user gesture and a reconnect has none. **The whole stage** can pop out too (`popStage`, the bar's button; Document PiP only, so
+the button is hidden without it): the same `renderStage` tree is rendered into the PiP window's document (`renderPop`), the main window shows "The stage is open in its own
+window" + Bring it back, and the window stays open while its room is suspended (a note meanwhile) and goes home when the room is left. Its bar has no sidebar and no fullscreen
+button (a PiP window cannot go fullscreen) and its pop-out button brings the stage back. A modal opened from it (Rename, Stream settings) appears in the main window.
+
+**Control bar.** Share screen, Share audio, Webcam, Layout and Room settings are split buttons with an always-visible arrow cut off by a separator line (inset 1 px
+`box-shadow`); grouped buttons sit on a backdrop (`--stage-btn`), the freestanding ones (hide sidebar, Copy invite link, pop out, fullscreen) have none; Leave is 64x50,
+as tall as a group (4 px padding + 40 px button + 1 px border each side); the people button shows and hides the strip. Narrow stages degrade by container queries on `.stg`
+(label first, then two rows). **Share audio keeps today's behaviour**: audio rides along with the picked screen, so the button is the mute switch (enabled only when the
+source has audio) and the arrow opens the same one-source menu with its meter. *Where I9 and I10 plug in:* `bar.js` builds the three split buttons of the first group
+(`shareBtn`, `audioBtn`, `camBtn`); I9 changes `audioBtn` (desktop audio, audio-only: also a `kind: "audio"` item type in `stage-state.js` `collect`, which now skips
+audio-only senders) and the `audioMenu` body in `menus.js`; I10 enables `camBtn` (currently `disabled` with the "not available yet" tooltip, its `menu: { kind: "cam" }` is
+declared) and adds a `cam` entry to `menus.js` `BODIES`; "Webcam in picture" in the Layout menu is a disabled checkbox until then. `getUserMedia` would go next to
+`capture.js` `stage()` (`getDisplayMedia`), a capture is then `{ video, audio, stream, ... }` either way.
+
+## Emoji avatars (task I6, 2026-11-04)
+
+The wire format is `protocol-spec.md` §9.2 (`AvatarHello 0xE9`, `AvatarAck 0xEA`, `AvatarSet 0xEB`, `AvatarList 0xEC`). Core: `protocol.js` `packAvatarSet` / `unpackAvatarSet` /
+`packAvatars` / `unpackAvatars` (the Rust test's vectors are in `dev/tests.js`), `RoomClient.#startAvatars` (Hello once a second, at most 10 times, until the Ack),
+`#onAvatarDatagram` (tag `0xEC` is tested **before** the media path, like `ViewersList`: a list can be longer than 19 bytes; a truncated list, trailing bytes or a bad entry
+is discarded whole; each list replaces the room's map; the UI hears about it only when the map changed, the relay repeats it every 3 s), `#syncAvatar` (after the Ack, re-send
+AvatarSet every 250 ms until the relay's list shows my own ConnId with my emoji: that entry is the Set's only ack; a reconnect has a new ConnId and runs it again),
+`setAvatar(emoji)`, `emojiOf(id)` (mine from my setting, so it shows at once and on an older relay). An older relay never acks: nobody else's emoji shows, the initial does.
+
+UI: Settings > Profile > Avatar opens the picker (`menus.js` `emojiMenu`: the replica's 40 emoji, a "Paste any emoji" field that takes the last grapheme, "Use my initial"; a pick
+closes the picker); the choice is `settings.emoji` in `localStorage` (`store.js`), announced to every room at connect and on change (`app.js` `setEmoji`). **Rendering** is
+`dom.js` `avatarEl`, the one builder (strip, hover card, stream menu header, idle tile, viewers dropdown, sidebar user band): the background comes from the emoji's strongest hue
+(`emojiInfo`: the emoji drawn on a 48 px canvas, 10-degree bins weighted by saturation, `null` for a colourless one like 💀 which gets a neutral slate), a thin black outline follows
+its shape (four 1 px `drop-shadow`s), and **the visible pixels are centred** (the same canvas pass measures the bounding box of the opaque pixels, `translate` moves the glyph
+by the difference to its em box; D1's "crop and centre"). *Why the replica's system-font approach and not native's 40 bundled pictures:* a browser has system emoji fonts; the
+native client draws only its 40 and shows the initial for any other emoji, which is fine for it. Without an emoji the avatar is the name's gradient as before.
+
+Checked 2026-11-04 (`docs/dev/e2e/stage.mjs`, headless Chromium, own relay): Alice picks 🦊, Vera sees it on her avatar over the datagrams, the orange background, the four-shadow
+outline, 💀 on slate, a pasted 🐻, text refused with a hint, Use my initial, the setting in `localStorage`, the hover card carries it, it is announced again after a relay
+restart. With `SSSHARE_AVATARS=0` (acts like an older relay) the owner sees her own, the other sees the initial. **Browser and native in one room** (headless rig,
+`HS_EMOJI_1=🦊`, a headless Chromium joining the rig's room by its join link): the native client's 🦊 shows on its avatar in the browser, and the browser's 🐻 (picked in Settings)
+shows on the native viewer's strip; native draws any of its 40, the browser any emoji.
+
+## What the stage tests cover (D1, task I6)
+
+`docs/dev/e2e/stage.mjs` drives the real UI with CDP pointer input (details and results: `docs/dev/README.md` "Stage end to end"): four pages (three sharers, one viewer who shares
+too), 138 checks with the relay restarts: control bar (arrows, separators, backdrops, Leave height, no people list), bars (hidden over a stream, grey between, blue under the
+pointer and during the whole drag, midway, 60 px = 60 px, the 12 % limit, even grid, horizontal, reorder), Crop, Floating (ratio, move, corner resize left/up/down-right, edge,
+raise), overlays (hover, stats slots without jitter, narrow tile, Always show names, Hide my own streams), strip and card (centre line, ring, same card for all, keep zone, no
+stacking, popped-out badge, Bring back), volume (during the drag, the wheel steps), menus (no `<select>`, dropdown width and place, Escape), presets and captions, Change source,
+Watched, fullscreen auto-hide (3 s, leave, key, menu hold + full 3 s, a bar button over a resize bar), emoji (above), pop-out survives a relay restart, the stage window.
+
+**What differs from native, and why:** no audio-only tiles and no Listen yet (I9); Webcam is a disabled button (I10); the stage pop-out needs Document Picture-in-Picture; the
+fullscreen is the page's, so "leaves the middle part" is leaving the window; modals are the page's (Rename, Stream settings appear over the stage, not in a viewport); the
+emoji picker takes any emoji; the Layout menu's "Webcam in picture" is disabled; `Escape` in fullscreen is the browser's: Chromium leaves fullscreen itself (the page hears `fullscreenchange`, not the key), so with a menu open in fullscreen the first Escape may leave fullscreen instead of closing the menu (not tested; the e2e closes the menu with a synthetic Escape key).
 
 ## Display name and room name in join links (task #69, 2026-10-15)
 
@@ -167,13 +283,12 @@ Both user requests, mirrored from the native client (`superdoc/ui/APP-SHELL.md`,
 ## Own-tile live preview (task #78, 2026-10-15)
 
 User request 2026-10-15: "For the sharer, it should show a stream preview, while he is tabbed into the program. Otherwise, its
-fine to hide it." The sharer's own card in "Sharing in this room" (`app.js` `myCard`) holds a persistent muted `<video
+fine to hide it." The sharer's own tile on the stage (`stage.js` `tileEl`, kind `mine`; before I6 the card in "Sharing in this room") holds a persistent muted `<video
 class="live-preview">` (`capture.js` `previewFor`) playing `new MediaStream([c.video])` (video only, never audio; audio-only
 captures get none). It is attached only while `document.visibilityState === "visible" && document.hasFocus()`; `visibilitychange`
 / `focus` / `blur` pause it and drop `srcObject`, and the element is `hidden`, so the placeholder shows and nothing is composited
 (the track itself keeps feeding the encoder). *Why a persistent element:* `render()` rebuilds the tree on every state change, so
-`myCard()` re-inserts the same element and playback never restarts. A `PREVIEW` chip (CSS `:has()` on the thumb) replaces the "Your
-screen" label while it plays. Native counterpart and shared rationale: `superdoc/features/self-preview.md`.
+`tileEl()` re-inserts the same element and playback never restarts. A `PREVIEW` chip (`.pchip`, shown by CSS `:has()` while it plays) is among the tile's hover buttons; the "Your screen" placeholder hides while it plays. Native counterpart and shared rationale: `superdoc/features/self-preview.md`.
 E2E: `docs/dev/e2e/live-preview.mjs <relay host:port> <certhash>` (headless Chromium: headless reports `document.hasFocus() ===
 false` by default, so the run switches focus with CDP `Emulation.setFocusEmulationEnabled`, and hides the page with a second tab +
 `Page.bringToFront`; checks attached/playing/video-only, survives `render()`, detached when unfocused or hidden, resumes).
@@ -184,10 +299,10 @@ User request: the sharer sees who watches, as a viewer number with a hover dropd
 feature as native (`protocol-spec.md` §9.1: `ViewersHello` datagram `0xE6`, relay `ViewersAck` `0xE7`, `ViewersList` `0xE8`).
 Core: `room-client.js` `#startViewersHello` (once a second, at most 10, after every (re)join), `#onViewersDatagram` (a datagram
 whose first byte is >= `0xE0` never goes down the media path), `ShareHandle.viewers()` (display names from the roster, sorted;
-`null` while the relay has not acked, so the UI draws nothing on an older relay), a 7 s expiry per share. UI: `app.js` `viewersChip`
-in the own card's thumb (`[viewers][PREVIEW]`) and `renderViewersPop` for the dropdown (`.vpop` in `app.css`, the same
-`.avatar.sm` as the People list). *Why a body-level `.layer` popup and not CSS `:hover`:* the thumb clips its content (rounded
-corners) and a list of 7 rows is taller than the thumb. The dropdown is rebuilt by every `render()` like the other popups, so it
+`null` while the relay has not acked, so the UI draws nothing on an older relay), a 7 s expiry per share. UI: `stage.js` `viewersChip`
+on the own tile's hover buttons (`[PREVIEW][viewers][tune]`) and `viewersPopEl` for the dropdown (`.vpop` in `app.css`, the same
+`.avatar.sm` as the people strip). *Why a body-level `.layer` popup and not CSS `:hover`:* the tile clips its content (rounded
+corners) and a list of 7 rows is taller than the tile. The dropdown is rebuilt by every `render()` like the other popups, so it
 follows live changes; its position is recomputed from the chip after each render, and it closes when the pointer leaves chip
 and popup. Verified end to end by `docs/dev/e2e/viewers.mjs <relay host:port> <certhash> [--old]` (headless Chromium: Alice shares, Bob and
 Zoë watch; chip 0 -> 2, dropdown rows and avatars, pointer into the dropdown keeps it open, a viewer leaving updates it live, 0
@@ -383,13 +498,3 @@ sharer), a browser that does report `smoothedRtt` (no such browser was available
 The repo is **private**; the project owner enables GitHub Pages later, so there is no public URL yet
 (the site will live under `/simple-screensharing/`). Until then test only locally as above. Nothing
 in `docs/` may rely on a CDN or a server-side route.
-
-## Share-card grid (task #120, 2026-11-03)
-
-Same rule as native (`superdoc/ui/APP-SHELL.md` "Sharing in this room" card grid; user report: the grid added empty columns, so
-one card shrank as the window grew). `dom.js` `cardShape(n, w, h)` mirrors `room::card_grid_shape`: 1..min(n, columns >= 260)
-columns, card width limited by column width, viewport height (16:9 thumb + 112 px per row) and 640, biggest wins, ties to more
-columns; `app.js` passes the `.p-center` width/height and caps the rows at `cols * w + gaps` (left-aligned). After every render
-`app.js` re-renders once if the centre's width or height moved > 4 px (the card size is continuous now, not a column count).
-`.p-center` has `scrollbar-gutter: stable` so a scrollbar appearing cannot narrow the area and flip the shape back and forth.
-Test: `docs/dev/tests.js` "card grid".

@@ -25,11 +25,11 @@ const site = await L.serveSite(0);
 const A = await L.openApp(site.url, { name: "client-1" });
 const probe = () =>
   A.page.eval(`(() => {
-    const v = document.querySelector(".thumb.mine > video.live-preview");
+    const v = document.querySelector(".st-tile.mine .vid > video.live-preview");
     if (!v) return null;
     return { hidden: v.hidden, attached: !!v.srcObject, tracks: v.srcObject ? v.srcObject.getTracks().map((t) => t.kind) : [],
-      w: v.videoWidth, t: v.currentTime, paused: v.paused, chip: getComputedStyle(document.querySelector(".thumb.mine .pv")).display,
-      label: getComputedStyle(document.querySelector(".thumb.mine .mine-label")).display,
+      w: v.videoWidth, t: v.currentTime, paused: v.paused, chip: getComputedStyle(document.querySelector(".st-tile.mine .pchip")).display,
+      label: getComputedStyle(document.querySelector(".st-tile.mine .mine-pic")).display,
       vis: document.visibilityState, focus: document.hasFocus() };
   })()`);
 try {
@@ -53,11 +53,11 @@ try {
   await A.page.screenshot(OUT + PFX + "focused_2.png");
 
   // survives a re-render (the UI rebuilds the tree on every state change); same element, still playing
-  await A.page.eval(`window.__pvEl = document.querySelector(".thumb.mine > video.live-preview")`);
+  await A.page.eval(`window.__pvEl = document.querySelector(".st-tile.mine .vid > video.live-preview")`);
   await A.page.eval(`__sss.render()`);
   await L.sleep(500);
   p = await probe();
-  check(p && !p.hidden && p.attached && (await A.page.eval(`window.__pvEl === document.querySelector(".thumb.mine > video.live-preview")`)), "survives render(): same element, still attached");
+  check(p && !p.hidden && p.attached && (await A.page.eval(`window.__pvEl === document.querySelector(".st-tile.mine .vid > video.live-preview")`)), "survives render(): same element, still attached");
 
   // window loses focus (another app in front, page still visible) -> detached and hidden. Simulated: CDP focus
   // emulation cannot force hasFocus() to false once the page was clicked, so the page's hasFocus is overridden and
