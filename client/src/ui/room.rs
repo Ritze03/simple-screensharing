@@ -1,31 +1,25 @@
-//! The central area (owner: I14): room header band, room body, People panel,
-//! for every [`View`]: a room (joined / reconnecting / disconnected),
-//! "Watched streams", and the welcome state.
+//! The central area for every [`View`]: a room (joined / reconnecting / disconnected), "Watched streams", and
+//! the welcome state. The People panel and the room's controls left with task I3 (2026-11-04): people are the
+//! stage's strip, the room's actions its control bar (`ui/stage/`).
 //!
 //! Regions (allocated by the shell, see `ui/mod.rs`):
-//! - [`show_header`]: the padded 56 px header band (pad 16), left-to-right.
-//!   `[fill hbox·title: h2, status pill, meta][room controls: Auto-connect,
-//!   Copy invite link, Leave, ⋯]`, every control 32 px. Owns
-//!   [`PopoverKind::RoomMenu`]. In a narrow window the controls collapse to
-//!   icons and the meta line drops, in the order commented in `show_header`.
-//! - [`show_stage`]: the whole central region of a joined room and of "Watched
-//!   streams": the black stage (`ui/stage/`), no scroll area, no padding.
-//! - [`show_body`]: the other states (welcome, disconnected, connecting,
-//!   reconnecting) as a vbox inside the central ScrollArea (padding 16, gap 16).
-//! - [`show_people`]: a 207 px vbox inside the People ScrollArea (padding
-//!   16 top/bottom, 12 left/right), gap 12. Only called while the selected
-//!   room is joined or reconnecting.
+//! - [`show_header`]: the padded 56 px header band (pad 16), `[h2 name][status pill][meta]`. A room with no
+//!   stage also gets `[⋯]` for the Room settings menu. Owns [`PopoverKind::Bar`]`(Room)` for those rooms.
+//! - [`show_stage`]: the whole central region of a joined room and of "Watched streams": the black stage with
+//!   its strip and bar (`ui/stage/`), no scroll area, no padding.
+//! - [`show_body`]: the other states (welcome, disconnected, connecting, reconnecting: banner, empty states) as a
+//!   vbox inside the central ScrollArea (padding 16, gap 16).
 //!
 //! # Strings
 //! Every string goes through [`tr`]: `t!(key)`, falling back to the English
 //! text until the locale files (I17) have the key.
 
-use egui::{Align, Color32, CornerRadius, Layout, Rect, Response, Sense, Stroke, StrokeKind, Ui, UiBuilder, pos2, vec2};
-use simple_screensharing_client::session::{ReconnectState, RoomHandle};
+use egui::{Align, Color32, CornerRadius, Layout, Rect, Sense, Stroke, StrokeKind, Ui, UiBuilder, pos2, vec2};
+use simple_screensharing_client::session::ReconnectState;
 
-use super::{ConnState, Cx, Modal, MyPhase, PopoverKind, RoomEntry, ShareState, UiAction, View, tr, tr_with};
+use super::{ConnState, Cx, Modal, PopoverKind, RoomEntry, ShareState, UiAction, View, tr, tr_with};
 use crate::theme::{self, Weight, font};
-use crate::widgets::{self, Btn, FILL, HBox, IconBtnKind, PersonRow, Pill, fixed, text_width};
+use crate::widgets::{self, Btn, FILL, HBox, IconBtnKind, Pill, fixed, text_width};
 
 /// Central-area UI state.
 #[derive(Default)]
@@ -38,9 +32,6 @@ pub struct RoomState {
 // Sizes (mockup CSS)
 // ---------------------------------------------------------------------------
 
-/// Room-name width the header keeps before it collapses its controls (a
-/// longer name truncates with "…" once every control is collapsed).
-const TITLE_NAME_MIN: f32 = 140.0;
 /// Empty-state action row width (`.empty hbox·actions`).
 const EMPTY_ACTIONS_W: f32 = 320.0;
 /// Reconnect banner: below this text-column width the buttons move under the
@@ -52,7 +43,8 @@ const BANNER_TEXT_MIN: f32 = 320.0;
 // ---------------------------------------------------------------------------
 
 
-/// Header band.
+/// Header band: `[h2 name][status pill][meta]`. A room with no stage (not connected, connecting) also gets a
+/// `⋯` that opens the Room settings menu, which the bar would otherwise hold (Auto-connect, Rename, Forget).
 pub fn show_header(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
     let room = cx.selected_room();
     let Some(r) = room else {
@@ -69,40 +61,6 @@ pub fn show_header(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
     };
 
     let joined = r.handle.filter(|_| r.conn == ConnState::Joined);
-    let auto_lbl = tr("ui.room.auto_connect", "Auto-connect");
-    let copy_lbl = tr("ui.room.copy_invite", "Copy invite link");
-    let leave_lbl = tr("ui.room.leave", "Leave");
-    let copy_tip = tr("ui.room.copy_invite_offline_tip", "Connect first: the link includes the relay's certificate");
-    let leave_tip = match r.conn {
-        ConnState::Joined => tr("ui.room.leave_tip", "Leave room"),
-        ConnState::Connecting | ConnState::Reconnecting => tr("ui.room.leave_reconnecting_tip", "Stop connecting to this room"),
-        ConnState::Disconnected => tr("ui.room.leave_offline_tip", "You're not connected to this room"),
-    };
-    let copy_tip_on = if joined.is_none() { format!("{copy_lbl}\n{copy_tip}") } else { copy_lbl.clone() };
-    let leave_tip_on = format!("{leave_lbl}\n{leave_tip}");
-    // Narrow windows (800 px minimum: the band is ~496 px): the lowest level
-    // whose controls leave the title its name (≥ TITLE_NAME_MIN), pill and,
-    // below level 2, the whole meta line. Each level keeps the ones before:
-    // 1 Copy invite link → icon (it is also in the ⋯ menu), 2 meta line
-    // dropped (People and the section headings show the same counts; never
-    // half-cut to "2 pe…"), 3 Leave → icon, 4 Auto-connect → bare checkbox
-    // (its tooltip says what it is). `Why` this order: redundant things go
-    // first, the room's own actions keep their words longest.
-    let copy_at = |l: usize| {
-        let b = Btn::secondary(&copy_lbl).icon("link").enabled(joined.is_some());
-        let b = if joined.is_none() { b.tip(&copy_tip) } else { b };
-        if l >= 1 { Btn { label: "", ..b }.tip(&copy_tip_on) } else { b }
-    };
-    let leave_at = |l: usize| {
-        let b = Btn::danger(&leave_lbl).icon("logout").enabled(r.conn != ConnState::Disconnected).tip(&leave_tip);
-        if l >= 3 { Btn { label: "", ..b }.tip(&leave_tip_on) } else { b }
-    };
-    // The checkbox's hover wash reaches 8 px past its text; the mockup leaves
-    // 20 px from "Auto-connect" to the next button (12 + the 8 gap).
-    let cb_full = theme::MARK + theme::S2 + text_width(ui, &auto_lbl, font(Weight::Regular, theme::FS_LABEL), 0.0).ceil() + theme::S3;
-    let cb_at = |l: usize| if l >= 4 { theme::MARK + theme::S3 } else { cb_full };
-
-    // Title: [h2][status pill][meta], gap 12.
     let pill_l = match r.conn {
         ConnState::Joined => tr("ui.room.connected", "Connected"),
         ConnState::Connecting => tr("ui.room.connecting_pill", "Connecting"),
@@ -135,89 +93,28 @@ pub fn show_header(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
     let meta_f = font(Weight::Regular, theme::FS_SMALL);
     let name_w = text_width(ui, &r.name, h2.clone(), 0.0).ceil();
     let pw = pill.width(ui);
-    let meta_w = meta.as_ref().map_or(0.0, |m| text_width(ui, m, meta_f.clone(), 0.0).ceil());
-    let title_need = |l: usize| name_w.min(TITLE_NAME_MIN) + theme::S3 + pw + if l < 2 && meta.is_some() { theme::S3 + meta_w } else { 0.0 };
-    let controls = |l: usize| cb_at(l) + copy_at(l).width(ui) + leave_at(l).width(ui) + theme::CTL_H + 4.0 * theme::S2;
-    let avail = ui.available_width();
-    let level = (0..=4).find(|l| avail - controls(*l) >= title_need(*l)).unwrap_or(4);
-    let (copy, leave, cb_w) = (copy_at(level), leave_at(level), cb_at(level));
-    let show_meta = meta.as_ref().filter(|_| level < 2);
-    let slots = [FILL, fixed(cb_w), fixed(copy.width(ui)), fixed(leave.width(ui)), fixed(theme::CTL_H)];
-    let row = HBox::new("hbox·room-controls", theme::CTL_H).slots(&slots).show(ui);
-
+    let menu_btn = joined.is_none();
+    let slots: Vec<widgets::Slot> = if menu_btn { vec![FILL, fixed(theme::CTL_H)] } else { vec![FILL] };
+    let row = HBox::new("hbox·room-title", theme::CTL_H).slots(&slots).show(ui);
     row.show(ui, 0, Align::Min, |ui| {
+        // Name, then the pill, then the meta line while it fits (a long name truncates before it).
         let avail = ui.available_width();
-        let meta_room = if show_meta.is_some() { theme::S3 + meta_w } else { 0.0 };
+        let meta_w = meta.as_ref().map_or(0.0, |m| text_width(ui, m, meta_f.clone(), 0.0).ceil());
+        let meta_room = if meta.is_some() && name_w + pw + 2.0 * theme::S3 + meta_w <= avail { theme::S3 + meta_w } else { 0.0 };
         let tw = name_w.min((avail - pw - theme::S3 - meta_room).max(0.0));
         let t = HBox::new("hbox·title", theme::CTL_H).gap(theme::S3).slots(&[fixed(tw), fixed(pw), FILL]).show(ui);
         t.text(ui, 0, &r.name, h2, theme::TEXT, Align::Min);
-        let c = t.cell(1);
-        pill.paint(ui, Rect::from_center_size(c.center(), vec2(pw, theme::PILL_H)));
-        if let Some(m) = show_meta {
+        pill.paint(ui, Rect::from_center_size(t.cell(1).center(), vec2(pw, theme::PILL_H)));
+        if let (Some(m), true) = (meta.as_ref(), meta_room > 0.0) {
             t.text(ui, 2, m, meta_f, theme::TEXT_DIM, Align::Min);
         }
     });
-
-    let mut on = r.auto_connect;
-    let auto_tip = tr("ui.room.auto_connect_tip", "Connect to this room when the app starts");
-    let (cb_label, auto_tip) = if level >= 4 { (String::new(), format!("{auto_lbl}\n{auto_tip}")) } else { (auto_lbl.clone(), auto_tip) };
-    if row.show(ui, 1, Align::Min, |ui| widgets::checkbox(ui, &mut on, &cb_label)).on_hover_text(&auto_tip).changed() {
-        cx.act(UiAction::SetAutoConnect { room: r.key.clone(), on });
-    }
-    let w = row.cell(2).width();
-    if row.show(ui, 2, Align::Min, |ui| copy.show_sized(ui, w)).clicked()
-        && let Some(h) = joined
-    {
-        cx.act(UiAction::CopyInviteLink(h));
-    }
-    let w = row.cell(3).width();
-    if row.show(ui, 3, Align::Min, |ui| leave.show_sized(ui, w)).clicked() {
-        match (r.conn, r.handle) {
-            (ConnState::Joined, Some(h)) => cx.act(UiAction::Leave(h)),
-            (ConnState::Connecting | ConnState::Reconnecting, _) => cx.act(UiAction::CancelReconnect(r.key.clone())),
-            _ => {}
+    if menu_btn {
+        let tip = tr("ui.room.options", "Room options");
+        if row.show(ui, 1, Align::Min, |ui| widgets::icon_btn(ui, "more_horiz", IconBtnKind::Bordered, &tip)).clicked() {
+            cx.toggle_popover(PopoverKind::Bar(super::stage::BarMenu::Room), row.cell(1));
         }
-    }
-    let menu_tip = tr("ui.room.options", "Room options");
-    if row.show(ui, 4, Align::Min, |ui| widgets::icon_btn(ui, "more_horiz", IconBtnKind::Bordered, &menu_tip)).clicked() {
-        cx.toggle_popover(PopoverKind::RoomMenu { room: r.key.clone() }, row.cell(4));
-    }
-    room_menu(ui, cx, &r, joined);
-}
-
-/// The `⋯` popover: Rename / Copy invite link / ─ / Forget room.
-fn room_menu(ui: &Ui, cx: &mut Cx, r: &RoomEntry, joined: Option<RoomHandle>) {
-    let Some(pop) = cx.popover_of(&PopoverKind::RoomMenu { room: r.key.clone() }) else { return };
-    let ctx = ui.ctx().clone();
-    let mut picked = None;
-    let rename = tr("ui.room.rename", "Rename");
-    let copy = tr("ui.room.copy_invite", "Copy invite link");
-    let forget = tr("ui.room.forget", "Forget room");
-    let forget_sub = tr("ui.room.forget_sub", "Leave and remove it from the list");
-    let open = super::popover(&ctx, pop, 340.0, |ui| {
-        if widgets::pop_item(ui, &widgets::PopItem::new("edit", &rename)).clicked() {
-            picked = Some(UiAction::OpenModal(Modal::Rename { room: r.key.clone() }));
-        }
-        if widgets::pop_item(ui, &widgets::PopItem::new("content_copy", &copy).enabled(joined.is_some())).clicked()
-            && let Some(h) = joined
-        {
-            picked = Some(UiAction::CopyInviteLink(h));
-        }
-        // `<hr>`: 1 px DIVIDER with 4 px above and below.
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 9.0), Sense::hover());
-        ui.painter().hline(rect.x_range().shrink(theme::S1), rect.center().y.round() + 0.5, Stroke::new(1.0_f32, theme::DIVIDER));
-        if widgets::pop_item(ui, &widgets::PopItem::new("delete", &forget).sub(&forget_sub).danger()).clicked() {
-            picked = Some(UiAction::OpenModal(Modal::ForgetConfirm { room: r.key.clone() }));
-        }
-    });
-    match picked {
-        Some(a @ UiAction::CopyInviteLink(_)) => {
-            cx.act(UiAction::ClosePopover);
-            cx.act(a);
-        }
-        Some(a) => cx.act(a),
-        None if !open => cx.act(UiAction::ClosePopover),
-        None => {}
+        super::stage::room_menu_popover(ui.ctx(), cx, &r);
     }
 }
 
@@ -236,7 +133,7 @@ pub fn shows_stage(cx: &Cx) -> bool {
 
 /// The stage, filling the whole central region.
 pub fn show_stage(ui: &mut Ui, cx: &mut Cx, st: &mut RoomState) {
-    super::stage::show(ui, cx, &mut st.stage);
+    super::stage::show_main(ui, cx, &mut st.stage);
 }
 
 /// Body for the other states: welcome, disconnected, connecting, reconnecting.
@@ -470,104 +367,6 @@ fn empty_state(ui: &mut Ui, icon: &str, title: &str, text: Option<&str>, btns: &
 // ---------------------------------------------------------------------------
 // Tiles
 // ---------------------------------------------------------------------------
-
-
-/// Our row while our share here is still Starting: an accent "in progress"
-/// pill (marching bar, no text) in the row's 44 px live slot, where the green
-/// LIVE pill goes once it is on air. `Why no text:` "STARTING" does not fit
-/// 44 px; the row's tooltip says it. The slot is `person_row`'s
-/// `[22][fill][44][18]`, pad 4/4, gap 8, so it ends 4 + 18 + 8 px from the right.
-fn starting_badge(ui: &Ui, row: &Response) {
-    let pill = Pill::progress("");
-    let w = pill.width(ui).min(44.0);
-    let right = row.rect.right() - theme::S1 - 18.0 - theme::S2;
-    pill.paint(ui, Rect::from_min_size(pos2(right - w, row.rect.center().y - theme::PILL_H / 2.0), vec2(w, theme::PILL_H)));
-}
-
-/// People panel: `[heading PEOPLE n][vbox·people → person_row …]`, you first.
-pub fn show_people(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
-    let Some(r) = cx.selected_room() else { return };
-    let Some((h, s)) = r.handle.and_then(|h| cx.session(h).map(|s| (h, s))) else {
-        // Reconnecting: the roster as it was when the room dropped, dimmed
-        // (`stale`), us first. The lib's copy leaves us out (`suspend_room`
-        // filters our conn id), so our row comes from the display name; it is
-        // never live (our shares are paused).
-        if let Some(info) = cx.state.reconnect_info(&r.key) {
-            widgets::heading(ui, &tr("ui.room.people", "People"), Some(&(info.members.len() + 1).to_string()), false);
-            let live_l = tr("ui.pill.live", "Live");
-            let you_tag = tr("ui.room.you", "You").to_lowercase();
-            let stale_tip = tr("ui.room.people_stale_tip", "As it was before the connection dropped");
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                let me = PersonRow { name: &cx.state.display_name, colors: theme::avatar_colors(&cx.state.display_name), you: Some(&you_tag), live: false, live_label: &live_l, watching: false, idle: true, stale: true };
-                widgets::person_row(ui, &me).on_hover_text(&stale_tip);
-                for m in &info.members {
-                    let live = info.streams.iter().any(|i| i.owner == m.conn_id);
-                    let row = PersonRow { name: &m.display_name, colors: theme::avatar_colors(&m.display_name), you: None, live, live_label: &live_l, watching: false, idle: !live, stale: true };
-                    widgets::person_row(ui, &row).on_hover_text(&stale_tip);
-                }
-            });
-            return;
-        }
-        widgets::heading(ui, &tr("ui.room.people", "People"), None, false);
-        // Wraps: the German line is wider than the 207 px column.
-        let text = if r.conn == ConnState::Connecting {
-            tr("ui.room.people_connecting", "Shown once the room is connected")
-        } else {
-            tr("ui.room.people_paused", "Back when the room reconnects")
-        };
-        let mut job = egui::text::LayoutJob::single_section(
-            text,
-            egui::TextFormat { font_id: font(Weight::Regular, theme::FS_SMALL), color: theme::TEXT_FAINT, line_height: Some(16.0), ..Default::default() },
-        );
-        job.wrap.max_width = ui.available_width();
-        let galley = ui.painter().layout_job(job);
-        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), galley.size().y.max(theme::ROW_H)), Sense::hover());
-        ui.painter().galley(pos2(rect.left(), rect.center().y - galley.size().y / 2.0), galley, theme::TEXT_FAINT);
-        return;
-    };
-    let me = s.client.conn_id();
-    let my_phase = cx.my_phase(h);
-    let starting_l = tr("ui.room.people_starting", "Starting…");
-    let starting_tip = if cx.live_captures().iter().any(|(id, c)| c.destinations.values().any(|d| d.room == h) && cx.state.capture_awaiting_first_frame(*id)) {
-        format!("{starting_l}\n{}", tr("ui.waiting_frame_hint", "An idle screen sends no picture until something on it changes. Move the mouse over the shared screen and the stream starts."))
-    } else {
-        starting_l.to_string()
-    };
-    widgets::heading(ui, &tr("ui.room.people", "People"), Some(&s.members.len().to_string()), false);
-    let watches = s.watches.lock().unwrap();
-    let audio = s.audio_watches.lock().unwrap();
-    // The mockup's faint lowercase "you" tag / "LIVE" pill, from existing keys.
-    let you_tag = tr("ui.room.you", "You").to_lowercase();
-    let live_l = tr("ui.pill.live", "Live");
-    ui.vertical(|ui| {
-        ui.spacing_mut().item_spacing.y = 0.0;
-        let order = s.members.iter().filter(|m| m.conn_id == me).chain(s.members.iter().filter(|m| m.conn_id != me));
-        for m in order {
-            let you = m.conn_id == me;
-            let live = if you { my_phase == Some(MyPhase::OnAir) } else { s.streams.iter().any(|i| i.owner == m.conn_id) };
-            let starting = you && my_phase == Some(MyPhase::Starting);
-            let watching = !you && (watches.keys().any(|k| k.0 == m.conn_id) || audio.iter().any(|(k, a)| k.0 == m.conn_id && !a.auto));
-            let resp = widgets::person_row(
-                ui,
-                &PersonRow {
-                    name: &m.display_name,
-                    colors: theme::avatar_colors(&m.display_name),
-                    you: you.then_some(you_tag.as_str()),
-                    live,
-                    live_label: &live_l,
-                    watching,
-                    idle: !live && !starting,
-                    stale: false,
-                },
-            );
-            if starting {
-                starting_badge(ui, &resp);
-                resp.on_hover_text(&starting_tip);
-            }
-        }
-    });
-}
 
 
 #[cfg(test)]

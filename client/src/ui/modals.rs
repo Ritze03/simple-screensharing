@@ -39,7 +39,7 @@ use simple_screensharing_client::net::{ServerAddrError, parse_join_string, parse
 use simple_screensharing_client::rooms::{AppSettings, PresentationMode};
 use simple_screensharing_client::session::RoomHandle;
 
-use super::{Cx, Modal, ShareState, UiAction, tr, tr_with};
+use super::{Cx, Modal, ShareState, UiAction, menu, tr, tr_with};
 use crate::theme::{self, Weight, font};
 use crate::widgets::{self, BannerKind, Btn, FooterClick, ModalSpec};
 
@@ -538,7 +538,7 @@ fn settings(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
         std::env::var_os(PRESENT_FALLBACK_ENV).is_some(),
     );
     let mut mode_i = shown_i;
-    let mode_refs: Vec<&str> = shown.iter().map(|i| mode_labels[*i].as_ref()).collect();
+    let mode_refs: Vec<menu::Opt> = shown.iter().map(|i| menu::Opt::new(mode_labels[*i].as_ref())).collect();
 
     let mut name_done = false;
     let mut click = FooterClick::None;
@@ -580,7 +580,7 @@ fn settings(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
                          Immediate: no cap, lowest latency, may tear.\n\
                          Takes effect after a restart.",
                     )),
-                    |ui| widgets::select(ui, "presentation_mode", &mut mode_i, &mode_refs),
+                    |ui| menu::select(ui, "presentation_mode", &mut mode_i, &mode_refs),
                 );
                 if restart {
                     widgets::banner(

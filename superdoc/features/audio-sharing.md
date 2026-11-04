@@ -768,15 +768,15 @@ need no PipeWire:
 - **Path (all intact):** `level` element in `audio::build_pipeline` (after `volume name=mute`) ->
   bus -> `pump_loop` -> `handle_bus_message` -> `AudioLevel` (atomic) ->
   `AudioCaptureHandle::level` -> `AppState::audio_share_level` (only while the audio capture is
-  `Active`) -> `action_bar::live` (`level_lit`) -> `AudioSlot` -> `widgets::meter`, repainted every
+  `Active`) -> (until task I3, 2026-11-04) `action_bar::live` (`level_lit`) -> `AudioSlot` -> `widgets::meter`; the control bar has no share meter any more, the stream-settings modal's Audio row still reads it, repainted every
   100 ms (`request_repaint_after` in `live`; the app repaints every 50 ms anyway). The chain has not
   changed since the July audio fix (`af5b8a6`); #105 did not touch it (it only changed which nodes
   are linked and which node the *dropdown* taps).
 - **Tests:** `audio::tests::capture_chain_level_messages_reach_the_level_value` runs the real
   capture chain (`build_pipeline_from_source`, `audiotestsrc` for `pipewiresrc`, bus and appsink
   streams created late as in `start_audio_sharing`) and asserts the level moves; 
-  `ui::action_bar::tests::the_bars_audio_slot_paints_as_many_lit_bars_as_the_level_says` renders
-  the slot and counts lit bars.
+  `ui::action_bar::tests::the_bars_audio_slot_paints_as_many_lit_bars_as_the_level_says` rendered
+  the slot and counted lit bars (removed with the slot in I3).
 - **One real defect found: the bar could show the dying share.** `ui::paired_audio` took the first
   audio capture pointing at the video capture. After switching the audio source (or a reconnect
   restart) the old one sits in `Stopping` next to the new one until its teardown lands, so the bar

@@ -8,20 +8,18 @@
 //!
 //! ```text
 //! ┌ SidePanel::left 272 (SIDEBAR_RAIL, 1 px PANEL_RAISED right border) ┐┌ TopBottomPanel::top 56: room header band ────────────────┐
-//! │ brand band 56 ............. sidebar::show_brand                    ││ room::show_header (band, DIVIDER bottom, pad 16)           │
-//! │ ScrollArea (pad 0/12/12, vbox gap 8) .. sidebar::show_body         │├──────────────────────────────────────────┬─────────────────┤
-//! │                                                                    ││ CentralPanel: room::show_stage (the black │ SidePanel::right│
-//! │                                                                    ││ stage) or ScrollArea .. room::show_body  │ 232 (people)    │
-//! │                                                                    ││                                          │ room::show_people
-//! │ user band 56 (ELEV_14, WELL_BORDER top) .. sidebar::show_user_band ││ TopBottomPanel::bottom 56: action_bar::show (PANEL_SUNKEN) │
-//! └────────────────────────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────┘
+//! │ brand band 56 ............. sidebar::show_brand                    ││ room::show_header (title, status pill, meta; band, pad 16)│
+//! │ ScrollArea (pad 0/12/12, vbox gap 8) .. sidebar::show_body         │├──────────────────────────────────────────────────────────┤
+//! │                                                                    ││ CentralPanel: room::show_stage = the black stage          │
+//! │                                                                    ││   streams · people strip · control bar (ui/stage/)        │
+//! │                                                                    ││ or ScrollArea .. room::show_body (every other state)      │
+//! │ user band 56 (ELEV_14, WELL_BORDER top) .. sidebar::show_user_band ││                                                          │
+//! └────────────────────────────────────────────────────────────────────┘└──────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! The People panel and the action bar exist only while a room view shows a
-//! joined or reconnecting room ([`Cx::shows_room_panels`]); a disconnected
-//! room, the "Watched streams" view and the welcome view have neither. The
-//! user band and the action band are both 56 px tall at the window bottom,
-//! so their top border lines are one line.
+//! The People panel and the bottom action band are gone (task I3, 2026-11-04): the stage's people strip and
+//! control bar replace them. The sidebar hides with the bar's button ([`Nav::sidebar_hidden`]); in stage
+//! fullscreen ([`Nav::stage_fullscreen`]) neither sidebar nor header is drawn.
 //!
 //! Modals ([`Modal`]) render after the panels: [`stream_settings::show`] for
 //! [`Modal::StreamSettings`], [`modals::show`] for every other kind. Pop-out
@@ -41,8 +39,6 @@
 //! room::show_header(ui: &mut Ui, cx: &mut Cx, st: &mut RoomState)
 //! room::show_stage(ui: &mut Ui, cx: &mut Cx, st: &mut RoomState)
 //! room::show_body(ui: &mut Ui, cx: &mut Cx)
-//! room::show_people(ui: &mut Ui, cx: &mut Cx, st: &mut RoomState)
-//! action_bar::show(ui: &mut Ui, cx: &mut Cx, st: &mut ActionBarState)
 //! stream_settings::show(ctx: &egui::Context, cx: &mut Cx, st: &mut StreamSettingsState,
 //!                       capture: CaptureSourceId, room: RoomHandle)
 //! modals::show(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState, modal: &Modal)
@@ -100,11 +96,12 @@ use tokio::sync::oneshot;
 use crate::theme::{self, Weight, font};
 use crate::widgets::{self, BandEdge};
 
-pub mod action_bar;
 mod apply;
+pub mod menu;
 pub mod modals;
 pub mod popout;
 pub mod room;
+pub mod share;
 pub mod sidebar;
 pub mod stage;
 pub mod stream_settings;
@@ -182,18 +179,12 @@ pub enum Modal {
 /// Which popover is open. Drawn by the screen that owns its anchor button.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PopoverKind {
-    /// Room header `[⋯]`: Rename / Copy invite link / Forget room. (room.rs)
-    RoomMenu { room: RoomKey },
     /// User band "who" click: "You're sharing" list + Stop all sharing. (sidebar.rs)
     Outgoing,
-    /// Idle bar "Share screen ▾" when another capture is live: add here /
-    /// move here / share a different screen. (action_bar.rs)
-    ShareMenu { room: RoomHandle },
-    /// Live bar "N rooms ▾": Also send to + Move to. (action_bar.rs)
-    Rooms { capture: CaptureSourceId, room: RoomHandle },
-    /// Audio source picker for `capture` (the video capture the audio rides
-    /// on), with per-source meters. (action_bar.rs)
-    AudioSource { capture: CaptureSourceId },
+    /// A control-bar dropdown: Share, Audio, Layout or Room settings. (stage/bar.rs, drawn by stage/menus.rs)
+    Bar(stage::BarMenu),
+    /// A stream's menu (its `⋯` button or a right click on the tile). (stage/menus.rs)
+    Tile(stage::ItemId),
     /// Stream settings "Also send to…". (stream_settings.rs)
     AlsoSendTo { capture: CaptureSourceId, room: RoomHandle },
     /// Stream settings "Move to…". (stream_settings.rs)
@@ -216,6 +207,12 @@ pub struct Nav {
     /// Double-click fullscreen: the one watched stream filling the whole
     /// window, with every other region hidden (`draw` shows only it).
     pub fullscreen: Option<FullscreenStream>,
+    /// The sidebar is hidden (the control bar's button).
+    pub sidebar_hidden: bool,
+    /// The stage fills the whole window (the control bar's fullscreen button): no sidebar, no header, the
+    /// strip and bar lie over the stage and auto-hide. `Some(was_fullscreen)`: whether the window was
+    /// already fullscreen, which leaving restores.
+    pub stage_fullscreen: Option<bool>,
 }
 
 /// The stream shown fullscreen in the main window ([`Nav::fullscreen`]).
@@ -396,14 +393,16 @@ pub enum UiAction {
 
     // --- stage --------------------------------------------------------------
     /// The Layout menu: show `view`'s streams as Split, Crop or Floating (per view, see [`StageSettings`]).
-    #[allow(dead_code)] // sent by the Layout menu (next worker)
     SetStageLayout { view: StageView, layout: StageLayout },
     /// "Hide my own streams": your own share gets no tile on any stage.
-    #[allow(dead_code)] // idem
     SetHideOwnStreams(bool),
     /// "Always show names": watched streams show their name tag without hovering.
-    #[allow(dead_code)] // idem
     SetAlwaysShowNames(bool),
+    /// The bar's hide / show sidebar button.
+    ToggleSidebar,
+    /// The bar's fullscreen button in the main window ([`Nav::stage_fullscreen`]).
+    EnterStageFullscreen,
+    ExitStageFullscreen,
 
     // --- misc -------------------------------------------------------------
 }
@@ -624,11 +623,6 @@ impl<'a> Cx<'a> {
             View::Room(key) => self.room(key),
             _ => None,
         }
-    }
-
-    /// Whether the People panel and the action bar are shown this frame.
-    pub fn shows_room_panels(&self) -> bool {
-        self.selected_room().is_some_and(|r| r.conn != ConnState::Disconnected)
     }
 
     /// A joined room's session.
@@ -921,6 +915,15 @@ pub fn volume_slider(ui: &mut Ui, percent: &mut u32) -> egui::Response {
     resp
 }
 
+/// The one place a person's avatar is drawn (task I3): the name's gradient and its initial, in `rect`, with
+/// the green presence dot when `presence`. The strip, the hover card, tiles, menus and the user band all call
+/// this, so the emoji avatars (I4) change one function. The colours are a pure function of the display name
+/// (`theme::avatar_colors`, `APP-SHELL.md` "Avatar colour").
+pub fn paint_person(ui: &Ui, rect: Rect, name: &str, presence: bool) {
+    let initial: String = name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
+    widgets::paint_avatar(ui, rect, &initial, theme::avatar_colors(name), presence);
+}
+
 /// The "Level loudness" toggle that sits right after every viewer volume slider (the tile
 /// pill, the pop-out / fullscreen pill): a 25 px round button painting `rect`. On = accent
 /// ring and tinted disc, light-blue `graphic_eq`; off = a faint icon. Returns true when it
@@ -1002,12 +1005,7 @@ pub fn share_label(raw: &str) -> String {
 pub fn popover(ctx: &egui::Context, pop: &Popover, width: f32, body: impl FnOnce(&mut Ui)) -> bool {
     let id = Id::new(("ui_popover", format!("{:?}", pop.kind)));
     let mut open = true;
-    let frame = Frame::new()
-        .fill(theme::PANEL_RAISED)
-        .stroke(Stroke::new(1.0_f32, theme::BORDER))
-        .corner_radius(CornerRadius::same(10))
-        .inner_margin(Margin::same(6))
-        .shadow(egui::Shadow { offset: [0, 14], blur: 40, spread: 0, color: Color32::from_black_alpha(153) });
+    let frame = menu::frame();
     // Last frame's size (the first frame assumes a zero height and corrects
     // itself on the next).
     let size = egui::AreaState::load(ctx, id).and_then(|s| s.size).unwrap_or(vec2(width, 0.0));
@@ -1064,7 +1062,6 @@ pub struct App {
     pub videos: VideoViews,
     pub sidebar: sidebar::SidebarState,
     pub room: room::RoomState,
-    pub action_bar: action_bar::ActionBarState,
     pub stream_settings: stream_settings::StreamSettingsState,
     pub modals: modals::ModalsState,
     pub popout: popout::PopoutState,
@@ -1103,12 +1100,11 @@ impl App {
         let view = state.room_store.rooms.first().map(|r| View::Room(r.join_string.clone())).unwrap_or_default();
         Self {
             state,
-            nav: Nav { view, modal: None, popover: None, fullscreen: None },
+            nav: Nav { view, ..Default::default() },
             shell: Shell::default(),
             videos: VideoViews::default(),
             sidebar: Default::default(),
             room: Default::default(),
-            action_bar: Default::default(),
             stream_settings: Default::default(),
             modals: Default::default(),
             popout: Default::default(),
@@ -1334,7 +1330,7 @@ impl App {
     /// Lay the window out and run every screen. Returns the actions they pushed.
     fn draw(&mut self, ctx: &egui::Context) -> Vec<UiAction> {
         let mut actions = Vec::new();
-        let App { state, nav, shell, videos, sidebar, room, action_bar, stream_settings, modals, popout, .. } = self;
+        let App { state, nav, shell, videos, sidebar, room, stream_settings, modals, popout, .. } = self;
         let mut cx = Cx::new(state, nav, shell, videos, &mut actions);
         if let Some(fs) = cx.nav.fullscreen {
             if cx.videos.get(fs.key).is_some_and(|e| !e.popped) {
@@ -1360,78 +1356,55 @@ impl App {
             // the normal layout this frame.
             cx.act(UiAction::ExitStreamFullscreen);
         }
-        let room_panels = cx.shows_room_panels();
+        // Stage fullscreen draws the stage alone; it ends with the stage (room left, view changed).
+        let stage_fs = cx.nav.stage_fullscreen.is_some() && room::shows_stage(&cx);
+        if cx.nav.stage_fullscreen.is_some() && !stage_fs {
+            cx.act(UiAction::ExitStageFullscreen);
+        }
 
         // Left sidebar: brand band / scroll body / user band, split by hand
         // so each region is exactly its spec size whatever its content does.
-        egui::SidePanel::left("sidebar")
-            .resizable(false)
-            .exact_width(theme::SIDEBAR_W)
-            .show_separator_line(false)
-            .frame(Frame::NONE.fill(theme::SIDEBAR_RAIL))
-            .show(ctx, |ui| {
-                let full = ui.max_rect();
-                ui.painter().vline(full.right() - 0.5, full.y_range(), Stroke::new(1.0_f32, theme::PANEL_RAISED));
-                let inner = Rect::from_min_max(full.min, pos2(full.right() - 1.0, full.bottom()));
-                let brand = Rect::from_min_size(inner.min, vec2(inner.width(), theme::BAND_H));
-                let user = Rect::from_min_max(pos2(inner.left(), inner.bottom() - theme::BAND_H), inner.max);
-                let body = Rect::from_min_max(pos2(inner.left(), brand.bottom()), pos2(inner.right(), user.top()));
-                region(ui, brand, "brand", |ui| {
-                    widgets::band(ui, theme::SIDEBAR_RAIL, BandEdge::None, theme::S4, |ui| sidebar::show_brand(ui, &mut cx, sidebar))
-                });
-                region(ui, body, "sidebar_body", |ui| {
-                    egui::ScrollArea::vertical().id_salt("sidebar_scroll").auto_shrink([false, false]).show(ui, |ui| {
-                        Frame::NONE.inner_margin(Margin { left: theme::S3 as i8, right: theme::S3 as i8, top: 0, bottom: theme::S3 as i8 }).show(
-                            ui,
-                            |ui| vbox(ui, theme::S2, |ui| sidebar::show_body(ui, &mut cx, sidebar)),
-                        );
+        if !stage_fs && !cx.nav.sidebar_hidden {
+            egui::SidePanel::left("sidebar")
+                .resizable(false)
+                .exact_width(theme::SIDEBAR_W)
+                .show_separator_line(false)
+                .frame(Frame::NONE.fill(theme::SIDEBAR_RAIL))
+                .show(ctx, |ui| {
+                    let full = ui.max_rect();
+                    ui.painter().vline(full.right() - 0.5, full.y_range(), Stroke::new(1.0_f32, theme::PANEL_RAISED));
+                    let inner = Rect::from_min_max(full.min, pos2(full.right() - 1.0, full.bottom()));
+                    let brand = Rect::from_min_size(inner.min, vec2(inner.width(), theme::BAND_H));
+                    let user = Rect::from_min_max(pos2(inner.left(), inner.bottom() - theme::BAND_H), inner.max);
+                    let body = Rect::from_min_max(pos2(inner.left(), brand.bottom()), pos2(inner.right(), user.top()));
+                    region(ui, brand, "brand", |ui| {
+                        widgets::band(ui, theme::SIDEBAR_RAIL, BandEdge::None, theme::S4, |ui| sidebar::show_brand(ui, &mut cx, sidebar))
+                    });
+                    region(ui, body, "sidebar_body", |ui| {
+                        egui::ScrollArea::vertical().id_salt("sidebar_scroll").auto_shrink([false, false]).show(ui, |ui| {
+                            Frame::NONE.inner_margin(Margin { left: theme::S3 as i8, right: theme::S3 as i8, top: 0, bottom: theme::S3 as i8 }).show(
+                                ui,
+                                |ui| vbox(ui, theme::S2, |ui| sidebar::show_body(ui, &mut cx, sidebar)),
+                            );
+                        });
+                    });
+                    region(ui, user, "user_band", |ui| {
+                        user_band(ui, |ui| sidebar::show_user_band(ui, &mut cx, sidebar));
                     });
                 });
-                region(ui, user, "user_band", |ui| {
-                    user_band(ui, |ui| sidebar::show_user_band(ui, &mut cx, sidebar));
-                });
-            });
+        }
 
-        // Room header band (spans the central width, People panel included).
-        egui::TopBottomPanel::top("room_header")
-            .resizable(false)
-            .exact_height(theme::BAND_H)
-            .show_separator_line(false)
-            .frame(Frame::NONE.fill(theme::PANEL_BASE))
-            .show(ctx, |ui| {
-                let r = ui.max_rect();
-                region(ui, r, "room_header", |ui| {
-                    widgets::band(ui, theme::PANEL_BASE, BandEdge::Bottom, theme::S4, |ui| room::show_header(ui, &mut cx, room))
-                });
-            });
-
-        if room_panels {
-            egui::TopBottomPanel::bottom("action_bar")
+        // Room header band (title, status, meta).
+        if !stage_fs {
+            egui::TopBottomPanel::top("room_header")
                 .resizable(false)
                 .exact_height(theme::BAND_H)
                 .show_separator_line(false)
-                .frame(Frame::NONE.fill(theme::PANEL_SUNKEN))
+                .frame(Frame::NONE.fill(theme::PANEL_BASE))
                 .show(ctx, |ui| {
                     let r = ui.max_rect();
-                    region(ui, r, "action_bar", |ui| {
-                        widgets::band(ui, theme::PANEL_SUNKEN, BandEdge::Top, theme::S4, |ui| action_bar::show(ui, &mut cx, action_bar))
-                    });
-                });
-            egui::SidePanel::right("people")
-                .resizable(false)
-                .exact_width(theme::PEOPLE_W)
-                .show_separator_line(false)
-                .frame(Frame::NONE.fill(theme::PANEL_SUNKEN))
-                .show(ctx, |ui| {
-                    let full = ui.max_rect();
-                    ui.painter().vline(full.left() + 0.5, full.y_range(), Stroke::new(1.0_f32, theme::DIVIDER));
-                    let inner = Rect::from_min_max(pos2(full.left() + 1.0, full.top()), full.max);
-                    region(ui, inner, "people", |ui| {
-                        egui::ScrollArea::vertical().id_salt("people_scroll").auto_shrink([false, false]).show(ui, |ui| {
-                            Frame::NONE
-                                .inner_margin(Margin::symmetric(theme::S3 as i8, theme::S4 as i8))
-                                .show(ui, |ui| vbox(ui, theme::S3, |ui| room::show_people(ui, &mut cx, room)));
-                        });
+                    region(ui, r, "room_header", |ui| {
+                        widgets::band(ui, theme::PANEL_BASE, BandEdge::Bottom, theme::S4, |ui| room::show_header(ui, &mut cx, room))
                     });
                 });
         }
@@ -1459,6 +1432,7 @@ impl App {
         }
         // Pop-out windows: re-declared every frame they should exist.
         popout::show(ctx, &mut cx, popout);
+        stage::show_windows(ctx, &mut cx, &mut room.stage);
 
         paint_toasts(ctx, &cx.shell.toasts);
         actions
@@ -1472,6 +1446,7 @@ impl eframe::App for App {
 
         // Escape closes the popover before anything else sees it (a modal
         // would otherwise close on the same press).
+        let popover_was_open = self.nav.popover.is_some();
         if self.nav.popover.is_some() && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             self.nav.popover = None;
         }
@@ -1479,6 +1454,17 @@ impl eframe::App for App {
         // Escape leaves stream fullscreen (no popover or modal is open then).
         if self.nav.fullscreen.is_some() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.apply(ctx, UiAction::ExitStreamFullscreen);
+        }
+
+        // Escape leaves stage fullscreen (a menu or modal takes the key first: a frame that started with a menu
+        // open only closes it, whatever the key events say).
+        if self.nav.stage_fullscreen.is_some()
+            && !popover_was_open
+            && self.nav.modal.is_none()
+            && self.nav.fullscreen.is_none()
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        {
+            self.apply(ctx, UiAction::ExitStageFullscreen);
         }
 
         let actions = self.draw(ctx);

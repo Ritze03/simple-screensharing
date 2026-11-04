@@ -7,7 +7,7 @@
 > performance" (#39, with the rotated-output check from #35), "Idle monitors" and the silence
 > watchdog (#32), resuming, the encoder-tuning backend mapping, "Video codec selection", the
 > bandwidth modes, and the audio-share backend. The UI lives in `client/src/ui/stream_settings.rs`,
-> `ui/action_bar.rs`, `ui/room.rs`, `ui/modals.rs` (see `superdoc/ui/APP-SHELL.md`).
+> `ui/share.rs`, `ui/stage/bar.rs`, `ui/room.rs`, `ui/modals.rs` (see `superdoc/ui/APP-SHELL.md`).
 > The removed Electron frontend's per-widget write-ups (edit panel, START A STREAM form, tab
 > layout, sidebar tree, audio-card button audits) were dropped from this page; the *why* that
 > outlived them is in "History: the Electron UI" at the end, the full text in version control
@@ -694,7 +694,7 @@ cleared; any non-Live state (a rebuild for a codec switch, a pause) resets it.
 the screen changes, so an idle or slower monitor under a 240 target would otherwise read as
 an encoder limit. No per-GPU tables: everything is measured at run time.
 
-UI: the action bar's Live status shows `Screen · 172/240 fps` in the warning colour and its
+UI (since task I3, 2026-11-04 the Share menu of the control bar instead of the old action bar; its header and notes say the same): the action bar's Live status shows `Screen · 172/240 fps` in the warning colour and its
 tooltip (now always present, with the full status) adds "Encoding 172 of 240 fps".
 Measured: H.264 @240 Balanced → hint at 171-173 fps; H.265 → viewer 240-241 fps, hint gone.
 
@@ -907,7 +907,7 @@ pipeline surgery"). Option 1 is exactly what the user does by hand, with the pro
 Option 2 is a later improvement.
 
 **UI (sharer).** The pill reads *Recovering* (`PillKind::Progress`, `ui.pill.recovering`) and
-the action bar title *Screen capture lost - Restarting the screen capture*; the tooltip has the
+the action bar title *Screen capture lost - Restarting the screen capture* (since I3 the same lines are the recovering pill and note in the Share menu, `share::share_menu`); the tooltip has the
 attempt number, the countdown to the next attempt and the last error. The room tile chip reads
 RECOVERING. `ui/APP-SHELL.md`.
 

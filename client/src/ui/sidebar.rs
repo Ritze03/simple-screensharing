@@ -222,14 +222,13 @@ fn decoded_fps(cx: &Cx, key: StreamKey) -> Option<u32> {
 pub fn show_user_band(ui: &mut Ui, cx: &mut Cx, _st: &mut SidebarState) {
     let row = HBox::new("user_band", theme::BAND_H).slots(&[fixed(theme::AVATAR), FILL, fixed(theme::CTL_H)]).show(ui);
     let name = cx.state.display_name.clone();
-    let initial: String = name.chars().next().map(|c| c.to_string()).unwrap_or_default();
     // Only rooms we're actually on air in; a share still Starting (e.g. an
     // idle screen waiting for its first frame) says "Starting…" instead.
     let n_live = cx.on_air_rooms().len();
     let starting = n_live == 0 && cx.live_rooms().iter().any(|h| cx.my_phase(*h) == Some(super::MyPhase::Starting));
     let online = cx.rooms().iter().any(|r| r.conn == ConnState::Joined);
     let av = Rect::from_center_size(row.cell(0).center(), vec2(theme::AVATAR, theme::AVATAR));
-    widgets::paint_avatar(ui, av, &initial, theme::avatar_colors(&name), online);
+    super::paint_person(ui, av, &name, online);
 
     // "who": vbox(name 13 bold / 16 line, status 11 / 14 line); the hover
     // wash is padded 3/6 around it (mockup `.p-user .who`, margin 0 −6).

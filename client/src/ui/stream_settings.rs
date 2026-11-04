@@ -46,7 +46,7 @@
 //! out (`AppState::supported_codecs`, as the former Electron app did).
 //!
 //! Owns [`PopoverKind::AlsoSendTo`] / [`PopoverKind::MoveTo`] (same lists as
-//! the bar's "N rooms ▾", see `action_bar::RoomTargets`).
+//! the bar's "N rooms ▾", see `share::RoomTargets`).
 
 use egui::{Align, CornerRadius, Rect, Response, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use simple_screensharing_client::capture::{QualityLevel, VideoCodec};
@@ -58,11 +58,11 @@ use simple_screensharing_client::session::{
     AppState, CaptureSourceId, DestEdit, Destination, DestinationId, LocalCapture, MAX_BITRATE_KBPS, RoomHandle,
 };
 
-use super::action_bar::{
+use super::share::{
     PillKind, RoomTargets, awaiting_first_frame, dest_kbps, dest_pill, find_source, level_lit, pop_heading, rooms_count, screen_name,
     source_size, video_destination_count, waiting_hint,
 };
-use super::{Cx, NextStream, Popover, PopoverKind, UiAction, tr, tr_with};
+use super::{Cx, NextStream, Popover, PopoverKind, UiAction, menu, tr, tr_with};
 use crate::theme::{self, Weight, font};
 use crate::widgets::{
     self, BannerKind, Btn, DestAction, DestRow, FILL, FooterClick, HBox, ModalSpec, Pill, fade, fixed, paint_galley, paint_gradient, paint_text,
@@ -101,13 +101,13 @@ pub struct StreamSettingsState {
 /// What the modal edits: one live destination, or the next-stream settings
 /// a staged capture goes live with.
 #[derive(Clone, Copy)]
-enum Target {
+pub(super) enum Target {
     Live(DestinationId, DestEdit),
     Staged,
 }
 
 impl Target {
-    fn values(&self, state: &AppState) -> NextStream {
+    pub(super) fn values(&self, state: &AppState) -> NextStream {
         match self {
             Target::Live(_, e) => NextStream {
                 framerate: e.framerate,
@@ -121,7 +121,7 @@ impl Target {
         }
     }
 
-    fn action(&self, n: NextStream) -> UiAction {
+    pub(super) fn action(&self, n: NextStream) -> UiAction {
         match self {
             Target::Live(d, e) => UiAction::EditDestination {
                 destination: *d,
@@ -139,7 +139,7 @@ impl Target {
         }
     }
 
-    fn preset_action(&self, p: EncoderPreset) -> UiAction {
+    pub(super) fn preset_action(&self, p: EncoderPreset) -> UiAction {
         match self {
             Target::Live(d, _) => UiAction::ApplyPresetToDestination { destination: *d, preset: p },
             Target::Staged => UiAction::ApplyPresetToNextStream(p),
@@ -352,7 +352,7 @@ fn codec_key(c: VideoCodec) -> String {
 /// Keep a level tap running for every audio source while the *staged* modal
 /// is open, so the Source card's meter moves before anything is shared (a
 /// staged capture has no audio share to read a level from). Same idea as the
-/// bar's audio popover (`action_bar::sync_level_taps`): start when it opens,
+/// bar's audio dropdown (`share::sync_level_taps`): start when it opens,
 /// restart when the source list changes, stop when it is no longer needed.
 ///
 /// `Why the modal has to do this itself:` taps only exist after an explicit
@@ -527,12 +527,12 @@ fn source_card(ui: &mut Ui, cx: &Cx, c: &LocalCapture, capture: CaptureSourceId,
             out.push(UiAction::Discard(capture));
             out.push(UiAction::StageShare(room));
         }
-        let opts: Vec<&str> = names.iter().map(String::as_str).collect();
+        let opts: Vec<menu::Opt> = names.iter().enumerate().map(|(i, n)| menu::Opt { label: n, sub: None, icon: Some(if i == 0 { "volume_off" } else { "music_note" }) }).collect();
         widgets::ctrl_row_value(
             ui,
             &tr("ui.stream.audio", "Audio"),
             None,
-            |ui| widgets::select(ui, "stream_audio", &mut idx, &opts),
+            |ui| menu::select(ui, "stream_audio", &mut idx, &opts),
             |ui| widgets::value_box_with(ui, |ui| widgets::meter(ui, lit)),
         );
         let enabled = audio.is_some();
@@ -804,8 +804,8 @@ fn video_card(ui: &mut Ui, cx: &Cx, target: Target, out: &mut Vec<UiAction>) {
         format!("preset {}\npreset_order {order}\ngop {}\nquality {:?}\ntune {:?}", preset.map_or("none", EncoderPreset::value), v.gop_millis, v.quality_level, v.tune)
     });
     widgets::card(ui, &tr("ui.stream.video", "Video"), None, |ui| {
-        let labels: Vec<&str> = fps_labels.iter().map(String::as_str).collect();
-        let r = widgets::ctrl_row(ui, &tr("ui.stream.fps_label", "FPS"), None, |ui| widgets::select(ui, "stream_fps", &mut fps_idx, &labels));
+        let labels: Vec<menu::Opt> = fps_labels.iter().map(|l| menu::Opt::new(l)).collect();
+        let r = widgets::ctrl_row(ui, &tr("ui.stream.fps_label", "FPS"), None, |ui| menu::select(ui, "stream_fps", &mut fps_idx, &labels));
         drive_dump::rect(|| "fps".into(), r.rect);
         drive_dump::line(|| format!("fps {}\nfps_options {}", v.framerate, fps_opts.iter().map(u32::to_string).collect::<Vec<_>>().join(" ")));
         if r.changed() {
@@ -824,7 +824,7 @@ fn video_card(ui: &mut Ui, cx: &Cx, target: Target, out: &mut Vec<UiAction>) {
 }
 
 /// The Video card's caption: "60 FPS · Quality encoding · Keyframe 1000 ms".
-fn preset_caption(v: &NextStream) -> String {
+pub(super) fn preset_caption(v: &NextStream) -> String {
     let mode = match v.quality_level {
         QualityLevel::Performance => tr("ui.stream.ql_performance", "Performance"),
         QualityLevel::Quality => tr("ui.stream.ql_quality", "Quality"),
@@ -855,7 +855,7 @@ fn rooms_popover(ctx: &egui::Context, cx: &mut Cx, capture: CaptureSourceId, roo
         tr("ui.stream.move_heading", "Move this stream to")
     };
     let mut picked = None;
-    let open = super::popover(ctx, &pop, super::action_bar::POPOVER_W, |ui| {
+    let open = super::popover(ctx, &pop, super::share::POPOVER_W, |ui| {
         pop_heading(ui, &heading);
         if also {
             targets.also_items(ui, &mut picked);

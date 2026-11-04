@@ -18,19 +18,24 @@ approved by the user as an HTML mockup (https://claude.ai/artifact/5yA1iHf1YnXqm
 its "Proposed" tab).
 
 ```
-┌ sidebar 272 ────────┐┌ room header band 56: title, status pill, meta | Auto-connect,
-│ brand band 56       ││   Copy invite link, Leave, ⋯                                    │
-│ Watched streams     │├─────────────────────────────────────────────┬─ People 232 ─────┤
-│ ROOMS (rooms well,  ││ the stage (black, pad 16): the room's       │ members, sharers │
-│  sharer sub-rows)   ││  streams as Split / Crop / Floating         │                  │
-│ Create or join      ││  (other states: scrolling body, pad 16)     │                  │
-│ user band 56        │├─────────────────────────────────────────────┴──────────────────┤
-└─────────────────────┘│ action band 56 (PANEL_SUNKEN), room-scoped                      │
-                       └────────────────────────────────────────────────────────────────┘
+┌ sidebar 272 ────────┐┌ room header band 56: title, status pill, meta                   ┐
+│ brand band 56       │├────────────────────────────────────────────────────────────────┤
+│ Watched streams     ││ the stage (black): streams as Split / Crop / Floating           │
+│ ROOMS (rooms well,  ││   people strip: avatars, ring, LIVE badge, hover card           │
+│  sharer sub-rows)   ││   control bar: [sidebar][invite] [share|audio|webcam][layout|   │
+│ Create or join      ││      room|people][leave] [pop out][fullscreen]                  │
+│ user band 56        ││  (other states: scrolling body, pad 16)                         │
+└─────────────────────┘└────────────────────────────────────────────────────────────────┘
 ```
 
-- Left sidebar **272 px**; room header band **56**; People **232 px**; bottom action band
-  **56**. The user band (sidebar bottom) and the action band share one top border line.
+The People panel and the bottom action band are gone (task I3, 2026-11-04): the stage's strip and bar replace
+them, and the room header lost its controls (Auto-connect, Copy invite link, Leave and `⋯` live in the bar and its
+Room settings menu). *Why:* the user approved the replica's stage, where people and controls sit on the stage like a
+call, not in side panels.
+
+- Left sidebar **272 px** (hides with the bar's button, `Nav::sidebar_hidden`); room header band **56**. A room
+  with no stage (not connected, connecting) keeps a `⋯` in the header for the Room settings menu, since there is
+  no bar to hold it.
 - **Connecting vs Reconnecting** (`ui::ConnState`: `Joined`, `Connecting`, `Reconnecting`,
   `Disconnected`). `Connecting` is a room's *first* connect in flight (sidebar/header pill
   "Connecting"); `Reconnecting` is only a suspended room (TERMINOLOGY) that the lib is
@@ -43,45 +48,28 @@ its "Proposed" tab).
   label and the wire default "Screen" (in any locale) render in the current language, other
   names (audio sources, peer-chosen labels) as is. The lib stores the label translated at
   creation, so without this a language switch would leave old shares in the old language.
-- The People panel and action bar exist only while the shown room is joined or
-  reconnecting (`Cx::shows_room_panels`); a disconnected room, the "Watched streams" view
-  and the welcome view have neither.
+- The stage (strip and bar included) exists only while the shown room is joined; "Watched streams" is always a stage;
+  a disconnected, connecting or reconnecting room and the welcome view show the scrolling body (`room::shows_stage`).
 - **The Stream Control / View / Settings nav rail is gone.** Settings is a modal opened
-  from the user band's gear; sharing lives in the room's action bar; watching is the
+  from the user band's gear; sharing lives in the stage's control bar; watching is the
   the room's stage.
 - **Stream settings open in a modal**, not a side panel. *Why:* the user said the side
   panel was too squished for the number of controls.
-- **Leave sits in the room header.** *Why:* user's call; it is a room-level action, not
-  a sharing one, so it is not in the (sharing) action bar.
-- **Narrow windows (800 px minimum → ~496 px header / action band, ~296 px centre column
-  between sidebar and People):** *Why 800 (PR #4, 2026-11-03; 960 before):* so the window
-  half-tiles on a 1920 px screen. Checked on the real app in en and de (#127): at 800 the
-  header sits at level 3 in en (Copy/Leave icons, no meta line) and 4 in de (bare checkbox),
-  the live bar collapses fully (status truncated, Stop sharing icon-only; staged: Go live
-  icon-only in de), one share card / tile per row (the cards are gone, see "The stage"), the stream-settings modal one column
-  (752 px). The only thing that clipped was the tile's hover statbar (`1920x1080 30fps 7.6…`
-  cut mid-number in a ~178 px cell): it now drops the resolution, then the bitrate, into
-  its tooltip (`stage::tile::statbar_fields`). Nothing clips;
-  controls degrade in a fixed order instead. Action bar: the status text truncates down
-  to 72 px first, then buttons go icon-only (label in the tooltip): Live = Stream
-  settings → `N rooms ▾` to `N ▾` → audio compact → Stop sharing; Staged/Picking =
-  Stream settings → audio → Discard → Go live. Header: Copy invite link icon-only →
-  meta line dropped whole (never "2 pe…") → Leave icon-only → bare Auto-connect checkbox.
-  *Why:* redundant controls go first (Stream settings is on the own tile, Copy invite
-  link in ⋯, the meta counts in People); the primary action keeps its words longest.
-  Details in the `action_bar.rs` module doc and `room::show_header`.
-  Body and modal: the stream-settings modal stacks its two columns into one when a
-  column would be narrower than its widest segmented control / Screen readout needs
-  (measured from the current locale's labels, so it is one column at 800 and 960 and two at
-  1280+ in en and de). The Preset and Codec rows size their segments to their labels
-  when equal segments would truncate, so German's "Niedrige Latenz" no longer forces
-  one column at every width (#47: four equal Preset segments needed a 585 px column,
-  more than the 1120 px modal's ~534 px half). The reconnect banner moves its buttons under the text when the
-  text column beside them would be under 320 px; empty states wrap, centred.
-  *Why measured, not a fixed breakpoint:* German labels run ~20 % longer, so a fixed
-  width either stacks English for nothing or still truncates German. *Why the banner
-  keeps its words:* Retry now is its whole point. Details in `stream_settings.rs`
-  (`column_need`) and `room::reconnect_banner`.
+- **Leave sits in the control bar** (red, as tall as the button groups; before I3 in the room header). *Why:* the
+  replica's call; it is a room-level action, so it is not in the Share group.
+- **Narrow windows (800 px minimum, a ~528 px stage when the sidebar shows).** *Why 800 (PR #4, 2026-11-03; 960
+  before):* so the window half-tiles on a 1920 px screen. The control bar degrades in a fixed order (`stage::bar::arrange`,
+  pure, tested): the **Copy invite link label** goes first, then the bar takes **two rows** (the middle part on top, the
+  side buttons under it, 104 px instead of 72); the middle part (two groups and Leave, ~500 px) still fits 528 px with 8 px
+  side padding. Icons never move into a menu. The hover card and the menus clamp to the window. The header drops its meta
+  line when it does not fit (never half-cut), a long room name truncates. Stage tiles: the name tag drops the stats
+  resolution, then the bitrate (`tile::stats_fields`), the number slots never half-draw. Body and modal: the
+  stream-settings modal stacks its two columns into one when a column would be narrower than its widest segmented
+  control / Screen readout needs (measured from the current locale's labels, so it is one column at 800 and 960 and
+  two at 1280+ in en and de); the reconnect banner moves its buttons under the text when the text column beside them
+  would be under 320 px; empty states wrap, centred. *Why measured, not a fixed breakpoint:* German labels run ~20 %
+  longer, so a fixed width either stacks English for nothing or still truncates German. Details in
+  `stream_settings.rs` (`column_need`), `room::reconnect_banner` and `stage/bar.rs`.
 - **The stage** (task I1, 2026-11-04; the replica's Stage, `ui/replica/index.html`, user-approved in the design
   sandbox, see `STYLING-GUIDE.md` "HTML replica"). The centre of a **joined room** and the whole **Watched streams**
   view are one black stage (`STAGE_BG`) that replaces the old "On screen" tiles and "Sharing in this room" cards;
@@ -95,9 +83,10 @@ its "Proposed" tab).
   double-click away on a bar.
   - **What is on it:** other people's video streams (watched = video; not watched = a dimmed preview, "X is
     sharing Y" and **Watch stream** / **Pop out**), audio-only senders (**Listen**), then your own live share.
-    Watched shows what you watch, nothing else. A popped-out stream is absent (the pop-out window is its place;
-    closing it brings it back until the avatar badge exists). Everything that used to be a card button is on its
-    tile: Watch / Pop out / Listen on the idle tile, Stream settings and the viewers chip (below) on the own tile.
+    Watched shows what you watch, nothing else. A popped-out stream is absent (the pop-out window is its place; closing it
+    brings it back, so does its owner's avatar in the strip, below). Everything that used to be a card button is on its
+    tile: Watch / Pop out / Listen on the idle tile, Stream settings and the viewers chip (below) on the own tile; the rest of
+    a stream's controls are its `⋯` menu.
   - **Keys:** a tile is identified by `stage::ItemId` = room handle + owner name + label (+ audio flag, n-th of
     identical ones), your own share is `room/me`; **not** by `StreamKey`, whose `ConnId`/`StreamId` change with every
     reconnect, so a reconnect keeps order, grid and window rects (`WantedStream`'s identity). Watch, pop-out, volume
@@ -137,12 +126,28 @@ its "Proposed" tab).
     a scratch helper over `hs-vptr`'s protocol did it, it is not in `client/scripts/` yet).
     The Layout menu does not exist yet (control bar rebuild): until then nothing in the app sets Crop or
     Floating, the actions and state are there.
-- **Tile overlay** (plain form; the stream menu, stats toggle, PIP and the polished hover card come with the control
-  bar rebuild): on hover a vignette, the statbar (name, resolution, fps, bitrate; narrow tiles drop resolution,
-  then bitrate, into the tooltip), round **Pop out**, **Fullscreen** and **Stop watching** buttons, and the audio
-  pill (mute, volume 0-500 %, level-loudness button) or a "No audio shared" chip. "Always show names" shows a
-  name tag without hovering. A green ring means the stream's shared audio is audible. Double-click a watched tile =
-  fullscreen (below).
+- **Tile overlay and stream menu** (task I3, D1): a watched tile shows nothing over its picture until the pointer is on it.
+  Then: the **name tag** at the top left (`[icon][name][· label]`, the icon is the audio status: `volume_up` audible,
+  `volume_off` muted or none) and three round buttons at the top right, **Pop out**, **Fullscreen** and `⋯`.
+  **"Always show names"** (Layout menu) keeps the tag without hovering; the buttons and the stats never stay. **Show
+  stats on the stream** (stream menu, per stream) adds `res · fps · rate` to the tag **while hovered**, in slots reserved
+  for `9999×9999`, `999 fps` and `99.9 Mbps` (`tile::RESERVE`), so the pill is exactly as wide as its content and never
+  jitters as a number gains a digit; its tooltip keeps what the old statbar's had (decoded vs shown fps, codec and decoder,
+  dropped). A narrow tile drops the resolution, then the bitrate (`tile::stats_fields`). A green ring on the picture
+  means the stream's shared audio is audible. Double-click a watched tile = fullscreen (below). *Why no audio pill and
+  no Stop button on the tile any more:* the replica puts volume, level loudness, stats and Stop watching in the stream
+  menu, so the picture stays clean (user, D1: "a stream's buttons and stats show only while it is hovered").
+- **The stream menu** (`stage/menus.rs::tile_menu`, `PopoverKind::Tile(ItemId)`): the `⋯` button or a **right click on any
+  tile** opens it (anchored to the button or the pointer). Header (avatar, who, `label · size`, or `label · room` in
+  Watched); for a watched stream with audio a Volume row `[mute][slider 0-500 %][pct]` and the **Level loudness** switch
+  (the global setting, same action as Settings), else "No audio in this stream"; **Show stats on the stream**; Pop out,
+  Fullscreen, Stop watching. An unwatched tile's menu is Watch stream / Pop out; an audio-only sender's Listen and,
+  while listening, the volume row; your own tile's Stream settings… / Stop sharing. **Volume acts during the drag**
+  (`tile_volume_slider` pushes `SetVolume` on every change, #135; D1) and **scrolling on the slider** moves it 5 % a notch
+  up to 200 %, 10 % above (`ui::volume_slider`, `wheel_step`, #113), here and in the pop-out. *Why the exception to "local
+  edit state is pushed on `drag_stopped`" (below):* `SetVolume` only sets the decoder's volume element and the in-memory
+  value, one per changed frame is cheap, and the user wants to hear the level while choosing it; the Boost slider in
+  Settings does the same (`PreviewAudioGain` while dragging, `SetAudioGain` on release).
 - **Own-tile live preview** (#78, user request 2026-10-15): your own tile shows a live <= 640x360 / <= 30 fps picture
   of what is captured **while the window is focused** (name tag `You · label` with a green or amber `cast` icon
   and the state, `PREVIEW` chip on hover); unfocused, minimized or with the tile not painted it is the hatched
@@ -154,7 +159,7 @@ its "Proposed" tab).
   own tile, shown on hover next to the Stream settings button): an eye chip with the number of people
   watching that share in that room (`[PREVIEW][viewers][tune]`, `stage::tile::viewers_dropdown`). Hovering it
   opens a dropdown (not a text tooltip): a `WATCHING NOW · N` heading, then one row per viewer, the same
-  initial-letter avatar the People list uses (`widgets::paint_avatar`, a 22 px disc)
+  initial-letter avatar the people strip uses (`ui::paint_person`, a 22 px disc)
   and the display name, sorted case-insensitively. It stays open while the pointer is on the chip,
   the dropdown or the gap between them, so the pointer can travel into it, and closes when it leaves;
   more than 8 viewers collapse into a `+N` row (a room holds 8 members, so this never shows today).
@@ -169,6 +174,66 @@ its "Proposed" tab).
   viewer number ... when he hovers over it, a drop-down thingy ... the profile picture and the
   username"); "profile picture" is the app's existing avatar. Browser twin: `docs/js/ui/app.js`
   `viewersChip`, `features/website.md`.
+
+**The control bar** (task I3, `stage/bar.rs`; the replica's `.ctlrow`): `[hide sidebar][Copy invite link]` left, two button
+groups and Leave in the middle, `[pop out][fullscreen]` right (Watched has no Invite, Room settings or Leave and shows
+Share and audio only while you have a share to act on, in the room you share in). **Share screen, Share audio, Webcam,
+Layout and Room settings are split buttons that always show their dropdown arrow**, cut off from the button by a separator
+line (`STAGE_BTN_SEP`); grouped buttons sit on a backdrop (`STAGE_BTN` in a `STAGE_GROUP` pill), the freestanding ones at the
+sides have none; a live Share/Audio button is green, a staged one accent (`ready`); **Leave is 64x50, as tall as a group**.
+The people button shows and hides the strip; there is no people list and no arrow above the avatars. *Share* click: idle
+starts the picker (or opens its menu when your share is live in another room, so add / move here stay reachable), staged
+or live opens the Stream settings modal; its arrow opens the **Share menu** (Off / Ready / Live header with pill, size,
+codec and rate; FPS and Preset for the live destination or the next stream; Change source, All stream settings…, Go live
+in / Stop sharing; a recovering or encoder-bound note). *Share audio* is enabled next to a screen only (audio rides along
+with it, tooltip says so); its arrow is today's source list with meters, mute and stop (`share::audio_menu`; I7 adds Desktop
+audio, audio-only and the settings). *Webcam* is present, disabled with a tooltip, and has no menu until I8 (its arrow
+will offer the camera and "All webcam settings…"); I7 and I8 only enable their `Split` in `bar::share_buttons` and add a
+`BarMenu` body in `menus.rs`. Layout menu: Split / Crop / Floating (two-line items), a disabled "Webcam in picture", Always
+show names, Hide my own streams (removes your screen and webcam from your stage only, others still see them), Reset sizes
+and positions. Room settings menu: header, Auto-connect, Rename, Copy invite link, Leave room, Forget room (the modals
+the old header used). Bar layout and narrow windows: see "Narrow windows".
+
+**The people strip and hover card** (task I3, `stage/strip.rs`): one 64 px cell per person (you first); ring, avatar, LIVE
+badge and name hang off **one centre line** (the pixel-snapped avatar rect's) with and without audio, and the green ring is
+one 2 px circle stroke 3 px outside the avatar, so it is even all round. The ring means audible shared audio (no voice chat);
+several streams of one person are one avatar with a count; a popped-out stream shows only as a dashed outline and a pop badge
+on its owner's avatar and a click on the avatar brings all of them back. Hovering a person opens **the same card for everyone**:
+avatar, name, "Sharing N streams", and per stream a row `label · Audio / No audio`, the numbers (`res · fps · codec · rate`,
+only the announced size for an unwatched stream), the state (`On the stage`, `Popped out` with a **Bring back** button, `Not
+watching`, `Your stream · N watching`, + the room in Watched). The card stays open over the avatar, the gap and itself. Audio
+is per owner on the wire (`sibling_audio_stream`), so two streams of one person both say Audio when the person shares audio.
+**Avatars are drawn by one function, `ui::paint_person(ui, rect, name, presence)`** (initial on the name's gradient today); its
+call sites: the strip, the hover card (head), the stream menu (head), the idle tile's big avatar, the viewers dropdown and the
+sidebar's user band. The emoji avatars (I4) change that function (and `Settings > Profile` in `modals.rs`, the "Profile" card
+of `settings`, gets the picker button).
+
+**Menus and dropdowns** (task I3, `ui/menu.rs`): every dropdown is the app's own popover style (`ui::popover` frame:
+`PANEL_RAISED`, radius 10, padding 6, shadow; `pop_item` rows with an icon and a faint second line, a highlighted current
+row). The bar's menus and the stream menu are `Nav::popover` (`PopoverKind::Bar(BarMenu)`, `PopoverKind::Tile(ItemId)`), drawn
+by `stage/menus.rs` *before* the bar so a click outside one that lands on another bar button closes it first. **Dropdown fields**
+(`menu::select`) open the same menu **under the field, as wide as it**; the Stream settings modal's FPS and Audio dropdowns and
+Settings > Presentation use it instead of `egui::ComboBox` (`widgets::select`, no longer called). *Why:* the user: every dropdown
+looks like the app's menus, icons and sub-lines where they exist.
+
+**The whole stage can pop out** (task I3, `stage::show_windows`): the bar's pop-out button moves the stage (streams, strip and
+bar) into its own OS window, an **immediate viewport** that runs the same `stage::show` with `Host::Window`, while the main window
+shows "The stage is open in its own window" and **Bring it back**; the window's button, its close button or a vanished room bring
+it back. Fullscreen there is the window's own (`ViewportCommand::Fullscreen`, F11 / Escape). *Why immediate, not deferred like the
+per-stream pop-outs:* a deferred closure is `Send + Sync + 'static` and cannot hold `Cx` and the video views; an immediate one runs
+inside our own frame, so there is no `Shared` round trip. *Left out:* the window is keyed by the room's `RoomHandle` (minted per
+connection), so a reconnect closes it and the stage returns to the main window; a modal opened from it (Stream settings…)
+appears in the main window. Per-stream pop-outs are unchanged (`popout.rs`, `popout_survives_resume`).
+
+**Fullscreen chrome** (task I3, `stage/chrome.rs`, the pure rule; the replica's behaviour and the user's request #136): the bar's
+fullscreen button makes the main window fullscreen with **only the stage** drawn (`Nav::stage_fullscreen`; no sidebar, header or
+side bars; Escape leaves, `App::update`). There the strip and bar **lie over the stage** (the arena keeps the whole window minus
+8 px, so **streams do not jump when they fade**), on a `STAGE_CHROME` wash, and fade out over 0.25 s: they hide when the pointer
+leaves the stage, and after 3 s without movement, click, scroll or key while it is on it; movement brings them back; the tile
+overlays and the cursor go with them. **An open menu, context menu, modal, dropdown or a drag stops the timer and keeps the chrome
+up wherever the pointer is; when it ends the chrome gets a full 3 s** (`chrome::step`: `held`, `grace`). Entering fullscreen starts
+the same 3 s. Outside fullscreen the chrome always shows and the streams get what is left above it. Per-stream fullscreen
+and the pop-out windows keep their older twin (`popout::overlay_shown`).
 
 ### Layout implementation rule
 
@@ -187,10 +252,11 @@ re-derive the split every frame and silently break when content height changes.
 | `mod.rs` | `App` (eframe app: polls the session, lays out the panels, runs modals/toasts, applies actions); `View` (`Welcome` / `Watching` / `Room(RoomKey)`); `Modal`, `PopoverKind`/`Popover`; `Nav { view, modal, popover }`; `Shell` (staged shares, toasts, create/join results, level taps); `UiAction` (every cross-screen action); `Cx`; selectors (`room_entries`, `ShareState`, `same_room`, ...); the shared `tr` / `tr_with` i18n fallback helpers |
 | `apply.rs` | `App::apply`: the **only** place a `UiAction` changes state. Thin calls into the lib (`session.rs`) plus nav/shell bookkeeping |
 | `video.rs` | `VideoViews`: one GPU `VideoView` per watched stream, keyed by `StreamKey = (RoomHandle, ConnId, StreamId)`, synced once per frame; `popped` flag + `close_requested` for pop-outs |
-| `stage/` | the stage (`mod.rs`: `StageState`, `StageSettings`, `StageView`/`StageLayout`, `ItemId`, items, input, painting; `geom.rs`: pure grid / bar / floating maths; `tile.rs`: video, idle, audio-only and own tiles, hover overlay, statbar, audio pill, viewers dropdown) |
+| `stage/` | the stage (`mod.rs`: `StageState`, `StageSettings`, `StageView`/`StageLayout`, `Host`, `ItemId`, items, input, painting, `show_main` / `show_windows`; `geom.rs`: pure grid / bar / floating maths; `tile.rs`: video, idle, audio-only and own tiles, the name tag with stats, the hover buttons, the viewers dropdown, the stream menu's volume row; `bar.rs`: the control bar and its pure `arrange`; `strip.rs`: people strip and hover card; `menus.rs`: bar dropdowns and the stream menu; `chrome.rs`: the fullscreen auto-hide rule) |
+| `menu.rs` | the app's menu style beyond `pop_item`: `menu::select` (a dropdown field), `switch_row`, the popover frame |
+| `share.rs` | the bar's Share screen and Share audio dropdown bodies, level-meter taps, "Also send to / Move to" lists (`RoomTargets`), pills, formatting, popover rows shared with the stream-settings modal (this was `action_bar.rs`) |
 | `sidebar.rs` | brand band, body (Watched streams well, ROOMS heading, rooms well with sharer sub-rows, Create-or-join), user band (avatar, "Live in N rooms" / "Not sharing" -> Outgoing popover, settings gear) |
-| `room.rs` | `show_header`, `show_stage` (the stage region), `show_body` (welcome, disconnected, connecting, reconnecting: banner, empty states), `show_people` |
-| `action_bar.rs` | bottom band, one layout per `ShareState`: Idle / Picking / Staged / Live / Paused; owns the share-menu, rooms and audio-source popovers |
+| `room.rs` | `show_header` (title, pill, meta; `⋯` for rooms with no stage), `show_stage` (the stage region), `show_body` (welcome, disconnected, connecting, reconnecting: banner, empty states) |
 | `stream_settings.rs` | the stream-settings modal (staged "Set up your stream", live "Stream settings"), width 1120 |
 | `modals.rs` | create/join, app settings, leave / forget confirm, rename, choose-your-name |
 | `popout.rs` | pop-out viewer windows: one deferred viewport per popped stream |
@@ -204,7 +270,8 @@ hover) and `pub fn show...(ui, cx: &mut Cx, st)` functions. It reads everything 
 `AppState`, `Nav` or `Shell`**; every change is `cx.act(UiAction::..)`, applied by
 `App::apply` after all screens have drawn (visible next frame). Local edit state is pushed
 as one action when it should take effect (e.g. on `drag_stopped`, not every frame of a
-drag). *Why:* the borrow checker can't hand four screens `&mut AppState` while they also
+drag), except where the user wants to hear or see the change while dragging (the viewer volume and the Boost
+slider push on every change). *Why:* the borrow checker can't hand four screens `&mut AppState` while they also
 read it, and a single apply site keeps every state transition in one reviewable place.
 
 The shell hands each screen a `Ui` that is exactly its region; a screen must not paint
@@ -254,8 +321,8 @@ the Playback card, **on by default**; `UiAction::SetLevelLoudness` -> `AppState:
 
 **Level-loudness button next to every viewer volume slider** (2026-11-03, task #126; user: "make sure the dynamic volume is
 something the viewer can actually select, whether he wants it or not ... next to the volume slider, have a little button
-that indicates the dynamic volume setting"). The audio pill is now `[25 mute][110 slider][34 %][25 level]` (tile pill in
-`room.rs`, pop-out / fullscreen pill in `popout.rs`; hidden with the slider while muted). The button is
+that indicates the dynamic volume setting"). The audio pill is `[25 mute][110 slider][34 %][25 level]` (pop-out / fullscreen pill in `popout.rs`; hidden with the slider while
+muted). Since task I3 the stage's tiles have no pill: the same global switch is the **Level loudness** row of the stream menu. The button is
 `ui::level_toggle` (25 px round, `graphic_eq` icon): **on** = accent ring + tinted disc + light-blue icon, **off** = faint
 icon; tooltip "Level loudness: on/off" (`ui.room.level_on/off`). A click sends `UiAction::SetLevelLoudness(!on)`, the same
 action and the same persisted global `level_loudness` setting as the Settings checkbox, so both stay in sync and it is live.
@@ -571,7 +638,7 @@ These were decided in the earlier UIs and are still the rules.
 - **Per-stream numbers are never invented**: sidebar fps = decoded fps while we watch a
   stream (the protocol's `StreamInfo` carries none), or the live destination's frame rate
   for our own share; empty otherwise.
-- **Share-state drives the action bar** (`ShareState`: Idle / Picking / Staged / Live /
+- **Share-state drives the control bar's Share button and menu** (`ShareState`: Idle / Picking / Staged / Live /
   Paused). Starting a share opens the OS picker first (capture `Starting` = Picking); the
   stream-settings modal then opens by itself.
 - **Stop frees the room at the click (2026-11-02, #98).** `AppState::stop_share` removes the

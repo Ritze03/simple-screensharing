@@ -395,6 +395,20 @@ impl App {
             UiAction::SetStageLayout { view, layout } => self.shell.stage.set_layout(view, layout),
             UiAction::SetHideOwnStreams(on) => self.shell.stage.hide_own = on,
             UiAction::SetAlwaysShowNames(on) => self.shell.stage.always_names = on,
+            UiAction::ToggleSidebar => self.nav.sidebar_hidden = !self.nav.sidebar_hidden,
+            UiAction::EnterStageFullscreen => {
+                if self.nav.stage_fullscreen.is_none() {
+                    let was_fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+                    self.nav.stage_fullscreen = Some(was_fullscreen);
+                    self.nav.popover = None;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+                }
+            }
+            UiAction::ExitStageFullscreen => {
+                if let Some(was_fullscreen) = self.nav.stage_fullscreen.take() {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(was_fullscreen));
+                }
+            }
         }
     }
 

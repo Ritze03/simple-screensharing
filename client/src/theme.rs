@@ -149,6 +149,12 @@ pub const TILE_GAP: f32 = 8.0;
 pub const STAGE_BTN_H: f32 = 40.0;
 /// `--strip-avatar` — people strip avatars.
 pub const STRIP_AVATAR: f32 = 44.0;
+/// The people strip's height (`.strip`: 22 above the avatars for ring and badges, 44, 7, a 14 px name, 2).
+pub const STRIP_H: f32 = 22.0 + STRIP_AVATAR + 7.0 + 14.0 + 2.0;
+/// `.stagefs .ctlrow` background (`rgba(6,7,9,.72)`): the strip and bar lying over the stage in fullscreen.
+pub const STAGE_CHROME: Color32 = rgba(6, 7, 9, 0.72);
+/// `--ovl-num` (`rgba(232,233,236,.85)`): mono numbers over a picture.
+pub const OVL_NUM: Color32 = rgba(232, 233, 236, 0.85);
 
 /// Debug-overlay colors (`--ov-*` in the mockup): vbox, hbox, fixed slot, fill slot.
 pub const OV_VBOX: Color32 = rgba(110, 140, 255, 0.85);
@@ -391,14 +397,18 @@ pub const ICONS: &[(&str, char)] = &[
     ("add", '\u{e145}'),
     ("add_to_queue", '\u{e05c}'),
     ("arrow_drop_down", '\u{e5c5}'),
+    ("bolt", '\u{ea0b}'),
+    ("call_end", '\u{e0b1}'),
     ("cast", '\u{e307}'),
     ("check", '\u{e5ca}'),
     ("check_circle", '\u{e86c}'),
     ("chevron_left", '\u{e408}'),
     ("chevron_right", '\u{e409}'),
     ("close", '\u{e14c}'),
+    ("close_fullscreen", '\u{f1cf}'),
     ("cloud_off", '\u{e2c1}'),
     ("content_copy", '\u{e14d}'),
+    ("crop", '\u{e3be}'),
     ("crop_square", '\u{e3c1}'),
     ("delete", '\u{e872}'),
     ("desktop_windows", '\u{e30c}'),
@@ -406,23 +416,30 @@ pub const ICONS: &[(&str, char)] = &[
     ("error", '\u{e000}'),
     ("expand_less", '\u{e5ce}'),
     ("expand_more", '\u{e5cf}'),
+    ("filter_none", '\u{e3e0}'),
     ("forum", '\u{e0bf}'),
     ("fullscreen", '\u{e5d0}'),
     ("fullscreen_exit", '\u{e5d1}'),
     ("graphic_eq", '\u{e1b8}'),
     ("grid_view", '\u{e9b0}'),
+    ("group", '\u{e7ef}'),
     ("info", '\u{e88e}'),
+    ("left_panel_close", '\u{f717}'),
+    ("left_panel_open", '\u{f716}'),
     ("link", '\u{e157}'),
     ("login", '\u{ea77}'),
     ("logout", '\u{e9ba}'),
     ("meeting_room", '\u{eb4f}'),
     ("mic", '\u{e029}'),
+    ("monitoring", '\u{f190}'),
     ("more_horiz", '\u{e5d3}'),
     ("move_down", '\u{eb61}'),
     ("music_note", '\u{e3a1}'),
+    ("music_off", '\u{e440}'),
     ("open_in_new", '\u{e895}'),
     ("pause", '\u{e034}'),
     ("person", '\u{e7fd}'),
+    ("person_add", '\u{e7fe}'),
     ("play_arrow", '\u{e037}'),
     ("radio_button_checked", '\u{e837}'),
     ("radio_button_unchecked", '\u{e836}'),
@@ -438,6 +455,7 @@ pub const ICONS: &[(&str, char)] = &[
     ("sync_problem", '\u{e629}'),
     ("tune", '\u{e429}'),
     ("tv_off", '\u{e647}'),
+    ("videocam_off", '\u{e04c}'),
     ("visibility", '\u{e417}'),
     ("visibility_off", '\u{e8f5}'),
     ("volume_off", '\u{e04f}'),

@@ -1,9 +1,15 @@
 //! What one stage tile shows: a watched stream's video with its hover overlay, a stream you can still
 //! watch (dimmed preview + Watch), an audio-only sender (Listen), or your own share (live preview).
 //!
-//! The overlay of a watched tile is the old tile's (vignette, statbar, round buttons, audio pill) with a
-//! fullscreen button added; the stream menu, stats toggle and PIP are a later rebuild (task I3 / I8).
-//! Decoder stats (and the decoder lock for the bitrate) are only read while the overlay is visible.
+//! **Hover overlay (task I3, the replica's):** a watched tile shows nothing over the picture until the pointer
+//! is on it. Then the name tag (`[icon][name][· label]`, the icon says whether its audio is audible) at the top
+//! left, with the numbers of "Show stats" appended in reserved, tabular slots, and three round buttons at the
+//! top right: Pop out, Fullscreen and `⋯` (the stream menu, [`tile_menu`]). "Always show names" keeps the tag
+//! without hovering; the numbers and the buttons never stay. A right click on any tile opens the same menu.
+//! Volume, level loudness, stats and Stop watching live in that menu, not in a pill over the picture.
+//! *Why:* the user's call from the replica (the stage should be a clean picture until asked), and "a stream's
+//! buttons and stats show only while it is hovered" (D1).
+//! Decoder stats (and the decoder lock for the bitrate) are only read while the numbers are visible.
 
 use egui::epaint::{Mesh, RectShape, Vertex, WHITE_UV};
 use egui::{Align, Color32, CornerRadius, Id, Layout, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, UiBuilder, pos2, vec2};
@@ -13,9 +19,9 @@ use simple_screensharing_client::decode::render::Fit;
 use simple_screensharing_client::protocol::{StreamInfo, StreamKind};
 use simple_screensharing_client::session::{CaptureSourceId, DestinationId, RoomHandle};
 
-use super::VolDrag;
+use super::{ItemId, VolDrag};
 use crate::theme::{self, Weight, font};
-use crate::ui::{Cx, Modal, StreamKey, UiAction, share_label, tr, tr_with};
+use crate::ui::{Cx, Modal, Popover, PopoverKind, StreamKey, UiAction, share_label, tr, tr_with};
 use crate::widgets::{self, Btn, FILL, HBox, fixed, paint_text, text_width};
 
 /// Where and how a tile is drawn this frame.
@@ -28,8 +34,11 @@ pub(super) struct Spot {
     /// The pointer is over this tile (and no tile above it).
     pub hovered: bool,
     pub always_names: bool,
+    /// "Show stats" is on for this stream.
+    pub stats: bool,
     /// Label tiles with the room too ("Watched").
     pub cross_room: bool,
+    pub id: ItemId,
 }
 
 /// Rounded corners over a wgpu video. `Why` masks: the video is a paint callback that cannot be clipped to a
@@ -57,28 +66,83 @@ fn corner_masks(ui: &Ui, rect: Rect, radius: u8) {
     ui.painter().add(Shape::mesh(mesh));
 }
 
-/// `.tag`: a dark 26 px pill at the tile's top left, `[icon][name][· label]`, truncated to the tile.
-pub(super) fn name_tag(ui: &Ui, rect: Rect, icon: &str, icon_col: Color32, name: &str, label: &str) {
-    let (nf, lf) = (font(Weight::Bold, theme::FS_ROW), font(Weight::Regular, theme::FS_ROW));
-    let label = format!("· {label}");
-    let (nw, lw) = (text_width(ui, name, nf.clone(), 0.0).ceil(), text_width(ui, &label, lf.clone(), 0.0).ceil());
-    let w = (7.0 + 15.0 + 6.0 + nw + 6.0 + lw + 9.0).min(rect.width() - 16.0);
-    if w < 40.0 {
-        return;
-    }
-    let bar = Rect::from_min_size(rect.min + vec2(theme::S2, theme::S2), vec2(w, 26.0));
-    ui.painter().rect_filled(bar, CornerRadius::same(7), theme::STAGE_TAG);
-    widgets::paint_icon(ui, Rect::from_min_size(bar.min + vec2(7.0, 0.0), vec2(15.0, 26.0)), icon, 15.0, icon_col);
-    let tx = bar.left() + 7.0 + 15.0 + 6.0;
-    let nr = paint_text(ui, Rect::from_x_y_ranges(tx..=bar.right() - 9.0, bar.y_range()), name, nf, theme::TEXT, Align::Min);
-    if nr.right() + 6.0 < bar.right() - 9.0 {
-        paint_text(ui, Rect::from_x_y_ranges(nr.right() + 6.0..=bar.right() - 9.0, bar.y_range()), &label, lf, theme::TEXT_DIM, Align::Min);
+/// The three numbers of "Show stats" as text: resolution, frame rate, bitrate.
+pub(super) struct Nums {
+    pub res: String,
+    pub fps: String,
+    pub rate: String,
+}
+
+/// What the stats slots reserve room for: the biggest resolution, a 3-digit frame rate, 10+ Mbps. The pill is
+/// as wide as these, not as the current values, so it never jitters as a number gains a digit (D1).
+const RESERVE: (&str, &str, &str) = ("9999×9999", "999 fps", "99.9 Mbps");
+
+/// Which numbers of the stats fit `avail` points: `(resolution, bitrate)`; the frame rate stays while anything
+/// does, `None` when not even it fits. Order of loss: resolution (changes least), then bitrate (fps is the
+/// health signal). `widths` are the reserved slot widths; every slot sits after a gap of [`theme::S2`].
+fn stats_fields(avail: f32, widths: (f32, f32, f32)) -> Option<(bool, bool)> {
+    let (res, fps, rate) = widths;
+    let g = theme::S2;
+    if (g + res) + (g + fps) + (g + rate) <= avail {
+        Some((true, true))
+    } else if (g + fps) + (g + rate) <= avail {
+        Some((false, true))
+    } else if g + fps <= avail {
+        Some((false, false))
+    } else {
+        None
     }
 }
 
+/// `.tag`: a dark 26 px pill at the tile's top left, `[icon][name][· label]` and, with `nums`, the stats slots.
+/// At most `max_w` wide (name and label truncate, then the numbers drop, see [`stats_fields`]). Returns the
+/// pill's rect and whether numbers were left out for lack of room.
+pub(super) fn name_tag(ui: &Ui, rect: Rect, max_w: f32, icon: &str, icon_col: Color32, name: &str, label: &str, nums: Option<&Nums>) -> Rect {
+    let (nf, lf, mf) = (font(Weight::Bold, theme::FS_ROW), font(Weight::Regular, theme::FS_ROW), font(Weight::Mono, theme::FS_SMALL));
+    let label = if label.is_empty() { String::new() } else { format!("· {label}") };
+    let (nw, lw) = (text_width(ui, name, nf.clone(), 0.0).ceil(), text_width(ui, &label, lf.clone(), 0.0).ceil());
+    let lead = 7.0 + 15.0 + 6.0;
+    let base = lead + nw + if lw > 0.0 { 6.0 + lw } else { 0.0 } + 9.0;
+    let widths = (text_width(ui, RESERVE.0, mf.clone(), 0.0).ceil(), text_width(ui, RESERVE.1, mf.clone(), 0.0).ceil(), text_width(ui, RESERVE.2, mf.clone(), 0.0).ceil());
+    let fields = nums.and_then(|_| stats_fields(max_w - base, widths));
+    let num_w = fields.map_or(0.0, |(res, rate)| {
+        theme::S2 * (1.0 + f32::from(res) + f32::from(rate)) + widths.1 + if res { widths.0 } else { 0.0 } + if rate { widths.2 } else { 0.0 }
+    });
+    let w = (base + num_w).min(max_w);
+    let bar = Rect::from_min_size(rect.min + vec2(theme::S2, theme::S2), vec2(w.max(0.0), 26.0));
+    if w < 40.0 {
+        return bar;
+    }
+    ui.painter().rect_filled(bar, CornerRadius::same(7), theme::STAGE_TAG);
+    widgets::paint_icon(ui, Rect::from_min_size(bar.min + vec2(7.0, 0.0), vec2(15.0, 26.0)), icon, 15.0, icon_col);
+    let right = bar.right() - 9.0 - num_w;
+    let tx = bar.left() + lead;
+    let nr = paint_text(ui, Rect::from_x_y_ranges(tx..=right.max(tx), bar.y_range()), name, nf, theme::TEXT, Align::Min);
+    if lw > 0.0 && nr.right() + 6.0 < right {
+        paint_text(ui, Rect::from_x_y_ranges(nr.right() + 6.0..=right, bar.y_range()), &label, lf, theme::TEXT_DIM, Align::Min);
+    }
+    if let (Some(n), Some((res, rate))) = (nums, fields) {
+        let num = theme::OVL_NUM;
+        let mut x = right.max(tx);
+        let mut slot = |text: &str, w: f32| {
+            x += theme::S2;
+            paint_text(ui, Rect::from_x_y_ranges(x..=x + w, bar.y_range()), text, mf.clone(), num, Align::Max);
+            x += w;
+        };
+        if res {
+            slot(&n.res, widths.0);
+        }
+        slot(&n.fps, widths.1);
+        if rate {
+            slot(&n.rate, widths.2);
+        }
+    }
+    bar
+}
+
 /// A watched stream: its video (Contain, or Cover in Crop), the green ring while its shared audio is audible,
-/// the health chip, and the hover overlay.
-pub(super) fn video_tile(ui: &mut Ui, cx: &Cx, drag: &mut VolDrag, key: StreamKey, s: &Spot, acts: &mut Vec<UiAction>) {
+/// the health chip, the name tag and the hover buttons.
+pub(super) fn video_tile(ui: &mut Ui, cx: &Cx, key: StreamKey, s: &Spot, acts: &mut Vec<UiAction>) {
     cx.videos.paint(key, ui, s.rect, if s.crop { Fit::Cover } else { Fit::Contain });
     corner_masks(ui, s.rect, s.round);
     let audible = cx.session(key.0).is_some_and(|x| x.sibling_audio_stream(key.1).is_some() && !x.volume(key.1, key.2).muted);
@@ -86,18 +150,82 @@ pub(super) fn video_tile(ui: &mut Ui, cx: &Cx, drag: &mut VolDrag, key: StreamKe
         ui.painter().rect_stroke(s.rect, CornerRadius::same(s.round), Stroke::new(2.0_f32, theme::SUCCESS), StrokeKind::Inside);
     }
     health_chip(ui, s.rect, stream_health(cx, key));
-    if s.always_names && !s.hovered {
-        let name = cx.member_name(key.0, key.1);
+    if s.always_names || s.hovered {
+        let owner = cx.member_name(key.0, key.1);
+        let name = if s.cross_room { format!("{owner} · {}", cx.room_name(key.0)) } else { owner };
         let label = cx.session(key.0).and_then(|x| x.streams.iter().find(|i| i.owner == key.1 && i.stream_id == key.2)).map(|i| share_label(&i.label)).unwrap_or_default();
-        let icon = if audible { "volume_up" } else { "volume_off" };
-        name_tag(ui, s.rect, icon, theme::TEXT_DIM, &name, &label);
+        let has_audio = cx.session(key.0).is_some_and(|x| x.sibling_audio_stream(key.1).is_some());
+        let (icon, col) = match (has_audio, audible) {
+            (false, _) => ("volume_off", theme::TEXT_DIM),
+            (true, false) => ("volume_off", theme::DANGER),
+            (true, true) => ("volume_up", theme::TEXT_DIM),
+        };
+        let nums = (s.stats && s.hovered).then(|| stream_nums(cx, key));
+        let max_w = s.rect.width() - 2.0 * theme::S2 - if s.hovered { TOOLS_RESERVE } else { 0.0 };
+        let tag = name_tag(ui, s.rect, max_w, icon, col, &name, &label, nums.as_ref().map(|n| &n.0));
+        if let Some((_, tip)) = nums {
+            ui.interact(tag, Id::new(("tag_tip", key)), Sense::hover()).on_hover_text(tip);
+        }
     }
-    tile_overlay(ui, cx, drag, key, s, acts);
+    tools(ui, s, Some(key), acts);
+}
+
+/// The numbers of a watched stream and the tooltip that adds what the pill has no room for.
+fn stream_nums(cx: &Cx, key: StreamKey) -> (Nums, String) {
+    let Some(entry) = cx.videos.get(key) else { return (Nums { res: String::new(), fps: String::new(), rate: String::new() }, String::new()) };
+    let stats = entry.view.lock().unwrap().source().stats();
+    let kbps = cx.session(key.0).and_then(|s| s.watches.lock().unwrap().get(&(key.1, key.2)).map(|w| w.decoder.lock().unwrap().received_bitrate_kbps())).unwrap_or(0.0);
+    let res = cx.videos.frame_size(key).map(|(w, h)| format!("{w}×{h}")).unwrap_or_default();
+    let nums = Nums { res: res.clone(), fps: format!("{:.0} fps", stats.decoded_fps), rate: fmt_kbps(kbps) };
+    let codec = stats.info.codec.map(|c| c.name()).unwrap_or("—");
+    let dec = stats.info.decoder_name.as_deref().unwrap_or("—");
+    let tip = tr_with(
+        "ui.room.stats_tip",
+        "Decoded %{decoded} fps · shown %{presented} fps\n%{codec} via %{decoder} · %{dropped} dropped",
+        &[
+            ("decoded", &format!("{:.0}", stats.decoded_fps)),
+            ("presented", &format!("{:.0}", stats.presented_fps)),
+            ("codec", codec),
+            ("decoder", dec),
+            ("dropped", &stats.access_units_dropped.to_string()),
+        ],
+    );
+    (nums, format!("{res} · {}\n{tip}", fmt_kbps(kbps)))
+}
+
+/// Room the three round buttons and their gaps take at the top right (3 x 29 + 2 x 4 + the tile's own gap).
+const TOOLS_RESERVE: f32 = 3.0 * OVL_H + 2.0 * theme::S1 + theme::S2;
+
+/// The hover buttons at the tile's top right, fading in over 0.12 s: `[Pop out][Fullscreen][⋯]` for a watched
+/// stream (`key`), only `[⋯]` for the others. `⋯` opens the stream menu at the button.
+fn tools(ui: &mut Ui, s: &Spot, key: Option<StreamKey>, acts: &mut Vec<UiAction>) {
+    let id = Id::new(("tile_tools", &s.id));
+    let alpha = ui.ctx().animate_bool_with_time(id, s.hovered, 0.12);
+    if alpha <= 0.0 {
+        return;
+    }
+    let mut ov = ui.new_child(UiBuilder::new().id_salt(id).max_rect(s.rect).layout(Layout::left_to_right(Align::Center)));
+    ov.set_clip_rect(s.rect.intersect(ui.clip_rect()));
+    ov.multiply_opacity(alpha);
+    let inner = s.rect.shrink(theme::S2);
+    let btn = |i: f32| Rect::from_min_size(pos2(inner.right() - OVL_H - i * (OVL_H + theme::S1), inner.top()), vec2(OVL_H, OVL_H));
+    let more = btn(0.0);
+    if round_btn(&mut ov, more, id.with("more"), "more_horiz", &tr("ui.stage.stream_menu", "Volume and more"), false).clicked() {
+        acts.push(UiAction::OpenPopover(Popover { kind: PopoverKind::Tile(s.id.clone()), anchor: more }));
+    }
+    if let Some(key) = key {
+        if round_btn(&mut ov, btn(1.0), id.with("fs"), "fullscreen", &tr("ui.stage.fullscreen", "Fullscreen"), false).clicked() {
+            acts.push(UiAction::EnterStreamFullscreen(key));
+        }
+        if round_btn(&mut ov, btn(2.0), id.with("pop"), "open_in_new", &tr("ui.room.pop_out_tip", "Pop out to its own window"), false).clicked() {
+            acts.push(UiAction::PopOut(key));
+        }
+    }
 }
 
 /// A stream in the room you do not watch yet (or an audio-only sender): a dark tile with the last preview
 /// dimmed behind `[avatar][X is sharing Y][1920×1080][Watch stream][Pop out]` (audio only: `[Listen]`).
-pub(super) fn idle_tile(ui: &mut Ui, cx: &Cx, key: StreamKey, info: &StreamInfo, s: &Spot, drag: &mut VolDrag, acts: &mut Vec<UiAction>) {
+pub(super) fn idle_tile(ui: &mut Ui, cx: &Cx, key: StreamKey, info: &StreamInfo, s: &Spot, acts: &mut Vec<UiAction>) {
     let audio_only = info.kind == StreamKind::Audio;
     let rect = s.rect;
     let radius = CornerRadius::same(s.round);
@@ -116,7 +244,7 @@ pub(super) fn idle_tile(ui: &mut Ui, cx: &Cx, key: StreamKey, info: &StreamInfo,
     let mut y = top;
     if full {
         let disc = Rect::from_center_size(pos2(rect.center().x, y + 26.0), vec2(52.0, 52.0));
-        widgets::paint_avatar(ui, disc, &initial(&name), theme::avatar_colors(&name), false);
+        crate::ui::paint_person(ui, disc, &name, false);
         y += 52.0 + theme::S2;
         let text = if audio_only {
             tr_with("ui.stage.sharing_audio", "%{name} is sharing audio", &[("name", &name)])
@@ -156,15 +284,12 @@ pub(super) fn idle_tile(ui: &mut Ui, cx: &Cx, key: StreamKey, info: &StreamInfo,
         (Some(1), false) => acts.push(UiAction::WatchPoppedOut(key)),
         _ => {}
     }
-    if listening && s.hovered {
-        let inner = rect.shrink(theme::S2);
-        audio_pill(ui, cx, drag, key, Rect::from_min_size(pos2(inner.left(), inner.bottom() - OVL_H), vec2(inner.width(), OVL_H)), acts);
-    }
+    tools(ui, s, None, acts);
 }
 
 /// Your own share in this room: a live preview of what you capture while the window is focused (task #78), a
-/// screen-hatch placeholder otherwise, the tag `You · label`, and on hover `[viewers][PREVIEW]` and a Stream
-/// settings button.
+/// screen-hatch placeholder otherwise, the tag `You · label`, and on hover `[viewers][PREVIEW]`, a Stream
+/// settings button and `⋯`.
 pub(super) fn mine_tile(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSourceId, destination: DestinationId, s: &Spot, acts: &mut Vec<UiAction>) {
     let Some(c) = cx.capture(capture) else { return };
     let Some(d) = c.destinations.get(&destination) else { return };
@@ -199,13 +324,19 @@ pub(super) fn mine_tile(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSou
             .on_hover_text(tr("ui.waiting_frame_hint", "An idle screen sends no picture until something on it changes. Move the mouse over the shared screen and the stream starts."));
     }
     let label = if on_air { share_label(&c.label) } else { format!("{} · {chip}", share_label(&c.label)) };
-    name_tag(ui, rect, "cast", if on_air { theme::SUCCESS } else { theme::WARNING }, &tr("ui.room.you", "You"), &label);
+    // Like every tag: while hovered or with "Always show names", and always while the share is not on air (a
+    // starting, stalled or failed share must say so, whatever the placeholder under it shows).
+    if s.hovered || s.always_names || !on_air {
+        let max_w = rect.width() - 2.0 * theme::S2 - if s.hovered { 2.0 * OVL_H + 3.0 * theme::S1 + 120.0 } else { 0.0 };
+        name_tag(ui, rect, max_w, "cast", if on_air { theme::SUCCESS } else { theme::WARNING }, &tr("ui.room.you", "You"), &label, None);
+    }
     if !s.hovered {
         return;
     }
-    // Top right: [PREVIEW][viewers][Stream settings], added after the tile's own widgets so they sit above.
+    // Top right: [PREVIEW][viewers][Stream settings][⋯], added after the tile's own widgets so they sit above.
     let inner = rect.shrink(theme::S2);
-    let btn = Rect::from_min_size(pos2(inner.right() - OVL_H, inner.top()), vec2(OVL_H, OVL_H));
+    let more = Rect::from_min_size(pos2(inner.right() - OVL_H, inner.top()), vec2(OVL_H, OVL_H));
+    let btn = more.translate(vec2(-(OVL_H + theme::S1), 0.0));
     let row = Rect::from_min_max(pos2(inner.left(), inner.top()), pos2(btn.left() - theme::S1, inner.top() + OVL_H));
     let mut r = ui.new_child(UiBuilder::new().max_rect(row).layout(Layout::right_to_left(Align::Center)));
     if let Some(names) = viewer_names(cx, h, d.stream_id) {
@@ -220,17 +351,16 @@ pub(super) fn mine_tile(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSou
     if round_btn(ui, btn, Id::new(("stage_mine_settings", capture)), "tune", &tr("ui.room.stream_settings", "Stream settings"), false).clicked() {
         acts.push(UiAction::OpenModal(Modal::StreamSettings { capture, room: h }));
     }
+    if round_btn(ui, more, Id::new(("stage_mine_more", capture)), "more_horiz", &tr("ui.stage.stream_menu", "Volume and more"), false).clicked() {
+        acts.push(UiAction::OpenPopover(Popover { kind: PopoverKind::Tile(s.id.clone()), anchor: more }));
+    }
 }
 
-fn initial(name: &str) -> String {
-    name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default()
-}
-
-fn fmt_kbps(kbps: f64) -> String {
+pub(super) fn fmt_kbps(kbps: f64) -> String {
     if kbps >= 1000.0 { format!("{:.1} Mbps", kbps / 1000.0) } else { format!("{kbps:.0} kbps") }
 }
 
-/// Statbar / round button / audio pill height.
+/// Statbar / round button height.
 const OVL_H: f32 = 29.0;
 
 /// Cover-fit a preview texture into `rect` (crop, never letterbox), tinted by `tint`.
@@ -275,160 +405,6 @@ fn health_chip(ui: &Ui, rect: Rect, state: ViewState) {
     paint_text(ui, tr_, &text, f, theme::TEXT, Align::Min);
 }
 
-
-/// The hover overlay of a tile: vignette, `[hbox·top: fill statbar, Pop out,
-/// Fullscreen, Stop watching]`, `[hbox·bottom: audio pill]`, inset 8. Fades in over
-/// 0.12 s while the pointer is over the tile; nothing is built at alpha 0.
-fn tile_overlay(ui: &mut Ui, cx: &Cx, drag: &mut VolDrag, key: StreamKey, s: &Spot, acts: &mut Vec<UiAction>) {
-    let (rect, cross_room) = (s.rect, s.cross_room);
-    let id = Id::new(("tile_overlay", key));
-    let alpha = ui.ctx().animate_bool_with_time(id, s.hovered, 0.12);
-    if alpha <= 0.0 {
-        return;
-    }
-    let mut ov = ui.new_child(UiBuilder::new().id_salt(id).max_rect(rect).layout(Layout::left_to_right(Align::Center)));
-    ov.set_clip_rect(rect.intersect(ui.clip_rect()));
-    ov.multiply_opacity(alpha);
-
-    // Vignette: .55 → .1 over the top 40 %, → .82 at the bottom.
-    let v = |a: f32| Color32::from_rgba_unmultiplied(10, 11, 13, (a * 255.0) as u8);
-    let split = rect.top() + rect.height() * 0.4;
-    let tr_ = s.round;
-    let top_r = CornerRadius { nw: tr_, ne: tr_, sw: 0, se: 0 };
-    let bot_r = CornerRadius { nw: 0, ne: 0, sw: tr_, se: tr_ };
-    widgets::paint_gradient(ov.painter(), Rect::from_min_max(rect.min, pos2(rect.right(), split)), top_r, 180.0, v(0.55), v(0.10));
-    widgets::paint_gradient(ov.painter(), Rect::from_min_max(pos2(rect.left(), split), rect.max), bot_r, 180.0, v(0.10), v(0.82));
-
-    let inner = rect.shrink(theme::S2);
-    // --- top: [fill statbar][29 pop out][29 fullscreen][29 stop], gaps 8 / 4 -------------
-    let top = Rect::from_min_size(inner.min, vec2(inner.width(), OVL_H));
-    let stop_r = Rect::from_min_size(pos2(top.right() - OVL_H, top.top()), vec2(OVL_H, OVL_H));
-    let fs_r = stop_r.translate(vec2(-(OVL_H + theme::S1), 0.0));
-    let pop_r = fs_r.translate(vec2(-(OVL_H + theme::S1), 0.0));
-    let bar_cell = Rect::from_min_max(top.min, pos2(pop_r.left() - theme::S2, top.bottom()));
-    statbar(&mut ov, cx, key, bar_cell, cross_room);
-    if round_btn(&mut ov, pop_r, id.with("pop"), "open_in_new", &tr("ui.room.pop_out_tip", "Pop out to its own window"), false).clicked() {
-        acts.push(UiAction::PopOut(key));
-    }
-    if round_btn(&mut ov, fs_r, id.with("fs"), "fullscreen", &tr("ui.stage.fullscreen", "Fullscreen"), false).clicked() {
-        acts.push(UiAction::EnterStreamFullscreen(key));
-    }
-    if round_btn(&mut ov, stop_r, id.with("stop"), "close", &tr("ui.room.stop_watching", "Stop watching"), true).clicked() {
-        acts.push(UiAction::Unwatch(key));
-    }
-
-    // --- bottom: audio pill, or "No audio shared" --------------------------
-    let bottom = Rect::from_min_size(pos2(inner.left(), inner.bottom() - OVL_H), vec2(inner.width(), OVL_H));
-    let has_audio = cx.session(key.0).is_some_and(|s| s.sibling_audio_stream(key.1).is_some());
-    if has_audio {
-        audio_pill(&mut ov, cx, drag, key, bottom, acts);
-    } else {
-        let mut c = ov.new_child(UiBuilder::new().max_rect(bottom).layout(Layout::left_to_right(Align::Center)));
-        widgets::chip_dark(&mut c, Some("volume_off"), false, &tr("ui.room.no_audio", "No audio shared"));
-    }
-}
-
-/// `hbox·statbar` (29 px pill, pad 10, gap 8): `[7 dot][name][res][fps 6ch][rate 8ch]`,
-/// content-sized up to `cell`'s width (the name truncates). The numbers sit in
-/// fixed tabular-width slots so the bar doesn't jitter as they change. Hover
-/// shows decoded vs presented fps (presentation must keep up with decode).
-/// In a narrow tile ([`statbar_fields`]) the resolution and then the bitrate
-/// leave the bar for the tooltip instead of being cut off mid-number.
-fn statbar(ui: &mut Ui, cx: &Cx, key: StreamKey, cell: Rect, cross_room: bool) {
-    let Some(entry) = cx.videos.get(key) else { return };
-    let stats = entry.view.lock().unwrap().source().stats();
-    let kbps = cx
-        .session(key.0)
-        .and_then(|s| s.watches.lock().unwrap().get(&(key.1, key.2)).map(|w| w.decoder.lock().unwrap().received_bitrate_kbps()))
-        .unwrap_or(0.0);
-    let name = cx.member_name(key.0, key.1);
-    let name = if cross_room { format!("{name} · {}", cx.room_name(key.0)) } else { name };
-    let res = cx.videos.frame_size(key).map(|(w, h)| format!("{w}x{h}")).unwrap_or_default();
-    let fps = format!("{:.0}fps", stats.decoded_fps);
-    let rate = fmt_kbps(kbps);
-
-    let nf = font(Weight::Bold, theme::FS_ROW);
-    let mf = font(Weight::Mono, theme::FS_SMALL);
-    let ch = text_width(ui, "0", mf.clone(), 0.0);
-    let (res_w, fps_w, rate_w) = (text_width(ui, &res, mf.clone(), 0.0).ceil(), (6.0 * ch).ceil(), (8.0 * ch).ceil());
-    let (show_res, show_rate) = statbar_fields(cell.width(), res_w, fps_w, rate_w);
-    let (res_w, rate_w) = (if show_res { res_w } else { 0.0 }, if show_rate { rate_w } else { 0.0 });
-    let fixed_w = statbar_fixed_w(res_w, fps_w, rate_w);
-    let name_w = text_width(ui, &name, nf.clone(), 0.0).ceil().min((cell.width() - fixed_w).max(0.0));
-    let w = (fixed_w + name_w).min(cell.width());
-    let bar = Rect::from_min_size(cell.min, vec2(w, OVL_H));
-    let p = ui.painter();
-    p.rect_filled(bar, CornerRadius::same(15), Color32::from_black_alpha(158));
-    let mut child = ui.new_child(UiBuilder::new().max_rect(bar).layout(Layout::left_to_right(Align::Center)));
-    child.shrink_clip_rect(bar);
-    let slots = [fixed(7.0), fixed(name_w), fixed(res_w), fixed(fps_w), fixed(rate_w)];
-    let row = HBox::new("hbox·statbar", OVL_H).pad(10.0, 10.0).slots(&slots).show(&mut child);
-    let c = row.cell(0).center();
-    // Amber instead of green while the stream is recovering or the sharer's capture is stalled.
-    let (dot, glow) = if stream_health(cx, key) == ViewState::Healthy {
-        (theme::SUCCESS, theme::SUCCESS_GLOW)
-    } else {
-        (theme::WARNING, theme::WARNING)
-    };
-    child.painter().circle_filled(c, 5.0, glow.gamma_multiply(0.25));
-    child.painter().circle_filled(c, 3.5, dot);
-    let num = Color32::from_rgba_unmultiplied(232, 233, 236, 217);
-    row.text(&child, 1, &name, nf, theme::TEXT, Align::Min);
-    if show_res {
-        row.text(&child, 2, &res, mf.clone(), num, Align::Min);
-    }
-    row.text(&child, 3, &fps, mf.clone(), num, Align::Max);
-    if show_rate {
-        row.text(&child, 4, &rate, mf, num, Align::Max);
-    }
-    row.response.on_hover_ui(|ui| {
-        // What a narrow bar left out, so it is still one hover away.
-        let hidden: Vec<&str> = [(!show_res).then_some(res.as_str()), (!show_rate).then_some(rate.as_str())]
-            .into_iter()
-            .flatten()
-            .filter(|t| !t.is_empty())
-            .collect();
-        if !hidden.is_empty() {
-            ui.label(hidden.join(" · "));
-        }
-        let codec = stats.info.codec.map(|c| c.name()).unwrap_or("—");
-        let dec = stats.info.decoder_name.as_deref().unwrap_or("—");
-        ui.label(tr_with(
-            "ui.room.stats_tip",
-            "Decoded %{decoded} fps · shown %{presented} fps\n%{codec} via %{decoder} · %{dropped} dropped",
-            &[
-                ("decoded", &format!("{:.0}", stats.decoded_fps)),
-                ("presented", &format!("{:.0}", stats.presented_fps)),
-                ("codec", codec),
-                ("decoder", dec),
-                ("dropped", &stats.access_units_dropped.to_string()),
-            ],
-        ));
-    });
-}
-
-/// Width of the statbar without its name: pads 10+10, the 7 px dot and a gap
-/// 8 before every following slot (a 0-wide slot keeps its gap; harmless).
-fn statbar_fixed_w(res_w: f32, fps_w: f32, rate_w: f32) -> f32 {
-    10.0 + 7.0 + theme::S2 + theme::S2 + res_w + theme::S2 + fps_w + theme::S2 + rate_w + 10.0
-}
-
-/// Which optional statbar numbers fit `cell_w`, as `(resolution, bitrate)`;
-/// fps always stays. `Why` this order: at the 800 px minimum window (PR #4)
-/// a room tile is ~264 px and its statbar cell ~178 px, too narrow for
-/// `1920x1080 30fps 7.6 Mbps`, which was cut mid-number. The resolution
-/// changes least (the share card shows it too), the received bitrate is
-/// next, fps is the health signal. Hidden values move into the tooltip.
-fn statbar_fields(cell_w: f32, res_w: f32, fps_w: f32, rate_w: f32) -> (bool, bool) {
-    if statbar_fixed_w(res_w, fps_w, rate_w) <= cell_w {
-        (true, true)
-    } else if statbar_fixed_w(0.0, fps_w, rate_w) <= cell_w {
-        (false, true)
-    } else {
-        (false, false)
-    }
-}
-
 /// `.round-btn`: 29 px circle, translucent dark fill, faint white ring,
 /// 16 px icon; `stop` turns the icon red on hover.
 fn round_btn(ui: &mut Ui, rect: Rect, id: Id, icon: &str, tip: &str, stop: bool) -> Response {
@@ -442,12 +418,13 @@ fn round_btn(ui: &mut Ui, rect: Rect, id: Id, icon: &str, tip: &str, stop: bool)
     resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip)
 }
 
-/// The tile's volume slider. Pushes `SetVolume` on **every** change, mid-drag included (#135, user:
-/// "make sure that when the volume slider is moved it instantly sets the volume even while moving and
+/// The volume slider of the stream menu. Pushes `SetVolume` on **every** change, mid-drag included (#135,
+/// user: "make sure that when the volume slider is moved it instantly sets the volume even while moving and
 /// not only when the user actually lifts his mouse button"). `Why:` the user wants to hear the level
 /// while choosing it. `SetVolume` only sets the decoder's `volume` element and the in-memory
 /// session value (nothing is written to disk), so one per changed frame is cheap. `drag` keeps
-/// the shown value one frame ahead of the session until the pushed value has landed.
+/// the shown value one frame ahead of the session until the pushed value has landed. The mouse wheel over it
+/// steps it too (5 % up to 200 %, 10 % above, `ui::volume_slider`).
 pub(in crate::ui) fn tile_volume_slider(ui: &mut Ui, drag: &mut VolDrag, key: StreamKey, shown: u32, applied: u32, acts: &mut Vec<UiAction>) -> Response {
     let mut v = shown;
     let r = crate::ui::volume_slider(ui, &mut v);
@@ -463,65 +440,38 @@ pub(in crate::ui) fn tile_volume_slider(ui: &mut Ui, drag: &mut VolDrag, key: St
     r
 }
 
-/// `hbox·audio-pill` (29 px, pad 2/2, gap 4): `[25 mute][110 volume 0–500 %][34 pct][25 level]`,
-/// or `[25 mute][Muted]` (pad 2/10) while muted. Both end buttons sit concentric in the pill's
-/// half-circle ends, 2 px in (#130). `level` is the global loudness-levelling toggle (#126). The slider pushes `SetVolume` on every change, mid-drag too (#135).
-fn audio_pill(ui: &mut Ui, cx: &Cx, drag: &mut VolDrag, key: StreamKey, bottom: Rect, acts: &mut Vec<UiAction>) {
+/// Where a stream menu's volume row writes: the stream's audio (a video stream's sibling audio, or the
+/// audio-only stream itself, `RoomSession::volume` resolves both).
+pub(super) fn menu_volume_row(ui: &mut Ui, cx: &Cx, drag: &mut VolDrag, key: StreamKey, acts: &mut Vec<UiAction>) {
     let Some(s) = cx.session(key.0) else { return };
     let vol = s.volume(key.1, key.2);
     let shown = (*drag).filter(|(k, _)| *k == key).map_or(vol.volume_percent, |(_, v)| v);
-    let muted_l = tr("ui.room.muted", "Muted");
-    let pct = format!("{shown}%");
-    let tf = font(Weight::Mono, theme::FS_TINY);
-    let tail = if vol.muted { text_width(ui, &muted_l, tf.clone(), 0.0).ceil() } else { 110.0 + theme::S1 + 34.0 + theme::S1 + 25.0 };
-    // Right pad 2 like the left one, so the level button fills the right end cap (#130); 10 after the "Muted" text.
-    let pad_r = if vol.muted { 10.0 } else { 2.0 };
-    let w = 2.0 + 25.0 + theme::S1 + tail + pad_r;
-    let pill = Rect::from_min_size(bottom.min, vec2(w.min(bottom.width()), OVL_H));
-    ui.painter().rect(pill, CornerRadius::same(15), Color32::from_black_alpha(184), Stroke::new(1.0_f32, Color32::from_white_alpha(46)), StrokeKind::Inside);
-
-    let mut child = ui.new_child(UiBuilder::new().max_rect(pill).layout(Layout::left_to_right(Align::Center)));
-    child.shrink_clip_rect(pill);
-    let slots_muted = [fixed(25.0), fixed(tail)];
-    let slots = [fixed(25.0), fixed(110.0), fixed(34.0), fixed(25.0)];
-    let row = HBox::new("hbox·audio-pill", OVL_H).gap(theme::S1).pad(2.0, pad_r).slots(if vol.muted { &slots_muted } else { &slots }).show(&mut child);
-
-    // Mute toggle: 25 px round, red icon while muted.
+    let row = HBox::new("menu_volume", theme::CTL_H).gap(theme::S1).pad(theme::S2, theme::S2).slots(&[fixed(28.0), FILL, fixed(40.0)]).show(ui);
     let mr = Rect::from_center_size(row.cell(0).center(), vec2(25.0, 25.0));
-    let mresp = child.interact(mr, Id::new(("tile_mute", key)), Sense::click());
+    let mresp = ui.interact(mr, Id::new(("menu_mute", key)), Sense::click());
     if mresp.hovered() {
-        child.painter().circle_filled(mr.center(), 12.5, Color32::from_white_alpha(20));
+        ui.painter().circle_filled(mr.center(), 12.5, Color32::from_white_alpha(20));
     }
     let (icon, col, tip) = if vol.muted {
         ("volume_off", theme::DANGER, tr("ui.room.unmute", "Listen"))
     } else {
         ("volume_up", theme::TEXT, tr("ui.room.mute", "Mute this stream"))
     };
-    widgets::paint_icon(&child, mr, icon, 16.0, col);
-    if mresp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(&tip).clicked() {
+    widgets::paint_icon(ui, mr, icon, 16.0, col);
+    if mresp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip).clicked() {
         acts.push(UiAction::SetVolume { stream: key, volume_percent: vol.volume_percent, muted: !vol.muted });
     }
-    let num = Color32::from_rgba_unmultiplied(232, 233, 236, 217);
-    if vol.muted {
-        row.text(&child, 1, &muted_l, tf, num, Align::Min);
-        return;
-    }
-    // The slider is 32 px tall; centre it on the 29 px pill.
-    let sc = row.cell(1);
-    let sr = Rect::from_center_size(sc.center(), vec2(sc.width(), theme::CTL_H));
-    let mut sl = child.new_child(UiBuilder::new().id_salt(("tile_vol", key)).max_rect(sr).layout(Layout::left_to_right(Align::Center)));
-    tile_volume_slider(&mut sl, drag, key, shown, vol.volume_percent, acts).on_hover_text(tr("ui.room.volume", "Volume"));
-    row.text(&child, 2, &pct, tf, num, Align::Max);
-    let lr = Rect::from_center_size(row.cell(3).center(), vec2(25.0, 25.0));
-    if crate::ui::level_toggle(&child, lr, Id::new(("tile_level", key)), cx.state.level_loudness) {
-        acts.push(UiAction::SetLevelLoudness(!cx.state.level_loudness));
-    }
+    let applied = vol.volume_percent;
+    row.show(ui, 1, Align::Min, |ui| {
+        ui.add_enabled_ui(!vol.muted, |ui| tile_volume_slider(ui, drag, key, shown, applied, acts).on_hover_text(tr("ui.room.volume", "Volume")));
+    });
+    let text = if vol.muted { tr("ui.room.muted", "Muted") } else { format!("{shown}%") };
+    row.text(ui, 2, &text, font(Weight::Mono, theme::FS_TINY), theme::TEXT_DIM, Align::Max);
 }
 
 // ---------------------------------------------------------------------------
 // Share cards
 // ---------------------------------------------------------------------------
-
 
 /// A centred `[icon 24][label 11]` on a thumb.
 fn thumb_placeholder(ui: &Ui, thumb: Rect, icon: &str, icon_col: Color32, label: &str) {
@@ -534,7 +484,7 @@ fn thumb_placeholder(ui: &Ui, thumb: Rect, icon: &str, icon_col: Color32, label:
 /// Display names of the people watching our stream `stream_id` in room `h` (the relay's list,
 /// spec 9.1, resolved through the roster, sorted). `None` when the relay does not report viewers
 /// (an older relay): the card then shows no count at all, since "0" would be a lie.
-fn viewer_names(cx: &Cx, h: RoomHandle, stream_id: u8) -> Option<Vec<String>> {
+pub(super) fn viewer_names(cx: &Cx, h: RoomHandle, stream_id: u8) -> Option<Vec<String>> {
     let s = cx.session(h)?;
     if !s.viewers_supported {
         return None;
@@ -552,7 +502,7 @@ const VIEWERS_POP_W: f32 = 200.0;
 
 /// The hover dropdown under the viewer chip (user request, task #116: "hovers something like a
 /// viewer number ... a drop-down thingy ... the profile picture and the username"): one row per
-/// viewer, avatar then name, the same avatar the People list uses. Open while the pointer is on the
+/// viewer, avatar then name, the same avatar the people strip uses. Open while the pointer is on the
 /// chip or, once open, anywhere on the chip, the dropdown or the gap between them, so the pointer
 /// can travel into it. Nobody watching: no dropdown, a plain tooltip says so.
 fn viewers_dropdown(ui: &Ui, chip: &Response, names: &[String]) {
@@ -577,14 +527,8 @@ fn viewers_dropdown(ui: &Ui, chip: &Response, names: &[String]) {
     let x = (chip.rect.right() - VIEWERS_POP_W).max(screen.left() + 8.0);
     let below = chip.rect.bottom() + 4.0;
     let y = if below + height > screen.bottom() - 8.0 { chip.rect.top() - 4.0 - height } else { below };
-    let frame = egui::Frame::new()
-        .fill(theme::PANEL_RAISED)
-        .stroke(Stroke::new(1.0_f32, theme::BORDER))
-        .corner_radius(CornerRadius::same(10))
-        .inner_margin(egui::Margin::same(6))
-        .shadow(egui::Shadow { offset: [0, 14], blur: 40, spread: 0, color: Color32::from_black_alpha(153) });
     let area = egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(pos2(x, y)).show(ctx, |ui| {
-        frame.show(ui, |ui| {
+        crate::ui::menu::frame().show(ui, |ui| {
             ui.set_width(VIEWERS_POP_W - 12.0);
             ui.spacing_mut().item_spacing.y = 0.0;
             let (hr, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
@@ -594,7 +538,7 @@ fn viewers_dropdown(ui: &Ui, chip: &Response, names: &[String]) {
                 let row = HBox::new("viewer_row", 28.0).pad(theme::S2, theme::S2).slots(&[fixed(theme::AVATAR_SM), FILL]).show(ui);
                 // The slot is as tall as the row; the avatar is a 22 px disc in its middle.
                 let disc = Rect::from_center_size(row.cell(0).center(), vec2(theme::AVATAR_SM, theme::AVATAR_SM));
-                widgets::paint_avatar(ui, disc, &initial(name), theme::avatar_colors(name), false);
+                crate::ui::paint_person(ui, disc, name, false);
                 row.text(ui, 1, name, font(Weight::Regular, theme::FS_LABEL), theme::TEXT, Align::Min);
             }
             if extra > 0 {
@@ -606,20 +550,49 @@ fn viewers_dropdown(ui: &Ui, chip: &Response, names: &[String]) {
     ctx.data_mut(|d| d.insert_temp(id, area.response.rect));
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn statbar_drops_resolution_then_bitrate_when_narrow() {
-        // Roughly the real widths: res "1920x1080" 80, fps 6ch 42, rate 8ch 56.
-        let full = statbar_fixed_w(80.0, 42.0, 56.0);
-        assert_eq!(statbar_fields(full + 40.0, 80.0, 42.0, 56.0), (true, true));
-        assert_eq!(statbar_fields(full - 1.0, 80.0, 42.0, 56.0), (false, true));
-        // A narrow tile (~178 px statbar cell) keeps fps + bitrate.
-        assert_eq!(statbar_fields(178.0, 80.0, 42.0, 56.0), (false, true));
-        assert_eq!(statbar_fields(120.0, 80.0, 42.0, 56.0), (false, false));
+    fn stats_drop_resolution_then_bitrate_when_narrow() {
+        // Roughly the real mono widths: "9999×9999" 78, "999 fps" 60, "99.9 Mbps" 78.
+        let w = (78.0, 60.0, 78.0);
+        let g = theme::S2;
+        let all = (g + 78.0) + (g + 60.0) + (g + 78.0);
+        assert_eq!(stats_fields(all, w), Some((true, true)));
+        assert_eq!(stats_fields(all - 1.0, w), Some((false, true)));
+        assert_eq!(stats_fields(g + 60.0 + g + 78.0, w), Some((false, true)));
+        assert_eq!(stats_fields(g + 60.0 + g + 78.0 - 1.0, w), Some((false, false)));
+        assert_eq!(stats_fields(g + 60.0, w), Some((false, false)));
+        assert_eq!(stats_fields(g + 59.0, w), None, "not even the frame rate fits");
+    }
+
+    /// D1: the stats pill is as wide as its reserved slots, whatever the numbers say, so it cannot jitter.
+    #[test]
+    fn the_stats_reserve_covers_the_biggest_numbers_and_never_the_current_ones() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mf = font(Weight::Mono, theme::FS_SMALL);
+                let reserve = |s: &str| text_width(ui, s, mf.clone(), 0.0);
+                // Digits are tabular: any value of the same length measures the same, longer ones are bounded by the reserve.
+                for (text, slot) in [("1920×1080", RESERVE.0), ("640×360", RESERVE.0), ("9999×9999", RESERVE.0), ("5 fps", RESERVE.1), ("144 fps", RESERVE.1), ("999 fps", RESERVE.1), ("640 kbps", RESERVE.2), ("5.5 Mbps", RESERVE.2), ("12.3 Mbps", RESERVE.2), ("99.9 Mbps", RESERVE.2)] {
+                    assert!(reserve(text) <= reserve(slot) + 0.01, "{text} must fit the slot reserved for {slot}");
+                }
+                assert!((reserve("1920×1080") - reserve("9999×9999")).abs() < 0.01, "a tabular font: the resolution slot is the same width for any digits");
+                // The pill's width does not depend on the numbers.
+                let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(900.0, 300.0));
+                let small = Nums { res: "640×360".into(), fps: "5 fps".into(), rate: "640 kbps".into() };
+                let big = Nums { res: "9999×9999".into(), fps: "999 fps".into(), rate: "99.9 Mbps".into() };
+                let a = name_tag(ui, rect, 800.0, "volume_up", theme::TEXT, "Ritze", "Screen", Some(&small));
+                let b = name_tag(ui, rect, 800.0, "volume_up", theme::TEXT, "Ritze", "Screen", Some(&big));
+                assert_eq!(a.width(), b.width(), "same pill for small and big numbers");
+                let bare = name_tag(ui, rect, 800.0, "volume_up", theme::TEXT, "Ritze", "Screen", None);
+                assert!(a.width() > bare.width(), "the numbers add their reserved room");
+            });
+        });
     }
 
     #[test]

@@ -552,16 +552,15 @@ async fn joining_a_bad_link_reports_inline_and_starts_nothing() {
     app.state.cancel_connect();
 }
 
-/// The shell geometry the spec pins: sidebar 272, people 232, every band 56,
-/// the user band and the action band on one line, at the 800x600 minimum
-/// window (PR #4) and three common sizes.
+/// The shell geometry the spec pins: sidebar 272, every band 56, the header over the whole central width, the
+/// centre taking the rest (no People panel and no action band since task I3), at the 800x600 minimum window
+/// (PR #4) and three common sizes; and with the sidebar hidden the header spans the window.
 #[tokio::test]
 async fn shell_regions_match_the_spec_sizes() {
     let _home = isolated_home();
     let a = unreachable_join_string(1);
     let mut app = app_with_rooms(&[("Alpha", a.clone())]);
-    // A pending first connect makes the selected room "connecting": People
-    // panel and action bar are shown (Paused, with connecting wording).
+    // A pending first connect makes the selected room "connecting": the scrolling body, not a stage.
     app.state.start_connect(a.clone(), false).unwrap();
     let ctx = ctx();
     for (w, h) in [(800.0, 600.0), (1280.0, 800.0), (1600.0, 900.0), (1920.0, 1080.0)] {
@@ -574,22 +573,23 @@ async fn shell_regions_match_the_spec_sizes() {
         assert_eq!((brand.top(), brand.height()), (0.0, theme::BAND_H));
         assert_eq!((user.bottom(), user.height()), (h, theme::BAND_H));
         assert_eq!((body.top(), body.bottom()), (theme::BAND_H, h - theme::BAND_H));
-        let (header, bar, people, center) = (get("room_header"), get("action_bar"), get("people"), get("room_body"));
+        let (header, center) = (get("room_header"), get("room_body"));
         assert_eq!((header.left(), header.right(), header.top(), header.height()), (theme::SIDEBAR_W, w, 0.0, theme::BAND_H));
-        assert_eq!((bar.left(), bar.right(), bar.height()), (theme::SIDEBAR_W, w, theme::BAND_H));
-        assert_eq!(bar.top(), user.top(), "action band and user band share one top line");
-        assert_eq!(people.width(), theme::PEOPLE_W - 1.0, "people inner width (1 px border)");
-        assert_eq!((people.top(), people.bottom(), people.right()), (theme::BAND_H, h - theme::BAND_H, w));
-        assert_eq!((center.left(), center.right()), (theme::SIDEBAR_W, w - theme::PEOPLE_W));
-        assert_eq!((center.top(), center.bottom()), (theme::BAND_H, h - theme::BAND_H));
+        assert_eq!((center.left(), center.right()), (theme::SIDEBAR_W, w));
+        assert_eq!((center.top(), center.bottom()), (theme::BAND_H, h));
+        assert!(!regions.contains_key("people") && !regions.contains_key("action_bar"), "the People panel and the action band are gone");
     }
-    // Disconnected: no People panel, no action bar; the body takes the rest.
-    app.state.cancel_connect();
+    // The bar's button hides the sidebar: the header takes the whole window width.
+    app.apply(&ctx, UiAction::ToggleSidebar);
     frame(&mut app, &ctx, egui::vec2(1280.0, 800.0));
     frame(&mut app, &ctx, egui::vec2(1280.0, 800.0));
     let regions: HashMap<&str, Rect> = shell_regions(&ctx).into_iter().collect();
-    assert!(!regions.contains_key("people") && !regions.contains_key("action_bar"));
-    assert_eq!(regions["room_body"], Rect::from_min_max(egui::pos2(theme::SIDEBAR_W, theme::BAND_H), egui::pos2(1280.0, 800.0)));
+    assert!(!regions.contains_key("brand"), "no sidebar while hidden");
+    assert_eq!((regions["room_header"].left(), regions["room_header"].right()), (0.0, 1280.0));
+    assert_eq!(regions["room_body"], Rect::from_min_max(egui::pos2(0.0, theme::BAND_H), egui::pos2(1280.0, 800.0)));
+    app.apply(&ctx, UiAction::ToggleSidebar);
+    assert!(!app.nav.sidebar_hidden);
+    app.state.cancel_connect();
 }
 
 /// Mockup `positionPopup`: below and left-aligned; above when it would cross
@@ -698,44 +698,6 @@ fn live_in_toast_fires_once_per_on_air_spell() {
     assert!(newly_on_air(&mut announced, &[RoomHandle(7)]).is_empty(), "no repeat while it stays on air");
     assert!(newly_on_air(&mut announced, &[]).is_empty());
     assert_eq!(newly_on_air(&mut announced, &[RoomHandle(7)]), vec![RoomHandle(7)], "announced again after leaving air");
-}
-
-/// #75: the user saw the bar's pill clipped to "CONNECTI" (fixed 84 px slot).
-/// The bar's pill slot fits every label it can show, in every locale, and the
-/// small LIVE pill fits `person_row`'s 44 px live slot.
-#[test]
-fn pill_slots_fit_every_label_in_every_locale() {
-    use super::action_bar::{BAR_PILLS, bar_pill_w_with};
-    use crate::widgets::{Pill, PillLead};
-    let ctx = ctx();
-    let mut checked = 0;
-    for _ in 0..2 {
-        checked = 0;
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                for loc in ["en", "de"] {
-                    let text = |k: &str, en: &'static str| {
-                        let s = t!(k, locale = loc);
-                        if s.as_ref() == k || s.ends_with(k) { en.to_string() } else { s.into_owned() }
-                    };
-                    let slot = bar_pill_w_with(ui, text);
-                    for (lead, k, en) in BAR_PILLS {
-                        let label = text(k, en);
-                        let w = Pill::muted(&label).lead(lead).large().width(ui);
-                        assert!(w <= slot, "{loc}: bar pill {label:?} is {w} px, slot {slot}");
-                        checked += 1;
-                    }
-                    let live = text("ui.pill.live", "Live");
-                    let w = Pill::live(&live).lead(PillLead::None).width(ui);
-                    assert!(w <= 44.0, "{loc}: people-row LIVE pill is {w} px, slot 44");
-                }
-                let connecting = Pill::progress("Connecting").large().width(ui);
-                assert!(bar_pill_w_with(ui, |_, en| en.to_string()) >= connecting, "regression: CONNECTING must fit");
-                assert!(connecting > 84.0, "the old 84 px slot really was too narrow ({connecting})");
-            });
-        });
-    }
-    assert_eq!(checked, 2 * BAR_PILLS.len());
 }
 
 #[tokio::test]
@@ -955,6 +917,40 @@ fn the_tile_volume_slider_pushes_set_volume_while_the_button_is_still_down() {
     assert!(pushed.windows(2).all(|w| w[0] < w[1]), "following the pointer to the right: {pushed:?}");
 }
 
+/// D1: scrolling on the stream menu's volume slider moves it (5 % a notch up to 200 %, 10 % above) and pushes
+/// `SetVolume` for every notch, like a drag does.
+#[test]
+fn the_stream_menus_volume_slider_steps_with_the_wheel_and_pushes_every_notch() {
+    let ctx = ctx();
+    let size = egui::vec2(300.0, 100.0);
+    let key: StreamKey = (RoomHandle(1), 7, 2);
+    let mut st: Option<(StreamKey, u32)> = None;
+    let mut slider = Rect::NOTHING;
+    let mut shown = 195u32;
+    let run = |events: Vec<egui::Event>, st: &mut Option<(StreamKey, u32)>, shown: &mut u32, slider: &mut Rect| -> Vec<u32> {
+        let mut acts = Vec::new();
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)), events, ..Default::default() };
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.set_width(200.0);
+                *slider = stage::tile_volume_slider(ui, st, key, *shown, *shown, &mut acts).rect;
+            });
+        });
+        let pushed: Vec<u32> = acts.iter().filter_map(|a| if let UiAction::SetVolume { volume_percent, .. } = a { Some(*volume_percent) } else { None }).collect();
+        if let Some(v) = pushed.last() {
+            *shown = *v; // the session applied it
+        }
+        pushed
+    };
+    let wheel = |y: f32| egui::Event::MouseWheel { unit: egui::MouseWheelUnit::Line, delta: egui::vec2(0.0, y), modifiers: egui::Modifiers::NONE };
+    run(vec![], &mut st, &mut shown, &mut slider);
+    run(vec![egui::Event::PointerMoved(slider.center())], &mut st, &mut shown, &mut slider);
+    assert_eq!(run(vec![wheel(1.0)], &mut st, &mut shown, &mut slider), [200], "195 -> 200");
+    assert_eq!(run(vec![wheel(1.0)], &mut st, &mut shown, &mut slider), [210], "above 200 the step is 10");
+    assert_eq!(run(vec![wheel(-1.0)], &mut st, &mut shown, &mut slider), [200]);
+    assert_eq!(run(vec![wheel(-1.0)], &mut st, &mut shown, &mut slider), [195], "and 5 again at or below 200");
+}
+
 /// The stage's layout choice is per view (each room and Watched keep their own) and only
 /// `UiAction`s change it; the two stage options are global.
 #[tokio::test]
@@ -973,6 +969,42 @@ async fn the_stage_layout_is_per_view_and_set_through_actions() {
     app.apply(&ctx, UiAction::SetHideOwnStreams(true));
     app.apply(&ctx, UiAction::SetAlwaysShowNames(true));
     assert!(app.shell.stage.hide_own && app.shell.stage.always_names);
+}
+
+/// The control bar, an open menu and stage fullscreen draw at the 800 px minimum window and bigger ones; stage
+/// fullscreen draws the stage alone (no sidebar, no header) over the whole window and ends with the stage.
+#[tokio::test]
+async fn the_stage_bar_menus_and_fullscreen_draw_at_every_window_size() {
+    use super::stage::BarMenu;
+    let _home = isolated_home();
+    let mut app = app_with_rooms(&[]);
+    app.nav.view = View::Watching;
+    let ctx = ctx();
+    let anchor =Rect::from_min_size(egui::pos2(500.0, 540.0), egui::vec2(68.0, 40.0));
+    for (w, h) in [(800.0, 600.0), (1280.0, 800.0), (1920.0, 1080.0)] {
+        let size = egui::vec2(w, h);
+        frame(&mut app, &ctx, size);
+        frame(&mut app, &ctx, size);
+        for menu in [BarMenu::Layout, BarMenu::Share, BarMenu::Audio] {
+            app.apply(&ctx, UiAction::OpenPopover(Popover { kind: PopoverKind::Bar(menu), anchor }));
+            frame(&mut app, &ctx, size);
+            frame(&mut app, &ctx, size);
+            app.apply(&ctx, UiAction::ClosePopover);
+        }
+        app.apply(&ctx, UiAction::EnterStageFullscreen);
+        frame(&mut app, &ctx, size);
+        frame(&mut app, &ctx, size);
+        let regions: HashMap<&str, Rect> = shell_regions(&ctx).into_iter().collect();
+        assert!(!regions.contains_key("room_header") && !regions.contains_key("brand"), "fullscreen draws the stage alone at {w}x{h}");
+        assert_eq!(regions["room_body"], Rect::from_min_size(egui::Pos2::ZERO, size));
+        app.apply(&ctx, UiAction::ExitStageFullscreen);
+        assert!(app.nav.stage_fullscreen.is_none());
+    }
+    // It ends with the stage: leaving "Watched" for the welcome view drops a stale fullscreen at the next frame.
+    app.apply(&ctx, UiAction::EnterStageFullscreen);
+    app.nav.view = View::Welcome;
+    frame(&mut app, &ctx, egui::vec2(1280.0, 800.0));
+    assert!(app.nav.stage_fullscreen.is_none());
 }
 
 /// "Watched streams" is the stage even with nothing watched, and a frame of it draws (the note) without

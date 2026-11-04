@@ -1,5 +1,5 @@
-//! The stage (task I1, `superdoc/ui/replica/index.html` "Stage"): the central area of a joined room and of
-//! "Watched streams" is a black stage holding the room's streams in one of three layouts.
+//! The stage (tasks I1 and I3, `superdoc/ui/replica/index.html` "Stage"): the central area of a joined room and of
+//! "Watched streams" is a black stage with the room's streams, the people strip under them and the control bar.
 //!
 //! - **Split** shows every picture whole in an even-ish grid (the row count that shows the most picture
 //!   area), **Crop** fills the same cells (the video is cropped around its centre, `Fit::Cover`), **Floating**
@@ -8,12 +8,23 @@
 //!   onto another swaps them (Split, Crop). The maths is in [`geom`] (pure, tested), the tile contents in `tile`.
 //! - **What is on it:** the room's streams of other people (watched ones as video, the others as a dimmed
 //!   "X is sharing Y, Watch stream" tile, audio-only senders with a Listen button), then your own live share.
-//!   "Watched" shows every watched stream of every room and nothing else. A popped-out stream is absent.
+//!   "Watched" shows every watched stream of every room and nothing else. A popped-out stream is absent from
+//!   the stage; its owner's avatar in the strip carries a badge that brings it back.
+//! - **Under the streams:** the people strip (`strip.rs`: avatars, ring, LIVE badge, hover card) and the control
+//!   bar (`bar.rs`: split buttons, layout, room, people, leave, pop out, fullscreen), their menus in `menus.rs`.
+//!   Outside fullscreen they always show and the streams get what is left; in **fullscreen** they lie over the
+//!   stage so the streams never jump, and fade after 3 s without movement (`chrome.rs`, the pure rule).
+//! - **The whole stage can pop out** into its own window ([`show_windows`]): an immediate viewport that draws
+//!   this same stage ([`Host::Window`]), while the main window shows a note and "Bring it back". *Why an
+//!   immediate viewport:* the stage needs `Cx` and the video views, which a deferred viewport's closure
+//!   (`Send + Sync + 'static`, `viewer-window.md`) cannot hold; immediate runs inside our own frame. What is
+//!   left out: the window is keyed by the room's `RoomHandle`, so it closes when the room reconnects (the stage
+//!   comes back in the main window), and modals opened from it appear in the main window.
 //! - **Per-view state** (`StageState`, UI-private, per session, not persisted): each room and "Watched" keep
 //!   their own order, grid, window rects and z-order. Streams are keyed by [`ItemId`] (room handle + owner
 //!   name + label), not by `ConnId`/`StreamId`, so a reconnect keeps the layout. The layout choice and the
-//!   two stage options live in [`StageSettings`] (`Shell::stage`), because the Layout menu (a different
-//!   screen) reads and sets them through [`UiAction::SetStageLayout`], [`UiAction::SetHideOwnStreams`] and
+//!   two stage options live in [`StageSettings`] (`Shell::stage`), because the Layout menu and the tiles read
+//!   them through [`UiAction::SetStageLayout`], [`UiAction::SetHideOwnStreams`] and
 //!   [`UiAction::SetAlwaysShowNames`].
 //!
 //! # Input and bars
@@ -27,12 +38,16 @@
 //! # Performance
 //! No repaint loop: video repaints are frame-driven by `VideoView`, a drag repaints on input.
 
+mod bar;
+mod chrome;
 mod geom;
+mod menus;
+mod strip;
 mod tile;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use egui::{Align, CursorIcon, Id, Pos2, Rect, Sense, Stroke, Ui, pos2, vec2};
+use egui::{Align, CursorIcon, Id, Pos2, Rect, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
 use simple_screensharing_client::protocol::{StreamInfo, StreamKind};
 use simple_screensharing_client::session::{CaptureSourceId, DestinationId, RoomHandle};
 
@@ -40,7 +55,8 @@ use geom::{Bar, FRect, Grid};
 #[cfg(test)]
 pub(super) use tile::tile_volume_slider;
 
-use super::{Cx, ShareState, StreamKey, UiAction, View, tr};
+pub use bar::BarMenu;
+use super::{Cx, Popover, PopoverKind, RoomEntry, ShareState, StreamKey, UiAction, View, tr};
 use crate::theme::{self, Weight, font};
 use crate::widgets::{self, paint_text};
 
@@ -91,10 +107,9 @@ impl Cx<'_> {
         }
     }
 
-    /// The layout of the stage shown now (Split when there is none); for the Layout menu.
-    #[allow(dead_code)]
-    pub fn stage_layout(&self) -> StageLayout {
-        self.stage_view().map_or_else(StageLayout::default, |v| self.shell.stage.layout(&v))
+    /// The joined room a stage shows (the open room, or the one a pop-out window was made for).
+    fn stage_room(&self, h: RoomHandle) -> Option<RoomEntry> {
+        self.rooms().into_iter().find(|r| r.handle == Some(h))
     }
 }
 
@@ -119,6 +134,36 @@ pub struct StageState {
     views: HashMap<StageView, ViewGeom>,
     drag: Option<Drag>,
     vol_drag: VolDrag,
+    /// The people button hid the strip (it shows until then).
+    pub(super) strip_hidden: bool,
+    /// Stages shown in their own window ([`show_windows`]); the main window shows a note for these.
+    pub(super) popped: HashSet<StageView>,
+    /// "Show stats on the stream" is on for these watched streams.
+    pub(super) stats: HashSet<StreamKey>,
+    /// Fullscreen auto-hide state of the chrome ([`chrome`]); `None` outside fullscreen.
+    chrome: Option<chrome::Chrome>,
+    /// Level meters of the audio dropdown ([`super::share::sync_level_taps`]).
+    pub(super) taps: Option<Vec<u32>>,
+}
+
+impl StageState {
+    /// "Reset sizes and positions": forget `view`'s grid, floating windows and their order.
+    pub(super) fn reset_view(&mut self, view: &StageView) {
+        if let Some(g) = self.views.get_mut(view) {
+            g.grid = None;
+            g.float.clear();
+            g.z.clear();
+        }
+    }
+}
+
+/// Which window a stage is drawn in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Host {
+    /// The main window's central area.
+    Main,
+    /// Its own window ([`show_windows`]): fullscreen is that window's, there is no sidebar button.
+    Window,
 }
 
 /// One view's own layout state. Never pruned: a stream that comes back (reconnect, re-share) keeps its place.
@@ -187,7 +232,7 @@ fn collect(cx: &Cx, view: &StageView) -> Vec<Item> {
                     add(*h, who, info.label.clone(), false, Kind::Idle(key, info.clone()), aspect(info.width as f32, info.height as f32));
                 }
             }
-            if let Some(room) = cx.selected_room()
+            if let Some(room) = cx.stage_room(*h)
                 && let ShareState::Live { capture, destination } = cx.share_state(&room)
                 && let Some(d) = cx.capture(capture).and_then(|c| c.destinations.get(&destination))
             {
@@ -220,19 +265,21 @@ fn note(ui: &Ui, rect: Rect, icon: &str, title: &str, text: Option<&str>) {
     }
 }
 
-/// The stage: fills `ui`'s whole rect.
-pub fn show(ui: &mut Ui, cx: &mut Cx, st: &mut StageState) {
-    let Some(view) = cx.stage_view() else { return };
-    let full = ui.max_rect();
-    ui.painter().rect_filled(full, 0.0, theme::STAGE_BG);
-    let arena = full.shrink(theme::S4);
+/// The streams of one stage inside `arena` (or the note when there is nothing to show). `hover_ok` is false
+/// while fullscreen has hidden the chrome: the tile overlays go with it.
+fn draw_arena(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, view: &StageView, items: &[Item], arena: Rect, hover_ok: bool, chrome_top: f32) {
+    // What the strip and bar cover in fullscreen takes no input from the streams under it: a press on a bar
+    // button must never grab a resize bar or a tile behind it (found in the rig: the Layout button sat on a bar).
+    let live = |r: Rect| {
+        let r = r.intersect(Rect::from_min_max(pos2(f32::MIN, f32::MIN), pos2(f32::MAX, chrome_top)));
+        if r.is_positive() { r } else { Rect::from_min_size(r.min, vec2(0.0, 0.0)) }
+    };
     let (hide_own, always_names) = (cx.shell.stage.hide_own, cx.shell.stage.always_names);
-    let layout = cx.shell.stage.layout(&view);
+    let layout = cx.shell.stage.layout(view);
     let cxr: &Cx = cx;
-    let items = collect(cxr, &view);
-    let StageState { views, drag, vol_drag } = st;
+    let StageState { views, drag, stats, .. } = st;
     let geom = views.entry(view.clone()).or_default();
-    for it in &items {
+    for it in items {
         if !geom.order.contains(&it.id) {
             geom.order.push(it.id.clone());
         }
@@ -255,6 +302,11 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, st: &mut StageState) {
         return;
     }
 
+    if arena.width() < 8.0 || arena.height() < 8.0 {
+        // A window too small for any picture (the bar and strip take what there is).
+        *drag = None;
+        return;
+    }
     let (w, h) = (arena.width(), arena.height());
     let ars: Vec<f32> = vis.iter().map(|i| i.ar).collect();
     let (crop, float) = (layout == StageLayout::Crop, layout == StageLayout::Floating);
@@ -325,24 +377,26 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, st: &mut StageState) {
     let mut raise: Option<ItemId> = None;
     for &i in &paint_order {
         let (it, rect) = (vis[i], shown[i]);
-        let resp = ui.interact(rect, Id::new(("stage_tile", &it.id)), Sense::click_and_drag());
+        let resp = ui.interact(live(rect), Id::new(("stage_tile", &it.id)), Sense::click_and_drag());
         let spot = tile::Spot {
             rect,
             crop,
             round: if float { 0 } else { 8 },
-            hovered: hover == Some(i) && !dragging,
+            hovered: hover == Some(i) && !dragging && hover_ok && menu_ok(cxr, &it.id),
             always_names,
+            stats: matches!(&it.kind, Kind::Video(k) if stats.contains(k)),
             cross_room: matches!(view, StageView::Watched),
+            id: it.id.clone(),
         };
         match &it.kind {
-            Kind::Video(key) => tile::video_tile(ui, cxr, vol_drag, *key, &spot, &mut acts),
-            Kind::Idle(key, info) | Kind::Audio(key, info) => tile::idle_tile(ui, cxr, *key, info, &spot, vol_drag, &mut acts),
+            Kind::Video(key) => tile::video_tile(ui, cxr, *key, &spot, &mut acts),
+            Kind::Idle(key, info) | Kind::Audio(key, info) => tile::idle_tile(ui, cxr, *key, info, &spot, &mut acts),
             Kind::Mine(capture, destination) => tile::mine_tile(ui, cxr, it.id.room, *capture, *destination, &spot, &mut acts),
         }
         if float {
             ui.painter().rect_stroke(rect, 0.0, Stroke::new(1.0_f32, theme::BORDER), egui::StrokeKind::Outside);
             let handle = Rect::from_min_size(rect.max - vec2(20.0, 20.0), vec2(20.0, 20.0));
-            let rz = ui.interact(handle, Id::new(("stage_resize", &it.id)), Sense::drag());
+            let rz = ui.interact(live(handle), Id::new(("stage_resize", &it.id)), Sense::drag());
             let grip = Stroke::new(1.5_f32, theme::TEXT_DIM);
             for k in [4.0, 10.0] {
                 ui.painter().line_segment([pos2(handle.right() - 2.0, handle.bottom() - k), pos2(handle.right() - k, handle.bottom() - 2.0)], grip);
@@ -367,6 +421,11 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, st: &mut StageState) {
         {
             acts.push(UiAction::EnterStreamFullscreen(*key));
         }
+        if resp.secondary_clicked()
+            && let Some(p) = resp.interact_pointer_pos()
+        {
+            acts.push(UiAction::OpenPopover(Popover { kind: PopoverKind::Tile(it.id.clone()), anchor: Rect::from_min_size(p, vec2(1.0, 1.0)) }));
+        }
         if resp.drag_started()
             && started.is_none()
             && let Some(origin) = press
@@ -385,7 +444,7 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, st: &mut StageState) {
     };
     let grey = !dragging && (over_bar.is_some() || (ui.rect_contains_pointer(arena) && hover.is_none()));
     for (bar, rect) in &bars {
-        let resp = ui.interact(*rect, Id::new(("stage_bar", bar)), Sense::click_and_drag());
+        let resp = ui.interact(live(*rect), Id::new(("stage_bar", bar)), Sense::click_and_drag());
         let vertical = matches!(bar, Bar::V { .. });
         if resp.hovered() || bar_drag == Some(*bar) {
             ui.ctx().set_cursor_icon(if vertical { CursorIcon::ResizeHorizontal } else { CursorIcon::ResizeVertical });
@@ -446,4 +505,156 @@ pub fn show(ui: &mut Ui, cx: &mut Cx, st: &mut StageState) {
     for a in acts {
         cx.act(a);
     }
+}
+
+/// The Room settings menu for a room with no stage (see `room::show_header`).
+pub fn room_menu_popover(ctx: &egui::Context, cx: &mut Cx, room: &RoomEntry) {
+    menus::room_popover(ctx, cx, room);
+}
+
+/// An open stream menu keeps its own tile's buttons up; any other open menu or modal takes the pointer, so
+/// no hover chrome shows behind it (the replica's `pin-ovl`).
+fn menu_ok(cx: &Cx, id: &ItemId) -> bool {
+    match &cx.nav.popover {
+        Some(Popover { kind: PopoverKind::Tile(open), .. }) => open == id,
+        Some(_) => false,
+        None => cx.nav.modal.is_none(),
+    }
+}
+
+/// The stage of the main window's central area: the stage itself, or the note while it is popped out.
+pub fn show_main(ui: &mut Ui, cx: &mut Cx, st: &mut StageState) {
+    let Some(view) = cx.stage_view() else { return };
+    if !st.popped.contains(&view) {
+        show(ui, cx, st, Host::Main, &view);
+        return;
+    }
+    let full = ui.max_rect();
+    ui.painter().rect_filled(full, 0.0, theme::STAGE_BG);
+    if cx.nav.stage_fullscreen.is_some() {
+        cx.act(UiAction::ExitStageFullscreen);
+    }
+    note(ui, full, "open_in_new", &tr("ui.stage.popped_title", "The stage is open in its own window"), Some(&tr("ui.stage.popped_text", "Your streams keep playing there.")));
+    let c = full.center();
+    let br = Rect::from_center_size(pos2(c.x, c.y + 58.0), vec2(180.0, theme::CTL_H));
+    let mut child = ui.new_child(UiBuilder::new().max_rect(br));
+    let label = tr("ui.stage.bring_back", "Bring it back");
+    if widgets::Btn::secondary(&label).icon("close_fullscreen").show_sized(&mut child, br.width()).clicked() {
+        st.popped.remove(&view);
+    }
+}
+
+/// The popped-out stages: one immediate viewport each, drawing the same stage ([`Host::Window`]). Closing the
+/// window brings the stage back; so does a room that is gone.
+pub fn show_windows(ctx: &egui::Context, cx: &mut Cx, st: &mut StageState) {
+    let views: Vec<StageView> = st.popped.iter().cloned().collect();
+    for view in views {
+        let title = match &view {
+            StageView::Room(h) => cx.room_name(*h),
+            StageView::Watched => tr("ui.room.watched_title", "Watched streams"),
+        };
+        if matches!(&view, StageView::Room(h) if cx.stage_room(*h).is_none()) {
+            st.popped.remove(&view);
+            continue;
+        }
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title(title)
+            .with_inner_size([1280.0, 760.0])
+            .with_min_inner_size([480.0, 320.0])
+            .with_app_id("simple-screensharing-popout");
+        if let Some(icon) = super::app_icon() {
+            builder = builder.with_icon(icon);
+        }
+        let mut closed = false;
+        ctx.show_viewport_immediate(egui::ViewportId::from_hash_of(("stage_window", &view)), builder, |ctx, _class| {
+            closed = ctx.input(|i| i.viewport().close_requested());
+            egui::CentralPanel::default().frame(egui::Frame::NONE.fill(theme::STAGE_BG)).show(ctx, |ui| show(ui, cx, st, Host::Window, &view));
+        });
+        if closed {
+            st.popped.remove(&view);
+        }
+    }
+}
+
+/// The stage `view`, filling `ui`'s whole rect: the streams, then the people strip and the control bar (under
+/// the streams, or over them in fullscreen).
+fn show(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, host: Host, view: &StageView) {
+    let ctx = ui.ctx().clone();
+    let full = ui.max_rect();
+    ui.painter().rect_filled(full, 0.0, theme::STAGE_BG);
+    let items = collect(cx, view);
+    // Menus first: a click outside one that lands on a bar button must close it before the button reacts.
+    menus::show(&ctx, cx, st, view, &items);
+
+    let fullscreen = match host {
+        Host::Main => cx.nav.stage_fullscreen.is_some(),
+        Host::Window => ctx.input(|i| i.viewport().fullscreen.unwrap_or(false)),
+    };
+    if host == Host::Window {
+        let (f11, esc) = ctx.input(|i| (i.key_pressed(egui::Key::F11), i.key_pressed(egui::Key::Escape)));
+        if f11 || (esc && fullscreen && cx.nav.popover.is_none()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
+        }
+    }
+    // Fullscreen: the chrome hides itself (`chrome.rs`); an open menu, modal, dropdown or drag holds it up.
+    let shown = if fullscreen {
+        let now = ctx.input(|i| i.time);
+        let held = cx.nav.popover.is_some() || cx.nav.modal.is_some() || st.drag.is_some() || super::menu::any_select_open(&ctx);
+        let (inside, active) = ctx.input(|i| {
+            let moved = i.events.iter().any(|e| {
+                matches!(e, egui::Event::PointerMoved(_) | egui::Event::PointerButton { .. } | egui::Event::MouseWheel { .. } | egui::Event::Key { .. } | egui::Event::Text(_))
+            });
+            (i.pointer.latest_pos().is_some_and(|p| full.contains(p)), moved)
+        });
+        let (next, shown) = chrome::step(st.chrome.unwrap_or_else(|| chrome::Chrome::start(now)), now, inside, active, held);
+        if let Some(rest) = next.remaining(now) {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(rest + 0.02));
+        }
+        st.chrome = Some(next);
+        if !shown && inside {
+            ctx.set_cursor_icon(CursorIcon::None);
+        }
+        shown
+    } else {
+        st.chrome = None;
+        true
+    };
+    let alpha = ctx.animate_bool_with_time(Id::new(("stage_chrome", host)), shown, 0.25);
+
+    let bar = bar::Bar::new(cx, st, view, host, fullscreen);
+    let arr = bar.arrange(ui, full.width());
+    let people = strip::people(cx, view, &items);
+    let strip_h = if st.strip_hidden || people.is_empty() { 0.0 } else { theme::STRIP_H };
+    let bar_h = arr.height();
+    let arena = if fullscreen {
+        full.shrink(theme::S2)
+    } else {
+        Rect::from_min_max(full.min + vec2(theme::S4, theme::S4), pos2(full.right() - theme::S4, (full.bottom() - strip_h - bar_h).max(full.top() + theme::S4)))
+    };
+    // The chrome that lies over the streams in fullscreen (strip and bar), from its top edge down.
+    let chrome_top = if fullscreen && alpha > 0.0 { full.bottom() - bar_h - strip_h } else { f32::MAX };
+    draw_arena(ui, cx, st, view, &items, arena, shown, chrome_top);
+
+    // Shown but not yet faded in: the widgets are already there, so a click right after the pointer comes back works.
+    if alpha <= 0.0 && !shown {
+        return;
+    }
+    let mut ov = ui.new_child(UiBuilder::new().id_salt("stage_chrome").max_rect(full));
+    ov.multiply_opacity(alpha);
+    let bar_rect = Rect::from_min_max(pos2(full.left(), (full.bottom() - bar_h).max(full.top())), full.max);
+    let strip_rect = Rect::from_min_max(pos2(full.left(), bar_rect.top() - strip_h), pos2(full.right(), bar_rect.top()));
+    if fullscreen {
+        ov.painter().rect_filled(bar_rect, 0.0, theme::STAGE_CHROME);
+        if strip_h > 0.0 {
+            widgets::paint_gradient(ov.painter(), strip_rect, egui::CornerRadius::ZERO, 180.0, egui::Color32::TRANSPARENT, theme::STAGE_CHROME);
+        }
+    }
+    let mut acts: Vec<UiAction> = Vec::new();
+    if strip_h > 0.0 {
+        strip::show(&mut ov, cx, strip_rect, view, &people, &items, &mut acts);
+    }
+    for a in acts {
+        cx.act(a);
+    }
+    bar.show(&mut ov, cx, st, bar_rect, &arr);
 }

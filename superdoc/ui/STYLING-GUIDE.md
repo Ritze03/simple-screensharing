@@ -97,7 +97,7 @@ number at a call site; if a role is missing, add a named `pub const` to `theme.r
 
 - **Sizes**: band 56 (`BAND_H`), control 32 / large 36 (`CTL_H`, `CTL_H_LG`), pill 18 / 22,
   row 32 (`ROW_H`) / subrow 24, dest row 40, label slot 120 (`LABEL_W`), value slot 72
-  (`VALUE_W`), spacing 4/8/12/16 (`S1..S4`), sidebar 272, People 232, modal 520/640/1120.
+  (`VALUE_W`), spacing 4/8/12/16 (`S1..S4`), sidebar 272, modal 520/640/1120 (`PEOPLE_W` is unused since the People panel went, task I3).
   Radii `ROUNDING*` (14 card, 12 well, 9, 8, 6).
 - **Colours** (former-Electron/mockup values): surfaces `SIDEBAR_RAIL` < `PANEL_SUNKEN` <
   `PANEL_BASE` < `PANEL_RAISED`; text `TEXT`/`TEXT_DIM`/`TEXT_FAINT`; `ACCENT` (+
@@ -136,16 +136,12 @@ number at a call site; if a role is missing, add a named `pub const` to `theme.r
 - **Reserved value width.** The value box is always the fixed `VALUE_W` slot, sized for the
   widest value, so a row never shifts as a number gains a digit.
 - **A pill slot is never narrower than its pill** (2026-10-15). Size a pill's slot from
-  `Pill::width(ui)`, with the mockup width (84 / 96) only as the minimum: the action bar
-  uses `action_bar::bar_pill_w` (widest of every label it can show, `BAR_PILLS`, in the
-  current language, so the status text does not jump when Starting turns Live), the modal
-  head and `dest_row` use `max(minimum, pill width)`, the room header sizes the slot to the
-  pill. The browser mirrors this with `SL(84, pill, { min: true })` (`docs/js/ui/dom.js`).
-  Clipping a pill is a bug, not a fallback; `ui::tests::pill_slots_fit_every_label_in_every_locale`
-  checks every bar label in en and de. *Why:* the user saw the bar's fixed 84 px slot clip
-  "CONNECTING" to "CONNECTI" (2026-10-15); German labels ("ÜBERNEHME", "WECHSELT") were
-  wider still. Exception: the people row's 44 px live slot only ever shows "LIVE" (and a
-  text-less Starting bar).
+  `Pill::width(ui)`, with the mockup width (84 / 96) only as the minimum: the modal head and `dest_row` use
+  `max(minimum, pill width)`, the share menu's header sizes the slot to the pill. The browser mirrors this with
+  `SL(84, pill, { min: true })` (`docs/js/ui/dom.js`). Clipping a pill is a bug, not a fallback. *Why:* the user saw the
+  old action bar's fixed 84 px slot clip "CONNECTING" to "CONNECTI" (2026-10-15); German labels ("ÜBERNEHME", "WECHSELT")
+  were wider still. (The bar's pill slot and `ui::tests::pill_slots_fit_every_label_in_every_locale` went with the action
+  bar in task I3.)
 - **`StrokeKind::Outside` for hand-painted rect strokes** (egui >= 0.31 requires an
   explicit kind; Outside matches what older egui drew). Built-in widgets use Inside and
   can't be changed.
@@ -235,14 +231,16 @@ authored as a claude.ai artifact fragment (no `<!doctype>`/`<html>`, the publish
 a doctype wrapper or the browser uses quirks mode. It is a copy, not a source of truth: when the egui look changes,
 the replica drifts until someone updates it.
 
-The default **Stage** views are a proposal, not the app (#134, 2026-11-03): a black stage with Split / Crop / Floating
-layouts, a people strip with avatars and a grouped control bar. *Why (user request):* the middle part should work like
-a voice-call stage, with the people list, stream volume and settings out of the way until asked for. Its tokens are
-under "stage redesign" at the top of the file and have no `theme.rs` constant yet. Decisions worth keeping if this
-moves to egui: a popped-out stream shows **only** as a badge on its owner's avatar (click brings it back); the green
-ring means audible shared audio, because the app has no voice chat; Split and Crop share one grid (row count that
-shows the most picture area), Crop only fills the cells; resizing in those two is by splitters, so an even grid stays
-one double-click away.
+The default **Stage** views are the app since task I1 (the stage) and I3 (strip, control bar, menus, pop-out, fullscreen
+chrome; 2026-11-04): a black stage with Split / Crop / Floating layouts, a people strip with avatars and a grouped control
+bar. *Why (user request):* the middle part should work like a voice-call stage, with the people list, stream volume and
+settings out of the way until asked. Its tokens are under "stage redesign" at the top of the replica and now have `theme.rs`
+constants (`STAGE_*`, `STRIP_*`, `STAGE_CHROME`, `OVL_NUM`). Decisions worth keeping: a popped-out stream shows **only** as a
+badge on its owner's avatar (click brings it back); the green ring means audible shared audio, because the app has no voice
+chat; Split and Crop share one grid (row count that shows the most picture area), Crop only fills the cells; resizing in
+those two is by splitters, so an even grid stays one double-click away. Where the code lives: `APP-SHELL.md` "The stage",
+"The control bar", "The people strip and hover card", "Menus and dropdowns", "The whole stage can pop out". The **Classic**
+views were not built in the app.
 
 **Watched** (Stage group, #136, 2026-11-03) is the same stage for every stream you watch, from all rooms. *Why (user
 request):* "the same view should be on the watched streams section ... everything combined". A stream's key is
@@ -252,9 +250,9 @@ are shared. Watched has no Invite, Room settings or Leave, and shows Share and a
 on (a new share starts from a room, so no room picker). Several streams of one person are one avatar with a count.
 
 **Emoji avatars** (#136): a person can pick an emoji (Settings > Profile) that replaces the initial on the same
-name-derived gradient; `avatar()` is the one helper. No wire field exists yet, so in the app this needs a protocol change.
+name-derived gradient; `avatar()` is the one helper (native: `ui::paint_person`). No wire field exists yet, so in the app this needs a protocol change.
 
-**Fullscreen chrome** (#136, native `popout.rs` `OVERLAY_IDLE`): in fullscreen the strip and bar lie over the stage, so
+**Fullscreen chrome** (#136, native `stage/chrome.rs`; the older per-stream twin is `popout.rs` `OVERLAY_IDLE`): in fullscreen the strip and bar lie over the stage, so
 the streams do not jump. *Why (user request):* they should be out of the way: shown only while the pointer is over the
 stage, gone after 3 s without movement. An open menu or a drag cancels the timer and keeps them up even off the stage;
 when it ends they get a full 3 s again, so closing a menu never hides the bar at once. Outside fullscreen they always show.
