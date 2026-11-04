@@ -77,7 +77,7 @@ Playwright `_electron`) is in git: `git log -- superdoc/features/viewer-window.m
   Wayland has no absolute-positioning protocol, so a pop-out's default position is the
   compositor's choice; no display picker was built for that reason.
 - **The pop-out must honour the jitter-buffer setting.** Its own JS context once fell back to a
-  hard-coded 2000 ms instead of the user's `max_jitter_buffer_ms`; the egui pop-out shares the
+  hard-coded 2000 ms instead of the browser's own jitter-buffer setting (core option `maxJitterBufferMs`; the native client has no such setting any more); the egui pop-out shares the
   tile's `VideoView`, so this class of bug cannot recur.
 - **Watch grid fits tiles to the window shape**, not `ceil(sqrt(n))`: for every column count the
   per-tile 16:9 size is computed and the shape with the largest tile area wins (tall windows
