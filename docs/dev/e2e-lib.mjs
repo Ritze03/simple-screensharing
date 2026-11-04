@@ -56,11 +56,16 @@ export async function waitJoined(page, i = 0, timeout = 20000) {
 export const inviteLink = (page, i = 0) => page.eval(`__sss.S.rooms[${i}].inviteLink()`);
 
 /**
- * Replace getDisplayMedia with the harness pattern source (noisy rectangles + frame/clock strip + optional 440 Hz tone),
+ * Replace getDisplayMedia with the harness pattern source (noisy rectangles + frame/clock strip; the optional 440 Hz tone only with `audio: true` + SSS_E2E_AUDIO=1, VMs only),
  * so the real UI's share flow runs unattended. The pattern module is the one dev/ pages use.
  */
-export async function stubCapture(page, { width = 1920, height = 1080, fps = 60, audio = true } = {}) {
+export const AUDIO_OK = process.env.SSS_E2E_AUDIO === "1";
+export async function stubCapture(page, { width = 1920, height = 1080, fps = 60, audio = false } = {}) {
+  // Video only unless asked: the tone is an AudioContext, and no audio runs on the host (testing-and-verification.md). Audio needs
+  // `audio: true` AND SSS_E2E_AUDIO=1, which is only for the test VMs.
+  if (audio && !AUDIO_OK) throw new Error("stubCapture({ audio: true }) plays a tone: set SSS_E2E_AUDIO=1, and only inside a test VM");
   await page.eval(`(async () => {
+    window.__SSS_E2E_AUDIO = ${AUDIO_OK};
     const { makePatternSource } = await import("${BASE}dev/pattern.js");
     const src = makePatternSource(${width}, ${height}, ${fps}, { audio: ${audio} });
     document.body.lastElementChild.style.cssText = "position:fixed;left:-9999px;width:8px;height:8px";

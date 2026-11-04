@@ -16,6 +16,8 @@ export function makePatternSource(width, height, targetFps, { audio = false, spe
   const track = stream.getVideoTracks()[0];
   let audioCtx = null;
   if (audio) {
+    // No audio on the host: only a page the VM drivers started (SSS_E2E_AUDIO=1 -> `window.__SSS_E2E_AUDIO`, or `?audio=1` in the URL).
+    if (!globalThis.__SSS_E2E_AUDIO && new URLSearchParams(location.search).get("audio") !== "1") throw new Error("makePatternSource({ audio: true }) needs SSS_E2E_AUDIO=1 (test VMs only)");
     // A 440 Hz tone as the "captured" audio, so the audio share path (AudioEncoder -> Opus -> relay) is exercised too.
     audioCtx = new AudioContext({ sampleRate: 48000 });
     const osc = audioCtx.createOscillator();

@@ -30,6 +30,7 @@ const BASE_FLAGS = [
   "--disable-backgrounding-occluded-windows",
   "--autoplay-policy=no-user-gesture-required",
   "--enable-features=WebCodecs,WebTransport",
+  ...(process.env.SSS_E2E_AUDIO === "1" ? [] : ["--mute-audio"]), // belt and braces: no audio on the host (only the test VMs set SSS_E2E_AUDIO=1)
   "--enable-logging=stderr",
   "--v=0",
 ];

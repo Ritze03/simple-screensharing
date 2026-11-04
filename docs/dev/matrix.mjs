@@ -79,6 +79,7 @@ export async function runPair({ relay, hash, codec, fps, size, bitrate, duration
 
 async function main() {
   const o = parseArgs(process.argv.slice(2));
+  if ((o.audio || o.source === "tab") && process.env.SSS_E2E_AUDIO !== "1") throw new Error("--audio / --source tab play a tone: test VMs only, with SSS_E2E_AUDIO=1");
   const rows = [];
   const all = [];
   for (const codec of o.codecs.split(",")) {

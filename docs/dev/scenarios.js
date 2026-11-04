@@ -6,6 +6,7 @@ import { CanvasRenderer, ConnectError, JoinRejectedError, RoomClient, capabiliti
 import { kvGet, kvSet, log, params, postResult } from "./pagelog.js";
 import { makePatternSource } from "./pattern.js";
 
+const AUDIO = params.get("audio") === "1"; // only scenarios.mjs with SSS_E2E_AUDIO=1 (test VMs): no audio on the host
 const RELAY = params.get("relay");
 const HASH = params.get("hash");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -288,6 +289,7 @@ scenario("static screen (no new frames at all): a new viewer still gets a keyfra
 });
 
 scenario("audio follows video; volume 0-500 % and mute", async () => {
+  if (!AUDIO) return { skipped: "audio runs only in the test VMs (SSS_E2E_AUDIO=1)" };
   const room = newRoom();
   const a = await client(room.link, "sharer");
   const b = await client(room.link, "viewer");
@@ -491,10 +493,10 @@ scenario("stream stopping under a viewer cleans up (watch-ended, no leaked subsc
   const room = newRoom();
   const a = await client(room.link, "sharer");
   const b = await client(room.link, "viewer");
-  const src = makePatternSource(320, 180, 15, { audio: true });
-  const share = await a.startShare({ stream: src.stream, fps: 15, bitrateKbps: 500, audio: true });
+  const src = makePatternSource(320, 180, 15, { audio: AUDIO });
+  const share = await a.startShare({ stream: src.stream, fps: 15, bitrateKbps: 500, audio: AUDIO });
   const st = await waitFor(() => streamOf(b, a), 5000, "stream");
-  await waitFor(() => streamOf(b, a, "audio"), 5000, "audio stream");
+  if (AUDIO) await waitFor(() => streamOf(b, a, "audio"), 5000, "audio stream");
   b.watch(st.key, { canvas: document.body.appendChild(document.createElement("canvas")) });
   await waitFor(() => (b.watchStats(st.key) || {}).decoded > 3, 8000, "decoding");
   share.stop();

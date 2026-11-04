@@ -23,7 +23,7 @@ function parseArgs(argv) {
     if (!a.startsWith("--")) continue;
     const k = a.slice(2);
     if (k === "flag") o.flags.push(argv[++i]);
-    else if (k === "audio") o.audio = true;
+    else if (k === "audio") { if (process.env.SSS_E2E_AUDIO !== "1") throw new Error("--audio plays a tone: test VMs only, with SSS_E2E_AUDIO=1"); o.audio = true; }
     else o[k] = argv[++i];
   }
   return o;

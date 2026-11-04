@@ -14,6 +14,7 @@ import { spawn } from "node:child_process";
 import { createWriteStream, mkdirSync } from "node:fs";
 const W = new URL("../", import.meta.url).pathname;
 const L = await import(W + "e2e-lib.mjs");
+if (process.env.SSS_E2E_AUDIO !== "1") throw new Error("audio-only.mjs plays audio: it runs only inside a test VM, with SSS_E2E_AUDIO=1 (never on the host)");
 const args = process.argv.slice(2);
 const opt = (n) => (args.includes(n) ? args[args.indexOf(n) + 1] : null);
 const [RELAY, HASH] = args.filter((a, i) => !a.startsWith("--") && !(i > 0 && args[i - 1].startsWith("--")));

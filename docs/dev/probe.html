@@ -55,7 +55,7 @@ for (const mode of ["constant", "variable", "quantizer"]) {
 }
 res.webtransport = { present: typeof WebTransport !== "undefined", congestionControl: false };
 try { new WebTransport("https://127.0.0.1:1/x", { congestionControl: "low-latency" }).closed.catch(() => {}); res.webtransport.congestionControl = true; } catch (e) { res.webtransport.congestionControl = String(e); }
-res.misc = { mediaStreamTrackProcessor: typeof MediaStreamTrackProcessor, offscreenCanvas: typeof OffscreenCanvas, audioContextSampleRate: new AudioContext().sampleRate, hardwareConcurrency: navigator.hardwareConcurrency };
+res.misc = { mediaStreamTrackProcessor: typeof MediaStreamTrackProcessor, offscreenCanvas: typeof OffscreenCanvas, audioContext: typeof AudioContext /* never constructed: no audio on the host */, hardwareConcurrency: navigator.hardwareConcurrency };
 document.getElementById("out").textContent = JSON.stringify(res, null, 2);
 await postResult(res);
 </script>

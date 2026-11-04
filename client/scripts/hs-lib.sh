@@ -387,11 +387,13 @@ hs_start_client() {
   mkdir -p "$SCRATCH/data$n"
   rm -f "$SCRATCH/ui$n.txt"
   [[ -n "${!extra_var:-}" ]] && read -r -a extra <<<"${!extra_var}"
+  # No audio on the host (testing-and-verification.md): notification sounds would reach autoaudiosink, so the
+  # rig's clients get fakesink; a CLIENT_ENV_<n> that sets SSS_SOUND_SINK comes later in env's list and wins.
   swaymsg "workspace number $ws" >/dev/null     # a new window opens on the focused workspace
   log "starting client #$n on $out (config $cfg, log $SCRATCH/client$n.log)"
   hs_spawn "client$n" env XDG_CONFIG_HOME="$cfg" XDG_DATA_HOME="$SCRATCH/data$n" \
     RUST_LOG="${RUST_LOG:-info}" SSS_UI_DUMP="$SCRATCH/ui$n.txt" \
-    PULSE_SERVER="unix:$RT/no-pulse" "${extra[@]}" "${!bin_var:-$CLIENT_BIN}"
+    PULSE_SERVER="unix:$RT/no-pulse" SSS_SOUND_SINK=fakesink "${extra[@]}" "${!bin_var:-$CLIENT_BIN}"
   pid="$(hs_pid_of "client$n")"
   for ((i = 0; i < 150; i++)); do
     [[ -n "$(hs_win_json "$pid")" ]] && break

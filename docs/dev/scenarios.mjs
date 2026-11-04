@@ -12,7 +12,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const args = Object.fromEntries(process.argv.slice(2).reduce((a, x, i, arr) => (x.startsWith("--") ? [...a, [x.slice(2), arr[i + 1]]] : a), []));
 const port = args.relay.split(":")[1];
 const { server, port: httpPort, results, waitersResult, kv } = await startServer({ onLog: (id, m) => console.log(`  ${m}`) });
-const url = `http://127.0.0.1:${httpPort}/simple-screensharing/dev/scenarios.html?id=0&relay=${args.relay}&hash=${args.hash}${args.only ? `&only=${encodeURIComponent(args.only)}` : ""}`;
+const url = `http://127.0.0.1:${httpPort}/simple-screensharing/dev/scenarios.html?id=0&relay=${args.relay}&hash=${args.hash}${args.only ? `&only=${encodeURIComponent(args.only)}` : ""}${process.env.SSS_E2E_AUDIO === "1" ? "&audio=1" : ""}`;
 const b = launchChromium(url, { flags: ["--disable-frame-rate-limit", "--disable-gpu-vsync"] });
 let restarting = false;
 const flags = new Set();
