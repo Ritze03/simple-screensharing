@@ -7,8 +7,7 @@ video") and the module docs of `client/src/audio.rs` and `client/src/decode.rs`.
 
 ## 2026-11-04: planned, not built: audio-only shares and an audio exclusion list
 
-User request for the redesign's implementation step: sharing **only audio** must be possible (no screen share needed), and
-Settings gets a list of **strings the user enters for source names to exclude**. Sources that match are hidden from the audio
+User request for the redesign's implementation step: sharing **only audio** must be possible (no screen share needed), and the audio settings menu (opened from the audio button's dropdown) gets a list of **strings for source names to exclude**, picked from the detected sources or typed in. Sources that match are hidden from the audio
 source selection and filtered out of desktop audio automatically. **Why:** voice chat such as Discord or TeamSpeak must not
 end up in the share. Desktop audio (the audio button's default in the replica, `ui/STYLING-GUIDE.md` "HTML replica") therefore
 cannot be a plain monitor of the output: it has to link every app except the excluded ones.

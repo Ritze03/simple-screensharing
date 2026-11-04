@@ -1210,7 +1210,8 @@ function camMenu() {
 }
 function audioMenu() {
   const cur = S.audioOn ? S.audioSrc : "No audio";
-  return `<div class="ml">Audio source</div>${audioSources().map(([n, icon, sub]) => `<button type="button" class="mi two${cur === n ? " on" : ""}" data-act="asrc:${esc(n)}">${ic(icon)}<span class="t">${esc(n)}<small>${n === "Desktop audio" && S.audioExcl.length ? `Everything you hear, minus ${S.audioExcl.length} excluded` : sub}</small></span>${cur === n ? ic("check", "chk") : ""}</button>`).join("")}`;
+  return `<div class="ml">Audio source</div>${audioSources().map(([n, icon, sub]) => `<button type="button" class="mi two${cur === n ? " on" : ""}" data-act="asrc:${esc(n)}">${ic(icon)}<span class="t">${esc(n)}<small>${n === "Desktop audio" && S.audioExcl.length ? `Everything you hear, minus ${S.audioExcl.length} excluded` : sub}</small></span>${cur === n ? ic("check", "chk") : ""}</button>`).join("")}
+    <div class="msep"></div>${mi("tune", "All audio settings…", "modal:audio")}`;
 }
 function layoutMenu() {
   return `<div class="ml">Layout</div>${LAYOUTS.map(([k, icon, n, sub]) => `<button type="button" class="mi two${V().layout === k ? " on" : ""}" data-act="layout:${k}">${ic(icon)}<span class="t">${n}<small>${sub}</small></span>${V().layout === k ? ic("check", "chk") : ""}</button>`).join("")}
@@ -1527,6 +1528,13 @@ function exclMenu() {
     <div class="msep"></div><div class="ml">Or enter a name</div>
     <div class="mrow"><input class="field" id="excl-in" placeholder="Part of a source name" aria-label="Part of a source name" autocomplete="off"><button type="button" class="btn btn-secondary" data-act="excladdtext">Add</button></div>`;
 }
+function audioModal() {
+  const body = card("Source", null, ctrlRow("Audio", select("audioSrc", audioSources().map((a) => a[0])))) +
+    card("Volume", null, ctrlRow("Boost", slider("boost", 0, 200, 5), `<span class="val" id="boost-val">${S.boost}%</span>`, "Trim the shared audio before it is sent")) +
+    card("Desktop audio", null, exclRows());
+  const foot = `${S.audioOn ? `<button type="button" class="btn btn-danger btn-lg" data-act="audio">${ic("music_off")}Stop sharing audio</button>` : `<button type="button" class="btn btn-secondary btn-lg" data-act="audio">${ic("music_note")}Share desktop audio</button>`}${FILL("")}<button type="button" class="btn btn-primary btn-lg" data-act="close">Done</button>`;
+  return shell("wide", "Audio settings", S.audioOn ? `Sharing ${esc(S.audioSrc)}` : "Not sharing audio", body, foot);
+}
 function settingsModal() {
   const body = card("Profile", null, ctrlRow("Display name", `<input class="field" id="set-name" value="${esc(me())}" aria-label="Display name">`, undefined, "What friends see in rooms") +
       ctrlRow("Avatar", `<button type="button" class="btn btn-secondary" data-menu="emoji" data-anchor="emoji" title="Pick an emoji for your avatar">${avatar(me(), true)}${emojiOf(me()) ? "Change" : "Pick an emoji"}</button>`, undefined, "An emoji instead of your initial, on the same colour")) +
@@ -1535,7 +1543,6 @@ function settingsModal() {
     card("Playback", null, ctrlRow("Jitter buffer", slider("jitter", 0, 5000, 100), `<span class="val" id="jitter-val">${(S.jitter / 1000).toFixed(1)} s</span>`, "How much delay smooths out the network") +
       ctrlRow("Catch-up speed", slider("catchup", 5, 10, 1), `<span class="val" id="catchup-val">${S.catchup}%</span>`, "How fast playback catches up after a hiccup") +
       ctrlRow("Level loudness", cbx("level", "Even out the volume of what I watch"), undefined, "Viewer-side automatic gain on every watched stream")) +
-    card("Shared audio", null, ctrlRow("Boost", slider("boost", 0, 200, 5), `<span class="val" id="boost-val">${S.boost}%</span>`, "Trim the shared audio before it is sent") + exclRows()) +
     card("Sounds", null, ctrlRow("Volume", slider("soundVol", 0, 100, 5, "", "Sound volume"), `<span class="val" id="sound-val">${S.soundVol}%</span>`, "How loud these sounds are, separate from any stream") +
       Object.entries(SOUNDS).map(([k, x]) => `<div class="hb g2 crow">${FILL(`<span class="lbl">${x.label}</span>`)}<button type="button" class="btn btn-secondary" data-act="sound:${k}">${ic("play_arrow")}Test</button></div>`).join("")) +
     card("Diagnostics", null, ctrlRow("Logs", `<div class="hb g2" style="width:100%">${FILL(`<button type="button" class="btn btn-secondary wide">Copy to clipboard</button>`)}${FILL(`<button type="button" class="btn btn-secondary wide">Save to file…</button>`)}</div>`, undefined, "Recent log lines of this app") +
@@ -1586,6 +1593,7 @@ function render() {
   else if (S.modal === "settings") html += settingsModal();
   else if (S.modal === "add") html += addModal();
   else if (S.modal === "cam") html += camModal();
+  else if (S.modal === "audio") html += audioModal();
   if (!S.modal || S.menu === "emoji" || S.menu === "excl") html += renderMenu();
   frame.innerHTML = html;
   tipUser = null;
