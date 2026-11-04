@@ -27,6 +27,19 @@ cd client/scripts                         # SCRATCH defaults to <target>/hs-scra
 
 `hs-scenario.sh LABEL CODEC FPS PRESET` does share -> setup -> go live -> watch -> 7 tooltip
 screenshots + sender per-stage rates (`gst-rate.py` on the tracer log) -> stop, in one call.
+**Settings changes on a live share (2026-11-04, task #139).** `setup` only works in the staged modal; `hs-drive.sh live [fps=N]
+[preset=text|quality|gaming] [quality=performance|quality] [gop=MS] [kbps=K] [codec=C]` opens the *live* modal (the share button), applies
+the named values in that order through the real controls (FPS and Keyframe are dropdowns, Preset and Encoding segments, Bitrate the value
+box typed with `hs_type`), reads each back from the dump, prints one `live: ...` line and closes it with Done. Each value is one
+`EditDestination`/`ApplyPresetToDestination`, so it takes the same tier the app gives it (a bitrate write, a branch swap, a source
+restart). `hs-live-cycle.sh LABEL CODEC FPS PRESET KBPS SECS [GAP]` shares, goes live, watches, then runs a cycle of `live` calls
+(`CYCLE="step|step"` to change it) every GAP seconds and prints counts from the sender's and the viewer's logs (capture deaths, portal
+restarts, branch flow errors, rate-control restarts, codec fallbacks, no-IDR, viewer `never completed`); `final-viewer.png` shows
+whether the viewer kept a picture. The rig must be up with `HS_PATTERN=none` plus a pattern started through `hs-rig.sh run -- python3 hs-pat-photo.py FPS PIDFILE`:
+`hs-pat-photo.py` is a detailed desktop of smooth colour with grain and a moving window (needs ~935 kB keyframes at 1080p 60 fps
+Quality: the hard case for `vaav1enc`'s coded buffer), `hs-pat-gray.py` the same with 7-gray 3x3 blocks, which a palette encoder
+shrinks 8x (see `features/stream-control.md` "Settings changes on a live share"). `SSS_VAENC_EXTRA="min-qp=90,mbbrc=1"` in a client's
+environment appends encoder properties (commas become spaces).
 `hs-rig.sh status` lists processes/outputs/windows, `hs-rig.sh run -- CMD...` runs CMD inside
 the rig's environment (`grim`, `swaymsg`, `wtype`, `busctl`, ...).
 Headless sway's `wtype` loses the first key of each run: type through `hs_type` (`hs-lib.sh`), never bare `wtype`. It starts with a shift modifier and a pause, no key. *Why not a dummy key:* wtype numbers its keys from evdev code 1, which is Escape in the keymap the client still has when the first key arrives. A dummy Shift_L (the old `hs_type`) reached the client as an Escape in about 1 of 3 runs, so one `key N -k Escape` could close a menu and then leave fullscreen (2026-11-04, the "Escape left fullscreen" of I3).
@@ -93,8 +106,9 @@ Settings controls (`sound.volume`, `sound.test.*`, `sound_volume`) are dumped on
 | --- | --- |
 | `hs-rig.sh up\|status\|run\|down` | the rig |
 | `hs-lib.sh` | shared functions (sourced; sources `launch-lib.sh` for build/config/join-link helpers) |
-| `hs-drive.sh STEP` | share, setup, golive, discard, watch, hover, sample, stopshare, unwatch, shot, crop, click, move, key, modal, mclick (`mclick NAME L60` = 60 pt from the rect's left edge), tree; by dumped name for any client: rect, val, await, uclick, udclick, umove, uscroll, udrag; drag (window coordinates); relay-restart [DOWN_SECS] |
+| `hs-drive.sh STEP` | share, setup, golive, live, discard, watch, hover, sample, stopshare, unwatch, shot, crop, click, move, key, modal, mclick (`mclick NAME L60` = 60 pt from the rect's left edge), tree; by dumped name for any client: rect, val, await, uclick, udclick, umove, uscroll, udrag; drag (window coordinates); relay-restart [DOWN_SECS] |
 | `hs-scenario.sh` | one measured share (screenshots + per-stage rates) |
+| `hs-live-cycle.sh` | a share whose Preset / FPS / Encoding / Keyframe / Bitrate are changed over and over while live (`hs-drive.sh live`), with log counts per run |
 | `hs-pip-spots.py` | drags a webcam in picture onto all 8 spots with the real pointer, checks `pipinfo` after each release, optional screenshot per spot (needs a PIP on screen: `CLIENT_ENV_1="SSS_FAKE_CAMERA=1"`, share + webcam on client 1, Watch both on client 2, Layout > Webcam in picture) |
 | `hs-probe.sh` | `portal-probe.py` against the rig's portal (no picker) |
 | `hs-vptr.c`, `hs-vptr-protocol.xml` | the virtual-pointer keepalive, one-shot `scroll` and `drag` (protocol XML from wlroots, MIT) |

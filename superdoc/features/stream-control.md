@@ -1,6 +1,6 @@
 # Stream Control (desktop client)
 
-> **Status (2026-10-14; the webcam section, "The lagspike on every keyframe" and "AV1 branch deaths read as a lost portal source" added 2026-11-04).** The client is one native egui binary and this page is its
+> **Status (2026-10-14; the webcam section, "The lagspike on every keyframe", "AV1 branch deaths read as a lost portal source" and "Settings changes on a live share, and the coded-buffer deaths that were left" added 2026-11-04).** The client is one native egui binary and this page is its
 > **backend** reference: `client/src/capture.rs` (with its inline `destination` and `branch`
 > modules), `session.rs`, `bandwidth.rs`, `presets.rs`, `rooms.rs`. It covers "The shape of a
 > capture", staging and "Go live", fan-out, transfer, the three tiers, "Capture/encode
@@ -21,6 +21,115 @@ plan (`superdoc/ui/APP-SHELL.md`): starting and editing outgoing streams, **mult
 fan-out**, **transfer** between rooms, and the two **bandwidth modes** with
 `bandwidth::allocate` wired into live encoders. The plan it implemented is
 `superdoc/brainstorm/ui-redesign-multiroom-streaming.md` (final plan items 4, 5 and 7).
+
+---
+
+## Settings changes on a live share, and the coded-buffer deaths that were left (2026-11-04, task #139)
+
+**Brief.** Row 137 stopped a dead encode branch from reading as a lost portal source, but (1) nothing had tested what the user does
+all day, changing Preset / bitrate / FPS / Keyframe on a live share (their log: gop 250/1000, kbps 10000/25700, Quality/Performance, 60/120
+fps within minutes, on AV1), and (2) 1080p 60 fps Quality still rebuilt the branch every GOP and then restarted the capture.
+
+**The rig can now drive live changes.** `hs-drive.sh live fps=60 gop=1000 preset=quality quality=performance kbps=10000 codec=h265`
+opens the live modal and sets the named values through the real controls; `hs-live-cycle.sh` runs a cycle of those over minutes and counts
+sender and viewer log lines (`client/scripts/README.md`). Every change goes through `CaptureHandle::change_destination`, so it takes
+the tier `classify_change` gives it: FPS, Keyframe, Encoding, Preset, Codec = one branch swap each, Bitrate = one `bitrate` property
+write. A rise of the FPS over what the source runs at is a tier-3 `set_source_framerate`, which here only raises a number: the capture
+restarts the old build showed came from encoder deaths, and **no run of the new build had one**.
+
+**Before** (`9343855`, the build of row 137; same rig, `hs-live-cycle.sh`, AV1 120 fps Gaming 25 700 kbps, a detailed desktop with a
+moving window, the default 12-step cycle: Quality 10 000 kbps / Gaming 25 700 / 60 fps + 1000 ms / 120 + 250 / 10 000 / 25 700 /
+Performance / Quality / 1000 ms / 250 ms / 240 fps / 120 fps, one visit of the modal every ~8 s). Counted from before the share starts:
+see the table. The failures were the ones the brief named:
+
+- **`av1_reset_off` outlived the settings.** It is learned for one frame rate / keyframe interval / quality (60 fps Quality: the post-restart
+  IDR fills the 972 kB buffer; 120 fps Gaming: it fits), and the pump kept it across the swap, so after Quality -> Gaming the pump never
+  restarted the rate control again and the branch died on the first oversized keyframe. `IdrControl::params_changed` now forgets the learned
+  state (and a pending restart) after a user swap and after a `bitrate` write. `av1_coded_buffer_bytes` itself was already right: it is
+  computed from `params.framerate` at every keyframe, so it follows a change of FPS.
+- **A `bitrate` write on `vaav1enc` forces an IDR** (the row 137 observation) and `DestCmd::SetBitrate` did nothing about its size. It now
+  marks the next keyframe as "after a restart", so one that fills the buffer is learned like the pump's own restarts.
+- **A restart that does not help ran forever.** With the keyframes held near the limit by something else (a `min-qp` floor: 758 kB of 972 kB
+  at every keyframe) the 75 % trigger fired every 2 s and each restart cost an extra ~760 kB IDR (50 restarts in 40 s). A restart whose
+  keyframe is still >= 80 % of the one that triggered it is now learned off (`av1_reset_trigger`).
+- **The swap path with `async=false` worked**: 0 `produced no IDR within 5s` in every run of the new build; the old build had 1 in the
+  90 s run (the 4th rebuild of a death loop).
+
+**1080p 60 fps Quality, detailed still content: what was tried, one fresh rig per row** (60 fps, Quality, Keyframe 1000 ms,
+25 700 kbps, 40 s, a static desktop with one moving window; `SSS_VAENC_EXTRA` appends encoder properties; "dead" = branch flow errors):
+
+| encoder property (added to the pipeline) | content | largest keyframe | result |
+|---|---|---|---|
+| none | 7-gray 3x3 blocks ("noise") | 1130 kB | dead branch every GOP |
+| none | photographic (smooth colour + grain) | 935 kB | 19 branch deaths, 3 capture restarts |
+| `mbbrc=0`, `rate-control=cbr`, `target-usage=1`, `target-percentage=50`, `hierarchical-level=1 gf-group-size=1 ref-frames=1` | photographic | 935 kB | no change (19-20 deaths) |
+| `allow-intrabc=true` | noise | 1130 kB | no change |
+| **`palette-mode=true`** | noise | **129 kB** (deltas 17-40 -> 4-5 kB) | no deaths |
+| `palette-mode=true` (+ intrabc) | photographic | 935 kB | no change |
+| `min-qp=100 max-qp=200` | noise | 760 kB | no deaths (restart loop, above) |
+| **`min-qp=70` / `90` / `110`** | photographic | **414 / 305 / 162 kB** | no deaths |
+
+So two levers work and they are different content: **palette mode** is what flat-colour screen content (a code editor, a terminal, a
+UI) needs and costs nothing elsewhere (identical keyframe sizes and encode times on photographic content, `enc_gap` / `enc_late` equal);
+**`min-qp`** caps what the rate control may spend on a keyframe at any content, at the price of a quality ceiling (still 4-6 kB deltas
+on a still picture: it stops "spending the surplus" on static detail). What does *not* help is every rate-control knob; `cpb-size` is
+discarded for AV1 (GStreamer raises a value under half the bitrate to 2 s of bitrate), and a larger buffer by lying about the frame
+rate is no option at 60 fps: 972 kB (level <= 4.1, ratio 4) is already the largest `vaav1enc` ever allots a 1080p frame.
+*Why the earlier "min-qp 60/120 made no difference" differs from this table: unknown (single runs; most likely the property did not
+reach the encoder).*
+
+**What the code does now (`capture.rs`):**
+
+1. **`palette-mode=true` for AV1 on Mesa AMD** (`launch_fragment`, gated like `vaapi_target_usage` by `va_driver_is_mesa_amd()`: it is a
+   sequence-level tool flag and only this driver was measured).
+2. **First AV1 branch death in 30 s: a quality floor** (`AV1_QP_FLOOR` = `min-qp` 70, `AV1_FLOOR_FAILURES` 1): the dead branch is rebuilt
+   with it, the log says `rebuilding it with a quality floor (min-qp=70) so its keyframes fit the encoder's N kB coded buffer`. *Why on
+   the first death and not never:* a floor for everyone costs sharpness on every still screen for a problem that only some content has;
+   *why on the first and not the second:* a rebuilt branch without it dies at its next big keyframe, and every death is a ~1 s freeze
+   (150 s cycle: 12 deaths when the floor came at the second death and was forgotten at every settings change, 1 death in 200 s
+   when it comes at the first and is kept; the floor is process-wide because the keyframes are big because of
+   the shared screen, and it is **kept across settings changes** and cleared by a new share: forgetting it at each change meant two deaths
+   to relearn it at every change to 60 fps).
+3. **Third VA branch death in 30 s: another codec** (`fallback_codec`, `CODEC_FALLBACK_FAILURES` 3, below `MAX_BRANCH_FAILURES` 4):
+   AV1 -> H.265 -> H.264, only codecs this machine can encode, rebuilt as the same `SwapMode::Failed` swap with the new codec and the
+   log `the AV1 encode branch failed 3 times in 30s ...; moving this destination to H265 for the rest of the share (change its
+   settings to try AV1 again)`. The viewers sniff the codec from the bitstream and the swap sends a keyframe, as for a user's codec
+   change. *Why this exists although AV1 now rarely gets there:* the brief's "never leave it cycling". **H.265 is not a safe way out**
+   (`Calculate codedbuf size` 1 053 240 B at 1080p 120 fps, 1 575 480 B at 60 fps: level-limited too; the keyframes of 120 fps Quality
+   reached 760 kB-1 MB: 29 deaths and 5 capture restarts in 50 s on the pre-#139 build), so it falls on to H.264, whose coded buffer
+   never failed in any rig run (keyframes up to 1.3 MB at 120 fps). The settings UI still shows the user's codec; a settings change
+   re-applies it.
+
+**After (same scenarios, same rig, sender = the new build; counts are for the whole run including the first seconds):**
+
+| scenario (live-change cycle, sender build) | changes | capture restarts (portal) | branch deaths | rate-control restarts | quality floors | codec fallbacks | no IDR in 5 s | viewer `never completed` |
+|---|---|---|---|---|---|---|---|---|
+| AV1 photographic 120 fps Gaming, 200 s: `9343855` | 24 | **6** | **30** | 21 | - | - | 0 | 0 |
+| same, #139 | 24 | **0** | **1** | 3 | 1 | 0 | 0 | 0 |
+| AV1 photographic, cycle of Quality/Gaming/60 fps/120 fps/Encoding, starts 60 fps Quality, 150 s: `9343855` | 15 | **6** | **30** | 23 | - | - | 0 | 0 |
+| same, #139 | 15 | **0** | **1** | 2 | 1 | 0 | 0 | 0 |
+| AV1 7-gray desktop 120 fps Gaming, 150 s: `9343855` | 18 | **4** | **26** | 20 | - | - | 1 | 0 |
+| same, #139 | 18 | **0** | **0** | 0 | 0 | 0 | 0 | 0 |
+| H.265 photographic 120 fps Gaming, 150 s: `9343855` | 18 | 0 | 2 | 0 | - | - | 0 | 0 |
+| same, #139 | 18 | 0 | 2 | 0 | 0 | 0 | 0 | 0 |
+| H.264 photographic 120 fps Gaming, 150 s: `9343855` | 18 | 0 | 0 | 0 | - | - | 0 | 0 |
+| same, #139 | 18 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+
+(The default cycle is 12 steps, one modal visit every ~8 s: Quality + 10 000 kbps, Gaming + 25 700, 60 fps + 1000 ms, 120 fps + 250 ms,
+bitrate 10 000, bitrate 25 700, Performance, Quality, 1000 ms, 250 ms, 240 fps, 120 fps. A "portal restart" is the
+`capture source lost` -> `restart attempt` path the user saw as *Recovering*; "branch deaths" are `returned a flow error` lines.
+`never completed` is 0 in every run; the final viewer screenshots of the two AV1 photographic runs (checked by eye) show the live
+picture, 121 and 60 fps in the tile.) Earlier runs of the
+intermediate builds: a 300 s cycle with the floor forgotten at each change had 0 deaths in its counted part, so the first-death
+counting window matters: the cycle script now counts from before the share starts. The static 60 fps Quality case on its own: 19 deaths and
+3 capture restarts in 40 s before, 1 death and 0 restarts after (keyframes 414 kB).
+
+**Not proven.** (1) The viewers were the rig's native client only; a browser viewer of the codec that a fallback switches to
+was not exercised. (2) Palette mode and the `min-qp` floor were measured on this rig's synthetic desktops (7-gray blocks, smooth colour
+with grain), not on the user's real screen; their log (`key_kB` 130-700 at 60 fps) suggests less extreme content, so the floor may
+never trigger for them. (3) The H.265 path was cycled once (2 branch deaths in 150 s, below the fallback threshold, no restarts); the
+H.265 -> H.264 step ran only as a unit-tested ladder, not live. (4) Everything was on the dev machine's RX 7900 XTX / Mesa 26.2.5 /
+GStreamer 1.28.8; other drivers may size their coded buffer differently. (5) Bitrate writes were cycled 10 000 <-> 25 700 kbps only.
 
 ---
 
@@ -104,14 +213,12 @@ burst), so the pump avoids it where it can:
 | fix 1 only (60 s) | 3 restarts (4 failures in 30 s gave up) | 20 | 1 |
 | fixes 1-3 | **0 (0)** | **0** | 0 |
 
-**Not fixed, said plainly.** At **1080p 60 fps Quality (1000 ms GOP)** on this rig's static detailed desktop the encoder fills the whole
-972 kB buffer with the second keyframe at any bitrate (10 000 kbps: max 967 kB; 25 700: dead on the second IDR every time), and nothing
-we tried stops it: `cpb-size` is *discarded* for AV1 (GStreamer resets a value below `max_bitrate / 2` to 2 s of bitrate; 53 % made no
-difference), `min-qp` 60/120, `mbbrc` and `rate-control=cbr` made no difference either (single runs). There the branch is rebuilt every GOP,
-four times, and then the share falls back to the old capture restart. The user's own 60 fps keyframes were 130-700 kB, so their content is
-less extreme than the rig's. If it shows up for real the options are H.265/H.264 for that destination (their buffers are not
-level-limited) or a smaller picture. *Not tried:* lying about the frame rate in the caps to get the bigger level-4.1 buffer at 120 fps
-(the rate control would mis-size every frame).
+**Not fixed by this change, said plainly (2026-11-04, #137): superseded by the section above (task #139).** At **1080p 60 fps Quality
+(1000 ms GOP)** on this rig's static detailed desktop the encoder filled the whole 972 kB buffer with the second keyframe at any bitrate
+and nothing tried then stopped it (`cpb-size` discarded for AV1, `mbbrc`, `rate-control=cbr`, single runs). #139 found what does work
+(`palette-mode`, a `min-qp` floor, and the codec fallback), and that two statements made here were wrong: `min-qp` *does* shrink AV1
+keyframes (70 / 90 / 110 gave 414 / 305 / 162 kB instead of 935 kB; why the earlier "60/120, no difference" runs saw nothing is
+unknown, most likely the property did not reach the encoder), and H.265's buffer is level-limited too (it is **not** a safe way out).
 
 **The multiplier climb and the viewer's lost keyframes (a second problem, separate cause).** `PacePolicy` grows the keyframe pacing
 factor x1.5 per clean keyframe (>= 100 datagrams) up to its `MAX` and halves it on a retransmit burst; `MAX` was 12. On the user's

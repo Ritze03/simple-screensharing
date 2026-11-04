@@ -495,8 +495,18 @@ impl EncoderBackend {
                     VideoCodec::H264 | VideoCodec::H265 => " b-frames=0",
                     VideoCodec::Av1 => "",
                 };
+                // `palette-mode=true` for AV1 on Mesa AMD (task #139): a keyframe of flat-colour screen content (a code
+                // editor, a terminal, a UI) comes out several times smaller, which matters because `vaav1enc`'s coded
+                // buffer is only 486-972 kB (see [`av1_coded_buffer_bytes`]). Rig, 1080p 60 fps Quality 25.7 Mbit/s, a
+                // 7-gray detailed desktop: keyframes 1130 kB (dead branch every GOP) -> 129 kB, deltas 17-40 -> 4-5 kB.
+                // Photographic content: identical sizes and encode times with and without it (935 kB both). Only on
+                // the driver it was measured on; the property is a sequence-level tool flag other drivers may not take.
+                let palette = if codec == VideoCodec::Av1 && va_driver_is_mesa_amd() { " palette-mode=true" } else { "" };
+                let floor = AV1_QP_FLOOR.load(Ordering::Relaxed);
+                let palette = if codec == VideoCodec::Av1 && floor > 0 { format!("{palette} min-qp={floor}") } else { palette.to_string() };
+                let dbg_extra = std::env::var("SSS_VAENC_EXTRA").map(|e| format!(" {}", e.replace(',', " "))).unwrap_or_default(); // debug only: SSS_VAENC_EXTRA="min-qp=90,mbbrc=1" appends encoder properties (commas become spaces; a CLIENT_ENV_n value cannot hold spaces)
                 format!(
-                    "{element} rate-control=vbr bitrate={bitrate_kbps} key-int-max={gop_frames} target-usage={target_usage}{b_frames_flag}{quality_extra}"
+                    "{element} rate-control=vbr bitrate={bitrate_kbps} key-int-max={gop_frames} target-usage={target_usage}{b_frames_flag}{quality_extra}{palette}{dbg_extra}"
                 )
             }
         }
@@ -2746,6 +2756,7 @@ async fn start_sharing_with_source(
     capture_source: CaptureSource,
     encode: EncodeChoice,
 ) -> Result<CaptureHandle> {
+    AV1_QP_FLOOR.store(0, Ordering::Relaxed);
     let mut handle = start_capture_with_source(framerate, capture_source).await?;
 
     let source = handle.source_caps();
@@ -3856,6 +3867,8 @@ struct IdrControl {
     av1: bool,
     /// An AV1 rate-control restart was written and no keyframe has come out since.
     av1_reset_pending: bool,
+    /// Size in bytes of the keyframe that made the pump restart the AV1 rate control (0: none or a bitrate write).
+    av1_reset_trigger: usize,
     /// Restarting the AV1 rate control overflowed (or came within 10 % of) the coded buffer: never again for
     /// this destination (it is a property of the preset's rate control, not of one branch).
     av1_reset_off: bool,
@@ -3873,6 +3886,21 @@ impl IdrControl {
             self.av1_reset_off = true;
             tracing::warn!("the AV1 branch died right after a rate-control restart; not restarting it again");
         }
+    }
+
+    /// The destination's encoder settings changed live (a swap to new parameters, or a `bitrate` write): what was
+    /// learned about the old ones does not hold (task #139).
+    ///
+    /// `Why:` `av1_reset_off` was learned at one frame rate / keyframe interval / quality (60 fps Quality's 972 kB
+    /// buffer is full after one post-restart IDR, 120 fps Gaming's 648 kB buffer has room for it), and it used to
+    /// outlive a settings change: after Quality -> Gaming the pump never restarted the rate control again and the
+    /// branch died on the first oversized keyframe. A pending restart belongs to the old branch too: its keyframe
+    /// would be measured against the wrong buffer. Relearning costs at most one branch rebuild.
+    fn params_changed(&mut self) {
+        self.av1_reset_off = false;
+        self.av1_reset_pending = false;
+        self.av1_reset_trigger = 0;
+        self.av1_reset_after = None;
     }
 
     fn big(&self) -> bool {
@@ -3912,14 +3940,19 @@ impl IdrControl {
     /// The value alternates between `kbps - 1` and `kbps`, because a write of the same value may be a no-op.
     fn on_keyframe(&mut self, branch: &branch::EncodeBranch, kbps: u32, bytes: usize, coded_limit: Option<usize>, now: Instant) {
         self.av1 = coded_limit.is_some();
+        // Why "no smaller than 80 % of the one that triggered it" also turns it off (task #139): with the keyframes
+        // pinned near the limit by something else (a min-qp floor, rig: 758 kB of 972 kB at every keyframe) the
+        // restart never gets them under 75 % and ran every 2 s forever, an extra ~760 kB IDR each time.
+        let trigger = std::mem::take(&mut self.av1_reset_trigger);
         if std::mem::take(&mut self.av1_reset_pending)
             && let Some(limit) = coded_limit
-            && bytes * 100 >= limit * 90
+            && (bytes * 100 >= limit * 90 || (trigger > 0 && bytes * 100 >= trigger * 80))
         {
             self.av1_reset_off = true;
             tracing::warn!(
-                "the AV1 keyframe after a rate-control restart was {} kB of a {} kB coded buffer; not restarting it again",
+                "the AV1 keyframe after a rate-control restart was {} kB (it was {} kB) of a {} kB coded buffer; not restarting it again",
                 bytes / 1000,
+                trigger / 1000,
                 limit / 1000
             );
         }
@@ -3940,6 +3973,7 @@ impl IdrControl {
             );
             branch.set_bitrate_kbps(target);
             self.av1_reset_pending = true;
+            self.av1_reset_trigger = bytes;
         }
         if self.squeezed {
             branch.set_bitrate_kbps(kbps);
@@ -4369,12 +4403,46 @@ async fn destination_pump(
                         continue;
                     }
                     branch_failures.push_back(now);
-                    tracing::warn!(
-                        "stream {stream_id}: the encode branch failed ({reason}); rebuilding just this branch, the capture source is fine (failure {} of {MAX_BRANCH_FAILURES} allowed in {}s)",
-                        branch_failures.len(),
-                        BRANCH_FAILURE_WINDOW.as_secs()
-                    );
-                    let params = runtime.lock().unwrap().params();
+                    let mut params = runtime.lock().unwrap().params();
+                    // A VA encoder that keeps dying (task #139): its coded buffer is too small for what the
+                    // rate control wants to code (`vaav1enc` 486-972 kB, `vah265enc` 1.05-1.6 MB at 1080p, both
+                    // falling with the frame rate), and a rebuilt branch dies at its next big keyframe. Keep the
+                    // share alive on another codec instead of cycling until the capture is declared lost.
+                    let va_branch = branch.as_ref().is_some_and(|b| b.backend() == EncoderBackend::Vaapi);
+                    let av1_branch = va_branch && params.codec == VideoCodec::Av1;
+                    if av1_branch && AV1_QP_FLOOR.load(Ordering::Relaxed) == 0 && branch_failures.len() >= AV1_FLOOR_FAILURES {
+                        // The smallest change that keeps AV1: a quality floor (`min-qp`) caps what the rate control
+                        // may spend on a keyframe. Measured at 1080p 60 fps, 25.7 Mbit/s, photographic detail:
+                        // keyframes 935 kB -> 414 kB (min-qp 70), 305 (90), 162 (110).
+                        AV1_QP_FLOOR.store(AV1_QP_FLOOR_VALUE, Ordering::Relaxed);
+                        tracing::warn!(
+                            "stream {stream_id}: the AV1 encode branch failed {} times in {}s (last: {reason}); rebuilding it with a quality floor (min-qp={AV1_QP_FLOOR_VALUE}) so its keyframes fit the encoder's {} kB coded buffer",
+                            branch_failures.len(),
+                            BRANCH_FAILURE_WINDOW.as_secs(),
+                            av1_coded_buffer_bytes(params.width, params.height, params.framerate) / 1000
+                        );
+                        branch_failures.clear();
+                    } else if va_branch
+                        && branch_failures.len() >= CODEC_FALLBACK_FAILURES
+                        && let Some(codec) = fallback_codec(params.codec, supported_codecs(EncoderBackend::Vaapi))
+                    {
+                        tracing::warn!(
+                            "stream {stream_id}: the {:?} encode branch failed {} times in {}s (last: {reason}); \
+                             moving this destination to {codec:?} for the rest of the share (change its settings to try {:?} again)",
+                            params.codec,
+                            branch_failures.len(),
+                            BRANCH_FAILURE_WINDOW.as_secs(),
+                            params.codec
+                        );
+                        params.codec = codec;
+                        branch_failures.clear();
+                    } else {
+                        tracing::warn!(
+                            "stream {stream_id}: the encode branch failed ({reason}); rebuilding just this branch, the capture source is fine (failure {} of {MAX_BRANCH_FAILURES} allowed in {}s)",
+                            branch_failures.len(),
+                            BRANCH_FAILURE_WINDOW.as_secs()
+                        );
+                    }
                     let old = branch.take().expect("guarded by branch.is_some()");
                     let id = branch::BranchId(next_branch_id);
                     next_branch_id = next_branch_id.wrapping_add(1);
@@ -4510,6 +4578,10 @@ async fn destination_pump(
                             // and twice more later in case that one is lost
                             // on the way (#97).
                             idr.squeezed = false;
+                            if !swap.recovery {
+                                // A settings change: new fps / keyframe interval / quality / codec (task #139).
+                                idr.params_changed();
+                            }
                             idr.force(&new_branch, &runtime);
                             keyframe_repeats = destination::keyframe_repeat_schedule(Instant::now()).into_iter().collect();
                             last_keyframe_burst = Some(Instant::now());
@@ -4623,6 +4695,10 @@ async fn destination_pump(
                     branch.set_bitrate_kbps(bitrate_kbps);
                     idr.squeezed = false;
                     runtime.lock().unwrap().set_bitrate(bitrate_kbps);
+                    // A write restarts the VA rate control and `vaav1enc` codes an IDR at once, sized for the new
+                    // bitrate: measure it like the pump's own restarts (task #139).
+                    idr.params_changed();
+                    idr.av1_reset_pending = idr.av1;
                 }
             }
             DestCmd::ApplyParams { params, reply } => {
@@ -4702,6 +4778,38 @@ async fn destination_pump(
 /// More encode-branch failures than this within [`BRANCH_FAILURE_WINDOW`] and the pump stops rebuilding
 /// (task #137): a rebuilt encoder that dies at once is not helped by another one.
 const MAX_BRANCH_FAILURES: usize = 4;
+/// The AV1 branch of a destination failing this many times within [`BRANCH_FAILURE_WINDOW`] moves it to another
+/// codec ([`fallback_codec`]) instead of rebuilding AV1 once more (task #139). Below [`MAX_BRANCH_FAILURES`], so
+/// the fallback comes first.
+const CODEC_FALLBACK_FAILURES: usize = 3;
+/// The AV1 branch of a destination failing this many times within [`BRANCH_FAILURE_WINDOW`] gets a quality floor
+/// ([`AV1_QP_FLOOR`]) before anything else changes. One: a rebuilt branch without it dies at its next big keyframe
+/// (rig: 2-4 s later), and every death is a ~1 s freeze; with the floor kept for the whole share (also across settings
+/// changes) the 150 s settings cycle went from 12 deaths (floor forgotten at each change, two deaths to relearn it) to one.
+const AV1_FLOOR_FAILURES: usize = 1;
+/// `min-qp` of the floor. Why 70: at 1080p 60 fps photographic detail it takes the keyframes from 935 kB to 414 kB (the
+/// 972 kB buffer's limit was the problem), and AV1's quantizer index 70 is still a high-quality picture; 90 and 110 give 305
+/// and 162 kB but start to cost visible sharpness on a still screen.
+const AV1_QP_FLOOR_VALUE: u32 = 70;
+/// `min-qp` the next VA AV1 branch is built with (0: none). Process-wide on purpose: the keyframes are big because of what
+/// is on the shared screen, not because of one destination, and plumbing a per-destination field through every
+/// `VideoParams` literal buys nothing. Set by the pump's failure arm, cleared by a new share (kept across settings changes: the content, not the setting, makes the keyframes big).
+static AV1_QP_FLOOR: AtomicU32 = AtomicU32::new(0);
+
+/// The codec a destination whose VA encoder keeps dying moves to: AV1 -> H.265 when this machine can encode it, else
+/// H.264; H.265 -> H.264; H.264 has nowhere to go.
+///
+/// `Why H.265 is not the safe end:` its coded buffer is level-limited too (`Calculate codedbuf size` 1 053 240 B at
+/// 1080p 120 fps, 1 575 480 B at 60 fps, rig; the keyframes of 1080p 120 fps Quality reached 760 kB-1 MB and the
+/// branch died every 2 s, 29 deaths and 5 capture restarts in 50 s). `vah264enc` never failed in any rig run.
+fn fallback_codec(from: VideoCodec, supported: &[VideoCodec]) -> Option<VideoCodec> {
+    let ladder: &[VideoCodec] = match from {
+        VideoCodec::Av1 => &[VideoCodec::H265, VideoCodec::H264],
+        VideoCodec::H265 => &[VideoCodec::H264],
+        VideoCodec::H264 => &[],
+    };
+    ladder.iter().copied().find(|c| supported.contains(c))
+}
 const BRANCH_FAILURE_WINDOW: Duration = Duration::from_secs(30);
 
 /// How long [`destination_pump`]'s `Stop` waits for the relay to accept the
@@ -10701,6 +10809,25 @@ mod tests {
         assert_eq!(av1_coded_buffer_bytes(1920, 1080, 15), 972_000);
         // A bigger picture picks a higher level: 4K 60 fps is level 5.1.
         assert_eq!(av1_coded_buffer_bytes(3840, 2160, 60), 3840 * 2160 * 15 / 8 / 8);
+    }
+
+    /// Task #139: a destination whose AV1 encoder keeps dying moves to H.265, else H.264, and never to a codec this
+    /// machine cannot encode; a live settings change forgets what the pump learned about the old AV1 settings.
+    #[test]
+    fn encoder_deaths_fall_back_av1_to_h265_to_h264_and_a_settings_change_forgets_what_was_learned() {
+        let all = [VideoCodec::H264, VideoCodec::H265, VideoCodec::Av1];
+        assert_eq!(fallback_codec(VideoCodec::Av1, &all), Some(VideoCodec::H265));
+        assert_eq!(fallback_codec(VideoCodec::Av1, &[VideoCodec::H264, VideoCodec::Av1]), Some(VideoCodec::H264));
+        assert_eq!(fallback_codec(VideoCodec::Av1, &[VideoCodec::Av1]), None);
+        assert_eq!(fallback_codec(VideoCodec::H265, &all), Some(VideoCodec::H264), "H.265 is level-limited too");
+        assert_eq!(fallback_codec(VideoCodec::H264, &all), None);
+        assert!(CODEC_FALLBACK_FAILURES < MAX_BRANCH_FAILURES, "the fallback must come before the capture is declared lost");
+        assert!(AV1_FLOOR_FAILURES < CODEC_FALLBACK_FAILURES, "the quality floor is tried before the codec changes");
+
+        let mut idr = IdrControl { av1: true, av1_reset_off: true, av1_reset_pending: true, av1_reset_after: Some(Instant::now()), ..Default::default() };
+        idr.params_changed();
+        assert!(!idr.av1_reset_off && !idr.av1_reset_pending && idr.av1_reset_after.is_none());
+        assert!(idr.av1, "the branch is still AV1");
     }
 
     /// Task #137: an encoder error in a tee branch must stay in the branch. `identity error-after` stands in for

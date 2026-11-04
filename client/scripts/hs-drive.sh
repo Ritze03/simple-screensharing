@@ -21,6 +21,11 @@
 #                             FPS one of 15 30 60 90 120 144 165 240; CODEC h264|av1|h265;
 #                             PRESET text|quality|gaming. KBPS needs keyboard input
 #                             (wtype) and is the least reliable part; prefer START_KBPS at `up`.
+#   live [fps=N] [preset=P] [quality=performance|quality] [gop=MS] [kbps=K] [codec=C]
+#                             change settings of a LIVE share through the real modal: opens it (the share button), applies the
+#                             named values in that order, reads each back, closes it with Done. Several in one call are
+#                             several edits a few hundred ms apart, like a user clicking through. Run `hs-drive.sh share`
+#                             -> `setup` -> `golive` first. Prints one `live: ...` line with the values now set.
 #   golive                    sharer: "Go live in <room>" (waits until enabled; exit 1 unless
 #                             the modal closes)
 #   discard                   sharer: click "Discard" (leftmost footer button of the staged modal): drops
@@ -180,6 +185,46 @@ case "$STEP" in
       dump_wait bitrate "$kbps" 3 || die "setup: bitrate is $(dump_get bitrate), wanted $kbps (wtype: keyboard capability/keymap issue? use START_KBPS at rig up)"
     fi
     log "setup: $(dump_get fps) fps, $(dump_get codec), $(dump_get preset), $(dump_get bitrate) kbps"
+    ;;
+  live)
+    uclick "${SHARER:-1}" ctl.share; modal_open; sleep 0.3
+    [[ "$(dump_get mode)" == live ]] || die "live: the modal is not the live one (mode $(dump_get mode)); go live first"
+    for kv in "$@"; do
+      k="${kv%%=*}"; v="${kv#*=}"
+      case "$k" in
+        fps)
+          if [[ "$(dump_get fps)" != "$v" ]]; then
+            i="$(index_of "$v" $(dump_get fps_options))"; [[ -n "$i" ]] || die "live: fps $v not in $(dump_get fps_options)"
+            mclick fps; sleep 0.6; mclick "opt.$i"; dump_wait fps "$v" 3 || die "live: fps is $(dump_get fps), wanted $v"
+          fi ;;
+        gop)
+          if [[ "$(dump_get gop)" != "$v" ]]; then
+            i="$(index_of "$v" $(dump_get gop_options))"; [[ -n "$i" ]] || die "live: keyframe $v not in $(dump_get gop_options)"
+            mclick gop; sleep 0.6; mclick "opt.$i"; dump_wait gop "$v" 3 || die "live: gop is $(dump_get gop), wanted $v"
+          fi ;;
+        preset)
+          i="$(index_of "$v" $(dump_get preset_order))"; [[ -n "$i" ]] || die "live: preset $v? ($(dump_get preset_order))"
+          mclick "preset.$i"; dump_wait preset "$v" 3 || die "live: preset is $(dump_get preset), wanted $v" ;;
+        quality)
+          case "$v" in performance) i=0; want=Performance;; quality) i=1; want=Quality;; *) die "live: quality $v? (performance|quality)";; esac
+          mclick "quality.$i"; dump_wait quality "$want" 3 || die "live: quality is $(dump_get quality), wanted $want" ;;
+        kbps)
+          if [[ "$(dump_get bitrate)" != "$v" ]]; then
+            mclick bitrate -36; sleep 0.2
+            swaymsg "[pid=$(hs_pid_of "client${SHARER:-1}")] focus" >/dev/null
+            hs_type -M ctrl a -m ctrl "$v" -k Return
+            dump_wait bitrate "$v" 3 || die "live: bitrate is $(dump_get bitrate), wanted $v"
+          fi ;;
+        codec)
+          i="$(index_of "$v" $(dump_get codec_order))"; [[ -n "$i" ]] || die "live: codec $v?"
+          mclick "codec.$i"; dump_wait codec "$v" 3 || die "live: codec is $(dump_get codec), wanted $v" ;;
+        *) die "live: unknown setting '$k'" ;;
+      esac
+      sleep 0.3
+    done
+    log "live: $(dump_get fps) fps, $(dump_get codec), preset $(dump_get preset), $(dump_get quality), keyframe $(dump_get gop) ms, $(dump_get bitrate) kbps"
+    mclick footer -48
+    dump_wait open 0 5 || die "live: the modal did not close"
     ;;
   golive)
     modal_open
