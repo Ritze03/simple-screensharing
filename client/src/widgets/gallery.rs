@@ -523,7 +523,7 @@ impl Gallery {
                 avatar_emoji(ui, e, &n[..1], theme::AVATAR_SM, theme::avatar_colors(n), false);
             }
             vsep(ui);
-            for (e, n) in [("🦊", "Fox"), ("💀", "Skull"), ("🐙", "Octo"), ("🦖", "Rex"), ("", "None")] {
+            for (e, n) in [("🦊", "Fox"), ("💀", "Skull"), ("🐙", "Octo"), ("🦖", "Rex"), ("🇩🇪", "Flag"), ("👍🏽", "Tone"), ("🧑‍💻", "Dev"), ("1️⃣", "Key"), ("\u{1fade}", "New"), ("", "None")] {
                 avatar_emoji(ui, e, &n[..1], theme::AVATAR, theme::avatar_colors(n), e == "🐙");
             }
             vsep(ui);
@@ -532,14 +532,22 @@ impl Gallery {
                 avatar_emoji(ui, e, &n[..1], 96.0, theme::avatar_colors(n), false);
             }
         });
+        // the contact sheet of the centring rule: every picker emoji on the disc at the size of the band
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(theme::S2, theme::S2);
+            for e in EMOJI {
+                avatar_emoji(ui, e, "?", theme::AVATAR, theme::avatar_colors(e), false);
+            }
+        });
         ui.horizontal_top(|ui| {
-            let (rect, _) = ui.allocate_exact_size(vec2(320.0, 250.0), egui::Sense::hover());
+            let (rect, _) = ui.allocate_exact_size(vec2(320.0, 310.0), egui::Sense::hover());
             ui.painter().rect(rect, CornerRadius::same(10), theme::ELEV_14, egui::Stroke::new(1.0_f32, theme::BTN_BORDER), egui::StrokeKind::Inside);
             let mut menu = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(vec2(4.0, 6.0))));
-            match emoji_picker(&mut menu, &self.emoji, "Use my initial") {
-                Some(EmojiChoice::Pick(e)) => self.emoji = e.to_string(),
+            let text = PickerText { clear: "Use my initial", paste: "Paste any emoji", not_emoji: "That isn't an emoji we can draw", too_long: "That emoji is too long to send (16 bytes at most)" };
+            match emoji_picker(&mut menu, &self.emoji, &text).choice {
+                Some(EmojiChoice::Pick(e) | EmojiChoice::Typed(e)) => self.emoji = e,
                 Some(EmojiChoice::Clear) => self.emoji.clear(),
-                None => {}
+                Some(EmojiChoice::Done) | None => {}
             }
             avatar_emoji(ui, &self.emoji, "M", 56.0, theme::avatar_colors("mo"), false);
         });

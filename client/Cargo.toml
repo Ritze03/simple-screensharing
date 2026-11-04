@@ -59,6 +59,10 @@ rust-i18n = "4.2.1"
 # between rebuilds; these collections are rendered as ordered lists in the UI
 # and must iterate in the order the user created their entries.
 indexmap = "2"
+# Colour emoji avatars (`widgets/emoji.rs`): GSUB shaping of the embedded Noto Color Emoji font (flags, skin tones, ZWJ
+# sequences and keycaps are ligatures of its `ccmp` feature), and grapheme splitting of what is pasted or received.
+rustybuzz = "0.20"
+unicode-segmentation = "1.13"
 
 # ashpd (xdg-desktop-portal bindings) is Linux/Unix-only: it shells out to
 # `std::os::unix` internals that simply don't exist on Windows, and portal

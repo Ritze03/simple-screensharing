@@ -252,21 +252,36 @@ on (a new share starts from a room, so no room picker). Several streams of one p
 **Emoji avatars** (#136, built in #106 / I6, 2026-11-04): a person can pick an emoji (Settings > Profile) that replaces the initial on a
 background taken from the emoji; `avatar()` is the one helper (native: `ui::paint_person` -> `widgets::paint_avatar_emoji`, browser `dom.js` `avatarEl`).
 The relay carries the emoji (`protocol-spec.md` §9.2); a peer or relay without it shows the initial.
-Rendering rules, native and browser alike:
-- **Size and centring:** the emoji is drawn at **0.62 x the avatar's size** (`EMOJI_AVATAR_FRACTION`, the replica's `font-size: .62 x --av`) and **centred by
-  its visible pixels** (the crop), not by the font box, which is off-centre for some emoji (the fox).
-- **Outline:** a **1 px black outline** that follows the emoji's shape, to lift it off the background: native paints the picture four times, shifted by one pixel left,
-  right, up and down, in black, then once in white (`paint_avatar_emoji`); the browser stacks four `drop-shadow(1px 0 0 #000)` filters (`.avatar .emo`).
+Rendering rules (rewritten 2026-11-04, row 120, after the user tested the real client; native unless the browser is named):
+- **Size:** **0.62 x the avatar's size** (`EMOJI_AVATAR_FRACTION`, the replica's `font-size: .62 x --av`), in both clients.
+- **Centring:** native puts the emoji's **balance point** on the disc's centre: the midpoint of the solid pixels' (alpha >= 128) mass centre and the centre of their smallest
+  enclosing circle (`emoji.rs` `balance_point`). *Why:* centring the crop box is what the first version did, and a box's centre is only the middle of the shape's extremes: the
+  pizza slice ("doesnt seem to work for all icons") has its weight on the right and nothing in its lower left, so it sat visibly off with a perfectly centred box. The mass
+  centre alone overshoots (🌙, 🎸); the enclosing circle alone follows thin parts (🎮 rises 2 px). The midpoint looked right on all 40 at 32 px. The crop itself (alpha >= 16)
+  only trims the texture. The **browser still centres its bounding box** (`dom.js` `emojiInfo`), so it keeps the old pizza.
+- **Outline:** a **1 px black outline** (2 device px at `pixels_per_point` 2) that follows the emoji's shape, to lift it off the background. Native dilates the scaled alpha with a
+  round kernel and composites it behind the emoji **in the same texture** (`emoji.rs` `bake`), one quad; the browser stacks four `drop-shadow(1px 0 0 #000)` filters
+  (`.avatar .emo`), which make the same 3 x 3 dilation. *Why baked, per drawn size:* the first version drew one half-size texture five times; sampled down about 3 to 1 without
+  mipmaps it gave a broken stair-step line and a grainy picture. The picker's grid has no outline, like the replica.
 - **Background:** the emoji's strongest hue as the usual two-stop gradient; a **colourless** emoji (the skull) gets the neutral **slate**
   `hsl(222, 14 %, 36 %)` to `hsl(222, 14 %, 24 %)`.
-- **Source of the pictures:** native embeds the 40 picker emoji as bundled Noto Color Emoji bitmaps (`client/assets/emoji/`, OFL 1.1; egui cannot draw colour
-  emoji and the AppImage / Flatpak / Windows builds cannot rely on a system emoji font), so an emoji outside the 40 shows as the initial; the browser draws
-  the system's emoji font.
+- **Source of the pictures:** native embeds **Noto Color Emoji** itself (`client/assets/emoji/`, CBDT bitmaps, OFL 1.1; egui cannot draw colour emoji and the AppImage / Flatpak /
+  Windows builds cannot rely on a system emoji font), so any emoji the font has draws, a flag, a skin tone, a ZWJ sequence or a keycap included (rustybuzz shapes them, they are
+  GSUB ligatures). The browser draws the system's emoji font.
+- **What shows the initial:** the string comes from a peer, so anything that is not **one grapheme shaped to one bitmap, non-ASCII, at most 16 bytes** (`is_drawable`,
+  `emoji_glyph`): text, two emoji, a digit (the font has plain digit bitmaps for its keycaps), an emoji newer than the font, a ZWJ sequence with no ligature.
+- **Cost and bounds:** shaped, decoded and measured once per emoji, baked once per drawn size; the cache in `ctx.data` holds **128 emoji** (least recently drawn goes; negative
+  results count) with **8 sizes** each, so a peer cycling through strings cannot grow it. Nothing runs per frame and nothing at start-up (the font is parsed on first use).
 - **The avatar popover** (Settings > Profile > Avatar, `modals.rs` `avatar_row`): the app's menu frame (`menu::frame()`), **about 280 px wide** (8 cells of 32 px
   + 7 gaps of 2 px + the frame's 12 px = 282), opening under the avatar button. A **44 px header** (`HBox`, slots `[fixed(32), FILL]`) holds a **32 px avatar**
-  and a **two-line title** ("Your avatar" / "Friends see it instead of your initial"), then the 8 x 5 grid, then "Use my initial". **"Paste any emoji" is
-  deliberately browser-only** (the replica's field is kept in the browser's picker, `menus.js` `emojiMenu`, which takes the last grapheme the user pastes): native can
-  only draw the 40 bundled pictures, so a free-text field would accept emoji it cannot show.
+  and a **two-line title** ("Your avatar" / "Friends see it instead of your initial"), then the 8 x 5 grid, the **"Paste any emoji" field** with the replica's `.emoji-hint` line
+  under it, then "Use my initial". A grid item closes the popover. The field works like the browser's `emojiMenu`: on every change it takes the **last drawable grapheme** and applies
+  it, Enter closes; text without one warns "That isn't an emoji we can draw", an emoji over the wire's 16 bytes (a family) warns "too long to send" and is not applied.
+  *Why the native field empties once it took an emoji* (the replica keeps it selected): the field is egui text, which has no colour emoji and shows a flag or a ZWJ sequence as loose
+  symbols; the header's avatar is the feedback.
+- **The hover ring** of the avatar button (1.5 px, 2 px off the disc, accent while the popover is open) is painted from the row's parent `ui`, after the row. *Why:* an `HBox` cell clips to
+  its own rect, which is as tall as the disc and starts at its left edge, so the ring painted inside it lost its top, bottom and left (the user's "Avatar outline borked"). Anything that
+  overhangs a cell belongs outside the cell.
 
 **Fullscreen chrome** (#136, native `stage/chrome.rs`; the older per-stream twin is `popout.rs` `OVERLAY_IDLE`): in fullscreen the strip and bar lie over the stage, so
 the streams do not jump. *Why (user request):* they should be out of the way: shown only while the pointer is over the

@@ -1176,22 +1176,25 @@ mod tests {
 const EMOJI_POP_W: f32 = 8.0 * 32.0 + 7.0 * 2.0 + 12.0;
 
 /// Settings > Profile "Avatar" row: my avatar as a button that opens the emoji picker as a popover in the
-/// app's menu style (header with the avatar, "Your avatar" and its hint, the grid, then "Use my initial").
-/// A choice becomes [`UiAction::SetEmoji`] and closes the popover. The replica's "Paste any emoji" field is
-/// not built: only the bundled emoji can be drawn (`widgets/emoji.rs`).
+/// app's menu style (header with the avatar, "Your avatar" and its hint, the grid, the "Paste any emoji" field,
+/// then "Use my initial"). A choice becomes [`UiAction::SetEmoji`]; a grid item closes the popover, an emoji
+/// from the field stays in it until Enter (`widgets/emoji.rs`).
+///
+/// `Why` the hover ring is painted out here, after the row: the row's cell clips to its own rect, which is as
+/// tall as the disc and starts at its left edge, so a ring painted inside it lost its top, bottom and left
+/// (the user's "Avatar outline borked", row 120).
 fn avatar_row(ui: &mut Ui, cx: &mut Cx) {
     let emoji = cx.state.emoji.clone();
     let name = cx.state.display_name.clone();
     let mut choice = None;
-    widgets::ctrl_row(ui, &tr("ui.settings.avatar", "Avatar"), None, |ui| {
+    let (disc, ring) = widgets::ctrl_row(ui, &tr("ui.settings.avatar", "Avatar"), None, |ui| {
         let (rect, _) = ui.allocate_exact_size(vec2(theme::AVATAR, theme::AVATAR), Sense::hover());
         let resp = ui.interact(rect, ui.make_persistent_id("avatar_btn"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
         let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp));
-        if open || resp.hovered() {
-            ui.painter().circle_stroke(rect.center(), theme::AVATAR / 2.0 + 2.0, Stroke::new(1.5_f32, if open { theme::ACCENT } else { theme::BTN_BORDER }));
-        }
+        let ring = (open || resp.hovered()).then_some(if open { theme::ACCENT } else { theme::BTN_BORDER });
+        drive_dump::rect(|| "avatar.btn".into(), rect);
         super::paint_person(ui, rect, &name, &emoji, false);
-        egui::Popup::from_toggle_button_response(&resp)
+        let popup = egui::Popup::from_toggle_button_response(&resp)
             .kind(egui::PopupKind::Menu)
             .layout(egui::Layout::top_down_justified(egui::Align::Min))
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
@@ -1209,15 +1212,31 @@ fn avatar_row(ui: &mut Ui, cx: &mut Cx) {
                 widgets::paint_text(ui, Rect::from_x_y_ranges(c.x_range(), top..=top + 16.0), &tr("ui.settings.avatar_title", "Your avatar"), font(Weight::Bold, theme::FS_ROW), theme::TEXT, Align::Min);
                 widgets::paint_text(ui, Rect::from_x_y_ranges(c.x_range(), top + 16.0..=top + 30.0), &tr("ui.settings.avatar_hint", "Friends see it instead of your initial"), font(Weight::Regular, theme::FS_TINY), theme::TEXT_DIM, Align::Min);
                 ui.add_space(theme::S1);
-                choice = widgets::emoji_picker(ui, &emoji, &tr("ui.settings.avatar_clear", "Use my initial"));
-                if choice.is_some() {
+                let text = widgets::PickerText {
+                    clear: &tr("ui.settings.avatar_clear", "Use my initial"),
+                    paste: &tr("ui.settings.avatar_paste", "Paste any emoji"),
+                    not_emoji: &tr("ui.settings.avatar_not_emoji", "That isn't an emoji we can draw"),
+                    too_long: &tr("ui.settings.avatar_too_long", "That emoji is too long to send (16 bytes at most)"),
+                };
+                let picked = widgets::emoji_picker(ui, &emoji, &text);
+                drive_dump::rect(|| "avatar.field".into(), picked.field);
+                choice = picked.choice;
+                if !matches!(choice, None | Some(widgets::EmojiChoice::Typed(_))) {
                     ui.close();
                 }
             });
+        if popup.is_none() {
+            widgets::emoji_picker_closed(ui.ctx());
+        }
+        (rect, ring)
     });
+    if let Some(color) = ring {
+        let center = egui::emath::GuiRounding::round_to_pixels(disc, ui.ctx().pixels_per_point()).center();
+        ui.painter().circle_stroke(center, theme::AVATAR / 2.0 + 2.0, Stroke::new(1.5_f32, color));
+    }
     match choice {
-        Some(widgets::EmojiChoice::Pick(e)) => cx.act(UiAction::SetEmoji(e.to_string())),
+        Some(widgets::EmojiChoice::Pick(e) | widgets::EmojiChoice::Typed(e)) => cx.act(UiAction::SetEmoji(e)),
         Some(widgets::EmojiChoice::Clear) => cx.act(UiAction::SetEmoji(String::new())),
-        None => {}
+        Some(widgets::EmojiChoice::Done) | None => {}
     }
 }

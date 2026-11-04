@@ -462,34 +462,28 @@ pub fn paint_avatar(ui: &Ui, rect: Rect, initial: &str, colors: [Color32; 2], pr
     paint_avatar_emoji(ui, rect, "", initial, colors, presence);
 }
 
-/// [`avatar`] with an emoji: `emoji` ("" = none) is drawn instead of the initial when it is one of
-/// [`super::EMOJI`], on a gradient taken from the emoji's own colour (`colors`, the name's, is used
-/// for an initial). An emoji this client has no picture of shows the initial, like no emoji.
+/// [`avatar`] with an emoji: `emoji` ("" = none) is drawn instead of the initial, on a gradient taken
+/// from the emoji's own colour (`colors`, the name's, is used for an initial). A string with no
+/// picture ([`super::is_drawable`]) shows the initial, like no emoji.
 pub fn avatar_emoji(ui: &mut Ui, emoji: &str, initial: &str, size: f32, colors: [Color32; 2], presence: bool) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
     paint_avatar_emoji(ui, rect, emoji, initial, colors, presence);
     resp
 }
 
-/// [`paint_avatar`] with an emoji, see [`avatar_emoji`]. The emoji is the crop of its visible
-/// pixels centred on the disc, at `0.62 x` the avatar size like the replica's `.avatar .emo`, with
-/// the replica's 1 px black outline (the picture again in black, shifted 1 px up, down, left and
-/// right, behind it) that follows its shape.
+/// [`paint_avatar`] with an emoji, see [`avatar_emoji`]. The emoji sits with its balance point on the
+/// disc's centre, at `0.62 x` the avatar size like the replica's `.avatar .emo`, with the replica's
+/// 1 px black outline that follows its shape, baked into its texture at this size (`widgets/emoji.rs`).
 pub fn paint_avatar_emoji(ui: &Ui, rect: Rect, emoji: &str, initial: &str, colors: [Color32; 2], presence: bool) {
     let p = ui.painter();
     let ppp = ui.ctx().pixels_per_point();
     // Snap the disc to whole pixels so it and the glyph share one grid.
     let rect = egui::emath::GuiRounding::round_to_pixels(rect, ppp);
-    let glyph = if emoji.is_empty() { None } else { super::emoji_glyph(ui.ctx(), emoji) };
+    let glyph = super::emoji_glyph(ui.ctx(), emoji, rect.height() * super::EMOJI_AVATAR_FRACTION, true);
     let colors = glyph.as_ref().map_or(colors, |g| g.colors);
     paint_gradient(p, rect, pill_radius(rect.height()), theme::AVATAR_GRADIENT_DEG, colors[0], colors[1]);
     if let Some(g) = glyph {
-        let img = egui::emath::GuiRounding::round_to_pixels(super::emoji_rect(rect.center(), rect.height() * super::EMOJI_AVATAR_FRACTION, g.crop), ppp);
-        let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-        for d in [vec2(-1.0, 0.0), vec2(1.0, 0.0), vec2(0.0, -1.0), vec2(0.0, 1.0)] {
-            p.image(g.tex.id(), img.translate(d), uv, Color32::BLACK);
-        }
-        p.image(g.tex.id(), img, uv, Color32::WHITE);
+        g.paint(ui, rect.center());
     } else {
         // The replica's sizes: `.avatar.sm`, `.avatar`, the strip's `.pv .avatar`, the idle tile's `.invite .avatar`.
         let fs = match rect.height() {
