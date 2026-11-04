@@ -5,6 +5,14 @@ Audio capture/encode/playback is described where it grew up: `features/stream-co
 video") and the module docs of `client/src/audio.rs` and `client/src/decode.rs`. This page covers
 **keeping the audio aligned with the picture** (task #91, 2026-11-01), the **shared audio is a name** (#105), the viewer volume (#96), the **sender-side boost** (#114, capped at 200 % and calibration-free since #119) and the **viewer-side loudness levelling** (#119); for the share sink's lifecycle (WirePlumber pauses a player when its sink goes away, a resuming stream loses its links) see the #123 block. **Why shared audio broke after a pause/resume** (the capture ran on `pipewiresrc`'s clock; the native viewer's jitter buffer guessed the frame size from PTS steps) is the #128 block, which also corrects the explanations of #117, #121, #123 and #125. **Static in silence** (the sender's dither made `opusenc` code noise at 64 kbps) is the #129 block.
 
+## 2026-11-04: planned, not built: audio-only shares and an audio exclusion list
+
+User request for the redesign's implementation step: sharing **only audio** must be possible (no screen share needed), and
+Settings gets a list of **strings the user enters for source names to exclude**. Sources that match are hidden from the audio
+source selection and filtered out of desktop audio automatically. **Why:** voice chat such as Discord or TeamSpeak must not
+end up in the share. Desktop audio (the audio button's default in the replica, `ui/STYLING-GUIDE.md` "HTML replica") therefore
+cannot be a plain monitor of the output: it has to link every app except the excluded ones.
+
 ## 2026-11-03: volume sliders apply while dragging, not on release (task #135)
 
 User request: *"make sure that when the volume slider is moved it instantly sets the volume even while moving and not
