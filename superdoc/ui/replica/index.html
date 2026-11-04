@@ -1325,6 +1325,7 @@ function gridRects(n, ars, W, H) {
   });
   return { cells, guts };
 }
+let lastGuts = [];
 function layoutArena() {
   const ar = document.getElementById("arena");
   if (!ar) return;
@@ -1336,6 +1337,7 @@ function layoutArena() {
   const ars = keys.map((k) => parseFloat(tiles.get(k).style.getPropertyValue("--ar")) || 16 / 9);
   const { cells, guts } = gridRects(keys.length, ars, W, H);
   const rects = [];
+  lastGuts = guts;
   keys.forEach((k, i) => {
     const t = tiles.get(k), c = cells[i];
     let q;
@@ -1364,7 +1366,7 @@ function layoutArena() {
     /* midway between the pictures you see, not the cells: a letterboxed picture leaves the cell edge off-centre */
     if (g.t === "v") g.x = (rects[g.a].x + rects[g.a].w + rects[g.a + 1].x - g.w) / 2;
     else g.y = (Math.max(...rects.slice(g.a, g.b).map((r) => r.y + r.h)) + Math.min(...rects.slice(g.b, g.e).map((r) => r.y)) - g.h) / 2;
-    d.className = "gut " + g.t;
+    d.className = "gut " + g.t + (drag?.kind === "gut" && drag.d.t === g.t && drag.d.i === g.i && drag.d.j === g.j ? " on" : "");
     Object.assign(d.style, { left: g.x + "px", top: g.y + "px", width: g.w + "px", height: g.h + "px" });
     d.dataset.gut = JSON.stringify(g);
     d.title = "Drag to resize, double-click to even out";
@@ -1753,11 +1755,19 @@ window.addEventListener("pointermove", (e) => {
   if (!ar) { drag = null; return; }
   const dx = (e.clientX - drag.sx) / SCALE, dy = (e.clientY - drag.sy) / SCALE, W = ar.clientWidth, H = ar.clientHeight;
   if (drag.kind === "gut") {
+    /* The bar sits midway between the pictures, which move slower than the cell edge (a picture only grows while its cell
+       limits it). So search the split that puts the bar under the pointer; where the pictures can't go further it stops. */
     const d = drag.d, arr = drag.arr.slice(), j = d.j, tot = arr[j] + arr[j + 1], MIN = 0.12;
-    arr[j] = Math.max(MIN, Math.min(tot - MIN, arr[j] + (d.t === "v" ? dx : dy) / d.avail));
-    arr[j + 1] = tot - arr[j];
-    if (d.t === "v") V().colFr[d.i] = arr; else V().rowFr = arr;
-    layoutArena();
+    const want = d.t === "v" ? d.x + d.w / 2 + dx : d.y + d.h / 2 + dy;
+    let lo = MIN, hi = tot - MIN;
+    for (let n = 0; n < 16; n++) {
+      const f = (lo + hi) / 2;
+      arr[j] = f; arr[j + 1] = tot - f;
+      if (d.t === "v") V().colFr[d.i] = arr.slice(); else V().rowFr = arr.slice();
+      layoutArena();
+      const g = lastGuts.find((x) => x.t === d.t && x.i === d.i && x.j === d.j);
+      if ((g.t === "v" ? g.x + g.w / 2 : g.y + g.h / 2) < want) lo = f; else hi = f;
+    }
     return;
   }
   if (!drag.moved && Math.hypot(dx, dy) < 4) return;
@@ -1792,7 +1802,7 @@ window.addEventListener("pointerup", () => {
   if (d.kind === "pipmove") snapPip(d.el);
   if (d.kind === "pipmove" || d.kind === "piprz") return layoutPip(d.el, d.g.tw, d.g.th, d.g.crop); /* the handle goes back to the inner corner */
   if (!ar) return;
-  if (d.kind === "gut" || V().layout === "float") { ar.classList.remove("nofx"); return; }
+  if (d.kind === "gut" || V().layout === "float") { ar.classList.remove("nofx"); layoutArena(); return; }
   if (!d.moved) return;
   /* land the dragged tile where it was dropped, then let both tiles glide to their new cells */
   d.t.style.transition = "none";
