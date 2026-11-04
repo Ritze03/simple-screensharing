@@ -327,7 +327,11 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 .statbar .nm { font-size: var(--fs-row); font-weight: 700; flex: 0 1 auto; }
 .statbar .v { font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: var(--fs-small); color: var(--ovl-num); white-space: nowrap; flex: 0 0 auto; }
 .statbar .v.fps { min-width: 6ch; text-align: right; }
-.statbar .v.kbps { min-width: 8ch; text-align: right; }
+/* the pill is as wide as its content, with room reserved so it doesn't jitter: 9999x9999, 3-digit fps, 10+ Mbps */
+.statbar { width: fit-content; }
+.statbar .v.res { min-width: 9ch; text-align: right; }
+.fs .statbar .v.fps { min-width: 10ch; }
+.statbar .v.kbps { min-width: 9ch; text-align: right; }
 .round-btn { width: var(--ovl-h); height: var(--ovl-h); border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; background: var(--ovl-round); border: 1px solid var(--ovl-round-ring); color: var(--text); cursor: pointer; padding: 0; box-sizing: border-box; flex: 0 0 auto; }
 .round-btn .ms { font-size: 16px; }
 .round-btn:hover { background: var(--ovl-round-hover); }
@@ -868,7 +872,7 @@ function renderHead(r) {
 
 function statbar(s, name, cross, fsMode) {
   return `<div class="hb g2 statbar"><span class="dot"></span><span class="txt nm">${esc(cross ? `${name} · ${cross}` : name)}</span>
-    <span class="v">${s.w}x${s.h}</span><span class="v fps">${fsMode ? `${s.fps}/${s.fps}fps` : `${s.fps}fps`}</span><span class="v kbps">${fmtKbps(s.kbps)}</span></div>`;
+    <span class="v res">${s.w}x${s.h}</span><span class="v fps">${fsMode ? `${s.fps}/${s.fps}fps` : `${s.fps}fps`}</span><span class="v kbps">${fmtKbps(s.kbps)}</span></div>`;
 }
 function audioPill() {
   const pct = `--pct:${(S.vol / 500) * 100}%`;
