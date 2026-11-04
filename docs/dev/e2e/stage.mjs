@@ -36,7 +36,13 @@ const sleep = L.sleep;
 const section = (s) => console.log(`\n== ${s}`);
 
 const site = await L.serveSite(0);
-const open = (name, url = site.url) => L.openApp(url, { name });
+// A fake camera for getUserMedia (Chromium's own moving test picture; `getDisplayMedia` is stubbed by the harness, never real, and no audio is requested
+// anywhere: the camera is always `audio: false`), and the camera permission granted through CDP instead of the fake-UI flag.
+const open = async (name, url = site.url) => {
+  const b = await L.openApp(url, { name, flags: ["--use-fake-device-for-media-stream"] });
+  await b.conn.send("Browser.grantPermissions", { permissions: ["videoCapture"], origin: new URL(site.url).origin }).catch(() => {});
+  return b;
+};
 const A = await open("Alice");
 const B = await open("Bob");
 const C = await open("Carol");
@@ -99,6 +105,32 @@ const closeMenu = async () => {
   await key(P, "Escape");
   await sleep(100);
 };
+
+/* ---------- webcam in picture helpers (I10) ---------- */
+/** The first PIP matching `sel`: its rect and its parent tile's (page coordinates), the stored position, the handle corner, the picture size. */
+const pipState = (p, sel = ".arena > .st-tile > .pip") => p.eval(`(() => {
+  const e = document.querySelector(${JSON.stringify(sel)}); if (!e) return null;
+  const t = e.parentElement; const r = e.getBoundingClientRect(), tr = t.getBoundingClientRect();
+  const ar = document.querySelector('.arena');
+  const par = parseFloat(t.style.getPropertyValue('--ar')) || 16 / 9;
+  const crop = ar.classList.contains('crop');
+  const picW = crop ? Math.max(tr.width, tr.height * par) : Math.min(tr.width, tr.height * par);
+  const pos = __sss.vg(ar.dataset.view).pip[e.dataset.id] || null;
+  const cs = getComputedStyle(e);
+  return { id: e.dataset.id, parent: t.dataset.id, c: e.dataset.c, ar: parseFloat(e.dataset.ar), pos: pos && JSON.parse(JSON.stringify(pos)),
+    pip: { x: r.x, y: r.y, w: r.width, h: r.height }, tile: { x: tr.x, y: tr.y, w: tr.width, h: tr.height }, picW, picH: picW / par,
+    radius: cs.borderTopLeftRadius, snap: cs.getPropertyValue('--x') || (e.classList.contains('snap') ? 'on' : '') };
+})()`);
+const insideOf = (r, o) => r.x >= o.x - 1 && r.y >= o.y - 1 && r.x + r.w <= o.x + o.w + 1 && r.y + r.h <= o.y + o.h + 1;
+/** The PIP sits on spot `[col, row]` of its visible picture: 12 px from the edge it is on, centred on a middle (the inset shrinks only in tiny pictures). */
+function spotInsetOk(s, spot) {
+  const l = s.pip.x - s.tile.x, t = s.pip.y - s.tile.y;
+  const r = s.tile.x + s.tile.w - (s.pip.x + s.pip.w), b = s.tile.y + s.tile.h - (s.pip.y + s.pip.h);
+  const m = (len, size) => Math.min(12, Math.max(0, (len - size) / 2));
+  const okX = spot[0] === 0 ? Math.abs(l - m(s.tile.w, s.pip.w)) < 1.5 : spot[0] === 2 ? Math.abs(r - m(s.tile.w, s.pip.w)) < 1.5 : Math.abs(l - r) < 1.5;
+  const okY = spot[1] === 0 ? Math.abs(t - m(s.tile.h, s.pip.h)) < 1.5 : spot[1] === 2 ? Math.abs(b - m(s.tile.h, s.pip.h)) < 1.5 : Math.abs(t - b) < 1.5;
+  return okX && okY;
+}
 
 async function startSharer(X, name, w, h) {
   await L.stubCapture(X.page, { width: w, height: h, fps: 15, audio: false });
@@ -167,8 +199,9 @@ try {
   check(await P.eval("!document.querySelector('.p-side')"), "the bar's sidebar button hides the sidebar");
   await P.click("#btn-sidebar");
   check(await P.eval("!!document.querySelector('.p-side')"), "and shows it again");
-  check(await P.eval("document.querySelector('#btn-webcam').disabled && !!document.querySelector('#btn-webcam').title"), "Webcam is a present, disabled split button with a tooltip (task I10 enables it)");
-  check(await P.eval("document.querySelector('#btn-audio').disabled && /./.test(document.querySelector('#btn-audio').title)"), "Share audio is disabled while the shared source has no audio (today's behaviour)");
+  await P.waitFor("!document.querySelector('#btn-webcam').disabled", { what: "the webcam button enabled once the cameras are listed" });
+  check(await P.eval("!document.querySelector('#btn-webcam').disabled && /Share your webcam/.test(document.querySelector('#btn-webcam').title)"), "Webcam is an enabled split button (task I10) with the camera in its tooltip", await P.eval("document.querySelector('#btn-webcam').title"));
+  check(await P.eval("!document.querySelector('#btn-audio').disabled && /on its own/.test(document.querySelector('#btn-audio').title)"), "Share audio next to a screen that came with no audio is not a dead mute switch: it offers audio on its own (task I10)", await P.eval("document.querySelector('#btn-audio').title"));
 
   /* ============================== resize bars: Split ============================== */
   section("resize bars (Split)");
@@ -557,7 +590,7 @@ try {
   section("menus: the app's own style, no native select");
   await openLayoutMenu();
   const lay = await P.eval(`({ items: [...document.querySelectorAll('.menu.m-layout .mi')].map((e) => ({ t: e.innerText.replace(/\\s+/g, ' ').trim(), icon: !!e.querySelector('.ms'), two: e.classList.contains('two'), sub: !!e.querySelector('small') })), on: [...document.querySelectorAll('.menu.m-layout .mi.on')].map((e) => e.innerText.trim().split(/\\s+/).slice(-3).join(' ')), pip: (() => { const c = [...document.querySelectorAll('.menu.m-layout .cbx')].find((e) => /Webcam in picture/.test(e.innerText)); return c ? c.classList.contains('disabled') : null; })() })`);
-  check(lay.items.slice(0, 3).every((i) => i.icon && i.two && i.sub) && lay.items.length === 4 && lay.pip === true, "Layout menu: Split / Crop / Floating with icons and sub-lines, a disabled Webcam in picture, Always show names, Hide my own streams, Reset", JSON.stringify(lay.items.map((i) => i.t)));
+  check(lay.items.slice(0, 3).every((i) => i.icon && i.two && i.sub) && lay.items.length === 4 && lay.pip === false, "Layout menu: Split / Crop / Floating with icons and sub-lines, a live Webcam in picture (I10), Always show names, Hide my own streams, Reset", JSON.stringify(lay.items.map((i) => i.t)));
   await shot(P, "12_layout_menu");
   await closeMenu();
   await P.click("#btn-share");
@@ -849,6 +882,334 @@ try {
       check(true, "Bring the stage back (the button in its window) returns it to the main window");
     } else check(true, "the browser has no Document Picture-in-Picture: the stage pop-out button is hidden");
   } else console.log("\n(no --relay-bin/--relay-dir: the relay-restart checks are skipped)");
+
+  /* ============================== webcam, webcam in picture, audio-only tiles (task I10) ============================== */
+  section("webcam: getUserMedia, reaches a second page, a tile of its own");
+  // where a PIP of `size` starts along an axis of `len` on column/row i (an independent restatement of the rule: 12 px in, centred in the middle; the inset shrinks in tiny pictures)
+  const Gm = { pipAt: (origin, len, size, i) => { const m = Math.max(Math.min(12, (len - size) / 2), 0); return i === 0 ? origin + m : i === 1 ? origin + (len - size) / 2 : origin + len - size - m; } };
+  await setLayout("split");
+  await openLayoutMenu();
+  await layoutItem("/Reset/");
+  await closeMenu();
+  const SPOTS = [[0, 0], [1, 0], [2, 0], [0, 1], [2, 1], [0, 2], [1, 2], [2, 2]];
+  const liveCam = (X) => X.page.eval("__sss.S.captures.some((c) => c.kind === 'webcam' && c.state === 'live' && [...c.dests.values()].some((d) => d.state === 'live'))");
+  // Alice's webcam through her real bar: a click starts the saved camera (the fake one), no staging step, audio: false
+  await A.page.waitFor("!document.querySelector('#btn-webcam').disabled", { what: "Alice's webcam button" });
+  await A.page.click("#btn-webcam");
+  await A.page.waitFor("__sss.S.captures.some((c) => c.kind === 'webcam' && c.state === 'live' && [...c.dests.values()].some((d) => d.state === 'live'))", { timeout: 20000, what: "Alice's webcam live" });
+  check(await A.page.eval("document.querySelector('#btn-webcam').parentElement.classList.contains('on') && document.querySelector('#btn-webcam .ms').innerText.trim() === 'videocam'"), "a live webcam lights its bar button green with the videocam icon");
+  check(await A.page.eval("(() => { const c = __sss.S.captures.find((x) => x.kind === 'webcam'); return !c.audio && c.stream.getAudioTracks().length === 0 && c.label === 'Webcam'; })()"), "the webcam is a video-only capture labelled exactly Webcam (audio: false)");
+  check(await A.page.eval("!!document.querySelector('.st-tile.mine.cam') && /Webcam/.test(document.querySelector('.st-tile.mine.cam .tag').innerText)"), "her own stage has a `You · Webcam` tile next to her screen");
+  await P.waitFor("document.querySelectorAll('.arena > .st-tile').length === 5", { timeout: 30000, what: "the webcam shows on Vera's stage" });
+  const camTile = await P.eval(`(() => { const t = [...document.querySelectorAll('.arena > .st-tile')].find((x) => /\\/Webcam$/.test(x.dataset.id)); return t ? { idle: t.classList.contains('idle'), text: t.innerText, watch: !!t.querySelector('[data-watch]') } : null; })()`);
+  check(camTile && camTile.idle && camTile.watch && /Alice is sharing Webcam/.test(camTile.text), "on Vera's page it is an ordinary stream: an idle tile `Alice is sharing Webcam` with Watch stream", JSON.stringify(camTile));
+  check(await P.eval("__sss.S.rooms[0].streams.some((s) => s.kind === 'video' && s.label === 'Webcam' && s.ownerName === 'Alice') && !__sss.S.rooms[0].streams.some((s) => s.kind === 'audio')"), "on the wire: a video stream labelled `Webcam`, and no audio stream");
+  for (let i = 0; i < 6 && (await P.eval("__sss.S.rooms[0].watches.size")) < 4; i++) {
+    await P.click({ js: "document.querySelector('.st-tile[data-id$=\"/Webcam\"] [data-watch]')" });
+    await sleep(700);
+  }
+  await P.waitFor("[...__sss.S.rooms[0].watches.values()].some((w) => w.label === 'Webcam' && w.firstFrame)", { timeout: 40000, what: "the webcam's first frame on Vera's page" });
+  const camStats = await P.eval("(() => { const r = __sss.S.rooms[0]; const w = [...r.watches.values()].find((x) => x.label === 'Webcam'); return { st: r.client.watchStats(w.key), audio: !!w.handle.audioKey, w: w.canvas.width, h: w.canvas.height }; })()");
+  await sleep(1500);
+  const camStats2 = await P.eval("(() => { const r = __sss.S.rooms[0]; const w = [...r.watches.values()].find((x) => x.label === 'Webcam'); return r.client.watchStats(w.key); })()");
+  check(camStats2.decoded > camStats.st.decoded && camStats.w > 0 && camStats.h > 0 && !camStats.audio, "the webcam decodes on the second page and Alice's webcam watch plays no audio", `${camStats.st.decoded} -> ${camStats2.decoded} frames, ${camStats.w}x${camStats.h}`);
+  check(await P.eval("(() => { const t = document.querySelector('.st-tile[data-id$=\"/Webcam\"]'); return !!t && t.classList.contains('cam') && !t.querySelector('.tag .ms.off') && !!t.querySelector('.tag .ms') && t.querySelector('.tag .ms').innerText.trim() === 'videocam'; })()"), "a watched webcam's tag has the videocam icon, no audio icon (a webcam brings no audio)");
+  // the menu: no volume row, no Level loudness, "No audio in this stream"
+  await P.eval(`document.querySelector('.st-tile[data-id$="/Webcam"] [data-mk^="tile:"]').click()`);
+  await P.waitFor("document.querySelector('.menu.m-tile')", { what: "the webcam's stream menu" });
+  check(await P.eval("!document.querySelector('.menu.m-tile input.vol') && /No audio/i.test(document.querySelector('.menu.m-tile').innerText)"), "the webcam's stream menu has no volume and says it has no audio");
+  await closeMenu();
+  await shot(P, "40_cam_tile");
+
+  section("webcam in picture: off by default, on per view");
+  await viewKey();
+  const tileCount = () => P.eval("document.querySelectorAll('.arena > .st-tile').length");
+  check((await tileCount()) === 5 && (await P.eval("!document.querySelector('.pip')")), "Webcam in picture is off until switched on: the webcam is a tile of its own");
+  await openLayoutMenu();
+  check(await P.eval("(() => { const c = [...document.querySelectorAll('.menu .cbx')].find((e) => /Webcam in picture/.test(e.innerText)); return !!c && !c.classList.contains('on') && !c.classList.contains('disabled') && c.getAttribute('aria-checked') === 'false'; })()"), "the Layout menu's `Webcam in picture` is a live checkbox, unchecked");
+  await closeMenu();
+  await P.eval("(() => { const w = [...__sss.S.rooms[0].watches.values()].find((x) => x.label === 'Webcam'); w.canvas.__marker = 'same canvas'; })()");
+  const pipOn = async () => {
+    await openLayoutMenu();
+    await layoutItem("/Webcam in picture/");
+    await closeMenu();
+    await sleep(300);
+  };
+  await pipOn();
+  await P.waitFor("document.querySelectorAll('.arena > .st-tile').length === 4 && !!document.querySelector('.arena > .st-tile > .pip')", { what: "the webcam moves into Alice's screen" });
+  let st = await pipState(P);
+  check(st && /\/Alice\/video\/Screen$/.test(st.parent) && /Webcam$/.test(st.id), "with it on, Alice's webcam sits inside Alice's screen share and has no tile", st && `${st.parent} <- ${st.id}`);
+  check(await P.eval("[...__sss.S.rooms[0].watches.values()].find((x) => x.label === 'Webcam').canvas.__marker === 'same canvas' && !!document.querySelector('.pip > canvas')"), "the webcam's <canvas> was re-adopted by the PIP, not recreated");
+  near(st.pip.w, 0.24 * st.tile.w, 1.5, "a new PIP is a quarter of the picture wide (.24)");
+  check(st.pos.spot[0] === 2 && st.pos.spot[1] === 2 && spotInsetOk(st, [2, 2]), "it starts bottom right, 12 px from both edges", JSON.stringify(st.pos));
+  check(st.c === "lt", "the handle sits on the corner facing the middle of the picture (top left for a PIP bottom right)", st.c);
+  const glide = await P.eval("[...document.styleSheets].some((sh) => [...sh.cssRules].some((r) => r.selectorText === '.pip.snap' && /0\\.16s/.test(r.style.transition)))");
+  check(/6px/.test(st.radius) && glide, "the browser rounds the corners (6 px) and glides to a spot (.16 s, `.pip.snap`)", `${st.radius} glide=${glide}`);
+  await shot(P, "41_pip_default");
+
+  section("webcam in picture: eight spots with real drags, resize, edges");
+  const tileOf = (p) => p.eval("(() => { const t = document.querySelector('.arena > .st-tile:has(> .pip)'); const r = t.getBoundingClientRect(); return { id: t.dataset.id, x: r.x, y: r.y, w: r.width, h: r.height, z: t.style.zIndex, l: t.style.left, t: t.style.top, wd: t.style.width, ht: t.style.height }; })()");
+  const tile0 = await tileOf(P);
+  const dragTo = async (spot) => {
+    const s = await pipState(P);
+    const x0 = s.pip.x + s.pip.w / 2;
+    const y0 = s.pip.y + s.pip.h / 2;
+    const tx = s.tile.x + Gm.pipAt(0, s.tile.w, s.pip.w, spot[0]) + s.pip.w / 2;
+    const ty = s.tile.y + Gm.pipAt(0, s.tile.h, s.pip.h, spot[1]) + s.pip.h / 2;
+    let mid = null;
+    await drag(P, x0, y0, tx - x0, ty - y0, { steps: 10, mid: async () => { mid = await pipState(P); } });
+    await sleep(450); // the glide
+    return { after: await pipState(P), mid };
+  };
+  const tileSame = (a, b) => ["x", "y", "w", "h"].every((k) => Math.abs(a[k] - b[k]) < 0.6);
+  let allSpots = true;
+  const spotNotes = [];
+  for (const spot of SPOTS) {
+    const { after, mid } = await dragTo(spot);
+    const pipGood = after && after.pos.spot && after.pos.spot[0] === spot[0] && after.pos.spot[1] === spot[1] && spotInsetOk(after, spot) && insideOf(after.pip, after.tile) && mid && mid.pos.spot === null;
+    spotNotes.push(`${spot}:${pipGood ? "ok" : "BAD " + JSON.stringify(after && after.pos)}`);
+    if (!pipGood) allSpots = false;
+    if (!tileSame(await tileOf(P), tile0)) allSpots = false;
+  }
+  check(allSpots, "a real drag to each of the 8 spots snaps there (free during the drag, 12 px inset or centred on release) and never moves the tile under it", spotNotes.join(" "));
+  // a click changes nothing
+  st = await pipState(P);
+  await P.click({ js: "document.querySelector('.pip')" });
+  const pipSt1 = await pipState(P);
+  check(JSON.stringify(pipSt1.pos) === JSON.stringify(st.pos) && Math.abs(pipSt1.pip.x - st.pip.x) < 0.6, "a click on the PIP changes nothing");
+  await shot(P, "42_pip_spot");
+  // resize: aspect locked, the corner opposite the handle stays, the spot stays
+  st = await pipState(P);
+  const hx = st.pip.x + (st.c[0] === "r" ? st.pip.w - 10 : 10);
+  const hy = st.pip.y + (st.c[1] === "b" ? st.pip.h - 10 : 10);
+  await move(P, st.pip.x + 5, st.pip.y + 5); // hover the tile so the handle shows
+  const fx = st.c[0] === "r" ? st.pip.x : st.pip.x + st.pip.w;
+  const fy = st.c[1] === "b" ? st.pip.y : st.pip.y + st.pip.h;
+  await drag(P, hx, hy, st.c[0] === "r" ? 60 : -60, st.c[1] === "b" ? 34 : -34, { steps: 8 });
+  await sleep(200);
+  let pipSt2 = await pipState(P);
+  const fx2 = st.c[0] === "r" ? pipSt2.pip.x : pipSt2.pip.x + pipSt2.pip.w;
+  const fy2 = st.c[1] === "b" ? pipSt2.pip.y : pipSt2.pip.y + pipSt2.pip.h;
+  check(pipSt2.pip.w > st.pip.w + 20, "dragging the handle outwards grows the PIP", `${st.pip.w.toFixed(0)} -> ${pipSt2.pip.w.toFixed(0)}`);
+  near(pipSt2.pip.w / pipSt2.pip.h, st.ar, 0.02, "the aspect ratio is locked while resizing");
+  check(Math.abs(fx2 - fx) < 1.5 && Math.abs(fy2 - fy) < 1.5, "the corner opposite the handle stays put", `${fx},${fy} vs ${fx2},${fy2}`);
+  check(JSON.stringify(pipSt2.pos.spot) === JSON.stringify(st.pos.spot) && tileSame(await tileOf(P), tile0), "a resize leaves the spot and never resizes the tile under it");
+  const hx2 = pipSt2.pip.x + (pipSt2.c[0] === "r" ? pipSt2.pip.w - 10 : 10);
+  const hy2 = pipSt2.pip.y + (pipSt2.c[1] === "b" ? pipSt2.pip.h - 10 : 10);
+  await drag(P, hx2, hy2, pipSt2.c[0] === "r" ? -900 : 900, pipSt2.c[1] === "b" ? -900 : 900, { steps: 8 });
+  await sleep(200);
+  pipSt2 = await pipState(P);
+  near(pipSt2.pip.w, 72, 1, "shrinking stops at the minimum width of 72 px");
+  await drag(P, pipSt2.pip.x + (pipSt2.c[0] === "r" ? pipSt2.pip.w - 10 : 10), pipSt2.pip.y + (pipSt2.c[1] === "b" ? pipSt2.pip.h - 10 : 10), pipSt2.c[0] === "r" ? 3000 : -3000, pipSt2.c[1] === "b" ? 3000 : -3000, { steps: 8 });
+  await sleep(200);
+  pipSt2 = await pipState(P);
+  check(insideOf(pipSt2.pip, pipSt2.tile), "growing is capped by the visible picture", `${JSON.stringify(pipSt2.pip)} in ${JSON.stringify(pipSt2.tile)}`);
+  // back to the default size for the rest
+  await P.eval("(() => { const k = document.querySelector('.arena').dataset.view; for (const p of Object.values(__sss.vg(k).pip)) p.w = 0.24; __sss.render(); })()");
+  await sleep(300);
+
+  section("webcam in picture: stays on its spot across layouts, tile resizes and fullscreen; inside the picture in Crop");
+  let pipKept = true;
+  const pipNotes = [];
+  for (const spot of [[0, 1], [2, 0], [1, 2]]) {
+    await setLayout("split");
+    const a = await dragTo(spot);
+    for (const lay of ["crop", "float", "split"]) {
+      await setLayout(lay);
+      await sleep(250);
+      const s = await pipState(P);
+      const pipGood = s && JSON.stringify(s.pos.spot) === JSON.stringify(spot) && spotInsetOk(s, spot) && insideOf(s.pip, s.tile);
+      pipNotes.push(`${spot}/${lay}:${pipGood ? "ok" : "BAD"}`);
+      if (!pipGood) pipKept = false;
+    }
+  }
+  check(pipKept, "the spot is the same in Split, Crop and Floating (same inset from the same edges)", pipNotes.join(" "));
+  // a tile resize: the viewport shrinks, the tile follows
+  const vspot = (await pipState(P)).pos.spot;
+  await P.setViewport(1000, 640);
+  await sleep(500);
+  let pipSv = await pipState(P);
+  check(pipSv && JSON.stringify(pipSv.pos.spot) === JSON.stringify(vspot) && spotInsetOk(pipSv, vspot) && pipSv.tile.w < 900, "a smaller window (smaller tiles) keeps the spot", `${pipSv && pipSv.tile.w.toFixed(0)}x${pipSv && pipSv.tile.h.toFixed(0)}`);
+  await P.setViewport(1440, 900);
+  await sleep(400);
+  // a resize bar dragged in Split changes the tile under the PIP: the spot holds
+  await setLayout("split");
+  const barsNow = await guts(P);
+  if (barsNow.length) {
+    const before = await pipState(P);
+    await drag(P, barsNow[0].cx, barsNow[0].cy, barsNow[0].w > barsNow[0].h ? 0 : 70, barsNow[0].w > barsNow[0].h ? 50 : 0, { steps: 8 });
+    await sleep(300);
+    const after = await pipState(P);
+    check(after && JSON.stringify(after.pos.spot) === JSON.stringify(before.pos.spot) && spotInsetOk(after, after.pos.spot), "dragging a resize bar (the tile under the PIP changes size) keeps the spot");
+    await P.eval(`__sss.vg(document.querySelector('.arena').dataset.view).grid = null; __sss.render();`);
+    await sleep(300);
+  }
+  // Crop in a tall narrow window: the picture is wider than the tile, the PIP stays inside what shows, for every spot and for drags past the edges
+  await P.setViewport(700, 1000);
+  await setLayout("crop");
+  await sleep(500);
+  const pipCropTile = await pipState(P);
+  check(pipCropTile && pipCropTile.picW > pipCropTile.tile.w + 1 || pipCropTile && pipCropTile.picH > pipCropTile.tile.h + 1, "in this window Crop really crops the picture", pipCropTile && `${pipCropTile.tile.w.toFixed(0)}x${pipCropTile.tile.h.toFixed(0)} tile`);
+  let pipCropOk = true;
+  const pipCropNotes = [];
+  for (const spot of SPOTS) {
+    const { after, mid } = await dragTo(spot);
+    const pipGood = after && JSON.stringify(after.pos.spot) === JSON.stringify(spot) && spotInsetOk(after, spot) && insideOf(after.pip, after.tile);
+    pipCropNotes.push(`${spot}:${pipGood ? "ok" : "BAD"}`);
+    if (!pipGood) pipCropOk = false;
+  }
+  check(pipCropOk, "in Crop all 8 spots are reachable and the PIP stays inside the visible picture", pipCropNotes.join(" "));
+  let pipPastOk = true;
+  for (const [dx, dy] of [[-2500, -2500], [2500, 2500], [-2500, 2500], [2500, -2500]]) {
+    const s = await pipState(P);
+    let inMid = true;
+    await drag(P, s.pip.x + s.pip.w / 2, s.pip.y + s.pip.h / 2, dx, dy, { steps: 8, mid: async () => { const m = await pipState(P); inMid = insideOf(m.pip, m.tile); } });
+    await sleep(450);
+    const a = await pipState(P);
+    if (!inMid || !insideOf(a.pip, a.tile)) pipPastOk = false;
+  }
+  check(pipPastOk, "a drag far past the edges stops at the edge of the visible picture, in Crop too (while held and after release)");
+  await shot(P, "43_pip_crop");
+  await P.setViewport(1440, 900);
+  await setLayout("split");
+  await sleep(400);
+
+  // Floating: the PIP is above its window; a press on it never moves or resizes the window
+  await setLayout("float");
+  await sleep(300);
+  const fl0 = await tileOf(P);
+  await dragTo([0, 0]);
+  const fl1 = await tileOf(P);
+  check(tileSame(fl0, fl1) && fl0.l === fl1.l && fl0.t === fl1.t, "in Floating a drag of the PIP never moves its parent window", `${fl0.l},${fl0.t} vs ${fl1.l},${fl1.t}`);
+  await setLayout("split");
+
+  // the stage's own fullscreen: same spot
+  const fsSpot = (await pipState(P)).pos.spot;
+  await P.click("#btn-stagefs");
+  await P.waitFor("__sss.S.stage.fullscreen && document.querySelector('.stagefs') && !!document.querySelector('.arena > .st-tile > .pip')", { timeout: 8000, what: "stage fullscreen with the PIP" });
+  await sleep(600);
+  const pipSf = await pipState(P);
+  check(pipSf && JSON.stringify(pipSf.pos.spot) === JSON.stringify(fsSpot) && spotInsetOk(pipSf, fsSpot), "the stage's fullscreen keeps the PIP on its spot", pipSf && JSON.stringify(pipSf.pos.spot));
+  await P.click("#btn-stagefs");
+  await P.waitFor("!__sss.S.stage.fullscreen", { what: "left the stage fullscreen" });
+  await sleep(400);
+  // the stream's own fullscreen (double-click on the parent): the PIP goes into it
+  const ptile = await tileOf(P);
+  await move(P, ptile.x + ptile.w / 2, ptile.y + ptile.h / 2);
+  await P.dblclick({ js: "document.querySelector('.arena > .st-tile:has(> .pip) .vid')" });
+  await P.waitFor("!!document.querySelector('.pip-stage > .pip')", { timeout: 8000, what: "the PIP in the stream fullscreen" });
+  await sleep(500);
+  const pipSfs = await P.eval(`(() => { const s = document.querySelector('.pip-stage'); const p = s.querySelector('.pip'); const cv = s.querySelector('canvas'); const b = s.getBoundingClientRect(); const ar = cv.width / cv.height; let w = b.width, h = w / ar; if (h > b.height) { h = b.height; w = h * ar; } const pic = { x: b.x + (b.width - w) / 2, y: b.y + (b.height - h) / 2, w, h }; const r = p.getBoundingClientRect(); return { pip: { x: r.x, y: r.y, w: r.width, h: r.height }, tile: pic, pos: JSON.parse(JSON.stringify(__sss.vg(document.querySelector('.arena') ? document.querySelector('.arena').dataset.view : "")?.pip[p.dataset.id] ?? null)), tiles: document.querySelectorAll('.arena > .st-tile').length, camTiles: [...document.querySelectorAll('.arena > .st-tile')].filter((x) => /Webcam$/.test(x.dataset.id)).length }; })()`);
+  check(pipSfs.pos && spotInsetOk(pipSfs, pipSfs.pos.spot) && pipSfs.camTiles === 0, "the stream's fullscreen has its webcam in picture on the same spot, and the webcam is not a tile behind it", JSON.stringify({ spot: pipSfs.pos && pipSfs.pos.spot, camTiles: pipSfs.camTiles }));
+  await shot(P, "44_pip_fullscreen");
+  // the PIP can be moved there too, and that is the same state the stage uses
+  const fsPip = await P.eval("(() => { const r = document.querySelector('.pip-stage > .pip').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()");
+  await drag(P, fsPip.x, fsPip.y, -3000, -3000, { steps: 8 });
+  await sleep(450);
+  const fsMoved = await P.eval("JSON.parse(JSON.stringify(Object.values(__sss.vg(document.querySelector('.arena').dataset.view).pip)[0]))");
+  check(JSON.stringify(fsMoved.spot) === "[0,0]", "dragging it in the stream fullscreen snaps it to a spot too (top left)", JSON.stringify(fsMoved));
+  await P.dblclick({ js: "document.querySelector('.pip-stage canvas')" });
+  await P.waitFor("!document.querySelector('.pip-stage')", { timeout: 8000, what: "left the stream fullscreen" });
+  await sleep(500);
+  const pipBack = await pipState(P);
+  check(pipBack && JSON.stringify(pipBack.pos.spot) === "[0,0]" && spotInsetOk(pipBack, [0, 0]) && (await tileCount()) === 4, "leaving it returns the PIP to the tile on the spot you moved it to");
+  await dragTo([2, 2]);
+
+  section("webcam in picture: stays a tile when it cannot be a picture; pop-out; off");
+  // Bob has watched nothing: switch it on there; neither stream is playing
+  await B.page.waitFor("document.querySelectorAll('.st-tile').length >= 3", { timeout: 20000, what: "Bob's stage" });
+  await B.page.click("#btn-layout");
+  await B.page.waitFor("document.querySelector('.menu.m-layout')", { what: "Bob's layout menu" });
+  await B.page.click({ js: "[...document.querySelectorAll('.menu .cbx')].find((e) => /Webcam in picture/.test(e.innerText))" });
+  await key(B.page, "Escape");
+  const bobTiles = () => B.page.eval(`[...document.querySelectorAll('.arena > .st-tile')].map((t) => ({ id: t.dataset.id, idle: t.classList.contains('idle') }))`);
+  const bob0 = await bobTiles();
+  check(!(await B.page.eval("!!document.querySelector('.pip')")) && bob0.some((t) => /Webcam$/.test(t.id) && t.idle) && bob0.some((t) => /\/Alice\/video\/Screen$/.test(t.id) && t.idle), "a viewer who has watched neither stream sees both as tiles (a webcam you cannot see playing in a picture would have no Watch button)", JSON.stringify(bob0.map((t) => t.id.split("/").pop())));
+  await B.page.click({ js: "document.querySelector('.st-tile[data-id$=\"/Webcam\"] [data-watch]')" });
+  await B.page.waitFor("__sss.S.rooms[0].watches.size === 1", { what: "Bob watches the webcam only" });
+  await sleep(500);
+  check(!(await B.page.eval("!!document.querySelector('.pip')")), "watching only the webcam (its screen not playing) leaves it a tile");
+  await B.page.click({ js: "document.querySelector('.st-tile[data-id$=\"/Alice/video/Screen\"] [data-watch]')" });
+  await B.page.waitFor("__sss.S.rooms[0].watches.size === 2 && !!document.querySelector('.arena > .st-tile > .pip')", { timeout: 20000, what: "Bob's webcam moves into the screen it now watches" });
+  check(true, "once Bob watches the screen too, the webcam goes into it");
+  // the parent popped out: the webcam is a tile on the stage again
+  if (await P.eval("typeof documentPictureInPicture !== 'undefined'")) {
+    await P.click({ js: "document.querySelector('.arena > .st-tile:has(> .pip) [aria-label*=\"own window\"]')" });
+    await P.waitFor("__sss.S.rooms[0].watches && [...__sss.S.rooms[0].watches.values()].some((w) => w.popped === 'pip')", { timeout: 10000, what: "the screen pops out" }).catch(() => {});
+    await sleep(600);
+    check((await P.eval("!document.querySelector('.pip') && [...document.querySelectorAll('.arena > .st-tile')].some((t) => /Webcam$/.test(t.dataset.id) && !t.classList.contains('idle'))")), "a popped-out parent shows alone in its window and its webcam is a playing tile on the stage");
+    await P.eval("(() => { const w = [...__sss.S.rooms[0].watches.values()].find((x) => x.popped); const b = document.querySelector('.strip .pv.popped'); if (b) b.click(); })()");
+    await P.waitFor("![...__sss.S.rooms[0].watches.values()].some((w) => w.popped) && !!document.querySelector('.arena > .st-tile > .pip')", { timeout: 10000, what: "the stream is back" });
+    check(true, "bringing it back puts the webcam into the picture again");
+  }
+  // the strip's hover card says "In picture"
+  const pipNm = await P.eval("(() => { const c = [...document.querySelectorAll('.strip .pv')].find((p) => p.dataset.user === 'Alice'); const r = c.querySelector('.avatar').getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()");
+  await move(P, pipNm.x, pipNm.y);
+  await P.waitFor("document.querySelector('.utip')", { what: "Alice's hover card" });
+  check(await P.eval("[...document.querySelectorAll('.utip .ust')].some((r) => /Webcam/.test(r.querySelector('.l1').innerText) && /In picture/.test(r.querySelector('.l3').innerText))"), "the hover card of Alice says `In picture` on her webcam's row");
+  await move(P, 5, 5);
+  await sleep(300);
+
+  // Vera's own webcam goes into her own screen; Hide my own streams removes both, others still see them
+  section("webcam in picture: your own webcam in your own screen, Hide my own streams");
+  await P.click("#btn-webcam");
+  await P.waitFor("__sss.S.captures.some((c) => c.kind === 'webcam' && c.state === 'live' && [...c.dests.values()].some((d) => d.state === 'live'))", { timeout: 20000, what: "Vera's webcam live" });
+  await sleep(500);
+  const mineIn = await pipState(P, ".arena > .st-tile.mine > .pip");
+  check(mineIn && /\/me$/.test(mineIn.parent) && /\/me\/cam$/.test(mineIn.id), "your own webcam sits inside your own screen share", mineIn && `${mineIn.parent} <- ${mineIn.id}`);
+  check(await P.eval("!document.querySelector('.arena > .st-tile.mine.cam') && !!document.querySelector('.st-tile.mine > .pip > video.live-preview, .st-tile.mine > .pip > .mine-pic')"), "…with no tile of its own, showing the live preview or the placeholder");
+  await openLayoutMenu();
+  await layoutItem("/Hide my own streams/");
+  await closeMenu();
+  await sleep(400);
+  check(await P.eval("!document.querySelector('.arena > .st-tile.mine') && ![...document.querySelectorAll('.pip')].some((p) => /\\/me\\/cam$/.test(p.dataset.id))"), "Hide my own streams removes my screen and my in-picture webcam from my stage");
+  check(await A.page.eval("(() => { const ts = [...document.querySelectorAll('.arena > .st-tile')].map((t) => t.dataset.id); return ts.some((i) => /\\/Vera\\/video\\/Screen$/.test(i)) && ts.some((i) => /\\/Vera\\/video\\/Webcam$/.test(i)); })()"), "…and others still see both of Vera's shares");
+  await openLayoutMenu();
+  await layoutItem("/Hide my own streams/");
+  await closeMenu();
+  await sleep(300);
+  await shot(P, "45_own_pip");
+  // Webcam in picture off: the tile comes back
+  await pipOn(); // toggles it off
+  await sleep(400);
+  const offTiles = await P.eval("[...document.querySelectorAll('.arena > .st-tile')].map((t) => t.dataset.id)");
+  check(!(await P.eval("!!document.querySelector('.pip')")) && offTiles.some((i) => /\/Alice\/video\/Webcam$/.test(i)) && offTiles.some((i) => /\/me\/cam$/.test(i)) && (await P.eval("[...__sss.S.rooms[0].watches.values()].find((x) => x.label === 'Webcam').canvas.__marker === 'same canvas'")), "switching Webcam in picture off gives the webcams their tiles back (the same <canvas>)", String(offTiles.length));
+  await pipOn(); // on again for the last step
+
+  // a webcam alone (its owner stops the screen share): a tile again
+  await A.page.click(".splitb:has(#btn-share) .caret");
+  await A.page.waitFor("document.querySelector('.menu.m-share')", { what: "Alice's share menu" });
+  await A.page.click({ js: "document.querySelector('.menu.m-share .mi.danger')" });
+  await A.page.waitFor("!__sss.S.captures.some((c) => c.kind === 'screen')", { timeout: 10000, what: "Alice stops her screen" });
+  await P.waitFor("!document.querySelector('.arena > .st-tile > .pip:not([data-id$=\"/me/cam\"])') && [...document.querySelectorAll('.arena > .st-tile')].some((t) => /\\/Alice\\/video\\/Webcam$/.test(t.dataset.id))", { timeout: 15000, what: "Alice's webcam is a tile again" });
+  check(true, "a webcam whose owner stopped the screen share is a tile again (and a webcam alone stays one)");
+  // stop the webcams through the real UI
+  await P.click("#btn-webcam");
+  await P.waitFor("!__sss.S.captures.some((c) => c.kind === 'webcam')", { timeout: 10000, what: "Vera's webcam stopped" });
+  await A.page.click("#btn-webcam");
+  await A.page.waitFor("!__sss.S.captures.some((c) => c.kind === 'webcam')", { timeout: 10000, what: "Alice's webcam stopped" });
+  await P.waitFor("!__sss.S.rooms[0].streams.some((s) => s.label === 'Webcam')", { timeout: 10000, what: "the webcam stream is gone on Vera's page" });
+  check(true, "the second click on the webcam button stops it, and its stream disappears from the room");
+
+  section("audio-only senders: a Listen tile (no sound is played: the Listen click itself is a VM test)");
+  // A stream list with an audio stream and no screen: injected into the page state (no audio stream, no AudioContext: the host never plays sound)
+  const injectAudio = (withScreen, withCam) => P.eval(`(() => { const r = __sss.S.rooms[0]; const mk = (streamId, kind, label) => ({ key: "ffff:" + streamId, owner: "ffff", ownerId: 0xffffn, streamId, kind, label, width: 0, height: 0, self: false, ownerName: "Zed" });
+    r.streams = r.streams.filter((s) => s.owner !== "ffff").concat([mk(77, "audio", "Desktop audio")]${withScreen ? ", mk(78, 'video', 'Screen')" : ""}${withCam ? ", mk(79, 'video', 'Webcam')" : ""}); __sss.render(); })()`);
+  await injectAudio(false, false);
+  await sleep(300);
+  const audTile = await P.eval(`(() => { const t = document.querySelector('.st-tile.audio-only'); return t ? { text: t.innerText, listen: !!t.querySelector('[data-listen]'), tag: t.querySelector('.tag') && t.querySelector('.tag').innerText } : null; })()`);
+  check(audTile && /Zed is sharing audio/.test(audTile.text) && /Audio only/.test(audTile.text) && audTile.listen && /Zed/.test(audTile.tag) && /Desktop audio/.test(audTile.tag), "an audio-only sender gets a tile `Zed is sharing audio · Audio only` with Listen and the label `Desktop audio`", JSON.stringify(audTile));
+  await injectAudio(false, true);
+  await sleep(200);
+  check(await P.eval("!!document.querySelector('.st-tile.audio-only') && !!document.querySelector('.st-tile[data-id$=\"/Zed/Webcam\"]')"), "a sender with only a webcam and audio: the audio is an audio-only tile of its own (a webcam is no video for the audio that follows video)");
+  await injectAudio(true, false);
+  await sleep(200);
+  check(await P.eval("!document.querySelector('.st-tile.audio-only') && !!document.querySelector('.st-tile[data-id$=\"/Zed/Screen\"]')"), "with a screen share the audio rides along: no audio-only tile");
+  await P.eval("(() => { const r = __sss.S.rooms[0]; r.streams = r.streams.filter((s) => s.owner !== 'ffff'); __sss.render(); })()");
+  await P.eval("document.querySelector('#btn-layout').scrollIntoView()");
+  const audSrc = await P.eval("(() => { const w = __sss.S.rooms[0].client; return typeof w.watch === 'function'; })()");
+  check(audSrc, "the core watches an audio stream directly (`watch(audioKey)`, no canvas) for Listen");
+  check(true, "Share audio on the bar: with no audio-only share a click opens the browser's picker (not run here: no audio on the host)");
 
   if (OLD_RELAY && OLD_HASH) {
     section("a relay without avatars (an older relay): nobody else's emoji shows, my own still does");

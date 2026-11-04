@@ -1,7 +1,7 @@
 // One RoomEntry per saved room: its RoomClient (one WebTransport connection), connection state, roster, streams,
 // previews and the streams we watch there. Turns core events into UI state and asks for a re-render.
 
-import { RoomClient, parseJoinLink, formatJoinLink, stripLinkName, ConnectError, JoinRejectedError, JoinLinkError } from "../core/index.js";
+import { RoomClient, parseJoinLink, formatJoinLink, stripLinkName, isWebcamLabel, ConnectError, JoinRejectedError, JoinLinkError } from "../core/index.js";
 import { S, invalidate, toast, persistRooms, displayName } from "./store.js";
 import { t, DICT } from "./i18n.js";
 import { onShareEvent, onShareStats, stopDestsInRoom } from "./capture.js";
@@ -54,6 +54,15 @@ export class RoomEntry {
   }
   hasAudio(ownerId) {
     return FAKE_AUDIO || this.streams.some((s) => s.owner === ownerId && s.kind === "audio");
+  }
+  /** Whether `ownerId` shares a screen (a webcam is no video for the audio that rides along: native `owner_has_video`). */
+  ownerHasVideo(ownerId) {
+    return this.streams.some((s) => s.owner === ownerId && s.kind === "video" && !isWebcamLabel(s.label));
+  }
+  /** Audio streams of other people whose owner shares no screen: the audio-only senders, which get a Listen tile (native `stage::collect`). A sender with a screen has
+   *  their audio ride along with the screen's watch. */
+  audioOnlyStreams() {
+    return this.streams.filter((s) => s.kind === "audio" && !s.self && !this.ownerHasVideo(s.owner));
   }
   memberName(id) {
     const m = this.members.find((x) => x.id === id);
@@ -196,7 +205,7 @@ function wire(r, client) {
     // A reconnect (theirs or ours, e.g. a relay restart) gives the sharer a fresh ConnId, so the same share comes back
     // under a new stream key. The core cannot tell that from a stop + restart, so remember the stream's stableKey for
     // a minute and resume watching when the same one reappears (the policy lives here, the identity comes from the core).
-    const entry = { stableKey: d.stableKey, ownerName: w.ownerName, label: w.label, vol: w.vol, muted: w.muted, popped: popped ? w : null, until: Date.now() + RESUME_MS };
+    const entry = { stableKey: d.stableKey, kind: d.kind || "video", ownerName: w.ownerName, label: w.label, vol: w.vol, muted: w.muted, popped: popped ? w : null, until: Date.now() + RESUME_MS };
     r.resume.push(entry);
     if (popped) {
       // Not resumed in time (the sharer is really gone): the window goes.
@@ -245,7 +254,8 @@ function wire(r, client) {
 /** Feed the sound rules with who watches my shares here right now (the core's `shares`: `viewerIds` per share, kept fresh by the relay's lists), then play what that adds up to. */
 function syncViewerSounds(r) {
   const shares = r.client ? r.client.shares.filter((s) => !s.ended) : [];
-  r.sounds.viewers(new Set(shares.map((s) => s.videoStreamId)), new Map(shares.map((s) => [s.videoStreamId, s.viewerIds])));
+  const vids = shares.filter((s) => s.videoStreamId != null); // an audio-only share has no viewer list
+  r.sounds.viewers(new Set(vids.map((s) => s.videoStreamId)), new Map(vids.map((s) => [s.videoStreamId, s.viewerIds])));
   flushSounds(r.sounds);
 }
 
@@ -258,7 +268,7 @@ function resumeWatches(r) {
   r.resume = r.resume.filter((e) => e.until > now);
   if (!r.resume.length || r.state !== "joined") return;
   for (const e of [...r.resume]) {
-    const s = r.streams.find((x) => x.kind === "video" && !x.self && !r.watches.has(x.key) && (e.stableKey ? x.stableKey === e.stableKey : (x.ownerName || r.memberName(x.owner)) === e.ownerName && x.label === e.label));
+    const s = r.streams.find((x) => x.kind === (e.kind || "video") && !x.self && !r.watches.has(x.key) && (e.stableKey ? x.stableKey === e.stableKey : (x.ownerName || r.memberName(x.owner)) === e.ownerName && x.label === e.label));
     if (!s) continue;
     r.resume.splice(r.resume.indexOf(e), 1);
     const w = watchStream(r, s.key);
@@ -274,16 +284,20 @@ export function watchStream(r, key) {
   if (!r.client || r.watches.has(key)) return r.watches.get(key);
   const info = r.streams.find((s) => s.key === key);
   if (!info) return null;
-  const canvas = document.createElement("canvas");
-  canvas.width = 16;
-  canvas.height = 9;
+  // An audio-only sender is "listened to": the same watch, with no picture (`audioOnly`, no canvas).
+  const audioOnly = info.kind === "audio";
+  const canvas = audioOnly ? null : document.createElement("canvas");
+  if (canvas) {
+    canvas.width = 16;
+    canvas.height = 9;
+  }
   const w = {
-    key, roomId: r.id, owner: info.owner, ownerName: info.ownerName || r.memberName(info.owner), label: info.label,
+    key, roomId: r.id, owner: info.owner, ownerName: info.ownerName || r.memberName(info.owner), label: info.label, audioOnly,
     canvas, handle: null, vol: 1, muted: false, popped: null, stats: null, codec: null, error: null, firstFrame: false,
   };
   try {
     r.client.resumeAudio();
-    w.handle = r.client.watch(key, { canvas });
+    w.handle = r.client.watch(key, audioOnly ? {} : { canvas });
     if (w.handle.renderer) {
       w.handle.renderer.onDraw = () => {
         if (!w.firstFrame) {
@@ -328,7 +342,7 @@ export function setWatchMuted(r, w, muted) {
 /** Every watch across every room, in room order. */
 export function allWatches() {
   const out = [];
-  for (const r of S.rooms) for (const w of r.watches.values()) out.push({ r, w });
+  for (const r of S.rooms) for (const w of r.watches.values()) if (!w.audioOnly) out.push({ r, w }); // "Watched streams" are pictures; a Listen is not one
   return out;
 }
 

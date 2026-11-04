@@ -11,9 +11,12 @@ import { S, persistSettings, persistRooms, toast, displayName } from "./store.js
 import { t } from "./i18n.js";
 import { h, ic, pct, cbx, seg, avatarEl, EMOJI, pickEmoji, snapVolumePct, volumeWheel, VOLUME_MAX_PCT, fmtKbps, meter } from "./dom.js";
 import { roomById, setWatchVolume, setWatchMuted, unwatchStream, watchStream, connectRoom, applyLevelLoudness } from "./rooms.js";
-import { allocated, allDests, capById, capInRoom, captureName, captureRes, stagedFor, captureLevel, setAudioMuted, addDest, moveDest, editDest, stopDest, stopAll, goLive, changeSource } from "./capture.js";
+import {
+  allocated, allSends, capById, capInRoom, captureName, captureRes, stagedFor, captureLevel, setAudioMuted, addDest, moveDest, editDest, stopDest, stopAll, goLive, changeSource,
+  screens, audioInRoom, startAudio, stopWebcam, cameras, camChoice, camsListing, useCamera,
+} from "./capture.js";
 import { A } from "./actions.js";
-import { viewOf, viewKey, itemById, layoutOf, setLayout, resetView, LAYOUTS, codecName } from "./stage-state.js";
+import { viewOf, viewKey, itemById, layoutOf, setLayout, resetView, pipOn, LAYOUTS, codecName } from "./stage-state.js";
 import { popoutMode } from "./popout.js";
 
 export const FPS_LIST = [15, 30, 60, 90, 120, 144, 165, 240];
@@ -76,10 +79,10 @@ const head = (lead, title, sub, mono) => h("div", { class: "mh" }, lead, h("div"
 
 /* ---------- control-bar menus ---------- */
 
-/** The room the Share / Audio buttons act on: a room's stage = that room; Watched = the room you share in. */
+/** The room the Share / Audio / Webcam buttons act on: a room's stage = that room; Watched = the room you share in (your screen's, else the webcam's or audio's). */
 export function shareRoomOf(view) {
   if (view.kind === "room") return view.r;
-  const c = S.captures.find((x) => x.dests.size || x.stagedRoom);
+  const c = S.captures.find((x) => x.kind === "screen" && (x.dests.size || x.stagedRoom)) || S.captures.find((x) => x.dests.size || x.stagedRoom);
   return c ? roomById([...c.dests.keys()][0] || c.stagedRoom) : null;
 }
 
@@ -111,12 +114,12 @@ function shareMenu(view) {
   out.push(sep());
   if (!cap) {
     // Not sharing here: an existing share can be added or moved here, a new one starts the picker.
-    for (const x of S.captures.filter((c) => c.state === "live")) {
+    for (const x of screens().filter((c) => c.state === "live")) {
       out.push(menuItem({ icon: "add_to_queue", label: t("ui.popup.add_here", { screen: captureName(x) }), sub: t("ui.popup.add_here_sub"), onclick: done(() => addDest(x, r)) }));
       const from = [...x.dests.keys()].map((y) => roomById(y)).filter(Boolean);
       out.push(menuItem({ icon: "swap_horiz", label: t("ui.popup.move_here", { screen: captureName(x) }), sub: t("ui.popup.move_here_sub", { rooms: from.map((y) => y.name).join(", ") }), onclick: done(async () => { for (const f of from) await moveDest(x, f, r); }) }));
     }
-    out.push(menuItem({ icon: "screen_share", label: S.captures.some((c) => c.state === "live") ? t("ui.popup.share_different") : t("ui.popup.share_here"), sub: S.captures.some((c) => c.state === "live") ? t("ui.popup.share_different_sub") : null, onclick: done(() => A.startStage(r)) }));
+    out.push(menuItem({ icon: "screen_share", label: screens().some((c) => c.state === "live") ? t("ui.popup.share_different") : t("ui.popup.share_here"), sub: screens().some((c) => c.state === "live") ? t("ui.popup.share_different_sub") : null, onclick: done(() => A.startStage(r)) }));
   } else {
     out.push(menuItem({ icon: "swap_horiz", label: t("ui.bar.change_source"), extra: h("span", { class: "unit", text: t("ui.bar.change_source_sub") }), onclick: done(() => changeSource(cap)) }));
     out.push(menuItem({ icon: "tune", label: t("ui.bar.all_stream_settings"), onclick: done(() => A.openStreamModal(cap.id, r.id)) }));
@@ -132,17 +135,46 @@ const denseSeg = (opts, cur, onPick) => {
   return el;
 };
 
-/** Shared audio (today's behaviour: the browser decides what audio comes with the picked screen; this is the mute and its meter). */
-function audioMenu() {
-  const cap = capById(S.menu.cap);
-  if (!cap) return [];
-  return [
-    label(t("ui.popup.audio_source")),
-    menuItem({ icon: "speaker", label: t("ui.capture.audio_with", { screen: captureName(cap) }), sub: (cap.audio && cap.audio.label) || t("ui.popup.audio_from_browser"), on: true, extra: A.liveMeter(() => captureLevel(cap)), onclick: done() }),
-    sep(),
-    menuItem({ icon: cap.audioMuted ? "volume_up" : "volume_off", label: cap.audioMuted ? t("ui.bar.unmute_audio") : t("ui.bar.mute_audio"), cls: cap.audioMuted ? "" : "danger", onclick: done(() => setAudioMuted(cap, !cap.audioMuted)) }),
-    h("div", { class: "mrow cap", text: t("ui.popup.audio_browser_note") }),
-  ];
+/** Shared audio. A browser decides what audio can be shared (D9: Desktop audio, groups and the exclusion list are native Linux only, a browser can't list apps):
+ *  the audio that came with the picked screen (its mute and meter) and an audio-only share of its own, picked in the browser's picker (a tab, or the system). */
+function audioMenu(view) {
+  const r = shareRoomOf(view);
+  if (!r) return [];
+  const cap = capInRoom(r.id) || stagedFor(r.id);
+  const aud = audioInRoom(r.id);
+  const out = [label(t("ui.popup.audio_source"))];
+  if (cap && cap.audio) {
+    out.push(menuItem({ icon: "speaker", label: t("ui.capture.audio_with", { screen: captureName(cap) }), sub: (cap.audio && cap.audio.label) || t("ui.popup.audio_from_browser"), on: true, extra: A.liveMeter(() => captureLevel(cap)), onclick: done() }));
+  }
+  if (aud) {
+    out.push(menuItem({ icon: "music_note", label: aud.label, sub: t("ui.popup.audio_only_sub"), on: true, extra: A.liveMeter(() => captureLevel(aud)), onclick: done() }));
+  } else {
+    out.push(menuItem({ icon: "music_note", label: t("ui.popup.audio_only_item"), sub: t("ui.popup.audio_only_item_sub"), disabled: r.state !== "joined", onclick: done(() => startAudio(r)) }));
+  }
+  out.push(sep());
+  if (cap && cap.audio) {
+    out.push(menuItem({ icon: cap.audioMuted ? "volume_up" : "volume_off", label: cap.audioMuted ? t("ui.bar.unmute_audio") : t("ui.bar.mute_audio"), cls: cap.audioMuted ? "" : "danger", onclick: done(() => setAudioMuted(cap, !cap.audioMuted)) }));
+  }
+  if (aud) {
+    out.push(menuItem({ icon: aud.audioMuted ? "volume_up" : "volume_off", label: aud.audioMuted ? t("ui.bar.unmute_audio") : t("ui.bar.mute_audio"), onclick: done(() => setAudioMuted(aud, !aud.audioMuted)) }));
+    out.push(menuItem({ icon: "stop_circle", label: t("ui.popup.audio_stop"), cls: "danger", onclick: done(() => { stopDest(aud, r.id); toast(t("ui.toast.stopped_in", { room: r.name }), "stop_circle"); }) }));
+  }
+  out.push(h("div", { class: "mrow cap", text: t("ui.popup.audio_browser_note") }));
+  return out;
+}
+
+/** The webcam's arrow (D1: "only offers the camera and 'All webcam settings…'"): the cameras the browser lists, the current one ticked, then the modal. */
+function camMenu(view) {
+  const r = shareRoomOf(view);
+  if (!r) return [];
+  const list = cameras();
+  const cur = camChoice();
+  const out = [label(t("ui.webcam.camera_heading"))];
+  if (!list.length) out.push(h("div", { class: "mrow cap", text: camsListing() ? t("ui.bar.webcam_looking") : t("ui.bar.webcam_none") }));
+  for (const cam of list) out.push(menuItem({ icon: "videocam", label: cam.name, on: cam === cur, onclick: done(() => useCamera(cam)) }));
+  out.push(sep());
+  out.push(menuItem({ icon: "tune", label: t("ui.webcam.all_settings"), onclick: done(() => A.openModal({ kind: "webcam", room: r.id })) }));
+  return out;
 }
 
 function layoutMenu() {
@@ -152,7 +184,7 @@ function layoutMenu() {
     label(t("ui.stage.layout_heading")),
     ...LAYOUTS.map(([k, icon, name, sub]) => menuItem({ icon, label: t(name), sub: t(sub), on: cur === k, onclick: done(() => setLayout(key, k)) })),
     sep(),
-    checkRow(t("ui.stage.pip"), false, () => {}, t("ui.bar.webcam_soon"), true),
+    checkRow(t("ui.stage.pip"), pipOn(key), stay(() => (pipOn(key) ? S.stage.pip.delete(key) : S.stage.pip.add(key))), t("ui.stage.pip_tip_menu")),
     checkRow(t("ui.stage.always_names"), S.stage.alwaysNames, stay(() => (S.stage.alwaysNames = !S.stage.alwaysNames)), t("ui.stage.always_names_tip")),
     checkRow(t("ui.stage.hide_own"), S.stage.hideOwn, stay(() => (S.stage.hideOwn = !S.stage.hideOwn)), t("ui.stage.hide_own_tip")),
     sep(),
@@ -180,31 +212,45 @@ function roomMenu() {
 
 /* ---------- the stream menu ---------- */
 
+/** The stream menu's volume block: mute button, slider (0-500 %, acting during the drag, snapping at 100 %), the % and the Level loudness switch. */
+function volumeRows(r, w) {
+  const pctEl = h("span", { class: "pct", text: w.muted ? t("ui.tile.muted") : Math.round(w.vol * 100) + "%" });
+  const slider = h("input", { type: "range", class: "vol", min: "0", max: String(VOLUME_MAX_PCT), step: "5", value: String(Math.round(w.vol * 100)), disabled: w.muted, "aria-label": t("ui.stage.volume") });
+  // Acts during the drag, not on release (D1): every input event sets the decoder's gain.
+  slider.addEventListener("input", (ev) => {
+    if (!ev.fromWheel) slider.value = String(snapVolumePct(Number(slider.value)));
+    setWatchVolume(r, w, Number(slider.value) / 100);
+    pctEl.textContent = slider.value + "%";
+    pct(slider);
+  });
+  volumeWheel(slider);
+  return [
+    label(t("ui.stage.volume")),
+    h("div", { class: "mrow" },
+      h("button", { type: "button", class: "icon-btn sm", title: w.muted ? t("ui.room.unmute") : t("ui.tile.mute"), "aria-label": w.muted ? t("ui.room.unmute") : t("ui.tile.mute"), onclick: stay(() => { r.client && r.client.resumeAudio(); setWatchMuted(r, w, !w.muted); }) }, ic(w.muted ? "volume_off" : "volume_up")),
+      slider, pctEl),
+    switchRow("graphic_eq", t("ui.room.level_label"), S.settings.levelLoudness, stay(() => { S.settings.levelLoudness = !S.settings.levelLoudness; persistSettings(); applyLevelLoudness(); })),
+  ];
+}
+
 function tileMenu() {
   const M = S.menu;
   const view = viewOf(M.viewKey);
   const it = view && itemById(view, M.itemId);
   if (!it) return [];
   const { r, w, s, mine } = it;
-  const out = [head(avatarEl(it.owner, r.emojiByName(it.owner) || (mine ? S.settings.emoji : ""), { sm: true }), mine ? t("ui.stage.your_stream") : it.owner,
-    `${it.label} · ${view.kind === "watched" ? r.name : mine ? captureRes(it.c) : [s.width ? `${s.width}×${s.height}` : ""].filter(Boolean).join("")}`)];
+  const out = [head(avatarEl(it.owner, r.emojiByName(it.owner) || (mine ? S.settings.emoji : ""), { sm: true }), mine ? (it.cam ? t("ui.stage.your_webcam") : t("ui.stage.your_stream")) : it.owner,
+    `${it.label} · ${view.kind === "watched" ? r.name : mine ? captureRes(it.c) : it.kind === "audio" ? t("ui.room.audio_only") : [s.width ? `${s.width}×${s.height}` : ""].filter(Boolean).join("")}`)];
+  if (it.kind === "audio") {
+    // an audio-only sender: volume while listening, and Listen / Stop listening
+    if (w) out.push(...volumeRows(r, w));
+    if (w) out.push(sep());
+    out.push(menuItem({ icon: w ? "volume_off" : "volume_up", label: w ? t("ui.room.stop_listening") : t("ui.room.listen"), onclick: done(() => (w ? unwatchStream(r, w.key) : watchStream(r, s.key))) }));
+    return out;
+  }
   if (w) {
-    if (r.hasAudio(s.owner)) {
-      const pctEl = h("span", { class: "pct", text: w.muted ? t("ui.tile.muted") : Math.round(w.vol * 100) + "%" });
-      const slider = h("input", { type: "range", class: "vol", min: "0", max: String(VOLUME_MAX_PCT), step: "5", value: String(Math.round(w.vol * 100)), disabled: w.muted, "aria-label": t("ui.stage.volume") });
-      // Acts during the drag, not on release (D1): every input event sets the decoder's gain.
-      slider.addEventListener("input", (ev) => {
-        if (!ev.fromWheel) slider.value = String(snapVolumePct(Number(slider.value)));
-        setWatchVolume(r, w, Number(slider.value) / 100);
-        pctEl.textContent = slider.value + "%";
-        pct(slider);
-      });
-      volumeWheel(slider);
-      out.push(label(t("ui.stage.volume")));
-      out.push(h("div", { class: "mrow" },
-        h("button", { type: "button", class: "icon-btn sm", title: w.muted ? t("ui.room.unmute") : t("ui.tile.mute"), "aria-label": w.muted ? t("ui.room.unmute") : t("ui.tile.mute"), onclick: stay(() => { r.client && r.client.resumeAudio(); setWatchMuted(r, w, !w.muted); }) }, ic(w.muted ? "volume_off" : "volume_up")),
-        slider, pctEl));
-      out.push(switchRow("graphic_eq", t("ui.room.level_label"), S.settings.levelLoudness, stay(() => { S.settings.levelLoudness = !S.settings.levelLoudness; persistSettings(); applyLevelLoudness(); })));
+    if (!it.cam && r.hasAudio(s.owner)) {
+      out.push(...volumeRows(r, w));
     } else out.push(h("div", { class: "mrow dim" }, ic("volume_off"), t("ui.stage.no_audio_stream")));
     out.push(switchRow("monitoring", t("ui.stage.show_stats"), S.stage.stats.has(it.id), stay(() => (S.stage.stats.has(it.id) ? S.stage.stats.delete(it.id) : S.stage.stats.add(it.id)))));
   }
@@ -213,6 +259,9 @@ function tileMenu() {
     if (popoutMode()) out.push(menuItem({ icon: "open_in_new", label: t("ui.room.pop_out"), onclick: done(() => A.doPopOut(r, w)) }));
     out.push(menuItem({ icon: "fullscreen", label: t("ui.stage.fullscreen"), onclick: done(() => A.doFullscreen(r, w)) }));
     out.push(menuItem({ icon: "visibility_off", label: t("ui.room.stop_watching"), cls: "danger", onclick: done(() => unwatchStream(r, w.key)) }));
+  } else if (mine && it.cam) {
+    out.push(menuItem({ icon: "tune", label: t("ui.webcam.settings_item"), onclick: done(() => A.openModal({ kind: "webcam", room: r.id })) }));
+    out.push(menuItem({ icon: "videocam_off", label: t("ui.webcam.stop_item"), cls: "danger", onclick: done(() => { stopWebcam(); toast(t("ui.toast.stopped_in", { room: r.name }), "videocam_off"); }) }));
   } else if (mine) {
     out.push(menuItem({ icon: "tune", label: t("ui.bar.all_stream_settings"), onclick: done(() => A.openStreamModal(it.c.id, r.id)) }));
     out.push(menuItem({ icon: "stop_screen_share", label: t("ui.bar.stop_sharing"), cls: "danger", onclick: done(() => { stopDest(it.c, r.id); toast(t("ui.toast.stopped_in", { room: r.name }), "stop_circle"); }) }));
@@ -227,11 +276,17 @@ function tileMenu() {
 
 function outgoingMenu() {
   const out = [label(t("ui.sidebar.outgoing.heading"))];
-  const ds = allDests();
+  const ds = allSends();
   if (!ds.length) out.push(h("div", { class: "mrow cap", text: t("ui.sidebar.outgoing.none") }));
   for (const { cap, d } of ds) {
     const rr = roomById(d.roomId);
-    out.push(menuItem({ icon: "cast", label: rr ? rr.name : "?", sub: t("ui.sidebar.outgoing.sub", { screen: captureName(cap), fps: d.fps, kbps: allocated(d) }), onclick: done(() => rr && A.selectRoom(rr, () => A.openStreamModal(cap.id, rr.id))) }));
+    if (cap.kind === "audio") {
+      out.push(menuItem({ icon: "music_note", label: rr ? rr.name : "?", sub: t("ui.sidebar.outgoing.audio_sub", { source: captureName(cap) }), onclick: done(() => rr && A.selectRoom(rr)) }));
+    } else if (cap.kind === "webcam") {
+      out.push(menuItem({ icon: "videocam", label: rr ? rr.name : "?", sub: t("ui.sidebar.outgoing.sub", { screen: captureName(cap), fps: d.fps, kbps: allocated(d) }), onclick: done(() => rr && A.selectRoom(rr, () => A.openModal({ kind: "webcam", room: rr.id }))) }));
+    } else {
+      out.push(menuItem({ icon: "cast", label: rr ? rr.name : "?", sub: t("ui.sidebar.outgoing.sub", { screen: captureName(cap), fps: d.fps, kbps: allocated(d) }), onclick: done(() => rr && A.selectRoom(rr, () => A.openStreamModal(cap.id, rr.id))) }));
+    }
   }
   if (ds.length) {
     out.push(sep());
@@ -303,7 +358,7 @@ function ddMenu() {
   return M.opts.map(([v, text, sub, icon]) => menuItem({ icon, label: text, sub, on: String(v) === String(M.cur), role: "option", onclick: done(() => M.onPick(v)) }));
 }
 
-const BODIES = { share: shareMenu, audio: audioMenu, layout: layoutMenu, room: roomMenu, tile: tileMenu, outgoing: outgoingMenu, alsosend: () => targetsMenu("alsosend"), move: () => targetsMenu("move"), emoji: emojiMenu, dd: ddMenu };
+const BODIES = { share: shareMenu, audio: audioMenu, cam: camMenu, layout: layoutMenu, room: roomMenu, tile: tileMenu, outgoing: outgoingMenu, alsosend: () => targetsMenu("alsosend"), move: () => targetsMenu("move"), emoji: emojiMenu, dd: ddMenu };
 
 /** The open menu as an element for host `hostId` ("main" | "pop"), or null. */
 export function renderMenu(hostId) {

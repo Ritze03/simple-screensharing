@@ -35,6 +35,10 @@ const NACK_TICK_MS = 5; // poll the reassembler this often while a frame is inco
 const NACK_DEFAULT_RTT_MS = 150; // when the browser does not report a smoothed RTT (WebTransport getStats)
 
 export const streamKey = (ownerHex, streamId) => `${ownerHex}:${streamId}`;
+
+/** A webcam is an ordinary video stream whose label starts with "Webcam" (plan D7; native `capture::webcam::is_webcam_label`). */
+export const WEBCAM_LABEL = "Webcam";
+export const isWebcamLabel = (label) => String(label ?? "").startsWith(WEBCAM_LABEL);
 const parseKey = (key) => {
   const [owner, sid] = String(key).split(":");
   return { owner, streamId: Number(sid) };
@@ -606,7 +610,7 @@ export class RoomClient extends EventTarget {
   /** Streams of `owner` that are audio (the sibling the native client auto-subscribes). */
   #siblingAudioKey(videoKey) {
     const v = this.streams.get(videoKey);
-    if (!v || v.kind !== "video") return null;
+    if (!v || v.kind !== "video" || isWebcamLabel(v.label)) return null; // a webcam is no video for the audio that follows video (native `owner_has_video`)
     for (const s of this.streams.values()) if (s.owner === v.owner && s.kind === "audio") return s.key;
     return null;
   }
@@ -626,7 +630,7 @@ export class RoomClient extends EventTarget {
     if (this.watches.has(key)) return this.watches.get(key);
     if (info.kind === "video" && !capabilities().webCodecsDecode) throw new Error("This browser has no WebCodecs VideoDecoder.");
     const handle = new WatchHandle(this, key, null);
-    handle.followAudio = info.kind === "video" && audio;
+    handle.followAudio = info.kind === "video" && audio && !isWebcamLabel(info.label);
     this.watches.set(key, handle);
     if (canvas) handle.attachToCanvas(canvas);
     if (onFrame) handle.setFrameCallback(onFrame);
@@ -1161,22 +1165,28 @@ export class RoomClient extends EventTarget {
     share.subscribers = 0;
     share.audioSubscribers = 0;
     share.viewerIds = [];
-    s.send({ type: "AnnounceStream", streamId: share.videoStreamId, kind: "video", label: clampUtf8(share.label), width: share.width, height: share.height }).catch(() => {});
+    if (share.videoStreamId != null) {
+      s.send({ type: "AnnounceStream", streamId: share.videoStreamId, kind: "video", label: clampUtf8(share.label), width: share.width, height: share.height }).catch(() => {});
+    }
     if (share.audioStreamId != null) {
       s.send({ type: "AnnounceStream", streamId: share.audioStreamId, kind: "audio", label: clampUtf8(share.audioLabel), width: 0, height: 0 }).catch(() => {});
     }
-    share.sender.requestKeyframe();
+    if (share.sender) share.sender.requestKeyframe();
   }
 
   /**
    * Share a screen/window/tab (and optionally its audio) into the room.
    * @param {object} [o]
    * @param {boolean} [o.audio=false]         also capture and share audio (where the browser offers it)
+   * @param {boolean} [o.audioOnly=false]     share ONLY the stream's audio track as an audio-only share (no video stream is announced; a
+   *                                          video track in `o.stream` is ignored, the caller stops it). Throws when there is no audio track.
    * @param {"auto"|"h264"|"h265"|"av1"} [o.codec="auto"]  "auto" = H.264 (hardware-decodable everywhere)
    * @param {number} [o.fps=60]
    * @param {number} [o.bitrateKbps=8000]
    * @param {"text"|"quality"|"gaming"} [o.preset="quality"] ("balanced" and "low_latency" are aliases of quality)
-   * @param {string} [o.label="Screen"]
+   * @param {string} [o.label="Screen"]               the stream label ("Webcam" makes it a webcam, by the label rule of `isWebcamLabel`)
+   * @param {number} [o.gopMs]                        keyframe interval (default: the preset's)
+   * @param {"quality"|"realtime"} [o.latencyMode]    encoder mode (default: the preset's)
    * @param {MediaStream} [o.stream]          use this stream instead of calling getDisplayMedia (tests, custom pickers)
    * @param {object} [o.displayMediaOptions]  merged into the getDisplayMedia() argument
    * @param {boolean} [o.previews=true]
@@ -1185,6 +1195,7 @@ export class RoomClient extends EventTarget {
   async startShare(o = {}) {
     if (this.state !== "connected") throw new Error("join a room before sharing");
     const caps = capabilities();
+    const audioOnly = !!o.audioOnly;
     if (!caps.canShare && !o.stream) throw new Error("Sharing needs WebCodecs, MediaStreamTrackProcessor and getDisplayMedia (a current Chromium-based browser).");
     const fps = o.fps ?? 60;
     const bitrateKbps = o.bitrateKbps ?? 8000;
@@ -1193,32 +1204,38 @@ export class RoomClient extends EventTarget {
     let ownsStream = false;
     if (!stream) {
       stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { frameRate: { ideal: fps, max: fps }, ...(o.width ? { width: { ideal: o.width } } : {}), ...(o.height ? { height: { ideal: o.height } } : {}) },
-        audio: o.audio ? { echoCancellation: false, noiseSuppression: false, autoGainControl: false } : false,
+        // an audio-only share still has to ask for video (browsers refuse audio alone); the video track is stopped below
+        video: audioOnly ? true : { frameRate: { ideal: fps, max: fps }, ...(o.width ? { width: { ideal: o.width } } : {}), ...(o.height ? { height: { ideal: o.height } } : {}) },
+        audio: o.audio || audioOnly ? { echoCancellation: false, noiseSuppression: false, autoGainControl: false } : false,
         ...(o.displayMediaOptions || {}),
       });
       ownsStream = true;
     }
-    const videoTrack = stream.getVideoTracks()[0];
-    if (!videoTrack) throw new Error("the selected source has no video track");
-    const audioTrack = o.audio !== false ? stream.getAudioTracks()[0] || null : null;
+    if (audioOnly && ownsStream) for (const v of stream.getVideoTracks()) v.stop();
+    const videoTrack = audioOnly ? null : stream.getVideoTracks()[0];
+    if (!audioOnly && !videoTrack) throw new Error("the selected source has no video track");
+    const audioTrack = audioOnly || o.audio !== false ? stream.getAudioTracks()[0] || null : null;
+    if (audioOnly && !audioTrack) {
+      if (ownsStream) stream.getTracks().forEach((t) => t.stop());
+      throw new Error("the selected source has no audio track");
+    }
     if (o.audio && !audioTrack && ownsStream) {
       this.dispatchEvent(new CustomEvent("share", { detail: { state: "no-audio", message: "The browser did not offer audio for this source (choose a tab, or enable 'Share system audio' where supported)." } }));
     }
 
     const codec = !o.codec || o.codec === "auto" ? "h264" : o.codec;
     const clock = new MediaClock();
-    const videoStreamId = this.#allocStreamId();
-    const settings = videoTrack.getSettings();
+    const videoStreamId = audioOnly ? null : this.#allocStreamId();
+    const settings = videoTrack ? videoTrack.getSettings() : {};
     const share = new ShareHandle(this, {
-      stream, ownsStream, videoTrack, audioTrack, codec, fps, bitrateKbps, label: o.label ?? "Screen", audioLabel: `${o.label ?? "Screen"} audio`,
-      videoStreamId, audioStreamId: null, width: settings.width || 0, height: settings.height || 0, audioMuted: false, previewEnabled: o.previews !== false,
+      stream, ownsStream, videoTrack, audioTrack, codec, fps, bitrateKbps, label: o.label ?? (audioOnly ? "Audio" : "Screen"), audioLabel: audioOnly ? (o.label ?? "Audio") : `${o.label ?? "Screen"} audio`,
+      audioOnly, videoStreamId, audioStreamId: null, width: settings.width || 0, height: settings.height || 0, audioMuted: false, previewEnabled: !audioOnly && o.previews !== false,
       sampler: new PreviewSampler(), previewDue: false, previewTimer: null,
     });
     this.shares.push(share); // reserve the id before allocating the audio one
     if (audioTrack) share.audioStreamId = this.#allocStreamId();
 
-    share.sender = new VideoSender({
+    if (!audioOnly) share.sender = new VideoSender({
       track: videoTrack, codec, fps, bitrateKbps, clock,
       gopMs: o.gopMs ?? preset.gopMs, latencyMode: o.latencyMode ?? preset.latencyMode,
       hardwareAcceleration: o.hardwareAcceleration ?? this.hardwareAcceleration,
@@ -1243,13 +1260,13 @@ export class RoomClient extends EventTarget {
       },
     });
     try {
-      await share.sender.start();
+      if (share.sender) await share.sender.start();
     } catch (e) {
       this.shares.splice(this.shares.indexOf(share), 1);
       if (ownsStream) stream.getTracks().forEach((t) => t.stop());
       throw e;
     }
-    share.codecString = share.sender.stats.codecString;
+    share.codecString = share.sender ? share.sender.stats.codecString : null;
 
     if (audioTrack) {
       share.audioSender = new AudioSender({
@@ -1262,6 +1279,12 @@ export class RoomClient extends EventTarget {
       try {
         await share.audioSender.start();
       } catch (e) {
+        if (audioOnly) {
+          // an audio-only share with no working encoder has nothing left to send
+          this.shares.splice(this.shares.indexOf(share), 1);
+          if (ownsStream) stream.getTracks().forEach((t) => t.stop());
+          throw e;
+        }
         emitError(this, "audio-share-unavailable", e);
         share.audioSender = null;
         share.audioStreamId = null;
@@ -1269,7 +1292,7 @@ export class RoomClient extends EventTarget {
       }
     }
 
-    videoTrack.addEventListener("ended", () => {
+    (videoTrack || audioTrack).addEventListener("ended", () => {
       this.dispatchEvent(new CustomEvent("share", { detail: { state: "ended-by-browser", share } }));
       this.stopShare(share);
     });
@@ -1277,7 +1300,7 @@ export class RoomClient extends EventTarget {
     this.#announceShare(share);
     this.#startPreviewTimer(share);
     // A damage-driven capture of a completely static source can stay silent; tell the UI instead of looking dead.
-    share.noFrameTimer = setTimeout(() => {
+    if (share.sender) share.noFrameTimer = setTimeout(() => {
       if (!share.ended && share.sender.stats.captured === 0) {
         this.dispatchEvent(new CustomEvent("share", { detail: { state: "no-frames", share, message: "The capture source has not delivered a single frame yet (a static screen, or a capture problem)." } }));
       }
@@ -1319,7 +1342,7 @@ export class RoomClient extends EventTarget {
     if (share.ownsStream) share.stream.getTracks().forEach((t) => t.stop());
     const s = this.session;
     if (s) {
-      s.send({ type: "StopStream", streamId: share.videoStreamId }).catch(() => {});
+      if (share.videoStreamId != null) s.send({ type: "StopStream", streamId: share.videoStreamId }).catch(() => {});
       if (share.audioStreamId != null) s.send({ type: "StopStream", streamId: share.audioStreamId }).catch(() => {});
     }
     this.tx.delete(share.videoStreamId);
@@ -1329,7 +1352,7 @@ export class RoomClient extends EventTarget {
   }
 
   _shareStats(share) {
-    const v = share.sender.getStats();
+    const v = share.sender ? share.sender.getStats() : {};
     const tx = this.tx.get(share.videoStreamId);
     return {
       ...v,

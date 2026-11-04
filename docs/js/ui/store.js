@@ -58,6 +58,17 @@ function normalizeStream(st) {
   return st;
 }
 
+const WEBCAM_CODECS = ["h264", "av1", "h265"];
+function normalizeWebcam(w) {
+  w = w && typeof w === "object" ? w : {};
+  return {
+    cameraId: typeof w.cameraId === "string" ? w.cameraId : "",
+    mode: typeof w.mode === "string" && /^\d+x\d+@\d+$/.test(w.mode) ? w.mode : "",
+    codec: WEBCAM_CODECS.includes(w.codec) ? w.codec : "h264",
+    kbps: Number.isFinite(w.kbps) ? Math.min(12000, Math.max(200, Math.round(w.kbps))) : 2500,
+  };
+}
+
 export function loadSettings() {
   const s = read(K_SETTINGS) || {};
   const out = {
@@ -78,6 +89,9 @@ export function loadSettings() {
     // The presets are Text, Quality and Gaming (I2); a stored "balanced" or "low_latency" (and anything unknown) is Quality, like the
     // native settings file (`rooms::StartStreamDefaults`).
     stream: normalizeStream(Object.assign({ fps: 60, codec: "h264", preset: "quality", kbps: 6000, audio: true }, s.stream || {})),
+    // The webcam (task I10; native `WebcamSettings`): the camera's device id ("" = the first one), its mode `WxH@fps` ("" = the default, 1280x720 at 30),
+    // the codec and the bitrate (200-12000 kbps, default 2500). The encoder is fixed: Performance, keyframe 2000 ms.
+    webcam: normalizeWebcam(s.webcam),
     // Settings > Profile: my emoji avatar ("" = none), announced to every room's relay (core `setAvatar`).
     emoji: typeof s.emoji === "string" ? s.emoji.trim() : "",
     lastServer: typeof s.lastServer === "string" ? s.lastServer : "",
@@ -111,6 +125,7 @@ export const S = {
   stage: {
     layouts: {}, // view key ("room:<id>" | "watched") -> "split" | "crop" | "float"
     hideOwn: false,
+    pip: new Set(), // view keys with "Webcam in picture" on (per view, off until switched on: native `StageSettings::pip`)
     alwaysNames: false,
     stripHidden: false, // the people button hid the strip
     sidebarHidden: false,

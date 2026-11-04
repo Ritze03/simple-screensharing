@@ -15,6 +15,8 @@ import { CanvasRenderer, VideoReceiver } from "../js/core/video-rx.js";
 import { ENCODER_PRESETS } from "../js/core/video-tx.js";
 import { avatarBg, avatarColors, avatarHue, pickEmoji, sliderCtl, snapVolumePct, wheelStepVolumePct, volumeWheel, VOLUME_MAX_PCT } from "../js/ui/dom.js";
 import * as G from "../js/ui/stage-geom.js";
+import { pipPairs, shareLabel } from "../js/ui/stage-state.js";
+import { isWebcamLabel } from "../js/core/room-client.js";
 import { CHROME_IDLE_MS, chromeRemaining, chromeStart, chromeStep } from "../js/ui/chrome.js";
 import { loadSettings } from "../js/ui/store.js";
 import { Gate, MIN_GAP_MS, RESUME_QUIET_MS, RoomSounds, SOUNDS, SOUND_NAMES, soundPlan } from "../js/ui/sounds.js";
@@ -1071,7 +1073,7 @@ test("volume: sliders apply on the input event, while the thumb is still being d
   // The viewer volume slider (menus.js tileMenu, the stream menu) is not importable without a stage: guard its wiring by source.
   // It must listen to `input` (fires per drag step) and never to `change` (fires on release only).
   const src = await (await fetch(new URL("../js/ui/menus.js", import.meta.url))).text();
-  const menu = src.slice(src.indexOf("function tileMenu("), src.indexOf("/* ---------- other menus"));
+  const menu = src.slice(src.indexOf("function volumeRows("), src.indexOf("/* ---------- other menus"));
   ok(menu.includes('slider.addEventListener("input"') && menu.includes("setWatchVolume(r, w,"), "the stream menu applies the gain on input");
   ok(!/slider\.addEventListener\("change"|onchange/.test(menu), "the stream menu has no change-only path");
   ok(menu.includes("volumeWheel(slider)"), "the stream menu's slider takes the wheel");
@@ -1755,6 +1757,211 @@ test("stage geometry: corner resize uses width and height together (also moving 
   near(m.x * 1000, 0.2 * 1000 + 60); near(m.y * 500, 0.2 * 500 - 30);
   const far = G.moveFloat({ x: 0.2, y: 0.2, w: 0.3, h: 0.3 }, 9999, -9999, 1000, 500);
   near(far.x + far.w, 1, 1e-6); near(far.y, 0, 1e-6);
+});
+
+// ------------------------------------------------------------------------------------------------ webcam in picture (I10; port of the I8 tests in client/src/ui/stage/geom.rs and stage/mod.rs)
+
+const CAM = 16 / 9;
+const inside = (r, o) => r.x >= o.x - 1e-3 && r.y >= o.y - 1e-3 && r.x + r.w <= o.x + o.w + 1e-3 && r.y + r.h <= o.y + o.h + 1e-3;
+const pip = (o = {}) => ({ ...G.defaultPip(), ...o });
+const lay = (tw, th, crop, p) => G.layoutPip(tw, th, AR, CAM, crop, p);
+
+test("pip geometry: spots sit in the corners and the middles, the inset shrinks in small pictures", () => {
+  eq(G.PIP_INSET, 12); eq(G.PIP_MIN, 72);
+  eq(G.pipAt(0, 1000, 200, 0), G.PIP_INSET);
+  eq(G.pipAt(0, 1000, 200, 1), 400);
+  eq(G.pipAt(0, 1000, 200, 2), 1000 - 200 - G.PIP_INSET);
+  eq(G.pipAt(0, 210, 200, 0), 5);
+  eq(G.pipAt(0, 210, 200, 2), 5);
+  eq(G.pipAt(50, 100, 100, 0), 50);
+  eq(G.pipAt(50, 100, 150, 2), 0, "a PIP bigger than the picture hangs over, inset 0");
+});
+
+test("pip geometry: a new PIP is bottom right, a quarter of the picture wide, 12 px from both edges; its handle faces the middle", () => {
+  eq(G.defaultPip(), { w: 0.24, spot: [2, 2], x: 0, y: 0 });
+  const g = lay(1000, 1000 / AR, false, pip());
+  near(g.rect.w, 240); near(g.rect.h, 240 / CAM);
+  near(g.vis.x + g.vis.w - (g.rect.x + g.rect.w), G.PIP_INSET); near(g.vis.y + g.vis.h - (g.rect.y + g.rect.h), G.PIP_INSET);
+  eq(g.corner, { right: false, bottom: false }, "bottom right: the handle faces the middle, top left");
+  const at = (s) => lay(1000, 1000 / AR, false, pip({ spot: s })).corner;
+  eq(at([0, 0]), { right: true, bottom: true });
+  eq(at([2, 0]), { right: false, bottom: true });
+  eq(at([0, 2]), { right: true, bottom: false });
+  eq(at([2, 2]), { right: false, bottom: false });
+});
+
+test("pip geometry: a spot survives tile resizes and layouts (same inset from the same edges, inside what shows)", () => {
+  for (const spot of [[0, 0], [1, 0], [2, 0], [0, 1], [2, 1], [0, 2], [1, 2], [2, 2]]) {
+    for (const [tw, th, crop] of [[1000, 1000 / AR, false], [400, 400 / AR, false], [500, 700, true], [1900, 1000, true], [1920, 1080, false]]) {
+      const g = lay(tw, th, crop, pip({ spot }));
+      const [cx, cy] = [g.rect.x + g.rect.w / 2, g.rect.y + g.rect.h / 2];
+      const [vcx, vcy] = [g.vis.x + g.vis.w / 2, g.vis.y + g.vis.h / 2];
+      if (spot[0] === 0) near(g.rect.x - g.vis.x, G.PIP_INSET, 1e-3, `${spot} ${tw}x${th}`);
+      else if (spot[0] === 1) near(cx, vcx);
+      else near(g.vis.x + g.vis.w - (g.rect.x + g.rect.w), G.PIP_INSET);
+      if (spot[1] === 0) near(g.rect.y - g.vis.y, G.PIP_INSET, 1e-3, `${spot} ${tw}x${th}`);
+      else if (spot[1] === 1) near(cy, vcy);
+      else near(g.vis.y + g.vis.h - (g.rect.y + g.rect.h), G.PIP_INSET);
+      ok(inside(g.rect, g.vis), `${spot} ${tw}x${th} crop=${crop} ${show(g.rect)} not in ${show(g.vis)}`);
+    }
+  }
+});
+
+test("pip geometry: in Crop the PIP stays in the visible centre and the stored value is kept", () => {
+  const p = pip();
+  const g = lay(400, 700, true, p);
+  ok(g.pic.w > 401, "the picture is cropped at the sides");
+  eq(g.vis, R(0, 0, 400, 700));
+  ok(inside(g.rect, g.vis));
+  ok(g.rect.w <= 400 + 1e-3, "width is a fraction of the picture, capped by what shows");
+  const split = lay(1000, 1000 / AR, false, p);
+  near(split.vis.x + split.vis.w - (split.rect.x + split.rect.w), G.PIP_INSET, 1e-3, "back in Split the same stored position gives the unscaled corner");
+});
+
+test("pip geometry: never smaller than the minimum nor bigger than what shows", () => {
+  near(lay(200, 200 / AR, false, pip({ w: 0.01 })).rect.w, G.PIP_MIN);
+  near(lay(200, 200 / AR, false, pip({ w: 5 })).rect.w, 200, 1e-3, "no bigger than the visible width");
+  const small = lay(60, 60 / AR, false, pip());
+  ok(inside(small.rect, small.vis), "a tile smaller than the minimum: the PIP fills what shows");
+});
+
+test("pip geometry: a released PIP goes to the nearest of the eight spots; a click leaves the spot; the middle is no spot", () => {
+  const [tw, th] = [1000, 1000 / AR];
+  const base = lay(tw, th, false, pip());
+  const cases = [[-2000, -2000, [0, 0]], [-300, -2000, [1, 0]], [2000, -2000, [2, 0]], [-2000, -200, [0, 1]], [0, -200, [2, 1]], [-2000, 2000, [0, 2]], [-380, 2000, [1, 2]], [5, 5, [2, 2]]];
+  for (const [dx, dy, want] of cases) {
+    const p = pip();
+    G.movePip(base, dx, dy, p);
+    eq(p.spot, null, "free during the drag");
+    const g = lay(tw, th, false, p);
+    G.snapPip(g, p);
+    eq(p.spot, want, `dragged by ${dx},${dy}`);
+    ok(inside(lay(tw, th, false, p).rect, g.vis));
+  }
+  const click = pip({ spot: [0, 1] });
+  G.snapPip(lay(tw, th, false, click), click);
+  eq(click.spot, [0, 1]);
+  const mid = pip();
+  G.movePip(base, base.vis.x + base.vis.w / 2 - (base.rect.x + base.rect.w / 2), base.vis.y + base.vis.h / 2 - (base.rect.y + base.rect.h / 2), mid);
+  G.snapPip(lay(tw, th, false, mid), mid);
+  ok(!(mid.spot[0] === 1 && mid.spot[1] === 1), "the middle of the picture is no spot");
+});
+
+test("pip geometry: a drag stops at the edge of the visible picture, in Crop too, and a move never resizes", () => {
+  for (const [tw, th, crop] of [[1000, 1000 / AR, false], [400, 700, true], [1900, 600, true]]) {
+    const base = lay(tw, th, crop, pip());
+    for (const [dx, dy] of [[-9999, -9999], [9999, 9999], [-9999, 9999], [37, -11]]) {
+      const p = pip();
+      G.movePip(base, dx, dy, p);
+      const g = lay(tw, th, crop, p);
+      ok(inside(g.rect, g.vis), `${tw}x${th} crop=${crop} d=${dx},${dy}: ${show(g.rect)} outside ${show(g.vis)}`);
+      near(g.rect.w, base.rect.w, 1e-2); near(g.rect.h, base.rect.h, 1e-2);
+    }
+  }
+  const base = lay(1000, 1000 / AR, false, pip());
+  const p = pip();
+  G.movePip(base, -40, -25, p);
+  const g = lay(1000, 1000 / AR, false, p);
+  near(g.rect.x - base.rect.x, -40, 1e-2); near(g.rect.y - base.rect.y, -25, 1e-2);
+});
+
+test("pip geometry: a resize keeps the aspect and the opposite corner, stays inside, holds the minimum and leaves the spot", () => {
+  for (const [tw, th, crop] of [[1000, 1000 / AR, false], [500, 700, true]]) {
+    const base = lay(tw, th, crop, pip());
+    const c = base.corner;
+    eq(c, { right: false, bottom: false });
+    const [fx, fy] = [base.rect.x + base.rect.w, base.rect.y + base.rect.h];
+    const grown = pip();
+    G.resizePip(base, c, -80, -45, grown);
+    let g = lay(tw, th, crop, grown);
+    ok(g.rect.w > base.rect.w + 20, `${crop}: grows`);
+    near(g.rect.w / g.rect.h, CAM, 1e-3, "aspect holds");
+    ok(inside(g.rect, g.vis));
+    ok(Math.hypot(g.rect.x + g.rect.w - fx, g.rect.y + g.rect.h - fy) < 1, "the corner opposite the handle stays");
+    const shrunk = pip();
+    G.resizePip(base, c, 500, 500, shrunk);
+    g = lay(tw, th, crop, shrunk);
+    near(g.rect.w, Math.min(G.PIP_MIN, g.vis.w), 1e-2, "down to the minimum, not below");
+    const huge = pip();
+    G.resizePip(base, c, -9999, -9999, huge);
+    g = lay(tw, th, crop, huge);
+    ok(inside(g.rect, g.vis) && g.rect.w <= g.vis.w + 1e-3);
+    eq(huge.spot, [2, 2], "a resize leaves the spot");
+  }
+});
+
+// pairing (native `pip_pairs`): items are `{ id, kind, cam, owner, mine, r, popped, w }`
+const room1 = { id: "r1" };
+const item = (id, owner, cam, kind = "video", o = {}) => ({ id, kind, cam, owner, mine: false, r: room1, popped: false, w: kind === "video" ? {} : null, ...o });
+const pairsOf = (items) => pipPairs(items, items.map((i) => i.id));
+const flat = (m) => Object.fromEntries([...m].map(([k, v]) => [k, v.id]));
+
+test("pip pairing: a webcam goes into its owner's first playing screen share, whatever their order, and not into someone else's", () => {
+  let items = [item("s1", "Jonas", false), item("c1", "Jonas", true), item("s3", "Ana", false)];
+  eq(flat(pairsOf(items)), { s1: "c1" }, "Jonas's webcam sits in Jonas's screen, not Ana's");
+  items = [item("c1", "Jonas", true), item("s1", "Jonas", false)];
+  eq(flat(pairsOf(items)), { s1: "c1" }, "the webcam may come first");
+  items = [item("s1", "Jonas", false), item("s4", "Jonas", false), item("c1", "Jonas", true)];
+  eq(flat(pairsOf(items)), { s1: "c1" }, "the first screen share when there are two");
+});
+
+test("pip pairing: a webcam stays a tile with no playing share to sit in (none, not watched, popped out), or when it is not played itself", () => {
+  const none = (items) => pairsOf(items).size === 0;
+  ok(none([item("c1", "Jonas", true)]), "no screen share at all");
+  ok(none([item("s1", "Jonas", false, "idle"), item("c1", "Jonas", true)]), "the screen is not watched");
+  ok(none([item("s1", "Jonas", false), item("c1", "Jonas", true, "idle")]), "the webcam is not watched");
+  const popped = [item("s1", "Jonas", false, "video", { popped: true, w: { popped: "pip" } }), item("c1", "Jonas", true)];
+  ok(none(popped), "the screen is in its own window");
+  popped[0].popped = false;
+  popped[1].popped = true;
+  ok(none(popped), "so is the webcam");
+  ok(none([item("a1", "Jonas", false, "audio"), item("c1", "Jonas", true)]), "an audio-only sender is no picture");
+  eq(flat(pairsOf([item("s1", "Jonas", false, "video", { popped: true, w: { popped: "fullscreen" } }), item("c1", "Jonas", true)])), { s1: "c1" }, "the fullscreen of the stream takes its webcam along");
+});
+
+test("pip pairing: your webcam goes into your own screen, one parent holds one webcam, another room's person of the same name is another person", () => {
+  const mine = (id, cam) => item(id, "Me", cam, "mine", { mine: true, w: null });
+  eq(flat(pairsOf([mine("m1", false), mine("m2", true)])), { m1: "m2" });
+  eq(flat(pairsOf([item("s1", "Me", false), mine("m2", true)])), {}, "someone else called Me is not you");
+  const two = [item("s1", "Jonas", false), item("c1", "Jonas", true), item("c2", "Jonas", true)];
+  eq(flat(pairsOf(two)), { s1: "c1" }, "the second webcam keeps its tile");
+  const other = [item("s1", "Jonas", false), item("c1", "Jonas", true, "video", { r: { id: "r2" } })];
+  eq(pairsOf(other).size, 0);
+});
+
+test("webcam: settings default to the replica's (H.264, 2500 kbps, no mode) and a bad stored value is repaired", () => {
+  const prev = localStorage.getItem("sss.settings.v1");
+  try {
+    localStorage.removeItem("sss.settings.v1");
+    eq(loadSettings().webcam, { cameraId: "", mode: "", codec: "h264", kbps: 2500 });
+    localStorage.setItem("sss.settings.v1", JSON.stringify({ webcam: { cameraId: "abc", mode: "1280x720@30", codec: "av1", kbps: 99999 } }));
+    eq(loadSettings().webcam, { cameraId: "abc", mode: "1280x720@30", codec: "av1", kbps: 12000 }, "capped at 12000");
+    localStorage.setItem("sss.settings.v1", JSON.stringify({ webcam: { mode: "huge", codec: "vp9", kbps: 5 } }));
+    eq(loadSettings().webcam, { cameraId: "", mode: "", codec: "h264", kbps: 200 }, "raised to 200, unknown codec and mode dropped");
+  } finally {
+    if (prev == null) localStorage.removeItem("sss.settings.v1");
+    else localStorage.setItem("sss.settings.v1", prev);
+  }
+});
+
+test("labels: Webcam and Desktop audio show in the current language, anything else as is", () => {
+  eq(isWebcamLabel("Webcam"), true); eq(isWebcamLabel("Webcam 2"), true); eq(isWebcamLabel("Screen"), false); eq(isWebcamLabel(""), false);
+  eq(shareLabel("Spotify"), "Spotify");
+  eq(shareLabel("Tab audio"), "Tab audio");
+  eq(shareLabel("Webcam"), "Webcam");
+  eq(shareLabel("Desktop audio"), DICT.en["share.desktop_audio_label"]);
+  eq(shareLabel("Desktop-Audio"), DICT.en["share.desktop_audio_label"], "the German spelling too");
+});
+
+test("i18n: the webcam, audio-only and Listen strings have both languages, German identical to the native ones", () => {
+  for (const k of ["ui.webcam.title", "ui.webcam.encoder_note", "ui.webcam.start", "ui.webcam.stop", "ui.bar.webcam_caret", "ui.stage.pip_tip", "ui.room.listen", "ui.room.stop_listening", "ui.stage.sharing_audio", "ui.strip.in_picture"]) {
+    ok(DICT.en[k] && DICT.de[k], k);
+  }
+  eq(DICT.en["ui.webcam.encoder_note"], "Encoder: Performance · Keyframe 2000 ms");
+  eq(DICT.de["ui.room.listen"], "Zuhören");
+  eq(DICT.de["ui.stage.sharing_audio"], "%{name} teilt Ton");
+  eq(DICT.de["ui.webcam.mode"], "Modus");
+  ok(!("ui.bar.webcam_soon" in DICT.en) && !("ui.bar.share_audio_first" in DICT.en), "the 'not available yet' texts are gone");
 });
 
 test("stage: the hover card stays open over the card, the avatar and the gap straight above it, NOT over the neighbours' avatars", () => {

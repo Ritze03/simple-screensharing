@@ -3,7 +3,11 @@
 // buttons that always show their dropdown arrow, cut off from the button by a separator line; grouped buttons sit on a backdrop, the
 // freestanding ones at the sides have none; a live Share/Audio button is green, a staged one accent; Leave is as tall as a group.
 // The people button shows and hides the strip (no people list, no arrow above the avatars). Watched has no Invite, Room settings or
-// Leave and shows Share and audio only while you have a share to act on, in the room you share in.
+// Leave and shows Share, audio and webcam only while you have such a share to act on, in the room you share in.
+// Share audio and Webcam are shares of their own (task I10, native I7/I8): with a screen share that came with audio the audio button is its mute
+// switch, else a click starts an audio-only share (a tab's or the system's audio, as the browser offers it) and the next one stops it; the webcam
+// button starts the camera (`getUserMedia`) and the next click stops it, from another room it moves, its arrow only offers the cameras and
+// "All webcam settings...".
 // Narrow windows degrade by CSS container queries on the stage: the Copy-invite label goes first, then the bar takes two rows.
 
 import { capabilities } from "../core/index.js";
@@ -11,9 +15,10 @@ import { S } from "./store.js";
 import { t } from "./i18n.js";
 import { h, ic } from "./dom.js";
 import { A } from "./actions.js";
-import { capInRoom, stagedFor, setAudioMuted } from "./capture.js";
+import { capInRoom, screens, stagedFor, setAudioMuted, webcamInRoom, webcamCap, audioInRoom, startWebcam, stopWebcam, stopDest, camSupported, camsRequested, camsListing, refreshCameras, camChoice, cameras } from "./capture.js";
 import { viewKey, layoutOf, LAYOUTS } from "./stage-state.js";
 import { opener, openMenu, shareRoomOf } from "./menus.js";
+import { toast } from "./store.js";
 import { pipSupported } from "./popout.js";
 
 const caps = capabilities();
@@ -45,7 +50,7 @@ export function renderBar(view, host, { fullscreen = false } = {}) {
 
   const canShare = caps.canShare && !!shareRoom && shareRoom.state === "joined";
   const shareTitle = (cap ? (live ? t("ui.bar.stream_settings") : t("ui.stream.title_staged")) : t("ui.bar.share_screen_tip")) + (!r && shareRoom ? ` (${roomName})` : "");
-  const othersLive = S.captures.some((c) => c.state === "live" && !(shareRoom && c.dests.has(shareRoom.id)));
+  const othersLive = screens().some((c) => c.state === "live" && !(shareRoom && c.dests.has(shareRoom.id)));
   const shareBtn = !r && !cap ? null : split({
     main: {
       id: "btn-share", title: caps.canShare ? shareTitle : t("ui.err.cannot_share"), icon: "screen_share",
@@ -54,16 +59,41 @@ export function renderBar(view, host, { fullscreen = false } = {}) {
     },
     menu: { mk: "share", kind: "share", extra: { viewKey: key } }, state, disabled: !canShare || picking, arrowTitle: t("ui.bar.share_caret"), arrowDisabled: !canShare,
   });
-  // Share audio: audio rides along with the screen the browser picked (today's behaviour), so the button is the mute switch and the arrow its menu.
-  // Task I9 adds desktop audio and audio-only sharing here: this is where its button and menu body plug in (`menus.js` `audioMenu`).
+  // Share audio. With a screen share whose audio came along (the browser decides what) the button is its mute switch. Without one it is an audio-only share
+  // of its own: a click picks a tab or the system audio, the next click stops it (native: Desktop audio on / off). Its arrow is the audio menu.
+  const aud = shareRoom ? audioInRoom(shareRoom.id) : null;
   const hasAudio = !!cap && !!cap.audio;
-  const audioTitle = !cap ? t("ui.bar.share_audio_first") : !cap.audio ? t("ui.bar.no_audio_tip") : cap.audioMuted ? t("ui.bar.unmute_audio") : t("ui.bar.mute_audio");
-  const audioBtn = !r && !cap ? null : split({
-    main: { id: "btn-audio", title: audioTitle, icon: hasAudio && !cap.audioMuted ? "music_note" : "music_off", onclick: () => cap && setAudioMuted(cap, !cap.audioMuted) },
-    menu: { mk: "audio", kind: "audio", extra: { cap: cap && cap.id, viewKey: key } }, state: hasAudio && !cap.audioMuted ? (live ? "on" : "ready") : "", disabled: !hasAudio || picking, arrowTitle: t("ui.bar.audio_caret"),
+  const joined = !!shareRoom && shareRoom.state === "joined";
+  const audioOnClick = () => {
+    if (hasAudio) return setAudioMuted(cap, !cap.audioMuted);
+    if (aud) {
+      stopDest(aud, shareRoom.id);
+      return toast(t("ui.toast.stopped_in", { room: shareRoom.name }), "stop_circle");
+    }
+    return A.startAudio(shareRoom);
+  };
+  const audioTitle = hasAudio ? (cap.audioMuted ? t("ui.bar.unmute_audio") : t("ui.bar.mute_audio")) : aud ? t("ui.bar.stop_audio_tip", { source: aud.label }) : cap ? t("ui.bar.share_audio_only_tip") : t("ui.bar.share_audio_tip");
+  const audioOn = hasAudio ? !cap.audioMuted : !!aud && !aud.audioMuted;
+  const audioBtn = !r && !cap && !aud ? null : split({
+    main: { id: "btn-audio", title: audioTitle, icon: audioOn ? "music_note" : "music_off", onclick: audioOnClick },
+    menu: { mk: "audio", kind: "audio", extra: { viewKey: key } }, state: audioOn ? (hasAudio && !live ? "ready" : "on") : "", disabled: picking || !joined || !caps.canShare, arrowTitle: t("ui.bar.audio_caret"), arrowDisabled: !joined || !caps.canShare,
   });
-  // Webcam: present, disabled (task I10 enables its split and adds the camera menu body).
-  const camBtn = !r && !cap ? null : split({ main: { id: "btn-webcam", title: t("ui.bar.webcam_soon"), icon: "videocam_off", onclick: () => {} }, menu: { mk: "cam", kind: "cam" }, disabled: true });
+  // Webcam: a share of its own, no screen needed (`getUserMedia`, `audio: false`). One click starts the saved camera in its saved mode, into the room the bar
+  // acts on (from another room it MOVES); the next click stops it. The arrow only offers the cameras and "All webcam settings...".
+  const wc = shareRoom ? webcamInRoom(shareRoom.id) : null;
+  const wcElsewhere = !wc && !!webcamCap();
+  const canCam = camSupported() && caps.webCodecsEncode && caps.trackProcessor && caps.canWatch && joined;
+  if (canCam && !camsRequested()) setTimeout(refreshCameras, 0);
+  const camName = (camChoice() && camChoice().name) || "";
+  const noCam = !wc && !cameras().length;
+  const camTitle = !camSupported() ? t("ui.err.cannot_share") : wc ? t("ui.bar.stop_webcam_tip", { camera: camName }) : noCam ? (!camsRequested() || camsListing() ? t("ui.bar.webcam_looking") : t("ui.bar.webcam_none")) : wcElsewhere ? t("ui.bar.move_webcam_tip", { camera: camName }) : t("ui.bar.share_webcam_tip", { camera: camName });
+  const camBtn = !r && !wc ? null : split({
+    main: {
+      id: "btn-webcam", title: camTitle, icon: wc ? "videocam" : "videocam_off",
+      onclick: () => (wc ? (stopWebcam(), toast(t("ui.toast.stopped_in", { room: shareRoom.name }), "videocam_off")) : startWebcam(shareRoom)),
+    },
+    menu: { mk: "cam", kind: "cam", extra: { viewKey: key } }, state: wc ? "on" : "", disabled: !canCam || noCam, arrowTitle: t("ui.bar.webcam_caret"), arrowDisabled: !canCam,
+  });
 
   const L = LAYOUTS.find((l) => l[0] === layoutOf(key));
   const layoutTitle = t("ui.bar.layout_tip", { layout: t(L[2]) });

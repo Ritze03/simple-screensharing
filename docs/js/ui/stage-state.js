@@ -6,10 +6,13 @@
 // core's `stableKey` (room + sharer name + kind + label), never by the stream key whose ConnId changes with every reconnect, so a
 // reconnect keeps the layout (the browser twin of native `ItemId`). Your own share is `<room>/me`.
 
+import { isWebcamLabel, WEBCAM_LABEL } from "../core/index.js";
 import { S, displayName } from "./store.js";
 import { roomById, allWatches } from "./rooms.js";
-import { allocated, capInRoom, captureName, captureRes } from "./capture.js";
+import { allocated, capInRoom, webcamInRoom, captureName, captureRes } from "./capture.js";
+import { defaultPip } from "./stage-geom.js";
 import { fmtKbps } from "./dom.js";
+import { t, DICT } from "./i18n.js";
 
 export const WATCHED = { kind: "watched" };
 export const roomView = (r) => ({ kind: "room", r });
@@ -21,8 +24,12 @@ export function viewOf(key) {
 }
 
 /* ---------- per-view layout state ---------- */
-const VG = {}; // view key -> { order: [ids], z: [ids] back to front, float: { id: {x,y,w,h} fractions }, grid }
-export const vg = (key) => (VG[key] ??= { order: [], z: [], float: {}, grid: null });
+const VG = {}; // view key -> { order: [ids], z: [ids] back to front, float: { id: {x,y,w,h} fractions }, grid, pip: { webcam id: {w, spot, x, y} } }
+export const vg = (key) => (VG[key] ??= { order: [], z: [], float: {}, grid: null, pip: {} });
+/** The size and spot of the webcam `camId` in its parent's picture in view `key` (a new one starts bottom right, .24 wide). */
+export const pipPos = (key, camId) => (vg(key).pip[camId] ??= defaultPip());
+/** "Webcam in picture" is on for this view (per view, off until switched on: native `StageSettings::pip`). */
+export const pipOn = (key) => S.stage.pip.has(key);
 export const layoutOf = (key) => S.stage.layouts[key] || "split";
 export const LAYOUTS = [
   ["split", "grid_view", "ui.stage.layout_split", "ui.stage.layout_split_sub"],
@@ -40,6 +47,7 @@ export function resetView(key) {
   g.grid = null;
   g.float = {};
   g.z = [];
+  g.pip = {}; // also forgets the webcams' spots and sizes
 }
 
 /* ---------- formatters (the sidebar uses them too) ---------- */
@@ -72,10 +80,12 @@ export function itemAspect(it) {
 }
 
 /**
- * What `view` shows, in the session's order: a room's video streams of other people (watched ones as video, the others as an idle
- * "X is sharing Y" tile), then your own live share; "Watched" has every watched stream of every room and nothing else. Audio-only
- * senders get no tile yet (task I9: audio-only sharing and Listen).
- * Item: `{ id, kind: "video"|"idle"|"mine", r, s, w, c, d, owner, label, mine, popped, ar }`.
+ * What `view` shows, in the session's order: a room's streams of other people (watched ones as video, the others as an idle "X is sharing Y"
+ * tile, an audio-only sender as a Listen tile), then your own live screen and webcam; "Watched" has every watched video stream of every room
+ * and nothing else.
+ * Item: `{ id, kind: "video"|"idle"|"audio"|"mine", r, s, w, c, d, owner, label, mine, cam, popped, ar, inPip, pipCam }`. `cam`: a webcam (its label
+ * starts with "Webcam"). `kind: "audio"`: `w` is the Listen watch (null while not listening). `inPip`: a webcam drawn inside its owner's screen
+ * share (no tile of its own); `pipCam`: on that screen share, the webcam item inside it.
  */
 export function collect(view) {
   const out = [];
@@ -88,12 +98,21 @@ export function collect(view) {
   const stableId = (r, s) => uniq(`${r.id}/${s.stableKey || `${s.ownerName}/${s.label}`}`);
   if (view.kind === "room") {
     const r = view.r;
-    for (const s of r.videoStreams()) {
-      const w = r.watches.get(s.key) || null;
-      out.push({ id: stableId(r, s), kind: w ? "video" : "idle", r, s, w, owner: s.ownerName || r.memberName(s.owner), label: s.label, mine: false });
+    for (const s of r.streams) {
+      if (s.self) continue;
+      if (s.kind === "video") {
+        const w = r.watches.get(s.key) || null;
+        out.push({ id: stableId(r, s), kind: w ? "video" : "idle", r, s, w, owner: s.ownerName || r.memberName(s.owner), label: s.label, mine: false });
+      } else if (s.kind === "audio" && !r.ownerHasVideo(s.owner)) {
+        // an audio-only sender: a Listen tile (with a screen the audio rides along with the screen's watch and has no tile)
+        out.push({ id: stableId(r, s), kind: "audio", r, s, w: r.watches.get(s.key) || null, owner: s.ownerName || r.memberName(s.owner), label: s.label, mine: false });
+      }
     }
     const c = capInRoom(r.id);
     if (c && c.dests.get(r.id)) out.push({ id: `${r.id}/me`, kind: "mine", r, c, d: c.dests.get(r.id), owner: displayName(), label: captureName(c), mine: true });
+    // your webcam is a share of its own: a tile like your screen's (native `Kind::Mine` with the label "Webcam")
+    const cam = webcamInRoom(r.id);
+    if (cam && cam.dests.get(r.id)) out.push({ id: `${r.id}/me/cam`, kind: "mine", r, c: cam, d: cam.dests.get(r.id), owner: displayName(), label: WEBCAM_LABEL, mine: true });
   } else {
     for (const { r, w } of allWatches()) {
       const s = r.streams.find((x) => x.key === w.key) || { key: w.key, owner: w.owner, ownerName: w.ownerName, label: w.label, width: 0, height: 0 };
@@ -101,19 +120,67 @@ export function collect(view) {
     }
   }
   for (const it of out) {
+    it.cam = isWebcamLabel(it.label);
+    it.label = shareLabel(it.label);
     it.popped = !!(it.w && it.w.popped);
     it.ar = itemAspect(it);
   }
+  markPip(view, out);
   return out;
+}
+
+/** A label that is a known default in any language shows in the current one (native `share_label`): the webcam's wire label is `Webcam` everywhere, a Desktop
+ *  audio share announces the English "Desktop audio" (task I7); anything else (a browser's "Tab audio", an app's name) as is. */
+export function shareLabel(raw) {
+  if (isWebcamLabel(raw)) return t("ui.stream.webcam");
+  if (Object.values(DICT).some((d) => d["share.desktop_audio_label"] === raw)) return t("share.desktop_audio_label");
+  return raw;
+}
+
+/* ---------- webcam in picture: who sits inside whom ---------- */
+
+/** Whether a webcam item and its parent are the same person (the same room, and you are you: your name could be someone else's). */
+const sameOwner = (a, b) => a.r === b.r && (a.mine ? b.mine : !b.mine && a.owner === b.owner);
+/** An item that is playing on the stage: a watched stream or your own share, not in a pop-out window. A stream in the FULLSCREEN stage still counts: the
+ *  PIP goes with it into the fullscreen (native `fullscreen_pip`), only a pop-out window shows its stream alone. */
+const playing = (i) => (i.kind === "video" || i.kind === "mine") && (!i.popped || (i.w && i.w.popped === "fullscreen"));
+
+/**
+ * Webcam in picture (native `pip_pairs`, the replica's `pipPairs`): parent item id -> the webcam item that sits inside it. The parent is the webcam
+ * owner's first screen share, in the view's order, that is on the stage and playing (yours, or one you watch, and not popped out), in the same room; the
+ * webcam must be playing too. With none, the webcam stays a tile (a webcam you cannot see playing in a picture would have no Watch button anywhere).
+ * One parent holds one webcam: the first one, a second keeps its tile. Pure: `items` carry `{ id, kind, cam, owner, mine, r, popped, w }`.
+ */
+export function pipPairs(items, order) {
+  const list = order.map((id) => items.find((i) => i.id === id)).filter((i) => i && playing(i));
+  const pairs = new Map();
+  for (const c of list.filter((i) => i.cam)) {
+    const p = list.find((i) => !i.cam && sameOwner(c, i));
+    if (p && !pairs.has(p.id)) pairs.set(p.id, c);
+  }
+  return pairs;
+}
+
+/** Make sure every item is in the view's order, then (when the view has Webcam in picture on) mark the webcams that sit inside a share. */
+function markPip(view, items) {
+  const key = viewKey(view);
+  const g = vg(key);
+  for (const it of items) if (!g.order.includes(it.id)) g.order.push(it.id);
+  if (!pipOn(key)) return;
+  for (const [pid, cam] of pipPairs(items, g.order)) {
+    cam.inPip = true;
+    items.find((i) => i.id === pid).pipCam = cam;
+  }
 }
 
 /** The item with `id` in `view` (null when it is gone). */
 export const itemById = (view, id) => collect(view).find((i) => i.id === id) || null;
-/** The view's items in the view's own order (new ones appended), minus popped-out ones and, with "Hide my own streams", your own. */
+/** The view's items in the view's own order (new ones appended), minus popped-out ones, the webcams inside a picture and, with "Hide my own streams", your own
+ *  (a webcam inside your own screen goes with it). */
 export function visibleItems(view, items) {
   const g = vg(viewKey(view));
   for (const it of items) if (!g.order.includes(it.id)) g.order.push(it.id);
-  return g.order.map((id) => items.find((i) => i.id === id)).filter((i) => i && !i.popped && !(S.stage.hideOwn && i.mine));
+  return g.order.map((id) => items.find((i) => i.id === id)).filter((i) => i && !i.popped && !i.inPip && !(S.stage.hideOwn && i.mine));
 }
 
 /** Whether the person called `name` shares audible audio in `items` (a watched stream whose sender shares audio and is not muted, or
@@ -121,12 +188,13 @@ export function visibleItems(view, items) {
 export function audibleFor(items, name, self) {
   return items.some((it) => {
     if (it.mine) return self && !!it.c.audio && !it.c.audioMuted;
-    return it.owner === name && !!it.w && it.r.hasAudio(it.s.owner) && !it.w.muted;
+    return it.owner === name && !!it.w && !it.cam && it.r.hasAudio(it.s.owner) && !it.w.muted; // a webcam brings no audio
   });
 }
 
 /** `res · fps · codec · rate` of an item (what the hover card prints); for an unwatched stream only the announced size. */
 export function itemNumbers(it) {
+  if (it.kind === "audio") return t("ui.room.audio_only");
   if (it.mine) return [captureRes(it.c), `${it.d.fps} fps`, codecName(it.d.codec), fmtKbps(allocated(it.d))].filter(Boolean).join(" · ");
   if (!it.w) return it.s && it.s.width ? `${it.s.width}×${it.s.height}` : "";
   const st = it.w.stats;

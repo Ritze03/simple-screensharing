@@ -103,12 +103,12 @@ new RoomClient({
 | `reconnectNow()` | "Retry now". While `reconnecting`: skips the backoff wait and cancels a handshake that is stuck. While `connected`: drops the connection and joins again (fresh ConnId, so **other** viewers of your shares see them restart). Shares stay registered and are re-announced, watches stay (a watched stream keeps its key unless its owner reconnected). Resolves with the state after the attempt (`connected`, or `reconnecting` if it failed and retries go on). Nothing is dropped, unlike `disconnect()` + `connect()`. |
 | `findStreamByStableKey(stableKey, { exceptKeys })` | The stream now in the room with that identity, or `null` (see "Stable stream identity"). |
 | `disconnect()` | Stops shares and watches, sends `Leave`, lets queued datagrams flush, closes. |
-| `watch(key, { canvas?, onFrame?, audio = true })` | Subscribe. Returns a `WatchHandle`. Watching a video stream also subscribes the owner's audio stream ("audio follows video", re-evaluated when that audio stream appears or disappears). |
+| `watch(key, { canvas?, onFrame?, audio = true })` | Subscribe. Returns a `WatchHandle`. Watching a video stream also subscribes the owner's audio stream ("audio follows video", re-evaluated when that audio stream appears or disappears), **except a webcam** (`isWebcamLabel`: a label starting with `Webcam`; a webcam brings no audio and is no video for the audio that follows video, native `owner_has_video`). `watch()` of an **audio** key is "Listen": no canvas, a standalone audio receiver for a sender that shares audio with no screen (task I10). |
 | *(A/V sync)* | The followed audio is delayed to line up with the owner's video (`avsync.js`: per-stream latency floors, deadband steps, 0-2 s; none for audio-only). Needs the sender to stamp audio and video PTS from one clock (native: since 2026-11-01; browser sender: always). `features/audio-sharing.md`. |
 | `unwatch(key)` | Unsubscribes the stream and its followed audio. |
 | `setVolume(key, 0..5)`, `setMuted(key, bool)` | Per-stream playback gain (0-500 %) and mute. `key` may be the video key (applies to its audio) or an audio key. Persists across re-watch. |
 | `resumeAudio()` | Call from a user gesture if the autoplay policy left the `AudioContext` suspended. |
-| `startShare(opts)` | Share a screen/window/tab (+ audio). Returns a `ShareHandle`. See below. |
+| `startShare(opts)` | Share a screen/window/tab (+ audio), a camera stream (`label: "Webcam"`) or just audio (`audioOnly`). Returns a `ShareHandle`. See below. |
 | `stopShare(handle?)` | Stop one share, or all. |
 | `setJitterSettings({ maxJitterBufferMs?, catchUpSpeedPercent? })` | Live. |
 | `watchStats(key)` | Latest numbers for one watched stream (also delivered in `stats`). |
@@ -187,7 +187,10 @@ const share = await client.startShare({
   fps: 60, bitrateKbps: 8000,
   preset: "quality",            // text | quality | gaming (balanced and low_latency are aliases of quality; see below)
   label: "Screen", previews: true,
-  stream,                       // a MediaStream to share instead of calling getDisplayMedia (tests, custom pickers)
+  stream,                       // a MediaStream to share instead of calling getDisplayMedia (tests, custom pickers, a getUserMedia camera)
+  audioOnly: false,             // share ONLY the stream's audio track (task I10): no video stream is announced (`share.videoStreamId`, `share.sender` are null),
+                                // a video track in `stream` is ignored, none audio track = a throw. Without `stream`, getDisplayMedia is asked for video too
+                                // (browsers refuse audio alone) and its video track stopped at once.
   displayMediaOptions,          // merged into the getDisplayMedia() argument
   gopMs, latencyMode, hardwareAcceleration,   // overrides
 });
@@ -210,6 +213,11 @@ Behaviour that matches the native sender:
   (native waits a full interval for the first one).
 * **Backpressure.** If the transport backs up, whole frames are dropped and a keyframe is forced (an encoded frame was lost);
   if the encoder backs up, input frames are dropped (nothing was encoded, so no keyframe is needed).
+* **A webcam** (task I10) is an ordinary video share: `startShare({ stream: <getUserMedia video-only stream>, label: "Webcam", gopMs: 2000, latencyMode: "realtime", audio: false })`.
+  Anyone who sees a stream labelled `Webcam*` treats it as a webcam (`isWebcamLabel`, `WEBCAM_LABEL`, both exported); nothing else on the wire differs.
+* **An audio-only share** (`audioOnly: true`) announces one audio stream (label `o.label`, default `Audio`) and nothing else: `ShareHandle.audioOnly`, `videoStreamId: null`,
+  `sender: null`; `stopShare`, stats, reconnect re-announce and `SubscriberCount` all handle the missing video half. Native senders can share the same way (I7), and the
+  viewer side (`watch(audioKey)`) already played it.
 * `getDisplayMedia` must be called from a user gesture, so call `startShare()` from a click handler.
 * Audio capture is whatever the browser offers: it differs per browser/OS/source (tab audio is the common denominator; system
   audio only on some platforms). When `audio: true` but the source has none, a `share` event with `state: "no-audio"` fires and
@@ -232,7 +240,7 @@ Behaviour that matches the native sender:
 | module | |
 | --- | --- |
 | `index.js` | public re-exports |
-| `room-client.js` | `RoomClient`, `WatchHandle`, `ShareHandle`, `capabilities`, `probeEncoders`, `streamKey` |
+| `room-client.js` | `RoomClient`, `WatchHandle`, `ShareHandle`, `capabilities`, `probeEncoders`, `streamKey`, `isWebcamLabel`, `WEBCAM_LABEL` |
 | `session.js` | `RelaySession`: one WebTransport connection (control stream + framing, datagram writer with backpressure counter, uni streams, join handshake incl. ConnId collision retry, `ConnectError`, `JoinRejectedError`) |
 | `protocol.js` | port of `protocol/src/lib.rs`: every `ClientToRelay`/`RelayToClient` encode+decode, control framing (`ControlFrameReader`, 64 KiB cap), 19-byte media header, 15-byte preview header, constants |
 | `postcard.js` | the postcard subset used (varints, strings, fixed arrays) |

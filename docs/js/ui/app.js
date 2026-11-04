@@ -16,13 +16,15 @@ import {
   applyLevelLoudness,
 } from "./rooms.js";
 import {
-  capById, capInRoom, liveRoomIds, allDests, allocated, applyBandwidth, captureName, captureRes, stage, discard, goLive,
-  stopDest, editDest, captureLevel, changeSource, setAudioMuted,
+  capById, capInRoom, capsInRoom, webcamInRoom, webcamCap, liveRoomIds, allDests, allocated, applyBandwidth, captureName, captureRes, stage, discard, goLive,
+  stopDest, editDest, captureLevel, changeSource, setAudioMuted, startAudio, startWebcam, stopWebcam, cameras, camChoice, camModes, camMode, modeKey, camsRequested, camsListing,
+  refreshCameras, probeCamera, useCamera, useMode, useCodec, useKbps, WEBCAM_KBPS_MIN, WEBCAM_KBPS_MAX,
 } from "./capture.js";
 import { popOut, closePopout, popStage as popoutStage, closeStage, stageWindow } from "./popout.js";
 import { A } from "./actions.js";
 import { SOUND_NAMES, SoundOut } from "./sounds.js";
-import { WATCHED, roomView, viewKey, viewOf, vg, watchFps } from "./stage-state.js";
+import { WATCHED, roomView, viewKey, viewOf, vg, watchFps, collect } from "./stage-state.js";
+import { fullscreenPip } from "./pip.js";
 import { renderStage, renderPoppedNote, afterRender, isDragging, bindWindow, overlays, toggleStageFullscreen } from "./stage.js";
 import { opener, selectField, FPS_LIST, PRESET_ORDER, presetLabel, presetCaption } from "./menus.js";
 
@@ -197,7 +199,7 @@ function renderSide() {
     const joined = r.state === "joined";
     const mine = capInRoom(r.id);
     const vids = r.videoStreams();
-    const nShares = joined ? vids.length + (mine ? 1 : 0) : null;
+    const nShares = joined ? vids.length + (mine ? 1 : 0) + (webcamInRoom(r.id) ? 1 : 0) : null;
     rows.push(roomRow({
       lead: h("span", { class: "sdot " + (r.state === "disconnected" && r.error ? "failed" : r.state) }), name: r.name,
       me: liveIds.includes(r.id) ? ic("cast", "ico live") : null,
@@ -312,7 +314,7 @@ function renderHead(r) {
     : r.state === "reconnecting" ? h("span", { class: "badge badge-degraded" }, ic("sync"), t("ui.sidebar.status_reconnecting"))
       : r.state === "connecting" ? h("span", { class: "badge badge-progress" }, h("span", { class: "bar" }), t("ui.room.connecting"))
         : h("span", { class: "badge badge-muted" }, t("ui.sidebar.status_disconnected"));
-  const nSharing = r.videoStreams().length + (capInRoom(r.id) ? 1 : 0);
+  const nSharing = r.videoStreams().length + (capInRoom(r.id) ? 1 : 0) + (webcamInRoom(r.id) ? 1 : 0);
   return H({ tag: "header", cls: "band top p-head", g: 2 },
     H({ g: 3, cls: "eq" }, h("h2", { text: r.name, title: r.name }), status,
       r.members.length ? T(t("ui.room.meta", { people: r.members.length, sharing: nSharing }), "meta") : null),
@@ -333,7 +335,18 @@ async function doPopOut(r, w) {
 async function doFullscreen(r, w) {
   try {
     if (w.popped === "fullscreen") closePopout(w);
-    else if (!w.popped) await popOut(w, () => invalidate(), "fullscreen");
+    else if (!w.popped) {
+      // The webcam in this stream's picture goes into the fullscreen with it (same spot, same size; the stage window's view counts too).
+      let ctx = null;
+      for (const v of [stageViewNow(), stageWindow() && viewOf(stageWindow().key)].filter(Boolean)) {
+        const parent = collect(v).find((i) => i.w === w);
+        if (parent && parent.pipCam) {
+          ctx = { parent, cam: parent.pipCam, key: viewKey(v) };
+          break;
+        }
+      }
+      await popOut(w, () => invalidate(), "fullscreen", ctx ? (stageEl) => fullscreenPip(stageEl, ctx.parent, ctx.cam, ctx.key) : null);
+    }
   } catch (e) {
     toast(t("ui.toast.popout_failed", { error: e.message }), "error", { err: true });
   }
@@ -364,7 +377,7 @@ async function popStage(key, back) {
 }
 /** Leave a room: the confirm modal when something would be lost (an outgoing share or a live watch, native rule), else at once. */
 async function leaveRoom(r) {
-  if (capInRoom(r.id) || r.watches.size) {
+  if (capsInRoom(r.id).length || r.watches.size) {
     S.menu = null;
     S.modal = { kind: "leave", room: r.id };
     return render();
@@ -501,16 +514,17 @@ function renderModal() {
   const spacer = () => FILL(null);
   if (M.kind === "stream") modal = renderStreamModal(M, close);
   else if (M.kind === "settings") modal = renderSettings(close, lgBtn, spacer);
+  else if (M.kind === "webcam") modal = renderWebcamModal(M, close, lgBtn, spacer);
   else if (M.kind === "add") modal = renderAdd(M, close, lgBtn, spacer);
   else if (M.kind === "leave" || M.kind === "forget") {
     const r = roomById(M.room);
     if (!r) { S.modal = null; return h("div"); }
     const forget = M.kind === "forget";
-    const c = capInRoom(r.id);
+    const cs = capsInRoom(r.id);
     const w = r.watches.size;
     modal = modalShell("", forget ? t("ui.modal.forget_title", { room: r.name }) : t("ui.modal.leave_title", { room: r.name }), null, close, [
       h("p", { text: forget ? t("ui.modal.forget_text") : t("ui.modal.leave_text") }),
-      c ? banner("warning", t("ui.modal.stream_stops", { room: r.name }) + (c.dests.size > 1 ? " " + t("ui.modal.keeps_going") : "")) : null,
+      ...cs.map((c) => banner("warning", (c.kind === "audio" ? t("ui.modal.warn_audio_stops", { room: r.name }) : t("ui.modal.stream_stops", { room: r.name })) + (c.dests.size > 1 ? " " + t("ui.modal.keeps_going") : ""))),
       w ? banner("warning", w === 1 ? t("ui.modal.stop_watching_one") : t("ui.modal.stop_watching_n", { count: w })) : null,
     ], [spacer(), lgBtn("btn-secondary", t("ui.modal.cancel"), close), lgBtn("btn-danger-solid", forget ? t("ui.room.forget") : t("ui.modal.leave_room"), async () => {
       S.modal = null;
@@ -552,6 +566,51 @@ function renderModal() {
   }
   scrim.appendChild(modal);
   return scrim;
+}
+
+/** The webcam modal (task I10, native `webcam_settings.rs`, the replica's `camModal`): Source (Camera from `enumerateDevices`, Mode), Compression (Codec, Bitrate
+ *  200-12000), the fixed-encoder note, footer `[Start | Stop webcam][fill][Done]`. Everything acts at once: camera and mode restart a running webcam, codec and bitrate
+ *  change it live. A browser has no list of what a camera delivers: the modes are the camera's maximum (known once it was opened) and common sizes that fit. */
+function renderWebcamModal(M, close, lgBtn, spacer) {
+  const r = roomById(M.room);
+  if (!r) {
+    S.modal = null;
+    return h("div");
+  }
+  if (!camsRequested()) setTimeout(refreshCameras, 0);
+  const list = cameras();
+  const cur = camChoice();
+  if (cur) setTimeout(() => probeCamera(cur), 0); // learns the camera's maximum (only where the permission was granted already)
+  const wc = S.settings.webcam;
+  const liveHere = webcamInRoom(r.id);
+  const mode = cur ? camMode(cur) : null;
+  const sub0 = mode ? `${mode.w}×${mode.h} · ${mode.fps} fps` : t("ui.bar.webcam_none");
+  const sub = liveHere ? t("ui.webcam.sub_live", { mode: sub0, room: r.name }) : sub0;
+  const modeLabel = (m) => t("ui.webcam.mode_label_browser", { size: `${m.w}×${m.h}`, fps: m.fps });
+
+  const source = card(t("ui.webcam.source_card"), null,
+    cur
+      ? [
+        ctrlRow(t("ui.webcam.camera"), selectField({ id: "wc-camera", opts: list.map((c, i) => [String(i), c.name, null, "videocam"]), cur: String(list.indexOf(cur)), onPick: (v) => useCamera(list[Number(v)]) }), undefined, null, "wc-camera"),
+        ctrlRow(t("ui.webcam.mode"), selectField({ id: "wc-mode", opts: camModes(cur).map((m) => [modeKey(m), modeLabel(m), m.max ? t("ui.webcam.mode_max") : null]), cur: modeKey(mode), onPick: (v) => useMode(v) }), undefined, t("ui.webcam.mode_tip_browser"), "wc-mode"),
+      ]
+      : ctrlRow(t("ui.webcam.camera"), T(camsListing() || !camsRequested() ? t("ui.bar.webcam_looking") : t("ui.bar.webcam_none"), "ro")));
+
+  const bw = S.settings.bw;
+  const codecOpts = CODECS.filter(([v]) => !encoders || encoders.has(v));
+  const codec = encoders && encoders.size && !encoders.has(wc.codec) ? codecOpts[0][0] : wc.codec; // a stored codec this browser cannot encode shows as the first one it can
+  const compression = card(t("ui.stream.compression"), null,
+    codecOpts.length <= 1 && encoders ? null : ctrlRow(t("ui.stream.codec"), seg(codecOpts, codec, (v) => useCodec(v))),
+    bw.mode === "per_stream"
+      ? sliderRow(t("ui.stream.bitrate"), "wc-kbps", WEBCAM_KBPS_MIN, WEBCAM_KBPS_MAX, 100, () => wc.kbps, (v) => { wc.kbps = v; }, String, t("ui.webcam.bitrate_tip"), () => useKbps(wc.kbps))
+      : ctrlRow(t("ui.stream.bitrate"), h("span", { class: "ro txt", style: "width:100%;text-align:right", text: t("ui.stream.set_by_budget") }), valBox("\u2014"), t("ui.stream.budget_tip")),
+    H({ g: 2 }, SL(LABEL_W, null), FILL(h("span", { class: "cap", id: "wc-note", text: t("ui.webcam.encoder_note") }))));
+
+  const lead = liveHere
+    ? lgBtn("btn-danger", t("ui.webcam.stop"), () => { stopWebcam(); toast(t("ui.toast.stopped_in", { room: r.name }), "videocam_off"); }, "videocam_off", false, "btn-webcam-stop")
+    : lgBtn("btn-secondary", t("ui.webcam.start"), () => startWebcam(r), "videocam", !cur || r.state !== "joined", "btn-webcam-start");
+  return modalShell("wide", t("ui.webcam.title"), sub, close, [source, compression],
+    [lead, spacer(), lgBtn("btn-primary", t("ui.stream.done"), close, null, false, "btn-webcam-done")], null, t("ui.close"));
 }
 
 function renderSettings(close, lgBtn, spacer) {
@@ -790,6 +849,7 @@ window.addEventListener("hashchange", joinFromHash);
 Object.assign(A, {
   render, liveText, liveMeter, openStreamModal, startStage, copyLink, leaveRoom, doPopOut, doFullscreen, watchAndPop, popStage, setEmoji,
   toggleStageFullscreen,
+  startAudio: (r) => startAudio(r),
   openModal: (m) => { S.menu = null; S.modal = m; render(); },
   selectRoom: (r, then) => { select(r, false); if (then) then(); },
 });

@@ -523,3 +523,31 @@ select.field { cursor: pointer; padding-right: 6px; }
 .stage-win .stg { height: 100vh; }
 
 @media (prefers-reduced-motion: reduce) { .stagefs .stripwrap, .stagefs .ctlrow, .stagefs .hover-ui { transition: none; } }
+
+/* ===================================== webcam in picture (task I10) =====================================
+   A webcam drawn inside its owner's screen share (the replica's `.pip`, native `stage/pip.rs`). pip.js places it (`placePip`) from the geometry of
+   stage-geom.js; the handle sits on the corner facing the middle of the picture, so a PIP pushed into a corner can still grow. The browser can round the
+   corners and glide to a spot (native cannot: a video there is a paint callback). */
+.pip { position: absolute; z-index: 9; overflow: hidden; border-radius: 6px; background: #000; box-shadow: 0 0 0 1px rgba(255, 255, 255, .22), 0 6px 18px rgba(0, 0, 0, .55); cursor: grab; touch-action: none; }
+.pip:active, .pip.held { cursor: grabbing; }
+.pip.snap { transition: left .16s ease, top .16s ease; }
+@media (prefers-reduced-motion: reduce) { .pip.snap { transition: none; } }
+.pip > canvas, .pip > video.live-preview { position: absolute; inset: 0; width: 100%; height: 100%; display: block; background: #000; pointer-events: none; }
+.pip > video.live-preview { object-fit: contain; }
+.pip > video.live-preview[hidden] { display: none; }
+.pip > .mine-pic { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--text-faint); background-image: var(--screen-hatch); pointer-events: none; }
+.pip > .mine-pic .ms { font-size: 22px; color: var(--success); }
+.pip:has(> video.live-preview:not([hidden])) > .mine-pic { display: none; }
+.prz { position: absolute; z-index: 1; width: 20px; height: 20px; }
+.prz::after { content: ""; position: absolute; inset: 4px; box-sizing: border-box; border: solid var(--text); border-width: 0 2px 2px 0; border-radius: 0 0 4px 0; filter: drop-shadow(0 0 2px #000); }
+.pip.held .prz { opacity: 1; }
+.pip[data-c="rb"] .prz { right: 0; bottom: 0; cursor: nwse-resize; }
+.pip[data-c="lt"] .prz { left: 0; top: 0; cursor: nwse-resize; transform: rotate(180deg); }
+.pip[data-c="rt"] .prz { right: 0; top: 0; cursor: nesw-resize; transform: rotate(-90deg); }
+.pip[data-c="lb"] .prz { left: 0; bottom: 0; cursor: nesw-resize; transform: rotate(90deg); }
+.pip-stage > .pip { z-index: 5; }
+.pip-stage .ovl { z-index: 6; pointer-events: none; }
+.pip-stage .ovl > *, .pip-stage .ovl .fl { pointer-events: none; }
+.pip-stage .ovl .statbar, .pip-stage .ovl .round-btn { pointer-events: auto; }
+/* an audio-only sender's tile: no picture, the Listen button; listening shows the volume in the tag */
+.st-tile.audio-only .vid { background-image: var(--screen-hatch); }

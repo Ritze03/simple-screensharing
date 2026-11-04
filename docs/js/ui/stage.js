@@ -16,19 +16,20 @@ import { A } from "./actions.js";
 import { capabilities } from "../core/index.js";
 import { closePopout, popoutMode } from "./popout.js";
 import { previewFor } from "./capture.js";
+import { pipEl, placePip, pipPointerMove, pipPointerUp, pipDragging } from "./pip.js";
 import * as G from "./stage-geom.js";
 import { chromeStart, chromeStep, chromeRemaining } from "./chrome.js";
 import { vg, viewKey, viewOf, layoutOf, collect, visibleItems, itemAspect, audibleFor, itemNumbers, watchFps, watchKbps, watchRes } from "./stage-state.js";
 import { renderBar } from "./bar.js";
 import { openTileMenu, renderMenu, positionMenu, closeMenu } from "./menus.js";
-import { watchStream } from "./rooms.js";
+import { watchStream, unwatchStream } from "./rooms.js";
 
 const caps = capabilities();
 export { watchFps, watchKbps, watchRes };
 
 const arenas = new Set(); // every arena built by the last render (main window and the pop-out window)
 let drag = null; // a pointer drag in progress: { kind: "bar" | "tile" | "rz", ... }
-export const isDragging = () => !!drag;
+export const isDragging = () => !!drag || pipDragging();
 
 /* ============================== the stage ============================== */
 
@@ -74,13 +75,14 @@ export function renderPoppedNote(view) {
 function tileEl(it, view, key, arena) {
   const { r, w, mine, kind } = it;
   const cross = view.kind === "watched";
-  const hasAudio = !mine && !!w && r.hasAudio(it.s.owner);
-  const audible = hasAudio && !w.muted;
-  const stats = !!w && S.stage.stats.has(it.id);
+  const audioOnly = kind === "audio";
+  const hasAudio = !mine && !!w && !it.cam && r.hasAudio(it.s.owner); // a webcam brings no audio
+  const audible = (hasAudio || (audioOnly && !!w)) && !w.muted;
+  const stats = !!w && !audioOnly && S.stage.stats.has(it.id);
   const open = S.menu && S.menu.kind === "tile" && S.menu.itemId === it.id;
   const label = cross ? `${it.label} · ${r.name}` : it.label;
   const tile = h("div", {
-    class: "st-tile" + (kind === "idle" ? " idle" : "") + (kind === "mine" ? " mine" : "") + (audible ? " audible" : "") + (S.flash === it.s?.key ? " flash" : "") + (open ? " menu-open" : ""),
+    class: "st-tile" + (kind === "idle" ? " idle" : "") + (audioOnly ? " audio-only" : "") + (kind === "mine" ? " mine" : "") + (it.cam ? " cam" : "") + (audible ? " audible" : "") + (S.flash === it.s?.key ? " flash" : "") + (open ? " menu-open" : ""),
     "data-id": it.id, style: `--ar:${it.ar.toFixed(4)}`, tabindex: "0", "aria-label": mine ? t("ui.stage.your_stream") : t("ui.tile.aria", { name: it.owner }),
   });
   tile._it = it;
@@ -92,8 +94,18 @@ function tileEl(it, view, key, arena) {
     else tile.append(vid);
   } else if (kind === "mine") {
     const live = it.d.state === "live";
-    vid.append(...[previewFor(it.c), h("div", { class: "mine-pic" }, ic("cast"), h("span", { text: `${t("ui.room.my_screen")} · ${live ? t("ui.room.live_chip") : t("ui.room.chip_starting")}` }))].filter(Boolean));
+    const what = it.cam ? t("ui.room.my_webcam") : t("ui.room.my_screen");
+    vid.append(...[previewFor(it.c), h("div", { class: "mine-pic" }, ic(it.cam ? "videocam" : "cast"), h("span", { text: `${what} · ${live ? t("ui.room.live_chip") : t("ui.room.chip_starting")}` }))].filter(Boolean));
     tile.appendChild(vid);
+  } else if (audioOnly) {
+    // an audio-only sender: no picture, a Listen button (Stop listening while it plays)
+    tile.append(vid, h("div", { class: "invite" },
+      avatarEl(it.owner, r.emojiByName(it.owner)),
+      h("b", { text: t("ui.stage.sharing_audio", { name: it.owner }) }),
+      h("span", { text: t("ui.room.audio_only") }),
+      h("div", { class: "hb g2" }, w
+        ? h("button", { type: "button", class: "btn btn-secondary", "data-listen": it.s.key, onclick: () => unwatchStream(r, it.s.key) }, ic("volume_off"), t("ui.room.stop_listening"))
+        : h("button", { type: "button", class: "btn btn-primary", "data-listen": it.s.key, disabled: !caps.canWatch || r.state !== "joined" || null, onclick: () => watchStream(r, it.s.key) }, ic("volume_up"), t("ui.room.listen")))));
   } else {
     const prev = r.previews.get(it.s.key);
     if (prev) vid.appendChild(h("img", { src: prev, alt: "" }));
@@ -108,7 +120,9 @@ function tileEl(it, view, key, arena) {
 
   // the name tag (top left): audio status icon, name, source; with "Show stats" also the numbers in slots reserved for 9999x9999,
   // 999 fps and 99.9 Mbps so the pill is as wide as its content and never jitters; they show while the tile is hovered
-  const tagIcon = kind === "video" ? (!hasAudio ? ic("volume_off") : w.muted ? ic("volume_off", "off") : ic("volume_up")) : mine ? ic("cast", it.d.state === "live" ? "live" : "warn") : ic("visibility_off");
+  const tagIcon = it.cam && kind === "video" ? ic("videocam") : kind === "video" ? (!hasAudio ? ic("volume_off") : w.muted ? ic("volume_off", "off") : ic("volume_up"))
+    : audioOnly ? (w ? (w.muted ? ic("volume_off", "off") : ic("volume_up")) : ic("volume_off"))
+      : mine ? ic(it.cam ? "videocam" : "cast", it.d.state === "live" ? "live" : "warn") : ic("visibility_off");
   const tag = h("span", { class: "tag" + (S.stage.alwaysNames ? "" : " hover-ui") + (stats ? " stats" : ""), title: `${mine ? t("ui.sidebar.you") : it.owner} · ${label}` },
     tagIcon, h("span", { class: "nm", text: mine ? t("ui.sidebar.you") : it.owner }), h("span", { class: "lb", text: "· " + label }));
   if (stats) {
@@ -125,7 +139,8 @@ function tileEl(it, view, key, arena) {
   const tools = h("div", { class: "tools hover-ui" });
   if (kind === "mine") {
     const chip = viewersChip(it.c, r);
-    tools.append(...[h("span", { class: "chip-dark pchip", title: t("ui.room.preview_tip"), text: t("ui.room.preview_chip") }), chip, btn("tune", t("ui.room.stream_settings"), () => A.openStreamModal(it.c.id, r.id))].filter(Boolean));
+    tools.append(...[h("span", { class: "chip-dark pchip", title: t("ui.room.preview_tip"), text: t("ui.room.preview_chip") }), chip,
+      it.cam ? btn("tune", t("ui.room.webcam_settings"), () => A.openModal({ kind: "webcam", room: r.id })) : btn("tune", t("ui.room.stream_settings"), () => A.openStreamModal(it.c.id, r.id))].filter(Boolean));
   } else if (kind === "video") {
     if (popoutMode()) tools.append(btn("open_in_new", t("ui.room.pop_out_tip"), () => A.doPopOut(r, w)));
     tools.append(btn("fullscreen", t("ui.stage.fullscreen"), () => A.doFullscreen(r, w)));
@@ -134,6 +149,19 @@ function tileEl(it, view, key, arena) {
   tile.appendChild(tools);
   tile.appendChild(h("span", { class: "rz hover-ui", title: t("ui.stage.resize_tip") }));
 
+  // Webcam in picture: the webcam of this stream's owner sits inside its picture (stage-state.js `pipPairs`); a press on it stops there (pip.js).
+  if (it.pipCam) {
+    tile.appendChild(pipEl(it.pipCam, {
+      key,
+      geom: () => ({ tw: tile.clientWidth, th: tile.clientHeight, ar: parseFloat(tile.style.getPropertyValue("--ar")) || 16 / 9, crop: layoutOf(key) === "crop" }),
+      onPress: () => {
+        if (layoutOf(key) === "float") {
+          raise(vg(key), it.id); // a floating parent comes to the front when its webcam is pressed
+          layoutArena(arena);
+        }
+      },
+    }));
+  }
   tile.addEventListener("pointerdown", (e) => tilePointerDown(e, tile, arena));
   if (kind === "video") tile.addEventListener("dblclick", (e) => { if (!e.target.closest("button, input")) A.doFullscreen(r, w); });
   tile.addEventListener("contextmenu", (e) => {
@@ -246,8 +274,12 @@ function cardEl() {
   const hd = h("div", { class: "hd" }, avatarEl(p.name, p.emoji), h("div", {}, h("b", { text: name }), h("small", { text: sub })), h("div", { class: "fl" }),
     its.length ? h("span", { class: "badge badge-live" }, h("span", { class: "dot" }), t("ui.pill.live")) : null);
   const rows = its.map((it) => {
-    const audio = it.mine ? !!it.c.audio : it.r.hasAudio(it.s.owner);
-    const status = it.mine ? [ic("cast"), t("ui.strip.your_stream")] : it.popped ? [ic("open_in_new"), t("ui.strip.popped")] : it.w ? [ic("visibility"), t("ui.strip.on_stage")] : [ic("visibility_off"), t("ui.strip.not_watching")];
+    const audio = it.kind === "audio" || (it.mine ? !!it.c.audio : !it.cam && it.r.hasAudio(it.s.owner));
+    const status = it.inPip ? [ic("picture_in_picture"), t("ui.strip.in_picture")]
+      : it.mine ? (it.cam ? [ic("videocam"), t("ui.strip.your_webcam")] : [ic("cast"), t("ui.strip.your_stream")])
+        : it.popped ? [ic("open_in_new"), t("ui.strip.popped")]
+          : it.kind === "audio" ? (it.w ? [ic("volume_up"), t("ui.strip.listening")] : [ic("visibility_off"), t("ui.strip.not_watching")])
+            : it.w ? [ic("visibility"), t("ui.strip.on_stage")] : [ic("visibility_off"), t("ui.strip.not_watching")];
     const watching = it.mine ? viewerNames(it.c, it.r) : null;
     const extra = [cross ? it.r.name : null, watching ? t("ui.strip.watching_n", { count: watching.length }) : null].filter(Boolean).join(" · ");
     return h("div", { class: "ust" },
@@ -339,6 +371,8 @@ export function layoutArena(ar) {
     el.style.top = q.y + "px";
     el.style.width = q.w + "px";
     el.style.height = q.h + "px";
+    const pip = el.querySelector(":scope > .pip");
+    if (pip) placePip(pip);
   });
   // the resize bars (Split, Crop), reused by key so a drag keeps its element
   const guts = (ar._guts ||= new Map());
@@ -412,6 +446,13 @@ setInterval(() => {
         changed = true;
       }
     }
+    for (const el of a.querySelectorAll(":scope > .st-tile > .pip")) {
+      const ar = itemAspect(el._cam); // the webcam's own picture can change shape too
+      if (Math.abs(ar - (parseFloat(el.dataset.ar) || 0)) > 0.002) {
+        el.dataset.ar = ar.toFixed(4);
+        changed = true;
+      }
+    }
     if (changed && !drag) layoutArena(a);
   }
 }, 400);
@@ -435,7 +476,7 @@ function gutPointerDown(e, ar, k) {
 }
 
 function tilePointerDown(e, tile, ar) {
-  if (e.button !== 0 || e.target.closest("button, input, a, .viewers")) return;
+  if (e.button !== 0 || e.target.closest("button, input, a, .viewers, .pip")) return;
   const key = ar._m.key;
   const g = vg(key);
   const id = tile.dataset.id;
@@ -593,14 +634,17 @@ export function bindWindow(win, hostId) {
   const host = { id: hostId, win, doc: win.document };
   const mv = (e) => {
     pointerInside = true;
-    dragMove(e);
+    if (!pipPointerMove(e)) dragMove(e);
     cardPointer(e, host);
     vpopPointer(e, host);
     if (S.stage.fullscreen && hostId === "main") chromeSync(true);
   };
   win.addEventListener("pointermove", mv);
-  win.addEventListener("pointerup", endDrag);
-  win.addEventListener("pointercancel", endDrag);
+  const up = (e) => {
+    if (!pipPointerUp(e)) endDrag();
+  };
+  win.addEventListener("pointerup", up);
+  win.addEventListener("pointercancel", up);
   win.addEventListener("pointerdown", () => S.stage.fullscreen && hostId === "main" && chromeSync(true), true);
   win.addEventListener("wheel", () => S.stage.fullscreen && hostId === "main" && chromeSync(true), { passive: true, capture: true });
   win.document.documentElement.addEventListener("mouseleave", () => {

@@ -55,9 +55,11 @@ const copyStyles = (win) => {
  * @param w       the watch ({ canvas, ownerName, ... })
  * @param onBack  called once the stream is back in the main window (window closed / fullscreen left)
  * @param want    "fullscreen" forces the fullscreen stage (double-click on a tile); omitted = PiP when supported
+ * @param decorate optional `(stageEl) => dispose`: called once the stage exists, for what lies over the picture there (the stream's webcam in picture, task I10);
+ *                `dispose` runs when the stream is back
  * @returns "pip" | "fullscreen"
  */
-export async function popOut(w, onBack, want) {
+export async function popOut(w, onBack, want, decorate) {
   if (current) closePopout(current.w);
   if (stageWin) closeStage();
   const mode = want === "fullscreen" ? (document.fullscreenEnabled ? "fullscreen" : null) : popoutMode();
@@ -70,7 +72,7 @@ export async function popOut(w, onBack, want) {
     win.document.body.className = "pip-body";
     const stage = stageFor(w, win.document, () => win.close());
     win.document.body.appendChild(stage);
-    current = { w, win, stage, kind: "pip", onBack };
+    current = { w, win, stage, kind: "pip", onBack, dispose: decorate ? decorate(stage) : null };
     win.addEventListener("pagehide", () => current && current.win === win && back(current.w)); // current.w: a rebind swaps the watch
     w.popped = "pip";
     return "pip";
@@ -80,7 +82,7 @@ export async function popOut(w, onBack, want) {
   autoHide(stage);
   stage.addEventListener("dblclick", () => current && closePopout(current.w)); // double-click again = back (Esc does the same natively)
   document.body.appendChild(stage);
-  current = { w, stage, kind: "fullscreen", onBack };
+  current = { w, stage, kind: "fullscreen", onBack, dispose: decorate ? decorate(stage) : null };
   const onFs = () => {
     if (document.fullscreenElement !== stage) {
       document.removeEventListener("fullscreenchange", onFs);
@@ -119,6 +121,7 @@ function back(w, { silent = false } = {}) {
   if (!current || current.w !== w) return;
   const c = current;
   current = null;
+  if (c.dispose) c.dispose();
   c.stage.remove();
   w.popped = null;
   if (!silent && c.onBack) c.onBack();
