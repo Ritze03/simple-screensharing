@@ -740,7 +740,7 @@ const S = Object.assign({
   addTab: "join", vol: 100, muted: false, level: true, fps: 60, kbps: 8000, codec: "H.264", preset: "Quality",
   camRoom: null, camName: CAMS[0].name, camMode: CAMS[0].modes[0], camCodec: "H.264", camKbps: 2500,
   bwMode: "per", lang: "English", presentation: "Mailbox (default)", jitter: 2000, catchup: 5, boost: 100,
-  diag: false, muteShared: false, size: "1920x1080", pin: false, spin: false, myEmoji: "",
+  diag: false, muteShared: false, size: "1920x1080", pin: false, spin: false, myEmoji: "", soundVol: 50,
 }, STAGE_DEFAULTS());
 const D = () => DATA[S.data];
 /* "sharerSelf": the presets that show your own share (rig: you are client-1, the only sharer). */
@@ -1423,6 +1423,31 @@ function captureFloat() {
   });
 }
 
+/* Notification sounds, generated, so there are no files to ship. People joining and leaving your stream are soft sine
+   pairs, up and down; streams starting and stopping are rounder triangle notes, a rising chord and a low fall. */
+const SOUNDS = {
+  join: { label: "Someone joins my stream", wave: "sine", notes: [659, 880] },
+  leave: { label: "Someone leaves my stream", wave: "sine", notes: [880, 587] },
+  start: { label: "Someone starts a stream", wave: "triangle", notes: [523, 659, 784] },
+  stop: { label: "Someone stops a stream", wave: "triangle", notes: [392, 294] },
+};
+let audioCtx = null;
+function playSound(name) {
+  const { wave, notes } = SOUNDS[name], peak = (S.soundVol / 100) * 0.3;
+  if (!peak) return;
+  audioCtx ??= new AudioContext();
+  audioCtx.resume();
+  notes.forEach((f, i) => {
+    const t = audioCtx.currentTime + i * 0.09, o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = wave; o.frequency.value = f;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(peak, t + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.22);
+    o.connect(g).connect(audioCtx.destination);
+    o.start(t); o.stop(t + 0.24);
+  });
+}
+
 /* ============================== modals ============================== */
 function shell(cls, title, sub, body, foot, extraHead = "") {
   return `<div class="scrim" data-scrim="1"><div class="vb g0 modal ${cls}" role="dialog" aria-modal="true" aria-label="${esc(title)}">
@@ -1465,6 +1490,8 @@ function settingsModal() {
       ctrlRow("Catch-up speed", slider("catchup", 5, 10, 1), `<span class="val" id="catchup-val">${S.catchup}%</span>`, "How fast playback catches up after a hiccup") +
       ctrlRow("Level loudness", cbx("level", "Even out the volume of what I watch"), undefined, "Viewer-side automatic gain on every watched stream")) +
     card("Shared audio", null, ctrlRow("Boost", slider("boost", 0, 200, 5), `<span class="val" id="boost-val">${S.boost}%</span>`, "Trim the shared audio before it is sent")) +
+    card("Sounds", null, ctrlRow("Volume", slider("soundVol", 0, 100, 5, "", "Sound volume"), `<span class="val" id="sound-val">${S.soundVol}%</span>`, "How loud these sounds are, separate from any stream") +
+      Object.entries(SOUNDS).map(([k, x]) => `<div class="hb g2 crow">${FILL(`<span class="lbl">${x.label}</span>`)}<button type="button" class="btn btn-secondary" data-act="sound:${k}">${ic("play_arrow")}Test</button></div>`).join("")) +
     card("Diagnostics", null, ctrlRow("Logs", `<div class="hb g2" style="width:100%">${FILL(`<button type="button" class="btn btn-secondary wide">Copy to clipboard</button>`)}${FILL(`<button type="button" class="btn btn-secondary wide">Save to file…</button>`)}</div>`, undefined, "Recent log lines of this app") +
       ctrlRow("Relay", cbx("diag", "Send diagnostics to the relay"), undefined, "Off by default. Sends the same log text as Logs to the relay of each room you are in"));
   return shell("wide", "Settings", null, body, `${FILL("")}<button type="button" class="btn btn-primary btn-lg" data-act="close">Done</button>`);
@@ -1660,6 +1687,7 @@ document.addEventListener("click", (e) => {
     case "pip": V().pip = !V().pip; break;
     case "tagsalways": S.tagsAlways = !S.tagsAlways; break;
     case "hideown": S.hideOwn = !S.hideOwn; break;
+    case "sound": return playSound(arg);
     case "chsrc": render(); return toast("The system's screen and window picker opens here", "swap_horiz");
     case "audio":
       S.audioOn = !S.audioOn; S.audioSrc = S.audioOn ? "Desktop audio" : "No audio"; /* the button means the whole desktop; a single app is in the arrow's list */
@@ -1914,7 +1942,7 @@ document.addEventListener("input", (e) => {
     return;
   }
   S[k] = v;
-  const out = { vol: ["vol-pct", v + "%"], kbps: ["kbps-val", v], camKbps: ["camkbps-val", v], jitter: ["jitter-val", (v / 1000).toFixed(1) + " s"], catchup: ["catchup-val", v + "%"], boost: ["boost-val", v + "%"] }[k];
+  const out = { vol: ["vol-pct", v + "%"], kbps: ["kbps-val", v], camKbps: ["camkbps-val", v], jitter: ["jitter-val", (v / 1000).toFixed(1) + " s"], catchup: ["catchup-val", v + "%"], boost: ["boost-val", v + "%"], soundVol: ["sound-val", v + "%"] }[k];
   if (out) { const n = document.getElementById(out[0]); if (n) n.textContent = out[1]; }
 });
 document.addEventListener("change", (e) => {
