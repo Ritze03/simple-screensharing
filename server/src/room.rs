@@ -169,6 +169,11 @@ pub struct ConnState {
     /// The connection sent a `VIEWERS_TAG_HELLO` (spec §9.1): it is sent the viewer list of each
     /// stream it owns, and nobody else ever is.
     pub viewers: bool,
+    /// The connection sent an `AVATAR_TAG_HELLO` (spec §9.2): it is sent every member's emoji.
+    pub avatars: bool,
+    /// This member's emoji avatar (spec §9.2); empty = none. Validated UTF-8, at most
+    /// `MAX_AVATAR_BYTES` bytes. Dies with the connection.
+    pub avatar: String,
 }
 
 /// One resolved fan-out destination for a stream's media datagrams: the
@@ -385,6 +390,18 @@ impl RoomState {
         let _ = conn.connection.send_datagram(Bytes::from(crate::protocol::pack_viewers(stream_id, &ids)));
     }
 
+    /// Send the room's emoji list (spec §9.2) to `only`, or to every connection that said
+    /// `AVATAR_TAG_HELLO`. Call under the room lock after any change; also used by the refresh.
+    pub fn notify_avatars(&self, only: Option<ConnId>) {
+        let mut entries: Vec<(ConnId, &str)> =
+            self.connections.values().map(|c| (c.conn_id, c.avatar.as_str())).filter(|(_, e)| !e.is_empty()).collect();
+        entries.sort_unstable();
+        let list = Bytes::from(crate::protocol::pack_avatars(entries));
+        for c in self.connections.values().filter(|c| c.avatars && only.is_none_or(|o| o == c.conn_id)) {
+            let _ = c.connection.send_datagram(list.clone());
+        }
+    }
+
     /// Send a `RelayToClient` message to exactly one connection, if it's
     /// still present in the room.
     pub fn send_to(&self, target: ConnId, msg: RelayToClient) {
@@ -446,6 +463,9 @@ pub struct Registry {
     /// Whether viewer lists are sent to sharers (spec §9.1); `SSSHARE_VIEWERS=0` turns it off,
     /// which makes this relay behave like one that predates #116.
     pub viewers_enabled: bool,
+    /// Whether emoji avatars are carried (spec §9.2); `SSSHARE_AVATARS=0` turns it off (no ack, no
+    /// lists, sets ignored: like a relay that predates #106).
+    pub avatars_enabled: bool,
     /// Where opt-in client diagnostics uploads are stored (spec §6.7).
     pub client_logs: crate::client_logs::ClientLogs,
     pub started_at: std::time::Instant,
@@ -468,6 +488,7 @@ impl Registry {
             datagrams_evicting: AtomicU64::new(0),
             nack: NackStats::from_env(),
             viewers_enabled: std::env::var("SSSHARE_VIEWERS").map(|v| v != "0").unwrap_or(true),
+            avatars_enabled: std::env::var("SSSHARE_AVATARS").map(|v| v != "0").unwrap_or(true),
             client_logs: crate::client_logs::ClientLogs::from_env(),
             started_at: std::time::Instant::now(),
             listen_addr,

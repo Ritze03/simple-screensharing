@@ -939,6 +939,13 @@ pub struct RoomSession {
     /// [`VIEWERS_STALE`] is dropped (a lost "now nobody" heals itself). Pruned in `drain_events`.
     pub viewers: HashMap<StreamId, (Vec<ConnId>, Instant)>,
 
+    /// The relay carries emoji avatars (spec 9.2): it answered our avatar-hello. `false` on an
+    /// older relay, where nobody else's emoji ever shows (the own one still does, [`Self::emoji_of`]).
+    pub avatars_supported: bool,
+    /// The other members' emoji, by `ConnId`: the relay's last whole list (spec 9.2), replaced on
+    /// every list and pruned when a member leaves. Use [`Self::emoji_of`] to read it.
+    pub avatars: HashMap<ConnId, String>,
+
     /// Watches carried over from before a reconnect that are still waiting for
     /// their stream to be announced again (the owner may be reconnecting too,
     /// and a relay restart empties the room). Resolved against the roster by
@@ -955,6 +962,18 @@ pub struct RoomSession {
 }
 
 impl RoomSession {
+    /// The emoji shown as `conn_id`'s avatar in this room, "" when there is none: ours from our own
+    /// setting (so it shows at once and on a relay that predates avatars), everybody else's from the
+    /// relay's list. Not checked against the drawable set: the avatar widget draws the initial for an
+    /// emoji it has no picture of.
+    pub fn emoji_of(&self, conn_id: ConnId) -> String {
+        if conn_id == self.client.conn_id() {
+            self.client.avatar()
+        } else {
+            self.avatars.get(&conn_id).cloned().unwrap_or_default()
+        }
+    }
+
     /// The streams this session is watching or listening to, as
     /// [`WantedStream`]s (video watches and standalone-Listen audio; the audio
     /// that rides along with a video watch is re-derived by
@@ -1652,6 +1671,9 @@ pub struct AppState {
     /// levelling of every watched audio stream (`leveller.rs`). On by default. Applied live through
     /// the process-wide `leveller::ENABLED` switch. See `rooms::AppSettings::level_loudness`.
     pub level_loudness: bool,
+    /// Settings > Profile (persisted): this person's emoji avatar, "" = none. Sent to every
+    /// room's relay; see [`AppState::set_emoji`] and `rooms::AppSettings::emoji`.
+    pub emoji: String,
     /// Rate limiting, hysteresis and last-allocation bookkeeping for
     /// Absolute-Maximum mode. Never persisted: it describes this session's
     /// live encoders.
@@ -1897,6 +1919,7 @@ impl Default for AppState {
             send_diagnostics: settings.send_diagnostics,
             audio_gain: settings.audio_gain(),
             level_loudness: settings.level_loudness,
+            emoji: settings.emoji,
             bandwidth: BandwidthController::new(),
             pending_destinations: Vec::new(),
             recoveries: IndexMap::new(),
@@ -2000,6 +2023,15 @@ pub fn save_level_loudness(on: bool) {
     settings.level_loudness = on;
     if let Err(e) = settings.save() {
         tracing::warn!("failed to save the level-loudness preference: {e:#}");
+    }
+}
+
+/// Persist the emoji avatar (#106).
+pub fn save_emoji(emoji: &str) {
+    let mut settings = AppSettings::load();
+    settings.emoji = emoji.to_string();
+    if let Err(e) = settings.save() {
+        tracing::warn!("failed to save the emoji avatar: {e:#}");
     }
 }
 
@@ -3994,6 +4026,7 @@ impl AppState {
         event_rx: mpsc::UnboundedReceiver<ClientEvent>,
         join_string: String,
     ) {
+        client.set_avatar(&self.emoji);
         let watches: Arc<Mutex<HashMap<(ConnId, StreamId), WatchEntry>>> = Arc::new(Mutex::new(HashMap::new()));
         let audio_watches: Arc<Mutex<HashMap<(ConnId, StreamId), AudioWatch>>> = Arc::new(Mutex::new(HashMap::new()));
 
@@ -4034,6 +4067,8 @@ impl AppState {
                 audio_muted_by_owner: HashSet::new(),
                 viewers_supported: false,
                 viewers: HashMap::new(),
+                avatars_supported: false,
+                avatars: HashMap::new(),
                 rewatch: Vec::new(),
                 rewatch_deadline: None,
                 resume_after_stop: Vec::new(),
@@ -4219,6 +4254,7 @@ impl AppState {
                         // join/leave cycles. See that field's doc comment.
                         room.audio_volume_by_owner.remove(&conn_id);
                         room.audio_muted_by_owner.remove(&conn_id);
+                        room.avatars.remove(&conn_id);
                     }
                     ClientEvent::PresenceDelta(PresenceEvent::StreamStarted(info)) => {
                         room.note_stream_started(info);
@@ -4253,6 +4289,11 @@ impl AppState {
                     ClientEvent::Viewers { stream_id, viewers } => {
                         room.viewers_supported = true;
                         room.viewers.insert(stream_id, (viewers, Instant::now()));
+                    }
+                    ClientEvent::AvatarsSupported => room.avatars_supported = true,
+                    ClientEvent::Avatars(list) => {
+                        room.avatars_supported = true;
+                        room.avatars = list.into_iter().collect();
                     }
                     ClientEvent::KeyframeRequest { stream_id } => {
                         if let Some((LocalCapture { status: ShareStatus::Active(ShareHandle::Video(h)), .. }, dest)) =
@@ -5134,6 +5175,17 @@ impl AppState {
         self.send_diagnostics = on;
         crate::diag_upload::set_enabled(on, true);
         save_send_diagnostics(on);
+    }
+
+    /// Settings > Profile: set (or, with "", clear) our emoji avatar: persisted and sent to every
+    /// connected room now (and to every room joined or reconnected later). The picker offers only
+    /// the emoji the client can draw; one it cannot draw shows as the initial, here and for peers.
+    pub fn set_emoji(&mut self, emoji: &str) {
+        self.emoji = emoji.trim().to_string();
+        save_emoji(&self.emoji);
+        for room in self.rooms.values() {
+            room.client.set_avatar(&self.emoji);
+        }
     }
 
     /// Settings > Playback > Level loudness: switch the viewer-side levelling on or off (live, for

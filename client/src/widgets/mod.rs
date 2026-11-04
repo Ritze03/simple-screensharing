@@ -62,6 +62,7 @@
 
 mod containers;
 mod controls;
+mod emoji;
 pub mod gallery;
 mod layout;
 mod paint;
@@ -71,6 +72,7 @@ mod tests;
 
 pub use containers::*;
 pub use controls::*;
+pub use emoji::*;
 pub use layout::*;
 pub use paint::*;
 pub use rows::*;

@@ -66,6 +66,7 @@ pub struct Gallery {
     name: String,
     modal_open: bool,
     last_click: String,
+    emoji: String,
     initial_scroll: Option<f32>,
 }
 
@@ -92,6 +93,7 @@ impl Default for Gallery {
             name: String::new(),
             modal_open: env("SSS_GALLERY_MODAL").is_some_and(|v| v == "1"),
             last_click: "—".into(),
+            emoji: "🦊".into(),
             initial_scroll: env("SSS_GALLERY_SCROLL").and_then(|v| v.parse().ok()),
         }
     }
@@ -512,6 +514,34 @@ impl Gallery {
                 chip_dark(&mut c, Some("volume_up"), false, "");
                 chip_dark(&mut c, Some("volume_off"), false, "No audio shared");
             });
+        });
+
+        heading(ui, "Emoji avatars and picker", Some("#106"), true);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = theme::S2;
+            for (e, n) in [("🦊", "Fox"), ("💀", "Skull"), ("🐙", "Octo"), ("🐸", "Frog"), ("🌈", "Rain"), ("⭐", "Star"), ("🍕", "Pizza"), ("🤖", "Bot")] {
+                avatar_emoji(ui, e, &n[..1], theme::AVATAR_SM, theme::avatar_colors(n), false);
+            }
+            vsep(ui);
+            for (e, n) in [("🦊", "Fox"), ("💀", "Skull"), ("🐙", "Octo"), ("🦖", "Rex"), ("", "None")] {
+                avatar_emoji(ui, e, &n[..1], theme::AVATAR, theme::avatar_colors(n), e == "🐙");
+            }
+            vsep(ui);
+            for (e, n) in [("🦊", "Fox"), ("🐧", "Pingu")] {
+                avatar_emoji(ui, e, &n[..1], 64.0, theme::avatar_colors(n), false);
+                avatar_emoji(ui, e, &n[..1], 96.0, theme::avatar_colors(n), false);
+            }
+        });
+        ui.horizontal_top(|ui| {
+            let (rect, _) = ui.allocate_exact_size(vec2(320.0, 250.0), egui::Sense::hover());
+            ui.painter().rect(rect, CornerRadius::same(10), theme::ELEV_14, egui::Stroke::new(1.0_f32, theme::BTN_BORDER), egui::StrokeKind::Inside);
+            let mut menu = ui.new_child(egui::UiBuilder::new().max_rect(rect.shrink2(vec2(4.0, 6.0))));
+            match emoji_picker(&mut menu, &self.emoji, "Use my initial") {
+                Some(EmojiChoice::Pick(e)) => self.emoji = e.to_string(),
+                Some(EmojiChoice::Clear) => self.emoji.clear(),
+                None => {}
+            }
+            avatar_emoji(ui, &self.emoji, "M", 56.0, theme::avatar_colors("mo"), false);
         });
 
         heading(ui, "Banners", None, true);

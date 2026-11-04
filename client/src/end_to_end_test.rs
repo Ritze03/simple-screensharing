@@ -2929,6 +2929,61 @@ async fn native_client_learns_the_relay_cert_hash_and_tolerates_a_stale_one() {
     assert_eq!(c.current_cert_hash(), Some(hash), "reports what the relay really presented, not what the link said");
 }
 
+/// Wait for a [`ClientEvent::Avatars`] list that satisfies `want`, skipping everything else.
+async fn avatars_until(
+    ev: &mut tokio::sync::mpsc::UnboundedReceiver<crate::net::ClientEvent>,
+    what: &str,
+    want: impl Fn(&[(crate::protocol::ConnId, String)]) -> bool,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut last = Vec::new();
+    while std::time::Instant::now() < deadline {
+        if let Ok(Some(crate::net::ClientEvent::Avatars(list))) = tokio::time::timeout(Duration::from_millis(500), ev.recv()).await {
+            if want(&list) {
+                return;
+            }
+            last = list;
+        }
+    }
+    panic!("never saw {what}; the last list was {last:?}");
+}
+
+/// Emoji avatars (spec §9.2) through the real relay: a change reaches the other client, a joiner
+/// gets what is already set, a clear removes it, and a reconnect (new `ConnId`) re-announces. Run
+/// with `cargo test -p simple-screensharing-client --release --lib -- --ignored emoji_avatars`.
+#[tokio::test]
+#[ignore = "spawns a real relay server child process (current version, SSSHARE_SERVER_BIN)"]
+async fn emoji_avatars_travel_through_the_relay() {
+    let port = pick_free_udp_port().expect("free UDP port");
+    let _server = spawn_relay_server(port).expect("spawn relay");
+    let link = crate::net::format_join_string(&format!("127.0.0.1:{port}"), &rand::random(), &rand::random());
+
+    let (a, _s, mut ev_a) = connect_with_retry(&link, "ana").await.expect("connect a");
+    a.set_avatar("🦊");
+    // b joins late and gets what is already set
+    let (b, _s, mut ev_b) = connect_with_retry(&link, "ben").await.expect("connect b");
+    let ana = a.conn_id();
+    avatars_until(&mut ev_b, "ana's fox", |l| l.contains(&(ana, "🦊".to_string()))).await;
+
+    // a change while connected reaches everybody, the sender included (its own entry is its ack)
+    b.set_avatar("💀");
+    let ben = b.conn_id();
+    avatars_until(&mut ev_a, "ben's skull", |l| l.contains(&(ben, "💀".to_string())) && l.contains(&(ana, "🦊".to_string()))).await;
+
+    // clearing removes the entry
+    a.set_avatar("");
+    avatars_until(&mut ev_b, "ana's entry gone", |l| l.iter().all(|(id, _)| *id != ana) && l.contains(&(ben, "💀".to_string()))).await;
+    assert_eq!(a.avatar(), "");
+
+    // a reconnect is a new connection with a new ConnId: it re-announces by itself
+    drop(a);
+    let (a2, _s, _ev_a2) = connect_with_retry(&link, "ana").await.expect("reconnect a");
+    a2.set_avatar("🐙");
+    let ana2 = a2.conn_id();
+    assert_ne!(ana, ana2);
+    avatars_until(&mut ev_b, "the reconnected octopus", |l| l.contains(&(ana2, "🐙".to_string()))).await;
+}
+
 /// The relay's `logs/clients` directory for the relay [`spawn_relay_server`] started on `port`.
 fn relay_client_log_dir(port: u16) -> PathBuf {
     let cwd = match std::env::var_os("SSSHARE_SERVER_CWD") {
@@ -3069,7 +3124,7 @@ mod session_logic {
     async fn wait_for(state: &mut AppState, timeout: Duration, done: impl Fn(&AppState) -> bool) {
         let ctx = egui::Context::default();
         let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
+        while std::time::Instant::now() < deadline {
             state.drain_events(&ctx);
             state.poll_capture_states();
             state.poll_pending_destinations();

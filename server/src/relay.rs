@@ -64,6 +64,7 @@ use crate::protocol::{
     ClientToRelay, ConnId, MAX_CONTROL_FRAME_LEN, MAX_NAME_LEN, MAX_ROOM_MEMBERS,
     MEDIA_FLAG_RETRANSMIT, MediaHeader, Member, NACK_TAG_HELLO, NACK_TAG_HELLO_ACK, NACK_TAG_MISS,
     NACK_TAG_REQUEST, NackRange, StreamKind, is_nack_datagram, PresenceEvent, PreviewHeader, RejectReason, RelayToClient, RoomId,
+    AVATAR_TAG_ACK, AVATAR_TAG_HELLO, AVATAR_TAG_SET, MEDIA_HEADER_LEN, unpack_avatar_set,
     DIAG_TAG_ACK, DIAG_TAG_HELLO, VIEWERS_TAG_ACK, VIEWERS_TAG_HELLO, DIAG_UPLOAD_VERSION, MAX_DIAG_BATCH_BYTES, STREAM_TYPE_DIAG,
     STREAM_TYPE_PREVIEW, StreamId, StreamInfo, clamp_utf8, decode_payload, encode_frame,
 };
@@ -400,6 +401,9 @@ pub fn start(
     if registry.viewers_enabled {
         tokio::spawn(refresh_viewers(Arc::downgrade(&registry)));
     }
+    if registry.avatars_enabled {
+        tokio::spawn(refresh_avatars(Arc::downgrade(&registry)));
+    }
     let serving = endpoint.clone();
     tokio::spawn(async move {
         if let Err(e) = serve(registry, serving).await {
@@ -429,6 +433,24 @@ pub(crate) async fn refresh_viewers(registry: std::sync::Weak<Registry>) {
             for (owner, sid) in watched {
                 guard.notify_viewers(owner, sid);
             }
+        }
+    }
+}
+
+/// How often the room's emoji list is re-sent to every member that asked for it (spec §9.2): a
+/// datagram can be lost, and this is also what makes a late joiner's missed list and a lost
+/// "now nobody has one" heal.
+pub const AVATARS_REFRESH: Duration = Duration::from_secs(3);
+
+/// Re-send each room's emoji list to its avatar-capable members every [`AVATARS_REFRESH`].
+pub(crate) async fn refresh_avatars(registry: std::sync::Weak<Registry>) {
+    let mut tick = tokio::time::interval(AVATARS_REFRESH);
+    loop {
+        tick.tick().await;
+        let Some(registry) = registry.upgrade() else { return };
+        let rooms: Vec<_> = registry.rooms.read().await.values().cloned().collect();
+        for room in rooms {
+            room.lock().await.notify_avatars(None);
         }
     }
 }
@@ -646,6 +668,8 @@ async fn perform_join(
                 stream_count: 0,
                 nack: false,
                 viewers: false,
+                avatars: false,
+                avatar: String::new(),
             },
         );
 
@@ -922,6 +946,30 @@ async fn connection_loop(
                                 guard.streams.keys().filter(|(o, _)| *o == conn_id).map(|(_, s)| *s).collect();
                             for sid in owned {
                                 guard.notify_viewers(conn_id, sid);
+                            }
+                        }
+                    }
+                    Ok(bytes) if bytes.as_ref() == [AVATAR_TAG_HELLO] && registry.avatars_enabled => {
+                        // Spec §9.2: this member shows emoji avatars. The ack doubles as the
+                        // capability probe (an older relay never answers).
+                        let mut guard = room.lock().await;
+                        if let Some(c) = guard.connections.get_mut(&conn_id) {
+                            c.avatars = true;
+                            let _ = connection.send_datagram(Bytes::from_static(&[AVATAR_TAG_ACK]));
+                            guard.notify_avatars(Some(conn_id));
+                        }
+                    }
+                    Ok(bytes) if bytes.first() == Some(&AVATAR_TAG_SET) && bytes.len() < MEDIA_HEADER_LEN => {
+                        // Spec §9.2: this member's own emoji. Anything malformed is dropped.
+                        if registry.avatars_enabled
+                            && let Some(emoji) = unpack_avatar_set(&bytes)
+                        {
+                            let mut guard = room.lock().await;
+                            if let Some(c) = guard.connections.get_mut(&conn_id)
+                                && c.avatar != emoji
+                            {
+                                c.avatar = emoji.to_string();
+                                guard.notify_avatars(None);
                             }
                         }
                     }
@@ -1463,7 +1511,11 @@ async fn cleanup_connection(
         guard.notify_viewers(owner, stream_id);
     }
 
+    let had_avatar = guard.connections.get(&conn_id).is_some_and(|c| !c.avatar.is_empty());
     guard.connections.remove(&conn_id);
+    if had_avatar {
+        guard.notify_avatars(None);
+    }
     guard.log.push(format!("{conn_id:016x} left"));
     guard.broadcast(
         &RelayToClient::PresenceDelta {

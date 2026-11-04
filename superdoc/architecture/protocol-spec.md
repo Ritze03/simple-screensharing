@@ -810,6 +810,75 @@ Compatibility matrix:
 | new | new, `SSSHARE_VIEWERS=0` | like an old relay |
 | old / browser without #116 | new | never says Hello: nothing is sent to it, behaviour unchanged |
 
+### 9.2 Emoji avatars (task #106, 2026-11-04)
+
+**Why.** A person can pick an emoji as their avatar (Settings > Profile; the picker offers 40) and
+every peer shows it instead of the initial (design decision D6). Neither presence (§8, `Member` has
+exactly `conn_id`, `display_name`, `stream_count`) nor any control message can carry it, because the
+control format is frozen (§2, `wire_bytes_unchanged`). So, as for viewer lists (§9.1) and NACK (§6.6),
+it is a handshake of short tagged datagrams that every older peer drops: an old peer simply shows the
+initial.
+
+| Tag | Name | Direction | Length | Meaning |
+| --- | --- | --- | --- | --- |
+| `0xE9` | AvatarHello | client -> relay | 1 | "I show emoji avatars: send me everyone's" |
+| `0xEA` | AvatarAck | relay -> client | 1 | this relay carries avatars; a list follows at once |
+| `0xEB` | AvatarSet | client -> relay | 1 + 0..=16 | my own emoji: `tag u8 | emoji UTF-8`; no bytes after the tag = "no emoji" |
+| `0xEC` | AvatarList | relay -> client | 2 + (9 + n) x count | every member's emoji, the whole set |
+
+AvatarList layout (big-endian): `tag u8 | count u8 | (conn_id u64 | len u8 | emoji UTF-8 x len) x count`.
+Members without an emoji are left out, so a list with `count = 0` means "nobody has one". Example for
+`conn_id 1 = 🦊` and `0x0102030405060708 = 💀`: `ec 02 | 0000000000000001 04 f09fa68a | 0102030405060708 04 f09f9280`.
+
+- **Compatibility.** Hello, Ack and Set are shorter than a media header (19 bytes; Set is at most 17), so
+  an older relay drops them as undersized (§6.6) and never answers: the client sees no Ack and shows
+  nobody's emoji (its own still shows to itself). The list can exceed 19 bytes, which is safe only because
+  **the relay sends it solely to a connection that said AvatarHello**; a receiver tests the tag byte `0xEC`
+  before the media path (a media datagram starts with `0x01`), exactly as for `ViewersList`. Tags `0xE9`-`0xEC`
+  collide with no other family (`0xE0`-`0xE8`). Browsers that do not know them drop them as undersized
+  or never receive them.
+- **Client behaviour.** After joining, send `AvatarHello` every second (at most 10 times) until `AvatarAck`
+  arrives. After the Ack, whenever the relay's list does not show my own `conn_id` with the emoji I want
+  (or shows one when I want none), send `AvatarSet` again, every 250 ms in the native client, until it does:
+  my own entry in the list is the acknowledgement of a Set (the datagrams are lossy and there is no other
+  ack). A change of emoji while connected is the same loop; a reconnect has a new `ConnId` (§3.1), so the new
+  connection runs Hello and Set again by itself. Nothing is remembered per room by the relay beyond the
+  connection's life.
+- **Relay behaviour.** On Hello: mark the connection (`ConnState.avatars`), reply `AvatarAck`, then send it
+  the list. On `AvatarSet` from any connection (Hello or not): validate (UTF-8, at most **16 bytes**; an
+  invalid or longer one is dropped, the previous value stays) and, if it differs from what is stored
+  (`ConnState.avatar`), store it and send the new list to **every connection that said Hello** (the sender
+  included). The list is also sent to all of them every **3 s** (`AVATARS_REFRESH`), so a lost datagram, a
+  lost "now nobody has one" and a late joiner heal within one refresh, and when a member that had an emoji
+  leaves. The relay stores one string per connection and forwards it, nothing else. `SSSHARE_AVATARS=0` is
+  the kill switch: no Ack, no lists, Sets ignored (exactly an older relay).
+- **Receiver behaviour (trust boundary).** The client replaces its whole per-room map with each list (an
+  absent member has none) and drops a member's entry when `MemberLeft` arrives. A list that is truncated,
+  has trailing bytes, or any entry that is empty, longer than 16 bytes or not UTF-8, is discarded whole. The
+  UI draws an emoji only if it is one of the picker's 40 (it has a bundled picture of each); anything else
+  shows the initial, like no emoji. Keyed by `ConnId` within one live session.
+- **Why 16 bytes and why cleartext.** 16 covers a keycap, a flag or a four-codepoint ZWJ sequence and keeps
+  `AvatarSet` below the media-header length, which is what makes it safe to send to an old relay without
+  negotiation. An entry is at most 25 bytes, so even 32 entries (`MAX_AVATAR_ENTRIES`; a room has at most 8
+  members) fit one datagram (802 bytes, under the 1000-byte cap of §6.3). The emoji is **not** room-key encrypted: the relay sees it. *Why:* the display
+  name is already sent in cleartext in `Join` and shown to the relay's operator, so an avatar is profile
+  data of the same standing; an AEAD blob would need a counter value (§5.1) and a payload longer than 18
+  bytes (so it could not be sent to an unknown relay without a handshake first), for no change in who learns
+  what. A side benefit: the relay attributes each emoji to the connection it came from, so a member cannot
+  set someone else's avatar. The relay can of course forge one, as it can forge a display name.
+- **Rate.** A flood of alternating `AvatarSet` datagrams makes the relay send a list of at most ~200 bytes to
+  at most 8 connections per datagram, less than the media a member may already send; there is no limiter.
+
+Compatibility matrix:
+
+| client | relay | result |
+| --- | --- | --- |
+| new | old | Hello dropped, no Ack: nobody else's emoji shows, own still does |
+| new | new | Ack, then lists on every change and every 3 s |
+| new | new, `SSSHARE_AVATARS=0` | like an old relay |
+| old / browser without #106 | new | never says Hello: nothing is sent to it; an old peer shows the initial of everybody |
+| new | any, peer is old | the old peer's entry is absent: its initial is shown |
+
 ---
 
 ## 10. Relay bookkeeping data model
@@ -835,6 +904,8 @@ ConnState {
     subscriptions: HashSet<(ConnId, StreamId)>, // streams THIS conn watches
     nack: bool,                                 // sent Hello (§6.6)
     viewers: bool,                              // sent ViewersHello (§9.1): gets viewer lists of its own streams
+    avatars: bool,                              // sent AvatarHello (§9.2): gets the room's emoji list
+    avatar: String,                             // this member's emoji (§9.2), "" = none, <= 16 bytes UTF-8
 }
 
 StreamState {
@@ -865,6 +936,9 @@ Key operations:
 - **Subscribe / Unsubscribe:** update `subscribers` and the subscriber's `subscriptions`;
   send `SubscriberCount` to the owner (and `KeyframeRequest` on a new subscriber, §9) and, if the owner
   said `ViewersHello`, its `ViewersList` (§9.1).
+- **Avatar datagram in** (§9.2): Hello -> mark, reply Ack + list to that connection; Set -> validate, store in
+  `ConnState.avatar`, on a change send the list to every connection with `avatars`. A member leaving also
+  triggers a list when it had an emoji.
 - **Media datagram in:** parse the 19-byte header, validate source `conn_id`, forward
   verbatim to `streams[(conn_id, stream_id)].subscribers` (§6.2). Drop if no subscribers
   or unknown stream.

@@ -40,7 +40,7 @@ simple-screensharing-protocol = { path = "../protocol" }
 gstreamer = "0.24.5"
 gstreamer-app = "0.24.5"
 gstreamer-video = "0.24.5"
-image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 quinn = { version = "0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "platform-verifier"] }
 rand = "0.10.2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

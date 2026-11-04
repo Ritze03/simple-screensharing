@@ -446,6 +446,11 @@ pub struct AppSettings {
     /// key gets it on.
     #[serde(default = "AppSettings::default_level_loudness")]
     pub level_loudness: bool,
+    /// Settings > Profile: the emoji shown as this person's avatar instead of their initial, one of
+    /// `widgets::EMOJI` ("" = none; any other value is shown as none). Sent to every room's relay
+    /// (spec §9.2). An old settings file without the key gets none.
+    #[serde(default)]
+    pub emoji: String,
 }
 
 /// See [`AppSettings::start_stream_defaults`].
@@ -522,6 +527,7 @@ impl Default for AppSettings {
             send_diagnostics: false,
             audio_gain: Self::default_audio_gain(),
             level_loudness: true,
+            emoji: String::new(),
         }
     }
 }
@@ -899,6 +905,7 @@ mod tests {
             send_diagnostics: true,
             audio_gain: 1.5,
             level_loudness: false,
+            emoji: "🦊".to_string(),
         };
         let toml_str = toml::to_string_pretty(&settings).unwrap();
         let parsed: AppSettings = toml::from_str(&toml_str).unwrap();
@@ -913,7 +920,16 @@ mod tests {
         assert!(parsed.send_diagnostics);
         assert_eq!(parsed.audio_gain, 1.5);
         assert!(!parsed.level_loudness);
+        assert_eq!(parsed.emoji, "🦊");
         assert!(toml_str.contains("audio_gain = 1.5\n"), "stored readably: {toml_str}");
+    }
+
+    /// #106: a settings file from before emoji avatars loads with none, and none is not written as junk.
+    #[test]
+    fn old_settings_file_has_no_emoji() {
+        let parsed: AppSettings = toml::from_str("language = \"de\"\n").unwrap();
+        assert_eq!(parsed.emoji, "");
+        assert_eq!(AppSettings::default().emoji, "");
     }
 
     /// Task #114: no boost unless set; a file from before the setting, or a corrupt value, is safe.

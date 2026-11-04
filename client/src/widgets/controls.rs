@@ -459,28 +459,56 @@ pub fn avatar(ui: &mut Ui, initial: &str, size: f32, colors: [Color32; 2], prese
 /// and the pixel rounding of that position then put a capital up to 1 px high
 /// or low depending on where the row landed (1 px low in the user's band).
 pub fn paint_avatar(ui: &Ui, rect: Rect, initial: &str, colors: [Color32; 2], presence: bool) {
+    paint_avatar_emoji(ui, rect, "", initial, colors, presence);
+}
+
+/// [`avatar`] with an emoji: `emoji` ("" = none) is drawn instead of the initial when it is one of
+/// [`super::EMOJI`], on a gradient taken from the emoji's own colour (`colors`, the name's, is used
+/// for an initial). An emoji this client has no picture of shows the initial, like no emoji.
+pub fn avatar_emoji(ui: &mut Ui, emoji: &str, initial: &str, size: f32, colors: [Color32; 2], presence: bool) -> Response {
+    let (rect, resp) = ui.allocate_exact_size(vec2(size, size), Sense::hover());
+    paint_avatar_emoji(ui, rect, emoji, initial, colors, presence);
+    resp
+}
+
+/// [`paint_avatar`] with an emoji, see [`avatar_emoji`]. The emoji is the crop of its visible
+/// pixels centred on the disc, at `0.62 x` the avatar size like the replica's `.avatar .emo`, with
+/// the replica's 1 px black outline (the picture again in black, shifted 1 px up, down, left and
+/// right, behind it) that follows its shape.
+pub fn paint_avatar_emoji(ui: &Ui, rect: Rect, emoji: &str, initial: &str, colors: [Color32; 2], presence: bool) {
     let p = ui.painter();
     let ppp = ui.ctx().pixels_per_point();
     // Snap the disc to whole pixels so it and the glyph share one grid.
     let rect = egui::emath::GuiRounding::round_to_pixels(rect, ppp);
+    let glyph = if emoji.is_empty() { None } else { super::emoji_glyph(ui.ctx(), emoji) };
+    let colors = glyph.as_ref().map_or(colors, |g| g.colors);
     paint_gradient(p, rect, pill_radius(rect.height()), theme::AVATAR_GRADIENT_DEG, colors[0], colors[1]);
-    let fs = if rect.height() <= theme::AVATAR_SM { 10.5 } else { 13.0 };
-    let g = p.layout_no_wrap(initial.to_uppercase(), font(Weight::Bold, fs), Color32::WHITE);
-    // Vertically: `mesh_bounds` = the glyph quads (the rasterised ink rows, cap
-    // top to baseline for a capital, umlaut dots and descenders included), not
-    // the line box with its descent. Horizontally: the advance box; a capital's
-    // side bearings are balanced, while the quad carries a faint AA column on
-    // one side (measured: +0.5 px, rounding to a visible +1 px). Text is drawn
-    // on whole pixels (the tessellator rounds the galley position), so both are
-    // snapped here against the snapped disc; an odd leftover pixel goes *up*
-    // (floor; the optical centre sits slightly high) instead of wherever the
-    // independent rounding of disc and text happened to land.
-    let ink = g.mesh_bounds;
-    if ink.is_positive() {
-        let x = rect.center().x - g.rect.center().x;
-        let y = rect.center().y - ink.center().y;
-        let pos = pos2((x * ppp).round() / ppp, (y * ppp + 1e-3).floor() / ppp);
-        p.galley(pos, g, Color32::WHITE);
+    if let Some(g) = glyph {
+        let img = egui::emath::GuiRounding::round_to_pixels(super::emoji_rect(rect.center(), rect.height() * super::EMOJI_AVATAR_FRACTION, g.crop), ppp);
+        let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+        for d in [vec2(-1.0, 0.0), vec2(1.0, 0.0), vec2(0.0, -1.0), vec2(0.0, 1.0)] {
+            p.image(g.tex.id(), img.translate(d), uv, Color32::BLACK);
+        }
+        p.image(g.tex.id(), img, uv, Color32::WHITE);
+    } else {
+        let fs = if rect.height() <= theme::AVATAR_SM { 10.5 } else { 13.0 };
+        let g = p.layout_no_wrap(initial.to_uppercase(), font(Weight::Bold, fs), Color32::WHITE);
+        // Vertically: `mesh_bounds` = the glyph quads (the rasterised ink rows, cap
+        // top to baseline for a capital, umlaut dots and descenders included), not
+        // the line box with its descent. Horizontally: the advance box; a capital's
+        // side bearings are balanced, while the quad carries a faint AA column on
+        // one side (measured: +0.5 px, rounding to a visible +1 px). Text is drawn
+        // on whole pixels (the tessellator rounds the galley position), so both are
+        // snapped here against the snapped disc; an odd leftover pixel goes *up*
+        // (floor; the optical centre sits slightly high) instead of wherever the
+        // independent rounding of disc and text happened to land.
+        let ink = g.mesh_bounds;
+        if ink.is_positive() {
+            let x = rect.center().x - g.rect.center().x;
+            let y = rect.center().y - ink.center().y;
+            let pos = pos2((x * ppp).round() / ppp, (y * ppp + 1e-3).floor() / ppp);
+            p.galley(pos, g, Color32::WHITE);
+        }
     }
     if presence {
         // Mockup `.avatar .pres`: a 10 px green dot with a 2 px ring in the user

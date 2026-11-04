@@ -350,6 +350,74 @@ pub fn unpack_viewers(bytes: &[u8]) -> Option<(StreamId, Vec<ConnId>)> {
     Some((bytes[1], ids))
 }
 
+// ---------------------------------------------------------------------
+// §9.2 Emoji avatars (#106): one emoji per member, relayed as short tagged datagrams
+// ---------------------------------------------------------------------
+
+/// Client -> relay, 1 byte: "I show emoji avatars: tell me everyone's". Repeated until
+/// [`AVATAR_TAG_ACK`] arrives. Undersized for every older relay ([`is_nack_datagram`]).
+pub const AVATAR_TAG_HELLO: u8 = 0xE9;
+/// Relay -> client, 1 byte: this relay carries avatars. Followed at once by a [`AVATAR_TAG_LIST`].
+pub const AVATAR_TAG_ACK: u8 = 0xEA;
+/// Client -> relay: `tag u8 | emoji UTF-8` (0..=[`MAX_AVATAR_BYTES`] bytes; none = "no emoji").
+/// At most 17 bytes, so an older relay drops it as undersized.
+pub const AVATAR_TAG_SET: u8 = 0xEB;
+/// Relay -> client (only one that said [`AVATAR_TAG_HELLO`]): every member's emoji, the whole
+/// current set: `tag u8 | count u8 | (conn_id u64 BE | len u8 | emoji UTF-8) x count`, members
+/// without an emoji left out. Can exceed a media header, which is safe because only a client that
+/// opted in ever receives one; a receiver tests the tag byte, not the length.
+pub const AVATAR_TAG_LIST: u8 = 0xEC;
+/// Longest emoji (UTF-8 bytes) a relay accepts and a client sends: a keycap or flag sequence, or
+/// a four-codepoint ZWJ one. Keeps [`AVATAR_TAG_SET`] below the media header length.
+pub const MAX_AVATAR_BYTES: usize = 16;
+/// Most entries a list carries (a list entry is at most 25 bytes: 32 x 25 + 2 fits one datagram).
+pub const MAX_AVATAR_ENTRIES: usize = 32;
+
+/// Encode an [`AVATAR_TAG_SET`] datagram; `None` if `emoji` is longer than [`MAX_AVATAR_BYTES`].
+/// An empty `emoji` clears the avatar.
+pub fn pack_avatar_set(emoji: &str) -> Option<Vec<u8>> {
+    (emoji.len() <= MAX_AVATAR_BYTES).then(|| [&[AVATAR_TAG_SET][..], emoji.as_bytes()].concat())
+}
+
+/// The emoji of an [`AVATAR_TAG_SET`] datagram ("" = clear); `None` if it is anything else, too
+/// long, or not UTF-8.
+pub fn unpack_avatar_set(bytes: &[u8]) -> Option<&str> {
+    let body = bytes.strip_prefix(&[AVATAR_TAG_SET])?;
+    (body.len() <= MAX_AVATAR_BYTES).then(|| std::str::from_utf8(body).ok()).flatten()
+}
+
+/// Encode an [`AVATAR_TAG_LIST`]: members with an empty or oversized emoji are skipped, and at most
+/// [`MAX_AVATAR_ENTRIES`] are written.
+pub fn pack_avatars<'a>(entries: impl IntoIterator<Item = (ConnId, &'a str)>) -> Vec<u8> {
+    let mut b = vec![AVATAR_TAG_LIST, 0];
+    for (id, emoji) in entries.into_iter().filter(|(_, e)| !e.is_empty() && e.len() <= MAX_AVATAR_BYTES).take(MAX_AVATAR_ENTRIES) {
+        b.extend_from_slice(&id.to_be_bytes());
+        b.push(emoji.len() as u8);
+        b.extend_from_slice(emoji.as_bytes());
+        b[1] += 1;
+    }
+    b
+}
+
+/// Decode an [`AVATAR_TAG_LIST`]; `None` if it is anything else, truncated, has trailing bytes, or
+/// any entry is empty, too long or not UTF-8 (the whole list is distrusted then).
+pub fn unpack_avatars(bytes: &[u8]) -> Option<Vec<(ConnId, String)>> {
+    let [AVATAR_TAG_LIST, count, rest @ ..] = bytes else { return None };
+    let mut rest = rest;
+    let mut out = Vec::with_capacity(*count as usize);
+    for _ in 0..*count {
+        let (id, tail) = rest.split_first_chunk::<8>()?;
+        let (&len, tail) = tail.split_first()?;
+        let len = len as usize;
+        if len == 0 || len > MAX_AVATAR_BYTES || tail.len() < len {
+            return None;
+        }
+        out.push((u64::from_be_bytes(*id), std::str::from_utf8(&tail[..len]).ok()?.to_string()));
+        rest = &tail[len..];
+    }
+    rest.is_empty().then_some(out)
+}
+
 /// Whether `bytes` is a NACK-family datagram rather than a media fragment: shorter than a media
 /// header (so every older peer, relay or browser drops it as undersized instead of mistaking it
 /// for media) and led by a tag no media `version` byte will use.
@@ -621,6 +689,44 @@ mod tests {
         assert!(is_nack_datagram(&[VIEWERS_TAG_HELLO]) && is_nack_datagram(&[VIEWERS_TAG_ACK]));
         let others = [NACK_TAG_HELLO, NACK_TAG_HELLO_ACK, NACK_TAG_REQUEST, NACK_TAG_MISS, DIAG_TAG_HELLO, DIAG_TAG_ACK];
         for t in [VIEWERS_TAG_HELLO, VIEWERS_TAG_ACK, VIEWERS_TAG_LIST] {
+            assert!(!others.contains(&t) && t >= NACK_TAG_HELLO);
+        }
+    }
+
+    #[test]
+    fn avatar_datagrams_round_trip_and_reject_garbage() {
+        // SET: tag + emoji, short enough that every older relay drops it as undersized
+        let set = pack_avatar_set("🦊").unwrap();
+        assert_eq!(hex(&set), "ebf09fa68a");
+        assert_eq!(unpack_avatar_set(&set), Some("🦊"));
+        assert_eq!(unpack_avatar_set(&pack_avatar_set("").unwrap()), Some(""));
+        let longest = pack_avatar_set(&"x".repeat(MAX_AVATAR_BYTES)).unwrap();
+        assert!(longest.len() < MEDIA_HEADER_LEN && is_nack_datagram(&longest));
+        assert!(pack_avatar_set(&"x".repeat(MAX_AVATAR_BYTES + 1)).is_none());
+        assert_eq!(unpack_avatar_set(&[&[AVATAR_TAG_SET][..], &[b'x'; 17]].concat()), None, "too long");
+        assert_eq!(unpack_avatar_set(&[AVATAR_TAG_SET, 0xff, 0xfe]), None, "not UTF-8");
+        assert_eq!(unpack_avatar_set(&[AVATAR_TAG_ACK]), None);
+        // LIST
+        let l = pack_avatars([(1, "🦊"), (2, ""), (0x0102_0304_0506_0708, "💀")]);
+        assert_eq!(hex(&l), "ec02000000000000000104f09fa68a0102030405060708 04f09f9280".replace(' ', ""));
+        assert_eq!(unpack_avatars(&l), Some(vec![(1, "🦊".into()), (0x0102_0304_0506_0708, "💀".into())]));
+        assert_eq!(unpack_avatars(&pack_avatars([])), Some(vec![]));
+        assert_eq!(unpack_avatars(&l[..l.len() - 1]), None, "truncated");
+        assert_eq!(unpack_avatars(&[&l[..], &[0][..]].concat()), None, "trailing byte");
+        assert_eq!(unpack_avatars(&[AVATAR_TAG_LIST, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0]), None, "empty emoji entry");
+        assert_eq!(unpack_avatars(&[AVATAR_TAG_LIST, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0xff]), None, "not UTF-8");
+        let many: Vec<(ConnId, &str)> = (0..100).map(|i| (i, "🦊")).collect();
+        let big = pack_avatars(many);
+        assert_eq!(unpack_avatars(&big).unwrap().len(), MAX_AVATAR_ENTRIES);
+        let widest = pack_avatars((0..100).map(|i| (i, "xxxxxxxxxxxxxxxx")));
+        assert!(widest.len() <= 1200, "a full list fits one datagram: {}", widest.len());
+        // Hello/Ack/Set are undersized for older relays; no tag collides with another family
+        assert!(is_nack_datagram(&[AVATAR_TAG_HELLO]) && is_nack_datagram(&[AVATAR_TAG_ACK]));
+        let others = [
+            NACK_TAG_HELLO, NACK_TAG_HELLO_ACK, NACK_TAG_REQUEST, NACK_TAG_MISS, DIAG_TAG_HELLO, DIAG_TAG_ACK,
+            VIEWERS_TAG_HELLO, VIEWERS_TAG_ACK, VIEWERS_TAG_LIST,
+        ];
+        for t in [AVATAR_TAG_HELLO, AVATAR_TAG_ACK, AVATAR_TAG_SET, AVATAR_TAG_LIST] {
             assert!(!others.contains(&t) && t >= NACK_TAG_HELLO);
         }
     }

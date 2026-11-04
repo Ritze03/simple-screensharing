@@ -113,7 +113,7 @@ use crate::nack::{hello_loop, SendRing};
 use crate::protocol::{
     cert_hash_of_der, decode_cert_hash, decode_control_payload, encode_cert_hash, encode_control_frame, ClientToRelay, ConnId, CertHash, MediaHeader, Member,
     PresenceEvent, PreviewHeader, RejectReason, RelayToClient, RoomId, StreamId, StreamInfo,
-    StreamKind, is_nack_datagram, unpack_viewers, NackRange, DIAG_TAG_ACK, VIEWERS_TAG_ACK, VIEWERS_TAG_HELLO, VIEWERS_TAG_LIST, MAX_CONTROL_FRAME_LEN, NACK_TAG_HELLO_ACK, NACK_TAG_MISS, NACK_TAG_REQUEST,
+    StreamKind, is_nack_datagram, unpack_avatars, unpack_viewers, NackRange, pack_avatar_set, AVATAR_TAG_ACK, AVATAR_TAG_HELLO, AVATAR_TAG_LIST, DIAG_TAG_ACK, VIEWERS_TAG_ACK, VIEWERS_TAG_HELLO, VIEWERS_TAG_LIST, MAX_CONTROL_FRAME_LEN, NACK_TAG_HELLO_ACK, NACK_TAG_MISS, NACK_TAG_REQUEST,
     PROTOCOL_VERSION, STREAM_TYPE_PREVIEW,
 };
 
@@ -588,6 +588,11 @@ pub enum ClientEvent {
     /// Who watches our stream `stream_id` right now (spec §9.1): the complete set, as ConnIds.
     /// Only ever arrives from a relay that understands the viewers-hello.
     Viewers { stream_id: StreamId, viewers: Vec<ConnId> },
+    /// The relay acknowledged our avatar-hello: it carries emoji avatars (spec §9.2).
+    AvatarsSupported,
+    /// Every member's emoji in this room right now (spec §9.2), the whole set, own entry included;
+    /// a member without an emoji is absent. Only ever arrives from a relay that carries avatars.
+    Avatars(Vec<(ConnId, String)>),
     MediaFrame(DecryptedMediaFrame),
     Preview(DecryptedPreview),
     /// The control stream ended (relay closed it, connection dropped, or we
@@ -618,6 +623,8 @@ pub struct ScreenshareClient {
     cert_hash: Option<CertHash>,
     /// Recently sent video datagrams, for NACK retransmits (spec §6.6).
     send_ring: Arc<SendRing>,
+    /// Our emoji avatar and whether the relay has it (spec §9.2).
+    avatar: Arc<AvatarSync>,
 }
 
 /// SHA-256 of the leaf certificate the relay presented on `connection`, or
@@ -725,6 +732,7 @@ impl ScreenshareClient {
         let nack_acked = Arc::new(AtomicBool::new(false));
         let diag_acked = Arc::new(AtomicBool::new(false));
         let viewers_acked = Arc::new(AtomicBool::new(false));
+        let avatar = Arc::new(AvatarSync::default());
         tokio::spawn(datagram_reader_loop(
             connection.clone(),
             parsed.room_key,
@@ -734,9 +742,11 @@ impl ScreenshareClient {
             nack_acked.clone(),
             diag_acked.clone(),
             viewers_acked.clone(),
+            avatar.clone(),
         ));
         tokio::spawn(hello_loop(connection.clone(), nack_acked));
         tokio::spawn(viewers_hello_loop(connection.clone(), viewers_acked));
+        tokio::spawn(avatar_loop(connection.clone(), avatar.clone()));
         tokio::spawn(crate::diag_upload::upload_loop(connection.clone(), diag_acked.clone()));
         tokio::spawn(preview_uni_loop(connection.clone(), parsed.room_key, event_tx));
 
@@ -749,6 +759,7 @@ impl ScreenshareClient {
             room_id: parsed.room_id,
             cert_hash,
             send_ring,
+            avatar,
         };
 
         Ok((client, snapshot, event_rx))
@@ -756,6 +767,23 @@ impl ScreenshareClient {
 
     pub fn conn_id(&self) -> ConnId {
         self.conn_id
+    }
+
+    /// Our emoji avatar as set ("" = none).
+    pub fn avatar(&self) -> String {
+        self.avatar.want.lock().unwrap().clone()
+    }
+
+    /// Set (or, with "", clear) our emoji avatar in this room (spec §9.2). The background loop
+    /// sends it to the relay until the relay's list shows it, so a lost datagram, a late relay ack
+    /// and a change while connected all end the same way. An emoji too long for the wire is none.
+    pub fn set_avatar(&self, emoji: &str) {
+        let emoji = if pack_avatar_set(emoji).is_some() { emoji } else { "" };
+        let mut want = self.avatar.want.lock().unwrap();
+        if *want != emoji {
+            *want = emoji.to_string();
+            self.avatar.relay_has_it.store(false, Ordering::Relaxed);
+        }
     }
 
     pub fn room_key(&self) -> [u8; 32] {
@@ -931,6 +959,50 @@ async fn viewers_hello_loop(connection: quinn::Connection, acked: Arc<AtomicBool
     }
 }
 
+/// Our emoji avatar as the net tasks of one connection share it (spec §9.2).
+struct AvatarSync {
+    /// What we want the room to show ("" = none).
+    want: std::sync::Mutex<String>,
+    /// The relay answered our avatar-hello.
+    acked: AtomicBool,
+    /// The relay's last list agrees with `want` (starts true: nothing wanted, nothing to send).
+    relay_has_it: AtomicBool,
+}
+
+impl Default for AvatarSync {
+    fn default() -> Self {
+        Self { want: Default::default(), acked: AtomicBool::new(false), relay_has_it: AtomicBool::new(true) }
+    }
+}
+
+/// Emoji avatars (spec §9.2): a 1-byte hello every second (at most 10) until the relay acks, which
+/// an older relay never does; after that our emoji is re-sent four times a second until the relay's
+/// list shows it. The loop ends with the connection.
+async fn avatar_loop(connection: quinn::Connection, avatar: Arc<AvatarSync>) {
+    let mut hellos = 0;
+    for tick in 0u32.. {
+        let sent = if !avatar.acked.load(Ordering::Relaxed) {
+            if tick % 4 != 0 {
+                true
+            } else if hellos == 10 {
+                return;
+            } else {
+                hellos += 1;
+                connection.send_datagram(Bytes::from_static(&[AVATAR_TAG_HELLO])).is_ok()
+            }
+        } else if !avatar.relay_has_it.load(Ordering::Relaxed) {
+            let want = avatar.want.lock().unwrap().clone();
+            connection.send_datagram(Bytes::from(pack_avatar_set(&want).unwrap_or_default())).is_ok()
+        } else {
+            true
+        };
+        if !sent {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 /// How often the datagram loop polls the reassembler while a frame is being repaired.
 const NACK_TICK: Duration = Duration::from_millis(5);
 
@@ -943,6 +1015,7 @@ async fn datagram_reader_loop(
     nack_acked: Arc<AtomicBool>,
     diag_acked: Arc<AtomicBool>,
     viewers_acked: Arc<AtomicBool>,
+    avatar: Arc<AvatarSync>,
 ) {
     let mut reassembler = Reassembler::new();
     let mut last_poll = Instant::now();
@@ -969,6 +1042,21 @@ async fn datagram_reader_loop(
                     && tx.send(ClientEvent::Viewers { stream_id, viewers }).is_err()
                 {
                     return;
+                }
+            } else if datagram.first() == Some(&AVATAR_TAG_LIST) {
+                // Everyone's emoji (spec §9.2); like the viewer list, longer than a media header
+                // and recognised by its tag. Our own entry tells us whether the relay has our emoji.
+                if let Some(list) = unpack_avatars(&datagram) {
+                    let ours = list.iter().find(|(id, _)| *id == own_id).map_or("", |(_, e)| e.as_str());
+                    avatar.relay_has_it.store(ours == *avatar.want.lock().unwrap(), Ordering::Relaxed);
+                    if tx.send(ClientEvent::Avatars(list)).is_err() {
+                        return;
+                    }
+                }
+            } else if datagram.as_ref() == [AVATAR_TAG_ACK] {
+                if !avatar.acked.swap(true, Ordering::Relaxed) {
+                    tracing::debug!("the relay carries emoji avatars");
+                    let _ = tx.send(ClientEvent::AvatarsSupported);
                 }
             } else if datagram.as_ref() == [VIEWERS_TAG_ACK] {
                 if !viewers_acked.swap(true, Ordering::Relaxed) {
