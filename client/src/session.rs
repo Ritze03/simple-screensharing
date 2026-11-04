@@ -57,7 +57,7 @@ use std::time::{Duration, Instant};
 use indexmap::IndexMap;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::audio::{self, AudioCaptureHandle, AudioSource};
+use crate::audio::{self, AudioCaptureHandle, AudioChoice, AudioSource, Exclusions};
 use crate::bandwidth::{self, AllocInput, Allocation, DestId, DestSpec};
 use crate::capture::{self, CaptureHandle, DestKey};
 use crate::decode::{self, AudioDecoder, PreviewCache, StreamDecoder};
@@ -608,19 +608,15 @@ pub struct LocalCapture {
     pub status: ShareStatus,
     /// For an **audio** capture: the video capture this audio share was
     /// started as a companion to, if any. `None` for every video capture, and
-    /// for a standalone audio share started without a screen share to attach
-    /// to.
+    /// for an audio-only share (task I7: the control bar's audio button starts
+    /// those, independent of any screen share, and they keep running when the
+    /// screen stops).
     ///
-    /// `Why the link is explicit and not inferred:` the Stream Control tab no
-    /// longer gives audio a card of its own — a shared application's audio
-    /// renders as an extra row inside its screen share's card (see
-    /// `superdoc/features/stream-control.md`), so the frontend has to know
-    /// *which* card a given audio share belongs in. "Same room" alone is
-    /// ambiguous the moment someone shares two monitors into one room: both
-    /// cards would claim the same audio row, and Stop on either would kill
-    /// audio for both without saying so. Recording the pairing at the moment
-    /// the user clicks "Add audio" on a specific card is unambiguous and
-    /// costs one `Option`.
+    /// A `Some` pairing (kept at the lib level) means Stop on the video stops
+    /// the audio too ([`AppState::stop_share`]). `Why the link is explicit and
+    /// not inferred:` "same room" alone is ambiguous the moment someone shares
+    /// two monitors into one room: both would claim the same audio, and Stop on
+    /// either would kill audio for both without saying so.
     pub audio_for_capture: Option<CaptureSourceId>,
     /// Rooms this capture is being sent into.
     pub destinations: IndexMap<DestinationId, Destination>,
@@ -1497,9 +1493,9 @@ pub enum SuspendedShare {
     /// is a local thing and the portal prompt must not come back); only the
     /// encode branch bound to the dead connection was removed.
     Video { capture: CaptureSourceId, params: capture::destination::VideoParams, role: PendingRole },
-    /// An audio share paired with `for_capture`. Its capture is bound to the
+    /// An audio share (paired with `for_capture` when it has one). Its capture is bound to the
     /// dead connection as a whole, so it was stopped; this restarts it.
-    Audio { for_capture: CaptureSourceId, source: AudioSource, muted: bool },
+    Audio { for_capture: Option<CaptureSourceId>, choice: AudioChoice, muted: bool },
 }
 
 /// One room that dropped unexpectedly and is being reconnected. Lives in
@@ -1696,15 +1692,20 @@ pub struct AppState {
     /// user's retry ([`Self::retry_destination`]) clears an entry.
     recovery_gave_up: std::collections::HashSet<CaptureSourceId>,
 
-    /// Audio sources discovered by the last `list_audio_sources()` call.
+    /// Audio sources discovered by the last `list_audio_sources()` call, without the ones the
+    /// exclusion list leaves out (what every source list shows). Grouped: see `AudioSource::group`.
     pub audio_sources: Vec<AudioSource>,
+    /// The last listing as it came, before the exclusion list was applied (re-filtered when the list changes).
+    audio_sources_all: Vec<AudioSource>,
+    /// Audio settings > Exclude: shared with every running audio share, whose poll reads it each
+    /// second (`audio::Exclusions`). Persisted as `AppSettings::audio_exclusions`.
+    pub audio_exclusions: Exclusions,
     pub audio_sources_error: Option<String>,
     /// Set once we've kicked off the first automatic listing, so we don't
     /// re-trigger it every frame.
     pub audio_sources_requested: bool,
     /// In-flight `list_audio_sources()` call, if any.
     pub audio_sources_rx: Option<oneshot::Receiver<Result<Vec<AudioSource>, String>>>,
-    pub selected_audio_source: Option<AudioSource>,
 
     /// Live non-announcing level taps backing the "Add audio"/"Switch"
     /// dropdown's per-candidate meters — see [`AudioLevelTapId`] and
@@ -1733,9 +1734,9 @@ pub struct AppState {
     /// by their (kept) handle. See [`ReconnectState`] and the "Auto-reconnect"
     /// section of the `AppState` impl.
     pub reconnects: IndexMap<RoomHandle, ReconnectState>,
-    /// The audio source each running audio share was started with, so a
-    /// reconnect can restart it (the capture only keeps the source's name).
-    pub audio_share_sources: HashMap<CaptureSourceId, AudioSource>,
+    /// What each running audio share was started with (desktop or a name), so a reconnect can
+    /// restart it.
+    pub audio_share_sources: HashMap<CaptureSourceId, AudioChoice>,
     /// Set by [`Self::begin_shutdown`]: from then on nothing reconnects.
     pub shutting_down: bool,
     /// Current UI language ("en" or "de"), mirrored into `rust_i18n`'s global
@@ -1926,10 +1927,11 @@ impl Default for AppState {
             recovery_history: HashMap::new(),
             recovery_gave_up: std::collections::HashSet::new(),
             audio_sources: Vec::new(),
+            audio_sources_all: Vec::new(),
+            audio_exclusions: Exclusions::new(settings.audio_exclusions.clone()),
             audio_sources_error: None,
             audio_sources_requested: false,
             audio_sources_rx: None,
-            selected_audio_source: None,
             audio_level_taps: HashMap::new(),
             next_audio_level_tap_id: 0,
             room_store,
@@ -2032,6 +2034,15 @@ pub fn save_emoji(emoji: &str) {
     settings.emoji = emoji.to_string();
     if let Err(e) = settings.save() {
         tracing::warn!("failed to save the emoji avatar: {e:#}");
+    }
+}
+
+/// Persist the audio exclusion list (task I7).
+pub fn save_audio_exclusions(list: &[String]) {
+    let mut settings = AppSettings::load();
+    settings.audio_exclusions = list.to_vec();
+    if let Err(e) = settings.save() {
+        tracing::warn!("failed to save the audio exclusion list: {e:#}");
     }
 }
 
@@ -3104,51 +3115,49 @@ impl AppState {
         }
     }
 
-    /// "Add audio" clicked: same shape as `start_video_share`, for the
-    /// currently selected source. No-op (returns `Ok(())`) if no source is
-    /// selected (the button is disabled in that case).
+    /// Start sharing audio into `room_handle`: the whole desktop except the excluded apps, or one
+    /// name ([`AudioChoice`]). Same shape as `start_video_share`.
     ///
-    /// `for_capture` is the video capture this audio is being attached to, so
-    /// its row can be rendered inside that capture's card — see
-    /// [`LocalCapture::audio_for_capture`]. There is no standalone-audio mode
-    /// any more: **every** audio share must be paired to a video capture —
-    /// see this crate's hard invariant ("no audio-only streams, ever"), so
-    /// `for_capture` is mandatory here, not an `Option`.
+    /// **Audio is a share of its own (task I7, plan decision D9).** `for_capture` is `None` for an
+    /// audio-only share (no screen share needed, board #102; what the UI always passes: the audio
+    /// button is independent of the screen, so stopping the screen leaves the audio running) and
+    /// `Some(video capture)` for one that is paired with a screen share, whose Stop then stops the
+    /// audio too ([`Self::stop_share`]). The old invariant ("no audio-only streams, ever": every
+    /// audio share needed a live video capture) is gone: the wire carries audio without video, and a
+    /// viewer lists an audio-only sender with a Listen button.
     ///
-    /// `Why this checks liveness, not just existence:` `for_capture` can
-    /// legitimately name a capture that exists but is only **staged**
-    /// (`stage_video_share` ran, `go_live` hasn't yet — zero destinations,
-    /// nothing announced to any room). The frontend's staged card exposes
-    /// "+Add audio" before "Go Live" is clicked, and until this check
-    /// existed, clicking it there would announce a live audio stream paired
-    /// to a video capture that was not actually sending anything —
-    /// exactly the orphan, video-less "LIVE" row the hard invariant above
-    /// forbids. A capture counts as live iff it has at least one destination
-    /// (`add_destination_with_params`/`go_live` are the only things that ever
-    /// push one), so `!destinations.is_empty()` is the same staged-vs-live
-    /// test the rest of this module already relies on — no new flag needed.
-    pub fn start_audio_share(&mut self, room_handle: RoomHandle, for_capture: CaptureSourceId, muted: bool) -> Result<(), String> {
-        let is_live = self.captures.get(&for_capture).is_some_and(|c| !c.destinations.is_empty());
-        if !is_live {
-            return Err(
-                "cannot start audio share: the paired screen share is not live yet — click \"Go Live\" first"
-                    .to_string(),
-            );
+    /// `Why a paired share still checks liveness, not just existence:` `for_capture` can
+    /// legitimately name a capture that exists but is only **staged** (`stage_video_share` ran,
+    /// `go_live` hasn't yet — zero destinations, nothing announced to any room); a paired audio
+    /// stream announced next to a video capture that sends nothing would be an orphan. A capture
+    /// counts as live iff it has at least one destination (`add_destination_with_params`/`go_live`
+    /// are the only things that ever push one), so `!destinations.is_empty()` is the same
+    /// staged-vs-live test the rest of this module already relies on.
+    pub fn start_audio_share(
+        &mut self,
+        room_handle: RoomHandle,
+        for_capture: Option<CaptureSourceId>,
+        choice: AudioChoice,
+        muted: bool,
+    ) -> Result<(), String> {
+        if let Some(capture) = for_capture {
+            let is_live = self.captures.get(&capture).is_some_and(|c| !c.destinations.is_empty());
+            if !is_live {
+                return Err(
+                    "cannot start audio share: the paired screen share is not live yet — click \"Go Live\" first".to_string(),
+                );
+            }
         }
-        let Some(source) = self.selected_audio_source.clone() else {
-            return Ok(());
-        };
-        self.start_audio_share_with(room_handle, for_capture, source, muted)
+        self.start_audio_share_with(room_handle, for_capture, choice, muted)
     }
 
-    /// [`Self::start_audio_share`] with the source given explicitly: what a
-    /// reconnect uses to bring a share back with the source it was started
-    /// with, not whatever the dropdown has selected by now.
+    /// [`Self::start_audio_share`] without the liveness check: what a reconnect uses to bring a share
+    /// back with what it was started with, not whatever the menu has selected by now.
     fn start_audio_share_with(
         &mut self,
         room_handle: RoomHandle,
-        for_capture: CaptureSourceId,
-        source: AudioSource,
+        for_capture: Option<CaptureSourceId>,
+        choice: AudioChoice,
         muted: bool,
     ) -> Result<(), String> {
         let capture_id = self.alloc_capture_id();
@@ -3160,15 +3169,15 @@ impl AppState {
         room.destinations.push(destination_id);
         let client = room.client.clone();
 
-        self.audio_share_sources.insert(capture_id, source.clone());
+        self.audio_share_sources.insert(capture_id, choice.clone());
         let (tx, rx) = oneshot::channel();
         self.captures.insert(
             capture_id,
             LocalCapture {
                 kind: StreamKind::Audio,
-                label: source.name.clone(),
+                label: choice.label().to_string(),
                 status: ShareStatus::Starting(rx),
-                audio_for_capture: Some(for_capture),
+                audio_for_capture: for_capture,
                 destinations: IndexMap::from([(
                     destination_id,
                     Destination {
@@ -3191,14 +3200,65 @@ impl AppState {
         self.share_error = None;
 
         let gain = self.audio_gain;
+        let exclusions = self.audio_exclusions.clone();
         tokio::spawn(async move {
-            let result = audio::start_audio_sharing(&client, stream_id, &source, gain, muted)
+            let result = audio::start_audio_sharing(&client, stream_id, &choice, &exclusions, gain, muted)
                 .await
                 .map(ShareHandle::Audio)
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
         });
         Ok(())
+    }
+
+    /// Our own audio share in `room` (desktop or a name), with a stopping one losing to a running one:
+    /// switching the choice leaves the old capture `Stopping` for a second or more next to the new one
+    /// (#115: the bar showed the dying share, its flat meter, and Mute hit the wrong capture).
+    pub fn audio_share_in(&self, room: RoomHandle) -> Option<CaptureSourceId> {
+        let mut ours = self
+            .captures
+            .iter()
+            .filter(|(_, c)| c.kind == StreamKind::Audio && c.destinations.values().any(|d| d.room == room));
+        let first = ours.next()?;
+        let live = std::iter::once(first).chain(ours).find(|(_, c)| !matches!(c.status, ShareStatus::Stopping(_)));
+        Some(*live.unwrap_or(first).0)
+    }
+
+    /// What our audio share in `room` captures ([`Self::audio_share_in`]).
+    pub fn audio_choice_in(&self, room: RoomHandle) -> Option<AudioChoice> {
+        let id = self.audio_share_in(room)?;
+        let label = || AudioChoice::Named(self.captures.get(&id).map(|c| c.label.clone()).unwrap_or_default());
+        Some(self.audio_share_sources.get(&id).cloned().unwrap_or_else(label))
+    }
+
+    /// Replace the exclusion list (Audio settings > Desktop audio > Exclude): blanks and duplicates (ignoring
+    /// case) are dropped, the list is saved, and the source lists are filtered again. A running share notices
+    /// at its next 1 s poll: a source that was linked and is now excluded is unlinked
+    /// (`audio::sync_links`). Returns the list as stored.
+    pub fn set_audio_exclusions(&mut self, list: Vec<String>) -> Vec<String> {
+        let mut clean: Vec<String> = Vec::new();
+        for e in list {
+            let e = e.trim().to_string();
+            if !e.is_empty() && !clean.iter().any(|c| c.to_lowercase() == e.to_lowercase()) {
+                clean.push(e);
+            }
+        }
+        self.audio_exclusions.set(clean.clone());
+        save_audio_exclusions(&clean);
+        self.filter_audio_sources();
+        clean
+    }
+
+    /// A fresh listing arrived: remember it as it is and show it without the excluded sources.
+    pub fn set_audio_sources(&mut self, sources: Vec<AudioSource>) {
+        self.audio_sources_all = sources;
+        self.filter_audio_sources();
+    }
+
+    /// `audio_sources` = the last listing minus what the exclusion list leaves out.
+    fn filter_audio_sources(&mut self) {
+        let list = self.audio_exclusions.get();
+        self.audio_sources = self.audio_sources_all.iter().filter(|s| !s.is_excluded(&list)).cloned().collect();
     }
 
     /// Mute/unmute an audio share without stopping it — the Mute toggle on
@@ -3270,13 +3330,10 @@ impl AppState {
     ///
     /// `Why this cascades to paired audio:` a video capture can have an audio
     /// capture riding along (`LocalCapture::audio_for_capture` pointing back
-    /// at it) — either live, or merely staged waiting for the video to go
-    /// live. Stopping/cancelling the video without also stopping that audio
-    /// would leave it running forever with no video left to belong to,
-    /// exactly the orphan-audio state the hard "no audio-only streams" rule
-    /// forbids. This covers both cancelling a staged video card (which
-    /// reuses this same function, see `stage_video_share`'s doc comment) and
-    /// stopping a live one.
+    /// at it): a pairing is a promise that the audio belongs to that screen,
+    /// so stopping or cancelling the screen (which reuses this same function,
+    /// see `stage_video_share`'s doc comment) stops it too. An audio-only
+    /// share has no pairing and is stopped by its own id.
     pub fn stop_share(&mut self, capture_id: CaptureSourceId) {
         let paired_audio: Vec<CaptureSourceId> = self
             .captures
@@ -3802,7 +3859,7 @@ impl AppState {
         let Some(rx) = &mut self.audio_sources_rx else { return };
         match rx.try_recv() {
             Ok(Ok(sources)) => {
-                self.audio_sources = sources;
+                self.set_audio_sources(sources);
                 self.audio_sources_rx = None;
             }
             Ok(Err(e)) => {
@@ -4539,19 +4596,12 @@ impl AppState {
                 }
             }
             StreamKind::Audio if active => {
-                let source = self
-                    .audio_share_sources
-                    .get(&capture_id)
-                    .cloned()
-                    .or_else(|| self.audio_sources.iter().find(|s| s.name == label).cloned());
+                let choice = self.audio_share_sources.get(&capture_id).cloned().unwrap_or(AudioChoice::Named(label.clone()));
                 // The whole audio capture is bound to the dead connection;
                 // stop it and start a fresh one later (still muted if it was).
                 let muted = self.is_audio_share_muted(capture_id);
                 self.stop_share_one(capture_id);
-                match (audio_for, source) {
-                    (Some(for_capture), Some(source)) => Some(SuspendedShare::Audio { for_capture, source, muted }),
-                    _ => None,
-                }
+                Some(SuspendedShare::Audio { for_capture: audio_for, choice, muted })
             }
             // Mid-start: no handle to take apart yet. Cancel it the way a user
             // stop would (torn down on arrival); the user starts it again.
@@ -4715,7 +4765,7 @@ impl AppState {
             room.rewatch_deadline = Some(now + REWATCH_GRACE);
             room.apply_rewatch(now);
         }
-        // Video first: an audio share is only valid next to a live video one.
+        // Video first: a paired audio share is only valid next to a live video one.
         for share in &entry.shares {
             if let SuspendedShare::Video { capture, params, role } = share
                 && self.captures.get(capture).is_some_and(|c| matches!(c.status, ShareStatus::Active(ShareHandle::Video(_))))
@@ -4724,9 +4774,9 @@ impl AppState {
             }
         }
         for share in entry.shares {
-            if let SuspendedShare::Audio { for_capture, source, muted } = share
-                && self.captures.get(&for_capture).is_some_and(|c| !c.destinations.is_empty())
-                && let Err(e) = self.start_audio_share_with(handle, for_capture, source, muted)
+            if let SuspendedShare::Audio { for_capture, choice, muted } = share
+                && for_capture.is_none_or(|c| self.captures.get(&c).is_some_and(|c| !c.destinations.is_empty()))
+                && let Err(e) = self.start_audio_share_with(handle, for_capture, choice, muted)
             {
                 note_share_error(&mut self.share_error, e);
             }
@@ -4984,6 +5034,10 @@ pub fn pick_level_tap_serial(sources: Vec<AudioSource>, source_id: u32) -> Resul
 /// treats as "leave this one meter unlit") instead of every other command in
 /// the app.
 pub async fn build_audio_level_tap(source_id: u32) -> Result<audio::AudioLevelTapHandle, String> {
+    // The fake sources of the rig (`SSS_UI_FAKE_AUDIO_SOURCES`) are not in any graph: no stream may be created for them.
+    if std::env::var_os("SSS_UI_FAKE_AUDIO_SOURCES").is_some() {
+        return Err("fake audio sources have no level".to_string());
+    }
     let serial = pick_level_tap_serial(list_audio_sources_async().await?, source_id)?;
     tokio::task::spawn_blocking(move || audio::start_level_tap(serial))
         .await
@@ -6341,7 +6395,7 @@ mod ui_ops_tests {
 
     #[test]
     fn level_tap_serial_is_picked_from_a_fresh_listing() {
-        let src = |id, serial| AudioSource { id, name: format!("app{id}"), serial };
+        let src = |id, serial| AudioSource { id, name: format!("app{id}"), serial, group: audio::AudioGroup::Other, aliases: Vec::new() };
         let sources = vec![src(1, Some(100)), src(2, None)];
         assert_eq!(pick_level_tap_serial(sources.clone(), 1), Ok(100));
         assert_eq!(pick_level_tap_serial(sources.clone(), 3), Err("audio source is no longer listed".to_string()));

@@ -59,7 +59,7 @@ use simple_screensharing_client::session::{
 };
 
 use super::share::{
-    PillKind, RoomTargets, awaiting_first_frame, dest_kbps, dest_pill, find_source, level_lit, pop_heading, rooms_count, screen_name,
+    PillKind, RoomTargets, SourceOptions, awaiting_first_frame, dest_kbps, dest_pill, level_lit, pop_heading, rooms_count, screen_name,
     source_size, video_destination_count, waiting_hint,
 };
 use super::{Cx, NextStream, Popover, PopoverKind, UiAction, drive_dump, menu, tr, tr_with};
@@ -93,9 +93,6 @@ pub struct StreamSettingsState {
     floor: Option<u32>,
     /// `ctx` time of the last live edit pushed (min "Applying" duration).
     applied_at: Option<f64>,
-    /// Audio source ids the level meters were started for (staged modal
-    /// only; `None` = no taps started by this modal).
-    taps: Option<Vec<u32>>,
 }
 
 /// What the modal edits: one live destination, or the next-stream settings
@@ -158,11 +155,10 @@ struct Anchors {
 pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut StreamSettingsState, capture: CaptureSourceId, room: RoomHandle) {
     let Some(c) = cx.capture(capture) else { return };
     if st.opened_for != Some(capture) {
-        *st = StreamSettingsState { opened_for: Some(capture), taps: st.taps.take(), ..Default::default() };
+        *st = StreamSettingsState { opened_for: Some(capture), ..Default::default() };
         cx.act(UiAction::RefreshAudioSources);
     }
     let staged = c.destinations.is_empty();
-    sync_level_taps(cx, st, staged);
     let here: Option<(DestinationId, &Destination)> = c.destinations.iter().find(|(_, d)| d.room == room).map(|(id, d)| (*id, d));
     let target = match here {
         Some((id, d)) => Target::Live(id, d.edit),
@@ -235,12 +231,6 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut StreamSettingsState, capt
     for a in out {
         cx.act(a);
     }
-    // Any footer button, Escape or a click outside ends the modal: release
-    // the meters it started (nothing else stops them; the bar only stops the
-    // taps of its own popover).
-    if (!matches!(click, FooterClick::None) || (action.close && cx.nav.popover.is_none())) && st.taps.take().is_some() {
-        cx.act(UiAction::StopLevelTaps);
-    }
     match (staged, click) {
         (true, FooterClick::Leading(0)) => cx.act(UiAction::Discard(capture)),
         (true, FooterClick::Trailing(1)) => cx.act(UiAction::GoLive { capture, room }),
@@ -270,7 +260,7 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut StreamSettingsState, capt
         cx.toggle_popover(PopoverKind::MoveTo { capture, room }, r);
     }
     // Audio meter in the Source card.
-    if cx.paired_audio(capture).is_some() || st.taps.is_some() {
+    if cx.audio_share(room).is_some() {
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 }
@@ -278,30 +268,6 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut StreamSettingsState, capt
 /// `codec` key for [`drive_dump`]: `h264` / `av1` / `h265`.
 fn codec_key(c: VideoCodec) -> String {
     codec_label(c).to_lowercase().replace('.', "")
-}
-
-/// Keep a level tap running for every audio source while the *staged* modal
-/// is open, so the Source card's meter moves before anything is shared (a
-/// staged capture has no audio share to read a level from). Same idea as the
-/// bar's audio dropdown (`share::sync_level_taps`): start when it opens,
-/// restart when the source list changes, stop when it is no longer needed.
-///
-/// `Why the modal has to do this itself:` taps only exist after an explicit
-/// [`UiAction::StartLevelTaps`], and the bar starts them only for its own
-/// popover. The live modal reads the running share's level instead, so only
-/// the staged one needs them.
-fn sync_level_taps(cx: &mut Cx, st: &mut StreamSettingsState, staged: bool) {
-    if !staged {
-        if st.taps.take().is_some() {
-            cx.act(UiAction::StopLevelTaps);
-        }
-        return;
-    }
-    let ids: Vec<u32> = cx.state.audio_sources.iter().map(|s| s.id).collect();
-    if st.taps.as_ref() != Some(&ids) && !ids.is_empty() {
-        cx.act(UiAction::StartLevelTaps(ids.clone()));
-        st.taps = Some(ids);
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -403,37 +369,18 @@ fn screen_readout(c: &LocalCapture) -> String {
 // ---------------------------------------------------------------------------
 
 fn source_card(ui: &mut Ui, cx: &Cx, c: &LocalCapture, capture: CaptureSourceId, room: RoomHandle, out: &mut Vec<UiAction>) {
-    let staged = c.destinations.is_empty();
     let state = cx.state;
     let screen = screen_readout(c);
-    let audio = cx.paired_audio(capture);
-    let current: Option<String> = if staged {
-        cx.shell.staged.get(&room).and_then(|s| s.audio.as_ref().map(|a| a.name.clone()))
-    } else {
-        audio.map(|(_, a)| a.label.clone())
-    };
+    // Audio is a share of its own (task I7): this row starts, switches and stops the room's audio at once,
+    // staged screen or live.
+    let audio = cx.audio_share(room);
     let muted = audio.is_some_and(|(id, _)| state.is_audio_share_muted(id));
     let lit = match audio {
         Some((id, _)) if !muted => state.audio_share_level(id).map(level_lit).unwrap_or(0),
-        // Staged: nothing is shared yet, read the chosen source's own tap.
-        None if staged => cx
-            .shell
-            .staged
-            .get(&room)
-            .and_then(|s| s.audio.as_ref())
-            .and_then(|a| cx.source_level(a.id))
-            .map(level_lit)
-            .unwrap_or(0),
         _ => 0,
     };
-    let mut names: Vec<String> = vec![tr("ui.stream.no_audio", "No audio")];
-    names.extend(state.audio_sources.iter().map(|s| s.name.clone()));
-    if let Some(cur) = &current
-        && !names[1..].contains(cur)
-    {
-        names.push(cur.clone());
-    }
-    let mut idx = current.as_ref().and_then(|cur| names[1..].iter().position(|n| n == cur).map(|i| i + 1)).unwrap_or(0);
+    let options = SourceOptions::new(cx, room);
+    let mut idx = options.selected;
     let before = idx;
     let mut mute = muted;
     let change = tr("ui.stream.change", "Change");
@@ -458,7 +405,7 @@ fn source_card(ui: &mut Ui, cx: &Cx, c: &LocalCapture, capture: CaptureSourceId,
             out.push(UiAction::Discard(capture));
             out.push(UiAction::StageShare(room));
         }
-        let opts: Vec<menu::Opt> = names.iter().enumerate().map(|(i, n)| menu::Opt { label: n, sub: None, icon: Some(if i == 0 { "volume_off" } else { "music_note" }) }).collect();
+        let opts = options.opts();
         widgets::ctrl_row_value(
             ui,
             &tr("ui.stream.audio", "Audio"),
@@ -469,15 +416,11 @@ fn source_card(ui: &mut Ui, cx: &Cx, c: &LocalCapture, capture: CaptureSourceId,
         let enabled = audio.is_some();
         let r = widgets::ctrl_row(ui, "", None, |ui| widgets::checkbox_enabled(ui, &mut mute, &mute_l, enabled));
         if r.changed() {
-            out.push(UiAction::SetSharedAudioMuted { capture, muted: mute });
+            out.push(UiAction::SetSharedAudioMuted { room, muted: mute });
         }
     });
     if idx != before {
-        if idx == 0 {
-            out.push(UiAction::StopSharingAudio { capture });
-        } else if let Some(source) = find_source(cx, &names[idx]) {
-            out.push(UiAction::ShareAudio { capture, source });
-        }
+        out.push(options.action(room, idx));
     }
 }
 

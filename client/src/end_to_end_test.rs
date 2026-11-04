@@ -1901,7 +1901,7 @@ async fn watching_video_automatically_delivers_the_sharers_audio_too() {
         .find(|s| s.name.contains(PW_CLIENT_NAME))
         .cloned()
         .expect("did not find the synthetic test app among live audio sources");
-    let audio_handle = crate::audio::start_audio_sharing(&client_a, AUDIO_STREAM_ID, &source, 1.0, false)
+    let audio_handle = crate::audio::start_audio_sharing(&client_a, AUDIO_STREAM_ID, &crate::audio::AudioChoice::Named(source.name.clone()), &crate::audio::Exclusions::default(), 1.0, false)
         .await
         .expect("start_audio_sharing failed");
     eprintln!("[audio-follows-video] step 2 OK: sharer enabled audio AFTER the viewer was already watching");
@@ -2103,7 +2103,7 @@ async fn volume_survives_sender_audio_restart_or_switch() {
         .find(|s| s.name.contains(PW_CLIENT_NAME_A))
         .cloned()
         .expect("did not find the first synthetic test app among live audio sources");
-    let audio_handle_a = crate::audio::start_audio_sharing(&client_a, AUDIO_STREAM_ID_A, &source_a, 1.0, false)
+    let audio_handle_a = crate::audio::start_audio_sharing(&client_a, AUDIO_STREAM_ID_A, &crate::audio::AudioChoice::Named(source_a.name.clone()), &crate::audio::Exclusions::default(), 1.0, false)
         .await
         .expect("start_audio_sharing (first) failed");
 
@@ -2181,7 +2181,7 @@ async fn volume_survives_sender_audio_restart_or_switch() {
         .find(|s| s.name.contains(PW_CLIENT_NAME_B))
         .cloned()
         .expect("did not find the second synthetic test app among live audio sources");
-    let audio_handle_b = crate::audio::start_audio_sharing(&client_a, AUDIO_STREAM_ID_B, &source_b, 1.0, false)
+    let audio_handle_b = crate::audio::start_audio_sharing(&client_a, AUDIO_STREAM_ID_B, &crate::audio::AudioChoice::Named(source_b.name.clone()), &crate::audio::Exclusions::default(), 1.0, false)
         .await
         .expect("start_audio_sharing (second) failed");
 
@@ -2602,15 +2602,16 @@ async fn big_fps_jump_mid_stream_keeps_viewer_frames_flowing() {
     eprintln!("[e2e-fps-jump] PASS: viewer kept decoding frames across both big fps jumps");
 }
 
-/// Regression test for the "orphan audio-only stream" bug (2026-07-29 — see
+/// Regression test for the "orphan audio stream" bug (2026-07-29 — see
 /// this task's dispatch notes / `superdoc/features/stream-control.md`):
 /// `AppState::start_audio_share` used to announce a live audio stream
 /// against **any** `for_capture` id that merely existed, without checking
 /// whether that capture was actually live (had a destination). Clicking
 /// "+ Add audio" on a staged (pre-"Go live") video card — a real capture
 /// with **zero** destinations, per `stage_video_share`'s doc comment — used
-/// to create exactly that: a video-less "LIVE" stream visible forever in
-/// the room panel with nothing to pair it to.
+/// to create exactly that: a "LIVE" stream paired to a video that sends
+/// nothing. Since task I7 audio can also be a share of its own
+/// (`for_capture: None`, no such check); a *pairing* still has to name a live capture.
 ///
 /// Needs no relay server, no real GStreamer pipeline, and no PipeWire — the
 /// rejection happens before any of that is touched (see `start_audio_share`'s
@@ -2638,18 +2639,18 @@ async fn start_audio_share_rejects_a_merely_staged_video_capture() {
         },
     );
 
-    state.selected_audio_source = Some(crate::audio::AudioSource { id: 0, name: "Test app".to_string(), serial: None });
     // `room_handle` never gets looked up: the gate must reject before that,
     // so an id naming no real room at all is deliberate here, not sloppy —
     // if this ever *didn't* error, the next line inside `start_audio_share`
     // would be a room lookup against a handle that doesn't exist.
     let bogus_room_handle = crate::session::RoomHandle(0);
 
-    let result = state.start_audio_share(bogus_room_handle, capture_id, false);
+    let choice = crate::audio::AudioChoice::Named("Test app".to_string());
+    let result = state.start_audio_share(bogus_room_handle, Some(capture_id), choice, false);
     assert!(
         result.is_err(),
         "BUG REPRODUCED: start_audio_share must reject a for_capture that is only staged \
-         (zero destinations), not silently announce an orphan audio-only stream"
+         (zero destinations), not silently announce an orphan paired audio stream"
     );
     assert_eq!(
         state.captures.len(),
@@ -2737,8 +2738,8 @@ async fn start_audio_share_succeeds_once_the_video_capture_is_live() {
     }
     assert_eq!(state.captures[&video_capture_id].destinations.len(), 1, "test setup: video capture must be live");
 
-    state.selected_audio_source = Some(crate::audio::AudioSource { id: 0, name: "Test app".to_string(), serial: None });
-    let result = state.start_audio_share(room_handle, video_capture_id, false);
+    let choice = crate::audio::AudioChoice::Named("Test app".to_string());
+    let result = state.start_audio_share(room_handle, Some(video_capture_id), choice, false);
     assert!(result.is_ok(), "start_audio_share must succeed against a live for_capture, got {result:?}");
 
     let audio_capture_id = state
@@ -3434,6 +3435,11 @@ mod session_logic {
 /// `autoaudiosink` plays to whatever sink `PULSE_SINK` / `PIPEWIRE_NODE` names; recording that
 /// sink's monitor is how the *heard* result is measured (`testing-and-verification.md`, VM audio
 /// tests). Run it only in a VM (audio streams are not allowed on the dev host).
+///
+/// Task I7 knobs: `SSS_LIVE_CHOICE=desktop` shares the whole desktop (`AudioChoice::Desktop`) instead of the app
+/// named `SSS_LIVE_APP`; `SSS_LIVE_EXCLUDE=a,b` is the exclusion list (default: none); `SSS_LIVE_EXCL_AT=20:+name,40:-name`
+/// adds (`+`) or removes (`-`) an entry at that second of the run, like the audio settings do. Every second the
+/// log also prints which streams are linked into the share's sink (`linked [...]`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "live audio soak against a real application; VM only, see testing-and-verification.md"]
 async fn live_audio_share_soak() {
@@ -3458,12 +3464,36 @@ async fn live_audio_share_soak() {
     let room_handle = viewer.insert_room(client_b, snapshot_b, events_b, join_string.clone());
     let ctx = egui::Context::default();
 
-    let sources = crate::audio::list_audio_sources().expect("list_audio_sources");
-    let source = sources.iter().find(|s| s.name == app).cloned().unwrap_or_else(|| panic!("no audio source named {app}: {sources:?}"));
-    let audio_handle = crate::audio::start_audio_sharing(&client_a, AUDIO_STREAM_ID, &source, 1.0, false)
+    let split = |v: String| v.split(',').map(|e| e.trim().to_string()).filter(|e| !e.is_empty()).collect::<Vec<_>>();
+    let exclusions = crate::audio::Exclusions::new(std::env::var("SSS_LIVE_EXCLUDE").map(split).unwrap_or_default());
+    // `t:+name` / `t:-name`: what the audio settings' Add and remove buttons do, t seconds into the run.
+    let schedule: Vec<(u64, bool, String)> = std::env::var("SSS_LIVE_EXCL_AT")
+        .map(split)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|e| {
+            let (t, rest) = e.split_once(':')?;
+            Some((t.parse().ok()?, rest.starts_with('+'), rest[1..].to_string()))
+        })
+        .collect();
+    let desktop = std::env::var("SSS_LIVE_CHOICE").is_ok_and(|v| v == "desktop");
+    let choice = if desktop {
+        crate::audio::AudioChoice::Desktop
+    } else {
+        let sources = crate::audio::list_audio_sources().expect("list_audio_sources");
+        let source = sources.iter().find(|s| s.name == app).cloned().unwrap_or_else(|| panic!("no audio source named {app}: {sources:?}"));
+        crate::audio::AudioChoice::Named(source.name)
+    };
+    let audio_handle = crate::audio::start_audio_sharing(&client_a, AUDIO_STREAM_ID, &choice, &exclusions, 1.0, false)
         .await
         .expect("start_audio_sharing");
-    eprintln!("[soak] sharing '{app}'");
+    eprintln!("[soak] sharing {choice:?}, exclusions {:?}", exclusions.get());
+    // The sources as the audio menu lists them: group, name.
+    if let Ok(list) = crate::audio::list_audio_sources() {
+        for s in &list {
+            eprintln!("[soak] source {:?} / {} (excluded: {})", s.group, s.name, s.is_excluded(&exclusions.get()));
+        }
+    }
 
     for _ in 0..80 {
         viewer.drain_events(&ctx);
@@ -3484,9 +3514,111 @@ async fn live_audio_share_soak() {
             .get(&(owner, AUDIO_STREAM_ID))
             .map(|w| w.decoder.packets_received())
             .unwrap_or(0);
-        eprintln!("[soak] t={t:3}s sender level {:.3} viewer packets {packets}", audio_handle.level());
+        for (at, add, name) in schedule.iter().filter(|(at, ..)| *at == t) {
+            let mut list = exclusions.get();
+            if *add {
+                list.push(name.clone());
+            } else {
+                list.retain(|e| e != name);
+            }
+            eprintln!("[soak] t={at}s exclusions are now {list:?}");
+            exclusions.set(list);
+        }
+        let linked = audio_handle.linked_stream_names().unwrap_or_default();
+        eprintln!("[soak] t={t:3}s sender level {:.3} viewer packets {packets} linked {linked:?}", audio_handle.level());
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     let _ = audio_handle.stop().await;
     eprintln!("[soak] done");
+}
+
+/// Polls `state` (events and capture states) until `done` holds, or panics after `timeout`.
+async fn wait_state(state: &mut crate::session::AppState, timeout: Duration, done: impl Fn(&crate::session::AppState) -> bool) {
+    let ctx = egui::Context::default();
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        state.drain_events(&ctx);
+        state.poll_capture_states();
+        if done(state) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("condition not met within {timeout:?}");
+}
+
+/// Task I7: an audio-only share through the app's own path (`AppState::start_audio_share(room, None, ..)`, what the
+/// bar's audio button does): no screen share, a viewer sees an audio-only sender and hears it, Stop leaves nothing
+/// behind (no capture, no sink in the graph, the stream gone for the viewer). `SSS_LIVE_APP` names a source (default
+/// `Firefox`) unless `SSS_LIVE_CHOICE=desktop`. VM only (it creates a PipeWire sink and a capture stream).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live audio-only share against a real application; VM only, see testing-and-verification.md"]
+async fn live_audio_only_share_through_the_app_state() {
+    let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).with_test_writer().try_init();
+    let app = std::env::var("SSS_LIVE_APP").unwrap_or_else(|_| "Firefox".into());
+    let choice = if std::env::var("SSS_LIVE_CHOICE").is_ok_and(|v| v == "desktop") {
+        crate::audio::AudioChoice::Desktop
+    } else {
+        crate::audio::AudioChoice::Named(app.clone())
+    };
+    let port = pick_free_udp_port().expect("free udp port");
+    let _server = spawn_relay_server(port).expect("spawn relay");
+    let server_addr = format!("127.0.0.1:{port}");
+    let room_id: RoomId = rand::random();
+    let room_key: [u8; 32] = rand::random();
+    let join_string = crate::net::format_join_string(&server_addr, &room_id, &room_key);
+
+    let (client_a, snapshot_a, events_a) = connect_with_retry(&join_string, "sharer").await.expect("client A");
+    let owner = client_a.conn_id();
+    let mut sharer = crate::session::AppState::default();
+    let room_a = sharer.insert_room(client_a, snapshot_a, events_a, join_string.clone());
+    let (client_b, snapshot_b, events_b) = connect_with_retry(&join_string, "viewer").await.expect("client B");
+    let mut viewer = crate::session::AppState::default();
+    let room_b = viewer.insert_room(client_b, snapshot_b, events_b, join_string.clone());
+    let ctx = egui::Context::default();
+
+    // No screen capture exists anywhere: this is the whole point.
+    assert!(sharer.captures.is_empty());
+    sharer.start_audio_share(room_a, None, choice, false).expect("audio-only start");
+    let id = sharer.audio_share_in(room_a).expect("the share is registered at once (Starting)");
+    assert_eq!(sharer.captures[&id].audio_for_capture, None, "an audio-only share has no pairing");
+    wait_state(&mut sharer, Duration::from_secs(15), |s| matches!(s.captures.get(&id).map(|c| &c.status), Some(crate::session::ShareStatus::Active(_)))).await;
+    assert!(sharer.share_error.is_none(), "start failed: {:?}", sharer.share_error);
+    eprintln!("[audio-only] share is Active, label {:?}", sharer.captures[&id].label);
+
+    // The viewer sees an audio stream from the sharer with no video next to it, and can listen.
+    let mut stream_id = None;
+    for _ in 0..80 {
+        viewer.drain_events(&ctx);
+        stream_id = viewer.rooms[&room_b].streams.iter().find(|s| s.owner == owner && s.kind == crate::protocol::StreamKind::Audio).map(|s| s.stream_id);
+        if stream_id.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let stream_id = stream_id.expect("the viewer never saw the audio-only stream");
+    assert!(!viewer.rooms[&room_b].owner_has_video(owner), "the sender has no video");
+    viewer.rooms.get_mut(&room_b).unwrap().toggle_listen(owner, stream_id);
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    viewer.drain_events(&ctx);
+    let packets = viewer.rooms[&room_b].audio_watches.lock().unwrap().get(&(owner, stream_id)).map(|w| w.decoder.packets_received()).unwrap_or(0);
+    eprintln!("[audio-only] viewer received {packets} packets");
+    assert!(packets > 50, "an audio-only share must reach the viewer: {packets} packets in ~4 s");
+
+    // Stop: the capture goes, and so does the sink.
+    sharer.stop_share(id);
+    wait_state(&mut sharer, Duration::from_secs(15), |s| !s.captures.contains_key(&id)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let leftovers = String::from_utf8_lossy(&std::process::Command::new("pw-dump").output().expect("pw-dump").stdout).matches("ssshare-sink-").count();
+    assert_eq!(leftovers, 0, "Stop must not leave the share's sink or capture stream in the graph");
+    for _ in 0..40 {
+        viewer.drain_events(&ctx);
+        if !viewer.rooms[&room_b].streams.iter().any(|s| s.owner == owner && s.stream_id == stream_id) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!viewer.rooms[&room_b].streams.iter().any(|s| s.owner == owner && s.stream_id == stream_id), "the relay announced the stop");
+    assert!(sharer.rooms[&room_a].destinations.is_empty(), "the room forgot the destination");
+    eprintln!("[audio-only] PASS");
 }

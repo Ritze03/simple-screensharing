@@ -28,6 +28,7 @@
 
 use egui::{Align, CornerRadius, Rect, Sense, Stroke, Ui, vec2};
 use simple_screensharing_client::protocol::StreamKind;
+use simple_screensharing_client::session::ShareStatus;
 
 use super::{ConnState, Cx, Modal, PopoverKind, RoomKey, ShareState, StreamKey, UiAction, View, tr, tr_with};
 use crate::theme::{self, Weight, font};
@@ -238,8 +239,11 @@ pub fn show_user_band(ui: &mut Ui, cx: &mut Cx, _st: &mut SidebarState) {
     if resp.hovered() || cx.popover_of(&PopoverKind::Outgoing).is_some() {
         ui.painter().rect_filled(hot, CornerRadius::same(theme::ROUNDING_XS), theme::WASH_HOVER_1);
     }
+    // Audio on its own (task I7) is no screen: "Live in N rooms" stays about screens.
+    let audio_only = cx.state.captures.values().any(|c| c.kind == StreamKind::Audio && !matches!(c.status, ShareStatus::Stopping(_)));
     let status = match n_live {
         0 if starting => tr("ui.sidebar.starting", "Starting…").to_string(),
+        0 if audio_only => tr("ui.sidebar.sharing_audio", "Sharing audio").to_string(),
         0 => tr("ui.sidebar.not_sharing", "Not sharing").to_string(),
         1 => tr("ui.sidebar.live_in_one_room", "Live in 1 room").to_string(),
         n => tr_with("ui.sidebar.live_in_rooms", "Live in %{count} rooms", &[("count", &n.to_string())]),
@@ -247,7 +251,7 @@ pub fn show_user_band(ui: &mut Ui, cx: &mut Cx, _st: &mut SidebarState) {
     let top = Rect::from_x_y_ranges(who.x_range(), who.center().y - 15.0..=who.center().y + 1.0);
     let bottom = Rect::from_x_y_ranges(who.x_range(), who.center().y + 1.0..=who.center().y + 15.0);
     widgets::paint_text(ui, top, &name, font(Weight::Bold, theme::FS_ROW), theme::TEXT, Align::Min);
-    let status_col = if n_live > 0 { theme::SUCCESS } else if starting { theme::ACCENT_LIGHTER } else { theme::TEXT_DIM };
+    let status_col = if n_live > 0 || audio_only { theme::SUCCESS } else if starting { theme::ACCENT_LIGHTER } else { theme::TEXT_DIM };
     widgets::paint_text(ui, bottom, &status, font(Weight::Regular, theme::FS_TINY), status_col, Align::Min);
     let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tr("ui.sidebar.outgoing_tip", "Your outgoing streams"));
     if resp.clicked() {
@@ -288,6 +292,19 @@ fn outgoing_body(ui: &mut Ui, cx: &Cx) -> Vec<UiAction> {
                 let key: Option<RoomKey> = cx.session(d.room).map(|s| s.join_string.clone());
                 out.extend(key.map(UiAction::SelectRoom));
                 out.push(UiAction::OpenModal(Modal::StreamSettings { capture, room: d.room }));
+            }
+        }
+    }
+    // Our audio shares (desktop or one app, no screen needed): click opens the audio settings of that room.
+    for c in cx.state.captures.values().filter(|c| c.kind == StreamKind::Audio && !matches!(c.status, ShareStatus::Stopping(_))) {
+        for d in c.destinations.values() {
+            any = true;
+            let room = cx.room_name(d.room);
+            let sub = tr_with("ui.sidebar.outgoing.audio_sub", "%{source} · audio only", &[("source", &super::share_label(&c.label))]);
+            if widgets::pop_item(ui, &PopItem::new("music_note", &room).sub(&sub)).clicked() {
+                let key: Option<RoomKey> = cx.session(d.room).map(|s| s.join_string.clone());
+                out.extend(key.map(UiAction::SelectRoom));
+                out.push(UiAction::OpenModal(Modal::AudioSettings { room: d.room }));
             }
         }
     }

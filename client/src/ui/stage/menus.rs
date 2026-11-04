@@ -48,10 +48,8 @@ fn bar_menu(ctx: &egui::Context, cx: &mut Cx, st: &mut StageState, view: &StageV
             }
         }
         BarMenu::Audio => {
-            if let Some((room, state)) = target
-                && let Some(capture) = share::capture_of(state)
-            {
-                close = share::audio_menu(ui, cxr, room, capture, &mut out);
+            if let Some((room, _)) = target {
+                close = share::audio_menu(ui, cxr, room, &mut out);
             }
         }
         BarMenu::Layout => reset = layout_menu(ui, cxr, view, &mut out, &mut close),

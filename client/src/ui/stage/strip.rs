@@ -65,7 +65,7 @@ fn audible(cx: &Cx, it: &Item) -> bool {
     match &it.kind {
         Kind::Video(key) => cx.stream_has_audio(*key) && cx.session(key.0).is_some_and(|s| !s.volume(key.1, key.2).muted),
         Kind::Audio(key, _) => cx.is_watching(*key) && cx.session(key.0).is_some_and(|s| !s.volume(key.1, key.2).muted),
-        Kind::Mine(capture, _) => cx.paired_audio(*capture).is_some_and(|(id, _)| !cx.state.is_audio_share_muted(id)),
+        Kind::Mine(..) => cx.audio_share(it.id.room).is_some_and(|(id, _)| !cx.state.is_audio_share_muted(id)),
         Kind::Idle(..) => false,
     }
 }
@@ -75,7 +75,7 @@ fn has_audio(cx: &Cx, it: &Item) -> bool {
     match &it.kind {
         Kind::Video(key) | Kind::Idle(key, _) => cx.stream_has_audio(*key),
         Kind::Audio(..) => true,
-        Kind::Mine(capture, _) => cx.paired_audio(*capture).is_some(),
+        Kind::Mine(..) => cx.audio_share(it.id.room).is_some(),
     }
 }
 

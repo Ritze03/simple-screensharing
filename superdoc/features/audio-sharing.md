@@ -3,14 +3,167 @@
 Audio capture/encode/playback is described where it grew up: `features/stream-control.md`
 ("Sharing audio ...", "The 2026-07-28 audio bugs"), `features/video-pipeline.md` ("Audio follows
 video") and the module docs of `client/src/audio.rs` and `client/src/decode.rs`. This page covers
-**keeping the audio aligned with the picture** (task #91, 2026-11-01), the **shared audio is a name** (#105), the viewer volume (#96), the **sender-side boost** (#114, capped at 200 % and calibration-free since #119) and the **viewer-side loudness levelling** (#119); for the share sink's lifecycle (WirePlumber pauses a player when its sink goes away, a resuming stream loses its links) see the #123 block. **Why shared audio broke after a pause/resume** (the capture ran on `pipewiresrc`'s clock; the native viewer's jitter buffer guessed the frame size from PTS steps) is the #128 block, which also corrects the explanations of #117, #121, #123 and #125. **Static in silence** (the sender's dither made `opusenc` code noise at 64 kbps) is the #129 block.
+**keeping the audio aligned with the picture** (task #91, 2026-11-01), the **shared audio is a name** (#105), the viewer volume (#96), the **sender-side boost** (#114, capped at 200 % and calibration-free since #119) and the **viewer-side loudness levelling** (#119); for the share sink's lifecycle (WirePlumber pauses a player when its sink goes away, a resuming stream loses its links) see the #123 block. **Why shared audio broke after a pause/resume** (the capture ran on `pipewiresrc`'s clock; the native viewer's jitter buffer guessed the frame size from PTS steps) is the #128 block, which also corrects the explanations of #117, #121, #123 and #125. **Static in silence** (the sender's dither made `opusenc` code noise at 64 kbps) is the #129 block. **Desktop audio, audio-only shares, the exclusion list, source groups and the audio settings menu** (I7) are the first block below.
 
-## 2026-11-04: planned, not built: audio-only shares and an audio exclusion list
+## 2026-11-04: desktop audio, audio-only shares, the exclusion list, source groups, the audio settings menu (task I7)
 
-User request for the redesign's implementation step: sharing **only audio** must be possible (no screen share needed), and the audio settings menu (opened from the audio button's dropdown) gets a list of **strings for source names to exclude**, picked from the detected sources or typed in. Sources that match are hidden from the audio
-source selection and filtered out of desktop audio automatically. **Why:** voice chat such as Discord or TeamSpeak must not
-end up in the share. Desktop audio (the audio button's default in the replica, `ui/STYLING-GUIDE.md` "HTML replica") therefore
-cannot be a plain monitor of the output: it has to link every app except the excluded ones.
+User requirements (D1, the plan's own words) and the design decision (D9):
+
+- The audio button turns on **Desktop audio** with one click and off with the next. Its arrow opens the source list; at
+  the bottom **All audio settings…** opens a menu of its own (source, Boost, the exclusion list; Boost left the general
+  Settings). Every dropdown in it is the app's own menu style (`ui/menu.rs` `select`: icons, sub-lines, under the field,
+  as wide as it).
+- Sources are listed under headings: **Games, Browsers, Media, Voice chat, Devices** (and Other).
+- An **exclusion list** (Add: pick one of the sources detected right now or type any text; every entry has a remove
+  button; **Discord and TeamSpeak are on it by default**). An entry matches any source whose name contains it, ignoring
+  case: that source stays out of desktop audio and off every source list.
+- Sharing **only audio** must work with no screen share (board #102).
+- D9: *"Desktop audio links every app into the share sink except excluded ones, through the existing `link_poll_loop`;
+  audio-only shares replace the 'paired video' invariant in `start_audio_share` — a plain output monitor couldn't leave
+  Discord out. Desktop audio, source groups and the exclusion list are native Linux only: a browser can't list apps,
+  and Windows has no audio capture."*
+
+### What a share captures (`audio.rs`)
+
+`AudioChoice::Desktop | Named(name)` replaces "the selected `AudioSource`". Both go through the same 1 s
+`link_poll_loop` and `link_diff`; only the matching set differs (`wanted_ids` over one `pw-dump` snapshot):
+
+| choice | set linked into the share's sink |
+| --- | --- |
+| `Named(n)` (#105, unchanged) | every `Stream/Output/Audio` stream whose name is `n` |
+| `Desktop` | every `Stream/Output/Audio` stream |
+
+minus, for both: **excluded streams** (`Stream::is_excluded`: the exclusion list is matched against the display name,
+`node.name`, `application.name` and `application.process.binary`, ignoring case, blank entries ignored), **this client's
+own streams** and the share's own sink. For Desktop also the **plumbing** (EasyEffects' output stream: it sits between
+an app and the speakers, so capturing it next to the app's own stream would play everything twice).
+
+- **Our own playback.** A viewer in this same client plays through `autoaudiosink`; a Desktop share that linked that
+  stream would feed the room to itself. `streams()` leaves out every stream whose `application.process.id` is this process
+  (`std::process::id()`); the pid is read from the stream node or, when only the client object has it (java), from the
+  `Client` object named by `client.id`. Never `pipewire.sec.pid`: for a pulse client that is `pipewire-pulse`. Also true
+  of the source list, so a viewer's playback is not offered either.
+- **Exclusion changes apply to a running share.** `Exclusions` is an `Arc<RwLock<Vec<String>>>` shared by the settings and
+  every share (`AppState::audio_exclusions`); the poll re-reads it each tick. `sync_links` now also **unlinks** a stream
+  that is linked, still in the graph and no longer wanted (`unlink_node_from_sink`: `pw-link -d` of the links from that
+  node into our sink only; the app's own routing is untouched). Without that an exclusion added mid-share would only take
+  effect for streams that appear later. If the app on the list is the share's own named app, the share switches to
+  Desktop (which leaves it out) instead of going quiet (`UiAction::SetAudioExclusions`, replica `addExcl`).
+- **Why a name list and the unlink instead of a monitor of the output:** a plain monitor of the default sink is the whole
+  mix and "couldn't leave Discord out"; linking per stream can.
+- **Unchanged and still guarded:** the private null sink (#121), `wait_for_capture_link` (the capture can never fall through
+  to the microphone), unlink-before-removal when a share stops (#123), the system clock (#128), no dither (#129).
+
+### Source groups (`audio.rs` `classify`)
+
+`classify(&GroupInput { media_role, node_name, app_name, binary, has_steam_env, device }) -> AudioGroup`, pure and
+unit-tested (`desktop_audio_tests`). First match wins:
+
+| # | rule | group |
+| - | ---- | ----- |
+| 1 | a device's stream: `node.name` starts with `bluez_`, or `device.api` = bluez5, or any `api.bluez5.*` prop | Devices |
+| 2 | `media.role` = Game | Games |
+| 3 | `media.role` = Communication or Phone | Voice chat |
+| 4 | a whole word of Discord, Vesktop, TeamSpeak, Mumble, Zoom, Skype, Teams in the binary, application or node name | Voice chat |
+| 5 | ... of Firefox, Floorp, Chromium, Chrome, Zen, Brave, Vivaldi, Opera, LibreWolf, Waterfox, Edge, Epiphany, Falkon | Browsers |
+| 6 | ... `gamescope` | Games |
+| 7 | ... of Spotify, mpv, VLC, Rhythmbox, Celluloid, Totem, Clementine, Strawberry, Audacious, Elisa, Amberol, ... | Media |
+| 8 | `SteamAppId` in the process environment | Games |
+| 9 | `media.role` = Music, Movie or Video | Media |
+| 10 | anything else | Other |
+
+*Why games are detected and never named* (user, 2026-11-04): a list of titles is never complete. `SteamAppId` in the
+environment means a Steam game, native or through Proton (confirmed: Skill Up! via Proton, cs2 native), and `media.role`
+Game means a game; neither says which. A wine binary alone is not a game (`wine64-preloader` without `SteamAppId` is Other);
+`java` is a game only when its `media.role` is Game, as Minecraft's is (the name stays `java`); any other java is Other. The
+command line is never read (it can hold login tokens).
+
+*The environment read* (`process_has_steam_app_id`): `/proc/<pid>/environ` is read only for a stream that rules 1-7
+leave to rule 8 (`needs_steam_probe`), once per (pid, binary), on the blocking pool (`list_audio_sources` runs there), and
+only the *names* are looked at: each NUL-separated entry is tested for the prefix `SteamAppId=` and dropped; no value is
+copied, kept or logged (the environment can hold secrets). Known binaries (rules 4-7) win over the environment so a
+browser is a browser and is never probed. Whole words, not substrings, so `zen` does not match `zenity`.
+
+The list is de-duplicated by name (#105) and ordered by group; each row shows the group's icon and a sub-line ("Game",
+"Browser", "Media player", "Voice chat", "Device", "App"). Replica differences: no "Steam game" / "Gamescope" sub-lines.
+
+### Audio is a share of its own (`session.rs`, `ui/`)
+
+- `AppState::start_audio_share(room, for_capture: Option<..>, choice, muted)`. `for_capture` is `None` for an audio-only
+  share and what the control bar always passes: audio is independent of the screen (replica: stopping the screen leaves
+  the audio on). `Some(video)` still pairs a share with a live capture (the liveness check stays: a pairing to a staged
+  capture is rejected) and then Stop on the video stops the audio too. The old hard invariant "no audio-only streams,
+  ever" (every audio share needed a live video capture) is gone: the wire already carried audio without video and a
+  viewer already lists such a sender with Listen (I1).
+- One audio share per room, found with `AppState::audio_share_in(room)` (a `Stopping` one loses to a running one, #115).
+  Choosing another source replaces it and keeps it muted if it was (#118). `selected_audio_source` and `StagedShare::audio`
+  are gone: a pick acts at once, staged screen or not (also the stream settings' Audio row).
+- **Reconnect** (`SuspendedShare::Audio { for_capture: Option<..>, choice, muted }`): an audio-only share is restarted on the
+  new connection with the same choice. **Leave** with an audio share asks like with a screen ("Your audio to X stops.").
+  **Stop all sharing** stops it. A start still in flight is torn down on arrival (`stop_share_one`), so Stop leaves no
+  sink behind (`live_audio_only_share_through_the_app_state` asserts it).
+- **Not done (replica does not either):** no own tile for an audio-only share on the stage (the audio button is the
+  indicator: green with the source in its tooltip; the sidebar user band says "Sharing audio" and the Outgoing popover lists
+  it, click opens the audio settings); `MyPhase` / "Live in N rooms" stay about screens.
+- **Settings key:** `audio_exclusions` (`AppSettings`, array of strings). A file without the key gets
+  `["Discord", "TeamSpeak"]`; a saved empty list stays empty so the user can remove both.
+- **UI** (`ui/audio_settings.rs`, `ui/share.rs`, `ui/stage/bar.rs`): the audio button (one click = Desktop audio on/off;
+  green + `music_note` when on, tooltip names the source), the dropdown (No audio, Desktop audio with "minus N excluded",
+  groups with live meters, mute while sharing, All audio settings…), the modal (Source, Volume/Boost, Desktop audio/Exclude)
+  and the Add popover. Dump names in `drive_dump`: `audio.source`, `audio.boost`, `audio.excl_add`, `audio.excl.<i>(.remove)`,
+  `audio.excl_text`, `audio.excl_add_text`, lines `boost`, `excl`.
+- **Windows:** all of it is Linux only. `audio.rs` still compiles there (std only, the existing `cfg` for `die_with_parent`;
+  `/proc` is simply absent), but Windows has no audio capture, so nothing starts one. The browser cannot list apps.
+
+### Measured (Fedora 44 VM `fedora-ssd`, PipeWire 1.6.2, WirePlumber 0.5.13, Firefox 150; real in-process sharer and
+viewer through a real relay; `desktop-run.sh`, `tones.py`)
+
+Sources: Firefox playing a 440 Hz tone (real, MPRIS), an emulated app called **Discord** at 880 Hz (`media.role=Communication`,
+`emu_src.py`), plus quiet fake streams for the groups. Desktop audio, exclusion list `["Discord"]`; the share sink's own
+monitor (what is in the share), per second:
+
+| time | event | 440 Hz (Firefox) | 880 Hz (Discord) |
+| --- | --- | --- | --- |
+| 0-11 s | Discord excluded | -21.1 dBFS | **-99 (absent; at the noise floor)** |
+| 12 s | entry removed during the share | -21.1 | **-6.0** (linked at the next poll) |
+| 24 s | entry added back | -21.1 | **-99** (unlinked: log `stream node 77 is no longer wanted (excluded); unlinked 2 link(s)`) |
+| 36 s | "Firefox" added too | **-99** | -99 (rms -58 dB: only the quiet fake streams) |
+| 48 s | "Firefox" removed | -21.1 | -99 |
+
+The viewer's recording (`viewer-out`'s monitor) agrees: 440 Hz and not 880 Hz in the first stretch. **Firefox's
+`PlaybackStatus` stayed `Playing` the whole run**, through every unlink and when the share stopped at the end (#123's
+unlink-before-removal holds for Desktop audio, and unlinking one stream does not make WirePlumber pause the player).
+- **Viewer's own playback not captured:** the viewer's stream (`simple_screensharing_client-<hash>`, `Stream/Output/Audio`,
+  linked to `viewer-out`) is in the graph and never in `linked [...]` (the log prints `audio_handle.linked_stream_names()`
+  every second); `list_audio_sources` does not list it.
+- **Groups** (the log's `source` lines, real classification of real streams): `Games / FakeGame` (`media.role=Game`),
+  `Games / SteamThing` (process environment `SteamAppId=480`, `media.role=Production`), `Browsers / Firefox`,
+  `VoiceChat / Discord` (excluded), `Devices / iPhone von Mo` (a `Stream/Output/Audio` node named `bluez_input.AA_BB_...`
+  made with `pw-cli`), `Other / PlainApp`.
+- **Audio-only share** (`live_audio_only_share_through_the_app_state`, named `Floorp` and Desktop): no screen capture anywhere,
+  the viewer sees the audio stream with `owner_has_video` false, 200 packets in ~4 s (50/s), a 440 Hz recording at about
+  -17 dBFS rms, and after `stop_share` the capture is gone, no `ssshare-sink-` object is left in `pw-dump`, the relay
+  announced the stop and the room forgot the destination. A named share (`Floorp` 440 Hz with Discord on and off the list)
+  carries only Floorp: the old #105 behaviour is unchanged.
+- **Known limit, measured:** while the only streams linked into the sink are suspended ones (the fake phone node, a paused
+  device) no packets are sent (`viewer packets` stood still for 11 s after the last active stream was unlinked, and resumed
+  at once when Firefox came back). With *nothing* linked at all the share sends ~50 packets/s (measured); an idle
+  linked stream (a paused Firefox) too (#129). Nothing audible is lost; only the packet counter stands still.
+
+### Tests
+
+Unit (`audio::desktop_audio_tests`, `rooms` and `ui` tests): the group table with the brief's real examples (Spotify,
+Floorp/Chromium/Zen, gamescope, `Skill Up!.exe`/cs2 with and without `SteamAppId`, java with and without the Game role,
+Discord, TeamSpeak, a Bluetooth phone), that the environment is read only for streams no known app claims, the `SteamAppId`
+prefix test, the exclusion match (case, blanks), the matching set of Desktop vs Named, the stream list of a snapshot (pid on
+the client object, a string pid, own streams dropped), the links to unlink, the settings default (old file, empty list).
+Live (VM only, `#[ignore]`): `live_audio_share_soak` (new knobs `SSS_LIVE_CHOICE=desktop`, `SSS_LIVE_EXCLUDE`,
+`SSS_LIVE_EXCL_AT`) and `live_audio_only_share_through_the_app_state`; harness `client/scripts/vm-audio/desktop-run.sh`
+(host) / `desktop-audio.sh` (VM; scenarios `desktop`, `named`, `empty`, `only`), `tones.py` (Goertzel per second),
+`emu_src.py` got VOLUME and PROPS arguments (volume 0 makes the stream vanish: use 0.001). In the rig
+(`SSS_UI_FAKE_AUDIO_SOURCES=1`: the replica's examples through the real grouping, level taps and sharing switched off so
+the rig creates no audio) the menu, the groups, the modal, Add and remove (settings.toml checked) and the Boost drag were
+driven for real.
 
 ## 2026-11-03: volume sliders apply while dragging, not on release (task #135)
 

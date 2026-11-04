@@ -11,7 +11,7 @@
 //!   stream-settings modal, so the lists can't drift.
 
 use egui::{Align, CornerRadius, Margin, Rect, Sense, Stroke, StrokeKind, Ui, vec2};
-use simple_screensharing_client::audio::AudioSource;
+use simple_screensharing_client::audio::{AudioChoice, AudioGroup};
 use simple_screensharing_client::capture::destination::{DestinationState, EncoderLimited};
 use simple_screensharing_client::presets::{self, EncoderPreset, EncoderTuning};
 use simple_screensharing_client::protocol::StreamKind;
@@ -39,7 +39,9 @@ pub(super) fn share_target(cx: &Cx, view: &StageView) -> Option<(RoomHandle, Sha
             let all: Vec<(RoomHandle, ShareState)> =
                 cx.rooms().iter().filter_map(|r| r.handle).map(|h| (h, super::share_state(cx.state, cx.shell, h))).collect();
             let live = all.iter().find(|(_, s)| matches!(s, ShareState::Live { .. }));
-            live.or_else(|| all.iter().find(|(_, s)| !matches!(s, ShareState::Idle))).copied()
+            // Sharing only audio counts too: the audio button stays to turn it off.
+            let audio_only = || all.iter().find(|(h, _)| cx.audio_share(*h).is_some());
+            live.or_else(|| all.iter().find(|(_, s)| !matches!(s, ShareState::Idle))).or_else(audio_only).copied()
         }
     }
 }
@@ -217,52 +219,163 @@ fn go_live_item(ui: &mut Ui, label: &str) -> bool {
     row.response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
-/// The audio source of the capture's share: the staged choice, or the live paired share's label.
-pub(super) fn audio_current(cx: &Cx, room: RoomHandle, capture: CaptureSourceId) -> Option<String> {
-    match cx.shell.staged.get(&room).filter(|s| s.capture == capture) {
-        Some(s) => s.audio.as_ref().map(|a| a.name.clone()),
-        None => cx.paired_audio(capture).map(|(_, a)| a.label.clone()),
+/// The label of our audio share in `room`, if there is one ("Desktop audio" or the app's name).
+pub(super) fn audio_current(cx: &Cx, room: RoomHandle) -> Option<String> {
+    cx.audio_share(room).map(|(_, a)| a.label.clone())
+}
+
+/// A source group's heading ("Games", "Browsers", ...).
+pub(super) fn group_title(g: AudioGroup) -> String {
+    match g {
+        AudioGroup::Games => tr("ui.audio.group_games", "Games"),
+        AudioGroup::Browsers => tr("ui.audio.group_browsers", "Browsers"),
+        AudioGroup::Media => tr("ui.audio.group_media", "Media"),
+        AudioGroup::VoiceChat => tr("ui.audio.group_voice", "Voice chat"),
+        AudioGroup::Devices => tr("ui.audio.group_devices", "Devices"),
+        AudioGroup::Other => tr("ui.audio.group_other", "Other"),
     }
 }
 
-/// The Share audio dropdown: every app producing audio with a live meter, the current one highlighted,
-/// mute (live) and stop. Returns true when it should close.
-pub(super) fn audio_menu(ui: &mut Ui, cx: &Cx, room: RoomHandle, capture: CaptureSourceId, out: &mut Vec<UiAction>) -> bool {
+/// The sub-line of a source row: what kind of thing it is.
+pub(super) fn group_sub(g: AudioGroup) -> String {
+    match g {
+        AudioGroup::Games => tr("ui.audio.sub_games", "Game"),
+        AudioGroup::Browsers => tr("ui.audio.sub_browsers", "Browser"),
+        AudioGroup::Media => tr("ui.audio.sub_media", "Media player"),
+        AudioGroup::VoiceChat => tr("ui.audio.sub_voice", "Voice chat"),
+        AudioGroup::Devices => tr("ui.audio.sub_devices", "Device"),
+        AudioGroup::Other => tr("ui.audio.sub_other", "App"),
+    }
+}
+
+/// The icon of a source row.
+pub(super) fn group_icon(g: AudioGroup) -> &'static str {
+    match g {
+        AudioGroup::Games => "sports_esports",
+        AudioGroup::Browsers => "public",
+        AudioGroup::Media => "music_note",
+        AudioGroup::VoiceChat => "forum",
+        AudioGroup::Devices => "smartphone",
+        AudioGroup::Other => "apps",
+    }
+}
+
+/// The sub-line of the "Desktop audio" row: it says how many sources the exclusion list leaves out.
+pub(super) fn desktop_sub(excluded: usize) -> String {
+    if excluded == 0 {
+        tr("ui.audio.desktop_sub", "Everything you hear")
+    } else {
+        tr_with("ui.audio.desktop_sub_excl", "Everything you hear, minus %{count} excluded", &[("count", &excluded.to_string())])
+    }
+}
+
+/// The rows of an audio source field (the stream settings' Audio row, the audio settings' Source row): No audio,
+/// Desktop audio, then every listed app under its group heading. `choices[i]` is what row `i` picks
+/// (`None` = no audio).
+pub(super) struct SourceOptions {
+    rows: Vec<(String, String, &'static str, Option<String>)>,
+    pub choices: Vec<Option<AudioChoice>>,
+    /// The row of the current choice.
+    pub selected: usize,
+}
+
+impl SourceOptions {
+    pub(super) fn new(cx: &Cx, room: RoomHandle) -> Self {
+        let mut rows = vec![
+            (tr("ui.audio.no_audio", "No audio"), tr("ui.audio.no_audio_sub", "Only the picture"), "volume_off", None),
+            (tr("ui.audio.desktop", "Desktop audio"), desktop_sub(cx.state.audio_exclusions.get().len()), "desktop_windows", None),
+        ];
+        let mut choices = vec![None, Some(AudioChoice::Desktop)];
+        for s in &cx.state.audio_sources {
+            rows.push((s.name.clone(), group_sub(s.group), group_icon(s.group), Some(group_title(s.group))));
+            choices.push(Some(AudioChoice::Named(s.name.clone())));
+        }
+        let current = cx.audio_choice(room);
+        let selected = match &current {
+            None => 0,
+            Some(c) => match choices.iter().position(|x| x.as_ref() == Some(c)) {
+                Some(i) => i,
+                None => {
+                    // The app is not listed right now (it paused): keep showing the choice.
+                    rows.push((c.label().to_string(), group_sub(AudioGroup::Other), group_icon(AudioGroup::Other), None));
+                    choices.push(current.clone());
+                    choices.len() - 1
+                }
+            },
+        };
+        Self { rows, choices, selected }
+    }
+
+    pub(super) fn opts(&self) -> Vec<super::menu::Opt<'_>> {
+        self.rows
+            .iter()
+            .map(|(label, sub, icon, group)| super::menu::Opt { label, sub: Some(sub), icon: Some(icon), group: group.as_deref() })
+            .collect()
+    }
+
+    /// The action for picking row `idx` (when it differs from the shown one).
+    pub(super) fn action(&self, room: RoomHandle, idx: usize) -> UiAction {
+        match &self.choices[idx] {
+            None => UiAction::StopSharingAudio { room },
+            Some(choice) => UiAction::ShareAudio { room, choice: choice.clone() },
+        }
+    }
+}
+
+/// The audio dropdown of the bar's Share audio button (replica `audioMenu`): No audio, Desktop audio, then
+/// every app producing audio under its group's heading with a live meter, the current choice lit; mute (while
+/// sharing) and "All audio settings…" at the bottom. Picking a row starts, switches or stops the share in
+/// `room` at once; audio needs no screen share. Returns true when it should close.
+pub(super) fn audio_menu(ui: &mut Ui, cx: &Cx, room: RoomHandle, out: &mut Vec<UiAction>) -> bool {
     let state = cx.state;
-    let current = audio_current(cx, room, capture);
-    let staged = cx.shell.staged.get(&room).is_some_and(|s| s.capture == capture);
+    let current = cx.audio_choice(room);
+    let mut close = false;
     pop_heading(ui, &tr("ui.audio.heading", "Audio source"));
+    let none = tr("ui.audio.no_audio", "No audio");
+    if widgets::pop_item(ui, &PopItem::new("volume_off", &none).sub(&tr("ui.audio.no_audio_sub", "Only the picture")).selected(current.is_none())).clicked() {
+        out.push(UiAction::StopSharingAudio { room });
+        close = true;
+    }
+    let desktop = tr("ui.audio.desktop", "Desktop audio");
+    let sub = desktop_sub(state.audio_exclusions.get().len());
+    if widgets::pop_item(ui, &PopItem::new("desktop_windows", &desktop).sub(&sub).selected(current == Some(AudioChoice::Desktop))).clicked() {
+        out.push(UiAction::ShareAudio { room, choice: AudioChoice::Desktop });
+        close = true;
+    }
     if state.audio_sources.is_empty() {
         pop_note(ui, &state.audio_sources_error.clone().unwrap_or_else(|| tr("ui.audio.none", "No app is playing audio")));
         if widgets::pop_item(ui, &PopItem::new("refresh", &tr("ui.audio.refresh", "Refresh"))).clicked() {
             out.push(UiAction::RefreshAudioSources);
         }
     }
-    let mut close = false;
-    egui::ScrollArea::vertical().max_height(300.0).auto_shrink([true, true]).show(ui, |ui| {
+    egui::ScrollArea::vertical().max_height(360.0).auto_shrink([true, true]).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
+        let mut last = None;
         for s in &state.audio_sources {
+            if last != Some(s.group) {
+                pop_heading(ui, &group_title(s.group));
+                last = Some(s.group);
+            }
             let lit = cx.source_level(s.id).map(level_lit).unwrap_or(0);
-            let sel = current.as_deref() == Some(s.name.as_str());
-            if widgets::pop_item(ui, &PopItem::new("music_note", &s.name).selected(sel).meter(lit)).clicked() {
-                out.push(UiAction::ShareAudio { capture, source: s.clone() });
+            let sel = current == Some(AudioChoice::Named(s.name.clone()));
+            let sub = group_sub(s.group);
+            if widgets::pop_item(ui, &PopItem::new(group_icon(s.group), &s.name).sub(&sub).selected(sel).meter(lit)).clicked() {
+                out.push(UiAction::ShareAudio { room, choice: AudioChoice::Named(s.name.clone()) });
                 close = true;
             }
         }
     });
-    if !staged && let Some((id, _)) = cx.paired_audio(capture) {
+    pop_sep(ui);
+    if let Some((id, _)) = cx.audio_share(room) {
         let mut muted = state.is_audio_share_muted(id);
         let icon = if muted { "volume_off" } else { "volume_up" };
         if super::menu::switch_row(ui, icon, &tr("ui.bar.mute_audio", "Mute shared audio"), &mut muted) {
-            out.push(UiAction::SetSharedAudioMuted { capture, muted });
+            out.push(UiAction::SetSharedAudioMuted { room, muted });
         }
     }
-    if current.is_some() {
-        pop_sep(ui);
-        if widgets::pop_item(ui, &PopItem::new("volume_off", &tr("ui.audio.stop", "Stop sharing audio")).danger()).clicked() {
-            out.push(UiAction::StopSharingAudio { capture });
-            close = true;
-        }
+    if widgets::pop_item(ui, &PopItem::new("tune", &tr("ui.audio.settings_item", "All audio settings…"))).clicked() {
+        out.push(UiAction::OpenModal(Modal::AudioSettings { room }));
+        close = true;
     }
     close
 }
@@ -574,11 +687,6 @@ pub(super) fn pop_check_item(ui: &mut Ui, checked: bool, label: &str, sub: &str)
     paint_text(ui, top, label, font(Weight::Regular, theme::FS_LABEL), theme::TEXT, Align::Min);
     paint_text(ui, bot, sub, font(Weight::Regular, theme::FS_TINY), theme::TEXT_FAINT, Align::Min);
     r.response.on_hover_cursor(egui::CursorIcon::PointingHand)
-}
-
-/// An audio source by display name from the current listing.
-pub(super) fn find_source(cx: &Cx, name: &str) -> Option<AudioSource> {
-    cx.state.audio_sources.iter().find(|s| s.name == name).cloned()
 }
 
 #[cfg(test)]

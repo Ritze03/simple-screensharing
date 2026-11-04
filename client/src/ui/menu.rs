@@ -11,16 +11,19 @@ use egui::{Align, CornerRadius, Frame, Layout, Margin, Popup, PopupCloseBehavior
 use crate::theme::{self, Weight, font};
 use crate::widgets::{self, FILL, HBox, fixed};
 
-/// One choice of a [`select`]: label, an optional second line and an optional icon.
+/// One choice of a [`select`]: label, an optional second line and an optional icon. Options come in
+/// runs: a `group` that differs from the previous option's starts the run with a heading (the audio
+/// source field's Games / Browsers / ..., task I7); `None` adds none.
 pub struct Opt<'a> {
     pub label: &'a str,
     pub sub: Option<&'a str>,
     pub icon: Option<&'a str>,
+    pub group: Option<&'a str>,
 }
 
 impl<'a> Opt<'a> {
     pub fn new(label: &'a str) -> Self {
-        Self { label, sub: None, icon: None }
+        Self { label, sub: None, icon: None, group: None }
     }
 }
 
@@ -81,7 +84,12 @@ pub fn select(ui: &mut Ui, id_salt: impl std::hash::Hash, selected: &mut usize, 
             ui.set_width(w - 14.0);
             ui.spacing_mut().item_spacing.y = 0.0;
             egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, true]).show(ui, |ui| {
+                let mut last_group = None;
                 for (i, o) in opts.iter().enumerate() {
+                    if let Some(g) = o.group.filter(|g| last_group != Some(*g)) {
+                        super::share::pop_heading(ui, g);
+                    }
+                    last_group = o.group;
                     let r = option_row(ui, o, i == *selected);
                     super::drive_dump::rect(|| format!("opt.{i}"), r.rect);
                     if r.clicked() {

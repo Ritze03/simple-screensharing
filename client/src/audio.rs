@@ -61,8 +61,17 @@
 //! Application-output audio only, per this project's design — never
 //! microphone/physical-input capture. [`wait_for_capture_link`] is what
 //! makes that a guarantee rather than an intention. The UI that drives this
-//! is the "+ Add audio" row on a screen share's card in Stream Control (see
-//! `superdoc/features/stream-control.md`).
+//! is the control bar's audio button and its menus (`ui/share.rs`, `ui/audio_settings.rs`).
+//!
+//! # What a share captures (task I7)
+//!
+//! An [`AudioChoice`]: **Desktop** links every app output stream except the excluded ones
+//! ([`Exclusions`], [`name_is_excluded`]), this process's own streams (a viewer's playback must not feed
+//! back into the share it watches) and the plumbing ([`Stream::is_plumbing`]); **Named** is the old
+//! #105 model, every stream with one name. Both go through the same 1 s [`link_poll_loop`] and
+//! [`link_diff`]; the matching set is [`wanted_ids`]. A stream that becomes excluded while linked is
+//! unlinked ([`sync_links`]). Sources are listed under a group ([`classify`]). Linux only: Windows has no
+//! audio capture, and the browser cannot list apps. See `superdoc/features/audio-sharing.md`.
 
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -154,9 +163,26 @@ fn run_pw_dump() -> Result<Vec<PwObject>> {
 // ---------------------------------------------------------------------
 // Public API: source enumeration
 // ---------------------------------------------------------------------
+/// The heading a source is listed under (task I7, plan decision D9). Order is the order of the headings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AudioGroup {
+    Games,
+    Browsers,
+    Media,
+    VoiceChat,
+    Devices,
+    /// Anything without a known group: a plain app, `java` without the Game role.
+    Other,
+}
+
+impl AudioGroup {
+    /// Every group in heading order.
+    pub const ALL: [AudioGroup; 6] =
+        [AudioGroup::Games, AudioGroup::Browsers, AudioGroup::Media, AudioGroup::VoiceChat, AudioGroup::Devices, AudioGroup::Other];
+}
 
 /// One currently-running application audio stream, discoverable via
-/// [`list_audio_sources`] and passed to [`start_audio_sharing`].
+/// [`list_audio_sources`] and chosen (by name) as [`AudioChoice::Named`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioSource {
     /// The PipeWire node id (as of the moment it was listed). In the
@@ -175,33 +201,353 @@ pub struct AudioSource {
     /// mid-registration); [`start_level_tap`] just fails with a clear error
     /// for that one entry rather than mis-tapping it.
     pub serial: Option<u64>,
+    /// The heading this source is listed under ([`classify`]).
+    pub group: AudioGroup,
+    /// Every name the exclusion list is matched against ([`AudioSource::is_excluded`]): the display
+    /// name, `node.name`, `application.name` and the process binary.
+    pub aliases: Vec<String>,
+}
+
+impl AudioSource {
+    /// Whether an entry of `list` excludes this source ([`name_is_excluded`] on every alias).
+    pub fn is_excluded(&self, list: &[String]) -> bool {
+        self.aliases.iter().any(|a| name_is_excluded(a, list))
+    }
+}
+
+/// What a share captures (task I7, D9): the whole desktop except the excluded apps, or every stream
+/// with one name (#105).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AudioChoice {
+    /// Every app's output stream except the excluded ones ([`Exclusions`]), ours and the plumbing.
+    Desktop,
+    /// Every stream called this ([`AudioSource::name`]).
+    Named(String),
+}
+
+/// The label of a desktop-audio share on the wire (what viewers read; `ui::share_label` translates it).
+pub const DESKTOP_LABEL: &str = "Desktop audio";
+
+impl AudioChoice {
+    /// The share's label: what viewers see on the stream.
+    pub fn label(&self) -> &str {
+        match self {
+            AudioChoice::Desktop => DESKTOP_LABEL,
+            AudioChoice::Named(n) => n,
+        }
+    }
+}
+
+/// Whether `name` is excluded by `list`: some non-blank entry is contained in it, ignoring case
+/// (task I7, D1). A blank entry would match everything and is ignored.
+pub fn name_is_excluded(name: &str, list: &[String]) -> bool {
+    let name = name.to_lowercase();
+    list.iter().map(|e| e.trim()).filter(|e| !e.is_empty()).any(|e| name.contains(&e.to_lowercase()))
+}
+
+/// The exclusion list, shared between the settings and every running share: a change reaches the
+/// 1 s poll of a running desktop-audio share at its next tick ([`link_poll_loop`]).
+#[derive(Debug, Clone, Default)]
+pub struct Exclusions(Arc<std::sync::RwLock<Vec<String>>>);
+
+impl Exclusions {
+    pub fn new(list: Vec<String>) -> Self {
+        Self(Arc::new(std::sync::RwLock::new(list)))
+    }
+
+    pub fn get(&self) -> Vec<String> {
+        self.0.read().map(|l| l.clone()).unwrap_or_default()
+    }
+
+    pub fn set(&self, list: Vec<String>) {
+        if let Ok(mut l) = self.0.write() {
+            *l = list;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Source groups
+// ---------------------------------------------------------------------
+
+/// What [`classify`] decides from. Everything comes from `pw-dump` except `has_steam_env`.
+#[derive(Debug, Clone, Default)]
+pub struct GroupInput<'a> {
+    /// `media.role` of the stream (`Game`, `Music`, `Communication`, ...), when set.
+    pub media_role: Option<&'a str>,
+    pub node_name: &'a str,
+    /// `application.name`.
+    pub app_name: Option<&'a str>,
+    /// `application.process.binary`.
+    pub binary: Option<&'a str>,
+    /// The process has `SteamAppId` in its environment ([`process_has_steam_app_id`]).
+    pub has_steam_env: bool,
+    /// A hardware or Bluetooth device's stream (`bluez_input...`, `api.bluez5.*`) rather than an app.
+    pub device: bool,
+}
+
+/// Words (split at everything that is not a letter or digit, lower case) that name an app family.
+/// Whole words, so `zen` does not match `zenity`.
+const BROWSER_WORDS: &[&str] = &[
+    "firefox", "floorp", "chromium", "chrome", "zen", "brave", "vivaldi", "opera", "librewolf", "waterfox", "msedge", "edge", "epiphany", "falkon",
+];
+const VOICE_WORDS: &[&str] = &["discord", "vesktop", "teamspeak", "teamspeak3", "ts3client", "mumble", "zoom", "skype", "teams"];
+const MEDIA_WORDS: &[&str] = &[
+    "spotify", "mpv", "vlc", "rhythmbox", "celluloid", "totem", "clementine", "strawberry", "audacious", "elisa", "amberol", "lollypop", "mplayer",
+    "smplayer", "haruna", "kodi", "plex", "tidal", "deezer", "jellyfin", "cider",
+];
+/// Games are never listed by title: only the compositor games run in (it is not a game's name) is known.
+const GAME_WORDS: &[&str] = &["gamescope"];
+
+fn has_word(fields: &[Option<&str>], words: &[&str]) -> bool {
+    fields.iter().flatten().any(|f| f.to_lowercase().split(|c: char| !c.is_alphanumeric()).any(|w| words.contains(&w)))
+}
+
+/// The group of a stream (task I7). First match wins:
+///
+/// | # | rule | group |
+/// | - | ---- | ----- |
+/// | 1 | a device's stream (`bluez_*`, `api.bluez5.*`) | Devices |
+/// | 2 | `media.role` = Game | Games |
+/// | 3 | `media.role` = Communication or Phone | Voice chat |
+/// | 4 | binary, app or node name has a word of Discord, TeamSpeak, Mumble, Zoom, ... | Voice chat |
+/// | 5 | ... of Firefox, Floorp, Chromium, Chrome, Zen, ... | Browsers |
+/// | 6 | ... `gamescope` | Games |
+/// | 7 | ... of Spotify, mpv, VLC, ... | Media |
+/// | 8 | `SteamAppId` in the process environment (Steam game, native or Proton) | Games |
+/// | 9 | `media.role` = Music, Movie or Video | Media |
+/// | 10 | anything else (a `wine64-preloader` without `SteamAppId`, `java` without the Game role) | Other |
+///
+/// *Why games are detected and never named:* a list of titles is never complete; `media.role` Game
+/// and `SteamAppId` mean "a game" without knowing which. Steps 4-7 (known binaries) come before 8 so
+/// the environment is read only for the streams nothing else claims ([`needs_steam_probe`]).
+pub fn classify(i: &GroupInput) -> AudioGroup {
+    let role = i.media_role.map(str::to_lowercase);
+    let role = role.as_deref();
+    let names = [i.binary, i.app_name, Some(i.node_name)];
+    if i.device {
+        AudioGroup::Devices
+    } else if role == Some("game") {
+        AudioGroup::Games
+    } else if matches!(role, Some("communication" | "phone")) || has_word(&names, VOICE_WORDS) {
+        AudioGroup::VoiceChat
+    } else if has_word(&names, BROWSER_WORDS) {
+        AudioGroup::Browsers
+    } else if has_word(&names, GAME_WORDS) {
+        AudioGroup::Games
+    } else if has_word(&names, MEDIA_WORDS) {
+        AudioGroup::Media
+    } else if i.has_steam_env {
+        AudioGroup::Games
+    } else if matches!(role, Some("music" | "movie" | "video")) {
+        AudioGroup::Media
+    } else {
+        AudioGroup::Other
+    }
+}
+
+/// Whether [`classify`] would still say Other without the environment, i.e. whether reading the
+/// process's environment can change the answer.
+pub fn needs_steam_probe(i: &GroupInput) -> bool {
+    classify(&GroupInput { has_steam_env: false, ..i.clone() }) == AudioGroup::Other
+}
+
+/// Whether the environment block `environ` (`NAME=value` entries split by NUL) defines `SteamAppId`.
+/// Only the entry names are looked at; values are never copied, kept or logged (the environment can
+/// hold secrets).
+fn environ_has_steam_app_id(environ: impl std::io::Read) -> bool {
+    use std::io::BufRead;
+    std::io::BufReader::new(environ).split(0).map_while(|e| e.ok()).any(|e| e.starts_with(b"SteamAppId="))
+}
+
+/// Whether process `pid` has `SteamAppId` in its environment (`/proc/<pid>/environ`), cached per pid and
+/// binary (a reused pid is a different process). `false` when it cannot be read. Blocking file read:
+/// call it off the UI thread ([`list_audio_sources`] runs on the blocking pool).
+pub fn process_has_steam_app_id(pid: u32, binary: &str) -> bool {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<(u32, String), bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(known) = cache.lock().ok().and_then(|c| c.get(&(pid, binary.to_string())).copied()) {
+        return known;
+    }
+    let found = std::fs::File::open(format!("/proc/{pid}/environ")).map(environ_has_steam_app_id).unwrap_or(false);
+    if let Ok(mut c) = cache.lock() {
+        if c.len() > 512 {
+            c.clear();
+        }
+        c.insert((pid, binary.to_string()), found);
+    }
+    found
+}
+
+// ---------------------------------------------------------------------
+// Streams of the graph
+// ---------------------------------------------------------------------
+
+/// One application output stream of a `pw-dump` snapshot, with what is needed to name, match and group it.
+#[derive(Debug, Clone)]
+struct Stream {
+    id: u32,
+    serial: Option<u64>,
+    /// The display name (see [`AudioSource::name`]).
+    name: String,
+    node_name: String,
+    app_name: Option<String>,
+    binary: Option<String>,
+    role: Option<String>,
+    /// `application.process.id`, on the stream node or else on its client object (java has it only there).
+    /// Never `pipewire.sec.pid`: for a pulse client that is the `pipewire-pulse` process.
+    pid: Option<u32>,
+    device: bool,
+}
+
+impl Stream {
+    fn aliases(&self) -> Vec<String> {
+        let mut a = vec![self.name.clone(), self.node_name.clone()];
+        a.extend(self.app_name.clone());
+        a.extend(self.binary.clone());
+        a
+    }
+
+    fn is_excluded(&self, list: &[String]) -> bool {
+        self.aliases().iter().any(|a| name_is_excluded(a, list))
+    }
+
+    /// The stream of a tool that already sits in the graph between an app and the speakers: capturing
+    /// it next to the app's own stream would play everything twice.
+    fn is_plumbing(&self) -> bool {
+        let fields = [self.binary.as_deref(), self.app_name.as_deref(), Some(self.node_name.as_str())];
+        has_word(&fields, &["easyeffects"])
+    }
+}
+
+/// `prop` as a number, also when `pw-dump` wrote it as a string.
+fn prop_num(props: &Map<String, Value>, key: &str) -> Option<u64> {
+    let v = props.get(key)?;
+    v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
+/// Every application output stream (`Stream/Output/Audio`) in `objects`, in graph order, except this
+/// client's own: the share's sink (`output.ssshare-sink-...`) and every stream of this process (a viewer's
+/// own playback must never be captured back into the share it is watching).
+fn streams(objects: &[PwObject]) -> Vec<Stream> {
+    let own_sink_prefix = format!("output.{SINK_NAME_PREFIX}");
+    let client_pid: std::collections::HashMap<u32, u32> = objects
+        .iter()
+        .filter(|o| o.obj_type.as_deref() == Some("PipeWire:Interface:Client"))
+        .filter_map(|o| Some((o.id, prop_num(o.info.as_ref()?.props.as_ref()?, "application.process.id")? as u32)))
+        .collect();
+    let me = std::process::id();
+    let mut out = Vec::new();
+    for obj in objects {
+        if obj.obj_type.as_deref() != Some("PipeWire:Interface:Node") {
+            continue;
+        }
+        let Some(info) = &obj.info else { continue };
+        let Some(props) = &info.props else { continue };
+        if prop_str(props, "media.class") != Some("Stream/Output/Audio") {
+            continue;
+        }
+        let node_name = prop_str(props, "node.name").unwrap_or_default();
+        if node_name.starts_with(&own_sink_prefix) {
+            continue;
+        }
+        let pid = prop_num(props, "application.process.id")
+            .or_else(|| prop_num(props, "client.id").and_then(|c| client_pid.get(&(c as u32)).map(|p| u64::from(*p))))
+            .map(|p| p as u32);
+        if pid == Some(me) {
+            continue;
+        }
+        let name = prop_str(props, "node.description")
+            .or_else(|| prop_str(props, "application.name"))
+            .or_else(|| prop_str(props, "media.name"))
+            .filter(|s| !s.is_empty())
+            .unwrap_or(node_name)
+            .to_string();
+        let name = if name.is_empty() { format!("(unnamed stream {})", obj.id) } else { name };
+        let own = |k: &str| prop_str(props, k).filter(|s| !s.is_empty()).map(str::to_string);
+        out.push(Stream {
+            id: obj.id,
+            serial: prop_u64(props, "object.serial"),
+            name,
+            node_name: node_name.to_string(),
+            app_name: own("application.name"),
+            binary: own("application.process.binary"),
+            role: own("media.role"),
+            pid,
+            device: node_name.starts_with("bluez_")
+                || prop_str(props, "device.api") == Some("bluez5")
+                || props.keys().any(|k| k.starts_with("api.bluez5.")),
+        });
+    }
+    out
+}
+
+/// The registry ids a share links, from one snapshot: every stream called `name` for a named share;
+/// every stream for the desktop, minus the plumbing. Excluded streams ([`Stream::is_excluded`]) are
+/// never in either.
+fn wanted_ids(streams: &[Stream], choice: &AudioChoice, exclusions: &[String]) -> Vec<u32> {
+    streams
+        .iter()
+        .filter(|s| !s.is_excluded(exclusions))
+        .filter(|s| match choice {
+            AudioChoice::Desktop => !s.is_plumbing(),
+            AudioChoice::Named(name) => s.name == *name,
+        })
+        .map(|s| s.id)
+        .collect()
 }
 
 /// Lists every application currently producing audio: PipeWire nodes with
 /// `media.class = "Stream/Output/Audio"` (confirmed against this machine's
 /// real `pw-dump` output — see module docs), excluding this module's own
-/// loopback nodes (see [`SINK_NAME_PREFIX`]) so an in-progress audio
-/// share doesn't list itself as a shareable source.
+/// loopback nodes (see [`SINK_NAME_PREFIX`]) and this process's streams, so an in-progress
+/// audio share doesn't list itself, nor does a viewer's playback.
 ///
 /// **One entry per name** (task #105): an app often has several streams with
 /// the same name (browser tabs, a game plus its launcher); the choice in the
 /// UI is the *name*, and [`start_audio_sharing`] mixes every stream that has
 /// it. The entry returned is the first such node, a representative for the
-/// level meter.
+/// level meter. Entries come ordered by [`AudioGroup`] (stable inside a group). The exclusion list
+/// is not applied here ([`AudioSource::is_excluded`] does it for whoever shows the list).
+///
+/// Blocking: runs `pw-dump` and, for a stream no known app claims, reads its process's environment
+/// ([`process_has_steam_app_id`]).
 pub fn list_audio_sources() -> Result<Vec<AudioSource>> {
-    let objects = run_pw_dump()?;
-    Ok(dedup_by_name(extract_audio_sources(&objects)))
+    // The rig has no audio and the host may not run any (testing-and-verification.md): this lists the replica's
+    // examples through the real grouping instead, so the menus can be driven.
+    let (objects, steam): (Vec<PwObject>, fn(u32, &str) -> bool) = if std::env::var_os("SSS_UI_FAKE_AUDIO_SOURCES").is_some() {
+        (serde_json::from_str(FAKE_SNAPSHOT).context("the fake snapshot")?, |pid, _| pid == 777)
+    } else {
+        (run_pw_dump()?, process_has_steam_app_id)
+    };
+    let mut sources = dedup_by_name(extract_audio_sources(&objects, &steam));
+    sources.sort_by_key(|s| s.group);
+    Ok(sources)
 }
+
+/// What `SSS_UI_FAKE_AUDIO_SOURCES=1` lists (`pw-dump` shaped; the replica's examples, `ui/STYLING-GUIDE.md`). Pid 777
+/// stands for the process that has `SteamAppId` in its environment.
+const FAKE_SNAPSHOT: &str = r#"[
+ {"id":901,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Stream/Output/Audio","node.name":"Skill Up!.exe","application.name":"Skill Up!.exe","application.process.binary":"wine64-preloader","application.process.id":777,"object.serial":1901}}},
+ {"id":902,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Stream/Output/Audio","node.name":"gamescope","node.description":"gamescope-0 (game) output","application.name":"gamescope","application.process.binary":"gamescope","object.serial":1902}}},
+ {"id":903,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Stream/Output/Audio","node.name":"java","application.name":"java","application.process.binary":"java","media.role":"Game","object.serial":1903}}},
+ {"id":904,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Stream/Output/Audio","node.name":"cs2","application.name":"cs2","application.process.binary":"cs2","application.process.id":777,"object.serial":1904}}},
+ {"id":905,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Stream/Output/Audio","node.name":"Floorp","application.name":"Floorp","application.process.binary":"floorp","object.serial":1905}}},
+ {"id":906,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Stream/Output/Audio","node.name":"Chromium","application.name":"Chromium","application.process.binary":"chromium","object.serial":1906}}},
+ {"id":907,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Stream/Output/Audio","node.name":"Zen","application.name":"Zen","application.process.binary":"zen-bin","object.serial":1907}}},
+ {"id":908,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Stream/Output/Audio","node.name":"spotify","application.name":"Spotify","application.process.binary":"spotify","media.role":"Music","object.serial":1908}}},
+ {"id":909,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Stream/Output/Audio","node.name":"mpv","application.name":"mpv","application.process.binary":"mpv","media.role":"Movie","object.serial":1909}}},
+ {"id":910,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Stream/Output/Audio","node.name":"WEBRTC VoiceEngine","node.description":"Discord","application.name":"WEBRTC VoiceEngine","application.process.binary":"Discord","object.serial":1910}}},
+ {"id":911,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Stream/Output/Audio","node.name":"TeamSpeak","application.name":"TeamSpeak","application.process.binary":"ts3client_linux_amd64","object.serial":1911}}},
+ {"id":912,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Stream/Output/Audio","node.name":"bluez_input.AA_BB_CC.2","node.description":"iPhone von Mo","object.serial":1912}}},
+ {"id":913,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Stream/Output/Audio","node.name":"some-app","node.description":"Some app","object.serial":1913}}}
+]"#;
 
 /// Keeps the first node of each name, in listing order.
 fn dedup_by_name(sources: Vec<AudioSource>) -> Vec<AudioSource> {
     let mut seen = std::collections::HashSet::new();
     sources.into_iter().filter(|s| seen.insert(s.name.clone())).collect()
-}
-
-/// Registry ids of every stream named `name` in this snapshot.
-fn node_ids_named(objects: &[PwObject], name: &str) -> Vec<u32> {
-    extract_audio_sources(objects).into_iter().filter(|s| s.name == name).map(|s| s.id).collect()
 }
 
 /// What the 1 s poll does with a fresh snapshot: the matching nodes not
@@ -214,33 +560,27 @@ fn link_diff(matching: &[u32], linked: &std::collections::HashSet<u32>) -> (Vec<
     (to_add, kept)
 }
 
-fn extract_audio_sources(objects: &[PwObject]) -> Vec<AudioSource> {
-    let loopback_output_prefix = format!("output.{SINK_NAME_PREFIX}");
-    let mut sources = Vec::new();
-    for obj in objects {
-        if obj.obj_type.as_deref() != Some("PipeWire:Interface:Node") {
-            continue;
-        }
-        let Some(info) = &obj.info else { continue };
-        let Some(props) = &info.props else { continue };
-        if prop_str(props, "media.class") != Some("Stream/Output/Audio") {
-            continue;
-        }
-        let node_name = prop_str(props, "node.name").unwrap_or_default();
-        if node_name.starts_with(&loopback_output_prefix) {
-            continue;
-        }
-        let name = prop_str(props, "node.description")
-            .or_else(|| prop_str(props, "application.name"))
-            .or_else(|| prop_str(props, "media.name"))
-            .filter(|s| !s.is_empty())
-            .unwrap_or(node_name)
-            .to_string();
-        let name = if name.is_empty() { format!("(unnamed stream {})", obj.id) } else { name };
-        let serial = prop_u64(props, "object.serial");
-        sources.push(AudioSource { id: obj.id, name, serial });
-    }
-    sources
+/// The listing of one snapshot (every stream, not yet de-duplicated); `steam_env(pid, binary)` answers
+/// the environment question for the streams that need it ([`needs_steam_probe`]).
+fn extract_audio_sources(objects: &[PwObject], steam_env: &dyn Fn(u32, &str) -> bool) -> Vec<AudioSource> {
+    streams(objects)
+        .into_iter()
+        .map(|s| {
+            let mut input = GroupInput {
+                media_role: s.role.as_deref(),
+                node_name: &s.node_name,
+                app_name: s.app_name.as_deref(),
+                binary: s.binary.as_deref(),
+                has_steam_env: false,
+                device: s.device,
+            };
+            if let Some(pid) = s.pid.filter(|_| needs_steam_probe(&input)) {
+                input.has_steam_env = steam_env(pid, s.binary.as_deref().unwrap_or_default());
+            }
+            let group = classify(&input);
+            AudioSource { id: s.id, name: s.name.clone(), serial: s.serial, group, aliases: s.aliases() }
+        })
+        .collect()
 }
 
 /// Output-direction port object ids of `node_id`, ordered by PipeWire's
@@ -556,15 +896,27 @@ fn link_source_into_loopback(objects: &[PwObject], source_node_id: u32, loopback
     }
     Ok(())
 }
-
-/// Links every not-yet-linked stream named `name` in `objects` into the
-/// loopback input and records it in `linked`; forgets nodes that vanished.
-/// A node that cannot be linked yet (no ports, `pw-link` error) is not
-/// recorded, so the next tick retries it. Never links a node of another name.
-/// A stream already linked that lost links ([`lost_links`]) is linked again.
-fn sync_links(objects: &[PwObject], name: &str, loopback_input_node_id: u32, linked: &mut std::collections::HashSet<u32>) {
-    let matching = node_ids_named(objects, name);
+/// Links every not-yet-linked stream the share wants ([`wanted_ids`]) in `objects` into the sink and
+/// records it in `linked`; forgets nodes that vanished, and **unlinks** the ones that are still there
+/// but no longer wanted (an exclusion entry added during the share, task I7; PipeWire only removes the
+/// links of a node that goes away). A node that cannot be linked yet (no ports, `pw-link` error) is
+/// not recorded, so the next tick retries it. A stream already linked that lost links
+/// ([`lost_links`]) is linked again.
+fn sync_links(
+    objects: &[PwObject],
+    choice: &AudioChoice,
+    exclusions: &[String],
+    loopback_input_node_id: u32,
+    linked: &mut std::collections::HashSet<u32>,
+) {
+    let name = choice.label();
+    let present = streams(objects);
+    let matching = wanted_ids(&present, choice, exclusions);
     let (to_add, kept) = link_diff(&matching, linked);
+    for id in linked.iter().filter(|id| !kept.contains(id) && present.iter().any(|s| s.id == **id)) {
+        let n = unlink_node_from_sink(objects, *id, loopback_input_node_id);
+        tracing::info!("audio share '{name}': stream node {id} is no longer wanted (excluded); unlinked {n} link(s)");
+    }
     for id in lost_links(objects, &kept, loopback_input_node_id) {
         match link_source_into_loopback(objects, id, loopback_input_node_id) {
             Ok(()) => tracing::info!("audio share '{name}': re-linked stream node {id} (it re-created its ports)"),
@@ -583,6 +935,31 @@ fn sync_links(objects: &[PwObject], name: &str, loopback_input_node_id: u32, lin
     }
 }
 
+/// Registry ids of the links from `node_id` into `sink_node_id`.
+fn links_between(objects: &[PwObject], node_id: u32, sink_node_id: u32) -> Vec<u32> {
+    objects
+        .iter()
+        .filter(|obj| obj.obj_type.as_deref() == Some("PipeWire:Interface:Link"))
+        .filter(|obj| {
+            obj.info.as_ref().and_then(|i| i.props.as_ref()).is_some_and(|p| {
+                prop_u64(p, "link.output.node") == Some(u64::from(node_id)) && prop_u64(p, "link.input.node") == Some(u64::from(sink_node_id))
+            })
+        })
+        .map(|obj| obj.id)
+        .collect()
+}
+
+/// Deletes the links that feed the share's sink from `node_id` (the app's own routing is not touched).
+/// Returns how many it deleted. Unlike removing the sink this does not make WirePlumber pause the
+/// app's player (#123; checked in the VMs for task I7).
+fn unlink_node_from_sink(objects: &[PwObject], node_id: u32, sink_node_id: u32) -> usize {
+    let links = links_between(objects, node_id, sink_node_id);
+    for id in &links {
+        let _ = Command::new("pw-link").arg("-d").arg(id.to_string()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    }
+    links.len()
+}
+
 /// The streams of `linked` that have ports again but are missing a link into the sink: Firefox
 /// re-creates the ports of its stream node on a pause/resume (same node id), and PipeWire drops
 /// every link on the old ports (task #123). Sorted, for a stable log and test.
@@ -593,8 +970,9 @@ fn lost_links(objects: &[PwObject], linked: &std::collections::HashSet<u32>, sin
     lost
 }
 
-/// Once a second, re-lists the graph and links every stream that carries the shared name into the
-/// sink: streams that appeared (a new tab, a restarted app, Firefox re-creating its stream after a
+/// Once a second, re-lists the graph and links every stream the share wants into the
+/// sink (those that carry the shared name, or for desktop audio every app except the excluded ones,
+/// [`wanted_ids`]; the exclusion list is read again every tick, so a change applies to a running share): streams that appeared (a new tab, a restarted app, Firefox re-creating its stream after a
 /// mute, #117) and streams we linked that lost their links (Firefox re-creates its ports on a
 /// pause/resume, #123). Both are plain (re)links into the running chain ([`sync_links`]).
 ///
@@ -606,7 +984,7 @@ fn lost_links(objects: &[PwObject], linked: &std::collections::HashSet<u32>, sin
 /// capture then starved for good; a rebuild only helped because it restarted that clock. Since
 /// the pipeline runs on the monotonic system clock ([`build_pipeline_from_source`]) a graph change
 /// costs nothing, so the poll just links, and a resume no longer loses its first second.
-async fn link_poll_loop(name: String, sink_input_node_id: u32, mut linked: std::collections::HashSet<u32>) {
+async fn link_poll_loop(choice: AudioChoice, exclusions: Exclusions, sink_input_node_id: u32, mut linked: std::collections::HashSet<u32>) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tick.tick().await; // the first tick is immediate; start_audio_sharing just synced
@@ -624,7 +1002,7 @@ async fn link_poll_loop(name: String, sink_input_node_id: u32, mut linked: std::
         if node_port_ids(&objects, sink_input_node_id as u64, "input").is_empty() {
             continue;
         }
-        sync_links(&objects, &name, sink_input_node_id, &mut linked);
+        sync_links(&objects, &choice, &exclusions.get(), sink_input_node_id, &mut linked);
     }
 }
 
@@ -1052,15 +1430,13 @@ pub struct AudioCaptureHandle {
     mute_element: gst::Element,
     /// The sender-side boost ([`AudioCaptureHandle::set_gain`]).
     gain_stage: GainStage,
-    /// The application whose audio this share is capturing — the name the
-    /// user picked in the source list. Surfaced next to the share's level
-    /// meter in Stream Control, so the row can say *what* is being shared
-    /// rather than just that something is.
-    source_name: String,
+    /// What this share captures: the desktop or one name. Its label says what is being shared.
+    choice: AudioChoice,
 }
 
-/// Starts sharing `source`'s audio on `stream_id`: spins up a private
-/// PipeWire loopback, non-destructively taps `source`'s existing output
+/// Starts sharing `choice`'s audio on `stream_id` (the whole desktop except `exclusions`, or one
+/// name, task I7): spins up a private
+/// PipeWire null sink, non-destructively taps the chosen streams' existing output
 /// ports into it, builds and starts the Opus capture/encode pipeline, and
 /// (once the pipeline has actually reached `Playing` — mirroring
 /// `capture.rs::start_sharing`'s "announce only after real capture starts"
@@ -1071,7 +1447,18 @@ pub struct AudioCaptureHandle {
 /// unavailable or fail, the source's ports have disappeared, or the
 /// GStreamer pipeline fails to construct/start. Any partially-created
 /// loopback process is cleaned up before returning an error.
-pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, source: &AudioSource, gain: f64, muted: bool) -> Result<AudioCaptureHandle> {
+pub async fn start_audio_sharing(
+    client: &ScreenshareClient,
+    stream_id: u8,
+    choice: &AudioChoice,
+    exclusions: &Exclusions,
+    gain: f64,
+    muted: bool,
+) -> Result<AudioCaptureHandle> {
+    // The rig's fake sources (`SSS_UI_FAKE_AUDIO_SOURCES`, `list_audio_sources`) mean "no audio may be created here".
+    if std::env::var_os("SSS_UI_FAKE_AUDIO_SOURCES").is_some() {
+        bail!("audio sharing is switched off (SSS_UI_FAKE_AUDIO_SOURCES)");
+    }
     ensure_gstreamer_initialized()?;
 
     // stream_id + a random suffix: unique even if two audio shares started
@@ -1093,7 +1480,7 @@ pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, sour
     // (re)appears. The capture pipeline reads only the loopback's output, so
     // an unlinked loopback is silence, never the microphone.
     let mut linked = std::collections::HashSet::new();
-    sync_links(&objects, &source.name, loopback.node_id, &mut linked);
+    sync_links(&objects, choice, &exclusions.get(), loopback.node_id, &mut linked);
 
     let capture_node_name = format!("{loopback_name}-cap");
     let BuiltPipeline { pipeline, sink: appsink, mute: mute_element, gain_stage } =
@@ -1147,12 +1534,12 @@ pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, sour
     let pts_offset_us =
         sender_clock_offset_us(pipeline.current_running_time().map(|t| t.useconds()).unwrap_or(0), Instant::now());
     let pump_task = tokio::spawn(pump_loop(pump_client, stream_id, stream, bus_stream, level.clone(), pts_offset_us));
-    let link_task = tokio::spawn(link_poll_loop(source.name.clone(), loopback.node_id, linked));
+    let link_task = tokio::spawn(link_poll_loop(choice.clone(), exclusions.clone(), loopback.node_id, linked));
 
     // No width/height for audio (spec's AnnounceStream fields exist for
     // video streams' benefit); 0x0 signals "not applicable".
     if let Err(e) = client
-        .announce_stream(stream_id, StreamKind::Audio, &source.name, 0, 0)
+        .announce_stream(stream_id, StreamKind::Audio, choice.label(), 0, 0)
         .await
         .context("failed to announce audio stream to the relay")
     {
@@ -1173,7 +1560,7 @@ pub async fn start_audio_sharing(client: &ScreenshareClient, stream_id: u8, sour
         level,
         mute_element,
         gain_stage,
-        source_name: source.name.clone(),
+        choice: choice.clone(),
     })
 }
 
@@ -1208,10 +1595,9 @@ impl AudioCaptureHandle {
         self.level.get()
     }
 
-    /// The name of the application being captured, as picked in the source
-    /// list.
-    pub fn source_name(&self) -> &str {
-        &self.source_name
+    /// What this share captures.
+    pub fn choice(&self) -> &AudioChoice {
+        &self.choice
     }
 
     /// Mute/unmute what this share sends, without stopping it — the Stream
@@ -1236,6 +1622,27 @@ impl AudioCaptureHandle {
     /// The boost this share is applying now.
     pub fn gain(&self) -> f64 {
         self.gain_stage.gain()
+    }
+
+    /// `node.name` of every stream that has a link into this share's sink right now (a `pw-dump`, blocking).
+    /// A diagnostic for the VM tests of desktop audio: what is *in* the share, e.g. that an excluded app and the
+    /// viewer's own playback are not.
+    pub fn linked_stream_names(&self) -> Result<Vec<String>> {
+        let objects = run_pw_dump()?;
+        let Some(sink) = find_sink_node(&objects, &self.loopback_child.name) else { return Ok(Vec::new()) };
+        let node_name = |id: u64| {
+            objects.iter().find(|o| u64::from(o.id) == id).and_then(|o| prop_str(o.info.as_ref()?.props.as_ref()?, "node.name")).map(str::to_string)
+        };
+        let mut names: Vec<String> = links_into_node(&objects, sink.node_id)
+            .into_iter()
+            .filter_map(|link| {
+                let props = objects.iter().find(|o| o.id == link)?.info.as_ref()?.props.as_ref()?;
+                node_name(prop_u64(props, "link.output.node")?)
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        Ok(names)
     }
 
     /// Tears the audio share down cleanly: stops the GStreamer pipeline,
@@ -2012,8 +2419,10 @@ mod tests {
     #[test]
     fn extract_audio_sources_finds_real_app_excludes_own_loopback_and_wrong_class() {
         let objects = fixture_objects();
-        let sources = extract_audio_sources(&objects);
-        assert_eq!(sources, vec![AudioSource { id: 262, name: "TestApp".to_string(), serial: Some(90210) }]);
+        let sources = extract_audio_sources(&objects, &|_, _| false);
+        assert_eq!(sources.len(), 1);
+        let s = &sources[0];
+        assert_eq!((s.id, s.name.as_str(), s.serial), (262, "TestApp", Some(90210)));
     }
 
     /// Three app streams: two named "Firefox" (ids 10, 11), one "Spotify" (20),
@@ -2038,7 +2447,7 @@ mod tests {
     #[test]
     fn dropdown_lists_each_name_once_with_the_first_node_as_representative() {
         let objects = duplicate_name_objects();
-        let all = extract_audio_sources(&objects);
+        let all = extract_audio_sources(&objects, &|_, _| false);
         assert_eq!(all.len(), 3, "extraction keeps every stream");
         let listed = dedup_by_name(all);
         let names: Vec<_> = listed.iter().map(|s| (s.name.as_str(), s.id)).collect();
@@ -2048,11 +2457,12 @@ mod tests {
     #[test]
     fn a_name_matches_all_its_output_streams_and_nothing_else() {
         let objects = duplicate_name_objects();
-        assert_eq!(node_ids_named(&objects, "Firefox"), vec![10, 11]);
-        assert_eq!(node_ids_named(&objects, "Spotify"), vec![20]);
-        assert!(node_ids_named(&objects, "Discord").is_empty());
+        let named = |objects: &[PwObject], n: &str| wanted_ids(&streams(objects), &AudioChoice::Named(n.to_string()), &[]);
+        assert_eq!(named(&objects, "Firefox"), vec![10, 11]);
+        assert_eq!(named(&objects, "Spotify"), vec![20]);
+        assert!(named(&objects, "Discord").is_empty());
         // The real fixture's own sink is never matched, whatever the name.
-        assert!(node_ids_named(&fixture_objects(), "ssshare-sink-3-abc123").is_empty());
+        assert!(named(&fixture_objects(), "ssshare-sink-3-abc123").is_empty());
     }
 
     #[test]
@@ -2540,7 +2950,7 @@ mod tests {
             .expect("did not find the synthetic test app among live audio sources");
 
         eprintln!("[audio-stop-test] starting real audio share for source {source:?}");
-        let handle = start_audio_sharing(&client, 7, &source, 1.0, false)
+        let handle = start_audio_sharing(&client, 7, &AudioChoice::Named(source.name.clone()), &Exclusions::default(), 1.0, false)
             .await
             .expect("start_audio_sharing failed");
 
@@ -2683,5 +3093,182 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
         assert!(!survived, "child (pid {child_pid}) outlived its SIGKILLed parent: PR_SET_PDEATHSIG is not in effect");
+    }
+}
+
+/// Task I7: source groups, the exclusion list, desktop audio's matching set and the streams of one snapshot.
+#[cfg(test)]
+mod desktop_audio_tests {
+    use super::*;
+
+    /// `classify` for `(role, node name, app name, binary, steam env, device)`.
+    fn group(role: Option<&str>, node: &str, app: Option<&str>, bin: Option<&str>, steam: bool, device: bool) -> AudioGroup {
+        classify(&GroupInput { media_role: role, node_name: node, app_name: app, binary: bin, has_steam_env: steam, device })
+    }
+
+    /// The real examples of the brief (the user's host, 2026-11-04) and the rule table of [`classify`].
+    #[test]
+    fn groups_come_out_right_for_the_real_examples() {
+        use AudioGroup::*;
+        // A phone connected over Bluetooth (a `bluez_input` node): Devices.
+        assert_eq!(group(None, "bluez_input.AA_BB_CC_DD_EE_FF.2", None, None, false, true), Devices);
+        // Spotify: media.role Music (and its binary).
+        assert_eq!(group(Some("Music"), "spotify", Some("Spotify"), Some("spotify"), false, false), Media);
+        assert_eq!(group(Some("Music"), "x", None, None, false, false), Media, "the role alone is enough");
+        // Browsers by binary / application name.
+        assert_eq!(group(None, "Firefox", Some("Floorp"), Some("floorp"), false, false), Browsers);
+        assert_eq!(group(None, "Chromium", Some("Chromium"), Some("chromium"), false, false), Browsers);
+        assert_eq!(group(None, "zen", Some("Zen"), Some("zen-bin"), false, false), Browsers);
+        // A word, not a substring: zenity is no browser.
+        assert_eq!(group(None, "zenity", None, Some("zenity"), false, false), Other);
+        // Gamescope's output stream.
+        assert_eq!(group(None, "gamescope", Some("gamescope"), Some("gamescope"), false, false), Games);
+        // A Proton game: the binary is wine64-preloader, SteamAppId is in its environment.
+        assert_eq!(group(None, "Skill Up!.exe", Some("Skill Up!.exe"), Some("wine64-preloader"), true, false), Games);
+        // ... a wine binary without SteamAppId is not a game (the user's call).
+        assert_eq!(group(None, "Skill Up!.exe", Some("Skill Up!.exe"), Some("wine64-preloader"), false, false), Other);
+        // A native Steam game (cs2) has the variable too.
+        assert_eq!(group(None, "cs2", Some("cs2"), Some("cs2"), true, false), Games);
+        // java is a game only with the Game role (Minecraft's); the name stays java either way.
+        assert_eq!(group(Some("Game"), "java", Some("java"), Some("java"), false, false), Games);
+        assert_eq!(group(None, "java", Some("java"), Some("java"), false, false), Other);
+        // media.role Game counts for anything.
+        assert_eq!(group(Some("game"), "whatever", None, None, false, false), Games);
+        // Voice chat: by name, binary or role.
+        assert_eq!(group(None, "WEBRTC VoiceEngine", Some("WEBRTC VoiceEngine"), Some("Discord"), false, false), VoiceChat);
+        assert_eq!(group(None, "TeamSpeak", Some("TeamSpeak"), Some("ts3client_linux_amd64"), false, false), VoiceChat);
+        assert_eq!(group(Some("Communication"), "x", None, None, false, false), VoiceChat);
+        // Players by binary; anything unknown is Other.
+        assert_eq!(group(Some("Movie"), "mpv", Some("mpv"), Some("mpv"), false, false), Media);
+        assert_eq!(group(None, "Some app", None, None, false, false), Other);
+        // Rule order: a device wins over everything, known binaries over the environment.
+        assert_eq!(group(Some("Game"), "bluez_input.x", None, None, true, true), Devices);
+        assert_eq!(group(None, "firefox", None, Some("firefox"), true, false), Browsers);
+    }
+
+    #[test]
+    fn the_environment_is_read_only_for_streams_no_known_app_claims() {
+        let probe = |role, node, bin| needs_steam_probe(&GroupInput { media_role: role, node_name: node, app_name: None, binary: bin, ..Default::default() });
+        assert!(probe(None, "Skill Up!.exe", Some("wine64-preloader")));
+        assert!(probe(None, "cs2", Some("cs2")));
+        assert!(!probe(None, "firefox", Some("firefox")), "a browser is a browser: no /proc read");
+        assert!(!probe(Some("Game"), "java", Some("java")), "the role already says it");
+        assert!(!probe(Some("Music"), "spotify", Some("spotify")));
+        assert!(!needs_steam_probe(&GroupInput { node_name: "bluez_input.x", device: true, ..Default::default() }));
+    }
+
+    #[test]
+    fn steam_app_id_is_found_by_name_and_values_are_never_looked_at() {
+        let has = |s: &[u8]| environ_has_steam_app_id(std::io::Cursor::new(s.to_vec()));
+        assert!(has(b"HOME=/home/x\0SteamAppId=1234\0TOKEN=secret"));
+        assert!(has(b"SteamAppId=0"));
+        assert!(!has(b"HOME=/home/x\0SteamGameId=1234"), "only SteamAppId");
+        assert!(!has(b"NOT_SteamAppId=1\0SteamAppIdX=2"), "the whole name, at the start of an entry");
+        assert!(!has(b""));
+        // `/proc/<pid>/environ` of a process that is gone, or of a pid that is not ours, is simply "no".
+        assert!(!process_has_steam_app_id(u32::MAX - 1, "nothing"));
+    }
+
+    #[test]
+    fn the_exclusion_matches_any_name_containing_it_ignoring_case() {
+        let list = vec!["Discord".to_string(), "  TeamSpeak ".to_string(), String::new(), "  ".to_string()];
+        assert!(name_is_excluded("discord", &list));
+        assert!(name_is_excluded("WEBRTC Discord Voice", &list));
+        assert!(name_is_excluded("TEAMSPEAK 3", &list), "entries are trimmed too");
+        assert!(!name_is_excluded("Firefox", &list), "blank entries must not match everything");
+        assert!(!name_is_excluded("anything", &[]));
+    }
+
+    /// A snapshot: a client object that carries the pid of `java`, our own stream, a phone, a Proton game, and
+    /// Discord (its name says something else, its binary says Discord).
+    fn snapshot() -> Vec<PwObject> {
+        let me = std::process::id();
+        let json = format!(
+            r#"[
+            {{"id":5,"type":"PipeWire:Interface:Client","info":{{"props":{{"application.process.id":4242,"application.process.binary":"java"}}}}}},
+            {{"id":30,"type":"PipeWire:Interface:Node","info":{{"props":{{"media.class":"Stream/Output/Audio","node.name":"java","application.name":"java","media.role":"Game","client.id":5,"object.serial":130}}}}}},
+            {{"id":31,"type":"PipeWire:Interface:Node","info":{{"props":{{"media.class":"Stream/Output/Audio","node.name":"viewer","application.name":"our own playback","application.process.id":{me},"object.serial":131}}}}}},
+            {{"id":32,"type":"PipeWire:Interface:Node","info":{{"props":{{"media.class":"Stream/Output/Audio","node.name":"bluez_input.AA_BB.2","node.description":"iPhone von Mo","object.serial":132}}}}}},
+            {{"id":33,"type":"PipeWire:Interface:Node","info":{{"props":{{"media.class":"Stream/Output/Audio","node.name":"Skill Up!.exe","application.name":"Skill Up!.exe","application.process.binary":"wine64-preloader","application.process.id":"777","object.serial":133}}}}}},
+            {{"id":34,"type":"PipeWire:Interface:Node","info":{{"props":{{"media.class":"Stream/Output/Audio","node.name":"WEBRTC VoiceEngine","application.name":"WEBRTC VoiceEngine","application.process.binary":"Discord","application.process.id":888,"object.serial":134}}}}}},
+            {{"id":35,"type":"PipeWire:Interface:Node","info":{{"props":{{"media.class":"Stream/Output/Audio","node.name":"ee_soe_output_level","application.name":"easyeffects","object.serial":135}}}}}},
+            {{"id":36,"type":"PipeWire:Interface:Node","info":{{"props":{{"media.class":"Stream/Output/Audio","node.name":"firefox","application.name":"Firefox","application.process.binary":"firefox","application.process.id":999,"object.serial":136}}}}}}
+            ]"#
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn a_listing_groups_every_stream_of_a_snapshot_and_leaves_out_our_own() {
+        let probed = std::cell::RefCell::new(Vec::new());
+        let sources = extract_audio_sources(&snapshot(), &|pid, bin| {
+            probed.borrow_mut().push((pid, bin.to_string()));
+            pid == 777
+        });
+        let by = |name: &str| sources.iter().find(|s| s.name == name).unwrap_or_else(|| panic!("{name} not listed in {sources:?}"));
+        assert_eq!(by("java").group, AudioGroup::Games, "java with the Game role; its pid is only on the client object");
+        assert_eq!(by("iPhone von Mo").group, AudioGroup::Devices);
+        assert_eq!(by("Skill Up!.exe").group, AudioGroup::Games, "SteamAppId of pid 777 (given as a string)");
+        assert_eq!(by("WEBRTC VoiceEngine").group, AudioGroup::VoiceChat);
+        assert_eq!(by("Firefox").group, AudioGroup::Browsers);
+        assert!(sources.iter().all(|s| s.name != "our own playback"), "this process's streams are not sources");
+        // Only the game was a candidate: no other stream's environment was read.
+        assert_eq!(*probed.borrow(), vec![(777, "wine64-preloader".to_string())]);
+    }
+
+    #[test]
+    fn the_listing_is_ordered_by_group() {
+        let mut v = dedup_by_name(extract_audio_sources(&snapshot(), &|_, _| false));
+        v.sort_by_key(|s| s.group);
+        let groups: Vec<_> = v.iter().map(|s| s.group).collect();
+        let mut sorted = groups.clone();
+        sorted.sort();
+        assert_eq!(groups, sorted);
+        assert_eq!(AudioGroup::ALL.iter().copied().min(), Some(AudioGroup::Games));
+    }
+
+    #[test]
+    fn desktop_audio_is_every_app_except_ours_the_plumbing_and_the_excluded() {
+        let objects = snapshot();
+        let all = streams(&objects);
+        // Ours (31) is never a stream at all; EasyEffects (35) is plumbing.
+        assert_eq!(wanted_ids(&all, &AudioChoice::Desktop, &[]), vec![30, 32, 33, 34, 36]);
+        // The default list: Discord is matched by its binary even though the stream's name is WEBRTC VoiceEngine.
+        let default = crate::rooms::AppSettings::default_audio_exclusions();
+        assert_eq!(wanted_ids(&all, &AudioChoice::Desktop, &default), vec![30, 32, 33, 36]);
+        // By the display name too (the phone), and ignoring case.
+        assert_eq!(wanted_ids(&all, &AudioChoice::Desktop, &["IPHONE".to_string()]), vec![30, 33, 34, 36]);
+        // A named share is every stream of that name, never an excluded one.
+        assert_eq!(wanted_ids(&all, &AudioChoice::Named("Firefox".to_string()), &[]), vec![36]);
+        assert!(wanted_ids(&all, &AudioChoice::Named("Firefox".to_string()), &["fire".to_string()]).is_empty());
+        assert!(wanted_ids(&all, &AudioChoice::Named("our own playback".to_string()), &[]).is_empty(), "a viewer's own playback is never captured back");
+    }
+
+    #[test]
+    fn the_stream_to_unlink_after_an_exclusion_is_found_by_its_links_into_the_sink() {
+        let json = r#"[
+            {"id":101,"type":"PipeWire:Interface:Link","info":{"props":{"link.output.node":30,"link.input.node":700,"link.output.port":1,"link.input.port":2}}},
+            {"id":102,"type":"PipeWire:Interface:Link","info":{"props":{"link.output.node":30,"link.input.node":55,"link.output.port":1,"link.input.port":3}}},
+            {"id":103,"type":"PipeWire:Interface:Link","info":{"props":{"link.output.node":32,"link.input.node":700,"link.output.port":4,"link.input.port":2}}}
+        ]"#;
+        let objects: Vec<PwObject> = serde_json::from_str(json).unwrap();
+        // Only the link into OUR sink goes; the app's own routing (to node 55, the speakers) stays.
+        assert_eq!(links_between(&objects, 30, 700), vec![101]);
+        assert_eq!(links_between(&objects, 32, 700), vec![103]);
+        assert!(links_between(&objects, 31, 700).is_empty());
+    }
+
+    #[test]
+    fn exclusions_are_shared_with_running_shares() {
+        let a = Exclusions::new(vec!["Discord".to_string()]);
+        let b = a.clone();
+        b.set(vec![]);
+        assert!(a.get().is_empty(), "a clone sees the change: that is how a running poll learns of it");
+    }
+
+    #[test]
+    fn labels() {
+        assert_eq!(AudioChoice::Desktop.label(), "Desktop audio");
+        assert_eq!(AudioChoice::Named("Spotify".to_string()).label(), "Spotify");
     }
 }

@@ -82,7 +82,7 @@
 use std::collections::HashMap;
 
 use egui::{Align, Color32, CornerRadius, Frame, Id, Layout, Margin, Rect, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
-use simple_screensharing_client::audio::{AudioLevelTapHandle, AudioSource};
+use simple_screensharing_client::audio::{AudioChoice, AudioLevelTapHandle};
 use simple_screensharing_client::capture::destination::DestinationState;
 use simple_screensharing_client::presets::EncoderPreset;
 use simple_screensharing_client::protocol::{ConnId, StreamInfo, StreamKind};
@@ -97,6 +97,7 @@ use crate::theme::{self, Weight, font};
 use crate::widgets::{self, BandEdge};
 
 mod apply;
+pub mod audio_settings;
 pub mod drive_dump;
 pub mod menu;
 pub mod modals;
@@ -158,6 +159,9 @@ pub enum Modal {
     /// destination yet, else live ("Stream settings", Stop sharing in/Done).
     /// Rendered by [`stream_settings::show`].
     StreamSettings { capture: CaptureSourceId, room: RoomHandle },
+    /// The audio settings menu of the control bar's audio button (task I7): source, Boost and the
+    /// exclusion list, for the audio share in `room`. Rendered by [`audio_settings::show`].
+    AudioSettings { room: RoomHandle },
     /// "Create or join a room" (tabs Join / Create). Form state lives in
     /// `ModalsState`; results come back in `Shell::join_error` /
     /// `Shell::create_result`.
@@ -190,6 +194,9 @@ pub enum PopoverKind {
     AlsoSendTo { capture: CaptureSourceId, room: RoomHandle },
     /// Stream settings "Move to…". (stream_settings.rs)
     MoveTo { capture: CaptureSourceId, room: RoomHandle },
+    /// The audio settings menu's "Add" under the exclusion list: detected sources and a text field.
+    /// (audio_settings.rs)
+    AudioExclude,
 }
 
 /// An open popover and the screen rect of the button it hangs off.
@@ -332,7 +339,7 @@ pub enum UiAction {
     /// The stream-settings modal opens by itself once the picker resolves.
     StageShare(RoomHandle),
     /// Go live with a staged capture in `room` (saves the settings as
-    /// defaults, attaches any staged audio, closes its settings modal).
+    /// defaults, closes its settings modal).
     GoLive { capture: CaptureSourceId, room: RoomHandle },
     /// Throw a staged capture away (closes its settings modal).
     Discard(CaptureSourceId),
@@ -358,11 +365,15 @@ pub enum UiAction {
     SetBandwidthFloor(u32),
 
     // --- shared audio -----------------------------------------------------
-    /// Share (or switch to) `source` alongside video `capture`. For a staged
-    /// capture it is remembered and attached at Go live.
-    ShareAudio { capture: CaptureSourceId, source: AudioSource },
-    StopSharingAudio { capture: CaptureSourceId },
-    SetSharedAudioMuted { capture: CaptureSourceId, muted: bool },
+    /// Share (or switch to) `choice` in `room`: desktop audio or one app. Audio is a share of its own,
+    /// independent of any screen share (task I7); switching replaces the running one and keeps it muted
+    /// if it was (#118).
+    ShareAudio { room: RoomHandle, choice: AudioChoice },
+    StopSharingAudio { room: RoomHandle },
+    SetSharedAudioMuted { room: RoomHandle, muted: bool },
+    /// Audio settings > Exclude: the new list (blanks and duplicates are dropped; saved, applied to the
+    /// source lists and to a running desktop share at its next poll).
+    SetAudioExclusions(Vec<String>),
     /// Re-list audio sources (async; result in `cx.state.audio_sources`).
     RefreshAudioSources,
     /// Start level meters for these audio source ids (a picker opened).
@@ -418,9 +429,6 @@ pub enum UiAction {
 #[derive(Debug, Clone)]
 pub struct StagedShare {
     pub capture: CaptureSourceId,
-    /// Audio chosen before going live; attached at Go live (the lib only
-    /// shares audio next to a live capture).
-    pub audio: Option<AudioSource>,
     /// Whether the settings modal was auto-opened when the picker resolved.
     pub modal_opened: bool,
 }
@@ -749,9 +757,15 @@ impl<'a> Cx<'a> {
         self.state.captures.get(&id)
     }
 
-    /// The audio capture paired with video capture `capture`, if any.
-    pub fn paired_audio(&self, capture: CaptureSourceId) -> Option<(CaptureSourceId, &'a LocalCapture)> {
-        paired_audio(self.state, capture).and_then(|id| self.state.captures.get(&id).map(|c| (id, c)))
+    /// Our own audio share in `room` (desktop or one app), if any: independent of the screen share
+    /// (task I7). A stopping one loses to a running one ([`AppState::audio_share_in`]).
+    pub fn audio_share(&self, room: RoomHandle) -> Option<(CaptureSourceId, &'a LocalCapture)> {
+        self.state.audio_share_in(room).and_then(|id| self.state.captures.get(&id).map(|c| (id, c)))
+    }
+
+    /// What our audio share in `room` captures, if there is one.
+    pub fn audio_choice(&self, room: RoomHandle) -> Option<AudioChoice> {
+        self.state.audio_choice_in(room)
     }
 
     /// Live state of a destination as one value for pills.
@@ -865,21 +879,6 @@ pub fn share_state(state: &AppState, shell: &Shell, room: RoomHandle) -> ShareSt
         };
     }
     ShareState::Idle
-}
-
-/// The audio capture riding on video capture `capture`.
-///
-/// `Why a stopping one loses:` switching the audio source, or a room reconnect,
-/// leaves the old audio capture in `Stopping` (reaped when its teardown lands,
-/// a second or more) next to the new one, and both point at `capture`. The
-/// first match used to win, so for that long the bar showed the dying share:
-/// its name, a flat meter (a stopping share has no level), and a Mute click
-/// that hit the wrong capture (#115).
-pub fn paired_audio(state: &AppState, capture: CaptureSourceId) -> Option<CaptureSourceId> {
-    let mut riders = state.captures.iter().filter(|(_, c)| c.audio_for_capture == Some(capture));
-    let first = riders.next()?;
-    let live = std::iter::once(first).chain(riders).find(|(_, c)| !matches!(c.status, ShareStatus::Stopping(_)));
-    Some(*live.unwrap_or(first).0)
 }
 
 
@@ -1001,6 +1000,9 @@ pub fn share_label(raw: &str) -> String {
         tr("share.video_label", "Screen share")
     } else if raw == "Screen" || default_in_any_locale("ui.stream.screen") {
         tr("ui.stream.screen", "Screen")
+    } else if default_in_any_locale("share.desktop_audio_label") {
+        // A desktop-audio share announces the English label on the wire (task I7).
+        tr("share.desktop_audio_label", "Desktop audio")
     } else {
         raw.to_string()
     }
@@ -1077,6 +1079,7 @@ pub struct App {
     pub sidebar: sidebar::SidebarState,
     pub room: room::RoomState,
     pub stream_settings: stream_settings::StreamSettingsState,
+    pub audio_settings: audio_settings::AudioSettingsState,
     pub modals: modals::ModalsState,
     pub popout: popout::PopoutState,
     /// `ctx.input(|i| i.time)` at the start of this frame (toast clock).
@@ -1120,6 +1123,7 @@ impl App {
             sidebar: Default::default(),
             room: Default::default(),
             stream_settings: Default::default(),
+            audio_settings: Default::default(),
             modals: Default::default(),
             popout: Default::default(),
             now: 0.0,
@@ -1195,7 +1199,7 @@ impl App {
         {
             self.nav.modal = None;
         }
-        if let Some(Modal::LeaveConfirm { room }) = &self.nav.modal
+        if let Some(Modal::LeaveConfirm { room } | Modal::AudioSettings { room }) = &self.nav.modal
             && !self.state.rooms.contains_key(room)
         {
             self.nav.modal = None;
@@ -1344,7 +1348,7 @@ impl App {
     /// Lay the window out and run every screen. Returns the actions they pushed.
     fn draw(&mut self, ctx: &egui::Context) -> Vec<UiAction> {
         let mut actions = Vec::new();
-        let App { state, nav, shell, videos, sidebar, room, stream_settings, modals, popout, .. } = self;
+        let App { state, nav, shell, videos, sidebar, room, stream_settings, audio_settings, modals, popout, .. } = self;
         let mut cx = Cx::new(state, nav, shell, videos, &mut actions);
         if let Some(fs) = cx.nav.fullscreen {
             if cx.videos.get(fs.key).is_some_and(|e| !e.popped) {
@@ -1441,6 +1445,7 @@ impl App {
         // Modals over the panels.
         match cx.nav.modal.clone() {
             Some(Modal::StreamSettings { capture, room }) => stream_settings::show(ctx, &mut cx, stream_settings, capture, room),
+            Some(Modal::AudioSettings { room }) => audio_settings::show(ctx, &mut cx, audio_settings, room),
             Some(m) => modals::show(ctx, &mut cx, modals, &m),
             None => {}
         }

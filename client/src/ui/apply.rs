@@ -7,7 +7,8 @@ use std::sync::atomic::Ordering;
 use simple_screensharing_client::net::{format_join_string_with_hash, parse_join_string};
 use simple_screensharing_client::session::{self, PendingRole};
 
-use super::{App, FullscreenStream, Modal, StagedShare, UiAction, View, paired_audio, room_entries, same_room, tr, tr_with, view_is_room};
+use super::{App, FullscreenStream, Modal, StagedShare, UiAction, View, room_entries, same_room, tr, tr_with, view_is_room};
+use simple_screensharing_client::audio::{AudioChoice, name_is_excluded};
 
 impl App {
     /// Apply one action. `ctx` is only used for the clipboard.
@@ -220,19 +221,12 @@ impl App {
                     return;
                 }
                 let capture = self.state.stage_video_share_with_saved_defaults();
-                self.shell.staged.insert(room, StagedShare { capture, audio: None, modal_opened: false });
+                self.shell.staged.insert(room, StagedShare { capture, modal_opened: false });
                 self.nav.popover = None;
             }
             UiAction::GoLive { capture, room } => {
                 self.state.go_live_and_save_defaults(capture, room);
-                let staged = self.shell.staged.shift_remove(&room);
-                if let Some(source) = staged.and_then(|s| s.audio) {
-                    // Audio rides on a live capture only; it's live now.
-                    self.state.selected_audio_source = Some(source);
-                    if let Err(e) = self.state.start_audio_share(room, capture, false) {
-                        self.toast(tr_with("ui.toast.audio_failed", "Couldn't share audio: %{error}", &[("error", &e.to_string())]), "error");
-                    }
-                }
+                self.shell.staged.shift_remove(&room);
                 if matches!(self.nav.modal, Some(Modal::StreamSettings { capture: c, .. }) if c == capture) {
                     self.nav.modal = None;
                 }
@@ -314,37 +308,40 @@ impl App {
             UiAction::SetBandwidthFloor(v) => self.state.set_bandwidth_floor(v),
 
             // --- shared audio --------------------------------------------
-            UiAction::ShareAudio { capture, source } => {
-                if let Some(staged) = self.shell.staged.values_mut().find(|s| s.capture == capture) {
-                    staged.audio = Some(source);
-                    self.nav.popover = None;
-                    return;
-                }
-                // Switching source replaces the share; keep it muted if it was (#118).
-                let muted = paired_audio(&self.state, capture).is_some_and(|old| self.state.is_audio_share_muted(old));
-                if let Some(old) = paired_audio(&self.state, capture) {
+            UiAction::ShareAudio { room, choice } => {
+                // Switching replaces the running share; keep it muted if it was (#118).
+                let old = self.state.audio_share_in(room);
+                let muted = old.is_some_and(|o| self.state.is_audio_share_muted(o));
+                if let Some(old) = old {
                     self.state.stop_share(old);
                 }
-                let room = self.state.captures.get(&capture).and_then(|c| c.destinations.values().next()).map(|d| d.room);
-                if let Some(room) = room {
-                    self.state.selected_audio_source = Some(source);
-                    if let Err(e) = self.state.start_audio_share(room, capture, muted) {
-                        self.toast(tr_with("ui.toast.audio_failed", "Couldn't share audio: %{error}", &[("error", &e.to_string())]), "error");
-                    }
+                if let Err(e) = self.state.start_audio_share(room, None, choice, muted) {
+                    self.toast(tr_with("ui.toast.audio_failed", "Couldn't share audio: %{error}", &[("error", &e.to_string())]), "error");
                 }
                 self.nav.popover = None;
             }
-            UiAction::StopSharingAudio { capture } => {
-                if let Some(staged) = self.shell.staged.values_mut().find(|s| s.capture == capture) {
-                    staged.audio = None;
-                } else if let Some(audio) = paired_audio(&self.state, capture) {
+            UiAction::StopSharingAudio { room } => {
+                if let Some(audio) = self.state.audio_share_in(room) {
                     self.state.stop_share(audio);
                 }
                 self.nav.popover = None;
             }
-            UiAction::SetSharedAudioMuted { capture, muted } => {
-                if let Some(audio) = paired_audio(&self.state, capture) {
+            UiAction::SetSharedAudioMuted { room, muted } => {
+                if let Some(audio) = self.state.audio_share_in(room) {
                     self.state.set_audio_share_muted(audio, muted);
+                }
+            }
+            UiAction::SetAudioExclusions(list) => {
+                let stored = self.state.set_audio_exclusions(list);
+                // The app you were sharing just went on the list (replica): the share turns into desktop
+                // audio, which leaves it out, instead of silently going quiet.
+                let rooms: Vec<_> = self.state.rooms.keys().copied().collect();
+                for room in rooms {
+                    if let Some(AudioChoice::Named(n)) = self.state.audio_choice_in(room)
+                        && name_is_excluded(&n, &stored)
+                    {
+                        self.apply(ctx, UiAction::ShareAudio { room, choice: AudioChoice::Desktop });
+                    }
                 }
             }
             UiAction::RefreshAudioSources => self.state.refresh_audio_sources(),

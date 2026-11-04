@@ -9,7 +9,8 @@
 //!   above the avatars.
 //! - **Share audio and Webcam** are complete split buttons (look, tooltips, arrow) so their later rows only
 //!   have to switch them on: the Webcam one is disabled with a tooltip until I8 and has no dropdown body;
-//!   Share audio keeps today's source list (`share::audio_menu`; I7 adds Desktop audio and the settings).
+//!   Share audio (I7) is a share of its own: one click turns Desktop audio on, the next off, with no screen
+//!   needed; its arrow opens the source list (`share::audio_menu`) and "All audio settings…".
 //! - **Narrow windows** (800 px minimum, a ~528 px stage): the label of Copy invite link goes first, then the
 //!   bar takes two rows (the middle part on top, the side buttons under it). Icons never move into a menu.
 //!   Pure rule: [`arrange`]. Check en and de.
@@ -17,11 +18,12 @@
 
 use egui::emath::GuiRounding;
 use egui::{Align, Color32, CornerRadius, Id, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
+use simple_screensharing_client::audio::AudioChoice;
 use simple_screensharing_client::session::RoomHandle;
 
 use super::{Host, StageLayout, StageState, StageView};
 use crate::theme::{self, Weight, font};
-use crate::ui::share::{self, capture_of, live_elsewhere};
+use crate::ui::share::{self, live_elsewhere};
 use crate::ui::{ConnState, Cx, PopoverKind, RoomEntry, ShareState, UiAction, drive_dump, tr, tr_with};
 use crate::widgets::{self, DISABLED_OPACITY, paint_icon, paint_text, text_width};
 
@@ -293,24 +295,24 @@ impl Bar {
             cx.toggle_popover(PopoverKind::Bar(BarMenu::Share), rect);
         }
         bx += SPLIT_W + GROUP_GAP;
-        // --- Share audio: only next to a screen (it rides along with it) ---
-        let capture = capture_of(state);
-        let cur = capture.and_then(|c| share::audio_current(cx, room, c));
-        let (tone, tip) = match (&cur, capture) {
-            (Some(name), _) => (Tone::On, tr_with("ui.bar.stop_audio_tip", "Stop sharing audio (%{source})", &[("source", name)])),
-            (None, Some(_)) => (Tone::Off, tr("ui.bar.share_audio", "Share audio")),
-            (None, None) => (Tone::Off, format!("{}\n{}", tr("ui.bar.share_audio", "Share audio"), tr("ui.bar.share_audio_first", "Share a screen first; audio rides along with it"))),
+        // --- Share audio: a share of its own, no screen needed (task I7, D1). One click turns Desktop audio
+        // on, the next turns it off; the arrow opens the source list and "All audio settings…". ---
+        let cur = share::audio_current(cx, room);
+        let (tone, tip) = match &cur {
+            Some(name) => (Tone::On, tr_with("ui.bar.stop_audio_tip", "Stop sharing audio (%{source})", &[("source", name)])),
+            None => (Tone::Off, tr("ui.bar.share_desktop_audio", "Share desktop audio")),
         };
         let rect = Rect::from_min_size(pos2(bx, by), vec2(SPLIT_W, BTN_H));
         let icon = if cur.is_some() { "music_note" } else { "music_off" };
-        let enabled = capture.is_some() && !matches!(state, ShareState::Picking { .. });
-        let (main, caret) = split(ui, rect, &Split { name: "audio", icon, tone, enabled, tip: &tip, caret_tip: &tr("ui.bar.audio_caret", "Pick an audio source"), open: open(cx, BarMenu::Audio) });
-        if let (Some(capture), true) = (capture, main || caret) {
-            if main && cur.is_some() {
-                cx.act(UiAction::StopSharingAudio { capture });
+        let (main, caret) = split(ui, rect, &Split { name: "audio", icon, tone, enabled: true, tip: &tip, caret_tip: &tr("ui.bar.audio_caret", "Pick an audio source"), open: open(cx, BarMenu::Audio) });
+        if main {
+            if cur.is_some() {
+                cx.act(UiAction::StopSharingAudio { room });
             } else {
-                cx.toggle_popover(PopoverKind::Bar(BarMenu::Audio), rect);
+                cx.act(UiAction::ShareAudio { room, choice: AudioChoice::Desktop });
             }
+        } else if caret {
+            cx.toggle_popover(PopoverKind::Bar(BarMenu::Audio), rect);
         }
         bx += SPLIT_W + GROUP_GAP;
         // --- Webcam: present, disabled until I8 (the arrow will offer the camera and "All webcam settings…") ---

@@ -1007,6 +1007,39 @@ async fn the_stage_bar_menus_and_fullscreen_draw_at_every_window_size() {
     assert!(app.nav.stage_fullscreen.is_none());
 }
 
+/// Task I7: the audio settings menu draws; the exclusion list is saved, hides matching sources from every list, and
+/// an entry removed brings them back; a saved empty list stays empty.
+#[tokio::test]
+async fn the_audio_settings_menu_draws_and_the_exclusion_list_filters_the_source_lists() {
+    use simple_screensharing_client::audio::{AudioGroup, AudioSource};
+    let _home = isolated_home();
+    let mut app = app_with_rooms(&[]);
+    let ctx = ctx();
+    let src = |id: u32, name: &str, group| AudioSource { id, name: name.to_string(), serial: Some(u64::from(id)), group, aliases: vec![name.to_string()] };
+    app.state.set_audio_sources(vec![src(1, "Skill Up!.exe", AudioGroup::Games), src(2, "Discord", AudioGroup::VoiceChat), src(3, "Firefox", AudioGroup::Browsers)]);
+    let names = |app: &App| app.state.audio_sources.iter().map(|s| s.name.clone()).collect::<Vec<_>>();
+    assert_eq!(names(&app), vec!["Skill Up!.exe", "Firefox"], "Discord is on the default list: off every source list");
+    assert_eq!(app.state.audio_exclusions.get(), vec!["Discord", "TeamSpeak"]);
+
+    app.apply(&ctx, UiAction::OpenModal(Modal::AudioSettings { room: RoomHandle(1) }));
+    let size = egui::vec2(1280.0, 800.0);
+    frame(&mut app, &ctx, size);
+    frame(&mut app, &ctx, size);
+    app.apply(&ctx, UiAction::OpenPopover(Popover { kind: PopoverKind::AudioExclude, anchor: Rect::from_min_size(egui::pos2(700.0, 500.0), egui::vec2(70.0, 32.0)) }));
+    frame(&mut app, &ctx, size);
+    frame(&mut app, &ctx, size);
+
+    // Any case, any part of the name; blanks and duplicates are dropped.
+    app.apply(&ctx, UiAction::SetAudioExclusions(vec!["  fire".into(), "".into(), "FIRE".into()]));
+    assert_eq!(app.state.audio_exclusions.get(), vec!["fire"]);
+    assert_eq!(names(&app), vec!["Skill Up!.exe", "Discord"], "Discord is back, Firefox is gone");
+    assert!(simple_screensharing_client::rooms::AppSettings::load().audio_exclusions == vec!["fire".to_string()], "saved");
+    app.apply(&ctx, UiAction::SetAudioExclusions(vec![]));
+    assert_eq!(names(&app).len(), 3);
+    assert!(simple_screensharing_client::rooms::AppSettings::load().audio_exclusions.is_empty(), "an empty list stays empty");
+    frame(&mut app, &ctx, size);
+}
+
 /// "Watched streams" is the stage even with nothing watched, and a frame of it draws (the note) without
 /// touching anything; the welcome view is not a stage.
 #[tokio::test]
@@ -1027,7 +1060,7 @@ async fn watched_streams_is_a_stage_and_the_welcome_view_is_not() {
 /// #135: the Boost slider's mid-drag action is live and unsaved, the release saves.
 #[test]
 fn the_boost_slider_previews_while_the_pointer_is_down_and_saves_on_release() {
-    use super::modals::boost_action;
+    use super::audio_settings::boost_action;
     assert!(boost_action(1.5, 1.0, false).is_some_and(|a| matches!(a, UiAction::PreviewAudioGain(g) if g == 1.5)));
     assert!(boost_action(1.5, 1.5, false).is_none(), "nothing new to apply");
     assert!(boost_action(1.5, 1.5, true).is_some_and(|a| matches!(a, UiAction::SetAudioGain(g) if g == 1.5)), "saved even though already applied");
@@ -1060,26 +1093,38 @@ fn level_toggle_reports_a_click_only_on_the_button() {
 }
 
 /// #115: after an audio source switch the old share is `Stopping` for a second
-/// or more, and both audio captures point at the video capture. The bar must
-/// follow the new one (its level, its mute), not the dying one.
+/// or more, and both audio captures send into the room. The bar must follow the
+/// new one (its level, its mute), not the dying one.
 #[test]
 fn the_bar_follows_the_live_audio_share_not_the_stopping_one() {
-    use simple_screensharing_client::session::{LocalCapture, ShareStatus};
-    let audio = |status: ShareStatus, label: &str| LocalCapture {
+    use simple_screensharing_client::session::{AUDIO_DESTINATION_PARAMS, Destination, DestinationId, LocalCapture, ShareStatus};
+    let room = RoomHandle(3);
+    let audio = |status: ShareStatus, label: &str, room: RoomHandle| LocalCapture {
         kind: StreamKind::Audio,
         label: label.to_string(),
         status,
-        audio_for_capture: Some(CaptureSourceId(10)),
-        destinations: Default::default(),
+        audio_for_capture: None,
+        destinations: indexmap::IndexMap::from([(
+            DestinationId(label.len() as u32),
+            Destination {
+                room,
+                stream_id: 0,
+                params: AUDIO_DESTINATION_PARAMS,
+                runtime: None,
+                pending: None,
+                edit: Destination::edit_from(AUDIO_DESTINATION_PARAMS),
+                apply_rx: None,
+            },
+        )]),
     };
     let (_tx_old, rx_old) = tokio::sync::oneshot::channel();
     let (_tx_new, rx_new) = tokio::sync::oneshot::channel();
     let mut state = AppState::default();
-    state.captures.insert(CaptureSourceId(20), audio(ShareStatus::Stopping(rx_old), "old"));
-    assert_eq!(paired_audio(&state, CaptureSourceId(10)), Some(CaptureSourceId(20)), "a lone stopping share is still shown");
-    state.captures.insert(CaptureSourceId(21), audio(ShareStatus::Starting(rx_new), "new"));
-    assert_eq!(paired_audio(&state, CaptureSourceId(10)), Some(CaptureSourceId(21)));
-    assert_eq!(paired_audio(&state, CaptureSourceId(99)), None);
+    state.captures.insert(CaptureSourceId(20), audio(ShareStatus::Stopping(rx_old), "old", room));
+    assert_eq!(state.audio_share_in(room), Some(CaptureSourceId(20)), "a lone stopping share is still shown");
+    state.captures.insert(CaptureSourceId(21), audio(ShareStatus::Starting(rx_new), "newer", room));
+    assert_eq!(state.audio_share_in(room), Some(CaptureSourceId(21)));
+    assert_eq!(state.audio_share_in(RoomHandle(99)), None, "another room has none");
 }
 
 // ---------------------------------------------------------------------------

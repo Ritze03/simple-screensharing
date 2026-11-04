@@ -24,7 +24,8 @@
 //!   recently saved room. `Why:` the lib keeps no "last server" setting, and
 //!   the newest saved room is the last server the user created or joined on.
 //! - **Settings** (`Modal::Settings`, 640): cards Profile / Language / Display /
-//!   Playback / Shared audio (boost slider + calibration, task #114) / Diagnostics (copy or save the in-memory log, `logbuf`; opt-in upload to the relay). Text and
+//!   Playback / Diagnostics (copy or save the in-memory log, `logbuf`; opt-in upload to the relay). The Boost
+//!   slider (task #114) left for the audio settings menu (`audio_settings.rs`, task I7). Text and
 //!   sliders are buffered and pushed when the edit settles
 //!   (focus lost, pointer released), not every frame of a drag, since each
 //!   setter writes `settings.toml`.
@@ -34,12 +35,11 @@
 
 
 use egui::{Align, Rect, Sense, Stroke, Ui, vec2};
-use simple_screensharing_client::audio_gain;
 use simple_screensharing_client::net::{ServerAddrError, parse_join_string, parse_server_addr};
 use simple_screensharing_client::rooms::{AppSettings, PresentationMode};
 use simple_screensharing_client::session::RoomHandle;
 
-use super::{Cx, Modal, ShareState, UiAction, drive_dump, menu, tr, tr_with};
+use super::{Cx, Modal, ShareState, UiAction, menu, tr, tr_with};
 use crate::theme::{self, Weight, font};
 use crate::widgets::{self, BannerKind, Btn, FooterClick, ModalSpec};
 
@@ -77,13 +77,6 @@ pub struct ModalsState {
     display_name: String,
     jitter_s: f32,
     catch_up: u32,
-    /// Audio boost slider, in dB (task #114; `audio_gain::gain_to_db` of the setting).
-    gain_db: f32,
-    /// The setting `gain_db` was last in step with: when the state moves away from it by
-    /// something other than our own push, the slider follows.
-    gain_seen: f64,
-    /// The slider was edited and not pushed yet (pushed once the pointer is released).
-    gain_dirty: bool,
     // rename
     rename: String,
     // choose name
@@ -117,9 +110,6 @@ impl ModalsState {
                 self.display_name = cx.state.display_name.clone();
                 self.jitter_s = cx.state.max_jitter_buffer_ms as f32 / 1000.0;
                 self.catch_up = cx.state.catch_up_speed_percent;
-                self.gain_db = audio_gain::gain_to_db(cx.state.audio_gain) as f32;
-                self.gain_seen = cx.state.audio_gain;
-                self.gain_dirty = false;
             }
             Modal::ChooseName => {
                 self.choose_name = cx.state.display_name.clone();
@@ -211,7 +201,7 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState, modal: &Moda
         }
         Modal::Rename { room } => rename(ctx, cx, st, room),
         Modal::ChooseName => choose_name(ctx, cx, st),
-        Modal::StreamSettings { .. } => {}
+        Modal::StreamSettings { .. } | Modal::AudioSettings { .. } => {}
     }
 }
 
@@ -641,7 +631,6 @@ fn settings(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
                     cx.act(UiAction::SetLevelLoudness(level));
                 }
             });
-            audio_card(ui, cx, st);
             widgets::card(ui, &tr("ui.settings.logs_card", "Diagnostics"), None, |ui| {
                 let copy = tr("ui.settings.logs_copy", "Copy to clipboard");
                 let save = tr("ui.settings.logs_save", "Save to file…");
@@ -711,64 +700,9 @@ fn settings(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
     if settled && st.catch_up != cx.state.catch_up_speed_percent {
         cx.act(UiAction::SetCatchUpSpeed(st.catch_up));
     }
-    // The boost slider (#135): applied to the running shares on every changed frame of the drag
-    // (the user wants to hear the level while choosing it), saved once the pointer is released.
-    if st.gain_dirty {
-        let gain = audio_gain::clamp_gain(audio_gain::db_to_gain(st.gain_db as f64));
-        if let Some(a) = boost_action(gain, cx.state.audio_gain, settled) {
-            cx.act(a);
-        }
-        if settled {
-            st.gain_dirty = false;
-            st.gain_seen = gain;
-        }
-    }
     if closing {
         cx.act(UiAction::CloseModal);
     }
-}
-
-/// What the Boost slider pushes this frame (#135): while the pointer is down a live, unsaved
-/// [`UiAction::PreviewAudioGain`] whenever the value moved; once settled one [`UiAction::SetAudioGain`]
-/// that saves it (always, because the previews already made `applied` equal to `gain`).
-pub(super) fn boost_action(gain: f64, applied: f64, settled: bool) -> Option<UiAction> {
-    if settled {
-        Some(UiAction::SetAudioGain(gain))
-    } else if (gain - applied).abs() > 1e-9 {
-        Some(UiAction::PreviewAudioGain(gain))
-    } else {
-        None
-    }
-}
-
-/// The "Shared audio" card (task #114): the sender-side boost slider, 50-200 % (#119).
-///
-/// `Why the slider is in dB:` each doubling is the same distance and 100 % sits in the middle of
-/// the track (-6 dB .. +6 dB). The value shown is still the percent, because that is what the
-/// viewers' volume sliders and the user's own words ("a volume multiplier") use.
-fn audio_card(ui: &mut Ui, cx: &mut Cx, st: &mut ModalsState) {
-    let state = cx.state;
-    // Follow the state when something else changed it.
-    if !st.gain_dirty && (state.audio_gain - st.gain_seen).abs() > 1e-9 {
-        st.gain_db = audio_gain::gain_to_db(state.audio_gain) as f32;
-        st.gain_seen = state.audio_gain;
-    }
-    widgets::card(ui, &tr("ui.settings.audio_card", "Shared audio"), None, |ui| {
-        let percent = format!("{}%", (audio_gain::db_to_gain(st.gain_db as f64) * 100.0).round());
-        let (r, _) = widgets::ctrl_row_value(
-            ui,
-            &tr("ui.settings.audio_boost", "Boost"),
-            Some(&tr(
-                "ui.settings.audio_boost_tip",
-                "Makes the audio you share louder (or quieter) before it is sent, up to 200%. A limiter keeps the loud peaks from distorting. 100% leaves it as it is. Applies to a share that is already running. Viewers level the loudness themselves, so you rarely need this.",
-            )),
-            |ui| widgets::slider(ui, &mut st.gain_db, audio_gain::gain_db_range(), 0.5),
-            |ui| widgets::value_box(ui, &percent),
-        );
-        drive_dump::rect(|| "settings.boost".into(), r.rect);
-        drive_dump::line(|| format!("boost {percent}"));
-        st.gain_dirty |= r.changed();
-    });
 }
 
 // ---------------------------------------------------------------------------
@@ -800,6 +734,10 @@ fn leave_warnings(cx: &Cx, room: RoomHandle) -> Vec<String> {
             ));
         }
         out.push(s);
+    }
+    // Audio is a share of its own (task I7): leaving stops it too.
+    if cx.audio_share(room).is_some() {
+        out.push(tr("ui.modal.warn_audio_stops", "Your audio to %{room} stops.").replace("%{room}", &name));
     }
     let watching = cx
         .shares_in(room)

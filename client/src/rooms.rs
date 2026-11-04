@@ -451,6 +451,12 @@ pub struct AppSettings {
     /// (spec §9.2). An old settings file without the key gets none.
     #[serde(default)]
     pub emoji: String,
+    /// Audio settings > Desktop audio > Exclude (task I7): texts matched against source names, ignoring
+    /// case. A source whose name contains one stays out of desktop audio and off every source list.
+    /// A file from before the setting gets Discord and TeamSpeak (voice chat must not end up in a
+    /// share); an empty list that was saved stays empty, so the user can remove both.
+    #[serde(default = "AppSettings::default_audio_exclusions")]
+    pub audio_exclusions: Vec<String>,
 }
 
 /// See [`AppSettings::start_stream_defaults`].
@@ -528,6 +534,7 @@ impl Default for AppSettings {
             audio_gain: Self::default_audio_gain(),
             level_loudness: true,
             emoji: String::new(),
+            audio_exclusions: Self::default_audio_exclusions(),
         }
     }
 }
@@ -535,6 +542,11 @@ impl Default for AppSettings {
 impl AppSettings {
     fn default_level_loudness() -> bool {
         true
+    }
+
+    /// Voice chat that must not end up in a share by default.
+    pub fn default_audio_exclusions() -> Vec<String> {
+        vec!["Discord".to_string(), "TeamSpeak".to_string()]
     }
 
     fn default_audio_gain() -> f64 {
@@ -906,6 +918,7 @@ mod tests {
             audio_gain: 1.5,
             level_loudness: false,
             emoji: "🦊".to_string(),
+            audio_exclusions: vec!["Teams".to_string()],
         };
         let toml_str = toml::to_string_pretty(&settings).unwrap();
         let parsed: AppSettings = toml::from_str(&toml_str).unwrap();
@@ -921,7 +934,20 @@ mod tests {
         assert_eq!(parsed.audio_gain, 1.5);
         assert!(!parsed.level_loudness);
         assert_eq!(parsed.emoji, "🦊");
+        assert_eq!(parsed.audio_exclusions, vec!["Teams".to_string()]);
         assert!(toml_str.contains("audio_gain = 1.5\n"), "stored readably: {toml_str}");
+    }
+
+    /// Task I7: a file from before the exclusion list gets Discord and TeamSpeak; a saved empty list stays empty.
+    #[test]
+    fn audio_exclusions_default_to_voice_chat_and_an_empty_list_stays_empty() {
+        let old: AppSettings = toml::from_str("language = \"de\"\n").unwrap();
+        assert_eq!(old.audio_exclusions, vec!["Discord".to_string(), "TeamSpeak".to_string()]);
+        let empty: AppSettings = toml::from_str("audio_exclusions = []\n").unwrap();
+        assert!(empty.audio_exclusions.is_empty());
+        let round: AppSettings = toml::from_str(&toml::to_string_pretty(&empty).unwrap()).unwrap();
+        assert!(round.audio_exclusions.is_empty(), "an empty list survives a save and a load");
+        assert_eq!(AppSettings::default().audio_exclusions, old.audio_exclusions);
     }
 
     /// #106: a settings file from before emoji avatars loads with none, and none is not written as junk.
