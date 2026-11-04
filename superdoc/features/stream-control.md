@@ -335,11 +335,11 @@ the self-preview branch.
 *Why (user request 2026-10-15):* "For the sharer, it should show a stream preview, while he is tabbed into
 the program. Otherwise, its fine to hide it." Design, code map and the appsink `async=false` trap:
 `superdoc/features/self-preview.md`. In short: one valve-gated tee branch per capture
-(`capture.rs` `live_branch`, `LivePreview`, `CaptureHandle::set_live_preview`), <= 640x360 at <= 30 fps RGBA,
+(`capture.rs` `live_branch`, `LivePreview`, `CaptureHandle::set_live_preview`), <= 1920x1080 at <= 30 fps BGRA (was 640x360 until 2026-11-04, task #132; the new size and its cost table are in `self-preview.md`),
 open only while the egui window is focused and the own tile was painted within 0.6 s; closed it is a pad call
 and an unref per frame. The encode branches are not touched.
 
-**Measured cost (2026-10-15, headless rig, stock xdpw, GPU domain, H.265 240 fps balanced, `vkcube` at 240 Hz; the
+**Measured cost at the old 640x360 size (history; 1080p numbers: `self-preview.md`) (2026-10-15, headless rig, stock xdpw, GPU domain, H.265 240 fps balanced, `vkcube` at 240 Hz; the
 sharer window focused or not by `swaymsg '[pid=..] focus'` with a held `wtype` giving the seat a keyboard, see below):**
 
 | state | viewer tooltip, 3 samples (decoded / shown fps, dropped) | sharer process CPU (`top`, 3 s) | live branch sink counter |
