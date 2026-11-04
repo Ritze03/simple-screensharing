@@ -63,7 +63,7 @@ use crate::capture::{self, CaptureHandle, DestKey};
 use crate::decode::{self, AudioDecoder, PreviewCache, StreamDecoder};
 use crate::net::{ClientEvent, CloseCause, PresenceSnapshotState, ScreenshareClient};
 use crate::protocol::{ConnId, Member, PresenceEvent, StreamId, StreamInfo, StreamKind};
-use crate::rooms::{AppSettings, BandwidthMode, PresentationMode, RoomStore, StartStreamDefaults};
+use crate::rooms::{AppSettings, BandwidthMode, PresentationMode, RoomStore, StartStreamDefaults, WebcamSettings};
 
 pub type ConnectResult = Result<(ScreenshareClient, PresenceSnapshotState, mpsc::UnboundedReceiver<ClientEvent>), ConnectError>;
 
@@ -623,6 +623,23 @@ pub struct LocalCapture {
 }
 
 impl LocalCapture {
+    /// Whether this is a webcam share (task I8): a video capture labelled [`capture::webcam::LABEL`]. *Why the
+    /// label and not a field:* it is the one rule every client side uses for a webcam (plan D7), and a
+    /// capture is only ever built here (`start_webcam_now`) with that label.
+    pub fn is_webcam(&self) -> bool {
+        self.kind == StreamKind::Video && capture::webcam::is_webcam_label(&self.label)
+    }
+
+    /// The label this capture's streams carry on the wire: "Screen" or [`capture::webcam::LABEL`] for video, the
+    /// source's name for audio.
+    pub fn wire_label(&self) -> String {
+        match (self.kind, self.is_webcam()) {
+            (StreamKind::Video, true) => capture::webcam::LABEL.to_string(),
+            (StreamKind::Video, false) => "Screen".to_string(),
+            (StreamKind::Audio, _) => self.label.clone(),
+        }
+    }
+
     /// The lifecycle state to *show* for `dest`, folding in this capture's
     /// own start/stop status.
     ///
@@ -750,6 +767,16 @@ pub fn effective_gain(volume_percent: u32, muted: bool) -> f64 {
 }
 
 /// The `stream_id` of `owner`'s announced audio stream in `streams`, if any.
+pub fn owner_has_video_in(streams: &[StreamInfo], owner: ConnId) -> bool {
+    streams.iter().any(|s| s.owner == owner && s.kind == StreamKind::Video && !capture::webcam::is_webcam_label(&s.label))
+}
+
+/// Whether `(owner, stream_id)` is a webcam stream (its label starts with `Webcam`, plan D7): audio does not follow
+/// its watch.
+pub fn is_webcam_stream_in(streams: &[StreamInfo], owner: ConnId, stream_id: StreamId) -> bool {
+    streams.iter().any(|s| s.owner == owner && s.stream_id == stream_id && capture::webcam::is_webcam_label(&s.label))
+}
+
 pub fn sibling_audio_stream_in(streams: &[StreamInfo], owner: ConnId) -> Option<StreamId> {
     streams.iter().find(|s| s.owner == owner && s.kind == StreamKind::Audio).map(|s| s.stream_id)
 }
@@ -1178,8 +1205,12 @@ impl RoomSession {
     /// decide whether an audio stream gets its own "Listen" row in the
     /// Streams list (only audio-only senders do; a sender with video has
     /// their audio auto-subscribed via `toggle_watch` instead).
+    ///
+    /// A webcam (task I8) does not count: it carries no audio, so a sender with only a webcam and an audio share
+    /// has their audio as an audio-only share, with its own Listen button, not as the sound of a picture you
+    /// cannot watch it with.
     pub fn owner_has_video(&self, owner: ConnId) -> bool {
-        self.streams.iter().any(|s| s.owner == owner && s.kind == StreamKind::Video)
+        owner_has_video_in(&self.streams, owner)
     }
 
     /// How many *other* people are streaming into this room right now — the
@@ -1344,7 +1375,13 @@ impl RoomSession {
         let mut desired: Vec<(ConnId, StreamId)> = Vec::new();
         {
             let mut watches = self.watches.lock().unwrap();
-            for (&(owner, _), entry) in watches.iter_mut() {
+            for (&(owner, stream), entry) in watches.iter_mut() {
+                // A webcam brings no audio along (task I8): the sound belongs to the screen, and a viewer who
+                // only watches the camera does not get it forced on them, with no volume control to turn down.
+                if is_webcam_stream_in(&self.streams, owner, stream) {
+                    entry.audio_stream_id = None;
+                    continue;
+                }
                 let sibling = self.streams.iter().find(|s| s.owner == owner && s.kind == StreamKind::Audio).map(|s| s.stream_id);
                 entry.audio_stream_id = sibling;
                 if let Some(stream_id) = sibling
@@ -1670,6 +1707,18 @@ pub struct AppState {
     /// Settings > Profile (persisted): this person's emoji avatar, "" = none. Sent to every
     /// room's relay; see [`AppState::set_emoji`] and `rooms::AppSettings::emoji`.
     pub emoji: String,
+    /// The webcam menu's choices (persisted, task I8): camera, mode, codec, bitrate. See
+    /// [`rooms::WebcamSettings`](crate::rooms::WebcamSettings).
+    pub webcam: WebcamSettings,
+    /// The cameras the last listing found ([`AppState::refresh_webcams`]).
+    pub webcams: Vec<capture::webcam::Camera>,
+    /// In-flight camera listing. It runs on a blocking thread: the device monitor opens every device.
+    webcams_rx: Option<oneshot::Receiver<Vec<capture::webcam::Camera>>>,
+    /// Whether the first listing was asked for (the UI asks once it draws a bar).
+    pub webcams_requested: bool,
+    /// A webcam start that waits for the running or stopping webcam to be gone first (a camera can be opened
+    /// once): the room it goes to. Started by [`AppState::poll_capture_states`].
+    webcam_start_after_stop: Option<RoomHandle>,
     /// Rate limiting, hysteresis and last-allocation bookkeeping for
     /// Absolute-Maximum mode. Never persisted: it describes this session's
     /// live encoders.
@@ -1921,6 +1970,11 @@ impl Default for AppState {
             audio_gain: settings.audio_gain(),
             level_loudness: settings.level_loudness,
             emoji: settings.emoji,
+            webcam: settings.webcam,
+            webcams: Vec::new(),
+            webcams_rx: None,
+            webcams_requested: false,
+            webcam_start_after_stop: None,
             bandwidth: BandwidthController::new(),
             pending_destinations: Vec::new(),
             recoveries: IndexMap::new(),
@@ -2034,6 +2088,15 @@ pub fn save_emoji(emoji: &str) {
     settings.emoji = emoji.to_string();
     if let Err(e) = settings.save() {
         tracing::warn!("failed to save the emoji avatar: {e:#}");
+    }
+}
+
+/// Persist the webcam menu's choices (task I8).
+pub fn save_webcam_settings(webcam: &WebcamSettings) {
+    let mut settings = AppSettings::load();
+    settings.webcam = webcam.clone();
+    if let Err(e) = settings.save() {
+        tracing::warn!("failed to save the webcam settings: {e:#}");
     }
 }
 
@@ -2712,9 +2775,12 @@ impl AppState {
                     // broadcast would have carried, since the relay never
                     // echoes it back to the connection that announced it. See
                     // `RoomSession::note_stream_started`'s doc comment.
-                    if let Some(dest) =
-                        self.captures.get(&pending.capture_id).and_then(|c| c.destinations.get(&pending.destination_id))
+                    if let Some((capture, dest)) = self
+                        .captures
+                        .get(&pending.capture_id)
+                        .and_then(|c| c.destinations.get(&pending.destination_id).map(|d| (c, d)))
                     {
+                        let label = capture.wire_label();
                         let stream_id = dest.stream_id;
                         let (width, height) = (dest.params.width as u16, dest.params.height as u16);
                         if let Some(room) = self.rooms.get_mut(&pending.room) {
@@ -2723,7 +2789,7 @@ impl AppState {
                                 owner,
                                 stream_id,
                                 kind: StreamKind::Video,
-                                label: "Screen".to_string(),
+                                label,
                                 width,
                                 height,
                             });
@@ -3523,10 +3589,7 @@ impl AppState {
                         // note_stream_started`'s doc comment for why nothing
                         // else ever will.
                         for dest in capture.destinations.values() {
-                            let label = match capture.kind {
-                                StreamKind::Video => "Screen".to_string(),
-                                StreamKind::Audio => capture.label.clone(),
-                            };
+                            let label = capture.wire_label();
                             let (width, height) = if capture.kind == StreamKind::Video {
                                 (dest.params.width as u16, dest.params.height as u16)
                             } else {
@@ -3577,6 +3640,7 @@ impl AppState {
                 self.forget_destinations_of(&capture);
             }
         }
+        self.poll_webcam_start();
     }
 
     // -----------------------------------------------------------------
@@ -3599,19 +3663,23 @@ impl AppState {
     /// [`Self::poll_capture_recovery`] with the clock injected (tests).
     pub fn poll_capture_recovery_at(&mut self, now: Instant) {
         // 1. Captures whose source just died.
-        let lost: Vec<(CaptureSourceId, String, u32, Option<String>)> = self
+        let lost: Vec<(CaptureSourceId, String, u32, Option<String>, bool)> = self
             .captures
             .iter()
             .filter(|(id, _)| !self.recoveries.contains_key(*id) && !self.recovery_gave_up.contains(*id))
             .filter_map(|(id, c)| match &c.status {
                 ShareStatus::Active(ShareHandle::Video(h)) => {
-                    h.source_lost().map(|reason| (*id, reason, h.source_caps().framerate, h.restore_token()))
+                    h.source_lost().map(|reason| (*id, reason, h.source_caps().framerate, h.restore_token(), c.is_webcam()))
                 }
                 _ => None,
             })
             .collect();
-        for (capture_id, reason, framerate, restore_token) in lost {
-            self.begin_recovery(capture_id, reason, framerate, restore_token, now);
+        for (capture_id, reason, framerate, restore_token, webcam) in lost {
+            if webcam {
+                self.end_lost_webcam(capture_id, reason);
+            } else {
+                self.begin_recovery(capture_id, reason, framerate, restore_token, now);
+            }
         }
 
         // 2. Advance every recovery.
@@ -3831,6 +3899,194 @@ impl AppState {
                 }
             });
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Webcam (task I8)
+    // -----------------------------------------------------------------
+
+    /// Kick off a camera listing (`capture::webcam::list_cameras`) on a blocking thread. The result lands in
+    /// [`Self::webcams`] through [`Self::poll_webcams`]. Asked once by the bar and again whenever the webcam
+    /// menu opens (a camera may have been plugged in).
+    pub fn refresh_webcams(&mut self) {
+        self.webcams_requested = true;
+        if self.webcams_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = oneshot::channel();
+        self.webcams_rx = Some(rx);
+        tokio::spawn(async move {
+            let cams = tokio::task::spawn_blocking(capture::webcam::list_cameras).await.unwrap_or_default();
+            let _ = tx.send(cams);
+        });
+    }
+
+    /// Whether a camera listing is running now.
+    pub fn webcams_listing(&self) -> bool {
+        self.webcams_rx.is_some()
+    }
+
+    /// Take a finished camera listing in. Call once per frame.
+    pub fn poll_webcams(&mut self) {
+        let Some(rx) = &mut self.webcams_rx else { return };
+        match rx.try_recv() {
+            Ok(cams) => {
+                self.webcams = cams;
+                self.webcams_rx = None;
+            }
+            Err(oneshot::error::TryRecvError::Empty) => {}
+            Err(oneshot::error::TryRecvError::Closed) => self.webcams_rx = None,
+        }
+    }
+
+    /// The camera and mode the saved choice stands for in the current listing ([`capture::webcam::resolve`]).
+    pub fn webcam_choice(&self) -> Option<(usize, usize)> {
+        capture::webcam::resolve(&self.webcams, &self.webcam.camera, &self.webcam.mode)
+    }
+
+    /// What a webcam share would start with now.
+    pub fn webcam_spec(&self) -> Option<capture::webcam::Spec> {
+        let (c, m) = self.webcam_choice()?;
+        let cam = &self.webcams[c];
+        Some(capture::webcam::Spec { device: cam.device.clone(), mode: cam.modes[m].clone() })
+    }
+
+    /// Our running webcam (not one that is stopping) and the room it goes to. At most one: a camera can be
+    /// opened once.
+    pub fn webcam_share(&self) -> Option<(CaptureSourceId, RoomHandle)> {
+        self.captures
+            .iter()
+            .filter(|(_, c)| c.is_webcam() && !matches!(c.status, ShareStatus::Stopping(_)))
+            .find_map(|(id, c)| c.destinations.values().next().map(|d| (*id, d.room)))
+    }
+
+    /// Start (or move) the webcam share into `room_handle`: its own capture, no screen share needed (the plan's
+    /// "own room"). Moving it from another room stops the running one first, and any start waits until no
+    /// webcam capture is left, because a camera can only be opened once ([`Self::poll_webcam_start`]).
+    /// `Err` is a message for the user: no `v4l2src`, not Linux, no camera.
+    pub fn start_webcam(&mut self, room_handle: RoomHandle) -> Result<(), String> {
+        match capture::webcam::unavailable() {
+            Some(capture::webcam::Unavailable::Platform) => return Err(t!("errors.webcam_platform").to_string()),
+            Some(capture::webcam::Unavailable::NoPlugin) => return Err(t!("errors.webcam_no_plugin").to_string()),
+            None => {}
+        }
+        if self.webcam_spec().is_none() {
+            return Err(t!("errors.webcam_none_found").to_string());
+        }
+        if !self.rooms.contains_key(&room_handle) {
+            return Ok(());
+        }
+        if let Some((running, _)) = self.webcam_share() {
+            self.stop_share(running);
+        }
+        self.webcam_start_after_stop = Some(room_handle);
+        self.poll_webcam_start();
+        Ok(())
+    }
+
+    /// Stop the webcam share, and a start that was waiting.
+    pub fn stop_webcam(&mut self) {
+        self.webcam_start_after_stop = None;
+        if let Some((running, _)) = self.webcam_share() {
+            self.stop_share(running);
+        }
+    }
+
+    /// A webcam start that was waiting for the old webcam capture to finish stopping goes ahead once none is left.
+    fn poll_webcam_start(&mut self) {
+        let Some(room) = self.webcam_start_after_stop else { return };
+        if self.captures.values().any(LocalCapture::is_webcam) {
+            return;
+        }
+        self.webcam_start_after_stop = None;
+        if let Some(spec) = self.webcam_spec() {
+            self.start_webcam_now(room, spec);
+        }
+    }
+
+    /// The webcam capture of `spec` with its one destination in `room_handle`, started in the background
+    /// (modelled on [`Self::start_video_share`]: the destination exists from the start and goes `Starting` until
+    /// the first keyframe). Tune and keyframe interval are fixed ([`capture::EncodeChoice::webcam`]).
+    fn start_webcam_now(&mut self, room_handle: RoomHandle, spec: capture::webcam::Spec) {
+        let capture_id = self.alloc_capture_id();
+        let destination_id = self.alloc_destination_id();
+        let Some(room) = self.rooms.get_mut(&room_handle) else { return };
+        let stream_id = room.next_stream_id;
+        room.next_stream_id = room.next_stream_id.wrapping_add(1);
+        room.destinations.push(destination_id);
+        let client = room.client.clone();
+
+        let (bitrate_kbps, codec) = (self.webcam.bitrate_kbps, self.webcam.codec);
+        let encode = capture::EncodeChoice::webcam(codec);
+        let params = capture::destination::VideoParams {
+            width: spec.mode.width,
+            height: spec.mode.height,
+            framerate: spec.mode.framerate(),
+            bitrate_kbps,
+            backend: capture::EncoderBackend::default(),
+            tune: encode.tune,
+            quality_level: encode.quality_level,
+            gop_millis: encode.gop_millis,
+            codec,
+        };
+        let (tx, rx) = oneshot::channel();
+        self.captures.insert(
+            capture_id,
+            LocalCapture {
+                kind: StreamKind::Video,
+                label: capture::webcam::LABEL.to_string(),
+                status: ShareStatus::Starting(rx),
+                audio_for_capture: None,
+                destinations: IndexMap::from([(
+                    destination_id,
+                    Destination { room: room_handle, stream_id, params, runtime: None, pending: None, edit: Destination::edit_from(params), apply_rx: None },
+                )]),
+            },
+        );
+        self.share_error = None;
+        tokio::spawn(async move {
+            #[cfg(target_os = "linux")]
+            let result = capture::start_webcam_sharing(&client, stream_id, DestKey(destination_id.0), &spec, bitrate_kbps, codec)
+                .await
+                .map(ShareHandle::Video)
+                .map_err(|e| start_error_string(&e));
+            #[cfg(not(target_os = "linux"))]
+            let result: Result<ShareHandle, String> = {
+                let _ = (&client, &spec, bitrate_kbps);
+                Err(t!("errors.webcam_platform").to_string())
+            };
+            let _ = tx.send(result);
+        });
+    }
+
+    /// The webcam menu's choices changed. Saves them; a running webcam follows: another camera or mode restarts it
+    /// in the same room (a different capture), another codec or bitrate is a live change of its destination.
+    pub fn set_webcam_settings(&mut self, new: WebcamSettings) {
+        let old = std::mem::replace(&mut self.webcam, new.clone());
+        save_webcam_settings(&new);
+        let Some((capture_id, room)) = self.webcam_share() else { return };
+        if old.camera != new.camera || old.mode != new.mode {
+            if let Err(e) = self.start_webcam(room) {
+                note_share_error(&mut self.share_error, e);
+            }
+            return;
+        }
+        let dests: Vec<(DestinationId, DestEdit)> =
+            self.captures.get(&capture_id).map(|c| c.destinations.iter().map(|(id, d)| (*id, d.edit)).collect()).unwrap_or_default();
+        for (id, edit) in dests {
+            if edit.codec != new.codec || edit.bitrate_kbps != new.bitrate_kbps {
+                self.edit_destination(id, DestEdit { codec: new.codec, bitrate_kbps: new.bitrate_kbps, ..edit });
+            }
+        }
+    }
+
+    /// A webcam whose source died (unplugged, taken by another program): the share ends and the user is told,
+    /// instead of the portal-style restart loop a screen capture gets (a camera that is gone does not come back by
+    /// itself, and nothing here could pick another one for the user).
+    fn end_lost_webcam(&mut self, capture_id: CaptureSourceId, reason: String) {
+        tracing::warn!("webcam {capture_id:?} lost ({reason}); ending the share");
+        self.stop_share(capture_id);
+        note_share_error(&mut self.share_error, t!("errors.webcam_lost", reason = reason).to_string());
     }
 
     /// Kick off (or re-kick-off) an `audio::list_audio_sources()` call on
@@ -6150,6 +6406,73 @@ mod ui_ops_tests {
             other => panic!("expected Failed, got {other:?}"),
         }
         assert!(state.share_error.is_some(), "the user is told");
+    }
+
+    /// Task I8, "a camera unplugged mid-share should end the webcam share cleanly with a toast, not a portal restart
+    /// loop": a webcam whose source died is stopped (its destination released at once, the room told), no recovery
+    /// is started for it, and the user's one-line error says the webcam was lost. A screen capture with the same
+    /// loss does start a recovery.
+    #[tokio::test]
+    async fn a_webcam_that_is_lost_ends_the_share_and_a_screen_is_restarted() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        let fragment = "videotestsrc is-live=true pattern=ball ! video/x-raw,width=160,height=120,framerate=15/1";
+        for (label, is_webcam) in [(capture::webcam::LABEL, true), ("Screen share", false)] {
+            let handle = capture::start_capture_from_test_source(15, fragment).await.expect("a test-source capture");
+            let (capture_id, _dest) = insert_destination(&mut state);
+            let capture = state.captures.get_mut(&capture_id).unwrap();
+            capture.label = label.to_string();
+            capture.status = ShareStatus::Active(ShareHandle::Video(handle));
+            assert_eq!(capture.is_webcam(), is_webcam);
+            if let ShareStatus::Active(ShareHandle::Video(h)) = &state.captures[&capture_id].status {
+                h.inject_source_lost("v4l2src0: Could not read from resource (the camera is gone)");
+            }
+            state.poll_capture_recovery_at(Instant::now());
+            if is_webcam {
+                assert!(state.recovery(capture_id).is_none(), "no restart loop for a camera");
+                assert!(matches!(state.captures[&capture_id].status, ShareStatus::Stopping(_)), "the share is being stopped");
+                assert!(state.captures[&capture_id].destinations.is_empty(), "its destination is gone at once");
+                let e = state.share_error.take().expect("the user is told");
+                assert!(e.contains("Webcam") || e.contains("webcam"), "{e}");
+                assert!(!state.recovery_gave_up.contains(&capture_id), "not a failed recovery either");
+            } else {
+                assert!(state.recovery(capture_id).is_some(), "a screen is restarted");
+                assert!(matches!(state.captures[&capture_id].status, ShareStatus::Active(_)));
+            }
+        }
+    }
+
+    /// A webcam capture is its own share: the screen-only views of the session ignore it, and it has its wire label.
+    #[tokio::test]
+    async fn a_webcam_capture_is_labelled_and_is_not_a_screen() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        let (capture_id, _) = insert_destination(&mut state);
+        let c = state.captures.get_mut(&capture_id).unwrap();
+        assert!(!c.is_webcam());
+        assert_eq!(c.wire_label(), "Screen");
+        c.label = capture::webcam::LABEL.to_string();
+        assert!(c.is_webcam());
+        assert_eq!(c.wire_label(), "Webcam");
+        assert_eq!(state.webcam_share(), Some((capture_id, RoomHandle(0))));
+        // A stopping one is gone for the UI.
+        let (_tx, rx) = oneshot::channel();
+        state.captures.get_mut(&capture_id).unwrap().status = ShareStatus::Stopping(rx);
+        assert_eq!(state.webcam_share(), None);
+    }
+
+    /// A webcam brings no audio along: watching only the camera must not subscribe to the sender's audio, and the
+    /// audio of a sender that only has a webcam is an audio-only share with its own Listen card.
+    #[test]
+    fn a_webcam_is_not_a_video_for_the_audio_that_follows_video() {
+        let info = |stream_id, kind, label: &str| StreamInfo { owner: 7, stream_id, kind, label: label.into(), width: 1280, height: 720 };
+        let streams = vec![info(1, StreamKind::Video, "Webcam"), info(2, StreamKind::Audio, "Desktop audio")];
+        assert!(!owner_has_video_in(&streams, 7), "a webcam alone: the audio gets its own card");
+        assert!(is_webcam_stream_in(&streams, 7, 1) && !is_webcam_stream_in(&streams, 7, 2) && !is_webcam_stream_in(&streams, 8, 1));
+        let mut with_screen = streams.clone();
+        with_screen.push(info(3, StreamKind::Video, "Screen"));
+        assert!(owner_has_video_in(&with_screen, 7), "with a screen, the audio rides along with it");
+        assert!(!is_webcam_stream_in(&with_screen, 7, 3));
     }
 
     /// A dismissed picker is the user's answer: no further attempts.

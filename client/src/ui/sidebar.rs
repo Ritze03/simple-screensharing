@@ -295,6 +295,20 @@ fn outgoing_body(ui: &mut Ui, cx: &Cx) -> Vec<UiAction> {
             }
         }
     }
+    // Our webcam (task I8): click opens its settings.
+    for (_, c) in cx.state.captures.iter().filter(|(_, c)| c.is_webcam() && !matches!(c.status, ShareStatus::Stopping(_))) {
+        for d in c.destinations.values() {
+            any = true;
+            let p = d.runtime.as_ref().map_or(d.params, |rt| rt.lock().unwrap().params());
+            let room = cx.room_name(d.room);
+            let sub = tr_with("ui.sidebar.outgoing.sub", "%{screen} · %{fps} fps · %{kbps} kbps", &[("screen", &super::share_label(&c.label)), ("fps", &p.framerate.to_string()), ("kbps", &p.bitrate_kbps.to_string())]);
+            if widgets::pop_item(ui, &PopItem::new("videocam", &room).sub(&sub)).clicked() {
+                let key: Option<RoomKey> = cx.session(d.room).map(|s| s.join_string.clone());
+                out.extend(key.map(UiAction::SelectRoom));
+                out.push(UiAction::OpenModal(Modal::WebcamSettings { room: d.room }));
+            }
+        }
+    }
     // Our audio shares (desktop or one app, no screen needed): click opens the audio settings of that room.
     for c in cx.state.captures.values().filter(|c| c.kind == StreamKind::Audio && !matches!(c.status, ShareStatus::Stopping(_))) {
         for d in c.destinations.values() {

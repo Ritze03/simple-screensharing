@@ -457,6 +457,40 @@ pub struct AppSettings {
     /// share); an empty list that was saved stays empty, so the user can remove both.
     #[serde(default = "AppSettings::default_audio_exclusions")]
     pub audio_exclusions: Vec<String>,
+    /// The webcam menu's choices (task I8). A file from before the setting gets the defaults.
+    #[serde(default)]
+    pub webcam: WebcamSettings,
+}
+
+/// What the webcam menu remembers (task I8, [`AppSettings::webcam`]): which camera, which of its modes, and how it
+/// is compressed. The encoder's tune and keyframe interval are fixed (`capture::EncodeChoice::webcam`), so they
+/// are not here. The camera is its name and the mode its `capture::webcam::Mode::key`, both as strings, so a
+/// camera that is not plugged in (or a mode it no longer offers) just falls back to the first camera and its
+/// default mode (`capture::webcam::resolve`) without losing the saved values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebcamSettings {
+    /// The camera's name; "" = the first one.
+    #[serde(default)]
+    pub camera: String,
+    /// The mode as `MJPG 1280x720@30`; "" = the camera's default.
+    #[serde(default)]
+    pub mode: String,
+    #[serde(default)]
+    pub codec: VideoCodec,
+    #[serde(default = "WebcamSettings::default_bitrate_kbps")]
+    pub bitrate_kbps: u32,
+}
+
+impl WebcamSettings {
+    fn default_bitrate_kbps() -> u32 {
+        crate::capture::webcam::DEFAULT_BITRATE_KBPS
+    }
+}
+
+impl Default for WebcamSettings {
+    fn default() -> Self {
+        Self { camera: String::new(), mode: String::new(), codec: VideoCodec::default(), bitrate_kbps: Self::default_bitrate_kbps() }
+    }
 }
 
 /// See [`AppSettings::start_stream_defaults`].
@@ -535,6 +569,7 @@ impl Default for AppSettings {
             level_loudness: true,
             emoji: String::new(),
             audio_exclusions: Self::default_audio_exclusions(),
+            webcam: WebcamSettings::default(),
         }
     }
 }
@@ -919,9 +954,11 @@ mod tests {
             level_loudness: false,
             emoji: "🦊".to_string(),
             audio_exclusions: vec!["Teams".to_string()],
+            webcam: WebcamSettings { camera: "C920".into(), mode: "MJPG 1280x720@30".into(), codec: VideoCodec::H265, bitrate_kbps: 1800 },
         };
         let toml_str = toml::to_string_pretty(&settings).unwrap();
         let parsed: AppSettings = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.webcam, settings.webcam);
         assert_eq!(parsed.language, "de");
         assert_eq!(parsed.presentation_mode, PresentationMode::Mailbox);
         assert_eq!(parsed.bandwidth_mode, BandwidthMode::Absolute);
@@ -991,6 +1028,18 @@ mod tests {
         assert!(!AppSettings::default().send_diagnostics);
         let parsed: AppSettings = toml::from_str("language = \"de\"\n").unwrap();
         assert!(!parsed.send_diagnostics);
+    }
+
+    /// Task I8: a file from before the webcam menu loads with the defaults, and a file that names only a camera
+    /// keeps that and defaults the rest.
+    #[test]
+    fn webcam_settings_default_and_load_from_old_files() {
+        let old: AppSettings = toml::from_str("language = \"de\"\n").unwrap();
+        assert_eq!(old.webcam, WebcamSettings::default());
+        assert_eq!((old.webcam.camera.as_str(), old.webcam.mode.as_str(), old.webcam.bitrate_kbps), ("", "", 2500));
+        let part: AppSettings = toml::from_str("[webcam]\ncamera = \"C920\"\n").unwrap();
+        assert_eq!((part.webcam.camera.as_str(), part.webcam.bitrate_kbps), ("C920", 2500));
+        assert_eq!(part.webcam.codec, VideoCodec::default());
     }
 
     /// A settings file written before `display_name` existed must still

@@ -223,6 +223,155 @@ pub fn resize_float(o: FRect, dx: f32, dy: f32, ar: f32, w: f32, h: f32) -> FRec
     fit_float(FRect { w: nw / w, ..o }, ar, w, h)
 }
 
+// ---------------------------------------------------------------------------
+// Webcam in picture (task I8): the replica's `snapPip` / `layoutPip` / `movePip`
+// ---------------------------------------------------------------------------
+
+/// How far a PIP sits from the edges of the visible picture on its spot (px; less when the picture is small).
+pub const PIP_INSET: f32 = 12.0;
+/// Smallest a PIP gets (px wide), unless the visible picture is smaller.
+pub const PIP_MIN: f32 = 72.0;
+
+/// A webcam's size and place inside its parent's picture, one per webcam and view (the replica's `pipPos`).
+/// `w` is a fraction of the picture's width. The place is one of eight [`pip_at`] spots (`spot`, column and row 0..=2,
+/// the middle excluded: the corners and the middle of each side), which is what survives layout changes, tile
+/// resizes and fullscreen. Only while a drag is in progress is it free (`spot` is `None`, `x`/`y` are fractions of
+/// the picture): on release it goes to the nearest spot ([`snap_pip`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PipPos {
+    pub w: f32,
+    pub spot: Option<(u8, u8)>,
+    pub x: f32,
+    pub y: f32,
+}
+
+impl Default for PipPos {
+    /// A quarter of the picture's width (.24), bottom right.
+    fn default() -> Self {
+        Self { w: 0.24, spot: Some((2, 2)), x: 0.0, y: 0.0 }
+    }
+}
+
+/// A corner of a PIP: the one that carries its resize handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Corner {
+    pub right: bool,
+    pub bottom: bool,
+}
+
+/// A PIP laid out in its parent tile (all rects relative to the tile's top-left): the PIP itself, the whole picture
+/// (`pic`: bigger than the tile in Crop) and the part of it you can see (`vis`), the PIP's aspect ratio and where
+/// its handle is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PipGeo {
+    pub rect: Rect,
+    pub pic: Rect,
+    pub vis: Rect,
+    pub ar: f32,
+    pub corner: Corner,
+}
+
+/// Where a PIP of `size` starts along an axis of the visible picture (`origin`, `len`): column or row `i` of the
+/// three (start, middle, end). The inset shrinks when the picture is barely bigger than the PIP.
+pub fn pip_at(origin: f32, len: f32, size: f32, i: u8) -> f32 {
+    let m = PIP_INSET.min((len - size) / 2.0).max(0.0);
+    match i {
+        0 => origin + m,
+        1 => origin + (len - size) / 2.0,
+        _ => origin + len - size - m,
+    }
+}
+
+/// The picture of a stream of aspect `ar` in a `tw` x `th` tile, and what shows of it: all of it when contained
+/// (Split, Floating), the centre when it fills the tile (Crop, `Fit::Cover`).
+pub fn picture(tw: f32, th: f32, ar: f32, crop: bool) -> (Rect, Rect) {
+    let pw = if crop { tw.max(th * ar) } else { tw.min(th * ar) };
+    let ph = pw / ar;
+    let pic = Rect::from_min_size(pos2((tw - pw) / 2.0, (th - ph) / 2.0), vec2(pw, ph));
+    let vis = pic.intersect(Rect::from_min_size(pos2(0.0, 0.0), vec2(tw, th)));
+    (pic, vis)
+}
+
+/// Place a webcam of aspect `a` inside a `tw` x `th` tile showing a stream of aspect `ar`. Size and place are
+/// fractions of the **picture**, so they survive a tile resize and every layout; what is shown is clamped to the
+/// visible part, so Crop does not lose the Split position (the stored value stays). *Why the handle faces the
+/// middle:* a PIP pushed into a corner could otherwise only shrink, and in Floating its handle would land on the
+/// window's own. `ar` of 0 or less counts as 16:9.
+pub fn layout_pip(tw: f32, th: f32, ar: f32, a: f32, crop: bool, p: &PipPos) -> PipGeo {
+    let ar = if ar > 0.0 { ar } else { 16.0 / 9.0 };
+    let (pic, vis) = picture(tw, th, ar, crop);
+    let w = (p.w * pic.width()).max(PIP_MIN).min(vis.width()).min(vis.height() * a);
+    let h = w / a;
+    let (x, y) = match p.spot {
+        Some((i, j)) => (pip_at(vis.min.x, vis.width(), w, i), pip_at(vis.min.y, vis.height(), h, j)),
+        None => (
+            (pic.min.x + p.x * pic.width()).min(vis.max.x - w).max(vis.min.x),
+            (pic.min.y + p.y * pic.height()).min(vis.max.y - h).max(vis.min.y),
+        ),
+    };
+    let rect = Rect::from_min_size(pos2(x, y), vec2(w, h));
+    let corner = Corner { right: rect.center().x <= vis.center().x, bottom: rect.center().y <= vis.center().y };
+    PipGeo { rect, pic, vis, ar: a, corner }
+}
+
+/// The spot nearest to where a dragged PIP is.
+pub fn nearest_spot(g: &PipGeo) -> (u8, u8) {
+    let mut best = (f32::INFINITY, (2, 2));
+    for i in 0..3u8 {
+        for j in 0..3u8 {
+            if (i, j) == (1, 1) {
+                continue;
+            }
+            let at = pos2(pip_at(g.vis.min.x, g.vis.width(), g.rect.width(), i), pip_at(g.vis.min.y, g.vis.height(), g.rect.height(), j));
+            let d = (at - g.rect.min).length();
+            if d < best.0 {
+                best = (d, (i, j));
+            }
+        }
+    }
+    best.1
+}
+
+/// Release of a drag: a PIP that was moved freely goes to the nearest spot. One that already has a spot (a click,
+/// a resize) stays.
+pub fn snap_pip(g: &PipGeo, p: &mut PipPos) {
+    if p.spot.is_none() {
+        p.spot = Some(nearest_spot(g));
+    }
+}
+
+/// `p` for a PIP at `rect` in the picture `g.pic`.
+fn store(g: &PipGeo, rect: Rect, p: &mut PipPos) {
+    *p = PipPos { x: (rect.min.x - g.pic.min.x) / g.pic.width(), y: (rect.min.y - g.pic.min.y) / g.pic.height(), w: rect.width() / g.pic.width(), spot: p.spot };
+}
+
+/// The PIP `g` as it was at the press, dragged by `d` px: free (no spot), kept inside the visible picture, so
+/// dragging past an edge stops at the edge, in Crop too.
+pub fn move_pip(g: &PipGeo, d: egui::Vec2, p: &mut PipPos) {
+    let (w, h) = (g.rect.width(), g.rect.height());
+    let x = (g.rect.min.x + d.x).min(g.vis.max.x - w).max(g.vis.min.x);
+    let y = (g.rect.min.y + d.y).min(g.vis.max.y - h).max(g.vis.min.y);
+    p.spot = None;
+    store(g, Rect::from_min_size(pos2(x, y), vec2(w, h)), p);
+}
+
+/// The PIP `g` as it was at the press with its handle on `c` dragged by `d` px: the opposite corner stays, the
+/// aspect ratio holds, the handle goes to the point of the diagonal nearest the pointer (so width and height both
+/// count), and it stays inside the visible picture and above [`PIP_MIN`]. The spot is untouched.
+pub fn resize_pip(g: &PipGeo, c: Corner, d: egui::Vec2, p: &mut PipPos) {
+    let a = g.ar;
+    let (sx, sy) = (if c.right { 1.0 } else { -1.0 }, if c.bottom { 1.0 } else { -1.0 });
+    let (w, h) = (g.rect.width(), g.rect.height());
+    let (fx, fy) = (if c.right { g.rect.min.x } else { g.rect.max.x }, if c.bottom { g.rect.min.y } else { g.rect.max.y });
+    let want = (w + sx * d.x + (h + sy * d.y) / a) / (1.0 + 1.0 / (a * a));
+    let cap_x = if c.right { g.vis.max.x - fx } else { fx - g.vis.min.x };
+    let cap_y = if c.bottom { g.vis.max.y - fy } else { fy - g.vis.min.y };
+    let nw = want.min(cap_x).min(cap_y * a).max(PIP_MIN.min(g.vis.width()).min(g.vis.height() * a));
+    let nx = if c.right { fx } else { fx - nw };
+    let ny = if c.bottom { fy } else { fy - nw / a };
+    store(g, Rect::from_min_size(pos2(nx, ny), vec2(nw, nw / a)), p);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,5 +516,186 @@ mod tests {
         assert!((m.x * w - (0.2 * w + 60.0)).abs() < 1e-3 && (m.y * h - (0.2 * h - 30.0)).abs() < 1e-3);
         let far = move_float(o, 9999.0, -9999.0, w, h);
         assert!((far.x + far.w - 1.0).abs() < 1e-6 && far.y.abs() < 1e-6);
+    }
+
+    // --- webcam in picture (task I8) ---
+
+    const CAM: f32 = 16.0 / 9.0;
+
+    fn inside(r: Rect, outer: Rect) -> bool {
+        r.min.x >= outer.min.x - 1e-3 && r.min.y >= outer.min.y - 1e-3 && r.max.x <= outer.max.x + 1e-3 && r.max.y <= outer.max.y + 1e-3
+    }
+
+    #[test]
+    fn spots_sit_in_the_corners_and_the_middles_with_an_inset_that_shrinks_in_small_pictures() {
+        // 1000 wide picture, 200 wide PIP: start, centre, end.
+        assert_eq!(pip_at(0.0, 1000.0, 200.0, 0), PIP_INSET);
+        assert_eq!(pip_at(0.0, 1000.0, 200.0, 1), 400.0);
+        assert_eq!(pip_at(0.0, 1000.0, 200.0, 2), 1000.0 - 200.0 - PIP_INSET);
+        // Barely bigger than the PIP: the inset is half the slack, never negative.
+        assert_eq!(pip_at(0.0, 210.0, 200.0, 0), 5.0);
+        assert_eq!(pip_at(0.0, 210.0, 200.0, 2), 5.0);
+        assert_eq!(pip_at(50.0, 100.0, 100.0, 0), 50.0);
+        assert_eq!(pip_at(50.0, 100.0, 150.0, 2), 0.0, "a PIP bigger than the picture hangs over, inset 0");
+    }
+
+    /// D1: a PIP starts bottom right, a quarter of the picture wide, 12 px from both edges.
+    #[test]
+    fn a_new_pip_is_bottom_right_a_quarter_wide() {
+        let g = layout_pip(1000.0, 1000.0 / AR, AR, CAM, false, &PipPos::default());
+        assert!((g.rect.width() - 240.0).abs() < 1e-3);
+        assert!((g.rect.height() - 240.0 / CAM).abs() < 1e-3);
+        assert!((g.vis.max.x - g.rect.max.x - PIP_INSET).abs() < 1e-3 && (g.vis.max.y - g.rect.max.y - PIP_INSET).abs() < 1e-3);
+        assert_eq!(g.corner, Corner { right: false, bottom: false }, "bottom right: the handle faces the middle, top left");
+    }
+
+    /// D1: "stays on its spot across layouts, tile resizes and fullscreen": the same stored position puts the PIP
+    /// on the same spot (the same inset from the same edges) in every tile size, in Crop as in Split.
+    #[test]
+    fn a_spot_survives_tile_resizes_and_layouts() {
+        for spot in [(0u8, 0u8), (1, 0), (2, 0), (0, 1), (2, 1), (0, 2), (1, 2), (2, 2)] {
+            let p = PipPos { spot: Some(spot), ..PipPos::default() };
+            for (tw, th, crop) in [(1000.0, 1000.0 / AR, false), (400.0, 400.0 / AR, false), (500.0, 700.0, true), (1900.0, 1000.0, true), (1920.0, 1080.0, false)] {
+                let g = layout_pip(tw, th, AR, CAM, crop, &p);
+                let (cx, cy) = (g.rect.center().x, g.rect.center().y);
+                let (vcx, vcy) = (g.vis.center().x, g.vis.center().y);
+                match spot.0 {
+                    0 => assert!((g.rect.min.x - g.vis.min.x - PIP_INSET).abs() < 1e-3, "{spot:?} {tw}x{th}"),
+                    1 => assert!((cx - vcx).abs() < 1e-3),
+                    _ => assert!((g.vis.max.x - g.rect.max.x - PIP_INSET).abs() < 1e-3),
+                }
+                match spot.1 {
+                    0 => assert!((g.rect.min.y - g.vis.min.y - PIP_INSET).abs() < 1e-3, "{spot:?} {tw}x{th}"),
+                    1 => assert!((cy - vcy).abs() < 1e-3),
+                    _ => assert!((g.vis.max.y - g.rect.max.y - PIP_INSET).abs() < 1e-3),
+                }
+                assert!(inside(g.rect, g.vis), "{spot:?} {tw}x{th} crop={crop}: {:?} not in {:?}", g.rect, g.vis);
+            }
+        }
+    }
+
+    /// D1: "stays inside the visible picture, in Crop too". A 16:9 stream in a tall Crop cell is cropped to its
+    /// centre: the picture is wider than the tile, the PIP stays in the part you see, and the stored spot is the
+    /// same one Split would use.
+    #[test]
+    fn in_crop_the_pip_stays_in_the_visible_centre_and_the_stored_value_is_kept() {
+        let p = PipPos::default();
+        let g = layout_pip(400.0, 700.0, AR, CAM, true, &p);
+        assert!(g.pic.width() > 400.0 + 1.0, "the picture is cropped at the sides: {:?}", g.pic);
+        assert_eq!(g.vis, Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 700.0)));
+        assert!(inside(g.rect, g.vis));
+        // Width is a fraction of the *picture*, capped by what shows.
+        assert!(g.rect.width() <= 400.0 + 1e-3);
+        // Back in Split the same stored position gives the unscaled corner again.
+        let split = layout_pip(1000.0, 1000.0 / AR, AR, CAM, false, &p);
+        assert!((split.vis.max.x - split.rect.max.x - PIP_INSET).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_pip_is_never_smaller_than_the_minimum_nor_bigger_than_what_shows() {
+        let tiny = layout_pip(200.0, 200.0 / AR, AR, CAM, false, &PipPos { w: 0.01, ..PipPos::default() });
+        assert!((tiny.rect.width() - PIP_MIN).abs() < 1e-3);
+        let huge = layout_pip(200.0, 200.0 / AR, AR, CAM, false, &PipPos { w: 5.0, ..PipPos::default() });
+        assert!((huge.rect.width() - 200.0).abs() < 1e-3, "no bigger than the visible width");
+        // A tile smaller than the minimum: the PIP fills what shows, still inside it.
+        let small = layout_pip(60.0, 60.0 / AR, AR, CAM, false, &PipPos::default());
+        assert!(inside(small.rect, small.vis));
+    }
+
+    /// D1: "snaps on release to the nearest of 8 spots".
+    #[test]
+    fn a_released_pip_goes_to_the_nearest_of_the_eight_spots() {
+        let (tw, th) = (1000.0, 1000.0 / AR);
+        let base = layout_pip(tw, th, AR, CAM, false, &PipPos::default());
+        // Drag from the default bottom-right to several places and release.
+        let cases = [
+            (vec2(-2000.0, -2000.0), (0, 0)),
+            (vec2(-300.0, -2000.0), (1, 0)),
+            (vec2(2000.0, -2000.0), (2, 0)),
+            (vec2(-2000.0, -200.0), (0, 1)),
+            (vec2(0.0, -200.0), (2, 1)),
+            (vec2(-2000.0, 2000.0), (0, 2)),
+            (vec2(-380.0, 2000.0), (1, 2)),
+            (vec2(5.0, 5.0), (2, 2)),
+        ];
+        for (d, want) in cases {
+            let mut p = PipPos::default();
+            move_pip(&base, d, &mut p);
+            assert_eq!(p.spot, None, "free during the drag");
+            let g = layout_pip(tw, th, AR, CAM, false, &p);
+            snap_pip(&g, &mut p);
+            assert_eq!(p.spot, Some(want), "dragged by {d:?}");
+            assert!(inside(layout_pip(tw, th, AR, CAM, false, &p).rect, g.vis));
+        }
+        // A click (no drag) leaves the spot alone.
+        let mut p = PipPos { spot: Some((0, 1)), ..PipPos::default() };
+        snap_pip(&layout_pip(tw, th, AR, CAM, false, &p), &mut p);
+        assert_eq!(p.spot, Some((0, 1)));
+        // The middle of the picture is no spot: a PIP dropped there goes to a side or corner.
+        let mut p = PipPos::default();
+        let centre = (base.vis.center() - base.rect.center()) + vec2(0.0, 0.0);
+        move_pip(&base, centre, &mut p);
+        snap_pip(&layout_pip(tw, th, AR, CAM, false, &p), &mut p);
+        assert_ne!(p.spot, Some((1, 1)));
+    }
+
+    /// D1: "a drag past an edge stays inside the visible picture, in Crop too".
+    #[test]
+    fn a_drag_stops_at_the_edge_of_the_visible_picture() {
+        for (tw, th, crop) in [(1000.0, 1000.0 / AR, false), (400.0, 700.0, true), (1900.0, 600.0, true)] {
+            let base = layout_pip(tw, th, AR, CAM, crop, &PipPos::default());
+            for d in [vec2(-9999.0, -9999.0), vec2(9999.0, 9999.0), vec2(-9999.0, 9999.0), vec2(37.0, -11.0)] {
+                let mut p = PipPos::default();
+                move_pip(&base, d, &mut p);
+                let g = layout_pip(tw, th, AR, CAM, crop, &p);
+                assert!(inside(g.rect, g.vis), "{tw}x{th} crop={crop} d={d:?}: {:?} outside {:?}", g.rect, g.vis);
+                assert!((g.rect.size() - base.rect.size()).length() < 1e-2, "a move never resizes");
+            }
+        }
+        // A small move is followed one to one.
+        let base = layout_pip(1000.0, 1000.0 / AR, AR, CAM, false, &PipPos::default());
+        let mut p = PipPos::default();
+        move_pip(&base, vec2(-40.0, -25.0), &mut p);
+        let g = layout_pip(1000.0, 1000.0 / AR, AR, CAM, false, &p);
+        assert!((g.rect.min - base.rect.min - vec2(-40.0, -25.0)).length() < 1e-2);
+    }
+
+    /// D1: "a resize keeps the aspect"; the corner opposite the handle stays; it stays inside; the minimum holds.
+    #[test]
+    fn a_resize_keeps_the_aspect_and_the_opposite_corner() {
+        for (tw, th, crop) in [(1000.0, 1000.0 / AR, false), (500.0, 700.0, true)] {
+            let base = layout_pip(tw, th, AR, CAM, crop, &PipPos::default());
+            let c = base.corner;
+            assert_eq!(c, Corner { right: false, bottom: false });
+            let fixed = base.rect.max;
+            // Pulling the handle up and left grows the PIP, down and right shrinks it.
+            let mut grown = PipPos::default();
+            resize_pip(&base, c, vec2(-80.0, -45.0), &mut grown);
+            let g = layout_pip(tw, th, AR, CAM, crop, &grown);
+            assert!(g.rect.width() > base.rect.width() + 20.0, "{crop}: grows");
+            assert!((g.rect.width() / g.rect.height() - CAM).abs() < 1e-3, "aspect holds");
+            assert!(inside(g.rect, g.vis));
+            assert!((g.rect.max - fixed).length() < 1.0, "the corner opposite the handle stays: {:?} vs {fixed:?}", g.rect.max);
+            let mut shrunk = PipPos::default();
+            resize_pip(&base, c, vec2(500.0, 500.0), &mut shrunk);
+            let g = layout_pip(tw, th, AR, CAM, crop, &shrunk);
+            assert!((g.rect.width() - PIP_MIN.min(g.vis.width())).abs() < 1e-2, "down to the minimum, not below");
+            // Far past the picture: capped by what shows.
+            let mut huge = PipPos::default();
+            resize_pip(&base, c, vec2(-9999.0, -9999.0), &mut huge);
+            let g = layout_pip(tw, th, AR, CAM, crop, &huge);
+            assert!(inside(g.rect, g.vis) && g.rect.width() <= g.vis.width() + 1e-3);
+            assert_eq!(huge.spot, Some((2, 2)), "a resize leaves the spot");
+        }
+    }
+
+    /// The handle is on the corner facing the middle, whichever spot the PIP is on.
+    #[test]
+    fn the_handle_faces_the_middle_of_the_picture() {
+        let at = |s: (u8, u8)| layout_pip(1000.0, 1000.0 / AR, AR, CAM, false, &PipPos { spot: Some(s), ..PipPos::default() }).corner;
+        assert_eq!(at((0, 0)), Corner { right: true, bottom: true });
+        assert_eq!(at((2, 0)), Corner { right: false, bottom: true });
+        assert_eq!(at((0, 2)), Corner { right: true, bottom: false });
+        assert_eq!(at((2, 2)), Corner { right: false, bottom: false });
     }
 }

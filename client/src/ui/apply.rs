@@ -259,6 +259,8 @@ impl App {
                 }
             }
             UiAction::StopAllSharing => {
+                // The webcam too, and a webcam start that was waiting for the old one to stop.
+                self.state.stop_webcam();
                 let ids: Vec<_> = self.state.captures.keys().copied().collect();
                 for id in ids {
                     self.state.stop_share(id);
@@ -306,6 +308,20 @@ impl App {
             UiAction::SetBandwidthMode(m) => self.state.set_bandwidth_mode(m),
             UiAction::SetBandwidthTotal(v) => self.state.set_bandwidth_total(v),
             UiAction::SetBandwidthFloor(v) => self.state.set_bandwidth_floor(v),
+
+            // --- webcam ----------------------------------------------------
+            UiAction::StartWebcam(room) => {
+                if let Err(e) = self.state.start_webcam(room) {
+                    self.toast(tr_with("ui.toast.webcam_failed", "Couldn't share the webcam: %{error}", &[("error", &e)]), "error");
+                }
+                self.nav.popover = None;
+            }
+            UiAction::StopWebcam => {
+                self.state.stop_webcam();
+                self.nav.popover = None;
+            }
+            UiAction::SetWebcam(w) => self.state.set_webcam_settings(w),
+            UiAction::RefreshWebcams => self.state.refresh_webcams(),
 
             // --- shared audio --------------------------------------------
             UiAction::ShareAudio { room, choice } => {
@@ -393,6 +409,7 @@ impl App {
             UiAction::SetStageLayout { view, layout } => self.shell.stage.set_layout(view, layout),
             UiAction::SetHideOwnStreams(on) => self.shell.stage.hide_own = on,
             UiAction::SetAlwaysShowNames(on) => self.shell.stage.always_names = on,
+            UiAction::SetStagePip { view, on } => self.shell.stage.set_pip(view, on),
             UiAction::ToggleSidebar => self.nav.sidebar_hidden = !self.nav.sidebar_hidden,
             UiAction::EnterStageFullscreen => {
                 if self.nav.stage_fullscreen.is_none() {

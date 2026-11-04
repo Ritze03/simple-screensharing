@@ -42,16 +42,18 @@ mod bar;
 mod chrome;
 mod geom;
 mod menus;
+mod pip;
 mod strip;
 mod tile;
 
 use std::collections::{HashMap, HashSet};
 
 use egui::{Align, CursorIcon, Id, Pos2, Rect, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
+use simple_screensharing_client::capture::webcam;
 use simple_screensharing_client::protocol::{StreamInfo, StreamKind};
 use simple_screensharing_client::session::{CaptureSourceId, DestinationId, RoomHandle};
 
-use geom::{Bar, FRect, Grid};
+use geom::{Bar, FRect, Grid, PipGeo, PipPos};
 #[cfg(test)]
 pub(super) use tile::tile_volume_slider;
 
@@ -84,6 +86,9 @@ pub struct StageSettings {
     pub hide_own: bool,
     /// "Always show names": the name tag of a watched stream shows without hovering.
     pub always_names: bool,
+    /// "Webcam in picture" is on for these stages (per view, off until switched on): a webcam sits inside its
+    /// owner's screen share ([`pip_pairs`]).
+    pip: HashSet<StageView>,
 }
 
 impl StageSettings {
@@ -94,6 +99,19 @@ impl StageSettings {
 
     pub(super) fn set_layout(&mut self, view: StageView, layout: StageLayout) {
         self.layouts.insert(view, layout);
+    }
+
+    /// Whether `view` puts webcams in their owner's picture.
+    pub fn pip(&self, view: &StageView) -> bool {
+        self.pip.contains(view)
+    }
+
+    pub(super) fn set_pip(&mut self, view: StageView, on: bool) {
+        if on {
+            self.pip.insert(view);
+        } else {
+            self.pip.remove(&view);
+        }
     }
 }
 
@@ -107,9 +125,15 @@ impl Cx<'_> {
         }
     }
 
-    /// Whether the sender of `key` shares audio with it.
+    /// Whether `key` is a webcam stream (its label starts with `Webcam`, plan D7).
+    fn is_webcam_stream(&self, key: StreamKey) -> bool {
+        self.session(key.0).is_some_and(|s| s.streams.iter().any(|i| i.owner == key.1 && i.stream_id == key.2 && webcam::is_webcam_label(&i.label)))
+    }
+
+    /// Whether the sender of `key` shares audio with it. A webcam never does: the sound belongs to the screen
+    /// (`RoomSession::sync_audio_watches` does not follow a webcam either).
     fn stream_has_audio(&self, key: StreamKey) -> bool {
-        drive_dump::fake_audio() || self.session(key.0).is_some_and(|s| s.sibling_audio_stream(key.1).is_some())
+        !self.is_webcam_stream(key) && (drive_dump::fake_audio() || self.session(key.0).is_some_and(|s| s.sibling_audio_stream(key.1).is_some()))
     }
 
     /// The joined room a stage shows (the open room, or the one a pop-out window was made for).
@@ -158,6 +182,7 @@ impl StageState {
             g.grid = None;
             g.float.clear();
             g.z.clear();
+            g.pip.clear();
         }
     }
 }
@@ -179,6 +204,8 @@ struct ViewGeom {
     z: Vec<ItemId>,
     float: HashMap<ItemId, FRect>,
     grid: Option<Grid>,
+    /// Webcam in picture: each webcam's size and spot in its parent's picture, per view ([`pip_pairs`]).
+    pip: HashMap<ItemId, PipPos>,
 }
 
 /// A pointer drag in progress; `origin` is where the press started.
@@ -187,6 +214,8 @@ enum Drag {
     Move { id: ItemId, origin: Pos2, from: FRect },
     Resize { id: ItemId, origin: Pos2, from: FRect },
     Reorder { id: ItemId, origin: Pos2 },
+    /// A webcam in picture moved or resized ([`pip`]).
+    Pip(pip::PipDragState),
 }
 
 enum Kind {
@@ -205,6 +234,37 @@ struct Item {
     ar: f32,
     mine: bool,
     popped: bool,
+    /// This webcam is drawn inside its owner's screen share ([`pip_pairs`]), so it has no tile. Set by [`show`].
+    in_pip: bool,
+}
+
+impl Item {
+    /// A webcam (its label starts with `Webcam`, plan D7): yours or someone else's.
+    fn is_cam(&self) -> bool {
+        webcam::is_webcam_label(&self.id.label)
+    }
+}
+
+/// Webcam in picture: parent item id -> index of the webcam item that sits inside it (task I8, the replica's
+/// `pipPairs`). The parent is the webcam owner's first screen share, in this view's order, that is **on the
+/// stage and playing**: yours, or one you watch, and not popped out. So with no screen share running, with one you
+/// do not watch (its tile holds the Watch button), or with the share popped out, the webcam stays a tile of its
+/// own. A webcam you do not watch yet stays a tile too, for the same reason: it is not playing, so it is
+/// not in `list`. One parent holds one webcam (a second one keeps its tile).
+fn pip_pairs(items: &[Item], order: &[ItemId]) -> HashMap<ItemId, usize> {
+    let list: Vec<usize> = order
+        .iter()
+        .filter_map(|id| items.iter().position(|i| &i.id == id))
+        .filter(|&k| !items[k].popped && matches!(items[k].kind, Kind::Video(_) | Kind::Mine(..)))
+        .collect();
+    let mut pairs = HashMap::new();
+    for &c in list.iter().filter(|&&k| items[k].is_cam()) {
+        let owner = (items[c].id.room, &items[c].id.who);
+        if let Some(&p) = list.iter().find(|&&k| !items[k].is_cam() && (items[k].id.room, &items[k].id.who) == owner) {
+            pairs.insert(items[p].id.clone(), c);
+        }
+    }
+    pairs
 }
 
 fn aspect(w: f32, h: f32) -> f32 {
@@ -218,7 +278,14 @@ fn collect(cx: &Cx, view: &StageView) -> Vec<Item> {
         let nth = out.iter().filter(|i| i.id.room == room && i.id.who == who && i.id.label == label && i.id.audio == audio).count() as u8;
         let popped = matches!(&kind, Kind::Video(k) if cx.is_popped(*k));
         let mine = matches!(kind, Kind::Mine(..));
-        out.push(Item { id: ItemId { room, who, label, audio, nth }, kind, ar, mine, popped });
+        out.push(Item { id: ItemId { room, who, label, audio, nth }, kind, ar, mine, popped, in_pip: false });
+    };
+    let mine_ar = |capture: CaptureSourceId, destination: DestinationId| {
+        let p = cx.capture(capture).and_then(|c| c.destinations.get(&destination)).map(|d| match &d.runtime {
+            Some(rt) => rt.lock().unwrap().params(),
+            None => d.params,
+        });
+        p.map_or(aspect(0.0, 0.0), |p| aspect(p.width as f32, p.height as f32))
     };
     let video_ar = |key: StreamKey, info: Option<&StreamInfo>| match cx.videos.frame_size(key) {
         Some((w, h)) => aspect(w as f32, h as f32),
@@ -239,13 +306,12 @@ fn collect(cx: &Cx, view: &StageView) -> Vec<Item> {
             }
             if let Some(room) = cx.stage_room(*h)
                 && let ShareState::Live { capture, destination } = cx.share_state(&room)
-                && let Some(d) = cx.capture(capture).and_then(|c| c.destinations.get(&destination))
             {
-                let p = match &d.runtime {
-                    Some(rt) => rt.lock().unwrap().params(),
-                    None => d.params,
-                };
-                add(*h, String::new(), String::new(), false, Kind::Mine(capture, destination), aspect(p.width as f32, p.height as f32));
+                add(*h, String::new(), String::new(), false, Kind::Mine(capture, destination), mine_ar(capture, destination));
+            }
+            // Your webcam is a share of its own (task I8), a tile like your screen's.
+            if let Some((capture, destination, _)) = cx.webcam_share(*h) {
+                add(*h, String::new(), webcam::LABEL.to_string(), false, Kind::Mine(capture, destination), mine_ar(capture, destination));
             }
         }
         StageView::Watched => {
@@ -281,6 +347,7 @@ fn draw_arena(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, view: &StageView, i
     };
     let (hide_own, always_names) = (cx.shell.stage.hide_own, cx.shell.stage.always_names);
     let layout = cx.shell.stage.layout(view);
+    let pip_on = cx.shell.stage.pip(view);
     let cxr: &Cx = cx;
     let StageState { views, drag, stats, .. } = st;
     let geom = views.entry(view.clone()).or_default();
@@ -289,8 +356,15 @@ fn draw_arena(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, view: &StageView, i
             geom.order.push(it.id.clone());
         }
     }
-    let vis: Vec<&Item> =
-        geom.order.iter().filter_map(|id| items.iter().find(|i| &i.id == id)).filter(|i| !i.popped && !(hide_own && i.mine)).collect();
+    // Webcam in picture: a webcam inside its owner's screen share has no tile of its own.
+    let pairs = if pip_on { pip_pairs(items, &geom.order) } else { HashMap::new() };
+    let in_pip: HashSet<ItemId> = pairs.values().map(|&c| items[c].id.clone()).collect();
+    let vis: Vec<&Item> = geom
+        .order
+        .iter()
+        .filter_map(|id| items.iter().find(|i| &i.id == id))
+        .filter(|i| !i.popped && !(hide_own && i.mine) && !in_pip.contains(&i.id))
+        .collect();
     if vis.is_empty() {
         *drag = None;
         let (icon, title, text) = if items.is_empty() {
@@ -336,6 +410,7 @@ fn draw_arena(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, view: &StageView, i
                     geom.float.insert(id.clone(), geom::resize_float(*from, p.x - origin.x, p.y - origin.y, ars[i], w, h));
                 }
             }
+            Drag::Pip(d) => pip::apply_drag(d, p, &mut geom.pip),
             _ => {}
         }
     }
@@ -397,6 +472,7 @@ fn draw_arena(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, view: &StageView, i
     let mut started: Option<Drag> = None;
     let press = ui.input(|i| i.pointer.press_origin());
     let mut raise: Option<ItemId> = None;
+    let mut pip_geos: HashMap<ItemId, PipGeo> = HashMap::new();
     for &i in &paint_order {
         let (it, rect) = (vis[i], shown[i]);
         let resp = ui.interact(live(rect), Id::new(("stage_tile", &it.id)), Sense::click_and_drag());
@@ -415,6 +491,28 @@ fn draw_arena(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, view: &StageView, i
             Kind::Video(key) => tile::video_tile(ui, cxr, *key, &spot, &mut acts),
             Kind::Idle(key, info) | Kind::Audio(key, info) => tile::idle_tile(ui, cxr, *key, info, &spot, &mut acts),
             Kind::Mine(capture, destination) => tile::mine_tile(ui, cxr, it.id.room, *capture, *destination, &spot, &mut acts),
+        }
+        // The webcam in this stream's picture, above the tile (and below a floating window's own handle, drawn next).
+        if let Some(&ci) = pairs.get(&it.id) {
+            let cam = &items[ci];
+            let pos = *geom.pip.entry(cam.id.clone()).or_default();
+            let input = pip::Input {
+                name: i.to_string(),
+                tile: rect,
+                parent_ar: it.ar,
+                crop,
+                cam,
+                hovered: hover == Some(i) && hover_ok,
+                dragged: matches!(drag, Some(Drag::Pip(d)) if d.cam == cam.id),
+            };
+            let out = pip::show(ui, cxr, &input, pos, press, &live, &mut acts);
+            pip_geos.insert(cam.id.clone(), out.geo);
+            if out.raise && float {
+                raise = Some(it.id.clone());
+            }
+            if started.is_none() {
+                started = out.started.map(Drag::Pip);
+            }
         }
         if float {
             ui.painter().rect_stroke(rect, 0.0, Stroke::new(1.0_f32, theme::BORDER), egui::StrokeKind::Outside);
@@ -520,6 +618,10 @@ fn draw_arena(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, view: &StageView, i
         {
             geom.order.swap(from, to);
         }
+        // A webcam in picture that was moved goes to the nearest spot.
+        if let Some(Drag::Pip(d)) = drag.as_ref() {
+            pip::release(d, &pip_geos, &mut geom.pip);
+        }
         *drag = None;
     }
     if started.is_some() && drag.is_none() {
@@ -542,6 +644,55 @@ fn draw_arena(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, view: &StageView, i
 /// The Room settings menu for a room with no stage (see `room::show_header`).
 pub fn room_menu_popover(ctx: &egui::Context, cx: &mut Cx, room: &RoomEntry) {
     menus::room_popover(ctx, cx, room);
+}
+
+/// Stream fullscreen in the main window (the one watched stream filling the window, `Nav::fullscreen`) draws the
+/// webcam in picture that belongs to it, if the open stage has one: same spot, same size as on the stage, and the
+/// same drag and handle (task I8, D1: it "stays on its spot across layouts, tile resizes and fullscreen"). The stage's
+/// own fullscreen and a popped-out stage draw the PIP with the rest of the stage.
+pub fn fullscreen_pip(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, parent: StreamKey, rect: Rect) {
+    let Some(view) = cx.stage_view() else { return };
+    if !cx.shell.stage.pip(&view) {
+        return;
+    }
+    let items = collect(cx, &view);
+    let StageState { views, drag, .. } = st;
+    let geom = views.entry(view).or_default();
+    for it in &items {
+        if !geom.order.contains(&it.id) {
+            geom.order.push(it.id.clone());
+        }
+    }
+    let pairs = pip_pairs(&items, &geom.order);
+    let Some(parent_item) = items.iter().find(|i| matches!(i.kind, Kind::Video(k) if k == parent)) else { return };
+    let Some(&ci) = pairs.get(&parent_item.id) else { return };
+    let cam = &items[ci];
+    let (pointer, down, press) = ui.input(|i| (i.pointer.latest_pos(), i.pointer.primary_down(), i.pointer.press_origin()));
+    if let (Some(Drag::Pip(d)), Some(p), true) = (drag.as_ref(), pointer, down) {
+        pip::apply_drag(d, p, &mut geom.pip);
+    }
+    let pos = *geom.pip.entry(cam.id.clone()).or_default();
+    let input = pip::Input {
+        name: "fs".into(),
+        tile: rect,
+        parent_ar: parent_item.ar,
+        crop: false,
+        cam,
+        hovered: false,
+        dragged: matches!(drag, Some(Drag::Pip(d)) if d.cam == cam.id),
+    };
+    let mut acts: Vec<UiAction> = Vec::new();
+    let out = pip::show(ui, cx, &input, pos, press, &|r| r, &mut acts);
+    if drag.is_none() {
+        *drag = out.started.map(Drag::Pip);
+    }
+    if !down && let Some(Drag::Pip(d)) = drag.as_ref() {
+        pip::release(d, &HashMap::from([(cam.id.clone(), out.geo)]), &mut geom.pip);
+        *drag = None;
+    }
+    for a in acts {
+        cx.act(a);
+    }
 }
 
 /// An open stream menu keeps its own tile's buttons up; any other open menu or modal takes the pointer, so
@@ -622,7 +773,14 @@ fn show(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, host: Host, view: &StageV
     let ctx = ui.ctx().clone();
     let full = ui.max_rect();
     ui.painter().rect_filled(full, 0.0, theme::STAGE_BG);
-    let items = collect(cx, view);
+    let mut items = collect(cx, view);
+    if cx.shell.stage.pip(view) {
+        // The strip's cards say which webcams sit inside a picture.
+        let order = st.views.get(view).map(|g| g.order.clone()).unwrap_or_default();
+        for ci in pip_pairs(&items, &order).into_values() {
+            items[ci].in_pip = true;
+        }
+    }
     // Menus first: a click outside one that lands on a bar button must close it before the button reacts.
     menus::show(&ctx, cx, st, view, &items);
 
@@ -698,4 +856,81 @@ fn show(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, host: Host, view: &StageV
         cx.act(a);
     }
     bar.show(&mut ov, cx, st, bar_rect, &arr);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ROOM: RoomHandle = RoomHandle(1);
+
+    fn item(who: &str, label: &str, kind: Kind) -> Item {
+        let mine = matches!(kind, Kind::Mine(..));
+        Item { id: ItemId { room: ROOM, who: who.into(), label: label.into(), audio: false, nth: 0 }, kind, ar: 16.0 / 9.0, mine, popped: false, in_pip: false }
+    }
+
+    fn video(who: &str, label: &str, stream: u8) -> Item {
+        item(who, label, Kind::Video((ROOM, 7, stream)))
+    }
+
+    fn idle(who: &str, label: &str, stream: u8) -> Item {
+        let info = StreamInfo { owner: 7, stream_id: stream, kind: StreamKind::Video, label: label.into(), width: 1280, height: 720 };
+        item(who, label, Kind::Idle((ROOM, 7, stream), info))
+    }
+
+    fn order(items: &[Item]) -> Vec<ItemId> {
+        items.iter().map(|i| i.id.clone()).collect()
+    }
+
+    /// Plan D1: "Webcam in picture moves a person's webcam into their first playing screen share".
+    #[test]
+    fn a_webcam_goes_into_its_owners_playing_screen_share() {
+        let items = [video("Jonas", "Screen", 1), video("Jonas", "Webcam", 2), video("Ana", "Screen", 3)];
+        let pairs = pip_pairs(&items, &order(&items));
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[&items[0].id], 1, "Jonas's webcam sits in Jonas's screen, not Ana's");
+        // The webcam may come first in the stage's order: same result.
+        let items = [video("Jonas", "Webcam", 2), video("Jonas", "Screen", 1)];
+        assert_eq!(pip_pairs(&items, &order(&items))[&items[1].id], 0);
+        // The first screen share when there are two.
+        let items = [video("Jonas", "Screen", 1), video("Jonas", "Window · mpv", 4), video("Jonas", "Webcam", 2)];
+        let pairs = pip_pairs(&items, &order(&items));
+        assert_eq!(pairs[&items[0].id], 2);
+        assert!(!pairs.contains_key(&items[1].id));
+    }
+
+    /// D1: with no screen share playing, or none that you watch, or it is popped out, or you do not watch the
+    /// webcam itself (its tile holds the Watch button), the webcam stays a tile.
+    #[test]
+    fn a_webcam_stays_a_tile_when_there_is_no_playing_share_to_sit_in() {
+        let none = |items: &[Item]| pip_pairs(items, &order(items)).is_empty();
+        assert!(none(&[video("Jonas", "Webcam", 2)]), "no screen share at all");
+        assert!(none(&[idle("Jonas", "Screen", 1), video("Jonas", "Webcam", 2)]), "the screen is not watched");
+        assert!(none(&[video("Jonas", "Screen", 1), idle("Jonas", "Webcam", 2)]), "the webcam is not watched");
+        let mut popped = [video("Jonas", "Screen", 1), video("Jonas", "Webcam", 2)];
+        popped[0].popped = true;
+        assert!(none(&popped), "the screen is in its own window");
+        popped[0].popped = false;
+        popped[1].popped = true;
+        assert!(none(&popped), "so is the webcam");
+        // An audio-only sender is no picture.
+        let info = StreamInfo { owner: 7, stream_id: 5, kind: StreamKind::Audio, label: "Desktop audio".into(), width: 0, height: 0 };
+        let mut audio = [item("Jonas", "Desktop audio", Kind::Audio((ROOM, 7, 5), info)), video("Jonas", "Webcam", 2)];
+        audio[0].id.audio = true;
+        assert!(none(&audio));
+    }
+
+    /// Your own webcam goes into your own screen (both are `who == ""`), and one parent holds one webcam.
+    #[test]
+    fn your_own_webcam_sits_in_your_own_screen_and_one_parent_holds_one_webcam() {
+        let items = [item("", "", Kind::Mine(CaptureSourceId(0), DestinationId(0))), item("", "Webcam", Kind::Mine(CaptureSourceId(1), DestinationId(1)))];
+        assert_eq!(pip_pairs(&items, &order(&items))[&items[0].id], 1);
+        let two = [video("Jonas", "Screen", 1), video("Jonas", "Webcam", 2), video("Jonas", "Webcam", 3)];
+        let pairs = pip_pairs(&two, &order(&two));
+        assert_eq!(pairs.len(), 1, "the second webcam keeps its tile");
+        // Another room's person of the same name is another person.
+        let mut other_room = [video("Jonas", "Screen", 1), video("Jonas", "Webcam", 2)];
+        other_room[1].id.room = RoomHandle(2);
+        assert!(pip_pairs(&other_room, &order(&other_room)).is_empty());
+    }
 }

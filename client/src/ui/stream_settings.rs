@@ -761,7 +761,7 @@ fn staged_share(cx: &Cx) -> u32 {
 /// A slider row's value to push: on release of a drag, or on a non-drag
 /// change (a click on the track, a typed / dragged value box). While a drag
 /// is running the value lives in `buf`.
-fn commit(r: Response, value: u32, buf: &mut Option<u32>) -> Option<u32> {
+pub(super) fn commit(r: Response, value: u32, buf: &mut Option<u32>) -> Option<u32> {
     if r.dragged() && !r.drag_stopped() {
         *buf = Some(value);
         return None;
@@ -830,7 +830,7 @@ fn seg_spans(ui: &Ui, inner_w: f32, labels: &[&str]) -> Vec<(f32, f32)> {
         .collect()
 }
 
-fn seg_gated<T: PartialEq + Copy>(ui: &mut Ui, dump: &str, current: &mut T, options: &[(T, &str, bool, &str)], disabled_tip: &str) -> bool {
+pub(super) fn seg_gated<T: PartialEq + Copy>(ui: &mut Ui, dump: &str, current: &mut T, options: &[(T, &str, bool, &str)], disabled_tip: &str) -> bool {
     let w = ui.available_width();
     let (outer, resp) = ui.allocate_exact_size(vec2(w, theme::CTL_H), Sense::hover());
     let cr = |r: u8| CornerRadius::same(r);

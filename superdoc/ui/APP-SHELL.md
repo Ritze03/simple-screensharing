@@ -187,11 +187,14 @@ or live opens the Stream settings modal; its arrow opens the **Share menu** (Off
 codec and rate; FPS and Preset for the live destination or the next stream; Change source, All stream settings…, Go live
 in / Stop sharing; a recovering or encoder-bound note). *Share audio* is enabled next to a screen only (audio rides along
 with it, tooltip says so); its arrow is today's source list with meters, mute and stop (`share::audio_menu`; I7 adds Desktop
-audio, audio-only and the settings). *Webcam* is present, disabled with a tooltip, and has no menu until I8 (its arrow
-will offer the camera and "All webcam settings…"); I7 and I8 only enable their `Split` in `bar::share_buttons` and add a
-`BarMenu` body in `menus.rs`. Layout menu: Split / Crop / Floating (two-line items), a disabled "Webcam in picture", Always
-show names, Hide my own streams (removes your screen and webcam from your stage only, others still see them), Reset sizes
-and positions. Room settings menu: header, Auto-connect, Rename, Copy invite link, Leave room, Forget room (the modals
+audio, audio-only and the settings). *Webcam* (I8) is a share of its own, no screen needed: click starts it (the saved
+camera in its saved mode, into the room the bar acts on; from another room it **moves**) and the next click stops it; its
+arrow opens **only** the camera list (name and `/dev/video0` under it, the current one ticked; a new camera resets the
+mode) and "All webcam settings…" (`share::webcam_menu`, `BarMenu::Webcam`). It is disabled with the reason as its tooltip
+when there is no `v4l2src` plugin, no camera ("Looking for cameras…" while the first listing runs) or off Linux, and a
+running webcam lights it green. Layout menu: Split / Crop / Floating (two-line items), **Webcam in picture** (per view),
+Always show names, Hide my own streams (removes your screen and webcam, in-picture webcam included, from your stage only,
+others still see them), Reset sizes and positions (also forgets the PIP spots and sizes). Room settings menu: header, Auto-connect, Rename, Copy invite link, Leave room, Forget room (the modals
 the old header used). Bar layout and narrow windows: see "Narrow windows".
 
 **The people strip and hover card** (task I3, `stage/strip.rs`): one 64 px cell per person (you first); ring, avatar, LIVE
@@ -263,6 +266,51 @@ slots (`widgets::HBox`, row helpers, `card`/`well`/`band`/`grid_rows`/`modal_she
 one takes the rest" is exactly what panels express; hand-computed `add_space` fillers would
 re-derive the split every frame and silently break when content height changes.
 
+**Webcam and webcam in picture** (task I8, 2026-11-04; `ui/webcam_settings.rs`, `stage/pip.rs`, `stage/geom.rs`; replica
+`superdoc/ui/replica/index.html` `camMenu`, `camModal`, `.pip`, `snapPip`, `layoutPip`; the design notes are in
+`STYLING-GUIDE.md` "Stream settings and webcam"; the capture side in `features/stream-control.md` "Webcam capture").
+
+- **Your webcam** is an item of your own stage like your screen (`Kind::Mine`, `ItemId.label == "Webcam"`, `who == ""`):
+  a tile `You · Webcam` with the live preview (while the window is focused, else the placeholder "Your webcam · live"),
+  a viewer chip and a Webcam settings button (not Stream settings), its `⋯` menu says Webcam settings… / Stop webcam.
+  Someone else's webcam is a stream whose label starts with `Webcam` (`webcam::is_webcam_label`): an idle tile with a
+  Watch button, a watched tile with a `videocam` icon in its tag and no audio row ("No audio in this stream").
+- **The webcam modal** (width `MODAL_W_WIDE`): *Source* card with **Camera** and **Mode** dropdowns (`menu::select`; the Mode
+  list holds every mode the camera really offers, `1280×720 · 30 fps · MJPG`, usable ones first, and opens scrolled to
+  the current one), *Compression* with **Codec** (when the machine encodes more than one) and **Bitrate** (200-12000,
+  `Set by upload budget` in Absolute bandwidth mode), the fixed-encoder note, footer `[Start webcam | Stop webcam][fill][Done]`.
+  Everything acts at once; camera and mode restart a running webcam, codec and bitrate change it live.
+  Opened from the arrow's item, the tile's gear and `⋯`, and the sidebar's Outgoing popover (`Modal::WebcamSettings`).
+- **Webcam in picture** (Layout menu checkbox, **per view** and off until switched on: `StageSettings::pip`,
+  `UiAction::SetStagePip`) moves a person's webcam into their first screen share that is **playing on this stage**
+  (`pip_pairs`: yours, or one you watch, not popped out; one parent holds one webcam). With none, with a share you do
+  not watch (its tile holds the Watch button), with the share popped out, or while you do not watch the webcam itself,
+  the webcam stays a tile. Your own webcam goes into your own screen the same way. Hide my own streams hides both.
+  *Why a tile again in those cases:* a webcam you cannot see playing in a picture would have no Watch button anywhere.
+- **Position and size** (`geom::PipPos`, per webcam and per view in `ViewGeom::pip`; replica `layoutPip`): the size is a
+  fraction of the **picture's** width (default .24, minimum 72 px, never more than what shows) and the place is one of
+  **eight spots** (corners and the middle of each side, 12 px inset, less in a small picture), default bottom right.
+  Only a drag in progress is free; **on release it goes to the nearest spot** (`snap_pip`), so the spot stays across
+  layouts, tile resizes, the stage's fullscreen, a popped-out stage and stream fullscreen of the parent. It stays inside the
+  **visible** part of the picture, in Crop too (Crop shows the middle of a wider picture; the stored value is kept, so
+  Split gets the old spot back). Drag past an edge stops at the edge. A click does nothing. The handle (20 px, drawn as the
+  replica's L) is on the corner **facing the middle of the picture** and resizes with the aspect locked and the opposite
+  corner fixed (`resize_pip`). Right click: the webcam's own stream menu; double click: its fullscreen. *Why the handle faces
+  the middle:* a PIP pushed into a corner could otherwise only shrink, and in Floating its handle would land on the window's
+  own; the PIP is registered above its tile and below the floating window's grip, so a press on it never moves or resizes the
+  tile under it. Deviations from the replica: **square corners** (a video is a wgpu paint callback that cannot be clipped to a
+  rounded rect; an outline and a shadow set it off) and **no snap glide** (the spot is the state, not a transition).
+- **Fullscreen and pop-out:** the stage's own fullscreen and a popped-out stage draw the PIP with the stage; **stream
+  fullscreen** (`Nav::fullscreen`, the double-click one) calls `stage::fullscreen_pip` for the parent's webcam (same
+  spot, same size, same drag). A **stream pop-out window** (`popout.rs`) of the parent shows that stream alone, no PIP,
+  and the webcam is a tile on the stage while the parent is popped out (shortest rule, the replica's: a popped-out parent is
+  not playing on the stage).
+- **Strip:** a webcam inside a picture says `In picture` on its owner's hover card.
+- **Rig names** (`SSS_UI_DUMP`): `pip.N` and `pip.N.grip` (N = the parent's tile index; `pip.fs` in stream fullscreen),
+  `pipinfo N spot=C,R w=.. handle=tl|tr|bl|br who=..`, `menu.pip`, and in the modal `webcam.camera`, `webcam.mode`,
+  `webcam.bitrate`, `webcam.footer`, `webcam_codec.I`, `webcam_modes N`, `webcam_mode KEY`. `hs-pip-spots.py` drags a PIP
+  onto all 8 spots with the real pointer. `CLIENT_ENV_1="SSS_FAKE_CAMERA=1"` gives a client a moving test camera.
+
 ## Module map (`client/src/ui/`)
 
 | File | Owns |
@@ -270,7 +318,8 @@ re-derive the split every frame and silently break when content height changes.
 | `mod.rs` | `App` (eframe app: polls the session, lays out the panels, runs modals/toasts, applies actions); `View` (`Welcome` / `Watching` / `Room(RoomKey)`); `Modal`, `PopoverKind`/`Popover`; `Nav { view, modal, popover }`; `Shell` (staged shares, toasts, create/join results, level taps); `UiAction` (every cross-screen action); `Cx`; selectors (`room_entries`, `ShareState`, `same_room`, ...); the shared `tr` / `tr_with` i18n fallback helpers |
 | `apply.rs` | `App::apply`: the **only** place a `UiAction` changes state. Thin calls into the lib (`session.rs`) plus nav/shell bookkeeping |
 | `video.rs` | `VideoViews`: one GPU `VideoView` per watched stream, keyed by `StreamKey = (RoomHandle, ConnId, StreamId)`, synced once per frame; `popped` flag + `close_requested` for pop-outs |
-| `stage/` | the stage (`mod.rs`: `StageState`, `StageSettings`, `StageView`/`StageLayout`, `Host`, `ItemId`, items, input, painting, `show_main` / `show_windows`; `geom.rs`: pure grid / bar / floating maths; `tile.rs`: video, idle, audio-only and own tiles, the name tag with stats, the hover buttons, the viewers dropdown, the stream menu's volume row; `bar.rs`: the control bar and its pure `arrange`; `strip.rs`: people strip and hover card; `menus.rs`: bar dropdowns and the stream menu; `chrome.rs`: the fullscreen auto-hide rule) |
+| `stage/` | the stage (`mod.rs`: `StageState`, `StageSettings`, `StageView`/`StageLayout`, `Host`, `ItemId`, items, input, painting, `show_main` / `show_windows`; `geom.rs`: pure grid / bar / floating / webcam-in-picture maths; `pip.rs`: one webcam in picture, drawn and dragged; `tile.rs`: video, idle, audio-only and own tiles, the name tag with stats, the hover buttons, the viewers dropdown, the stream menu's volume row; `bar.rs`: the control bar and its pure `arrange`; `strip.rs`: people strip and hover card; `menus.rs`: bar dropdowns and the stream menu; `chrome.rs`: the fullscreen auto-hide rule) |
+| `webcam_settings.rs` | the webcam modal (task I8): Source (camera, mode), Compression (codec, bitrate), "Encoder: Performance · Keyframe 2000 ms", footer `[Start / Stop webcam][Done]` |
 | `menu.rs` | the app's menu style beyond `pop_item`: `menu::select` (a dropdown field), `switch_row`, the popover frame |
 | `share.rs` | the bar's Share screen and Share audio dropdown bodies, level-meter taps, "Also send to / Move to" lists (`RoomTargets`), pills, formatting, popover rows shared with the stream-settings modal (this was `action_bar.rs`) |
 | `sidebar.rs` | brand band, body (Watched streams well, ROOMS heading, rooms well with sharer sub-rows, Create-or-join), user band (avatar, "Live in N rooms" / "Not sharing" -> Outgoing popover, settings gear) |

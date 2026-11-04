@@ -70,6 +70,9 @@ pub fn select(ui: &mut Ui, id_salt: impl std::hash::Hash, selected: &mut usize, 
 
     let mut picked = None;
     let w = rect.width();
+    // The list opens scrolled to the current choice (once, so the user can still scroll away): with a long list
+    // (a camera's 200 modes) the current one is otherwise far below the fold.
+    let opened_now = !ui.data(|d| d.get_temp::<bool>(popup_id).unwrap_or(false));
     Popup::from_toggle_button_response(&resp)
         .id(popup_id)
         .kind(PopupKind::Menu)
@@ -91,6 +94,9 @@ pub fn select(ui: &mut Ui, id_salt: impl std::hash::Hash, selected: &mut usize, 
                     }
                     last_group = o.group;
                     let r = option_row(ui, o, i == *selected);
+                    if opened_now && i == *selected {
+                        r.scroll_to_me(Some(Align::Center));
+                    }
                     super::drive_dump::rect(|| format!("opt.{i}"), r.rect);
                     if r.clicked() {
                         picked = Some(i);
@@ -98,6 +104,8 @@ pub fn select(ui: &mut Ui, id_salt: impl std::hash::Hash, selected: &mut usize, 
                 }
             });
         });
+    let open_now = Popup::is_id_open(ui.ctx(), popup_id);
+    ui.data_mut(|d| d.insert_temp(popup_id, open_now));
     if let Some(i) = picked
         && i != *selected
     {

@@ -52,6 +52,11 @@ fn bar_menu(ctx: &egui::Context, cx: &mut Cx, st: &mut StageState, view: &StageV
                 close = share::audio_menu(ui, cxr, room, &mut out);
             }
         }
+        BarMenu::Webcam => {
+            if let Some((room, _)) = target {
+                close = share::webcam_menu(ui, cxr, room, &mut out);
+            }
+        }
         BarMenu::Layout => reset = layout_menu(ui, cxr, view, &mut out, &mut close),
         BarMenu::Room => {
             if let Some(r) = &room {
@@ -103,10 +108,12 @@ fn layout_menu(ui: &mut Ui, cx: &Cx, view: &StageView, out: &mut Vec<UiAction>, 
     share::pop_sep(ui);
     let pad = Margin::symmetric(8, 0);
     egui::Frame::NONE.inner_margin(pad).show(ui, |ui| {
-        // Webcam in picture comes with the webcam (I8).
-        let mut off = false;
-        widgets::checkbox_enabled(ui, &mut off, &tr("ui.stage.pip", "Webcam in picture"), false)
-            .on_hover_text(tr("ui.bar.webcam_soon", "Webcam sharing is not available yet"));
+        let mut pip = cx.shell.stage.pip(view);
+        let r = widgets::checkbox(ui, &mut pip, &tr("ui.stage.pip", "Webcam in picture"));
+        drive_dump::rect(|| "menu.pip".into(), r.rect);
+        if r.on_hover_text(tr("ui.stage.pip_tip_menu", "A webcam sits inside its owner's screen share, if they have one running")).changed() {
+            out.push(UiAction::SetStagePip { view: view.clone(), on: pip });
+        }
         let mut names = cx.shell.stage.always_names;
         let r = widgets::checkbox(ui, &mut names, &tr("ui.stage.always_names", "Always show names"));
         drive_dump::rect(|| "menu.always_names".into(), r.rect);
@@ -278,6 +285,17 @@ fn tile_menu_body(
                 *close = true;
             }
         }
+        Kind::Mine(capture, destination) if it.is_cam() => {
+            if widgets::pop_item(ui, &PopItem::new("tune", &tr("ui.webcam.settings_item", "Webcam settings…"))).clicked() {
+                out.push(UiAction::OpenModal(Modal::WebcamSettings { room: it.id.room }));
+                *close = true;
+            }
+            let _ = (capture, destination);
+            if widgets::pop_item(ui, &PopItem::new("videocam_off", &tr("ui.webcam.stop_item", "Stop webcam")).danger()).clicked() {
+                out.push(UiAction::StopWebcam);
+                *close = true;
+            }
+        }
         Kind::Mine(capture, destination) => {
             if widgets::pop_item(ui, &PopItem::new("tune", &tr("ui.bar.all_stream_settings", "Stream settings…"))).clicked() {
                 out.push(UiAction::OpenModal(Modal::StreamSettings { capture: *capture, room: it.id.room }));
@@ -298,7 +316,10 @@ fn header_text(cx: &Cx, it: &Item, combined: bool) -> (String, String) {
         if tail.is_empty() { label } else { format!("{label} · {tail}") }
     };
     match &it.kind {
-        Kind::Mine(capture, _) => (tr("ui.stage.your_stream", "Your stream"), place(cx.capture(*capture).map(|c| share_label(&c.label)).unwrap_or_default(), String::new())),
+        Kind::Mine(capture, _) => {
+            let who = if it.is_cam() { tr("ui.stage.your_webcam", "Your webcam") } else { tr("ui.stage.your_stream", "Your stream") };
+            (who, place(cx.capture(*capture).map(|c| share_label(&c.label)).unwrap_or_default(), String::new()))
+        }
         Kind::Video(key) | Kind::Idle(key, _) | Kind::Audio(key, _) => {
             let info = cx.session(key.0).and_then(|s| s.streams.iter().find(|i| i.owner == key.1 && i.stream_id == key.2));
             let size = cx.videos.frame_size(*key).map(|(w, h)| format!("{w}×{h}")).unwrap_or_default();

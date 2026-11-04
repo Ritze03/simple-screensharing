@@ -22,7 +22,8 @@ opus                 # opusenc, opusdec
 debug                # capssetter
 level                # level (capture level meter)
 replaygain           # rglimiter (limiter after the sender-side audio boost, #114; optional: the share runs without it)
-jpeg                 # jpegdec
+jpeg                 # jpegdec (also the MJPEG decode of a webcam)
+video4linux2         # v4l2src, webcam sharing (task I8; the device monitor lists cameras with it too). Missing = the webcam button is disabled with a tooltip, nothing else changes
 videoparsersbad      # h264parse, h265parse, av1parse
 typefindfunctions    # caps detection for the parsers
 pipewire             # pipewiresrc, pipewiresink (links the HOST libpipewire; the PATCHED build from /opt/pipewire-gst, see Dockerfile)

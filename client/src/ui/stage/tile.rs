@@ -158,10 +158,12 @@ pub(super) fn video_tile(ui: &mut Ui, cx: &Cx, key: StreamKey, s: &Spot, acts: &
         let owner = cx.member_name(key.0, key.1);
         let name = if s.cross_room { format!("{owner} · {}", cx.room_name(key.0)) } else { owner };
         let label = cx.session(key.0).and_then(|x| x.streams.iter().find(|i| i.owner == key.1 && i.stream_id == key.2)).map(|i| share_label(&i.label)).unwrap_or_default();
-        let (icon, col) = match (has_audio, audible) {
-            (false, _) => ("volume_off", theme::TEXT_DIM),
-            (true, false) => ("volume_off", theme::DANGER),
-            (true, true) => ("volume_up", theme::TEXT_DIM),
+        // A webcam has no audio of its own: its icon says what it is instead.
+        let (icon, col) = match (cx.is_webcam_stream(key), has_audio, audible) {
+            (true, ..) => ("videocam", theme::TEXT_DIM),
+            (_, false, _) => ("volume_off", theme::TEXT_DIM),
+            (_, true, false) => ("volume_off", theme::DANGER),
+            (_, true, true) => ("volume_up", theme::TEXT_DIM),
         };
         let nums = (s.stats && s.hovered).then(|| stream_nums(cx, key));
         let max_w = s.rect.width() - 2.0 * theme::S2 - if s.hovered { TOOLS_RESERVE } else { 0.0 };
@@ -305,10 +307,8 @@ pub(super) fn mine_tile(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSou
     let Some(d) = c.destinations.get(&destination) else { return };
     let rect = s.rect;
     let radius = CornerRadius::same(s.round);
-    // Asking for the preview is what keeps it running: only a focused window paints this (`App::poll_live_previews`).
-    if c.kind == StreamKind::Video && ui.ctx().input(|i| i.viewport().focused.unwrap_or(true) && !i.viewport().minimized.unwrap_or(false)) {
-        acts.push(UiAction::LivePreviewSeen(capture));
-    }
+    let webcam = c.is_webcam();
+    ask_live_preview(ui, c, capture, acts);
     let state = cx.destination_state(c, d);
     let recovering = cx.state.recovery(capture).is_some() && matches!(state, DestinationState::Live | DestinationState::Stalled { .. } | DestinationState::Failed(_));
     let (chip, on_air) = if recovering {
@@ -327,9 +327,11 @@ pub(super) fn mine_tile(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSou
         paint_cover(ui.painter(), rect, tex, radius, Color32::WHITE);
     } else {
         widgets::paint_hatch(ui.painter(), rect, radius, 8.0, theme::ELEV_19, theme::ELEV_14);
-        thumb_placeholder(ui, rect, "cast", theme::SUCCESS, &format!("{} · {}", tr("ui.room.my_screen", "Your screen"), chip.to_lowercase()));
+        let (icon, what) = if webcam { ("videocam", tr("ui.room.my_webcam", "Your webcam")) } else { ("cast", tr("ui.room.my_screen", "Your screen")) };
+        thumb_placeholder(ui, rect, icon, theme::SUCCESS, &format!("{what} · {}", chip.to_lowercase()));
     }
-    if state == DestinationState::Starting && cx.state.capture_awaiting_first_frame(capture) {
+    // A camera has frames at once; the hint is about a screen that sends nothing while it does not change.
+    if !webcam && state == DestinationState::Starting && cx.state.capture_awaiting_first_frame(capture) {
         ui.interact(rect, Id::new(("stage_mine_hint", capture, destination)), Sense::hover())
             .on_hover_text(tr("ui.waiting_frame_hint", "An idle screen sends no picture until something on it changes. Move the mouse over the shared screen and the stream starts."));
     }
@@ -338,7 +340,7 @@ pub(super) fn mine_tile(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSou
     // starting, stalled or failed share must say so, whatever the placeholder under it shows).
     if s.hovered || s.always_names || !on_air {
         let max_w = rect.width() - 2.0 * theme::S2 - if s.hovered { 2.0 * OVL_H + 3.0 * theme::S1 + 120.0 } else { 0.0 };
-        let tag = name_tag(ui, rect, max_w, "cast", if on_air { theme::SUCCESS } else { theme::WARNING }, &tr("ui.room.you", "You"), &label, None);
+        let tag = name_tag(ui, rect, max_w, if webcam { "videocam" } else { "cast" }, if on_air { theme::SUCCESS } else { theme::WARNING }, &tr("ui.room.you", "You"), &label, None);
         drive_dump::rect(|| format!("tag.{}", s.n), tag);
     }
     if !s.hovered {
@@ -361,11 +363,25 @@ pub(super) fn mine_tile(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSou
         widgets::chip_dark(&mut r, None, false, &tr("ui.room.preview_chip", "PREVIEW"))
             .on_hover_text(tr("ui.room.preview_tip", "A live preview of your screen, shown while this window is focused. Viewers get the full quality stream."));
     }
-    if round_btn(ui, btn, Id::new(("stage_mine_settings", capture)), "tune", &tr("ui.room.stream_settings", "Stream settings"), false).clicked() {
-        acts.push(UiAction::OpenModal(Modal::StreamSettings { capture, room: h }));
+    let (tip, modal) = if webcam {
+        (tr("ui.room.webcam_settings", "Webcam settings"), Modal::WebcamSettings { room: h })
+    } else {
+        (tr("ui.room.stream_settings", "Stream settings"), Modal::StreamSettings { capture, room: h })
+    };
+    if round_btn(ui, btn, Id::new(("stage_mine_settings", capture)), "tune", &tip, false).clicked() {
+        acts.push(UiAction::OpenModal(modal));
     }
     if round_btn(ui, more, Id::new(("stage_mine_more", capture)), "more_horiz", &tr("ui.stage.stream_menu", "Volume and more"), false).clicked() {
         acts.push(UiAction::OpenPopover(Popover { kind: PopoverKind::Tile(s.id.clone()), anchor: more }));
+    }
+}
+
+/// Asking for the live preview is what keeps it running: only a focused window paints this
+/// (`App::poll_live_previews`). The own tile of a share does it every pass it is drawn, and so does a webcam's
+/// picture-in-picture, which stands in for its tile.
+pub(super) fn ask_live_preview(ui: &Ui, c: &simple_screensharing_client::session::LocalCapture, capture: CaptureSourceId, acts: &mut Vec<UiAction>) {
+    if c.kind == StreamKind::Video && ui.ctx().input(|i| i.viewport().focused.unwrap_or(true) && !i.viewport().minimized.unwrap_or(false)) {
+        acts.push(UiAction::LivePreviewSeen(capture));
     }
 }
 
@@ -377,7 +393,7 @@ pub(super) fn fmt_kbps(kbps: f64) -> String {
 const OVL_H: f32 = 29.0;
 
 /// Cover-fit a preview texture into `rect` (crop, never letterbox), tinted by `tint`.
-fn paint_cover(p: &egui::Painter, rect: Rect, tex: &egui::TextureHandle, radius: CornerRadius, tint: Color32) {
+pub(super) fn paint_cover(p: &egui::Painter, rect: Rect, tex: &egui::TextureHandle, radius: CornerRadius, tint: Color32) {
     let [tw, th] = tex.size();
     let (ta, ra) = (tw as f32 / th.max(1) as f32, rect.width() / rect.height());
     let uv = if ta > ra {

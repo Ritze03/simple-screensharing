@@ -7,10 +7,11 @@
 //!   button by a separator line; a lit split button is green (live) or accent (ready). Leave is as tall as a
 //!   group (50 px). The people button shows and hides the strip; there is no people list and no arrow
 //!   above the avatars.
-//! - **Share audio and Webcam** are complete split buttons (look, tooltips, arrow) so their later rows only
-//!   have to switch them on: the Webcam one is disabled with a tooltip until I8 and has no dropdown body;
-//!   Share audio (I7) is a share of its own: one click turns Desktop audio on, the next off, with no screen
-//!   needed; its arrow opens the source list (`share::audio_menu`) and "All audio settings…".
+//! - **Share audio and Webcam** are shares of their own, no screen needed. Audio (I7): one click turns Desktop
+//!   audio on, the next off; its arrow opens the source list (`share::audio_menu`) and "All audio settings…".
+//!   Webcam (I8): one click starts the camera (the saved one, in its saved mode), the next stops it; its arrow only
+//!   offers the cameras and "All webcam settings…" (`share::webcam_menu`, the modal is `webcam_settings.rs`). It is
+//!   disabled, with the reason as its tooltip, while there is no `v4l2src`, no camera, or off Linux.
 //! - **Narrow windows** (800 px minimum, a ~528 px stage): the label of Copy invite link goes first, then the
 //!   bar takes two rows (the middle part on top, the side buttons under it). Icons never move into a menu.
 //!   Pure rule: [`arrange`]. Check en and de.
@@ -19,6 +20,7 @@
 use egui::emath::GuiRounding;
 use egui::{Align, Color32, CornerRadius, Id, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use simple_screensharing_client::audio::AudioChoice;
+use simple_screensharing_client::capture::webcam;
 use simple_screensharing_client::session::RoomHandle;
 
 use super::{Host, StageLayout, StageState, StageView};
@@ -27,11 +29,12 @@ use crate::ui::share::{self, live_elsewhere};
 use crate::ui::{ConnState, Cx, PopoverKind, RoomEntry, ShareState, UiAction, drive_dump, tr, tr_with};
 use crate::widgets::{self, DISABLED_OPACITY, paint_icon, paint_text, text_width};
 
-/// A dropdown of the bar (`PopoverKind::Bar`). Webcam gets its own in I8.
+/// A dropdown of the bar (`PopoverKind::Bar`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BarMenu {
     Share,
     Audio,
+    Webcam,
     Layout,
     Room,
 }
@@ -315,10 +318,35 @@ impl Bar {
             cx.toggle_popover(PopoverKind::Bar(BarMenu::Audio), rect);
         }
         bx += SPLIT_W + GROUP_GAP;
-        // --- Webcam: present, disabled until I8 (the arrow will offer the camera and "All webcam settings…") ---
+        // --- Webcam (task I8): its own share. One click starts or stops it; the arrow offers the camera and
+        // "All webcam settings…". ---
+        if !cx.state.webcams_requested {
+            cx.act(UiAction::RefreshWebcams);
+        }
         let rect = Rect::from_min_size(pos2(bx, by), vec2(SPLIT_W, BTN_H));
-        let tip = tr("ui.bar.webcam_soon", "Webcam sharing is not available yet");
-        split(ui, rect, &Split { name: "webcam", icon: "videocam_off", tone: Tone::Off, enabled: false, tip: &tip, caret_tip: &tip, open: false });
+        let live_here = cx.webcam_share(room).is_some();
+        let camera = cx.state.webcam_choice().map(|(c, _)| cx.state.webcams[c].name.clone()).unwrap_or_default();
+        let with_camera = |key: &str, en: &'static str| tr_with(key, en, &[("camera", &camera)]);
+        let (tone, icon, tip, enabled) = match webcam::unavailable() {
+            Some(webcam::Unavailable::Platform) => (Tone::Off, "videocam_off", tr("ui.bar.webcam_platform", "Webcam sharing is not available on this system yet"), false),
+            Some(webcam::Unavailable::NoPlugin) => (Tone::Off, "videocam_off", tr("ui.bar.webcam_no_plugin", "Webcam sharing needs GStreamer's video4linux2 plugin (v4l2src), which is not installed"), false),
+            None if live_here => (Tone::On, "videocam", with_camera("ui.bar.stop_webcam_tip", "Stop sharing your webcam (%{camera})"), true),
+            None if cx.state.webcams.is_empty() => {
+                let looking = !cx.state.webcams_requested || cx.state.webcams_listing();
+                (Tone::Off, "videocam_off", if looking { tr("ui.bar.webcam_looking", "Looking for cameras…") } else { tr("ui.bar.webcam_none", "No camera found") }, false)
+            }
+            None if cx.state.webcam_share().is_some() => (Tone::Off, "videocam_off", with_camera("ui.bar.move_webcam_tip", "Move your webcam here (%{camera})"), true),
+            None => (Tone::Off, "videocam_off", with_camera("ui.bar.share_webcam_tip", "Share your webcam (%{camera})"), true),
+        };
+        let (main, caret) = split(ui, rect, &Split { name: "webcam", icon, tone, enabled, tip: &tip, caret_tip: &tr("ui.bar.webcam_caret", "Pick a camera"), open: open(cx, BarMenu::Webcam) });
+        if main {
+            cx.act(if live_here { UiAction::StopWebcam } else { UiAction::StartWebcam(room) });
+        } else if caret {
+            if cx.popover_of(&PopoverKind::Bar(BarMenu::Webcam)).is_none() {
+                cx.act(UiAction::RefreshWebcams);
+            }
+            cx.toggle_popover(PopoverKind::Bar(BarMenu::Webcam), rect);
+        }
     }
 }
 

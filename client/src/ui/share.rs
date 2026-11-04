@@ -15,7 +15,7 @@ use simple_screensharing_client::audio::{AudioChoice, AudioGroup};
 use simple_screensharing_client::capture::destination::{DestinationState, EncoderLimited};
 use simple_screensharing_client::presets::{self, EncoderPreset, EncoderTuning};
 use simple_screensharing_client::protocol::StreamKind;
-use simple_screensharing_client::rooms::BandwidthMode;
+use simple_screensharing_client::rooms::{BandwidthMode, WebcamSettings};
 use simple_screensharing_client::session::{
     CaptureSourceId, Destination, DestinationId, LocalCapture, PendingRole, RoomHandle, ShareHandle, ShareStatus,
 };
@@ -39,9 +39,10 @@ pub(super) fn share_target(cx: &Cx, view: &StageView) -> Option<(RoomHandle, Sha
             let all: Vec<(RoomHandle, ShareState)> =
                 cx.rooms().iter().filter_map(|r| r.handle).map(|h| (h, super::share_state(cx.state, cx.shell, h))).collect();
             let live = all.iter().find(|(_, s)| matches!(s, ShareState::Live { .. }));
-            // Sharing only audio counts too: the audio button stays to turn it off.
+            // Sharing only audio counts too: the audio button stays to turn it off. So does a webcam alone.
             let audio_only = || all.iter().find(|(h, _)| cx.audio_share(*h).is_some());
-            live.or_else(|| all.iter().find(|(_, s)| !matches!(s, ShareState::Idle))).or_else(audio_only).copied()
+            let webcam_only = || all.iter().find(|(h, _)| cx.webcam_share(*h).is_some());
+            live.or_else(|| all.iter().find(|(_, s)| !matches!(s, ShareState::Idle))).or_else(audio_only).or_else(webcam_only).copied()
         }
     }
 }
@@ -217,6 +218,30 @@ fn go_live_item(ui: &mut Ui, label: &str) -> bool {
     row.icon(ui, 0, "cast", 16.0, theme::PRIMARY_TEXT);
     row.text(ui, 1, label, font(Weight::Bold, theme::FS_LABEL), theme::PRIMARY_TEXT, Align::Min);
     row.response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+}
+
+/// The dropdown of the bar's webcam button (replica `camMenu`): only the camera, picked at once (a new camera
+/// resets the mode to its default, and a running webcam restarts on it), and "All webcam settings…" for the rest.
+/// Returns true when it should close.
+pub(super) fn webcam_menu(ui: &mut Ui, cx: &Cx, room: RoomHandle, out: &mut Vec<UiAction>) -> bool {
+    pop_heading(ui, &tr("ui.webcam.camera_heading", "Camera"));
+    let current = cx.state.webcam_choice().map(|(c, _)| c);
+    let mut close = false;
+    if cx.state.webcams.is_empty() {
+        pop_note(ui, &tr("ui.bar.webcam_none", "No camera found"));
+    }
+    for (i, cam) in cx.state.webcams.iter().enumerate() {
+        if widgets::pop_item(ui, &PopItem::new("videocam", &cam.name).sub(&cam.device).selected(current == Some(i))).clicked() {
+            out.push(UiAction::SetWebcam(WebcamSettings { camera: cam.name.clone(), mode: String::new(), ..cx.state.webcam.clone() }));
+            close = true;
+        }
+    }
+    pop_sep(ui);
+    if widgets::pop_item(ui, &PopItem::new("tune", &tr("ui.webcam.all_settings", "All webcam settings…"))).clicked() {
+        out.push(UiAction::OpenModal(Modal::WebcamSettings { room }));
+        close = true;
+    }
+    close
 }
 
 /// The label of our audio share in `room`, if there is one ("Desktop audio" or the app's name).

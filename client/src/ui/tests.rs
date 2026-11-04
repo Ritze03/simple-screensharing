@@ -615,6 +615,8 @@ fn share_label_translates_known_defaults_only() {
     assert_eq!(share_label(""), here);
     assert_eq!(share_label("Screen"), tr("ui.stream.screen", "Screen"));
     assert_eq!(share_label("Spotify"), "Spotify");
+    // Task I8: the webcam's wire label is `Webcam` in every language.
+    assert_eq!(share_label("Webcam"), tr("ui.stream.webcam", "Webcam"));
 }
 
 /// A failed Connect's reason is kept per room (any spelling of it) and
@@ -1038,6 +1040,70 @@ async fn the_audio_settings_menu_draws_and_the_exclusion_list_filters_the_source
     assert_eq!(names(&app).len(), 3);
     assert!(simple_screensharing_client::rooms::AppSettings::load().audio_exclusions.is_empty(), "an empty list stays empty");
     frame(&mut app, &ctx, size);
+}
+
+/// Task I8: the webcam menu and its modal draw with a camera listed (and with none), a camera or mode picked in it is
+/// saved (and a new camera resets the mode), and the Layout menu's "Webcam in picture" is a per-view option.
+#[tokio::test]
+async fn the_webcam_menu_and_modal_draw_and_picks_are_saved_and_the_pip_option_is_per_view() {
+    use super::stage::BarMenu;
+    use simple_screensharing_client::capture::webcam::{Camera, Mode};
+    use simple_screensharing_client::rooms::{AppSettings, WebcamSettings};
+    let _home = isolated_home();
+    let mut app = app_with_rooms(&[]);
+    let ctx = ctx();
+    let size = egui::vec2(1280.0, 800.0);
+    let mode = |format: &str, w, h, fps| Mode { format: format.into(), width: w, height: h, fps_num: fps, fps_den: 1 };
+    let cams = vec![
+        Camera { name: "Cam A".into(), device: "/dev/video0".into(), modes: vec![mode("MJPG", 1280, 720, 30), mode("YUY2", 640, 480, 15)] },
+        Camera { name: "Cam B".into(), device: "/dev/video2".into(), modes: vec![mode("MJPG", 640, 480, 30)] },
+    ];
+    let draw = |app: &mut App| {
+        frame(app, &ctx, size);
+        frame(app, &ctx, size);
+    };
+
+    // No camera listed: the modal and the dropdown still draw.
+    app.apply(&ctx, UiAction::OpenModal(Modal::WebcamSettings { room: RoomHandle(1) }));
+    draw(&mut app);
+    app.apply(&ctx, UiAction::CloseModal);
+    app.nav.view = View::Watching;
+    app.apply(&ctx, UiAction::OpenPopover(Popover { kind: PopoverKind::Bar(BarMenu::Webcam), anchor: Rect::from_min_size(egui::pos2(500.0, 540.0), egui::vec2(68.0, 40.0)) }));
+    draw(&mut app);
+    app.apply(&ctx, UiAction::ClosePopover);
+
+    // Two cameras: nothing saved yet resolves to the first camera and its default mode (720p MJPG at 30).
+    app.state.webcams = cams.clone();
+    assert_eq!(app.state.webcam_choice(), Some((0, 0)));
+    assert_eq!(app.state.webcam_spec().map(|s| (s.device, s.mode.key())), Some(("/dev/video0".to_string(), "MJPG 1280x720@30".to_string())));
+    app.apply(&ctx, UiAction::OpenModal(Modal::WebcamSettings { room: RoomHandle(1) }));
+    draw(&mut app);
+
+    // Picking a mode saves camera and mode; a new camera resets the mode; codec and bitrate keep.
+    let saved = || AppSettings::load().webcam;
+    app.apply(&ctx, UiAction::SetWebcam(WebcamSettings { camera: "Cam A".into(), mode: "YUYV 640x480@15".into(), ..app.state.webcam.clone() }));
+    assert_eq!((saved().camera.as_str(), saved().mode.as_str()), ("Cam A", "YUYV 640x480@15"));
+    assert_eq!(app.state.webcam_choice(), Some((0, 1)));
+    app.apply(&ctx, UiAction::SetWebcam(WebcamSettings { codec: simple_screensharing_client::capture::VideoCodec::H265, bitrate_kbps: 1800, ..app.state.webcam.clone() }));
+    app.apply(&ctx, UiAction::SetWebcam(WebcamSettings { camera: "Cam B".into(), mode: String::new(), ..app.state.webcam.clone() }));
+    assert_eq!(app.state.webcam_choice(), Some((1, 0)), "the new camera's default mode");
+    assert_eq!((saved().bitrate_kbps, saved().codec), (1800, simple_screensharing_client::capture::VideoCodec::H265));
+    draw(&mut app);
+    // A saved camera that is unplugged falls back to the first, without forgetting the saved name.
+    app.state.webcams = cams[..1].to_vec();
+    assert_eq!(app.state.webcam_choice(), Some((0, 0)));
+    assert_eq!(app.state.webcam.camera, "Cam B");
+    draw(&mut app);
+
+    // "Webcam in picture" belongs to a view: switching it on in one stage leaves the other alone.
+    let room = StageView::Room(RoomHandle(1));
+    assert!(!app.shell.stage.pip(&StageView::Watched), "off until switched on");
+    app.apply(&ctx, UiAction::SetStagePip { view: StageView::Watched, on: true });
+    assert!(app.shell.stage.pip(&StageView::Watched) && !app.shell.stage.pip(&room));
+    app.apply(&ctx, UiAction::SetStagePip { view: room.clone(), on: true });
+    app.apply(&ctx, UiAction::SetStagePip { view: StageView::Watched, on: false });
+    assert!(!app.shell.stage.pip(&StageView::Watched) && app.shell.stage.pip(&room));
+    draw(&mut app);
 }
 
 /// "Watched streams" is the stage even with nothing watched, and a frame of it draws (the note) without

@@ -65,6 +65,7 @@ fn audible(cx: &Cx, it: &Item) -> bool {
     match &it.kind {
         Kind::Video(key) => cx.stream_has_audio(*key) && cx.session(key.0).is_some_and(|s| !s.volume(key.1, key.2).muted),
         Kind::Audio(key, _) => cx.is_watching(*key) && cx.session(key.0).is_some_and(|s| !s.volume(key.1, key.2).muted),
+        Kind::Mine(..) if it.is_cam() => false,
         Kind::Mine(..) => cx.audio_share(it.id.room).is_some_and(|(id, _)| !cx.state.is_audio_share_muted(id)),
         Kind::Idle(..) => false,
     }
@@ -75,6 +76,7 @@ fn has_audio(cx: &Cx, it: &Item) -> bool {
     match &it.kind {
         Kind::Video(key) | Kind::Idle(key, _) => cx.stream_has_audio(*key),
         Kind::Audio(..) => true,
+        Kind::Mine(..) if it.is_cam() => false,
         Kind::Mine(..) => cx.audio_share(it.id.room).is_some(),
     }
 }
@@ -322,6 +324,8 @@ fn aspect_label(w: u16, h: u16) -> String {
 /// The state line: icon and text (`On the stage · room`; the room only in "Watched"), your own count of viewers.
 fn state_line(cx: &Cx, view: &StageView, it: &Item) -> (&'static str, String) {
     let (icon, mut text) = match &it.kind {
+        _ if it.in_pip => ("picture_in_picture", tr("ui.strip.in_picture", "In picture")),
+        Kind::Mine(..) if it.is_cam() => ("videocam", tr("ui.strip.your_webcam", "Your webcam")),
         Kind::Mine(..) => ("cast", tr("ui.strip.your_stream", "Your stream")),
         _ if it.popped => ("open_in_new", tr("ui.strip.popped", "Popped out")),
         Kind::Video(_) => ("visibility", tr("ui.strip.on_stage", "On the stage")),

@@ -23,6 +23,7 @@ level
 opusenc
 opusdec
 jpegdec
+v4l2src
 h264parse
 h265parse
 av1parse

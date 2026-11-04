@@ -110,6 +110,7 @@ pub mod stream_settings;
 #[cfg(test)]
 mod tests;
 mod video;
+pub mod webcam_settings;
 
 pub use stage::{StageLayout, StageSettings, StageView};
 pub use video::{StreamKey, VideoViews};
@@ -162,6 +163,9 @@ pub enum Modal {
     /// The audio settings menu of the control bar's audio button (task I7): source, Boost and the
     /// exclusion list, for the audio share in `room`. Rendered by [`audio_settings::show`].
     AudioSettings { room: RoomHandle },
+    /// The webcam menu of the control bar's webcam button (task I8): camera, mode, codec and bitrate, for the
+    /// webcam in `room`. Rendered by [`webcam_settings::show`].
+    WebcamSettings { room: RoomHandle },
     /// "Create or join a room" (tabs Join / Create). Form state lives in
     /// `ModalsState`; results come back in `Shell::join_error` /
     /// `Shell::create_result`.
@@ -364,6 +368,16 @@ pub enum UiAction {
     SetBandwidthTotal(u32),
     SetBandwidthFloor(u32),
 
+    // --- webcam (task I8) ---------------------------------------------------
+    /// Start the webcam in `room` (or move it there from another room). Its own share, no screen needed.
+    StartWebcam(RoomHandle),
+    /// Stop the webcam.
+    StopWebcam,
+    /// The webcam menu's choices: saved, and a running webcam follows them (a new camera or mode restarts it).
+    SetWebcam(simple_screensharing_client::rooms::WebcamSettings),
+    /// Re-list the cameras (async; result in `cx.state.webcams`).
+    RefreshWebcams,
+
     // --- shared audio -----------------------------------------------------
     /// Share (or switch to) `choice` in `room`: desktop audio or one app. Audio is a share of its own,
     /// independent of any screen share (task I7); switching replaces the running one and keeps it muted
@@ -412,6 +426,8 @@ pub enum UiAction {
     SetHideOwnStreams(bool),
     /// "Always show names": watched streams show their name tag without hovering.
     SetAlwaysShowNames(bool),
+    /// The Layout menu's "Webcam in picture" for `view`: a webcam sits inside its owner's screen share.
+    SetStagePip { view: StageView, on: bool },
     /// The bar's hide / show sidebar button.
     ToggleSidebar,
     /// The bar's fullscreen button in the main window ([`Nav::stage_fullscreen`]).
@@ -709,7 +725,7 @@ impl<'a> Cx<'a> {
     /// [`Self::on_air_rooms`] for "Live in N rooms".
     pub fn live_rooms(&self) -> Vec<RoomHandle> {
         let mut out: Vec<RoomHandle> = Vec::new();
-        for c in self.state.captures.values().filter(|c| c.kind == StreamKind::Video) {
+        for c in self.state.captures.values().filter(|c| c.kind == StreamKind::Video && !c.is_webcam()) {
             for d in c.destinations.values() {
                 if !out.contains(&d.room) {
                     out.push(d.room);
@@ -724,7 +740,7 @@ impl<'a> Cx<'a> {
     /// screen can take a long time); showing it as Live meanwhile was wrong.
     pub fn my_phase(&self, room: RoomHandle) -> Option<MyPhase> {
         let mut out = None;
-        for c in self.state.captures.values().filter(|c| c.kind == StreamKind::Video) {
+        for c in self.state.captures.values().filter(|c| c.kind == StreamKind::Video && !c.is_webcam()) {
             for d in c.destinations.values().filter(|d| d.room == room) {
                 match c.destination_state(d) {
                     DestinationState::Live | DestinationState::Rebuilding { .. } | DestinationState::Stalled { .. } => return Some(MyPhase::OnAir),
@@ -742,14 +758,23 @@ impl<'a> Cx<'a> {
         self.live_rooms().into_iter().filter(|h| self.my_phase(*h) == Some(MyPhase::OnAir)).collect()
     }
 
-    /// Our video captures that have at least one destination.
+    /// Our screen captures that have at least one destination (a webcam is not one: [`Self::webcam_share`]).
     pub fn live_captures(&self) -> Vec<(CaptureSourceId, &'a LocalCapture)> {
         self.state
             .captures
             .iter()
-            .filter(|(_, c)| c.kind == StreamKind::Video && !c.destinations.is_empty())
+            .filter(|(_, c)| c.kind == StreamKind::Video && !c.is_webcam() && !c.destinations.is_empty())
             .map(|(id, c)| (*id, c))
             .collect()
+    }
+
+    /// Our webcam share in `room`, if there is one (task I8): its capture, destination and the capture. A
+    /// stopping one is gone already ([`AppState::webcam_share`]).
+    pub fn webcam_share(&self, room: RoomHandle) -> Option<(CaptureSourceId, DestinationId, &'a LocalCapture)> {
+        let (id, r) = self.state.webcam_share()?;
+        let c = self.state.captures.get(&id)?;
+        let dest = c.destinations.iter().find(|(_, d)| d.room == room).map(|(d, _)| *d);
+        (r == room).then_some(dest).flatten().map(|d| (id, d, c))
     }
 
     /// A capture by id.
@@ -860,7 +885,8 @@ pub fn room_entries(state: &AppState) -> Vec<RoomEntry> {
 /// [`Cx::share_state`] for a joined room.
 pub fn share_state(state: &AppState, shell: &Shell, room: RoomHandle) -> ShareState {
     for (id, c) in &state.captures {
-        if c.kind != StreamKind::Video {
+        // A webcam is its own share with its own button (task I8): never the Share screen button's state.
+        if c.kind != StreamKind::Video || c.is_webcam() {
             continue;
         }
         if let Some((dest_id, _)) = c.destinations.iter().find(|(_, d)| d.room == room) {
@@ -1000,6 +1026,9 @@ pub fn share_label(raw: &str) -> String {
         tr("share.video_label", "Screen share")
     } else if raw == "Screen" || default_in_any_locale("ui.stream.screen") {
         tr("ui.stream.screen", "Screen")
+    } else if simple_screensharing_client::capture::webcam::is_webcam_label(raw) {
+        // The webcam's wire label (task I8), `Webcam` in every language.
+        tr("ui.stream.webcam", "Webcam")
     } else if default_in_any_locale("share.desktop_audio_label") {
         // A desktop-audio share announces the English label on the wire (task I7).
         tr("share.desktop_audio_label", "Desktop audio")
@@ -1080,6 +1109,7 @@ pub struct App {
     pub room: room::RoomState,
     pub stream_settings: stream_settings::StreamSettingsState,
     pub audio_settings: audio_settings::AudioSettingsState,
+    pub webcam_settings: webcam_settings::WebcamSettingsState,
     pub modals: modals::ModalsState,
     pub popout: popout::PopoutState,
     /// `ctx.input(|i| i.time)` at the start of this frame (toast clock).
@@ -1124,6 +1154,7 @@ impl App {
             room: Default::default(),
             stream_settings: Default::default(),
             audio_settings: Default::default(),
+            webcam_settings: Default::default(),
             modals: Default::default(),
             popout: Default::default(),
             now: 0.0,
@@ -1165,6 +1196,7 @@ impl App {
         self.state.poll_pending_destinations();
         self.state.poll_destination_edits();
         self.state.poll_audio_sources();
+        self.state.poll_webcams();
         // Rate-limited + hysteresis-filtered internally; cheap most frames.
         self.state.apply_bandwidth_allocation();
 
@@ -1199,7 +1231,7 @@ impl App {
         {
             self.nav.modal = None;
         }
-        if let Some(Modal::LeaveConfirm { room } | Modal::AudioSettings { room }) = &self.nav.modal
+        if let Some(Modal::LeaveConfirm { room } | Modal::AudioSettings { room } | Modal::WebcamSettings { room }) = &self.nav.modal
             && !self.state.rooms.contains_key(room)
         {
             self.nav.modal = None;
@@ -1348,7 +1380,7 @@ impl App {
     /// Lay the window out and run every screen. Returns the actions they pushed.
     fn draw(&mut self, ctx: &egui::Context) -> Vec<UiAction> {
         let mut actions = Vec::new();
-        let App { state, nav, shell, videos, sidebar, room, stream_settings, audio_settings, modals, popout, .. } = self;
+        let App { state, nav, shell, videos, sidebar, room, stream_settings, audio_settings, webcam_settings, modals, popout, .. } = self;
         let mut cx = Cx::new(state, nav, shell, videos, &mut actions);
         if let Some(fs) = cx.nav.fullscreen {
             if cx.videos.get(fs.key).is_some_and(|e| !e.popped) {
@@ -1360,6 +1392,9 @@ impl App {
                     let pic = cx.videos.paint(fs.key, ui, rect, simple_screensharing_client::decode::render::Fit::Contain);
                     // Registered before the overlay, whose button then takes its own clicks.
                     let dbl = ui.interact(rect, Id::new("stream_fullscreen"), Sense::click()).double_clicked();
+                    // The webcam in picture of this stream, if it has one (the stage's own, same place and size);
+                    // after the double click above, so a press on it is the PIP's and does not leave fullscreen.
+                    stage::fullscreen_pip(ui, &mut cx, &mut room.stage, fs.key, rect);
                     // `Why` the pop-out's overlay (`popout::fullscreen_overlay`): user request
                     // 2026-11-03, the same overlay as a fullscreened pop-out.
                     let first_frame = pic.is_some_and(|r| r.width() > 0.0);
@@ -1446,6 +1481,7 @@ impl App {
         match cx.nav.modal.clone() {
             Some(Modal::StreamSettings { capture, room }) => stream_settings::show(ctx, &mut cx, stream_settings, capture, room),
             Some(Modal::AudioSettings { room }) => audio_settings::show(ctx, &mut cx, audio_settings, room),
+            Some(Modal::WebcamSettings { room }) => webcam_settings::show(ctx, &mut cx, webcam_settings, room),
             Some(m) => modals::show(ctx, &mut cx, modals, &m),
             None => {}
         }

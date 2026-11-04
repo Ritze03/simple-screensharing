@@ -956,6 +956,10 @@ enum CaptureSource {
     Portal(PortalCapture),
     #[cfg(windows)]
     Windows,
+    /// A webcam (task I8, Linux only: `v4l2src`, see [`webcam`]). Needs no portal and no consent flow; the
+    /// frames enter the System domain like Windows' desktop capture does.
+    #[cfg(target_os = "linux")]
+    Webcam(webcam::Spec),
     /// TEST-ONLY seam: bypasses the interactive portal/pipewiresrc (Linux)
     /// or `d3d11screencapturesrc` (Windows) acquisition entirely, launching
     /// [`build_pipeline`] directly from a caller-supplied `gst-launch`-syntax
@@ -987,6 +991,18 @@ impl CaptureSource {
             CaptureSource::Portal(_) => true,
             #[allow(unreachable_patterns)]
             _ => false,
+        }
+    }
+
+    /// The label this source's streams are announced with: "Screen" for a screen, [`webcam::LABEL`] for a
+    /// camera (plan D7: an ordinary video stream whose label starts with `Webcam`, so peers that do not know
+    /// webcams show it as one more stream).
+    fn wire_label(&self) -> &'static str {
+        match self {
+            #[cfg(target_os = "linux")]
+            CaptureSource::Webcam(_) => webcam::LABEL,
+            #[allow(unreachable_patterns)]
+            _ => "Screen",
         }
     }
 
@@ -1084,6 +1100,11 @@ impl CaptureSource {
                 // before.
                 let _ = framerate;
                 "d3d11screencapturesrc monitor-index=0 do-timestamp=true".to_string()
+            }
+            #[cfg(target_os = "linux")]
+            CaptureSource::Webcam(spec) => {
+                let _ = framerate;
+                webcam::source_fragment(spec)
             }
             #[cfg(any(test, feature = "test-source"))]
             CaptureSource::TestSource(fragment) => {
@@ -2283,6 +2304,8 @@ async fn close_portal_quietly(source: &CaptureSource) {
             Ok(Err(e)) => tracing::warn!("failed to close the portal session of a capture that did not start: {e}"),
             Err(_) => tracing::warn!("closing the portal session of a capture that did not start timed out"),
         },
+        #[cfg(target_os = "linux")]
+        CaptureSource::Webcam(_) => {}
         #[cfg(any(test, feature = "test-source"))]
         CaptureSource::TestSource(_) => {}
     }
@@ -2552,7 +2575,47 @@ pub async fn start_sharing(
     ensure_gstreamer_initialized()?;
 
     let capture_source = acquire_capture_source().await?;
-    start_sharing_with_source(client, stream_id, key, bitrate_kbps, framerate, capture_source).await
+    start_sharing_with_source(client, stream_id, key, bitrate_kbps, framerate, capture_source, EncodeChoice::screen()).await
+}
+
+/// What the first destination of a capture is encoded with, besides its bitrate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodeChoice {
+    pub tune: TuneMode,
+    pub quality_level: QualityLevel,
+    pub gop_millis: u32,
+    pub codec: VideoCodec,
+}
+
+impl EncodeChoice {
+    /// A screen share's start values ("good mix" defaults, not this pipeline's old hardcoded low-latency extreme,
+    /// see [`TuneMode`] / [`QualityLevel`]); the UI's settings change them once the share is live.
+    pub fn screen() -> Self {
+        Self { tune: TuneMode::default(), quality_level: QualityLevel::default(), gop_millis: DEFAULT_GOP_MILLIS, codec: VideoCodec::default() }
+    }
+
+    /// A webcam's: fixed (plan D8), only the codec is the user's. *Why Performance and 2000 ms:* a face does
+    /// not need the screen's quality settings, a camera runs all the time next to a screen share that does, and
+    /// a keyframe every 2 s keeps the cost of the many small frames low ([`webcam::KEYFRAME_MILLIS`]).
+    pub fn webcam(codec: VideoCodec) -> Self {
+        Self { tune: TuneMode::LowLatency, quality_level: QualityLevel::Performance, gop_millis: webcam::KEYFRAME_MILLIS, codec }
+    }
+}
+
+/// Starts a webcam share (task I8) into one room: the camera `spec` as the capture source, one destination with
+/// the webcam's fixed encoder settings ([`EncodeChoice::webcam`]) and `bitrate_kbps`, announced as
+/// [`webcam::LABEL`] once its first keyframe is out. No portal, no picker.
+#[cfg(target_os = "linux")]
+pub async fn start_webcam_sharing(
+    client: &ScreenshareClient,
+    stream_id: u8,
+    key: DestKey,
+    spec: &webcam::Spec,
+    bitrate_kbps: u32,
+    codec: VideoCodec,
+) -> Result<CaptureHandle> {
+    ensure_gstreamer_initialized()?;
+    start_sharing_with_source(client, stream_id, key, bitrate_kbps, spec.mode.framerate(), CaptureSource::Webcam(spec.clone()), EncodeChoice::webcam(codec)).await
 }
 
 /// **Staged capture, no destination yet** — the "Go live" flow's first half
@@ -2643,6 +2706,7 @@ pub async fn start_sharing_from_test_source(
         bitrate_kbps,
         framerate,
         CaptureSource::TestSource(source_fragment.to_string()),
+        EncodeChoice::screen(),
     )
     .await
 }
@@ -2674,6 +2738,7 @@ async fn start_sharing_with_source(
     bitrate_kbps: u32,
     framerate: u32,
     capture_source: CaptureSource,
+    encode: EncodeChoice,
 ) -> Result<CaptureHandle> {
     let mut handle = start_capture_with_source(framerate, capture_source).await?;
 
@@ -2687,13 +2752,13 @@ async fn start_sharing_with_source(
         // silently falls back to software per branch if this machine's VAAPI
         // can't actually run another concurrent encode session.
         backend: detect_encoder_backend(),
-        // "Good mix" defaults, not this pipeline's old hardcoded low-latency
-        // extreme — see `TuneMode`/`QualityLevel`'s
-        // `#[default]` doc comments.
-        tune: TuneMode::default(),
-        quality_level: QualityLevel::default(),
-        gop_millis: DEFAULT_GOP_MILLIS,
-        codec: VideoCodec::default(),
+        // The caller's choice: "good mix" defaults for a screen (see
+        // `TuneMode`/`QualityLevel`'s `#[default]` doc comments), the fixed
+        // settings of a webcam.
+        tune: encode.tune,
+        quality_level: encode.quality_level,
+        gop_millis: encode.gop_millis,
+        codec: encode.codec,
     };
 
     // Everything above already owns the pipeline/portal session via `handle`
@@ -2709,7 +2774,8 @@ async fn start_sharing_with_source(
     // of the process's life**, with no affordance to stop it: the user's
     // screen went on being captured after they were told the share had
     // failed.
-    let started = spawn_destination(&handle.pipeline, &handle.tee, &handle.capture_errors, client, stream_id, key, params).await;
+    let label = handle.capture_source.wire_label();
+    let started = spawn_destination(&handle.pipeline, &handle.tee, &handle.capture_errors, client, stream_id, key, params, label).await;
     match started {
         Ok(destination) => {
             handle.ensure_preview_task(client, stream_id);
@@ -2845,6 +2911,8 @@ async fn abandon_capture(pipeline: gst::Pipeline, capture_source: CaptureSource,
                 tracing::warn!("failed to close the portal session of an abandoned capture: {e}");
             }
         }
+        #[cfg(target_os = "linux")]
+        CaptureSource::Webcam(_) => {}
         #[cfg(any(test, feature = "test-source"))]
         CaptureSource::TestSource(_) => {}
     }
@@ -2865,6 +2933,7 @@ async fn abandon_capture(pipeline: gst::Pipeline, capture_source: CaptureSource,
 /// only returns once this branch has proven itself, so this is the earliest
 /// honest moment to announce — and the same moment the destination's own
 /// state machine goes `Starting` → `Live`.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_destination(
     pipeline: &gst::Pipeline,
     tee: &gst::Element,
@@ -2873,6 +2942,7 @@ async fn spawn_destination(
     stream_id: u8,
     key: DestKey,
     params: destination::VideoParams,
+    label: &'static str,
 ) -> Result<DestinationHandle> {
     // The destination's wire clock is anchored *before* its branch exists, so
     // `on_pipeline_start` below only ever re-anchors the offset onto a
@@ -2922,7 +2992,7 @@ async fn spawn_destination(
     }
 
     if let Err(e) = client
-        .announce_stream(stream_id, StreamKind::Video, "Screen", params.width as u16, params.height as u16)
+        .announce_stream(stream_id, StreamKind::Video, label, params.width as u16, params.height as u16)
         .await
     {
         // Nothing is announced, so nothing may keep encoding: remove the
@@ -3264,6 +3334,8 @@ impl CaptureHandle {
                     Ok(Err(e)) => tracing::warn!("error closing screencast portal session: {e}"),
                     Err(_) => tracing::warn!("closing the screencast portal session took longer than {CAPTURE_STOP_STEP_TIMEOUT:?}"),
                 },
+                #[cfg(target_os = "linux")]
+                CaptureSource::Webcam(_) => {}
                 #[cfg(any(test, feature = "test-source"))]
                 CaptureSource::TestSource(_) => {}
             }
@@ -3343,8 +3415,9 @@ impl CaptureHandle {
         let client = client.clone();
         let params = destination::clamp_to_source(params, self.source_caps());
         let capture_errors = self.capture_errors.clone();
+        let label = self.capture_source.wire_label();
         tokio::spawn(async move {
-            let result = spawn_destination(&pipeline, &tee, &capture_errors, &client, stream_id, key, params)
+            let result = spawn_destination(&pipeline, &tee, &capture_errors, &client, stream_id, key, params, label)
                 .await
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
@@ -9673,6 +9746,425 @@ pub mod branch {
             built.pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
         }
 
+    }
+}
+
+// ---------------------------------------------------------------------
+// Webcams (task I8)
+// ---------------------------------------------------------------------
+
+/// Webcam sharing (task I8; plan decisions D7, D8, D10).
+///
+/// - **A webcam is an ordinary video stream** whose label starts with [`LABEL`] (D7). *Why a label and not a new
+///   `StreamKind`:* a new kind would break every peer that does not know it, a label does not: they show it as
+///   one more stream. The browser client names its webcam the same way.
+/// - **Linux only, `v4l2src`** (D10): the modes come from the device itself ([`list_cameras`], GStreamer's device
+///   monitor, so no new crate), the capture is its own [`CaptureHandle`] in the System domain (a camera has no
+///   DMA-BUF path worth having: `v4l2src ! jpegdec`, or the raw format, then the usual `videoconvert` to the tee).
+///   On other platforms nothing here lists a camera and [`unavailable`] says why; the Windows build only has to
+///   compile.
+/// - **The encoder is fixed** (D8): Performance, keyframe every [`KEYFRAME_MILLIS`] ([`EncodeChoice::webcam`]).
+///
+/// `SSS_FAKE_CAMERA=1` (the rig's hook, off unless set, like `SSS_UI_FAKE_AUDIO`) lists one fake camera whose
+/// frames are a `videotestsrc` ball, so the stage's picture-in-picture can be checked with a picture that moves
+/// (the host's real webcam has its lens blocked).
+pub mod webcam {
+    use super::*;
+
+    /// The wire label of a webcam stream (`Webcam` and anything that starts with it).
+    pub const LABEL: &str = "Webcam";
+    /// A webcam's keyframe interval (plan D8).
+    pub const KEYFRAME_MILLIS: u32 = 2000;
+    /// Webcam default bitrate: a 720p face at 30 fps is fine at this.
+    pub const DEFAULT_BITRATE_KBPS: u32 = 2500;
+    /// `SSS_FAKE_CAMERA=1`: see the module doc.
+    #[cfg(target_os = "linux")]
+    pub const FAKE_ENV: &str = "SSS_FAKE_CAMERA";
+    /// The device of the fake camera.
+    const FAKE_DEVICE: &str = "fake:ball";
+    /// The format name of motion-JPEG modes (what `v4l2-ctl` calls it).
+    pub const MJPEG: &str = "MJPG";
+
+    /// Whether a stream label is a webcam's (the one rule every client side uses).
+    pub fn is_webcam_label(label: &str) -> bool {
+        label.starts_with(LABEL)
+    }
+
+    /// One thing a camera can deliver: a pixel format, a size and a frame rate (a fraction, `15/2` is 7.5 fps).
+    #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+    pub struct Mode {
+        /// [`MJPEG`] or a GStreamer raw format name (`YUY2`, `NV12`, ...).
+        pub format: String,
+        pub width: u32,
+        pub height: u32,
+        pub fps_num: u32,
+        pub fps_den: u32,
+    }
+
+    impl Mode {
+        pub fn is_mjpeg(&self) -> bool {
+            self.format == MJPEG
+        }
+
+        pub fn fps(&self) -> f32 {
+            self.fps_num as f32 / self.fps_den.max(1) as f32
+        }
+
+        /// The frame rate as the encoder's whole number (7.5 fps is 8).
+        pub fn framerate(&self) -> u32 {
+            (self.fps().round() as u32).max(1)
+        }
+
+        fn pixels(&self) -> u32 {
+            self.width * self.height
+        }
+
+        /// The format as people know it: `v4l2-ctl` says `YUYV` where GStreamer says `YUY2`.
+        pub fn format_label(&self) -> &str {
+            if self.format == "YUY2" { "YUYV" } else { &self.format }
+        }
+
+        /// The stored form, `MJPG 1280x720@30` (`@15/2` for a fractional rate): what the settings file keeps and
+        /// [`Self::from_key`] reads back.
+        pub fn key(&self) -> String {
+            let fps = if self.fps_den == 1 { self.fps_num.to_string() } else { format!("{}/{}", self.fps_num, self.fps_den) };
+            format!("{} {}x{}@{fps}", self.format_label(), self.width, self.height)
+        }
+
+        pub fn from_key(key: &str) -> Option<Self> {
+            let (format, rest) = key.split_once(' ')?;
+            let (size, fps) = rest.split_once('@')?;
+            let (w, h) = size.split_once('x')?;
+            let (num, den) = match fps.split_once('/') {
+                Some((n, d)) => (n.parse().ok()?, d.parse().ok()?),
+                None => (fps.parse().ok()?, 1),
+            };
+            let format = if format == "YUYV" { "YUY2" } else { format };
+            let (width, height): (u32, u32) = (w.parse().ok()?, h.parse().ok()?);
+            (num > 0 && den > 0).then(|| Self { format: format.to_string(), width, height, fps_num: num, fps_den: den })
+        }
+    }
+
+    /// A camera: its name, its device node and every mode it offers ([`sort_modes`] order).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Camera {
+        pub name: String,
+        pub device: String,
+        pub modes: Vec<Mode>,
+    }
+
+    /// What a webcam capture is started with.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Spec {
+        pub device: String,
+        pub mode: Mode,
+    }
+
+    /// Why webcams cannot be shared here, when they cannot.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Unavailable {
+        /// Not Linux: the Windows plan comes later.
+        Platform,
+        /// GStreamer's `video4linux2` plugin (`v4l2src`) is not installed.
+        NoPlugin,
+    }
+
+    /// `None` when this machine can share a webcam; else why not (the bar's button is disabled with that text).
+    pub fn unavailable() -> Option<Unavailable> {
+        #[cfg(target_os = "linux")]
+        {
+            if fake_wanted() {
+                return None;
+            }
+            if ensure_gstreamer_initialized().is_err() || gst::ElementFactory::find("v4l2src").is_none() {
+                return Some(Unavailable::NoPlugin);
+            }
+            None
+        }
+        #[cfg(not(target_os = "linux"))]
+        Some(Unavailable::Platform)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fake_wanted() -> bool {
+        std::env::var_os(FAKE_ENV).is_some()
+    }
+
+    /// The values a caps field holds: the one value, or every value of a list. GStreamer's own `v4l2` device provider
+    /// merges structures that differ in one field (`width=2304, height={ 1536, 1296 }`), PipeWire's lists one
+    /// structure per size with a rate list; both must read the same.
+    fn list_of<T>(s: &gst::StructureRef, field: &str, one: impl Fn(&gst::glib::SendValue) -> Option<T>) -> Vec<T> {
+        let Ok(v) = s.value(field) else { return Vec::new() };
+        if let Some(x) = one(v) {
+            return vec![x];
+        }
+        v.get::<gst::List>().map(|l| l.iter().filter_map(&one).collect()).unwrap_or_default()
+    }
+
+    /// The modes the structures of `caps` stand for: motion-JPEG and raw system-memory ones, one per size and frame
+    /// rate a structure lists. Compressed H.264 (the encoder here needs raw frames) and DMA-BUF variants are left out.
+    pub fn modes_of(caps: &gst::CapsRef) -> Vec<Mode> {
+        let mut out = Vec::new();
+        for (i, s) in caps.iter().enumerate() {
+            if caps.features(i).is_some_and(|f| f.contains("memory:DMABuf")) {
+                continue;
+            }
+            let formats: Vec<String> = match s.name().as_str() {
+                "image/jpeg" => vec![MJPEG.to_string()],
+                "video/x-raw" => list_of(s, "format", |v| v.get::<&str>().ok().map(str::to_string)),
+                _ => continue,
+            };
+            let int = |v: &gst::glib::SendValue| v.get::<i32>().ok();
+            let (widths, heights) = (list_of(s, "width", int), list_of(s, "height", int));
+            let rates = list_of(s, "framerate", |v| v.get::<gst::Fraction>().ok());
+            for format in &formats {
+                for &w in widths.iter().filter(|w| **w > 0) {
+                    for &h in heights.iter().filter(|h| **h > 0) {
+                        for f in rates.iter().filter(|f| f.numer() > 0 && f.denom() > 0) {
+                            out.push(Mode { format: format.clone(), width: w as u32, height: h as u32, fps_num: f.numer() as u32, fps_den: f.denom() as u32 });
+                        }
+                    }
+                }
+            }
+        }
+        sort_modes(&mut out);
+        out
+    }
+
+    /// Slower than this a webcam is a slideshow; such modes are listed (they are real) but after every other one.
+    const SLOW_FPS: f32 = 15.0;
+
+    /// The modes a person would pick first, then the slow ones ([`SLOW_FPS`]; a C920's raw 2304x1536 runs at 2 fps and
+    /// would otherwise head a 217-row list). Each part: biggest picture first; at one size motion-JPEG before raw (the
+    /// camera's own compression is what makes its high modes fast: a C920 delivers raw 1080p at 5 fps, MJPEG at 30),
+    /// then the faster rate first.
+    pub fn sort_modes(modes: &mut Vec<Mode>) {
+        modes.sort_by(|a, b| {
+            (a.fps() < SLOW_FPS)
+                .cmp(&(b.fps() < SLOW_FPS))
+                .then(b.pixels().cmp(&a.pixels()))
+                .then(b.is_mjpeg().cmp(&a.is_mjpeg()))
+                .then((b.fps_num * a.fps_den).cmp(&(a.fps_num * b.fps_den)))
+                .then(a.format.cmp(&b.format))
+        });
+        modes.dedup();
+    }
+
+    /// The mode a camera starts with: the biggest picture up to 1280x720 that runs at 15 fps or more (motion-JPEG
+    /// first, a rate up to 30: a webcam share at 60 fps is waste), else the biggest mode there is.
+    pub fn default_mode(modes: &[Mode]) -> Option<&Mode> {
+        let score = |m: &Mode| (m.pixels(), m.is_mjpeg(), m.framerate().min(30), std::cmp::Reverse(m.framerate()));
+        modes.iter().filter(|m| m.pixels() <= 1280 * 720 && m.fps() >= SLOW_FPS).max_by_key(|m| score(m)).or_else(|| modes.first())
+    }
+
+    /// The camera and mode a saved choice (`camera` = the name, `mode` = [`Mode::key`], either may be empty or
+    /// stale) stands for: indexes into `cams` and its modes. The first camera when the name is unknown, the
+    /// default mode when the saved one is not offered (any more); `None` without cameras.
+    pub fn resolve(cams: &[Camera], camera: &str, mode: &str) -> Option<(usize, usize)> {
+        let ci = cams.iter().position(|c| c.name == camera).unwrap_or(0);
+        let cam = cams.get(ci)?;
+        let mi = cam.modes.iter().position(|m| m.key() == mode).or_else(|| default_mode(&cam.modes).and_then(|d| cam.modes.iter().position(|m| m == d)))?;
+        Some((ci, mi))
+    }
+
+    /// The fake camera `SSS_FAKE_CAMERA` lists.
+    #[cfg(target_os = "linux")]
+    fn fake_camera() -> Camera {
+        let mode = |format: &str, width, height, fps| Mode { format: format.into(), width, height, fps_num: fps, fps_den: 1 };
+        let mut modes = vec![mode(MJPEG, 1280, 720, 30), mode(MJPEG, 640, 360, 30), mode("YUY2", 640, 480, 15)];
+        sort_modes(&mut modes);
+        Camera { name: "Test camera".into(), device: FAKE_DEVICE.into(), modes }
+    }
+
+    /// Every camera this machine has, with the modes it offers. **Blocking** (the device monitor opens each
+    /// device to read its formats): call it off the UI thread. Empty off Linux and without `v4l2src`.
+    /// Metadata nodes (a C920's `/dev/video1`) offer no picture mode and drop out; only `v4l2` devices count, and one
+    /// node is listed once even when two device providers (GStreamer's own, PipeWire's) both show it.
+    pub fn list_cameras() -> Vec<Camera> {
+        #[cfg(target_os = "linux")]
+        {
+            if fake_wanted() {
+                return vec![fake_camera()];
+            }
+            if unavailable().is_some() {
+                return Vec::new();
+            }
+            let monitor = gst::DeviceMonitor::new();
+            monitor.add_filter(Some("Video/Source"), None);
+            if monitor.start().is_err() {
+                return Vec::new();
+            }
+            let devices = monitor.devices();
+            monitor.stop();
+            let mut out: Vec<Camera> = Vec::new();
+            for d in devices {
+                let props = d.properties();
+                if props.as_ref().and_then(|p| p.get::<String>("device.api").ok()).as_deref() != Some("v4l2") {
+                    continue;
+                }
+                // The native provider says `device.path`, PipeWire's (on a desktop with PipeWire's v4l2 monitor, which
+                // is the one the monitor then shows) `api.v4l2.path`; either way capture opens the node itself.
+                let path = props.as_ref().and_then(|p| p.get::<String>("device.path").or_else(|_| p.get::<String>("api.v4l2.path")).ok());
+                let Some(path) = path else { continue };
+                let modes = d.caps().map(|c| modes_of(&c)).unwrap_or_default();
+                if modes.is_empty() || out.iter().any(|c| c.device == path) {
+                    continue;
+                }
+                let mut name = d.display_name().trim_end_matches(" (V4L2)").to_string();
+                if out.iter().any(|c| c.name == name) {
+                    name = format!("{name} ({path})");
+                }
+                out.push(Camera { name, device: path, modes });
+            }
+            out
+        }
+        #[cfg(not(target_os = "linux"))]
+        Vec::new()
+    }
+
+    /// The `gst-launch` fragment of a capture from `spec`: `v4l2src` pinned to the mode (and `jpegdec` for
+    /// motion-JPEG), up to the raw frames the System-domain pipeline takes over from.
+    pub fn source_fragment(spec: &Spec) -> String {
+        let m = &spec.mode;
+        let size = format!("width={},height={},framerate={}/{}", m.width, m.height, m.fps_num, m.fps_den);
+        if spec.device == FAKE_DEVICE {
+            return format!("videotestsrc is-live=true pattern=ball ! video/x-raw,{size}");
+        }
+        let dev = &spec.device;
+        if m.is_mjpeg() {
+            format!("v4l2src device=\"{dev}\" do-timestamp=true ! image/jpeg,{size} ! jpegdec")
+        } else {
+            format!("v4l2src device=\"{dev}\" do-timestamp=true ! video/x-raw,format={},{size}", m.format)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::str::FromStr;
+
+        fn mode(format: &str, w: u32, h: u32, n: u32, d: u32) -> Mode {
+            Mode { format: format.into(), width: w, height: h, fps_num: n, fps_den: d }
+        }
+
+        /// What a C920's monitor lists, cut down: a rate list, a fraction, a DMA-BUF twin, raw, H.264.
+        fn c920_caps() -> gst::Caps {
+            ensure_gstreamer_initialized().unwrap();
+            gst::Caps::from_str(
+                "video/x-raw(memory:DMABuf), drm-format=YUYV, format=DMA_DRM, width=640, height=480, framerate=30/1; \
+                 video/x-raw, format=YUY2, width=640, height=480, framerate={ (fraction)30/1, (fraction)15/1 }; \
+                 video/x-raw, format=YUY2, width=1920, height=1080, framerate=5/1; \
+                 video/x-h264, stream-format=byte-stream, width=1920, height=1080, framerate=30/1; \
+                 image/jpeg, width=1920, height=1080, framerate={ (fraction)30/1, (fraction)15/2 }; \
+                 image/jpeg, width=1280, height=720, framerate={ (fraction)60/1, (fraction)30/1, (fraction)10/1 }",
+            )
+            .unwrap()
+        }
+
+        /// Plan D1 / "Done when": the listing is what the device says, and nothing else: no DMA-BUF twin, no
+        /// compressed H.264, every rate of a list; the biggest picture first and motion-JPEG ahead of raw, the slow
+        /// modes (under 15 fps) after all the others.
+        #[test]
+        fn the_modes_are_what_the_caps_list() {
+            let keys: Vec<String> = modes_of(&c920_caps()).iter().map(Mode::key).collect();
+            assert_eq!(
+                keys,
+                [
+                    "MJPG 1920x1080@30",
+                    "MJPG 1280x720@60",
+                    "MJPG 1280x720@30",
+                    "YUYV 640x480@30",
+                    "YUYV 640x480@15",
+                    "MJPG 1920x1080@15/2",
+                    "YUYV 1920x1080@5",
+                    "MJPG 1280x720@10"
+                ]
+            );
+        }
+
+        /// GStreamer's own v4l2 provider merges structures (`height` as a list, a format list); the same modes come
+        /// out as from one structure per mode.
+        #[test]
+        fn merged_structures_give_the_same_modes() {
+            ensure_gstreamer_initialized().unwrap();
+            let merged = gst::Caps::from_str(
+                "video/x-raw, format=YUY2, width=2304, height={ 1536, 1296 }, framerate=2/1; \
+                 video/x-raw, format={ YUY2, NV12 }, width=640, height=480, framerate={ 30/1, 15/1 }",
+            )
+            .unwrap();
+            let mut keys: Vec<String> = modes_of(&merged).iter().map(Mode::key).collect();
+            keys.sort();
+            assert_eq!(keys, ["NV12 640x480@15", "NV12 640x480@30", "YUYV 2304x1296@2", "YUYV 2304x1536@2", "YUYV 640x480@15", "YUYV 640x480@30"]);
+        }
+
+        #[test]
+        fn mode_keys_round_trip_and_a_bad_key_is_none() {
+            for m in [mode("MJPG", 1280, 720, 30, 1), mode("YUY2", 640, 480, 15, 1), mode("MJPG", 1920, 1080, 15, 2), mode("NV12", 320, 240, 30000, 1001)] {
+                assert_eq!(Mode::from_key(&m.key()), Some(m.clone()), "{}", m.key());
+            }
+            assert_eq!(mode("YUY2", 1, 1, 1, 1).key(), "YUYV 1x1@1", "named as v4l2-ctl names it");
+            for bad in ["", "MJPG", "MJPG 1280x720", "MJPG 1280x720@0", "MJPG axb@30", "MJPG 1280x720@30/0"] {
+                assert_eq!(Mode::from_key(bad), None, "{bad:?}");
+            }
+            assert_eq!(mode("MJPG", 1, 1, 15, 2).framerate(), 8, "7.5 fps encodes as 8");
+            assert_eq!(mode("MJPG", 1, 1, 1, 100).framerate(), 1, "never 0");
+        }
+
+        /// A webcam starts at 720p MJPEG, at most 30 fps, even though the camera offers 1080p and 60 fps.
+        #[test]
+        fn the_default_mode_is_720p_motion_jpeg_at_30() {
+            let modes = modes_of(&c920_caps());
+            assert_eq!(default_mode(&modes).map(Mode::key).as_deref(), Some("MJPG 1280x720@30"), "30 over 60, 720p over 1080p");
+            // Nothing small and quick enough: the biggest there is.
+            let slow = [mode("YUY2", 1920, 1080, 5, 1), mode("YUY2", 640, 480, 5, 1)];
+            assert_eq!(default_mode(&slow).map(Mode::key).as_deref(), Some("YUYV 1920x1080@5"));
+            assert_eq!(default_mode(&[]), None);
+        }
+
+        #[test]
+        fn a_saved_choice_resolves_to_what_is_offered_now() {
+            let cams = vec![
+                Camera { name: "A".into(), device: "/dev/video0".into(), modes: modes_of(&c920_caps()) },
+                Camera { name: "B".into(), device: "/dev/video2".into(), modes: vec![mode("MJPG", 640, 480, 30, 1)] },
+            ];
+            assert_eq!(resolve(&cams, "A", "YUYV 640x480@15"), Some((0, 4)), "saved camera and mode");
+            assert_eq!(resolve(&cams, "B", "YUYV 640x480@15"), Some((1, 0)), "the mode is not B's: its default");
+            assert_eq!(resolve(&cams, "gone", ""), Some((0, 2)), "unknown camera: the first, with its default mode");
+            assert_eq!(resolve(&[], "A", ""), None);
+        }
+
+        #[test]
+        fn the_fragment_pins_the_mode_and_decodes_motion_jpeg() {
+            let cam = |m: Mode| Spec { device: "/dev/video0".into(), mode: m };
+            assert_eq!(
+                source_fragment(&cam(mode("MJPG", 1280, 720, 30, 1))),
+                "v4l2src device=\"/dev/video0\" do-timestamp=true ! image/jpeg,width=1280,height=720,framerate=30/1 ! jpegdec"
+            );
+            assert_eq!(
+                source_fragment(&cam(mode("YUY2", 640, 480, 15, 2))),
+                "v4l2src device=\"/dev/video0\" do-timestamp=true ! video/x-raw,format=YUY2,width=640,height=480,framerate=15/2"
+            );
+            let fake = Spec { device: FAKE_DEVICE.into(), mode: mode("MJPG", 640, 360, 30, 1) };
+            assert!(source_fragment(&fake).starts_with("videotestsrc is-live=true"));
+            // Both parse as real pipeline descriptions (the plugin may be missing: that is a different error).
+            ensure_gstreamer_initialized().unwrap();
+            gst::parse::launch(&format!("{} ! fakesink", source_fragment(&fake))).expect("the fake camera's fragment is valid");
+        }
+
+        #[test]
+        fn a_webcam_is_a_label_not_a_kind() {
+            assert!(is_webcam_label("Webcam") && is_webcam_label("Webcam 2"));
+            assert!(!is_webcam_label("Screen") && !is_webcam_label("My Webcam") && !is_webcam_label(""));
+            assert_eq!(CaptureSource::Webcam(Spec { device: "x".into(), mode: mode("MJPG", 1, 1, 1, 1) }).wire_label(), LABEL);
+            assert_eq!(CaptureSource::TestSource(String::new()).wire_label(), "Screen");
+        }
+
+        /// The encoder settings of a webcam are fixed (plan D8); only the codec is the user's.
+        #[test]
+        fn the_webcam_encoder_is_performance_with_a_two_second_keyframe() {
+            let e = EncodeChoice::webcam(VideoCodec::H265);
+            assert_eq!((e.quality_level, e.gop_millis, e.codec), (QualityLevel::Performance, 2000, VideoCodec::H265));
+        }
     }
 }
 

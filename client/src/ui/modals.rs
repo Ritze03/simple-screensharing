@@ -201,7 +201,7 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState, modal: &Moda
         }
         Modal::Rename { room } => rename(ctx, cx, st, room),
         Modal::ChooseName => choose_name(ctx, cx, st),
-        Modal::StreamSettings { .. } | Modal::AudioSettings { .. } => {}
+        Modal::StreamSettings { .. } | Modal::AudioSettings { .. } | Modal::WebcamSettings { .. } => {}
     }
 }
 

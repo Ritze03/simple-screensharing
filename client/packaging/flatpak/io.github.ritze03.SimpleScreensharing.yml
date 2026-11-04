@@ -13,7 +13,7 @@ finish-args:
   - --share=ipc              # X11 shared memory (fallback-x11 only)
   - --socket=wayland
   - --socket=fallback-x11
-  - --device=dri             # Vulkan (wgpu) + VA-API encode/decode
+  - --device=all             # webcam (/dev/video*, task I8) + Vulkan (wgpu) and VA-API encode/decode (dri); a sandbox without it just lists no camera
   - --socket=pulseaudio      # playback (pulsesink); pipewire-pulse speaks it
   - --filesystem=xdg-run/pipewire-0   # pw-dump / pw-link / pw-cli (per-app audio sharing)
   # Screen capture goes through the xdg-desktop-portal ScreenCast API: no permission needed.

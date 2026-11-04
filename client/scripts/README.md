@@ -51,7 +51,7 @@ Env knobs (all optional): `SCRATCH` (one rig per scratch dir; default per worktr
 `PROFILE` (`release` default; use release for fps), `HS_NO_BUILD=1`, `HS_FPS` (capture output
 refresh, default 240), `HS_PATTERN`, `HS_XDPW`, `HS_PIPEWIRE`, `RUST_LOG`,
 `START_CODEC/START_FPS/START_KBPS` (pre-fill the stream form; the reliable way to set kbps),
-`SSS_LANGUAGE`, `CLIENT_ENV_<n>` (extra env for client n, e.g. a `GST_DEBUG` for the sharer; `CLIENT_ENV_2="SSS_UI_FAKE_AUDIO=1"` makes every stream that client watches act as if it had audio: volume row, ring, pop-out pill, nothing played), `HS_NAME_<n>` (display name of client n, default `client-<n>`), `HS_EMOJI_<n>` (emoji avatar of client n, one of the picker's), `HS_SEND_DIAG_<n>=1` (client n starts with Settings > Diagnostics > "Send diagnostics to the relay" ticked, #110),
+`SSS_LANGUAGE`, `CLIENT_ENV_<n>` (extra env for client n, e.g. a `GST_DEBUG` for the sharer; `CLIENT_ENV_1="SSS_FAKE_CAMERA=1"` makes client 1 list one fake camera whose frames are a moving `videotestsrc` ball, task I8, the host webcam has its lens blocked; without it a client lists the real `/dev/video0`, which the rig can open: close it again (`fuser /dev/video0`); `CLIENT_ENV_2="SSS_UI_FAKE_AUDIO=1"` makes every stream that client watches act as if it had audio: volume row, ring, pop-out pill, nothing played), `HS_NAME_<n>` (display name of client n, default `client-<n>`), `HS_EMOJI_<n>` (emoji avatar of client n, one of the picker's), `HS_SEND_DIAG_<n>=1` (client n starts with Settings > Diagnostics > "Send diagnostics to the relay" ticked, #110),
 `HS_RELAY_ENV` (`"A=1 B=2"` for the relay process, e.g. `SSSHARE_NACK=0` for a relay that behaves like one without NACK), `HS_RELAY_BIN` / `HS_CLIENT_BIN_<n>` (run another binary for the relay / client n, e.g. an older build for mixed-version checks, #104).
 
 Input details: pointer = `swaymsg seat - cursor ...` (needs `hs-vptr`); mouse wheel = `$SCRATCH/bin/hs-vptr scroll N`
@@ -79,6 +79,8 @@ Every frame, when it changed, each client rewrites `$SCRATCH/ui<n>.txt`: `rect N
 | `stage.bring_back`, `settings.boost`; `boost` | "Bring it back" while the stage is popped out; Settings > Boost |
 | `chrome`, `chrome_alpha`, `stage_full W H`, `popover`, `modal`, `stage_fs`, `stream_fs`, `open` | state: fullscreen chrome, open menu / modal, fullscreen, the stream settings modal |
 | `fps`, `fps_options`, `codec.I`, `preset.I`, `change`, `footer`, `bitrate`, `mode`, `ready`, ... | the stream settings modal (`stream_settings.rs`) |
+| `pip.N`, `pip.N.grip` (`pip.fs` in stream fullscreen), `pipinfo N spot=C,R w=.. handle=tl\|tr\|bl\|br who=..`, `menu.pip` | a webcam in picture (task I8): N is its parent's tile index (`pw.` prefix in a popped-out stage); `spot` is column,row 0..2 (`free` only while dragged); the handle is on the corner facing the middle |
+| `webcam.camera`, `webcam.mode`, `webcam.bitrate`, `webcam.footer` (`uclick N webcam.footer L60` = Start / Stop webcam), `webcam_codec.I`, `webcam_modes N`, `webcam_mode KEY`, `webcam camera=.. codec=.. kbps=..` | the webcam modal (`webcam_settings.rs`); the bar button is `ctl.webcam` / `ctl.webcam.arrow`, its menu rows `menu.<camera name>` and `menu.All_webcam_settings…` |
 
 | Script | Purpose |
 | --- | --- |
@@ -86,6 +88,7 @@ Every frame, when it changed, each client rewrites `$SCRATCH/ui<n>.txt`: `rect N
 | `hs-lib.sh` | shared functions (sourced; sources `launch-lib.sh` for build/config/join-link helpers) |
 | `hs-drive.sh STEP` | share, setup, golive, discard, watch, hover, sample, stopshare, unwatch, shot, crop, click, move, key, modal, mclick (`mclick NAME L60` = 60 pt from the rect's left edge), tree; by dumped name for any client: rect, val, await, uclick, udclick, umove, uscroll, udrag; drag (window coordinates); relay-restart [DOWN_SECS] |
 | `hs-scenario.sh` | one measured share (screenshots + per-stage rates) |
+| `hs-pip-spots.py` | drags a webcam in picture onto all 8 spots with the real pointer, checks `pipinfo` after each release, optional screenshot per spot (needs a PIP on screen: `CLIENT_ENV_1="SSS_FAKE_CAMERA=1"`, share + webcam on client 1, Watch both on client 2, Layout > Webcam in picture) |
 | `hs-probe.sh` | `portal-probe.py` against the rig's portal (no picker) |
 | `hs-vptr.c`, `hs-vptr-protocol.xml` | the virtual-pointer keepalive, one-shot `scroll` and `drag` (protocol XML from wlroots, MIT) |
 | `xdph-emu.c` | a PipeWire producer that offers formats exactly like xdg-desktop-portal-hyprland 1.4.1 (DMA-BUF modifier list with `DONT_FIXATE` + fixation handshake); the rig's sway/xdpw cannot show xdph-only negotiation bugs (task #76, `packaging/README.md`). Build and usage in its header; rig only |

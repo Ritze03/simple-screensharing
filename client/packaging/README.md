@@ -30,6 +30,16 @@ with a source-built FFmpeg, crates, release compile), later ones ~2.
 | `gst-elements.txt` | elements the build verifies resolve from the bundled set alone |
 | `../../simple-screensharing.desktop` | desktop entry (repo root; ritz-get also installs it as the start-menu shortcut; AppImage icon: `docs/assets/icon.svg`, rendered at build time) |
 
+## Webcam (task I8, 2026-11-04): `video4linux2` is bundled, the camera is the host's
+
+`v4l2src` (and GStreamer's native v4l2 device provider, which lists the cameras and their modes) is in the
+`video4linux2` plugin: `gst-plugins.txt` has it and `gst-elements.txt` lists `v4l2src`, so the build fails if the
+bundled set cannot resolve it. `jpegdec` (MJPEG webcam modes) was bundled already. The camera itself, its kernel driver
+and the udev data are the host's. **Not rebuilt here:** the AppImage needs the container build, so the plugin's own
+library needs (libgudev, libv4l2) were not checked against `dist/appimage-host-libs.txt`; if the build complains about
+an unexpected host library, that is where to look. A client without the plugin disables the webcam button with a tooltip
+(`capture::webcam::unavailable`), nothing else changes. Windows has no webcam yet (the cross build only has to compile).
+
 ## Decision: bundle GStreamer, take GPU / PipeWire from the host
 
 Why bundle GStreamer instead of requiring the host's: the client needs ~20 plugins from four
@@ -238,8 +248,9 @@ the AppImage must carry GStreamer because distros split the plugins differently;
 runtime is one fixed set for every distro, which is the point of the format.
 
 **Permissions** (`finish-args`): `--share=network` (relay), `--socket=wayland`,
-`--socket=fallback-x11`, `--share=ipc`, `--device=dri` (Vulkan for wgpu, VA-API for the hardware
-codecs), `--socket=pulseaudio` (playback through `pulsesink`), and
+`--socket=fallback-x11`, `--share=ipc`, `--device=all` (the webcam, `/dev/video*`, task I8; it includes `dri`:
+Vulkan for wgpu, VA-API for the hardware codecs; `--device=dri` alone gives a sandbox with no camera, which the client
+handles: the webcam button says "No camera found"), `--socket=pulseaudio` (playback through `pulsesink`), and
 `--filesystem=xdg-run/pipewire-0` (per-app audio sharing spawns the runtime's `pw-dump`,
 `pw-link`, `pw-cli`, `client/src/audio.rs`; all three exist in the runtime, but audio
 sharing is NOT tested in the Flatpak: no audio tests, see `testing-and-verification.md`).
