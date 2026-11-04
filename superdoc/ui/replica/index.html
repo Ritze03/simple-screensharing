@@ -1871,6 +1871,21 @@ window.addEventListener("pointerup", () => chromeSync());
 document.documentElement.addEventListener("mouseleave", () => chromePointer(-1, -1));
 document.addEventListener("keydown", () => { if (wasFs && !held) chromeTimer(false); });
 
+/* Scrolling on a volume slider: 5 % a notch up to 200 %, 10 % above, as in the app (#113; widgets/controls.rs). A touchpad's small deltas add up to a notch. */
+let wheelAcc = 0;
+frame.addEventListener("wheel", (e) => {
+  const el = e.target.closest?.('input[type="range"].vol');
+  if (!el || el.disabled) return;
+  e.preventDefault();
+  wheelAcc += Math.max(-40, Math.min(40, e.deltaMode ? -e.deltaY * 40 : -e.deltaY)); /* one event is at most one notch: browsers report 100+ px for one */
+  const n = Math.trunc(wheelAcc / 40);
+  wheelAcc -= n * 40;
+  if (!n) return;
+  let v = Number(el.value);
+  for (let i = 0; i < Math.abs(n); i++) v += n > 0 ? (v >= 200 ? 10 : 5) : (v > 200 ? -10 : -5);
+  el.value = Math.max(0, Math.min(500, v));
+  el.dispatchEvent(Object.assign(new Event("input", { bubbles: true }), { wheel: true }));
+}, { passive: false });
 document.addEventListener("input", (e) => {
   if (e.target.id === "emoji-in") {
     const g = pickEmoji(e.target.value);
@@ -1884,7 +1899,7 @@ document.addEventListener("input", (e) => {
   const k = e.target.dataset?.range;
   if (!k) return;
   let v = Number(e.target.value);
-  if (k.startsWith("vol") && Math.abs(v - 100) <= 10) { v = 100; e.target.value = "100"; } /* detent at 100 % (room.rs volume_slider) */
+  if (k.startsWith("vol") && !e.wheel && Math.abs(v - 100) <= 10) { v = 100; e.target.value = "100"; } /* detent at 100 % (room.rs volume_slider) */
   setPct(e.target);
   if (k.startsWith("vol:")) {
     S.vols[k.slice(4)] = v;
