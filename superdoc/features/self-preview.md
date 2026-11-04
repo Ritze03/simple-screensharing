@@ -1,8 +1,8 @@
 # Own-tile live preview (the sharer sees their own share)
 
 > **Status (2026-10-15, task #78): live again, in a different shape.** The old always-on 320x180
-> self-preview branch was removed (see "History"); since #78 the sharer's own tile in the room's
-> "Sharing in this room" grid shows a live, downscaled picture of what is being captured, **only while
+> self-preview branch was removed (see "History"); since #78 the sharer's own tile (on the stage
+> since I1/I6, 2026-11-04; before that a card in the room's "Sharing in this room" grid) shows a live, downscaled picture of what is being captured, **only while
 > the app window is focused** (native) or the page is visible and focused (browser). Otherwise the tile
 > is the hatched placeholder and the preview costs nothing.
 >
@@ -14,7 +14,7 @@
 - **Where:** `capture.rs` `live_branch` (appended to both capture descriptions) and `LivePreview`;
   `CaptureHandle::set_live_preview(bool)`, `live_preview_frame()` (newest RGBA frame, never blocks),
   `live_preview_frames()` (buffers that reached the sink, for verification). UI: `ui/mod.rs`
-  `App::poll_live_previews` + `Shell::live_previews`, own tile `ui/room.rs` `my_card`.
+  `App::poll_live_previews` + `Shell::live_previews`, own tile `ui/stage/tile.rs` `mine_tile` (it was `ui/room.rs` `my_card` before the stage).
 - **Branch:** `tee ! valve(drop, forward-sticky-events) + RateCap probe (30 fps) ! queue(leaky, 1)
   ! vapostproc | videoscale ! videoconvert ! capsfilter(RGBA, fitted size, 30/1) ! appsink`. Size: the source
   fitted into 640x360, aspect kept, never upscaled, even sides (`fit_live_size`), written into the capsfilter
@@ -75,5 +75,5 @@ element, so playback never restarts (same idea as the fullscreen stage in `popou
 ## Related docs
 
 - `superdoc/features/stream-control.md`: capture pipeline, capture domains, "Own-tile live preview".
-- `superdoc/ui/APP-SHELL.md`: the own card.
+- `superdoc/ui/APP-SHELL.md`: the own tile.
 - `superdoc/features/website.md`: browser side.

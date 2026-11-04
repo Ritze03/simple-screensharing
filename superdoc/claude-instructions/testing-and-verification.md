@@ -138,8 +138,12 @@ Rules for working in it:
 Do not test audio sharing, level meters or tones; do not create any PipeWire *audio* stream.
 Spotify keeps playing on the user's machine (their own session, not part of the rig): never
 stop, pause or reconfigure it. If you need an example stream for something, Spotify is it, read
-only. The rig's clients never share audio, have `PULSE_SERVER` pointed at a dead socket, and the
-rig's PipeWire is private.
+only. The rig's clients never share audio, have `PULSE_SERVER` pointed at a dead socket, play their notification sounds into
+`SSS_SOUND_SINK=fakesink` (`hs_start_client` sets it, 2026-11-04) and the rig's PipeWire is private. Rig fakes that need no audio
+stream: `SSS_UI_FAKE_AUDIO_SOURCES=1` (the audio menu's sources; sharing is refused), `SSS_UI_FAKE_AUDIO=1` (watched streams act as if they had audio),
+`SSS_FAKE_CAMERA=1` (a moving test camera). **Browser tests too:** a test that creates an `AudioContext` or a `{ audio: true }` capture
+(`docs/dev/`: `stubCapture({ audio: true })`, `audio-only.mjs`, `matrix.mjs --audio`) belongs in the VMs; the harness refuses it unless
+`SSS_E2E_AUDIO=1` and mutes Chromium otherwise (`docs/dev/README.md` "No audio on the host").
 
 **Why, and the `pipewiresink` stall warning (task #48)**: a live `audiotestsrc ! pipewiresink`
 that gets stuck at state `S` (suspended with an `active` link; check `pw-top`) wedges PipeWire
@@ -211,6 +215,7 @@ Both are GNOME/Wayland desktops with PipeWire + WirePlumber, user `mo`, no sound
   ssh command line (`pkill -f "[p]robe.py"`), or the ssh session kills itself.
 - **Noise floor of a silent stretch (#129):** `VFMT=f32 host-run.sh ...` records the viewer as float (an s16 recording adds
   its own dither and hides what the viewer produced), `noise.py viewer.wav events.txt` prints the RMS of every paused stretch.
+- **Desktop audio (task I7, 2026-11-04):** `client/scripts/vm-audio/desktop-audio.sh LABEL desktop|named|empty|only` (in the VM) drives desktop audio, the exclusion list (Discord added, removed, Firefox added and removed again) and audio-only shares against real streams plus silent fake sources for the groups; `desktop-run.sh PORT LABEL SCENARIO` runs it from the host and analyzes the recordings with `tones.py FILE.wav FREQ...` (per window, how loud each tone is in dBFS: 440 Hz = Firefox, 880 Hz = the excluded app; pure analysis of a file, plays nothing).
 - **Also capture, before/after a change:** `pw-dump`, `pw-top -b -n 2`, `pw-metadata -n settings`, and the
   WirePlumber side (`WIREPLUMBER_DEBUG=s-linking.mpris:5`) when a player is paused unexpectedly.
 - **Leave the VMs as found:** remove `~/.config/pipewire/pipewire.conf.d/50-fakehw.conf` (and restart

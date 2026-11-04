@@ -2,7 +2,7 @@
 
 **Website (watch/share in the browser): https://ritze03.github.io/simple-screensharing/**
 
-Screensharing for a group of friends: share a screen (plus an app's audio) into a room
+Screensharing for a group of friends: share a screen, your desktop's or one app's audio (alone or with the screen) and a webcam into a room
 and everyone with the room's link watches, in low latency and end to end encrypted. The
 relay forwards ciphertext and never holds the room key.
 

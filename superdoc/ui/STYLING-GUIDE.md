@@ -240,7 +240,7 @@ badge on its owner's avatar (click brings it back); the green ring means audible
 chat; Split and Crop share one grid (row count that shows the most picture area), Crop only fills the cells; resizing in
 those two is by splitters, so an even grid stays one double-click away. Where the code lives: `APP-SHELL.md` "The stage",
 "The control bar", "The people strip and hover card", "Menus and dropdowns", "The whole stage can pop out". The **Classic**
-views were not built in the app.
+views (the pre-stage layout) are not in the app any more: the replica keeps them only for side-by-side comparison.
 
 **Watched** (Stage group, #136, 2026-11-03) is the same stage for every stream you watch, from all rooms. *Why (user
 request):* "the same view should be on the watched streams section ... everything combined". A stream's key is
@@ -249,15 +249,31 @@ room and Watched keep their own layout state (`V()`), while watch, pop-out, volu
 are shared. Watched has no Invite, Room settings or Leave, and shows Share and audio only while you have a share to act
 on (a new share starts from a room, so no room picker). Several streams of one person are one avatar with a count.
 
-**Emoji avatars** (#136): a person can pick an emoji (Settings > Profile) that replaces the initial on the same
-name-derived gradient; `avatar()` is the one helper (native: `ui::paint_person`). No wire field exists yet, so in the app this needs a protocol change.
+**Emoji avatars** (#136, built in #106 / I6, 2026-11-04): a person can pick an emoji (Settings > Profile) that replaces the initial on a
+background taken from the emoji; `avatar()` is the one helper (native: `ui::paint_person` -> `widgets::paint_avatar_emoji`, browser `dom.js` `avatarEl`).
+The relay carries the emoji (`protocol-spec.md` §9.2); a peer or relay without it shows the initial.
+Rendering rules, native and browser alike:
+- **Size and centring:** the emoji is drawn at **0.62 x the avatar's size** (`EMOJI_AVATAR_FRACTION`, the replica's `font-size: .62 x --av`) and **centred by
+  its visible pixels** (the crop), not by the font box, which is off-centre for some emoji (the fox).
+- **Outline:** a **1 px black outline** that follows the emoji's shape, to lift it off the background: native paints the picture four times, shifted by one pixel left,
+  right, up and down, in black, then once in white (`paint_avatar_emoji`); the browser stacks four `drop-shadow(1px 0 0 #000)` filters (`.avatar .emo`).
+- **Background:** the emoji's strongest hue as the usual two-stop gradient; a **colourless** emoji (the skull) gets the neutral **slate**
+  `hsl(222, 14 %, 36 %)` to `hsl(222, 14 %, 24 %)`.
+- **Source of the pictures:** native embeds the 40 picker emoji as bundled Noto Color Emoji bitmaps (`client/assets/emoji/`, OFL 1.1; egui cannot draw colour
+  emoji and the AppImage / Flatpak / Windows builds cannot rely on a system emoji font), so an emoji outside the 40 shows as the initial; the browser draws
+  the system's emoji font.
+- **The avatar popover** (Settings > Profile > Avatar, `modals.rs` `avatar_row`): the app's menu frame (`menu::frame()`), **about 280 px wide** (8 cells of 32 px
+  + 7 gaps of 2 px + the frame's 12 px = 282), opening under the avatar button. A **44 px header** (`HBox`, slots `[fixed(32), FILL]`) holds a **32 px avatar**
+  and a **two-line title** ("Your avatar" / "Friends see it instead of your initial"), then the 8 x 5 grid, then "Use my initial". **"Paste any emoji" is
+  deliberately browser-only** (the replica's field is kept in the browser's picker, `menus.js` `emojiMenu`, which takes the last grapheme the user pastes): native can
+  only draw the 40 bundled pictures, so a free-text field would accept emoji it cannot show.
 
 **Fullscreen chrome** (#136, native `stage/chrome.rs`; the older per-stream twin is `popout.rs` `OVERLAY_IDLE`): in fullscreen the strip and bar lie over the stage, so
 the streams do not jump. *Why (user request):* they should be out of the way: shown only while the pointer is over the
 stage, gone after 3 s without movement. An open menu or a drag cancels the timer and keeps them up even off the stage;
 when it ends they get a full 3 s again, so closing a menu never hides the bar at once. Outside fullscreen they always show.
 
-**Stream settings and webcam** (#137, 2026-11-04), a proposal like the Stage. *Why (user request):* simpler stream
+**Stream settings and webcam** (#137, 2026-11-04; built in I8-I10, both clients). *Why (user request):* simpler stream
 settings and a webcam next to the screen share. The modal's two right-hand cards keep their widgets and are renamed and
 reordered: **Compression** (Codec, Bitrate; the user wanted something other than "Codec" as the title) and **Video** (FPS
 dropdown, Preset). The presets replace Balanced and Advanced tuning: Text = 15 FPS, Quality encoding, keyframe 250 ms;
@@ -272,7 +288,22 @@ webcam into their first playing screen share. It stays a tile while they have no
 webcam, because that tile holds its Watch button. Position and size are fractions of the parent's picture, per webcam and
 per view (`V().pipPos`), and `layoutPip` clamps only what is shown to the visible picture, so Crop does not lose the Split
 position. *Why the handle sits on the corner facing the picture's middle:* a PIP pushed into a corner could otherwise only
-shrink, and in Floating its handle would land on the window's own. Classic hides webcams: the current app has none.
+shrink, and in Floating its handle would land on the window's own. (The replica's old Classic views hide webcams; the app has them, in both clients.)
+
+## Audio controls (task I7, 2026-11-04)
+
+Built from the replica's `audioModal` and bar; the rules are the stage's (split button, `menu::select`, popover frame), so only what is specific is listed:
+
+- **Audio button** (a split button in the bar, `stage/bar.rs`): off = `music_off` icon, on = `music_note` in the live green (tooltip names the source); a click is Desktop audio on / off,
+  the arrow opens the audio menu. It needs no screen share and stays enabled.
+- **Audio menu** (`share::audio_menu`, a `PopoverKind::Bar` popover): `pop_item` rows with icon, name and a sub-line, **group headings** (Games, Browsers, Media, Voice chat,
+  Devices, Other), a live **level meter** at the end of each source row (running only while the menu is open), a separator, the **Mute shared audio** switch row (`menu::switch_row`)
+  while sharing, and **All audio settings…** (`tune` icon).
+- **Audio settings menu** (`audio_settings.rs`, a modal of the stream settings' family): cards **Source** (Audio dropdown), **Volume** (the **Boost** slider, 50-200 %;
+  **Boost is no longer in Settings**, the Settings > Shared audio card is gone) and **Desktop audio** (the **Exclude** list). Footer `[Stop sharing audio | Share desktop audio][fill][Done]`.
+- **Exclusion list and its Add popover:** each entry is a text row with a Remove button; **Add** opens a popover (`PopoverKind::AudioExclude`) listing "Detected audio sources" (one click adds
+  one; "Every detected source is excluded" when none is left) and an "Or enter a name" field with its own Add button.
+- All strings are `ui.audio.*`, `ui.audio_settings.*`. Rig names: `audio.*` in `client/scripts/README.md`.
 
 ## Verifying a style change
 

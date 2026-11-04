@@ -216,9 +216,18 @@ Plugin availability in the 1.26.9 runtime (`gst-inspect-1.0`): present `d3d11scr
 `wasapi2src`, `wasapisrc`, `opusenc`, `opusdec`; absent `av1dec`, `mfav1enc`, `dxgiscreencapsrc`; absent in the VM only
 (no capable GPU) `d3d11h264dec`, `d3d11h265dec`, `d3d11av1dec`, `d3d12h264dec`, `nvh264enc`, `qsvh264enc`, `amfh264enc`.
 
+## Compile check without a Windows machine (2026-11-04, task I11)
+
+`PKG_CONFIG_ALLOW_CROSS=1 cargo check --target x86_64-pc-windows-gnu --release --workspace --all-targets` (the `x86_64-pc-windows-gnu` rustup target and
+`x86_64-w64-mingw32-gcc` installed) compiles the client lib, bin and tests, the server and the protocol crate: `cargo check` does not link, so the host's GStreamer `.pc`
+files are enough for the `-sys` build scripts once pkg-config is allowed to cross. It type-checks the `#[cfg(windows)]` / `#[cfg(not(target_os = "linux"))]` paths (audio and
+webcam stubs, `CaptureSource::Windows`) but proves nothing about linking, the MSVC toolchain or runtime behaviour. It found one real error on 2026-11-04: a unit test named
+`CaptureSource::Webcam`, a Linux-only variant (fixed). Remaining warnings on this target are only dead code of Linux-only constants (`PORTAL_MIN_BUFFERS`, `STATIC_KEEPALIVE_FPS`).
+
 ## Known limits
 
 - No Windows audio capture/sharing: `audio.rs` is PipeWire-only (`#[cfg(not(target_os = "linux"))]` stubs).
+- **Linux only since 2026-11-04 (stage tasks I7, I8):** **Desktop audio**, the source groups and the exclusion list (all of the audio button: it can only turn on a PipeWire source), audio-only shares, and the **webcam** (`v4l2src`: `capture::webcam::list_cameras` returns nothing off Linux, the bar's Webcam button is disabled with that reason). A Windows client still *receives* all of it: an audio-only sender's Listen tile, a webcam as one more stream, a webcam in picture, emoji avatars and the notification sounds (`sounds.rs` plays through `autoaudiosink`, so they work, unverified on Windows). Compile status of these paths on the Windows target: the last I11 check, below.
 - Software H.264 encode only; a full-HD 60 fps Windows share with `x264enc` costs real CPU.
 - A `SSS_CONFIG_HOME`-less run uses `%APPDATA%\simple-screensharing\` (`rooms.toml`, `settings.toml`).
 - The window needs a real desktop session: over SSH only (session 0) the GUI cannot present. To drive it remotely use a

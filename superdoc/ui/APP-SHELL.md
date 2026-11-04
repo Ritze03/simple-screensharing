@@ -147,7 +147,7 @@ call, not in side panels.
   up to 200 %, 10 % above (`ui::volume_slider`, `wheel_step`, #113), here and in the pop-out. *Why the exception to "local
   edit state is pushed on `drag_stopped`" (below):* `SetVolume` only sets the decoder's volume element and the in-memory
   value, one per changed frame is cheap, and the user wants to hear the level while choosing it; the Boost slider in
-  Settings does the same (`PreviewAudioGain` while dragging, `SetAudioGain` on release).
+  the audio settings menu does the same (`PreviewAudioGain` while dragging, `SetAudioGain` on release).
 - **Own-tile live preview** (#78, user request 2026-10-15): your own tile shows a live <= 640x360 / <= 30 fps picture
   of what is captured **while the window is focused** (name tag `You · label` with a green or amber `cast` icon
   and the state, `PREVIEW` chip on hover); unfocused, minimized or with the tile not painted it is the hatched
@@ -185,9 +185,7 @@ The people button shows and hides the strip; there is no people list and no arro
 starts the picker (or opens its menu when your share is live in another room, so add / move here stay reachable), staged
 or live opens the Stream settings modal; its arrow opens the **Share menu** (Off / Ready / Live header with pill, size,
 codec and rate; FPS and Preset for the live destination or the next stream; Change source, All stream settings…, Go live
-in / Stop sharing; a recovering or encoder-bound note). *Share audio* is enabled next to a screen only (audio rides along
-with it, tooltip says so); its arrow is today's source list with meters, mute and stop (`share::audio_menu`; I7 adds Desktop
-audio, audio-only and the settings). *Webcam* (I8) is a share of its own, no screen needed: click starts it (the saved
+in / Stop sharing; a recovering or encoder-bound note). *Share audio* (I7) is a share of its own, **no screen needed** (it was "next to a screen only" until 2026-11-04): one click turns **Desktop audio** on (the icon goes `music_note`, green), the next turns it off; its arrow opens the **audio menu** (`share::audio_menu`: heading "Audio source", No audio, Desktop audio with the sub-line "Everything you hear" / "... minus N excluded", then every app under its **source group** heading (Games, Browsers, Media, Voice chat, Devices, Other) with a live level meter, a Mute shared audio switch while sharing, and "All audio settings…"). Picking a row starts, switches or stops the share in the room the bar acts on at once. "All audio settings…" opens the **audio settings menu** (`audio_settings.rs`, `Modal::AudioSettings`): Source card (the Audio dropdown, `menu::select`), Volume card (**Boost** 50-200 %, moved here from Settings > Shared audio), Desktop audio card (the **exclusion list**: Add opens a popover, `PopoverKind::AudioExclude`, with the sources detected now and an "Or enter a name" field; every entry has Remove), footer `[Stop sharing audio | Share desktop audio][fill][Done]`. Why and the audio side: `features/audio-sharing.md` "desktop audio ... (task I7)"; Linux only. *Webcam* (I8) is a share of its own, no screen needed: click starts it (the saved
 camera in its saved mode, into the room the bar acts on; from another room it **moves**) and the next click stops it; its
 arrow opens **only** the camera list (name and `/dev/video0` under it, the current one ticked; a new camera resets the
 mode) and "All webcam settings…" (`share::webcam_menu`, `BarMenu::Webcam`). It is disabled with the reason as its tooltip
@@ -320,6 +318,8 @@ re-derive the split every frame and silently break when content height changes.
 | `video.rs` | `VideoViews`: one GPU `VideoView` per watched stream, keyed by `StreamKey = (RoomHandle, ConnId, StreamId)`, synced once per frame; `popped` flag + `close_requested` for pop-outs |
 | `stage/` | the stage (`mod.rs`: `StageState`, `StageSettings`, `StageView`/`StageLayout`, `Host`, `ItemId`, items, input, painting, `show_main` / `show_windows`; `geom.rs`: pure grid / bar / floating / webcam-in-picture maths; `pip.rs`: one webcam in picture, drawn and dragged; `tile.rs`: video, idle, audio-only and own tiles, the name tag with stats, the hover buttons, the viewers dropdown, the stream menu's volume row; `bar.rs`: the control bar and its pure `arrange`; `strip.rs`: people strip and hover card; `menus.rs`: bar dropdowns and the stream menu; `chrome.rs`: the fullscreen auto-hide rule) |
 | `webcam_settings.rs` | the webcam modal (task I8): Source (camera, mode), Compression (codec, bitrate), "Encoder: Performance · Keyframe 2000 ms", footer `[Start / Stop webcam][Done]` |
+| `audio_settings.rs` | the audio settings menu (task I7): Source, Volume (Boost), Desktop audio (exclusion list and its Add popover), footer `[Stop sharing audio / Share desktop audio][Done]` |
+| `drive_dump.rs` | the `SSS_UI_DUMP` hook of the rig's scripts (control rects and values; names in `client/scripts/README.md`) |
 | `menu.rs` | the app's menu style beyond `pop_item`: `menu::select` (a dropdown field), `switch_row`, the popover frame |
 | `share.rs` | the bar's Share screen and Share audio dropdown bodies, level-meter taps, "Also send to / Move to" lists (`RoomTargets`), pills, formatting, popover rows shared with the stream-settings modal (this was `action_bar.rs`) |
 | `sidebar.rs` | brand band, body (Watched streams well, ROOMS heading, rooms well with sharer sub-rows, Create-or-join), user band (avatar, "Live in N rooms" / "Not sharing" -> Outgoing popover, settings gear) |
@@ -372,12 +372,10 @@ sway seat has a keyboard (hold one open with `wtype -P Shift_L -s 30000 -p Shift
 "Copy invite link" behaves the same). Tests: `logbuf::tests::*`,
 `ui::tests::copy_logs_puts_the_dump_on_the_clipboard_and_toasts`.
 
-**Settings > Shared audio: Boost slider** (2026-11-03, task #114; since #119 without the Calibrate row and capped at
-200 %). A card between Playback and Diagnostics (`modals.rs` `audio_card`): a `ctrl_row_value` (Boost: `widgets::slider`
+**Boost slider** (2026-11-03, task #114; since #119 without the Calibrate row and capped at 200 %; **moved on 2026-11-04 (I7) from Settings > Shared audio to the audio settings menu's Volume card**, the Settings card is gone): a `ctrl_row_value` (Boost: `widgets::slider`
 in dB, 50-200 %, 100 % mid-track, 0.5 dB knob steps, a `value_box` reading `150%`; applied live on every changed frame of a drag as
-`UiAction::PreviewAudioGain`, saved on pointer release as `UiAction::SetAudioGain`, #135). The calibration (a nested `HBox [FILL, 104]` row with an app picker, a 10 s listen and a
-banner) was removed in #119 together with `UiAction::CalibrateAudio` / `CancelAudioCalibration`.
-How it works, and why: `features/audio-sharing.md` "sender-side audio boost" and the #119 block. Tests: `ui::tests::audio_boost::*`.
+`UiAction::PreviewAudioGain`, saved on pointer release as `UiAction::SetAudioGain`, #135). The calibration was removed in #119 together with `UiAction::CalibrateAudio` / `CancelAudioCalibration`.
+How it works, and why: `features/audio-sharing.md` "sender-side audio boost" and the #119 block. Tests: `ui::tests::audio_boost::*`. Rig dump: `audio.boost`, `boost N`.
 
 **Settings > Playback > Level loudness** (2026-11-03, task #119; user: "the auto levelling should happen on the viewers
 side"). A `ctrl_row` with a checkbox ("Even out the volume of what I watch", tooltip on the label) as the third row of
@@ -385,6 +383,8 @@ the Playback card, **on by default**; `UiAction::SetLevelLoudness` -> `AppState:
 `level_loudness`, flips the process-wide `leveller::ENABLED`, live for every watched stream). The browser has the same row
 (`#set-level-loudness`). Design and numbers: `features/audio-sharing.md` (2026-11-03, #119). Tests:
 `ui::tests::audio_boost::level_loudness_defaults_on_persists_and_drives_the_leveller_switch`.
+
+**Settings > Sounds** (2026-11-04, task I9; `modals.rs`): a card with one **Volume** row (slider 0-100 %, default 50, applied live while dragged, saved on release; `UiAction::PreviewSoundVolume` / `SetSoundVolume`) and one **Test** button per notification sound (join / leave my stream, someone starts / stops a stream; `UiAction::TestSound`). Separate from every stream's volume. Design, edge rules and why: `features/audio-sharing.md` "Notification sounds". Rig dump: `sound.volume`, `sound.test.*`, `sound_volume N`.
 
 **Level-loudness button next to every viewer volume slider** (2026-11-03, task #126; user: "make sure the dynamic volume is
 something the viewer can actually select, whether he wants it or not ... next to the volume slider, have a little button
@@ -396,13 +396,13 @@ action and the same persisted global `level_loudness` setting as the Settings ch
 In a pop-out viewport the click goes through `Shared::pending_level` (like `pending_volume`) to the main window. *Why one
 global switch, not per stream:* the user asked for the *setting* to be visible and reachable where the volume is, not for a
 per-stream mode; per-stream state (storage per owner like `audio_volume_by_owner`, a flag on each decoder) is possible if
-it is ever wanted. The browser tile pill has the same button (`levelToggle` in `docs/js/ui/app.js`, `.audio-pill button.level`).
+it is ever wanted. The browser had the same button on its tile pill (`levelToggle` in `app.js`, `.audio-pill button.level`); since I6 its tiles have no pill either and the switch is the **Level loudness** row of the stream menu (`docs/js/ui/menus.js`, `applyLevelLoudness`).
 The viewer volume maximum stays 500 % (the same request first asked to cap it at 200 %, then the user said "leave it at 500%").
 Tests: `ui::tests::level_toggle_reports_a_click_only_on_the_button`; gallery card "Viewer volume" shows both states.
 *Geometry (2026-11-03, #130; user: "The dynamic volume button should be all the way in the right half-circle"):* the pill
 pads 2 px on both ends while the slider shows (10 px on the right only after the "Muted" text), so the 25 px mute and level
 buttons are concentric with the 29 px pill's half-circle ends, 2 px in all round. Browser: 1 px border + 1 px padding
-(`.audio-pill`, `.audio-pill:not(.muted)`).
+(`.audio-pill`, `.audio-pill:not(.muted)`; the pill is gone from the browser since I6, the geometry now only applies to the pop-out's pill).
 
 **Settings > Diagnostics > Relay: "Send diagnostics to the relay"** (2026-11-03, task #110; user: "he or all of my
 friends could just tick the checkbox while we are still in heavy development, and then I can just see it.
@@ -430,6 +430,8 @@ pop-out viewports. *Why:* on Windows (and X11) eframe's default "e" showed in th
 taskbar. Wayland takes the icon from `app_id` + the .desktop file, so it is harmless there. The
 exe file itself (Explorer, shortcuts) has no embedded icon resource: that needs a build-time
 resource compiler (`winresource`/`embed-resource` + an `.ico`), not added.
+
+**Note (2026-11-04, plan D8):** the preset, tuning and "Advanced" paragraphs of #90-#95 below describe the state of 2026-11-01. Since then the presets are **Text / Quality / Gaming** (they set the FPS once, the encoder mode and the keyframe interval), the Advanced tuning rows and the Balanced / Low-Latency presets are gone, and the modal's right-hand cards are Compression and Video (`features/stream-control.md` "Presets", `STYLING-GUIDE.md` "Stream settings and webcam"). The reasons below (hide what does nothing) still apply.
 
 **The stream-settings modal shows only controls that change the encode** (2026-11-01, task #90, user:
 "Keep the [Tune] setting. But make sure to not show settings, if they wouldn't do anything!").

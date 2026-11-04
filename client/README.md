@@ -21,7 +21,9 @@ GPU encode and decode); Windows is in progress, see `../superdoc/features/window
 ## Build and run
 
 Needs a Rust toolchain and GStreamer (with the VA plugins for hardware codecs; `check-deps.sh`
-reports what is missing). From the repo root:
+reports what is missing). Prerequisites by feature: the `video4linux2` plugin (`v4l2src`, in gst-plugins-good) and `jpegdec` for the **webcam**
+(optional, Linux only: without them the bar's Webcam button is disabled and says why), PipeWire with `pw-cli`/`pw-link`/`pw-dump` for
+**audio sharing** (desktop audio, per-app audio), an `xdg-desktop-portal` backend for **screen capture**. From the repo root:
 
 ```bash
 cargo run -p simple-screensharing-server     # relay; its TUI needs a tty, port 4433, cert state in ./state/ of the cwd

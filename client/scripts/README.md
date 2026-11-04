@@ -78,7 +78,7 @@ Every frame, when it changed, each client rewrites `$SCRATCH/ui<n>.txt`: `rect N
 | `card`, `card.row.I`, `card.back.I`; `cardrow I audio 0\|1 label=..` | the hover card |
 | `stage.bring_back`; `boost` | "Bring it back" while the stage is popped out; `boost` is the Boost percent (the old `settings.boost` rect is gone: Boost left Settings for the audio menu, `audio.boost`) |
 | `side.settings` | the sidebar's Settings button |
-| `sound.volume`, `sound.test.join\|leave\|start\|stop`; `sound_volume N` | Settings > Notifications: the volume slider and its value (percent), the four Test buttons |
+| `sound.volume`, `sound.test.join\|leave\|start\|stop`; `sound_volume N` | Settings > Sounds: the volume slider and its value (percent), the four Test buttons |
 | `audio.source`, `audio.boost`, `audio.excl_add`, `audio.excl.I`, `audio.excl.I.remove`, `audio.excl_text`, `audio.excl_add_text`; `boost N`, `excl A\|B` | the audio settings menu (`audio_settings.rs`): source dropdown, Boost slider (percent), the exclusion list (Add button, row I and its remove, the text fields of the Add popover) |
 | `chrome`, `chrome_alpha`, `stage_full W H`, `popover`, `modal`, `stage_fs`, `stream_fs`, `open` | state: fullscreen chrome, open menu / modal, fullscreen, the stream settings modal |
 | `fps`, `fps_options`, `codec.I`, `preset.I`, `change`, `footer`, `bitrate`, `mode`, `ready`, ... | the stream settings modal (`stream_settings.rs`) |

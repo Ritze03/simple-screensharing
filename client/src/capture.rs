@@ -10155,6 +10155,8 @@ pub mod webcam {
         fn a_webcam_is_a_label_not_a_kind() {
             assert!(is_webcam_label("Webcam") && is_webcam_label("Webcam 2"));
             assert!(!is_webcam_label("Screen") && !is_webcam_label("My Webcam") && !is_webcam_label(""));
+            // `CaptureSource::Webcam` exists on Linux only (found by the I11 Windows `cargo check --all-targets`).
+            #[cfg(target_os = "linux")]
             assert_eq!(CaptureSource::Webcam(Spec { device: "x".into(), mode: mode("MJPG", 1, 1, 1, 1) }).wire_label(), LABEL);
             assert_eq!(CaptureSource::TestSource(String::new()).wire_label(), "Screen");
         }

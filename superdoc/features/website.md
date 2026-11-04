@@ -232,6 +232,20 @@ native viewer** (`owner_has_video=false`, 350-400 packets), and a webcam-plus-au
 stubs the picker, and Chromium's own refusal of `video: false` is documented, not exercised), Firefox (no `getDisplayMedia` encode path, no MediaStreamTrackProcessor), a real USB camera (the fake device delivers 1280x720 at 20 fps and reports
 no capability list worth a mode menu), a real GPU, Windows.
 
+## Sounds (task I9, 2026-11-04)
+
+Settings > **Sounds** has one volume (0-100, step 5, default 50, `settings.soundVol` in `localStorage`, applied live while the slider is dragged) and a Test button per
+sound, like native. The four sounds (someone joins / leaves one of my streams, someone else starts / stops one), their edge rules and the *why* are on
+`features/audio-sharing.md` "Notification sounds"; the browser code is `docs/js/ui/sounds.js` (`SOUNDS`, `soundPlan`, `RoomSounds`, `Gate`, `SoundOut`), a port of native
+`client/src/sounds.rs` with the same tests in `dev/tests.js`. Rules specific to the browser:
+
+- **An `AudioContext` is created only when a sound is really played**, never at boot or on a click, so a page that a script drives never touches the audio output (the dev
+  harness replaces `SoundOut.play` and only looks at what would play). Volume 0 plays nothing and creates nothing.
+- **An event sound before the page has had a click or key press is dropped** (`navigator.userActivation.hasBeenActive`): browsers block audio until then, and a sound
+  that arrives late would be wrong. A Test button is a gesture, so it may resume a blocked context.
+- A room that just resumed from a dropped connection is quiet for 15 s (`RESUME_QUIET_MS`: a restarted relay has everybody re-announce); the same sound is not
+  started twice within a second (`MIN_GAP_MS`).
+
 ## Emoji avatars (task I6, 2026-11-04)
 
 The wire format is `protocol-spec.md` §9.2 (`AvatarHello 0xE9`, `AvatarAck 0xEA`, `AvatarSet 0xEB`, `AvatarList 0xEC`). Core: `protocol.js` `packAvatarSet` / `unpackAvatarSet` /

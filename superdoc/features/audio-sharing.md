@@ -22,6 +22,7 @@ User requirements (D1, the plan's own words) and the design decision (D9):
   audio-only shares replace the 'paired video' invariant in `start_audio_share` — a plain output monitor couldn't leave
   Discord out. Desktop audio, source groups and the exclusion list are native Linux only: a browser can't list apps,
   and Windows has no audio capture."*
+- **Browser twin (I10):** the website has the audio button too, as an audio-only share of a picked tab or the system audio (`docs/js/ui/capture.js` `startAudio`) and the Listen tile for an audio-only sender; it has no Desktop audio, no groups and no exclusion list. Details and the browser's notification sounds: `features/website.md` "Webcam, audio-only shares and webcam in picture" and "Sounds".
 
 ### What a share captures (`audio.rs`)
 
@@ -240,7 +241,7 @@ Audit of every volume-type slider:
   `SetAudioGain` once on release. The jitter and catch-up sliders are not volume and keep push-on-release.
 - **Native pop-out / fullscreen pill** (`ui/popout.rs` `audio_pill`) was already live: `.changed()` of the same `volume_slider`
   fires on every dragged frame and goes through `Shared::pending_volume` (pop-out) or straight out (fullscreen).
-- **Browser viewer slider** (`docs/js/ui/app.js` `audioPill`) was already live: `input` listener calling `setWatchVolume`
+- **Browser viewer slider** (`docs/js/ui/app.js` `audioPill`; since I6 the volume row of the stream menu, `docs/js/ui/menus.js`) was already live: `input` listener calling `setWatchVolume`
   (the `change` event is not used). The browser has no Boost slider; the other `sliderCtl` sliders (bitrate, jitter, ...) are not volume.
 
 Tests: `ui::tests::the_tile_volume_slider_pushes_set_volume_while_the_button_is_still_down` (real egui press + drag events,
@@ -956,7 +957,7 @@ Every viewer volume slider (native tile pill, pop-out / fullscreen pill, browser
   ran, so `wheel_notches` zeroes `smooth_scroll_delta.y` while the pointer is on the slider and the room panel under it
   does not scroll. (`ui::tests::wheel_over_the_volume_slider...` runs real `MouseWheel` events through a
   `ScrollArea` and fails without that line.)
-- **Browser wiring.** `volumeWheel(slider)` (`ui/dom.js`, called from `audioPill`): a non-passive `wheel` listener that
+- **Browser wiring.** `volumeWheel(slider)` (`ui/dom.js`, called from the stream menu's volume row in `menus.js`; from `audioPill` before I6): a non-passive `wheel` listener that
   `preventDefault()`s (no page scroll), sums `deltaY` (lines x 33), steps once it reaches half a notch
   (|deltaY| ~100 = one notch; a big flick = several), sets `slider.value` and dispatches an `input` event.
 - **Detent vs wheel.** The 100 % detent is for pointing (drag/click). A wheel step goes through 100 normally

@@ -2123,6 +2123,12 @@ with `capture::branch::tests::setting_one_branchs_bitrate_writes_through_to_that
 
 ## Sharing audio: an attachment on a screen share's card
 
+> **Superseded in part 2026-11-04 (task I7, plan D9; `features/audio-sharing.md`):** audio is no longer an attachment on a screen share. The audio button of the
+> control bar is independent of the screen: no "+ Add audio on a card", no "paired with video" invariant (`start_audio_share(room, None, ..)` is what the UI
+> always passes; `for_capture: Some(..)` survives for a share paired with a screen, whose Stop then stops the audio too). Stopping the screen leaves the audio
+> running. A viewer sees an audio-only sender as a **Listen** tile (`Watch` is for video; a sender with a screen still gets its audio with the watch,
+> "Audio follows video"). Everything below is the 2026-07-28 reasoning, kept where it still explains the pipeline.
+
 **Added 2026-07-28.** **Superseded the same day** — the section below described audio as
 its own `LocalCapture` *and* its own card, started from a standalone SHARE AUDIO panel.
 The capture is still its own `LocalCapture` (that part is unchanged); the **UI is not**.
@@ -2219,6 +2225,8 @@ and nothing for the slider to change. It works as designed once (1) is fixed.
 
 ## Audio is a row on the share, not a card of its own (backend facts)
 
+> **Note 2026-11-04 (I7):** the UI presentation described here (an extra row on the share) is gone; the backend facts (meter, mute, boost, stop) hold. Boost is set from the audio settings menu now (not Settings > Shared audio), the "Pairing" bullet is only the paired case (`for_capture: Some`), and "No stranded audio" is moot: an audio share is listed in Outgoing on its own.
+
 **Owner's request (2026-07-28):** attach audio to the screen share instead of making it its own
 card: a meter, the captured application's name, Mute and Stop on one extra row of the share.
 (Audio is still its own `LocalCapture` and its own `StreamKind::Audio` stream id on the wire; only
@@ -2233,7 +2241,7 @@ its *presentation* is bundled.)
   continuous Opus stream keeps the viewer's jitter buffer from seeing a mute as a multi-second
   dropout.
 - **Boost (#114):** `volume name=gain` + `rglimiter name=limiter` in F32 *before* the mute and the meter
-  (`audio::GAIN_STAGE`), set live by `AudioCaptureHandle::set_gain` from Settings > Shared audio; an
+  (`audio::GAIN_STAGE`), set live by `AudioCaptureHandle::set_gain` from the audio settings menu (Settings > Shared audio until 2026-11-04); an
   `audioconvert` after the meter takes it back to S16 for `opusenc`. `features/audio-sharing.md` (2026-11-03,
   task #114): why sender-side, why the limiter is bypassed at 100 %. The calibration was removed and the boost capped at 200 % in #119; viewers level loudness themselves (`leveller.rs`).
 - **Stop:** plain `stop_destination(<audio destination id>)`; an audio capture always has exactly
