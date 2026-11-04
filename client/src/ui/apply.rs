@@ -379,6 +379,12 @@ impl App {
             UiAction::SetEmoji(e) => self.state.set_emoji(&e),
             UiAction::SetLanguage(l) => self.state.set_language(&l),
             UiAction::SetPresentationMode(m) => self.state.set_presentation_mode(m),
+            UiAction::SetJitterBuffer(ms) => {
+                self.state.set_max_jitter_buffer_ms(ms);
+            }
+            UiAction::SetCatchUpSpeed(p) => {
+                self.state.set_catch_up_speed_percent(p);
+            }
             UiAction::SetSendDiagnostics(on) => self.state.set_send_diagnostics(on),
             UiAction::SetAudioGain(g) => {
                 self.state.set_audio_gain(g);

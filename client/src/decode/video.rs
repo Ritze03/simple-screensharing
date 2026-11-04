@@ -60,10 +60,11 @@ use gstreamer_video::{VideoFrame, VideoInfo};
 
 use super::codec::{self, VideoCodec};
 use super::frame::{DecodedFrame, DecoderInfo, Shared};
+use super::playout::{Limits, Playout};
 
 /// Message sent from `feed()`/`Drop` to the pipeline-owning thread.
 pub(super) enum PipelineMsg {
-    AccessUnit { pts_us: u64, keyframe: bool, data: Vec<u8> },
+    AccessUnit { arrived: Instant, pts_us: u64, keyframe: bool, data: Vec<u8> },
     /// Viewer recovery (L2, `decode/recovery.rs`): drop everything queued, rebuild the
     /// pipeline of the current codec and drop deltas until the next keyframe.
     Reset,
@@ -753,18 +754,29 @@ impl Worker {
 pub(super) fn run(rx: std_mpsc::Receiver<PipelineMsg>, shared: Arc<Shared>, allow_hardware: bool) -> Result<()> {
     let mut worker = Worker::new(shared.clone(), allow_hardware);
     let mut backlog: VecDeque<Au> = VecDeque::new();
+    // The playout buffer (row 136, `decode/playout.rs`): access units wait here for their measured
+    // delay before joining the backlog.
+    let mut playout: Playout<Au> = Playout::new();
     let mut lag_watch = LagWatch::default();
     'run: loop {
         // Idle: block (briefly, so bus/probation housekeeping still runs).
         // Backed up: just a short nap until the decoder has room again.
-        let wait = if backlog.is_empty() { Duration::from_millis(20) } else { Duration::from_micros(150) };
+        // Holding frames: sleep until the head is due, a real wake-up (no polling, no repaint loop).
+        let lim = Limits::current();
+        let mut wait = if backlog.is_empty() { Duration::from_millis(20) } else { Duration::from_micros(150) };
+        if let Some(due) = playout.next_due(Instant::now(), lim) {
+            wait = wait.min(due.max(Duration::from_micros(50)));
+        }
         let mut next = rx.recv_timeout(wait);
         loop {
             match next {
-                Ok(PipelineMsg::AccessUnit { pts_us, keyframe, data }) => backlog.push_back((pts_us, keyframe, data)),
+                Ok(PipelineMsg::AccessUnit { arrived, pts_us, keyframe, data }) => {
+                    playout.push(arrived, pts_us, (pts_us, keyframe, data), Limits::current());
+                }
                 Ok(PipelineMsg::Reset) => {
                     // Everything queued before the reset is pre-reset input.
                     backlog.clear();
+                    playout.clear();
                     worker.reset();
                 }
                 Ok(PipelineMsg::Shutdown) | Err(std_mpsc::RecvTimeoutError::Disconnected) => break 'run,
@@ -781,6 +793,12 @@ pub(super) fn run(rx: std_mpsc::Receiver<PipelineMsg>, shared: Arc<Shared>, allo
                 Err(std_mpsc::TryRecvError::Disconnected) => Err(std_mpsc::RecvTimeoutError::Disconnected),
             };
         }
+        let lim = Limits::current();
+        let due = playout.poll(Instant::now(), lim);
+        if !due.is_empty() {
+            shared.set_playout_ms(playout.applied_ms());
+        }
+        backlog.extend(due);
 
         let dropped = trim_backlog(&mut backlog, BACKLOG_MAX_AUS);
         if dropped > 0 {

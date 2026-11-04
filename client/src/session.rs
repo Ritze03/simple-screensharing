@@ -1690,6 +1690,13 @@ pub struct AppState {
     pub absolute_total_kbps: u32,
     /// Absolute-Maximum mode's guaranteed per-destination floor (persisted).
     pub destination_floor_kbps: u32,
+    /// Ceiling on the View tab's jitter buffer, in milliseconds (persisted).
+    /// See `rooms::AppSettings::max_jitter_buffer_ms`.
+    pub max_jitter_buffer_ms: u32,
+    /// Ceiling, as a percent of wall-clock time, on the jitter buffer's
+    /// catch-up playback speed (persisted). See
+    /// `rooms::AppSettings::catch_up_speed_percent`.
+    pub catch_up_speed_percent: u32,
     /// Settings > Diagnostics > "Send diagnostics to the relay" (persisted, off by default).
     /// See `rooms::AppSettings::send_diagnostics`, `diag_upload.rs`.
     pub send_diagnostics: bool,
@@ -1941,6 +1948,7 @@ impl Default for AppState {
         // is logged from then on.
         crate::diag_upload::set_enabled(settings.send_diagnostics, false);
         crate::leveller::set_enabled(settings.level_loudness);
+        crate::decode::playout::set_limits(settings.max_jitter_buffer_ms, settings.catch_up_speed_percent);
         crate::sounds::set_volume(settings.sound_volume);
         Self {
             display_name,
@@ -1966,6 +1974,8 @@ impl Default for AppState {
             bandwidth_mode: settings.bandwidth_mode,
             absolute_total_kbps: settings.absolute_total_kbps,
             destination_floor_kbps: settings.destination_floor_kbps,
+            max_jitter_buffer_ms: settings.max_jitter_buffer_ms,
+            catch_up_speed_percent: settings.catch_up_speed_percent,
             send_diagnostics: settings.send_diagnostics,
             audio_gain: settings.audio_gain(),
             level_loudness: settings.level_loudness,
@@ -2052,6 +2062,19 @@ pub fn save_bandwidth_settings(mode: BandwidthMode, absolute_total_kbps: u32, de
     }
 }
 
+/// Persist the jitter buffer ceiling. Mirrors `save_language`/
+/// `save_presentation_mode`'s load-modify-save shape, for the same reason:
+/// don't clobber the sibling settings. Clamps to `AppSettings`' 0..=5000
+/// range so a corrupt or out-of-range caller can't persist a value the
+/// frontend's own range input wouldn't allow.
+pub fn save_max_jitter_buffer_ms(ms: u32) {
+    let mut settings = AppSettings::load();
+    settings.max_jitter_buffer_ms = AppSettings::clamp_max_jitter_buffer_ms(ms);
+    if let Err(e) = settings.save() {
+        tracing::warn!("failed to save jitter buffer preference: {e:#}");
+    }
+}
+
 /// Persist the "send diagnostics" opt-in (task #110).
 pub fn save_send_diagnostics(on: bool) {
     let mut settings = AppSettings::load();
@@ -2112,6 +2135,18 @@ pub fn save_audio_gain(gain: f64) {
     settings.audio_gain = crate::audio_gain::clamp_gain(gain);
     if let Err(e) = settings.save() {
         tracing::warn!("failed to save the audio boost: {e:#}");
+    }
+}
+
+/// Persist the catch-up speed ceiling. Mirrors `save_max_jitter_buffer_ms`'s
+/// load-modify-save shape and defense-in-depth clamp — don't clobber the
+/// sibling settings, and don't trust a corrupt/out-of-range caller over the
+/// frontend's own 5-10 range input.
+pub fn save_catch_up_speed_percent(percent: u32) {
+    let mut settings = AppSettings::load();
+    settings.catch_up_speed_percent = AppSettings::clamp_catch_up_speed_percent(percent);
+    if let Err(e) = settings.save() {
+        tracing::warn!("failed to save catch-up speed preference: {e:#}");
     }
 }
 
@@ -5459,6 +5494,30 @@ impl AppState {
         save_presentation_mode(mode);
     }
 
+    /// Clamped here too (defense in depth) even though the UI's range input
+    /// already restricts it to 0..=5000 — see
+    /// `rooms::AppSettings::clamp_max_jitter_buffer_ms`. Returns the value
+    /// actually stored.
+    pub fn set_max_jitter_buffer_ms(&mut self, ms: u32) -> u32 {
+        let ms = AppSettings::clamp_max_jitter_buffer_ms(ms);
+        self.max_jitter_buffer_ms = ms;
+        crate::decode::playout::set_limits(ms, self.catch_up_speed_percent);
+        save_max_jitter_buffer_ms(ms);
+        ms
+    }
+
+    /// Clamped here too (defense in depth) even though the UI's range input
+    /// already restricts it to 5..=10 — see
+    /// `rooms::AppSettings::clamp_catch_up_speed_percent`. Returns the value
+    /// actually stored.
+    pub fn set_catch_up_speed_percent(&mut self, percent: u32) -> u32 {
+        let percent = AppSettings::clamp_catch_up_speed_percent(percent);
+        self.catch_up_speed_percent = percent;
+        crate::decode::playout::set_limits(self.max_jitter_buffer_ms, percent);
+        save_catch_up_speed_percent(percent);
+        percent
+    }
+
     /// Settings > Diagnostics: start or stop uploading the log to the relays (persisted).
     pub fn set_send_diagnostics(&mut self, on: bool) {
         self.send_diagnostics = on;
@@ -6132,6 +6191,24 @@ mod ui_ops_tests {
         state.set_display_name("  Mo  ");
         assert_eq!(state.display_name, "Mo");
         assert_eq!(AppSettings::load().display_name, "Mo");
+    }
+
+    #[tokio::test]
+    async fn jitter_buffer_and_catch_up_speed_are_clamped_then_persisted() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+
+        assert_eq!(state.set_max_jitter_buffer_ms(99_999), 5000);
+        assert_eq!(state.max_jitter_buffer_ms, 5000);
+        assert_eq!(AppSettings::load().max_jitter_buffer_ms, 5000);
+        assert_eq!(state.set_max_jitter_buffer_ms(1500), 1500);
+
+        assert_eq!(state.set_catch_up_speed_percent(0), 5);
+        assert_eq!(state.set_catch_up_speed_percent(50), 10);
+        assert_eq!(state.catch_up_speed_percent, 10);
+        let saved = AppSettings::load();
+        assert_eq!(saved.catch_up_speed_percent, 10);
+        assert_eq!(saved.max_jitter_buffer_ms, 1500, "saving one setting must not clobber its siblings");
     }
 
     #[tokio::test]

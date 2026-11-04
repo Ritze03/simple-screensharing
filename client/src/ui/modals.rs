@@ -60,6 +60,7 @@ pub enum SettingsTab {
     #[default]
     Profile,
     Interface,
+    Playback,
     Diagnostics,
 }
 
@@ -96,6 +97,8 @@ pub struct ModalsState {
     /// Tallest Settings body drawn so far (see [`SETTINGS_BODY_H`]).
     settings_body_h: f32,
     display_name: String,
+    jitter_s: f32,
+    catch_up: u32,
     /// Sounds > Volume as dragged, and whether it moved since it was last saved (the drag acts live,
     /// the release saves once).
     sound_vol: u32,
@@ -131,6 +134,8 @@ impl ModalsState {
             }
             Modal::Settings => {
                 self.display_name = cx.state.display_name.clone();
+                self.jitter_s = cx.state.max_jitter_buffer_ms as f32 / 1000.0;
+                self.catch_up = cx.state.catch_up_speed_percent;
                 self.sound_vol = cx.state.sound_volume;
                 self.sound_dirty = false;
             }
@@ -564,12 +569,13 @@ fn settings(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
             let tab_labels = [
                 tr("ui.settings.profile", "Profile"),
                 tr("ui.settings.tab_interface", "Interface"),
+                tr("ui.settings.playback", "Playback"),
                 tr("ui.settings.logs_card", "Diagnostics"),
             ];
-            let tabs = [SettingsTab::Profile, SettingsTab::Interface, SettingsTab::Diagnostics];
+            let tabs = [SettingsTab::Profile, SettingsTab::Interface, SettingsTab::Playback, SettingsTab::Diagnostics];
             let opts: Vec<(SettingsTab, &str)> = tabs.iter().zip(&tab_labels).map(|(t, l)| (*t, l.as_ref())).collect();
             let top = ui.cursor().min;
-            let spans = widgets::slot_spans(ui.available_width() - 6.0, 3.0, &[FILL; 3]);
+            let spans = widgets::slot_spans(ui.available_width() - 6.0, 3.0, &[FILL; 4]);
             widgets::segmented(ui, &mut st.settings_tab, &opts);
             for (t, (x, w)) in tabs.iter().zip(spans) {
                 let r = egui::Rect::from_min_size(top + egui::vec2(3.0 + x, 3.0), egui::vec2(w, theme::CTL_H - 6.0));
@@ -627,6 +633,39 @@ fn settings(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
                             None,
                         );
                     }
+                });
+            }
+            if st.settings_tab == SettingsTab::Playback {
+                widgets::card(ui, &tr("ui.settings.playback", "Playback"), None, |ui| {
+                    let max_ms = simple_screensharing_client::rooms::AppSettings::clamp_max_jitter_buffer_ms(u32::MAX) as f32 / 1000.0;
+                    widgets::slider_row(
+                        ui,
+                        &tr("ui.settings.jitter", "Jitter buffer"),
+                        Some(&tr(
+                            "ui.settings.jitter_tip",
+                            "Max jitter buffer. Smooths network hiccups; grows only when needed, up to this ceiling.",
+                        )),
+                        &mut st.jitter_s,
+                        0.0..=max_ms,
+                        0.1,
+                        1,
+                        " s",
+                    );
+                    let lo = simple_screensharing_client::rooms::AppSettings::clamp_catch_up_speed_percent(0);
+                    let hi = simple_screensharing_client::rooms::AppSettings::clamp_catch_up_speed_percent(u32::MAX);
+                    widgets::slider_row(
+                        ui,
+                        &tr("ui.settings.catch_up", "Catch-up speed"),
+                        Some(&tr(
+                            "ui.settings.catch_up_tip",
+                            "How much faster than live playback runs while shrinking the buffer after a spike.",
+                        )),
+                        &mut st.catch_up,
+                        lo..=hi,
+                        1.0,
+                        0,
+                        "%",
+                    );
                 });
             }
             if st.settings_tab == SettingsTab::Interface {
@@ -727,8 +766,15 @@ fn settings(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
     {
         cx.act(UiAction::SetDisplayName(st.display_name.trim().to_string()));
     }
-    // Slider: push once the pointer is released (each setter saves to disk).
+    // Sliders: push once the pointer is released (each setter saves to disk).
     let settled = closing || !ctx.input(|i| i.pointer.any_down());
+    let jitter_ms = (st.jitter_s * 1000.0).round() as u32;
+    if settled && jitter_ms != cx.state.max_jitter_buffer_ms {
+        cx.act(UiAction::SetJitterBuffer(jitter_ms));
+    }
+    if settled && st.catch_up != cx.state.catch_up_speed_percent {
+        cx.act(UiAction::SetCatchUpSpeed(st.catch_up));
+    }
     if settled && std::mem::take(&mut st.sound_dirty) {
         cx.act(UiAction::SetSoundVolume(st.sound_vol));
     }

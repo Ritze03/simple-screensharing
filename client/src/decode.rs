@@ -304,6 +304,7 @@ use crate::protocol::{ConnId, StreamId};
 mod avsync;
 mod codec;
 mod frame;
+pub mod playout;
 mod recovery;
 #[cfg(test)]
 mod recovery_tests;
@@ -888,7 +889,9 @@ impl StreamDecoder {
             s.video_decoder_started();
             s
         });
-        sync.note_video(now, frame.pts, frame.stalled);
+        // The playout buffer holds the picture back by its delay (`decode/playout.rs`): the audio
+        // has to be delayed to match what is *shown*, not what arrived.
+        sync.note_video(now + Duration::from_micros(self.frames.playout_delay_us()), frame.pts, frame.stalled);
         // Counted here, ahead of the pre-keyframe gate below, so the bitrate
         // readout reflects real received network throughput even during the
         // brief pre-keyframe window where frames are being dropped rather
@@ -919,6 +922,7 @@ impl StreamDecoder {
             return;
         }
         let msg = PipelineMsg::AccessUnit {
+            arrived: now,
             pts_us: frame.pts,
             keyframe: frame.keyframe,
             data: frame.payload.clone(),

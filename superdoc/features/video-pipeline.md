@@ -54,8 +54,9 @@ SW: appsrc ! {h264,h265,av1}parse ! {avdec_h264,avdec_h265,av1dec} ! videoconver
   renderer converts YUV to RGB in a shader. The old `videoconvert ! RGBA` stage capped
   throughput far below the 120-240 fps target.
 - **No pacing in the decoder.** The appsink is `sync=false` and frames are published the moment
-  they come out; pacing belongs where the display refresh is known (the presenter).
-  `PacingState` stays as a `pub` building block for that.
+  they come out. Since row 136 (2026-11-04) the viewer paces *before* the decoder instead: the
+  **playout buffer** below holds encoded access units for a measured delay. `PacingState` stays
+  unwired as a `pub` building block.
 
 **A keyframe is a freeze, not a latency step (row 129, 2026-11-04).** The viewer cannot show a keyframe's picture before its last fragment arrives and the presenter is latest-only, so the sharer's keyframe pacing window shows up 1:1 as a freeze of the picture (decoder-output gap = pump hold + ~13 ms IDR decode; relay, upload and the rest measured at 1-2 ms on loopback). On a real line the sender's uplink sets that window, not the pump (row 133): `features/stream-control.md` "Keyframe stutter on the real machine".
 
@@ -106,9 +107,9 @@ the hardware path is first and the fallback is a safety net, not a plan.
 **User report (live, 2026-11-03):** "ale is streaming and his screenshare is constantly going
 faster and slower again", a *smooth* slowdown and speedup, ale shares no audio.
 
-**Mechanism (code):** the native viewer has no playout pacing (above: frames are shown the moment
-they are decoded; `PacingState` is not wired; the two Settings sliders for it, `max_jitter_buffer_ms` /
-`catch_up_speed_percent`, were read by nothing native and were removed, #125, 2026-11-04). So when the decoder
+**Mechanism (code):** the native viewer had no playout pacing when this was written (frames were shown the moment
+they were decoded; `PacingState` is not wired; the two Settings sliders for it were read by nothing and removed,
+#125, 2026-11-04; the playout buffer of row 136 and the sliders came back later that day, see "Playout buffer"). So when the decoder
 is slower than the stream nothing is dropped at first: access units queue in the pipeline
 thread's backlog (`decode/video.rs` `run`, up to `BACKLOG_MAX_AUS` = 64, 0.7 s at 90 fps), the
 picture runs late more and more (slow motion at decoder speed / stream rate), and when the decoder
@@ -146,7 +147,7 @@ on Mesa AMD"), so 120 fps would be ~80 % of that instance.
 - Confound: the 23:16:40-23:19:34 stretch overlapped this investigation's own release builds, and
   one 44 fps window at ~23:12 followed its GPU load tests, so neither is a clean natural sample.
 
-Ruled out by the code: a playout or catch-up controller and clock drift (the native viewer has
+Ruled out by the code (at the time; the playout buffer arrived in row 136): a playout or catch-up controller and clock drift (the native viewer had
 neither), A/V alignment (ale shares no audio). NACK hold-and-release and recovery loops were **not**
 ruled out by measurement, the client's log being unavailable.
 
@@ -183,6 +184,70 @@ complete, released), at the decoder thread, at the decoder's output and when it 
 
 "Shown" is the upload in the paint callback, not the moment of scan-out: time waiting for the swapchain shows up in the next
 frame's figure, the compositor's own delay does not.
+
+### Playout buffer (2026-11-04, row 136)
+
+`client/src/decode/playout.rs` (pure, `now` injected, 11 unit tests) used by `decode/video.rs` `run`. **What:** access units
+are held *encoded* (kB each, never decoded frames) for a measured per-stream delay before they join the decoder backlog; the
+loop wakes for the head's due time through `recv_timeout` (a real wake-up, no polling; `VideoView`'s waker still drives the
+repaint). The delay shrinks again by playing up to 5-10 % faster than live. Every number is the browser's
+(`docs/js/core/jitter.js`) except what the delay aims at.
+
+```text
+x = arrival - pts;  baseline = min x (creeps up 1 ms/s: clock skew);  late = x - baseline   (sender clock offset cancels)
+peak = max late over the last 8 s;  target = 1.15 * peak, clamped [0, max_jitter_buffer_ms]
+applied: up by at most 20 ms per frame; down by at most catch_up_percent of wall time
+release = pts + baseline + applied   (never before the previous release); a frame never waits more than max since arrival
+```
+
+*Arrival* is when `feed` got the complete (NACK-repaired) frame. Rules, each with a test: first frame at once (`applied`
+starts at 0); nothing is ever dropped by the buffer; a **still screen** adds nothing (no frames, no measurement; the next
+frame's `arrival - pts` is the baseline again); `max = 0` is today's behaviour exactly; the maximum is a hard cap
+(`min(release, arrival + max)`, read at every poll, so lowering the slider releases held frames at once); a PTS restart
+(5 s of lateness) releases what is held and measures again. `PipelineMsg::Reset` (L2 recovery) clears it. The two sliders
+(Settings > Playback) call `decode::playout::set_limits`, read by every stream on its next frame.
+
+**Why held encoded, before the decoder (the browser's way):** 1080p NV12 frames are ~3 MB, a 250 ms buffer at 240 fps would
+be 180 MB; access units are tens of kB, and the existing `trim_backlog` still guards the decoder side.
+
+**Why the peak, not the browser's `ewma * 4 + 40 ms`:** the EWMA averages `|jitter|`, and a keyframe stall is one big sample
+among hundreds of normal ones: at 60 fps with a 180 ms stall once a second the average deviation is about 3 ms and the
+formula asks for about 50 ms, so most of the stall still reaches the screen (a unit test uses exactly this case). The
+buffer has to cover the worst recent lateness. The 8 s window outlasts a 2 s keyframe interval; after the stalls stop the
+target falls and the catch-up speed sets how fast. The `+ 40 ms` floor is gone: a clean path keeps about what its own
+keyframes need (23 ms in the rig with no bottleneck).
+
+**Why (user, 2026-11-04):** "On 5 mbit/s it seems a little bit shorter. But if building the playout buffer fixes it, add it.
+Make it dynamic, like it was before with an automatic catchup speed. Also add the settings back to the Settings menu."
+Cause of the stutter: row 133 (`stream-control.md`): a keyframe needs size / sender uplink to arrive, later frames queue
+behind it and arrive in a clump.
+
+**A/V sync follows.** `StreamDecoder::feed` tells `AvSync` the video arrived at `now + playout delay`
+(`Shared::playout_us`, set by the pipeline thread), so the video latency floor rises with the buffer and the audio is
+delayed by the same amount (`decode/avsync.rs`; test `the_playout_buffer_delay_reaches_the_audio_delay`). Not verified
+with real audio (no audio on the host).
+
+**The `video timing` line** gained `playout_ms[median/p99/max]` (the delay at each release). `decode_ms` now includes the
+time a frame was held. `late_ms` is against the window's minimum, so it shows evenness, not the added latency (that is `playout_ms`).
+
+**Measured (row 136, rig, release, relay behind the row-133 proxy: 38 Mbit/s up, 150 ms queue, 10 ms each way, 10 Mbit/s
+stream, a detailed window moving in circles; "off" = `max_jitter_buffer_ms = 0`; viewer `video timing`, last 10 s window,
+median/p99 of the gap between shown frames at a keyframe, and the added delay):**
+
+| case | keyframe shown gap off | on | other frames' gap on | playout delay |
+|---|---|---|---|---|
+| AV1 120 fps Gaming (key 250) | 68.8 / 73.0 ms | 11.1 / 18.8 | 8.3 / 12.8 | 70.6 / 74.3 ms |
+| H.264 60 fps Gaming | 78.0 / 88.2 | 20.4 / 26.4 | 16.6 / 21.2 | 81.2 |
+| H.264 60 fps Quality (key 1000) | 165.6 / 171.0 | 31.6 / 40.8 | 16.8 / 29.7 | 192.0 / 199.5 |
+| AV1 120 fps Quality (key 1000) | 500.9 / 999.5 | 516.7 / 1001.1 | - | 87 / 154 |
+| AV1 120 Gaming, clean path (no bottleneck) | - | 10.7 / 15.6 | 8.3 / 12.7 | 22.6 / 23.0 |
+| AV1 120 Gaming, 1 % loss up + 0.5 % down | 90.5-108 / 154-215 | 10.7 / 88 (first window), then 11-15 / 16-32 | 8.3 / 12.5 | 226-260 |
+
+The AV1 Quality row is not a buffer matter: a 605 kB keyframe overflows the proxy's 150 ms queue (`a keyframe never
+completed (261/521 fragments)`), viewer recovery L1 asks for a new one (recovered after 673 ms off / 690 ms on): same
+with and without the buffer. A *still screen* (the pattern frozen with SIGSTOP; the sharer kept sending keyframes at about
+30 fps) left the delay at 73-87 ms, no growth. Under loss the buffer grows to cover NACK repair (a repaired keyframe
+arrives about 250 ms late): the stutter is gone, the price is that delay; the user can cap it with the slider.
 
 ## Viewer recovery (`client/src/decode/recovery.rs`, 2026-11-02, #101)
 
@@ -505,8 +570,9 @@ that outlived the code:
   `superdoc/meta/TERMINOLOGY.md` "Sniffing"); the browser's is `docs/js/core/codec.js`.
 - **Jitter buffer:** buffer *encoded* chunks and delay `decode()`, not decoded frames (a 1080p
   `VideoFrame` is ~3 MB). Playout delay eased toward `jitterEwma * 4 + 40 ms` (RFC 3550 EWMA, alpha
-  1/16, ease step 20 ms), capped by the user's `max_jitter_buffer_ms` (default 2000, 0-5000; browser only, the native setting is gone, #125). The
-  browser viewer keeps this design in `docs/js/core/jitter.js`.
+  1/16, ease step 20 ms), capped by the user's `max_jitter_buffer_ms` (default 2000, 0-5000). The
+  browser viewer keeps this design in `docs/js/core/jitter.js`. The native viewer has the same shape since
+  row 136 with a different target (peak, not EWMA): "Playout buffer" below.
 - **Sustained sender-faster-than-decoder overload** drifted without bound because the
   browser decoder was still fed every chunk. A frame cannot be skipped singly (delta frames
   reference earlier ones, so a skipped P-frame raises a fatal decoder error); the safe drop is a

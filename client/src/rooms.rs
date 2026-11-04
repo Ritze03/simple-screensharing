@@ -383,6 +383,22 @@ pub struct AppSettings {
     /// anyone (round-1 Q8).
     #[serde(default = "AppSettings::default_destination_floor_kbps")]
     pub destination_floor_kbps: u32,
+    /// Ceiling on the View tab's jitter buffer, in milliseconds (plan doc:
+    /// user-configurable instead of the buffer's earlier hardcoded 2000ms).
+    /// The buffer itself still grows only as far as live jitter demands —
+    /// this just caps how far it's allowed to grow.
+    #[serde(default = "AppSettings::default_max_jitter_buffer_ms")]
+    pub max_jitter_buffer_ms: u32,
+    /// Ceiling, as a percent of wall-clock time, on how much faster than
+    /// live the View tab's jitter buffer is allowed to play back queued
+    /// video while shrinking back down after a jitter spike
+    /// (`tile-video.js`'s `updateAppliedBuffer`) — e.g. 5 means "at most 5%
+    /// faster than real time" while catching up. Project owner, verbatim:
+    /// "It should run at max 5%-10% faster... to basically catch up to live
+    /// again." The dynamic shrink itself is always on; this only bounds how
+    /// aggressively it's allowed to speed up.
+    #[serde(default = "AppSettings::default_catch_up_speed_percent")]
+    pub catch_up_speed_percent: u32,
     /// The "START A STREAM" form's last-used values (`stream-control.js`'s
     /// `renderStartStreamCard`) — framerate, bitrate, and the three
     /// testing-oriented encoder tuning knobs, saved on every change so the
@@ -602,6 +618,8 @@ impl Default for AppSettings {
             bandwidth_mode: BandwidthMode::default(),
             absolute_total_kbps: Self::default_absolute_total_kbps(),
             destination_floor_kbps: Self::default_destination_floor_kbps(),
+            max_jitter_buffer_ms: Self::default_max_jitter_buffer_ms(),
+            catch_up_speed_percent: Self::default_catch_up_speed_percent(),
             start_stream_defaults: StartStreamDefaults::default(),
             display_name: String::new(),
             send_diagnostics: false,
@@ -657,6 +675,34 @@ impl AppSettings {
     /// a slideshow.
     fn default_destination_floor_kbps() -> u32 {
         500
+    }
+
+    /// 2000ms: the jitter buffer's original hardcoded ceiling, kept as the
+    /// default so this setting's introduction is a no-op for anyone who
+    /// never touches it.
+    fn default_max_jitter_buffer_ms() -> u32 {
+        2000
+    }
+
+    /// Clamp range for `max_jitter_buffer_ms`: 0 (buffer effectively
+    /// disabled) to 5000ms (well above any jitter this app is expected to
+    /// smooth; a higher ceiling just adds playout latency for no benefit).
+    pub fn clamp_max_jitter_buffer_ms(ms: u32) -> u32 {
+        ms.clamp(0, 5000)
+    }
+
+    /// 5%: the conservative end of the owner's requested 5-10% range, kept
+    /// as the default so the catch-up speedup starts subtle (barely
+    /// perceptible) rather than aggressive — the user can dial it up to
+    /// 10% from Settings if they want faster recovery after a jitter spike.
+    fn default_catch_up_speed_percent() -> u32 {
+        5
+    }
+
+    /// Clamp range for `catch_up_speed_percent`: 5 to 10, matching the
+    /// range the project owner asked for explicitly ("max 5%-10% faster").
+    pub fn clamp_catch_up_speed_percent(percent: u32) -> u32 {
+        percent.clamp(5, 10)
     }
 
     /// `$XDG_CONFIG_HOME/simple-screensharing/settings.toml` (or the
@@ -963,6 +1009,8 @@ mod tests {
             bandwidth_mode: BandwidthMode::Absolute,
             absolute_total_kbps: 12_345,
             destination_floor_kbps: 750,
+            max_jitter_buffer_ms: 3_500,
+            catch_up_speed_percent: 8,
             start_stream_defaults: StartStreamDefaults::default(),
             display_name: "mo".to_string(),
             send_diagnostics: true,
@@ -983,6 +1031,8 @@ mod tests {
         assert_eq!(parsed.bandwidth_mode, BandwidthMode::Absolute);
         assert_eq!(parsed.absolute_total_kbps, 12_345);
         assert_eq!(parsed.destination_floor_kbps, 750);
+        assert_eq!(parsed.max_jitter_buffer_ms, 3_500);
+        assert_eq!(parsed.catch_up_speed_percent, 8);
         assert_eq!(parsed.display_name, "mo");
         assert!(parsed.send_diagnostics);
         assert_eq!(parsed.audio_gain, 1.5);
@@ -1133,16 +1183,41 @@ mod tests {
         assert_eq!(parsed.presentation_mode, PresentationMode::Mailbox);
     }
 
-    /// Settings files written before #125 (2026-11-04) carry the removed `max_jitter_buffer_ms` and
-    /// `catch_up_speed_percent` keys; they must still load, the keys ignored (the next save drops them).
+    /// Same missing-field tolerance as above, for `max_jitter_buffer_ms`
+    /// specifically — a settings file written before this field existed must
+    /// still parse and default it to the jitter buffer's original hardcoded
+    /// ceiling.
     #[test]
-    fn app_settings_with_the_removed_jitter_and_catch_up_keys_still_load() {
-        let parsed: AppSettings = toml::from_str(
-            "language = \"de\"\nmax_jitter_buffer_ms = 3500\ncatch_up_speed_percent = 8\n",
-        )
-        .unwrap();
-        assert_eq!(parsed.language, "de");
-        assert!(!toml::to_string(&parsed).unwrap().contains("jitter"));
+    fn app_settings_missing_max_jitter_buffer_ms_defaults() {
+        let parsed: AppSettings = toml::from_str("language = \"de\"\n").unwrap();
+        assert_eq!(parsed.max_jitter_buffer_ms, 2000);
+    }
+
+    #[test]
+    fn clamp_max_jitter_buffer_ms_clamps_to_0_5000() {
+        assert_eq!(AppSettings::clamp_max_jitter_buffer_ms(0), 0);
+        assert_eq!(AppSettings::clamp_max_jitter_buffer_ms(5000), 5000);
+        assert_eq!(AppSettings::clamp_max_jitter_buffer_ms(9999), 5000);
+        assert_eq!(AppSettings::clamp_max_jitter_buffer_ms(2000), 2000);
+    }
+
+    /// Same missing-field tolerance as above, for `catch_up_speed_percent`
+    /// specifically — a settings file written before this field existed
+    /// must still parse and default it to the conservative end of the
+    /// owner's requested range.
+    #[test]
+    fn app_settings_missing_catch_up_speed_percent_defaults() {
+        let parsed: AppSettings = toml::from_str("language = \"de\"\n").unwrap();
+        assert_eq!(parsed.catch_up_speed_percent, 5);
+    }
+
+    #[test]
+    fn clamp_catch_up_speed_percent_clamps_to_5_10() {
+        assert_eq!(AppSettings::clamp_catch_up_speed_percent(0), 5);
+        assert_eq!(AppSettings::clamp_catch_up_speed_percent(5), 5);
+        assert_eq!(AppSettings::clamp_catch_up_speed_percent(10), 10);
+        assert_eq!(AppSettings::clamp_catch_up_speed_percent(9999), 10);
+        assert_eq!(AppSettings::clamp_catch_up_speed_percent(7), 7);
     }
 
     /// A settings file written before `start_stream_defaults` existed must

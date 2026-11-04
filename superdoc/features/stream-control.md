@@ -88,7 +88,7 @@ holds nothing back (on loopback it is ~37 kB, harmless at RTT 0); loss and the N
 | Keyframe 1000 ms | 600-700 kB | 140-180 ms | 1/s | a longer stall: the size grows with the interval |
 | Keyframe 8 s (H.264, temporary override, 0.1 % loss) | 0.9-1.5 MB | 291 ms | every 8 s | much longer stall; fall-back to 2.5x makes it worse |
 | squeeze every IDR (#102's `bitrate` write) | 27-57 kB (#102) | about 10-20 ms, estimated | 4/s | -2 dB static, -4..-6 dB detail on each keyframe: a visible pulse; radeonsi quirk, not measured here |
-| playout buffer on the viewer (native has none) | unchanged | hidden | | fixed latency of about the stall on everything: ~70 ms at Gaming on this line, ~180 ms at 1000 ms; not built |
+| playout buffer on the viewer | unchanged | hidden | | added latency of about the stall (~70 ms at Gaming on this line, ~180 ms at 1000 ms), dynamic; **built in row 136**, measured in `video-pipeline.md` "Playout buffer" |
 
 A faster uplink fixes it too: at 100 Mbit/s the same keyframe costs ~20 ms plus decode.
 

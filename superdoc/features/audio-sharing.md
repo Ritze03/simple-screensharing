@@ -1185,7 +1185,9 @@ queued sources that would overlap.
   the guess; not added, it would touch the protocol crate.
 - **Video decode and sink latency are assumed equal** (VA decode is a few ms; the audio sink adds
   its own buffer, not queried). Expect a residual of a few tens of ms.
-- **Video floor uses arrival, not presentation, on native** (the renderer pulls frames its own
-  way). Browser uses the jitter buffer's release time.
+- **Video floor uses arrival plus the playout buffer's delay on native** (row 136, 2026-11-04): the native viewer
+  holds encoded frames (`decode/playout.rs`), `feed` reports `now + Shared::playout_us` to `AvSync::note_video`, so the audio
+  follows the buffer as it grows and shrinks (still the 60 ms deadband and 500 ms step limit). The renderer's own
+  pull latency is not added. Browser uses the jitter buffer's release time.
 - **Capturing sources that stamp unusual PTS** are unaffected: only `buffer pts + offset` reaches
   the wire, as before.

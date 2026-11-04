@@ -378,6 +378,9 @@ pub(super) struct Shared {
     timeline: Mutex<Timeline>,
     /// The stream id for that log, set by the decoder.
     timeline_stream: AtomicU64,
+    /// The playout buffer's current delay in microseconds (`decode/playout.rs`), set by the pipeline
+    /// thread; read by `feed` so the audio is delayed to match the picture.
+    playout_us: AtomicU64,
 }
 
 impl Shared {
@@ -396,6 +399,7 @@ impl Shared {
             info: Mutex::new(DecoderInfo::default()),
             timeline: Mutex::new(Timeline::default()),
             timeline_stream: AtomicU64::new(0),
+            playout_us: AtomicU64::new(0),
         })
     }
 
@@ -417,6 +421,16 @@ impl Shared {
         for line in lines.into_iter().flatten() {
             tracing::info!("video timing stream {stream}: {line}");
         }
+    }
+
+    /// The playout buffer's delay now (pipeline thread, once per released frame).
+    pub(super) fn set_playout_ms(&self, ms: f64) {
+        self.playout_us.store((ms * 1000.0) as u64, Ordering::Relaxed);
+        self.timeline.lock().unwrap().note_playout(ms);
+    }
+
+    pub(super) fn playout_us(&self) -> u64 {
+        self.playout_us.load(Ordering::Relaxed)
     }
 
     pub(super) fn set_display_hint(&self, width: u32, height: u32) {
@@ -565,6 +579,11 @@ impl FrameSource {
     }
 
     /// The access unit went to the decoder thread (row 133, `decode/timing.rs`).
+    /// The playout buffer's delay in microseconds: how much later than it arrived the picture is.
+    pub(super) fn playout_delay_us(&self) -> u64 {
+        self.0.playout_us()
+    }
+
     pub(super) fn note_fed(&self, now: Instant, pts_us: u64, keyframe: bool, bytes: usize, arrival: Option<FrameArrival>) {
         self.0.timeline.lock().unwrap().note_fed(now, pts_us, keyframe, bytes, arrival);
     }

@@ -231,6 +231,20 @@ mod tests {
 
     const MS: i64 = 1_000;
 
+    /// Row 136: the video decoder reports `arrival + playout delay`, so the picture's floor rises by
+    /// the buffer and the audio is delayed by the same amount (up to the nominal lead).
+    #[test]
+    fn the_playout_buffer_delay_reaches_the_audio_delay() {
+        let (mut video, mut audio) = (LatencyFloor::new(), LatencyFloor::new());
+        feed(&mut audio, 0, 100, 50, 20 * MS);
+        feed(&mut video, 0, 100, 60, 150 * MS);
+        let without = target_delay_us(video.floor(), audio.floor(), true);
+        let mut buffered = LatencyFloor::new();
+        feed(&mut buffered, 0, 100, 60, 150 * MS + 180 * MS);
+        let with = target_delay_us(buffered.floor(), audio.floor(), true);
+        assert_eq!(with - without, 180 * MS);
+    }
+
     /// Feed `n` packets at `fps`, each `lat` us late, starting at `t0` (sender clock = local clock).
     fn feed(f: &mut LatencyFloor, t0: i64, n: i64, fps: i64, lat: i64) -> i64 {
         let step = 1_000_000 / fps;

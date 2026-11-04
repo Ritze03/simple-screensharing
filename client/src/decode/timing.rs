@@ -125,6 +125,8 @@ pub(super) struct Timeline {
     last_complete: Option<Instant>,
     last_decoded: Option<Instant>,
     last_shown: Option<(Instant, u64)>,
+    /// The playout buffer's delay at each release in this window (row 136).
+    playout: Spread,
 }
 
 impl Timeline {
@@ -155,6 +157,11 @@ impl Timeline {
     }
 
     /// The report lines, when one is due and there is anything to say.
+    /// The playout buffer's delay when it released a frame.
+    pub(super) fn note_playout(&mut self, ms: f64) {
+        self.playout.add(ms);
+    }
+
     pub(super) fn report(&mut self, now: Instant) -> Option<Vec<String>> {
         let last = *self.last_report.get_or_insert(now);
         let window = now.saturating_duration_since(last);
@@ -165,6 +172,7 @@ impl Timeline {
         let settled = self.frames.iter().take_while(|e| now.saturating_duration_since(e.fed) >= SETTLE).count();
         let frames: Vec<Entry> = self.frames.drain(..settled).collect();
         if frames.is_empty() {
+            self.playout = Spread::default();
             return None;
         }
         Some(self.analyze(&frames, window, now))
@@ -257,7 +265,7 @@ impl Timeline {
         let mut lines = vec![format!(
             "win_s={:.1} frames={} keyframes={keys} key_kB={} delta_kB={} pts_gap_ms={} span_ms[{}] net_late_ms[{}] arrive_gap_ms[{}] \
              queue_ms={} decode_ms[{}] out_gap_ms[{}] shown_gap_ms[{}] late_ms[{}] late_frames key={late_key} other={late_other} \
-             held={held} held_worst_ms={held_worst:.1} repaired={repaired} undecoded={undecoded} unshown={unshown} pts_unix_floor_us={:.0}",
+             held={held} held_worst_ms={held_worst:.1} repaired={repaired} undecoded={undecoded} unshown={unshown} pts_unix_floor_us={:.0} playout_ms[{}]",
             window.as_secs_f64(),
             frames.len(),
             key_bytes.three(),
@@ -272,6 +280,7 @@ impl Timeline {
             shown_gap.text(),
             late.text(),
             base_unix + complete_floor,
+            std::mem::take(&mut self.playout).three(),
         )];
         if let Some((value, i)) = worst {
             lines.push(worst_line(frames, i, value));

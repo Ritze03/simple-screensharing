@@ -53,7 +53,7 @@ call, not in side panels.
 - **The Stream Control / View / Settings nav rail is gone.** Settings is a modal opened
   from the user band's gear; sharing lives in the stage's control bar; watching is the
   the room's stage.
-- **Settings is a modal with three tabs**, Profile | Interface (Language, Display, Sounds) | Diagnostics (a
+- **Settings is a modal with four tabs** (Playback is back since 2026-11-04, row 136), Profile | Interface (Language, Display, Sounds) | Playback (Jitter buffer, Catch-up speed) | Diagnostics (a
   `widgets::segmented` row, `ModalsState::settings_tab`, opens on Profile and keeps the choice while the app runs); the
   body has one height on every tab (`SETTINGS_BODY_H`). The browser has Profile | Interface (Language, Sounds) | Playback.
   The native Playback tab is gone (2026-11-04, row 134): its one control, Level loudness, moved to the control bar
@@ -867,15 +867,20 @@ buttons (40 px high there, not group height). Test: `bar::tests::the_label_goes_
 The browser keeps its Playback tab (the jitter and catch-up sliders work there) minus the Level loudness row; its bar
 wraps by CSS so it needed no rule.
 
-## Native Playback: jitter buffer and catch-up sliders removed (2026-11-04, #125)
+## Native Playback: jitter buffer and catch-up sliders removed (2026-11-04, #125), restored with a real buffer (row 136)
 
-The native viewer has no playout pacing (frames are shown as decoded, `features/video-pipeline.md`), so the Settings >
-Playback sliders "Jitter buffer" and "Catch-up speed" did nothing. **Why:** the user was told so and said "Remove them",
-under their rule "If a setting doesn't do anything, hide it". Gone: both sliders, `UiAction::SetJitterBuffer` /
+The native viewer had no playout pacing, so the Settings > Playback sliders "Jitter buffer" and "Catch-up speed" did
+nothing. **Why removed:** the user was told so and said "Remove them", under their rule "If a setting doesn't do
+anything, hide it" (#125). **Why back (row 136, the same day):** the native viewer got a playout buffer
+(`decode/playout.rs`, `features/video-pipeline.md` "Playout buffer"); the user: "Also add the settings back to the
+Settings menu." Restored: both sliders (Settings > **Playback** tab, between Interface and Diagnostics; the tab row is
+four `FILL` slots, rig rects `settings.tab.profile|interface|playback|diagnostics`), `UiAction::SetJitterBuffer` /
 `SetCatchUpSpeed`, `AppState::set_max_jitter_buffer_ms` / `set_catch_up_speed_percent`, `AppSettings.max_jitter_buffer_ms`
-/ `catch_up_speed_percent` with defaults and clamps, the locale keys. An old `settings.toml` with those keys still loads
-(serde ignores unknown keys; there is no `deny_unknown_fields`, keep it so); the next save drops them. The browser keeps
-its own working sliders (`docs/js/ui/`, `client.setJitterSettings`). Playback kept Level loudness until row 134 moved it to the bar and removed the tab (above).
+(default 2000, 0-5000) / `catch_up_speed_percent` (default 5, 5-10), the locale keys (the browser's words, German as in
+the browser). Both setters also call `decode::playout::set_limits`, which every running stream reads on its next frame
+(the sliders push on release, as before). An old `settings.toml` with the keys keeps them; one without gets the
+defaults. The tab holds only these two sliders, so `SETTINGS_BODY_H` (set by the Interface tab) is unchanged. Level
+loudness stays on the control bar (above).
 
 ## Strings
 
