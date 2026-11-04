@@ -934,6 +934,43 @@ reassembler (`fragment.rs`) to drop duplicate fragments of an already completed 
 fragment must also not be re-encrypted (a nonce is never reused), only re-sent. On a lossy link the one forced IDR is often lost and
 the viewer waited for the next GOP boundary (2 s) with a frozen picture.
 
+### A second output mode change that left the share stuck (2026-11-04, #115)
+
+**Seen (I5):** live share, captured output 1920x1080 -> 1280x1024 (recovered) -> 1920x1080 (stuck: viewer at ~2-5 fps,
+squashed picture, L1 recovery looping). **Reproduced** in the headless rig on stock xdpw 0.8.4 (`swaymsg output
+HEADLESS-1 mode ...`), 1 of ~20 mode changes (3 + 8 fresh-rig two-change runs + a 10-change loop); the other changes all
+recovered. Stock xdpw has three behaviours on a mode change of the captured output, none of them ours:
+1. it **crashes** (`ext_image_copy_capture_session_v1#18: error 1: session already has a frame object`, `xdpw-crashed.log`),
+   `pipewiresrc` reports `stream error: target not found`, the session restarts the capture (~0.5 s); about 40 % of changes;
+2. it **survives but its stream goes silent** (nothing offered to the branch): the 5 s silence path declares the source
+   lost and the capture is restarted (`the capture source stopped delivering frames`, 2-3 s); about 55 %;
+3. it **survives and renegotiates** (`wlroots: num_modififiers` x4, `paused`, `streaming`) and then logs
+   `ext: frame capture failed: buffer constraint mismatch` / `ext: started frame without buffer` (or, later,
+   `out of buffers` / `unable to export buffer, dropping frame`): the stream is dead but `pipewiresrc`'s
+   `keepalive-time` keeps resending its last buffer. The tracer shows `capture 29.9 fps` = `into encode branch 29.9 fps`
+   and no encoder output; the branch is *offered* frames, so `stall_verdict` calls it an **encoder wedge**, rebuilds the
+   branch 3 times (`the source delivers frames but the encoder emits none`) and ends `the encoder stayed silent through
+   3 rebuilds; giving up` with the destination `Failed`. Caught once (stock, second change after an xdpw restart).
+   **Why the encoder emits nothing from the keepalive buffers is not known** (could not catch the state again to look).
+
+**Patched xdpw** (`HS_XDPW=patched`, wlr-screencopy): 2 of 2 changes recovered through the silence path
+(`the capture source stopped delivering frames`, source lost after ~5 s, new portal session, 0.5-2.9 s), no crash. One
+sequence only, so "the wlr-screencopy build does not show behaviour 3" is weak evidence.
+
+**Fix (client, small):** `destination::give_up_restarts_capture`: when the wedge verdict gives up (3 failed rebuilds, ~35 s)
+and the source is a portal (`silence_is_loss`) not yet declared lost, the pump declares the *source* lost
+(`treating the capture source as dead`) instead of failing the destination, so the session's restart schedule runs.
+Restarting the capture is the path that recovered behaviours 1 and 2 every time. *Why not detect keepalive-only
+frames earlier:* the branch cannot tell a resent buffer from a real one (that is the #39 finding), and the cause of
+the silent encoder is unknown, so the late, bounded escalation is the safe version; a real encoder wedge pays up to the same
+restart, bounded by `CAPTURE_RESTART_DELAYS`. **Not verified in the rig:** behaviour 3 could not be provoked on demand, so
+the new branch was only unit-tested and regression-run (mode changes still recover).
+Related, not a bug: several mode changes within ~2 min walk down `CAPTURE_RESTART_DELAYS` (`RECOVERY_RESET_AFTER`, "a flapping
+source is slowed down") and end in `giving up after 5 restart attempt(s)`; a 13 s loop of changes did that after 5.
+
+Hyprland (xdph) was not tested (no xdph in the rig; `xdph-emu` only emulates its format offer). The escalation applies to
+it as well, but whether xdph ever shows behaviour 3 is unknown. The percentages above are from about 20 changes.
+
 ### Big keyframes: rate pacing, a squeezed IDR, no repeats (2026-11-03, #102)
 
 **Field case.** Sharer on Fedora + GNOME, RX 9070 XT (radeonsi), `vah264enc`, 1080p, 120 fps, 8300 kbps,

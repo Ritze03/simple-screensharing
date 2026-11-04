@@ -4186,8 +4186,19 @@ async fn destination_pump(
                                     ));
                                 }
                                 destination::StallVerdict::GiveUp => {
-                                    tracing::error!("stream {stream_id}: the encoder stayed silent through {wedge_rebuilds} rebuilds; giving up");
-                                    runtime.lock().unwrap().fail("the encoder stopped producing frames and could not be restarted");
+                                    if destination::give_up_restarts_capture(capture_errors.silence_is_loss, declared_source_lost) {
+                                        // #115: frames reach the branch (a stuck stock xdpw stream, after an output mode
+                                        // change, keeps `pipewiresrc`'s keepalive resending) yet nothing is ever
+                                        // encoded, and fresh branches do not help: the source is the likelier culprit.
+                                        declared_source_lost = true;
+                                        tracing::warn!(
+                                            "stream {stream_id}: the encoder stayed silent through {wedge_rebuilds} rebuilds; treating the capture source as dead"
+                                        );
+                                        capture_errors.mark_lost("the capture delivers frames that cannot be encoded".to_string());
+                                    } else {
+                                        tracing::error!("stream {stream_id}: the encoder stayed silent through {wedge_rebuilds} rebuilds; giving up");
+                                        runtime.lock().unwrap().fail("the encoder stopped producing frames and could not be restarted");
+                                    }
                                 }
                             }
                         }
@@ -4862,6 +4873,22 @@ pub mod destination {
             Some(_) if since_last_rebuild.is_none_or(|d| d >= wedge_rebuild_backoff(rebuilds_done)) => StallVerdict::RebuildBranch,
             Some(_) => StallVerdict::Wait,
         }
+    }
+
+    /// What the pump does when [`stall_verdict`] says [`StallVerdict::GiveUp`]
+    /// (#115): `true` = declare the capture source lost (the session restarts
+    /// the capture, bounded by its own schedule), `false` = fail the
+    /// destination. Only a source whose silence means loss (the portal; not
+    /// Windows) and that has not been declared lost yet gets the restart.
+    ///
+    /// `Why a restart before failing:` a stock xdpw that survives an output
+    /// mode change can keep its stream "alive" but dead while `pipewiresrc`'s
+    /// keepalive resends the last buffer, so the branch counts frames as
+    /// offered and the verdict is "encoder wedge" for ever (3 fresh branches,
+    /// then `Failed`, share dead until the user stops and shares again). A new
+    /// portal session is what actually recovers it.
+    pub fn give_up_restarts_capture(silence_is_loss: bool, already_declared_lost: bool) -> bool {
+        silence_is_loss && !already_declared_lost
     }
 
     /// Why a destination is in [`DestinationState::Stalled`]. Only ever a
@@ -5764,6 +5791,15 @@ pub mod destination {
             // Three rebuilds did not help: the last one gets 10 s, then the destination fails.
             assert_eq!(stall_verdict(s(60), Some(60), MAX_WEDGE_REBUILDS, Some(s(9))), StallVerdict::Wait);
             assert_eq!(stall_verdict(s(60), Some(60), MAX_WEDGE_REBUILDS, Some(s(10))), StallVerdict::GiveUp);
+        }
+
+        #[test]
+        fn giving_up_on_the_encoder_restarts_a_portal_capture_once_before_failing() {
+            // The portal (silence is loss), not yet declared: restart the capture.
+            assert!(give_up_restarts_capture(true, false));
+            // Already declared (the restart is the session's job now), or Windows: fail as before.
+            assert!(!give_up_restarts_capture(true, true));
+            assert!(!give_up_restarts_capture(false, false));
         }
 
         #[test]
