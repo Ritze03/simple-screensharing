@@ -70,6 +70,8 @@ export function loadSettings() {
     catchup: clampCatchUpSpeedPercent(Number.isFinite(s.catchup) ? s.catchup : DEFAULT_CATCH_UP_SPEED_PERCENT),
     // Viewer-side loudness levelling of watched audio (#119); on unless the user switched it off.
     levelLoudness: s.levelLoudness !== false,
+    // Notification sounds volume, percent 0-100 (0 = silent), separate from every stream's volume (I9; `sounds.js`). Default 50.
+    soundVol: Number.isFinite(s.soundVol) ? Math.min(100, Math.max(0, Math.round(s.soundVol))) : 50,
     // Upload bandwidth, same two modes as native: per-stream maximum, or one absolute total split across every stream.
     bw: Object.assign({ mode: "absolute", total: 12000, floor: 3000 }, s.bw || {}),
     // Defaults for the next stream (the staged stream-settings modal starts from these).

@@ -20,6 +20,7 @@ all paths relative so GitHub Pages can serve `docs/` under `/simple-screensharin
 | `rooms.js` | one `RoomEntry` per saved room: its `RoomClient`, state, roster, streams, previews, watches; core events -> state |
 | `capture.js` | outgoing streams: a capture (one `getDisplayMedia` pick) and its destinations (one `startShare` per room), bandwidth split, live edits, the own-tile live preview element (`previewFor`, attached only while the page is visible and focused) |
 | `popout.js` | pop-outs: a stream in Document Picture-in-Picture (fallback Fullscreen; the fullscreen stage is also the tile double-click; it survives a reconnect, `rebind`), and the whole stage in a PiP window (`popStage`) |
+| `sounds.js` | notification sounds (task I9): the four generated sounds (WebAudio, the replica's definitions), the pure edge detector `RoomSounds` (a port of native `sounds::RoomSounds`: viewer-set compare, stream-key diff, quiet after a resume), the `Gate`, `SoundOut.play` (the one exit; replaced by the harness) |
 | `i18n.js` | en/de dictionary, `t(key, vars)` with the native `%{var}` placeholders. German is the informal "du" form with the native terms (identical strings where key and English text match `client/locales/de.yml`) |
 
 ## Design notes (the why)

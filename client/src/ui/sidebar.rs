@@ -258,7 +258,9 @@ pub fn show_user_band(ui: &mut Ui, cx: &mut Cx, _st: &mut SidebarState) {
         cx.toggle_popover(PopoverKind::Outgoing, hot);
     }
 
-    if row.show(ui, 2, Align::Center, |ui| widgets::icon_btn(ui, "settings", IconBtnKind::Plain, &tr("ui.sidebar.settings", "Settings"))).clicked() {
+    let settings = row.show(ui, 2, Align::Center, |ui| widgets::icon_btn(ui, "settings", IconBtnKind::Plain, &tr("ui.sidebar.settings", "Settings")));
+    super::drive_dump::rect(|| "side.settings".into(), settings.rect);
+    if settings.clicked() {
         cx.act(UiAction::OpenModal(Modal::Settings));
     }
 

@@ -41,3 +41,4 @@ pub mod preview;
 pub mod protocol;
 pub mod rooms;
 pub mod session;
+pub mod sounds;

@@ -446,6 +446,10 @@ pub struct AppSettings {
     /// key gets it on.
     #[serde(default = "AppSettings::default_level_loudness")]
     pub level_loudness: bool,
+    /// Settings > Sounds > Volume (task I9): how loud the notification sounds are, percent 0-100 (0 = silent),
+    /// separate from every stream's volume. A file from before the setting gets 50; a larger value is read as 100.
+    #[serde(default = "AppSettings::default_sound_volume")]
+    pub sound_volume: u32,
     /// Settings > Profile: the emoji shown as this person's avatar instead of their initial, one of
     /// `widgets::EMOJI` ("" = none; any other value is shown as none). Sent to every room's relay
     /// (spec §9.2). An old settings file without the key gets none.
@@ -567,6 +571,7 @@ impl Default for AppSettings {
             send_diagnostics: false,
             audio_gain: Self::default_audio_gain(),
             level_loudness: true,
+            sound_volume: Self::default_sound_volume(),
             emoji: String::new(),
             audio_exclusions: Self::default_audio_exclusions(),
             webcam: WebcamSettings::default(),
@@ -577,6 +582,10 @@ impl Default for AppSettings {
 impl AppSettings {
     fn default_level_loudness() -> bool {
         true
+    }
+
+    fn default_sound_volume() -> u32 {
+        crate::sounds::DEFAULT_VOLUME
     }
 
     /// Voice chat that must not end up in a share by default.
@@ -952,6 +961,7 @@ mod tests {
             send_diagnostics: true,
             audio_gain: 1.5,
             level_loudness: false,
+            sound_volume: 35,
             emoji: "🦊".to_string(),
             audio_exclusions: vec!["Teams".to_string()],
             webcam: WebcamSettings { camera: "C920".into(), mode: "MJPG 1280x720@30".into(), codec: VideoCodec::H265, bitrate_kbps: 1800 },
@@ -970,6 +980,7 @@ mod tests {
         assert!(parsed.send_diagnostics);
         assert_eq!(parsed.audio_gain, 1.5);
         assert!(!parsed.level_loudness);
+        assert_eq!(parsed.sound_volume, 35);
         assert_eq!(parsed.emoji, "🦊");
         assert_eq!(parsed.audio_exclusions, vec!["Teams".to_string()]);
         assert!(toml_str.contains("audio_gain = 1.5\n"), "stored readably: {toml_str}");
@@ -985,6 +996,16 @@ mod tests {
         let round: AppSettings = toml::from_str(&toml::to_string_pretty(&empty).unwrap()).unwrap();
         assert!(round.audio_exclusions.is_empty(), "an empty list survives a save and a load");
         assert_eq!(AppSettings::default().audio_exclusions, old.audio_exclusions);
+    }
+
+    /// Task I9: a settings file from before the notification sounds loads with volume 50; 0 stays 0 (silent).
+    #[test]
+    fn old_settings_file_gets_the_default_sound_volume() {
+        let old: AppSettings = toml::from_str("language = \"de\"\n").unwrap();
+        assert_eq!(old.sound_volume, 50);
+        assert_eq!(AppSettings::default().sound_volume, 50);
+        let silent: AppSettings = toml::from_str("sound_volume = 0\n").unwrap();
+        assert_eq!(silent.sound_volume, 0);
     }
 
     /// #106: a settings file from before emoji avatars loads with none, and none is not written as junk.

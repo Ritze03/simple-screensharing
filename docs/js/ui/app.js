@@ -21,6 +21,7 @@ import {
 } from "./capture.js";
 import { popOut, closePopout, popStage as popoutStage, closeStage, stageWindow } from "./popout.js";
 import { A } from "./actions.js";
+import { SOUND_NAMES, SoundOut } from "./sounds.js";
 import { WATCHED, roomView, viewKey, viewOf, vg, watchFps } from "./stage-state.js";
 import { renderStage, renderPoppedNote, afterRender, isDragging, bindWindow, overlays, toggleStageFullscreen } from "./stage.js";
 import { opener, selectField, FPS_LIST, PRESET_ORDER, presetLabel, presetCaption } from "./menus.js";
@@ -570,6 +571,11 @@ function renderSettings(close, lgBtn, spacer) {
       sliderRow(t("ui.settings.jitter"), "set-jitter", 0, 5000, 100, () => st.jitter, (v) => { st.jitter = v; }, (v) => (v / 1000).toFixed(1) + " s", t("ui.settings.jitter_tip"), commit),
       sliderRow(t("ui.settings.catchup"), "set-catchup", 5, 10, 1, () => st.catchup, (v) => { st.catchup = v; }, (v) => v + "%", t("ui.settings.catchup_tip"), commit),
       ctrlRow(t("ui.settings.level_loudness"), cbx(t("ui.settings.level_loudness_on"), st.levelLoudness, () => { st.levelLoudness = !st.levelLoudness; persistSettings(); applyLevelLoudness(); render(); }, { id: "set-level-loudness" }), undefined, t("ui.settings.level_loudness_tip"), "set-level-loudness")),
+    // Notification sounds (I9): one volume, separate from every stream's, applied live while dragged; a Test button per sound.
+    card(t("ui.settings.sounds_card"), null,
+      sliderRow(t("ui.settings.sound_volume"), "set-sound-vol", 0, 100, 5, () => st.soundVol, (v) => { st.soundVol = v; }, (v) => v + "%", t("ui.settings.sound_volume_tip"), persistSettings),
+      SOUND_NAMES.map((n) => H({ g: 2, cls: "crow" }, FILL(h("span", { class: "lbl", text: t("ui.settings.sound_" + n) })),
+        h("button", { type: "button", class: "btn btn-secondary", id: "btn-sound-" + n, onclick: () => SoundOut.play(n, { test: true }) }, ic("play_arrow"), t("ui.settings.sound_test"))))),
   ], [spacer(), lgBtn("btn-primary", t("ui.stream.done"), close, null, false, "btn-settings-done")], null, t("ui.close"));
 }
 
@@ -788,4 +794,4 @@ Object.assign(A, {
   selectRoom: (r, then) => { select(r, false); if (then) then(); },
 });
 bindWindow(window, "main");
-window.__sss = { S, render, vg, stageWindow }; // vg / stageWindow: for the dev harness (docs/dev/e2e/stage.mjs) // debugging handle (also used by the local verification scripts)
+window.__sss = { S, render, vg, stageWindow, SoundOut }; // vg / stageWindow: for the dev harness (docs/dev/e2e/stage.mjs) // debugging handle (also used by the local verification scripts)

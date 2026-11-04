@@ -17,6 +17,7 @@ import { avatarBg, avatarColors, avatarHue, pickEmoji, sliderCtl, snapVolumePct,
 import * as G from "../js/ui/stage-geom.js";
 import { CHROME_IDLE_MS, chromeRemaining, chromeStart, chromeStep } from "../js/ui/chrome.js";
 import { loadSettings } from "../js/ui/store.js";
+import { Gate, MIN_GAP_MS, RESUME_QUIET_MS, RoomSounds, SOUNDS, SOUND_NAMES, soundPlan } from "../js/ui/sounds.js";
 import { DICT } from "../js/ui/i18n.js";
 import { AudioReceiver, MAX_VOLUME } from "../js/core/audio.js";
 import { CEILING_DB, GATE_DB, Leveller, MAX_GAIN_DB, RISE_DB_PER_S, TARGET_DB } from "../js/core/leveller.js";
@@ -1863,6 +1864,118 @@ test("i18n: every stage string has an English and a German text and the same pla
     eq((DICT.de[k].match(/%\{\w+\}/g) || []).sort(), (DICT.en[k].match(/%\{\w+\}/g) || []).sort(), `placeholders of ${k}`);
   }
   for (const k of ["ui.preset.text", "ui.stage.layout_split", "ui.strip.sharing_n", "ui.settings.avatar_paste"]) ok(DICT.en[k] && DICT.de[k], k);
+});
+
+// ------------------------------------------------------------------------------------------------ notification sounds (I9, port of client/src/sounds.rs tests)
+// Pure: nothing here creates an AudioContext or plays anything.
+
+test("sounds: the four definitions are the replica's, and the plan's peak is volume/100 * 0.3 (nothing at 0)", () => {
+  eq(SOUND_NAMES, ["join", "leave", "start", "stop"]);
+  eq(SOUNDS.join, { wave: "sine", notes: [659, 880] });
+  eq(SOUNDS.leave, { wave: "sine", notes: [880, 587] });
+  eq(SOUNDS.start, { wave: "triangle", notes: [523, 659, 784] });
+  eq(SOUNDS.stop, { wave: "triangle", notes: [392, 294] });
+  for (const n of SOUND_NAMES) {
+    eq(soundPlan(n, 0), null, `${n} at 0`);
+    for (const v of [5, 50, 100]) near(soundPlan(n, v).peak, (v / 100) * 0.3, 1e-12, `${n} at ${v}`);
+    near(soundPlan(n, 1000).peak, 0.3, 1e-12, "more than 100 is 100");
+  }
+  eq(soundPlan("start", 50).notes.map((x) => x.at), [0, 0.09, 0.18]);
+  const plans = SOUND_NAMES.map((n) => JSON.stringify(soundPlan(n, 100)));
+  eq(new Set(plans).size, 4, "the four sounds differ");
+});
+
+const lists = (o) => new Map(Object.entries(o).map(([k, v]) => [Number(k), v]));
+const vpass = (r, mine, l, now = 0) => (r.viewers(new Set(mine), lists(l)), r.drain(now));
+
+test("sounds: viewers join and leave once per change; the relay's 2 s repeats and an old relay are silent", () => {
+  const r = new RoomSounds();
+  eq(vpass(r, [3], {}), [], "no list yet (an old relay never sends one)");
+  eq(vpass(r, [3], { 3: ["a"] }), ["join"]);
+  for (let i = 0; i < 5; i++) eq(vpass(r, [3], { 3: ["a"] }), [], "a repeat");
+  eq(vpass(r, [3], { 3: ["a", "b"] }), ["join"]);
+  eq(vpass(r, [3], { 3: ["b"] }), ["leave"]);
+  eq(vpass(r, [3], { 3: [] }), ["leave"]);
+  eq(vpass(r, [3], { 3: [] }), []);
+});
+
+test("sounds: a person across several streams of mine counts once; a join and a leave in one pass are both heard", () => {
+  const r = new RoomSounds();
+  eq(vpass(r, [3, 4], { 3: ["a"] }), ["join"]);
+  eq(vpass(r, [3, 4], { 3: ["a"], 4: ["a"] }), []);
+  eq(vpass(r, [3, 4], { 3: [], 4: ["a"] }), [], "still watching the other one");
+  eq(vpass(r, [3, 4], { 3: [], 4: [] }), ["leave"]);
+  eq(vpass(r, [3, 4], { 3: ["a", "c"], 4: ["d"] }), ["join"]);
+  eq(vpass(r, [3, 4], { 3: ["e"], 4: [] }), ["join", "leave"]);
+});
+
+test("sounds: stopping my own stream is not everyone leaving; lists of streams that are not mine are ignored", () => {
+  const r = new RoomSounds();
+  vpass(r, [3], { 3: ["a", "b"] });
+  eq(vpass(r, [], { 3: ["a", "b"] }), [], "I stopped stream 3");
+  eq(vpass(r, [], {}), []);
+  eq(vpass(r, [5], { 5: ["a"] }), ["join"], "a new stream of mine starts from nobody");
+  eq(vpass(r, [], { 9: ["a"] }), []);
+  eq(vpass(r, [3], { 9: ["a"] }), []);
+});
+
+test("sounds: someone else's streams start and stop by key; the snapshot, a label change and my own streams are silent", () => {
+  const r = new RoomSounds();
+  r.streams(["x:1", "y:1"], false); // the snapshot of a (re)connect: baseline only
+  eq(r.drain(0), []);
+  r.streams(["x:1", "y:1"], true); // the same list again (a label change keeps the key)
+  eq(r.drain(0), []);
+  r.streams(["x:1", "y:1", "z:2"], true);
+  eq(r.drain(0), ["start"]);
+  r.streams(["x:1", "y:1"], true);
+  eq(r.drain(0), ["stop"]);
+  r.streams(["x:1", "q:1"], true); // one gone and one new in one pass: both, once each
+  eq(r.drain(0), ["start", "stop"]);
+  r.streams(["a:1", "a:2", "a:3", "a:4", "a:5", "a:6", "a:7", "a:8"], true);
+  eq(r.drain(0), ["start", "stop"], "8 at once are one sound each");
+  eq(r.drain(0), [], "drained");
+});
+
+test("sounds: a resumed room is quiet for a while but keeps its baselines", () => {
+  const r = new RoomSounds();
+  r.quiet(RESUME_QUIET_MS);
+  r.streams(["x:1"], true);
+  r.viewers(new Set([3]), lists({ 3: ["a"] }));
+  eq(r.drain(1000), [], "the replay is silent");
+  r.viewers(new Set([3]), lists({ 3: ["a"] }));
+  eq(r.drain(RESUME_QUIET_MS + 1), [], "the person who came back is the baseline, their repeat is no join");
+  r.streams(["x:1", "y:1"], true);
+  eq(r.drain(RESUME_QUIET_MS + 1), ["start"]);
+});
+
+test("sounds: the gate spaces one sound by a second and leaves the others alone", () => {
+  const g = new Gate();
+  ok(g.admit("join", 0));
+  ok(!g.admit("join", 10));
+  ok(g.admit("leave", 10));
+  ok(!g.admit("join", MIN_GAP_MS - 1));
+  ok(g.admit("join", MIN_GAP_MS));
+});
+
+test("sounds: the volume setting defaults to 50, is clamped and survives a bad stored value", () => {
+  const key = "sss.settings.v1";
+  const before = localStorage.getItem(key);
+  try {
+    localStorage.removeItem(key);
+    eq(loadSettings().soundVol, 50, "default");
+    localStorage.setItem(key, JSON.stringify({ soundVol: 0 }));
+    eq(loadSettings().soundVol, 0, "0 is silent, not the default");
+    localStorage.setItem(key, JSON.stringify({ soundVol: 250 }));
+    eq(loadSettings().soundVol, 100);
+    localStorage.setItem(key, JSON.stringify({ soundVol: "loud" }));
+    eq(loadSettings().soundVol, 50);
+  } finally {
+    if (before == null) localStorage.removeItem(key);
+    else localStorage.setItem(key, before);
+  }
+});
+test("i18n: every Sounds string has both languages", () => {
+  for (const k of ["sounds_card", "sound_volume", "sound_volume_tip", "sound_join", "sound_leave", "sound_start", "sound_stop", "sound_test"]) ok(DICT.en["ui.settings." + k] && DICT.de["ui.settings." + k], k);
 });
 
 // ------------------------------------------------------------------------------------------------ runner

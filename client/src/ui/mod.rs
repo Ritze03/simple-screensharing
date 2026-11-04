@@ -413,6 +413,12 @@ pub enum UiAction {
     PreviewAudioGain(f64),
     /// Settings > Playback > Level loudness: viewer-side loudness levelling on/off (task #119).
     SetLevelLoudness(bool),
+    /// Settings > Sounds > Volume released (or the modal closed): persist the notification-sound volume (task I9).
+    SetSoundVolume(u32),
+    /// The Volume slider mid-drag: applied live, not saved; the release sends `SetSoundVolume`.
+    PreviewSoundVolume(u32),
+    /// Settings > Sounds > Test: play one notification sound now (a no-op at volume 0).
+    TestSound(simple_screensharing_client::sounds::Sound),
     /// Settings > Diagnostics: copy the in-memory log (`logbuf`) to the clipboard + toast.
     CopyLogs,
     /// Settings > Diagnostics: write the log to a file in the Downloads folder, toast and
@@ -1136,6 +1142,8 @@ impl App {
         // SIGTERM/SIGINT/SIGHUP close the window, so `on_exit` leaves every
         // room cleanly and peers drop us at once instead of on a timeout.
         simple_screensharing_client::session::install_shutdown_signal_handlers(cc.egui_ctx.clone());
+        // The one place notification sounds may reach a sound card: tests build the app through `with_state`.
+        simple_screensharing_client::sounds::enable_output();
         Self::with_state(AppState::default())
     }
 

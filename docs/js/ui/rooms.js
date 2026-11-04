@@ -7,6 +7,7 @@ import { t, DICT } from "./i18n.js";
 import { onShareEvent, onShareStats, stopDestsInRoom } from "./capture.js";
 import { closePopout, rebind } from "./popout.js";
 import { applyMediaEvent } from "./media-event.js";
+import { RoomSounds, RESUME_QUIET_MS, flushSounds } from "./sounds.js";
 
 // `?fakeaudio=1` (dev harness only, like the native rig's SSS_UI_FAKE_AUDIO): every stream acts as if its sender shared audio (the ring, the
 // volume row, the card's "Audio"), so the audio UI can be tested without creating an audio stream on the host.
@@ -37,6 +38,7 @@ export class RoomEntry {
     this.previews = new Map(); // key -> object URL
     this.watches = new Map(); // key -> Watch
     this.resume = []; // watches that ended recently, resumed when the same sharer's stream reappears
+    this.sounds = new RoomSounds(); // notification-sound edges of this room (sounds.js)
   }
   /** The link to send to friends: the stored link plus this room's name (5th field), unless it is only the "Room abcd1234" placeholder. */
   inviteLink() {
@@ -150,6 +152,7 @@ function wire(r, client) {
       r.issue = null;
       resumeWatches(r);
     }
+    if (d.state === "connected" && d.reconnected) r.sounds.quiet(Date.now() + RESUME_QUIET_MS); // the room replays what it had: no sounds for it
     if (d.state === "connected" && d.reconnected) toast(t("ui.toast.reconnected", { room: r.name }), "check_circle");
     invalidate();
   });
@@ -159,6 +162,9 @@ function wire(r, client) {
   });
   on("streams", (d) => {
     r.streams = d.streams;
+    // Notification sounds: the snapshot a (re)connect delivers arrives while the room is not "joined" yet, so it only sets the baseline.
+    r.sounds.streams(d.streams.filter((s) => !s.self).map((s) => s.key), r.state === "joined");
+    syncViewerSounds(r);
     for (const key of [...r.previews.keys()]) {
       if (!d.streams.some((s) => s.key === key)) {
         URL.revokeObjectURL(r.previews.get(key));
@@ -213,7 +219,10 @@ function wire(r, client) {
   });
   on("share", (d) => onShareEvent(r, d));
   on("subscribers", () => invalidate());
-  on("viewers", () => invalidate());
+  on("viewers", () => {
+    syncViewerSounds(r);
+    invalidate();
+  });
   on("avatars", () => invalidate());
   on("error", (d) => {
     if (d.code === "link-expired" || d.code === "relay-unreachable") {
@@ -231,6 +240,13 @@ function wire(r, client) {
       invalidate();
     }
   });
+}
+
+/** Feed the sound rules with who watches my shares here right now (the core's `shares`: `viewerIds` per share, kept fresh by the relay's lists), then play what that adds up to. */
+function syncViewerSounds(r) {
+  const shares = r.client ? r.client.shares.filter((s) => !s.ended) : [];
+  r.sounds.viewers(new Set(shares.map((s) => s.videoStreamId)), new Map(shares.map((s) => [s.videoStreamId, s.viewerIds])));
+  flushSounds(r.sounds);
 }
 
 /* ---------------- watching ---------------- */

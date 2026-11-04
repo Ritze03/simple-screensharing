@@ -789,6 +789,34 @@ mod audio_boost {
         frame(&mut app, &ctx, size);
         assert_eq!(app.nav.modal, Some(Modal::Settings));
     }
+
+    /// Task I9: the sound volume defaults to 50, a drag applies it live without saving, the release saves,
+    /// the next start remembers it, and Test never plays in a test (the output is only enabled by `App::new`).
+    #[tokio::test]
+    async fn sound_volume_defaults_to_50_previews_live_and_saves_on_release() {
+        let _home = isolated_home();
+        let mut app = app_with_rooms(&[]);
+        let ctx = ctx();
+        let size = egui::vec2(1000.0, 1400.0);
+        assert_eq!(app.state.sound_volume, 50);
+        app.apply(&ctx, UiAction::OpenModal(Modal::Settings));
+        frame(&mut app, &ctx, size);
+        app.apply(&ctx, UiAction::PreviewSoundVolume(75));
+        assert_eq!(app.state.sound_volume, 75, "applied at once");
+        assert_eq!(AppSettings::load().sound_volume, 50, "not written mid-drag");
+        app.apply(&ctx, UiAction::PreviewSoundVolume(500));
+        assert_eq!(app.state.sound_volume, 100, "clamped");
+        app.apply(&ctx, UiAction::SetSoundVolume(35));
+        assert_eq!(AppSettings::load().sound_volume, 35, "saved on release");
+        assert_eq!(AppState::default().sound_volume, 35, "the next start remembers it");
+        for sound in simple_screensharing_client::sounds::Sound::ALL {
+            app.apply(&ctx, UiAction::TestSound(sound));
+        }
+        app.apply(&ctx, UiAction::SetSoundVolume(0));
+        app.apply(&ctx, UiAction::TestSound(simple_screensharing_client::sounds::Sound::Join));
+        frame(&mut app, &ctx, size);
+        assert_eq!(app.nav.modal, Some(Modal::Settings));
+    }
 }
 
 /// Task #113: the mouse-wheel step of the viewer volume slider.

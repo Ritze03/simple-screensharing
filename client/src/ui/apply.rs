@@ -393,6 +393,12 @@ impl App {
                 self.state.apply_audio_gain(g);
             }
             UiAction::SetLevelLoudness(on) => self.state.set_level_loudness(on),
+            UiAction::SetSoundVolume(v) => self.state.set_sound_volume(v),
+            UiAction::PreviewSoundVolume(v) => {
+                self.state.sound_volume = v.min(simple_screensharing_client::sounds::MAX_VOLUME);
+                simple_screensharing_client::sounds::set_volume(v);
+            }
+            UiAction::TestSound(sound) => simple_screensharing_client::sounds::play(sound),
             UiAction::CopyLogs => {
                 ctx.copy_text(simple_screensharing_client::logbuf::dump());
                 self.toast(tr("ui.toast.logs_copied", "Logs copied"), "content_copy");

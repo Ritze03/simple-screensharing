@@ -24,7 +24,8 @@
 //!   recently saved room. `Why:` the lib keeps no "last server" setting, and
 //!   the newest saved room is the last server the user created or joined on.
 //! - **Settings** (`Modal::Settings`, 640): cards Profile / Language / Display /
-//!   Playback / Diagnostics (copy or save the in-memory log, `logbuf`; opt-in upload to the relay). The Boost
+//!   Playback / Sounds (task I9: notification volume, live while dragged and saved on release, and a Test button per
+//!   sound) / Diagnostics (copy or save the in-memory log, `logbuf`; opt-in upload to the relay). The Boost
 //!   slider (task #114) left for the audio settings menu (`audio_settings.rs`, task I7). Text and
 //!   sliders are buffered and pushed when the edit settles
 //!   (focus lost, pointer released), not every frame of a drag, since each
@@ -39,9 +40,10 @@ use simple_screensharing_client::net::{ServerAddrError, parse_join_string, parse
 use simple_screensharing_client::rooms::{AppSettings, PresentationMode};
 use simple_screensharing_client::session::RoomHandle;
 
-use super::{Cx, Modal, ShareState, UiAction, menu, tr, tr_with};
+use super::{Cx, Modal, ShareState, UiAction, drive_dump, menu, tr, tr_with};
 use crate::theme::{self, Weight, font};
-use crate::widgets::{self, BannerKind, Btn, FooterClick, ModalSpec};
+use crate::widgets::{self, BannerKind, Btn, FILL, FooterClick, HBox, ModalSpec, fixed};
+use simple_screensharing_client::sounds::{self, Sound};
 
 
 /// Which half of the create/join modal is showing.
@@ -77,6 +79,10 @@ pub struct ModalsState {
     display_name: String,
     jitter_s: f32,
     catch_up: u32,
+    /// Sounds > Volume as dragged, and whether it moved since it was last saved (the drag acts live,
+    /// the release saves once).
+    sound_vol: u32,
+    sound_dirty: bool,
     // rename
     rename: String,
     // choose name
@@ -110,6 +116,8 @@ impl ModalsState {
                 self.display_name = cx.state.display_name.clone();
                 self.jitter_s = cx.state.max_jitter_buffer_ms as f32 / 1000.0;
                 self.catch_up = cx.state.catch_up_speed_percent;
+                self.sound_vol = cx.state.sound_volume;
+                self.sound_dirty = false;
             }
             Modal::ChooseName => {
                 self.choose_name = cx.state.display_name.clone();
@@ -631,6 +639,39 @@ fn settings(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
                     cx.act(UiAction::SetLevelLoudness(level));
                 }
             });
+            widgets::card(ui, &tr("ui.settings.sounds_card", "Sounds"), None, |ui| {
+                let percent = format!("{}%", st.sound_vol);
+                let (r, _) = widgets::ctrl_row_value(
+                    ui,
+                    &tr("ui.settings.sound_volume", "Volume"),
+                    Some(&tr("ui.settings.sound_volume_tip", "How loud these sounds are, separate from any stream")),
+                    |ui| widgets::slider(ui, &mut st.sound_vol, 0..=sounds::MAX_VOLUME, 5.0),
+                    |ui| widgets::value_box(ui, &percent),
+                );
+                drive_dump::rect(|| "sound.volume".into(), r.rect);
+                drive_dump::line(|| format!("sound_volume {percent}"));
+                if r.changed() {
+                    st.sound_dirty = true;
+                    cx.act(UiAction::PreviewSoundVolume(st.sound_vol));
+                }
+                let test = tr("ui.settings.sound_test", "Test");
+                for (sound, name, label) in [
+                    (Sound::Join, "join", tr("ui.settings.sound_join", "Someone joins my stream")),
+                    (Sound::Leave, "leave", tr("ui.settings.sound_leave", "Someone leaves my stream")),
+                    (Sound::Start, "start", tr("ui.settings.sound_start", "Someone starts a stream")),
+                    (Sound::Stop, "stop", tr("ui.settings.sound_stop", "Someone stops a stream")),
+                ] {
+                    let btn = Btn::secondary(&test).icon("play_arrow");
+                    let w = btn.width(ui);
+                    let row = HBox::new("sound_row", theme::CTL_H).slots(&[FILL, fixed(w)]).show(ui);
+                    row.text(ui, 0, &label, font(Weight::Regular, theme::FS_LABEL), theme::TEXT, Align::Min);
+                    let r = row.show(ui, 1, Align::Max, |ui| btn.show_sized(ui, w));
+                    drive_dump::rect(|| format!("sound.test.{name}"), r.rect);
+                    if r.clicked() {
+                        cx.act(UiAction::TestSound(sound));
+                    }
+                }
+            });
             widgets::card(ui, &tr("ui.settings.logs_card", "Diagnostics"), None, |ui| {
                 let copy = tr("ui.settings.logs_copy", "Copy to clipboard");
                 let save = tr("ui.settings.logs_save", "Save to file…");
@@ -699,6 +740,9 @@ fn settings(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState) {
     }
     if settled && st.catch_up != cx.state.catch_up_speed_percent {
         cx.act(UiAction::SetCatchUpSpeed(st.catch_up));
+    }
+    if settled && std::mem::take(&mut st.sound_dirty) {
+        cx.act(UiAction::SetSoundVolume(st.sound_vol));
     }
     if closing {
         cx.act(UiAction::CloseModal);

@@ -3,7 +3,7 @@
 Audio capture/encode/playback is described where it grew up: `features/stream-control.md`
 ("Sharing audio ...", "The 2026-07-28 audio bugs"), `features/video-pipeline.md` ("Audio follows
 video") and the module docs of `client/src/audio.rs` and `client/src/decode.rs`. This page covers
-**keeping the audio aligned with the picture** (task #91, 2026-11-01), the **shared audio is a name** (#105), the viewer volume (#96), the **sender-side boost** (#114, capped at 200 % and calibration-free since #119) and the **viewer-side loudness levelling** (#119); for the share sink's lifecycle (WirePlumber pauses a player when its sink goes away, a resuming stream loses its links) see the #123 block. **Why shared audio broke after a pause/resume** (the capture ran on `pipewiresrc`'s clock; the native viewer's jitter buffer guessed the frame size from PTS steps) is the #128 block, which also corrects the explanations of #117, #121, #123 and #125. **Static in silence** (the sender's dither made `opusenc` code noise at 64 kbps) is the #129 block. **Desktop audio, audio-only shares, the exclusion list, source groups and the audio settings menu** (I7) are the first block below.
+**keeping the audio aligned with the picture** (task #91, 2026-11-01), the **shared audio is a name** (#105), the viewer volume (#96), the **sender-side boost** (#114, capped at 200 % and calibration-free since #119) and the **viewer-side loudness levelling** (#119); for the share sink's lifecycle (WirePlumber pauses a player when its sink goes away, a resuming stream loses its links) see the #123 block. **Why shared audio broke after a pause/resume** (the capture ran on `pipewiresrc`'s clock; the native viewer's jitter buffer guessed the frame size from PTS steps) is the #128 block, which also corrects the explanations of #117, #121, #123 and #125. **Static in silence** (the sender's dither made `opusenc` code noise at 64 kbps) is the #129 block. **Desktop audio, audio-only shares, the exclusion list, source groups and the audio settings menu** (I7) are the first block below, and the **notification sounds** (I9, generated join / leave / start / stop sounds with their own volume) the last section of it.
 
 ## 2026-11-04: desktop audio, audio-only shares, the exclusion list, source groups, the audio settings menu (task I7)
 
@@ -164,6 +164,65 @@ Live (VM only, `#[ignore]`): `live_audio_share_soak` (new knobs `SSS_LIVE_CHOICE
 (`SSS_UI_FAKE_AUDIO_SOURCES=1`: the replica's examples through the real grouping, level taps and sharing switched off so
 the rig creates no audio) the menu, the groups, the modal, Add and remove (settings.toml checked) and the Boost drag were
 driven for real.
+
+### Notification sounds (task I9, same day)
+
+User requirement (D1): four different sounds, *someone joins my stream, leaves my stream, someone starts a stream, someone stops a
+stream*, each with a Test button, and one volume slider in the general settings, separate from the stream volumes. Hard rule (D13): they
+are checked by unit tests only and **never played on the host**; the real listen is the user's own check.
+
+**What and where.** No sound files: the four sounds are generated from the replica's definitions (`superdoc/ui/replica/index.html`
+`SOUNDS` / `playSound`), the same table in three places that must stay equal: native `client/src/sounds.rs`, browser
+`docs/js/ui/sounds.js`, the replica. join = sine 659 + 880 Hz, leave = sine 880 + 587, start = triangle 523 + 659 + 784, stop = triangle
+392 + 294; a note every 90 ms, each 240 ms long with an exponential attack to the peak in 12 ms and release to -80 dB at 220 ms;
+`peak = volume / 100 * 0.3`. Settings > **Sounds** holds the volume (0-100, step 5, default 50, `AppSettings::sound_volume` /
+browser `soundVol` in `settings`; 0 = silent and creates no pipeline) and a Test button per sound. *Why a 0.3 cap:* a notice, never a
+shout; at 100 % a note peaks at -10 dBFS. *Why its own slider:* a notice must not follow the volume of whatever is being watched.
+
+**Native playback** (`sounds::play`): `synth(sound, volume)` is a pure function to 48 kHz mono f32; one short burst
+`appsrc ! audioconvert ! audioresample ! autoaudiosink` (element replaceable by `SSS_SOUND_SINK=<element>`, the rig sets `fakesink`) on its
+own thread, one buffer, EOS, dropped at the end; a failure is logged once and ignored. Guards: a `Gate` allows one burst of a sound at a
+time and the same sound again only a second after its last start (8 members joining over a second are one sound), and
+`RoomSounds::drain` yields each sound at most once per event pass. *Why output is off until `ui::App::new` calls `sounds::enable_output()`*:
+the `ui` tests run the real `AppState` and `UiAction::TestSound` with the lib compiled without `cfg(test)`, so a `cfg(test)` switch would
+not have covered them; the only way no test ever plays is that only the real binary can turn playback on. The Settings slider acts during the drag
+(`PreviewSoundVolume`, applied through `sounds::set_volume`) and saves once on release (`SetSoundVolume`), the Boost slider's pattern.
+*Not in the user's own Desktop audio share:* the notification stream is created by this process, and `audio::streams()` drops every
+stream whose `application.process.id` (also read through the PipeWire client object) is this process, so it is never offered or captured;
+this was already covered for the viewer's own playback and nothing new was needed.
+
+**The edge rules** (`sounds::RoomSounds` native, `RoomSounds` in `sounds.js` browser, the same tests in both):
+- *Someone joins / leaves my stream:* from the relay's viewer lists (spec 9.1, `RoomSession::viewers` / the core's `ShareHandle.viewerIds`),
+  compared **as sets** once per event pass, because the relay repeats a list every 2 s. A person counts across all my streams in the room
+  once (watching the screen and the webcam is one join; stopping one of the two is no leave). An old relay sends no lists: these two
+  sounds never fire.
+- *Someone starts / stops a stream:* native: the `StreamStarted` / `StreamStopped` deltas (a started stream the roster already has, a label
+  change, is silent; so is a stop for a stream the roster never had); browser: the difference of the stream keys between two `streams`
+  events. A webcam and a screen are two streams, an audio-only share is one; a screen share with its paired audio arrives as two and the
+  gate makes it one sound.
+- *Never for:* my own streams; the snapshot at join (native: it is the baseline, not an event; browser: the snapshot arrives while the room
+  is not yet `joined`, so it only sets the baseline); my own stream stopping (the viewers that go with it are not "leaving": nothing sounds for
+  the people of a stream that disappeared from my streams since the last pass); a resumed room, which stays quiet for 15 s
+  (`RESUME_QUIET`) after a reconnect while its baselines still follow, because a restarted relay has everybody re-announce and re-watch.
+- A room counts while it is joined, on screen or not, focused or not (the user asked for no filter).
+*Deviation from the brief, "not the first list after I start sharing":* built as "the baseline of a new stream is nobody". A first list that
+names someone is a real join (nobody can watch a stream before it is announced), so silencing it would lose the first viewer's sound; the
+list the relay sends right after an announce is empty and is no change.
+
+**Browser** (`docs/js/ui/sounds.js`): `OscillatorNode` + `GainNode` with the replica's ramps. The `AudioContext` is created only when a sound
+is actually played, never at boot or on a click. Browsers block audio until the page has had a click or key press: an event sound arriving
+before that is **dropped** (a late sound would be wrong; `navigator.userActivation.hasBeenActive`), from the first click on they play; a Test
+button is itself a click and always plays. `SoundOut.play` is the single exit and is replaced by the harness.
+
+**Tests** (nothing plays): `sounds::tests` (four sounds differ, first-note pitch by zero crossings, peak follows the volume within the cap,
+starts at 0 and ends at the -80 dB floor with no step, the edge detector over sequences, the gate, a burst reaching EOS through a `fakesink`),
+`rooms` (old settings file gets 50), `ui::tests::sound_volume_...`; `session::reconnect_e2e::notification_sounds_follow_the_room_events`
+(`#[ignore]`, real relay, two `AppState`s, counts `sounds::requested`: one start for the watcher, one join, one leave, one stop, nothing for
+the sharer's own start or stop, no leave when the stale window passes). JS: `dev/tests.js` "sounds" group (definitions, plan, the same sequences,
+gate, setting). Real pages (headless Chromium, `SoundOut.play` replaced, `window.AudioContext` trapped): the sequence above through a
+throwaway relay. Rig: the Settings card, a drag (live `Preview`, `Set` on release, `settings.toml` written), the four Test buttons with
+`SSS_SOUND_SINK=fakesink` (no audio stream in the rig's PipeWire). New dump rects: `side.settings`
+(sidebar gear), `sound.volume` and `sound.test.<join|leave|start|stop>` are new dump rects, `sound_volume` a new value line.
 
 ## 2026-11-03: volume sliders apply while dragging, not on release (task #135)
 

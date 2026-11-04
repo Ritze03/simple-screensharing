@@ -961,6 +961,10 @@ pub struct RoomSession {
     /// arrived. The relay repeats a non-empty list every 2 s, so an entry older than
     /// [`VIEWERS_STALE`] is dropped (a lost "now nobody" heals itself). Pruned in `drain_events`.
     pub viewers: HashMap<StreamId, (Vec<ConnId>, Instant)>,
+    /// What this room's events say should make a notification sound (task I9, `sounds.rs`): the edge
+    /// detector for people joining/leaving my streams and others' streams starting/stopping. Born with
+    /// the session, so a room's join snapshot is its baseline; a resumed room starts quiet.
+    pub sounds: crate::sounds::RoomSounds,
 
     /// The relay carries emoji avatars (spec 9.2): it answered our avatar-hello. `false` on an
     /// older relay, where nobody else's emoji ever shows (the own one still does, [`Self::emoji_of`]).
@@ -1704,6 +1708,10 @@ pub struct AppState {
     /// levelling of every watched audio stream (`leveller.rs`). On by default. Applied live through
     /// the process-wide `leveller::ENABLED` switch. See `rooms::AppSettings::level_loudness`.
     pub level_loudness: bool,
+    /// Settings > Sounds > Volume (persisted, task I9): the volume of the notification sounds, percent,
+    /// separate from every stream's volume. 0 = silent. Applied live through `sounds::set_volume`.
+    /// See `rooms::AppSettings::sound_volume`, `sounds.rs`.
+    pub sound_volume: u32,
     /// Settings > Profile (persisted): this person's emoji avatar, "" = none. Sent to every
     /// room's relay; see [`AppState::set_emoji`] and `rooms::AppSettings::emoji`.
     pub emoji: String,
@@ -1940,6 +1948,7 @@ impl Default for AppState {
         // is logged from then on.
         crate::diag_upload::set_enabled(settings.send_diagnostics, false);
         crate::leveller::set_enabled(settings.level_loudness);
+        crate::sounds::set_volume(settings.sound_volume);
         Self {
             display_name,
             display_name_set,
@@ -1969,6 +1978,7 @@ impl Default for AppState {
             send_diagnostics: settings.send_diagnostics,
             audio_gain: settings.audio_gain(),
             level_loudness: settings.level_loudness,
+            sound_volume: settings.sound_volume.min(crate::sounds::MAX_VOLUME),
             emoji: settings.emoji,
             webcam: settings.webcam,
             webcams: Vec::new(),
@@ -2079,6 +2089,15 @@ pub fn save_level_loudness(on: bool) {
     settings.level_loudness = on;
     if let Err(e) = settings.save() {
         tracing::warn!("failed to save the level-loudness preference: {e:#}");
+    }
+}
+
+/// Persist the notification-sound volume (task I9).
+pub fn save_sound_volume(percent: u32) {
+    let mut settings = AppSettings::load();
+    settings.sound_volume = percent;
+    if let Err(e) = settings.save() {
+        tracing::warn!("failed to save the sound volume: {e:#}");
     }
 }
 
@@ -4380,6 +4399,7 @@ impl AppState {
                 audio_muted_by_owner: HashSet::new(),
                 viewers_supported: false,
                 viewers: HashMap::new(),
+                sounds: Default::default(),
                 avatars_supported: false,
                 avatars: HashMap::new(),
                 rewatch: Vec::new(),
@@ -4547,6 +4567,7 @@ impl AppState {
     /// introduced by it.
     pub fn drain_events(&mut self, ctx: &egui::Context) {
         let mut closed: Vec<(RoomHandle, String)> = Vec::new();
+        let mut sounds: Vec<crate::sounds::Sound> = Vec::new();
         let AppState { rooms, captures, .. } = self;
 
         for (handle, room) in rooms.iter_mut() {
@@ -4570,9 +4591,14 @@ impl AppState {
                         room.avatars.remove(&conn_id);
                     }
                     ClientEvent::PresenceDelta(PresenceEvent::StreamStarted(info)) => {
+                        // A stream the roster already has is announced again (a label change): not news.
+                        let known = room.streams.iter().any(|s| s.owner == info.owner && s.stream_id == info.stream_id);
+                        room.sounds.stream_started(info.owner == room.client.conn_id(), known);
                         room.note_stream_started(info);
                     }
                     ClientEvent::PresenceDelta(PresenceEvent::StreamStopped { conn_id, stream_id }) => {
+                        let known = room.streams.iter().any(|s| s.owner == conn_id && s.stream_id == stream_id);
+                        room.sounds.stream_stopped(conn_id == room.client.conn_id(), known);
                         // Before the roster forgets the stream: ends a watch
                         // of it (no frozen tile) and queues its resume.
                         room.end_watch_of_stopped(conn_id, stream_id, Instant::now());
@@ -4666,6 +4692,12 @@ impl AppState {
             if !room.viewers.is_empty() {
                 ctx.request_repaint_after(Duration::from_secs(1));
             }
+            // Notification sounds: who watches my streams now (a set compare, once per pass), then what
+            // this pass's events add up to. See `sounds::RoomSounds`.
+            let me = room.client.conn_id();
+            let mine = room.streams.iter().filter(|s| s.owner == me).map(|s| s.stream_id).collect();
+            room.sounds.viewers(mine, room.viewers.iter().map(|(id, (v, _))| (*id, v.as_slice())));
+            sounds.extend(room.sounds.drain(now));
 
             // Right after this room's `StreamStarted`/`StreamStopped` events
             // have been applied to `room.streams` — the only inputs that can
@@ -4679,6 +4711,7 @@ impl AppState {
             room.apply_rewatch(Instant::now());
         }
 
+        crate::sounds::play_all(&sounds);
         for (handle, reason) in closed {
             let cause = self.rooms.get(&handle).and_then(|r| r.client.close_cause()).unwrap_or(CloseCause::Other);
             self.suspend_room(handle, reason, cause);
@@ -5019,6 +5052,8 @@ impl AppState {
         if let Some(room) = self.rooms.get_mut(&handle) {
             room.rewatch = entry.wanted;
             room.rewatch_deadline = Some(now + REWATCH_GRACE);
+            // The room replays everything it had (a restarted relay: everyone re-announces and re-watches).
+            room.sounds.quiet_until(now + crate::sounds::RESUME_QUIET);
             room.apply_rewatch(now);
         }
         // Video first: a paired audio share is only valid next to a live video one.
@@ -5504,6 +5539,14 @@ impl AppState {
         self.level_loudness = on;
         crate::leveller::set_enabled(on);
         save_level_loudness(on);
+    }
+
+    /// Settings > Sounds > Volume: set the notification-sound volume (percent, clamped to 0-100), live, and
+    /// persist it. The slider calls it on every step of a drag (steps of 5: at most 20 small writes).
+    pub fn set_sound_volume(&mut self, percent: u32) {
+        self.sound_volume = percent.min(crate::sounds::MAX_VOLUME);
+        crate::sounds::set_volume(self.sound_volume);
+        save_sound_volume(self.sound_volume);
     }
 
     /// Settings > Audio boost: set (and persist) the sender-side multiplier, and apply it to
@@ -7251,6 +7294,76 @@ mod reconnect_e2e {
         assert!(watcher.rooms[&wh].watches.lock().unwrap().contains_key(&(new_owner, new_stream)));
         assert!(!watcher.rooms[&wh].watches.lock().unwrap().contains_key(&(old_owner, old_stream)));
         eprintln!("[restart] watch resumed {:.2}s after the restart", restarted.elapsed().as_secs_f64());
+
+        watcher.shutdown(Duration::from_secs(2)).await;
+        sharer.shutdown(Duration::from_secs(3)).await;
+        drop(relay);
+    }
+
+    /// Notification sounds (task I9) through a real relay and two real `AppState`s: the watcher hears the sharer's
+    /// stream start and stop, the sharer hears the watcher join and leave its stream, and nobody hears their own
+    /// share start or stop. Counts [`crate::sounds::requested`]: nothing plays (the output is never enabled in tests).
+    /// Run it alone: the counters are process-wide.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "spawns a real relay server child process (and a real GStreamer capture); run it alone, the sound counters are global"]
+    async fn notification_sounds_follow_the_room_events() {
+        use crate::sounds::{Sound, requested};
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        gstreamer::init().expect("gstreamer init");
+        let _home = isolated_config_home();
+        let port = pick_free_udp_port().expect("free port");
+        let relay = spawn_relay_server(port).expect("relay");
+
+        let mut watcher = AppState::default();
+        let mut sharer = AppState::default();
+        let join_string = watcher.create_room(&format!("127.0.0.1:{port}"), "sounds").expect("create_room").join_string;
+        await_relay(&join_string).await;
+        watcher.join_room(join_string.clone(), "watcher".into(), String::new()).expect("join");
+        sharer.join_room(join_string.clone(), "sharer".into(), "sounds".into()).expect("join");
+        drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(10), "both joined", |s| !s[0].rooms.is_empty() && !s[1].rooms.is_empty()).await;
+        let wh = *watcher.rooms.keys().next().unwrap();
+        let sh = *sharer.rooms.keys().next().unwrap();
+        let sharer_conn = sharer.rooms[&sh].client.conn_id();
+        // Joining a room, and a member joining it, is not a sound.
+        run_for(&mut [&mut watcher, &mut sharer], Duration::from_millis(500)).await;
+        let counts = || [Sound::Join, Sound::Leave, Sound::Start, Sound::Stop].map(requested);
+        assert_eq!(counts(), [0, 0, 0, 0], "joining sounds nothing");
+
+        // The sharer goes live: the watcher hears a start, the sharer does not hear its own.
+        let capture_id = share_test_source(&mut sharer, sh).await;
+        {
+            // What `poll_pending_destinations` does for a live destination (the test source bypasses it): the
+            // sharer's own roster has the stream, which is what tells the sound rules it is "mine".
+            let room = sharer.rooms.get_mut(&sh).unwrap();
+            let owner = room.client.conn_id();
+            room.note_stream_started(StreamInfo { owner, stream_id: 0, kind: StreamKind::Video, label: "test capture".into(), width: 320, height: 240 });
+        }
+        drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(10), "watcher sees the stream", |s| stream_of(s[0], wh, "sharer").is_some()).await;
+        run_for(&mut [&mut watcher, &mut sharer], Duration::from_millis(500)).await;
+        assert_eq!(counts(), [0, 0, 1, 0], "one start, and not for the sharer's own stream");
+
+        // The watcher watches: the sharer hears one join. The repeat of the list every 2 s is nothing.
+        let (owner, stream) = stream_of(&watcher, wh, "sharer").unwrap();
+        watcher.rooms.get_mut(&wh).unwrap().toggle_watch(owner, stream);
+        drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(10), "sharer hears the join", |_| requested(Sound::Join) == 1).await;
+        run_for(&mut [&mut watcher, &mut sharer], Duration::from_millis(4500)).await;
+        assert_eq!(counts(), [1, 0, 1, 0], "one join, however often the relay repeats the list");
+
+        // The watcher stops watching and watches again: a leave, then a join.
+        watcher.rooms.get_mut(&wh).unwrap().toggle_watch(owner, stream);
+        drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(10), "sharer hears the leave", |_| requested(Sound::Leave) == 1).await;
+        // `Leave` -> `Join` is a pause of at least the gate's second; the counters count requests, not plays.
+        watcher.rooms.get_mut(&wh).unwrap().toggle_watch(owner, stream);
+        drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(10), "sharer hears the second join", |_| requested(Sound::Join) == 2).await;
+        assert_eq!(counts(), [2, 1, 1, 0]);
+
+        // The sharer stops: the watcher hears a stop; the sharer does not hear its viewer "leave" (not even when the
+        // relay's stale-list window of 7 s passes).
+        sharer.stop_share(capture_id);
+        sharer.rooms.get_mut(&sh).unwrap().note_stream_stopped(sharer_conn, 0);
+        drive(&mut [&mut watcher, &mut sharer], Duration::from_secs(10), "watcher hears the stop", |_| requested(Sound::Stop) == 1).await;
+        run_for(&mut [&mut watcher, &mut sharer], Duration::from_secs(8)).await;
+        assert_eq!(counts(), [2, 1, 1, 1], "stopping one's own stream is not everybody leaving");
 
         watcher.shutdown(Duration::from_secs(2)).await;
         sharer.shutdown(Duration::from_secs(3)).await;
