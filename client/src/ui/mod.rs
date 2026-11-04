@@ -430,6 +430,8 @@ pub enum UiAction {
     SetHideOwnStreams(bool),
     /// "Always show names": watched streams show their name tag without hovering.
     SetAlwaysShowNames(bool),
+    /// Layout menu "Show stats": numbers on every watched stream's name tag.
+    SetShowStats(bool),
     /// The Layout menu's "Webcam in picture" for `view`: a webcam sits inside its owner's screen share.
     SetStagePip { view: StageView, on: bool },
     /// The bar's hide / show sidebar button.

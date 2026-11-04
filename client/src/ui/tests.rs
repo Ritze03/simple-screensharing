@@ -998,7 +998,9 @@ async fn the_stage_layout_is_per_view_and_set_through_actions() {
     assert!(!app.shell.stage.hide_own && !app.shell.stage.always_names);
     app.apply(&ctx, UiAction::SetHideOwnStreams(true));
     app.apply(&ctx, UiAction::SetAlwaysShowNames(true));
-    assert!(app.shell.stage.hide_own && app.shell.stage.always_names);
+    assert!(!app.shell.stage.show_stats, "stats are off until switched on");
+    app.apply(&ctx, UiAction::SetShowStats(true));
+    assert!(app.shell.stage.hide_own && app.shell.stage.always_names && app.shell.stage.show_stats);
 }
 
 /// The control bar, an open menu and stage fullscreen draw at the 800 px minimum window and bigger ones; stage

@@ -408,14 +408,20 @@ try {
   await sleep(300);
   check((await css(P, ".arena > .st-tile .tools", "opacity", null, 0)) === "1" && (await css(P, ".arena > .st-tile .tag", "opacity", null, 0)) === "1", "hovered: the buttons and the name tag show");
   await shot(P, "07_hover");
-  // Show stats on the stream (the tile menu's switch): numbers only while hovered, in reserved slots, no jitter
+  // Show stats (ONE switch in the Layout menu, every stream): numbers only while hovered, in reserved slots, no jitter
   await P.click({ js: `document.querySelectorAll('.arena > .st-tile')[0].querySelector('.tools .round-btn:last-child')` });
   await P.waitFor("document.querySelector('.menu.m-tile')", { what: "stream menu" });
   const menuItems = await P.eval(`[...document.querySelectorAll('.menu.m-tile .mi')].map((e) => e.innerText.replace(/\\s+/g, ' ').trim())`);
-  check(["Show stats", "Pop out", "Fullscreen", "Stop watching"].every((x) => menuItems.some((m) => m.includes(x))) && menuItems.some((m) => /Level loudness/.test(m)), "the stream menu: volume, level loudness, stats, pop out, fullscreen, stop watching", JSON.stringify(menuItems));
-  await P.click({ js: `[...document.querySelectorAll('.menu.m-tile .mi')].find((e) => /Show stats/.test(e.innerText))` });
+  check(["Pop out", "Fullscreen", "Stop watching"].every((x) => menuItems.some((m) => m.includes(x))) && menuItems.some((m) => /Level loudness/.test(m)) && !menuItems.some((m) => /stats/i.test(m)), "the stream menu: volume, level loudness, pop out, fullscreen, stop watching, and no stats switch any more", JSON.stringify(menuItems));
+  await closeMenu();
+  check((await P.eval(`document.querySelectorAll('.arena > .st-tile .tag .v').length`)) === 0, "stats are off by default: no numbers in any tag");
+  await openLayoutMenu();
+  const layoutItems = await P.eval(`[...document.querySelectorAll('.menu.m-layout .mi, .menu.m-layout .cbx')].map((e) => e.innerText.replace(/\\s+/g, ' ').trim())`);
+  check(["Always show names", "Show stats", "Hide my own streams"].every((x) => layoutItems.some((m) => m.includes(x))), "the Layout menu has Always show names, Show stats and Hide my own streams", JSON.stringify(layoutItems));
+  await layoutItem("/Show stats/");
   await sleep(150);
   await closeMenu();
+  check((await P.eval(`[...document.querySelectorAll('.arena > .st-tile')].filter((t) => t._it.w).every((t) => t.querySelectorAll('.tag .v').length === 3) && [...document.querySelectorAll('.arena > .st-tile')].filter((t) => t._it.w).length >= 3`)), "Show stats switches the numbers on for every stream at once");
   const vt2 = (await tiles(P))[0];
   await move(P, 4, 4);
   await sleep(250);
@@ -440,11 +446,9 @@ try {
   // a narrow tile drops what does not fit, the resolution first, then the rate (native stats_fields); a wide one shows all three
   const wide = await P.eval(`document.querySelectorAll('.arena > .st-tile')[0].querySelector('.tag').dataset.fit`);
   const narrowI = await P.eval(`(() => { const w = [...document.querySelectorAll('.arena > .st-tile')].map((t) => t.getBoundingClientRect().width); return w.indexOf(Math.min(...w)); })()`);
-  await P.eval(`(() => { const it = document.querySelectorAll('.arena > .st-tile')[${narrowI}]._it; __sss.S.stage.stats.add(it.id); __sss.render(); })()`);
   await sleep(300);
   const narrow = await P.eval(`(() => { const t = document.querySelectorAll('.arena > .st-tile')[${narrowI}]; const tg = t.querySelector('.tag'); return { fit: tg.dataset.fit, w: t.getBoundingClientRect().width, tag: tg.getBoundingClientRect().width }; })()`);
   check(wide === "all" && narrow.fit !== "all" && narrow.tag <= narrow.w, "a wide tile shows resolution, fps and rate; a narrow one drops numbers (resolution first) and its pill still fits", `wide ${wide}, ${narrow.w.toFixed(0)} px wide -> ${narrow.fit}, pill ${narrow.tag.toFixed(0)} px`);
-  await P.eval(`(() => { const it = document.querySelectorAll('.arena > .st-tile')[${narrowI}]._it; __sss.S.stage.stats.delete(it.id); __sss.render(); })()`);
   // Always show names (Layout menu): the name tag stays without hovering, the buttons and stats never do
   await openLayoutMenu();
   await layoutItem("/Always show names/");
@@ -453,6 +457,10 @@ try {
   await sleep(300);
   check((await css(P, ".arena > .st-tile .tag", "opacity", null, 2)) === "1" && (await css(P, ".arena > .st-tile .tools", "opacity", null, 2)) === "0", "Always show names: the tag stays, the buttons do not");
   check((await css(P, ".arena > .st-tile .tag .v.fps", "display", null, 0)) === "none", "and the stats still need a hover");
+  await openLayoutMenu();
+  await layoutItem("/Show stats/");
+  await closeMenu();
+  check((await P.eval(`document.querySelectorAll('.arena > .st-tile .tag .v').length`)) === 0, "Show stats off again: no numbers in any tag");
   await openLayoutMenu();
   await layoutItem("/Always show names/");
   await closeMenu();
@@ -622,6 +630,27 @@ try {
   await P.click({ text: "Quality", sel: ".modal .seg button" });
   await sleep(400);
   check((await cap()) === "60 FPS · Quality encoding · Keyframe 1000 ms", "Quality: 60 fps, Quality encoding, keyframe 1000 ms", await cap());
+  // Encoding and Keyframe are fields again (user: "The settings for the keyframe and the Performance/Quality setting should still be shown"):
+  // they show what the preset set, editing one by hand leaves no preset lit, re-picking a preset restores both
+  const fields = () => P.eval(`({ gop: document.querySelector('#st-gop .txt')?.innerText, enc: document.querySelector('#st-encoding .seg button.on, .modal .seg:has(button[title=Performance]) button.on')?.innerText, preset: document.querySelectorAll('.modal .seg:has(button[title=Gaming]) button.on').length ? document.querySelector('.modal .seg:has(button[title=Gaming]) button.on').innerText : "none" })`);
+  let f = await fields();
+  check(f.gop === "1000 ms" && f.enc === "Quality" && f.preset === "Quality", "the Keyframe and Encoding fields show the Quality preset's 1000 ms / Quality", JSON.stringify(f));
+  await P.click("#st-gop");
+  await P.waitFor("document.querySelector('.menu.m-dd')", { what: "keyframe dropdown" });
+  const gopItems = await P.eval(`[...document.querySelectorAll('.menu.m-dd .mi')].map((e) => e.innerText.replace(/\\s*check$/, '').trim())`);
+  check(JSON.stringify(gopItems) === '["250 ms","500 ms","1000 ms","2000 ms"]', "the Keyframe dropdown lists 250, 500, 1000, 2000 ms", JSON.stringify(gopItems));
+  await P.click({ js: `[...document.querySelectorAll('.menu.m-dd .mi')].find((e) => e.innerText.trim() === "500 ms")` });
+  await P.waitFor("__sss.S.captures.every((c) => c.dests.size && [...c.dests.values()].every((d) => d.state === 'live'))", { timeout: 20000, what: "live again after a keyframe edit" });
+  f = await fields();
+  check(f.gop === "500 ms" && f.preset === "none" && (await cap()) === "60 FPS · Quality encoding · Keyframe 500 ms" && !/custom/i.test(await cap()), "Keyframe 500 ms: no preset lit, the caption says what is set (never custom)", JSON.stringify(f) + " " + (await cap()));
+  check(await P.eval(`[...__sss.S.captures[0].dests.values()].every((d) => d.gopMs === 500 && d.latencyMode === "quality" && d.share)`), "the live destination restarted with the new keyframe interval", await P.eval(`JSON.stringify([...__sss.S.captures[0].dests.values()].map((d) => [d.gopMs, d.latencyMode, d.preset]))`));
+  await P.click({ text: "Performance", sel: ".modal .seg button" });
+  await P.waitFor("__sss.S.captures.every((c) => c.dests.size && [...c.dests.values()].every((d) => d.state === 'live'))", { timeout: 20000, what: "live again after an encoding edit" });
+  check((await cap()) === "60 FPS · Performance encoding · Keyframe 500 ms" && (await fields()).preset === "none", "Encoding Performance by hand: caption follows, still no preset lit", await cap());
+  await P.click({ text: "Quality", sel: ".modal .seg button" });
+  await P.waitFor("__sss.S.captures.every((c) => c.dests.size && [...c.dests.values()].every((d) => d.state === 'live'))", { timeout: 20000, what: "live again after re-picking Quality" });
+  f = await fields();
+  check(f.gop === "1000 ms" && f.enc === "Quality" && f.preset === "Quality" && (await cap()) === "60 FPS · Quality encoding · Keyframe 1000 ms", "re-picking the Quality preset restores Quality encoding and 1000 ms", JSON.stringify(f));
   await P.click({ text: "Done", sel: ".modal-foot button" });
   await sleep(300);
   await P.waitFor("__sss.S.captures.every((c) => c.dests.size && [...c.dests.values()].every((d) => d.state === 'live'))", { timeout: 20000, what: "live again after restarts" });

@@ -409,6 +409,7 @@ impl App {
             UiAction::SetStageLayout { view, layout } => self.shell.stage.set_layout(view, layout),
             UiAction::SetHideOwnStreams(on) => self.shell.stage.hide_own = on,
             UiAction::SetAlwaysShowNames(on) => self.shell.stage.always_names = on,
+            UiAction::SetShowStats(on) => self.shell.stage.show_stats = on,
             UiAction::SetStagePip { view, on } => self.shell.stage.set_pip(view, on),
             UiAction::ToggleSidebar => self.nav.sidebar_hidden = !self.nav.sidebar_hidden,
             UiAction::EnterStageFullscreen => {

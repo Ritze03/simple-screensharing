@@ -122,6 +122,12 @@ fn layout_menu(ui: &mut Ui, cx: &Cx, view: &StageView, out: &mut Vec<UiAction>, 
         {
             out.push(UiAction::SetAlwaysShowNames(names));
         }
+        let mut stats = cx.shell.stage.show_stats;
+        let r = widgets::checkbox(ui, &mut stats, &tr("ui.stage.show_stats", "Show stats"));
+        drive_dump::rect(|| "menu.show_stats".into(), r.rect);
+        if r.on_hover_text(tr("ui.stage.show_stats_tip", "Resolution, frame rate and bitrate on every stream's name tag while you hover it")).changed() {
+            out.push(UiAction::SetShowStats(stats));
+        }
         let mut hide = cx.shell.stage.hide_own;
         let r = widgets::checkbox(ui, &mut hide, &tr("ui.stage.hide_own", "Hide my own streams"));
         drive_dump::rect(|| "menu.hide_own".into(), r.rect);
@@ -187,17 +193,17 @@ fn room_menu(ui: &mut Ui, cx: &Cx, r: &crate::ui::RoomEntry, out: &mut Vec<UiAct
     }
 }
 
-/// A stream's menu (`⋯` on its tile, or a right click): who and what, volume and level loudness, stats, then
+/// A stream's menu (`⋯` on its tile, or a right click): who and what, volume and level loudness, then
 /// pop out / fullscreen / stop watching (your own share: Stream settings and Stop sharing). Volume acts during
 /// the drag and the wheel steps it (5 % up to 200 %, 10 % above).
 fn tile_menu(ctx: &egui::Context, cx: &mut Cx, st: &mut StageState, view: &StageView, pop: &Popover, it: &Item) {
     let mut out: Vec<UiAction> = Vec::new();
     let mut close = false;
     let cxr: &Cx = cx;
-    let StageState { stats, vol_drag, .. } = st;
+    let StageState { vol_drag, .. } = st;
     let combined = matches!(view, StageView::Watched);
     let open = popover(ctx, pop, 280.0, |ui| {
-        tile_menu_body(ui, cxr, it, combined, stats, vol_drag, &mut out, &mut close);
+        tile_menu_body(ui, cxr, it, combined, vol_drag, &mut out, &mut close);
     });
     for a in out {
         cx.act(a);
@@ -213,7 +219,6 @@ fn tile_menu_body(
     cx: &Cx,
     it: &Item,
     combined: bool,
-    stats: &mut std::collections::HashSet<crate::ui::StreamKey>,
     vol_drag: &mut super::VolDrag,
     out: &mut Vec<UiAction>,
     close: &mut bool,
@@ -240,10 +245,6 @@ fn tile_menu_body(
                 volume(ui, *key, out);
             } else {
                 share::pop_note(ui, &tr("ui.stage.no_audio_stream", "No audio in this stream"));
-            }
-            let mut on = stats.contains(key);
-            if menu::switch_row(ui, "monitoring", &tr("ui.stage.show_stats", "Show stats on the stream"), &mut on) {
-                if on { stats.insert(*key) } else { stats.remove(key) };
             }
             share::pop_sep(ui);
             if widgets::pop_item(ui, &PopItem::new("open_in_new", &tr("ui.room.pop_out", "Pop out"))).clicked() {

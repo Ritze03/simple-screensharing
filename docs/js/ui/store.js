@@ -1,7 +1,7 @@
 // Persistence (localStorage) for settings and saved rooms, plus the shared UI state object and its re-render hook.
 // Every localStorage access is wrapped: a private window or blocked storage must not break the page.
 
-import { DEFAULT_MAX_JITTER_BUFFER_MS, DEFAULT_CATCH_UP_SPEED_PERCENT, clampMaxJitterBufferMs, clampCatchUpSpeedPercent } from "../core/index.js";
+import { DEFAULT_MAX_JITTER_BUFFER_MS, DEFAULT_CATCH_UP_SPEED_PERCENT, clampMaxJitterBufferMs, clampCatchUpSpeedPercent, ENCODER_PRESETS } from "../core/index.js";
 
 const K_SETTINGS = "sss.settings.v1";
 const K_ROOMS = "sss.rooms.v1";
@@ -53,8 +53,20 @@ export const displayName = () => (S.settings.name || "").trim() || autoName();
 const browserLang = () => (String(navigator.language || "en").toLowerCase().startsWith("de") ? "de" : "en");
 
 const PRESET_NAMES = ["text", "quality", "gaming"];
+/** The keyframe intervals the stream settings offer, ms (the presets use 250 and 1000, the webcam 2000); a stored other one is listed as it is. */
+export const GOP_OPTIONS = [250, 500, 1000, 2000];
+/** The preset whose encoding mode and keyframe interval are exactly these (native `EncoderTuning::preset` compares the same pair), or ""
+ *  when none: a hand-made combination, no preset lit. */
+export const presetOf = (latencyMode, gopMs) => PRESET_NAMES.find((p) => ENCODER_PRESETS[p].latencyMode === latencyMode && ENCODER_PRESETS[p].gopMs === gopMs) || "";
+/** What a stream config encodes with: its own `latencyMode` ("quality" | "realtime") and `gopMs`, else its preset's (an older stored config has only a preset). */
+export function encoderOf(d) {
+  const p = ENCODER_PRESETS[d.preset] || ENCODER_PRESETS.quality;
+  return { latencyMode: d.latencyMode === "quality" || d.latencyMode === "realtime" ? d.latencyMode : p.latencyMode, gopMs: Number.isFinite(d.gopMs) && d.gopMs > 0 ? d.gopMs : p.gopMs };
+}
 function normalizeStream(st) {
   if (!PRESET_NAMES.includes(st.preset)) st.preset = "quality";
+  const { latencyMode, gopMs } = encoderOf(st);
+  Object.assign(st, { latencyMode, gopMs, preset: presetOf(latencyMode, gopMs) });
   return st;
 }
 
@@ -121,7 +133,7 @@ export const S = {
   flash: null,
   menu: null, // the open dropdown / context menu (menus.js): { kind, mk, ... }
   // The stage (stage.js). Layout state per view lives there (UI-private, per session, not persisted, like native `StageState`); these are the
-  // choices the Layout menu and the bar set. `stats`: ids of the streams that show "Show stats on the stream".
+  // choices the Layout menu and the bar set.
   stage: {
     layouts: {}, // view key ("room:<id>" | "watched") -> "split" | "crop" | "float"
     hideOwn: false,
@@ -129,7 +141,7 @@ export const S = {
     alwaysNames: false,
     stripHidden: false, // the people button hid the strip
     sidebarHidden: false,
-    stats: new Set(),
+    showStats: false, // Layout menu "Show stats": the numbers on every watched stream's name tag (native `StageSettings::show_stats`)
     popped: new Set(), // view keys whose whole stage is in its own (Document PiP) window
     fullscreen: false,
   },

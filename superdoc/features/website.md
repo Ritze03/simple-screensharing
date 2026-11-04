@@ -158,12 +158,18 @@ A 400 ms poll re-lays-out an arena when a stream's picture changes shape, so a f
 - *Streams don't jump* and *a tall bar swallows no clicks:* in fullscreen the chrome has `z-index: 30` over the bars' 20.
 
 **The stream menu** (`⋯` or a right click on a tile): header, Volume (mute, slider 0-500 % acting **during the drag**, scrolling on it 5 % a notch up to 200 %, 10 % above,
-`volumeWheel`), Level loudness (the global setting), Show stats on the stream, Pop out, Fullscreen, Stop watching; an unwatched tile: Watch stream / Pop out; your own
+`volumeWheel`), Level loudness (the global setting), Pop out, Fullscreen, Stop watching (no stats row); an unwatched tile: Watch stream / Pop out; your own
 tile: Stream settings / Stop sharing. **Share menu** (the Share button's arrow): state header, FPS and Preset (for the live destination, the staged stream or the next one),
 Change source, All stream settings, Go live / Stop sharing; when your share is live in another room, Add here / Move here stay reachable. **Stream settings modal**: Source (with
 **Change** while setting up and while live: `capture.js` `changeSource` picks again and restarts every destination on the new tracks, the new share first, like a live FPS
-change), Compression (Codec, Bitrate), Video (FPS dropdown, Preset Text / Quality / Gaming and its caption `fps · mode · keyframe`, never "(custom)"). A preset sets the FPS
-once (`ENCODER_PRESETS[p].fps`); changing the FPS by hand keeps the preset's encoder mode and keyframe because the preset name stays and `startShare` takes `fps` separately.
+change), Compression (Codec, Bitrate), Video (FPS dropdown, Preset Text / Quality / Gaming, **Encoding** Performance | Quality, **Keyframe** 250 / 500 / 1000 / 2000 ms, and the caption `fps · mode · keyframe`, never "(custom)"). A preset sets the FPS,
+the encoding mode and the keyframe interval at once (`presetPatch`); changing the FPS by hand keeps the encoder mode and keyframe. Encoding and Keyframe are stored next to the
+preset as `latencyMode` ("realtime" = Performance, "quality") and `gopMs` (`ui/store.js` `encoderOf`, `presetOf`), travel with every destination (`capture.js` `encCfg`) and go to `startShare`
+as explicit `latencyMode` / `gopMs` (which override the preset's); editing one by hand sets the other two from `presetOf(latencyMode, gopMs)`, so a combination that matches no preset leaves **no preset lit**
+(`preset: ""`). A live edit restarts the destination like a preset does, and the modal's note says so ("Changing framerate, codec, preset, encoding or keyframe restarts the stream"). An older stored
+config with only a `preset` loads with that preset's values. *Why:* the user: "The settings for the keyframe and the Performance/Quality setting should still be shown (right now only accessible
+through the presets Text/Quality/Gaming itself)." **Show stats** is one Layout-menu checkbox for every watched stream (`S.stage.showStats`, off until switched on, hover-only like before); the user:
+""Show stats on the stream" should be inside of the "LAYOUT" dropdown and not per individual stream."
 `store.js` loads a stored `balanced` / `low_latency` as `quality`.
 
 **Pop-outs.** A stream's pop-out is unchanged (Document PiP, fallback fullscreen) but **survives a reconnect or a relay restart**: `endWatch` keeps the window open while the 60 s

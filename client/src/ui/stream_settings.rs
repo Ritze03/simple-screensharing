@@ -12,9 +12,13 @@
 //!   capture's first frame + equal `[Also send to…][Move to…]`),
 //!   Upload bandwidth (Mode / Total / Floor / Per stream or over-budget banner);
 //! - how it's encoded: Compression (Codec / Bitrate) and Video (FPS dropdown / Preset
-//!   Text, Quality, Gaming + a caption "60 FPS · Quality encoding · Keyframe 1000 ms"). No
-//!   encoder-limit banner or "Use H.265" offer since 2026-10-15 (user: "just annoying"); the
-//!   Advanced tuning rows are gone since 2026-11-04 (plan decision D8: the presets replace them).
+//!   Text, Quality, Gaming / Encoding Performance|Quality / Keyframe 250, 500, 1000, 2000 ms
+//!   + a caption "60 FPS · Quality encoding · Keyframe 1000 ms"). No encoder-limit banner or "Use H.265"
+//!   offer since 2026-10-15 (user: "just annoying"). The Advanced section is gone since 2026-11-04 (plan
+//!   decision D8: the presets replace it) but its two values that matter, Encoding and Keyframe, are
+//!   fields again the same day. *Why:* the user: "The settings for the keyframe and the Performance/Quality
+//!   setting should still be shown (right now only accessible through the presets Text/Quality/Gaming itself)."
+//!   A preset sets both; editing one by hand leaves no preset lit (the preset is derived from the pair).
 //!   The Source card's Change button is there staged and live.
 //!
 //! Every control row is `[120 label][fill control][72 value]` (the widgets
@@ -73,6 +77,8 @@ use crate::widgets::{
 const TOTAL_RANGE: std::ops::RangeInclusive<u32> = 500..=40_000;
 const FLOOR_RANGE: std::ops::RangeInclusive<u32> = 100..=20_000;
 const BW_STEP: f64 = 100.0;
+/// The keyframe intervals the Video card offers, ms (the presets use 250 and 1000, the webcam 2000).
+const GOP_OPTIONS: [u32; 4] = [250, 500, 1000, 2000];
 /// Minimum time the "Applying" pill stays up after a live edit, seconds
 /// (mockup `touch()`): a bitrate-only change applies instantly and would
 /// otherwise never show any feedback.
@@ -689,6 +695,42 @@ fn video_card(ui: &mut Ui, cx: &Cx, target: Target, out: &mut Vec<UiAction>) {
         let changed = widgets::ctrl_row(ui, &tr("ui.stream.preset", "Preset"), None, |ui| seg_gated(ui, "preset", &mut preset, &preset_opts, ""));
         if changed && let Some(p) = preset {
             out.push(target.preset_action(p));
+        }
+        // The two values a preset sets besides the FPS (and the tune, which has no row): editable, and a hand-made
+        // combination that matches no preset simply leaves none lit (`preset` is derived from these two).
+        let perf = tr("ui.stream.ql_performance", "Performance");
+        let qual = tr("ui.stream.ql_quality", "Quality");
+        let mut ql = v.quality_level;
+        let opts = [(QualityLevel::Performance, perf.as_str()), (QualityLevel::Quality, qual.as_str())];
+        let tip = tr("ui.stream.encoding_tip", "Performance encodes fastest. Quality spends more effort on every frame for a sharper picture at the same bitrate.");
+        let r = widgets::ctrl_row(ui, &tr("ui.stream.encoding", "Encoding"), Some(&tip), |ui| {
+            // Two equal segments: `quality.0` Performance, `quality.1` Quality (for hs-drive).
+            let w = ui.available_width();
+            let at = ui.cursor().min;
+            for i in 0..2 {
+                let seg = Rect::from_min_size(pos2(at.x + w / 2.0 * i as f32, at.y), vec2(w / 2.0, theme::CTL_H));
+                drive_dump::rect(|| format!("quality.{i}"), seg);
+            }
+            widgets::segmented(ui, &mut ql, &opts)
+        });
+        if r {
+            out.push(target.action(NextStream { quality_level: ql, ..v }));
+        }
+        // A stored interval that is not in the list (an older settings file) is listed as it is.
+        let mut gops: Vec<u32> = GOP_OPTIONS.to_vec();
+        if !gops.contains(&v.gop_millis) {
+            gops.push(v.gop_millis);
+            gops.sort_unstable();
+        }
+        let gop_labels: Vec<String> = gops.iter().map(|g| tr_with("ui.stream.gop_ms", "%{ms} ms", &[("ms", &g.to_string())])).collect();
+        let gop_opts: Vec<menu::Opt> = gop_labels.iter().map(|l| menu::Opt::new(l)).collect();
+        let mut gop_idx = gops.iter().position(|g| *g == v.gop_millis).unwrap_or(0);
+        let tip = tr("ui.stream.keyframe_tip", "How often a full picture is sent. A shorter interval recovers faster after a lost packet or fast motion, but costs bitrate.");
+        let r = widgets::ctrl_row(ui, &tr("ui.stream.keyframe", "Keyframe"), Some(&tip), |ui| menu::select(ui, "stream_keyframe", &mut gop_idx, &gop_opts));
+        drive_dump::rect(|| "gop".into(), r.rect);
+        drive_dump::line(|| format!("gop_options {}", gops.iter().map(u32::to_string).collect::<Vec<_>>().join(" ")));
+        if r.changed() {
+            out.push(target.action(NextStream { gop_millis: gops[gop_idx], ..v }));
         }
         let slots = [fixed(theme::LABEL_W), FILL];
         let row = HBox::new("preset_caption", 16.0).slots(&slots).show(ui);

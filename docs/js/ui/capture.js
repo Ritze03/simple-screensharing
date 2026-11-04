@@ -9,7 +9,7 @@
 // the stream end and a new one start in its place.
 
 import { WEBCAM_LABEL } from "../core/index.js";
-import { S, invalidate, toast, persistSettings } from "./store.js";
+import { S, invalidate, toast, persistSettings, encoderOf } from "./store.js";
 import { t } from "./i18n.js";
 
 let seq = 1;
@@ -129,6 +129,9 @@ const pickDisplay = (fps) =>
     selfBrowserSurface: "exclude",
   });
 
+/** The settings one destination is started with (fps, codec, bitrate and the encoder: preset name, mode and keyframe interval, see `encoderOf`). */
+const encCfg = (d) => ({ fps: d.fps, codec: d.codec, preset: d.preset, ...encoderOf(d), kbps: d.kbps });
+
 /**
  * Pick a screen for `room` (must run inside a click handler: getDisplayMedia needs the user gesture).
  * Resolves the staged capture, or null when the user cancelled the picker.
@@ -137,7 +140,7 @@ export async function stage(room) {
   const def = S.settings.stream;
   const c = {
     id: seq++, kind: "screen", state: "picking", stagedRoom: room.id, stream: null, video: null, audio: null, label: "", audioMuted: false,
-    staged: { fps: def.fps, codec: def.codec, preset: def.preset, kbps: def.kbps }, dests: new Map(), meter: null,
+    staged: { ...encCfg(def) }, dests: new Map(), meter: null,
   };
   S.captures.push(c);
   invalidate();
@@ -217,7 +220,7 @@ async function swapStream(c, stream, cfg = {}) {
     d.state = "restarting";
     invalidate();
     try {
-      await startDest(c, room, { fps: d.fps, codec: d.codec, preset: d.preset, kbps: d.kbps, ...cfg }, { state: "restarting" });
+      await startDest(c, room, { ...encCfg(d), ...cfg }, { state: "restarting" });
     } catch (e) {
       d.state = "live";
       toast(t("ui.toast.share_failed", { error: e.message }), "error", { err: true });
@@ -257,14 +260,14 @@ async function startDest(c, room, cfg, { state = "starting" } = {}) {
       await clones[0].applyConstraints({ frameRate: { ideal: cfg.fps, max: cfg.fps } });
     } catch {}
   }
-  const d = { roomId: room.id, share: null, fps: cfg.fps, codec: cfg.codec, preset: cfg.preset, kbps: cfg.kbps, state, clones, appliedKbps: 0, stats: null, stopping: false };
+  const d = { roomId: room.id, share: null, ...encCfg(cfg), state, clones, appliedKbps: 0, stats: null, stopping: false };
   const prev = c.dests.get(room.id);
   if (!prev) c.dests.set(room.id, d);
   invalidate();
   const kbps = allocated(d);
   try {
     d.share = await room.client.startShare({
-      stream: new MediaStream(clones), audio: !!c.audio, codec: cfg.codec, fps: cfg.fps, bitrateKbps: kbps, preset: cfg.preset, label: c.label,
+      stream: new MediaStream(clones), audio: !!c.audio, codec: cfg.codec, fps: cfg.fps, bitrateKbps: kbps, preset: cfg.preset, latencyMode: cfg.latencyMode, gopMs: cfg.gopMs, label: c.label,
       // a webcam's encoder is fixed (plan D8): Performance, a keyframe every 2000 ms; an audio share has no video encoder at all
       ...(c.kind === "webcam" ? { gopMs: WEBCAM_GOP_MS, latencyMode: "realtime" } : {}),
       ...(audioOnly ? { audioOnly: true } : {}),
@@ -313,7 +316,7 @@ export async function goLive(c, room) {
 export async function addDest(c, room) {
   const src = [...c.dests.values()][0] || c.staged;
   try {
-    await startDest(c, room, { fps: src.fps, codec: src.codec, preset: src.preset, kbps: src.kbps });
+    await startDest(c, room, encCfg(src));
     toast(t("ui.toast.live_in", { room: room.name }), "cast");
   } catch (e) {
     toast(t("ui.toast.share_failed", { error: e.message }), "error", { err: true });
@@ -327,7 +330,7 @@ export async function moveDest(c, from, to) {
   d.state = "moving";
   invalidate();
   try {
-    await startDest(c, to, { fps: d.fps, codec: d.codec, preset: d.preset, kbps: d.kbps });
+    await startDest(c, to, encCfg(d));
     stopDest(c, from.id, { keepCapture: true });
     if (S.modal && S.modal.kind === "stream" && S.modal.room === from.id) S.modal.room = to.id;
     toast(t("ui.toast.moved", { room: to.name }), "swap_horiz");
@@ -352,11 +355,11 @@ export function stopAll() {
   for (const c of [...S.captures]) endCapture(c);
 }
 
-/** Change fps / codec / preset of a live destination: restart it with the new settings. */
+/** Change fps / codec / preset / encoding mode / keyframe interval of a live destination: restart it with the new settings. */
 export async function editDest(c, room, patch) {
   const d = c.dests.get(room.id);
   if (!d) return;
-  const cfg = { fps: d.fps, codec: d.codec, preset: d.preset, kbps: d.kbps, ...patch };
+  const cfg = { ...encCfg(d), ...patch };
   if ("kbps" in patch && Object.keys(patch).length === 1) {
     d.kbps = patch.kbps;
     applyBandwidth();
@@ -555,7 +558,7 @@ async function openCamera(cam, mode) {
 const webcamCfg = (cam) => {
   const m = camMode(cam);
   const wc = S.settings.webcam;
-  return { fps: m.fps, codec: wc.codec, preset: "gaming", kbps: wc.kbps };
+  return { fps: m.fps, codec: wc.codec, preset: "", latencyMode: "realtime", gopMs: WEBCAM_GOP_MS, kbps: wc.kbps }; // fixed encoder (plan D8)
 };
 
 /** Start the webcam in `room` (the saved camera in its saved mode); live in another room it MOVES here. Resolves the capture, or null (refused, failed). */

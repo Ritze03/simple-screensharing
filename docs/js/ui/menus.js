@@ -7,7 +7,7 @@
 // overlays; `mk` pairs it with the element that opened it (`data-mk`), so a second click on that element closes it again.
 
 import { ENCODER_PRESETS } from "../core/index.js";
-import { S, persistSettings, persistRooms, toast, displayName } from "./store.js";
+import { S, persistSettings, persistRooms, toast, displayName, encoderOf, presetOf, GOP_OPTIONS } from "./store.js";
 import { t } from "./i18n.js";
 import { h, ic, pct, cbx, seg, avatarEl, EMOJI, pickEmoji, snapVolumePct, volumeWheel, VOLUME_MAX_PCT, fmtKbps, meter } from "./dom.js";
 import { roomById, setWatchVolume, setWatchMuted, unwatchStream, watchStream, connectRoom, applyLevelLoudness } from "./rooms.js";
@@ -23,10 +23,22 @@ export const FPS_LIST = [15, 30, 60, 90, 120, 144, 165, 240];
 export const PRESET_ORDER = ["text", "quality", "gaming"];
 export const presetLabel = (p) => t("ui.preset." + p);
 /** "60 FPS · Quality encoding · Keyframe 1000 ms": what a preset sets (native `preset_caption`); never "(custom)". */
-export function presetCaption(preset, fps) {
-  const e = ENCODER_PRESETS[preset] || ENCODER_PRESETS.quality;
-  return t("ui.stream.preset_caption", { fps, mode: e.latencyMode === "realtime" ? t("ui.stream.ql_performance") : t("ui.stream.ql_quality"), ms: e.gopMs });
+export function presetCaption(d) {
+  const e = encoderOf(d);
+  return t("ui.stream.preset_caption", { fps: d.fps, mode: e.latencyMode === "realtime" ? t("ui.stream.ql_performance") : t("ui.stream.ql_quality"), ms: e.gopMs });
 }
+/** A preset sets all of these at once (the FPS, the encoding mode, the keyframe interval). */
+export const presetPatch = (p) => ({ preset: p, fps: ENCODER_PRESETS[p].fps, latencyMode: ENCODER_PRESETS[p].latencyMode, gopMs: ENCODER_PRESETS[p].gopMs });
+/** Editing the encoding mode or the keyframe interval by hand: the preset is whichever one now matches both, else none is lit. */
+export const encoderPatch = (d, patch) => {
+  const e = { ...encoderOf(d), ...patch };
+  return { ...e, preset: presetOf(e.latencyMode, e.gopMs) };
+};
+/** The keyframe intervals to list for `d`: the offered ones, plus a stored other one as it is. */
+export const gopChoices = (d) => {
+  const g = encoderOf(d).gopMs;
+  return (GOP_OPTIONS.includes(g) ? GOP_OPTIONS : [...GOP_OPTIONS, g].sort((a, b) => a - b)).map((v) => [v, t("ui.stream.gop_ms", { ms: v })]);
+};
 
 const rectOf = (el) => {
   const r = el.getBoundingClientRect();
@@ -109,8 +121,8 @@ function shareMenu(view) {
     h("div", { class: "mrow" }, denseSeg(FPS_LIST.map((f) => [f, String(f)]), d.fps, (v) => stay(() => edit({ fps: v }))())),
   ];
   out.push(label(t("ui.stream.preset")));
-  out.push(h("div", { class: "mrow" }, seg(PRESET_ORDER.map((p) => [p, presetLabel(p)]), d.preset, (v) => stay(() => edit({ preset: v, fps: ENCODER_PRESETS[v].fps }))())));
-  out.push(h("div", { class: "mrow" }, h("span", { class: "cap", text: presetCaption(d.preset, d.fps) })));
+  out.push(h("div", { class: "mrow" }, seg(PRESET_ORDER.map((p) => [p, presetLabel(p)]), d.preset, (v) => stay(() => edit(presetPatch(v)))())));
+  out.push(h("div", { class: "mrow" }, h("span", { class: "cap", text: presetCaption(d) })));
   out.push(sep());
   if (!cap) {
     // Not sharing here: an existing share can be added or moved here, a new one starts the picker.
@@ -186,6 +198,7 @@ function layoutMenu() {
     sep(),
     checkRow(t("ui.stage.pip"), pipOn(key), stay(() => (pipOn(key) ? S.stage.pip.delete(key) : S.stage.pip.add(key))), t("ui.stage.pip_tip_menu")),
     checkRow(t("ui.stage.always_names"), S.stage.alwaysNames, stay(() => (S.stage.alwaysNames = !S.stage.alwaysNames)), t("ui.stage.always_names_tip")),
+    checkRow(t("ui.stage.show_stats"), S.stage.showStats, stay(() => (S.stage.showStats = !S.stage.showStats)), t("ui.stage.show_stats_tip")),
     checkRow(t("ui.stage.hide_own"), S.stage.hideOwn, stay(() => (S.stage.hideOwn = !S.stage.hideOwn)), t("ui.stage.hide_own_tip")),
     sep(),
     menuItem({ icon: "restart_alt", label: t("ui.stage.reset_layout"), onclick: done(() => resetView(key)) }),
@@ -252,7 +265,6 @@ function tileMenu() {
     if (!it.cam && r.hasAudio(s.owner)) {
       out.push(...volumeRows(r, w));
     } else out.push(h("div", { class: "mrow dim" }, ic("volume_off"), t("ui.stage.no_audio_stream")));
-    out.push(switchRow("monitoring", t("ui.stage.show_stats"), S.stage.stats.has(it.id), stay(() => (S.stage.stats.has(it.id) ? S.stage.stats.delete(it.id) : S.stage.stats.add(it.id)))));
   }
   out.push(sep());
   if (w) {

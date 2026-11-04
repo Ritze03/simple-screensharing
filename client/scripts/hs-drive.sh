@@ -29,7 +29,7 @@
 #   mclick NAME [DX [DY]]     click a control of the open modal by its dumped rect (DX<0: from the right
 #                             edge, `L60`: 60 pt from the left edge)
 #   watch [T]                 viewer (VIEWER=N, default 2): click "Watch stream" on stage tile T (default 0)
-#   hover [T]                 viewer: switch "Show stats on the stream" on for tile T and park the pointer on its
+#   hover [T]                 viewer: switch the Layout menu's "Show stats" on (every stream) and hover tile T and park the pointer on its
 #                             name tag (tooltip shows "Decoded X fps / shown Y fps")
 #   sample OUTDIR N SECS      viewer: N screenshots of the tooltip region every SECS s ->
 #                             OUTDIR/tip-<i>.png (+ montage.png when ImageMagick is there)
@@ -200,8 +200,8 @@ case "$STEP" in
     t="${1:-0}"
     umove "$VIEWER" "tile.$t"; sleep 0.5
     if [[ "$(UI_DUMP="$SCRATCH/ui$VIEWER.txt" dump_get "stats.$t")" != 1 ]]; then
-      uclick "$VIEWER" "tool.$t.more"; sleep 0.4
-      uclick "$VIEWER" menu.Show_stats_on_the_stream; sleep 0.3
+      uclick "$VIEWER" ctl.layout; sleep 0.4             # "Show stats" is one checkbox of the Layout menu (all streams)
+      uclick "$VIEWER" menu.show_stats; sleep 0.3
       "$SELF_DIR/hs-drive.sh" key "$VIEWER" -k Escape; sleep 0.3
       umove "$VIEWER" "tile.$t"; sleep 0.5
     fi

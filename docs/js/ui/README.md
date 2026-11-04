@@ -33,7 +33,7 @@ all paths relative so GitHub Pages can serve `docs/` under `/simple-screensharin
 * **Fan-out is done in the UI.** The core shares one stream into one room per `startShare()`. A capture going to several
   rooms gets track clones and one `startShare` per room (own encoder, own key), like native ("each extra room is a separate
   encoded + encrypted stream").
-* **Live edits.** Bitrate applies in place (`ShareHandle.setBitrate`). Framerate, codec and preset cannot change on a
+* **Live edits.** Bitrate applies in place (`ShareHandle.setBitrate`). Framerate, codec, preset, encoding mode and keyframe interval cannot change on a
   running WebCodecs share, so the destination restarts (new share first, then the old one stops); the modal says so.
 * **Resume after reconnects.** A reconnect gives the sharer a fresh ConnId and therefore a new stream key, which ends the
   watch. The core cannot tell that from a stop + restart, so the UI remembers ended watches for 60 s, keyed by the core's

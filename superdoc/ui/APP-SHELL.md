@@ -115,7 +115,7 @@ call, not in side panels.
     (`StageState::views`, UI-private, per session, **not persisted**). It is never pruned, so a stream that comes
     back keeps its place. The layout choice and the two options sit in `Shell::stage` (`StageSettings`) because the
     Layout menu is another screen: `UiAction::SetStageLayout { view, layout }`, `SetHideOwnStreams`,
-    `SetAlwaysShowNames`; `Cx::stage_view()` / `Cx::stage_layout()` read them.
+    `SetAlwaysShowNames`, `SetShowStats`; `Cx::stage_view()` / `Cx::stage_layout()` read them.
   - **Resize bars (Split, Crop):** with the pointer between streams, **including the black space around a
     picture**, every bar shows dark grey (`BORDER`); over a stream they hide; the bar under the pointer is blue
     (`ACCENT`) and stays blue for the whole drag, the others hide. A bar sits **midway between the two visible
@@ -151,18 +151,23 @@ call, not in side panels.
   Then: the **name tag** at the top left (`[icon][name][· label]`, the icon is the audio status: `volume_up` audible,
   `volume_off` muted or none) and three round buttons at the top right, **Pop out**, **Fullscreen** and `⋯`.
   **"Always show names"** (Layout menu) keeps the tag without hovering; the buttons and the stats never stay. **Show
-  stats on the stream** (stream menu, per stream) adds `res · fps · rate` to the tag **while hovered**, in slots reserved
+  stats** (Layout menu, ONE switch for every watched stream, `StageSettings::show_stats`, off until switched on, not
+  persisted, `UiAction::SetShowStats`; dump rect `menu.show_stats`) adds `res · fps · rate` to the tag **while hovered**
+  (it does not ride on "Always show names"), in slots reserved
   for `9999×9999`, `999 fps` and `99.9 Mbps` (`tile::RESERVE`), so the pill is exactly as wide as its content and never
   jitters as a number gains a digit; its tooltip keeps what the old statbar's had (decoded vs shown fps, codec and decoder,
   dropped). A narrow tile drops the resolution, then the bitrate (`tile::stats_fields`). A green ring on the picture
   means the stream's shared audio is audible. Double-click a watched tile = fullscreen (below). *Why no audio pill and
-  no Stop button on the tile any more:* the replica puts volume, level loudness, stats and Stop watching in the stream
+  no Stop button on the tile any more:* the replica puts volume, level loudness and Stop watching in the stream
   menu, so the picture stays clean (user, D1: "a stream's buttons and stats show only while it is hovered").
+  *Why Show stats moved from the stream menu to the Layout menu (2026-11-04):* the user: ""Show stats on the stream"
+  should be inside of the "LAYOUT" dropdown and not per individual stream." The tag's numbers are a view choice like
+  names and own streams, not a property of one stream; the per-stream set (`StageState::stats`) is gone.
 - **The stream menu** (`stage/menus.rs::tile_menu`, `PopoverKind::Tile(ItemId)`): the `⋯` button or a **right click on any
   tile** opens it (anchored to the button or the pointer). Header (avatar, who, `label · size`, or `label · room` in
   Watched); for a watched stream with audio a Volume row `[mute][slider 0-500 %][pct]` and the **Level loudness** switch
-  (the global setting, same action as Settings), else "No audio in this stream"; **Show stats on the stream**; Pop out,
-  Fullscreen, Stop watching. An unwatched tile's menu is Watch stream / Pop out; an audio-only sender's Listen and,
+  (the global setting, same action as Settings), else "No audio in this stream"; Pop out,
+  Fullscreen, Stop watching (no stats row: it is the Layout menu's). An unwatched tile's menu is Watch stream / Pop out; an audio-only sender's Listen and,
   while listening, the volume row; your own tile's Stream settings… / Stop sharing. **Volume acts during the drag**
   (`tile_volume_slider` pushes `SetVolume` on every change, #135; D1) and **scrolling on the slider** moves it 5 % a notch
   up to 200 %, 10 % above (`ui::volume_slider`, `wheel_step`, #113), here and in the pop-out. *Why the exception to "local
@@ -212,7 +217,7 @@ arrow opens **only** the camera list (name and `/dev/video0` under it, the curre
 mode) and "All webcam settings…" (`share::webcam_menu`, `BarMenu::Webcam`). It is disabled with the reason as its tooltip
 when there is no `v4l2src` plugin, no camera ("Looking for cameras…" while the first listing runs) or off Linux, and a
 running webcam lights it green. Layout menu: Split / Crop / Floating (two-line items), **Webcam in picture** (per view),
-Always show names, Hide my own streams (removes your screen and webcam, in-picture webcam included, from your stage only,
+Always show names, **Show stats** (numbers on every stream's name tag while hovered), Hide my own streams (removes your screen and webcam, in-picture webcam included, from your stage only,
 others still see them), Reset sizes and positions (also forgets the PIP spots and sizes). Room settings menu: header, Auto-connect, Rename, Copy invite link, Leave room, Forget room (the modals
 the old header used). Bar layout and narrow windows: see "Narrow windows".
 
@@ -375,7 +380,7 @@ re-derive the split every frame and silently break when content height changes.
 | `share.rs` | the bar's Share screen and Share audio dropdown bodies, level-meter taps, "Also send to / Move to" lists (`RoomTargets`), pills, formatting, popover rows shared with the stream-settings modal (this was `action_bar.rs`) |
 | `sidebar.rs` | brand band, body (Watched streams well, ROOMS heading, rooms well with sharer sub-rows, Create-or-join), user band (avatar, "Live in N rooms" / "Not sharing" -> Outgoing popover, settings gear) |
 | `room.rs` | `show_header` (title, pill, meta; `⋯` for rooms with no stage), `show_stage` (the stage region), `show_body` (welcome, disconnected, connecting, reconnecting: banner, empty states) |
-| `stream_settings.rs` | the stream-settings modal (staged "Set up your stream", live "Stream settings"), width 1120 |
+| `stream_settings.rs` | the stream-settings modal (staged "Set up your stream", live "Stream settings"), width 1120. Video card: FPS, Preset, **Encoding** (Performance / Quality segments) and **Keyframe** (select 250 / 500 / 1000 / 2000 ms), caption; see "Video card: Encoding and Keyframe" |
 | `modals.rs` | create/join, app settings, leave / forget confirm, rename, choose-your-name |
 | `popout.rs` | pop-out viewer windows: one deferred viewport per popped stream |
 | `tests.rs` | session-model lookups, bandwidth wiring, shell geometry (`shell_regions_match_the_spec_sizes`), nav/action behaviour |
@@ -483,6 +488,20 @@ exe file itself (Explorer, shortcuts) has no embedded icon resource: that needs 
 resource compiler (`winresource`/`embed-resource` + an `.ico`), not added.
 
 **Note (2026-11-04, plan D8):** the preset, tuning and "Advanced" paragraphs of #90-#95 below describe the state of 2026-11-01. Since then the presets are **Text / Quality / Gaming** (they set the FPS once, the encoder mode and the keyframe interval), the Advanced tuning rows and the Balanced / Low-Latency presets are gone, and the modal's right-hand cards are Compression and Video (`features/stream-control.md` "Presets", `STYLING-GUIDE.md` "Stream settings and webcam"). The reasons below (hide what does nothing) still apply.
+
+**Video card: Encoding and Keyframe (2026-11-04).** Under Preset the Video card shows the two values a preset sets besides the FPS:
+**Encoding** (`widgets::segmented`, Performance | Quality, `ui.stream.ql_*`; dump rects `quality.0` / `quality.1`, value `quality`) and
+**Keyframe** (`menu::select`, 250 / 500 / 1000 / 2000 ms, `GOP_OPTIONS`; a stored interval outside the list is listed as it is; dump rect `gop`,
+values `gop`, `gop_options`). Both edit `NextStream.quality_level` / `gop_millis` through the same `target.action` as the FPS (staged:
+`SetNextStream`; live: `EditDestination`, which rebuilds the branch; the head's "Applying" pill shows). A preset sets all of them at once
+(`ApplyPresetToDestination` / `ApplyPresetToNextStream`); editing one by hand so that no preset matches leaves **no preset lit**, because
+`EncoderTuning::preset` compares quality level plus keyframe interval only. The caption stays and never says "(custom)". The webcam's
+fixed Performance / 2000 ms stays fixed (its modal has no such rows). Tooltips: Keyframe says a shorter interval recovers faster after a lost
+packet or fast motion but costs bitrate (row 129 measures keyframe lag spikes).
+*Why:* the user, after the presets replaced the Advanced rows: "The settings for the keyframe and the Performance/Quality setting should still
+be shown (right now only accessible through the presets Text/Quality/Gaming itself)." *Why a select and not the old 250-4000 ms slider:* the
+presets use 250 and 1000, the webcam 2000, and the useful range is a handful of steps; a dropdown is one row, matches FPS above it, and
+keeps the card's height.
 
 **The stream-settings modal shows only controls that change the encode** (2026-11-01, task #90, user:
 "Keep the [Tune] setting. But make sure to not show settings, if they wouldn't do anything!").

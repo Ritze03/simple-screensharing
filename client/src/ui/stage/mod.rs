@@ -24,9 +24,9 @@
 //!   their own order, grid, window rects and z-order. Streams are keyed by [`ItemId`] (room handle + owner
 //!   name + label), not by `ConnId`/`StreamId`, so a reconnect keeps the layout. **A person is a connection**
 //!   (room + `ConnId`, [`Item::conn`]): whose a stream is never goes by the name, see [`ItemId`]. The layout choice and the
-//!   two stage options live in [`StageSettings`] (`Shell::stage`), because the Layout menu and the tiles read
+//!   stage options live in [`StageSettings`] (`Shell::stage`), because the Layout menu and the tiles read
 //!   them through [`UiAction::SetStageLayout`], [`UiAction::SetHideOwnStreams`] and
-//!   [`UiAction::SetAlwaysShowNames`].
+//!   [`UiAction::SetAlwaysShowNames`] and [`UiAction::SetShowStats`].
 //!
 //! # Input and bars
 //! Every tile is a `Sense::click_and_drag` widget registered in draw order, so with overlapping floating
@@ -99,6 +99,8 @@ pub struct StageSettings {
     pub hide_own: bool,
     /// "Always show names": the name tag of a watched stream shows without hovering.
     pub always_names: bool,
+    /// "Show stats": every watched stream's name tag carries its numbers while it is hovered (D1). Off until switched on.
+    pub show_stats: bool,
     /// "Webcam in picture" is on for these stages (per view, off until switched on): a webcam sits inside its
     /// owner's screen share ([`pip_pairs`]).
     pip: HashSet<StageView>,
@@ -181,8 +183,6 @@ pub struct StageState {
     pub(super) strip_hidden: bool,
     /// Stages shown in their own window ([`show_windows`]); the main window shows a note for these.
     pub(super) popped: HashSet<StageView>,
-    /// "Show stats on the stream" is on for these watched streams.
-    pub(super) stats: HashSet<StreamKey>,
     /// Fullscreen auto-hide state of the chrome ([`chrome`]); `None` outside fullscreen.
     chrome: Option<chrome::Chrome>,
     /// Level meters of the audio dropdown ([`super::share::sync_level_taps`]).
@@ -394,11 +394,11 @@ fn draw_arena(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, view: &StageView, i
         let r = r.intersect(Rect::from_min_max(pos2(f32::MIN, f32::MIN), pos2(f32::MAX, chrome_top)));
         if r.is_positive() { r } else { Rect::from_min_size(r.min, vec2(0.0, 0.0)) }
     };
-    let (hide_own, always_names) = (cx.shell.stage.hide_own, cx.shell.stage.always_names);
+    let (hide_own, always_names, show_stats) = (cx.shell.stage.hide_own, cx.shell.stage.always_names, cx.shell.stage.show_stats);
     let layout = cx.shell.stage.layout(view);
     let pip_on = cx.shell.stage.pip(view);
     let cxr: &Cx = cx;
-    let StageState { views, drag, stats, .. } = st;
+    let StageState { views, drag, .. } = st;
     let geom = views.entry(view.clone()).or_default();
     for it in items {
         if !geom.order.contains(&it.id) {
@@ -561,7 +561,7 @@ fn draw_arena(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, view: &StageView, i
             round: if float { 0 } else { 8 },
             hovered: hover == Some(i) && !dragging && hover_ok && menu_ok(cxr, &it.id),
             always_names,
-            stats: matches!(&it.kind, Kind::Video(k) if stats.contains(k)),
+            stats: show_stats,
             cross_room: matches!(view, StageView::Watched),
             id: it.id.clone(),
         };

@@ -78,7 +78,7 @@ function tileEl(it, view, key, arena) {
   const audioOnly = kind === "audio";
   const hasAudio = !mine && !!w && !it.cam && r.hasAudio(it.s.owner); // a webcam brings no audio
   const audible = (hasAudio || (audioOnly && !!w)) && !w.muted;
-  const stats = !!w && !audioOnly && S.stage.stats.has(it.id);
+  const stats = !!w && !audioOnly && S.stage.showStats;
   const open = S.menu && S.menu.kind === "tile" && S.menu.itemId === it.id;
   const label = cross ? `${it.label} · ${r.name}` : it.label;
   const tile = h("div", {

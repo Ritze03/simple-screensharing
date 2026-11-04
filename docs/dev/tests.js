@@ -18,7 +18,7 @@ import * as G from "../js/ui/stage-geom.js";
 import { pipPairs, shareLabel, peopleOf, numberIdentical } from "../js/ui/stage-state.js";
 import { isWebcamLabel } from "../js/core/room-client.js";
 import { CHROME_IDLE_MS, chromeRemaining, chromeStart, chromeStep } from "../js/ui/chrome.js";
-import { loadSettings } from "../js/ui/store.js";
+import { loadSettings, presetOf, encoderOf } from "../js/ui/store.js";
 import { Gate, MIN_GAP_MS, RESUME_QUIET_MS, RoomSounds, SOUNDS, SOUND_NAMES, soundPlan } from "../js/ui/sounds.js";
 import { DICT } from "../js/ui/i18n.js";
 import { AudioReceiver, MAX_VOLUME } from "../js/core/audio.js";
@@ -2084,6 +2084,25 @@ test("avatars: the picker takes the last emoji of a text as one grapheme (a flag
 });
 
 // ------------------------------------------------------------------------------------------------ presets in the UI settings (I6)
+
+test("settings: the encoding mode and keyframe interval are stored next to the preset; the preset is whichever one matches both", () => {
+  const key = "sss.settings.v1";
+  const before = localStorage.getItem(key);
+  try {
+    eq([presetOf("quality", 250), presetOf("quality", 1000), presetOf("realtime", 250), presetOf("realtime", 1000), presetOf("quality", 500)], ["text", "quality", "gaming", "", ""], "presetOf");
+    eq(encoderOf({ preset: "gaming" }), { latencyMode: "realtime", gopMs: 250 }, "an older config has only its preset");
+    eq(encoderOf({ preset: "", latencyMode: "quality", gopMs: 500 }), { latencyMode: "quality", gopMs: 500 }, "a hand-made pair");
+    localStorage.setItem(key, JSON.stringify({ stream: { preset: "gaming" } }));
+    eq([loadSettings().stream.latencyMode, loadSettings().stream.gopMs, loadSettings().stream.preset], ["realtime", 250, "gaming"], "an old file: the preset fills both");
+    localStorage.setItem(key, JSON.stringify({ stream: { preset: "", latencyMode: "realtime", gopMs: 2000 } }));
+    eq([loadSettings().stream.latencyMode, loadSettings().stream.gopMs, loadSettings().stream.preset], ["realtime", 2000, ""], "a hand-made pair loads as it is, no preset");
+    localStorage.setItem(key, JSON.stringify({ stream: { preset: "text", latencyMode: "bogus", gopMs: -5 } }));
+    eq([loadSettings().stream.latencyMode, loadSettings().stream.gopMs, loadSettings().stream.preset], ["quality", 250, "text"], "garbage falls back to the preset's values");
+  } finally {
+    if (before == null) localStorage.removeItem(key);
+    else localStorage.setItem(key, before);
+  }
+});
 
 test("settings: a stored balanced or low_latency preset loads as quality, quality/text/gaming are kept", () => {
   const key = "sss.settings.v1";

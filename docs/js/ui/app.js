@@ -4,8 +4,8 @@
 // images) by moving them into the new tree. Numbers that change every second (fps, kbps, meters) are patched in
 // place instead of re-rendering, so sliders and hovers are never interrupted.
 
-import { capabilities, createRoom, parseJoinLink, parseServerAddr, base64urlDecode, probeEncoders, ENCODER_PRESETS } from "../core/index.js";
-import { S, onInvalidate, invalidate, toast, persistSettings, persistRooms, loadRooms, autoName, displayName } from "./store.js";
+import { capabilities, createRoom, parseJoinLink, parseServerAddr, base64urlDecode, probeEncoders } from "../core/index.js";
+import { S, onInvalidate, invalidate, toast, persistSettings, persistRooms, loadRooms, autoName, displayName, encoderOf } from "./store.js";
 import { t, setLang, getLang } from "./i18n.js";
 import {
   h, ic, T, V, H, SL, FILL, pct, ctrlRow, valBox, sliderRow, seg, cbx, card, roomRow, sharerRow, destRow, btnRow, emptyState,
@@ -26,7 +26,7 @@ import { SOUND_NAMES, SoundOut } from "./sounds.js";
 import { WATCHED, roomView, viewKey, viewOf, vg, watchFps, collect } from "./stage-state.js";
 import { fullscreenPip } from "./pip.js";
 import { renderStage, renderPoppedNote, afterRender, isDragging, bindWindow, overlays, toggleStageFullscreen } from "./stage.js";
-import { opener, selectField, FPS_LIST, PRESET_ORDER, presetLabel, presetCaption } from "./menus.js";
+import { opener, selectField, FPS_LIST, PRESET_ORDER, presetLabel, presetCaption, presetPatch, encoderPatch, gopChoices } from "./menus.js";
 
 const caps = capabilities();
 const CODECS = [["h264", "H.264"], ["av1", "AV1"], ["h265", "H.265"]];
@@ -474,12 +474,17 @@ function renderStreamModal(M, close) {
       : ctrlRow(t("ui.stream.bitrate"), h("span", { class: "ro txt", style: "width:100%;text-align:right", text: t("ui.stream.set_by_budget") }), valBox(String(staged ? Math.max(bw.floor, Math.round(bw.total / Math.max(1, n) / 100) * 100) : allocated(d))), t("ui.stream.budget_tip")));
 
   // Video: FPS (a dropdown in the app's own menu style), the preset and what it sets. A preset sets the FPS once; changing the FPS afterwards
-  // keeps its encoding mode and keyframe interval, so the caption is always "fps · mode · keyframe", never "(custom)".
+  // keeps its encoding mode and keyframe interval, so the caption is always "fps · mode · keyframe", never "(custom)". Encoding and Keyframe
+  // are fields too: editing one by hand so that no preset matches leaves no preset lit (the preset is derived from the pair).
+  const enc = encoderOf(d);
+  const gopSel = selectField({ id: "st-gop", opts: gopChoices(d), cur: enc.gopMs, onPick: (v) => edit(encoderPatch(d, { gopMs: Number(v) })), title: t("ui.stream.keyframe_tip") });
   const fpsSel = selectField({ id: "st-fps", opts: FPS_LIST.map((f) => [f, t("ui.stream.fps", { fps: f })]), cur: d.fps, onPick: (v) => edit({ fps: Number(v) }), title: t("share.framerate_label") });
   const video = card(t("ui.stream.video"), null,
     ctrlRow(t("ui.stream.fps_label"), fpsSel, undefined, null, "st-fps"),
-    ctrlRow(t("ui.stream.preset"), seg(PRESET_ORDER.map((p) => [p, presetLabel(p)]), d.preset, (v) => edit({ preset: v, fps: ENCODER_PRESETS[v].fps }))),
-    H({ g: 2 }, SL(LABEL_W, null), FILL(h("span", { class: "cap", id: "preset-cap", text: presetCaption(d.preset, d.fps) }))));
+    ctrlRow(t("ui.stream.preset"), seg(PRESET_ORDER.map((p) => [p, presetLabel(p)]), d.preset, (v) => edit(presetPatch(v)))),
+    ctrlRow(t("ui.stream.encoding"), seg([["realtime", t("ui.stream.ql_performance")], ["quality", t("ui.stream.ql_quality")]], enc.latencyMode, (v) => edit(encoderPatch(d, { latencyMode: v }))), undefined, t("ui.stream.encoding_tip")),
+    ctrlRow(t("ui.stream.keyframe"), gopSel, undefined, t("ui.stream.keyframe_tip"), "st-gop"),
+    H({ g: 2 }, SL(LABEL_W, null), FILL(h("span", { class: "cap", id: "preset-cap", text: presetCaption(d) }))));
 
   const body = H({ g: 3, cls: "st", style: "align-items:flex-start" },
     V({ cls: "eq", g: 3 }, source, dests, bwCard),

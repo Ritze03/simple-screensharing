@@ -75,7 +75,7 @@ Settings controls (`sound.volume`, `sound.test.*`, `sound_volume`) are dumped on
 | `win.N`, `grip.N` | floating window and its corner handle |
 | `tool.N.more\|fs\|pop\|settings`, `tag.N`, `watch.N` (`uclick .. watch.0 L40` = Watch stream); `stats.N` | a tile's hover buttons (only while shown), name tag, idle button row |
 | `ctl.share\|audio\|webcam\|layout\|room` and `.arrow`, `ctl.people\|leave\|sidebar\|invite\|pop\|fs`, `ctl.group.X` | the control bar |
-| `menu`, `menu.LABEL` (spaces become `_`), `menu.always_names`, `menu.hide_own`, `menu.volume`, `menu.mute`; `volume` | the open menu and its rows; the volume row and its value |
+| `menu`, `menu.LABEL` (spaces become `_`), `menu.always_names`, `menu.show_stats`, `menu.hide_own`, `menu.volume`, `menu.mute`; `volume` | the open menu and its rows; the volume row and its value |
 | `opt.I` | row I of an open dropdown (`menu::select`) |
 | `strip.NAME` (`strip.you`; `strip.NAME~2` is the second person of that name), `strip.NAME.live`; `person NAME streams N popped N ring 0\|1`; `cardof NAME rows N` | avatars and LIVE badges; one `cardof` line per open hover card |
 | `card`, `card.row.I`, `card.back.I`; `cardrow I audio 0\|1 label=..` | the hover card |
@@ -85,7 +85,7 @@ Settings controls (`sound.volume`, `sound.test.*`, `sound_volume`) are dumped on
 | `sound.volume`, `sound.test.join\|leave\|start\|stop`; `sound_volume N` | Settings > Sounds: the volume slider and its value (percent), the four Test buttons |
 | `audio.source`, `audio.boost`, `audio.excl_add`, `audio.excl.I`, `audio.excl.I.remove`, `audio.excl_text`, `audio.excl_add_text`; `boost N`, `excl A\|B` | the audio settings menu (`audio_settings.rs`): source dropdown, Boost slider (percent), the exclusion list (Add button, row I and its remove, the text fields of the Add popover) |
 | `chrome`, `chrome_alpha`, `stage_full W H`, `popover`, `modal`, `stage_fs`, `stream_fs`, `open` | state: fullscreen chrome, open menu / modal, fullscreen, the stream settings modal |
-| `fps`, `fps_options`, `codec.I`, `preset.I`, `change`, `footer`, `bitrate`, `mode`, `ready`, ... | the stream settings modal (`stream_settings.rs`) |
+| `fps`, `fps_options`, `codec.I`, `preset.I`, `gop` (Keyframe select; value `gop`, `gop_options`), `quality.0\|1` (Encoding segments Performance\|Quality; value `quality`), `change`, `footer`, `bitrate`, `mode`, `ready`, ... | the stream settings modal (`stream_settings.rs`) |
 | `pip.N`, `pip.N.grip` (`pip.fs` in stream fullscreen), `pipinfo N spot=C,R w=.. handle=tl\|tr\|bl\|br who=..`, `menu.pip` | a webcam in picture (task I8): N is its parent's tile index (`pw.` prefix in a popped-out stage); `spot` is column,row 0..2 (`free` only while dragged); the handle is on the corner facing the middle |
 | `webcam.camera`, `webcam.mode`, `webcam.bitrate`, `webcam.footer` (`uclick N webcam.footer L60` = Start / Stop webcam), `webcam_codec.I`, `webcam_modes N`, `webcam_mode KEY`, `webcam camera=.. codec=.. kbps=..` | the webcam modal (`webcam_settings.rs`); the bar button is `ctl.webcam` / `ctl.webcam.arrow`, its menu rows `menu.<camera name>` and `menu.All_webcam_settings…` |
 
