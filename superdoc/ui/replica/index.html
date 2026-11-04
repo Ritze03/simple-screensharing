@@ -701,13 +701,13 @@ const CODECS = ["H.264", "AV1", "H.265"];
 const CAMS = [{ name: "Logitech C920", dev: "/dev/video0", modes: ["MJPG 1920x1080@30", "MJPG 1280x720@60", "YUYV 1280x720@10", "YUYV 640x480@30"] },
   { name: "Integrated Camera", dev: "/dev/video2", modes: ["MJPG 1280x720@30", "MJPG 640x480@30", "YUYV 640x480@30", "YUYV 320x240@30"] }];
 const CAM_ENCODER = "Encoder: Performance · Keyframe 2000 ms";
-/* [name, icon, sub-line, group]. Groups come from what PipeWire tells about a stream (see the plan), so a game run through Proton lands in Games. */
+/* [name, icon, sub-line, group]. Groups come from what PipeWire tells about a stream (see the plan), so anything with a Steam app id lands in Games: it detects that something is a game, not which one. */
 const AUDIO_SRCS = [["No audio", "volume_off", "Only the picture", ""], ["Desktop audio", "desktop_windows", "Everything you hear", ""],
-  ["Skill Up!.exe", "sports_esports", "Proton game", "Games"], ["gamescope (game) output", "sports_esports", "Gamescope", "Games"], ["Minecraft", "sports_esports", "Java game", "Games"], ["cs2", "sports_esports", "Steam game", "Games"],
+  ["Skill Up!.exe", "sports_esports", "Steam game", "Games"], ["gamescope (game) output", "sports_esports", "Gamescope", "Games"], ["java", "sports_esports", "Game", "Games"], ["cs2", "sports_esports", "Steam game", "Games"],
   ["Floorp", "public", "Browser", "Browsers"], ["Chromium", "public", "Browser", "Browsers"], ["Zen", "public", "Browser", "Browsers"],
   ["Spotify", "music_note", "Music player", "Media"], ["mpv", "movie", "Video player", "Media"],
   ["Discord", "forum", "Voice chat", "Voice chat"], ["TeamSpeak", "headset_mic", "Voice chat", "Voice chat"],
-  ["iPhone", "smartphone", "Bluetooth device", "Devices"], ["java", "apps", "App", "Other"]];
+  ["iPhone", "smartphone", "Bluetooth device", "Devices"], ["Some app", "apps", "App", "Other"]];
 /* Rows with a heading each time the group changes. */
 const grouped = (rows, group, draw) => { let last = ""; return rows.map((r) => { const g = group(r), head = g && g !== last ? `<div class="ml">${esc(g)}</div>` : ""; last = g; return head + draw(r); }).join(""); };
 /* Desktop audio exclusion list: text matched against source names, ignoring case. A match stays out of desktop audio and off every source list. */
