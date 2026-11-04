@@ -608,6 +608,7 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 
 /* emoji avatar picker (Settings > Profile) */
 .menu.m-emoji, .menu.m-share, .menu.m-cam { width: 320px; }
+.menu.m-audio, .menu.m-dd, .menu.m-excl { max-height: 620px; overflow-y: auto; }
 .emoji-grid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 2px; padding: 0 4px 6px; }
 .emoji-grid button { aspect-ratio: 1; border: 0; background: transparent; border-radius: 7px; padding: 0; cursor: pointer; font-family: var(--font-emoji); font-size: 20px; line-height: 1; }
 .emoji-grid button:hover { background: var(--wash-hover-1); }
@@ -700,11 +701,19 @@ const CODECS = ["H.264", "AV1", "H.265"];
 const CAMS = [{ name: "Logitech C920", dev: "/dev/video0", modes: ["MJPG 1920x1080@30", "MJPG 1280x720@60", "YUYV 1280x720@10", "YUYV 640x480@30"] },
   { name: "Integrated Camera", dev: "/dev/video2", modes: ["MJPG 1280x720@30", "MJPG 640x480@30", "YUYV 640x480@30", "YUYV 320x240@30"] }];
 const CAM_ENCODER = "Encoder: Performance · Keyframe 2000 ms";
-const AUDIO_SRCS = [["No audio", "volume_off", "Only the picture"], ["Desktop audio", "desktop_windows", "Everything you hear"], ["Spotify", "music_note", "App"], ["Floorp", "public", "App · browser"], ["mpv", "movie", "App · video player"], ["Discord", "forum", "App · voice chat"], ["TeamSpeak", "headset_mic", "App · voice chat"]];
+/* [name, icon, sub-line, group]. Groups come from what PipeWire tells about a stream (see the plan), so a game run through Proton lands in Games. */
+const AUDIO_SRCS = [["No audio", "volume_off", "Only the picture", ""], ["Desktop audio", "desktop_windows", "Everything you hear", ""],
+  ["Skill Up!.exe", "sports_esports", "Proton game", "Games"], ["gamescope (game) output", "sports_esports", "Gamescope", "Games"],
+  ["Floorp", "public", "Browser", "Browsers"], ["Chromium", "public", "Browser", "Browsers"], ["Zen", "public", "Browser", "Browsers"],
+  ["Spotify", "music_note", "Music player", "Media"], ["mpv", "movie", "Video player", "Media"],
+  ["Discord", "forum", "Voice chat", "Voice chat"], ["TeamSpeak", "headset_mic", "Voice chat", "Voice chat"],
+  ["iPhone", "smartphone", "Bluetooth device", "Devices"]];
+/* Rows with a heading each time the group changes. */
+const grouped = (rows, group, draw) => { let last = ""; return rows.map((r) => { const g = group(r), head = g && g !== last ? `<div class="ml">${esc(g)}</div>` : ""; last = g; return head + draw(r); }).join(""); };
 /* Desktop audio exclusion list: text matched against source names, ignoring case. A match stays out of desktop audio and off every source list. */
 const isExcluded = (n) => n !== "No audio" && n !== "Desktop audio" && S.audioExcl.some((x) => n.toLowerCase().includes(x.toLowerCase()));
 const audioSources = () => AUDIO_SRCS.filter(([n]) => !isExcluded(n));
-const audioRows = () => audioSources().map(([n, icon, sub]) => [n, n, sub, icon]);
+const audioRows = () => audioSources().map(([n, icon, sub, group]) => [n, n, sub, icon, group]);
 
 /* ============================== presets (the nav's views) ============================== */
 const STAGE = [
@@ -1216,7 +1225,7 @@ function camMenu() {
 }
 function audioMenu() {
   const cur = S.audioOn ? S.audioSrc : "No audio";
-  return `<div class="ml">Audio source</div>${audioSources().map(([n, icon, sub]) => `<button type="button" class="mi two${cur === n ? " on" : ""}" data-act="asrc:${esc(n)}">${ic(icon)}<span class="t">${esc(n)}<small>${n === "Desktop audio" && S.audioExcl.length ? `Everything you hear, minus ${S.audioExcl.length} excluded` : sub}</small></span>${cur === n ? ic("check", "chk") : ""}</button>`).join("")}
+  return `<div class="ml">Audio source</div>${grouped(audioSources(), (r) => r[3], ([n, icon, sub]) => `<button type="button" class="mi two${cur === n ? " on" : ""}" data-act="asrc:${esc(n)}">${ic(icon)}<span class="t">${esc(n)}<small>${n === "Desktop audio" && S.audioExcl.length ? `Everything you hear, minus ${S.audioExcl.length} excluded` : sub}</small></span>${cur === n ? ic("check", "chk") : ""}</button>`)}
     <div class="msep"></div>${mi("tune", "All audio settings…", "modal:audio")}`;
 }
 function layoutMenu() {
@@ -1274,8 +1283,8 @@ function emojiMenu() {
     ${mi("text_fields", "Use my initial", "emoji:")}`;
 }
 function ddMenu() {
-  return (DD[S.ddKey] || []).map(([v, label, sub, icon]) => { const on = String(v) === String(S[S.ddKey]);
-    return `<button type="button" class="mi${sub ? " two" : ""}${on ? " on" : ""}" data-act="ddpick:${esc(v)}">${icon ? ic(icon) : ""}<span class="t">${esc(label)}${sub ? `<small>${esc(sub)}</small>` : ""}</span>${on ? ic("check", "chk") : ""}</button>`; }).join("");
+  return grouped(DD[S.ddKey] || [], (r) => r[4], ([v, label, sub, icon]) => { const on = String(v) === String(S[S.ddKey]);
+    return `<button type="button" class="mi${sub ? " two" : ""}${on ? " on" : ""}" data-act="ddpick:${esc(v)}">${icon ? ic(icon) : ""}<span class="t">${esc(label)}${sub ? `<small>${esc(sub)}</small>` : ""}</span>${on ? ic("check", "chk") : ""}</button>`; });
 }
 function ddPick(key, v) {
   S[key] = key === "fps" ? Number(v) : v;
