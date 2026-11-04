@@ -699,7 +699,10 @@ const CODECS = ["H.264", "AV1", "H.265"];
 const CAMS = [{ name: "Logitech C920", dev: "/dev/video0", modes: ["MJPG 1920x1080@30", "MJPG 1280x720@60", "YUYV 1280x720@10", "YUYV 640x480@30"] },
   { name: "Integrated Camera", dev: "/dev/video2", modes: ["MJPG 1280x720@30", "MJPG 640x480@30", "YUYV 640x480@30", "YUYV 320x240@30"] }];
 const CAM_ENCODER = "Encoder: Performance · Keyframe 2000 ms";
-const AUDIO_SRCS = [["No audio", "volume_off", "Only the picture"], ["Desktop audio", "desktop_windows", "Everything you hear"], ["Spotify", "music_note", "App"], ["Floorp", "public", "App · browser"], ["mpv", "movie", "App · video player"]];
+const AUDIO_SRCS = [["No audio", "volume_off", "Only the picture"], ["Desktop audio", "desktop_windows", "Everything you hear"], ["Spotify", "music_note", "App"], ["Floorp", "public", "App · browser"], ["mpv", "movie", "App · video player"], ["Discord", "forum", "App · voice chat"], ["TeamSpeak", "headset_mic", "App · voice chat"]];
+/* Desktop audio exclusion list: text matched against source names, ignoring case. A match stays out of desktop audio and off every source list. */
+const isExcluded = (n) => n !== "No audio" && n !== "Desktop audio" && S.audioExcl.some((x) => n.toLowerCase().includes(x.toLowerCase()));
+const audioSources = () => AUDIO_SRCS.filter(([n]) => !isExcluded(n));
 
 /* ============================== presets (the nav's views) ============================== */
 const STAGE = [
@@ -739,7 +742,7 @@ const S = Object.assign({
   addTab: "join", vol: 100, muted: false, level: true, fps: 60, kbps: 8000, codec: "H.264", preset: "Quality",
   camRoom: null, camName: CAMS[0].name, camMode: CAMS[0].modes[0], camCodec: "H.264", camKbps: 2500,
   bwMode: "per", lang: "English", presentation: "Mailbox (default)", jitter: 2000, catchup: 5, boost: 100,
-  diag: false, muteShared: false, size: "1920x1080", pin: false, spin: false, myEmoji: "", soundVol: 50,
+  diag: false, muteShared: false, size: "1920x1080", pin: false, spin: false, myEmoji: "", soundVol: 50, audioExcl: ["Discord"],
 }, STAGE_DEFAULTS());
 const D = () => DATA[S.data];
 /* "sharerSelf": the presets that show your own share (rig: you are client-1, the only sharer). */
@@ -1203,7 +1206,7 @@ function camMenu() {
 }
 function audioMenu() {
   const cur = S.audioOn ? S.audioSrc : "No audio";
-  return `<div class="ml">Audio source</div>${AUDIO_SRCS.map(([n, icon, sub]) => `<button type="button" class="mi two${cur === n ? " on" : ""}" data-act="asrc:${esc(n)}">${ic(icon)}<span class="t">${esc(n)}<small>${sub}</small></span>${cur === n ? ic("check", "chk") : ""}</button>`).join("")}`;
+  return `<div class="ml">Audio source</div>${audioSources().map(([n, icon, sub]) => `<button type="button" class="mi two${cur === n ? " on" : ""}" data-act="asrc:${esc(n)}">${ic(icon)}<span class="t">${esc(n)}<small>${n === "Desktop audio" && S.audioExcl.length ? `Everything you hear, minus ${S.audioExcl.length} excluded` : sub}</small></span>${cur === n ? ic("check", "chk") : ""}</button>`).join("")}`;
 }
 function layoutMenu() {
   return `<div class="ml">Layout</div>${LAYOUTS.map(([k, icon, n, sub]) => `<button type="button" class="mi two${V().layout === k ? " on" : ""}" data-act="layout:${k}">${ic(icon)}<span class="t">${n}<small>${sub}</small></span>${V().layout === k ? ic("check", "chk") : ""}</button>`).join("")}
@@ -1260,7 +1263,7 @@ function emojiMenu() {
     ${mi("text_fields", "Use my initial", "emoji:")}`;
 }
 function renderMenu() {
-  const f = { share: shareMenu, audio: audioMenu, cam: camMenu, layout: layoutMenu, room: roomMenu, ctx: ctxMenu, emoji: emojiMenu }[S.menu];
+  const f = { share: shareMenu, audio: audioMenu, cam: camMenu, layout: layoutMenu, room: roomMenu, ctx: ctxMenu, emoji: emojiMenu, excl: exclMenu }[S.menu];
   const body = f ? f() : "";
   return body ? `<div class="menu m-${S.menu}" id="menu" role="menu">${body}</div>` : "";
 }
@@ -1284,6 +1287,11 @@ function placeMenu() {
   m.style.top = Math.max(8, Math.min(y, fh - mh - 8)) + "px";
   const f = m.querySelector("#room-rename");
   if (f) { f.focus(); f.select(); }
+}
+function addExcl(text) {
+  if (!text || S.audioExcl.some((x) => x.toLowerCase() === text.toLowerCase())) return;
+  S.audioExcl.push(text);
+  if (isExcluded(S.audioSrc)) S.audioSrc = S.audioOn ? "Desktop audio" : "No audio"; /* the app you were sharing just went on the list */
 }
 const closeMenu = () => Object.assign(S, { menu: null, ctx: null, roomCtx: null, roomEdit: null, forgetAsk: false });
 function toast(msg, icon = "check_circle") {
@@ -1483,7 +1491,7 @@ function streamModal() {
   const r = roomById(D().meRoom);
   const source = card("Source", null,
     ctrlRow("Screen", `<span class="txt ro">Screen share · 1920×1080</span>`, `<button type="button" class="btn btn-secondary wide" data-act="chsrc">Change</button>`) +
-    ctrlRow("Audio", select("audioSrc", AUDIO_SRCS.map((a) => a[0])), `<span class="val center">${meter(0)}</span>`) +
+    ctrlRow("Audio", select("audioSrc", audioSources().map((a) => a[0])), `<span class="val center">${meter(0)}</span>`) +
     ctrlRow(null, cbx("muteShared", "Mute shared audio", true)));
   const dest = `<div class="hb g2 destrow cur">${SL(18, ic("radio_button_checked", "ico"))}${FILL(`<span class="txt name">${esc(r.name)}<small>this room</small></span>`)}
     ${SL(84, staged ? `<span class="badge badge-muted">Not live</span>` : pillLive(false), "l", true)}${SL(76, `<span class="kbps">${staged ? "—" : S.kbps + " kbps"}</span>`, "r")}
@@ -1504,6 +1512,17 @@ function streamModal() {
     : `<button type="button" class="btn btn-danger btn-lg" data-act="stop">${ic("stop_screen_share")}Stop sharing in ${esc(r.name)}</button>${FILL("")}<span class="hb g1 note">${ic("check_circle")}Saved</span><button type="button" class="btn btn-primary btn-lg" data-act="close">Done</button>`;
   return shell("xwide", staged ? "Set up your stream" : "Stream settings", staged ? `Screen share · goes live in ${esc(r.name)}` : `Live in ${esc(r.name)} · changes apply right away`, body, foot);
 }
+function exclRows() {
+  const rows = S.audioExcl.map((x) => `<div class="hb g2 destrow">${SL(18, ic("volume_off", "ico"))}${FILL(`<span class="txt name">${esc(x)}</span>`)}${SL(32, `<button type="button" class="icon-btn sm" title="Remove" aria-label="Remove ${esc(x)}" data-act="exclrm:${esc(x)}">${ic("close")}</button>`)}</div>`).join("");
+  return `<div class="hb g2 crow">${SL(120, `<span class="lbl">Exclude${tipIc("Any source whose name contains this text, ignoring case")}</span>`, "l")}${FILL(`<span class="txt cap">Left out of desktop audio and hidden from the source list</span>`)}
+    <button type="button" class="btn btn-secondary" data-menu="excl" data-anchor="excl">${ic("add")}Add</button></div>${rows ? `<div class="vb g1">${rows}</div>` : ""}`;
+}
+function exclMenu() {
+  const found = AUDIO_SRCS.map((a) => a[0]).filter((n) => n !== "No audio" && n !== "Desktop audio" && !isExcluded(n));
+  return `<div class="ml">Detected audio sources</div>${found.map((n) => mi("volume_up", esc(n), "excladd:" + esc(n))).join("") || `<div class="mrow cap">Every detected source is excluded</div>`}
+    <div class="msep"></div><div class="ml">Or enter a name</div>
+    <div class="mrow"><input class="field" id="excl-in" placeholder="Part of a source name" aria-label="Part of a source name" autocomplete="off"><button type="button" class="btn btn-secondary" data-act="excladdtext">Add</button></div>`;
+}
 function settingsModal() {
   const body = card("Profile", null, ctrlRow("Display name", `<input class="field" id="set-name" value="${esc(me())}" aria-label="Display name">`, undefined, "What friends see in rooms") +
       ctrlRow("Avatar", `<button type="button" class="btn btn-secondary" data-menu="emoji" data-anchor="emoji" title="Pick an emoji for your avatar">${avatar(me(), true)}${emojiOf(me()) ? "Change" : "Pick an emoji"}</button>`, undefined, "An emoji instead of your initial, on the same colour")) +
@@ -1512,7 +1531,7 @@ function settingsModal() {
     card("Playback", null, ctrlRow("Jitter buffer", slider("jitter", 0, 5000, 100), `<span class="val" id="jitter-val">${(S.jitter / 1000).toFixed(1)} s</span>`, "How much delay smooths out the network") +
       ctrlRow("Catch-up speed", slider("catchup", 5, 10, 1), `<span class="val" id="catchup-val">${S.catchup}%</span>`, "How fast playback catches up after a hiccup") +
       ctrlRow("Level loudness", cbx("level", "Even out the volume of what I watch"), undefined, "Viewer-side automatic gain on every watched stream")) +
-    card("Shared audio", null, ctrlRow("Boost", slider("boost", 0, 200, 5), `<span class="val" id="boost-val">${S.boost}%</span>`, "Trim the shared audio before it is sent")) +
+    card("Shared audio", null, ctrlRow("Boost", slider("boost", 0, 200, 5), `<span class="val" id="boost-val">${S.boost}%</span>`, "Trim the shared audio before it is sent") + exclRows()) +
     card("Sounds", null, ctrlRow("Volume", slider("soundVol", 0, 100, 5, "", "Sound volume"), `<span class="val" id="sound-val">${S.soundVol}%</span>`, "How loud these sounds are, separate from any stream") +
       Object.entries(SOUNDS).map(([k, x]) => `<div class="hb g2 crow">${FILL(`<span class="lbl">${x.label}</span>`)}<button type="button" class="btn btn-secondary" data-act="sound:${k}">${ic("play_arrow")}Test</button></div>`).join("")) +
     card("Diagnostics", null, ctrlRow("Logs", `<div class="hb g2" style="width:100%">${FILL(`<button type="button" class="btn btn-secondary wide">Copy to clipboard</button>`)}${FILL(`<button type="button" class="btn btn-secondary wide">Save to file…</button>`)}</div>`, undefined, "Recent log lines of this app") +
@@ -1563,7 +1582,7 @@ function render() {
   else if (S.modal === "settings") html += settingsModal();
   else if (S.modal === "add") html += addModal();
   else if (S.modal === "cam") html += camModal();
-  if (!S.modal || S.menu === "emoji") html += renderMenu();
+  if (!S.modal || S.menu === "emoji" || S.menu === "excl") html += renderMenu();
   frame.innerHTML = html;
   tipUser = null;
   frame.querySelectorAll('input[type="range"]').forEach(setPct);
@@ -1609,7 +1628,7 @@ function applyPreset(key) {
 const framePt = (cx, cy) => { const fr = frame.getBoundingClientRect(); return { x: (cx - fr.left) / SCALE, y: (cy - fr.top) / SCALE }; };
 const exitFs = () => { S.view = S.fsBack; };
 const enterFs = (key) => { if (S.view !== "fullscreen") S.fsBack = S.view; Object.assign(S, { fsKey: key, view: "fullscreen" }); };
-const STAY = new Set(["fps", "preset", "pip", "tagsalways", "hideown", "campick", "auto", "rename", "cancel", "forgetask", "mute", "level", "stats"]); /* menu actions that keep the menu open */
+const STAY = new Set(["fps", "preset", "pip", "tagsalways", "hideown", "excladd", "excladdtext", "campick", "auto", "rename", "cancel", "forgetask", "mute", "level", "stats"]); /* menu actions that keep the menu open */
 document.addEventListener("click", (e) => {
   const pre = e.target.closest("[data-preset]");
   if (pre) return applyPreset(pre.dataset.preset);
@@ -1710,6 +1729,9 @@ document.addEventListener("click", (e) => {
     case "tagsalways": S.tagsAlways = !S.tagsAlways; break;
     case "hideown": S.hideOwn = !S.hideOwn; break;
     case "sound": return playSound(arg);
+    case "excladdtext": addExcl(document.getElementById("excl-in")?.value.trim()); break;
+    case "excladd": addExcl(arg); break;
+    case "exclrm": S.audioExcl = S.audioExcl.filter((x) => x !== arg); break;
     case "chsrc": render(); return toast("The system's screen and window picker opens here", "swap_horiz");
     case "audio":
       S.audioOn = !S.audioOn; S.audioSrc = S.audioOn ? "Desktop audio" : "No audio"; /* the button means the whole desktop; a single app is in the arrow's list */
@@ -1748,6 +1770,8 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     if (S.menu) closeMenu(); else if (S.modal) S.modal = null; else if (S.view === "fullscreen") exitFs(); else if (S.stageFs) S.stageFs = false; else return;
     render();
+  } else if (e.key === "Enter" && e.target.id === "excl-in") {
+    e.preventDefault(); frame.querySelector('[data-act="excladdtext"]')?.click();
   } else if (e.key === "Enter" && e.target.id === "emoji-in") {
     e.preventDefault(); closeMenu(); render();
   } else if (e.key === "Enter" && e.target.id === "room-rename") {
