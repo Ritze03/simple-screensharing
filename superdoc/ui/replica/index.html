@@ -467,8 +467,10 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 .tag .lb { color: var(--text-dim); font-weight: 400; overflow: hidden; text-overflow: ellipsis; }
 .tools { position: absolute; right: 8px; top: 8px; z-index: 10; display: flex; gap: 4px; }
 .st-tile:hover .hover-ui { opacity: 1; }
-.st-tile .ovl.stats { padding: 8px; pointer-events: none; z-index: 10; bottom: auto; right: 110px; }
-.st-tile .ovl.stats .statbar { align-self: flex-start; }
+/* the name bar sits at the top left, clear of the tools on the right; with stats on it also carries the numbers */
+.st-tile .tag { top: 8px; bottom: auto; max-width: calc(100% - 128px); }
+.tag .v { flex: 0 0 auto; font-family: var(--font-mono); font-variant-numeric: tabular-nums; font-size: var(--fs-small); font-weight: 400; color: var(--ovl-num); }
+.tag.stats .v::before { content: "·"; margin-right: 6px; color: var(--text-faint); }
 @container (max-height: 200px) { .st-tile .invite > :not(.btn) { display: none; } }
 .rz { position: absolute; right: 0; bottom: 0; width: 20px; height: 20px; z-index: 11; cursor: nwse-resize; display: none;
   background: linear-gradient(135deg, transparent 0 55%, var(--text-dim) 55% 61%, transparent 61% 72%, var(--text-dim) 72% 78%, transparent 78%); }
@@ -1106,15 +1108,17 @@ function stTile(it, combined, cam) {
   const pic = mine && !s.cam ? `<div class="mine-pic">${ic("cast")}<span>Your screen · live</span></div>` : screenPic(s.pic);
   const tagIc = s.cam ? ic("videocam", mine ? "live" : "") : mine ? ic("cast", "live") : !s.audio ? ic("volume_off") : muted ? ic("volume_off", "off") : ic("volume_up");
   const lb = esc(combined ? `${s.label} · ${r.name}` : s.label);
-  const tag = `<span class="tag${S.tagsAlways ? "" : " hover-ui"}" title="${mine ? "You" : esc(s.owner)} · ${lb}">${tagIc}<span>${esc(mine ? "You" : s.owner)}</span><span class="lb">· ${lb}</span></span>`;
+  /* one bar at the top: name and source, plus the stream's numbers when "Show stats" is on (then it stays, like the old stats bar) */
+  const st = w && S.stats[key];
+  const nums = st ? `<span class="v">${s.w}×${s.h}</span><span class="v">${s.fps} fps</span><span class="v">${fmtKbps(s.kbps)}</span>` : "";
+  const tag = `<span class="tag${S.tagsAlways || st ? "" : " hover-ui"}${st ? " stats" : ""}" title="${mine ? "You" : esc(s.owner)} · ${lb}">${tagIc}<span>${esc(mine ? "You" : s.owner)}</span><span class="lb">· ${lb}</span>${nums}</span>`;
   const tools = `<div class="tools hover-ui">${w ? `<button type="button" class="round-btn" title="Pop out to its own window" aria-label="Pop out" data-act="pop:${k}">${ic("open_in_new")}</button>
     <button type="button" class="round-btn" title="Fullscreen" aria-label="Fullscreen" data-act="fs:${k}">${ic("fullscreen")}</button>` : ""}
     <button type="button" class="round-btn" title="Volume and more" aria-label="Stream menu" data-ctx="${k}">${ic("more_horiz")}</button></div>`;
-  const stats = w && S.stats[key] ? `<div class="ovl stats">${statbar(s, mine ? "You" : s.owner, combined ? r.name : null)}</div>` : "";
   const invite = w ? "" : `<div class="invite">${avatar(s.owner)}<b>${esc(s.owner)} is sharing ${esc(s.label)}</b><span>${s.w}×${s.h} · ${s.fps} fps</span>
     <button type="button" class="btn btn-primary" data-act="watch:${k}">${ic("play_arrow")}Watch stream</button></div>`;
   return `<div class="st-tile${w ? "" : " idle"}${audible ? " audible" : ""}" data-key="${k}"${w ? ` data-dbl="fs:${k}"` : ""} style="--ar:${(s.w / s.h).toFixed(4)}" tabindex="0" aria-label="${mine ? "Your" : esc(s.owner) + "'s"} stream">
-    <div class="vid">${pic}</div>${cam ? pipEl(cam) : ""}${invite}${stats}${tag}${tools}<span class="rz" title="Drag to resize"></span></div>`;
+    <div class="vid">${pic}</div>${cam ? pipEl(cam) : ""}${invite}${tag}${tools}<span class="rz" title="Drag to resize"></span></div>`;
 }
 
 /* r: the room, or null for the combined stage of Watched. */
