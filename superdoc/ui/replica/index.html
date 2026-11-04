@@ -484,6 +484,7 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 .gut::after { content: ""; position: absolute; border-radius: 2px; background: transparent; transition: background .12s; }
 .gut.v::after { left: calc(50% - 1.5px); width: 3px; top: 20%; bottom: 20%; }
 .gut.h::after { top: calc(50% - 1.5px); height: 3px; left: 20%; right: 20%; }
+:where(.arena:hover:not(:has(.st-tile:hover))) .gut::after { background: var(--text-faint); } /* the pointer is between the streams: grey bars, the one under it blue */
 .gut:hover::after, .gut.on::after { background: var(--accent); }
 
 /* people strip */
