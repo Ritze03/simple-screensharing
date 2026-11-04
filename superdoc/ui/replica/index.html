@@ -1166,16 +1166,11 @@ function shareMenu() {
     ${mi("tune", "All stream settings…", "modal:stream")}
     ${live ? mi("stop_screen_share", "Stop sharing", "stop", "", "danger") : mi("cast", `Go live in ${esc(r.name)}`, "golive")}`}`;
 }
+/* The bar's arrow only picks the camera; everything else is in the big menu (camModal). */
 function camMenu() {
-  const on = S.camOn && S.camRoom === camTarget(), m = camMode(), cur = CAMS.find((c) => c.name === S.camName);
-  const row = (act, text, extra, sel, icon = "") => `<button type="button" class="mi${sel ? " on" : ""}" data-act="${esc(act)}">${icon && ic(icon)}<span class="t">${esc(text)}</span>${extra}${sel ? ic("check", "chk") : ""}</button>`;
-  return `<div class="mh">${on ? pillLive() : `<span class="badge badge-muted">Off</span>`}<div><b>Webcam</b><small class="mono">${m.w}×${m.h} · ${m.fps} fps · ${esc(S.camCodec)}</small></div></div>
-    <div class="ml">Camera</div>${CAMS.map((c) => row("campick:" + c.name, c.name, `<span class="unit">${c.dev}</span>`, c === cur, "videocam")).join("")}
-    <div class="ml">Mode</div>${cur.modes.map((x) => { const [f, res] = x.split(" "), [wh, fps] = res.split("@");
-      return row("cammode:" + x, `${wh.replace("x", "×")} · ${fps} fps`, `<span class="unit">${f}</span>`, x === S.camMode); }).join("")}
-    <div class="ml">Codec</div><div class="mrow">${segAct("camcodec", CODECS, S.camCodec)}</div>
-    <div class="ml">Bitrate</div><div class="mrow">${FILL(slider("camKbps", 200, 12000, 100, "", "Webcam bitrate"))}${SL(72, `<span class="val" id="camkbps-val">${S.camKbps}</span>`, "r")}</div>
-    <div class="mrow"><span class="cap">${CAM_ENCODER}</span></div>`;
+  const cur = CAMS.find((c) => c.name === S.camName);
+  return `<div class="ml">Camera</div>${CAMS.map((c) => `<button type="button" class="mi${c === cur ? " on" : ""}" data-act="campick:${esc(c.name)}">${ic("videocam")}<span class="t">${esc(c.name)}</span><span class="unit">${c.dev}</span>${c === cur ? ic("check", "chk") : ""}</button>`).join("")}
+    <div class="msep"></div>${mi("tune", "All webcam settings…", "modal:cam")}`;
 }
 function audioMenu() {
   const cur = S.audioOn ? S.audioSrc : "No audio";
@@ -1459,6 +1454,17 @@ function settingsModal() {
       ctrlRow("Relay", cbx("diag", "Send diagnostics to the relay"), undefined, "Off by default. Sends the same log text as Logs to the relay of each room you are in"));
   return shell("wide", "Settings", null, body, `${FILL("")}<button type="button" class="btn btn-primary btn-lg" data-act="close">Done</button>`);
 }
+function camModal() {
+  const on = S.camOn && S.camRoom === camTarget(), m = camMode(), cur = CAMS.find((c) => c.name === S.camName), room = roomById(camTarget());
+  const modes = `<div class="selwrap"><select class="field" data-sel="camMode" aria-label="Mode">${cur.modes.map((x) => { const [f, res] = x.split(" "), [wh, fps] = res.split("@");
+    return `<option value="${esc(x)}"${x === S.camMode ? " selected" : ""}>${wh.replace("x", "×")} · ${fps} fps · ${f}</option>`; }).join("")}</select>${ic("expand_more")}</div>`;
+  const body = card("Source", null, ctrlRow("Camera", select("camName", CAMS.map((c) => c.name))) + ctrlRow("Mode", modes, undefined, "What this camera offers (v4l2)")) +
+    card("Compression", null, ctrlRow("Codec", seg("camCodec", CODECS)) +
+      ctrlRow("Bitrate", slider("camKbps", 200, 12000, 100, "", "Webcam bitrate"), `<span class="val" id="camkbps-val">${S.camKbps}</span>`, "kbps for this webcam") +
+      `<div class="hb g2">${SL(120, "")}${FILL(`<span class="cap">${CAM_ENCODER}</span>`)}</div>`);
+  const foot = `${on ? `<button type="button" class="btn btn-danger btn-lg" data-act="cam">${ic("videocam_off")}Stop webcam</button>` : `<button type="button" class="btn btn-secondary btn-lg" data-act="cam">${ic("videocam")}Start webcam</button>`}${FILL("")}<button type="button" class="btn btn-primary btn-lg" data-act="close">Done</button>`;
+  return shell("wide", "Webcam settings", `${m.w}×${m.h} · ${m.fps} fps${on && room ? ` · live in ${esc(room.name)}` : ""}`, body, foot);
+}
 function addModal() {
   const tabs = `<div class="hb g0">${FILL(`<div class="seg"><button type="button" class="${S.addTab === "join" ? "on" : ""}" data-set="addTab" data-val="join">Join with a link</button><button type="button" class="${S.addTab === "create" ? "on" : ""}" data-set="addTab" data-val="create">Create a new room</button></div>`)}</div>`;
   const body = S.addTab === "join"
@@ -1491,6 +1497,7 @@ function render() {
   if (S.modal === "stream") html += streamModal();
   else if (S.modal === "settings") html += settingsModal();
   else if (S.modal === "add") html += addModal();
+  else if (S.modal === "cam") html += camModal();
   if (!S.modal || S.menu === "emoji") html += renderMenu();
   frame.innerHTML = html;
   tipUser = null;
@@ -1537,7 +1544,7 @@ function applyPreset(key) {
 const framePt = (cx, cy) => { const fr = frame.getBoundingClientRect(); return { x: (cx - fr.left) / SCALE, y: (cy - fr.top) / SCALE }; };
 const exitFs = () => { S.view = S.fsBack; };
 const enterFs = (key) => { if (S.view !== "fullscreen") S.fsBack = S.view; Object.assign(S, { fsKey: key, view: "fullscreen" }); };
-const STAY = new Set(["fps", "preset", "pip", "campick", "cammode", "camcodec", "auto", "rename", "cancel", "forgetask", "mute", "level", "stats"]); /* menu actions that keep the menu open */
+const STAY = new Set(["fps", "preset", "pip", "campick", "auto", "rename", "cancel", "forgetask", "mute", "level", "stats"]); /* menu actions that keep the menu open */
 document.addEventListener("click", (e) => {
   const pre = e.target.closest("[data-preset]");
   if (pre) return applyPreset(pre.dataset.preset);
@@ -1634,9 +1641,7 @@ document.addEventListener("click", (e) => {
       break;
     }
     case "campick": S.camName = arg; S.camMode = CAMS.find((c) => c.name === arg).modes[0]; break;
-    case "cammode": S.camMode = arg; break;
-    case "camcodec": S.camCodec = arg; break;
-    case "camset": if (S.view === "fullscreen") exitFs(); S.menu = "cam"; break;
+    case "camset": if (S.view === "fullscreen") exitFs(); S.modal = "cam"; break;
     case "pip": V().pip = !V().pip; break;
     case "chsrc": render(); return toast("The system's screen and window picker opens here", "swap_horiz");
     case "audio":
@@ -1881,6 +1886,7 @@ document.addEventListener("change", (e) => {
   if (t.dataset?.sel) {
     S[t.dataset.sel] = t.value;
     if (t.dataset.sel === "fps") S.fps = Number(t.value);
+    if (t.dataset.sel === "camName") S.camMode = CAMS.find((c) => c.name === t.value).modes[0];
     if (t.dataset.sel === "audioSrc") S.audioOn = t.value !== "No audio";
     render();
   }
