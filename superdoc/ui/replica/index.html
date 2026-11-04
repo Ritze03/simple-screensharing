@@ -484,7 +484,7 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 .gut::after { content: ""; position: absolute; border-radius: 2px; background: transparent; transition: background .12s; }
 .gut.v::after { left: calc(50% - 1.5px); width: 3px; top: 20%; bottom: 20%; }
 .gut.h::after { top: calc(50% - 1.5px); height: 3px; left: 20%; right: 20%; }
-:where(.arena:hover:not(:has(.st-tile:hover))) .gut::after { background: var(--text-faint); } /* the pointer is between the streams: grey bars, the one under it blue */
+:where(.arena:hover:not(:has(.st-tile:hover))) .gut::after { background: var(--btn-border); } /* the pointer is between the streams: grey bars, the one under it blue */
 .gut:hover::after, .gut.on::after { background: var(--accent); }
 
 /* people strip */
@@ -1318,10 +1318,10 @@ function gridRects(n, ars, W, H) {
       const cw = V().colFr[i][j] * availW;
       cells.push({ x, y, w: cw, h: rh });
       x += cw;
-      if (j < c - 1) { guts.push({ t: "v", i, j, x: x - 3, y, w: GAP + 6, h: rh, avail: availW }); x += GAP; }
+      if (j < c - 1) { guts.push({ t: "v", i, j, a: cells.length - 1, x: x - 3, y, w: GAP + 6, h: rh, avail: availW }); x += GAP; }
     }
     y += rh;
-    if (i < counts.length - 1) { guts.push({ t: "h", i, j: i, x: 0, y: y - 3, w: W, h: GAP + 6, avail: availH }); y += GAP; }
+    if (i < counts.length - 1) { guts.push({ t: "h", i, j: i, a: cells.length - c, b: cells.length, e: cells.length + counts[i + 1], x: 0, y: y - 3, w: W, h: GAP + 6, avail: availH }); y += GAP; }
   });
   return { cells, guts };
 }
@@ -1335,6 +1335,7 @@ function layoutArena() {
   const W = ar.clientWidth, H = ar.clientHeight;
   const ars = keys.map((k) => parseFloat(tiles.get(k).style.getPropertyValue("--ar")) || 16 / 9);
   const { cells, guts } = gridRects(keys.length, ars, W, H);
+  const rects = [];
   keys.forEach((k, i) => {
     const t = tiles.get(k), c = cells[i];
     let q;
@@ -1352,6 +1353,7 @@ function layoutArena() {
       q = V().layout === "crop" ? c : containRect(c.x, c.y, c.w, c.h, ars[i]);
       t.style.zIndex = "";
     }
+    rects[i] = q;
     Object.assign(t.style, { left: q.x + "px", top: q.y + "px", width: q.w + "px", height: q.h + "px" });
     const pip = t.querySelector(":scope > .pip");
     if (pip) layoutPip(pip, q.w, q.h, V().layout === "crop");
@@ -1359,6 +1361,9 @@ function layoutArena() {
   if (V().layout === "float") return;
   for (const g of guts) {
     const d = document.createElement("div");
+    /* midway between the pictures you see, not the cells: a letterboxed picture leaves the cell edge off-centre */
+    if (g.t === "v") g.x = (rects[g.a].x + rects[g.a].w + rects[g.a + 1].x - g.w) / 2;
+    else g.y = (Math.max(...rects.slice(g.a, g.b).map((r) => r.y + r.h)) + Math.min(...rects.slice(g.b, g.e).map((r) => r.y)) - g.h) / 2;
     d.className = "gut " + g.t;
     Object.assign(d.style, { left: g.x + "px", top: g.y + "px", width: g.w + "px", height: g.h + "px" });
     d.dataset.gut = JSON.stringify(g);
