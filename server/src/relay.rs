@@ -1682,9 +1682,20 @@ pub(crate) mod tests {
         registry: &Arc<Registry>,
         room_id: RoomId,
         label: &str,
+        pred: impl FnMut(&RoomState) -> bool,
+    ) {
+        await_room_state_for(registry, room_id, label, Duration::from_secs(2), pred).await
+    }
+
+    /// [`await_room_state`] with a caller-chosen deadline (a cold Chromium needs more than 2 s).
+    pub(crate) async fn await_room_state_for(
+        registry: &Arc<Registry>,
+        room_id: RoomId,
+        label: &str,
+        deadline: Duration,
         mut pred: impl FnMut(&RoomState) -> bool,
     ) {
-        for _ in 0..200 {
+        for _ in 0..(deadline.as_millis() / 10) {
             let room = registry.rooms.read().await.get(&room_id).cloned();
             if let Some(room) = room
                 && pred(&*room.lock().await)

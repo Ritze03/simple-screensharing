@@ -64,7 +64,9 @@ async fn upload(peer: &Peer, bytes: &[u8]) -> bool {
     let mut s = peer.conn.open_uni().await.unwrap();
     s.write_all(bytes).await.unwrap();
     s.finish().unwrap();
-    // `stopped` ends with Ok(None) when the relay read everything, Ok(Some(_)) when it refused.
+    // `stopped` ends with Ok(None) when the relay read everything, Ok(Some(_)) when it refused
+    // (but a refusal can lose the race against the stream already being fully delivered: only
+    // an accepted batch is reliably `true`, so assert on stored files for refusals).
     matches!(tokio::time::timeout(Duration::from_secs(3), s.stopped()).await, Ok(Ok(None)))
 }
 
@@ -117,8 +119,12 @@ async fn hello_is_acked_and_batches_are_stored_per_person_and_session() {
     assert!(say_hello(&peer).await, "a new relay answers DiagHello");
 
     assert!(upload(&peer, &batch("Simple Screensharing client log\nversion: test\n----\n2026-11-03T12:00:00Z  INFO x: first\n")).await);
-    assert!(upload(&peer, &batch("2026-11-03T12:00:30Z  INFO x: second\n")).await);
     let path = only_log(&root).await.expect("one file");
+    // The relay takes one batch at a time and refuses an overlapping one (the client retries
+    // with the next batch), and `upload` returns once the relay has *read* the stream, not
+    // once it has stored it: wait for the first batch before sending the second (task #124).
+    wait_for(&path, "first").await;
+    assert!(upload(&peer, &batch("2026-11-03T12:00:30Z  INFO x: second\n")).await);
     let name = path.file_name().unwrap().to_string_lossy().into_owned();
     assert_eq!(name, "Mo_Müller-00000000000000a1.log");
     let text = wait_for(&path, "second").await;
@@ -144,7 +150,10 @@ async fn a_stream_without_hello_is_refused_and_nothing_is_stored() {
     let root = scratch("nohello");
     let (_registry, addr, client) = relay(&root, true).await;
     let peer = join(&client, addr, 0xB1, "mo").await;
-    assert!(!upload(&peer, &batch("sneaky\n")).await, "refused");
+    // Not asserted: the refusal is a STOP_SENDING, and for a tiny stream whose data and FIN
+    // were already delivered `stopped()` may resolve Ok(None) first (1 run in ~30, task #124).
+    // What matters is that nothing is stored, checked below.
+    let _ = upload(&peer, &batch("sneaky\n")).await;
     // The connection is fine afterwards: a Hello still works and then the upload is stored.
     assert!(say_hello(&peer).await);
     assert!(upload(&peer, &batch("now allowed\n")).await);
@@ -160,7 +169,7 @@ async fn the_kill_switch_means_no_ack_and_no_storage_but_a_normal_connection() {
     let (_registry, addr, client) = relay(&root, false).await;
     let peer = join(&client, addr, 0xC1, "mo").await;
     assert!(!say_hello(&peer).await, "no DiagAck while SSSHARE_DIAG_UPLOAD=0");
-    assert!(!upload(&peer, &batch("x\n")).await);
+    let _ = upload(&peer, &batch("x\n")).await; // refusal not observable reliably, see above
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(!root.exists(), "nothing written");
     assert!(peer.conn.close_reason().is_none(), "the connection stays up");

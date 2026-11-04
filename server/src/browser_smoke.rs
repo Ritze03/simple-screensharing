@@ -32,7 +32,7 @@ use crate::protocol::{
     ClientToRelay, ConnId, MAX_MEDIA_DATAGRAM_LEN, MediaHeader, PROTOCOL_VERSION, PreviewHeader,
     RelayToClient, RoomId, StreamKind, encode_cert_hash,
 };
-use crate::relay::tests::{await_room_state, insecure_client_endpoint, recv_ctrl, send_ctrl};
+use crate::relay::tests::{await_room_state, await_room_state_for, insecure_client_endpoint, recv_ctrl, send_ctrl};
 use crate::relay::{build_endpoint_with, serve};
 use crate::room::Registry;
 
@@ -203,7 +203,22 @@ async fn headless_chromium_joins_over_webtransport() {
     let page_done = Arc::new(AtomicBool::new(false));
     tokio::spawn(serve_page(listener, result_tx, page_done.clone()));
 
-    let profile = std::env::temp_dir().join(format!("ssshare-chromium-{}", std::process::id()));
+    // Chromium's scratch space. Two TMPDIR faults used to kill this test with nothing but
+    // "timed out waiting for room state: browser stream announced" 2 s later (chromium exits
+    // at once, stderr was discarded):
+    //  - a TMPDIR that does not exist (a stale scratch path): "Failed To Create Data
+    //    Directory", because chromium does not create missing parents of --user-data-dir;
+    //  - a long TMPDIR (a worktree path, as the project rules recommend): chromium puts its
+    //    singleton unix socket in TMPDIR/org.chromium.Chromium.XXXXXX/ and aborts with
+    //    "Socket path too long" past sun_path's 108 bytes.
+    // So the profile lives in a short dir (TMPDIR if it is short, else /tmp; a few MB, removed
+    // at the end) and chromium gets that dir as its TMPDIR too.
+    let tmp = std::env::temp_dir();
+    let base = if tmp.as_os_str().len() <= 40 { tmp } else { std::path::PathBuf::from("/tmp") };
+    let profile = base.join(format!("ssshare-chromium-{}", std::process::id()));
+    std::fs::create_dir_all(&profile)
+        .unwrap_or_else(|e| panic!("cannot create the chromium profile dir {}: {e}", profile.display()));
+    let chrome_log = profile.with_extension("log");
     let page_url = format!(
         "http://127.0.0.1:{page_port}/?port={}&hash={hash}&room={}&me={BROWSER:x}&sharer={SHARER:x}&sharer_stream={SHARER_STREAM}",
         relay_addr.port(),
@@ -219,18 +234,33 @@ async fn headless_chromium_joins_over_webtransport() {
             "--disable-background-networking",
         ])
         .arg(format!("--user-data-dir={}", profile.display()))
+        .env("TMPDIR", &base)
         .arg(&page_url)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&chrome_log).expect("chromium log file"))
         .kill_on_drop(true)
         .spawn()
         .expect("launch chromium");
 
-    // The page announces a stream; only then can the native viewer subscribe.
-    await_room_state(&registry, room_id, "browser stream announced", |r| {
-        r.streams.contains_key(&(BROWSER, 0))
-    })
-    .await;
+    // The page announces a stream; only then can the native viewer subscribe. Chromium's cold
+    // start is slow on a loaded machine, so this waits 30 s instead of the 2 s default, and
+    // reports what chromium printed if it exits before getting there.
+    let announced = await_room_state_for(
+        &registry,
+        room_id,
+        "browser stream announced (30 s)",
+        Duration::from_secs(30),
+        |r| r.streams.contains_key(&(BROWSER, 0)),
+    );
+    tokio::select! {
+        () = announced => {}
+        status = chrome.wait() => {
+            let log = std::fs::read_to_string(&chrome_log).unwrap_or_default();
+            let _ = std::fs::remove_file(&chrome_log);
+            panic!("chromium exited ({status:?}) before the page announced a stream; stderr:\n{log}");
+        }
+    }
+    let _ = std::fs::remove_file(&chrome_log);
     send_ctrl(
         &mut viewer_send,
         &ClientToRelay::Subscribe { target: BROWSER, stream_id: 0 },
@@ -303,7 +333,15 @@ async fn headless_chromium_joins_over_webtransport() {
     stop.store(true, Ordering::Relaxed);
     feeder.abort();
     let _ = chrome.kill().await;
-    let _ = std::fs::remove_dir_all(&profile);
+    // Chromium's helper processes outlive the browser process for a moment and re-create
+    // files in the profile; remove it until it stays gone (it used to leak ~140 KB per run).
+    for _ in 0..20 {
+        let _ = std::fs::remove_dir_all(&profile);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if !profile.exists() {
+            break;
+        }
+    }
 
     println!("browser smoke result: {result}");
     let v: serde_json::Value = serde_json::from_str(&result).expect("result is JSON");

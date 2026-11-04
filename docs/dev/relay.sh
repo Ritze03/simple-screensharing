@@ -25,7 +25,12 @@ start_session() {
   local bin="$1" dir="$2" port="$3" keep="$4"
   mkdir -p "$dir"
   [ "$keep" = 1 ] || rm -f "$dir/state/cert.meta" # force a fresh certificate
-  tmux new-session -d -s "ssshare-relay-$port" "cd '$dir' && exec '$bin' $port"
+  # A new tmux session gets the environment of the tmux *server*, not of this script, so an
+  # `SSSHARE_AVATARS=0 relay.sh start ...` prefix would be lost whenever a server already runs:
+  # forward every SSSHARE_* variable explicitly (-e, tmux >= 3.2).
+  local envargs=() v
+  while IFS= read -r v; do envargs+=(-e "$v"); done < <(env | grep '^SSSHARE_' || true)
+  tmux new-session -d -s "ssshare-relay-$port" "${envargs[@]}" "cd '$dir' && exec '$bin' $port"
   for _ in $(seq 1 100); do
     [ -f "$dir/state/cert.meta" ] && break
     sleep 0.1
