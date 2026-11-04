@@ -244,9 +244,8 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 .field { background: var(--field); border: 1px solid var(--border); border-radius: var(--rounding-sm); color: var(--text); height: var(--ctl-h); padding: 0 10px; outline: none; width: 100%; box-sizing: border-box; min-width: 0; font-size: var(--fs-row); }
 .field::placeholder { color: var(--text-faint); }
 .field:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-chip-bg); }
-.selwrap { position: relative; width: 100%; }
-.selwrap select { appearance: none; -webkit-appearance: none; cursor: pointer; padding-right: 30px; font-size: var(--fs-row); }
-.selwrap .ms { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); font-size: 18px; color: var(--text-dim); pointer-events: none; }
+.field.dd { display: flex; align-items: center; justify-content: space-between; gap: var(--s2); cursor: pointer; text-align: left; font-size: var(--fs-row); }
+.field.dd .ms { color: var(--text-dim); }
 .cbx { display: inline-flex; align-items: center; gap: 10px; height: var(--ctl-h); cursor: pointer; user-select: none; padding: 0 var(--s2); margin: 0 calc(-1 * var(--s2)); border-radius: 6px; font-size: var(--fs-label); color: var(--text); white-space: nowrap; }
 .cbx:hover { background: var(--wash-hover-1); }
 .cbx .box { width: 18px; height: 18px; box-sizing: border-box; border-radius: 5px; border: 1px solid var(--btn-border); display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; }
@@ -705,6 +704,7 @@ const AUDIO_SRCS = [["No audio", "volume_off", "Only the picture"], ["Desktop au
 /* Desktop audio exclusion list: text matched against source names, ignoring case. A match stays out of desktop audio and off every source list. */
 const isExcluded = (n) => n !== "No audio" && n !== "Desktop audio" && S.audioExcl.some((x) => n.toLowerCase().includes(x.toLowerCase()));
 const audioSources = () => AUDIO_SRCS.filter(([n]) => !isExcluded(n));
+const audioRows = () => audioSources().map(([n, icon, sub]) => [n, n, sub, icon]);
 
 /* ============================== presets (the nav's views) ============================== */
 const STAGE = [
@@ -832,8 +832,14 @@ const seg = (key, opts) => `<div class="seg" role="radiogroup">${opts.map((o) =>
 const segAct = (verb, opts, cur, cls = "") => `<div class="seg ${cls}" role="radiogroup">${opts.map((o) => `<button type="button" class="${cur === o ? "on" : ""}" data-act="${verb}:${esc(o)}">${esc(o)}</button>`).join("")}</div>`;
 const presetCap = () => { const p = ENC_PRESETS[S.preset]; return `${S.fps} FPS · ${p.mode} encoding · Keyframe ${p.key} ms`; };
 const cbx = (key, label, disabled) => `<span class="cbx${S[key] ? " on" : ""}${disabled ? " disabled" : ""}" role="checkbox" tabindex="0" aria-checked="${!!S[key]}" data-toggle="${disabled ? "" : key}"><span class="box">${ic("check")}</span>${label}</span>`;
-const select = (key, opts) => `<div class="selwrap"><select class="field" data-sel="${key}">${opts.map((o) => `<option${S[key] === o ? " selected" : ""}>${esc(o)}</option>`).join("")}</select>${ic("expand_more")}</div>`;
-const fpsSelect = () => `<div class="selwrap"><select class="field" data-sel="fps" aria-label="FPS">${FPS_LIST.map((f) => `<option value="${f}"${S.fps === f ? " selected" : ""}>${f} fps</option>`).join("")}</select>${ic("expand_more")}</div>`;
+/* The app's dropdown: a field that opens one of our menus, never the browser's own popup. An option is a value, or [value, label, sub, icon]. */
+const DD = {};
+const select = (key, opts) => {
+  DD[key] = opts.map((o) => (Array.isArray(o) ? o : [o, o]));
+  const cur = DD[key].find((o) => String(o[0]) === String(S[key]));
+  return `<button type="button" class="field dd" data-dd="${key}" aria-haspopup="listbox"><span class="txt">${esc(cur ? cur[1] : S[key] ?? "")}</span>${ic("expand_more")}</button>`;
+};
+const fpsSelect = () => select("fps", FPS_LIST.map((f) => [f, f + " fps"]));
 const slider = (key, min, max, step, cls = "", label = key) => `<input type="range" class="${cls}" min="${min}" max="${max}" step="${step}" value="${S[key]}" data-range="${key}" aria-label="${label}">`;
 const meter = (lit = 0) => `<span class="meter">${[0, 1, 2, 3, 4].map((i) => `<i class="${i < lit ? "lit" : ""}"></i>`).join("")}</span>`;
 const pillLive = (lg) => `<span class="badge badge-live${lg ? " lg" : ""}"><span class="dot"></span>Live</span>`;
@@ -1267,8 +1273,17 @@ function emojiMenu() {
     <div class="emoji-hint" id="emoji-hint"></div>
     ${mi("text_fields", "Use my initial", "emoji:")}`;
 }
+function ddMenu() {
+  return (DD[S.ddKey] || []).map(([v, label, sub, icon]) => { const on = String(v) === String(S[S.ddKey]);
+    return `<button type="button" class="mi${sub ? " two" : ""}${on ? " on" : ""}" data-act="ddpick:${esc(v)}">${icon ? ic(icon) : ""}<span class="t">${esc(label)}${sub ? `<small>${esc(sub)}</small>` : ""}</span>${on ? ic("check", "chk") : ""}</button>`; }).join("");
+}
+function ddPick(key, v) {
+  S[key] = key === "fps" ? Number(v) : v;
+  if (key === "camName") S.camMode = CAMS.find((c) => c.name === v).modes[0];
+  if (key === "audioSrc") S.audioOn = v !== "No audio";
+}
 function renderMenu() {
-  const f = { share: shareMenu, audio: audioMenu, cam: camMenu, layout: layoutMenu, room: roomMenu, ctx: ctxMenu, emoji: emojiMenu, excl: exclMenu }[S.menu];
+  const f = { share: shareMenu, audio: audioMenu, cam: camMenu, layout: layoutMenu, room: roomMenu, ctx: ctxMenu, emoji: emojiMenu, excl: exclMenu, dd: ddMenu }[S.menu];
   const body = f ? f() : "";
   return body ? `<div class="menu m-${S.menu}" id="menu" role="menu">${body}</div>` : "";
 }
@@ -1281,12 +1296,13 @@ function placeMenu() {
   let x, y;
   if (pos) { x = pos.x; y = pos.y; if (y + mh > fh - 8) y = Math.max(8, y - mh); }
   else {
-    const a = frame.querySelector(`[data-anchor="${S.menu}"]`);
+    const a = frame.querySelector(S.menu === "dd" ? `[data-dd="${S.ddKey}"]` : `[data-anchor="${S.menu}"]`);
     if (!a) { m.remove(); return; }
     const r = a.getBoundingClientRect();
     const ax = (r.left - fr.left) / SCALE, ay = (r.top - fr.top) / SCALE, aw = r.width / SCALE, ah = r.height / SCALE;
     x = ax + aw / 2 - mw / 2; y = ay - mh - 10;
     if (y < 8) { y = ay + ah + 8; x = ax + aw - mw; }
+    if (S.menu === "dd") { m.style.width = aw + "px"; x = ax; y = ay + ah + 4; } /* a dropdown opens under its field, as wide as it */
   }
   m.style.left = Math.max(8, Math.min(x, fw - mw - 8)) + "px";
   m.style.top = Math.max(8, Math.min(y, fh - mh - 8)) + "px";
@@ -1496,7 +1512,7 @@ function streamModal() {
   const r = roomById(D().meRoom);
   const source = card("Source", null,
     ctrlRow("Screen", `<span class="txt ro">Screen share · 1920×1080</span>`, `<button type="button" class="btn btn-secondary wide" data-act="chsrc">Change</button>`) +
-    ctrlRow("Audio", select("audioSrc", audioSources().map((a) => a[0])), `<span class="val center">${meter(0)}</span>`) +
+    ctrlRow("Audio", select("audioSrc", audioRows()), `<span class="val center">${meter(0)}</span>`) +
     ctrlRow(null, cbx("muteShared", "Mute shared audio", true)));
   const dest = `<div class="hb g2 destrow cur">${SL(18, ic("radio_button_checked", "ico"))}${FILL(`<span class="txt name">${esc(r.name)}<small>this room</small></span>`)}
     ${SL(84, staged ? `<span class="badge badge-muted">Not live</span>` : pillLive(false), "l", true)}${SL(76, `<span class="kbps">${staged ? "—" : S.kbps + " kbps"}</span>`, "r")}
@@ -1529,7 +1545,7 @@ function exclMenu() {
     <div class="mrow"><input class="field" id="excl-in" placeholder="Part of a source name" aria-label="Part of a source name" autocomplete="off"><button type="button" class="btn btn-secondary" data-act="excladdtext">Add</button></div>`;
 }
 function audioModal() {
-  const body = card("Source", null, ctrlRow("Audio", select("audioSrc", audioSources().map((a) => a[0])))) +
+  const body = card("Source", null, ctrlRow("Audio", select("audioSrc", audioRows()))) +
     card("Volume", null, ctrlRow("Boost", slider("boost", 0, 200, 5), `<span class="val" id="boost-val">${S.boost}%</span>`, "Trim the shared audio before it is sent")) +
     card("Desktop audio", null, exclRows());
   const foot = `${S.audioOn ? `<button type="button" class="btn btn-danger btn-lg" data-act="audio">${ic("music_off")}Stop sharing audio</button>` : `<button type="button" class="btn btn-secondary btn-lg" data-act="audio">${ic("music_note")}Share desktop audio</button>`}${FILL("")}<button type="button" class="btn btn-primary btn-lg" data-act="close">Done</button>`;
@@ -1551,8 +1567,7 @@ function settingsModal() {
 }
 function camModal() {
   const on = S.camOn && S.camRoom === camTarget(), m = camMode(), cur = CAMS.find((c) => c.name === S.camName), room = roomById(camTarget());
-  const modes = `<div class="selwrap"><select class="field" data-sel="camMode" aria-label="Mode">${cur.modes.map((x) => { const [f, res] = x.split(" "), [wh, fps] = res.split("@");
-    return `<option value="${esc(x)}"${x === S.camMode ? " selected" : ""}>${wh.replace("x", "×")} · ${fps} fps · ${f}</option>`; }).join("")}</select>${ic("expand_more")}</div>`;
+  const modes = select("camMode", cur.modes.map((x) => { const [f, res] = x.split(" "), [wh, fps] = res.split("@"); return [x, `${wh.replace("x", "×")} · ${fps} fps · ${f}`]; }));
   const body = card("Source", null, ctrlRow("Camera", select("camName", CAMS.map((c) => c.name))) + ctrlRow("Mode", modes, undefined, "What this camera offers (v4l2)")) +
     card("Compression", null, ctrlRow("Codec", seg("camCodec", CODECS)) +
       ctrlRow("Bitrate", slider("camKbps", 200, 12000, 100, "", "Webcam bitrate"), `<span class="val" id="camkbps-val">${S.camKbps}</span>`, "kbps for this webcam") +
@@ -1594,7 +1609,7 @@ function render() {
   else if (S.modal === "add") html += addModal();
   else if (S.modal === "cam") html += camModal();
   else if (S.modal === "audio") html += audioModal();
-  if (!S.modal || S.menu === "emoji" || S.menu === "excl") html += renderMenu();
+  if (!S.modal || ["emoji", "excl", "dd"].includes(S.menu)) html += renderMenu();
   frame.innerHTML = html;
   tipUser = null;
   frame.querySelectorAll('input[type="range"]').forEach(setPct);
@@ -1654,6 +1669,11 @@ document.addEventListener("click", (e) => {
   if (set) { S[set.dataset.set] = set.dataset.val; return render(); }
   const tog = e.target.closest("[data-toggle]");
   if (tog && tog.dataset.toggle) { S[tog.dataset.toggle] = !S[tog.dataset.toggle]; return render(); }
+  const dd = e.target.closest("[data-dd]");
+  if (dd) {
+    if (!(prev.menu === "dd" && S.ddKey === dd.dataset.dd)) Object.assign(S, { menu: "dd", ddKey: dd.dataset.dd });
+    return render();
+  }
   const mb = e.target.closest("[data-menu]");
   if (mb) {
     const m = mb.dataset.menu;
@@ -1740,6 +1760,7 @@ document.addEventListener("click", (e) => {
     case "pip": V().pip = !V().pip; break;
     case "tagsalways": S.tagsAlways = !S.tagsAlways; break;
     case "hideown": S.hideOwn = !S.hideOwn; break;
+    case "ddpick": ddPick(S.ddKey, arg); break;
     case "sound": return playSound(arg);
     case "excladdtext": addExcl(document.getElementById("excl-in")?.value.trim()); break;
     case "excladd": addExcl(arg); break;
@@ -2009,13 +2030,6 @@ document.addEventListener("change", (e) => {
   if (t.id === "nav-data") { S.data = t.value; return applyPreset(S.preset0 || "stage"); }
   if (t.id === "nav-ovl") { S.pin = t.checked; return render(); }
   if (t.id === "nav-spin") { S.spin = t.checked; return render(); }
-  if (t.dataset?.sel) {
-    S[t.dataset.sel] = t.value;
-    if (t.dataset.sel === "fps") S.fps = Number(t.value);
-    if (t.dataset.sel === "camName") S.camMode = CAMS.find((c) => c.name === t.value).modes[0];
-    if (t.dataset.sel === "audioSrc") S.audioOn = t.value !== "No audio";
-    render();
-  }
 });
 
 /* Initial state; `#rig` in the address loads the rig data, `#<preset>` (e.g. #settings, #stage-float) a view. */
