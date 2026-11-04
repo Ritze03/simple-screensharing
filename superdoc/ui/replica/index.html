@@ -269,7 +269,7 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 /* avatar (widgets::paint_avatar), status dot */
 .avatar { --av: 32px; width: var(--av); height: var(--av); border-radius: 50%; color: #fff; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; font-size: 13px; flex: 0 0 auto; position: relative; }
 .avatar.sm { --av: 22px; font-size: 10.5px; }
-.avatar .emo { font-family: var(--font-emoji); font-weight: 400; font-size: calc(var(--av) * .62); line-height: 1; } /* an emoji avatar sits on the same name-derived gradient */
+.avatar .emo { font-family: var(--font-emoji); font-weight: 400; font-size: calc(var(--av) * .62); line-height: 1; display: inline-block; filter: drop-shadow(1px 0 0 #000) drop-shadow(-1px 0 0 #000) drop-shadow(0 1px 0 #000) drop-shadow(0 -1px 0 #000); } /* the black outline follows the emoji's shape and lifts it off its gradient */
 .avatar .pres { position: absolute; right: -2px; bottom: -2px; width: 10px; height: 10px; border-radius: 50%; border: 2px solid var(--elev-14); background: var(--success); }
 .sdot { width: 9px; height: 9px; border-radius: 50%; box-sizing: border-box; }
 .sdot.joined { background: var(--success); box-shadow: var(--success-glow); }
