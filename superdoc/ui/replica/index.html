@@ -471,6 +471,8 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 /* a webcam inside its owner's screen share (#137). layoutPip() places it; the handle sits on the corner facing the middle of the picture, so a PIP pushed into a corner can still grow */
 .pip { position: absolute; z-index: 9; overflow: hidden; border-radius: 6px; background: #000; box-shadow: 0 0 0 1px rgba(255, 255, 255, .22), 0 6px 18px rgba(0, 0, 0, .55); cursor: grab; touch-action: none; }
 .pip:active { cursor: grabbing; }
+.pip.snap { transition: left .16s ease, top .16s ease; }
+@media (prefers-reduced-motion: reduce) { .pip.snap { transition: none; } }
 .prz { position: absolute; z-index: 1; width: 20px; height: 20px; }
 .prz::after { content: ""; position: absolute; inset: 4px; box-sizing: border-box; border: solid var(--text); border-width: 0 2px 2px 0; border-radius: 0 0 4px 0; filter: drop-shadow(0 0 2px #000); }
 .pip[data-c="rb"] .prz { right: 0; bottom: 0; cursor: nwse-resize; }
@@ -1371,14 +1373,31 @@ function layoutArena() {
    webcam, so per person and per view), which is why they survive layout changes. What is shown is clamped to the part of
    the picture you can see: all of it in Split and Floating, the centre in Crop; the stored value stays, so Split gets the
    old spot back. Percentages of the tile, so the PIP follows the tile's own size transition. */
+/* Eight fixed spots: the corners and the middle of each side. p.a = [column, row], 0..2, so a PIP stays on its spot in every
+   layout. Only a drag in progress is free (no p.a); on release it goes to the nearest spot. */
+const PIP_INSET = 12;
+const pipAt = (o, len, size, i) => { const m = Math.max(0, Math.min(PIP_INSET, (len - size) / 2)); return i === 0 ? o + m : i === 1 ? o + (len - size) / 2 : o + len - size - m; };
+function snapPip(el) {
+  const g = el.geo, p = V().pipPos[el.dataset.key];
+  if (p.a) return; /* a click, not a drag */
+  let best = Infinity;
+  for (const i of [0, 1, 2]) for (const j of [0, 1, 2]) {
+    if (i === 1 && j === 1) continue;
+    const d = Math.hypot(pipAt(g.vis.x, g.vis.w, g.w, i) - g.x, pipAt(g.vis.y, g.vis.h, g.h, j) - g.y);
+    if (d < best) { best = d; p.a = [i, j]; }
+  }
+  el.classList.add("snap");
+  setTimeout(() => el.classList.remove("snap"), 200);
+}
 function layoutPip(el, tw, th, crop) {
   const ar = parseFloat(el.parentElement.style.getPropertyValue("--ar")) || 16 / 9, a = parseFloat(el.dataset.ar);
   const pw = crop ? Math.max(tw, th * ar) : Math.min(tw, th * ar), ph = pw / ar;
   const pic = { x: (tw - pw) / 2, y: (th - ph) / 2, w: pw, h: ph };
   const vis = { x: Math.max(0, pic.x), y: Math.max(0, pic.y), w: Math.min(tw, pw), h: Math.min(th, ph) };
-  const p = V().pipPos[el.dataset.key] ??= { x: .74, y: 1 - .03 - (.24 * ar) / a, w: .24 };
+  const p = V().pipPos[el.dataset.key] ??= { w: .24, a: [2, 2] };
   const w = Math.min(Math.max(p.w * pw, PIP_MIN), vis.w, vis.h * a), h = w / a;
-  const x = Math.max(vis.x, Math.min(pic.x + p.x * pw, vis.x + vis.w - w)), y = Math.max(vis.y, Math.min(pic.y + p.y * ph, vis.y + vis.h - h));
+  const x = p.a ? pipAt(vis.x, vis.w, w, p.a[0]) : Math.max(vis.x, Math.min(pic.x + p.x * pw, vis.x + vis.w - w));
+  const y = p.a ? pipAt(vis.y, vis.h, h, p.a[1]) : Math.max(vis.y, Math.min(pic.y + p.y * ph, vis.y + vis.h - h));
   Object.assign(el.style, { left: (x / tw) * 100 + "%", top: (y / th) * 100 + "%", width: (w / tw) * 100 + "%", height: (h / th) * 100 + "%" });
   if (drag?.kind !== "piprz" || drag.el !== el) el.dataset.c = (x + w / 2 > vis.x + vis.w / 2 ? "l" : "r") + (y + h / 2 > vis.y + vis.h / 2 ? "t" : "b");
   el.geo = { tw, th, crop, a, pic, vis, x, y, w, h };
@@ -1675,6 +1694,7 @@ function movePip(e) {
   const { pic, vis, a } = g, vr = vis.x + vis.w, vb = vis.y + vis.h, p = V().pipPos[el.dataset.key];
   let { x, y, w } = g;
   if (drag.kind === "pipmove") {
+    delete p.a;
     x = Math.max(vis.x, Math.min(x + dx, vr - w));
     y = Math.max(vis.y, Math.min(y + dy, vb - g.h));
   } else {
@@ -1756,6 +1776,7 @@ window.addEventListener("pointerup", () => {
   if (!drag) return;
   const d = drag, ar = document.getElementById("arena");
   drag = null;
+  if (d.kind === "pipmove") snapPip(d.el);
   if (d.kind === "pipmove" || d.kind === "piprz") return layoutPip(d.el, d.g.tw, d.g.th, d.g.crop); /* the handle goes back to the inner corner */
   if (!ar) return;
   if (d.kind === "gut" || V().layout === "float") { ar.classList.remove("nofx"); return; }
