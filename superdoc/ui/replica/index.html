@@ -508,12 +508,6 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 .pv.popped { cursor: pointer; }
 .pv.popped .avatar { outline: 2px dashed var(--accent-ghost-border); outline-offset: 3px; }
 .pv:hover .avatar { filter: brightness(1.12); }
-.strip-tg { position: absolute; left: 50%; top: -12px; transform: translateX(-50%); z-index: 25; height: 24px; padding: 0 8px; border-radius: 999px; border: 1px solid var(--stage-group-border); background: var(--stage-group); color: var(--text-dim); display: inline-flex; align-items: center; gap: 4px; cursor: pointer; font-size: var(--fs-tiny); font-family: var(--font-mono); }
-.strip-tg:hover { color: var(--text); background: var(--stage-btn-hover); }
-.strip-tg .ms { font-size: 16px; }
-/* collapsed: the button gets its own band above the bar, clear of both the bar and the streams */
-.stripwrap:not(:has(.strip)) { height: 34px; }
-.stripwrap:not(:has(.strip)) .strip-tg { top: 6px; }
 
 /* control row + bar */
 .ctlrow { height: 72px; flex: 0 0 72px; display: flex; align-items: center; gap: var(--s2); padding: 0 var(--s4); box-sizing: border-box; }
@@ -624,7 +618,7 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 .stagefs .stripwrap, .stagefs .ctlrow { position: relative; z-index: 30; pointer-events: none; transition: opacity .25s; }
 .stagefs .stripwrap { background: linear-gradient(180deg, transparent, rgba(6, 7, 9, .72)); }
 .stagefs .ctlrow { background: rgba(6, 7, 9, .72); }
-.stagefs :is(.strip-tg, .pv, .cb, .cgroup) { pointer-events: auto; }
+.stagefs :is(.pv, .cb, .cgroup) { pointer-events: auto; }
 .fs .hover-ui, .stagefs .hover-ui { transition: opacity .25s; }
 .chrome-off :is(.stagefs .stripwrap, .stagefs .ctlrow, .stagefs .hover-ui, .fs .hover-ui) { opacity: 0; }
 .chrome-off :is(.stagefs .stripwrap, .stagefs .ctlrow, .stagefs .hover-ui, .fs .hover-ui), .chrome-off :is(.stagefs .stripwrap, .stagefs .ctlrow, .stagefs .hover-ui, .fs .hover-ui) * { pointer-events: none !important; }
@@ -710,7 +704,7 @@ const STAGE = [
   ["stage-live", "Sharing · menu", { sharing: "live", sharerSelf: true, audioOn: true, audioSrc: "Spotify", menu: "share" }],
   ["stage-pip", "Webcam + PIP", { pip: true, camOn: true, sharing: "live", sharerSelf: true, alsoWatch: [K_JONAS] }],
   ["stage-popped", "Popped out", { popped: [K_ANA] }],
-  ["stage-focus", "No sidebar + people", { side: false, peoplePanel: true }],
+  ["stage-focus", "No sidebar", { side: false }],
   ["stage-room", "Room menu", { menu: "room" }],
   ["stage-watched", "Watched", { view: "watched", watchAll: true }],
 ];
@@ -731,7 +725,7 @@ const MODALS = [
 
 /* Everything keyed by stream (popped, watchSet, vols, mutes, levels, stats) is shared by the views: it is the same stream.
    What a view arranges (V()) is not: every room and Watched keep their own layout, order, sizes and positions. */
-const STAGE_DEFAULTS = () => ({ classic: false, side: true, peoplePanel: false, strip: true, menu: null, ctx: null, roomCtx: null, roomEdit: null,
+const STAGE_DEFAULTS = () => ({ classic: false, side: true, strip: true, menu: null, ctx: null, roomCtx: null, roomEdit: null,
   forgetAsk: false, popped: new Set(), stageFs: false, views: {},
   vols: {}, mutes: {}, levels: {}, stats: {}, audioOn: false, audioSrc: "No audio", camOn: false, fsKey: null, fsBack: "room", watchSet: new Set() });
 const newView = () => ({ layout: "split", order: [], float: {}, z: [], gridSig: "", rowFr: null, colFr: null, stagePopped: false, pip: false, pipPos: {} });
@@ -1002,8 +996,6 @@ function peopleRows(r) {
   }).join("")}</div>`;
 }
 const renderPeople = (r) => `<aside class="vb g3 p-right">${secHead("People", r.members.length)}${peopleRows(r)}</aside>`;
-/* Watched spans the rooms, so its list is grouped by them. */
-const renderPeopleAll = () => `<aside class="vb g4 p-right">${D().rooms.filter((r) => r.state === "joined").map((r) => `<div class="vb g2">${secHead(`<span class="txt">${esc(r.name)}</span>`, r.members.length)}${peopleRows(r)}</div>`).join("")}</aside>`;
 
 function renderBar(r) {
   const bar = (kids) => `<footer class="hb g2 band bottom p-bar">${kids}</footer>`;
@@ -1031,7 +1023,7 @@ function renderMain(fw, fh) {
     const list = watchedItems(), nr = new Set(list.map((i) => i.r.id)).size;
     const meta = list.length ? `${list.length} stream${list.length === 1 ? "" : "s"} from ${nr} room${nr === 1 ? "" : "s"}` : "Every stream you're watching, from every room";
     return `<main class="vb g0 eq"><header class="hb g2 band top p-head"><h2>Watched streams</h2><span class="txt meta">${meta}</span></header>
-      <div class="hb g0 eq st minh0">${renderStage(null)}${S.peoplePanel ? renderPeopleAll() : ""}</div></main>`;
+      <div class="hb g0 eq st minh0">${renderStage(null)}</div></main>`;
   }
   if (S.view === "watched") {
     const list = D().rooms.flatMap((r) => watched(r).map((s) => [r, s]));
@@ -1043,7 +1035,7 @@ function renderMain(fw, fh) {
   const r = curRoom();
   if (!r) return `<main class="vb g0 eq"><div class="vb g4 p-center eq">${emptyState("meeting_room", "No rooms in your list", "Create or join one with the button in the sidebar.")}</div></main>`;
   const panels = r.state === "joined";
-  if (!S.classic && panels) return `<main class="vb g0 eq">${renderHead(r)}<div class="hb g0 eq st minh0">${renderStage(r)}${S.peoplePanel ? renderPeople(r) : ""}</div></main>`;
+  if (!S.classic && panels) return `<main class="vb g0 eq">${renderHead(r)}<div class="hb g0 eq st minh0">${renderStage(r)}</div></main>`;
   return `<main class="vb g0 eq">${renderHead(r)}<div class="hb g0 eq st minh0">${renderCenter(r, fw, fh)}${panels ? renderPeople(r) : ""}</div>${panels ? renderBar(r) : ""}</main>`;
 }
 
@@ -1138,8 +1130,7 @@ function renderStage(r) {
 function renderStrip(r, items) {
   const ms = r ? r.members : [...new Set(items.map((i) => i.s.owner))]; /* Watched: the owners, one avatar per person */
   if (!ms.length) return `<div class="stripwrap"></div>`;
-  const tg = `<button type="button" class="strip-tg" data-act="strip" title="${S.strip ? "Hide the people strip" : "Show the people strip"}" aria-label="${S.strip ? "Hide" : "Show"} the people strip">${ic(S.strip ? "expand_more" : "expand_less")}${S.strip ? "" : `<span>${ms.length}</span>`}</button>`;
-  if (!S.strip) return `<div class="stripwrap">${tg}</div>`;
+  if (!S.strip) return "";
   const pv = ms.map((m) => {
     const isMe = m === me(), its = items.filter((i) => i.s.owner === m);
     const popped = its.some((i) => S.popped.has(i.key));
@@ -1151,7 +1142,7 @@ function renderStrip(r, items) {
       ${avatar(m, false, false, badges)}
       <span class="nm">${isMe ? "You" : esc(m)}</span></${tagN}>`;
   }).join("");
-  return `<div class="stripwrap">${tg}<div class="strip" role="list">${pv}</div></div>`;
+  return `<div class="stripwrap"><div class="strip" role="list">${pv}</div></div>`;
 }
 
 /* Watched has no room of its own: Invite, Room settings and Leave go. Share and audio stay only while there is something
@@ -1174,7 +1165,7 @@ function renderControls(r) {
   const L = LAYOUTS.find((l) => l[0] === V().layout);
   const layout = `<div class="splitb${open("layout")}" data-anchor="layout"><button type="button" class="cb" data-menu="layout" title="Layout: ${L[2]}" aria-label="Layout: ${L[2]}">${ic(L[1])}</button>${caret("layout", "Choose a layout")}</div>`;
   const room = !r ? "" : `<div class="splitb${open("room")}" data-anchor="room"><button type="button" class="cb" data-menu="room" title="Room settings" aria-label="Room settings">${ic("tune")}</button>${caret("room", "Room settings")}</div>`;
-  const people = `<button type="button" class="cb${S.peoplePanel ? " sel" : ""}" data-act="people" title="${S.peoplePanel ? "Hide" : "Show"} the people list" aria-pressed="${S.peoplePanel}">${ic("group")}</button>`;
+  const people = `<button type="button" class="cb${S.strip ? " sel" : ""}" data-act="people" title="${S.strip ? "Hide" : "Show"} the people" aria-pressed="${S.strip}">${ic("group")}</button>`;
   return `<div class="ctlrow">
     <div class="side">${S.stageFs ? "" : `<button type="button" class="cb dim" data-act="side" title="${S.side ? "Hide the sidebar" : "Show the sidebar"}" aria-label="${S.side ? "Hide" : "Show"} the sidebar">${ic(S.side ? "left_panel_close" : "left_panel_open")}</button>`}
       ${r ? `<button type="button" class="cb dim" data-act="invite" title="Copy the room's invite link">${ic("person_add")}<span class="lbl2">Copy invite link</span></button>` : ""}</div>
@@ -1560,8 +1551,8 @@ function render() {
   const r = curRoom();
   let html;
   if (S.view === "fullscreen") html = renderFullscreen();
-  else if (S.stageFs && !S.classic && S.view === "watched") html = `<div class="stagefs">${renderStage(null)}${S.peoplePanel ? renderPeopleAll() : ""}</div>`;
-  else if (S.stageFs && !S.classic && r && r.state === "joined") html = `<div class="stagefs">${renderStage(r)}${S.peoplePanel ? renderPeople(r) : ""}</div>`;
+  else if (S.stageFs && !S.classic && S.view === "watched") html = `<div class="stagefs">${renderStage(null)}</div>`;
+  else if (S.stageFs && !S.classic && r && r.state === "joined") html = `<div class="stagefs">${renderStage(r)}</div>`;
   else html = `<div class="hb g0 st p-app">${S.side || S.classic ? renderSide() : ""}${renderMain(fw, fh)}</div>`;
   if (S.modal === "stream") html += streamModal();
   else if (S.modal === "settings") html += settingsModal();
@@ -1662,8 +1653,7 @@ document.addEventListener("click", (e) => {
     case "discard": case "stop": Object.assign(S, { sharing: "none", modal: null }); S.popped.delete(myKey()); break;
     case "exitfs": exitFs(); break;
     case "side": S.side = !S.side; break;
-    case "people": S.peoplePanel = !S.peoplePanel; break;
-    case "strip": S.strip = !S.strip; break;
+    case "people": S.strip = !S.strip; break;
     case "popview": V().stagePopped = !V().stagePopped; break;
     case "stagefs": S.stageFs = !S.stageFs; break;
     case "invite": render(); return toast("Invite link copied");
