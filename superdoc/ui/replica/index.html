@@ -1094,11 +1094,12 @@ function stTile(it, combined, cam) {
 function renderStage(r) {
   const items = r ? stageItems(r) : watchedItems();
   syncOrder(items);
-  const vis = V().order.map((k) => items.find((i) => i.key === k)).filter((i) => i && !S.popped.has(i.key));
+  const vis = V().order.map((k) => items.find((i) => i.key === k)).filter((i) => i && !S.popped.has(i.key) && !(S.hideOwn && i.mine));
   let inner;
   if (V().stagePopped) inner = stNote("open_in_new", "The stage is open in its own window", "Your streams keep playing there.", `<button type="button" class="btn btn-secondary" data-act="popview">${ic("close_fullscreen")}Bring it back</button>`);
   else if (!items.length) inner = r ? stNote("tv_off", "Nobody is sharing yet", "Share your screen with the button below.")
     : stNote("visibility_off", "You're not watching anything", "Open a room in the sidebar and pick a stream to watch.");
+  else if (!vis.length && S.hideOwn && items.some((i) => i.mine)) inner = stNote("visibility_off", "Your own streams are hidden", "Others still see them. Turn this off in the Layout menu.");
   else if (!vis.length) inner = stNote("open_in_new", "Every stream is popped out", "Click a person below to bring their stream back.");
   else {
     const pairs = pipPairs(items), inPip = new Set([...pairs.values()].map((c) => c.key));
@@ -1186,6 +1187,7 @@ function layoutMenu() {
     <div class="msep"></div>
     <div class="mrow"><span class="cbx${V().pip ? " on" : ""}" role="checkbox" tabindex="0" aria-checked="${V().pip}" data-act="pip" title="A webcam sits inside its owner's screen share, if they have one running"><span class="box">${ic("check")}</span>Webcam in picture</span></div>
     <div class="mrow"><span class="cbx${S.tagsAlways ? " on" : ""}" role="checkbox" tabindex="0" aria-checked="${!!S.tagsAlways}" data-act="tagsalways" title="Off: name and audio status only show while you hover a stream"><span class="box">${ic("check")}</span>Always show names</span></div>
+    <div class="mrow"><span class="cbx${S.hideOwn ? " on" : ""}" role="checkbox" tabindex="0" aria-checked="${!!S.hideOwn}" data-act="hideown" title="Your screen and webcam leave the stage here; others still see them"><span class="box">${ic("check")}</span>Hide my own streams</span></div>
     <div class="msep"></div>${mi("restart_alt", "Reset sizes and positions", "resetlayout")}`;
 }
 function roomMenu() {
@@ -1557,7 +1559,7 @@ function applyPreset(key) {
 const framePt = (cx, cy) => { const fr = frame.getBoundingClientRect(); return { x: (cx - fr.left) / SCALE, y: (cy - fr.top) / SCALE }; };
 const exitFs = () => { S.view = S.fsBack; };
 const enterFs = (key) => { if (S.view !== "fullscreen") S.fsBack = S.view; Object.assign(S, { fsKey: key, view: "fullscreen" }); };
-const STAY = new Set(["fps", "preset", "pip", "tagsalways","campick", "auto", "rename", "cancel", "forgetask", "mute", "level", "stats"]); /* menu actions that keep the menu open */
+const STAY = new Set(["fps", "preset", "pip", "tagsalways", "hideown", "campick", "auto", "rename", "cancel", "forgetask", "mute", "level", "stats"]); /* menu actions that keep the menu open */
 document.addEventListener("click", (e) => {
   const pre = e.target.closest("[data-preset]");
   if (pre) return applyPreset(pre.dataset.preset);
@@ -1657,6 +1659,7 @@ document.addEventListener("click", (e) => {
     case "camset": if (S.view === "fullscreen") exitFs(); S.modal = "cam"; break;
     case "pip": V().pip = !V().pip; break;
     case "tagsalways": S.tagsAlways = !S.tagsAlways; break;
+    case "hideown": S.hideOwn = !S.hideOwn; break;
     case "chsrc": render(); return toast("The system's screen and window picker opens here", "swap_horiz");
     case "audio":
       S.audioOn = !S.audioOn; S.audioSrc = S.audioOn ? "Desktop audio" : "No audio"; /* the button means the whole desktop; a single app is in the arrow's list */
