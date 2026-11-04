@@ -24,6 +24,82 @@ fan-out**, **transfer** between rooms, and the two **bandwidth modes** with
 
 ---
 
+## Presets: Text, Quality, Gaming; the keyframe interval is saved (2026-11-04, plan decision D8)
+
+The four presets (Low-Latency, Balanced, Quality, Gaming) and the Advanced tuning rows are gone. The
+user's table (`client/src/presets.rs`, `EncoderPreset`):
+
+| preset | FPS (set once) | encoding (`QualityLevel`) | keyframe interval | tune (hidden) |
+| --- | --- | --- | --- | --- |
+| Text | 15 | Quality | 250 ms | best quality |
+| Quality | 60 | Quality | 1000 ms | best quality |
+| Gaming | 120 | Performance | 250 ms | low latency |
+
+*Why (user's table, plan decision D8):* three presets people can tell apart replace four that were
+partly twins; only Performance and Quality survive as "encoding" modes (the `target-usage` / x264
+`speed-preset` mapping below is unchanged, Quality = 4 on Mesa AMD, Performance = 2). Text is for
+documents and code: sharp at a low frame rate, a keyframe is cheap at 15 fps so 250 ms costs little.
+
+- **A preset sets the FPS once.** `apply_preset_to_start_stream` / `DestEdit::apply_preset` write the
+  preset's frame rate, quality level, tune and keyframe interval; the FPS dropdown afterwards changes
+  only the rate. "Which preset is lit" is derived from **quality level + keyframe interval** only
+  (`EncoderPreset::detect`), so a hand-changed FPS keeps the highlight, and a stale stored tune does not
+  unlight it (the tune only matters on x264 and is no longer shown). A combination that matches no preset
+  (an older settings file) lights no button; the Video card's caption always reads the real values
+  (`60 FPS · Quality encoding · Keyframe 1000 ms`) and never says "custom".
+- **The keyframe interval is saved** in `settings.toml` (`start_stream_defaults.gop_millis`, written at
+  "Go live" with the rest) and restored by `apply_start_stream_defaults`. It used to be reset to the
+  default on every start because only Gaming moved it; now every preset sets one, so forgetting it would
+  show a preset's name with another preset's interval. `session::save_start_stream_defaults` now takes the
+  whole `StartStreamDefaults`.
+- **Old files keep loading.** `StartStreamDefaults.quality_level` loads `"balanced"` (the retired middle
+  level) as `quality` (`deserialize_with`); `tune = "low_latency"` is kept as stored (hidden, only x264
+  reads it); a missing `gop_millis` becomes 1000 ms (`DEFAULT_GOP_MILLIS`, the Quality preset's), a missing
+  `quality_level` Quality. An old `performance` stays Performance at 1000 ms, which is no preset until the
+  user picks Gaming (the old Gaming's 750 ms was never saved, and old Low-Latency and Gaming are
+  indistinguishable in the file, so they cannot both map to Quality as the old preset names would
+  suggest). Stored values are not rewritten until the next save. `QualityLevel::Balanced` still exists in
+  the enum (x264 `medium`, its `target-usage`), it is just not offered or produced any more.
+  `EncoderPreset::from_value("balanced" | "low_latency")` is Quality, for symmetry with the browser, which
+  stores preset names (`docs/js/core/video-tx.js` `ENCODER_PRESETS`).
+- **Fresh app default = the Quality preset's fields** (`AppState::default`, `StartStreamDefaults::default`)
+  at the old 30 fps / 8000 kbps; 30 fps with Quality encoding and 1000 ms still lights "Quality" (the FPS is
+  not part of the match). `capture::DEFAULT_GOP_MILLIS` is 1000 now (was the protocol spec's 2 s; the spec
+  figure is only a self-heal ceiling, a shorter interval stays conformant, it costs bitrate and buys a
+  faster join/recovery). The webcam (task I8, not built yet) is fixed to Performance and 2000 ms: pass
+  `gop_millis: 2000` in its `VideoParams`; nothing else is needed.
+- **Removed:** `EncoderProfile` (and `EncoderBackend::tune_applies`, `quality_effect`,
+  `visible_quality_levels`, `display_quality_level`, `EncoderPreset::visible_for/detect_for`): the twin hiding
+  they drove (#95) is moot with three presets that are distinct on every backend. The "hide a setting that
+  does nothing" rule is kept by deleting the Tune, Quality-level and Keyframe rows rather than hiding them.
+- **UI** (`ui/stream_settings.rs`, replica `superdoc/ui/replica/index.html`): right column **Compression**
+  (Codec, Bitrate) then **Video** (FPS dropdown, Preset, caption). The Source card's **Change** button is
+  there staged and live. While live it ends the stream first (`Discard` + `StageShare`: there is no source
+  swap under a running encoder; it also stops the capture's other rooms), and the modal reopens staged.
+- **Keyframe interval at 250 ms: nothing broke.** `key-int-max` = `capture::gop_frames` (rounded frames:
+  Text is 4 frames = 267 ms at 15 fps). The sender-redundancy bursts (#97: +300 ms / +1 s repeats, one per
+  `KEYFRAME_BURST_MIN_GAP` = 2 s) only follow forced IDRs and are harmless next to a natural IDR every
+  250 ms; `IdrControl`'s "big" test is by size (> 1/4 s of bitrate), independent of the interval, and a
+  natural IDR that large at 250 ms would eat the whole interval's budget, which the VBR does not produce on
+  these contents. Not stress-tested with a big-IDR scene at 250 ms (the rig's vkcube IDRs are 30-60 kB).
+- **Measured** (headless rig, release build, H.264 VA, 1080p vkcube, 8000 kbps, GStreamer tracer on the
+  encoder output pad, `DELTA_UNIT` clear = keyframe; the client log's `sending a keyframe` line only covers
+  keyframes of 24+ datagrams, vkcube's are smaller at 60/120 fps, so it cannot be used for this):
+
+  | preset | encoder output | keyframes | median gap (p10 / p90) |
+  | --- | --- | --- | --- |
+  | Text | 15.0 fps | 282 in ~75 s | 267 ms (263 / 271) |
+  | Quality | 60.0 fps | 27 in ~24 s | 1001 ms (697 / 1003; the 697 is the transition) |
+  | Gaming | 119.7 fps | 241 in ~60 s | 250 ms (246 / 254) |
+
+  The native viewer decoded Text (sidebar "16 fps", 5.6 Mbps) and Gaming ("121 fps"). `settings.toml` after
+  "Go live" with Text: `framerate = 15`, `tune = "best_quality"`, `quality_level = "quality"`,
+  `gop_millis = 250`; the next staged card opened with Text / 250 ms / 15 fps. Presets were switched live
+  Text -> Quality -> Gaming (a branch rebuild each, the stream kept running).
+- **Cost to know:** Quality is x264 `veryslow` / VA `target-usage` 4 and it is now also the default and the
+  Text preset, where Balanced (`medium`) was the default: on a software-only machine (Windows without VA) the
+  default encode is much heavier than before. The user's table asked for it; not measured on x264.
+
 ## The shape of a capture, after this stage
 
 One capture is **one screen grab, one GStreamer pipeline, N destinations**:
@@ -450,7 +526,7 @@ Mechanism (read from xdpw 0.8.4 `pipewire_screencast.c` + `ext_image_copy.c`, pi
 
 ## `target-usage` is a bitfield on Mesa AMD; Balanced = 3, Quality = 4 (2026-11-01, #92)
 
-**2026-11-01 (#95): the UI hides what the mapping makes a twin, per running backend.** On Mesa AMD,
+**2026-11-01 (#95): the UI hides what the mapping makes a twin, per running backend.** *(Superseded 2026-11-04: `EncoderProfile` and the twin hiding were deleted when the presets became Text/Quality/Gaming, see "Presets: Text, Quality, Gaming".)* On Mesa AMD,
 Performance (2) and Balanced (3) are the same encode (table below), so the stream-settings modal no longer
 offers a Balanced quality level there, and Low-Latency (Performance, 2000 ms) is the same encode as Balanced
 (Tune is dropped on VA) so that preset is hidden too (user rule: "If a setting doesn't do anything, hide it").
@@ -1013,6 +1089,8 @@ after both a 35 s and a 120 s pause.
 ---
 
 ## Encoder tuning controls
+
+**Superseded in the UI 2026-11-04** (Tune, Quality-level and Keyframe rows and the four old presets are gone, see "Presets: Text, Quality, Gaming"); the backend mapping below is still how the fields are encoded.
 
 **Added 2026-07-28.** Three more per-destination live-editable settings, alongside
 resolution/framerate/bitrate: **Tune** (Low-Latency / Best Quality — `BestQuality` default),
@@ -1772,8 +1850,8 @@ strings equal the wire strings; every new field is `#[serde(default)]` so an old
 still loads. *Why separate from the live `AppState` settings view:* the live `framerate`/
 `bitrate_kbps` reset to defaults every launch ("every launch starts fresh"), which is a different
 question from "what did the user last save"; tune/quality only exist per destination.
-First-run fallback equals the backend `#[default]`s: 30 fps / 8000 kbps / `best_quality` /
-`balanced` / `constant` / H.264. The `[start_stream_defaults]` block is written to `settings.toml`
+First-run fallback (since 2026-11-04) is the Quality preset: 30 fps / 8000 kbps / `best_quality` /
+`quality` / 1000 ms keyframe interval (saved too now) / H.264. The `[start_stream_defaults]` block is written to `settings.toml`
 in the app's config dir; check a persistence change with a scratch `XDG_CONFIG_HOME` and the `run`
 skill's `drive.sh`.
 

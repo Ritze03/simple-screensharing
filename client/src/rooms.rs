@@ -40,6 +40,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::capture::{QualityLevel, TuneMode, VideoCodec};
+use crate::presets::EncoderPreset;
 use crate::net::{format_join_string, parse_join_string};
 
 /// The identity of the room a join string points at: `server|room-id|key`
@@ -454,10 +455,17 @@ pub struct StartStreamDefaults {
     pub framerate: u32,
     #[serde(default = "StartStreamDefaults::default_bitrate_kbps")]
     pub bitrate_kbps: u32,
+    /// Not shown any more (the presets set it, `presets.rs`); kept so an old file's value loads.
     #[serde(default)]
     pub tune: TuneMode,
-    #[serde(default)]
+    /// A stored `balanced` (the retired middle level) loads as `quality`
+    /// ([`Self::balanced_is_quality`]); a file without the key gets the Quality preset's.
+    #[serde(default = "StartStreamDefaults::default_quality_level", deserialize_with = "StartStreamDefaults::balanced_is_quality")]
     pub quality_level: QualityLevel,
+    /// Keyframe interval in ms, saved since 2026-11-04 (it used to reset on every start).
+    /// A file that predates it gets the Quality preset's, `DEFAULT_GOP_MILLIS`.
+    #[serde(default = "StartStreamDefaults::default_gop_millis")]
+    pub gop_millis: u32,
     /// `#[serde(default)]` (-> `VideoCodec::H264`) is load-bearing here:
     /// every existing user's on-disk `settings.toml` predates this field, so
     /// it must deserialize to exactly the behavior they already had rather
@@ -474,15 +482,36 @@ impl StartStreamDefaults {
     fn default_bitrate_kbps() -> u32 {
         crate::session::DEFAULT_BITRATE_KBPS
     }
+
+    fn default_quality_level() -> QualityLevel {
+        EncoderPreset::Quality.tuning().quality_level
+    }
+
+    fn default_gop_millis() -> u32 {
+        EncoderPreset::Quality.tuning().gop_millis
+    }
+
+    /// `Why (user's preset table, 2026-11-04):` the presets only know Performance and Quality, so the
+    /// retired Balanced level an old `settings.toml` may hold becomes Quality. The file is not
+    /// rewritten until the next save.
+    fn balanced_is_quality<'de, D: serde::Deserializer<'de>>(d: D) -> Result<QualityLevel, D::Error> {
+        Ok(match QualityLevel::deserialize(d)? {
+            QualityLevel::Balanced => QualityLevel::Quality,
+            level => level,
+        })
+    }
 }
 
 impl Default for StartStreamDefaults {
+    /// The Quality preset's encoder fields at the default frame rate and bitrate.
     fn default() -> Self {
+        let t = EncoderPreset::Quality.tuning();
         Self {
             framerate: Self::default_framerate(),
             bitrate_kbps: Self::default_bitrate_kbps(),
-            tune: TuneMode::default(),
-            quality_level: QualityLevel::default(),
+            tune: t.tune,
+            quality_level: t.quality_level,
+            gop_millis: t.gop_millis,
             codec: VideoCodec::default(),
         }
     }
@@ -1032,12 +1061,45 @@ mod tests {
                 bitrate_kbps: 12_000,
                 tune: crate::capture::TuneMode::LowLatency,
                 quality_level: crate::capture::QualityLevel::Performance,
+                gop_millis: 250,
                 codec: crate::capture::VideoCodec::H265,
             },
             ..AppSettings::default()
         };
         let parsed: AppSettings = toml::from_str(&toml::to_string_pretty(&settings).unwrap()).unwrap();
         assert_eq!(parsed.start_stream_defaults, settings.start_stream_defaults);
+        assert_eq!(parsed.start_stream_defaults.gop_millis, 250, "the keyframe interval is saved");
+    }
+
+    /// A real `settings.toml` of the Low-Latency / Balanced era (no `gop_millis`, a `rate_control`
+    /// key of an older era, the retired `balanced` level and `low_latency` tune) still loads: the
+    /// retired Balanced level becomes Quality, the tune is kept, the interval defaults to the
+    /// Quality preset's, and the preset highlighted is Quality.
+    #[test]
+    fn old_balanced_settings_load_as_the_quality_preset() {
+        let old = "language = \"en\"\n\n[start_stream_defaults]\nframerate = 30\nbitrate_kbps = 8000\ntune = \"best_quality\"\nquality_level = \"balanced\"\ncodec = \"h264\"\n";
+        let d = toml::from_str::<AppSettings>(old).unwrap().start_stream_defaults;
+        assert_eq!(d.quality_level, crate::capture::QualityLevel::Quality);
+        assert_eq!(d.gop_millis, crate::capture::DEFAULT_GOP_MILLIS);
+        assert_eq!(d.framerate, 30, "the frame rate stays: a preset sets it only when clicked");
+        let tuning = crate::presets::EncoderTuning { tune: d.tune, quality_level: d.quality_level, gop_millis: d.gop_millis };
+        assert_eq!(tuning.preset(), Some(EncoderPreset::Quality));
+
+        let old = "[start_stream_defaults]\nframerate = 60\nbitrate_kbps = 12000\ntune = \"low_latency\"\nquality_level = \"balanced\"\n";
+        let d = toml::from_str::<AppSettings>(old).unwrap().start_stream_defaults;
+        assert_eq!(d.quality_level, crate::capture::QualityLevel::Quality);
+        assert_eq!(d.tune, crate::capture::TuneMode::LowLatency, "the hidden tune is kept as stored");
+        assert_eq!(d.gop_millis, 1000);
+    }
+
+    /// An old Gaming/Low-Latency user (`performance`) keeps Performance; it is no preset until the
+    /// interval is 250 ms (the old Gaming's 750 ms was never saved).
+    #[test]
+    fn old_performance_settings_keep_performance() {
+        let old = "[start_stream_defaults]\nframerate = 120\nbitrate_kbps = 12000\ntune = \"low_latency\"\nquality_level = \"performance\"\n";
+        let d = toml::from_str::<AppSettings>(old).unwrap().start_stream_defaults;
+        assert_eq!(d.quality_level, crate::capture::QualityLevel::Performance);
+        assert_eq!(d.gop_millis, 1000);
     }
 
     /// A `settings.toml` written before `codec` existed (no `codec` key at

@@ -11,9 +11,11 @@
 //!   sends nothing until it changes" while a Starting row waits for the
 //!   capture's first frame + equal `[Also send to…][Move to…]`),
 //!   Upload bandwidth (Mode / Total / Floor / Per stream or over-budget banner);
-//! - how it's encoded: Video (Framerate / Bitrate / Codec; no encoder-limit
-//!   banner or "Use H.265" offer since 2026-10-15, user: "just annoying"), Encoder (Preset ×4
-//!   + collapsible Advanced: Tune / Quality level / Keyframe interval).
+//! - how it's encoded: Compression (Codec / Bitrate) and Video (FPS dropdown / Preset
+//!   Text, Quality, Gaming + a caption "60 FPS · Quality encoding · Keyframe 1000 ms"). No
+//!   encoder-limit banner or "Use H.265" offer since 2026-10-15 (user: "just annoying"); the
+//!   Advanced tuning rows are gone since 2026-11-04 (plan decision D8: the presets replace them).
+//!   The Source card's Change button is there staged and live.
 //!
 //! Every control row is `[120 label][fill control][72 value]` (the widgets
 //! row helpers), so value boxes share one right edge.
@@ -23,7 +25,7 @@
 //! to [`READOUT_NEED_CAP`]), the two columns stack into one in reading order
 //! (where it goes, then how it's encoded); the modal body already scrolls.
 //! The Preset and Codec rows ([`seg_gated`]) size their segments to their
-//! labels when equal segments would truncate (German's four presets), so they
+//! labels when equal segments would truncate (German labels), so they
 //! never force the stack on their own (#47: they did, at every width).
 //! In practice (checked on the real app, #47): two columns at 1280 and up in
 //! en and de, one column at 960 (912 px modal) and at the 800 minimum (752 px
@@ -47,7 +49,7 @@
 //! the bar's "N rooms ▾", see `action_bar::RoomTargets`).
 
 use egui::{Align, CornerRadius, Rect, Response, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
-use simple_screensharing_client::capture::{self, EncoderProfile, QualityLevel, TuneMode, VideoCodec};
+use simple_screensharing_client::capture::{QualityLevel, VideoCodec};
 use simple_screensharing_client::presets::{
     self, BITRATE_STEP_KBPS, CODEC_DISPLAY_ORDER, EncoderPreset, EncoderTuning, MIN_BITRATE_KBPS, codec_description, codec_label,
 };
@@ -63,16 +65,14 @@ use super::action_bar::{
 use super::{Cx, NextStream, Popover, PopoverKind, UiAction, tr, tr_with};
 use crate::theme::{self, Weight, font};
 use crate::widgets::{
-    self, BannerKind, Btn, DestAction, DestRow, FILL, FooterClick, HBox, ModalSpec, Pill, fade, paint_gradient, paint_galley, text_galley,
+    self, BannerKind, Btn, DestAction, DestRow, FILL, FooterClick, HBox, ModalSpec, Pill, fade, fixed, paint_galley, paint_gradient, paint_text,
+    text_galley,
 };
 
 /// Bandwidth slider ranges (carried over from the former Electron app).
 const TOTAL_RANGE: std::ops::RangeInclusive<u32> = 500..=40_000;
 const FLOOR_RANGE: std::ops::RangeInclusive<u32> = 100..=20_000;
 const BW_STEP: f64 = 100.0;
-/// Keyframe interval slider (mockup).
-const GOP_RANGE: std::ops::RangeInclusive<u32> = 250..=4000;
-const GOP_STEP: f64 = 250.0;
 /// Minimum time the "Applying" pill stays up after a live edit, seconds
 /// (mockup `touch()`): a bitrate-only change applies instantly and would
 /// otherwise never show any feedback.
@@ -84,13 +84,11 @@ const READOUT_NEED_CAP: f32 = 260.0;
 /// Stream-settings modal state.
 #[derive(Default)]
 pub struct StreamSettingsState {
-    adv_open: bool,
     /// The capture the modal was last drawn for: a new one resets the drag
     /// buffers and refreshes the audio source list once.
     opened_for: Option<CaptureSourceId>,
     /// Values of sliders while dragged (pushed on release).
     bitrate: Option<u32>,
-    gop: Option<u32>,
     total: Option<u32>,
     floor: Option<u32>,
     /// `ctx` time of the last live edit pushed (min "Applying" duration).
@@ -160,7 +158,7 @@ struct Anchors {
 pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut StreamSettingsState, capture: CaptureSourceId, room: RoomHandle) {
     let Some(c) = cx.capture(capture) else { return };
     if st.opened_for != Some(capture) {
-        *st = StreamSettingsState { adv_open: st.adv_open, opened_for: Some(capture), taps: st.taps.take(), ..Default::default() };
+        *st = StreamSettingsState { opened_for: Some(capture), taps: st.taps.take(), ..Default::default() };
         cx.act(UiAction::RefreshAudioSources);
     }
     let staged = c.destinations.is_empty();
@@ -284,8 +282,8 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut StreamSettingsState, capt
 /// one `key value…` per line, whenever that changes:
 /// `rect NAME x0 y0 x1 y1` (logical points, window-relative; NAME `fps`,
 /// `codec.I` / `preset.I` indexing `codec_order` / `preset_order`,
-/// `advanced`, `footer`), `fps` / `fps_options` / `codec` / `preset` /
-/// `advanced` / `mode` / `ready` / `open`, plus `ppp` and `screen W H` so the
+/// `change`, `footer`), `fps` / `fps_options` / `codec` / `preset` / `gop` /
+/// `quality` / `tune` / `mode` / `ready` / `open`, plus `ppp` and `screen W H` so the
 /// script can map points to pixels. Unset (always, outside the scripts):
 /// nothing is recorded.
 ///
@@ -397,8 +395,8 @@ fn body(
             source_card(l, cx, c, capture, room, out);
             destinations_card(l, cx, c, capture, room, out, anchors);
             bandwidth_card(l, cx, st, c, target, out);
-            video_card(r, cx, st, c, target, out);
-            encoder_card(r, cx, st, c, target, out);
+            compression_card(r, cx, st, c, target, out);
+            video_card(r, cx, target, out);
         });
     } else {
         // Narrow window: one column in reading order (the body scrolls).
@@ -407,8 +405,8 @@ fn body(
             source_card(ui, cx, c, capture, room, out);
             destinations_card(ui, cx, c, capture, room, out, anchors);
             bandwidth_card(ui, cx, st, c, target, out);
-            video_card(ui, cx, st, c, target, out);
-            encoder_card(ui, cx, st, c, target, out);
+            compression_card(ui, cx, st, c, target, out);
+            video_card(ui, cx, target, out);
         });
     }
 }
@@ -441,8 +439,6 @@ fn column_need_for(ui: &Ui, readout_w: f32, staged: bool) -> f32 {
     let control = [
         // `widgets::segmented`: always equal segments.
         need(&t(&[("ui.stream.bw_per_stream", "Per-stream maximum"), ("ui.stream.bw_absolute", "Absolute maximum")]), true),
-        need(&t(&[("ui.stream.tune_low", "Low latency"), ("ui.stream.tune_best", "Best quality")]), true),
-        need(&t(&[("ui.stream.ql_performance", "Performance"), ("ui.stream.ql_balanced", "Balanced"), ("ui.stream.ql_quality", "Quality")]), true),
         // [`seg_gated`]: label-proportional when equal would truncate.
         need(&presets, false),
         need(&codecs, false),
@@ -513,22 +509,23 @@ fn source_card(ui: &mut Ui, cx: &Cx, c: &LocalCapture, capture: CaptureSourceId,
     let mute_l = tr("ui.stream.mute_audio", "Mute shared audio");
     widgets::card(ui, &tr("ui.stream.source", "Source"), None, |ui| {
         let label = tr("ui.stream.screen", "Screen");
-        if staged {
-            let (_, clicked) = widgets::ctrl_row_value(
-                ui,
-                &label,
-                None,
-                |ui| screen_ro(ui, &screen),
-                |ui| Btn::secondary(&change).show_sized(ui, theme::VALUE_W).clicked(),
-            );
-            if clicked {
-                // Re-pick: throw this capture away and open the picker again
-                // (the modal re-opens by itself once it resolves).
-                out.push(UiAction::Discard(capture));
-                out.push(UiAction::StageShare(room));
-            }
-        } else {
-            widgets::ctrl_row(ui, &label, None, |ui| screen_ro(ui, &screen));
+        let (_, clicked) = widgets::ctrl_row_value(
+            ui,
+            &label,
+            None,
+            |ui| screen_ro(ui, &screen),
+            |ui| {
+                let r = Btn::secondary(&change).show_sized(ui, theme::VALUE_W);
+                drive_dump::rect(|| "change".into(), r.rect);
+                r.clicked()
+            },
+        );
+        if clicked {
+            // Re-pick: throw this capture away and open the picker again (the modal re-opens by itself
+            // once it resolves, staged). While live this ends the stream first: there is no source swap
+            // under a running encoder yet.
+            out.push(UiAction::Discard(capture));
+            out.push(UiAction::StageShare(room));
         }
         let opts: Vec<&str> = names.iter().map(String::as_str).collect();
         widgets::ctrl_row_value(
@@ -725,24 +722,31 @@ fn bandwidth_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, c: &LocalC
 }
 
 // ---------------------------------------------------------------------------
-// How it's encoded
+// How it's encoded: Compression, Video
 // ---------------------------------------------------------------------------
 
-fn video_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, c: &LocalCapture, target: Target, out: &mut Vec<UiAction>) {
+/// Compression: Codec (only when this machine can encode more than one) and Bitrate.
+fn compression_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, c: &LocalCapture, target: Target, out: &mut Vec<UiAction>) {
     let state = cx.state;
     let v = target.values(state);
-    let fps_opts = presets::framerate_options_for(v.framerate);
-    let fps_labels: Vec<String> = fps_opts.iter().map(|f| tr_with("ui.stream.fps", "%{fps} fps", &[("fps", &f.to_string())])).collect();
-    let mut fps_idx = fps_opts.iter().position(|f| *f == v.framerate).unwrap_or(0);
     let supported = AppState::supported_codecs();
-    widgets::card(ui, &tr("ui.stream.video", "Video"), None, |ui| {
-        let labels: Vec<&str> = fps_labels.iter().map(String::as_str).collect();
-        let r = widgets::ctrl_row(ui, &tr("ui.stream.framerate", "Framerate"), None, |ui| widgets::select(ui, "stream_fps", &mut fps_idx, &labels));
-        drive_dump::rect(|| "fps".into(), r.rect);
-        drive_dump::line(|| format!("fps {}\nfps_options {}", v.framerate, fps_opts.iter().map(u32::to_string).collect::<Vec<_>>().join(" ")));
+    widgets::card(ui, &tr("ui.stream.compression", "Compression"), None, |ui| {
         drive_dump::line(|| format!("codec {}\ncodec_order {}", codec_key(v.codec), CODEC_DISPLAY_ORDER.iter().map(|c| codec_key(*c)).collect::<Vec<_>>().join(" ")));
-        if r.changed() {
-            out.push(target.action(NextStream { framerate: fps_opts[fps_idx], ..v }));
+        // Only codecs this machine can encode are drawn (hidden, not greyed out: user rule 2026-11-01),
+        // and with a single one (software x264: H.264 only) there is nothing to choose: no row.
+        if presets::codec_choice_offered(supported) {
+            let opts: Vec<(VideoCodec, &str, bool, &str)> = CODEC_DISPLAY_ORDER
+                .iter()
+                .filter(|c| supported.contains(c))
+                .map(|c| (*c, codec_label(*c), true, codec_description(*c)))
+                .collect();
+            // A stored codec this machine cannot encode (a settings file from another machine) is
+            // shown as the first one it can: that is what the stream would use. Stored value untouched.
+            let mut codec = if supported.contains(&v.codec) { v.codec } else { opts[0].0 };
+            let changed = widgets::ctrl_row(ui, &tr("ui.stream.codec", "Codec"), None, |ui| seg_gated(ui, "codec", &mut codec, &opts, ""));
+            if changed {
+                out.push(target.action(NextStream { codec, ..v }));
+            }
         }
         let bitrate_l = tr("ui.stream.bitrate", "Bitrate");
         if state.bandwidth_mode == BandwidthMode::Absolute {
@@ -778,157 +782,59 @@ fn video_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, c: &LocalCaptu
                 out.push(target.action(NextStream { bitrate_kbps: k, ..v }));
             }
         }
-        // Only codecs this machine can encode are drawn (hidden, not greyed out: user rule 2026-11-01),
-        // and with a single one (software x264: H.264 only) there is nothing to choose: no row.
-        if presets::codec_choice_offered(supported) {
-            let opts: Vec<(VideoCodec, &str, bool, &str)> = CODEC_DISPLAY_ORDER
-                .iter()
-                .filter(|c| supported.contains(c))
-                .map(|c| (*c, codec_label(*c), true, codec_description(*c)))
-                .collect();
-            // A stored codec this machine cannot encode (a settings file from another machine) is
-            // shown as the first one it can: that is what the stream would use. Stored value untouched.
-            let mut codec = if supported.contains(&v.codec) { v.codec } else { opts[0].0 };
-            let changed = widgets::ctrl_row(ui, &tr("ui.stream.codec", "Codec"), None, |ui| seg_gated(ui, "codec", &mut codec, &opts, ""));
-            if changed {
-                out.push(target.action(NextStream { codec, ..v }));
-            }
-        }
     });
 }
 
-fn encoder_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, c: &LocalCapture, target: Target, out: &mut Vec<UiAction>) {
-    encoder_card_for(ui, cx, st, target_profile(c, target), target, out);
-}
-
-/// The encoder this target's settings apply to: a live destination's *running*
-/// backend (it can be x264 although the machine probes VA: a per-branch
-/// fallback, `Destination::encoder_backend`), a staged capture's the probed one.
-/// Which controls do anything depends on it (`EncoderProfile`).
-fn target_profile(c: &LocalCapture, target: Target) -> EncoderProfile {
-    let backend = match target {
-        Target::Live(d, _) => c.destinations.get(&d).map(Destination::encoder_backend),
-        Target::Staged => None,
-    }
-    .unwrap_or_else(capture::detect_encoder_backend);
-    EncoderProfile::of(backend)
-}
-
-/// [`encoder_card`] for a given encoder profile. A control that does nothing on it
-/// is not drawn, and a choice that duplicates another one is drawn once (the
-/// stored value is kept either way): `EncoderProfile::tune_applies`,
-/// `visible_quality_levels`, `EncoderPreset::visible_for`.
-fn encoder_card_for(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, profile: EncoderProfile, target: Target, out: &mut Vec<UiAction>) {
+/// Video: FPS (a dropdown) and the Preset (Text / Quality / Gaming), then one caption line with
+/// what is really set: `60 FPS · Quality encoding · Keyframe 1000 ms`.
+///
+/// `Why the caption is built from the stored values and never says "custom":` the preset sets the FPS
+/// once, so the FPS can be changed by hand without leaving the preset, and a stored combination that
+/// matches no preset (an older settings file) still reads truthfully with no button lit.
+fn video_card(ui: &mut Ui, cx: &Cx, target: Target, out: &mut Vec<UiAction>) {
     let v = target.values(cx.state);
-    let tuning = EncoderTuning { tune: v.tune, quality_level: v.quality_level, gop_millis: v.gop_millis };
-    let mut preset = EncoderPreset::detect_for(tuning, profile);
-    drive_dump::line(|| {
-        // The *drawn* presets and levels, in order (`preset.N` rects index into `preset_order`).
-        let order = EncoderPreset::visible_for(profile).iter().map(|p| p.value()).collect::<Vec<_>>().join(" ");
-        let levels = profile.visible_quality_levels().iter().map(|l| format!("{l:?}").to_lowercase()).collect::<Vec<_>>().join(" ");
-        format!(
-            "preset {}\npreset_order {order}\nadvanced {}\nstored_tune {:?}\nstored_level {:?}\nshown_level {:?}\nlevel_order {levels}\ntune_row {}\nbackend {:?} mesa_amd {}",
-            preset.map_or("custom", EncoderPreset::value),
-            u8::from(st.adv_open),
-            v.tune,
-            v.quality_level,
-            profile.display_quality_level(v.quality_level),
-            u8::from(profile.tune_applies()),
-            profile.backend,
-            profile.mesa_amd,
-        )
-    });
+    let fps_opts = presets::framerate_options_for(v.framerate);
+    let fps_labels: Vec<String> = fps_opts.iter().map(|f| tr_with("ui.stream.fps", "%{fps} fps", &[("fps", &f.to_string())])).collect();
+    let mut fps_idx = fps_opts.iter().position(|f| *f == v.framerate).unwrap_or(0);
+    let mut preset = EncoderTuning { tune: v.tune, quality_level: v.quality_level, gop_millis: v.gop_millis }.preset();
     let preset_opts: Vec<(Option<EncoderPreset>, &str, bool, &str)> =
-        EncoderPreset::visible_for(profile).iter().map(|p| (Some(*p), p.label(), true, p.description())).collect();
-    let adv = tr("ui.stream.advanced", "Advanced tuning");
-    let collapsed_extra = widgets::card(ui, &tr("ui.stream.encoder", "Encoder"), None, |ui| {
+        EncoderPreset::ALL.iter().map(|p| (Some(*p), p.label(), true, p.description())).collect();
+    drive_dump::line(|| {
+        let order = EncoderPreset::ALL.iter().map(|p| p.value()).collect::<Vec<_>>().join(" ");
+        format!("preset {}\npreset_order {order}\ngop {}\nquality {:?}\ntune {:?}", preset.map_or("none", EncoderPreset::value), v.gop_millis, v.quality_level, v.tune)
+    });
+    widgets::card(ui, &tr("ui.stream.video", "Video"), None, |ui| {
+        let labels: Vec<&str> = fps_labels.iter().map(String::as_str).collect();
+        let r = widgets::ctrl_row(ui, &tr("ui.stream.fps_label", "FPS"), None, |ui| widgets::select(ui, "stream_fps", &mut fps_idx, &labels));
+        drive_dump::rect(|| "fps".into(), r.rect);
+        drive_dump::line(|| format!("fps {}\nfps_options {}", v.framerate, fps_opts.iter().map(u32::to_string).collect::<Vec<_>>().join(" ")));
+        if r.changed() {
+            // Only the rate: the encoder mode and the keyframe interval stay.
+            out.push(target.action(NextStream { framerate: fps_opts[fps_idx], ..v }));
+        }
         let changed = widgets::ctrl_row(ui, &tr("ui.stream.preset", "Preset"), None, |ui| seg_gated(ui, "preset", &mut preset, &preset_opts, ""));
         if changed && let Some(p) = preset {
             out.push(target.preset_action(p));
         }
-        let r = widgets::collapser(ui, &mut st.adv_open, &adv);
-        drive_dump::rect(|| "advanced".into(), r.rect);
-        if st.adv_open {
-            adv_rows(ui, st, target, v, profile, out);
-            0.0
-        } else {
-            // What the rows would add to the card: their height + the gap above them.
-            adv_rows_height(ui, target, v, profile) + ui.spacing().item_spacing.y
-        }
+        let slots = [fixed(theme::LABEL_W), FILL];
+        let row = HBox::new("preset_caption", 16.0).slots(&slots).show(ui);
+        let c = row.cell(1);
+        paint_text(ui, c, &preset_caption(&v), font(Weight::Regular, theme::FS_TINY), theme::TEXT_DIM, Align::Min);
     });
-    // Reserve it below the card instead (see `adv_rows_height`). `add_space` only moves
-    // the cursor, which already sits one item gap below the card, so that gap is part
-    // of the reservation. (Not at all when open: even a zero spacer would add the gap
-    // to the column's height.)
-    if collapsed_extra > 0.0 {
-        ui.add_space((collapsed_extra - ui.spacing().item_spacing.y).max(0.0));
-    }
 }
 
-/// The Advanced tuning rows (Tune, Quality level, Keyframe interval). Tune is left out
-/// on backends that ignore it, and a quality level that is another one's twin on this
-/// driver is not offered (`EncoderProfile`).
-fn adv_rows(ui: &mut Ui, st: &mut StreamSettingsState, target: Target, v: NextStream, profile: EncoderProfile, out: &mut Vec<UiAction>) {
-    let (low, best) = (tr("ui.stream.tune_low", "Low latency"), tr("ui.stream.tune_best", "Best quality"));
-    let (perf, bal, qual) = (
-        tr("ui.stream.ql_performance", "Performance"),
-        tr("ui.stream.ql_balanced", "Balanced"),
-        tr("ui.stream.ql_quality", "Quality"),
-    );
-    // Tune only exists in x264; the VA encoders ignore it, so there the row is not shown.
-    if profile.tune_applies() {
-        let mut tune = v.tune;
-        if widgets::ctrl_row(ui, &tr("ui.stream.tune", "Tune"), None, |ui| {
-            widgets::segmented(ui, &mut tune, &[(TuneMode::LowLatency, low.as_str()), (TuneMode::BestQuality, best.as_str())])
-        }) {
-            out.push(target.action(NextStream { tune, ..v }));
-        }
-    }
-    // A stored level that is a twin of a visible one (Balanced on Mesa AMD = Performance)
-    // is shown as that one; clicking the shown one is no change, so the stored value
-    // stays until the user picks another.
-    let label = |l: QualityLevel| match l {
-        QualityLevel::Performance => perf.as_str(),
-        QualityLevel::Balanced => bal.as_str(),
-        QualityLevel::Quality => qual.as_str(),
+/// The Video card's caption: "60 FPS · Quality encoding · Keyframe 1000 ms".
+fn preset_caption(v: &NextStream) -> String {
+    let mode = match v.quality_level {
+        QualityLevel::Performance => tr("ui.stream.ql_performance", "Performance"),
+        QualityLevel::Balanced => tr("ui.stream.ql_balanced", "Balanced"),
+        QualityLevel::Quality => tr("ui.stream.ql_quality", "Quality"),
     };
-    let opts: Vec<(QualityLevel, &str)> = profile.visible_quality_levels().into_iter().map(|l| (l, label(l))).collect();
-    let mut ql = profile.display_quality_level(v.quality_level);
-    if widgets::ctrl_row(ui, &tr("ui.stream.quality_level", "Quality level"), None, |ui| widgets::segmented(ui, &mut ql, &opts)) {
-        out.push(target.action(NextStream { quality_level: ql, ..v }));
-    }
-    let mut gop = st.gop.unwrap_or(v.gop_millis);
-    let r = widgets::slider_row(
-        ui,
-        &tr("ui.stream.keyframe", "Keyframe interval"),
-        Some(&tr("ui.stream.keyframe_tip", "GOP length. Shorter recovers faster from fast motion, costs more bitrate.")),
-        &mut gop,
-        GOP_RANGE,
-        GOP_STEP,
-        0,
-        " ms",
-    );
-    if let Some(g) = commit(r, gop, &mut st.gop) {
-        out.push(target.action(NextStream { gop_millis: g, ..v }));
-    }
-
-}
-
-/// Height the Advanced rows take, laid out once in an invisible child that advances
-/// nothing. The Encoder card reserves it as empty space below itself while Advanced is
-/// collapsed, so the modal is as tall closed as open.
-///
-/// `Why:` the user disliked the modal growing and shrinking (and jumping, it is
-/// centred) when Advanced was toggled (2026-10-15). A hidden layout pass is
-/// deterministic (no one-frame resize on first open) and follows font and language;
-/// the space sits outside the card (empty body space, not an oversized card). In the
-/// two-column layout it only matters when the right column is the taller one.
-fn adv_rows_height(ui: &mut Ui, target: Target, v: NextStream, profile: EncoderProfile) -> f32 {
-    let rect = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), f32::INFINITY));
-    let mut ghost = ui.new_child(egui::UiBuilder::new().max_rect(rect).invisible().sizing_pass());
-    // Scratch drag buffers and action sink: the ghost must not touch the real ones.
-    adv_rows(&mut ghost, &mut StreamSettingsState::default(), target, v, profile, &mut Vec::new());
-    ghost.min_rect().height()
+    tr_with(
+        "ui.stream.preset_caption",
+        "%{fps} FPS · %{mode} encoding · Keyframe %{ms} ms",
+        &[("fps", &v.framerate.to_string()), ("mode", &mode), ("ms", &v.gop_millis.to_string())],
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1094,7 +1000,6 @@ fn seg_gated<T: PartialEq + Copy>(ui: &mut Ui, dump: &str, current: &mut T, opti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use simple_screensharing_client::capture::EncoderBackend;
 
     /// #47: at the modal's full width (1120 − 2 × 20 frame padding, gap 12)
     /// every shipped locale must get two columns, even with the Screen
@@ -1136,61 +1041,18 @@ mod tests {
         }
     }
 
-    /// The Encoder card plus its reserved space is as tall closed as open, so
-    /// toggling Advanced never resizes (or moves) the centred modal.
+    /// The caption reads the stored values and never says "custom".
     #[test]
-    fn encoder_card_height_does_not_depend_on_advanced() {
-        let state = AppState::default();
-        let (nav, shell, videos) = (super::super::Nav::default(), super::super::Shell::default(), super::super::VideoViews::default());
-        let height = |adv_open: bool, profile: EncoderProfile| {
-            let ctx = egui::Context::default();
-            theme::apply(&ctx);
-            let mut st = StreamSettingsState { adv_open, ..Default::default() };
-            let mut h = 0.0;
-            // Two frames: fonts load on the first.
-            for _ in 0..2 {
-                let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        let mut actions = Vec::new();
-                        let cx = Cx::new(&state, &nav, &shell, &videos, &mut actions);
-                        // A scope's rect is its content, like a body column's.
-                        h = ui.scope(|ui| encoder_card_for(ui, &cx, &mut st, profile, Target::Staged, &mut Vec::new())).response.rect.height();
-                    });
-                });
-            }
-            h
+    fn caption_shows_fps_mode_and_keyframe() {
+        let v = NextStream {
+            framerate: 120,
+            bitrate_kbps: 8000,
+            tune: simple_screensharing_client::capture::TuneMode::LowLatency,
+            quality_level: QualityLevel::Performance,
+            gop_millis: 250,
+            codec: VideoCodec::H264,
         };
-        for profile in [EncoderProfile::new(EncoderBackend::Software, false), EncoderProfile::new(EncoderBackend::Vaapi, false), EncoderProfile::new(EncoderBackend::Vaapi, true)] {
-            let (open, closed) = (height(true, profile), height(false, profile));
-            assert!((open - closed).abs() < 0.5, "{profile:?}: open {open} px vs closed {closed} px");
-        }
-    }
-
-    /// The Tune row is drawn on x264 and gone on the VA encoders, which ignore it:
-    /// the Encoder card is one control row shorter there (the row's height is the
-    /// only difference, so any larger gap means something else changed too).
-    #[test]
-    fn tune_row_is_only_drawn_where_it_does_something() {
-        let state = AppState::default();
-        let (nav, shell, videos) = (super::super::Nav::default(), super::super::Shell::default(), super::super::VideoViews::default());
-        let open_height = |profile: EncoderProfile| {
-            let ctx = egui::Context::default();
-            theme::apply(&ctx);
-            let mut st = StreamSettingsState { adv_open: true, ..Default::default() };
-            let mut h = 0.0;
-            for _ in 0..2 {
-                let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                    egui::CentralPanel::default().show(ctx, |ui| {
-                        let mut actions = Vec::new();
-                        let cx = Cx::new(&state, &nav, &shell, &videos, &mut actions);
-                        h = ui.scope(|ui| encoder_card_for(ui, &cx, &mut st, profile, Target::Staged, &mut Vec::new())).response.rect.height();
-                    });
-                });
-            }
-            h
-        };
-        let (x264, va) = (open_height(EncoderProfile::new(EncoderBackend::Software, false)), open_height(EncoderProfile::new(EncoderBackend::Vaapi, true)));
-        let row = theme::CTL_H + theme::S2;
-        assert!(x264 - va >= row - 4.0, "x264 card {x264} px, VA card {va} px: Tune row (~{row} px) missing on x264 or still there on VA");
+        assert_eq!(preset_caption(&v), "120 FPS · Performance encoding · Keyframe 250 ms");
+        assert_eq!(preset_caption(&NextStream { framerate: 30, ..v }), "30 FPS · Performance encoding · Keyframe 250 ms");
     }
 }

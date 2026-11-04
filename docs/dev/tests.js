@@ -820,10 +820,14 @@ test("jitter: reset() clears queue and pacing anchor", () => {
   ok(jb.nextDelay(20) <= 40 + 1e-9, "re-anchored on the first chunk after reset");
 });
 
-test("presets: the four native presets are mapped", () => {
-  eq(Object.keys(ENCODER_PRESETS), ["low_latency", "balanced", "quality", "gaming"]);
-  eq(ENCODER_PRESETS.gaming.gopMs, 750);
-  eq(ENCODER_PRESETS.balanced.gopMs, 2000);
+test("presets: the three native presets are mapped, the retired names load as Quality", () => {
+  eq(Object.keys(ENCODER_PRESETS), ["text", "quality", "gaming", "balanced", "low_latency"]);
+  const row = (p) => [p.fps, p.latencyMode, p.gopMs];
+  eq(row(ENCODER_PRESETS.text), [15, "quality", 250]);
+  eq(row(ENCODER_PRESETS.quality), [60, "quality", 1000]);
+  eq(row(ENCODER_PRESETS.gaming), [120, "realtime", 250]);
+  eq(ENCODER_PRESETS.balanced, ENCODER_PRESETS.quality);
+  eq(ENCODER_PRESETS.low_latency, ENCODER_PRESETS.quality);
 });
 
 // ------------------------------------------------------------------------------------------------ reverse vectors (JS -> Rust)

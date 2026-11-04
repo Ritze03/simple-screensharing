@@ -6,24 +6,31 @@
 
 import { sniffCodec } from "./codec.js";
 
-export const DEFAULT_GOP_MS = 2000; // client/src/capture.rs DEFAULT_GOP_MILLIS
+export const DEFAULT_GOP_MS = 1000; // client/src/capture.rs DEFAULT_GOP_MILLIS (the Quality preset's)
 export const KEYFRAME_COALESCE_MS = 100; // spec §9: ignore a KeyframeRequest within ~100 ms of an IDR
 
 /**
- * Native encoder presets (client/src/presets.rs) mapped onto what WebCodecs can express.
- *  - tune LowLatency   -> latencyMode "realtime"   (BestQuality -> "quality")
+ * Native encoder presets (client/src/presets.rs, the user's table, plan decision D8, 2026-11-04) mapped onto what
+ * WebCodecs can express. `fps` is what picking the preset sets once (changing the FPS by hand keeps the rest).
+ *   text    15 fps, Quality encoding,     keyframe  250 ms
+ *   quality 60 fps, Quality encoding,     keyframe 1000 ms
+ *   gaming 120 fps, Performance encoding, keyframe  250 ms
+ *  - encoding mode Quality -> latencyMode "quality", Performance -> "realtime" (the native tune and quality level are
+ *    NATIVE-ONLY otherwise: x264 speed-preset / VA target-usage have no WebCodecs equivalent).
  *  - rate control: not a setting (#88). Always bitrateMode "variable" (native Dynamic = VA vbr). The native Static
  *    (CQP) mode was removed after it froze streams on motion; WebCodecs has no per-frame-QP path here anyway.
  *  - GOP               -> forced keyframe interval (WebCodecs has no GOP knob; we call encode({keyFrame}))
- *  - quality level (x264 speed-preset / VA target-usage): NATIVE-ONLY, no WebCodecs equivalent.
- * `low_latency` is kept so a stored/native value stays valid, but here it is identical to `balanced`: the UI
- * (ui/app.js) does not offer it and shows it as Balanced (user rule 2026-11-01, #93: hide what does nothing).
+ * The webcam will be fixed to Performance, keyframe 2000 ms (pass `gopMs`/`latencyMode` explicitly, no preset).
+ * `balanced` and `low_latency` are the retired names: a stored value (the UI keeps the preset name in localStorage,
+ * ui/store.js) loads as Quality, like the native settings file (`rooms::StartStreamDefaults`).
  */
+const QUALITY_PRESET = { fps: 60, latencyMode: "quality", gopMs: 1000 };
 export const ENCODER_PRESETS = Object.freeze({
-  low_latency: { latencyMode: "realtime", gopMs: DEFAULT_GOP_MS },
-  balanced: { latencyMode: "realtime", gopMs: DEFAULT_GOP_MS },
-  quality: { latencyMode: "quality", gopMs: DEFAULT_GOP_MS },
-  gaming: { latencyMode: "realtime", gopMs: 750 },
+  text: { fps: 15, latencyMode: "quality", gopMs: 250 },
+  quality: QUALITY_PRESET,
+  gaming: { fps: 120, latencyMode: "realtime", gopMs: 250 },
+  balanced: QUALITY_PRESET,
+  low_latency: QUALITY_PRESET,
 });
 
 // H.264 levels: [name byte, MaxMBPS, MaxFS]

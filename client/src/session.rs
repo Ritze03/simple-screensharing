@@ -1883,9 +1883,10 @@ impl Default for AppState {
             share_error: None,
             bitrate_kbps: DEFAULT_BITRATE_KBPS,
             framerate: DEFAULT_FRAMERATE,
-            tune: capture::TuneMode::default(),
-            quality_level: capture::QualityLevel::default(),
-            gop_millis: capture::DEFAULT_GOP_MILLIS,
+            // The Quality preset (`presets::EncoderPreset`), a fresh app's choice.
+            tune: crate::presets::EncoderPreset::Quality.tuning().tune,
+            quality_level: crate::presets::EncoderPreset::Quality.tuning().quality_level,
+            gop_millis: crate::presets::EncoderPreset::Quality.tuning().gop_millis,
             codec: capture::VideoCodec::default(),
             new_stream_room: None,
             bandwidth_mode: settings.bandwidth_mode,
@@ -2024,19 +2025,12 @@ pub fn save_catch_up_speed_percent(percent: u32) {
 }
 
 /// Persist the "START A STREAM" form's current values. Same load-modify-save
-/// shape as `save_bandwidth_settings`, and for the same reason all five are
+/// shape as `save_bandwidth_settings`, and for the same reason all of them are
 /// written together: they're one coherent form, saved on every change to
 /// that form, so a mid-edit crash never leaves the persisted defaults half-updated.
-pub fn save_start_stream_defaults(
-    framerate: u32,
-    bitrate_kbps: u32,
-    tune: crate::capture::TuneMode,
-    quality_level: crate::capture::QualityLevel,
-    codec: crate::capture::VideoCodec,
-) {
+pub fn save_start_stream_defaults(defaults: StartStreamDefaults) {
     let mut settings = AppSettings::load();
-    settings.start_stream_defaults =
-        crate::rooms::StartStreamDefaults { framerate, bitrate_kbps, tune, quality_level, codec };
+    settings.start_stream_defaults = defaults;
     if let Err(e) = settings.save() {
         tracing::warn!("failed to save start-stream defaults: {e:#}");
     }
@@ -5227,23 +5221,18 @@ impl AppState {
     /// live "next capture" fields — see [`Self::apply_start_stream_defaults`]
     /// for the other direction.
     pub fn set_start_stream_defaults(defaults: StartStreamDefaults) {
-        save_start_stream_defaults(
-            defaults.framerate,
-            defaults.bitrate_kbps,
-            defaults.tune,
-            defaults.quality_level,
-            defaults.codec,
-        );
+        save_start_stream_defaults(defaults);
     }
 
     /// The live "next capture" settings in persisted-defaults shape
-    /// (everything the form saves; GOP is deliberately not part of it).
+    /// (everything the form saves, the keyframe interval included).
     pub fn current_start_stream_settings(&self) -> StartStreamDefaults {
         StartStreamDefaults {
             framerate: self.framerate,
             bitrate_kbps: self.bitrate_kbps,
             tune: self.tune,
             quality_level: self.quality_level,
+            gop_millis: self.gop_millis,
             codec: self.codec,
         }
     }
@@ -5255,7 +5244,7 @@ impl AppState {
     }
 
     /// Push the persisted last-used values into the live "next capture"
-    /// fields, and reset `gop_millis` to [`capture::DEFAULT_GOP_MILLIS`].
+    /// fields.
     ///
     /// `Why this exists:` [`Self::stage_video_share`] (like the
     /// `start_video_share` it replaced) reads those process-wide fields, not
@@ -5265,20 +5254,18 @@ impl AppState {
     /// hardcoded first-run fallback on a fresh launch) instead of what "Go
     /// live" last actually used.
     ///
-    /// `Why GOP is reset and not restored:` `gop_millis` is *not* one of the
-    /// persisted fields — it is a preset-specific tradeoff (only Gaming moves
-    /// it, see `presets.rs`), not a standalone setting worth remembering
-    /// across restarts. It is always reset to the protocol default here so a
-    /// previous staged card's Gaming preset (a shorter GOP) can never
-    /// silently bleed into the next one.
+    /// The keyframe interval is restored like the rest (2026-11-04, plan decision
+    /// D8). Before it was reset to the default here, because only the Gaming
+    /// preset moved it; now every preset sets one, so forgetting it would show
+    /// the saved preset's name with another preset's interval.
     pub fn apply_start_stream_defaults(&mut self) {
         let d = Self::start_stream_defaults();
         self.framerate = d.framerate;
         self.bitrate_kbps = d.bitrate_kbps;
         self.tune = d.tune;
         self.quality_level = d.quality_level;
+        self.gop_millis = d.gop_millis;
         self.codec = d.codec;
-        self.gop_millis = capture::DEFAULT_GOP_MILLIS;
     }
 
     /// "Share Screen" clicked: [`Self::apply_start_stream_defaults`], then
@@ -5509,7 +5496,7 @@ pub(crate) mod test_support {
             bitrate_kbps: 8000,
             backend: capture::EncoderBackend::Software,
             tune: capture::TuneMode::BestQuality,
-            quality_level: capture::QualityLevel::Balanced,
+            quality_level: capture::QualityLevel::Quality,
             gop_millis: capture::DEFAULT_GOP_MILLIS,
             codec: capture::VideoCodec::H264,
         }
@@ -5855,6 +5842,7 @@ mod ui_ops_tests {
             bitrate_kbps: 15_000,
             tune: capture::TuneMode::LowLatency,
             quality_level: capture::QualityLevel::Quality,
+            gop_millis: 250,
             codec: capture::VideoCodec::Av1,
         }
     }
@@ -5871,11 +5859,10 @@ mod ui_ops_tests {
         assert_eq!(AppSettings::load().absolute_total_kbps, 31_000);
     }
 
-    /// Staging a share must open with the *saved* last-used values, and must
-    /// always reset the (never-persisted) GOP so a previous Gaming preset
-    /// can't bleed into the next card.
+    /// Staging a share must open with the *saved* last-used values, the saved
+    /// keyframe interval included (a previous card's preset can't bleed in).
     #[tokio::test]
-    async fn apply_start_stream_defaults_loads_saved_values_and_resets_gop() {
+    async fn apply_start_stream_defaults_loads_saved_values_including_gop() {
         let _home = isolated_config_home();
         AppState::set_start_stream_defaults(sample_defaults());
         let mut state = AppState::default();
@@ -5885,7 +5872,7 @@ mod ui_ops_tests {
         state.apply_start_stream_defaults();
 
         assert_eq!(state.current_start_stream_settings(), sample_defaults());
-        assert_eq!(state.gop_millis, capture::DEFAULT_GOP_MILLIS);
+        assert_eq!(state.gop_millis, 250);
     }
 
     #[tokio::test]

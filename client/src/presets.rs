@@ -1,61 +1,52 @@
 //! Encoder presets and the small option tables the Stream Control UI offers.
 //!
-//! Ported from the former Electron frontend (its `components.js`, removed in
-//! the egui rework: `ENCODER_PRESETS` / `activeEncoderPreset` / `CODEC_OPTIONS`, and
-//! `stream-control.js`'s `FRAMERATE_OPTIONS` / `framerateOptionsFor`) so the
-//! native UI stays a thin view over the lib: it asks this module "which
-//! preset is active?" and "what does picking Gaming set?" instead of owning
-//! the table itself.
-//!
 //! # What a preset is
 //!
-//! A preset is a named combination of three encoder knobs — [`TuneMode`],
+//! A preset is a named combination of the encoder knobs [`TuneMode`],
 //! [`QualityLevel`] and the GOP/keyframe interval in milliseconds
-//! ([`EncoderTuning`]). Picking a preset is a convenience mapping onto those
-//! three fields, not a fourth setting: nothing about a preset is stored
-//! anywhere, so "which preset is active" is always derived from the three
-//! fields by [`EncoderPreset::detect`]. A hand-tuned combination that matches
-//! no preset is a legal, unhighlighted state.
+//! ([`EncoderTuning`]), plus the **frame rate** it starts from. Picking one is a
+//! convenience mapping, not a setting of its own: nothing about a preset is
+//! stored by name, "which preset is active" is derived from the stored fields
+//! by [`EncoderPreset::detect`] (quality level + keyframe interval), and a
+//! combination that matches none is a legal, unhighlighted state.
+//!
+//! | preset | FPS | encoding (`QualityLevel`) | keyframe |
+//! | --- | --- | --- | --- |
+//! | Text | 15 | Quality | 250 ms |
+//! | Quality | 60 | Quality | 1000 ms |
+//! | Gaming | 120 | Performance | 250 ms |
+//!
+//! `Why (user's table, plan decision D8, 2026-11-04):` three presets replace
+//! Low-Latency / Balanced / Quality / Gaming and the Advanced tuning rows. Only
+//! Performance and Quality remain as modes; the old Balanced and Low-Latency
+//! stored values load as Quality. **A preset sets the FPS once; changing the FPS
+//! by hand keeps the encoder mode and the keyframe interval**, which is why the
+//! FPS is applied here but never part of [`EncoderPreset::detect`].
+//!
+//! The tune (x264 `zerolatency`, ignored by the VA encoders) is not user-visible
+//! any more: Gaming sets [`TuneMode::LowLatency`], the other two
+//! [`TuneMode::BestQuality`] (what those presets had before), and detection
+//! ignores it.
 //!
 //! Where the presets get applied (inherent methods, defined at the bottom of
 //! this file):
-//! - a running destination's edit buffer — [`DestEdit::apply_preset`], or
+//! - a running destination's edit buffer: [`DestEdit::apply_preset`], or
 //!   [`AppState::apply_preset_to_destination`] to also push it into the live
 //!   encoder;
-//! - the "next capture" settings of the Start-a-stream form —
+//! - the "next capture" settings of the Start-a-stream form:
 //!   [`AppState::apply_preset_to_start_stream`].
 //!
 //! `Why:` those methods live here, not in `session.rs`: the preset table and
-//! every place it is applied or reverse-looked-up stay in one file, and
-//! `session.rs` (already ~4k lines) needs no `crate::presets` import. Callers
-//! see them as ordinary `AppState`/`DestEdit` methods either way.
+//! every place it is applied or reverse-looked-up stay in one file.
 //!
-//! # Why these three, and why these values
-//!
-//! - **Low-Latency**: fastest quality level (`performance`), low-latency tune.
-//! - **Balanced** and **Quality** want "spend the bandwidth budget on
-//!   quality": best-quality tune, `balanced` / `quality` level.
-//! - **Gaming** is Low-Latency's tune and level paired with a much shorter GOP
-//!   ([`GAMING_GOP_MILLIS`], 0.75 s vs. the 2 s default) for faster recovery
-//!   from motion artefacts. It differs from Low-Latency in the GOP only.
-//! - **Balanced** is the middle, default option: it equals `AppState`'s own
-//!   default tune/quality/GOP, so a freshly launched app's "next capture"
-//!   settings already *are* the Balanced preset.
-//! - **Rate control is not part of a preset** (removed 2026-10-15, #88): every
-//!   encode is Dynamic (VBR, bitrate bounded). It used to be a fourth knob
-//!   (Dynamic/Static); Low-Latency and Gaming had been Static, whose constant
-//!   quantizer ignored the configured bitrate and froze streams on motion.
-//!   `Why:` user 2026-10-15, Dynamic "just works", so the choice went away.
-//!   See `superdoc/features/stream-control.md` "Rate control".
+//! Rate control is not part of a preset (removed 2026-10-15, #88): every
+//! encode is Dynamic. See `superdoc/features/stream-control.md` "Rate control".
 
-use crate::capture::{DEFAULT_GOP_MILLIS, EncoderProfile, QualityLevel, TuneMode, VideoCodec};
+use crate::capture::{QualityLevel, TuneMode, VideoCodec};
 use crate::session::{AppState, DestEdit, DestinationId};
 
-/// GOP/keyframe interval of the Gaming preset, ms. Every other preset keeps
-/// [`DEFAULT_GOP_MILLIS`] (the protocol spec's 2 s self-heal ceiling).
-pub const GAMING_GOP_MILLIS: u32 = 750;
-
-/// The three encoder knobs a preset sets together.
+/// The encoder knobs a preset sets together (the frame rate is separate:
+/// [`EncoderPreset::framerate`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EncoderTuning {
     pub tune: TuneMode,
@@ -66,25 +57,10 @@ pub struct EncoderTuning {
 }
 
 impl EncoderTuning {
-    /// The preset whose three fields exactly match `self`, or `None` for a
-    /// hand-tuned combination. Reverse lookup for highlighting the active
-    /// preset button.
+    /// The preset these fields match (quality level and keyframe interval), or
+    /// `None`. Reverse lookup for highlighting the active preset button.
     pub fn preset(self) -> Option<EncoderPreset> {
         EncoderPreset::detect(self)
-    }
-
-    /// [`Self::preset`] as the user sees it on `profile`: only what changes the
-    /// encode there is compared, see [`EncoderPreset::detect_for`].
-    pub fn preset_for(self, profile: EncoderProfile) -> Option<EncoderPreset> {
-        EncoderPreset::detect_for(self, profile)
-    }
-
-    /// What these three fields *effectively* encode on `profile`: Tune counts
-    /// only where the backend reads it, the quality level only as its
-    /// [`EncoderProfile::quality_effect`] (twin levels are equal), the GOP
-    /// always. Two tunings with an equal `effect` give the same encode.
-    pub fn effect(self, profile: EncoderProfile) -> (Option<TuneMode>, u32, u32) {
-        (profile.tune_applies().then_some(self.tune), profile.quality_effect(self.quality_level), self.gop_millis)
     }
 }
 
@@ -97,139 +73,88 @@ pub fn codec_choice_offered(supported: &[VideoCodec]) -> bool {
 }
 
 impl Default for EncoderTuning {
-    /// The Balanced preset — also what `AppState::default()` starts with.
+    /// The Quality preset: also what `AppState::default()` starts with.
     fn default() -> Self {
-        EncoderPreset::Balanced.tuning()
+        EncoderPreset::Quality.tuning()
     }
 }
 
-/// The preset picker's options, in display order (Low-Latency, Balanced,
-/// Quality, Gaming — [`EncoderPreset::ALL`]).
+/// The preset picker's options, in display order ([`EncoderPreset::ALL`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EncoderPreset {
-    LowLatency,
-    Balanced,
+    Text,
     Quality,
     Gaming,
 }
 
 impl EncoderPreset {
-    pub const ALL: [EncoderPreset; 4] = [Self::LowLatency, Self::Balanced, Self::Quality, Self::Gaming];
+    pub const ALL: [EncoderPreset; 3] = [Self::Text, Self::Quality, Self::Gaming];
 
-    /// Stable identifier (the JS table's `value`), usable as a settings/IPC
-    /// key.
+    /// Stable identifier, usable as a settings/IPC key (same strings as the browser's).
     pub const fn value(self) -> &'static str {
         match self {
-            Self::LowLatency => "low_latency",
-            Self::Balanced => "balanced",
+            Self::Text => "text",
             Self::Quality => "quality",
             Self::Gaming => "gaming",
         }
     }
 
-    /// Inverse of [`Self::value`].
+    /// Inverse of [`Self::value`]. The retired `balanced` and `low_latency`
+    /// load as Quality (the browser stores preset names, `docs/js/core/video-tx.js`).
     pub fn from_value(value: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|p| p.value() == value)
+        match value {
+            "balanced" | "low_latency" => Some(Self::Quality),
+            _ => Self::ALL.into_iter().find(|p| p.value() == value),
+        }
     }
 
-    /// Button label, localized (en: the JS table's `label`).
+    /// Button label, localized.
     pub fn label(self) -> &'static str {
-        localized(match self {
-            Self::LowLatency => "presets.low_latency.label",
-            Self::Balanced => "presets.balanced.label",
-            Self::Quality => "presets.quality.label",
-            Self::Gaming => "presets.gaming.label",
-        })
+        match self {
+            Self::Text => localized("presets.text.label", "Text"),
+            Self::Quality => localized("presets.quality.label", "Quality"),
+            Self::Gaming => localized("presets.gaming.label", "Gaming"),
+        }
     }
 
-    /// Tooltip text, localized (en: the JS table's `title`).
+    /// Tooltip text, localized.
     pub fn description(self) -> &'static str {
-        localized(match self {
-            Self::LowLatency => "presets.low_latency.description",
-            Self::Balanced => "presets.balanced.description",
-            Self::Quality => "presets.quality.description",
-            Self::Gaming => "presets.gaming.description",
-        })
+        match self {
+            Self::Text => localized("presets.text.description", "Sharp, readable text and documents at a low frame rate."),
+            Self::Quality => localized("presets.quality.description", "Maximizes visual quality within the bandwidth ceiling."),
+            Self::Gaming => localized(
+                "presets.gaming.description",
+                "Tuned for fast-motion/gaming content: a high frame rate and a short keyframe interval for quicker recovery.",
+            ),
+        }
     }
 
-    /// The three encoder fields this preset sets.
+    /// The frame rate picking this preset starts from.
+    pub const fn framerate(self) -> u32 {
+        match self {
+            Self::Text => 15,
+            Self::Quality => 60,
+            Self::Gaming => 120,
+        }
+    }
+
+    /// The encoder fields this preset sets.
     pub const fn tuning(self) -> EncoderTuning {
         match self {
-            Self::LowLatency => EncoderTuning {
-                tune: TuneMode::LowLatency,
-                quality_level: QualityLevel::Performance,
-                gop_millis: DEFAULT_GOP_MILLIS,
-            },
-            Self::Balanced => EncoderTuning {
-                tune: TuneMode::BestQuality,
-                quality_level: QualityLevel::Balanced,
-                gop_millis: DEFAULT_GOP_MILLIS,
-            },
-            Self::Quality => EncoderTuning {
-                tune: TuneMode::BestQuality,
-                quality_level: QualityLevel::Quality,
-                gop_millis: DEFAULT_GOP_MILLIS,
-            },
-            Self::Gaming => EncoderTuning {
-                tune: TuneMode::LowLatency,
-                quality_level: QualityLevel::Performance,
-                gop_millis: GAMING_GOP_MILLIS,
-            },
+            Self::Text => EncoderTuning { tune: TuneMode::BestQuality, quality_level: QualityLevel::Quality, gop_millis: 250 },
+            Self::Quality => EncoderTuning { tune: TuneMode::BestQuality, quality_level: QualityLevel::Quality, gop_millis: 1000 },
+            Self::Gaming => EncoderTuning { tune: TuneMode::LowLatency, quality_level: QualityLevel::Performance, gop_millis: 250 },
         }
     }
 
-    /// Whichever preset's three fields exactly match `tuning`, or `None` if
-    /// none does (an allowed, unhighlighted state).
+    /// Whichever preset has `tuning`'s quality level and keyframe interval, or
+    /// `None` (an allowed, unhighlighted state). The tune is ignored: it is not
+    /// shown, and the VA encoders do not read it.
     pub fn detect(tuning: EncoderTuning) -> Option<Self> {
-        Self::ALL.into_iter().find(|p| p.tuning() == tuning)
-    }
-
-    /// The presets the picker shows on `profile`, in display order. A preset
-    /// is hidden when another one gives the identical *effective* encode
-    /// ([`EncoderTuning::effect`]); the default, Balanced, always wins, the
-    /// others then win in display order. Hidden, never deleted: picking any
-    /// visible preset still writes all three fields, and a stored value that
-    /// belongs to a hidden twin is highlighted as its visible twin
-    /// ([`Self::detect_for`]).
-    ///
-    /// `Why (#95, user rule 2026-11-01 "if a setting doesn't do anything, hide it"):`
-    /// on Mesa AMD VA, Tune does nothing and Performance = Balanced
-    /// ([`EncoderProfile::quality_effect`]), so Low-Latency (low-latency,
-    /// Performance, 2000 ms) is the same encode as Balanced (best-quality,
-    /// Balanced, 2000 ms): two buttons for one result. The browser hides the
-    /// same one (`PRESET_TWIN` in `docs/js/ui`). Derived from the effective
-    /// settings rather than hard-coded, so it follows a changed mapping, a
-    /// different driver, or a destination that fell back to x264, where all
-    /// four differ.
-    pub fn visible_for(profile: EncoderProfile) -> Vec<Self> {
-        let mut shown: Vec<Self> = Vec::new();
-        for p in Self::priority_order() {
-            if !shown.iter().any(|s| s.tuning().effect(profile) == p.tuning().effect(profile)) {
-                shown.push(p);
-            }
-        }
-        Self::ALL.into_iter().filter(|p| shown.contains(p)).collect()
-    }
-
-    /// Balanced first (the default wins ties), then the display order.
-    fn priority_order() -> [Self; 4] {
-        [Self::Balanced, Self::LowLatency, Self::Quality, Self::Gaming]
-    }
-
-    /// [`Self::detect`] for what `profile` actually encodes with: the preset
-    /// (always a *visible* one, [`Self::visible_for`]) whose effective
-    /// settings equal `tuning`'s. Where Tune does nothing the stored tune is
-    /// ignored; a stored quality level or preset that is a twin of a visible
-    /// one highlights that one.
-    ///
-    /// `Why:` the hidden things are still stored (a settings file moved to a
-    /// machine where they matter keeps working), so the screen must not read
-    /// "custom" for a value the user can neither see nor fix. A stored
-    /// Low-Latency on Mesa AMD highlights Balanced; its stored fields are left
-    /// alone until the user picks something else.
-    pub fn detect_for(tuning: EncoderTuning, profile: EncoderProfile) -> Option<Self> {
-        let want = tuning.effect(profile);
-        Self::priority_order().into_iter().find(|p| p.tuning().effect(profile) == want)
+        Self::ALL.into_iter().find(|p| {
+            let t = p.tuning();
+            (t.quality_level, t.gop_millis) == (tuning.quality_level, tuning.gop_millis)
+        })
     }
 }
 
@@ -247,12 +172,13 @@ impl DestEdit {
         }
     }
 
-    /// Overwrite tune / quality level / GOP with `preset`'s
+    /// Overwrite frame rate, tune, quality level and GOP with `preset`'s
     /// values. Edit buffer only — nothing reaches the live encoder until
     /// [`AppState::apply_destination_edit`] (or use
     /// [`AppState::apply_preset_to_destination`], which does both).
     pub fn apply_preset(&mut self, preset: EncoderPreset) {
         let t = preset.tuning();
+        self.framerate = preset.framerate();
         self.tune = t.tune;
         self.quality_level = t.quality_level;
         self.gop_millis = t.gop_millis;
@@ -283,19 +209,19 @@ impl AppState {
     }
 
     /// Picking `preset` on the Start-a-stream form: set the live "next
-    /// capture" tune / quality level / GOP together. Not
-    /// persisted (GOP never is; the rest is saved at "Go live" by
-    /// [`AppState::go_live_and_save_defaults`]).
+    /// capture" frame rate / tune / quality level / GOP together. Saved at
+    /// "Go live" by [`AppState::go_live_and_save_defaults`].
     pub fn apply_preset_to_start_stream(&mut self, preset: EncoderPreset) {
         let t = preset.tuning();
+        self.framerate = preset.framerate();
         self.tune = t.tune;
         self.quality_level = t.quality_level;
         self.gop_millis = t.gop_millis;
     }
 
     /// Picking `preset` on a destination row: set the row's preset-driven
-    /// edit fields and apply immediately (the preset buttons apply on click,
-    /// unlike the Advanced fields' explicit Apply). No-op if the destination
+    /// edit fields and apply immediately (the preset buttons apply on click).
+    /// No-op if the destination
     /// is already gone.
     pub fn apply_preset_to_destination(&mut self, destination_id: DestinationId, preset: EncoderPreset) {
         self.with_destination(destination_id, |dest| dest.edit.apply_preset(preset));
@@ -349,63 +275,35 @@ pub const fn codec_label(codec: VideoCodec) -> &'static str {
 
 /// Codec picker tooltip text, localized.
 pub fn codec_description(codec: VideoCodec) -> &'static str {
-    localized(match codec {
-        VideoCodec::H264 => "presets.codec.h264.description",
-        VideoCodec::Av1 => "presets.codec.av1.description",
-        VideoCodec::H265 => "presets.codec.h265.description",
-    })
+    match codec {
+        VideoCodec::H264 => localized("presets.codec.h264.description", "Most compatible — decodes everywhere, including hardware that can't do H.265/AV1."),
+        VideoCodec::Av1 => localized("presets.codec.av1.description", "Modern, royalty-free, best efficiency on Intel/NVIDIA hardware."),
+        VideoCodec::H265 => localized("presets.codec.h265.description", "Best quality on this hardware; licensing caveats on some platforms/browsers."),
+    }
 }
 
 /// `t!(key)` as a `&'static str`, so the label/description signatures (and the
-/// UI callers that borrow them into `&str` tables) stay unchanged.
+/// UI callers that borrow them into `&str` tables) stay unchanged. A key the
+/// locale files lack reads as `en` (what `ui::tr` does for the UI).
 ///
 /// `Why:` the leak is bounded: one entry per (locale, key), interned on first use.
-fn localized(key: &'static str) -> &'static str {
+fn localized(key: &'static str, en: &'static str) -> &'static str {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     static CACHE: OnceLock<Mutex<HashMap<(String, &'static str), &'static str>>> = OnceLock::new();
     let locale = rust_i18n::locale().to_string();
     let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
-    cache.entry((locale, key)).or_insert_with(|| Box::leak(rust_i18n::t!(key).into_owned().into_boxed_str()))
+    cache.entry((locale, key)).or_insert_with(|| {
+        let s = rust_i18n::t!(key);
+        let found = s.as_ref() != key && !s.ends_with(key);
+        Box::leak(if found { s.into_owned() } else { en.to_string() }.into_boxed_str())
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capture::EncoderBackend;
 
-    /// The former JS `ENCODER_PRESETS` table (the Electron frontend's `components.js`, removed
-    /// ~:994), copied as `(value, label, title, tune, qualityLevel,
-    /// gopMillis)` (its `rateControl` column is gone, #88) with the JS wire strings
-    /// (`dto::parse_tune_mode` etc.) and `DEFAULT_GOP_MILLIS = 2000`,
-    /// `GAMING_GOP_MILLIS = 750`.
-    const JS_TABLE: [(&str, &str, &str, &str, &str, u32); 4] = [
-        (
-            "low_latency",
-            "Low-Latency",
-            "Fastest encode, prioritizes reduced delay over compression efficiency.",
-            "low_latency",
-            "performance",
-            2000,
-        ),
-        ("balanced", "Balanced", "The default — a good mix of latency and quality.", "best_quality", "balanced", 2000),
-        ("quality", "Quality", "Maximizes visual quality within the bandwidth ceiling.", "best_quality", "quality", 2000),
-        (
-            "gaming",
-            "Gaming",
-            "Tuned for fast-motion/gaming content — shorter keyframe interval for quicker recovery from motion artifacts.",
-            "low_latency",
-            "performance",
-            750,
-        ),
-    ];
-
-    fn tune_str(t: TuneMode) -> &'static str {
-        match t {
-            TuneMode::LowLatency => "low_latency",
-            TuneMode::BestQuality => "best_quality",
-        }
-    }
     fn quality_str(q: QualityLevel) -> &'static str {
         match q {
             QualityLevel::Performance => "performance",
@@ -414,24 +312,25 @@ mod tests {
         }
     }
 
+    /// The user's table (plan decision D8): `(value, fps, quality level, keyframe ms)`.
+    const TABLE: [(&str, u32, &str, u32); 3] = [("text", 15, "quality", 250), ("quality", 60, "quality", 1000), ("gaming", 120, "performance", 250)];
+
     #[test]
-    fn every_preset_matches_the_js_table_exactly() {
-        assert_eq!(EncoderPreset::ALL.len(), JS_TABLE.len());
-        for (preset, (value, label, title, tune, quality, gop)) in EncoderPreset::ALL.into_iter().zip(JS_TABLE) {
+    fn presets_match_the_users_table() {
+        assert_eq!(EncoderPreset::ALL.len(), TABLE.len());
+        for (preset, (value, fps, quality, gop)) in EncoderPreset::ALL.into_iter().zip(TABLE) {
             assert_eq!(preset.value(), value);
-            assert_eq!(preset.label(), label);
-            assert_eq!(preset.description(), title);
-            let t = preset.tuning();
-            assert_eq!(tune_str(t.tune), tune, "{value} tune");
-            assert_eq!(quality_str(t.quality_level), quality, "{value} quality level");
-            assert_eq!(t.gop_millis, gop, "{value} gop");
+            assert_eq!(preset.framerate(), fps, "{value} fps");
+            assert_eq!(quality_str(preset.tuning().quality_level), quality, "{value} quality level");
+            assert_eq!(preset.tuning().gop_millis, gop, "{value} keyframe");
         }
     }
 
     #[test]
-    fn gop_constants_match_js() {
-        assert_eq!(DEFAULT_GOP_MILLIS, 2000);
-        assert_eq!(GAMING_GOP_MILLIS, 750);
+    fn labels_are_readable_without_locale_entries() {
+        // `presets.text.*` is not in the locale files yet: the English fallback shows, never the key.
+        assert!(!EncoderPreset::Text.label().starts_with("presets."));
+        assert!(!EncoderPreset::Text.description().starts_with("presets."));
     }
 
     #[test]
@@ -442,142 +341,44 @@ mod tests {
         }
     }
 
-    /// Low-Latency and Gaming differ only in GOP, so the GOP is what the
-    /// reverse lookup has to tell them apart by.
+    /// Text and Quality differ only in the keyframe interval, so that is what tells them apart;
+    /// the tune is not shown and does not count.
     #[test]
-    fn detect_distinguishes_low_latency_from_gaming_by_gop_only() {
-        let mut t = EncoderPreset::LowLatency.tuning();
-        assert_eq!(t.preset(), Some(EncoderPreset::LowLatency));
-        t.gop_millis = GAMING_GOP_MILLIS;
-        assert_eq!(t.preset(), Some(EncoderPreset::Gaming));
+    fn detect_reads_quality_level_and_keyframe_only() {
+        let mut t = EncoderPreset::Text.tuning();
+        t.gop_millis = 1000;
+        assert_eq!(t.preset(), Some(EncoderPreset::Quality));
+        t.tune = TuneMode::LowLatency;
+        assert_eq!(t.preset(), Some(EncoderPreset::Quality), "a stale tune does not unhighlight");
     }
 
     #[test]
     fn hand_tuned_combination_matches_no_preset() {
-        let tuning = EncoderTuning {
-            tune: TuneMode::BestQuality,
-            quality_level: QualityLevel::Performance,
-            gop_millis: DEFAULT_GOP_MILLIS,
-        };
-        assert_eq!(tuning.preset(), None);
-        let mut balanced = EncoderPreset::Balanced.tuning();
-        balanced.gop_millis = 1234;
-        assert_eq!(balanced.preset(), None);
+        let mut t = EncoderPreset::Quality.tuning();
+        t.gop_millis = 2000;
+        assert_eq!(t.preset(), None);
+        let mut t = EncoderPreset::Quality.tuning();
+        t.quality_level = QualityLevel::Performance;
+        assert_eq!(t.preset(), None, "Performance at 1000 ms is none of the three");
+        let mut t = EncoderPreset::Quality.tuning();
+        t.quality_level = QualityLevel::Balanced;
+        assert_eq!(t.preset(), None, "an unmigrated Balanced matches nothing");
     }
 
-    const AMD: EncoderProfile = EncoderProfile::new(EncoderBackend::Vaapi, true);
-    const SPEC: EncoderProfile = EncoderProfile::new(EncoderBackend::Vaapi, false);
-    const X264: EncoderProfile = EncoderProfile::new(EncoderBackend::Software, false);
-
     #[test]
-    fn only_software_reads_tune() {
-        assert!(X264.tune_applies());
-        assert!(!AMD.tune_applies());
-        assert!(!SPEC.tune_applies());
-        assert!(EncoderBackend::Software.tune_applies());
-        assert!(!EncoderBackend::Vaapi.tune_applies());
+    fn default_tuning_is_the_quality_preset() {
+        assert_eq!(EncoderTuning::default(), EncoderPreset::Quality.tuning());
+        assert_eq!(EncoderTuning::default().gop_millis, crate::capture::DEFAULT_GOP_MILLIS);
     }
 
-    /// Mesa AMD: Performance = Balanced (target-usage 2/3), Tune does nothing,
-    /// so Low-Latency is Balanced's twin and is the only preset hidden.
     #[test]
-    fn mesa_amd_hides_the_low_latency_twin() {
-        use EncoderPreset::*;
-        assert_eq!(EncoderPreset::visible_for(AMD), vec![Balanced, Quality, Gaming]);
-    }
-
-    /// Spec-order VA (Intel): Performance 7 / Balanced 4 / Quality 1 are all
-    /// different encodes, so every preset is shown even though Tune is a no-op.
-    #[test]
-    fn spec_order_va_shows_every_preset() {
-        assert_eq!(EncoderPreset::visible_for(SPEC), EncoderPreset::ALL.to_vec());
-    }
-
-    /// x264 reads Tune and has three distinct speed presets: nothing hidden.
-    #[test]
-    fn software_shows_every_preset() {
-        assert_eq!(EncoderPreset::visible_for(X264), EncoderPreset::ALL.to_vec());
-    }
-
-    /// Every preset is found again as itself wherever it is visible; a hidden one
-    /// is found as its visible twin, whatever the (ignored) tune is.
-    #[test]
-    fn detect_for_follows_effective_settings() {
-        for profile in [AMD, SPEC, X264] {
-            let visible = EncoderPreset::visible_for(profile);
-            for preset in EncoderPreset::ALL {
-                let found = preset.tuning().preset_for(profile).unwrap();
-                assert!(visible.contains(&found), "{profile:?}: {preset:?} highlights hidden {found:?}");
-                if visible.contains(&preset) {
-                    assert_eq!(found, preset, "{profile:?}");
-                }
-            }
-        }
-        // The stored hidden twin lights up Balanced on AMD ...
-        assert_eq!(EncoderPreset::LowLatency.tuning().preset_for(AMD), Some(EncoderPreset::Balanced));
-        // ... and stays Low-Latency where it differs.
-        assert_eq!(EncoderPreset::LowLatency.tuning().preset_for(SPEC), Some(EncoderPreset::LowLatency));
-        assert_eq!(EncoderPreset::LowLatency.tuning().preset_for(X264), Some(EncoderPreset::LowLatency));
-        // Tune is ignored on VA, counted on x264.
+    fn value_round_trips_and_retired_values_load_as_quality() {
         for preset in EncoderPreset::ALL {
-            let mut t = preset.tuning();
-            t.tune = match t.tune {
-                TuneMode::LowLatency => TuneMode::BestQuality,
-                TuneMode::BestQuality => TuneMode::LowLatency,
-            };
-            for va in [AMD, SPEC] {
-                assert_eq!(t.preset_for(va), preset.tuning().preset_for(va), "stale tune must not change the highlight on VA ({preset:?})");
-            }
+            assert_eq!(EncoderPreset::from_value(preset.value()), Some(preset));
         }
-        let mut t = EncoderPreset::Balanced.tuning();
-        t.tune = TuneMode::LowLatency;
-        assert_eq!(t.preset_for(X264), None);
-    }
-
-    /// A stored Balanced level is Performance's twin on AMD: the Balanced button is
-    /// hidden and a stored Balanced highlights Performance; stored value untouched.
-    #[test]
-    fn quality_levels_hide_the_balanced_twin_on_mesa_amd() {
-        use QualityLevel::*;
-        assert_eq!(AMD.visible_quality_levels(), vec![Performance, Quality]);
-        assert_eq!(AMD.display_quality_level(Balanced), Performance);
-        assert_eq!(AMD.display_quality_level(Performance), Performance);
-        assert_eq!(AMD.display_quality_level(Quality), Quality);
-        for p in [SPEC, X264] {
-            assert_eq!(p.visible_quality_levels(), QualityLevel::ALL.to_vec(), "{p:?}");
-            for l in QualityLevel::ALL {
-                assert_eq!(p.display_quality_level(l), l);
-            }
-        }
-    }
-
-    /// Twin-ness is derived from the mapping, not named per driver: levels are
-    /// twins exactly when the driver folds their target-usage together.
-    #[test]
-    fn spec_order_mapping_has_no_twins_and_amd_mapping_has_one_pair() {
-        let twins = |p: EncoderProfile| {
-            let mut n = 0;
-            for (i, a) in QualityLevel::ALL.iter().enumerate() {
-                for b in &QualityLevel::ALL[i + 1..] {
-                    n += usize::from(p.quality_effect(*a) == p.quality_effect(*b));
-                }
-            }
-            n
-        };
-        assert_eq!(twins(AMD), 1);
-        assert_eq!(twins(SPEC), 0);
-        assert_eq!(twins(X264), 0);
-    }
-
-    #[test]
-    fn presets_are_distinct_without_tune_on_x264_and_spec_order() {
-        for profile in [X264, SPEC] {
-            for (i, a) in EncoderPreset::ALL.iter().enumerate() {
-                for b in &EncoderPreset::ALL[i + 1..] {
-                    assert_ne!(a.tuning().effect(profile), b.tuning().effect(profile), "{profile:?} {a:?}/{b:?}");
-                }
-            }
-        }
+        assert_eq!(EncoderPreset::from_value("balanced"), Some(EncoderPreset::Quality));
+        assert_eq!(EncoderPreset::from_value("low_latency"), Some(EncoderPreset::Quality));
+        assert_eq!(EncoderPreset::from_value("nope"), None);
     }
 
     #[test]
@@ -587,29 +388,15 @@ mod tests {
     }
 
     #[test]
-    fn default_tuning_is_balanced_and_equals_the_enums_defaults() {
-        assert_eq!(EncoderTuning::default().preset(), Some(EncoderPreset::Balanced));
-        let t = EncoderTuning::default();
-        assert_eq!(t.tune, TuneMode::default());
-        assert_eq!(t.quality_level, QualityLevel::default());
-        assert_eq!(t.gop_millis, DEFAULT_GOP_MILLIS);
-    }
-
-    #[test]
-    fn value_round_trips() {
-        for preset in EncoderPreset::ALL {
-            assert_eq!(EncoderPreset::from_value(preset.value()), Some(preset));
-        }
-        assert_eq!(EncoderPreset::from_value("nope"), None);
-    }
-
-    #[test]
     fn framerate_options_add_a_nonstandard_current_rate_sorted() {
         assert_eq!(framerate_options_for(60), FRAMERATE_OPTIONS.to_vec());
         assert_eq!(framerate_options_for(0), FRAMERATE_OPTIONS.to_vec());
         assert_eq!(framerate_options_for(100), vec![15, 30, 60, 90, 100, 120, 144, 165, 240]);
         assert_eq!(framerate_options_for(10).first(), Some(&10));
         assert_eq!(framerate_options_for(300).last(), Some(&300));
+        for p in EncoderPreset::ALL {
+            assert!(FRAMERATE_OPTIONS.contains(&p.framerate()), "{} fps is offered", p.framerate());
+        }
     }
 
     #[test]
@@ -619,14 +406,13 @@ mod tests {
 
     // ---- applying presets (needs a real `AppState`, no network/GStreamer) ----
 
-    use crate::session::test_support::{insert_destination, isolated_config_home, video_params};
     use crate::session::Destination;
+    use crate::session::test_support::{insert_destination, isolated_config_home, video_params};
 
     #[test]
-    fn dest_edit_apply_preset_sets_only_the_three_tuning_fields() {
+    fn dest_edit_apply_preset_sets_fps_and_the_tuning_fields_only() {
         let mut edit = Destination::edit_from(video_params());
         edit.scale_percent = 50;
-        edit.framerate = 144;
         edit.bitrate_kbps = 12_345;
         edit.codec = VideoCodec::Av1;
         let untouched = edit;
@@ -634,14 +420,20 @@ mod tests {
         for preset in EncoderPreset::ALL {
             edit.apply_preset(preset);
             assert_eq!(edit.tuning(), preset.tuning());
+            assert_eq!(edit.framerate, preset.framerate());
             assert_eq!(edit.active_preset(), Some(preset));
             assert_eq!(
-                (edit.scale_percent, edit.framerate, edit.bitrate_kbps, edit.codec),
-                (untouched.scale_percent, untouched.framerate, untouched.bitrate_kbps, untouched.codec),
+                (edit.scale_percent, edit.bitrate_kbps, edit.codec),
+                (untouched.scale_percent, untouched.bitrate_kbps, untouched.codec),
                 "{} must not touch non-preset fields",
                 preset.value()
             );
         }
+
+        // A preset sets the FPS once: changing it by hand keeps the encoder mode and keyframe.
+        edit.apply_preset(EncoderPreset::Gaming);
+        edit.framerate = 30;
+        assert_eq!(edit.active_preset(), Some(EncoderPreset::Gaming));
 
         edit.gop_millis = 1234;
         assert_eq!(edit.active_preset(), None, "a hand-tuned buffer highlights no preset");
@@ -651,25 +443,26 @@ mod tests {
     async fn start_stream_settings_follow_the_applied_preset() {
         let _home = isolated_config_home();
         let mut state = AppState::default();
-        assert_eq!(state.start_stream_preset(), Some(EncoderPreset::Balanced), "a fresh app already is the Balanced preset");
+        assert_eq!(state.start_stream_preset(), Some(EncoderPreset::Quality), "a fresh app already is the Quality preset");
 
         for preset in EncoderPreset::ALL {
             state.apply_preset_to_start_stream(preset);
             assert_eq!(state.start_stream_tuning(), preset.tuning());
+            assert_eq!(state.framerate, preset.framerate());
             assert_eq!(state.start_stream_preset(), Some(preset));
         }
 
-        // Gaming is the only preset that moves the GOP off the default.
-        state.apply_preset_to_start_stream(EncoderPreset::Gaming);
-        assert_eq!(state.gop_millis, GAMING_GOP_MILLIS);
+        state.apply_preset_to_start_stream(EncoderPreset::Text);
+        assert_eq!(state.gop_millis, 250);
         state.apply_preset_to_start_stream(EncoderPreset::Quality);
-        assert_eq!(state.gop_millis, DEFAULT_GOP_MILLIS);
+        assert_eq!(state.gop_millis, 1000);
 
-        // Applying a preset leaves the rest of the form alone.
-        state.framerate = 144;
+        // The rate picked by hand afterwards does not change the preset; the bitrate is never a preset's.
         state.bitrate_kbps = 20_000;
-        state.apply_preset_to_start_stream(EncoderPreset::LowLatency);
-        assert_eq!((state.framerate, state.bitrate_kbps), (144, 20_000));
+        state.apply_preset_to_start_stream(EncoderPreset::Gaming);
+        state.framerate = 144;
+        assert_eq!(state.start_stream_preset(), Some(EncoderPreset::Gaming));
+        assert_eq!(state.bitrate_kbps, 20_000);
     }
 
     #[tokio::test]
@@ -677,16 +470,16 @@ mod tests {
         let _home = isolated_config_home();
         let mut state = AppState::default();
         let (capture_id, destination_id) = insert_destination(&mut state);
-        assert_eq!(state.captures[&capture_id].destinations[&destination_id].edit.active_preset(), Some(EncoderPreset::Balanced));
+        assert_eq!(state.captures[&capture_id].destinations[&destination_id].edit.active_preset(), Some(EncoderPreset::Quality));
 
         state.apply_preset_to_destination(destination_id, EncoderPreset::Gaming);
 
         let edit = state.captures[&capture_id].destinations[&destination_id].edit;
         assert_eq!(edit.active_preset(), Some(EncoderPreset::Gaming));
-        assert_eq!((edit.framerate, edit.bitrate_kbps), (60, 8000), "non-preset fields stay as they were");
+        assert_eq!((edit.framerate, edit.bitrate_kbps), (120, 8000), "the preset's fps, the bitrate as it was");
 
         // Unknown destination: no-op.
-        state.apply_preset_to_destination(crate::session::DestinationId(999), EncoderPreset::Quality);
+        state.apply_preset_to_destination(crate::session::DestinationId(999), EncoderPreset::Text);
         assert_eq!(state.captures[&capture_id].destinations[&destination_id].edit.active_preset(), Some(EncoderPreset::Gaming));
     }
 }

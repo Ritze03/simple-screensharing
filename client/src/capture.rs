@@ -346,98 +346,7 @@ fn vaapi_target_usage(level: QualityLevel, mesa_amd: bool) -> u32 {
     }
 }
 
-/// What one encoder backend *actually does* with the Stream settings, as far as
-/// the UI needs to know it: whether Tune is read at all, and which
-/// [`QualityLevel`]s give bit-identical encodes ("twins"). The stream-settings
-/// screen hides a control that does nothing and a choice that duplicates
-/// another one (user rule 2026-11-01: "If a setting doesn't do anything, hide
-/// it ... so other platforms can still use it"); it never drops the stored
-/// value, so a settings file moved to another driver or platform keeps working.
-///
-/// `Why a struct and not `EncoderBackend` alone (#95):` on [`EncoderBackend::Vaapi`]
-/// the answer depends on the VA *driver* (Mesa AMD vs spec order, see
-/// [`vaapi_target_usage`]), which is a process-wide probe. Carrying `mesa_amd`
-/// as data lets the unit tests cover both mappings on any machine.
-///
-/// Twin-ness is derived from [`vaapi_target_usage`] itself, never hard-coded
-/// per driver: it stays correct if the mapping changes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct EncoderProfile {
-    pub backend: EncoderBackend,
-    /// Only ever true for [`EncoderBackend::Vaapi`].
-    pub mesa_amd: bool,
-}
-
-impl EncoderProfile {
-    pub const fn new(backend: EncoderBackend, mesa_amd: bool) -> Self {
-        Self { backend, mesa_amd: mesa_amd && matches!(backend, EncoderBackend::Vaapi) }
-    }
-
-    /// The profile of `backend` on this machine (probes the VA driver once).
-    pub fn of(backend: EncoderBackend) -> Self {
-        Self::new(backend, backend == EncoderBackend::Vaapi && va_driver_is_mesa_amd())
-    }
-
-    /// See [`EncoderBackend::tune_applies`].
-    pub const fn tune_applies(self) -> bool {
-        self.backend.tune_applies()
-    }
-
-    /// An opaque value that is equal for two levels exactly when they give the
-    /// same encode on this backend. x264: the three distinct speed presets.
-    /// VA: the `target-usage` the level maps to, folded the way the driver
-    /// folds it: Mesa AMD reads it as a bitfield where 1 is its own
-    /// combination and 2/3, 4/5, 6/7 are bit-identical pairs (table on
-    /// [`vaapi_target_usage`]); spec-order drivers treat every value as
-    /// distinct.
-    pub fn quality_effect(self, level: QualityLevel) -> u32 {
-        match self.backend {
-            EncoderBackend::Software => match level {
-                QualityLevel::Performance => 0,
-                QualityLevel::Balanced => 1,
-                QualityLevel::Quality => 2,
-            },
-            EncoderBackend::Vaapi => {
-                let tu = vaapi_target_usage(level, self.mesa_amd);
-                if self.mesa_amd && tu >= 2 { 1000 + tu / 2 } else { tu }
-            }
-        }
-    }
-
-    /// Quality levels the picker shows, in display order. Where levels are
-    /// twins the *Balanced* one is left out (Performance and Quality win: they
-    /// are the ends of the range, Balanced is the in-between that has collapsed
-    /// onto one of them).
-    pub fn visible_quality_levels(self) -> Vec<QualityLevel> {
-        const PRIORITY: [QualityLevel; 3] = [QualityLevel::Performance, QualityLevel::Quality, QualityLevel::Balanced];
-        let mut shown: Vec<QualityLevel> = Vec::new();
-        for l in PRIORITY {
-            if !shown.iter().any(|s| self.quality_effect(*s) == self.quality_effect(l)) {
-                shown.push(l);
-            }
-        }
-        QualityLevel::ALL.into_iter().filter(|l| shown.contains(l)).collect()
-    }
-
-    /// The visible level that gives the same encode as `level` (itself when it
-    /// is visible): what the picker highlights for a stored twin.
-    pub fn display_quality_level(self, level: QualityLevel) -> QualityLevel {
-        let e = self.quality_effect(level);
-        self.visible_quality_levels().into_iter().find(|l| self.quality_effect(*l) == e).unwrap_or(level)
-    }
-}
-
 impl EncoderBackend {
-    /// Whether [`TuneMode`] changes the encode on this backend. Only
-    /// [`EncoderBackend::Software`] reads it (x264enc `tune=zerolatency` or
-    /// not); the VA encoders have no equivalent property and
-    /// [`Self::launch_fragment`] drops it (`let _ = tune;`). The stream-settings
-    /// UI hides the Tune row where this is false. Keep it in step with
-    /// `launch_fragment` if a backend ever starts honouring tune.
-    pub const fn tune_applies(self) -> bool {
-        matches!(self, EncoderBackend::Software)
-    }
-
     /// The `gst-launch`-syntax fragment for this backend's encoder element,
     /// including its bitrate/GOP properties. Deliberately returns just the
     /// element description (not surrounding `!`s) so [`build_pipeline`] stays
@@ -993,24 +902,32 @@ const PORTAL_MIN_BUFFERS: u32 = 6;
 /// real source delivers, or its resends compete with real frames.
 const STATIC_KEEPALIVE_FPS: u32 = 30;
 
-/// Protocol-spec's 2-second GOP interval (§9: "the next scheduled 2 s
-/// keyframe") as this pipeline's *default*, in milliseconds — every
-/// destination gets this unless its
-/// [`destination::VideoParams::gop_millis`] says otherwise. Milliseconds
+/// The default keyframe (GOP) interval, in milliseconds: the Quality
+/// preset's, 1000 ms (`presets::EncoderPreset`). Every destination gets this
+/// unless its [`destination::VideoParams::gop_millis`] says otherwise (Text and
+/// Gaming ask for 250 ms, the webcam will ask for 2000 ms), and a settings file
+/// without a saved interval loads with it. Milliseconds
 /// (not a `f64` seconds count) so [`destination::VideoParams`]/
 /// [`branch::EncodeSettings`] can keep deriving `Eq`/`Hash` like every other
 /// field on them — `f64` can't.
 ///
-/// `Why a per-destination override exists at all` (2026-07-30): the Gaming
-/// preset (the UI's encoder presets) deliberately
-/// asks for a shorter GOP for faster recovery
-/// from motion artifacts — fast-paced/gaming content rarely holds still long
-/// enough for the 2s self-heal ceiling to matter, and the wait for the *next*
-/// keyframe is far more noticeable during constant motion. Every other
-/// preset keeps this default untouched — the "self-heal ceiling bounding how
-/// long a decode glitch can visibly persist" the protocol spec's 2s figure
-/// documents is still exactly right for them.
-pub const DEFAULT_GOP_MILLIS: u32 = 2000;
+/// `Why 1000 and not the protocol spec's 2 s (§9 "the next scheduled 2 s
+/// keyframe", 2026-11-04, plan decision D8):` the user's preset table. The spec
+/// figure is only a self-heal *ceiling* (how long a decode glitch can last), so
+/// a shorter interval stays conformant; it costs bitrate (more IDRs) and buys a
+/// faster join and recovery. Overrides exist because content differs: fast
+/// motion wants 250 ms, a document at 15 fps also (a keyframe is cheap there),
+/// the webcam can wait 2 s.
+pub const DEFAULT_GOP_MILLIS: u32 = 1000;
+
+/// The encoder's `key-int-max` for a keyframe interval: frames, rounded to the nearest and at
+/// least 1 (0 would mean "never insert a keyframe past the first", see [`MAX_FRAMERATE`]). The
+/// interval is a whole number of frames, so Text's 250 ms at 15 fps is 4 frames = 267 ms
+/// (measured in the rig: median keyframe gap 267 ms; 1000 ms at 60 fps 1001 ms; 250 ms at
+/// 120 fps 250 ms).
+fn gop_frames(gop_millis: u32, framerate: u32) -> u32 {
+    ((u64::from(gop_millis) * u64::from(framerate) + 500) / 1000).max(1) as u32
+}
 
 /// Sensible default; full user-selectable bitrate UI (up to the spec's
 /// 40 Mbit/s ceiling) is a later task — this is just the plumbing default.
@@ -6761,7 +6678,7 @@ pub mod branch {
         // frames at low framerates; `.max(1)` is the hard floor `key-int-max`
         // itself needs (0 would mean "never insert a keyframe past the
         // first" — see [`MAX_FRAMERATE`]'s doc comment on the same hazard).
-        let gop_frames = (((settings.gop_millis as u64) * (framerate as u64) + 500) / 1000).max(1) as u32;
+        let gop_frames = gop_frames(settings.gop_millis, framerate);
         let encoder = settings.backend.launch_fragment(
             settings.bitrate_kbps,
             gop_frames,
@@ -9734,6 +9651,16 @@ pub mod branch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The presets' keyframe intervals (user's table, 2026-11-04) as `key-int-max`.
+    #[test]
+    fn gop_frames_for_the_presets() {
+        assert_eq!(gop_frames(250, 15), 4, "Text: 3.75 rounds to 4 frames");
+        assert_eq!(gop_frames(1000, 60), 60, "Quality");
+        assert_eq!(gop_frames(250, 120), 30, "Gaming");
+        assert_eq!(gop_frames(2000, 30), 60, "the webcam's 2000 ms");
+        assert_eq!(gop_frames(250, 1), 1, "never 0: that would mean no keyframe past the first");
+    }
 
     /// Task #52: the portal source gets the decoupling queue (see
     /// [`decoupled_source`]) in both domains' descriptions, and any other
