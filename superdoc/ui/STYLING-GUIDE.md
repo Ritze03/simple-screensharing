@@ -264,7 +264,7 @@ settings and a webcam next to the screen share. The modal's two right-hand cards
 reordered: **Compression** (Codec, Bitrate; the user wanted something other than "Codec" as the title) and **Video** (FPS
 dropdown, Preset). The presets replace Balanced and Advanced tuning: Text = 15 FPS, Quality encoding, keyframe 250 ms;
 Quality = 60 FPS, Quality, 1000 ms; Gaming = 120 FPS, Performance, 250 ms. A preset sets the FPS once; changing the FPS by
-hand keeps its encoder mode and keyframe and the caption says "(custom)". The share dropdown shows the same state. The
+hand keeps its encoder mode and keyframe. The share dropdown shows the same state. The
 Source card's Change button is there while live too.
 
 The webcam is a stream of its own (`<room>/me/cam`, `cam: true`) with a split button in the control bar: camera, its v4l2
