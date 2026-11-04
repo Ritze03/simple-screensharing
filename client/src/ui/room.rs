@@ -8,75 +8,36 @@
 //!   Copy invite link, Leave, ⋯]`, every control 32 px. Owns
 //!   [`PopoverKind::RoomMenu`]. In a narrow window the controls collapse to
 //!   icons and the meta line drops, in the order commented in `show_header`.
-//! - [`show_body`]: a vbox inside the central ScrollArea (padding 16), gap 16
-//!   between sections: reconnecting banner / "On screen" tiles / "Sharing in
-//!   this room" cards / empty states.
+//! - [`show_stage`]: the whole central region of a joined room and of "Watched
+//!   streams": the black stage (`ui/stage/`), no scroll area, no padding.
+//! - [`show_body`]: the other states (welcome, disconnected, connecting,
+//!   reconnecting) as a vbox inside the central ScrollArea (padding 16, gap 16).
 //! - [`show_people`]: a 207 px vbox inside the People ScrollArea (padding
 //!   16 top/bottom, 12 left/right), gap 12. Only called while the selected
 //!   room is joined or reconnecting.
-//!
-//! # Tiles
-//! A tile is a 16:9 frame with the GPU video letterboxed into it
-//! (`cx.videos.show`) and a hover overlay (vignette, statbar, round Pop out /
-//! Stop watching buttons, audio pill). Layout (mockup `renderTiles`):
-//! - in a room: one tile → one column capped at 46 % of the window height ×
-//!   16:9 ([`single_tile_width`]) so the share cards stay in view; more → two
-//!   equal columns ([`room_tile_cols`]).
-//! - "Watched streams": every watched stream, so the tiles are fitted into
-//!   the viewport with `grid_shape` (a port of the former Electron frontend's `computeGridShape`) ([`grid_shape`]).
-//!   `Why` not the room rule there: that view has nothing below the tiles, so
-//!   the biggest tiles that fit beat a fixed two-column grid that scrolls.
-//!
-//! # Performance
-//! Nothing here requests a repaint: video repaints are frame-driven inside
-//! `VideoView`. Decoder stats (and the decoder lock for the bitrate) are only
-//! read while a tile's overlay is visible (hover).
 //!
 //! # Strings
 //! Every string goes through [`tr`]: `t!(key)`, falling back to the English
 //! text until the locale files (I17) have the key.
 
+use egui::{Align, Color32, CornerRadius, Layout, Rect, Response, Sense, Stroke, StrokeKind, Ui, UiBuilder, pos2, vec2};
+use simple_screensharing_client::session::{ReconnectState, RoomHandle};
 
-use egui::epaint::{Mesh, RectShape, Vertex, WHITE_UV};
-use egui::{Align, Color32, CornerRadius, Id, Layout, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, UiBuilder, pos2, vec2};
-use simple_screensharing_client::capture::VideoCodec;
-use simple_screensharing_client::capture::destination::DestinationState;
-use simple_screensharing_client::decode::ViewState;
-use simple_screensharing_client::decode::render::Fit;
-use simple_screensharing_client::protocol::{StreamInfo, StreamKind};
-use simple_screensharing_client::session::{CaptureSourceId, DestinationId, ReconnectState, RoomHandle};
-
-use super::{ConnState, Cx, Modal, MyPhase, PopoverKind, RoomEntry, ShareState, StreamKey, UiAction, View, tr, tr_with};
+use super::{ConnState, Cx, Modal, MyPhase, PopoverKind, RoomEntry, ShareState, UiAction, View, tr, tr_with};
 use crate::theme::{self, Weight, font};
-use crate::widgets::{self, Btn, FILL, HBox, IconBtnKind, PersonRow, Pill, fixed, paint_text, text_width};
+use crate::widgets::{self, Btn, FILL, HBox, IconBtnKind, PersonRow, Pill, fixed, text_width};
 
 /// Central-area UI state.
 #[derive(Default)]
 pub struct RoomState {
-    /// A tile volume slider being dragged: the value shown until the
-    /// `SetVolume` pushed by the last change has landed in the session.
-    vol_drag: Option<(StreamKey, u32)>,
+    /// The stage's layout geometry, drags and slider state.
+    pub stage: super::stage::StageState,
 }
 
 // ---------------------------------------------------------------------------
 // Sizes (mockup CSS)
 // ---------------------------------------------------------------------------
 
-/// Tile corner radius (`.tile`).
-const TILE_R: u8 = 6;
-/// Statbar / round button / audio pill height.
-const OVL_H: f32 = 29.0;
-/// Share-card info block: pad 12 + who 22 + 8 + specs 16 + 8 + buttons 32 + pad 12.
-const CARD_INFO_H: f32 = 12.0 + 22.0 + 8.0 + 16.0 + 8.0 + 32.0 + 12.0;
-/// A single "On screen" tile is at most this fraction of the window height tall.
-const SINGLE_TILE_VH: f32 = 0.46;
-/// Smallest tile width the layouts aim for (a grid column's minimum).
-const MIN_TILE_W: f32 = theme::GRID_PITCH - theme::GRID_GAP;
-/// Widest a share card gets (see [`card_grid_shape`]). `Why 640:` the card's
-/// picture is a 320 px preview JPEG (`preview::PREVIEW_MAX_WIDTH`) or the own
-/// live preview (<= 640x360); wider only upscales a thumbnail, and Watch puts
-/// the real video in "On screen", which has no such cap.
-const CARD_MAX_W: f32 = 640.0;
 /// Room-name width the header keeps before it collapses its controls (a
 /// longer name truncates with "…" once every control is collapsed).
 const TITLE_NAME_MIN: f32 = 140.0;
@@ -90,108 +51,6 @@ const BANNER_TEXT_MIN: f32 = 320.0;
 // Pure layout math (tested)
 // ---------------------------------------------------------------------------
 
-/// Width of a lone "On screen" tile: the full width, capped so the tile is at
-/// most [`SINGLE_TILE_VH`] of the window height tall at 16:9 (mockup
-/// `max-width: calc(46vh * 16 / 9)`), never below [`MIN_TILE_W`] unless the
-/// area itself is narrower.
-pub fn single_tile_width(avail_w: f32, window_h: f32) -> f32 {
-    let cap = (window_h * SINGLE_TILE_VH * 16.0 / 9.0).max(MIN_TILE_W);
-    avail_w.min(cap).max(0.0)
-}
-
-/// Columns for the room's "On screen" tiles (mockup: 1 for one tile, else 2),
-/// dropping to 1 when two columns would be narrower than [`MIN_TILE_W`].
-pub fn room_tile_cols(n: usize, avail_w: f32) -> usize {
-    if n <= 1 || avail_w < 2.0 * MIN_TILE_W + theme::GRID_GAP { 1 } else { 2 }
-}
-
-/// Port of the former Electron frontend's `computeGridShape` (removed in the egui rework): the
-/// column count and tile width that give `n` 16:9 tiles the largest area in
-/// `w × h` with `gap` between them. Shapes whose tiles would be narrower than
-/// [`MIN_TILE_W`] are skipped (the view then scrolls instead of shrinking
-/// tiles to stamps).
-pub fn grid_shape(n: usize, w: f32, h: f32, gap: f32) -> (usize, f32) {
-    let w = w.max(0.0);
-    let h = h.max(0.0);
-    if n <= 1 {
-        let tw = if h > 0.0 { w.min(h * 16.0 / 9.0) } else { w };
-        return (1, tw.max(MIN_TILE_W.min(w)));
-    }
-    let mut best: Option<(usize, f32, f32)> = None;
-    for cols in 1..=n {
-        let rows = n.div_ceil(cols);
-        let cell_w = (w - gap * (cols as f32 - 1.0)) / cols as f32;
-        let cell_h = (h - gap * (rows as f32 - 1.0)) / rows as f32;
-        if cell_h <= 0.0 {
-            continue;
-        }
-        let tw = cell_w.min(cell_h * 16.0 / 9.0);
-        if tw < MIN_TILE_W.min(w) {
-            continue;
-        }
-        let area = tw * tw * 9.0 / 16.0;
-        if best.is_none_or(|b| area > b.2) {
-            best = Some((cols, tw, area));
-        }
-    }
-    match best {
-        Some((cols, tw, _)) => (cols, tw),
-        // Nothing fits the height: as many full-width-ish columns as fit.
-        None => {
-            let cols = (((w + gap) / (MIN_TILE_W + gap)).floor() as usize).clamp(1, n);
-            (cols, (w - gap * (cols as f32 - 1.0)) / cols as f32)
-        }
-    }
-}
-
-/// Columns and card width for the "Sharing in this room" cards (task #120, user
-/// report 2026-11-03: the old `grid_cols` grid added columns by width alone, so
-/// one card shrank to a quarter of the area as the window grew). Like a
-/// video-call gallery: try every column count from 1 to `min(n, columns of at
-/// least MIN_TILE_W that fit)` (never an empty column), size the card by the
-/// width *and* the viewport height `h` (16:9 thumb + `CARD_INFO_H` + 2 px border
-/// per row), cap at [`CARD_MAX_W`], and keep the largest card; on a tie (both
-/// at the cap) more columns win, so fewer rows. Never below `MIN_TILE_W` (unless
-/// the area is narrower): a short viewport scrolls instead. Every candidate's
-/// width only grows with `w` and the candidate set only grows, so a wider
-/// window never gives smaller cards.
-pub fn card_grid_shape(n: usize, w: f32, h: f32, gap: f32) -> (usize, f32) {
-    let w = w.max(0.0);
-    let n = n.max(1);
-    let fit = (((w + gap) / (MIN_TILE_W + gap)).floor() as usize).clamp(1, n);
-    let mut best = (1, 0.0_f32);
-    for cols in 1..=fit {
-        let rows = n.div_ceil(cols);
-        let cell_w = (w - gap * (cols as f32 - 1.0)) / cols as f32;
-        let cell_h = (h - gap * (rows as f32 - 1.0)) / rows as f32;
-        let by_h = (cell_h - CARD_INFO_H - 2.0) * 16.0 / 9.0 + 2.0;
-        let cw = cell_w.min(by_h).min(CARD_MAX_W).max(MIN_TILE_W.min(cell_w));
-        if cw >= best.1 {
-            best = (cols, cw);
-        }
-    }
-    best
-}
-
-fn initial(name: &str) -> String {
-    name.chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default()
-}
-
-fn codec_label(c: VideoCodec) -> &'static str {
-    match c {
-        VideoCodec::H264 => "H.264",
-        VideoCodec::H265 => "H.265",
-        VideoCodec::Av1 => "AV1",
-    }
-}
-
-fn fmt_kbps(kbps: f64) -> String {
-    if kbps >= 1000.0 { format!("{:.1} Mbps", kbps / 1000.0) } else { format!("{kbps:.0} kbps") }
-}
-
-// ---------------------------------------------------------------------------
-// Header band
-// ---------------------------------------------------------------------------
 
 /// Header band.
 pub fn show_header(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
@@ -366,8 +225,22 @@ fn room_menu(ui: &Ui, cx: &mut Cx, r: &RoomEntry, joined: Option<RoomHandle>) {
 // Body
 // ---------------------------------------------------------------------------
 
-/// Body for the current view.
-pub fn show_body(ui: &mut Ui, cx: &mut Cx, st: &mut RoomState) {
+/// Whether the central area is the stage (a joined room, "Watched streams") instead of the scrolling body.
+pub fn shows_stage(cx: &Cx) -> bool {
+    match &cx.nav.view {
+        View::Watching => true,
+        View::Room(_) => cx.selected_room().is_some_and(|r| r.conn == ConnState::Joined && r.handle.is_some()),
+        View::Welcome => false,
+    }
+}
+
+/// The stage, filling the whole central region.
+pub fn show_stage(ui: &mut Ui, cx: &mut Cx, st: &mut RoomState) {
+    super::stage::show(ui, cx, &mut st.stage);
+}
+
+/// Body for the other states: welcome, disconnected, connecting, reconnecting.
+pub fn show_body(ui: &mut Ui, cx: &mut Cx) {
     match &cx.nav.view {
         View::Welcome => {
             let title = tr("ui.room.welcome_title", "Pick a room on the left");
@@ -377,34 +250,17 @@ pub fn show_body(ui: &mut Ui, cx: &mut Cx, st: &mut RoomState) {
                 cx.act(UiAction::OpenModal(Modal::CreateJoin));
             }
         }
-        View::Watching => {
-            let keys = cx.watched();
-            if keys.is_empty() {
-                let title = tr("ui.room.watching_empty_title", "You're not watching anything");
-                let text = tr("ui.room.watching_empty_text", "Open a room and click Watch on a share.");
-                empty_state(ui, "visibility_off", &title, Some(&text), &[]);
-                return;
-            }
-            // The viewport minus the body padding (the clip rect is the
-            // ScrollArea's viewport).
-            let h = ui.clip_rect().height() - 2.0 * theme::S4;
-            let (cols, tw) = grid_shape(keys.len(), ui.available_width(), h, theme::GRID_GAP);
-            tiles(ui, cx, st, &keys, true, cols, tw);
-        }
+        // Watched streams and joined rooms are the stage (`show_stage`).
+        View::Watching => {}
         View::Room(_) => {
             let Some(r) = cx.selected_room() else { return };
-            room_body(ui, cx, st, &r);
+            room_body(ui, cx, &r);
         }
     }
 }
 
-/// One card in "Sharing in this room".
-enum CardItem<'a> {
-    Share(&'a StreamInfo),
-    Mine { capture: CaptureSourceId, destination: DestinationId },
-}
 
-fn room_body(ui: &mut Ui, cx: &mut Cx, st: &mut RoomState, r: &RoomEntry) {
+fn room_body(ui: &mut Ui, cx: &mut Cx, r: &RoomEntry) {
     match (r.conn, r.handle) {
         (ConnState::Disconnected, _) => {
             // The last Connect failed: say why, above the usual empty state.
@@ -442,63 +298,11 @@ fn room_body(ui: &mut Ui, cx: &mut Cx, st: &mut RoomState, r: &RoomEntry) {
                 empty_state(ui, "tv_off", &title, Some(&text), &[]);
             });
         }
-        (ConnState::Joined, Some(h)) => joined_body(ui, cx, st, r, h),
+        // A joined room is the stage; `shows_stage` keeps it from getting here.
+        (ConnState::Joined, Some(_)) => {}
     }
 }
 
-fn joined_body(ui: &mut Ui, cx: &mut Cx, st: &mut RoomState, r: &RoomEntry, h: RoomHandle) {
-    let watched: Vec<StreamKey> = cx.watched().into_iter().filter(|k| k.0 == h).collect();
-    if !watched.is_empty() {
-        let n = watched.len();
-        section(ui, &tr("ui.room.on_screen", "On screen"), n, |ui| {
-            let avail = ui.available_width();
-            let cols = room_tile_cols(n, avail);
-            let tw = if n == 1 { single_tile_width(avail, ui.ctx().content_rect().height()) } else { 0.0 };
-            tiles(ui, cx, st, &watched, false, cols, tw);
-        });
-    }
-
-    // Cards: shares not on screen (audio-only senders always), then ours.
-    let mut items: Vec<CardItem> = cx
-        .shares_in(h)
-        .into_iter()
-        .filter(|i| i.kind == StreamKind::Audio || !watched.contains(&(h, i.owner, i.stream_id)))
-        .map(CardItem::Share)
-        .collect();
-    if let ShareState::Live { capture, destination } = cx.share_state(r) {
-        items.push(CardItem::Mine { capture, destination });
-    }
-    let title = if watched.is_empty() { tr("ui.room.sharing", "Sharing in this room") } else { tr("ui.room.also_sharing", "Also sharing in this room") };
-    let mut acts = Vec::new();
-    section(ui, &title, items.len(), |ui| {
-        if items.is_empty() {
-            let (title, text) = if watched.is_empty() {
-                (tr("ui.room.nobody_title", "Nobody is sharing yet"), Some(tr("ui.room.nobody_text", "Start your own share with the bar below.")))
-            } else {
-                (tr("ui.room.all_watched_title", "You're watching everything shared here"), None)
-            };
-            empty_state(ui, "tv_off", &title, text.as_deref(), &[]);
-            return;
-        }
-        let cxr: &Cx = cx;
-        // Viewport minus the body padding and this section's heading (the clip rect
-        // is the ScrollArea's viewport), so a lone section's rows fit without scrolling.
-        let vh = ui.clip_rect().height() - 2.0 * theme::S4 - theme::HEADING_H - theme::S3;
-        let (cols, cw) = card_grid_shape(items.len(), ui.available_width(), vh, theme::GRID_GAP);
-        // A left-aligned block exactly `cols` cards wide, so the gaps stay 12.
-        let grid_w = cols as f32 * cw + (cols as f32 - 1.0) * theme::GRID_GAP;
-        ui.allocate_ui(vec2(grid_w, 0.0), |ui| {
-            ui.set_width(grid_w);
-            widgets::grid_rows_with(ui, cols, items.len(), |ui, i| match &items[i] {
-                CardItem::Share(info) => share_card(ui, cxr, h, info, &mut acts),
-                CardItem::Mine { capture, destination } => my_card(ui, cxr, h, *capture, *destination, &mut acts),
-            });
-        });
-    });
-    for a in acts {
-        cx.act(a);
-    }
-}
 
 /// `vbox·section` (gap 12): `[heading LABEL count][body]`.
 fn section(ui: &mut Ui, title: &str, count: usize, body: impl FnOnce(&mut Ui)) {
@@ -667,650 +471,6 @@ fn empty_state(ui: &mut Ui, icon: &str, title: &str, text: Option<&str>, btns: &
 // Tiles
 // ---------------------------------------------------------------------------
 
-/// A grid of video tiles: `cols` equal columns; `tile_w > 0` caps each tile's
-/// width (left-aligned in its column). `cross_room` labels tiles with the
-/// room name too ("Watched streams").
-fn tiles(ui: &mut Ui, cx: &mut Cx, st: &mut RoomState, keys: &[StreamKey], cross_room: bool, cols: usize, tile_w: f32) {
-    let mut acts = Vec::new();
-    let cxr: &Cx = cx;
-    widgets::grid_rows_with(ui, cols, keys.len(), |ui, i| {
-        let key = keys[i];
-        let w = if tile_w > 0.0 { ui.available_width().min(tile_w) } else { ui.available_width() };
-        let size = vec2(w, (w * 9.0 / 16.0).round());
-        if cxr.is_popped(key) {
-            popped_tile(ui, cxr, key, size, cross_room, &mut acts);
-        } else if let Some(resp) = cxr.videos.show(key, ui, size, Fit::Contain) {
-            tile_chrome(ui, resp.rect);
-            health_chip(ui, resp.rect, stream_health(cxr, key));
-            // Double-click = fullscreen. Registered before the overlay, whose
-            // buttons then take their own clicks. Single click does nothing.
-            if ui.interact(resp.rect, Id::new(("tile_dbl", key)), Sense::click()).double_clicked() {
-                acts.push(UiAction::EnterStreamFullscreen(key));
-            }
-            tile_overlay(ui, cxr, st, key, resp.rect, cross_room, &mut acts);
-        }
-    });
-    for a in acts {
-        cx.act(a);
-    }
-}
-
-/// What the viewer's decoder says about a watched stream (recovering from loss,
-/// or the sharer's capture is stalled). `Healthy` when unknown.
-fn stream_health(cx: &Cx, key: StreamKey) -> ViewState {
-    cx.session(key.0)
-        .and_then(|s| s.watches.lock().unwrap().get(&(key.1, key.2)).map(|w| w.decoder.lock().unwrap().view_state(std::time::Instant::now())))
-        .unwrap_or(ViewState::Healthy)
-}
-
-/// A centred chip over a tile whose stream is not healthy, so a frozen picture is never
-/// mistaken for a live one: amber dot + "Recovering…" (a keyframe was lost or the link
-/// is down; the viewer is already asking for a new one) or "Sharer's capture stalled"
-/// (the sender flagged it; advisory, nothing acts on it). Nothing is drawn when healthy.
-fn health_chip(ui: &Ui, rect: Rect, state: ViewState) {
-    let text = match state {
-        ViewState::Healthy => return,
-        ViewState::Recovering => tr("video.recovering", "Recovering…"),
-        ViewState::SharerStalled => tr("video.sharer_stalled", "Sharer's capture stalled"),
-    };
-    let f = font(Weight::Bold, theme::FS_SMALL);
-    let dot = 7.0;
-    let w = (text_width(ui, &text, f.clone(), 0.0) + dot + theme::S2 + 2.0 * theme::S3).min(rect.width() - 2.0 * theme::S2);
-    let r = Rect::from_center_size(rect.center(), vec2(w, OVL_H));
-    ui.painter().rect_filled(r, CornerRadius::same(15), theme::CHIP_DARK);
-    ui.painter().circle_filled(pos2(r.left() + theme::S3 + dot / 2.0, r.center().y), dot / 2.0, theme::WARNING);
-    let tr_ = Rect::from_x_y_ranges(r.left() + theme::S3 + dot + theme::S2..=r.right() - theme::S3, r.y_range());
-    paint_text(ui, tr_, &text, f, theme::TEXT, Align::Min);
-}
-
-/// Rounded corners + the faint green ring around a tile's video. `Why` the
-/// corner masks: the video is a wgpu paint callback that can't be clipped to
-/// a rounded rect, so the body background is painted over its corners.
-fn tile_chrome(ui: &Ui, rect: Rect) {
-    let p = ui.painter();
-    let r = TILE_R as f32;
-    let mut mesh = Mesh::default();
-    for (corner, sx, sy) in [(rect.left_top(), 1.0, 1.0), (rect.right_top(), -1.0, 1.0), (rect.left_bottom(), 1.0, -1.0), (rect.right_bottom(), -1.0, -1.0)] {
-        // Triangle fan from the corner point over the quarter arc.
-        let c = pos2(corner.x + sx * r, corner.y + sy * r);
-        let base = mesh.vertices.len() as u32;
-        mesh.vertices.push(Vertex { pos: corner, uv: WHITE_UV, color: theme::PANEL_BASE });
-        const STEPS: u32 = 6;
-        for s in 0..=STEPS {
-            let a = std::f32::consts::FRAC_PI_2 * s as f32 / STEPS as f32;
-            let pos = pos2(c.x - sx * r * a.cos(), c.y - sy * r * a.sin());
-            mesh.vertices.push(Vertex { pos, uv: WHITE_UV, color: theme::PANEL_BASE });
-        }
-        for s in 0..STEPS {
-            mesh.indices.extend_from_slice(&[base, base + 1 + s, base + 2 + s]);
-        }
-    }
-    p.add(Shape::mesh(mesh));
-    p.rect_stroke(rect, CornerRadius::same(TILE_R), Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(80, 200, 120, 51)), StrokeKind::Outside);
-}
-
-/// "X is open in its own window" placeholder for a popped-out stream:
-/// dashed accent 16:9 frame, `[icon][text][hbox·actions 300: Bring back, Stop watching]`.
-fn popped_tile(ui: &mut Ui, cx: &Cx, key: StreamKey, size: egui::Vec2, cross_room: bool, acts: &mut Vec<UiAction>) {
-    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-    let r = CornerRadius::same(TILE_R);
-    let p = ui.painter();
-    p.rect_filled(rect, r, theme::ACCENT_GHOST_BG);
-    widgets::paint_dashed_rect(p, rect.shrink(0.75), r, Stroke::new(1.5_f32, theme::ACCENT_GHOST_BORDER), 5.0, 4.0);
-    let name = cx.member_name(key.0, key.1);
-    let who = if cross_room { format!("{name} · {}", cx.room_name(key.0)) } else { name };
-    let text = tr("ui.room.popped_text", "is open in its own window");
-    let back = tr("ui.room.bring_back", "Bring back");
-    let stop = tr("ui.room.stop_watching", "Stop watching");
-    let btns = [Btn::secondary(&back).icon("move_down"), Btn::danger(&stop).icon("close")];
-    // Centred vbox, gap 12: icon 28 / text line 18 / buttons 32.
-    let block_h = 28.0 + theme::S3 + 18.0 + theme::S3 + theme::CTL_H;
-    let top = rect.center().y - block_h / 2.0;
-    let line = |y: f32, h: f32| Rect::from_x_y_ranges(rect.x_range().shrink(theme::S3), y..=y + h);
-    widgets::paint_icon(ui, line(top, 28.0), "open_in_new", 28.0, theme::ACCENT_LIGHTER);
-    let ty = top + 28.0 + theme::S3;
-    let bold = font(Weight::Bold, theme::FS_LABEL);
-    let reg = font(Weight::Regular, theme::FS_LABEL);
-    let (ww, tw) = (text_width(ui, &who, bold.clone(), 0.0), text_width(ui, &text, reg.clone(), 0.0) + 4.0);
-    let x0 = (rect.center().x - (ww + tw) / 2.0).max(rect.left() + theme::S3);
-    let wr = paint_text(ui, Rect::from_x_y_ranges(x0..=rect.right() - theme::S3, ty..=ty + 18.0), &who, bold, theme::TEXT, Align::Min);
-    paint_text(ui, Rect::from_x_y_ranges(wr.right() + 4.0..=rect.right() - theme::S3, ty..=ty + 18.0), &text, reg, theme::TEXT_DIM, Align::Min);
-    let bw = 300.0_f32.min(rect.width() - 2.0 * theme::S3);
-    let by = ty + 18.0 + theme::S3;
-    let br = Rect::from_min_size(pos2(rect.center().x - bw / 2.0, by), vec2(bw, theme::CTL_H));
-    let mut child = ui.new_child(UiBuilder::new().max_rect(br).layout(Layout::left_to_right(Align::Center)));
-    match widgets::btn_row(&mut child, &btns) {
-        Some(0) => acts.push(UiAction::BringBack(key)),
-        Some(1) => acts.push(UiAction::Unwatch(key)),
-        _ => {}
-    }
-}
-
-/// The hover overlay of a tile: vignette, `[hbox·top: fill statbar, Pop out,
-/// Stop watching]`, `[hbox·bottom: audio pill]`, inset 8. Fades in over
-/// 0.12 s while the pointer is over the tile; nothing is built at alpha 0.
-fn tile_overlay(ui: &mut Ui, cx: &Cx, st: &mut RoomState, key: StreamKey, rect: Rect, cross_room: bool, acts: &mut Vec<UiAction>) {
-    let id = Id::new(("tile_overlay", key));
-    let hovered = ui.rect_contains_pointer(rect);
-    let alpha = ui.ctx().animate_bool_with_time(id, hovered, 0.12);
-    if alpha <= 0.0 {
-        return;
-    }
-    let mut ov = ui.new_child(UiBuilder::new().id_salt(id).max_rect(rect).layout(Layout::left_to_right(Align::Center)));
-    ov.set_clip_rect(rect.intersect(ui.clip_rect()));
-    ov.multiply_opacity(alpha);
-
-    // Vignette: .55 → .1 over the top 40 %, → .82 at the bottom.
-    let v = |a: f32| Color32::from_rgba_unmultiplied(10, 11, 13, (a * 255.0) as u8);
-    let split = rect.top() + rect.height() * 0.4;
-    let tr_ = TILE_R;
-    let top_r = CornerRadius { nw: tr_, ne: tr_, sw: 0, se: 0 };
-    let bot_r = CornerRadius { nw: 0, ne: 0, sw: tr_, se: tr_ };
-    widgets::paint_gradient(ov.painter(), Rect::from_min_max(rect.min, pos2(rect.right(), split)), top_r, 180.0, v(0.55), v(0.10));
-    widgets::paint_gradient(ov.painter(), Rect::from_min_max(pos2(rect.left(), split), rect.max), bot_r, 180.0, v(0.10), v(0.82));
-
-    let inner = rect.shrink(theme::S2);
-    // --- top: [fill statbar][29 pop out][29 stop], gaps 8 / 4 -------------
-    let top = Rect::from_min_size(inner.min, vec2(inner.width(), OVL_H));
-    let stop_r = Rect::from_min_size(pos2(top.right() - OVL_H, top.top()), vec2(OVL_H, OVL_H));
-    let pop_r = stop_r.translate(vec2(-(OVL_H + theme::S1), 0.0));
-    let bar_cell = Rect::from_min_max(top.min, pos2(pop_r.left() - theme::S2, top.bottom()));
-    statbar(&mut ov, cx, key, bar_cell, cross_room);
-    if round_btn(&mut ov, pop_r, id.with("pop"), "open_in_new", &tr("ui.room.pop_out_tip", "Pop out to its own window"), false).clicked() {
-        acts.push(UiAction::PopOut(key));
-    }
-    if round_btn(&mut ov, stop_r, id.with("stop"), "close", &tr("ui.room.stop_watching", "Stop watching"), true).clicked() {
-        acts.push(UiAction::Unwatch(key));
-    }
-
-    // --- bottom: audio pill, or "No audio shared" --------------------------
-    let bottom = Rect::from_min_size(pos2(inner.left(), inner.bottom() - OVL_H), vec2(inner.width(), OVL_H));
-    let has_audio = cx.session(key.0).is_some_and(|s| s.sibling_audio_stream(key.1).is_some());
-    if has_audio {
-        audio_pill(&mut ov, cx, st, key, bottom, acts);
-    } else {
-        let mut c = ov.new_child(UiBuilder::new().max_rect(bottom).layout(Layout::left_to_right(Align::Center)));
-        widgets::chip_dark(&mut c, Some("volume_off"), false, &tr("ui.room.no_audio", "No audio shared"));
-    }
-}
-
-/// `hbox·statbar` (29 px pill, pad 10, gap 8): `[7 dot][name][res][fps 6ch][rate 8ch]`,
-/// content-sized up to `cell`'s width (the name truncates). The numbers sit in
-/// fixed tabular-width slots so the bar doesn't jitter as they change. Hover
-/// shows decoded vs presented fps (presentation must keep up with decode).
-/// In a narrow tile ([`statbar_fields`]) the resolution and then the bitrate
-/// leave the bar for the tooltip instead of being cut off mid-number.
-fn statbar(ui: &mut Ui, cx: &Cx, key: StreamKey, cell: Rect, cross_room: bool) {
-    let Some(entry) = cx.videos.get(key) else { return };
-    let stats = entry.view.lock().unwrap().source().stats();
-    let kbps = cx
-        .session(key.0)
-        .and_then(|s| s.watches.lock().unwrap().get(&(key.1, key.2)).map(|w| w.decoder.lock().unwrap().received_bitrate_kbps()))
-        .unwrap_or(0.0);
-    let name = cx.member_name(key.0, key.1);
-    let name = if cross_room { format!("{name} · {}", cx.room_name(key.0)) } else { name };
-    let res = cx.videos.frame_size(key).map(|(w, h)| format!("{w}x{h}")).unwrap_or_default();
-    let fps = format!("{:.0}fps", stats.decoded_fps);
-    let rate = fmt_kbps(kbps);
-
-    let nf = font(Weight::Bold, theme::FS_ROW);
-    let mf = font(Weight::Mono, theme::FS_SMALL);
-    let ch = text_width(ui, "0", mf.clone(), 0.0);
-    let (res_w, fps_w, rate_w) = (text_width(ui, &res, mf.clone(), 0.0).ceil(), (6.0 * ch).ceil(), (8.0 * ch).ceil());
-    let (show_res, show_rate) = statbar_fields(cell.width(), res_w, fps_w, rate_w);
-    let (res_w, rate_w) = (if show_res { res_w } else { 0.0 }, if show_rate { rate_w } else { 0.0 });
-    let fixed_w = statbar_fixed_w(res_w, fps_w, rate_w);
-    let name_w = text_width(ui, &name, nf.clone(), 0.0).ceil().min((cell.width() - fixed_w).max(0.0));
-    let w = (fixed_w + name_w).min(cell.width());
-    let bar = Rect::from_min_size(cell.min, vec2(w, OVL_H));
-    let p = ui.painter();
-    p.rect_filled(bar, CornerRadius::same(15), Color32::from_black_alpha(158));
-    let mut child = ui.new_child(UiBuilder::new().max_rect(bar).layout(Layout::left_to_right(Align::Center)));
-    child.shrink_clip_rect(bar);
-    let slots = [fixed(7.0), fixed(name_w), fixed(res_w), fixed(fps_w), fixed(rate_w)];
-    let row = HBox::new("hbox·statbar", OVL_H).pad(10.0, 10.0).slots(&slots).show(&mut child);
-    let c = row.cell(0).center();
-    // Amber instead of green while the stream is recovering or the sharer's capture is stalled.
-    let (dot, glow) = if stream_health(cx, key) == ViewState::Healthy {
-        (theme::SUCCESS, theme::SUCCESS_GLOW)
-    } else {
-        (theme::WARNING, theme::WARNING)
-    };
-    child.painter().circle_filled(c, 5.0, glow.gamma_multiply(0.25));
-    child.painter().circle_filled(c, 3.5, dot);
-    let num = Color32::from_rgba_unmultiplied(232, 233, 236, 217);
-    row.text(&child, 1, &name, nf, theme::TEXT, Align::Min);
-    if show_res {
-        row.text(&child, 2, &res, mf.clone(), num, Align::Min);
-    }
-    row.text(&child, 3, &fps, mf.clone(), num, Align::Max);
-    if show_rate {
-        row.text(&child, 4, &rate, mf, num, Align::Max);
-    }
-    row.response.on_hover_ui(|ui| {
-        // What a narrow bar left out, so it is still one hover away.
-        let hidden: Vec<&str> = [(!show_res).then_some(res.as_str()), (!show_rate).then_some(rate.as_str())]
-            .into_iter()
-            .flatten()
-            .filter(|t| !t.is_empty())
-            .collect();
-        if !hidden.is_empty() {
-            ui.label(hidden.join(" · "));
-        }
-        let codec = stats.info.codec.map(|c| c.name()).unwrap_or("—");
-        let dec = stats.info.decoder_name.as_deref().unwrap_or("—");
-        ui.label(tr_with(
-            "ui.room.stats_tip",
-            "Decoded %{decoded} fps · shown %{presented} fps\n%{codec} via %{decoder} · %{dropped} dropped",
-            &[
-                ("decoded", &format!("{:.0}", stats.decoded_fps)),
-                ("presented", &format!("{:.0}", stats.presented_fps)),
-                ("codec", codec),
-                ("decoder", dec),
-                ("dropped", &stats.access_units_dropped.to_string()),
-            ],
-        ));
-    });
-}
-
-/// Width of the statbar without its name: pads 10+10, the 7 px dot and a gap
-/// 8 before every following slot (a 0-wide slot keeps its gap; harmless).
-fn statbar_fixed_w(res_w: f32, fps_w: f32, rate_w: f32) -> f32 {
-    10.0 + 7.0 + theme::S2 + theme::S2 + res_w + theme::S2 + fps_w + theme::S2 + rate_w + 10.0
-}
-
-/// Which optional statbar numbers fit `cell_w`, as `(resolution, bitrate)`;
-/// fps always stays. `Why` this order: at the 800 px minimum window (PR #4)
-/// a room tile is ~264 px and its statbar cell ~178 px, too narrow for
-/// `1920x1080 30fps 7.6 Mbps`, which was cut mid-number. The resolution
-/// changes least (the share card shows it too), the received bitrate is
-/// next, fps is the health signal. Hidden values move into the tooltip.
-fn statbar_fields(cell_w: f32, res_w: f32, fps_w: f32, rate_w: f32) -> (bool, bool) {
-    if statbar_fixed_w(res_w, fps_w, rate_w) <= cell_w {
-        (true, true)
-    } else if statbar_fixed_w(0.0, fps_w, rate_w) <= cell_w {
-        (false, true)
-    } else {
-        (false, false)
-    }
-}
-
-/// `.round-btn`: 29 px circle, translucent dark fill, faint white ring,
-/// 16 px icon; `stop` turns the icon red on hover.
-fn round_btn(ui: &mut Ui, rect: Rect, id: Id, icon: &str, tip: &str, stop: bool) -> Response {
-    let resp = ui.interact(rect, id, Sense::click());
-    let hover = resp.hovered();
-    let p = ui.painter();
-    let fill = Color32::from_rgba_unmultiplied(16, 17, 20, if hover { 204 } else { 140 });
-    p.circle(rect.center(), rect.width() / 2.0 - 0.5, fill, Stroke::new(1.0_f32, Color32::from_white_alpha(41)));
-    let col = if hover && stop { theme::DANGER } else { theme::TEXT };
-    widgets::paint_icon(ui, rect, icon, 16.0, col);
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(tip)
-}
-
-/// The tile's volume slider. Pushes `SetVolume` on **every** change, mid-drag included (#135, user:
-/// "make sure that when the volume slider is moved it instantly sets the volume even while moving and
-/// not only when the user actually lifts his mouse button"). `Why:` the user wants to hear the level
-/// while choosing it. `SetVolume` only sets the decoder's `volume` element and the in-memory
-/// session value (nothing is written to disk), so one per changed frame is cheap. `st.vol_drag` keeps
-/// the shown value one frame ahead of the session until the pushed value has landed.
-pub(super) fn tile_volume_slider(ui: &mut Ui, st: &mut RoomState, key: StreamKey, shown: u32, applied: u32, acts: &mut Vec<UiAction>) -> Response {
-    let mut v = shown;
-    let r = super::volume_slider(ui, &mut v);
-    if r.dragged() || r.changed() {
-        st.vol_drag = Some((key, v));
-    }
-    if r.changed() {
-        acts.push(UiAction::SetVolume { stream: key, volume_percent: v, muted: false });
-    } else if !r.dragged() && st.vol_drag.is_some_and(|(k, d)| k == key && d == applied) {
-        // The pushed value has landed: stop overriding it.
-        st.vol_drag = None;
-    }
-    r
-}
-
-/// `hbox·audio-pill` (29 px, pad 2/2, gap 4): `[25 mute][110 volume 0–500 %][34 pct][25 level]`,
-/// or `[25 mute][Muted]` (pad 2/10) while muted. Both end buttons sit concentric in the pill's
-/// half-circle ends, 2 px in (#130). `level` is the global loudness-levelling toggle (#126). The slider pushes `SetVolume` on every change, mid-drag too (#135).
-fn audio_pill(ui: &mut Ui, cx: &Cx, st: &mut RoomState, key: StreamKey, bottom: Rect, acts: &mut Vec<UiAction>) {
-    let Some(s) = cx.session(key.0) else { return };
-    let vol = s.volume(key.1, key.2);
-    let shown = st.vol_drag.filter(|(k, _)| *k == key).map_or(vol.volume_percent, |(_, v)| v);
-    let muted_l = tr("ui.room.muted", "Muted");
-    let pct = format!("{shown}%");
-    let tf = font(Weight::Mono, theme::FS_TINY);
-    let tail = if vol.muted { text_width(ui, &muted_l, tf.clone(), 0.0).ceil() } else { 110.0 + theme::S1 + 34.0 + theme::S1 + 25.0 };
-    // Right pad 2 like the left one, so the level button fills the right end cap (#130); 10 after the "Muted" text.
-    let pad_r = if vol.muted { 10.0 } else { 2.0 };
-    let w = 2.0 + 25.0 + theme::S1 + tail + pad_r;
-    let pill = Rect::from_min_size(bottom.min, vec2(w.min(bottom.width()), OVL_H));
-    ui.painter().rect(pill, CornerRadius::same(15), Color32::from_black_alpha(184), Stroke::new(1.0_f32, Color32::from_white_alpha(46)), StrokeKind::Inside);
-
-    let mut child = ui.new_child(UiBuilder::new().max_rect(pill).layout(Layout::left_to_right(Align::Center)));
-    child.shrink_clip_rect(pill);
-    let slots_muted = [fixed(25.0), fixed(tail)];
-    let slots = [fixed(25.0), fixed(110.0), fixed(34.0), fixed(25.0)];
-    let row = HBox::new("hbox·audio-pill", OVL_H).gap(theme::S1).pad(2.0, pad_r).slots(if vol.muted { &slots_muted } else { &slots }).show(&mut child);
-
-    // Mute toggle: 25 px round, red icon while muted.
-    let mr = Rect::from_center_size(row.cell(0).center(), vec2(25.0, 25.0));
-    let mresp = child.interact(mr, Id::new(("tile_mute", key)), Sense::click());
-    if mresp.hovered() {
-        child.painter().circle_filled(mr.center(), 12.5, Color32::from_white_alpha(20));
-    }
-    let (icon, col, tip) = if vol.muted {
-        ("volume_off", theme::DANGER, tr("ui.room.unmute", "Listen"))
-    } else {
-        ("volume_up", theme::TEXT, tr("ui.room.mute", "Mute this stream"))
-    };
-    widgets::paint_icon(&child, mr, icon, 16.0, col);
-    if mresp.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(&tip).clicked() {
-        acts.push(UiAction::SetVolume { stream: key, volume_percent: vol.volume_percent, muted: !vol.muted });
-    }
-    let num = Color32::from_rgba_unmultiplied(232, 233, 236, 217);
-    if vol.muted {
-        row.text(&child, 1, &muted_l, tf, num, Align::Min);
-        return;
-    }
-    // The slider is 32 px tall; centre it on the 29 px pill.
-    let sc = row.cell(1);
-    let sr = Rect::from_center_size(sc.center(), vec2(sc.width(), theme::CTL_H));
-    let mut sl = child.new_child(UiBuilder::new().id_salt(("tile_vol", key)).max_rect(sr).layout(Layout::left_to_right(Align::Center)));
-    tile_volume_slider(&mut sl, st, key, shown, vol.volume_percent, acts).on_hover_text(tr("ui.room.volume", "Volume"));
-    row.text(&child, 2, &pct, tf, num, Align::Max);
-    let lr = Rect::from_center_size(row.cell(3).center(), vec2(25.0, 25.0));
-    if super::level_toggle(&child, lr, Id::new(("tile_level", key)), cx.state.level_loudness) {
-        acts.push(UiAction::SetLevelLoudness(!cx.state.level_loudness));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Share cards
-// ---------------------------------------------------------------------------
-
-/// Card frame (`.scard`): `PANEL_RAISED`, 1 px border, radius 12, soft shadow;
-/// returns `(thumb rect, info rect)` — a 16:9 thumb inside the border, then
-/// the info block ([`CARD_INFO_H`]).
-fn card_frame(ui: &mut Ui) -> (Rect, Rect) {
-    let w = ui.available_width();
-    let thumb_h = ((w - 2.0) * 9.0 / 16.0).round();
-    let (rect, _) = ui.allocate_exact_size(vec2(w, 1.0 + thumb_h + CARD_INFO_H + 1.0), Sense::hover());
-    let r = CornerRadius::same(theme::ROUNDING_WELL);
-    let p = ui.painter();
-    p.add(egui::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha(46) }.as_shape(rect, r));
-    p.add(egui::Shadow { offset: [0, 1], blur: 2, spread: 0, color: Color32::from_black_alpha(64) }.as_shape(rect, r));
-    p.rect(rect, r, theme::PANEL_RAISED, Stroke::new(1.0_f32, theme::BORDER), StrokeKind::Inside);
-    let thumb = Rect::from_min_size(rect.min + vec2(1.0, 1.0), vec2(w - 2.0, thumb_h));
-    let info = Rect::from_min_max(pos2(rect.left() + 1.0, thumb.bottom()), rect.max - vec2(1.0, 1.0));
-    (thumb, info)
-}
-
-fn thumb_radius() -> CornerRadius {
-    let r = theme::ROUNDING_WELL - 1;
-    CornerRadius { nw: r, ne: r, sw: 0, se: 0 }
-}
-
-/// `hbox·corners` over a thumb (inset 8): `[chip][fill][audio chip?]`.
-fn thumb_corners(ui: &mut Ui, thumb: Rect, live: Option<&str>, audio: bool) {
-    let row = Rect::from_min_size(thumb.min + vec2(theme::S2, theme::S2), vec2(thumb.width() - 2.0 * theme::S2, 22.0));
-    let mut c = ui.new_child(UiBuilder::new().max_rect(row).layout(Layout::left_to_right(Align::Center)));
-    c.shrink_clip_rect(thumb);
-    match live {
-        Some(t) if t == "LIVE" => widgets::chip_dark(&mut c, None, true, t),
-        Some(t) => widgets::chip_dark(&mut c, None, false, t),
-        None => return,
-    };
-    if audio {
-        let mut r = ui.new_child(UiBuilder::new().max_rect(row).layout(Layout::right_to_left(Align::Center)));
-        widgets::chip_dark(&mut r, Some("volume_up"), false, "").on_hover_text(tr("ui.room.shares_audio", "Shares audio"));
-    }
-}
-
-/// `vbox·info` (pad 12, gap 8): `[hbox·who 22: avatar 22, bold name, fill
-/// dim title][hbox·specs 16][btn_row]`. `who` = (shown name, the display
-/// name the avatar initial and colour come from); they differ only on
-/// our own card ("You" / "Du" vs our name). Returns the clicked button.
-fn card_info(ui: &mut Ui, info: Rect, who: (&str, &str), title: &str, specs: &str, btns: &[Btn]) -> Option<usize> {
-    let inner = info.shrink(theme::S3);
-    let mut c = ui.new_child(UiBuilder::new().max_rect(inner).layout(Layout::top_down(Align::Min)));
-    c.spacing_mut().item_spacing.y = theme::S2;
-    let nf = font(Weight::Bold, 13.5);
-    let nw = text_width(&c, who.0, nf.clone(), 0.0).ceil().min(inner.width() * 0.6);
-    let row = HBox::new("hbox·who", theme::AVATAR_SM).slots(&[fixed(theme::AVATAR_SM), fixed(nw), FILL]).show(&mut c);
-    widgets::paint_avatar(&c, row.cell(0), &initial(who.1), theme::avatar_colors(who.1), false);
-    row.text(&c, 1, who.0, nf, theme::TEXT, Align::Min);
-    row.text(&c, 2, title, font(Weight::Regular, theme::FS_SMALL), theme::TEXT_DIM, Align::Min);
-    let row = HBox::new("hbox·specs", 16.0).slots(&[FILL]).show(&mut c);
-    row.text(&c, 0, specs, font(Weight::Mono, theme::FS_TINY), theme::TEXT_DIM, Align::Min);
-    widgets::btn_row(&mut c, btns)
-}
-
-/// Cover-fit a preview texture into the thumb (crop, never letterbox).
-fn paint_cover(p: &egui::Painter, thumb: Rect, tex: &egui::TextureHandle) {
-    let [tw, th] = tex.size();
-    let (ta, ra) = (tw as f32 / th.max(1) as f32, thumb.width() / thumb.height());
-    let uv = if ta > ra {
-        let k = ra / ta;
-        Rect::from_min_max(pos2(0.5 - k / 2.0, 0.0), pos2(0.5 + k / 2.0, 1.0))
-    } else {
-        let k = ta / ra;
-        Rect::from_min_max(pos2(0.0, 0.5 - k / 2.0), pos2(1.0, 0.5 + k / 2.0))
-    };
-    p.add(RectShape::filled(thumb, thumb_radius(), Color32::WHITE).with_texture(tex.id(), uv));
-}
-
-/// Someone else's share: preview thumbnail (latest decoded preview JPEG),
-/// owner, specs, `[Watch][Pop out]` (audio-only: `[Listen]`).
-fn share_card(ui: &mut Ui, cx: &Cx, h: RoomHandle, info: &StreamInfo, acts: &mut Vec<UiAction>) {
-    let key = (h, info.owner, info.stream_id);
-    let Some(s) = cx.session(h) else { return };
-    let (thumb, info_r) = card_frame(ui);
-    let p = ui.painter();
-    p.rect_filled(thumb, thumb_radius(), theme::TILE_BG);
-    let audio_only = info.kind == StreamKind::Audio;
-    if let Some(tex) = s.preview_textures.get(&(info.owner, info.stream_id)) {
-        paint_cover(p, thumb, tex);
-    } else {
-        let (icon, label) = if audio_only {
-            ("music_note", tr("ui.room.audio_only", "Audio only"))
-        } else {
-            ("screen_share", tr("ui.room.no_preview", "Preview arrives shortly"))
-        };
-        thumb_placeholder(ui, thumb, icon, theme::TEXT_FAINT, &label);
-    }
-    let has_audio = audio_only || s.sibling_audio_stream(info.owner).is_some();
-    thumb_corners(ui, thumb, Some("LIVE"), has_audio && !audio_only);
-
-    let label = super::share_label(&info.label);
-    let name = cx.member_name(h, info.owner);
-    let specs = if audio_only {
-        tr("ui.room.audio_only", "Audio only")
-    } else if info.width > 0 && info.height > 0 {
-        format!("{}×{}", info.width, info.height)
-    } else {
-        "—".to_owned()
-    };
-    let who = (name.as_str(), name.as_str());
-    if audio_only {
-        let listening = cx.is_watching(key);
-        let (l_on, l_off) = (tr("ui.room.listen", "Listen"), tr("ui.room.stop_listening", "Stop listening"));
-        let b = if listening { Btn::secondary(&l_off).icon("volume_off") } else { Btn::primary(&l_on).icon("volume_up") };
-        if card_info(ui, info_r, who, &label, &specs, &[b]).is_some() {
-            acts.push(UiAction::ToggleListen(key));
-        }
-    } else {
-        let watch = tr("ui.room.watch", "Watch");
-        let pop = tr("ui.room.pop_out", "Pop out");
-        let pop_tip = tr("ui.room.pop_out_card_tip", "Watch in its own window");
-        let btns = [Btn::primary(&watch).icon("play_arrow"), Btn::secondary(&pop).icon("open_in_new").tip(&pop_tip)];
-        match card_info(ui, info_r, who, &label, &specs, &btns) {
-            Some(0) => acts.push(UiAction::Watch(key)),
-            Some(1) => acts.push(UiAction::WatchPoppedOut(key)),
-            _ => {}
-        }
-    }
-}
-
-/// A centred `[icon 24][label 11]` on a thumb.
-fn thumb_placeholder(ui: &Ui, thumb: Rect, icon: &str, icon_col: Color32, label: &str) {
-    let cy = thumb.center().y;
-    let line = |y: f32, h: f32| Rect::from_x_y_ranges(thumb.x_range().shrink(theme::S2), y..=y + h);
-    widgets::paint_icon(ui, line(cy - 22.0, 24.0), icon, 24.0, icon_col);
-    paint_text(ui, line(cy + 6.0, 16.0), label, font(Weight::Regular, theme::FS_TINY), theme::TEXT_FAINT, Align::Center);
-}
-
-/// Display names of the people watching our stream `stream_id` in room `h` (the relay's list,
-/// spec 9.1, resolved through the roster, sorted). `None` when the relay does not report viewers
-/// (an older relay): the card then shows no count at all, since "0" would be a lie.
-fn viewer_names(cx: &Cx, h: RoomHandle, stream_id: u8) -> Option<Vec<String>> {
-    let s = cx.session(h)?;
-    if !s.viewers_supported {
-        return None;
-    }
-    let ids = s.viewers.get(&stream_id).map(|(v, _)| v.as_slice()).unwrap_or(&[]);
-    let mut names: Vec<String> = ids.iter().filter_map(|c| s.members.iter().find(|m| m.conn_id == *c)).map(|m| m.display_name.clone()).collect();
-    names.sort_by_key(|n| n.to_lowercase());
-    Some(names)
-}
-
-/// Most viewer rows the dropdown lists; the rest collapse into one "+N" row.
-const VIEWER_ROWS_MAX: usize = 8;
-/// Width of the viewers dropdown.
-const VIEWERS_POP_W: f32 = 200.0;
-
-/// The hover dropdown under the viewer chip (user request, task #116: "hovers something like a
-/// viewer number ... a drop-down thingy ... the profile picture and the username"): one row per
-/// viewer, avatar then name, the same avatar the People list uses. Open while the pointer is on the
-/// chip or, once open, anywhere on the chip, the dropdown or the gap between them, so the pointer
-/// can travel into it. Nobody watching: no dropdown, a plain tooltip says so.
-fn viewers_dropdown(ui: &Ui, chip: &Response, names: &[String]) {
-    if names.is_empty() {
-        chip.clone().on_hover_text(tr("ui.room.viewers_none", "Nobody is watching this yet."));
-        return;
-    }
-    let ctx = ui.ctx();
-    let id = chip.id.with("viewers_dropdown");
-    // The dropdown's rect from the previous frame, kept only while it is open.
-    let shown: Option<Rect> = ctx.data(|d| d.get_temp(id));
-    let hovering = |r: Rect| ctx.pointer_hover_pos().is_some_and(|p| r.expand(3.0).contains(p));
-    if !(chip.hovered() || shown.is_some_and(|r| hovering(r.union(chip.rect)))) {
-        ctx.data_mut(|d| d.remove::<Rect>(id));
-        return;
-    }
-    let rows = names.len().min(VIEWER_ROWS_MAX);
-    let extra = names.len() - rows;
-    let height = 24.0 + (rows + usize::from(extra > 0)) as f32 * 28.0 + 12.0;
-    let screen = ctx.content_rect();
-    // Hangs off the chip's right edge, 4 px below (above if the window ends first).
-    let x = (chip.rect.right() - VIEWERS_POP_W).max(screen.left() + 8.0);
-    let below = chip.rect.bottom() + 4.0;
-    let y = if below + height > screen.bottom() - 8.0 { chip.rect.top() - 4.0 - height } else { below };
-    let frame = egui::Frame::new()
-        .fill(theme::PANEL_RAISED)
-        .stroke(Stroke::new(1.0_f32, theme::BORDER))
-        .corner_radius(CornerRadius::same(10))
-        .inner_margin(egui::Margin::same(6))
-        .shadow(egui::Shadow { offset: [0, 14], blur: 40, spread: 0, color: Color32::from_black_alpha(153) });
-    let area = egui::Area::new(id).order(egui::Order::Foreground).fixed_pos(pos2(x, y)).show(ctx, |ui| {
-        frame.show(ui, |ui| {
-            ui.set_width(VIEWERS_POP_W - 12.0);
-            ui.spacing_mut().item_spacing.y = 0.0;
-            let (hr, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
-            let title = format!("{} · {}", tr("ui.room.viewers_title", "Watching now").to_uppercase(), names.len());
-            paint_text(ui, hr.shrink2(vec2(theme::S2, 0.0)), &title, font(Weight::Bold, theme::FS_SECTION), theme::ACCENT, Align::Min);
-            for name in &names[..rows] {
-                let row = HBox::new("viewer_row", 28.0).pad(theme::S2, theme::S2).slots(&[fixed(theme::AVATAR_SM), FILL]).show(ui);
-                // The slot is as tall as the row; the avatar is a 22 px disc in its middle.
-                let disc = Rect::from_center_size(row.cell(0).center(), vec2(theme::AVATAR_SM, theme::AVATAR_SM));
-                widgets::paint_avatar(ui, disc, &initial(name), theme::avatar_colors(name), false);
-                row.text(ui, 1, name, font(Weight::Regular, theme::FS_LABEL), theme::TEXT, Align::Min);
-            }
-            if extra > 0 {
-                let row = HBox::new("viewer_more", 28.0).pad(theme::S2, theme::S2).slots(&[FILL]).show(ui);
-                row.text(ui, 0, &format!("+{extra}"), font(Weight::Regular, theme::FS_LABEL), theme::TEXT_DIM, Align::Min);
-            }
-        });
-    });
-    ctx.data_mut(|d| d.insert_temp(id, area.response.rect));
-}
-
-/// Our own share in this room: a live preview of what we capture while this
-/// window is focused (task #78; a screen-hatch placeholder otherwise), specs
-/// of what we send, one full-width "Stream settings" button.
-fn my_card(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSourceId, destination: DestinationId, acts: &mut Vec<UiAction>) {
-    let Some(c) = cx.capture(capture) else { return };
-    let Some(d) = c.destinations.get(&destination) else { return };
-    let (thumb, info_r) = card_frame(ui);
-    let is_video = c.kind == StreamKind::Video;
-    // Asking for the preview is what keeps it running: only a focused window
-    // paints this (see `App::poll_live_previews`).
-    if is_video && ui.ctx().input(|i| i.viewport().focused.unwrap_or(true) && !i.viewport().minimized.unwrap_or(false)) {
-        acts.push(UiAction::LivePreviewSeen(capture));
-    }
-    let live_tex = cx.shell.live_previews.get(&capture).and_then(|t| t.tex.as_ref());
-    if let Some(tex) = live_tex {
-        ui.painter().rect_filled(thumb, thumb_radius(), theme::TILE_BG);
-        paint_cover(ui.painter(), thumb, tex);
-    } else {
-        widgets::paint_hatch(ui.painter(), thumb, thumb_radius(), 8.0, theme::ELEV_19, theme::ELEV_14);
-        thumb_placeholder(ui, thumb, "cast", theme::SUCCESS, &tr("ui.room.my_screen", "Your screen"));
-    }
-    // The capture's source died and is being restarted (#99).
-    let recovering = cx.state.recovery(capture).is_some()
-        && matches!(cx.destination_state(c, d), DestinationState::Live | DestinationState::Stalled { .. } | DestinationState::Failed(_));
-    let chip = if recovering {
-        tr("ui.room.chip_recovering", "RECOVERING")
-    } else {
-        match cx.destination_state(c, d) {
-            DestinationState::Live | DestinationState::Rebuilding { .. } => "LIVE".to_owned(),
-            DestinationState::Starting => tr("ui.room.chip_starting", "STARTING"),
-            DestinationState::Stalled { .. } => tr("ui.room.chip_stalled", "STALLED"),
-            DestinationState::Failed(_) => tr("ui.room.chip_failed", "FAILED"),
-        }
-    };
-    thumb_corners(ui, thumb, Some(&chip), false);
-    if cx.destination_state(c, d) == DestinationState::Starting && cx.state.capture_awaiting_first_frame(capture) {
-        ui.interact(thumb, Id::new(("my_card_thumb", capture, destination)), Sense::hover())
-            .on_hover_text(tr("ui.waiting_frame_hint", "An idle screen sends no picture until something on it changes. Move the mouse over the shared screen and the stream starts."));
-    }
-    // Right corner, added after the thumb's own hover area so it sits above it: [viewers][PREVIEW].
-    let viewers = viewer_names(cx, h, d.stream_id);
-    if viewers.is_some() || live_tex.is_some() {
-        let row = Rect::from_min_size(thumb.min + vec2(theme::S2, theme::S2), vec2(thumb.width() - 2.0 * theme::S2, 22.0));
-        let mut r = ui.new_child(UiBuilder::new().max_rect(row).layout(Layout::right_to_left(Align::Center)));
-        if live_tex.is_some() {
-            // Says the picture is a local preview, not what viewers get.
-            widgets::chip_dark(&mut r, None, false, &tr("ui.room.preview_chip", "PREVIEW"))
-                .on_hover_text(tr("ui.room.preview_tip", "A live preview of your screen, shown while this window is focused. Viewers get the full quality stream."));
-        }
-        if let Some(names) = &viewers {
-            let chip = widgets::chip_dark(&mut r, Some("visibility"), false, &names.len().to_string());
-            viewers_dropdown(ui, &chip, names);
-        }
-    }
-
-    let params = match &d.runtime {
-        Some(rt) => rt.lock().unwrap().params(),
-        None => d.params,
-    };
-    let mut specs = String::new();
-    if params.width > 0 && params.height > 0 {
-        specs = format!("{}×{} · ", params.width, params.height);
-    }
-    specs.push_str(&format!("{} fps · {}", params.framerate, codec_label(params.codec)));
-    let you = tr("ui.room.you", "You");
-    // The avatar shows our name's initial, as our People row does (not the
-    // "You" label's: German "Du" made it a "D").
-    let my_name = cx.my_conn(h).map(|me| cx.member_name(h, me)).unwrap_or_else(|| cx.state.display_name.clone());
-    let settings = tr("ui.room.stream_settings", "Stream settings");
-    if card_info(ui, info_r, (&you, &my_name), &super::share_label(&c.label), &specs, &[Btn::secondary(&settings).icon("tune")]).is_some() {
-        acts.push(UiAction::OpenModal(Modal::StreamSettings { capture, room: h }));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// People
-// ---------------------------------------------------------------------------
 
 /// Our row while our share here is still Starting: an accent "in progress"
 /// pill (marching bar, no text) in the row's 44 px live slot, where the green
@@ -1409,99 +569,10 @@ pub fn show_people(ui: &mut Ui, cx: &mut Cx, _st: &mut RoomState) {
     });
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn single_tile_is_capped_by_window_height() {
-        // 900 px window: 46 % × 16/9 ≈ 736 px wide.
-        let w = single_tile_width(1300.0, 900.0);
-        assert!((w - 900.0 * 0.46 * 16.0 / 9.0).abs() < 0.01, "{w}");
-        // Narrow area: the area wins.
-        assert_eq!(single_tile_width(500.0, 900.0), 500.0);
-        // Tiny window: never below a grid column unless the area is smaller.
-        assert_eq!(single_tile_width(1000.0, 100.0), MIN_TILE_W);
-        assert_eq!(single_tile_width(200.0, 100.0), 200.0);
-    }
-
-    #[test]
-    fn room_tiles_use_one_or_two_columns() {
-        assert_eq!(room_tile_cols(1, 2000.0), 1);
-        assert_eq!(room_tile_cols(2, 1000.0), 2);
-        assert_eq!(room_tile_cols(5, 1000.0), 2);
-        // Two columns would be under 260 each.
-        assert_eq!(room_tile_cols(2, 2.0 * MIN_TILE_W + theme::GRID_GAP - 1.0), 1);
-    }
-
-    #[test]
-    fn card_grid_never_adds_empty_columns_and_never_shrinks() {
-        let g = theme::GRID_GAP;
-        // One card never gets a second column, however wide; capped at CARD_MAX_W.
-        for w in [300.0, 1200.0, 2600.0, 5000.0] {
-            assert_eq!(card_grid_shape(1, w, 1000.0, g).0, 1, "{w}");
-        }
-        assert_eq!(card_grid_shape(1, 5000.0, 1000.0, g).1, CARD_MAX_W);
-        // A short viewport limits the card by its height (16:9 thumb + info block).
-        let (_, cw) = card_grid_shape(1, 2000.0, 400.0, g);
-        assert!((cw - ((400.0 - CARD_INFO_H - 2.0) * 16.0 / 9.0 + 2.0)).abs() < 0.01, "{cw}");
-        // Four cards: wide and short -> one row; wide and tall -> 2x2 or 4x1, whichever is bigger.
-        assert_eq!(card_grid_shape(4, 2400.0, 500.0, g).0, 4);
-        let (c, cw) = card_grid_shape(4, 1400.0, 1000.0, g);
-        assert!(c == 2 || c == 4, "{c}");
-        assert!(cw > 330.0, "{cw}");
-        // Growing the width never shrinks the cards, for any count and height; never overflows.
-        for n in 1..=6 {
-            for h in [300.0, 700.0, 1100.0] {
-                let mut prev = 0.0;
-                let mut w = 200.0;
-                while w < 4000.0 {
-                    let (c, cw) = card_grid_shape(n, w, h, g);
-                    assert!(c >= 1 && c <= n, "n={n} w={w} c={c}");
-                    assert!(cw + 0.001 >= prev, "n={n} h={h} w={w}: {cw} < {prev}");
-                    assert!(c as f32 * cw + (c as f32 - 1.0) * g <= w + 0.01, "n={n} w={w} overflows");
-                    prev = cw;
-                    w += 7.0;
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn grid_shape_maximises_tile_area() {
-        // One tile: as wide as fits the height at 16:9.
-        let (c, w) = grid_shape(1, 1600.0, 450.0, 12.0);
-        assert_eq!(c, 1);
-        assert!((w - 800.0).abs() < 0.01);
-        // Two tiles in a wide, short area: side by side.
-        assert_eq!(grid_shape(2, 1600.0, 500.0, 12.0).0, 2);
-        // Two tiles in a tall, narrow area: stacked.
-        assert_eq!(grid_shape(2, 700.0, 1200.0, 12.0).0, 1);
-        // Four tiles in a 16:9-ish area: 2×2.
-        let (c, w) = grid_shape(4, 1600.0, 900.0, 12.0);
-        assert_eq!(c, 2);
-        assert!(w > 700.0 && w <= 794.0, "{w}");
-        // Columns never get narrower than a grid column; no fit → scroll.
-        let (c, w) = grid_shape(9, 800.0, 100.0, 12.0);
-        assert!(w >= MIN_TILE_W && c >= 1, "{c} {w}");
-    }
-
-    #[test]
-    fn statbar_drops_resolution_then_bitrate_when_narrow() {
-        // Roughly the real widths: res "1920x1080" 80, fps 6ch 42, rate 8ch 56.
-        let full = statbar_fixed_w(80.0, 42.0, 56.0);
-        assert_eq!(statbar_fields(full + 40.0, 80.0, 42.0, 56.0), (true, true));
-        assert_eq!(statbar_fields(full - 1.0, 80.0, 42.0, 56.0), (false, true));
-        // The 800 px window's room tile (~178 px statbar cell) keeps fps + bitrate.
-        assert_eq!(statbar_fields(178.0, 80.0, 42.0, 56.0), (false, true));
-        assert_eq!(statbar_fields(120.0, 80.0, 42.0, 56.0), (false, false));
-    }
-
-    #[test]
-    fn kbps_formatting() {
-        assert_eq!(fmt_kbps(5500.0), "5.5 Mbps");
-        assert_eq!(fmt_kbps(640.4), "640 kbps");
-    }
 
     #[test]
     fn tr_falls_back_to_english() {

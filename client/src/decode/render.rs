@@ -76,6 +76,9 @@ pub enum Fit {
     Contain,
     /// Fill the rect, ignoring aspect ratio.
     Stretch,
+    /// Keep aspect ratio, fill the rect, crop what sticks out around the centre. The returned rect is
+    /// bigger than `outer`; the caller's clip rect (the painter's) crops it.
+    Cover,
 }
 
 /// Where the video goes inside `outer` for a `content` (frame size in pixels)
@@ -91,11 +94,16 @@ pub fn fit_rect(outer: Rect, content: Vec2, fit: Fit, pixels_per_point: f32) -> 
             let scale = (outer.width() / content.x).min(outer.height() / content.y);
             content * scale
         }
+        Fit::Cover => content * (outer.width() / content.x).max(outer.height() / content.y),
     };
     let ppp = if pixels_per_point > 0.0 { pixels_per_point } else { 1.0 };
     let snap = |v: f32| (v * ppp).round() / ppp;
     let min = egui::pos2(snap(outer.center().x - size.x / 2.0), snap(outer.center().y - size.y / 2.0));
-    let max = egui::pos2(snap(min.x + size.x).min(snap(outer.max.x)), snap(min.y + size.y).min(snap(outer.max.y)));
+    let max = if fit == Fit::Cover {
+        egui::pos2(snap(min.x + size.x), snap(min.y + size.y))
+    } else {
+        egui::pos2(snap(min.x + size.x).min(snap(outer.max.x)), snap(min.y + size.y).min(snap(outer.max.y)))
+    };
     Rect::from_min_max(min, max)
 }
 
@@ -718,6 +726,17 @@ mod tests {
         // Exact fit is the identity.
         let r = fit_rect(outer, egui::vec2(1600.0, 900.0), Fit::Contain, 1.0);
         assert_eq!(r, outer);
+    }
+
+    #[test]
+    fn fit_cover_fills_the_rect_and_crops_around_the_centre() {
+        let outer = Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(400.0, 400.0));
+        let r = fit_rect(outer, egui::vec2(1920.0, 1080.0), Fit::Cover, 1.0);
+        assert!((r.height() - 400.0).abs() < 1.0 && (r.width() - 400.0 * 16.0 / 9.0).abs() < 1.0, "{r:?}");
+        assert!((r.center() - outer.center()).length() < 1.0);
+        assert!(r.contains_rect(outer));
+        let r = fit_rect(outer, egui::vec2(1080.0, 1920.0), Fit::Cover, 1.0);
+        assert!((r.width() - 400.0).abs() < 1.0 && r.height() > 400.0);
     }
 
     #[test]

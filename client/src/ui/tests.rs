@@ -919,16 +919,16 @@ fn the_tile_volume_slider_pushes_set_volume_while_the_button_is_still_down() {
     let ctx = ctx();
     let size = egui::vec2(300.0, 100.0);
     let key: StreamKey = (RoomHandle(1), 7, 2);
-    let mut st = room::RoomState::default();
+    let mut st: Option<(StreamKey, u32)> = None;
     let mut applied = 100u32;
     let mut slider = Rect::NOTHING;
-    let run = |events: Vec<egui::Event>, st: &mut room::RoomState, applied: u32, slider: &mut Rect| -> Vec<UiAction> {
+    let run = |events: Vec<egui::Event>, st: &mut Option<(StreamKey, u32)>, applied: u32, slider: &mut Rect| -> Vec<UiAction> {
         let mut acts = Vec::new();
         let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(egui::Pos2::ZERO, size)), events, ..Default::default() };
         let _ = ctx.run(input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.set_width(200.0);
-                *slider = room::tile_volume_slider(ui, st, key, applied, applied, &mut acts).rect;
+                *slider = stage::tile_volume_slider(ui, st, key, applied, applied, &mut acts).rect;
             });
         });
         acts
@@ -953,6 +953,43 @@ fn the_tile_volume_slider_pushes_set_volume_while_the_button_is_still_down() {
     assert!(ctx.input(|i| i.pointer.any_down()), "the button was never released");
     assert!(pushed.len() >= 3, "a SetVolume per moved frame while dragging, got {pushed:?}");
     assert!(pushed.windows(2).all(|w| w[0] < w[1]), "following the pointer to the right: {pushed:?}");
+}
+
+/// The stage's layout choice is per view (each room and Watched keep their own) and only
+/// `UiAction`s change it; the two stage options are global.
+#[tokio::test]
+async fn the_stage_layout_is_per_view_and_set_through_actions() {
+    let _home = isolated_home();
+    let mut app = app_with_rooms(&[]);
+    let ctx = ctx();
+    let (a, b) = (StageView::Room(RoomHandle(1)), StageView::Room(RoomHandle(2)));
+    assert_eq!(app.shell.stage.layout(&a), StageLayout::Split, "Split until changed");
+    app.apply(&ctx, UiAction::SetStageLayout { view: a.clone(), layout: StageLayout::Floating });
+    app.apply(&ctx, UiAction::SetStageLayout { view: StageView::Watched, layout: StageLayout::Crop });
+    assert_eq!(app.shell.stage.layout(&a), StageLayout::Floating);
+    assert_eq!(app.shell.stage.layout(&b), StageLayout::Split);
+    assert_eq!(app.shell.stage.layout(&StageView::Watched), StageLayout::Crop);
+    assert!(!app.shell.stage.hide_own && !app.shell.stage.always_names);
+    app.apply(&ctx, UiAction::SetHideOwnStreams(true));
+    app.apply(&ctx, UiAction::SetAlwaysShowNames(true));
+    assert!(app.shell.stage.hide_own && app.shell.stage.always_names);
+}
+
+/// "Watched streams" is the stage even with nothing watched, and a frame of it draws (the note) without
+/// touching anything; the welcome view is not a stage.
+#[tokio::test]
+async fn watched_streams_is_a_stage_and_the_welcome_view_is_not() {
+    let _home = isolated_home();
+    let mut app = app_with_rooms(&[]);
+    let ctx = ctx();
+    let size = egui::vec2(1280.0, 800.0);
+    frame(&mut app, &ctx, size);
+    let mut actions = Vec::new();
+    assert!(!room::shows_stage(&Cx::new(&app.state, &app.nav, &app.shell, &app.videos, &mut actions)), "welcome");
+    app.nav.view = View::Watching;
+    assert!(room::shows_stage(&Cx::new(&app.state, &app.nav, &app.shell, &app.videos, &mut actions)));
+    frame(&mut app, &ctx, size);
+    assert_eq!(Cx::new(&app.state, &app.nav, &app.shell, &app.videos, &mut actions).stage_view(), Some(StageView::Watched));
 }
 
 /// #135: the Boost slider's mid-drag action is live and unsaved, the release saves.

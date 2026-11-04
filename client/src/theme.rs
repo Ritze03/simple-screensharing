@@ -127,6 +127,29 @@ pub const SUCCESS_GLOW: Color32 = rgba(80, 200, 120, 0.8);
 /// `.chip-dark` fill (`rgba(0,0,0,.66)`) — chips over video.
 pub const CHIP_DARK: Color32 = rgba(0, 0, 0, 0.66);
 
+// Stage redesign (task #134, "stage redesign" tokens of `superdoc/ui/replica/index.html`): the black stage
+// the streams sit on, its name tags and the control bar.
+/// `--stage-bg` — the black area the streams sit on.
+pub const STAGE_BG: Color32 = Color32::from_rgb(0x06, 0x07, 0x08);
+/// `--stage-group` — control-bar button groups.
+pub const STAGE_GROUP: Color32 = Color32::from_rgb(0x17, 0x18, 0x1B);
+/// `--stage-group-border` (= `DIVIDER`).
+pub const STAGE_GROUP_BORDER: Color32 = DIVIDER;
+/// `--stage-btn` — backdrop of every control-bar button.
+pub const STAGE_BTN: Color32 = Color32::from_rgb(0x22, 0x23, 0x27);
+/// `--stage-btn-sep` — line between a button and its dropdown arrow.
+pub const STAGE_BTN_SEP: Color32 = rgba(0, 0, 0, 0.5);
+/// `--stage-btn-hover` (= `BTN`).
+pub const STAGE_BTN_HOVER: Color32 = BTN;
+/// `--stage-tag` — name tag on a tile (= the statbar's alpha).
+pub const STAGE_TAG: Color32 = rgba(0, 0, 0, 0.62);
+/// `--tile-gap` — gap between tiles in Split / Crop (also the resize bar's resting width).
+pub const TILE_GAP: f32 = 8.0;
+/// `--stage-btn-h` — control-bar buttons.
+pub const STAGE_BTN_H: f32 = 40.0;
+/// `--strip-avatar` — people strip avatars.
+pub const STRIP_AVATAR: f32 = 44.0;
+
 /// Debug-overlay colors (`--ov-*` in the mockup): vbox, hbox, fixed slot, fill slot.
 pub const OV_VBOX: Color32 = rgba(110, 140, 255, 0.85);
 pub const OV_HBOX: Color32 = rgba(232, 163, 61, 0.85);

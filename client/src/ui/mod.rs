@@ -10,8 +10,8 @@
 //! ┌ SidePanel::left 272 (SIDEBAR_RAIL, 1 px PANEL_RAISED right border) ┐┌ TopBottomPanel::top 56: room header band ────────────────┐
 //! │ brand band 56 ............. sidebar::show_brand                    ││ room::show_header (band, DIVIDER bottom, pad 16)           │
 //! │ ScrollArea (pad 0/12/12, vbox gap 8) .. sidebar::show_body         │├──────────────────────────────────────────┬─────────────────┤
-//! │                                                                    ││ CentralPanel: ScrollArea (pad 16, vbox   │ SidePanel::right│
-//! │                                                                    ││ gap 16) .. room::show_body               │ 232 (people)    │
+//! │                                                                    ││ CentralPanel: room::show_stage (the black │ SidePanel::right│
+//! │                                                                    ││ stage) or ScrollArea .. room::show_body  │ 232 (people)    │
 //! │                                                                    ││                                          │ room::show_people
 //! │ user band 56 (ELEV_14, WELL_BORDER top) .. sidebar::show_user_band ││ TopBottomPanel::bottom 56: action_bar::show (PANEL_SUNKEN) │
 //! └────────────────────────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────┘
@@ -39,7 +39,8 @@
 //! sidebar::show_body(ui: &mut Ui, cx: &mut Cx, st: &mut SidebarState)
 //! sidebar::show_user_band(ui: &mut Ui, cx: &mut Cx, st: &mut SidebarState)
 //! room::show_header(ui: &mut Ui, cx: &mut Cx, st: &mut RoomState)
-//! room::show_body(ui: &mut Ui, cx: &mut Cx, st: &mut RoomState)
+//! room::show_stage(ui: &mut Ui, cx: &mut Cx, st: &mut RoomState)
+//! room::show_body(ui: &mut Ui, cx: &mut Cx)
 //! room::show_people(ui: &mut Ui, cx: &mut Cx, st: &mut RoomState)
 //! action_bar::show(ui: &mut Ui, cx: &mut Cx, st: &mut ActionBarState)
 //! stream_settings::show(ctx: &egui::Context, cx: &mut Cx, st: &mut StreamSettingsState,
@@ -77,9 +78,9 @@
 //!
 //! **Video.** [`VideoViews`] (`cx.videos`) holds one `VideoView` per watched
 //! stream, keyed by [`StreamKey`], created and dropped by the shell as
-//! watches start and stop. Draw a tile with
-//! `cx.videos.show(key, ui, size, Fit::Contain)` (returns the response; paint
-//! overlays with `ui.painter_at(resp.rect)`). Never `request_repaint()` for
+//! watches start and stop. Paint a tile with
+//! `cx.videos.paint(key, ui, rect, Fit::Contain)` (`Fit::Cover` crops; paint
+//! overlays on top afterwards). Never `request_repaint()` for
 //! video: the view repaints at the stream's frame rate on its own.
 
 use std::collections::HashMap;
@@ -105,11 +106,13 @@ pub mod modals;
 pub mod popout;
 pub mod room;
 pub mod sidebar;
+pub mod stage;
 pub mod stream_settings;
 #[cfg(test)]
 mod tests;
 mod video;
 
+pub use stage::{StageLayout, StageSettings, StageView};
 pub use video::{StreamKey, VideoViews};
 
 /// Idle-fallback repaint cadence while connecting/connected, so presence
@@ -391,6 +394,17 @@ pub enum UiAction {
     /// remember the path in `Shell::saved_logs`.
     SaveLogs,
 
+    // --- stage --------------------------------------------------------------
+    /// The Layout menu: show `view`'s streams as Split, Crop or Floating (per view, see [`StageSettings`]).
+    #[allow(dead_code)] // sent by the Layout menu (next worker)
+    SetStageLayout { view: StageView, layout: StageLayout },
+    /// "Hide my own streams": your own share gets no tile on any stage.
+    #[allow(dead_code)] // idem
+    SetHideOwnStreams(bool),
+    /// "Always show names": watched streams show their name tag without hovering.
+    #[allow(dead_code)] // idem
+    SetAlwaysShowNames(bool),
+
     // --- misc -------------------------------------------------------------
 }
 
@@ -424,6 +438,8 @@ pub struct Toast {
 /// UI-level state that more than one screen reads, owned by the shell.
 #[derive(Default)]
 pub struct Shell {
+    /// The stage's layout choices (set by the Layout menu through `UiAction`s).
+    pub stage: StageSettings,
     /// The "Choose your name" modal was already offered this run (Later /
     /// Escape / × keeps it away until the next start).
     pub name_prompt_shown: bool,
@@ -634,11 +650,6 @@ impl<'a> Cx<'a> {
             .and_then(|s| s.members.iter().find(|m| m.conn_id == owner))
             .map(|m| m.display_name.clone())
             .unwrap_or_else(|| "?".to_string())
-    }
-
-    /// Our own connection id in `room`.
-    pub fn my_conn(&self, room: RoomHandle) -> Option<ConnId> {
-        self.session(room).map(|s| s.client.conn_id())
     }
 
     /// Other people's shares in `room` that get a card: video streams, plus
@@ -1428,10 +1439,14 @@ impl App {
         egui::CentralPanel::default().frame(Frame::NONE.fill(theme::PANEL_BASE)).show(ctx, |ui| {
             let r = ui.max_rect();
             region(ui, r, "room_body", |ui| {
+                if room::shows_stage(&cx) {
+                    room::show_stage(ui, &mut cx, room);
+                    return;
+                }
                 egui::ScrollArea::vertical().id_salt("room_body_scroll").auto_shrink([false, false]).show(ui, |ui| {
                     Frame::NONE
                         .inner_margin(Margin::same(theme::S4 as i8))
-                        .show(ui, |ui| vbox(ui, theme::S4, |ui| room::show_body(ui, &mut cx, room)));
+                        .show(ui, |ui| vbox(ui, theme::S4, |ui| room::show_body(ui, &mut cx)));
                 });
             });
         });

@@ -26,7 +26,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use egui::{Response, Ui, Vec2};
+use egui::Ui;
 use simple_screensharing_client::decode::render::{Fit, VideoView};
 use simple_screensharing_client::protocol::{ConnId, StreamId};
 use simple_screensharing_client::decode::FrameSource;
@@ -184,13 +184,6 @@ impl VideoViews {
     /// Popped-out streams, oldest first.
     pub fn popped(&self) -> Vec<StreamKey> {
         self.order.iter().copied().filter(|k| self.entries.get(k).is_some_and(|e| e.popped)).collect()
-    }
-
-    /// Allocate `size` in `ui` and draw `key`'s video letterboxed into it
-    /// (black before the first frame). `None` if `key` isn't watched.
-    pub fn show(&self, key: StreamKey, ui: &mut Ui, size: Vec2, fit: Fit) -> Option<Response> {
-        let entry = self.entries.get(&key)?;
-        Some(entry.view.lock().unwrap().show(ui, size, fit))
     }
 
 

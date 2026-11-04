@@ -390,6 +390,11 @@ impl App {
                 }
                 Err(e) => self.toast(tr_with("ui.toast.logs_save_failed", "Couldn't save the logs: %{error}", &[("error", &format!("{e:#}"))]), "error"),
             },
+
+            // --- stage ----------------------------------------------------
+            UiAction::SetStageLayout { view, layout } => self.shell.stage.set_layout(view, layout),
+            UiAction::SetHideOwnStreams(on) => self.shell.stage.hide_own = on,
+            UiAction::SetAlwaysShowNames(on) => self.shell.stage.always_names = on,
         }
     }
 

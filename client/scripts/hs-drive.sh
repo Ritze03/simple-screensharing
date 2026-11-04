@@ -17,7 +17,7 @@
 # coordinates read off screenshots of the 1920x1080 fullscreen windows (below).
 #
 # Usage: SCRATCH=<rig scratch> hs-drive.sh STEP [ARGS...]
-#   share                     sharer: click "Share screen" (portal auto-grants, no picker);
+#   share                     sharer: click "Share screen" (portal auto-grants, no picker; SHARER=3 drives client 3 instead of 1, for steps share/setup/golive/stopshare);
 #                             waits for the "Set up your stream" modal
 #   setup FPS CODEC PRESET [KBPS]
 #                             FPS one of 15 30 60 90 120 144 165 240; CODEC h264|av1|h265;
@@ -30,7 +30,7 @@
 #   modal                     print the sharer's modal dump
 #   mclick NAME [DX [DY]]     click a control of the open modal by its dumped rect (DX<0: from the right
 #                             edge, `L60`: 60 pt from the left edge)
-#   watch                     viewer: click "Watch" on the sharer's card
+#   watch                     viewer: click "Watch stream" on the sharer's stage tile (a lone tile; with several, click/move at their tile coordinates)
 #   hover                     viewer: park the pointer on the tile's stats bar (tooltip shows
 #                             "Decoded X fps / shown Y fps")
 #   sample OUTDIR N SECS      viewer: N screenshots of the tooltip region every SECS s ->
@@ -53,7 +53,7 @@ hs_assert_private
 
 STEP="${1:?STEP}"; shift
 
-UI_DUMP="${UI_DUMP:-$SCRATCH/ui1.txt}"      # the sharer's (client 1)
+UI_DUMP="${UI_DUMP:-$SCRATCH/ui${SHARER:-1}.txt}"      # the sharer's (client 1, or client $SHARER)
 
 # --- pointer / keys -------------------------------------------------------------------------
 gmove()  { swaymsg "seat - cursor set $1 $2" >/dev/null; }
@@ -82,7 +82,7 @@ dump_wait() {
 }
 # "OX OY PPP" of the sharer window (points -> global pixels).
 sharer_origin() {
-  local o; o="$(client_origin 1)" || return 1
+  local o; o="$(client_origin "${SHARER:-1}")" || return 1
   echo "$o $(dump_get ppp)"
 }
 mclick() {
@@ -108,14 +108,14 @@ modal_open() { dump_wait open 1 15 || die "the sharer's stream-settings modal is
 # (measured 2026-10-14 on the 1920x1080 fullscreen windows; override with the env vars if the UI moves)
 SHARE_BTN="${SHARE_BTN:-354 1052}"     # sharer: "Share screen" in the bottom bar
 STOP_BTN="${STOP_BTN:-1838 1052}"      # sharer: red "Stop sharing" in the bottom bar
-WATCH_BTN="${WATCH_BTN:-377 371}"      # viewer: "Watch" on the sharer's card
-HOVER_XY="${HOVER_XY:-433 123}"        # viewer: the tile's "client-1 1920x1080 235fps 8.0 Mbps" pill
-UNWATCH_XY="${UNWATCH_XY:-1148 122}"   # viewer: the x on the tile
-TIP_GEOM="${TIP_GEOM:-280 90 560 260}" # viewer: region holding the pill and its tooltip (X Y W H)
+WATCH_BTN="${WATCH_BTN:-900 595}"      # viewer: "Watch stream" on the sharer's idle stage tile (a lone 16:9 tile, button row at y 595)
+HOVER_XY="${HOVER_XY:-430 173}"        # viewer: the tile's "client-1 1920x1080 60fps 8.1 Mbps" pill (top left of a lone 16:9 stage tile)
+UNWATCH_XY="${UNWATCH_XY:-1650 173}"   # viewer: the x on the tile (pop out 1584, fullscreen 1617, x 1650)
+TIP_GEOM="${TIP_GEOM:-280 140 560 260}" # viewer: region holding the pill and its tooltip (X Y W H)
 
 case "$STEP" in
   share)
-    wclick 1 $SHARE_BTN
+    wclick "${SHARER:-1}" $SHARE_BTN
     modal_open
     ;;
   setup)
@@ -147,7 +147,7 @@ case "$STEP" in
     if [[ -n "$kbps" && "$(dump_get bitrate)" != "$kbps" ]]; then
       [[ -n "$(dump_get bitrate)" ]] || die "setup: no bitrate slider (absolute bandwidth mode?)"
       mclick bitrate -36; sleep 0.2                         # the row's 72 pt value box
-      swaymsg "[pid=$(hs_pid_of client1)] focus" >/dev/null
+      swaymsg "[pid=$(hs_pid_of "client${SHARER:-1}")] focus" >/dev/null
       hs_type -M ctrl a -m ctrl "$kbps" -k Return
       dump_wait bitrate "$kbps" 3 || die "setup: bitrate is $(dump_get bitrate), wanted $kbps (wtype: keyboard capability/keymap issue? use START_KBPS at rig up)"
     fi
@@ -180,7 +180,7 @@ case "$STEP" in
     done
     command -v montage >/dev/null && montage "$out"/tip-*.png -tile 3x -geometry +4+4 -background '#222' "$out/montage.png" 2>/dev/null
     ;;
-  stopshare) wclick 1 $STOP_BTN ;;
+  stopshare) wclick "${SHARER:-1}" $STOP_BTN ;;
   unwatch)   wmove 2 900 500; sleep 0.5; wclick 2 $UNWATCH_XY ;;
   shot)      grim -o "${2:-$HS_OUT_VIEWER}" "${1:?FILE}" ;;
   crop)      # crop FILE OUTPUT X Y W H

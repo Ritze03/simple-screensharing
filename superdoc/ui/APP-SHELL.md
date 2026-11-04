@@ -21,9 +21,9 @@ its "Proposed" tab).
 ┌ sidebar 272 ────────┐┌ room header band 56: title, status pill, meta | Auto-connect,
 │ brand band 56       ││   Copy invite link, Leave, ⋯                                    │
 │ Watched streams     │├─────────────────────────────────────────────┬─ People 232 ─────┤
-│ ROOMS (rooms well,  ││ body (scroll, pad 16, gap 16):              │ members, sharers │
-│  sharer sub-rows)   ││  "On screen" tiles (16:9, GPU video)        │                  │
-│ Create or join      ││  "Sharing in this room" cards               │                  │
+│ ROOMS (rooms well,  ││ the stage (black, pad 16): the room's       │ members, sharers │
+│  sharer sub-rows)   ││  streams as Split / Crop / Floating         │                  │
+│ Create or join      ││  (other states: scrolling body, pad 16)     │                  │
 │ user band 56        │├─────────────────────────────────────────────┴──────────────────┤
 └─────────────────────┘│ action band 56 (PANEL_SUNKEN), room-scoped                      │
                        └────────────────────────────────────────────────────────────────┘
@@ -48,7 +48,7 @@ its "Proposed" tab).
   and the welcome view have neither.
 - **The Stream Control / View / Settings nav rail is gone.** Settings is a modal opened
   from the user band's gear; sharing lives in the room's action bar; watching is the
-  room's tiles.
+  the room's stage.
 - **Stream settings open in a modal**, not a side panel. *Why:* the user said the side
   panel was too squished for the number of controls.
 - **Leave sits in the room header.** *Why:* user's call; it is a room-level action, not
@@ -58,16 +58,16 @@ its "Proposed" tab).
   half-tiles on a 1920 px screen. Checked on the real app in en and de (#127): at 800 the
   header sits at level 3 in en (Copy/Leave icons, no meta line) and 4 in de (bare checkbox),
   the live bar collapses fully (status truncated, Stop sharing icon-only; staged: Go live
-  icon-only in de), one share card / tile per row, the stream-settings modal one column
+  icon-only in de), one share card / tile per row (the cards are gone, see "The stage"), the stream-settings modal one column
   (752 px). The only thing that clipped was the tile's hover statbar (`1920x1080 30fps 7.6…`
   cut mid-number in a ~178 px cell): it now drops the resolution, then the bitrate, into
-  its tooltip (`room::statbar_fields`). Nothing clips;
+  its tooltip (`stage::tile::statbar_fields`). Nothing clips;
   controls degrade in a fixed order instead. Action bar: the status text truncates down
   to 72 px first, then buttons go icon-only (label in the tooltip): Live = Stream
   settings → `N rooms ▾` to `N ▾` → audio compact → Stop sharing; Staged/Picking =
   Stream settings → audio → Discard → Go live. Header: Copy invite link icon-only →
   meta line dropped whole (never "2 pe…") → Leave icon-only → bare Auto-connect checkbox.
-  *Why:* redundant controls go first (Stream settings is on the own card, Copy invite
+  *Why:* redundant controls go first (Stream settings is on the own tile, Copy invite
   link in ⋯, the meta counts in People); the primary action keeps its words longest.
   Details in the `action_bar.rs` module doc and `room::show_header`.
   Body and modal: the stream-settings modal stacks its two columns into one when a
@@ -82,41 +82,89 @@ its "Proposed" tab).
   width either stacks English for nothing or still truncates German. *Why the banner
   keeps its words:* Retry now is its whole point. Details in `stream_settings.rs`
   (`column_need`) and `room::reconnect_banner`.
-- **"Sharing in this room" card grid** (#120, user report 2026-11-03): `room::card_grid_shape` picks the
-  columns and card width like a video-call gallery: column counts 1..`min(cards, columns >= 260 wide)`
-  (never an empty column), each card limited by its column width, by the viewport height (16:9 thumb +
-  the 112 px info block/border per row) and by `CARD_MAX_W` = 640; the biggest card wins, a tie (both at
-  640) goes to more columns (fewer rows). Never below 260 (a short viewport scrolls). The block is
-  exactly `cols` cards wide and **left-aligned** like the section heading. *Why:* the old grid took
-  `clamp(floor((w+12)/272), 1, 4)` columns by width alone, so one card grew with the window until a
-  new (empty) column appeared and halved it; the user: "it doesn't have to do that since the space
-  isn't required". A wider window now never gives smaller cards (each candidate only grows with the
-  width and the candidate set only grows; tested). *Why 640:* the card's picture is a 320 px preview
-  JPEG or the <= 640x360 own live preview; the real video goes to "On screen" via Watch. The browser
-  mirrors it (`dom.js` `cardShape`, `features/website.md`). The "On screen" tiles (1 capped / 2
-  columns) and "Watched streams" (`grid_shape`, cols <= tiles) already had no empty columns.
-- **Own-tile live preview** (#78, user request 2026-10-15): the own card in "Sharing in this room"
-  shows a live <= 640x360 / <= 30 fps picture of what is captured **while the window is focused**
-  (`LIVE`/`STARTING` chip left, `PREVIEW` chip right); unfocused, minimized or with the tile not
-  painted it is the hatched "Your screen" placeholder and the capture's preview branch is closed.
-  *Why:* "show a stream preview while tabbed into the program; otherwise fine to hide it". It replaces
-  the earlier deliberate "no self-preview". Code: `room::my_card`, `App::poll_live_previews`,
-  `UiAction::LivePreviewSeen`; design in `superdoc/features/self-preview.md`.
-- **Viewers chip and hover dropdown on the own card** (#116, 2026-11-03): the own card in "Sharing in
-  this room" shows an eye chip with the number of people watching that share in that room, in the
-  thumb's top-right corner (`[viewers][PREVIEW]`, `room::viewers_dropdown`). Hovering it opens a
-  dropdown (not a text tooltip): a `WATCHING NOW · N` heading, then one row per viewer, the same
-  initial-letter avatar the People list and the cards use (`widgets::paint_avatar`, a 22 px disc)
+- **The stage** (task I1, 2026-11-04; the replica's Stage, `ui/replica/index.html`, user-approved in the design
+  sandbox, see `STYLING-GUIDE.md` "HTML replica"). The centre of a **joined room** and the whole **Watched streams**
+  view are one black stage (`STAGE_BG`) that replaces the old "On screen" tiles and "Sharing in this room" cards;
+  `room::show_stage` hands it the whole central region (no scroll area; every other state keeps the scrolling body,
+  `room::shows_stage`). Code: `client/src/ui/stage/` (`mod.rs` state, items, input, painting; `geom.rs` the pure
+  maths with tests; `tile.rs` what a tile shows). Layouts, per view (each room and Watched keep their own):
+  **Split** every picture whole in a grid, **Crop** the same cells filled (`Fit::Cover`: the wgpu quad is bigger
+  than the cell and the painter's clip crops it), **Floating** one window per stream. The grid is the row count
+  that shows the most picture area (`geom::best_rows`), rows filled evenly from the top. *Why one grid for Split and
+  Crop, and no "even grid" setting:* the user's design call; resizing is by the bars, so an even grid stays one
+  double-click away on a bar.
+  - **What is on it:** other people's video streams (watched = video; not watched = a dimmed preview, "X is
+    sharing Y" and **Watch stream** / **Pop out**), audio-only senders (**Listen**), then your own live share.
+    Watched shows what you watch, nothing else. A popped-out stream is absent (the pop-out window is its place;
+    closing it brings it back until the avatar badge exists). Everything that used to be a card button is on its
+    tile: Watch / Pop out / Listen on the idle tile, Stream settings and the viewers chip (below) on the own tile.
+  - **Keys:** a tile is identified by `stage::ItemId` = room handle + owner name + label (+ audio flag, n-th of
+    identical ones), your own share is `room/me`; **not** by `StreamKey`, whose `ConnId`/`StreamId` change with every
+    reconnect, so a reconnect keeps order, grid and window rects (`WantedStream`'s identity). Watch, pop-out, volume
+    and stats belong to the stream (`StreamKey`) and are shared by every view; the layout state is per view
+    (`StageState::views`, UI-private, per session, **not persisted**). It is never pruned, so a stream that comes
+    back keeps its place. The layout choice and the two options sit in `Shell::stage` (`StageSettings`) because the
+    Layout menu is another screen: `UiAction::SetStageLayout { view, layout }`, `SetHideOwnStreams`,
+    `SetAlwaysShowNames`; `Cx::stage_view()` / `Cx::stage_layout()` read them.
+  - **Resize bars (Split, Crop):** with the pointer between streams, **including the black space around a
+    picture**, every bar shows dark grey (`BORDER`); over a stream they hide; the bar under the pointer is blue
+    (`ACCENT`) and stays blue for the whole drag, the others hide. A bar sits **midway between the two visible
+    pictures**, never on the hidden cell edge (`geom::place`). A dragged bar stays under the pointer: dragging
+    60 px moves it 60 px and it stops only at the limit (12 % of the pair). *Why a search and not "move the edge by
+    the pointer's distance":* in Split a picture only grows while its cell limits it, so the bar (which follows the
+    pictures) moves slower than the cell edge; `geom::drag_bar` bisects the split that puts the bar under the
+    pointer. The drag is applied *before* the frame is laid out so nothing lags. Double-click a bar: even grid.
+  - **Floating windows** keep their stream's aspect ratio always, also when they come from Crop or after a
+    frame size change (`geom::fit_float` re-applies it every frame, width wins): no black bars. They start where
+    Split showed the picture. The corner handle (bottom right) moves the corner to the nearest point of the
+    window's diagonal (`geom::resize_float`), so width and height both count, growing and shrinking; moving only
+    left or only up shrinks it too. Press raises a window; windows stop at the stage edge.
+  - **Drag to reorder** (Split, Crop): drag a tile onto another, they swap on release (accent ring on the target).
+  - **Paint order:** egui paints a wgpu callback in the order shapes are added, so a floating window above
+    another covers its video correctly; the rounded-corner masks (the video cannot be clipped to a rounded rect)
+    are only used outside Floating, where windows overlap and a mask would paint over the one underneath.
+  - **Streams must not jump:** there is no chrome that fades on the stage itself; the hover overlay is painted
+    over the tile and takes no layout space.
+  - **Tests and measurements:** `ui::stage::geom::tests::*` (rows, midway bars, 60 px drag, limits, aspect
+    keeping, corner resize), `decode::render::tests::fit_cover_*`, `ui::tests::the_stage_layout_is_per_view_*`,
+    `watched_streams_is_a_stage_*`. Rig (2026-11-04, 1920x1080 window, headless sway): a 60 px drag moved a
+    horizontal bar 60 px (rows 519-521 -> 579-581, also with letterboxed pictures), -120 px moved it 120; a
+    floating window resized by (-100, 0) went 688 -> 612 px wide (formula: 612.0) with its ratio kept, (0, -80)
+    578 px, (+80, +80) 673 px; moving a window by (120, 90) moved it exactly that; relay restart: the
+    re-created watch came back in its dragged window position. Mouse drags need real motion events during
+    the press: `swaymsg seat - cursor set/move` sends none while a button is down (sway's implicit grab), so the
+    rig's scripted drags need a virtual pointer's `motion` (press, N relative motions, release in one process;
+    a scratch helper over `hs-vptr`'s protocol did it, it is not in `client/scripts/` yet).
+    The Layout menu does not exist yet (control bar rebuild): until then nothing in the app sets Crop or
+    Floating, the actions and state are there.
+- **Tile overlay** (plain form; the stream menu, stats toggle, PIP and the polished hover card come with the control
+  bar rebuild): on hover a vignette, the statbar (name, resolution, fps, bitrate; narrow tiles drop resolution,
+  then bitrate, into the tooltip), round **Pop out**, **Fullscreen** and **Stop watching** buttons, and the audio
+  pill (mute, volume 0-500 %, level-loudness button) or a "No audio shared" chip. "Always show names" shows a
+  name tag without hovering. A green ring means the stream's shared audio is audible. Double-click a watched tile =
+  fullscreen (below).
+- **Own-tile live preview** (#78, user request 2026-10-15): your own tile shows a live <= 640x360 / <= 30 fps picture
+  of what is captured **while the window is focused** (name tag `You · label` with a green or amber `cast` icon
+  and the state, `PREVIEW` chip on hover); unfocused, minimized or with the tile not painted it is the hatched
+  "Your screen · LIVE/STARTING" placeholder and the capture's preview branch is closed. *Why:* "show a stream
+  preview while tabbed into the program; otherwise fine to hide it". It replaces the earlier deliberate "no
+  self-preview". Code: `stage::tile::mine_tile`, `App::poll_live_previews`, `UiAction::LivePreviewSeen`; design in
+  `superdoc/features/self-preview.md`.
+- **Viewers chip and hover dropdown on the own tile** (#116, 2026-11-03; moved from the old own card to the stage's
+  own tile, shown on hover next to the Stream settings button): an eye chip with the number of people
+  watching that share in that room (`[PREVIEW][viewers][tune]`, `stage::tile::viewers_dropdown`). Hovering it
+  opens a dropdown (not a text tooltip): a `WATCHING NOW · N` heading, then one row per viewer, the same
+  initial-letter avatar the People list uses (`widgets::paint_avatar`, a 22 px disc)
   and the display name, sorted case-insensitively. It stays open while the pointer is on the chip,
   the dropdown or the gap between them, so the pointer can travel into it, and closes when it leaves;
   more than 8 viewers collapse into a `+N` row (a room holds 8 members, so this never shows today).
   0 viewers: the chip shows `0` and a plain tooltip says nobody watches yet; no dropdown. **On a relay
   that does not report viewers (an older relay) the chip is not drawn at all**, since a `0` would be
-  wrong. Per room: a share in two rooms has two cards with their own lists. Data: the relay's
+  wrong. Per room: a share in two rooms has two tiles with their own lists. Data: the relay's
   `ViewersList` datagrams (`protocol-spec.md` §9.1) -> `ClientEvent::Viewers` ->
-  `RoomSession::viewers` (pruned after `VIEWERS_STALE`), names from the roster. *Why the own card and
-  not the bottom bar:* the card is per room and per stream (the bar shows one share and rolls rooms
-  into an "N rooms" popover), it already carries the LIVE/PREVIEW chips, and a hover list needs room that
+  `RoomSession::viewers` (pruned after `VIEWERS_STALE`), names from the roster. *Why the own tile and
+  not the bottom bar:* the tile is per room and per stream (the bar shows one share and rolls rooms
+  into an "N rooms" popover) and a hover list needs room that
   the bar's one-line status does not have. *Why a dropdown with avatars:* the user's request ("a
   viewer number ... when he hovers over it, a drop-down thingy ... the profile picture and the
   username"); "profile picture" is the app's existing avatar. Browser twin: `docs/js/ui/app.js`
@@ -139,8 +187,9 @@ re-derive the split every frame and silently break when content height changes.
 | `mod.rs` | `App` (eframe app: polls the session, lays out the panels, runs modals/toasts, applies actions); `View` (`Welcome` / `Watching` / `Room(RoomKey)`); `Modal`, `PopoverKind`/`Popover`; `Nav { view, modal, popover }`; `Shell` (staged shares, toasts, create/join results, level taps); `UiAction` (every cross-screen action); `Cx`; selectors (`room_entries`, `ShareState`, `same_room`, ...); the shared `tr` / `tr_with` i18n fallback helpers |
 | `apply.rs` | `App::apply`: the **only** place a `UiAction` changes state. Thin calls into the lib (`session.rs`) plus nav/shell bookkeeping |
 | `video.rs` | `VideoViews`: one GPU `VideoView` per watched stream, keyed by `StreamKey = (RoomHandle, ConnId, StreamId)`, synced once per frame; `popped` flag + `close_requested` for pop-outs |
+| `stage/` | the stage (`mod.rs`: `StageState`, `StageSettings`, `StageView`/`StageLayout`, `ItemId`, items, input, painting; `geom.rs`: pure grid / bar / floating maths; `tile.rs`: video, idle, audio-only and own tiles, hover overlay, statbar, audio pill, viewers dropdown) |
 | `sidebar.rs` | brand band, body (Watched streams well, ROOMS heading, rooms well with sharer sub-rows, Create-or-join), user band (avatar, "Live in N rooms" / "Not sharing" -> Outgoing popover, settings gear) |
-| `room.rs` | `show_header`, `show_body` (reconnect banner, "On screen" tiles, "Sharing in this room" cards, empty states), `show_people` |
+| `room.rs` | `show_header`, `show_stage` (the stage region), `show_body` (welcome, disconnected, connecting, reconnecting: banner, empty states), `show_people` |
 | `action_bar.rs` | bottom band, one layout per `ShareState`: Idle / Picking / Staged / Live / Paused; owns the share-menu, rooms and audio-source popovers |
 | `stream_settings.rs` | the stream-settings modal (staged "Set up your stream", live "Stream settings"), width 1120 |
 | `modals.rs` | create/join, app settings, leave / forget confirm, rename, choose-your-name |
@@ -389,8 +438,8 @@ Presentation mode can only be set at surface creation, so a change in Settings a
 the next launch (`superdoc/features/presentation-modes.md`).
 
 Pop-out: the view sits in an `Arc<Mutex<VideoView>>` so the deferred viewport closure
-(`Send + Sync + 'static`) can paint the same view the tile would; while `popped` the tile
-shows a placeholder. The pop-out has hover-gated chrome (statbar, audio pill; volume 0-500 % with a snap at 100 %, task #96, `features/audio-sharing.md`), F11
+(`Send + Sync + 'static`) can paint the same view the tile would; while `popped` the stage leaves the
+stream out. The pop-out has hover-gated chrome (statbar, audio pill; volume 0-500 % with a snap at 100 %, task #96, `features/audio-sharing.md`), F11
 fullscreen, and Escape only *leaves* fullscreen, never closes (the former Electron viewer's
 rules, carried over; `superdoc/features/viewer-window.md`).
 
@@ -410,8 +459,8 @@ out by surprise; an explicit `Unwatch` clears `popped` first. The window itself 
 any new pop-out, windowed): it is closed while the room is suspended. Test:
 `ui::tests::popout_survives_resume`.
 
-**Double-click a watched tile = fullscreen** (2026-10-15, task #77). `room::tiles` registers a
-`Sense::click` over the tile's video (before the hover overlay, so the overlay's buttons keep their own
+**Double-click a watched tile = fullscreen** (2026-10-15, task #77). `stage::show` registers a
+`Sense::click_and_drag` over the tile (before the hover overlay, so the overlay's buttons keep their own
 clicks; a single click still does nothing) and a double-click pushes `UiAction::EnterStreamFullscreen(key)`.
 `apply` records `Nav.fullscreen = Some(FullscreenStream { key, was_fullscreen })` (was the window already
 fullscreen?) and sends `ViewportCommand::Fullscreen(true)`. While `Nav.fullscreen` is set, `App::draw` paints
@@ -419,7 +468,7 @@ fullscreen?) and sends `ViewportCommand::Fullscreen(true)`. While `Nav.fullscree
 no sidebar, bands, modals or toasts; pop-out viewports are still declared). A double-click on it or Escape
 (handled in `App::update`) pushes `ExitStreamFullscreen`, which sends `Fullscreen(was_fullscreen)`, so a window
 that was already fullscreen stays fullscreen. If the stream disappears (unwatched, ended, popped out) the next
-`draw` leaves the mode by itself. A popped-out tile is a placeholder and is not eligible. Inside a pop-out
+`draw` leaves the mode by itself. A popped-out stream is absent from the stage and not eligible. Inside a pop-out
 viewport a double-click toggles that window's fullscreen like F11 (`popout.rs`, registered before the chrome).
 
 **The fullscreen stream carries the pop-out's overlay** (2026-11-03, task #106): `App::draw` calls
