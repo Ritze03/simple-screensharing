@@ -1,6 +1,6 @@
 # Stream Control (desktop client)
 
-> **Status (2026-10-14; the webcam section and "The lagspike on every keyframe" added 2026-11-04).** The client is one native egui binary and this page is its
+> **Status (2026-10-14; the webcam section, "The lagspike on every keyframe" and "AV1 branch deaths read as a lost portal source" added 2026-11-04).** The client is one native egui binary and this page is its
 > **backend** reference: `client/src/capture.rs` (with its inline `destination` and `branch`
 > modules), `session.rs`, `bandwidth.rs`, `presets.rs`, `rooms.rs`. It covers "The shape of a
 > capture", staging and "Go live", fan-out, transfer, the three tiers, "Capture/encode
@@ -21,6 +21,123 @@ plan (`superdoc/ui/APP-SHELL.md`): starting and editing outgoing streams, **mult
 fan-out**, **transfer** between rooms, and the two **bandwidth modes** with
 `bandwidth::allocate` wired into live encoders. The plan it implemented is
 `superdoc/brainstorm/ui-redesign-multiroom-streaming.md` (final plan items 4, 5 and 7).
+
+---
+
+## AV1 branch deaths read as a lost portal source: the coded buffer, the branch latch, the 4x pace cap (2026-11-04, task #137)
+
+**User report (real build `3a204da`, RX 7900 XTX, CachyOS, sharing and watching on one machine through the public relay):**
+"The short freezes are gone, but it just randomly drops out and cancels the connection and switches to recovering."
+
+**What the real log showed.** Five capture deaths in 90 s (`capture pipeline error from ...GstPipeWireSrc:pipewiresrc0: Internal
+data stream error ... streaming stopped, reason error (-5)`, also from `portal_queue`), each followed by `capture source lost`, a
+portal restart with schedule position 0..3 (delays of 0, 2, 5, 10 s: the visible *Recovering*), `encode branch removal: EOS was
+not accepted` and two 1 s timeouts. Every one came 10-15 ms after a *natural keyframe time* of an AV1 120 fps / 25.7 Mbit/s /
+Keyframe 250 ms stream, right after a run of keyframes that had grown from ~250 to 570 kB.
+
+**Cause (reproduced in the rig, `GST_DEBUG=2` on the sharer; the element is named by evidence).** `vaav1enc` fails to map its
+VA coded buffer for a frame that is bigger than the buffer:
+
+```
+vadisplay vasurfaceimage.c:309:va_map_buffer: vaMapBuffer: operation failed
+vaav1enc gstvaav1enc.c:4122:gst_va_av1_enc_prepare_output:<branch_encoder_0> Failed to create output buffer
+vabaseenc gstvabaseenc.c:557:_push_buffer_to_downstream:<branch_encoder_0> Failed to prepare output
+basesrc gstbasesrc.c:3187:gst_base_src_loop:<pipewiresrc0> error: streaming stopped, reason error (-5)
+```
+
+GStreamer sizes that buffer as `width x height x 15 / 8 / MinCompressionRatio` of the AV1 *level* it derives from the picture size
+and the display rate (`gstvaav1enc.c`, `_av1_calculate_coded_size`; log line `Calculate codedbuf size: 648000` at 1080p 120 fps,
+level 5.0). The ratio rises with the level, so the buffer *shrinks* as the frame rate rises: 1080p up to ~68 fps 972 kB, 70-120 fps
+648 kB, 144-240 fps 486 kB (`av1_coded_buffer_bytes`, unit test). The VA rate control on a static screen makes each keyframe bigger
+than the last (rig: 253, 256, 288, 344, 382, 411, 435, 486, 540, 627 kB) until one does not fit. The failure is a plain
+`GST_FLOW_ERROR` returned by the encoder's chain function **without a bus message**, and it travels *upstream*: the branch's leaky
+queue, the shared `tee` (a flow combiner: an ERROR from one branch is fatal for the tee), then `pipewiresrc`, which stops its task.
+The bus therefore only ever carried the source's and `portal_queue`'s messages, and `is_source_side_error` (anything not under
+`:branch_`) read them as a dead portal source. So an encoder problem cost a whole capture restart. `-5` means "something downstream
+returned an error"; it was never the portal.
+
+*Why this is not the pacing:* the crash comes at keyframe time because that is when the encoder is handed a big frame; the multiplier
+climb is a separate thing (below). Deaths also happen with the pace pinned at 2.5x and at 60 fps.
+
+**Fix 1: contain a branch failure (`capture.rs`, `branch::BranchFailure`, `branch_entry_probe`).** The probe on the branch's
+entry pad (it already counted offered frames) now looks at the entry queue's src pad `last_flow_result()` before every buffer. On an
+`Error`/`NotNegotiated` it finds the culprit (`failing_element`: the peer after the last pad in the chain that holds the error, i.e.
+the element whose own src pad is fine), logs
+`encode branch BranchId(0): branch_encoder_0 (vaav1enc) returned a flow error ...`, latches it and `Drop`s every later buffer, so the
+tee never sees the error and the source and every other branch keep running. The destination pump has an arm on the latch and
+rebuilds only that branch at once (`SwapMode::Failed`: the recovery swap, old branch removed with `RemoveBounds::DEAD`, no drain wait for
+a queue that can never pass an EOS). More than `MAX_BRANCH_FAILURES` (4) in 30 s ends as before: the capture is declared lost (a
+restart; a share that cannot restart fails). Test:
+`a_failing_branch_is_cut_off_and_named_while_the_source_and_the_other_branch_keep_running` (`identity error-after` stands in for the encoder:
+the failing element is named, the other tee branch keeps getting frames, the only bus error is the failing element's).
+
+**Fix 2: the encode branch's appsink is `async=false`.** The first version of fix 1 rebuilt a branch and the *second* rebuild never
+produced a frame (`encode branch produced no IDR within 5s`, the x264 fallback too, then a declared lost source anyway). The stats tracer
+showed the tee still at 240 fps and the new branch's queue passing exactly one buffer: the encoder's first IDR reached the appsink
+(`gst_app_sink_preroll: setting preroll buffer`) and the streaming thread then sat in the preroll wait. The live-preview branch hit the
+same thing and has `async=false` for it (see `live_branch`); the encode branch did not. With it every rebuilt branch gets frames (rig: 25
+rebuilds in 90 s with the encoder dying every 2.5 s, none failed to start).
+
+**Fix 3: keep AV1 keyframes under the buffer (`IdrControl`).** Containing a failure costs one rebuild (~0.3 s freeze and a keyframe
+burst), so the pump avoids it where it can:
+
+- *Restart the rate control before the limit.* A natural AV1 keyframe of >= 75 % of `av1_coded_buffer_bytes` (and at most every 2 s)
+  gets a `bitrate` write of `kbps - 1` / `kbps` alternately. Any write restarts the VA rate control and makes the encoder code an IDR at
+  once, and the keyframes start small again (~330-390 kB at 1080p 120 fps, 25.7 Mbit/s): one extra ~330 kB keyframe every ~2.5 s instead of
+  a dead branch. Log: `AV1 keyframe of 491 kB is 75% of the encoder's 648 kB coded buffer; restarting its rate control ...`. *Why
+  alternate:* a write of the same value may be a no-op. *Why only above 75 %:* the write itself forces an IDR, so a write at every
+  keyframe sends every frame as an IDR (4762 keyframes in 40 s in the experiment that showed it).
+- *Learned off when it does not fit.* The keyframe after a restart is measured; one >= 90 % of the buffer (or a branch death while the
+  restart is pending) turns the restart off for the destination (`av1_reset_off`). Measured: at 1080p **60 fps Quality** the post-write
+  IDR overflowed the 972 kB buffer (the branch died 34 ms after the write, every time), at 120 fps Gaming it is ~51 % of 648 kB.
+- *No squeeze for AV1.* `IdrControl::force` squeezes the bitrate before a forced IDR when the last natural keyframes were big (#102,
+  measured for `vah264enc`: the IDR after a write is 5-10x smaller). For AV1 that write is what killed the branch at 60 fps Quality (row
+  133's "-5 after a squeezed IDR"), so it is skipped; the +300 ms / +1 s repeat IDRs after a rebuild are skipped too (`big()` is always
+  true for a VA AV1 branch): at 60 fps Quality the repeat IDR, coded right behind the first, overflowed the buffer and killed every rebuilt
+  branch in turn.
+
+**Same rig scenario, before and after** (AV1 120 fps Gaming, Keyframe 250 ms, 25 700 kbps, headless rig, direct relay):
+
+| build | capture deaths (portal restarts) in 90 s | branch failures | viewer `keyframe never completed` |
+|---|---|---|---|
+| `3a204da` | 12 (12) | not counted | 0 |
+| fix 1 only (60 s) | 3 restarts (4 failures in 30 s gave up) | 20 | 1 |
+| fixes 1-3 | **0 (0)** | **0** | 0 |
+
+**Not fixed, said plainly.** At **1080p 60 fps Quality (1000 ms GOP)** on this rig's static detailed desktop the encoder fills the whole
+972 kB buffer with the second keyframe at any bitrate (10 000 kbps: max 967 kB; 25 700: dead on the second IDR every time), and nothing
+we tried stops it: `cpb-size` is *discarded* for AV1 (GStreamer resets a value below `max_bitrate / 2` to 2 s of bitrate; 53 % made no
+difference), `min-qp` 60/120, `mbbrc` and `rate-control=cbr` made no difference either (single runs). There the branch is rebuilt every GOP,
+four times, and then the share falls back to the old capture restart. The user's own 60 fps keyframes were 130-700 kB, so their content is
+less extreme than the rig's. If it shows up for real the options are H.265/H.264 for that destination (their buffers are not
+level-limited) or a smaller picture. *Not tried:* lying about the frame rate in the caps to get the bigger level-4.1 buffer at 120 fps
+(the rate control would mis-size every frame).
+
+**The multiplier climb and the viewer's lost keyframes (a second problem, separate cause).** `PacePolicy` grows the keyframe pacing
+factor x1.5 per clean keyframe (>= 100 datagrams) up to its `MAX` and halves it on a retransmit burst; `MAX` was 12. On the user's
+37-38 Mbit/s line a 465 kB keyframe at 12x leaves in 12 ms (about 310 Mbit/s) and overflows the modem queue. The policy can only learn
+that limit by losing a keyframe, and after every 10 s hold it climbs back and loses the next one. Rig, `udpproxy` 38 Mbit/s up / 150 ms
+queue / 0.1 % loss, same build, AV1 120 fps 25.7 Mbit/s, ~500 kB keyframes, 70 s, only the pace differing:
+
+| pace | viewer `a keyframe never completed` |
+|---|---|
+| pinned 2.5x | 0 |
+| pinned 4x | 1 |
+| pinned 12x | **27** |
+| adaptive up to 12x | 9 (8 of them within a keyframe of a 6x or 12x burst) |
+| adaptive up to 4x (this change) | 0 and 1 (two runs) |
+
+`PacePolicy::MAX` is now **4.0** (row 133 had already measured "anything above about 3.7x buys nothing" on this line). A 500 kB keyframe
+at 25.7 Mbit/s takes ~39 ms instead of 12 ms to leave the pump; the playout buffer (row 136, `video-pipeline.md` "Playout buffer") absorbs
+that, which is what made the 12x window worth having in row 129. In the user's log the single viewer episode (14:02:47, 107/331
+fragments) came right after the factor had been halved to 6x and then 2.5x by two resume requests, with 330-700 kB keyframes: so the 12x
+climb is not the only way to lose a keyframe on that line, but it was the one that made it happen again and again in the rig.
+
+**Logs for next time.** The failing element is in the log now (`... branch_encoder_N (vaav1enc) returned a flow error`), so a real log
+settles it: that line with no `capture source lost` after it means the containment worked; a `capture source lost` with no branch line
+before it is a real source problem. For the coded buffer itself run the sharer with `GST_DEBUG=2,vaav1enc:4` (`Calculate codedbuf size`,
+`Use level`). The bench scripts (`crash.sh`, `pxrun.sh`, `summ.sh`, `corr.py`: one fresh rig per case) are in the worker's
+`.tl-scratch/bench/`.
 
 ---
 
@@ -155,7 +272,7 @@ real network or a loaded relay host.
    119 ms plan took 173 ms. It now sleeps until `start + i x 2 ms`. Alone: Quality 60 fps 197 -> 119 ms.
 2. **An adaptive rate, `destination::PacePolicy`.** The window is the freeze, so a faster rate is the lever, but a
    fixed faster rate is wrong on a tight link (table below). The factor (x the destination's bitrate) starts at #102's 2.5,
-   grows x1.5 per clean keyframe of >= 100 datagrams up to 12, and halves (not below 2.5) and holds 10 s when (a) the relay
+   grows x1.5 per clean keyframe of >= 100 datagrams up to 12 (**capped at 4 since 2026-11-04, task #137**, see "AV1 branch deaths read as a lost portal source"), and halves (not below 2.5) and holds 10 s when (a) the relay
    forwarded at least `max(4, 1 % of the keyframe's datagrams)` retransmit requests for what we sent since the last
    keyframe (`SendRing::resent`: our burst overflowed a queue, or the path loses), or (b) a viewer that was not just joining
    asked for a keyframe (`DestCmd::KeyframeRequest`, > 2 s after a subscriber-count change). It only moves while the relay

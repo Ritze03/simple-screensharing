@@ -3773,6 +3773,50 @@ const BIG_KEYFRAME_DIVISOR: u64 = 4;
 /// would switch the squeeze off right when the next request needs it.
 const BIG_KEYFRAME_MEMORY: Duration = Duration::from_secs(10);
 
+/// The coded buffer GStreamer's `vaav1enc` gives the VA driver for one frame, in bytes (task #137).
+///
+/// `Why this is here:` an AV1 frame bigger than this buffer is not truncated, the driver's
+/// `vaMapBuffer` just fails (`vaav1enc ... Failed to create output buffer`, flow error `-5`) and the whole
+/// encode branch dies. GStreamer sizes the buffer as `width * height * 15 / 8 / MinCompressionRatio` of
+/// the AV1 *level* it picks from the picture size and the display rate (`gstvaav1enc.c`
+/// `_av1_calculate_level_and_tier` / `_av1_calculate_coded_size`; the bitrate does not enter, the
+/// tier test compares kbit/s with bit/s and never fires). The ratio grows with the level, so the
+/// buffer *shrinks* when the frame rate rises: 1080p 60 fps 972 kB (level 4.1), 120 fps 648 kB
+/// (level 5.0), 240 fps 486 kB (level 5.1). Measured (rig, GStreamer 1.28.8): `Calculate codedbuf size:
+/// 648000` at 1080p 120 fps, and every branch death followed a 600-650 kB keyframe.
+fn av1_coded_buffer_bytes(width: u32, height: u32, fps: u32) -> usize {
+    // (MaxPicSize, MaxHSize, MaxVSize, MaxDisplayRate, MainCR), levels 2.0 .. 6.3 in order.
+    const LEVELS: [(u64, u32, u32, u64, u64); 14] = [
+        (147_456, 2048, 1152, 4_423_680, 2),
+        (278_784, 2816, 1584, 8_363_520, 2),
+        (665_856, 4352, 2448, 19_975_680, 2),
+        (1_065_024, 5504, 3096, 31_950_720, 2),
+        (2_359_296, 6144, 3456, 70_778_880, 4),
+        (2_359_296, 6144, 3456, 141_557_760, 4),
+        (8_912_896, 8192, 4352, 267_386_880, 6),
+        (8_912_896, 8192, 4352, 534_773_760, 8),
+        (8_912_896, 8192, 4352, 1_069_547_520, 8),
+        (8_912_896, 8192, 4352, 1_069_547_520, 8),
+        (35_651_584, 16384, 8704, 1_069_547_520, 8),
+        (35_651_584, 16384, 8704, 2_139_095_040, 8),
+        (35_651_584, 16384, 8704, 4_278_190_080, 8),
+        (35_651_584, 16384, 8704, 4_278_190_080, 8),
+    ];
+    let pixels = u64::from(width) * u64::from(height);
+    let rate = pixels * u64::from(fps.max(1));
+    let cr = LEVELS
+        .iter()
+        .find(|(max_pic, max_w, max_h, max_rate, _)| pixels <= *max_pic && width <= *max_w && height <= *max_h && rate <= *max_rate)
+        .map_or(8, |l| l.4);
+    (pixels * 15 / 8 / cr) as usize
+}
+
+/// A keyframe this share of [`av1_coded_buffer_bytes`] makes the AV1 pump restart the encoder's rate
+/// control ([`IdrControl::on_keyframe`]).
+const AV1_RESET_PERCENT: usize = 75;
+/// Least time between two such restarts: the keyframe a restart forces must not trigger the next one.
+const AV1_RESET_MIN_GAP: Duration = Duration::from_secs(2);
+
 /// Size control for the IDRs a destination forces (#102): a viewer's request, a
 /// resume, a branch swap, the repeats.
 ///
@@ -3804,17 +3848,46 @@ struct IdrControl {
     squeezed: bool,
     /// Keyframes before this are the write-back's own, not natural ones.
     settle_until: Option<Instant>,
+    /// No AV1 rate-control restart before this ([`AV1_RESET_MIN_GAP`]).
+    av1_reset_after: Option<Instant>,
+    /// The last AV1 restart wrote `bitrate - 1` (the next writes the real value back).
+    av1_nudged: bool,
+    /// The branch is a VA AV1 encoder (see [`IdrControl::big`]).
+    av1: bool,
+    /// An AV1 rate-control restart was written and no keyframe has come out since.
+    av1_reset_pending: bool,
+    /// Restarting the AV1 rate control overflowed (or came within 10 % of) the coded buffer: never again for
+    /// this destination (it is a property of the preset's rate control, not of one branch).
+    av1_reset_off: bool,
 }
 
 impl IdrControl {
+    /// Whether the repeat IDRs are skipped (and, for H.264/H.265, a forced IDR squeezed). Always true for a VA AV1
+    /// branch (task #137): its coded buffer is only 486-972 kB (see [`av1_coded_buffer_bytes`]), and a forced IDR
+    /// right behind another one came out *bigger* than the first (rig, 1080p 60 fps Quality: 456 kB, then an IDR
+    /// that overflowed the 972 kB buffer at the +300 ms repeat, killed the branch, and the rebuilt branch's own
+    /// repeat killed it again, four times in 3 s).
+    /// The encode branch failed: a rate-control restart that was still waiting for its keyframe is the likely cause.
+    fn note_branch_failure(&mut self) {
+        if std::mem::take(&mut self.av1_reset_pending) {
+            self.av1_reset_off = true;
+            tracing::warn!("the AV1 branch died right after a rate-control restart; not restarting it again");
+        }
+    }
+
     fn big(&self) -> bool {
-        self.big_until.is_some_and(|t| Instant::now() < t)
+        self.av1 || self.big_until.is_some_and(|t| Instant::now() < t)
     }
 
     /// Forces an IDR on `branch`, squeezing the bitrate first when it is big.
     fn force(&mut self, branch: &branch::EncodeBranch, runtime: &destination::SharedDestination) {
-        if self.big() && !self.squeezed && branch.backend() == EncoderBackend::Vaapi {
-            let kbps = runtime.lock().unwrap().params().bitrate_kbps;
+        let params = runtime.lock().unwrap().params();
+        self.av1 = params.codec == VideoCodec::Av1 && branch.backend() == EncoderBackend::Vaapi;
+        // Not for AV1: a `bitrate` write makes `vaav1enc` code an IDR of 330-390 kB at 1080p 120 fps but one
+        // that overflowed the 972 kB coded buffer at 60 fps Quality (rig: the branch died 34 ms after the
+        // write, every time), so the H.264 squeeze (#102) is a way to kill the branch there.
+        if self.big() && !self.av1 && !self.squeezed && branch.backend() == EncoderBackend::Vaapi {
+            let kbps = params.bitrate_kbps;
             tracing::info!("the last keyframes were big; squeezing the encoder's bitrate for the forced one");
             branch.set_bitrate_kbps(kbps / 10 * 9);
             self.squeezed = true;
@@ -3826,7 +3899,48 @@ impl IdrControl {
 
     /// A keyframe of `bytes` left the encoder: undo the squeeze, or learn
     /// whether the natural ones are big.
-    fn on_keyframe(&mut self, branch: &branch::EncodeBranch, kbps: u32, bytes: usize, now: Instant) {
+    ///
+    /// `coded_limit` is [`av1_coded_buffer_bytes`] for an AV1 branch, else `None`. A natural keyframe of
+    /// [`AV1_RESET_PERCENT`] of it or more restarts the rate control with a bitrate write.
+    ///
+    /// `Why:` on a static screen the VA rate control's keyframes *grow* with every GOP (rig, 1080p 120 fps
+    /// 25.7 Mbit/s: 253, 256, 288, 344, 382, 411, 435, 486, 540, 627 kB, then one above the 648 kB
+    /// coded buffer and the branch died). Any write of `bitrate` restarts the rate control (it also
+    /// makes the encoder emit an IDR at once) and the keyframes start small again (measured ~330 kB
+    /// with a write at every keyframe), so one write every few seconds keeps them under the limit
+    /// at the price of one extra ~330 kB keyframe: much cheaper than the encoder rebuild a failure costs.
+    /// The value alternates between `kbps - 1` and `kbps`, because a write of the same value may be a no-op.
+    fn on_keyframe(&mut self, branch: &branch::EncodeBranch, kbps: u32, bytes: usize, coded_limit: Option<usize>, now: Instant) {
+        self.av1 = coded_limit.is_some();
+        if std::mem::take(&mut self.av1_reset_pending)
+            && let Some(limit) = coded_limit
+            && bytes * 100 >= limit * 90
+        {
+            self.av1_reset_off = true;
+            tracing::warn!(
+                "the AV1 keyframe after a rate-control restart was {} kB of a {} kB coded buffer; not restarting it again",
+                bytes / 1000,
+                limit / 1000
+            );
+        }
+        if let Some(limit) = coded_limit
+            && !self.squeezed
+            && !self.av1_reset_off
+            && bytes * 100 >= limit * AV1_RESET_PERCENT
+            && self.av1_reset_after.is_none_or(|t| now >= t)
+        {
+            self.av1_reset_after = Some(now + AV1_RESET_MIN_GAP);
+            self.av1_nudged = !self.av1_nudged;
+            let target = if self.av1_nudged { kbps.saturating_sub(1).max(1) } else { kbps };
+            tracing::info!(
+                "AV1 keyframe of {} kB is {}% of the encoder's {} kB coded buffer; restarting its rate control (bitrate write {target}) before a bigger one overflows it",
+                bytes / 1000,
+                bytes * 100 / limit.max(1),
+                limit / 1000
+            );
+            branch.set_bitrate_kbps(target);
+            self.av1_reset_pending = true;
+        }
         if self.squeezed {
             branch.set_bitrate_kbps(kbps);
             self.squeezed = false;
@@ -4133,10 +4247,16 @@ async fn destination_pump(
     // the last one started.
     let mut wedge_rebuilds: u32 = 0;
     let mut last_wedge_rebuild: Option<Instant> = None;
+    // When this destination's encode branch failed and was rebuilt (task #137), newest last; see the
+    // `branch.failed()` arm.
+    let mut branch_failures: VecDeque<Instant> = VecDeque::new();
     // Set once this pump declared the capture source dead, to log it once.
     let mut declared_source_lost = false;
 
     loop {
+        // A handle on the current branch's failure latch that does not borrow `branch` (the sample arm
+        // below borrows it mutably).
+        let failure_watch = branch.as_ref().map(|b| b.failure());
         // A command deferred by a swap is replayed first, as soon as there is
         // no swap in flight; otherwise wait for whatever happens next.
         let command: DestCmd = if swapping.is_none() && let Some(deferred_cmd) = deferred.pop_front() {
@@ -4163,7 +4283,11 @@ async fn destination_pump(
                                 && p.keyframe
                                 && let Some(b) = branch.as_ref()
                             {
-                                idr.on_keyframe(b, params.bitrate_kbps, p.bytes(), Instant::now());
+                                let coded_limit = (params.codec == VideoCodec::Av1 && b.backend() == EncoderBackend::Vaapi)
+                                    .then(|| encoded_dimensions(&sample))
+                                    .flatten()
+                                    .map(|(w, h)| av1_coded_buffer_bytes(w, h, params.framerate));
+                                idr.on_keyframe(b, params.bitrate_kbps, p.bytes(), coded_limit, Instant::now());
                             }
                             if was_stalled
                                 && runtime.lock().unwrap().is_stalled()
@@ -4210,6 +4334,53 @@ async fn destination_pump(
                         }
                         None => branch_ended = true,
                     }
+                    continue;
+                }
+                // The branch's encoder chain returned a flow error (task #137): rebuild this one branch at
+                // once. Without this, the error went up through the tee into `pipewiresrc` and read as a lost
+                // portal source (see [`branch::BranchFailure`]).
+                _ = async { failure_watch.as_ref().expect("guarded by branch.is_some()").failed().await },
+                    if swapping.is_none() && branch.is_some() =>
+                {
+                    let now = Instant::now();
+                    let reason = branch.as_ref().and_then(|b| b.failure_reason()).unwrap_or_default();
+                    idr.note_branch_failure();
+                    branch_failures.retain(|t| now.duration_since(*t) < BRANCH_FAILURE_WINDOW);
+                    if branch_failures.len() >= MAX_BRANCH_FAILURES {
+                        // The rebuilt encoder fails as fast as the last one did: nothing a fresh branch can fix.
+                        // Same ending as an encoder that stays silent through every rebuild.
+                        tracing::error!(
+                            "stream {stream_id}: the encode branch failed {} times in {}s (last: {reason}); giving up on it",
+                            branch_failures.len() + 1,
+                            BRANCH_FAILURE_WINDOW.as_secs()
+                        );
+                        let old = branch.take().expect("guarded by branch.is_some()");
+                        let (pipeline, tee) = (pipeline.clone(), tee.clone());
+                        tokio::spawn(async move {
+                            let _ = branch::remove_branch_with(&pipeline, &tee, old, branch::RemoveBounds::DEAD).await;
+                        });
+                        if destination::give_up_restarts_capture(capture_errors.silence_is_loss, declared_source_lost) {
+                            declared_source_lost = true;
+                            capture_errors.mark_lost("the encoder keeps failing".to_string());
+                        } else {
+                            runtime.lock().unwrap().fail("the encoder keeps failing and could not be restarted");
+                        }
+                        branch_ended = true;
+                        continue;
+                    }
+                    branch_failures.push_back(now);
+                    tracing::warn!(
+                        "stream {stream_id}: the encode branch failed ({reason}); rebuilding just this branch, the capture source is fine (failure {} of {MAX_BRANCH_FAILURES} allowed in {}s)",
+                        branch_failures.len(),
+                        BRANCH_FAILURE_WINDOW.as_secs()
+                    );
+                    let params = runtime.lock().unwrap().params();
+                    let old = branch.take().expect("guarded by branch.is_some()");
+                    let id = branch::BranchId(next_branch_id);
+                    next_branch_id = next_branch_id.wrapping_add(1);
+                    swapping = Some(PendingSwap::spawn(
+                        &pipeline, &tee, &runtime, old, id, params, branch::SwapMode::Failed, None,
+                    ));
                     continue;
                 }
                 _ = stall_ticker.tick() => {
@@ -4528,6 +4699,11 @@ async fn destination_pump(
     }
 }
 
+/// More encode-branch failures than this within [`BRANCH_FAILURE_WINDOW`] and the pump stops rebuilding
+/// (task #137): a rebuilt encoder that dies at once is not helped by another one.
+const MAX_BRANCH_FAILURES: usize = 4;
+const BRANCH_FAILURE_WINDOW: Duration = Duration::from_secs(30);
+
 /// How long [`destination_pump`]'s `Stop` waits for the relay to accept the
 /// `StopStream` before moving on to the branch teardown regardless.
 const STOP_NOTIFY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -4556,7 +4732,7 @@ impl PendingSwap {
     ) -> Self {
         let (pipeline, tee, runtime) = (pipeline.clone(), tee.clone(), runtime.clone());
         let handle = tokio::spawn(async move { branch::swap_to_new_branch_with(&pipeline, &tee, &runtime, old, id, params, mode).await });
-        Self { handle, reply, recovery: mode == branch::SwapMode::Recovery }
+        Self { handle, reply, recovery: mode != branch::SwapMode::Normal }
     }
 
     /// Awaits the swap. Cancel-safe in a `select!` (a `JoinHandle` is).
@@ -4667,8 +4843,9 @@ const PACE_STEP: Duration = Duration::from_millis(2);
 /// share tolerates; a lost one costs a 1.5 s recovery round.
 ///
 /// `factor` is [`destination::PacePolicy::factor`]: 2.5 until the path has proven clean, then up to
-/// 12 (row 129: the window is the freeze the viewer sees on every keyframe, 119 ms for 372 kB at 10 Mbit/s
-/// and 2.5x, ~25 ms at 12x). The 60 ms floor shrinks with it.
+/// 4 (row 129: the window is the freeze the viewer sees on every keyframe, 119 ms for 372 kB at 10 Mbit/s
+/// and 2.5x, ~75 ms at 4x; the cap was 12 until task #137, see [`destination::PacePolicy::MAX`]). The 60 ms floor
+/// shrinks with it.
 fn pace_plan(count: usize, bytes: usize, keyframe: bool, framerate: u32, bitrate_kbps: u32, factor: f64) -> Option<(usize, Duration)> {
     if count < PACE_MIN_DATAGRAMS {
         return None;
@@ -4945,6 +5122,13 @@ fn prepare_media_payload(
 /// destination's wire clock, records it in the [`destination::DestinationRuntime`]
 /// (caching IDRs for the stall protocol and driving the first-IDR
 /// `Starting`/`Stalled` → `Live` transitions), and sends it.
+/// Width and height from an encoded sample's caps.
+fn encoded_dimensions(sample: &gst::Sample) -> Option<(u32, u32)> {
+    let caps = sample.caps()?;
+    let s = caps.structure(0)?;
+    Some((u32::try_from(s.get::<i32>("width").ok()?).ok()?, u32::try_from(s.get::<i32>("height").ok()?).ok()?))
+}
+
 fn send_encoded_sample(
     client: &ScreenshareClient,
     stream_id: u8,
@@ -5082,8 +5266,16 @@ pub mod destination {
     impl PacePolicy {
         /// Starting and lowest factor: #102's 2.5 x bitrate.
         pub const BASE: f64 = super::PACE_RATE_FACTOR;
-        /// Fastest factor. 12 x 10 Mbit/s = 120 Mbit/s: a 372 kB IDR in 25 ms, close to unpaced.
-        pub const MAX: f64 = 12.0;
+        /// Fastest factor: 4x. It was 12 (a 372 kB IDR at 10 Mbit/s in 25 ms, close to unpaced) until task #137.
+        ///
+        /// `Why 4:` on the user's line (37-38 Mbit/s up, row 133) anything above ~3.7x of a 10 Mbit/s stream buys
+        /// nothing, and above that it overflows the modem's queue: rig behind `udpproxy` at 38 Mbit/s up, AV1
+        /// 120 fps 25.7 Mbit/s, ~500 kB keyframes, 70 s, same build, only `SSS_PACE_MULT` differing: pinned 2.5x
+        /// 0 keyframes never completed, 4x 1, 12x **27** (adaptive up to 12x: 9, each one right after the policy
+        /// had climbed back to 6-12x: it can only learn the limit by losing a keyframe, and re-learns every
+        /// hold period). The playout buffer (row 136) now absorbs the longer window (500 kB at 4x of
+        /// 25.7 Mbit/s = ~39 ms instead of 12 ms), which is what made the 12x window worth having.
+        pub const MAX: f64 = 4.0;
         /// Growth per clean big keyframe.
         pub const GROWTH: f64 = 1.5;
         /// After a back-off the factor stays put this long.
@@ -5990,17 +6182,17 @@ pub mod destination {
             assert_eq!(p.factor(), 2.5);
             // Clean big keyframes: x1.5 each, up to the cap.
             assert_eq!(p.on_keyframe(t, 0, 372, true), Some(3.75));
-            assert_eq!(p.on_keyframe(t + s(1), 0, 372, true), Some(5.625));
+            assert_eq!(p.on_keyframe(t + s(1), 0, 372, true), Some(4.0), "capped at 4x (task #137)");
             for i in 2..10 {
                 p.on_keyframe(t + s(i), 0, 372, true);
             }
             assert_eq!(p.factor(), PacePolicy::MAX);
             assert_eq!(p.on_keyframe(t + s(11), 0, 372, true), None, "at the cap nothing changes");
             // The relay forwarded 40 retransmit requests since the last keyframe: halve and hold.
-            assert_eq!(p.on_keyframe(t + s(12), 40, 372, true), Some(6.0));
+            assert_eq!(p.on_keyframe(t + s(12), 40, 372, true), Some(2.5));
             assert_eq!(p.on_keyframe(t + s(13), 40, 372, true), None, "held for 10 s");
             assert_eq!(p.on_keyframe(t + s(21), 40, 372, true), None, "still held");
-            assert_eq!(p.on_keyframe(t + s(23), 40, 372, true), Some(9.0), "growth resumes after the hold");
+            assert_eq!(p.on_keyframe(t + s(23), 40, 372, true), Some(3.75), "growth resumes after the hold");
             // Losses never take it below the base.
             let mut p = PacePolicy::new(None, 0);
             p.on_keyframe(t, 100, 372, true);
@@ -6018,7 +6210,7 @@ pub mod destination {
             let mut p = PacePolicy::new(None, 0);
             p.on_keyframe(t, 0, 372, true);
             // 3 resent fragments (about 0.4 % random loss on a 372-datagram IDR is ~1.5) are below the threshold of 4.
-            assert_eq!(p.on_keyframe(t + Duration::from_secs(1), 3, 372, true), Some(5.625));
+            assert_eq!(p.on_keyframe(t + Duration::from_secs(1), 3, 372, true), Some(4.0));
             assert_eq!(PacePolicy::loss_threshold(1000), 10);
             assert_eq!(PacePolicy::loss_threshold(100), 4);
         }
@@ -6692,6 +6884,96 @@ pub mod branch {
         pub codec: VideoCodec,
     }
 
+    /// A branch whose encoder chain returned a flow error (task #137).
+    ///
+    /// `Why:` a `GST_FLOW_ERROR` from inside a branch (measured: `vaav1enc` failing to map its coded
+    /// buffer for a frame bigger than the buffer GStreamer sized from the AV1 level) travels *upstream*
+    /// through the branch's leaky queue and the shared `tee` into `pipewiresrc`, which then stops its
+    /// streaming task with `Internal data stream error (-5)`. The bus only ever sees the source's and the
+    /// pre-tee queue's message, so the error looked like a lost portal source and every destination paid
+    /// a full portal restart (and, with the restart schedule, up to 10 s of Recovering). The branch's
+    /// entry probe now catches the error at its own door (see [`branch_entry_probe`]) so the tee never
+    /// sees it, and records here which element returned it; the destination's pump rebuilds just this
+    /// branch.
+    #[derive(Default)]
+    pub(super) struct BranchFailure {
+        pub(super) reason: Mutex<Option<String>>,
+        notify: tokio::sync::Notify,
+    }
+
+    impl BranchFailure {
+        pub(super) fn record(&self, reason: String) -> bool {
+            let mut slot = self.reason.lock().unwrap();
+            if slot.is_some() {
+                return false;
+            }
+            *slot = Some(reason);
+            drop(slot);
+            self.notify.notify_one();
+            true
+        }
+
+        pub(super) fn is_set(&self) -> bool {
+            self.reason.lock().unwrap().is_some()
+        }
+
+        /// Completes when the branch failed (a stored permit: not lost if it fires before this is awaited).
+        pub async fn failed(&self) {
+            self.notify.notified().await
+        }
+    }
+
+    /// The element of a branch chain that returned the flow error, found from the pads' last flow
+    /// returns. An error returned by element N's chain function is stored as the last flow return of
+    /// the src pad of element N-1 (and of every one upstream of it), so the culprit is the peer after
+    /// the last src pad that holds an error. `first_src` is the src pad of the branch's entry queue.
+    pub(super) fn failing_element(first_src: &gst::Pad) -> String {
+        let is_error = |pad: &gst::Pad| matches!(pad.last_flow_result(), Err(gst::FlowError::Error | gst::FlowError::NotNegotiated));
+        let (mut culprit, mut pad) = (None, first_src.clone());
+        let mut hops = 0;
+        while is_error(&pad) && hops < 32 {
+            hops += 1;
+            let Some(next) = pad.peer().and_then(|p| p.parent_element()) else { break };
+            culprit = Some(next.clone());
+            match next.static_pad("src") {
+                Some(src) => pad = src,
+                None => break,
+            }
+        }
+        match culprit {
+            Some(e) => format!("{} ({})", e.name(), e.factory().map(|f| f.name().to_string()).unwrap_or_default()),
+            None => "unknown element".to_string(),
+        }
+    }
+
+    /// The probe on a branch's entry pad: counts the frames offered and shields the tee from a branch
+    /// whose encoder chain failed (see [`BranchFailure`]).
+    pub(super) fn branch_entry_probe(
+        counter: Arc<AtomicU64>,
+        failure: Arc<BranchFailure>,
+        queue_src: Option<gst::Pad>,
+        id: BranchId,
+    ) -> impl Fn(&gst::Pad, &mut gst::PadProbeInfo) -> gst::PadProbeReturn + Send + Sync + 'static {
+        move |_pad, _info| {
+            if failure.is_set() {
+                return gst::PadProbeReturn::Drop;
+            }
+            if let Some(src) = &queue_src
+                && matches!(src.last_flow_result(), Err(gst::FlowError::Error | gst::FlowError::NotNegotiated))
+            {
+                let element = failing_element(src);
+                tracing::warn!(
+                    "encode branch {id:?}: {element} returned a flow error ({:?}); the branch is cut off from the capture and will be rebuilt",
+                    src.last_flow_result()
+                );
+                failure.record(element);
+                return gst::PadProbeReturn::Drop;
+            }
+            counter.fetch_add(1, Ordering::Relaxed);
+            gst::PadProbeReturn::Ok
+        }
+    }
+
     /// A live encode branch built by [`add_branch`]: a `gst::Bin` already
     /// added to its pipeline and linked to a tee request pad, plus
     /// everything [`remove_branch`] needs to tear it back down.
@@ -6740,6 +7022,8 @@ pub mod branch {
         /// Frames that reached this branch (counted on its sink pad, before
         /// the leaky queue): what [`super::destination::stall_verdict`] reads.
         offered: Arc<AtomicU64>,
+        /// Set (once) when the branch's own encoder chain returned a flow error (see [`BranchFailure`]).
+        failure: Arc<BranchFailure>,
         /// The backend this branch was *actually* built with: differs from the
         /// requested [`EncodeSettings::backend`] when
         /// [`add_branch_with_fallback`] / [`add_branch_live_waiting`] fell back
@@ -6760,6 +7044,16 @@ pub mod branch {
         /// write while `Playing` (see [`super::EncoderBackend::launch_fragment`]).
         pub fn set_bitrate_kbps(&self, bitrate_kbps: u32) {
             self.encoder.set_property("bitrate", bitrate_kbps);
+        }
+
+        /// Why this branch's encoder chain died, once it did (see [`BranchFailure`]).
+        pub fn failure_reason(&self) -> Option<String> {
+            self.failure.reason.lock().unwrap().clone()
+        }
+
+        /// The branch's failure latch, for a caller that must wait on it while using the branch.
+        pub(super) fn failure(&self) -> Arc<BranchFailure> {
+            self.failure.clone()
         }
 
         /// Frames offered to this branch so far — see the `offered` field.
@@ -7098,7 +7392,7 @@ pub mod branch {
              ! capssetter caps=video/x-raw,framerate={framerate}/1 join=true replace=false \
              ! {encoder} name={encoder_name} \
              ! {output_caps} \
-             ! appsink name={appsink_name} emit-signals=false sync=false max-buffers=8 drop=false"
+             ! appsink name={appsink_name} emit-signals=false sync=false async=false max-buffers=8 drop=false"
         );
 
         // `ghost_unlinked_pads=true` auto-creates a ghost pad on the bin for
@@ -7141,12 +7435,15 @@ pub mod branch {
         })?;
 
         let offered = Arc::new(AtomicU64::new(0));
-        let counter = offered.clone();
+        let failure = Arc::new(BranchFailure::default());
+        // The entry queue's src pad: its last flow return is where a failure downstream shows first.
+        let queue_src = branch_sink_pad
+            .downcast_ref::<gst::GhostPad>()
+            .and_then(|g| g.target())
+            .and_then(|p| p.parent_element())
+            .and_then(|q| q.static_pad("src"));
         branch_sink_pad
-            .add_probe(gst::PadProbeType::BUFFER, move |_pad, _info| {
-                counter.fetch_add(1, Ordering::Relaxed);
-                gst::PadProbeReturn::Ok
-            })
+            .add_probe(gst::PadProbeType::BUFFER, branch_entry_probe(offered.clone(), failure.clone(), queue_src, id))
             .ok_or_else(|| anyhow!("failed to install the offered-frame counter on branch {id:?}"))?;
 
         let tee_pad = tee
@@ -7174,7 +7471,7 @@ pub mod branch {
             return Err(anyhow!("failed to link tee's new request pad to the encode branch: {e:?}"));
         }
 
-        Ok(EncodeBranch { id, appsink, bin, tee_pad, encoder: encoder_element, valve, stream: None, offered, backend: settings.backend })
+        Ok(EncodeBranch { id, appsink, bin, tee_pad, encoder: encoder_element, valve, stream: None, offered, failure, backend: settings.backend })
     }
 
     /// [`add_branch`] with the same per-branch VAAPI→software fallback
@@ -7562,6 +7859,9 @@ pub mod branch {
         /// frames, and the capture's own stop has a short overall deadline.
         /// A teardown that outlives it keeps running on its blocking thread.
         pub const FAST: Self = Self { drain: Duration::from_secs(1), teardown: Duration::from_secs(3) };
+        /// For a branch whose encoder chain already failed (task #137): nothing will ever drain through
+        /// it, so no drain wait at all.
+        pub const DEAD: Self = Self { drain: Duration::ZERO, teardown: BRANCH_TEARDOWN_TIMEOUT };
     }
 
     /// [`remove_branch`] with explicit phase bounds (see [`RemoveBounds`]).
@@ -7583,7 +7883,7 @@ pub mod branch {
         // value is what makes this safe by construction: the production reader
         // cannot still be holding it.
         let _ = branch.sample_stream();
-        let EncodeBranch { id: _, appsink: _, bin, tee_pad, encoder: _, valve: _, stream, offered: _, backend: _ } = branch;
+        let EncodeBranch { id: _, appsink: _, bin, tee_pad, encoder: _, valve: _, stream, offered: _, failure: _, backend: _ } = branch;
         let mut appsink_stream = stream.expect("sample_stream() populated it immediately above");
 
         let branch_sink_pad = bin
@@ -7853,6 +8153,11 @@ pub mod branch {
         /// old branch, which is stuck by definition, is removed in the
         /// background instead of being waited for.
         Recovery,
+        /// The old branch's encoder chain returned a flow error (task #137, see [`BranchFailure`]): as
+        /// [`Self::Recovery`], but the dead branch is removed without waiting for a drain
+        /// ([`RemoveBounds::DEAD`]): a dead queue never passes the EOS on, so the normal 5 s wait only kept
+        /// its encoder and its frames of the shared buffer pool alive for nothing.
+        Failed,
     }
 
     /// [`swap_to_new_branch`] with an explicit [`SwapMode`].
@@ -7896,10 +8201,11 @@ pub mod branch {
             runtime.finish_rebuild();
         }
 
-        if mode == SwapMode::Recovery {
+        if mode != SwapMode::Normal {
             let (pipeline, tee) = (pipeline.clone(), tee.clone());
+            let bounds = if mode == SwapMode::Failed { RemoveBounds::DEAD } else { RemoveBounds::DEFAULT };
             tokio::spawn(async move {
-                let _ = remove_branch(&pipeline, &tee, old).await;
+                let _ = remove_branch_with(&pipeline, &tee, old, bounds).await;
             });
         } else if let Err(e) = remove_branch(pipeline, tee, old).await {
             // The swap already succeeded; a messy teardown of the *old* branch
@@ -10383,6 +10689,76 @@ pub mod webcam {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Task #137: GStreamer sizes `vaav1enc`'s coded buffer from the AV1 level, which falls with the
+    /// frame rate; the numbers are what `Calculate codedbuf size` printed in the rig (648000 at 1080p 120).
+    #[test]
+    fn av1_coded_buffer_follows_gstreamers_level_table() {
+        assert_eq!(av1_coded_buffer_bytes(1920, 1080, 120), 648_000, "level 5.0, ratio 6");
+        assert_eq!(av1_coded_buffer_bytes(1920, 1080, 60), 972_000, "level 4.1, ratio 4");
+        assert_eq!(av1_coded_buffer_bytes(1920, 1080, 30), 972_000, "level 4.0, ratio 4");
+        assert_eq!(av1_coded_buffer_bytes(1920, 1080, 240), 486_000, "level 5.1, ratio 8");
+        assert_eq!(av1_coded_buffer_bytes(1920, 1080, 15), 972_000);
+        // A bigger picture picks a higher level: 4K 60 fps is level 5.1.
+        assert_eq!(av1_coded_buffer_bytes(3840, 2160, 60), 3840 * 2160 * 15 / 8 / 8);
+    }
+
+    /// Task #137: an encoder error in a tee branch must stay in the branch. `identity error-after` stands in for
+    /// the `vaav1enc` that failed to map its coded buffer: it returns a flow error, which used to travel up
+    /// through the tee and stop the source (`pipewiresrc` "Internal data stream error (-5)").
+    #[test]
+    fn a_failing_branch_is_cut_off_and_named_while_the_source_and_the_other_branch_keep_running() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch(
+            "videotestsrc is-live=true ! video/x-raw,width=64,height=64,framerate=100/1 ! tee name=t \
+             t. ! queue name=other_q ! fakesink name=other sync=false \
+             t. ! queue name=q ! identity name=bomb error-after=5 ! fakesink name=doomed sync=false",
+        )
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let q = pipeline.by_name("q").unwrap();
+        let failure = Arc::new(branch::BranchFailure::default());
+        q.static_pad("sink")
+            .unwrap()
+            .add_probe(
+                gst::PadProbeType::BUFFER,
+                branch::branch_entry_probe(Arc::new(AtomicU64::new(0)), failure.clone(), q.static_pad("src"), branch::BranchId(7)),
+            )
+            .unwrap();
+        let other_seen = Arc::new(AtomicU64::new(0));
+        let counter = other_seen.clone();
+        pipeline
+            .by_name("other")
+            .unwrap()
+            .static_pad("sink")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                gst::PadProbeReturn::Ok
+            })
+            .unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !failure.is_set() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let reason = failure.reason.lock().unwrap().clone().expect("the branch failure is recorded");
+        assert!(reason.contains("bomb") && reason.contains("identity"), "the failing element is named: {reason}");
+        // The tee never saw the error: the source and the healthy branch go on.
+        let before = other_seen.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(other_seen.load(Ordering::Relaxed) >= before + 20, "the healthy branch kept receiving frames");
+        let bus = pipeline.bus().unwrap();
+        while let Some(msg) = bus.pop() {
+            if let gst::MessageView::Error(e) = msg.view() {
+                let src = msg.src().map(|s| s.name().to_string()).unwrap_or_default();
+                assert_eq!(src, "bomb", "only the failing element reports an error, not the source: {}", e.error());
+            }
+        }
+        pipeline.set_state(gst::State::Null).unwrap();
+    }
 
     /// Row 133: the sender's timing line tells a late keyframe and the frames behind it apart.
     #[test]

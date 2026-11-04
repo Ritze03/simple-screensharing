@@ -511,6 +511,12 @@ a decode-side reader will meet:
 - **Idle monitors (#32).** The first branch waits for the source's first repaint; a silence watchdog
   moves a quiet destination to `Stalled(SourceLost)` and viewers are fed a cached IDR meanwhile:
   `stream-control.md` "Idle monitors" and "Silence watchdog".
+- **AV1 keyframes and the coded buffer (2026-11-04, task #137).** `vaav1enc` kills its encode branch with a flow error when one frame
+  is bigger than the VA coded buffer GStreamer sizes from the AV1 level (1080p: 972 kB up to ~68 fps, 648 kB at 120, 486 kB at 240).
+  The error used to reach `pipewiresrc` through the tee and look like a lost portal source; now the branch is cut off, named in the
+  log and rebuilt alone, and the pump restarts the rate control (a `bitrate` write) when a keyframe reaches 75 % of the buffer.
+  The keyframe **pacing** factor is capped at 4x (was 12x) because the 12x burst overflowed the uplink queue and lost keyframes the
+  viewer then had to recover (L1, "Viewer recovery"): `stream-control.md` "AV1 branch deaths read as a lost portal source".
 
 
 
