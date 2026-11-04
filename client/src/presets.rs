@@ -307,7 +307,6 @@ mod tests {
     fn quality_str(q: QualityLevel) -> &'static str {
         match q {
             QualityLevel::Performance => "performance",
-            QualityLevel::Balanced => "balanced",
             QualityLevel::Quality => "quality",
         }
     }
@@ -360,9 +359,6 @@ mod tests {
         let mut t = EncoderPreset::Quality.tuning();
         t.quality_level = QualityLevel::Performance;
         assert_eq!(t.preset(), None, "Performance at 1000 ms is none of the three");
-        let mut t = EncoderPreset::Quality.tuning();
-        t.quality_level = QualityLevel::Balanced;
-        assert_eq!(t.preset(), None, "an unmigrated Balanced matches nothing");
     }
 
     #[test]

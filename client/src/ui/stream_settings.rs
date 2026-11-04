@@ -827,7 +827,6 @@ fn video_card(ui: &mut Ui, cx: &Cx, target: Target, out: &mut Vec<UiAction>) {
 fn preset_caption(v: &NextStream) -> String {
     let mode = match v.quality_level {
         QualityLevel::Performance => tr("ui.stream.ql_performance", "Performance"),
-        QualityLevel::Balanced => tr("ui.stream.ql_balanced", "Balanced"),
         QualityLevel::Quality => tr("ui.stream.ql_quality", "Quality"),
     };
     tr_with(

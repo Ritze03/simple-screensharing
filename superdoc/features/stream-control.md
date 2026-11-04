@@ -36,8 +36,8 @@ user's table (`client/src/presets.rs`, `EncoderPreset`):
 | Gaming | 120 | Performance | 250 ms | low latency |
 
 *Why (user's table, plan decision D8):* three presets people can tell apart replace four that were
-partly twins; only Performance and Quality survive as "encoding" modes (the `target-usage` / x264
-`speed-preset` mapping below is unchanged, Quality = 4 on Mesa AMD, Performance = 2). Text is for
+partly twins; only Performance and Quality survive as "encoding" modes (the VA `target-usage` mapping
+below is unchanged, Quality = 4 on Mesa AMD, Performance = 2; x264 Quality is `medium`, see the `Why:` below). Text is for
 documents and code: sharp at a low frame rate, a keyframe is cheap at 15 fps so 250 ms costs little.
 
 - **A preset sets the FPS once.** `apply_preset_to_start_stream` / `DestEdit::apply_preset` write the
@@ -58,8 +58,9 @@ documents and code: sharp at a low frame rate, a keyframe is cheap at 15 fps so 
   `quality_level` Quality. An old `performance` stays Performance at 1000 ms, which is no preset until the
   user picks Gaming (the old Gaming's 750 ms was never saved, and old Low-Latency and Gaming are
   indistinguishable in the file, so they cannot both map to Quality as the old preset names would
-  suggest). Stored values are not rewritten until the next save. `QualityLevel::Balanced` still exists in
-  the enum (x264 `medium`, its `target-usage`), it is just not offered or produced any more.
+  suggest). Stored values are not rewritten until the next save. `QualityLevel::Balanced` is removed from the
+  enum: `quality_level = "balanced"` is a `serde(alias)` of `Quality`, so nothing can produce it any more
+  (a file written by this build never contains it; an old one is not rewritten until its next save).
   `EncoderPreset::from_value("balanced" | "low_latency")` is Quality, for symmetry with the browser, which
   stores preset names (`docs/js/core/video-tx.js` `ENCODER_PRESETS`).
 - **Fresh app default = the Quality preset's fields** (`AppState::default`, `StartStreamDefaults::default`)
@@ -96,9 +97,13 @@ documents and code: sharp at a low frame rate, a keyframe is cheap at 15 fps so 
   "Go live" with Text: `framerate = 15`, `tune = "best_quality"`, `quality_level = "quality"`,
   `gop_millis = 250`; the next staged card opened with Text / 250 ms / 15 fps. Presets were switched live
   Text -> Quality -> Gaming (a branch rebuild each, the stream kept running).
-- **Cost to know:** Quality is x264 `veryslow` / VA `target-usage` 4 and it is now also the default and the
-  Text preset, where Balanced (`medium`) was the default: on a software-only machine (Windows without VA) the
-  default encode is much heavier than before. The user's table asked for it; not measured on x264.
+- **Why x264 Quality is `medium`, not `veryslow` (2026-11-04):** Quality became the default (and is the Text
+  preset), and software x264 must not get heavier than the old default, Balanced = `medium`. Windows encodes
+  with `x264enc` only (`features/windows.md`), so `veryslow` at 1080p would have been the default there.
+  `capture::EncoderBackend::launch_fragment` maps `Performance` to `ultrafast` and `Quality` to `medium`
+  (pinned by `quality_level_maps_to_speed_preset_and_target_usage`). VA is unchanged (Quality = 4 on Mesa AMD,
+  1 elsewhere). The `windows.md` row that measured x264 at `veryslow` (~line 210) is historic and was left as
+  written. Not measured on x264 since the change (it is the same `speed-preset` the old default used).
 
 ## The shape of a capture, after this stage
 
@@ -1371,6 +1376,8 @@ regression tests and `go_live_attaches_the_first_destination_with_real_resolutio
 were re-run and still pass; this fix touches only `decode.rs`, nothing sender-side.
 
 ### Backend mapping — real, and asymmetric between backends
+
+**Since 2026-11-04 the Balanced level is gone and x264 `Quality` is `medium` (see "Presets: Text, Quality, Gaming"); the table below is the older mapping.**
 
 | Control | `x264enc` (Software) | `vah264enc` (Vaapi) |
 | --- | --- | --- |

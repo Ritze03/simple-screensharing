@@ -323,12 +323,10 @@ fn va_driver_is_mesa_amd() -> bool {
 /// (H.264 at 3 Mbit/s: VMAF 77 vs 86) on screen content, so it is not the
 /// "Quality" setting its spec position suggests.
 ///
-/// Mapping on Mesa AMD: Performance 2 (fast band), Balanced 3 (the same band;
-/// the encode is identical to Performance, there is no cheaper or better
-/// point between balance and quality that 1..=7 can reach), Quality 4 (the
-/// quality preset: nearly all of the gain of 6 at twice its AV1 speed).
-/// Other drivers follow the VA order: Performance 7 (the spec's fastest),
-/// Balanced 4, Quality 1.
+/// Mapping on Mesa AMD: Performance 2 (fast band), Quality 4 (the quality
+/// preset: nearly all of the gain of 6 at twice its AV1 speed). Other drivers
+/// follow the VA order: Performance 7 (the spec's fastest), Quality 1. (The
+/// retired Balanced level was 3 / 4.)
 ///
 /// `Why Performance is 7 off Mesa AMD (#94, 2026-11-01):` 2 was picked in #46
 /// because 7 was the slowest band on radeonsi; since #92 radeonsi has its own
@@ -339,9 +337,7 @@ fn vaapi_target_usage(level: QualityLevel, mesa_amd: bool) -> u32 {
     match (level, mesa_amd) {
         (QualityLevel::Performance, true) => 2,
         (QualityLevel::Performance, false) => 7,
-        (QualityLevel::Balanced, true) => 3,
         (QualityLevel::Quality, true) => 4,
-        (QualityLevel::Balanced, false) => 4,
         (QualityLevel::Quality, false) => 1,
     }
 }
@@ -393,8 +389,10 @@ impl EncoderBackend {
                 };
                 let speed_preset = match quality_level {
                     QualityLevel::Performance => "ultrafast",
-                    QualityLevel::Balanced => "medium",
-                    QualityLevel::Quality => "veryslow",
+                    // `medium`, not `veryslow`: Quality is the default (2026-11-04) and software x264
+                    // must not get heavier than the old default (Balanced = medium); Windows encodes
+                    // with x264enc only.
+                    QualityLevel::Quality => "medium",
                 };
                 // x264enc has no rate-control *enum* like vah264enc's, and no
                 // QVBR-equivalent knob; its default single-pass mode with a
@@ -667,25 +665,19 @@ pub enum QualityLevel {
     /// (measured table in [`EncoderBackend::launch_fragment`], #46), hence its
     /// own arm in [`vaapi_target_usage`] (#92, #94).
     Performance,
-    /// x264enc `speed-preset=medium` / vah264enc `target-usage=4` (`3` on
-    /// Mesa AMD, where 4 is the half-speed AV1 band, [`vaapi_target_usage`],
-    /// #92) — the midpoint of both scales (x264's own upstream default preset is
-    /// `medium`). The default: per the "good mix" product requirement (see
-    /// [`TuneMode`]'s doc comment), neither speed nor quality extreme should
-    /// be the out-of-the-box behavior — this sits between [`Self::Performance`]
-    /// and [`Self::Quality`].
-    #[default]
-    Balanced,
-    /// x264enc `speed-preset=veryslow` / vah264enc `target-usage=1` (`4` on
+    /// x264enc `speed-preset=medium` / vah264enc `target-usage=1` (`4` on
     /// Mesa AMD, where 1 is pre-encode + VBAQ and measured worse,
-    /// [`vaapi_target_usage`], #92) — the slowest, best-quality end of both
-    /// scales.
+    /// [`vaapi_target_usage`], #92). The default, and the Text and Quality
+    /// presets.
+    ///
+    /// `Why x264 medium and not veryslow (2026-11-04, plan decision D8):` Quality
+    /// became the default, and software x264 (Windows has nothing else) must not
+    /// get heavier than the old default, Balanced = `medium`. `veryslow` is far
+    /// too slow for 1080p. The old `balanced` loads as this level
+    /// (`serde(alias)`), a stored `quality` encodes with `medium` now.
+    #[default]
+    #[serde(alias = "balanced")]
     Quality,
-}
-
-impl QualityLevel {
-    /// Every level, in the order the picker shows them.
-    pub const ALL: [QualityLevel; 3] = [Self::Performance, Self::Balanced, Self::Quality];
 }
 
 // Rate control is not a setting (#88, 2026-10-15): every VA encoder runs Dynamic
@@ -6238,7 +6230,7 @@ pub mod destination {
                 ChangeTier::BranchSwap
             );
             assert_eq!(
-                classify_change(source, from, VideoParams { quality_level: QualityLevel::Quality, ..from }),
+                classify_change(source, from, VideoParams { quality_level: QualityLevel::Performance, ..from }),
                 ChangeTier::BranchSwap
             );
             assert_eq!(
@@ -9944,17 +9936,17 @@ mod tests {
 
     /// The per-driver `target-usage` table ([`vaapi_target_usage`], #92) is
     /// pure, so it is checked everywhere: Mesa AMD keeps Performance and
-    /// Balanced in the fast bands (2, 3: Mesa's balance preset) and Quality in
+    /// Performance in the fast band (2: Mesa's balance preset) and Quality in
     /// the quality preset (4), never 1 (pre-encode + VBAQ, slower and worse on
     /// screen content) or 6-7 (AV1 at ~95 fps); other drivers follow the VA spec
-    /// order: 7 / 4 / 1 (Performance 7 since #94).
+    /// order: 7 / 1 (Performance 7 since #94).
     #[test]
     fn vaapi_target_usage_per_driver() {
         use QualityLevel::*;
-        let amd = [Performance, Balanced, Quality].map(|l| vaapi_target_usage(l, true));
-        assert_eq!(amd, [2, 3, 4]);
-        let spec = [Performance, Balanced, Quality].map(|l| vaapi_target_usage(l, false));
-        assert_eq!(spec, [7, 4, 1]);
+        let amd = [Performance, Quality].map(|l| vaapi_target_usage(l, true));
+        assert_eq!(amd, [2, 4]);
+        let spec = [Performance, Quality].map(|l| vaapi_target_usage(l, false));
+        assert_eq!(spec, [7, 1]);
         assert!(amd.iter().chain(spec.iter()).all(|v| (1..=7).contains(v)));
     }
 
@@ -9976,19 +9968,13 @@ mod tests {
         // avoids hardcoding the underlying integer value.
         assert_eq!(performance.property_value("speed-preset").serialize().unwrap(), "ultrafast");
 
-        let balanced = build_encoder_element(
-            EncoderBackend::Software,
-            TuneMode::default(),
-            QualityLevel::Balanced,
-        );
-        assert_eq!(balanced.property_value("speed-preset").serialize().unwrap(), "medium");
-
+        // Quality is the default, so it must cost what the old default (Balanced) cost.
         let quality = build_encoder_element(
             EncoderBackend::Software,
             TuneMode::default(),
             QualityLevel::Quality,
         );
-        assert_eq!(quality.property_value("speed-preset").serialize().unwrap(), "veryslow");
+        assert_eq!(quality.property_value("speed-preset").serialize().unwrap(), "medium");
 
         if gst::ElementFactory::make(VAAPI_ENCODER_ELEMENT).build().is_err() {
             eprintln!("skipping VAAPI half: '{VAAPI_ENCODER_ELEMENT}' is not available in this environment");
@@ -10002,13 +9988,6 @@ mod tests {
             QualityLevel::Performance,
         );
         assert_eq!(vaapi_performance.property::<u32>("target-usage"), vaapi_target_usage(QualityLevel::Performance, amd));
-
-        let vaapi_balanced = build_encoder_element(
-            EncoderBackend::Vaapi,
-            TuneMode::default(),
-            QualityLevel::Balanced,
-        );
-        assert_eq!(vaapi_balanced.property::<u32>("target-usage"), vaapi_target_usage(QualityLevel::Balanced, amd));
 
         let vaapi_quality = build_encoder_element(
             EncoderBackend::Vaapi,
@@ -10647,11 +10626,11 @@ mod tests {
             gop_millis: DEFAULT_GOP_MILLIS,
             codec: VideoCodec::default(),
         };
-        // Exactly what clicking "Balanced" in the edit panel sends: two
+        // Exactly what clicking a preset in the edit panel sends: two
         // fields at once, nothing else changed.
         let after = destination::VideoParams {
             tune: TuneMode::BestQuality,
-            quality_level: QualityLevel::Balanced,
+            quality_level: QualityLevel::Quality,
             ..before
         };
         assert_eq!(

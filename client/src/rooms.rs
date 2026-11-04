@@ -458,9 +458,9 @@ pub struct StartStreamDefaults {
     /// Not shown any more (the presets set it, `presets.rs`); kept so an old file's value loads.
     #[serde(default)]
     pub tune: TuneMode,
-    /// A stored `balanced` (the retired middle level) loads as `quality`
-    /// ([`Self::balanced_is_quality`]); a file without the key gets the Quality preset's.
-    #[serde(default = "StartStreamDefaults::default_quality_level", deserialize_with = "StartStreamDefaults::balanced_is_quality")]
+    /// A stored `balanced` (the retired middle level) loads as `quality` (`QualityLevel`'s serde alias);
+    /// a file without the key gets the Quality preset's.
+    #[serde(default = "StartStreamDefaults::default_quality_level")]
     pub quality_level: QualityLevel,
     /// Keyframe interval in ms, saved since 2026-11-04 (it used to reset on every start).
     /// A file that predates it gets the Quality preset's, `DEFAULT_GOP_MILLIS`.
@@ -489,16 +489,6 @@ impl StartStreamDefaults {
 
     fn default_gop_millis() -> u32 {
         EncoderPreset::Quality.tuning().gop_millis
-    }
-
-    /// `Why (user's preset table, 2026-11-04):` the presets only know Performance and Quality, so the
-    /// retired Balanced level an old `settings.toml` may hold becomes Quality. The file is not
-    /// rewritten until the next save.
-    fn balanced_is_quality<'de, D: serde::Deserializer<'de>>(d: D) -> Result<QualityLevel, D::Error> {
-        Ok(match QualityLevel::deserialize(d)? {
-            QualityLevel::Balanced => QualityLevel::Quality,
-            level => level,
-        })
     }
 }
 
