@@ -43,6 +43,20 @@ pub(super) struct Spot {
     pub id: ItemId,
 }
 
+/// What a tile draws between its picture and its overlay: the webcam in picture ([`super::pip`]). `Why` a hook: a
+/// video is a wgpu paint callback, so what covers what is the order the shapes and callbacks are added in; the name
+/// tag and stats must come after the PIP or it covers the name (user: "The PIP webcam is drawn above the name in a
+/// screenshare (Should be below it, so its visible)"). A tile calls it once, after its picture and before its tag and
+/// buttons; the caller runs it afterwards if the tile returned early ([`run_between`]).
+pub(super) type Between<'a> = Option<Box<dyn FnOnce(&mut Ui, &mut Vec<UiAction>) + 'a>>;
+
+/// Run the hook if it has not run yet.
+pub(super) fn run_between(b: &mut Between, ui: &mut Ui, acts: &mut Vec<UiAction>) {
+    if let Some(f) = b.take() {
+        f(ui, acts);
+    }
+}
+
 /// Rounded corners over a wgpu video. `Why` masks: the video is a paint callback that cannot be clipped to a
 /// rounded rect, so the stage colour is painted over its corners.
 fn corner_masks(ui: &Ui, rect: Rect, radius: u8) {
@@ -144,7 +158,7 @@ pub(super) fn name_tag(ui: &Ui, rect: Rect, max_w: f32, icon: &str, icon_col: Co
 
 /// A watched stream: its video (Contain, or Cover in Crop), the green ring while its shared audio is audible,
 /// the health chip, the name tag and the hover buttons.
-pub(super) fn video_tile(ui: &mut Ui, cx: &Cx, key: StreamKey, s: &Spot, acts: &mut Vec<UiAction>) {
+pub(super) fn video_tile(ui: &mut Ui, cx: &Cx, key: StreamKey, s: &Spot, between: &mut Between, acts: &mut Vec<UiAction>) {
     cx.videos.paint(key, ui, s.rect, if s.crop { Fit::Cover } else { Fit::Contain });
     corner_masks(ui, s.rect, s.round);
     let has_audio = cx.stream_has_audio(key);
@@ -153,6 +167,7 @@ pub(super) fn video_tile(ui: &mut Ui, cx: &Cx, key: StreamKey, s: &Spot, acts: &
         ui.painter().rect_stroke(s.rect, CornerRadius::same(s.round), Stroke::new(2.0_f32, theme::SUCCESS), StrokeKind::Inside);
     }
     health_chip(ui, s.rect, stream_health(cx, key));
+    run_between(between, ui, acts);
     drive_dump::line(|| format!("stats.{} {}", s.n, u8::from(s.stats)));
     if s.always_names || s.hovered {
         let owner = cx.member_name(key.0, key.1);
@@ -302,7 +317,7 @@ pub(super) fn idle_tile(ui: &mut Ui, cx: &Cx, key: StreamKey, info: &StreamInfo,
 /// Your own share in this room: a live preview of what you capture while the window is focused (task #78), a
 /// screen-hatch placeholder otherwise, the tag `You · label`, and on hover `[viewers][PREVIEW]`, a Stream
 /// settings button and `⋯`.
-pub(super) fn mine_tile(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSourceId, destination: DestinationId, s: &Spot, acts: &mut Vec<UiAction>) {
+pub(super) fn mine_tile(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSourceId, destination: DestinationId, s: &Spot, between: &mut Between, acts: &mut Vec<UiAction>) {
     let Some(c) = cx.capture(capture) else { return };
     let Some(d) = c.destinations.get(&destination) else { return };
     let rect = s.rect;
@@ -335,6 +350,7 @@ pub(super) fn mine_tile(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSou
         ui.interact(rect, Id::new(("stage_mine_hint", capture, destination)), Sense::hover())
             .on_hover_text(tr("ui.waiting_frame_hint", "An idle screen sends no picture until something on it changes. Move the mouse over the shared screen and the stream starts."));
     }
+    run_between(between, ui, acts);
     let label = if on_air { share_label(&c.label) } else { format!("{} · {chip}", share_label(&c.label)) };
     // Like every tag: while hovered or with "Always show names", and always while the share is not on air (a
     // starting, stalled or failed share must say so, whatever the placeholder under it shows).

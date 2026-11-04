@@ -35,8 +35,20 @@
 //! others hide. A drag is applied **before** the frame is laid out, from the pointer's distance to where the
 //! press started, so the bar under the pointer does not lag a frame.
 //!
+//! # Motion (task I12, the replica's `.st-tile` and `.pip.snap` transitions)
+//! A tile whose layout rect changes (a swap, a layout switch, a stream added or removed, "Reset sizes", a bar
+//! double-click) **glides** to it over 0.2 s with the CSS `ease` curve ([`geom::Glide`], per tile and per view,
+//! arena-relative). It does not glide while a bar, a floating window or its resize handle is being dragged (the
+//! replica's `nofx`: the tile must stay under the pointer), when the arena itself changed size (window resize,
+//! fullscreen, the people strip hidden: nothing wanders), or when it appears. The tile being reordered follows the
+//! pointer 1:1 and, let go, glides from where it was dropped to its cell (the swapped one to its new cell). A webcam in
+//! picture glides to its spot for 0.16 s after a drag ([`pip`]). *Why:* the user: "Moving streams around (swapping
+//! them) is not as smooth as on the artifact" and "Moving the webcam around when in webcam PIP mode isnt as smooth as
+//! the artifact". Repaints are requested only while a glide runs.
+//!
 //! # Performance
-//! No repaint loop: video repaints are frame-driven by `VideoView`, a drag repaints on input.
+//! No repaint loop: video repaints are frame-driven by `VideoView`, a drag repaints on input, a glide for its
+//! 0.2 s.
 
 mod bar;
 mod chrome;
@@ -183,6 +195,7 @@ impl StageState {
             g.float.clear();
             g.z.clear();
             g.pip.clear();
+            g.pip_glide.clear();
         }
     }
 }
@@ -206,6 +219,12 @@ struct ViewGeom {
     grid: Option<Grid>,
     /// Webcam in picture: each webcam's size and spot in its parent's picture, per view ([`pip_pairs`]).
     pip: HashMap<ItemId, PipPos>,
+    /// Where each tile is drawn while it glides to its layout rect (arena-relative, [`geom::Glide`]).
+    glide: HashMap<ItemId, geom::Glide>,
+    /// The arena size of the last frame: a different one (window resize, fullscreen) moves tiles without a glide.
+    arena: Option<(f32, f32)>,
+    /// Webcams gliding to their spot after a drag ([`pip`]).
+    pip_glide: HashMap<ItemId, pip::PipGlide>,
 }
 
 /// A pointer drag in progress; `origin` is where the press started.
@@ -432,9 +451,38 @@ fn draw_arena(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, view: &StageView, i
         placed.pics.iter().map(|r| r.translate(off)).collect()
     };
     drive_dump::line(|| format!("layout {layout:?}\ntiles {}", vis.len()));
+    // Glide: where each tile is drawn this frame (`rects` stay the layout's, the drop targets).
+    let now = ui.input(|i| i.time);
+    let arena_moved = geom.arena.is_none_or(|(pw, ph)| (pw - w).abs() > 0.5 || (ph - h).abs() > 0.5);
+    geom.arena = Some((w, h));
+    // A bar, a window or its handle under the pointer, or a changed arena: nothing glides (`nofx`).
+    let snap = arena_moved || matches!(drag, Some(Drag::Bar { .. } | Drag::Move { .. } | Drag::Resize { .. }));
+    let reorder_id = match drag {
+        Some(Drag::Reorder { id, .. }) => Some(id.clone()),
+        _ => None,
+    };
+    geom.glide.retain(|id, _| vis.iter().any(|i| &i.id == id));
+    let mut animating = false;
+    let cur: Vec<Rect> = vis
+        .iter()
+        .zip(&rects)
+        .map(|(it, r)| {
+            let target = r.translate(-off);
+            let dragged = reorder_id.as_ref() == Some(&it.id);
+            let g = geom::Glide::step(geom.glide.get(&it.id).copied(), target, now, snap || dragged, geom::TILE_GLIDE);
+            geom.glide.insert(it.id.clone(), g);
+            let (drawn, done) = g.at(now, geom::TILE_GLIDE);
+            animating |= !done;
+            drawn.translate(off)
+        })
+        .collect();
+    if animating {
+        ui.ctx().request_repaint();
+    }
     let cells = grid.cells(w, h);
     for (i, it) in vis.iter().enumerate() {
-        drive_dump::rect(|| format!("tile.{i}"), rects[i]);
+        drive_dump::rect(|| format!("tile.{i}"), cur[i]);
+        drive_dump::rect(|| format!("tile_goal.{i}"), rects[i]);
         if let Some(c) = cells.get(i) {
             drive_dump::rect(|| format!("cell.{i}"), c.translate(off));
         }
@@ -456,9 +504,9 @@ fn draw_arena(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, view: &StageView, i
         Some(Drag::Reorder { id, origin }) => vis.iter().position(|i| &i.id == id).zip(pointer.map(|p| p - *origin)),
         _ => None,
     };
-    let mut shown = rects.clone();
+    let mut shown = cur.clone();
     if let Some((i, delta)) = reordering {
-        shown[i] = rects[i].translate(delta);
+        shown[i] = cur[i].translate(delta);
         paint_order.retain(|&x| x != i);
         paint_order.push(i);
     }
@@ -487,12 +535,10 @@ fn draw_arena(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, view: &StageView, i
             cross_room: matches!(view, StageView::Watched),
             id: it.id.clone(),
         };
-        match &it.kind {
-            Kind::Video(key) => tile::video_tile(ui, cxr, *key, &spot, &mut acts),
-            Kind::Idle(key, info) | Kind::Audio(key, info) => tile::idle_tile(ui, cxr, *key, info, &spot, &mut acts),
-            Kind::Mine(capture, destination) => tile::mine_tile(ui, cxr, it.id.room, *capture, *destination, &spot, &mut acts),
-        }
-        // The webcam in this stream's picture, above the tile (and below a floating window's own handle, drawn next).
+        // The webcam in this stream's picture goes between the tile's picture and its overlay, so the name tag and the
+        // stats are above it (and below a floating window's own handle, drawn next).
+        let mut pip_out: Option<pip::Out> = None;
+        let mut between: tile::Between = None;
         if let Some(&ci) = pairs.get(&it.id) {
             let cam = &items[ci];
             let pos = *geom.pip.entry(cam.id.clone()).or_default();
@@ -504,9 +550,25 @@ fn draw_arena(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, view: &StageView, i
                 cam,
                 hovered: hover == Some(i) && hover_ok,
                 dragged: matches!(drag, Some(Drag::Pip(d)) if d.cam == cam.id),
+                glide: geom.pip_glide.get(&cam.id).copied(),
+                now,
             };
-            let out = pip::show(ui, cxr, &input, pos, press, &live, &mut acts);
+            let (live, press, slot) = (&live, press, &mut pip_out);
+            between = Some(Box::new(move |ui: &mut Ui, acts: &mut Vec<UiAction>| *slot = Some(pip::show(ui, cxr, &input, pos, press, live, acts))));
+        }
+        match &it.kind {
+            Kind::Video(key) => tile::video_tile(ui, cxr, *key, &spot, &mut between, &mut acts),
+            Kind::Idle(key, info) | Kind::Audio(key, info) => tile::idle_tile(ui, cxr, *key, info, &spot, &mut acts),
+            Kind::Mine(capture, destination) => tile::mine_tile(ui, cxr, it.id.room, *capture, *destination, &spot, &mut between, &mut acts),
+        }
+        tile::run_between(&mut between, ui, &mut acts);
+        drop(between);
+        if let (Some(&ci), Some(out)) = (pairs.get(&it.id), pip_out) {
+            let cam = &items[ci];
             pip_geos.insert(cam.id.clone(), out.geo);
+            if out.glide_done {
+                geom.pip_glide.remove(&cam.id);
+            }
             if out.raise && float {
                 raise = Some(it.id.clone());
             }
@@ -612,15 +674,25 @@ fn draw_arena(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, view: &StageView, i
     // Release: a reorder drag swaps the two tiles.
     if drag.is_some() && !down {
         if let (Some(Drag::Reorder { id, .. }), Some(p)) = (drag.as_ref(), pointer)
-            && let Some(from) = geom.order.iter().position(|o| o == id)
-            && let Some(target) = vis.iter().zip(&rects).find(|(it, r)| &it.id != id && r.contains(p)).map(|(it, _)| it.id.clone())
-            && let Some(to) = geom.order.iter().position(|o| *o == target)
+            && let Some(i) = vis.iter().position(|it| &it.id == id)
         {
-            geom.order.swap(from, to);
+            // Both tiles glide to their cells; the dragged one starts where it was dropped (the replica lands it
+            // there first), the other from where it is drawn (its glide carries on, retargeted next frame).
+            let dropped = shown[i].translate(-off);
+            let target = vis.iter().zip(&rects).find(|(it, r)| &it.id != id && r.contains(p)).map(|(it, _)| it.id.clone());
+            let swap = geom.order.iter().position(|o| o == id).zip(target.and_then(|t| geom.order.iter().position(|o| *o == t)));
+            if let Some((from, to)) = swap {
+                geom.order.swap(from, to);
+                geom.glide.insert(id.clone(), geom::Glide::at_rest(dropped, now));
+            } else {
+                geom.glide.insert(id.clone(), geom::Glide { from: dropped, to: rects[i].translate(-off), start: now });
+            }
+            ui.ctx().request_repaint();
         }
-        // A webcam in picture that was moved goes to the nearest spot.
+        // A webcam in picture that was moved goes to the nearest spot, gliding there.
         if let Some(Drag::Pip(d)) = drag.as_ref() {
-            pip::release(d, &pip_geos, &mut geom.pip);
+            pip::release(d, &pip_geos, &mut geom.pip, &mut geom.pip_glide, now);
+            ui.ctx().request_repaint();
         }
         *drag = None;
     }
@@ -667,7 +739,7 @@ pub fn fullscreen_pip(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, parent: Str
     let Some(parent_item) = items.iter().find(|i| matches!(i.kind, Kind::Video(k) if k == parent)) else { return };
     let Some(&ci) = pairs.get(&parent_item.id) else { return };
     let cam = &items[ci];
-    let (pointer, down, press) = ui.input(|i| (i.pointer.latest_pos(), i.pointer.primary_down(), i.pointer.press_origin()));
+    let (pointer, down, press, now) = ui.input(|i| (i.pointer.latest_pos(), i.pointer.primary_down(), i.pointer.press_origin(), i.time));
     if let (Some(Drag::Pip(d)), Some(p), true) = (drag.as_ref(), pointer, down) {
         pip::apply_drag(d, p, &mut geom.pip);
     }
@@ -680,14 +752,20 @@ pub fn fullscreen_pip(ui: &mut Ui, cx: &mut Cx, st: &mut StageState, parent: Str
         cam,
         hovered: false,
         dragged: matches!(drag, Some(Drag::Pip(d)) if d.cam == cam.id),
+        glide: geom.pip_glide.get(&cam.id).copied(),
+        now,
     };
     let mut acts: Vec<UiAction> = Vec::new();
     let out = pip::show(ui, cx, &input, pos, press, &|r| r, &mut acts);
+    if out.glide_done {
+        geom.pip_glide.remove(&cam.id);
+    }
     if drag.is_none() {
         *drag = out.started.map(Drag::Pip);
     }
     if !down && let Some(Drag::Pip(d)) = drag.as_ref() {
-        pip::release(d, &HashMap::from([(cam.id.clone(), out.geo)]), &mut geom.pip);
+        pip::release(d, &HashMap::from([(cam.id.clone(), out.geo)]), &mut geom.pip, &mut geom.pip_glide, now);
+        ui.ctx().request_repaint();
         *drag = None;
     }
     for a in acts {

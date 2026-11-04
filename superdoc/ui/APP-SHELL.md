@@ -244,6 +244,36 @@ cancelled) brings the stage home. *Left out:* a modal opened from it (Rename, St
 wants its input there (a click on it works; Escape in the popped window does not reach it). Per-stream pop-outs are unchanged
 (`popout.rs`, `popout_survives_resume`).
 
+**Stage motion and draw order** (task I12, 2026-11-04; `stage/geom.rs` `ease`, `Glide`, `stage/mod.rs` `draw_arena`, `stage/pip.rs`
+`PipGlide`; replica `.st-tile` / `.arena.nofx` / `.st-tile.dragging` / `.pip.snap`).
+- **Tiles glide.** When a tile's layout rect changes (a swap, a layout switch, "Reset sizes", a bar double-click, a stream added or
+  removed so the row count or the aspect fit changes) it slides to the new rect over **0.2 s with the CSS `ease` curve**
+  (`cubic-bezier(.25,.1,.25,1)`, `geom::ease`; egui's own animations are linear). State per view and tile: `ViewGeom::glide`
+  (`geom::Glide { from, to, start }`, **arena-relative**, so a moving arena carries a glide along); each frame `Glide::step` takes
+  the layout rect, a changed target starts a new glide **from where the tile is drawn now** (a swap in the middle of a glide does
+  not jump). Drawing, hit-testing, hover and the PIP use the drawn rect; the drop targets use the layout rect.
+- **What does not glide** (the replica's `nofx`): a bar, a floating window or its resize handle being dragged (the tile must stay
+  1:1 under the pointer; the other tiles of a bar drag follow it at once); a changed **arena size** (window resize, stage
+  fullscreen in or out, the people strip hidden: nothing wanders, "streams do not jump when the bar fades" stays true because the
+  arena does not change then); a tile that appears. The dragged **reorder** tile follows the pointer without easing; let go, it
+  glides from where it was dropped to its cell (the swapped tile to its new one), as the replica lands it first and then glides.
+- **The PIP glides** after a drag (`.pip.snap`, **0.16 s `ease`**, position only): on release the PIP goes from where it was let
+  go to its spot (`pip::PipGlide { from (tile-relative), start }`; its end is the spot as the layout has it each frame, so a gliding
+  tile carries it). The drag itself is 1:1: it is applied from the pointer's distance to the press **before** the frame is laid
+  out (like bars). A resize does not glide. *Why:* the user, from their own test of the real client: "Moving streams around
+  (swapping them) is not as smooth as on the artifact" and "Moving the webcam around when in webcam PIP mode isnt as smooth as the
+  artifact". Not done: egui has no reduced-motion style, so the replica's `prefers-reduced-motion` has no twin.
+- **Repaints** are requested only while a glide runs (`request_repaint` per frame for 0.2 / 0.16 s, plus one on the release that
+  starts one); idle stays idle (rig: 0-1 CPU ticks per 3 s with nothing playing, before and after a swap).
+- **Rig names:** `tile.N` is the **drawn** rect (mid-glide while one runs), `tile_goal.N` the layout rect it is gliding to and
+  `cell.N` the grid cell; `pip.N` is the drawn PIP. Scripts that click a tile wait for the glide (0.2 s) or use `tile_goal.N`.
+- **Draw order on a tile** (user: "The PIP webcam is drawn above the name in a screenshare (Should be below it, so its visible)"):
+  picture, then the webcam in picture, then the name tag with its stats, the hover buttons and the placeholder chips. A video is a
+  wgpu paint callback, so what covers what is the order shapes and callbacks are added to the layer: `tile::video_tile` and
+  `tile::mine_tile` take a `Between` hook (`run_between`) that `draw_arena` fills with `pip::show` and that runs after the tile's
+  picture and before its overlay. (Before I12 the PIP was drawn after the whole tile and covered the name when it sat on the top
+  left; the hover buttons now also sit above the PIP, and win a press over it.)
+
 **Fullscreen chrome** (task I3, `stage/chrome.rs`, the pure rule; the replica's behaviour and the user's request #136): the bar's
 fullscreen button makes the main window fullscreen with **only the stage** drawn (`Nav::stage_fullscreen`; no sidebar, header or
 side bars; Escape leaves, `App::update`). There the strip and bar **lie over the stage** (the arena keeps the whole window minus
@@ -297,7 +327,7 @@ re-derive the split every frame and silently break when content height changes.
   the middle:* a PIP pushed into a corner could otherwise only shrink, and in Floating its handle would land on the window's
   own; the PIP is registered above its tile and below the floating window's grip, so a press on it never moves or resizes the
   tile under it. Deviations from the replica: **square corners** (a video is a wgpu paint callback that cannot be clipped to a
-  rounded rect; an outline and a shadow set it off) and **no snap glide** (the spot is the state, not a transition).
+  rounded rect; an outline and a shadow set it off) and, until I12, **no snap glide** (see "Stage motion" below: the snap glides now).
 - **Fullscreen and pop-out:** the stage's own fullscreen and a popped-out stage draw the PIP with the stage; **stream
   fullscreen** (`Nav::fullscreen`, the double-click one) calls `stage::fullscreen_pip` for the parent's webcam (same
   spot, same size, same drag). A **stream pop-out window** (`popout.rs`) of the parent shows that stream alone, no PIP,

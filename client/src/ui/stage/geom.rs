@@ -372,6 +372,93 @@ pub fn resize_pip(g: &PipGeo, c: Corner, d: egui::Vec2, p: &mut PipPos) {
     store(g, Rect::from_min_size(pos2(nx, ny), vec2(nw, nw / a)), p);
 }
 
+// ---- Glides (the replica's `.st-tile` and `.pip.snap` transitions) -----------------------------------------------
+
+/// How long a tile takes to glide to a new rect (`.st-tile { transition: left .2s ease, ... }`).
+pub const TILE_GLIDE: f64 = 0.2;
+/// How long a webcam in picture glides to its spot after a drag (`.pip.snap { transition: left .16s ease, ... }`).
+pub const PIP_GLIDE: f64 = 0.16;
+
+/// CSS `ease`, `cubic-bezier(.25, .1, .25, 1)`: progress `t` in 0..=1 of the time to progress of the way. egui's own
+/// animations are linear (`animate_value_with_time`), so the replica's curve is solved here: find the bezier
+/// parameter whose x is `t` (Newton, with bisection as the fallback), return its y.
+pub fn ease(t: f32) -> f32 {
+    const X1: f32 = 0.25;
+    const Y1: f32 = 0.1;
+    const X2: f32 = 0.25;
+    const Y2: f32 = 1.0;
+    let t = t.clamp(0.0, 1.0);
+    let bez = |a: f32, b: f32, s: f32| 3.0 * a * (1.0 - s) * (1.0 - s) * s + 3.0 * b * (1.0 - s) * s * s + s * s * s;
+    let dx = |s: f32| 3.0 * X1 * (1.0 - s) * (1.0 - s) + 6.0 * (X2 - X1) * (1.0 - s) * s + 3.0 * (1.0 - X2) * s * s;
+    let mut s = t;
+    for _ in 0..8 {
+        let err = bez(X1, X2, s) - t;
+        if err.abs() < 1e-6 {
+            return bez(Y1, Y2, s);
+        }
+        let d = dx(s);
+        if d.abs() < 1e-6 {
+            break;
+        }
+        s -= err / d;
+    }
+    let (mut lo, mut hi) = (0.0_f32, 1.0_f32);
+    s = t;
+    for _ in 0..24 {
+        if bez(X1, X2, s) < t {
+            lo = s;
+        } else {
+            hi = s;
+        }
+        s = (lo + hi) / 2.0;
+    }
+    bez(Y1, Y2, s)
+}
+
+/// `a` to `b`, `k` of the way (componentwise: position and size both glide, like `left/top/width/height`).
+pub fn lerp_rect(a: Rect, b: Rect, k: f32) -> Rect {
+    let l = |x: f32, y: f32| x + (y - x) * k;
+    Rect::from_min_max(pos2(l(a.min.x, b.min.x), l(a.min.y, b.min.y)), pos2(l(a.max.x, b.max.x), l(a.max.y, b.max.y)))
+}
+
+/// One tile's glide from where it was drawn (`from`) to its layout rect (`to`), both arena-relative so a moving
+/// arena (window resize, fullscreen) carries them along. `start` is `egui` input time in seconds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Glide {
+    pub from: Rect,
+    pub to: Rect,
+    pub start: f64,
+}
+
+impl Glide {
+    /// A tile at rest at `r`.
+    pub fn at_rest(r: Rect, now: f64) -> Self {
+        Glide { from: r, to: r, start: now }
+    }
+
+    /// Where it is drawn at `now`, and whether it has arrived.
+    pub fn at(&self, now: f64, dur: f64) -> (Rect, bool) {
+        let t = ((now - self.start) / dur).clamp(0.0, 1.0) as f32;
+        if t >= 1.0 { (self.to, true) } else { (lerp_rect(self.from, self.to, ease(t)), false) }
+    }
+
+    /// The glide of the next frame for a layout that now says `target`: a tile with no glide yet appears there;
+    /// `snap` (a drag, a resized window) puts it there at once; a changed target starts a new glide from where the
+    /// tile is drawn now (so a swap in the middle of a glide does not jump); an unchanged one carries on.
+    pub fn step(prev: Option<Glide>, target: Rect, now: f64, snap: bool, dur: f64) -> Glide {
+        match prev {
+            Some(g) if !snap && same_rect(g.to, target) => g,
+            Some(g) if !snap => Glide { from: g.at(now, dur).0, to: target, start: now },
+            _ => Glide::at_rest(target, now),
+        }
+    }
+}
+
+/// Rects equal to within a hundredth of a point (a layout recomputed every frame must not restart a glide over float noise).
+fn same_rect(a: Rect, b: Rect) -> bool {
+    (a.min - b.min).abs().max_elem() < 0.01 && (a.max - b.max).abs().max_elem() < 0.01
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +467,48 @@ mod tests {
 
     fn center_of(p: &Placed, bar: Bar) -> f32 {
         p.bars.iter().find(|(b, _)| *b == bar).map(|(b, r)| bar_center(*b, *r)).unwrap()
+    }
+
+    #[test]
+    fn ease_is_the_css_ease_curve() {
+        assert_eq!(ease(0.0), 0.0);
+        assert!((ease(1.0) - 1.0).abs() < 1e-6);
+        // Reference points of cubic-bezier(.25,.1,.25,1) (browsers): about .41 at 25 %, .80 at 50 %, .96 at 75 %.
+        assert!((ease(0.25) - 0.4085).abs() < 0.01, "{}", ease(0.25));
+        assert!((ease(0.5) - 0.8024).abs() < 0.01, "{}", ease(0.5));
+        assert!((ease(0.75) - 0.9604).abs() < 0.01, "{}", ease(0.75));
+        // Monotonic, never past the target.
+        let mut last = 0.0;
+        for i in 0..=100 {
+            let e = ease(i as f32 / 100.0);
+            assert!(e >= last - 1e-6 && e <= 1.0 + 1e-6);
+            last = e;
+        }
+    }
+
+    #[test]
+    fn a_glide_runs_from_where_the_tile_is_drawn_to_the_new_rect_and_ends_exactly_on_it() {
+        let a = Rect::from_min_size(pos2(0.0, 0.0), vec2(100.0, 50.0));
+        let b = Rect::from_min_size(pos2(200.0, 40.0), vec2(300.0, 150.0));
+        // New tile: at rest. Unchanged target: untouched. Snap: at rest.
+        let g = Glide::step(None, a, 1.0, false, TILE_GLIDE);
+        assert_eq!(g, Glide::at_rest(a, 1.0));
+        assert_eq!(Glide::step(Some(g), a, 1.1, false, TILE_GLIDE), g);
+        assert_eq!(Glide::step(Some(g), b, 1.1, true, TILE_GLIDE), Glide::at_rest(b, 1.1));
+        // A new target starts a glide.
+        let g = Glide::step(Some(g), b, 2.0, false, TILE_GLIDE);
+        assert_eq!(g.at(2.0, TILE_GLIDE), (a, false));
+        let (mid, done) = g.at(2.1, TILE_GLIDE);
+        assert!(!done && mid.min.x > 100.0 && mid.min.x < 200.0 && mid.width() > 100.0 && mid.width() < 300.0);
+        assert_eq!(g.at(2.2, TILE_GLIDE), (b, true));
+        assert_eq!(g.at(9.0, TILE_GLIDE), (b, true));
+        // Retargeting in mid glide continues from the drawn rect.
+        let c = Rect::from_min_size(pos2(0.0, 300.0), vec2(100.0, 50.0));
+        let g2 = Glide::step(Some(g), c, 2.1, false, TILE_GLIDE);
+        assert_eq!(g2.from, mid);
+        // Float noise does not restart it.
+        let noisy = b.translate(vec2(0.001, 0.0));
+        assert_eq!(Glide::step(Some(g), noisy, 2.1, false, TILE_GLIDE), g);
     }
 
     #[test]

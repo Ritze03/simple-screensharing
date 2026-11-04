@@ -11,7 +11,11 @@
 //! - **Square corners**, unlike the replica's 6 px radius: a video is a wgpu paint callback that cannot be clipped to
 //!   a rounded rect (the tiles mask their corners with the stage colour, which would show here as black corners
 //!   over the screen share). A thin outline and a shadow set it off instead.
-//! - **No snap animation** (the replica glides for .16 s): the spot is the state, not a transition.
+//! - **The snap glides** (the replica's `.pip.snap`, .16 s `ease`, task I12): the spot is the state, the glide only
+//!   what is drawn. A drag is 1:1 under the pointer (applied before the layout, [`apply_drag`]); on release the
+//!   PIP glides from where it was let go to its spot ([`PipGlide`]: the start, tile-relative, so the glide also
+//!   follows a tile that is gliding itself). A resize does not glide. *Why:* the user, "Moving the webcam around
+//!   when in webcam PIP mode isnt as smooth as the artifact".
 
 use egui::{Color32, CornerRadius, CursorIcon, Id, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use simple_screensharing_client::decode::render::Fit;
@@ -43,6 +47,14 @@ pub(super) struct PipDragState {
     pub from: PipGeo,
 }
 
+/// A PIP gliding to its spot after a drag: where it was let go (the rect's top left, tile-relative) and when. The
+/// end is the PIP's spot as the layout has it now, so a tile that moves meanwhile carries it along.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PipGlide {
+    pub from: egui::Vec2,
+    pub start: f64,
+}
+
 /// One PIP to draw.
 pub(super) struct Input<'a> {
     /// Name stem for the rig's dump (`pip.<name>`, `pip.<name>.grip`).
@@ -59,6 +71,9 @@ pub(super) struct Input<'a> {
     pub hovered: bool,
     /// This PIP is being dragged.
     pub dragged: bool,
+    /// The glide to its spot, if one runs, and the time (egui input time, seconds).
+    pub glide: Option<PipGlide>,
+    pub now: f64,
 }
 
 pub(super) struct Out {
@@ -67,6 +82,8 @@ pub(super) struct Out {
     /// A press on it: a floating parent comes to the front.
     pub raise: bool,
     pub started: Option<PipDragState>,
+    /// The glide is over (or was never there): the caller drops it.
+    pub glide_done: bool,
 }
 
 /// Draw one PIP in its parent tile and read its input. `live` limits input to what the fullscreen chrome does
@@ -74,7 +91,18 @@ pub(super) struct Out {
 pub(super) fn show(ui: &mut Ui, cx: &Cx, i: &Input, pos: PipPos, press: Option<Pos2>, live: &dyn Fn(Rect) -> Rect, acts: &mut Vec<UiAction>) -> Out {
     let geo = geom::layout_pip(i.tile.width(), i.tile.height(), i.parent_ar, i.cam.ar, i.crop, &pos);
     let off = i.tile.min.to_vec2();
-    let rect = geo.rect.translate(off);
+    let mut rect = geo.rect.translate(off);
+    // The glide to the spot after a drag; the spot itself (`geo`) is already where it ends.
+    let mut glide_done = true;
+    if let Some(g) = i.glide.filter(|_| !i.dragged) {
+        let t = ((i.now - g.start) / geom::PIP_GLIDE).clamp(0.0, 1.0) as f32;
+        if t < 1.0 {
+            glide_done = false;
+            let min = (g.from + (geo.rect.min.to_vec2() - g.from) * geom::ease(t)).to_pos2() + off;
+            rect = Rect::from_min_size(min, rect.size());
+            ui.ctx().request_repaint();
+        }
+    }
     let painter = ui.painter().clone();
     painter.add(egui::Shadow { offset: [0, 6], blur: 18, spread: 0, color: Color32::from_black_alpha(140) }.as_shape(rect, CornerRadius::ZERO));
     match &i.cam.kind {
@@ -137,7 +165,7 @@ pub(super) fn show(ui: &mut Ui, cx: &Cx, i: &Input, pos: PipPos, press: Option<P
     };
     let resp = resp.on_hover_text(tip);
 
-    let mut out = Out { geo, raise: hr.is_pointer_button_down_on() || resp.is_pointer_button_down_on(), started: None };
+    let mut out = Out { geo, raise: hr.is_pointer_button_down_on() || resp.is_pointer_button_down_on(), started: None, glide_done };
     if let Some(origin) = press {
         let begin = |kind| PipDragState { cam: i.cam.id.clone(), kind, origin, from: geo };
         if hr.drag_started() {
@@ -170,11 +198,19 @@ pub(super) fn apply_drag(d: &PipDragState, pointer: Pos2, pip: &mut std::collect
     }
 }
 
-/// The pointer was released: a moved PIP goes to the nearest spot, from where it was drawn this frame.
-pub(super) fn release(d: &PipDragState, geos: &std::collections::HashMap<ItemId, PipGeo>, pip: &mut std::collections::HashMap<ItemId, PipPos>) {
+/// The pointer was released: a moved PIP goes to the nearest spot, from where it was drawn this frame, and glides
+/// there from where it was let go.
+pub(super) fn release(
+    d: &PipDragState,
+    geos: &std::collections::HashMap<ItemId, PipGeo>,
+    pip: &mut std::collections::HashMap<ItemId, PipPos>,
+    glides: &mut std::collections::HashMap<ItemId, PipGlide>,
+    now: f64,
+) {
     if d.kind == PipDrag::Move
         && let (Some(pos), Some(geo)) = (pip.get_mut(&d.cam), geos.get(&d.cam))
     {
         geom::snap_pip(geo, pos);
+        glides.insert(d.cam.clone(), PipGlide { from: geo.rect.min.to_vec2(), start: now });
     }
 }
