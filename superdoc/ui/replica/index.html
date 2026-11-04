@@ -1074,7 +1074,7 @@ function stTile(it, combined, cam) {
   const pic = mine && !s.cam ? `<div class="mine-pic">${ic("cast")}<span>Your screen · live</span></div>` : screenPic(s.pic);
   const tagIc = s.cam ? ic("videocam", mine ? "live" : "") : mine ? ic("cast", "live") : !s.audio ? ic("volume_off") : muted ? ic("volume_off", "off") : ic("volume_up");
   const lb = esc(combined ? `${s.label} · ${r.name}` : s.label);
-  const tag = `<span class="tag" title="${mine ? "You" : esc(s.owner)} · ${lb}">${tagIc}<span>${esc(mine ? "You" : s.owner)}</span><span class="lb">· ${lb}</span></span>`;
+  const tag = `<span class="tag${S.tagsAlways ? "" : " hover-ui"}" title="${mine ? "You" : esc(s.owner)} · ${lb}">${tagIc}<span>${esc(mine ? "You" : s.owner)}</span><span class="lb">· ${lb}</span></span>`;
   const tools = `<div class="tools hover-ui">${w ? `<button type="button" class="round-btn" title="Pop out to its own window" aria-label="Pop out" data-act="pop:${k}">${ic("open_in_new")}</button>
     <button type="button" class="round-btn" title="Fullscreen" aria-label="Fullscreen" data-act="fs:${k}">${ic("fullscreen")}</button>` : ""}
     <button type="button" class="round-btn" title="Volume and more" aria-label="Stream menu" data-ctx="${k}">${ic("more_horiz")}</button></div>`;
@@ -1180,6 +1180,7 @@ function layoutMenu() {
   return `<div class="ml">Layout</div>${LAYOUTS.map(([k, icon, n, sub]) => `<button type="button" class="mi two${V().layout === k ? " on" : ""}" data-act="layout:${k}">${ic(icon)}<span class="t">${n}<small>${sub}</small></span>${V().layout === k ? ic("check", "chk") : ""}</button>`).join("")}
     <div class="msep"></div>
     <div class="mrow"><span class="cbx${V().pip ? " on" : ""}" role="checkbox" tabindex="0" aria-checked="${V().pip}" data-act="pip" title="A webcam sits inside its owner's screen share, if they have one running"><span class="box">${ic("check")}</span>Webcam in picture</span></div>
+    <div class="mrow"><span class="cbx${S.tagsAlways ? " on" : ""}" role="checkbox" tabindex="0" aria-checked="${!!S.tagsAlways}" data-act="tagsalways" title="Off: name and audio status only show while you hover a stream"><span class="box">${ic("check")}</span>Always show names</span></div>
     <div class="msep"></div>${mi("restart_alt", "Reset sizes and positions", "resetlayout")}`;
 }
 function roomMenu() {
@@ -1544,7 +1545,7 @@ function applyPreset(key) {
 const framePt = (cx, cy) => { const fr = frame.getBoundingClientRect(); return { x: (cx - fr.left) / SCALE, y: (cy - fr.top) / SCALE }; };
 const exitFs = () => { S.view = S.fsBack; };
 const enterFs = (key) => { if (S.view !== "fullscreen") S.fsBack = S.view; Object.assign(S, { fsKey: key, view: "fullscreen" }); };
-const STAY = new Set(["fps", "preset", "pip", "campick", "auto", "rename", "cancel", "forgetask", "mute", "level", "stats"]); /* menu actions that keep the menu open */
+const STAY = new Set(["fps", "preset", "pip", "tagsalways","campick", "auto", "rename", "cancel", "forgetask", "mute", "level", "stats"]); /* menu actions that keep the menu open */
 document.addEventListener("click", (e) => {
   const pre = e.target.closest("[data-preset]");
   if (pre) return applyPreset(pre.dataset.preset);
@@ -1643,6 +1644,7 @@ document.addEventListener("click", (e) => {
     case "campick": S.camName = arg; S.camMode = CAMS.find((c) => c.name === arg).modes[0]; break;
     case "camset": if (S.view === "fullscreen") exitFs(); S.modal = "cam"; break;
     case "pip": V().pip = !V().pip; break;
+    case "tagsalways": S.tagsAlways = !S.tagsAlways; break;
     case "chsrc": render(); return toast("The system's screen and window picker opens here", "swap_horiz");
     case "audio":
       S.audioOn = !S.audioOn; S.audioSrc = S.audioOn ? "Desktop audio" : "No audio"; /* the button means the whole desktop; a single app is in the arrow's list */
