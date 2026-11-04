@@ -1,5 +1,9 @@
 # Own-tile live preview (the sharer sees their own share)
 
+> **Update 2026-11-04 (task #132): the preview is now up to 1920x1080 (was 640x360).** *Why (user request
+> 2026-11-04):* "Fix: The own screenshare preview has a really low resolution." The stage's own tile fills the
+> window, which the old card-sized preview did not. Numbers: "Size and fps, measured" below.
+>
 > **Status (2026-10-15, task #78): live again, in a different shape.** The old always-on 320x180
 > self-preview branch was removed (see "History"); since #78 the sharer's own tile (on the stage
 > since I1/I6, 2026-11-04; before that a card in the room's "Sharing in this room" grid) shows a live, downscaled picture of what is being captured, **only while
@@ -16,12 +20,34 @@
   `live_preview_frames()` (buffers that reached the sink, for verification). UI: `ui/mod.rs`
   `App::poll_live_previews` + `Shell::live_previews`, own tile `ui/stage/tile.rs` `mine_tile` (it was `ui/room.rs` `my_card` before the stage).
 - **Branch:** `tee ! valve(drop, forward-sticky-events) + RateCap probe (30 fps) ! queue(leaky, 1)
-  ! vapostproc | videoscale ! videoconvert ! capsfilter(RGBA, fitted size, 30/1) ! appsink`. Size: the source
-  fitted into 640x360, aspect kept, never upscaled, even sides (`fit_live_size`), written into the capsfilter
-  when the branch opens. The branch is the same in both [`CaptureDomain`]s except for the scaler: in the GPU
-  domain `vapostproc` scales on the GPU and downloads only the small RGBA picture (~28 MB/s at 640x360x30,
-  nothing like the 240 fps full-size stream); in the System domain it is `videoscale ! videoconvert`. One
-  branch per capture, shown in every room's own tile of that capture; the encode branches are not touched.
+  ! vapostproc | videoscale ! videoconvert ! capsfilter(BGRA, fitted size, 30/1) ! appsink`. Size: the source
+  fitted into **1920x1080**, aspect kept, never upscaled, even sides (`fit_live_size`), written into the capsfilter
+  when the branch opens (so a 720p source is shown at 1280x720 and a 4K one is scaled down by the GPU). The branch
+  is the same in both [`CaptureDomain`]s except for the scaler: in the GPU domain `vapostproc` scales on the GPU
+  and downloads only the preview-sized picture (up to ~250 MB/s of BGRA at 1080p x 30, nothing like the
+  240 fps full-size stream); in the System domain it is `videoscale ! videoconvert`. One branch per capture, shown
+  in every room's own tile of that capture; the encode branches are not touched. The format is BGRA, not RGBA:
+  `vapostproc` writes an "RGBA" caps as A,B,G,R bytes on this stack (the preview came out red); `sample_to_live_frame`
+  swizzles to RGBA for egui. Colours checked on the vkcube at 1080p (teal logo stays teal).
+- **Size and fps, measured (task #132, 2026-11-04):** headless rig, release, GPU domain, H.265 240 fps `quality`,
+  vkcube, sharer process CPU over 10 s (percent of one core), window focused vs unfocused (valve closed):
+
+  | preview | sharer CPU, unfocused | focused | encoder output fps (unfocused / focused) |
+  | --- | --- | --- | --- |
+  | 640x360 @ 30 (old) | 8 % | 14 % (+6) | 232.9 / 232.9 |
+  | 1280x720 @ 30 | 8 % | 20 % (+12) | 232.8 / 233.6 |
+  | **1920x1080 @ 30 (now)** | 8 % | 28 % (+20) | 232.8 / 233.0 |
+  | 1920x1080 @ 60 | 8 % | 36 % (+28) | 233.1 / 227.6 (min 202) |
+
+  Capture stayed at 239.7-239.8 fps in every row except the 60 fps one (236.6). The cost grows with the pixels
+  (download, BGRA to RGBA swizzle, upload of the texture, 33 ms repaint), not with the source; **30 fps at 1080p
+  does not move the encoder, 60 fps does**, so the fps stays 30. *Why not size to the tile's real pixels:* the
+  size is fixed when the branch opens, rewriting the capsfilter on a running branch sends a reconfigure up the live
+  tee (the thing the design avoids), and the tile is at most window-sized anyway; 1080p already covers a 1080p
+  window's tile with 1:1 to 1.3x. *Not NV12 (1.5 B/px, the renderer can draw it):* 1080p30 BGRA does not touch the
+  encoder and runs only while the app is focused (so not while the user is in a game); revisit if the 20 points
+  matter. Sharpness: a `timeoverlay` test pattern in the 1506x846 own tile, 640x360 (soft, 2.4x stretched) against
+  1080p (crisp).
 - **Focus gating, so unfocused costs nothing:** the own tile pushes `UiAction::LivePreviewSeen(capture)` on
   every pass it is painted with the window focused and not minimized (`viewport().focused` /
   `.minimized`). `poll_live_previews` opens the valve while that was within 0.6 s (`LIVE_PREVIEW_GRACE`),

@@ -115,7 +115,7 @@ reconnecting, not connected) keeps the scrolling body with its banner and a `⋯
 | module | |
 | --- | --- |
 | `stage.js` | the stage: tiles (watched video, idle "X is sharing Y", own share), arena layout, resize bars and drags, the people strip and hover card, the viewers dropdown, fullscreen + its auto-hiding chrome, the window listeners |
-| `stage-state.js` | what a view shows (`collect`) and the per-view layout (`vg`: order, z, floating rects, grid; UI-private, per session, not persisted), keyed by `stableKey` |
+| `stage-state.js` | what a view shows (`collect`) and the per-view layout (`vg`: order, z, floating rects, grid; UI-private, per session, not persisted), keyed by `stableKey`. The Layout switches (layout Split / Crop / Float per view, Webcam in picture per view, Hide own, Always show names, Show stats) are different: they live in `S.stage` and are saved (`store.js` `persistStage` into `settings.stage`, keyed by saved room) |
 | `stage-geom.js` | the pure maths, a line-for-line port of native `stage/geom.rs` (`bestRows`, `place`, `dragBar`, `fitFloat`, `resizeFloat`, `cardKeeps`), same tests |
 | `chrome.js` | the pure fullscreen auto-hide rule, a port of native `stage/chrome.rs`, same tests |
 | `bar.js` | the control bar (split buttons, groups, Leave, pop out, fullscreen) |
@@ -168,7 +168,7 @@ preset as `latencyMode` ("realtime" = Performance, "quality") and `gopMs` (`ui/s
 as explicit `latencyMode` / `gopMs` (which override the preset's); editing one by hand sets the other two from `presetOf(latencyMode, gopMs)`, so a combination that matches no preset leaves **no preset lit**
 (`preset: ""`). A live edit restarts the destination like a preset does, and the modal's note says so ("Changing framerate, codec, preset, encoding or keyframe restarts the stream"). An older stored
 config with only a `preset` loads with that preset's values. *Why:* the user: "The settings for the keyframe and the Performance/Quality setting should still be shown (right now only accessible
-through the presets Text/Quality/Gaming itself)." **Show stats** is one Layout-menu checkbox for every watched stream (`S.stage.showStats`, off until switched on, hover-only like before); the user:
+through the presets Text/Quality/Gaming itself)." **Show stats** is one Layout-menu checkbox for every watched stream (`S.stage.showStats`, saved, off by default, hover-only like before); the user:
 ""Show stats on the stream" should be inside of the "LAYOUT" dropdown and not per individual stream."
 `store.js` loads a stored `balanced` / `low_latency` as `quality`.
 
@@ -222,7 +222,7 @@ sizes (1920x1080, 1280x720, 960x540, 640x480, 320x240) that fit, at 30 fps (and 
 track really delivers. Your webcam is an item of your stage (`<room>/me/cam`, tile `You · Webcam`, settings button, `⋯` menu Webcam settings… / Stop webcam). Someone else's is an idle tile and, when
 watched, a tile whose tag has the `videocam` icon and whose menu says it has no audio.
 
-**Webcam in picture** (Layout menu checkbox, per view, off until switched on; native I8). Port, line for line like `stage-geom.js`: `layoutPip`, `pipAt`, `nearestSpot`, `snapPip`, `movePip`, `resizePip` of
+**Webcam in picture** (Layout menu checkbox, per view, saved, on by default: `S.stage.pipOff` holds the views where it is switched off; native I8). Port, line for line like `stage-geom.js`: `layoutPip`, `pipAt`, `nearestSpot`, `snapPip`, `movePip`, `resizePip` of
 `client/src/ui/stage/geom.rs` with the same tests (`dev/tests.js` "pip geometry"), the pairing `pipPairs` of `stage/mod.rs` (`dev/tests.js` "pip pairing"), `pip.js` for `stage/pip.rs`. Inset 12, minimum width 72,
 default `{ w: .24, spot: [2, 2] }`; the size is a fraction of the picture's width and a spot is column and row 0..2 without (1,1) (corners and side middles). A drag moves it free, clamped to the visible
 picture (also in Crop), and on release it **snaps to the nearest spot** and glides there (.16 s, not under `prefers-reduced-motion`); the handle (20 px) is on the corner facing the middle of the picture and resizes with

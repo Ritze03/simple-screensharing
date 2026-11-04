@@ -1337,11 +1337,17 @@ const PREVIEW_BRANCH_FRAMERATE: u32 = 1;
 
 /// The sharer's own live preview (task #78, user request 2026-10-15): its frame
 /// rate, and the box its size is fitted into (aspect kept, never upscaled).
-/// 640x360 at 30 fps is ~28 MB/s of RGBA and one small GPU scale; the full
-/// 240 fps / 1080p+ capture is never touched.
+/// 1920x1080 at 30 fps is ~250 MB/s of BGRA (download + upload) and one GPU
+/// scale; the full 240 fps capture is never touched. Measured in the rig (H.265
+/// 240 fps, sharer CPU on top of 8 % idle): 640x360 +6 points, 1280x720 +12,
+/// 1920x1080 +20, 1920x1080 at 60 fps +28 with the encoder dipping to 202 fps;
+/// at 30 fps the encoder output stays at 233 fps. `Why 1080p:` the own tile on
+/// the stage fills the window, 640x360 was visibly soft (user, 2026-11-04: "The
+/// own screenshare preview has a really low resolution"); see
+/// `superdoc/features/self-preview.md`. Do not raise the fps without re-measuring.
 const LIVE_PREVIEW_FPS: u32 = 30;
-const LIVE_PREVIEW_MAX_W: u32 = 640;
-const LIVE_PREVIEW_MAX_H: u32 = 360;
+const LIVE_PREVIEW_MAX_W: u32 = 1920;
+const LIVE_PREVIEW_MAX_H: u32 = 1080;
 /// The branch's pixel format. `Why BGRA and not RGBA:` `vapostproc` on this stack
 /// labels its "RGBA" output but writes the bytes as A,B,G,R (measured with a solid
 /// 0xff2040 NV12 frame: RGBA gave `ff 35 2c f9`, BGRA gave the right `35 2c f9 ff`),
@@ -9645,8 +9651,8 @@ pub mod branch {
             assert!((20..=75).contains(&opened), "2 s open should give ~60 frames at 30 fps, got {opened}");
             let sample = live.sink.try_pull_sample(gst::ClockTime::from_mseconds(500)).expect("a frame");
             let f = super::super::sample_to_live_frame(&sample).unwrap();
-            assert_eq!((f.width, f.height), (640, 360), "720p fits 640x360");
-            assert_eq!(f.rgba.len(), 640 * 360 * 4);
+            assert_eq!((f.width, f.height), (1280, 720), "a 720p source is passed on at its own size (never upscaled)");
+            assert_eq!(f.rgba.len(), 1280 * 720 * 4);
             assert!(f.rgba.chunks_exact(4).all(|p| p[3] == 255));
 
             live.set(tee, false);
@@ -9676,11 +9682,14 @@ pub mod branch {
 
         #[test]
         fn live_preview_size_fits_the_box_keeps_aspect_and_never_upscales() {
-            assert_eq!(super::super::fit_live_size(1920, 1080, 640, 360), (640, 360));
-            assert_eq!(super::super::fit_live_size(3840, 1080, 640, 360), (640, 180));
-            assert_eq!(super::super::fit_live_size(1080, 1920, 640, 360), (202, 360));
-            assert_eq!(super::super::fit_live_size(320, 200, 640, 360), (320, 200));
-            assert_eq!(super::super::fit_live_size(0, 0, 640, 360), (640, 360));
+            let (mw, mh) = (super::super::LIVE_PREVIEW_MAX_W, super::super::LIVE_PREVIEW_MAX_H);
+            assert_eq!((mw, mh), (1920, 1080));
+            assert_eq!(super::super::fit_live_size(1920, 1080, mw, mh), (1920, 1080));
+            assert_eq!(super::super::fit_live_size(3840, 2160, mw, mh), (1920, 1080));
+            assert_eq!(super::super::fit_live_size(3840, 1080, mw, mh), (1920, 540));
+            assert_eq!(super::super::fit_live_size(1080, 1920, mw, mh), (608, 1080));
+            assert_eq!(super::super::fit_live_size(320, 200, mw, mh), (320, 200));
+            assert_eq!(super::super::fit_live_size(0, 0, mw, mh), (mw, mh));
         }
 
         fn set_gate_closed(built: &super::super::CapturePipeline, closed: bool) {
