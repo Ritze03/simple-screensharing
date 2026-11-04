@@ -12,7 +12,7 @@
 
 use egui::{Align, CornerRadius, Margin, Rect, Sense, Stroke, StrokeKind, Ui, vec2};
 use simple_screensharing_client::audio::{AudioChoice, AudioGroup};
-use simple_screensharing_client::capture::destination::{DestinationState, EncoderLimited};
+use simple_screensharing_client::capture::destination::DestinationState;
 use simple_screensharing_client::presets::{self, EncoderPreset, EncoderTuning};
 use simple_screensharing_client::protocol::StreamKind;
 use simple_screensharing_client::rooms::{BandwidthMode, WebcamSettings};
@@ -120,12 +120,9 @@ pub(super) fn share_menu(ui: &mut Ui, cx: &Cx, room: RoomHandle, state: ShareSta
     });
     let row = HBox::new("share_menu_caption", 18.0).pad(theme::S2, theme::S2).slots(&[FILL]).show(ui);
     row.text(ui, 0, &preset_caption(&v), font(Weight::Regular, theme::FS_TINY), theme::TEXT_DIM, Align::Min);
-    // What went wrong under a live share: the capture is being restarted, or the encoder cannot keep up.
-    if let (ShareState::Live { capture: id, .. }, Some((_, d))) = (state, here) {
-        let note = match cx.state.recovery(id) {
-            Some(rec) => Some(recovering_tip(rec)),
-            None => encoder_limited(d).map(encoder_limit_tip),
-        };
+    // What went wrong under a live share: the capture is being restarted.
+    if let (ShareState::Live { capture: id, .. }, Some(_)) = (state, here) {
+        let note = cx.state.recovery(id).map(recovering_tip);
         for line in note.iter().flat_map(|n| n.lines()) {
             pop_note(ui, line);
         }
@@ -633,25 +630,6 @@ pub(super) fn recovering_tip(recovery: &simple_screensharing_client::session::Ca
 /// something on it changes. See `AppState::capture_awaiting_first_frame`.
 pub(super) fn awaiting_first_frame(cx: &Cx, capture: CaptureSourceId, c: &LocalCapture, d: &Destination) -> bool {
     matches!(c.destination_state(d), DestinationState::Starting) && cx.state.capture_awaiting_first_frame(capture)
-}
-
-/// `Some` while `d`'s encoder has been the bottleneck for a while: it
-/// encodes fewer frames than it is offered (see
-/// `capture::destination::EncoderLimit`, #46).
-pub(super) fn encoder_limited(d: &Destination) -> Option<EncoderLimited> {
-    d.runtime.as_ref().and_then(|r| r.lock().ok()?.encoder_limited())
-}
-
-/// Bar tooltip for an encoder-bound destination: "Encoding N of M fps" and
-/// what to do about it.
-fn encoder_limit_tip(l: EncoderLimited) -> String {
-    let head = tr_with(
-        "ui.bar.encoding_n_of_m",
-        "Encoding %{n} of %{fps} fps",
-        &[("n", &l.encoding_fps.to_string()), ("fps", &l.target_fps.to_string())],
-    );
-    let why = tr("ui.bar.encoder_limit_why", "Your encoder can't keep up with this framerate.");
-    format!("{head}\n{why}")
 }
 
 /// The long form of the "waiting for the screen to change" hint (bar tooltip,

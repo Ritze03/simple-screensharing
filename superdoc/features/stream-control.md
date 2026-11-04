@@ -905,16 +905,17 @@ cleared; any non-Live state (a rebuild for a codec switch, a pause) resets it.
 the screen changes, so an idle or slower monitor under a 240 target would otherwise read as
 an encoder limit. No per-GPU tables: everything is measured at run time.
 
-UI (since task I3, 2026-11-04 the Share menu of the control bar instead of the old action bar; its header and notes say the same): the action bar's Live status shows `Screen · 172/240 fps` in the warning colour and its
-tooltip (now always present, with the full status) adds "Encoding 172 of 240 fps".
-Measured: H.264 @240 Balanced → hint at 171-173 fps; H.265 → viewer 240-241 fps, hint gone.
+**Removed 2026-11-04 (user, row 135): every UI surface of the hint** (the "Encoding N of M fps" /
+"Your encoder can't keep up" note in the Share menu; keys `ui.bar.encoding_n_of_m`,
+`ui.bar.encoder_limit_why`). The user: "framerate is dynamic, so remove the warning. It always pops
+up, when nothing is moving." The measurement itself (`EncoderLimit`, `DestinationRuntime::encoder_limited`)
+is now unused by the UI and still in `capture.rs`.
 
 **Removed 2026-10-15 (user, #87): the stream-settings banner.** The Video card used to show an
 Info banner under Framerate, "Your encoder reaches about N fps with H.264 on this machine.",
 with a "Use H.265" button. The user: "it's just annoying". Both strings
 (`ui.stream.encoder_limit`, `ui.stream.use_h265`) and the card code are gone; the measurement
-(`EncoderLimit`) stays because the action bar's status colour and tooltip still use it, and
-`ui.bar.encoder_limit_why` no longer points at Stream settings.
+(`EncoderLimit`) stayed for the bar until 2026-11-04 (see above).
 
 ## Cancelling the screen picker is silent (2026-10-14)
 
