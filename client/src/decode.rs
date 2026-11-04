@@ -310,6 +310,7 @@ mod recovery_tests;
 pub mod render;
 #[cfg(test)]
 mod test_util;
+pub(crate) mod timing;
 mod video;
 #[cfg(test)]
 mod video_tests;
@@ -822,6 +823,7 @@ impl StreamDecoder {
         // why that policy over drop-oldest).
         let (tx, rx) = std_mpsc::sync_channel::<PipelineMsg>(VIDEO_INGEST_CHANNEL_CAPACITY);
 
+        shared.set_timing_stream(stream_id);
         let pipeline_shared = shared.clone();
         let thread = thread::Builder::new()
             .name(format!("decode-stream-{stream_id}"))
@@ -921,6 +923,7 @@ impl StreamDecoder {
             keyframe: frame.keyframe,
             data: frame.payload.clone(),
         };
+        self.frames.note_fed(now, frame.pts, frame.keyframe, frame.payload.len(), frame.arrival);
         match self.tx.try_send(msg) {
             Ok(()) => self.recovery.on_fed(now),
             Err(std_mpsc::TrySendError::Full(_)) => {
@@ -2616,6 +2619,7 @@ mod tests {
 
     fn stall_test_frame(stalled: bool) -> DecryptedMediaFrame {
         DecryptedMediaFrame {
+            arrival: None,
             conn_id: 1,
             stream_id: 0,
             pts: 0,
@@ -2786,6 +2790,7 @@ mod tests {
 
         for (i, au) in access_units.iter().enumerate() {
             let frame = DecryptedMediaFrame {
+                arrival: None,
                 stalled: false,
                 loss: Default::default(),
                 conn_id: 1,
@@ -3036,6 +3041,7 @@ mod tests {
 
         for (i, packet) in packets.iter().enumerate() {
             let frame = DecryptedMediaFrame {
+                arrival: None,
                 stalled: false,
                 loss: Default::default(),
                 conn_id: 1,
@@ -3050,6 +3056,7 @@ mod tests {
         // A frame for a different stream_id must be a silent no-op, never a
         // panic or a push into this decoder's pipeline.
         decoder.feed(&DecryptedMediaFrame {
+            arrival: None,
             conn_id: 1,
             stream_id: 200,
             pts: 0,
@@ -3917,6 +3924,7 @@ mod tests {
 
         for &i in &order {
             decoder.feed(&DecryptedMediaFrame {
+                arrival: None,
                 stalled: false,
                 loss: Default::default(),
                 conn_id: 1,

@@ -50,6 +50,7 @@ fn clip(codec: VideoCodec, frames: u32, key_int: u32) -> Option<Vec<Au>> {
 
 fn media(au: &Au) -> DecryptedMediaFrame {
     DecryptedMediaFrame {
+        arrival: None,
         conn_id: 1,
         stream_id: STREAM,
         pts: au.pts_us,
@@ -235,6 +236,7 @@ fn unrecognised_or_non_key_access_units_are_dropped_until_a_codec_is_known() {
     }
     // A keyframe-flagged blob that isn't any codec: dropped by the sniffer.
     dec.feed(&DecryptedMediaFrame {
+        arrival: None,
         conn_id: 1,
         stream_id: STREAM,
         pts: 0,

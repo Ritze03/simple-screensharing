@@ -167,6 +167,23 @@ cause has to be known first. The line deliberately names no cause.
 Balanced or H.265, and see whether the viewer recovers. That separates the video-engine suspect from
 the rest.
 
+### Timing report (2026-11-04, row 133)
+
+`decode/timing.rs`: one `Timeline` per stream records each frame at reassembly (`fragment::FrameArrival`: first fragment,
+complete, released), at the decoder thread, at the decoder's output and when it is uploaded for a repaint
+(`FrameSource::note_shown`), matched by PTS, one mutex per stage. Every 10 s two info lines `video timing stream N: ...`:
+
+- `span_ms` first to last fragment; `net_late_ms` arrival against the sender's clock, above the window's floor; `arrive_gap_ms`;
+  `queue_ms` from release to the decoder thread; `decode_ms`; `out_gap_ms`; `shown_gap_ms`.
+- **`late_ms`, the stutter number:** shown time minus PTS above the window's floor. `Why:` a gap between shown frames proves
+  nothing on a damage-driven source; a frame late against the sender's clock is a hitch. `late_frames key=N other=M` counts clearly
+  late frames at keyframes and elsewhere, which says at once whether the hitches belong to keyframes.
+- `held`, `held_worst_ms`, `repaired` (NACK), `undecoded`, `unshown` (replaced before a repaint took it).
+- `worst late_ms=X:` the frames around the worst moment, `pts`, `K` for a keyframe, size and `complete/decoded/shown` in ms.
+
+"Shown" is the upload in the paint callback, not the moment of scan-out: time waiting for the swapchain shows up in the next
+frame's figure, the compositor's own delay does not.
+
 ## Viewer recovery (`client/src/decode/recovery.rs`, 2026-11-02, #101)
 
 **The problem.** The wire is lossy and has no retransmission, so every codec/fps transition and every

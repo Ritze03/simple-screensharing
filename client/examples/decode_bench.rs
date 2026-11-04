@@ -186,6 +186,7 @@ fn run_pass(dec: &mut StreamDecoder, aus: &[AccessUnit]) -> Result<PassResult> {
             std::hint::spin_loop();
         }
         dec.feed(&DecryptedMediaFrame {
+            arrival: None,
             conn_id: 1,
             stream_id: STREAM_ID,
             pts: au.pts_us,

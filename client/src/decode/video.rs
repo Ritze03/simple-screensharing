@@ -452,6 +452,9 @@ fn build(codec: VideoCodec, backend: Backend, shared: &Arc<Shared>) -> Result<Ac
                 }
                 let info = &cached.as_ref().expect("just filled").1;
                 let pts_us = buffer.pts().map(|p| p.useconds());
+                if let Some(pts) = pts_us {
+                    cb_shared.note_decoded(pts);
+                }
                 let mapped = match VideoFrame::from_buffer_readable(buffer, info) {
                     Ok(f) => f,
                     Err(_) => {

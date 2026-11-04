@@ -32,7 +32,9 @@ use gstreamer_video::prelude::*;
 use gstreamer_video::{VideoColorMatrix, VideoColorRange, VideoCropMeta, VideoFrame, VideoInfo};
 
 use super::codec::VideoCodec;
+use super::timing::Timeline;
 use super::FpsCounter;
+use crate::fragment::FrameArrival;
 
 /// YUV→RGB matrix a frame was encoded with (what a shader needs to undo it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -372,6 +374,10 @@ pub(super) struct Shared {
     decoded_fps: Mutex<FpsCounter>,
     presented_fps: Mutex<FpsCounter>,
     info: Mutex<DecoderInfo>,
+    /// The stream's per-stage timing log (row 133, `decode/timing.rs`).
+    timeline: Mutex<Timeline>,
+    /// The stream id for that log, set by the decoder.
+    timeline_stream: AtomicU64,
 }
 
 impl Shared {
@@ -388,7 +394,29 @@ impl Shared {
             decoded_fps: Mutex::new(FpsCounter::new()),
             presented_fps: Mutex::new(FpsCounter::new()),
             info: Mutex::new(DecoderInfo::default()),
+            timeline: Mutex::new(Timeline::default()),
+            timeline_stream: AtomicU64::new(0),
         })
+    }
+
+    /// Names the stream in the timing report.
+    pub(super) fn set_timing_stream(&self, stream_id: u8) {
+        self.timeline_stream.store(u64::from(stream_id), Ordering::Relaxed);
+    }
+
+    /// The frame left the decoder; also where the timing report is written, this thread runs for
+    /// as long as anything is being watched.
+    pub(super) fn note_decoded(&self, pts_us: u64) {
+        let now = Instant::now();
+        let lines = {
+            let mut timeline = self.timeline.lock().unwrap();
+            timeline.note_decoded(now, pts_us);
+            timeline.report(now)
+        };
+        let stream = self.timeline_stream.load(Ordering::Relaxed);
+        for line in lines.into_iter().flatten() {
+            tracing::info!("video timing stream {stream}: {line}");
+        }
     }
 
     pub(super) fn set_display_hint(&self, width: u32, height: u32) {
@@ -531,6 +559,16 @@ impl FrameSource {
 
     /// Report that one frame was shown to the user (feeds
     /// [`DecoderStats::presented_fps`]). Call once per presented frame.
+    /// The frame went to the GPU for the next repaint (row 133, `decode/timing.rs`).
+    pub fn note_shown(&self, pts_us: u64) {
+        self.0.timeline.lock().unwrap().note_shown(Instant::now(), pts_us);
+    }
+
+    /// The access unit went to the decoder thread (row 133, `decode/timing.rs`).
+    pub(super) fn note_fed(&self, now: Instant, pts_us: u64, keyframe: bool, bytes: usize, arrival: Option<FrameArrival>) {
+        self.0.timeline.lock().unwrap().note_fed(now, pts_us, keyframe, bytes, arrival);
+    }
+
     pub fn note_presented(&self) {
         self.0.presented_total.fetch_add(1, Ordering::Relaxed);
         self.0.presented_fps.lock().unwrap().record();

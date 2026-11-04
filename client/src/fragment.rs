@@ -122,6 +122,8 @@ struct FrameBuf {
     received: usize,
     first_seen: Instant,
     last_touched: Instant,
+    /// When the last missing fragment came in (a frame in NACK mode can wait after that).
+    complete_at: Option<Instant>,
     /// The header's `flags` byte (same on every fragment), so a discarded frame can be reported as
     /// "an IDR was lost" and a released one carries its keyframe / stalled bits.
     flags: u8,
@@ -143,6 +145,7 @@ impl FrameBuf {
             received: 0,
             first_seen: now,
             last_touched: now,
+            complete_at: None,
             flags,
             max_index: 0,
             attempts: 0,
@@ -153,6 +156,15 @@ impl FrameBuf {
 
     fn keyframe(&self) -> bool {
         self.flags & MEDIA_FLAG_KEYFRAME != 0
+    }
+
+    fn arrival(&self, released: Instant) -> FrameArrival {
+        FrameArrival {
+            first_fragment: self.first_seen,
+            complete: self.complete_at.unwrap_or(released),
+            released,
+            repaired: self.attempts > 0,
+        }
     }
 
     fn is_complete(&self) -> bool {
@@ -272,6 +284,18 @@ impl FrameLoss {
     }
 }
 
+/// When a frame's fragments came in; the viewer's timing report reads it (`decode/timing.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameArrival {
+    pub first_fragment: Instant,
+    /// Its last missing fragment arrived.
+    pub complete: Instant,
+    /// Handed on. Later than `complete` when an older frame was being repaired (NACK hold).
+    pub released: Instant,
+    /// A fragment of this frame had to be asked for again.
+    pub repaired: bool,
+}
+
 /// One fully received frame, still encrypted.
 #[derive(Debug)]
 pub struct Completed {
@@ -282,6 +306,7 @@ pub struct Completed {
     pub ciphertext: Vec<u8>,
     /// Incomplete frames of this stream given up on since the previous frame it delivered.
     pub loss: FrameLoss,
+    pub arrival: FrameArrival,
 }
 
 impl Completed {
@@ -427,9 +452,12 @@ impl Reassembler {
             }
         }
         buf.last_touched = now;
+        if buf.complete_at.is_none() && buf.is_complete() {
+            buf.complete_at = Some(now);
+        }
 
         if nack {
-            Self::release(stream, header.conn_id, header.stream_id, &mut out, &mut self.stats);
+            Self::release(stream, header.conn_id, header.stream_id, now, &mut out, &mut self.stats);
             Self::attach_loss(stream, &mut out);
             return out;
         }
@@ -457,6 +485,7 @@ impl Reassembler {
                 stream_id: header.stream_id,
                 frame_id: header.frame_id,
                 flags: done.flags,
+                arrival: done.arrival(now),
                 ciphertext: done.concat(),
                 loss: FrameLoss::default(),
             });
@@ -477,6 +506,7 @@ impl Reassembler {
         stream: &mut StreamReassembly,
         conn_id: ConnId,
         stream_id: StreamId,
+        now: Instant,
         out: &mut Vec<Completed>,
         stats: &mut NackStats,
     ) {
@@ -493,7 +523,8 @@ impl Reassembler {
                 stats.frames_recovered += 1;
             }
             stream.done.insert(id);
-            out.push(Completed { conn_id, stream_id, frame_id: id, flags: frame.flags, ciphertext: frame.concat(), loss: FrameLoss::default() });
+            let arrival = frame.arrival(now);
+            out.push(Completed { conn_id, stream_id, frame_id: id, flags: frame.flags, arrival, ciphertext: frame.concat(), loss: FrameLoss::default() });
         }
     }
 
@@ -584,7 +615,7 @@ impl Reassembler {
                 }
             }
             let before = released.len();
-            Self::release(stream, conn_id, stream_id, &mut released, &mut self.stats);
+            Self::release(stream, conn_id, stream_id, now, &mut released, &mut self.stats);
             Self::attach_loss(stream, &mut released[before..]);
         }
         (released, requests)

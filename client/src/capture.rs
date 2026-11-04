@@ -4122,6 +4122,8 @@ async fn destination_pump(
     let mut idr = IdrControl::default();
     // How fast keyframes are paced out; adapts to the path (row 129).
     let mut pace = destination::PacePolicy::new(destination::PacePolicy::pinned_from_env(), client.send_ring().resent.load(Ordering::Relaxed));
+    // The per-stage timing report of this destination (row 133).
+    let mut send_timing = SendTiming::default();
     // When the subscriber count last changed: a keyframe request right after is a join, not a loss.
     let mut last_subscriber_change: Option<Instant> = None;
     // When the last repeat burst started, to rate-cap the ones viewers ask for.
@@ -4153,6 +4155,8 @@ async fn destination_pump(
                             // decodable to apply it to) — so ask for an IDR now
                             // instead of waiting out the rest of the GOP.
                             let was_stalled = runtime.lock().unwrap().is_stalled();
+                            let pulled = Instant::now();
+                            let capture_pts_us = sample.buffer().and_then(|b| b.pts()).map(|t| t.useconds());
                             let prepared = send_encoded_sample(&client, stream_id, &sample, start, &runtime);
                             let params = runtime.lock().unwrap().params();
                             if let Ok(p) = &prepared
@@ -4169,6 +4173,7 @@ async fn destination_pump(
                             }
                             let result = match prepared {
                                 Ok(prepared) => {
+                                    let (keyframe, bytes, wire_pts_us) = (prepared.keyframe, prepared.bytes(), prepared.wire_pts_us);
                                     if prepared.keyframe
                                         && let Some(f) = pace.on_keyframe(
                                             Instant::now(),
@@ -4179,7 +4184,22 @@ async fn destination_pump(
                                     {
                                         tracing::debug!("stream {stream_id}: keyframe pacing rate is now {f:.1}x the bitrate");
                                     }
-                                    prepared.send(params.framerate, params.bitrate_kbps, pace.factor()).await
+                                    let sent = prepared.send(params.framerate, params.bitrate_kbps, pace.factor()).await;
+                                    let connection = client.connection();
+                                    let queued = QUINN_DATAGRAM_BUFFER.saturating_sub(connection.datagram_send_buffer_space());
+                                    send_timing.note(SentFrame {
+                                        pulled,
+                                        sent: Instant::now(),
+                                        capture_pts_us: capture_pts_us.unwrap_or(wire_pts_us),
+                                        wire_pts_us,
+                                        keyframe,
+                                        bytes,
+                                        queued,
+                                    });
+                                    if let Some(line) = send_timing.report(Instant::now(), &params, pace.factor(), || connection.stats()) {
+                                        tracing::info!("video timing stream {stream_id}: {line}");
+                                    }
+                                    sent
                                 }
                                 Err(e) => Err(e),
                             };
@@ -4614,6 +4634,7 @@ struct PreparedMedia {
     connection: quinn::Connection,
     datagrams: Vec<bytes::Bytes>,
     keyframe: bool,
+    wire_pts_us: u64,
 }
 
 /// Datagram count from which a frame is paced (about 28 KB at 1.2 kB per
@@ -4673,6 +4694,154 @@ fn pace_plan(count: usize, bytes: usize, keyframe: bool, framerate: u32, bitrate
         return None;
     }
     Some((count.div_ceil(steps), PACE_STEP))
+}
+
+/// quinn's default `datagram_send_buffer_size`, which the client does not change: what is free of it
+/// tells how much of a frame still waits in quinn after [`PreparedMedia::send`] returned.
+const QUINN_DATAGRAM_BUFFER: usize = 1024 * 1024;
+
+/// How often the sender's timing report is due.
+const SEND_TIMING_EVERY: Duration = Duration::from_secs(10);
+/// The frames right behind a keyframe that are told apart in that report.
+const SEND_TIMING_AFTER_KEY: u32 = 3;
+
+/// One frame through the pump, for [`SendTiming`].
+#[derive(Debug, Clone, Copy)]
+struct SentFrame {
+    /// Pulled off the encoder's appsink.
+    pulled: Instant,
+    /// `PreparedMedia::send` returned.
+    sent: Instant,
+    capture_pts_us: u64,
+    wire_pts_us: u64,
+    keyframe: bool,
+    bytes: usize,
+    /// Bytes still in quinn's datagram queue right after the send.
+    queued: usize,
+}
+
+/// The sender's half of the timing report (row 133; the viewer's is `decode/timing.rs`, which says
+/// why these exist): one `video timing` line per [`SEND_TIMING_EVERY`] with the settings actually in
+/// use, how evenly frames leave the encoder, how much later a keyframe does than a delta (`enc_late`:
+/// pulled time minus capture PTS above the window's minimum, so an IDR's extra encode time and any
+/// queue behind it), the size of the frames behind a keyframe (a starved encoder shows there), how
+/// long the pump held and what the path did.
+#[derive(Debug, Default)]
+struct SendTiming {
+    frames: Vec<SentFrame>,
+    last_report: Option<Instant>,
+    since_key: u32,
+    last_pulled: Option<Instant>,
+    last_pts_us: Option<u64>,
+    last_key_pulled: Option<Instant>,
+    last_path: (u64, u64, u64),
+}
+
+impl SendTiming {
+    fn note(&mut self, frame: SentFrame) {
+        if self.frames.len() < 4096 {
+            self.frames.push(frame);
+        }
+    }
+
+    fn report(
+        &mut self,
+        now: Instant,
+        params: &destination::VideoParams,
+        factor: f64,
+        stats: impl FnOnce() -> quinn::ConnectionStats,
+    ) -> Option<String> {
+        let window = now.saturating_duration_since(*self.last_report.get_or_insert(now));
+        if window < SEND_TIMING_EVERY {
+            return None;
+        }
+        self.last_report = Some(now);
+        let frames = std::mem::take(&mut self.frames);
+        let first = frames.first()?;
+        let stats = stats();
+        use crate::decode::timing::Spread;
+        let ms = |from: Instant, to: Instant| to.saturating_duration_since(from).as_secs_f64() * 1000.0;
+        let behind = |f: &SentFrame| ms(first.pulled, f.pulled) - f.capture_pts_us as f64 / 1000.0;
+        let floor = frames.iter().map(behind).fold(f64::INFINITY, f64::min);
+
+        let [mut late_key, mut late_after, mut late_other] = [(); 3].map(|()| Spread::default());
+        let [mut size_key, mut size_after, mut size_other] = [(); 3].map(|()| Spread::default());
+        let [mut gap_key, mut gap_after, mut gap_other] = [(); 3].map(|()| Spread::default());
+        let (mut pts_gap, mut key_interval, mut hold_key, mut hold_delta) =
+            (Spread::default(), Spread::default(), Spread::default(), Spread::default());
+        let mut queued_max = 0usize;
+        for f in &frames {
+            let (late, size, gap) = if f.keyframe {
+                self.since_key = 0;
+                (&mut late_key, &mut size_key, &mut gap_key)
+            } else {
+                self.since_key = self.since_key.saturating_add(1);
+                if self.since_key <= SEND_TIMING_AFTER_KEY {
+                    (&mut late_after, &mut size_after, &mut gap_after)
+                } else {
+                    (&mut late_other, &mut size_other, &mut gap_other)
+                }
+            };
+            late.add(behind(f) - floor);
+            size.add(f.bytes as f64 / 1000.0);
+            if let Some(prev) = self.last_pulled.replace(f.pulled) {
+                gap.add(ms(prev, f.pulled));
+            }
+            if let Some(prev) = self.last_pts_us.replace(f.capture_pts_us) {
+                pts_gap.add(f.capture_pts_us.saturating_sub(prev) as f64 / 1000.0);
+            }
+            if f.keyframe {
+                if let Some(prev) = self.last_key_pulled.replace(f.pulled) {
+                    key_interval.add(ms(prev, f.pulled));
+                }
+                hold_key.add(ms(f.pulled, f.sent));
+            } else {
+                hold_delta.add(ms(f.pulled, f.sent));
+            }
+            queued_max = queued_max.max(f.queued);
+        }
+        let unix_now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64() * 1e6;
+        let pts_unix_floor = frames
+            .iter()
+            .map(|f| unix_now - now.saturating_duration_since(f.pulled).as_secs_f64() * 1e6 - f.wire_pts_us as f64)
+            .fold(f64::INFINITY, f64::min);
+        let path = (stats.path.sent_packets, stats.path.lost_packets, stats.path.congestion_events);
+        let (sent, lost, congestion) = (
+            path.0.saturating_sub(self.last_path.0),
+            path.1.saturating_sub(self.last_path.1),
+            path.2.saturating_sub(self.last_path.2),
+        );
+        self.last_path = path;
+        Some(format!(
+            "win_s={:.1} codec={:?} fps={} kbps={} gop_ms={} quality={:?} frames={} keyframes={} key_interval_ms={} key_kB={} after_key_kB={} delta_kB={} \
+             pts_gap_ms={} enc_gap_ms[key={} after={} other={}] enc_late_ms[key={} after={} other={}] pump_hold_ms[key={} delta={}] \
+             pace={factor:.1}x quinn_queue_max_kB={} rtt_ms={} cwnd_kB={} sent={sent} lost={lost} congestion={congestion} pts_unix_floor_us={pts_unix_floor:.0}",
+            window.as_secs_f64(),
+            params.codec,
+            params.framerate,
+            params.bitrate_kbps,
+            params.gop_millis,
+            params.quality_level,
+            frames.len(),
+            size_key.count(),
+            key_interval.three(),
+            size_key.three(),
+            size_after.three(),
+            size_other.three(),
+            pts_gap.three(),
+            gap_key.three(),
+            gap_after.three(),
+            gap_other.three(),
+            late_key.three(),
+            late_after.three(),
+            late_other.three(),
+            hold_key.three(),
+            hold_delta.three(),
+            queued_max / 1000,
+            stats.path.rtt.as_millis(),
+            stats.path.cwnd / 1000,
+        ))
+    }
 }
 
 impl PreparedMedia {
@@ -4774,7 +4943,7 @@ fn prepare_media_payload(
     let datagrams: Vec<bytes::Bytes> = datagrams.into_iter().map(bytes::Bytes::from).collect();
     client.send_ring().record(stream_id, counter, &datagrams);
 
-    Ok(PreparedMedia { connection, datagrams, keyframe })
+    Ok(PreparedMedia { connection, datagrams, keyframe, wire_pts_us })
 }
 
 /// Takes one encoded access unit off the appsink, maps it onto this
@@ -10373,6 +10542,46 @@ pub mod webcam {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Row 133: the sender's timing line tells a late keyframe and the frames behind it apart.
+    #[test]
+    fn send_timing_reports_keyframes_and_the_frames_behind_them() {
+        let params = destination::VideoParams {
+            width: 1920,
+            height: 1080,
+            framerate: 120,
+            bitrate_kbps: 10_000,
+            backend: EncoderBackend::Vaapi,
+            tune: TuneMode::LowLatency,
+            quality_level: QualityLevel::Performance,
+            gop_millis: 250,
+            codec: VideoCodec::Av1,
+        };
+        let start = Instant::now();
+        let mut t = SendTiming::default();
+        let never = || -> quinn::ConnectionStats { panic!("the path is only read when a report is due") };
+        assert!(t.report(start, &params, 12.0, never).is_none());
+        for i in 0..120u64 {
+            let keyframe = i % 30 == 0;
+            let pulled = start + Duration::from_micros(i * 8_000 + if keyframe { 6_000 } else { 0 });
+            t.note(SentFrame {
+                pulled,
+                sent: pulled + Duration::from_millis(if keyframe { 14 } else { 0 }),
+                capture_pts_us: i * 8_000,
+                wire_pts_us: i * 8_000,
+                keyframe,
+                bytes: if keyframe { 229_000 } else { 3_000 },
+                queued: 0,
+            });
+        }
+        assert!(t.report(start + Duration::from_secs(1), &params, 12.0, never).is_none());
+        let line = t.report(start + Duration::from_secs(10), &params, 12.0, quinn::ConnectionStats::default).expect("due");
+        assert!(line.contains("codec=Av1 fps=120 kbps=10000 gop_ms=250"), "{line}");
+        assert!(line.contains("frames=120 keyframes=4 key_interval_ms=240.0"), "{line}");
+        assert!(line.contains("key_kB=229.0/229.0/229.0"), "{line}");
+        assert!(line.contains("enc_late_ms[key=6.0/6.0/6.0 after=0.0"), "{line}");
+        assert!(line.contains("pump_hold_ms[key=14.0/14.0/14.0"), "{line}");
+    }
 
     /// The presets' keyframe intervals (user's table, 2026-11-04) as `key-int-max`.
     #[test]

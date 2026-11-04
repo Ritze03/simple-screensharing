@@ -323,6 +323,7 @@ impl VideoRenderer {
         upload(queue, gpu, &frame);
         stream.seq = frame.seq;
         source.note_presented();
+        source.note_shown(frame.pts_us);
     }
 
     fn bind_group_for(&self, source: &FrameSource) -> Option<&wgpu::BindGroup> {

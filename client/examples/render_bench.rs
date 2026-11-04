@@ -214,6 +214,7 @@ fn feed(mut decoders: Vec<StreamDecoder>, aus: Vec<AccessUnit>, fps: u32, stop: 
             }
             for dec in &mut decoders {
                 dec.feed(&DecryptedMediaFrame {
+                    arrival: None,
                     conn_id: 1,
                     stream_id: dec.stream_id(),
                     pts: au.pts_us + round * loop_us,

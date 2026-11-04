@@ -561,6 +561,8 @@ pub struct DecryptedMediaFrame {
     /// Incomplete frames of this stream the reassembler discarded since the previous frame it
     /// delivered (loss evidence for viewer recovery, `decode/recovery.rs`).
     pub loss: crate::fragment::FrameLoss,
+    /// When its fragments came in (`None` in tests); for the timing report, `decode/timing.rs`.
+    pub arrival: Option<crate::fragment::FrameArrival>,
     /// Raw codec bytes (one H.264 access unit, or one Opus packet).
     pub payload: Vec<u8>,
 }
@@ -1106,6 +1108,7 @@ async fn datagram_reader_loop(
                         keyframe: done.is_keyframe(),
                         stalled: done.is_stalled(),
                         loss: done.loss,
+                        arrival: Some(done.arrival),
                         payload,
                     };
                     if tx.send(ClientEvent::MediaFrame(frame)).is_err() {

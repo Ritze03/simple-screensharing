@@ -24,7 +24,43 @@ fan-out**, **transfer** between rooms, and the two **bandwidth modes** with
 
 ---
 
+## Keyframe stutter on the real machine: what the logs prove so far (2026-11-04, row 133)
+
+**User report (2026-11-04, verbatim), after row 129 below:** "the stutter on keyframes is still there." So the section
+below is unproven on the real machine: it measured the rig (loopback, one pattern, decoder output, not the screen).
+
+**What their uploaded logs and the relay's show** (session 10:24-10:29 UTC, both clients on one machine, build `8d92373`,
+AV1, 120 fps, ~10 Mbit/s, keyframe interval 250 ms; the fps and bitrate are worked out from `paced over` and the 30 ms floor):
+
+- **The keyframe interval is a frame count, not a time.** `key-int-max` = 30 frames, and the relay counted 5326 frames /
+  181 keyframes, 5822 / 196, 5746 / 191, 4098 / 137, 1218 / 41: always 29.4-30 frames per keyframe, while the frame rate
+  moved between 61 and 95 fps (capture is damage-driven). That is the 0.3-0.75 s spacing in the log. Nothing forces them:
+  `IdrControl` logs its squeezes and there are none.
+- **Keyframes are most of the stream.** The relay saw 0.63-0.97 MB/s; 3 keyframes/s of ~200 kB are about 0.6 MB/s of that.
+- **Loss and the NACK hold do not explain "every keyframe":** 703 keyframes against 13 repair events in 250 s, relay ->
+  viewer 64 of 232 152 packets lost. `RcvbufErrors` on the relay is 3782 in 138 M datagrams since its last boot.
+- **quinn does not hold the burst back:** the BBR window only grows (`cwnd=225188566` on the relay's viewer connection;
+  `bbr/mod.rs` adds every acked byte while `cwnd_gain < target_window`), so its pacer never binds after the start.
+- **Encode and decode of an IDR are not slow** on this GPU, measured outside the app with the client's exact element
+  lines (AV1, 1080p120, a 180-190 kB IDR, one at a time, not both at once): encode 4.0 ms against 3.4 for a delta, no
+  reordering in `vaav1enc` (its `gf-group-size` default did not delay anything), decode 8.7 / 11.5 ms (median / max)
+  against 3.3 for a delta, so about one frame of extra gap at 120 fps.
+
+So none of the row 129 candidates is proven. **The cause is not known yet**, which is why the timing report below exists.
+
+**`video timing` log lines (permanent, info, one per 10 s and stream, near-zero cost).** Sender (`SendTiming`,
+`capture.rs`): the settings in use, keyframe interval, sizes of keyframes / the 3 frames behind them / other deltas,
+`pts_gap_ms`, `enc_gap_ms`, `enc_late_ms` (pulled minus capture PTS above the window's floor: an IDR's extra encode time),
+`pump_hold_ms`, `quinn_queue_max_kB`, path stats. Viewer: `features/video-pipeline.md` "Timing report". Every figure is
+`median/p99/max`, split `key` / `after` (3 frames behind a keyframe) / `other`. `pts_unix_floor_us` on both sides: with both clients on one
+machine their difference is the shortest capture-to-complete time.
+
+*Why:* "the stutter on keyframes is still there": only the user's machine can show which stage hitches, and their
+uploaded log comes back with no effort from them.
+
 ## The lagspike on every keyframe: the pacing hold, deadline pacing and an adaptive rate (2026-11-04, row 129)
+
+*(Row 133 above: the user still sees the stutter with this in place; the conclusion below holds for the rig only.)*
 
 **User report (2026-11-04, verbatim):** "On every keyframe, there is a lagspike in the screenshare." Their uploaded
 client log had 1846 `sending a keyframe of ~300-360 datagrams (~300-360 kB), paced over ~80-100 ms` lines in one session
