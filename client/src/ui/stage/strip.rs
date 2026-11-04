@@ -6,6 +6,10 @@
 //! voice chat. Several streams of one person are one avatar with a count; a popped-out stream shows only as a
 //! badge on its owner's avatar (dashed outline, a pop badge) and a click brings it back from there.
 //!
+//! **A person is a connection** ([`Person::room`] + [`Person::conn`]), not a name: everything here, the egui ids
+//! included, keys on that. `Why`: the user runs two clients in one room under one name, "Both are technically me, but
+//! that should be properly handled!"; by name the two shared one hover and one card and claimed each other's streams.
+//!
 //! Hovering a person opens the same card for everyone: a header and, per stream, a row saying Audio or No
 //! audio, its numbers and its state (on the stage, popped out with a Bring back button, not watched). The
 //! card stays open while the pointer is on the avatar, the gap straight above it or the card, so its button
@@ -13,6 +17,7 @@
 
 use egui::emath::GuiRounding;
 use egui::{Align, Color32, CornerRadius, Id, Order, Rect, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
+use simple_screensharing_client::protocol::ConnId;
 use simple_screensharing_client::session::RoomHandle;
 
 use super::{Item, Kind, StageView};
@@ -20,8 +25,11 @@ use crate::theme::{self, Weight, font};
 use crate::ui::{Cx, UiAction, drive_dump, tr, tr_with};
 use crate::widgets::{self, FILL, HBox, fixed, paint_galley, paint_icon, paint_text, text_galley, text_width};
 
-/// A person in the strip: their name and the stage items that are theirs (indices into the stage's items).
+/// A person in the strip: a connection in a room ("Watched" mixes rooms), their name and the stage items that are
+/// theirs (indices into the stage's items).
 pub(super) struct Person {
+    pub room: RoomHandle,
+    pub conn: ConnId,
     pub name: String,
     pub you: bool,
     pub emoji: String,
@@ -30,27 +38,40 @@ pub(super) struct Person {
 
 /// Who the strip shows: a room's members (you first), or the owners of the watched streams ("Watched").
 pub(super) fn people(cx: &Cx, view: &StageView, items: &[Item]) -> Vec<Person> {
-    let mine = |name: &str| -> Vec<usize> { items.iter().enumerate().filter(|(_, i)| i.id.who == name).map(|(k, _)| k).collect() };
     match view {
         StageView::Room(h) => {
             let Some(s) = cx.session(*h) else { return Vec::new() };
             let me = s.client.conn_id();
-            let you_name = cx.state.display_name.clone();
-            let own: Vec<usize> = items.iter().enumerate().filter(|(_, i)| i.mine).map(|(k, _)| k).collect();
-            let others = s.members.iter().filter(|m| m.conn_id != me).map(|m| Person { name: m.display_name.clone(), you: false, emoji: s.emoji_of(m.conn_id), items: mine(&m.display_name) });
-            std::iter::once(Person { name: you_name, you: true, emoji: cx.state.emoji.clone(), items: own }).chain(others).collect()
+            let others = s.members.iter().filter(|m| m.conn_id != me).map(|m| (m.conn_id, m.display_name.clone(), s.emoji_of(m.conn_id)));
+            room_people(*h, (me, cx.state.display_name.clone(), cx.state.emoji.clone()), others, items)
         }
-        StageView::Watched => {
-            let mut out: Vec<Person> = Vec::new();
-            for (k, it) in items.iter().enumerate() {
-                match out.iter_mut().find(|p| p.name == it.id.who) {
-                    Some(p) => p.items.push(k),
-                    None => out.push(Person { name: it.id.who.clone(), you: false, emoji: cx.emoji_of_name(it.id.room, &it.id.who), items: vec![k] }),
-                }
-            }
-            out
+        StageView::Watched => owners(items, |room, conn| cx.emoji_of(room, conn)),
+    }
+}
+
+/// A room's people, `you` first: `(conn, name, emoji)` each, with the items of that connection.
+fn room_people(room: RoomHandle, you: (ConnId, String, String), others: impl Iterator<Item = (ConnId, String, String)>, items: &[Item]) -> Vec<Person> {
+    let person = |(conn, name, emoji): (ConnId, String, String), is_you: bool| Person {
+        room,
+        conn,
+        name,
+        you: is_you,
+        emoji,
+        items: items.iter().enumerate().filter(|(_, i)| i.conn == conn).map(|(k, _)| k).collect(),
+    };
+    std::iter::once(person(you, true)).chain(others.map(|o| person(o, false))).collect()
+}
+
+/// The owners of `items` in order of appearance: one person per room and connection, with a count of their streams.
+fn owners(items: &[Item], emoji_of: impl Fn(RoomHandle, ConnId) -> String) -> Vec<Person> {
+    let mut out: Vec<Person> = Vec::new();
+    for (k, it) in items.iter().enumerate() {
+        match out.iter_mut().find(|p| (p.room, p.conn) == (it.id.room, it.conn)) {
+            Some(p) => p.items.push(k),
+            None => out.push(Person { room: it.id.room, conn: it.conn, name: it.id.who.clone(), you: false, emoji: emoji_of(it.id.room, it.conn), items: vec![k] }),
         }
     }
+    out
 }
 
 /// Cell width, gap and side padding of the strip.
@@ -91,15 +112,26 @@ pub(super) fn show(ui: &mut Ui, cx: &Cx, rect: Rect, view: &StageView, people: &
         let content_w = (total + 2.0 * SIDE_PAD).max(rect.width());
         let (area, _) = ui.allocate_exact_size(vec2(content_w, rect.height()), Sense::hover());
         let mut x = area.left() + (content_w - total) / 2.0;
-        for p in people {
+        for (i, p) in people.iter().enumerate() {
             let cell = Rect::from_min_size(pos2(x, area.top()), vec2(CELL_W, rect.height()));
             x += CELL_W + CELL_GAP;
-            person(ui, cx, cell, view, p, items, acts);
+            person(ui, cx, cell, view, p, &dump_tag(people, i), items, acts);
         }
     });
 }
 
-fn person(ui: &mut Ui, cx: &Cx, cell: Rect, view: &StageView, p: &Person, items: &[Item], acts: &mut Vec<UiAction>) {
+/// A person's name in the `SSS_UI_DUMP`: `you`, the name, `NAME~2` for the second of that name.
+fn dump_tag(people: &[Person], i: usize) -> String {
+    let p = &people[i];
+    match people[..i].iter().filter(|q| !q.you && q.name == p.name).count() {
+        _ if p.you => "you".into(),
+        0 => p.name.clone(),
+        n => format!("{}~{}", p.name, n + 1),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn person(ui: &mut Ui, cx: &Cx, cell: Rect, view: &StageView, p: &Person, tag: &str, items: &[Item], acts: &mut Vec<UiAction>) {
     let its: Vec<&Item> = p.items.iter().map(|k| &items[*k]).collect();
     let popped: Vec<&Item> = its.iter().copied().filter(|i| i.popped).collect();
     let ring = its.iter().any(|i| audible(cx, i));
@@ -107,10 +139,9 @@ fn person(ui: &mut Ui, cx: &Cx, cell: Rect, view: &StageView, p: &Person, items:
     // One centre line for everything: the avatar rect snapped to whole pixels.
     let av = Rect::from_min_size(pos2(cell.center().x - a / 2.0, cell.top() + TOP_PAD), vec2(a, a)).round_to_pixels(ui.pixels_per_point());
     let hit = Rect::from_min_max(pos2(cell.left(), av.top() - 6.0), pos2(cell.right(), av.bottom() + 7.0 + 14.0));
-    let tag = if p.you { "you" } else { &p.name };
     drive_dump::rect(|| format!("strip.{tag}"), av);
     drive_dump::line(|| format!("person {tag} streams {} popped {} ring {}", its.len(), popped.len(), u8::from(ring)));
-    let resp = ui.interact(hit, Id::new(("strip_person", &p.name)), if popped.is_empty() { Sense::hover() } else { Sense::click() });
+    let resp = ui.interact(hit, Id::new(("strip_person", p.room, p.conn)), if popped.is_empty() { Sense::hover() } else { Sense::click() });
     crate::ui::paint_person(ui, av, &p.name, &p.emoji, false);
     let c = av.center();
     let painter = ui.painter();
@@ -160,7 +191,7 @@ fn person(ui: &mut Ui, cx: &Cx, cell: Rect, view: &StageView, p: &Person, items:
             }
         }
     }
-    hover_card(ui, cx, &resp, av, view, p, &its, acts);
+    hover_card(ui, cx, &resp, av, view, p, tag, &its, acts);
 }
 
 /// Card width: one row's worth of numbers needs 320, a person without streams only a name.
@@ -169,9 +200,9 @@ const CARD_W_PLAIN: f32 = 260.0;
 const ROW_H: f32 = 8.0 + 22.0 + 3.0 + 14.0 + 3.0 + 14.0;
 
 #[allow(clippy::too_many_arguments)]
-fn hover_card(ui: &Ui, cx: &Cx, resp: &egui::Response, av: Rect, view: &StageView, p: &Person, its: &[&Item], acts: &mut Vec<UiAction>) {
+fn hover_card(ui: &Ui, cx: &Cx, resp: &egui::Response, av: Rect, view: &StageView, p: &Person, tag: &str, its: &[&Item], acts: &mut Vec<UiAction>) {
     let ctx = ui.ctx();
-    let id = Id::new(("strip_card", &p.name));
+    let id = Id::new(("strip_card", p.room, p.conn));
     let shown: Option<Rect> = ctx.data(|d| d.get_temp(id));
     let keep = shown.is_some_and(|r| ctx.pointer_hover_pos().is_some_and(|q| card_keeps(r, av, q)));
     if !(resp.hovered() || keep) {
@@ -193,6 +224,7 @@ fn hover_card(ui: &Ui, cx: &Cx, resp: &egui::Response, av: Rect, view: &StageVie
             });
         });
     drive_dump::rect(|| "card".into(), area.response.rect);
+    drive_dump::line(|| format!("cardof {tag} rows {}", its.len()));
     ctx.data_mut(|d| d.insert_temp(id, area.response.rect));
 }
 
@@ -346,12 +378,59 @@ fn state_line(cx: &Cx, view: &StageView, it: &Item) -> (&'static str, String) {
 /// How many people watch our share in `room`, when the relay reports it.
 fn viewers(cx: &Cx, room: RoomHandle, dest: simple_screensharing_client::session::DestinationId) -> Option<usize> {
     let stream_id = cx.state.captures.values().find_map(|c| c.destinations.get(&dest).map(|d| d.stream_id))?;
-    super::tile::viewer_names(cx, room, stream_id).map(|v| v.len())
+    super::tile::viewer_list(cx, room, stream_id).map(|v| v.len())
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::{ItemId, Kind};
     use super::*;
+
+    const ROOM: RoomHandle = RoomHandle(1);
+
+    fn stream(room: RoomHandle, conn: ConnId, who: &str, stream: u8) -> Item {
+        let id = ItemId { room, who: who.into(), label: "Screen".into(), audio: false, nth: 0 };
+        Item { id, conn, kind: Kind::Video((room, conn, stream)), ar: 1.0, mine: false, popped: false, in_pip: false }
+    }
+
+    fn who(conn: ConnId, name: &str) -> (ConnId, String, String) {
+        (conn, name.into(), String::new())
+    }
+
+    /// The user's report: two members with one name are two people, each with only their own streams.
+    #[test]
+    fn two_members_with_one_name_are_two_people_each_with_their_own_streams() {
+        let items = [stream(ROOM, 2, "Ritze", 0), stream(ROOM, 3, "Ritze", 0), stream(ROOM, 3, "Ritze", 1)];
+        let people = room_people(ROOM, who(1, "Ritze"), [who(2, "Ritze"), who(3, "Ritze")].into_iter(), &items);
+        assert_eq!(people.iter().map(|p| (p.conn, p.you, p.items.clone())).collect::<Vec<_>>(), [(1, true, vec![]), (2, false, vec![0]), (3, false, vec![1, 2])]);
+        // Your own share is yours by connection, not by name.
+        let mut mine = stream(ROOM, 1, "", 0);
+        mine.mine = true;
+        let items = [mine, stream(ROOM, 2, "Ritze", 0)];
+        let people = room_people(ROOM, who(1, "Ritze"), [who(2, "Ritze")].into_iter(), &items);
+        assert_eq!(people[0].items, [0]);
+        assert_eq!(people[1].items, [1]);
+    }
+
+    /// "Watched": several streams of one person are one avatar with a count, per connection and room.
+    #[test]
+    fn watched_has_one_person_per_room_and_connection() {
+        let other = RoomHandle(2);
+        let items = [stream(ROOM, 2, "Ritze", 0), stream(ROOM, 3, "Ritze", 0), stream(ROOM, 2, "Ritze", 1), stream(other, 2, "Ritze", 0)];
+        let people = owners(&items, |room, conn| format!("{}/{conn}", room.0));
+        assert_eq!(people.iter().map(|p| (p.room, p.conn, p.emoji.as_str(), p.items.clone())).collect::<Vec<_>>(), [
+            (ROOM, 2, "1/2", vec![0, 2]),
+            (ROOM, 3, "1/3", vec![1]),
+            (other, 2, "2/2", vec![3]),
+        ]);
+    }
+
+    /// The rig tells two people of one name apart in the dump.
+    #[test]
+    fn the_dump_names_the_second_of_a_name_apart() {
+        let people = room_people(ROOM, who(1, "Ritze"), [who(2, "Ritze"), who(3, "Ritze"), who(4, "Mo")].into_iter(), &[]);
+        assert_eq!((0..4).map(|i| dump_tag(&people, i)).collect::<Vec<_>>(), ["you", "Ritze", "Ritze~2", "Mo"]);
+    }
 
     #[test]
     fn a_card_stays_open_over_itself_its_avatar_and_the_gap_but_not_over_the_next_avatar() {

@@ -92,9 +92,25 @@ call, not in side panels.
     brings it back, so does its owner's avatar in the strip, below). Everything that used to be a card button is on its
     tile: Watch / Pop out / Listen on the idle tile, Stream settings and the viewers chip (below) on the own tile; the rest of
     a stream's controls are its `⋯` menu.
+  - **A person is a connection** (2026-11-04, #127): inside a live session people and whose-is-this go by room + `ConnId`
+    (`Item::conn`, `strip::Person { room, conn }`), never by display name: strip, hover card and its keep zone, avatars,
+    emoji (`Cx::emoji_of(room, conn)`), stream counts, the viewers dropdown, the stream menu head, the popped badge, webcam
+    in picture. "You" is your own connection, so a second client of yours under your name is someone else and stays on
+    your stage with Hide my own streams. In Watched a person is room + conn, so a friend in two rooms is two avatars.
+    *Why:* the user, from two clients of their own in one room under one name: "When i hover "You", it doesnt show
+    anything and hovering "Ritze" shows both at once. (Both are technically me, but that should be properly handled!)".
+    By name the two shared one egui id (one hover, one card), claimed each other's streams, and the first member of that
+    name lent its emoji to the other (the roster's order is the relay's, so that could be the viewer's own emoji: #128's
+    "a changed emoji doesn't reach others").
   - **Keys:** a tile is identified by `stage::ItemId` = room handle + owner name + label (+ audio flag, n-th of
     identical ones), your own share is `room/me`; **not** by `StreamKey`, whose `ConnId`/`StreamId` change with every
-    reconnect, so a reconnect keeps order, grid and window rects (`WantedStream`'s identity). Watch, pop-out, volume
+    reconnect, so a reconnect keeps order, grid and window rects (`WantedStream`'s identity). `ItemId` only names a place
+    in the layout. Identical ids are numbered in `(ConnId, StreamId)` order (`number_identical`), so two same-named owners
+    sharing one label are two tiles and the number does not depend on announcement order. **A reconnect:** `ConnId`s are
+    random and new, so those two may swap numbers and with them their places, sizes and a pop-out; nothing is lost, there is
+    no panic, the two ids stay the same two. *Why accepted:* nothing that survives a reconnect tells them apart
+    (`session::match_wanted` has the same limit). If one of the two stops sharing, the other takes number 0 and so the
+    first one's place. Watch, pop-out, volume
     and stats belong to the stream (`StreamKey`) and are shared by every view; the layout state is per view
     (`StageState::views`, UI-private, per session, **not persisted**). It is never pruned, so a stream that comes
     back keeps its place. The layout choice and the two options sit in `Shell::stage` (`StageSettings`) because the
@@ -214,11 +230,11 @@ is per owner on the wire (`sibling_audio_stream`), so two streams of one person 
 colour (neutral slate for a colourless one), with a thin black outline and its visible-pixel crop centred; "" or an emoji
 the client has no picture of (a peer's, outside the 40) draws the initial on the name's gradient. Call sites: the strip, the
 hover card (head), the stream menu (head), the idle tile's big avatar, the viewers dropdown and the sidebar's user band.
-*Where the emoji comes from:* `Cx::emoji_of_name(room, name)` (member by display name in that room's session, then
-`RoomSession::emoji_of(conn_id)`; my own entry is my setting, so a change shows at once); the strip's `Person` carries it
-(`you` = `cx.state.emoji`, Watched uses each item's own room), the viewers dropdown and idle tile look it up with the room
-they already have, the stream menu uses `cx.state.emoji` for my own item. *Why by name:* stage items and the strip identify
-people by display name (`ItemId.who`), as `ConnId` changes on reconnect.
+*Where the emoji comes from:* `Cx::emoji_of(room, conn)` (`RoomSession::emoji_of(conn_id)`; my own entry is my setting, so a
+change shows at once); the strip's `Person` carries it (`you` = `cx.state.emoji`, Watched uses each item's own room), the
+viewers dropdown (`tile::viewer_list` gives `(ConnId, name)`), the idle tile and the stream menu look it up by the stream's
+connection, the stream menu uses `cx.state.emoji` for my own item. *Why by connection:* "a person is a connection" under
+"The stage"; it was by name until 2026-11-04 (#127).
 
 **Settings > Profile > Avatar** (2026-11-04, task #114): a row under Display name with my avatar as a button; clicking it
 opens the picker as a popover in the menu style (`modals.rs` `avatar_row`, `menu::frame()`, closes on a pick or an outside

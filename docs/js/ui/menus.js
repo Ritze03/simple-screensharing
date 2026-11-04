@@ -239,7 +239,7 @@ function tileMenu() {
   const it = view && itemById(view, M.itemId);
   if (!it) return [];
   const { r, w, s, mine } = it;
-  const out = [head(avatarEl(it.owner, r.emojiByName(it.owner) || (mine ? S.settings.emoji : ""), { sm: true }), mine ? (it.cam ? t("ui.stage.your_webcam") : t("ui.stage.your_stream")) : it.owner,
+  const out = [head(avatarEl(it.owner, r.emojiOf(it.conn) || (mine ? S.settings.emoji : ""), { sm: true }), mine ? (it.cam ? t("ui.stage.your_webcam") : t("ui.stage.your_stream")) : it.owner,
     `${it.label} · ${view.kind === "watched" ? r.name : mine ? captureRes(it.c) : it.kind === "audio" ? t("ui.room.audio_only") : [s.width ? `${s.width}×${s.height}` : ""].filter(Boolean).join("")}`)];
   if (it.kind === "audio") {
     // an audio-only sender: volume while listening, and Listen / Stop listening

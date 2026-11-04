@@ -77,7 +77,7 @@ Settings controls (`sound.volume`, `sound.test.*`, `sound_volume`) are dumped on
 | `ctl.share\|audio\|webcam\|layout\|room` and `.arrow`, `ctl.people\|leave\|sidebar\|invite\|pop\|fs`, `ctl.group.X` | the control bar |
 | `menu`, `menu.LABEL` (spaces become `_`), `menu.always_names`, `menu.hide_own`, `menu.volume`, `menu.mute`; `volume` | the open menu and its rows; the volume row and its value |
 | `opt.I` | row I of an open dropdown (`menu::select`) |
-| `strip.NAME` (`strip.you`), `strip.NAME.live`; `person NAME streams N popped N ring 0\|1` | avatars and LIVE badges |
+| `strip.NAME` (`strip.you`; `strip.NAME~2` is the second person of that name), `strip.NAME.live`; `person NAME streams N popped N ring 0\|1`; `cardof NAME rows N` | avatars and LIVE badges; one `cardof` line per open hover card |
 | `card`, `card.row.I`, `card.back.I`; `cardrow I audio 0\|1 label=..` | the hover card |
 | `stage.bring_back`; `boost` | "Bring it back" while the stage is popped out; `boost` is the Boost percent (the old `settings.boost` rect is gone: Boost left Settings for the audio menu, `audio.boost`) |
 | `side.settings` | the sidebar's Settings button |

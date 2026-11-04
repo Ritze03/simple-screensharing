@@ -1241,6 +1241,103 @@ try {
   check(audSrc, "the core watches an audio stream directly (`watch(audioKey)`, no canvas) for Listen");
   check(true, "Share audio on the bar: with no audio-only share a click opens the browser's picker (not run here: no audio on the host)");
 
+  section("two members with one name are two people (the user's report: hovering You showed nothing, hovering the other showed both cards)");
+  {
+    const T1 = await L.openApp(site.url, { name: "Twin", settings: { emoji: "🦊" } });
+    const T2 = await L.openApp(site.url, { name: "Twin", settings: { emoji: "🐻" } });
+    const TV = await L.openApp(site.url + "?fakeaudio=1", { name: "Wes" });
+    const Q = TV.page;
+    await L.createRoom(T1.page, { name: "twins", server: RELAY, hash: HASH });
+    await L.waitJoined(T1.page);
+    const tlink = await L.inviteLink(T1.page);
+    for (const X of [T2, TV]) {
+      await L.addRoomByLink(X.page, tlink, "twins");
+      await L.waitJoined(X.page);
+    }
+    await startSharer(T1, "Twin", 960, 540);
+    await startSharer(T2, "Twin", 960, 540);
+    await Q.waitFor("document.querySelectorAll('.st-tile.idle').length === 2", { timeout: 30000, what: "both Twins' tiles" });
+    await Q.waitFor(`document.querySelectorAll('.pv[data-user="Twin"] .emo').length === 2`, { timeout: 20000, what: "both Twins' emoji" });
+    const ids = await Q.eval("[...document.querySelectorAll('.arena > .st-tile')].map((t) => t.dataset.id)");
+    check(new Set(ids).size === 2, "both share the same label: two tiles with their own id", JSON.stringify(ids));
+    const pvs = (p) => p.eval(`[...document.querySelectorAll('.strip .pv')].map((e) => ({ user: e.dataset.user, person: e.dataset.person, live: !!e.querySelector('.lv'), emo: e.querySelector('.emo')?.innerText ?? "" }))`);
+    const twins = (await pvs(Q)).filter((x) => x.user === "Twin");
+    check(twins.length === 2 && twins[0].person !== twins[1].person && twins.every((x) => x.live) && new Set(twins.map((x) => x.emo)).size === 2, "two avatars, each LIVE, each with its own emoji", JSON.stringify(twins));
+    check((await Q.eval("[...document.querySelectorAll('.st-tile.idle .invite .emo')].map((e) => e.innerText).sort().join('')")) === "🐻🦊", "each idle tile shows its owner's emoji, not the first of that name");
+    /** Hover the person `person` on page `p`: the cards that open (there must be one). */
+    const hoverCard = async (p, person) => {
+      await move(p, 3, 3);
+      await p.waitFor("!document.querySelector('.utip')", { what: "no card left open" });
+      const av = await p.eval(`(() => { const r = [...document.querySelectorAll('.strip .pv')].find((e) => e.dataset.person === ${JSON.stringify(person)}).querySelector('.avatar').getBoundingClientRect(); return { cx: r.x + r.width / 2, cy: r.y + r.height / 2 }; })()`);
+      await move(p, av.cx, av.cy);
+      await p.waitFor("document.querySelector('.utip')", { what: "a card" });
+      await sleep(150);
+      return p.eval(`({ n: document.querySelectorAll('.utip').length, name: document.querySelector('.utip .hd b').innerText, emo: document.querySelector('.utip .hd .emo')?.innerText ?? "", rows: document.querySelectorAll('.utip .ust').length })`);
+    };
+    for (const x of twins) {
+      const c = await hoverCard(Q, x.person);
+      check(c.n === 1 && c.emo === x.emo && c.rows === 1, `a third person hovering ${x.emo} sees only that card, with one stream`, JSON.stringify(c));
+    }
+    await move(Q, 3, 3);
+    const own = await pvs(T1.page);
+    const me = own.find((x) => x.emo === "🦊"), other = own.find((x) => x.emo === "🐻");
+    const cMe = await hoverCard(T1.page, me.person), cOther = await hoverCard(T1.page, other.person);
+    check(cMe.n === 1 && cMe.name === "You" && cMe.rows === 1, "hovering You shows your own card", JSON.stringify(cMe));
+    check(cOther.n === 1 && cOther.name === "Twin" && cOther.emo === "🐻" && cOther.rows === 1, "hovering the other Twin shows only theirs", JSON.stringify(cOther));
+    await shot(T1.page, "twins_card");
+    await move(T1.page, 3, 3);
+    // Hide my own streams hides mine by connection: the other Twin stays on my stage
+    await T1.page.click("#btn-layout");
+    await T1.page.waitFor("document.querySelector('.menu.m-layout')", { what: "layout menu" });
+    await T1.page.click({ js: "[...document.querySelectorAll('.menu .mi, .menu .cbx')].find((e) => /Hide my own/.test(e.innerText))" });
+    await T1.page.waitFor("document.querySelectorAll('.arena > .st-tile').length === 1", { what: "my own tile gone" });
+    check(await T1.page.eval("!document.querySelector('.st-tile.mine') && !!document.querySelector('.st-tile.idle')"), "Hide my own streams hides only mine: the other client of my name stays on my stage");
+    // both watched: each tile keeps its own pop-out and Stop watching
+    for (let n = 1; n <= 2; n++) {
+      for (let i = 0; i < 6 && (await Q.eval("__sss.S.rooms[0].watches.size")) < n; i++) {
+        await Q.click("[data-watch]");
+        await sleep(700);
+      }
+      await Q.waitFor(`__sss.S.rooms[0].watches.size === ${n}`, { what: `Twin watch ${n}` });
+    }
+    await Q.waitFor("[...__sss.S.rooms[0].watches.values()].every((w) => w.firstFrame)", { timeout: 40000, what: "first frames of both" });
+    await Q.waitFor("document.querySelectorAll('.arena > .st-tile:not(.idle)').length === 2", { what: "two playing tiles" });
+    const wOf = "[...__sss.S.rooms[0].watches.values()]";
+    const t0 = (await tiles(Q))[0];
+    const owner0 = await Q.eval(`document.querySelectorAll('.arena > .st-tile')[0]._it.conn`);
+    await move(Q, t0.cx, t0.cy);
+    await sleep(250);
+    await Q.click({ js: `document.querySelectorAll('.arena > .st-tile')[0].querySelector('.tools .round-btn')` });
+    await Q.waitFor(`${wOf}.some((w) => w.popped)`, { timeout: 10000, what: "one Twin popped out" });
+    await sleep(300);
+    const pop = await Q.eval(`({ tiles: document.querySelectorAll('.arena > .st-tile').length, popped: ${wOf}.filter((w) => w.popped).map((w) => w.owner), badges: [...document.querySelectorAll('.pv.popped')].map((e) => e.dataset.person.split("/").pop()) })`);
+    check(pop.tiles === 1 && pop.popped.length === 1 && pop.popped[0] === owner0 && pop.badges.length === 1 && pop.badges[0] === owner0, "popping one tile pops only that stream, and the badge is on its owner's avatar only", JSON.stringify(pop));
+    for (let i = 0; i < 5 && (await Q.eval(`${wOf}.some((w) => w.popped)`)); i++) {
+      await Q.click(".pv.popped").catch(() => {});
+      await sleep(700);
+    }
+    await Q.waitFor(`!${wOf}.some((w) => w.popped) && document.querySelectorAll('.arena > .st-tile').length === 2`, { what: "brought back" });
+    if (RELAY_BIN && RELAY_DIR) {
+      const orderBefore = await Q.eval(`__sss.vg("room:" + __sss.S.rooms[0].id).order.slice()`);
+      spawnSync("bash", [W + "relay.sh", "restart", RELAY_BIN, RELAY_DIR, RELAY.split(":").pop()], { stdio: "inherit" });
+      await Q.waitFor(`__sss.S.rooms[0].state === "joined" && ${wOf}.length === 2 && document.querySelectorAll('.arena > .st-tile:not(.idle)').length === 2`, { timeout: 60000, what: "both Twins watched again after the relay restart" });
+      const orderAfter = await Q.eval(`__sss.vg("room:" + __sss.S.rooms[0].id).order.slice()`);
+      const tilesAfter = await Q.eval("[...document.querySelectorAll('.arena > .st-tile')].map((t) => t.dataset.id).sort()");
+      check(JSON.stringify(orderAfter) === JSON.stringify(orderBefore) && tilesAfter.every((id) => orderBefore.includes(id)), "a relay restart keeps both ids and both watches (the two may swap places, nothing is lost)", JSON.stringify({ orderBefore, orderAfter }));
+      await Q.waitFor(`document.querySelectorAll('.pv[data-user="Twin"] .emo').length === 2`, { timeout: 30000, what: "emoji after the restart" });
+      check(new Set((await pvs(Q)).filter((x) => x.user === "Twin").map((x) => x.emo)).size === 2, "both still have their own emoji");
+      await Q.waitFor("[...__sss.S.rooms[0].watches.values()].every((w) => w.firstFrame)", { timeout: 40000, what: "first frames after the restart" });
+    }
+    const t1 = (await tiles(Q))[1];
+    await rightClick(Q, t1.cx, t1.cy);
+    await Q.waitFor("document.querySelector('.menu')", { what: "stream menu" });
+    await Q.click({ js: "[...document.querySelectorAll('.menu .mi')].find((e) => /Stop watching/.test(e.innerText))" });
+    await Q.waitFor(`${wOf}.length === 1`, { what: "one watch left" });
+    check(await Q.eval("document.querySelectorAll('.st-tile.idle').length === 1 && document.querySelectorAll('.arena > .st-tile:not(.idle)').length === 1"), "Stop watching on one tile stops only that one");
+    check([T1, T2, TV].every((x) => x.consoleErrors.length === 0), "no console errors on the Twins' pages", [T1, T2, TV].flatMap((x) => x.consoleErrors).join(" | "));
+    for (const X of [T1, T2, TV]) await X.close();
+  }
+
   if (OLD_RELAY && OLD_HASH) {
     section("a relay without avatars (an older relay): nobody else's emoji shows, my own still does");
     const X = await open("Olga", site.url);

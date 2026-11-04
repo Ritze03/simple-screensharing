@@ -15,7 +15,7 @@ import { CanvasRenderer, VideoReceiver } from "../js/core/video-rx.js";
 import { ENCODER_PRESETS } from "../js/core/video-tx.js";
 import { avatarBg, avatarColors, avatarHue, balancePoint, pickEmoji, sliderCtl, snapVolumePct, wheelStepVolumePct, volumeWheel, VOLUME_MAX_PCT } from "../js/ui/dom.js";
 import * as G from "../js/ui/stage-geom.js";
-import { pipPairs, shareLabel } from "../js/ui/stage-state.js";
+import { pipPairs, shareLabel, peopleOf, numberIdentical } from "../js/ui/stage-state.js";
 import { isWebcamLabel } from "../js/core/room-client.js";
 import { CHROME_IDLE_MS, chromeRemaining, chromeStart, chromeStep } from "../js/ui/chrome.js";
 import { loadSettings } from "../js/ui/store.js";
@@ -1890,9 +1890,9 @@ test("pip geometry: a resize keeps the aspect and the opposite corner, stays ins
   }
 });
 
-// pairing (native `pip_pairs`): items are `{ id, kind, cam, owner, mine, r, popped, w }`
+// pairing (native `pip_pairs`): items are `{ id, kind, cam, conn, owner, mine, r, popped, w }`; a name is one connection here unless a test says otherwise
 const room1 = { id: "r1" };
-const item = (id, owner, cam, kind = "video", o = {}) => ({ id, kind, cam, owner, mine: false, r: room1, popped: false, w: kind === "video" ? {} : null, ...o });
+const item = (id, owner, cam, kind = "video", o = {}) => ({ id, kind, cam, conn: owner, owner, mine: false, r: room1, popped: false, w: kind === "video" ? {} : null, ...o });
 const pairsOf = (items) => pipPairs(items, items.map((i) => i.id));
 const flat = (m) => Object.fromEntries([...m].map(([k, v]) => [k, v.id]));
 
@@ -1920,13 +1920,51 @@ test("pip pairing: a webcam stays a tile with no playing share to sit in (none, 
 });
 
 test("pip pairing: your webcam goes into your own screen, one parent holds one webcam, another room's person of the same name is another person", () => {
-  const mine = (id, cam) => item(id, "Me", cam, "mine", { mine: true, w: null });
+  const mine = (id, cam) => item(id, "Me", cam, "mine", { conn: "self", mine: true, w: null });
   eq(flat(pairsOf([mine("m1", false), mine("m2", true)])), { m1: "m2" });
   eq(flat(pairsOf([item("s1", "Me", false), mine("m2", true)])), {}, "someone else called Me is not you");
   const two = [item("s1", "Jonas", false), item("c1", "Jonas", true), item("c2", "Jonas", true)];
   eq(flat(pairsOf(two)), { s1: "c1" }, "the second webcam keeps its tile");
   const other = [item("s1", "Jonas", false), item("c1", "Jonas", true, "video", { r: { id: "r2" } })];
   eq(pairsOf(other).size, 0);
+  // two people of one name: a webcam goes into its own connection's screen
+  const twins = [item("s1", "Ritze", false, "video", { conn: "c1" }), item("s2", "Ritze", false, "video", { conn: "c2" }), item("k2", "Ritze", true, "video", { conn: "c2" })];
+  eq(flat(pairsOf(twins)), { s2: "k2" }, "not the first screen of that name");
+  eq(pairsOf([twins[0], twins[2]]).size, 0, "the other Ritze's screen is no parent");
+});
+
+test("two members with one name are two people, each with only their own streams (the user's report)", () => {
+  const r = { id: "r1", members: [{ id: "c2", name: "Ritze" }, { id: "c1", name: "Ritze", self: true }, { id: "c3", name: "Ritze" }], emojiOf: (id) => `emoji of ${id}` };
+  const it = (conn, key, o = {}) => ({ id: key, r, conn, owner: "Ritze", mine: false, ...o });
+  const items = [it("c2", "a"), it("c3", "b"), it("c3", "c"), it("c1", "m", { mine: true })];
+  const people = peopleOf({ kind: "room", r }, items);
+  eq(people.map((p) => [p.key, p.you, p.emoji, p.items.map((i) => i.id)]), [
+    ["r1/c1", true, "emoji of c1", ["m"]],
+    ["r1/c2", false, "emoji of c2", ["a"]],
+    ["r1/c3", false, "emoji of c3", ["b", "c"]],
+  ]);
+});
+
+test("Watched: several streams of one person are one avatar with a count, per room and connection", () => {
+  const r1 = { id: "r1", emojiOf: (id) => id }, r2 = { id: "r2", emojiOf: (id) => id };
+  const it = (r, conn, id) => ({ id, r, conn, owner: "Ritze" });
+  const people = peopleOf({ kind: "watched" }, [it(r1, "c2", "a"), it(r1, "c3", "b"), it(r1, "c2", "c"), it(r2, "c2", "d")]);
+  eq(people.map((p) => [p.key, p.emoji, p.items.map((i) => i.id)]), [["r1/c2", "c2", ["a", "c"]], ["r1/c3", "c3", ["b"]], ["r2/c2", "c2", ["d"]]]);
+});
+
+test("item ids: two same-named owners sharing one label are two tiles, in stream key order whatever the list's order; a reconnect keeps the same two ids", () => {
+  const it = (key) => ({ id: "r1/room/Ritze/video/Screen", s: { key } });
+  const ids = (keys) => {
+    const items = keys.map(it);
+    numberIdentical(items);
+    return Object.fromEntries(items.map((i) => [i.s.key, i.id.replace("r1/room/Ritze/video/Screen", "")]));
+  };
+  eq(ids(["aa:1", "bb:1"]), { "aa:1": "", "bb:1": "#1" });
+  eq(ids(["bb:1", "aa:1"]), { "aa:1": "", "bb:1": "#1" }, "the announcement order does not matter");
+  eq(Object.values(ids(["ff:1", "01:2"])).sort(), ["", "#1"], "new ConnIds: the same two ids, whoever gets which");
+  const other = [{ id: "x", s: { key: "aa:1" } }, { id: "y", s: { key: "aa:2" } }, { id: "r/me" }];
+  numberIdentical(other);
+  eq(other.map((i) => i.id), ["x", "y", "r/me"], "different ids stay as they are");
 });
 
 test("webcam: settings default to the replica's (H.264, 2500 kbps, no mode) and a bad stored value is repaired", () => {

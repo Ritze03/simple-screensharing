@@ -19,7 +19,7 @@ import { previewFor } from "./capture.js";
 import { pipEl, placePip, pipPointerMove, pipPointerUp, pipDragging } from "./pip.js";
 import * as G from "./stage-geom.js";
 import { chromeStart, chromeStep, chromeRemaining } from "./chrome.js";
-import { vg, viewKey, viewOf, layoutOf, collect, visibleItems, itemAspect, audibleFor, itemNumbers, watchFps, watchKbps, watchRes } from "./stage-state.js";
+import { vg, viewKey, viewOf, layoutOf, collect, visibleItems, itemAspect, audibleFor, peopleOf, itemNumbers, watchFps, watchKbps, watchRes } from "./stage-state.js";
 import { renderBar } from "./bar.js";
 import { openTileMenu, renderMenu, positionMenu, closeMenu } from "./menus.js";
 import { watchStream, unwatchStream } from "./rooms.js";
@@ -100,7 +100,7 @@ function tileEl(it, view, key, arena) {
   } else if (audioOnly) {
     // an audio-only sender: no picture, a Listen button (Stop listening while it plays)
     tile.append(vid, h("div", { class: "invite" },
-      avatarEl(it.owner, r.emojiByName(it.owner)),
+      avatarEl(it.owner, r.emojiOf(it.conn)),
       h("b", { text: t("ui.stage.sharing_audio", { name: it.owner }) }),
       h("span", { text: t("ui.room.audio_only") }),
       h("div", { class: "hb g2" }, w
@@ -110,7 +110,7 @@ function tileEl(it, view, key, arena) {
     const prev = r.previews.get(it.s.key);
     if (prev) vid.appendChild(h("img", { src: prev, alt: "" }));
     tile.append(vid, h("div", { class: "invite" },
-      avatarEl(it.owner, r.emojiByName(it.owner)),
+      avatarEl(it.owner, r.emojiOf(it.conn)),
       h("b", { text: t("ui.stage.sharing", { name: it.owner, label: it.label }) }),
       it.s.width ? h("span", { text: `${it.s.width}×${it.s.height}` }) : null,
       h("div", { class: "hb g2" },
@@ -175,14 +175,21 @@ function tileEl(it, view, key, arena) {
 
 let vpop = null; // { cap, room }: the open dropdown; it is rebuilt by every render, so it follows live changes
 const VIEWER_ROWS_MAX = 8;
-const viewerNames = (c, r) => c.dests.get(r.id)?.share?.viewers?.() ?? null;
+/** The members watching my share `c` in room `r`, sorted by name; `null` when the relay does not report viewers. Members, not names: two viewers of one name are two rows,
+ *  each with their own emoji. */
+function viewersOf(c, r) {
+  const share = c.dests.get(r.id)?.share;
+  if (share?.viewers?.() == null) return null;
+  const list = share.viewerIds.map((id) => r.members.find((m) => m.id === id)).filter(Boolean);
+  return list.sort((a, b) => (a.name || "").toLowerCase().localeCompare((b.name || "").toLowerCase()));
+}
 
 /** The viewer count chip of my own tile; `null` when the relay does not report viewers (an older relay): no count rather than a wrong "0". */
 function viewersChip(c, r) {
-  const names = viewerNames(c, r);
-  if (!names) return null;
-  const chip = h("span", { class: "chip-dark viewers", "data-cap": c.id, "data-room": r.id }, ic("visibility"), String(names.length));
-  if (!names.length) {
+  const viewers = viewersOf(c, r);
+  if (!viewers) return null;
+  const chip = h("span", { class: "chip-dark viewers", "data-cap": c.id, "data-room": r.id }, ic("visibility"), String(viewers.length));
+  if (!viewers.length) {
     chip.title = t("ui.room.viewers_none");
     return chip;
   }
@@ -197,11 +204,11 @@ function viewersChip(c, r) {
 function viewersPopEl() {
   const c = S.captures.find((x) => x.id === vpop.cap);
   const r = S.rooms.find((x) => x.id === vpop.room);
-  const names = c && r ? viewerNames(c, r) : null;
-  if (!names || !names.length) return null;
-  const rows = names.slice(0, VIEWER_ROWS_MAX).map((n) => h("div", { class: "hb g2 vrow" }, h("div", { class: "sl", style: "width:22px;flex-basis:22px" }, avatarEl(n, r.emojiByName(n), { sm: true })), h("div", { class: "fl" }, T(n))));
-  if (names.length > VIEWER_ROWS_MAX) rows.push(h("div", { class: "hb g0 vrow more" }, T(`+${names.length - VIEWER_ROWS_MAX}`)));
-  return h("div", { class: "vb g0 vpop" }, h("div", { class: "hb g0 ph" }, T(`${t("ui.room.viewers_title").toUpperCase()} · ${names.length}`)), rows);
+  const viewers = c && r ? viewersOf(c, r) : null;
+  if (!viewers || !viewers.length) return null;
+  const rows = viewers.slice(0, VIEWER_ROWS_MAX).map((m) => h("div", { class: "hb g2 vrow" }, h("div", { class: "sl", style: "width:22px;flex-basis:22px" }, avatarEl(m.name, r.emojiOf(m.id), { sm: true })), h("div", { class: "fl" }, T(m.name))));
+  if (viewers.length > VIEWER_ROWS_MAX) rows.push(h("div", { class: "hb g0 vrow more" }, T(`+${viewers.length - VIEWER_ROWS_MAX}`)));
+  return h("div", { class: "vb g0 vpop" }, h("div", { class: "hb g0 ph" }, T(`${t("ui.room.viewers_title").toUpperCase()} · ${viewers.length}`)), rows);
 }
 function positionViewersPop(win) {
   const doc = win.document;
@@ -222,31 +229,17 @@ function positionViewersPop(win) {
 
 /* ============================== people strip + hover card ============================== */
 
-/** Who the strip shows: a room's members (you first), or the owners of the watched streams (Watched). `{ name, you, emoji, items }`. */
-function peopleOf(view, items) {
-  if (view.kind === "room") {
-    const r = view.r;
-    const members = [...r.members].sort((a, b) => (b.self ? 1 : 0) - (a.self ? 1 : 0));
-    return members.map((m) => ({ name: m.name || "?", you: !!m.self, emoji: r.emojiOf(m.id), items: m.self ? items.filter((i) => i.mine) : items.filter((i) => !i.mine && i.owner === m.name), r }));
-  }
-  const names = [...new Set(items.map((i) => i.owner))];
-  return names.map((n) => {
-    const its = items.filter((i) => i.owner === n);
-    return { name: n, you: false, emoji: its[0].r.emojiByName(n), items: its, r: its[0].r };
-  });
-}
-
 function stripEl(view, items, people, host) {
   const pv = people.map((p) => {
     const its = p.items;
     const popped = its.some((i) => i.popped);
-    const audible = audibleFor(its, p.name, p.you);
+    const audible = audibleFor(its);
     const badges = [
       its.length ? h("span", { class: "lv", text: t("ui.strip.live") }) : null,
       its.length > 1 ? h("span", { class: "cnt", title: t("ui.strip.sharing_n", { count: its.length }), text: String(its.length) }) : null,
       popped ? h("span", { class: "pop" }, ic("open_in_new")) : null,
     ];
-    const props = { class: `pv${its.length ? " streaming" : ""}${popped ? " popped" : ""}${audible ? " audible" : ""}`, "data-user": p.name };
+    const props = { class: `pv${its.length ? " streaming" : ""}${popped ? " popped" : ""}${audible ? " audible" : ""}`, "data-user": p.name, "data-person": p.key };
     if (popped) Object.assign(props, { type: "button", "aria-label": t("ui.strip.bring_all_tip", { name: p.name }), onclick: () => bringBack(its.filter((i) => i.popped)) });
     else props.role = "listitem";
     return h(popped ? "button" : "div", props, avatarEl(p.name, p.emoji, { kids: badges }), h("span", { class: "nm", text: p.you ? t("ui.room.you") : p.name }));
@@ -265,7 +258,7 @@ function cardEl() {
   const view = viewOf(C.view);
   if (!view) return null;
   const items = collect(view);
-  const p = peopleOf(view, items).find((x) => x.name === C.name);
+  const p = peopleOf(view, items).find((x) => x.key === C.person);
   if (!p) return null;
   const its = p.items;
   const cross = view.kind === "watched";
@@ -280,7 +273,7 @@ function cardEl() {
         : it.popped ? [ic("open_in_new"), t("ui.strip.popped")]
           : it.kind === "audio" ? (it.w ? [ic("volume_up"), t("ui.strip.listening")] : [ic("visibility_off"), t("ui.strip.not_watching")])
             : it.w ? [ic("visibility"), t("ui.strip.on_stage")] : [ic("visibility_off"), t("ui.strip.not_watching")];
-    const watching = it.mine ? viewerNames(it.c, it.r) : null;
+    const watching = it.mine ? viewersOf(it.c, it.r) : null;
     const extra = [cross ? it.r.name : null, watching ? t("ui.strip.watching_n", { count: watching.length }) : null].filter(Boolean).join(" · ");
     return h("div", { class: "ust" },
       h("div", { class: "l1" }, h("span", { class: "txt", text: it.label }), h("div", { class: "fl" }),
@@ -291,11 +284,13 @@ function cardEl() {
   });
   return h("div", { class: "utip" + (its.length ? " multi" : ""), role: "tooltip" }, hd, rows);
 }
+/** A person's cell in the strip of `doc`. By `data-person` (room + ConnId), never by `data-user`: that is the name, and two people may have one. */
+const avatarOf = (doc, person) => [...doc.querySelectorAll(".pv[data-person]")].find((e) => e.dataset.person === person);
 function positionCard(win) {
   const doc = win.document;
   const tip = doc.querySelector(".utip");
   if (!tip || !S.card) return;
-  const av = [...doc.querySelectorAll(".pv[data-user]")].find((e) => e.dataset.user === S.card.name);
+  const av = avatarOf(doc, S.card.person);
   if (!av) {
     S.card = null;
     tip.remove();
@@ -311,21 +306,21 @@ function positionCard(win) {
 function cardPointer(e, host) {
   if (drag) return;
   const doc = host.doc;
-  const over = e.target.closest && e.target.closest(".pv[data-user]");
+  const over = e.target.closest && e.target.closest(".pv[data-person]");
   const q = { x: e.clientX, y: e.clientY };
   if (S.card) {
     const tip = doc.querySelector(".utip");
-    const av = [...doc.querySelectorAll(".pv[data-user]")].find((x) => x.dataset.user === S.card.name);
+    const av = avatarOf(doc, S.card.person);
     const keeps = tip && av && G.cardKeeps(tip.getBoundingClientRect(), av.querySelector(".avatar").getBoundingClientRect(), q);
-    if (keeps && !(over && over.dataset.user !== S.card.name)) return;
-    if (!over || over.dataset.user !== S.card.name) {
+    if (keeps && !(over && over.dataset.person !== S.card.person)) return;
+    if (!over || over.dataset.person !== S.card.person) {
       S.card = null;
       if (!over) return A.render();
     }
   }
   if (over && !S.card && !(chromeOn && !chromeShown)) {
     const stg = over.closest(".stg");
-    S.card = { name: over.dataset.user, view: stg ? stg.dataset.view : null, hostId: host.id };
+    S.card = { person: over.dataset.person, view: stg ? stg.dataset.view : null, hostId: host.id };
     A.render();
   }
 }

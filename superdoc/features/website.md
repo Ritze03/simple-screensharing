@@ -49,6 +49,13 @@ docs/dev/        harness, tests, scenarios, e2e        (README.md)  not linked f
   kind + label); a reconnect gives the sharer a fresh ConnId and so a new stream key, and the core
   cannot tell that from stop + restart. Resume policy is therefore UI-side (60 s list in
   `docs/js/ui/rooms.js`, same window as the native `REWATCH_GRACE`).
+- **A person is a connection** (2026-11-04, #127; native twin in `ui/APP-SHELL.md` "The stage"). A stage item carries `conn` (its
+  owner's ConnId) and `peopleOf`, `sameOwner`, `audibleFor`, the hover card (`S.card.person`, `data-person` = room + ConnId; `data-user`
+  stays the name, for tests only), the emoji (`r.emojiOf(id)`, `emojiByName` is gone) and the viewers dropdown (`viewersOf`, from
+  `share.viewerIds`) go by it, never by name. `stableKey` stays what it is, so two same-named sharers of one label have one
+  `stableKey`: `numberIdentical` gives their item ids `#1`, `#2` in stream key order. After a reconnect the two may swap numbers, places
+  and resumed watches; nothing is lost. *Why:* the user, running two clients under one name: "Both are
+  technically me, but that should be properly handled!".
 - **`reconnectNow()`** ("Retry now"): skips the backoff and cancels a stuck handshake; while
   connected it re-joins. **Link-expiry vs unreachable heuristics:** Chromium cannot say why a
   handshake failed, so only a hash that has *never* worked in this page (pinned or, after the retry

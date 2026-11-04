@@ -82,7 +82,8 @@ buttons, one menu style, stage pop-out, fullscreen auto-hide, emoji avatars. The
   `A.flush()` when it ends. Anything new that tracks the pointer across several events must do the same, or the full re-render replaces the element under the pointer.
 * **Pointer-driven overlays decide by geometry, not by `mouseleave`.** Every render replaces both the trigger and the overlay, and a replaced element never gets its
   `mouseleave`: the hover card (`cardKeeps`) and the viewers dropdown test the pointer position on `pointermove` of the document.
-* **Item ids are `room id + stableKey`** (your own share `<room>/me`), never the stream key: a reconnect gives the sharer a new ConnId and must keep the layout.
+* **Item ids are `room id + stableKey`** (your own share `<room>/me`), never the stream key: a reconnect gives the sharer a new ConnId and must keep the layout. Identical ones get `#1`, `#2` (`numberIdentical`).
+* **A person is a connection:** whose an item is goes by `it.conn` (room + ConnId across rooms, `peopleOf`), never by `it.owner`, which is only the name to show. Two members may have one name.
 * **Menus:** open one with `opener(mk, kind, extra)` (a control) or `openMenu`; add a body to `menus.js` `BODIES`. `S.menu.hostId` says which window draws it (main or the stage window).
 * **No `<select>`.** A dropdown is `selectField`.
 * **Webcam in picture state is per view, keyed by the webcam's item id** (`vg(key).pip[id] = { w, spot, x, y }`): the spot survives layouts, tile resizes and fullscreen.

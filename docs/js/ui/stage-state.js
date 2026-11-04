@@ -5,6 +5,11 @@
 // its own order, grid, window rects and z-order (`vg`), UI-private and not persisted. Streams are keyed by an item id built from the
 // core's `stableKey` (room + sharer name + kind + label), never by the stream key whose ConnId changes with every reconnect, so a
 // reconnect keeps the layout (the browser twin of native `ItemId`). Your own share is `<room>/me`.
+//
+// A PERSON is a connection, not a name: two members of one name are two people (`Why:` the user runs two clients under one name, "Both are
+// technically me, but that should be properly handled!"). So an item carries `conn` (its owner's ConnId) and everything that asks "whose is
+// this" compares that, room + conn across rooms (`peopleOf`, `sameOwner`). The name only labels. The item id above is the one thing that stays
+// name-based, because it must outlive the ConnId: `numberIdentical` keeps two same-named owners' same-labelled streams apart.
 
 import { isWebcamLabel, WEBCAM_LABEL } from "../core/index.js";
 import { S, displayName } from "./store.js";
@@ -83,42 +88,38 @@ export function itemAspect(it) {
  * What `view` shows, in the session's order: a room's streams of other people (watched ones as video, the others as an idle "X is sharing Y"
  * tile, an audio-only sender as a Listen tile), then your own live screen and webcam; "Watched" has every watched video stream of every room
  * and nothing else.
- * Item: `{ id, kind: "video"|"idle"|"audio"|"mine", r, s, w, c, d, owner, label, mine, cam, popped, ar, inPip, pipCam }`. `cam`: a webcam (its label
+ * Item: `{ id, kind: "video"|"idle"|"audio"|"mine", r, s, w, c, d, conn, owner, label, mine, cam, popped, ar, inPip, pipCam }`. `conn`: the owner's ConnId, whose it
+ * is (`owner` is their display name, only for showing). `cam`: a webcam (its label
  * starts with "Webcam"). `kind: "audio"`: `w` is the Listen watch (null while not listening). `inPip`: a webcam drawn inside its owner's screen
  * share (no tile of its own); `pipCam`: on that screen share, the webcam item inside it.
  */
 export function collect(view) {
   const out = [];
-  const seen = new Map();
-  const uniq = (base) => {
-    const n = seen.get(base) || 0;
-    seen.set(base, n + 1);
-    return n ? `${base}#${n}` : base;
-  };
-  const stableId = (r, s) => uniq(`${r.id}/${s.stableKey || `${s.ownerName}/${s.label}`}`);
+  const stableId = (r, s) => `${r.id}/${s.stableKey || `${s.ownerName}/${s.label}`}`;
   if (view.kind === "room") {
     const r = view.r;
     for (const s of r.streams) {
       if (s.self) continue;
       if (s.kind === "video") {
         const w = r.watches.get(s.key) || null;
-        out.push({ id: stableId(r, s), kind: w ? "video" : "idle", r, s, w, owner: s.ownerName || r.memberName(s.owner), label: s.label, mine: false });
+        out.push({ id: stableId(r, s), kind: w ? "video" : "idle", r, s, w, conn: s.owner, owner: s.ownerName || r.memberName(s.owner), label: s.label, mine: false });
       } else if (s.kind === "audio" && !r.ownerHasVideo(s.owner)) {
         // an audio-only sender: a Listen tile (with a screen the audio rides along with the screen's watch and has no tile)
-        out.push({ id: stableId(r, s), kind: "audio", r, s, w: r.watches.get(s.key) || null, owner: s.ownerName || r.memberName(s.owner), label: s.label, mine: false });
+        out.push({ id: stableId(r, s), kind: "audio", r, s, w: r.watches.get(s.key) || null, conn: s.owner, owner: s.ownerName || r.memberName(s.owner), label: s.label, mine: false });
       }
     }
     const c = capInRoom(r.id);
-    if (c && c.dests.get(r.id)) out.push({ id: `${r.id}/me`, kind: "mine", r, c, d: c.dests.get(r.id), owner: displayName(), label: captureName(c), mine: true });
+    if (c && c.dests.get(r.id)) out.push({ id: `${r.id}/me`, kind: "mine", r, c, d: c.dests.get(r.id), conn: r.selfId, owner: displayName(), label: captureName(c), mine: true });
     // your webcam is a share of its own: a tile like your screen's (native `Kind::Mine` with the label "Webcam")
     const cam = webcamInRoom(r.id);
-    if (cam && cam.dests.get(r.id)) out.push({ id: `${r.id}/me/cam`, kind: "mine", r, c: cam, d: cam.dests.get(r.id), owner: displayName(), label: WEBCAM_LABEL, mine: true });
+    if (cam && cam.dests.get(r.id)) out.push({ id: `${r.id}/me/cam`, kind: "mine", r, c: cam, d: cam.dests.get(r.id), conn: r.selfId, owner: displayName(), label: WEBCAM_LABEL, mine: true });
   } else {
     for (const { r, w } of allWatches()) {
       const s = r.streams.find((x) => x.key === w.key) || { key: w.key, owner: w.owner, ownerName: w.ownerName, label: w.label, width: 0, height: 0 };
-      out.push({ id: stableId(r, s), kind: "video", r, s, w, owner: w.ownerName, label: w.label, mine: false });
+      out.push({ id: stableId(r, s), kind: "video", r, s, w, conn: s.owner, owner: w.ownerName, label: w.label, mine: false });
     }
   }
+  numberIdentical(out);
   for (const it of out) {
     it.cam = isWebcamLabel(it.label);
     it.label = shareLabel(it.label);
@@ -127,6 +128,37 @@ export function collect(view) {
   }
   markPip(view, out);
   return out;
+}
+
+/** Items with one id (two same-named owners sharing one label, or one owner's two "Screen"s) get `#1`, `#2`... in stream key order, so a tile never shares its layout
+ *  with another (native `number_identical`). `Why` stream key order and not the list's: the same stream keeps its number from frame to frame. A ConnId is new after a
+ *  reconnect, so two same-named owners may swap numbers then, and so places: nothing is lost, and no identity that survives a reconnect can tell them apart. */
+export function numberIdentical(items) {
+  const seen = new Map();
+  const key = (i) => (i.s ? i.s.key : "");
+  for (const it of [...items].sort((a, b) => (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0))) {
+    const n = seen.get(it.id) || 0;
+    seen.set(it.id, n + 1);
+    if (n) it.id = `${it.id}#${n}`;
+  }
+}
+
+/** Who the strip shows: a room's members (you first), or the owners of the watched streams (Watched). A person is a connection, so `key` is room + ConnId
+ *  and a person's `items` are the ones with their `conn`: never compare names here. `{ key, name, you, emoji, items, r }`. */
+export function peopleOf(view, items) {
+  const personKey = (r, conn) => `${r.id}/${conn}`;
+  if (view.kind === "room") {
+    const r = view.r;
+    const members = [...r.members].sort((a, b) => (b.self ? 1 : 0) - (a.self ? 1 : 0));
+    return members.map((m) => ({ key: personKey(r, m.id), name: m.name || "?", you: !!m.self, emoji: r.emojiOf(m.id), items: items.filter((i) => (m.self ? i.mine : !i.mine && i.conn === m.id)), r }));
+  }
+  const people = new Map();
+  for (const it of items) {
+    const key = personKey(it.r, it.conn);
+    if (!people.has(key)) people.set(key, { key, name: it.owner, you: false, emoji: it.r.emojiOf(it.conn), items: [], r: it.r });
+    people.get(key).items.push(it);
+  }
+  return [...people.values()];
 }
 
 /** A label that is a known default in any language shows in the current one (native `share_label`): the webcam's wire label is `Webcam` everywhere, a Desktop
@@ -139,8 +171,8 @@ export function shareLabel(raw) {
 
 /* ---------- webcam in picture: who sits inside whom ---------- */
 
-/** Whether a webcam item and its parent are the same person (the same room, and you are you: your name could be someone else's). */
-const sameOwner = (a, b) => a.r === b.r && (a.mine ? b.mine : !b.mine && a.owner === b.owner);
+/** Whether a webcam item and its parent are the same person: the same room and the same connection (a name could be someone else's). */
+const sameOwner = (a, b) => a.r === b.r && a.conn === b.conn;
 /** An item that is playing on the stage: a watched stream or your own share, not in a pop-out window. A stream in the FULLSCREEN stage still counts: the
  *  PIP goes with it into the fullscreen (native `fullscreen_pip`), only a pop-out window shows its stream alone. */
 const playing = (i) => (i.kind === "video" || i.kind === "mine") && (!i.popped || (i.w && i.w.popped === "fullscreen"));
@@ -149,7 +181,7 @@ const playing = (i) => (i.kind === "video" || i.kind === "mine") && (!i.popped |
  * Webcam in picture (native `pip_pairs`, the replica's `pipPairs`): parent item id -> the webcam item that sits inside it. The parent is the webcam
  * owner's first screen share, in the view's order, that is on the stage and playing (yours, or one you watch, and not popped out), in the same room; the
  * webcam must be playing too. With none, the webcam stays a tile (a webcam you cannot see playing in a picture would have no Watch button anywhere).
- * One parent holds one webcam: the first one, a second keeps its tile. Pure: `items` carry `{ id, kind, cam, owner, mine, r, popped, w }`.
+ * One parent holds one webcam: the first one, a second keeps its tile. Pure: `items` carry `{ id, kind, cam, conn, r, popped, w }`.
  */
 export function pipPairs(items, order) {
   const list = order.map((id) => items.find((i) => i.id === id)).filter((i) => i && playing(i));
@@ -183,12 +215,12 @@ export function visibleItems(view, items) {
   return g.order.map((id) => items.find((i) => i.id === id)).filter((i) => i && !i.popped && !i.inPip && !(S.stage.hideOwn && i.mine));
 }
 
-/** Whether the person called `name` shares audible audio in `items` (a watched stream whose sender shares audio and is not muted, or
- *  my own share with audio that is not muted): the strip's green ring. */
-export function audibleFor(items, name, self) {
+/** Whether a person's `items` carry audible audio (a watched stream whose sender shares audio and is not muted, or my own share with audio that is not muted): the
+ *  strip's green ring. */
+export function audibleFor(items) {
   return items.some((it) => {
-    if (it.mine) return self && !!it.c.audio && !it.c.audioMuted;
-    return it.owner === name && !!it.w && !it.cam && it.r.hasAudio(it.s.owner) && !it.w.muted; // a webcam brings no audio
+    if (it.mine) return !!it.c.audio && !it.c.audioMuted;
+    return !!it.w && !it.cam && it.r.hasAudio(it.s.owner) && !it.w.muted; // a webcam brings no audio
   });
 }
 

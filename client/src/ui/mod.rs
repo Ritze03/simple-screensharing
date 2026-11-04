@@ -669,13 +669,11 @@ impl<'a> Cx<'a> {
         }
     }
 
-    /// The emoji avatar of the member called `name` in `room` ("" for none or an unknown member). Your own
-    /// entry comes from your setting (`RoomSession::emoji_of`), so a change shows at once. Names, not
-    /// `ConnId`s, because stage items and the strip identify people by display name.
-    pub fn emoji_of_name(&self, room: RoomHandle, name: &str) -> String {
-        self.session(room)
-            .and_then(|s| s.members.iter().find(|m| m.display_name == name).map(|m| s.emoji_of(m.conn_id)))
-            .unwrap_or_default()
+    /// The emoji avatar of the connection `conn` in `room` ("" for none or an unknown member). Your own entry
+    /// comes from your setting (`RoomSession::emoji_of`), so a change shows at once. `Why` not by name: a person is a
+    /// connection, and the first member of a name may be someone else, even you (the roster's order is the relay's).
+    pub fn emoji_of(&self, room: RoomHandle, conn: ConnId) -> String {
+        self.session(room).map(|s| s.emoji_of(conn)).unwrap_or_default()
     }
 
     /// Display name of `owner` in `room` ("?" if unknown).
@@ -958,7 +956,7 @@ pub fn volume_slider(ui: &mut Ui, percent: &mut u32) -> egui::Response {
 
 /// The one place a person's avatar is drawn (task I3): the name's gradient and its initial, in `rect`, with
 /// the green presence dot when `presence`. The strip, the hover card, tiles, menus and the user band all call
-/// this. `emoji` ("" = none; look it up with [`Cx::emoji_of_name`]) replaces the initial and sets the
+/// this. `emoji` ("" = none; look it up with [`Cx::emoji_of`]) replaces the initial and sets the
 /// background from its own colour; otherwise the colours are a pure function of the display name
 /// (`theme::avatar_colors`, `APP-SHELL.md` "Avatar colour").
 pub fn paint_person(ui: &Ui, rect: Rect, name: &str, emoji: &str, presence: bool) {

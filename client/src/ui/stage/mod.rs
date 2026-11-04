@@ -22,7 +22,8 @@
 //!   left out: modals opened from it appear in the main window.
 //! - **Per-view state** (`StageState`, UI-private, per session, not persisted): each room and "Watched" keep
 //!   their own order, grid, window rects and z-order. Streams are keyed by [`ItemId`] (room handle + owner
-//!   name + label), not by `ConnId`/`StreamId`, so a reconnect keeps the layout. The layout choice and the
+//!   name + label), not by `ConnId`/`StreamId`, so a reconnect keeps the layout. **A person is a connection**
+//!   (room + `ConnId`, [`Item::conn`]): whose a stream is never goes by the name, see [`ItemId`]. The layout choice and the
 //!   two stage options live in [`StageSettings`] (`Shell::stage`), because the Layout menu and the tiles read
 //!   them through [`UiAction::SetStageLayout`], [`UiAction::SetHideOwnStreams`] and
 //!   [`UiAction::SetAlwaysShowNames`].
@@ -62,7 +63,7 @@ use std::collections::{HashMap, HashSet};
 
 use egui::{Align, CursorIcon, Id, Pos2, Rect, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
 use simple_screensharing_client::capture::webcam;
-use simple_screensharing_client::protocol::{StreamInfo, StreamKind};
+use simple_screensharing_client::protocol::{ConnId, StreamInfo, StreamKind};
 use simple_screensharing_client::session::{CaptureSourceId, DestinationId, RoomHandle};
 
 use geom::{Bar, FRect, Grid, PipGeo, PipPos};
@@ -155,8 +156,9 @@ impl Cx<'_> {
 }
 
 /// A tile's identity across reconnects: room + owner name + label (+ audio flag, + the n-th of identical
-/// ones). Your own share is `who == ""` (one per room). `Why` not `StreamKey`: `ConnId` and `StreamId` change
-/// with every reconnect (`WantedStream`).
+/// ones, [`number_identical`]). Your own share is `who == ""` (one per room). `Why` not `StreamKey`: `ConnId` and
+/// `StreamId` change with every reconnect (`WantedStream`). It names a place in the layout, nothing else: whose a
+/// stream is goes by [`Item::conn`], because two people may have one name.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ItemId {
     room: RoomHandle,
@@ -248,6 +250,9 @@ enum Kind {
 
 struct Item {
     id: ItemId,
+    /// Whose it is: a person is a connection, so this and the room say who, never `id.who` (the name, for showing).
+    /// Yours is your own `ConnId`.
+    conn: ConnId,
     kind: Kind,
     /// Aspect ratio (w/h) of the picture.
     ar: f32,
@@ -261,6 +266,30 @@ impl Item {
     /// A webcam (its label starts with `Webcam`, plan D7): yours or someone else's.
     fn is_cam(&self) -> bool {
         webcam::is_webcam_label(&self.id.label)
+    }
+
+    /// The stream id of someone else's stream.
+    fn stream_id(&self) -> Option<u8> {
+        match &self.kind {
+            Kind::Video(key) | Kind::Idle(key, _) | Kind::Audio(key, _) => Some(key.2),
+            Kind::Mine(..) => None,
+        }
+    }
+}
+
+/// Give items of one identity (two same-named owners sharing one label, or one owner's two "Screen"s) their `nth`, in
+/// `(ConnId, StreamId)` order, so a tile never shares its layout with another. `Why` that order and not the list's: the
+/// same stream keeps its number from frame to frame, whatever order the announcements came in. A `ConnId` is random
+/// and new after a reconnect, so two same-named owners may swap numbers then and with them their places: nothing is lost,
+/// and nothing that survives a reconnect can tell the two apart (`session::match_wanted` has the same limit).
+fn number_identical(items: &mut [Item]) {
+    let mut by_conn: Vec<usize> = (0..items.len()).collect();
+    by_conn.sort_by_key(|&k| (items[k].conn, items[k].stream_id()));
+    let mut seen: HashMap<ItemId, u8> = HashMap::new();
+    for k in by_conn {
+        let n = seen.entry(items[k].id.clone()).or_default();
+        items[k].id.nth = *n;
+        *n = n.saturating_add(1);
     }
 }
 
@@ -278,8 +307,8 @@ fn pip_pairs(items: &[Item], order: &[ItemId]) -> HashMap<ItemId, usize> {
         .collect();
     let mut pairs = HashMap::new();
     for &c in list.iter().filter(|&&k| items[k].is_cam()) {
-        let owner = (items[c].id.room, &items[c].id.who);
-        if let Some(&p) = list.iter().find(|&&k| !items[k].is_cam() && (items[k].id.room, &items[k].id.who) == owner) {
+        let owner = (items[c].id.room, items[c].conn);
+        if let Some(&p) = list.iter().find(|&&k| !items[k].is_cam() && (items[k].id.room, items[k].conn) == owner) {
             pairs.insert(items[p].id.clone(), c);
         }
     }
@@ -293,11 +322,10 @@ fn aspect(w: f32, h: f32) -> f32 {
 /// What `view` shows, in the session's order.
 fn collect(cx: &Cx, view: &StageView) -> Vec<Item> {
     let mut out: Vec<Item> = Vec::new();
-    let mut add = |room: RoomHandle, who: String, label: String, audio: bool, kind: Kind, ar: f32| {
-        let nth = out.iter().filter(|i| i.id.room == room && i.id.who == who && i.id.label == label && i.id.audio == audio).count() as u8;
+    let mut add = |room: RoomHandle, conn: ConnId, who: String, label: String, audio: bool, kind: Kind, ar: f32| {
         let popped = matches!(&kind, Kind::Video(k) if cx.is_popped(*k));
         let mine = matches!(kind, Kind::Mine(..));
-        out.push(Item { id: ItemId { room, who, label, audio, nth }, kind, ar, mine, popped, in_pip: false });
+        out.push(Item { id: ItemId { room, who, label, audio, nth: 0 }, conn, kind, ar, mine, popped, in_pip: false });
     };
     let mine_ar = |capture: CaptureSourceId, destination: DestinationId| {
         let p = cx.capture(capture).and_then(|c| c.destinations.get(&destination)).map(|d| match &d.runtime {
@@ -316,31 +344,33 @@ fn collect(cx: &Cx, view: &StageView) -> Vec<Item> {
                 let key = (*h, info.owner, info.stream_id);
                 let who = cx.member_name(*h, info.owner);
                 if info.kind == StreamKind::Audio {
-                    add(*h, who, info.label.clone(), true, Kind::Audio(key, info.clone()), aspect(0.0, 0.0));
+                    add(*h, info.owner, who, info.label.clone(), true, Kind::Audio(key, info.clone()), aspect(0.0, 0.0));
                 } else if cx.videos.get(key).is_some() {
-                    add(*h, who, info.label.clone(), false, Kind::Video(key), video_ar(key, Some(info)));
+                    add(*h, info.owner, who, info.label.clone(), false, Kind::Video(key), video_ar(key, Some(info)));
                 } else {
-                    add(*h, who, info.label.clone(), false, Kind::Idle(key, info.clone()), aspect(info.width as f32, info.height as f32));
+                    add(*h, info.owner, who, info.label.clone(), false, Kind::Idle(key, info.clone()), aspect(info.width as f32, info.height as f32));
                 }
             }
+            let me = cx.session(*h).map_or(0, |s| s.client.conn_id());
             if let Some(room) = cx.stage_room(*h)
                 && let ShareState::Live { capture, destination } = cx.share_state(&room)
             {
-                add(*h, String::new(), String::new(), false, Kind::Mine(capture, destination), mine_ar(capture, destination));
+                add(*h, me, String::new(), String::new(), false, Kind::Mine(capture, destination), mine_ar(capture, destination));
             }
             // Your webcam is a share of its own (task I8), a tile like your screen's.
             if let Some((capture, destination, _)) = cx.webcam_share(*h) {
-                add(*h, String::new(), webcam::LABEL.to_string(), false, Kind::Mine(capture, destination), mine_ar(capture, destination));
+                add(*h, me, String::new(), webcam::LABEL.to_string(), false, Kind::Mine(capture, destination), mine_ar(capture, destination));
             }
         }
         StageView::Watched => {
             for key in cx.watched() {
                 let info = cx.session(key.0).and_then(|s| s.streams.iter().find(|i| i.owner == key.1 && i.stream_id == key.2));
                 let label = info.map(|i| i.label.clone()).unwrap_or_default();
-                add(key.0, cx.member_name(key.0, key.1), label, false, Kind::Video(key), video_ar(key, info));
+                add(key.0, key.1, cx.member_name(key.0, key.1), label, false, Kind::Video(key), video_ar(key, info));
             }
         }
     }
+    number_identical(&mut out);
     out
 }
 
@@ -942,18 +972,33 @@ mod tests {
 
     const ROOM: RoomHandle = RoomHandle(1);
 
+    /// A connection per name, unless a test says otherwise ([`of`]).
+    fn conn(who: &str) -> ConnId {
+        who.bytes().map(u64::from).sum()
+    }
+
     fn item(who: &str, label: &str, kind: Kind) -> Item {
         let mine = matches!(kind, Kind::Mine(..));
-        Item { id: ItemId { room: ROOM, who: who.into(), label: label.into(), audio: false, nth: 0 }, kind, ar: 16.0 / 9.0, mine, popped: false, in_pip: false }
+        let conn = match &kind {
+            Kind::Video(key) | Kind::Idle(key, _) | Kind::Audio(key, _) => key.1,
+            Kind::Mine(..) => conn(who),
+        };
+        Item { id: ItemId { room: ROOM, who: who.into(), label: label.into(), audio: false, nth: 0 }, conn, kind, ar: 16.0 / 9.0, mine, popped: false, in_pip: false }
     }
 
     fn video(who: &str, label: &str, stream: u8) -> Item {
-        item(who, label, Kind::Video((ROOM, 7, stream)))
+        of(conn(who), who, label, stream)
+    }
+
+    /// A watched stream of the connection `owner`, whatever its name.
+    fn of(owner: ConnId, who: &str, label: &str, stream: u8) -> Item {
+        item(who, label, Kind::Video((ROOM, owner, stream)))
     }
 
     fn idle(who: &str, label: &str, stream: u8) -> Item {
-        let info = StreamInfo { owner: 7, stream_id: stream, kind: StreamKind::Video, label: label.into(), width: 1280, height: 720 };
-        item(who, label, Kind::Idle((ROOM, 7, stream), info))
+        let owner = conn(who);
+        let info = StreamInfo { owner, stream_id: stream, kind: StreamKind::Video, label: label.into(), width: 1280, height: 720 };
+        item(who, label, Kind::Idle((ROOM, owner, stream), info))
     }
 
     fn order(items: &[Item]) -> Vec<ItemId> {
@@ -992,8 +1037,9 @@ mod tests {
         popped[1].popped = true;
         assert!(none(&popped), "so is the webcam");
         // An audio-only sender is no picture.
-        let info = StreamInfo { owner: 7, stream_id: 5, kind: StreamKind::Audio, label: "Desktop audio".into(), width: 0, height: 0 };
-        let mut audio = [item("Jonas", "Desktop audio", Kind::Audio((ROOM, 7, 5), info)), video("Jonas", "Webcam", 2)];
+        let owner = conn("Jonas");
+        let info = StreamInfo { owner, stream_id: 5, kind: StreamKind::Audio, label: "Desktop audio".into(), width: 0, height: 0 };
+        let mut audio = [item("Jonas", "Desktop audio", Kind::Audio((ROOM, owner, 5), info)), video("Jonas", "Webcam", 2)];
         audio[0].id.audio = true;
         assert!(none(&audio));
     }
@@ -1010,5 +1056,51 @@ mod tests {
         let mut other_room = [video("Jonas", "Screen", 1), video("Jonas", "Webcam", 2)];
         other_room[1].id.room = RoomHandle(2);
         assert!(pip_pairs(&other_room, &order(&other_room)).is_empty());
+    }
+
+    /// The user's report: two clients in one room under one name. A person is a connection, so a webcam goes into its
+    /// own connection's screen, not the first screen of that name.
+    #[test]
+    fn a_webcam_stays_with_its_connection_when_two_people_have_one_name() {
+        let mut items = [of(1, "Ritze", "Screen", 1), of(2, "Ritze", "Screen", 1), of(2, "Ritze", "Webcam", 2)];
+        number_identical(&mut items);
+        let pairs = pip_pairs(&items, &order(&items));
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[&items[1].id], 2, "in the second Ritze's screen");
+        // The other Ritze's screen alone is no parent.
+        let mut items = [of(1, "Ritze", "Screen", 1), of(2, "Ritze", "Webcam", 2)];
+        number_identical(&mut items);
+        assert!(pip_pairs(&items, &order(&items)).is_empty());
+    }
+
+    /// Two same-named owners sharing one label are two tiles, in `(ConnId, StreamId)` order whatever the list's order is.
+    #[test]
+    fn identical_items_get_their_own_id_in_a_stable_order() {
+        let ids = |mut items: Vec<Item>| {
+            number_identical(&mut items);
+            let mut v: Vec<(ConnId, u8, u8)> = items.iter().map(|i| (i.conn, i.stream_id().unwrap(), i.id.nth)).collect();
+            v.sort();
+            v
+        };
+        let want = vec![(1, 4, 0), (1, 9, 1), (2, 0, 2)];
+        assert_eq!(ids(vec![of(2, "Ritze", "Screen", 0), of(1, "Ritze", "Screen", 9), of(1, "Ritze", "Screen", 4)]), want);
+        assert_eq!(ids(vec![of(1, "Ritze", "Screen", 4), of(2, "Ritze", "Screen", 0), of(1, "Ritze", "Screen", 9)]), want, "the announcement order does not matter");
+        // Different labels, an audio flag or another name are not identical.
+        let mut items = vec![of(1, "Ritze", "Screen", 0), of(1, "Ritze", "Webcam", 1), of(2, "Mo", "Screen", 0)];
+        number_identical(&mut items);
+        assert!(items.iter().all(|i| i.id.nth == 0));
+    }
+
+    /// A reconnect gives both owners new `ConnId`s: the two ids stay the same two, whoever gets which, so the layout
+    /// keyed by them survives (they may swap places, nothing is lost).
+    #[test]
+    fn a_reconnect_keeps_both_ids_of_two_same_named_owners() {
+        let mut before = [of(10, "Ritze", "Screen", 0), of(20, "Ritze", "Screen", 0)];
+        number_identical(&mut before);
+        let mut after = [of(99, "Ritze", "Screen", 3), of(5, "Ritze", "Screen", 1)];
+        number_identical(&mut after);
+        let set = |i: &[Item]| i.iter().map(|x| x.id.clone()).collect::<HashSet<_>>();
+        assert_eq!(set(&before).len(), 2);
+        assert_eq!(set(&before), set(&after));
     }
 }

@@ -72,11 +72,6 @@ export class RoomEntry {
   emojiOf(id) {
     return this.client ? this.client.emojiOf(id) : "";
   }
-  /** The emoji of the member called `name` here (stage items and the strip identify people by display name: a ConnId changes on reconnect). */
-  emojiByName(name) {
-    const m = this.members.find((x) => x.name === name);
-    return m ? this.emojiOf(m.id) : "";
-  }
 }
 
 export const roomById = (id) => S.rooms.find((r) => r.id === id) || null;

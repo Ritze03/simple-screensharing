@@ -16,7 +16,7 @@ use egui::{Align, Color32, CornerRadius, Id, Layout, Rect, Response, Sense, Shap
 use simple_screensharing_client::capture::destination::DestinationState;
 use simple_screensharing_client::decode::ViewState;
 use simple_screensharing_client::decode::render::Fit;
-use simple_screensharing_client::protocol::{StreamInfo, StreamKind};
+use simple_screensharing_client::protocol::{ConnId, StreamInfo, StreamKind};
 use simple_screensharing_client::session::{CaptureSourceId, DestinationId, RoomHandle};
 
 use super::{ItemId, VolDrag};
@@ -270,7 +270,7 @@ pub(super) fn idle_tile(ui: &mut Ui, cx: &Cx, key: StreamKey, info: &StreamInfo,
     let mut y = top;
     if full {
         let disc = Rect::from_center_size(pos2(rect.center().x, y + 26.0), vec2(52.0, 52.0));
-        crate::ui::paint_person(ui, disc, &name, &cx.emoji_of_name(key.0, &name), false);
+        crate::ui::paint_person(ui, disc, &name, &cx.emoji_of(key.0, key.1), false);
         y += 52.0 + theme::S2;
         let text = if audio_only {
             tr_with("ui.stage.sharing_audio", "%{name} is sharing audio", &[("name", &name)])
@@ -370,9 +370,9 @@ pub(super) fn mine_tile(ui: &mut Ui, cx: &Cx, h: RoomHandle, capture: CaptureSou
     drive_dump::rect(|| format!("tool.{}.settings", s.n), btn);
     let row = Rect::from_min_max(pos2(inner.left(), inner.top()), pos2(btn.left() - theme::S1, inner.top() + OVL_H));
     let mut r = ui.new_child(UiBuilder::new().max_rect(row).layout(Layout::right_to_left(Align::Center)));
-    if let Some(names) = viewer_names(cx, h, d.stream_id) {
-        let chip = widgets::chip_dark(&mut r, Some("visibility"), false, &names.len().to_string());
-        viewers_dropdown(ui, cx, h, &chip, &names);
+    if let Some(viewers) = viewer_list(cx, h, d.stream_id) {
+        let chip = widgets::chip_dark(&mut r, Some("visibility"), false, &viewers.len().to_string());
+        viewers_dropdown(ui, cx, h, &chip, &viewers);
     }
     if live_tex.is_some() {
         // Says the picture is a local preview, not what viewers get.
@@ -529,18 +529,18 @@ fn thumb_placeholder(ui: &Ui, thumb: Rect, icon: &str, icon_col: Color32, label:
     paint_text(ui, line(cy + 6.0, 16.0), label, font(Weight::Regular, theme::FS_TINY), theme::TEXT_FAINT, Align::Center);
 }
 
-/// Display names of the people watching our stream `stream_id` in room `h` (the relay's list,
-/// spec 9.1, resolved through the roster, sorted). `None` when the relay does not report viewers
-/// (an older relay): the card then shows no count at all, since "0" would be a lie.
-pub(super) fn viewer_names(cx: &Cx, h: RoomHandle, stream_id: u8) -> Option<Vec<String>> {
+/// The connections and display names of the people watching our stream `stream_id` in room `h` (the
+/// relay's list, spec 9.1, resolved through the roster, sorted by name). `None` when the relay does not
+/// report viewers (an older relay): the card then shows no count at all, since "0" would be a lie.
+pub(super) fn viewer_list(cx: &Cx, h: RoomHandle, stream_id: u8) -> Option<Vec<(ConnId, String)>> {
     let s = cx.session(h)?;
     if !s.viewers_supported {
         return None;
     }
     let ids = s.viewers.get(&stream_id).map(|(v, _)| v.as_slice()).unwrap_or(&[]);
-    let mut names: Vec<String> = ids.iter().filter_map(|c| s.members.iter().find(|m| m.conn_id == *c)).map(|m| m.display_name.clone()).collect();
-    names.sort_by_key(|n| n.to_lowercase());
-    Some(names)
+    let mut viewers: Vec<(ConnId, String)> = ids.iter().filter_map(|c| s.members.iter().find(|m| m.conn_id == *c)).map(|m| (m.conn_id, m.display_name.clone())).collect();
+    viewers.sort_by_key(|(conn, name)| (name.to_lowercase(), *conn));
+    Some(viewers)
 }
 
 /// Most viewer rows the dropdown lists; the rest collapse into one "+N" row.
@@ -553,8 +553,8 @@ const VIEWERS_POP_W: f32 = 200.0;
 /// viewer, avatar then name, the same avatar the people strip uses. Open while the pointer is on the
 /// chip or, once open, anywhere on the chip, the dropdown or the gap between them, so the pointer
 /// can travel into it. Nobody watching: no dropdown, a plain tooltip says so.
-fn viewers_dropdown(ui: &Ui, cx: &Cx, room: RoomHandle, chip: &Response, names: &[String]) {
-    if names.is_empty() {
+fn viewers_dropdown(ui: &Ui, cx: &Cx, room: RoomHandle, chip: &Response, viewers: &[(ConnId, String)]) {
+    if viewers.is_empty() {
         chip.clone().on_hover_text(tr("ui.room.viewers_none", "Nobody is watching this yet."));
         return;
     }
@@ -567,8 +567,8 @@ fn viewers_dropdown(ui: &Ui, cx: &Cx, room: RoomHandle, chip: &Response, names: 
         ctx.data_mut(|d| d.remove::<Rect>(id));
         return;
     }
-    let rows = names.len().min(VIEWER_ROWS_MAX);
-    let extra = names.len() - rows;
+    let rows = viewers.len().min(VIEWER_ROWS_MAX);
+    let extra = viewers.len() - rows;
     let height = 24.0 + (rows + usize::from(extra > 0)) as f32 * 28.0 + 12.0;
     let screen = ctx.content_rect();
     // Hangs off the chip's right edge, 4 px below (above if the window ends first).
@@ -580,13 +580,13 @@ fn viewers_dropdown(ui: &Ui, cx: &Cx, room: RoomHandle, chip: &Response, names: 
             ui.set_width(VIEWERS_POP_W - 12.0);
             ui.spacing_mut().item_spacing.y = 0.0;
             let (hr, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
-            let title = format!("{} · {}", tr("ui.room.viewers_title", "Watching now").to_uppercase(), names.len());
+            let title = format!("{} · {}", tr("ui.room.viewers_title", "Watching now").to_uppercase(), viewers.len());
             paint_text(ui, hr.shrink2(vec2(theme::S2, 0.0)), &title, font(Weight::Bold, theme::FS_SECTION), theme::ACCENT, Align::Min);
-            for name in &names[..rows] {
+            for (conn, name) in &viewers[..rows] {
                 let row = HBox::new("viewer_row", 28.0).pad(theme::S2, theme::S2).slots(&[fixed(theme::AVATAR_SM), FILL]).show(ui);
                 // The slot is as tall as the row; the avatar is a 22 px disc in its middle.
                 let disc = Rect::from_center_size(row.cell(0).center(), vec2(theme::AVATAR_SM, theme::AVATAR_SM));
-                crate::ui::paint_person(ui, disc, name, &cx.emoji_of_name(room, name), false);
+                crate::ui::paint_person(ui, disc, name, &cx.emoji_of(room, *conn), false);
                 row.text(ui, 1, name, font(Weight::Regular, theme::FS_LABEL), theme::TEXT, Align::Min);
             }
             if extra > 0 {
