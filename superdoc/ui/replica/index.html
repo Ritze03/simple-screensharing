@@ -459,6 +459,7 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 .st-tile .mine-pic .ms { font-size: 30px; color: var(--success); }
 .st-tile .invite { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; text-align: center; padding: var(--s3); }
 .st-tile .invite b { font-size: 14px; }
+.st-tile .invite .avatar { --av: calc(var(--strip-avatar) + 8px); font-size: 20px; } /* a little bigger than the people strip's 44px */
 .st-tile .invite > span:not(.avatar) { font-size: var(--fs-small); color: var(--text-dim); font-family: var(--font-mono); }
 .tag { position: absolute; left: 8px; bottom: 8px; z-index: 10; height: 26px; box-sizing: border-box; padding: 0 9px 0 7px; border-radius: 7px; background: var(--stage-tag); display: flex; align-items: center; gap: 6px; font-size: var(--fs-row); font-weight: 600; max-width: calc(100% - 16px); white-space: nowrap; overflow: hidden; }
 .tag .ms { font-size: 15px; color: var(--text-dim); }
@@ -565,6 +566,10 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 .mi.on > .ms:first-child { color: var(--accent-lighter); }
 .mi.danger, .mi.danger > .ms { color: var(--danger); }
 .mi.danger:hover { background: var(--danger-tint); }
+/* the menu's main action (Go live): the same accent fill as a primary button, set off by a little space above */
+.mi.primary { background: var(--accent-gradient); box-shadow: var(--accent-glow); color: var(--primary-text); font-weight: 700; margin-top: 4px; }
+.mi.primary > .ms { color: var(--primary-text); }
+.mi.primary:hover { background: var(--accent-gradient); filter: brightness(1.08); }
 .mi .sw { width: 30px; height: 18px; border-radius: 9px; background: var(--btn-border); position: relative; flex: 0 0 auto; transition: background .12s; }
 .mi .sw::after { content: ""; position: absolute; left: 2px; top: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--text); transition: left .12s; }
 .mi .sw.on { background: var(--accent); } .mi .sw.on::after { left: 14px; }
@@ -1188,7 +1193,7 @@ function shareMenu() {
     <div class="msep"></div>
     ${off ? mi("screen_share", "Share your screen…", "share") : `${mi("swap_horiz", "Change source", "chsrc", `<span class="unit">screen, window</span>`)}
     ${mi("tune", "All stream settings…", "modal:stream")}
-    ${live ? mi("stop_screen_share", "Stop sharing", "stop", "", "danger") : mi("cast", `Go live in ${esc(r.name)}`, "golive")}`}`;
+    ${live ? mi("stop_screen_share", "Stop sharing", "stop", "", "danger") : mi("cast", `Go live in ${esc(r.name)}`, "golive", "", "primary")}`}`;
 }
 /* The bar's arrow only picks the camera; everything else is in the big menu (camModal). */
 function camMenu() {
