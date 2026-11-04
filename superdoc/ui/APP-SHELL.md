@@ -53,6 +53,10 @@ call, not in side panels.
 - **The Stream Control / View / Settings nav rail is gone.** Settings is a modal opened
   from the user band's gear; sharing lives in the stage's control bar; watching is the
   the room's stage.
+- **Settings is a modal with four tabs**, Profile | Interface (Language, Display, Sounds) | Playback | Diagnostics (a
+  `widgets::segmented` row, `ModalsState::settings_tab`, opens on Profile and keeps the choice while the app runs); the
+  body has one height on every tab (`SETTINGS_BODY_H`). The browser has Profile | Interface (Language, Sounds) | Playback.
+  *Why:* the user's request, 2026-11-04.
 - **Stream settings open in a modal**, not a side panel. *Why:* the user said the side
   panel was too squished for the number of controls.
 - **Leave sits in the control bar** (red, as tall as the button groups; before I3 in the room header). *Why:* the

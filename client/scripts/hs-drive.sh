@@ -91,6 +91,15 @@ vdrag() { "$SCRATCH/bin/hs-vptr" drag $(layout_size) "$1" "$2" "$3" "$4" "${6:-2
 # --- modal dump (same helpers as drive.sh) --------------------------------------------------
 dump_get()  { awk -v k="$1" '$1==k { $1=""; sub(/^ /, ""); print; exit }' "$UI_DUMP" 2>/dev/null; }
 dump_rect() { awk -v n="$1" '$1=="rect" && $2==n { print $3, $4, $5, $6; exit }' "$UI_DUMP" 2>/dev/null; }
+# wait_rect N NAME [SECS]: wait until client N's dump has the rect NAME (e.g. a hover-only button)
+wait_rect() {
+  local i; UI_DUMP="$SCRATCH/ui${1}.txt"
+  for i in $(seq 1 $(( ${3:-3} * 10 ))); do
+    [[ -n "$(dump_rect "$2")" ]] && return 0
+    sleep 0.1
+  done
+  die "wait_rect: the dump has no rect '$2' after ${3:-3}s ($UI_DUMP)"
+}
 dump_wait() {
   local i
   for i in $(seq 1 $(( $3 * 10 ))); do
@@ -214,7 +223,8 @@ case "$STEP" in
     dump_wait open 0 5 || die "stopshare: the modal did not close" ;;
   unwatch)
     t="${1:-0}"
-    umove "$VIEWER" "tile.$t"; sleep 0.5; uclick "$VIEWER" "tool.$t.more"; sleep 0.4; uclick "$VIEWER" menu.Stop_watching ;;
+    wait_rect "$VIEWER" "tile.$t"; umove "$VIEWER" "tile.$t"; wait_rect "$VIEWER" "tool.$t.more"
+    uclick "$VIEWER" "tool.$t.more"; wait_rect "$VIEWER" menu.Stop_watching; uclick "$VIEWER" menu.Stop_watching ;;
   shot)      grim -o "${2:-$HS_OUT_VIEWER}" "${1:?FILE}" ;;
   crop)      # crop FILE OUTPUT X Y W H
     o="${2:?OUTPUT}"; read -r ox oy < <(swaymsg -t get_outputs | jq -r --arg o "$o" '.[] | select(.name==$o) | "\(.rect.x) \(.rect.y)"')

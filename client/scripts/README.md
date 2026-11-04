@@ -67,7 +67,10 @@ Every frame, when it changed, each client rewrites `$SCRATCH/ui<n>.txt`: `rect N
 
 | Names | What |
 | --- | --- |
-| `tile.N`, `cell.N`; `tileinfo N KIND ar R who=.. label=..`; `tiles`, `layout` | stage tile N: the picture and its grid cell, in stage order |
+| `tile.N`, `cell.N`; `tileinfo N KIND ar R who=.. label=..`; `tiles`, `layout` | stage tile N: the picture and its grid cell, in stage order. `tile.N` is the drawn rect, mid-glide while one runs; `tile_goal.N` is the layout rect. A script that clicks right after a swap waits 0.2 s or uses `tile_goal.N`. |
+
+Settings controls (`sound.volume`, `sound.test.*`, `sound_volume`) are dumped only while their tab is showing; click `settings.tab.<profile|interface|playback|diagnostics>` first.
+
 | `bar.v0.0`, `bar.h0`; `barstate v0.0 hidden\|grey\|blue` | resize bars (hit rect) and how they show |
 | `win.N`, `grip.N` | floating window and its corner handle |
 | `tool.N.more\|fs\|pop\|settings`, `tag.N`, `watch.N` (`uclick .. watch.0 L40` = Watch stream); `stats.N` | a tile's hover buttons (only while shown), name tag, idle button row |
