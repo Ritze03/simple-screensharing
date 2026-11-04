@@ -778,10 +778,37 @@ function hsl(h, s, l) {
   return "#" + [f(0), f(8), f(4)].map((x) => x.toString(16).padStart(2, "0")).join("");
 }
 function avatarBg(name) {
+  const e = emojiOf(name), tint = e ? emojiHue(e) : undefined;
+  if (tint === null) return `background:linear-gradient(140deg, ${hsl(222, .14, .36)}, ${hsl(222, .14, .24)})`; /* a colourless emoji: neutral slate */
   let h = 2166136261;
   for (const b of new TextEncoder().encode(String(name).trim().toLowerCase())) h = Math.imul(h ^ b, 16777619) >>> 0;
-  const hue = h % 360;
+  const hue = tint ?? h % 360;
   return `background:linear-gradient(140deg, ${hsl(hue, .6, .36)}, ${hsl((hue + 350) % 360, .6, .24)})`;
+}
+/* An emoji avatar takes its background from the emoji: its strongest hue, in 10-degree bins so a mix of colours can't average
+   to mud. Null when the emoji has almost no colour. */
+const emojiHues = new Map();
+function emojiHue(e) {
+  if (emojiHues.has(e)) return emojiHues.get(e);
+  const c = document.createElement("canvas");
+  c.width = c.height = 32;
+  const x = c.getContext("2d", { willReadFrequently: true });
+  x.font = '26px "Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji", "Twemoji Mozilla", sans-serif';
+  x.textAlign = "center"; x.textBaseline = "middle";
+  x.fillText(e, 16, 17);
+  const d = x.getImageData(0, 0, 32, 32).data, bins = new Array(36).fill(0);
+  let coloured = 0;
+  for (let i = 0; i < d.length; i += 4) {
+    if (d[i + 3] < 128) continue;
+    const [r, g, b] = [d[i], d[i + 1], d[i + 2]], hi = Math.max(r, g, b), lo = Math.min(r, g, b), sat = hi ? (hi - lo) / hi : 0;
+    if (sat < .25 || hi < 40) continue;
+    const dl = hi - lo, hue = (60 * (hi === r ? (g - b) / dl + 6 : hi === g ? (b - r) / dl + 2 : (r - g) / dl + 4)) % 360;
+    bins[Math.floor(hue / 10)] += sat;
+    coloured++;
+  }
+  const hue = coloured < 30 ? null : bins.indexOf(Math.max(...bins)) * 10 + 5;
+  emojiHues.set(e, hue);
+  return hue;
 }
 const initial = (n) => esc((String(n).trim()[0] || "?").toUpperCase());
 const emojiOf = (n) => (n === me() ? S.myEmoji : D().emoji?.[n]) || "";
