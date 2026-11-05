@@ -25,7 +25,7 @@ import { SOUND_NAMES, SoundOut } from "./sounds.js";
 import { WATCHED, roomView, viewKey, viewOf, vg, watchFps, collect } from "./stage-state.js";
 import { fullscreenPip } from "./pip.js";
 import { renderStage, renderPoppedNote, afterRender, isDragging, bindWindow, overlays, toggleStageFullscreen } from "./stage.js";
-import { opener, selectField, FPS_LIST, PRESET_ORDER, presetLabel, presetCaption, presetPatch, encoderPatch, gopChoices } from "./menus.js";
+import { opener, openMenu, selectField, FPS_LIST, PRESET_ORDER, presetLabel, presetCaption, presetPatch, encoderPatch, gopChoices } from "./menus.js";
 
 const caps = capabilities();
 const CODECS = [["h264", "H.264"], ["av1", "AV1"], ["h265", "H.265"]];
@@ -205,6 +205,8 @@ function renderSide() {
       num: nShares || null, unit: nShares ? ic("screen_share", "unit-ico") : null,
       sel: S.view === "room" && S.selected === r.id, title: roomStatusTitle(r),
       onclick: () => select(r),
+      // Right click: this room's Room settings menu at the pointer, whichever room is open.
+      oncontextmenu: (e) => { e.preventDefault(); openMenu("room", e.currentTarget, { roomId: r.id, pos: { x: e.clientX, y: e.clientY } }); },
     }));
     if (!joined) continue;
     if (mine) {

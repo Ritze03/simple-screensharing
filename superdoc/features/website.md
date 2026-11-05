@@ -180,6 +180,8 @@ the button is hidden without it): the same `renderStage` tree is rendered into t
 window" + Bring it back, and the window stays open while its room is suspended (a note meanwhile) and goes home when the room is left. Its bar has no sidebar and no fullscreen
 button (a PiP window cannot go fullscreen) and its pop-out button brings the stage back. A modal opened from it (Rename, Stream settings) appears in the main window.
 
+**Right click on a sidebar room row** (2026-11-05): `app.js` `oncontextmenu` on the `roomRow` (`dom.js`) calls `openMenu("room", row, { roomId, pos })` after `preventDefault()`: the Room settings menu (`menus.js` `roomMenu`, reads `S.menu.roomId`) opens at the pointer for that room, whichever is open, also while disconnected; `stage.mjs` covers it. *Why:* user, "on desktop, make sure that right clicking a room in the left view opens the same context menu, as the bottom button bar has".
+
 **Control bar.** Share screen, Share audio, Webcam, Layout and Room settings are split buttons with an always-visible arrow cut off by a separator line (inset 1 px
 `box-shadow`); grouped buttons sit on a backdrop (`--stage-btn`), the freestanding ones (hide sidebar, Copy invite link, pop out, fullscreen) have none; Leave is 64x50,
 as tall as a group (4 px padding + 40 px button + 1 px border each side); the people button shows and hides the strip. Narrow stages degrade by container queries on `.stg`

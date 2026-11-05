@@ -692,6 +692,35 @@ try {
   await sleep(150);
   check(await P.eval("!document.querySelector('.menu')"), "a second click on the button that opened a menu closes it");
 
+  // Right click on a sidebar room row: that room's Room settings at the pointer, whichever room is open, also while disconnected.
+  await L.addRoomByLink(P, ["127.0.0.1:1", ...link.split("|").slice(1)].join("|"), "ghost");
+  await P.waitFor("__sss.S.rooms.length === 2", { what: "a second, unreachable room" });
+  await sleep(300);
+  const rowNames = () => P.eval(`[...document.querySelectorAll('.p-row')].map((e) => e.innerText.replace(/\\s+/g, ' ').trim())`);
+  const rowRect = async (re) => (await rects(P, ".p-row"))[(await rowNames()).findIndex((t) => re.test(t))];
+  await P.click({ text: "stage", sel: ".p-row" }); // joining the ghost selected it; back to the first room
+  await sleep(200);
+  const openBefore = await P.eval("__sss.S.selected");
+  const gr = await rowRect(/ghost/);
+  await rightClick(P, gr.cx, gr.cy);
+  const rc = await P.eval(`({ menu: !!document.querySelector('.menu.m-room'), head: document.querySelector('.menu.m-room .mh')?.innerText.replace(/\\s+/g, ' '), items: [...document.querySelectorAll('.menu.m-room .mi')].map((e) => e.innerText.replace(/\\s+/g, ' ').trim()), sel: __sss.S.selected, x: Math.round(document.querySelector('.menu.m-room')?.getBoundingClientRect().x || 0) })`);
+  check(rc.menu && /ghost/.test(rc.head) && rc.sel === openBefore && rc.items.some((m) => m.includes("Connect")) && !rc.items.some((m) => m.includes("Leave room")) && Math.abs(rc.x - gr.cx) < 4, "right click on a room row opens that room's menu at the pointer (Connect for a disconnected room); the open room stays", JSON.stringify({ ...rc, gr }));
+  await shot(P, "14b_room_row_menu");
+  const fr = await rowRect(/stage/);
+  await rightClick(P, fr.cx, fr.cy);
+  check(await P.eval(`/stage/.test(document.querySelector('.menu.m-room .mh')?.innerText) && document.querySelectorAll('.menu').length === 1`), "a right click on another row moves the menu to that room");
+  await key(P, "Escape"); // the open menu lies over the rows below its row
+  await rightClick(P, gr.cx, gr.cy);
+  await P.click({ text: "Rename", sel: ".menu.m-room .mi" });
+  check(await P.eval(`__sss.S.modal?.kind === 'rename' && __sss.S.modal.room === __sss.S.rooms.find((r) => r.name === 'ghost').id`), "Rename in a row's menu acts on the clicked room, not the open one", await P.eval(`JSON.stringify([__sss.S.modal, __sss.S.menu && __sss.S.menu.roomId, __sss.S.rooms.map((r) => r.name + ':' + r.id)])`));
+  await key(P, "Escape");
+  await sleep(150);
+  await rightClick(P, gr.cx, gr.cy);
+  await P.click({ text: "Forget room", sel: ".menu.m-room .mi" });
+  await P.click({ text: "Forget room", sel: ".modal-foot button" });
+  await P.waitFor("__sss.S.rooms.length === 1 && __sss.S.rooms[0].name === 'stage'", { what: "the ghost room forgotten" });
+  check(true, "Forget room in a row's menu removed the clicked room only");
+
   /* ============================== Watched view ============================== */
   section("Watched streams");
   await P.click({ text: "Watched streams", sel: ".p-row" });

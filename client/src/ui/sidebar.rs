@@ -30,7 +30,7 @@ use egui::{Align, CornerRadius, Rect, Sense, Stroke, Ui, vec2};
 use simple_screensharing_client::protocol::StreamKind;
 use simple_screensharing_client::session::ShareStatus;
 
-use super::{ConnState, Cx, Modal, PopoverKind, RoomKey, ShareState, StreamKey, UiAction, View, tr, tr_with};
+use super::{ConnState, Cx, Modal, Popover, PopoverKind, RoomKey, ShareState, StreamKey, UiAction, View, tr, tr_with};
 use crate::theme::{self, Weight, font};
 use crate::widgets::{
     self, Btn, DotState, FILL, HBox, IconBtnKind, IconTone, LiveSlot, PopItem, RoomLead, RoomRow, SharerRow, Unit, fixed,
@@ -62,13 +62,15 @@ pub fn show_brand(ui: &mut Ui, _cx: &mut Cx, _st: &mut SidebarState) {
 #[derive(Debug, Clone)]
 enum Line {
     /// `widgets::room_row`: dot, bold name, live cast, share count.
-    Room { name: String, dot: DotState, live: bool, num: Option<u32>, selected: bool, tip: String, click: Vec<UiAction> },
+    Room { name: String, dot: DotState, live: bool, num: Option<u32>, selected: bool, tip: String, click: Vec<UiAction>, key: RoomKey },
     /// `widgets::sharer_row` under its room: icon, name, fps.
     Sharer { icon: &'static str, tone: IconTone, name: String, fps: Option<u32>, tip: Option<String>, click: Vec<UiAction> },
 }
 
 /// Sidebar body: watched-streams well, ROOMS heading, rooms well, create/join.
 pub fn show_body(ui: &mut Ui, cx: &mut Cx, _st: &mut SidebarState) {
+    // Drawn before the rows: a right click on another row then queues its open after this menu's click-outside close.
+    super::stage::room_key_popover(&ui.ctx().clone(), cx);
     // "Watched streams": the cross-room grid (View::Watching).
     let watched = cx.watched().len() as u32;
     let sel_watching = cx.nav.view == View::Watching;
@@ -111,9 +113,10 @@ pub fn show_body(ui: &mut Ui, cx: &mut Cx, _st: &mut SidebarState) {
 /// Draw the rooms well's lines; returns the clicked line's actions.
 fn paint_lines(ui: &mut Ui, lines: &[Line]) -> Option<Vec<UiAction>> {
     let mut clicked = None;
+    let mut secondary = None;
     for line in lines {
         let (resp, click) = match line {
-            Line::Room { name, dot, live, num, selected, tip, click } => {
+            Line::Room { name, dot, live, num, selected, tip, click, key } => {
                 let row = RoomRow {
                     lead: RoomLead::Dot(*dot),
                     name,
@@ -122,7 +125,13 @@ fn paint_lines(ui: &mut Ui, lines: &[Line]) -> Option<Vec<UiAction>> {
                     unit: if num.is_some() { Unit::Icon("screen_share") } else { Unit::None },
                     selected: *selected,
                 };
-                (widgets::room_row(ui, &row).on_hover_text(tip.as_str()), click)
+                let resp = widgets::room_row(ui, &row).on_hover_text(tip.as_str());
+                super::drive_dump::rect(|| format!("side.room {name}"), resp.rect);
+                if resp.secondary_clicked() {
+                    let p = resp.interact_pointer_pos().unwrap_or(resp.rect.left_bottom());
+                    secondary = Some(UiAction::OpenPopover(Popover { kind: PopoverKind::RoomMenu(key.clone()), anchor: Rect::from_min_size(p, vec2(1.0, 1.0)) }));
+                }
+                (resp, click)
             }
             Line::Sharer { icon, tone, name, fps, tip, click } => {
                 let row = SharerRow { icon, tone: *tone, name, num: *fps, unit: if fps.is_some() { "fps" } else { "" } };
@@ -137,7 +146,8 @@ fn paint_lines(ui: &mut Ui, lines: &[Line]) -> Option<Vec<UiAction>> {
             clicked = Some(click.clone());
         }
     }
-    clicked
+    // A right click opens the room's Room settings menu without selecting it.
+    secondary.map(|a| vec![a]).or(clicked)
 }
 
 /// The rooms well as data: every room (saved and connected, list order),
@@ -171,6 +181,7 @@ fn room_lines(cx: &Cx) -> Vec<Line> {
             selected: super::view_is_room(&cx.nav.view, &r.key),
             tip: tip.to_string(),
             click: vec![UiAction::SelectRoom(r.key.clone())],
+            key: r.key.clone(),
         });
         let Some(h) = handle else { continue };
         if let Some((capture, fps)) = mine {
@@ -362,7 +373,7 @@ mod tests {
     }
 
     fn room(name: &str, num: Option<u32>, live: bool) -> Line {
-        Line::Room { name: name.into(), dot: DotState::Joined, live, num, selected: false, tip: String::new(), click: Vec::new() }
+        Line::Room { name: name.into(), dot: DotState::Joined, live, num, selected: false, tip: String::new(), click: Vec::new(), key: String::new() }
     }
 
     /// Room rows are 32 px, sharer rows 24 px, and every number slot (28)
