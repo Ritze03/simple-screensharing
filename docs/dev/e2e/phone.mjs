@@ -83,6 +83,10 @@ try {
   /* ============================== the phone is a phone ============================== */
   // no screen capture and no Document PiP, like Android Chrome / iOS Safari
   await P.addInitScript("try { delete MediaDevices.prototype.getDisplayMedia; } catch {} try { Object.defineProperty(window, 'documentPictureInPicture', { value: undefined }); } catch {}");
+  // Wake Lock spy around the REAL navigator.wakeLock (headless Chromium grants it): counts requests and live sentinels, can make a request reject.
+  await P.addInitScript(`(() => { if (!navigator.wakeLock) return; const real = navigator.wakeLock.request.bind(navigator.wakeLock);
+    const wl = window.__wl = { calls: 0, live: 0, reject: false, sents: [] };
+    navigator.wakeLock.request = async (t) => { wl.calls++; if (wl.reject) throw new DOMException("no gesture", "NotAllowedError"); const s = await real(t); wl.sents.push(s); wl.live++; s.addEventListener("release", () => wl.live--); return s; }; })()`);
   await phoneSize(390, 844);
   await P.goto(site.url);
   await P.waitFor("window.__sss && document.querySelector('#app').children.length > 0", { what: "reload" });
@@ -134,6 +138,25 @@ try {
   await P.waitFor("document.querySelector('.st-tile.idle [data-watch]')", { timeout: 30000, what: "Alice's idle tile" });
   await shot("04_room_idle");
   check(true, "joined a room through the dialog by touch");
+
+  /* ---------- screen wake lock (real lock in headless Chromium, requests spied) ---------- */
+  section("wake lock: joined on a phone, not watching");
+  const WL = (e) => P.eval("(() => { const w = __wl; return " + e + "; })()");
+  await P.waitFor("__wl.live === 1", { what: "wake lock held after joining on a phone" });
+  await P.eval("for (let i = 0; i < 5; i++) __sss.render()");
+  await sleep(300);
+  check(await WL("w.calls === 1 && w.live === 1"), "joined on a phone holds ONE wake lock; repeated renders issue no duplicate requests", JSON.stringify(await WL("({ calls: w.calls, live: w.live })")));
+  await P.eval("__wl.sents[__wl.sents.length - 1].release()"); // what the browser does when the page is hidden
+  await P.eval("document.dispatchEvent(new Event('visibilitychange'))");
+  await P.waitFor("__wl.live === 1 && __wl.calls === 2", { what: "wake lock re-acquired when visible again" });
+  check(true, "a dropped lock is re-acquired on visibilitychange (visible)");
+  await P.eval("__wl.reject = true; __wl.sents[__wl.sents.length - 1].release(); document.dispatchEvent(new Event('visibilitychange'))");
+  await sleep(300);
+  check(await WL("w.live === 0 && w.calls === 3"), "a rejected request leaves no lock and raises nothing", JSON.stringify(await WL("({ calls: w.calls, live: w.live })")));
+  await P.eval("__wl.reject = false");
+  await tapAt(5, 5);
+  await P.waitFor("__wl.live === 1", { what: "wake lock acquired by the next tap" });
+  check(true, "after a rejected request the next tap retries and gets the lock");
 
   // the sidebar room row: long-press opens the Room settings menu
   section("long-press on a room");
@@ -249,6 +272,27 @@ try {
     await P.waitFor("!__sss.S.stage.fullscreen", { what: "fullscreen left" });
     await sleep(300);
   }
+
+  /* ============================== wake lock ends with the room ============================== */
+  section("wake lock: leaving releases it");
+  await P.eval("__sss.S.modal = { kind: 'leave', room: __sss.S.rooms[0].id }; __sss.render()");
+  await tap(".modal .btn-danger-solid");
+  await P.waitFor("__wl.live === 0", { what: "wake lock released after leaving the room" });
+  check(await P.eval("__sss.S.rooms[0].state === 'disconnected' && __wl.live === 0"), "leaving the room releases the wake lock (watching ended with it)");
+  await sleep(300);
+  check(await WL("w.live === 0"), "...and it stays released");
+
+  section("wake lock: no navigator.wakeLock");
+  const NW = await L.openApp(site.url, { name: "NoWL" });
+  await NW.page.addInitScript("try { Object.defineProperty(navigator, 'wakeLock', { value: undefined }); } catch {}");
+  await NW.page.goto(site.url);
+  await NW.page.waitFor("window.__sss && document.querySelector('#app').children.length > 0", { what: "boot without wakeLock" });
+  await L.createRoom(NW.page, { name: "nowl room", server: RELAY, hash: HASH });
+  await L.waitJoined(NW.page);
+  await NW.page.send("Emulation.setDeviceMetricsOverride", { width: 390, height: 844, deviceScaleFactor: 2, mobile: true }); // now a phone: a lock would be wanted
+  await sleep(500);
+  check(await NW.page.eval("navigator.wakeLock === undefined") && NW.consoleErrors.length === 0, "a browser without navigator.wakeLock joins a room and raises nothing", NW.consoleErrors.slice(0, 2).join(" | "));
+  await NW.close();
 
   /* ============================== a state with no WebTransport is not a blank page ============================== */
   section("unsupported browser message");

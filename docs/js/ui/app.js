@@ -21,6 +21,7 @@ import {
 } from "./capture.js";
 import { popOut, closePopout, popStage as popoutStage, closeStage, stageWindow } from "./popout.js";
 import { A } from "./actions.js";
+import { syncWakeLock } from "./wakelock.js";
 import { SOUND_NAMES, SoundOut } from "./sounds.js";
 import { WATCHED, roomView, viewKey, viewOf, vg, watchFps, collect } from "./stage-state.js";
 import { fullscreenPip } from "./pip.js";
@@ -77,6 +78,7 @@ function render() {
   }
   renderQueued = false;
   promptForName();
+  syncWakeLock();
   if (S.modal) S.drawer = false; // a dialog replaces the rooms drawer
   const keep = SCROLLERS.map((s) => {
     const n = root.querySelector(s);

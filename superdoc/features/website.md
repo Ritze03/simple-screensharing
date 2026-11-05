@@ -655,3 +655,9 @@ sharer), a browser that does report `smoothedRtt` (no such browser was available
 The repo is **private**; the project owner enables GitHub Pages later, so there is no public URL yet
 (the site will live under `/simple-screensharing/`). Until then test only locally as above. Nothing
 in `docs/` may rely on a CDN or a server-side route.
+
+### Screen Wake Lock (2026-11-05)
+
+*Why:* the user: "On the website when I open it with the phone my screen keeps getting darker and turns off eventually. Make sure to fix that. Should be simple." The viewer draws into a `<canvas>` (`CanvasRenderer`), so the phone sees no playing `<video>` and lets the screen sleep.
+
+`docs/js/ui/wakelock.js` `syncWakeLock()`, called by every `render()`, holds `navigator.wakeLock.request("screen")` while any room has a watch, a screen or webcam share has a destination (`allDests()`), or, on a phone (`PHONE`), any room is joined (watching or not). It releases when none holds. The browser drops the lock when the page is hidden, so `visibilitychange` to visible re-requests; a rejected request (Safari refuses without a user gesture) is retried on the next render or `pointerdown`. A `pending` flag stops duplicate requests, and a lock granted after it stopped being wanted is released at once. No `navigator.wakeLock`, or a rejection: silent, no toast. Checked by `e2e/phone.mjs` against the real lock in headless Chromium (requests spied); only a real iPhone proves Safari/WebKit behaviour.
