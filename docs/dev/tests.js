@@ -9,7 +9,8 @@ import { MAX_LINK_ROOM_NAME_CHARS, base64urlDecode, bytesToHex, createRoom, enco
 import { NonceSequence, NonceSpaceExhausted, buildAad, buildNonce, decryptFrame, decryptPreview, encryptFrame, encryptPreview, importRoomKey } from "../js/core/crypto.js";
 import { NACK_HARD_LIMIT_MS, Reassembler, fragmentFrame, nackRetryInterval, pacePlan } from "../js/core/fragment.js";
 import { SEND_RING_BYTES, SendRing, nackEnabledByDefault } from "../js/core/nack.js";
-import { deriveCodecString, sniffCodec } from "../js/core/codec.js";
+import { RefChain, deriveCodecString, sniffCodec } from "../js/core/codec.js";
+import { mediaLogLine } from "../js/ui/media-event.js";
 import { DECODE_QUEUE_CATCHUP_THRESHOLD, JitterBuffer, MAX_DECODE_QUEUE, clampCatchUpSpeedPercent, clampMaxJitterBufferMs } from "../js/core/jitter.js";
 import { CanvasRenderer, VideoReceiver } from "../js/core/video-rx.js";
 import { ENCODER_PRESETS } from "../js/core/video-tx.js";
@@ -816,6 +817,163 @@ test("video receiver: on the first decoder overload a Gecko-style receiver re-co
   configs.length = 0;
   await feed(new VideoReceiver({ onFrame: (f) => f.close(), DecoderClass: make(), maxJitterBufferMs: 0, adaptiveLatency: false }));
   eq(configs.map((c) => c.optimizeForLatency), [true], "non-adaptive receivers never change the decoder config");
+});
+
+// A MOCK of an unforgiving decoder, for regression tests only: it proves what reaches decode(), not how a phone behaves. It fails for good on
+// every broken reference, where real ones do so on some (see website.md "Phone decoder failures"). `timestamp` is its oracle, independent of the parser:
+// frames are numbered 1 ms apart, so a delta that is not exactly one step after the last submitted frame stands on a broken reference.
+function strictDecoder() {
+  const log = { errors: [], configs: [], decoded: [], created: 0 };
+  class StrictDecoder {
+    static async isConfigSupported() {
+      return { supported: true };
+    }
+    constructor({ output, error }) {
+      Object.assign(this, { output, error, state: "unconfigured", decodeQueueSize: 0, last: null });
+      log.created++;
+    }
+    configure(c) {
+      log.configs.push(c);
+      this.state = "configured";
+      this.last = null;
+    }
+    fail(why) {
+      log.errors.push(why);
+      this.state = "closed";
+      const e = new Error("Decoder failure");
+      e.name = "EncodingError";
+      queueMicrotask(() => this.error(e));
+    }
+    decode(c) {
+      if (this.state !== "configured") throw new Error("decode on a " + this.state + " decoder");
+      if (this.last === null && c.type !== "key") return this.fail("no keyframe after configure");
+      if (this.last !== null && c.timestamp <= this.last) return this.fail("timestamp went back");
+      if (c.type === "delta" && c.timestamp !== this.last + 1000) return this.fail(`broken reference: ${this.last} -> ${c.timestamp}`);
+      this.last = c.timestamp;
+      log.decoded.push(c.timestamp);
+      this.output({ displayWidth: 1920, displayHeight: 1080, codedWidth: 1920, codedHeight: 1080, close() {} });
+    }
+    close() {
+      this.state = "closed";
+    }
+  }
+  return { Decoder: StrictDecoder, log };
+}
+
+class Bits {
+  constructor() {
+    this.s = "";
+  }
+  u(n, v) {
+    this.s += v.toString(2).padStart(n, "0");
+    return this;
+  }
+  ue(v) {
+    const b = (v + 1).toString(2);
+    this.s += "0".repeat(b.length - 1) + b;
+    return this;
+  }
+  bytes() {
+    const s = this.s + "1" + "0".repeat(15);
+    return Array.from({ length: s.length >> 3 }, (_, i) => parseInt(s.slice(i * 8, i * 8 + 8), 2));
+  }
+}
+const h264Sps = [0, 0, 0, 1, 0x67, 66, 0, 30, ...new Bits().ue(0).ue(0).bytes()]; // baseline, sps 0, log2_max_frame_num 4
+const h264Au = (n, key) => Uint8Array.from([...(key ? h264Sps : []), 0, 0, 0, 1, key ? 0x65 : 0x41, ...new Bits().ue(0).ue(7).ue(0).u(4, n % 16).bytes()]);
+const av1Obu = (type, payload) => [(type << 3) | 2, payload.length, ...payload];
+const av1Seq = new Bits().u(3, 0).u(2, 0).u(1, 0).u(1, 0).u(5, 0).u(12, 0).u(5, 8).u(1, 0).u(4, 10).u(4, 10).u(11, 1919).u(11, 1079).u(1, 0).u(3, 0).u(4, 0).u(1, 1).u(2, 0).u(2, 3).u(3, 6).u(3, 0).u(1, 0).bytes();
+function av1Au(n, key) {
+  const head = key ? new Bits().u(1, 0).u(2, 0).u(1, 1).u(1, 0).u(1, 0).u(1, 0).u(7, n % 128) : new Bits().u(1, 0).u(2, 1).u(1, 1).u(1, 0).u(1, 0).u(1, 0).u(1, 0).u(7, n % 128).u(3, 0).u(8, 1);
+  return Uint8Array.from([0x12, 0, ...(key ? av1Obu(1, av1Seq) : []), ...av1Obu(6, head.bytes())]);
+}
+
+/** Frames 0..59 at 1 ms pts steps, a keyframe every 15, `lost` never reaching the receiver. One frame_id per frame plus one for an audio packet in between. */
+async function playStrict(au, lost, opts = {}) {
+  const s = strictDecoder();
+  const events = [];
+  const rx = new VideoReceiver({ onFrame: () => {}, onEvent: (t, d) => events.push({ t, ...d }), DecoderClass: s.Decoder, maxJitterBufferMs: 0, ...opts });
+  for (let n = 0; n < 60; n++) {
+    if (lost.includes(n)) continue;
+    rx.pushFrame({ ptsUs: n * 1000, keyframe: n % 15 === 0, payload: au(n % 15, n % 15 === 0), frameId: n * 2 });
+    await new Promise((r) => setTimeout(r, 0));
+  }
+  await new Promise((r) => setTimeout(r, 120));
+  const stats = rx.getStats();
+  rx.close();
+  return { ...s.log, events, stats };
+}
+
+for (const [name, au] of [["H.264", h264Au], ["AV1", av1Au]]) {
+  test(`a frame lost whole: nothing on a broken reference reaches a strict decoder (${name})`, async () => {
+    const r = await playStrict(au, [20]);
+    eq(r.errors, [], "the decoder never saw a delta on a broken reference");
+    eq(r.stats.decoderErrors, 0);
+    eq(r.stats.gaps, 1, "the gap was seen");
+    const need = r.events.filter((e) => e.t === "need-keyframe");
+    eq(need.length, 1);
+    eq([need[0].reason, need[0].from, need[0].to, need[0].idStep], ["gap", 4, 6, 4]);
+    ok(!r.decoded.some((t) => t > 19000 && t < 30000), "decoding stops at the gap");
+    ok(r.decoded.includes(30000) && r.decoded.includes(59000), "and carries on from the next keyframe");
+  });
+  test(`an unbroken stream never trips the chain check (${name})`, async () => {
+    const r = await playStrict(au, []);
+    eq([r.errors, r.stats.gaps, r.stats.skippedDeltas, r.decoded.length], [[], 0, 0, 60]);
+  });
+}
+
+test("RefChain: a jump between consecutive frame ids cannot be loss, so the check switches itself off", () => {
+  const c = new RefChain();
+  c.step("h264", h264Au(0, true), true);
+  eq(c.step("h264", h264Au(1, false), false, 1), null);
+  eq(c.step("h264", h264Au(5, false), false, 1), null, "not reported");
+  ok(c.off, "off");
+  eq(c.step("h264", h264Au(9, false), false, 3), null, "and silent from then on");
+});
+
+test("RefChain: frame_num wraps, and a non-reference picture does not move it", () => {
+  const c = new RefChain();
+  c.step("h264", h264Au(14, true), true);
+  eq(c.step("h264", h264Au(15, false), false, 2), null);
+  eq(c.step("h264", h264Au(0, false), false, 2), null, "15 -> 0 is one step");
+  const nonRef = h264Au(1, false);
+  nonRef[4] = 0x01; // nal_ref_idc 0
+  eq(c.step("h264", nonRef, false, 2), null);
+  eq(c.step("h264", h264Au(1, false), false, 2), null, "the next picture has the same number");
+  eq(c.step("h264", h264Au(3, false), false, 2), { from: 1, to: 3 });
+});
+
+test("decoder failure: the log line has the context, the keyframe interval is known, three failures ask for software", async () => {
+  const s = strictDecoder();
+  const events = [];
+  let clock = 0;
+  const rx = new VideoReceiver({ onFrame: () => {}, onEvent: (t, d) => events.push({ type: t, ...d }), DecoderClass: s.Decoder, maxJitterBufferMs: 0, now: () => clock });
+  let n = 0;
+  const key = () => {
+    clock += 250;
+    rx.pushFrame({ ptsUs: n++ * 1000, keyframe: true, payload: h264Au(0, true), frameId: n });
+    rx.pushFrame({ ptsUs: n++ * 1000, keyframe: false, payload: h264Au(1, false), frameId: n });
+  };
+  for (let i = 0; i < 6; i++) key();
+  for (let i = 0; i < 3; i++) {
+    rx.decoder.fail("forced");
+    await new Promise((r) => setTimeout(r, 0));
+    key();
+  }
+  await new Promise((r) => setTimeout(r, 0));
+  const err = events.filter((e) => e.type === "decoder-error");
+  eq(err.length, 3);
+  const line = mediaLogLine(err[2]);
+  ok(line.startsWith("decoder-error #3 (EncodingError: Decoder failure) avc1.42001e 1920x1080 hw=no-preference q=0 key=0ms/2f break=2f out="), line);
+  ok(line.endsWith(" gaps=0 chain=on ptsback=0"), line);
+  ok(mediaLogLine(err[0]).includes(" break=none "), "no loss before the first failure");
+  eq(events.find((e) => e.type === "need-keyframe" && e.reason === "decoder-error").gopMs, 250, "the room client can leave a short interval alone");
+  eq(mediaLogLine(events.find((e) => e.type === "decoder-mode")), "decoder-mode (prefer-software)");
+  key();
+  rx.decoder.fail("forced");
+  await new Promise((r) => setTimeout(r, 0));
+  key();
+  eq(s.log.configs.at(-1).hardwareAcceleration, "prefer-software", "the next decoder is a software one");
+  rx.close();
 });
 
 test("jitter: reset() clears queue and pacing anchor", () => {

@@ -22,6 +22,9 @@ const MAX_PENDING_DATAGRAMS = 400; // ~400 KB queued inside WebTransport; more t
 const MAX_RX_QUEUE = 64;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const RESUBSCRIBE_MIN_INTERVAL_MS = 1500;
+// With keyframes this close together the next one arrives by itself. Asking anyway costs an extra IDR on the wire, a moment off
+// the relay's route and, on the sharer, a "left" and "joined" sound (the viewer list changes twice). `waiting` still asks.
+const KEYFRAME_SOON_MS = 500;
 const FIRST_RECONNECT_MS = 50;
 const BACKOFF_MS = [500, 1000, 2000, 4000, 8000, 10000];
 // Viewer lists (spec section 9.1): 1-byte hello datagram to the relay, its 1-byte ack and the per-stream list it sends our way.
@@ -98,7 +101,7 @@ class RxStream {
         try {
           const { ptsUs, payload } = await decryptFrame(this.client._key, this.info.ownerId, op.frameId, this.info.streamId, op.ciphertext);
           this.stalled = op.stalled;
-          if (this.info.kind === "video") this.impl.pushFrame({ ptsUs, keyframe: op.keyframe, payload, stalled: op.stalled });
+          if (this.info.kind === "video") this.impl.pushFrame({ ptsUs, keyframe: op.keyframe, payload, stalled: op.stalled, frameId: op.frameId });
           else this.impl.pushPacket({ ptsUs, payload });
         } catch (e) {
           this.decryptFailures++;
@@ -756,6 +759,7 @@ export class RoomClient extends EventTarget {
       const info = this.streams.get(key);
       const s = this.session;
       if (!rx || !info || !s) return;
+      if (detail.reason !== "waiting" && detail.gopMs !== null && detail.gopMs <= KEYFRAME_SOON_MS) return;
       const now = performance.now();
       if (now - rx.lastResubscribe < RESUBSCRIBE_MIN_INTERVAL_MS) return;
       rx.lastResubscribe = now;

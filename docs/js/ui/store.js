@@ -196,7 +196,7 @@ export function dropLog(kind, text) {
   const last = S.dropLog[S.dropLog.length - 1];
   if (last && last.kind === kind && last.text === text) { last.n++; last.at = Date.now(); return; } // the same line again: counted, not repeated
   S.dropLog.push({ at: Date.now(), kind, text, n: 1 });
-  if (S.dropLog.length > 80) S.dropLog.splice(0, S.dropLog.length - 80);
+  if (S.dropLog.length > 200) S.dropLog.splice(0, S.dropLog.length - 200);
 }
 
 export function toast(text, icon = "check_circle", { err = false } = {}) {

@@ -6,7 +6,7 @@ import { S, invalidate, toast, persistRooms, displayName, dropLog } from "./stor
 import { t, DICT } from "./i18n.js";
 import { onShareEvent, onShareStats, stopDestsInRoom } from "./capture.js";
 import { closePopout, rebind } from "./popout.js";
-import { applyMediaEvent } from "./media-event.js";
+import { applyMediaEvent, mediaLogLine } from "./media-event.js";
 import { RoomSounds, RESUME_QUIET_MS, flushSounds } from "./sounds.js";
 
 // `?fakeaudio=1` (dev harness only, like the native rig's SSS_UI_FAKE_AUDIO): every stream acts as if its sender shared audio (the ring, the
@@ -231,7 +231,8 @@ function wire(r, client) {
   on("media", (d) => {
     const w = r.watches.get(d.key);
     if (!w) return;
-    if (d.type === "need-keyframe" || d.type === "decoder-error") dropLog("recover", `${r.name}: ${w.ownerName}'s ${w.label}: ${d.type} (${d.reason || d.message || "?"})`);
+    const line = mediaLogLine(d);
+    if (line) dropLog("recover", `${r.name}: ${w.ownerName}'s ${w.label}: ${line}`);
     applyMediaEvent(w, d, (codec) => t("ui.tile.unsupported", { codec }));
     invalidate();
   });

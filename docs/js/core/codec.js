@@ -200,6 +200,11 @@ class BitReader {
     }
     return v;
   }
+  ue() {
+    let zeros = 0;
+    while (this.f(1) === 0) if (++zeros >= 32) throw new RangeError("exp-golomb code too long");
+    return this.f(zeros) + 2 ** zeros - 1;
+  }
   uvlc() {
     let zeros = 0;
     for (;;) {
@@ -226,7 +231,7 @@ export function av1CodecString(au) {
     if (pe > au.length) return null;
     if (type === 1) {
       try {
-        return av1SequenceHeaderToCodec(au.subarray(ps, pe));
+        return av1SequenceInfo(au.subarray(ps, pe))?.string ?? null;
       } catch {
         return null;
       }
@@ -236,7 +241,7 @@ export function av1CodecString(au) {
   return null;
 }
 
-function av1SequenceHeaderToCodec(payload) {
+function av1SequenceInfo(payload) {
   const r = new BitReader(payload);
   const seqProfile = r.f(3);
   r.f(1); // still_picture
@@ -275,6 +280,7 @@ function av1SequenceHeaderToCodec(payload) {
     r.f(4);
     r.f(3);
   }
+  let forceSct = 2, forceMv = 2, hintBits = 0;
   r.f(1); // use_128x128_superblock
   r.f(1); // enable_filter_intra
   r.f(1); // enable_intra_edge_filter
@@ -289,11 +295,9 @@ function av1SequenceHeaderToCodec(payload) {
       r.f(1); // ref_frame_mvs
     }
     const chooseSct = r.f(1);
-    const forceSct = chooseSct ? 2 : r.f(1);
-    if (forceSct > 0) {
-      if (r.f(1) === 0) r.f(1); // seq_choose_integer_mv / seq_force_integer_mv
-    }
-    if (orderHint) r.f(3);
+    forceSct = chooseSct ? 2 : r.f(1);
+    if (forceSct > 0) forceMv = r.f(1) ? 2 : r.f(1); // seq_choose_integer_mv / seq_force_integer_mv
+    if (orderHint) hintBits = r.f(3) + 1;
   }
   r.f(1); // enable_superres
   r.f(1); // enable_cdef
@@ -303,7 +307,8 @@ function av1SequenceHeaderToCodec(payload) {
   if (seqProfile === 2 && highBitdepth) bitDepth = r.f(1) ? 12 : 10;
   else bitDepth = highBitdepth ? 10 : 8;
   const lvl = String(level0).padStart(2, "0");
-  return `av01.${seqProfile}.${lvl}${tier0 === 1 ? "H" : "M"}.${String(bitDepth).padStart(2, "0")}`;
+  const string = `av01.${seqProfile}.${lvl}${tier0 === 1 ? "H" : "M"}.${String(bitDepth).padStart(2, "0")}`;
+  return { string, forceSct, forceMv, hintBits: frameIdNumbersPresent ? 0 : hintBits };
 }
 
 /**
@@ -315,4 +320,132 @@ export function deriveCodecString(au) {
   if (!codec) return null;
   const string = codec === CODECS.H264 ? avcCodecString(au) : codec === CODECS.H265 ? hevcCodecString(au) : av1CodecString(au);
   return string ? { codec, string } : null;
+}
+
+// ---------------------------------------------------------------------
+// Reference chain: was a whole frame lost in front of this one?
+// ---------------------------------------------------------------------
+
+const H264_HIGH_PROFILES = new Set([100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135]);
+
+/** `{ bits, plane }` of an H.264 SPS: the width of `frame_num`, and whether a slice header carries colour_plane_id. Null if it uses scaling lists (no encoder here does). */
+function h264SpsInfo(au) {
+  for (const { start, end } of annexBNals(au)) {
+    if ((au[start] & 0x1f) !== 7) continue;
+    const r = new BitReader(stripEmulationPrevention(au.subarray(start + 1, end)));
+    const profile = r.f(8);
+    r.f(16); // constraint flags, level
+    r.ue(); // seq_parameter_set_id
+    let plane = 0;
+    if (H264_HIGH_PROFILES.has(profile)) {
+      if (r.ue() === 3) plane = r.f(1); // chroma_format_idc, separate_colour_plane_flag
+      r.ue();
+      r.ue();
+      r.f(1); // bit depths, qpprime_y_zero_transform_bypass_flag
+      if (r.f(1)) return null; // seq_scaling_matrix_present_flag
+    }
+    return { bits: r.ue() + 4, plane };
+  }
+  return null;
+}
+
+/**
+ * Follows a video stream's own picture numbering, because nothing else can see a frame that vanished whole: a frame with at
+ * least one fragment left shows up in the reassembler, one with none leaves no trace, and `frame_id` cannot tell (it is the
+ * connection's nonce counter, shared with audio, other streams and previews, spec 5.1). H.264: `frame_num`. AV1: the shown
+ * frame's `order_hint` (the display index, so it also holds for a GF group with hidden frames). Not followed: H.265, and AV1 without order hints
+ * (Chromium's own AV1 encoder writes none, so a browser sharer's AV1 is blind here; `prev` stays null).
+ *
+ * Self-disarming: a jump between two frames with consecutive `frame_id`s cannot be loss, so this encoder numbers its pictures
+ * differently from what is assumed here, and the check switches off for good (`off`) rather than freezing a healthy stream.
+ */
+export class RefChain {
+  constructor() {
+    this.off = false;
+    this.seq = null; // what the last keyframe's parameter sets say
+    this.prev = null; // H.264: PrevRefFrameNum; AV1: the last shown order hint
+    this.slots = new Array(8).fill(0); // AV1: the order hint in each reference slot (show_existing_frame names a slot)
+  }
+
+  /**
+   * Note one frame, in stream order, every frame from a keyframe on. `idStep` = its `frame_id` minus the previous frame's.
+   * @returns {{from:number,to:number}|null} the jump when frames are missing in front of this one, else null
+   */
+  step(codec, au, keyframe, idStep) {
+    if (this.off) return null;
+    let cur = null;
+    try {
+      cur = codec === CODECS.H264 ? this.#h264(au, keyframe) : codec === CODECS.AV1 ? this.#av1(au, keyframe) : null;
+    } catch {}
+    const prev = this.prev;
+    if (!cur) {
+      this.prev = null; // cannot tell: start over at the next frame that can be read
+      return null;
+    }
+    if (!cur.keep || keyframe) this.prev = cur.n;
+    if (keyframe || prev === null) return null;
+    const jump = (cur.n - prev + cur.mod) % cur.mod;
+    if (jump <= 1) return null;
+    if (idStep === 1) this.off = true;
+    return idStep > 1 ? { from: prev, to: cur.n } : null;
+  }
+
+  #h264(au, keyframe) {
+    if (keyframe) this.seq = h264SpsInfo(au) || this.seq;
+    if (!this.seq) return null;
+    for (let i = 0; i + 3 < au.length; i++) {
+      if (au[i] !== 0 || au[i + 1] !== 0 || au[i + 2] !== 1) continue;
+      const nal = au[i + 3];
+      const type = nal & 0x1f;
+      if (type !== 1 && type !== 5) continue;
+      const r = new BitReader(stripEmulationPrevention(au.subarray(i + 4, i + 24)));
+      r.ue(); // first_mb_in_slice
+      r.ue(); // slice_type
+      r.ue(); // pic_parameter_set_id
+      if (this.seq.plane) r.f(2);
+      return { n: r.f(this.seq.bits), mod: 2 ** this.seq.bits, keep: (nal & 0x60) === 0 }; // a non-reference picture does not move PrevRefFrameNum
+    }
+    return null;
+  }
+
+  #av1(au, keyframe) {
+    let shown = null;
+    let offset = 0;
+    while (offset < au.length) {
+      const header = au[offset];
+      const type = (header >> 3) & 0x0f;
+      const ext = (header >> 2) & 1;
+      const leb = (header >> 1) & 1 ? readLeb128(au, offset + 1 + ext) : null;
+      if (!leb) return null;
+      const ps = offset + 1 + ext + leb.len;
+      const pe = ps + leb.value;
+      if (type === 1 && keyframe) this.seq = av1SequenceInfo(au.subarray(ps, pe)) || this.seq;
+      if (type === 3 || type === 6) {
+        if (!this.seq || !this.seq.hintBits) return null;
+        shown = this.#av1Frame(new BitReader(au.subarray(ps, Math.min(pe, ps + 32))), shown);
+      }
+      offset = pe;
+    }
+    return shown === null ? null : { n: shown, mod: 2 ** this.seq.hintBits };
+  }
+
+  /** uncompressed_header() as far as refresh_frame_flags (AV1 spec 5.9.2; decoder-model and frame-id streams never get here). Returns the shown order hint so far. */
+  #av1Frame(r, shown) {
+    const s = this.seq;
+    if (r.f(1)) return this.slots[r.f(3)]; // show_existing_frame
+    const frameType = r.f(2); // 0 key, 1 inter, 2 intra-only, 3 switch
+    const show = r.f(1);
+    if (!show) r.f(1); // showable_frame
+    const allRefresh = frameType === 3 || (frameType === 0 && show);
+    const resilient = allRefresh ? 1 : r.f(1);
+    r.f(1); // disable_cdf_update
+    const sct = s.forceSct === 2 ? r.f(1) : s.forceSct;
+    if (sct && s.forceMv === 2) r.f(1); // force_integer_mv
+    if (frameType !== 3) r.f(1); // frame_size_override_flag
+    const hint = r.f(s.hintBits);
+    if (frameType === 1 && !resilient) r.f(3); // primary_ref_frame
+    const refresh = allRefresh ? 0xff : r.f(8);
+    for (let i = 0; i < 8; i++) if ((refresh >> i) & 1) this.slots[i] = hint;
+    return show ? hint : shown;
+  }
 }

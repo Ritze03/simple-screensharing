@@ -458,6 +458,10 @@ to 1 %.
 (burst loss, reordering beyond 2 fragments, RTT jitter), more than one viewer of the same stream (unit tests
 only), audio.
 
+### A frame lost whole (browser viewer, row 150, 2026-11-05)
+
+NACK repairs a frame it knows about. A frame with no fragment left is known to nobody, and `frame_id` cannot show it (nonce counter, shared by every stream). Native still has this blind spot (`fragment.rs` `FrameLoss`). In a browser it can be fatal: Chromium's AV1 decoder fails on such a frame (measured), and WebKit closes the decoder on one undecodable frame. So the browser follows the picture numbering in the bitstream (`codec.js` `RefChain`) and treats a jump like any loss. Detail, evidence and what is still inference: `features/website.md` "Phone decoder failures".
+
 ## Native display (`client/src/decode/render.rs` + `render.wgsl`)
 
 **Added 2026-10-14 (I9).** Replaces "HTTP relay + WebCodecs in a `<canvas>`" (see History). The

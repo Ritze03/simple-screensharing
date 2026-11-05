@@ -369,6 +369,62 @@ scenario("peer with the wrong room key: nothing decodes, nothing crashes", async
   return { decryptFailures: s.decryptFailures };
 });
 
+// A frame whose every fragment is lost leaves no trace in the reassembler and NACK cannot ask for it. Real encoders here, so this also
+// shows their numbering suits RefChain: 0 gaps while nothing is lost, and the check never switches itself off.
+for (const codec of ["h264", "av1"]) {
+  scenario(`frame lost whole (${codec}): seen, nothing broken decoded, the next keyframe heals it without a resubscribe`, async () => {
+    const room = newRoom();
+    const a = await client(room.link, "sharer");
+    const b = await client(room.link, "viewer");
+    const src = makePatternSource(640, 360, 30);
+    await a.startShare({ stream: src.stream, codec, fps: 30, bitrateKbps: 2000, gopMs: 400 });
+    const st = await waitFor(() => streamOf(b, a), 5000, "stream");
+    b.watch(st.key, { canvas: document.body.appendChild(document.createElement("canvas")) });
+    await waitFor(() => (b.watchStats(st.key) || {}).decoded > 90, 15000, "decoding");
+    const rx = b.subs.get(st.key).impl;
+    ok(b.watchStats(st.key).codec === codec, `really ${codec}`);
+    ok(b.watchStats(st.key).gaps === 0 && !rx.chain.off, `no gap on an intact stream (gaps ${b.watchStats(st.key).gaps}, off ${rx.chain.off})`);
+    const sess = b.session;
+    const sent = [];
+    const send = sess.send.bind(sess);
+    sess.send = (m) => (sent.push(m.type), send(m));
+    const orig = sess.onDatagram;
+    const seen = new Set();
+    let lost = 0, victim = -1;
+    sess.onDatagram = (d) => {
+      if (d.length > 19 && !(d[1] & 1)) {
+        const id = new DataView(d.buffer, d.byteOffset).getUint32(11);
+        if (!seen.has(id)) {
+          seen.add(id);
+          if (seen.size % 12 === 0) (victim = id), lost++;
+        }
+        if (id === victim) return;
+      }
+      orig(d);
+    };
+    await sleep(6000);
+    sess.onDatagram = orig;
+    sess.send = send;
+    const s = b.watchStats(st.key);
+    ok(lost >= 2, `frames removed (${lost})`);
+    log(`${codec}: ${JSON.stringify({ fps: s.receivedFps, lost, gaps: s.gaps, seq: rx.chain.seq, prev: rx.chain.prev, keys: rx.keyTimes.map(Math.round) })}`);
+    // Chromium's AV1 encoder writes no order hints, so there is nothing to follow: the check must then stay out of the way. Native vaav1enc does write them.
+    const followed = rx.chain.prev !== null;
+    ok(codec === "av1" || followed, "H.264 is always followed");
+    ok(followed ? s.gaps > 0 : s.gaps === 0, `seen (${s.gaps} of ${lost}, followed: ${followed})`);
+    ok(!rx.chain.off, "the check stayed on");
+    const failures = events(b, "media").filter((e) => e.d.type === "decoder-error").map((e) => `${e.d.name}: ${e.d.message} sinceKey=${e.d.sinceKey} out=${e.d.outputs} chain=${e.d.chain}`);
+    log(`${codec} decoder errors: ${s.decoderErrors} ${JSON.stringify(failures.slice(0, 4))}`);
+    // Unfollowed, Chromium's real AV1 decoder fails on these frames ("Decoding error."): that path must still recover, which the end of this scenario checks.
+    ok(!followed || s.decoderErrors === 0, `no decoder error while followed (${s.decoderErrors}: ${failures[0]})`);
+    ok(!sent.includes("Unsubscribe"), `no resubscribe with short keyframe intervals (sent: ${sent.join(",") || "nothing"})`);
+    const before = s.decoded;
+    await waitFor(() => !b.watchStats(st.key).needKeyframe && b.watchStats(st.key).decoded > before + 15, 5000, "still decoding");
+    src.stop();
+    return { lost, gaps: s.gaps, followed, decoderErrors: s.decoderErrors, skippedDeltas: s.skippedDeltas, gopMs: rx.keyTimes.map(Math.round) };
+  });
+}
+
 scenario("packet loss: viewer waits for a keyframe, asks for one (resubscribe), and recovers", async () => {
   const room = newRoom();
   const a = await client(room.link, "sharer", { nack: false }); // the legacy path: drop and recover by keyframe (NACK has its own scenarios below)

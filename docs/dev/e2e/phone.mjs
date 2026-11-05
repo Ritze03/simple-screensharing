@@ -184,6 +184,18 @@ try {
   check(await P.eval("!!document.querySelector('#btn-noscreen') && !document.querySelector('#btn-share') && !document.querySelector('#btn-audio')"), "no getDisplayMedia: Share screen / Share audio are replaced by one dimmed button");
   check(await P.eval("!!document.querySelector('#btn-webcam') && !document.querySelector('#btn-popstage')"), "Webcam stays, pop-out is hidden without Document PiP");
 
+  // A decoder failure, through the real recovery path (the next decode() throws what WebKit's error says): the last picture stays.
+  section("decoder failure");
+  await P.eval(`(() => { const r = __sss.S.rooms[0]; const w = [...r.watches.values()][0]; window.__tiles = 0; window.__watch = w;
+    window.__spy = setInterval(() => { if (document.querySelector(".st-tile .wait")) window.__tiles++; }, 20);
+    const d = r.client.subs.get(w.key).impl.decoder; d.decode = () => { throw Object.assign(new Error("Decoder failure"), { name: "EncodingError" }); }; })()`);
+  await P.waitFor("[...__sss.S.rooms[0].watches.values()][0].stats?.decoderErrors >= 1", { timeout: 10000, what: "the decoder failed" });
+  await P.waitFor("(() => { const r = __sss.S.rooms[0]; const s = r.client.watchStats([...r.watches.keys()][0]); return !s.needKeyframe && s.decodedFps > 1; })()", { timeout: 20000, what: "decoding again" });
+  const df = await P.eval(`(() => { clearInterval(window.__spy); const r = __sss.S.rooms[0]; const w = [...r.watches.values()][0];
+    return { tiles: window.__tiles, same: w === window.__watch, first: w.firstFrame, line: __sss.S.dropLog.map((e) => e.text).find((t) => t.includes("decoder-error")) }; })()`);
+  check(df.tiles === 0 && df.same && df.first, "no waiting tile, the same watch: the last picture stays", JSON.stringify(df));
+  check(/decoder-error #1 \(EncodingError: Decoder failure\) \S+ 960x540 hw=no-preference q=\d+ key=\d+ms\/\d+f break=none out=\d+ gaps=0 chain=\w+ ptsback=0/.test(df.line || ""), "the Connection log has the whole story in one line");
+
   for (const [n, w, h] of SIZES) {
     sizeName = n;
     section(`stage ${n}`);
