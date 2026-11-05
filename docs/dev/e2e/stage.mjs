@@ -809,22 +809,23 @@ try {
     await A.page.click({ js: `[...document.querySelectorAll('.menu.m-emoji .emoji-grid button')].find((b) => b.innerText === ${JSON.stringify(e)})` });
   };
   await openPicker();
-  const grid40 = await A.page.eval("document.querySelectorAll('.menu.m-emoji .emoji-grid button').length");
-  check(grid40 === 40 && (await A.page.eval("!!document.querySelector('#emoji-in')")), "Settings > Profile: the picker offers 40 emoji and a Paste any emoji field");
-  await pickGrid("🦊");
+  const grid56 = await A.page.eval("document.querySelectorAll('.menu.m-emoji .emoji-grid button').length");
+  check(grid56 === 56 && (await A.page.eval("!!document.querySelector('#emoji-in')")), "Settings > Profile: the picker offers 56 emoji and a Paste any emoji field");
+  await shot(A.page, "17_emoji_picker");
+  await pickGrid("🦁");
   check(await A.page.eval("!document.querySelector('.menu.m-emoji')"), "a pick closes the picker (the modal under it stays)");
-  await P.waitFor(`document.querySelector('.pv[data-user="Alice"] .avatar .emo')?.innerText === "🦊"`, { timeout: 15000, what: "Vera sees Alice's emoji over the datagrams" });
-  check(true, "Alice picks 🦊: Vera sees it on Alice's avatar (AvatarSet -> relay list -> AvatarList)");
-  const foxBg = hueOfBg(await avBg(P, "Alice"));
-  check(foxBg && foxBg.h >= 10 && foxBg.h <= 50, "the background comes from the emoji's strongest colour (an orange fox)", JSON.stringify(foxBg));
+  await P.waitFor(`document.querySelector('.pv[data-user="Alice"] .avatar .emo')?.innerText === "🦁"`, { timeout: 15000, what: "Vera sees Alice's emoji over the datagrams" });
+  check(true, "Alice picks 🦁: Vera sees it on Alice's avatar (AvatarSet -> relay list -> AvatarList)");
+  const lionBg = hueOfBg(await avBg(P, "Alice"));
+  check(lionBg && lionBg.h >= 10 && lionBg.h <= 50, "the background comes from the emoji's strongest colour (an orange lion)", JSON.stringify(lionBg));
   const emoCss = await P.eval(`getComputedStyle(document.querySelector('.pv[data-user="Alice"] .avatar .emo')).filter`);
   check((emoCss.match(/drop-shadow/g) || []).length === 4, "a thin black outline follows the emoji's shape (four 1 px drop-shadows)", emoCss);
-  await pickGrid("💀");
-  await P.waitFor(`document.querySelector('.pv[data-user="Alice"] .avatar .emo')?.innerText === "💀"`, { timeout: 15000, what: "skull" });
+  await pickGrid("🐼");
+  await P.waitFor(`document.querySelector('.pv[data-user="Alice"] .avatar .emo')?.innerText === "🐼"`, { timeout: 15000, what: "panda" });
   const sk = await avBg(P, "Alice");
   const skHue = hueOfBg(sk);
-  check(skHue && skHue.s < 0.3, "a colourless emoji (the skull) gets a neutral slate, not a hue", sk);
-  await shot(P, "18_emoji_skull");
+  check(skHue && skHue.s < 0.3, "a colourless emoji (the panda) gets a neutral slate, not a hue", sk);
+  await shot(P, "18_emoji_panda");
   await openPicker();
   await A.page.type("#emoji-in", "🐻");
   await P.waitFor(`document.querySelector('.pv[data-user="Alice"] .avatar .emo')?.innerText === "🐻"`, { timeout: 15000, what: "pasted bear" });
@@ -835,10 +836,10 @@ try {
   await A.page.click({ text: "Use my initial", sel: ".menu.m-emoji .mi" });
   await P.waitFor(`document.querySelector('.pv[data-user="Alice"] .avatar .emo') == null`, { timeout: 15000, what: "emoji cleared" });
   check((await P.eval(`[...document.querySelectorAll('.strip .pv')].find((p) => p.dataset.user === "Alice").querySelector('.avatar').innerText.trim()`)).startsWith("A"), "Use my initial: the initial is back");
-  await pickGrid("🦊");
-  await P.waitFor(`document.querySelector('.pv[data-user="Alice"] .avatar .emo')?.innerText === "🦊"`, { timeout: 15000, what: "fox again" });
-  check((await A.page.eval(`JSON.parse(localStorage.getItem("sss.settings.v1")).emoji`)) === "🦊", "the emoji is saved in localStorage");
-  await shot(P, "19_emoji_fox");
+  await pickGrid("🦁");
+  await P.waitFor(`document.querySelector('.pv[data-user="Alice"] .avatar .emo')?.innerText === "🦁"`, { timeout: 15000, what: "lion again" });
+  check((await A.page.eval(`JSON.parse(localStorage.getItem("sss.settings.v1")).emoji`)) === "🦁", "the emoji is saved in localStorage");
+  await shot(P, "19_emoji_lion");
   // tile glide (the replica's .st-tile transition): on in a plain arena, off while a bar or a window is dragged
   check(await P.eval(`(() => { const t = document.querySelector('.arena > .st-tile'), a = t.parentElement; const g = () => getComputedStyle(t).transitionProperty + "|" + getComputedStyle(t).transitionDuration; const on = g(); a.classList.add("dragging"); const off = g(); a.classList.remove("dragging"); return /left/.test(on) && /0\.2s/.test(on) && /^all\|0s|^none|0s$/.test(off); })()`), "tiles glide (left/top/width/height .2s) and do not while the arena is dragging");
   // Settings tabs: Profile | Interface (Language, Sounds) | Playback; one stable modal height
@@ -896,7 +897,7 @@ try {
       await sleep(700);
     }
     await P.waitFor("![...__sss.S.rooms[0].watches.values()].some((w) => w.popped)", { what: "brought back" });
-    await P.waitFor(`document.querySelector('.pv[data-user="Alice"] .avatar .emo')?.innerText === "🦊"`, { timeout: 30000, what: "Alice's emoji after the relay restart" });
+    await P.waitFor(`document.querySelector('.pv[data-user="Alice"] .avatar .emo')?.innerText === "🦁"`, { timeout: 30000, what: "Alice's emoji after the relay restart" });
     check(true, "after the relay restart Alice's emoji is announced again (a reconnect has a new ConnId)");
 
     // the whole stage in its own window, across a restart

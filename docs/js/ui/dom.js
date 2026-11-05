@@ -207,8 +207,16 @@ const AVATAR_S = 0.6, AVATAR_LA = 0.36, AVATAR_LB = 0.24, AVATAR_SHIFT_B = 350;
 export function avatarColors(name, hue = avatarHue(name)) {
   return [hslHex(hue, AVATAR_S, AVATAR_LA), hslHex((hue + AVATAR_SHIFT_B) % 360, AVATAR_S, AVATAR_LB)];
 }
-/** The picker's emoji grid (the replica's `EMOJI`). Any emoji can be pasted; native draws any one grapheme of at most 16 bytes that shapes to a single bitmap glyph in its embedded Noto font. */
-export const EMOJI = [..."😀😎🤓🥳🤖👻👽🎃💀🤡🐶🐱🦊🐻🐼🐸🐙🦄🐧🦉🍕🍔🍩🍣🍉☕🌮🍺🎮🎧🎬🎸⚽🚀🌈⭐🔥⚡🌙🌵"];
+/** The picker's emoji, 8 per row in three groups (rows 0 | 1-5 | 6; menus.js sets the groups apart): the user's own list (2026-11-05), same as native `widgets/emoji.rs` `EMOJI`. An explicit array: spreading a string would split 🐻‍❄️, 🐿️ and 🕊️. Any other single emoji can still be pasted; native draws any one grapheme of at most 16 bytes that shapes to a single bitmap glyph in its embedded Noto font. */
+export const EMOJI = [
+  "🤪", "🤤", "🤠", "🫪", "🤓", "🤔", "🥶", "😡",
+  "🐒", "🦁", "🐷", "🐑", "🐹", "🦥", "🐼", "🐻‍❄️",
+  "🐻", "🐿️", "🦫", "🦔", "🦒", "🐮", "🐱", "🫏",
+  "🐔", "🐓", "🐥", "🐣", "🐦", "🐧", "🕊️", "🦜",
+  "🐸", "🐢", "🦎", "🐍", "🐬", "🫍", "🦭", "🐙",
+  "🦀", "🐌", "🐛", "🐜", "🐝", "🪰", "🪱", "🦤",
+  "🥒", "🍟", "🍕", "🌭", "🥙", "🍿", "🍔", "🍝",
+];
 const EMOJI_FONT = '"Noto Color Emoji", "Apple Color Emoji", "Segoe UI Emoji", "Twemoji Mozilla", sans-serif';
 /** Greyish background of a colourless emoji (like 💀): the replica's `hsl(222, .14, .36 / .24)` slate, not a hue at all. */
 const SLATE = [hslHex(222, 0.14, 0.36), hslHex(222, 0.14, 0.24)];

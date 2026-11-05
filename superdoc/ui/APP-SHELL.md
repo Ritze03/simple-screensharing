@@ -252,7 +252,7 @@ is per owner on the wire (`sibling_audio_stream`), so two streams of one person 
 **Avatars are drawn by one function, `ui::paint_person(ui, rect, name, emoji, presence)`** (2026-11-04, task #114): `emoji`
 ("" = none) goes to `widgets::paint_avatar_emoji`: a bundled emoji replaces the initial, on a background from its strongest
 colour (neutral slate for a colourless one), with a thin black outline and its visible-pixel crop centred; "" or an emoji
-the client has no picture of (a peer's, outside the 40) draws the initial on the name's gradient. Call sites: the strip, the
+the client has no picture of (a peer's, outside the picker's 56) draws the initial on the name's gradient. Call sites: the strip, the
 hover card (head), the stream menu (head), the idle tile's big avatar, the viewers dropdown and the sidebar's user band.
 *Where the emoji comes from:* `Cx::emoji_of(room, conn)` (`RoomSession::emoji_of(conn_id)`; my own entry is my setting, so a
 change shows at once); the strip's `Person` carries it (`you` = `cx.state.emoji`, Watched uses each item's own room), the
@@ -262,10 +262,9 @@ connection, the stream menu uses `cx.state.emoji` for my own item. *Why by conne
 
 **Settings > Profile > Avatar** (2026-11-04, task #114): a row under Display name with my avatar as a button; clicking it
 opens the picker as a popover in the menu style (`modals.rs` `avatar_row`, `menu::frame()`, closes on a pick or an outside
-click): header (my avatar, "Your avatar", "Friends see it instead of your initial"), the 8x5 grid of the 40 emoji
+click): header (my avatar, "Your avatar", "Friends see it instead of your initial"), the 8-wide grid of the 56 emoji (three groups set apart by a small gap: 1 row, 5 rows, 1 row)
 (`widgets::emoji_picker`), then "Use my initial" (`text_fields` icon). A choice is `UiAction::SetEmoji(String)` ("" = clear),
-applied in `apply.rs` through `AppState::set_emoji` (saved, announced to every connected room). *Why no "Paste any emoji"
-field (the replica has one):* only the 40 bundled emoji can be drawn (no colour-emoji font is guaranteed on every build).
+applied in `apply.rs` through `AppState::set_emoji` (saved, announced to every connected room). The list is the user's own choice (2026-11-05, `Why:` they picked these 56, in three groups, replacing the replica's 40). The "Paste any emoji" field is there too (row 120): any emoji of one grapheme, at most 16 bytes, that shapes to one bitmap glyph in the embedded Noto font can be drawn, not only the 56.
 
 **Menus and dropdowns** (task I3, `ui/menu.rs`): every dropdown is the app's own popover style (`ui::popover` frame:
 `PANEL_RAISED`, radius 10, padding 6, shadow; `pop_item` rows with an icon and a faint second line; the current row has a lit

@@ -269,7 +269,7 @@ is discarded whole; each list replaces the room's map; the UI hears about it onl
 AvatarSet every 250 ms until the relay's list shows my own ConnId with my emoji: that entry is the Set's only ack; a reconnect has a new ConnId and runs it again),
 `setAvatar(emoji)`, `emojiOf(id)` (mine from my setting, so it shows at once and on an older relay). An older relay never acks: nobody else's emoji shows, the initial does.
 
-UI: Settings > Profile > Avatar opens the picker (`menus.js` `emojiMenu`: the replica's 40 emoji, a "Paste any emoji" field that takes the last grapheme, "Use my initial"; a pick
+UI: Settings > Profile > Avatar opens the picker (`menus.js` `emojiMenu`: the user's own 56 emoji (2026-11-05, three groups; `Why:` the user chose the list; an explicit array in `dom.js`, since spreading a string splits 🐻‍❄️), a "Paste any emoji" field that takes the last grapheme, "Use my initial"; a pick
 closes the picker); the choice is `settings.emoji` in `localStorage` (`store.js`), announced to every room at connect and on change (`app.js` `setEmoji`). **Rendering** is
 `dom.js` `avatarEl`, the one builder (strip, hover card, stream menu header, idle tile, viewers dropdown, sidebar user band): the background comes from the emoji's strongest hue
 (`emojiInfo`: the emoji drawn on a 48 px canvas, 10-degree bins weighted by saturation, `null` for a colourless one like 💀 which gets a neutral slate), a thin black outline follows

@@ -33,11 +33,20 @@ use unicode_segmentation::UnicodeSegmentation;
 use super::{PopItem, paint_text, pop_item, text_field};
 use crate::theme::{self, Weight, font};
 
-/// The picker's emoji, in picker order: the replica's `const EMOJI`, the contract with the browser.
-pub const EMOJI: [&str; 40] = [
-    "😀", "😎", "🤓", "🥳", "🤖", "👻", "👽", "🎃", "💀", "🤡", "🐶", "🐱", "🦊", "🐻", "🐼", "🐸", "🐙", "🦄", "🐧", "🦉", "🍕",
-    "🍔", "🍩", "🍣", "🍉", "☕", "🌮", "🍺", "🎮", "🎧", "🎬", "🎸", "⚽", "🚀", "🌈", "⭐", "🔥", "⚡", "🌙", "🌵",
+/// The picker's emoji, in picker order, 8 per row in three groups (rows 0 | 1-5 | 6, see `GROUP_ROWS`): the
+/// user's own list (2026-11-05), the contract with the browser's `docs/js/ui/dom.js` `EMOJI`. Any other single
+/// emoji still works as an avatar (the paste field).
+pub const EMOJI: [&str; 56] = [
+    "🤪", "🤤", "🤠", "🫪", "🤓", "🤔", "🥶", "😡",
+    "🐒", "🦁", "🐷", "🐑", "🐹", "🦥", "🐼", "🐻‍❄️",
+    "🐻", "🐿️", "🦫", "🦔", "🦒", "🐮", "🐱", "🫏",
+    "🐔", "🐓", "🐥", "🐣", "🐦", "🐧", "🕊️", "🦜",
+    "🐸", "🐢", "🦎", "🐍", "🐬", "🫍", "🦭", "🐙",
+    "🦀", "🐌", "🐛", "🐜", "🐝", "🪰", "🪱", "🦤",
+    "🥒", "🍟", "🍕", "🌭", "🥙", "🍿", "🍔", "🍝",
 ];
+/// Rows after which the picker leaves a small gap (the end of a group).
+const GROUP_ROWS: [usize; 2] = [1, 6];
 
 /// Noto Color Emoji: CBDT bitmaps only, one 109 ppem strike. Parsed on first use.
 static FONT: &[u8] = include_bytes!("../../assets/emoji/NotoColorEmoji.ttf");
@@ -404,8 +413,8 @@ pub fn emoji_picker_closed(ctx: &Context) {
     ctx.data_mut(|d| d.remove_temp::<String>(field_id()));
 }
 
-/// The emoji picker of Settings > Profile (replica `emojiMenu`, minus its header): the 40 emoji in an
-/// 8-column grid with 2 px gaps filling the available width, `current` highlighted, the "Paste any
+/// The emoji picker of Settings > Profile (replica `emojiMenu`, minus its header): the 56 emoji in an
+/// 8-column grid (groups set apart by a small gap) with 2 px gaps filling the available width, `current` highlighted, the "Paste any
 /// emoji" field with its warning line, then one item that returns [`EmojiChoice::Clear`]. Pure view:
 /// the caller stores the choice.
 ///
@@ -444,7 +453,7 @@ fn picker_rows(ui: &mut Ui, current: &str, text: &PickerText) -> PickerResult {
         }
         ui.allocate_rect(row_rect, Sense::hover());
         if row + 1 < EMOJI.len().div_ceil(COLS) {
-            ui.add_space(GAP);
+            ui.add_space(if GROUP_ROWS.contains(&(row + 1)) { GAP + 6.0 } else { GAP });
         }
     }
     ui.add_space(theme::S2);
@@ -493,7 +502,7 @@ mod tests {
             assert!(p.crop[2] > 40 && p.crop[3] > 40, "{emoji} crop {:?}", p.crop);
         }
         let unique: std::collections::HashSet<_> = EMOJI.iter().collect();
-        assert_eq!(unique.len(), 40);
+        assert_eq!(unique.len(), EMOJI.len());
     }
 
     #[test]

@@ -351,7 +351,7 @@ function emojiMenu() {
   });
   return [
     head(avatarEl(displayName(), cur), t("ui.settings.avatar_title"), t("ui.settings.avatar_hint")),
-    h("div", { class: "emoji-grid" }, EMOJI.map((e) => h("button", { type: "button", class: e === cur ? "on" : "", "aria-label": e, onclick: done(() => set(e)) }, e))),
+    h("div", { class: "emoji-grid" }, EMOJI.flatMap((e, i) => [...(i === 8 || i === 48 ? [h("div", { class: "emoji-sep" })] : []), h("button", { type: "button", class: e === cur ? "on" : "", "aria-label": e, onclick: done(() => set(e)) }, e)])),
     h("div", { class: "mrow" }, inp),
     hint,
     menuItem({ icon: "text_fields", label: t("ui.settings.avatar_clear"), onclick: done(() => set("")) }),
