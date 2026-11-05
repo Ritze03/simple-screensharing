@@ -2096,14 +2096,15 @@ test("settings: the encoding mode and keyframe interval are stored next to the p
   const key = "sss.settings.v1";
   const before = localStorage.getItem(key);
   try {
-    eq([presetOf("quality", 250), presetOf("quality", 1000), presetOf("realtime", 250), presetOf("realtime", 1000), presetOf("quality", 500)], ["text", "quality", "gaming", "", ""], "presetOf");
+    eq([presetOf(15, "quality", 250), presetOf(60, "quality", 1000), presetOf(120, "realtime", 250), presetOf(60, "realtime", 1000), presetOf(60, "quality", 500)], ["text", "quality", "gaming", "", ""], "presetOf");
+    eq([presetOf(120, "quality", 250), presetOf(15, "quality", 250)], ["", "text"], "presetOf: 120 fps + Quality + 250 ms is no preset, 15 is Text");
     eq(encoderOf({ preset: "gaming" }), { latencyMode: "realtime", gopMs: 250 }, "an older config has only its preset");
     eq(encoderOf({ preset: "", latencyMode: "quality", gopMs: 500 }), { latencyMode: "quality", gopMs: 500 }, "a hand-made pair");
-    localStorage.setItem(key, JSON.stringify({ stream: { preset: "gaming" } }));
+    localStorage.setItem(key, JSON.stringify({ stream: { preset: "gaming", fps: 120 } }));
     eq([loadSettings().stream.latencyMode, loadSettings().stream.gopMs, loadSettings().stream.preset], ["realtime", 250, "gaming"], "an old file: the preset fills both");
     localStorage.setItem(key, JSON.stringify({ stream: { preset: "", latencyMode: "realtime", gopMs: 2000 } }));
     eq([loadSettings().stream.latencyMode, loadSettings().stream.gopMs, loadSettings().stream.preset], ["realtime", 2000, ""], "a hand-made pair loads as it is, no preset");
-    localStorage.setItem(key, JSON.stringify({ stream: { preset: "text", latencyMode: "bogus", gopMs: -5 } }));
+    localStorage.setItem(key, JSON.stringify({ stream: { preset: "text", fps: 15, latencyMode: "bogus", gopMs: -5 } }));
     eq([loadSettings().stream.latencyMode, loadSettings().stream.gopMs, loadSettings().stream.preset], ["quality", 250, "text"], "garbage falls back to the preset's values");
   } finally {
     if (before == null) localStorage.removeItem(key);
@@ -2115,8 +2116,8 @@ test("settings: a stored balanced or low_latency preset loads as quality, qualit
   const key = "sss.settings.v1";
   const before = localStorage.getItem(key);
   try {
-    for (const [stored, want] of [["balanced", "quality"], ["low_latency", "quality"], ["quality", "quality"], ["text", "text"], ["gaming", "gaming"], ["bogus", "quality"]]) {
-      localStorage.setItem(key, JSON.stringify({ stream: { preset: stored } }));
+    for (const [stored, want, fps] of [["balanced", "quality", 60], ["low_latency", "quality", 60], ["quality", "quality", 60], ["text", "text", 15], ["gaming", "gaming", 120], ["bogus", "quality", 60]]) {
+      localStorage.setItem(key, JSON.stringify({ stream: { preset: stored, fps } }));
       eq(loadSettings().stream.preset, want, stored);
     }
     localStorage.removeItem(key);

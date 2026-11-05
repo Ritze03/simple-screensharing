@@ -55,9 +55,9 @@ const browserLang = () => (String(navigator.language || "en").toLowerCase().star
 const PRESET_NAMES = ["text", "quality", "gaming"];
 /** The keyframe intervals the stream settings offer, ms (the presets use 250 and 1000, the webcam 2000); a stored other one is listed as it is. */
 export const GOP_OPTIONS = [250, 500, 1000, 2000];
-/** The preset whose encoding mode and keyframe interval are exactly these (native `EncoderTuning::preset` compares the same pair), or ""
+/** The preset whose FPS, encoding mode and keyframe interval are exactly these (native `EncoderPreset::detect`), or ""
  *  when none: a hand-made combination, no preset lit. */
-export const presetOf = (latencyMode, gopMs) => PRESET_NAMES.find((p) => ENCODER_PRESETS[p].latencyMode === latencyMode && ENCODER_PRESETS[p].gopMs === gopMs) || "";
+export const presetOf = (fps, latencyMode, gopMs) => PRESET_NAMES.find((p) => ENCODER_PRESETS[p].fps === fps && ENCODER_PRESETS[p].latencyMode === latencyMode && ENCODER_PRESETS[p].gopMs === gopMs) || "";
 /** What a stream config encodes with: its own `latencyMode` ("quality" | "realtime") and `gopMs`, else its preset's (an older stored config has only a preset). */
 export function encoderOf(d) {
   const p = ENCODER_PRESETS[d.preset] || ENCODER_PRESETS.quality;
@@ -66,7 +66,7 @@ export function encoderOf(d) {
 function normalizeStream(st) {
   if (!PRESET_NAMES.includes(st.preset)) st.preset = "quality";
   const { latencyMode, gopMs } = encoderOf(st);
-  Object.assign(st, { latencyMode, gopMs, preset: presetOf(latencyMode, gopMs) });
+  Object.assign(st, { latencyMode, gopMs, preset: presetOf(st.fps, latencyMode, gopMs) });
   return st;
 }
 

@@ -631,6 +631,18 @@ try {
   await P.click({ js: `[...document.querySelectorAll('.menu.m-dd .mi')].find((e) => e.innerText.trim() === "30 fps")` });
   await sleep(500);
   check((await cap()) === "30 FPS · Quality encoding · Keyframe 250 ms" && (await P.eval(`document.querySelector('.modal .seg button.on')?.innerText`)) !== undefined, "changing the FPS by hand keeps the preset's mode and keyframe", await cap());
+  const litNow = (scope) => P.eval(`[...document.querySelectorAll('${scope} .seg:has(button[title=Gaming]) button.on')].map((b) => b.innerText).join()`);
+  check((await litNow(".modal")) === "", "Text at 30 fps (hand-changed): no preset lit", await litNow(".modal"));
+  await P.click("#st-fps");
+  await P.click({ js: `[...document.querySelectorAll('.menu.m-dd .mi')].find((e) => e.innerText.trim() === "120 fps")` });
+  await sleep(500);
+  check((await cap()) === "120 FPS · Quality encoding · Keyframe 250 ms" && (await litNow(".modal")) === "", "120 fps + Quality + 250 ms: no preset lit", await cap());
+  const ord = await P.eval(`(() => { const y = (e) => e.getBoundingClientRect().top; const p = document.querySelector('.modal .seg:has(button[title=Gaming])'); return y(p) < y(document.querySelector('#st-fps')) && y(document.querySelector('#st-fps')) < y(document.querySelector('#st-gop')); })()`);
+  check(ord, "Video card order: Preset, FPS, ..., Keyframe");
+  await P.click("#st-fps");
+  await P.click({ js: `[...document.querySelectorAll('.menu.m-dd .mi')].find((e) => e.innerText.trim() === "15 fps")` });
+  await sleep(500);
+  check((await litNow(".modal")) === "Text", "back at 15 fps: Text lit again", await litNow(".modal"));
   await P.click({ text: "Gaming", sel: ".modal .seg button" });
   await sleep(500);
   check((await cap()) === "120 FPS · Performance encoding · Keyframe 250 ms", "Gaming: 120 fps, Performance encoding, keyframe 250 ms", await cap());
@@ -681,6 +693,9 @@ try {
   await P.waitFor("document.querySelector('.menu.m-share')", { what: "share menu" });
   const sm = await P.eval(`({ head: document.querySelector('.menu.m-share .mh').innerText.replace(/\\s+/g, ' '), fps: document.querySelectorAll('.menu.m-share .seg.dense button').length, presets: [...document.querySelectorAll('.menu.m-share .seg:not(.dense) button')].map((b) => b.innerText), items: [...document.querySelectorAll('.menu.m-share .mi')].map((e) => e.innerText.replace(/\\s+/g, ' ').trim()) })`);
   check(sm.fps === 8 && JSON.stringify(sm.presets) === '["Text","Quality","Gaming"]' && sm.items.some((i) => /Change source/.test(i)) && sm.items.some((i) => /Stop sharing/.test(i)) && /Live/i.test(sm.head), "the Share menu: header, FPS, Preset, Change source, All stream settings, Stop sharing", JSON.stringify(sm));
+  // live Quality preset at 60 fps: lit; the menu lists Preset above FPS
+  const mo = await P.eval(`(() => { const m = document.querySelector('.menu.m-share'); const y = (e) => e.getBoundingClientRect().top; const p = m.querySelector('.seg:not(.dense)'); const f = m.querySelector('.seg.dense'); return { lit: [...p.querySelectorAll('button.on')].map((b) => b.innerText).join(), above: y(p) < y(f), cap: y(m.querySelector('.cap')) < y(f) }; })()`);
+  check(mo.lit === "Quality" && mo.above && mo.cap, "the Share menu: Quality lit at 60 fps, Preset (and its caption) above FPS", JSON.stringify(mo));
   await shot(P, "14_share_menu");
   await closeMenu();
   await P.click("#btn-room");

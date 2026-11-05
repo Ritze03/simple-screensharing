@@ -229,7 +229,7 @@ share** (`AppState::apply_destination_edit`), user: "It should also save the mos
 (not just the profile, like even if a custom framerate and keyframe interval)". The saved value is the user's edit, not the
 destination's live params, so an automatic codec fallback (AV1 -> H.265 -> H.264) is never remembered. Staged edits that
 never went live stay unsaved. Its arrow opens the **Share menu** (Off / Ready / Live header with pill, size,
-codec and rate; FPS and Preset for the live destination or the next stream; Change source, All stream settings…, Go live
+codec and rate; Preset (with its caption) and then FPS for the live destination or the next stream (2026-11-05: Preset above FPS, a preset lit only on an exact FPS + encoding + keyframe match); Change source, All stream settings…, Go live
 in / Stop sharing; a recovering or encoder-bound note). *Share audio* (I7) is a share of its own, **no screen needed** (it was "next to a screen only" until 2026-11-04): one click turns **Desktop audio** on (the icon goes `music_note`, green), the next turns it off; its arrow opens the **audio menu** (`share::audio_menu`: heading "Audio source", No audio, Desktop audio with the sub-line "Everything you hear" / "... minus N excluded", then every app under its **source group** heading (Games, Browsers, Media, Voice chat, Devices, Other) with a live level meter, a Mute shared audio switch while sharing, and "All audio settings…"). Picking a row starts, switches or stops the share in the room the bar acts on at once. "All audio settings…" opens the **audio settings menu** (`audio_settings.rs`, `Modal::AudioSettings`): Source card (the Audio dropdown, `menu::select`), Volume card (**Boost** 50-200 %, moved here from Settings > Shared audio), Desktop audio card (the **exclusion list**: Add opens a popover, `PopoverKind::AudioExclude`, with the sources detected now and an "Or enter a name" field; every entry has Remove), footer `[Stop sharing audio | Share desktop audio][fill][Done]`. Why and the audio side: `features/audio-sharing.md` "desktop audio ... (task I7)"; Linux only. *Webcam* (I8) is a share of its own, no screen needed: click starts it (the saved
 camera in its saved mode, into the room the bar acts on; from another room it **moves**) and the next click stops it; its
 arrow opens **only** the camera list (name and `/dev/video0` under it, the current one ticked; a new camera resets the
@@ -401,7 +401,7 @@ re-derive the split every frame and silently break when content height changes.
 | `share.rs` | the bar's Share screen and Share audio dropdown bodies, level-meter taps, "Also send to / Move to" lists (`RoomTargets`), pills, formatting, popover rows shared with the stream-settings modal (this was `action_bar.rs`) |
 | `sidebar.rs` | brand band, body (Watched streams well, ROOMS heading, rooms well with sharer sub-rows, Create-or-join), user band (avatar, "Live in N rooms" / "Not sharing" -> Outgoing popover, settings gear) |
 | `room.rs` | `show_header` (title, pill, meta; `⋯` for rooms with no stage), `show_stage` (the stage region), `show_body` (welcome, disconnected, connecting, reconnecting: banner, empty states) |
-| `stream_settings.rs` | the stream-settings modal (staged "Set up your stream", live "Stream settings"), width 1120. Video card: FPS, Preset, **Encoding** (Performance / Quality segments) and **Keyframe** (select 250 / 500 / 1000 / 2000 ms), caption; see "Video card: Encoding and Keyframe" |
+| `stream_settings.rs` | the stream-settings modal (staged "Set up your stream", live "Stream settings"), width 1120. Video card: Preset, FPS, **Encoding** (Performance / Quality segments) and **Keyframe** (select 250 / 500 / 1000 / 2000 ms), caption; see "Video card: Encoding and Keyframe" |
 | `modals.rs` | create/join, app settings, leave / forget confirm, rename, choose-your-name |
 | `popout.rs` | pop-out viewer windows: one deferred viewport per popped stream |
 | `tests.rs` | session-model lookups, bandwidth wiring, shell geometry (`shell_regions_match_the_spec_sizes`), nav/action behaviour |
@@ -509,19 +509,20 @@ resource compiler (`winresource`/`embed-resource` + an `.ico`), not added.
 
 **Note (2026-11-04, plan D8):** the preset, tuning and "Advanced" paragraphs of #90-#95 below describe the state of 2026-11-01. Since then the presets are **Text / Quality / Gaming** (they set the FPS once, the encoder mode and the keyframe interval), the Advanced tuning rows and the Balanced / Low-Latency presets are gone, and the modal's right-hand cards are Compression and Video (`features/stream-control.md` "Presets", `STYLING-GUIDE.md` "Stream settings and webcam"). The reasons below (hide what does nothing) still apply.
 
-**Video card: Encoding and Keyframe (2026-11-04).** Under Preset the Video card shows the two values a preset sets besides the FPS:
+**Video card: Encoding and Keyframe (2026-11-04).** The card's order is Preset, FPS, Encoding, Keyframe, caption (FPS moved under Preset 2026-11-05). Encoding and Keyframe are the two values a preset sets besides the FPS:
 **Encoding** (`widgets::segmented`, Performance | Quality, `ui.stream.ql_*`; dump rects `quality.0` / `quality.1`, value `quality`) and
 **Keyframe** (`menu::select`, 250 / 500 / 1000 / 2000 ms, `GOP_OPTIONS`; a stored interval outside the list is listed as it is; dump rect `gop`,
 values `gop`, `gop_options`). Both edit `NextStream.quality_level` / `gop_millis` through the same `target.action` as the FPS (staged:
 `SetNextStream`; live: `EditDestination`, which rebuilds the branch; the head's "Applying" pill shows). A preset sets all of them at once
-(`ApplyPresetToDestination` / `ApplyPresetToNextStream`); editing one by hand so that no preset matches leaves **no preset lit**, because
-`EncoderTuning::preset` compares quality level plus keyframe interval only. The caption stays and never says "(custom)". The webcam's
+(`ApplyPresetToDestination` / `ApplyPresetToNextStream`); editing one of them or the FPS by hand so that no preset matches leaves **no preset lit**, because
+`EncoderPreset::detect(framerate, tuning)` compares FPS, quality level and keyframe interval (all three exact; since 2026-11-05, before it left the FPS out and 120 fps + Quality + 250 ms lit Text). Picking the matching FPS again relights it. A fresh app (30 fps default, Quality encoding) therefore lights none. The caption stays and never says "(custom)". The webcam's
 fixed Performance / 2000 ms stays fixed (its modal has no such rows). Tooltips: Keyframe says a shorter interval recovers faster after a lost
 packet or fast motion but costs bitrate (row 129 measures keyframe lag spikes).
 *Why:* the user, after the presets replaced the Advanced rows: "The settings for the keyframe and the Performance/Quality setting should still
 be shown (right now only accessible through the presets Text/Quality/Gaming itself)." *Why a select and not the old 250-4000 ms slider:* the
 presets use 250 and 1000, the webcam 2000, and the useful range is a handful of steps; a dropdown is one row, matches FPS above it, and
 keeps the card's height.
+*Why (user, 2026-11-05):* "In the settings, of the stream, it should only show a preset, if the settings match it perfectly. Also, FPS should be below the preset line." (a screenshot of 120 fps + Quality + 250 ms with Text lit).
 
 **The stream-settings modal shows only controls that change the encode** (2026-11-01, task #90, user:
 "Keep the [Tune] setting. But make sure to not show settings, if they wouldn't do anything!").

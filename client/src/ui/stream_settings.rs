@@ -11,14 +11,14 @@
 //!   sends nothing until it changes" while a Starting row waits for the
 //!   capture's first frame + equal `[Also send to…][Move to…]`),
 //!   Upload bandwidth (Mode / Total / Floor / Per stream or over-budget banner);
-//! - how it's encoded: Compression (Codec / Bitrate) and Video (FPS dropdown / Preset
-//!   Text, Quality, Gaming / Encoding Performance|Quality / Keyframe 250, 500, 1000, 2000 ms
+//! - how it's encoded: Compression (Codec / Bitrate) and Video (Preset Text, Quality, Gaming /
+//!   FPS dropdown / Encoding Performance|Quality / Keyframe 250, 500, 1000, 2000 ms
 //!   + a caption "60 FPS · Quality encoding · Keyframe 1000 ms"). No encoder-limit banner or "Use H.265"
 //!   offer since 2026-10-15 (user: "just annoying"). The Advanced section is gone since 2026-11-04 (plan
 //!   decision D8: the presets replace it) but its two values that matter, Encoding and Keyframe, are
 //!   fields again the same day. *Why:* the user: "The settings for the keyframe and the Performance/Quality
 //!   setting should still be shown (right now only accessible through the presets Text/Quality/Gaming itself)."
-//!   A preset sets both; editing one by hand leaves no preset lit (the preset is derived from the pair).
+//!   A preset sets both; editing one by hand (or the FPS) leaves no preset lit (the preset is derived from FPS + the pair).
 //!   The Source card's Change button is there staged and live.
 //!
 //! Every control row is `[120 label][fill control][72 value]` (the widgets
@@ -665,18 +665,20 @@ fn compression_card(ui: &mut Ui, cx: &Cx, st: &mut StreamSettingsState, c: &Loca
     });
 }
 
-/// Video: FPS (a dropdown) and the Preset (Text / Quality / Gaming), then one caption line with
+/// Video: the Preset (Text / Quality / Gaming), FPS (a dropdown), Encoding and Keyframe, then one caption line with
 /// what is really set: `60 FPS · Quality encoding · Keyframe 1000 ms`.
 ///
-/// `Why the caption is built from the stored values and never says "custom":` the preset sets the FPS
-/// once, so the FPS can be changed by hand without leaving the preset, and a stored combination that
-/// matches no preset (an older settings file) still reads truthfully with no button lit.
+/// `Why the caption is built from the stored values and never says "custom":` a combination that matches
+/// no preset (a hand-changed FPS, an older settings file) still reads truthfully with no button lit.
+/// `Why a preset lights only on an exact FPS + encoding + keyframe match, and sits above FPS (user,
+/// 2026-11-05):` "it should only show a preset, if the settings match it perfectly. Also, FPS should be below
+/// the preset line."; the preset sets all three, a hand-changed FPS keeps the other two and unlights it.
 fn video_card(ui: &mut Ui, cx: &Cx, target: Target, out: &mut Vec<UiAction>) {
     let v = target.values(cx.state);
     let fps_opts = presets::framerate_options_for(v.framerate);
     let fps_labels: Vec<String> = fps_opts.iter().map(|f| tr_with("ui.stream.fps", "%{fps} fps", &[("fps", &f.to_string())])).collect();
     let mut fps_idx = fps_opts.iter().position(|f| *f == v.framerate).unwrap_or(0);
-    let mut preset = EncoderTuning { tune: v.tune, quality_level: v.quality_level, gop_millis: v.gop_millis }.preset();
+    let mut preset = EncoderPreset::detect(v.framerate, EncoderTuning { tune: v.tune, quality_level: v.quality_level, gop_millis: v.gop_millis });
     let preset_opts: Vec<(Option<EncoderPreset>, &str, bool, &str)> =
         EncoderPreset::ALL.iter().map(|p| (Some(*p), p.label(), true, p.description())).collect();
     drive_dump::line(|| {
@@ -684,6 +686,10 @@ fn video_card(ui: &mut Ui, cx: &Cx, target: Target, out: &mut Vec<UiAction>) {
         format!("preset {}\npreset_order {order}\ngop {}\nquality {:?}\ntune {:?}", preset.map_or("none", EncoderPreset::value), v.gop_millis, v.quality_level, v.tune)
     });
     widgets::card(ui, &tr("ui.stream.video", "Video"), None, |ui| {
+        let changed = widgets::ctrl_row(ui, &tr("ui.stream.preset", "Preset"), None, |ui| seg_gated(ui, "preset", &mut preset, &preset_opts, ""));
+        if changed && let Some(p) = preset {
+            out.push(target.preset_action(p));
+        }
         let labels: Vec<menu::Opt> = fps_labels.iter().map(|l| menu::Opt::new(l)).collect();
         let r = widgets::ctrl_row(ui, &tr("ui.stream.fps_label", "FPS"), None, |ui| menu::select(ui, "stream_fps", &mut fps_idx, &labels));
         drive_dump::rect(|| "fps".into(), r.rect);
@@ -692,12 +698,8 @@ fn video_card(ui: &mut Ui, cx: &Cx, target: Target, out: &mut Vec<UiAction>) {
             // Only the rate: the encoder mode and the keyframe interval stay.
             out.push(target.action(NextStream { framerate: fps_opts[fps_idx], ..v }));
         }
-        let changed = widgets::ctrl_row(ui, &tr("ui.stream.preset", "Preset"), None, |ui| seg_gated(ui, "preset", &mut preset, &preset_opts, ""));
-        if changed && let Some(p) = preset {
-            out.push(target.preset_action(p));
-        }
         // The two values a preset sets besides the FPS (and the tune, which has no row): editable, and a hand-made
-        // combination that matches no preset simply leaves none lit (`preset` is derived from these two).
+        // combination that matches no preset simply leaves none lit (`preset` is derived from these and the FPS).
         let perf = tr("ui.stream.ql_performance", "Performance");
         let qual = tr("ui.stream.ql_quality", "Quality");
         let mut ql = v.quality_level;

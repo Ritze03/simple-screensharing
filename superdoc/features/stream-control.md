@@ -627,9 +627,10 @@ documents and code: sharp at a low frame rate, a keyframe is cheap at 15 fps so 
 
 - **A preset sets the FPS once.** `apply_preset_to_start_stream` / `DestEdit::apply_preset` write the
   preset's frame rate, quality level, tune and keyframe interval; the FPS dropdown afterwards changes
-  only the rate. "Which preset is lit" is derived from **quality level + keyframe interval** only
-  (`EncoderPreset::detect`), so a hand-changed FPS keeps the highlight, and a stale stored tune does not
-  unlight it (the tune only matters on x264 and is no longer shown). A combination that matches no preset
+  only the rate. "Which preset is lit" is derived from **FPS + quality level + keyframe interval**, all
+  exact (`EncoderPreset::detect(framerate, tuning)`, 2026-11-05; user: "it should only show a preset, if
+  the settings match it perfectly"), so a hand-changed FPS unlights it and the matching FPS relights it,
+  and a stale stored tune does not unlight it (the tune only matters on x264 and is no longer shown). A combination that matches no preset
   (an older settings file) lights no button; the Video card's caption always reads the real values
   (`60 FPS · Quality encoding · Keyframe 1000 ms`) and never says "custom".
 - **The keyframe interval is saved** in `settings.toml` (`start_stream_defaults.gop_millis`, written at
@@ -660,7 +661,7 @@ documents and code: sharp at a low frame rate, a keyframe is cheap at 15 fps so 
   they drove (#95) is moot with three presets that are distinct on every backend. The "hide a setting that
   does nothing" rule is kept by deleting the Tune, Quality-level and Keyframe rows rather than hiding them.
 - **UI** (`ui/stream_settings.rs`, replica `superdoc/ui/replica/index.html`): right column **Compression**
-  (Codec, Bitrate) then **Video** (FPS dropdown, Preset, caption). The Source card's **Change** button is
+  (Codec, Bitrate) then **Video** (Preset, FPS dropdown, Encoding, Keyframe, caption). The Source card's **Change** button is
   there staged and live. While live it ends the stream first (`Discard` + `StageShare`: there is no source
   swap under a running encoder; it also stops the capture's other rooms), and the modal reopens staged.
 - **Keyframe interval at 250 ms: nothing broke.** `key-int-max` = `capture::gop_frames` (rounded frames:

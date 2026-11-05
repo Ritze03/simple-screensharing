@@ -29,11 +29,13 @@ export function presetCaption(d) {
 }
 /** A preset sets all of these at once (the FPS, the encoding mode, the keyframe interval). */
 export const presetPatch = (p) => ({ preset: p, fps: ENCODER_PRESETS[p].fps, latencyMode: ENCODER_PRESETS[p].latencyMode, gopMs: ENCODER_PRESETS[p].gopMs });
-/** Editing the encoding mode or the keyframe interval by hand: the preset is whichever one now matches both, else none is lit. */
+/** Editing the encoding mode or the keyframe interval by hand: the preset is whichever one now matches all three, else none is lit. */
 export const encoderPatch = (d, patch) => {
   const e = { ...encoderOf(d), ...patch };
-  return { ...e, preset: presetOf(e.latencyMode, e.gopMs) };
+  return { ...e, preset: presetOf(d.fps, e.latencyMode, e.gopMs) };
 };
+/** The preset to light for `d`: derived from FPS + encoding + keyframe, never the stored `d.preset` (which may be stale after an FPS edit). */
+export const litPreset = (d) => presetOf(d.fps, encoderOf(d).latencyMode, encoderOf(d).gopMs);
 /** The keyframe intervals to list for `d`: the offered ones, plus a stored other one as it is. */
 export const gopChoices = (d) => {
   const g = encoderOf(d).gopMs;
@@ -117,12 +119,12 @@ function shareMenu(view) {
   const sub = cap ? [captureRes(cap), codecName(d.codec), fmtKbps(live ? allocated(d) : d.kbps)].filter(Boolean).join(" · ") : "";
   const out = [
     head(lead, t("ui.bar.screen_share"), sub, true),
-    label(t("ui.stream.fps_label")),
-    h("div", { class: "mrow" }, denseSeg(FPS_LIST.map((f) => [f, String(f)]), d.fps, (v) => stay(() => edit({ fps: v }))())),
   ];
   out.push(label(t("ui.stream.preset")));
-  out.push(h("div", { class: "mrow" }, seg(PRESET_ORDER.map((p) => [p, presetLabel(p)]), d.preset, (v) => stay(() => edit(presetPatch(v)))())));
+  out.push(h("div", { class: "mrow" }, seg(PRESET_ORDER.map((p) => [p, presetLabel(p)]), litPreset(d), (v) => stay(() => edit(presetPatch(v)))())));
   out.push(h("div", { class: "mrow" }, h("span", { class: "cap", text: presetCaption(d) })));
+  out.push(label(t("ui.stream.fps_label")));
+  out.push(h("div", { class: "mrow" }, denseSeg(FPS_LIST.map((f) => [f, String(f)]), d.fps, (v) => stay(() => edit({ fps: v }))())));
   out.push(sep());
   if (!cap) {
     // Not sharing here: an existing share can be added or moved here, a new one starts the picker.

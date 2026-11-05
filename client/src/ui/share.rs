@@ -97,19 +97,9 @@ pub(super) fn share_menu(ui: &mut Ui, cx: &Cx, room: RoomHandle, state: ShareSta
     paint_text(ui, Rect::from_x_y_ranges(c.x_range(), top..=top + 16.0), &tr("ui.bar.screen_share", "Screen share"), font(Weight::Bold, theme::FS_ROW), theme::TEXT, Align::Min);
     paint_text(ui, Rect::from_x_y_ranges(c.x_range(), top + 16.0..=top + 30.0), &sub, font(Weight::Mono, theme::FS_TINY), theme::TEXT_DIM, Align::Min);
 
-    // FPS and Preset (the live destination's, or the next stream's defaults).
-    pop_heading(ui, &tr("ui.stream.fps_label", "FPS"));
-    let fps_opts = presets::framerate_options_for(v.framerate);
-    let fps_labels: Vec<String> = fps_opts.iter().map(u32::to_string).collect();
-    let fps_pairs: Vec<(u32, &str)> = fps_opts.iter().copied().zip(fps_labels.iter().map(String::as_str)).collect();
-    let mut fps = v.framerate;
-    egui::Frame::NONE.inner_margin(Margin::symmetric(theme::S2 as i8, 2)).show(ui, |ui| {
-        if widgets::segmented(ui, &mut fps, &fps_pairs) {
-            out.push(target.action(super::NextStream { framerate: fps, ..v }));
-        }
-    });
+    // Preset (lit only on an exact match), its caption, then FPS (the live destination's, or the next stream's defaults).
     pop_heading(ui, &tr("ui.stream.preset", "Preset"));
-    let mut preset = EncoderTuning { tune: v.tune, quality_level: v.quality_level, gop_millis: v.gop_millis }.preset();
+    let mut preset = EncoderPreset::detect(v.framerate, EncoderTuning { tune: v.tune, quality_level: v.quality_level, gop_millis: v.gop_millis });
     let preset_pairs: Vec<(Option<EncoderPreset>, &str)> = EncoderPreset::ALL.iter().map(|p| (Some(*p), p.label())).collect();
     egui::Frame::NONE.inner_margin(Margin::symmetric(theme::S2 as i8, 2)).show(ui, |ui| {
         if widgets::segmented(ui, &mut preset, &preset_pairs)
@@ -120,6 +110,17 @@ pub(super) fn share_menu(ui: &mut Ui, cx: &Cx, room: RoomHandle, state: ShareSta
     });
     let row = HBox::new("share_menu_caption", 18.0).pad(theme::S2, theme::S2).slots(&[FILL]).show(ui);
     row.text(ui, 0, &preset_caption(&v), font(Weight::Regular, theme::FS_TINY), theme::TEXT_DIM, Align::Min);
+    // FPS (the live destination's, or the next stream's defaults).
+    pop_heading(ui, &tr("ui.stream.fps_label", "FPS"));
+    let fps_opts = presets::framerate_options_for(v.framerate);
+    let fps_labels: Vec<String> = fps_opts.iter().map(u32::to_string).collect();
+    let fps_pairs: Vec<(u32, &str)> = fps_opts.iter().copied().zip(fps_labels.iter().map(String::as_str)).collect();
+    let mut fps = v.framerate;
+    egui::Frame::NONE.inner_margin(Margin::symmetric(theme::S2 as i8, 2)).show(ui, |ui| {
+        if widgets::segmented(ui, &mut fps, &fps_pairs) {
+            out.push(target.action(super::NextStream { framerate: fps, ..v }));
+        }
+    });
     // What went wrong under a live share: the capture is being restarted.
     if let (ShareState::Live { capture: id, .. }, Some(_)) = (state, here) {
         let note = cx.state.recovery(id).map(recovering_tip);

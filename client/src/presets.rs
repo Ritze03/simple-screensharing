@@ -7,7 +7,7 @@
 //! ([`EncoderTuning`]), plus the **frame rate** it starts from. Picking one is a
 //! convenience mapping, not a setting of its own: nothing about a preset is
 //! stored by name, "which preset is active" is derived from the stored fields
-//! by [`EncoderPreset::detect`] (quality level + keyframe interval), and a
+//! by [`EncoderPreset::detect`] (FPS + quality level + keyframe interval), and a
 //! combination that matches none is a legal, unhighlighted state.
 //!
 //! | preset | FPS | encoding (`QualityLevel`) | keyframe |
@@ -20,8 +20,12 @@
 //! Low-Latency / Balanced / Quality / Gaming and the Advanced tuning rows. Only
 //! Performance and Quality remain as modes; the old Balanced and Low-Latency
 //! stored values load as Quality. **A preset sets the FPS once; changing the FPS
-//! by hand keeps the encoder mode and the keyframe interval**, which is why the
-//! FPS is applied here but never part of [`EncoderPreset::detect`].
+//! by hand keeps the encoder mode and the keyframe interval.**
+//!
+//! `Why the FPS is part of the match (user, 2026-11-05, changing D8's "never part of detect"):` "it should
+//! only show a preset, if the settings match it perfectly". 120 fps + Quality + 250 ms used to light Text.
+//! So a preset is lit only when FPS, encoding and keyframe all equal its row; a hand-changed FPS unlights
+//! it and picking the matching FPS again relights it.
 //!
 //! The tune (x264 `zerolatency`, ignored by the VA encoders) is not user-visible
 //! any more: Gaming sets [`TuneMode::LowLatency`], the other two
@@ -57,11 +61,6 @@ pub struct EncoderTuning {
 }
 
 impl EncoderTuning {
-    /// The preset these fields match (quality level and keyframe interval), or
-    /// `None`. Reverse lookup for highlighting the active preset button.
-    pub fn preset(self) -> Option<EncoderPreset> {
-        EncoderPreset::detect(self)
-    }
 }
 
 /// Whether the Codec row offers a choice at all. With a single producible
@@ -147,13 +146,13 @@ impl EncoderPreset {
         }
     }
 
-    /// Whichever preset has `tuning`'s quality level and keyframe interval, or
-    /// `None` (an allowed, unhighlighted state). The tune is ignored: it is not
-    /// shown, and the VA encoders do not read it.
-    pub fn detect(tuning: EncoderTuning) -> Option<Self> {
+    /// The preset that equals `framerate` and `tuning`'s quality level and
+    /// keyframe interval exactly, or `None` (an allowed, unhighlighted state).
+    /// The tune is ignored: it is not shown, and the VA encoders do not read it.
+    pub fn detect(framerate: u32, tuning: EncoderTuning) -> Option<Self> {
         Self::ALL.into_iter().find(|p| {
             let t = p.tuning();
-            (t.quality_level, t.gop_millis) == (tuning.quality_level, tuning.gop_millis)
+            (p.framerate(), t.quality_level, t.gop_millis) == (framerate, tuning.quality_level, tuning.gop_millis)
         })
     }
 }
@@ -187,7 +186,7 @@ impl DestEdit {
     /// Which preset this buffer currently equals, if any — for highlighting
     /// the active preset button. `None` for a hand-tuned combination.
     pub fn active_preset(&self) -> Option<EncoderPreset> {
-        self.tuning().preset()
+        EncoderPreset::detect(self.framerate, self.tuning())
     }
 }
 
@@ -205,7 +204,7 @@ impl AppState {
     /// Which preset the "next capture" settings currently equal, if any — for
     /// highlighting the active preset button.
     pub fn start_stream_preset(&self) -> Option<EncoderPreset> {
-        self.start_stream_tuning().preset()
+        EncoderPreset::detect(self.framerate, self.start_stream_tuning())
     }
 
     /// Picking `preset` on the Start-a-stream form: set the live "next
@@ -326,6 +325,14 @@ mod tests {
     }
 
     #[test]
+    fn a_preset_is_detected_only_on_an_exact_fps_encoding_keyframe_match() {
+        let t = EncoderPreset::Text.tuning();
+        assert_eq!(EncoderPreset::detect(15, t), Some(EncoderPreset::Text));
+        assert_eq!(EncoderPreset::detect(120, t), None, "120 fps + Quality + 250 ms is no preset");
+        assert_eq!(EncoderPreset::detect(120, EncoderPreset::Gaming.tuning()), Some(EncoderPreset::Gaming));
+    }
+
+    #[test]
     fn labels_are_readable_without_locale_entries() {
         // `presets.text.*` is not in the locale files yet: the English fallback shows, never the key.
         assert!(!EncoderPreset::Text.label().starts_with("presets."));
@@ -335,30 +342,29 @@ mod tests {
     #[test]
     fn detect_is_the_inverse_of_tuning() {
         for preset in EncoderPreset::ALL {
-            assert_eq!(EncoderPreset::detect(preset.tuning()), Some(preset));
-            assert_eq!(preset.tuning().preset(), Some(preset));
+            assert_eq!(EncoderPreset::detect(preset.framerate(), preset.tuning()), Some(preset));
         }
     }
 
     /// Text and Quality differ only in the keyframe interval, so that is what tells them apart;
     /// the tune is not shown and does not count.
     #[test]
-    fn detect_reads_quality_level_and_keyframe_only() {
+    fn detect_reads_fps_quality_level_and_keyframe_only() {
         let mut t = EncoderPreset::Text.tuning();
         t.gop_millis = 1000;
-        assert_eq!(t.preset(), Some(EncoderPreset::Quality));
+        assert_eq!(EncoderPreset::detect(60, t), Some(EncoderPreset::Quality));
         t.tune = TuneMode::LowLatency;
-        assert_eq!(t.preset(), Some(EncoderPreset::Quality), "a stale tune does not unhighlight");
+        assert_eq!(EncoderPreset::detect(60, t), Some(EncoderPreset::Quality), "a stale tune does not unhighlight");
     }
 
     #[test]
     fn hand_tuned_combination_matches_no_preset() {
         let mut t = EncoderPreset::Quality.tuning();
         t.gop_millis = 2000;
-        assert_eq!(t.preset(), None);
+        assert_eq!(EncoderPreset::detect(60, t), None);
         let mut t = EncoderPreset::Quality.tuning();
         t.quality_level = QualityLevel::Performance;
-        assert_eq!(t.preset(), None, "Performance at 1000 ms is none of the three");
+        assert_eq!(EncoderPreset::detect(60, t), None, "Performance at 1000 ms is none of the three");
     }
 
     #[test]
@@ -426,9 +432,12 @@ mod tests {
             );
         }
 
-        // A preset sets the FPS once: changing it by hand keeps the encoder mode and keyframe.
+        // A preset sets the FPS once: changing it by hand keeps the encoder mode and keyframe but unlights the preset.
         edit.apply_preset(EncoderPreset::Gaming);
         edit.framerate = 30;
+        assert_eq!(edit.tuning(), EncoderPreset::Gaming.tuning());
+        assert_eq!(edit.active_preset(), None);
+        edit.framerate = 120;
         assert_eq!(edit.active_preset(), Some(EncoderPreset::Gaming));
 
         edit.gop_millis = 1234;
@@ -439,7 +448,9 @@ mod tests {
     async fn start_stream_settings_follow_the_applied_preset() {
         let _home = isolated_config_home();
         let mut state = AppState::default();
-        assert_eq!(state.start_stream_preset(), Some(EncoderPreset::Quality), "a fresh app already is the Quality preset");
+        // A fresh app has the Quality encoding but the 30 fps default, so no preset is lit until the FPS matches too.
+        assert_eq!(state.start_stream_tuning(), EncoderPreset::Quality.tuning());
+        assert_eq!(state.start_stream_preset(), None);
 
         for preset in EncoderPreset::ALL {
             state.apply_preset_to_start_stream(preset);
@@ -453,11 +464,12 @@ mod tests {
         state.apply_preset_to_start_stream(EncoderPreset::Quality);
         assert_eq!(state.gop_millis, 1000);
 
-        // The rate picked by hand afterwards does not change the preset; the bitrate is never a preset's.
+        // The rate picked by hand afterwards keeps the tuning and unlights the preset; the bitrate is never a preset's.
         state.bitrate_kbps = 20_000;
         state.apply_preset_to_start_stream(EncoderPreset::Gaming);
         state.framerate = 144;
-        assert_eq!(state.start_stream_preset(), Some(EncoderPreset::Gaming));
+        assert_eq!(state.start_stream_tuning(), EncoderPreset::Gaming.tuning());
+        assert_eq!(state.start_stream_preset(), None);
         assert_eq!(state.bitrate_kbps, 20_000);
     }
 

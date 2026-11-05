@@ -1259,7 +1259,7 @@ mod tests {
         assert_eq!(d.gop_millis, crate::capture::DEFAULT_GOP_MILLIS);
         assert_eq!(d.framerate, 30, "the frame rate stays: a preset sets it only when clicked");
         let tuning = crate::presets::EncoderTuning { tune: d.tune, quality_level: d.quality_level, gop_millis: d.gop_millis };
-        assert_eq!(tuning.preset(), Some(EncoderPreset::Quality));
+        assert_eq!(tuning, EncoderPreset::Quality.tuning());
 
         let old = "[start_stream_defaults]\nframerate = 60\nbitrate_kbps = 12000\ntune = \"low_latency\"\nquality_level = \"balanced\"\n";
         let d = toml::from_str::<AppSettings>(old).unwrap().start_stream_defaults;

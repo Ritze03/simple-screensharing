@@ -25,7 +25,7 @@ import { SOUND_NAMES, SoundOut } from "./sounds.js";
 import { WATCHED, roomView, viewKey, viewOf, vg, watchFps, collect } from "./stage-state.js";
 import { fullscreenPip } from "./pip.js";
 import { renderStage, renderPoppedNote, afterRender, isDragging, bindWindow, overlays, toggleStageFullscreen } from "./stage.js";
-import { opener, openMenu, selectField, FPS_LIST, PRESET_ORDER, presetLabel, presetCaption, presetPatch, encoderPatch, gopChoices } from "./menus.js";
+import { opener, openMenu, selectField, FPS_LIST, PRESET_ORDER, presetLabel, presetCaption, presetPatch, encoderPatch, litPreset, gopChoices } from "./menus.js";
 
 const caps = capabilities();
 const CODECS = [["h264", "H.264"], ["av1", "AV1"], ["h265", "H.265"]];
@@ -501,15 +501,15 @@ function renderStreamModal(M, close) {
       ? sliderRow(t("ui.stream.bitrate"), "st-kbps", 500, 20000, 250, () => d.kbps, (v) => { d.kbps = v; }, String, t("ui.stream.bitrate_tip"), () => edit({ kbps: d.kbps }))
       : ctrlRow(t("ui.stream.bitrate"), h("span", { class: "ro txt", style: "width:100%;text-align:right", text: t("ui.stream.set_by_budget") }), valBox(String(staged ? Math.max(bw.floor, Math.round(bw.total / Math.max(1, n) / 100) * 100) : allocated(d))), t("ui.stream.budget_tip")));
 
-  // Video: FPS (a dropdown in the app's own menu style), the preset and what it sets. A preset sets the FPS once; changing the FPS afterwards
-  // keeps its encoding mode and keyframe interval, so the caption is always "fps · mode · keyframe", never "(custom)". Encoding and Keyframe
-  // are fields too: editing one by hand so that no preset matches leaves no preset lit (the preset is derived from the pair).
+  // Video: the preset, FPS (a dropdown in the app's own menu style), Encoding, Keyframe and what is set. A preset sets the FPS once; changing the FPS
+  // afterwards keeps its encoding mode and keyframe interval, so the caption is always "fps · mode · keyframe", never "(custom)". The preset is lit
+  // only when FPS + encoding + keyframe all equal its row (`litPreset`, derived, user 2026-11-05: "only show a preset, if the settings match it perfectly").
   const enc = encoderOf(d);
   const gopSel = selectField({ id: "st-gop", opts: gopChoices(d), cur: enc.gopMs, onPick: (v) => edit(encoderPatch(d, { gopMs: Number(v) })), title: t("ui.stream.keyframe_tip") });
   const fpsSel = selectField({ id: "st-fps", opts: FPS_LIST.map((f) => [f, t("ui.stream.fps", { fps: f })]), cur: d.fps, onPick: (v) => edit({ fps: Number(v) }), title: t("share.framerate_label") });
   const video = card(t("ui.stream.video"), null,
+    ctrlRow(t("ui.stream.preset"), seg(PRESET_ORDER.map((p) => [p, presetLabel(p)]), litPreset(d), (v) => edit(presetPatch(v)))),
     ctrlRow(t("ui.stream.fps_label"), fpsSel, undefined, null, "st-fps"),
-    ctrlRow(t("ui.stream.preset"), seg(PRESET_ORDER.map((p) => [p, presetLabel(p)]), d.preset, (v) => edit(presetPatch(v)))),
     ctrlRow(t("ui.stream.encoding"), seg([["realtime", t("ui.stream.ql_performance")], ["quality", t("ui.stream.ql_quality")]], enc.latencyMode, (v) => edit(encoderPatch(d, { latencyMode: v }))), undefined, t("ui.stream.encoding_tip")),
     ctrlRow(t("ui.stream.keyframe"), gopSel, undefined, t("ui.stream.keyframe_tip"), "st-gop"),
     H({ g: 2 }, SL(LABEL_W, null), FILL(h("span", { class: "cap", id: "preset-cap", text: presetCaption(d) }))));

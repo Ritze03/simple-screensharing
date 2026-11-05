@@ -200,6 +200,14 @@ case "$STEP" in
     fps="${1:?FPS}"; codec="${2:?CODEC}"; preset="${3:?PRESET}"; kbps="${4:-}"
     case "$preset" in text|quality|gaming) ;; *) die "preset $preset? (text|quality|gaming)";; esac
     modal_open
+    # The preset first: it sets FPS + encoding + keyframe, and only an exact match lights it (2026-11-05), so a
+    # hand-set FPS after it (FPS differs from the preset's) leaves the encoding of the preset and no button lit.
+    if [[ "$(dump_get preset)" != "$preset" ]]; then
+      i="$(index_of "$preset" $(dump_get preset_order))"
+      [[ -n "$i" ]] || die "preset $preset? ($(dump_get preset_order))"
+      mclick "preset.$i"
+      dump_wait preset "$preset" 3 || die "setup: preset is $(dump_get preset), wanted $preset"
+    fi
     if [[ "$(dump_get fps)" != "$fps" ]]; then
       i="$(index_of "$fps" $(dump_get fps_options))"
       [[ -n "$i" ]] || die "fps $fps not in the dropdown ($(dump_get fps_options))"
@@ -213,12 +221,6 @@ case "$STEP" in
       mclick "codec.$i"
       dump_wait codec "$codec" 3 || die "setup: codec is $(dump_get codec), wanted $codec (greyed out = this machine can't encode it)"
     fi
-    if [[ "$(dump_get preset)" != "$preset" ]]; then
-      i="$(index_of "$preset" $(dump_get preset_order))"
-      [[ -n "$i" ]] || die "preset $preset? ($(dump_get preset_order))"
-      mclick "preset.$i"
-      dump_wait preset "$preset" 3 || die "setup: preset is $(dump_get preset), wanted $preset"
-    fi
     if [[ -n "$kbps" && "$(dump_get bitrate)" != "$kbps" ]]; then
       [[ -n "$(dump_get bitrate)" ]] || die "setup: no bitrate slider (absolute bandwidth mode?)"
       mclick bitrate -36; sleep 0.2                         # the row's 72 pt value box
@@ -226,7 +228,7 @@ case "$STEP" in
       hs_type -M ctrl a -m ctrl "$kbps" -k Return
       dump_wait bitrate "$kbps" 3 || die "setup: bitrate is $(dump_get bitrate), wanted $kbps (wtype: keyboard capability/keymap issue? use START_KBPS at rig up)"
     fi
-    log "setup: $(dump_get fps) fps, $(dump_get codec), $(dump_get preset), $(dump_get bitrate) kbps"
+    log "setup: $(dump_get fps) fps, $(dump_get codec), preset $(dump_get preset) (none = FPS differs from it), $(dump_get bitrate) kbps"
     ;;
   live)
     uclick "${SHARER:-1}" ctl.share; modal_open; sleep 0.3
