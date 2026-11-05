@@ -90,6 +90,26 @@ pub fn room_popover(ctx: &egui::Context, cx: &mut Cx, room: &crate::ui::RoomEntr
     }
 }
 
+/// The Room settings menu of the room `key` names, when a sidebar right click opened it (`PopoverKind::RoomMenu`):
+/// the same body as the bar's, for any room, connected or not.
+pub fn room_key_popover(ctx: &egui::Context, cx: &mut Cx) {
+    let Some(pop) = cx.nav.popover.clone() else { return };
+    let PopoverKind::RoomMenu(key) = &pop.kind else { return };
+    let Some(room) = cx.rooms().into_iter().find(|r| crate::ui::same_room(&r.key, key)) else {
+        cx.act(UiAction::ClosePopover);
+        return;
+    };
+    let (mut out, mut close) = (Vec::new(), false);
+    let cxr: &Cx = cx;
+    let open = popover(ctx, &pop, MENU_W, |ui| room_menu(ui, cxr, &room, &mut out, &mut close));
+    for a in out {
+        cx.act(a);
+    }
+    if close || !open {
+        cx.act(UiAction::ClosePopover);
+    }
+}
+
 /// The Layout menu: the three layouts, the stage options, reset. Returns true for "Reset sizes and positions".
 fn layout_menu(ui: &mut Ui, cx: &Cx, view: &StageView, out: &mut Vec<UiAction>, close: &mut bool) -> bool {
     let cur = cx.shell.stage.layout(view);

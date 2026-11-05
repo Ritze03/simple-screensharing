@@ -192,6 +192,9 @@ pub enum PopoverKind {
     Outgoing,
     /// A control-bar dropdown: Share, Audio, Layout or Room settings. (stage/bar.rs, drawn by stage/menus.rs)
     Bar(stage::BarMenu),
+    /// The Room settings menu of the room this key names, opened by a right click on its sidebar row (any room, open or
+    /// not). (sidebar.rs, drawn by stage/menus.rs `room_key_popover`)
+    RoomMenu(RoomKey),
     /// A stream's menu (its `⋯` button or a right click on the tile). (stage/menus.rs)
     Tile(stage::ItemId),
     /// Stream settings "Also send to…". (stream_settings.rs)

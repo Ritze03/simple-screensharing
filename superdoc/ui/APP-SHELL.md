@@ -240,6 +240,8 @@ Always show names, **Show stats** (numbers on every stream's name tag while hove
 others still see them), Reset sizes and positions (also forgets the PIP spots and sizes). Room settings menu: header, Auto-connect, Rename, Copy invite link, Leave room, Forget room (the modals
 the old header used). Bar layout and narrow windows: see "Narrow windows".
 
+**Right click on a sidebar room row** (2026-11-05) opens this same Room settings menu at the pointer, for the clicked room (open or not, connected or not: Connect instead of Leave); a left click still selects, a right click never changes the open room. Native: `PopoverKind::RoomMenu(RoomKey)`, set by `sidebar.rs` `paint_lines` (`secondary_clicked`), drawn by `stage/menus.rs` `room_key_popover` at the top of `sidebar::show_body` (before the rows, so a right click on another row queues its open after the old menu's click-outside close); body is the shared `room_menu`. *Why:* user, "on desktop, make sure that right clicking a room in the left view opens the same context menu, as the bottom button bar has".
+
 **The people strip and hover card** (task I3, `stage/strip.rs`): one 64 px cell per person (you first); ring, avatar, LIVE
 badge and name hang off **one centre line** (the pixel-snapped avatar rect's) with and without audio, and the green ring is
 one 2 px circle stroke 3 px outside the avatar, so it is even all round. The ring means audible shared audio (no voice chat);

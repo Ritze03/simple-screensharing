@@ -138,8 +138,8 @@ export function secHead(title, count, rule) {
   return H({ g: 2 }, h("h3", { class: "section-label" }, title, count != null ? h("span", { class: "count", text: String(count) }) : null), rule ? h("span", { class: "rule" }) : null);
 }
 /** Sidebar room row: hbox [slot 18 lead][fill name][slot 18 me-live][slot 28 number][slot 22 unit] */
-export function roomRow({ lead, name, me, num, unit, sel, onclick, title, numAttrs }) {
-  return H({ tag: "button", cls: "p-row" + (sel ? " sel" : ""), attrs: { type: "button", onclick, title: title || null } },
+export function roomRow({ lead, name, me, num, unit, sel, onclick, oncontextmenu, title, numAttrs }) {
+  return H({ tag: "button", cls: "p-row" + (sel ? " sel" : ""), attrs: { type: "button", onclick, oncontextmenu, title: title || null } },
     SL(18, lead), FILL(T(name, "name")), me === false ? null : SL(18, me || null),
     SL(28, h("span", Object.assign({ class: "num", text: num == null ? "" : String(num) }, numAttrs || {})), { al: "r" }), SL(22, unit || null, { al: "l" }));
 }

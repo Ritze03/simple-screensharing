@@ -72,6 +72,7 @@ use geom::{Bar, FRect, Grid, PipGeo, PipPos};
 pub(super) use tile::tile_volume_slider;
 
 pub use bar::BarMenu;
+pub use menus::room_key_popover;
 use super::{Cx, Popover, PopoverKind, RoomEntry, ShareState, StreamKey, UiAction, View, drive_dump, tr};
 use crate::theme::{self, Weight, font};
 use crate::widgets::{self, paint_text};
