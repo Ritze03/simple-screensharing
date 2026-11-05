@@ -145,7 +145,9 @@ pub(super) fn share_menu(ui: &mut Ui, cx: &Cx, room: RoomHandle, state: ShareSta
                 pop_sep(ui);
             }
             let label = if items.is_empty() { tr("ui.share_menu.share_here", "Share your screen…") } else { tr("ui.share_menu.other", "Share a different screen") };
-            if widgets::pop_item(ui, &PopItem::new("screen_share", &label).sub(&tr("ui.share_menu.other_sub", "Opens the system picker"))).clicked() {
+            let r = widgets::pop_item(ui, &PopItem::new("screen_share", &label).sub(&tr("ui.share_menu.other_sub", "Opens the system picker")));
+            crate::ui::drive_dump::rect(|| "menu.share_start".into(), r.rect);
+            if r.clicked() {
                 picked = Some(vec![UiAction::StageShare(room)]);
             }
         }

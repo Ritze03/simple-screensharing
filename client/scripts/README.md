@@ -12,7 +12,9 @@ as **legacy** (bottom of this page) and carry a banner. The rule and the machine
 ```bash
 cd client/scripts                         # SCRATCH defaults to <target>/hs-scratch/rig
 ./hs-rig.sh up                            # build (release) + everything below, ~15 s warm
-./hs-drive.sh share                       # click "Share screen": portal grants, no picker; modal opens
+./hs-drive.sh share                       # the Share arrow menu's "Share your screen": portal grants, no picker; modal opens
+./hs-drive.sh shareauto                   # the Share button itself: live at once with the remembered settings, no modal (fails if one opens)
+./hs-drive.sh restart 1                   # restart client 1 keeping its config (what the app saved: remembered stream settings)
 ./hs-drive.sh setup 240 h265 quality      # fps codec preset [kbps]; every value is read back
 ./hs-drive.sh golive                      # "Go live in <room>"
 ./hs-drive.sh watch                       # viewer: click Watch
@@ -87,7 +89,7 @@ Settings controls (`sound.volume`, `sound.test.*`, `sound_volume`) are dumped on
 | `bar.v0.0`, `bar.h0`; `barstate v0.0 hidden\|grey\|blue` | resize bars (hit rect) and how they show |
 | `win.N`, `grip.N` | floating window and its corner handle |
 | `tool.N.more\|fs\|pop\|settings`, `tag.N`, `watch.N` (`uclick .. watch.0 L40` = Watch stream); `stats.N` | a tile's hover buttons (only while shown), name tag, idle button row |
-| `ctl.share\|audio\|webcam\|layout\|room` and `.arrow`, `ctl.people\|leave\|sidebar\|invite\|pop\|fs`, `ctl.group.X` | the control bar |
+| `menu.share_start` (the Share menu's start entry); `share idle\|picking\|staged\|live\|paused` (the bar's Share state); `ctl.share\|audio\|webcam\|layout\|room` and `.arrow`, `ctl.people\|leave\|sidebar\|invite\|pop\|fs`, `ctl.group.X` | the control bar |
 | `menu`, `menu.LABEL` (spaces become `_`), `menu.always_names`, `menu.show_stats`, `menu.hide_own`, `menu.volume`, `menu.mute`; `volume` | the open menu and its rows; the volume row and its value |
 | `opt.I` | row I of an open dropdown (`menu::select`) |
 | `strip.NAME` (`strip.you`; `strip.NAME~2` is the second person of that name), `strip.NAME.live`; `person NAME streams N popped N ring 0\|1`; `cardof NAME rows N` | avatars and LIVE badges; one `cardof` line per open hover card |
@@ -106,7 +108,7 @@ Settings controls (`sound.volume`, `sound.test.*`, `sound_volume`) are dumped on
 | --- | --- |
 | `hs-rig.sh up\|status\|run\|down` | the rig |
 | `hs-lib.sh` | shared functions (sourced; sources `launch-lib.sh` for build/config/join-link helpers) |
-| `hs-drive.sh STEP` | share, setup, golive, live, discard, watch, hover, sample, stopshare, unwatch, shot, crop, click, move, key, modal, mclick (`mclick NAME L60` = 60 pt from the rect's left edge), tree; by dumped name for any client: rect, val, await, uclick, udclick, umove, uscroll, udrag; drag (window coordinates); relay-restart [DOWN_SECS] |
+| `hs-drive.sh STEP` | share (menu path: modal), shareauto (main button: no modal), restart [N], setup, golive, live, discard, watch, hover, sample, stopshare, unwatch, shot, crop, click, move, key, modal, mclick (`mclick NAME L60` = 60 pt from the rect's left edge), tree; by dumped name for any client: rect, val, await, uclick, udclick, umove, uscroll, udrag; drag (window coordinates); relay-restart [DOWN_SECS] |
 | `hs-scenario.sh` | one measured share (screenshots + per-stage rates) |
 | `hs-live-cycle.sh` | a share whose Preset / FPS / Encoding / Keyframe / Bitrate are changed over and over while live (`hs-drive.sh live`), with log counts per run |
 | `hs-pip-spots.py` | drags a webcam in picture onto all 8 spots with the real pointer, checks `pipinfo` after each release, optional screenshot per spot (needs a PIP on screen: `CLIENT_ENV_1="SSS_FAKE_CAMERA=1"`, share + webcam on client 1, Watch both on client 2, Layout > Webcam in picture) |

@@ -270,4 +270,4 @@ tests in the VMs"). It covers a native audio-only sender (a throwaway `audio-onl
 packets decoded, Stop listening), a browser audio-only share (`#btn-audio` with the harness' stubbed `getDisplayMedia`, only the audio kept) heard by a browser and by the native viewer (`listen` mode), and the webcam-plus-audio case.
 
 The older runs that depended on the old tiles and cards were updated: `viewers.mjs` (the viewers chip is on the own tile), `live-preview.mjs`, `avatar-fullscreen.mjs`, `e2e-lib.mjs`
-(`goLive` picks the FPS in the app's own dropdown: `pickFps`). `live.js` and `matrix.mjs` default to the new preset name (`quality`).
+(`goLive` goes through the Share menu's start entry and picks the FPS in the app's own dropdown: `pickFps`; `goLiveAuto` clicks the bar's Share button: live at once, no modal, 2026-11-05). `live.js` and `matrix.mjs` default to the new preset name (`quality`).

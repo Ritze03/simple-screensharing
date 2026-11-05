@@ -1358,3 +1358,14 @@ async fn settings_tabs_open_on_profile_draw_each_and_stay_selected() {
     frame(&mut app, &ctx, size);
     assert_eq!(app.modals.settings_tab, SettingsTab::Diagnostics, "kept while the app runs");
 }
+
+/// The bar's Share button stages with `auto`: the ready capture goes live by itself (the remembered settings), the menu's entry
+/// does not (it opens the modal); a room that is not joined holds an automatic share back.
+#[test]
+fn an_automatic_staged_share_goes_live_by_itself_only_in_a_joined_room() {
+    let auto = StagedShare { capture: simple_screensharing_client::session::CaptureSourceId(1), modal_opened: false, auto: true };
+    let manual = StagedShare { auto: false, ..auto.clone() };
+    assert!(auto.goes_live_by_itself(true));
+    assert!(!auto.goes_live_by_itself(false), "a suspended room keeps it staged until it is back");
+    assert!(!manual.goes_live_by_itself(true), "the menu's entry opens the modal");
+}

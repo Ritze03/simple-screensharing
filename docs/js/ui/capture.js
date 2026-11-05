@@ -360,6 +360,12 @@ export async function editDest(c, room, patch) {
   const d = c.dests.get(room.id);
   if (!d) return;
   const cfg = { ...encCfg(d), ...patch };
+  // What the user last chose is what the next share starts with, also on a live one (2026-11-05). `cfg` is the user's edit, so a
+  // codec the browser substituted on its own is not stored.
+  if (c.kind === "screen") {
+    S.settings.stream = { ...S.settings.stream, ...encCfg(cfg) };
+    persistSettings();
+  }
   if ("kbps" in patch && Object.keys(patch).length === 1) {
     d.kbps = patch.kbps;
     applyBandwidth();

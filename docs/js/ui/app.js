@@ -386,10 +386,17 @@ async function leaveRoom(r) {
   render();
 }
 
-async function startStage(r) {
+/** The picker, then: `auto` (the bar's Share button) goes live at once with the remembered settings, else (the Share menu's entry) the stream modal opens. */
+async function startStage(r, auto = false) {
   S.menu = null;
   const c = await stage(r);
-  if (c && S.view === "room" && S.selected === r.id && !S.modal) openStreamModal(c.id, r.id);
+  if (!c) return;
+  if (auto) {
+    // A remembered codec this browser cannot encode starts with the first encodable one, as the modal would show (staged copy only).
+    if (encoders && encoders.size && !encoders.has(c.staged.codec)) c.staged.codec = CODECS.find(([v]) => encoders.has(v))[0];
+    return goLive(c, r);
+  }
+  if (S.view === "room" && S.selected === r.id && !S.modal) openStreamModal(c.id, r.id);
 }
 
 /* ============================== stream settings modal ============================== */

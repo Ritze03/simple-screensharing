@@ -383,7 +383,8 @@ hs_start_client() {
   cfg="$SCRATCH/cfg$n"; extra_var="CLIENT_ENV_$n"; name_var="HS_NAME_$n"; bin_var="HS_CLIENT_BIN_$n"
   diag_var="HS_SEND_DIAG_$n"; emoji_var="HS_EMOJI_$n"
   # HS_NAME_1/HS_NAME_2 override the display name; HS_SEND_DIAG_<n>=1 ticks "Send diagnostics to the relay" (#110)
-  SSS_SEND_DIAGNOSTICS="${!diag_var:-}" SSS_EMOJI="${!emoji_var:-}" sss_seed_config "$cfg" "${!name_var:-client-$n}"
+  # HS_KEEP_CONFIG=1 (hs-drive.sh restart): keep the config as the previous run left it (remembered stream settings)
+  [[ -n "${HS_KEEP_CONFIG:-}" ]] || SSS_SEND_DIAGNOSTICS="${!diag_var:-}" SSS_EMOJI="${!emoji_var:-}" sss_seed_config "$cfg" "${!name_var:-client-$n}"
   mkdir -p "$SCRATCH/data$n"
   rm -f "$SCRATCH/ui$n.txt"
   [[ -n "${!extra_var:-}" ]] && read -r -a extra <<<"${!extra_var}"

@@ -342,6 +342,9 @@ pub enum UiAction {
     /// "Share screen": stage a capture for `room` (opens the OS picker).
     /// The stream-settings modal opens by itself once the picker resolves.
     StageShare(RoomHandle),
+    /// The control bar's Share screen button: like [`Self::StageShare`], but the share goes live by itself with the
+    /// remembered settings once the picker resolves (no modal).
+    ShareNow(RoomHandle),
     /// Go live with a staged capture in `room` (saves the settings as
     /// defaults, closes its settings modal).
     GoLive { capture: CaptureSourceId, room: RoomHandle },
@@ -455,6 +458,16 @@ pub struct StagedShare {
     pub capture: CaptureSourceId,
     /// Whether the settings modal was auto-opened when the picker resolved.
     pub modal_opened: bool,
+    /// Go live with the remembered settings once the capture is ready, instead of opening the modal.
+    pub auto: bool,
+}
+
+impl StagedShare {
+    /// Whether a ready capture goes live by itself now (the bar's Share button) instead of opening the settings modal: only
+    /// while its room is joined (a suspended room keeps the staged capture until it is back).
+    pub fn goes_live_by_itself(&self, room_joined: bool) -> bool {
+        self.auto && room_joined
+    }
 }
 
 /// A level tap being built: (generation, audio source id, result).
@@ -1234,7 +1247,7 @@ impl App {
         self.videos.sync(&self.state);
         self.sync_stage_keys();
         self.poll_live_previews(ctx);
-        self.poll_staged();
+        self.poll_staged(ctx);
         self.poll_level_taps();
         self.prompt_for_name();
         let now = ctx.input(|i| i.time);
@@ -1330,7 +1343,7 @@ impl App {
     /// `Why a reconnecting room keeps its staged share:` the handle is stable
     /// across the outage (`ReconnectState::handle`), so the staged card simply
     /// reappears when the room is back instead of re-prompting the OS picker.
-    fn poll_staged(&mut self) {
+    fn poll_staged(&mut self, ctx: &egui::Context) {
         let state = &self.state;
         let mut orphaned = Vec::new();
         self.shell.staged.retain(|room, s| {
@@ -1348,15 +1361,26 @@ impl App {
             View::Room(key) => self.state.rooms.iter().find(|(_, r)| same_room(&r.join_string, key)).map(|(h, _)| *h),
             _ => None,
         };
+        let mut go_live = Vec::new();
         for (room, s) in self.shell.staged.iter_mut() {
             let ready = self.state.captures.get(&s.capture).is_some_and(|c| matches!(c.status, ShareStatus::Active(_)));
             if ready && !s.modal_opened {
+                if s.auto {
+                    if s.goes_live_by_itself(self.state.rooms.contains_key(room)) {
+                        s.modal_opened = true;
+                        go_live.push((s.capture, *room));
+                    }
+                    continue;
+                }
                 s.modal_opened = true;
                 if self.nav.modal.is_none() && selected == Some(*room) {
                     self.nav.modal = Some(Modal::StreamSettings { capture: s.capture, room: *room });
                     self.nav.popover = None;
                 }
             }
+        }
+        for (capture, room) in go_live {
+            self.apply(ctx, UiAction::GoLive { capture, room });
         }
     }
 

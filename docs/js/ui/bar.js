@@ -55,8 +55,8 @@ export function renderBar(view, host, { fullscreen = false } = {}) {
   const shareBtn = !r && !cap ? null : split({
     main: {
       id: "btn-share", title: caps.canShare ? shareTitle : t("ui.err.cannot_share"), icon: "screen_share",
-      // Idle: the picker (or, when your share is live in another room, its menu: add / move here stay reachable). Staged or live: the stream settings.
-      onclick: (e) => (cap ? A.openStreamModal(cap.id, shareRoom.id) : othersLive ? openMenu("share", e.currentTarget.nextElementSibling, { mk: "share", viewKey: key }) : A.startStage(shareRoom)),
+      // Idle: the picker, then live at once with the remembered settings, no modal (or, when your share is live in another room, its menu: add / move here stay reachable). Staged or live: the stream settings.
+      onclick: (e) => (cap ? A.openStreamModal(cap.id, shareRoom.id) : othersLive ? openMenu("share", e.currentTarget.nextElementSibling, { mk: "share", viewKey: key }) : A.startStage(shareRoom, true)),
     },
     menu: { mk: "share", kind: "share", extra: { viewKey: key } }, state, disabled: !canShare || picking, arrowTitle: t("ui.bar.share_caret"), arrowDisabled: !canShare,
   });

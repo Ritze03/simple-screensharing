@@ -3010,7 +3010,18 @@ impl AppState {
     /// branch swap, or a shared-source restart plus swap — this side never
     /// decides which.
     pub fn apply_destination_edit(&mut self, destination_id: DestinationId) {
-        let Some((capture_id, _, _)) = find_destination(&self.captures, destination_id) else { return };
+        let Some((capture_id, _, dest)) = find_destination(&self.captures, destination_id) else { return };
+        // The user's choice is the new last-used default, also on a live share (2026-11-05). It comes from the
+        // edit buffer, never from the destination's live params, so an automatic codec fallback is not saved.
+        let e = dest.edit;
+        Self::set_start_stream_defaults(StartStreamDefaults {
+            framerate: e.framerate,
+            bitrate_kbps: e.bitrate_kbps,
+            tune: e.tune,
+            quality_level: e.quality_level,
+            gop_millis: e.gop_millis,
+            codec: e.codec,
+        });
         let Some(capture) = self.captures.get_mut(&capture_id) else { return };
         let ShareStatus::Active(ShareHandle::Video(handle)) = &capture.status else { return };
         let source = handle.source_caps();
@@ -5686,9 +5697,12 @@ impl AppState {
     /// "Go live" clicked: [`Self::go_live`], then persist the card's current
     /// encoder settings as the new last-used defaults.
     ///
-    /// `Why the save happens here and not on every change:` per the project
-    /// owner's explicit request, the defaults are persisted once, at "Go
-    /// live", not on every keystroke while the card is merely staged.
+    /// `Why the save happens here for staged edits:` per the project owner's
+    /// explicit request, a card that is merely staged is not saved on every
+    /// keystroke, only at "Go live". Since 2026-11-05 a change on a *live*
+    /// share is saved too (`apply_destination_edit`): "It should also save the
+    /// most recent settings, that the user has used (not just the profile,
+    /// like even if a custom framerate and keyframe interval)".
     pub fn go_live_and_save_defaults(&mut self, capture_id: CaptureSourceId, room_handle: RoomHandle) {
         self.go_live(capture_id, room_handle);
         self.save_current_start_stream_defaults();
@@ -6297,6 +6311,27 @@ mod ui_ops_tests {
         let saved = AppState::start_stream_defaults();
         assert_eq!(saved, state.current_start_stream_settings());
         assert_eq!((saved.framerate, saved.bitrate_kbps, saved.codec), (144, 22_000, capture::VideoCodec::H265));
+    }
+
+    /// A change on a live share is the new last-used default (2026-11-05), the keyframe interval and a custom fps included,
+    /// and it is the user's edit that is stored (never what the encoder fell back to).
+    #[tokio::test]
+    async fn editing_a_live_destination_saves_it_as_the_last_used_settings() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        let (capture_id, destination_id) = insert_destination(&mut state);
+        let mut edit = state.captures[&capture_id].destinations[&destination_id].edit;
+        edit.framerate = 144;
+        edit.gop_millis = 500;
+        edit.bitrate_kbps = 9_000;
+        edit.codec = capture::VideoCodec::Av1;
+        state.edit_destination(destination_id, edit);
+
+        let saved = AppState::start_stream_defaults();
+        assert_eq!((saved.framerate, saved.gop_millis, saved.bitrate_kbps, saved.codec), (144, 500, 9_000, capture::VideoCodec::Av1));
+        let mut next = AppState::default();
+        next.apply_start_stream_defaults();
+        assert_eq!((next.framerate, next.gop_millis), (144, 500), "the next share starts with them");
     }
 
     #[tokio::test]

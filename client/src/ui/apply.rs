@@ -12,6 +12,17 @@ use simple_screensharing_client::audio::{AudioChoice, name_is_excluded};
 
 impl App {
     /// Apply one action. `ctx` is only used for the clipboard.
+    /// Stage a capture for `room` (opens the picker). `auto`: go live by itself once the picker resolved
+    /// (`poll_staged`) instead of opening the settings modal.
+    fn stage_share(&mut self, room: simple_screensharing_client::session::RoomHandle, auto: bool) {
+        if self.shell.staged.contains_key(&room) || !self.state.rooms.contains_key(&room) {
+            return;
+        }
+        let capture = self.state.stage_video_share_with_saved_defaults();
+        self.shell.staged.insert(room, StagedShare { capture, modal_opened: false, auto });
+        self.nav.popover = None;
+    }
+
     pub(super) fn apply(&mut self, ctx: &egui::Context, action: UiAction) {
         match action {
             UiAction::LivePreviewSeen(id) => {
@@ -216,14 +227,8 @@ impl App {
             }
 
             // --- sharing -------------------------------------------------
-            UiAction::StageShare(room) => {
-                if self.shell.staged.contains_key(&room) || !self.state.rooms.contains_key(&room) {
-                    return;
-                }
-                let capture = self.state.stage_video_share_with_saved_defaults();
-                self.shell.staged.insert(room, StagedShare { capture, modal_opened: false });
-                self.nav.popover = None;
-            }
+            UiAction::StageShare(room) => self.stage_share(room, false),
+            UiAction::ShareNow(room) => self.stage_share(room, true),
             UiAction::GoLive { capture, room } => {
                 self.state.go_live_and_save_defaults(capture, room);
                 self.shell.staged.shift_remove(&room);

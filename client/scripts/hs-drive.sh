@@ -15,8 +15,11 @@
 # from `swaymsg -t get_tree`; every value is read back and the step FAILS if it did not take.
 #
 # Usage: SCRATCH=<rig scratch> hs-drive.sh STEP [ARGS...]
-#   share                     sharer: click "Share screen" (portal auto-grants, no picker; SHARER=3 drives client 3 instead of 1, for steps share/setup/golive/stopshare);
-#                             waits for the "Set up your stream" modal
+#   share                     sharer: the Share split button's ARROW menu -> "Share your screen..." (portal auto-grants, no picker;
+#                             SHARER=3 drives client 3 instead of 1, for steps share/setup/golive/stopshare); waits for the
+#                             "Set up your stream" modal (the menu path: picker, modal, Go live)
+#   shareauto                 sharer: click the Share button's MAIN part: picker, then live at once with the remembered settings, no
+#                             modal. Waits for the dump's `share live`; fails if the modal opened. Needs no setup/golive
 #   setup FPS CODEC PRESET [KBPS]
 #                             FPS one of 15 30 60 90 120 144 165 240; CODEC h264|av1|h265;
 #                             PRESET text|quality|gaming. KBPS needs keyboard input
@@ -56,6 +59,8 @@
 #                             the same, from the centre of a dumped rect by (DX, DY) points
 #   key N KEYS...             wtype to client N (focuses it first), e.g. `key 1 -M ctrl a -m ctrl`
 #   relay-restart [DOWN_SECS] kill the relay and start it again DOWN_SECS later (default 0), same port and cert
+#   restart [N]               stop client N (default 1) and start it again, same output (workspace WS, default N+1), config kept (settings the app saved, e.g. the
+#                             remembered stream settings, survive; `up` seeds a fresh config). Auto-connects to the room again
 #   tree                      sway window list
 
 set -uo pipefail
@@ -151,8 +156,25 @@ tip_geom() { UI_DUMP="$SCRATCH/ui$VIEWER.txt"; dump_rect "tag.${1:-0}" | awk '{ 
 
 case "$STEP" in
   share)
-    uclick "${SHARER:-1}" ctl.share
+    uclick "${SHARER:-1}" ctl.share.arrow; sleep 0.4
+    uclick "${SHARER:-1}" menu.share_start
     modal_open
+    ;;
+  restart)
+    n="${1:-1}"; pid="$(hs_pid_of "client$n")"; [[ -n "$pid" ]] || die "no client$n in $HS_PIDS"
+    out="$(hs_win_output "$pid")"
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid"
+    for _ in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
+    HS_KEEP_CONFIG=1 hs_start_client "$n" "${WS:-$((n + 1))}" "$out" ;;
+  shareauto)
+    n="${SHARER:-1}"
+    uclick "$n" ctl.share
+    for _ in $(seq 1 60); do
+      [[ "$(UI_DUMP="$SCRATCH/ui$n.txt" dump_get open)" == 1 ]] && die "shareauto: the stream-settings modal opened (it must not)"
+      [[ "$(UI_DUMP="$SCRATCH/ui$n.txt" dump_get share)" == live ]] && break
+      sleep 0.5
+    done
+    [[ "$(UI_DUMP="$SCRATCH/ui$n.txt" dump_get share)" == live ]] || die "shareauto: the share is not live after 30 s (share $(UI_DUMP="$SCRATCH/ui$n.txt" dump_get share))"
     ;;
   setup)
     fps="${1:?FPS}"; codec="${2:?CODEC}"; preset="${3:?PRESET}"; kbps="${4:-}"

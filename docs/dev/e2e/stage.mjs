@@ -652,6 +652,7 @@ try {
   f = await fields();
   check(f.gop === "500 ms" && f.preset === "none" && (await cap()) === "60 FPS · Quality encoding · Keyframe 500 ms" && !/custom/i.test(await cap()), "Keyframe 500 ms: no preset lit, the caption says what is set (never custom)", JSON.stringify(f) + " " + (await cap()));
   check(await P.eval(`[...__sss.S.captures[0].dests.values()].every((d) => d.gopMs === 500 && d.latencyMode === "quality" && d.share)`), "the live destination restarted with the new keyframe interval", await P.eval(`JSON.stringify([...__sss.S.captures[0].dests.values()].map((d) => [d.gopMs, d.latencyMode, d.preset]))`));
+  check(await P.eval(`(() => { const st = __sss.S.settings.stream; return st.gopMs === 500 && st.fps === 60 && st.codec === "h264"; })()`), "a keyframe edit on a LIVE share is the new remembered setting (not only what was set before Go live)", await P.eval("JSON.stringify(__sss.S.settings.stream)"));
   await P.click({ text: "Performance", sel: ".modal .seg button" });
   await P.waitFor("__sss.S.captures.every((c) => c.dests.size && [...c.dests.values()].every((d) => d.state === 'live'))", { timeout: 20000, what: "live again after an encoding edit" });
   check((await cap()) === "60 FPS · Performance encoding · Keyframe 500 ms" && (await fields()).preset === "none", "Encoding Performance by hand: caption follows, still no preset lit", await cap());
@@ -1253,6 +1254,13 @@ try {
   await A.page.waitFor("!__sss.S.captures.some((c) => c.kind === 'screen')", { timeout: 10000, what: "Alice stops her screen" });
   await P.waitFor("!document.querySelector('.arena > .st-tile > .pip:not([data-id$=\"/me/cam\"])') && [...document.querySelectorAll('.arena > .st-tile')].some((t) => /\\/Alice\\/video\\/Webcam$/.test(t.dataset.id))", { timeout: 15000, what: "Alice's webcam is a tile again" });
   check(true, "a webcam whose owner stopped the screen share is a tile again (and a webcam alone stays one)");
+  // the bar's Share button, idle: the picker, then live at once with the remembered settings, no modal (task 140)
+  await L.stubCapture(A.page, { width: 960, height: 540, fps: 15, audio: false });
+  const rem = await A.page.eval("JSON.stringify(__sss.S.settings.stream)");
+  await L.goLiveAuto(A.page);
+  const auto = await A.page.eval(`({ modal: !!document.querySelector('.modal'), dests: [...__sss.S.captures.find((c) => c.kind === 'screen').dests.values()].map((d) => [d.fps, d.codec, d.gopMs]) })`);
+  const r0 = JSON.parse(rem);
+  check(!auto.modal && auto.dests.length === 1 && auto.dests[0][0] === r0.fps && auto.dests[0][1] === r0.codec && auto.dests[0][2] === r0.gopMs, "Share (main button, idle): no stream settings modal, live with the remembered fps / codec / keyframe", JSON.stringify([rem, auto]));
   // stop the webcams through the real UI
   await P.click("#btn-webcam");
   await P.waitFor("!__sss.S.captures.some((c) => c.kind === 'webcam')", { timeout: 10000, what: "Vera's webcam stopped" });

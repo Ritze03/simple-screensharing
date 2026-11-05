@@ -216,8 +216,19 @@ Layout and Room settings are split buttons that always show their dropdown arrow
 line (`STAGE_BTN_SEP`); grouped buttons sit on a backdrop (`STAGE_BTN` in a `STAGE_GROUP` pill), the freestanding ones at the
 sides have none; a live Share/Audio button is green, a staged one accent (`ready`); **Leave is 64x50, as tall as a group**.
 The people button shows and hides the strip; there is no people list and no arrow above the avatars. *Share* click: idle
-starts the picker (or opens its menu when your share is live in another room, so add / move here stay reachable), staged
-or live opens the Stream settings modal; its arrow opens the **Share menu** (Off / Ready / Live header with pill, size,
+starts the picker and, once something is picked, **goes live by itself with the remembered settings, no modal** (2026-11-05,
+`UiAction::ShareNow` -> `StagedShare::auto`, `App::poll_staged`; a dismissed picker leaves nothing staged; or opens its menu
+when your share is live in another room, so add / move here stay reachable), staged
+or live opens the Stream settings modal. The menu's own start entry ("Share your screen…" / "Share a different screen" /
+"Change source") keeps the old flow: picker, then the full modal, then Go live (`UiAction::StageShare`). *Why:* user,
+2026-11-05: "When clicking the screenshare button in the bottom bar, it should just open the picker and once something is
+selected, it should automatically start the screenshare, without opening the full settings. When it is started from the
+context menu, it should open up the full settings of it." **Remembered settings:** every stream setting (FPS, Preset's
+Encoding and Keyframe, Codec, Bitrate) is saved as `start_stream_defaults` at Go live **and on every change of a live
+share** (`AppState::apply_destination_edit`), user: "It should also save the most recent settings, that the user has used
+(not just the profile, like even if a custom framerate and keyframe interval)". The saved value is the user's edit, not the
+destination's live params, so an automatic codec fallback (AV1 -> H.265 -> H.264) is never remembered. Staged edits that
+never went live stay unsaved. Its arrow opens the **Share menu** (Off / Ready / Live header with pill, size,
 codec and rate; FPS and Preset for the live destination or the next stream; Change source, All stream settings…, Go live
 in / Stop sharing; a recovering or encoder-bound note). *Share audio* (I7) is a share of its own, **no screen needed** (it was "next to a screen only" until 2026-11-04): one click turns **Desktop audio** on (the icon goes `music_note`, green), the next turns it off; its arrow opens the **audio menu** (`share::audio_menu`: heading "Audio source", No audio, Desktop audio with the sub-line "Everything you hear" / "... minus N excluded", then every app under its **source group** heading (Games, Browsers, Media, Voice chat, Devices, Other) with a live level meter, a Mute shared audio switch while sharing, and "All audio settings…"). Picking a row starts, switches or stops the share in the room the bar acts on at once. "All audio settings…" opens the **audio settings menu** (`audio_settings.rs`, `Modal::AudioSettings`): Source card (the Audio dropdown, `menu::select`), Volume card (**Boost** 50-200 %, moved here from Settings > Shared audio), Desktop audio card (the **exclusion list**: Add opens a popover, `PopoverKind::AudioExclude`, with the sources detected now and an "Or enter a name" field; every entry has Remove), footer `[Stop sharing audio | Share desktop audio][fill][Done]`. Why and the audio side: `features/audio-sharing.md` "desktop audio ... (task I7)"; Linux only. *Webcam* (I8) is a share of its own, no screen needed: click starts it (the saved
 camera in its saved mode, into the room the bar acts on; from another room it **moves**) and the next click stops it; its

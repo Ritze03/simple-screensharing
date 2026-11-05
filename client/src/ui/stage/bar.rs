@@ -308,13 +308,23 @@ impl Bar {
             ShareState::Picking { .. } => (Tone::Off, tr("ui.bar.picking_title", "Choose a screen in the system picker"), false),
             _ => (Tone::Off, tr("ui.bar.share_screen_tip", "Share your screen"), true),
         };
+        drive_dump::line(|| {
+            let name = match state {
+                ShareState::Idle => "idle",
+                ShareState::Picking { .. } => "picking",
+                ShareState::Staged { .. } => "staged",
+                ShareState::Live { .. } => "live",
+                ShareState::Paused => "paused",
+            };
+            format!("share {name}")
+        });
         let rect = Rect::from_min_size(pos2(bx, by), vec2(SPLIT_W, BTN_H));
         let (main, caret) = split(ui, rect, &Split { name: "share", icon: "screen_share", tone, enabled, tip: &tip, caret_tip: &tr("ui.bar.share_caret", "Framerate, source and preset"), open: open(cx, BarMenu::Share) });
         if main {
             match state {
                 ShareState::Live { capture, .. } | ShareState::Staged { capture } => cx.act(UiAction::OpenModal(crate::ui::Modal::StreamSettings { capture, room })),
                 ShareState::Idle if live_elsewhere(cx, room) => cx.toggle_popover(PopoverKind::Bar(BarMenu::Share), rect),
-                ShareState::Idle => cx.act(UiAction::StageShare(room)),
+                ShareState::Idle => cx.act(UiAction::ShareNow(room)),
                 _ => {}
             }
         } else if caret {

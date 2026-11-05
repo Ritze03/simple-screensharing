@@ -85,9 +85,17 @@ export async function pickFps(page, fps) {
   await page.waitFor(`document.querySelector("#st-fps .txt")?.innerText.trim() === ${JSON.stringify(want)}`, { what: "fps picked" });
 }
 
-/** Click through the real share flow: the bar's Share screen -> stream settings (codec, fps) -> Go live. */
-export async function goLive(page, { codec = "h264", fps = 60, kbps = null } = {}) {
+/** The bar's Share screen main button: the picker, then live at once with the remembered settings (no modal). Resolves when live. */
+export async function goLiveAuto(page) {
   await page.click("#btn-share");
+  await page.waitFor("__sss.S.captures.some((c) => c.state === 'live' && [...c.dests.values()].some((d) => d.state === 'live'))", { timeout: 20000, what: "live" });
+}
+
+/** Click through the real share flow of the Share menu: its arrow -> "Share your screen" -> stream settings (codec, fps) -> Go live. */
+export async function goLive(page, { codec = "h264", fps = 60, kbps = null } = {}) {
+  await page.click("#btn-share ~ .caret");
+  await page.waitFor("document.querySelector('.menu.m-share')", { what: "share menu" });
+  await page.click({ js: "[...document.querySelectorAll('.menu.m-share .mi')].find((e) => /^screen_share/.test(e.innerText.trim()))" });
   await page.waitFor("document.querySelector('#st-fps')", { what: "stream modal" });
   await pickFps(page, fps);
   const label = { h264: "H.264", h265: "H.265", av1: "AV1" }[codec];
