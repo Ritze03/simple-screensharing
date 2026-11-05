@@ -20,6 +20,7 @@ cd client/scripts                         # SCRATCH defaults to <target>/hs-scra
 ./hs-drive.sh watch                       # viewer: click Watch
 ./hs-drive.sh hover                       # viewer: tooltip "Decoded X fps / shown Y fps, H.265 via vah265dec"
 ./hs-drive.sh shot /path/viewer.png       # grim -o HEADLESS-3 (viewer);  `shot f.png HEADLESS-2` = sharer
+./hs-resize.sh 1280x720                   # change the captured output's size under a live share; `hs-resize.sh burst [N] [GAP_MS] [FINAL]` = a window edge being dragged
 ./hs-extra-client.sh 3 Alice 4            # a third (fourth, ...) client on HEADLESS-3, workspace 4: more viewers, or a second stream (SHARER=3 ./hs-drive.sh share|setup|golive)
 ./hs-drive.sh uclick 2 ctl.layout         # by dumped name: any control of client 2 (names below)
 ./hs-drive.sh udrag 2 bar.v0.0 60 0 1500 & # a real drag, held 1.5 s at the end; meanwhile:

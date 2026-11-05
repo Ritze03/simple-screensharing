@@ -24,6 +24,65 @@ fan-out**, **transfer** between rooms, and the two **bandwidth modes** with
 
 ---
 
+## The source changes size: a window resized, a mode change, a game changing resolution (2026-11-05, row 141)
+
+**Brief.** While a share is live the source can change size. Before this, nothing noticed: `source_caps()` cached the first size for
+good and the only way out was the dead-source route below, which waited for the silence watchdog (3 s without an encoded frame, 2 s
+more) and then restarted: about 6 s frozen.
+
+**Measured in the rig (stock xdpw 0.8.4, `swaymsg output HEADLESS-1 resolution ...`, `client/scripts/hs-resize.sh`).** The portal
+cannot follow a size change in place. Three outcomes were seen, run to run, at every codec: (a) `xdpw.log` `ext: frame capture failed:
+buffer constraint mismatch`, then `out of buffers` / `unable to export buffer` for ever; `pipewiresrc` renegotiates and pushes the new
+size as a caps event, but delivers 0 fresh buffers (a bare `pipewiresrc ! queue ! fakesink` probe does the same, so it is not our
+pipeline); (b) the same without any caps event; (c) the node is destroyed (`stream error: target not found`). A burst of 16 buffers
+sometimes arrives seconds later and nothing after it. So an in-place fix (rewriting caps, swapping branches) cannot help against this
+portal, and the restart (new portal session, restore token, ~0.5 s) stays the answer for it. Window capture was not testable: the rig's
+xdpw shares outputs only (`chooser_type=none`).
+
+**What changed.**
+- `SizeWatch` (a probe on the tee's sink pad, `capture.rs`): the live frame size from the caps events, when it last changed, buffers
+  since, and the newest buffer's time. `source_caps()` stays the size the destinations were built for (the basis `rescale_for_new_source`
+  and `edited_params` work from); the live size is separate.
+- `CaptureHandle::poll_resize` (called per frame from `AppState::poll_capture_recovery_at`, step 0):
+  1. the size must stay put for `RESIZE_SETTLE` (600 ms), so a drag with many sizes per second acts once;
+  2. settled and **fresh** buffers arrived (`RESIZE_ALIVE_FRAMES` = 3 distinct `GstBuffer`s, because `pipewiresrc`'s keepalive resends the
+     held buffer and must not read as alive): every destination gets `rescale_for_new_source(params, old, new)` through
+     `change_destination`, the ordinary tier-2 branch swap (build alongside, first IDR, flip). The new size becomes `source_caps()`.
+     Viewers keep the stream id; the decoder reconfigures on the new parameter sets and the stage re-lays out from the decoded size
+     (the relay's announced `width`/`height` are not updated, nothing reads them once a frame decoded);
+  3. settled and no fresh buffer: the capture is marked lost at once (`SOURCE_RESIZED_TEXT`) and the session restarts it, instead of
+     waiting for the 5 s watchdog;
+  4. no buffer at the tee for `SOURCE_GAP_LOST` (2 s) on a keepalive source: lost too, for outcome (b), which has no caps event.
+  The pumps' watchdog holds off `SourceDead` while the size is still changing (`CaptureErrors::size.resizing`).
+- `finish_recovery`: a restart that comes out at another size does not walk the restart backoff (`recovery_history`). A drag with a portal
+  that cannot follow it restarts once per settled size, each time at position 0 (before: +2 s, +5 s, ... after the second resize).
+- `rescale_for_new_source` moved to `capture::destination` (re-exported by `session`); the per-mille share is rounded and 99.5 % counts as
+  the whole source (truncation drifted 1920x1080 to 1916x1076 over three restarts).
+
+**Why:** a branch has fixed encode caps; scaling into them keeps the stream alive but distorts the aspect, and an encoder cannot take new
+parameters mid-stream, so the branch swap is the one honest way to a new size. It is debounced because every swap is an encoder build.
+The restart is kept, not replaced, because the measured portal needs it.
+
+**Measured (rig, release, 60 fps, stock xdpw, viewer = client 2):**
+
+| Scenario | Before | After |
+| --- | --- | --- |
+| one mode change 1920x1080 -> 1280x720, H.264 / H.265 | source declared lost 5.7 s later, ~6.3 s frozen | lost 1.1 s after the change, recovered 0.5 s later: ~1.6 s, viewer at the new size and aspect |
+| burst of 14 sizes in 1.2 s, ending 1600x900 | (not run; schedule +2 s, +5 s each) | one or two restarts at position 0, picture back ~2.7-3 s after the first change, correct size |
+| size change with no caps event (outcome b) | ~5.7 s | 2 s gap rule + 0.5 s restart: ~2.6 s |
+| live source that survives (test source 1280x720 -> five sizes in 500 ms -> 640x480) | not handled | one swap, viewer decodes 640x480, no gap over 3 s (`end_to_end_test::a_source_that_changes_size_keeps_the_viewer_decoding_at_the_new_aspect`) |
+
+**Known ceilings (`ponytail:` in code).** A destination whose swap is already in flight when the size settles answers `Err` and keeps
+the old size until the next change. The 2 s gap rule restarts a capture that stalls 2 s for any reason (the watchdog's 5 s before).
+One H.265 run hit `ring vcn_unified_1 timeout` (only that ring was reset, `Ring reset succeeded`, the client process died with `amdgpu: The
+CS has cancelled because the context is lost`): the encoder was busy while the old capture was torn down. Not reproduced in two more runs.
+
+**For a direct `pipewiresrc` of a `Video/Source` node (gamescope, row 142):** such a node renegotiates in place, so it takes path 2 (swap),
+not the restart; `SizeWatch` hangs on the tee and works unchanged for any source. Frames there must be fresh buffers, not keepalive
+resends, or `poll_resize` reads it as dead.
+
+---
+
 ## Settings changes on a live share, and the coded-buffer deaths that were left (2026-11-04, task #139)
 
 **Brief.** Row 137 stopped a dead encode branch from reading as a lost portal source, but (1) nothing had tested what the user does
@@ -1342,7 +1401,7 @@ Verified with an `LD_PRELOAD` fault that hangs `vaEndPicture` on encode contexts
 on every VA call kills the capture and shows up as a dead source instead): picture back about 14 s
 after the hang (3 s silence + 3 s stalled + 5 s for the VA dud to miss its IDR + the x264 branch).
 
-**Dead source (per capture, in the session): Option 1.** `AppState::poll_capture_recovery`
+**Dead source (per capture, in the session): Option 1.** (A size change reaches this route faster since 2026-11-05: see "The source changes size" at the top.) `AppState::poll_capture_recovery`
 (once per frame) sees `source_lost()` and starts a `CaptureRecovery` (`AppState::recoveries`):
 `begin_stall` (every destination `Stalled`, cached IDR keepalive; the old pipeline stays in
 place so viewers keep their frozen tile), then restart attempts on the schedule

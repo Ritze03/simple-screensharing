@@ -43,7 +43,9 @@ for the sharer. A fresh build proves itself: `grep -c '<new string>' target/rele
 ## 2. Drive a share
 
 ```bash
-./hs-drive.sh share                      # click "Share screen": the portal grants at once; modal opens
+./hs-drive.sh share                      # the Share arrow menu's "Share your screen": the portal grants at once; modal opens
+./hs-drive.sh shareauto                  # the Share button itself: live at once with the remembered settings, no modal
+./hs-resize.sh 1280x720 | burst [N] [GAP_MS] [FINAL]   # size change of the captured output under a live share
 ./hs-drive.sh setup 240 h265 quality     # FPS CODEC PRESET (text|quality|gaming) [KBPS]; reads every value back, exits 1 on a miss
 ./hs-drive.sh golive                     # "Go live in <room>"
 ./hs-drive.sh watch                      # viewer clicks Watch

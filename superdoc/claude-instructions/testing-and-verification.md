@@ -63,7 +63,7 @@ parallel. The user also stopped audio tests (below).
 
 ```bash
 client/scripts/hs-rig.sh up            # build + sway + bus + PipeWire + portal + relay + pattern + 2 clients
-client/scripts/hs-drive.sh share|setup|golive|watch|hover|shot ...   # or hs-scenario.sh for one measured share
+client/scripts/hs-drive.sh share|shareauto|setup|golive|watch|hover|shot ...   # share = the Share menu (modal), shareauto = the Share button (live at once); or hs-scenario.sh for one measured share; hs-resize.sh changes the captured output's size (one change or a burst)
 client/scripts/hs-rig.sh down          # always, when you are done (also removes the private runtime dir)
 ```
 
@@ -117,7 +117,7 @@ Rules for working in it:
   to `HEAD` (and 4 of 5 before #52), the rate moving with whatever else ran on the machine; since #112 it is 0 of
   60 (mixed codecs, 60/120 fps). The rig emulates dbus activation for xdpw, so a crash is invisible to scripts
   (the client's single retry on a fresh portal session, #59, succeeds); `$SCRATCH/xdpw-crashed.log` counts them
-  (`grep -c 'restarted by bus activation'`). `hs-drive.sh share` failing to open the modal (the old "1 in 10") was
+  (`grep -c 'restarted by bus activation'`). `hs-drive.sh share` (the Share menu path) failing to open the modal (the old "1 in 10") was
   always this crash, not a script race.
   **The other failure of the same flap (#122)**: a share that stays STARTING with no frame ("capture started in
   the Gpu domain", then `the capture source has produced no frame in 3.01s`) and an `xdpw.log` full of
