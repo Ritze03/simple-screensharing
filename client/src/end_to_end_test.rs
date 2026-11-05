@@ -2670,6 +2670,119 @@ async fn a_source_that_changes_size_keeps_the_viewer_decoding_at_the_new_aspect(
     let _ = sharer.leave().await;
 }
 
+/// Row 148: a live source resized at random for a long time (a window dragged: tiny and odd sizes, fast bursts, pauses)
+/// keeps streaming. Per codec (`SSS_STRESS_CODEC=h264|h265|av1`, default h264), `SSS_STRESS_SECS` (default 40). The
+/// viewer must be decoding at the end, at the final aspect, and no gap between decoded frames may pass the budget.
+/// The source is a test source (no portal): the swap path is real, the portal's behaviour is not (rig: `hs-resize.sh`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "spawns a real relay server child process and real GStreamer capture/decode pipelines; run explicitly with \
+            `cargo test -p simple-screensharing-client --lib --release -- --ignored a_window_resized_at_random --nocapture`"]
+async fn a_window_resized_at_random_keeps_streaming() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    let secs: u64 = std::env::var("SSS_STRESS_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+    let codec = match std::env::var("SSS_STRESS_CODEC").as_deref() {
+        Ok("h265") => capture::VideoCodec::H265,
+        Ok("av1") => capture::VideoCodec::Av1,
+        _ => capture::VideoCodec::H264,
+    };
+    let port = pick_free_udp_port().expect("free port");
+    let _server = spawn_relay_server(port).expect("relay");
+    let join_string = crate::net::format_join_string(&format!("127.0.0.1:{port}"), &rand::random::<RoomId>(), &rand::random::<[u8; 32]>());
+    let (sharer, _s, mut events_a) = connect_with_retry(&join_string, "sharer").await.expect("sharer");
+    let (viewer, _v, mut events_b) = connect_with_retry(&join_string, "viewer").await.expect("viewer");
+    let owner = sharer.conn_id();
+    let source = "videotestsrc is-live=true pattern=ball ! capsfilter name=sourcesize caps=video/x-raw,width=1280,height=720,framerate=30/1";
+    let handle = capture::start_sharing_from_test_source(&sharer, VIDEO_STREAM_ID, capture::DEFAULT_BITRATE_KBPS, 30, source)
+        .await
+        .expect("start_sharing_from_test_source");
+    if codec != capture::VideoCodec::H264 {
+        let d = handle.destination_runtime(capture::DestKey(0)).expect("destination");
+        let current = d.lock().unwrap().params();
+        let change = handle.change_destination(capture::DestKey(0), capture::destination::VideoParams { codec, ..current }).expect("codec change");
+        if let Some(done) = change.done {
+            done.await.expect("reply").expect("the codec change must apply");
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(events_b.recv().await, Some(ClientEvent::PresenceDelta(PresenceEvent::StreamStarted(_)))) {}
+    })
+    .await
+    .expect("StreamStarted");
+    viewer.subscribe(owner, VIDEO_STREAM_ID).await.expect("subscribe");
+    let mut decoder = StreamDecoder::new(VIDEO_STREAM_ID).expect("decoder");
+
+    // The schedule: bursts of 3-8 random sizes 60-250 ms apart, then 1-4 s of calm; ends with 8 s of calm at a fixed size.
+    let rnd = |lo: u32, hi: u32| lo + rand::random::<u32>() % (hi - lo + 1);
+    let (mut next_burst, mut burst_left, mut next_step) = (std::time::Instant::now() + Duration::from_secs(3), 0u32, std::time::Instant::now());
+    let (final_w, final_h) = (rnd(300, 1500), rnd(200, 900));
+    let (mut last_at, mut max_gap, mut worst_at, mut last_size) = (std::time::Instant::now(), Duration::ZERO, 0u64, [0usize; 2]);
+    let (mut changes, mut swaps, mut calm_from) = (0u32, 0u32, None::<std::time::Instant>);
+    let start = std::time::Instant::now();
+    let mut final_set = false;
+    while start.elapsed() < Duration::from_secs(secs + 10) {
+        tokio::select! {
+            e = events_a.recv() => match e {
+                Some(ClientEvent::SubscriberCount { count, .. }) => handle.notify_subscriber_count(capture::DestKey(0), count),
+                Some(ClientEvent::KeyframeRequest { .. }) => handle.notify_keyframe_request(capture::DestKey(0)),
+                _ => {}
+            },
+            e = events_b.recv() => if let Some(ClientEvent::MediaFrame(f)) = e { decoder.feed(&f) },
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        let now = std::time::Instant::now();
+        if start.elapsed() < Duration::from_secs(secs) {
+            if burst_left == 0 && now >= next_burst {
+                burst_left = rnd(3, 8);
+            }
+            if burst_left > 0 && now >= next_step {
+                // a mix: tiny, odd, wide, tall
+                let (w, h) = match rnd(0, 3) {
+                    0 => (rnd(40, 200), rnd(30, 150)),
+                    1 => (rnd(200, 1900) | 1, rnd(150, 1000) | 1),
+                    2 => (rnd(900, 1900), rnd(100, 300)),
+                    _ => (rnd(100, 300), rnd(600, 1000)),
+                };
+                handle.test_resize_source(w as i32, h as i32);
+                changes += 1;
+                burst_left -= 1;
+                next_step = now + Duration::from_millis(rnd(60, 250) as u64);
+                if burst_left == 0 {
+                    next_burst = now + Duration::from_millis(rnd(1000, 4000) as u64);
+                }
+            }
+        } else if !final_set {
+            handle.test_resize_source(final_w as i32, final_h as i32);
+            final_set = true;
+            calm_from = Some(now);
+        }
+        swaps += handle.poll_resize(now).len() as u32;
+        assert!(handle.source_lost().is_none(), "a resize must not read as a lost source: {:?}", handle.source_lost());
+        if let Some(img) = decoder.latest_frame() {
+            let gap = last_at.elapsed();
+            if gap > max_gap && start.elapsed() > Duration::from_secs(4) {
+                (max_gap, worst_at) = (gap, start.elapsed().as_secs());
+            }
+            last_at = std::time::Instant::now();
+            last_size = img.size;
+        }
+    }
+    let calm = calm_from.map(|t| t.elapsed()).unwrap_or_default();
+    eprintln!(
+        "[resize-stress] {codec:?}: {changes} source sizes in {secs} s, {swaps} swap rounds, longest gap between decoded frames {max_gap:?} (at {worst_at} s), \
+         final viewer size {last_size:?} for source {final_w}x{final_h}, quiet for {calm:?}"
+    );
+    assert!(last_at.elapsed() < Duration::from_secs(2), "the viewer was not decoding at the end (last frame {:?} ago)", last_at.elapsed());
+    let (vw, vh) = (last_size[0] as f64, last_size[1] as f64);
+    assert!(
+        (vw / vh - f64::from(final_w) / f64::from(final_h)).abs() < 0.06 * f64::from(final_w) / f64::from(final_h) + 0.05,
+        "the viewer's aspect {vw}x{vh} does not follow the source {final_w}x{final_h}"
+    );
+    assert!(max_gap < Duration::from_secs(8), "decoded frames stalled for {max_gap:?}");
+    let _ = handle.stop().await;
+    drop(viewer);
+    let _ = sharer.leave().await;
+}
+
 /// Regression test for the "orphan audio stream" bug (2026-07-29 — see
 /// this task's dispatch notes / `superdoc/features/stream-control.md`):
 /// `AppState::start_audio_share` used to announce a live audio stream

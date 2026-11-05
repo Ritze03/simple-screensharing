@@ -1839,6 +1839,10 @@ pub fn capture_restart_delay(attempt: u32) -> Option<Duration> {
 /// speed).
 pub const RECOVERY_RESET_AFTER: Duration = Duration::from_secs(30);
 
+/// One restart attempt may take this long (a portal picker waits for a person; a portal that hangs waits for nothing)
+/// before it counts as failed and the schedule moves on, so "Recovering" is never open-ended.
+pub const RESTART_ATTEMPT_MAX: Duration = Duration::from_secs(120);
+
 /// A video capture whose source died, being restarted ([`AppState::recoveries`]).
 /// The read side is for the UI ("Recovering", attempt number and last error in
 /// a tooltip); the rest is the driver's.
@@ -1863,7 +1867,7 @@ enum RecoveryPhase {
     /// Waiting for the next attempt's slot.
     Waiting { until: Instant },
     /// A replacement capture is starting (the portal may be asking).
-    Starting(oneshot::Receiver<Result<CaptureHandle, String>>),
+    Starting(oneshot::Receiver<Result<CaptureHandle, String>>, Instant),
 }
 
 impl CaptureRecovery {
@@ -1872,7 +1876,7 @@ impl CaptureRecovery {
     pub fn attempt_number(&self) -> u32 {
         match self.phase {
             RecoveryPhase::Waiting { .. } => (self.attempt + 1).min(self.attempts_total()),
-            RecoveryPhase::Starting(_) => self.attempt.max(1),
+            RecoveryPhase::Starting(..) => self.attempt.max(1),
         }
     }
 
@@ -1893,7 +1897,7 @@ impl CaptureRecovery {
     pub fn retry_in(&self, now: Instant) -> Option<Duration> {
         match self.phase {
             RecoveryPhase::Waiting { until } => Some(until.saturating_duration_since(now)),
-            RecoveryPhase::Starting(_) => None,
+            RecoveryPhase::Starting(..) => None,
         }
     }
 }
@@ -3734,10 +3738,15 @@ impl AppState {
                         let result = capture::start_capture_restoring(framerate, token).await.map_err(|e| start_error_string(&e));
                         let _ = tx.send(result);
                     });
-                    recovery.phase = RecoveryPhase::Starting(rx);
+                    recovery.phase = RecoveryPhase::Starting(rx, now);
                 }
                 RecoveryPhase::Waiting { .. } => {}
-                RecoveryPhase::Starting(rx) => match rx.try_recv() {
+                // A start that neither succeeds nor fails (a portal that never answers) is a failed attempt after
+                // RESTART_ATTEMPT_MAX (row 148); the late result is stopped when it arrives (the dropped receiver).
+                RecoveryPhase::Starting(_, began) if now.saturating_duration_since(*began) > RESTART_ATTEMPT_MAX => {
+                    self.attempt_failed(capture_id, format!("the capture did not start within {RESTART_ATTEMPT_MAX:?}"), false, now);
+                }
+                RecoveryPhase::Starting(rx, _) => match rx.try_recv() {
                     Ok(Ok(handle)) => self.finish_recovery(capture_id, handle, now),
                     Ok(Err(e)) => {
                         // A dismissed picker is the user's answer, not a
@@ -3867,6 +3876,7 @@ impl AppState {
             });
             return;
         };
+        new_handle.expect_frames();
         let new_source = new_handle.source_caps();
         let old_source = match &capture.status {
             ShareStatus::Active(ShareHandle::Video(h)) => h.source_caps(),
@@ -3937,7 +3947,7 @@ impl AppState {
     fn cancel_recovery(&mut self, capture_id: CaptureSourceId) {
         self.recovery_history.remove(&capture_id);
         self.recovery_gave_up.remove(&capture_id);
-        if let Some(CaptureRecovery { phase: RecoveryPhase::Starting(rx), .. }) = self.recoveries.shift_remove(&capture_id) {
+        if let Some(CaptureRecovery { phase: RecoveryPhase::Starting(rx, _), .. }) = self.recoveries.shift_remove(&capture_id) {
             tokio::spawn(async move {
                 if let Ok(Ok(handle)) = rx.await {
                     let _ = handle.stop().await;
@@ -6517,6 +6527,36 @@ mod ui_ops_tests {
             other => panic!("expected Failed, got {other:?}"),
         }
         assert!(state.share_error.is_some(), "the user is told");
+    }
+
+    /// Row 148: a restart attempt that never answers (a portal that hangs) fails after RESTART_ATTEMPT_MAX and the
+    /// schedule moves on, so "Recovering" is never open-ended.
+    #[tokio::test]
+    async fn a_restart_attempt_that_never_answers_counts_as_failed() {
+        let _home = isolated_config_home();
+        let mut state = AppState::default();
+        let (capture_id, _dest_id) = insert_destination(&mut state);
+        let t0 = Instant::now();
+        let (_tx, rx) = oneshot::channel();
+        state.recoveries.insert(
+            capture_id,
+            CaptureRecovery {
+                attempt: 1,
+                last_error: "boom".to_string(),
+                since: t0,
+                phase: RecoveryPhase::Starting(rx, t0),
+                deferred: Vec::new(),
+                framerate: 30,
+                restore_token: None,
+                start_pos: 0,
+            },
+        );
+        state.poll_capture_recovery_at(t0 + RESTART_ATTEMPT_MAX - Duration::from_secs(1));
+        assert!(state.recovery(capture_id).unwrap().retry_in(t0).is_none(), "still starting");
+        state.poll_capture_recovery_at(t0 + RESTART_ATTEMPT_MAX + Duration::from_secs(1));
+        let recovery = state.recovery(capture_id).expect("the schedule goes on");
+        assert!(recovery.retry_in(t0).is_some(), "the hung attempt is over and the next one is waiting");
+        assert!(recovery.last_error().contains("did not start"), "{}", recovery.last_error());
     }
 
     /// Task I8, "a camera unplugged mid-share should end the webcam share cleanly with a toast, not a portal restart

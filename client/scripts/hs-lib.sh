@@ -196,7 +196,7 @@ hs_write_portal_conf() {
   local fps="${HS_MAX_FPS:-${HS_FPS:-240}}"
   cat >"$SCRATCH/xdpw.conf" <<EOF
 [screencast]
-chooser_type=none
+$(if [[ "${HS_PATTERN:-}" == window ]]; then echo "chooser_type=dmenu"; echo "chooser_cmd=grep -m1 '^Window: vkcube'"; else echo "chooser_type=none"; fi)
 output_name=$HS_OUT_CAP
 max_fps=$fps
 ${HS_FORCE_MOD_LINEAR:+force_mod_linear=1}
@@ -346,6 +346,15 @@ hs_start_pattern() {
       # delivers no frames to the portal: capture is damage-driven).
       swaymsg "workspace number 1" >/dev/null
       hs_spawn pattern vkcube --wsi wayland --present_mode 1 --width "$HS_W" --height "$HS_H" --suppress_popups ;;
+    window)
+      # HS_PATTERN=window (row 148): a floating vkcube WINDOW is what xdpw shares (chooser picks "Window: vkcube"; the
+      # sharer client needs SSS_PORTAL_SOURCES=window); resize it with hs-resize.sh win WxH.
+      swaymsg "workspace number 1" >/dev/null
+      hs_spawn pattern vkcube --wsi wayland --present_mode 1 --width 1280 --height 720 --suppress_popups
+      hs_wait 20 "the vkcube window" bash -c "swaymsg -t get_tree | jq -e '[.. | objects | select(.name? == \"vkcube\")] | length > 0' >/dev/null"
+      swaymsg '[title="vkcube"] fullscreen disable, floating enable, resize set 1280 720, move position 100 100' >/dev/null
+      sleep 1
+      return 0 ;;
     gst)
       swaymsg "workspace number 1" >/dev/null
       hs_spawn pattern gst-launch-1.0 videotestsrc pattern=ball '!' "video/x-raw,width=$HS_W,height=$HS_H,framerate=300/1" \
