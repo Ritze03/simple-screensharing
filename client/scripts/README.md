@@ -90,6 +90,7 @@ Settings controls (`sound.volume`, `sound.test.*`, `sound_volume`) are dumped on
 | `bar.v0.0`, `bar.h0`; `barstate v0.0 hidden\|grey\|blue` | resize bars (hit rect) and how they show |
 | `win.N`, `grip.N` | floating window and its corner handle |
 | `tool.N.more\|fs\|pop\|settings`, `tag.N`, `watch.N` (`uclick .. watch.0 L40` = Watch stream); `stats.N` | a tile's hover buttons (only while shown), name tag, idle button row |
+| `share_pick.screen`, `share_pick.gamescope` (the "What do you want to share?" question, only while a gamescope node exists; `hs-drive.sh sharepick screen\|gamescope`) | the gamescope question |
 | `menu.share_start` (the Share menu's start entry); `share idle\|picking\|staged\|live\|paused` (the bar's Share state); `ctl.share\|audio\|webcam\|layout\|room` and `.arrow`, `ctl.people\|leave\|sidebar\|invite\|pop\|fs`, `ctl.group.X` | the control bar |
 | `menu`, `menu.LABEL` (spaces become `_`), `menu.always_names`, `menu.show_stats`, `menu.hide_own`, `menu.volume`, `menu.mute`; `volume` | the open menu and its rows; the volume row and its value |
 | `opt.I` | row I of an open dropdown (`menu::select`) |

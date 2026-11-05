@@ -870,6 +870,14 @@ defaults." (with a screenshot of the menu: Split, Webcam in picture checked, the
   `setLayout`). The room id is the saved room's (`<roomIdHex>@<server>`), stable across reloads. `S.stage.pip` (the set of
   views with it on) became `S.stage.pipOff`.
 
+## Share asks "screen or gamescope" when a gamescope node exists (2026-11-05, row 142)
+
+`Modal::SharePick { room, auto, node }` (`ui/modals.rs` `share_pick`, a small question in the `LeaveConfirm` style): body text naming the node, two
+body buttons **Screen** and **Gamescope** (dump rects `share_pick.screen`, `share_pick.gamescope`), footer Cancel. Raised by the Share main button
+(`auto`) and the menu entry alike, after a per-click `pw-dump` look-up (`Shell::gamescope_probe`, polled by `poll_staged`, repaint every 30 ms while it
+runs); no node means no modal and no visible delay. Answers push `UiAction::SharePicked`. Backend and *why*: `features/stream-control.md`
+"Sharing gamescope directly". Rig: `hs-drive.sh sharepick screen|gamescope`, or `SHARE_PICK=` on `share`/`shareauto`.
+
 ## Level loudness: a control-bar button, the native Playback tab removed (2026-11-04, row 134)
 
 User: "Maybe remove the playback tab and move level loudness (since its global) to the left of the "Hide the people"

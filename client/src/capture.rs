@@ -970,6 +970,9 @@ enum CaptureSource {
     /// frames enter the System domain like Windows' desktop capture does.
     #[cfg(target_os = "linux")]
     Webcam(webcam::Spec),
+    /// A gamescope session's PipeWire video node, read directly ([`gamescope`], row 142): no portal, no picker.
+    #[cfg(target_os = "linux")]
+    Gamescope(gamescope::Node),
     /// TEST-ONLY seam: bypasses the interactive portal/pipewiresrc (Linux)
     /// or `d3d11screencapturesrc` (Windows) acquisition entirely, launching
     /// [`build_pipeline`] directly from a caller-supplied `gst-launch`-syntax
@@ -999,6 +1002,10 @@ impl CaptureSource {
         match self {
             #[cfg(unix)]
             CaptureSource::Portal(_) => true,
+            // Gamescope repaints only when the game does; the keepalive resend below keeps a still game flowing, so
+            // silence with it on means the node is gone, as for the portal.
+            #[cfg(target_os = "linux")]
+            CaptureSource::Gamescope(_) => true,
             #[allow(unreachable_patterns)]
             _ => false,
         }
@@ -1011,6 +1018,8 @@ impl CaptureSource {
         match self {
             #[cfg(target_os = "linux")]
             CaptureSource::Webcam(_) => webcam::LABEL,
+            #[cfg(target_os = "linux")]
+            CaptureSource::Gamescope(_) => gamescope::LABEL,
             #[allow(unreachable_patterns)]
             _ => "Screen",
         }
@@ -1020,6 +1029,9 @@ impl CaptureSource {
         match self {
             #[cfg(unix)]
             CaptureSource::Portal(portal) => portal.restore_token.clone(),
+            // What a restart needs to find the same source again, see [`gamescope::TOKEN_PREFIX`].
+            #[cfg(target_os = "linux")]
+            CaptureSource::Gamescope(node) => Some(format!("{}{}", gamescope::TOKEN_PREFIX, node.name)),
             #[allow(unreachable_patterns)]
             _ => None,
         }
@@ -1056,8 +1068,7 @@ impl CaptureSource {
                 // heartbeat, not the full selected rate, so it is 30 fps (or
                 // the selected rate when that is lower). Never 0 for any
                 // in-range `framerate`, so it can never disable the keepalive.
-                let keepalive_fps = framerate.clamp(MIN_FRAMERATE, MAX_FRAMERATE).min(STATIC_KEEPALIVE_FPS);
-                let keepalive_ms = (1000 / keepalive_fps).max(1);
+                let keepalive_ms = keepalive_ms(framerate);
                 //
                 // `Why min-buffers={PORTAL_MIN_BUFFERS} (measured, #39 — this is half of the "portal
                 // delivers exactly half the output's rate" ceiling):`
@@ -1082,6 +1093,16 @@ impl CaptureSource {
                     "pipewiresrc fd={} path={} do-timestamp=true keepalive-time={keepalive_ms} min-buffers={PORTAL_MIN_BUFFERS}",
                     portal._pipewire_fd.as_raw_fd(),
                     portal.node_id
+                )
+            }
+            #[cfg(target_os = "linux")]
+            CaptureSource::Gamescope(node) => {
+                // The same element as the portal's minus `fd`/`path`: it connects to the default PipeWire daemon and
+                // looks the node up by `node.name`. Keepalive and buffers as there (a still game sends nothing).
+                let name: String = node.name.chars().filter(|c| !matches!(c, '"' | '\\')).collect();
+                format!(
+                    "pipewiresrc target-object=\"{name}\" do-timestamp=true keepalive-time={} min-buffers={PORTAL_MIN_BUFFERS}",
+                    keepalive_ms(framerate)
                 )
             }
             #[cfg(windows)]
@@ -1123,6 +1144,13 @@ impl CaptureSource {
             }
         }
     }
+}
+
+/// `keepalive-time` of a `pipewiresrc` source for `framerate`: see the portal arm of
+/// [`CaptureSource::launch_fragment`] for why it is capped at [`STATIC_KEEPALIVE_FPS`] and never 0.
+fn keepalive_ms(framerate: u32) -> u32 {
+    let fps = framerate.clamp(MIN_FRAMERATE, MAX_FRAMERATE).min(STATIC_KEEPALIVE_FPS);
+    (1000 / fps).max(1)
 }
 
 /// Acquires this platform's [`CaptureSource`]. On Linux/Unix this runs the
@@ -1509,6 +1537,11 @@ impl CaptureDomain {
     fn for_source(source: &CaptureSource) -> Self {
         #[cfg(unix)]
         if matches!(source, CaptureSource::Portal(_)) && gpu_capture_available() {
+            return Self::Gpu;
+        }
+        // Gamescope offers DMA-BUF too; a failed GPU start falls back to the CPU path like the portal's.
+        #[cfg(target_os = "linux")]
+        if matches!(source, CaptureSource::Gamescope(_)) && gpu_capture_available() {
             return Self::Gpu;
         }
         let _ = source;
@@ -2404,7 +2437,7 @@ async fn close_portal_quietly(source: &CaptureSource) {
             Err(_) => tracing::warn!("closing the portal session of a capture that did not start timed out"),
         },
         #[cfg(target_os = "linux")]
-        CaptureSource::Webcam(_) => {}
+        CaptureSource::Webcam(_) | CaptureSource::Gamescope(_) => {}
         #[cfg(any(test, feature = "test-source"))]
         CaptureSource::TestSource(_) => {}
     }
@@ -2747,6 +2780,11 @@ pub async fn start_capture(framerate: u32) -> Result<CaptureHandle> {
 /// portal so a persisting portal re-grants the same monitor without a picker.
 pub async fn start_capture_restoring(framerate: u32, restore_token: Option<String>) -> Result<CaptureHandle> {
     ensure_gstreamer_initialized()?;
+    // A gamescope capture's "token" names its node: look it up again (its id may have changed) and never ask the portal.
+    #[cfg(target_os = "linux")]
+    if let Some(name) = restore_token.as_deref().and_then(|t| t.strip_prefix(gamescope::TOKEN_PREFIX)) {
+        return start_gamescope_capture(framerate, Some(name.to_string())).await;
+    }
     let capture_source = acquire_capture_source_restoring(restore_token.clone()).await?;
     match start_capture_with_source(framerate, capture_source).await {
         // `Why one retry on a new portal session (task #59):` stock
@@ -2774,6 +2812,20 @@ pub async fn start_capture_restoring(framerate: u32, restore_token: Option<Strin
         }
         other => other,
     }
+}
+
+/// [`start_capture`] for a gamescope node (row 142): the node called `name`, or the first gamescope node when `None`.
+/// No portal and no picker, on a restart too. Fails with a plain error (not a portal error) when there is no such
+/// node; the session's restart schedule retries it, so a gamescope that comes back is picked up again.
+#[cfg(target_os = "linux")]
+pub async fn start_gamescope_capture(framerate: u32, name: Option<String>) -> Result<CaptureHandle> {
+    ensure_gstreamer_initialized()?;
+    let node = gamescope::find(name.as_deref()).await.ok_or_else(|| match &name {
+        Some(n) => anyhow!("the gamescope capture \"{n}\" is gone"),
+        None => anyhow!("no gamescope capture found"),
+    })?;
+    tracing::info!("capturing gamescope node {:?} (object.serial {:?})", node.name, node.serial);
+    start_capture_with_source(framerate, CaptureSource::Gamescope(node)).await
 }
 
 /// TEST-ONLY seam (see [`CaptureSource::TestSource`]): starts the exact same
@@ -3012,7 +3064,7 @@ async fn abandon_capture(pipeline: gst::Pipeline, capture_source: CaptureSource,
             }
         }
         #[cfg(target_os = "linux")]
-        CaptureSource::Webcam(_) => {}
+        CaptureSource::Webcam(_) | CaptureSource::Gamescope(_) => {}
         #[cfg(any(test, feature = "test-source"))]
         CaptureSource::TestSource(_) => {}
     }
@@ -3435,7 +3487,7 @@ impl CaptureHandle {
                     Err(_) => tracing::warn!("closing the screencast portal session took longer than {CAPTURE_STOP_STEP_TIMEOUT:?}"),
                 },
                 #[cfg(target_os = "linux")]
-                CaptureSource::Webcam(_) => {}
+                CaptureSource::Webcam(_) | CaptureSource::Gamescope(_) => {}
                 #[cfg(any(test, feature = "test-source"))]
                 CaptureSource::TestSource(_) => {}
             }
@@ -10543,6 +10595,103 @@ pub mod branch {
             built.pipeline.set_state(gst::State::Null).expect("pipeline should stop cleanly");
         }
 
+    }
+}
+
+// ---------------------------------------------------------------------
+// Gamescope (row 142)
+// ---------------------------------------------------------------------
+
+/// Sharing a gamescope session directly: its PipeWire `Video/Source` node is read with `pipewiresrc target-object=`
+/// (no portal, no picker; [`CaptureSource::Gamescope`]).
+///
+/// Detection reads `pw-dump` (the same parser the audio sources use): a node whose `media.class` is `Video/Source`
+/// and whose `node.name` or `media.name` contains "gamescope", ignoring case. A custom build names itself
+/// `gamescope-ritz` (`media.name = gamescope`), stock gamescope `gamescope`; audio nodes of the same name and webcams
+/// (`Video/Source`, `v4l2_input...`) never match.
+pub mod gamescope {
+    use super::*;
+    use crate::audio::{PwObject, prop_str, prop_u64, run_pw_dump};
+
+    /// The wire label of a gamescope share (any label that is not `Webcam...` is a screen to every viewer).
+    pub const LABEL: &str = "Gamescope";
+    /// A gamescope capture's [`CaptureHandle::restore_token`] is this + the node's `node.name`, so the session's
+    /// restart (which only carries that string) finds the node again instead of asking the portal.
+    pub const TOKEN_PREFIX: &str = "node:";
+    /// How long a `pw-dump` may take before the answer is "no gamescope": a stuck daemon must not stall the Share button.
+    const DETECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Node {
+        /// `node.name`: what `pipewiresrc target-object=` takes and what survives a restart of the game.
+        pub name: String,
+        pub serial: Option<u64>,
+    }
+
+    /// Every gamescope video node of a `pw-dump` snapshot, in graph order.
+    pub(crate) fn nodes_in(objects: &[PwObject]) -> Vec<Node> {
+        objects
+            .iter()
+            .filter(|o| o.obj_type.as_deref() == Some("PipeWire:Interface:Node"))
+            .filter_map(|o| {
+                let props = o.info.as_ref()?.props.as_ref()?;
+                if prop_str(props, "media.class") != Some("Video/Source") {
+                    return None;
+                }
+                let name = prop_str(props, "node.name")?;
+                let hit = |s: &str| s.to_ascii_lowercase().contains("gamescope");
+                (hit(name) || prop_str(props, "media.name").is_some_and(hit)).then(|| Node { name: name.to_string(), serial: prop_u64(props, "object.serial") })
+            })
+            .collect()
+    }
+
+    /// The gamescope node called `name`, or the first one when `None`. Runs `pw-dump` off the async threads and
+    /// answers `None` for a missing node, a failing `pw-dump` and a timeout alike.
+    // ponytail: two gamescopes at once: the first listed wins (a restart keeps its name, so it stays on the same one).
+    pub async fn find(name: Option<&str>) -> Option<Node> {
+        let dump = tokio::time::timeout(DETECT_TIMEOUT, tokio::task::spawn_blocking(run_pw_dump)).await.ok()?.ok()?;
+        let nodes = nodes_in(&dump.map_err(|e| tracing::debug!("gamescope detection: {e:#}")).ok()?);
+        nodes.into_iter().find(|n| name.is_none_or(|w| n.name == w))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The shape of the user's host (`pw-dump`, 2026-11-05): the gamescope video node, its audio sink and stream
+        /// of the same name, and a webcam.
+        const DUMP: &str = r#"[
+          {"id":50,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Video/Source","node.name":"gamescope-ritz","media.name":"gamescope","object.serial":777}}},
+          {"id":51,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Stream/Output/Audio","node.name":"gamescope-ritz"}}},
+          {"id":52,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Audio/Sink","node.name":"gamescope"}}},
+          {"id":53,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Video/Source","node.name":"v4l2_input.pci-0000_00_14.0-usb-0_5_1.0","media.name":"Webcam"}}},
+          {"id":54,"type":"PipeWire:Interface:Node","info":{"props":{"media.class":"Video/Source","node.name":"stream.7","media.name":"Gamescope"}}},
+          {"id":55,"type":"PipeWire:Interface:Port","info":{"direction":"output","props":{"port.name":"capture_1","node.name":"gamescope-ritz"}}}
+        ]"#;
+
+        #[test]
+        fn only_a_gamescope_video_source_is_detected() {
+            let objects: Vec<PwObject> = serde_json::from_str(DUMP).unwrap();
+            let nodes = nodes_in(&objects);
+            assert_eq!(
+                nodes,
+                vec![
+                    Node { name: "gamescope-ritz".into(), serial: Some(777) },
+                    Node { name: "stream.7".into(), serial: None },
+                ]
+            );
+            assert!(nodes_in(&[]).is_empty());
+        }
+
+        #[test]
+        fn a_gamescope_capture_restarts_on_its_node_by_name() {
+            let source = CaptureSource::Gamescope(Node { name: "gamescope-ritz".into(), serial: Some(1) });
+            assert_eq!(source.restore_token().as_deref(), Some("node:gamescope-ritz"));
+            let fragment = source.launch_fragment(60);
+            assert!(fragment.starts_with("pipewiresrc target-object=\"gamescope-ritz\" ") && !fragment.contains("fd="), "{fragment}");
+            assert_eq!(source.wire_label(), LABEL);
+            assert!(source.silence_means_lost());
+        }
     }
 }
 

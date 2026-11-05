@@ -18,6 +18,9 @@
 #   share                     sharer: the Share split button's ARROW menu -> "Share your screen..." (portal auto-grants, no picker;
 #                             SHARER=3 drives client 3 instead of 1, for steps share/setup/golive/stopshare); waits for the
 #                             "Set up your stream" modal (the menu path: picker, modal, Go live)
+#   sharepick screen|gamescope  sharer: answer the "What do you want to share?" question (it appears when the rig has a
+#                             gamescope node: `hs-rig.sh run -- gamescope --backend headless -W 1280 -H 720 -- vkcube`);
+#                             `SHARE_PICK=screen|gamescope` makes share/shareauto answer it themselves
 #   shareauto                 sharer: click the Share button's MAIN part: picker, then live at once with the remembered settings, no
 #                             modal. Waits for the dump's `share live`; fails if the modal opened. Needs no setup/golive
 #   setup FPS CODEC PRESET [KBPS]
@@ -148,6 +151,18 @@ index_of() {
   local w="$1" i=0 x; shift
   for x in "$@"; do [[ "$x" == "$w" ]] && { echo "$i"; return; }; i=$((i + 1)); done
 }
+# share_pick_answer [force]: with SHARE_PICK=screen|gamescope, answer the gamescope question (it only appears while a
+# gamescope node exists; without `force` it waits 2 s for it and carries on when it does not show).
+share_pick_answer() {
+  local n="${SHARER:-1}" i
+  [[ -n "${SHARE_PICK:-}" ]] || return 0
+  for i in $(seq 1 $(( $([[ "${1:-}" == force ]] && echo 100 || echo 20) ))); do
+    [[ -n "$(UI_DUMP="$SCRATCH/ui$n.txt" dump_rect "share_pick.$SHARE_PICK")" ]] && { uclick "$n" "share_pick.$SHARE_PICK"; return 0; }
+    sleep 0.1
+  done
+  [[ "${1:-}" == force ]] && die "share_pick_answer: the question did not appear"
+  return 0
+}
 modal_open() { dump_wait open 1 15 || die "the sharer's stream-settings modal is not open (dump: $UI_DUMP)"; }
 
 VIEWER="${VIEWER:-2}"
@@ -158,8 +173,12 @@ case "$STEP" in
   share)
     uclick "${SHARER:-1}" ctl.share.arrow; sleep 0.4
     uclick "${SHARER:-1}" menu.share_start
+    share_pick_answer
     modal_open
     ;;
+  sharepick)
+    # sharer: wait for the "What do you want to share?" question (a gamescope node exists) and answer it: screen|gamescope
+    SHARE_PICK="${1:?screen|gamescope}" share_pick_answer force ;;
   restart)
     n="${1:-1}"; pid="$(hs_pid_of "client$n")"; [[ -n "$pid" ]] || die "no client$n in $HS_PIDS"
     out="$(hs_win_output "$pid")"
@@ -169,6 +188,7 @@ case "$STEP" in
   shareauto)
     n="${SHARER:-1}"
     uclick "$n" ctl.share
+    share_pick_answer
     for _ in $(seq 1 60); do
       [[ "$(UI_DUMP="$SCRATCH/ui$n.txt" dump_get open)" == 1 ]] && die "shareauto: the stream-settings modal opened (it must not)"
       [[ "$(UI_DUMP="$SCRATCH/ui$n.txt" dump_get share)" == live ]] && break

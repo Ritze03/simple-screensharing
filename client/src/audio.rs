@@ -119,34 +119,34 @@ fn ensure_gstreamer_initialized() -> Result<()> {
 /// a raw JSON map rather than named fields since which properties a node/port
 /// carries varies by object kind.
 #[derive(Debug, Deserialize)]
-struct PwObject {
-    id: u32,
+pub(crate) struct PwObject {
+    pub(crate) id: u32,
     #[serde(rename = "type", default)]
-    obj_type: Option<String>,
+    pub(crate) obj_type: Option<String>,
     #[serde(default)]
-    info: Option<PwInfo>,
+    pub(crate) info: Option<PwInfo>,
 }
 
 #[derive(Debug, Deserialize)]
-struct PwInfo {
+pub(crate) struct PwInfo {
     /// Present (as `"output"`/`"input"`) on `PipeWire:Interface:Port`
     /// objects; absent on nodes.
     #[serde(default)]
     direction: Option<String>,
     #[serde(default)]
-    props: Option<Map<String, Value>>,
+    pub(crate) props: Option<Map<String, Value>>,
 }
 
-fn prop_str<'a>(props: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+pub(crate) fn prop_str<'a>(props: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
     props.get(key).and_then(Value::as_str)
 }
 
-fn prop_u64(props: &Map<String, Value>, key: &str) -> Option<u64> {
+pub(crate) fn prop_u64(props: &Map<String, Value>, key: &str) -> Option<u64> {
     props.get(key).and_then(Value::as_u64)
 }
 
 /// Runs `pw-dump` and parses its JSON output.
-fn run_pw_dump() -> Result<Vec<PwObject>> {
+pub(crate) fn run_pw_dump() -> Result<Vec<PwObject>> {
     let output = Command::new("pw-dump")
         .output()
         .context("failed to run pw-dump (is PipeWire installed and running?)")?;

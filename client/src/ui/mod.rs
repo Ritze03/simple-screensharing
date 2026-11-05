@@ -175,6 +175,10 @@ pub enum Modal {
     /// "Leave X?" — raised by [`UiAction::Leave`] when the room has active
     /// shares or watches; confirm with [`UiAction::LeaveConfirmed`].
     LeaveConfirm { room: RoomHandle },
+    /// "What do you want to share?": raised by the Share button or menu entry when a gamescope node exists
+    /// (`capture::gamescope`, row 142). Screen or gamescope push [`UiAction::SharePicked`]. `auto` as for
+    /// [`UiAction::ShareNow`]; `node` is the gamescope node found. Rendered by `modals`.
+    SharePick { room: RoomHandle, auto: bool, node: String },
     /// "Forget X?" — confirm with [`UiAction::Forget`].
     ForgetConfirm { room: RoomKey },
     /// "Rename room" — confirm with [`UiAction::Rename`].
@@ -348,6 +352,9 @@ pub enum UiAction {
     /// The control bar's Share screen button: like [`Self::StageShare`], but the share goes live by itself with the
     /// remembered settings once the picker resolves (no modal).
     ShareNow(RoomHandle),
+    /// The answer of [`Modal::SharePick`]: stage the capture of the screen (`node` `None`: the portal's picker) or of
+    /// that gamescope node (no picker). `auto` as for [`Self::ShareNow`].
+    SharePicked { room: RoomHandle, auto: bool, node: Option<String> },
     /// Go live with a staged capture in `room` (saves the settings as
     /// defaults, closes its settings modal).
     GoLive { capture: CaptureSourceId, room: RoomHandle },
@@ -465,6 +472,24 @@ pub struct StagedShare {
     pub auto: bool,
 }
 
+/// What a Share click does once the gamescope look-up answered.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    /// Ask which one first.
+    Ask(Modal),
+    /// No gamescope: today's flow, the portal picker (`room`, `auto`).
+    Stage(RoomHandle, bool),
+}
+
+/// The flow decision of a Share click (the bar's main button `auto`, or the menu entry): a gamescope node found asks
+/// first, none goes straight to the portal.
+pub fn share_after_probe(room: RoomHandle, auto: bool, found: Option<String>) -> ProbeOutcome {
+    match found {
+        Some(node) => ProbeOutcome::Ask(Modal::SharePick { room, auto, node }),
+        None => ProbeOutcome::Stage(room, auto),
+    }
+}
+
 impl StagedShare {
     /// Whether a ready capture goes live by itself now (the bar's Share button) instead of opening the settings modal: only
     /// while its room is joined (a suspended room keeps the staged capture until it is back).
@@ -497,6 +522,9 @@ pub struct Shell {
     /// capture has no destination, so nothing in `AppState` says which room
     /// it is for.
     pub staged: indexmap::IndexMap<RoomHandle, StagedShare>,
+    /// The gamescope look-up a Share click started (`pw-dump`, off the UI thread): room, `auto`, answer. Polled by
+    /// [`App::poll_staged`]; a node found asks [`Modal::SharePick`], none stages the portal share as before.
+    pub gamescope_probe: Option<(RoomHandle, bool, oneshot::Receiver<Option<String>>)>,
     pub toasts: Vec<Toast>,
     /// Rooms whose "Live in <room>" toast was already shown for the current
     /// on-air spell ([`newly_on_air`]).
@@ -1261,7 +1289,7 @@ impl App {
         {
             self.nav.modal = None;
         }
-        if let Some(Modal::LeaveConfirm { room } | Modal::AudioSettings { room } | Modal::WebcamSettings { room }) = &self.nav.modal
+        if let Some(Modal::LeaveConfirm { room } | Modal::AudioSettings { room } | Modal::WebcamSettings { room } | Modal::SharePick { room, .. }) = &self.nav.modal
             && !self.state.rooms.contains_key(room)
         {
             self.nav.modal = None;
@@ -1347,6 +1375,26 @@ impl App {
     /// across the outage (`ReconnectState::handle`), so the staged card simply
     /// reappears when the room is back instead of re-prompting the OS picker.
     fn poll_staged(&mut self, ctx: &egui::Context) {
+        if let Some((room, auto, rx)) = &mut self.shell.gamescope_probe {
+            let (room, auto) = (*room, *auto);
+            match rx.try_recv() {
+                Ok(found) => {
+                    self.shell.gamescope_probe = None;
+                    match share_after_probe(room, auto, found) {
+                        ProbeOutcome::Ask(modal) => {
+                            self.nav.modal = Some(modal);
+                            self.nav.popover = None;
+                        }
+                        ProbeOutcome::Stage(room, auto) => self.stage_share_now(room, auto, None),
+                    }
+                }
+                Err(oneshot::error::TryRecvError::Empty) => ctx.request_repaint_after(std::time::Duration::from_millis(30)),
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    self.shell.gamescope_probe = None;
+                    self.stage_share_now(room, auto, None);
+                }
+            }
+        }
         let state = &self.state;
         let mut orphaned = Vec::new();
         self.shell.staged.retain(|room, s| {

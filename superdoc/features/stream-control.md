@@ -24,6 +24,48 @@ fan-out**, **transfer** between rooms, and the two **bandwidth modes** with
 
 ---
 
+## Sharing gamescope directly (2026-11-05, row 142)
+
+**Brief.** The user, with a screenshot of the PipeWire graph (node `gamescope-ritz`, subtitle `gamescope`, output port `capture_1`): "if
+this capture is detected, first ask if the user wants to stream his screen or gamescope directly". Native client, Linux only.
+
+**Detection** (`capture::gamescope`, `nodes_in` is the pure part): `pw-dump` (the audio module's parser, `audio::run_pw_dump`), a node with
+`media.class == "Video/Source"` whose `node.name` or `media.name` contains "gamescope", ignoring case. Stock gamescope is `gamescope`, the
+user's build `gamescope-ritz`; the same-named audio nodes and the webcam (`v4l2_input...`) do not match. *Why a look-up per Share click and
+no cached list:* a cached "no gamescope" would hide a game started a minute ago, and `pw-dump` is ~30 ms off the UI thread (2 s timeout,
+then "none"), so without gamescope the click reaches the portal as before.
+
+**Flow.** Share main button (`ShareNow`) and menu entry (`StageShare`) both go through `App::stage_share`, which starts the look-up; `poll_staged`
+finishes it: none = today's flow, found = `Modal::SharePick` ("Screen" / "Gamescope"). Screen = `SharePicked { node: None }` = the portal picker;
+Gamescope = `stage_gamescope_share_with_saved_defaults(node)`: no portal, the main button goes live at once, the menu path opens the Stream
+settings modal. The decision is `ui::share_after_probe` (tested).
+
+**Capture.** `CaptureSource::Gamescope(Node)`: `pipewiresrc target-object="<node.name>" do-timestamp=true keepalive-time=.. min-buffers=..`
+(the portal's fragment without `fd`/`path`: it connects to the default PipeWire daemon). Same pipeline after the source: the GPU domain
+(DMA-BUF, `vapostproc`) with the CPU fallback on a failed start, `SizeWatch`, preview, encoder choice. The share is labelled `Gamescope` on the
+wire (any non-`Webcam` label is a screen to every viewer). The xdpw start-up workarounds (`decoupled_source` queue, the 30 ms pause, `repair_portal_start`) also run
+because they key on `pipewiresrc`; they are harmless here (the first-buffer wait is at most 200 ms).
+*Why keepalive and silence = loss as for the portal:* gamescope repaints when the game does, so a still game sends nothing; the keepalive resend is the
+heartbeat, and with it a silent tee means the node is gone.
+
+**The node dies.** `pipewiresrc` reports `stream error: target not found` on the bus (measured, rig): the capture is marked lost and the session's
+recovery runs (`CAPTURE_RESTART_DELAYS`: 0, 2, 5, 10, 30 s). The "restore token" of a gamescope capture is `node:<node.name>`
+(`gamescope::TOKEN_PREFIX`), and `start_capture_restoring` answers it with `start_gamescope_capture`, which looks the node up again by name each
+attempt (its id changes), never the portal. A game back within the schedule is picked up (measured: attempt 4 attached to the new node);
+otherwise the share ends with `capture lost: the gamescope capture "gamescope" is gone`.
+`ponytail:` two gamescopes at once: the first listed wins.
+
+**Measured (rig, 2026-11-05, release).** Real `gamescope --backend headless -W 1280 -H 720 -- vkcube` inside the rig's sway and private PipeWire:
+node `gamescope`, capture started in the Gpu domain, viewer decodes 1280x720 30 fps H.264 via `vah264dec`, 6 Mbps. Main button and menu path
+both worked, "Screen" went to the portal, killing gamescope mid-share gave the give-up error after 5 attempts and no picker. A fake `pipewiresink`
+`Video/Source` (`videotestsrc`, BGRx) behaved the same, including the quick-return recovery. Not measured: a node that changes size in place (the
+headless gamescope cannot be resized and the fake node did not renegotiate); that path is the shared `SizeWatch` of row 141.
+
+**Why** (the user's wording above): ask first rather than guess, because a gamescope node exists whenever a game session runs, even while the user
+means to share the desktop.
+
+---
+
 ## The source changes size: a window resized, a mode change, a game changing resolution (2026-11-05, row 141)
 
 **Brief.** While a share is live the source can change size. Before this, nothing noticed: `source_caps()` cached the first size for

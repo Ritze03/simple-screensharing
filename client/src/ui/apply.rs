@@ -14,11 +14,36 @@ impl App {
     /// Apply one action. `ctx` is only used for the clipboard.
     /// Stage a capture for `room` (opens the picker). `auto`: go live by itself once the picker resolved
     /// (`poll_staged`) instead of opening the settings modal.
+    ///
+    /// On Linux a gamescope look-up comes first (row 142, `poll_staged` finishes it): no node, today's flow; a node,
+    /// the "Screen or gamescope" question. Why a look-up per click and no cached list: a cached "no gamescope" would
+    /// hide a game started a minute ago, and `pw-dump` takes ~30 ms off the UI thread.
     fn stage_share(&mut self, room: simple_screensharing_client::session::RoomHandle, auto: bool) {
+        if self.shell.staged.contains_key(&room) || !self.state.rooms.contains_key(&room) || self.shell.gamescope_probe.is_some() {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let _ = tx.send(simple_screensharing_client::capture::gamescope::find(None).await.map(|n| n.name));
+            });
+            self.shell.gamescope_probe = Some((room, auto, rx));
+            self.nav.popover = None;
+        }
+        #[cfg(not(target_os = "linux"))]
+        self.stage_share_now(room, auto, None);
+    }
+
+    /// Stage the capture: the portal's picker, or the gamescope node `node` (no picker).
+    pub(super) fn stage_share_now(&mut self, room: simple_screensharing_client::session::RoomHandle, auto: bool, node: Option<String>) {
         if self.shell.staged.contains_key(&room) || !self.state.rooms.contains_key(&room) {
             return;
         }
-        let capture = self.state.stage_video_share_with_saved_defaults();
+        let capture = match node {
+            Some(node) => self.state.stage_gamescope_share_with_saved_defaults(node),
+            None => self.state.stage_video_share_with_saved_defaults(),
+        };
         self.shell.staged.insert(room, StagedShare { capture, modal_opened: false, auto });
         self.nav.popover = None;
     }
@@ -229,6 +254,12 @@ impl App {
             // --- sharing -------------------------------------------------
             UiAction::StageShare(room) => self.stage_share(room, false),
             UiAction::ShareNow(room) => self.stage_share(room, true),
+            UiAction::SharePicked { room, auto, node } => {
+                if matches!(self.nav.modal, Some(Modal::SharePick { .. })) {
+                    self.nav.modal = None;
+                }
+                self.stage_share_now(room, auto, node);
+            }
             UiAction::GoLive { capture, room } => {
                 self.state.go_live_and_save_defaults(capture, room);
                 self.shell.staged.shift_remove(&room);

@@ -1369,3 +1369,17 @@ fn an_automatic_staged_share_goes_live_by_itself_only_in_a_joined_room() {
     assert!(!auto.goes_live_by_itself(false), "a suspended room keeps it staged until it is back");
     assert!(!manual.goes_live_by_itself(true), "the menu's entry opens the modal");
 }
+
+/// Row 142: a gamescope node asks "Screen or gamescope" first (the bar's main button `auto` and the menu entry alike);
+/// without one a Share click goes straight to the portal, as before.
+#[test]
+fn a_gamescope_node_asks_first_and_none_goes_to_the_portal() {
+    let room = RoomHandle(3);
+    for auto in [true, false] {
+        assert_eq!(share_after_probe(room, auto, None), ProbeOutcome::Stage(room, auto));
+        assert_eq!(
+            share_after_probe(room, auto, Some("gamescope-ritz".into())),
+            ProbeOutcome::Ask(Modal::SharePick { room, auto, node: "gamescope-ritz".into() })
+        );
+    }
+}

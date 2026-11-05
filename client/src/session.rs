@@ -635,6 +635,7 @@ impl LocalCapture {
     pub fn wire_label(&self) -> String {
         match (self.kind, self.is_webcam()) {
             (StreamKind::Video, true) => capture::webcam::LABEL.to_string(),
+            (StreamKind::Video, false) if self.label == capture::gamescope::LABEL => capture::gamescope::LABEL.to_string(),
             (StreamKind::Video, false) => "Screen".to_string(),
             (StreamKind::Audio, _) => self.label.clone(),
         }
@@ -2464,6 +2465,16 @@ impl AppState {
     /// state `stop_share` already knows how to tear down; no separate cancel
     /// path is needed.
     pub fn stage_video_share(&mut self) -> CaptureSourceId {
+        self.stage_share_of(None)
+    }
+
+    /// [`Self::stage_video_share`] for a gamescope node (row 142, `capture::gamescope`): no portal, the capture reads
+    /// the PipeWire node called `node` directly. The share is labelled [`capture::gamescope::LABEL`].
+    pub fn stage_gamescope_share(&mut self, node: String) -> CaptureSourceId {
+        self.stage_share_of(Some(node))
+    }
+
+    fn stage_share_of(&mut self, node: Option<String>) -> CaptureSourceId {
         let capture_id = self.alloc_capture_id();
         let framerate = self.framerate;
         let (tx, rx) = oneshot::channel();
@@ -2471,7 +2482,7 @@ impl AppState {
             capture_id,
             LocalCapture {
                 kind: StreamKind::Video,
-                label: t!("share.video_label").to_string(),
+                label: if node.is_some() { capture::gamescope::LABEL.to_string() } else { t!("share.video_label").to_string() },
                 status: ShareStatus::Starting(rx),
                 audio_for_capture: None,
                 destinations: IndexMap::new(),
@@ -2480,7 +2491,12 @@ impl AppState {
         self.share_error = None;
 
         tokio::spawn(async move {
-            let result = capture::start_capture(framerate).await.map(ShareHandle::Video).map_err(|e| start_error_string(&e));
+            let started = match node {
+                #[cfg(target_os = "linux")]
+                Some(name) => capture::start_gamescope_capture(framerate, Some(name)).await,
+                _ => capture::start_capture(framerate).await,
+            };
+            let result = started.map(ShareHandle::Video).map_err(|e| start_error_string(&e));
             let _ = tx.send(result);
         });
         capture_id
@@ -5690,6 +5706,12 @@ impl AppState {
     pub fn stage_video_share_with_saved_defaults(&mut self) -> CaptureSourceId {
         self.apply_start_stream_defaults();
         self.stage_video_share()
+    }
+
+    /// [`Self::stage_video_share_with_saved_defaults`] for the gamescope node `node` (row 142).
+    pub fn stage_gamescope_share_with_saved_defaults(&mut self, node: String) -> CaptureSourceId {
+        self.apply_start_stream_defaults();
+        self.stage_gamescope_share(node)
     }
 
     /// "Go live" clicked: [`Self::go_live`], then persist the card's current

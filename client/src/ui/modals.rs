@@ -229,6 +229,7 @@ pub fn show(ctx: &egui::Context, cx: &mut Cx, st: &mut ModalsState, modal: &Moda
         }
         Modal::Rename { room } => rename(ctx, cx, st, room),
         Modal::ChooseName => choose_name(ctx, cx, st),
+        Modal::SharePick { room, auto, node } => share_pick(ctx, cx, *room, *auto, node),
         Modal::StreamSettings { .. } | Modal::AudioSettings { .. } | Modal::WebcamSettings { .. } => {}
     }
 }
@@ -885,6 +886,43 @@ fn confirm(
         FooterClick::Trailing(0) => cx.act(UiAction::CloseModal),
         _ if a.close => cx.act(UiAction::CloseModal),
         _ => {}
+    }
+}
+
+/// "What do you want to share?": Screen (the portal's picker as before) or Gamescope (the node, no picker). Both are
+/// body buttons so the rig can find them (`share_pick.screen`, `share_pick.gamescope`); the footer is Cancel.
+fn share_pick(ctx: &egui::Context, cx: &mut Cx, room: RoomHandle, auto: bool, node: &str) {
+    let title = tr("ui.modal.share_pick_title", "What do you want to share?");
+    let body = tr_with("ui.modal.share_pick_body", "Gamescope is running (%{node}). Share your whole screen, or gamescope on its own?", &[("node", node)]);
+    let (screen, gamescope) = (tr("ui.modal.share_pick_screen", "Screen"), tr("ui.modal.share_pick_gamescope", "Gamescope"));
+    let cancel = tr("ui.modal.cancel", "Cancel");
+    let spec = ModalSpec { id: "share_pick", title: &title, sub: None, width: theme::MODAL_W, head_pill: None };
+    let mut click = FooterClick::None;
+    let mut picked = None;
+    let a = widgets::modal_shell(
+        ctx,
+        &spec,
+        |ui| {
+            paragraph(ui, &body);
+            ui.add_space(theme::S3);
+            let r = HBox::new("share_pick", theme::CTL_H_LG).slots(&[FILL, fixed(theme::S2), FILL]).show(ui);
+            let (w0, w2) = (r.cell(0).width(), r.cell(2).width());
+            let s = r.show(ui, 0, Align::Min, |ui| Btn::secondary(&screen).large().show_sized(ui, w0));
+            drive_dump::rect(|| "share_pick.screen".into(), s.rect);
+            let g = r.show(ui, 2, Align::Min, |ui| Btn::primary(&gamescope).large().show_sized(ui, w2));
+            drive_dump::rect(|| "share_pick.gamescope".into(), g.rect);
+            if s.clicked() {
+                picked = Some(None);
+            } else if g.clicked() {
+                picked = Some(Some(node.to_string()));
+            }
+        },
+        |ui| click = widgets::modal_footer(ui, &[], None, &[Btn::secondary(&cancel)]),
+    );
+    if let Some(node) = picked {
+        cx.act(UiAction::SharePicked { room, auto, node });
+    } else if matches!(click, FooterClick::Trailing(0)) || a.close {
+        cx.act(UiAction::CloseModal);
     }
 }
 
