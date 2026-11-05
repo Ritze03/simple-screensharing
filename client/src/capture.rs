@@ -1672,6 +1672,86 @@ struct CapturePipeline {
     /// Flipped by the first buffer to reach the `tee`; see
     /// [`CaptureHandle::awaiting_first_frame`].
     frame_seen: Arc<std::sync::atomic::AtomicBool>,
+    /// When the frame size at the `tee` last changed, and how many frames came since ([`SizeWatch`]).
+    size: Arc<SizeWatch>,
+}
+
+/// How long the source's frame size must stay put before [`CaptureHandle::poll_resize`] acts on it, so
+/// dragging a window edge (many sizes per second) causes one rebuild after it settles.
+const RESIZE_SETTLE: Duration = Duration::from_millis(600);
+/// No buffer at the `tee` for this long, on a source that resends its last frame while idle (`keepalive-time`),
+/// is a dead source. Faster than the pumps' watchdog (3 s + 2 s) because a portal that stops delivering after a
+/// size change gives no caps event we could notice instead (measured, #141: both variants occur).
+const SOURCE_GAP_LOST: Duration = Duration::from_millis(2000);
+/// The loss reason [`CaptureHandle::poll_resize`] records; the session restarts without backoff for it.
+pub const SOURCE_RESIZED_TEXT: &str = "the capture source stopped after it changed size";
+/// Frames that must arrive at the `tee` after a size change for the source to count as alive.
+const RESIZE_ALIVE_FRAMES: u64 = 3;
+
+/// Frame size at the `tee` as the caps events report it (the live size; `source_caps()` is the size the
+/// destinations were built for), the time of its last change and the buffers seen since.
+///
+/// Why: stock xdpw stops delivering after an output mode change (measured 2026-11-05, #141: 1 of 240 fps
+/// then nothing, `ext: frame capture failed: buffer constraint mismatch`, `out of buffers`) although
+/// `pipewiresrc` renegotiates and pushes the new caps. A source that survives (gamescope, window capture)
+/// keeps delivering. Telling the two apart needs "caps changed at T" and "frames since T".
+#[derive(Default)]
+struct SizeWatch {
+    changed: Mutex<Option<(u32, u32, Instant)>>,
+    frames: std::sync::atomic::AtomicU64,
+    /// Buffers since the change whose `GstBuffer` differs from the one before: `pipewiresrc`'s keepalive
+    /// resends the held buffer, which must not read as a source that is alive.
+    fresh: std::sync::atomic::AtomicU64,
+    last_buffer: std::sync::atomic::AtomicUsize,
+    /// Milliseconds (+1) since [`watch_base`] of the newest buffer; 0 = none yet.
+    last_ms: std::sync::atomic::AtomicU64,
+}
+
+fn watch_base() -> Instant {
+    static BASE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *BASE.get_or_init(Instant::now)
+}
+
+impl SizeWatch {
+    fn frames(&self) -> u64 {
+        self.frames.load(Ordering::Relaxed)
+    }
+
+    /// `true` while the size is still changing (inside [`RESIZE_SETTLE`] of the last change).
+    fn resizing(&self, now: Instant) -> bool {
+        self.changed.lock().unwrap().is_some_and(|(_, _, at)| now.saturating_duration_since(at) < RESIZE_SETTLE)
+    }
+
+    fn install(self: &Arc<Self>, tee: &gst::Element) {
+        let Some(pad) = tee.static_pad("sink") else { return };
+        let this = self.clone();
+        pad.add_probe(gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+            match &info.data {
+                Some(gst::PadProbeData::Buffer(b)) => {
+                    this.frames.fetch_add(1, Ordering::Relaxed);
+                    this.last_ms.store(watch_base().elapsed().as_millis() as u64 + 1, Ordering::Relaxed);
+                    if this.last_buffer.swap(b.as_ptr() as usize, Ordering::Relaxed) != b.as_ptr() as usize {
+                        this.fresh.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Some(gst::PadProbeData::Event(event)) => {
+                    if let gst::EventView::Caps(c) = event.view()
+                        && let Some(s) = c.caps().structure(0)
+                        && let (Ok(w), Ok(h)) = (s.get::<i32>("width"), s.get::<i32>("height"))
+                    {
+                        let mut at = this.changed.lock().unwrap();
+                        if at.is_none_or(|(ow, oh, _)| (ow, oh) != (w as u32, h as u32)) {
+                            *at = Some((w as u32, h as u32, Instant::now()));
+                            this.frames.store(0, Ordering::Relaxed);
+                            this.fresh.store(0, Ordering::Relaxed);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
 }
 
 /// Builds and links (but does not start) the capture pipeline described in
@@ -1869,7 +1949,10 @@ fn build_pipeline_from_description(description: &str, domain: CaptureDomain, ori
         });
     }
 
-    Ok(CapturePipeline { pipeline, tee, preview_sink, live, frame_seen })
+    let size = Arc::new(SizeWatch::default());
+    size.install(&tee);
+
+    Ok(CapturePipeline { pipeline, tee, preview_sink, live, frame_seen, size })
 }
 
 /// Stops a branch being added to the live `tee` from asking everything
@@ -2869,7 +2952,7 @@ async fn start_capture_with_source(framerate: u32, capture_source: CaptureSource
         }
     };
     tracing::info!("capture started in the {domain:?} domain");
-    let CapturePipeline { pipeline, tee, preview_sink, live, frame_seen } = built;
+    let CapturePipeline { pipeline, tee, preview_sink, live, frame_seen, size: size_watch } = built;
 
     // Size for the never-upscale clamp ([`destination::clamp_to_source`]) and
     // for whatever destination is added first: read off the tee's negotiated
@@ -2883,7 +2966,7 @@ async fn start_capture_with_source(framerate: u32, capture_source: CaptureSource
         Some(bus) => bus,
         None => return Err(abandon_capture(pipeline, capture_source, anyhow!("pipeline has no bus")).await),
     };
-    let capture_errors = CaptureErrors { silence_is_loss: capture_source.silence_means_lost(), ..Default::default() };
+    let capture_errors = CaptureErrors { silence_is_loss: capture_source.silence_means_lost(), size: size_watch, ..Default::default() };
     let capture_task = tokio::spawn(capture_loop(bus.stream(), capture_errors.clone()));
 
     Ok(CaptureHandle {
@@ -3639,6 +3722,16 @@ impl CaptureHandle {
         self.restore_token.clone()
     }
 
+    /// TEST-ONLY: change the size a test source produces (its fragment must hold `capsfilter name=sourcesize`).
+    #[cfg(any(test, feature = "test-source"))]
+    pub fn test_resize_source(&self, width: i32, height: i32) {
+        let filter = self.pipeline.by_name("sourcesize").expect("the test source has no `capsfilter name=sourcesize`");
+        let mut caps = filter.property::<gst::Caps>("caps");
+        caps.make_mut().set("width", width);
+        caps.make_mut().set("height", height);
+        filter.set_property("caps", &caps);
+    }
+
     /// TEST-ONLY: pretend the source died, as a bus error would.
     #[cfg(any(test, feature = "test-source"))]
     pub fn inject_source_lost(&self, reason: &str) {
@@ -3678,6 +3771,54 @@ impl CaptureHandle {
             state.height = height as u32;
         }
         *state
+    }
+
+    /// Per-frame check for a source that changed size (a window resized, a monitor mode change, a game
+    /// changing resolution). Waits until the size has been stable for [`RESIZE_SETTLE`], so a drag rebuilds once.
+    /// Then, if frames kept arriving, every destination is swapped to the new shape ([`rescale_for_new_source`],
+    /// the same [`Self::change_destination`] branch swap as a settings edit) and the new size becomes
+    /// [`Self::source_caps`]; if the source went silent (stock xdpw does, after a mode change) the capture is
+    /// declared lost at once, which the session answers with its restart (no 5 s silence wait).
+    ///
+    /// Why not swap on the caps event itself: a drag sends dozens of sizes; each swap is an encoder build.
+    /// Why the branches meanwhile keep their fixed size: the picture is briefly scaled (stretched) into it,
+    /// never a stall.
+    // ponytail: a destination whose swap is already in flight when the size settles answers Err and is not
+    // retried (the next resize does it); ceiling: a resize landing inside a user's Apply.
+    pub fn poll_resize(&self, now: Instant) -> Vec<(DestKey, ChangeRequest)> {
+        let basis = self.source_caps();
+        let last = self.capture_errors.size.last_ms.load(Ordering::Relaxed);
+        if self.capture_errors.silence_is_loss
+            && last > 0
+            && now.saturating_duration_since(watch_base()) > Duration::from_millis(last) + SOURCE_GAP_LOST
+            && self.capture_errors.lost().is_none()
+        {
+            tracing::warn!("no frame reached the capture tee for {SOURCE_GAP_LOST:?}; the source is dead, restarting the capture");
+            self.capture_errors.mark_lost("the capture source stopped delivering frames".to_string());
+        }
+        let Some((w, h, at)) = *self.capture_errors.size.changed.lock().unwrap() else { return Vec::new() };
+        if basis.width == 0 || (w, h) == (basis.width, basis.height) || now.saturating_duration_since(at) < RESIZE_SETTLE {
+            return Vec::new();
+        }
+        let (frames, fresh) = (self.capture_errors.size.frames(), self.capture_errors.size.fresh.load(Ordering::Relaxed));
+        tracing::debug!("source resized to {w}x{h}: {frames} frames, {fresh} fresh since");
+        if fresh < RESIZE_ALIVE_FRAMES {
+            if self.capture_errors.silence_is_loss && self.capture_errors.lost().is_none() {
+                tracing::warn!("the capture source delivers nothing since it changed size to {w}x{h}; restarting the capture");
+                self.capture_errors.mark_lost(SOURCE_RESIZED_TEXT.to_string());
+            }
+            return Vec::new();
+        }
+        let new = destination::SourceCaps { width: w, height: h, framerate: basis.framerate };
+        *self.source_state.lock().unwrap() = new;
+        tracing::info!("capture source resized {}x{} -> {w}x{h}; rebuilding {} destination(s) at the new shape", basis.width, basis.height, self.destinations.len());
+        self.destinations
+            .iter()
+            .filter_map(|d| {
+                let target = destination::rescale_for_new_source(d.params(), basis, new);
+                self.change_destination(d.key, target).ok().map(|c| (d.key, c))
+            })
+            .collect()
     }
 
     /// Raise the rate this capture is considered to be running at, so a
@@ -4128,6 +4269,9 @@ struct CaptureErrors {
     /// delivers only on change): silence there is normal and must never restart
     /// the capture.
     silence_is_loss: bool,
+    /// The source's live frame size and frames since it changed ([`SizeWatch`]): a silence right after a
+    /// size change is [`CaptureHandle::poll_resize`]'s to judge, not the pumps' watchdog's.
+    size: Arc<SizeWatch>,
 }
 
 impl CaptureErrors {
@@ -4511,6 +4655,8 @@ async fn destination_pump(
                                 destination::StallVerdict::Wait => {}
                                 // A source that is silent on a static screen by design (Windows): not a loss.
                                 destination::StallVerdict::SourceDead if !capture_errors.silence_is_loss => {}
+                                // The size is still changing (a window edge being dragged): wait for it to settle.
+                                destination::StallVerdict::SourceDead if capture_errors.size.resizing(now) => {}
                                 destination::StallVerdict::SourceDead => {
                                     if !declared_source_lost {
                                         declared_source_lost = true;
@@ -5775,6 +5921,33 @@ pub mod destination {
         }
 
         out
+    }
+
+    /// `params` (a destination's settings on the old source) carried over to a
+    /// replacement source of a different size, keeping the destination's scale
+    /// (its size as a share of the source) rather than its pixel size.
+    ///
+    /// `Why:` after a monitor mode change or rotation the replacement source has
+    /// other dimensions. Re-adding the old pixel size would let `clamp_to_source`
+    /// squash it into the wrong aspect ratio (a 1920x1080 destination on a
+    /// rotated 1080x1920 source) or keep a stale smaller size on a larger source.
+    /// A destination that followed the source (width/height 0), or any size that
+    /// is unknown, is passed through unchanged.
+    pub fn rescale_for_new_source(
+        params: VideoParams,
+        old: SourceCaps,
+        new: SourceCaps,
+    ) -> VideoParams {
+        if params.width == 0 || params.height == 0 || old.width == 0 || old.height == 0 || new.width == 0 || new.height == 0 {
+            return params;
+        }
+        // Share of the source in per mille, from the width; the height follows the new source's aspect.
+        // Rounded, and 99.5 % and up counts as the whole source: truncating drifted a full-size stream down by a
+        // few pixels with every restart (1920x1080 -> 1916x1076 after three, measured in the rig, #141).
+        let permille = ((u64::from(params.width) * 1000 + u64::from(old.width) / 2) / u64::from(old.width)).clamp(1, 1000);
+        let permille = if permille >= 995 { 1000 } else { permille };
+        let scale = |v: u32| ((u64::from(v) * permille / 1000) as u32).max(2) & !1;
+        VideoParams { width: scale(new.width), height: scale(new.height), ..params }
     }
 
     /// The rate the shared capture source must run at to serve every

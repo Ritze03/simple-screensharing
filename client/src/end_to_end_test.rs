@@ -2602,6 +2602,74 @@ async fn big_fps_jump_mid_stream_keeps_viewer_frames_flowing() {
     eprintln!("[e2e-fps-jump] PASS: viewer kept decoding frames across both big fps jumps");
 }
 
+/// A live source that changes size (a game changing resolution, a shared window resized, and 16:9 -> 4:3 here)
+/// must not break the stream: after [`capture::CaptureHandle::poll_resize`] has settled and swapped the branch, the
+/// viewer decodes frames of the new size with the new aspect, and no gap between decoded frames reaches a few seconds.
+/// (Task #141. A stock portal that stops delivering is the other half; that is measured in the rig.)
+#[tokio::test]
+#[ignore = "spawns a real relay server child process and real GStreamer capture/decode pipelines; run explicitly with \
+            `cargo test -p simple-screensharing-client --lib --release -- --ignored a_source_that_changes_size --nocapture`"]
+async fn a_source_that_changes_size_keeps_the_viewer_decoding_at_the_new_aspect() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    let port = pick_free_udp_port().expect("free port");
+    let _server = spawn_relay_server(port).expect("relay");
+    let join_string = crate::net::format_join_string(&format!("127.0.0.1:{port}"), &rand::random::<RoomId>(), &rand::random::<[u8; 32]>());
+    let (sharer, _s, mut events_a) = connect_with_retry(&join_string, "sharer").await.expect("sharer");
+    let (viewer, _v, mut events_b) = connect_with_retry(&join_string, "viewer").await.expect("viewer");
+    let owner = sharer.conn_id();
+    let source = "videotestsrc is-live=true pattern=ball ! capsfilter name=sourcesize caps=video/x-raw,width=1280,height=720,framerate=30/1";
+    let handle = capture::start_sharing_from_test_source(&sharer, VIDEO_STREAM_ID, capture::DEFAULT_BITRATE_KBPS, 30, source)
+        .await
+        .expect("start_sharing_from_test_source");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !matches!(events_b.recv().await, Some(ClientEvent::PresenceDelta(PresenceEvent::StreamStarted(_)))) {}
+    })
+    .await
+    .expect("StreamStarted");
+    viewer.subscribe(owner, VIDEO_STREAM_ID).await.expect("subscribe");
+    let mut decoder = StreamDecoder::new(VIDEO_STREAM_ID).expect("decoder");
+
+    let (mut last_size, mut last_at, mut max_gap, mut resized_at) = ([0usize; 2], std::time::Instant::now(), Duration::ZERO, None);
+    let mut sizes_after = Vec::new();
+    let start = std::time::Instant::now();
+    let mut swaps = Vec::new();
+    while start.elapsed() < Duration::from_secs(14) {
+        tokio::select! {
+            e = events_a.recv() => match e {
+                Some(ClientEvent::SubscriberCount { count, .. }) => handle.notify_subscriber_count(capture::DestKey(0), count),
+                Some(ClientEvent::KeyframeRequest { .. }) => handle.notify_keyframe_request(capture::DestKey(0)),
+                _ => {}
+            },
+            e = events_b.recv() => if let Some(ClientEvent::MediaFrame(f)) = e { decoder.feed(&f) },
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        if start.elapsed() > Duration::from_secs(4) && resized_at.is_none() {
+            // a burst of sizes first (a drag), then the final one: must end in ONE swap
+            for (w, h) in [(1100, 700), (900, 700), (800, 600), (720, 540), (640, 480)] {
+                handle.test_resize_source(w, h);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            resized_at = Some(std::time::Instant::now());
+        }
+        swaps.extend(handle.poll_resize(std::time::Instant::now()));
+        if let Some(img) = decoder.latest_frame() {
+            max_gap = max_gap.max(last_at.elapsed());
+            last_at = std::time::Instant::now();
+            last_size = img.size;
+            if resized_at.is_some() {
+                sizes_after.push(img.size);
+            }
+        }
+    }
+    assert!(handle.source_lost().is_none(), "a size change must not read as a lost source");
+    assert_eq!(swaps.len(), 1, "the burst must rebuild the destination once, after it settled");
+    assert_eq!(last_size, [640, 480], "the viewer must end on the new size at the new aspect (got {last_size:?})");
+    assert!(max_gap < Duration::from_secs(3), "decoded frames stalled for {max_gap:?}");
+    let _ = handle.stop().await;
+    drop(viewer);
+    let _ = sharer.leave().await;
+}
+
 /// Regression test for the "orphan audio stream" bug (2026-07-29 — see
 /// this task's dispatch notes / `superdoc/features/stream-control.md`):
 /// `AppState::start_audio_share` used to announce a live audio stream

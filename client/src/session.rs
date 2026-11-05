@@ -1897,29 +1897,7 @@ impl CaptureRecovery {
     }
 }
 
-/// `params` (a destination's settings on the old source) carried over to a
-/// replacement source of a different size, keeping the destination's scale
-/// (its size as a share of the source) rather than its pixel size.
-///
-/// `Why:` after a monitor mode change or rotation the replacement source has
-/// other dimensions. Re-adding the old pixel size would let `clamp_to_source`
-/// squash it into the wrong aspect ratio (a 1920x1080 destination on a
-/// rotated 1080x1920 source) or keep a stale smaller size on a larger source.
-/// A destination that followed the source (width/height 0), or any size that
-/// is unknown, is passed through unchanged.
-pub fn rescale_for_new_source(
-    params: capture::destination::VideoParams,
-    old: capture::destination::SourceCaps,
-    new: capture::destination::SourceCaps,
-) -> capture::destination::VideoParams {
-    if params.width == 0 || params.height == 0 || old.width == 0 || old.height == 0 || new.width == 0 || new.height == 0 {
-        return params;
-    }
-    // Share of the source in per mille, from the width; the height follows the new source's aspect.
-    let permille = (u64::from(params.width) * 1000 / u64::from(old.width)).clamp(1, 1000);
-    let scale = |v: u32| ((u64::from(v) * permille / 1000) as u32).max(2) & !1;
-    capture::destination::VideoParams { width: scale(new.width), height: scale(new.height), ..params }
-}
+pub use capture::destination::rescale_for_new_source;
 
 /// Default value of [`AppState::connect_timeout`] — the feature request's
 /// "connecting should time out after 15 seconds".
@@ -3693,6 +3671,20 @@ impl AppState {
 
     /// [`Self::poll_capture_recovery`] with the clock injected (tests).
     pub fn poll_capture_recovery_at(&mut self, now: Instant) {
+        // 0. Sources that changed size and settled: swap every destination to the new shape, or (the source
+        // went silent) the capture is marked lost and step 1 restarts it.
+        for (id, capture) in self.captures.iter_mut() {
+            let ShareStatus::Active(ShareHandle::Video(handle)) = &capture.status else { continue };
+            if self.recoveries.contains_key(id) || handle.source_lost().is_some() {
+                continue;
+            }
+            for (key, change) in handle.poll_resize(now) {
+                if let Some(dest) = capture.destinations.get_mut(&DestinationId(key.0)) {
+                    dest.params = change.applied;
+                    dest.apply_rx = change.done;
+                }
+            }
+        }
         // 1. Captures whose source just died.
         let lost: Vec<(CaptureSourceId, String, u32, Option<String>, bool)> = self
             .captures
@@ -3915,7 +3907,13 @@ impl AppState {
         // `Why `start_pos + 1` and not the attempts used (a recovery that needed
         // five tries is a long outage, not a flapping source): only a capture
         // that keeps dying right after a successful restart walks down the schedule.
-        self.recovery_history.insert(capture_id, (now, recovery.start_pos + 1));
+        // A restart that came out at another size is the source changing size, not flapping: it never walks the
+        // backoff (a window drag with a portal that cannot follow it restarts once per settled size, at once).
+        if (old_source.width, old_source.height) == (new_source.width, new_source.height) {
+            self.recovery_history.insert(capture_id, (now, recovery.start_pos + 1));
+        } else {
+            self.recovery_history.remove(&capture_id);
+        }
     }
 
     /// Stop tracking a recovery (the capture is being stopped or dropped); a
@@ -6418,6 +6416,7 @@ mod ui_ops_tests {
     fn a_new_source_keeps_the_destinations_share_of_it_not_its_pixel_size() {
         use capture::destination::SourceCaps;
         let src = |w, h| SourceCaps { width: w, height: h, framerate: 60 };
+        use capture::destination::VideoParams;
         let mut params = video_params();
         // Full size, then half size, on a rotated source.
         params.width = 1920;
@@ -6431,6 +6430,15 @@ mod ui_ops_tests {
         // A smaller mode keeps the share.
         let smaller = rescale_for_new_source(params, src(1920, 1080), src(1280, 720));
         assert_eq!((smaller.width, smaller.height), (640, 360));
+        // A window dragged to another aspect (#141): full size follows, half size stays half.
+        let full = VideoParams { width: 1280, height: 720, ..params };
+        let wide = rescale_for_new_source(full, src(1280, 720), src(1600, 900));
+        assert_eq!((wide.width, wide.height), (1600, 900));
+        let square = rescale_for_new_source(VideoParams { width: 640, height: 360, ..params }, src(1280, 720), src(800, 800));
+        assert_eq!((square.width, square.height), (400, 400));
+        // Repeated rescales do not drift a full-size stream below the source.
+        let drifted = rescale_for_new_source(VideoParams { width: 1916, height: 1076, ..params }, src(1920, 1080), src(1920, 1080));
+        assert_eq!((drifted.width, drifted.height), (1920, 1080));
         // "Follow the source" and unknown sizes pass through.
         params.width = 0;
         params.height = 0;
