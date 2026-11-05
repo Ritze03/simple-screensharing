@@ -556,3 +556,71 @@ select.field { cursor: pointer; padding-right: 6px; }
 .pip-stage .ovl .statbar, .pip-stage .ovl .round-btn { pointer-events: auto; }
 /* an audio-only sender's tile: no picture, the Listen button; listening shows the volume in the tag */
 .st-tile.audio-only .vid { background-image: var(--screen-hatch); }
+
+/* ===================================== phones (task 145, 2026-11-05) =====================================
+   One breakpoint, the same query as store.js PHONE_Q: narrow (portrait) or short + touch (landscape). The desktop rules above are untouched.
+   The rooms list becomes a drawer over the stage; touch gets bigger targets and the hover-only bits are always there. */
+.drawer-btn, .drawer-scrim { display: none; }
+@media (max-width: 760px), (max-height: 500px) and (pointer: coarse) {
+  :root { --ctl-h: 40px; --ctl-h-lg: 44px; --band-h: 52px; --row-h: 44px; --subrow-h: 40px; --strip-avatar: 40px; }
+  html, body { overscroll-behavior: none; -webkit-tap-highlight-color: transparent; }
+  button, .p-row, .p-sub, .mi { touch-action: manipulation; }
+  #app { height: 100vh; height: 100dvh; min-width: 0; overflow: hidden; padding: 0 env(safe-area-inset-right) 0 env(safe-area-inset-left); box-sizing: border-box; }
+  .field, input.field { font-size: 16px; } /* iOS zooms into a field with a smaller font */
+  /* the rooms drawer */
+  .p-side { position: fixed; z-index: 35; left: 0; top: 0; bottom: 0; width: min(310px, 86vw); flex-basis: auto; visibility: hidden; transform: translateX(-100%); padding-left: env(safe-area-inset-left); box-sizing: border-box; }
+  .drawer-open .p-side { visibility: visible; transform: none; box-shadow: 0 0 40px rgba(0, 0, 0, .7); }
+  .drawer-open .p-user { padding-bottom: env(safe-area-inset-bottom); height: calc(var(--band-h) + env(safe-area-inset-bottom)); flex-basis: auto; }
+  .drawer-scrim { display: block; position: fixed; inset: 0; z-index: 34; background: var(--scrim); }
+  .drawer-btn { display: inline-flex; }
+  .p-row, .p-sub { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; }
+  .p-head .meta { display: none; }
+  .band { padding: 0 var(--s3); }
+  /* dialogs and menus use the screen */
+  .scrim { height: 100vh; height: 100dvh; }
+  .modal, .modal.wide, .modal.xwide { width: calc(100% - 16px); max-height: calc(100% - 16px); }
+  .modal-body { padding: var(--s3) var(--s4); -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+  .modal.settings-modal .modal-body { min-height: 0; }
+  .modal-foot { padding: var(--s2) var(--s4); height: auto; flex-basis: auto; min-height: 64px; flex-wrap: wrap; }
+  .modal-foot .btn { min-width: 0; }
+  .crow > .sl:first-child { width: 96px !important; flex-basis: 96px !important; }
+  .mi { height: 44px; flex-basis: 44px; }
+  .mi.two { height: 52px; flex-basis: 52px; }
+  .menu { max-height: calc(100dvh - 16px); overflow-y: auto; }
+  .menu.m-emoji, .menu.m-share, .menu.m-layout { width: 340px; }
+  .toasts { top: calc(60px + env(safe-area-inset-top)); left: 12px; right: 12px; transform: none; }
+  .toast .txt { white-space: normal; overflow: visible; }
+  .toast { height: auto; min-height: 32px; padding: 6px 14px; white-space: normal; }
+  .empty { padding: var(--s4); }
+  .p-center { padding: var(--s3); scrollbar-gutter: auto; }
+  /* the stage */
+  .arena { margin: var(--s2) var(--s2) 0; }
+  .stagefs .arena { inset: var(--s1); }
+  .strip { padding: 14px var(--s3) 2px; gap: 10px; }
+  .ctlrow { padding-bottom: calc(6px + env(safe-area-inset-bottom)); }
+  .cb { min-width: 44px; }
+  .cb.dim { min-width: 44px; }
+  .splitb > .caret { min-width: 30px; width: 30px; }
+  .gut, .rz { display: none; } /* ponytail: no resize bars / floating handles on a phone (nothing to scroll, and a thin bar under a finger is a mis-drag); Reset layout and the Layout menu stay */
+  .round-btn { width: 40px; height: 40px; }
+  .round-btn .ms { font-size: 20px; }
+  .tag { max-width: calc(100% - 156px); height: 30px; }
+  .st-tile .invite { padding: var(--s2); gap: 6px; }
+  #btn-sidebar { display: none; }
+}
+/* hover has no meaning on a touch screen: the tile's name and buttons are always there */
+@media (hover: none) and (pointer: coarse) {
+  .hover-ui { opacity: 1; }
+  .st-tile { cursor: default; }
+}
+/* a short (landscape) phone: the header band goes where a stage has its own bar (the bar's button opens the rooms), the strip and the bar get slimmer */
+@media (max-height: 500px) and (pointer: coarse) {
+  main:has(.stg) > .p-head { display: none; }
+  #btn-sidebar { display: inline-flex; }
+  .strip { padding: 6px var(--s3) 0; }
+  .pv { gap: 3px; }
+  .pv .avatar { --av: 32px; font-size: 14px; }
+  .pv .lv { bottom: -5px; height: 15px; font-size: 7.5px; }
+  .ctlrow { height: 56px; flex-basis: 56px; padding-top: 0; padding-bottom: 0; }
+  .arena { margin-top: var(--s1); }
+}

@@ -138,8 +138,8 @@ export function secHead(title, count, rule) {
   return H({ g: 2 }, h("h3", { class: "section-label" }, title, count != null ? h("span", { class: "count", text: String(count) }) : null), rule ? h("span", { class: "rule" }) : null);
 }
 /** Sidebar room row: hbox [slot 18 lead][fill name][slot 18 me-live][slot 28 number][slot 22 unit] */
-export function roomRow({ lead, name, me, num, unit, sel, onclick, oncontextmenu, title, numAttrs }) {
-  return H({ tag: "button", cls: "p-row" + (sel ? " sel" : ""), attrs: { type: "button", onclick, oncontextmenu, title: title || null } },
+export function roomRow({ lead, name, me, num, unit, sel, onclick, oncontextmenu, onpointerdown, title, numAttrs }) {
+  return H({ tag: "button", cls: "p-row" + (sel ? " sel" : ""), attrs: { type: "button", onclick, oncontextmenu, onpointerdown, title: title || null } },
     SL(18, lead), FILL(T(name, "name")), me === false ? null : SL(18, me || null),
     SL(28, h("span", Object.assign({ class: "num", text: num == null ? "" : String(num) }, numAttrs || {})), { al: "r" }), SL(22, unit || null, { al: "l" }));
 }
@@ -162,7 +162,7 @@ export const btnRow = (...btns) => H({ g: 2 }, btns.filter(Boolean).map((b) => {
 export function emptyState(icon, title, text, actions, { err = false, errText = null } = {}) {
   return V({ cls: "empty", g: 2 }, ic(icon, "big" + (err ? " err" : "")), T(title, "b"), text ? h("span", { text }) : null,
     errText ? h("span", { class: "errtext", text: errText }) : null,
-    actions ? H({ g: 0, style: "width:320px;margin-top:var(--s2)" }, FILL(actions)) : null);
+    actions ? H({ g: 0, style: "width:min(320px,100%);margin-top:var(--s2)" }, FILL(actions)) : null);
 }
 export function banner(icon, text, action, { error = false } = {}) {
   return H({ cls: "banner" + (error ? " error" : ""), g: 2 }, SL(18, ic(icon)), FILL(T(text)), action || null);
@@ -320,3 +320,30 @@ export function avatarEl(name, emoji, { sm = false, pres = null, cls = "", kids 
 /** The last emoji of a text as one grapheme (a flag or a ZWJ family stays whole); "" when there is none. Pasting over or after the old one both work. */
 const isEmoji = (g) => /\p{Extended_Pictographic}|\p{Regional_Indicator}|⃣/u.test(g);
 export const pickEmoji = (text) => [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(String(text || ""))].map((x) => x.segment).filter(isEmoji).at(-1) || "";
+
+/**
+ * Touch long-press (500 ms, finger moved < 10 px): `fn({ x, y })`, and the click that ends the press is swallowed. Android Chrome also fires `contextmenu` itself,
+ * iOS Safari never does, so the timer is ours. Document-level end listeners: a re-render replaces the pressed element under the finger.
+ */
+export const lp = { until: 0 };
+export function longPress(e, fn) {
+  if (e.pointerType === "mouse") return;
+  const x0 = e.clientX;
+  const y0 = e.clientY;
+  const end = () => {
+    clearTimeout(timer);
+    for (const ev of ["pointerup", "pointercancel"]) document.removeEventListener(ev, end, true);
+    document.removeEventListener("pointermove", move, true);
+  };
+  const move = (m) => { if (Math.hypot(m.clientX - x0, m.clientY - y0) > 10) end(); };
+  const timer = setTimeout(() => {
+    end();
+    const eat = (c) => { lp.until = 0; c.stopPropagation(); c.preventDefault(); };
+    lp.until = performance.now() + 1500; // the document's close-menu click handler (stage.js) ignores that click too
+    document.addEventListener("click", eat, { capture: true, once: true });
+    setTimeout(() => { lp.until = 0; document.removeEventListener("click", eat, true); }, 1500); // the lift may never produce a click
+    fn({ x: x0, y: y0 });
+  }, 500);
+  for (const ev of ["pointerup", "pointercancel"]) document.addEventListener(ev, end, true);
+  document.addEventListener("pointermove", move, true);
+}

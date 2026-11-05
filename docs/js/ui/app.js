@@ -5,11 +5,11 @@
 // place instead of re-rendering, so sliders and hovers are never interrupted.
 
 import { capabilities, createRoom, parseJoinLink, parseServerAddr, base64urlDecode, probeEncoders } from "../core/index.js";
-import { S, onInvalidate, invalidate, toast, persistSettings, persistRooms, loadRooms, autoName, displayName, encoderOf } from "./store.js";
+import { S, PHONE, onInvalidate, invalidate, toast, persistSettings, persistRooms, loadRooms, autoName, displayName, encoderOf } from "./store.js";
 import { t, setLang, getLang } from "./i18n.js";
 import {
   h, ic, T, V, H, SL, FILL, pct, ctrlRow, valBox, sliderRow, seg, cbx, card, roomRow, sharerRow, destRow, btnRow, emptyState,
-  banner, meter, modalShell, avatarEl, LABEL_W,
+  banner, meter, modalShell, avatarEl, LABEL_W, longPress,
 } from "./dom.js";
 import {
   RoomEntry, roomById, connectRoom, disconnectRoom, retryNow, watchStream, allWatches, addRoom, forgetRoom, applyJitterSettings,
@@ -77,6 +77,7 @@ function render() {
   }
   renderQueued = false;
   promptForName();
+  if (S.modal) S.drawer = false; // a dialog replaces the rooms drawer
   const keep = SCROLLERS.map((s) => {
     const n = root.querySelector(s);
     return n ? n.scrollTop : null;
@@ -98,7 +99,8 @@ function render() {
   const fsStage = S.stage.fullscreen && sv && !S.stage.popped.has(viewKey(sv));
   const app = fsStage
     ? V({ cls: "p-app fs-root", g: 0 }, renderStage(sv, HOST_MAIN, { fullscreen: true }))
-    : H({ cls: "p-app st", g: 0 }, S.stage.sidebarHidden && sv ? null : renderSide(), renderMain(sv));
+    : H({ cls: "p-app st" + (S.drawer ? " drawer-open" : ""), g: 0 }, S.stage.sidebarHidden && sv && !PHONE.matches ? null : renderSide(), renderMain(sv),
+      S.drawer ? h("div", { class: "drawer-scrim", onclick: () => { S.drawer = false; render(); } }) : null);
   if (S.modal) app.appendChild(renderModal());
   app.appendChild(h("div", { class: "layer" }, overlays("main")));
   app.appendChild(V({ cls: "toasts", g: 1, attrs: { role: "status", "aria-live": "polite" } },
@@ -155,6 +157,16 @@ A.flush = () => {
 };
 onInvalidate(render);
 window.addEventListener("resize", () => invalidate());
+// Phone: the on-screen keyboard shrinks the viewport (Chrome resizes the layout, iOS only the visual viewport): keep the field in use in view.
+document.addEventListener("focusin", (e) => {
+  if (!PHONE.matches || !e.target.matches || !e.target.matches("input, textarea")) return;
+  const f = e.target;
+  setTimeout(() => f.isConnected && f.scrollIntoView({ block: "center", behavior: "smooth" }), 350);
+});
+window.visualViewport && window.visualViewport.addEventListener("resize", () => {
+  const f = document.activeElement;
+  if (PHONE.matches && f && f.matches && f.matches("input, textarea")) f.scrollIntoView({ block: "center" });
+});
 
 function liveText(el, fn) {
   live.push({ el, fn });
@@ -184,6 +196,9 @@ function liveMeter(fn) {
   return el;
 }
 
+/** Phone only (css hides it elsewhere): opens the rooms drawer. */
+const drawerBtn = () => h("button", { class: "icon-btn drawer-btn", type: "button", id: "btn-drawer", title: t("ui.sidebar.open_rooms"), "aria-label": t("ui.sidebar.open_rooms"), onclick: () => { S.drawer = !S.drawer; render(); } }, ic("menu"));
+
 function roomStatusTitle(r) {
   return { joined: t("ui.sidebar.status_connected"), reconnecting: t("ui.sidebar.status_reconnecting"), connecting: t("ui.room.connecting"), disconnected: t("ui.sidebar.status_disconnected") }[r.state];
 }
@@ -207,6 +222,8 @@ function renderSide() {
       onclick: () => select(r),
       // Right click: this room's Room settings menu at the pointer, whichever room is open.
       oncontextmenu: (e) => { e.preventDefault(); openMenu("room", e.currentTarget, { roomId: r.id, pos: { x: e.clientX, y: e.clientY } }); },
+      // Touch: a long press does the same (Android also sends contextmenu itself, iOS never does).
+      onpointerdown: (e) => { const el = e.currentTarget; longPress(e, (pos) => openMenu("room", el, { roomId: r.id, pos })); },
     }));
     if (!joined) continue;
     if (mine) {
@@ -229,7 +246,7 @@ function renderSide() {
     V({ cls: "p-side-scroll", g: 2 },
       V({ cls: "well", g: 0 },
         roomRow({ lead: ic("grid_view", "ico"), name: t("ui.sidebar.watched_streams"), me: false, num: watches.length, unit: ic("visibility", "unit-ico"), sel: S.view === "watching",
-          title: t("ui.sidebar.watched_streams_tip"), onclick: () => { S.view = "watching"; render(); } })),
+          title: t("ui.sidebar.watched_streams_tip"), onclick: () => { S.view = "watching"; S.drawer = false; render(); } })),
       H({ g: 2, style: "margin-top:var(--s1)" }, h("h2", { class: "section-label" }, t("ui.sidebar.rooms"), h("span", { class: "count", text: String(S.rooms.length) })), h("span", { class: "rule" })),
       S.rooms.length ? V({ cls: "well", g: 0, attrs: { role: "list" } }, rows) : h("div", { class: "side-empty", text: t("ui.sidebar.no_rooms") }),
       H({ g: 0 }, FILL(h("button", { class: "btn btn-ghost wide", type: "button", id: "btn-create-join", onclick: () => openAdd() }, ic("add"), t("ui.sidebar.create_or_join"))))),
@@ -241,6 +258,7 @@ function renderSide() {
 }
 
 function select(r, rerender = true) {
+  S.drawer = false;
   S.view = "room";
   S.selected = r.id;
   S.menu = null;
@@ -261,7 +279,9 @@ function flash(key) {
 
 function capsBanner() {
   if (caps.canWatch) return null;
-  return banner("block", t("ui.err.browser_unsupported"), null, { error: true });
+  // Say what is missing (a blank or half-working page is worse): the three things canWatch needs.
+  const list = [!caps.webTransport && "WebTransport", !caps.webCodecsDecode && "WebCodecs", !caps.secureContext && "https"].filter(Boolean).join(", ");
+  return banner("block", t("ui.err.browser_unsupported") + " " + t("ui.err.missing", { list }), null, { error: true });
 }
 
 /** The stage region: the stage itself, or a note with "Bring it back" while it is open in its own window. */
@@ -274,12 +294,12 @@ function renderMain(sv) {
   const cbRow = cb ? H({ cls: "p-banner", g: 0 }, FILL(cb)) : null;
   if (S.view === "watching") {
     return V({ tag: "main", cls: "eq", g: 0 },
-      H({ tag: "header", cls: "band top p-head", g: 2 }, h("h2", { text: t("ui.sidebar.watched_streams") }), T(t("ui.sidebar.watched_streams_tip"), "meta")), cbRow, stageRegion(sv));
+      H({ tag: "header", cls: "band top p-head", g: 2 }, drawerBtn(), h("h2", { text: t("ui.sidebar.watched_streams") }), T(t("ui.sidebar.watched_streams_tip"), "meta")), cbRow, stageRegion(sv));
   }
   const r = sel();
   if (!r) {
     return V({ tag: "main", cls: "eq", g: 0 },
-      H({ tag: "header", cls: "band top p-head", g: 2 }, h("h2", { text: t("app.title") })),
+      H({ tag: "header", cls: "band top p-head", g: 2 }, drawerBtn(), h("h2", { text: t("app.title") })),
       H({ cls: "eq st minh0", g: 0 },
         V({ cls: "p-center eq", g: 4 }, cb,
           emptyState("meeting_room", t("ui.home.title"), t("ui.home.text"),
@@ -316,7 +336,7 @@ function renderHead(r) {
       : r.state === "connecting" ? h("span", { class: "badge badge-progress" }, h("span", { class: "bar" }), t("ui.room.connecting"))
         : h("span", { class: "badge badge-muted" }, t("ui.sidebar.status_disconnected"));
   const nSharing = r.videoStreams().length + (capInRoom(r.id) ? 1 : 0) + (webcamInRoom(r.id) ? 1 : 0);
-  return H({ tag: "header", cls: "band top p-head", g: 2 },
+  return H({ tag: "header", cls: "band top p-head", g: 2 }, drawerBtn(),
     H({ g: 3, cls: "eq" }, h("h2", { text: r.name, title: r.name }), status,
       r.members.length ? T(t("ui.room.meta", { people: r.members.length, sharing: nSharing }), "meta") : null),
     r.state === "joined" ? null
