@@ -24,6 +24,16 @@ real outputs or input: no windows, no `hyprctl dispatch`/`mmsg`, no `ydotool`, n
 environment, no real portal picker. Never touch the user's real outputs (Hyprland: DP-1, DP-2,
 DP-3, HDMI-A-1). The GUI lock is not needed (the rig shares nothing visible with anyone).
 
+**Always headless sway, never Hyprland (user rule, 2026-11-05).** No Hyprland instance of any kind in a test: not headless,
+not nested, no `xdg-desktop-portal-hyprland`. The user: "ALWAYS headless sway. Never hyprland".
+
+**The rig does not isolate the GPU (2026-11-05, row 148).** It shares the host's real amdgpu. A rig client's VA encoder under a
+window-resize stress in sway (random sizes down to about 60x36, several per second) caused VCN page faults, `ring vcn_unified_1
+timeout`, a failed ring reset and a full `GPU mode1 reset` with `VRAM is lost`, which aborted the user's Hyprland, kitty, Floorp and
+gamescope. So **no resize stress or rapid encoder restarts on a VA encoder on this machine** unless the user okays that run; use
+software encoding (x264, `CaptureDomain::System`) for that logic. At the first `mmhub page fault` or `vcn_unified` line in
+`journalctl -k`, stop the run and report; do not continue.
+
 What does **not** count as verification of app behaviour:
 
 - **`--gallery`** (`simple-screensharing-client --gallery`, `client/src/widgets/gallery.rs`).
