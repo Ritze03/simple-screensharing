@@ -624,3 +624,7 @@ select.field { cursor: pointer; padding-right: 6px; }
   .ctlrow { height: 56px; flex-basis: 56px; padding-top: 0; padding-bottom: 0; }
   .arena { margin-top: var(--s1); }
 }
+
+/* Settings > Connection (task 146): the drop log, selectable monospace text */
+.connlog { margin: 0; padding: 8px 10px; max-height: 260px; overflow: auto; white-space: pre-wrap; word-break: break-word; user-select: text; -webkit-user-select: text;
+  font: 11.5px/1.45 ui-monospace, monospace; color: var(--text-dim, var(--text)); background: var(--surface-2, rgba(127,127,127,.12)); border-radius: 8px; }

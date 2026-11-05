@@ -104,6 +104,39 @@ Watch and share both work. Differences from native, all platform limits:
   control stream first and `connect()` rejects with `JoinRejectedError`. The UI shows "This room is
   full (8 people at most)".
 
+## Phone dropouts: what can end a watch, the connection log, and the relay's control-frame bug (row 146, 2026-11-05)
+
+*Why:* the user on an iPhone 15 Pro Max (Chrome = WebKit) watching 1080p 60 (AV1 and H.264) over Wi-Fi: "frequent dropouts, there is the disconnect sound, then it says 'Waiting for first frame' for a quick time, then it connects again", every few seconds; a friend on Windows + Chrome has it far less often. There is no console on a phone, so the first job was to find which layer drops.
+
+**What a "disconnect sound" and a "Waiting for the first frame" tile can only be** (read from `ui/sounds.js` `RoomSounds`, `ui/rooms.js`, `core/room-client.js`, then driven in a real Chromium viewer, `e2e/dropui.mjs`):
+
+- The "stop" sound (low falling triangle pair) plays only when *another member's stream key vanishes from the room while this page is `joined`*. A viewer's own relay-session loss and reconnect plays nothing here (the snapshot a reconnect delivers arrives in state `reconnecting`, and the room is quiet for 15 s after: `RESUME_QUIET_MS`). The "leave" sound (the same notes, sine, higher) plays for *the sharer* when a viewer of its stream goes away.
+- "Waiting for the first frame" (`stage.js:95`) shows only on a *fresh* watch object (`!w.firstFrame`). A relay-session reconnect keeps the watch object (the core re-subscribes), so it never shows that tile; a `watch-ended` plus resume does.
+- No viewer-side logic ends a watch: the core ends one only on `StreamStopped` / `MemberLeft` / a stream missing from the post-reconnect snapshot. Loss, a slow decoder, `need-keyframe` (Unsubscribe + Subscribe), the jitter buffer and NACK never remove a stream (`#streamGone` is the only way).
+
+**Measured on this machine** (native sharer in the headless rig, 1080p 60, relay of this branch, headless Chromium 153 viewer; the viewer joined through a UDP proxy that shaped relay -> viewer):
+
+| run | duration | result |
+| --- | --- | --- |
+| H.264 60, direct | 600 s | 0 session closes, 0 stream losses, 0 sounds, 59.4-59.9 decoded fps |
+| H.264 60, 20 Mbit/s, 60 ms queue | 300 s | same, 0 events |
+| H.264 60, 10 Mbit/s + 0.3 % loss | 90 s | 0 events |
+| H.264 60, 3 % loss + 20 ms | 90 s | 0 events (many `need-keyframe`, all recovered in place) |
+| AV1 60, 3 % loss + 20 ms | 120 s | 0 events |
+| H.264 60, 30 s total blackhole | 80 s | session closes ("control stream ended"), reconnects after about 10 s, watch survives, **no sound**, no waiting tile |
+
+So with Chromium a viewer that is merely slow or lossy never drops, and a viewer whose session really closes does not hear a sound and does not see the waiting tile. The symptom therefore needs either a sharer whose session or stream ends (the sound and the new watch are then the *viewers'* experience), or the iPhone's session closing and the sound being the sharer's "leave".
+
+**The bug found, measured with a test that failed before the fix: the relay ends a connection when a control frame arrives in pieces and a datagram arrives between them.** `server/src/relay.rs` `connection_loop` raced `read_control_frame` (two `read_exact` calls) against `connection.read_datagram()` and `accept_uni()` in one `select!`. `read_exact` is not cancel-safe: when the datagram branch wins while a frame is only partly in (its 4-byte length prefix, or a payload split over two packets), the bytes already taken are dropped, the next read starts mid-frame, reads a garbage length or payload, `bail!`s ("control frame length N exceeds cap", "decoding control frame", "control stream closed mid-frame"), and the relay drops that member: `MemberLeft`, its streams stopped. The member's session shows as closed (browser: `control stream ended`), and a native client's too. Test `relay::tests::split_control_frame_survives_a_datagram_in_between` (cut inside the length prefix and inside the payload, a datagram after each cut) failed with `send datagram: ConnectionLost(ApplicationClosed(ApplicationClose { error_code: 0, reason: b"" }))` and passes with `ControlReader` (a persistent buffer filled by the cancel-safe `RecvStream::read`). Datagrams are what makes it likely in the field: a sharer sends media datagrams all the time, a viewer sends NACK requests and Hello/Avatar datagrams exactly while it is losing packets, which is also when it sends Unsubscribe + Subscribe.
+*What stays inference:* nothing here proves a real iPhone, or a real Chromium, splits a control frame. Chromium never did in the runs above (every `connection ended` line in the relay log of these runs is an expected close). That WebKit's QUIC stack cuts a small stream write at a packet boundary, or sends it as two STREAM frames, is the open point: a Windows Chrome that splits rarely and an iPhone that splits often would explain "far less frequent", but it is a hypothesis. **A relay deployment is needed for this fix** (website-only changes cannot stop the relay from losing bytes).
+Production check that settles it, from the relay's `relay.log` (INFO level, no change needed): `connection ended` lines whose `error=` contains `exceeds cap`, `decoding control frame` or `closed mid-frame`, around the times of a drop. None of those = this is not the cause.
+
+**Evidence the next test produces: Settings > Connection** (`ui/app.js` `connLog`, `store.js` `dropLog`, `rooms.js`). Every line that explains a drop is kept in memory for the page's life (80 lines, a repeated line is counted `xN`) and shown as selectable text with a Copy button, on a phone too (a fourth tab, "Connection" / "Verbindung"):
+- `connection to the relay lost: <reason> (close code N)`: the close code and text the browser reports (the control stream's end now waits up to 150 ms for `wt.closed`, `session.js`, so the code is not lost to a race), `retry N failed: <why>`, `back after X s`;
+- `<name>'s video "<label>" is gone: they stopped it | their session on the relay ended | not there any more after our reconnect` (+ `(we were watching it)`): the new core event `stream-gone` (`cause`, also on `watch-ended`);
+- `<name>'s <label>: need-keyframe (loss|waiting|decoder-error|overload)` and `decoder-error (<message>)`: the viewer-side recoveries.
+Reading it: "their session on the relay ended" or "they stopped it" on every viewer = the sharer side (A); `connection to the relay lost` with a close code = the viewer's session (B, and the relay bug above if the relay log has the lines); only `need-keyframe` / `decoder-error` lines and no loss = the decoder (C). `e2e/conn-log.mjs <relay> <hash>` checks all of it against a real relay.
+
 ## The website on a phone (row 145, 2026-11-05)
 
 *Why:* the user asked "Can you also make sure that the website works on smartphones as well?". Before this the page had a fixed `#app { min-width: 800px }`, no width `@media`, hover-only tile buttons, right click as the only way to a room's menu, and the stage could not be reached by touch.

@@ -363,7 +363,7 @@ export class RoomClient extends EventTarget {
     // restart from the next keyframe: datagrams were lost meanwhile), and forget the ones that are gone.
     for (const [key, reasons] of [...this.subRefs]) {
       if (!this.streams.has(key)) {
-        this.#streamGone(key, before.get(key));
+        this.#streamGone(key, before.get(key), "gone-after-reconnect");
       } else if (reasons.size) {
         const rx = this.subs.get(key);
         if (rx) rx.enqueue({ type: "loss" });
@@ -396,11 +396,11 @@ export class RoomClient extends EventTarget {
     if (!this.autoReconnect) {
       this.members.clear();
       this.streams.clear();
-      this.#setState("closed", { reason });
+      this.#setState("closed", { reason, closeCode: info && info.closeCode });
       emitError(this, "connection-lost", new Error(`Connection to the relay lost: ${reason}`), { fatal: true });
       return;
     }
-    this.#setState("reconnecting", { reason });
+    this.#setState("reconnecting", { reason, closeCode: info && info.closeCode });
     this.#scheduleReconnect();
   }
 
@@ -540,7 +540,7 @@ export class RoomClient extends EventTarget {
           this.#emitRoster();
         } else if (e.type === "MemberLeft") {
           const id = connIdToHex(e.connId);
-          for (const [key, s] of [...this.streams]) if (s.owner === id) this.#streamGone(key);
+          for (const [key, s] of [...this.streams]) if (s.owner === id) this.#streamGone(key, null, "member-left");
           this.members.delete(id);
           this.avatars.delete(id);
           this.#emitRoster();
@@ -555,7 +555,7 @@ export class RoomClient extends EventTarget {
           this.#reconcileFollowers();
         } else if (e.type === "StreamStopped") {
           const owner = connIdToHex(e.connId);
-          this.#streamGone(streamKey(owner, e.streamId));
+          this.#streamGone(streamKey(owner, e.streamId), null, "stream-stopped");
           const m = this.members.get(owner);
           if (m) m.streamCount = [...this.streams.values()].filter((s) => s.owner === owner).length;
           this.#emitRoster();
@@ -585,8 +585,10 @@ export class RoomClient extends EventTarget {
     }
   }
 
-  #streamGone(key, known = null) {
+  /** `cause`: why it is gone, for the UI's connection log: "stream-stopped" (the owner stopped it), "member-left" (the owner's session ended), "gone-after-reconnect". */
+  #streamGone(key, known = null, cause = "stream-stopped") {
     const info = this.streams.get(key) || known;
+    this.dispatchEvent(new CustomEvent("stream-gone", { detail: { key, cause, ownerName: info ? info.ownerName : "", label: info ? info.label : "", kind: info ? info.kind : "video" } }));
     this.streams.delete(key);
     this.previews.delete(key);
     if (this.subRefs.has(key)) {
@@ -598,7 +600,7 @@ export class RoomClient extends EventTarget {
       this.watches.delete(key);
       w.detach();
       this.dispatchEvent(new CustomEvent("watch-ended", {
-        detail: { key, reason: "stream-stopped", stableKey: info ? this.#stableKey(info) : null, ownerName: info ? info.ownerName : "", label: info ? info.label : "", kind: info ? info.kind : "video" },
+        detail: { key, reason: "stream-stopped", cause, stableKey: info ? this.#stableKey(info) : null, ownerName: info ? info.ownerName : "", label: info ? info.label : "", kind: info ? info.kind : "video" },
       }));
     }
     this.#reconcileFollowers();

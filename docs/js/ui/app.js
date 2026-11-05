@@ -648,12 +648,22 @@ function renderWebcamModal(M, close, lgBtn, spacer) {
 
 /** The Settings tab last shown: kept while the page lives, so the modal reopens on it (the native `ModalsState::settings_tab`). */
 let settingsTab = "profile";
+/** Settings > Connection: the lines `dropLog` collected (store.js), as selectable text with a Copy button; a phone has no console, so this is where a drop's reason is read. */
+function connLog() {
+  const fmt = (e) => `${new Date(e.at).toLocaleTimeString([], { hour12: false })} ${e.text}${e.n > 1 ? ` x${e.n}` : ""}`;
+  const text = S.dropLog.map(fmt).join("\n");
+  const copy = h("button", { type: "button", class: "btn btn-secondary", id: "btn-conn-copy", onclick: () => {
+    try { navigator.clipboard.writeText(text).then(() => toast(t("ui.settings.conn_copied"), "content_copy")); } catch {}
+  } }, ic("content_copy"), t("ui.settings.conn_copy"));
+  return [h("pre", { class: "connlog", id: "conn-log", text: text || t("ui.settings.conn_empty") }), H({ g: 2 }, FILL(h("span")), copy)];
+}
+
 function renderSettings(close, lgBtn, spacer) {
   const st = S.settings;
   const M = S.modal;
   const tab = M.tab || "profile";
   // Native has a fourth tab, Diagnostics (log export, relay diagnostics); a browser has neither, so it is not offered here.
-  const tabs = H({ g: 0 }, FILL(seg([["profile", t("ui.settings.profile")], ["interface", t("ui.settings.tab_interface")], ["playback", t("ui.settings.playback")]], tab,
+  const tabs = H({ g: 0 }, FILL(seg([["profile", t("ui.settings.profile")], ["interface", t("ui.settings.tab_interface")], ["playback", t("ui.settings.playback")], ["connection", t("ui.settings.tab_connection")]], tab,
     (v) => { M.tab = settingsTab = v; render(); })));
   const nameIn = h("input", { class: "field", id: "set-name", value: st.name, placeholder: autoName(), maxlength: "64", "aria-label": t("join.display_name_label") });
   nameIn.addEventListener("input", () => { st.name = nameIn.value; if (st.name.trim()) st.nameSet = true; persistSettings(); });
@@ -670,6 +680,7 @@ function renderSettings(close, lgBtn, spacer) {
     tab === "playback" && card(t("ui.settings.playback"), null,
       sliderRow(t("ui.settings.jitter"), "set-jitter", 0, 5000, 100, () => st.jitter, (v) => { st.jitter = v; }, (v) => (v / 1000).toFixed(1) + " s", t("ui.settings.jitter_tip"), commit),
       sliderRow(t("ui.settings.catchup"), "set-catchup", 5, 10, 1, () => st.catchup, (v) => { st.catchup = v; }, (v) => v + "%", t("ui.settings.catchup_tip"), commit)),
+    tab === "connection" && card(t("ui.settings.tab_connection"), null, h("span", { class: "hint", text: t("ui.settings.conn_note") }), connLog()),
     // Notification sounds (I9): one volume, separate from every stream's, applied live while dragged; a Test button per sound.
     tab === "interface" && card(t("ui.settings.sounds_card"), null,
       sliderRow(t("ui.settings.sound_volume"), "set-sound-vol", 0, 100, 5, () => st.soundVol, (v) => { st.soundVol = v; }, (v) => v + "%", t("ui.settings.sound_volume_tip"), persistSettings),

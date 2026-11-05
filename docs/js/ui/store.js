@@ -153,6 +153,7 @@ export const S = {
   modal: null,
   popup: null,
   toasts: [],
+  dropLog: [], // Settings > Connection: what ended or restarted a watch or the room connection, newest last (`dropLog()` below)
   flash: null,
   menu: null, // the open dropdown / context menu (menus.js): { kind, mk, ... }
   // The stage (stage.js). Layout geometry per view (order, sizes, spots) lives there, UI-private and per session like native `StageState`. These are
@@ -187,6 +188,15 @@ export function invalidate() {
   };
   requestAnimationFrame(run);
   setTimeout(run, 100);
+}
+
+/** One line of the connection log (Settings > Connection): `kind` is "lost" | "back" | "stream" | "recover". The user has no console on a phone, so every
+ *  drop of a watch writes its reason here. Kept in memory for the page's life, newest last, at most 80 lines. */
+export function dropLog(kind, text) {
+  const last = S.dropLog[S.dropLog.length - 1];
+  if (last && last.kind === kind && last.text === text) { last.n++; last.at = Date.now(); return; } // the same line again: counted, not repeated
+  S.dropLog.push({ at: Date.now(), kind, text, n: 1 });
+  if (S.dropLog.length > 80) S.dropLog.splice(0, S.dropLog.length - 80);
 }
 
 export function toast(text, icon = "check_circle", { err = false } = {}) {

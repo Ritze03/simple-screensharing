@@ -504,6 +504,46 @@ async fn read_control_frame(recv: &mut RecvStream) -> Result<Option<ClientToRela
     Ok(Some(msg))
 }
 
+/// Reads control frames for the steady-state loop, where the read is raced against datagrams and uni
+/// streams in a `select!` (task 146). `read_control_frame` must not be used there: `read_exact` is not
+/// cancel-safe, so a datagram arriving while a frame is only partly in (its length prefix, or a payload
+/// split over packets, which is how a client's stack may send it) dropped the bytes already taken, the
+/// next read started in the middle of a frame, and the relay ended the connection: that viewer's session
+/// closed and it reconnected. Here the bytes live in `buf`, and `RecvStream::read` is cancel-safe.
+struct ControlReader {
+    buf: Vec<u8>,
+}
+
+impl ControlReader {
+    fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    /// Cancel-safe: dropping the future between polls loses nothing. `Ok(None)` is a clean close with no frame in flight.
+    async fn next(&mut self, recv: &mut RecvStream) -> Result<Option<ClientToRelay>> {
+        loop {
+            if let Some(head) = self.buf.first_chunk::<4>() {
+                let len = u32::from_be_bytes(*head);
+                if len > MAX_CONTROL_FRAME_LEN {
+                    bail!("control frame length {len} exceeds cap {MAX_CONTROL_FRAME_LEN}");
+                }
+                let total = 4 + len as usize;
+                if self.buf.len() >= total {
+                    let msg = decode_payload(&self.buf[4..total]).context("decoding control frame");
+                    self.buf.drain(..total);
+                    return Ok(Some(msg?));
+                }
+            }
+            let mut chunk = [0u8; 2048];
+            match recv.read(&mut chunk).await.context("reading the control stream")? {
+                Some(n) => self.buf.extend_from_slice(&chunk[..n]),
+                None if self.buf.is_empty() => return Ok(None),
+                None => bail!("control stream closed mid-frame"),
+            }
+        }
+    }
+}
+
 /// Write one length-prefixed control frame directly (used only for the
 /// pre-registration handshake, where there's no writer task/channel yet).
 async fn write_control_frame(send: &mut SendStream, msg: &RelayToClient) -> Result<()> {
@@ -906,13 +946,14 @@ async fn connection_loop(
     route_tx: &mpsc::UnboundedSender<RouteUpdate>,
 ) -> Result<()> {
     let mut dropped_datagrams: u64 = 0;
+    let mut control = ControlReader::new();
     // Diagnostics upload (spec §6.7): accepted only from a connection that said DiagHello, one
     // stream at a time.
     let mut diag_hello = false;
     let diag_busy = Arc::new(AtomicBool::new(false));
     loop {
         tokio::select! {
-            frame = read_control_frame(ctrl_recv) => {
+            frame = control.next(ctrl_recv) => {
                 match frame? {
                     Some(ClientToRelay::Leave) => {
                         tracing::debug!(conn_id = format!("{conn_id:016x}"), "explicit Leave");
@@ -2224,6 +2265,47 @@ pub(crate) mod tests {
         let guard = room.lock().await;
         assert_eq!(guard.streams.len(), 1);
         assert_eq!(guard.connections.len(), 1);
+    }
+
+    /// A control frame that arrives in pieces, with a datagram landing between the pieces, must still be
+    /// read as one frame (task 146). `connection_loop` selects between the control stream and the
+    /// datagram reader; a non-cancel-safe frame read (`read_exact`) loses the bytes it already took when the
+    /// datagram branch wins, the next read starts in the middle of a frame, and the relay ends that
+    /// connection: the viewer's session drops and it reconnects.
+    #[tokio::test]
+    async fn split_control_frame_survives_a_datagram_in_between() {
+        const SHARER: ConnId = 0xC000_0000_0000_0001;
+        let registry = Arc::new(Registry::new((Ipv4Addr::LOCALHOST, 0).into()));
+        let server_endpoint = build_endpoint((IpAddr::V4(Ipv4Addr::LOCALHOST), 0).into()).expect("bind server endpoint");
+        let local_addr = server_endpoint.local_addr().expect("local addr");
+        tokio::spawn(serve(registry.clone(), server_endpoint));
+        let client_endpoint = insecure_client_endpoint();
+        let room_id: RoomId = [7u8; 16];
+        let (conn, mut send, mut recv) = connect_and_join(&client_endpoint, local_addr, SHARER, room_id).await;
+        assert!(matches!(recv_ctrl(&mut recv).await, RelayToClient::PresenceSnapshot { .. }));
+        let framed = encode_frame(&ClientToRelay::AnnounceStream {
+            stream_id: 0,
+            kind: StreamKind::Video,
+            label: "Monitor 1".into(),
+            width: 1920,
+            height: 1080,
+        })
+        .expect("encode announce");
+        // Cuts inside the 4-byte length prefix, then inside the payload; a datagram after each cut.
+        let cuts = [2, 6];
+        let mut from = 0;
+        for cut in cuts {
+            send.write_all(&framed[from..cut]).await.expect("write part");
+            from = cut;
+            tokio::time::sleep(Duration::from_millis(60)).await; // the part reaches the relay as its own packet
+            conn.send_datagram(Bytes::from_static(&[0x7f; 4])).expect("send datagram");
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+        send.write_all(&framed[from..]).await.expect("write rest");
+        await_room_state(&registry, room_id, "the split announce was read as one frame", |r| {
+            r.streams.contains_key(&(SHARER, 0)) && r.connections.contains_key(&SHARER)
+        })
+        .await;
     }
 
     /// Connect a native test client and send one `Join`.

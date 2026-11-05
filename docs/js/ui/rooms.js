@@ -2,7 +2,7 @@
 // previews and the streams we watch there. Turns core events into UI state and asks for a re-render.
 
 import { RoomClient, parseJoinLink, formatJoinLink, stripLinkName, isWebcamLabel, ConnectError, JoinRejectedError, JoinLinkError } from "../core/index.js";
-import { S, invalidate, toast, persistRooms, displayName } from "./store.js";
+import { S, invalidate, toast, persistRooms, displayName, dropLog } from "./store.js";
 import { t, DICT } from "./i18n.js";
 import { onShareEvent, onShareStats, stopDestsInRoom } from "./capture.js";
 import { closePopout, rebind } from "./popout.js";
@@ -150,8 +150,16 @@ function wire(r, client) {
   const on = (type, fn) => client.addEventListener(type, (e) => r.client === client && fn(e.detail));
   on("state", (d) => {
     const map = { connecting: "connecting", connected: "joined", reconnecting: "reconnecting", closed: "disconnected", idle: "disconnected" };
+    const was = r.state;
     r.state = map[d.state] || r.state;
     r.attempt = d.attempt || 0;
+    // Connection log: the reason the relay session ended (a close code and text from the browser, or why a retry failed), and how long it took to be back.
+    if (d.state === "reconnecting" && was === "joined") {
+      r.lostAt = Date.now();
+      dropLog("lost", `${r.name}: connection to the relay lost: ${d.reason || "no reason given"}${d.closeCode ? ` (close code ${d.closeCode})` : ""}`);
+    } else if (d.state === "reconnecting" && d.attempt > 1) dropLog("lost", `${r.name}: retry ${d.attempt - 1} failed: ${d.reason || "no reason given"}`);
+    else if (d.state === "closed") dropLog("lost", `${r.name}: closed: ${d.reason || "no reason given"}`);
+    if (d.state === "connected" && d.reconnected) dropLog("back", `${r.name}: back after ${r.lostAt ? ((Date.now() - r.lostAt) / 1000).toFixed(1) : "?"} s`);
     if (d.state === "connected") {
       r.issue = null;
       resumeWatches(r);
@@ -177,6 +185,11 @@ function wire(r, client) {
     }
     resumeWatches(r);
     invalidate();
+  });
+  on("stream-gone", (d) => {
+    const who = d.ownerName || "someone";
+    const why = d.cause === "member-left" ? "their session on the relay ended" : d.cause === "gone-after-reconnect" ? "not there any more after our reconnect" : "they stopped it";
+    dropLog("stream", `${r.name}: ${who}'s ${d.kind} "${d.label}" is gone: ${why}${r.watches.has(d.key) ? " (we were watching it)" : ""}`);
   });
   on("preview", (d) => {
     const old = r.previews.get(d.key);
@@ -218,6 +231,7 @@ function wire(r, client) {
   on("media", (d) => {
     const w = r.watches.get(d.key);
     if (!w) return;
+    if (d.type === "need-keyframe" || d.type === "decoder-error") dropLog("recover", `${r.name}: ${w.ownerName}'s ${w.label}: ${d.type} (${d.reason || d.message || "?"})`);
     applyMediaEvent(w, d, (codec) => t("ui.tile.unsupported", { codec }));
     invalidate();
   });

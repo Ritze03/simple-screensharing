@@ -305,6 +305,8 @@ export class RelaySession {
     } catch (e) {
       // surfaced through wt.closed
     }
+    // The stream ends a moment before `wt.closed` settles: wait for it, so the close code and text (the reason a drop is shown with) are not lost.
+    if (!this.closeInfo) await Promise.race([this.wt.closed.catch(() => null), new Promise((r) => setTimeout(r, 150))]);
     this.#closed(this.closeInfo || { reason: "control stream ended" });
   }
 
