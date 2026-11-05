@@ -11,7 +11,7 @@
 // Narrow windows degrade by CSS container queries on the stage: the Copy-invite label goes first, then the bar takes two rows.
 
 import { capabilities } from "../core/index.js";
-import { S, persistSettings } from "./store.js";
+import { S, PHONE, persistSettings } from "./store.js";
 import { applyLevelLoudness } from "./rooms.js";
 import { t } from "./i18n.js";
 import { h, ic } from "./dom.js";
@@ -112,7 +112,7 @@ export function renderBar(view, host, { fullscreen = false } = {}) {
 
   const side = host === "main" && !fullscreen
     ? h("button", { type: "button", class: "cb dim", id: "btn-sidebar", title: S.stage.sidebarHidden ? t("ui.bar.show_sidebar") : t("ui.bar.hide_sidebar"), "aria-label": S.stage.sidebarHidden ? t("ui.bar.show_sidebar") : t("ui.bar.hide_sidebar"),
-      onclick: () => { S.stage.sidebarHidden = !S.stage.sidebarHidden; A.render(); } }, ic(S.stage.sidebarHidden ? "left_panel_open" : "left_panel_close"))
+      onclick: () => { if (PHONE.matches) S.drawer = true; else S.stage.sidebarHidden = !S.stage.sidebarHidden; A.render(); } }, ic(S.stage.sidebarHidden ? "left_panel_open" : "left_panel_close"))
     : null;
   const invite = !r ? null : h("button", { type: "button", class: "cb dim", id: "btn-invite", title: t("ui.room.copy_invite_tip"), onclick: () => A.copyLink(r) }, ic("person_add"), h("span", { class: "lbl2", text: t("ui.room.copy_invite") }));
   const leave = !r ? null : h("button", { type: "button", class: "cb leave", id: "btn-leave", title: t("ui.bar.leave_room", { room: r.name }), "aria-label": t("ui.bar.leave_room", { room: r.name }), onclick: () => A.leaveRoom(r) }, ic("call_end"));
@@ -123,7 +123,10 @@ export function renderBar(view, host, { fullscreen = false } = {}) {
   const fs = host === "main"
     ? h("button", { type: "button", class: "cb dim", id: "btn-stagefs", title: S.stage.fullscreen ? t("ui.stage.exit_fullscreen") : t("ui.stage.fullscreen"), "aria-label": S.stage.fullscreen ? t("ui.stage.exit_fullscreen") : t("ui.stage.fullscreen"), onclick: () => A.toggleStageFullscreen() }, ic(S.stage.fullscreen ? "fullscreen_exit" : "fullscreen"))
     : null;
-  const g1 = [shareBtn, audioBtn, camBtn].filter(Boolean);
+  // No getDisplayMedia (every phone browser): the two split buttons would only be dead weight in a narrow bar, so one dimmed button says why on tap.
+  const noScreen = caps.canWatch && !caps.getDisplayMedia && !!shareRoom;
+  const noScreenBtn = !noScreen ? null : h("button", { type: "button", class: "cb dim", id: "btn-noscreen", title: t("ui.err.no_screen_share"), "aria-label": t("ui.err.no_screen_share"), onclick: () => toast(t("ui.err.no_screen_share"), "screen_share", { err: true }) }, ic("screen_share"));
+  const g1 = [noScreen ? noScreenBtn : shareBtn, noScreen ? null : audioBtn, camBtn].filter(Boolean);
   return h("div", { class: "ctlrow" },
     h("div", { class: "side" }, side, invite),
     h("div", { class: "mid" }, g1.length ? h("div", { class: "cgroup" }, g1) : null, h("div", { class: "cgroup" }, layoutBtn, roomBtn, levelBtn, peopleBtn), leave),

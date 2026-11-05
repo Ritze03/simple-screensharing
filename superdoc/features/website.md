@@ -104,6 +104,45 @@ Watch and share both work. Differences from native, all platform limits:
   control stream first and `connect()` rejects with `JoinRejectedError`. The UI shows "This room is
   full (8 people at most)".
 
+## The website on a phone (row 145, 2026-11-05)
+
+*Why:* the user asked "Can you also make sure that the website works on smartphones as well?". Before this the page had a fixed `#app { min-width: 800px }`, no width `@media`, hover-only tile buttons, right click as the only way to a room's menu, and the stage could not be reached by touch.
+
+**One breakpoint**, `(max-width: 760px), (max-height: 500px) and (pointer: coarse)` = narrow (portrait) or short + touch (landscape). It is written twice, in `css/app.css` (the last block, "phones") and in `store.js` `PHONE_Q` / `PHONE` (`matchMedia`, for what CSS cannot decide); change both. Desktop rules are untouched (`stage.mjs` 227/227 and `tests.html` 124/124 as before). `ponytail:` no tablet tier: a tablet gets the desktop layout when wider than 760 px.
+
+| area | on a phone |
+| --- | --- |
+| rooms list | a drawer over the stage (`.p-side` fixed, `S.drawer`); the menu button in every header band opens it (`#btn-drawer`), the bar's sidebar button does in landscape (`#btn-sidebar`); closed by picking a room or Watched, by a tap on the scrim or by opening any dialog |
+| landscape | the header band is hidden where a stage has its own bar (`main:has(.stg)`), strip avatars 32 px, bar 56 px |
+| room menu | **long-press** on a sidebar room (500 ms, `dom.js` `longPress`: iOS Safari never sends `contextmenu`; Android does and opens the same menu); the press swallows its own click; `-webkit-touch-callout: none` on the rows |
+| tiles | the name tag and the three buttons (pop-out, fullscreen, `⋯` stream menu) are always shown (`hover: none`), 40 px; the pop-out button is dropped when it would only be the fullscreen button again (no Document PiP) |
+| people strip | a tap opens the hover card, a tap elsewhere closes it (`stage.js` touch `pointerdown`); the viewers chip too |
+| fullscreen | a tap shows the auto-hidden chrome (the document `pointerdown` already fed `chromeSync`); where `requestFullscreen` is missing (iPhone Safari) the stage-only layout stays as a pseudo fullscreen and the bar's button leaves it; the tile's own fullscreen button is hidden without `document.fullscreenEnabled` |
+| layouts | Split and Crop only: **Floating is hidden** (not offered, a saved `float` shows as Split: `layoutOf`), and so are the resize bars and window handles (a 3 px bar under a finger is a mis-drag; nothing scrolls in the stage). Reset layout stays |
+| bar | wraps by the existing container query; buttons 44 x 40, arrows 30 wide |
+| menus, dialogs | menus 44 px rows and scroll within the viewport; dialogs `calc(100% - 16px)` wide, their body scrolls, foot wraps, `100dvh`; fields 16 px (iOS would zoom), a focused field scrolls into view (`focusin` + `visualViewport` resize; `interactive-widget=resizes-content` in the viewport meta, `viewport-fit=cover` + `env(safe-area-inset-*)`) |
+| sharing | where `getDisplayMedia` is missing, Share screen and Share audio are replaced by one dimmed button that says why on tap (`ui.err.no_screen_share`); Webcam stays when `getUserMedia` works; the Document PiP buttons are hidden where unsupported (already so) |
+| unsupported browser | the banner now names what is missing (`WebTransport`, `WebCodecs`, `https`) next to the old text |
+
+**Stream size after a sender's resize** (row 141): checked, nothing to fix. The tile aspect uses the decoded canvas (`itemAspect`), and the resolution label / stats use `watchStats().width` = the decoded frame's `displayWidth` (`video-rx.js`), the announced `StreamInfo` size only for a stream that is not being watched.
+
+### Which phones can watch (checked 2026-11-05)
+
+Needs WebTransport with `serverCertificateHashes` (the relay's self-signed certificate is pinned) and WebCodecs `VideoDecoder`, over https.
+
+| browser | watch | share screen | share webcam |
+| --- | --- | --- | --- |
+| Chrome / Edge / Samsung Internet on Android | yes (Chrome for Android lists `serverCertificateHashes` from 157; older ones: no pinning, so only a relay with a CA certificate) | no (`getDisplayMedia` does not exist on Android) | yes (`getUserMedia` + WebCodecs encode + `MediaStreamTrackProcessor`) |
+| Firefox for Android | no (WebCodecs missing in 159 per caniuse) | no | no |
+| Safari on iOS 26.4 or newer (and every iOS browser, they are WebKit) | yes (WebTransport + `serverCertificateHashes` from 26.4, WebCodecs from 26.0) | no (no `getDisplayMedia` on iPhone) | not tried: needs `MediaStreamTrackProcessor`, which WebKit lacks, so the button stays disabled |
+| iOS before 26.4 | no (no certificate pinning; WebCodecs partial) | no | no |
+
+Sources: caniuse "WebTransport serverCertificateHashes" (Chrome Android 157, Firefox Android 159, Safari / iOS Safari 26.4), caniuse "WebCodecs" (iOS Safari full from 26.0, partial 16.4-18.7, Firefox Android none), MDN `WebTransport` (Baseline 2026, newly available since March 2026). The iOS rows rest on caniuse and MDN data, not on a device; the WebKit release notes were not found. Only a real phone can prove them.
+
+### Tests
+
+`docs/dev/e2e/phone.mjs <relay> <hash>`: headless Chromium with phone emulation (`mobile: true`, touch emulation, coarse pointer, no `getDisplayMedia`, no Document PiP) and real `Input.dispatchTouchEvent` only; Alice shares a synthetic screen, the phone joins through the dialog, watches, and the run asserts a really decoded stream (960x540), `scrollWidth <= innerWidth` and nothing sticking out on every screen, 40 px tap targets, every menu and dialog inside the viewport, the long-press room menu, the drawer, tap-open people card, fullscreen chrome by tap, the no-screen button, the unsupported-browser message; at 390x844, 844x390 and 360x640. Screenshots go to `E2E_OUT`. What it cannot show: a real on-screen keyboard, iOS-only behaviour (no `contextmenu`, no element fullscreen, safe-area insets), real GPU decode and thermal behaviour.
+
 ## The stage (task I6, 2026-11-04)
 
 The browser client got the stage of the native client (`superdoc/ui/APP-SHELL.md` "The stage", design approved in the replica

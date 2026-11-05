@@ -12,7 +12,7 @@
 // name-based, because it must outlive the ConnId: `numberIdentical` keeps two same-named owners' same-labelled streams apart.
 
 import { isWebcamLabel, WEBCAM_LABEL } from "../core/index.js";
-import { S, displayName, persistStage } from "./store.js";
+import { S, PHONE, displayName, persistStage } from "./store.js";
 import { roomById, allWatches } from "./rooms.js";
 import { allocated, capInRoom, webcamInRoom, captureName, captureRes } from "./capture.js";
 import { defaultPip } from "./stage-geom.js";
@@ -35,7 +35,8 @@ export const vg = (key) => (VG[key] ??= { order: [], z: [], float: {}, grid: nul
 export const pipPos = (key, camId) => (vg(key).pip[camId] ??= defaultPip());
 /** "Webcam in picture" is on for this view (per view, on until switched off: native `StageSettings::pip`). */
 export const pipOn = (key) => !S.stage.pipOff.has(key);
-export const layoutOf = (key) => S.stage.layouts[key] || "split";
+// ponytail: Floating (drag/resize windows) makes no sense on a phone: it is not offered there and a saved "float" shows as Split.
+export const layoutOf = (key) => (PHONE.matches && S.stage.layouts[key] === "float" ? "split" : S.stage.layouts[key] || "split");
 export const LAYOUTS = [
   ["split", "grid_view", "ui.stage.layout_split", "ui.stage.layout_split_sub"],
   ["crop", "crop", "ui.stage.layout_crop", "ui.stage.layout_crop_sub"],

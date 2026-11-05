@@ -140,7 +140,11 @@ export const saveRoomList = (rooms) => write(K_ROOMS, rooms.map((r) => ({ id: r.
 const initialSettings = loadSettings();
 const stageLayouts = () => Object.fromEntries(Object.entries(initialSettings.stage.views).filter(([, v]) => v.layout !== "split").map(([k, v]) => [k, v.layout]));
 const stagePipOff = () => new Set(Object.entries(initialSettings.stage.views).filter(([, v]) => !v.pip).map(([k]) => k));
+/** A phone-sized screen: narrow (portrait) or short and touch (landscape). The SAME query is in css/app.css `@media`; change both together. ponytail: one breakpoint, no tablet tier. */
+export const PHONE_Q = "(max-width: 760px), (max-height: 500px) and (pointer: coarse)";
+export const PHONE = window.matchMedia(PHONE_Q);
 export const S = {
+  drawer: false, // phone: the rooms list slides over the stage (css `.drawer-open`)
   settings: initialSettings,
   rooms: [], // RoomEntry (rooms.js)
   captures: [], // Capture (capture.js)

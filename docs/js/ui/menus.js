@@ -7,7 +7,7 @@
 // overlays; `mk` pairs it with the element that opened it (`data-mk`), so a second click on that element closes it again.
 
 import { ENCODER_PRESETS } from "../core/index.js";
-import { S, persistSettings, persistStage, persistRooms, toast, displayName, encoderOf, presetOf, GOP_OPTIONS } from "./store.js";
+import { S, PHONE, persistSettings, persistStage, persistRooms, toast, displayName, encoderOf, presetOf, GOP_OPTIONS } from "./store.js";
 import { t } from "./i18n.js";
 import { h, ic, pct, cbx, seg, avatarEl, EMOJI, pickEmoji, snapVolumePct, volumeWheel, VOLUME_MAX_PCT, fmtKbps, meter } from "./dom.js";
 import { roomById, setWatchVolume, setWatchMuted, unwatchStream, watchStream, connectRoom, applyLevelLoudness } from "./rooms.js";
@@ -194,7 +194,7 @@ function layoutMenu() {
   const cur = layoutOf(key);
   return [
     label(t("ui.stage.layout_heading")),
-    ...LAYOUTS.map(([k, icon, name, sub]) => menuItem({ icon, label: t(name), sub: t(sub), on: cur === k, onclick: done(() => setLayout(key, k)) })),
+    ...LAYOUTS.filter(([k]) => !(PHONE.matches && k === "float")).map(([k, icon, name, sub]) => menuItem({ icon, label: t(name), sub: t(sub), on: cur === k, onclick: done(() => setLayout(key, k)) })),
     sep(),
     checkRow(t("ui.stage.pip"), pipOn(key), stay(() => { pipOn(key) ? S.stage.pipOff.add(key) : S.stage.pipOff.delete(key); persistStage(); }), t("ui.stage.pip_tip_menu")),
     checkRow(t("ui.stage.always_names"), S.stage.alwaysNames, stay(() => { S.stage.alwaysNames = !S.stage.alwaysNames; persistStage(); }), t("ui.stage.always_names_tip")),

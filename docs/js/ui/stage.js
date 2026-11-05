@@ -9,9 +9,9 @@
 // tree, so video never restarts. The people strip's hover card and the viewers dropdown are decided by pointer geometry on the
 // document (the replaced elements never get a mouseleave).
 
-import { S, invalidate } from "./store.js";
+import { S, invalidate, PHONE } from "./store.js";
 import { t } from "./i18n.js";
-import { h, ic, T, avatarEl } from "./dom.js";
+import { h, ic, T, avatarEl, lp } from "./dom.js";
 import { A } from "./actions.js";
 import { capabilities } from "../core/index.js";
 import { closePopout, popoutMode } from "./popout.js";
@@ -25,6 +25,8 @@ import { openTileMenu, renderMenu, positionMenu, closeMenu } from "./menus.js";
 import { watchStream, unwatchStream } from "./rooms.js";
 
 const caps = capabilities();
+/** The pop-out button: a real window (Document PiP) anywhere; where it would only be the tile's fullscreen again (no PiP) a phone has the fullscreen button already. */
+const popOutBtn = () => !!popoutMode() && !(PHONE.matches && popoutMode() === "fullscreen");
 export { watchFps, watchKbps, watchRes };
 
 const arenas = new Set(); // every arena built by the last render (main window and the pop-out window)
@@ -115,7 +117,7 @@ function tileEl(it, view, key, arena) {
       it.s.width ? h("span", { text: `${it.s.width}×${it.s.height}` }) : null,
       h("div", { class: "hb g2" },
         h("button", { type: "button", class: "btn btn-primary", "data-watch": it.s.key, disabled: !caps.canWatch || r.state !== "joined" || null, onclick: () => watchStream(r, it.s.key) }, ic("play_arrow"), t("ui.stage.watch_stream")),
-        popoutMode() ? h("button", { type: "button", class: "btn btn-secondary", title: t("ui.room.pop_out_card_tip"), disabled: !caps.canWatch || r.state !== "joined" || null, onclick: () => A.watchAndPop(r, it.s.key) }, ic("open_in_new"), t("ui.room.pop_out")) : null)));
+        popOutBtn() ? h("button", { type: "button", class: "btn btn-secondary", title: t("ui.room.pop_out_card_tip"), disabled: !caps.canWatch || r.state !== "joined" || null, onclick: () => A.watchAndPop(r, it.s.key) }, ic("open_in_new"), t("ui.room.pop_out")) : null)));
   }
 
   // the name tag (top left): audio status icon, name, source; with "Show stats" also the numbers in slots reserved for 9999x9999,
@@ -142,8 +144,8 @@ function tileEl(it, view, key, arena) {
     tools.append(...[h("span", { class: "chip-dark pchip", title: t("ui.room.preview_tip"), text: t("ui.room.preview_chip") }), chip,
       it.cam ? btn("tune", t("ui.room.webcam_settings"), () => A.openModal({ kind: "webcam", room: r.id })) : btn("tune", t("ui.room.stream_settings"), () => A.openStreamModal(it.c.id, r.id))].filter(Boolean));
   } else if (kind === "video") {
-    if (popoutMode()) tools.append(btn("open_in_new", t("ui.room.pop_out_tip"), () => A.doPopOut(r, w)));
-    tools.append(btn("fullscreen", t("ui.stage.fullscreen"), () => A.doFullscreen(r, w)));
+    if (popOutBtn()) tools.append(btn("open_in_new", t("ui.room.pop_out_tip"), () => A.doPopOut(r, w)));
+    if (document.fullscreenEnabled) tools.append(btn("fullscreen", t("ui.stage.fullscreen"), () => A.doFullscreen(r, w))); // iPhone Safari has no element fullscreen
   }
   tools.append(h("button", { type: "button", class: "round-btn", title: t("ui.stage.stream_menu"), "aria-label": t("ui.stage.stream_menu"), "data-mk": "tile:" + it.id, onclick: (e) => openTileMenu(key, it.id, e.currentTarget) }, ic("more_horiz")));
   tile.appendChild(tools);
@@ -395,6 +397,7 @@ export function layoutArena(ar) {
   fitTags(ar);
 }
 
+const TOOLS_RESERVE_PHONE = 156; // the round buttons are 40 px on a phone
 const TOOLS_RESERVE = 119; // 16 px of margins + the three round buttons the hovered tile shows (native `TOOLS_RESERVE` + margins)
 /** The stats in a name tag lose what does not fit, like native `stats_fields`: the resolution first (it changes least), then the bitrate
  *  (the frame rate is the health signal); the slots stay reserved for 9999x9999 / 999 fps / 99.9 Mbps so the pill never jitters. Measured
@@ -408,7 +411,7 @@ function fitTags(ar) {
     const [res, fps, rate] = [slot("res"), slot("fps"), slot("kbps")];
     const base = tag.scrollWidth - res - fps - rate;
     tag.classList.remove("measure");
-    const avail = tile.clientWidth - TOOLS_RESERVE;
+    const avail = tile.clientWidth - (PHONE.matches ? TOOLS_RESERVE_PHONE : TOOLS_RESERVE);
     tag.dataset.fit = base + res + fps + rate <= avail ? "all" : base + fps + rate <= avail ? "nores" : base + fps <= avail ? "fps" : "none";
   }
 }
@@ -604,6 +607,7 @@ export function toggleStageFullscreen() {
   S.stage.fullscreen = true;
   cs = null;
   A.render();
+  if (!root.requestFullscreen) return; // iPhone Safari: no element fullscreen; the stage-only layout is all there is (the bar's button leaves it)
   root.requestFullscreen().catch(() => {
     // no Fullscreen API (or refused): stay in a plain window, the stage-only layout is still there
     S.stage.fullscreen = false;
@@ -640,6 +644,12 @@ export function bindWindow(win, hostId) {
     if (!pipPointerUp(e)) endDrag();
   };
   win.addEventListener("pointerup", up);
+  // Touch has no hover: a tap on a person opens their card (and a tap elsewhere closes it), a tap on the viewers chip opens its list.
+  win.addEventListener("pointerdown", (e) => {
+    if (e.pointerType === "mouse") return;
+    cardPointer(e, host);
+    vpopPointer(e, host);
+  }, true);
   win.addEventListener("pointercancel", up);
   win.addEventListener("pointerdown", () => S.stage.fullscreen && hostId === "main" && chromeSync(true), true);
   win.addEventListener("wheel", () => S.stage.fullscreen && hostId === "main" && chromeSync(true), { passive: true, capture: true });
@@ -653,7 +663,7 @@ export function bindWindow(win, hostId) {
   });
   // A menu closes when anything outside it is clicked; a second click on the control that opened it closes it too (and must not re-open it).
   win.document.addEventListener("click", (e) => {
-    if (!S.menu || S.menu.hostId !== hostId) return;
+    if (!S.menu || S.menu.hostId !== hostId || performance.now() < lp.until) return;
     if (e.target.closest && e.target.closest(".menu")) return;
     const op = e.target.closest && e.target.closest("[data-mk]");
     if (op && op.dataset.mk === S.menu.mk) {
