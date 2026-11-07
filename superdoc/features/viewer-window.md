@@ -3,7 +3,7 @@
 > **Status (2026-10-14).** The viewer is the native egui client. "Pop-out windows" and "A watch's
 > lifecycle" below are current; the short **History** section at the end condenses the removed
 > Electron pop-out window (kept for the *why* behind the rules the egui port copied). Display
-> internals: `superdoc/features/video-pipeline.md` "Native display".
+> internals: `superdoc/features/video/decode-and-display.md` "Native display".
 
 ## Pop-out windows (`client/src/ui/popout.rs`)
 
@@ -17,7 +17,7 @@ stream** (`StreamKey = (RoomHandle, ConnId, StreamId)`), re-declared every frame
 - **Hover chrome** (the former Electron `body:hover` rule, no idle timeout in a window; in fullscreen it auto-hides after 3 s idle, task #124, `ui/APP-SHELL.md`): while the pointer is anywhere in
   the window a vignette, a top row `[statbar][x]` and a bottom audio pill (`[mute][slider 0-500 %, snaps at 100 %][%]`,
   or "No audio shared") appear. Statbar = `[dot][name . room][WxH][decoded/presented fps][bitrate]`
-  in fixed tabular-width fields. A centred chip is always shown while waiting for the first frame, "Recovering…" (viewer recovery, `features/video-pipeline.md`) or "Sharer's capture stalled" (not hover-gated; same wording as the in-app tile). The
+  in fixed tabular-width fields. A centred chip is always shown while waiting for the first frame, "Recovering…" (viewer recovery, `features/video/viewer-recovery.md`) or "Sharer's capture stalled" (not hover-gated; same wording as the in-app tile). The
   chrome data is refreshed by the main window at most 4x a second into a `Shared` struct, and
   volume changes go back through `Shared::pending_volume`: `Why:` the viewport closure must be
   `Send + Sync + 'static` and cannot hold `Cx`, and screens never mutate `AppState` themselves. When
@@ -53,7 +53,7 @@ Full detail in `superdoc/architecture/implementation-notes.md` (tasks #36 and #4
   re-announced are waited for `REWATCH_GRACE` = **60 s**, matching the browser client's resume list.
 - **AV1 is cropped to the announced size (#40).** VCN4 (RX 7900 XTX) encodes 1080p as 1082 lines and
   nothing in the bitstream names the padding; the decoder crops to the size from `StreamInfo`
-  (`StreamDecoder::set_display_size`). Detail: `video-pipeline.md` "Visible size, not coded size".
+  (`StreamDecoder::set_display_size`). Detail: `video/decode-and-display.md` "Visible size, not coded size".
 
 
 ## History: the Electron pop-out window (removed)

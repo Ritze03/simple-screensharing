@@ -3,7 +3,7 @@
 Task #86, 2026-11-02. Code: `server/src/transport.rs` (`TransportTuning`, relay side),
 `client/src/net.rs::build_client_endpoint` (the native client's mirror), `server/src/transport_lab.rs`
 (the measuring lab). Env overrides on the relay and the client: `SSSHARE_CC=bbr|cubic|newreno`
-(relay and client), `SSSHARE_DGRAM_BUF_KB` (relay only).
+(relay: all three; client: only `cubic` is honoured, any other value gives BBR, `net.rs` `build_client_endpoint`), `SSSHARE_DGRAM_BUF_KB` (relay only).
 
 ## Decision
 
@@ -14,7 +14,7 @@ Task #86, 2026-11-02. Code: `server/src/transport.rs` (`TransportTuning`, relay 
 | Max idle timeout | 60 s | **20 s** | both |
 | Keep-alive | 15 s | **5 s** | both |
 | Deadline drop / "never evict the newest IDR" | n/a | **not built** (reasoning below) | |
-| Eviction counter + path-stats logging (WIP ad14e6a) | n/a | **kept** (`relay.rs`: `viewer send queue full` every <= 5 s per viewer, `connection path stats` at the end of a connection, `Registry::datagrams_forwarded/evicting`) | relay |
+| Eviction counter + path-stats logging (WIP ad14e6a) | n/a | **kept** (`relay.rs`: `viewer send queue full` every <= 5 s per viewer, `connection path stats` at the end of a connection, `Registry::datagrams_forwarded/datagrams_evicting`) | relay |
 
 The lab knobs of the WIP patch became the documented `SSSHARE_CC` / `SSSHARE_DGRAM_BUF_KB`
 overrides: one env var is the cheapest rollback if BBR ever misbehaves on someone's path, and the
@@ -26,7 +26,7 @@ connection open for 45 s with old (60 s/15 s) and new (20 s/5 s) on either end, 
 A new client against the old relay still gets its 20 s (the minimum) and its own 5 s pings; an old
 client against the new relay gets the relay's 20 s and 5 s pings. The congestion controller is purely
 sender-local. The **relay change only takes effect when the user redeploys the relay**
-(vogelnest.any64.de:41000 runs the old build): the client change alone already fixes the sharer's
+(the deployed relay, `<relay host>`, runs the old build; see `.claude/local/relay.md` in the main checkout): the client change alone already fixes the sharer's
 uplink (BBR) and shortens dead-path detection, but relay -> viewer keeps Cubic (and its collapse
 under loss) until then.
 
@@ -187,7 +187,7 @@ transitions (the 12-transition test of the investigators) were not re-run here.
 BBR (above) makes the transport keep delivering under random loss, but a frame still dies with any
 one of its fragments (a 1 MB IDR is ~1000 of them). The relay therefore also answers retransmit
 requests. Wire format, capability probe, compatibility matrix and the *why* of every choice:
-`architecture/protocol-spec.md` section 6.6. Relay side, in short:
+`architecture/protocol-spec.md` section 6.6; the viewer side (detect, ask, hold and release in order) is `features/video/selective-retransmission.md`. Relay side, in short:
 
 - **Cache.** Per *video* stream, `StreamRoute::cache` (`protocol::FragmentCache<Bytes>`) holds the
   datagrams the forwarder sent in the last 2 s, at most 8 MiB, only while the stream has
@@ -204,7 +204,7 @@ requests. Wire format, capability probe, compatibility matrix and the *why* of e
   `NACK activity in the last 10 s requests=.. from_cache=.. forwarded_to_owner=.. miss_replies=..
   owner_resends_relayed=..`.
 - Tests: `server/src/nack_tests.rs`.
-- **Deploy note:** an old relay (the vogelnest one until redeployed) simply drops Hello as an
+- **Deploy note:** an old relay (the deployed one until redeployed) simply drops Hello as an
   undersized datagram, so new clients never NACK against it. The relay must be redeployed for the
   feature to do anything.
 
@@ -223,7 +223,7 @@ requests. Wire format, capability probe, compatibility matrix and the *why* of e
 Code: `server/src/diag.rs`. Why: a friend's stall used to mean "relaunch from a terminal and send me
 the client log". The relay sees both legs of every stream, so a periodic summary in its own log is
 usually enough (the field case that motivated it was read off the TUI: a viewer doing
-unsubscribe -> subscribe every ~1.5 s, the L1 keyframe request of `features/video-pipeline.md`
+unsubscribe -> subscribe every ~1.5 s, the L1 keyframe request of `features/video/viewer-recovery.md`
 "Viewer recovery", while the stream rate swung 1 KB/s <-> 1 MB/s). Server only: no protocol or client
 change.
 
@@ -277,9 +277,9 @@ has `lost` / `congestion` / `evicted` > 0 while the stream line is healthy. View
 `resubs` high. Everything healthy but the viewer still sees stutter: the problem is in the viewer's
 decode/render (ask for that client's log).
 
-**On vogelnest.** `grep -h 'diag ' /var/lib/sss/logs/relay.log.*`; narrow with `diag stream` / `diag conn`,
+**On the deployed relay** (`<relay host>`; log directory and host in `.claude/local/relay.md` in the main checkout). `grep -h 'diag ' <relay log dir>/relay.log.*`; narrow with `diag stream` / `diag conn`,
 `owner_name="Name"` / `name="Name"`, `end=1`, `evicted=[1-9]`, or e.g.
-`grep -h 'diag stream' /var/lib/sss/logs/relay.log.2026-11-03 | grep -v 'resubs=0'`.
+`grep -h 'diag stream' <relay log dir>/relay.log.2026-11-03 | grep -v 'resubs=0'`.
 
 **Cost.** Per media datagram the forwarder takes one uncontended `std::sync::Mutex` (the stream's
 counters) and parses the 19 B header a second time; no allocation, plus one relaxed `fetch_add` per
@@ -313,9 +313,9 @@ deleted at start and then hourly (`client_logs::prune_at`; only directories name
 under `logs/clients` is touched). The relay logs `dropping client diagnostics: limit reached` (WARN) and
 `client diagnostics uploads (...) enabled=... dir=...` at start.
 
-**On vogelnest.** `ls /var/lib/sss/logs/clients/$(date -u +%F)/`, then e.g.
-`less -R /var/lib/sss/logs/clients/2026-11-03/Name-<conn id>.log`,
-`grep -h 'WARN\|recover' /var/lib/sss/logs/clients/2026-11-03/Name-*.log`, or follow a live session with
+**On the deployed relay** (see `.claude/local/relay.md` in the main checkout). `ls <relay log dir>/clients/$(date -u +%F)/`, then e.g.
+`less -R <relay log dir>/clients/2026-11-03/Name-<conn id>.log`,
+`grep -h 'WARN\|recover' <relay log dir>/clients/2026-11-03/Name-*.log`, or follow a live session with
 `tail -f`. The relay has to be redeployed for any of this to work (an older relay never acks).
 
 **Cost.** Relay: a 1-byte datagram compare per datagram (`bytes == [0xE4]`, before the NACK check), one

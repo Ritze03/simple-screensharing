@@ -20,7 +20,7 @@
   `live_preview_frames()` (buffers that reached the sink, for verification). UI: `ui/mod.rs`
   `App::poll_live_previews` + `Shell::live_previews`, own tile `ui/stage/tile.rs` `mine_tile` (it was `ui/room.rs` `my_card` before the stage).
 - **Branch:** `tee ! valve(drop, forward-sticky-events) + RateCap probe (30 fps) ! queue(leaky, 1)
-  ! vapostproc | videoscale ! videoconvert ! capsfilter(BGRA, fitted size, 30/1) ! appsink`. Size: the source
+  ! vapostproc | videoscale ! videoconvert ! capsfilter(BGRA, fitted size) ! appsink`. Size: the source
   fitted into **1920x1080**, aspect kept, never upscaled, even sides (`fit_live_size`), written into the capsfilter
   when the branch opens (so a 720p source is shown at 1280x720 and a 4K one is scaled down by the GPU). The branch
   is the same in both [`CaptureDomain`]s except for the scaler: in the GPU domain `vapostproc` scales on the GPU
@@ -82,9 +82,9 @@ holds a muted `<video class="live-preview">` playing `new MediaStream([videoTrac
 audio). Attached while `document.visibilityState === "visible" && document.hasFocus()`; on
 `visibilitychange` / `focus` / `blur` it is paused and `srcObject = null`, the element `hidden`, so the
 placeholder shows and nothing renders (the track itself keeps feeding the encoder). *Why a persistent
-element per capture:* `render()` rebuilds the tree on every state change; `myCard()` re-inserts the same
+element per capture:* `render()` rebuilds the tree on every state change; the stage (`docs/js/ui/stage.js`) re-inserts the same
 element, so playback never restarts (same idea as the fullscreen stage in `popout.js`). CSS (`app.css`
-`.thumb.mine`) uses `:has()` to swap the "Your screen" label for the `PREVIEW` chip. Audio-only captures
+`.st-tile.mine`, `.st-tile .mine-pic`) uses `:has()` to hide the "Your screen" placeholder (`.mine-pic`) and show the `PREVIEW` chip. Audio-only captures
 (`c.video == null`) get no element. E2E: `docs/dev/e2e/live-preview.mjs` (see `features/website.md`).
 
 ## History
