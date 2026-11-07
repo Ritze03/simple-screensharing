@@ -950,6 +950,8 @@ for (const [name, au] of [["H.264", h264Au], ["AV1", av1Au]]) {
     eq([rx.getStats().gaps, rx.getStats().repaired, rx.getStats().skippedDeltas, rx.getStats().ptsBack], [1, 1, 0, 0]);
     eq(events.filter((e) => e.t === "need-keyframe"), [], "no keyframe wanted");
     eq(events.find((e) => e.t === "repaired").bytes, au(5, false).length, "the log can tell how big the lost frame was");
+    const rep = events.find((e) => e.t === "repaired");
+    eq(mediaLogLine({ type: "repaired", ...rep, dropIn: 3 }), `repaired (${rep.from}->${rep.to}, id +4, ${rep.ms}ms, ${rep.rounds} rounds, ${au(5, false).length} B, 1/1, dropin=3)`);
     await settle(250);
     eq(asked.length, 1, "nothing asked again after the repair");
     rx.close();
@@ -1110,7 +1112,7 @@ test("decoder failure: the log line has the context, the keyframe interval is kn
   eq(err.length, 3);
   const line = mediaLogLine(err[2]);
   ok(line.startsWith("decoder-error #3 (EncodingError: Decoder failure) avc1.42001e 1920x1080 hw=no-preference q=0 key=0ms/2f break=2f out="), line);
-  ok(line.endsWith(" gaps=0 chain=on ptsback=0"), line);
+  ok(line.endsWith(" gaps=0 chain=on ptsback=0 stale=0 repaired=0"), line);
   ok(mediaLogLine(err[0]).includes(" break=none "), "no loss before the first failure");
   eq(events.find((e) => e.type === "need-keyframe" && e.reason === "decoder-error").gopMs, 250, "the room client can leave a short interval alone");
   eq(mediaLogLine(events.find((e) => e.type === "decoder-mode")), "decoder-mode (prefer-software)");

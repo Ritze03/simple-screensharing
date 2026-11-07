@@ -150,6 +150,8 @@ Reading it: "their session on the relay ended" or "they stopped it" on every vie
 
 ## Phone decoder failures: frames lost whole (row 150, 2026-11-05)
 
+**2026-11-07 (row 151): gaps are now repaired first.** A frame lost whole is re-requested by its `frame_id` (a NACK Request for an unseen frame, `protocol-spec.md` §6.6 "A frame never seen"), later frames are held, and only if no answer comes does the keyframe wait below start. See `video-pipeline.md` "A frame lost whole". The Connection log gained fields for it (list after the example below).
+
 *Why:* row 146 ruled the browser decoder out, and that was wrong: its runs used random loss in software decoders on a desktop, which proves nothing about a phone's decoder, and they never removed a frame whole. The user's Connection log from an iPhone 15 Pro Max (Chrome, so WebKit), 5 minutes at 1080p 60, shows no relay session line and no stream-gone line, only this, every 2-60 s, mostly not right after a logged loss:
 
 ```
@@ -198,6 +200,8 @@ need-keyframe (gap 4->6, id +4)
 ```
 
 `#3` failures of this watch; then the error's name and message, codec string, size, hardware hint; `q` decode queue at the last submit (an errored decoder reports 0); `key` time and frames since the last keyframe; `break` frames since the last loss, gap or decoder failure (`none` = no break yet); `out` pictures this decoder produced (0 = it failed straight after configure); `gaps` seen so far; `chain` on / off / none; `ptsback` frames whose pts did not rise. `id +N` in a gap line is the `frame_id` step.
+
+**Connection log additions (2026-11-07, row 151).** `decoder-error` lines end with ` stale=N repaired=N` (stale deltas dropped so far, frames repaired so far). A successful repair is its own line: `repaired (4->6, id +4, 4ms, 1 rounds, 8 B, 1/1, dropin=3)` = gap from picture 4 to 6, `frame_id` step 4, ms from detection to the frame being back, request rounds used, size of the repaired frame, repaired/gaps totals, `dropin` = datagrams this browser threw away itself (`?` where it does not report that). A gap that could not be repaired is `need-keyframe (gap 4->6, id +4, unrepaired 310ms, dropin=0)` (the `unrepaired` part only after a failed repair). `repaired` lines differ in their numbers, so `dropLog` does not collapse them: at one repair every 2 s the 200-line log holds about 7 minutes.
 
 Reading it: `gap` lines and few or no `decoder-error` = the cause is confirmed and fixed. `decoder-error` at the old rate with `chain=on`, `gaps=0` and a large `break` = whole-frame loss was not the cause; look next at `key` (small: the keyframe itself is refused, a bitstream problem) and `out=0`. `chain=off` or `none` on AV1 = the sender's numbering needs a look.
 

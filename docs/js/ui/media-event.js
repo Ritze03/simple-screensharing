@@ -7,11 +7,12 @@
 
 /** The Connection log's line for a media event, null for one it does not show. A phone has only this screen, so one decoder failure is one line with all that is known about it. */
 export function mediaLogLine(d) {
-  if (d.type === "need-keyframe") return `need-keyframe (${d.reason === "gap" ? `gap ${d.from}->${d.to}, id +${d.idStep ?? "?"}` : d.reason || "?"})`;
+  if (d.type === "need-keyframe") return `need-keyframe (${d.reason === "gap" ? `gap ${d.from}->${d.to}, id +${d.idStep ?? "?"}${d.ms != null ? `, unrepaired ${d.ms}ms` : ""}, dropin=${d.dropIn ?? "?"}` : d.reason || "?"})`;
   if (d.type === "decoder-mode" && d.hardwareAcceleration) return `decoder-mode (${d.hardwareAcceleration})`;
+  if (d.type === "repaired") return `repaired (${d.from}->${d.to}, id +${d.idStep}, ${d.ms}ms, ${d.rounds} rounds, ${d.bytes} B, ${d.repaired}/${d.gaps}, dropin=${d.dropIn ?? "?"})`;
   if (d.type !== "decoder-error") return null;
   if (d.codecString === undefined) return `decoder-error (${d.message || "?"})`; // audio
-  return `decoder-error #${d.count} (${d.name || "?"}: ${d.message || "?"}) ${d.codecString} ${d.width}x${d.height} hw=${d.hardwareAcceleration} q=${d.queue} key=${d.keyAgoMs ?? "?"}ms/${d.sinceKey}f break=${d.sinceBreak === null ? "none" : `${d.sinceBreak}f`} out=${d.outputs} gaps=${d.gaps} chain=${d.chain} ptsback=${d.ptsBack}`;
+  return `decoder-error #${d.count} (${d.name || "?"}: ${d.message || "?"}) ${d.codecString} ${d.width}x${d.height} hw=${d.hardwareAcceleration} q=${d.queue} key=${d.keyAgoMs ?? "?"}ms/${d.sinceKey}f break=${d.sinceBreak === null ? "none" : `${d.sinceBreak}f`} out=${d.outputs} gaps=${d.gaps} chain=${d.chain} ptsback=${d.ptsBack} stale=${d.stale} repaired=${d.repaired}`;
 }
 
 /** @param w the watch (`{ codec, error }`); @param d the event detail `{ type, codec? }`; @param tr `(codecUpper) => message`. Returns true if `w` changed. */

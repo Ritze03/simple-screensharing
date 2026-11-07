@@ -528,6 +528,12 @@ security-relevant. The relay never decrypts anything for this either.
 * **Give up.** After the third round plus one interval, on `Miss`, or after 1 s whatever
   happens: the frame is discarded exactly as in §6.5 and reported as loss, so the existing
   recovery (L1 keyframe request, `decode/recovery.rs`) takes over unchanged.
+* **A frame never seen (2026-11-07, row 151, browser viewer).** A viewer may send a Request for a frame of which it has
+  not received a single fragment, as `first 0, count 256` (it knows only the `frame_id`, from the gap in the numbering, not
+  the fragment count). A relay or sender holding the frame answers with the fragments it has; a Miss for a range past the
+  frame's end (the ask covers more fragments than exist) is ignored by the viewer, it only ends the wait when nothing was
+  supplied. *Why:* the frame has no reassembly state to name a range from, and the ask must stay one 18-byte datagram.
+  Seen by the user as `repaired (...)` in the Connection log (`website.md` "Phone decoder failures").
 * **Order.** While a frame is being repaired, **later complete frames of the same stream are
   held back and released in order** once it completes or is abandoned. *Why:* the decoder must
   see frame N before N+1; a late-completing N fed after N+5 corrupts the picture, and an IDR
