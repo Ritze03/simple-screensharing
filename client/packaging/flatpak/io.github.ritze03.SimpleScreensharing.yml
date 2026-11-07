@@ -1,5 +1,5 @@
 # Flatpak manifest of the egui client. Built by ../../../build-flatpak.sh (repo root);
-# notes and the *why*: superdoc/features/flatpak.md.
+# notes and the *why*: client/packaging/README.md "Flatpak".
 app-id: io.github.ritze03.SimpleScreensharing
 runtime: org.freedesktop.Platform
 runtime-version: '25.08'

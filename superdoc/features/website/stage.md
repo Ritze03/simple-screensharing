@@ -4,7 +4,7 @@ The browser stage (tiles, control bar, layouts, chrome), its fullscreen rule and
 
 ## Tile fullscreen never errors (row 152, 2026-11-07)
 
-The user, testing on an iPhone 15 Pro Max in Chrome (WebKit): "fullscreening a screenshare just results in an error." **Cause (inferred from the code, not reproduced on a real iPhone):** `popOut(..., "fullscreen")` called
+The user, testing on an iPhone in Chrome (WebKit): "fullscreening a screenshare just results in an error." **Cause (inferred from the code, not reproduced on a real iPhone):** `popOut(..., "fullscreen")` called
 `stage.requestFullscreen()` and, when it was missing (`document.fullscreenEnabled` false made it throw `ui.err.no_popout`) or rejected, `doFullscreen` showed the red "Pop-out failed: ..." toast.
 **Fix (`docs/js/ui/popout.js` `popOut`, `fallback`):** the tile's fullscreen is always the body-level `.pip-stage` (already `position: fixed; inset: 0`); the browser's fullscreen is requested on top, and when
 the API is missing or rejects the stage stays as a plain full-viewport layer (`.css-fs`: `100dvh`, exit button always visible because touch has no `:hover`, padded by `env(safe-area-inset-*)`, Escape and double-click

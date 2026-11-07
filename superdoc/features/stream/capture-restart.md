@@ -205,7 +205,7 @@ IDR); (3) every failed IDR made the viewer ask again (L1, Unsubscribe+Subscribe)
 answered each ask with the IDR plus two repeats at +300 ms / +1 s, so ~3 MB of IDRs per request, each
 as unlikely to arrive whole as the last.
 
-**Encoder side: what radeonsi honors (measured on the dev machine's AMD GPU, Mesa 26.2, GStreamer
+**Encoder side: what radeonsi honors (measured on the test machine's AMD GPU, Mesa 26.2, GStreamer
 1.28.8, the client's exact `vah264enc` config, 1080p120, 8300 kbps).** Content: a 1920x1080 colored-noise
 texture scrolling 3 px/frame (P frames predict it, an IDR cannot: big IDR, tiny P, like game/video
 content) and a calm-then-moving clip (120 static frames, then 120 noisy ones).

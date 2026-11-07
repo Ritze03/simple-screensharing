@@ -49,7 +49,7 @@ requested_codec`). This mirrors how `EncoderBackend::Vaapi` already silently ign
 
 The UI calls `AppState::supported_codecs` (wraps `capture::
 supported_codecs(capture::detect_encoder_backend())`, returning `[H264]` on
-`Software` and H.264 plus whichever of H.265 / AV1 the VA stack has an encoder element for on `Vaapi`, see the Why below) to grey out H.265/AV1 in the
+`Software` and H.264 plus whichever of H.265 / AV1 the VA stack has an encoder element for on `Vaapi`, see the Why below) to hide H.265/AV1 in the
 selector on a machine that would silently downgrade them, rather than let a user pick an
 option that quietly does something else. `capture::StagedCaptureRow` also carries this same
 list alongside the staged card's other encoder
@@ -64,7 +64,7 @@ list offered such a machine an AV1 button that silently downgraded the branch to
 (`branch::add_branch_with_fallback`): a control that does nothing, which the UI now hides (user rule 2026-11-01).
 The per-branch software fallback remains as the safety net.
 
-### `vah265enc`/`vaav1enc`: confirmed via `gst-inspect-1.0` on this dev machine (AMD RDNA3
+### `vah265enc`/`vaav1enc`: confirmed via `gst-inspect-1.0` on the test machine (an AMD
 GPU, GStreamer 1.28.5)
 
 Both elements' `rate-control` (`cbr`/`vbr`/`cqp`/`qvbr`), `bitrate`, `key-int-max`, and
@@ -73,7 +73,7 @@ Both elements' `rate-control` (`cbr`/`vbr`/`cqp`/`qvbr`), `bitrate`, `key-int-ma
 only needs to swap the element name per codec, not remap any property. Their `mbbrc`
 property (mentioned as a possible per-codec wrinkle before this stage started) defaults to
 `"auto"`/`"disabled"` on both and was left untouched — nothing in this pipeline's existing
-`RateControlMode`/`QualityLevel` mapping needs it.
+`RateControlMode` (removed in #88)/`QualityLevel` mapping needs it.
 
 Output caps differ by codec, not just by element (`branch::add_branch`'s caps immediately
 downstream of the encoder):

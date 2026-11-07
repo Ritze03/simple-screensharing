@@ -181,7 +181,7 @@ use a stub with a real 20 ms TOC byte (`0xF8`).
   change fine; the GStreamer clock did not. Its `priority.driver=3000` experiment worked because with our sink always
   the driver the capture's clock never stepped. The idle -> running rebuild is removed.
 
-**Not verified:** the user's own host (real ALSA at 44.1 kHz, EasyEffects, the Firefox-based browser, a viewer elsewhere); the browser
+**Not verified:** the user's own host (real ALSA at 44.1 kHz, an audio-effects app, the Firefox-based browser, a viewer elsewhere); the browser
 viewer against the fixed sender. If it still breaks there: run sharer and viewer with `SSS_AUDIO_DUMP=<dir>` and
 compare `pktdump.py sent-*.pkt` (what was sent), `recv-*.pkt` and `play-*.log` (how many `gap` lines). **Same pattern elsewhere, not changed:** the video capture pipelines
 (`capture.rs`) also run on their `pipewiresrc`'s clock; a screencast's driver is the portal node and does not switch
@@ -363,7 +363,7 @@ crossed links do not count, the stale/rebuild decision), `only_the_links_feeding
 `end_to_end_test::live_audio_share_soak` (VM only).
 
 **Still open / not covered:** the first ~1 s of the resumed sound is lost (poll interval + rebuild); polling faster
-costs a `pw-dump` per tick. Not reproduced: the user's EasyEffects-on-the-host setup (the Fedora VM runs EasyEffects
+costs a `pw-dump` per tick. Not reproduced: an audio-effects app on the host (the Fedora VM runs EasyEffects
 and shows the same behaviour as without it). The 250 ms settle also runs in `Drop` (the abrupt-disconnect backstop)
 on whatever thread drops the handle. A different WirePlumber without `mpris-pause.lua` is unaffected by part 1 and
 only pays the 250 ms.

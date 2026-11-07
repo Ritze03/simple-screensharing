@@ -58,12 +58,12 @@ id came from `pw-dump`'s top-level `id` field.
 - `path` is **deprecated** (`gst-inspect-1.0 pipewiresrc`); `target-object` replaces it.
 - Both take *"the source name/serial"* — a node's **`object.serial`** or its `node.name`.
   Neither takes `pw-dump`'s registry `id`, which is a *different number*: measured live on
-  the dev machine, the loopback output node was registry id `333`, `object.serial`
+  the test machine, the loopback output node was registry id `333`, `object.serial`
   `18643`. The registry id therefore matched nothing.
 - **A `pipewiresrc` whose target does not resolve does not fail.** `node.autoconnect`
   defaults to `true`, so the session manager links it to the **default audio source** —
   the microphone. Confirmed live with `pw-link -l`: the capture stream came up linked to
-  `easyeffects_source:capture_FL`.
+  `<audio-effects-app>_source:capture_FL`.
 
 So the shared application's audio was never captured, and the sharer's mic was being
 Opus-encoded and broadcast to the room instead. Nothing downstream could tell: the

@@ -140,7 +140,7 @@ announces a loopback node and its ports as separate registry events, a beat apar
   capture-pipeline running time (time since *that sharer* started sharing) — for a
   late-joining viewer the gap between those two clocks becomes a large scheduled-playout
   delay, and the sink stalls waiting for buffers whose PTS puts them deep in its past.
-  Confirmed live against a real Spotify audio stream: 6 of 299 buffers reached the sink
+  Confirmed live against a real music player's audio stream: 6 of 299 buffers reached the sink
   before the fix, 296 of 299 after. Fix: a new `AudioTimeline` (`decode.rs:1462`) re-bases
   incoming sender PTS onto the receiver pipeline's own running time (100ms initial lead),
   using the same self-healing re-base-on-discontinuity approach as `PacingState` on the

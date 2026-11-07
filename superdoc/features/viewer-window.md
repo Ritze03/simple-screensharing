@@ -51,7 +51,7 @@ Full detail in `superdoc/architecture/client-reconnect-and-watches.md` (tasks #3
   (see `superdoc/meta/TERMINOLOGY.md`), and what the user was watching is kept as `WantedStream`s identified by
   **owner display name + kind + label** (never `ConnId`/`StreamId`, which change). Streams not yet
   re-announced are waited for `REWATCH_GRACE` = **60 s**, matching the browser client's resume list.
-- **AV1 is cropped to the announced size (#40).** VCN4 (RX 7900 XTX) encodes 1080p as 1082 lines and
+- **AV1 is cropped to the announced size (#40).** a VCN4 AMD GPU encodes 1080p as 1082 lines and
   nothing in the bitstream names the padding; the decoder crops to the size from `StreamInfo`
   (`StreamDecoder::set_display_size`). Detail: `video/decode-and-display.md` "Visible size, not coded size".
 

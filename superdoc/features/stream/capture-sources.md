@@ -6,12 +6,12 @@ Part of the Stream Control reference, hub: `superdoc/features/stream-control.md`
 
 ## Sharing gamescope directly (2026-11-05, row 142)
 
-**Brief.** The user, with a screenshot of the PipeWire graph (node `gamescope-ritz`, subtitle `gamescope`, output port `capture_1`): "if
+**Brief.** The user, with a screenshot of the PipeWire graph (node `gamescope-<name>`, subtitle `gamescope`, output port `capture_1`): "if
 this capture is detected, first ask if the user wants to stream his screen or gamescope directly". Native client, Linux only.
 
 **Detection** (`capture::gamescope`, `nodes_in` is the pure part): `pw-dump` (the audio module's parser, `audio::run_pw_dump`), a node with
 `media.class == "Video/Source"` whose `node.name` or `media.name` contains "gamescope", ignoring case. Stock gamescope is `gamescope`, the
-user's build `gamescope-ritz`; the same-named audio nodes and the webcam (`v4l2_input...`) do not match. *Why a look-up per Share click and
+user's build `gamescope-<name>`; the same-named audio nodes and the webcam (`v4l2_input...`) do not match. *Why a look-up per Share click and
 no cached list:* a cached "no gamescope" would hide a game started a minute ago, and `pw-dump` is ~30 ms off the UI thread (2 s timeout,
 then "none"), so without gamescope the click reaches the portal as before.
 
@@ -253,7 +253,7 @@ restarted on resume-from-pause and after a swap so those gaps don't count.
 
 ## Capture source errors lead the share error (2026-10-15, #76)
 
-**Symptom (user, AppImage on Hyprland):** `Share error: failed to bring up the encode branch
+**Symptom (a user's AppImage build on a Hyprland desktop):** `Share error: failed to bring up the encode branch
 for stream 0: software fallback encode branch produced no IDR either`, while the terminal
 had the real cause: `capture pipeline error from .../GstPipeWireSrc:pipewiresrcN: stream
 error: unhandled format`. The root cause of *that* error is packaging, see

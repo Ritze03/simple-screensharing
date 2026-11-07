@@ -96,7 +96,7 @@ documents and code: sharp at a low frame rate, a keyframe is cheap at 15 fps so 
 resolution/framerate/bitrate: **Tune** (Low-Latency / Best Quality — `BestQuality` default),
 **Quality Level** (Performance / Balanced / Quality — `Balanced` default), and **Rate
 Control** (Constant / Adaptive / Quality — `Constant` default). Defined as `TuneMode`,
-`QualityLevel`, `RateControlMode` in `capture.rs`, exposed via `edit_destination`'s
+`QualityLevel`, `RateControlMode` (removed in #88) in `capture.rs`, exposed via `edit_destination`'s
 `tune`/`quality_level` params (snake_case strings, same convention as every
 other `edit_destination` param) and as controls in the destination settings
 (`client/src/ui/stream_settings.rs`).
@@ -112,7 +112,7 @@ this as a real product bug against that requirement. The fix: `TuneMode::BestQua
 midpoint between `Performance`'s `ultrafast`/`7` and `Quality`'s `veryslow`/`1` (`medium` is
 also x264's own upstream default preset) — are now the `#[default]`s, with `LowLatency` and
 `Performance` demoted to explicit opt-ins for whichever extreme a user actually needs.
-`RateControlMode::Constant` (CBR) stays the default untouched: CBR-by-default is the correct
+`RateControlMode::Constant` (removed in #88) (CBR) stays the default untouched: CBR-by-default is the correct
 choice for live-streaming bandwidth predictability on its own merits, not an extreme that
 needed fixing. Regression coverage for the new mapping:
 `capture::tests::quality_level_maps_to_speed_preset_and_target_usage` (asserts `Balanced` →
@@ -141,7 +141,7 @@ Framerate is a regular-user control (always visible); the raw knobs are not.
 
 
 **Why these are tier 2 (`BranchSwap`), not tier 1 (a live property write) — including for
-`RateControlMode::Adaptive`, which turns out to be a no-op on one backend:** none of
+`RateControlMode::Adaptive` (removed in #88), which turns out to be a no-op on one backend:** none of
 `x264enc`/`vah264enc`'s tuning properties (`speed-preset`/`target-usage`,
 `tune`, `rate-control`/`pass`) are safely writable on an already-`Playing` element the way
 `bitrate` is — `EncoderBackend::launch_fragment` bakes them into the element's

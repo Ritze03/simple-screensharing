@@ -90,3 +90,4 @@ The rules are in `claude-instructions/testing-and-verification.md`; these pages 
 ## meta/
 
 - [Terminology](meta/TERMINOLOGY.md): project vocabulary.
+- [Glossary details](meta/glossary-details.md): the long-form entries behind the terminology.

@@ -4,7 +4,7 @@ Phone dropouts, decoder failures, which phones can watch, and the Screen Wake Lo
 
 ## Phone dropouts: what can end a watch, the connection log, and the relay's control-frame bug (row 146, 2026-11-05)
 
-*Why:* the user on an iPhone 15 Pro Max (Chrome = WebKit) watching 1080p 60 (AV1 and H.264) over Wi-Fi: "frequent dropouts, there is the disconnect sound, then it says 'Waiting for first frame' for a quick time, then it connects again", every few seconds; a friend on Windows + Chrome has it far less often. There is no console on a phone, so the first job was to find which layer drops.
+*Why:* the user on an iPhone (Chrome = WebKit) watching 1080p 60 (AV1 and H.264) over Wi-Fi: "frequent dropouts, there is the disconnect sound, then it says 'Waiting for first frame' for a quick time, then it connects again", every few seconds; a friend on Windows + Chrome has it far less often. There is no console on a phone, so the first job was to find which layer drops.
 
 **What a "disconnect sound" and a "Waiting for the first frame" tile can only be** (read from `ui/sounds.js` `RoomSounds`, `ui/rooms.js`, `core/room-client.js`, then driven in a real Chromium viewer, `e2e/dropui.mjs`):
 
@@ -39,13 +39,13 @@ Reading it: "their session on the relay ended" or "they stopped it" on every vie
 
 **2026-11-07 (row 151): gaps are now repaired first.** A frame lost whole is re-requested by its `frame_id` (a NACK Request for an unseen frame, `protocol-spec.md` §6.6 "A frame never seen"), later frames are held, and only if no answer comes does the keyframe wait below start. See `features/video/selective-retransmission.md` "A frame lost whole". The Connection log gained fields for it (list after the example below).
 
-*Why:* row 146 ruled the browser decoder out, and that was wrong: its runs used random loss in software decoders on a desktop, which proves nothing about a phone's decoder, and they never removed a frame whole. The user's Connection log from an iPhone 15 Pro Max (Chrome, so WebKit), 5 minutes at 1080p 60, shows no relay session line and no stream-gone line, only this, every 2-60 s, mostly not right after a logged loss:
+*Why:* row 146 ruled the browser decoder out, and that was wrong: its runs used random loss in software decoders on a desktop, which proves nothing about a phone's decoder, and they never removed a frame whole. The user's Connection log from an iPhone (Chrome, so WebKit), 5 minutes at 1080p 60, shows no relay session line and no stream-gone line, only this, every 2-60 s, mostly not right after a logged loss:
 
 ```
-14:54:49 TestPort: Ritze's Screen: decoder-error (Decoder failure)
-14:54:49 TestPort: Ritze's Screen: need-keyframe (decoder-error)
-14:54:50 TestPort: Ritze's Screen: need-keyframe (loss)
-14:54:51 TestPort: Ritze's Screen: decoder-error (Decoder failure)
+14:54:49 TestPort: <name>'s Screen: decoder-error (Decoder failure)
+14:54:49 TestPort: <name>'s Screen: need-keyframe (decoder-error)
+14:54:50 TestPort: <name>'s Screen: need-keyframe (loss)
+14:54:51 TestPort: <name>'s Screen: decoder-error (Decoder failure)
 ```
 
 The user reports it on Android too ("Both on IOS and android"), on AV1 and H.264.

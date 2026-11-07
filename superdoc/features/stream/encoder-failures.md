@@ -108,7 +108,7 @@ counting window matters: the cycle script now counts from before the share start
 was not exercised. (2) Palette mode and the `min-qp` floor were measured on this rig's synthetic desktops (7-gray blocks, smooth colour
 with grain), not on the user's real screen; their log (`key_kB` 130-700 at 60 fps) suggests less extreme content, so the floor may
 never trigger for them. (3) The H.265 path was cycled once (2 branch deaths in 150 s, below the fallback threshold, no restarts); the
-H.265 -> H.264 step ran only as a unit-tested ladder, not live. (4) Everything was on the dev machine's AMD GPU / Mesa 26.2.5 /
+H.265 -> H.264 step ran only as a unit-tested ladder, not live. (4) Everything was on the test machine's AMD GPU / Mesa 26.2.5 /
 GStreamer 1.28.8; other drivers may size their coded buffer differently. (5) Bitrate writes were cycled 10 000 <-> 25 700 kbps only.
 
 ---
@@ -434,7 +434,7 @@ elsewhere (see `destination::STALL_RESEND_INTERVAL`'s doc comment).
 
 **Repro and verification**: real relay + real `videotestsrc`-backed capture + a real
 `StreamDecoder`, forcing the software backend at 1920×1080 (VAAPI has enough headroom on the
-dev machine to hide the bug entirely — the repro needs decode to actually be the bottleneck) —
+the test machine to hide the bug entirely — the repro needs decode to actually be the bottleneck) —
 `end_to_end_test::big_fps_jump_mid_stream_keeps_viewer_frames_flowing`. A viewer already
 watching gets jumped 15fps → 280fps (`SourceRestart` tier) then back down 280fps → 15fps
 (`BranchSwap` tier); asserts the gap between two consecutive newly-decoded frames never exceeds

@@ -154,7 +154,7 @@ symbol floor as before).
 
 The client side of the same report: a capture source that errors during branch bring-up now
 leads the share error (`screen capture failed: pipewiresrcN: stream error: unhandled
-format`) instead of being blamed on the encoder; see `superdoc/features/stream-control.md`
+format`) instead of being blamed on the encoder; see `superdoc/features/stream/capture-sources.md`
 "Capture source errors lead the share error".
 
 ## Decision: build in a Debian 13 container, supported hosts

@@ -167,7 +167,7 @@ have the same name, include them in the share (Combining multiple streams)."*
 - **Not covered:** a half-linked node (FL linked, FR `pw-link` failed) is retried and then fails
   forever on the duplicate FL link; rare, logged at debug level. Two *different* apps that share a
   display name are mixed too (that is the requested definition of "same name").
-- **Persistence:** none to migrate. The selection lives in `AppState::selected_audio_source` /
+- **Persistence:** none to migrate. The selection lives in `AppState::selected_audio_source` (gone since I7; `AudioChoice` now) /
   `StagedShare::audio` and was never written to a settings file.
 - **Tests:** unit only (the no-audio rule): `audio::tests::dropdown_lists_each_name_once_*`,
   `a_name_matches_all_its_output_streams_and_nothing_else`, `link_diff_adds_new_matches_*`. The
