@@ -37,6 +37,8 @@ export const NACK_IDLE_MS = 20;
 export const NACK_MAX_ROUNDS = 3;
 /** More suspect fragments than this is congestion, not loss: abandoned without asking. */
 export const NACK_MAX_REPAIR_FRAGMENTS = 128;
+/** A frame nobody here has seen (row 151) has an unknown size: its Request names this many fragments, the most a relay or sender answers. */
+export const NACK_WHOLE_FRAME_FRAGMENTS = 256;
 /** Nothing waits longer than this for a frame, whatever else happens. */
 export const NACK_HARD_LIMIT_MS = 1000;
 /** Memory guard: frames held per stream. */
@@ -244,9 +246,9 @@ export class Reassembler {
   }
 
   /** NACK mode: the relay cannot supply (part of) the range's frame. It is given up at the next poll. */
-  nackMiss({ connId, streamId, frameId }) {
+  nackMiss({ connId, streamId, frameId, first = 0 }) {
     const buf = this.streams.get(`${connId}:${streamId}`)?.frames.get(frameId);
-    if (buf) buf.giveUp = true;
+    if (buf && first < buf.parts.length) buf.giveUp = true; // past the frame's end: the tail of a whole-frame Request, nothing is missing
   }
 
   /** Missing fragment indices worth asking for now: a hole with >= 2 later fragments behind it, or every hole once the frame is quiet. */

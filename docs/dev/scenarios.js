@@ -330,6 +330,61 @@ scenario("audio follows video; volume 0-500 % and mute", async () => {
   src.stop();
 });
 
+// Row 151: the repair itself, against a real relay. Every 12th delta vanishes whole on its first way: towards the viewer (the relay's cache has it) or
+// towards the relay (only the sharer's send ring has it). H.264 only: Chromium's AV1 encoder writes no order hints, so a browser sharer's AV1 is not followed (the unit tests cover AV1).
+for (const leg of ["relay -> viewer", "sharer -> relay"]) {
+  scenario(`frame lost whole (h264), ${leg}: asked for by its id and back, no freeze and no keyframe wanted`, async () => {
+    const room = newRoom();
+    const a = await client(room.link, "sharer");
+    const b = await client(room.link, "viewer");
+    const src = makePatternSource(640, 360, 30);
+    await a.startShare({ stream: src.stream, codec: "h264", fps: 30, bitrateKbps: 2000, gopMs: 4000 }); // keyframes far apart: without the repair every loss is a long freeze
+    const st = await waitFor(() => streamOf(b, a), 5000, "stream");
+    b.watch(st.key, { canvas: document.body.appendChild(document.createElement("canvas")) });
+    await waitFor(() => (b.watchStats(st.key) || {}).decoded > 30 && b.nackStats().active && a.nackStats().active, 15000, "decoding, NACK on");
+    const sess = b.session;
+    const sent = [];
+    const send = sess.send.bind(sess);
+    sess.send = (m) => (sent.push(m.type), send(m));
+    const seen = new Set();
+    let lost = 0, victim = -1;
+    const drop = (d) => {
+      if (d.length <= 19 || d[1] & 5) return false; // not media, a keyframe, or a re-send
+      const id = new DataView(d.buffer, d.byteOffset).getUint32(11);
+      if (!seen.has(id)) {
+        seen.add(id);
+        victim = seen.size % 12 === 0 ? id : -1;
+        if (victim === id) lost++;
+      }
+      return id === victim; // only until the next frame starts: the repair comes after that
+    };
+    const before = b.watchStats(st.key);
+    const served = a.nackStats().served.resent;
+    const [target, method] = leg === "relay -> viewer" ? [sess, "onDatagram"] : [a.session, "sendDatagram"];
+    const orig = target[method].bind(target);
+    target[method] = (d) => (drop(d) ? undefined : orig(d));
+    await sleep(6000);
+    target[method] = orig;
+    sess.send = send;
+    await sleep(500);
+    const s = b.watchStats(st.key);
+    const repairs = events(b, "media").filter((e) => e.d.type === "repaired").map((e) => e.d);
+    const ms = Math.max(...repairs.map((r) => r.ms));
+    log(`repair ${leg}: ${JSON.stringify({ lost, gaps: s.gaps, repaired: s.repaired, skipped: s.skippedDeltas - before.skippedDeltas, ms: repairs.map((r) => r.ms), rounds: repairs.map((r) => r.rounds), bytes: repairs.map((r) => r.bytes) })}`);
+    ok(lost >= 10, `frames removed (${lost})`);
+    ok(s.gaps >= lost - 1, `seen (${s.gaps} of ${lost})`);
+    ok(s.repaired === s.gaps, `every one repaired (${s.repaired} of ${s.gaps})`);
+    ok(s.skippedDeltas === before.skippedDeltas, `nothing skipped (${s.skippedDeltas - before.skippedDeltas})`);
+    ok(events(b, "media").every((e) => e.d.type !== "need-keyframe" || e.d.reason !== "gap"), "no keyframe wanted for a gap");
+    ok(!sent.includes("Unsubscribe"), `no resubscribe (sent: ${sent.join(",") || "nothing"})`);
+    ok(s.decoderErrors === 0 && s.ptsBack === 0, `decoder fine (errors ${s.decoderErrors}, ptsBack ${s.ptsBack})`);
+    ok(ms < 150, `one round trip each (max ${ms} ms)`);
+    if (leg === "sharer -> relay") ok(a.nackStats().served.resent > served, "the sharer's ring answered");
+    src.stop();
+    return { lost, gaps: s.gaps, repaired: s.repaired, maxMs: ms };
+  });
+}
+
 scenario("previews: sender produces ~immediately, relay replays the cached one to late joiners", async () => {
   const room = newRoom();
   const a = await client(room.link, "sharer");
@@ -396,7 +451,7 @@ for (const codec of ["h264", "av1"]) {
         const id = new DataView(d.buffer, d.byteOffset).getUint32(11);
         if (!seen.has(id)) {
           seen.add(id);
-          if (seen.size % 12 === 0) (victim = id), lost++;
+          if (seen.size % 7 === 0) (victim = id), lost++; // 7: 12 deltas per keyframe here, so every 12th would always be the last of its group, whose loss the keyframe hides
         }
         if (id === victim) return;
       }
@@ -407,7 +462,7 @@ for (const codec of ["h264", "av1"]) {
     sess.send = send;
     const s = b.watchStats(st.key);
     ok(lost >= 2, `frames removed (${lost})`);
-    log(`${codec}: ${JSON.stringify({ fps: s.receivedFps, lost, gaps: s.gaps, seq: rx.chain.seq, prev: rx.chain.prev, keys: rx.keyTimes.map(Math.round) })}`);
+    log(`${codec}: ${JSON.stringify({ fps: s.receivedFps, lost, gaps: s.gaps, repaired: s.repaired, skipped: s.skippedDeltas, need: events(b, "media").filter((e) => e.d.type === "need-keyframe").length, seq: rx.chain.seq, prev: rx.chain.prev, keys: rx.keyTimes.map(Math.round) })}`);
     // Chromium's AV1 encoder writes no order hints, so there is nothing to follow: the check must then stay out of the way. Native vaav1enc does write them.
     const followed = rx.chain.prev !== null;
     ok(codec === "av1" || followed, "H.264 is always followed");

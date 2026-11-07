@@ -3,7 +3,7 @@
 import { AudioReceiver, AudioSender, MAX_VOLUME } from "./audio.js";
 import { AvSync } from "./avsync.js";
 import { NonceSpaceExhausted, decryptFrame, decryptPreview, encryptFrame, encryptPreview, importRoomKey } from "./crypto.js";
-import { Reassembler, fragmentFrame, pacePlan } from "./fragment.js";
+import { NACK_WHOLE_FRAME_FRAGMENTS, Reassembler, fragmentFrame, pacePlan } from "./fragment.js";
 import { HELLO_DATAGRAM, HELLO_INTERVAL_MS, HELLO_MAX_TRIES, SendRing, nackEnabledByDefault } from "./nack.js";
 import { JoinLinkError, parseJoinLink } from "./joinlink.js";
 import { PREVIEW_FIRST_DELAY_MS, PREVIEW_INTERVAL_MS, PreviewSampler } from "./preview.js";
@@ -707,6 +707,8 @@ export class RoomClient extends EventTarget {
           else frame.close();
         },
         onEvent: (type, detail) => this.#onVideoEvent(key, type, detail),
+        requestFrames: (ids) => this.#requestFrames(info, ids),
+        rttMs: () => this.#rttMs(),
         maxJitterBufferMs: this.maxJitterBufferMs,
         catchUpSpeedPercent: this.catchUpSpeedPercent,
         hardwareAcceleration: this.hardwareAcceleration,
@@ -752,8 +754,21 @@ export class RoomClient extends EventTarget {
     s.send({ type: "Subscribe", target: info.ownerId, streamId: info.streamId }).catch(() => {});
   }
 
+  /** Frames lost whole: all a viewer knows of them is their id, so the Request names fragment 0 on and the answer shows how many there are (spec 6.6). */
+  #requestFrames(info, ids) {
+    const s = this.session;
+    if (!s || !this.reassembler.nack) return false;
+    for (const frameId of ids) {
+      s.sendDatagram(packNackRange(NACK_TAG_REQUEST, { connId: info.ownerId, streamId: info.streamId, frameId, first: 0, count: NACK_WHOLE_FRAME_FRAGMENTS }));
+      this.reassembler.nackStats.requests++;
+    }
+    return true;
+  }
+
   #onVideoEvent(key, type, detail) {
-    this.dispatchEvent(new CustomEvent("media", { detail: { key, type, ...detail } }));
+    // droppedIncoming: datagrams this browser threw away itself because the page did not read them in time. Null where getStats does not have it.
+    const dropIn = this.lastTransportStats?.datagrams?.droppedIncoming ?? null;
+    this.dispatchEvent(new CustomEvent("media", { detail: { key, type, ...detail, dropIn } }));
     if (type === "need-keyframe" && this.lossRecovery === "resubscribe") {
       const rx = this.subs.get(key);
       const info = this.streams.get(key);
@@ -1011,6 +1026,7 @@ export class RoomClient extends EventTarget {
         const r = unpackNackRange(bytes);
         if (r) {
           this.reassembler.nackMiss(r);
+          if (r.first === 0) this.subs.get(streamKey(connIdToHex(r.connId), r.streamId))?.impl.frameMissing?.(r.frameId);
           this.#scheduleNackPoll(0);
         }
         break;

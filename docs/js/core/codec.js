@@ -369,10 +369,12 @@ export class RefChain {
 
   /**
    * Note one frame, in stream order, every frame from a keyframe on. `idStep` = its `frame_id` minus the previous frame's.
-   * @returns {{from:number,to:number}|null} the jump when frames are missing in front of this one, else null
+   * @returns {{from:number,to:number}|null} the jump when frames are missing in front of this one, else null. A frame that gets a jump is not
+   * noted, so it can be tried again once the missing ones arrived.
    */
   step(codec, au, keyframe, idStep) {
     if (this.off) return null;
+    const slots = this.slots.slice();
     let cur = null;
     try {
       cur = codec === CODECS.H264 ? this.#h264(au, keyframe) : codec === CODECS.AV1 ? this.#av1(au, keyframe) : null;
@@ -387,7 +389,11 @@ export class RefChain {
     const jump = (cur.n - prev + cur.mod) % cur.mod;
     if (jump <= 1) return null;
     if (idStep === 1) this.off = true;
-    return idStep > 1 ? { from: prev, to: cur.n } : null;
+    if (!(idStep > 1)) return null;
+    // Not taken into the state: this frame waits, and the frames that went missing may still come in front of it.
+    this.prev = prev;
+    this.slots = slots;
+    return { from: prev, to: cur.n };
   }
 
   #h264(au, keyframe) {

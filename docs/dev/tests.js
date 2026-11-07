@@ -921,6 +921,152 @@ for (const [name, au] of [["H.264", h264Au], ["AV1", av1Au]]) {
   });
 }
 
+/** A receiver on the strict decoder whose requestFrames just notes the ids. `feed(n, id)` pushes frame n (1 ms pts steps, keyframe when n % 15 === 0). */
+function repairRig(au, opts = {}) {
+  const s = strictDecoder();
+  const events = [], asked = [];
+  const rx = new VideoReceiver({
+    onFrame: () => {}, onEvent: (t, d) => events.push({ t, ...d }), DecoderClass: s.Decoder, maxJitterBufferMs: 0, rttMs: () => 10,
+    requestFrames: (ids) => (asked.push(ids), true), ...opts,
+  });
+  const feed = (n, frameId) => rx.pushFrame({ ptsUs: n * 1000, keyframe: n % 15 === 0, payload: au(n % 15, n % 15 === 0), frameId });
+  const settle = (ms = 0) => new Promise((r) => setTimeout(r, ms));
+  return { rx, feed, settle, events, asked, log: s.log };
+}
+
+for (const [name, au] of [["H.264", h264Au], ["AV1", av1Au]]) {
+  test(`a frame lost whole is asked for by its id and goes back to its place: no freeze, nothing dropped (${name})`, async () => {
+    const { rx, feed, settle, events, asked, log } = repairRig(au);
+    for (let n = 0; n < 5; n++) feed(n, n * 2);
+    feed(6, 12); // 5 (id 10) is missing; ids 9 and 11 are audio packets nobody here can tell from it
+    eq(asked, [[9, 10, 11]], "every skipped id");
+    feed(7, 14);
+    await settle();
+    eq(log.decoded.length, 5, "held, not decoded, while the hole is open");
+    feed(5, 10); // the repair
+    await settle();
+    eq(log.errors, []);
+    eq(log.decoded, [0, 1, 2, 3, 4, 5, 6, 7].map((n) => n * 1000), "in order, the two unanswered audio ids do not matter");
+    eq([rx.getStats().gaps, rx.getStats().repaired, rx.getStats().skippedDeltas, rx.getStats().ptsBack], [1, 1, 0, 0]);
+    eq(events.filter((e) => e.t === "need-keyframe"), [], "no keyframe wanted");
+    eq(events.find((e) => e.t === "repaired").bytes, au(5, false).length, "the log can tell how big the lost frame was");
+    await settle(250);
+    eq(asked.length, 1, "nothing asked again after the repair");
+    rx.close();
+  });
+}
+
+test("a hole of several frames: decoding resumes only when all of them are back, in whatever order they came", async () => {
+  const { rx, feed, settle, asked, log } = repairRig(h264Au);
+  for (let n = 0; n < 3; n++) feed(n, n);
+  feed(6, 6);
+  eq(asked, [[3, 4, 5]]);
+  feed(4, 4);
+  feed(3, 3);
+  await settle();
+  eq(log.decoded.length, 5, "3 and 4 can go, 5 is still missing");
+  eq(rx.repair !== null, true, "the repair is still open");
+  feed(5, 5);
+  await settle();
+  eq([log.errors, log.decoded.length, rx.getStats().repaired], [[], 7, 1]);
+  rx.close();
+});
+
+test("a frame nobody can supply: asked twice, then the keyframe wait, with no broken delta decoded", async () => {
+  const { rx, feed, settle, events, asked, log } = repairRig(h264Au);
+  for (let n = 0; n < 5; n++) feed(n, n * 2);
+  feed(6, 12);
+  feed(7, 14);
+  await settle(300); // nackRetryInterval is at least 100 ms
+  eq(asked.length, 2);
+  const need = events.filter((e) => e.t === "need-keyframe");
+  eq([need.length, need[0].reason, need[0].from, need[0].to, need[0].idStep, need[0].rounds], [1, "gap", 4, 6, 4, 2]);
+  eq(rx.getStats().skippedDeltas, 2, "what was held is gone");
+  feed(8, 16);
+  feed(15, 30);
+  feed(16, 32);
+  await settle();
+  eq(log.errors, []);
+  eq(log.decoded.slice(-2), [15000, 16000], "the next keyframe heals it");
+  rx.close();
+});
+
+test("the relay says Miss for every skipped id: the keyframe wait starts at once", () => {
+  const { rx, feed, events } = repairRig(h264Au);
+  for (let n = 0; n < 5; n++) feed(n, n);
+  feed(6, 6);
+  eq(rx.repair !== null, true);
+  rx.frameMissing(5);
+  eq(events.filter((e) => e.t === "need-keyframe")[0]?.reason, "gap");
+  rx.close();
+});
+
+test("no NACK, or too many ids to ask for: the keyframe wait starts at once", () => {
+  const a = repairRig(h264Au, { requestFrames: () => false });
+  for (let n = 0; n < 5; n++) a.feed(n, n);
+  a.feed(6, 6);
+  eq(a.events.filter((e) => e.t === "need-keyframe").length, 1);
+  a.rx.close();
+  const b = repairRig(h264Au);
+  for (let n = 0; n < 5; n++) b.feed(n, n);
+  b.feed(6, 100);
+  eq([b.asked, b.events.filter((e) => e.t === "need-keyframe").length], [[], 1]);
+  b.rx.close();
+});
+
+test("a keyframe during a repair ends it: what is held in front of it goes, what is behind it stays", async () => {
+  const { rx, feed, settle, events, log } = repairRig(h264Au);
+  for (let n = 10; n < 15; n++) (n === 10 ? rx.pushFrame({ ptsUs: 10000, keyframe: true, payload: h264Au(0, true), frameId: 10 }) : rx.pushFrame({ ptsUs: n * 1000, keyframe: false, payload: h264Au(n - 10, false), frameId: n }));
+  rx.pushFrame({ ptsUs: 16000, keyframe: false, payload: h264Au(6, false), frameId: 16 }); // 15 lost
+  rx.pushFrame({ ptsUs: 17000, keyframe: false, payload: h264Au(7, false), frameId: 17 });
+  feed(30, 30);
+  feed(31, 31);
+  await settle(60); // their pts lie 20 ms ahead: the jitter buffer paces them
+  eq(log.errors, []);
+  eq(log.decoded.slice(-2), [30000, 31000]);
+  eq([rx.repair, rx.held.length, events.filter((e) => e.t === "need-keyframe").length], [null, 0, 0]);
+  rx.close();
+});
+
+// The hole the two log lines of 2026-11-07 point at: both failures have ptsback > 0. A delta that comes after a newer frame used to reach the decoder when no wait was on.
+test("a delta older than the last frame never reaches the decoder, and does not disturb the numbering", async () => {
+  const { rx, feed, settle, events, log } = repairRig(h264Au);
+  for (let n = 0; n < 15; n++) feed(n, n);
+  feed(15, 16); // the keyframe, with frame id 15 not there yet
+  rx.pushFrame({ ptsUs: 14500, keyframe: false, payload: h264Au(14, false), frameId: 15 }); // late, behind the keyframe
+  feed(16, 17);
+  await settle();
+  eq(log.errors, [], "timestamps never went back at decode()");
+  eq([rx.getStats().stale, rx.getStats().gaps, rx.getStats().ptsBack], [1, 0, 0]);
+  eq(events.filter((e) => e.t === "need-keyframe"), []);
+  rx.close();
+});
+
+test("RefChain: a frame that shows a jump is not noted, so it can be tried again behind the missing one", () => {
+  for (const [codec, au] of [["h264", h264Au], ["av1", av1Au]]) {
+    const c = new RefChain();
+    c.step(codec, au(0, true), true);
+    eq(c.step(codec, au(1, false), false, 2), null);
+    eq(c.step(codec, au(3, false), false, 3), { from: 1, to: 3 });
+    eq(c.step(codec, au(3, false), false, 3), { from: 1, to: 3 }, "still");
+    eq(c.step(codec, au(2, false), false, 2), null, "the missing one");
+    eq(c.step(codec, au(3, false), false, 2), null, "and the held one fits");
+  }
+});
+
+test("a Miss past a frame's end is the tail of a whole-frame Request: the frame is not given up", () => {
+  let clock = 0;
+  const r = new Reassembler({ now: () => clock });
+  r.setNack(true);
+  const h = (i) => ({ connId: 7n, streamId: 1, frameId: 9, fragmentIndex: i, fragmentCount: 3, keyframe: false, stalled: false });
+  r.ingest(h(0), new Uint8Array(4));
+  r.nackMiss({ connId: 7n, streamId: 1, frameId: 9, first: 3, count: 253 });
+  r.ingest(h(1), new Uint8Array(4));
+  eq(r.poll(10).frames.length, 0);
+  eq(r.ingest(h(2), new Uint8Array(4)).length, 1, "completes");
+  eq(r.droppedFrames, 0);
+});
+
 test("RefChain: a jump between consecutive frame ids cannot be loss, so the check switches itself off", () => {
   const c = new RefChain();
   c.step("h264", h264Au(0, true), true);
