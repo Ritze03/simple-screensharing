@@ -33,7 +33,7 @@ appending. This file stays in context for the whole session.
 - **Exclusion list** — `AppSettings::audio_exclusions`: app names kept out of Desktop audio and every source list (Discord and TeamSpeak by default). `features/audio/desktop-audio.md`.
 - **Emoji avatar** — the emoji a person picks as profile picture; its colour sets the avatar background, carried by the relay via `AvatarHello`/`AvatarList`. `features/website/viewer-features.md`, `architecture/protocol-spec.md` §9.2.
 - **PIP spot** — one of the eight places (corners, side middles) a webcam in picture snaps to when released. `ui/STAGE.md`.
-- **Playout buffer** (jitter buffer, row 136) — the dynamic per-stream viewer delay that holds encoded frames so late clumps play out evenly; capped by Settings > Playback > Jitter buffer. `features/video/playout-buffer.md`.
+- **Playout buffer** (jitter buffer, row 136) — the dynamic per-stream viewer delay that holds encoded frames so late clumps play out evenly; capped by Settings > Playback > Jitter buffer (default 2 s, 0 = off). `features/video/playout-buffer.md`, `meta/glossary-details.md`.
 - **Gamescope capture** (row 142) — sharing a gamescope session's PipeWire `Video/Source` node directly, with no portal or picker. `features/stream/capture-sources.md`.
 - **Wanted stream** — a watch carried over a reconnect, identified by owner name + kind + label, never by `ConnId`/`StreamId`. `session::WantedStream`, `architecture/client-reconnect-and-watches.md`.
 

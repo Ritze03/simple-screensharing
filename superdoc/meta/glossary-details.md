@@ -26,3 +26,14 @@ or Stalled. **Starting**: none is on air yet but one is still Starting (for exam
 portal's first frame). It drives the sidebar cast icon and the "Live in N rooms" line. Screens only: the
 audio button's state is separate (`features/audio/desktop-audio.md`). Idle-monitor shares:
 `features/stream/capture-sources.md`.
+
+## Playout buffer
+
+Settings > Playback > Jitter buffer caps the buffer: default 2 s (`playout::DEFAULT_MAX_MS` = 2000), at
+most 5 s (`MAX_MS_LIMIT` = 5000), and 0 turns it off. How the delay grows and shrinks:
+`features/video/playout-buffer.md`.
+
+## Source paths dropped from entries
+
+Where the code lives, for entries that no longer name it: the layout model is `client/src/widgets/layout.rs`
+(module doc of `widgets/mod.rs`); the emoji avatar drawing is `client/src/widgets/emoji.rs`.
