@@ -283,6 +283,34 @@ try {
     await tap("#btn-stagefs");
     await P.waitFor("!__sss.S.stage.fullscreen", { what: "fullscreen left" });
     await sleep(300);
+
+    // a tile's fullscreen where the browser has no element fullscreen (iPhone: API missing) or refuses it (rejects): never an error, a fixed
+    // full-viewport stage with a visible exit, which survives render(). SIMULATED: the API is removed / made to reject by overriding
+    // Element.prototype.requestFullscreen; real WebKit must confirm.
+    for (const mode of ["missing", "rejects"]) {
+      await P.eval(`(() => { window.__rf = window.__rf || Element.prototype.requestFullscreen;
+        Element.prototype.requestFullscreen = ${mode === "missing" ? "undefined" : "() => Promise.reject(new TypeError('Type error'))"}; })()`);
+      await tap('.st-tile .tools button[aria-label="Fullscreen"]');
+      await P.waitFor("document.querySelector('.pip-stage.css-fs')", { what: `fallback fullscreen (${mode})` });
+      check(await P.eval("!document.querySelector('.toast.err')"), `tile fullscreen, API ${mode}: no error toast`);
+      await P.eval("__sss.render()");
+      check(await P.eval("!!document.querySelector('.pip-stage.css-fs canvas')"), `API ${mode}: the fullscreen layer survives a render()`);
+      await inView(".pip-stage.css-fs", "the fallback fullscreen layer");
+      await inView(".pip-stage.css-fs .round-btn", "its exit button");
+      await shot(`16_tile_fullscreen_${mode}`);
+      await tap(".pip-stage.css-fs .round-btn");
+      await P.waitFor("!document.querySelector('.pip-stage')", { what: "fallback fullscreen left" });
+      check(await P.eval("!document.querySelector('.toast.err') && !!document.querySelector('.st-tile canvas')"), `API ${mode}: exit brings the tile back`);
+    }
+    // the stage's own fullscreen, refused: the stage-only layout stays (it used to snap back silently)
+    await P.eval("Element.prototype.requestFullscreen = () => Promise.reject(new TypeError('Type error'))");
+    await tap("#btn-stagefs");
+    await sleep(500);
+    check(await P.eval("__sss.S.stage.fullscreen"), "stage fullscreen refused by the browser: the stage-only layout stays");
+    await tap("#btn-stagefs");
+    await P.waitFor("!__sss.S.stage.fullscreen", { what: "stage-only layout left" });
+    await P.eval("Element.prototype.requestFullscreen = window.__rf");
+    await sleep(300);
   }
 
   /* ============================== wake lock ends with the room ============================== */

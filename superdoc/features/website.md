@@ -104,6 +104,17 @@ Watch and share both work. Differences from native, all platform limits:
   control stream first and `connect()` rejects with `JoinRejectedError`. The UI shows "This room is
   full (8 people at most)".
 
+## Tile fullscreen never errors (row 152, 2026-11-07)
+
+The user, testing on an iPhone 15 Pro Max in Chrome (WebKit): "fullscreening a screenshare just results in an error." **Cause (inferred from the code, not reproduced on a real iPhone):** `popOut(..., "fullscreen")` called
+`stage.requestFullscreen()` and, when it was missing (`document.fullscreenEnabled` false made it throw `ui.err.no_popout`) or rejected, `doFullscreen` showed the red "Pop-out failed: ..." toast.
+**Fix (`docs/js/ui/popout.js` `popOut`, `fallback`):** the tile's fullscreen is always the body-level `.pip-stage` (already `position: fixed; inset: 0`); the browser's fullscreen is requested on top, and when
+the API is missing or rejects the stage stays as a plain full-viewport layer (`.css-fs`: `100dvh`, exit button always visible because touch has no `:hover`, padded by `env(safe-area-inset-*)`, Escape and double-click
+leave, survives `render()`). The tile button (`stage.js`) is no longer hidden without `document.fullscreenEnabled`. The bar's stage fullscreen (`toggleStageFullscreen`) keeps its stage-only layout when
+`requestFullscreen` rejects (it used to snap back silently, so on an iPhone the button seemed dead).
+Why: the user wanted a working fullscreen or a useful full-size view, never an error. Test: `e2e/phone.mjs` (API removed, API rejecting, at 390x844, 844x390, 360x640; simulated by overriding
+`Element.prototype.requestFullscreen`) and the real desktop fullscreen in `e2e/stage.mjs`.
+
 ## Phone dropouts: what can end a watch, the connection log, and the relay's control-frame bug (row 146, 2026-11-05)
 
 *Why:* the user on an iPhone 15 Pro Max (Chrome = WebKit) watching 1080p 60 (AV1 and H.264) over Wi-Fi: "frequent dropouts, there is the disconnect sound, then it says 'Waiting for first frame' for a quick time, then it connects again", every few seconds; a friend on Windows + Chrome has it far less often. There is no console on a phone, so the first job was to find which layer drops.
@@ -205,7 +216,7 @@ Reading it: `gap` lines and few or no `decoder-error` = the cause is confirmed a
 | room menu | **long-press** on a sidebar room (500 ms, `dom.js` `longPress`: iOS Safari never sends `contextmenu`; Android does and opens the same menu); the press swallows its own click; `-webkit-touch-callout: none` on the rows |
 | tiles | the name tag and the three buttons (pop-out, fullscreen, `⋯` stream menu) are always shown (`hover: none`), 40 px; the pop-out button is dropped when it would only be the fullscreen button again (no Document PiP) |
 | people strip | a tap opens the hover card, a tap elsewhere closes it (`stage.js` touch `pointerdown`); the viewers chip too |
-| fullscreen | a tap shows the auto-hidden chrome (the document `pointerdown` already fed `chromeSync`); where `requestFullscreen` is missing (iPhone Safari) the stage-only layout stays as a pseudo fullscreen and the bar's button leaves it; the tile's own fullscreen button is hidden without `document.fullscreenEnabled` |
+| fullscreen | a tap shows the auto-hidden chrome (the document `pointerdown` already fed `chromeSync`); where `requestFullscreen` is missing (iPhone Safari) the stage-only layout stays as a pseudo fullscreen and the bar's button leaves it; the tile's fullscreen button is always there (row 152: without element fullscreen it opens the fixed full-viewport layer) |
 | layouts | Split and Crop only: **Floating is hidden** (not offered, a saved `float` shows as Split: `layoutOf`), and so are the resize bars and window handles (a 3 px bar under a finger is a mis-drag; nothing scrolls in the stage). Reset layout stays |
 | bar | wraps by the existing container query; buttons 44 x 40, arrows 30 wide |
 | menus, dialogs | menus 44 px rows and scroll within the viewport; dialogs `calc(100% - 16px)` wide, their body scrolls, foot wraps, `100dvh`; fields 16 px (iOS would zoom), a focused field scrolls into view (`focusin` + `visualViewport` resize; `interactive-widget=resizes-content` in the viewport meta, `viewport-fit=cover` + `env(safe-area-inset-*)`) |

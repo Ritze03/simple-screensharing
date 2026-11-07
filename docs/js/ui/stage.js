@@ -145,7 +145,7 @@ function tileEl(it, view, key, arena) {
       it.cam ? btn("tune", t("ui.room.webcam_settings"), () => A.openModal({ kind: "webcam", room: r.id })) : btn("tune", t("ui.room.stream_settings"), () => A.openStreamModal(it.c.id, r.id))].filter(Boolean));
   } else if (kind === "video") {
     if (popOutBtn()) tools.append(btn("open_in_new", t("ui.room.pop_out_tip"), () => A.doPopOut(r, w)));
-    if (document.fullscreenEnabled) tools.append(btn("fullscreen", t("ui.stage.fullscreen"), () => A.doFullscreen(r, w))); // iPhone Safari has no element fullscreen
+    tools.append(btn("fullscreen", t("ui.stage.fullscreen"), () => A.doFullscreen(r, w))); // no element fullscreen (iPhone): popout.js falls back to a fixed full-viewport layer
   }
   tools.append(h("button", { type: "button", class: "round-btn", title: t("ui.stage.stream_menu"), "aria-label": t("ui.stage.stream_menu"), "data-mk": "tile:" + it.id, onclick: (e) => openTileMenu(key, it.id, e.currentTarget) }, ic("more_horiz")));
   tile.appendChild(tools);
@@ -608,11 +608,7 @@ export function toggleStageFullscreen() {
   cs = null;
   A.render();
   if (!root.requestFullscreen) return; // iPhone Safari: no element fullscreen; the stage-only layout is all there is (the bar's button leaves it)
-  root.requestFullscreen().catch(() => {
-    // no Fullscreen API (or refused): stay in a plain window, the stage-only layout is still there
-    S.stage.fullscreen = false;
-    A.render();
-  });
+  root.requestFullscreen().catch(() => {}); // refused (iPhone browsers reject too): the stage-only layout stays as the fullscreen, the bar's button leaves it
 }
 function onFullscreenChange() {
   const fe = document.fullscreenElement;

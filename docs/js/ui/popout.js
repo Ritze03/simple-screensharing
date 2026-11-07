@@ -62,7 +62,7 @@ const copyStyles = (win) => {
 export async function popOut(w, onBack, want, decorate) {
   if (current) closePopout(current.w);
   if (stageWin) closeStage();
-  const mode = want === "fullscreen" ? (document.fullscreenEnabled ? "fullscreen" : null) : popoutMode();
+  const mode = want === "fullscreen" ? "fullscreen" : popoutMode(); // fullscreen never fails: without element fullscreen the stage is a fixed full-viewport layer (`fallback`)
   if (!mode) throw new Error(t("ui.err.no_popout"));
   if (mode === "pip") {
     const win = await window.documentPictureInPicture.requestWindow({ width: 960, height: 540 });
@@ -77,7 +77,9 @@ export async function popOut(w, onBack, want, decorate) {
     w.popped = "pip";
     return "pip";
   }
-  const stage = stageFor(w, document, () => document.exitFullscreen().catch(() => {}));
+  let native = false; // true while the browser's own fullscreen holds the stage; otherwise it is only the fixed `.pip-stage` layer (`.css-fs`)
+  const leave = () => (native && document.fullscreenElement ? document.exitFullscreen().catch(() => {}) : current && closePopout(current.w));
+  const stage = stageFor(w, document, leave);
   stage.style.zIndex = "200";
   autoHide(stage);
   stage.addEventListener("dblclick", () => current && closePopout(current.w)); // double-click again = back (Esc does the same natively)
@@ -89,15 +91,33 @@ export async function popOut(w, onBack, want, decorate) {
       if (current && current.stage === stage) back(current.w);
     }
   };
-  document.addEventListener("fullscreenchange", onFs);
   w.popped = "fullscreen";
+  if (!stage.requestFullscreen) return fallback(stage);
   try {
+    document.addEventListener("fullscreenchange", onFs);
     await stage.requestFullscreen();
+    native = true;
   } catch (e) {
+    // iPhone browsers (WebKit): no element fullscreen, or a rejection; the layer already fills the viewport
     document.removeEventListener("fullscreenchange", onFs);
-    back(w, { silent: true });
-    throw e;
+    return fallback(stage);
   }
+  return "fullscreen";
+}
+
+/** No element fullscreen: keep the fixed full-viewport stage, with its exit button always visible (no hover on touch), clear of the notch / home bar, and Escape.
+ *  Inline styles: they beat the `:hover` / `.idle` overlay rules of app.css. */
+function fallback(stage) {
+  stage.classList.add("css-fs");
+  stage.style.height = "100dvh";
+  const ovl = stage.querySelector(".ovl");
+  if (ovl) ovl.style.cssText += ";opacity:1;box-sizing:border-box;padding:max(8px,env(safe-area-inset-top)) max(8px,env(safe-area-inset-right)) 0 max(8px,env(safe-area-inset-left))";
+  const esc = (e) => {
+    if (e.key !== "Escape") return;
+    document.removeEventListener("keydown", esc);
+    if (current && current.stage === stage) closePopout(current.w);
+  };
+  document.addEventListener("keydown", esc);
   return "fullscreen";
 }
 
