@@ -4,6 +4,8 @@ target/
 client/.playwright-mcp/
 .claude/scheduled_tasks.lock
 .claude/teamlead/
+# machine-specific values kept out of the public docs (see superdoc playbook)
+.claude/local/
 # relay-generated TLS cert/key (server/src/cert.rs); secret, never commit
 /state/
 /server/state/
