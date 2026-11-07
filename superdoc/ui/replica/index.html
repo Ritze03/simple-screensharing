@@ -664,23 +664,23 @@ body { background: var(--page-bg); color: var(--text); font-family: var(--font-s
 /* ============================== fake data ==============================
    Two data sets: "demo" (richer, shows the audio pill) and "rig" (the headless rig's names, for side-by-side
    comparison with screenshots of the real app). Edit freely. */
-const K_RITZE = "films/Ritze/Screen", K_KRITA = "films/Ritze/Window · Krita", K_ANA = "films/Ana/Display 2", K_JONAS = "films/Jonas/Window · mpv", K_JCAM = "films/Jonas/Webcam"; /* stream keys, see skey() */
+const K_RITA = "films/Rita/Screen", K_KRITA = "films/Rita/Window · Krita", K_ANA = "films/Ana/Display 2", K_JONAS = "films/Jonas/Window · mpv", K_JCAM = "films/Jonas/Webcam"; /* stream keys, see skey() */
 const DATA = {
   demo: {
     rooms: [
-      { id: "films", name: "Friday Films", state: "joined", members: ["mo", "Ritze", "Ana", "Jonas", "Lea"], auto: true,
-        streams: [{ owner: "Ritze", label: "Screen", w: 2560, h: 1440, fps: 60, kbps: 9400, codec: "H.265", viewers: 3, audio: true, preview: true, pic: "cube" },
-                  { owner: "Ritze", label: "Window · Krita", w: 1600, h: 1000, fps: 30, kbps: 3800, codec: "H.265", viewers: 1, audio: false, preview: true, pic: "desk" },
+      { id: "films", name: "Friday Films", state: "joined", members: ["Max", "Rita", "Ana", "Jonas", "Lea"], auto: true,
+        streams: [{ owner: "Rita", label: "Screen", w: 2560, h: 1440, fps: 60, kbps: 9400, codec: "H.265", viewers: 3, audio: true, preview: true, pic: "cube" },
+                  { owner: "Rita", label: "Window · Krita", w: 1600, h: 1000, fps: 30, kbps: 3800, codec: "H.265", viewers: 1, audio: false, preview: true, pic: "desk" },
                   { owner: "Ana", label: "Display 2", w: 1920, h: 1200, fps: 30, kbps: 5200, codec: "AV1", viewers: 2, audio: false, preview: true, pic: "desk" },
                   { owner: "Jonas", label: "Window · mpv", w: 1920, h: 800, fps: 24, kbps: 4100, codec: "H.264", viewers: 1, audio: true, preview: true, pic: "film" },
                   { owner: "Jonas", label: "Webcam", w: 1280, h: 720, fps: 30, kbps: 1800, codec: "H.264", viewers: 2, audio: false, preview: true, pic: "cam", cam: true }] },
-      { id: "games", name: "Gaming Night", state: "joined", members: ["mo", "Ben", "Cleo", "Ana"], auto: true,
+      { id: "games", name: "Gaming Night", state: "joined", members: ["Max", "Ben", "Cleo", "Ana"], auto: true,
         streams: [{ owner: "Ben", label: "Screen", w: 1920, h: 1080, fps: 144, kbps: 12000, codec: "H.264", viewers: 1, audio: true, preview: true, pic: "cube" },
                   { owner: "Ana", label: "Window · Factorio", w: 1920, h: 1080, fps: 60, kbps: 6000, codec: "AV1", viewers: 2, audio: true, preview: true, pic: "film" }] },
       { id: "study", name: "Study Group", state: "disconnected", members: [], auto: false, streams: [] },
     ],
-    me: "mo", meRoom: "films", watchKey: K_RITZE,
-    stageWatch: [K_RITZE, K_KRITA, K_ANA, K_JCAM], allWatch: [K_RITZE, K_KRITA, K_ANA, K_JONAS, K_JCAM, "games/Ben/Screen", "games/Ana/Window · Factorio"],
+    me: "Max", meRoom: "films", watchKey: K_RITA,
+    stageWatch: [K_RITA, K_KRITA, K_ANA, K_JCAM], allWatch: [K_RITA, K_KRITA, K_ANA, K_JONAS, K_JCAM, "games/Ben/Screen", "games/Ana/Window · Factorio"],
     emoji: { Ana: "🦊", Ben: "🐙" }, /* name -> avatar emoji; your own is S.myEmoji (Settings > Profile) */
   },
   rig: {
@@ -719,7 +719,7 @@ const audioRows = () => audioSources().map(([n, icon, sub, group]) => [n, n, sub
 const STAGE = [
   ["stage", "Split", { pip: true, alsoWatch: [K_JONAS] }], /* the default view shows a webcam in picture: Jonas's, inside his share */
   ["stage-crop", "Crop", { layout: "crop" }],
-  ["stage-float", "Floating", { layout: "float", float: { [K_RITZE]: { x: .02, y: .03, w: .5 }, [K_KRITA]: { x: .55, y: .02, w: .3 }, [K_ANA]: { x: .52, y: .4, w: .44 }, [K_JONAS]: { x: .06, y: .64, w: .36 }, [K_JCAM]: { x: .44, y: .76, w: .16 } }, z: [K_RITZE, K_KRITA, K_JONAS, K_ANA, K_JCAM] }],
+  ["stage-float", "Floating", { layout: "float", float: { [K_RITA]: { x: .02, y: .03, w: .5 }, [K_KRITA]: { x: .55, y: .02, w: .3 }, [K_ANA]: { x: .52, y: .4, w: .44 }, [K_JONAS]: { x: .06, y: .64, w: .36 }, [K_JCAM]: { x: .44, y: .76, w: .16 } }, z: [K_RITA, K_KRITA, K_JONAS, K_ANA, K_JCAM] }],
   ["stage-live", "Sharing · menu", { sharing: "live", sharerSelf: true, audioOn: true, audioSrc: "Spotify", menu: "share" }],
   ["stage-pip", "Webcam + PIP", { pip: true, camOn: true, sharing: "live", sharerSelf: true, alsoWatch: [K_JONAS] }],
   ["stage-popped", "Popped out", { popped: [K_ANA] }],

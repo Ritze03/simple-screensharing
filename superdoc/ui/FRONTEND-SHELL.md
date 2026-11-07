@@ -13,7 +13,7 @@ preserved in git: `git show 3f2d5d3:superdoc/ui/FRONTEND-SHELL.md`.
 ## What lives on from it
 
 The Electron app is the **visual and behavioural reference** for the egui UI: the colour
-tokens (`client/frontend/styles/tokens.css` -> `client/src/theme.rs`, each constant names
+tokens (`client/frontend/styles/tokens.css` (deleted) -> `client/src/theme.rs`, each constant names
 its CSS variable), sizes, copy, the viewer window's rules (hover-gated chrome, Escape
 leaves fullscreen but never closes), custom segmented/checkbox looks, the Material Symbols
 icon set, and the Geist fonts. Where the egui styling guide says "Electron wins on looks",
