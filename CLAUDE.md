@@ -6,7 +6,7 @@ relay with a ratatui TUI), `protocol/` (shared wire crate), `docs/` (the GitHub-
 watch and share; `docs/js/core` protocol+media core, `docs/js/ui` UI, `docs/dev` test harness) and
 `superdoc/` (this knowledge base). Orientation: `README.md`, then `superdoc/architecture/overview.md`.
 
-<!-- superdoc:start v2 -->
+<!-- superdoc:start v4 -->
 ## Docs: read before you touch, update after you change
 
 Full discipline — what to read, when to update, how to record the *why* — lives in the

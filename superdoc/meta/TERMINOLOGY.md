@@ -8,6 +8,12 @@ it before acting on it.** Once its meaning is clear, add it to this file. Keep t
 file up to date automatically: whenever the user introduces or clarifies a term, add or
 amend the entry here.
 
+**Keep every entry short: what the term is, and where to read more.** One or two
+sentences, about 200 characters. Details, behaviour, option names, history and rationale
+belong on the linked doc page. If that page doesn't exist and there is more to say, write
+the page; don't grow the entry. When you amend an entry, trim it to this form instead of
+appending. This file stays in context for the whole session.
+
 ## Terms
 
 - **Suspended room** — a joined room whose connection dropped unexpectedly: its `RoomSession` is gone but a `ReconnectState` (`AppState::reconnects`) keeps its handle, last-known roster and what the user had running (watches, our shares) while the client retries. Not the same as a room the user left. See `architecture/implementation-notes.md` (task #36).
