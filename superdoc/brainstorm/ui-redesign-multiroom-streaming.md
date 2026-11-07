@@ -1,5 +1,7 @@
 # Brainstorm: UI Redesign & Multi-Room Streaming Architecture
 
+> **Historical.** Written 2026-07-26 before the egui rebuild and the stage; decisions are kept as recorded. The current design is in `superdoc/architecture/overview.md` (module map) and `superdoc/ui/APP-SHELL.md`.
+
 **Date:** 2026-07-26
 **Format:** 3 agents × 2 rounds + 1 final verify round (teamlead brainstorm mode)
 **Models:** UX/Design lens — Sonnet 5 High · Performance/Rendering lens — Sonnet 5 High ·
@@ -263,7 +265,7 @@ found. Resolutions:
 - ~~`tui.rs` (a second, less-visible frontend reusing `net.rs`/`capture.rs`/`decode.rs`) and
   the end-to-end test harness construct state directly and will need updating alongside every
   refactor step, not just `ui.rs`.~~ `tui.rs` was removed 2026-07-26 (see
-  `architecture/implementation-notes.md`'s "TUI front-end removed") — `ui.rs` is now the only
+  git history of `architecture/implementation-notes.md`, the "TUI front-end removed" entry) — `ui.rs` is now the only
   frontend. The end-to-end test harness (`end_to_end_test.rs`) still constructs state directly
   and still needs updating alongside every refactor step.
 - New UI strings need locale entries in both `en.yml` and `de.yml`.

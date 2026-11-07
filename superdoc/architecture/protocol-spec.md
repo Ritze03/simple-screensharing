@@ -1,6 +1,6 @@
 # Wire Protocol Specification
 
-Binding contract for the **Rust relay server** and the **Rust + egui desktop client**.
+Binding contract for the **Rust relay server**, the **Rust + egui desktop client** and the **browser client** (`docs/`).
 This resolves the four load-bearing protocol gaps and the presence-roster inconsistency
 from the brainstorm's "Final Verify Results" section into exact, implementable wire
 detail. Everything in `superdoc/brainstorm/simple-screensharing-platform.md` is already
@@ -17,7 +17,7 @@ encoding are defined once, in the shared crate `protocol/` (`simple-screensharin
 `client/src/protocol.rs` and `server/src/protocol.rs` only re-export it. Its
 `wire_bytes_unchanged` test pins the postcard bytes of every enum variant, so changing this
 spec's wire format means changing that crate and that test deliberately. `Why:` the relay,
-the native client and the coming browser client must change in lockstep (one repo), and two
+the native client and the browser client must change in lockstep (one repo), and two
 independently derived copies (the old layout) could silently drift.
 
 Conventions used throughout:
@@ -644,10 +644,10 @@ file on the relay. The ring is process-wide, so a client in two rooms on two rel
 #### Storage on the relay (`server/src/client_logs.rs`)
 
 `logs/clients/<YYYY-MM-DD>/<display-name>-<conn_id>.log` relative to the relay's working directory
-(`/var/lib/sss` on vogelnest): one file per connection, appended to, `# relay:` lines for start and end.
+(a deployment-specific directory): one file per connection, appended to, `# relay:` lines for start and end.
 The day is the UTC day of the connection's first batch. The display name is reduced to letters, digits,
 `-` and `_` (everything else, path separators and dots included, becomes `_`; 32 characters at most; empty
-becomes `anon`), the connection id keeps two people called "mo" apart. Caps, because anyone in a room can
+becomes `anon`), the connection id keeps two people called "alex" apart. Caps, because anyone in a room can
 open the stream: **20 MiB per file**, **500 MiB per day directory** (a batch that does not fit is dropped
 whole, with one `# relay:` note per file; a restarted relay re-counts the day from disk), and **day
 directories older than 14 days are deleted** (at start, then hourly).
@@ -754,7 +754,7 @@ which is negligible at friend scale (≤ 8 members, rarely many simultaneous joi
 
 To avoid an IDR burst when several viewers join at once, the **sender** coalesces
 requests: it ignores a `KeyframeRequest` if it already emitted an IDR within the last
-~100 ms (a sender-side detail, not a wire requirement). The `0 → 1` case additionally
+~100 ms (a sender-side detail, not a wire requirement). The relay debounces too, per stream: `KEYFRAME_REQUEST_DEBOUNCE` (100 ms, `server/src/relay.rs`) collapses a burst of near-simultaneous subscribes into one `KeyframeRequest`. The `0 → 1` case additionally
 triggers resume-from-idle before the forced IDR.
 
 The relay sends both messages only to the stream's owner; other members never receive
@@ -818,7 +818,7 @@ Compatibility matrix:
 
 ### 9.2 Emoji avatars (task #106, 2026-11-04)
 
-**Why.** A person can pick an emoji as their avatar (Settings > Profile; the picker offers 40) and
+**Why.** A person can pick an emoji as their avatar (Settings > Profile; the picker offers 56) and
 every peer shows it instead of the initial (design decision D6). Neither presence (§8, `Member` has
 exactly `conn_id`, `display_name`, `stream_count`) nor any control message can carry it, because the
 control format is frozen (§2, `wire_bytes_unchanged`). So, as for viewer lists (§9.1) and NACK (§6.6),
@@ -994,7 +994,8 @@ equal in rooms and forwarding.
    1000 bytes** (§6.3). Datagrams are unordered and lossy as ever; the receiver drops a frame
    with a missing fragment.
 5. Limits worth knowing: control frames ≤ 64 KiB; previews ≤ 2 MiB (relay-side cap); idle
-   timeout 60 s with relay keep-alives every 15 s.
+   timeout 20 s with relay keep-alives every 5 s (`TransportTuning::default()` in `server/src/transport.rs`, since 2026-11-02;
+   60 s / 15 s is only the test-only `legacy()` setting). Rationale and measurements: `features/relay-transport.md`.
 
 ### 11.3 Certificate: pinned, self-signed, auto-rotating
 
@@ -1025,14 +1026,14 @@ All forms are valid everywhere; a parser that knows only 3/4 fields rejects the 
 
 `server` (1st field) is `host:port`, `1.2.3.4:port` or `[ipv6]:port`, **the port is mandatory**
 (1-65535; a bare IPv6 literal without brackets has no port and is rejected the same way). Clients
-never default it: the relay's own default is 4433 but real deployments use others (41000 on
-`vogelnest.any64.de`), so a silent default turns a typo into an opaque timeout (and a browser
+never default it: the relay's own default is 4433 but real deployments use others (for example 44000 on
+`relay.example.org`), so a silent default turns a typo into an opaque timeout (and a browser
 would quietly try 443). Native `net::parse_server_addr`, browser `parseServerAddr`
 (`docs/js/core/joinlink.js`); the create/join dialog blocks Create/Join on a bad address and a
 connect (also of an already saved room) fails with "server address needs a port, e.g.
 host:4433" instead of a DNS-sounding error. `parse_join_string` / `parseJoinLink` stay lenient on
 the server field so an old saved room with a portless address still loads and shows that error.
-*Why:* user report 2026-10-15 (task #84): `vogelnest.any64.de` without `:41000` gave `could not
+*Why:* user report 2026-10-15 (task #84): `relay.example.org` without `:44000` gave `could not
 resolve server address ...: invalid socket address`.
 
 `certhash` = SHA-256 of the relay's **leaf certificate DER**, **base64url, no padding** (43
